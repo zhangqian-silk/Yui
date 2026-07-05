@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { TaskComment } from "../comment/comment.js";
 import { dataError } from "../errors/cliError.js";
 import type { TaskEvent } from "../event/taskEvent.js";
-import type { Role } from "../role/role.js";
+import type { GlobalRole, Role } from "../role/role.js";
 import type { CustomRunner } from "../runner/runner.js";
 import type { Task } from "../task/task.js";
 import { taskRecordCodec } from "./taskRecordCodec.js";
@@ -22,6 +22,10 @@ export type TaskStore = {
   renameRole(taskId: string, oldName: string, role: Role): void;
   listRoles(taskId: string): Role[];
   getRole(taskId: string, name: string): Role | null;
+  saveGlobalRole(role: GlobalRole): void;
+  listGlobalRoles(): GlobalRole[];
+  getGlobalRole(name: string): GlobalRole | null;
+  removeGlobalRole(name: string): boolean;
   nextCommentId(taskId: string): string;
   saveComment(taskId: string, comment: TaskComment): void;
   listComments(taskId: string): TaskComment[];
@@ -176,6 +180,48 @@ export class FileTaskStore implements TaskStore {
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "ENOENT") {
         return null;
+      }
+
+      throw error;
+    }
+  }
+
+  saveGlobalRole(role: GlobalRole): void {
+    const roleDir = this.globalRoleDir(role.name);
+    mkdirSync(roleDir, { recursive: true });
+    writeFileSync(this.globalRoleFile(role.name), `${JSON.stringify(role, null, 2)}\n`);
+  }
+
+  listGlobalRoles(): GlobalRole[] {
+    const rolesDir = this.globalRolesDir();
+    mkdirSync(rolesDir, { recursive: true });
+
+    return readdirSync(rolesDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => this.getGlobalRole(entry.name))
+      .filter((role): role is GlobalRole => role !== null)
+      .sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  getGlobalRole(name: string): GlobalRole | null {
+    try {
+      return parseGlobalRole(name, readFileSync(this.globalRoleFile(name), "utf8"));
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+        return null;
+      }
+
+      throw error;
+    }
+  }
+
+  removeGlobalRole(name: string): boolean {
+    try {
+      rmSync(this.globalRoleDir(name), { recursive: true });
+      return true;
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+        return false;
       }
 
       throw error;
@@ -337,6 +383,18 @@ export class FileTaskStore implements TaskStore {
     return join(this.taskDir(taskId), "roles");
   }
 
+  private globalRolesDir(): string {
+    return join(this.rootDir, "roles");
+  }
+
+  private globalRoleDir(name: string): string {
+    return join(this.globalRolesDir(), name);
+  }
+
+  private globalRoleFile(name: string): string {
+    return join(this.globalRoleDir(name), "role.json");
+  }
+
   private roleDir(taskId: string, name: string): string {
     return join(this.rolesDir(taskId), name);
   }
@@ -448,6 +506,27 @@ function parseCustomRunner(id: string, raw: string): CustomRunner {
   }
 
   return value as CustomRunner;
+}
+
+function parseGlobalRole(name: string, raw: string): GlobalRole {
+  const value = parseJson(raw, `Invalid global role record: ${name}`);
+
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    typeof value.name !== "string" ||
+    typeof value.agent !== "string" ||
+    typeof value.command !== "string" ||
+    !isStringArray(value.args) ||
+    !isStringRecord(value.env) ||
+    typeof value.workspace !== "string" ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string"
+  ) {
+    throw dataError(`Invalid global role record: ${name}`);
+  }
+
+  return value as GlobalRole;
 }
 
 function parseTaskmuxConfig(raw: string): TaskmuxConfig {

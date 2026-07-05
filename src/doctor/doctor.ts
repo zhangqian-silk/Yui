@@ -1,6 +1,8 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { renderTable } from "../output/table.js";
 import type { CustomRunner } from "../runner/runner.js";
+import { resolveRunner } from "../runner/runnerRegistry.js";
 import { FileTaskStore, resolveTaskmuxHome } from "../storage/taskStore.js";
 import { inspectStorageSchema, type StorageSchemaState } from "../storage/storageSchema.js";
 import type { CommandRunner } from "../tmux/commandRunner.js";
@@ -11,28 +13,105 @@ export function runDoctor(
   customRunners: CustomRunner[] = [],
   storageSchema: StorageSchemaState = inspectStorageSchema(resolveTaskmuxHome(env))
 ): string {
-  const checks = [
+  return renderDoctor(getDoctorChecks(env, runner, customRunners, storageSchema));
+}
+
+export function getDoctorChecks(
+  env: NodeJS.ProcessEnv,
+  runner: CommandRunner,
+  customRunners: CustomRunner[] = [],
+  storageSchema: StorageSchemaState = inspectStorageSchema(resolveTaskmuxHome(env))
+): DoctorCheck[] {
+  return [
     checkNode(),
     checkExecutable("tmux", env.TASKMUX_TMUX_BIN ?? "tmux", ["-V"], runner),
     ...customRunners.map((customRunner) =>
-      checkExecutable(`runner:${customRunner.id}`, customRunner.command, ["--version"], runner)
+      checkExecutable(`agent:${customRunner.id}`, customRunner.command, ["--version"], runner)
     ),
     {
       name: "taskmux home",
       status: "ok",
       detail: resolveTaskmuxHome(env)
     },
+    checkDefaultAgent(resolveTaskmuxHome(env), storageSchema, customRunners),
     checkStorageSchema(storageSchema),
     checkStoragePermissions(resolveTaskmuxHome(env)),
     checkStorageRecords(resolveTaskmuxHome(env), storageSchema)
   ];
-
-  return `TaskMux doctor\n${checks
-    .map((check) => `${check.name}\t${check.status}\t${check.detail}`)
-    .join("\n")}\n`;
 }
 
-type DoctorCheck = {
+function checkDefaultAgent(rootDir: string, state: StorageSchemaState, customRunners: CustomRunner[]): DoctorCheck {
+  if (state.status === "upgrade-required") {
+    return {
+      name: "default agent",
+      status: "upgrade-required",
+      detail: "run taskmux migrate"
+    };
+  }
+
+  if (state.status === "unsupported") {
+    return {
+      name: "default agent",
+      status: "unsupported",
+      detail: `current=${state.currentVersion} latest=${state.latestVersion}`
+    };
+  }
+
+  if (state.status === "invalid") {
+    return {
+      name: "default agent",
+      status: "invalid",
+      detail: state.detail
+    };
+  }
+
+  try {
+    const config = new FileTaskStore(rootDir).getConfig();
+
+    if (config.defaultAgent === undefined || config.defaultAgent.length === 0) {
+      return {
+        name: "default agent",
+        status: "missing",
+        detail: "run taskmux setup"
+      };
+    }
+
+    if (resolveRunner(config.defaultAgent, customRunners) === null) {
+      return {
+        name: "default agent",
+        status: "invalid",
+        detail: `${config.defaultAgent} is not configured`
+      };
+    }
+
+    return {
+      name: "default agent",
+      status: "ok",
+      detail: config.defaultAgent
+    };
+  } catch (error) {
+    return {
+      name: "default agent",
+      status: "invalid",
+      detail: errorMessage(error)
+    };
+  }
+}
+
+export function renderDoctor(checks: DoctorCheck[]): string {
+  return `TaskMux doctor\n${renderTable(
+    "Checks",
+    [
+      { header: "Check", minWidth: 8, maxWidth: 22 },
+      { header: "Status", minWidth: 7, maxWidth: 16 },
+      { header: "Detail", minWidth: 12, maxWidth: 88 }
+    ],
+    checks.map((check) => [check.name, check.status, check.detail]),
+    Math.max(54, Math.min(process.stdout.columns ?? 100, 140))
+  )}\n`;
+}
+
+export type DoctorCheck = {
   name: string;
   status: "ok" | "missing" | "upgrade-required" | "unsupported" | "invalid";
   detail: string;
@@ -158,11 +237,12 @@ function checkStorageRecords(rootDir: string, state: StorageSchemaState): Doctor
     const tasks = store.listTasks();
     const roleCount = tasks.reduce((count, task) => count + store.listRoles(task.id).length, 0);
     const runnerCount = store.listCustomRunners().length;
+    const globalRoleCount = store.listGlobalRoles().length;
 
     return {
       name: "storage records",
       status: "ok",
-      detail: `tasks=${tasks.length} roles=${roleCount} runners=${runnerCount}`
+      detail: `tasks=${tasks.length} roles=${roleCount} globalRoles=${globalRoleCount} agents=${runnerCount}`
     };
   } catch (error) {
     return {

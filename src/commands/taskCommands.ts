@@ -3,7 +3,8 @@ import { dirname } from "node:path";
 import { createTaskComment } from "../comment/comment.js";
 import { roleNotFound, runtimeError, taskNotFound, usageError } from "../errors/cliError.js";
 import { createTaskEvent } from "../event/taskEvent.js";
-import { createRole, updateRole, updateRoleStatus } from "../role/role.js";
+import { copyGlobalRoleToTaskRole, createRole, updateRole, updateRoleStatus } from "../role/role.js";
+import { SYSTEM_OWNER_ROLE } from "../role/systemRoles.js";
 import { resolveRunner, supportedRunnerIds } from "../runner/runnerRegistry.js";
 import { createTask, updateTaskMetadata, updateTaskStatus } from "../task/task.js";
 import type { TaskComment } from "../comment/comment.js";
@@ -13,7 +14,7 @@ import type { TaskStore } from "../storage/taskStore.js";
 import type { Task, TaskMetadata, TaskPriority, TaskStatus } from "../task/task.js";
 import type { TmuxManager } from "../tmux/tmuxManager.js";
 
-const BUILTIN_OWNER_ROLE = "owner";
+const BUILTIN_OWNER_ROLE = SYSTEM_OWNER_ROLE;
 
 export function runTaskCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
   const [command, ...rest] = args;
@@ -55,6 +56,8 @@ export function runTaskCommand(args: string[], store: TaskStore, tmux?: TmuxMana
       return taskRoleCommand(rest, store, tmux);
     case "assign":
       return assignTaskRoleCommand(rest, store);
+    case "bind":
+      return bindTaskRoleCommand(rest, store);
     case "assign-many":
       return assignManyTaskRolesCommand(rest, store);
     case "roles":
@@ -111,10 +114,17 @@ function createTaskCommand(args: string[], store: TaskStore): string {
   const metadata = template === undefined ? input.metadata : mergeTemplateMetadata(input.metadata, template);
   const task = createTask(store.nextTaskId(), title, new Date(), metadata);
   const config = store.getConfig();
-  const agent = requireOwnerRoleAgent(readOptionalOption(args, "--agent")?.trim() ?? config.defaultAgent);
-  const workspace = readOptionalOption(args, "--workspace")?.trim() ?? config.defaultWorkspace ?? process.cwd();
+  const explicitAgent = readOptionalOption(args, "--agent")?.trim();
+  const defaultAgent = explicitAgent ?? config.defaultAgent;
+  const explicitWorkspace = readOptionalOption(args, "--workspace")?.trim();
+  const workspace = explicitWorkspace ?? config.defaultWorkspace ?? process.cwd();
   const assignedRoles = uniqueStrings([BUILTIN_OWNER_ROLE, ...(template?.roles ?? [])])
-    .map((roleName) => createResolvedRole(roleName, agent, workspace, store));
+    .map((roleName) => createRoleFromGlobalOrAgent(roleName, {
+      agent: explicitAgent,
+      fallbackAgent: defaultAgent,
+      workspace,
+      workspaceOverride: explicitWorkspace
+    }, store));
 
   store.saveTask(task);
   rememberTask(store, task.id);
@@ -426,24 +436,35 @@ function assignTaskRoleCommand(args: string[], store: TaskStore): string {
     throw taskNotFound(taskId);
   }
 
-  const agent = readOption(rest, "--agent").trim();
-  const workspace = readOption(rest, "--workspace").trim();
+  assertKnownOptions(rest, new Set(["--agent", "--workspace", "--as"]));
 
-  if (agent.length === 0) {
-    throw usageError("--agent is required.");
+  const agent = readOptionalOption(rest, "--agent")?.trim();
+  const workspace = readOptionalOption(rest, "--workspace")?.trim();
+  const targetName = readOptionalOption(rest, "--as")?.trim() ?? roleName;
+  const role = agent === undefined
+    ? copyGlobalRole(roleName, store, { name: targetName, workspaceOverride: workspace })
+    : createResolvedRole(targetName, agent, requireWorkspace(workspace), store);
+
+  saveRoleAndRecordEvent(taskId, role, store);
+
+  if (agent === undefined) {
+    return [
+      `Bound role ${role.name} to ${taskId}`,
+      `Source role: ${roleName}`,
+      `Agent: ${role.agent}`,
+      `Workspace: ${role.workspace}`
+    ].join("\n").concat("\n");
   }
-
-  if (workspace.length === 0) {
-    throw usageError("--workspace is required.");
-  }
-
-  const roleNameResult = saveResolvedRole(taskId, roleName, agent, workspace, store);
 
   return [
-    `Assigned role ${roleNameResult} to ${taskId}`,
+    `Assigned role ${role.name} to ${taskId}`,
     `Agent: ${agent}`,
-    `Workspace: ${workspace}`
+    `Workspace: ${role.workspace}`
   ].join("\n").concat("\n");
+}
+
+function bindTaskRoleCommand(args: string[], store: TaskStore): string {
+  return assignTaskRoleCommand(args, store);
 }
 
 function assignManyTaskRolesCommand(args: string[], store: TaskStore): string {
@@ -467,17 +488,20 @@ function assignManyTaskRolesCommand(args: string[], store: TaskStore): string {
 
   const config = store.getConfig();
   const agent = readOptionalOption(rest, "--agent")?.trim() ?? config.defaultAgent;
-  const workspace = readOptionalOption(rest, "--workspace")?.trim() ?? config.defaultWorkspace;
+  const explicitWorkspace = readOptionalOption(rest, "--workspace")?.trim();
+  const workspace = explicitWorkspace ?? config.defaultWorkspace;
 
-  if (agent === undefined || agent.length === 0) {
-    throw usageError("--agent is required.");
-  }
+  const assignedRoles = roleNames.map((roleName) => {
+    const role = createRoleFromGlobalOrAgent(roleName, {
+      agent: undefined,
+      fallbackAgent: agent,
+      workspace,
+      workspaceOverride: explicitWorkspace
+    }, store);
 
-  if (workspace === undefined || workspace.length === 0) {
-    throw usageError("--workspace is required.");
-  }
-
-  const assignedRoles = roleNames.map((roleName) => saveResolvedRole(taskId, roleName, agent, workspace, store));
+    saveRoleAndRecordEvent(taskId, role, store);
+    return role.name;
+  });
 
   return `Assigned roles to ${taskId}: ${assignedRoles.join(", ")}\n`;
 }
@@ -1099,20 +1123,6 @@ function recordTaskEvent(
   store.saveEvent(taskId, createTaskEvent(store.nextEventId(taskId), type, payload, new Date()));
 }
 
-function saveResolvedRole(
-  taskId: string,
-  roleName: string,
-  agent: string,
-  workspace: string,
-  store: TaskStore
-): string {
-  const role = createResolvedRole(roleName, agent, workspace, store);
-
-  saveRoleAndRecordEvent(taskId, role, store);
-
-  return role.name;
-}
-
 function createResolvedRole(
   roleName: string,
   agent: string,
@@ -1128,26 +1138,79 @@ function createResolvedRole(
   return createRole(roleName, runner, workspace, new Date());
 }
 
+function createRoleFromGlobalOrAgent(
+  roleName: string,
+  options: {
+    agent: string | undefined;
+    fallbackAgent: string | undefined;
+    workspace: string | undefined;
+    workspaceOverride?: string;
+  },
+  store: TaskStore
+): Role {
+  if (options.agent === undefined) {
+    const globalRole = store.getGlobalRole(roleName);
+
+    if (globalRole !== null) {
+      return copyGlobalRole(roleName, store, {
+        workspaceOverride: options.workspaceOverride
+      });
+    }
+  }
+
+  const agent = options.agent ?? options.fallbackAgent;
+
+  if (agent === undefined || agent.length === 0) {
+    throw usageError(`Role ${roleName} requires an agent or a configured global role. Run taskmux role add ${roleName} --agent <agent-id>.`);
+  }
+
+  return createResolvedRole(roleName, agent, requireWorkspace(options.workspace), store);
+}
+
+function copyGlobalRole(
+  roleName: string,
+  store: TaskStore,
+  options: { name?: string; workspaceOverride?: string } = {}
+): Role {
+  const globalRole = store.getGlobalRole(roleName);
+
+  if (globalRole === null) {
+    throw roleNotFound(roleName);
+  }
+
+  const role = copyGlobalRoleToTaskRole(globalRole, new Date(), options.name ?? globalRole.name);
+
+  if (options.workspaceOverride !== undefined) {
+    if (options.workspaceOverride.length === 0) {
+      throw usageError("--workspace is required.");
+    }
+
+    return updateRole(role, { workspace: options.workspaceOverride }, new Date());
+  }
+
+  return role;
+}
+
 function saveRoleAndRecordEvent(taskId: string, role: Role, store: TaskStore): void {
   store.saveRole(taskId, role);
   recordTaskEvent(store, taskId, "role.assigned", { role: role.name, agent: role.agent });
 }
 
-function requireOwnerRoleAgent(agent: string | undefined): string {
-  if (agent !== undefined && agent.length > 0) {
-    return agent;
-  }
-
-  throw usageError("Owner role requires a runner. Run taskmux setup, then set default-agent or pass --agent <runner-id>.");
-}
-
 function throwUnsupportedAgent(agent: string, store: TaskStore): never {
   const supportedAgents = supportedRunnerIds(store.listCustomRunners());
   const supportedText = supportedAgents.length === 0
-    ? "none configured. Run taskmux setup, then add a runner."
+    ? "none configured. Run taskmux setup, then add an agent."
     : supportedAgents.join(", ");
 
   throw usageError(`Unsupported agent: ${agent}\nSupported agents: ${supportedText}`);
+}
+
+function requireWorkspace(workspace: string | undefined): string {
+  if (workspace !== undefined && workspace.length > 0) {
+    return workspace;
+  }
+
+  throw usageError("--workspace is required.");
 }
 
 function rememberTask(store: TaskStore, taskId: string, options: { current?: boolean } = {}): void {
@@ -1659,7 +1722,8 @@ export function taskUsage(): string {
   taskmux task restore <task-id>
   taskmux task open <task-id>
   taskmux task context <task-id> [--format text|json] [--include-transcripts]
-  taskmux task assign <task-id> <role> --agent <agent> --workspace <path>
+  taskmux task bind <task-id> <role> [--as <task-role>] [--workspace <path>]
+  taskmux task assign <task-id> <role> [--agent <agent>] [--workspace <path>] [--as <task-role>]
   taskmux task assign-many <task-id> --role <role> ... [--agent <agent>] [--workspace <path>]
   taskmux task role update <task-id> <role> [--agent <agent>] [--workspace <path>]
   taskmux task role rename <task-id> <role> <new-role>

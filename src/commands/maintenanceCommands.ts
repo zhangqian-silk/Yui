@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import type { TaskComment } from "../comment/comment.js";
 import { dataError, usageError } from "../errors/cliError.js";
 import type { TaskEvent } from "../event/taskEvent.js";
-import type { Role } from "../role/role.js";
+import type { GlobalRole, Role } from "../role/role.js";
 import type { CustomRunner } from "../runner/runner.js";
 import type { TaskStore, TaskmuxConfig } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
@@ -20,6 +20,7 @@ type TaskmuxSnapshot = {
   exportedAt: string;
   config: TaskmuxConfig;
   runners: CustomRunner[];
+  roles?: GlobalRole[];
   tasks: TaskSnapshot[];
 };
 
@@ -30,6 +31,7 @@ export function runExportCommand(args: string[], store: TaskStore): string {
     exportedAt: new Date().toISOString(),
     config: store.getConfig(),
     runners: store.listCustomRunners(),
+    roles: store.listGlobalRoles(),
     tasks: store.listTasks().map((task) => ({
       task,
       roles: store.listRoles(task.id).map((role) => ({
@@ -60,6 +62,10 @@ export function runImportCommand(args: string[], store: TaskStore): string {
 
   for (const runner of snapshot.runners) {
     store.saveCustomRunner(runner);
+  }
+
+  for (const role of snapshot.roles ?? []) {
+    store.saveGlobalRole(role);
   }
 
   for (const taskSnapshot of snapshot.tasks) {
@@ -204,4 +210,3 @@ function readOptionalOption(args: string[], name: string): string | undefined {
 function hasFlag(args: string[], name: string): boolean {
   return args.includes(name);
 }
-

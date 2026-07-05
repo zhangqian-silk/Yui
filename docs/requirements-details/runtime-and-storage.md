@@ -55,30 +55,48 @@ Detected status changes are written back to `role.json` with a refreshed `update
 ## Role Lifecycle Actions
 
 - Every new task receives the system `owner` role before `task create` returns.
-- `owner` uses the explicit `--agent` / `--workspace` values when present, then `default-agent` / `default-workspace`. Workspace falls back to the current directory; agent must resolve to a configured runner.
+- TaskMux also has the protected global `assistant` role for user-facing conversation through `role enter assistant`.
+- `owner` first copies a same-named global role preset when present. Otherwise it uses explicit `--agent` / `--workspace` values when present, then `default-agent` / `default-workspace`. Workspace falls back to the current directory; agent must resolve to a configured agent.
 - `task role rename` rejects attempts to rename `owner` or rename another role to `owner`.
 - `task enter <task-id> <role>` records the role as `running` after a successful tmux attach command returns.
 - `task detach <task-id> <role>` records the role as `detached` after tmux detaches clients from the task session.
 - `task stop <task-id> <role>` records the role as `exited` after sending `C-c`.
 - `task kill <task-id> <role>` records the role as `exited` after killing the role window.
 - `task restart <task-id> <role>` attempts to kill the old role window, recreates the role window from stored role metadata, attaches to it, and records the role as `running`.
-- `task role update <task-id> <role>` updates a role's stored runner contract, workspace, or both.
+- `task role update <task-id> <role>` updates a task-local role's stored agent contract, workspace, or both.
 - `task role rename <task-id> <role> <new-role>` updates the editable role name and attempts to rename the matching tmux window. Missing tmux sessions or windows do not block the local role rename.
 
-## Runner Configuration
+## Agent Configuration
 
-Runner definitions are managed with:
+Agent definitions are managed with:
 
-- `runner add <runner-id> --command <command> [--arg <arg> ...] [--env KEY=value ...]`
-- `runner list`
-- `runner show <runner-id>`
-- `runner remove <runner-id>`
+- `agent add <agent-id> --command <command> [--arg <arg> ...] [--env KEY=value ...]`
+- `agent list`
+- `agent show <agent-id>`
+- `agent remove <agent-id>`
 
-Fresh installs have no configured runners. Runner ids may contain letters, numbers, hyphens, and underscores. `codex` and `claude` are normal runner ids that users may bind to Codex CLI and Claude Code through `runner add`.
+Fresh installs have no configured agents until `setup` or `agent add` writes one. Agent ids may contain letters, numbers, hyphens, and underscores. `codex` and `claude` are normal agent ids that users may bind to Codex CLI and Claude Code.
 
-`task assign --agent <runner-id>` resolves the runner before writing `role.json`. Role records store the resolved `agent`, `command`, `args`, and `env`. Later changes to the runner definition do not mutate already assigned roles. `task role update --agent <runner-id>` resolves the current runner definition and overwrites the role's stored execution contract.
+`task assign --agent <agent-id>` resolves the agent before writing `role.json`. Role records store the resolved `agent`, `command`, `args`, and `env`. Later changes to the agent definition do not mutate already assigned roles. `task role update --agent <agent-id>` resolves the current agent definition and overwrites the task-local role's stored execution contract.
 
-`setup` prints copyable runner bindings for Codex, Claude, and custom CLIs, and states that every task includes the system `owner` role. `doctor` checks configured runner commands with `--version` and reports them as `runner:<runner-id>`.
+`setup` shows a numbered table of built-in common agent CLI candidates after checking each command locally and marking it `installed` or `missing`. Every interactive run shows the full agent and workspace prompts. Current values are marked or shown as the enter key default, so pressing enter keeps the current value when one exists or accepts the displayed default. The selected agent is stored using the selected name as both id and command with empty args and env when needed, then setup writes default agent and workspace. `doctor` checks configured agent commands with `--version` and reports them as `agent:<agent-id>` in a wrapped table.
+
+`doctor` also checks `default-agent`. Missing `default-agent` is reported as `missing` with guidance to run `taskmux setup`, and a configured default agent that does not resolve to an agent record is reported as `invalid`.
+
+## Global Role Presets
+
+Global role presets are managed with:
+
+- `role add <role> --agent <agent-id> [--workspace <path>]`
+- `role list`
+- `role show <role>`
+- `role update <role> [--agent <agent-id>] [--workspace <path>]`
+- `role remove <role>`
+- `role enter <role>`
+
+Global role records live under `roles/<role>/role.json`. Binding a global role with `task bind <task-id> <role>` or `task assign <task-id> <role>` without `--agent` creates a task-local copy under `tasks/<task-id>/roles/<role>/`. Later global role changes do not mutate already-bound task roles, and `task role update` does not mutate the global preset.
+
+The protected global role names are `assistant` and `owner`. `role remove assistant` and `role remove owner` fail with `USAGE_ERROR`. When either protected role is not configured, `role list`, `role show`, and `board` display `?` for agent and workspace. When `default-agent` resolves to a configured agent, `setup` configures both protected global roles with that agent and `default-workspace` or the current working directory.
 
 ## Defaults And Templates
 
@@ -95,7 +113,7 @@ Templated task creation assigns common roles and metadata:
 | `bug` | `priority=high`, `tag=bug` | `owner`, `rd`, `tester` |
 | `review` | `priority=medium`, `tag=review` | `owner`, `reviewer` |
 
-`task create --template <name>` may override template metadata with explicit task options. Task creation and template roles use explicit `--agent` / `--workspace`, then configured defaults. Workspace falls back to the current working directory; agent has no built-in fallback and must resolve to a configured runner.
+`task create --template <name>` may override template metadata with explicit task options. Task creation and template roles first copy same-named global role presets when present. Without a preset, they use explicit `--agent` / `--workspace`, then configured defaults. Workspace falls back to the current working directory; agent has no built-in fallback and must resolve to a configured agent.
 
 `task assign-many` accepts repeated `--role` values and uses explicit or configured default agent/workspace values.
 
@@ -125,8 +143,8 @@ CLI errors are structured for automation and shell scripts.
 | 2 | `USAGE_ERROR` | Missing task id, missing role name, missing option values, unsupported agent, empty title, or empty comment |
 | 3 | `TASK_NOT_FOUND` | The requested task record does not exist |
 | 3 | `ROLE_NOT_FOUND` | The requested role record does not exist under an existing task |
-| 3 | `RUNNER_NOT_FOUND` | The requested runner id cannot be resolved |
-| 4 | `DATA_ERROR` | Stored task, role, comment, event, or runner JSON cannot be parsed or does not match the active schema |
+| 3 | `AGENT_NOT_FOUND` | The requested agent id cannot be resolved |
+| 4 | `DATA_ERROR` | Stored task, role, comment, event, or agent JSON cannot be parsed or does not match the active schema |
 | 5 | `RUNTIME_ERROR` | Unexpected runtime failure |
 
 Non-interactive commands write errors to stderr as `<ERROR_CODE>: <message>` and exit with the mapped code. The interactive task shell prints structured command errors and keeps the shell running.
@@ -145,7 +163,7 @@ The TaskMux data directory also contains a global storage schema manifest:
 }
 ```
 
-Normal task and runner commands check the manifest before reading domain records. Missing manifests are initialized to the current storage schema version. Older manifests stop the command with `DATA_ERROR: Storage schema upgrade required: <current> -> <latest>. Run \`taskmux migrate\`.` Newer or invalid manifests also fail with `DATA_ERROR`.
+Normal task, agent, and role commands check the manifest before reading domain records. Missing manifests are initialized to the current storage schema version. Older manifests stop the command with `DATA_ERROR: Storage schema upgrade required: <current> -> <latest>. Run \`taskmux migrate\`.` Newer or invalid manifests also fail with `DATA_ERROR`.
 
 `taskmux backup` creates a timestamped raw copy of the current TaskMux data under `backups/backup-<timestamp>/`. Backup creation copies current storage entries and excludes `backups/` so backup chains do not recursively include previous backups.
 
@@ -153,7 +171,7 @@ Normal task and runner commands check the manifest before reading domain records
 
 `taskmux migrate --dry-run` reports the migration plan without creating backups, running migration steps, or writing `schema.json`.
 
-`taskmux export --output <file>` writes a JSON snapshot containing config, custom runners, active tasks, roles, comments, events, and stored transcripts. `taskmux import <file>` restores that snapshot into the configured TaskMux home. Importing into non-empty storage overwrites tasks and roles with the same ids and appends imported comments and events.
+`taskmux export --output <file>` writes a JSON snapshot containing config, custom agents, global role presets, active tasks, task roles, comments, events, and stored transcripts. `taskmux import <file>` restores that snapshot into the configured TaskMux home. Importing into non-empty storage overwrites tasks and roles with the same ids and appends imported comments and events.
 
 `taskmux prune --trash` removes deleted task directories under `trash/tasks`. `taskmux prune --backups --keep-backups <count>` removes older backups after keeping the newest backup directories.
 
@@ -283,7 +301,7 @@ Event record:
 }
 ```
 
-Custom runner record:
+Custom agent record:
 
 ```json
 {
