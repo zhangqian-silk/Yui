@@ -74,7 +74,7 @@ function parseConfigKey(value: string | undefined): ConfigKey {
 function configUsage(): string {
   return `Config commands:
   taskmux config show
-  taskmux config set default-agent <runner-id>
+  taskmux config set default-agent <agent-id>
   taskmux config set default-workspace <path>
   taskmux config unset default-agent
   taskmux config unset default-workspace

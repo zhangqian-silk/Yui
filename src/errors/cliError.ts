@@ -2,6 +2,7 @@ export type CliErrorCode =
   | "USAGE_ERROR"
   | "TASK_NOT_FOUND"
   | "ROLE_NOT_FOUND"
+  | "AGENT_NOT_FOUND"
   | "RUNNER_NOT_FOUND"
   | "DATA_ERROR"
   | "RUNTIME_ERROR";
@@ -10,6 +11,7 @@ const EXIT_CODES: Record<CliErrorCode, number> = {
   USAGE_ERROR: 2,
   TASK_NOT_FOUND: 3,
   ROLE_NOT_FOUND: 3,
+  AGENT_NOT_FOUND: 3,
   RUNNER_NOT_FOUND: 3,
   DATA_ERROR: 4,
   RUNTIME_ERROR: 5
@@ -39,6 +41,10 @@ export function roleNotFound(name: string): CliError {
 
 export function runnerNotFound(id: string): CliError {
   return new CliError("RUNNER_NOT_FOUND", `Runner not found: ${id}`);
+}
+
+export function agentNotFound(id: string): CliError {
+  return new CliError("AGENT_NOT_FOUND", `Agent not found: ${id}`);
 }
 
 export function dataError(message: string): CliError {

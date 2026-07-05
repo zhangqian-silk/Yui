@@ -1,13 +1,17 @@
 #!/usr/bin/env node
 
 import { readFileSync } from "node:fs";
+import { runAgentCommand } from "./commands/agentCommands.js";
+import { runBoardCommand } from "./commands/boardCommands.js";
 import { runConfigCommand } from "./commands/configCommands.js";
+import { runGlobalRoleCommand } from "./commands/globalRoleCommands.js";
 import { runExportCommand, runImportCommand, runPruneCommand } from "./commands/maintenanceCommands.js";
 import { runTaskCommand } from "./commands/taskCommands.js";
 import { runBackupCommand, runMigrateCommand } from "./commands/migrationCommands.js";
 import { runRunnerCommand } from "./commands/runnerCommands.js";
-import { runDoctor } from "./doctor/doctor.js";
-import { CliError, usageError } from "./errors/cliError.js";
+import { runDashboard } from "./dashboard/dashboard.js";
+import { getDoctorChecks, renderDoctor, runDoctor } from "./doctor/doctor.js";
+import { CliError, dataError, usageError } from "./errors/cliError.js";
 import { runSetupCommand } from "./setup/setupCommand.js";
 import { runTaskShell } from "./shell/taskShell.js";
 import { FileTaskStore, resolveTaskmuxHome } from "./storage/taskStore.js";
@@ -22,6 +26,7 @@ const usage = `TaskMux ${VERSION}
 Local task board for native agent CLI sessions backed by tmux.
 
 Usage:
+  taskmux
   taskmux --help
   taskmux --version
   taskmux completion bash|zsh|fish
@@ -32,13 +37,20 @@ Usage:
   taskmux export --output <file>
   taskmux import <file>
   taskmux prune [--trash] [--backups] [--keep-backups <count>]
+  taskmux board
   taskmux config show
-  taskmux config set default-agent <runner-id>
+  taskmux config set default-agent <agent-id>
   taskmux config set default-workspace <path>
-  taskmux runner add <runner-id> --command <command> [--arg <arg> ...] [--env KEY=value ...]
-  taskmux runner list
-  taskmux runner show <runner-id>
-  taskmux runner remove <runner-id>
+  taskmux agent add <agent-id> --command <command> [--arg <arg> ...] [--env KEY=value ...]
+  taskmux agent list
+  taskmux agent show <agent-id>
+  taskmux agent remove <agent-id>
+  taskmux role add <role> --agent <agent-id> [--workspace <path>]
+  taskmux role list
+  taskmux role show <role>
+  taskmux role update <role> [--agent <agent-id>] [--workspace <path>]
+  taskmux role remove <role>
+  taskmux role enter <role>
   taskmux task create <title> [--template feature|bug|review] [--agent <agent>] [--workspace <path>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--owner <owner>] [--due YYYY-MM-DD]
   taskmux task update <task-id> [--title <title>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--owner <owner>] [--due YYYY-MM-DD] [--clear-description] [--clear-priority] [--clear-tags] [--clear-owner] [--clear-due]
   taskmux task list [--status <status>] [--owner <owner>] [--tag <tag>] [--priority <priority>] [--search <text>]
@@ -78,7 +90,7 @@ Usage:
   taskmux task comments <task-id>
   taskmux task events <task-id>
 
-Role, tmux, and runner commands are defined in docs/requirements.md.
+Role, tmux, and agent commands are defined in docs/requirements.md.
 `;
 
 const args = process.argv.slice(2);
@@ -107,6 +119,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args.length === 0) {
+    await runDefaultDashboard(rootDir);
+    return;
+  }
+
   if (args[0] === "completion") {
     console.log(renderCompletion(args[1]).trimEnd());
     return;
@@ -122,7 +139,14 @@ async function main(): Promise<void> {
   }
 
   if (args[0] === "setup") {
-    console.log(runSetupCommand(args.slice(1), process.env, new NodeCommandRunner()).trimEnd());
+    ensureStorageSchema(rootDir);
+    const store = new FileTaskStore(rootDir);
+    const output = await runSetupCommand(args.slice(1), process.env, new NodeCommandRunner(), store, {
+      input: process.stdin,
+      output: process.stdout,
+      forceInteractive: process.env.TASKMUX_SETUP_INTERACTIVE === "1"
+    });
+    console.log(output.trimEnd());
     return;
   }
 
@@ -163,6 +187,27 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "board") {
+    ensureStorageSchema(rootDir);
+    const store = new FileTaskStore(rootDir);
+    console.log(runBoardCommand(store).trimEnd());
+    return;
+  }
+
+  if (args[0] === "agent") {
+    ensureStorageSchema(rootDir);
+    const store = new FileTaskStore(rootDir);
+    console.log(runAgentCommand(args.slice(1), store).trimEnd());
+    return;
+  }
+
+  if (args[0] === "role") {
+    ensureStorageSchema(rootDir);
+    const store = new FileTaskStore(rootDir);
+    console.log(runGlobalRoleCommand(args.slice(1), store).trimEnd());
+    return;
+  }
+
   if (args[0] === "runner") {
     ensureStorageSchema(rootDir);
     const store = new FileTaskStore(rootDir);
@@ -191,6 +236,27 @@ async function main(): Promise<void> {
   }
 
   console.log(usage);
+}
+
+async function runDefaultDashboard(rootDir: string): Promise<void> {
+  const commandRunner = new NodeCommandRunner();
+  const storageSchema = inspectStorageSchema(rootDir);
+  const storeForDoctor = new FileTaskStore(rootDir);
+  const customRunners = canReadStore(storageSchema) ? listCustomRunnersForDoctor(storeForDoctor) : [];
+  const checks = getDoctorChecks(process.env, commandRunner, customRunners, storageSchema);
+  const failedChecks = checks.filter((check) => check.status !== "ok");
+
+  process.stdout.write(renderDoctor(checks));
+
+  if (failedChecks.length > 0) {
+    throw dataError(`Doctor checks failed: ${failedChecks.map((check) => `${check.name}=${check.status}`).join(", ")}`);
+  }
+
+  ensureStorageSchema(rootDir);
+  const store = new FileTaskStore(rootDir);
+  const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", commandRunner);
+
+  await runDashboard(store, tmux);
 }
 
 function readPackageVersion(): string {
@@ -223,7 +289,7 @@ function listCustomRunnersForDoctor(store: FileTaskStore) {
 
 function renderCompletion(shell: string | undefined): string {
   const commands = [
-    "doctor", "setup", "backup", "migrate", "export", "import", "prune", "config", "runner", "task", "completion",
+    "doctor", "setup", "backup", "migrate", "export", "import", "prune", "board", "config", "agent", "role", "task", "completion",
     "create", "update", "list", "board", "show", "start", "done", "archive", "reopen", "delete", "restore",
     "shell", "context", "assign", "assign-many", "role", "roles", "enter", "tail", "detail", "status",
     "refresh", "transcript", "activity", "timeline", "detach", "stop", "kill", "restart", "cleanup",

@@ -105,6 +105,7 @@ function toTaskCommand(taskId: string, name: string, args: string[]): string[] {
     case "comment":
       return [normalizedName, taskId, ...args];
     case "assign":
+    case "bind":
     case "assign-many":
       return [normalizedName, taskId, ...args];
     case "transcript":
@@ -185,6 +186,7 @@ function shellHelp(): string {
   role rename <role> <new-role>
   comment <body>
   assign <role> --agent <agent> --workspace <path>
+  bind <role> [--as <task-role>] [--workspace <path>]
   assign-many --role <role> ... [--agent <agent>] [--workspace <path>]
   enter <role>
   tail <role>

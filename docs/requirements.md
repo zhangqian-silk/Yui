@@ -19,7 +19,7 @@ TaskMux does not provide team collaboration, remote synchronization, identity ma
 | --- | --- |
 | Task | A local unit of work managed by TaskMux |
 | Role | A named execution responsibility inside a task, such as `rd`, `reviewer`, or `tester` |
-| Runner | A native CLI executable bound to a role, such as Codex CLI or Claude Code |
+| Agent | A native CLI executable bound to a role, such as Codex CLI or Claude Code |
 | Workspace | The filesystem directory where a role executes |
 | Tmux Session | The persistent terminal session backing one TaskMux task |
 | Tmux Window | The persistent terminal window backing one role |
@@ -33,6 +33,7 @@ TaskMux uses tmux as the only role execution substrate in the first version.
 - One task maps to one tmux session.
 - One role maps to one tmux window.
 - One role window runs one native agent CLI process.
+- TaskMux defines two protected system roles: global `assistant` for user-facing conversation and task-local `owner` for scheduling task roles.
 - Every task includes the system `owner` role. `owner` is created during task creation and cannot be renamed.
 
 Example:
@@ -47,13 +48,19 @@ reviewer -> tmux window taskmux-task-42:reviewer
 
 TaskMux currently provides:
 
-- `taskmux runner add <runner-id> --command <command> [--arg <arg> ...] [--env KEY=value ...]` creates or replaces a custom runner definition
-- `taskmux runner list` lists configured runner definitions
-- `taskmux runner show <runner-id>` shows one runner definition
-- `taskmux runner remove <runner-id>` removes a custom runner definition
+- `taskmux agent add <agent-id> --command <command> [--arg <arg> ...] [--env KEY=value ...]` creates or replaces a custom agent definition
+- `taskmux agent list` lists configured agent definitions
+- `taskmux agent show <agent-id>` shows one agent definition
+- `taskmux agent remove <agent-id>` removes a custom agent definition
+- `taskmux role add <role> --agent <agent-id> [--workspace <path>]` creates or replaces a global role preset
+- `taskmux role list` lists global role presets
+- `taskmux role show <role>` shows one global role preset
+- `taskmux role update <role> [--agent <agent-id>] [--workspace <path>]` updates a global role preset
+- `taskmux role remove <role>` removes a global role preset
+- `taskmux board` shows configured agents and global role presets
 - `taskmux completion bash|zsh|fish` prints shell completion for the selected shell
 - `taskmux config show` shows local defaults
-- `taskmux config set default-agent <runner-id>` stores the default runner id
+- `taskmux config set default-agent <agent-id>` stores the default agent id
 - `taskmux config set default-workspace <path>` stores the default role workspace
 - `taskmux config unset default-agent|default-workspace` removes one default
 - `taskmux task create <title> [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--owner <owner>] [--due YYYY-MM-DD]` creates a local task with status `open` and optional task board metadata
@@ -76,7 +83,8 @@ TaskMux currently provides:
 - `taskmux task shell <task-id>` opens an interactive task control shell
 - `taskmux task assign <task-id> <role> --agent <agent> --workspace <path>` assigns a role to an existing task with status `idle`
 - `taskmux task assign-many <task-id> --role <role> ... [--agent <agent>] [--workspace <path>]` assigns multiple roles at once
-- `taskmux task role update <task-id> <role> [--agent <agent>] [--workspace <path>]` updates a role's runner contract or workspace
+- `taskmux task bind <task-id> <role> [--as <task-role>] [--workspace <path>]` copies a global role preset into a task
+- `taskmux task role update <task-id> <role> [--agent <agent>] [--workspace <path>]` updates a task-local role's agent contract or workspace
 - `taskmux task role rename <task-id> <role> <new-role>` renames a role and attempts to rename the matching tmux window
 - `taskmux task roles <task-id>` lists roles assigned to a task
 - `taskmux task enter <task-id> <role>` creates or reuses the task tmux session and role tmux window, then attaches to the role
@@ -96,8 +104,8 @@ TaskMux currently provides:
 - `taskmux task comment <task-id> <body>` appends a comment to a task
 - `taskmux task comments <task-id>` lists comments for a task
 - `taskmux task events <task-id>` lists the local event history for a task
-- `taskmux doctor` checks Node.js, tmux, configured runners, TaskMux home, storage schema, storage permissions, and stored record health
-- `taskmux setup [tmux] [--yes]` checks installable system dependencies, installs tmux through a supported package manager only when `--yes` is provided, and prints owner-role CLI binding guidance
+- `taskmux doctor` checks Node.js, tmux, configured agents, TaskMux home, storage schema, storage permissions, and stored record health, and renders check results as a wrapped table
+- `taskmux setup [tmux] [--yes]` interactively configures required local defaults on every run, shows numbered built-in common agent CLI candidates with current/default values and local `installed`/`missing` prechecks, and installs tmux through a supported package manager only when `--yes` is provided
 - `taskmux backup` creates a timestamped raw storage backup
 - `taskmux migrate` upgrades older local storage schemas after creating a backup
 - `taskmux migrate --dry-run` reports migration work without writing storage
@@ -143,29 +151,48 @@ Role status is stored in `role.json` and may be refreshed from tmux by `task sta
 - `running`: task tmux session contains the role window
 - `detached`: TaskMux detached clients from the task session while leaving the role process available
 - `exited`: role window has been stopped, killed, or is absent while the task session can be inspected
-- `failed`: reserved for runner failures that TaskMux can classify
+- `failed`: reserved for agent failures that TaskMux can classify
 
 When tmux cannot be inspected, TaskMux keeps the stored status instead of overwriting it with an uncertain value.
 
-## Runner Semantics
+## Agent Semantics
 
-TaskMux supports user-configured runner ids.
+TaskMux supports user-configured agent ids.
 
-- Runner definitions are stored locally and are task-independent.
-- A runner defines a command, ordered args, and environment variables.
-- Fresh installs have no default runner definitions. `codex` and `claude` are ordinary runner ids users may bind with `runner add`.
-- `task assign --agent <runner-id>` resolves the runner id before writing role state.
-- `task role update --agent <runner-id>` resolves the runner id and overwrites that role's stored command, args, env, and agent id.
-- A role stores the resolved runner command, args, and env so later `enter` and `restart` use the same execution contract even if the runner definition changes.
+- Agent definitions are stored locally and are task-independent.
+- An agent defines a command, ordered args, and environment variables.
+- Fresh installs have no stored agent definitions until `setup` or `agent add` writes one.
+- `setup` exposes built-in common CLI candidates for selection; these candidates are prompt metadata, not preinstalled records.
+- `setup` prechecks each candidate locally, shows `installed` or `missing`, and lets the user select by number.
+- Every interactive `setup` run shows the agent and workspace prompts. Pressing enter keeps the current value when one exists, or accepts the displayed default.
+- A setup-selected agent only needs its name; TaskMux stores that name as both agent id and command with empty args and env.
+- `task assign --agent <agent-id>` resolves the agent id before writing role state.
+- `task role update --agent <agent-id>` resolves the agent id and overwrites that task-local role's stored command, args, env, and agent id.
+- A task-local role stores the resolved agent command, args, and env so later `enter` and `restart` use the same execution contract even if the agent definition changes.
+
+## Global Role Presets
+
+Global roles are user-configured task role presets.
+
+- `role add <role> --agent <agent-id> [--workspace <path>]` stores a global role preset.
+- `role list/show/update/remove` manages global presets.
+- `role enter assistant` starts the configured global assistant agent in its workspace.
+- `task bind <task-id> <role>` copies a global role preset into a task.
+- `task assign <task-id> <role>` without `--agent` also copies the global preset.
+- Once copied, a task-local role is independent from the global preset.
+- Later `role update` changes only the global preset; later `task role update` changes only the task-local copy.
+- `assistant` and `owner` are protected system roles and cannot be removed.
+- When protected system roles are not configured, role and board views show `?` for their agent and workspace.
 
 ## Template And Defaults
 
 TaskMux stores local defaults in `config.json` under the TaskMux home.
 
-- `default-agent` is used when task creation, a template, or multi-role assignment does not specify `--agent`.
+- `default-agent` is required for a healthy setup and is checked by `doctor`; it is used as a fallback when task creation, a template, or multi-role assignment cannot copy a same-named global role preset and does not specify `--agent`.
 - `default-workspace` is used when task creation, a template, or multi-role assignment does not specify `--workspace`.
 - `currentTaskId` stores the task selected by `task current <task-id>`.
 - `lastTaskId` stores the most recently touched task from creation, clone, show, open, context, or explicit current selection.
+- `setup` fills `default-workspace` and configures the protected `assistant` and `owner` global role presets from `default-agent` when it resolves to a configured agent.
 - `task create` creates the system `owner` role for every task.
 - `task create --template feature` creates `owner`, `rd`, and `reviewer` roles and adds the `feature` tag with medium priority unless overridden.
 - `task create --template bug` creates `owner`, `rd`, and `tester` roles and adds the `bug` tag with high priority unless overridden.
@@ -205,7 +232,7 @@ Suggested layout:
 
 Task, role, comment, and event records are versioned with `schemaVersion: 1`. TaskMux validates loaded records before using them. Invalid JSON, missing required fields, unsupported schema versions, or invalid status values must fail with `DATA_ERROR` rather than being treated as empty state.
 
-The data directory has a global storage schema manifest at `schema.json`. Normal task and runner commands run a storage preflight on startup:
+The data directory has a global storage schema manifest at `schema.json`. Normal task, agent, and role commands run a storage preflight on startup:
 
 - Missing manifests are initialized to the current storage schema version.
 - Current manifests allow the command to continue.
@@ -218,7 +245,7 @@ The data directory has a global storage schema manifest at `schema.json`. Normal
 
 `taskmux migrate --dry-run` reports whether schema initialization or upgrade would happen without writing `schema.json` or creating a backup.
 
-`taskmux export --output <file>` writes a JSON snapshot with config, custom runners, active tasks, roles, comments, events, and stored transcripts. `taskmux import <file>` restores that snapshot into the configured TaskMux home.
+`taskmux export --output <file>` writes a JSON snapshot with config, custom agents, global role presets, active tasks, task roles, comments, events, and stored transcripts. `taskmux import <file>` restores that snapshot into the configured TaskMux home.
 
 `taskmux prune --trash` removes deleted task directories under `trash/tasks`. `taskmux prune --backups --keep-backups <count>` removes older backup directories after keeping the newest entries.
 
@@ -236,7 +263,7 @@ Task priorities are `low`, `medium`, `high`, and `urgent`. Due dates use `YYYY-M
 
 Task ids use the stable `task-<number>` format in the first version. The next id is derived from existing local task directories.
 
-Custom runner records live under `runners/<runner-id>/runner.json`.
+Custom agent records currently live under `runners/<agent-id>/runner.json` for compatibility with existing local data.
 
 Role runtime records live under `tasks/<task-id>/roles/<role>/role.json`. Role names are task-scoped and resolved from `info.json`. Reassigning an existing role overwrites that role's current agent, command, args, env, and workspace while preserving the task identity. `task role update` changes the same runtime contract without changing the role name. `task role rename` updates `info.json` and attempts `tmux rename-window` for the current role target; tmux rename failures do not block local metadata updates when the window is absent.
 
@@ -259,7 +286,7 @@ TaskMux commands use stable process exit codes for scriptable failure handling.
 | Exit Code | Error Code | Scope |
 | --- | --- | --- |
 | 2 | `USAGE_ERROR` | Missing arguments, invalid options, unsupported agents, or empty user input |
-| 3 | `TASK_NOT_FOUND` / `ROLE_NOT_FOUND` / `RUNNER_NOT_FOUND` | Missing task, role, or runner records |
+| 3 | `TASK_NOT_FOUND` / `ROLE_NOT_FOUND` / `AGENT_NOT_FOUND` | Missing task, role, or agent records |
 | 4 | `DATA_ERROR` | Invalid stored JSON, unsupported schema version, or invalid stored fields |
 | 5 | `RUNTIME_ERROR` | Unexpected runtime failures or unavailable execution plumbing |
 
@@ -272,4 +299,4 @@ Errors are printed to stderr as `<ERROR_CODE>: <message>`.
 - Web UI
 - Non-tmux execution fallback
 - Forced PTY input interception
-- Guaranteed custom slash commands inside every runner
+- Guaranteed custom slash commands inside every agent
