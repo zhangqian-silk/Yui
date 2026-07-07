@@ -12,11 +12,11 @@ export function createStorageBackup(rootDir: string, now = new Date()): StorageB
   const id = `backup-${createdAt.replaceAll(":", "-").replaceAll(".", "-")}`;
   const backupRoot = join(rootDir, "backups");
   const backupPath = join(backupRoot, id);
+  const entries = readdirSync(rootDir, { withFileTypes: true });
 
-  mkdirSync(rootDir, { recursive: true });
   mkdirSync(backupPath, { recursive: true });
 
-  for (const entry of readdirSync(rootDir, { withFileTypes: true })) {
+  for (const entry of entries) {
     if (entry.name === "backups") {
       continue;
     }

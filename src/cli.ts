@@ -12,10 +12,14 @@ import { runRunnerCommand } from "./commands/runnerCommands.js";
 import { runDashboard } from "./dashboard/dashboard.js";
 import { getDoctorChecks, renderDoctor, runDoctor } from "./doctor/doctor.js";
 import { CliError, dataError, usageError } from "./errors/cliError.js";
-import { runSetupCommand } from "./setup/setupCommand.js";
+import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
 import { runTaskShell } from "./shell/taskShell.js";
 import { FileTaskStore, resolveTaskmuxHome } from "./storage/taskStore.js";
-import { ensureStorageSchema, inspectStorageSchema, type StorageSchemaState } from "./storage/storageSchema.js";
+import {
+  inspectStorageSchema,
+  requireStorageSchema,
+  type StorageSchemaState
+} from "./storage/storageSchema.js";
 import { NodeCommandRunner } from "./tmux/commandRunner.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
 
@@ -31,12 +35,13 @@ Usage:
   taskmux --version
   taskmux completion bash|zsh|fish
   taskmux doctor
-  taskmux setup [tmux] [--yes]
+  taskmux setup [tmux]
   taskmux backup
   taskmux migrate [--dry-run]
   taskmux export --output <file>
   taskmux import <file>
   taskmux prune [--trash] [--backups] [--keep-backups <count>]
+  taskmux assistant
   taskmux board
   taskmux config show
   taskmux config set default-agent <agent-id>
@@ -51,10 +56,10 @@ Usage:
   taskmux role update <role> [--agent <agent-id>] [--workspace <path>]
   taskmux role remove <role>
   taskmux role enter <role>
-  taskmux task create <title> [--template feature|bug|review] [--agent <agent>] [--workspace <path>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--owner <owner>] [--due YYYY-MM-DD]
-  taskmux task update <task-id> [--title <title>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--owner <owner>] [--due YYYY-MM-DD] [--clear-description] [--clear-priority] [--clear-tags] [--clear-owner] [--clear-due]
-  taskmux task list [--status <status>] [--owner <owner>] [--tag <tag>] [--priority <priority>] [--search <text>]
-  taskmux task board [--status <status>] [--owner <owner>] [--tag <tag>] [--priority <priority>] [--search <text>] [--with-roles]
+  taskmux task create <title> [--template feature|bug|review] [--agent <agent>] [--workspace <path>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD]
+  taskmux task update <task-id> [--title <title>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD] [--clear-description] [--clear-priority] [--clear-tags] [--clear-due]
+  taskmux task list [--status <status>] [--tag <tag>] [--priority <priority>] [--search <text>]
+  taskmux task board [--status <status>] [--tag <tag>] [--priority <priority>] [--search <text>] [--with-roles]
   taskmux task show <task-id>
   taskmux task current [<task-id>]
   taskmux task last
@@ -139,13 +144,14 @@ async function main(): Promise<void> {
   }
 
   if (args[0] === "setup") {
-    ensureStorageSchema(rootDir);
-    const store = new FileTaskStore(rootDir);
-    const output = await runSetupCommand(args.slice(1), process.env, new NodeCommandRunner(), store, {
+    const setupIo = {
       input: process.stdin,
       output: process.stdout,
       forceInteractive: process.env.TASKMUX_SETUP_INTERACTIVE === "1"
-    });
+    };
+
+    validateSetupInvocation(args.slice(1), setupIo);
+    const output = await runSetupCommand(args.slice(1), process.env, new NodeCommandRunner(), setupIo);
     console.log(output.trimEnd());
     return;
   }
@@ -156,67 +162,79 @@ async function main(): Promise<void> {
   }
 
   if (args[0] === "backup") {
+    requireStorageSchema(rootDir);
     console.log(runBackupCommand(rootDir).trimEnd());
     return;
   }
 
   if (args[0] === "config") {
-    ensureStorageSchema(rootDir);
+    requireStorageSchema(rootDir);
     const store = new FileTaskStore(rootDir);
-    console.log(runConfigCommand(args.slice(1), store).trimEnd());
+    console.log(runConfigCommand(args.slice(1), store, process.env).trimEnd());
     return;
   }
 
   if (args[0] === "export") {
-    ensureStorageSchema(rootDir);
+    requireStorageSchema(rootDir);
     const store = new FileTaskStore(rootDir);
     console.log(runExportCommand(args.slice(1), store).trimEnd());
     return;
   }
 
   if (args[0] === "import") {
-    ensureStorageSchema(rootDir);
+    requireStorageSchema(rootDir);
     const store = new FileTaskStore(rootDir);
     console.log(runImportCommand(args.slice(1), store).trimEnd());
     return;
   }
 
   if (args[0] === "prune") {
-    ensureStorageSchema(rootDir);
+    requireStorageSchema(rootDir);
     console.log(runPruneCommand(args.slice(1), rootDir).trimEnd());
     return;
   }
 
+  if (args[0] === "assistant") {
+    if (args.length > 1) {
+      throw usageError("Assistant usage: taskmux assistant");
+    }
+
+    requireStorageSchema(rootDir);
+    const store = new FileTaskStore(rootDir);
+    console.log(runGlobalRoleCommand(["enter", "assistant"], store, { taskmuxHome: rootDir }).trimEnd());
+    return;
+  }
+
   if (args[0] === "board") {
-    ensureStorageSchema(rootDir);
+    requireStorageSchema(rootDir);
     const store = new FileTaskStore(rootDir);
     console.log(runBoardCommand(store).trimEnd());
     return;
   }
 
   if (args[0] === "agent") {
-    ensureStorageSchema(rootDir);
+    requireStorageSchema(rootDir);
     const store = new FileTaskStore(rootDir);
     console.log(runAgentCommand(args.slice(1), store).trimEnd());
     return;
   }
 
   if (args[0] === "role") {
-    ensureStorageSchema(rootDir);
+    requireStorageSchema(rootDir);
     const store = new FileTaskStore(rootDir);
-    console.log(runGlobalRoleCommand(args.slice(1), store).trimEnd());
+    console.log(runGlobalRoleCommand(args.slice(1), store, { taskmuxHome: rootDir }).trimEnd());
     return;
   }
 
   if (args[0] === "runner") {
-    ensureStorageSchema(rootDir);
+    requireStorageSchema(rootDir);
     const store = new FileTaskStore(rootDir);
     console.log(runRunnerCommand(args.slice(1), store).trimEnd());
     return;
   }
 
   if (args[0] === "task") {
-    ensureStorageSchema(rootDir);
+    requireStorageSchema(rootDir);
     const store = new FileTaskStore(rootDir);
     const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandRunner());
 
@@ -252,7 +270,7 @@ async function runDefaultDashboard(rootDir: string): Promise<void> {
     throw dataError(`Doctor checks failed: ${failedChecks.map((check) => `${check.name}=${check.status}`).join(", ")}`);
   }
 
-  ensureStorageSchema(rootDir);
+  requireStorageSchema(rootDir);
   const store = new FileTaskStore(rootDir);
   const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", commandRunner);
 
@@ -276,7 +294,7 @@ function readPackageVersion(): string {
 }
 
 function canReadStore(state: StorageSchemaState): boolean {
-  return state.status === "current" || state.status === "uninitialized";
+  return state.status === "current";
 }
 
 function listCustomRunnersForDoctor(store: FileTaskStore) {
@@ -289,7 +307,7 @@ function listCustomRunnersForDoctor(store: FileTaskStore) {
 
 function renderCompletion(shell: string | undefined): string {
   const commands = [
-    "doctor", "setup", "backup", "migrate", "export", "import", "prune", "board", "config", "agent", "role", "task", "completion",
+    "doctor", "setup", "backup", "migrate", "export", "import", "prune", "assistant", "board", "config", "agent", "role", "task", "completion",
     "create", "update", "list", "board", "show", "start", "done", "archive", "reopen", "delete", "restore",
     "shell", "context", "assign", "assign-many", "role", "roles", "enter", "tail", "detail", "status",
     "refresh", "transcript", "activity", "timeline", "detach", "stop", "kill", "restart", "cleanup",

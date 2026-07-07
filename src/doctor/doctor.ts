@@ -1,5 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { accessSync, constants } from "node:fs";
 import { renderTable } from "../output/table.js";
 import type { CustomRunner } from "../runner/runner.js";
 import { resolveRunner } from "../runner/runnerRegistry.js";
@@ -28,11 +27,7 @@ export function getDoctorChecks(
     ...customRunners.map((customRunner) =>
       checkExecutable(`agent:${customRunner.id}`, customRunner.command, ["--version"], runner)
     ),
-    {
-      name: "taskmux home",
-      status: "ok",
-      detail: resolveTaskmuxHome(env)
-    },
+    checkTaskmuxHome(resolveTaskmuxHome(env)),
     checkDefaultAgent(resolveTaskmuxHome(env), storageSchema, customRunners),
     checkStorageSchema(storageSchema),
     checkStoragePermissions(resolveTaskmuxHome(env)),
@@ -150,13 +145,39 @@ function firstLine(output: string): string {
   return output.trim().split("\n")[0] ?? "";
 }
 
+function checkTaskmuxHome(rootDir: string): DoctorCheck {
+  try {
+    accessSync(rootDir, constants.R_OK);
+
+    return {
+      name: "taskmux home",
+      status: "ok",
+      detail: rootDir
+    };
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return {
+        name: "taskmux home",
+        status: "missing",
+        detail: "run taskmux setup"
+      };
+    }
+
+    return {
+      name: "taskmux home",
+      status: "invalid",
+      detail: errorMessage(error)
+    };
+  }
+}
+
 function checkStorageSchema(state: StorageSchemaState): DoctorCheck {
   switch (state.status) {
     case "uninitialized":
       return {
         name: "storage schema",
-        status: "ok",
-        detail: `latest=${state.latestVersion}`
+        status: "missing",
+        detail: "run taskmux setup"
       };
     case "current":
       return {
@@ -186,12 +207,8 @@ function checkStorageSchema(state: StorageSchemaState): DoctorCheck {
 }
 
 function checkStoragePermissions(rootDir: string): DoctorCheck {
-  const probePath = join(rootDir, ".taskmux-doctor-write-check");
-
   try {
-    mkdirSync(rootDir, { recursive: true });
-    writeFileSync(probePath, "ok\n");
-    rmSync(probePath);
+    accessSync(rootDir, constants.R_OK | constants.W_OK);
 
     return {
       name: "storage permissions",
@@ -199,6 +216,14 @@ function checkStoragePermissions(rootDir: string): DoctorCheck {
       detail: "read-write"
     };
   } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return {
+        name: "storage permissions",
+        status: "missing",
+        detail: "run taskmux setup"
+      };
+    }
+
     return {
       name: "storage permissions",
       status: "invalid",
@@ -208,6 +233,14 @@ function checkStoragePermissions(rootDir: string): DoctorCheck {
 }
 
 function checkStorageRecords(rootDir: string, state: StorageSchemaState): DoctorCheck {
+  if (state.status === "uninitialized") {
+    return {
+      name: "storage records",
+      status: "missing",
+      detail: "run taskmux setup"
+    };
+  }
+
   if (state.status === "upgrade-required") {
     return {
       name: "storage records",

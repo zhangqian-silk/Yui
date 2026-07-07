@@ -33,8 +33,8 @@ TaskMux uses tmux as the only role execution substrate in the first version.
 - One task maps to one tmux session.
 - One role maps to one tmux window.
 - One role window runs one native agent CLI process.
-- TaskMux defines two protected system roles: global `assistant` for user-facing conversation and task-local `owner` for scheduling task roles.
-- Every task includes the system `owner` role. `owner` is created during task creation and cannot be renamed.
+- TaskMux defines two protected system roles: global `assistant` for user-facing conversation and task-local `leader` for coordinating task roles.
+- Every task includes the system `leader` role. `leader` is created during task creation and cannot be renamed.
 
 Example:
 
@@ -58,16 +58,17 @@ TaskMux currently provides:
 - `taskmux role update <role> [--agent <agent-id>] [--workspace <path>]` updates a global role preset
 - `taskmux role remove <role>` removes a global role preset
 - `taskmux board` shows configured agents and global role presets
+- `taskmux assistant` enters the protected global `assistant` role with TaskMux CLI operating context
 - `taskmux completion bash|zsh|fish` prints shell completion for the selected shell
 - `taskmux config show` shows local defaults
 - `taskmux config set default-agent <agent-id>` stores the default agent id
 - `taskmux config set default-workspace <path>` stores the default role workspace
 - `taskmux config unset default-agent|default-workspace` removes one default
-- `taskmux task create <title> [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--owner <owner>] [--due YYYY-MM-DD]` creates a local task with status `open` and optional task board metadata
+- `taskmux task create <title> [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD]` creates a local task with status `open` and optional task board metadata
 - `taskmux task create <title> --template feature|bug|review [--agent <agent>] [--workspace <path>]` creates a task from a built-in template and assigns default roles
-- `taskmux task update <task-id> [--title <title>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--owner <owner>] [--due YYYY-MM-DD] [--clear-description] [--clear-priority] [--clear-tags] [--clear-owner] [--clear-due]` updates or clears task board metadata
-- `taskmux task list [--status <status>] [--owner <owner>] [--tag <tag>] [--priority <priority>] [--search <text>]` lists local tasks in id order with optional filters
-- `taskmux task board [--status <status>] [--owner <owner>] [--tag <tag>] [--priority <priority>] [--search <text>] [--with-roles]` renders local tasks grouped by lifecycle status with optional filters and role status counts
+- `taskmux task update <task-id> [--title <title>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD] [--clear-description] [--clear-priority] [--clear-tags] [--clear-due]` updates or clears task board metadata
+- `taskmux task list [--status <status>] [--tag <tag>] [--priority <priority>] [--search <text>]` lists local tasks in id order with optional filters
+- `taskmux task board [--status <status>] [--tag <tag>] [--priority <priority>] [--search <text>] [--with-roles]` renders local tasks grouped by lifecycle status with optional filters and role status counts
 - `taskmux task show <task-id>` shows one task by id
 - `taskmux task current [<task-id>]` shows or sets the current task pointer
 - `taskmux task last` shows the most recently touched task pointer
@@ -105,13 +106,15 @@ TaskMux currently provides:
 - `taskmux task comments <task-id>` lists comments for a task
 - `taskmux task events <task-id>` lists the local event history for a task
 - `taskmux doctor` checks Node.js, tmux, configured agents, TaskMux home, storage schema, storage permissions, and stored record health, and renders check results as a wrapped table
-- `taskmux setup [tmux] [--yes]` interactively configures required local defaults on every run, shows numbered built-in common agent CLI candidates with current/default values and local `installed`/`missing` prechecks, and installs tmux through a supported package manager only when `--yes` is provided
+- `taskmux setup [tmux]` requires an interactive terminal, initializes the resolved TaskMux home before writing schema/config/role/workspace data, configures required local defaults on every run, shows numbered built-in common agent CLI candidates with current/default values and local `installed`/`missing` prechecks, prompts before running tmux install commands when tmux is missing, and finishes with a concise completion message plus tmux status or install guidance
 - `taskmux backup` creates a timestamped raw storage backup
 - `taskmux migrate` upgrades older local storage schemas after creating a backup
 - `taskmux migrate --dry-run` reports migration work without writing storage
 - `taskmux export --output <file>` writes a local JSON snapshot
 - `taskmux import <file>` imports a local JSON snapshot
 - `taskmux prune --trash [--backups] [--keep-backups <count>]` prunes deleted tasks and old backups
+
+Structured multi-row command output must render as wrapped tables through `src/output/table.ts`. This applies to board, list, status, check, role, comment, event, activity, and timeline views, and to future commands that display records with multiple fields.
 
 ## Release Automation
 
@@ -164,7 +167,7 @@ TaskMux supports user-configured agent ids.
 - Fresh installs have no stored agent definitions until `setup` or `agent add` writes one.
 - `setup` exposes built-in common CLI candidates for selection; these candidates are prompt metadata, not preinstalled records.
 - `setup` prechecks each candidate locally, shows `installed` or `missing`, and lets the user select by number.
-- Every interactive `setup` run shows the agent and workspace prompts. Pressing enter keeps the current value when one exists, or accepts the displayed default.
+- Every interactive `setup` run initializes the resolved TaskMux home before storage writes, then shows the agent prompt. Pressing enter keeps the current agent when one exists, or accepts the displayed default. Setup creates the default workspace at `<taskmux-home>/workspace`.
 - A setup-selected agent only needs its name; TaskMux stores that name as both agent id and command with empty args and env.
 - `task assign --agent <agent-id>` resolves the agent id before writing role state.
 - `task role update --agent <agent-id>` resolves the agent id and overwrites that task-local role's stored command, args, env, and agent id.
@@ -176,12 +179,13 @@ Global roles are user-configured task role presets.
 
 - `role add <role> --agent <agent-id> [--workspace <path>]` stores a global role preset.
 - `role list/show/update/remove` manages global presets.
-- `role enter assistant` starts the configured global assistant agent in its workspace.
+- `taskmux assistant` and `role enter assistant` start the configured global assistant agent in its workspace with `TASKMUX_HOME`, `TASKMUX_ROLE`, `TASKMUX_WORKSPACE`, and `TASKMUX_ASSISTANT_CONTEXT` injected.
+- The assistant context instructs the agent to manage TaskMux through the `taskmux` CLI instead of editing storage files directly.
 - `task bind <task-id> <role>` copies a global role preset into a task.
 - `task assign <task-id> <role>` without `--agent` also copies the global preset.
 - Once copied, a task-local role is independent from the global preset.
 - Later `role update` changes only the global preset; later `task role update` changes only the task-local copy.
-- `assistant` and `owner` are protected system roles and cannot be removed.
+- `assistant` and `leader` are protected system roles and cannot be removed.
 - When protected system roles are not configured, role and board views show `?` for their agent and workspace.
 
 ## Template And Defaults
@@ -192,11 +196,11 @@ TaskMux stores local defaults in `config.json` under the TaskMux home.
 - `default-workspace` is used when task creation, a template, or multi-role assignment does not specify `--workspace`.
 - `currentTaskId` stores the task selected by `task current <task-id>`.
 - `lastTaskId` stores the most recently touched task from creation, clone, show, open, context, or explicit current selection.
-- `setup` fills `default-workspace` and configures the protected `assistant` and `owner` global role presets from `default-agent` when it resolves to a configured agent.
-- `task create` creates the system `owner` role for every task.
-- `task create --template feature` creates `owner`, `rd`, and `reviewer` roles and adds the `feature` tag with medium priority unless overridden.
-- `task create --template bug` creates `owner`, `rd`, and `tester` roles and adds the `bug` tag with high priority unless overridden.
-- `task create --template review` creates `owner` and `reviewer` roles and adds the `review` tag with medium priority unless overridden.
+- Interactive `setup` fills `default-workspace` with `<taskmux-home>/workspace` and configures the protected `assistant` and `leader` global role presets from `default-agent` and that workspace when the agent resolves to a configured agent; non-interactive scripts use `config set` for defaults.
+- `task create` creates the system `leader` role for every task.
+- `task create --template feature` creates `leader`, `rd`, and `reviewer` roles and adds the `feature` tag with medium priority unless overridden.
+- `task create --template bug` creates `leader`, `rd`, and `tester` roles and adds the `bug` tag with high priority unless overridden.
+- `task create --template review` creates `leader` and `reviewer` roles and adds the `review` tag with medium priority unless overridden.
 
 `task clone` copies the source task's editable metadata and assigned role execution contracts into a new task, resets cloned roles to `idle`, records the clone source in the new task's event log, and updates the last-task pointer.
 
@@ -234,32 +238,32 @@ Task, role, comment, and event records are versioned with `schemaVersion: 1`. Ta
 
 The data directory has a global storage schema manifest at `schema.json`. Normal task, agent, and role commands run a storage preflight on startup:
 
-- Missing manifests are initialized to the current storage schema version.
+- Missing manifests fail with guidance to run `taskmux setup`.
 - Current manifests allow the command to continue.
 - Older manifests fail with `DATA_ERROR` and instruct the user to run `taskmux migrate`.
 - Newer or invalid manifests fail with `DATA_ERROR`.
 
 `taskmux backup` creates a timestamped raw copy of the current data directory under `backups/`. Backup creation excludes the `backups/` directory itself so backups do not recursively copy previous backups.
 
-`taskmux migrate` is the only place where older storage schemas are upgraded. Migrations run in version order and update `schema.json` after all required steps succeed. When a migration upgrades an older schema, TaskMux creates a backup before applying migration steps and prints the backup path. Business stores read and write only the latest schema.
+`taskmux setup` is the only command that initializes a missing TaskMux home and schema manifest. `taskmux migrate` upgrades older storage schemas only after a manifest already exists. Migrations run in version order and update `schema.json` after all required steps succeed. When a migration upgrades an older schema, TaskMux creates a backup before applying migration steps and prints the backup path. Business stores read and write only the latest schema.
 
-`taskmux migrate --dry-run` reports whether schema initialization or upgrade would happen without writing `schema.json` or creating a backup.
+`taskmux migrate --dry-run` reports whether an existing schema would be upgraded without writing `schema.json` or creating a backup. Missing schemas report `taskmux setup` guidance instead of an initialization plan.
 
 `taskmux export --output <file>` writes a JSON snapshot with config, custom agents, global role presets, active tasks, task roles, comments, events, and stored transcripts. `taskmux import <file>` restores that snapshot into the configured TaskMux home.
 
 `taskmux prune --trash` removes deleted task directories under `trash/tasks`. `taskmux prune --backups --keep-backups <count>` removes older backup directories after keeping the newest entries.
 
-`doctor` reports storage schema status, storage directory read/write permission, and stored record health. Outdated storage is reported as `upgrade-required` with `current`, `latest`, and `run taskmux migrate` guidance. Invalid stored records are reported as `storage records invalid` without aborting the rest of the doctor report.
+`doctor` reports TaskMux home status, storage schema status, storage directory read/write permission, and stored record health without initializing missing storage. Missing storage is reported with `run taskmux setup` guidance. Outdated storage is reported as `upgrade-required` with `current`, `latest`, and `run taskmux migrate` guidance. Invalid stored records are reported as `storage records invalid` without aborting the rest of the doctor report.
 
 Task and role user-editable labels are isolated from runtime state:
 
-- Task title, description, priority, tags, owner, and due date live in `tasks/<task-id>/info.json`.
+- Task title, description, priority, tags, and due date live in `tasks/<task-id>/info.json`.
 - Role name lives in `tasks/<task-id>/roles/<role>/info.json`.
 - Runtime records do not require title or role name fields.
 - Users may edit `info.json` directly; TaskMux reads the edited title or role name on the next command.
 - Runtime records containing inline task title or role name are invalid in the current schema.
 
-Task priorities are `low`, `medium`, `high`, and `urgent`. Due dates use `YYYY-MM-DD`. `task update` can clear optional metadata fields with the `--clear-*` flags. `task list` filters by status, owner, tag, priority, and case-insensitive search across title, description, owner, priority, due date, and tags. `task board` uses the same filters and groups matching tasks under `open`, `active`, `done`, and `archived`; `--with-roles` appends stored role status counts.
+Task priorities are `low`, `medium`, `high`, and `urgent`. Due dates use `YYYY-MM-DD`. `task update` can clear optional metadata fields with the `--clear-*` flags. `task list` filters by status, tag, priority, and case-insensitive search across title, description, priority, due date, and tags. `task board` uses the same filters and groups matching tasks by lifecycle status in a table; `--with-roles` appends stored role status counts.
 
 Task ids use the stable `task-<number>` format in the first version. The next id is derived from existing local task directories.
 

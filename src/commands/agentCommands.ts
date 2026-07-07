@@ -1,4 +1,5 @@
 import { agentNotFound, usageError } from "../errors/cliError.js";
+import { defaultTableWidth, renderTable } from "../output/table.js";
 import { createCustomRunner } from "../runner/runner.js";
 import type { RunnerDefinition, RunnerEnvironment } from "../runner/runner.js";
 import { listRunnerDefinitions, resolveRunner } from "../runner/runnerRegistry.js";
@@ -63,7 +64,16 @@ function listAgentCommand(store: TaskStore): string {
     return "No agents configured.\n";
   }
 
-  return `${agents.map((agent) => `${agent.id}\t${agent.source}\t${agentCommandSummary(agent)}`).join("\n")}\n`;
+  return `${renderTable(
+    "Agents",
+    [
+      { header: "Agent", minWidth: 5, maxWidth: 24 },
+      { header: "Source", minWidth: 6, maxWidth: 12 },
+      { header: "Command", minWidth: 7, maxWidth: 80 }
+    ],
+    agents.map((agent) => [agent.id, agent.source, agentCommandSummary(agent)]),
+    defaultTableWidth()
+  )}\n`;
 }
 
 function showAgentCommand(args: string[], store: TaskStore): string {

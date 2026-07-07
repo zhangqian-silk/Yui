@@ -1,14 +1,19 @@
+import { existsSync } from "node:fs";
+import { delimiter, join } from "node:path";
 import { usageError } from "../errors/cliError.js";
+import { defaultTableWidth, renderTable } from "../output/table.js";
+import { SYSTEM_ASSISTANT_ROLE, SYSTEM_LEADER_ROLE } from "../role/systemRoles.js";
+import { resolveRunner } from "../runner/runnerRegistry.js";
 import type { TaskStore, TaskmuxConfig } from "../storage/taskStore.js";
 
 type ConfigKey = "default-agent" | "default-workspace";
 
-export function runConfigCommand(args: string[], store: TaskStore): string {
+export function runConfigCommand(args: string[], store: TaskStore, env: NodeJS.ProcessEnv = process.env): string {
   const [command, ...rest] = args;
 
   switch (command) {
     case "show":
-      return showConfigCommand(store);
+      return showConfigCommand(store, env);
     case "set":
       return setConfigCommand(rest, store);
     case "unset":
@@ -18,7 +23,7 @@ export function runConfigCommand(args: string[], store: TaskStore): string {
   }
 }
 
-function showConfigCommand(store: TaskStore): string {
+function showConfigCommand(store: TaskStore, env: NodeJS.ProcessEnv): string {
   const config = store.getConfig();
 
   return [
@@ -26,8 +31,92 @@ function showConfigCommand(store: TaskStore): string {
     `Default agent: ${config.defaultAgent ?? "(none)"}`,
     `Default workspace: ${config.defaultWorkspace ?? "(none)"}`,
     `Current task: ${config.currentTaskId ?? "(none)"}`,
-    `Last task: ${config.lastTaskId ?? "(none)"}`
+    `Last task: ${config.lastTaskId ?? "(none)"}`,
+    "",
+    renderConfigStatus(store, config, env)
   ].join("\n").concat("\n");
+}
+
+function renderConfigStatus(store: TaskStore, config: TaskmuxConfig, env: NodeJS.ProcessEnv): string {
+  return renderTable(
+    "Status",
+    [
+      { header: "Item", minWidth: 8, maxWidth: 22 },
+      { header: "Status", minWidth: 7, maxWidth: 16 },
+      { header: "Detail", minWidth: 12, maxWidth: 88 }
+    ],
+    configStatusRows(store, config, env),
+    defaultTableWidth()
+  );
+}
+
+function configStatusRows(store: TaskStore, config: TaskmuxConfig, env: NodeJS.ProcessEnv): string[][] {
+  const rows: string[][] = [];
+  const defaultAgent = config.defaultAgent?.trim() ?? "";
+
+  if (defaultAgent.length === 0) {
+    rows.push(["default-agent", "missing", "taskmux config set default-agent <agent-id>"]);
+  } else {
+    const agent = resolveRunner(defaultAgent, store.listCustomRunners());
+
+    if (agent === null) {
+      rows.push(["default-agent", "invalid", `${defaultAgent} is not configured`]);
+    } else {
+      rows.push([
+        "default-agent",
+        "configured",
+        `command=${agent.command}${commandUnavailableDetail(agent.command, env)}`
+      ]);
+    }
+  }
+
+  const workspace = config.defaultWorkspace?.trim() ?? "";
+
+  if (workspace.length === 0) {
+    rows.push(["workspace", "missing", "taskmux config set default-workspace <path>"]);
+  } else {
+    rows.push(["workspace", "configured", workspace]);
+  }
+
+  for (const roleName of [SYSTEM_ASSISTANT_ROLE, SYSTEM_LEADER_ROLE]) {
+    const role = store.getGlobalRole(roleName);
+
+    if (role === null) {
+      rows.push([`role:${roleName}`, "missing", "Run taskmux setup in an interactive terminal."]);
+    } else {
+      rows.push([`role:${roleName}`, "configured", `agent=${role.agent} workspace=${role.workspace}`]);
+    }
+  }
+
+  return rows;
+}
+
+function commandUnavailableDetail(command: string, env: NodeJS.ProcessEnv): string {
+  if (commandOnPath(command, env)) {
+    return "";
+  }
+
+  if (command.includes("/") || command.includes("\\")) {
+    return "; missing";
+  }
+
+  return "; not found in PATH";
+}
+
+function commandOnPath(command: string, env: NodeJS.ProcessEnv): boolean {
+  if (command.includes("/") || command.includes("\\")) {
+    return existsSync(command);
+  }
+
+  const pathEntries = (env.PATH ?? "").split(delimiter).filter((entry) => entry.length > 0);
+  const extensions =
+    process.platform === "win32"
+      ? (env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter((entry) => entry.length > 0)
+      : [""];
+
+  return pathEntries.some((entry) =>
+    extensions.some((extension) => existsSync(join(entry, `${command}${extension}`)))
+  );
 }
 
 function setConfigCommand(args: string[], store: TaskStore): string {
