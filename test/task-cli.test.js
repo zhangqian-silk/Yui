@@ -2734,6 +2734,7 @@ test("setup prints a tmux install plan without changing the system", async () =>
   mkdirSync(fakeBin);
   createPathExecutable(fakeBin, "codex", "process.stdout.write('codex 1.0\\n');");
   createPathExecutable(fakeBin, "apt-get", "process.stdout.write('apt 2.0\\n');");
+  createPathExecutable(fakeBin, "sudo", "process.stdout.write('sudo 1.0\\n');");
 
   const output = await runTaskmuxInteractive(
     ["setup"],
@@ -2886,6 +2887,20 @@ if (args.join(" ") === "install -y tmux") writeFileSync(${JSON.stringify(install
 process.stdout.write("apt 2.0\\n");
 `
   );
+  createPathExecutable(
+    fakeBin,
+    "sudo",
+    `const { appendFileSync, writeFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+if (args[0] === "--version") {
+  process.stdout.write("sudo 1.0\\n");
+  process.exit(0);
+}
+appendFileSync(${JSON.stringify(logFile)}, JSON.stringify(["sudo", ...args]) + "\\n");
+if (args.join(" ") === "apt-get install -y tmux") writeFileSync(${JSON.stringify(installedMarker)}, "ok\\n");
+process.stdout.write("sudo 1.0\\n");
+`
+  );
 
   const output = await runTaskmuxInteractive(
     ["setup"],
@@ -2902,7 +2917,7 @@ process.stdout.write("apt 2.0\\n");
   assert.match(output, /Install tmux now\? \[y\/N\]: /);
   assert.match(output, /Tmux installed/);
   assert.doesNotMatch(output, /TaskMux config/);
-  assert.deepEqual(log, [
+  assert.deepEqual(log.map((entry) => entry[0] === "sudo" ? entry.slice(1) : entry), [
     ["apt-get", "update"],
     ["apt-get", "install", "-y", "tmux"]
   ]);
