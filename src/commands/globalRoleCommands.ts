@@ -1,12 +1,23 @@
 import { spawnSync } from "node:child_process";
+import { prepareGlobalRoleLaunch } from "../assistant/assistantContext.js";
 import { roleNotFound, usageError } from "../errors/cliError.js";
+import { defaultTableWidth, renderTable } from "../output/table.js";
 import { createGlobalRole, updateGlobalRole } from "../role/role.js";
 import type { GlobalRole } from "../role/role.js";
 import { isSystemRoleName, SYSTEM_ROLE_NAMES, systemRoleDescription } from "../role/systemRoles.js";
 import { resolveRunner, supportedRunnerIds } from "../runner/runnerRegistry.js";
 import type { TaskStore } from "../storage/taskStore.js";
 
-export function runGlobalRoleCommand(args: string[], store: TaskStore): string {
+type GlobalRoleCommandOptions = {
+  taskmuxHome?: string;
+  env?: NodeJS.ProcessEnv;
+};
+
+export function runGlobalRoleCommand(
+  args: string[],
+  store: TaskStore,
+  options: GlobalRoleCommandOptions = {}
+): string {
   const [command, ...rest] = args;
 
   switch (command) {
@@ -21,7 +32,7 @@ export function runGlobalRoleCommand(args: string[], store: TaskStore): string {
     case "remove":
       return removeGlobalRoleCommand(rest, store);
     case "enter":
-      return enterGlobalRoleCommand(rest, store);
+      return enterGlobalRoleCommand(rest, store, options);
     default:
       return globalRoleUsage();
   }
@@ -53,7 +64,17 @@ function listGlobalRoleCommand(store: TaskStore): string {
     return "No roles configured.\n";
   }
 
-  return `${rows.map((row) => `${row.name}\t${row.agent}\t${row.workspace}\t${row.kind}`).join("\n")}\n`;
+  return `${renderTable(
+    "Roles",
+    [
+      { header: "Role", minWidth: 4, maxWidth: 24 },
+      { header: "Agent", minWidth: 5, maxWidth: 20 },
+      { header: "Workspace", minWidth: 9, maxWidth: 54 },
+      { header: "Kind", minWidth: 6, maxWidth: 34 }
+    ],
+    rows.map((row) => [row.name, row.agent, row.workspace, row.kind]),
+    defaultTableWidth()
+  )}\n`;
 }
 
 function showGlobalRoleCommand(args: string[], store: TaskStore): string {
@@ -137,7 +158,11 @@ function removeGlobalRoleCommand(args: string[], store: TaskStore): string {
   return `Removed role ${roleName}\n`;
 }
 
-function enterGlobalRoleCommand(args: string[], store: TaskStore): string {
+function enterGlobalRoleCommand(
+  args: string[],
+  store: TaskStore,
+  options: GlobalRoleCommandOptions
+): string {
   const [name] = args;
   const roleName = parseGlobalRoleName(name);
   const role = store.getGlobalRole(roleName);
@@ -146,9 +171,14 @@ function enterGlobalRoleCommand(args: string[], store: TaskStore): string {
     throw roleNotFound(roleName);
   }
 
-  const result = spawnSync(role.command, role.args, {
+  const launch = prepareGlobalRoleLaunch(role, {
+    taskmuxHome: options.taskmuxHome,
+    baseEnv: options.env
+  });
+
+  const result = spawnSync(role.command, launch.args, {
     cwd: role.workspace,
-    env: { ...process.env, ...role.env },
+    env: launch.env,
     stdio: "inherit"
   });
 

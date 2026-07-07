@@ -3,8 +3,9 @@ import { dirname } from "node:path";
 import { createTaskComment } from "../comment/comment.js";
 import { roleNotFound, runtimeError, taskNotFound, usageError } from "../errors/cliError.js";
 import { createTaskEvent } from "../event/taskEvent.js";
+import { defaultTableWidth, renderTable } from "../output/table.js";
 import { copyGlobalRoleToTaskRole, createRole, updateRole, updateRoleStatus } from "../role/role.js";
-import { SYSTEM_OWNER_ROLE } from "../role/systemRoles.js";
+import { SYSTEM_LEADER_ROLE } from "../role/systemRoles.js";
 import { resolveRunner, supportedRunnerIds } from "../runner/runnerRegistry.js";
 import { createTask, updateTaskMetadata, updateTaskStatus } from "../task/task.js";
 import type { TaskComment } from "../comment/comment.js";
@@ -14,7 +15,7 @@ import type { TaskStore } from "../storage/taskStore.js";
 import type { Task, TaskMetadata, TaskPriority, TaskStatus } from "../task/task.js";
 import type { TmuxManager } from "../tmux/tmuxManager.js";
 
-const BUILTIN_OWNER_ROLE = SYSTEM_OWNER_ROLE;
+const BUILTIN_LEADER_ROLE = SYSTEM_LEADER_ROLE;
 
 export function runTaskCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
   const [command, ...rest] = args;
@@ -118,7 +119,7 @@ function createTaskCommand(args: string[], store: TaskStore): string {
   const defaultAgent = explicitAgent ?? config.defaultAgent;
   const explicitWorkspace = readOptionalOption(args, "--workspace")?.trim();
   const workspace = explicitWorkspace ?? config.defaultWorkspace ?? process.cwd();
-  const assignedRoles = uniqueStrings([BUILTIN_OWNER_ROLE, ...(template?.roles ?? [])])
+  const assignedRoles = uniqueStrings([BUILTIN_LEADER_ROLE, ...(template?.roles ?? [])])
     .map((roleName) => createRoleFromGlobalOrAgent(roleName, {
       agent: explicitAgent,
       fallbackAgent: defaultAgent,
@@ -153,7 +154,7 @@ function listTaskCommand(args: string[], store: TaskStore): string {
     return "No tasks found.\n";
   }
 
-  return `${tasks.map(renderTaskListRow).join("\n")}\n`;
+  return `${renderTaskListTable(tasks)}\n`;
 }
 
 function boardTaskCommand(args: string[], store: TaskStore): string {
@@ -207,7 +208,7 @@ function currentTaskCommand(args: string[], store: TaskStore): string {
 
   rememberTask(store, task.id, { current: true });
 
-  return `Current task: ${task.id}\t${task.title}\n`;
+  return `Current task: ${task.id} ${task.title}\n`;
 }
 
 function lastTaskCommand(store: TaskStore): string {
@@ -234,7 +235,6 @@ function cloneTaskCommand(args: string[], store: TaskStore): string {
     description: sourceTask.description,
     priority: sourceTask.priority,
     tags: sourceTask.tags,
-    owner: sourceTask.owner,
     dueAt: sourceTask.dueAt
   });
 
@@ -584,8 +584,8 @@ function renameTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxMana
     throw usageError("New role name is required.");
   }
 
-  if (oldName === BUILTIN_OWNER_ROLE || newName.trim() === BUILTIN_OWNER_ROLE) {
-    throw usageError("Built-in owner role cannot be renamed.");
+  if (oldName === BUILTIN_LEADER_ROLE || newName.trim() === BUILTIN_LEADER_ROLE) {
+    throw usageError("Built-in leader role cannot be renamed.");
   }
 
   if (store.getTask(taskId) === null) {
@@ -632,7 +632,7 @@ function listTaskRolesCommand(args: string[], store: TaskStore): string {
     return "No roles assigned.\n";
   }
 
-  return `${roles.map((role) => `${role.name}\t${role.agent}\t${role.status}\t${role.workspace}`).join("\n")}\n`;
+  return `${renderRoleTable(`Task roles: ${taskId}`, roles)}\n`;
 }
 
 function enterTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
@@ -774,10 +774,15 @@ function refreshTaskRolesCommand(
     return currentRole;
   });
 
-  return [
+  return `${renderTable(
     `${action} task ${taskId} roles`,
-    ...currentRoles.map((role) => `${role.name}\t${role.status}`)
-  ].join("\n").concat("\n");
+    [
+      { header: "Role", minWidth: 4, maxWidth: 24 },
+      { header: "Status", minWidth: 6, maxWidth: 12 }
+    ],
+    currentRoles.map((role) => [role.name, role.status]),
+    defaultTableWidth()
+  )}\n`;
 }
 
 function statusTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
@@ -916,7 +921,16 @@ function listTaskCommentsCommand(args: string[], store: TaskStore): string {
     return "No comments found.\n";
   }
 
-  return `${comments.map((comment) => `${comment.id}\t${comment.createdAt}\t${comment.body}`).join("\n")}\n`;
+  return `${renderTable(
+    `Task comments: ${taskId}`,
+    [
+      { header: "Comment", minWidth: 7, maxWidth: 16 },
+      { header: "Created", minWidth: 10, maxWidth: 28 },
+      { header: "Body", minWidth: 8, maxWidth: 76 }
+    ],
+    comments.map((comment) => [comment.id, comment.createdAt, comment.body]),
+    defaultTableWidth()
+  )}\n`;
 }
 
 function listTaskEventsCommand(args: string[], store: TaskStore): string {
@@ -936,9 +950,7 @@ function listTaskEventsCommand(args: string[], store: TaskStore): string {
     return "No events found.\n";
   }
 
-  return `${events
-    .map((event) => `${event.id}\t${event.createdAt}\t${event.type}\t${renderEventPayload(event.payload)}`)
-    .join("\n")}\n`;
+  return `${renderEventTable(`Task events: ${taskId}`, events)}\n`;
 }
 
 function taskActivityCommand(args: string[], store: TaskStore): string {
@@ -958,19 +970,28 @@ function taskActivityCommand(args: string[], store: TaskStore): string {
     return `Task activity: ${taskId}\nNo roles assigned.\n`;
   }
 
-  return [
+  return `${renderTable(
     `Task activity: ${taskId}`,
-    ...roles.map((role) => {
+    [
+      { header: "Role", minWidth: 4, maxWidth: 24 },
+      { header: "Agent", minWidth: 5, maxWidth: 20 },
+      { header: "Status", minWidth: 6, maxWidth: 12 },
+      { header: "Transcript", minWidth: 10, maxWidth: 18 },
+      { header: "Updated", minWidth: 10, maxWidth: 28 }
+    ],
+    roles.map((role) => {
       const transcript = store.readTranscript(taskId, role.name);
+
       return [
         role.name,
         role.agent,
         role.status,
-        `transcriptLines=${countTranscriptLines(transcript)}`,
-        `updated=${role.updatedAt}`
-      ].join("\t");
-    })
-  ].join("\n").concat("\n");
+        String(countTranscriptLines(transcript)),
+        role.updatedAt
+      ];
+    }),
+    defaultTableWidth()
+  )}\n`;
 }
 
 function taskTimelineCommand(args: string[], store: TaskStore): string {
@@ -987,11 +1008,11 @@ function taskTimelineCommand(args: string[], store: TaskStore): string {
   const lines = [
     ...store.listEvents(taskId).map((event) => ({
       createdAt: event.createdAt,
-      line: `${event.createdAt}\tevent\t${event.type}\t${renderEventPayload(event.payload)}`
+      row: [event.createdAt, "event", event.type, renderEventPayload(event.payload)]
     })),
     ...store.listComments(taskId).map((comment) => ({
       createdAt: comment.createdAt,
-      line: `${comment.createdAt}\tcomment\t${comment.id}\t${comment.body}`
+      row: [comment.createdAt, "comment", comment.id, comment.body]
     }))
   ].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
 
@@ -999,7 +1020,17 @@ function taskTimelineCommand(args: string[], store: TaskStore): string {
     return `Task timeline: ${taskId}\nNo timeline entries.\n`;
   }
 
-  return [`Task timeline: ${taskId}`, ...lines.map((entry) => entry.line)].join("\n").concat("\n");
+  return `${renderTable(
+    `Task timeline: ${taskId}`,
+    [
+      { header: "Created", minWidth: 10, maxWidth: 28 },
+      { header: "Kind", minWidth: 5, maxWidth: 10 },
+      { header: "Type", minWidth: 4, maxWidth: 24 },
+      { header: "Detail", minWidth: 8, maxWidth: 76 }
+    ],
+    lines.map((entry) => entry.row),
+    defaultTableWidth()
+  )}\n`;
 }
 
 type TaskContextFormat = "text" | "json";
@@ -1059,14 +1090,11 @@ function renderTaskContextText(context: TaskContext, includeTranscripts: boolean
     "Task Context",
     ...renderTaskContextTaskLines(context.task),
     "",
-    "Roles",
-    ...renderTaskContextRoles(context.roles, includeTranscripts),
+    renderTaskContextRoles(context.roles, includeTranscripts),
     "",
-    "Comments",
-    ...renderTaskContextComments(context.comments),
+    renderTaskContextComments(context.comments),
     "",
-    "Events",
-    ...renderTaskContextEvents(context.events)
+    renderTaskContextEvents(context.events)
   ].join("\n").concat("\n");
 }
 
@@ -1081,37 +1109,39 @@ function renderTaskContextTaskLines(task: Task): string[] {
   ];
 }
 
-function renderTaskContextRoles(roles: TaskContextRole[], includeTranscripts: boolean): string[] {
-  if (roles.length === 0) {
-    return ["  No roles."];
-  }
+function renderTaskContextRoles(roles: TaskContextRole[], includeTranscripts: boolean): string {
+  const columns = [
+    { header: "Role", minWidth: 4, maxWidth: 24 },
+    { header: "Agent", minWidth: 5, maxWidth: 20 },
+    { header: "Status", minWidth: 6, maxWidth: 12 },
+    { header: "Workspace", minWidth: 9, maxWidth: 48 },
+    ...(includeTranscripts ? [{ header: "Transcript", minWidth: 10, maxWidth: 54 }] : [])
+  ];
+  const rows = roles.map((role) => [
+    role.name,
+    role.agent,
+    role.status,
+    role.workspace,
+    ...(includeTranscripts ? [role.transcript === undefined || role.transcript === null ? "not captured" : role.transcript.trimEnd()] : [])
+  ]);
 
-  return roles.flatMap((role) => {
-    const lines = [`  ${role.name}\t${role.agent}\t${role.status}\t${role.workspace}`];
-
-    if (includeTranscripts && role.transcript !== undefined) {
-      const transcript = role.transcript;
-      lines.push(`    Transcript: ${transcript === null ? "not captured" : transcript.trimEnd()}`);
-    }
-
-    return lines;
-  });
+  return renderTable("Roles", columns, rows, defaultTableWidth());
 }
 
-function renderTaskContextComments(comments: TaskComment[]): string[] {
-  if (comments.length === 0) {
-    return ["  No comments."];
-  }
-
-  return comments.map((comment) => `  ${comment.id}\t${comment.body}`);
+function renderTaskContextComments(comments: TaskComment[]): string {
+  return renderTable(
+    "Comments",
+    [
+      { header: "Comment", minWidth: 7, maxWidth: 16 },
+      { header: "Body", minWidth: 8, maxWidth: 76 }
+    ],
+    comments.map((comment) => [comment.id, comment.body]),
+    defaultTableWidth()
+  );
 }
 
-function renderTaskContextEvents(events: TaskEvent[]): string[] {
-  if (events.length === 0) {
-    return ["  No events."];
-  }
-
-  return events.map((event) => `  ${event.id}\t${event.type}\t${renderEventPayload(event.payload)}`);
+function renderTaskContextEvents(events: TaskEvent[]): string {
+  return renderEventTable("Events", events);
 }
 
 function recordTaskEvent(
@@ -1231,16 +1261,44 @@ function renderTaskPointer(label: string, taskId: string | undefined, store: Tas
   const task = store.getTask(taskId);
 
   if (task === null) {
-    return `${label}: ${taskId}\tmissing\n`;
+    return `${label}: ${taskId} missing\n`;
   }
 
-  return `${label}: ${task.id}\t${task.title}\n`;
+  return `${label}: ${task.id} ${task.title}\n`;
 }
 
 function renderEventPayload(payload: Record<string, string>): string {
   return Object.entries(payload)
     .map(([key, value]) => `${key}=${value}`)
     .join(" ");
+}
+
+function renderRoleTable(title: string, roles: Role[]): string {
+  return renderTable(
+    title,
+    [
+      { header: "Role", minWidth: 4, maxWidth: 24 },
+      { header: "Agent", minWidth: 5, maxWidth: 20 },
+      { header: "Status", minWidth: 6, maxWidth: 12 },
+      { header: "Workspace", minWidth: 9, maxWidth: 54 }
+    ],
+    roles.map((role) => [role.name, role.agent, role.status, role.workspace]),
+    defaultTableWidth()
+  );
+}
+
+function renderEventTable(title: string, events: TaskEvent[]): string {
+  return renderTable(
+    title,
+    [
+      { header: "Event", minWidth: 6, maxWidth: 16 },
+      { header: "Created", minWidth: 10, maxWidth: 28 },
+      { header: "Type", minWidth: 8, maxWidth: 24 },
+      { header: "Payload", minWidth: 8, maxWidth: 76 }
+    ],
+    events.map((event) => [event.id, event.createdAt, event.type, renderEventPayload(event.payload)]),
+    defaultTableWidth()
+  );
 }
 
 function findRole(
@@ -1297,7 +1355,6 @@ type TranscriptExportFormat = "text" | "json" | "markdown";
 
 type TaskListFilters = {
   status?: TaskStatus;
-  owner?: string;
   tag?: string;
   priority?: TaskPriority;
   search?: string;
@@ -1321,10 +1378,9 @@ function parseTaskBoardInput(
   const description = readOptionalOption(optionArgs, "--description")?.trim();
   const priority = parseTaskPriority(readOptionalOption(optionArgs, "--priority"));
   const tags = readRepeatedOption(optionArgs, "--tag").map((tag) => tag.trim()).filter((tag) => tag.length > 0);
-  const owner = readOptionalOption(optionArgs, "--owner")?.trim();
   const dueAt = readOptionalOption(optionArgs, "--due")?.trim();
 
-  const knownOptions = new Set(["--title", "--description", "--priority", "--tag", "--owner", "--due"]);
+  const knownOptions = new Set(["--title", "--description", "--priority", "--tag", "--due"]);
 
   for (const option of options.extraKnownOptions ?? []) {
     knownOptions.add(option);
@@ -1334,7 +1390,6 @@ function parseTaskBoardInput(
     knownOptions.add("--clear-description");
     knownOptions.add("--clear-priority");
     knownOptions.add("--clear-tags");
-    knownOptions.add("--clear-owner");
     knownOptions.add("--clear-due");
   }
 
@@ -1356,10 +1411,6 @@ function parseTaskBoardInput(
     metadata.tags = tags;
   }
 
-  if (owner !== undefined && owner.length > 0) {
-    metadata.owner = owner;
-  }
-
   if (dueAt !== undefined && dueAt.length > 0) {
     assertDueAt(dueAt);
     metadata.dueAt = dueAt;
@@ -1376,10 +1427,6 @@ function parseTaskBoardInput(
 
     if (hasFlag(optionArgs, "--clear-tags")) {
       metadata.tags = undefined;
-    }
-
-    if (hasFlag(optionArgs, "--clear-owner")) {
-      metadata.owner = undefined;
     }
 
     if (hasFlag(optionArgs, "--clear-due")) {
@@ -1475,13 +1522,12 @@ function countTranscriptLines(transcript: string | null): number {
 }
 
 function parseTaskListFilters(args: string[]): TaskListFilters {
-  assertKnownOptions(args, new Set(["--status", "--owner", "--tag", "--priority", "--search"]));
+  assertKnownOptions(args, new Set(["--status", "--tag", "--priority", "--search"]));
 
   const status = parseTaskStatus(readOptionalOption(args, "--status"));
 
   return {
     status,
-    owner: readOptionalOption(args, "--owner")?.trim(),
     tag: readOptionalOption(args, "--tag")?.trim(),
     priority: parseTaskPriority(readOptionalOption(args, "--priority")),
     search: readOptionalOption(args, "--search")?.trim().toLowerCase()
@@ -1489,12 +1535,11 @@ function parseTaskListFilters(args: string[]): TaskListFilters {
 }
 
 function parseTaskBoardViewOptions(args: string[]): TaskBoardViewOptions {
-  assertKnownOptions(args, new Set(["--status", "--owner", "--tag", "--priority", "--search", "--with-roles"]));
+  assertKnownOptions(args, new Set(["--status", "--tag", "--priority", "--search", "--with-roles"]));
 
   return {
     filters: {
       status: parseTaskStatus(readOptionalOption(args, "--status")),
-      owner: readOptionalOption(args, "--owner")?.trim(),
       tag: readOptionalOption(args, "--tag")?.trim(),
       priority: parseTaskPriority(readOptionalOption(args, "--priority")),
       search: readOptionalOption(args, "--search")?.trim().toLowerCase()
@@ -1505,10 +1550,6 @@ function parseTaskBoardViewOptions(args: string[]): TaskBoardViewOptions {
 
 function taskMatchesFilters(task: Task, filters: TaskListFilters): boolean {
   if (filters.status !== undefined && task.status !== filters.status) {
-    return false;
-  }
-
-  if (filters.owner !== undefined && task.owner !== filters.owner) {
     return false;
   }
 
@@ -1527,10 +1568,18 @@ function taskMatchesFilters(task: Task, filters: TaskListFilters): boolean {
   return true;
 }
 
-function renderTaskListRow(task: Task): string {
-  const metadata = renderTaskMetadataSummary(task);
-
-  return `${task.id}\t${task.status}\t${task.title}${metadata.length === 0 ? "" : `\t${metadata}`}`;
+function renderTaskListTable(tasks: Task[]): string {
+  return renderTable(
+    "Tasks",
+    [
+      { header: "Task", minWidth: 6, maxWidth: 14 },
+      { header: "Status", minWidth: 6, maxWidth: 10 },
+      { header: "Title", minWidth: 10, maxWidth: 48 },
+      { header: "Metadata", minWidth: 8, maxWidth: 58 }
+    ],
+    tasks.map((task) => [task.id, task.status, task.title, renderTaskMetadataSummary(task)]),
+    defaultTableWidth()
+  );
 }
 
 function renderTaskBoard(tasks: Task[], store: TaskStore, withRoles: boolean): string {
@@ -1540,26 +1589,34 @@ function renderTaskBoard(tasks: Task[], store: TaskStore, withRoles: boolean): s
     { status: "done", title: "Done" },
     { status: "archived", title: "Archived" }
   ];
-  const lines = groups.flatMap((group) => {
-    const groupedTasks = tasks.filter((task) => task.status === group.status);
+  const rows = groups.flatMap((group) => {
+    const groupTasks = tasks.filter((task) => task.status === group.status);
 
-    if (groupedTasks.length === 0) {
-      return [group.title, "  No tasks."];
+    if (groupTasks.length === 0) {
+      return [[group.title, "", "(none)", "", ""]];
     }
 
-    return [group.title, ...groupedTasks.map((task) => renderTaskBoardRow(task, store, withRoles))];
+    return groupTasks.map((task) => [
+        group.title,
+        task.id,
+        task.title,
+        renderTaskMetadataSummary(task),
+        withRoles ? renderTaskRoleSummary(store.listRoles(task.id)) : ""
+      ]);
   });
 
-  return `${lines.join("\n")}\n`;
-}
-
-function renderTaskBoardRow(task: Task, store: TaskStore, withRoles: boolean): string {
-  const summaries = [
-    renderTaskMetadataSummary(task),
-    withRoles ? renderTaskRoleSummary(store.listRoles(task.id)) : ""
-  ].filter((summary) => summary.length > 0);
-
-  return `  ${task.id}\t${task.title}${summaries.length === 0 ? "" : `\t${summaries.join(" ")}`}`;
+  return `${renderTable(
+    "Task board",
+    [
+      { header: "Status", minWidth: 6, maxWidth: 10 },
+      { header: "Task", minWidth: 6, maxWidth: 14 },
+      { header: "Title", minWidth: 10, maxWidth: 44 },
+      { header: "Metadata", minWidth: 8, maxWidth: 44 },
+      { header: "Roles", minWidth: 6, maxWidth: 42 }
+    ],
+    rows,
+    defaultTableWidth()
+  )}\n`;
 }
 
 function renderTaskRoleSummary(roles: Role[]): string {
@@ -1593,10 +1650,6 @@ function renderTaskMetadataLines(task: Task): string[] {
     lines.push(`Tags: ${task.tags.join(", ")}`);
   }
 
-  if (task.owner !== undefined) {
-    lines.push(`Owner: ${task.owner}`);
-  }
-
   if (task.dueAt !== undefined) {
     lines.push(`Due: ${task.dueAt}`);
   }
@@ -1607,7 +1660,6 @@ function renderTaskMetadataLines(task: Task): string[] {
 function renderTaskMetadataSummary(task: Task): string {
   return [
     task.priority === undefined ? null : `priority=${task.priority}`,
-    task.owner === undefined ? null : `owner=${task.owner}`,
     task.tags === undefined || task.tags.length === 0 ? null : `tags=${task.tags.join(",")}`,
     task.dueAt === undefined ? null : `due=${task.dueAt}`
   ]
@@ -1619,7 +1671,6 @@ function taskSearchText(task: Task): string {
   return [
     task.title,
     task.description,
-    task.owner,
     task.priority,
     task.dueAt,
     ...(task.tags ?? [])
@@ -1706,10 +1757,10 @@ function assertDueAt(value: string): void {
 
 export function taskUsage(): string {
   return `Task commands:
-  taskmux task create <title> [--template feature|bug|review] [--agent <agent>] [--workspace <path>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--owner <owner>] [--due YYYY-MM-DD]
-  taskmux task update <task-id> [--title <title>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--owner <owner>] [--due YYYY-MM-DD] [--clear-description] [--clear-priority] [--clear-tags] [--clear-owner] [--clear-due]
-  taskmux task list [--status <status>] [--owner <owner>] [--tag <tag>] [--priority <priority>] [--search <text>]
-  taskmux task board [--status <status>] [--owner <owner>] [--tag <tag>] [--priority <priority>] [--search <text>] [--with-roles]
+  taskmux task create <title> [--template feature|bug|review] [--agent <agent>] [--workspace <path>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD]
+  taskmux task update <task-id> [--title <title>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD] [--clear-description] [--clear-priority] [--clear-tags] [--clear-due]
+  taskmux task list [--status <status>] [--tag <tag>] [--priority <priority>] [--search <text>]
+  taskmux task board [--status <status>] [--tag <tag>] [--priority <priority>] [--search <text>] [--with-roles]
   taskmux task show <task-id>
   taskmux task current [<task-id>]
   taskmux task last

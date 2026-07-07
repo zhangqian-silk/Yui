@@ -1,21 +1,22 @@
-import { existsSync } from "node:fs";
-import { delimiter, join, resolve } from "node:path";
+import { existsSync, mkdirSync } from "node:fs";
+import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 import { usageError } from "../errors/cliError.js";
-import { renderTable } from "../output/table.js";
+import { defaultTableWidth, renderTable } from "../output/table.js";
 import { createGlobalRole } from "../role/role.js";
-import { SYSTEM_ASSISTANT_ROLE, SYSTEM_OWNER_ROLE } from "../role/systemRoles.js";
+import { SYSTEM_ASSISTANT_ROLE, SYSTEM_LEADER_ROLE } from "../role/systemRoles.js";
 import { createCustomRunner } from "../runner/runner.js";
+import type { RunnerDefinition } from "../runner/runner.js";
 import { resolveRunner } from "../runner/runnerRegistry.js";
-import type { TaskStore } from "../storage/taskStore.js";
+import { ensureTaskmuxHome, FileTaskStore, resolveTaskmuxHome, type TaskStore } from "../storage/taskStore.js";
+import { ensureStorageSchema } from "../storage/storageSchema.js";
 import type { CommandRunner } from "../tmux/commandRunner.js";
 
 export type SetupDependency = "tmux";
 
 type SetupOptions = {
   dependency?: SetupDependency;
-  yes: boolean;
 };
 
 type InstallStep = {
@@ -29,11 +30,13 @@ type InstallPlan = {
   manualHint: string;
 };
 
-type SetupIo = {
+export type SetupIo = {
   input?: Readable & { isTTY?: boolean };
   output?: Writable & { columns?: number };
   forceInteractive?: boolean;
 };
+
+type InteractiveSetupIo = Required<Pick<SetupIo, "input" | "output">> & SetupIo;
 
 type SetupAgentChoice = {
   name: string;
@@ -45,6 +48,13 @@ type SetupAgentOption = SetupAgentChoice & {
   installed: boolean;
   current: boolean;
 };
+
+type SetupConfigResult = {
+  defaultAgent: RunnerDefinition | null;
+  defaultWorkspace: string | undefined;
+};
+
+type SetupQuestion = (prompt: string) => Promise<string>;
 
 const setupAgentChoices: SetupAgentChoice[] = [
   { name: "codex", description: "OpenAI Codex CLI" },
@@ -60,30 +70,14 @@ export async function runSetupCommand(
   args: string[],
   env: NodeJS.ProcessEnv,
   runner: CommandRunner,
-  store?: TaskStore,
   io: SetupIo = {}
 ): Promise<string> {
   const options = parseSetupOptions(args);
   const dependencies: SetupDependency[] = options.dependency === undefined ? ["tmux"] : [options.dependency];
-  const lines: string[] = [];
+  const outputLines: string[] = [];
 
-  if (store !== undefined) {
-    lines.push(...await setupRequiredConfig(store, env, io));
-    lines.push(...setupSystemRoles(store));
-  }
-
-  for (const dependency of dependencies) {
-    if (dependency === "tmux") {
-      lines.push(...setupTmux(options.yes, env, runner));
-    }
-  }
-
-  return `TaskMux setup\n${renderStatusTable(lines, tableWidth(io))}\n`;
-}
-
-async function setupRequiredConfig(store: TaskStore, env: NodeJS.ProcessEnv, io: SetupIo): Promise<string[]> {
   if (!shouldPrompt(io)) {
-    return setupRequiredConfigStatus(store);
+    throw setupRequiresInteractiveError();
   }
 
   const readline = createInterface({
@@ -93,52 +87,72 @@ async function setupRequiredConfig(store: TaskStore, env: NodeJS.ProcessEnv, io:
   });
 
   try {
-    if (io.input?.isTTY === true) {
-      return await promptForRequiredConfig(store, env, io, (question) => readline.question(question));
+    const question = createSetupQuestion(readline, io);
+    const taskmuxHome = resolveTaskmuxHome(env);
+
+    ensureTaskmuxHome(taskmuxHome);
+    ensureStorageSchema(taskmuxHome);
+
+    const store = new FileTaskStore(taskmuxHome);
+    const configResult = await promptForRequiredConfig(store, taskmuxHome, env, io, question);
+
+    setupSystemRoles(store, configResult.defaultAgent, configResult.defaultWorkspace);
+    outputLines.push("TaskMux home initialized.");
+    outputLines.push("Workspace initialized under TaskMux home.");
+
+    for (const dependency of dependencies) {
+      if (dependency === "tmux") {
+        outputLines.push(...await setupTmux(env, runner, question));
+      }
     }
 
-    const lineIterator = readline[Symbol.asyncIterator]();
+    outputLines.push("TaskMux setup complete.");
 
-    return await promptForRequiredConfig(store, env, io, async (prompt) => {
-      io.output?.write(prompt);
-      const nextLine = await lineIterator.next();
-      return nextLine.done === true ? "" : nextLine.value;
-    });
+    return `${outputLines.join("\n")}\n`;
   } finally {
     readline.close();
   }
 }
 
-function setupRequiredConfigStatus(store: TaskStore): string[] {
-  const config = store.getConfig();
-  const customRunners = store.listCustomRunners();
-  const agent =
-    config.defaultAgent === undefined || config.defaultAgent.length === 0
-      ? null
-      : resolveRunner(config.defaultAgent, customRunners);
-  const lines = [
-    "config\tmode\tnon-interactive",
-    "config\tnext\tRun taskmux setup in an interactive terminal to configure defaults."
-  ];
+export function validateSetupInvocation(args: string[], io: SetupIo = {}): void {
+  parseSetupOptions(args);
 
-  if (agent !== null) {
-    lines.push(`config\tok\tagent=${agent.id} workspace=${config.defaultWorkspace ?? "(none)"}`);
-  } else if (config.defaultAgent !== undefined && config.defaultAgent.length > 0) {
-    lines.push(`default-agent\tinvalid\t${config.defaultAgent} is not configured.`);
-  } else {
-    lines.push("config\tmissing\tRun taskmux setup.");
+  if (!shouldPrompt(io)) {
+    throw setupRequiresInteractiveError();
+  }
+}
+
+function setupRequiresInteractiveError(): ReturnType<typeof usageError> {
+  return usageError(
+    "Setup requires an interactive terminal. Use taskmux config set default-agent <agent-id> and taskmux config set default-workspace <path> for scripted changes."
+  );
+}
+
+function createSetupQuestion(
+  readline: ReturnType<typeof createInterface>,
+  io: InteractiveSetupIo
+): SetupQuestion {
+  if (io.input.isTTY === true) {
+    return (prompt) => readline.question(prompt);
   }
 
-  return lines;
+  const lineIterator = readline[Symbol.asyncIterator]();
+
+  return async (prompt) => {
+    io.output.write(prompt);
+    const nextLine = await lineIterator.next();
+
+    return nextLine.done === true ? "" : nextLine.value;
+  };
 }
 
 async function promptForRequiredConfig(
   store: TaskStore,
+  taskmuxHome: string,
   env: NodeJS.ProcessEnv,
   io: SetupIo,
   question: (prompt: string) => Promise<string>
-): Promise<string[]> {
-  const lines = ["config\tmode\tinteractive"];
+): Promise<SetupConfigResult> {
   const config = store.getConfig();
   const customRunners = store.listCustomRunners();
   const currentDefaultAgent = config.defaultAgent?.trim() ?? "";
@@ -169,24 +183,23 @@ async function promptForRequiredConfig(
   const answer = await question(`${table}\nChoose default agent by number or name [${defaultOption.name}]: `);
   const selectedAgent = parseAgentSelection(answer, options, defaultOption, env);
   const selectedAgentName = selectedAgent.name;
-  const selectedAgentInstalled = selectedAgent.installed;
 
   const existingAgent = resolveRunner(selectedAgentName, store.listCustomRunners());
-  const agentCheck = selectedAgentInstalled ? "found in PATH" : "not found in PATH";
 
   if (existingAgent === null) {
     const agent = createCustomRunner(selectedAgentName, selectedAgentName, [], {}, new Date());
 
     store.saveCustomRunner(agent);
-    lines.push(`agent\tconfigured\t${agent.id} command=${agent.command}; ${agentCheck}`);
-  } else {
-    lines.push(`agent\tok\t${existingAgent.id} command=${existingAgent.command}; ${agentCheck}`);
   }
 
-  const currentWorkspace = config.defaultWorkspace?.trim() ?? "";
-  const fallbackWorkspace = currentWorkspace || process.cwd();
-  const workspaceAnswer = await question(`Default workspace [${fallbackWorkspace}]: `);
-  const defaultWorkspace = resolve(workspaceAnswer.trim() || fallbackWorkspace);
+  const defaultAgent = resolveRunner(selectedAgentName, store.listCustomRunners());
+
+  if (defaultAgent === null) {
+    throw usageError(`${selectedAgentName} is not configured.`);
+  }
+
+  const defaultWorkspace = setupWorkspace(taskmuxHome);
+  mkdirSync(defaultWorkspace, { recursive: true });
 
   store.saveConfig({
     ...store.getConfig(),
@@ -194,9 +207,14 @@ async function promptForRequiredConfig(
     defaultWorkspace
   });
 
-  lines.push(`config\tconfigured\tagent=${selectedAgentName} workspace=${defaultWorkspace}`);
+  return {
+    defaultAgent,
+    defaultWorkspace
+  };
+}
 
-  return lines;
+function setupWorkspace(taskmuxHome: string): string {
+  return join(taskmuxHome, "workspace");
 }
 
 function buildSetupAgentOptions(env: NodeJS.ProcessEnv, currentAgent: string): SetupAgentOption[] {
@@ -297,103 +315,71 @@ function resolveDefaultAgentOption(
 }
 
 function tableWidth(io: SetupIo): number {
-  return Math.max(46, Math.min(io.output?.columns ?? process.stdout.columns ?? 100, 140));
+  return io.output?.columns === undefined ? defaultTableWidth() : Math.max(46, Math.min(io.output.columns, 140));
 }
 
-function renderStatusTable(lines: string[], maxWidth: number): string {
-  return renderTable(
-    "Status",
-    [
-      { header: "Item", minWidth: 8, maxWidth: 22 },
-      { header: "Status", minWidth: 7, maxWidth: 16 },
-      { header: "Detail", minWidth: 12, maxWidth: 88 }
-    ],
-    lines.map((line) => {
-      const [item = "", status = "", ...detailParts] = line.split("\t");
-
-      return [item, status, detailParts.join(" ")];
-    }),
-    maxWidth
-  );
-}
-
-function shouldPrompt(io: SetupIo): io is Required<Pick<SetupIo, "input" | "output">> & SetupIo {
+function shouldPrompt(io: SetupIo): io is InteractiveSetupIo {
   return io.input !== undefined && io.output !== undefined && (io.forceInteractive === true || io.input.isTTY === true);
 }
 
-function setupSystemRoles(store: TaskStore): string[] {
-  const config = store.getConfig();
-
-  if (config.defaultAgent === undefined || config.defaultAgent.length === 0) {
-    return [
-      `${SYSTEM_ASSISTANT_ROLE}\tpending\tagent=?`,
-      `${SYSTEM_OWNER_ROLE}\tpending\tagent=?`
-    ];
-  }
-
-  const agent = resolveRunner(config.defaultAgent, store.listCustomRunners());
-
+function setupSystemRoles(store: TaskStore, agent: RunnerDefinition | null, workspace: string | undefined): void {
   if (agent === null) {
-    return [
-      `${SYSTEM_ASSISTANT_ROLE}\tpending\tagent=?`,
-      `${SYSTEM_OWNER_ROLE}\tpending\tagent=?`
-    ];
+    return;
   }
 
-  const workspace = config.defaultWorkspace ?? process.cwd();
+  if (workspace === undefined || workspace.length === 0) {
+    return;
+  }
 
-  for (const roleName of [SYSTEM_ASSISTANT_ROLE, SYSTEM_OWNER_ROLE]) {
+  for (const roleName of [SYSTEM_ASSISTANT_ROLE, SYSTEM_LEADER_ROLE]) {
     store.saveGlobalRole(createGlobalRole(roleName, agent, workspace, new Date()));
   }
-
-  return [
-    `${SYSTEM_ASSISTANT_ROLE}\tconfigured\tagent=${agent.id} workspace=${workspace}`,
-    `${SYSTEM_OWNER_ROLE}\tconfigured\tagent=${agent.id} workspace=${workspace}`
-  ];
 }
 
 function parseSetupOptions(args: string[]): SetupOptions {
   let dependency: SetupDependency | undefined;
-  let yes = false;
 
   for (const arg of args) {
-    if (arg === "--yes" || arg === "-y") {
-      yes = true;
-      continue;
-    }
-
     if (arg === "tmux") {
       dependency = "tmux";
       continue;
     }
 
-    throw usageError("Setup usage: taskmux setup [tmux] [--yes]");
+    throw usageError("Setup usage: taskmux setup [tmux]");
   }
 
-  return { dependency, yes };
+  return { dependency };
 }
 
-function setupTmux(yes: boolean, env: NodeJS.ProcessEnv, runner: CommandRunner): string[] {
+async function setupTmux(env: NodeJS.ProcessEnv, runner: CommandRunner, question: SetupQuestion): Promise<string[]> {
   const tmuxCommand = env.TASKMUX_TMUX_BIN ?? "tmux";
 
   if (hasExecutable(tmuxCommand, ["-V"], runner)) {
-    return ["tmux\tok\talready installed"];
+    return ["Tmux already installed."];
   }
 
   const plan = detectTmuxInstallPlan(env, runner);
 
   if (plan === null) {
     return [
-      "tmux\tmissing\tno supported package manager detected",
-      "tmux\tmanual\tInstall tmux manually, then run taskmux doctor."
+      "Tmux is not installed.",
+      "Install tmux manually, then run taskmux doctor."
     ];
   }
 
-  if (!yes) {
+  const lines = [
+    "Tmux is not installed.",
+    `Install with ${plan.manager}:`,
+    ...plan.steps.map((step) => `  ${renderStep(step)}`)
+  ];
+
+  const answer = (await question("Install tmux now? [y/N]: ")).trim().toLowerCase();
+
+  if (answer !== "y" && answer !== "yes") {
     return [
-      `tmux\tmissing\tinstall with ${plan.manager}`,
-      ...plan.steps.map((step) => `tmux\tplan\t${renderStep(step)}`),
-      "tmux\tnext\tRun taskmux setup --yes to execute the install plan."
+      ...lines,
+      "Skipped tmux installation.",
+      "After installing tmux, run taskmux doctor."
     ];
   }
 
@@ -403,12 +389,16 @@ function setupTmux(yes: boolean, env: NodeJS.ProcessEnv, runner: CommandRunner):
 
   if (!hasExecutable(tmuxCommand, ["-V"], runner)) {
     return [
-      `tmux\tinvalid\tinstall command completed, but ${tmuxCommand} is still unavailable`,
-      `tmux\tmanual\t${plan.manualHint}`
+      ...lines,
+      `Tmux install command completed, but ${tmuxCommand} is still unavailable.`,
+      plan.manualHint
     ];
   }
 
-  return ["tmux\tok\tinstalled"];
+  return [
+    ...lines,
+    "Tmux installed."
+  ];
 }
 
 function detectTmuxInstallPlan(env: NodeJS.ProcessEnv, runner: CommandRunner): InstallPlan | null {

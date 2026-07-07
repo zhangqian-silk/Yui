@@ -18,6 +18,10 @@ export function renderTable(title: string, columns: TableColumn[], rows: string[
   return [title, ...renderedRows].join("\n");
 }
 
+export function defaultTableWidth(): number {
+  return Math.max(46, Math.min(process.stdout.columns ?? 100, 140));
+}
+
 function fitColumnWidths(columns: TableColumn[], rows: string[][], maxWidth: number): number[] {
   const widths = columns.map((column, columnIndex) => {
     const maxContentWidth = Math.max(

@@ -1,6 +1,6 @@
 import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { TaskComment } from "../comment/comment.js";
 import { dataError } from "../errors/cliError.js";
 import type { TaskEvent } from "../event/taskEvent.js";
@@ -49,7 +49,13 @@ export type TaskmuxConfig = {
 };
 
 export function resolveTaskmuxHome(env: NodeJS.ProcessEnv): string {
-  return env.TASKMUX_HOME ?? join(homedir(), ".taskmux");
+  return env.TASKMUX_HOME === undefined || env.TASKMUX_HOME.length === 0
+    ? join(homedir(), ".taskmux")
+    : resolve(env.TASKMUX_HOME);
+}
+
+export function ensureTaskmuxHome(rootDir: string): void {
+  mkdirSync(rootDir, { recursive: true });
 }
 
 export class FileTaskStore implements TaskStore {
@@ -119,12 +125,8 @@ export class FileTaskStore implements TaskStore {
   }
 
   listTasks(): Task[] {
-    const tasksDir = this.tasksDir();
-    mkdirSync(tasksDir, { recursive: true });
-
-    return readdirSync(tasksDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => this.getTask(entry.name))
+    return this.directoryNames(this.tasksDir())
+      .map((name) => this.getTask(name))
       .filter((task): task is Task => task !== null)
       .sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }));
   }
@@ -164,12 +166,8 @@ export class FileTaskStore implements TaskStore {
   }
 
   listRoles(taskId: string): Role[] {
-    const rolesDir = this.rolesDir(taskId);
-    mkdirSync(rolesDir, { recursive: true });
-
-    return readdirSync(rolesDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => this.readRoleByStorageName(taskId, entry.name))
+    return this.directoryNames(this.rolesDir(taskId))
+      .map((name) => this.readRoleByStorageName(taskId, name))
       .filter((role): role is Role => role !== null)
       .sort((left, right) => left.name.localeCompare(right.name));
   }
@@ -193,12 +191,8 @@ export class FileTaskStore implements TaskStore {
   }
 
   listGlobalRoles(): GlobalRole[] {
-    const rolesDir = this.globalRolesDir();
-    mkdirSync(rolesDir, { recursive: true });
-
-    return readdirSync(rolesDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => this.getGlobalRole(entry.name))
+    return this.directoryNames(this.globalRolesDir())
+      .map((name) => this.getGlobalRole(name))
       .filter((role): role is GlobalRole => role !== null)
       .sort((left, right) => left.name.localeCompare(right.name));
   }
@@ -300,12 +294,8 @@ export class FileTaskStore implements TaskStore {
   }
 
   listCustomRunners(): CustomRunner[] {
-    const runnersDir = this.runnersDir();
-    mkdirSync(runnersDir, { recursive: true });
-
-    return readdirSync(runnersDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => this.getCustomRunner(entry.name))
+    return this.directoryNames(this.runnersDir())
+      .map((name) => this.getCustomRunner(name))
       .filter((runner): runner is CustomRunner => runner !== null)
       .sort((left, right) => left.id.localeCompare(right.id));
   }
@@ -442,11 +432,8 @@ export class FileTaskStore implements TaskStore {
   }
 
   private findRoleByInfoName(taskId: string, name: string): Role | null {
-    const rolesDir = this.rolesDir(taskId);
-    mkdirSync(rolesDir, { recursive: true });
-
-    for (const entry of readdirSync(rolesDir, { withFileTypes: true }).filter((item) => item.isDirectory())) {
-      const role = this.readRoleByStorageName(taskId, entry.name);
+    for (const storageName of this.directoryNames(this.rolesDir(taskId))) {
+      const role = this.readRoleByStorageName(taskId, storageName);
 
       if (role !== null && role.name === name) {
         return role;
@@ -457,22 +444,33 @@ export class FileTaskStore implements TaskStore {
   }
 
   private resolveRoleStorageName(taskId: string, name: string): string | null {
-    const rolesDir = this.rolesDir(taskId);
-    mkdirSync(rolesDir, { recursive: true });
-
     if (this.readOptionalText(this.roleFile(taskId, name)) !== null) {
       return name;
     }
 
-    for (const entry of readdirSync(rolesDir, { withFileTypes: true }).filter((item) => item.isDirectory())) {
-      const role = this.readRoleByStorageName(taskId, entry.name);
+    for (const storageName of this.directoryNames(this.rolesDir(taskId))) {
+      const role = this.readRoleByStorageName(taskId, storageName);
 
       if (role !== null && role.name === name) {
-        return entry.name;
+        return storageName;
       }
     }
 
     return null;
+  }
+
+  private directoryNames(path: string): string[] {
+    try {
+      return readdirSync(path, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name);
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+        return [];
+      }
+
+      throw error;
+    }
   }
 
   private readOptionalText(path: string): string | null {

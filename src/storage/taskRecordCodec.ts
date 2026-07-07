@@ -9,7 +9,6 @@ export type TaskInfoRecord = {
   description?: string;
   priority?: TaskPriority;
   tags?: string[];
-  owner?: string;
   dueAt?: string;
 };
 
@@ -64,7 +63,6 @@ export class TaskRecordCodec {
         description: task.description,
         priority: task.priority,
         tags: task.tags,
-        owner: task.owner,
         dueAt: task.dueAt
       }
     };
@@ -85,7 +83,6 @@ export class TaskRecordCodec {
       description: info.description,
       priority: info.priority,
       tags: info.tags,
-      owner: info.owner,
       dueAt: info.dueAt
     };
   }
@@ -153,7 +150,6 @@ export class TaskRecordCodec {
       (value.description !== undefined && typeof value.description !== "string") ||
       (value.priority !== undefined && !isTaskPriority(value.priority)) ||
       (value.tags !== undefined && !isStringArray(value.tags)) ||
-      (value.owner !== undefined && typeof value.owner !== "string") ||
       (value.dueAt !== undefined && typeof value.dueAt !== "string")
     ) {
       throw dataError(`Invalid task info record: ${id}`);

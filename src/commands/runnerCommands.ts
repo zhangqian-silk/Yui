@@ -1,4 +1,5 @@
 import { runnerNotFound, usageError } from "../errors/cliError.js";
+import { defaultTableWidth, renderTable } from "../output/table.js";
 import { createCustomRunner } from "../runner/runner.js";
 import type { RunnerDefinition, RunnerEnvironment } from "../runner/runner.js";
 import { listRunnerDefinitions, resolveRunner } from "../runner/runnerRegistry.js";
@@ -63,7 +64,16 @@ function listRunnerCommand(store: TaskStore): string {
     return "No runners configured.\n";
   }
 
-  return `${runners.map((runner) => `${runner.id}\t${runner.source}\t${runnerCommandSummary(runner)}`).join("\n")}\n`;
+  return `${renderTable(
+    "Runners",
+    [
+      { header: "Runner", minWidth: 6, maxWidth: 24 },
+      { header: "Source", minWidth: 6, maxWidth: 12 },
+      { header: "Command", minWidth: 7, maxWidth: 80 }
+    ],
+    runners.map((runner) => [runner.id, runner.source, runnerCommandSummary(runner)]),
+    defaultTableWidth()
+  )}\n`;
 }
 
 function showRunnerCommand(args: string[], store: TaskStore): string {

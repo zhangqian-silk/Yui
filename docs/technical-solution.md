@@ -137,7 +137,7 @@ Agent definitions provide:
 
 Custom agent records live in `TASKMUX_HOME/runners/<agent-id>/runner.json` for compatibility with existing local data. Existing task roles store the resolved command contract so later agent edits do not silently change already assigned roles.
 
-`taskmux setup` interactively guides the user through the required local defaults: `default-agent` and `default-workspace`. Every interactive run renders the built-in common agent CLI candidates as a numbered table, probes each candidate locally, marks the current agent when present, and labels candidates `installed` or `missing`. Selecting a candidate only requires its name; pressing enter keeps the current agent/workspace or accepts the displayed default. Setup persists the selected name as both agent id and command with empty args and env, writes config, and renders setup status as a wrapped table. In non-interactive environments, setup reports missing required config and tells the user to rerun setup in an interactive terminal. When `default-agent` resolves to a configured agent, setup writes the protected `assistant` and `owner` global role presets with that agent and `default-workspace`.
+`taskmux setup` requires an interactive terminal and guides the user through the required local defaults: `default-agent` and `default-workspace`. Setup first initializes the TaskMux home resolved by the normal resolver, then writes the schema manifest before any config, role, or workspace data. Every run renders the built-in common agent CLI candidates as a numbered table, probes each candidate locally, marks the current agent when present, and labels candidates `installed` or `missing`. Selecting a candidate only requires its name; pressing enter keeps the current agent or accepts the displayed default. Setup persists the selected name as both agent id and command with empty args and env, creates `<taskmux-home>/workspace`, writes it as `default-workspace`, and writes the protected `assistant` and `leader` global role presets when the agent resolves. If tmux is missing, setup prints install guidance and asks before executing package-manager commands. Non-interactive invocations fail with guidance to use `taskmux config set default-agent <agent-id>` and `taskmux config set default-workspace <path>`. Setup finishes with a concise completion message plus tmux status or install guidance; `taskmux config show` remains the explicit command for configuration status.
 
 ## Global Role Presets
 
@@ -145,7 +145,9 @@ Global role presets live under `TASKMUX_HOME/roles/<role>/role.json`. A global r
 
 `task bind <task-id> <role>` and `task assign <task-id> <role>` without `--agent` copy the global role into `TASKMUX_HOME/tasks/<task-id>/roles/<role>/`. The copied task role is independent: later `role update` changes only the global preset, and later `task role update` changes only the task-local copy.
 
-The protected global role names are `assistant` and `owner`. They always appear in global role and board views; missing protected role configuration is rendered as `?`. They cannot be removed. `role enter assistant` starts the configured assistant agent directly in its workspace as the global user-facing conversation entry point.
+The protected global role names are `assistant` and `leader`. They always appear in global role and board views; missing protected role configuration is rendered as `?`. They cannot be removed. `taskmux assistant` and `role enter assistant` start the configured assistant agent directly in its workspace as the global user-facing conversation entry point.
+
+Assistant entry writes `assistant/TASKMUX_ASSISTANT.md` under TaskMux home and injects `TASKMUX_HOME`, `TASKMUX_ROLE`, `TASKMUX_WORKSPACE`, and `TASKMUX_ASSISTANT_CONTEXT` into the agent process. The context tells the assistant to manage TaskMux through CLI commands such as `taskmux task create`, `taskmux role add`, `taskmux task assign`, and `taskmux task bind` instead of directly editing JSON storage. When the assistant command is Codex CLI and the stored assistant args are empty, TaskMux passes an initial prompt pointing Codex at the generated context.
 
 Tmux starts roles with one shell-command argument assembled from the stored role command, env, and args. Example:
 
@@ -171,7 +173,7 @@ The first config schema stores:
 
 `src/commands/configCommands.ts` owns `config show/set/unset`. `task create`, `task create --template`, and `task assign-many` read these defaults through the `TaskStore` boundary. Task workflow commands update `currentTaskId` and `lastTaskId` through the same config boundary so pointer state remains separate from task runtime records.
 
-Built-in templates live in `src/commands/taskCommands.ts` because they compose task metadata and role assignment in one use case. Templates do not introduce a new storage record type; they create normal task, role, and event records. Every task creation includes the system `owner` role before template roles are added. `owner` cannot be renamed.
+Built-in templates live in `src/commands/taskCommands.ts` because they compose task metadata and role assignment in one use case. Templates do not introduce a new storage record type; they create normal task, role, and event records. Every task creation includes the system `leader` role before template roles are added. `leader` cannot be renamed.
 
 ## Interactive Task Shell
 
@@ -237,13 +239,13 @@ TASKMUX_HOME or ~/.taskmux
       events.jsonl
 ```
 
-`schema.json` stores the global storage schema manifest: `schemaVersion`, `storageVersion`, and `updatedAt`. `info.json` stores the user-editable task title and task board metadata: `description`, `priority`, `tags`, `owner`, and `dueAt`. `task.json` stores runtime state: `schemaVersion`, `id`, `status`, `createdAt`, and `updatedAt`. `FileTaskStore` owns id allocation, task persistence, task listing, task lookup, and task lifecycle status writes. The CLI resolves the data directory once and passes the store into task command handlers.
+`schema.json` stores the global storage schema manifest: `schemaVersion`, `storageVersion`, and `updatedAt`. `info.json` stores the user-editable task title and task board metadata: `description`, `priority`, `tags`, and `dueAt`. `task.json` stores runtime state: `schemaVersion`, `id`, `status`, `createdAt`, and `updatedAt`. `FileTaskStore` owns id allocation, task persistence, task listing, task lookup, and task lifecycle status writes. The CLI resolves the data directory once and passes the store into task command handlers.
 
 `config.json` stores local defaults for agent and workspace plus current and last task pointers. The config parser validates `schemaVersion: 1` and optional string fields before returning values to commands.
 
-Task board commands live in `src/commands/taskCommands.ts`. `task create` and `task update` compose task title and metadata writes before saving through `TaskStore`; clear flags write `undefined` optional metadata so JSON encoding omits those fields. `task list` and `task board` share one filter parser for status, owner, tag, priority, and search. `task list` renders tab-separated rows; `task board` renders the same filtered task set grouped by `open`, `active`, `done`, and `archived`. `task board --with-roles` reads stored roles and appends status counts without tmux probes.
+Task board commands live in `src/commands/taskCommands.ts`. `task create` and `task update` compose task title and metadata writes before saving through `TaskStore`; clear flags write `undefined` optional metadata so JSON encoding omits those fields. `task list` and `task board` share one filter parser for status, tag, priority, and search. Both commands render wrapped tables through `src/output/table.ts`; `task board` keeps lifecycle grouping in a `Status` column for `open`, `active`, `done`, and `archived`. `task board --with-roles` reads stored roles and appends status counts without tmux probes.
 
-`task create` composes task metadata and role assignment in one command. It copies same-named global role presets when present; otherwise it resolves the configured agent before saving task data. It saves the task, records `task.created`, then creates the system `owner` role and any template roles. Each role write records a `role.assigned` event.
+`task create` composes task metadata and role assignment in one command. It copies same-named global role presets when present; otherwise it resolves the configured agent before saving task data. It saves the task, records `task.created`, then creates the system `leader` role and any template roles. Each role write records a `role.assigned` event.
 
 `task current` and `task last` are pointer commands over `config.json`. `task current <task-id>` validates that the task exists, then writes both `currentTaskId` and `lastTaskId`. Commands that make a task the obvious focus, including create, clone, show, open, and context, update `lastTaskId`.
 
@@ -275,7 +277,7 @@ TASKMUX_HOME or ~/.taskmux
 
 Agent `runner.json` records store `schemaVersion`, `id`, `command`, `args`, `env`, `createdAt`, and `updatedAt`.
 
-`info.json` stores the user-editable role name. Task-local `role.json` stores runtime state: `schemaVersion`, `agent`, `command`, `args`, `env`, `workspace`, `status`, `createdAt`, and `updatedAt`. Runtime records containing inline task title or role name are rejected by the current schema. Role runtime records must include the resolved command contract (`command`, `args`, and `env`) so tmux can restart roles from persisted state without consulting mutable agent definitions. `task role update` overwrites that command contract or workspace while preserving status and created time. `task role rename` updates the role info record in its existing storage directory and calls `TmuxManager.renameRole` best effort, except the system `owner` role cannot be renamed. The first stable role status is `idle`; `task enter` writes `running`, `task detach` writes `detached`, and `task stop` / `task kill` write `exited`. `task status`, `task refresh`, and `task cleanup` refresh role status from tmux when possible and write detected changes back to `role.json`; `task detail` reads stored role metadata without probing tmux.
+`info.json` stores the user-editable role name. Task-local `role.json` stores runtime state: `schemaVersion`, `agent`, `command`, `args`, `env`, `workspace`, `status`, `createdAt`, and `updatedAt`. Runtime records containing inline task title or role name are rejected by the current schema. Role runtime records must include the resolved command contract (`command`, `args`, and `env`) so tmux can restart roles from persisted state without consulting mutable agent definitions. `task role update` overwrites that command contract or workspace while preserving status and created time. `task role rename` updates the role info record in its existing storage directory and calls `TmuxManager.renameRole` best effort, except the system `leader` role cannot be renamed. The first stable role status is `idle`; `task enter` writes `running`, `task detach` writes `detached`, and `task stop` / `task kill` write `exited`. `task status`, `task refresh`, and `task cleanup` refresh role status from tmux when possible and write detected changes back to `role.json`; `task detail` reads stored role metadata without probing tmux.
 
 Task comments are append-only JSONL records:
 
@@ -303,7 +305,7 @@ The command layer appends events only after the underlying user-visible mutation
 
 Storage reads validate JSON records before returning domain objects:
 
-- Task info records require `schemaVersion: 1` and string title. Optional task board metadata requires string description, priority `low|medium|high|urgent`, string-array tags, string owner, and string due date. Task runtime records require `schemaVersion: 1`, string ids and timestamps, and a valid task status.
+- Task info records require `schemaVersion: 1` and string title. Optional task board metadata requires string description, priority `low|medium|high|urgent`, string-array tags, and string due date. Task runtime records require `schemaVersion: 1`, string ids and timestamps, and a valid task status.
 - Role info records require `schemaVersion: 1` and string name. Role runtime records require `schemaVersion: 1`, string agent, string command, string-array args, string-map env, workspace, timestamps, and a valid role status.
 - Comment records require `schemaVersion: 1`, string id, body, and timestamp.
 - Event records require `schemaVersion: 1`, string id, string type, string-map payload, and timestamp.
@@ -314,9 +316,9 @@ Invalid records raise `DATA_ERROR` instead of being skipped silently.
 
 `src/storage/taskRecordCodec.ts` owns task and role record encoding, decoding, and composition for the current storage schema. `FileTaskStore` only resolves file paths and raw file IO for these records. Cross-version upgrade handling belongs to the storage schema and migration boundary, not to fallback branches inside business stores.
 
-`src/storage/storageSchema.ts` owns the global storage schema manifest, startup preflight, and migration runner. Normal `task`, `agent`, and `role` commands call the preflight before constructing business stores. If storage is outdated, preflight raises `DATA_ERROR` with `taskmux migrate` guidance; it does not let business commands read older layouts.
+`src/storage/storageSchema.ts` owns the global storage schema manifest, startup preflight, and migration runner. Normal `task`, `agent`, and `role` commands call the preflight before constructing business stores. Missing storage raises `DATA_ERROR` with `taskmux setup` guidance. Outdated storage raises `DATA_ERROR` with `taskmux migrate` guidance; preflight does not initialize missing storage or let business commands read older layouts.
 
-Storage migrations live under `src/storage/migrations/` and are registered by the migration runner. Each migration handles one version step. `taskmux migrate` runs the required steps in order and writes the latest `schema.json` only after all required migrations complete.
+Storage migrations live under `src/storage/migrations/` and are registered by the migration runner. Each migration handles one version step. `taskmux migrate` runs the required steps in order and writes the latest `schema.json` only after all required migrations complete. Missing storage is initialized by `taskmux setup`, not by migration commands.
 
 `taskmux migrate --dry-run` uses the schema inspector only. It does not call the migration runner, create backups, or write the manifest.
 
@@ -324,7 +326,7 @@ Storage migrations live under `src/storage/migrations/` and are registered by th
 
 `src/commands/maintenanceCommands.ts` owns export, import, and prune. Export builds a JSON snapshot through store APIs. Import restores config, custom agents, global role presets, tasks, task roles, transcripts, comments, and events through the same store write APIs. Prune removes trash task directories and old backup directories by filesystem path under the configured TaskMux home.
 
-`doctor` calls the storage schema inspector without upgrading storage. It reports `ok`, `upgrade-required`, `unsupported`, or `invalid` in a wrapped table and keeps upgrade execution behind the explicit `taskmux migrate` command. Doctor also checks `default-agent`, storage read/write permission with a temporary probe file, and scans stored task, global role, task role, and agent records through the current store validators. Missing or unresolved `default-agent` is a failed doctor check. Record validation failures are reported as `storage records invalid` instead of aborting the doctor report.
+`doctor` calls the storage schema inspector without initializing or upgrading storage. It reports missing storage with `taskmux setup` guidance, reports outdated storage as `upgrade-required`, and keeps upgrade execution behind the explicit `taskmux migrate` command. Doctor also checks `default-agent`, TaskMux home accessibility, storage read/write permission without writing probe files, and scans stored task, global role, task role, and agent records through the current store validators only when the schema is current. Missing or unresolved `default-agent` is a failed doctor check. Record validation failures are reported as `storage records invalid` instead of aborting the doctor report.
 
 ## Error Handling
 

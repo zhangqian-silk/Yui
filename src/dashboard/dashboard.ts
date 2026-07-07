@@ -236,9 +236,9 @@ function dashboardHelp(): string {
   return `TaskMux dashboard commands:
   dashboard
   r
-  board [--status <status>] [--owner <owner>] [--tag <tag>] [--priority <priority>] [--search <text>]
+  board [--status <status>] [--tag <tag>] [--priority <priority>] [--search <text>]
   b
-  list [--status <status>] [--owner <owner>] [--tag <tag>] [--priority <priority>] [--search <text>]
+  list [--status <status>] [--tag <tag>] [--priority <priority>] [--search <text>]
   ls
   current [<task-id>]
   c [<task-id>]
@@ -247,7 +247,7 @@ function dashboardHelp(): string {
   open [<task-id>]
   o [<task-id>]
   show [<task-id>]
-  update [<task-id>] [--title <title>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--owner <owner>] [--due YYYY-MM-DD]
+  update [<task-id>] [--title <title>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD]
   start [<task-id>]
   done [<task-id>]
   archive [<task-id>]

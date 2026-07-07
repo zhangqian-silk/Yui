@@ -5,7 +5,6 @@ export type TaskMetadata = {
   description?: string;
   priority?: TaskPriority;
   tags?: string[];
-  owner?: string;
   dueAt?: string;
 };
 
@@ -16,7 +15,6 @@ export type Task = {
   description?: string;
   priority?: TaskPriority;
   tags?: string[];
-  owner?: string;
   dueAt?: string;
   status: TaskStatus;
   createdAt: string;

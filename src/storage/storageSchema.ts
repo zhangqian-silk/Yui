@@ -124,16 +124,32 @@ export function ensureStorageSchema(rootDir: string): void {
   }
 }
 
+export function requireStorageSchema(rootDir: string): void {
+  const state = inspectStorageSchema(rootDir);
+
+  switch (state.status) {
+    case "uninitialized":
+      throw dataError("TaskMux is not initialized. Run `taskmux setup`.");
+    case "current":
+      return;
+    case "upgrade-required":
+      throw dataError(
+        `Storage schema upgrade required: ${state.currentVersion} -> ${state.latestVersion}. Run \`taskmux migrate\`.`
+      );
+    case "unsupported":
+      throw dataError(
+        `Unsupported storage schema version: ${state.currentVersion}. This TaskMux supports storage schema ${state.latestVersion}.`
+      );
+    case "invalid":
+      throw dataError(`Invalid storage schema manifest: ${state.manifestPath}.`);
+  }
+}
+
 export function runStorageMigrations(rootDir: string, now = new Date()): StorageMigrationResult {
   const state = inspectStorageSchema(rootDir);
 
   if (state.status === "uninitialized") {
-    writeStorageManifest(rootDir, CURRENT_STORAGE_SCHEMA_VERSION, now);
-    return {
-      fromVersion: null,
-      toVersion: CURRENT_STORAGE_SCHEMA_VERSION,
-      changed: true
-    };
+    throw dataError("TaskMux is not initialized. Run `taskmux setup`.");
   }
 
   if (state.status === "current") {

@@ -18,10 +18,6 @@ export function runMigrateCommand(rootDir: string, args: string[] = []): string 
     return `Storage schema already up to date: ${result.toVersion}\n`;
   }
 
-  if (result.fromVersion === null) {
-    return `Initialized storage schema ${result.toVersion}\n`;
-  }
-
   return [
     `Migrated storage schema ${result.fromVersion} -> ${result.toVersion}`,
     result.backup === undefined ? null : `Backup: ${result.backup.path}`
@@ -36,7 +32,7 @@ function dryRunMigrateCommand(rootDir: string): string {
 
   switch (state.status) {
     case "uninitialized":
-      return `Storage migration dry run uninitialized -> ${state.latestVersion}\nSchema would be initialized\n`;
+      return "TaskMux is not initialized. Run `taskmux setup`.\n";
     case "current":
       return `Storage schema already up to date: ${state.currentVersion}\n`;
     case "upgrade-required":

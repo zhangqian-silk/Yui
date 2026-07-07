@@ -1,6 +1,6 @@
 {
   "name": "@zq-silk/taskmux",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Local task board for native agent CLI sessions backed by tmux.",
   "license": "MIT",
   "type": "module",
