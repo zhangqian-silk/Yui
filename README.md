@@ -16,6 +16,25 @@ Command entrypoint:
 taskmux
 ```
 
+## Local Development
+
+To test the current checkout as commands without writing to `~/.taskmux`:
+
+```sh
+make link
+taskmux-dev --help
+```
+
+`make link` builds and globally links the normal `taskmux` command, then creates a local-only `taskmux-dev` wrapper in the npm global bin directory. `taskmux-dev` always runs this checkout's `dist/cli.js` with data isolated under `output/taskmux-cli-dev`, even if the calling shell already sets `TASKMUX_HOME`.
+
+The wrapper is not an npm package entrypoint and is not published. `make link` refuses to replace an existing `taskmux-dev` command that it did not create, and `make unlink` removes only a wrapper created by this checkout:
+
+```sh
+make unlink
+```
+
+Use `make local-smoke` for the preset non-interactive smoke flow; use `taskmux-dev` for direct command-by-command testing.
+
 Running `taskmux` without arguments runs `doctor` first. If every check passes, TaskMux opens an interactive dashboard that shows the current task, last task, and grouped task board. The dashboard accepts short commands such as `board`, `current task-1`, `open`, `roles`, `enter leader`, and `q`.
 
 ## Core Model
