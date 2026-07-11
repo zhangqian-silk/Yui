@@ -4042,29 +4042,11 @@ test("controller rebuilds and refreshes its derived SQLite index", async () => {
   }
 });
 
-test("controller file watcher reloads a valid direct edit into the derived index", async () => {
-  const home = createConfiguredHome();
-  const env = {
-    TASKMUX_HOME: home,
-    TASKMUX_CONTROLLER_MODE: "auto",
-    TASKMUX_CONTROLLER_SCAN_INTERVAL_MS: "60000"
-  };
-  const { default: Database } = await import("better-sqlite3");
-  runTaskmux(["task", "create", "Before direct edit"], { TASKMUX_HOME: home });
+test("controller does not depend on filesystem watchers", () => {
+  const controllerSource = readFileSync(join(process.cwd(), "src", "controller", "controller.ts"), "utf8");
 
-  try {
-    runTaskmux(["controller", "start"], env);
-    writeFileSync(
-      join(home, "tasks", "task-1", "info.json"),
-      JSON.stringify({ schemaVersion: 1, title: "After direct edit" })
-    );
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 350);
-    const database = new Database(join(home, "runtime", "index.sqlite"), { readonly: true });
-    assert.equal(database.prepare("SELECT title FROM tasks WHERE id = 'task-1'").get().title, "After direct edit");
-    database.close();
-  } finally {
-    runTaskmuxFailure(["controller", "stop"], env);
-  }
+  assert.doesNotMatch(controllerSource, /fileReloadWatcher|startTaskmuxFileWatcher|stopFileWatcher/);
+  assert.equal(existsSync(join(process.cwd(), "src", "storage", "fileReloadWatcher.ts")), false);
 });
 
 test("controller serves the last valid value and logs an invalid direct edit", () => {
