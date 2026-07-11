@@ -20,18 +20,6 @@ export type ExecutorCapabilities = {
   nativeSessionDiscovery: boolean;
 };
 
-export interface AgentExecutor {
-  readonly id: string;
-  readonly capabilities: ExecutorCapabilities;
-  start(input: string): Promise<string>;
-  recover(nativeSessionId: string): Promise<void>;
-  send(input: string): Promise<void>;
-  interrupt(): Promise<void>;
-  stop(): Promise<void>;
-  status(): Promise<AgentSessionStatus>;
-  discoverNativeSessionId(): Promise<string | null>;
-}
-
 export function recordAgentSession(
   taskId: string,
   roleName: string,

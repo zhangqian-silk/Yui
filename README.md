@@ -24,6 +24,8 @@ Running `taskmux` without arguments runs `doctor` first. If every check passes, 
 - Running `taskmux` without arguments opens the local interactive dashboard after passing doctor checks.
 - A Task is a long-lived mission with only an `archived` marker; completion belongs to finite WorkItems, Cycles, and AgentRuns.
 - The local Controller auto-starts for ordinary CLI commands, binds to `127.0.0.1`, authenticates with a random token, serializes mutations, deduplicates request ids, coalesces wakeups, and performs inactivity and schedule scans.
+- Complete snapshot writes are staged in a replayable recovery journal before atomic replacement. Controller startup replays interrupted writes and rebuilds the deletable SQLite index from authoritative files.
+- A recursive local watcher reloads valid direct edits into the derived index. Invalid edits remain untouched while the Controller serves its last valid value and records diagnostics under `runtime/logs/`.
 - Each successfully dispatched Leader wakeup creates a durable Cycle describing the coalesced trigger reasons; linked WorkItems move from running to completed or failed with their AgentRun outcome.
 - One Task maps to one tmux session. Each independent role maps to one tmux window and native Agent session.
 - TaskMux has two protected system roles: global `operator` for user-facing CLI administration and task-local `leader` for task stewardship.
@@ -231,7 +233,9 @@ Global role presets are managed with `role add/list/show/update/remove`. A prese
 
 `task current [<task-id>]` shows or sets the current task for shorter workflows. `task last` shows the most recently touched task. Task creation, show, open, context, and clone update the last-task pointer. `task clone <task-id> [--title <title>]` creates a new task from an existing task's metadata and assigned roles while resetting cloned roles to `idle`.
 
-Editable task and role labels are separated from runtime state. Task title and task board metadata live in `tasks/<task-id>/info.json`; role name lives in `tasks/<task-id>/roles/<role>/info.json`. Users can edit those `info.json` files directly, and TaskMux reads the edited values on the next command.
+Editable task and role labels are separated from runtime state. Task title and task board metadata live in `tasks/<task-id>/info.json`; role name lives in `tasks/<task-id>/roles/<role>/info.json`. Users can edit those `info.json` files directly. The Controller watches valid edits and keeps the previous valid value available when an edit is malformed.
+
+`runtime/index.sqlite` contains only derived Task, role, and WorkItem lookup data. It may be deleted at any time and is rebuilt from TaskMux files. `runtime/recovery-journal/` contains complete pending snapshot writes used for crash recovery; successful writes remove their journal entry.
 
 Assigned roles are stored under the task directory. Each role runtime record stores `schemaVersion`, agent, command, args, env, workspace, status, and timestamps.
 

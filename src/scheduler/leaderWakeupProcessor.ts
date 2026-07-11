@@ -1,9 +1,9 @@
-import { randomUUID } from "node:crypto";
 import { createTaskEvent } from "../event/taskEvent.js";
 import { createCycle, type CycleCause } from "../cycle/cycle.js";
 import { compileDispatchInput } from "../context/dispatchContext.js";
-import { buildAgentLaunchPlan, withTaskmuxRunEnvironment } from "../executor/launchPlan.js";
-import { recordAgentSession, type AgentSession } from "../executor/agentExecutor.js";
+import { withTaskmuxRunEnvironment } from "../executor/launchPlan.js";
+import type { AgentSession } from "../executor/agentExecutor.js";
+import { resolveAgentExecutor } from "../executor/executorRegistry.js";
 import { updateRoleStatus } from "../role/role.js";
 import { createAgentRun } from "../run/agentRun.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
@@ -53,21 +53,16 @@ export function processLeaderWakeups(
         compiledInput,
         now
       );
-      let baseLaunch = buildAgentLaunchPlan(role, mode, session);
-      if (mode === "new" && role.agent === "claude") {
-        const nativeSessionId = randomUUID();
-        effectiveSession = recordAgentSession(
-          task.id,
-          role.name,
-          role.agent,
-          nativeSessionId,
-          now,
-          null
-        );
-        baseLaunch = { ...baseLaunch, args: [...baseLaunch.args, "--session-id", nativeSessionId] };
-      }
+      const prepared = resolveAgentExecutor(role.agent).prepare({
+        taskId: task.id,
+        role,
+        mode,
+        session,
+        now
+      });
+      effectiveSession = prepared.session;
       const launch = withTaskmuxRunEnvironment(
-        baseLaunch,
+        prepared.launch,
         resolveTaskmuxHome(process.env),
         role,
         run,

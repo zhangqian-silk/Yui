@@ -6,7 +6,7 @@ import { CliError, dataError, type CliErrorCode } from "../errors/cliError.js";
 import { expireStaleAgentRuns, failExitedAgentRuns, readAgentRunTtl, scanTaskWakeups } from "../scheduler/inactivityScanner.js";
 import { processLeaderWakeups } from "../scheduler/leaderWakeupProcessor.js";
 import { mergePendingWakeup } from "../scheduler/pendingWakeup.js";
-import { FileTaskStore } from "../storage/taskStore.js";
+import { FileTaskStore, type TaskStore } from "../storage/taskStore.js";
 import { NodeCommandRunner } from "../tmux/commandRunner.js";
 import { TmuxManager } from "../tmux/tmuxManager.js";
 import { runTaskCommand } from "../commands/taskCommands.js";
@@ -15,6 +15,11 @@ import { runBoardCommand } from "../commands/boardCommands.js";
 import { runConfigCommand } from "../commands/configCommands.js";
 import { runGlobalRoleCommand } from "../commands/globalRoleCommands.js";
 import { runRunnerCommand } from "../commands/runnerCommands.js";
+import { replayPendingSnapshotWrites } from "../storage/recoveryJournal.js";
+import { createResilientTaskStore, primeResilientTaskStore } from "../storage/resilientTaskStore.js";
+import { rebuildDerivedIndex } from "../storage/derivedIndex.js";
+import { startTaskmuxFileWatcher } from "../storage/fileReloadWatcher.js";
+import { appendControllerDiagnostic } from "./controllerDiagnostics.js";
 
 export const CONTROLLER_API_VERSION = 1;
 
@@ -44,12 +49,36 @@ export async function serveController(rootDir: string): Promise<void> {
 
   removeControllerDiscovery(rootDir);
   const releaseLock = acquireControllerLock(rootDir, process.pid);
+  let stopFileWatcher = (): void => undefined;
   try {
+    replayPendingSnapshotWrites(rootDir);
     const token = randomBytes(32).toString("hex");
-    const store = new FileTaskStore(rootDir);
+    const store = createResilientTaskStore(
+      new FileTaskStore(rootDir),
+      (error, method, args) => appendControllerDiagnostic(
+        rootDir,
+        "storage.invalid_edit",
+        error.message,
+        { method, args }
+      )
+    );
     const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandRunner());
+    const refreshDerivedState = (): void => {
+      primeResilientTaskStore(store);
+      rebuildDerivedIndex(rootDir, store);
+    };
+    refreshDerivedState();
+    stopFileWatcher = startTaskmuxFileWatcher(
+      rootDir,
+      refreshDerivedState,
+      (error) => appendControllerDiagnostic(
+        rootDir,
+        "storage.reload_failed",
+        error instanceof Error ? error.message : String(error)
+      )
+    );
     const server = createServer((request, response) => {
-      void handleRequest(request, response, token, rootDir, store, tmux);
+      void handleRequest(request, response, token, rootDir, store, tmux, refreshDerivedState);
     });
 
     await new Promise<void>((resolve, reject) => {
@@ -81,8 +110,13 @@ export async function serveController(rootDir: string): Promise<void> {
         failExitedAgentRuns(store, tmux, new Date());
         scanTaskWakeups(store, new Date());
         processLeaderWakeups(store, tmux, new Date());
-      } catch {
-        // A malformed user-edited file must not terminate the Controller.
+        refreshDerivedState();
+      } catch (error) {
+        appendControllerDiagnostic(
+          rootDir,
+          "scheduler.scan_failed",
+          error instanceof Error ? error.message : String(error)
+        );
       }
     };
     scan();
@@ -107,6 +141,7 @@ export async function serveController(rootDir: string): Promise<void> {
       process.once("SIGINT", stop);
     });
   } finally {
+    stopFileWatcher();
     removeControllerDiscovery(rootDir);
     releaseLock();
   }
@@ -237,8 +272,9 @@ async function handleRequest(
   response: ServerResponse,
   token: string,
   rootDir: string,
-  store: FileTaskStore,
-  tmux: TmuxManager
+  store: TaskStore,
+  tmux: TmuxManager,
+  refreshDerivedState: () => void
 ): Promise<void> {
   if (request.method !== "POST" || request.url !== "/rpc") {
     sendJson(response, 404, { error: "Not found." });
@@ -333,6 +369,7 @@ async function handleRequest(
 
       const output = runTaskCommand(rpc.params.args, store, tmux);
       processLeaderWakeups(store, tmux, new Date());
+      refreshDerivedState();
       const body = { requestId: rpc.requestId, result: { output } };
       writeRpcResult(rootDir, rpc.requestId, body);
       sendJson(response, 200, body);
@@ -354,6 +391,7 @@ async function handleRequest(
       }
 
       const output = runControllerCommandGroup(rpc.params.group, rpc.params.args, store, rootDir);
+      refreshDerivedState();
       const body = { requestId: rpc.requestId, result: { output } };
       writeRpcResult(rootDir, rpc.requestId, body);
       sendJson(response, 200, body);
@@ -373,7 +411,7 @@ async function handleRequest(
 function runControllerCommandGroup(
   group: string,
   args: string[],
-  store: FileTaskStore,
+  store: TaskStore,
   rootDir: string
 ): string {
   switch (group) {

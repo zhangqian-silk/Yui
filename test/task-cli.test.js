@@ -538,6 +538,25 @@ test("reads edited task info from the user-editable info file", () => {
   assert.match(listOutput, tableCellsRegex("task-1", "ongoing", "Edited task title"));
 });
 
+test("keeps the last valid task value while preserving an invalid direct edit", async () => {
+  const home = createConfiguredHome();
+  runTaskmux(["task", "create", "Last valid title"], { TASKMUX_HOME: home });
+  const { FileTaskStore } = await import("../dist/storage/taskStore.js");
+  const { createResilientTaskStore } = await import("../dist/storage/resilientTaskStore.js");
+  const diagnostics = [];
+  const store = createResilientTaskStore(new FileTaskStore(home), (error) => diagnostics.push(error.message));
+  const infoFile = join(home, "tasks", "task-1", "info.json");
+
+  assert.equal(store.getTask("task-1").title, "Last valid title");
+  writeFileSync(infoFile, "{ invalid json\n");
+  assert.equal(store.getTask("task-1").title, "Last valid title");
+  assert.equal(readFileSync(infoFile, "utf8"), "{ invalid json\n");
+  assert.match(diagnostics[0], /Invalid task info record/);
+
+  writeFileSync(infoFile, JSON.stringify({ schemaVersion: 1, title: "Reloaded valid title" }));
+  assert.equal(store.getTask("task-1").title, "Reloaded valid title");
+});
+
 test("atomically replaces task snapshots instead of following a state-file symlink", () => {
   const home = createConfiguredHome();
 
@@ -553,6 +572,52 @@ test("atomically replaces task snapshots instead of following a state-file symli
   assert.equal(JSON.parse(readFileSync(sentinel, "utf8")).archived, false);
   assert.equal(JSON.parse(readFileSync(taskFile, "utf8")).archived, true);
   assert.equal(lstatSync(taskFile).isSymbolicLink(), false);
+});
+
+test("replays a staged complete snapshot after an interrupted write", async () => {
+  const home = createTaskmuxHome();
+  const target = join(home, "tasks", "task-1", "task.json");
+  const recovery = await import("../dist/storage/recoveryJournal.js");
+
+  recovery.stageSnapshotWrite(home, target, '{"schemaVersion":2,"archived":false}\n', "write-1");
+  assert.equal(existsSync(target), false);
+
+  const replayed = recovery.replayPendingSnapshotWrites(home);
+  assert.deepEqual(replayed, [target]);
+  assert.equal(readFileSync(target, "utf8"), '{"schemaVersion":2,"archived":false}\n');
+  assert.deepEqual(readdirSync(join(home, "runtime", "recovery-journal")), []);
+});
+
+test("rebuilds the deletable SQLite index from authoritative task files", async () => {
+  const home = createConfiguredHome();
+  runTaskmux(["task", "create", "Index this mission"], { TASKMUX_HOME: home });
+  runTaskmux(
+    ["task", "work-item", "create", "task-1", "--title", "Index finite work", "--assignee", "leader"],
+    { TASKMUX_HOME: home }
+  );
+  const { FileTaskStore } = await import("../dist/storage/taskStore.js");
+  const { rebuildDerivedIndex } = await import("../dist/storage/derivedIndex.js");
+  const { default: Database } = await import("better-sqlite3");
+  const indexFile = join(home, "runtime", "index.sqlite");
+
+  rebuildDerivedIndex(home, new FileTaskStore(home));
+  let database = new Database(indexFile, { readonly: true });
+  assert.deepEqual(database.prepare("SELECT id, title, archived FROM tasks").get(), {
+    id: "task-1", title: "Index this mission", archived: 0
+  });
+  assert.deepEqual(database.prepare("SELECT task_id, name FROM roles").get(), {
+    task_id: "task-1", name: "leader"
+  });
+  assert.deepEqual(database.prepare("SELECT task_id, id, status FROM work_items").get(), {
+    task_id: "task-1", id: "work-item-1", status: "pending"
+  });
+  database.close();
+
+  unlinkSync(indexFile);
+  rebuildDerivedIndex(home, new FileTaskStore(home));
+  database = new Database(indexFile, { readonly: true });
+  assert.equal(database.prepare("SELECT count(*) AS count FROM tasks").get().count, 1);
+  database.close();
 });
 
 test("creates tasks with task board metadata", () => {
@@ -3640,6 +3705,115 @@ test("starts and reaches the controller through authenticated loopback RPC", () 
   }
 });
 
+test("controller replays staged snapshot writes before serving requests", async () => {
+  const home = createConfiguredHome();
+  runTaskmux(["task", "create", "Original title"], { TASKMUX_HOME: home });
+  const recovery = await import("../dist/storage/recoveryJournal.js");
+  const target = join(home, "tasks", "task-1", "info.json");
+  recovery.stageSnapshotWrite(
+    home,
+    target,
+    `${JSON.stringify({ schemaVersion: 1, title: "Recovered title" }, null, 2)}\n`,
+    "controller-replay"
+  );
+
+  try {
+    runTaskmux(["controller", "start"], { TASKMUX_HOME: home });
+    assert.equal(JSON.parse(readFileSync(target, "utf8")).title, "Recovered title");
+    assert.deepEqual(readdirSync(join(home, "runtime", "recovery-journal")), []);
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], { TASKMUX_HOME: home });
+  }
+});
+
+test("controller rebuilds and refreshes its derived SQLite index", async () => {
+  const home = createConfiguredHome();
+  const env = { TASKMUX_HOME: home, TASKMUX_CONTROLLER_MODE: "auto" };
+  const { default: Database } = await import("better-sqlite3");
+  runTaskmux(["task", "create", "Existing indexed task"], { TASKMUX_HOME: home });
+  const indexFile = join(home, "runtime", "index.sqlite");
+
+  try {
+    runTaskmux(["controller", "start"], env);
+    let database = new Database(indexFile, { readonly: true });
+    assert.equal(database.prepare("SELECT count(*) AS count FROM tasks").get().count, 1);
+    database.close();
+
+    runTaskmux(["task", "create", "Controller indexed task"], env);
+    database = new Database(indexFile, { readonly: true });
+    assert.equal(database.prepare("SELECT count(*) AS count FROM tasks").get().count, 2);
+    database.close();
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], env);
+  }
+});
+
+test("controller file watcher reloads a valid direct edit into the derived index", async () => {
+  const home = createConfiguredHome();
+  const env = {
+    TASKMUX_HOME: home,
+    TASKMUX_CONTROLLER_MODE: "auto",
+    TASKMUX_CONTROLLER_SCAN_INTERVAL_MS: "60000"
+  };
+  const { default: Database } = await import("better-sqlite3");
+  runTaskmux(["task", "create", "Before direct edit"], { TASKMUX_HOME: home });
+
+  try {
+    runTaskmux(["controller", "start"], env);
+    writeFileSync(
+      join(home, "tasks", "task-1", "info.json"),
+      JSON.stringify({ schemaVersion: 1, title: "After direct edit" })
+    );
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 350);
+    const database = new Database(join(home, "runtime", "index.sqlite"), { readonly: true });
+    assert.equal(database.prepare("SELECT title FROM tasks WHERE id = 'task-1'").get().title, "After direct edit");
+    database.close();
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], env);
+  }
+});
+
+test("controller serves the last valid value and logs an invalid direct edit", () => {
+  const home = createConfiguredHome();
+  const env = { TASKMUX_HOME: home, TASKMUX_CONTROLLER_MODE: "auto" };
+  runTaskmux(["task", "create", "Controller cached title"], { TASKMUX_HOME: home });
+
+  try {
+    runTaskmux(["controller", "start"], env);
+    assert.match(runTaskmux(["task", "show", "task-1"], env), /Controller cached title/);
+    const infoFile = join(home, "tasks", "task-1", "info.json");
+    writeFileSync(infoFile, "{ invalid json\n");
+
+    assert.match(runTaskmux(["task", "show", "task-1"], env), /Controller cached title/);
+    assert.equal(readFileSync(infoFile, "utf8"), "{ invalid json\n");
+    const diagnostics = readFileSync(join(home, "runtime", "logs", "controller.jsonl"), "utf8");
+    assert.match(diagnostics, /storage.invalid_edit/);
+    assert.match(diagnostics, /Invalid task info record/);
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], env);
+  }
+});
+
+test("controller primes individual role values before an invalid direct edit", () => {
+  const home = createConfiguredHome();
+  const env = { TASKMUX_HOME: home, TASKMUX_CONTROLLER_MODE: "auto" };
+  runTaskmux(["task", "create", "Cache role records"], { TASKMUX_HOME: home });
+  runTaskmux(
+    ["task", "assign", "task-1", "reviewer", "--agent", "codex", "--workspace", "/tmp/project-a"],
+    { TASKMUX_HOME: home }
+  );
+
+  try {
+    runTaskmux(["controller", "start"], env);
+    const roleInfo = join(home, "tasks", "task-1", "roles", "reviewer", "info.json");
+    writeFileSync(roleInfo, "{ invalid json\n");
+    assert.match(runTaskmux(["task", "detail", "task-1", "reviewer"], env), /Role: reviewer/);
+    assert.equal(readFileSync(roleInfo, "utf8"), "{ invalid json\n");
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], env);
+  }
+});
+
 test("removes a stale discovery file when its live pid does not answer Controller health", () => {
   const home = createConfiguredHome();
   const discoveryFile = join(home, "runtime", "controller.json");
@@ -3984,6 +4158,54 @@ test("keeps the leader native session fixed until explicit replacement", () => {
   assert.equal(session.nativeSessionId, "codex-session-2");
   assert.equal(session.policy, "fixed");
   assert.deepEqual(session.previousSessionIds, ["codex-session-1"]);
+});
+
+test("builds Codex start and recovery plans through the unified executor adapter", async () => {
+  const { resolveAgentExecutor } = await import("../dist/executor/executorRegistry.js");
+  const role = {
+    schemaVersion: 1,
+    name: "reviewer",
+    agent: "codex",
+    command: "codex",
+    args: ["--full-auto"],
+    env: { CODEX_HOME: "/tmp/codex" },
+    workspace: "/tmp/project-a",
+    status: "idle",
+    createdAt: "2026-07-11T00:00:00.000Z",
+    updatedAt: "2026-07-11T00:00:00.000Z"
+  };
+  const session = {
+    schemaVersion: 1,
+    taskId: "task-1",
+    roleName: "reviewer",
+    agent: "codex",
+    nativeSessionId: "codex-thread-1",
+    policy: "leader-controlled",
+    status: "ready",
+    previousSessionIds: [],
+    createdAt: "2026-07-11T00:00:00.000Z",
+    updatedAt: "2026-07-11T00:00:00.000Z"
+  };
+
+  const executor = resolveAgentExecutor("codex");
+  assert.deepEqual(executor.prepare({
+    taskId: "task-1", role, mode: "new", session: null,
+    now: new Date("2026-07-11T00:00:00.000Z")
+  }), {
+    launch: { command: "codex", args: ["--full-auto"], env: { CODEX_HOME: "/tmp/codex" } },
+    session: null
+  });
+  assert.deepEqual(executor.prepare({
+    taskId: "task-1", role, mode: "resume", session,
+    now: new Date("2026-07-11T00:00:00.000Z")
+  }), {
+    launch: {
+      command: "codex",
+      args: ["--full-auto", "resume", "codex-thread-1"],
+      env: { CODEX_HOME: "/tmp/codex" }
+    },
+    session
+  });
 });
 
 test("preallocates and records a native session id for a new Claude dispatch", () => {

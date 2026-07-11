@@ -1,5 +1,4 @@
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { createTaskComment } from "../comment/comment.js";
@@ -12,7 +11,8 @@ import { createTaskEvent } from "../event/taskEvent.js";
 import { createTaskInputDraft } from "../input/taskInput.js";
 import { createMilestone, renderMilestoneTimelineEntry } from "../milestone/milestone.js";
 import { recordAgentSession } from "../executor/agentExecutor.js";
-import { buildAgentLaunchPlan, type DispatchMode, withTaskmuxRunEnvironment } from "../executor/launchPlan.js";
+import { resolveAgentExecutor } from "../executor/executorRegistry.js";
+import { type DispatchMode, withTaskmuxRunEnvironment } from "../executor/launchPlan.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { copyGlobalRoleToTaskRole, createRole, updateRole, updateRoleStatus } from "../role/role.js";
 import { createChildRole } from "../role/childRole.js";
@@ -444,23 +444,16 @@ function dispatchTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxMa
     new Date(),
     { workItemId, topics }
   );
-  let effectiveSession = session;
-  let baseLaunch = buildAgentLaunchPlan(role, mode as DispatchMode, session);
-  if (mode === "new" && role.agent === "claude") {
-    const nativeSessionId = randomUUID();
-    effectiveSession = recordAgentSession(
-      taskId,
-      roleName,
-      role.agent,
-      nativeSessionId,
-      new Date(),
-      session,
-      session === null ? undefined : "Leader selected a new native session."
-    );
-    baseLaunch = { ...baseLaunch, args: [...baseLaunch.args, "--session-id", nativeSessionId] };
-  }
+  const prepared = resolveAgentExecutor(role.agent).prepare({
+    taskId,
+    role,
+    mode: mode as DispatchMode,
+    session,
+    now: new Date()
+  });
+  const effectiveSession = prepared.session;
   const launch = withTaskmuxRunEnvironment(
-    baseLaunch,
+    prepared.launch,
     resolveTaskmuxHome(process.env),
     role,
     run,

@@ -1,7 +1,6 @@
-import { appendFileSync, closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { join, resolve } from "node:path";
 import type { TaskComment } from "../comment/comment.js";
 import type { Milestone } from "../milestone/milestone.js";
 import type { Decision } from "../decision/decision.js";
@@ -22,6 +21,7 @@ import { emptyTaskTopics, type TaskTopics } from "../topic/topic.js";
 import type { WorkItem } from "../workItem/workItem.js";
 import type { RoleWorktree } from "../worktree/worktree.js";
 import { taskRecordCodec } from "./taskRecordCodec.js";
+import { writeRecoverableSnapshot } from "./recoveryJournal.js";
 
 export type TaskStore = {
   getConfig(): TaskmuxConfig;
@@ -133,7 +133,7 @@ export class FileTaskStore implements TaskStore {
 
   saveConfig(config: TaskmuxConfig): void {
     mkdirSync(this.rootDir, { recursive: true });
-    writeAtomicText(this.configFile(), `${JSON.stringify(config, null, 2)}\n`);
+    this.writeSnapshot(this.configFile(), `${JSON.stringify(config, null, 2)}\n`);
   }
 
   nextTaskId(): string {
@@ -154,8 +154,8 @@ export class FileTaskStore implements TaskStore {
     const encoded = taskRecordCodec.encodeTask(task);
 
     mkdirSync(taskDir, { recursive: true });
-    writeAtomicText(this.taskFile(task.id), `${JSON.stringify(encoded.runtime, null, 2)}\n`);
-    writeAtomicText(this.taskInfoFile(task.id), `${JSON.stringify(encoded.info, null, 2)}\n`);
+    this.writeSnapshot(this.taskFile(task.id), `${JSON.stringify(encoded.runtime, null, 2)}\n`);
+    this.writeSnapshot(this.taskInfoFile(task.id), `${JSON.stringify(encoded.info, null, 2)}\n`);
   }
 
   deleteTask(id: string): boolean {
@@ -211,7 +211,7 @@ export class FileTaskStore implements TaskStore {
 
   saveTaskTopics(taskId: string, topics: TaskTopics): void {
     mkdirSync(this.taskDir(taskId), { recursive: true });
-    writeAtomicText(this.topicsFile(taskId), `${JSON.stringify(topics, null, 2)}\n`);
+    this.writeSnapshot(this.topicsFile(taskId), `${JSON.stringify(topics, null, 2)}\n`);
   }
 
   getTaskInputDraft(taskId: string): TaskInputDraft | null {
@@ -222,7 +222,7 @@ export class FileTaskStore implements TaskStore {
 
   saveTaskInputDraft(taskId: string, draft: TaskInputDraft): void {
     mkdirSync(this.taskDir(taskId), { recursive: true });
-    writeAtomicText(this.taskInputDraftFile(taskId), `${JSON.stringify(draft, null, 2)}\n`);
+    this.writeSnapshot(this.taskInputDraftFile(taskId), `${JSON.stringify(draft, null, 2)}\n`);
   }
 
   clearTaskInputDraft(taskId: string): void {
@@ -237,7 +237,7 @@ export class FileTaskStore implements TaskStore {
 
   savePendingWakeup(wakeup: PendingWakeup): void {
     mkdirSync(this.pendingWakeupsDir(), { recursive: true });
-    writeAtomicText(this.pendingWakeupFile(wakeup.taskId), `${JSON.stringify(wakeup, null, 2)}\n`);
+    this.writeSnapshot(this.pendingWakeupFile(wakeup.taskId), `${JSON.stringify(wakeup, null, 2)}\n`);
   }
 
   listPendingWakeups(): PendingWakeup[] {
@@ -267,7 +267,7 @@ export class FileTaskStore implements TaskStore {
 
   saveLeaderFailure(failure: LeaderFailure): void {
     mkdirSync(this.leaderFailuresDir(), { recursive: true });
-    writeAtomicText(this.leaderFailureFile(failure.taskId), `${JSON.stringify(failure, null, 2)}\n`);
+    this.writeSnapshot(this.leaderFailureFile(failure.taskId), `${JSON.stringify(failure, null, 2)}\n`);
   }
 
   clearLeaderFailure(taskId: string): void {
@@ -281,7 +281,7 @@ export class FileTaskStore implements TaskStore {
 
   saveTaskSchedule(taskId: string, schedule: TaskSchedule): void {
     mkdirSync(this.taskDir(taskId), { recursive: true });
-    writeAtomicText(this.taskScheduleFile(taskId), `${JSON.stringify(schedule, null, 2)}\n`);
+    this.writeSnapshot(this.taskScheduleFile(taskId), `${JSON.stringify(schedule, null, 2)}\n`);
   }
 
   nextCycleId(taskId: string): string {
@@ -302,7 +302,7 @@ export class FileTaskStore implements TaskStore {
 
   saveCycle(taskId: string, cycle: Cycle): void {
     mkdirSync(this.cyclesDir(taskId), { recursive: true });
-    writeAtomicText(this.cycleFile(taskId, cycle.id), `${JSON.stringify(cycle, null, 2)}\n`);
+    this.writeSnapshot(this.cycleFile(taskId, cycle.id), `${JSON.stringify(cycle, null, 2)}\n`);
   }
 
   nextWorkItemId(taskId: string): string {
@@ -323,7 +323,7 @@ export class FileTaskStore implements TaskStore {
 
   saveWorkItem(taskId: string, workItem: WorkItem): void {
     mkdirSync(this.workItemsDir(taskId), { recursive: true });
-    writeAtomicText(this.workItemFile(taskId, workItem.id), `${JSON.stringify(workItem, null, 2)}\n`);
+    this.writeSnapshot(this.workItemFile(taskId, workItem.id), `${JSON.stringify(workItem, null, 2)}\n`);
   }
 
   getAgentSession(taskId: string, roleName: string): AgentSession | null {
@@ -334,7 +334,7 @@ export class FileTaskStore implements TaskStore {
 
   saveAgentSession(session: AgentSession): void {
     mkdirSync(this.agentSessionsDir(session.taskId), { recursive: true });
-    writeAtomicText(
+    this.writeSnapshot(
       this.agentSessionFile(session.taskId, session.roleName),
       `${JSON.stringify(session, null, 2)}\n`
     );
@@ -351,7 +351,7 @@ export class FileTaskStore implements TaskStore {
 
   saveAgentRun(run: AgentRun): void {
     mkdirSync(this.agentRunsDir(run.taskId), { recursive: true });
-    writeAtomicText(this.agentRunFile(run.taskId, run.id), `${JSON.stringify(run, null, 2)}\n`);
+    this.writeSnapshot(this.agentRunFile(run.taskId, run.id), `${JSON.stringify(run, null, 2)}\n`);
   }
 
   getActiveAgentRun(taskId: string, roleName: string): AgentRun | null {
@@ -369,7 +369,7 @@ export class FileTaskStore implements TaskStore {
 
   saveActiveAgentRun(run: AgentRun): void {
     mkdirSync(this.activeAgentRunsDir(run.taskId), { recursive: true });
-    writeAtomicText(this.activeAgentRunFile(run.taskId, run.roleName), `${JSON.stringify(run, null, 2)}\n`);
+    this.writeSnapshot(this.activeAgentRunFile(run.taskId, run.roleName), `${JSON.stringify(run, null, 2)}\n`);
   }
 
   clearActiveAgentRun(taskId: string, roleName: string): void {
@@ -378,7 +378,7 @@ export class FileTaskStore implements TaskStore {
 
   saveTaskBrief(taskId: string, markdown: string): void {
     mkdirSync(this.taskDir(taskId), { recursive: true });
-    writeAtomicText(this.taskBriefFile(taskId), markdown);
+    this.writeSnapshot(this.taskBriefFile(taskId), markdown);
   }
 
   readTaskBrief(taskId: string): string | null {
@@ -407,7 +407,7 @@ export class FileTaskStore implements TaskStore {
 
   saveMilestone(taskId: string, milestone: Milestone): void {
     mkdirSync(this.milestonesDir(taskId), { recursive: true });
-    writeAtomicText(this.milestoneFile(taskId, milestone.id), `${JSON.stringify(milestone, null, 2)}\n`);
+    this.writeSnapshot(this.milestoneFile(taskId, milestone.id), `${JSON.stringify(milestone, null, 2)}\n`);
   }
 
   nextDecisionId(taskId: string): string {
@@ -427,12 +427,12 @@ export class FileTaskStore implements TaskStore {
 
   saveDecision(taskId: string, decision: Decision): void {
     mkdirSync(this.decisionsDir(taskId), { recursive: true });
-    writeAtomicText(this.decisionFile(taskId, decision.id), `${JSON.stringify(decision, null, 2)}\n`);
+    this.writeSnapshot(this.decisionFile(taskId, decision.id), `${JSON.stringify(decision, null, 2)}\n`);
   }
 
   saveRoleWorktree(taskId: string, worktree: RoleWorktree): void {
     mkdirSync(this.roleDir(taskId, worktree.roleName), { recursive: true });
-    writeAtomicText(
+    this.writeSnapshot(
       this.roleWorktreeFile(taskId, worktree.roleName),
       `${JSON.stringify(worktree, null, 2)}\n`
     );
@@ -444,8 +444,8 @@ export class FileTaskStore implements TaskStore {
     const encoded = taskRecordCodec.encodeRole(role);
 
     mkdirSync(roleDir, { recursive: true });
-    writeAtomicText(this.roleFile(taskId, storageName), `${JSON.stringify(encoded.runtime, null, 2)}\n`);
-    writeAtomicText(this.roleInfoFile(taskId, storageName), `${JSON.stringify(encoded.info, null, 2)}\n`);
+    this.writeSnapshot(this.roleFile(taskId, storageName), `${JSON.stringify(encoded.runtime, null, 2)}\n`);
+    this.writeSnapshot(this.roleInfoFile(taskId, storageName), `${JSON.stringify(encoded.info, null, 2)}\n`);
   }
 
   renameRole(taskId: string, oldName: string, role: Role): void {
@@ -456,8 +456,8 @@ export class FileTaskStore implements TaskStore {
     }
 
     const encoded = taskRecordCodec.encodeRole(role);
-    writeAtomicText(this.roleFile(taskId, storageName), `${JSON.stringify(encoded.runtime, null, 2)}\n`);
-    writeAtomicText(this.roleInfoFile(taskId, storageName), `${JSON.stringify(encoded.info, null, 2)}\n`);
+    this.writeSnapshot(this.roleFile(taskId, storageName), `${JSON.stringify(encoded.runtime, null, 2)}\n`);
+    this.writeSnapshot(this.roleInfoFile(taskId, storageName), `${JSON.stringify(encoded.info, null, 2)}\n`);
   }
 
   listRoles(taskId: string): Role[] {
@@ -483,7 +483,7 @@ export class FileTaskStore implements TaskStore {
     const roleDir = this.roleDir(taskId, role.name);
     mkdirSync(roleDir, { recursive: true });
     rmSync(this.roleFile(taskId, role.name), { force: true });
-    writeAtomicText(this.roleInfoFile(taskId, role.name), `${JSON.stringify(role, null, 2)}\n`);
+    this.writeSnapshot(this.roleInfoFile(taskId, role.name), `${JSON.stringify(role, null, 2)}\n`);
   }
 
   getChildRole(taskId: string, name: string): ChildRole | null {
@@ -528,7 +528,7 @@ export class FileTaskStore implements TaskStore {
   saveGlobalRole(role: GlobalRole): void {
     const roleDir = this.globalRoleDir(role.name);
     mkdirSync(roleDir, { recursive: true });
-    writeAtomicText(this.globalRoleFile(role.name), `${JSON.stringify(role, null, 2)}\n`);
+    this.writeSnapshot(this.globalRoleFile(role.name), `${JSON.stringify(role, null, 2)}\n`);
   }
 
   listGlobalRoles(): GlobalRole[] {
@@ -615,7 +615,7 @@ export class FileTaskStore implements TaskStore {
     const storageName = this.resolveRoleStorageName(taskId, roleName) ?? roleName;
     const roleDir = this.roleDir(taskId, storageName);
     mkdirSync(roleDir, { recursive: true });
-    writeAtomicText(this.transcriptFile(taskId, storageName), transcript);
+    this.writeSnapshot(this.transcriptFile(taskId, storageName), transcript);
   }
 
   readTranscript(taskId: string, roleName: string): string | null {
@@ -631,7 +631,7 @@ export class FileTaskStore implements TaskStore {
   saveCustomRunner(runner: CustomRunner): void {
     const runnerDir = this.runnerDir(runner.id);
     mkdirSync(runnerDir, { recursive: true });
-    writeAtomicText(this.runnerFile(runner.id), `${JSON.stringify(runner, null, 2)}\n`);
+    this.writeSnapshot(this.runnerFile(runner.id), `${JSON.stringify(runner, null, 2)}\n`);
   }
 
   listCustomRunners(): CustomRunner[] {
@@ -934,6 +934,10 @@ export class FileTaskStore implements TaskStore {
       }
       throw error;
     }
+  }
+
+  private writeSnapshot(target: string, content: string): void {
+    writeRecoverableSnapshot(this.rootDir, target, content);
   }
 
   private readOptionalText(path: string): string | null {
@@ -1330,25 +1334,4 @@ function isOptionalString(value: unknown): value is string | undefined {
 
 function isStringRecord(value: unknown): value is Record<string, string> {
   return isRecord(value) && Object.values(value).every((item) => typeof item === "string");
-}
-
-function writeAtomicText(target: string, content: string): void {
-  mkdirSync(dirname(target), { recursive: true });
-  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
-  let descriptor: number | null = null;
-
-  try {
-    descriptor = openSync(temporary, "wx", 0o600);
-    writeFileSync(descriptor, content, { encoding: "utf8" });
-    fsyncSync(descriptor);
-    closeSync(descriptor);
-    descriptor = null;
-    renameSync(temporary, target);
-  } catch (error) {
-    if (descriptor !== null) {
-      closeSync(descriptor);
-    }
-    rmSync(temporary, { force: true });
-    throw error;
-  }
 }
