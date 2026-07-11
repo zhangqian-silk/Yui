@@ -1,4 +1,4 @@
-<p align="right"><strong>English</strong> | <a href="README.zh-CN.md">简体中文</a></p>
+<p align="right"><strong>English</strong> | <a href="https://github.com/zhangqian-silk/TaskMux/blob/master/i18n/README.zh-CN.md">简体中文</a></p>
 
 # TaskMux
 
@@ -51,11 +51,11 @@ taskmux task enter task-1 leader
 
 ## How it works
 
-![TaskMux architecture: User and Scheduler connect through the local Controller to durable files, a derived index, and tmux Agent sessions.](assets/taskmux-architecture.png)
+![TaskMux architecture: User and Scheduler connect through the local Controller to durable files, a derived index, and tmux Agent sessions.](https://raw.githubusercontent.com/zhangqian-silk/TaskMux/master/assets/taskmux-architecture.png)
 
 The Controller is the single mutation boundary. It starts on demand, listens only on loopback, and coordinates persistence, scheduling, Agent dispatch, and tmux state.
 
-![TaskMux workflow: a long-running Task advances through input, Leader planning, finite WorkItems, Worker execution, durable yield, and the next Cycle.](assets/taskmux-workflow.png)
+![TaskMux workflow: a long-running Task advances through input, Leader planning, finite WorkItems, Worker execution, durable yield, and the next Cycle.](https://raw.githubusercontent.com/zhangqian-silk/TaskMux/master/assets/taskmux-workflow.png)
 
 ## Core concepts
 
@@ -147,7 +147,7 @@ TaskMux stores authoritative state under `~/.taskmux` by default. Set `TASKMUX_H
 
 The SQLite index is derived and disposable. TaskMux refreshes derived state only at explicit Controller boundaries: startup, successful command transactions, and Scheduler scans. It does **not** watch or poll storage files. Use the CLI instead of editing TaskMux files directly when a change must take effect predictably.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the system model, persistence rules, and runtime boundaries.
+See [ARCHITECTURE.md](https://github.com/zhangqian-silk/TaskMux/blob/master/ARCHITECTURE.md) for the system model, persistence rules, and runtime boundaries.
 
 ## Development
 
