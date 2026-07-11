@@ -1,12 +1,12 @@
-<p align="right"><a href="README.md">English</a> | <strong>简体中文</strong></p>
+<p align="right"><a href="../README.md">English</a> | <strong>简体中文</strong></p>
 
 # TaskMux
 
 TaskMux 是面向长时间运行的原生 Agent CLI 会话的本地控制平面。它将持久化任务模型、单一 Controller 和 tmux Agent 会话组合在一起，使任务可以持续推进、故障恢复和并行委派，同时不把状态隐藏在远端服务中。
 
 [![npm version](https://img.shields.io/npm/v/@zq-silk/taskmux.svg)](https://www.npmjs.com/package/@zq-silk/taskmux)
-[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](package.json)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](../LICENSE)
+[![node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](../package.json)
 
 ## 为什么使用 TaskMux？
 
@@ -51,11 +51,11 @@ taskmux task enter task-1 leader
 
 ## 工作原理
 
-![TaskMux 架构：用户和 Scheduler 通过本地 Controller 连接持久化文件、派生索引与 tmux Agent 会话。](assets/taskmux-architecture.png)
+![TaskMux 架构：用户和 Scheduler 通过本地 Controller 连接持久化文件、派生索引与 tmux Agent 会话。](../assets/taskmux-architecture.png)
 
 Controller 是唯一的变更边界。它按需启动，仅监听 loopback，并统一协调持久化、调度、Agent 派发和 tmux 状态。
 
-![TaskMux 工作流：长生命周期 Task 经过输入、Leader 规划、有限 WorkItem、Worker 执行、持久化 Yield 和下一轮 Cycle 持续推进。](assets/taskmux-workflow.png)
+![TaskMux 工作流：长生命周期 Task 经过输入、Leader 规划、有限 WorkItem、Worker 执行、持久化 Yield 和下一轮 Cycle 持续推进。](../assets/taskmux-workflow.png)
 
 ## 核心概念
 
@@ -147,7 +147,7 @@ TaskMux 默认将权威状态存储在 `~/.taskmux`。测试或自动化可通�
 
 SQLite 索引只是可删除、可重建的派生数据。TaskMux 只在显式 Controller 边界刷新派生状态：启动、成功的命令事务和 Scheduler 扫描。它**不会**监听或轮询存储文件。需要可预测地生效时，应使用 CLI，而不是直接编辑 TaskMux 文件。
 
-系统模型、持久化规则和运行时边界见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+系统模型、持久化规则和运行时边界见 [ARCHITECTURE.md](../ARCHITECTURE.md)。
 
 ## 本地开发
 
@@ -167,4 +167,4 @@ taskmux-dev --help
 
 ## 许可证
 
-[MIT](LICENSE)
+[MIT](../LICENSE)
