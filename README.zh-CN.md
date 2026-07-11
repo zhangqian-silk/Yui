@@ -51,39 +51,11 @@ taskmux task enter task-1 leader
 
 ## 工作原理
 
-```mermaid
-flowchart LR
-    User[用户] --> CLI[CLI / Operator]
-    CLI --> Controller[本地 Controller]
-    Scheduler[Scheduler] --> Controller
-    Controller --> Files[(权威本地文件)]
-    Controller --> Index[(派生 SQLite 索引)]
-    Controller --> Tmux[tmux 运行时]
-    Tmux --> Leader[Leader 会话]
-    Tmux --> Workers[独立角色会话]
-    Workers -->|yield| Controller
-    Controller -->|合并后的唤醒| Leader
-```
+![TaskMux 架构：用户和 Scheduler 通过本地 Controller 连接持久化文件、派生索引与 tmux Agent 会话。](assets/taskmux-architecture.png)
 
 Controller 是唯一的变更边界。它按需启动，仅监听 loopback，并统一协调持久化、调度、Agent 派发和 tmux 状态。
 
-```mermaid
-sequenceDiagram
-    actor User as 用户
-    participant Operator
-    participant Controller
-    participant Leader
-    participant Worker
-
-    User->>Operator: 创建或更新 Task
-    Operator->>Controller: 已校验的 CLI 命令
-    Controller->>Leader: 启动或恢复固定会话
-    Leader->>Controller: 创建 WorkItem 并派发角色
-    Controller->>Worker: 启动或恢复原生 Agent 会话
-    Worker->>Controller: Yield 持久化结果
-    Controller->>Leader: 合并原因后只唤醒一次
-    Leader->>Controller: 整理结果和下一步重点
-```
+![TaskMux 工作流：长生命周期 Task 经过输入、Leader 规划、有限 WorkItem、Worker 执行、持久化 Yield 和下一轮 Cycle 持续推进。](assets/taskmux-workflow.png)
 
 ## 核心概念
 

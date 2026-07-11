@@ -13,6 +13,7 @@
     "README.md",
     "README.zh-CN.md",
     "ARCHITECTURE.md",
+    "assets",
     "LICENSE"
   ],
   "scripts": {

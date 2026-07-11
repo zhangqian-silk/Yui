@@ -13,24 +13,7 @@ This document describes the current architectural contract of TaskMux. It is a m
 
 ## System context
 
-```mermaid
-flowchart TB
-    User[User] --> CLI[TaskMux CLI]
-    User --> Operator[Operator Agent session]
-    Operator --> CLI
-    CLI -->|authenticated loopback RPC| Controller
-    Scheduler --> Controller
-
-    Controller --> Domain[Domain services]
-    Controller --> Store[File repository]
-    Controller --> Index[(Derived SQLite index)]
-    Controller --> Executors[Agent executors]
-    Executors --> Tmux[tmux runtime]
-    Tmux --> Leader[Leader session]
-    Tmux --> Roles[Independent role sessions]
-
-    Store --> Home[(TASKMUX_HOME)]
-```
+![TaskMux system context: the local Controller coordinates user commands, scheduling, durable files, the derived index, and tmux Agent sessions.](assets/taskmux-architecture.png)
 
 TaskMux has no required remote control plane, database server, or message broker. The CLI remains the public interface; the Controller is local infrastructure.
 
@@ -50,42 +33,13 @@ TaskMux has no required remote control plane, database server, or message broker
 
 ## Domain model
 
-```mermaid
-classDiagram
-    Task "1" --> "*" Cycle
-    Task "1" --> "*" WorkItem
-    Task "1" --> "*" TaskRole
-    Task "1" --> "*" Topic
-    Task "1" --> "*" Decision
-    Task "1" --> "*" Milestone
-    Cycle "0..1" --> "*" WorkItem
-    WorkItem "0..1" --> "*" AgentRun
-    TaskRole "1" --> "*" AgentRun
-
-    class Task {
-      id
-      title
-      archived
-      current focus
-    }
-    class Cycle {
-      cause
-      summary
-      active or ended
-    }
-    class WorkItem {
-      assignee
-      topics
-      finite status
-      outcome
-    }
-    class AgentRun {
-      mode
-      input
-      active or terminal status
-      summary
-    }
-```
+| Entity | Relationship |
+| --- | --- |
+| **Task** | Owns Cycles, WorkItems, TaskRoles, Topics, Decisions, and Milestones. |
+| **Cycle** | Groups one bounded period of advancement and may contain WorkItems. |
+| **WorkItem** | May span one or more AgentRuns until it reaches a terminal outcome. |
+| **TaskRole** | Owns the execution contract and AgentRuns for one responsibility. |
+| **AgentRun** | Records one asynchronous dispatch round and its durable result. |
 
 ### Task lifecycle
 
@@ -102,22 +56,7 @@ Global role templates use copy semantics. Once a role is bound into a Task, late
 
 ## Command and transaction flow
 
-```mermaid
-sequenceDiagram
-    participant CLI
-    participant Controller
-    participant Journal as Recovery journal
-    participant Files as Authoritative files
-    participant Index as Derived index
-
-    CLI->>Controller: RPC(method, params, requestId, token)
-    Controller->>Journal: Persist request intent
-    Controller->>Journal: Stage complete transaction
-    Journal->>Files: Apply atomic write/delete set
-    Controller->>Journal: Persist RPC result and clear intent
-    Controller->>Index: Rebuild derived state
-    Controller-->>CLI: Stable result envelope
-```
+![TaskMux persistence: requests pass through the idempotent Controller, transaction journal, authoritative files, and replaceable derived index.](assets/taskmux-reliability.png)
 
 Mutating request IDs are idempotent. A committed result is returned without reapplying the command. If a process stops after a transaction is staged, Controller startup completes the staged operation before serving requests.
 
@@ -125,18 +64,7 @@ Setup and schema migration remain explicit lifecycle operations. Ordinary CLI, d
 
 ## Dispatch and wakeup flow
 
-```mermaid
-flowchart LR
-    Trigger[Input / schedule / role result / inactivity] --> Pending[Pending wakeup]
-    Pending --> Coalesce[Coalesce reasons]
-    Coalesce --> Recover[Recover fixed Leader session]
-    Recover --> Cycle[Create advancement Cycle]
-    Cycle --> Work[Create or update WorkItems]
-    Work --> Dispatch[Dispatch independent role]
-    Dispatch --> Run[AgentRun]
-    Run --> Yield[Durable yield]
-    Yield --> Pending
-```
+![TaskMux workflow: triggers wake the fixed Leader, which creates finite work, dispatches a Worker, and receives a durable Yield for the next Cycle.](assets/taskmux-workflow.png)
 
 Dispatch returns after the native session accepts the work; execution remains asynchronous. Yield ends the AgentRun, updates any linked WorkItem, and queues one coalesced Leader wakeup.
 
@@ -193,17 +121,6 @@ TaskMux does not run a filesystem watcher or a polling loop for direct file edit
 The supported mutation path is the CLI. Direct file edits are not automatically detected and should not be used when immediate, predictable application is required.
 
 ## Agent and tmux boundaries
-
-```mermaid
-flowchart TB
-    Task --> Session[tmux Task session]
-    Session --> LeaderWindow[Leader window]
-    Session --> WorkerWindowA[Worker window A]
-    Session --> WorkerWindowB[Worker window B]
-    Operator --> OperatorSession[separate persistent tmux session]
-    WorkerWindowA --> WorktreeA[optional Git worktree A]
-    WorkerWindowB --> WorktreeB[optional Git worktree B]
-```
 
 One Task maps to one tmux session. Each independent TaskRole maps to one window and native Agent session. When the Leader workspace is a Git repository, independent roles require an explicit TaskMux worktree before dispatch.
 
