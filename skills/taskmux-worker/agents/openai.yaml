@@ -1,0 +1,4 @@
+interface:
+  display_name: "TaskMux Worker"
+  short_description: "Execute and report TaskMux work items"
+  default_prompt: "Use $taskmux-worker to execute the assigned TaskMux work item and report the result."

@@ -1,7 +1,7 @@
 import { dataError } from "../errors/cliError.js";
-import type { Role } from "../role/role.js";
+import type { Role, RoleProfile } from "../role/role.js";
 import type { RunnerEnvironment } from "../runner/runner.js";
-import type { Task, TaskPriority, TaskStatus } from "../task/task.js";
+import type { Task, TaskPriority } from "../task/task.js";
 
 export type TaskInfoRecord = {
   schemaVersion: 1;
@@ -15,12 +15,16 @@ export type TaskInfoRecord = {
 export type TaskRuntimeRecord = {
   schemaVersion: 1;
   id: string;
-  status: TaskStatus;
+  archived: boolean;
+  archivedAt?: string;
+  archivedBy?: Task["archivedBy"];
+  archiveReason?: string;
+  archiveSummary?: string;
   createdAt: string;
   updatedAt: string;
 };
 
-export type RoleInfoRecord = {
+export type RoleInfoRecord = RoleProfile & {
   schemaVersion: 1;
   name: string;
 };
@@ -53,7 +57,11 @@ export class TaskRecordCodec {
       runtime: {
         schemaVersion: task.schemaVersion,
         id: task.id,
-        status: task.status,
+        archived: task.archived,
+        archivedAt: task.archivedAt,
+        archivedBy: task.archivedBy,
+        archiveReason: task.archiveReason,
+        archiveSummary: task.archiveSummary,
         createdAt: task.createdAt,
         updatedAt: task.updatedAt
       },
@@ -102,7 +110,13 @@ export class TaskRecordCodec {
       },
       info: {
         schemaVersion: 1,
-        name: role.name
+        name: role.name,
+        description: role.description,
+        responsibilities: role.responsibilities,
+        constraints: role.constraints,
+        expectedOutput: role.expectedOutput,
+        systemPrompt: role.systemPrompt,
+        skills: role.skills
       }
     };
   }
@@ -118,7 +132,7 @@ export class TaskRecordCodec {
 
     return {
       ...runtime,
-      name: info.name
+      ...info
     };
   }
 
@@ -130,14 +144,28 @@ export class TaskRecordCodec {
       value.schemaVersion !== 1 ||
       typeof value.id !== "string" ||
       "title" in value ||
-      !isTaskStatus(value.status) ||
+      (typeof value.archived !== "boolean" && !isLegacyTaskStatus(value.status)) ||
+      (value.archivedAt !== undefined && typeof value.archivedAt !== "string") ||
+      (value.archivedBy !== undefined && !["user", "operator", "leader"].includes(String(value.archivedBy))) ||
+      (value.archiveReason !== undefined && typeof value.archiveReason !== "string") ||
+      (value.archiveSummary !== undefined && typeof value.archiveSummary !== "string") ||
       typeof value.createdAt !== "string" ||
       typeof value.updatedAt !== "string"
     ) {
       throw dataError(`Invalid task record: ${id}`);
     }
 
-    return value as TaskRuntimeRecord;
+    return {
+      schemaVersion: 1,
+      id: value.id,
+      archived: typeof value.archived === "boolean" ? value.archived : value.status === "archived",
+      ...(value.archivedAt === undefined ? {} : { archivedAt: value.archivedAt as string }),
+      ...(value.archivedBy === undefined ? {} : { archivedBy: value.archivedBy as Task["archivedBy"] }),
+      ...(value.archiveReason === undefined ? {} : { archiveReason: value.archiveReason as string }),
+      ...(value.archiveSummary === undefined ? {} : { archiveSummary: value.archiveSummary as string }),
+      createdAt: value.createdAt,
+      updatedAt: value.updatedAt
+    };
   }
 
   private parseTaskInfo(id: string, raw: string): TaskInfoRecord {
@@ -183,7 +211,17 @@ export class TaskRecordCodec {
   private parseRoleInfo(name: string, raw: string): RoleInfoRecord {
     const value = parseJson(raw, `Invalid role info record: ${name}`);
 
-    if (!isRecord(value) || value.schemaVersion !== 1 || typeof value.name !== "string") {
+    if (
+      !isRecord(value) ||
+      value.schemaVersion !== 1 ||
+      typeof value.name !== "string" ||
+      !isOptionalString(value.description) ||
+      (value.responsibilities !== undefined && !isStringArray(value.responsibilities)) ||
+      (value.constraints !== undefined && !isStringArray(value.constraints)) ||
+      !isOptionalString(value.expectedOutput) ||
+      !isOptionalString(value.systemPrompt) ||
+      (value.skills !== undefined && !isStringArray(value.skills))
+    ) {
       throw dataError(`Invalid role info record: ${name}`);
     }
 
@@ -213,7 +251,11 @@ function isStringRecord(value: unknown): value is Record<string, string> {
   return isRecord(value) && Object.values(value).every((item) => typeof item === "string");
 }
 
-function isTaskStatus(status: unknown): status is TaskStatus {
+function isOptionalString(value: unknown): value is string | undefined {
+  return value === undefined || typeof value === "string";
+}
+
+function isLegacyTaskStatus(status: unknown): boolean {
   return ["open", "active", "done", "archived"].includes(String(status));
 }
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "TaskMux Operator"
+  short_description: "Manage TaskMux tasks and user input safely"
+  default_prompt: "Use $taskmux-operator to update and coordinate a TaskMux task for me."

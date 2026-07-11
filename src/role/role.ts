@@ -2,7 +2,16 @@ import type { RunnerDefinition, RunnerEnvironment } from "../runner/runner.js";
 
 export type RoleStatus = "idle" | "running" | "detached" | "exited" | "failed";
 
-export type Role = {
+export type RoleProfile = {
+  description?: string;
+  responsibilities?: string[];
+  constraints?: string[];
+  expectedOutput?: string;
+  systemPrompt?: string;
+  skills?: string[];
+};
+
+export type Role = RoleProfile & {
   schemaVersion: 1;
   name: string;
   agent: string;
@@ -15,7 +24,7 @@ export type Role = {
   updatedAt: string;
 };
 
-export type GlobalRole = {
+export type GlobalRole = RoleProfile & {
   schemaVersion: 1;
   name: string;
   agent: string;
@@ -27,7 +36,13 @@ export type GlobalRole = {
   updatedAt: string;
 };
 
-export function createRole(name: string, runner: RunnerDefinition, workspace: string, now: Date): Role {
+export function createRole(
+  name: string,
+  runner: RunnerDefinition,
+  workspace: string,
+  now: Date,
+  profile: RoleProfile = {}
+): Role {
   const trimmedName = name.trim();
   const trimmedAgent = runner.id.trim();
   const trimmedWorkspace = workspace.trim();
@@ -54,14 +69,21 @@ export function createRole(name: string, runner: RunnerDefinition, workspace: st
     args: runner.args,
     env: runner.env,
     workspace: trimmedWorkspace,
+    ...profile,
     status: "idle",
     createdAt: timestamp,
     updatedAt: timestamp
   };
 }
 
-export function createGlobalRole(name: string, runner: RunnerDefinition, workspace: string, now: Date): GlobalRole {
-  const role = createRole(name, runner, workspace, now);
+export function createGlobalRole(
+  name: string,
+  runner: RunnerDefinition,
+  workspace: string,
+  now: Date,
+  profile: RoleProfile = {}
+): GlobalRole {
+  const role = createRole(name, runner, workspace, now, profile);
 
   return {
     schemaVersion: role.schemaVersion,
@@ -71,6 +93,12 @@ export function createGlobalRole(name: string, runner: RunnerDefinition, workspa
     args: role.args,
     env: role.env,
     workspace: role.workspace,
+    description: role.description,
+    responsibilities: role.responsibilities,
+    constraints: role.constraints,
+    expectedOutput: role.expectedOutput,
+    systemPrompt: role.systemPrompt,
+    skills: role.skills,
     createdAt: role.createdAt,
     updatedAt: role.updatedAt
   };
@@ -87,6 +115,12 @@ export function copyGlobalRoleToTaskRole(globalRole: GlobalRole, now: Date, name
     args: globalRole.args,
     env: globalRole.env,
     workspace: globalRole.workspace,
+    description: globalRole.description,
+    responsibilities: globalRole.responsibilities,
+    constraints: globalRole.constraints,
+    expectedOutput: globalRole.expectedOutput,
+    systemPrompt: globalRole.systemPrompt,
+    skills: globalRole.skills,
     status: "idle",
     createdAt: timestamp,
     updatedAt: timestamp

@@ -314,6 +314,12 @@ Storage reads validate JSON records before returning domain objects:
 
 Invalid records raise `DATA_ERROR` instead of being skipped silently.
 
+Controller-backed reads wrap `FileTaskStore` with `createResilientTaskStore`. The wrapper refreshes cached values after valid reads and returns the method's last valid value when a later direct edit fails schema validation. Startup and file-watcher refreshes prime individual Task, role, Cycle, WorkItem, milestone, decision, session, and runner lookup paths. Invalid edits remain untouched and are recorded in `runtime/logs/controller.jsonl`.
+
+Snapshot writes use `src/storage/recoveryJournal.ts`. Each write first stages a complete target-relative payload under `runtime/recovery-journal/`, atomically replaces the snapshot, and removes the staged record. `src/storage/domainTransaction.ts` runs multi-file commands against an isolated authoritative-state workspace, derives complete file and directory write/delete operations, and stages them under `runtime/domain-transactions/`. Controller startup replays domain transactions before individual snapshot writes, so a crash during application converges to the complete committed state.
+
+`src/storage/derivedIndex.ts` rebuilds `runtime/index.sqlite` from authoritative files. The index contains Task, role, and WorkItem lookup tables only; it is refreshed on startup, Controller mutations, scheduler scans, and valid file-watcher reloads. A missing or corrupt index is deleted and rebuilt without changing Task data.
+
 `src/storage/taskRecordCodec.ts` owns task and role record encoding, decoding, and composition for the current storage schema. `FileTaskStore` only resolves file paths and raw file IO for these records. Cross-version upgrade handling belongs to the storage schema and migration boundary, not to fallback branches inside business stores.
 
 `src/storage/storageSchema.ts` owns the global storage schema manifest, startup preflight, and migration runner. Normal `task`, `agent`, and `role` commands call the preflight before constructing business stores. Missing storage raises `DATA_ERROR` with `taskmux setup` guidance. Outdated storage raises `DATA_ERROR` with `taskmux migrate` guidance; preflight does not initialize missing storage or let business commands read older layouts.
@@ -322,7 +328,7 @@ Storage migrations live under `src/storage/migrations/` and are registered by th
 
 `taskmux migrate --dry-run` uses the schema inspector only. It does not call the migration runner, create backups, or write the manifest.
 
-`src/storage/storageBackup.ts` owns raw storage backups. `taskmux backup` creates `backups/backup-<timestamp>/` under the TaskMux home and copies all current storage entries except `backups/`. `taskmux migrate` creates a backup before applying migrations from an older schema version and includes that backup path in command output.
+`src/storage/storageBackup.ts` owns raw storage backups. `taskmux backup` creates the copy under a private pending directory, copies all current storage entries except `backups/`, writes its manifest, and atomically renames it to `backups/backup-<timestamp>/`. `taskmux migrate` creates a backup before applying migrations from an older schema version and includes that backup path in command output.
 
 `src/commands/maintenanceCommands.ts` owns export, import, and prune. Export builds a JSON snapshot through store APIs. Import restores config, custom agents, global role presets, tasks, task roles, transcripts, comments, and events through the same store write APIs. Prune removes trash task directories and old backup directories by filesystem path under the configured TaskMux home.
 
@@ -347,6 +353,16 @@ Command handlers throw `CliError` for expected user, lookup, and storage failure
 
 TaskMux reads recent role output through tmux capture APIs. The first version exposes role detail, tail, transcript, and task event history without attaching to the role.
 
+Controller infrastructure diagnostics are append-only JSONL records under `runtime/logs/controller.jsonl`. Storage reload and scheduler errors stay out of the curated Task timeline.
+
+Agent-specific start and recovery command construction lives behind the common `AgentExecutor` contract. The contract also owns send, interrupt, stop, status mapping, native session discovery, metadata attachment, and capabilities; `TmuxManager` supplies the isolated runtime operations.
+
+Controller RPC writes stage a durable request intent before mutation. The domain transaction includes the cached RPC result, so startup replay restores both state and the response without rerunning the command. A surviving intent without a committed result returns an explicit unknown-outcome conflict. Results expire after 30 days by default (`TASKMUX_RPC_RESULT_RETENTION_MS`); compact tombstones prevent expired request IDs from ever being reapplied. CLI commands, Dashboard commands, Task Shell mutations, Scheduler scans, attach status, import, prune, and backup share the Controller single-writer boundary; setup and migration remain explicit lifecycle operations.
+
+Claude session IDs are reserved before the first launch and the reserved session uses `--session-id`. Codex assigns new interactive thread IDs internally, so its first dispatch injects a registration command using `CODEX_THREAD_ID`; all later Leader wakeups recover that fixed registered session.
+
+Leader recovery failures create durable Operator notifications and best-effort alerts in the protected Operator tmux session. Explicitly recording or replacing the fixed Leader session clears the failure pause and notification before wakeup processing resumes.
+
 `task detail` combines role name from `info.json` with runtime metadata from `role.json` and derives the tmux target as `taskmux-<task-id>:<role>`. `task status` probes tmux window state and persists detected status changes. `task refresh` and `task cleanup` apply the same probe to every role in a task. `task transcript` reads tmux capture output and persists it to `roles/<role>/transcript.log`.
 
 `task events` reads `events.jsonl` and prints event id, timestamp, type, and payload key-value pairs. `task open` reads task, role, and comment counts from storage and prints a task context summary. `task context` produces a fuller handoff snapshot, with JSON output available for automation. `task shell` provides an interactive wrapper over the same task command handlers, including `events` and `context`. `task detach` detaches tmux clients for the task session and does not terminate the role process.
@@ -355,4 +371,4 @@ TaskMux reads recent role output through tmux capture APIs. The first version ex
 
 Domain behavior should be tested without requiring tmux. Tmux command construction and process integration should be isolated behind interfaces so unit tests can use fakes.
 
-End-to-end tmux tests should be added only after the command surface and tmux manager interface stabilize.
+The integration suite uses an isolated real tmux server for multi-role window and cwd isolation. Real Codex and Claude CLI contract checks are opt-in through `TASKMUX_SMOKE_CODEX=1` and `TASKMUX_SMOKE_CLAUDE=1`; they inspect local CLI session flags without starting Agent work.

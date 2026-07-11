@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
-import { SYSTEM_ASSISTANT_ROLE, SYSTEM_LEADER_ROLE } from "../role/systemRoles.js";
+import { SYSTEM_LEADER_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
 import { resolveRunner } from "../runner/runnerRegistry.js";
 import type { TaskStore, TaskmuxConfig } from "../storage/taskStore.js";
 
@@ -78,7 +78,7 @@ function configStatusRows(store: TaskStore, config: TaskmuxConfig, env: NodeJS.P
     rows.push(["workspace", "configured", workspace]);
   }
 
-  for (const roleName of [SYSTEM_ASSISTANT_ROLE, SYSTEM_LEADER_ROLE]) {
+  for (const roleName of [SYSTEM_OPERATOR_ROLE, SYSTEM_LEADER_ROLE]) {
     const role = store.getGlobalRole(roleName);
 
     if (role === null) {

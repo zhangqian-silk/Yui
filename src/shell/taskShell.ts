@@ -8,13 +8,14 @@ import type { TmuxManager } from "../tmux/tmuxManager.js";
 export async function runTaskShell(
   taskId: string,
   store: TaskStore,
-  tmux: TmuxManager
+  tmux: TmuxManager,
+  executeTaskCommand: (args: string[]) => Promise<string> = async (args) => runTaskCommand(args, store, tmux)
 ): Promise<void> {
   if (store.getTask(taskId) === null) {
     throw taskNotFound(taskId);
   }
 
-  output.write(runTaskCommand(["open", taskId], store, tmux));
+  output.write(await executeTaskCommand(["open", taskId]));
 
   const rl = createInterface({ input, output });
 
@@ -22,7 +23,7 @@ export async function runTaskShell(
     if (!input.isTTY) {
       for await (const line of rl) {
         output.write(`taskmux ${taskId}> `);
-        if (handleShellLine(taskId, line, store, tmux) === "exit") {
+        if (await handleShellLine(taskId, line, executeTaskCommand) === "exit") {
           break;
         }
       }
@@ -31,7 +32,7 @@ export async function runTaskShell(
 
     while (true) {
       const line = await rl.question(`taskmux ${taskId}> `);
-      if (handleShellLine(taskId, line, store, tmux) === "exit") {
+      if (await handleShellLine(taskId, line, executeTaskCommand) === "exit") {
         break;
       }
     }
@@ -40,12 +41,11 @@ export async function runTaskShell(
   }
 }
 
-function handleShellLine(
+async function handleShellLine(
   taskId: string,
   line: string,
-  store: TaskStore,
-  tmux: TmuxManager
-): "continue" | "exit" {
+  executeTaskCommand: (args: string[]) => Promise<string>
+): Promise<"continue" | "exit"> {
   const command = parseCommandLine(line);
 
   if (command.length === 0) {
@@ -64,7 +64,7 @@ function handleShellLine(
   }
 
   try {
-    output.write(runTaskCommand(toTaskCommand(taskId, name, args), store, tmux));
+    output.write(await executeTaskCommand(toTaskCommand(taskId, name, args)));
   } catch (error) {
     if (error instanceof CliError) {
       output.write(`${error.code}: ${error.message}\n`);
@@ -82,10 +82,8 @@ function toTaskCommand(taskId: string, name: string, args: string[]): string[] {
   switch (normalizedName) {
     case "summary":
       return ["open", taskId];
-    case "start":
-    case "done":
     case "archive":
-    case "reopen":
+    case "unarchive":
     case "refresh":
     case "cleanup":
     case "delete":
@@ -163,10 +161,8 @@ function parseCommandLine(line: string): string[] {
 function shellHelp(): string {
   return `Task shell commands:
   summary
-  start
-  done
   archive
-  reopen
+  unarchive
   roles
   r
   refresh

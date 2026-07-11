@@ -1,4 +1,3 @@
-export type TaskStatus = "open" | "active" | "done" | "archived";
 export type TaskPriority = "low" | "medium" | "high" | "urgent";
 
 export type TaskMetadata = {
@@ -16,7 +15,11 @@ export type Task = {
   priority?: TaskPriority;
   tags?: string[];
   dueAt?: string;
-  status: TaskStatus;
+  archived: boolean;
+  archivedAt?: string;
+  archivedBy?: "user" | "operator" | "leader";
+  archiveReason?: string;
+  archiveSummary?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -35,18 +38,32 @@ export function createTask(id: string, title: string, now: Date, metadata: TaskM
     id,
     title: trimmedTitle,
     ...metadata,
-    status: "open",
+    archived: false,
     createdAt: timestamp,
     updatedAt: timestamp
   };
 }
 
-export function updateTaskStatus(task: Task, status: TaskStatus, now: Date): Task {
-  return {
-    ...task,
-    status,
-    updatedAt: now.toISOString()
-  };
+export function updateTaskArchived(
+  task: Task,
+  archived: boolean,
+  now: Date,
+  archive?: { by: NonNullable<Task["archivedBy"]>; reason?: string; summary?: string }
+): Task {
+  const { archivedAt: _archivedAt, archivedBy: _archivedBy, archiveReason: _archiveReason,
+    archiveSummary: _archiveSummary, ...base } = task;
+  const timestamp = now.toISOString();
+  return archived
+    ? {
+        ...base,
+        archived: true,
+        archivedAt: timestamp,
+        archivedBy: archive?.by ?? "user",
+        ...(archive?.reason === undefined ? {} : { archiveReason: archive.reason.trim() }),
+        ...(archive?.summary === undefined ? {} : { archiveSummary: archive.summary.trim() }),
+        updatedAt: timestamp
+      }
+    : { ...base, archived: false, updatedAt: timestamp };
 }
 
 export function updateTaskMetadata(task: Task, metadata: Partial<TaskMetadata & { title: string }>, now: Date): Task {

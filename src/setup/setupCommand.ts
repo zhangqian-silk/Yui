@@ -5,7 +5,7 @@ import type { Readable, Writable } from "node:stream";
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { createGlobalRole } from "../role/role.js";
-import { SYSTEM_ASSISTANT_ROLE, SYSTEM_LEADER_ROLE } from "../role/systemRoles.js";
+import { SYSTEM_LEADER_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
 import { createCustomRunner } from "../runner/runner.js";
 import type { RunnerDefinition } from "../runner/runner.js";
 import { resolveRunner } from "../runner/runnerRegistry.js";
@@ -331,7 +331,7 @@ function setupSystemRoles(store: TaskStore, agent: RunnerDefinition | null, work
     return;
   }
 
-  for (const roleName of [SYSTEM_ASSISTANT_ROLE, SYSTEM_LEADER_ROLE]) {
+  for (const roleName of [SYSTEM_OPERATOR_ROLE, SYSTEM_LEADER_ROLE]) {
     store.saveGlobalRole(createGlobalRole(roleName, agent, workspace, new Date()));
   }
 }
