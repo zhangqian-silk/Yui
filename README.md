@@ -23,10 +23,11 @@ Running `taskmux` without arguments runs `doctor` first. If every check passes, 
 - TaskMux stores task data in a user-level data directory.
 - Running `taskmux` without arguments opens the local interactive dashboard after passing doctor checks.
 - A Task is a long-lived mission with only an `archived` marker; completion belongs to finite WorkItems, Cycles, and AgentRuns.
-- The local Controller binds to `127.0.0.1`, authenticates with a random token, coalesces wakeups, and performs inactivity and schedule scans.
+- The local Controller auto-starts for ordinary CLI commands, binds to `127.0.0.1`, authenticates with a random token, serializes mutations, deduplicates request ids, coalesces wakeups, and performs inactivity and schedule scans.
+- Each successfully dispatched Leader wakeup creates a durable Cycle describing the coalesced trigger reasons; linked WorkItems move from running to completed or failed with their AgentRun outcome.
 - One Task maps to one tmux session. Each independent role maps to one tmux window and native Agent session.
 - TaskMux has two protected system roles: global `operator` for user-facing CLI administration and task-local `leader` for task stewardship.
-- Every task includes the system `leader` role. `leader` is created with the task and cannot be renamed.
+- Every task includes the system `leader` role. `leader` is created with the task, immediately receives its first Controller-managed run, and cannot be renamed.
 - Child roles contain only descriptive constraints for a parent role. They have no TaskMux-managed Agent session, tmux window, or worktree.
 - Leaving a role means detaching from tmux, not exiting the agent CLI.
 - `task status` checks tmux window state and writes detected role status back to storage.
@@ -41,7 +42,9 @@ Running `taskmux` without arguments runs `doctor` first. If every check passes, 
 taskmux
 taskmux setup
 taskmux operator
-taskmux controller start
+# The Operator opens in the persistent taskmux-operator tmux session.
+# `controller start` remains available for explicit lifecycle management.
+taskmux controller status
 taskmux agent add claude --command claude
 taskmux role add reviewer --agent claude --workspace ~/projects/app
 taskmux board
@@ -60,7 +63,7 @@ taskmux task last
 taskmux task clone task-1 --title "Follow-up export flow"
 taskmux task update task-1 --priority urgent --tag blocked
 taskmux task update task-1 --clear-due
-taskmux task archive task-1
+taskmux task archive task-1 --reason "Current phase is stable" --summary "Canary complete; revisit at the next release."
 taskmux task unarchive task-1
 taskmux task delete task-1
 taskmux task restore task-1
@@ -91,10 +94,12 @@ taskmux task topic create task-1 --id data-migration --name "Data migration" --d
 taskmux task input draft task-1 "New user context"
 taskmux task input submit task-1
 taskmux task cycle create task-1 --cause operator-input --summary "Process submitted context"
+taskmux task cycle end task-1 cycle-1 --summary "Submitted context has been incorporated"
+taskmux task decision record task-1 --title "Use canary deployment" --rationale "Limit rollback impact" --topic architecture --topic deployment
 taskmux task work-item create task-1 --title "Run canary checks" --assignee leader --topic testing --topic deployment
 taskmux task role child task-1 risk-reviewer --parent leader --description "Review risks" --expected-output "Risk report"
 taskmux task session record task-1 leader --native-id native-session-id
-taskmux task dispatch task-1 reviewer --mode resume --input "Continue review"
+taskmux task dispatch task-1 reviewer --mode resume --work-item work-item-1 --topic testing --input "Continue review"
 taskmux task yield task-1 reviewer --summary "Review completed"
 taskmux task schedule set task-1 --inactivity-minutes 60 --cooldown-minutes 15 --every-minutes 1440 --next-at 2026-07-12T00:00:00Z
 taskmux task worktree create task-1 reviewer --path ../task-1-reviewer --branch taskmux/reviewer
@@ -114,6 +119,10 @@ taskmux import taskmux-snapshot.json
 taskmux prune --trash
 taskmux completion bash
 ```
+
+Append `--json` to ordinary commands for a stable `{ "ok", "output" }` envelope. Errors use `{ "ok": false, "code", "message", "details" }`. `task context --format json` continues to return the structured Task context directly.
+
+TaskMux-launched role sessions receive `TASKMUX_HOME`, `TASKMUX_TASK_ID`, `TASKMUX_ROLE`, `TASKMUX_RUN_ID`, and `TASKMUX_WORKSPACE`. Scoped commands such as `taskmux task context --format json` and `taskmux task yield --summary "..."` can therefore omit Task and role ids inside a role session.
 
 Inside the task shell:
 
@@ -230,7 +239,7 @@ Runtime records with inline task titles or role names are invalid in the current
 
 Task comments are appended to `comments.jsonl` under the task directory and can be listed without entering a role session. Each comment record includes `schemaVersion`.
 
-Task events are appended to `events.jsonl` under the task directory. The event stream records Task changes, archive transitions, role operations, dispatches, AgentRun yields, milestones, and comments; each event record includes `schemaVersion`, `id`, `type`, `payload`, and `createdAt`.
+Task events are appended to `events.jsonl` under the task directory. The event stream records Task changes, archive transitions, role operations, dispatches, AgentRun yields, decisions, milestones, and comments; each event record includes `schemaVersion`, `id`, `type`, `payload`, and `createdAt`.
 
 `task archive` and `task unarchive` update the Task's only terminal-like marker. WorkItem and AgentRun records carry finite execution states.
 

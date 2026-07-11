@@ -1,8 +1,10 @@
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { TaskComment } from "../comment/comment.js";
 import type { Milestone } from "../milestone/milestone.js";
+import type { Decision } from "../decision/decision.js";
 import type { Cycle } from "../cycle/cycle.js";
 import { dataError } from "../errors/cliError.js";
 import type { TaskEvent } from "../event/taskEvent.js";
@@ -13,6 +15,7 @@ import type { ChildRole } from "../role/childRole.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { CustomRunner } from "../runner/runner.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
+import type { LeaderFailure } from "../scheduler/leaderFailure.js";
 import type { TaskSchedule } from "../scheduler/taskSchedule.js";
 import type { Task } from "../task/task.js";
 import { emptyTaskTopics, type TaskTopics } from "../topic/topic.js";
@@ -38,13 +41,18 @@ export type TaskStore = {
   savePendingWakeup(wakeup: PendingWakeup): void;
   listPendingWakeups(): PendingWakeup[];
   clearPendingWakeup(taskId: string): void;
+  getLeaderFailure(taskId: string): LeaderFailure | null;
+  saveLeaderFailure(failure: LeaderFailure): void;
+  clearLeaderFailure(taskId: string): void;
   getTaskSchedule(taskId: string): TaskSchedule | null;
   saveTaskSchedule(taskId: string, schedule: TaskSchedule): void;
   nextCycleId(taskId: string): string;
   getCycle(taskId: string, cycleId: string): Cycle | null;
+  listCycles(taskId: string): Cycle[];
   saveCycle(taskId: string, cycle: Cycle): void;
   nextWorkItemId(taskId: string): string;
   getWorkItem(taskId: string, workItemId: string): WorkItem | null;
+  listWorkItems(taskId: string): WorkItem[];
   saveWorkItem(taskId: string, workItem: WorkItem): void;
   getAgentSession(taskId: string, roleName: string): AgentSession | null;
   saveAgentSession(session: AgentSession): void;
@@ -59,7 +67,12 @@ export type TaskStore = {
   appendTaskTimeline(taskId: string, markdown: string): void;
   nextMilestoneId(taskId: string): string;
   getMilestone(taskId: string, milestoneId: string): Milestone | null;
+  listMilestones(taskId: string): Milestone[];
   saveMilestone(taskId: string, milestone: Milestone): void;
+  nextDecisionId(taskId: string): string;
+  getDecision(taskId: string, decisionId: string): Decision | null;
+  listDecisions(taskId: string): Decision[];
+  saveDecision(taskId: string, decision: Decision): void;
   saveRoleWorktree(taskId: string, worktree: RoleWorktree): void;
   saveRole(taskId: string, role: Role): void;
   renameRole(taskId: string, oldName: string, role: Role): void;
@@ -120,7 +133,7 @@ export class FileTaskStore implements TaskStore {
 
   saveConfig(config: TaskmuxConfig): void {
     mkdirSync(this.rootDir, { recursive: true });
-    writeFileSync(this.configFile(), `${JSON.stringify(config, null, 2)}\n`);
+    writeAtomicText(this.configFile(), `${JSON.stringify(config, null, 2)}\n`);
   }
 
   nextTaskId(): string {
@@ -141,8 +154,8 @@ export class FileTaskStore implements TaskStore {
     const encoded = taskRecordCodec.encodeTask(task);
 
     mkdirSync(taskDir, { recursive: true });
-    writeFileSync(this.taskFile(task.id), `${JSON.stringify(encoded.runtime, null, 2)}\n`);
-    writeFileSync(this.taskInfoFile(task.id), `${JSON.stringify(encoded.info, null, 2)}\n`);
+    writeAtomicText(this.taskFile(task.id), `${JSON.stringify(encoded.runtime, null, 2)}\n`);
+    writeAtomicText(this.taskInfoFile(task.id), `${JSON.stringify(encoded.info, null, 2)}\n`);
   }
 
   deleteTask(id: string): boolean {
@@ -198,7 +211,7 @@ export class FileTaskStore implements TaskStore {
 
   saveTaskTopics(taskId: string, topics: TaskTopics): void {
     mkdirSync(this.taskDir(taskId), { recursive: true });
-    writeFileSync(this.topicsFile(taskId), `${JSON.stringify(topics, null, 2)}\n`);
+    writeAtomicText(this.topicsFile(taskId), `${JSON.stringify(topics, null, 2)}\n`);
   }
 
   getTaskInputDraft(taskId: string): TaskInputDraft | null {
@@ -209,7 +222,7 @@ export class FileTaskStore implements TaskStore {
 
   saveTaskInputDraft(taskId: string, draft: TaskInputDraft): void {
     mkdirSync(this.taskDir(taskId), { recursive: true });
-    writeFileSync(this.taskInputDraftFile(taskId), `${JSON.stringify(draft, null, 2)}\n`);
+    writeAtomicText(this.taskInputDraftFile(taskId), `${JSON.stringify(draft, null, 2)}\n`);
   }
 
   clearTaskInputDraft(taskId: string): void {
@@ -224,7 +237,7 @@ export class FileTaskStore implements TaskStore {
 
   savePendingWakeup(wakeup: PendingWakeup): void {
     mkdirSync(this.pendingWakeupsDir(), { recursive: true });
-    writeFileSync(this.pendingWakeupFile(wakeup.taskId), `${JSON.stringify(wakeup, null, 2)}\n`);
+    writeAtomicText(this.pendingWakeupFile(wakeup.taskId), `${JSON.stringify(wakeup, null, 2)}\n`);
   }
 
   listPendingWakeups(): PendingWakeup[] {
@@ -247,6 +260,20 @@ export class FileTaskStore implements TaskStore {
     rmSync(this.pendingWakeupFile(taskId), { force: true });
   }
 
+  getLeaderFailure(taskId: string): LeaderFailure | null {
+    const raw = this.readOptionalText(this.leaderFailureFile(taskId));
+    return raw === null ? null : parseLeaderFailure(taskId, raw);
+  }
+
+  saveLeaderFailure(failure: LeaderFailure): void {
+    mkdirSync(this.leaderFailuresDir(), { recursive: true });
+    writeAtomicText(this.leaderFailureFile(failure.taskId), `${JSON.stringify(failure, null, 2)}\n`);
+  }
+
+  clearLeaderFailure(taskId: string): void {
+    rmSync(this.leaderFailureFile(taskId), { force: true });
+  }
+
   getTaskSchedule(taskId: string): TaskSchedule | null {
     const raw = this.readOptionalText(this.taskScheduleFile(taskId));
     return raw === null ? null : parseTaskSchedule(taskId, raw);
@@ -254,7 +281,7 @@ export class FileTaskStore implements TaskStore {
 
   saveTaskSchedule(taskId: string, schedule: TaskSchedule): void {
     mkdirSync(this.taskDir(taskId), { recursive: true });
-    writeFileSync(this.taskScheduleFile(taskId), `${JSON.stringify(schedule, null, 2)}\n`);
+    writeAtomicText(this.taskScheduleFile(taskId), `${JSON.stringify(schedule, null, 2)}\n`);
   }
 
   nextCycleId(taskId: string): string {
@@ -267,9 +294,15 @@ export class FileTaskStore implements TaskStore {
     return raw === null ? null : parseCycle(taskId, cycleId, raw);
   }
 
+  listCycles(taskId: string): Cycle[] {
+    return this.jsonRecordIds(this.cyclesDir(taskId))
+      .map((id) => this.getCycle(taskId, id))
+      .filter((cycle): cycle is Cycle => cycle !== null);
+  }
+
   saveCycle(taskId: string, cycle: Cycle): void {
     mkdirSync(this.cyclesDir(taskId), { recursive: true });
-    writeFileSync(this.cycleFile(taskId, cycle.id), `${JSON.stringify(cycle, null, 2)}\n`);
+    writeAtomicText(this.cycleFile(taskId, cycle.id), `${JSON.stringify(cycle, null, 2)}\n`);
   }
 
   nextWorkItemId(taskId: string): string {
@@ -282,9 +315,15 @@ export class FileTaskStore implements TaskStore {
     return raw === null ? null : parseWorkItem(taskId, workItemId, raw);
   }
 
+  listWorkItems(taskId: string): WorkItem[] {
+    return this.jsonRecordIds(this.workItemsDir(taskId))
+      .map((id) => this.getWorkItem(taskId, id))
+      .filter((item): item is WorkItem => item !== null);
+  }
+
   saveWorkItem(taskId: string, workItem: WorkItem): void {
     mkdirSync(this.workItemsDir(taskId), { recursive: true });
-    writeFileSync(this.workItemFile(taskId, workItem.id), `${JSON.stringify(workItem, null, 2)}\n`);
+    writeAtomicText(this.workItemFile(taskId, workItem.id), `${JSON.stringify(workItem, null, 2)}\n`);
   }
 
   getAgentSession(taskId: string, roleName: string): AgentSession | null {
@@ -295,7 +334,7 @@ export class FileTaskStore implements TaskStore {
 
   saveAgentSession(session: AgentSession): void {
     mkdirSync(this.agentSessionsDir(session.taskId), { recursive: true });
-    writeFileSync(
+    writeAtomicText(
       this.agentSessionFile(session.taskId, session.roleName),
       `${JSON.stringify(session, null, 2)}\n`
     );
@@ -312,7 +351,7 @@ export class FileTaskStore implements TaskStore {
 
   saveAgentRun(run: AgentRun): void {
     mkdirSync(this.agentRunsDir(run.taskId), { recursive: true });
-    writeFileSync(this.agentRunFile(run.taskId, run.id), `${JSON.stringify(run, null, 2)}\n`);
+    writeAtomicText(this.agentRunFile(run.taskId, run.id), `${JSON.stringify(run, null, 2)}\n`);
   }
 
   getActiveAgentRun(taskId: string, roleName: string): AgentRun | null {
@@ -330,7 +369,7 @@ export class FileTaskStore implements TaskStore {
 
   saveActiveAgentRun(run: AgentRun): void {
     mkdirSync(this.activeAgentRunsDir(run.taskId), { recursive: true });
-    writeFileSync(this.activeAgentRunFile(run.taskId, run.roleName), `${JSON.stringify(run, null, 2)}\n`);
+    writeAtomicText(this.activeAgentRunFile(run.taskId, run.roleName), `${JSON.stringify(run, null, 2)}\n`);
   }
 
   clearActiveAgentRun(taskId: string, roleName: string): void {
@@ -339,7 +378,7 @@ export class FileTaskStore implements TaskStore {
 
   saveTaskBrief(taskId: string, markdown: string): void {
     mkdirSync(this.taskDir(taskId), { recursive: true });
-    writeFileSync(this.taskBriefFile(taskId), markdown);
+    writeAtomicText(this.taskBriefFile(taskId), markdown);
   }
 
   readTaskBrief(taskId: string): string | null {
@@ -360,14 +399,40 @@ export class FileTaskStore implements TaskStore {
     return raw === null ? null : parseMilestone(taskId, milestoneId, raw);
   }
 
+  listMilestones(taskId: string): Milestone[] {
+    return this.jsonRecordIds(this.milestonesDir(taskId))
+      .map((id) => this.getMilestone(taskId, id))
+      .filter((milestone): milestone is Milestone => milestone !== null);
+  }
+
   saveMilestone(taskId: string, milestone: Milestone): void {
     mkdirSync(this.milestonesDir(taskId), { recursive: true });
-    writeFileSync(this.milestoneFile(taskId, milestone.id), `${JSON.stringify(milestone, null, 2)}\n`);
+    writeAtomicText(this.milestoneFile(taskId, milestone.id), `${JSON.stringify(milestone, null, 2)}\n`);
+  }
+
+  nextDecisionId(taskId: string): string {
+    return this.nextRecordId("decision", (id) => this.getDecision(taskId, id));
+  }
+
+  getDecision(taskId: string, decisionId: string): Decision | null {
+    const raw = this.readOptionalText(this.decisionFile(taskId, decisionId));
+    return raw === null ? null : parseDecision(taskId, decisionId, raw);
+  }
+
+  listDecisions(taskId: string): Decision[] {
+    return this.jsonRecordIds(this.decisionsDir(taskId))
+      .map((id) => this.getDecision(taskId, id))
+      .filter((decision): decision is Decision => decision !== null);
+  }
+
+  saveDecision(taskId: string, decision: Decision): void {
+    mkdirSync(this.decisionsDir(taskId), { recursive: true });
+    writeAtomicText(this.decisionFile(taskId, decision.id), `${JSON.stringify(decision, null, 2)}\n`);
   }
 
   saveRoleWorktree(taskId: string, worktree: RoleWorktree): void {
     mkdirSync(this.roleDir(taskId, worktree.roleName), { recursive: true });
-    writeFileSync(
+    writeAtomicText(
       this.roleWorktreeFile(taskId, worktree.roleName),
       `${JSON.stringify(worktree, null, 2)}\n`
     );
@@ -379,8 +444,8 @@ export class FileTaskStore implements TaskStore {
     const encoded = taskRecordCodec.encodeRole(role);
 
     mkdirSync(roleDir, { recursive: true });
-    writeFileSync(this.roleFile(taskId, storageName), `${JSON.stringify(encoded.runtime, null, 2)}\n`);
-    writeFileSync(this.roleInfoFile(taskId, storageName), `${JSON.stringify(encoded.info, null, 2)}\n`);
+    writeAtomicText(this.roleFile(taskId, storageName), `${JSON.stringify(encoded.runtime, null, 2)}\n`);
+    writeAtomicText(this.roleInfoFile(taskId, storageName), `${JSON.stringify(encoded.info, null, 2)}\n`);
   }
 
   renameRole(taskId: string, oldName: string, role: Role): void {
@@ -391,8 +456,8 @@ export class FileTaskStore implements TaskStore {
     }
 
     const encoded = taskRecordCodec.encodeRole(role);
-    writeFileSync(this.roleFile(taskId, storageName), `${JSON.stringify(encoded.runtime, null, 2)}\n`);
-    writeFileSync(this.roleInfoFile(taskId, storageName), `${JSON.stringify(encoded.info, null, 2)}\n`);
+    writeAtomicText(this.roleFile(taskId, storageName), `${JSON.stringify(encoded.runtime, null, 2)}\n`);
+    writeAtomicText(this.roleInfoFile(taskId, storageName), `${JSON.stringify(encoded.info, null, 2)}\n`);
   }
 
   listRoles(taskId: string): Role[] {
@@ -418,7 +483,7 @@ export class FileTaskStore implements TaskStore {
     const roleDir = this.roleDir(taskId, role.name);
     mkdirSync(roleDir, { recursive: true });
     rmSync(this.roleFile(taskId, role.name), { force: true });
-    writeFileSync(this.roleInfoFile(taskId, role.name), `${JSON.stringify(role, null, 2)}\n`);
+    writeAtomicText(this.roleInfoFile(taskId, role.name), `${JSON.stringify(role, null, 2)}\n`);
   }
 
   getChildRole(taskId: string, name: string): ChildRole | null {
@@ -463,7 +528,7 @@ export class FileTaskStore implements TaskStore {
   saveGlobalRole(role: GlobalRole): void {
     const roleDir = this.globalRoleDir(role.name);
     mkdirSync(roleDir, { recursive: true });
-    writeFileSync(this.globalRoleFile(role.name), `${JSON.stringify(role, null, 2)}\n`);
+    writeAtomicText(this.globalRoleFile(role.name), `${JSON.stringify(role, null, 2)}\n`);
   }
 
   listGlobalRoles(): GlobalRole[] {
@@ -550,7 +615,7 @@ export class FileTaskStore implements TaskStore {
     const storageName = this.resolveRoleStorageName(taskId, roleName) ?? roleName;
     const roleDir = this.roleDir(taskId, storageName);
     mkdirSync(roleDir, { recursive: true });
-    writeFileSync(this.transcriptFile(taskId, storageName), transcript);
+    writeAtomicText(this.transcriptFile(taskId, storageName), transcript);
   }
 
   readTranscript(taskId: string, roleName: string): string | null {
@@ -566,7 +631,7 @@ export class FileTaskStore implements TaskStore {
   saveCustomRunner(runner: CustomRunner): void {
     const runnerDir = this.runnerDir(runner.id);
     mkdirSync(runnerDir, { recursive: true });
-    writeFileSync(this.runnerFile(runner.id), `${JSON.stringify(runner, null, 2)}\n`);
+    writeAtomicText(this.runnerFile(runner.id), `${JSON.stringify(runner, null, 2)}\n`);
   }
 
   listCustomRunners(): CustomRunner[] {
@@ -649,6 +714,14 @@ export class FileTaskStore implements TaskStore {
     return join(this.milestonesDir(taskId), `${milestoneId}.json`);
   }
 
+  private decisionsDir(taskId: string): string {
+    return join(this.taskDir(taskId), "decisions");
+  }
+
+  private decisionFile(taskId: string, decisionId: string): string {
+    return join(this.decisionsDir(taskId), `${decisionId}.json`);
+  }
+
   private runtimeDir(): string {
     return join(this.rootDir, "runtime");
   }
@@ -659,6 +732,14 @@ export class FileTaskStore implements TaskStore {
 
   private pendingWakeupFile(taskId: string): string {
     return join(this.pendingWakeupsDir(), `${taskId}.json`);
+  }
+
+  private leaderFailuresDir(): string {
+    return join(this.runtimeDir(), "leader-failures");
+  }
+
+  private leaderFailureFile(taskId: string): string {
+    return join(this.leaderFailuresDir(), `${taskId}.json`);
   }
 
   private cyclesDir(taskId: string): string {
@@ -841,6 +922,20 @@ export class FileTaskStore implements TaskStore {
     }
   }
 
+  private jsonRecordIds(path: string): string[] {
+    try {
+      return readdirSync(path, { withFileTypes: true })
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+        .map((entry) => entry.name.slice(0, -5))
+        .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+        return [];
+      }
+      throw error;
+    }
+  }
+
   private readOptionalText(path: string): string | null {
     try {
       return readFileSync(path, "utf8");
@@ -1017,6 +1112,7 @@ function parseTaskSchedule(taskId: string, raw: string): TaskSchedule {
     typeof value.inactivityMinutes !== "number" ||
     typeof value.cooldownMinutes !== "number" ||
     (value.reviewAt !== undefined && typeof value.reviewAt !== "string") ||
+    (value.lastLeaderWakeupAt !== undefined && typeof value.lastLeaderWakeupAt !== "string") ||
     (value.recurring !== undefined && (
       !isRecord(value.recurring) ||
       typeof value.recurring.everyMinutes !== "number" ||
@@ -1028,6 +1124,23 @@ function parseTaskSchedule(taskId: string, raw: string): TaskSchedule {
   }
 
   return value as TaskSchedule;
+}
+
+function parseLeaderFailure(taskId: string, raw: string): LeaderFailure {
+  const value = parseJson(raw, `Invalid leader failure record: ${taskId}`);
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    value.taskId !== taskId ||
+    typeof value.nativeSessionId !== "string" ||
+    typeof value.message !== "string" ||
+    typeof value.attemptCount !== "number" ||
+    typeof value.firstFailedAt !== "string" ||
+    typeof value.lastFailedAt !== "string"
+  ) {
+    throw dataError(`Invalid leader failure record: ${taskId}`);
+  }
+  return value as LeaderFailure;
 }
 
 function parseMilestone(taskId: string, milestoneId: string, raw: string): Milestone {
@@ -1056,16 +1169,37 @@ function parseCycle(taskId: string, cycleId: string, raw: string): Cycle {
     value.schemaVersion !== 1 ||
     value.id !== cycleId ||
     value.taskId !== taskId ||
-    !["schedule", "review-time", "operator-input", "role-result", "inactivity", "explicit-wake"].includes(String(value.cause)) ||
+    !["task-created", "user-comment", "schedule", "review-time", "operator-input", "role-result", "inactivity", "explicit-wake"].includes(String(value.cause)) ||
     typeof value.summary !== "string" ||
     !["active", "ended"].includes(String(value.status)) ||
     typeof value.createdAt !== "string" ||
-    typeof value.updatedAt !== "string"
+    typeof value.updatedAt !== "string" ||
+    (value.endedAt !== undefined && typeof value.endedAt !== "string")
   ) {
     throw dataError(`Invalid cycle record: ${taskId}/${cycleId}`);
   }
 
   return value as Cycle;
+}
+
+function parseDecision(taskId: string, decisionId: string, raw: string): Decision {
+  const value = parseJson(raw, `Invalid decision record: ${taskId}/${decisionId}`);
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    value.id !== decisionId ||
+    value.taskId !== taskId ||
+    typeof value.title !== "string" ||
+    typeof value.rationale !== "string" ||
+    !isStringArray(value.topics) ||
+    !["active", "superseded"].includes(String(value.status)) ||
+    (value.supersededReason !== undefined && typeof value.supersededReason !== "string") ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string"
+  ) {
+    throw dataError(`Invalid decision record: ${taskId}/${decisionId}`);
+  }
+  return value as Decision;
 }
 
 function parseWorkItem(taskId: string, workItemId: string, raw: string): WorkItem {
@@ -1126,6 +1260,8 @@ function parseAgentRun(taskId: string, runId: string, raw: string): AgentRun {
     typeof value.roleName !== "string" ||
     !["new", "resume"].includes(String(value.mode)) ||
     typeof value.input !== "string" ||
+    (value.workItemId !== undefined && typeof value.workItemId !== "string") ||
+    (value.topics !== undefined && !isStringArray(value.topics)) ||
     !["active", "yielded", "failed", "expired"].includes(String(value.status)) ||
     (value.summary !== undefined && typeof value.summary !== "string") ||
     typeof value.createdAt !== "string" ||
@@ -1194,4 +1330,25 @@ function isOptionalString(value: unknown): value is string | undefined {
 
 function isStringRecord(value: unknown): value is Record<string, string> {
   return isRecord(value) && Object.values(value).every((item) => typeof item === "string");
+}
+
+function writeAtomicText(target: string, content: string): void {
+  mkdirSync(dirname(target), { recursive: true });
+  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  let descriptor: number | null = null;
+
+  try {
+    descriptor = openSync(temporary, "wx", 0o600);
+    writeFileSync(descriptor, content, { encoding: "utf8" });
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = null;
+    renameSync(temporary, target);
+  } catch (error) {
+    if (descriptor !== null) {
+      closeSync(descriptor);
+    }
+    rmSync(temporary, { force: true });
+    throw error;
+  }
 }

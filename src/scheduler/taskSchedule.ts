@@ -7,6 +7,7 @@ export type TaskSchedule = {
     everyMinutes: number;
     nextAt: string;
   };
+  lastLeaderWakeupAt?: string;
   updatedAt: string;
 };
 

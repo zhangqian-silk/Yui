@@ -7,6 +7,8 @@ export type AgentRun = {
   roleName: string;
   mode: DispatchMode;
   input: string;
+  workItemId?: string;
+  topics?: string[];
   status: "active" | "yielded" | "failed" | "expired";
   summary?: string;
   createdAt: string;
@@ -20,7 +22,8 @@ export function createAgentRun(
   roleName: string,
   mode: DispatchMode,
   input: string,
-  now: Date
+  now: Date,
+  context: { workItemId?: string; topics?: string[] } = {}
 ): AgentRun {
   const timestamp = now.toISOString();
   return {
@@ -30,6 +33,8 @@ export function createAgentRun(
     roleName,
     mode,
     input,
+    ...(context.workItemId === undefined ? {} : { workItemId: context.workItemId }),
+    ...(context.topics === undefined ? {} : { topics: [...new Set(context.topics)] }),
     status: "active",
     createdAt: timestamp,
     updatedAt: timestamp
@@ -47,6 +52,28 @@ export function yieldAgentRun(run: AgentRun, summary: string, now: Date): AgentR
     ...run,
     status: "yielded",
     summary: trimmedSummary,
+    updatedAt: timestamp,
+    endedAt: timestamp
+  };
+}
+
+export function expireAgentRun(run: AgentRun, now: Date): AgentRun {
+  const timestamp = now.toISOString();
+  return {
+    ...run,
+    status: "expired",
+    summary: "Controller inferred that the run is idle after its execution TTL elapsed.",
+    updatedAt: timestamp,
+    endedAt: timestamp
+  };
+}
+
+export function failAgentRun(run: AgentRun, summary: string, now: Date): AgentRun {
+  const timestamp = now.toISOString();
+  return {
+    ...run,
+    status: "failed",
+    summary,
     updatedAt: timestamp,
     endedAt: timestamp
   };

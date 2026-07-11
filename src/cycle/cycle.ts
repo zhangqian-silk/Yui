@@ -1,4 +1,6 @@
 export type CycleCause =
+  | "task-created"
+  | "user-comment"
   | "schedule"
   | "review-time"
   | "operator-input"
@@ -15,6 +17,7 @@ export type Cycle = {
   status: "active" | "ended";
   createdAt: string;
   updatedAt: string;
+  endedAt?: string;
 };
 
 export function createCycle(
@@ -41,5 +44,20 @@ export function createCycle(
     status: "active",
     createdAt: timestamp,
     updatedAt: timestamp
+  };
+}
+
+export function endCycle(cycle: Cycle, summary: string, now: Date): Cycle {
+  const trimmedSummary = summary.trim();
+  if (trimmedSummary.length === 0) {
+    throw new Error("Cycle ending summary is required.");
+  }
+  const timestamp = now.toISOString();
+  return {
+    ...cycle,
+    summary: trimmedSummary,
+    status: "ended",
+    updatedAt: timestamp,
+    endedAt: timestamp
   };
 }

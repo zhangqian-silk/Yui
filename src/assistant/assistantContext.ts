@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { GlobalRole } from "../role/role.js";
 import { SYSTEM_ASSISTANT_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
@@ -46,7 +46,9 @@ function writeAssistantContext(taskmuxHome: string, workspace: string): string {
 }
 
 function renderAssistantContext(taskmuxHome: string, workspace: string): string {
-  return `# TaskMux Operator
+  return `${readOperatorSkill()}
+
+# TaskMux Operator runtime
 
 You are the TaskMux Operator. Act as the user's CLI proxy and manage TaskMux without performing Task work.
 
@@ -68,6 +70,10 @@ Environment:
 - TASKMUX_HOME=${taskmuxHome}
 - TASKMUX_WORKSPACE=${workspace}
 `;
+}
+
+function readOperatorSkill(): string {
+  return readFileSync(new URL("../../skills/taskmux-operator/SKILL.md", import.meta.url), "utf8").trim();
 }
 
 function withAssistantPrompt(role: GlobalRole, contextPath: string): string[] {

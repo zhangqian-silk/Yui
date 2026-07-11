@@ -1,4 +1,5 @@
 import type { AgentSession } from "./agentExecutor.js";
+import type { AgentRun } from "../run/agentRun.js";
 import type { Role } from "../role/role.js";
 
 export type DispatchMode = "new" | "resume";
@@ -43,4 +44,25 @@ export function buildAgentLaunchPlan(
   }
 
   throw new Error(`Agent does not define a recovery adapter: ${role.agent}.`);
+}
+
+export function withTaskmuxRunEnvironment(
+  launch: AgentLaunchPlan,
+  taskmuxHome: string,
+  role: Role,
+  run: AgentRun,
+  nativeSessionId?: string
+): AgentLaunchPlan {
+  return {
+    ...launch,
+    env: {
+      ...launch.env,
+      TASKMUX_HOME: taskmuxHome,
+      TASKMUX_TASK_ID: run.taskId,
+      TASKMUX_ROLE: role.name,
+      TASKMUX_RUN_ID: run.id,
+      TASKMUX_WORKSPACE: role.workspace,
+      ...(nativeSessionId === undefined ? {} : { TASKMUX_NATIVE_SESSION_ID: nativeSessionId })
+    }
+  };
 }

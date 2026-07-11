@@ -16,6 +16,10 @@ export type TaskRuntimeRecord = {
   schemaVersion: 1;
   id: string;
   archived: boolean;
+  archivedAt?: string;
+  archivedBy?: Task["archivedBy"];
+  archiveReason?: string;
+  archiveSummary?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -54,6 +58,10 @@ export class TaskRecordCodec {
         schemaVersion: task.schemaVersion,
         id: task.id,
         archived: task.archived,
+        archivedAt: task.archivedAt,
+        archivedBy: task.archivedBy,
+        archiveReason: task.archiveReason,
+        archiveSummary: task.archiveSummary,
         createdAt: task.createdAt,
         updatedAt: task.updatedAt
       },
@@ -137,6 +145,10 @@ export class TaskRecordCodec {
       typeof value.id !== "string" ||
       "title" in value ||
       (typeof value.archived !== "boolean" && !isLegacyTaskStatus(value.status)) ||
+      (value.archivedAt !== undefined && typeof value.archivedAt !== "string") ||
+      (value.archivedBy !== undefined && !["user", "operator", "leader"].includes(String(value.archivedBy))) ||
+      (value.archiveReason !== undefined && typeof value.archiveReason !== "string") ||
+      (value.archiveSummary !== undefined && typeof value.archiveSummary !== "string") ||
       typeof value.createdAt !== "string" ||
       typeof value.updatedAt !== "string"
     ) {
@@ -147,6 +159,10 @@ export class TaskRecordCodec {
       schemaVersion: 1,
       id: value.id,
       archived: typeof value.archived === "boolean" ? value.archived : value.status === "archived",
+      ...(value.archivedAt === undefined ? {} : { archivedAt: value.archivedAt as string }),
+      ...(value.archivedBy === undefined ? {} : { archivedBy: value.archivedBy as Task["archivedBy"] }),
+      ...(value.archiveReason === undefined ? {} : { archiveReason: value.archiveReason as string }),
+      ...(value.archiveSummary === undefined ? {} : { archiveSummary: value.archiveSummary as string }),
       createdAt: value.createdAt,
       updatedAt: value.updatedAt
     };

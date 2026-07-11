@@ -9,9 +9,9 @@ export class TmuxManager {
     private readonly runner: CommandRunner
   ) {}
 
-  enterRole(taskId: string, role: Role): void {
+  enterRole(taskId: string, role: Role, launch?: AgentLaunchPlan): void {
     this.ensureSession(taskId);
-    this.ensureWindow(taskId, role);
+    this.ensureWindow(taskId, role, launch);
     this.runner.run(this.tmuxBin, ["attach-session", "-t", this.target(taskId, role.name)], {
       inheritStdio: true
     });
@@ -28,9 +28,24 @@ export class TmuxManager {
     ]);
   }
 
-  dispatchRole(taskId: string, role: Role, launch: AgentLaunchPlan, input: string): void {
+  dispatchRole(
+    taskId: string,
+    role: Role,
+    launch: AgentLaunchPlan,
+    input: string,
+    options: { replaceExisting?: boolean } = {}
+  ): void {
     this.ensureSession(taskId);
-    this.ensureWindow(taskId, role, launch);
+    if (options.replaceExisting === true) {
+      try {
+        this.killRole(taskId, role.name);
+      } catch {
+        // A new session can also be the first session for this role.
+      }
+      this.createWindow(taskId, role, launch);
+    } else {
+      this.ensureWindow(taskId, role, launch);
+    }
     this.runner.run(this.tmuxBin, ["send-keys", "-l", "-t", this.target(taskId, role.name), input]);
     this.runner.run(this.tmuxBin, ["send-keys", "-t", this.target(taskId, role.name), "Enter"]);
   }
@@ -99,6 +114,10 @@ export class TmuxManager {
       return;
     }
 
+    this.createWindow(taskId, role, launch ?? role);
+  }
+
+  private createWindow(taskId: string, role: Role, launch: AgentLaunchPlan | Role): void {
     this.runner.run(this.tmuxBin, [
       "new-window",
       "-t",
@@ -107,7 +126,7 @@ export class TmuxManager {
       role.name,
       "-c",
       role.workspace,
-      roleShellCommand(launch ?? role)
+      roleShellCommand(launch)
     ]);
   }
 

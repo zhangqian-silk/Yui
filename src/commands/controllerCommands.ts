@@ -8,8 +8,10 @@ import {
   serveController
 } from "../controller/controller.js";
 import { runtimeError, usageError } from "../errors/cliError.js";
-import { scanTaskWakeups } from "../scheduler/inactivityScanner.js";
+import { expireStaleAgentRuns, failExitedAgentRuns, readAgentRunTtl, scanTaskWakeups } from "../scheduler/inactivityScanner.js";
 import { FileTaskStore } from "../storage/taskStore.js";
+import { NodeCommandRunner } from "../tmux/commandRunner.js";
+import { TmuxManager } from "../tmux/tmuxManager.js";
 
 export async function runControllerCommand(
   args: string[],
@@ -41,7 +43,15 @@ export async function runControllerCommand(
   }
 
   if (command === "scan" && rest.length === 0) {
-    const queued = scanTaskWakeups(new FileTaskStore(rootDir), new Date());
+    const store = new FileTaskStore(rootDir);
+    const now = new Date();
+    expireStaleAgentRuns(store, now, readAgentRunTtl(env.TASKMUX_AGENT_RUN_TTL_MS));
+    failExitedAgentRuns(
+      store,
+      new TmuxManager(env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandRunner()),
+      now
+    );
+    const queued = scanTaskWakeups(store, now);
     return `Queued ${queued.length} task wakeup${queued.length === 1 ? "" : "s"}\n`;
   }
 
@@ -74,6 +84,22 @@ async function startController(rootDir: string, env: NodeJS.ProcessEnv): Promise
   return `Controller started (pid ${discovery.pid})\n`;
 }
 
+export async function ensureControllerRunning(
+  rootDir: string,
+  env: NodeJS.ProcessEnv
+) {
+  const status = await controllerStatus(rootDir);
+  if (!status.running) {
+    await startController(rootDir, env);
+  }
+
+  const discovery = readControllerDiscovery(rootDir);
+  if (discovery === null) {
+    throw runtimeError("Controller discovery is unavailable after startup.");
+  }
+  return discovery;
+}
+
 async function controllerStatus(rootDir: string): Promise<{ running: boolean; pid?: number; apiVersion?: number }> {
   const discovery = readControllerDiscovery(rootDir);
 
@@ -91,11 +117,16 @@ async function controllerStatus(rootDir: string): Promise<{ running: boolean; pi
       apiVersion: number;
     };
   } catch {
+    removeControllerDiscovery(rootDir);
     return { running: false };
   }
 }
 
 async function stopController(rootDir: string): Promise<string> {
+  const status = await controllerStatus(rootDir);
+  if (!status.running) {
+    return "Controller stopped\n";
+  }
   const discovery = readControllerDiscovery(rootDir);
 
   if (discovery === null) {

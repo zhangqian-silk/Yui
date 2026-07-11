@@ -1,5 +1,5 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -22,6 +22,7 @@ function runTaskmux(args, env) {
     encoding: "utf8",
     env: {
       ...process.env,
+      TASKMUX_CONTROLLER_MODE: "direct",
       ...env
     }
   });
@@ -32,6 +33,7 @@ function runTaskmuxFailure(args, env) {
     encoding: "utf8",
     env: {
       ...process.env,
+      TASKMUX_CONTROLLER_MODE: "direct",
       ...env
     }
   });
@@ -42,6 +44,7 @@ function runTaskmuxInteractive(args, input, env) {
     const child = spawn(process.execPath, [cli, ...args], {
       env: {
         ...process.env,
+        TASKMUX_CONTROLLER_MODE: "direct",
         ...env
       },
       stdio: ["pipe", "pipe", "pipe"]
@@ -104,6 +107,77 @@ if (args[0] === "list-windows") {
   process.stdout.write("rd\\n");
   process.exit(0);
 }
+process.exit(0);
+`
+  );
+  chmodSync(fakeTmux, 0o755);
+
+  return fakeTmux;
+}
+
+function createExistingRoleTmux(home, roleName) {
+  const fakeTmux = join(home, "fake-existing-role-tmux.js");
+  const logFile = join(home, "existing-role-tmux-calls.jsonl");
+
+  writeFileSync(
+    fakeTmux,
+    `#!/usr/bin/env node
+const { appendFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+appendFileSync(process.env.FAKE_TMUX_LOG, JSON.stringify(args) + "\\n");
+if (args[0] === "list-windows") process.stdout.write(${JSON.stringify(`${roleName}\n`)});
+process.exit(0);
+`
+  );
+  chmodSync(fakeTmux, 0o755);
+
+  return { fakeTmux, logFile };
+}
+
+function createStatefulTmux(home) {
+  const fakeTmux = join(home, "fake-stateful-tmux.js");
+  const logFile = join(home, "stateful-tmux-calls.jsonl");
+  const stateFile = join(home, "stateful-tmux-windows.txt");
+
+  writeFileSync(
+    fakeTmux,
+    `#!/usr/bin/env node
+const { appendFileSync, existsSync, readFileSync, writeFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+const state = process.env.FAKE_TMUX_STATE;
+appendFileSync(process.env.FAKE_TMUX_LOG, JSON.stringify(args) + "\\n");
+if (args[0] === "has-session") process.exit(existsSync(state) ? 0 : 1);
+if (args[0] === "new-session") { writeFileSync(state, ""); process.exit(0); }
+if (args[0] === "list-windows") { if (existsSync(state)) process.stdout.write(readFileSync(state, "utf8")); process.exit(0); }
+if (args[0] === "new-window") {
+  const name = args[args.indexOf("-n") + 1];
+  const current = existsSync(state) ? readFileSync(state, "utf8").split("\\n").filter(Boolean) : [];
+  if (!current.includes(name)) current.push(name);
+  writeFileSync(state, current.join("\\n") + "\\n");
+  process.exit(0);
+}
+if (args[0] === "kill-window") {
+  const name = args.at(-1).split(":").at(-1);
+  const current = existsSync(state) ? readFileSync(state, "utf8").split("\\n").filter((item) => item && item !== name) : [];
+  writeFileSync(state, current.length === 0 ? "" : current.join("\\n") + "\\n");
+  process.exit(0);
+}
+process.exit(0);
+`
+  );
+  chmodSync(fakeTmux, 0o755);
+
+  return { fakeTmux, logFile, stateFile };
+}
+
+function createFailingDispatchTmux(home) {
+  const fakeTmux = join(home, "fake-failing-dispatch-tmux.js");
+
+  writeFileSync(
+    fakeTmux,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === "has-session" || args[0] === "new-session") process.exit(1);
 process.exit(0);
 `
   );
@@ -464,6 +538,23 @@ test("reads edited task info from the user-editable info file", () => {
   assert.match(listOutput, tableCellsRegex("task-1", "ongoing", "Edited task title"));
 });
 
+test("atomically replaces task snapshots instead of following a state-file symlink", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["task", "create", "Protect local state writes"], { TASKMUX_HOME: home });
+  const taskFile = join(home, "tasks", "task-1", "task.json");
+  const sentinel = join(home, "sentinel-task.json");
+  writeFileSync(sentinel, readFileSync(taskFile, "utf8"));
+  unlinkSync(taskFile);
+  symlinkSync(sentinel, taskFile);
+
+  runTaskmux(["task", "archive", "task-1"], { TASKMUX_HOME: home });
+
+  assert.equal(JSON.parse(readFileSync(sentinel, "utf8")).archived, false);
+  assert.equal(JSON.parse(readFileSync(taskFile, "utf8")).archived, true);
+  assert.equal(lstatSync(taskFile).isSymbolicLink(), false);
+});
+
 test("creates tasks with task board metadata", () => {
   const home = createConfiguredHome();
 
@@ -748,7 +839,7 @@ test("renders role status counts on the grouped task board", () => {
   );
   const output = runTaskmux(["task", "board", "--with-roles"], { TASKMUX_HOME: home });
 
-  assert.match(output, tableCellsRegex("Ongoing", "task-1", "Coordinate checkout flow", "", "roles idle=3"));
+  assert.match(output, tableCellsRegex("Ongoing", "task-1", "Coordinate checkout flow", "", "", "roles idle=3"));
 });
 
 test("deletes and restores tasks without losing task data", () => {
@@ -858,6 +949,42 @@ test("shows a task by id", () => {
   assert.match(output, /Archived: no/);
 });
 
+test("returns stable JSON envelopes for generic command success and failure", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["task", "create", "Read JSON output"], { TASKMUX_HOME: home });
+  const success = JSON.parse(
+    runTaskmux(["task", "show", "task-1", "--json"], { TASKMUX_HOME: home })
+  );
+  const failed = runTaskmuxFailure(
+    ["task", "show", "task-999", "--json"],
+    { TASKMUX_HOME: home }
+  );
+  const error = JSON.parse(failed.stderr);
+
+  assert.equal(success.ok, true);
+  assert.match(success.output, /Task: task-1/);
+  assert.equal(error.ok, false);
+  assert.equal(error.code, "TASK_NOT_FOUND");
+  assert.match(error.message, /task-999/);
+});
+
+test("preserves structured CLI errors across the Controller RPC boundary", () => {
+  const home = createConfiguredHome();
+  const env = { TASKMUX_HOME: home, TASKMUX_CONTROLLER_MODE: "auto" };
+
+  try {
+    const failed = runTaskmuxFailure(["task", "show", "task-999", "--json"], env);
+    const error = JSON.parse(failed.stderr);
+
+    assert.equal(failed.status, 3);
+    assert.equal(error.code, "TASK_NOT_FOUND");
+    assert.match(error.message, /task-999/);
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], env);
+  }
+});
+
 test("updates the task archive marker", () => {
   const home = createConfiguredHome();
 
@@ -879,6 +1006,37 @@ test("updates the task archive marker", () => {
   );
   assert.equal(task.status, undefined);
   assert.equal(task.archived, false);
+});
+
+test("persists an archive summary and discards stale automatic wakeups", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["task", "create", "Archive a completed phase"], { TASKMUX_HOME: home });
+  runTaskmux(["task", "wake", "task-1", "--reason", "old-trigger"], { TASKMUX_HOME: home });
+  runTaskmux(
+    [
+      "task", "archive", "task-1",
+      "--reason", "Current phase has reached a stable point",
+      "--summary", "Canary is complete; revisit when production traffic increases."
+    ],
+    { TASKMUX_HOME: home }
+  );
+  const archived = JSON.parse(readFileSync(join(home, "tasks", "task-1", "task.json"), "utf8"));
+
+  assert.equal(archived.archived, true);
+  assert.equal(archived.archiveReason, "Current phase has reached a stable point");
+  assert.match(archived.archiveSummary, /Canary is complete/);
+  assert.match(archived.archivedAt, /^\d{4}-/);
+  assert.equal(existsSync(join(home, "runtime", "pending-wakeups", "task-1.json")), false);
+  runTaskmux(["task", "comment", "task-1", "Keep this note for reactivation."], { TASKMUX_HOME: home });
+  assert.equal(existsSync(join(home, "runtime", "pending-wakeups", "task-1.json")), false);
+
+  runTaskmux(["task", "unarchive", "task-1"], { TASKMUX_HOME: home });
+  const active = JSON.parse(readFileSync(join(home, "tasks", "task-1", "task.json"), "utf8"));
+  assert.equal(active.archived, false);
+  assert.equal(active.archivedAt, undefined);
+  assert.equal(active.archiveReason, undefined);
+  assert.equal(active.archiveSummary, undefined);
 });
 
 test("keeps a task long-lived until it is explicitly archived", () => {
@@ -1534,6 +1692,42 @@ test("opens a task context summary", () => {
   assert.match(output, /Next: taskmux task enter task-1 <role>/);
 });
 
+test("includes schedules cycles work items milestones and sessions in task context", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["task", "create", "Expose durable progress context"], { TASKMUX_HOME: home });
+  runTaskmux(
+    ["task", "schedule", "set", "task-1", "--inactivity-minutes", "60", "--cooldown-minutes", "15"],
+    { TASKMUX_HOME: home }
+  );
+  runTaskmux(
+    ["task", "cycle", "create", "task-1", "--cause", "explicit-wake", "--summary", "Plan the release"],
+    { TASKMUX_HOME: home }
+  );
+  runTaskmux(
+    ["task", "work-item", "create", "task-1", "--title", "Run canary", "--cycle", "cycle-1"],
+    { TASKMUX_HOME: home }
+  );
+  runTaskmux(
+    ["task", "milestone", "add", "task-1", "--title", "Plan approved", "--summary", "Release plan is approved"],
+    { TASKMUX_HOME: home }
+  );
+  runTaskmux(
+    ["task", "session", "record", "task-1", "leader", "--native-id", "leader-session"],
+    { TASKMUX_HOME: home }
+  );
+
+  const context = JSON.parse(
+    runTaskmux(["task", "context", "task-1", "--format", "json"], { TASKMUX_HOME: home })
+  );
+
+  assert.equal(context.schedule.inactivityMinutes, 60);
+  assert.deepEqual(context.cycles.map((cycle) => cycle.id), ["cycle-1"]);
+  assert.deepEqual(context.workItems.map((item) => item.id), ["work-item-1"]);
+  assert.deepEqual(context.milestones.map((milestone) => milestone.id), ["milestone-1"]);
+  assert.equal(context.sessions.leader.nativeSessionId, "leader-session");
+});
+
 test("exports transcripts in markdown and json formats", () => {
   const home = createConfiguredHome();
   const { fakeTmux, logFile } = createFakeTmux(home);
@@ -1765,7 +1959,8 @@ test("shows role status", () => {
   );
 
   const output = runTaskmux(["task", "status", "task-1", "rd"], {
-    TASKMUX_HOME: home
+    TASKMUX_HOME: home,
+    TASKMUX_TMUX_BIN: join(home, "missing-tmux")
   });
 
   assert.match(output, /Role: rd/);
@@ -2547,6 +2742,32 @@ process.stdout.write("assistant ready\\n");
   assert.match(log.args[0], /Do not perform Task work or edit TaskMux JSON storage directly/);
 });
 
+test("runs the Operator in its own persistent tmux session", () => {
+  const home = createTaskmuxHome();
+  const fakeAgent = createFakeExecutable(home, "operator-agent.js", "operator ready\n");
+  const { fakeTmux, logFile } = createFakeTmux(home);
+
+  writeStorageSchema(home, 2);
+  addAgent(home, "codex", fakeAgent);
+  runTaskmux(["role", "add", "operator", "--agent", "codex", "--workspace", home], {
+    TASKMUX_HOME: home
+  });
+  runTaskmux(["operator"], {
+    TASKMUX_HOME: home,
+    TASKMUX_TMUX_BIN: fakeTmux,
+    FAKE_TMUX_LOG: logFile
+  });
+
+  const calls = readFileSync(logFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  const newWindow = calls.find((call) => call[0] === "new-window" && call.includes("operator"));
+
+  assert.ok(newWindow);
+  assert.ok(calls.some((call) => call[0] === "attach-session" && call.at(-1) === "taskmux-operator:operator"));
+  assert.match(newWindow.at(-1), /TASKMUX_OPERATOR_CONTEXT=/);
+  assert.match(newWindow.at(-1), /operator-agent\.js/);
+  assert.match(readFileSync(join(home, "operator", "TASKMUX_OPERATOR.md"), "utf8"), /Do not describe a draft as official/);
+});
+
 test("assigns custom runners and starts configured commands", () => {
   const home = createConfiguredHome();
   const fakeAgent = createFakeExecutable(home, "custom-agent.js", "custom agent 1.0\n");
@@ -2779,7 +3000,7 @@ test("starts the default dashboard after doctor checks pass", async () => {
   assert.match(output, /TaskMux dashboard/);
   assert.match(output, /Current task: task-1\s+Dashboard task/);
   assert.match(output, /Board/);
-  assert.match(output, tableCellsRegex("Ongoing", "task-1", "Dashboard task", "", "roles idle=1"));
+  assert.match(output, tableCellsRegex("Ongoing", "task-1", "Dashboard task", "", "", "roles idle=1"));
   assert.match(output, /taskmux>/);
 });
 
@@ -3357,6 +3578,23 @@ test("creates a cycle and a finite work item inside a long-lived task", () => {
   assert.equal(completed.status, "completed");
   assert.equal(completed.outcome, "Canary checks passed");
   assert.match(completed.endedAt, /^\d{4}-/);
+
+  runTaskmux(
+    ["task", "cycle", "end", "task-1", "cycle-1", "--summary", "Canary cycle completed successfully"],
+    { TASKMUX_HOME: home }
+  );
+  const endedCycle = JSON.parse(
+    readFileSync(join(home, "tasks", "task-1", "cycles", "cycle-1.json"), "utf8")
+  );
+  assert.equal(endedCycle.status, "ended");
+  assert.equal(endedCycle.summary, "Canary cycle completed successfully");
+  assert.match(endedCycle.endedAt, /^\d{4}-/);
+
+  const initialCycle = runTaskmux(
+    ["task", "cycle", "create", "task-1", "--cause", "task-created", "--summary", "Initial stewardship"],
+    { TASKMUX_HOME: home }
+  );
+  assert.match(initialCycle, /Created cycle cycle-2/);
 });
 
 test("coalesces comments and explicit triggers into one leader wakeup", () => {
@@ -3402,6 +3640,38 @@ test("starts and reaches the controller through authenticated loopback RPC", () 
   }
 });
 
+test("removes a stale discovery file when its live pid does not answer Controller health", () => {
+  const home = createConfiguredHome();
+  const discoveryFile = join(home, "runtime", "controller.json");
+  mkdirSync(join(home, "runtime"), { recursive: true });
+  writeFileSync(discoveryFile, JSON.stringify({
+    schemaVersion: 1,
+    apiVersion: 1,
+    host: "127.0.0.1",
+    port: 1,
+    pid: process.pid,
+    token: "not-a-controller",
+    startedAt: new Date().toISOString()
+  }));
+
+  const status = JSON.parse(runTaskmux(["controller", "status", "--json"], { TASKMUX_HOME: home }));
+  assert.equal(status.running, false);
+  assert.equal(existsSync(discoveryFile), false);
+});
+
+test("uses an exclusive process lock for Controller startup", async () => {
+  const home = createConfiguredHome();
+  const controller = await import("../dist/controller/controller.js");
+
+  assert.equal(typeof controller.acquireControllerLock, "function");
+  const release = controller.acquireControllerLock(home, process.pid);
+  assert.throws(() => controller.acquireControllerLock(home, process.pid), /Controller startup is locked/);
+  release();
+
+  const releaseAgain = controller.acquireControllerLock(home, process.pid);
+  releaseAgain();
+});
+
 test("controller applies a mutating RPC request id only once", async () => {
   const home = createConfiguredHome();
 
@@ -3432,6 +3702,117 @@ test("controller applies a mutating RPC request id only once", async () => {
       readFileSync(join(home, "runtime", "pending-wakeups", "task-1.json"), "utf8")
     );
     assert.equal(wakeup.requestCount, 1);
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], { TASKMUX_HOME: home });
+  }
+});
+
+test("auto-starts the Controller and routes ordinary task commands through RPC", () => {
+  const home = createConfiguredHome();
+  const { fakeTmux, logFile, stateFile } = createStatefulTmux(home);
+  const env = {
+    TASKMUX_HOME: home,
+    TASKMUX_CONTROLLER_MODE: "auto",
+    TASKMUX_TMUX_BIN: fakeTmux,
+    FAKE_TMUX_LOG: logFile,
+    FAKE_TMUX_STATE: stateFile
+  };
+
+  try {
+    const output = runTaskmux(["task", "create", "Create through the Controller"], env);
+    const discovery = JSON.parse(readFileSync(join(home, "runtime", "controller.json"), "utf8"));
+
+    assert.match(output, /Created task task-1/);
+    assert.equal(discovery.host, "127.0.0.1");
+    assert.equal(JSON.parse(readFileSync(join(home, "tasks", "task-1", "task.json"), "utf8")).archived, false);
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], env);
+  }
+});
+
+test("starts the dedicated Leader's first run after task creation", () => {
+  const home = createConfiguredHome();
+  const { fakeTmux, logFile } = createExistingRoleTmux(home, "leader");
+  const env = {
+    TASKMUX_HOME: home,
+    TASKMUX_CONTROLLER_MODE: "auto",
+    TASKMUX_TMUX_BIN: fakeTmux,
+    FAKE_TMUX_LOG: logFile,
+    TASKMUX_CONTROLLER_SCAN_INTERVAL_MS: "60000"
+  };
+
+  try {
+    runTaskmux(["task", "create", "Start Leader stewardship"], env);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+    const run = JSON.parse(
+      readFileSync(join(home, "runtime", "active-runs", "task-1", "leader.json"), "utf8")
+    );
+    const cycle = JSON.parse(
+      readFileSync(join(home, "tasks", "task-1", "cycles", "cycle-1.json"), "utf8")
+    );
+    const calls = readFileSync(logFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+
+    assert.equal(run.mode, "new");
+    assert.match(run.input, /# TaskMux Leader/);
+    assert.match(run.input, /task-created/);
+    assert.equal(cycle.cause, "task-created");
+    assert.match(cycle.summary, /task-created/);
+    assert.equal(existsSync(join(home, "runtime", "pending-wakeups", "task-1.json")), false);
+    assert.ok(calls.some((call) => call[0] === "new-window" && call.includes("leader")));
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], env);
+  }
+});
+
+test("routes configuration and role mutations through the same Controller", () => {
+  const home = createConfiguredHome();
+  const env = { TASKMUX_HOME: home, TASKMUX_CONTROLLER_MODE: "auto" };
+
+  try {
+    runTaskmux(["config", "set", "default-workspace", "/tmp/controller-workspace"], env);
+    runTaskmux(
+      ["role", "add", "controller-reviewer", "--agent", "codex", "--workspace", "/tmp/controller-workspace"],
+      env
+    );
+
+    assert.equal(existsSync(join(home, "runtime", "controller.json")), true);
+    assert.equal(JSON.parse(readFileSync(join(home, "config.json"), "utf8")).defaultWorkspace, "/tmp/controller-workspace");
+    assert.equal(
+      JSON.parse(readFileSync(join(home, "roles", "controller-reviewer", "role.json"), "utf8")).agent,
+      "codex"
+    );
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], env);
+  }
+});
+
+test("deduplicates a generic task command RPC by request id", async () => {
+  const home = createConfiguredHome();
+
+  try {
+    runTaskmux(["controller", "start"], { TASKMUX_HOME: home });
+    const discovery = JSON.parse(readFileSync(join(home, "runtime", "controller.json"), "utf8"));
+    const request = {
+      apiVersion: 1,
+      requestId: "same-task-command",
+      method: "task.command",
+      params: { args: ["create", "Create exactly once"] }
+    };
+    const invoke = () => fetch(`http://127.0.0.1:${discovery.port}/rpc`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${discovery.token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(request)
+    });
+
+    assert.equal((await invoke()).status, 200);
+    assert.equal((await invoke()).status, 200);
+    assert.deepEqual(
+      readdirSync(join(home, "tasks")).filter((name) => name.startsWith("task-")),
+      ["task-1"]
+    );
   } finally {
     runTaskmuxFailure(["controller", "stop"], { TASKMUX_HOME: home });
   }
@@ -3605,6 +3986,72 @@ test("keeps the leader native session fixed until explicit replacement", () => {
   assert.deepEqual(session.previousSessionIds, ["codex-session-1"]);
 });
 
+test("preallocates and records a native session id for a new Claude dispatch", () => {
+  const home = createConfiguredHome();
+  const { fakeTmux, logFile } = createFakeTmux(home);
+  const env = { TASKMUX_HOME: home, TASKMUX_TMUX_BIN: fakeTmux, FAKE_TMUX_LOG: logFile };
+
+  runTaskmux(["task", "create", "Delegate a Claude review"], env);
+  runTaskmux(
+    ["task", "assign", "task-1", "reviewer", "--agent", "claude", "--workspace", "/tmp/project-a"],
+    env
+  );
+  runTaskmux(
+    ["task", "dispatch", "task-1", "reviewer", "--mode", "new", "--input", "Review the release"],
+    env
+  );
+
+  const session = JSON.parse(
+    readFileSync(join(home, "runtime", "role-sessions", "task-1", "reviewer.json"), "utf8")
+  );
+  const calls = readFileSync(logFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  const newWindow = calls.find((call) => call[0] === "new-window" && call.includes("reviewer"));
+
+  assert.match(session.nativeSessionId, /^[0-9a-f-]{36}$/);
+  assert.equal(session.agent, "claude");
+  assert.ok(newWindow);
+  assert.match(newWindow.at(-1), new RegExp(`claude --session-id ${session.nativeSessionId}`));
+  assert.match(newWindow.at(-1), new RegExp(`TASKMUX_NATIVE_SESSION_ID=${session.nativeSessionId}`));
+});
+
+test("asks a new Codex role to register the executor-provided thread id", () => {
+  const home = createConfiguredHome();
+  const { fakeTmux, logFile } = createFakeTmux(home);
+  const env = { TASKMUX_HOME: home, TASKMUX_TMUX_BIN: fakeTmux, FAKE_TMUX_LOG: logFile };
+
+  runTaskmux(["task", "create", "Register a Codex session"], env);
+  runTaskmux(
+    ["task", "dispatch", "task-1", "leader", "--mode", "new", "--input", "Begin stewardship"],
+    env
+  );
+  const calls = readFileSync(logFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  const literalInput = calls.find((call) => call[0] === "send-keys" && call[1] === "-l");
+
+  assert.ok(literalInput);
+  assert.match(literalInput.at(-1), /CODEX_THREAD_ID/);
+  assert.match(literalInput.at(-1), /task session record/);
+});
+
+test("replaces an existing tmux role window when the Leader selects a new session", () => {
+  const home = createConfiguredHome();
+  const { fakeTmux, logFile } = createExistingRoleTmux(home, "reviewer");
+  const env = { TASKMUX_HOME: home, TASKMUX_TMUX_BIN: fakeTmux, FAKE_TMUX_LOG: logFile };
+
+  runTaskmux(["task", "create", "Restart a role with fresh context"], env);
+  runTaskmux(
+    ["task", "assign", "task-1", "reviewer", "--agent", "claude", "--workspace", "/tmp/project-a"],
+    env
+  );
+  runTaskmux(
+    ["task", "dispatch", "task-1", "reviewer", "--mode", "new", "--input", "Start from fresh context"],
+    env
+  );
+
+  const calls = readFileSync(logFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.ok(calls.some((call) => call[0] === "kill-window" && call.at(-1) === "taskmux-task-1:reviewer"));
+  assert.ok(calls.some((call) => call[0] === "new-window" && call.includes("reviewer")));
+});
+
 test("dispatches a role synchronously while its agent work continues in tmux", () => {
   const home = createConfiguredHome();
   const { fakeTmux, logFile } = createFakeTmux(home);
@@ -3624,9 +4071,117 @@ test("dispatches a role synchronously while its agent work continues in tmux", (
     .map((line) => JSON.parse(line));
 
   assert.match(output, /Dispatch accepted for task-1\/leader \(resume\)/);
-  assert.deepEqual(calls[3].slice(-1), ["codex resume codex-session-1"]);
-  assert.deepEqual(calls[4], ["send-keys", "-l", "-t", "taskmux-task-1:leader", "Continue the next work item"]);
+  assert.match(calls[3].at(-1), /TASKMUX_TASK_ID=task-1/);
+  assert.match(calls[3].at(-1), /codex resume codex-session-1$/);
+  assert.deepEqual(calls[4].slice(0, 4), ["send-keys", "-l", "-t", "taskmux-task-1:leader"]);
+  assert.match(calls[4][4], /# TaskMux Leader/);
+  assert.match(calls[4][4], /Continue the next work item$/);
   assert.deepEqual(calls[5], ["send-keys", "-t", "taskmux-task-1:leader", "Enter"]);
+});
+
+test("links a dispatch run to its finite WorkItem and Topics", () => {
+  const home = createConfiguredHome();
+  const { fakeTmux, logFile } = createFakeTmux(home);
+  const env = { TASKMUX_HOME: home, TASKMUX_TMUX_BIN: fakeTmux, FAKE_TMUX_LOG: logFile };
+
+  runTaskmux(["task", "create", "Review deployment safety"], env);
+  runTaskmux(
+    ["task", "assign", "task-1", "reviewer", "--agent", "codex", "--workspace", "/tmp/project-a"],
+    env
+  );
+  runTaskmux(
+    [
+      "task", "work-item", "create", "task-1",
+      "--title", "Review rollback safety", "--assignee", "reviewer", "--topic", "deployment"
+    ],
+    env
+  );
+  runTaskmux(
+    [
+      "task", "dispatch", "task-1", "reviewer", "--mode", "new",
+      "--work-item", "work-item-1", "--topic", "testing", "--input", "Run the review"
+    ],
+    env
+  );
+
+  const run = JSON.parse(
+    readFileSync(join(home, "tasks", "task-1", "agent-runs", "agent-run-1.json"), "utf8")
+  );
+  const workItem = JSON.parse(
+    readFileSync(join(home, "tasks", "task-1", "work-items", "work-item-1.json"), "utf8")
+  );
+
+  assert.equal(run.workItemId, "work-item-1");
+  assert.deepEqual(run.topics, ["deployment", "testing"]);
+  assert.match(run.input, /WorkItem work-item-1: Review rollback safety/);
+  assert.equal(workItem.status, "running");
+
+  runTaskmux(
+    ["task", "yield", "task-1", "reviewer", "--summary", "Rollback safety is verified."],
+    env
+  );
+  const completedWorkItem = JSON.parse(
+    readFileSync(join(home, "tasks", "task-1", "work-items", "work-item-1.json"), "utf8")
+  );
+  assert.equal(completedWorkItem.status, "completed");
+  assert.equal(completedWorkItem.outcome, "Rollback safety is verified.");
+  assert.match(completedWorkItem.endedAt, /^\d{4}-/);
+});
+
+test("injects TaskMux role context and the matching system skill into a dispatch", () => {
+  const home = createConfiguredHome();
+  const { fakeTmux, logFile } = createFakeTmux(home);
+
+  runTaskmux(["task", "create", "Review release context"], { TASKMUX_HOME: home });
+  runTaskmux(
+    ["task", "assign", "task-1", "reviewer", "--agent", "codex", "--workspace", "/tmp/project-a"],
+    { TASKMUX_HOME: home }
+  );
+  runTaskmux(
+    ["task", "dispatch", "task-1", "reviewer", "--mode", "new", "--input", "Review the release"],
+    { TASKMUX_HOME: home, TASKMUX_TMUX_BIN: fakeTmux, FAKE_TMUX_LOG: logFile }
+  );
+
+  const calls = readFileSync(logFile, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const newWindow = calls.find((call) => call[0] === "new-window" && call.includes("reviewer"));
+  const literalInput = calls.find((call) => call[0] === "send-keys" && call[1] === "-l");
+
+  assert.ok(newWindow);
+  assert.match(newWindow.at(-1), new RegExp(`TASKMUX_HOME=${home.replaceAll("/", "\\/")}`));
+  assert.match(newWindow.at(-1), /TASKMUX_TASK_ID=task-1/);
+  assert.match(newWindow.at(-1), /TASKMUX_ROLE=reviewer/);
+  assert.match(newWindow.at(-1), /TASKMUX_RUN_ID=agent-run-1/);
+  assert.match(newWindow.at(-1), /TASKMUX_WORKSPACE=\/tmp\/project-a/);
+  assert.ok(literalInput);
+  assert.match(literalInput.at(-1), /# TaskMux Worker/);
+  assert.match(literalInput.at(-1), /Review the release/);
+});
+
+test("rejects a second dispatch while the same role already has an active run", () => {
+  const home = createConfiguredHome();
+  const { fakeTmux, logFile } = createFakeTmux(home);
+  const env = { TASKMUX_HOME: home, TASKMUX_TMUX_BIN: fakeTmux, FAKE_TMUX_LOG: logFile };
+
+  runTaskmux(["task", "create", "Avoid overlapping role work"], env);
+  runTaskmux(
+    ["task", "assign", "task-1", "reviewer", "--agent", "codex", "--workspace", "/tmp/project-a"],
+    env
+  );
+  runTaskmux(
+    ["task", "dispatch", "task-1", "reviewer", "--mode", "new", "--input", "First round"],
+    env
+  );
+
+  const rejected = runTaskmuxFailure(
+    ["task", "dispatch", "task-1", "reviewer", "--mode", "new", "--input", "Overlapping round"],
+    env
+  );
+
+  assert.equal(rejected.status, 2);
+  assert.match(rejected.stderr, /already has an active agent run/);
 });
 
 test("records an agent run and wakes the leader when an independent role yields", () => {
@@ -3666,6 +4221,31 @@ test("records an agent run and wakes the leader when an independent role yields"
   assert.deepEqual(pendingWakeup.reasons, ["role-result"]);
 });
 
+test("resolves context and yield scope from the role session environment", () => {
+  const home = createConfiguredHome();
+  const { fakeTmux, logFile } = createFakeTmux(home);
+  const baseEnv = { TASKMUX_HOME: home, TASKMUX_TMUX_BIN: fakeTmux, FAKE_TMUX_LOG: logFile };
+
+  runTaskmux(["task", "create", "Use scoped role commands"], baseEnv);
+  runTaskmux(
+    ["task", "assign", "task-1", "reviewer", "--agent", "codex", "--workspace", "/tmp/project-a"],
+    baseEnv
+  );
+  runTaskmux(
+    ["task", "dispatch", "task-1", "reviewer", "--mode", "new", "--input", "Review"],
+    baseEnv
+  );
+  const roleEnv = { ...baseEnv, TASKMUX_TASK_ID: "task-1", TASKMUX_ROLE: "reviewer" };
+
+  runTaskmux(["task", "session", "record", "--native-id", "scoped-session"], roleEnv);
+  const context = JSON.parse(runTaskmux(["task", "context", "--format", "json"], roleEnv));
+  const yielded = runTaskmux(["task", "yield", "--summary", "Review is complete"], roleEnv);
+
+  assert.equal(context.task.id, "task-1");
+  assert.equal(context.sessions.reviewer.nativeSessionId, "scoped-session");
+  assert.match(yielded, /Yielded agent-run-1 from task-1\/reviewer/);
+});
+
 test("wakes an inactive unarchived task only when no agent run is active", () => {
   const home = createConfiguredHome();
 
@@ -3685,6 +4265,131 @@ test("wakes an inactive unarchived task only when no agent run is active", () =>
   runTaskmux(["task", "archive", "task-1"], { TASKMUX_HOME: home });
   const secondScan = runTaskmux(["controller", "scan"], { TASKMUX_HOME: home });
   assert.match(secondScan, /Queued 0 task wakeups/);
+});
+
+test("suppresses a repeated inactivity wakeup during the configured cooldown", () => {
+  const home = createConfiguredHome();
+  const { fakeTmux, logFile } = createFakeTmux(home);
+  const env = {
+    TASKMUX_HOME: home,
+    TASKMUX_TMUX_BIN: fakeTmux,
+    FAKE_TMUX_LOG: logFile,
+    TASKMUX_CONTROLLER_SCAN_INTERVAL_MS: "50"
+  };
+
+  runTaskmux(["task", "create", "Avoid repeated idle reviews"], env);
+  runTaskmux(
+    ["task", "session", "record", "task-1", "leader", "--native-id", "codex-session-1"],
+    env
+  );
+  runTaskmux(
+    ["task", "schedule", "set", "task-1", "--inactivity-minutes", "0", "--cooldown-minutes", "60"],
+    env
+  );
+  runTaskmux(["task", "wake", "task-1", "--reason", "initial-review"], env);
+
+  try {
+    runTaskmux(["controller", "start"], env);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], env);
+  }
+
+  runTaskmux(["task", "yield", "task-1", "leader", "--summary", "No action needed yet."], env);
+  const scan = runTaskmux(["controller", "scan"], env);
+  const schedule = JSON.parse(readFileSync(join(home, "tasks", "task-1", "schedule.json"), "utf8"));
+
+  assert.match(scan, /Queued 0 task wakeups/);
+  assert.match(schedule.lastLeaderWakeupAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(existsSync(join(home, "runtime", "pending-wakeups", "task-1.json")), false);
+});
+
+test("expires an abandoned agent run and wakes the leader once", () => {
+  const home = createConfiguredHome();
+  const { fakeTmux, logFile, stateFile } = createStatefulTmux(home);
+  const env = {
+    TASKMUX_HOME: home,
+    TASKMUX_TMUX_BIN: fakeTmux,
+    FAKE_TMUX_LOG: logFile,
+    FAKE_TMUX_STATE: stateFile,
+    TASKMUX_CONTROLLER_SCAN_INTERVAL_MS: "25",
+    TASKMUX_AGENT_RUN_TTL_MS: "25"
+  };
+
+  runTaskmux(["task", "create", "Recover an abandoned review"], env);
+  runTaskmux(
+    ["task", "assign", "task-1", "reviewer", "--agent", "codex", "--workspace", "/tmp/project-a"],
+    env
+  );
+  runTaskmux(
+    ["task", "dispatch", "task-1", "reviewer", "--mode", "new", "--input", "Review the release"],
+    env
+  );
+
+  try {
+    runTaskmux(["controller", "start"], env);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+    const storedRun = JSON.parse(
+      readFileSync(join(home, "tasks", "task-1", "agent-runs", "agent-run-1.json"), "utf8")
+    );
+    const reviewer = JSON.parse(
+      readFileSync(join(home, "tasks", "task-1", "roles", "reviewer", "role.json"), "utf8")
+    );
+    const events = readFileSync(join(home, "tasks", "task-1", "events.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+
+    assert.equal(storedRun.status, "expired");
+    assert.equal(reviewer.status, "idle");
+    assert.match(storedRun.endedAt, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(existsSync(join(home, "runtime", "active-runs", "task-1", "reviewer.json")), false);
+    assert.equal(events.filter((event) => event.type === "leader.wakeup_dispatched").length, 1);
+    assert.match(
+      events.find((event) => event.type === "leader.wakeup_dispatched").payload.reasons,
+      /role-run-expired/
+    );
+    assert.equal(existsSync(join(home, "runtime", "pending-wakeups", "task-1.json")), false);
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], env);
+  }
+});
+
+test("fails an active role run immediately when its tmux window has exited", () => {
+  const home = createConfiguredHome();
+  const { fakeTmux, logFile } = createFakeTmux(home);
+  const env = {
+    TASKMUX_HOME: home,
+    TASKMUX_TMUX_BIN: fakeTmux,
+    FAKE_TMUX_LOG: logFile,
+    TASKMUX_AGENT_RUN_TTL_MS: "99999999"
+  };
+
+  runTaskmux(["task", "create", "Notice a failed review process"], env);
+  runTaskmux(
+    ["task", "assign", "task-1", "reviewer", "--agent", "codex", "--workspace", "/tmp/project-a"],
+    env
+  );
+  runTaskmux(
+    ["task", "dispatch", "task-1", "reviewer", "--mode", "new", "--input", "Review the release"],
+    env
+  );
+
+  runTaskmux(["controller", "scan"], env);
+  const storedRun = JSON.parse(
+    readFileSync(join(home, "tasks", "task-1", "agent-runs", "agent-run-1.json"), "utf8")
+  );
+  const wakeup = JSON.parse(
+    readFileSync(join(home, "runtime", "pending-wakeups", "task-1.json"), "utf8")
+  );
+  const role = JSON.parse(
+    readFileSync(join(home, "tasks", "task-1", "roles", "reviewer", "role.json"), "utf8")
+  );
+
+  assert.equal(storedRun.status, "failed");
+  assert.equal(role.status, "exited");
+  assert.equal(existsSync(join(home, "runtime", "active-runs", "task-1", "reviewer.json")), false);
+  assert.deepEqual(wakeup.reasons, ["role-run-failed"]);
 });
 
 test("controller periodically performs the inactivity safety scan", () => {
@@ -3714,11 +4419,12 @@ test("controller periodically performs the inactivity safety scan", () => {
 
 test("controller recovers the fixed leader session to process a pending wakeup", () => {
   const home = createConfiguredHome();
-  const { fakeTmux, logFile } = createFakeTmux(home);
+  const { fakeTmux, logFile, stateFile } = createStatefulTmux(home);
   const env = {
     TASKMUX_HOME: home,
     TASKMUX_TMUX_BIN: fakeTmux,
     FAKE_TMUX_LOG: logFile,
+    FAKE_TMUX_STATE: stateFile,
     TASKMUX_CONTROLLER_SCAN_INTERVAL_MS: "50"
   };
 
@@ -3741,10 +4447,59 @@ test("controller recovers the fixed leader session to process a pending wakeup",
     assert.equal(activeRun.mode, "resume");
     assert.match(activeRun.input, /user-comment/);
     assert.equal(existsSync(join(home, "runtime", "pending-wakeups", "task-1.json")), false);
+    assert.match(calls[3].at(-1), /TASKMUX_HOME=/);
+    assert.match(calls[3].at(-1), /TASKMUX_TASK_ID=task-1/);
+    assert.match(calls[3].at(-1), /TASKMUX_ROLE=leader/);
+    assert.match(calls[3].at(-1), /TASKMUX_RUN_ID=agent-run-1/);
     assert.match(calls[3].at(-1), /codex resume codex-session-1/);
+    assert.match(activeRun.input, /# TaskMux Leader/);
   } finally {
     runTaskmuxFailure(["controller", "stop"], env);
   }
+});
+
+test("pauses leader wakeups after recovery failure until the session is explicitly replaced", () => {
+  const home = createConfiguredHome();
+  const fakeTmux = createFailingDispatchTmux(home);
+  const env = {
+    TASKMUX_HOME: home,
+    TASKMUX_TMUX_BIN: fakeTmux,
+    TASKMUX_CONTROLLER_SCAN_INTERVAL_MS: "25"
+  };
+
+  runTaskmux(["task", "create", "Repair a broken Leader session"], env);
+  runTaskmux(
+    ["task", "session", "record", "task-1", "leader", "--native-id", "broken-session"],
+    env
+  );
+  runTaskmux(["task", "wake", "task-1", "--reason", "scheduled-review"], env);
+
+  try {
+    runTaskmux(["controller", "start"], env);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+    const failure = JSON.parse(
+      readFileSync(join(home, "runtime", "leader-failures", "task-1.json"), "utf8")
+    );
+    const context = JSON.parse(
+      runTaskmux(["task", "context", "task-1", "--format", "json"], env)
+    );
+
+    assert.equal(failure.nativeSessionId, "broken-session");
+    assert.equal(failure.attemptCount, 1);
+    assert.equal(context.leaderFailure.attemptCount, 1);
+    assert.equal(existsSync(join(home, "runtime", "pending-wakeups", "task-1.json")), true);
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], env);
+  }
+
+  runTaskmux(
+    [
+      "task", "session", "replace", "task-1", "leader",
+      "--native-id", "replacement-session", "--reason", "original session is irrecoverable"
+    ],
+    env
+  );
+  assert.equal(existsSync(join(home, "runtime", "leader-failures", "task-1.json")), false);
 });
 
 test("coalesces one-off review and recurring schedule firings without reopening the task", () => {
@@ -3821,4 +4576,60 @@ test("persists the leader brief and curated milestones in user-readable files", 
   assert.match(timeline, /The canary environment now deploys/);
   assert.match(context.brief, /Make deployments repeatable/);
   assert.deepEqual(context.topics.builtIn.map((topic) => topic.id).slice(0, 2), ["requirements", "architecture"]);
+});
+
+test("records and supersedes durable decisions with Topic associations", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["task", "create", "Choose a deployment strategy"], { TASKMUX_HOME: home });
+  runTaskmux(
+    [
+      "task", "decision", "record", "task-1",
+      "--title", "Use canary deployment",
+      "--rationale", "Canary limits rollback impact while preserving feedback speed.",
+      "--topic", "architecture", "--topic", "deployment"
+    ],
+    { TASKMUX_HOME: home }
+  );
+  runTaskmux(
+    [
+      "task", "decision", "supersede", "task-1", "decision-1",
+      "--reason", "The platform now provides native blue-green routing."
+    ],
+    { TASKMUX_HOME: home }
+  );
+
+  const context = JSON.parse(
+    runTaskmux(["task", "context", "task-1", "--format", "json"], { TASKMUX_HOME: home })
+  );
+  const timeline = readFileSync(join(home, "tasks", "task-1", "timeline.md"), "utf8");
+
+  assert.equal(context.decisions[0].id, "decision-1");
+  assert.equal(context.decisions[0].status, "superseded");
+  assert.deepEqual(context.decisions[0].topics, ["architecture", "deployment"]);
+  assert.match(context.decisions[0].supersededReason, /blue-green/);
+  assert.match(timeline, /Use canary deployment/);
+});
+
+test("shows durable focus and finite progress on the task board", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["task", "create", "Track release progress"], { TASKMUX_HOME: home });
+  runTaskmux(
+    [
+      "task", "brief", "update", "task-1",
+      "--objective", "Ship safely",
+      "--focus", "Canary validation",
+      "--leader-summary", "Preparing the first canary"
+    ],
+    { TASKMUX_HOME: home }
+  );
+  runTaskmux(
+    ["task", "work-item", "create", "task-1", "--title", "Run canary"],
+    { TASKMUX_HOME: home }
+  );
+
+  const board = runTaskmux(["task", "board", "--with-roles"], { TASKMUX_HOME: home });
+  assert.match(board, /focus=Canary validation/);
+  assert.match(board, /work pending=1/);
 });
