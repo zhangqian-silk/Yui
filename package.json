@@ -1,7 +1,7 @@
 {
   "name": "@zq-silk/taskmux",
   "version": "0.1.5",
-  "description": "Local task board for native agent CLI sessions backed by tmux.",
+  "description": "Local control plane for long-running native agent CLI sessions backed by tmux.",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -11,6 +11,8 @@
     "dist",
     "skills",
     "README.md",
+    "README.zh-CN.md",
+    "ARCHITECTURE.md",
     "LICENSE"
   ],
   "scripts": {

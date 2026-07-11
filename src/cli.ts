@@ -112,8 +112,6 @@ Usage:
   taskmux task schedule set <task-id> ...
   taskmux task decision record|supersede <task-id> ...
   taskmux task worktree create <task-id> <role> --path <path> --branch <branch>
-
-Role, tmux, and agent commands are defined in docs/requirements.md.
 `;
 
 const rawArgs = process.argv.slice(2);
