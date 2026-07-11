@@ -1,7 +1,7 @@
 import { dataError } from "../errors/cliError.js";
-import type { Role } from "../role/role.js";
+import type { Role, RoleProfile } from "../role/role.js";
 import type { RunnerEnvironment } from "../runner/runner.js";
-import type { Task, TaskPriority, TaskStatus } from "../task/task.js";
+import type { Task, TaskPriority } from "../task/task.js";
 
 export type TaskInfoRecord = {
   schemaVersion: 1;
@@ -16,12 +16,11 @@ export type TaskRuntimeRecord = {
   schemaVersion: 1;
   id: string;
   archived: boolean;
-  status: TaskStatus;
   createdAt: string;
   updatedAt: string;
 };
 
-export type RoleInfoRecord = {
+export type RoleInfoRecord = RoleProfile & {
   schemaVersion: 1;
   name: string;
 };
@@ -55,7 +54,6 @@ export class TaskRecordCodec {
         schemaVersion: task.schemaVersion,
         id: task.id,
         archived: task.archived,
-        status: task.status,
         createdAt: task.createdAt,
         updatedAt: task.updatedAt
       },
@@ -104,7 +102,13 @@ export class TaskRecordCodec {
       },
       info: {
         schemaVersion: 1,
-        name: role.name
+        name: role.name,
+        description: role.description,
+        responsibilities: role.responsibilities,
+        constraints: role.constraints,
+        expectedOutput: role.expectedOutput,
+        systemPrompt: role.systemPrompt,
+        skills: role.skills
       }
     };
   }
@@ -120,7 +124,7 @@ export class TaskRecordCodec {
 
     return {
       ...runtime,
-      name: info.name
+      ...info
     };
   }
 
@@ -132,7 +136,7 @@ export class TaskRecordCodec {
       value.schemaVersion !== 1 ||
       typeof value.id !== "string" ||
       "title" in value ||
-      !isTaskStatus(value.status) ||
+      (typeof value.archived !== "boolean" && !isLegacyTaskStatus(value.status)) ||
       typeof value.createdAt !== "string" ||
       typeof value.updatedAt !== "string"
     ) {
@@ -140,8 +144,11 @@ export class TaskRecordCodec {
     }
 
     return {
-      ...(value as Omit<TaskRuntimeRecord, "archived">),
-      archived: typeof value.archived === "boolean" ? value.archived : value.status === "archived"
+      schemaVersion: 1,
+      id: value.id,
+      archived: typeof value.archived === "boolean" ? value.archived : value.status === "archived",
+      createdAt: value.createdAt,
+      updatedAt: value.updatedAt
     };
   }
 
@@ -188,7 +195,17 @@ export class TaskRecordCodec {
   private parseRoleInfo(name: string, raw: string): RoleInfoRecord {
     const value = parseJson(raw, `Invalid role info record: ${name}`);
 
-    if (!isRecord(value) || value.schemaVersion !== 1 || typeof value.name !== "string") {
+    if (
+      !isRecord(value) ||
+      value.schemaVersion !== 1 ||
+      typeof value.name !== "string" ||
+      !isOptionalString(value.description) ||
+      (value.responsibilities !== undefined && !isStringArray(value.responsibilities)) ||
+      (value.constraints !== undefined && !isStringArray(value.constraints)) ||
+      !isOptionalString(value.expectedOutput) ||
+      !isOptionalString(value.systemPrompt) ||
+      (value.skills !== undefined && !isStringArray(value.skills))
+    ) {
       throw dataError(`Invalid role info record: ${name}`);
     }
 
@@ -218,7 +235,11 @@ function isStringRecord(value: unknown): value is Record<string, string> {
   return isRecord(value) && Object.values(value).every((item) => typeof item === "string");
 }
 
-function isTaskStatus(status: unknown): status is TaskStatus {
+function isOptionalString(value: unknown): value is string | undefined {
+  return value === undefined || typeof value === "string";
+}
+
+function isLegacyTaskStatus(status: unknown): boolean {
   return ["open", "active", "done", "archived"].includes(String(status));
 }
 

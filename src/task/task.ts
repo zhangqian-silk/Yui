@@ -1,4 +1,3 @@
-export type TaskStatus = "open" | "active" | "done" | "archived";
 export type TaskPriority = "low" | "medium" | "high" | "urgent";
 
 export type TaskMetadata = {
@@ -17,7 +16,6 @@ export type Task = {
   tags?: string[];
   dueAt?: string;
   archived: boolean;
-  status: TaskStatus;
   createdAt: string;
   updatedAt: string;
 };
@@ -37,18 +35,8 @@ export function createTask(id: string, title: string, now: Date, metadata: TaskM
     title: trimmedTitle,
     ...metadata,
     archived: false,
-    status: "open",
     createdAt: timestamp,
     updatedAt: timestamp
-  };
-}
-
-export function updateTaskStatus(task: Task, status: TaskStatus, now: Date): Task {
-  return {
-    ...task,
-    archived: status === "archived" ? true : status === "open" ? false : task.archived,
-    status,
-    updatedAt: now.toISOString()
   };
 }
 
@@ -56,7 +44,6 @@ export function updateTaskArchived(task: Task, archived: boolean, now: Date): Ta
   return {
     ...task,
     archived,
-    status: archived ? "archived" : "open",
     updatedAt: now.toISOString()
   };
 }

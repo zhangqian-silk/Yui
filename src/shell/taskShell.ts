@@ -82,10 +82,8 @@ function toTaskCommand(taskId: string, name: string, args: string[]): string[] {
   switch (normalizedName) {
     case "summary":
       return ["open", taskId];
-    case "start":
-    case "done":
     case "archive":
-    case "reopen":
+    case "unarchive":
     case "refresh":
     case "cleanup":
     case "delete":
@@ -163,10 +161,8 @@ function parseCommandLine(line: string): string[] {
 function shellHelp(): string {
   return `Task shell commands:
   summary
-  start
-  done
   archive
-  reopen
+  unarchive
   roles
   r
   refresh

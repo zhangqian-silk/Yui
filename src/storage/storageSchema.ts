@@ -2,9 +2,10 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { dataError } from "../errors/cliError.js";
 import { migrateStorageV0ToV1, type StorageMigration } from "./migrations/v0ToV1.js";
+import { migrateStorageV1ToV2 } from "./migrations/v1ToV2.js";
 import { createStorageBackup, type StorageBackupResult } from "./storageBackup.js";
 
-export const CURRENT_STORAGE_SCHEMA_VERSION = 1;
+export const CURRENT_STORAGE_SCHEMA_VERSION = 2;
 export const STORAGE_SCHEMA_FILE = "schema.json";
 
 export type StorageSchemaManifest = {
@@ -51,7 +52,7 @@ export type StorageMigrationResult = {
   backup?: StorageBackupResult;
 };
 
-const migrations: StorageMigration[] = [migrateStorageV0ToV1];
+const migrations: StorageMigration[] = [migrateStorageV0ToV1, migrateStorageV1ToV2];
 
 export function inspectStorageSchema(rootDir: string): StorageSchemaState {
   const manifestPath = storageSchemaFile(rootDir);

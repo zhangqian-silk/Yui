@@ -2,16 +2,22 @@ import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSyn
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { TaskComment } from "../comment/comment.js";
+import type { Milestone } from "../milestone/milestone.js";
 import type { Cycle } from "../cycle/cycle.js";
 import { dataError } from "../errors/cliError.js";
 import type { TaskEvent } from "../event/taskEvent.js";
+import type { AgentSession } from "../executor/agentExecutor.js";
 import type { TaskInputDraft } from "../input/taskInput.js";
 import type { GlobalRole, Role } from "../role/role.js";
+import type { ChildRole } from "../role/childRole.js";
+import type { AgentRun } from "../run/agentRun.js";
 import type { CustomRunner } from "../runner/runner.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
+import type { TaskSchedule } from "../scheduler/taskSchedule.js";
 import type { Task } from "../task/task.js";
 import { emptyTaskTopics, type TaskTopics } from "../topic/topic.js";
 import type { WorkItem } from "../workItem/workItem.js";
+import type { RoleWorktree } from "../worktree/worktree.js";
 import { taskRecordCodec } from "./taskRecordCodec.js";
 
 export type TaskStore = {
@@ -30,16 +36,39 @@ export type TaskStore = {
   clearTaskInputDraft(taskId: string): void;
   getPendingWakeup(taskId: string): PendingWakeup | null;
   savePendingWakeup(wakeup: PendingWakeup): void;
+  listPendingWakeups(): PendingWakeup[];
+  clearPendingWakeup(taskId: string): void;
+  getTaskSchedule(taskId: string): TaskSchedule | null;
+  saveTaskSchedule(taskId: string, schedule: TaskSchedule): void;
   nextCycleId(taskId: string): string;
   getCycle(taskId: string, cycleId: string): Cycle | null;
   saveCycle(taskId: string, cycle: Cycle): void;
   nextWorkItemId(taskId: string): string;
   getWorkItem(taskId: string, workItemId: string): WorkItem | null;
   saveWorkItem(taskId: string, workItem: WorkItem): void;
+  getAgentSession(taskId: string, roleName: string): AgentSession | null;
+  saveAgentSession(session: AgentSession): void;
+  nextAgentRunId(taskId: string): string;
+  getAgentRun(taskId: string, runId: string): AgentRun | null;
+  saveAgentRun(run: AgentRun): void;
+  getActiveAgentRun(taskId: string, roleName: string): AgentRun | null;
+  saveActiveAgentRun(run: AgentRun): void;
+  clearActiveAgentRun(taskId: string, roleName: string): void;
+  saveTaskBrief(taskId: string, markdown: string): void;
+  readTaskBrief(taskId: string): string | null;
+  appendTaskTimeline(taskId: string, markdown: string): void;
+  nextMilestoneId(taskId: string): string;
+  getMilestone(taskId: string, milestoneId: string): Milestone | null;
+  saveMilestone(taskId: string, milestone: Milestone): void;
+  saveRoleWorktree(taskId: string, worktree: RoleWorktree): void;
   saveRole(taskId: string, role: Role): void;
   renameRole(taskId: string, oldName: string, role: Role): void;
   listRoles(taskId: string): Role[];
   getRole(taskId: string, name: string): Role | null;
+  saveChildRole(taskId: string, role: ChildRole): void;
+  getChildRole(taskId: string, name: string): ChildRole | null;
+  listChildRoles(taskId: string): ChildRole[];
+  removeTaskRole(taskId: string, name: string): { removed: boolean; childCount: number };
   saveGlobalRole(role: GlobalRole): void;
   listGlobalRoles(): GlobalRole[];
   getGlobalRole(name: string): GlobalRole | null;
@@ -198,6 +227,36 @@ export class FileTaskStore implements TaskStore {
     writeFileSync(this.pendingWakeupFile(wakeup.taskId), `${JSON.stringify(wakeup, null, 2)}\n`);
   }
 
+  listPendingWakeups(): PendingWakeup[] {
+    try {
+      return readdirSync(this.pendingWakeupsDir(), { withFileTypes: true })
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+        .map((entry) => entry.name.slice(0, -5))
+        .map((taskId) => this.getPendingWakeup(taskId))
+        .filter((wakeup): wakeup is PendingWakeup => wakeup !== null)
+        .sort((left, right) => left.taskId.localeCompare(right.taskId));
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+        return [];
+      }
+      throw error;
+    }
+  }
+
+  clearPendingWakeup(taskId: string): void {
+    rmSync(this.pendingWakeupFile(taskId), { force: true });
+  }
+
+  getTaskSchedule(taskId: string): TaskSchedule | null {
+    const raw = this.readOptionalText(this.taskScheduleFile(taskId));
+    return raw === null ? null : parseTaskSchedule(taskId, raw);
+  }
+
+  saveTaskSchedule(taskId: string, schedule: TaskSchedule): void {
+    mkdirSync(this.taskDir(taskId), { recursive: true });
+    writeFileSync(this.taskScheduleFile(taskId), `${JSON.stringify(schedule, null, 2)}\n`);
+  }
+
   nextCycleId(taskId: string): string {
     return this.nextRecordId("cycle", (id) => this.getCycle(taskId, id));
   }
@@ -226,6 +285,92 @@ export class FileTaskStore implements TaskStore {
   saveWorkItem(taskId: string, workItem: WorkItem): void {
     mkdirSync(this.workItemsDir(taskId), { recursive: true });
     writeFileSync(this.workItemFile(taskId, workItem.id), `${JSON.stringify(workItem, null, 2)}\n`);
+  }
+
+  getAgentSession(taskId: string, roleName: string): AgentSession | null {
+    const raw = this.readOptionalText(this.agentSessionFile(taskId, roleName));
+
+    return raw === null ? null : parseAgentSession(taskId, roleName, raw);
+  }
+
+  saveAgentSession(session: AgentSession): void {
+    mkdirSync(this.agentSessionsDir(session.taskId), { recursive: true });
+    writeFileSync(
+      this.agentSessionFile(session.taskId, session.roleName),
+      `${JSON.stringify(session, null, 2)}\n`
+    );
+  }
+
+  nextAgentRunId(taskId: string): string {
+    return this.nextRecordId("agent-run", (id) => this.getAgentRun(taskId, id));
+  }
+
+  getAgentRun(taskId: string, runId: string): AgentRun | null {
+    const raw = this.readOptionalText(this.agentRunFile(taskId, runId));
+    return raw === null ? null : parseAgentRun(taskId, runId, raw);
+  }
+
+  saveAgentRun(run: AgentRun): void {
+    mkdirSync(this.agentRunsDir(run.taskId), { recursive: true });
+    writeFileSync(this.agentRunFile(run.taskId, run.id), `${JSON.stringify(run, null, 2)}\n`);
+  }
+
+  getActiveAgentRun(taskId: string, roleName: string): AgentRun | null {
+    const raw = this.readOptionalText(this.activeAgentRunFile(taskId, roleName));
+    if (raw === null) {
+      return null;
+    }
+
+    const value = parseJson(raw, `Invalid active agent run record: ${taskId}/${roleName}`);
+    if (!isRecord(value) || typeof value.id !== "string") {
+      throw dataError(`Invalid active agent run record: ${taskId}/${roleName}`);
+    }
+    return parseAgentRun(taskId, value.id, raw);
+  }
+
+  saveActiveAgentRun(run: AgentRun): void {
+    mkdirSync(this.activeAgentRunsDir(run.taskId), { recursive: true });
+    writeFileSync(this.activeAgentRunFile(run.taskId, run.roleName), `${JSON.stringify(run, null, 2)}\n`);
+  }
+
+  clearActiveAgentRun(taskId: string, roleName: string): void {
+    rmSync(this.activeAgentRunFile(taskId, roleName), { force: true });
+  }
+
+  saveTaskBrief(taskId: string, markdown: string): void {
+    mkdirSync(this.taskDir(taskId), { recursive: true });
+    writeFileSync(this.taskBriefFile(taskId), markdown);
+  }
+
+  readTaskBrief(taskId: string): string | null {
+    return this.readOptionalText(this.taskBriefFile(taskId));
+  }
+
+  appendTaskTimeline(taskId: string, markdown: string): void {
+    mkdirSync(this.taskDir(taskId), { recursive: true });
+    appendFileSync(this.taskTimelineFile(taskId), markdown);
+  }
+
+  nextMilestoneId(taskId: string): string {
+    return this.nextRecordId("milestone", (id) => this.getMilestone(taskId, id));
+  }
+
+  getMilestone(taskId: string, milestoneId: string): Milestone | null {
+    const raw = this.readOptionalText(this.milestoneFile(taskId, milestoneId));
+    return raw === null ? null : parseMilestone(taskId, milestoneId, raw);
+  }
+
+  saveMilestone(taskId: string, milestone: Milestone): void {
+    mkdirSync(this.milestonesDir(taskId), { recursive: true });
+    writeFileSync(this.milestoneFile(taskId, milestone.id), `${JSON.stringify(milestone, null, 2)}\n`);
+  }
+
+  saveRoleWorktree(taskId: string, worktree: RoleWorktree): void {
+    mkdirSync(this.roleDir(taskId, worktree.roleName), { recursive: true });
+    writeFileSync(
+      this.roleWorktreeFile(taskId, worktree.roleName),
+      `${JSON.stringify(worktree, null, 2)}\n`
+    );
   }
 
   saveRole(taskId: string, role: Role): void {
@@ -267,6 +412,52 @@ export class FileTaskStore implements TaskStore {
 
       throw error;
     }
+  }
+
+  saveChildRole(taskId: string, role: ChildRole): void {
+    const roleDir = this.roleDir(taskId, role.name);
+    mkdirSync(roleDir, { recursive: true });
+    rmSync(this.roleFile(taskId, role.name), { force: true });
+    writeFileSync(this.roleInfoFile(taskId, role.name), `${JSON.stringify(role, null, 2)}\n`);
+  }
+
+  getChildRole(taskId: string, name: string): ChildRole | null {
+    const raw = this.readOptionalText(this.roleInfoFile(taskId, name));
+
+    if (raw === null) {
+      return null;
+    }
+
+    const value = parseJson(raw, `Invalid child role record: ${name}`);
+    if (!isRecord(value) || value.architecture !== "child") {
+      return null;
+    }
+
+    return parseChildRole(name, raw);
+  }
+
+  listChildRoles(taskId: string): ChildRole[] {
+    return this.directoryNames(this.rolesDir(taskId))
+      .map((name) => this.getChildRole(taskId, name))
+      .filter((role): role is ChildRole => role !== null)
+      .sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  removeTaskRole(taskId: string, name: string): { removed: boolean; childCount: number } {
+    const roleDir = this.roleDir(taskId, name);
+    const exists = this.readOptionalText(this.roleFile(taskId, name)) !== null ||
+      this.readOptionalText(this.roleInfoFile(taskId, name)) !== null;
+
+    if (!exists) {
+      return { removed: false, childCount: 0 };
+    }
+
+    const childNames = this.directoryNames(this.rolesDir(taskId)).filter((candidate) =>
+      this.getChildRole(taskId, candidate)?.parentRole === name
+    );
+    rmSync(roleDir, { recursive: true, force: true });
+    childNames.forEach((childName) => rmSync(this.roleDir(taskId, childName), { recursive: true, force: true }));
+    return { removed: true, childCount: childNames.length };
   }
 
   saveGlobalRole(role: GlobalRole): void {
@@ -438,6 +629,26 @@ export class FileTaskStore implements TaskStore {
     return join(this.taskDir(taskId), "input-draft.json");
   }
 
+  private taskScheduleFile(taskId: string): string {
+    return join(this.taskDir(taskId), "schedule.json");
+  }
+
+  private taskBriefFile(taskId: string): string {
+    return join(this.taskDir(taskId), "brief.md");
+  }
+
+  private taskTimelineFile(taskId: string): string {
+    return join(this.taskDir(taskId), "timeline.md");
+  }
+
+  private milestonesDir(taskId: string): string {
+    return join(this.taskDir(taskId), "milestones");
+  }
+
+  private milestoneFile(taskId: string, milestoneId: string): string {
+    return join(this.milestonesDir(taskId), `${milestoneId}.json`);
+  }
+
   private runtimeDir(): string {
     return join(this.rootDir, "runtime");
   }
@@ -464,6 +675,38 @@ export class FileTaskStore implements TaskStore {
 
   private workItemFile(taskId: string, workItemId: string): string {
     return join(this.workItemsDir(taskId), `${workItemId}.json`);
+  }
+
+  private roleSessionsDir(): string {
+    return join(this.runtimeDir(), "role-sessions");
+  }
+
+  private agentSessionsDir(taskId: string): string {
+    return join(this.roleSessionsDir(), taskId);
+  }
+
+  private agentSessionFile(taskId: string, roleName: string): string {
+    return join(this.agentSessionsDir(taskId), `${roleName}.json`);
+  }
+
+  private agentRunsDir(taskId: string): string {
+    return join(this.taskDir(taskId), "agent-runs");
+  }
+
+  private agentRunFile(taskId: string, runId: string): string {
+    return join(this.agentRunsDir(taskId), `${runId}.json`);
+  }
+
+  private activeRunsDir(): string {
+    return join(this.runtimeDir(), "active-runs");
+  }
+
+  private activeAgentRunsDir(taskId: string): string {
+    return join(this.activeRunsDir(), taskId);
+  }
+
+  private activeAgentRunFile(taskId: string, roleName: string): string {
+    return join(this.activeAgentRunsDir(taskId), `${roleName}.json`);
   }
 
   private trashDir(): string {
@@ -516,6 +759,10 @@ export class FileTaskStore implements TaskStore {
 
   private roleInfoFile(taskId: string, name: string): string {
     return join(this.roleDir(taskId, name), "info.json");
+  }
+
+  private roleWorktreeFile(taskId: string, name: string): string {
+    return join(this.roleDir(taskId, name), "worktree.json");
   }
 
   private transcriptFile(taskId: string, name: string): string {
@@ -649,6 +896,12 @@ function parseGlobalRole(name: string, raw: string): GlobalRole {
     !isStringArray(value.args) ||
     !isStringRecord(value.env) ||
     typeof value.workspace !== "string" ||
+    (value.description !== undefined && typeof value.description !== "string") ||
+    (value.responsibilities !== undefined && !isStringArray(value.responsibilities)) ||
+    (value.constraints !== undefined && !isStringArray(value.constraints)) ||
+    (value.expectedOutput !== undefined && typeof value.expectedOutput !== "string") ||
+    (value.systemPrompt !== undefined && typeof value.systemPrompt !== "string") ||
+    (value.skills !== undefined && !isStringArray(value.skills)) ||
     typeof value.createdAt !== "string" ||
     typeof value.updatedAt !== "string"
   ) {
@@ -656,6 +909,28 @@ function parseGlobalRole(name: string, raw: string): GlobalRole {
   }
 
   return value as GlobalRole;
+}
+
+function parseChildRole(name: string, raw: string): ChildRole {
+  const value = parseJson(raw, `Invalid child role record: ${name}`);
+
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    value.name !== name ||
+    value.architecture !== "child" ||
+    typeof value.parentRole !== "string" ||
+    typeof value.description !== "string" ||
+    !isStringArray(value.responsibilities) ||
+    !isStringArray(value.constraints) ||
+    typeof value.expectedOutput !== "string" ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string"
+  ) {
+    throw dataError(`Invalid child role record: ${name}`);
+  }
+
+  return value as ChildRole;
 }
 
 function parseTaskmuxConfig(raw: string): TaskmuxConfig {
@@ -733,6 +1008,46 @@ function parsePendingWakeup(taskId: string, raw: string): PendingWakeup {
   return value as PendingWakeup;
 }
 
+function parseTaskSchedule(taskId: string, raw: string): TaskSchedule {
+  const value = parseJson(raw, `Invalid task schedule record: ${taskId}`);
+
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    typeof value.inactivityMinutes !== "number" ||
+    typeof value.cooldownMinutes !== "number" ||
+    (value.reviewAt !== undefined && typeof value.reviewAt !== "string") ||
+    (value.recurring !== undefined && (
+      !isRecord(value.recurring) ||
+      typeof value.recurring.everyMinutes !== "number" ||
+      typeof value.recurring.nextAt !== "string"
+    )) ||
+    typeof value.updatedAt !== "string"
+  ) {
+    throw dataError(`Invalid task schedule record: ${taskId}`);
+  }
+
+  return value as TaskSchedule;
+}
+
+function parseMilestone(taskId: string, milestoneId: string, raw: string): Milestone {
+  const value = parseJson(raw, `Invalid milestone record: ${taskId}/${milestoneId}`);
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    value.id !== milestoneId ||
+    value.taskId !== taskId ||
+    typeof value.title !== "string" ||
+    typeof value.summary !== "string" ||
+    !isStringArray(value.topics) ||
+    value.createdBy !== "leader" ||
+    typeof value.createdAt !== "string"
+  ) {
+    throw dataError(`Invalid milestone record: ${taskId}/${milestoneId}`);
+  }
+  return value as Milestone;
+}
+
 function parseCycle(taskId: string, cycleId: string, raw: string): Cycle {
   const value = parseJson(raw, `Invalid cycle record: ${taskId}/${cycleId}`);
 
@@ -766,13 +1081,61 @@ function parseWorkItem(taskId: string, workItemId: string, raw: string): WorkIte
     typeof value.assignee !== "string" ||
     !isStringArray(value.topics) ||
     !["pending", "running", "completed", "failed", "cancelled", "superseded"].includes(String(value.status)) ||
+    (value.outcome !== undefined && typeof value.outcome !== "string") ||
     typeof value.createdAt !== "string" ||
-    typeof value.updatedAt !== "string"
+    typeof value.updatedAt !== "string" ||
+    (value.endedAt !== undefined && typeof value.endedAt !== "string")
   ) {
     throw dataError(`Invalid work item record: ${taskId}/${workItemId}`);
   }
 
   return value as WorkItem;
+}
+
+function parseAgentSession(taskId: string, roleName: string, raw: string): AgentSession {
+  const value = parseJson(raw, `Invalid agent session record: ${taskId}/${roleName}`);
+
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    value.taskId !== taskId ||
+    value.roleName !== roleName ||
+    typeof value.agent !== "string" ||
+    typeof value.nativeSessionId !== "string" ||
+    !["fixed", "leader-controlled"].includes(String(value.policy)) ||
+    !["unknown", "ready", "running", "stopped", "broken"].includes(String(value.status)) ||
+    !isStringArray(value.previousSessionIds) ||
+    (value.replacementReason !== undefined && typeof value.replacementReason !== "string") ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string"
+  ) {
+    throw dataError(`Invalid agent session record: ${taskId}/${roleName}`);
+  }
+
+  return value as AgentSession;
+}
+
+function parseAgentRun(taskId: string, runId: string, raw: string): AgentRun {
+  const value = parseJson(raw, `Invalid agent run record: ${taskId}/${runId}`);
+
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    value.id !== runId ||
+    value.taskId !== taskId ||
+    typeof value.roleName !== "string" ||
+    !["new", "resume"].includes(String(value.mode)) ||
+    typeof value.input !== "string" ||
+    !["active", "yielded", "failed", "expired"].includes(String(value.status)) ||
+    (value.summary !== undefined && typeof value.summary !== "string") ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string" ||
+    (value.endedAt !== undefined && typeof value.endedAt !== "string")
+  ) {
+    throw dataError(`Invalid agent run record: ${taskId}/${runId}`);
+  }
+
+  return value as AgentRun;
 }
 
 function parseComment(id: string, raw: string): TaskComment {

@@ -8,6 +8,8 @@ import {
   serveController
 } from "../controller/controller.js";
 import { runtimeError, usageError } from "../errors/cliError.js";
+import { scanTaskWakeups } from "../scheduler/inactivityScanner.js";
+import { FileTaskStore } from "../storage/taskStore.js";
 
 export async function runControllerCommand(
   args: string[],
@@ -38,7 +40,12 @@ export async function runControllerCommand(
     return stopController(rootDir);
   }
 
-  throw usageError("Controller usage: taskmux controller start|status [--json]|stop.");
+  if (command === "scan" && rest.length === 0) {
+    const queued = scanTaskWakeups(new FileTaskStore(rootDir), new Date());
+    return `Queued ${queued.length} task wakeup${queued.length === 1 ? "" : "s"}\n`;
+  }
+
+  throw usageError("Controller usage: taskmux controller start|status [--json]|stop|scan.");
 }
 
 async function startController(rootDir: string, env: NodeJS.ProcessEnv): Promise<string> {

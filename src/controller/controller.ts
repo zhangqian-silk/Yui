@@ -3,6 +3,12 @@ import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync }
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { dataError } from "../errors/cliError.js";
+import { scanTaskWakeups } from "../scheduler/inactivityScanner.js";
+import { processLeaderWakeups } from "../scheduler/leaderWakeupProcessor.js";
+import { mergePendingWakeup } from "../scheduler/pendingWakeup.js";
+import { FileTaskStore } from "../storage/taskStore.js";
+import { NodeCommandRunner } from "../tmux/commandRunner.js";
+import { TmuxManager } from "../tmux/tmuxManager.js";
 
 export const CONTROLLER_API_VERSION = 1;
 
@@ -32,8 +38,9 @@ export async function serveController(rootDir: string): Promise<void> {
 
   removeControllerDiscovery(rootDir);
   const token = randomBytes(32).toString("hex");
+  const store = new FileTaskStore(rootDir);
   const server = createServer((request, response) => {
-    void handleRequest(request, response, token);
+    void handleRequest(request, response, token, rootDir, store);
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -57,6 +64,20 @@ export async function serveController(rootDir: string): Promise<void> {
     startedAt: new Date().toISOString()
   });
 
+  const scanInterval = readScanInterval(process.env.TASKMUX_CONTROLLER_SCAN_INTERVAL_MS);
+  const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandRunner());
+  const scan = (): void => {
+    try {
+      scanTaskWakeups(store, new Date());
+      processLeaderWakeups(store, tmux, new Date());
+    } catch {
+      // A malformed user-edited file must not terminate the Controller.
+    }
+  };
+  scan();
+  const scanTimer = setInterval(scan, scanInterval);
+  scanTimer.unref();
+
   await new Promise<void>((resolve) => {
     let stopping = false;
     const stop = (): void => {
@@ -64,6 +85,7 @@ export async function serveController(rootDir: string): Promise<void> {
         return;
       }
       stopping = true;
+      clearInterval(scanTimer);
       server.close(() => {
         removeControllerDiscovery(rootDir);
         resolve();
@@ -73,6 +95,11 @@ export async function serveController(rootDir: string): Promise<void> {
     process.once("SIGTERM", stop);
     process.once("SIGINT", stop);
   });
+}
+
+function readScanInterval(value: string | undefined): number {
+  const parsed = Number(value ?? 30_000);
+  return Number.isFinite(parsed) && parsed >= 25 ? parsed : 30_000;
 }
 
 export function readControllerDiscovery(rootDir: string): ControllerDiscovery | null {
@@ -150,7 +177,9 @@ export async function callController(
 async function handleRequest(
   request: IncomingMessage,
   response: ServerResponse,
-  token: string
+  token: string,
+  rootDir: string,
+  store: FileTaskStore
 ): Promise<void> {
   if (request.method !== "POST" || request.url !== "/rpc") {
     sendJson(response, 404, { error: "Not found." });
@@ -171,6 +200,11 @@ async function handleRequest(
       return;
     }
 
+    if (!/^[A-Za-z0-9_-]+$/.test(rpc.requestId)) {
+      sendJson(response, 400, { error: "Invalid request id." });
+      return;
+    }
+
     if (rpc.method === "health") {
       sendJson(response, 200, {
         requestId: rpc.requestId,
@@ -179,10 +213,76 @@ async function handleRequest(
       return;
     }
 
+    const cached = readRpcResult(rootDir, rpc.requestId);
+    if (cached !== null) {
+      sendJson(response, 200, cached);
+      return;
+    }
+
+    if (rpc.method === "wakeup.merge") {
+      if (
+        typeof rpc.params !== "object" ||
+        rpc.params === null ||
+        !("taskId" in rpc.params) ||
+        typeof rpc.params.taskId !== "string" ||
+        !("reason" in rpc.params) ||
+        typeof rpc.params.reason !== "string"
+      ) {
+        sendJson(response, 400, { error: "wakeup.merge requires taskId and reason." });
+        return;
+      }
+
+      const task = store.getTask(rpc.params.taskId);
+      if (task === null) {
+        sendJson(response, 404, { error: `Task not found: ${rpc.params.taskId}` });
+        return;
+      }
+      if (task.archived) {
+        sendJson(response, 409, { error: `Cannot wake archived task: ${task.id}` });
+        return;
+      }
+
+      const wakeup = mergePendingWakeup(
+        task.id,
+        rpc.params.reason,
+        new Date(),
+        store.getPendingWakeup(task.id)
+      );
+      store.savePendingWakeup(wakeup);
+      const body = { requestId: rpc.requestId, result: { wakeup } };
+      writeRpcResult(rootDir, rpc.requestId, body);
+      sendJson(response, 200, body);
+      return;
+    }
+
     sendJson(response, 404, { requestId: rpc.requestId, error: `Unknown RPC method: ${rpc.method}` });
   } catch (error) {
     sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
   }
+}
+
+function readRpcResult(rootDir: string, requestId: string): unknown | null {
+  try {
+    return JSON.parse(readFileSync(rpcResultFile(rootDir, requestId), "utf8")) as unknown;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function writeRpcResult(rootDir: string, requestId: string, body: unknown): void {
+  const directory = join(rootDir, "runtime", "rpc-results");
+  const target = rpcResultFile(rootDir, requestId);
+  const temporary = `${target}.${process.pid}.tmp`;
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(temporary, `${JSON.stringify(body, null, 2)}\n`, { mode: 0o600 });
+  renameSync(temporary, target);
+}
+
+function rpcResultFile(rootDir: string, requestId: string): string {
+  return join(rootDir, "runtime", "rpc-results", `${requestId}.json`);
 }
 
 async function readRequestBody(request: IncomingMessage): Promise<string> {

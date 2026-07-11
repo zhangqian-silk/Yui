@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { GlobalRole } from "../role/role.js";
-import { SYSTEM_ASSISTANT_ROLE } from "../role/systemRoles.js";
+import { SYSTEM_ASSISTANT_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
 import type { RunnerEnvironment } from "../runner/runner.js";
 
 export type AssistantLaunch = {
@@ -13,7 +13,7 @@ export function prepareGlobalRoleLaunch(
   role: GlobalRole,
   options: { taskmuxHome?: string; baseEnv?: NodeJS.ProcessEnv } = {}
 ): AssistantLaunch {
-  if (role.name !== SYSTEM_ASSISTANT_ROLE || options.taskmuxHome === undefined) {
+  if (![SYSTEM_OPERATOR_ROLE, SYSTEM_ASSISTANT_ROLE].includes(role.name) || options.taskmuxHome === undefined) {
     return {
       args: role.args,
       env: mergeEnv(options.baseEnv, role.env)
@@ -25,6 +25,7 @@ export function prepareGlobalRoleLaunch(
     TASKMUX_HOME: options.taskmuxHome,
     TASKMUX_ROLE: role.name,
     TASKMUX_WORKSPACE: role.workspace,
+    TASKMUX_OPERATOR_CONTEXT: contextPath,
     TASKMUX_ASSISTANT_CONTEXT: contextPath
   };
 
@@ -35,8 +36,8 @@ export function prepareGlobalRoleLaunch(
 }
 
 function writeAssistantContext(taskmuxHome: string, workspace: string): string {
-  const assistantDir = join(taskmuxHome, "assistant");
-  const contextPath = join(assistantDir, "TASKMUX_ASSISTANT.md");
+  const assistantDir = join(taskmuxHome, "operator");
+  const contextPath = join(assistantDir, "TASKMUX_OPERATOR.md");
 
   mkdirSync(assistantDir, { recursive: true });
   writeFileSync(contextPath, `${renderAssistantContext(taskmuxHome, workspace)}\n`);
@@ -45,9 +46,9 @@ function writeAssistantContext(taskmuxHome: string, workspace: string): string {
 }
 
 function renderAssistantContext(taskmuxHome: string, workspace: string): string {
-  return `# TaskMux Assistant
+  return `# TaskMux Operator
 
-You are the TaskMux assistant. Help the user manage TaskMux by running the \`taskmux\` CLI.
+You are the TaskMux Operator. Act as the user's CLI proxy and manage TaskMux without performing Task work.
 
 Rules:
 
@@ -58,7 +59,9 @@ Rules:
 - When adding a reusable role preset, use \`taskmux role add <role> --agent <agent-id> --workspace <path>\`.
 - When adding a role to one task, use \`taskmux task assign <task-id> <role> --agent <agent-id> --workspace <path>\`.
 - When copying a global role preset into a task, use \`taskmux task bind <task-id> <role>\`.
-- Every task has a protected \`leader\` role. The global \`assistant\` and \`leader\` roles are system roles.
+- Every task has a protected \`leader\` role. The global \`operator\` and \`leader\` roles are system roles.
+- Use input draft and submit as separate steps unless user intent is already explicit.
+- Never act as a Task Leader or independent worker.
 
 Environment:
 
@@ -73,7 +76,7 @@ function withAssistantPrompt(role: GlobalRole, contextPath: string): string[] {
   }
 
   return [
-    `You are entering TaskMux assistant mode. Read and follow the instructions in ${contextPath}. Use taskmux CLI commands to manage tasks and roles. Do not edit TaskMux JSON storage directly.`
+    `You are entering TaskMux Operator mode. Read and follow the instructions in ${contextPath}. Use taskmux CLI commands to manage tasks and roles. Do not perform Task work or edit TaskMux JSON storage directly.`
   ];
 }
 

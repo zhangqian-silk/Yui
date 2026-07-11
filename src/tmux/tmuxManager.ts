@@ -1,5 +1,6 @@
 import type { Role } from "../role/role.js";
 import type { RoleStatus } from "../role/role.js";
+import type { AgentLaunchPlan } from "../executor/launchPlan.js";
 import type { CommandRunner } from "./commandRunner.js";
 
 export class TmuxManager {
@@ -25,6 +26,13 @@ export class TmuxManager {
       "-S",
       `-${lines}`
     ]);
+  }
+
+  dispatchRole(taskId: string, role: Role, launch: AgentLaunchPlan, input: string): void {
+    this.ensureSession(taskId);
+    this.ensureWindow(taskId, role, launch);
+    this.runner.run(this.tmuxBin, ["send-keys", "-l", "-t", this.target(taskId, role.name), input]);
+    this.runner.run(this.tmuxBin, ["send-keys", "-t", this.target(taskId, role.name), "Enter"]);
   }
 
   detachRole(taskId: string): void {
@@ -78,7 +86,7 @@ export class TmuxManager {
     }
   }
 
-  private ensureWindow(taskId: string, role: Role): void {
+  private ensureWindow(taskId: string, role: Role, launch?: AgentLaunchPlan): void {
     const windows = this.runner.run(this.tmuxBin, [
       "list-windows",
       "-t",
@@ -99,7 +107,7 @@ export class TmuxManager {
       role.name,
       "-c",
       role.workspace,
-      roleShellCommand(role)
+      roleShellCommand(launch ?? role)
     ]);
   }
 
@@ -112,9 +120,11 @@ export class TmuxManager {
   }
 }
 
-function roleShellCommand(role: Role): string {
-  const env = Object.entries(role.env).map(([key, value]) => `${key}=${value}`);
-  const parts = env.length > 0 ? ["env", ...env, role.command, ...role.args] : [role.command, ...role.args];
+function roleShellCommand(launch: Pick<Role, "command" | "args" | "env">): string {
+  const env = Object.entries(launch.env).map(([key, value]) => `${key}=${value}`);
+  const parts = env.length > 0
+    ? ["env", ...env, launch.command, ...launch.args]
+    : [launch.command, ...launch.args];
 
   return parts.map(shellQuote).join(" ");
 }

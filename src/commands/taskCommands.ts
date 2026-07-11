@@ -1,23 +1,35 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { createTaskComment } from "../comment/comment.js";
+import { createTaskBrief, renderTaskBrief } from "../brief/taskBrief.js";
 import { createCycle, type CycleCause } from "../cycle/cycle.js";
+import { compileDispatchInput } from "../context/dispatchContext.js";
 import { roleNotFound, runtimeError, taskNotFound, usageError } from "../errors/cliError.js";
 import { createTaskEvent } from "../event/taskEvent.js";
 import { createTaskInputDraft } from "../input/taskInput.js";
+import { createMilestone, renderMilestoneTimelineEntry } from "../milestone/milestone.js";
+import { recordAgentSession } from "../executor/agentExecutor.js";
+import { buildAgentLaunchPlan, type DispatchMode } from "../executor/launchPlan.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { copyGlobalRoleToTaskRole, createRole, updateRole, updateRoleStatus } from "../role/role.js";
+import { createChildRole } from "../role/childRole.js";
+import { createAgentRun, yieldAgentRun } from "../run/agentRun.js";
 import { SYSTEM_LEADER_ROLE } from "../role/systemRoles.js";
 import { resolveRunner, supportedRunnerIds } from "../runner/runnerRegistry.js";
 import { mergePendingWakeup } from "../scheduler/pendingWakeup.js";
-import { createTask, updateTaskArchived, updateTaskMetadata, updateTaskStatus } from "../task/task.js";
+import { createTaskSchedule } from "../scheduler/taskSchedule.js";
+import { createTask, updateTaskArchived, updateTaskMetadata } from "../task/task.js";
 import { BUILTIN_TOPICS, createCustomTopic, usesConventionalTopicId } from "../topic/topic.js";
-import { createWorkItem } from "../workItem/workItem.js";
+import { createWorkItem, updateWorkItemStatus, type WorkItemStatus } from "../workItem/workItem.js";
+import { createRoleWorktree } from "../worktree/worktree.js";
 import type { TaskComment } from "../comment/comment.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { Role } from "../role/role.js";
+import type { ChildRole } from "../role/childRole.js";
+import type { AgentRun } from "../run/agentRun.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import type { Task, TaskMetadata, TaskPriority, TaskStatus } from "../task/task.js";
+import type { Task, TaskMetadata, TaskPriority } from "../task/task.js";
 import type { TmuxManager } from "../tmux/tmuxManager.js";
 
 const BUILTIN_LEADER_ROLE = SYSTEM_LEADER_ROLE;
@@ -42,16 +54,10 @@ export function runTaskCommand(args: string[], store: TaskStore, tmux?: TmuxMana
       return cloneTaskCommand(rest, store);
     case "update":
       return updateTaskCommand(rest, store);
-    case "start":
-      return updateTaskStatusCommand(rest, store, "active", "Started");
-    case "done":
-      return updateTaskStatusCommand(rest, store, "done", "Completed");
     case "archive":
       return updateTaskArchivedCommand(rest, store, true);
     case "unarchive":
       return updateTaskArchivedCommand(rest, store, false);
-    case "reopen":
-      return updateTaskStatusCommand(rest, store, "open", "Reopened");
     case "open":
       return openTaskCommand(rest, store);
     case "context":
@@ -112,9 +118,297 @@ export function runTaskCommand(args: string[], store: TaskStore, tmux?: TmuxMana
       return taskWorkItemCommand(rest, store);
     case "wake":
       return wakeTaskCommand(rest, store);
+    case "session":
+      return taskSessionCommand(rest, store);
+    case "dispatch":
+      return dispatchTaskRoleCommand(rest, store, tmux);
+    case "yield":
+      return yieldTaskRoleCommand(rest, store);
+    case "schedule":
+      return taskScheduleCommand(rest, store);
+    case "brief":
+      return taskBriefCommand(rest, store);
+    case "milestone":
+      return taskMilestoneCommand(rest, store);
+    case "worktree":
+      return taskWorktreeCommand(rest, store);
     default:
-      return taskUsage();
+      if (command === undefined) {
+        return taskUsage();
+      }
+      throw usageError(taskUsage().trimEnd());
   }
+}
+
+function taskWorktreeCommand(args: string[], store: TaskStore): string {
+  const [command, taskId, roleName, ...rest] = args;
+  if (command !== "create" || taskId === undefined || roleName === undefined) {
+    throw usageError("Worktree usage: taskmux task worktree create <task-id> <role> --path <path> --branch <branch> [--base <ref>].");
+  }
+  if (store.getTask(taskId) === null) {
+    throw taskNotFound(taskId);
+  }
+  if (roleName === BUILTIN_LEADER_ROLE) {
+    throw usageError("The Leader owns the primary workspace and does not use a TaskMux worktree.");
+  }
+
+  const role = store.getRole(taskId, roleName);
+  if (role === null) {
+    throw roleNotFound(roleName);
+  }
+  const path = readOption(rest, "--path").trim();
+  const branch = readOption(rest, "--branch").trim();
+  const base = readOptionalOption(rest, "--base")?.trim();
+  const gitArgs = ["-C", role.workspace, "worktree", "add", "-b", branch, path];
+  if (base !== undefined) {
+    gitArgs.push(base);
+  }
+  execFileSync("git", gitArgs, { stdio: "pipe" });
+
+  const worktree = createRoleWorktree(
+    taskId,
+    roleName,
+    role.workspace,
+    path,
+    branch,
+    base,
+    new Date()
+  );
+  store.saveRoleWorktree(taskId, worktree);
+  store.saveRole(taskId, updateRole(role, { workspace: path }, new Date()));
+  recordTaskEvent(store, taskId, "role.worktree_created", { role: roleName, branch });
+  return `Created worktree for ${taskId}/${roleName}: ${path}\n`;
+}
+
+function taskBriefCommand(args: string[], store: TaskStore): string {
+  const [command, taskId, ...rest] = args;
+  if (command !== "update" || taskId === undefined) {
+    throw usageError("Brief usage: taskmux task brief update <task-id> --objective <body> [--boundary <body> ...] --focus <body> --leader-summary <body>.");
+  }
+  if (store.getTask(taskId) === null) {
+    throw taskNotFound(taskId);
+  }
+
+  const brief = createTaskBrief({
+    objective: readOption(rest, "--objective"),
+    boundaries: readRepeatedOption(rest, "--boundary"),
+    currentFocus: readOption(rest, "--focus"),
+    leaderSummary: readOption(rest, "--leader-summary")
+  }, new Date());
+  store.saveTaskBrief(taskId, renderTaskBrief(brief));
+  recordTaskEvent(store, taskId, "task.brief_updated", {});
+  return `Updated brief for task ${taskId}\n`;
+}
+
+function taskMilestoneCommand(args: string[], store: TaskStore): string {
+  const [command, taskId, ...rest] = args;
+  if (command !== "add" || taskId === undefined) {
+    throw usageError("Milestone usage: taskmux task milestone add <task-id> --title <title> --summary <body> [--topic <topic> ...].");
+  }
+  if (store.getTask(taskId) === null) {
+    throw taskNotFound(taskId);
+  }
+
+  const topics = readRepeatedOption(rest, "--topic").map((topic) => topic.trim());
+  const knownTopics = new Set([
+    ...BUILTIN_TOPICS.map(({ id }) => id),
+    ...store.getTaskTopics(taskId).customTopics.map(({ id }) => id)
+  ]);
+  const unknownTopic = topics.find((topic) => !knownTopics.has(topic));
+  if (unknownTopic !== undefined) {
+    throw usageError(`Topic not found: ${unknownTopic}.`);
+  }
+
+  const milestone = createMilestone(
+    store.nextMilestoneId(taskId),
+    taskId,
+    readOption(rest, "--title"),
+    readOption(rest, "--summary"),
+    topics,
+    new Date()
+  );
+  store.saveMilestone(taskId, milestone);
+  store.appendTaskTimeline(taskId, renderMilestoneTimelineEntry(milestone));
+  recordTaskEvent(store, taskId, "milestone.added", { milestone: milestone.id });
+  return `Added milestone ${milestone.id} to task ${taskId}\n`;
+}
+
+function taskScheduleCommand(args: string[], store: TaskStore): string {
+  const [command, taskId, ...rest] = args;
+
+  if (command !== "set" || taskId === undefined) {
+    throw usageError("Schedule usage: taskmux task schedule set <task-id> --inactivity-minutes <minutes> --cooldown-minutes <minutes> [--review-at <iso>].");
+  }
+
+  if (store.getTask(taskId) === null) {
+    throw taskNotFound(taskId);
+  }
+
+  const inactivityMinutes = Number(readOption(rest, "--inactivity-minutes"));
+  const cooldownMinutes = Number(readOption(rest, "--cooldown-minutes"));
+  const reviewAt = readOptionalOption(rest, "--review-at")?.trim();
+  const everyMinutesValue = readOptionalOption(rest, "--every-minutes")?.trim();
+  const nextAt = readOptionalOption(rest, "--next-at")?.trim();
+  if ((everyMinutesValue === undefined) !== (nextAt === undefined)) {
+    throw usageError("--every-minutes and --next-at must be provided together.");
+  }
+  const recurring = everyMinutesValue === undefined || nextAt === undefined
+    ? undefined
+    : { everyMinutes: Number(everyMinutesValue), nextAt };
+  const schedule = createTaskSchedule(
+    inactivityMinutes,
+    cooldownMinutes,
+    reviewAt,
+    recurring,
+    new Date()
+  );
+  store.saveTaskSchedule(taskId, schedule);
+  recordTaskEvent(store, taskId, "task.schedule_updated", {});
+  return `Updated schedule for task ${taskId}\n`;
+}
+
+function yieldTaskRoleCommand(args: string[], store: TaskStore): string {
+  const [taskId, roleName, ...rest] = args;
+
+  if (taskId === undefined || roleName === undefined) {
+    throw usageError("Yield usage: taskmux task yield <task-id> <role> --summary <summary>.");
+  }
+
+  if (store.getTask(taskId) === null) {
+    throw taskNotFound(taskId);
+  }
+
+  if (store.getRole(taskId, roleName) === null) {
+    throw roleNotFound(roleName);
+  }
+
+  const activeRun = store.getActiveAgentRun(taskId, roleName);
+  if (activeRun === null) {
+    throw usageError(`No active agent run exists for ${taskId}/${roleName}.`);
+  }
+
+  const run = yieldAgentRun(activeRun, readOption(rest, "--summary"), new Date());
+  store.saveAgentRun(run);
+  store.clearActiveAgentRun(taskId, roleName);
+  recordTaskEvent(store, taskId, "agent-run.yielded", { run: run.id, role: roleName });
+  if (roleName !== BUILTIN_LEADER_ROLE) {
+    queueLeaderWakeup(store, taskId, "role-result");
+  }
+
+  return `Yielded ${run.id} from ${taskId}/${roleName}\n`;
+}
+
+function dispatchTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
+  const [taskId, roleName, ...rest] = args;
+
+  if (taskId === undefined || roleName === undefined) {
+    throw usageError("Dispatch usage: taskmux task dispatch <task-id> <role> --mode new|resume --input <input>.");
+  }
+
+  if (store.getTask(taskId) === null) {
+    throw taskNotFound(taskId);
+  }
+
+  const role = store.getRole(taskId, roleName);
+  if (role === null) {
+    throw roleNotFound(roleName);
+  }
+
+  if (tmux === undefined) {
+    throw runtimeError("Tmux manager is not configured.");
+  }
+
+  const mode = readOption(rest, "--mode");
+  if (mode !== "new" && mode !== "resume") {
+    throw usageError("--mode must be new or resume.");
+  }
+
+  const input = readOption(rest, "--input").trim();
+  if (input.length === 0) {
+    throw usageError("Dispatch input is required.");
+  }
+
+  const session = store.getAgentSession(taskId, roleName);
+  if (roleName === BUILTIN_LEADER_ROLE && session !== null && mode === "new") {
+    throw usageError("The Leader must resume its fixed session; replace it explicitly if irrecoverable.");
+  }
+
+  const launch = buildAgentLaunchPlan(role, mode as DispatchMode, session);
+  const compiledInput = compileDispatchInput(store, taskId, role, input);
+  tmux.dispatchRole(taskId, role, launch, compiledInput);
+  store.saveRole(taskId, updateRoleStatus(role, "running", new Date()));
+  if (session !== null) {
+    store.saveAgentSession({ ...session, status: "running", updatedAt: new Date().toISOString() });
+  }
+  const run = createAgentRun(
+    store.nextAgentRunId(taskId),
+    taskId,
+    roleName,
+    mode as DispatchMode,
+    compiledInput,
+    new Date()
+  );
+  store.saveAgentRun(run);
+  store.saveActiveAgentRun(run);
+  recordTaskEvent(store, taskId, "role.dispatch_accepted", { role: roleName, mode });
+
+  return `Dispatch accepted for ${taskId}/${roleName} (${mode})\n`;
+}
+
+function taskSessionCommand(args: string[], store: TaskStore): string {
+  const [command, taskId, roleName, ...rest] = args;
+
+  if (taskId === undefined || roleName === undefined) {
+    throw usageError("Session usage: taskmux task session record|replace <task-id> <role> --native-id <id> [--reason <reason>].");
+  }
+
+  if (store.getTask(taskId) === null) {
+    throw taskNotFound(taskId);
+  }
+
+  const role = store.getRole(taskId, roleName);
+  if (role === null) {
+    throw roleNotFound(roleName);
+  }
+
+  const nativeSessionId = readOption(rest, "--native-id").trim();
+  const existing = store.getAgentSession(taskId, roleName);
+
+  if (command === "record") {
+    if (
+      roleName === BUILTIN_LEADER_ROLE &&
+      existing !== null &&
+      existing.nativeSessionId !== nativeSessionId
+    ) {
+      throw usageError("Leader session replacement must be explicit.");
+    }
+
+    const session = recordAgentSession(taskId, roleName, role.agent, nativeSessionId, new Date(), existing);
+    store.saveAgentSession(session);
+    return `Recorded native session for ${taskId}/${roleName}\n`;
+  }
+
+  if (command === "replace") {
+    const reason = readOption(rest, "--reason").trim();
+    if (reason.length === 0) {
+      throw usageError("Session replacement reason is required.");
+    }
+
+    const session = recordAgentSession(
+      taskId,
+      roleName,
+      role.agent,
+      nativeSessionId,
+      new Date(),
+      existing,
+      reason
+    );
+    store.saveAgentSession(session);
+    recordTaskEvent(store, taskId, "role.session_replaced", { role: roleName, reason });
+    return `Replaced native session for ${taskId}/${roleName}\n`;
+  }
+
+  throw usageError("Session usage: taskmux task session record|replace <task-id> <role> --native-id <id> [--reason <reason>].");
 }
 
 function wakeTaskCommand(args: string[], store: TaskStore): string {
@@ -170,14 +464,42 @@ function taskCycleCommand(args: string[], store: TaskStore): string {
 }
 
 function taskWorkItemCommand(args: string[], store: TaskStore): string {
-  const [command, taskId, ...rest] = args;
+  const [command, taskId, ...commandArgs] = args;
 
-  if (command !== "create" || taskId === undefined || store.getTask(taskId) === null) {
-    if (taskId !== undefined && store.getTask(taskId) === null) {
-      throw taskNotFound(taskId);
+  if (taskId !== undefined && store.getTask(taskId) === null) {
+    throw taskNotFound(taskId);
+  }
+
+  if (command === "update" && taskId !== undefined) {
+    const [workItemId, ...rest] = commandArgs;
+    if (workItemId === undefined) {
+      throw usageError("Work item id is required.");
     }
+    const workItem = store.getWorkItem(taskId, workItemId);
+    if (workItem === null) {
+      throw usageError(`Work item not found: ${workItemId}.`);
+    }
+    const status = readOption(rest, "--status");
+    const allowed = ["pending", "running", "completed", "failed", "cancelled", "superseded"];
+    if (!allowed.includes(status)) {
+      throw usageError(`Invalid work item status: ${status}.`);
+    }
+    const updated = updateWorkItemStatus(
+      workItem,
+      status as WorkItemStatus,
+      readOptionalOption(rest, "--outcome"),
+      new Date()
+    );
+    store.saveWorkItem(taskId, updated);
+    recordTaskEvent(store, taskId, "work-item.updated", { workItem: updated.id, status });
+    return `Updated work item ${updated.id} for task ${taskId}\n`;
+  }
+
+  if (command !== "create" || taskId === undefined) {
     throw usageError("Work item usage: taskmux task work-item create <task-id> --title <title> [--cycle <cycle>] [--assignee <role>] [--topic <topic> ...].");
   }
+
+  const rest = commandArgs;
 
   const cycleId = readOptionalOption(rest, "--cycle")?.trim();
   const assignee = readOptionalOption(rest, "--assignee")?.trim() ?? BUILTIN_LEADER_ROLE;
@@ -413,7 +735,7 @@ function showTaskCommand(args: string[], store: TaskStore): string {
   return [
     `Task: ${task.id}`,
     `Title: ${task.title}`,
-    `Status: ${task.status}`,
+    `Archived: ${task.archived ? "yes" : "no"}`,
     ...renderTaskMetadataLines(task),
     `Created: ${task.createdAt}`,
     `Updated: ${task.updatedAt}`
@@ -485,7 +807,15 @@ function cloneTaskCommand(args: string[], store: TaskStore): string {
         source: "custom"
       },
       role.workspace,
-      new Date()
+      new Date(),
+      {
+        description: role.description,
+        responsibilities: role.responsibilities,
+        constraints: role.constraints,
+        expectedOutput: role.expectedOutput,
+        systemPrompt: role.systemPrompt,
+        skills: role.skills
+      }
     );
 
     store.saveRole(clonedTask.id, clonedRole);
@@ -527,34 +857,6 @@ function updateTaskCommand(args: string[], store: TaskStore): string {
   return `Updated task ${updatedTask.id}\n`;
 }
 
-function updateTaskStatusCommand(
-  args: string[],
-  store: TaskStore,
-  status: TaskStatus,
-  action: string
-): string {
-  const [id] = args;
-
-  if (id === undefined || id.trim().length === 0) {
-    throw usageError("Task id is required.");
-  }
-
-  const task = store.getTask(id);
-
-  if (task === null) {
-    throw taskNotFound(id);
-  }
-
-  const updatedTask = updateTaskStatus(task, status, new Date());
-  store.saveTask(updatedTask);
-  recordTaskEvent(store, updatedTask.id, "task.status_changed", {
-    from: task.status,
-    to: updatedTask.status
-  });
-
-  return `${action} task ${updatedTask.id}\n`;
-}
-
 function openTaskCommand(args: string[], store: TaskStore): string {
   const [id] = args;
 
@@ -573,7 +875,7 @@ function openTaskCommand(args: string[], store: TaskStore): string {
   return [
     `Task: ${task.id}`,
     `Title: ${task.title}`,
-    `Status: ${task.status}`,
+    `Archived: ${task.archived ? "yes" : "no"}`,
     ...renderTaskMetadataLines(task),
     `Roles: ${store.listRoles(task.id).length}`,
     `Comments: ${store.listComments(task.id).length}`,
@@ -643,13 +945,97 @@ function taskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): 
   const [command, ...rest] = args;
 
   switch (command) {
+    case "child":
+      return createTaskChildRoleCommand(rest, store);
     case "update":
       return updateTaskRoleCommand(rest, store);
     case "rename":
       return renameTaskRoleCommand(rest, store, tmux);
+    case "remove":
+      return removeTaskRoleCommand(rest, store);
     default:
       return taskUsage();
   }
+}
+
+function removeTaskRoleCommand(args: string[], store: TaskStore): string {
+  const [taskId, roleName, ...rest] = args;
+
+  if (taskId === undefined || roleName === undefined || rest.length > 0) {
+    throw usageError("Role remove usage: taskmux task role remove <task-id> <role>.");
+  }
+
+  if (store.getTask(taskId) === null) {
+    throw taskNotFound(taskId);
+  }
+
+  if (roleName === BUILTIN_LEADER_ROLE) {
+    throw usageError("The task leader role cannot be removed.");
+  }
+
+  const result = store.removeTaskRole(taskId, roleName);
+  if (!result.removed) {
+    throw roleNotFound(roleName);
+  }
+
+  recordTaskEvent(store, taskId, "role.removed", {
+    role: roleName,
+    childCount: String(result.childCount)
+  });
+  return `Removed role ${roleName} and ${result.childCount} child role${result.childCount === 1 ? "" : "s"}\n`;
+}
+
+function createTaskChildRoleCommand(args: string[], store: TaskStore): string {
+  const [taskId, roleName, ...rest] = args;
+
+  if (taskId === undefined || taskId.trim().length === 0) {
+    throw usageError("Task id is required.");
+  }
+
+  if (roleName === undefined || roleName.trim().length === 0) {
+    throw usageError("Child role name is required.");
+  }
+
+  if (store.getTask(taskId) === null) {
+    throw taskNotFound(taskId);
+  }
+
+  assertKnownOptions(rest, new Set([
+    "--parent",
+    "--description",
+    "--responsibility",
+    "--constraint",
+    "--expected-output"
+  ]));
+
+  const parentRole = readOptionalOption(rest, "--parent")?.trim() ?? BUILTIN_LEADER_ROLE;
+
+  if (store.getRole(taskId, parentRole) === null) {
+    throw roleNotFound(parentRole);
+  }
+
+  if (store.getRole(taskId, roleName) !== null || store.getChildRole(taskId, roleName) !== null) {
+    throw usageError(`Role already exists: ${roleName}.`);
+  }
+
+  const childRole = createChildRole(
+    roleName,
+    parentRole,
+    {
+      description: readOption(rest, "--description"),
+      responsibilities: readRepeatedOption(rest, "--responsibility"),
+      constraints: readRepeatedOption(rest, "--constraint"),
+      expectedOutput: readOption(rest, "--expected-output")
+    },
+    new Date()
+  );
+  store.saveChildRole(taskId, childRole);
+  recordTaskEvent(store, taskId, "child-role.created", {
+    role: childRole.name,
+    parent: childRole.parentRole
+  });
+
+  return `Created child role ${childRole.name} for parent ${childRole.parentRole}\n`;
 }
 
 function assignTaskRoleCommand(args: string[], store: TaskStore): string {
@@ -1278,7 +1664,15 @@ type TaskContextRole = Role & {
 
 type TaskContext = {
   task: Task;
+  brief: string | null;
   roles: TaskContextRole[];
+  childRoles: ChildRole[];
+  topics: {
+    builtIn: typeof BUILTIN_TOPICS;
+    custom: ReturnType<TaskStore["getTaskTopics"]>["customTopics"];
+  };
+  activeRuns: AgentRun[];
+  pendingWakeup: ReturnType<TaskStore["getPendingWakeup"]>;
   comments: TaskComment[];
   events: TaskEvent[];
 };
@@ -1309,9 +1703,19 @@ function parseTaskContextFormat(value: string | undefined): TaskContextFormat {
 function buildTaskContext(task: Task, store: TaskStore, includeTranscripts: boolean): TaskContext {
   return {
     task,
+    brief: store.readTaskBrief(task.id),
     roles: store.listRoles(task.id).map((role) => includeTranscripts
       ? { ...role, transcript: store.readTranscript(task.id, role.name) }
       : role),
+    childRoles: store.listChildRoles(task.id),
+    topics: {
+      builtIn: BUILTIN_TOPICS,
+      custom: store.getTaskTopics(task.id).customTopics
+    },
+    activeRuns: store.listRoles(task.id)
+      .map((role) => store.getActiveAgentRun(task.id, role.name))
+      .filter((run): run is AgentRun => run !== null),
+    pendingWakeup: store.getPendingWakeup(task.id),
     comments: store.listComments(task.id),
     events: store.listEvents(task.id)
   };
@@ -1321,8 +1725,14 @@ function renderTaskContextText(context: TaskContext, includeTranscripts: boolean
   return [
     "Task Context",
     ...renderTaskContextTaskLines(context.task),
+    ...(context.brief === null ? [] : ["", context.brief.trimEnd()]),
     "",
     renderTaskContextRoles(context.roles, includeTranscripts),
+    ...(context.childRoles.length === 0
+      ? []
+      : ["", "Child role constraints", ...context.childRoles.map((role) =>
+        `${role.name} -> ${role.parentRole}: ${role.description}; expected: ${role.expectedOutput}`
+      )]),
     "",
     renderTaskContextComments(context.comments),
     "",
@@ -1334,7 +1744,7 @@ function renderTaskContextTaskLines(task: Task): string[] {
   return [
     `Task: ${task.id}`,
     `Title: ${task.title}`,
-    `Status: ${task.status}`,
+    `Archived: ${task.archived ? "yes" : "no"}`,
     ...renderTaskMetadataLines(task),
     `Created: ${task.createdAt}`,
     `Updated: ${task.updatedAt}`
@@ -1592,7 +2002,7 @@ type TaskTemplate = {
 type TranscriptExportFormat = "text" | "json" | "markdown";
 
 type TaskListFilters = {
-  status?: TaskStatus;
+  archived?: boolean;
   tag?: string;
   priority?: TaskPriority;
   search?: string;
@@ -1760,12 +2170,10 @@ function countTranscriptLines(transcript: string | null): number {
 }
 
 function parseTaskListFilters(args: string[]): TaskListFilters {
-  assertKnownOptions(args, new Set(["--status", "--tag", "--priority", "--search"]));
-
-  const status = parseTaskStatus(readOptionalOption(args, "--status"));
+  assertKnownOptions(args, new Set(["--archived", "--tag", "--priority", "--search"]));
 
   return {
-    status,
+    archived: parseBooleanOption(readOptionalOption(args, "--archived"), "--archived"),
     tag: readOptionalOption(args, "--tag")?.trim(),
     priority: parseTaskPriority(readOptionalOption(args, "--priority")),
     search: readOptionalOption(args, "--search")?.trim().toLowerCase()
@@ -1773,11 +2181,11 @@ function parseTaskListFilters(args: string[]): TaskListFilters {
 }
 
 function parseTaskBoardViewOptions(args: string[]): TaskBoardViewOptions {
-  assertKnownOptions(args, new Set(["--status", "--tag", "--priority", "--search", "--with-roles"]));
+  assertKnownOptions(args, new Set(["--archived", "--tag", "--priority", "--search", "--with-roles"]));
 
   return {
     filters: {
-      status: parseTaskStatus(readOptionalOption(args, "--status")),
+      archived: parseBooleanOption(readOptionalOption(args, "--archived"), "--archived"),
       tag: readOptionalOption(args, "--tag")?.trim(),
       priority: parseTaskPriority(readOptionalOption(args, "--priority")),
       search: readOptionalOption(args, "--search")?.trim().toLowerCase()
@@ -1787,7 +2195,7 @@ function parseTaskBoardViewOptions(args: string[]): TaskBoardViewOptions {
 }
 
 function taskMatchesFilters(task: Task, filters: TaskListFilters): boolean {
-  if (filters.status !== undefined && task.status !== filters.status) {
+  if (filters.archived !== undefined && task.archived !== filters.archived) {
     return false;
   }
 
@@ -1811,24 +2219,22 @@ function renderTaskListTable(tasks: Task[]): string {
     "Tasks",
     [
       { header: "Task", minWidth: 6, maxWidth: 14 },
-      { header: "Status", minWidth: 6, maxWidth: 10 },
+      { header: "State", minWidth: 7, maxWidth: 10 },
       { header: "Title", minWidth: 10, maxWidth: 48 },
       { header: "Metadata", minWidth: 8, maxWidth: 58 }
     ],
-    tasks.map((task) => [task.id, task.status, task.title, renderTaskMetadataSummary(task)]),
+    tasks.map((task) => [task.id, task.archived ? "archived" : "ongoing", task.title, renderTaskMetadataSummary(task)]),
     defaultTableWidth()
   );
 }
 
 function renderTaskBoard(tasks: Task[], store: TaskStore, withRoles: boolean): string {
-  const groups: Array<{ status: TaskStatus; title: string }> = [
-    { status: "open", title: "Open" },
-    { status: "active", title: "Active" },
-    { status: "done", title: "Done" },
-    { status: "archived", title: "Archived" }
+  const groups = [
+    { archived: false, title: "Ongoing" },
+    { archived: true, title: "Archived" }
   ];
   const rows = groups.flatMap((group) => {
-    const groupTasks = tasks.filter((task) => task.status === group.status);
+    const groupTasks = tasks.filter((task) => task.archived === group.archived);
 
     if (groupTasks.length === 0) {
       return [[group.title, "", "(none)", "", ""]];
@@ -1975,16 +2381,16 @@ function parseTaskPriority(value: string | undefined): TaskPriority | undefined 
   return value as TaskPriority;
 }
 
-function parseTaskStatus(value: string | undefined): TaskStatus | undefined {
+function parseBooleanOption(value: string | undefined, name: string): boolean | undefined {
   if (value === undefined) {
     return undefined;
   }
 
-  if (!["open", "active", "done", "archived"].includes(value)) {
-    throw usageError("--status must be one of open, active, done, archived.");
+  if (value !== "true" && value !== "false") {
+    throw usageError(`${name} must be true or false.`);
   }
 
-  return value as TaskStatus;
+  return value === "true";
 }
 
 function assertDueAt(value: string): void {
@@ -1997,17 +2403,14 @@ export function taskUsage(): string {
   return `Task commands:
   taskmux task create <title> [--template feature|bug|review] [--agent <agent>] [--workspace <path>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD]
   taskmux task update <task-id> [--title <title>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD] [--clear-description] [--clear-priority] [--clear-tags] [--clear-due]
-  taskmux task list [--status <status>] [--tag <tag>] [--priority <priority>] [--search <text>]
-  taskmux task board [--status <status>] [--tag <tag>] [--priority <priority>] [--search <text>] [--with-roles]
+  taskmux task list [--archived true|false] [--tag <tag>] [--priority <priority>] [--search <text>]
+  taskmux task board [--archived true|false] [--tag <tag>] [--priority <priority>] [--search <text>] [--with-roles]
   taskmux task show <task-id>
   taskmux task current [<task-id>]
   taskmux task last
   taskmux task clone <task-id> [--title <title>]
-  taskmux task start <task-id>
-  taskmux task done <task-id>
   taskmux task archive <task-id>
   taskmux task unarchive <task-id>
-  taskmux task reopen <task-id>
   taskmux task delete <task-id>
   taskmux task restore <task-id>
   taskmux task open <task-id>
@@ -2017,6 +2420,8 @@ export function taskUsage(): string {
   taskmux task assign-many <task-id> --role <role> ... [--agent <agent>] [--workspace <path>]
   taskmux task role update <task-id> <role> [--agent <agent>] [--workspace <path>]
   taskmux task role rename <task-id> <role> <new-role>
+  taskmux task role child <task-id> <role> [--parent <role>] --description <body> [--responsibility <body> ...] [--constraint <body> ...] --expected-output <body>
+  taskmux task role remove <task-id> <role>
   taskmux task roles <task-id>
   taskmux task enter <task-id> <role>
   taskmux task tail <task-id> <role>
@@ -2041,6 +2446,15 @@ export function taskUsage(): string {
   taskmux task input submit <task-id>
   taskmux task cycle create <task-id> --cause <cause> --summary <summary>
   taskmux task work-item create <task-id> --title <title> [--cycle <cycle>] [--assignee <role>] [--topic <topic> ...]
+  taskmux task work-item update <task-id> <work-item> --status <status> [--outcome <body>]
   taskmux task wake <task-id> --reason <reason>
+  taskmux task session record <task-id> <role> --native-id <id>
+  taskmux task session replace <task-id> <role> --native-id <id> --reason <reason>
+  taskmux task dispatch <task-id> <role> --mode new|resume --input <input>
+  taskmux task yield <task-id> <role> --summary <summary>
+  taskmux task schedule set <task-id> --inactivity-minutes <minutes> --cooldown-minutes <minutes> [--review-at <iso>] [--every-minutes <minutes> --next-at <iso>]
+  taskmux task brief update <task-id> --objective <body> [--boundary <body> ...] --focus <body> --leader-summary <body>
+  taskmux task milestone add <task-id> --title <title> --summary <body> [--topic <topic> ...]
+  taskmux task worktree create <task-id> <role> --path <path> --branch <branch> [--base <ref>]
 `;
 }

@@ -23,6 +23,7 @@ import {
 } from "./storage/storageSchema.js";
 import { NodeCommandRunner } from "./tmux/commandRunner.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
+import { SYSTEM_ASSISTANT_ROLE, SYSTEM_OPERATOR_ROLE } from "./role/systemRoles.js";
 
 const VERSION = readPackageVersion();
 
@@ -36,14 +37,15 @@ Usage:
   taskmux --version
   taskmux completion bash|zsh|fish
   taskmux doctor
-  taskmux controller start|status [--json]|stop
+  taskmux controller start|status [--json]|stop|scan
   taskmux setup [tmux]
   taskmux backup
   taskmux migrate [--dry-run]
   taskmux export --output <file>
   taskmux import <file>
   taskmux prune [--trash] [--backups] [--keep-backups <count>]
-  taskmux assistant
+  taskmux operator
+  taskmux assistant                 # legacy alias
   taskmux board
   taskmux config show
   taskmux config set default-agent <agent-id>
@@ -52,7 +54,7 @@ Usage:
   taskmux agent list
   taskmux agent show <agent-id>
   taskmux agent remove <agent-id>
-  taskmux role add <role> --agent <agent-id> [--workspace <path>]
+  taskmux role add <role> --agent <agent-id> [--workspace <path>] [--description <body>] [--responsibility <body> ...] [--constraint <body> ...] [--expected-output <body>] [--system-prompt <body>] [--skill <skill> ...]
   taskmux role list
   taskmux role show <role>
   taskmux role update <role> [--agent <agent-id>] [--workspace <path>]
@@ -60,17 +62,14 @@ Usage:
   taskmux role enter <role>
   taskmux task create <title> [--template feature|bug|review] [--agent <agent>] [--workspace <path>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD]
   taskmux task update <task-id> [--title <title>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD] [--clear-description] [--clear-priority] [--clear-tags] [--clear-due]
-  taskmux task list [--status <status>] [--tag <tag>] [--priority <priority>] [--search <text>]
-  taskmux task board [--status <status>] [--tag <tag>] [--priority <priority>] [--search <text>] [--with-roles]
+  taskmux task list [--archived true|false] [--tag <tag>] [--priority <priority>] [--search <text>]
+  taskmux task board [--archived true|false] [--tag <tag>] [--priority <priority>] [--search <text>] [--with-roles]
   taskmux task show <task-id>
   taskmux task current [<task-id>]
   taskmux task last
   taskmux task clone <task-id> [--title <title>]
-  taskmux task start <task-id>
-  taskmux task done <task-id>
   taskmux task archive <task-id>
   taskmux task unarchive <task-id>
-  taskmux task reopen <task-id>
   taskmux task delete <task-id>
   taskmux task restore <task-id>
   taskmux task shell <task-id>
@@ -97,6 +96,15 @@ Usage:
   taskmux task comment <task-id> <body>
   taskmux task comments <task-id>
   taskmux task events <task-id>
+  taskmux task topic create <task-id> --id <id> --name <name> --description <body>
+  taskmux task input draft|submit <task-id> [body]
+  taskmux task cycle create <task-id> --cause <cause> --summary <body>
+  taskmux task work-item create|update <task-id> ...
+  taskmux task role child <task-id> <role> [--parent <role>] ...
+  taskmux task dispatch <task-id> <role> --mode new|resume --input <body>
+  taskmux task yield <task-id> <role> --summary <body>
+  taskmux task schedule set <task-id> ...
+  taskmux task worktree create <task-id> <role> --path <path> --branch <branch>
 
 Role, tmux, and agent commands are defined in docs/requirements.md.
 `;
@@ -206,14 +214,17 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (args[0] === "assistant") {
+  if (args[0] === "operator" || args[0] === "assistant") {
     if (args.length > 1) {
-      throw usageError("Assistant usage: taskmux assistant");
+      throw usageError("Operator usage: taskmux operator");
     }
 
     requireStorageSchema(rootDir);
     const store = new FileTaskStore(rootDir);
-    console.log(runGlobalRoleCommand(["enter", "assistant"], store, { taskmuxHome: rootDir }).trimEnd());
+    const roleName = store.getGlobalRole(SYSTEM_OPERATOR_ROLE) !== null
+      ? SYSTEM_OPERATOR_ROLE
+      : SYSTEM_ASSISTANT_ROLE;
+    console.log(runGlobalRoleCommand(["enter", roleName], store, { taskmuxHome: rootDir }).trimEnd());
     return;
   }
 
@@ -319,11 +330,11 @@ function listCustomRunnersForDoctor(store: FileTaskStore) {
 
 function renderCompletion(shell: string | undefined): string {
   const commands = [
-    "doctor", "setup", "backup", "migrate", "export", "import", "prune", "assistant", "board", "config", "agent", "role", "task", "completion",
-    "create", "update", "list", "board", "show", "start", "done", "archive", "unarchive", "reopen", "delete", "restore",
+    "doctor", "setup", "backup", "migrate", "export", "import", "prune", "operator", "assistant", "board", "config", "agent", "role", "task", "completion",
+    "create", "update", "list", "board", "show", "archive", "unarchive", "delete", "restore",
     "shell", "context", "assign", "assign-many", "role", "roles", "enter", "tail", "detail", "status",
     "refresh", "transcript", "activity", "timeline", "detach", "stop", "kill", "restart", "cleanup",
-    "comment", "comments", "events", "current", "last", "clone", "topic", "input", "draft", "submit", "cycle", "work-item", "wake"
+    "comment", "comments", "events", "current", "last", "clone", "topic", "input", "draft", "submit", "cycle", "work-item", "wake", "session", "dispatch", "yield", "schedule", "brief", "milestone", "worktree"
   ].join(" ");
 
   if (shell === "bash") {

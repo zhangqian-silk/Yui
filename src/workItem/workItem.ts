@@ -9,8 +9,10 @@ export type WorkItem = {
   assignee: string;
   topics: string[];
   status: WorkItemStatus;
+  outcome?: string;
   createdAt: string;
   updatedAt: string;
+  endedAt?: string;
 };
 
 export function createWorkItem(
@@ -43,5 +45,27 @@ export function createWorkItem(
     status: "pending",
     createdAt: timestamp,
     updatedAt: timestamp
+  };
+}
+
+export function updateWorkItemStatus(
+  workItem: WorkItem,
+  status: WorkItemStatus,
+  outcome: string | undefined,
+  now: Date
+): WorkItem {
+  const terminal = ["completed", "failed", "cancelled", "superseded"].includes(status);
+  const trimmedOutcome = outcome?.trim();
+  if (terminal && (trimmedOutcome === undefined || trimmedOutcome.length === 0)) {
+    throw new Error(`Work item outcome is required for ${status}.`);
+  }
+
+  const timestamp = now.toISOString();
+  return {
+    ...workItem,
+    status,
+    ...(trimmedOutcome === undefined ? {} : { outcome: trimmedOutcome }),
+    updatedAt: timestamp,
+    ...(terminal ? { endedAt: timestamp } : {})
   };
 }

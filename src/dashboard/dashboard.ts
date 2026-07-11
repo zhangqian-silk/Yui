@@ -111,10 +111,8 @@ function toTaskCommand(name: string, args: string[], store: TaskStore): string[]
     case "events":
     case "activity":
     case "timeline":
-    case "start":
-    case "done":
     case "archive":
-    case "reopen":
+    case "unarchive":
     case "cleanup":
     case "delete":
       return [normalizedName, ...withDefaultTaskId(args, store)];
@@ -236,9 +234,9 @@ function dashboardHelp(): string {
   return `TaskMux dashboard commands:
   dashboard
   r
-  board [--status <status>] [--tag <tag>] [--priority <priority>] [--search <text>]
+  board [--archived true|false] [--tag <tag>] [--priority <priority>] [--search <text>]
   b
-  list [--status <status>] [--tag <tag>] [--priority <priority>] [--search <text>]
+  list [--archived true|false] [--tag <tag>] [--priority <priority>] [--search <text>]
   ls
   current [<task-id>]
   c [<task-id>]
@@ -248,10 +246,8 @@ function dashboardHelp(): string {
   o [<task-id>]
   show [<task-id>]
   update [<task-id>] [--title <title>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD]
-  start [<task-id>]
-  done [<task-id>]
   archive [<task-id>]
-  reopen [<task-id>]
+  unarchive [<task-id>]
   roles [<task-id>]
   bind [<task-id>] <role> [--as <task-role>] [--workspace <path>]
   enter [<task-id>] <role>

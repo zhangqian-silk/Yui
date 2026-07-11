@@ -45,13 +45,23 @@ function addGlobalRoleCommand(args: string[], store: TaskStore): string {
   const workspace = readOptionalOption(rest, "--workspace")?.trim() ?? store.getConfig().defaultWorkspace ?? process.cwd();
   const agent = resolveRunner(agentId, store.listCustomRunners());
 
-  assertKnownOptions(rest, new Set(["--agent", "--workspace"]));
+  assertKnownOptions(rest, new Set([
+    "--agent", "--workspace", "--description", "--responsibility", "--constraint",
+    "--expected-output", "--system-prompt", "--skill"
+  ]));
 
   if (agent === null) {
     throwUnsupportedAgent(agentId, store);
   }
 
-  const role = createGlobalRole(roleName, agent, workspace, new Date());
+  const role = createGlobalRole(roleName, agent, workspace, new Date(), {
+    description: readOptionalOption(rest, "--description")?.trim(),
+    responsibilities: readRepeatedOption(rest, "--responsibility"),
+    constraints: readRepeatedOption(rest, "--constraint"),
+    expectedOutput: readOptionalOption(rest, "--expected-output")?.trim(),
+    systemPrompt: readOptionalOption(rest, "--system-prompt")?.trim(),
+    skills: readRepeatedOption(rest, "--skill")
+  });
   store.saveGlobalRole(role);
 
   return renderGlobalRole(`Added role ${role.name}`, role);
@@ -233,7 +243,13 @@ function renderGlobalRole(title: string, role: GlobalRole): string {
     `Command: ${role.command}`,
     `Args: ${role.args.join(" ")}`,
     `Env: ${Object.entries(role.env).map(([key, value]) => `${key}=${value}`).join(" ")}`,
-    `Workspace: ${role.workspace}`
+    `Workspace: ${role.workspace}`,
+    `Description: ${role.description ?? ""}`,
+    `Responsibilities: ${(role.responsibilities ?? []).join("; ")}`,
+    `Constraints: ${(role.constraints ?? []).join("; ")}`,
+    `Expected output: ${role.expectedOutput ?? ""}`,
+    `System prompt: ${role.systemPrompt ?? ""}`,
+    `Skills: ${(role.skills ?? []).join(", ")}`
   ].join("\n").concat("\n");
 }
 
@@ -285,6 +301,17 @@ function readOptionalOption(args: string[], name: string): string | undefined {
   return args[index + 1];
 }
 
+function readRepeatedOption(args: string[], name: string): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] === name && args[index + 1] !== undefined && !args[index + 1].startsWith("--")) {
+      values.push(args[index + 1].trim());
+      index += 1;
+    }
+  }
+  return values;
+}
+
 function assertKnownOptions(args: string[], knownOptions: Set<string>): void {
   for (const arg of args) {
     if (arg.startsWith("--") && !knownOptions.has(arg)) {
@@ -304,7 +331,7 @@ function throwUnsupportedAgent(agent: string, store: TaskStore): never {
 
 export function globalRoleUsage(): string {
   return `Role commands:
-  taskmux role add <role> --agent <agent-id> [--workspace <path>]
+  taskmux role add <role> --agent <agent-id> [--workspace <path>] [--description <body>] [--responsibility <body> ...] [--constraint <body> ...] [--expected-output <body>] [--system-prompt <body>] [--skill <skill> ...]
   taskmux role list
   taskmux role show <role>
   taskmux role update <role> [--agent <agent-id>] [--workspace <path>]
