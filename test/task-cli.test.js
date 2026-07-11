@@ -865,6 +865,25 @@ test("updates task lifecycle status", () => {
   assert.equal(task.status, "open");
 });
 
+test("keeps a task long-lived until it is explicitly archived", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["task", "create", "Maintain the daily deployment check"], {
+    TASKMUX_HOME: home
+  });
+  let task = JSON.parse(readFileSync(join(home, "tasks", "task-1", "task.json"), "utf8"));
+  assert.equal(task.archived, false);
+
+  runTaskmux(["task", "archive", "task-1"], { TASKMUX_HOME: home });
+  task = JSON.parse(readFileSync(join(home, "tasks", "task-1", "task.json"), "utf8"));
+  assert.equal(task.archived, true);
+
+  const output = runTaskmux(["task", "unarchive", "task-1"], { TASKMUX_HOME: home });
+  task = JSON.parse(readFileSync(join(home, "tasks", "task-1", "task.json"), "utf8"));
+  assert.match(output, /Unarchived task task-1/);
+  assert.equal(task.archived, false);
+});
+
 test("assigns a role to an existing task", () => {
   const home = createConfiguredHome();
 
@@ -2078,7 +2097,6 @@ test("records and lists task event history", () => {
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line));
-
   assert.equal(events[0].schemaVersion, 1);
   assert.equal(events[0].id, "event-1");
   assert.equal(events[0].type, "task.created");
@@ -3093,4 +3111,226 @@ test("runs an interactive task shell", async () => {
   assert.match(output, /Task activity: task-1/);
   assert.match(output, /Task timeline: task-1/);
   assert.match(output, /Task Context/);
+});
+
+test("creates a task-local custom topic", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["task", "create", "Plan data migration"], { TASKMUX_HOME: home });
+  const output = runTaskmux(
+    [
+      "task",
+      "topic",
+      "create",
+      "task-1",
+      "--id",
+      "data-migration",
+      "--name",
+      "数据迁移",
+      "--description",
+      "数据结构变更、迁移过程与兼容性处理"
+    ],
+    { TASKMUX_HOME: home }
+  );
+  const topics = JSON.parse(readFileSync(join(home, "tasks", "task-1", "topics.json"), "utf8"));
+
+  assert.match(output, /Created topic data-migration for task task-1/);
+  assert.equal(topics.schemaVersion, 1);
+  assert.deepEqual(topics.customTopics.map(({ createdAt, ...topic }) => topic), [
+    {
+      id: "data-migration",
+      name: "数据迁移",
+      description: "数据结构变更、迁移过程与兼容性处理",
+      createdBy: "user"
+    }
+  ]);
+  assert.match(topics.customTopics[0].createdAt, /^\d{4}-\d{2}-\d{2}T/);
+});
+
+test("lists built-in and task-local topics together", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["task", "create", "Plan data migration"], { TASKMUX_HOME: home });
+  runTaskmux(
+    [
+      "task",
+      "topic",
+      "create",
+      "task-1",
+      "--id",
+      "data-migration",
+      "--name",
+      "数据迁移",
+      "--description",
+      "数据结构变更、迁移过程与兼容性处理"
+    ],
+    { TASKMUX_HOME: home }
+  );
+  const output = runTaskmux(["task", "topic", "list", "task-1"], { TASKMUX_HOME: home });
+
+  for (const topic of [
+    "requirements",
+    "architecture",
+    "ui",
+    "implementation",
+    "testing",
+    "deployment",
+    "operations",
+    "security",
+    "data-migration"
+  ]) {
+    assert.match(output, new RegExp(topic));
+  }
+  assert.match(output, /数据迁移/);
+});
+
+test("warns about custom topic naming without blocking it", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["task", "create", "Prepare deployment"], { TASKMUX_HOME: home });
+  const output = runTaskmux(
+    [
+      "task",
+      "topic",
+      "create",
+      "task-1",
+      "--id",
+      "Deployment Check",
+      "--name",
+      "部署检查",
+      "--description",
+      "发布前检查"
+    ],
+    { TASKMUX_HOME: home }
+  );
+
+  assert.match(output, /Created topic Deployment Check/);
+  assert.match(output, /Warning: topic ids conventionally use lower-case kebab-case/);
+});
+
+test("keeps operator input as a draft until it is submitted", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["task", "create", "Investigate deployment failures"], { TASKMUX_HOME: home });
+  const draftOutput = runTaskmux(
+    ["task", "input", "draft", "task-1", "Production fails only in the canary environment."],
+    { TASKMUX_HOME: home }
+  );
+  const draft = JSON.parse(
+    readFileSync(join(home, "tasks", "task-1", "input-draft.json"), "utf8")
+  );
+
+  assert.match(draftOutput, /Saved input draft for task task-1/);
+  assert.equal(draft.body, "Production fails only in the canary environment.");
+  assert.equal(existsSync(join(home, "tasks", "task-1", "comments.jsonl")), false);
+
+  const submitOutput = runTaskmux(["task", "input", "submit", "task-1"], {
+    TASKMUX_HOME: home
+  });
+  const comments = readFileSync(join(home, "tasks", "task-1", "comments.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const events = readFileSync(join(home, "tasks", "task-1", "events.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const pendingWakeup = JSON.parse(
+    readFileSync(join(home, "runtime", "pending-wakeups", "task-1.json"), "utf8")
+  );
+
+  assert.match(submitOutput, /Submitted input draft for task task-1/);
+  assert.equal(comments.at(-1).body, "Production fails only in the canary environment.");
+  assert.equal(comments.at(-1).author, "operator");
+  assert.equal(events.at(-1).type, "task.input_submitted");
+  assert.deepEqual(pendingWakeup.reasons, ["operator-input"]);
+  assert.equal(pendingWakeup.requestCount, 1);
+  assert.equal(existsSync(join(home, "tasks", "task-1", "input-draft.json")), false);
+});
+
+test("creates a cycle and a finite work item inside a long-lived task", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["task", "create", "Keep production deployments healthy"], { TASKMUX_HOME: home });
+  const cycleOutput = runTaskmux(
+    ["task", "cycle", "create", "task-1", "--cause", "explicit-wake", "--summary", "Check today's release"],
+    { TASKMUX_HOME: home }
+  );
+  const workItemOutput = runTaskmux(
+    [
+      "task",
+      "work-item",
+      "create",
+      "task-1",
+      "--title",
+      "Run canary checks",
+      "--cycle",
+      "cycle-1",
+      "--assignee",
+      "leader",
+      "--topic",
+      "testing",
+      "--topic",
+      "deployment"
+    ],
+    { TASKMUX_HOME: home }
+  );
+  const cycle = JSON.parse(
+    readFileSync(join(home, "tasks", "task-1", "cycles", "cycle-1.json"), "utf8")
+  );
+  const workItem = JSON.parse(
+    readFileSync(join(home, "tasks", "task-1", "work-items", "work-item-1.json"), "utf8")
+  );
+
+  assert.match(cycleOutput, /Created cycle cycle-1 for task task-1/);
+  assert.equal(cycle.cause, "explicit-wake");
+  assert.equal(cycle.status, "active");
+  assert.match(workItemOutput, /Created work item work-item-1 for task task-1/);
+  assert.equal(workItem.cycleId, "cycle-1");
+  assert.equal(workItem.assignee, "leader");
+  assert.equal(workItem.status, "pending");
+  assert.deepEqual(workItem.topics, ["testing", "deployment"]);
+});
+
+test("coalesces comments and explicit triggers into one leader wakeup", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["task", "create", "Track an external release"], { TASKMUX_HOME: home });
+  runTaskmux(["task", "comment", "task-1", "The vendor moved the release date."], {
+    TASKMUX_HOME: home
+  });
+  const output = runTaskmux(
+    ["task", "wake", "task-1", "--reason", "review-time"],
+    { TASKMUX_HOME: home }
+  );
+  const pendingWakeup = JSON.parse(
+    readFileSync(join(home, "runtime", "pending-wakeups", "task-1.json"), "utf8")
+  );
+
+  assert.match(output, /Queued leader wakeup for task task-1/);
+  assert.deepEqual(pendingWakeup.reasons, ["user-comment", "review-time"]);
+  assert.equal(pendingWakeup.requestCount, 2);
+});
+
+test("starts and reaches the controller through authenticated loopback RPC", () => {
+  const home = createConfiguredHome();
+
+  try {
+    const startOutput = runTaskmux(["controller", "start"], { TASKMUX_HOME: home });
+    const status = JSON.parse(
+      runTaskmux(["controller", "status", "--json"], { TASKMUX_HOME: home })
+    );
+    const discovery = JSON.parse(
+      readFileSync(join(home, "runtime", "controller.json"), "utf8")
+    );
+
+    assert.match(startOutput, /Controller started/);
+    assert.equal(discovery.host, "127.0.0.1");
+    assert.equal(discovery.apiVersion, 1);
+    assert.match(discovery.token, /^[a-f0-9]{64}$/);
+    assert.equal(status.running, true);
+    assert.equal(status.pid, discovery.pid);
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], { TASKMUX_HOME: home });
+  }
 });

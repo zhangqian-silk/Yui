@@ -2,11 +2,16 @@ import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSyn
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { TaskComment } from "../comment/comment.js";
+import type { Cycle } from "../cycle/cycle.js";
 import { dataError } from "../errors/cliError.js";
 import type { TaskEvent } from "../event/taskEvent.js";
+import type { TaskInputDraft } from "../input/taskInput.js";
 import type { GlobalRole, Role } from "../role/role.js";
 import type { CustomRunner } from "../runner/runner.js";
+import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import type { Task } from "../task/task.js";
+import { emptyTaskTopics, type TaskTopics } from "../topic/topic.js";
+import type { WorkItem } from "../workItem/workItem.js";
 import { taskRecordCodec } from "./taskRecordCodec.js";
 
 export type TaskStore = {
@@ -18,6 +23,19 @@ export type TaskStore = {
   restoreTask(id: string): boolean;
   listTasks(): Task[];
   getTask(id: string): Task | null;
+  getTaskTopics(taskId: string): TaskTopics;
+  saveTaskTopics(taskId: string, topics: TaskTopics): void;
+  getTaskInputDraft(taskId: string): TaskInputDraft | null;
+  saveTaskInputDraft(taskId: string, draft: TaskInputDraft): void;
+  clearTaskInputDraft(taskId: string): void;
+  getPendingWakeup(taskId: string): PendingWakeup | null;
+  savePendingWakeup(wakeup: PendingWakeup): void;
+  nextCycleId(taskId: string): string;
+  getCycle(taskId: string, cycleId: string): Cycle | null;
+  saveCycle(taskId: string, cycle: Cycle): void;
+  nextWorkItemId(taskId: string): string;
+  getWorkItem(taskId: string, workItemId: string): WorkItem | null;
+  saveWorkItem(taskId: string, workItem: WorkItem): void;
   saveRole(taskId: string, role: Role): void;
   renameRole(taskId: string, oldName: string, role: Role): void;
   listRoles(taskId: string): Role[];
@@ -141,6 +159,73 @@ export class FileTaskStore implements TaskStore {
     const infoRaw = this.readOptionalText(this.taskInfoFile(id));
 
     return taskRecordCodec.decodeTask(id, runtimeRaw, infoRaw);
+  }
+
+  getTaskTopics(taskId: string): TaskTopics {
+    const raw = this.readOptionalText(this.topicsFile(taskId));
+
+    return raw === null ? emptyTaskTopics() : parseTaskTopics(taskId, raw);
+  }
+
+  saveTaskTopics(taskId: string, topics: TaskTopics): void {
+    mkdirSync(this.taskDir(taskId), { recursive: true });
+    writeFileSync(this.topicsFile(taskId), `${JSON.stringify(topics, null, 2)}\n`);
+  }
+
+  getTaskInputDraft(taskId: string): TaskInputDraft | null {
+    const raw = this.readOptionalText(this.taskInputDraftFile(taskId));
+
+    return raw === null ? null : parseTaskInputDraft(taskId, raw);
+  }
+
+  saveTaskInputDraft(taskId: string, draft: TaskInputDraft): void {
+    mkdirSync(this.taskDir(taskId), { recursive: true });
+    writeFileSync(this.taskInputDraftFile(taskId), `${JSON.stringify(draft, null, 2)}\n`);
+  }
+
+  clearTaskInputDraft(taskId: string): void {
+    rmSync(this.taskInputDraftFile(taskId), { force: true });
+  }
+
+  getPendingWakeup(taskId: string): PendingWakeup | null {
+    const raw = this.readOptionalText(this.pendingWakeupFile(taskId));
+
+    return raw === null ? null : parsePendingWakeup(taskId, raw);
+  }
+
+  savePendingWakeup(wakeup: PendingWakeup): void {
+    mkdirSync(this.pendingWakeupsDir(), { recursive: true });
+    writeFileSync(this.pendingWakeupFile(wakeup.taskId), `${JSON.stringify(wakeup, null, 2)}\n`);
+  }
+
+  nextCycleId(taskId: string): string {
+    return this.nextRecordId("cycle", (id) => this.getCycle(taskId, id));
+  }
+
+  getCycle(taskId: string, cycleId: string): Cycle | null {
+    const raw = this.readOptionalText(this.cycleFile(taskId, cycleId));
+
+    return raw === null ? null : parseCycle(taskId, cycleId, raw);
+  }
+
+  saveCycle(taskId: string, cycle: Cycle): void {
+    mkdirSync(this.cyclesDir(taskId), { recursive: true });
+    writeFileSync(this.cycleFile(taskId, cycle.id), `${JSON.stringify(cycle, null, 2)}\n`);
+  }
+
+  nextWorkItemId(taskId: string): string {
+    return this.nextRecordId("work-item", (id) => this.getWorkItem(taskId, id));
+  }
+
+  getWorkItem(taskId: string, workItemId: string): WorkItem | null {
+    const raw = this.readOptionalText(this.workItemFile(taskId, workItemId));
+
+    return raw === null ? null : parseWorkItem(taskId, workItemId, raw);
+  }
+
+  saveWorkItem(taskId: string, workItem: WorkItem): void {
+    mkdirSync(this.workItemsDir(taskId), { recursive: true });
+    writeFileSync(this.workItemFile(taskId, workItem.id), `${JSON.stringify(workItem, null, 2)}\n`);
   }
 
   saveRole(taskId: string, role: Role): void {
@@ -345,6 +430,42 @@ export class FileTaskStore implements TaskStore {
     return join(this.taskDir(id), "info.json");
   }
 
+  private topicsFile(taskId: string): string {
+    return join(this.taskDir(taskId), "topics.json");
+  }
+
+  private taskInputDraftFile(taskId: string): string {
+    return join(this.taskDir(taskId), "input-draft.json");
+  }
+
+  private runtimeDir(): string {
+    return join(this.rootDir, "runtime");
+  }
+
+  private pendingWakeupsDir(): string {
+    return join(this.runtimeDir(), "pending-wakeups");
+  }
+
+  private pendingWakeupFile(taskId: string): string {
+    return join(this.pendingWakeupsDir(), `${taskId}.json`);
+  }
+
+  private cyclesDir(taskId: string): string {
+    return join(this.taskDir(taskId), "cycles");
+  }
+
+  private cycleFile(taskId: string, cycleId: string): string {
+    return join(this.cyclesDir(taskId), `${cycleId}.json`);
+  }
+
+  private workItemsDir(taskId: string): string {
+    return join(this.taskDir(taskId), "work-items");
+  }
+
+  private workItemFile(taskId: string, workItemId: string): string {
+    return join(this.workItemsDir(taskId), `${workItemId}.json`);
+  }
+
   private trashDir(): string {
     return join(this.rootDir, "trash");
   }
@@ -485,6 +606,16 @@ export class FileTaskStore implements TaskStore {
     }
   }
 
+  private nextRecordId(prefix: string, getRecord: (id: string) => unknown | null): string {
+    let number = 1;
+
+    while (getRecord(`${prefix}-${number}`) !== null) {
+      number += 1;
+    }
+
+    return `${prefix}-${number}`;
+  }
+
 }
 
 function parseCustomRunner(id: string, raw: string): CustomRunner {
@@ -544,6 +675,106 @@ function parseTaskmuxConfig(raw: string): TaskmuxConfig {
   return value as TaskmuxConfig;
 }
 
+function parseTaskTopics(taskId: string, raw: string): TaskTopics {
+  const value = parseJson(raw, `Invalid topic record: ${taskId}`);
+
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    !Array.isArray(value.customTopics) ||
+    !value.customTopics.every((topic) =>
+      isRecord(topic) &&
+      typeof topic.id === "string" &&
+      typeof topic.name === "string" &&
+      typeof topic.description === "string" &&
+      (topic.createdBy === "user" || topic.createdBy === "operator" || topic.createdBy === "leader") &&
+      typeof topic.createdAt === "string"
+    )
+  ) {
+    throw dataError(`Invalid topic record: ${taskId}`);
+  }
+
+  return value as TaskTopics;
+}
+
+function parseTaskInputDraft(taskId: string, raw: string): TaskInputDraft {
+  const value = parseJson(raw, `Invalid input draft record: ${taskId}`);
+
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    value.taskId !== taskId ||
+    typeof value.body !== "string" ||
+    value.author !== "operator" ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string"
+  ) {
+    throw dataError(`Invalid input draft record: ${taskId}`);
+  }
+
+  return value as TaskInputDraft;
+}
+
+function parsePendingWakeup(taskId: string, raw: string): PendingWakeup {
+  const value = parseJson(raw, `Invalid pending wakeup record: ${taskId}`);
+
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    value.taskId !== taskId ||
+    !isStringArray(value.reasons) ||
+    typeof value.requestCount !== "number" ||
+    typeof value.firstRequestedAt !== "string" ||
+    typeof value.lastRequestedAt !== "string"
+  ) {
+    throw dataError(`Invalid pending wakeup record: ${taskId}`);
+  }
+
+  return value as PendingWakeup;
+}
+
+function parseCycle(taskId: string, cycleId: string, raw: string): Cycle {
+  const value = parseJson(raw, `Invalid cycle record: ${taskId}/${cycleId}`);
+
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    value.id !== cycleId ||
+    value.taskId !== taskId ||
+    !["schedule", "review-time", "operator-input", "role-result", "inactivity", "explicit-wake"].includes(String(value.cause)) ||
+    typeof value.summary !== "string" ||
+    !["active", "ended"].includes(String(value.status)) ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string"
+  ) {
+    throw dataError(`Invalid cycle record: ${taskId}/${cycleId}`);
+  }
+
+  return value as Cycle;
+}
+
+function parseWorkItem(taskId: string, workItemId: string, raw: string): WorkItem {
+  const value = parseJson(raw, `Invalid work item record: ${taskId}/${workItemId}`);
+
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    value.id !== workItemId ||
+    value.taskId !== taskId ||
+    (value.cycleId !== undefined && typeof value.cycleId !== "string") ||
+    typeof value.title !== "string" ||
+    typeof value.assignee !== "string" ||
+    !isStringArray(value.topics) ||
+    !["pending", "running", "completed", "failed", "cancelled", "superseded"].includes(String(value.status)) ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string"
+  ) {
+    throw dataError(`Invalid work item record: ${taskId}/${workItemId}`);
+  }
+
+  return value as WorkItem;
+}
+
 function parseComment(id: string, raw: string): TaskComment {
   const value = parseJson(raw, `Invalid comment record: ${id}`);
 
@@ -552,6 +783,7 @@ function parseComment(id: string, raw: string): TaskComment {
     value.schemaVersion !== 1 ||
     typeof value.id !== "string" ||
     typeof value.body !== "string" ||
+    (value.author !== undefined && !["user", "operator", "leader"].includes(String(value.author))) ||
     typeof value.createdAt !== "string"
   ) {
     throw dataError(`Invalid comment record: ${id}`);

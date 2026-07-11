@@ -1,13 +1,18 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { createTaskComment } from "../comment/comment.js";
+import { createCycle, type CycleCause } from "../cycle/cycle.js";
 import { roleNotFound, runtimeError, taskNotFound, usageError } from "../errors/cliError.js";
 import { createTaskEvent } from "../event/taskEvent.js";
+import { createTaskInputDraft } from "../input/taskInput.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { copyGlobalRoleToTaskRole, createRole, updateRole, updateRoleStatus } from "../role/role.js";
 import { SYSTEM_LEADER_ROLE } from "../role/systemRoles.js";
 import { resolveRunner, supportedRunnerIds } from "../runner/runnerRegistry.js";
-import { createTask, updateTaskMetadata, updateTaskStatus } from "../task/task.js";
+import { mergePendingWakeup } from "../scheduler/pendingWakeup.js";
+import { createTask, updateTaskArchived, updateTaskMetadata, updateTaskStatus } from "../task/task.js";
+import { BUILTIN_TOPICS, createCustomTopic, usesConventionalTopicId } from "../topic/topic.js";
+import { createWorkItem } from "../workItem/workItem.js";
 import type { TaskComment } from "../comment/comment.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { Role } from "../role/role.js";
@@ -42,7 +47,9 @@ export function runTaskCommand(args: string[], store: TaskStore, tmux?: TmuxMana
     case "done":
       return updateTaskStatusCommand(rest, store, "done", "Completed");
     case "archive":
-      return updateTaskStatusCommand(rest, store, "archived", "Archived");
+      return updateTaskArchivedCommand(rest, store, true);
+    case "unarchive":
+      return updateTaskArchivedCommand(rest, store, false);
     case "reopen":
       return updateTaskStatusCommand(rest, store, "open", "Reopened");
     case "open":
@@ -95,9 +102,233 @@ export function runTaskCommand(args: string[], store: TaskStore, tmux?: TmuxMana
       return taskActivityCommand(rest, store);
     case "timeline":
       return taskTimelineCommand(rest, store);
+    case "topic":
+      return taskTopicCommand(rest, store);
+    case "input":
+      return taskInputCommand(rest, store);
+    case "cycle":
+      return taskCycleCommand(rest, store);
+    case "work-item":
+      return taskWorkItemCommand(rest, store);
+    case "wake":
+      return wakeTaskCommand(rest, store);
     default:
       return taskUsage();
   }
+}
+
+function wakeTaskCommand(args: string[], store: TaskStore): string {
+  const [taskId, ...rest] = args;
+
+  if (taskId === undefined || taskId.trim().length === 0) {
+    throw usageError("Task id is required.");
+  }
+
+  const task = store.getTask(taskId);
+
+  if (task === null) {
+    throw taskNotFound(taskId);
+  }
+
+  if (task.archived) {
+    throw usageError(`Cannot wake archived task: ${taskId}.`);
+  }
+
+  const reason = readOption(rest, "--reason").trim();
+  queueLeaderWakeup(store, taskId, reason);
+  recordTaskEvent(store, taskId, "leader.wakeup_requested", { reason });
+  return `Queued leader wakeup for task ${taskId}\n`;
+}
+
+function taskCycleCommand(args: string[], store: TaskStore): string {
+  const [command, taskId, ...rest] = args;
+
+  if (command !== "create" || taskId === undefined || store.getTask(taskId) === null) {
+    if (taskId !== undefined && store.getTask(taskId) === null) {
+      throw taskNotFound(taskId);
+    }
+    throw usageError("Cycle usage: taskmux task cycle create <task-id> --cause <cause> --summary <summary>.");
+  }
+
+  const cause = readOption(rest, "--cause");
+  const allowedCauses = ["schedule", "review-time", "operator-input", "role-result", "inactivity", "explicit-wake"];
+
+  if (!allowedCauses.includes(cause)) {
+    throw usageError(`Invalid cycle cause: ${cause}.`);
+  }
+
+  const cycle = createCycle(
+    store.nextCycleId(taskId),
+    taskId,
+    cause as CycleCause,
+    readOption(rest, "--summary"),
+    new Date()
+  );
+  store.saveCycle(taskId, cycle);
+  recordTaskEvent(store, taskId, "cycle.created", { cycle: cycle.id, cause: cycle.cause });
+  return `Created cycle ${cycle.id} for task ${taskId}\n`;
+}
+
+function taskWorkItemCommand(args: string[], store: TaskStore): string {
+  const [command, taskId, ...rest] = args;
+
+  if (command !== "create" || taskId === undefined || store.getTask(taskId) === null) {
+    if (taskId !== undefined && store.getTask(taskId) === null) {
+      throw taskNotFound(taskId);
+    }
+    throw usageError("Work item usage: taskmux task work-item create <task-id> --title <title> [--cycle <cycle>] [--assignee <role>] [--topic <topic> ...].");
+  }
+
+  const cycleId = readOptionalOption(rest, "--cycle")?.trim();
+  const assignee = readOptionalOption(rest, "--assignee")?.trim() ?? BUILTIN_LEADER_ROLE;
+  const topics = readRepeatedOption(rest, "--topic").map((topic) => topic.trim());
+  const knownTopicIds = new Set([
+    ...BUILTIN_TOPICS.map(({ id }) => id),
+    ...store.getTaskTopics(taskId).customTopics.map(({ id }) => id)
+  ]);
+
+  if (cycleId !== undefined && store.getCycle(taskId, cycleId) === null) {
+    throw usageError(`Cycle not found: ${cycleId}.`);
+  }
+
+  if (store.getRole(taskId, assignee) === null) {
+    throw roleNotFound(assignee);
+  }
+
+  const unknownTopic = topics.find((topic) => !knownTopicIds.has(topic));
+  if (unknownTopic !== undefined) {
+    throw usageError(`Topic not found: ${unknownTopic}.`);
+  }
+
+  const workItem = createWorkItem(
+    store.nextWorkItemId(taskId),
+    taskId,
+    {
+      title: readOption(rest, "--title"),
+      assignee,
+      topics,
+      ...(cycleId === undefined ? {} : { cycleId })
+    },
+    new Date()
+  );
+  store.saveWorkItem(taskId, workItem);
+  recordTaskEvent(store, taskId, "work-item.created", { workItem: workItem.id, assignee });
+  return `Created work item ${workItem.id} for task ${taskId}\n`;
+}
+
+function taskInputCommand(args: string[], store: TaskStore): string {
+  const [command, taskId, ...rest] = args;
+
+  if (taskId === undefined || taskId.trim().length === 0) {
+    throw usageError("Task id is required.");
+  }
+
+  if (store.getTask(taskId) === null) {
+    throw taskNotFound(taskId);
+  }
+
+  if (command === "draft") {
+    const body = rest.join(" ").trim();
+    const draft = createTaskInputDraft(taskId, body, new Date(), store.getTaskInputDraft(taskId) ?? undefined);
+    store.saveTaskInputDraft(taskId, draft);
+    return `Saved input draft for task ${taskId}\n`;
+  }
+
+  if (command === "submit" && rest.length === 0) {
+    const draft = store.getTaskInputDraft(taskId);
+
+    if (draft === null) {
+      throw usageError(`No input draft exists for task ${taskId}.`);
+    }
+
+    const comment = createTaskComment(store.nextCommentId(taskId), draft.body, new Date(), "operator");
+    store.saveComment(taskId, comment);
+    recordTaskEvent(store, taskId, "task.input_submitted", { comment: comment.id });
+    queueLeaderWakeup(store, taskId, "operator-input");
+    store.clearTaskInputDraft(taskId);
+    return `Submitted input draft for task ${taskId}\n`;
+  }
+
+  throw usageError("Input usage: taskmux task input draft <task-id> <body> | taskmux task input submit <task-id>.");
+}
+
+function updateTaskArchivedCommand(args: string[], store: TaskStore, archived: boolean): string {
+  const [taskId, ...rest] = args;
+
+  if (taskId === undefined || taskId.trim().length === 0 || rest.length > 0) {
+    throw usageError(`Task ${archived ? "archive" : "unarchive"} requires exactly one task id.`);
+  }
+
+  const task = store.getTask(taskId);
+
+  if (task === null) {
+    throw taskNotFound(taskId);
+  }
+
+  const updatedTask = updateTaskArchived(task, archived, new Date());
+  store.saveTask(updatedTask);
+  recordTaskEvent(store, taskId, archived ? "task.archived" : "task.unarchived", {});
+  return `${archived ? "Archived" : "Unarchived"} task ${taskId}\n`;
+}
+
+function taskTopicCommand(args: string[], store: TaskStore): string {
+  const [command, taskId, ...rest] = args;
+
+  if (taskId === undefined || taskId.trim().length === 0) {
+    throw usageError("Task id is required.");
+  }
+
+  if (store.getTask(taskId) === null) {
+    throw taskNotFound(taskId);
+  }
+
+  if (command === "create") {
+    const topics = store.getTaskTopics(taskId);
+    const topic = createCustomTopic(
+      {
+        id: readOption(rest, "--id"),
+        name: readOption(rest, "--name"),
+        description: readOption(rest, "--description"),
+        createdBy: "user"
+      },
+      new Date()
+    );
+
+    if (BUILTIN_TOPICS.some(({ id }) => id === topic.id) || topics.customTopics.some(({ id }) => id === topic.id)) {
+      throw usageError(`Topic already exists: ${topic.id}`);
+    }
+
+    store.saveTaskTopics(taskId, {
+      ...topics,
+      customTopics: [...topics.customTopics, topic]
+    });
+    const warning = usesConventionalTopicId(topic.id)
+      ? ""
+      : "Warning: topic ids conventionally use lower-case kebab-case.\n";
+    return `Created topic ${topic.id} for task ${taskId}\n${warning}`;
+  }
+
+  if (command === "list" && rest.length === 0) {
+    const customTopics = store.getTaskTopics(taskId).customTopics;
+    const rows = [
+      ...BUILTIN_TOPICS.map((topic) => [topic.id, topic.name, "built-in", topic.description]),
+      ...customTopics.map((topic) => [topic.id, topic.name, "custom", topic.description])
+    ];
+
+    return `${renderTable(
+      `Task topics: ${taskId}`,
+      [
+        { header: "Topic", minWidth: 8, maxWidth: 24 },
+        { header: "Name", minWidth: 4, maxWidth: 16 },
+        { header: "Scope", minWidth: 7, maxWidth: 8 },
+        { header: "Description", minWidth: 11, maxWidth: 44 }
+      ],
+      rows,
+      defaultTableWidth()
+    )}\n`;
+  }
+
+  throw usageError("Topic usage: taskmux task topic create|list <task-id>.");
 }
 
 function createTaskCommand(args: string[], store: TaskStore): string {
@@ -897,9 +1128,10 @@ function addTaskCommentCommand(args: string[], store: TaskStore): string {
     throw usageError("Comment body is required.");
   }
 
-  const comment = createTaskComment(store.nextCommentId(taskId), body, new Date());
+  const comment = createTaskComment(store.nextCommentId(taskId), body, new Date(), "user");
   store.saveComment(taskId, comment);
   recordTaskEvent(store, taskId, "comment.added", { comment: comment.id });
+  queueLeaderWakeup(store, taskId, "user-comment");
 
   return `Added comment to ${taskId}: ${comment.body}\n`;
 }
@@ -1151,6 +1383,12 @@ function recordTaskEvent(
   payload: Record<string, string>
 ): void {
   store.saveEvent(taskId, createTaskEvent(store.nextEventId(taskId), type, payload, new Date()));
+}
+
+function queueLeaderWakeup(store: TaskStore, taskId: string, reason: string): void {
+  store.savePendingWakeup(
+    mergePendingWakeup(taskId, reason, new Date(), store.getPendingWakeup(taskId))
+  );
 }
 
 function createResolvedRole(
@@ -1768,6 +2006,7 @@ export function taskUsage(): string {
   taskmux task start <task-id>
   taskmux task done <task-id>
   taskmux task archive <task-id>
+  taskmux task unarchive <task-id>
   taskmux task reopen <task-id>
   taskmux task delete <task-id>
   taskmux task restore <task-id>
@@ -1796,5 +2035,12 @@ export function taskUsage(): string {
   taskmux task comment <task-id> <body>
   taskmux task comments <task-id>
   taskmux task events <task-id>
+  taskmux task topic create <task-id> --id <id> --name <name> --description <body>
+  taskmux task topic list <task-id>
+  taskmux task input draft <task-id> <body>
+  taskmux task input submit <task-id>
+  taskmux task cycle create <task-id> --cause <cause> --summary <summary>
+  taskmux task work-item create <task-id> --title <title> [--cycle <cycle>] [--assignee <role>] [--topic <topic> ...]
+  taskmux task wake <task-id> --reason <reason>
 `;
 }

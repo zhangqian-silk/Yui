@@ -15,6 +15,7 @@ export type TaskInfoRecord = {
 export type TaskRuntimeRecord = {
   schemaVersion: 1;
   id: string;
+  archived: boolean;
   status: TaskStatus;
   createdAt: string;
   updatedAt: string;
@@ -53,6 +54,7 @@ export class TaskRecordCodec {
       runtime: {
         schemaVersion: task.schemaVersion,
         id: task.id,
+        archived: task.archived,
         status: task.status,
         createdAt: task.createdAt,
         updatedAt: task.updatedAt
@@ -137,7 +139,10 @@ export class TaskRecordCodec {
       throw dataError(`Invalid task record: ${id}`);
     }
 
-    return value as TaskRuntimeRecord;
+    return {
+      ...(value as Omit<TaskRuntimeRecord, "archived">),
+      archived: typeof value.archived === "boolean" ? value.archived : value.status === "archived"
+    };
   }
 
   private parseTaskInfo(id: string, raw: string): TaskInfoRecord {

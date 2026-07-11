@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { runAgentCommand } from "./commands/agentCommands.js";
 import { runBoardCommand } from "./commands/boardCommands.js";
 import { runConfigCommand } from "./commands/configCommands.js";
+import { runControllerCommand } from "./commands/controllerCommands.js";
 import { runGlobalRoleCommand } from "./commands/globalRoleCommands.js";
 import { runExportCommand, runImportCommand, runPruneCommand } from "./commands/maintenanceCommands.js";
 import { runTaskCommand } from "./commands/taskCommands.js";
@@ -35,6 +36,7 @@ Usage:
   taskmux --version
   taskmux completion bash|zsh|fish
   taskmux doctor
+  taskmux controller start|status [--json]|stop
   taskmux setup [tmux]
   taskmux backup
   taskmux migrate [--dry-run]
@@ -67,6 +69,7 @@ Usage:
   taskmux task start <task-id>
   taskmux task done <task-id>
   taskmux task archive <task-id>
+  taskmux task unarchive <task-id>
   taskmux task reopen <task-id>
   taskmux task delete <task-id>
   taskmux task restore <task-id>
@@ -164,6 +167,15 @@ async function main(): Promise<void> {
   if (args[0] === "backup") {
     requireStorageSchema(rootDir);
     console.log(runBackupCommand(rootDir).trimEnd());
+    return;
+  }
+
+  if (args[0] === "controller") {
+    requireStorageSchema(rootDir);
+    const output = await runControllerCommand(args.slice(1), rootDir, process.env);
+    if (output.length > 0) {
+      console.log(output.trimEnd());
+    }
     return;
   }
 
@@ -308,10 +320,10 @@ function listCustomRunnersForDoctor(store: FileTaskStore) {
 function renderCompletion(shell: string | undefined): string {
   const commands = [
     "doctor", "setup", "backup", "migrate", "export", "import", "prune", "assistant", "board", "config", "agent", "role", "task", "completion",
-    "create", "update", "list", "board", "show", "start", "done", "archive", "reopen", "delete", "restore",
+    "create", "update", "list", "board", "show", "start", "done", "archive", "unarchive", "reopen", "delete", "restore",
     "shell", "context", "assign", "assign-many", "role", "roles", "enter", "tail", "detail", "status",
     "refresh", "transcript", "activity", "timeline", "detach", "stop", "kill", "restart", "cleanup",
-    "comment", "comments", "events", "current", "last", "clone"
+    "comment", "comments", "events", "current", "last", "clone", "topic", "input", "draft", "submit", "cycle", "work-item", "wake"
   ].join(" ");
 
   if (shell === "bash") {
