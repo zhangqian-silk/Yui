@@ -173,7 +173,7 @@ class ClaudeExecutor extends BaseAgentExecutor {
       };
     }
 
-    const nativeSessionId = randomUUID();
+    const nativeSessionId = session?.status === "reserved" ? session.nativeSessionId : randomUUID();
     const created = recordAgentSession(
       taskId,
       role.name,
@@ -201,6 +201,20 @@ export function resolveAgentExecutor(agent: string): AgentExecutor {
     throw new Error(`Agent does not define an execution adapter: ${agent}.`);
   }
   return adapter;
+}
+
+export function reserveInitialAgentSession(
+  taskId: string,
+  role: Role,
+  now: Date
+): AgentSession | null {
+  if (role.agent !== "claude") {
+    return null;
+  }
+  return {
+    ...recordAgentSession(taskId, role.name, role.agent, randomUUID(), now, null),
+    status: "reserved"
+  };
 }
 
 function baseLaunch(role: Role): AgentLaunchPlan {

@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { TaskComment } from "../comment/comment.js";
@@ -419,8 +419,8 @@ export class FileTaskStore implements TaskStore {
   }
 
   appendTaskTimeline(taskId: string, markdown: string): void {
-    mkdirSync(this.taskDir(taskId), { recursive: true });
-    appendFileSync(this.taskTimelineFile(taskId), markdown);
+    const existing = this.readOptionalText(this.taskTimelineFile(taskId)) ?? "";
+    this.writeSnapshot(this.taskTimelineFile(taskId), `${existing}${markdown}`);
   }
 
   nextMilestoneId(taskId: string): string {
@@ -606,8 +606,8 @@ export class FileTaskStore implements TaskStore {
   }
 
   saveComment(taskId: string, comment: TaskComment): void {
-    mkdirSync(this.taskDir(taskId), { recursive: true });
-    appendFileSync(this.commentsFile(taskId), `${JSON.stringify(comment)}\n`);
+    const existing = this.readOptionalText(this.commentsFile(taskId)) ?? "";
+    this.writeSnapshot(this.commentsFile(taskId), `${existing}${JSON.stringify(comment)}\n`);
   }
 
   listComments(taskId: string): TaskComment[] {
@@ -630,8 +630,8 @@ export class FileTaskStore implements TaskStore {
   }
 
   saveEvent(taskId: string, event: TaskEvent): void {
-    mkdirSync(this.taskDir(taskId), { recursive: true });
-    appendFileSync(this.eventsFile(taskId), `${JSON.stringify(event)}\n`);
+    const existing = this.readOptionalText(this.eventsFile(taskId)) ?? "";
+    this.writeSnapshot(this.eventsFile(taskId), `${existing}${JSON.stringify(event)}\n`);
   }
 
   listEvents(taskId: string): TaskEvent[] {
@@ -1308,7 +1308,7 @@ function parseAgentSession(taskId: string, roleName: string, raw: string): Agent
     typeof value.agent !== "string" ||
     typeof value.nativeSessionId !== "string" ||
     !["fixed", "leader-controlled"].includes(String(value.policy)) ||
-    !["unknown", "ready", "running", "stopped", "broken"].includes(String(value.status)) ||
+    !["unknown", "reserved", "ready", "running", "stopped", "broken"].includes(String(value.status)) ||
     !isStringArray(value.previousSessionIds) ||
     (value.replacementReason !== undefined && typeof value.replacementReason !== "string") ||
     typeof value.createdAt !== "string" ||

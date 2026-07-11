@@ -5,7 +5,11 @@ import { CliError, usageError } from "../errors/cliError.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { TmuxManager } from "../tmux/tmuxManager.js";
 
-export async function runDashboard(store: TaskStore, tmux: TmuxManager): Promise<void> {
+export async function runDashboard(
+  store: TaskStore,
+  tmux: TmuxManager,
+  executeTaskCommand: (args: string[]) => Promise<string> = async (args) => runTaskCommand(args, store, tmux)
+): Promise<void> {
   output.write(renderDashboard(store, tmux));
 
   const rl = createInterface({ input, output });
@@ -14,7 +18,7 @@ export async function runDashboard(store: TaskStore, tmux: TmuxManager): Promise
     if (!input.isTTY) {
       for await (const line of rl) {
         output.write("taskmux> ");
-        if (handleDashboardLine(line, store, tmux) === "exit") {
+        if (await handleDashboardLine(line, store, tmux, executeTaskCommand) === "exit") {
           break;
         }
       }
@@ -23,7 +27,7 @@ export async function runDashboard(store: TaskStore, tmux: TmuxManager): Promise
 
     while (true) {
       const line = await rl.question("taskmux> ");
-      if (handleDashboardLine(line, store, tmux) === "exit") {
+      if (await handleDashboardLine(line, store, tmux, executeTaskCommand) === "exit") {
         break;
       }
     }
@@ -45,11 +49,12 @@ function renderDashboard(store: TaskStore, tmux: TmuxManager): string {
   ].join("\n").concat("\n");
 }
 
-function handleDashboardLine(
+async function handleDashboardLine(
   line: string,
   store: TaskStore,
-  tmux: TmuxManager
-): "continue" | "exit" {
+  tmux: TmuxManager,
+  executeTaskCommand: (args: string[]) => Promise<string>
+): Promise<"continue" | "exit"> {
   const command = parseCommandLine(line);
 
   if (command.length === 0) {
@@ -73,14 +78,14 @@ function handleDashboardLine(
   }
 
   try {
-    output.write(runTaskCommand(toTaskCommand(name, args, store), store, tmux));
+    output.write(await executeTaskCommand(toTaskCommand(name, args, store)));
   } catch (error) {
     if (error instanceof CliError) {
       output.write(`${error.code}: ${error.message}\n`);
       return "continue";
     }
-
-    throw error;
+    output.write(`RUNTIME_ERROR: ${error instanceof Error ? error.message : String(error)}\n`);
+    return "continue";
   }
 
   return "continue";

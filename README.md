@@ -24,12 +24,12 @@ Running `taskmux` without arguments runs `doctor` first. If every check passes, 
 - Running `taskmux` without arguments opens the local interactive dashboard after passing doctor checks.
 - A Task is a long-lived mission with only an `archived` marker; completion belongs to finite WorkItems, Cycles, and AgentRuns.
 - The local Controller auto-starts for ordinary CLI commands, binds to `127.0.0.1`, authenticates with a random token, serializes mutations, deduplicates request ids, coalesces wakeups, and performs inactivity and schedule scans.
-- Complete snapshot writes are staged in a replayable recovery journal before atomic replacement. Controller startup replays interrupted writes and rebuilds the deletable SQLite index from authoritative files.
+- Complete snapshot writes are staged before atomic replacement. Multi-file commands and Scheduler scans commit complete write/delete sets through a replayable domain-transaction journal; Controller startup finishes staged transactions before rebuilding the deletable SQLite index.
 - A recursive local watcher reloads valid direct edits into the derived index. Invalid edits remain untouched while the Controller serves its last valid value and records diagnostics under `runtime/logs/`.
 - Each successfully dispatched Leader wakeup creates a durable Cycle describing the coalesced trigger reasons; linked WorkItems move from running to completed or failed with their AgentRun outcome.
 - One Task maps to one tmux session. Each independent role maps to one tmux window and native Agent session.
 - TaskMux has two protected system roles: global `operator` for user-facing CLI administration and task-local `leader` for task stewardship.
-- Every task includes the system `leader` role. `leader` is created with the task, immediately receives its first Controller-managed run, and cannot be renamed.
+- Every task includes the system `leader` role. `leader` is created with the task, immediately receives its first Controller-managed run, and cannot be renamed. Claude Leader session IDs are reserved at Task creation; Codex registers its CLI-assigned `CODEX_THREAD_ID` on first launch because Codex does not accept a caller-selected ID for a new interactive session.
 - Child roles contain only descriptive constraints for a parent role. They have no TaskMux-managed Agent session, tmux window, or worktree.
 - Leaving a role means detaching from tmux, not exiting the agent CLI.
 - `task status` checks tmux window state and writes detected role status back to storage.
@@ -250,7 +250,7 @@ Task events are appended to `events.jsonl` under the task directory. The event s
 
 `task update` edits task board metadata and supports `--clear-description`, `--clear-priority`, `--clear-tags`, and `--clear-due`. `task delete` moves a task into `trash/tasks/<task-id>`; `task restore` moves it back without losing task files. `task list` supports `--archived`, `--tag`, `--priority`, and `--search` filters. `task board` groups the same filtered Task set into `Ongoing` and `Archived`; `--with-roles` adds stored role status counts.
 
-`task bind <task-id> <role>` copies a global role preset into a task. `task assign` without `--agent` behaves the same; with `--agent`, it creates a task-local role directly from that agent. A TaskRole's Agent type is fixed after creation; `task role update` may refresh the same Agent contract or change its workspace. `task role rename` updates the role info record and attempts to rename the matching tmux window when it exists; the system `leader` role cannot be renamed. `task enter` uses tmux to create or reuse a task session and role window, starts the stored command with its args and env, attaches the user to that role's native agent CLI, and records the role as `running` after a successful attach. `task tail` reads recent role output with `tmux capture-pane`.
+`task bind <task-id> <role>` copies a global role preset into a task. `task assign` without `--agent` behaves the same; with `--agent`, it creates a task-local role directly from that agent. A TaskRole's Agent type is fixed after creation; `task role update` may refresh the same Agent contract or change its workspace. `task role rename` updates the role info record and attempts to rename the matching tmux window when it exists; the system `leader` role cannot be renamed. `task enter` uses tmux to create or reuse a task session and role window, starts the stored command with its args and env, attaches the user to that role's native agent CLI, then commits the `running` status through the Controller. `task tail` reads recent role output with `tmux capture-pane`.
 
 Configured role Skills are loaded from `TASKMUX_HOME/skills/<skill>/SKILL.md` and merged after the applicable TaskMux system Skill. Independent roles whose Leader workspace is a Git repository must have a recorded TaskMux Worktree before dispatch.
 
@@ -266,7 +266,7 @@ Configured role Skills are loaded from `TASKMUX_HOME/skills/<skill>/SKILL.md` an
 
 TaskMux maintains a global storage schema manifest at `schema.json` under the configured data directory. Normal task, agent, and role commands check that manifest on startup. Missing storage fails with `DATA_ERROR` and tells the user to run `taskmux setup`; normal commands do not initialize storage. If the local storage version is older than the CLI's latest storage version, the command fails with `DATA_ERROR` and tells the user to run `taskmux migrate`.
 
-`backup` creates a timestamped raw copy of the current TaskMux data under `backups/` while excluding older backups from the new copy.
+`backup` creates a timestamped raw copy of the current TaskMux data under `backups/` while excluding older backups from the new copy. It builds the copy under a private pending name and atomically publishes the completed backup.
 
 `migrate` runs storage migrations in version order after a schema manifest already exists, and updates `schema.json` after a successful upgrade. Missing storage is initialized by `setup`, not by `migrate`. When an older storage version is upgraded, TaskMux creates a backup before running migration steps and prints the backup path. Current task and agent stores only read and write the latest schema; older layouts are handled by migration scripts instead of fallback branches in business commands.
 
@@ -381,6 +381,20 @@ Custom agent records also use `schemaVersion: 1`:
 | 3 | TASK_NOT_FOUND / ROLE_NOT_FOUND / AGENT_NOT_FOUND | Requested task, role, or agent does not exist |
 | 4 | DATA_ERROR | Stored TaskMux data is unreadable or fails schema validation |
 | 5 | RUNTIME_ERROR | Unexpected runtime failure |
+
+## Testing
+
+The default suite uses fake executors plus an isolated real tmux server when tmux is installed:
+
+```sh
+npm test
+```
+
+Real CLI contract smoke checks are opt-in and do not start paid Agent work:
+
+```sh
+TASKMUX_SMOKE_CODEX=1 TASKMUX_SMOKE_CLAUDE=1 node --test test/agent-smoke.test.js
+```
 
 ## License
 

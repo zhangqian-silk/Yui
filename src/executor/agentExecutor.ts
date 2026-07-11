@@ -1,4 +1,4 @@
-export type AgentSessionStatus = "unknown" | "ready" | "running" | "stopped" | "broken";
+export type AgentSessionStatus = "unknown" | "reserved" | "ready" | "running" | "stopped" | "broken";
 
 export type AgentSession = {
   schemaVersion: 1;

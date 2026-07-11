@@ -39,7 +39,7 @@ export function processLeaderWakeups(
 
     let effectiveSession: AgentSession | null = session;
     try {
-      const mode = session === null ? "new" : "resume";
+      const mode = session === null || session.status === "reserved" ? "new" : "resume";
       const input = [
         `TaskMux wakeup reasons: ${wakeup.reasons.join(", ")}.`,
         `Run taskmux task context ${task.id} --format json, then continue Leader stewardship.`

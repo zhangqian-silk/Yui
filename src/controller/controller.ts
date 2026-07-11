@@ -1,5 +1,14 @@
 import { randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync
+} from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { CliError, dataError, type CliErrorCode } from "../errors/cliError.js";
@@ -9,7 +18,7 @@ import { mergePendingWakeup } from "../scheduler/pendingWakeup.js";
 import { FileTaskStore, type TaskStore } from "../storage/taskStore.js";
 import { NodeCommandRunner } from "../tmux/commandRunner.js";
 import { TmuxManager } from "../tmux/tmuxManager.js";
-import { runTaskCommand } from "../commands/taskCommands.js";
+import { recordTaskRoleAttached, rememberTask, runTaskCommand } from "../commands/taskCommands.js";
 import { runAgentCommand } from "../commands/agentCommands.js";
 import { runBoardCommand } from "../commands/boardCommands.js";
 import { runConfigCommand } from "../commands/configCommands.js";
@@ -17,9 +26,14 @@ import { runGlobalRoleCommand } from "../commands/globalRoleCommands.js";
 import { runRunnerCommand } from "../commands/runnerCommands.js";
 import { runImportCommand, runPruneCommand } from "../commands/maintenanceCommands.js";
 import { runBackupCommand } from "../commands/migrationCommands.js";
-import { replayPendingSnapshotWrites } from "../storage/recoveryJournal.js";
+import {
+  replayPendingDomainTransactions,
+  replayPendingSnapshotWrites
+} from "../storage/recoveryJournal.js";
 import { createResilientTaskStore, primeResilientTaskStore } from "../storage/resilientTaskStore.js";
 import { rebuildDerivedIndex } from "../storage/derivedIndex.js";
+import { executeDomainTransaction } from "../storage/domainTransaction.js";
+import type { DomainTransactionOperation } from "../storage/recoveryJournal.js";
 import { startTaskmuxFileWatcher } from "../storage/fileReloadWatcher.js";
 import { appendControllerDiagnostic } from "./controllerDiagnostics.js";
 
@@ -53,7 +67,11 @@ export async function serveController(rootDir: string): Promise<void> {
   const releaseLock = acquireControllerLock(rootDir, process.pid);
   let stopFileWatcher = (): void => undefined;
   try {
+    replayPendingDomainTransactions(rootDir);
     replayPendingSnapshotWrites(rootDir);
+    const rpcResultRetention = readRpcResultRetention(process.env.TASKMUX_RPC_RESULT_RETENTION_MS);
+    pruneRpcResults(rootDir, new Date(), rpcResultRetention);
+    rmSync(join(rootDir, "runtime", "domain-workspaces"), { recursive: true, force: true });
     const token = randomBytes(32).toString("hex");
     const store = createResilientTaskStore(
       new FileTaskStore(rootDir),
@@ -108,12 +126,25 @@ export async function serveController(rootDir: string): Promise<void> {
     const agentRunTtl = readAgentRunTtl(process.env.TASKMUX_AGENT_RUN_TTL_MS);
     const scan = (): void => {
       try {
-        expireStaleAgentRuns(store, new Date(), agentRunTtl);
-        failExitedAgentRuns(store, tmux, new Date());
-        scanTaskWakeups(store, new Date());
-        processLeaderWakeups(store, tmux, new Date());
+        runSchedulerTransaction(rootDir, tmux, new Date(), agentRunTtl, true);
+        pruneRpcResults(rootDir, new Date(), rpcResultRetention);
         refreshDerivedState();
       } catch (error) {
+        if (error instanceof CliError && error.code === "DATA_ERROR") {
+          try {
+            appendControllerDiagnostic(
+              rootDir,
+              "scheduler.last_valid_fallback",
+              error.message
+            );
+            runSchedulerPass(store, tmux, new Date(), agentRunTtl, true);
+            pruneRpcResults(rootDir, new Date(), rpcResultRetention);
+            refreshDerivedState();
+            return;
+          } catch (fallbackError) {
+            error = fallbackError;
+          }
+        }
         appendControllerDiagnostic(
           rootDir,
           "scheduler.scan_failed",
@@ -147,6 +178,36 @@ export async function serveController(rootDir: string): Promise<void> {
     removeControllerDiscovery(rootDir);
     releaseLock();
   }
+}
+
+export function runSchedulerTransaction(
+  rootDir: string,
+  tmux: TmuxManager,
+  now: Date,
+  agentRunTtl: number,
+  processWakeups: boolean
+): number {
+  const transactionId = `scheduler-${now.getTime()}-${randomBytes(6).toString("hex")}`;
+  return executeDomainTransaction(rootDir, transactionId, (workingRoot) => {
+    const transactionStore = new FileTaskStore(workingRoot);
+    return runSchedulerPass(transactionStore, tmux, now, agentRunTtl, processWakeups);
+  });
+}
+
+function runSchedulerPass(
+  store: TaskStore,
+  tmux: TmuxManager,
+  now: Date,
+  agentRunTtl: number,
+  processWakeups: boolean
+): number {
+  expireStaleAgentRuns(store, now, agentRunTtl);
+  failExitedAgentRuns(store, tmux, now);
+  const queued = scanTaskWakeups(store, now);
+  if (processWakeups) {
+    processLeaderWakeups(store, tmux, now);
+  }
+  return queued.length;
 }
 
 export function acquireControllerLock(rootDir: string, pid: number): () => void {
@@ -322,6 +383,13 @@ async function handleRequest(
       });
       return;
     }
+    if (hasRpcTombstone(rootDir, rpc.requestId)) {
+      sendJson(response, 409, {
+        requestId: rpc.requestId,
+        error: `Request ${rpc.requestId} expired from the result cache and will not be reapplied.`
+      });
+      return;
+    }
 
     if (rpc.method === "wakeup.merge") {
       if (
@@ -345,20 +413,25 @@ async function handleRequest(
         sendJson(response, 409, { error: `Cannot wake archived task: ${task.id}` });
         return;
       }
+      const wakeupReason = rpc.params.reason;
 
-      writeRpcIntent(rootDir, rpc.requestId, rpc.method);
-
-      const wakeup = mergePendingWakeup(
-        task.id,
-        rpc.params.reason,
-        new Date(),
-        store.getPendingWakeup(task.id)
+      const body = executeRpcTransaction(
+        rootDir,
+        rpc,
+        refreshDerivedState,
+        (workingRoot) => {
+          const transactionStore = new FileTaskStore(workingRoot);
+          const wakeup = mergePendingWakeup(
+            task.id,
+            wakeupReason,
+            new Date(),
+            transactionStore.getPendingWakeup(task.id)
+          );
+          transactionStore.savePendingWakeup(wakeup);
+          processLeaderWakeups(transactionStore, tmux, new Date());
+          return { requestId: rpc.requestId, result: { wakeup } };
+        }
       );
-      store.savePendingWakeup(wakeup);
-      processLeaderWakeups(store, tmux, new Date());
-      const body = { requestId: rpc.requestId, result: { wakeup } };
-      writeRpcResult(rootDir, rpc.requestId, body);
-      clearRpcIntent(rootDir, rpc.requestId);
       sendJson(response, 200, body);
       return;
     }
@@ -378,14 +451,87 @@ async function handleRequest(
         sendJson(response, 400, { error: "Interactive task commands cannot run through RPC." });
         return;
       }
+      const commandArgs = rpc.params.args;
+      if (isTaskPointerCommand(commandArgs)) {
+        const taskId = commandArgs[1] ?? "";
+        const output = runTaskCommand(commandArgs, store, tmux, { rememberTaskReads: false });
+        const body = executeRpcTransaction(
+          rootDir,
+          rpc,
+          refreshDerivedState,
+          (workingRoot) => {
+            rememberTask(new FileTaskStore(workingRoot), taskId);
+            return { requestId: rpc.requestId, result: { output } };
+          }
+        );
+        sendJson(response, 200, body);
+        return;
+      }
+      if (isReadOnlyTaskCommand(commandArgs)) {
+        const output = runTaskCommand(commandArgs, store, tmux);
+        sendJson(response, 200, { requestId: rpc.requestId, result: { output } });
+        return;
+      }
 
-      writeRpcIntent(rootDir, rpc.requestId, rpc.method);
-      const output = runTaskCommand(rpc.params.args, store, tmux);
-      processLeaderWakeups(store, tmux, new Date());
-      refreshDerivedState();
-      const body = { requestId: rpc.requestId, result: { output } };
-      writeRpcResult(rootDir, rpc.requestId, body);
-      clearRpcIntent(rootDir, rpc.requestId);
+      const body = executeRpcTransaction(
+        rootDir,
+        rpc,
+        refreshDerivedState,
+        (workingRoot) => {
+          const transactionStore = new FileTaskStore(workingRoot);
+          const output = runTaskCommand(commandArgs, transactionStore, tmux);
+          processLeaderWakeups(transactionStore, tmux, new Date());
+          return { requestId: rpc.requestId, result: { output } };
+        }
+      );
+      sendJson(response, 200, body);
+      return;
+    }
+
+    if (rpc.method === "task.attach-complete") {
+      if (
+        typeof rpc.params !== "object" ||
+        rpc.params === null ||
+        !("taskId" in rpc.params) || typeof rpc.params.taskId !== "string" ||
+        !("roleName" in rpc.params) || typeof rpc.params.roleName !== "string"
+      ) {
+        sendJson(response, 400, { error: "task.attach-complete requires taskId and roleName." });
+        return;
+      }
+      const taskId = rpc.params.taskId;
+      const roleName = rpc.params.roleName;
+      const body = executeRpcTransaction(
+        rootDir,
+        rpc,
+        refreshDerivedState,
+        (workingRoot) => {
+          recordTaskRoleAttached(taskId, roleName, new FileTaskStore(workingRoot));
+          return { requestId: rpc.requestId, result: {} };
+        }
+      );
+      sendJson(response, 200, body);
+      return;
+    }
+
+    if (rpc.method === "scheduler.scan") {
+      const now = new Date();
+      const body = executeRpcTransaction(
+        rootDir,
+        rpc,
+        refreshDerivedState,
+        (workingRoot) => {
+          const transactionStore = new FileTaskStore(workingRoot);
+          expireStaleAgentRuns(
+            transactionStore,
+            now,
+            readAgentRunTtl(process.env.TASKMUX_AGENT_RUN_TTL_MS)
+          );
+          failExitedAgentRuns(transactionStore, tmux, now);
+          const queued = scanTaskWakeups(transactionStore, now).length;
+          const output = `Queued ${queued} task wakeup${queued === 1 ? "" : "s"}\n`;
+          return { requestId: rpc.requestId, result: { output } };
+        }
+      );
       sendJson(response, 200, body);
       return;
     }
@@ -403,13 +549,38 @@ async function handleRequest(
         sendJson(response, 400, { error: "command.execute requires group and a string args array." });
         return;
       }
+      const commandGroup = rpc.params.group;
+      const commandArgs = rpc.params.args;
+      if (isReadOnlyControllerCommand(commandGroup, commandArgs)) {
+        const output = runControllerCommandGroup(commandGroup, commandArgs, store, rootDir);
+        sendJson(response, 200, { requestId: rpc.requestId, result: { output } });
+        return;
+      }
 
-      writeRpcIntent(rootDir, rpc.requestId, rpc.method);
-      const output = runControllerCommandGroup(rpc.params.group, rpc.params.args, store, rootDir);
-      refreshDerivedState();
-      const body = { requestId: rpc.requestId, result: { output } };
-      writeRpcResult(rootDir, rpc.requestId, body);
-      clearRpcIntent(rootDir, rpc.requestId);
+      let body: { requestId: string; result: { output: string } };
+      if (commandGroup === "backup") {
+        writeRpcIntent(rootDir, rpc.requestId, rpc.method);
+        body = runDirectControllerCommand(rootDir, rpc.requestId, commandGroup, commandArgs, store);
+        clearRpcIntent(rootDir, rpc.requestId);
+        refreshDerivedState();
+      } else {
+        body = executeRpcTransaction(
+            rootDir,
+            rpc,
+            refreshDerivedState,
+            (workingRoot) => {
+              const transactionStore = new FileTaskStore(workingRoot);
+              const output = runControllerCommandGroup(
+                commandGroup,
+                commandArgs,
+                transactionStore,
+                workingRoot
+              );
+              return { requestId: rpc.requestId, result: { output } };
+            },
+            { includeBackups: commandGroup === "prune" }
+          );
+      }
       sendJson(response, 200, body);
       return;
     }
@@ -422,6 +593,67 @@ async function handleRequest(
         : error instanceof Error ? error.message : String(error)
     });
   }
+}
+
+function executeRpcTransaction<T>(
+  rootDir: string,
+  rpc: RpcRequest & { requestId: string },
+  refreshDerivedState: () => void,
+  execute: (workingRoot: string) => T,
+  options: { includeBackups?: boolean } = {}
+): T {
+  writeRpcIntent(rootDir, rpc.requestId, rpc.method);
+  const result = executeDomainTransaction(
+    rootDir,
+    rpc.requestId,
+    execute,
+    (body) => [rpcResultOperation(rootDir, rpc.requestId, body)],
+    options
+  );
+  clearRpcIntent(rootDir, rpc.requestId);
+  refreshDerivedState();
+  return result;
+}
+
+function isReadOnlyTaskCommand(args: string[]): boolean {
+  const command = args[0] ?? "";
+  if ([
+    "list", "board", "last", "roles",
+    "comments", "events", "activity", "timeline", "tail", "detail"
+  ].includes(command)) {
+    return true;
+  }
+  if (command === "current") {
+    return args.length === 1;
+  }
+  return command === "topic" && args[1] === "list";
+}
+
+function isTaskPointerCommand(args: string[]): boolean {
+  return ["show", "open", "context"].includes(args[0] ?? "");
+}
+
+function isReadOnlyControllerCommand(group: string, args: string[]): boolean {
+  if (group === "board") {
+    return true;
+  }
+  if (group === "config") {
+    return args[0] === "show";
+  }
+  return ["agent", "runner", "role"].includes(group) && ["list", "show"].includes(args[0] ?? "");
+}
+
+function runDirectControllerCommand(
+  rootDir: string,
+  requestId: string,
+  group: string,
+  args: string[],
+  store: TaskStore
+): { requestId: string; result: { output: string } } {
+  const output = runControllerCommandGroup(group, args, store, rootDir);
+  const body = { requestId, result: { output } };
+  writeRpcResult(rootDir, requestId, body);
+  return body;
 }
 
 function runControllerCommandGroup(
@@ -475,6 +707,18 @@ function writeRpcResult(rootDir: string, requestId: string, body: unknown): void
   renameSync(temporary, target);
 }
 
+function rpcResultOperation(
+  rootDir: string,
+  requestId: string,
+  body: unknown
+): DomainTransactionOperation {
+  return {
+    type: "write",
+    target: rpcResultFile(rootDir, requestId),
+    content: `${JSON.stringify(body, null, 2)}\n`
+  };
+}
+
 function readRpcIntent(rootDir: string, requestId: string): unknown | null {
   try {
     return JSON.parse(readFileSync(rpcIntentFile(rootDir, requestId), "utf8")) as unknown;
@@ -510,6 +754,73 @@ function rpcIntentFile(rootDir: string, requestId: string): string {
 
 function rpcResultFile(rootDir: string, requestId: string): string {
   return join(rootDir, "runtime", "rpc-results", `${requestId}.json`);
+}
+
+function readRpcResultRetention(value: string | undefined): number {
+  const parsed = Number(value ?? 30 * 24 * 60 * 60 * 1_000);
+  return Number.isFinite(parsed) && parsed >= 1_000
+    ? parsed
+    : 30 * 24 * 60 * 60 * 1_000;
+}
+
+function pruneRpcResults(rootDir: string, now: Date, retentionMs: number): void {
+  const directory = join(rootDir, "runtime", "rpc-results");
+  let names: string[];
+  try {
+    names = readdirSync(directory).filter((name) => name.endsWith(".json"));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+  for (const name of names) {
+    const path = join(directory, name);
+    if (now.getTime() - statSync(path).mtimeMs < retentionMs) {
+      continue;
+    }
+    const requestId = name.slice(0, -5);
+    appendRpcTombstone(rootDir, requestId, now);
+    rmSync(path, { force: true });
+  }
+}
+
+function hasRpcTombstone(rootDir: string, requestId: string): boolean {
+  return readRpcTombstones(rootDir).some((entry) => entry.requestId === requestId);
+}
+
+function appendRpcTombstone(rootDir: string, requestId: string, now: Date): void {
+  const entries = readRpcTombstones(rootDir);
+  if (entries.some((entry) => entry.requestId === requestId)) {
+    return;
+  }
+  const target = join(rootDir, "runtime", "rpc-tombstones.jsonl");
+  const temporary = `${target}.${process.pid}.tmp`;
+  mkdirSync(join(rootDir, "runtime"), { recursive: true });
+  const content = [
+    ...entries,
+    { schemaVersion: 1, requestId, expiredAt: now.toISOString() }
+  ].map((entry) => JSON.stringify(entry)).join("\n").concat("\n");
+  writeFileSync(temporary, content, { mode: 0o600 });
+  renameSync(temporary, target);
+}
+
+function readRpcTombstones(rootDir: string): Array<{
+  schemaVersion: 1;
+  requestId: string;
+  expiredAt: string;
+}> {
+  try {
+    return readFileSync(join(rootDir, "runtime", "rpc-tombstones.jsonl"), "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line) as { schemaVersion: 1; requestId: string; expiredAt: string });
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
 }
 
 async function readRequestBody(request: IncomingMessage): Promise<string> {

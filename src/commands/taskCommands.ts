@@ -11,7 +11,7 @@ import { createTaskEvent } from "../event/taskEvent.js";
 import { createTaskInputDraft } from "../input/taskInput.js";
 import { createMilestone, renderMilestoneTimelineEntry } from "../milestone/milestone.js";
 import { recordAgentSession } from "../executor/agentExecutor.js";
-import { resolveAgentExecutor } from "../executor/executorRegistry.js";
+import { reserveInitialAgentSession, resolveAgentExecutor } from "../executor/executorRegistry.js";
 import type { DispatchMode } from "../executor/launchPlan.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { copyGlobalRoleToTaskRole, createRole, updateRole, updateRoleStatus } from "../role/role.js";
@@ -37,7 +37,12 @@ import type { TmuxManager } from "../tmux/tmuxManager.js";
 
 const BUILTIN_LEADER_ROLE = SYSTEM_LEADER_ROLE;
 
-export function runTaskCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
+export function runTaskCommand(
+  args: string[],
+  store: TaskStore,
+  tmux?: TmuxManager,
+  options: { persistAttachStatus?: boolean; rememberTaskReads?: boolean } = {}
+): string {
   const [command, ...rest] = args;
 
   switch (command) {
@@ -48,7 +53,7 @@ export function runTaskCommand(args: string[], store: TaskStore, tmux?: TmuxMana
     case "board":
       return boardTaskCommand(rest, store);
     case "show":
-      return showTaskCommand(rest, store);
+      return showTaskCommand(rest, store, options.rememberTaskReads !== false);
     case "current":
       return currentTaskCommand(rest, store);
     case "last":
@@ -62,9 +67,9 @@ export function runTaskCommand(args: string[], store: TaskStore, tmux?: TmuxMana
     case "unarchive":
       return updateTaskArchivedCommand(rest, store, false);
     case "open":
-      return openTaskCommand(rest, store);
+      return openTaskCommand(rest, store, options.rememberTaskReads !== false);
     case "context":
-      return contextTaskCommand(rest, store);
+      return contextTaskCommand(rest, store, options.rememberTaskReads !== false);
     case "delete":
       return deleteTaskCommand(rest, store);
     case "restore":
@@ -80,7 +85,7 @@ export function runTaskCommand(args: string[], store: TaskStore, tmux?: TmuxMana
     case "roles":
       return listTaskRolesCommand(rest, store);
     case "enter":
-      return enterTaskRoleCommand(rest, store, tmux);
+      return enterTaskRoleCommand(rest, store, tmux, options.persistAttachStatus !== false);
     case "tail":
       return tailTaskRoleCommand(rest, store, tmux);
     case "detail":
@@ -412,7 +417,12 @@ function dispatchTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxMa
   }
 
   const session = store.getAgentSession(taskId, roleName);
-  if (roleName === BUILTIN_LEADER_ROLE && session !== null && mode === "new") {
+  if (
+    roleName === BUILTIN_LEADER_ROLE &&
+    session !== null &&
+    session.status !== "reserved" &&
+    mode === "new"
+  ) {
     throw usageError("The Leader must resume its fixed session; replace it explicitly if irrecoverable.");
   }
 
@@ -878,6 +888,13 @@ function createTaskCommand(args: string[], store: TaskStore): string {
   rememberTask(store, task.id);
   recordTaskEvent(store, task.id, "task.created", { title: task.title });
   assignedRoles.forEach((role) => saveRoleAndRecordEvent(task.id, role, store));
+  const leader = assignedRoles.find((role) => role.name === BUILTIN_LEADER_ROLE);
+  if (leader !== undefined) {
+    const reservation = reserveInitialAgentSession(task.id, leader, new Date());
+    if (reservation !== null) {
+      store.saveAgentSession(reservation);
+    }
+  }
   if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
     queueLeaderWakeup(store, task.id, "task-created");
   }
@@ -914,7 +931,7 @@ function boardTaskCommand(args: string[], store: TaskStore): string {
   return renderTaskBoard(tasks, store, options.withRoles);
 }
 
-function showTaskCommand(args: string[], store: TaskStore): string {
+function showTaskCommand(args: string[], store: TaskStore, remember: boolean): string {
   const [id] = args;
 
   if (id === undefined || id.trim().length === 0) {
@@ -927,7 +944,9 @@ function showTaskCommand(args: string[], store: TaskStore): string {
     throw taskNotFound(id);
   }
 
-  rememberTask(store, task.id);
+  if (remember) {
+    rememberTask(store, task.id);
+  }
 
   return [
     `Task: ${task.id}`,
@@ -1054,7 +1073,7 @@ function updateTaskCommand(args: string[], store: TaskStore): string {
   return `Updated task ${updatedTask.id}\n`;
 }
 
-function openTaskCommand(args: string[], store: TaskStore): string {
+function openTaskCommand(args: string[], store: TaskStore, remember: boolean): string {
   const [id] = args;
 
   if (id === undefined || id.trim().length === 0) {
@@ -1067,7 +1086,9 @@ function openTaskCommand(args: string[], store: TaskStore): string {
     throw taskNotFound(id);
   }
 
-  rememberTask(store, task.id);
+  if (remember) {
+    rememberTask(store, task.id);
+  }
 
   return [
     `Task: ${task.id}`,
@@ -1080,7 +1101,7 @@ function openTaskCommand(args: string[], store: TaskStore): string {
   ].join("\n").concat("\n");
 }
 
-function contextTaskCommand(args: string[], store: TaskStore): string {
+function contextTaskCommand(args: string[], store: TaskStore, remember: boolean): string {
   const [taskId, ...rest] = args;
 
   if (taskId === undefined || taskId.trim().length === 0) {
@@ -1093,7 +1114,9 @@ function contextTaskCommand(args: string[], store: TaskStore): string {
     throw taskNotFound(taskId);
   }
 
-  rememberTask(store, task.id);
+  if (remember) {
+    rememberTask(store, task.id);
+  }
 
   const options = parseTaskContextOptions(rest);
   const context = buildTaskContext(task, store, options.includeTranscripts);
@@ -1452,7 +1475,12 @@ function listTaskRolesCommand(args: string[], store: TaskStore): string {
   return `${renderRoleTable(`Task roles: ${taskId}`, roles)}\n`;
 }
 
-function enterTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
+function enterTaskRoleCommand(
+  args: string[],
+  store: TaskStore,
+  tmux: TmuxManager | undefined,
+  persistStatus: boolean
+): string {
   const roleLookup = findRole(args, store);
 
   if (typeof roleLookup === "string") {
@@ -1464,9 +1492,22 @@ function enterTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManag
   }
 
   tmux.enterRole(roleLookup.taskId, roleLookup.role);
-  store.saveRole(roleLookup.taskId, updateRoleStatus(roleLookup.role, "running", new Date()));
+  if (persistStatus) {
+    recordTaskRoleAttached(roleLookup.taskId, roleLookup.role.name, store);
+  }
 
   return `Attached role ${roleLookup.role.name} for ${roleLookup.taskId}\n`;
+}
+
+export function recordTaskRoleAttached(taskId: string, roleName: string, store: TaskStore): void {
+  if (store.getTask(taskId) === null) {
+    throw taskNotFound(taskId);
+  }
+  const role = store.getRole(taskId, roleName);
+  if (role === null) {
+    throw roleNotFound(roleName);
+  }
+  store.saveRole(taskId, updateRoleStatus(role, "running", new Date()));
 }
 
 function tailTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
@@ -2142,7 +2183,7 @@ function requireWorkspace(workspace: string | undefined): string {
   throw usageError("--workspace is required.");
 }
 
-function rememberTask(store: TaskStore, taskId: string, options: { current?: boolean } = {}): void {
+export function rememberTask(store: TaskStore, taskId: string, options: { current?: boolean } = {}): void {
   const config = store.getConfig();
 
   store.saveConfig({

@@ -1,4 +1,4 @@
-import { cpSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export type StorageBackupResult = {
@@ -12,22 +12,33 @@ export function createStorageBackup(rootDir: string, now = new Date()): StorageB
   const id = `backup-${createdAt.replaceAll(":", "-").replaceAll(".", "-")}`;
   const backupRoot = join(rootDir, "backups");
   const backupPath = join(backupRoot, id);
+  const pendingPath = join(backupRoot, `.pending-${id}-${process.pid}`);
   const entries = readdirSync(rootDir, { withFileTypes: true });
 
-  mkdirSync(backupPath, { recursive: true });
+  mkdirSync(pendingPath, { recursive: true });
 
-  for (const entry of entries) {
-    if (entry.name === "backups") {
-      continue;
+  try {
+    for (const entry of entries) {
+      if (entry.name === "backups") {
+        continue;
+      }
+
+      cpSync(join(rootDir, entry.name), join(pendingPath, entry.name), { recursive: true });
     }
 
-    cpSync(join(rootDir, entry.name), join(backupPath, entry.name), { recursive: true });
-  }
+    writeFileSync(
+      join(pendingPath, "backup.json"),
+      `${JSON.stringify({ schemaVersion: 1, id, createdAt, source: rootDir }, null, 2)}\n`
+    );
 
-  writeFileSync(
-    join(backupPath, "backup.json"),
-    `${JSON.stringify({ schemaVersion: 1, id, createdAt, source: rootDir }, null, 2)}\n`
-  );
+    if (process.env.TASKMUX_BACKUP_FAILPOINT === "before-publish") {
+      throw new Error(`Backup ${id} stopped before publish.`);
+    }
+    renameSync(pendingPath, backupPath);
+  } catch (error) {
+    rmSync(pendingPath, { recursive: true, force: true });
+    throw error;
+  }
 
   return {
     id,

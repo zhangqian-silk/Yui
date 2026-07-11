@@ -1,15 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
+  acquireControllerLock,
   callController,
   isProcessAlive,
   readControllerDiscovery,
   removeControllerDiscovery,
+  runSchedulerTransaction,
   serveController
 } from "../controller/controller.js";
 import { runtimeError, usageError } from "../errors/cliError.js";
-import { expireStaleAgentRuns, failExitedAgentRuns, readAgentRunTtl, scanTaskWakeups } from "../scheduler/inactivityScanner.js";
-import { FileTaskStore } from "../storage/taskStore.js";
+import { readAgentRunTtl } from "../scheduler/inactivityScanner.js";
 import { NodeCommandRunner } from "../tmux/commandRunner.js";
 import { TmuxManager } from "../tmux/tmuxManager.js";
 
@@ -43,16 +44,25 @@ export async function runControllerCommand(
   }
 
   if (command === "scan" && rest.length === 0) {
-    const store = new FileTaskStore(rootDir);
-    const now = new Date();
-    expireStaleAgentRuns(store, now, readAgentRunTtl(env.TASKMUX_AGENT_RUN_TTL_MS));
-    failExitedAgentRuns(
-      store,
-      new TmuxManager(env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandRunner()),
-      now
-    );
-    const queued = scanTaskWakeups(store, now);
-    return `Queued ${queued.length} task wakeup${queued.length === 1 ? "" : "s"}\n`;
+    const discovery = readControllerDiscovery(rootDir);
+    if (discovery !== null && isProcessAlive(discovery.pid)) {
+      const result = await callController(discovery, "scheduler.scan", randomUUID()) as { output: string };
+      return result.output;
+    }
+    const tmux = new TmuxManager(env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandRunner());
+    const release = acquireControllerLock(rootDir, process.pid);
+    try {
+      const queued = runSchedulerTransaction(
+        rootDir,
+        tmux,
+        new Date(),
+        readAgentRunTtl(env.TASKMUX_AGENT_RUN_TTL_MS),
+        false
+      );
+      return `Queued ${queued} task wakeup${queued === 1 ? "" : "s"}\n`;
+    } finally {
+      release();
+    }
   }
 
   throw usageError("Controller usage: taskmux controller start|status [--json]|stop|scan.");

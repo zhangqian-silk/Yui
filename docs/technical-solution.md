@@ -316,7 +316,7 @@ Invalid records raise `DATA_ERROR` instead of being skipped silently.
 
 Controller-backed reads wrap `FileTaskStore` with `createResilientTaskStore`. The wrapper refreshes cached values after valid reads and returns the method's last valid value when a later direct edit fails schema validation. Startup and file-watcher refreshes prime individual Task, role, Cycle, WorkItem, milestone, decision, session, and runner lookup paths. Invalid edits remain untouched and are recorded in `runtime/logs/controller.jsonl`.
 
-Snapshot writes use `src/storage/recoveryJournal.ts`. Each write first stages a complete target-relative payload under `runtime/recovery-journal/`, atomically replaces the snapshot, and removes the staged record. Controller startup replays any records left by an interrupted process before accepting requests.
+Snapshot writes use `src/storage/recoveryJournal.ts`. Each write first stages a complete target-relative payload under `runtime/recovery-journal/`, atomically replaces the snapshot, and removes the staged record. `src/storage/domainTransaction.ts` runs multi-file commands against an isolated authoritative-state workspace, derives complete file and directory write/delete operations, and stages them under `runtime/domain-transactions/`. Controller startup replays domain transactions before individual snapshot writes, so a crash during application converges to the complete committed state.
 
 `src/storage/derivedIndex.ts` rebuilds `runtime/index.sqlite` from authoritative files. The index contains Task, role, and WorkItem lookup tables only; it is refreshed on startup, Controller mutations, scheduler scans, and valid file-watcher reloads. A missing or corrupt index is deleted and rebuilt without changing Task data.
 
@@ -328,7 +328,7 @@ Storage migrations live under `src/storage/migrations/` and are registered by th
 
 `taskmux migrate --dry-run` uses the schema inspector only. It does not call the migration runner, create backups, or write the manifest.
 
-`src/storage/storageBackup.ts` owns raw storage backups. `taskmux backup` creates `backups/backup-<timestamp>/` under the TaskMux home and copies all current storage entries except `backups/`. `taskmux migrate` creates a backup before applying migrations from an older schema version and includes that backup path in command output.
+`src/storage/storageBackup.ts` owns raw storage backups. `taskmux backup` creates the copy under a private pending directory, copies all current storage entries except `backups/`, writes its manifest, and atomically renames it to `backups/backup-<timestamp>/`. `taskmux migrate` creates a backup before applying migrations from an older schema version and includes that backup path in command output.
 
 `src/commands/maintenanceCommands.ts` owns export, import, and prune. Export builds a JSON snapshot through store APIs. Import restores config, custom agents, global role presets, tasks, task roles, transcripts, comments, and events through the same store write APIs. Prune removes trash task directories and old backup directories by filesystem path under the configured TaskMux home.
 
@@ -357,7 +357,9 @@ Controller infrastructure diagnostics are append-only JSONL records under `runti
 
 Agent-specific start and recovery command construction lives behind the common `AgentExecutor` contract. The contract also owns send, interrupt, stop, status mapping, native session discovery, metadata attachment, and capabilities; `TmuxManager` supplies the isolated runtime operations.
 
-Controller RPC writes stage a durable request intent before mutation. A retry with a completed result returns the cached result; a retry whose intent survived without a result returns an explicit unknown-outcome conflict instead of reapplying a potentially completed mutation. Backup, import, prune, and non-attach Task shell commands use the same Controller single-writer boundary.
+Controller RPC writes stage a durable request intent before mutation. The domain transaction includes the cached RPC result, so startup replay restores both state and the response without rerunning the command. A surviving intent without a committed result returns an explicit unknown-outcome conflict. Results expire after 30 days by default (`TASKMUX_RPC_RESULT_RETENTION_MS`); compact tombstones prevent expired request IDs from ever being reapplied. CLI commands, Dashboard commands, Task Shell mutations, Scheduler scans, attach status, import, prune, and backup share the Controller single-writer boundary; setup and migration remain explicit lifecycle operations.
+
+Claude session IDs are reserved before the first launch and the reserved session uses `--session-id`. Codex assigns new interactive thread IDs internally, so its first dispatch injects a registration command using `CODEX_THREAD_ID`; all later Leader wakeups recover that fixed registered session.
 
 Leader recovery failures create durable Operator notifications and best-effort alerts in the protected Operator tmux session. Explicitly recording or replacing the fixed Leader session clears the failure pause and notification before wakeup processing resumes.
 
@@ -369,4 +371,4 @@ Leader recovery failures create durable Operator notifications and best-effort a
 
 Domain behavior should be tested without requiring tmux. Tmux command construction and process integration should be isolated behind interfaces so unit tests can use fakes.
 
-End-to-end tmux tests should be added only after the command surface and tmux manager interface stabilize.
+The integration suite uses an isolated real tmux server for multi-role window and cwd isolation. Real Codex and Claude CLI contract checks are opt-in through `TASKMUX_SMOKE_CODEX=1` and `TASKMUX_SMOKE_CLAUDE=1`; they inspect local CLI session flags without starting Agent work.

@@ -338,7 +338,7 @@ async function main(): Promise<void> {
       const discovery = await ensureControllerRunning(rootDir, process.env);
       await runTaskShell(taskId, store, tmux, async (commandArgs) => {
         if (commandArgs[0] === "enter") {
-          return runTaskCommand(commandArgs, store, tmux);
+          return attachTaskRoleThroughController(commandArgs, store, tmux, discovery);
         }
         const result = await callController(
           discovery,
@@ -348,6 +348,12 @@ async function main(): Promise<void> {
         ) as { output: string };
         return result.output;
       });
+      return;
+    }
+
+    if (taskArgs[0] === "enter" && process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
+      const discovery = await ensureControllerRunning(rootDir, process.env);
+      emit(await attachTaskRoleThroughController(taskArgs, store, tmux, discovery));
       return;
     }
 
@@ -370,6 +376,21 @@ async function main(): Promise<void> {
   }
 
   emit(usage);
+}
+
+async function attachTaskRoleThroughController(
+  commandArgs: string[],
+  store: FileTaskStore,
+  tmux: TmuxManager,
+  discovery: Awaited<ReturnType<typeof ensureControllerRunning>>
+): Promise<string> {
+  const [, taskId, roleName] = commandArgs;
+  if (taskId === undefined || roleName === undefined) {
+    return runTaskCommand(commandArgs, store, tmux);
+  }
+  const output = runTaskCommand(commandArgs, store, tmux, { persistAttachStatus: false });
+  await callController(discovery, "task.attach-complete", randomUUID(), { taskId, roleName });
+  return output;
 }
 
 function emit(output: string): void {
@@ -480,7 +501,23 @@ async function runDefaultDashboard(rootDir: string): Promise<void> {
   const store = new FileTaskStore(rootDir);
   const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", commandRunner);
 
-  await runDashboard(store, tmux);
+  if (process.env.TASKMUX_CONTROLLER_MODE === "direct") {
+    await runDashboard(store, tmux);
+    return;
+  }
+  const discovery = await ensureControllerRunning(rootDir, process.env);
+  await runDashboard(store, tmux, async (commandArgs) => {
+    if (commandArgs[0] === "enter") {
+      return attachTaskRoleThroughController(commandArgs, store, tmux, discovery);
+    }
+    const result = await callController(
+      discovery,
+      "task.command",
+      randomUUID(),
+      { args: commandArgs }
+    ) as { output: string };
+    return result.output;
+  });
 }
 
 function readPackageVersion(): string {
