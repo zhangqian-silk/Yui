@@ -34,7 +34,6 @@ import { createResilientTaskStore, primeResilientTaskStore } from "../storage/re
 import { rebuildDerivedIndex } from "../storage/derivedIndex.js";
 import { executeDomainTransaction } from "../storage/domainTransaction.js";
 import type { DomainTransactionOperation } from "../storage/recoveryJournal.js";
-import { startTaskmuxFileWatcher } from "../storage/fileReloadWatcher.js";
 import { appendControllerDiagnostic } from "./controllerDiagnostics.js";
 
 export const CONTROLLER_API_VERSION = 1;
@@ -65,7 +64,6 @@ export async function serveController(rootDir: string): Promise<void> {
 
   removeControllerDiscovery(rootDir);
   const releaseLock = acquireControllerLock(rootDir, process.pid);
-  let stopFileWatcher = (): void => undefined;
   try {
     replayPendingDomainTransactions(rootDir);
     replayPendingSnapshotWrites(rootDir);
@@ -88,15 +86,6 @@ export async function serveController(rootDir: string): Promise<void> {
       rebuildDerivedIndex(rootDir, store);
     };
     refreshDerivedState();
-    stopFileWatcher = startTaskmuxFileWatcher(
-      rootDir,
-      refreshDerivedState,
-      (error) => appendControllerDiagnostic(
-        rootDir,
-        "storage.reload_failed",
-        error instanceof Error ? error.message : String(error)
-      )
-    );
     const server = createServer((request, response) => {
       void handleRequest(request, response, token, rootDir, store, tmux, refreshDerivedState);
     });
@@ -174,7 +163,6 @@ export async function serveController(rootDir: string): Promise<void> {
       process.once("SIGINT", stop);
     });
   } finally {
-    stopFileWatcher();
     removeControllerDiscovery(rootDir);
     releaseLock();
   }
