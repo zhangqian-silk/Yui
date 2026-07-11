@@ -51,39 +51,11 @@ taskmux task enter task-1 leader
 
 ## How it works
 
-```mermaid
-flowchart LR
-    User[User] --> CLI[CLI / Operator]
-    CLI --> Controller[Local Controller]
-    Scheduler[Scheduler] --> Controller
-    Controller --> Files[(Authoritative local files)]
-    Controller --> Index[(Derived SQLite index)]
-    Controller --> Tmux[tmux runtime]
-    Tmux --> Leader[Leader session]
-    Tmux --> Workers[Independent role sessions]
-    Workers -->|yield| Controller
-    Controller -->|coalesced wakeup| Leader
-```
+![TaskMux architecture: User and Scheduler connect through the local Controller to durable files, a derived index, and tmux Agent sessions.](assets/taskmux-architecture.png)
 
 The Controller is the single mutation boundary. It starts on demand, listens only on loopback, and coordinates persistence, scheduling, Agent dispatch, and tmux state.
 
-```mermaid
-sequenceDiagram
-    actor User
-    participant Operator
-    participant Controller
-    participant Leader
-    participant Worker
-
-    User->>Operator: Create or update a Task
-    Operator->>Controller: Validated CLI command
-    Controller->>Leader: Start or recover the fixed session
-    Leader->>Controller: Create WorkItem and dispatch role
-    Controller->>Worker: Start or recover native Agent session
-    Worker->>Controller: Yield durable result
-    Controller->>Leader: Wake once with coalesced reasons
-    Leader->>Controller: Curate outcome and next focus
-```
+![TaskMux workflow: a long-running Task advances through input, Leader planning, finite WorkItems, Worker execution, durable yield, and the next Cycle.](assets/taskmux-workflow.png)
 
 ## Core concepts
 
