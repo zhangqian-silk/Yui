@@ -16,8 +16,8 @@ help:
 	@printf '%s\n' '  make lint          Run TypeScript no-emit check'
 	@printf '%s\n' '  make test          Run full test suite'
 	@printf '%s\n' '  make check         Run build, lint, and tests'
-	@printf '%s\n' '  make link          Build and npm-link this checkout globally'
-	@printf '%s\n' '  make unlink        Remove the global npm link for this package'
+	@printf '%s\n' '  make link          Link taskmux and install isolated taskmux-dev locally'
+	@printf '%s\n' '  make unlink        Remove the global taskmux link and local taskmux-dev launcher'
 	@printf '%s\n' '  make dev           Alias for local-smoke'
 	@printf '%s\n' '  make local-smoke   Reset output sandbox and exercise agent/role/task flow'
 	@printf '%s\n' '  make local-board   Show sandbox agent/global-role board'
@@ -41,9 +41,11 @@ check: build lint test
 
 link: build
 	npm link
+	node scripts/manage-dev-launcher.mjs install
 
 unlink:
 	npm unlink -g @zq-silk/taskmux
+	node scripts/manage-dev-launcher.mjs uninstall
 
 dev: local-smoke
 
