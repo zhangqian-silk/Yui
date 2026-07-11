@@ -15,6 +15,7 @@ import type { AgentRun } from "../run/agentRun.js";
 import type { CustomRunner } from "../runner/runner.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import type { LeaderFailure } from "../scheduler/leaderFailure.js";
+import type { OperatorNotification } from "../scheduler/operatorNotification.js";
 import type { TaskSchedule } from "../scheduler/taskSchedule.js";
 import type { Task } from "../task/task.js";
 import { emptyTaskTopics, type TaskTopics } from "../topic/topic.js";
@@ -44,6 +45,9 @@ export type TaskStore = {
   getLeaderFailure(taskId: string): LeaderFailure | null;
   saveLeaderFailure(failure: LeaderFailure): void;
   clearLeaderFailure(taskId: string): void;
+  getOperatorNotification(taskId: string): OperatorNotification | null;
+  saveOperatorNotification(notification: OperatorNotification): void;
+  clearOperatorNotification(taskId: string): void;
   getTaskSchedule(taskId: string): TaskSchedule | null;
   saveTaskSchedule(taskId: string, schedule: TaskSchedule): void;
   nextCycleId(taskId: string): string;
@@ -64,6 +68,8 @@ export type TaskStore = {
   clearActiveAgentRun(taskId: string, roleName: string): void;
   saveTaskBrief(taskId: string, markdown: string): void;
   readTaskBrief(taskId: string): string | null;
+  appendTaskTopicSummary(taskId: string, markdown: string): void;
+  readTaskTopicSummaries(taskId: string): string | null;
   appendTaskTimeline(taskId: string, markdown: string): void;
   nextMilestoneId(taskId: string): string;
   getMilestone(taskId: string, milestoneId: string): Milestone | null;
@@ -74,6 +80,7 @@ export type TaskStore = {
   listDecisions(taskId: string): Decision[];
   saveDecision(taskId: string, decision: Decision): void;
   saveRoleWorktree(taskId: string, worktree: RoleWorktree): void;
+  getRoleWorktree(taskId: string, roleName: string): RoleWorktree | null;
   saveRole(taskId: string, role: Role): void;
   renameRole(taskId: string, oldName: string, role: Role): void;
   listRoles(taskId: string): Role[];
@@ -274,6 +281,23 @@ export class FileTaskStore implements TaskStore {
     rmSync(this.leaderFailureFile(taskId), { force: true });
   }
 
+  getOperatorNotification(taskId: string): OperatorNotification | null {
+    const raw = this.readOptionalText(this.operatorNotificationFile(taskId));
+    return raw === null ? null : parseOperatorNotification(taskId, raw);
+  }
+
+  saveOperatorNotification(notification: OperatorNotification): void {
+    mkdirSync(this.operatorNotificationsDir(), { recursive: true });
+    this.writeSnapshot(
+      this.operatorNotificationFile(notification.taskId),
+      `${JSON.stringify(notification, null, 2)}\n`
+    );
+  }
+
+  clearOperatorNotification(taskId: string): void {
+    rmSync(this.operatorNotificationFile(taskId), { force: true });
+  }
+
   getTaskSchedule(taskId: string): TaskSchedule | null {
     const raw = this.readOptionalText(this.taskScheduleFile(taskId));
     return raw === null ? null : parseTaskSchedule(taskId, raw);
@@ -385,6 +409,15 @@ export class FileTaskStore implements TaskStore {
     return this.readOptionalText(this.taskBriefFile(taskId));
   }
 
+  appendTaskTopicSummary(taskId: string, markdown: string): void {
+    const existing = this.readOptionalText(this.taskTopicSummariesFile(taskId)) ?? "";
+    this.writeSnapshot(this.taskTopicSummariesFile(taskId), `${existing}${markdown}`);
+  }
+
+  readTaskTopicSummaries(taskId: string): string | null {
+    return this.readOptionalText(this.taskTopicSummariesFile(taskId));
+  }
+
   appendTaskTimeline(taskId: string, markdown: string): void {
     mkdirSync(this.taskDir(taskId), { recursive: true });
     appendFileSync(this.taskTimelineFile(taskId), markdown);
@@ -436,6 +469,11 @@ export class FileTaskStore implements TaskStore {
       this.roleWorktreeFile(taskId, worktree.roleName),
       `${JSON.stringify(worktree, null, 2)}\n`
     );
+  }
+
+  getRoleWorktree(taskId: string, roleName: string): RoleWorktree | null {
+    const raw = this.readOptionalText(this.roleWorktreeFile(taskId, roleName));
+    return raw === null ? null : parseRoleWorktree(taskId, roleName, raw);
   }
 
   saveRole(taskId: string, role: Role): void {
@@ -702,6 +740,10 @@ export class FileTaskStore implements TaskStore {
     return join(this.taskDir(taskId), "brief.md");
   }
 
+  private taskTopicSummariesFile(taskId: string): string {
+    return join(this.taskDir(taskId), "topic-summaries.md");
+  }
+
   private taskTimelineFile(taskId: string): string {
     return join(this.taskDir(taskId), "timeline.md");
   }
@@ -740,6 +782,14 @@ export class FileTaskStore implements TaskStore {
 
   private leaderFailureFile(taskId: string): string {
     return join(this.leaderFailuresDir(), `${taskId}.json`);
+  }
+
+  private operatorNotificationsDir(): string {
+    return join(this.runtimeDir(), "operator-notifications");
+  }
+
+  private operatorNotificationFile(taskId: string): string {
+    return join(this.operatorNotificationsDir(), `${taskId}.json`);
   }
 
   private cyclesDir(taskId: string): string {
@@ -1147,6 +1197,22 @@ function parseLeaderFailure(taskId: string, raw: string): LeaderFailure {
   return value as LeaderFailure;
 }
 
+function parseOperatorNotification(taskId: string, raw: string): OperatorNotification {
+  const value = parseJson(raw, `Invalid Operator notification: ${taskId}`);
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    value.taskId !== taskId ||
+    value.type !== "leader-recovery-failed" ||
+    typeof value.message !== "string" ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string"
+  ) {
+    throw dataError(`Invalid Operator notification: ${taskId}`);
+  }
+  return value as OperatorNotification;
+}
+
 function parseMilestone(taskId: string, milestoneId: string, raw: string): Milestone {
   const value = parseJson(raw, `Invalid milestone record: ${taskId}/${milestoneId}`);
   if (
@@ -1175,6 +1241,7 @@ function parseCycle(taskId: string, cycleId: string, raw: string): Cycle {
     value.taskId !== taskId ||
     !["task-created", "user-comment", "schedule", "review-time", "operator-input", "role-result", "inactivity", "explicit-wake"].includes(String(value.cause)) ||
     typeof value.summary !== "string" ||
+    (value.topics !== undefined && !isStringArray(value.topics)) ||
     !["active", "ended"].includes(String(value.status)) ||
     typeof value.createdAt !== "string" ||
     typeof value.updatedAt !== "string" ||
@@ -1183,7 +1250,7 @@ function parseCycle(taskId: string, cycleId: string, raw: string): Cycle {
     throw dataError(`Invalid cycle record: ${taskId}/${cycleId}`);
   }
 
-  return value as Cycle;
+  return { ...value, topics: value.topics ?? [] } as Cycle;
 }
 
 function parseDecision(taskId: string, decisionId: string, raw: string): Decision {
@@ -1253,6 +1320,24 @@ function parseAgentSession(taskId: string, roleName: string, raw: string): Agent
   return value as AgentSession;
 }
 
+function parseRoleWorktree(taskId: string, roleName: string, raw: string): RoleWorktree {
+  const value = parseJson(raw, `Invalid role worktree: ${taskId}/${roleName}`);
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    value.taskId !== taskId ||
+    value.roleName !== roleName ||
+    typeof value.repository !== "string" ||
+    typeof value.path !== "string" ||
+    typeof value.branch !== "string" ||
+    (value.base !== undefined && typeof value.base !== "string") ||
+    typeof value.createdAt !== "string"
+  ) {
+    throw dataError(`Invalid role worktree: ${taskId}/${roleName}`);
+  }
+  return value as RoleWorktree;
+}
+
 function parseAgentRun(taskId: string, runId: string, raw: string): AgentRun {
   const value = parseJson(raw, `Invalid agent run record: ${taskId}/${runId}`);
 
@@ -1286,13 +1371,14 @@ function parseComment(id: string, raw: string): TaskComment {
     value.schemaVersion !== 1 ||
     typeof value.id !== "string" ||
     typeof value.body !== "string" ||
+    (value.topics !== undefined && !isStringArray(value.topics)) ||
     (value.author !== undefined && !["user", "operator", "leader"].includes(String(value.author))) ||
     typeof value.createdAt !== "string"
   ) {
     throw dataError(`Invalid comment record: ${id}`);
   }
 
-  return value as TaskComment;
+  return { ...value, topics: value.topics ?? [] } as TaskComment;
 }
 
 function parseEvent(id: string, raw: string): TaskEvent {

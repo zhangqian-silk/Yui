@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { dataError } from "../errors/cliError.js";
 import type { Role } from "../role/role.js";
-import type { TaskStore } from "../storage/taskStore.js";
+import { resolveTaskmuxHome, type TaskStore } from "../storage/taskStore.js";
 
 export function compileDispatchInput(
   store: TaskStore,
@@ -28,6 +30,7 @@ export function compileDispatchInput(
       ...child.constraints.map((item) => `Constraint: ${item}`),
       `Expected output: ${child.expectedOutput}`
     ].join("\n"));
+  const configuredSkills = readConfiguredSkills(role.skills ?? []);
   const sessionRegistration = role.agent === "codex"
     ? [
         "Native session bookkeeping:",
@@ -39,11 +42,30 @@ export function compileDispatchInput(
   return [
     systemSkill,
     ...profileLines,
+    ...configuredSkills,
     ...childSections,
     ...(sessionRegistration === null ? [] : [sessionRegistration]),
     "TaskMux dispatch:",
     input
   ].join("\n\n");
+}
+
+function readConfiguredSkills(skills: string[]): string[] {
+  const taskmuxHome = resolveTaskmuxHome(process.env);
+  return skills.map((skill) => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(skill)) {
+      throw dataError(`Invalid configured Skill id: ${skill}`);
+    }
+    const path = join(taskmuxHome, "skills", skill, "SKILL.md");
+    try {
+      return readFileSync(path, "utf8").trim();
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+        throw dataError(`Configured Skill not found: ${skill}`);
+      }
+      throw error;
+    }
+  });
 }
 
 function readSystemSkill(name: "taskmux-leader" | "taskmux-worker"): string {

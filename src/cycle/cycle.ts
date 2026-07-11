@@ -14,6 +14,7 @@ export type Cycle = {
   taskId: string;
   cause: CycleCause;
   summary: string;
+  topics: string[];
   status: "active" | "ended";
   createdAt: string;
   updatedAt: string;
@@ -25,7 +26,8 @@ export function createCycle(
   taskId: string,
   cause: CycleCause,
   summary: string,
-  now: Date
+  now: Date,
+  topics: string[] = []
 ): Cycle {
   const trimmedSummary = summary.trim();
 
@@ -41,6 +43,7 @@ export function createCycle(
     taskId,
     cause,
     summary: trimmedSummary,
+    topics: [...new Set(topics)],
     status: "active",
     createdAt: timestamp,
     updatedAt: timestamp

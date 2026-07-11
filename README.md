@@ -93,6 +93,7 @@ taskmux task transcript export task-1 rd --format markdown --output task-1-rd.md
 taskmux task activity task-1
 taskmux task timeline task-1
 taskmux task topic create task-1 --id data-migration --name "Data migration" --description "Schema and compatibility work"
+taskmux task topic summarize task-1 --topic architecture --summary "Controller owns all ordinary mutations."
 taskmux task input draft task-1 "New user context"
 taskmux task input submit task-1
 taskmux task cycle create task-1 --cause operator-input --summary "Process submitted context"
@@ -241,7 +242,7 @@ Assigned roles are stored under the task directory. Each role runtime record sto
 
 Runtime records with inline task titles or role names are invalid in the current schema.
 
-Task comments are appended to `comments.jsonl` under the task directory and can be listed without entering a role session. Each comment record includes `schemaVersion`.
+Task comments are appended to `comments.jsonl` under the task directory and can be listed without entering a role session. Comments and Cycles accept repeated `--topic` associations. Curated per-Topic context is appended to `topic-summaries.md` with `task topic summarize`.
 
 Task events are appended to `events.jsonl` under the task directory. The event stream records Task changes, archive transitions, role operations, dispatches, AgentRun yields, decisions, milestones, and comments; each event record includes `schemaVersion`, `id`, `type`, `payload`, and `createdAt`.
 
@@ -249,7 +250,9 @@ Task events are appended to `events.jsonl` under the task directory. The event s
 
 `task update` edits task board metadata and supports `--clear-description`, `--clear-priority`, `--clear-tags`, and `--clear-due`. `task delete` moves a task into `trash/tasks/<task-id>`; `task restore` moves it back without losing task files. `task list` supports `--archived`, `--tag`, `--priority`, and `--search` filters. `task board` groups the same filtered Task set into `Ongoing` and `Archived`; `--with-roles` adds stored role status counts.
 
-`task bind <task-id> <role>` copies a global role preset into a task. `task assign` without `--agent` behaves the same; with `--agent`, it creates or replaces a task-local role directly from that agent. `task role update` can replace a task-local role's agent contract and workspace without changing the global preset. `task role rename` updates the role info record and attempts to rename the matching tmux window when it exists; the system `leader` role cannot be renamed. `task enter` uses tmux to create or reuse a task session and role window, starts the stored command with its args and env, attaches the user to that role's native agent CLI, and records the role as `running` after a successful attach. `task tail` reads recent role output with `tmux capture-pane`.
+`task bind <task-id> <role>` copies a global role preset into a task. `task assign` without `--agent` behaves the same; with `--agent`, it creates a task-local role directly from that agent. A TaskRole's Agent type is fixed after creation; `task role update` may refresh the same Agent contract or change its workspace. `task role rename` updates the role info record and attempts to rename the matching tmux window when it exists; the system `leader` role cannot be renamed. `task enter` uses tmux to create or reuse a task session and role window, starts the stored command with its args and env, attaches the user to that role's native agent CLI, and records the role as `running` after a successful attach. `task tail` reads recent role output with `tmux capture-pane`.
+
+Configured role Skills are loaded from `TASKMUX_HOME/skills/<skill>/SKILL.md` and merged after the applicable TaskMux system Skill. Independent roles whose Leader workspace is a Git repository must have a recorded TaskMux Worktree before dispatch.
 
 `task assign-many` assigns multiple roles in one command with repeated `--role` values.
 
@@ -276,6 +279,8 @@ TaskMux maintains a global storage schema manifest at `schema.json` under the co
 ## Operator Mode
 
 Operator mode uses a native Agent CLI as the TaskMux administrative control surface. The Operator creates and configures Tasks, handles draft/submit input, and manages roles by running `taskmux` commands; it does not perform Task work or become a Leader.
+
+If a fixed Leader session cannot be recovered, TaskMux pauses further Leader wakeups, stores a durable notification under `runtime/operator-notifications/`, and best-effort alerts the active Operator tmux session. Recording or replacing the Leader session clears both the pause and its notification.
 
 Common Operator commands:
 

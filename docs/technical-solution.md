@@ -355,6 +355,12 @@ TaskMux reads recent role output through tmux capture APIs. The first version ex
 
 Controller infrastructure diagnostics are append-only JSONL records under `runtime/logs/controller.jsonl`. Storage reload and scheduler errors stay out of the curated Task timeline.
 
+Agent-specific start and recovery command construction lives behind the common `AgentExecutor` contract. The contract also owns send, interrupt, stop, status mapping, native session discovery, metadata attachment, and capabilities; `TmuxManager` supplies the isolated runtime operations.
+
+Controller RPC writes stage a durable request intent before mutation. A retry with a completed result returns the cached result; a retry whose intent survived without a result returns an explicit unknown-outcome conflict instead of reapplying a potentially completed mutation. Backup, import, prune, and non-attach Task shell commands use the same Controller single-writer boundary.
+
+Leader recovery failures create durable Operator notifications and best-effort alerts in the protected Operator tmux session. Explicitly recording or replacing the fixed Leader session clears the failure pause and notification before wakeup processing resumes.
+
 `task detail` combines role name from `info.json` with runtime metadata from `role.json` and derives the tmux target as `taskmux-<task-id>:<role>`. `task status` probes tmux window state and persists detected status changes. `task refresh` and `task cleanup` apply the same probe to every role in a task. `task transcript` reads tmux capture output and persists it to `roles/<role>/transcript.log`.
 
 `task events` reads `events.jsonl` and prints event id, timestamp, type, and payload key-value pairs. `task open` reads task, role, and comment counts from storage and prints a task context summary. `task context` produces a fuller handoff snapshot, with JSON output available for automation. `task shell` provides an interactive wrapper over the same task command handlers, including `events` and `context`. `task detach` detaches tmux clients for the task session and does not terminate the role process.

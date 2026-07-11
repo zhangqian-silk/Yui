@@ -1,12 +1,12 @@
 import { createTaskEvent } from "../event/taskEvent.js";
 import { createCycle, type CycleCause } from "../cycle/cycle.js";
 import { compileDispatchInput } from "../context/dispatchContext.js";
-import { withTaskmuxRunEnvironment } from "../executor/launchPlan.js";
 import type { AgentSession } from "../executor/agentExecutor.js";
 import { resolveAgentExecutor } from "../executor/executorRegistry.js";
 import { updateRoleStatus } from "../role/role.js";
 import { createAgentRun } from "../run/agentRun.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
+import { createLeaderRecoveryNotification } from "./operatorNotification.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { resolveTaskmuxHome } from "../storage/taskStore.js";
 import type { TmuxManager } from "../tmux/tmuxManager.js";
@@ -53,22 +53,19 @@ export function processLeaderWakeups(
         compiledInput,
         now
       );
-      const prepared = resolveAgentExecutor(role.agent).prepare({
+      const executor = resolveAgentExecutor(role.agent);
+      const dispatchInput = {
+        runtime: tmux,
+        taskmuxHome: resolveTaskmuxHome(process.env),
         taskId: task.id,
         role,
-        mode,
-        session,
-        now
-      });
-      effectiveSession = prepared.session;
-      const launch = withTaskmuxRunEnvironment(
-        prepared.launch,
-        resolveTaskmuxHome(process.env),
-        role,
         run,
-        effectiveSession?.nativeSessionId
-      );
-      tmux.dispatchRole(task.id, role, launch, compiledInput, { replaceExisting: mode === "new" });
+        session,
+        input: compiledInput,
+        now
+      };
+      const prepared = mode === "new" ? executor.start(dispatchInput) : executor.recover(dispatchInput);
+      effectiveSession = prepared.session;
 
       store.saveAgentRun(run);
       store.saveActiveAgentRun(run);
@@ -115,6 +112,21 @@ export function processLeaderWakeups(
         now,
         store.getLeaderFailure(task.id)
       ));
+      store.saveOperatorNotification(createLeaderRecoveryNotification(
+        task.id,
+        message,
+        now,
+        store.getOperatorNotification(task.id)
+      ));
+      try {
+        tmux.sendRoleInput(
+          "operator",
+          "operator",
+          `TaskMux alert: Leader recovery failed for ${task.id}. ${message}`
+        );
+      } catch {
+        // The durable notification remains available when Operator is not running.
+      }
       if (effectiveSession !== null) {
         store.saveAgentSession({ ...effectiveSession, status: "broken", updatedAt: now.toISOString() });
       }

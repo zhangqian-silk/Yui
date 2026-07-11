@@ -10,6 +10,7 @@ const resilientReadMethods = new Set<keyof TaskStore>([
   "getPendingWakeup",
   "listPendingWakeups",
   "getLeaderFailure",
+  "getOperatorNotification",
   "getTaskSchedule",
   "getCycle",
   "listCycles",
@@ -19,9 +20,11 @@ const resilientReadMethods = new Set<keyof TaskStore>([
   "getAgentRun",
   "getActiveAgentRun",
   "readTaskBrief",
+  "readTaskTopicSummaries",
   "getMilestone",
   "listMilestones",
   "getDecision",
+  "getRoleWorktree",
   "listDecisions",
   "listRoles",
   "getRole",
@@ -86,8 +89,10 @@ export function primeResilientTaskStore(store: TaskStore): void {
     store.getTaskInputDraft(task.id);
     store.getPendingWakeup(task.id);
     store.getLeaderFailure(task.id);
+    store.getOperatorNotification(task.id);
     store.getTaskSchedule(task.id);
     store.readTaskBrief(task.id);
+    store.readTaskTopicSummaries(task.id);
     store.listComments(task.id);
     store.listEvents(task.id);
 
@@ -108,6 +113,7 @@ export function primeResilientTaskStore(store: TaskStore): void {
     }
     for (const role of store.listRoles(task.id)) {
       store.getRole(task.id, role.name);
+      store.getRoleWorktree(task.id, role.name);
       store.getAgentSession(task.id, role.name);
       store.getActiveAgentRun(task.id, role.name);
       store.readTranscript(task.id, role.name);

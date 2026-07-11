@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
 import type { Role } from "../role/role.js";
+import type { RoleStatus } from "../role/role.js";
+import type { AgentRun } from "../run/agentRun.js";
 import {
   recordAgentSession,
   type AgentSession,
+  type AgentSessionStatus,
   type ExecutorCapabilities
 } from "./agentExecutor.js";
-import type { AgentLaunchPlan, DispatchMode } from "./launchPlan.js";
+import { withTaskmuxRunEnvironment, type AgentLaunchPlan, type DispatchMode } from "./launchPlan.js";
 
 export type PrepareExecutionInput = {
   taskId: string;
@@ -20,13 +23,122 @@ export type PreparedExecution = {
   session: AgentSession | null;
 };
 
+export type AgentRuntime = {
+  dispatchRole(
+    taskId: string,
+    role: Role,
+    launch: AgentLaunchPlan,
+    input: string,
+    options?: { replaceExisting?: boolean }
+  ): void;
+  sendRoleInput(taskId: string, roleName: string, input: string): void;
+  stopRole(taskId: string, roleName: string): void;
+  killRole(taskId: string, roleName: string): void;
+  detectRoleStatus(taskId: string, roleName: string, fallback: RoleStatus): RoleStatus;
+};
+
+export type ExecutorDispatchInput = {
+  runtime: AgentRuntime;
+  taskmuxHome: string;
+  taskId: string;
+  role: Role;
+  run: AgentRun;
+  session: AgentSession | null;
+  input: string;
+  now: Date;
+};
+
+export type ExecutorControlInput = {
+  runtime: AgentRuntime;
+  taskId: string;
+  role: Role;
+};
+
 export interface AgentExecutor {
   readonly id: string;
   readonly capabilities: ExecutorCapabilities;
   prepare(input: PrepareExecutionInput): PreparedExecution;
+  start(input: ExecutorDispatchInput): PreparedExecution;
+  recover(input: ExecutorDispatchInput): PreparedExecution;
+  send(input: ExecutorControlInput & { input: string }): void;
+  interrupt(input: ExecutorControlInput): void;
+  stop(input: ExecutorControlInput): void;
+  status(input: ExecutorControlInput): AgentSessionStatus;
+  discoverNativeSessionId(session: AgentSession | null, env: NodeJS.ProcessEnv): string | null;
+  attachMetadata(launch: AgentLaunchPlan, input: Omit<ExecutorDispatchInput, "runtime" | "input" | "now">): AgentLaunchPlan;
 }
 
-class CodexExecutor implements AgentExecutor {
+abstract class BaseAgentExecutor implements AgentExecutor {
+  abstract readonly id: string;
+  abstract readonly capabilities: ExecutorCapabilities;
+  abstract prepare(input: PrepareExecutionInput): PreparedExecution;
+
+  start(input: ExecutorDispatchInput): PreparedExecution {
+    return this.dispatch(input, "new", true);
+  }
+
+  recover(input: ExecutorDispatchInput): PreparedExecution {
+    return this.dispatch(input, "resume", false);
+  }
+
+  send({ runtime, taskId, role, input }: ExecutorControlInput & { input: string }): void {
+    runtime.sendRoleInput(taskId, role.name, input);
+  }
+
+  interrupt({ runtime, taskId, role }: ExecutorControlInput): void {
+    runtime.stopRole(taskId, role.name);
+  }
+
+  stop({ runtime, taskId, role }: ExecutorControlInput): void {
+    runtime.killRole(taskId, role.name);
+  }
+
+  status({ runtime, taskId, role }: ExecutorControlInput): AgentSessionStatus {
+    const status = runtime.detectRoleStatus(taskId, role.name, role.status);
+    if (status === "running") {
+      return "running";
+    }
+    if (status === "exited") {
+      return "stopped";
+    }
+    if (status === "failed") {
+      return "broken";
+    }
+    return "ready";
+  }
+
+  discoverNativeSessionId(session: AgentSession | null, _env: NodeJS.ProcessEnv): string | null {
+    return session?.nativeSessionId ?? null;
+  }
+
+  attachMetadata(
+    launch: AgentLaunchPlan,
+    { taskmuxHome, role, run, session }: Omit<ExecutorDispatchInput, "runtime" | "input" | "now">
+  ): AgentLaunchPlan {
+    return withTaskmuxRunEnvironment(launch, taskmuxHome, role, run, session?.nativeSessionId);
+  }
+
+  private dispatch(input: ExecutorDispatchInput, mode: DispatchMode, replaceExisting: boolean): PreparedExecution {
+    const prepared = this.prepare({
+      taskId: input.taskId,
+      role: input.role,
+      mode,
+      session: input.session,
+      now: input.now
+    });
+    const launch = this.attachMetadata(prepared.launch, {
+      taskmuxHome: input.taskmuxHome,
+      taskId: input.taskId,
+      role: input.role,
+      run: input.run,
+      session: prepared.session
+    });
+    input.runtime.dispatchRole(input.taskId, input.role, launch, input.input, { replaceExisting });
+    return prepared;
+  }
+}
+
+class CodexExecutor extends BaseAgentExecutor {
   readonly id = "codex";
   readonly capabilities = { recover: true, interrupt: true, nativeSessionDiscovery: true };
 
@@ -41,9 +153,13 @@ class CodexExecutor implements AgentExecutor {
       session: existing
     };
   }
+
+  override discoverNativeSessionId(session: AgentSession | null, env: NodeJS.ProcessEnv): string | null {
+    return session?.nativeSessionId ?? env.CODEX_THREAD_ID?.trim() ?? null;
+  }
 }
 
-class ClaudeExecutor implements AgentExecutor {
+class ClaudeExecutor extends BaseAgentExecutor {
   readonly id = "claude";
   readonly capabilities = { recover: true, interrupt: true, nativeSessionDiscovery: false };
 

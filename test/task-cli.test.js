@@ -172,18 +172,21 @@ process.exit(0);
 
 function createFailingDispatchTmux(home) {
   const fakeTmux = join(home, "fake-failing-dispatch-tmux.js");
+  const logFile = join(home, "failing-dispatch-tmux-calls.jsonl");
 
   writeFileSync(
     fakeTmux,
     `#!/usr/bin/env node
+const { appendFileSync } = require("node:fs");
 const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(logFile)}, JSON.stringify(args) + "\\n");
 if (args[0] === "has-session" || args[0] === "new-session") process.exit(1);
 process.exit(0);
 `
   );
   chmodSync(fakeTmux, 0o755);
 
-  return fakeTmux;
+  return { fakeTmux, logFile };
 }
 
 function createFakeExecutable(home, name, output) {
@@ -1474,13 +1477,8 @@ test("lists roles for a task", () => {
   assert.match(output, tableCellsRegex("reviewer", "claude", "idle", "/tmp/project-a"));
 });
 
-test("updates role runner and workspace", () => {
+test("updates role workspace without changing its Agent contract", () => {
   const home = createConfiguredHome();
-  const fakeAgent = createFakeExecutable(home, "custom-agent.js", "custom agent 1.0\n");
-
-  runTaskmux(["runner", "add", "agent-js", "--command", fakeAgent, "--arg", "--mode", "--arg", "review"], {
-    TASKMUX_HOME: home
-  });
   runTaskmux(["task", "create", "Refactor login page"], {
     TASKMUX_HOME: home
   });
@@ -1490,7 +1488,7 @@ test("updates role runner and workspace", () => {
   );
 
   const output = runTaskmux(
-    ["task", "role", "update", "task-1", "rd", "--agent", "agent-js", "--workspace", "/tmp/project-b"],
+    ["task", "role", "update", "task-1", "rd", "--workspace", "/tmp/project-b"],
     { TASKMUX_HOME: home }
   );
   const detailOutput = runTaskmux(["task", "detail", "task-1", "rd"], {
@@ -1499,11 +1497,50 @@ test("updates role runner and workspace", () => {
   const role = JSON.parse(readFileSync(join(home, "tasks", "task-1", "roles", "rd", "role.json"), "utf8"));
 
   assert.match(output, /Updated role rd for task-1/);
-  assert.match(detailOutput, /Agent: agent-js/);
+  assert.match(detailOutput, /Agent: codex/);
   assert.match(detailOutput, /Workspace: \/tmp\/project-b/);
-  assert.equal(role.command, fakeAgent);
-  assert.deepEqual(role.args, ["--mode", "review"]);
+  assert.equal(role.command, "codex");
+  assert.deepEqual(role.args, []);
   assert.equal(role.workspace, "/tmp/project-b");
+});
+
+test("keeps a task role Agent type fixed after creation", () => {
+  const home = createConfiguredHome();
+  runTaskmux(["task", "create", "Keep role identity stable"], { TASKMUX_HOME: home });
+  runTaskmux(
+    ["task", "assign", "task-1", "reviewer", "--agent", "codex", "--workspace", "/tmp/project-a"],
+    { TASKMUX_HOME: home }
+  );
+
+  const result = runTaskmuxFailure(
+    ["task", "role", "update", "task-1", "reviewer", "--agent", "claude"],
+    { TASKMUX_HOME: home }
+  );
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /Agent type is fixed/);
+  assert.equal(JSON.parse(
+    readFileSync(join(home, "tasks", "task-1", "roles", "reviewer", "role.json"), "utf8")
+  ).agent, "codex");
+});
+
+test("rejects reassigning an existing task role to a different Agent", () => {
+  const home = createConfiguredHome();
+  runTaskmux(["task", "create", "Keep assigned role identity stable"], { TASKMUX_HOME: home });
+  runTaskmux(
+    ["task", "assign", "task-1", "reviewer", "--agent", "codex", "--workspace", "/tmp/project-a"],
+    { TASKMUX_HOME: home }
+  );
+
+  const result = runTaskmuxFailure(
+    ["task", "assign", "task-1", "reviewer", "--agent", "claude", "--workspace", "/tmp/project-a"],
+    { TASKMUX_HOME: home }
+  );
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /Agent type is fixed/);
+  assert.equal(JSON.parse(
+    readFileSync(join(home, "tasks", "task-1", "roles", "reviewer", "role.json"), "utf8")
+  ).agent, "codex");
 });
 
 test("renames roles and tmux windows", () => {
@@ -3451,6 +3488,25 @@ test("runs an interactive task shell", async () => {
   assert.match(output, /Task Context/);
 });
 
+test("routes Task shell mutations through the Controller", async () => {
+  const home = createConfiguredHome();
+  runTaskmux(["task", "create", "Controller shell"], { TASKMUX_HOME: home });
+  const env = { TASKMUX_HOME: home, TASKMUX_CONTROLLER_MODE: "auto" };
+
+  try {
+    await runTaskmuxInteractive(
+      ["task", "shell", "task-1"],
+      "comment shell-controlled update\nexit\n",
+      env
+    );
+    assert.equal(existsSync(join(home, "runtime", "controller.json")), true);
+    const comments = readFileSync(join(home, "tasks", "task-1", "comments.jsonl"), "utf8");
+    assert.match(comments, /shell-controlled update/);
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], env);
+  }
+});
+
 test("creates a task-local custom topic", () => {
   const home = createConfiguredHome();
 
@@ -3520,6 +3576,26 @@ test("lists built-in and task-local topics together", () => {
     assert.match(output, new RegExp(topic));
   }
   assert.match(output, /数据迁移/);
+});
+
+test("persists curated Topic summaries in task context", () => {
+  const home = createConfiguredHome();
+  runTaskmux(["task", "create", "Summarize architecture"], { TASKMUX_HOME: home });
+  runTaskmux(
+    [
+      "task", "topic", "summarize", "task-1", "--topic", "architecture",
+      "--summary", "The Controller is the only mutation writer."
+    ],
+    { TASKMUX_HOME: home }
+  );
+  const summaryFile = readFileSync(join(home, "tasks", "task-1", "topic-summaries.md"), "utf8");
+  const context = JSON.parse(
+    runTaskmux(["task", "context", "task-1", "--format", "json"], { TASKMUX_HOME: home })
+  );
+
+  assert.match(summaryFile, /## architecture/);
+  assert.match(summaryFile, /Controller is the only mutation writer/);
+  assert.equal(context.topicSummaries, summaryFile);
 });
 
 test("warns about custom topic naming without blocking it", () => {
@@ -3680,6 +3756,29 @@ test("coalesces comments and explicit triggers into one leader wakeup", () => {
   assert.match(output, /Queued leader wakeup for task task-1/);
   assert.deepEqual(pendingWakeup.reasons, ["user-comment", "review-time"]);
   assert.equal(pendingWakeup.requestCount, 2);
+});
+
+test("associates comments and Cycles with multiple Topics", () => {
+  const home = createConfiguredHome();
+  runTaskmux(["task", "create", "Track operational context"], { TASKMUX_HOME: home });
+  runTaskmux(
+    ["task", "comment", "task-1", "Review the rollout", "--topic", "operations", "--topic", "security"],
+    { TASKMUX_HOME: home }
+  );
+  runTaskmux(
+    [
+      "task", "cycle", "create", "task-1", "--cause", "explicit-wake",
+      "--summary", "Review rollout controls", "--topic", "operations", "--topic", "security"
+    ],
+    { TASKMUX_HOME: home }
+  );
+  const context = JSON.parse(
+    runTaskmux(["task", "context", "task-1", "--format", "json"], { TASKMUX_HOME: home })
+  );
+
+  assert.equal(context.comments[0].body, "Review the rollout");
+  assert.deepEqual(context.comments[0].topics, ["operations", "security"]);
+  assert.deepEqual(context.cycles[0].topics, ["operations", "security"]);
 });
 
 test("starts and reaches the controller through authenticated loopback RPC", () => {
@@ -3848,10 +3947,12 @@ test("uses an exclusive process lock for Controller startup", async () => {
 
 test("controller applies a mutating RPC request id only once", async () => {
   const home = createConfiguredHome();
+  const { fakeTmux } = createFailingDispatchTmux(home);
+  const env = { TASKMUX_HOME: home, TASKMUX_TMUX_BIN: fakeTmux };
 
   runTaskmux(["task", "create", "Deduplicate wakeups"], { TASKMUX_HOME: home });
   try {
-    runTaskmux(["controller", "start"], { TASKMUX_HOME: home });
+    runTaskmux(["controller", "start"], env);
     const discovery = JSON.parse(
       readFileSync(join(home, "runtime", "controller.json"), "utf8")
     );
@@ -3876,6 +3977,43 @@ test("controller applies a mutating RPC request id only once", async () => {
       readFileSync(join(home, "runtime", "pending-wakeups", "task-1.json"), "utf8")
     );
     assert.equal(wakeup.requestCount, 1);
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], env);
+  }
+});
+
+test("controller does not reapply a request whose crash intent has an unknown outcome", async () => {
+  const home = createConfiguredHome();
+  runTaskmux(["task", "create", "Protect crash retries"], { TASKMUX_HOME: home });
+  runTaskmux(["controller", "start"], { TASKMUX_HOME: home });
+
+  try {
+    const discovery = JSON.parse(readFileSync(join(home, "runtime", "controller.json"), "utf8"));
+    const intentDir = join(home, "runtime", "rpc-intents");
+    mkdirSync(intentDir, { recursive: true });
+    writeFileSync(join(intentDir, "crashed-request.json"), JSON.stringify({
+      schemaVersion: 1,
+      requestId: "crashed-request",
+      method: "task.command",
+      createdAt: "2026-07-11T00:00:00.000Z"
+    }));
+    const response = await fetch(`http://${discovery.host}:${discovery.port}/rpc`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${discovery.token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        apiVersion: 1,
+        requestId: "crashed-request",
+        method: "task.command",
+        params: { args: ["comment", "task-1", "must not be duplicated"] }
+      })
+    });
+
+    assert.equal(response.status, 409);
+    assert.match(JSON.stringify(await response.json()), /outcome is unknown/);
+    assert.equal(existsSync(join(home, "tasks", "task-1", "comments.jsonl")), false);
   } finally {
     runTaskmuxFailure(["controller", "stop"], { TASKMUX_HOME: home });
   }
@@ -3955,6 +4093,24 @@ test("routes configuration and role mutations through the same Controller", () =
       JSON.parse(readFileSync(join(home, "roles", "controller-reviewer", "role.json"), "utf8")).agent,
       "codex"
     );
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], env);
+  }
+});
+
+test("routes import mutations through the Controller single-writer boundary", () => {
+  const home = createConfiguredHome();
+  const snapshot = join(home, "snapshot.json");
+  runTaskmux(["task", "create", "Restore through Controller"], { TASKMUX_HOME: home });
+  runTaskmux(["export", "--output", snapshot], { TASKMUX_HOME: home });
+  runTaskmux(["task", "delete", "task-1"], { TASKMUX_HOME: home });
+  const env = { TASKMUX_HOME: home, TASKMUX_CONTROLLER_MODE: "auto" };
+
+  try {
+    assert.match(runTaskmux(["import", snapshot], env), /Imported TaskMux data/);
+    assert.equal(existsSync(join(home, "runtime", "controller.json")), true);
+    assert.equal(JSON.parse(readFileSync(join(home, "tasks", "task-1", "info.json"), "utf8")).title,
+      "Restore through Controller");
   } finally {
     runTaskmuxFailure(["controller", "stop"], env);
   }
@@ -4051,7 +4207,7 @@ test("injects child role descriptions into the parent dispatch only", () => {
     { TASKMUX_HOME: home, TASKMUX_TMUX_BIN: fakeTmux, FAKE_TMUX_LOG: logFile }
   );
   const calls = readFileSync(logFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-  const injectedInput = calls[4][4];
+  const injectedInput = calls[4][5];
 
   assert.match(injectedInput, /risk-reviewer/);
   assert.match(injectedInput, /Review rollback risk/);
@@ -4123,6 +4279,28 @@ test("creates a git worktree for an independent task role", () => {
   assert.equal(metadata.branch, "taskmux/reviewer");
   assert.equal(metadata.path, worktree);
   assert.equal(role.workspace, worktree);
+});
+
+test("requires an explicit worktree before dispatching an independent role in a Git workspace", () => {
+  const home = createConfiguredHome();
+  const repository = join(home, "repository");
+  mkdirSync(repository, { recursive: true });
+  execFileSync("git", ["init", repository], { stdio: "pipe" });
+  runTaskmux(["config", "set", "default-workspace", repository], { TASKMUX_HOME: home });
+  runTaskmux(["task", "create", "Isolate delegated work"], { TASKMUX_HOME: home });
+  runTaskmux(
+    ["task", "assign", "task-1", "reviewer", "--agent", "codex", "--workspace", repository],
+    { TASKMUX_HOME: home }
+  );
+  const { fakeTmux, logFile } = createFakeTmux(home);
+
+  const result = runTaskmuxFailure(
+    ["task", "dispatch", "task-1", "reviewer", "--mode", "new", "--input", "Review"],
+    { TASKMUX_HOME: home, TASKMUX_TMUX_BIN: fakeTmux, FAKE_TMUX_LOG: logFile }
+  );
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /worktree/i);
+  assert.equal(existsSync(logFile), false);
 });
 
 test("keeps the leader native session fixed until explicit replacement", () => {
@@ -4206,6 +4384,81 @@ test("builds Codex start and recovery plans through the unified executor adapter
     },
     session
   });
+});
+
+test("every Agent executor passes the common runtime operation contract", async () => {
+  const { resolveAgentExecutor } = await import("../dist/executor/executorRegistry.js");
+  const now = new Date("2026-07-11T00:00:00.000Z");
+
+  for (const agent of ["codex", "claude"]) {
+    const calls = [];
+    const runtime = {
+      dispatchRole: (...args) => calls.push(["dispatch", ...args]),
+      sendRoleInput: (...args) => calls.push(["send", ...args]),
+      stopRole: (...args) => calls.push(["interrupt", ...args]),
+      killRole: (...args) => calls.push(["stop", ...args]),
+      detectRoleStatus: () => "running"
+    };
+    const role = {
+      schemaVersion: 1,
+      name: "reviewer",
+      agent,
+      command: agent,
+      args: ["--safe"],
+      env: {},
+      workspace: "/tmp/project-a",
+      status: "idle",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString()
+    };
+    const run = {
+      schemaVersion: 1,
+      id: "agent-run-1",
+      taskId: "task-1",
+      roleName: "reviewer",
+      mode: "new",
+      input: "Review",
+      status: "active",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString()
+    };
+    const executor = resolveAgentExecutor(agent);
+    const started = executor.start({
+      runtime, taskmuxHome: "/tmp/taskmux", taskId: "task-1", role, run,
+      session: null, input: "Review", now
+    });
+    const nativeId = agent === "codex"
+      ? executor.discoverNativeSessionId(started.session, { CODEX_THREAD_ID: "codex-thread-1" })
+      : executor.discoverNativeSessionId(started.session, {});
+    const session = started.session ?? {
+      schemaVersion: 1,
+      taskId: "task-1",
+      roleName: "reviewer",
+      agent,
+      nativeSessionId: nativeId,
+      policy: "leader-controlled",
+      status: "ready",
+      previousSessionIds: [],
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString()
+    };
+
+    executor.recover({
+      runtime, taskmuxHome: "/tmp/taskmux", taskId: "task-1", role,
+      run: { ...run, mode: "resume" }, session, input: "Continue", now
+    });
+    executor.send({ runtime, taskId: "task-1", role, input: "More context" });
+    executor.interrupt({ runtime, taskId: "task-1", role });
+    executor.stop({ runtime, taskId: "task-1", role });
+
+    assert.equal(executor.status({ runtime, taskId: "task-1", role }), "running");
+    assert.match(nativeId, agent === "codex" ? /codex-thread-1/ : /^[0-9a-f-]{36}$/);
+    assert.equal(calls.filter(([type]) => type === "dispatch").length, 2);
+    assert.equal(calls.find(([type]) => type === "dispatch")[5].replaceExisting, true);
+    assert.equal(calls.filter(([type]) => type === "dispatch")[1][5].replaceExisting, false);
+    assert.deepEqual(calls.slice(-3).map(([type]) => type), ["send", "interrupt", "stop"]);
+    assert.match(calls[0][3].env.TASKMUX_RUN_ID, /agent-run-1/);
+  }
 });
 
 test("preallocates and records a native session id for a new Claude dispatch", () => {
@@ -4296,9 +4549,49 @@ test("dispatches a role synchronously while its agent work continues in tmux", (
   assert.match(calls[3].at(-1), /TASKMUX_TASK_ID=task-1/);
   assert.match(calls[3].at(-1), /codex resume codex-session-1$/);
   assert.deepEqual(calls[4].slice(0, 4), ["send-keys", "-l", "-t", "taskmux-task-1:leader"]);
-  assert.match(calls[4][4], /# TaskMux Leader/);
-  assert.match(calls[4][4], /Continue the next work item$/);
+  assert.equal(calls[4][4], "--");
+  assert.match(calls[4][5], /# TaskMux Leader/);
+  assert.match(calls[4][5], /Continue the next work item$/);
   assert.deepEqual(calls[5], ["send-keys", "-t", "taskmux-task-1:leader", "Enter"]);
+});
+
+test("dispatches roles through an isolated real tmux server", {
+  skip: spawnSync("tmux", ["-V"]).status !== 0
+}, () => {
+  const home = createConfiguredHome();
+  const socket = `taskmux-test-${process.pid}-${Date.now()}`;
+  const isolatedTmux = join(home, "isolated-tmux.sh");
+  writeFileSync(isolatedTmux, `#!/bin/sh
+case "$1" in
+  has-session|kill-window) exec tmux -L ${socket} "$@" 2>/dev/null ;;
+  *) exec tmux -L ${socket} "$@" ;;
+esac
+`);
+  chmodSync(isolatedTmux, 0o755);
+  runTaskmux(
+    ["runner", "add", "codex", "--command", "sh", "--arg", "-c", "--arg", "while :; do sleep 1; done"],
+    { TASKMUX_HOME: home }
+  );
+  runTaskmux(["task", "create", "Exercise real tmux isolation"], { TASKMUX_HOME: home });
+  runTaskmux(
+    ["task", "assign", "task-1", "reviewer", "--agent", "codex", "--workspace", "/tmp/project-a"],
+    { TASKMUX_HOME: home }
+  );
+
+  try {
+    runTaskmux(
+      ["task", "dispatch", "task-1", "reviewer", "--mode", "new", "--input", "Review"],
+      { TASKMUX_HOME: home, TASKMUX_TMUX_BIN: isolatedTmux }
+    );
+    const windows = execFileSync(
+      "tmux",
+      ["-L", socket, "list-windows", "-t", "taskmux-task-1", "-F", "#{window_name}"],
+      { encoding: "utf8" }
+    );
+    assert.match(windows, /^reviewer$/m);
+  } finally {
+    spawnSync("tmux", ["-L", socket, "kill-server"]);
+  }
 });
 
 test("links a dispatch run to its finite WorkItem and Topics", () => {
@@ -4380,6 +4673,33 @@ test("injects TaskMux role context and the matching system skill into a dispatch
   assert.ok(literalInput);
   assert.match(literalInput.at(-1), /# TaskMux Worker/);
   assert.match(literalInput.at(-1), /Review the release/);
+});
+
+test("merges configured custom Skill content into the system Skill dispatch context", () => {
+  const home = createConfiguredHome();
+  const { fakeTmux, logFile } = createFakeTmux(home);
+  const skillDir = join(home, "skills", "security-review");
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(join(skillDir, "SKILL.md"), "# Security review\n\nInspect trust boundaries and secret handling.\n");
+  runTaskmux(
+    [
+      "role", "add", "security-reviewer", "--agent", "codex", "--workspace", "/tmp/project-a",
+      "--skill", "security-review"
+    ],
+    { TASKMUX_HOME: home }
+  );
+  runTaskmux(["task", "create", "Review security boundaries"], { TASKMUX_HOME: home });
+  runTaskmux(["task", "assign", "task-1", "security-reviewer"], { TASKMUX_HOME: home });
+  runTaskmux(
+    ["task", "dispatch", "task-1", "security-reviewer", "--mode", "new", "--input", "Review now"],
+    { TASKMUX_HOME: home, TASKMUX_TMUX_BIN: fakeTmux, FAKE_TMUX_LOG: logFile }
+  );
+
+  const calls = readFileSync(logFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  const literalInput = calls.find((call) => call[0] === "send-keys" && call[1] === "-l").at(-1);
+  assert.match(literalInput, /# TaskMux Worker/);
+  assert.match(literalInput, /# Security review/);
+  assert.match(literalInput, /Inspect trust boundaries and secret handling/);
 });
 
 test("rejects a second dispatch while the same role already has an active run", () => {
@@ -4616,8 +4936,10 @@ test("fails an active role run immediately when its tmux window has exited", () 
 
 test("controller periodically performs the inactivity safety scan", () => {
   const home = createConfiguredHome();
+  const { fakeTmux } = createFailingDispatchTmux(home);
   const env = {
     TASKMUX_HOME: home,
+    TASKMUX_TMUX_BIN: fakeTmux,
     TASKMUX_CONTROLLER_SCAN_INTERVAL_MS: "50"
   };
 
@@ -4682,7 +5004,7 @@ test("controller recovers the fixed leader session to process a pending wakeup",
 
 test("pauses leader wakeups after recovery failure until the session is explicitly replaced", () => {
   const home = createConfiguredHome();
-  const fakeTmux = createFailingDispatchTmux(home);
+  const { fakeTmux, logFile } = createFailingDispatchTmux(home);
   const env = {
     TASKMUX_HOME: home,
     TASKMUX_TMUX_BIN: fakeTmux,
@@ -4702,12 +5024,20 @@ test("pauses leader wakeups after recovery failure until the session is explicit
     const failure = JSON.parse(
       readFileSync(join(home, "runtime", "leader-failures", "task-1.json"), "utf8")
     );
+    const notification = JSON.parse(
+      readFileSync(join(home, "runtime", "operator-notifications", "task-1.json"), "utf8")
+    );
     const context = JSON.parse(
       runTaskmux(["task", "context", "task-1", "--format", "json"], env)
     );
 
     assert.equal(failure.nativeSessionId, "broken-session");
     assert.equal(failure.attemptCount, 1);
+    assert.equal(notification.type, "leader-recovery-failed");
+    assert.equal(notification.taskId, "task-1");
+    assert.match(notification.message, /tmux|dispatch|session/i);
+    const calls = readFileSync(logFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    assert.ok(calls.some((call) => call[0] === "send-keys" && call.includes("taskmux-operator:operator")));
     assert.equal(context.leaderFailure.attemptCount, 1);
     assert.equal(existsSync(join(home, "runtime", "pending-wakeups", "task-1.json")), true);
   } finally {
@@ -4722,6 +5052,7 @@ test("pauses leader wakeups after recovery failure until the session is explicit
     env
   );
   assert.equal(existsSync(join(home, "runtime", "leader-failures", "task-1.json")), false);
+  assert.equal(existsSync(join(home, "runtime", "operator-notifications", "task-1.json")), false);
 });
 
 test("coalesces one-off review and recurring schedule firings without reopening the task", () => {

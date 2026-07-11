@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { createTaskComment } from "../comment/comment.js";
 import { createTaskBrief, renderTaskBrief } from "../brief/taskBrief.js";
 import { createCycle, endCycle, type CycleCause } from "../cycle/cycle.js";
@@ -12,7 +12,7 @@ import { createTaskInputDraft } from "../input/taskInput.js";
 import { createMilestone, renderMilestoneTimelineEntry } from "../milestone/milestone.js";
 import { recordAgentSession } from "../executor/agentExecutor.js";
 import { resolveAgentExecutor } from "../executor/executorRegistry.js";
-import { type DispatchMode, withTaskmuxRunEnvironment } from "../executor/launchPlan.js";
+import type { DispatchMode } from "../executor/launchPlan.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { copyGlobalRoleToTaskRole, createRole, updateRole, updateRoleStatus } from "../role/role.js";
 import { createChildRole } from "../role/childRole.js";
@@ -386,6 +386,17 @@ function dispatchTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxMa
     throw runtimeError("Tmux manager is not configured.");
   }
 
+  if (roleName !== BUILTIN_LEADER_ROLE) {
+    const leader = store.getRole(taskId, BUILTIN_LEADER_ROLE);
+    const worktree = store.getRoleWorktree(taskId, roleName);
+    if (leader !== null && existsSync(join(leader.workspace, ".git")) && worktree === null) {
+      throw usageError(`Independent role ${roleName} requires an explicit worktree before dispatch.`);
+    }
+    if (worktree !== null && (!existsSync(worktree.path) || role.workspace !== worktree.path)) {
+      throw usageError(`Role worktree is missing or does not match the configured workspace: ${roleName}.`);
+    }
+  }
+
   if (store.getActiveAgentRun(taskId, roleName) !== null) {
     throw usageError(`${taskId}/${roleName} already has an active agent run.`);
   }
@@ -444,23 +455,20 @@ function dispatchTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxMa
     new Date(),
     { workItemId, topics }
   );
-  const prepared = resolveAgentExecutor(role.agent).prepare({
+  const compiledInput = compileDispatchInput(store, taskId, role, scopedInput);
+  const executor = resolveAgentExecutor(role.agent);
+  const dispatchInput = {
+    runtime: tmux,
+    taskmuxHome: resolveTaskmuxHome(process.env),
     taskId,
     role,
-    mode: mode as DispatchMode,
-    session,
-    now: new Date()
-  });
-  const effectiveSession = prepared.session;
-  const launch = withTaskmuxRunEnvironment(
-    prepared.launch,
-    resolveTaskmuxHome(process.env),
-    role,
     run,
-    effectiveSession?.nativeSessionId
-  );
-  const compiledInput = compileDispatchInput(store, taskId, role, scopedInput);
-  tmux.dispatchRole(taskId, role, launch, compiledInput, { replaceExisting: mode === "new" });
+    session,
+    input: compiledInput,
+    now: new Date()
+  };
+  const prepared = mode === "new" ? executor.start(dispatchInput) : executor.recover(dispatchInput);
+  const effectiveSession = prepared.session;
   store.saveRole(taskId, updateRoleStatus(role, "running", new Date()));
   if (effectiveSession !== null) {
     store.saveAgentSession({ ...effectiveSession, status: "running", updatedAt: new Date().toISOString() });
@@ -508,6 +516,7 @@ function taskSessionCommand(args: string[], store: TaskStore): string {
     store.saveAgentSession(session);
     if (roleName === BUILTIN_LEADER_ROLE) {
       store.clearLeaderFailure(taskId);
+      store.clearOperatorNotification(taskId);
     }
     return `Recorded native session for ${taskId}/${roleName}\n`;
   }
@@ -530,6 +539,7 @@ function taskSessionCommand(args: string[], store: TaskStore): string {
     store.saveAgentSession(session);
     if (roleName === BUILTIN_LEADER_ROLE) {
       store.clearLeaderFailure(taskId);
+      store.clearOperatorNotification(taskId);
     }
     recordTaskEvent(store, taskId, "role.session_replaced", { role: roleName, reason });
     return `Replaced native session for ${taskId}/${roleName}\n`;
@@ -593,6 +603,8 @@ function taskCycleCommand(args: string[], store: TaskStore): string {
   }
 
   const cause = readOption(rest, "--cause");
+  const topics = readRepeatedOption(rest, "--topic").map((topic) => topic.trim());
+  validateTopicIds(store, taskId, topics);
   const allowedCauses = [
     "task-created", "user-comment", "schedule", "review-time", "operator-input",
     "role-result", "inactivity", "explicit-wake"
@@ -607,7 +619,8 @@ function taskCycleCommand(args: string[], store: TaskStore): string {
     taskId,
     cause as CycleCause,
     readOption(rest, "--summary"),
-    new Date()
+    new Date(),
+    topics
   );
   store.saveCycle(taskId, cycle);
   recordTaskEvent(store, taskId, "cycle.created", { cycle: cycle.id, cause: cycle.cause });
@@ -816,7 +829,22 @@ function taskTopicCommand(args: string[], store: TaskStore): string {
     )}\n`;
   }
 
-  throw usageError("Topic usage: taskmux task topic create|list <task-id>.");
+  if (command === "summarize") {
+    const topic = readOption(rest, "--topic").trim();
+    validateTopicIds(store, taskId, [topic]);
+    const summary = readOption(rest, "--summary").trim();
+    if (summary.length === 0) {
+      throw usageError("Topic summary is required.");
+    }
+    store.appendTaskTopicSummary(
+      taskId,
+      `## ${topic}\n\n${summary}\n\n_Updated ${new Date().toISOString()}_\n\n`
+    );
+    recordTaskEvent(store, taskId, "topic.summary_updated", { topic });
+    return `Updated Topic summary ${topic} for task ${taskId}\n`;
+  }
+
+  throw usageError("Topic usage: taskmux task topic create|list|summarize <task-id>.");
 }
 
 function createTaskCommand(args: string[], store: TaskStore): string {
@@ -1323,6 +1351,9 @@ function updateTaskRoleCommand(args: string[], store: TaskStore): string {
     if (agent.length === 0) {
       throw usageError("--agent is required.");
     }
+    if (agent !== role.agent) {
+      throw usageError(`TaskRole Agent type is fixed after creation: ${role.agent}.`);
+    }
 
     const runner = resolveRunner(agent, store.listCustomRunners());
 
@@ -1677,13 +1708,15 @@ function addTaskCommentCommand(args: string[], store: TaskStore): string {
     throw taskNotFound(taskId);
   }
 
-  const body = bodyParts.join(" ").trim();
+  const topics = readRepeatedOption(bodyParts, "--topic").map((topic) => topic.trim());
+  validateTopicIds(store, taskId, topics);
+  const body = stripRepeatedOption(bodyParts, "--topic").join(" ").trim();
 
   if (body.length === 0) {
     throw usageError("Comment body is required.");
   }
 
-  const comment = createTaskComment(store.nextCommentId(taskId), body, new Date(), "user");
+  const comment = createTaskComment(store.nextCommentId(taskId), body, new Date(), "user", topics);
   store.saveComment(taskId, comment);
   recordTaskEvent(store, taskId, "comment.added", { comment: comment.id });
   queueLeaderWakeup(store, taskId, "user-comment");
@@ -1834,6 +1867,7 @@ type TaskContextRole = Role & {
 type TaskContext = {
   task: Task;
   brief: string | null;
+  topicSummaries: string | null;
   roles: TaskContextRole[];
   childRoles: ChildRole[];
   topics: {
@@ -1880,6 +1914,7 @@ function buildTaskContext(task: Task, store: TaskStore, includeTranscripts: bool
   return {
     task,
     brief: store.readTaskBrief(task.id),
+    topicSummaries: store.readTaskTopicSummaries(task.id),
     roles: store.listRoles(task.id).map((role) => includeTranscripts
       ? { ...role, transcript: store.readTranscript(task.id, role.name) }
       : role),
@@ -1911,6 +1946,7 @@ function renderTaskContextText(context: TaskContext, includeTranscripts: boolean
     "Task Context",
     ...renderTaskContextTaskLines(context.task),
     ...(context.brief === null ? [] : ["", context.brief.trimEnd()]),
+    ...(context.topicSummaries === null ? [] : ["", context.topicSummaries.trimEnd()]),
     "",
     renderTaskContextRoles(context.roles, includeTranscripts),
     ...(context.childRoles.length === 0
@@ -1989,6 +2025,29 @@ function queueLeaderWakeup(store: TaskStore, taskId: string, reason: string): vo
   );
 }
 
+function validateTopicIds(store: TaskStore, taskId: string, topics: string[]): void {
+  const knownTopics = new Set([
+    ...BUILTIN_TOPICS.map(({ id }) => id),
+    ...store.getTaskTopics(taskId).customTopics.map(({ id }) => id)
+  ]);
+  const unknownTopic = topics.find((topic) => !knownTopics.has(topic));
+  if (unknownTopic !== undefined) {
+    throw usageError(`Topic not found: ${unknownTopic}.`);
+  }
+}
+
+function stripRepeatedOption(args: string[], name: string): string[] {
+  const result: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] === name) {
+      index += 1;
+      continue;
+    }
+    result.push(args[index] ?? "");
+  }
+  return result;
+}
+
 function createResolvedRole(
   roleName: string,
   agent: string,
@@ -2058,6 +2117,10 @@ function copyGlobalRole(
 }
 
 function saveRoleAndRecordEvent(taskId: string, role: Role, store: TaskStore): void {
+  const existing = store.getRole(taskId, role.name);
+  if (existing !== null && existing.agent !== role.agent) {
+    throw usageError(`TaskRole Agent type is fixed after creation: ${existing.agent}.`);
+  }
   store.saveRole(taskId, role);
   recordTaskEvent(store, taskId, "role.assigned", { role: role.name, agent: role.agent });
 }
@@ -2651,6 +2714,7 @@ export function taskUsage(): string {
   taskmux task events <task-id>
   taskmux task topic create <task-id> --id <id> --name <name> --description <body>
   taskmux task topic list <task-id>
+  taskmux task topic summarize <task-id> --topic <topic> --summary <body>
   taskmux task input draft <task-id> <body>
   taskmux task input submit <task-id>
   taskmux task cycle create <task-id> --cause <cause> --summary <summary>

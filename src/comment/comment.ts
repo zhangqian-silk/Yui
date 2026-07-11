@@ -2,6 +2,7 @@ export type TaskComment = {
   schemaVersion: 1;
   id: string;
   body: string;
+  topics: string[];
   author?: "user" | "operator" | "leader";
   createdAt: string;
 };
@@ -10,7 +11,8 @@ export function createTaskComment(
   id: string,
   body: string,
   now: Date,
-  author?: TaskComment["author"]
+  author?: TaskComment["author"],
+  topics: string[] = []
 ): TaskComment {
   const trimmedBody = body.trim();
 
@@ -22,6 +24,7 @@ export function createTaskComment(
     schemaVersion: 1,
     id,
     body: trimmedBody,
+    topics: [...new Set(topics)],
     ...(author === undefined ? {} : { author }),
     createdAt: now.toISOString()
   };

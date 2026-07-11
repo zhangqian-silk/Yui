@@ -15,6 +15,8 @@ import { runBoardCommand } from "../commands/boardCommands.js";
 import { runConfigCommand } from "../commands/configCommands.js";
 import { runGlobalRoleCommand } from "../commands/globalRoleCommands.js";
 import { runRunnerCommand } from "../commands/runnerCommands.js";
+import { runImportCommand, runPruneCommand } from "../commands/maintenanceCommands.js";
+import { runBackupCommand } from "../commands/migrationCommands.js";
 import { replayPendingSnapshotWrites } from "../storage/recoveryJournal.js";
 import { createResilientTaskStore, primeResilientTaskStore } from "../storage/resilientTaskStore.js";
 import { rebuildDerivedIndex } from "../storage/derivedIndex.js";
@@ -313,6 +315,13 @@ async function handleRequest(
       sendJson(response, 200, cached);
       return;
     }
+    if (readRpcIntent(rootDir, rpc.requestId) !== null) {
+      sendJson(response, 409, {
+        requestId: rpc.requestId,
+        error: `Request ${rpc.requestId} may have been applied before a crash; its outcome is unknown.`
+      });
+      return;
+    }
 
     if (rpc.method === "wakeup.merge") {
       if (
@@ -337,6 +346,8 @@ async function handleRequest(
         return;
       }
 
+      writeRpcIntent(rootDir, rpc.requestId, rpc.method);
+
       const wakeup = mergePendingWakeup(
         task.id,
         rpc.params.reason,
@@ -347,6 +358,7 @@ async function handleRequest(
       processLeaderWakeups(store, tmux, new Date());
       const body = { requestId: rpc.requestId, result: { wakeup } };
       writeRpcResult(rootDir, rpc.requestId, body);
+      clearRpcIntent(rootDir, rpc.requestId);
       sendJson(response, 200, body);
       return;
     }
@@ -367,11 +379,13 @@ async function handleRequest(
         return;
       }
 
+      writeRpcIntent(rootDir, rpc.requestId, rpc.method);
       const output = runTaskCommand(rpc.params.args, store, tmux);
       processLeaderWakeups(store, tmux, new Date());
       refreshDerivedState();
       const body = { requestId: rpc.requestId, result: { output } };
       writeRpcResult(rootDir, rpc.requestId, body);
+      clearRpcIntent(rootDir, rpc.requestId);
       sendJson(response, 200, body);
       return;
     }
@@ -390,10 +404,12 @@ async function handleRequest(
         return;
       }
 
+      writeRpcIntent(rootDir, rpc.requestId, rpc.method);
       const output = runControllerCommandGroup(rpc.params.group, rpc.params.args, store, rootDir);
       refreshDerivedState();
       const body = { requestId: rpc.requestId, result: { output } };
       writeRpcResult(rootDir, rpc.requestId, body);
+      clearRpcIntent(rootDir, rpc.requestId);
       sendJson(response, 200, body);
       return;
     }
@@ -428,6 +444,12 @@ function runControllerCommandGroup(
       return runRunnerCommand(args, store);
     case "board":
       return runBoardCommand(store);
+    case "backup":
+      return runBackupCommand(rootDir);
+    case "import":
+      return runImportCommand(args, store);
+    case "prune":
+      return runPruneCommand(args, rootDir);
     default:
       throw new Error(`Unsupported Controller command group: ${group}`);
   }
@@ -451,6 +473,39 @@ function writeRpcResult(rootDir: string, requestId: string, body: unknown): void
   mkdirSync(directory, { recursive: true });
   writeFileSync(temporary, `${JSON.stringify(body, null, 2)}\n`, { mode: 0o600 });
   renameSync(temporary, target);
+}
+
+function readRpcIntent(rootDir: string, requestId: string): unknown | null {
+  try {
+    return JSON.parse(readFileSync(rpcIntentFile(rootDir, requestId), "utf8")) as unknown;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function writeRpcIntent(rootDir: string, requestId: string, method: string): void {
+  const directory = join(rootDir, "runtime", "rpc-intents");
+  const target = rpcIntentFile(rootDir, requestId);
+  const temporary = `${target}.${process.pid}.tmp`;
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(temporary, `${JSON.stringify({
+    schemaVersion: 1,
+    requestId,
+    method,
+    createdAt: new Date().toISOString()
+  }, null, 2)}\n`, { mode: 0o600 });
+  renameSync(temporary, target);
+}
+
+function clearRpcIntent(rootDir: string, requestId: string): void {
+  rmSync(rpcIntentFile(rootDir, requestId), { force: true });
+}
+
+function rpcIntentFile(rootDir: string, requestId: string): string {
+  return join(rootDir, "runtime", "rpc-intents", `${requestId}.json`);
 }
 
 function rpcResultFile(rootDir: string, requestId: string): string {

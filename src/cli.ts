@@ -101,6 +101,7 @@ Usage:
   taskmux task comments <task-id>
   taskmux task events <task-id>
   taskmux task topic create <task-id> --id <id> --name <name> --description <body>
+  taskmux task topic summarize <task-id> --topic <topic> --summary <body>
   taskmux task input draft|submit <task-id> [body]
   taskmux task cycle create <task-id> --cause <cause> --summary <body>
   taskmux task cycle end <task-id> <cycle-id> --summary <body>
@@ -187,6 +188,10 @@ async function main(): Promise<void> {
 
   if (args[0] === "backup") {
     requireStorageSchema(rootDir);
+    if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
+      await printControllerCommand(rootDir, "backup", []);
+      return;
+    }
     emit(runBackupCommand(rootDir));
     return;
   }
@@ -220,6 +225,10 @@ async function main(): Promise<void> {
 
   if (args[0] === "import") {
     requireStorageSchema(rootDir);
+    if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
+      await printControllerCommand(rootDir, "import", args.slice(1));
+      return;
+    }
     const store = new FileTaskStore(rootDir);
     emit(runImportCommand(args.slice(1), store));
     return;
@@ -227,6 +236,10 @@ async function main(): Promise<void> {
 
   if (args[0] === "prune") {
     requireStorageSchema(rootDir);
+    if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
+      await printControllerCommand(rootDir, "prune", args.slice(1));
+      return;
+    }
     emit(runPruneCommand(args.slice(1), rootDir));
     return;
   }
@@ -318,7 +331,23 @@ async function main(): Promise<void> {
         throw usageError("Task id is required.");
       }
 
-      await runTaskShell(taskId, store, tmux);
+      if (process.env.TASKMUX_CONTROLLER_MODE === "direct") {
+        await runTaskShell(taskId, store, tmux);
+        return;
+      }
+      const discovery = await ensureControllerRunning(rootDir, process.env);
+      await runTaskShell(taskId, store, tmux, async (commandArgs) => {
+        if (commandArgs[0] === "enter") {
+          return runTaskCommand(commandArgs, store, tmux);
+        }
+        const result = await callController(
+          discovery,
+          "task.command",
+          randomUUID(),
+          { args: commandArgs }
+        ) as { output: string };
+        return result.output;
+      });
       return;
     }
 

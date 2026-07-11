@@ -46,8 +46,12 @@ export class TmuxManager {
     } else {
       this.ensureWindow(taskId, role, launch);
     }
-    this.runner.run(this.tmuxBin, ["send-keys", "-l", "-t", this.target(taskId, role.name), input]);
-    this.runner.run(this.tmuxBin, ["send-keys", "-t", this.target(taskId, role.name), "Enter"]);
+    this.sendRoleInput(taskId, role.name, input);
+  }
+
+  sendRoleInput(taskId: string, roleName: string, input: string): void {
+    this.runner.run(this.tmuxBin, ["send-keys", "-l", "-t", this.target(taskId, roleName), "--", input]);
+    this.runner.run(this.tmuxBin, ["send-keys", "-t", this.target(taskId, roleName), "Enter"]);
   }
 
   detachRole(taskId: string): void {
