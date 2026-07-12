@@ -14,20 +14,25 @@ import {
 
 export type CompletionQuestion = (prompt: string) => Promise<string>;
 
+export type CompletionWizardOptions = {
+  width?: number;
+  defaultSelection?: "current-shell" | "skip";
+};
+
 export async function runCompletionWizard(
   operation: "install" | "uninstall",
   store: TaskStore,
   env: NodeJS.ProcessEnv,
   identity: CliIdentity,
   question: CompletionQuestion,
-  width?: number,
-  defaultSelection: "current-shell" | "skip" = "current-shell"
+  options: CompletionWizardOptions = {}
 ): Promise<string> {
   const states = inspectCompletionStates(store.getConfig(), env, identity);
   const current = currentCompletionShell(env);
+  const defaultSelection = options.defaultSelection ?? "current-shell";
   const defaultHint = defaultSelection === "skip" ? " [skip]" : current === undefined ? "" : ` [${current}]`;
   const skipHint = defaultSelection === "skip" ? "" : " (or skip)";
-  const answer = await question(`${renderCompletionStateTable(states, width)}\nChoose shell by number or name${defaultHint}${skipHint}: `);
+  const answer = await question(`${renderCompletionStateTable(states, options.width)}\nChoose shell by number or name${defaultHint}${skipHint}: `);
   const normalizedAnswer = answer.trim().toLowerCase();
   if (normalizedAnswer === "skip" || (normalizedAnswer.length === 0 && defaultSelection === "skip")) {
     return `Completion ${operation} skipped.\n`;

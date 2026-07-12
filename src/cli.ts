@@ -115,7 +115,14 @@ async function main(): Promise<void> {
               const next = await iterator?.next();
               return next?.done === true || next === undefined ? "skip" : next.value;
             };
-        emit(await runCompletionWizard(args[1], store, process.env, resolveCliIdentity(process.env), question, process.stdout.columns));
+        emit(await runCompletionWizard(
+          args[1],
+          store,
+          process.env,
+          resolveCliIdentity(process.env),
+          question,
+          { width: process.stdout.columns }
+        ));
       } finally {
         readline.close();
       }
