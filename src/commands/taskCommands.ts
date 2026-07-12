@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createTaskComment } from "../comment/comment.js";
 import { createTaskBrief, renderTaskBrief } from "../brief/taskBrief.js";
-import { createCycle, endCycle, type CycleCause } from "../cycle/cycle.js";
+import { CYCLE_CAUSES, createCycle, endCycle, type CycleCause } from "../cycle/cycle.js";
 import { createDecision, renderDecisionTimelineEntry, supersedeDecision } from "../decision/decision.js";
 import { compileDispatchInput } from "../context/dispatchContext.js";
 import { roleNotFound, runtimeError, taskNotFound, usageError } from "../errors/cliError.js";
@@ -612,12 +612,7 @@ function taskCycleCommand(args: string[], store: TaskStore): string {
   const cause = readOption(rest, "--cause");
   const topics = readRepeatedOption(rest, "--topic").map((topic) => topic.trim());
   validateTopicIds(store, taskId, topics);
-  const allowedCauses = [
-    "task-created", "user-comment", "schedule", "review-time", "operator-input",
-    "role-result", "inactivity", "explicit-wake"
-  ];
-
-  if (!allowedCauses.includes(cause)) {
+  if (!CYCLE_CAUSES.includes(cause as CycleCause)) {
     throw usageError(`Invalid cycle cause: ${cause}.`);
   }
 

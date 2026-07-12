@@ -1,11 +1,25 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const packageJson = JSON.parse(readFileSync("package.json", "utf8"));
+
+function shellQuote(value) {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function runBashCompletion(completion, words, env = process.env, preamble = "") {
+  return spawnSync("bash", ["-c", `${completion}
+${preamble}
+COMP_WORDS=(${words.map(shellQuote).join(" ")})
+COMP_CWORD=${words.length - 1}
+_taskmux
+if (( \${#COMPREPLY[@]} > 0 )); then printf '<%s>\\n' "\${COMPREPLY[@]}"; fi
+`], { encoding: "utf8", env });
+}
 
 test("prints discoverable root help through the help command", () => {
   const output = execFileSync("node", ["dist/cli.js", "help"], {
@@ -215,6 +229,54 @@ printf '%s\\n' "\${COMPREPLY[@]}"
   assert.deepEqual(value.stdout.trim().split("\n"), ["feature", "bug", "review"]);
 });
 
+test("completion owns positional shell values and finite cycle causes", () => {
+  const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], { encoding: "utf8" });
+  const setShell = runBashCompletion(bash, ["taskmux", "config", "set", "completion", ""]);
+  const unsetShell = runBashCompletion(bash, ["taskmux", "config", "unset", "completion", ""]);
+  const cycleCause = runBashCompletion(bash, ["taskmux", "task", "cycle", "create", "task-1", "--cause", ""]);
+  const installOperand = runBashCompletion(bash, ["taskmux", "completion", "install", ""]);
+  const uninstallOperand = runBashCompletion(bash, ["taskmux", "completion", "uninstall", ""]);
+
+  assert.deepEqual(setShell.stdout.trim().split("\n"), ["<bash>", "<zsh>", "<fish>"]);
+  assert.deepEqual(unsetShell.stdout.trim().split("\n"), ["<bash>", "<zsh>", "<fish>"]);
+  assert.deepEqual(cycleCause.stdout.trim().split("\n"), [
+    "<task-created>", "<user-comment>", "<schedule>", "<review-time>",
+    "<operator-input>", "<role-result>", "<inactivity>", "<explicit-wake>"
+  ]);
+  assert.equal(installOperand.stdout, "");
+  assert.equal(uninstallOperand.stdout, "");
+});
+
+test("agent command completion suggests unique PATH executables", () => {
+  const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], { encoding: "utf8" });
+  const root = mkdtempSync(join(tmpdir(), "taskmux-completion-executables-"));
+  const first = join(root, "first");
+  const second = join(root, "second");
+  mkdirSync(first);
+  mkdirSync(second);
+  for (const directory of [first, second]) {
+    const executable = join(directory, "taskmux-fixture-tool");
+    writeFileSync(executable, "#!/bin/sh\n");
+    chmodSync(executable, 0o755);
+  }
+  writeFileSync(join(first, "taskmux-fixture-text"), "not executable\n");
+
+  try {
+    const result = runBashCompletion(
+      bash,
+      ["taskmux", "agent", "add", "demo", "--command", "taskmux-fixture-"],
+      { ...process.env, PATH: `${first}:${second}:${process.env.PATH ?? ""}` },
+      "taskmux-fixture-function() { :; }"
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(result.stdout.trim().split("\n"), ["<taskmux-fixture-tool>"]);
+    assert.match(bash, /compgen -c/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("completion suppresses unrelated file fallback but keeps catalog-declared file arguments", () => {
   const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], { encoding: "utf8" });
   const fish = execFileSync("node", ["dist/cli.js", "completion", "fish"], { encoding: "utf8" });
@@ -248,6 +310,28 @@ printf 'show:%s\\n' "\${COMPREPLY[@]}"
   }
 });
 
+test("bash file completion preserves spaced candidates and filename semantics", () => {
+  const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], { encoding: "utf8" });
+  const root = mkdtempSync(join(tmpdir(), "taskmux-completion-spaces-"));
+  writeFileSync(join(root, "state backup.json"), "{}");
+
+  try {
+    const result = spawnSync("bash", ["-c", `${bash}
+cd "$1"
+COMP_WORDS=(taskmux import state)
+COMP_CWORD=2
+_taskmux
+printf '<%s>\\n' "\${COMPREPLY[@]}"
+`, "completion-space-test", root], { encoding: "utf8" });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "<state backup.json>");
+    assert.match(bash, /compopt -o filenames/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("completion scope is derived only from words before the current token", () => {
   const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], { encoding: "utf8" });
   const zsh = execFileSync("node", ["dist/cli.js", "completion", "zsh"], { encoding: "utf8" });
@@ -258,6 +342,7 @@ test("completion scope is derived only from words before the current token", () 
   assert.match(zsh, /CURRENT > 2/);
   assert.doesNotMatch(zsh, /words\[2,-1\]/);
   assert.match(fish, /commandline -opc/);
+  assert.match(fish, /string join ' ' -- \$prior/);
 
   const bashResult = spawnSync("bash", ["-c", `${bash}
 COMP_WORDS=(taskmux task ro)
@@ -307,7 +392,7 @@ printf '%s\\n' "\${COMPREPLY[@]}"
   assert.doesNotMatch(bashResult.stdout, /^export$/m);
 });
 
-test("zsh completion works as an autoloaded fpath function after compinit", {
+test("zsh completion preserves catalog behavior across candidate kinds", {
   skip: spawnSync("zsh", ["--version"], { stdio: "ignore" }).status !== 0
 }, () => {
   const root = mkdtempSync(join(tmpdir(), "taskmux-zsh-completion-"));
@@ -315,18 +400,108 @@ test("zsh completion works as an autoloaded fpath function after compinit", {
   writeFileSync(join(root, "_taskmux"), completion);
 
   try {
-    const result = spawnSync("zsh", [
+    const invoke = (words) => spawnSync("zsh", [
       "-f",
       "-c",
-      'fpath=("$1" $fpath); autoload -Uz compinit; compinit -i -d "$1/.zcompdump"; autoload -Uz _taskmux; function compadd { print -rl -- "$@"; }; words=(taskmux ve); CURRENT=2; _taskmux; words=(taskmux task ro); CURRENT=3; _taskmux',
+      `fpath=("$1" $fpath)
+autoload -Uz compinit
+compinit -i -d "$1/.zcompdump"
+autoload -Uz _taskmux
+function compadd {
+  local argument emit=0
+  for argument in "$@"; do
+    if (( emit )); then print -r -- "$argument"; elif [[ "$argument" == -- ]]; then emit=1; fi
+  done
+}
+function _files { print -r -- 'state backup.json'; }
+function _command_names { [[ "$1" == -e ]] || return 9; print -r -- 'taskmux-fixture-tool'; }
+words=(${words.map(shellQuote).join(" ")})
+CURRENT=${words.length}
+_taskmux`,
       "taskmux-completion-test",
       root
     ], { encoding: "utf8" });
 
-    assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /^version$/m);
-    assert.match(result.stdout, /^role$/m);
-    assert.match(completion, /compadd -V taskmux-catalog/);
+    const rootCandidates = invoke(["taskmux", ""]);
+    const optionCandidates = invoke(["taskmux", "task", "create", "--"]);
+    const enumCandidates = invoke(["taskmux", "task", "create", "--template", ""]);
+    const hybridCandidates = invoke(["taskmux", "task", "transcript", "export", "--"]);
+    const fileCandidates = invoke(["taskmux", "import", "state"]);
+    const executableCandidates = invoke(["taskmux", "agent", "add", "demo", "--command", "taskmux"]);
+
+    assert.deepEqual(rootCandidates.stdout.trim().split("\n"), [
+      "task", "operator", "setup", "config", "agent", "role", "completion",
+      "controller", "doctor", "backup", "export", "import", "prune", "update", "version", "help"
+    ]);
+    assert.deepEqual(optionCandidates.stdout.trim().split("\n"), [
+      "--template", "--agent", "--workspace", "--description", "--priority", "--tag", "--due"
+    ]);
+    assert.deepEqual(enumCandidates.stdout.trim().split("\n"), ["feature", "bug", "review"]);
+    assert.deepEqual(hybridCandidates.stdout.trim().split("\n"), ["--format", "--output"]);
+    assert.equal(fileCandidates.stdout.trim(), "state backup.json");
+    assert.equal(executableCandidates.stdout.trim(), "taskmux-fixture-tool");
+    for (const result of [rootCandidates, optionCandidates, enumCandidates, hybridCandidates, fileCandidates, executableCandidates]) {
+      assert.equal(result.status, 0, result.stderr);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fish completion executes catalog ordering and ownership rules", {
+  skip: spawnSync("fish", ["--version"], { stdio: "ignore" }).status !== 0
+}, () => {
+  const root = mkdtempSync(join(tmpdir(), "taskmux-fish-completion-"));
+  const completionPath = join(root, "taskmux.fish");
+  const bin = join(root, "bin");
+  mkdirSync(bin);
+  writeFileSync(join(bin, "taskmux-fixture-tool"), "#!/bin/sh\n");
+  chmodSync(join(bin, "taskmux-fixture-tool"), 0o755);
+  writeFileSync(completionPath, execFileSync("node", ["dist/cli.js", "completion", "fish"], { encoding: "utf8" }));
+
+  try {
+    const invoke = (prior, current) => spawnSync("fish", ["-c", `
+set -g test_prior ${prior.map(shellQuote).join(" ")}
+set -g test_current ${shellQuote(current)}
+function commandline
+  if test "$argv[1]" = -opc
+    printf '%s\\n' $test_prior
+  else if test "$argv[1]" = -ct
+    printf '%s' "$test_current"
+  end
+end
+function __fish_complete_path
+  printf '%s\\n' 'state backup.json'
+end
+function __fish_complete_command
+  printf '%s\\n' taskmux-fixture-function taskmux-fixture-tool taskmux-fixture-tool
+end
+function taskmux-fixture-function; end
+source "$argv[1]"
+_taskmux
+`, completionPath], { encoding: "utf8", env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` } });
+
+    const rootCandidates = invoke(["taskmux"], "");
+    const optionCandidates = invoke(["taskmux", "task", "create"], "--");
+    const enumCandidates = invoke(["taskmux", "task", "create", "--template"], "");
+    const hybridCandidates = invoke(["taskmux", "task", "transcript", "export"], "--");
+    const fileCandidates = invoke(["taskmux", "import"], "state");
+    const executableCandidates = invoke(["taskmux", "agent", "add", "demo", "--command"], "taskmux");
+
+    assert.deepEqual(rootCandidates.stdout.trim().split("\n"), [
+      "task", "operator", "setup", "config", "agent", "role", "completion",
+      "controller", "doctor", "backup", "export", "import", "prune", "update", "version", "help"
+    ]);
+    assert.deepEqual(optionCandidates.stdout.trim().split("\n"), [
+      "--template", "--agent", "--workspace", "--description", "--priority", "--tag", "--due"
+    ]);
+    assert.deepEqual(enumCandidates.stdout.trim().split("\n"), ["feature", "bug", "review"]);
+    assert.deepEqual(hybridCandidates.stdout.trim().split("\n"), ["--format", "--output"]);
+    assert.equal(fileCandidates.stdout.trim(), "state backup.json");
+    assert.equal(executableCandidates.stdout.trim(), "taskmux-fixture-tool");
+    for (const result of [rootCandidates, optionCandidates, enumCandidates, hybridCandidates, fileCandidates, executableCandidates]) {
+      assert.equal(result.status, 0, result.stderr);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -13,8 +13,10 @@ function leaf(name, path = ["taskmux", name]) {
     sections: [],
     options: [],
     optionValues: {},
+    argumentValues: {},
     fileOptions: [],
     fileArguments: [],
+    executableOptions: [],
     commandPathArguments: false,
     values: [],
     children: []
@@ -32,8 +34,10 @@ function rootWith(children, sections) {
     sections,
     options: [],
     optionValues: {},
+    argumentValues: {},
     fileOptions: [],
     fileArguments: [],
+    executableOptions: [],
     commandPathArguments: false,
     values: [],
     children
@@ -96,6 +100,66 @@ test("catalog validation rejects duplicate tokens and removed alias surfaces", a
     catalog.options = [alias];
     assert.throws(() => validateCommandCatalog(catalog), /reserved alias token/i, alias);
   }
+});
+
+test("catalog validation rejects ambiguous completion ownership", async () => {
+  const { validateCommandCatalog } = await import("../dist/cli/commandCatalog.js");
+  const catalog = rootWith([], []);
+  catalog.options = ["--target"];
+
+  catalog.fileOptions = ["--target", "--target"];
+  assert.throws(() => validateCommandCatalog(catalog), /duplicate file completion option/i);
+
+  catalog.fileOptions = [];
+  catalog.executableOptions = ["--target", "--target"];
+  assert.throws(() => validateCommandCatalog(catalog), /duplicate executable completion option/i);
+
+  catalog.executableOptions = ["--target"];
+  catalog.optionValues = { "--target": ["one"] };
+  assert.throws(() => validateCommandCatalog(catalog), /multiple completion owners.*--target/i);
+
+  catalog.optionValues = {};
+  catalog.fileOptions = ["--target"];
+  assert.throws(() => validateCommandCatalog(catalog), /multiple completion owners.*--target/i);
+
+  catalog.fileOptions = [];
+  catalog.executableOptions = [];
+  catalog.argumentValues = { 0: ["one"] };
+  catalog.fileArguments = [0];
+  assert.throws(() => validateCommandCatalog(catalog), /multiple completion owners.*argument 0/i);
+});
+
+test("catalog validation rejects empty enum metadata", async () => {
+  const { validateCommandCatalog } = await import("../dist/cli/commandCatalog.js");
+
+  const emptyName = rootWith([], [{ id: "values", title: "Values", entries: [""] }]);
+  emptyName.values = [{ name: "", summary: "value" }];
+  assert.throws(() => validateCommandCatalog(emptyName), /command value name is required/i);
+
+  const emptySummary = rootWith([], [{ id: "values", title: "Values", entries: ["one"] }]);
+  emptySummary.values = [{ name: "one", summary: "" }];
+  assert.throws(() => validateCommandCatalog(emptySummary), /command value summary is required.*one/i);
+
+  const optionEnum = rootWith([], []);
+  optionEnum.options = ["--kind"];
+  optionEnum.optionValues = { "--kind": [""] };
+  assert.throws(() => validateCommandCatalog(optionEnum), /empty option value.*--kind/i);
+
+  const argumentEnum = rootWith([], []);
+  argumentEnum.argumentValues = { 0: [""] };
+  assert.throws(() => validateCommandCatalog(argumentEnum), /empty argument value.*argument 0/i);
+});
+
+test("catalog validation permits only one command-path provider", async () => {
+  const { validateCommandCatalog } = await import("../dist/cli/commandCatalog.js");
+  const first = { ...leaf("first"), commandPathArguments: true };
+  const second = { ...leaf("second"), commandPathArguments: true };
+  const catalog = rootWith(
+    [first, second],
+    [{ id: "main", title: "Main", entries: ["first", "second"] }]
+  );
+
+  assert.throws(() => validateCommandCatalog(catalog), /multiple command-path providers.*taskmux/i);
 });
 
 test("catalog declares stable semantic sections for every command group", async () => {

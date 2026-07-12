@@ -1,3 +1,5 @@
+import { CYCLE_CAUSES } from "../cycle/cycle.js";
+
 export type CommandNodeKind = "group" | "leaf" | "hybrid";
 
 export type CommandValue = {
@@ -23,8 +25,10 @@ export type CommandNode = {
   options: readonly string[];
   values: readonly CommandValue[];
   optionValues: Readonly<Record<string, readonly string[]>>;
+  argumentValues: Readonly<Record<number, readonly string[]>>;
   fileOptions: readonly string[];
   fileArguments: readonly number[];
+  executableOptions: readonly string[];
   commandPathArguments: boolean;
 };
 
@@ -39,8 +43,10 @@ type NodeInput = {
   options?: readonly string[];
   values?: readonly (string | CommandValue)[];
   optionValues?: Readonly<Record<string, readonly string[]>>;
+  argumentValues?: Readonly<Record<number, readonly string[]>>;
   fileOptions?: readonly string[];
   fileArguments?: readonly number[];
+  executableOptions?: readonly string[];
   commandPathArguments?: boolean;
 };
 
@@ -50,6 +56,9 @@ function buildNode(input: NodeInput, parentPath: readonly string[] = []): Comman
   const executable = input.executable ?? children.length === 0;
   const optionValues = Object.fromEntries(
     Object.entries(input.optionValues ?? {}).map(([option, values]) => [option, Object.freeze([...values])])
+  );
+  const argumentValues = Object.fromEntries(
+    Object.entries(input.argumentValues ?? {}).map(([position, values]) => [position, Object.freeze([...values])])
   );
   const usage = input.usage === undefined
     ? [`${path.join(" ")}${children.length > 0 && !executable ? " <command>" : ""}`]
@@ -73,8 +82,10 @@ function buildNode(input: NodeInput, parentPath: readonly string[] = []): Comman
       typeof value === "string" ? { name: value, summary: value } : { ...value }
     ))),
     optionValues: Object.freeze(optionValues),
+    argumentValues: Object.freeze(argumentValues),
     fileOptions: Object.freeze([...(input.fileOptions ?? [])]),
     fileArguments: Object.freeze([...(input.fileArguments ?? [])]),
+    executableOptions: Object.freeze([...(input.executableOptions ?? [])]),
     commandPathArguments: input.commandPathArguments ?? false
   });
 }
@@ -139,7 +150,7 @@ const taskChildren: readonly NodeInput[] = [
     { name: "submit", summary: "Submit drafted task input.", usage: "taskmux task input submit <task-id>" }
   ] },
   { name: "cycle", summary: "Manage task cycles.", sections: [{ id: "manage", title: "Manage", entries: ["create", "end"] }], children: [
-    { name: "create", summary: "Create a task cycle.", usage: "taskmux task cycle create <task-id> --cause <cause> --summary <body> [--topic <topic> ...]", options: ["--cause", "--summary", "--topic"] },
+    { name: "create", summary: "Create a task cycle.", usage: "taskmux task cycle create <task-id> --cause <cause> --summary <body> [--topic <topic> ...]", options: ["--cause", "--summary", "--topic"], optionValues: { "--cause": CYCLE_CAUSES } },
     { name: "end", summary: "End a task cycle.", usage: "taskmux task cycle end <task-id> <cycle-id> --summary <body>", options: ["--summary"] }
   ] },
   { name: "work-item", summary: "Manage finite work items.", sections: [{ id: "manage", title: "Manage", entries: ["create", "update"] }], children: [
@@ -223,7 +234,7 @@ export const ROOT_COMMAND = buildNode({
       ], children: [
         { name: "default-agent", summary: "Set the default agent.", usage: "taskmux config set default-agent <agent-id>" },
         { name: "default-workspace", summary: "Set the default workspace.", usage: "taskmux config set default-workspace <path>", fileArguments: [0] },
-        { name: "completion", summary: "Set one completion installation record.", usage: "taskmux config set completion <bash|zsh|fish> <script-path> <activation-path>", fileArguments: [1, 2] }
+        { name: "completion", summary: "Set one completion installation record.", usage: "taskmux config set completion <bash|zsh|fish> <script-path> <activation-path>", argumentValues: { 0: ["bash", "zsh", "fish"] }, fileArguments: [1, 2] }
       ] },
       { name: "unset", summary: "Clear a configuration value.", sections: [
         { id: "defaults", title: "Defaults", entries: ["default-agent", "default-workspace"] },
@@ -231,14 +242,14 @@ export const ROOT_COMMAND = buildNode({
       ], children: [
         { name: "default-agent", summary: "Clear the default agent." },
         { name: "default-workspace", summary: "Clear the default workspace." },
-        { name: "completion", summary: "Clear one completion installation record.", usage: "taskmux config unset completion <bash|zsh|fish>" }
+        { name: "completion", summary: "Clear one completion installation record.", usage: "taskmux config unset completion <bash|zsh|fish>", argumentValues: { 0: ["bash", "zsh", "fish"] } }
       ] }
     ] },
     { name: "agent", summary: "Manage configured native agent CLIs.", sections: [
       { id: "inspect", title: "Inspect", entries: ["list", "show"] },
       { id: "manage", title: "Manage", entries: ["add", "remove"] }
     ], children: [
-      { name: "add", summary: "Add an agent.", usage: "taskmux agent add <agent-id> --command <command> [--arg <arg> ...] [--env KEY=value ...]", options: ["--command", "--arg", "--env"], fileOptions: ["--command"] },
+      { name: "add", summary: "Add an agent.", usage: "taskmux agent add <agent-id> --command <command> [--arg <arg> ...] [--env KEY=value ...]", options: ["--command", "--arg", "--env"], executableOptions: ["--command"] },
       { name: "list", summary: "List agents." },
       { name: "show", summary: "Show an agent.", usage: "taskmux agent show <agent-id>" },
       { name: "remove", summary: "Remove an agent.", usage: "taskmux agent remove <agent-id>" }
@@ -305,12 +316,16 @@ export function findChild(node: CommandNode, name: string): CommandNode | undefi
 
 export function validateCommandCatalog(root: CommandNode): void {
   const reservedAliases = new Set(["-h", "--help", "-help", "-v", "--version"]);
+  const commandPathProviders: CommandNode[] = [];
   const visit = (node: CommandNode): void => {
     if (node.summary.trim().length === 0) {
       throw new Error(`Command summary is required: ${node.path.join(" ")}`);
     }
     if (node.usage.length === 0) {
       throw new Error(`Command usage is required: ${node.path.join(" ")}`);
+    }
+    if (node.commandPathArguments) {
+      commandPathProviders.push(node);
     }
     const names = new Set<string>();
     for (const child of node.children) {
@@ -326,6 +341,13 @@ export function validateCommandCatalog(root: CommandNode): void {
     const immediateTokens = new Set(names);
     for (const value of node.values) {
       const valueName = typeof value === "string" ? value : value.name;
+      const valueSummary = typeof value === "string" ? value : value.summary;
+      if (valueName.trim().length === 0) {
+        throw new Error(`Command value name is required: ${node.path.join(" ")}`);
+      }
+      if (valueSummary.trim().length === 0) {
+        throw new Error(`Command value summary is required: ${[...node.path, valueName].join(" ")}`);
+      }
       if (immediateTokens.has(valueName)) {
         throw new Error(`Duplicate command token: ${[...node.path, valueName].join(" ")}`);
       }
@@ -379,14 +401,55 @@ export function validateCommandCatalog(root: CommandNode): void {
       if (new Set(values).size !== values.length) {
         throw new Error(`Duplicate option value: ${[...node.path, option].join(" ")}`);
       }
+      if (values.some((value) => value.trim().length === 0)) {
+        throw new Error(`Empty option value is not allowed: ${[...node.path, option].join(" ")}`);
+      }
+    }
+    const argumentValuePositions = new Set<number>();
+    for (const [positionText, values] of Object.entries(node.argumentValues)) {
+      const position = Number(positionText);
+      if (!Number.isInteger(position) || position < 0) {
+        throw new Error(`Argument value positions must be non-negative integers: ${node.path.join(" ")}`);
+      }
+      argumentValuePositions.add(position);
+      if (new Set(values).size !== values.length) {
+        throw new Error(`Duplicate argument value: ${node.path.join(" ")} argument ${position}`);
+      }
+      if (values.some((value) => value.trim().length === 0)) {
+        throw new Error(`Empty argument value is not allowed: ${node.path.join(" ")} argument ${position}`);
+      }
+    }
+    if (new Set(node.fileOptions).size !== node.fileOptions.length) {
+      throw new Error(`Duplicate file completion option: ${node.path.join(" ")}`);
     }
     for (const option of node.fileOptions) {
       if (!optionNames.has(option)) {
         throw new Error(`File completion references unknown option: ${[...node.path, option].join(" ")}`);
       }
     }
+    if (new Set(node.executableOptions).size !== node.executableOptions.length) {
+      throw new Error(`Duplicate executable completion option: ${node.path.join(" ")}`);
+    }
+    for (const option of node.executableOptions) {
+      if (!optionNames.has(option)) {
+        throw new Error(`Executable completion references unknown option: ${[...node.path, option].join(" ")}`);
+      }
+    }
+    for (const option of optionNames) {
+      const owners = Number(Object.hasOwn(node.optionValues, option))
+        + Number(node.fileOptions.includes(option))
+        + Number(node.executableOptions.includes(option));
+      if (owners > 1) {
+        throw new Error(`Multiple completion owners for option: ${[...node.path, option].join(" ")}`);
+      }
+    }
     if (new Set(node.fileArguments).size !== node.fileArguments.length || node.fileArguments.some((index) => !Number.isInteger(index) || index < 0)) {
       throw new Error(`File argument positions must be unique non-negative integers: ${node.path.join(" ")}`);
+    }
+    for (const position of node.fileArguments) {
+      if (argumentValuePositions.has(position)) {
+        throw new Error(`Multiple completion owners for argument ${position}: ${node.path.join(" ")}`);
+      }
     }
 
     for (const child of node.children) {
@@ -394,6 +457,13 @@ export function validateCommandCatalog(root: CommandNode): void {
     }
   };
   visit(root);
+  if (commandPathProviders.length > 1) {
+    throw new Error(`Multiple command-path providers are not allowed: ${root.path.join(" ")}`);
+  }
+  const commandPathProvider = commandPathProviders[0];
+  if (commandPathProvider !== undefined && commandPathProvider.path.length !== root.path.length + 1) {
+    throw new Error(`Command-path provider must be a root command: ${commandPathProvider.path.join(" ")}`);
+  }
 }
 
 export function listPublicCommandPaths(root: CommandNode = ROOT_COMMAND): string[] {

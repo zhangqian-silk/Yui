@@ -12,8 +12,10 @@ type CompletionEntry = {
   immediate: readonly string[];
   options: readonly string[];
   optionValues: Readonly<Record<string, readonly string[]>>;
+  argumentValues: Readonly<Record<number, readonly string[]>>;
   fileOptions: readonly string[];
   fileArguments: readonly number[];
+  executableOptions: readonly string[];
   acceptsArguments: boolean;
 };
 
@@ -43,8 +45,10 @@ function collectEntries(root: CommandNode): CompletionEntry[] {
         immediate: orderedImmediateTokens(node),
         options: node.options,
         optionValues: node.optionValues,
+        argumentValues: node.argumentValues,
         fileOptions: node.fileOptions,
         fileArguments: node.fileArguments,
+        executableOptions: node.executableOptions,
         acceptsArguments: node.kind !== "group"
       });
     }
@@ -63,8 +67,10 @@ function collectEntries(root: CommandNode): CompletionEntry[] {
         immediate: orderedImmediateTokens(target),
         options: [],
         optionValues: {},
+        argumentValues: {},
         fileOptions: [],
         fileArguments: [],
+        executableOptions: [],
         acceptsArguments: true
       });
       visibleChildren(target).forEach(addHelpPath);
@@ -80,7 +86,7 @@ function renderBash(entries: readonly CompletionEntry[], identity: CliIdentity):
   const containsFunction = `${functionName}_contains`;
   return `${functionName}() {
   local path current previous argument_index command_depth
-  local -a immediate options value_keys value_lists file_options file_arguments candidates
+  local -a immediate options value_keys value_lists argument_value_positions argument_value_lists file_options file_arguments executable_options candidates
   path=""
   current="\${COMP_WORDS[COMP_CWORD]}"
   previous=""
@@ -90,7 +96,7 @@ function renderBash(entries: readonly CompletionEntry[], identity: CliIdentity):
   if (( COMP_CWORD > 1 )); then
     path="\${COMP_WORDS[*]:1:COMP_CWORD-1}"
   fi
-  immediate=(); options=(); value_keys=(); value_lists=(); file_options=(); file_arguments=(); candidates=()
+  immediate=(); options=(); value_keys=(); value_lists=(); argument_value_positions=(); argument_value_lists=(); file_options=(); file_arguments=(); executable_options=(); candidates=()
   case "$path" in
 ${renderBashCases(entries)}
     *) return 0;;
@@ -106,6 +112,14 @@ ${renderBashCases(entries)}
         break
       fi
     done
+    if (( \${#candidates[@]} == 0 )); then
+      for ((index=0; index<\${#argument_value_positions[@]}; index+=1)); do
+        if [[ "$argument_index" == "\${argument_value_positions[index]}" ]]; then
+          read -r -a candidates <<< "\${argument_value_lists[index]}"
+          break
+        fi
+      done
+    fi
     if (( \${#candidates[@]} == 0 && argument_index == 0 )); then
       candidates=("\${immediate[@]}")
     fi
@@ -115,8 +129,22 @@ ${renderBashCases(entries)}
     COMPREPLY=( $(compgen -W "\${candidates[*]}" -- "$current") )
     return 0
   fi
+  if ${containsFunction} "$previous" "\${executable_options[@]}"; then
+    local command
+    local -A seen_commands=()
+    COMPREPLY=()
+    while IFS= read -r command; do
+      if [[ -n "$command" && -z "\${seen_commands[$command]+x}" ]] && type -P -- "$command" >/dev/null 2>&1; then
+        seen_commands[$command]=1
+        COMPREPLY+=("$command")
+      fi
+    done < <(compgen -c -- "$current")
+    compopt -o nosort 2>/dev/null || true
+    return 0
+  fi
   if ${containsFunction} "$previous" "\${file_options[@]}" || ${containsFunction} "$argument_index" "\${file_arguments[@]}"; then
-    COMPREPLY=( $(compgen -f -- "$current") )
+    mapfile -t COMPREPLY < <(compgen -f -- "$current")
+    compopt -o filenames 2>/dev/null || true
   else
     COMPREPLY=()
   fi
@@ -143,8 +171,11 @@ function renderBashCases(entries: readonly CompletionEntry[]): string {
       `options=(${entry.options.map(shellQuote).join(" ")})`,
       `value_keys=(${Object.keys(entry.optionValues).map(shellQuote).join(" ")})`,
       `value_lists=(${Object.values(entry.optionValues).map((values) => shellQuote(values.join(" "))).join(" ")})`,
+      `argument_value_positions=(${Object.keys(entry.argumentValues).join(" ")})`,
+      `argument_value_lists=(${Object.values(entry.argumentValues).map((values) => shellQuote(values.join(" "))).join(" ")})`,
       `file_options=(${entry.fileOptions.map(shellQuote).join(" ")})`,
-      `file_arguments=(${entry.fileArguments.join(" ")})`
+      `file_arguments=(${entry.fileArguments.join(" ")})`,
+      `executable_options=(${entry.executableOptions.map(shellQuote).join(" ")})`
     ];
     return `    ${pattern}) ${assignments.join("; ")};;`;
   }).join("\n");
@@ -153,7 +184,7 @@ function renderBashCases(entries: readonly CompletionEntry[]): string {
 function renderZsh(entries: readonly CompletionEntry[], identity: CliIdentity): string {
   return `#compdef ${identity}
 local path current previous argument_index command_depth
-local -a immediate options value_keys value_lists file_options file_arguments candidates
+local -a immediate options value_keys value_lists argument_value_positions argument_value_lists file_options file_arguments executable_options candidates
 path=""
 current="$words[CURRENT]"
 previous=""
@@ -178,12 +209,24 @@ else
       break
     fi
   done
+  if (( \${#candidates[@]} == 0 )); then
+    for ((index=1; index<=\${#argument_value_positions[@]}; index+=1)); do
+      if [[ "$argument_index" == "$argument_value_positions[index]" ]]; then
+        candidates=(\${=argument_value_lists[index]})
+        break
+      fi
+    done
+  fi
   if (( \${#candidates[@]} == 0 && argument_index == 0 )); then
     candidates=("\${immediate[@]}")
   fi
 fi
 if (( \${#candidates[@]} > 0 )); then
   compadd -V taskmux-catalog -- "\${candidates[@]}"
+  return 0
+fi
+if (( \${executable_options[(Ie)$previous]} )); then
+  _command_names -e
   return 0
 fi
 if (( \${file_options[(Ie)$previous]} || \${file_arguments[(Ie)$argument_index]} )); then
@@ -202,8 +245,11 @@ function renderZshCases(entries: readonly CompletionEntry[]): string {
       `options=(${entry.options.map(shellQuote).join(" ")})`,
       `value_keys=(${Object.keys(entry.optionValues).map(shellQuote).join(" ")})`,
       `value_lists=(${Object.values(entry.optionValues).map((values) => shellQuote(values.join(" "))).join(" ")})`,
+      `argument_value_positions=(${Object.keys(entry.argumentValues).join(" ")})`,
+      `argument_value_lists=(${Object.values(entry.argumentValues).map((values) => shellQuote(values.join(" "))).join(" ")})`,
       `file_options=(${entry.fileOptions.map(shellQuote).join(" ")})`,
-      `file_arguments=(${entry.fileArguments.join(" ")})`
+      `file_arguments=(${entry.fileArguments.join(" ")})`,
+      `executable_options=(${entry.executableOptions.map(shellQuote).join(" ")})`
     ];
     return `  ${pattern}) ${assignments.join("; ")};;`;
   }).join("\n");
@@ -221,21 +267,27 @@ function renderFish(entries: readonly CompletionEntry[], identity: CliIdentity):
       set options ${entry.options.map(shellQuote).join(" ")}
       set value_keys ${Object.keys(entry.optionValues).map(shellQuote).join(" ")}
       set value_lists ${Object.values(entry.optionValues).map((values) => shellQuote(values.join(" "))).join(" ")}
+      set argument_value_positions ${Object.keys(entry.argumentValues).join(" ")}
+      set argument_value_lists ${Object.values(entry.argumentValues).map((values) => shellQuote(values.join(" "))).join(" ")}
       set file_options ${entry.fileOptions.map(shellQuote).join(" ")}
-      set file_arguments ${entry.fileArguments.join(" ")}`;
+      set file_arguments ${entry.fileArguments.join(" ")}
+      set executable_options ${entry.executableOptions.map(shellQuote).join(" ")}`;
   }).join("\n");
   return `function ${functionName}
   set -l prior (commandline -opc)
   set -l current (commandline -ct)
-  set -l path (string join ' ' $prior | string replace -r '^${identity} ?' '')
+  set -l path (string join ' ' -- $prior | string replace -r -- '^${identity} ?' '')
   set -l previous $prior[-1]
   set -l command_depth 0
   set -l immediate
   set -l options
   set -l value_keys
   set -l value_lists
+  set -l argument_value_positions
+  set -l argument_value_lists
   set -l file_options
   set -l file_arguments
+  set -l executable_options
   switch "$path"
 ${cases}
     case '*'
@@ -256,8 +308,26 @@ ${cases}
       end
     end
   end
+  if test (count $argument_value_positions) -gt 0
+    for index in (seq (count $argument_value_positions))
+      if test "$argument_index" = "$argument_value_positions[$index]"
+        string split ' ' -- "$argument_value_lists[$index]"
+        return 0
+      end
+    end
+  end
   if test $argument_index -eq 0; and test (count $immediate) -gt 0
     printf '%s\\n' $immediate
+    return 0
+  end
+  if contains -- "$previous" $executable_options
+    set -l seen_commands
+    for command in (__fish_complete_command)
+      if command -sq -- "$command"; and not contains -- "$command" $seen_commands
+        set -a seen_commands "$command"
+        printf '%s\\n' "$command"
+      end
+    end
     return 0
   end
   if contains -- "$previous" $file_options; or contains -- "$argument_index" $file_arguments
