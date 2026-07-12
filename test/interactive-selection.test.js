@@ -283,6 +283,8 @@ test("single-Task commands select from active and archived stored Tasks", ptyTes
 
 test("task status and transcript export resolve Task then TaskRole", ptyTest, async () => {
   const home = createTaskWithLeader();
+  const { FileTaskStore } = await import("../dist/storage/taskStore.js");
+  new FileTaskStore(home).saveTranscript("task-1", "leader", "stored transcript\n");
 
   const status = await runInTerminalSteps(
     ["task", "status"],
@@ -305,7 +307,7 @@ test("task status and transcript export resolve Task then TaskRole", ptyTest, as
     home
   );
   assert.equal(transcript.status, 0, transcript.output);
-  assert.match(transcript.output, /No transcript captured/);
+  assert.match(transcript.output, /stored transcript/);
 });
 
 test("selectors insert omitted references before complete command options", ptyTest, async () => {
@@ -331,18 +333,27 @@ test("selectors insert omitted references before complete command options", ptyT
   assert.match(transcript.output, /stored transcript/);
 });
 
-test("unknown or incomplete trailing options never trigger selection", ptyTest, () => {
+test("unknown trailing options never trigger selection while explicit value-less catalog enums do", ptyTest, async () => {
   const home = createTaskWithLeader();
 
-  for (const args of [
-    ["task", "context", "--unknown"],
-    ["task", "context", "--format"]
-  ]) {
+  for (const args of [["task", "context", "--unknown"]]) {
     const result = runInTerminal(args, "", home);
     assert.equal(result.status, 3, result.output);
     assert.doesNotMatch(result.output, /Select task/);
     assert.match(result.output, /TASK_NOT_FOUND: Task not found: --/);
   }
+
+  const finite = await runInTerminalSteps(
+    ["task", "context", "--format"],
+    [
+      { prompt: "Choose format", answer: "text\n" },
+      { prompt: "Choose task", answer: "\n" }
+    ],
+    home
+  );
+  assert.equal(finite.status, 0, finite.output);
+  assert.match(finite.output, /Select format/);
+  assert.match(finite.output, /^Task Context$/m);
 
   const structured = runInTerminal(["task", "context", "--format", "json"], "", home);
   assert.equal(structured.status, 3, structured.output);
@@ -457,16 +468,147 @@ test("selector reports an actionable error without prompting when no candidates 
   assert.equal(asked, false);
 });
 
-test("selector refuses to render more than twenty candidates", async () => {
+test("selector paginates and filters arbitrarily large candidate sets while keeping the default visible", async () => {
   const { store, node, resolveInteractiveArguments, addAgent } = await selectionFixture();
-  for (let index = 1; index <= 21; index += 1) {
-    addAgent(`agent-${index}`);
+  for (let index = 1; index <= 45; index += 1) {
+    addAgent(`agent-${String(index).padStart(2, "0")}`);
+  }
+  store.saveConfig({ schemaVersion: 1, defaultAgent: "agent-35" });
+  const writes = [];
+
+  const result = await resolveInteractiveArguments(
+    ["agent", "show"],
+    node,
+    store,
+    selectionIo(["p", "n", "/agent-42", ""], undefined, writes)
+  );
+
+  assert.deepEqual(result.args, ["agent", "show", "agent-42"]);
+  assert.match(writes.join(""), /Agents — 21-40 of 45/);
+  assert.match(writes.join(""), /Agents — 1-20 of 45/);
+  assert.match(writes.join(""), /Agents — 1-1 of 1 \(filtered from 45\)/);
+  assert.match(writes.join(""), /agent-35.*yes/);
+});
+
+test("selector accepts an exact value outside the visible page", async () => {
+  const { store, node, resolveInteractiveArguments, addAgent } = await selectionFixture();
+  for (let index = 1; index <= 45; index += 1) {
+    addAgent(`agent-${String(index).padStart(2, "0")}`);
   }
 
-  await assert.rejects(
-    resolveInteractiveArguments(["agent", "show"], node, store, selectionIo([])),
-    /21 agents are available.*limited to 20.*taskmux agent list/s
+  const result = await resolveInteractiveArguments(
+    ["agent", "show"],
+    node,
+    store,
+    selectionIo(["agent-45"])
   );
+
+  assert.deepEqual(result.args, ["agent", "show", "agent-45"]);
+});
+
+test("task enter resolves Task then TaskRole and an explicit Task only resolves its Role", async () => {
+  const [{ FileTaskStore }, { routeInvocation }, { resolveInteractiveArguments }] = await Promise.all([
+    import("../dist/storage/taskStore.js"),
+    import("../dist/cli/invocationRouter.js"),
+    import("../dist/cli/interactiveSelection.js")
+  ]);
+  const home = createTaskWithLeader();
+  const store = new FileTaskStore(home);
+  const invocation = routeInvocation(["task", "enter"]);
+  assert.equal(invocation.kind, "execute");
+
+  const both = await resolveInteractiveArguments(
+    ["task", "enter"],
+    invocation.node,
+    store,
+    selectionIo(["", ""]),
+    { preferredRole: "leader" }
+  );
+  assert.deepEqual(both.args, ["task", "enter", "task-1", "leader"]);
+
+  const roleOnly = await resolveInteractiveArguments(
+    ["task", "enter", "task-1"],
+    invocation.node,
+    store,
+    selectionIo([""]),
+    { preferredRole: "leader" }
+  );
+  assert.deepEqual(roleOnly.args, ["task", "enter", "task-1", "leader"]);
+});
+
+test("catalog finite enums resolve only required missing positions and explicit value-less options", async () => {
+  const [{ FileTaskStore }, { routeInvocation }, { resolveInteractiveArguments }] = await Promise.all([
+    import("../dist/storage/taskStore.js"),
+    import("../dist/cli/invocationRouter.js"),
+    import("../dist/cli/interactiveSelection.js")
+  ]);
+  const store = new FileTaskStore(createHome());
+
+  const optionInvocation = routeInvocation(["task", "list", "--priority"]);
+  assert.equal(optionInvocation.kind, "execute");
+  const option = await resolveInteractiveArguments(
+    ["task", "list", "--priority"],
+    optionInvocation.node,
+    store,
+    selectionIo(["high"])
+  );
+  assert.deepEqual(option.args, ["task", "list", "--priority", "high"]);
+
+  const positionalInvocation = routeInvocation(["config", "unset", "completion"]);
+  assert.equal(positionalInvocation.kind, "execute");
+  const positional = await resolveInteractiveArguments(
+    ["config", "unset", "completion"],
+    positionalInvocation.node,
+    store,
+    selectionIo(["zsh"])
+  );
+  assert.deepEqual(positional.args, ["config", "unset", "completion", "zsh"]);
+
+  const optionalInvocation = routeInvocation(["task", "list"]);
+  assert.equal(optionalInvocation.kind, "execute");
+  let asked = false;
+  const optional = await resolveInteractiveArguments(
+    ["task", "list"],
+    optionalInvocation.node,
+    store,
+    selectionIo([], () => { asked = true; })
+  );
+  assert.equal(optional.kind, "unchanged");
+  assert.equal(asked, false);
+
+  const currentInvocation = routeInvocation(["task", "current"]);
+  assert.equal(currentInvocation.kind, "execute");
+  const current = await resolveInteractiveArguments(
+    ["task", "current"],
+    currentInvocation.node,
+    store,
+    selectionIo([], () => { asked = true; })
+  );
+  assert.equal(current.kind, "unchanged");
+  assert.equal(asked, false);
+
+  asked = false;
+  const createInvocation = routeInvocation(["task", "create", "--priority"]);
+  assert.equal(createInvocation.kind, "execute");
+  const incompleteCreate = await resolveInteractiveArguments(
+    ["task", "create", "--priority"],
+    createInvocation.node,
+    store,
+    selectionIo([], () => { asked = true; })
+  );
+  assert.equal(incompleteCreate.kind, "unchanged");
+  assert.equal(asked, false);
+
+  const completionInvocation = routeInvocation(["config", "set", "completion"]);
+  assert.equal(completionInvocation.kind, "execute");
+  const incompleteCompletion = await resolveInteractiveArguments(
+    ["config", "set", "completion"],
+    completionInvocation.node,
+    store,
+    selectionIo([], () => { asked = true; })
+  );
+  assert.equal(incompleteCompletion.kind, "unchanged");
+  assert.equal(asked, false);
 });
 
 test("selector retries invalid input and accepts an exact candidate value", async () => {
@@ -557,6 +699,22 @@ test("interaction policy validation rejects missing dependencies and incompatibl
       actionTarget: true
     }]
   }]), /dependency must reference an earlier selector/);
+
+  assert.throws(() => validateInteractionPolicies([{
+    commandPath: ["task", "list"],
+    selectors: [{
+      option: "--missing",
+      entity: "agent",
+      provider: "configured-agents",
+      actionTarget: false
+    }]
+  }]), /selector option is not catalog-owned.*--missing/);
+
+  assert.throws(() => validateInteractionPolicies([{
+    commandPath: ["task", "show"],
+    selectors: [{ argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true }],
+    requiredOptions: ["--missing"]
+  }]), /required option is not catalog-owned.*--missing/);
 });
 
 test("interaction policies cover the approved read and delete command matrix", async () => {
@@ -577,7 +735,8 @@ test("interaction policies cover the approved read and delete command matrix", a
     ...["task status", "task tail", "task transcript"].map((path) => [path, [
       [2, "tasks"], [3, "task-roles"]
     ]]),
-    ["task transcript export", [[3, "tasks"], [4, "task-roles"]]],
+    ["task enter", [[2, "tasks"], [3, "task-roles"]]],
+    ["task transcript export", [[3, "tasks"], [4, "task-roles-with-transcripts"]]],
     ["task delete", [[2, "tasks"]]]
   ]);
 
@@ -630,6 +789,183 @@ test("global-role providers mirror show, remove, and enter command domains", asy
     actionTarget: true
   }, store, ["role", "enter"]);
   assert.deepEqual(configured.candidates.map(({ value }) => value), ["reviewer"]);
+});
+
+test("domain providers enumerate trash, drafts, topics, active cycles, open work items, and active decisions", async () => {
+  const [{ FileTaskStore }, { getSelectionCandidates }] = await Promise.all([
+    import("../dist/storage/taskStore.js"),
+    import("../dist/cli/interactionCandidates.js")
+  ]);
+  const home = createTaskWithLeader();
+  run(["task", "create", "Trash me"], home);
+  run(["task", "delete", "task-2"], home);
+  run(["task", "input", "draft", "task-1", "pending input"], home);
+  run(["task", "topic", "create", "task-1", "--id", "custom-topic", "--name", "Custom", "--description", "Custom topic"], home);
+  run(["task", "cycle", "create", "task-1", "--cause", "explicit-wake", "--summary", "Active cycle"], home);
+  run(["task", "cycle", "create", "task-1", "--cause", "explicit-wake", "--summary", "Ended cycle"], home);
+  run(["task", "cycle", "end", "task-1", "cycle-2", "--summary", "Done"], home);
+  run(["task", "work-item", "create", "task-1", "--title", "Open item", "--cycle", "cycle-1", "--assignee", "leader"], home);
+  run(["task", "work-item", "create", "task-1", "--title", "Closed item", "--assignee", "leader"], home);
+  run(["task", "work-item", "update", "task-1", "work-item-2", "--status", "completed", "--outcome", "Done"], home);
+  run(["task", "decision", "record", "task-1", "--title", "Active decision", "--rationale", "Keep"], home);
+  run(["task", "decision", "record", "task-1", "--title", "Old decision", "--rationale", "Replace"], home);
+  run(["task", "decision", "supersede", "task-1", "decision-2", "--reason", "Obsolete"], home);
+  const store = new FileTaskStore(home);
+  store.saveTranscript("task-1", "leader", "stored transcript\n");
+  run(["task", "assign", "task-1", "zeta", "--agent", "codex", "--workspace", home], home);
+  run(["task", "assign", "task-1", "alpha", "--agent", "codex", "--workspace", home], home);
+
+  const providerValues = (provider, args = ["task", "test", "task-1"]) => getSelectionCandidates({
+    argumentIndex: 3,
+    entity: "task",
+    provider,
+    dependsOn: 2,
+    actionTarget: true
+  }, store, args).candidates.map(({ value }) => value);
+
+  assert.deepEqual(providerValues("trashed-tasks", ["task", "restore"]), ["task-2"]);
+  assert.deepEqual(providerValues("tasks-with-input-drafts", ["task", "input", "submit"]), ["task-1"]);
+  assert.deepEqual(providerValues("active-cycles"), ["cycle-1"]);
+  assert.deepEqual(providerValues("open-work-items"), ["work-item-1"]);
+  assert.deepEqual(providerValues("active-decisions"), ["decision-1"]);
+  assert.deepEqual(providerValues("task-roles-with-transcripts"), ["leader"]);
+  assert.deepEqual(providerValues("task-topics").slice(-1), ["custom-topic"]);
+  assert.ok(providerValues("task-topics").includes("requirements"));
+  assert.deepEqual(providerValues("task-roles"), ["alpha", "leader", "zeta"]);
+  run(["task", "work-item", "create", "task-1", "--title", "Zeta item", "--assignee", "zeta"], home);
+  assert.deepEqual(
+    providerValues("dispatch-work-items", ["task", "dispatch", "task-1", "leader", "--work-item"]),
+    ["work-item-1"]
+  );
+  assert.deepEqual(providerValues("work-items"), ["work-item-1", "work-item-2", "work-item-3"]);
+});
+
+test("interaction policies cover remaining Task-owned enumerable domains", async () => {
+  const [{ routeInvocation }, { findInteractionPolicy }] = await Promise.all([
+    import("../dist/cli/invocationRouter.js"),
+    import("../dist/cli/interactionPolicy.js")
+  ]);
+  const expected = new Map([
+    ["task restore", [[2, "trashed-tasks"]]],
+    ["task input submit", [[3, "tasks-with-input-drafts"]]],
+    ["task cycle end", [[3, "tasks"], [4, "active-cycles"]]],
+    ["task work-item update", [[3, "tasks"], [4, "work-items"]]],
+    ["task decision supersede", [[3, "tasks"], [4, "active-decisions"]]],
+    ["task topic summarize", [[3, "tasks"], ["--topic", "task-topics"]]]
+  ]);
+
+  for (const [path, selectors] of expected) {
+    const invocation = routeInvocation(path.split(" "));
+    assert.equal(invocation.kind, "execute", path);
+    const policy = findInteractionPolicy(invocation.node);
+    assert.ok(policy, path);
+    assert.deepEqual(
+      policy.selectors.map((selector) => [selector.option ?? selector.argumentIndex, selector.provider]),
+      selectors,
+      path
+    );
+  }
+});
+
+test("interaction policy registry covers every approved enumerable reference command", async () => {
+  const [{ routeInvocation }, { findInteractionPolicy }] = await Promise.all([
+    import("../dist/cli/invocationRouter.js"),
+    import("../dist/cli/interactionPolicy.js")
+  ]);
+  const expectedPaths = [
+    "role add", "role update",
+    "task clone", "task update", "task archive", "task unarchive", "task shell", "task refresh", "task cleanup", "task wake",
+    "task assign", "task bind", "task assign-many", "task role child", "task role update", "task role remove",
+    "task detach", "task stop", "task kill", "task restart",
+    "task topic create", "task topic summarize", "task cycle create", "task cycle end",
+    "task work-item create", "task work-item update", "task session record", "task session replace",
+    "task dispatch", "task yield", "task schedule set", "task brief update", "task milestone add",
+    "task decision record", "task decision supersede", "task worktree create"
+  ];
+
+  for (const path of expectedPaths) {
+    const invocation = routeInvocation(path.split(" "));
+    assert.equal(invocation.kind, "execute", path);
+    assert.ok(findInteractionPolicy(invocation.node), path);
+  }
+
+  for (const excluded of ["task current", "task comment", "task input draft", "task role rename"] ) {
+    const invocation = routeInvocation(excluded.split(" "));
+    assert.equal(invocation.kind, "execute", excluded);
+    assert.equal(findInteractionPolicy(invocation.node), undefined, excluded);
+  }
+});
+
+test("value-less dynamic options allow their parent Task to resolve before the option candidate", async () => {
+  const [{ FileTaskStore }, { routeInvocation }, { resolveInteractiveArguments }] = await Promise.all([
+    import("../dist/storage/taskStore.js"),
+    import("../dist/cli/invocationRouter.js"),
+    import("../dist/cli/interactiveSelection.js")
+  ]);
+  const home = createTaskWithLeader();
+  run(["task", "topic", "create", "task-1", "--id", "custom-topic", "--name", "Custom", "--description", "Custom topic"], home);
+  const store = new FileTaskStore(home);
+  const invocation = routeInvocation(["task", "topic", "summarize", "--topic", "--summary", "Summary"]);
+  assert.equal(invocation.kind, "execute");
+
+  const result = await resolveInteractiveArguments(
+    ["task", "topic", "summarize", "--topic", "--summary", "Summary"],
+    invocation.node,
+    store,
+    selectionIo(["", "custom-topic"])
+  );
+
+  assert.deepEqual(result.args, [
+    "task", "topic", "summarize", "task-1", "--topic", "custom-topic", "--summary", "Summary"
+  ]);
+});
+
+test("incomplete free-form requirements and invalid explicit parents bypass domain prompts", async () => {
+  const [{ FileTaskStore }, { routeInvocation }, { resolveInteractiveArguments }] = await Promise.all([
+    import("../dist/storage/taskStore.js"),
+    import("../dist/cli/invocationRouter.js"),
+    import("../dist/cli/interactiveSelection.js")
+  ]);
+  const store = new FileTaskStore(createTaskWithLeader());
+  const invocation = routeInvocation(["task", "decision", "supersede"]);
+  assert.equal(invocation.kind, "execute");
+  let asked = false;
+
+  const incomplete = await resolveInteractiveArguments(
+    ["task", "decision", "supersede"],
+    invocation.node,
+    store,
+    selectionIo([], () => { asked = true; })
+  );
+  assert.equal(incomplete.kind, "unchanged");
+  assert.equal(asked, false);
+
+  const invalidParent = await resolveInteractiveArguments(
+    ["task", "decision", "supersede", "missing-task", "--reason", "obsolete"],
+    invocation.node,
+    store,
+    selectionIo([], () => { asked = true; })
+  );
+  assert.equal(invalidParent.kind, "unchanged");
+  assert.equal(asked, false);
+});
+
+test("Task shell reuses its readline boundary for missing enumerable references", ptyTest, async () => {
+  const home = createTaskWithLeader();
+  const result = await runInTerminalSteps(
+    ["task", "shell", "task-1"],
+    [
+      { prompt: "taskmux task-1>", answer: "detail\n" },
+      { prompt: "Choose task role", answer: "\n" },
+      { prompt: "taskmux task-1>", answer: "q\n" }
+    ],
+    home
+  );
+
+  assert.equal(result.status, 0, result.output);
+  assert.match(result.output, /Select task role: task-1/);
+  assert.match(result.output, /Role: leader/);
+  assert.doesNotMatch(result.output, /USAGE_ERROR: Role name is required/);
 });
 
 function createHome() {

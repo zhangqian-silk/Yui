@@ -31,6 +31,7 @@ export type TaskStore = {
   saveTask(task: Task): void;
   deleteTask(id: string): boolean;
   restoreTask(id: string): boolean;
+  listTrashedTaskIds(): string[];
   listTasks(): Task[];
   getTask(id: string): Task | null;
   getTaskTopics(taskId: string): TaskTopics;
@@ -197,6 +198,21 @@ export class FileTaskStore implements TaskStore {
     mkdirSync(this.tasksDir(), { recursive: true });
     renameSync(this.trashedTaskDir(id), this.taskDir(id));
     return true;
+  }
+
+  listTrashedTaskIds(): string[] {
+    return this.directoryNames(this.trashedTasksDir())
+      .filter((id) => this.getTask(id) === null)
+      .filter((id) => {
+        const runtimeRaw = this.readOptionalText(this.trashedTaskFile(id));
+        if (runtimeRaw === null) {
+          return false;
+        }
+        const infoRaw = this.readOptionalText(join(this.trashedTaskDir(id), "info.json"));
+        taskRecordCodec.decodeTask(id, runtimeRaw, infoRaw);
+        return true;
+      })
+      .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
   }
 
   listTasks(): Task[] {

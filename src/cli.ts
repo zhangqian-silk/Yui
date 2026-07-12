@@ -317,8 +317,26 @@ async function main(): Promise<void> {
         throw usageError("Task id is required.");
       }
 
+      const resolveShellArguments = async (
+        commandArgs: string[],
+        shellIo: import("./shell/taskShell.js").TaskShellSelectionIo
+      ): Promise<string[] | null> => {
+        const shellInvocation = routeInvocation(["task", ...commandArgs]);
+        if (shellInvocation.kind !== "execute") {
+          return commandArgs;
+        }
+        const result = await resolveInteractiveArguments(["task", ...commandArgs], shellInvocation.node, store, {
+          interactive: shellIo.interactive,
+          json: false,
+          width: shellIo.width,
+          write: shellIo.write,
+          question: shellIo.question
+        }, { preferredRole: process.env.TASKMUX_ROLE?.trim() });
+        return result.kind === "cancelled" ? null : result.args.slice(1);
+      };
+
       if (discovery === undefined) {
-        await runTaskShell(taskId, store, tmux);
+        await runTaskShell(taskId, store, tmux, undefined, resolveShellArguments);
         return;
       }
       await runTaskShell(taskId, store, tmux, async (commandArgs) => {
@@ -332,7 +350,7 @@ async function main(): Promise<void> {
           { args: commandArgs }
         ) as { output: string };
         return result.output;
-      });
+      }, resolveShellArguments);
       return;
     }
 
