@@ -162,6 +162,31 @@ test("catalog validation permits only one command-path provider", async () => {
   assert.throws(() => validateCommandCatalog(catalog), /multiple command-path providers.*taskmux/i);
 });
 
+test("catalog command-path provider is a visible metadata-free leaf", async () => {
+  const { validateCommandCatalog } = await import("../dist/cli/commandCatalog.js");
+  const invalidShapes = [
+    { hidden: true },
+    { kind: "group", children: [leaf("child", ["taskmux", "help", "child"])], sections: [{ id: "child", title: "Child", entries: ["child"] }] },
+    { values: [{ name: "value", summary: "Value" }], sections: [{ id: "value", title: "Value", entries: ["value"] }] },
+    { options: ["--format"] },
+    { optionValues: { "--format": ["text"] } },
+    { argumentValues: { 0: ["value"] } },
+    { fileOptions: ["--format"] },
+    { fileArguments: [0] },
+    { executableOptions: ["--format"] }
+  ];
+
+  for (const shape of invalidShapes) {
+    const provider = { ...leaf("help"), commandPathArguments: true, ...shape };
+    const catalog = rootWith([provider], [{ id: "support", title: "Support", entries: ["help"] }]);
+    assert.throws(
+      () => validateCommandCatalog(catalog),
+      /command-path provider must be a visible metadata-free leaf: taskmux help/i,
+      JSON.stringify(shape)
+    );
+  }
+});
+
 test("catalog declares stable semantic sections for every command group", async () => {
   const { ROOT_COMMAND } = await import("../dist/cli/commandCatalog.js");
   assert.deepEqual(ROOT_COMMAND.sections.map(({ id, title }) => ({ id, title })), [

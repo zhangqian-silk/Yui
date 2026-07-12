@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const packageJson = JSON.parse(readFileSync("package.json", "utf8"));
+const fishBinary = process.env.TASKMUX_TEST_FISH_BIN ?? "fish";
+const fishAvailable = spawnSync(fishBinary, ["--version"], { stdio: "ignore", env: process.env }).status === 0;
 
 function shellQuote(value) {
   return `'${value.replaceAll("'", `'\\''`)}'`;
@@ -332,6 +334,14 @@ printf '<%s>\\n' "\${COMPREPLY[@]}"
   }
 });
 
+test("bash completion keeps Bash 3.2-compatible array and stream primitives", () => {
+  const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], { encoding: "utf8" });
+
+  assert.doesNotMatch(bash, /\b(?:local|declare)\s+-A\b/);
+  assert.doesNotMatch(bash, /\b(?:mapfile|readarray)\b/);
+  assert.match(bash, /while IFS= read -r/);
+});
+
 test("completion scope is derived only from words before the current token", () => {
   const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], { encoding: "utf8" });
   const zsh = execFileSync("node", ["dist/cli.js", "completion", "zsh"], { encoding: "utf8" });
@@ -449,7 +459,7 @@ _taskmux`,
 });
 
 test("fish completion executes catalog ordering and ownership rules", {
-  skip: spawnSync("fish", ["--version"], { stdio: "ignore" }).status !== 0
+  skip: !fishAvailable
 }, () => {
   const root = mkdtempSync(join(tmpdir(), "taskmux-fish-completion-"));
   const completionPath = join(root, "taskmux.fish");
@@ -460,7 +470,7 @@ test("fish completion executes catalog ordering and ownership rules", {
   writeFileSync(completionPath, execFileSync("node", ["dist/cli.js", "completion", "fish"], { encoding: "utf8" }));
 
   try {
-    const invoke = (prior, current) => spawnSync("fish", ["-c", `
+    const invoke = (prior, current, useRealCommandHelper = false) => spawnSync(fishBinary, ["-c", `
 set -g test_prior ${prior.map(shellQuote).join(" ")}
 set -g test_current ${shellQuote(current)}
 function commandline
@@ -473,13 +483,17 @@ end
 function __fish_complete_path
   printf '%s\\n' 'state backup.json'
 end
-function __fish_complete_command
-  printf '%s\\n' taskmux-fixture-function taskmux-fixture-tool taskmux-fixture-tool
-end
 function taskmux-fixture-function; end
-source "$argv[1]"
+${useRealCommandHelper ? "" : `function __fish_complete_command
+  printf 'taskmux-fixture-function\\tFunction description\\ntaskmux-fixture-tool\\tFixture tool\\ntaskmux-fixture-tool\\tDuplicate description\\n'
+end`}
+source "$TASKMUX_COMPLETION_TEST_PATH"
 _taskmux
-`, completionPath], { encoding: "utf8", env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` } });
+`], { encoding: "utf8", env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+        TASKMUX_COMPLETION_TEST_PATH: completionPath
+      } });
 
     const rootCandidates = invoke(["taskmux"], "");
     const optionCandidates = invoke(["taskmux", "task", "create"], "--");
@@ -487,6 +501,7 @@ _taskmux
     const hybridCandidates = invoke(["taskmux", "task", "transcript", "export"], "--");
     const fileCandidates = invoke(["taskmux", "import"], "state");
     const executableCandidates = invoke(["taskmux", "agent", "add", "demo", "--command"], "taskmux");
+    const realExecutableCandidates = invoke(["taskmux", "agent", "add", "demo", "--command"], "taskmux-fixture-", true);
 
     assert.deepEqual(rootCandidates.stdout.trim().split("\n"), [
       "task", "operator", "setup", "config", "agent", "role", "completion",
@@ -498,8 +513,9 @@ _taskmux
     assert.deepEqual(enumCandidates.stdout.trim().split("\n"), ["feature", "bug", "review"]);
     assert.deepEqual(hybridCandidates.stdout.trim().split("\n"), ["--format", "--output"]);
     assert.equal(fileCandidates.stdout.trim(), "state backup.json");
-    assert.equal(executableCandidates.stdout.trim(), "taskmux-fixture-tool");
-    for (const result of [rootCandidates, optionCandidates, enumCandidates, hybridCandidates, fileCandidates, executableCandidates]) {
+    assert.equal(executableCandidates.stdout.trim(), "taskmux-fixture-tool\tFixture tool");
+    assert.ok(realExecutableCandidates.stdout.trim().split("\n").some((record) => record.split("\t")[0] === "taskmux-fixture-tool"));
+    for (const result of [rootCandidates, optionCandidates, enumCandidates, hybridCandidates, fileCandidates, executableCandidates, realExecutableCandidates]) {
       assert.equal(result.status, 0, result.stderr);
     }
   } finally {

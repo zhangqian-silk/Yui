@@ -326,6 +326,20 @@ export function validateCommandCatalog(root: CommandNode): void {
     }
     if (node.commandPathArguments) {
       commandPathProviders.push(node);
+      const ownsOtherCompletionMetadata = node.kind !== "leaf"
+        || node.hidden
+        || node.children.length > 0
+        || node.values.length > 0
+        || node.sections.length > 0
+        || node.options.length > 0
+        || Object.keys(node.optionValues).length > 0
+        || Object.keys(node.argumentValues).length > 0
+        || node.fileOptions.length > 0
+        || node.fileArguments.length > 0
+        || node.executableOptions.length > 0;
+      if (ownsOtherCompletionMetadata) {
+        throw new Error(`Command-path provider must be a visible metadata-free leaf: ${node.path.join(" ")}`);
+      }
     }
     const names = new Set<string>();
     for (const child of node.children) {

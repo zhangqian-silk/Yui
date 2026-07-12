@@ -131,11 +131,11 @@ ${renderBashCases(entries)}
   fi
   if ${containsFunction} "$previous" "\${executable_options[@]}"; then
     local command
-    local -A seen_commands=()
+    local -a seen_commands=()
     COMPREPLY=()
     while IFS= read -r command; do
-      if [[ -n "$command" && -z "\${seen_commands[$command]+x}" ]] && type -P -- "$command" >/dev/null 2>&1; then
-        seen_commands[$command]=1
+      if [[ -n "$command" ]] && type -P -- "$command" >/dev/null 2>&1 && ! ${containsFunction} "$command" "\${seen_commands[@]}"; then
+        seen_commands+=("$command")
         COMPREPLY+=("$command")
       fi
     done < <(compgen -c -- "$current")
@@ -143,7 +143,11 @@ ${renderBashCases(entries)}
     return 0
   fi
   if ${containsFunction} "$previous" "\${file_options[@]}" || ${containsFunction} "$argument_index" "\${file_arguments[@]}"; then
-    mapfile -t COMPREPLY < <(compgen -f -- "$current")
+    local file_candidate
+    COMPREPLY=()
+    while IFS= read -r file_candidate; do
+      COMPREPLY+=("$file_candidate")
+    done < <(compgen -f -- "$current")
     compopt -o filenames 2>/dev/null || true
   else
     COMPREPLY=()
@@ -322,10 +326,12 @@ ${cases}
   end
   if contains -- "$previous" $executable_options
     set -l seen_commands
-    for command in (__fish_complete_command)
-      if command -sq -- "$command"; and not contains -- "$command" $seen_commands
-        set -a seen_commands "$command"
-        printf '%s\\n' "$command"
+    set -l tab (printf '\\t')
+    for record in (__fish_complete_command)
+      set -l command_name (string split -m 1 "$tab" -- "$record")[1]
+      if command -sq -- "$command_name"; and not contains -- "$command_name" $seen_commands
+        set -a seen_commands "$command_name"
+        printf '%s\\n' "$record"
       end
     end
     return 0
