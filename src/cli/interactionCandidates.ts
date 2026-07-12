@@ -1,6 +1,5 @@
 import type { TableColumn } from "../output/table.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import { taskNotFound } from "../errors/cliError.js";
 import type { ArgumentSelector } from "./interactionPolicy.js";
 
 export type SelectionCandidate = {
@@ -83,7 +82,7 @@ export function getSelectionCandidates(
         return null;
       }
       if (store.getTask(taskId) === null) {
-        throw taskNotFound(taskId);
+        return null;
       }
       const roles = store.listRoles(taskId);
       return {

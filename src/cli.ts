@@ -32,7 +32,7 @@ import { routeInvocation } from "./cli/invocationRouter.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
 import { renderCompletion, type CliIdentity } from "./cli/completion.js";
 import { runCompletionWizard } from "./completion/completionWizard.js";
-import { resolveInteractiveArguments } from "./cli/interactiveSelection.js";
+import { allowsInteractiveSelection, resolveInteractiveArguments } from "./cli/interactiveSelection.js";
 
 const VERSION = readPackageVersion();
 
@@ -251,14 +251,17 @@ async function main(): Promise<void> {
 
   if (args[0] === "agent") {
     requireStorageSchema(rootDir);
+    const discovery = process.env.TASKMUX_CONTROLLER_MODE === "direct"
+      ? undefined
+      : await ensureControllerRunning(rootDir, process.env);
     const store = new FileTaskStore(rootDir);
     const resolvedArgs = await resolveTerminalArguments(args, invocation.node, store);
     if (resolvedArgs === null) {
       emit("Cancelled.");
       return;
     }
-    if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
-      await printControllerCommand(rootDir, "agent", resolvedArgs.slice(1));
+    if (discovery !== undefined) {
+      await printControllerCommand(rootDir, "agent", resolvedArgs.slice(1), discovery);
       return;
     }
     emit(runAgentCommand(resolvedArgs.slice(1), store));
@@ -278,6 +281,9 @@ async function main(): Promise<void> {
 
   if (args[0] === "task") {
     requireStorageSchema(rootDir);
+    const discovery = process.env.TASKMUX_CONTROLLER_MODE === "direct"
+      ? undefined
+      : await ensureControllerRunning(rootDir, process.env);
     const store = new FileTaskStore(rootDir);
     const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandExecutor());
     const scopedTaskArgs = resolveTaskCommandScope(args.slice(1), process.env);
@@ -295,11 +301,10 @@ async function main(): Promise<void> {
         throw usageError("Task id is required.");
       }
 
-      if (process.env.TASKMUX_CONTROLLER_MODE === "direct") {
+      if (discovery === undefined) {
         await runTaskShell(taskId, store, tmux);
         return;
       }
-      const discovery = await ensureControllerRunning(rootDir, process.env);
       await runTaskShell(taskId, store, tmux, async (commandArgs) => {
         if (commandArgs[0] === "enter") {
           return attachTaskRoleThroughController(commandArgs, store, tmux, discovery);
@@ -315,14 +320,12 @@ async function main(): Promise<void> {
       return;
     }
 
-    if (taskArgs[0] === "enter" && process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
-      const discovery = await ensureControllerRunning(rootDir, process.env);
+    if (taskArgs[0] === "enter" && discovery !== undefined) {
       emit(await attachTaskRoleThroughController(taskArgs, store, tmux, discovery));
       return;
     }
 
-    if (taskArgs[0] !== "enter" && process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
-      const discovery = await ensureControllerRunning(rootDir, process.env);
+    if (taskArgs[0] !== "enter" && discovery !== undefined) {
       const result = await callController(
         discovery,
         "task.command",
@@ -348,7 +351,7 @@ async function resolveTerminalArguments(
   store: FileTaskStore
 ): Promise<string[] | null> {
   const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
-  if (!interactive || jsonOutput) {
+  if (!interactive || !allowsInteractiveSelection(commandArgs, jsonOutput)) {
     return [...commandArgs];
   }
 
@@ -438,8 +441,9 @@ function resolveTaskCommandScope(commandArgs: string[], env: NodeJS.ProcessEnv):
     return [
       command,
       taskId,
-      ...(roleName === undefined || roleName.length === 0 ? [] : [roleName]),
-      ...rest
+      ...(rest.length > 0
+        ? rest
+        : roleName === undefined || roleName.length === 0 ? [] : [roleName])
     ];
   }
   if (command === "session" && !hasTaskId(rest[1])) {
@@ -463,8 +467,13 @@ function resolveTaskCommandScope(commandArgs: string[], env: NodeJS.ProcessEnv):
   return commandArgs;
 }
 
-async function printControllerCommand(rootDir: string, group: string, commandArgs: string[]): Promise<void> {
-  const discovery = await ensureControllerRunning(rootDir, process.env);
+async function printControllerCommand(
+  rootDir: string,
+  group: string,
+  commandArgs: string[],
+  existingDiscovery?: Awaited<ReturnType<typeof ensureControllerRunning>>
+): Promise<void> {
+  const discovery = existingDiscovery ?? await ensureControllerRunning(rootDir, process.env);
   const result = await callController(
     discovery,
     "command.execute",
