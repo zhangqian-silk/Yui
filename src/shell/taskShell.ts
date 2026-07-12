@@ -5,11 +5,24 @@ import { CliError, taskNotFound } from "../errors/cliError.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { TmuxManager } from "../tmux/tmuxManager.js";
 
+export type TaskShellSelectionIo = {
+  interactive: boolean;
+  width: number;
+  write(value: string): void;
+  question(prompt: string): Promise<string | undefined>;
+};
+
+export type TaskShellArgumentResolver = (
+  args: string[],
+  io: TaskShellSelectionIo
+) => Promise<string[] | null>;
+
 export async function runTaskShell(
   taskId: string,
   store: TaskStore,
   tmux: TmuxManager,
-  executeTaskCommand: (args: string[]) => Promise<string> = async (args) => runTaskCommand(args, store, tmux)
+  executeTaskCommand: (args: string[]) => Promise<string> = async (args) => runTaskCommand(args, store, tmux),
+  resolveTaskArguments?: TaskShellArgumentResolver
 ): Promise<void> {
   if (store.getTask(taskId) === null) {
     throw taskNotFound(taskId);
@@ -18,12 +31,18 @@ export async function runTaskShell(
   output.write(await executeTaskCommand(["open", taskId]));
 
   const rl = createInterface({ input, output });
+  const selectionIo: TaskShellSelectionIo = {
+    interactive: input.isTTY === true && output.isTTY === true,
+    width: output.columns ?? 100,
+    write: (value) => output.write(value),
+    question: async (prompt) => rl.question(prompt)
+  };
 
   try {
     if (!input.isTTY) {
       for await (const line of rl) {
         output.write(`taskmux ${taskId}> `);
-        if (await handleShellLine(taskId, line, executeTaskCommand) === "exit") {
+        if (await handleShellLine(taskId, line, executeTaskCommand, resolveTaskArguments, selectionIo) === "exit") {
           break;
         }
       }
@@ -32,7 +51,7 @@ export async function runTaskShell(
 
     while (true) {
       const line = await rl.question(`taskmux ${taskId}> `);
-      if (await handleShellLine(taskId, line, executeTaskCommand) === "exit") {
+      if (await handleShellLine(taskId, line, executeTaskCommand, resolveTaskArguments, selectionIo) === "exit") {
         break;
       }
     }
@@ -44,7 +63,9 @@ export async function runTaskShell(
 async function handleShellLine(
   taskId: string,
   line: string,
-  executeTaskCommand: (args: string[]) => Promise<string>
+  executeTaskCommand: (args: string[]) => Promise<string>,
+  resolveTaskArguments: TaskShellArgumentResolver | undefined,
+  selectionIo: TaskShellSelectionIo
 ): Promise<"continue" | "exit"> {
   const command = parseCommandLine(line);
 
@@ -64,7 +85,15 @@ async function handleShellLine(
   }
 
   try {
-    output.write(await executeTaskCommand(toTaskCommand(taskId, name, args)));
+    const commandArgs = toTaskCommand(taskId, name, args);
+    const resolvedArgs = resolveTaskArguments === undefined
+      ? commandArgs
+      : await resolveTaskArguments(commandArgs, selectionIo);
+    if (resolvedArgs === null) {
+      output.write("Cancelled.\n");
+      return "continue";
+    }
+    output.write(await executeTaskCommand(resolvedArgs));
   } catch (error) {
     if (error instanceof CliError) {
       output.write(`${error.code}: ${error.message}\n`);
