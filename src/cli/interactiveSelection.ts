@@ -32,7 +32,7 @@ export async function resolveInteractiveArguments(
 ): Promise<ArgumentResolution> {
   const resolved = [...args];
   const policy = findInteractionPolicy(node);
-  if (!io.interactive || io.json || policy === undefined) {
+  if (!io.interactive || !allowsInteractiveSelection(args, io.json) || policy === undefined) {
     return { kind: "unchanged", args: resolved };
   }
 
@@ -64,6 +64,13 @@ export async function resolveInteractiveArguments(
   }
 
   return changed ? { kind: "resolved", args: resolved } : { kind: "unchanged", args: resolved };
+}
+
+export function allowsInteractiveSelection(args: readonly string[], globalJson: boolean): boolean {
+  if (globalJson) {
+    return false;
+  }
+  return !args.some((argument, index) => argument === "--format" && args[index + 1] === "json");
 }
 
 async function selectCandidate(set: CandidateSet, io: SelectionIo): Promise<SelectionCandidate | undefined> {

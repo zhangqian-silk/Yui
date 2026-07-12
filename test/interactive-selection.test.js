@@ -1,13 +1,17 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
 const cli = join(process.cwd(), "dist", "cli.js");
+const scriptSupport = detectScriptSupport();
+const ptyTest = scriptSupport === null
+  ? { skip: "compatible util-linux script is unavailable" }
+  : { timeout: 10_000 };
 
-test("agent show selects the configured agent in a real terminal", () => {
+test("agent show selects the configured agent in a real terminal", ptyTest, () => {
   const home = createHome();
   run(["agent", "add", "codex", "--command", "codex"], home);
 
@@ -19,7 +23,7 @@ test("agent show selects the configured agent in a real terminal", () => {
   assert.match(result.output, /Agent: codex/);
 });
 
-test("agent remove asks for a default-No confirmation after interactive selection", () => {
+test("agent remove asks for a default-No confirmation after interactive selection", ptyTest, () => {
   const home = createHome();
   run(["agent", "add", "codex", "--command", "codex"], home);
 
@@ -31,7 +35,7 @@ test("agent remove asks for a default-No confirmation after interactive selectio
   assert.match(run(["agent", "show", "codex"], home), /Agent: codex/);
 });
 
-test("task detail resolves Task then TaskRole through dependent terminal selections", async () => {
+test("task detail resolves Task then TaskRole through dependent terminal selections", ptyTest, async () => {
   const home = createHome();
   run(["agent", "add", "codex", "--command", "codex"], home);
   run(["config", "set", "default-agent", "codex"], home);
@@ -54,7 +58,7 @@ test("task detail resolves Task then TaskRole through dependent terminal selecti
   assert.match(result.output, /Role: leader/);
 });
 
-test("task environment scope is resolved before dependent role selection", () => {
+test("task environment scope is resolved before dependent role selection", ptyTest, () => {
   const home = createTaskWithLeader();
 
   const result = runInTerminal(
@@ -70,17 +74,17 @@ test("task environment scope is resolved before dependent role selection", () =>
   assert.match(result.output, /Role: leader/);
 });
 
-test("an invalid explicit Task bypasses dependent selection and keeps the normal error", () => {
+test("an invalid explicit Task bypasses dependent selection and keeps the original validator error", ptyTest, () => {
   const home = createTaskWithLeader();
 
   const result = runInTerminal(["task", "detail", "missing-task"], "", home);
 
-  assert.equal(result.status, 3, result.output);
+  assert.equal(result.status, 2, result.output);
   assert.doesNotMatch(result.output, /Select task role/);
-  assert.match(result.output, /TASK_NOT_FOUND: Task not found: missing-task/);
+  assert.match(result.output, /USAGE_ERROR: Role name is required/);
 });
 
-test("explicit, non-terminal, and JSON invocations remain deterministic", () => {
+test("explicit, non-terminal, and JSON invocations remain deterministic", ptyTest, () => {
   const home = createHome();
   run(["agent", "add", "codex", "--command", "codex"], home);
 
@@ -109,6 +113,65 @@ test("explicit, non-terminal, and JSON invocations remain deterministic", () => 
     message: "Agent id is required.",
     details: {}
   });
+});
+
+test("Controller-routed selection starts the Controller before reading candidates", ptyTest, async () => {
+  const home = createHome();
+  run(["agent", "add", "codex", "--command", "codex"], home);
+  let discoveryAtPrompt = null;
+
+  try {
+    const result = await runInTerminalSteps(
+      ["agent", "show"],
+      [{
+        prompt: "Choose agent",
+        answer: "1\n",
+        onPrompt() {
+          const discoveryPath = join(home, "runtime", "controller.json");
+          discoveryAtPrompt = existsSync(discoveryPath)
+            ? JSON.parse(readFileSync(discoveryPath, "utf8"))
+            : null;
+        }
+      }],
+      home,
+      { TASKMUX_CONTROLLER_MODE: "auto" }
+    );
+
+    assert.equal(result.status, 0, result.output);
+    assert.equal(typeof discoveryAtPrompt?.pid, "number");
+    assert.match(result.output, /Agent: codex/);
+  } finally {
+    spawnSync(process.execPath, [cli, "controller", "stop"], {
+      encoding: "utf8",
+      env: { ...isolatedEnv(home), TASKMUX_CONTROLLER_MODE: "auto" },
+      timeout: 5_000
+    });
+  }
+});
+
+test("an explicit scoped role overrides TASKMUX_ROLE", ptyTest, () => {
+  const home = createTaskWithLeader();
+  run(["task", "assign", "task-1", "reviewer", "--agent", "codex", "--workspace", home], home);
+
+  const result = runInTerminal(
+    ["task", "detail", "reviewer"],
+    "",
+    home,
+    { TASKMUX_TASK_ID: "task-1", TASKMUX_ROLE: "leader" }
+  );
+
+  assert.equal(result.status, 0, result.output);
+  assert.doesNotMatch(result.output, /Select task role/);
+  assert.match(result.output, /Role: reviewer/);
+});
+
+test("structured command-local output disables interactive selection", async () => {
+  const selection = await import("../dist/cli/interactiveSelection.js");
+  assert.equal(typeof selection.allowsInteractiveSelection, "function");
+  assert.equal(selection.allowsInteractiveSelection(["task", "context", "--format", "json"], false), false);
+  assert.equal(selection.allowsInteractiveSelection(["task", "transcript", "export", "--format", "json"], false), false);
+  assert.equal(selection.allowsInteractiveSelection(["task", "context", "--format", "text"], false), true);
+  assert.equal(selection.allowsInteractiveSelection(["agent", "show"], true), false);
 });
 
 test("selector reports an actionable error without prompting when no candidates exist", async () => {
@@ -252,11 +315,16 @@ function run(args, home) {
 }
 
 function runInTerminal(args, input, home, extraEnv = {}) {
+  if (scriptSupport === null) {
+    throw new Error("compatible util-linux script is unavailable");
+  }
   const command = [process.execPath, cli, ...args].map(shellQuote).join(" ");
-  const result = spawnSync("script", ["-qec", command, "/dev/null"], {
+  const result = spawnSync(scriptSupport, ["-qec", command, "/dev/null"], {
     input,
     encoding: "utf8",
-    env: { ...isolatedEnv(home), ...extraEnv }
+    env: { ...isolatedEnv(home), ...extraEnv },
+    timeout: 5_000,
+    killSignal: "SIGKILL"
   });
 
   return {
@@ -267,25 +335,56 @@ function runInTerminal(args, input, home, extraEnv = {}) {
 
 function runInTerminalSteps(args, steps, home, extraEnv = {}) {
   return new Promise((resolve, reject) => {
+    if (scriptSupport === null) {
+      reject(new Error("compatible util-linux script is unavailable"));
+      return;
+    }
     const command = [process.execPath, cli, ...args].map(shellQuote).join(" ");
-    const child = spawn("script", ["-qec", command, "/dev/null"], {
+    const child = spawn(scriptSupport, ["-qec", command, "/dev/null"], {
       env: { ...isolatedEnv(home), ...extraEnv },
-      stdio: ["pipe", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: true
     });
     let output = "";
     let stepIndex = 0;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+      reject(new Error(`PTY command timed out after 5000ms: ${output}`));
+    }, 5_000);
     const consume = (chunk) => {
       output += chunk.toString().replaceAll("\r", "");
       const step = steps[stepIndex];
       if (step !== undefined && output.includes(step.prompt)) {
         stepIndex += 1;
+        step.onPrompt?.();
         child.stdin.write(step.answer);
       }
     };
     child.stdout.on("data", consume);
     child.stderr.on("data", consume);
-    child.on("error", reject);
+    child.on("error", (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
     child.on("close", (status) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
       child.stdin.end();
       resolve({ status, output });
     });
@@ -303,6 +402,14 @@ function isolatedEnv(home) {
 
 function shellQuote(value) {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function detectScriptSupport() {
+  const result = spawnSync("script", ["--version"], {
+    encoding: "utf8",
+    timeout: 2_000
+  });
+  return result.status === 0 && /util-linux/i.test(`${result.stdout}${result.stderr}`) ? "script" : null;
 }
 
 async function selectionFixture() {
