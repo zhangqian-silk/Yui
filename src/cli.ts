@@ -32,6 +32,7 @@ import { routeInvocation } from "./cli/invocationRouter.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
 import { renderCompletion, type CliIdentity } from "./cli/completion.js";
 import { runCompletionWizard } from "./completion/completionWizard.js";
+import { resolveInteractiveArguments } from "./cli/interactiveSelection.js";
 
 const VERSION = readPackageVersion();
 
@@ -250,12 +251,17 @@ async function main(): Promise<void> {
 
   if (args[0] === "agent") {
     requireStorageSchema(rootDir);
-    if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
-      await printControllerCommand(rootDir, "agent", args.slice(1));
+    const store = new FileTaskStore(rootDir);
+    const resolvedArgs = await resolveTerminalArguments(args, invocation.node, store);
+    if (resolvedArgs === null) {
+      emit("Cancelled.");
       return;
     }
-    const store = new FileTaskStore(rootDir);
-    emit(runAgentCommand(args.slice(1), store));
+    if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
+      await printControllerCommand(rootDir, "agent", resolvedArgs.slice(1));
+      return;
+    }
+    emit(runAgentCommand(resolvedArgs.slice(1), store));
     return;
   }
 
@@ -274,7 +280,13 @@ async function main(): Promise<void> {
     requireStorageSchema(rootDir);
     const store = new FileTaskStore(rootDir);
     const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandExecutor());
-    const taskArgs = resolveTaskCommandScope(args.slice(1), process.env);
+    const scopedTaskArgs = resolveTaskCommandScope(args.slice(1), process.env);
+    const resolvedFullArgs = await resolveTerminalArguments(["task", ...scopedTaskArgs], invocation.node, store);
+    if (resolvedFullArgs === null) {
+      emit("Cancelled.");
+      return;
+    }
+    const taskArgs = resolvedFullArgs.slice(1);
 
     if (taskArgs[0] === "shell") {
       const taskId = taskArgs[1];
@@ -328,6 +340,43 @@ async function main(): Promise<void> {
   }
 
   throw usageError(`Unknown command: ${args[0]}`);
+}
+
+async function resolveTerminalArguments(
+  commandArgs: readonly string[],
+  node: import("./cli/commandCatalog.js").CommandNode,
+  store: FileTaskStore
+): Promise<string[] | null> {
+  const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
+  if (!interactive || jsonOutput) {
+    return [...commandArgs];
+  }
+
+  const readline = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+  try {
+    const result = await resolveInteractiveArguments(commandArgs, node, store, {
+      interactive,
+      json: jsonOutput,
+      width: process.stdout.columns ?? 100,
+      write: (value) => process.stdout.write(value),
+      question: async (prompt) => {
+        try {
+          return await readline.question(prompt);
+        } catch (error) {
+          if (
+            error instanceof Error &&
+            (error.name === "AbortError" || "code" in error && error.code === "ERR_USE_AFTER_CLOSE")
+          ) {
+            return undefined;
+          }
+          throw error;
+        }
+      }
+    }, { preferredRole: process.env.TASKMUX_ROLE?.trim() });
+    return result.kind === "cancelled" ? null : result.args;
+  } finally {
+    readline.close();
+  }
 }
 
 function resolveCliIdentity(env: NodeJS.ProcessEnv): CliIdentity {
@@ -384,6 +433,14 @@ function resolveTaskCommandScope(commandArgs: string[], env: NodeJS.ProcessEnv):
   }
   if (command === "dispatch" && !hasTaskId(rest[0])) {
     return [command, taskId, ...rest];
+  }
+  if (command === "detail" && !hasTaskId(rest[0])) {
+    return [
+      command,
+      taskId,
+      ...(roleName === undefined || roleName.length === 0 ? [] : [roleName]),
+      ...rest
+    ];
   }
   if (command === "session" && !hasTaskId(rest[1])) {
     return [
