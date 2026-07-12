@@ -3268,10 +3268,11 @@ test("routes dashboard mutations through the Controller", async () => {
     TASKMUX_HOME: home,
     TASKMUX_CONTROLLER_MODE: "auto",
     TASKMUX_TMUX_BIN: fakeTmux,
-    TASKMUX_DOMAIN_TRANSACTION_FAILPOINT: "after-stage"
+    NODE_ENV: "test",
+    TASKMUX_TEST_ONLY_DOMAIN_TRANSACTION_FAILPOINT: "after-stage"
   });
 
-  assert.match(output, /Domain transaction .* stopped after staging/);
+  assert.match(output, /fail-closed pending restart recovery/);
   assert.equal(existsSync(join(home, "tasks", "task-1", "comments.jsonl")), false);
   assert.equal(readdirSync(join(home, "runtime", "domain-transactions")).length, 1);
   runTaskmuxFailure(["controller", "stop"], { TASKMUX_HOME: home });
@@ -4305,7 +4306,8 @@ test("commits query task pointers through the Controller transaction", () => {
   const env = {
     TASKMUX_HOME: home,
     TASKMUX_CONTROLLER_MODE: "auto",
-    TASKMUX_DOMAIN_TRANSACTION_FAILPOINT: "after-stage"
+    NODE_ENV: "test",
+    TASKMUX_TEST_ONLY_DOMAIN_TRANSACTION_FAILPOINT: "after-stage"
   };
 
   try {
@@ -4474,7 +4476,8 @@ test("controller completes a staged command transaction after restart without re
   const home = createConfiguredHome();
   const failingEnv = {
     TASKMUX_HOME: home,
-    TASKMUX_DOMAIN_TRANSACTION_FAILPOINT: "after-stage"
+    NODE_ENV: "test",
+    TASKMUX_TEST_ONLY_DOMAIN_TRANSACTION_FAILPOINT: "after-stage"
   };
   const request = {
     apiVersion: 1,
@@ -4495,7 +4498,7 @@ test("controller completes a staged command transaction after restart without re
       body: JSON.stringify(request)
     });
 
-    assert.equal((await invoke()).status, 400);
+    assert.equal((await invoke()).status, 503);
     assert.equal(existsSync(join(home, "tasks", "task-1", "task.json")), false);
     assert.equal(existsSync(join(home, "runtime", "domain-transactions", "restart-transaction.json")), true);
     runTaskmuxFailure(["controller", "stop"], failingEnv);
@@ -4523,7 +4526,8 @@ test("commits interactive attach status through the Controller single-writer bou
     TASKMUX_CONTROLLER_MODE: "auto",
     TASKMUX_TMUX_BIN: fakeTmux,
     FAKE_TMUX_LOG: logFile,
-    TASKMUX_DOMAIN_TRANSACTION_FAILPOINT: "after-stage"
+    NODE_ENV: "test",
+    TASKMUX_TEST_ONLY_DOMAIN_TRANSACTION_FAILPOINT: "after-stage"
   };
 
   try {
@@ -4659,7 +4663,8 @@ test("replays a staged prune transaction after Controller restart", () => {
   const failingEnv = {
     TASKMUX_HOME: home,
     TASKMUX_CONTROLLER_MODE: "auto",
-    TASKMUX_DOMAIN_TRANSACTION_FAILPOINT: "after-stage"
+    NODE_ENV: "test",
+    TASKMUX_TEST_ONLY_DOMAIN_TRANSACTION_FAILPOINT: "after-stage"
   };
   const trashTask = join(home, "trash", "tasks", "task-1");
 
@@ -5597,7 +5602,8 @@ test("runs an explicit Scheduler scan as a recoverable one-shot transaction", ()
 
   const result = runTaskmuxFailure(["controller", "scan"], {
     TASKMUX_HOME: home,
-    TASKMUX_DOMAIN_TRANSACTION_FAILPOINT: "after-stage"
+    NODE_ENV: "test",
+    TASKMUX_TEST_ONLY_DOMAIN_TRANSACTION_FAILPOINT: "after-stage"
   });
 
   assert.equal(result.status, 5);
@@ -5632,7 +5638,8 @@ test("controller replays a staged Scheduler transaction without dispatching twic
     TASKMUX_TMUX_BIN: fakeTmux,
     FAKE_TMUX_LOG: logFile,
     FAKE_TMUX_STATE: stateFile,
-    TASKMUX_DOMAIN_TRANSACTION_FAILPOINT: "after-stage",
+    NODE_ENV: "test",
+    TASKMUX_TEST_ONLY_DOMAIN_TRANSACTION_FAILPOINT: "after-stage",
     TASKMUX_CONTROLLER_SCAN_INTERVAL_MS: "60000"
   };
 

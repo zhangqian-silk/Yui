@@ -285,15 +285,15 @@ export class FileTaskStore implements TaskStore {
   }
 
   saveInputRequest(request: InputRequest): void {
-    const pointers = inputRecordPointers(request);
-    if (
-      pointers === null ||
-      !isInputRequestRecord(request, pointers.taskId, pointers.id)
-    ) {
+    const encoded = encodeInputRequestRecord(request);
+    if (encoded === null) {
       throw dataError("Invalid input request record");
     }
-    mkdirSync(this.inputRequestsDir(request.taskId), { recursive: true });
-    this.writeSnapshot(this.inputRequestFile(request.taskId, request.id), `${JSON.stringify(request, null, 2)}\n`);
+    mkdirSync(this.inputRequestsDir(encoded.record.taskId), { recursive: true });
+    this.writeSnapshot(
+      this.inputRequestFile(encoded.record.taskId, encoded.record.id),
+      encoded.content
+    );
   }
 
   getInputResolution(taskId: string, resolutionId: string): InputResolution | null {
@@ -311,17 +311,14 @@ export class FileTaskStore implements TaskStore {
   }
 
   saveInputResolution(resolution: InputResolution): void {
-    const pointers = inputRecordPointers(resolution);
-    if (
-      pointers === null ||
-      !isInputResolutionRecord(resolution, pointers.taskId, pointers.id)
-    ) {
+    const encoded = encodeInputResolutionRecord(resolution);
+    if (encoded === null) {
       throw dataError("Invalid input resolution record");
     }
-    mkdirSync(this.inputResolutionsDir(resolution.taskId), { recursive: true });
+    mkdirSync(this.inputResolutionsDir(encoded.record.taskId), { recursive: true });
     this.writeSnapshot(
-      this.inputResolutionFile(resolution.taskId, resolution.id),
-      `${JSON.stringify(resolution, null, 2)}\n`
+      this.inputResolutionFile(encoded.record.taskId, encoded.record.id),
+      encoded.content
     );
   }
 
@@ -1576,12 +1573,66 @@ function assertInputPointerId(value: string, label: string): void {
 }
 
 function inputRecordPointers(value: unknown): { taskId: string; id: string } | null {
-  if (
-    !isRecord(value) ||
-    typeof value.taskId !== "string" ||
-    typeof value.id !== "string"
-  ) {
+  try {
+    if (
+      !isRecord(value) ||
+      typeof value.taskId !== "string" ||
+      typeof value.id !== "string"
+    ) {
+      return null;
+    }
+    return { taskId: value.taskId, id: value.id };
+  } catch {
     return null;
   }
-  return { taskId: value.taskId, id: value.id };
+}
+
+function encodeInputRequestRecord(
+  value: unknown
+): { record: InputRequest; content: string } | null {
+  const pointers = inputRecordPointers(value);
+  if (pointers === null) {
+    return null;
+  }
+  try {
+    if (!isInputRequestRecord(value, pointers.taskId, pointers.id)) {
+      return null;
+    }
+    const serialized = JSON.stringify(value, null, 2);
+    if (typeof serialized !== "string") {
+      return null;
+    }
+    const record = JSON.parse(serialized) as unknown;
+    if (!isInputRequestRecord(record, pointers.taskId, pointers.id)) {
+      return null;
+    }
+    return { record, content: `${serialized}\n` };
+  } catch {
+    return null;
+  }
+}
+
+function encodeInputResolutionRecord(
+  value: unknown
+): { record: InputResolution; content: string } | null {
+  const pointers = inputRecordPointers(value);
+  if (pointers === null) {
+    return null;
+  }
+  try {
+    if (!isInputResolutionRecord(value, pointers.taskId, pointers.id)) {
+      return null;
+    }
+    const serialized = JSON.stringify(value, null, 2);
+    if (typeof serialized !== "string") {
+      return null;
+    }
+    const record = JSON.parse(serialized) as unknown;
+    if (!isInputResolutionRecord(record, pointers.taskId, pointers.id)) {
+      return null;
+    }
+    return { record, content: `${serialized}\n` };
+  } catch {
+    return null;
+  }
 }
