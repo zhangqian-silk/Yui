@@ -60,6 +60,8 @@ Global role templates use copy semantics. Once a role is bound into a Task, late
 
 Mutating request IDs are idempotent. A committed result is returned without reapplying the command. If a process stops after a transaction is staged, Controller startup completes the staged operation before serving requests.
 
+The command catalog is the authoritative public CLI vocabulary. It assigns every command to one semantic section and defines stable order within each section; help and Bash, Zsh, and Fish completion consume that structure directly. Public operations have one canonical spelling: scoped help uses `taskmux help [command path]`, and version output uses `taskmux version`. Completion suppresses unrelated filesystem fallback at catalog-owned positions while retaining catalog-declared enum, file/path, and executable ownership.
+
 Setup is an explicit lifecycle operation. Ordinary CLI, dashboard, Task shell, import, prune, backup, attach-state, and Scheduler mutations share the Controller boundary.
 
 ## Dispatch and wakeup flow

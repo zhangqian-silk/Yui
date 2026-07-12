@@ -1,4 +1,4 @@
-import { visibleChildren, type CommandNode } from "./commandCatalog.js";
+import { visibleCommandSections, type CommandNode } from "./commandCatalog.js";
 
 export function renderCommandHelp(node: CommandNode, version: string): string {
   const title = node.path.length === 1 ? "TaskMux" : `TaskMux ${node.path.slice(1).join(" ")}`;
@@ -8,23 +8,22 @@ export function renderCommandHelp(node: CommandNode, version: string): string {
 
   lines.push("", "Usage:", ...node.usage.map((usage) => `  ${usage}`));
 
-  const children = visibleChildren(node);
-  if (children.length > 0) {
-    const width = Math.max(...children.map((child) => child.name.length));
-    lines.push(
-      "",
-      "Commands:",
-      ...children.map((child) => `  ${child.name.padEnd(width)}  ${child.summary}`)
-    );
+  const sections = visibleCommandSections(node);
+  for (const section of sections) {
+    const width = Math.max(...section.entries.map((entry) => entry.name.length));
+    lines.push("", `${section.title}:`, ...section.entries.map(
+      (entry) => `  ${entry.name.padEnd(width)}  ${entry.summary}`
+    ));
   }
 
-  const optionWidth = Math.max("-h, --help".length, ...node.options.map((option) => option.length));
-  lines.push(
-    "",
-    "Options:",
-    ...node.options.map((option) => `  ${option.padEnd(optionWidth)}  ${describeOption(option)}`),
-    `  ${"-h, --help".padEnd(optionWidth)}  Show help.`
-  );
+  if (node.options.length > 0) {
+    const optionWidth = Math.max(...node.options.map((option) => option.length));
+    lines.push(
+      "",
+      "Options:",
+      ...node.options.map((option) => `  ${option.padEnd(optionWidth)}  ${describeOption(option)}`)
+    );
+  }
   return `${lines.join("\n")}\n`;
 }
 

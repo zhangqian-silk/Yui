@@ -1,12 +1,15 @@
-export type CycleCause =
-  | "task-created"
-  | "user-comment"
-  | "schedule"
-  | "review-time"
-  | "operator-input"
-  | "role-result"
-  | "inactivity"
-  | "explicit-wake";
+export const CYCLE_CAUSES = [
+  "task-created",
+  "user-comment",
+  "schedule",
+  "review-time",
+  "operator-input",
+  "role-result",
+  "inactivity",
+  "explicit-wake"
+] as const;
+
+export type CycleCause = typeof CYCLE_CAUSES[number];
 
 export type Cycle = {
   schemaVersion: 1;

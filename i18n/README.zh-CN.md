@@ -145,7 +145,7 @@ taskmux version                 # 输出已安装包的版本
 
 ## 帮助、补全与更新
 
-使用 `taskmux help [command ...]` 查看任意命令范围。`help`、`-h` 和 `--help` 也可以在命令组和叶子命令中使用，例如 `taskmux task role help` 和 `taskmux task role rename --help`。未知命令会先输出错误，再输出最近一层的帮助，并以状态码 2 退出；追加 `--json` 时仍只输出一个 JSON 错误 envelope，不附加帮助文本。
+仅使用规范形式 `taskmux help [command ...]` 查看任意命令范围，例如 `taskmux help task role` 或 `taskmux help task role rename`。直接输入不完整的命令组或未知命令时，会先输出错误，再输出最近一层的帮助，并以状态码 2 退出；追加 `--json` 时仍只输出一个 JSON 错误 envelope，不附加帮助文本。帮助信息按照 command catalog 定义的用途分类，并保持 catalog 中的顺序。
 
 生成按命令路径组织的补全脚本，不读取或修改 TaskMux 状态：
 
@@ -161,7 +161,7 @@ taskmux completion fish > ~/.config/fish/completions/taskmux.fish
 
 `taskmux-dev` 只为 `taskmux-dev` 生成和安装补全，使用独立文件名、标记和隔离配置。补全路径属于本机配置：`backup` 会包含它们，逻辑 `export` 会省略它们，`import` 会保留目标机器已有记录。
 
-`taskmux version` 等价于 `taskmux --version` 和 `taskmux -v`。`taskmux update` 会直接执行 `npm install --global @zq-silk/taskmux@latest`，并保留 npm 正常的交互输出。update 不支持 `--json`。
+仅使用规范形式 `taskmux version` 输出已安装版本。`taskmux update` 会直接执行 `npm install --global @zq-silk/taskmux@latest`，并保留 npm 正常的交互输出。update 不支持 `--json`。
 
 ## 本地状态
 
@@ -182,7 +182,7 @@ make check
 
 ```sh
 make link
-taskmux-dev --help
+taskmux-dev help
 ```
 
 `taskmux-dev` 始终使用 `output/taskmux-cli-dev` 作为隔离数据目录，并且不会进入 npm 发布包。`taskmux-dev update` 更新的是全局安装的正式 `taskmux` 包，不会更新当前 checkout、重新构建代码、修改受管理的 wrapper，也不会改动隔离开发数据。全局 npm 安装可能替换已有的 `taskmux` npm link。运行 `make unlink` 可移除受管理的 launcher。
