@@ -42,6 +42,12 @@ export type InteractionPolicy = {
   requiredArguments?: readonly number[];
   requiredOptions?: readonly string[];
   requiredAnyOptions?: readonly string[];
+  optionPrerequisites?: readonly {
+    option: string;
+    values: readonly string[];
+    requireWhenSelecting: boolean;
+    requiredOptions: readonly string[];
+  }[];
   confirmation?: {
     action: string;
     targetArgumentIndex: number;
@@ -301,7 +307,13 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = [
       { argumentIndex: 4, entity: "work-item", provider: "work-items", dependsOn: 3, actionTarget: true }
     ],
     trailingOptions: { "--status": "value", "--outcome": "value" },
-    requiredOptions: ["--status"]
+    requiredOptions: ["--status"],
+    optionPrerequisites: [{
+      option: "--status",
+      values: ["completed", "failed", "cancelled", "superseded"],
+      requireWhenSelecting: true,
+      requiredOptions: ["--outcome"]
+    }]
   },
   {
     commandPath: ["task", "decision", "supersede"],
@@ -476,6 +488,22 @@ export function validateInteractionPolicies(
     for (const option of policy.requiredAnyOptions ?? []) {
       if (!node.options.includes(option)) {
         throw new Error(`Interaction any-required option is not catalog-owned for ${key}: ${option}`);
+      }
+    }
+    for (const prerequisite of policy.optionPrerequisites ?? []) {
+      const optionValues = node.optionValues[prerequisite.option];
+      if (optionValues === undefined) {
+        throw new Error(`Interaction option prerequisite must reference a catalog enum for ${key}: ${prerequisite.option}`);
+      }
+      for (const value of prerequisite.values) {
+        if (!optionValues.includes(value)) {
+          throw new Error(`Interaction option prerequisite value is not catalog-owned for ${key}: ${value}`);
+        }
+      }
+      for (const requiredOption of prerequisite.requiredOptions) {
+        if (!node.options.includes(requiredOption)) {
+          throw new Error(`Interaction option prerequisite is not catalog-owned for ${key}: ${requiredOption}`);
+        }
       }
     }
     for (const option of Object.keys(policy.trailingOptions ?? {})) {

@@ -93,6 +93,19 @@ function catalogEnumsCanResolve(
   policy: InteractionPolicy | undefined
 ): boolean {
   if (policy !== undefined) {
+    const selectableOptions = new Set([
+      ...Object.keys(node.optionValues),
+      ...policy.selectors.flatMap((selector) => selector.option === undefined ? [] : [selector.option])
+    ]);
+    if (!trailingOptionsAreReady(args, policy, selectableOptions)) {
+      return false;
+    }
+    if (!suppressedSelectorArgumentsAreReady(args, policy)) {
+      return false;
+    }
+    if (!optionPrerequisitesAreReady(args, policy)) {
+      return false;
+    }
     const requiredArgumentsReady = policy.requiredArguments?.every((index) => {
       const value = args[index];
       return value !== undefined && !value.startsWith("--");
@@ -128,6 +141,18 @@ function catalogEnumsCanResolve(
 }
 
 function interactionPolicyIsReady(args: readonly string[], policy: InteractionPolicy): boolean {
+  const selectableOptions = new Set(
+    policy.selectors.flatMap((selector) => selector.option === undefined ? [] : [selector.option])
+  );
+  if (!trailingOptionsAreReady(args, policy, selectableOptions)) {
+    return false;
+  }
+  if (!suppressedSelectorArgumentsAreReady(args, policy)) {
+    return false;
+  }
+  if (!optionPrerequisitesAreReady(args, policy)) {
+    return false;
+  }
   const requiredArgumentsReady = policy.requiredArguments?.every((index) => {
     const value = args[index];
     return value !== undefined && !value.startsWith("--");
@@ -140,6 +165,100 @@ function interactionPolicyIsReady(args: readonly string[], policy: InteractionPo
   const anyOptionsReady = policy.requiredAnyOptions === undefined
     || policy.requiredAnyOptions.some((option) => args.includes(option));
   return requiredArgumentsReady && requiredOptionsReady && anyOptionsReady;
+}
+
+function trailingOptionsAreReady(
+  args: readonly string[],
+  policy: InteractionPolicy,
+  selectableOptions: ReadonlySet<string>
+): boolean {
+  for (let index = policy.commandPath.length; index < args.length; index += 1) {
+    const value = args[index] ?? "";
+    if (!value.startsWith("--")) {
+      continue;
+    }
+    const optionKind = policy.trailingOptions?.[value];
+    if (optionKind === undefined) {
+      return false;
+    }
+    if (optionKind === "flag") {
+      continue;
+    }
+    const optionValue = args[index + 1];
+    if (optionValue === undefined || optionValue.startsWith("--")) {
+      if (!selectableOptions.has(value)) {
+        return false;
+      }
+      continue;
+    }
+    index += 1;
+  }
+  return true;
+}
+
+function optionPrerequisitesAreReady(
+  args: readonly string[],
+  policy: InteractionPolicy
+): boolean {
+  return (policy.optionPrerequisites ?? []).every((prerequisite) => {
+    const optionIndex = args.indexOf(prerequisite.option);
+    const optionValue = optionIndex < 0 ? undefined : args[optionIndex + 1];
+    if (optionIndex < 0) {
+      return true;
+    }
+    const applies = optionValue === undefined || optionValue.startsWith("--")
+      ? prerequisite.requireWhenSelecting
+      : prerequisite.values.includes(optionValue);
+    if (!applies) {
+      return true;
+    }
+    return prerequisite.requiredOptions.every((requiredOption) => {
+      const requiredIndex = args.indexOf(requiredOption);
+      const requiredValue = requiredIndex < 0 ? undefined : args[requiredIndex + 1];
+      return requiredValue !== undefined && !requiredValue.startsWith("--");
+    });
+  });
+}
+
+function suppressedSelectorArgumentsAreReady(
+  args: readonly string[],
+  policy: InteractionPolicy
+): boolean {
+  return policy.selectors.every((selector) =>
+    selector.argumentIndex === undefined
+    || selector.unlessOption === undefined
+    || !args.includes(selector.unlessOption)
+    || positionalArgumentIsPresent(args, policy, selector.argumentIndex)
+  );
+}
+
+function positionalArgumentIsPresent(
+  args: readonly string[],
+  policy: InteractionPolicy,
+  argumentIndex: number
+): boolean {
+  const targetPosition = argumentIndex - policy.commandPath.length;
+  let position = 0;
+
+  for (let index = policy.commandPath.length; index < args.length; index += 1) {
+    const value = args[index] ?? "";
+    const optionKind = policy.trailingOptions?.[value];
+    if (optionKind !== undefined) {
+      if (optionKind === "value" && args[index + 1] !== undefined && !args[index + 1].startsWith("--")) {
+        index += 1;
+      }
+      continue;
+    }
+    if (value.startsWith("--")) {
+      return false;
+    }
+    if (position === targetPosition) {
+      return true;
+    }
+    position += 1;
+  }
+
+  return false;
 }
 
 function missingSelectorSlot(

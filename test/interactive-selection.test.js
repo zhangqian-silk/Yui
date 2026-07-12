@@ -84,6 +84,69 @@ test("an invalid explicit Task bypasses dependent selection and keeps the origin
   assert.match(result.output, /USAGE_ERROR: Role name is required/);
 });
 
+test("task assign does not select a Task when the free-form role is missing", ptyTest, () => {
+  const home = createTaskWithLeader();
+
+  const result = runInTerminal([
+    "task", "assign", "--agent", "codex", "--workspace", home
+  ], "", home);
+
+  assert.equal(result.status, 3, result.output);
+  assert.doesNotMatch(result.output, /Select task/);
+  assert.match(result.output, /TASK_NOT_FOUND: Task not found: --agent/);
+});
+
+test("task assign does not repair unknown options into a writable invocation", ptyTest, () => {
+  const home = createTaskWithLeader();
+
+  const result = runInTerminal([
+    "task", "assign", "task-1", "--bogus", "x", "--workspace", home, "--agent"
+  ], "", home);
+
+  assert.equal(result.status, 2, result.output);
+  assert.doesNotMatch(result.output, /Select agent/);
+  assert.match(result.output, /USAGE_ERROR: --agent is required/);
+  assert.doesNotMatch(run(["task", "roles", "task-1"], home), /--bogus/);
+});
+
+test("terminal work item status without an outcome does not start enum selection", ptyTest, () => {
+  const home = createTaskWithLeader();
+  run(["task", "work-item", "create", "task-1", "--title", "Review"], home);
+
+  const result = runInTerminal([
+    "task", "work-item", "update", "task-1", "work-item-1", "--status"
+  ], "", home);
+
+  assert.equal(result.status, 2, result.output);
+  assert.doesNotMatch(result.output, /Select status/);
+  assert.match(result.output, /USAGE_ERROR: --status is required/);
+});
+
+test("explicit terminal work item status without an outcome does not start entity selection", ptyTest, () => {
+  const home = createTaskWithLeader();
+  run(["task", "work-item", "create", "task-1", "--title", "Review"], home);
+
+  const result = runInTerminal([
+    "task", "work-item", "update", "task-1", "--status", "completed"
+  ], "", home);
+
+  assert.equal(result.status, 2, result.output);
+  assert.doesNotMatch(result.output, /Select work item/);
+  assert.match(result.output, /USAGE_ERROR: Work item not found: --status/);
+});
+
+test("an incomplete free-form option blocks unrelated enum selection", ptyTest, () => {
+  const home = createTaskWithLeader();
+
+  const result = runInTerminal([
+    "task", "update", "task-1", "--title", "--priority"
+  ], "", home);
+
+  assert.equal(result.status, 2, result.output);
+  assert.doesNotMatch(result.output, /Select priority/);
+  assert.match(result.output, /USAGE_ERROR: --title is required/);
+});
+
 test("an invalid explicit dispatch role bypasses work item selection and keeps the original validator error", ptyTest, () => {
   const home = createTaskWithLeader();
 
@@ -979,6 +1042,22 @@ test("Task shell reuses its readline boundary for missing enumerable references"
   assert.match(result.output, /Select task role: task-1/);
   assert.match(result.output, /Role: leader/);
   assert.doesNotMatch(result.output, /USAGE_ERROR: Role name is required/);
+});
+
+test("Task shell keeps interactive selection disabled in global JSON mode", ptyTest, async () => {
+  const home = createTaskWithLeader();
+  const result = await runInTerminalSteps(
+    ["task", "shell", "task-1", "--json"],
+    [
+      { prompt: "taskmux task-1>", answer: "detail\n" },
+      { prompt: "USAGE_ERROR: Role name is required.", answer: "q\n" }
+    ],
+    home
+  );
+
+  assert.equal(result.status, 0, result.output);
+  assert.doesNotMatch(result.output, /Select task role/);
+  assert.match(result.output, /USAGE_ERROR: Role name is required\./);
 });
 
 function createHome() {
