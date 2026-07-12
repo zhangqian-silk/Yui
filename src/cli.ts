@@ -327,7 +327,7 @@ async function main(): Promise<void> {
         }
         const result = await resolveInteractiveArguments(["task", ...commandArgs], shellInvocation.node, store, {
           interactive: shellIo.interactive,
-          json: false,
+          json: jsonOutput,
           width: shellIo.width,
           write: shellIo.write,
           question: shellIo.question
