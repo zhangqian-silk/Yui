@@ -145,7 +145,7 @@ Append `--json` to ordinary commands for a stable success or error envelope. Ins
 
 ## Help, completion, and updates
 
-Use `taskmux help [command ...]` to inspect any command scope. `help`, `-h`, and `--help` also work within groups, for example `taskmux task role help` and `taskmux task role rename --help`. An unknown command prints its error first, then the nearest scoped help, and exits with status 2. With `--json`, the same error remains one JSON envelope without appended help.
+Use the single canonical form `taskmux help [command ...]` to inspect any command scope, for example `taskmux help task role` or `taskmux help task role rename`. Bare command groups and unknown commands print an error first, then the nearest scoped help, and exit with status 2. With `--json`, the same error remains one JSON envelope without appended help. Help groups commands by their catalog-defined purpose and preserves catalog order.
 
 Generate path-aware completion without reading or changing TaskMux state:
 
@@ -161,7 +161,7 @@ Completion scripts and activation blocks use ownership markers, atomic replaceme
 
 `taskmux-dev` generates and installs completion for `taskmux-dev` with separate filenames, markers, and its isolated config. Completion paths are host-local: `backup` includes them, while logical `export` omits them and `import` preserves the target machine's existing records.
 
-`taskmux version` is equivalent to `taskmux --version` and `taskmux -v`. Run `taskmux update` to directly execute `npm install --global @zq-silk/taskmux@latest` with npm's normal interactive output. Update does not support `--json`.
+Use the single canonical form `taskmux version` to print the installed version. Run `taskmux update` to directly execute `npm install --global @zq-silk/taskmux@latest` with npm's normal interactive output. Update does not support `--json`.
 
 ## Local state
 
@@ -182,7 +182,7 @@ For command-by-command testing of the current checkout without touching `~/.task
 
 ```sh
 make link
-taskmux-dev --help
+taskmux-dev help
 ```
 
 `taskmux-dev` always uses `output/taskmux-cli-dev` as its isolated home and is not included in the npm package. `taskmux-dev update` updates the globally installed published `taskmux` package; it does not update this checkout, rebuild it, change the managed wrapper, or modify the isolated development data. A global npm install may replace an existing `npm link` for `taskmux`. Remove the managed launcher with `make unlink`.
