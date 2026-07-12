@@ -57,7 +57,7 @@ main().catch((error: unknown) => {
 });
 
 async function main(): Promise<void> {
-  if (args.includes("--version") || args.includes("-v") || (args[0] === "version" && args.length === 1)) {
+  if (args[0] === "version" && args.length === 1) {
     emit(VERSION);
     return;
   }
@@ -72,6 +72,16 @@ async function main(): Promise<void> {
       `Unknown command: ${invocation.typedPath}`,
       renderCommandHelp(invocation.helpNode, VERSION)
     );
+  }
+  if (invocation.kind === "incomplete") {
+    throw usageError(
+      `Command required after: ${invocation.typedPath}`,
+      `${renderCommandHelp(invocation.helpNode, VERSION)}\nRun \`taskmux help ${invocation.typedPath}\` for this command group.\n`
+    );
+  }
+
+  if (args[0] === "version") {
+    throw usageError("Version usage: taskmux version");
   }
 
   if (args[0] === "update") {
