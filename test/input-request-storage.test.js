@@ -416,3 +416,59 @@ test("rejects invalid in-memory records and unsafe pointer ids before touching p
   assert.equal(existsSync(join(home, "escaped.json")), false);
   assert.equal(existsSync(join(home, "escaped-task")), false);
 });
+
+test("rejects coercible, sparse, and prototype-backed records with stable data errors", (t) => {
+  const home = createHome(t);
+  const store = new FileTaskStore(home);
+  saveTask(store, "task-1");
+  const valid = createInputRequest(
+    "input-shape",
+    "task-1",
+    requester(),
+    {
+      question: "Question",
+      choices: [],
+      blockedRefs: [{ type: "task", id: "task-1" }],
+      resolutionPolicy: { mode: "user-required" }
+    },
+    now
+  );
+  const sparseBlockedRefs = [];
+  sparseBlockedRefs.length = 1;
+
+  for (const invalid of [
+    { ...valid, id: 1, taskId: 1 },
+    {
+      ...valid,
+      blockedRefs: [{ type: { toString: () => "task" }, id: "task-1" }]
+    },
+    { ...valid, blockedRefs: sparseBlockedRefs },
+    { ...valid, requester: Object.create(valid.requester) }
+  ]) {
+    assert.throws(
+      () => store.saveInputRequest(invalid),
+      (error) => error.code === "DATA_ERROR" && /Invalid input request record/.test(error.message)
+    );
+  }
+  assert.throws(
+    () => store.saveInputRequest(null),
+    (error) => error.code === "DATA_ERROR" && /Invalid input request record/.test(error.message)
+  );
+  assert.throws(
+    () => store.getInputRequest(1, 1),
+    (error) => error.code === "DATA_ERROR" && /Invalid task id/.test(error.message)
+  );
+
+  const resolution = answerInputRequest(valid, "resolution-shape", { text: "Answer" }, "online", now).resolution;
+  assert.throws(
+    () => store.saveInputResolution({
+      ...resolution,
+      operatorPresence: { toString: () => "online" }
+    }),
+    (error) => error.code === "DATA_ERROR" && /Invalid input resolution record/.test(error.message)
+  );
+  assert.throws(
+    () => store.saveInputResolution(null),
+    (error) => error.code === "DATA_ERROR" && /Invalid input resolution record/.test(error.message)
+  );
+});

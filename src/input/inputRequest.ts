@@ -122,6 +122,9 @@ export function createInputRequest(
   }
   assertTextEncodingAndSize(question, "Input request question", MAX_INPUT_QUESTION_LENGTH);
 
+  if (!isDenseArray(input.choices)) {
+    throw new Error("Input choices must be a dense array.");
+  }
   if (input.choices.length > MAX_INPUT_CHOICES) {
     throw new Error(`Too many input choices (maximum ${MAX_INPUT_CHOICES}).`);
   }
@@ -130,6 +133,9 @@ export function createInputRequest(
     throw new Error("Choice keys must be unique.");
   }
 
+  if (!isDenseArray(input.blockedRefs)) {
+    throw new Error("Blocked references must be a dense array.");
+  }
   if (input.blockedRefs.length > MAX_INPUT_BLOCKED_REFS) {
     throw new Error(`Too many blocked references (maximum ${MAX_INPUT_BLOCKED_REFS}).`);
   }
@@ -268,12 +274,15 @@ export function supersedeInputRequest(
 }
 
 function normalizeChoice(choice: InputChoice): InputChoice {
+  if (typeof choice?.key !== "string") {
+    throw new Error("Invalid choice key.");
+  }
   const key = choice.key.trim();
   if (!CHOICE_KEY_PATTERN.test(key)) {
     throw new Error("Invalid choice key.");
   }
 
-  const label = requiredText(choice.label, `Choice label for ${key}`, MAX_INPUT_CHOICE_LABEL_LENGTH);
+  const label = requiredText(choice.label, "Choice label", MAX_INPUT_CHOICE_LABEL_LENGTH);
   return {
     key,
     label,
@@ -282,7 +291,7 @@ function normalizeChoice(choice: InputChoice): InputChoice {
       : {
           description: requiredText(
             choice.description,
-            `Choice description for ${key}`,
+            "Choice description",
             MAX_INPUT_CHOICE_DESCRIPTION_LENGTH
           )
         })
@@ -292,6 +301,7 @@ function normalizeChoice(choice: InputChoice): InputChoice {
 function normalizeBlockedRef(reference: BlockedRef): BlockedRef {
   if (
     !["work-item", "decision", "task"].includes(reference.type) ||
+    typeof reference.id !== "string" ||
     !POINTER_ID_PATTERN.test(reference.id.trim())
   ) {
     throw new Error("Invalid blocked reference.");
@@ -428,7 +438,7 @@ function transitionTimestamp(request: InputRequest, now: Date): string {
 }
 
 function assertPointerId(value: string, label: string): void {
-  if (!POINTER_ID_PATTERN.test(value)) {
+  if (typeof value !== "string" || !POINTER_ID_PATTERN.test(value)) {
     throw new Error(`${label} is invalid.`);
   }
 }
@@ -478,4 +488,16 @@ function isWellFormedUtf16(value: string): boolean {
 
 function normalizeText(value: string): string {
   return value.replaceAll("\r\n", "\n").replaceAll("\r", "\n").trim();
+}
+
+function isDenseArray(value: unknown): value is unknown[] {
+  if (!Array.isArray(value)) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.hasOwn(value, index)) {
+      return false;
+    }
+  }
+  return true;
 }

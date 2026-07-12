@@ -121,6 +121,10 @@ test("rejects invalid questions, choices, blocked references, and policies", () 
   };
 
   assert.throws(
+    () => createInputRequest(1, "task-1", requester(), valid, now),
+    /Input request id is invalid/
+  );
+  assert.throws(
     () => createInputRequest("input-1", "task-1", requester(), { ...valid, question: " \r\n " }, now),
     /Input request question is required/
   );
@@ -344,6 +348,68 @@ test("does not reflect rejected choice values into errors", () => {
     "online",
     now
   ));
+  capture(() => createInputRequest(
+    "input-secret-label",
+    "task-1",
+    requester(),
+    {
+      question: "Question",
+      choices: [{ key: secret, label: " " }],
+      blockedRefs: [],
+      resolutionPolicy: { mode: "user-required" }
+    },
+    now
+  ));
+  capture(() => createInputRequest(
+    "input-secret-description",
+    "task-1",
+    requester(),
+    {
+      question: "Question",
+      choices: [{ key: secret, label: "Label", description: " " }],
+      blockedRefs: [],
+      resolutionPolicy: { mode: "user-required" }
+    },
+    now
+  ));
+});
+
+test("rejects sparse request arrays before constructing an unpersistable record", () => {
+  const choices = [];
+  choices.length = 1;
+  const blockedRefs = [];
+  blockedRefs.length = 1;
+
+  assert.throws(
+    () => createInputRequest(
+      "input-sparse-choices",
+      "task-1",
+      requester(),
+      {
+        question: "Question",
+        choices,
+        blockedRefs: [],
+        resolutionPolicy: { mode: "user-required" }
+      },
+      now
+    ),
+    /Input choices must be a dense array/
+  );
+  assert.throws(
+    () => createInputRequest(
+      "input-sparse-blocked",
+      "task-1",
+      requester(),
+      {
+        question: "Question",
+        choices: [],
+        blockedRefs,
+        resolutionPolicy: { mode: "user-required" }
+      },
+      now
+    ),
+    /Blocked references must be a dense array/
+  );
 });
 
 test("answers an open request and links a user resolution", () => {
