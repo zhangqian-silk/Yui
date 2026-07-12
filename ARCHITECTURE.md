@@ -21,7 +21,7 @@ TaskMux has no required remote control plane, database server, or message broker
 
 | Component | Responsibility |
 | --- | --- |
-| **CLI** | Parse commands, render human or JSON output, and route ordinary operations to the Controller. |
+| **CLI** | Parse commands, optionally resolve omitted references to locally enumerable TaskMux objects in an interactive terminal, render human or JSON output, and route ordinary operations to the Controller. |
 | **Controller** | Authenticate local RPC, serialize mutations, deduplicate request IDs, run recovery, and refresh derived state. |
 | **Domain services** | Apply Task, role, Cycle, WorkItem, schedule, decision, milestone, and session rules. |
 | **Scheduler** | Detect scheduled reviews, recurring work, inactivity, expired AgentRuns, and exited tmux windows. |
@@ -61,6 +61,8 @@ Global role templates use copy semantics. Once a role is bound into a Task, late
 Mutating request IDs are idempotent. A committed result is returned without reapplying the command. If a process stops after a transaction is staged, Controller startup completes the staged operation before serving requests.
 
 The command catalog is the authoritative public CLI vocabulary. It assigns every command to one semantic section and defines stable order within each section; help and Bash, Zsh, and Fish completion consume that structure directly. Public operations have one canonical spelling: scoped help uses `taskmux help [command path]`, and version output uses `taskmux version`. Completion suppresses unrelated filesystem fallback at catalog-owned positions while retaining catalog-declared enum, file/path, and executable ownership.
+
+Before the existing execution boundary, the CLI may guide a terminal user to select an omitted reference that TaskMux can enumerate from local authoritative state. Explicit arguments are never replaced, and scripts, redirected IO, and JSON invocations remain deterministic and non-interactive. The selected value is still validated by the ordinary command path.
 
 Setup is an explicit lifecycle operation. Ordinary CLI, dashboard, Task shell, import, prune, backup, attach-state, and Scheduler mutations share the Controller boundary.
 
