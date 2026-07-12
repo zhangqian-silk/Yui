@@ -35,6 +35,26 @@ type DomainTransaction = {
   createdAt: string;
 };
 
+export type DomainTransactionApplyResult = "applied" | "recovered";
+
+type DomainTransactionFaultInjection = {
+  initialAfterOperation?: number;
+  recoveryAfterOperation?: number;
+  failBeforeJournalRead?: boolean;
+  failBeforeJournalRemove?: boolean;
+};
+
+export class DomainTransactionRecoveryError extends Error {
+  constructor(
+    readonly transactionId: string,
+    readonly initialError: unknown,
+    readonly recoveryError: unknown
+  ) {
+    super(`Domain transaction ${transactionId} could not complete synchronous recovery.`);
+    this.name = "DomainTransactionRecoveryError";
+  }
+}
+
 export function stageSnapshotWrite(
   rootDir: string,
   target: string,
@@ -107,11 +127,42 @@ export function commitDomainTransaction(
   applyStagedDomainTransaction(rootDir, id);
 }
 
-export function applyStagedDomainTransaction(rootDir: string, id: string): void {
+export function applyStagedDomainTransaction(
+  rootDir: string,
+  id: string,
+  faultInjection: DomainTransactionFaultInjection = {}
+): DomainTransactionApplyResult {
   assertJournalId(id, "domain transaction");
   const journalFile = domainTransactionFile(rootDir, id);
-  applyDomainTransaction(rootDir, parseDomainTransaction(readFileSync(journalFile, "utf8"), id));
-  rmSync(journalFile, { force: true });
+  let transaction: DomainTransaction;
+  try {
+    if (faultInjection.failBeforeJournalRead === true) {
+      throw new Error("Injected domain transaction journal read failure.");
+    }
+    transaction = parseDomainTransaction(readFileSync(journalFile, "utf8"), id);
+  } catch (error) {
+    throw new DomainTransactionRecoveryError(id, error, error);
+  }
+  let result: DomainTransactionApplyResult = "applied";
+  try {
+    applyDomainTransaction(rootDir, transaction, "initial", faultInjection);
+  } catch (initialError) {
+    try {
+      applyDomainTransaction(rootDir, transaction, "recovery", faultInjection);
+      result = "recovered";
+    } catch (recoveryError) {
+      throw new DomainTransactionRecoveryError(id, initialError, recoveryError);
+    }
+  }
+  try {
+    if (faultInjection.failBeforeJournalRemove === true) {
+      throw new Error("Injected domain transaction journal cleanup failure.");
+    }
+    rmSync(journalFile, { force: true });
+  } catch (error) {
+    throw new DomainTransactionRecoveryError(id, error, error);
+  }
+  return result;
 }
 
 export function replayPendingDomainTransactions(rootDir: string): string[] {
@@ -129,7 +180,12 @@ export function replayPendingDomainTransactions(rootDir: string): string[] {
   return names.map((name) => {
     const id = name.slice(0, -5);
     const journalFile = join(directory, name);
-    applyDomainTransaction(rootDir, parseDomainTransaction(readFileSync(journalFile, "utf8"), id));
+    applyDomainTransaction(
+      rootDir,
+      parseDomainTransaction(readFileSync(journalFile, "utf8"), id),
+      "replay",
+      {}
+    );
     rmSync(journalFile, { force: true });
     return id;
   });
@@ -174,14 +230,42 @@ function isStoredDomainTransactionOperation(value: unknown): value is StoredDoma
   );
 }
 
-function applyDomainTransaction(rootDir: string, transaction: DomainTransaction): void {
-  for (const operation of transaction.operations) {
+function applyDomainTransaction(
+  rootDir: string,
+  transaction: DomainTransaction,
+  phase: "initial" | "recovery" | "replay",
+  faultInjection: DomainTransactionFaultInjection
+): void {
+  for (const [index, operation] of transaction.operations.entries()) {
     const target = resolveJournalTarget(rootDir, operation.target);
     if (operation.type === "write") {
       atomicWriteText(target, operation.content);
     } else {
       rmSync(target, { recursive: true, force: true });
     }
+    assertDomainTransactionApplyFailpoint(index + 1, phase, faultInjection);
+  }
+}
+
+function assertDomainTransactionApplyFailpoint(
+  operationCount: number,
+  phase: "initial" | "recovery" | "replay",
+  faultInjection: DomainTransactionFaultInjection
+): void {
+  const injectedOperation = phase === "initial"
+    ? faultInjection.initialAfterOperation
+    : phase === "recovery"
+      ? faultInjection.recoveryAfterOperation
+      : undefined;
+  const testFailpoint = process.env.NODE_ENV === "test"
+    ? process.env.TASKMUX_TEST_ONLY_DOMAIN_TRANSACTION_FAILPOINT
+    : undefined;
+  if (
+    injectedOperation === operationCount ||
+    (phase === "initial" && testFailpoint === `after-operation:${operationCount}`) ||
+    testFailpoint === `after-operation:${operationCount}-always`
+  ) {
+    throw new Error(`Domain transaction interrupted after operation ${operationCount}.`);
   }
 }
 

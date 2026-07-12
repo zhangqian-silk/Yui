@@ -366,6 +366,12 @@ test("replays input request, resolution, event, and supersede linkage as one dom
   assert.deepEqual(replayPendingDomainTransactions(home), ["input-atomic"]);
   assert.equal(store.getInputRequest("task-1", "input-original").status, "superseded");
   assert.equal(store.getInputRequest("task-1", "input-replacement").status, "open");
+  assert.deepEqual(
+    (({ status, resolutionId }) => ({ status, resolutionId }))(
+      store.getInputRequest("task-1", "input-answerable")
+    ),
+    { status: "answered", resolutionId: "resolution-atomic" }
+  );
   assert.equal(store.getInputResolution("task-1", "resolution-atomic").requestId, "input-answerable");
   assert.deepEqual(store.listEvents("task-1").map((event) => event.payload), [{
     taskId: "task-1",

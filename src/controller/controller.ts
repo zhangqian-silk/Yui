@@ -25,6 +25,7 @@ import { runConfigCommand } from "../commands/configCommands.js";
 import { runGlobalRoleCommand } from "../commands/globalRoleCommands.js";
 import { runImportCommand, runPruneCommand } from "../commands/maintenanceCommands.js";
 import {
+  DomainTransactionRecoveryError,
   replayPendingDomainTransactions,
   replayPendingSnapshotWrites
 } from "../storage/recoveryJournal.js";
@@ -35,6 +36,7 @@ import type { DomainTransactionOperation } from "../storage/recoveryJournal.js";
 import { appendControllerDiagnostic } from "./controllerDiagnostics.js";
 
 export const CONTROLLER_API_VERSION = 1;
+const failedDomainTransactionRoots = new Set<string>();
 
 export type ControllerDiscovery = {
   schemaVersion: 1;
@@ -65,6 +67,7 @@ export async function serveController(rootDir: string): Promise<void> {
   try {
     replayPendingDomainTransactions(rootDir);
     replayPendingSnapshotWrites(rootDir);
+    failedDomainTransactionRoots.delete(rootDir);
     const rpcResultRetention = readRpcResultRetention(process.env.TASKMUX_RPC_RESULT_RETENTION_MS);
     pruneRpcResults(rootDir, new Date(), rpcResultRetention);
     rmSync(join(rootDir, "runtime", "domain-workspaces"), { recursive: true, force: true });
@@ -117,6 +120,10 @@ export async function serveController(rootDir: string): Promise<void> {
         pruneRpcResults(rootDir, new Date(), rpcResultRetention);
         refreshDerivedState();
       } catch (error) {
+        if (error instanceof DomainTransactionRecoveryError) {
+          failClosedDomainTransactions(rootDir, error);
+          return;
+        }
         if (error instanceof CliError && error.code === "DATA_ERROR") {
           try {
             appendControllerDiagnostic(
@@ -341,6 +348,11 @@ async function handleRequest(
 
     if (rpc.apiVersion !== CONTROLLER_API_VERSION || typeof rpc.requestId !== "string") {
       sendJson(response, 400, { error: "Invalid RPC envelope." });
+      return;
+    }
+
+    if (failedDomainTransactionRoots.has(rootDir)) {
+      sendJson(response, 503, { error: "Controller storage is fail-closed pending restart recovery." });
       return;
     }
 
@@ -573,11 +585,34 @@ async function handleRequest(
 
     sendJson(response, 404, { requestId: rpc.requestId, error: `Unknown RPC method: ${rpc.method}` });
   } catch (error) {
+    if (error instanceof DomainTransactionRecoveryError) {
+      failClosedDomainTransactions(rootDir, error);
+      sendJson(response, 503, { error: "Controller storage is fail-closed pending restart recovery." });
+      return;
+    }
     sendJson(response, 400, {
       error: error instanceof CliError
         ? { code: error.code, message: error.message }
         : error instanceof Error ? error.message : String(error)
     });
+  }
+}
+
+function failClosedDomainTransactions(
+  rootDir: string,
+  error: DomainTransactionRecoveryError
+): void {
+  failedDomainTransactionRoots.add(rootDir);
+  setImmediate(() => process.kill(process.pid, "SIGTERM"));
+  try {
+    appendControllerDiagnostic(
+      rootDir,
+      "storage.domain_transaction_recovery_failed",
+      "A committed domain transaction could not complete synchronous recovery.",
+      { transactionId: error.transactionId }
+    );
+  } catch {
+    // Shutdown is already scheduled; a storage failure must not keep the Controller serving.
   }
 }
 

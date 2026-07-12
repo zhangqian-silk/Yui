@@ -3277,6 +3277,91 @@ test("routes dashboard mutations through the Controller", async () => {
   runTaskmuxFailure(["controller", "stop"], { TASKMUX_HOME: home });
 });
 
+test("fails the Controller closed when mid-apply synchronous recovery cannot complete", () => {
+  const home = createConfiguredHome();
+  runTaskmux(["task", "create", "Fail-closed task"], { TASKMUX_HOME: home });
+  const failingEnv = {
+    TASKMUX_HOME: home,
+    TASKMUX_CONTROLLER_MODE: "auto",
+    NODE_ENV: "test",
+    TASKMUX_TEST_ONLY_DOMAIN_TRANSACTION_FAILPOINT: "after-operation:1-always"
+  };
+
+  try {
+    runTaskmux(["controller", "start"], failingEnv);
+    const failed = runTaskmuxFailure(
+      ["task", "comment", "task-1", "Recover this committed comment"],
+      failingEnv
+    );
+    assert.notEqual(failed.status, 0);
+    assert.match(failed.stderr, /fail-closed pending restart recovery/);
+
+    let status = { running: true };
+    for (let attempt = 0; attempt < 40 && status.running; attempt += 1) {
+      status = JSON.parse(runTaskmux(
+        ["controller", "status", "--json"],
+        { TASKMUX_HOME: home }
+      ));
+      if (status.running) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+      }
+    }
+    assert.equal(status.running, false);
+    assert.equal(readdirSync(join(home, "runtime", "domain-transactions")).length, 1);
+
+    runTaskmux(["controller", "start"], { TASKMUX_HOME: home });
+    assert.match(
+      runTaskmux(["task", "comments", "task-1"], { TASKMUX_HOME: home }),
+      /Recover this committed comment/
+    );
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], { TASKMUX_HOME: home });
+  }
+});
+
+test("fails the Controller closed when a background Scheduler transaction cannot recover", () => {
+  const home = createConfiguredHome();
+  runTaskmux(["task", "create", "Fail-closed Scheduler task"], { TASKMUX_HOME: home });
+  runTaskmux(
+    ["task", "schedule", "set", "task-1", "--inactivity-minutes", "0", "--cooldown-minutes", "30"],
+    { TASKMUX_HOME: home }
+  );
+  const failingEnv = {
+    TASKMUX_HOME: home,
+    NODE_ENV: "test",
+    TASKMUX_CONTROLLER_SCAN_INTERVAL_MS: "25",
+    TASKMUX_TEST_ONLY_DOMAIN_TRANSACTION_FAILPOINT: "after-operation:1-always"
+  };
+
+  try {
+    runTaskmux(["controller", "start"], failingEnv);
+    let status = { running: true };
+    for (let attempt = 0; attempt < 40 && status.running; attempt += 1) {
+      status = JSON.parse(runTaskmux(
+        ["controller", "status", "--json"],
+        { TASKMUX_HOME: home }
+      ));
+      if (status.running) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+      }
+    }
+    assert.equal(status.running, false);
+    assert.equal(readdirSync(join(home, "runtime", "domain-transactions")).length, 1);
+
+    runTaskmux(["controller", "start"], { TASKMUX_HOME: home });
+    assert.deepEqual(readdirSync(join(home, "runtime", "domain-transactions")), []);
+    assert.equal(
+      JSON.parse(runTaskmux(
+        ["controller", "status", "--json"],
+        { TASKMUX_HOME: home }
+      )).running,
+      true
+    );
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], { TASKMUX_HOME: home });
+  }
+});
+
 test("blocks the default dashboard when doctor checks fail", () => {
   const home = createTaskmuxHome();
 
