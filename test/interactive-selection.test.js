@@ -84,6 +84,19 @@ test("an invalid explicit Task bypasses dependent selection and keeps the origin
   assert.match(result.output, /USAGE_ERROR: Role name is required/);
 });
 
+test("an invalid explicit dispatch role bypasses work item selection and keeps the original validator error", ptyTest, () => {
+  const home = createTaskWithLeader();
+
+  const result = runInTerminal([
+    "task", "dispatch", "task-1", "missing-role",
+    "--mode", "new", "--work-item", "--input", "review"
+  ], "", home);
+
+  assert.equal(result.status, 3, result.output);
+  assert.doesNotMatch(result.output, /Select work item|no open work items/i);
+  assert.match(result.output, /ROLE_NOT_FOUND: Role not found: missing-role/);
+});
+
 test("explicit, non-terminal, and JSON invocations remain deterministic", ptyTest, () => {
   const home = createHome();
   run(["agent", "add", "codex", "--command", "codex"], home);

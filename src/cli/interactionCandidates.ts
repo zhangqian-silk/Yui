@@ -238,6 +238,9 @@ export function getSelectionCandidates(
         return null;
       }
       const roleName = selector.provider === "dispatch-work-items" ? args[3] : undefined;
+      if (selector.provider === "dispatch-work-items" && (roleName === undefined || store.getRole(taskId, roleName) === null)) {
+        return null;
+      }
       const items = store.listWorkItems(taskId).filter((item) =>
         (selector.provider === "work-items" || ["pending", "running"].includes(item.status))
         && (roleName === undefined || item.assignee === roleName)
