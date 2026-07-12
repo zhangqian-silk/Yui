@@ -2,6 +2,7 @@ import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rm
 import { dirname, join, relative } from "node:path";
 import {
   applyStagedDomainTransaction,
+  DomainTransactionRecoveryError,
   stageDomainTransaction,
   type DomainTransactionOperation
 } from "./recoveryJournal.js";
@@ -25,7 +26,7 @@ export function executeDomainTransaction<T>(
   id: string,
   execute: (workingRoot: string) => T,
   extraOperations: (result: T) => DomainTransactionOperation[] = () => [],
-  options: { includeBackups?: boolean } = {}
+  options: { includeBackups?: boolean; testFailAfterStage?: boolean } = {}
 ): T {
   const authoritativePaths = options.includeBackups
     ? [...AUTHORITATIVE_PATHS, "backups"]
@@ -51,8 +52,15 @@ export function executeDomainTransaction<T>(
     operations.push(...extraOperations(result));
     if (operations.length > 0) {
       stageDomainTransaction(rootDir, id, operations);
-      if (process.env.TASKMUX_DOMAIN_TRANSACTION_FAILPOINT === "after-stage") {
-        throw new Error(`Domain transaction ${id} stopped after staging.`);
+      if (
+        options.testFailAfterStage === true ||
+        (
+          process.env.NODE_ENV === "test" &&
+          process.env.TASKMUX_TEST_ONLY_DOMAIN_TRANSACTION_FAILPOINT === "after-stage"
+        )
+      ) {
+        const interruption = new Error(`Domain transaction ${id} stopped after staging.`);
+        throw new DomainTransactionRecoveryError(id, interruption, interruption);
       }
       applyStagedDomainTransaction(rootDir, id);
     }

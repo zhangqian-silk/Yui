@@ -308,16 +308,6 @@ test("replays input request, resolution, event, and supersede linkage as one dom
   store.saveInputRequest(original);
   store.saveInputRequest(answerable);
 
-  const previousFailpoint = process.env.TASKMUX_DOMAIN_TRANSACTION_FAILPOINT;
-  process.env.TASKMUX_DOMAIN_TRANSACTION_FAILPOINT = "after-stage";
-  t.after(() => {
-    if (previousFailpoint === undefined) {
-      delete process.env.TASKMUX_DOMAIN_TRANSACTION_FAILPOINT;
-    } else {
-      process.env.TASKMUX_DOMAIN_TRANSACTION_FAILPOINT = previousFailpoint;
-    }
-  });
-
   assert.throws(
     () => executeDomainTransaction(home, "input-atomic", (workingRoot) => {
       const transactionStore = new FileTaskStore(workingRoot);
@@ -353,8 +343,8 @@ test("replays input request, resolution, event, and supersede linkage as one dom
         },
         new Date("2026-07-12T12:01:00.000Z")
       ));
-    }),
-    /stopped after staging/
+    }, () => [], { testFailAfterStage: true }),
+    /could not complete synchronous recovery/
   );
 
   assert.equal(store.getInputRequest("task-1", "input-original").status, "open");
@@ -362,7 +352,6 @@ test("replays input request, resolution, event, and supersede linkage as one dom
   assert.equal(store.getInputResolution("task-1", "resolution-atomic"), null);
   assert.deepEqual(store.listEvents("task-1"), []);
 
-  delete process.env.TASKMUX_DOMAIN_TRANSACTION_FAILPOINT;
   assert.deepEqual(replayPendingDomainTransactions(home), ["input-atomic"]);
   assert.equal(store.getInputRequest("task-1", "input-original").status, "superseded");
   assert.equal(store.getInputRequest("task-1", "input-replacement").status, "open");
@@ -470,5 +459,52 @@ test("rejects coercible, sparse, and prototype-backed records with stable data e
   assert.throws(
     () => store.saveInputResolution(null),
     (error) => error.code === "DATA_ERROR" && /Invalid input resolution record/.test(error.message)
+  );
+});
+
+test("validates the exact serialized input record before writing it", (t) => {
+  const home = createHome(t);
+  const store = new FileTaskStore(home);
+  saveTask(store, "task-1");
+  const valid = request("input-serialized", "task-1");
+  const hiddenTaskId = { ...valid };
+  Object.defineProperty(hiddenTaskId, "taskId", {
+    value: "task-1",
+    enumerable: false
+  });
+  const throwingToJson = { ...valid };
+  Object.defineProperty(throwingToJson, "toJSON", {
+    enumerable: false,
+    value: () => {
+      throw new Error("SERIALIZATION_SECRET_412be8");
+    }
+  });
+  let typeReads = 0;
+  const changingReference = {
+    get type() {
+      typeReads += 1;
+      return typeReads <= 2 ? "task" : undefined;
+    },
+    id: "task-1"
+  };
+
+  for (const invalid of [
+    hiddenTaskId,
+    throwingToJson,
+    { ...valid, blockedRefs: [changingReference] }
+  ]) {
+    assert.throws(
+      () => store.saveInputRequest(invalid),
+      (error) => {
+        assert.equal(error.code, "DATA_ERROR");
+        assert.equal(error.message, "Invalid input request record");
+        assert.doesNotMatch(error.message, /SERIALIZATION_SECRET/);
+        return true;
+      }
+    );
+  }
+  assert.equal(
+    existsSync(join(home, "tasks", "task-1", "input-requests", "input-serialized.json")),
+    false
   );
 });
