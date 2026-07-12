@@ -103,7 +103,7 @@ export async function runSetupCommand(
       env,
       setupCliIdentity(env),
       question,
-      tableWidth(io)
+      { width: tableWidth(io), defaultSelection: "skip" }
     );
 
     setupSystemRoles(store, configResult.defaultAgent, configResult.defaultWorkspace);
