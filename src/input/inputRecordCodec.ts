@@ -38,6 +38,8 @@ export function isInputRequestRecord(
     value.schemaVersion !== 1 ||
     value.id !== expectedRequestId ||
     value.taskId !== expectedTaskId ||
+    typeof expectedTaskId !== "string" ||
+    typeof expectedRequestId !== "string" ||
     !POINTER_ID_PATTERN.test(expectedTaskId) ||
     !POINTER_ID_PATTERN.test(expectedRequestId) ||
     !isRequester(value.requester) ||
@@ -45,7 +47,8 @@ export function isInputRequestRecord(
     !isChoices(value.choices) ||
     !isBlockedRefs(value.blockedRefs) ||
     !isResolutionPolicy(value.resolutionPolicy, value.choices) ||
-    !["open", "answered", "auto-resolved", "cancelled", "superseded"].includes(String(value.status)) ||
+    typeof value.status !== "string" ||
+    !["open", "answered", "auto-resolved", "cancelled", "superseded"].includes(value.status) ||
     !isIsoTimestamp(value.createdAt) ||
     !isIsoTimestamp(value.updatedAt) ||
     value.updatedAt < value.createdAt
@@ -101,12 +104,15 @@ export function isInputResolutionRecord(
     value.schemaVersion !== 1 ||
     value.id !== expectedResolutionId ||
     value.taskId !== expectedTaskId ||
+    typeof expectedTaskId !== "string" ||
+    typeof expectedResolutionId !== "string" ||
     !POINTER_ID_PATTERN.test(expectedTaskId) ||
     !POINTER_ID_PATTERN.test(expectedResolutionId) ||
     typeof value.requestId !== "string" ||
     !POINTER_ID_PATTERN.test(value.requestId) ||
     !isAnswer(value.answer) ||
-    !["online", "offline"].includes(String(value.operatorPresence)) ||
+    typeof value.operatorPresence !== "string" ||
+    !["online", "offline"].includes(value.operatorPresence) ||
     !isIsoTimestamp(value.resolvedAt)
   ) {
     return false;
@@ -132,7 +138,7 @@ function isRequester(value: unknown): boolean {
 }
 
 function isChoices(value: unknown): value is InputRequest["choices"] {
-  if (!Array.isArray(value) || value.length > MAX_INPUT_CHOICES) {
+  if (!isDenseArray(value) || value.length > MAX_INPUT_CHOICES) {
     return false;
   }
   const keys = new Set<string>();
@@ -155,12 +161,13 @@ function isChoices(value: unknown): value is InputRequest["choices"] {
 }
 
 function isBlockedRefs(value: unknown): boolean {
-  return Array.isArray(value) &&
+  return isDenseArray(value) &&
     value.length <= MAX_INPUT_BLOCKED_REFS &&
     value.every((reference) =>
     isRecord(reference) &&
     hasOnlyKeys(reference, ["type", "id"]) &&
-    ["work-item", "decision", "task"].includes(String(reference.type)) &&
+    typeof reference.type === "string" &&
+    ["work-item", "decision", "task"].includes(reference.type) &&
     typeof reference.id === "string" &&
     POINTER_ID_PATTERN.test(reference.id)
   );
@@ -271,5 +278,21 @@ function isWellFormedUtf16(value: string): boolean {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isDenseArray(value: unknown): value is unknown[] {
+  if (!Array.isArray(value)) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.hasOwn(value, index)) {
+      return false;
+    }
+  }
+  return true;
 }

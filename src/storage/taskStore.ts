@@ -285,7 +285,11 @@ export class FileTaskStore implements TaskStore {
   }
 
   saveInputRequest(request: InputRequest): void {
-    if (!isInputRequestRecord(request, request.taskId, request.id)) {
+    const pointers = inputRecordPointers(request);
+    if (
+      pointers === null ||
+      !isInputRequestRecord(request, pointers.taskId, pointers.id)
+    ) {
       throw dataError("Invalid input request record");
     }
     mkdirSync(this.inputRequestsDir(request.taskId), { recursive: true });
@@ -307,7 +311,11 @@ export class FileTaskStore implements TaskStore {
   }
 
   saveInputResolution(resolution: InputResolution): void {
-    if (!isInputResolutionRecord(resolution, resolution.taskId, resolution.id)) {
+    const pointers = inputRecordPointers(resolution);
+    if (
+      pointers === null ||
+      !isInputResolutionRecord(resolution, pointers.taskId, pointers.id)
+    ) {
       throw dataError("Invalid input resolution record");
     }
     mkdirSync(this.inputResolutionsDir(resolution.taskId), { recursive: true });
@@ -1562,7 +1570,18 @@ function isStringRecord(value: unknown): value is Record<string, string> {
 }
 
 function assertInputPointerId(value: string, label: string): void {
-  if (!INPUT_POINTER_ID_PATTERN.test(value)) {
+  if (typeof value !== "string" || !INPUT_POINTER_ID_PATTERN.test(value)) {
     throw dataError(`Invalid ${label} id`);
   }
+}
+
+function inputRecordPointers(value: unknown): { taskId: string; id: string } | null {
+  if (
+    !isRecord(value) ||
+    typeof value.taskId !== "string" ||
+    typeof value.id !== "string"
+  ) {
+    return null;
+  }
+  return { taskId: value.taskId, id: value.id };
 }
