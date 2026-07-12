@@ -20,13 +20,16 @@ export async function runCompletionWizard(
   env: NodeJS.ProcessEnv,
   identity: CliIdentity,
   question: CompletionQuestion,
-  width?: number
+  width?: number,
+  defaultSelection: "current-shell" | "skip" = "current-shell"
 ): Promise<string> {
   const states = inspectCompletionStates(store.getConfig(), env, identity);
   const current = currentCompletionShell(env);
-  const defaultHint = current === undefined ? "" : ` [${current}]`;
-  const answer = await question(`${renderCompletionStateTable(states, width)}\nChoose shell by number or name${defaultHint} (or skip): `);
-  if (answer.trim().toLowerCase() === "skip") {
+  const defaultHint = defaultSelection === "skip" ? " [skip]" : current === undefined ? "" : ` [${current}]`;
+  const skipHint = defaultSelection === "skip" ? "" : " (or skip)";
+  const answer = await question(`${renderCompletionStateTable(states, width)}\nChoose shell by number or name${defaultHint}${skipHint}: `);
+  const normalizedAnswer = answer.trim().toLowerCase();
+  if (normalizedAnswer === "skip" || (normalizedAnswer.length === 0 && defaultSelection === "skip")) {
     return `Completion ${operation} skipped.\n`;
   }
   const shell = parseSelection(answer, current);
@@ -63,9 +66,9 @@ export async function runCompletionWizard(
   let activate = false;
   if (needsActivation) {
     const activationAnswer = (await question(
-      `${activationBlock(shell, installation, identity)}\nUpdate ${installation.activationPath} with the managed TaskMux block? [y/N]: `
+      `${activationBlock(shell, installation, identity)}\nUpdate ${installation.activationPath} with the managed TaskMux block? [Y/n]: `
     )).trim().toLowerCase();
-    activate = activationAnswer === "y" || activationAnswer === "yes";
+    activate = activationAnswer === "" || activationAnswer === "y" || activationAnswer === "yes";
   }
   installCompletion(store, shell, installation, env, identity, activate);
   return needsActivation && !activate

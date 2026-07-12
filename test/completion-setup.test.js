@@ -173,10 +173,25 @@ test("completion selection prompt advertises skip", async () => {
   assert.match(output, /Completion install skipped/);
 });
 
+test("standalone completion install keeps the current shell as the blank default", async () => {
+  const home = createHome();
+  const userHome = mkdtempSync(join(tmpdir(), "taskmux-user-"));
+  const output = await runInteractive(["completion", "install"], "\nn\n", {
+    TASKMUX_HOME: home,
+    HOME: userHome,
+    SHELL: "/bin/zsh"
+  });
+
+  assert.match(output, /Choose shell by number or name \[zsh\] \(or skip\):/);
+  assert.match(output, /Selected: zsh \(Install\)/);
+  assert.match(output, /Completion zsh installation skipped/);
+  assert.equal(new FileTaskStore(home).getConfig().completionInstallations, undefined);
+});
+
 test("interactive install shows all shells and installs exactly one selected shell", async () => {
   const home = createHome();
   const userHome = mkdtempSync(join(tmpdir(), "taskmux-user-"));
-  const output = await runInteractive(["completion", "install"], "1\n\ny\n", {
+  const output = await runInteractive(["completion", "install"], "1\n\n\n", {
     TASKMUX_HOME: home,
     HOME: userHome,
     SHELL: "/bin/bash",
@@ -189,10 +204,31 @@ test("interactive install shows all shells and installs exactly one selected she
   assert.match(output, /\|\s*2\s*\|\s*Zsh\s*\|\s*Not installed\s*\|\s*Install\s*\|\s*\|\s*\|/);
   assert.match(output, /Install using these paths\? \[Y\/n\/customize\]:/);
   assert.doesNotMatch(output, /Completion script path/);
-  assert.match(output, /Update .*\.bashrc with the managed TaskMux block\? \[y\/N\]:/);
+  assert.match(output, /Update .*\.bashrc with the managed TaskMux block\? \[Y\/n\]:/);
   assert.equal(existsSync(scriptPath), true);
   assert.match(readFileSync(scriptPath, "utf8"), /taskmux-completion: managed shell=bash identity=taskmux/);
+  assert.match(readFileSync(join(userHome, ".bashrc"), "utf8"), /taskmux completion shell=bash identity=taskmux/);
   assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(home, "config.json"), "utf8")).completionInstallations), ["bash"]);
+});
+
+test("explicit activation decline leaves the installation repairable", async () => {
+  const home = createHome();
+  const userHome = mkdtempSync(join(tmpdir(), "taskmux-user-"));
+  const env = {
+    TASKMUX_HOME: home,
+    HOME: userHome,
+    SHELL: "/bin/bash",
+    XDG_DATA_HOME: join(userHome, "share")
+  };
+
+  const output = await runInteractive(["completion", "install"], "\n\nn\n", env);
+
+  assert.match(output, /Update .*\.bashrc with the managed TaskMux block\? \[Y\/n\]:/);
+  assert.match(output, /Completion bash script installed; activation still required/);
+  assert.equal(existsSync(join(userHome, ".bashrc")), false);
+
+  const statusOutput = await runInteractive(["completion", "install"], "\nn\n", env);
+  assert.match(statusOutput, /\|\s*Bash\s*\|\s*Needs repair\s*\|\s*Repair\s*\|/);
 });
 
 test("only customize prompts for and persists custom full paths", async () => {
@@ -252,6 +288,7 @@ test("interactive uninstall removes only the selected managed installation", asy
 
   const output = await runInteractive(["completion", "uninstall"], "\ny\n", env);
 
+  assert.match(output, /Remove now\? \[y\/N\]:/);
   assert.match(output, /Completion bash uninstalled/);
   assert.equal(existsSync(scriptPath), false);
   assert.equal(JSON.parse(readFileSync(join(home, "config.json"), "utf8")).completionInstallations, undefined);
@@ -367,6 +404,25 @@ test("setup reuses the completion wizard for exactly one selected shell", async 
   assert.equal(output.match(/Completion installation/g)?.length, 1);
   assert.deepEqual(Object.keys(config.completionInstallations), ["fish"]);
   assert.equal(existsSync(config.completionInstallations.fish.scriptPath), true);
+  assert.match(output, /TaskMux setup complete/);
+});
+
+test("setup defaults completion shell selection to skip", async () => {
+  const parent = mkdtempSync(join(tmpdir(), "taskmux-setup-completion-skip-"));
+  const home = join(parent, "state");
+  const userHome = join(parent, "user");
+  const output = await runInteractive(["setup"], "1\n\n", {
+    TASKMUX_HOME: home,
+    HOME: userHome,
+    SHELL: "/bin/zsh",
+    TASKMUX_TMUX_BIN: process.execPath
+  });
+  const config = JSON.parse(readFileSync(join(home, "config.json"), "utf8"));
+
+  assert.match(output, /Choose shell by number or name \[skip\]:/);
+  assert.match(output, /Completion install skipped/);
+  assert.equal(config.completionInstallations, undefined);
+  assert.equal(existsSync(join(userHome, ".zfunc", "_taskmux")), false);
   assert.match(output, /TaskMux setup complete/);
 });
 
