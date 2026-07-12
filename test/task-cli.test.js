@@ -203,14 +203,6 @@ process.stdout.write(${JSON.stringify(output)});
   return executable;
 }
 
-function addRunner(home, id, command = id) {
-  ensureTestStorageSchema(home);
-
-  return runTaskmux(["runner", "add", id, "--command", command], {
-    TASKMUX_HOME: home
-  });
-}
-
 function addAgent(home, id, command = id) {
   ensureTestStorageSchema(home);
 
@@ -226,9 +218,9 @@ function createTaskmuxHome() {
 function createConfiguredHome() {
   const home = createTaskmuxHome();
 
-  writeStorageSchema(home, 2);
-  addRunner(home, "codex", "codex");
-  addRunner(home, "claude", "claude");
+  writeStorageSchema(home, 3);
+  addAgent(home, "codex", "codex");
+  addAgent(home, "claude", "claude");
   runTaskmux(["config", "set", "default-agent", "codex"], {
     TASKMUX_HOME: home
   });
@@ -265,6 +257,40 @@ function tableCellsRegex(...cells) {
   return new RegExp(`\\|\\s+${cells.map((cell) => cell instanceof RegExp ? cell.source : escapeRegex(cell)).join("\\s+\\|\\s+")}`);
 }
 
+function configTableRows(output) {
+  const rows = [];
+  let previousDetailLength = 0;
+  let detailWidth = 0;
+
+  for (const line of output.split("\n").filter((line) => line.startsWith("|"))) {
+    const rawCells = line.split("|").slice(1, -1);
+    const cells = rawCells.map((cell) => cell.trim());
+
+    if (cells[0] === "Item") {
+      continue;
+    }
+
+    if (cells[0].length > 0) {
+      rows.push(cells);
+      previousDetailLength = cells[2].length;
+      detailWidth = rawCells[2].length - 2;
+      continue;
+    }
+
+    const row = rows.at(-1);
+    if (row !== undefined) {
+      row[2] += `${previousDetailLength < detailWidth ? " " : ""}${cells[2]}`;
+      previousDetailLength = cells[2].length;
+    }
+  }
+
+  return rows;
+}
+
+function configTableItems(output) {
+  return configTableRows(output).map(([item]) => item);
+}
+
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -282,9 +308,51 @@ function writeStorageSchema(home, storageVersion) {
 
 function ensureTestStorageSchema(home) {
   if (!existsSync(join(home, "schema.json"))) {
-    writeStorageSchema(home, 2);
+    writeStorageSchema(home, 3);
   }
 }
+
+test("rejects removed compatibility command groups", () => {
+  const home = createConfiguredHome();
+
+  for (const command of [["assistant"], ["runner", "list"], ["migrate"], ["board"]]) {
+    const result = runTaskmuxFailure(command, { TASKMUX_HOME: home });
+
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, new RegExp(`USAGE_ERROR: Unknown command: ${command[0]}`));
+  }
+});
+
+test("stores configured agents only under the canonical agents directory", () => {
+  const home = createTaskmuxHome();
+  writeStorageSchema(home, 3);
+
+  addAgent(home, "codex", "codex");
+
+  assert.equal(existsSync(join(home, "agents", "codex", "agent.json")), true);
+  assert.equal(existsSync(join(home, "runners")), false);
+});
+
+test("treats help as leaf data and keeps business argument errors concise", () => {
+  const home = createConfiguredHome();
+  const created = runTaskmux(["task", "create", "help"], { TASKMUX_HOME: home });
+  const invalid = runTaskmuxFailure(["task", "show"], { TASKMUX_HOME: home });
+
+  assert.match(created, /Created task task-1: help/);
+  assert.equal(invalid.status, 2);
+  assert.equal(invalid.stderr, "USAGE_ERROR: Task id is required.\n");
+});
+
+test("rejects previous storage schemas without an upgrade path", () => {
+  const home = createTaskmuxHome();
+  writeStorageSchema(home, 2);
+
+  const result = runTaskmuxFailure(["task", "list"], { TASKMUX_HOME: home });
+
+  assert.equal(result.status, 4);
+  assert.match(result.stderr, /Unsupported storage schema version: 2\. This TaskMux requires storage schema 3/);
+  assert.doesNotMatch(result.stderr, /migrate/i);
+});
 
 test("creates a task in the configured taskmux home", () => {
   const home = createConfiguredHome();
@@ -312,11 +380,11 @@ test("creates a task in the configured taskmux home", () => {
   assert.equal(taskInfo.title, "Refactor login page");
 });
 
-test("creates tasks with the built-in leader role from configured runner defaults", () => {
+test("creates tasks with the built-in leader role from configured agent defaults", () => {
   const home = createConfiguredHome();
   const leaderCli = createFakeExecutable(home, "leader-agent.js", "leader agent 1.0\n");
 
-  addRunner(home, "leader-cli", leaderCli);
+  addAgent(home, "leader-cli", leaderCli);
   runTaskmux(["config", "set", "default-agent", "leader-cli"], {
     TASKMUX_HOME: home
   });
@@ -335,11 +403,11 @@ test("creates tasks with the built-in leader role from configured runner default
   assert.match(roles, tableCellsRegex("leader", "leader-cli", "idle", "/tmp/project-a"));
 });
 
-test("requires a leader role runner before creating a task", () => {
+test("requires a leader role agent before creating a task", () => {
   const home = createTaskmuxHome();
   ensureTestStorageSchema(home);
 
-  const result = runTaskmuxFailure(["task", "create", "Missing leader runner"], {
+  const result = runTaskmuxFailure(["task", "create", "Missing leader agent"], {
     TASKMUX_HOME: home
   });
 
@@ -360,68 +428,6 @@ test("normal commands require setup before writing storage", () => {
   assert.equal(existsSync(join(home, "schema.json")), false);
 });
 
-test("blocks normal commands when storage schema requires migration", () => {
-  const home = createConfiguredHome();
-  writeStorageSchema(home, 0);
-
-  const result = runTaskmuxFailure(["task", "list"], {
-    TASKMUX_HOME: home
-  });
-
-  assert.equal(result.status, 4);
-  assert.match(result.stderr, /DATA_ERROR: Storage schema upgrade required: 0 -> 2/);
-  assert.match(result.stderr, /Run `taskmux migrate`/);
-});
-
-test("migrates storage schema to the latest version", () => {
-  const home = createConfiguredHome();
-  writeStorageSchema(home, 0);
-
-  const output = runTaskmux(["migrate"], {
-    TASKMUX_HOME: home
-  });
-  const backupPath = output.match(/Backup: (.+)/)?.[1]?.trim();
-  const schema = JSON.parse(readFileSync(join(home, "schema.json"), "utf8"));
-
-  assert.match(output, /Migrated storage schema 0 -> 2/);
-  assert.match(output, /Backup: /);
-  assert.ok(backupPath);
-  assert.equal(JSON.parse(readFileSync(join(backupPath, "schema.json"), "utf8")).storageVersion, 0);
-  assert.equal(schema.schemaVersion, 1);
-  assert.equal(schema.storageVersion, 2);
-  assert.equal(typeof schema.updatedAt, "string");
-  assert.match(
-    runTaskmux(["task", "list"], { TASKMUX_HOME: home }),
-    /No tasks found/
-  );
-});
-
-test("migrates v1 tasks to archived markers and renames the system Operator", () => {
-  const home = createTaskmuxHome();
-  const taskDir = join(home, "tasks", "task-1");
-  const assistantDir = join(home, "roles", "assistant");
-  mkdirSync(taskDir, { recursive: true });
-  mkdirSync(assistantDir, { recursive: true });
-  writeStorageSchema(home, 1);
-  writeFileSync(join(taskDir, "task.json"), JSON.stringify({
-    schemaVersion: 1,
-    id: "task-1",
-    status: "open",
-    createdAt: "2026-01-01T00:00:00.000Z",
-    updatedAt: "2026-01-01T00:00:00.000Z"
-  }));
-  writeFileSync(join(taskDir, "info.json"), JSON.stringify({ schemaVersion: 1, title: "Legacy task" }));
-  writeFileSync(join(assistantDir, "role.json"), JSON.stringify({ schemaVersion: 1, name: "assistant" }));
-
-  const output = runTaskmux(["migrate"], { TASKMUX_HOME: home });
-  const task = JSON.parse(readFileSync(join(taskDir, "task.json"), "utf8"));
-
-  assert.match(output, /Migrated storage schema 1 -> 2/);
-  assert.equal(task.archived, false);
-  assert.equal(existsSync(join(home, "roles", "operator", "role.json")), true);
-  assert.equal(existsSync(assistantDir), false);
-});
-
 test("creates explicit storage backups", () => {
   const home = createConfiguredHome();
 
@@ -436,7 +442,7 @@ test("creates explicit storage backups", () => {
 
   assert.ok(backupPath);
   assert.equal(existsSync(join(backupPath, "backups")), false);
-  assert.equal(JSON.parse(readFileSync(join(backupPath, "schema.json"), "utf8")).storageVersion, 2);
+  assert.equal(JSON.parse(readFileSync(join(backupPath, "schema.json"), "utf8")).storageVersion, 3);
   assert.equal(
     JSON.parse(readFileSync(join(backupPath, "tasks", "task-1", "info.json"), "utf8")).title,
     "Refactor login page"
@@ -491,7 +497,10 @@ test("exports imports and prunes local data", () => {
   assert.match(runTaskmux(["task", "show", "task-1"], { TASKMUX_HOME: targetHome }), /Portable task/);
   assert.match(runTaskmux(["task", "roles", "task-1"], { TASKMUX_HOME: targetHome }), tableCellsRegex("rd", "codex"));
   assert.match(runTaskmux(["task", "comments", "task-1"], { TASKMUX_HOME: targetHome }), /Ship it/);
-  assert.match(runTaskmux(["config", "show"], { TASKMUX_HOME: targetHome }), /Default agent: codex/);
+  assert.match(
+    runTaskmux(["config", "show"], { TASKMUX_HOME: targetHome }),
+    tableRowRegex("default-agent", "configured", "agent=codex; command=codex")
+  );
 
   runTaskmux(["task", "delete", "task-1"], {
     TASKMUX_HOME: targetHome
@@ -505,33 +514,14 @@ test("exports imports and prunes local data", () => {
   assert.equal(existsSync(join(targetHome, "trash", "tasks", "task-1")), false);
 });
 
-test("dry-runs storage migrations without writing schema", () => {
-  const home = createConfiguredHome();
-
-  writeStorageSchema(home, 0);
-
-  const output = runTaskmux(["migrate", "--dry-run"], {
-    TASKMUX_HOME: home
-  });
-
-  assert.match(output, /Storage migration dry run 0 -> 2/);
-  assert.match(output, /Backup would be created/);
-  assert.match(readFileSync(join(home, "schema.json"), "utf8"), /"storageVersion":0/);
-});
-
 test("maintenance commands do not initialize missing storage", () => {
   const parent = createTaskmuxHome();
   const home = join(parent, "taskmux-home");
 
   const backup = runTaskmuxFailure(["backup"], { TASKMUX_HOME: home });
-  const migrate = runTaskmuxFailure(["migrate"], { TASKMUX_HOME: home });
-  const dryRun = runTaskmux(["migrate", "--dry-run"], { TASKMUX_HOME: home });
 
   assert.equal(backup.status, 4);
   assert.match(backup.stderr, /DATA_ERROR: TaskMux is not initialized\. Run `taskmux setup`\./);
-  assert.equal(migrate.status, 4);
-  assert.match(migrate.stderr, /DATA_ERROR: TaskMux is not initialized\. Run `taskmux setup`\./);
-  assert.match(dryRun, /TaskMux is not initialized\. Run `taskmux setup`\./);
   assert.equal(existsSync(home), false);
 });
 
@@ -787,8 +777,196 @@ test("stores defaults and creates templated tasks with default roles", () => {
   const config = runTaskmux(["config", "show"], {
     TASKMUX_HOME: home
   });
-  assert.match(config, /Default agent: codex/);
-  assert.match(config, /Default workspace: \/tmp\/project-a/);
+  assert.match(config, tableRowRegex("default-agent", "configured", "agent=codex; command=codex"));
+  assert.match(config, tableRowRegex("default-workspace", "configured", "/tmp/project-a"));
+});
+
+test("shows configuration pointers in one ordered table", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["role", "add", "operator", "--agent", "codex", "--workspace", "/tmp/project-a"], {
+    TASKMUX_HOME: home
+  });
+  runTaskmux(["role", "add", "leader", "--agent", "codex", "--workspace", "/tmp/project-a"], {
+    TASKMUX_HOME: home
+  });
+
+  const output = runTaskmux(["config", "show"], { TASKMUX_HOME: home });
+
+  assert.equal(output.match(/^TaskMux config$/gm)?.length, 1);
+  assert.doesNotMatch(output, /^Default agent:/m);
+  assert.doesNotMatch(output, /^Default workspace:/m);
+  assert.doesNotMatch(output, /^Current task:/m);
+  assert.doesNotMatch(output, /^Last task:/m);
+  assert.doesNotMatch(output, /^Status$/m);
+  assert.deepEqual(configTableItems(output), [
+    "default-agent",
+    "default-workspace",
+    "current-task",
+    "last-task",
+    "role:operator",
+    "role:leader"
+  ]);
+  assert.match(output, tableRowRegex("default-agent", "configured", "agent=codex; command=codex"));
+  assert.match(output, tableRowRegex("default-workspace", "configured", "/tmp/project-a"));
+  assert.match(output, tableRowRegex("current-task", "unset", "\\s*\\|"));
+  assert.match(output, tableRowRegex("last-task", "unset", "\\s*\\|"));
+});
+
+test("shows a shared system-role workspace only on its owner row", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["role", "add", "operator", "--agent", "codex", "--workspace", "/tmp/project-a"], {
+    TASKMUX_HOME: home
+  });
+  runTaskmux(["role", "add", "leader", "--agent", "codex", "--workspace", "/tmp/project-a"], {
+    TASKMUX_HOME: home
+  });
+
+  const output = runTaskmux(["config", "show"], { TASKMUX_HOME: home });
+
+  assert.match(output, tableRowRegex("role:operator", "configured", "agent=codex\\s+\\|"));
+  assert.match(output, tableRowRegex("role:leader", "configured", "agent=codex\\s+\\|"));
+  assert.doesNotMatch(output, /role:(?:operator|leader)[^\n]*workspace=/);
+});
+
+test("shows only system-role workspace overrides when a default exists", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["role", "add", "operator", "--agent", "codex", "--workspace", "/tmp/project-a"], {
+    TASKMUX_HOME: home
+  });
+  runTaskmux(["role", "add", "leader", "--agent", "codex", "--workspace", "/tmp/project-b"], {
+    TASKMUX_HOME: home
+  });
+
+  const output = runTaskmux(["config", "show"], { TASKMUX_HOME: home });
+
+  assert.match(output, tableRowRegex("role:operator", "configured", "agent=codex\\s+\\|"));
+  assert.match(output, tableRowRegex("role:leader", "configured", "agent=codex; workspace=/tmp/project-b"));
+});
+
+test("keeps system-role workspaces visible when the default workspace is missing", () => {
+  const home = createTaskmuxHome();
+
+  addAgent(home, "codex", "codex");
+  runTaskmux(["config", "set", "default-agent", "codex"], { TASKMUX_HOME: home });
+  runTaskmux(["role", "add", "operator", "--agent", "codex", "--workspace", "/tmp/operator"], {
+    TASKMUX_HOME: home
+  });
+  runTaskmux(["role", "add", "leader", "--agent", "codex", "--workspace", "/tmp/leader"], {
+    TASKMUX_HOME: home
+  });
+
+  const output = runTaskmux(["config", "show"], { TASKMUX_HOME: home });
+
+  assert.match(output, tableRowRegex("default-workspace", "missing", "taskmux config set default-workspace <path>"));
+  assert.match(output, tableRowRegex("role:operator", "configured", "agent=codex; workspace=/tmp/operator"));
+  assert.match(output, tableRowRegex("role:leader", "configured", "agent=codex; workspace=/tmp/leader"));
+});
+
+test("shows configured current and last task pointers as set", () => {
+  const home = createConfiguredHome();
+
+  runTaskmux(["task", "create", "First task"], { TASKMUX_HOME: home });
+  runTaskmux(["task", "create", "Second task"], { TASKMUX_HOME: home });
+  runTaskmux(["task", "current", "task-1"], { TASKMUX_HOME: home });
+  const config = JSON.parse(readFileSync(join(home, "config.json"), "utf8"));
+  writeFileSync(join(home, "config.json"), `${JSON.stringify({ ...config, lastTaskId: "task-2" }, null, 2)}\n`);
+
+  const output = runTaskmux(["config", "show"], { TASKMUX_HOME: home });
+
+  assert.match(output, tableRowRegex("current-task", "set", "task-1"));
+  assert.match(output, tableRowRegex("last-task", "set", "task-2"));
+});
+
+test("preserves missing and invalid configuration diagnostics in the table", () => {
+  const home = createTaskmuxHome();
+
+  ensureTestStorageSchema(home);
+  runTaskmux(["config", "set", "default-agent", "missing-agent"], { TASKMUX_HOME: home });
+
+  const output = runTaskmux(["config", "show"], { TASKMUX_HOME: home });
+
+  assert.match(output, tableRowRegex("default-agent", "invalid", "missing-agent is not configured"));
+  assert.match(
+    output,
+    tableRowRegex("default-workspace", "missing", "taskmux config set default-workspace <path>")
+  );
+  assert.match(
+    output,
+    tableRowRegex("role:operator", "missing", "Run taskmux setup in an interactive terminal\\.")
+  );
+  assert.match(
+    output,
+    tableRowRegex("role:leader", "missing", "Run taskmux setup in an interactive terminal\\.")
+  );
+});
+
+test("preserves unavailable default-agent command diagnostics in the table", () => {
+  const home = createTaskmuxHome();
+  const missingPath = join(home, "missing-agent-command");
+
+  addAgent(home, "path-agent", missingPath);
+  addAgent(home, "name-agent", "taskmux-missing-agent-cli");
+  runTaskmux(["config", "set", "default-agent", "path-agent"], { TASKMUX_HOME: home });
+
+  const missingPathOutput = runTaskmux(["config", "show"], { TASKMUX_HOME: home });
+
+  assert.match(
+    missingPathOutput,
+    tableRowRegex("default-agent", "configured", "agent=path-agent;")
+  );
+  assert.match(missingPathOutput, new RegExp(`command=${escapeRegex(missingPath)}; missing`));
+
+  runTaskmux(["config", "set", "default-agent", "name-agent"], { TASKMUX_HOME: home });
+
+  const missingNameOutput = runTaskmux(["config", "show"], { TASKMUX_HOME: home });
+
+  assert.match(
+    missingNameOutput,
+    tableRowRegex("default-agent", "configured", "agent=name-agent;")
+  );
+  assert.equal(
+    configTableRows(missingNameOutput).find(([item]) => item === "default-agent")?.[2],
+    "agent=name-agent; command=taskmux-missing-agent-cli; not found in PATH"
+  );
+});
+
+test("keeps a wrapped shared workspace only on the default-workspace row", () => {
+  const home = createConfiguredHome();
+  const workspace = `/tmp/${"shared-workspace-segment-".repeat(6)}`;
+
+  runTaskmux(["config", "set", "default-workspace", workspace], { TASKMUX_HOME: home });
+  runTaskmux(["role", "add", "operator", "--agent", "codex", "--workspace", workspace], {
+    TASKMUX_HOME: home
+  });
+  runTaskmux(["role", "add", "leader", "--agent", "codex", "--workspace", workspace], {
+    TASKMUX_HOME: home
+  });
+
+  const rows = configTableRows(runTaskmux(["config", "show"], { TASKMUX_HOME: home }));
+
+  assert.equal(rows.find(([item]) => item === "default-workspace")?.[2], workspace);
+  assert.equal(rows.find(([item]) => item === "role:operator")?.[2], "agent=codex");
+  assert.equal(rows.find(([item]) => item === "role:leader")?.[2], "agent=codex");
+});
+
+test("wraps the single config table in the existing JSON success envelope", () => {
+  const home = createConfiguredHome();
+  const response = JSON.parse(runTaskmux(["config", "show", "--json"], { TASKMUX_HOME: home }));
+
+  assert.equal(response.ok, true);
+  assert.deepEqual(configTableItems(response.output), [
+    "default-agent",
+    "default-workspace",
+    "current-task",
+    "last-task",
+    "role:operator",
+    "role:leader"
+  ]);
+  assert.doesNotMatch(response.output, /^Default agent:/m);
+  assert.doesNotMatch(response.output, /^Default workspace:/m);
 });
 
 test("tracks current and last tasks for shorter workflows", () => {
@@ -1045,7 +1223,7 @@ test("rejects task records with inline titles", () => {
       schemaVersion: 1,
       id: "task-1",
       title: "Legacy task title",
-      status: "open",
+      archived: false,
       createdAt: "2026-06-23T00:00:00.000Z",
       updatedAt: "2026-06-23T00:00:00.000Z"
     })
@@ -1054,6 +1232,28 @@ test("rejects task records with inline titles", () => {
   const result = runTaskmuxFailure(["task", "show", "task-1"], {
     TASKMUX_HOME: home
   });
+
+  assert.equal(result.status, 4);
+  assert.match(result.stderr, /DATA_ERROR: Invalid task record: task-1/);
+});
+
+test("rejects task records that use the removed status field", () => {
+  const home = createConfiguredHome();
+  const taskDir = join(home, "tasks", "task-1");
+  mkdirSync(taskDir, { recursive: true });
+  writeFileSync(join(taskDir, "task.json"), JSON.stringify({
+    schemaVersion: 1,
+    id: "task-1",
+    status: "open",
+    createdAt: "2026-06-23T00:00:00.000Z",
+    updatedAt: "2026-06-23T00:00:00.000Z"
+  }));
+  writeFileSync(join(taskDir, "info.json"), JSON.stringify({
+    schemaVersion: 1,
+    title: "Removed status field"
+  }));
+
+  const result = runTaskmuxFailure(["task", "show", "task-1"], { TASKMUX_HOME: home });
 
   assert.equal(result.status, 4);
   assert.match(result.stderr, /DATA_ERROR: Invalid task record: task-1/);
@@ -1068,7 +1268,7 @@ test("rejects task records missing editable task info", () => {
     JSON.stringify({
       schemaVersion: 1,
       id: "task-1",
-      status: "open",
+      archived: false,
       createdAt: "2026-06-23T00:00:00.000Z",
       updatedAt: "2026-06-23T00:00:00.000Z"
     })
@@ -1227,7 +1427,7 @@ test("does not expose a ticket-style done transition for Tasks", () => {
   const task = JSON.parse(readFileSync(join(home, "tasks", "task-1", "task.json"), "utf8"));
 
   assert.equal(result.status, 2);
-  assert.match(result.stderr, /Task commands/);
+  assert.match(result.stderr, /^USAGE_ERROR: Unknown command: task done\n\nTaskMux task\n/);
   assert.equal(task.status, undefined);
   assert.equal(task.archived, false);
 });
@@ -1351,7 +1551,7 @@ test("rejects role records with inline names", () => {
     JSON.stringify({
       schemaVersion: 1,
       id: "task-1",
-      status: "open",
+      archived: false,
       createdAt: "2026-06-23T00:00:00.000Z",
       updatedAt: "2026-06-23T00:00:00.000Z"
     })
@@ -1394,7 +1594,7 @@ test("rejects role records missing editable role info", () => {
     JSON.stringify({
       schemaVersion: 1,
       id: "task-1",
-      status: "open",
+      archived: false,
       createdAt: "2026-06-23T00:00:00.000Z",
       updatedAt: "2026-06-23T00:00:00.000Z"
     })
@@ -1439,7 +1639,7 @@ test("rejects role records missing command contract", () => {
     JSON.stringify({
       schemaVersion: 1,
       id: "task-1",
-      status: "open",
+      archived: false,
       createdAt: "2026-06-23T00:00:00.000Z",
       updatedAt: "2026-06-23T00:00:00.000Z"
     })
@@ -1671,7 +1871,7 @@ test("rejects renaming the built-in leader role", () => {
   const home = createConfiguredHome();
   const leaderCli = createFakeExecutable(home, "leader-agent.js", "leader agent 1.0\n");
 
-  addRunner(home, "leader-cli", leaderCli);
+  addAgent(home, "leader-cli", leaderCli);
   runTaskmux(["task", "create", "Refactor login page", "--agent", "leader-cli", "--workspace", "/tmp/project-a"], {
     TASKMUX_HOME: home
   });
@@ -2625,7 +2825,7 @@ test("returns a data error exit code for invalid role schema", () => {
     JSON.stringify({
       schemaVersion: 1,
       id: "task-1",
-      status: "open",
+      archived: false,
       createdAt: "2026-06-23T00:00:00.000Z",
       updatedAt: "2026-06-23T00:00:00.000Z"
     })
@@ -2693,62 +2893,6 @@ test("returns a data error exit code for invalid comment schema", () => {
 
   assert.equal(result.status, 4);
   assert.match(result.stderr, /DATA_ERROR: Invalid comment record: task-1:1/);
-});
-
-test("adds lists and shows custom runners", () => {
-  const home = createTaskmuxHome();
-  const fakeAgent = createFakeExecutable(home, "custom-agent.js", "custom agent 1.0\n");
-  ensureTestStorageSchema(home);
-
-  const addOutput = runTaskmux(
-    [
-      "runner",
-      "add",
-      "agent-js",
-      "--command",
-      fakeAgent,
-      "--arg",
-      "--model",
-      "--arg",
-      "review",
-      "--env",
-      "TASKMUX_MODE=dev"
-    ],
-    { TASKMUX_HOME: home }
-  );
-
-  assert.match(addOutput, /Added runner agent-js/);
-
-  const runner = JSON.parse(
-    readFileSync(join(home, "runners", "agent-js", "runner.json"), "utf8")
-  );
-  assert.equal(runner.schemaVersion, 1);
-  assert.equal(runner.id, "agent-js");
-  assert.equal(runner.command, fakeAgent);
-  assert.deepEqual(runner.args, ["--model", "review"]);
-  assert.deepEqual(runner.env, { TASKMUX_MODE: "dev" });
-
-  const listOutput = runTaskmux(["runner", "list"], { TASKMUX_HOME: home });
-  assert.match(listOutput, tableCellsRegex("agent-js", "custom", fakeAgent));
-
-  const showOutput = runTaskmux(["runner", "show", "agent-js"], { TASKMUX_HOME: home });
-  assert.match(showOutput, /Runner: agent-js/);
-  assert.match(showOutput, new RegExp(`Command: ${fakeAgent.replaceAll("\\", "\\\\")}`));
-  assert.match(showOutput, /Args: --model review/);
-  assert.match(showOutput, /Env: TASKMUX_MODE=dev/);
-});
-
-test("does not expose codex or claude as default runners", () => {
-  const home = createTaskmuxHome();
-  ensureTestStorageSchema(home);
-
-  const listOutput = runTaskmux(["runner", "list"], {
-    TASKMUX_HOME: home
-  });
-
-  assert.match(listOutput, /No runners configured/);
-  assert.doesNotMatch(listOutput, /codex\s+builtin/);
-  assert.doesNotMatch(listOutput, /claude\s+builtin/);
 });
 
 test("adds lists shows and removes agents", () => {
@@ -2850,26 +2994,6 @@ test("copies descriptive role template fields into an independent task role", ()
   assert.deepEqual(taskRole.skills, ["security-review"]);
 });
 
-test("renders the agent and role board", () => {
-  const home = createTaskmuxHome();
-  const fakeAgent = createFakeExecutable(home, "custom-agent.js", "custom agent 1.0\n");
-
-  addAgent(home, "codex", fakeAgent);
-  runTaskmux(["role", "add", "leader", "--agent", "codex", "--workspace", "/tmp/project-a"], {
-    TASKMUX_HOME: home
-  });
-
-  const output = runTaskmux(["board"], { TASKMUX_HOME: home });
-
-  assert.match(output, /TaskMux board/);
-  assert.match(output, /Agents/);
-  assert.match(output, tableCellsRegex("codex", fakeAgent));
-  assert.match(output, /Roles/);
-  assert.match(output, tableCellsRegex("operator", "?", "?"));
-  assert.match(output, /system:global user-facing/);
-  assert.match(output, tableCellsRegex("leader", "codex", "/tmp/project-a"));
-});
-
 test("protects system roles and shows missing system role agents as question marks", () => {
   const home = createTaskmuxHome();
   ensureTestStorageSchema(home);
@@ -2893,56 +3017,12 @@ test("protects system roles and shows missing system role agents as question mar
   assert.match(leaderRemove.stderr, /USAGE_ERROR: System role cannot be removed: leader/);
 });
 
-test("keeps taskmux assistant as a legacy alias for Operator context", () => {
-  const home = createTaskmuxHome();
-  const logFile = join(home, "assistant-log.json");
-  const assistantAgent = join(home, "codex");
-
-  writeFileSync(
-    assistantAgent,
-    `#!/usr/bin/env node
-const { readFileSync, writeFileSync } = require("node:fs");
-const contextPath = process.env.TASKMUX_ASSISTANT_CONTEXT;
-writeFileSync(${JSON.stringify(logFile)}, JSON.stringify({
-  args: process.argv.slice(2),
-  home: process.env.TASKMUX_HOME,
-  role: process.env.TASKMUX_ROLE,
-  workspace: process.env.TASKMUX_WORKSPACE,
-  contextPath,
-  context: readFileSync(contextPath, "utf8")
-}));
-process.stdout.write("assistant ready\\n");
-`
-  );
-  chmodSync(assistantAgent, 0o755);
-
-  addAgent(home, "codex", assistantAgent);
-  runTaskmux(["role", "add", "assistant", "--agent", "codex", "--workspace", home], {
-    TASKMUX_HOME: home
-  });
-
-  const output = runTaskmux(["assistant"], { TASKMUX_HOME: home });
-  const log = JSON.parse(readFileSync(logFile, "utf8"));
-
-  assert.match(output, /assistant ready/);
-  assert.match(output, /Exited role assistant/);
-  assert.equal(log.home, home);
-  assert.equal(log.role, "assistant");
-  assert.equal(log.workspace, home);
-  assert.match(log.contextPath, /TASKMUX_OPERATOR\.md$/);
-  assert.match(log.context, /Use `taskmux` commands/);
-  assert.match(log.context, /Every task has a protected `leader` role/);
-  assert.equal(log.args.length, 1);
-  assert.match(log.args[0], /TaskMux Operator mode/);
-  assert.match(log.args[0], /Do not perform Task work or edit TaskMux JSON storage directly/);
-});
-
 test("runs the Operator in its own persistent tmux session", () => {
   const home = createTaskmuxHome();
   const fakeAgent = createFakeExecutable(home, "operator-agent.js", "operator ready\n");
   const { fakeTmux, logFile } = createFakeTmux(home);
 
-  writeStorageSchema(home, 2);
+  writeStorageSchema(home, 3);
   addAgent(home, "codex", fakeAgent);
   runTaskmux(["role", "add", "operator", "--agent", "codex", "--workspace", home], {
     TASKMUX_HOME: home
@@ -2963,14 +3043,14 @@ test("runs the Operator in its own persistent tmux session", () => {
   assert.match(readFileSync(join(home, "operator", "TASKMUX_OPERATOR.md"), "utf8"), /Do not describe a draft as official/);
 });
 
-test("assigns custom runners and starts configured commands", () => {
+test("assigns configured agents and starts their commands", () => {
   const home = createConfiguredHome();
   const fakeAgent = createFakeExecutable(home, "custom-agent.js", "custom agent 1.0\n");
   const { fakeTmux, logFile } = createFakeTmux(home);
 
   runTaskmux(
     [
-      "runner",
+      "agent",
       "add",
       "agent-js",
       "--command",
@@ -3035,33 +3115,12 @@ test("assigns custom runners and starts configured commands", () => {
   ]);
 });
 
-test("removes custom runners", () => {
-  const home = createConfiguredHome();
-  const fakeAgent = createFakeExecutable(home, "custom-agent.js", "custom agent 1.0\n");
-
-  runTaskmux(["runner", "add", "agent-js", "--command", fakeAgent], {
-    TASKMUX_HOME: home
-  });
-
-  const removeOutput = runTaskmux(["runner", "remove", "agent-js"], {
-    TASKMUX_HOME: home
-  });
-
-  assert.match(removeOutput, /Removed runner agent-js/);
-
-  const result = runTaskmuxFailure(["runner", "show", "agent-js"], {
-    TASKMUX_HOME: home
-  });
-  assert.equal(result.status, 3);
-  assert.match(result.stderr, /RUNNER_NOT_FOUND: Runner not found: agent-js/);
-});
-
 test("runs doctor checks with configured executables", () => {
   const home = createTaskmuxHome();
   const fakeTmux = createFakeExecutable(home, "fake-tmux.js", "tmux 3.4\n");
   const fakeAgent = createFakeExecutable(home, "default-agent.js", "default agent 1.0\n");
 
-  writeStorageSchema(home, 2);
+  writeStorageSchema(home, 3);
   addAgent(home, "default-agent", fakeAgent);
   runTaskmux(["config", "set", "default-agent", "default-agent"], {
     TASKMUX_HOME: home
@@ -3081,7 +3140,7 @@ test("runs doctor checks with configured executables", () => {
   assert.doesNotMatch(output, /claude\s+ok/);
   assert.match(output, tableRowRegex("taskmux home", "ok"));
   assert.match(output, tableRowRegex("default agent", "ok", "default-agent"));
-  assert.match(output, tableRowRegex("storage schema", "ok", "current=2 latest=2"));
+  assert.match(output, tableRowRegex("storage schema", "ok", "current=3 latest=3"));
   assert.match(output, tableRowRegex("storage permissions", "ok", "read-write"));
   assert.match(output, tableRowRegex("storage records", "ok", "tasks=0 roles=0 globalRoles=0 agents=1"));
   assert.match(output, new RegExp(home.replaceAll("\\", "\\\\")));
@@ -3090,7 +3149,7 @@ test("runs doctor checks with configured executables", () => {
 test("doctor reports missing default agent", () => {
   const home = createTaskmuxHome();
   const fakeTmux = createFakeExecutable(home, "fake-tmux.js", "tmux 3.4\n");
-  writeStorageSchema(home, 2);
+  writeStorageSchema(home, 3);
 
   const output = runTaskmux(["doctor"], {
     TASKMUX_HOME: home,
@@ -3117,17 +3176,18 @@ test("doctor does not initialize a missing taskmux home", () => {
   assert.equal(existsSync(home), false);
 });
 
-test("doctor guides users when storage schema needs migration", () => {
+test("doctor rejects unsupported storage schemas without migration guidance", () => {
   const home = createTaskmuxHome();
   const fakeTmux = createFakeExecutable(home, "fake-tmux.js", "tmux 3.4\n");
-  writeStorageSchema(home, 0);
+  writeStorageSchema(home, 2);
 
   const output = runTaskmux(["doctor"], {
     TASKMUX_HOME: home,
     TASKMUX_TMUX_BIN: fakeTmux
   });
 
-  assert.match(output, tableRowRegex("storage schema", "upgrade-required", "current=0 latest=2; run taskmux migrate"));
+  assert.match(output, tableRowRegex("storage schema", "unsupported", "current=2 latest=3"));
+  assert.doesNotMatch(output, /migrate/i);
 });
 
 test("doctor reports invalid storage records without failing", () => {
@@ -3147,13 +3207,13 @@ test("doctor reports invalid storage records without failing", () => {
   assert.match(output, tableRowRegex("storage records", "invalid", "Invalid task record: task-1"));
 });
 
-test("runs doctor checks for custom runner executables", () => {
+test("runs doctor checks for configured agent executables", () => {
   const home = createTaskmuxHome();
   const fakeTmux = createFakeExecutable(home, "fake-tmux.js", "tmux 3.4\n");
   const fakeAgent = createFakeExecutable(home, "custom-agent.js", "custom agent 1.0\n");
   ensureTestStorageSchema(home);
 
-  runTaskmux(["runner", "add", "agent-js", "--command", fakeAgent], {
+  runTaskmux(["agent", "add", "agent-js", "--command", fakeAgent], {
     TASKMUX_HOME: home
   });
 
@@ -3170,7 +3230,7 @@ test("starts the default dashboard after doctor checks pass", async () => {
   const fakeTmux = createFakeExecutable(home, "fake-tmux.js", "tmux 3.4\n");
   const fakeAgent = createFakeExecutable(home, "leader-agent.js", "leader agent 1.0\n");
 
-  addRunner(home, "leader-cli", fakeAgent);
+  addAgent(home, "leader-cli", fakeAgent);
   runTaskmux(["config", "set", "default-agent", "leader-cli"], {
     TASKMUX_HOME: home
   });
@@ -3242,7 +3302,7 @@ test("setup prints a tmux install plan without changing the system", async () =>
 
   const output = await runTaskmuxInteractive(
     ["setup"],
-    "1\n\n",
+    "1\nskip\n\n",
     {
       TASKMUX_HOME: home,
       TASKMUX_SETUP_INTERACTIVE: "1",
@@ -3286,7 +3346,7 @@ test("setup interactively selects a default agent from numbered candidates", asy
 
   const output = await runTaskmuxInteractive(
     ["setup"],
-    "1\n",
+    "1\nskip\n",
     {
       TASKMUX_HOME: home,
       TASKMUX_SETUP_INTERACTIVE: "1",
@@ -3314,20 +3374,18 @@ test("setup interactively selects a default agent from numbered candidates", asy
 
   const config = runTaskmux(["config", "show"], { TASKMUX_HOME: home });
   const agent = runTaskmux(["agent", "show", "codex"], { TASKMUX_HOME: home });
-  const board = runTaskmux(["board"], { TASKMUX_HOME: home });
+  const roles = runTaskmux(["role", "list"], { TASKMUX_HOME: home });
   const workspace = join(home, "workspace");
 
-  assert.match(config, /Default agent: codex/);
-  assert.match(config, new RegExp(`Default workspace: ${escapeRegex(workspace)}`));
-  assert.match(config, tableRowRegex("default-agent", "configured", "command=codex"));
+  assert.match(config, tableRowRegex("default-agent", "configured", "agent=codex; command=codex"));
   assert.doesNotMatch(config, /command=codex; found in PATH/);
-  assert.match(config, tableRowRegex("workspace", "configured", escapeRegex(workspace)));
-  assert.match(config, tableRowRegex("role:operator", "configured", `agent=codex workspace=${escapeRegex(workspace)}`));
-  assert.match(config, tableRowRegex("role:leader", "configured", `agent=codex workspace=${escapeRegex(workspace)}`));
+  assert.match(config, tableRowRegex("default-workspace", "configured", escapeRegex(workspace)));
+  assert.match(config, tableRowRegex("role:operator", "configured", "agent=codex\\s+\\|"));
+  assert.match(config, tableRowRegex("role:leader", "configured", "agent=codex\\s+\\|"));
   assert.match(agent, /Agent: codex/);
   assert.match(agent, /Command: codex/);
-  assert.match(board, tableCellsRegex("operator", "codex", workspace));
-  assert.match(board, tableCellsRegex("leader", "codex", workspace));
+  assert.match(roles, tableCellsRegex("operator", "codex", workspace));
+  assert.match(roles, tableCellsRegex("leader", "codex", workspace));
   assert.equal(existsSync(workspace), true);
 });
 
@@ -3342,7 +3400,7 @@ test("setup initializes a missing taskmux home before writing storage data", asy
 
   const output = await runTaskmuxInteractive(
     ["setup"],
-    "1\n",
+    "1\nskip\n",
     {
       TASKMUX_HOME: home,
       TASKMUX_SETUP_INTERACTIVE: "1",
@@ -3408,7 +3466,7 @@ process.stdout.write("sudo 1.0\\n");
 
   const output = await runTaskmuxInteractive(
     ["setup"],
-    "1\ny\n",
+    "1\nskip\ny\n",
     {
       TASKMUX_HOME: home,
       TASKMUX_SETUP_INTERACTIVE: "1",
@@ -3435,7 +3493,7 @@ test("setup reports unavailable default agent commands", async () => {
 
   const output = await runTaskmuxInteractive(
     ["setup"],
-    "taskmux-missing-agent-cli\n",
+    "taskmux-missing-agent-cli\nskip\n",
     {
       TASKMUX_HOME: home,
       TASKMUX_SETUP_INTERACTIVE: "1",
@@ -3444,9 +3502,10 @@ test("setup reports unavailable default agent commands", async () => {
     }
   );
 
-  assert.match(
-    runTaskmux(["config", "show"], { TASKMUX_HOME: home }),
-    tableRowRegex("default-agent", "configured", "command=taskmux-missing-agent-cli; not found in PATH")
+  assert.equal(
+    configTableRows(runTaskmux(["config", "show"], { TASKMUX_HOME: home }))
+      .find(([item]) => item === "default-agent")?.[2],
+    "agent=taskmux-missing-agent-cli; command=taskmux-missing-agent-cli; not found in PATH"
   );
   assert.doesNotMatch(output, /TaskMux setup\nStatus/);
 });
@@ -3462,14 +3521,14 @@ test("setup configures system roles from the default agent", async () => {
 
   const output = await runTaskmuxInteractive(
     ["setup"],
-    "\n",
+    "\nskip\n",
     {
       TASKMUX_HOME: home,
       TASKMUX_SETUP_INTERACTIVE: "1",
       TASKMUX_TMUX_BIN: fakeTmux
     }
   );
-  const board = runTaskmux(["board"], { TASKMUX_HOME: home });
+  const roles = runTaskmux(["role", "list"], { TASKMUX_HOME: home });
 
   const config = runTaskmux(["config", "show"], { TASKMUX_HOME: home });
   const workspace = join(home, "workspace");
@@ -3477,12 +3536,15 @@ test("setup configures system roles from the default agent", async () => {
   assert.match(output, /TaskMux setup complete/);
   assert.match(output, /TaskMux home initialized/);
   assert.doesNotMatch(output, /TaskMux config/);
-  assert.match(config, tableRowRegex("default-agent", "configured", "command=.*default-agent\\.js"));
-  assert.match(config, tableRowRegex("workspace", "configured", escapeRegex(workspace)));
-  assert.match(config, tableRowRegex("role:operator", "configured", `agent=default-agent workspace=${escapeRegex(workspace)}`));
-  assert.match(config, tableRowRegex("role:leader", "configured", `agent=default-agent workspace=${escapeRegex(workspace)}`));
-  assert.match(board, tableCellsRegex("operator", "default-agent", workspace));
-  assert.match(board, tableCellsRegex("leader", "default-agent", workspace));
+  assert.equal(
+    configTableRows(config).find(([item]) => item === "default-agent")?.[2],
+    `agent=default-agent; command=${fakeAgent}`
+  );
+  assert.match(config, tableRowRegex("default-workspace", "configured", escapeRegex(workspace)));
+  assert.match(config, tableRowRegex("role:operator", "configured", "agent=default-agent\\s+\\|"));
+  assert.match(config, tableRowRegex("role:leader", "configured", "agent=default-agent\\s+\\|"));
+  assert.match(roles, tableCellsRegex("operator", "default-agent", workspace));
+  assert.match(roles, tableCellsRegex("leader", "default-agent", workspace));
 });
 
 test("non-interactive setup does not configure roles", () => {
@@ -3497,12 +3559,12 @@ test("non-interactive setup does not configure roles", () => {
     TASKMUX_HOME: home,
     TASKMUX_TMUX_BIN: fakeTmux
   });
-  const board = runTaskmux(["board"], { TASKMUX_HOME: home });
+  const roles = runTaskmux(["role", "list"], { TASKMUX_HOME: home });
 
   assert.equal(result.status, 2);
   assert.match(result.stderr, /Setup requires an interactive terminal/);
-  assert.match(board, tableCellsRegex("operator", "?", "?"));
-  assert.match(board, tableCellsRegex("leader", "?", "?"));
+  assert.match(roles, tableCellsRegex("operator", "?", "?"));
+  assert.match(roles, tableCellsRegex("leader", "?", "?"));
 });
 
 test("setup prompts through existing config and keeps values on enter", async () => {
@@ -3518,7 +3580,7 @@ test("setup prompts through existing config and keeps values on enter", async ()
 
   const output = await runTaskmuxInteractive(
     ["setup"],
-    "\n",
+    "\nskip\n",
     {
       TASKMUX_HOME: home,
       TASKMUX_SETUP_INTERACTIVE: "1",
@@ -3538,11 +3600,9 @@ test("setup prompts through existing config and keeps values on enter", async ()
   assert.match(output, /Tmux already installed/);
   assert.doesNotMatch(output, /TaskMux config/);
   assert.doesNotMatch(output, /TaskMux setup\nStatus/);
-  assert.match(config, /Default agent: codex/);
-  assert.match(config, new RegExp(`Default workspace: ${escapeRegex(join(home, "workspace"))}`));
-  assert.match(config, tableRowRegex("default-agent", "configured", "command=codex"));
+  assert.match(config, tableRowRegex("default-agent", "configured", "agent=codex; command=codex"));
   assert.doesNotMatch(config, /command=codex; found in PATH/);
-  assert.match(config, tableRowRegex("workspace", "configured", escapeRegex(join(home, "workspace"))));
+  assert.match(config, tableRowRegex("default-workspace", "configured", escapeRegex(join(home, "workspace"))));
 });
 
 test("setup --yes is not supported", () => {
@@ -4667,7 +4727,8 @@ test("creates a git worktree for an independent task role", () => {
   const repository = join(home, "project");
   const worktree = join(home, "worktrees", "reviewer");
   mkdirSync(repository, { recursive: true });
-  execFileSync("git", ["init", "-b", "master"], { cwd: repository });
+  execFileSync("git", ["init"], { cwd: repository });
+  execFileSync("git", ["symbolic-ref", "HEAD", "refs/heads/master"], { cwd: repository });
   execFileSync("git", ["config", "user.email", "taskmux@example.invalid"], { cwd: repository });
   execFileSync("git", ["config", "user.name", "TaskMux Test"], { cwd: repository });
   writeFileSync(join(repository, "README.md"), "initial\n");
@@ -5040,7 +5101,7 @@ esac
   mkdirSync(reviewerWorkspace, { recursive: true });
   mkdirSync(researcherWorkspace, { recursive: true });
   runTaskmux(
-    ["runner", "add", "codex", "--command", "sh", "--arg", "-c", "--arg", "while :; do sleep 1; done"],
+    ["agent", "add", "codex", "--command", "sh", "--arg", "-c", "--arg", "while :; do sleep 1; done"],
     { TASKMUX_HOME: home }
   );
   runTaskmux(["task", "create", "Exercise real tmux isolation"], { TASKMUX_HOME: home });

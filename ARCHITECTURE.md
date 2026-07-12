@@ -60,7 +60,7 @@ Global role templates use copy semantics. Once a role is bound into a Task, late
 
 Mutating request IDs are idempotent. A committed result is returned without reapplying the command. If a process stops after a transaction is staged, Controller startup completes the staged operation before serving requests.
 
-Setup and schema migration remain explicit lifecycle operations. Ordinary CLI, dashboard, Task shell, import, prune, backup, attach-state, and Scheduler mutations share the Controller boundary.
+Setup is an explicit lifecycle operation. Ordinary CLI, dashboard, Task shell, import, prune, backup, attach-state, and Scheduler mutations share the Controller boundary.
 
 ## Dispatch and wakeup flow
 
@@ -78,7 +78,7 @@ The default root is `~/.taskmux`; `TASKMUX_HOME` overrides it.
 TASKMUX_HOME/
   config.json
   schema.json
-  runners/
+  agents/
   roles/
   tasks/<task-id>/
     info.json
@@ -104,6 +104,8 @@ TASKMUX_HOME/
     operator-notifications/
     logs/
 ```
+
+`schema.json` must match the current storage contract. TaskMux rejects other schema versions.
 
 ### Authoritative and derived state
 

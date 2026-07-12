@@ -1,0 +1,60 @@
+import { visibleChildren, type CommandNode } from "./commandCatalog.js";
+
+export function renderCommandHelp(node: CommandNode, version: string): string {
+  const title = node.path.length === 1 ? "TaskMux" : `TaskMux ${node.path.slice(1).join(" ")}`;
+  const lines = node.name === "taskmux"
+    ? [`TaskMux ${version}`, "", node.summary]
+    : [title, "", node.summary];
+
+  lines.push("", "Usage:", ...node.usage.map((usage) => `  ${usage}`));
+
+  const children = visibleChildren(node);
+  if (children.length > 0) {
+    const width = Math.max(...children.map((child) => child.name.length));
+    lines.push(
+      "",
+      "Commands:",
+      ...children.map((child) => `  ${child.name.padEnd(width)}  ${child.summary}`)
+    );
+  }
+
+  const optionWidth = Math.max("-h, --help".length, ...node.options.map((option) => option.length));
+  lines.push(
+    "",
+    "Options:",
+    ...node.options.map((option) => `  ${option.padEnd(optionWidth)}  ${describeOption(option)}`),
+    `  ${"-h, --help".padEnd(optionWidth)}  Show help.`
+  );
+  return `${lines.join("\n")}\n`;
+}
+
+function describeOption(option: string): string {
+  const descriptions: Record<string, string> = {
+    "--template": "Select a task template.",
+    "--agent": "Select an agent.",
+    "--workspace": "Set a workspace path.",
+    "--description": "Set descriptive text.",
+    "--priority": "Set task priority.",
+    "--tag": "Add a task tag.",
+    "--due": "Set a due date.",
+    "--json": "Emit native JSON output.",
+    "--output": "Write output to a file.",
+    "--format": "Select the output format.",
+    "--role": "Add a role.",
+    "--topic": "Add or select a topic.",
+    "--summary": "Set summary text.",
+    "--reason": "Set reason text."
+  };
+  const known = descriptions[option];
+  if (known !== undefined) {
+    return known;
+  }
+  const name = option.slice(2).replaceAll("-", " ");
+  if (name.startsWith("clear ")) {
+    return `Clear ${name.slice("clear ".length)}.`;
+  }
+  if (name.startsWith("include ") || name.startsWith("with ")) {
+    return `Include ${name.replace(/^(include|with) /, "")}.`;
+  }
+  return `Set ${name}.`;
+}

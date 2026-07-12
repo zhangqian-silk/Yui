@@ -1,6 +1,6 @@
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import type { TaskComment } from "../comment/comment.js";
 import type { Milestone } from "../milestone/milestone.js";
 import type { Decision } from "../decision/decision.js";
@@ -12,7 +12,7 @@ import type { TaskInputDraft } from "../input/taskInput.js";
 import type { GlobalRole, Role } from "../role/role.js";
 import type { ChildRole } from "../role/childRole.js";
 import type { AgentRun } from "../run/agentRun.js";
-import type { CustomRunner } from "../runner/runner.js";
+import type { ConfiguredAgent } from "../agent/agent.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import type { LeaderFailure } from "../scheduler/leaderFailure.js";
 import type { OperatorNotification } from "../scheduler/operatorNotification.js";
@@ -101,10 +101,10 @@ export type TaskStore = {
   listEvents(taskId: string): TaskEvent[];
   saveTranscript(taskId: string, roleName: string, transcript: string): void;
   readTranscript(taskId: string, roleName: string): string | null;
-  saveCustomRunner(runner: CustomRunner): void;
-  listCustomRunners(): CustomRunner[];
-  getCustomRunner(id: string): CustomRunner | null;
-  removeCustomRunner(id: string): boolean;
+  saveConfiguredAgent(agent: ConfiguredAgent): void;
+  listConfiguredAgents(): ConfiguredAgent[];
+  getConfiguredAgent(id: string): ConfiguredAgent | null;
+  removeConfiguredAgent(id: string): boolean;
 };
 
 export type TaskmuxConfig = {
@@ -113,6 +113,14 @@ export type TaskmuxConfig = {
   defaultWorkspace?: string;
   currentTaskId?: string;
   lastTaskId?: string;
+  completionInstallations?: Partial<Record<CompletionShell, CompletionInstallation>>;
+};
+
+export const COMPLETION_SHELLS = ["bash", "zsh", "fish"] as const;
+export type CompletionShell = typeof COMPLETION_SHELLS[number];
+export type CompletionInstallation = {
+  scriptPath: string;
+  activationPath: string;
 };
 
 export function resolveTaskmuxHome(env: NodeJS.ProcessEnv): string {
@@ -666,22 +674,22 @@ export class FileTaskStore implements TaskStore {
     return this.readOptionalText(this.transcriptFile(taskId, storageName));
   }
 
-  saveCustomRunner(runner: CustomRunner): void {
-    const runnerDir = this.runnerDir(runner.id);
-    mkdirSync(runnerDir, { recursive: true });
-    this.writeSnapshot(this.runnerFile(runner.id), `${JSON.stringify(runner, null, 2)}\n`);
+  saveConfiguredAgent(agent: ConfiguredAgent): void {
+    const agentDir = this.agentDir(agent.id);
+    mkdirSync(agentDir, { recursive: true });
+    this.writeSnapshot(this.agentFile(agent.id), `${JSON.stringify(agent, null, 2)}\n`);
   }
 
-  listCustomRunners(): CustomRunner[] {
-    return this.directoryNames(this.runnersDir())
-      .map((name) => this.getCustomRunner(name))
-      .filter((runner): runner is CustomRunner => runner !== null)
+  listConfiguredAgents(): ConfiguredAgent[] {
+    return this.directoryNames(this.agentsDir())
+      .map((name) => this.getConfiguredAgent(name))
+      .filter((agent): agent is ConfiguredAgent => agent !== null)
       .sort((left, right) => left.id.localeCompare(right.id));
   }
 
-  getCustomRunner(id: string): CustomRunner | null {
+  getConfiguredAgent(id: string): ConfiguredAgent | null {
     try {
-      return parseCustomRunner(id, readFileSync(this.runnerFile(id), "utf8"));
+      return parseConfiguredAgent(id, readFileSync(this.agentFile(id), "utf8"));
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "ENOENT") {
         return null;
@@ -691,9 +699,9 @@ export class FileTaskStore implements TaskStore {
     }
   }
 
-  removeCustomRunner(id: string): boolean {
+  removeConfiguredAgent(id: string): boolean {
     try {
-      rmSync(this.runnerDir(id), { recursive: true });
+      rmSync(this.agentDir(id), { recursive: true });
       return true;
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "ENOENT") {
@@ -900,16 +908,16 @@ export class FileTaskStore implements TaskStore {
     return join(this.roleDir(taskId, name), "transcript.log");
   }
 
-  private runnersDir(): string {
-    return join(this.rootDir, "runners");
+  private agentsDir(): string {
+    return join(this.rootDir, "agents");
   }
 
-  private runnerDir(id: string): string {
-    return join(this.runnersDir(), id);
+  private agentDir(id: string): string {
+    return join(this.agentsDir(), id);
   }
 
-  private runnerFile(id: string): string {
-    return join(this.runnerDir(id), "runner.json");
+  private agentFile(id: string): string {
+    return join(this.agentDir(id), "agent.json");
   }
 
   private getRoleByStorageName(taskId: string, storageName: string): Role | null {
@@ -1014,8 +1022,8 @@ export class FileTaskStore implements TaskStore {
 
 }
 
-function parseCustomRunner(id: string, raw: string): CustomRunner {
-  const value = parseJson(raw, `Invalid runner record: ${id}`);
+function parseConfiguredAgent(id: string, raw: string): ConfiguredAgent {
+  const value = parseJson(raw, `Invalid agent record: ${id}`);
 
   if (
     !isRecord(value) ||
@@ -1027,10 +1035,10 @@ function parseCustomRunner(id: string, raw: string): CustomRunner {
     typeof value.createdAt !== "string" ||
     typeof value.updatedAt !== "string"
   ) {
-    throw dataError(`Invalid runner record: ${id}`);
+    throw dataError(`Invalid agent record: ${id}`);
   }
 
-  return value as CustomRunner;
+  return value as ConfiguredAgent;
 }
 
 function parseGlobalRole(name: string, raw: string): GlobalRole {
@@ -1091,12 +1099,36 @@ function parseTaskmuxConfig(raw: string): TaskmuxConfig {
     !isOptionalString(value.defaultAgent) ||
     !isOptionalString(value.defaultWorkspace) ||
     !isOptionalString(value.currentTaskId) ||
-    !isOptionalString(value.lastTaskId)
+    !isOptionalString(value.lastTaskId) ||
+    !isCompletionInstallations(value.completionInstallations)
   ) {
     throw dataError("Invalid config record");
   }
 
   return value as TaskmuxConfig;
+}
+
+function isCompletionInstallations(value: unknown): value is TaskmuxConfig["completionInstallations"] {
+  if (value === undefined) {
+    return true;
+  }
+  if (Array.isArray(value) || !isRecord(value) || Object.keys(value).some((key) => !COMPLETION_SHELLS.includes(key as CompletionShell))) {
+    return false;
+  }
+  return Object.values(value).every((installation) =>
+    isRecord(installation) &&
+    Object.keys(installation).length === 2 &&
+    Object.hasOwn(installation, "scriptPath") &&
+    Object.hasOwn(installation, "activationPath") &&
+    typeof installation.scriptPath === "string" &&
+    installation.scriptPath.length > 0 &&
+    isAbsolute(installation.scriptPath) &&
+    resolve(installation.scriptPath) === installation.scriptPath &&
+    typeof installation.activationPath === "string" &&
+    installation.activationPath.length > 0 &&
+    isAbsolute(installation.activationPath) &&
+    resolve(installation.activationPath) === installation.activationPath
+  );
 }
 
 function parseTaskTopics(taskId: string, raw: string): TaskTopics {

@@ -1,49 +1,41 @@
 import { accessSync, constants } from "node:fs";
 import { renderTable } from "../output/table.js";
-import type { CustomRunner } from "../runner/runner.js";
-import { resolveRunner } from "../runner/runnerRegistry.js";
+import type { ConfiguredAgent } from "../agent/agent.js";
+import { resolveAgent } from "../agent/agentRegistry.js";
 import { FileTaskStore, resolveTaskmuxHome } from "../storage/taskStore.js";
 import { inspectStorageSchema, type StorageSchemaState } from "../storage/storageSchema.js";
-import type { CommandRunner } from "../tmux/commandRunner.js";
+import type { CommandExecutor } from "../tmux/commandExecutor.js";
 
 export function runDoctor(
   env: NodeJS.ProcessEnv,
-  runner: CommandRunner,
-  customRunners: CustomRunner[] = [],
+  executor: CommandExecutor,
+  agents: ConfiguredAgent[] = [],
   storageSchema: StorageSchemaState = inspectStorageSchema(resolveTaskmuxHome(env))
 ): string {
-  return renderDoctor(getDoctorChecks(env, runner, customRunners, storageSchema));
+  return renderDoctor(getDoctorChecks(env, executor, agents, storageSchema));
 }
 
 export function getDoctorChecks(
   env: NodeJS.ProcessEnv,
-  runner: CommandRunner,
-  customRunners: CustomRunner[] = [],
+  executor: CommandExecutor,
+  agents: ConfiguredAgent[] = [],
   storageSchema: StorageSchemaState = inspectStorageSchema(resolveTaskmuxHome(env))
 ): DoctorCheck[] {
   return [
     checkNode(),
-    checkExecutable("tmux", env.TASKMUX_TMUX_BIN ?? "tmux", ["-V"], runner),
-    ...customRunners.map((customRunner) =>
-      checkExecutable(`agent:${customRunner.id}`, customRunner.command, ["--version"], runner)
+    checkExecutable("tmux", env.TASKMUX_TMUX_BIN ?? "tmux", ["-V"], executor),
+    ...agents.map((agent) =>
+      checkExecutable(`agent:${agent.id}`, agent.command, ["--version"], executor)
     ),
     checkTaskmuxHome(resolveTaskmuxHome(env)),
-    checkDefaultAgent(resolveTaskmuxHome(env), storageSchema, customRunners),
+    checkDefaultAgent(resolveTaskmuxHome(env), storageSchema, agents),
     checkStorageSchema(storageSchema),
     checkStoragePermissions(resolveTaskmuxHome(env)),
     checkStorageRecords(resolveTaskmuxHome(env), storageSchema)
   ];
 }
 
-function checkDefaultAgent(rootDir: string, state: StorageSchemaState, customRunners: CustomRunner[]): DoctorCheck {
-  if (state.status === "upgrade-required") {
-    return {
-      name: "default agent",
-      status: "upgrade-required",
-      detail: "run taskmux migrate"
-    };
-  }
-
+function checkDefaultAgent(rootDir: string, state: StorageSchemaState, agents: ConfiguredAgent[]): DoctorCheck {
   if (state.status === "unsupported") {
     return {
       name: "default agent",
@@ -71,7 +63,7 @@ function checkDefaultAgent(rootDir: string, state: StorageSchemaState, customRun
       };
     }
 
-    if (resolveRunner(config.defaultAgent, customRunners) === null) {
+    if (resolveAgent(config.defaultAgent, agents) === null) {
       return {
         name: "default agent",
         status: "invalid",
@@ -108,7 +100,7 @@ export function renderDoctor(checks: DoctorCheck[]): string {
 
 export type DoctorCheck = {
   name: string;
-  status: "ok" | "missing" | "upgrade-required" | "unsupported" | "invalid";
+  status: "ok" | "missing" | "unsupported" | "invalid";
   detail: string;
 };
 
@@ -124,13 +116,13 @@ function checkExecutable(
   name: string,
   executable: string,
   args: string[],
-  runner: CommandRunner
+  executor: CommandExecutor
 ): DoctorCheck {
   try {
     return {
       name,
       status: "ok",
-      detail: firstLine(runner.run(executable, args))
+      detail: firstLine(executor.run(executable, args))
     };
   } catch {
     return {
@@ -185,12 +177,6 @@ function checkStorageSchema(state: StorageSchemaState): DoctorCheck {
         status: "ok",
         detail: `current=${state.currentVersion} latest=${state.latestVersion}`
       };
-    case "upgrade-required":
-      return {
-        name: "storage schema",
-        status: "upgrade-required",
-        detail: `current=${state.currentVersion} latest=${state.latestVersion}; run taskmux migrate`
-      };
     case "unsupported":
       return {
         name: "storage schema",
@@ -241,14 +227,6 @@ function checkStorageRecords(rootDir: string, state: StorageSchemaState): Doctor
     };
   }
 
-  if (state.status === "upgrade-required") {
-    return {
-      name: "storage records",
-      status: "upgrade-required",
-      detail: "run taskmux migrate"
-    };
-  }
-
   if (state.status === "unsupported") {
     return {
       name: "storage records",
@@ -269,13 +247,13 @@ function checkStorageRecords(rootDir: string, state: StorageSchemaState): Doctor
     const store = new FileTaskStore(rootDir);
     const tasks = store.listTasks();
     const roleCount = tasks.reduce((count, task) => count + store.listRoles(task.id).length, 0);
-    const runnerCount = store.listCustomRunners().length;
+    const agentCount = store.listConfiguredAgents().length;
     const globalRoleCount = store.listGlobalRoles().length;
 
     return {
       name: "storage records",
       status: "ok",
-      detail: `tasks=${tasks.length} roles=${roleCount} globalRoles=${globalRoleCount} agents=${runnerCount}`
+      detail: `tasks=${tasks.length} roles=${roleCount} globalRoles=${globalRoleCount} agents=${agentCount}`
     };
   } catch (error) {
     return {

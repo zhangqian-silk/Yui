@@ -6,12 +6,14 @@ import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { createGlobalRole } from "../role/role.js";
 import { SYSTEM_LEADER_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
-import { createCustomRunner } from "../runner/runner.js";
-import type { RunnerDefinition } from "../runner/runner.js";
-import { resolveRunner } from "../runner/runnerRegistry.js";
+import { createConfiguredAgent } from "../agent/agent.js";
+import type { AgentDefinition } from "../agent/agent.js";
+import { resolveAgent } from "../agent/agentRegistry.js";
 import { ensureTaskmuxHome, FileTaskStore, resolveTaskmuxHome, type TaskStore } from "../storage/taskStore.js";
 import { ensureStorageSchema } from "../storage/storageSchema.js";
-import type { CommandRunner } from "../tmux/commandRunner.js";
+import type { CommandExecutor } from "../tmux/commandExecutor.js";
+import { runCompletionWizard } from "../completion/completionWizard.js";
+import type { CliIdentity } from "../cli/completion.js";
 
 export type SetupDependency = "tmux";
 
@@ -50,7 +52,7 @@ type SetupAgentOption = SetupAgentChoice & {
 };
 
 type SetupConfigResult = {
-  defaultAgent: RunnerDefinition | null;
+  defaultAgent: AgentDefinition | null;
   defaultWorkspace: string | undefined;
 };
 
@@ -69,7 +71,7 @@ const setupAgentChoices: SetupAgentChoice[] = [
 export async function runSetupCommand(
   args: string[],
   env: NodeJS.ProcessEnv,
-  runner: CommandRunner,
+  executor: CommandExecutor,
   io: SetupIo = {}
 ): Promise<string> {
   const options = parseSetupOptions(args);
@@ -95,14 +97,23 @@ export async function runSetupCommand(
 
     const store = new FileTaskStore(taskmuxHome);
     const configResult = await promptForRequiredConfig(store, taskmuxHome, env, io, question);
+    const completionResult = await runCompletionWizard(
+      "install",
+      store,
+      env,
+      setupCliIdentity(env),
+      question,
+      tableWidth(io)
+    );
 
     setupSystemRoles(store, configResult.defaultAgent, configResult.defaultWorkspace);
     outputLines.push("TaskMux home initialized.");
     outputLines.push("Workspace initialized under TaskMux home.");
+    outputLines.push(completionResult.trimEnd());
 
     for (const dependency of dependencies) {
       if (dependency === "tmux") {
-        outputLines.push(...await setupTmux(env, runner, question));
+        outputLines.push(...await setupTmux(env, executor, question));
       }
     }
 
@@ -112,6 +123,10 @@ export async function runSetupCommand(
   } finally {
     readline.close();
   }
+}
+
+function setupCliIdentity(env: NodeJS.ProcessEnv): CliIdentity {
+  return env.TASKMUX_CLI_NAME === "taskmux-dev" ? "taskmux-dev" : "taskmux";
 }
 
 export function validateSetupInvocation(args: string[], io: SetupIo = {}): void {
@@ -142,7 +157,7 @@ function createSetupQuestion(
     io.output.write(prompt);
     const nextLine = await lineIterator.next();
 
-    return nextLine.done === true ? "" : nextLine.value;
+    return nextLine.done === true ? "skip" : nextLine.value;
   };
 }
 
@@ -154,12 +169,12 @@ async function promptForRequiredConfig(
   question: (prompt: string) => Promise<string>
 ): Promise<SetupConfigResult> {
   const config = store.getConfig();
-  const customRunners = store.listCustomRunners();
+  const agents = store.listConfiguredAgents();
   const currentDefaultAgent = config.defaultAgent?.trim() ?? "";
-  const currentDefaultRunner =
-    currentDefaultAgent.length === 0 ? null : resolveRunner(currentDefaultAgent, customRunners);
-  const options = buildSetupAgentOptions(env, currentDefaultRunner?.id ?? currentDefaultAgent);
-  const defaultOption = resolveDefaultAgentOption(options, currentDefaultRunner?.id ?? currentDefaultAgent, env);
+  const currentAgentDefinition =
+    currentDefaultAgent.length === 0 ? null : resolveAgent(currentDefaultAgent, agents);
+  const options = buildSetupAgentOptions(env, currentAgentDefinition?.id ?? currentDefaultAgent);
+  const defaultOption = resolveDefaultAgentOption(options, currentAgentDefinition?.id ?? currentDefaultAgent, env);
   const table = renderTable(
     "Default agent candidates",
     [
@@ -184,15 +199,15 @@ async function promptForRequiredConfig(
   const selectedAgent = parseAgentSelection(answer, options, defaultOption, env);
   const selectedAgentName = selectedAgent.name;
 
-  const existingAgent = resolveRunner(selectedAgentName, store.listCustomRunners());
+  const existingAgent = resolveAgent(selectedAgentName, store.listConfiguredAgents());
 
   if (existingAgent === null) {
-    const agent = createCustomRunner(selectedAgentName, selectedAgentName, [], {}, new Date());
+    const agent = createConfiguredAgent(selectedAgentName, selectedAgentName, [], {}, new Date());
 
-    store.saveCustomRunner(agent);
+    store.saveConfiguredAgent(agent);
   }
 
-  const defaultAgent = resolveRunner(selectedAgentName, store.listCustomRunners());
+  const defaultAgent = resolveAgent(selectedAgentName, store.listConfiguredAgents());
 
   if (defaultAgent === null) {
     throw usageError(`${selectedAgentName} is not configured.`);
@@ -322,7 +337,7 @@ function shouldPrompt(io: SetupIo): io is InteractiveSetupIo {
   return io.input !== undefined && io.output !== undefined && (io.forceInteractive === true || io.input.isTTY === true);
 }
 
-function setupSystemRoles(store: TaskStore, agent: RunnerDefinition | null, workspace: string | undefined): void {
+function setupSystemRoles(store: TaskStore, agent: AgentDefinition | null, workspace: string | undefined): void {
   if (agent === null) {
     return;
   }
@@ -351,14 +366,14 @@ function parseSetupOptions(args: string[]): SetupOptions {
   return { dependency };
 }
 
-async function setupTmux(env: NodeJS.ProcessEnv, runner: CommandRunner, question: SetupQuestion): Promise<string[]> {
+async function setupTmux(env: NodeJS.ProcessEnv, executor: CommandExecutor, question: SetupQuestion): Promise<string[]> {
   const tmuxCommand = env.TASKMUX_TMUX_BIN ?? "tmux";
 
-  if (hasExecutable(tmuxCommand, ["-V"], runner)) {
+  if (hasExecutable(tmuxCommand, ["-V"], executor)) {
     return ["Tmux already installed."];
   }
 
-  const plan = detectTmuxInstallPlan(env, runner);
+  const plan = detectTmuxInstallPlan(env, executor);
 
   if (plan === null) {
     return [
@@ -384,10 +399,10 @@ async function setupTmux(env: NodeJS.ProcessEnv, runner: CommandRunner, question
   }
 
   for (const step of plan.steps) {
-    runner.run(step.command, step.args, { inheritStdio: true });
+    executor.run(step.command, step.args, { inheritStdio: true });
   }
 
-  if (!hasExecutable(tmuxCommand, ["-V"], runner)) {
+  if (!hasExecutable(tmuxCommand, ["-V"], executor)) {
     return [
       ...lines,
       `Tmux install command completed, but ${tmuxCommand} is still unavailable.`,
@@ -401,8 +416,8 @@ async function setupTmux(env: NodeJS.ProcessEnv, runner: CommandRunner, question
   ];
 }
 
-function detectTmuxInstallPlan(env: NodeJS.ProcessEnv, runner: CommandRunner): InstallPlan | null {
-  if (process.platform === "darwin" && commandExists("brew", env, runner)) {
+function detectTmuxInstallPlan(env: NodeJS.ProcessEnv, executor: CommandExecutor): InstallPlan | null {
+  if (process.platform === "darwin" && commandExists("brew", env, executor)) {
     return {
       manager: "Homebrew",
       steps: [{ command: "brew", args: ["install", "tmux"] }],
@@ -414,9 +429,9 @@ function detectTmuxInstallPlan(env: NodeJS.ProcessEnv, runner: CommandRunner): I
     return null;
   }
 
-  if (commandExists("apt-get", env, runner)) {
-    const updateStep = withLinuxPrivilege("apt-get", ["update"], env, runner);
-    const installStep = withLinuxPrivilege("apt-get", ["install", "-y", "tmux"], env, runner);
+  if (commandExists("apt-get", env, executor)) {
+    const updateStep = withLinuxPrivilege("apt-get", ["update"], env, executor);
+    const installStep = withLinuxPrivilege("apt-get", ["install", "-y", "tmux"], env, executor);
 
     if (updateStep === null || installStep === null) {
       return null;
@@ -429,8 +444,8 @@ function detectTmuxInstallPlan(env: NodeJS.ProcessEnv, runner: CommandRunner): I
     };
   }
 
-  if (commandExists("dnf", env, runner)) {
-    const installStep = withLinuxPrivilege("dnf", ["install", "-y", "tmux"], env, runner);
+  if (commandExists("dnf", env, executor)) {
+    const installStep = withLinuxPrivilege("dnf", ["install", "-y", "tmux"], env, executor);
 
     if (installStep === null) {
       return null;
@@ -443,8 +458,8 @@ function detectTmuxInstallPlan(env: NodeJS.ProcessEnv, runner: CommandRunner): I
     };
   }
 
-  if (commandExists("pacman", env, runner)) {
-    const installStep = withLinuxPrivilege("pacman", ["-S", "--noconfirm", "tmux"], env, runner);
+  if (commandExists("pacman", env, executor)) {
+    const installStep = withLinuxPrivilege("pacman", ["-S", "--noconfirm", "tmux"], env, executor);
 
     if (installStep === null) {
       return null;
@@ -457,8 +472,8 @@ function detectTmuxInstallPlan(env: NodeJS.ProcessEnv, runner: CommandRunner): I
     };
   }
 
-  if (commandExists("apk", env, runner)) {
-    const installStep = withLinuxPrivilege("apk", ["add", "tmux"], env, runner);
+  if (commandExists("apk", env, executor)) {
+    const installStep = withLinuxPrivilege("apk", ["add", "tmux"], env, executor);
 
     if (installStep === null) {
       return null;
@@ -474,16 +489,16 @@ function detectTmuxInstallPlan(env: NodeJS.ProcessEnv, runner: CommandRunner): I
   return null;
 }
 
-function hasExecutable(command: string, args: string[], runner: CommandRunner): boolean {
+function hasExecutable(command: string, args: string[], executor: CommandExecutor): boolean {
   try {
-    runner.run(command, args);
+    executor.run(command, args);
     return true;
   } catch {
     return false;
   }
 }
 
-function commandExists(command: string, env: NodeJS.ProcessEnv, runner: CommandRunner): boolean {
+function commandExists(command: string, env: NodeJS.ProcessEnv, executor: CommandExecutor): boolean {
   if (command.includes("/")) {
     return existsSync(command);
   }
@@ -495,20 +510,20 @@ function commandExists(command: string, env: NodeJS.ProcessEnv, runner: CommandR
     return true;
   }
 
-  return hasExecutable(command, ["--version"], runner);
+  return hasExecutable(command, ["--version"], executor);
 }
 
 function withLinuxPrivilege(
   command: string,
   args: string[],
   env: NodeJS.ProcessEnv,
-  runner: CommandRunner
+  executor: CommandExecutor
 ): InstallStep | null {
   if (process.getuid?.() === 0) {
     return { command, args };
   }
 
-  if (!commandExists("sudo", env, runner)) {
+  if (!commandExists("sudo", env, executor)) {
     return null;
   }
 

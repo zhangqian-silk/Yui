@@ -1,11 +1,11 @@
 import { spawnSync } from "node:child_process";
-import { prepareGlobalRoleLaunch } from "../assistant/assistantContext.js";
+import { prepareGlobalRoleLaunch } from "../operator/operatorContext.js";
 import { roleNotFound, usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { createGlobalRole, updateGlobalRole } from "../role/role.js";
 import type { GlobalRole } from "../role/role.js";
 import { isSystemRoleName, SYSTEM_ROLE_NAMES, systemRoleDescription } from "../role/systemRoles.js";
-import { resolveRunner, supportedRunnerIds } from "../runner/runnerRegistry.js";
+import { resolveAgent, supportedAgentIds } from "../agent/agentRegistry.js";
 import type { TaskStore } from "../storage/taskStore.js";
 
 type GlobalRoleCommandOptions = {
@@ -34,7 +34,7 @@ export function runGlobalRoleCommand(
     case "enter":
       return enterGlobalRoleCommand(rest, store, options);
     default:
-      return globalRoleUsage();
+      throw usageError(command === undefined ? "Role command is required." : `Unknown command: role ${command}`);
   }
 }
 
@@ -43,7 +43,7 @@ function addGlobalRoleCommand(args: string[], store: TaskStore): string {
   const roleName = parseGlobalRoleName(name);
   const agentId = readOption(rest, "--agent").trim();
   const workspace = readOptionalOption(rest, "--workspace")?.trim() ?? store.getConfig().defaultWorkspace ?? process.cwd();
-  const agent = resolveRunner(agentId, store.listCustomRunners());
+  const agent = resolveAgent(agentId, store.listConfiguredAgents());
 
   assertKnownOptions(rest, new Set([
     "--agent", "--workspace", "--description", "--responsibility", "--constraint",
@@ -123,7 +123,7 @@ function updateGlobalRoleCommand(args: string[], store: TaskStore): string {
       throw usageError("--agent is required.");
     }
 
-    const agent = resolveRunner(agentId, store.listCustomRunners());
+    const agent = resolveAgent(agentId, store.listConfiguredAgents());
 
     if (agent === null) {
       throwUnsupportedAgent(agentId, store);
@@ -321,21 +321,10 @@ function assertKnownOptions(args: string[], knownOptions: Set<string>): void {
 }
 
 function throwUnsupportedAgent(agent: string, store: TaskStore): never {
-  const supportedAgents = supportedRunnerIds(store.listCustomRunners());
+  const supportedAgents = supportedAgentIds(store.listConfiguredAgents());
   const supportedText = supportedAgents.length === 0
     ? "none configured. Run taskmux agent add <agent-id> --command <command>."
     : supportedAgents.join(", ");
 
   throw usageError(`Unsupported agent: ${agent}\nSupported agents: ${supportedText}`);
-}
-
-export function globalRoleUsage(): string {
-  return `Role commands:
-  taskmux role add <role> --agent <agent-id> [--workspace <path>] [--description <body>] [--responsibility <body> ...] [--constraint <body> ...] [--expected-output <body>] [--system-prompt <body>] [--skill <skill> ...]
-  taskmux role list
-  taskmux role show <role>
-  taskmux role update <role> [--agent <agent-id>] [--workspace <path>]
-  taskmux role remove <role>
-  taskmux role enter <role>
-`;
 }

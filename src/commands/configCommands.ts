@@ -1,10 +1,12 @@
 import { existsSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { SYSTEM_LEADER_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
-import { resolveRunner } from "../runner/runnerRegistry.js";
-import type { TaskStore, TaskmuxConfig } from "../storage/taskStore.js";
+import { resolveAgent } from "../agent/agentRegistry.js";
+import { inspectCompletionStates } from "../completion/completionState.js";
+import type { CliIdentity } from "../cli/completion.js";
+import { COMPLETION_SHELLS, type CompletionShell, type TaskStore, type TaskmuxConfig } from "../storage/taskStore.js";
 
 type ConfigKey = "default-agent" | "default-workspace";
 
@@ -19,27 +21,19 @@ export function runConfigCommand(args: string[], store: TaskStore, env: NodeJS.P
     case "unset":
       return unsetConfigCommand(rest, store);
     default:
-      return configUsage();
+      throw usageError(command === undefined ? "Config command is required." : `Unknown command: config ${command}`);
   }
 }
 
 function showConfigCommand(store: TaskStore, env: NodeJS.ProcessEnv): string {
   const config = store.getConfig();
 
-  return [
-    "TaskMux config",
-    `Default agent: ${config.defaultAgent ?? "(none)"}`,
-    `Default workspace: ${config.defaultWorkspace ?? "(none)"}`,
-    `Current task: ${config.currentTaskId ?? "(none)"}`,
-    `Last task: ${config.lastTaskId ?? "(none)"}`,
-    "",
-    renderConfigStatus(store, config, env)
-  ].join("\n").concat("\n");
+  return `${renderConfigStatus(store, config, env)}\n`;
 }
 
 function renderConfigStatus(store: TaskStore, config: TaskmuxConfig, env: NodeJS.ProcessEnv): string {
   return renderTable(
-    "Status",
+    "TaskMux config",
     [
       { header: "Item", minWidth: 8, maxWidth: 22 },
       { header: "Status", minWidth: 7, maxWidth: 16 },
@@ -57,7 +51,7 @@ function configStatusRows(store: TaskStore, config: TaskmuxConfig, env: NodeJS.P
   if (defaultAgent.length === 0) {
     rows.push(["default-agent", "missing", "taskmux config set default-agent <agent-id>"]);
   } else {
-    const agent = resolveRunner(defaultAgent, store.listCustomRunners());
+    const agent = resolveAgent(defaultAgent, store.listConfiguredAgents());
 
     if (agent === null) {
       rows.push(["default-agent", "invalid", `${defaultAgent} is not configured`]);
@@ -65,7 +59,7 @@ function configStatusRows(store: TaskStore, config: TaskmuxConfig, env: NodeJS.P
       rows.push([
         "default-agent",
         "configured",
-        `command=${agent.command}${commandUnavailableDetail(agent.command, env)}`
+        `agent=${defaultAgent}; command=${agent.command}${commandUnavailableDetail(agent.command, env)}`
       ]);
     }
   }
@@ -73,9 +67,21 @@ function configStatusRows(store: TaskStore, config: TaskmuxConfig, env: NodeJS.P
   const workspace = config.defaultWorkspace?.trim() ?? "";
 
   if (workspace.length === 0) {
-    rows.push(["workspace", "missing", "taskmux config set default-workspace <path>"]);
+    rows.push(["default-workspace", "missing", "taskmux config set default-workspace <path>"]);
   } else {
-    rows.push(["workspace", "configured", workspace]);
+    rows.push(["default-workspace", "configured", workspace]);
+  }
+
+  rows.push(configPointerRow("current-task", config.currentTaskId));
+  rows.push(configPointerRow("last-task", config.lastTaskId));
+
+  for (const state of inspectCompletionStates(config, env, configCliIdentity(env))) {
+    if (state.installation === undefined) continue;
+    rows.push([
+      `completion:${state.shell}`,
+      "configured",
+      `script=${state.installation.scriptPath}; activation=${state.installation.activationPath}; state=${state.status}`
+    ]);
   }
 
   for (const roleName of [SYSTEM_OPERATOR_ROLE, SYSTEM_LEADER_ROLE]) {
@@ -84,11 +90,31 @@ function configStatusRows(store: TaskStore, config: TaskmuxConfig, env: NodeJS.P
     if (role === null) {
       rows.push([`role:${roleName}`, "missing", "Run taskmux setup in an interactive terminal."]);
     } else {
-      rows.push([`role:${roleName}`, "configured", `agent=${role.agent} workspace=${role.workspace}`]);
+      rows.push([
+        `role:${roleName}`,
+        "configured",
+        roleConfigDetail(role.agent, role.workspace, workspace)
+      ]);
     }
   }
 
   return rows;
+}
+
+function configCliIdentity(env: NodeJS.ProcessEnv): CliIdentity {
+  return env.TASKMUX_CLI_NAME === "taskmux-dev" ? "taskmux-dev" : "taskmux";
+}
+
+function configPointerRow(item: "current-task" | "last-task", taskId: string | undefined): string[] {
+  return [item, taskId === undefined ? "unset" : "set", taskId ?? ""];
+}
+
+function roleConfigDetail(agent: string, workspace: string, defaultWorkspace: string): string {
+  const workspaceDetail = defaultWorkspace.length === 0 || workspace !== defaultWorkspace
+    ? `; workspace=${workspace}`
+    : "";
+
+  return `agent=${agent}${workspaceDetail}`;
 }
 
 function commandUnavailableDetail(command: string, env: NodeJS.ProcessEnv): string {
@@ -121,6 +147,22 @@ function commandOnPath(command: string, env: NodeJS.ProcessEnv): boolean {
 
 function setConfigCommand(args: string[], store: TaskStore): string {
   const [key, ...valueParts] = args;
+  if (key === "completion") {
+    const [shellValue, scriptPath, activationPath, ...extra] = valueParts;
+    const shell = parseCompletionShell(shellValue);
+    if (scriptPath === undefined || activationPath === undefined || extra.length > 0) {
+      throw usageError("Config completion usage: taskmux config set completion <bash|zsh|fish> <script-path> <activation-path>");
+    }
+    const config = store.getConfig();
+    store.saveConfig({
+      ...config,
+      completionInstallations: {
+        ...config.completionInstallations,
+        [shell]: { scriptPath: resolveConfigPath(scriptPath), activationPath: resolveConfigPath(activationPath) }
+      }
+    });
+    return `Set completion ${shell}: ${resolveConfigPath(scriptPath)}\n`;
+  }
   const configKey = parseConfigKey(key);
   const value = valueParts.join(" ").trim();
 
@@ -136,12 +178,37 @@ function setConfigCommand(args: string[], store: TaskStore): string {
 
 function unsetConfigCommand(args: string[], store: TaskStore): string {
   const [key] = args;
+  if (key === "completion") {
+    const shell = parseCompletionShell(args[1]);
+    if (args.length !== 2) {
+      throw usageError("Config completion usage: taskmux config unset completion <bash|zsh|fish>");
+    }
+    const config = store.getConfig();
+    const installations = { ...config.completionInstallations };
+    delete installations[shell];
+    store.saveConfig({
+      ...config,
+      completionInstallations: Object.keys(installations).length === 0 ? undefined : installations
+    });
+    return `Unset completion ${shell}\n`;
+  }
   const configKey = parseConfigKey(key);
   const config = patchConfig(store.getConfig(), configKey, undefined);
 
   store.saveConfig(config);
 
   return `Unset ${configKey}\n`;
+}
+
+function parseCompletionShell(value: string | undefined): CompletionShell {
+  if (COMPLETION_SHELLS.includes(value as CompletionShell)) {
+    return value as CompletionShell;
+  }
+  throw usageError("Completion shell must be one of bash, zsh, fish.");
+}
+
+function resolveConfigPath(value: string): string {
+  return resolve(value);
 }
 
 function patchConfig(config: TaskmuxConfig, key: ConfigKey, value: string | undefined): TaskmuxConfig {
@@ -158,14 +225,4 @@ function parseConfigKey(value: string | undefined): ConfigKey {
   }
 
   throw usageError("Config key must be one of default-agent, default-workspace.");
-}
-
-function configUsage(): string {
-  return `Config commands:
-  taskmux config show
-  taskmux config set default-agent <agent-id>
-  taskmux config set default-workspace <path>
-  taskmux config unset default-agent
-  taskmux config unset default-workspace
-`;
 }

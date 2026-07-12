@@ -1,8 +1,8 @@
 import { agentNotFound, usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
-import { createCustomRunner } from "../runner/runner.js";
-import type { RunnerDefinition, RunnerEnvironment } from "../runner/runner.js";
-import { listRunnerDefinitions, resolveRunner } from "../runner/runnerRegistry.js";
+import { createConfiguredAgent } from "../agent/agent.js";
+import type { AgentDefinition, AgentEnvironment } from "../agent/agent.js";
+import { listAgentDefinitions, resolveAgent } from "../agent/agentRegistry.js";
 import type { TaskStore } from "../storage/taskStore.js";
 
 export function runAgentCommand(args: string[], store: TaskStore): string {
@@ -18,7 +18,7 @@ export function runAgentCommand(args: string[], store: TaskStore): string {
     case "remove":
       return removeAgentCommand(rest, store);
     default:
-      return agentUsage();
+      throw usageError(command === undefined ? "Agent command is required." : `Unknown command: agent ${command}`);
   }
 }
 
@@ -39,14 +39,14 @@ function addAgentCommand(args: string[], store: TaskStore): string {
     throw usageError("--command is required.");
   }
 
-  const agent = createCustomRunner(
+  const agent = createConfiguredAgent(
     id,
     command,
     readRepeatedOption(rest, "--arg"),
     readEnv(rest),
     new Date()
   );
-  store.saveCustomRunner(agent);
+  store.saveConfiguredAgent(agent);
 
   return renderAgent(`Added agent ${agent.id}`, {
     id: agent.id,
@@ -58,7 +58,7 @@ function addAgentCommand(args: string[], store: TaskStore): string {
 }
 
 function listAgentCommand(store: TaskStore): string {
-  const agents = listRunnerDefinitions(store.listCustomRunners());
+  const agents = listAgentDefinitions(store.listConfiguredAgents());
 
   if (agents.length === 0) {
     return "No agents configured.\n";
@@ -83,7 +83,7 @@ function showAgentCommand(args: string[], store: TaskStore): string {
     throw usageError("Agent id is required.");
   }
 
-  const agent = resolveRunner(id, store.listCustomRunners());
+  const agent = resolveAgent(id, store.listConfiguredAgents());
 
   if (agent === null) {
     throw agentNotFound(id);
@@ -99,14 +99,14 @@ function removeAgentCommand(args: string[], store: TaskStore): string {
     throw usageError("Agent id is required.");
   }
 
-  if (!store.removeCustomRunner(id)) {
+  if (!store.removeConfiguredAgent(id)) {
     throw agentNotFound(id);
   }
 
   return `Removed agent ${id}\n`;
 }
 
-function renderAgent(title: string, agent: RunnerDefinition): string {
+function renderAgent(title: string, agent: AgentDefinition): string {
   return [
     title,
     `Source: ${agent.source}`,
@@ -116,7 +116,7 @@ function renderAgent(title: string, agent: RunnerDefinition): string {
   ].join("\n").concat("\n");
 }
 
-function agentCommandSummary(agent: RunnerDefinition): string {
+function agentCommandSummary(agent: AgentDefinition): string {
   return [agent.command, ...agent.args].join(" ");
 }
 
@@ -149,7 +149,7 @@ function readRepeatedOption(args: string[], name: string): string[] {
   return values;
 }
 
-function readEnv(args: string[]): RunnerEnvironment {
+function readEnv(args: string[]): AgentEnvironment {
   return Object.fromEntries(readRepeatedOption(args, "--env").map(parseEnv));
 }
 
@@ -161,13 +161,4 @@ function parseEnv(value: string): [string, string] {
   }
 
   return [value.slice(0, separator), value.slice(separator + 1)];
-}
-
-export function agentUsage(): string {
-  return `Agent commands:
-  taskmux agent add <agent-id> --command <command> [--arg <arg> ...] [--env KEY=value ...]
-  taskmux agent list
-  taskmux agent show <agent-id>
-  taskmux agent remove <agent-id>
-`;
 }

@@ -9,7 +9,7 @@ import {
 const AUTHORITATIVE_PATHS = [
   "config.json",
   "schema.json",
-  "runners",
+  "agents",
   "roles",
   "tasks",
   "trash",

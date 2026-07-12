@@ -1,6 +1,6 @@
 import { dataError } from "../errors/cliError.js";
 import type { Role, RoleProfile } from "../role/role.js";
-import type { RunnerEnvironment } from "../runner/runner.js";
+import type { AgentEnvironment } from "../agent/agent.js";
 import type { Task, TaskPriority } from "../task/task.js";
 
 export type TaskInfoRecord = {
@@ -34,7 +34,7 @@ export type RoleRuntimeRecord = {
   agent: string;
   command: string;
   args: string[];
-  env: RunnerEnvironment;
+  env: AgentEnvironment;
   workspace: string;
   status: Role["status"];
   createdAt: string;
@@ -144,7 +144,8 @@ export class TaskRecordCodec {
       value.schemaVersion !== 1 ||
       typeof value.id !== "string" ||
       "title" in value ||
-      (typeof value.archived !== "boolean" && !isLegacyTaskStatus(value.status)) ||
+      "status" in value ||
+      typeof value.archived !== "boolean" ||
       (value.archivedAt !== undefined && typeof value.archivedAt !== "string") ||
       (value.archivedBy !== undefined && !["user", "operator", "leader"].includes(String(value.archivedBy))) ||
       (value.archiveReason !== undefined && typeof value.archiveReason !== "string") ||
@@ -158,7 +159,7 @@ export class TaskRecordCodec {
     return {
       schemaVersion: 1,
       id: value.id,
-      archived: typeof value.archived === "boolean" ? value.archived : value.status === "archived",
+      archived: value.archived,
       ...(value.archivedAt === undefined ? {} : { archivedAt: value.archivedAt as string }),
       ...(value.archivedBy === undefined ? {} : { archivedBy: value.archivedBy as Task["archivedBy"] }),
       ...(value.archiveReason === undefined ? {} : { archiveReason: value.archiveReason as string }),
@@ -253,10 +254,6 @@ function isStringRecord(value: unknown): value is Record<string, string> {
 
 function isOptionalString(value: unknown): value is string | undefined {
   return value === undefined || typeof value === "string";
-}
-
-function isLegacyTaskStatus(status: unknown): boolean {
-  return ["open", "active", "done", "archived"].includes(String(status));
 }
 
 function isTaskPriority(priority: unknown): priority is TaskPriority {

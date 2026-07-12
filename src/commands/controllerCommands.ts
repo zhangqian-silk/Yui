@@ -11,7 +11,7 @@ import {
 } from "../controller/controller.js";
 import { runtimeError, usageError } from "../errors/cliError.js";
 import { readAgentRunTtl } from "../scheduler/inactivityScanner.js";
-import { NodeCommandRunner } from "../tmux/commandRunner.js";
+import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
 import { TmuxManager } from "../tmux/tmuxManager.js";
 
 export async function runControllerCommand(
@@ -49,7 +49,7 @@ export async function runControllerCommand(
       const result = await callController(discovery, "scheduler.scan", randomUUID()) as { output: string };
       return result.output;
     }
-    const tmux = new TmuxManager(env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandRunner());
+    const tmux = new TmuxManager(env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandExecutor());
     const release = acquireControllerLock(rootDir, process.pid);
     try {
       const queued = runSchedulerTransaction(

@@ -1,11 +1,8 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { dataError } from "../errors/cliError.js";
-import { migrateStorageV0ToV1, type StorageMigration } from "./migrations/v0ToV1.js";
-import { migrateStorageV1ToV2 } from "./migrations/v1ToV2.js";
-import { createStorageBackup, type StorageBackupResult } from "./storageBackup.js";
 
-export const CURRENT_STORAGE_SCHEMA_VERSION = 2;
+export const CURRENT_STORAGE_SCHEMA_VERSION = 3;
 export const STORAGE_SCHEMA_FILE = "schema.json";
 
 export type StorageSchemaManifest = {
@@ -27,12 +24,6 @@ export type StorageSchemaState =
       manifestPath: string;
     }
   | {
-      status: "upgrade-required";
-      currentVersion: number;
-      latestVersion: number;
-      manifestPath: string;
-    }
-  | {
       status: "unsupported";
       currentVersion: number;
       latestVersion: number;
@@ -44,15 +35,6 @@ export type StorageSchemaState =
       manifestPath: string;
       detail: string;
     };
-
-export type StorageMigrationResult = {
-  fromVersion: number | null;
-  toVersion: number;
-  changed: boolean;
-  backup?: StorageBackupResult;
-};
-
-const migrations: StorageMigration[] = [migrateStorageV0ToV1, migrateStorageV1ToV2];
 
 export function inspectStorageSchema(rootDir: string): StorageSchemaState {
   const manifestPath = storageSchemaFile(rootDir);
@@ -77,16 +59,7 @@ export function inspectStorageSchema(rootDir: string): StorageSchemaState {
     };
   }
 
-  if (manifest.storageVersion < CURRENT_STORAGE_SCHEMA_VERSION) {
-    return {
-      status: "upgrade-required",
-      currentVersion: manifest.storageVersion,
-      latestVersion: CURRENT_STORAGE_SCHEMA_VERSION,
-      manifestPath
-    };
-  }
-
-  if (manifest.storageVersion > CURRENT_STORAGE_SCHEMA_VERSION) {
+  if (manifest.storageVersion !== CURRENT_STORAGE_SCHEMA_VERSION) {
     return {
       status: "unsupported",
       currentVersion: manifest.storageVersion,
@@ -112,14 +85,8 @@ export function ensureStorageSchema(rootDir: string): void {
       return;
     case "current":
       return;
-    case "upgrade-required":
-      throw dataError(
-        `Storage schema upgrade required: ${state.currentVersion} -> ${state.latestVersion}. Run \`taskmux migrate\`.`
-      );
     case "unsupported":
-      throw dataError(
-        `Unsupported storage schema version: ${state.currentVersion}. This TaskMux supports storage schema ${state.latestVersion}.`
-      );
+      throw unsupportedStorageSchema(state.currentVersion, state.latestVersion);
     case "invalid":
       throw dataError(`Invalid storage schema manifest: ${state.manifestPath}.`);
   }
@@ -133,69 +100,17 @@ export function requireStorageSchema(rootDir: string): void {
       throw dataError("TaskMux is not initialized. Run `taskmux setup`.");
     case "current":
       return;
-    case "upgrade-required":
-      throw dataError(
-        `Storage schema upgrade required: ${state.currentVersion} -> ${state.latestVersion}. Run \`taskmux migrate\`.`
-      );
     case "unsupported":
-      throw dataError(
-        `Unsupported storage schema version: ${state.currentVersion}. This TaskMux supports storage schema ${state.latestVersion}.`
-      );
+      throw unsupportedStorageSchema(state.currentVersion, state.latestVersion);
     case "invalid":
       throw dataError(`Invalid storage schema manifest: ${state.manifestPath}.`);
   }
 }
 
-export function runStorageMigrations(rootDir: string, now = new Date()): StorageMigrationResult {
-  const state = inspectStorageSchema(rootDir);
-
-  if (state.status === "uninitialized") {
-    throw dataError("TaskMux is not initialized. Run `taskmux setup`.");
-  }
-
-  if (state.status === "current") {
-    return {
-      fromVersion: state.currentVersion,
-      toVersion: state.currentVersion,
-      changed: false
-    };
-  }
-
-  if (state.status === "unsupported") {
-    throw dataError(
-      `Unsupported storage schema version: ${state.currentVersion}. This TaskMux supports storage schema ${state.latestVersion}.`
-    );
-  }
-
-  if (state.status === "invalid") {
-    throw dataError(`Invalid storage schema manifest: ${state.manifestPath}.`);
-  }
-
-  const fromVersion = state.currentVersion;
-  let currentVersion = state.currentVersion;
-  const backup = createStorageBackup(rootDir, now);
-
-  while (currentVersion < CURRENT_STORAGE_SCHEMA_VERSION) {
-    const migration = migrations.find((item) => item.fromVersion === currentVersion);
-
-    if (migration === undefined) {
-      throw dataError(
-        `No storage migration path from ${currentVersion} to ${CURRENT_STORAGE_SCHEMA_VERSION}.`
-      );
-    }
-
-    migration.run(rootDir);
-    currentVersion = migration.toVersion;
-  }
-
-  writeStorageManifest(rootDir, currentVersion, now);
-
-  return {
-    fromVersion,
-    toVersion: currentVersion,
-    changed: true,
-    backup
-  };
+function unsupportedStorageSchema(currentVersion: number, requiredVersion: number): ReturnType<typeof dataError> {
+  return dataError(
+    `Unsupported storage schema version: ${currentVersion}. This TaskMux requires storage schema ${requiredVersion}. Reinitialize TASKMUX_HOME.`
+  );
 }
 
 function writeStorageManifest(rootDir: string, storageVersion: number, now: Date): void {

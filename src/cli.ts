@@ -2,16 +2,15 @@
 
 import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { createInterface } from "node:readline/promises";
 import { runAgentCommand } from "./commands/agentCommands.js";
-import { runBoardCommand } from "./commands/boardCommands.js";
+import { runBackupCommand } from "./commands/backupCommands.js";
 import { runConfigCommand } from "./commands/configCommands.js";
 import { ensureControllerRunning, runControllerCommand } from "./commands/controllerCommands.js";
 import { callController } from "./controller/controller.js";
 import { runGlobalRoleCommand } from "./commands/globalRoleCommands.js";
 import { runExportCommand, runImportCommand, runPruneCommand } from "./commands/maintenanceCommands.js";
 import { runTaskCommand } from "./commands/taskCommands.js";
-import { runBackupCommand, runMigrateCommand } from "./commands/migrationCommands.js";
-import { runRunnerCommand } from "./commands/runnerCommands.js";
 import { runDashboard } from "./dashboard/dashboard.js";
 import { getDoctorChecks, renderDoctor, runDoctor } from "./doctor/doctor.js";
 import { CliError, dataError, usageError } from "./errors/cliError.js";
@@ -23,96 +22,18 @@ import {
   requireStorageSchema,
   type StorageSchemaState
 } from "./storage/storageSchema.js";
-import { NodeCommandRunner } from "./tmux/commandRunner.js";
+import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
-import { SYSTEM_ASSISTANT_ROLE, SYSTEM_OPERATOR_ROLE } from "./role/systemRoles.js";
-import { prepareGlobalRoleLaunch } from "./assistant/assistantContext.js";
+import { SYSTEM_OPERATOR_ROLE } from "./role/systemRoles.js";
+import { prepareGlobalRoleLaunch } from "./operator/operatorContext.js";
 import type { Role } from "./role/role.js";
+import { renderCommandHelp } from "./cli/helpRenderer.js";
+import { routeInvocation } from "./cli/invocationRouter.js";
+import { runUpdateCommand } from "./cli/updateCommand.js";
+import { renderCompletion, type CliIdentity } from "./cli/completion.js";
+import { runCompletionWizard } from "./completion/completionWizard.js";
 
 const VERSION = readPackageVersion();
-
-const usage = `TaskMux ${VERSION}
-
-Local task board for native agent CLI sessions backed by tmux.
-
-Usage:
-  taskmux
-  taskmux --help
-  taskmux --version
-  taskmux completion bash|zsh|fish
-  taskmux doctor
-  taskmux controller start|status [--json]|stop|scan
-  taskmux setup [tmux]
-  taskmux backup
-  taskmux migrate [--dry-run]
-  taskmux export --output <file>
-  taskmux import <file>
-  taskmux prune [--trash] [--backups] [--keep-backups <count>]
-  taskmux operator
-  taskmux assistant                 # legacy alias
-  taskmux board
-  taskmux config show
-  taskmux config set default-agent <agent-id>
-  taskmux config set default-workspace <path>
-  taskmux agent add <agent-id> --command <command> [--arg <arg> ...] [--env KEY=value ...]
-  taskmux agent list
-  taskmux agent show <agent-id>
-  taskmux agent remove <agent-id>
-  taskmux role add <role> --agent <agent-id> [--workspace <path>] [--description <body>] [--responsibility <body> ...] [--constraint <body> ...] [--expected-output <body>] [--system-prompt <body>] [--skill <skill> ...]
-  taskmux role list
-  taskmux role show <role>
-  taskmux role update <role> [--agent <agent-id>] [--workspace <path>]
-  taskmux role remove <role>
-  taskmux role enter <role>
-  taskmux task create <title> [--template feature|bug|review] [--agent <agent>] [--workspace <path>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD]
-  taskmux task update <task-id> [--title <title>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD] [--clear-description] [--clear-priority] [--clear-tags] [--clear-due]
-  taskmux task list [--archived true|false] [--tag <tag>] [--priority <priority>] [--search <text>]
-  taskmux task board [--archived true|false] [--tag <tag>] [--priority <priority>] [--search <text>] [--with-roles]
-  taskmux task show <task-id>
-  taskmux task current [<task-id>]
-  taskmux task last
-  taskmux task clone <task-id> [--title <title>]
-  taskmux task archive <task-id> [--reason <body>] [--summary <body>]
-  taskmux task unarchive <task-id>
-  taskmux task delete <task-id>
-  taskmux task restore <task-id>
-  taskmux task shell <task-id>
-  taskmux task context <task-id> [--format text|json] [--include-transcripts]
-  taskmux task assign <task-id> <role> --agent <agent> --workspace <path>
-  taskmux task assign-many <task-id> --role <role> ... [--agent <agent>] [--workspace <path>]
-  taskmux task role update <task-id> <role> [--agent <agent>] [--workspace <path>]
-  taskmux task role rename <task-id> <role> <new-role>
-  taskmux task roles <task-id>
-  taskmux task enter <task-id> <role>
-  taskmux task tail <task-id> <role>
-  taskmux task detail <task-id> <role>
-  taskmux task status <task-id> <role>
-  taskmux task refresh <task-id>
-  taskmux task transcript <task-id> <role>
-  taskmux task transcript export <task-id> <role> [--format text|json|markdown] [--output <file>]
-  taskmux task activity <task-id>
-  taskmux task timeline <task-id>
-  taskmux task detach <task-id> <role>
-  taskmux task stop <task-id> <role>
-  taskmux task kill <task-id> <role>
-  taskmux task restart <task-id> <role>
-  taskmux task cleanup <task-id>
-  taskmux task comment <task-id> <body>
-  taskmux task comments <task-id>
-  taskmux task events <task-id>
-  taskmux task topic create <task-id> --id <id> --name <name> --description <body>
-  taskmux task topic summarize <task-id> --topic <topic> --summary <body>
-  taskmux task input draft|submit <task-id> [body]
-  taskmux task cycle create <task-id> --cause <cause> --summary <body>
-  taskmux task cycle end <task-id> <cycle-id> --summary <body>
-  taskmux task work-item create|update <task-id> ...
-  taskmux task role child <task-id> <role> [--parent <role>] ...
-  taskmux task dispatch <task-id> <role> --mode new|resume [--work-item <id>] [--topic <topic> ...] --input <body>
-  taskmux task yield <task-id> <role> --summary <body>
-  taskmux task schedule set <task-id> ...
-  taskmux task decision record|supersede <task-id> ...
-  taskmux task worktree create <task-id> <role> --path <path> --branch <branch>
-`;
 
 const rawArgs = process.argv.slice(2);
 const nativeJsonCommand = rawArgs[0] === "controller" && rawArgs[1] === "status";
@@ -121,9 +42,10 @@ const args = jsonOutput ? rawArgs.filter((arg) => arg !== "--json") : rawArgs;
 
 main().catch((error: unknown) => {
   if (error instanceof CliError) {
-    console.error(jsonOutput
+    const rendered = jsonOutput
       ? JSON.stringify({ ok: false, code: error.code, message: error.message, details: {} })
-      : `${error.code}: ${error.message}`);
+      : `${error.code}: ${error.message}${error.helpText === undefined ? "" : `\n\n${error.helpText.trimEnd()}`}`;
+    console.error(rendered);
     process.exit(error.exitCode);
   }
 
@@ -135,17 +57,35 @@ main().catch((error: unknown) => {
 });
 
 async function main(): Promise<void> {
-  const rootDir = resolveTaskmuxHome(process.env);
-
-  if (args.includes("--version") || args.includes("-v")) {
+  if (args.includes("--version") || args.includes("-v") || (args[0] === "version" && args.length === 1)) {
     emit(VERSION);
     return;
   }
 
-  if (args.includes("--help") || args.includes("-h") || args.includes("-help")) {
-    emit(usage);
+  const invocation = routeInvocation(args);
+  if (invocation.kind === "help") {
+    emit(renderCommandHelp(invocation.node, VERSION));
     return;
   }
+  if (invocation.kind === "path-error") {
+    throw usageError(
+      `Unknown command: ${invocation.typedPath}`,
+      renderCommandHelp(invocation.helpNode, VERSION)
+    );
+  }
+
+  if (args[0] === "update") {
+    if (jsonOutput) {
+      throw usageError("Update does not support --json.");
+    }
+    if (args.length !== 1) {
+      throw usageError("Update usage: taskmux update");
+    }
+    process.exitCode = runUpdateCommand();
+    return;
+  }
+
+  const rootDir = resolveTaskmuxHome(process.env);
 
   if (args.length === 0) {
     await runDefaultDashboard(rootDir);
@@ -153,20 +93,51 @@ async function main(): Promise<void> {
   }
 
   if (args[0] === "completion") {
-    emit(renderCompletion(args[1]));
+    if (args[1] === "install" || args[1] === "uninstall") {
+      if (args.length !== 2) {
+        throw usageError(`Completion ${args[1]} usage: taskmux completion ${args[1]}`);
+      }
+      if (jsonOutput) {
+        throw usageError(`Completion ${args[1]} does not support --json.`);
+      }
+      if (process.stdin.isTTY !== true && process.env.TASKMUX_SETUP_INTERACTIVE !== "1") {
+        throw usageError(`Completion ${args[1]} requires an interactive terminal.`);
+      }
+      requireStorageSchema(rootDir);
+      const store = new FileTaskStore(rootDir);
+      const readline = createInterface({ input: process.stdin, output: process.stdout, terminal: process.stdin.isTTY === true });
+      try {
+        const iterator = process.stdin.isTTY === true ? undefined : readline[Symbol.asyncIterator]();
+        const question = process.stdin.isTTY === true
+          ? (prompt: string) => readline.question(prompt)
+          : async (prompt: string) => {
+              process.stdout.write(prompt);
+              const next = await iterator?.next();
+              return next?.done === true || next === undefined ? "skip" : next.value;
+            };
+        emit(await runCompletionWizard(args[1], store, process.env, resolveCliIdentity(process.env), question, process.stdout.columns));
+      } finally {
+        readline.close();
+      }
+      return;
+    }
+    emit(renderCompletion(args[1], resolveCliIdentity(process.env)));
     return;
   }
 
   if (args[0] === "doctor") {
     const storageSchema = inspectStorageSchema(rootDir);
     const store = new FileTaskStore(rootDir);
-    const customRunners = canReadStore(storageSchema) ? listCustomRunnersForDoctor(store) : [];
+    const agents = canReadStore(storageSchema) ? listConfiguredAgentsForDoctor(store) : [];
 
-    emit(runDoctor(process.env, new NodeCommandRunner(), customRunners, storageSchema));
+    emit(runDoctor(process.env, new NodeCommandExecutor(), agents, storageSchema));
     return;
   }
 
   if (args[0] === "setup") {
+    if (jsonOutput) {
+      throw usageError("Setup does not support --json.");
+    }
     const setupIo = {
       input: process.stdin,
       output: process.stdout,
@@ -174,13 +145,8 @@ async function main(): Promise<void> {
     };
 
     validateSetupInvocation(args.slice(1), setupIo);
-    const output = await runSetupCommand(args.slice(1), process.env, new NodeCommandRunner(), setupIo);
+    const output = await runSetupCommand(args.slice(1), process.env, new NodeCommandExecutor(), setupIo);
     emit(output);
-    return;
-  }
-
-  if (args[0] === "migrate") {
-    emit(runMigrateCommand(rootDir, args.slice(1)));
     return;
   }
 
@@ -242,44 +208,26 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (args[0] === "operator" || args[0] === "assistant") {
+  if (args[0] === "operator") {
     if (args.length > 1) {
       throw usageError("Operator usage: taskmux operator");
     }
 
     requireStorageSchema(rootDir);
     const store = new FileTaskStore(rootDir);
-    const roleName = store.getGlobalRole(SYSTEM_OPERATOR_ROLE) !== null
-      ? SYSTEM_OPERATOR_ROLE
-      : SYSTEM_ASSISTANT_ROLE;
-    if (args[0] === "operator" && roleName === SYSTEM_OPERATOR_ROLE) {
-      const role = store.getGlobalRole(roleName);
-      if (role === null) {
-        throw dataError("Operator role is not configured. Run taskmux setup.");
-      }
-      const prepared = prepareGlobalRoleLaunch(role, { taskmuxHome: rootDir, baseEnv: process.env });
-      const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandRunner());
-      const taskRole: Role = { ...role, status: "idle" };
-      tmux.enterRole("operator", taskRole, {
-        command: role.command,
-        args: prepared.args,
-        env: operatorLaunchEnvironment(role.env, prepared.env)
-      });
-      emit("Detached Operator session");
-      return;
+    const role = store.getGlobalRole(SYSTEM_OPERATOR_ROLE);
+    if (role === null) {
+      throw dataError("Operator role is not configured. Run taskmux setup.");
     }
-    emit(runGlobalRoleCommand(["enter", roleName], store, { taskmuxHome: rootDir }));
-    return;
-  }
-
-  if (args[0] === "board") {
-    requireStorageSchema(rootDir);
-    if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
-      await printControllerCommand(rootDir, "board", []);
-      return;
-    }
-    const store = new FileTaskStore(rootDir);
-    emit(runBoardCommand(store));
+    const prepared = prepareGlobalRoleLaunch(role, { taskmuxHome: rootDir, baseEnv: process.env });
+    const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandExecutor());
+    const taskRole: Role = { ...role, status: "idle" };
+    tmux.enterRole("operator", taskRole, {
+      command: role.command,
+      args: prepared.args,
+      env: operatorLaunchEnvironment(role.env, prepared.env)
+    });
+    emit("Detached Operator session");
     return;
   }
 
@@ -305,21 +253,10 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (args[0] === "runner") {
-    requireStorageSchema(rootDir);
-    if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
-      await printControllerCommand(rootDir, "runner", args.slice(1));
-      return;
-    }
-    const store = new FileTaskStore(rootDir);
-    emit(runRunnerCommand(args.slice(1), store));
-    return;
-  }
-
   if (args[0] === "task") {
     requireStorageSchema(rootDir);
     const store = new FileTaskStore(rootDir);
-    const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandRunner());
+    const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandExecutor());
     const taskArgs = resolveTaskCommandScope(args.slice(1), process.env);
 
     if (taskArgs[0] === "shell") {
@@ -373,7 +310,11 @@ async function main(): Promise<void> {
     return;
   }
 
-  emit(usage);
+  throw usageError(`Unknown command: ${args[0]}`);
+}
+
+function resolveCliIdentity(env: NodeJS.ProcessEnv): CliIdentity {
+  return env.TASKMUX_CLI_NAME === "taskmux-dev" ? "taskmux-dev" : "taskmux";
 }
 
 async function attachTaskRoleThroughController(
@@ -470,8 +411,7 @@ function operatorLaunchEnvironment(
     "TASKMUX_HOME",
     "TASKMUX_ROLE",
     "TASKMUX_WORKSPACE",
-    "TASKMUX_OPERATOR_CONTEXT",
-    "TASKMUX_ASSISTANT_CONTEXT"
+    "TASKMUX_OPERATOR_CONTEXT"
   ]) {
     const value = preparedEnvironment[key];
     if (value !== undefined) {
@@ -482,11 +422,11 @@ function operatorLaunchEnvironment(
 }
 
 async function runDefaultDashboard(rootDir: string): Promise<void> {
-  const commandRunner = new NodeCommandRunner();
+  const commandExecutor = new NodeCommandExecutor();
   const storageSchema = inspectStorageSchema(rootDir);
   const storeForDoctor = new FileTaskStore(rootDir);
-  const customRunners = canReadStore(storageSchema) ? listCustomRunnersForDoctor(storeForDoctor) : [];
-  const checks = getDoctorChecks(process.env, commandRunner, customRunners, storageSchema);
+  const agents = canReadStore(storageSchema) ? listConfiguredAgentsForDoctor(storeForDoctor) : [];
+  const checks = getDoctorChecks(process.env, commandExecutor, agents, storageSchema);
   const failedChecks = checks.filter((check) => check.status !== "ok");
 
   process.stdout.write(renderDoctor(checks));
@@ -497,7 +437,7 @@ async function runDefaultDashboard(rootDir: string): Promise<void> {
 
   requireStorageSchema(rootDir);
   const store = new FileTaskStore(rootDir);
-  const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", commandRunner);
+  const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", commandExecutor);
 
   if (process.env.TASKMUX_CONTROLLER_MODE === "direct") {
     await runDashboard(store, tmux);
@@ -538,44 +478,10 @@ function canReadStore(state: StorageSchemaState): boolean {
   return state.status === "current";
 }
 
-function listCustomRunnersForDoctor(store: FileTaskStore) {
+function listConfiguredAgentsForDoctor(store: FileTaskStore) {
   try {
-    return store.listCustomRunners();
+    return store.listConfiguredAgents();
   } catch {
     return [];
   }
-}
-
-function renderCompletion(shell: string | undefined): string {
-  const commands = [
-    "doctor", "setup", "backup", "migrate", "export", "import", "prune", "operator", "assistant", "board", "config", "agent", "role", "task", "completion",
-    "create", "update", "list", "board", "show", "archive", "unarchive", "delete", "restore",
-    "shell", "context", "assign", "assign-many", "role", "roles", "enter", "tail", "detail", "status",
-    "refresh", "transcript", "activity", "timeline", "detach", "stop", "kill", "restart", "cleanup",
-    "comment", "comments", "events", "current", "last", "clone", "topic", "input", "draft", "submit", "cycle", "work-item", "wake", "session", "dispatch", "yield", "schedule", "brief", "milestone", "decision", "worktree"
-  ].join(" ");
-
-  if (shell === "bash") {
-    return `_taskmux() {
-  COMPREPLY=( $(compgen -W "${commands}" -- "\${COMP_WORDS[COMP_CWORD]}") )
-}
-complete -F _taskmux taskmux
-`;
-  }
-
-  if (shell === "zsh") {
-    return `#compdef taskmux
-_arguments '*::taskmux command:(${commands})'
-`;
-  }
-
-  if (shell === "fish") {
-    return commands
-      .split(" ")
-      .map((command) => `complete -c taskmux -f -a ${command}`)
-      .join("\n")
-      .concat("\n");
-  }
-
-  throw usageError("Completion shell must be one of bash, zsh, fish.");
 }

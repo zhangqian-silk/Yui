@@ -35,8 +35,8 @@ const resilientReadMethods = new Set<keyof TaskStore>([
   "listComments",
   "listEvents",
   "readTranscript",
-  "listCustomRunners",
-  "getCustomRunner"
+  "listConfiguredAgents",
+  "getConfiguredAgent"
 ]);
 
 export function createResilientTaskStore(
@@ -79,8 +79,8 @@ export function primeResilientTaskStore(store: TaskStore): void {
   for (const role of store.listGlobalRoles()) {
     store.getGlobalRole(role.name);
   }
-  for (const runner of store.listCustomRunners()) {
-    store.getCustomRunner(runner.id);
+  for (const agent of store.listConfiguredAgents()) {
+    store.getConfiguredAgent(agent.id);
   }
 
   for (const task of store.listTasks()) {

@@ -1,10 +1,10 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { GlobalRole } from "../role/role.js";
-import { SYSTEM_ASSISTANT_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
-import type { RunnerEnvironment } from "../runner/runner.js";
+import { SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
+import type { AgentEnvironment } from "../agent/agent.js";
 
-export type AssistantLaunch = {
+export type OperatorLaunch = {
   args: string[];
   env: NodeJS.ProcessEnv;
 };
@@ -12,40 +12,39 @@ export type AssistantLaunch = {
 export function prepareGlobalRoleLaunch(
   role: GlobalRole,
   options: { taskmuxHome?: string; baseEnv?: NodeJS.ProcessEnv } = {}
-): AssistantLaunch {
-  if (![SYSTEM_OPERATOR_ROLE, SYSTEM_ASSISTANT_ROLE].includes(role.name) || options.taskmuxHome === undefined) {
+): OperatorLaunch {
+  if (role.name !== SYSTEM_OPERATOR_ROLE || options.taskmuxHome === undefined) {
     return {
       args: role.args,
       env: mergeEnv(options.baseEnv, role.env)
     };
   }
 
-  const contextPath = writeAssistantContext(options.taskmuxHome, role.workspace);
+  const contextPath = writeOperatorContext(options.taskmuxHome, role.workspace);
   const taskmuxEnv = {
     TASKMUX_HOME: options.taskmuxHome,
     TASKMUX_ROLE: role.name,
     TASKMUX_WORKSPACE: role.workspace,
-    TASKMUX_OPERATOR_CONTEXT: contextPath,
-    TASKMUX_ASSISTANT_CONTEXT: contextPath
+    TASKMUX_OPERATOR_CONTEXT: contextPath
   };
 
   return {
-    args: withAssistantPrompt(role, contextPath),
+    args: withOperatorPrompt(role, contextPath),
     env: mergeEnv(options.baseEnv, role.env, taskmuxEnv)
   };
 }
 
-function writeAssistantContext(taskmuxHome: string, workspace: string): string {
-  const assistantDir = join(taskmuxHome, "operator");
-  const contextPath = join(assistantDir, "TASKMUX_OPERATOR.md");
+function writeOperatorContext(taskmuxHome: string, workspace: string): string {
+  const operatorDir = join(taskmuxHome, "operator");
+  const contextPath = join(operatorDir, "TASKMUX_OPERATOR.md");
 
-  mkdirSync(assistantDir, { recursive: true });
-  writeFileSync(contextPath, `${renderAssistantContext(taskmuxHome, workspace)}\n`);
+  mkdirSync(operatorDir, { recursive: true });
+  writeFileSync(contextPath, `${renderOperatorContext(taskmuxHome, workspace)}\n`);
 
   return contextPath;
 }
 
-function renderAssistantContext(taskmuxHome: string, workspace: string): string {
+function renderOperatorContext(taskmuxHome: string, workspace: string): string {
   return `${readOperatorSkill()}
 
 # TaskMux Operator runtime
@@ -76,7 +75,7 @@ function readOperatorSkill(): string {
   return readFileSync(new URL("../../skills/taskmux-operator/SKILL.md", import.meta.url), "utf8").trim();
 }
 
-function withAssistantPrompt(role: GlobalRole, contextPath: string): string[] {
+function withOperatorPrompt(role: GlobalRole, contextPath: string): string[] {
   if (!isCodexCommand(role.command) || role.args.length > 0) {
     return role.args;
   }
@@ -94,8 +93,8 @@ function isCodexCommand(command: string): boolean {
 
 function mergeEnv(
   baseEnv: NodeJS.ProcessEnv = process.env,
-  roleEnv: RunnerEnvironment,
-  taskmuxEnv: RunnerEnvironment = {}
+  roleEnv: AgentEnvironment,
+  taskmuxEnv: AgentEnvironment = {}
 ): NodeJS.ProcessEnv {
   return {
     ...baseEnv,
