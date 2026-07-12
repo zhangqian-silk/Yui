@@ -2,25 +2,119 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
 
-test("catalog validation rejects duplicate sibling command names", async () => {
-  const catalog = await import("../dist/cli/commandCatalog.js");
-  assert.equal(typeof catalog.validateCommandCatalog, "function");
+function leaf(name, path = ["taskmux", name]) {
+  return {
+    name,
+    path,
+    summary: name,
+    kind: "leaf",
+    usage: [path.join(" ")],
+    hidden: false,
+    sections: [],
+    options: [],
+    optionValues: {},
+    fileOptions: [],
+    fileArguments: [],
+    commandPathArguments: false,
+    values: [],
+    children: []
+  };
+}
 
-  const duplicate = {
+function rootWith(children, sections) {
+  return {
     name: "taskmux",
     path: ["taskmux"],
     summary: "root",
     kind: "group",
     usage: ["taskmux"],
     hidden: false,
+    sections,
     options: [],
-    children: [
-      { name: "same", path: ["taskmux", "same"], summary: "one", kind: "leaf", usage: ["taskmux same"], hidden: false, options: [], children: [] },
-      { name: "same", path: ["taskmux", "same"], summary: "two", kind: "leaf", usage: ["taskmux same"], hidden: false, options: [], children: [] }
-    ]
+    optionValues: {},
+    fileOptions: [],
+    fileArguments: [],
+    commandPathArguments: false,
+    values: [],
+    children
   };
+}
+
+test("catalog validation rejects duplicate sibling command names", async () => {
+  const catalog = await import("../dist/cli/commandCatalog.js");
+  assert.equal(typeof catalog.validateCommandCatalog, "function");
+
+  const duplicate = rootWith(
+    [leaf("same"), { ...leaf("same"), summary: "two" }],
+    [{ id: "main", title: "Main", entries: ["same", "same"] }]
+  );
 
   assert.throws(() => catalog.validateCommandCatalog(duplicate), /Duplicate command path: taskmux same/);
+});
+
+test("catalog validation rejects missing, unknown, and ambiguously ordered section entries", async () => {
+  const { validateCommandCatalog } = await import("../dist/cli/commandCatalog.js");
+  const one = leaf("one");
+  const two = leaf("two");
+
+  assert.throws(
+    () => validateCommandCatalog(rootWith([one], [])),
+    /missing from command sections: taskmux one/i
+  );
+  assert.throws(
+    () => validateCommandCatalog(rootWith([one], [{ id: "main", title: "Main", entries: ["missing"] }])),
+    /unknown section entry: taskmux missing/i
+  );
+  assert.throws(
+    () => validateCommandCatalog(rootWith([one, two], [
+      { id: "main", title: "Main", entries: ["one"] },
+      { id: "later", title: "Later", entries: ["one", "two"] }
+    ])),
+    /duplicate section entry: taskmux one/i
+  );
+  assert.throws(
+    () => validateCommandCatalog(rootWith([one], [
+      { id: "main", title: "Main", entries: ["one"] },
+      { id: "main", title: "Again", entries: [] }
+    ])),
+    /duplicate command section: taskmux main/i
+  );
+});
+
+test("catalog validation rejects duplicate tokens and removed alias surfaces", async () => {
+  const { validateCommandCatalog } = await import("../dist/cli/commandCatalog.js");
+  const commandAndValue = rootWith(
+    [leaf("same")],
+    [{ id: "main", title: "Main", entries: ["same"] }]
+  );
+  commandAndValue.values = [{ name: "same", summary: "same value", section: "main" }];
+
+  assert.throws(() => validateCommandCatalog(commandAndValue), /duplicate command token: taskmux same/i);
+
+  for (const alias of ["-h", "--help", "-v", "--version"]) {
+    const catalog = rootWith([], []);
+    catalog.options = [alias];
+    assert.throws(() => validateCommandCatalog(catalog), /reserved alias token/i, alias);
+  }
+});
+
+test("catalog declares stable semantic sections for every command group", async () => {
+  const { ROOT_COMMAND } = await import("../dist/cli/commandCatalog.js");
+  assert.deepEqual(ROOT_COMMAND.sections.map(({ id, title }) => ({ id, title })), [
+    { id: "workflow", title: "Workflow" },
+    { id: "configuration", title: "Configuration" },
+    { id: "operations", title: "Operations" },
+    { id: "data", title: "Data" },
+    { id: "support", title: "Support" }
+  ]);
+
+  const visit = (node) => {
+    if (node.children.length > 0 || node.values.length > 0) {
+      assert.ok(node.sections.length > 0, `${node.path.join(" ")} has no semantic sections`);
+    }
+    node.children.forEach(visit);
+  };
+  visit(ROOT_COMMAND);
 });
 
 test("catalog covers every public root, group, nested, and leaf path", async () => {

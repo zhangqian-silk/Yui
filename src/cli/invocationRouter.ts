@@ -3,7 +3,8 @@ import { findChild, ROOT_COMMAND, type CommandNode } from "./commandCatalog.js";
 export type Invocation =
   | { kind: "execute"; node: CommandNode }
   | { kind: "help"; node: CommandNode }
-  | { kind: "path-error"; typedPath: string; helpNode: CommandNode };
+  | { kind: "path-error"; typedPath: string; helpNode: CommandNode }
+  | { kind: "incomplete"; typedPath: string; helpNode: CommandNode };
 
 export function routeInvocation(args: readonly string[]): Invocation {
   if (args.length === 0) {
@@ -14,11 +15,7 @@ export function routeInvocation(args: readonly string[]): Invocation {
     return resolveHelpPath(args.slice(1));
   }
 
-  if (args.includes("--help") || args.includes("-h")) {
-    return resolveExecutionPath(args.filter((arg) => arg !== "--help" && arg !== "-h"), true);
-  }
-
-  return resolveExecutionPath(args, false);
+  return resolveExecutionPath(args);
 }
 
 function resolveHelpPath(path: readonly string[]): Invocation {
@@ -41,7 +38,7 @@ function resolveHelpPath(path: readonly string[]): Invocation {
   return { kind: "help", node };
 }
 
-function resolveExecutionPath(args: readonly string[], forceHelp: boolean): Invocation {
+function resolveExecutionPath(args: readonly string[]): Invocation {
   let node = ROOT_COMMAND;
   let nearestGroup = ROOT_COMMAND;
   let index = 0;
@@ -52,10 +49,6 @@ function resolveExecutionPath(args: readonly string[], forceHelp: boolean): Invo
     }
 
     const token = args[index] ?? "";
-    if (token === "help" && index === args.length - 1) {
-      return { kind: "help", node };
-    }
-
     const child = findChild(node, token);
     if (child === undefined) {
       if (node.kind === "hybrid") {
@@ -75,8 +68,8 @@ function resolveExecutionPath(args: readonly string[], forceHelp: boolean): Invo
     }
   }
 
-  if (forceHelp || (node.kind === "group" && index === args.length)) {
-    return { kind: "help", node };
+  if (node.kind === "group" && index === args.length) {
+    return { kind: "incomplete", typedPath: args.join(" "), helpNode: node };
   }
   return { kind: "execute", node };
 }

@@ -7,15 +7,6 @@ import { join } from "node:path";
 
 const packageJson = JSON.parse(readFileSync("package.json", "utf8"));
 
-test("prints help text", () => {
-  const output = execFileSync("node", ["dist/cli.js", "--help"], {
-    encoding: "utf8"
-  });
-
-  assert.match(output, new RegExp(`TaskMux ${packageJson.version}`));
-  assert.match(output, /tmux/);
-});
-
 test("prints discoverable root help through the help command", () => {
   const output = execFileSync("node", ["dist/cli.js", "help"], {
     encoding: "utf8",
@@ -23,16 +14,20 @@ test("prints discoverable root help through the help command", () => {
   });
 
   assert.match(output, new RegExp(`TaskMux ${packageJson.version}`));
-  assert.match(output, /Commands:/);
+  assert.match(output, /Workflow:/);
+  assert.match(output, /Configuration:/);
+  assert.match(output, /Operations:/);
+  assert.match(output, /Data:/);
+  assert.match(output, /Support:/);
   assert.match(output, /\bhelp\b/);
   assert.match(output, /\bversion\b/);
   assert.match(output, /\bupdate\b/);
 });
 
-test("renders scoped group, nested-group, and leaf help without storage", () => {
+test("renders group, nested-group, and leaf help only through the canonical help command", () => {
   const env = { ...process.env, TASKMUX_HOME: "/path/that/does/not/exist" };
-  const task = execFileSync("node", ["dist/cli.js", "task", "--help"], { encoding: "utf8", env });
-  const taskRole = execFileSync("node", ["dist/cli.js", "task", "role", "help"], { encoding: "utf8", env });
+  const task = execFileSync("node", ["dist/cli.js", "help", "task"], { encoding: "utf8", env });
+  const taskRole = execFileSync("node", ["dist/cli.js", "help", "task", "role"], { encoding: "utf8", env });
   const rename = execFileSync("node", ["dist/cli.js", "help", "task", "role", "rename"], { encoding: "utf8", env });
   const create = execFileSync("node", ["dist/cli.js", "help", "task", "create"], { encoding: "utf8", env });
 
@@ -49,14 +44,16 @@ test("renders scoped group, nested-group, and leaf help without storage", () => 
   assert.match(create, /--template\s+Select a task template\./);
 });
 
-test("renders group help when a command group has no child", () => {
-  const output = execFileSync("node", ["dist/cli.js", "task", "role"], {
+test("rejects a bare command group and points to its canonical help path", () => {
+  const result = spawnSync("node", ["dist/cli.js", "task", "role"], {
     encoding: "utf8",
     env: { ...process.env, TASKMUX_HOME: "/path/that/does/not/exist" }
   });
 
-  assert.match(output, /TaskMux task role/);
-  assert.match(output, /\bchild\b/);
+  assert.equal(result.status, 2);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /^USAGE_ERROR: Command required after: task role\n\nTaskMux task role\n/);
+  assert.match(result.stderr, /Run `taskmux help task role`/);
 });
 
 test("prints an unknown path error before nearest scoped help", () => {
@@ -89,14 +86,6 @@ test("keeps unknown path JSON errors to one envelope", () => {
   assert.equal(result.stderr.trim().split("\n").length, 1);
 });
 
-test("prints package version", () => {
-  const output = execFileSync("node", ["dist/cli.js", "--version"], {
-    encoding: "utf8"
-  });
-
-  assert.equal(output.trim(), packageJson.version);
-});
-
 test("prints package version through the version command without storage", () => {
   const output = execFileSync("node", ["dist/cli.js", "version"], {
     encoding: "utf8",
@@ -106,20 +95,35 @@ test("prints package version through the version command without storage", () =>
   assert.equal(output.trim(), packageJson.version);
 });
 
-test("prints help text for the standard short flag", () => {
-  const output = execFileSync("node", ["dist/cli.js", "-h"], {
-    encoding: "utf8"
+test("rejects operands after the canonical version command", () => {
+  const result = spawnSync("node", ["dist/cli.js", "version", "extra"], {
+    encoding: "utf8",
+    env: { ...process.env, TASKMUX_HOME: "/path/that/does/not/exist" }
   });
 
-  assert.match(output, new RegExp(`TaskMux ${packageJson.version}`));
-  assert.match(output, /\bversion\b/);
+  assert.equal(result.status, 2);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /^USAGE_ERROR: Version usage: taskmux version$/m);
 });
 
-test("rejects the removed nonstandard help alias", () => {
-  const result = spawnSync("node", ["dist/cli.js", "-help"], { encoding: "utf8" });
+test("rejects every removed help and version alias", () => {
+  for (const alias of ["-h", "--help", "-help", "-v", "--version"]) {
+    const result = spawnSync("node", ["dist/cli.js", alias], { encoding: "utf8" });
+    assert.equal(result.status, 2, alias);
+    assert.equal(result.stdout, "", alias);
+    assert.match(result.stderr, new RegExp(`USAGE_ERROR: Unknown command: ${alias.replaceAll("-", "\\-")}`), alias);
+  }
+});
 
-  assert.equal(result.status, 2);
-  assert.match(result.stderr, /USAGE_ERROR: Unknown command: -help/);
+test("rejects scoped help aliases and treats help after a leaf as business data", () => {
+  const env = { ...process.env, TASKMUX_HOME: "/path/that/does/not/exist" };
+  const scoped = spawnSync("node", ["dist/cli.js", "task", "role", "help"], { encoding: "utf8", env });
+  const flag = spawnSync("node", ["dist/cli.js", "task", "--help"], { encoding: "utf8", env });
+
+  assert.equal(scoped.status, 2);
+  assert.match(scoped.stderr, /^USAGE_ERROR: Unknown command: task role help\n\nTaskMux task role\n/);
+  assert.equal(flag.status, 2);
+  assert.match(flag.stderr, /^USAGE_ERROR: Unknown command: task --help\n\nTaskMux task\n/);
 });
 
 test("prints shell completion scripts", () => {
@@ -142,18 +146,106 @@ test("generates path-aware completion from scoped catalog nodes", () => {
   const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], {
     encoding: "utf8"
   });
-  const taskRoleCase = bash.split("\n").find((line) => line.includes('"task role"')) ?? "";
-  const taskCreateCase = bash.split("\n").find((line) => line.includes('"task create"')) ?? "";
-  const completionCase = bash.split("\n").find((line) => line.includes('"completion"')) ?? "";
+  const complete = (words, cword) => spawnSync("bash", ["-c", `${bash}
+COMP_WORDS=(${words.map((word) => `'${word}'`).join(" ")})
+COMP_CWORD=${cword}
+_taskmux
+printf '%s\\n' "\${COMPREPLY[@]}"
+`], { encoding: "utf8" });
+  const taskRole = complete(["taskmux", "task", "role", ""], 3);
+  const taskCreate = complete(["taskmux", "task", "create", "--"], 3);
+  const taskTemplate = complete(["taskmux", "task", "create", "--template", ""], 4);
+  const completion = complete(["taskmux", "completion", ""], 2);
 
-  assert.match(bash, /help version update/);
-  assert.match(taskRoleCase, /child update rename remove/);
-  assert.doesNotMatch(taskRoleCase, /doctor|controller|agent/);
-  assert.match(taskCreateCase, /--template/);
-  assert.match(taskCreateCase, /feature bug review/);
-  assert.match(completionCase, /bash zsh fish/);
+  assert.match(bash, /immediate=\('task' 'operator'/);
+  assert.deepEqual(taskRole.stdout.trim().split("\n"), ["child", "update", "rename", "remove"]);
+  assert.doesNotMatch(taskRole.stdout, /doctor|controller|agent/);
+  assert.match(taskCreate.stdout, /^--template$/m);
+  assert.deepEqual(taskTemplate.stdout.trim().split("\n"), ["feature", "bug", "review"]);
+  assert.deepEqual(completion.stdout.trim().split("\n"), ["bash", "zsh", "fish", "install", "uninstall"]);
   assert.doesNotMatch(bash, /\bserve\b/);
   assert.equal(spawnSync("bash", ["-n"], { input: bash, encoding: "utf8" }).status, 0);
+});
+
+test("completion preserves catalog category order and never advertises removed aliases", () => {
+  const expectedRoot = [
+    "task", "operator",
+    "setup", "config", "agent", "role", "completion",
+    "controller", "doctor",
+    "backup", "export", "import", "prune",
+    "update", "version", "help"
+  ];
+  const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], { encoding: "utf8" });
+  const result = spawnSync("bash", ["-c", `${bash}
+COMP_WORDS=(taskmux "")
+COMP_CWORD=1
+_taskmux
+printf '%s\\n' "\${COMPREPLY[@]}"
+`], { encoding: "utf8" });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.stdout.trim().split("\n"), expectedRoot);
+  for (const alias of ["-h", "--help", "-v", "--version"]) {
+    assert.doesNotMatch(bash, new RegExp(`(?:^|[ '\\"])${alias.replaceAll("-", "\\-")}(?:$|[ '\\"])`));
+  }
+  assert.match(bash, /compopt -o nosort/);
+  const zsh = execFileSync("node", ["dist/cli.js", "completion", "zsh"], { encoding: "utf8" });
+  const fish = execFileSync("node", ["dist/cli.js", "completion", "fish"], { encoding: "utf8" });
+  assert.match(zsh, /compadd -V taskmux-catalog/);
+  assert.match(fish, /complete -c taskmux -f -k -a/);
+});
+
+test("completion offers options only for an option prefix and values only after their option", () => {
+  const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], { encoding: "utf8" });
+  const complete = (words, cword) => spawnSync("bash", ["-c", `${bash}
+COMP_WORDS=(${words.map((word) => `'${word}'`).join(" ")})
+COMP_CWORD=${cword}
+_taskmux
+printf '%s\\n' "\${COMPREPLY[@]}"
+`], { encoding: "utf8" });
+
+  const empty = complete(["taskmux", "task", "create", ""], 3);
+  const option = complete(["taskmux", "task", "create", "--"], 3);
+  const value = complete(["taskmux", "task", "create", "--template", ""], 4);
+
+  assert.equal(empty.status, 0, empty.stderr);
+  assert.equal(empty.stdout.trim(), "");
+  assert.match(option.stdout, /^--template$/m);
+  assert.doesNotMatch(option.stdout, /^feature$/m);
+  assert.deepEqual(value.stdout.trim().split("\n"), ["feature", "bug", "review"]);
+});
+
+test("completion suppresses unrelated file fallback but keeps catalog-declared file arguments", () => {
+  const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], { encoding: "utf8" });
+  const fish = execFileSync("node", ["dist/cli.js", "completion", "fish"], { encoding: "utf8" });
+  assert.doesNotMatch(bash, /complete .* -o default/);
+  assert.match(bash, /compgen -f/);
+  assert.match(fish, /if test \$argument_index -eq 0; and test \(count \$immediate\) -gt 0/);
+  assert.match(fish, /if test \(count \$value_keys\) -gt 0/);
+  assert.match(fish, /if test \(count \$options\) -gt 0/);
+  assert.match(fish, /__fish_complete_path/);
+
+  const root = mkdtempSync(join(tmpdir(), "taskmux-completion-files-"));
+  writeFileSync(join(root, "state.json"), "{}");
+  try {
+    const result = spawnSync("bash", ["-c", `${bash}
+cd "$1"
+COMP_WORDS=(taskmux import sta)
+COMP_CWORD=2
+_taskmux
+printf 'import:%s\\n' "\${COMPREPLY[@]}"
+COMP_WORDS=(taskmux task show sta)
+COMP_CWORD=3
+_taskmux
+printf 'show:%s\\n' "\${COMPREPLY[@]}"
+`, "completion-file-test", root], { encoding: "utf8" });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^import:state\.json$/m);
+    assert.doesNotMatch(result.stdout, /^show:state\.json$/m);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("completion scope is derived only from words before the current token", () => {
@@ -177,15 +269,25 @@ printf '%s\\n' "\${COMPREPLY[@]}"
   assert.deepEqual(bashResult.stdout.trim().split("\n").sort(), ["role", "roles"]);
 });
 
+test("completion follows canonical help command paths from the same catalog", () => {
+  const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], { encoding: "utf8" });
+  const result = spawnSync("bash", ["-c", `${bash}
+COMP_WORDS=(taskmux help task ro)
+COMP_CWORD=3
+_taskmux
+printf '%s\\n' "\${COMPREPLY[@]}"
+`], { encoding: "utf8" });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.stdout.trim().split("\n"), ["roles", "role"]);
+});
+
 test("hybrid child completion cases precede executable parents in every shell", () => {
   for (const shell of ["bash", "zsh", "fish"]) {
     const script = execFileSync("node", ["dist/cli.js", "completion", shell], { encoding: "utf8" });
     const lines = script.split("\n");
-    const child = lines.findIndex((line) => line.split("candidates=")[0]?.includes("task transcript export"));
-    const parent = lines.findIndex((line) => {
-      const selector = line.split("candidates=")[0] ?? "";
-      return selector.includes("task transcript") && !selector.includes("export");
-    });
+    const child = lines.findIndex((line) => /^\s*(?:case )?'task transcript export'/.test(line));
+    const parent = lines.findIndex((line) => /^\s*(?:case )?'task transcript'(?:\||\s|$)/.test(line));
 
     assert.notEqual(child, -1, `${shell} child case missing`);
     assert.notEqual(parent, -1, `${shell} parent case missing`);
@@ -194,7 +296,7 @@ test("hybrid child completion cases precede executable parents in every shell", 
 
   const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], { encoding: "utf8" });
   const bashResult = spawnSync("bash", ["-c", `${bash}
-COMP_WORDS=(taskmux task transcript export "")
+COMP_WORDS=(taskmux task transcript export "--")
 COMP_CWORD=4
 _taskmux
 printf '%s\\n' "\${COMPREPLY[@]}"
@@ -224,6 +326,7 @@ test("zsh completion works as an autoloaded fpath function after compinit", {
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /^version$/m);
     assert.match(result.stdout, /^role$/m);
+    assert.match(completion, /compadd -V taskmux-catalog/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -300,7 +403,7 @@ test("propagates npm update failures and rejects update operands", () => {
 });
 
 test("does not advertise removed compatibility commands", () => {
-  const help = execFileSync("node", ["dist/cli.js", "--help"], {
+  const help = execFileSync("node", ["dist/cli.js", "help"], {
     encoding: "utf8"
   });
   const completion = execFileSync("node", ["dist/cli.js", "completion", "bash"], {
