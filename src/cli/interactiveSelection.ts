@@ -7,7 +7,7 @@ import {
   type CandidateSet,
   type SelectionCandidate
 } from "./interactionCandidates.js";
-import { findInteractionPolicy } from "./interactionPolicy.js";
+import { findInteractionPolicy, type InteractionPolicy } from "./interactionPolicy.js";
 import type { CommandNode } from "./commandCatalog.js";
 
 export type SelectionIo = {
@@ -39,7 +39,7 @@ export async function resolveInteractiveArguments(
   let changed = false;
   let selectedActionTarget = false;
   for (const selector of policy.selectors) {
-    if (resolved[selector.argumentIndex] !== undefined) {
+    if (!selectorSlotIsMissing(resolved, selector.argumentIndex, policy.trailingOptions)) {
       continue;
     }
     const candidates = getSelectionCandidates(selector, store, resolved, context);
@@ -64,6 +64,36 @@ export async function resolveInteractiveArguments(
   }
 
   return changed ? { kind: "resolved", args: resolved } : { kind: "unchanged", args: resolved };
+}
+
+function selectorSlotIsMissing(
+  args: readonly string[],
+  argumentIndex: number,
+  trailingOptions: InteractionPolicy["trailingOptions"]
+): boolean {
+  const value = args[argumentIndex];
+  if (value === undefined) {
+    return true;
+  }
+  if (!value.startsWith("--") || trailingOptions === undefined) {
+    return false;
+  }
+
+  for (let index = argumentIndex; index < args.length; index += 1) {
+    const option = args[index] ?? "";
+    const kind = trailingOptions[option];
+    if (kind === undefined) {
+      return false;
+    }
+    if (kind === "value") {
+      const optionValue = args[index + 1];
+      if (optionValue === undefined || optionValue.startsWith("--")) {
+        return false;
+      }
+      index += 1;
+    }
+  }
+  return true;
 }
 
 export function allowsInteractiveSelection(args: readonly string[], globalJson: boolean): boolean {
