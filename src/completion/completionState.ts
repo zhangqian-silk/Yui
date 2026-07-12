@@ -149,6 +149,6 @@ function shellLabel(shell: CompletionShell): string {
   return shell[0].toUpperCase() + shell.slice(1);
 }
 
-function shellQuote(value: string): string {
+export function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
