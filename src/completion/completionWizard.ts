@@ -76,9 +76,13 @@ export async function runCompletionWizard(
     activate = activationAnswer === "" || activationAnswer === "y" || activationAnswer === "yes";
   }
   installCompletion(store, shell, installation, env, identity, activate);
-  return needsActivation && !activate
-    ? `Completion ${shell} script installed; activation still required.\n`
-    : `Completion ${shell} ${state.action.toLowerCase()}ed.\n`;
+  if (needsActivation && !activate) {
+    return `Completion ${shell} script installed; activation still required.\n`;
+  }
+  const result = `Completion ${shell} ${state.action.toLowerCase()}ed.\n`;
+  return needsActivation
+    ? `${result}The current shell is unchanged.\nRestart the current shell to activate completion: exec ${shell}\n`
+    : result;
 }
 
 function parseSelection(value: string, current: CompletionShell | undefined): CompletionShell {

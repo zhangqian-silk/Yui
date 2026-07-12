@@ -42,6 +42,18 @@ function runInteractive(args, input, env = {}) {
   });
 }
 
+function reloadHint(shell) {
+  return `The current shell is unchanged.\nRestart the current shell to activate completion: exec ${shell}`;
+}
+
+function assertOutputUsesHome(output, userHome, installation) {
+  assert.ok(installation);
+  assert.equal(installation.scriptPath.startsWith(`${userHome}/`), true);
+  assert.equal(installation.activationPath.startsWith(`${userHome}/`), true);
+  assert.equal(output.includes(installation.scriptPath), true);
+  assert.equal(output.includes(installation.activationPath), true);
+}
+
 test("config codec accepts supported completion installation records", () => {
   const home = createHome();
   const store = new FileTaskStore(home);
@@ -171,6 +183,7 @@ test("completion selection prompt advertises skip", async () => {
   });
   assert.match(output, /Choose shell by number or name \[zsh\] \(or skip\):/);
   assert.match(output, /Completion install skipped/);
+  assert.doesNotMatch(output, /Restart the current shell to activate completion/);
 });
 
 test("standalone completion install keeps the current shell as the blank default", async () => {
@@ -198,6 +211,7 @@ test("interactive install shows all shells and installs exactly one selected she
     XDG_DATA_HOME: join(userHome, "share")
   });
   const scriptPath = join(userHome, "share", "bash-completion", "completions", "taskmux");
+  const installation = new FileTaskStore(home).getConfig().completionInstallations?.bash;
 
   assert.match(output, /\|\s*#\s*\|\s*Shell\s*\|\s*Status\s*\|\s*Action\s*\|\s*Current\s*\|\s*Script\s*\|/);
   assert.match(output, /\|\s*1\s*\|\s*Bash\s*\|\s*Not installed\s*\|\s*Install\s*\|\s*yes\s*\|\s*\|/);
@@ -205,10 +219,12 @@ test("interactive install shows all shells and installs exactly one selected she
   assert.match(output, /Install using these paths\? \[Y\/n\/customize\]:/);
   assert.doesNotMatch(output, /Completion script path/);
   assert.match(output, /Update .*\.bashrc with the managed TaskMux block\? \[Y\/n\]:/);
+  assert.equal(output.includes(reloadHint("bash")), true);
   assert.equal(existsSync(scriptPath), true);
   assert.match(readFileSync(scriptPath, "utf8"), /taskmux-completion: managed shell=bash identity=taskmux/);
   assert.match(readFileSync(join(userHome, ".bashrc"), "utf8"), /taskmux completion shell=bash identity=taskmux/);
   assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(home, "config.json"), "utf8")).completionInstallations), ["bash"]);
+  assertOutputUsesHome(output, userHome, installation);
 });
 
 test("explicit activation decline leaves the installation repairable", async () => {
@@ -225,10 +241,16 @@ test("explicit activation decline leaves the installation repairable", async () 
 
   assert.match(output, /Update .*\.bashrc with the managed TaskMux block\? \[Y\/n\]:/);
   assert.match(output, /Completion bash script installed; activation still required/);
+  assert.doesNotMatch(output, /Restart the current shell to activate completion/);
   assert.equal(existsSync(join(userHome, ".bashrc")), false);
 
   const statusOutput = await runInteractive(["completion", "install"], "\nn\n", env);
   assert.match(statusOutput, /\|\s*Bash\s*\|\s*Needs repair\s*\|\s*Repair\s*\|/);
+  assert.doesNotMatch(statusOutput, /Restart the current shell to activate completion/);
+
+  const repairOutput = await runInteractive(["completion", "install"], "\n\n\n", env);
+  assert.match(repairOutput, /Completion bash repaired/);
+  assert.equal(repairOutput.includes(reloadHint("bash")), true);
 });
 
 test("only customize prompts for and persists custom full paths", async () => {
@@ -258,6 +280,37 @@ test("interactive install reuses recorded paths and offers Refresh", async () =>
 
   assert.match(output, /\|\s*Bash\s*\|\s*Installed\s*\|\s*Refresh\s*\|\s*yes\s*\|/);
   assert.match(output, new RegExp(JSON.parse(readFileSync(join(home, "config.json"), "utf8")).completionInstallations.bash.scriptPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(output, /Restart the current shell to activate completion/);
+});
+
+test("successful completion refresh explains how to activate the current shell", async () => {
+  const home = createHome();
+  const userHome = mkdtempSync(join(tmpdir(), "taskmux-user-"));
+  const env = { TASKMUX_HOME: home, HOME: userHome, SHELL: "/bin/bash", XDG_DATA_HOME: join(userHome, "share") };
+  await runInteractive(["completion", "install"], "\n\n\n", env);
+
+  const output = await runInteractive(["completion", "install"], "\n\n\n", env);
+  const installation = new FileTaskStore(home).getConfig().completionInstallations?.bash;
+
+  assert.match(output, /Completion bash refreshed/);
+  assert.equal(output.includes(reloadHint("bash")), true);
+  assertOutputUsesHome(output, userHome, installation);
+});
+
+test("custom non-automatic Fish activation shows the Fish restart command", async () => {
+  const home = createHome();
+  const userHome = mkdtempSync(join(tmpdir(), "taskmux-user-"));
+  const scriptPath = join(userHome, "custom", "taskmux.fish");
+  const activationPath = join(userHome, "custom", "config.fish");
+  const output = await runInteractive(
+    ["completion", "install"],
+    `fish\ncustomize\n${scriptPath}\n${activationPath}\n\n`,
+    { TASKMUX_HOME: home, HOME: userHome, SHELL: "/bin/fish", XDG_CONFIG_HOME: join(userHome, ".config") }
+  );
+  const installation = new FileTaskStore(home).getConfig().completionInstallations?.fish;
+
+  assert.equal(output.includes(reloadHint("fish")), true);
+  assertOutputUsesHome(output, userHome, installation);
 });
 
 test("interactive completion JSON mode fails before storage", () => {
@@ -290,6 +343,7 @@ test("interactive uninstall removes only the selected managed installation", asy
 
   assert.match(output, /Remove now\? \[y\/N\]:/);
   assert.match(output, /Completion bash uninstalled/);
+  assert.doesNotMatch(output, /Restart the current shell to activate completion/);
   assert.equal(existsSync(scriptPath), false);
   assert.equal(JSON.parse(readFileSync(join(home, "config.json"), "utf8")).completionInstallations, undefined);
   assert.doesNotMatch(readFileSync(join(userHome, ".bashrc"), "utf8"), /taskmux completion/);
@@ -321,7 +375,11 @@ test("activation failure retains a repairable installation record", async () => 
   writeFileSync(join(userHome, ".bashrc"), "# >>> taskmux completion shell=bash identity=taskmux >>>\n");
   const env = { TASKMUX_HOME: home, HOME: userHome, SHELL: "/bin/bash", XDG_DATA_HOME: join(userHome, "share") };
 
-  await assert.rejects(runInteractive(["completion", "install"], "\n\ny\n", env), /ambiguous TaskMux activation block/);
+  await assert.rejects(runInteractive(["completion", "install"], "\n\ny\n", env), (error) => {
+    assert.match(error.message, /ambiguous TaskMux activation block/);
+    assert.doesNotMatch(error.message, /Restart the current shell to activate completion/);
+    return true;
+  });
 
   const config = new FileTaskStore(home).getConfig();
   assert.ok(config.completionInstallations?.bash);
@@ -404,7 +462,28 @@ test("setup reuses the completion wizard for exactly one selected shell", async 
   assert.equal(output.match(/Completion installation/g)?.length, 1);
   assert.deepEqual(Object.keys(config.completionInstallations), ["fish"]);
   assert.equal(existsSync(config.completionInstallations.fish.scriptPath), true);
+  assertOutputUsesHome(output, userHome, config.completionInstallations.fish);
+  assert.doesNotMatch(output, /Restart the current shell to activate completion/);
   assert.match(output, /TaskMux setup complete/);
+});
+
+test("setup surfaces the shared Zsh restart guidance using isolated paths", async () => {
+  const parent = mkdtempSync(join(tmpdir(), "taskmux-setup-completion-zsh-"));
+  const home = join(parent, "state");
+  const userHome = join(parent, "user");
+  const output = await runInteractive(["setup"], "1\n2\n\n\n", {
+    TASKMUX_HOME: home,
+    HOME: userHome,
+    ZDOTDIR: userHome,
+    SHELL: "/bin/zsh",
+    TASKMUX_TMUX_BIN: process.execPath
+  });
+  const installation = new FileTaskStore(home).getConfig().completionInstallations?.zsh;
+
+  assert.match(output, /Completion zsh installed/);
+  assert.equal(output.includes(reloadHint("zsh")), true);
+  assert.match(output, /TaskMux setup complete/);
+  assertOutputUsesHome(output, userHome, installation);
 });
 
 test("setup defaults completion shell selection to skip", async () => {
@@ -421,6 +500,7 @@ test("setup defaults completion shell selection to skip", async () => {
 
   assert.match(output, /Choose shell by number or name \[skip\]:/);
   assert.match(output, /Completion install skipped/);
+  assert.doesNotMatch(output, /Restart the current shell to activate completion/);
   assert.equal(config.completionInstallations, undefined);
   assert.equal(existsSync(join(userHome, ".zfunc", "_taskmux")), false);
   assert.match(output, /TaskMux setup complete/);
