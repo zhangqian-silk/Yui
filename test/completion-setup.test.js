@@ -46,12 +46,20 @@ function reloadHint(shell) {
   return `The current shell is unchanged.\nRestart the current shell to activate completion: exec ${shell}`;
 }
 
+function switchHint(shell) {
+  return `The current shell is unchanged.\nSwitch this terminal to ${shell} to activate completion (replaces the current shell process): exec ${shell}`;
+}
+
+function customActivationHint(shell, activationPath) {
+  const quotedPath = `'${activationPath.replaceAll("'", "'\\''")}'`;
+  return `The current shell is unchanged.\nFrom a ${shell} session, load the custom activation file: source ${quotedPath}`;
+}
+
 function assertOutputUsesHome(output, userHome, installation) {
   assert.ok(installation);
   assert.equal(installation.scriptPath.startsWith(`${userHome}/`), true);
   assert.equal(installation.activationPath.startsWith(`${userHome}/`), true);
-  assert.equal(output.includes(installation.scriptPath), true);
-  assert.equal(output.includes(installation.activationPath), true);
+  assert.equal(output.includes(userHome), true);
 }
 
 test("config codec accepts supported completion installation records", () => {
@@ -227,6 +235,28 @@ test("interactive install shows all shells and installs exactly one selected she
   assertOutputUsesHome(output, userHome, installation);
 });
 
+for (const { selected, current } of [
+  { selected: "bash", current: "zsh" },
+  { selected: "zsh", current: "bash" }
+]) {
+  test(`standard ${selected} activation selected from ${current} describes switching shells`, async () => {
+    const home = createHome();
+    const userHome = mkdtempSync(join(tmpdir(), "taskmux-user-"));
+    const output = await runInteractive(["completion", "install"], `${selected}\n\n\n`, {
+      TASKMUX_HOME: home,
+      HOME: userHome,
+      SHELL: `/bin/${current}`,
+      XDG_DATA_HOME: join(userHome, "share"),
+      ZDOTDIR: userHome
+    });
+    const installation = new FileTaskStore(home).getConfig().completionInstallations?.[selected];
+
+    assert.equal(output.includes(switchHint(selected)), true);
+    assert.equal(output.includes(reloadHint(selected)), false);
+    assertOutputUsesHome(output, userHome, installation);
+  });
+}
+
 test("explicit activation decline leaves the installation repairable", async () => {
   const home = createHome();
   const userHome = mkdtempSync(join(tmpdir(), "taskmux-user-"));
@@ -297,18 +327,74 @@ test("successful completion refresh explains how to activate the current shell",
   assertOutputUsesHome(output, userHome, installation);
 });
 
-test("custom non-automatic Fish activation shows the Fish restart command", async () => {
+for (const shell of ["bash", "zsh", "fish"]) {
+  test(`custom ${shell} activation instructs the selected shell to source its file`, async () => {
+    const home = createHome();
+    const userHome = mkdtempSync(join(tmpdir(), "taskmux-user-"));
+    const scriptPath = join(userHome, "custom scripts", `taskmux.${shell}`);
+    const activationPath = join(userHome, "custom startup's", `${shell} rc`);
+    const output = await runInteractive(
+      ["completion", "install"],
+      `${shell}\ncustomize\n${scriptPath}\n${activationPath}\n\n`,
+      {
+        TASKMUX_HOME: home,
+        HOME: userHome,
+        SHELL: `/bin/${shell}`,
+        XDG_DATA_HOME: join(userHome, "share"),
+        XDG_CONFIG_HOME: join(userHome, ".config"),
+        ZDOTDIR: userHome
+      }
+    );
+    const installation = new FileTaskStore(home).getConfig().completionInstallations?.[shell];
+
+    assert.equal(output.includes(customActivationHint(shell, activationPath)), true);
+    assert.doesNotMatch(output, new RegExp(`exec ${shell}`));
+    assertOutputUsesHome(output, userHome, installation);
+  });
+}
+
+test("refresh keeps recorded custom activation guidance instead of treating it as the default", async () => {
   const home = createHome();
   const userHome = mkdtempSync(join(tmpdir(), "taskmux-user-"));
-  const scriptPath = join(userHome, "custom", "taskmux.fish");
-  const activationPath = join(userHome, "custom", "config.fish");
+  const scriptPath = join(userHome, "custom scripts", "taskmux.bash");
+  const activationPath = join(userHome, "custom startup", "bash rc");
+  const env = {
+    TASKMUX_HOME: home,
+    HOME: userHome,
+    SHELL: "/bin/bash",
+    XDG_DATA_HOME: join(userHome, "share")
+  };
+  await runInteractive(
+    ["completion", "install"],
+    `bash\ncustomize\n${scriptPath}\n${activationPath}\n\n`,
+    env
+  );
+
+  const output = await runInteractive(["completion", "install"], "bash\n\n\n", env);
+
+  assert.match(output, /Completion bash refreshed/);
+  assert.equal(output.includes(customActivationHint("bash", activationPath)), true);
+  assert.doesNotMatch(output, /exec bash/);
+});
+
+test("custom Fish script with the environment default activation path uses restart guidance", async () => {
+  const home = createHome();
+  const userHome = mkdtempSync(join(tmpdir(), "taskmux-user-"));
+  const scriptPath = join(userHome, "custom scripts", "taskmux.fish");
+  const activationPath = join(userHome, ".config", "fish", "config.fish");
   const output = await runInteractive(
     ["completion", "install"],
-    `fish\ncustomize\n${scriptPath}\n${activationPath}\n\n`,
-    { TASKMUX_HOME: home, HOME: userHome, SHELL: "/bin/fish", XDG_CONFIG_HOME: join(userHome, ".config") }
+    `fish\ncustomize\n${scriptPath}\n\n\n`,
+    {
+      TASKMUX_HOME: home,
+      HOME: userHome,
+      SHELL: "/bin/fish",
+      XDG_CONFIG_HOME: join(userHome, ".config")
+    }
   );
   const installation = new FileTaskStore(home).getConfig().completionInstallations?.fish;
 
+  assert.equal(installation?.activationPath, activationPath);
   assert.equal(output.includes(reloadHint("fish")), true);
   assertOutputUsesHome(output, userHome, installation);
 });

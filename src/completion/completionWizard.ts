@@ -9,6 +9,7 @@ import {
   currentCompletionShell,
   inspectCompletionStates,
   renderCompletionStateTable,
+  shellQuote,
   suggestedCompletionInstallation
 } from "./completionState.js";
 
@@ -81,8 +82,24 @@ export async function runCompletionWizard(
   }
   const result = `Completion ${shell} ${state.action.toLowerCase()}ed.\n`;
   return needsActivation
-    ? `${result}The current shell is unchanged.\nRestart the current shell to activate completion: exec ${shell}\n`
+    ? `${result}${activationGuidance(shell, installation, env, identity)}`
     : result;
+}
+
+function activationGuidance(
+  shell: CompletionShell,
+  installation: CompletionInstallation,
+  env: NodeJS.ProcessEnv,
+  identity: CliIdentity
+): string {
+  const unchanged = "The current shell is unchanged.\n";
+  const defaultActivationPath = suggestedCompletionInstallation(shell, env, identity).activationPath;
+  if (installation.activationPath !== defaultActivationPath) {
+    return `${unchanged}From a ${shell} session, load the custom activation file: source ${shellQuote(installation.activationPath)}\n`;
+  }
+  return currentCompletionShell(env) === shell
+    ? `${unchanged}Restart the current shell to activate completion: exec ${shell}\n`
+    : `${unchanged}Switch this terminal to ${shell} to activate completion (replaces the current shell process): exec ${shell}\n`;
 }
 
 function parseSelection(value: string, current: CompletionShell | undefined): CompletionShell {
