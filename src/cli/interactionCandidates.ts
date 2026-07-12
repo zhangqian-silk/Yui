@@ -1,4 +1,5 @@
 import type { TableColumn } from "../output/table.js";
+import { isSystemRoleName, SYSTEM_ROLE_NAMES, systemRoleDescription } from "../role/systemRoles.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { ArgumentSelector } from "./interactionPolicy.js";
 
@@ -47,6 +48,55 @@ export function getSelectionCandidates(
         emptyMessage: "No agents are configured. Run `taskmux agent add <agent-id> --command <command>`.",
         overflowHint: "Run `taskmux agent list` and pass the selected agent explicitly."
       };
+    }
+    case "global-roles-for-show": {
+      const configured = new Map(store.listGlobalRoles().map((role) => [role.name, role]));
+      const names = new Set([...SYSTEM_ROLE_NAMES, ...configured.keys()]);
+      return globalRoleCandidateSet(
+        [...names].sort((left, right) => left.localeCompare(right)).map((name) => {
+          const role = configured.get(name);
+          return {
+            value: name,
+            cells: [
+              name,
+              role?.agent ?? "?",
+              isSystemRoleName(name)
+                ? `system:${systemRoleDescription(name)}${role === undefined ? " (not configured)" : ""}`
+                : "custom"
+            ]
+          };
+        }),
+        context.preferredRole,
+        "No global roles are available."
+      );
+    }
+    case "removable-global-roles": {
+      const roles = store.listGlobalRoles()
+        .filter((role) => !isSystemRoleName(role.name))
+        .sort((left, right) => left.name.localeCompare(right.name));
+      return globalRoleCandidateSet(
+        roles.map((role) => ({
+          value: role.name,
+          cells: [role.name, role.agent, "custom"]
+        })),
+        context.preferredRole,
+        "No removable global roles are configured. Run `taskmux role add <role> --agent <agent-id>`."
+      );
+    }
+    case "configured-global-roles": {
+      const roles = store.listGlobalRoles().sort((left, right) => left.name.localeCompare(right.name));
+      return globalRoleCandidateSet(
+        roles.map((role) => ({
+          value: role.name,
+          cells: [
+            role.name,
+            role.agent,
+            isSystemRoleName(role.name) ? `system:${systemRoleDescription(role.name)}` : "custom"
+          ]
+        })),
+        context.preferredRole,
+        "No configured global roles are available. Run `taskmux role add <role> --agent <agent-id>`."
+      );
     }
     case "tasks": {
       const config = store.getConfig();
@@ -103,4 +153,24 @@ export function getSelectionCandidates(
       };
     }
   }
+}
+
+function globalRoleCandidateSet(
+  candidates: SelectionCandidate[],
+  defaultValue: string | undefined,
+  emptyMessage: string
+): CandidateSet {
+  return {
+    entityLabel: "global role",
+    title: "Select global role",
+    columns: [
+      { header: "Role", minWidth: 4, maxWidth: 24 },
+      { header: "Agent", minWidth: 5, maxWidth: 20 },
+      { header: "Kind", minWidth: 6, maxWidth: 46 }
+    ],
+    candidates,
+    defaultValue,
+    emptyMessage,
+    overflowHint: "Run `taskmux role list` and pass the selected role explicitly."
+  };
 }

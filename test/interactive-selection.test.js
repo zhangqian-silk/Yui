@@ -115,6 +115,49 @@ test("explicit, non-terminal, and JSON invocations remain deterministic", ptyTes
   });
 });
 
+test("new selector policies preserve explicit, non-terminal, and JSON command behavior", ptyTest, () => {
+  const home = createTaskWithLeader();
+  createGlobalRole(home, "reviewer");
+
+  for (const [args, expected] of [
+    [["config", "set", "default-agent", "codex"], /Set default-agent: codex/],
+    [["role", "show", "reviewer"], /Role: reviewer/],
+    [["task", "show", "task-1"], /Task: task-1/]
+  ]) {
+    const explicit = runInTerminal(args, "", home);
+    assert.equal(explicit.status, 0, explicit.output);
+    assert.doesNotMatch(explicit.output, /^Select /m);
+    assert.match(explicit.output, expected);
+  }
+
+  for (const [args, expected] of [
+    [["config", "set", "default-agent"], /USAGE_ERROR: Config value is required/],
+    [["role", "show"], /USAGE_ERROR: Role name is required/],
+    [["task", "show"], /USAGE_ERROR: Task id is required/]
+  ]) {
+    const nonTerminal = spawnSync(process.execPath, [cli, ...args], {
+      encoding: "utf8",
+      env: isolatedEnv(home)
+    });
+    assert.equal(nonTerminal.status, 2);
+    assert.doesNotMatch(`${nonTerminal.stdout}${nonTerminal.stderr}`, /^Select /m);
+    assert.match(nonTerminal.stderr, expected);
+  }
+
+  const json = spawnSync(process.execPath, [cli, "config", "set", "default-agent", "--json"], {
+    encoding: "utf8",
+    env: isolatedEnv(home)
+  });
+  assert.equal(json.status, 2);
+  assert.doesNotMatch(`${json.stdout}${json.stderr}`, /^Select /m);
+  assert.deepEqual(JSON.parse(json.stderr), {
+    ok: false,
+    code: "USAGE_ERROR",
+    message: "Config value is required.",
+    details: {}
+  });
+});
+
 test("Controller-routed selection starts the Controller before reading candidates", ptyTest, async () => {
   const home = createHome();
   run(["agent", "add", "codex", "--command", "codex"], home);
@@ -147,6 +190,235 @@ test("Controller-routed selection starts the Controller before reading candidate
       timeout: 5_000
     });
   }
+});
+
+test("config set default-agent selects a configured agent in a real terminal", ptyTest, () => {
+  const home = createHome();
+  run(["agent", "add", "codex", "--command", "codex"], home);
+
+  const result = runInTerminal(["config", "set", "default-agent"], "\n", home);
+
+  assert.equal(result.status, 0, result.output);
+  assert.match(result.output, /Select agent/);
+  assert.match(result.output, /Set default-agent: codex/);
+  assert.match(run(["config", "show"], home), /default-agent\s+\|\s+configured\s+\|\s+agent=codex/);
+});
+
+test("role show selects system placeholders after Controller recovery", ptyTest, async () => {
+  const home = createHome();
+  let discoveryAtPrompt = null;
+
+  try {
+    const result = await runInTerminalSteps(
+      ["role", "show"],
+      [{
+        prompt: "Choose global role",
+        answer: "operator\n",
+        onPrompt() {
+          const discoveryPath = join(home, "runtime", "controller.json");
+          discoveryAtPrompt = existsSync(discoveryPath)
+            ? JSON.parse(readFileSync(discoveryPath, "utf8"))
+            : null;
+        }
+      }],
+      home,
+      { TASKMUX_CONTROLLER_MODE: "auto" }
+    );
+
+    assert.equal(result.status, 0, result.output);
+    assert.equal(typeof discoveryAtPrompt?.pid, "number");
+    assert.match(result.output, /Role: operator/);
+    assert.match(result.output, /System: global user-facing CLI operator/);
+    assert.match(result.output, /Agent: \?/);
+  } finally {
+    stopController(home);
+  }
+});
+
+test("role remove excludes system roles and confirms an interactively selected custom role", ptyTest, () => {
+  const home = createHome();
+  createGlobalRole(home, "reviewer");
+
+  const cancelled = runInTerminal(["role", "remove"], "\n\n", home);
+
+  assert.equal(cancelled.status, 0, cancelled.output);
+  assert.match(cancelled.output, /Select global role/);
+  assert.match(cancelled.output, /reviewer/);
+  assert.doesNotMatch(cancelled.output, /\|\s+(operator|leader)\s+\|/);
+  assert.match(cancelled.output, /Remove role reviewer\? \[y\/N\]:/);
+  assert.match(cancelled.output, /Cancelled\./);
+  assert.match(run(["role", "show", "reviewer"], home), /Role: reviewer/);
+});
+
+test("role enter selects configured roles but not missing system placeholders", ptyTest, () => {
+  const home = createHome();
+  createGlobalRole(home, "reviewer", "true");
+
+  const result = runInTerminal(["role", "enter"], "\n", home);
+
+  assert.equal(result.status, 0, result.output);
+  assert.match(result.output, /Select global role/);
+  assert.match(result.output, /reviewer/);
+  assert.doesNotMatch(result.output, /\|\s+(operator|leader)\s+\|/);
+  assert.match(result.output, /Exited role reviewer/);
+});
+
+test("single-Task commands select from active and archived stored Tasks", ptyTest, () => {
+  const home = createTaskWithLeader();
+  run(["task", "create", "Archived task"], home);
+  run(["task", "archive", "task-2"], home);
+
+  const show = runInTerminal(["task", "show"], "task-2\n", home);
+  assert.equal(show.status, 0, show.output);
+  assert.match(show.output, /Select task/);
+  assert.match(show.output, /Archived task/);
+  assert.match(show.output, /Task: task-2/);
+  assert.match(show.output, /Archived: yes/);
+
+  const topics = runInTerminal(["task", "topic", "list"], "task-1\n", home);
+  assert.equal(topics.status, 0, topics.output);
+  assert.match(topics.output, /Select task/);
+  assert.match(topics.output, /Task topics: task-1/);
+});
+
+test("task status and transcript export resolve Task then TaskRole", ptyTest, async () => {
+  const home = createTaskWithLeader();
+
+  const status = await runInTerminalSteps(
+    ["task", "status"],
+    [
+      { prompt: "Choose task", answer: "\n" },
+      { prompt: "Choose task role", answer: "\n" }
+    ],
+    home
+  );
+  assert.equal(status.status, 0, status.output);
+  assert.match(status.output, /Task: task-1/);
+  assert.match(status.output, /Role: leader/);
+
+  const transcript = await runInTerminalSteps(
+    ["task", "transcript", "export"],
+    [
+      { prompt: "Choose task", answer: "\n" },
+      { prompt: "Choose task role", answer: "\n" }
+    ],
+    home
+  );
+  assert.equal(transcript.status, 0, transcript.output);
+  assert.match(transcript.output, /No transcript captured/);
+});
+
+test("selectors insert omitted references before complete command options", ptyTest, async () => {
+  const home = createTaskWithLeader();
+  const { FileTaskStore } = await import("../dist/storage/taskStore.js");
+  new FileTaskStore(home).saveTranscript("task-1", "leader", "stored transcript\n");
+
+  const context = runInTerminal(["task", "context", "--include-transcripts"], "\n", home);
+  assert.equal(context.status, 0, context.output);
+  assert.match(context.output, /Select task/);
+  assert.match(context.output, /^Task Context$/m);
+
+  const transcript = await runInTerminalSteps(
+    ["task", "transcript", "export", "--format", "markdown"],
+    [
+      { prompt: "Choose task", answer: "\n" },
+      { prompt: "Choose task role", answer: "\n" }
+    ],
+    home
+  );
+  assert.equal(transcript.status, 0, transcript.output);
+  assert.match(transcript.output, /# Transcript task-1 leader/);
+  assert.match(transcript.output, /stored transcript/);
+});
+
+test("unknown or incomplete trailing options never trigger selection", ptyTest, () => {
+  const home = createTaskWithLeader();
+
+  for (const args of [
+    ["task", "context", "--unknown"],
+    ["task", "context", "--format"]
+  ]) {
+    const result = runInTerminal(args, "", home);
+    assert.equal(result.status, 3, result.output);
+    assert.doesNotMatch(result.output, /Select task/);
+    assert.match(result.output, /TASK_NOT_FOUND: Task not found: --/);
+  }
+
+  const structured = runInTerminal(["task", "context", "--format", "json"], "", home);
+  assert.equal(structured.status, 3, structured.output);
+  assert.doesNotMatch(structured.output, /Select task/);
+  assert.match(structured.output, /TASK_NOT_FOUND: Task not found: --format/);
+});
+
+test("Task and role environment scope bypasses dependent status selection", ptyTest, () => {
+  const home = createTaskWithLeader();
+
+  const result = runInTerminal(
+    ["task", "status"],
+    "",
+    home,
+    { TASKMUX_TASK_ID: "task-1", TASKMUX_ROLE: "leader" }
+  );
+
+  assert.equal(result.status, 0, result.output);
+  assert.doesNotMatch(result.output, /Select task/);
+  assert.doesNotMatch(result.output, /Select task role/);
+  assert.match(result.output, /Task: task-1/);
+  assert.match(result.output, /Role: leader/);
+});
+
+test("explicit transcript export scope overrides Task and role environment scope", ptyTest, async () => {
+  const home = createTaskWithLeader();
+  run(["task", "create", "Explicit task"], home);
+  const { FileTaskStore } = await import("../dist/storage/taskStore.js");
+  new FileTaskStore(home).saveTranscript("task-2", "leader", "explicit-task-transcript\n");
+
+  const result = runInTerminal(
+    ["task", "transcript", "export", "task-2", "leader"],
+    "",
+    home,
+    { TASKMUX_TASK_ID: "task-1", TASKMUX_ROLE: "missing-role" }
+  );
+
+  assert.equal(result.status, 0, result.output);
+  assert.doesNotMatch(result.output, /Select task/);
+  assert.doesNotMatch(result.output, /Select task role/);
+  assert.match(result.output, /explicit-task-transcript/);
+});
+
+test("Task and role environment scope is inserted before transcript export options", ptyTest, async () => {
+  const home = createTaskWithLeader();
+  const { FileTaskStore } = await import("../dist/storage/taskStore.js");
+  new FileTaskStore(home).saveTranscript("task-1", "leader", "scoped transcript\n");
+
+  const result = runInTerminal(
+    ["task", "transcript", "export", "--format", "markdown"],
+    "",
+    home,
+    { TASKMUX_TASK_ID: "task-1", TASKMUX_ROLE: "leader" }
+  );
+
+  assert.equal(result.status, 0, result.output);
+  assert.doesNotMatch(result.output, /Select task/);
+  assert.doesNotMatch(result.output, /Select task role/);
+  assert.match(result.output, /# Transcript task-1 leader/);
+  assert.match(result.output, /scoped transcript/);
+});
+
+test("task delete asks for default-No confirmation only after interactive selection", ptyTest, () => {
+  const home = createTaskWithLeader();
+
+  const cancelled = runInTerminal(["task", "delete"], "\n\n", home);
+
+  assert.equal(cancelled.status, 0, cancelled.output);
+  assert.match(cancelled.output, /Delete task task-1\? \[y\/N\]:/);
+  assert.match(cancelled.output, /Cancelled\./);
+  assert.match(run(["task", "show", "task-1"], home), /Task: task-1/);
+
+  const explicit = runInTerminal(["task", "delete", "task-1"], "", home);
+  assert.equal(explicit.status, 0, explicit.output);
+  assert.doesNotMatch(explicit.output, /Delete task task-1\?/);
+  assert.match(explicit.output, /Deleted task task-1/);
 });
 
 test("an explicit scoped role overrides TASKMUX_ROLE", ptyTest, () => {
@@ -287,6 +559,79 @@ test("interaction policy validation rejects missing dependencies and incompatibl
   }]), /dependency must reference an earlier selector/);
 });
 
+test("interaction policies cover the approved read and delete command matrix", async () => {
+  const [{ routeInvocation }, { findInteractionPolicy }] = await Promise.all([
+    import("../dist/cli/invocationRouter.js"),
+    import("../dist/cli/interactionPolicy.js")
+  ]);
+  const expected = new Map([
+    ["config set default-agent", [[3, "configured-agents"]]],
+    ["role show", [[2, "global-roles-for-show"]]],
+    ["role remove", [[2, "removable-global-roles"]]],
+    ["role enter", [[2, "configured-global-roles"]]],
+    ...[
+      "task show", "task open", "task context", "task roles", "task comments",
+      "task events", "task activity", "task timeline"
+    ].map((path) => [path, [[2, "tasks"]]]),
+    ["task topic list", [[3, "tasks"]]],
+    ...["task status", "task tail", "task transcript"].map((path) => [path, [
+      [2, "tasks"], [3, "task-roles"]
+    ]]),
+    ["task transcript export", [[3, "tasks"], [4, "task-roles"]]],
+    ["task delete", [[2, "tasks"]]]
+  ]);
+
+  for (const [path, selectors] of expected) {
+    const invocation = routeInvocation(path.split(" "));
+    assert.equal(invocation.kind, "execute", path);
+    const policy = findInteractionPolicy(invocation.node);
+    assert.ok(policy, path);
+    assert.deepEqual(
+      policy.selectors.map((selector) => [selector.argumentIndex, selector.provider]),
+      selectors,
+      path
+    );
+  }
+});
+
+test("global-role providers mirror show, remove, and enter command domains", async () => {
+  const [{ FileTaskStore }, { getSelectionCandidates }] = await Promise.all([
+    import("../dist/storage/taskStore.js"),
+    import("../dist/cli/interactionCandidates.js")
+  ]);
+  const home = createHome();
+  createGlobalRole(home, "reviewer");
+  const store = new FileTaskStore(home);
+
+  const show = getSelectionCandidates({
+    argumentIndex: 2,
+    entity: "global-role",
+    provider: "global-roles-for-show",
+    actionTarget: true
+  }, store, ["role", "show"]);
+  assert.deepEqual(show.candidates.map(({ value }) => value), ["leader", "operator", "reviewer"]);
+  assert.deepEqual(
+    show.candidates.filter(({ value }) => value !== "reviewer").map(({ cells }) => cells[1]),
+    ["?", "?"]
+  );
+
+  const removable = getSelectionCandidates({
+    argumentIndex: 2,
+    entity: "global-role",
+    provider: "removable-global-roles",
+    actionTarget: true
+  }, store, ["role", "remove"]);
+  assert.deepEqual(removable.candidates.map(({ value }) => value), ["reviewer"]);
+
+  const configured = getSelectionCandidates({
+    argumentIndex: 2,
+    entity: "global-role",
+    provider: "configured-global-roles",
+    actionTarget: true
+  }, store, ["role", "enter"]);
+  assert.deepEqual(configured.candidates.map(({ value }) => value), ["reviewer"]);
+});
+
 function createHome() {
   const home = mkdtempSync(join(tmpdir(), "taskmux-interactive-"));
   mkdirSync(home, { recursive: true });
@@ -305,6 +650,12 @@ function createTaskWithLeader() {
   run(["config", "set", "default-workspace", home], home);
   run(["task", "create", "Interactive task"], home);
   return home;
+}
+
+function createGlobalRole(home, name, command = "codex") {
+  run(["agent", "add", "role-agent", "--command", command], home);
+  run(["config", "set", "default-workspace", home], home);
+  run(["role", "add", name, "--agent", "role-agent", "--workspace", home], home);
 }
 
 function run(args, home) {
@@ -388,6 +739,14 @@ function runInTerminalSteps(args, steps, home, extraEnv = {}) {
       child.stdin.end();
       resolve({ status, output });
     });
+  });
+}
+
+function stopController(home) {
+  spawnSync(process.execPath, [cli, "controller", "stop"], {
+    encoding: "utf8",
+    env: { ...isolatedEnv(home), TASKMUX_CONTROLLER_MODE: "auto" },
+    timeout: 5_000
   });
 }
 

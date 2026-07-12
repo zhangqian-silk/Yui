@@ -1,6 +1,12 @@
 import { findChild, ROOT_COMMAND, type CommandNode } from "./commandCatalog.js";
 
-export type CandidateProviderName = "configured-agents" | "tasks" | "task-roles";
+export type CandidateProviderName =
+  | "configured-agents"
+  | "global-roles-for-show"
+  | "removable-global-roles"
+  | "configured-global-roles"
+  | "tasks"
+  | "task-roles";
 export type SelectableEntity = "agent" | "global-role" | "task" | "task-role";
 
 export type ArgumentSelector = {
@@ -14,6 +20,7 @@ export type ArgumentSelector = {
 export type InteractionPolicy = {
   commandPath: readonly string[];
   selectors: readonly ArgumentSelector[];
+  trailingOptions?: Readonly<Record<string, "flag" | "value">>;
   confirmation?: {
     action: string;
     targetArgumentIndex: number;
@@ -35,6 +42,48 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = [
     confirmation: { action: "Remove agent", targetArgumentIndex: 2 }
   },
   {
+    commandPath: ["config", "set", "default-agent"],
+    selectors: [
+      { argumentIndex: 3, entity: "agent", provider: "configured-agents", actionTarget: true }
+    ]
+  },
+  {
+    commandPath: ["role", "show"],
+    selectors: [
+      { argumentIndex: 2, entity: "global-role", provider: "global-roles-for-show", actionTarget: true }
+    ]
+  },
+  {
+    commandPath: ["role", "remove"],
+    selectors: [
+      { argumentIndex: 2, entity: "global-role", provider: "removable-global-roles", actionTarget: true }
+    ],
+    confirmation: { action: "Remove role", targetArgumentIndex: 2 }
+  },
+  {
+    commandPath: ["role", "enter"],
+    selectors: [
+      { argumentIndex: 2, entity: "global-role", provider: "configured-global-roles", actionTarget: true }
+    ]
+  },
+  ...[
+    "show", "open", "context", "roles", "comments", "events", "activity", "timeline"
+  ].map((command): InteractionPolicy => ({
+    commandPath: ["task", command],
+    selectors: [
+      { argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true }
+    ],
+    ...(command === "context"
+      ? { trailingOptions: { "--format": "value", "--include-transcripts": "flag" } as const }
+      : {})
+  })),
+  {
+    commandPath: ["task", "topic", "list"],
+    selectors: [
+      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true }
+    ]
+  },
+  {
     commandPath: ["task", "detail"],
     selectors: [
       { argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true },
@@ -46,6 +95,40 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = [
         actionTarget: true
       }
     ]
+  },
+  ...["status", "tail", "transcript"].map((command): InteractionPolicy => ({
+    commandPath: ["task", command],
+    selectors: [
+      { argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true },
+      {
+        argumentIndex: 3,
+        entity: "task-role",
+        provider: "task-roles",
+        dependsOn: 2,
+        actionTarget: true
+      }
+    ]
+  })),
+  {
+    commandPath: ["task", "transcript", "export"],
+    selectors: [
+      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
+      {
+        argumentIndex: 4,
+        entity: "task-role",
+        provider: "task-roles",
+        dependsOn: 3,
+        actionTarget: true
+      }
+    ],
+    trailingOptions: { "--format": "value", "--output": "value" }
+  },
+  {
+    commandPath: ["task", "delete"],
+    selectors: [
+      { argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true }
+    ],
+    confirmation: { action: "Delete task", targetArgumentIndex: 2 }
   }
 ];
 
@@ -97,6 +180,8 @@ export function validateInteractionPolicies(
 
 function providerSupports(provider: CandidateProviderName, entity: SelectableEntity): boolean {
   return provider === "configured-agents" && entity === "agent"
+    || ["global-roles-for-show", "removable-global-roles", "configured-global-roles"].includes(provider)
+      && entity === "global-role"
     || provider === "tasks" && entity === "task"
     || provider === "task-roles" && entity === "task-role";
 }

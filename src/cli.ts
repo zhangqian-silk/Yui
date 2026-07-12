@@ -189,12 +189,20 @@ async function main(): Promise<void> {
 
   if (args[0] === "config") {
     requireStorageSchema(rootDir);
-    if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
-      await printControllerCommand(rootDir, "config", args.slice(1));
+    const discovery = process.env.TASKMUX_CONTROLLER_MODE === "direct"
+      ? undefined
+      : await ensureControllerRunning(rootDir, process.env);
+    const store = new FileTaskStore(rootDir);
+    const resolvedArgs = await resolveTerminalArguments(args, invocation.node, store);
+    if (resolvedArgs === null) {
+      emit("Cancelled.");
       return;
     }
-    const store = new FileTaskStore(rootDir);
-    emit(runConfigCommand(args.slice(1), store, process.env));
+    if (discovery !== undefined) {
+      await printControllerCommand(rootDir, "config", resolvedArgs.slice(1), discovery);
+      return;
+    }
+    emit(runConfigCommand(resolvedArgs.slice(1), store, process.env));
     return;
   }
 
@@ -270,12 +278,20 @@ async function main(): Promise<void> {
 
   if (args[0] === "role") {
     requireStorageSchema(rootDir);
-    if (args[1] !== "enter" && process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
-      await printControllerCommand(rootDir, "role", args.slice(1));
+    const discovery = args[1] !== "enter" && process.env.TASKMUX_CONTROLLER_MODE !== "direct"
+      ? await ensureControllerRunning(rootDir, process.env)
+      : undefined;
+    const store = new FileTaskStore(rootDir);
+    const resolvedArgs = await resolveTerminalArguments(args, invocation.node, store);
+    if (resolvedArgs === null) {
+      emit("Cancelled.");
       return;
     }
-    const store = new FileTaskStore(rootDir);
-    emit(runGlobalRoleCommand(args.slice(1), store, { taskmuxHome: rootDir }));
+    if (discovery !== undefined) {
+      await printControllerCommand(rootDir, "role", resolvedArgs.slice(1), discovery);
+      return;
+    }
+    emit(runGlobalRoleCommand(resolvedArgs.slice(1), store, { taskmuxHome: rootDir }));
     return;
   }
 
@@ -437,7 +453,21 @@ function resolveTaskCommandScope(commandArgs: string[], env: NodeJS.ProcessEnv):
   if (command === "dispatch" && !hasTaskId(rest[0])) {
     return [command, taskId, ...rest];
   }
-  if (command === "detail" && !hasTaskId(rest[0])) {
+  if (command === "transcript" && rest[0] === "export") {
+    if (!hasTaskId(rest[1])) {
+      const transcriptArgs = rest.slice(1);
+      const hasExplicitRole = transcriptArgs[0] !== undefined && !transcriptArgs[0].startsWith("--");
+      return [
+        command,
+        "export",
+        taskId,
+        ...(hasExplicitRole || roleName === undefined || roleName.length === 0 ? [] : [roleName]),
+        ...transcriptArgs
+      ];
+    }
+    return commandArgs;
+  }
+  if (["detail", "tail", "status", "transcript"].includes(command) && !hasTaskId(rest[0])) {
     return [
       command,
       taskId,
