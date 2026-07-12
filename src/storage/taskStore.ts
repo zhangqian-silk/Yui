@@ -9,6 +9,8 @@ import { dataError } from "../errors/cliError.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { AgentSession } from "../executor/agentExecutor.js";
 import type { TaskInputDraft } from "../input/taskInput.js";
+import type { InputRequest, InputResolution } from "../input/inputRequest.js";
+import { isInputRequestRecord, isInputResolutionRecord } from "../input/inputRecordCodec.js";
 import type { GlobalRole, Role } from "../role/role.js";
 import type { ChildRole } from "../role/childRole.js";
 import type { AgentRun } from "../run/agentRun.js";
@@ -23,6 +25,8 @@ import type { WorkItem } from "../workItem/workItem.js";
 import type { RoleWorktree } from "../worktree/worktree.js";
 import { taskRecordCodec } from "./taskRecordCodec.js";
 import { writeRecoverableSnapshot } from "./recoveryJournal.js";
+
+const INPUT_POINTER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 export type TaskStore = {
   getConfig(): TaskmuxConfig;
@@ -39,6 +43,12 @@ export type TaskStore = {
   getTaskInputDraft(taskId: string): TaskInputDraft | null;
   saveTaskInputDraft(taskId: string, draft: TaskInputDraft): void;
   clearTaskInputDraft(taskId: string): void;
+  getInputRequest(taskId: string, requestId: string): InputRequest | null;
+  listInputRequests(taskId: string): InputRequest[];
+  saveInputRequest(request: InputRequest): void;
+  getInputResolution(taskId: string, resolutionId: string): InputResolution | null;
+  listInputResolutions(taskId: string): InputResolution[];
+  saveInputResolution(resolution: InputResolution): void;
   getPendingWakeup(taskId: string): PendingWakeup | null;
   savePendingWakeup(wakeup: PendingWakeup): void;
   listPendingWakeups(): PendingWakeup[];
@@ -258,6 +268,53 @@ export class FileTaskStore implements TaskStore {
 
   clearTaskInputDraft(taskId: string): void {
     rmSync(this.taskInputDraftFile(taskId), { force: true });
+  }
+
+  getInputRequest(taskId: string, requestId: string): InputRequest | null {
+    assertInputPointerId(taskId, "task");
+    assertInputPointerId(requestId, "input request");
+    const raw = this.readOptionalText(this.inputRequestFile(taskId, requestId));
+    return raw === null ? null : parseInputRequest(taskId, requestId, raw);
+  }
+
+  listInputRequests(taskId: string): InputRequest[] {
+    assertInputPointerId(taskId, "task");
+    return this.jsonRecordIds(this.inputRequestsDir(taskId))
+      .map((id) => this.getInputRequest(taskId, id))
+      .filter((request): request is InputRequest => request !== null);
+  }
+
+  saveInputRequest(request: InputRequest): void {
+    if (!isInputRequestRecord(request, request.taskId, request.id)) {
+      throw dataError("Invalid input request record");
+    }
+    mkdirSync(this.inputRequestsDir(request.taskId), { recursive: true });
+    this.writeSnapshot(this.inputRequestFile(request.taskId, request.id), `${JSON.stringify(request, null, 2)}\n`);
+  }
+
+  getInputResolution(taskId: string, resolutionId: string): InputResolution | null {
+    assertInputPointerId(taskId, "task");
+    assertInputPointerId(resolutionId, "input resolution");
+    const raw = this.readOptionalText(this.inputResolutionFile(taskId, resolutionId));
+    return raw === null ? null : parseInputResolution(taskId, resolutionId, raw);
+  }
+
+  listInputResolutions(taskId: string): InputResolution[] {
+    assertInputPointerId(taskId, "task");
+    return this.jsonRecordIds(this.inputResolutionsDir(taskId))
+      .map((id) => this.getInputResolution(taskId, id))
+      .filter((resolution): resolution is InputResolution => resolution !== null);
+  }
+
+  saveInputResolution(resolution: InputResolution): void {
+    if (!isInputResolutionRecord(resolution, resolution.taskId, resolution.id)) {
+      throw dataError("Invalid input resolution record");
+    }
+    mkdirSync(this.inputResolutionsDir(resolution.taskId), { recursive: true });
+    this.writeSnapshot(
+      this.inputResolutionFile(resolution.taskId, resolution.id),
+      `${JSON.stringify(resolution, null, 2)}\n`
+    );
   }
 
   getPendingWakeup(taskId: string): PendingWakeup | null {
@@ -756,6 +813,22 @@ export class FileTaskStore implements TaskStore {
     return join(this.taskDir(taskId), "input-draft.json");
   }
 
+  private inputRequestsDir(taskId: string): string {
+    return join(this.taskDir(taskId), "input-requests");
+  }
+
+  private inputRequestFile(taskId: string, requestId: string): string {
+    return join(this.inputRequestsDir(taskId), `${requestId}.json`);
+  }
+
+  private inputResolutionsDir(taskId: string): string {
+    return join(this.taskDir(taskId), "input-resolutions");
+  }
+
+  private inputResolutionFile(taskId: string, resolutionId: string): string {
+    return join(this.inputResolutionsDir(taskId), `${resolutionId}.json`);
+  }
+
   private taskScheduleFile(taskId: string): string {
     return join(this.taskDir(taskId), "schedule.json");
   }
@@ -1187,6 +1260,24 @@ function parseTaskInputDraft(taskId: string, raw: string): TaskInputDraft {
   return value as TaskInputDraft;
 }
 
+function parseInputRequest(taskId: string, requestId: string, raw: string): InputRequest {
+  const message = `Invalid input request record: ${taskId}/${requestId}`;
+  const value = parseJson(raw, message);
+  if (!isInputRequestRecord(value, taskId, requestId)) {
+    throw dataError(message);
+  }
+  return value;
+}
+
+function parseInputResolution(taskId: string, resolutionId: string, raw: string): InputResolution {
+  const message = `Invalid input resolution record: ${taskId}/${resolutionId}`;
+  const value = parseJson(raw, message);
+  if (!isInputResolutionRecord(value, taskId, resolutionId)) {
+    throw dataError(message);
+  }
+  return value;
+}
+
 function parsePendingWakeup(taskId: string, raw: string): PendingWakeup {
   const value = parseJson(raw, `Invalid pending wakeup record: ${taskId}`);
 
@@ -1468,4 +1559,10 @@ function isOptionalString(value: unknown): value is string | undefined {
 
 function isStringRecord(value: unknown): value is Record<string, string> {
   return isRecord(value) && Object.values(value).every((item) => typeof item === "string");
+}
+
+function assertInputPointerId(value: string, label: string): void {
+  if (!INPUT_POINTER_ID_PATTERN.test(value)) {
+    throw dataError(`Invalid ${label} id`);
+  }
 }

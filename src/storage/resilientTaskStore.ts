@@ -7,6 +7,10 @@ const resilientReadMethods = new Set<keyof TaskStore>([
   "getTask",
   "getTaskTopics",
   "getTaskInputDraft",
+  "getInputRequest",
+  "listInputRequests",
+  "getInputResolution",
+  "listInputResolutions",
   "getPendingWakeup",
   "listPendingWakeups",
   "getLeaderFailure",
@@ -87,6 +91,12 @@ export function primeResilientTaskStore(store: TaskStore): void {
     store.getTask(task.id);
     store.getTaskTopics(task.id);
     store.getTaskInputDraft(task.id);
+    for (const request of store.listInputRequests(task.id)) {
+      store.getInputRequest(task.id, request.id);
+    }
+    for (const resolution of store.listInputResolutions(task.id)) {
+      store.getInputResolution(task.id, resolution.id);
+    }
     store.getPendingWakeup(task.id);
     store.getLeaderFailure(task.id);
     store.getOperatorNotification(task.id);

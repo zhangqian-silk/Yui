@@ -52,6 +52,19 @@ function rebuild(indexFile: string, store: TaskStore): void {
         topics TEXT NOT NULL,
         PRIMARY KEY (task_id, id)
       );
+      DROP TABLE IF EXISTS input_requests;
+      CREATE TABLE input_requests (
+        request_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        policy TEXT NOT NULL,
+        requester_agent TEXT NOT NULL,
+        blocked_count INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (task_id, request_id)
+      );
+      CREATE INDEX input_requests_by_request_id ON input_requests (request_id);
     `);
 
     const insertTask = database.prepare(
@@ -63,9 +76,12 @@ function rebuild(indexFile: string, store: TaskStore): void {
     const insertWorkItem = database.prepare(
       "INSERT INTO work_items (task_id, id, title, assignee, status, cycle_id, topics) VALUES (?, ?, ?, ?, ?, ?, ?)"
     );
+    const insertInputRequest = database.prepare(
+      "INSERT INTO input_requests (request_id, task_id, status, policy, requester_agent, blocked_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    );
     const tasks = store.listTasks();
     database.transaction(() => {
-      database.exec("DELETE FROM tasks; DELETE FROM roles; DELETE FROM work_items; DELETE FROM metadata;");
+      database.exec("DELETE FROM tasks; DELETE FROM roles; DELETE FROM work_items; DELETE FROM input_requests; DELETE FROM metadata;");
       database.prepare("INSERT INTO metadata (key, value) VALUES ('schemaVersion', '1')").run();
       for (const task of tasks) {
         insertTask.run(task.id, task.title, task.archived ? 1 : 0, task.updatedAt);
@@ -81,6 +97,18 @@ function rebuild(indexFile: string, store: TaskStore): void {
             workItem.status,
             workItem.cycleId ?? null,
             JSON.stringify(workItem.topics)
+          );
+        }
+        for (const request of store.listInputRequests(task.id)) {
+          insertInputRequest.run(
+            request.id,
+            request.taskId,
+            request.status,
+            request.resolutionPolicy.mode,
+            request.requester.agentId,
+            request.blockedRefs.length,
+            request.createdAt,
+            request.updatedAt
           );
         }
       }
