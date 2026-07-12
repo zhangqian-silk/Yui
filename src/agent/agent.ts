@@ -1,40 +1,40 @@
-export type RunnerEnvironment = Record<string, string>;
+export type AgentEnvironment = Record<string, string>;
 
-export type CustomRunner = {
+export type ConfiguredAgent = {
   schemaVersion: 1;
   id: string;
   command: string;
   args: string[];
-  env: RunnerEnvironment;
+  env: AgentEnvironment;
   createdAt: string;
   updatedAt: string;
 };
 
-export type RunnerDefinition = {
+export type AgentDefinition = {
   id: string;
   command: string;
   args: string[];
-  env: RunnerEnvironment;
+  env: AgentEnvironment;
   source: "custom";
 };
 
-export function createCustomRunner(
+export function createConfiguredAgent(
   id: string,
   command: string,
   args: string[],
-  env: RunnerEnvironment,
+  env: AgentEnvironment,
   now: Date
-): CustomRunner {
+): ConfiguredAgent {
   const trimmedId = id.trim();
   const trimmedCommand = command.trim();
   const timestamp = now.toISOString();
 
   if (trimmedId.length === 0) {
-    throw new Error("Runner id is required.");
+    throw new Error("Agent id is required.");
   }
 
   if (trimmedCommand.length === 0) {
-    throw new Error("Runner command is required.");
+    throw new Error("Agent command is required.");
   }
 
   return {
@@ -48,12 +48,12 @@ export function createCustomRunner(
   };
 }
 
-export function customRunnerToDefinition(runner: CustomRunner): RunnerDefinition {
+export function configuredAgentToDefinition(agent: ConfiguredAgent): AgentDefinition {
   return {
-    id: runner.id,
-    command: runner.command,
-    args: runner.args,
-    env: runner.env,
+    id: agent.id,
+    command: agent.command,
+    args: agent.args,
+    env: agent.env,
     source: "custom"
   };
 }

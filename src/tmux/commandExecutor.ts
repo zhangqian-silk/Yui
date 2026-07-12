@@ -4,11 +4,11 @@ export type CommandRunOptions = {
   inheritStdio?: boolean;
 };
 
-export type CommandRunner = {
+export type CommandExecutor = {
   run(command: string, args: string[], options?: CommandRunOptions): string;
 };
 
-export class NodeCommandRunner implements CommandRunner {
+export class NodeCommandExecutor implements CommandExecutor {
   run(command: string, args: string[], options: CommandRunOptions = {}): string {
     if (options.inheritStdio === true) {
       execFileSync(command, args, { stdio: "inherit" });

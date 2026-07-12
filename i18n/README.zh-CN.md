@@ -137,9 +137,31 @@ taskmux task timeline task-1    # 查看按时间排列的 Task 活动
 taskmux task enter task-1 leader
 taskmux controller status
 taskmux doctor
+taskmux help task role          # 查看指定命令范围的帮助
+taskmux version                 # 输出已安装包的版本
 ```
 
 普通命令可追加 `--json`，获得稳定的成功或错误 envelope。在 TaskMux 启动的角色会话中，如果环境变量已经标识 Task 和角色，作用域命令可以省略对应 ID。
+
+## 帮助、补全与更新
+
+使用 `taskmux help [command ...]` 查看任意命令范围。`help`、`-h` 和 `--help` 也可以在命令组和叶子命令中使用，例如 `taskmux task role help` 和 `taskmux task role rename --help`。未知命令会先输出错误，再输出最近一层的帮助，并以状态码 2 退出；追加 `--json` 时仍只输出一个 JSON 错误 envelope，不附加帮助文本。
+
+生成按命令路径组织的补全脚本，不读取或修改 TaskMux 状态：
+
+```sh
+taskmux completion bash > ~/.local/share/bash-completion/completions/taskmux
+taskmux completion zsh > ~/.zfunc/_taskmux
+taskmux completion fish > ~/.config/fish/completions/taskmux.fish
+```
+
+如需引导式持久安装，执行 `taskmux completion install`。安装器始终同时展示 Bash、Zsh 和 Fish。`$SHELL` 只标记推荐行，不会修改已保存路径。每次选择一个 Shell，确认完整脚本路径和激活文件后，再回答 `[Y/n/customize]`；只有选择 `customize` 才会询问自定义路径，修改 `.bashrc`、`.zshrc` 或自定义 Fish 激活文件前还会再次明确确认。再次运行该命令可以添加其他 Shell、刷新（Refresh）当前脚本或修复（Repair）受损的托管安装。`taskmux completion uninstall` 会安全移除一个选中的 TaskMux 托管安装。
+
+补全脚本与激活块带有所有权标记，使用原子替换，并拒绝符号链接或非 TaskMux 管理的冲突文件。`taskmux setup` 复用同一个单 Shell 向导，并支持输入 `skip` 跳过。交互式 setup/install/uninstall 必须在终端中运行且不支持 `--json`；上面的三个 stdout 生成命令仍可安全用于管道，且不依赖存储。
+
+`taskmux-dev` 只为 `taskmux-dev` 生成和安装补全，使用独立文件名、标记和隔离配置。补全路径属于本机配置：`backup` 会包含它们，逻辑 `export` 会省略它们，`import` 会保留目标机器已有记录。
+
+`taskmux version` 等价于 `taskmux --version` 和 `taskmux -v`。`taskmux update` 会直接执行 `npm install --global @zq-silk/taskmux@latest`，并保留 npm 正常的交互输出。update 不支持 `--json`。
 
 ## 本地状态
 
@@ -163,7 +185,7 @@ make link
 taskmux-dev --help
 ```
 
-`taskmux-dev` 始终使用 `output/taskmux-cli-dev` 作为隔离数据目录，并且不会进入 npm 发布包。运行 `make unlink` 可移除受管理的 launcher。
+`taskmux-dev` 始终使用 `output/taskmux-cli-dev` 作为隔离数据目录，并且不会进入 npm 发布包。`taskmux-dev update` 更新的是全局安装的正式 `taskmux` 包，不会更新当前 checkout、重新构建代码、修改受管理的 wrapper，也不会改动隔离开发数据。全局 npm 安装可能替换已有的 `taskmux` npm link。运行 `make unlink` 可移除受管理的 launcher。
 
 ## 许可证
 

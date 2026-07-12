@@ -1,24 +1,24 @@
 import type { Role } from "../role/role.js";
 import type { RoleStatus } from "../role/role.js";
 import type { AgentLaunchPlan } from "../executor/launchPlan.js";
-import type { CommandRunner } from "./commandRunner.js";
+import type { CommandExecutor } from "./commandExecutor.js";
 
 export class TmuxManager {
   constructor(
     private readonly tmuxBin: string,
-    private readonly runner: CommandRunner
+    private readonly executor: CommandExecutor
   ) {}
 
   enterRole(taskId: string, role: Role, launch?: AgentLaunchPlan): void {
     this.ensureSession(taskId);
     this.ensureWindow(taskId, role, launch);
-    this.runner.run(this.tmuxBin, ["attach-session", "-t", this.target(taskId, role.name)], {
+    this.executor.run(this.tmuxBin, ["attach-session", "-t", this.target(taskId, role.name)], {
       inheritStdio: true
     });
   }
 
   captureRole(taskId: string, roleName: string, lines = 80): string {
-    return this.runner.run(this.tmuxBin, [
+    return this.executor.run(this.tmuxBin, [
       "capture-pane",
       "-p",
       "-t",
@@ -50,12 +50,12 @@ export class TmuxManager {
   }
 
   sendRoleInput(taskId: string, roleName: string, input: string): void {
-    this.runner.run(this.tmuxBin, ["send-keys", "-l", "-t", this.target(taskId, roleName), "--", input]);
-    this.runner.run(this.tmuxBin, ["send-keys", "-t", this.target(taskId, roleName), "Enter"]);
+    this.executor.run(this.tmuxBin, ["send-keys", "-l", "-t", this.target(taskId, roleName), "--", input]);
+    this.executor.run(this.tmuxBin, ["send-keys", "-t", this.target(taskId, roleName), "Enter"]);
   }
 
   detachRole(taskId: string): void {
-    this.runner.run(this.tmuxBin, ["detach-client", "-s", this.sessionName(taskId)]);
+    this.executor.run(this.tmuxBin, ["detach-client", "-s", this.sessionName(taskId)]);
   }
 
   restartRole(taskId: string, role: Role): void {
@@ -70,7 +70,7 @@ export class TmuxManager {
 
   detectRoleStatus(taskId: string, roleName: string, fallback: RoleStatus): RoleStatus {
     try {
-      const windows = this.runner.run(this.tmuxBin, [
+      const windows = this.executor.run(this.tmuxBin, [
         "list-windows",
         "-t",
         this.sessionName(taskId),
@@ -85,28 +85,28 @@ export class TmuxManager {
   }
 
   stopRole(taskId: string, roleName: string): void {
-    this.runner.run(this.tmuxBin, ["send-keys", "-t", this.target(taskId, roleName), "C-c"]);
+    this.executor.run(this.tmuxBin, ["send-keys", "-t", this.target(taskId, roleName), "C-c"]);
   }
 
   killRole(taskId: string, roleName: string): void {
-    this.runner.run(this.tmuxBin, ["kill-window", "-t", this.target(taskId, roleName)]);
+    this.executor.run(this.tmuxBin, ["kill-window", "-t", this.target(taskId, roleName)]);
   }
 
   renameRole(taskId: string, oldRoleName: string, newRoleName: string): void {
-    this.runner.run(this.tmuxBin, ["rename-window", "-t", this.target(taskId, oldRoleName), newRoleName]);
+    this.executor.run(this.tmuxBin, ["rename-window", "-t", this.target(taskId, oldRoleName), newRoleName]);
   }
 
   private ensureSession(taskId: string): void {
     try {
-      this.runner.run(this.tmuxBin, ["has-session", "-t", this.sessionName(taskId)]);
+      this.executor.run(this.tmuxBin, ["has-session", "-t", this.sessionName(taskId)]);
       return;
     } catch {
-      this.runner.run(this.tmuxBin, ["new-session", "-d", "-s", this.sessionName(taskId)]);
+      this.executor.run(this.tmuxBin, ["new-session", "-d", "-s", this.sessionName(taskId)]);
     }
   }
 
   private ensureWindow(taskId: string, role: Role, launch?: AgentLaunchPlan): void {
-    const windows = this.runner.run(this.tmuxBin, [
+    const windows = this.executor.run(this.tmuxBin, [
       "list-windows",
       "-t",
       this.sessionName(taskId),
@@ -122,7 +122,7 @@ export class TmuxManager {
   }
 
   private createWindow(taskId: string, role: Role, launch: AgentLaunchPlan | Role): void {
-    this.runner.run(this.tmuxBin, [
+    this.executor.run(this.tmuxBin, [
       "new-window",
       "-t",
       this.sessionName(taskId),

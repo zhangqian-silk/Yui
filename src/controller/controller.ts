@@ -16,16 +16,14 @@ import { expireStaleAgentRuns, failExitedAgentRuns, readAgentRunTtl, scanTaskWak
 import { processLeaderWakeups } from "../scheduler/leaderWakeupProcessor.js";
 import { mergePendingWakeup } from "../scheduler/pendingWakeup.js";
 import { FileTaskStore, type TaskStore } from "../storage/taskStore.js";
-import { NodeCommandRunner } from "../tmux/commandRunner.js";
+import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
 import { TmuxManager } from "../tmux/tmuxManager.js";
 import { recordTaskRoleAttached, rememberTask, runTaskCommand } from "../commands/taskCommands.js";
 import { runAgentCommand } from "../commands/agentCommands.js";
-import { runBoardCommand } from "../commands/boardCommands.js";
+import { runBackupCommand } from "../commands/backupCommands.js";
 import { runConfigCommand } from "../commands/configCommands.js";
 import { runGlobalRoleCommand } from "../commands/globalRoleCommands.js";
-import { runRunnerCommand } from "../commands/runnerCommands.js";
 import { runImportCommand, runPruneCommand } from "../commands/maintenanceCommands.js";
-import { runBackupCommand } from "../commands/migrationCommands.js";
 import {
   replayPendingDomainTransactions,
   replayPendingSnapshotWrites
@@ -80,7 +78,7 @@ export async function serveController(rootDir: string): Promise<void> {
         { method, args }
       )
     );
-    const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandRunner());
+    const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandExecutor());
     const refreshDerivedState = (): void => {
       primeResilientTaskStore(store);
       rebuildDerivedIndex(rootDir, store);
@@ -622,13 +620,10 @@ function isTaskPointerCommand(args: string[]): boolean {
 }
 
 function isReadOnlyControllerCommand(group: string, args: string[]): boolean {
-  if (group === "board") {
-    return true;
-  }
   if (group === "config") {
     return args[0] === "show";
   }
-  return ["agent", "runner", "role"].includes(group) && ["list", "show"].includes(args[0] ?? "");
+  return ["agent", "role"].includes(group) && ["list", "show"].includes(args[0] ?? "");
 }
 
 function runDirectControllerCommand(
@@ -660,10 +655,6 @@ function runControllerCommandGroup(
         throw new Error("Interactive role commands cannot run through RPC.");
       }
       return runGlobalRoleCommand(args, store, { taskmuxHome: rootDir });
-    case "runner":
-      return runRunnerCommand(args, store);
-    case "board":
-      return runBoardCommand(store);
     case "backup":
       return runBackupCommand(rootDir);
     case "import":

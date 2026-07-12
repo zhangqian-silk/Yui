@@ -18,7 +18,7 @@ import { copyGlobalRoleToTaskRole, createRole, updateRole, updateRoleStatus } fr
 import { createChildRole } from "../role/childRole.js";
 import { createAgentRun, yieldAgentRun } from "../run/agentRun.js";
 import { SYSTEM_LEADER_ROLE } from "../role/systemRoles.js";
-import { resolveRunner, supportedRunnerIds } from "../runner/runnerRegistry.js";
+import { resolveAgent, supportedAgentIds } from "../agent/agentRegistry.js";
 import { mergePendingWakeup } from "../scheduler/pendingWakeup.js";
 import { createTaskSchedule } from "../scheduler/taskSchedule.js";
 import { createTask, updateTaskArchived, updateTaskMetadata } from "../task/task.js";
@@ -143,10 +143,7 @@ export function runTaskCommand(
     case "worktree":
       return taskWorktreeCommand(rest, store);
     default:
-      if (command === undefined) {
-        return taskUsage();
-      }
-      throw usageError(taskUsage().trimEnd());
+      throw usageError(command === undefined ? "Task command is required." : `Unknown command: task ${command}`);
   }
 }
 
@@ -1174,7 +1171,7 @@ function taskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): 
     case "remove":
       return removeTaskRoleCommand(rest, store);
     default:
-      return taskUsage();
+      throw usageError(command === undefined ? "Task role command is required." : `Unknown command: task role ${command}`);
   }
 }
 
@@ -1378,16 +1375,16 @@ function updateTaskRoleCommand(args: string[], store: TaskStore): string {
       throw usageError(`TaskRole Agent type is fixed after creation: ${role.agent}.`);
     }
 
-    const runner = resolveRunner(agent, store.listCustomRunners());
+    const resolvedAgent = resolveAgent(agent, store.listConfiguredAgents());
 
-    if (runner === null) {
-      throw usageError(`Unsupported agent: ${agent}\nSupported agents: ${supportedRunnerIds(store.listCustomRunners()).join(", ")}`);
+    if (resolvedAgent === null) {
+      throw usageError(`Unsupported agent: ${agent}\nSupported agents: ${supportedAgentIds(store.listConfiguredAgents()).join(", ")}`);
     }
 
-    patch.agent = runner.id;
-    patch.command = runner.command;
-    patch.args = runner.args;
-    patch.env = runner.env;
+    patch.agent = resolvedAgent.id;
+    patch.command = resolvedAgent.command;
+    patch.args = resolvedAgent.args;
+    patch.env = resolvedAgent.env;
   }
 
   if (workspace !== undefined) {
@@ -2095,13 +2092,13 @@ function createResolvedRole(
   workspace: string,
   store: TaskStore
 ): Role {
-  const runner = resolveRunner(agent, store.listCustomRunners());
+  const resolvedAgent = resolveAgent(agent, store.listConfiguredAgents());
 
-  if (runner === null) {
+  if (resolvedAgent === null) {
     throwUnsupportedAgent(agent, store);
   }
 
-  return createRole(roleName, runner, workspace, new Date());
+  return createRole(roleName, resolvedAgent, workspace, new Date());
 }
 
 function createRoleFromGlobalOrAgent(
@@ -2167,7 +2164,7 @@ function saveRoleAndRecordEvent(taskId: string, role: Role, store: TaskStore): v
 }
 
 function throwUnsupportedAgent(agent: string, store: TaskStore): never {
-  const supportedAgents = supportedRunnerIds(store.listCustomRunners());
+  const supportedAgents = supportedAgentIds(store.listConfiguredAgents());
   const supportedText = supportedAgents.length === 0
     ? "none configured. Run taskmux setup, then add an agent."
     : supportedAgents.join(", ");
@@ -2710,68 +2707,4 @@ function assertDueAt(value: string): void {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
     throw usageError("--due must use YYYY-MM-DD.");
   }
-}
-
-export function taskUsage(): string {
-  return `Task commands:
-  taskmux task create <title> [--template feature|bug|review] [--agent <agent>] [--workspace <path>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD]
-  taskmux task update <task-id> [--title <title>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD] [--clear-description] [--clear-priority] [--clear-tags] [--clear-due]
-  taskmux task list [--archived true|false] [--tag <tag>] [--priority <priority>] [--search <text>]
-  taskmux task board [--archived true|false] [--tag <tag>] [--priority <priority>] [--search <text>] [--with-roles]
-  taskmux task show <task-id>
-  taskmux task current [<task-id>]
-  taskmux task last
-  taskmux task clone <task-id> [--title <title>]
-  taskmux task archive <task-id> [--reason <body>] [--summary <body>]
-  taskmux task unarchive <task-id>
-  taskmux task delete <task-id>
-  taskmux task restore <task-id>
-  taskmux task open <task-id>
-  taskmux task context <task-id> [--format text|json] [--include-transcripts]
-  taskmux task bind <task-id> <role> [--as <task-role>] [--workspace <path>]
-  taskmux task assign <task-id> <role> [--agent <agent>] [--workspace <path>] [--as <task-role>]
-  taskmux task assign-many <task-id> --role <role> ... [--agent <agent>] [--workspace <path>]
-  taskmux task role update <task-id> <role> [--agent <agent>] [--workspace <path>]
-  taskmux task role rename <task-id> <role> <new-role>
-  taskmux task role child <task-id> <role> [--parent <role>] --description <body> [--responsibility <body> ...] [--constraint <body> ...] --expected-output <body>
-  taskmux task role remove <task-id> <role>
-  taskmux task roles <task-id>
-  taskmux task enter <task-id> <role>
-  taskmux task tail <task-id> <role>
-  taskmux task detail <task-id> <role>
-  taskmux task status <task-id> <role>
-  taskmux task refresh <task-id>
-  taskmux task transcript <task-id> <role>
-  taskmux task transcript export <task-id> <role> [--format text|json|markdown] [--output <file>]
-  taskmux task activity <task-id>
-  taskmux task timeline <task-id>
-  taskmux task detach <task-id> <role>
-  taskmux task stop <task-id> <role>
-  taskmux task kill <task-id> <role>
-  taskmux task restart <task-id> <role>
-  taskmux task cleanup <task-id>
-  taskmux task comment <task-id> <body>
-  taskmux task comments <task-id>
-  taskmux task events <task-id>
-  taskmux task topic create <task-id> --id <id> --name <name> --description <body>
-  taskmux task topic list <task-id>
-  taskmux task topic summarize <task-id> --topic <topic> --summary <body>
-  taskmux task input draft <task-id> <body>
-  taskmux task input submit <task-id>
-  taskmux task cycle create <task-id> --cause <cause> --summary <summary>
-  taskmux task cycle end <task-id> <cycle-id> --summary <summary>
-  taskmux task work-item create <task-id> --title <title> [--cycle <cycle>] [--assignee <role>] [--topic <topic> ...]
-  taskmux task work-item update <task-id> <work-item> --status <status> [--outcome <body>]
-  taskmux task wake <task-id> --reason <reason>
-  taskmux task session record <task-id> <role> --native-id <id>
-  taskmux task session replace <task-id> <role> --native-id <id> --reason <reason>
-  taskmux task dispatch <task-id> <role> --mode new|resume [--work-item <id>] [--topic <topic> ...] --input <input>
-  taskmux task yield <task-id> <role> --summary <summary>
-  taskmux task schedule set <task-id> --inactivity-minutes <minutes> --cooldown-minutes <minutes> [--review-at <iso>] [--every-minutes <minutes> --next-at <iso>]
-  taskmux task brief update <task-id> --objective <body> [--boundary <body> ...] --focus <body> --leader-summary <body>
-  taskmux task milestone add <task-id> --title <title> --summary <body> [--topic <topic> ...]
-  taskmux task decision record <task-id> --title <title> --rationale <body> [--topic <topic> ...]
-  taskmux task decision supersede <task-id> <decision-id> --reason <body>
-  taskmux task worktree create <task-id> <role> --path <path> --branch <branch> [--base <ref>]
-`;
 }

@@ -1,4 +1,4 @@
-import type { RunnerDefinition, RunnerEnvironment } from "../runner/runner.js";
+import type { AgentDefinition, AgentEnvironment } from "../agent/agent.js";
 
 export type RoleStatus = "idle" | "running" | "detached" | "exited" | "failed";
 
@@ -17,7 +17,7 @@ export type Role = RoleProfile & {
   agent: string;
   command: string;
   args: string[];
-  env: RunnerEnvironment;
+  env: AgentEnvironment;
   workspace: string;
   status: RoleStatus;
   createdAt: string;
@@ -30,7 +30,7 @@ export type GlobalRole = RoleProfile & {
   agent: string;
   command: string;
   args: string[];
-  env: RunnerEnvironment;
+  env: AgentEnvironment;
   workspace: string;
   createdAt: string;
   updatedAt: string;
@@ -38,13 +38,13 @@ export type GlobalRole = RoleProfile & {
 
 export function createRole(
   name: string,
-  runner: RunnerDefinition,
+  agent: AgentDefinition,
   workspace: string,
   now: Date,
   profile: RoleProfile = {}
 ): Role {
   const trimmedName = name.trim();
-  const trimmedAgent = runner.id.trim();
+  const trimmedAgent = agent.id.trim();
   const trimmedWorkspace = workspace.trim();
 
   if (trimmedName.length === 0) {
@@ -65,9 +65,9 @@ export function createRole(
     schemaVersion: 1,
     name: trimmedName,
     agent: trimmedAgent,
-    command: runner.command,
-    args: runner.args,
-    env: runner.env,
+    command: agent.command,
+    args: agent.args,
+    env: agent.env,
     workspace: trimmedWorkspace,
     ...profile,
     status: "idle",
@@ -78,12 +78,12 @@ export function createRole(
 
 export function createGlobalRole(
   name: string,
-  runner: RunnerDefinition,
+  agent: AgentDefinition,
   workspace: string,
   now: Date,
   profile: RoleProfile = {}
 ): GlobalRole {
-  const role = createRole(name, runner, workspace, now, profile);
+  const role = createRole(name, agent, workspace, now, profile);
 
   return {
     schemaVersion: role.schemaVersion,

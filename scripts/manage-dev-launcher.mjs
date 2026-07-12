@@ -114,6 +114,7 @@ function renderLauncher(projectRoot) {
 ${managedMarker}
 ${projectRootMarker}${JSON.stringify(projectRoot)}
 export TASKMUX_HOME=${shellQuote(home)}
+export TASKMUX_CLI_NAME=taskmux-dev
 exec node ${shellQuote(join(projectRoot, "dist", "cli.js"))} "$@"
 `;
 }

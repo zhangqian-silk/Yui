@@ -34,6 +34,7 @@ test("installs a local dev launcher that forces the project test home", () => {
     assert.match(launcher, /output\/taskmux-cli-dev/);
     assert.match(launcher, /dist\/cli\.js/);
     assert.match(launcher, /taskmux-dev-wrapper-project-root:/);
+    assert.match(launcher, /export TASKMUX_CLI_NAME=taskmux-dev/);
   } finally {
     rmSync(sandbox.root, { recursive: true, force: true });
   }
@@ -56,6 +57,33 @@ test("launcher overrides an inherited TASKMUX_HOME before starting the local CLI
     });
 
     assert.equal(output.trim(), join(sandbox.projectRoot, "output", "taskmux-cli-dev"));
+  } finally {
+    rmSync(sandbox.root, { recursive: true, force: true });
+  }
+});
+
+test("taskmux-dev forwards update to the checkout CLI without changing its wrapper or isolated home", () => {
+  const sandbox = createSandbox();
+
+  try {
+    mkdirSync(join(sandbox.projectRoot, "dist"), { recursive: true });
+    writeFileSync(
+      join(sandbox.projectRoot, "dist", "cli.js"),
+      "console.log(JSON.stringify({ args: process.argv.slice(2), home: process.env.TASKMUX_HOME }));\n"
+    );
+    installDevLauncher({ projectRoot: sandbox.projectRoot, binDir: sandbox.binDir });
+    const before = readFileSync(sandbox.launcherPath, "utf8");
+
+    const output = execFileSync(sandbox.launcherPath, ["update"], {
+      encoding: "utf8",
+      env: { ...process.env, TASKMUX_HOME: "/tmp/not-taskmux-dev" }
+    });
+
+    assert.deepEqual(JSON.parse(output), {
+      args: ["update"],
+      home: join(sandbox.projectRoot, "output", "taskmux-cli-dev")
+    });
+    assert.equal(readFileSync(sandbox.launcherPath, "utf8"), before);
   } finally {
     rmSync(sandbox.root, { recursive: true, force: true });
   }
@@ -118,6 +146,13 @@ test("Makefile manages the dev launcher without publishing it as an npm bin", ()
 
   assert.match(makefile, /link: build\n\tnpm link\n\tnode scripts\/manage-dev-launcher\.mjs install/);
   assert.match(makefile, /unlink:\n\tnpm unlink -g @zq-silk\/taskmux\n\tnode scripts\/manage-dev-launcher\.mjs uninstall/);
+  assert.match(makefile, /import \{ ensureStorageSchema \} from "\.\/dist\/storage\/storageSchema\.js"/);
   assert.deepEqual(packageJson.bin, { taskmux: "./dist/cli.js" });
   assert.equal(packageJson.files.includes("scripts"), false);
+});
+
+test("build removes stale dist modules before compiling", () => {
+  const packageJson = JSON.parse(readFileSync("package.json", "utf8"));
+
+  assert.match(packageJson.scripts.prebuild, /rmSync\('dist'/);
 });

@@ -3,7 +3,6 @@ export type CliErrorCode =
   | "TASK_NOT_FOUND"
   | "ROLE_NOT_FOUND"
   | "AGENT_NOT_FOUND"
-  | "RUNNER_NOT_FOUND"
   | "DATA_ERROR"
   | "RUNTIME_ERROR";
 
@@ -12,7 +11,6 @@ const EXIT_CODES: Record<CliErrorCode, number> = {
   TASK_NOT_FOUND: 3,
   ROLE_NOT_FOUND: 3,
   AGENT_NOT_FOUND: 3,
-  RUNNER_NOT_FOUND: 3,
   DATA_ERROR: 4,
   RUNTIME_ERROR: 5
 };
@@ -20,15 +18,15 @@ const EXIT_CODES: Record<CliErrorCode, number> = {
 export class CliError extends Error {
   readonly exitCode: number;
 
-  constructor(readonly code: CliErrorCode, message: string) {
+  constructor(readonly code: CliErrorCode, message: string, readonly helpText?: string) {
     super(message);
     this.name = "CliError";
     this.exitCode = EXIT_CODES[code];
   }
 }
 
-export function usageError(message: string): CliError {
-  return new CliError("USAGE_ERROR", message);
+export function usageError(message: string, helpText?: string): CliError {
+  return new CliError("USAGE_ERROR", message, helpText);
 }
 
 export function taskNotFound(id: string): CliError {
@@ -37,10 +35,6 @@ export function taskNotFound(id: string): CliError {
 
 export function roleNotFound(name: string): CliError {
   return new CliError("ROLE_NOT_FOUND", `Role not found: ${name}`);
-}
-
-export function runnerNotFound(id: string): CliError {
-  return new CliError("RUNNER_NOT_FOUND", `Runner not found: ${id}`);
 }
 
 export function agentNotFound(id: string): CliError {

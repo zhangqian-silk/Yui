@@ -4,7 +4,7 @@ import type { TaskComment } from "../comment/comment.js";
 import { dataError, usageError } from "../errors/cliError.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { GlobalRole, Role } from "../role/role.js";
-import type { CustomRunner } from "../runner/runner.js";
+import type { ConfiguredAgent } from "../agent/agent.js";
 import type { TaskStore, TaskmuxConfig } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
 
@@ -19,18 +19,19 @@ type TaskmuxSnapshot = {
   schemaVersion: 1;
   exportedAt: string;
   config: TaskmuxConfig;
-  runners: CustomRunner[];
+  agents: ConfiguredAgent[];
   roles?: GlobalRole[];
   tasks: TaskSnapshot[];
 };
 
 export function runExportCommand(args: string[], store: TaskStore): string {
   const output = readOption(args, "--output");
+  const { completionInstallations: _hostLocalCompletion, ...portableConfig } = store.getConfig();
   const snapshot: TaskmuxSnapshot = {
     schemaVersion: 1,
     exportedAt: new Date().toISOString(),
-    config: store.getConfig(),
-    runners: store.listCustomRunners(),
+    config: portableConfig,
+    agents: store.listConfiguredAgents(),
     roles: store.listGlobalRoles(),
     tasks: store.listTasks().map((task) => ({
       task,
@@ -58,10 +59,12 @@ export function runImportCommand(args: string[], store: TaskStore): string {
 
   const snapshot = parseSnapshot(readFileSync(input, "utf8"));
 
-  store.saveConfig(snapshot.config);
+  const targetCompletionInstallations = store.getConfig().completionInstallations;
+  const { completionInstallations: _importedHostLocalCompletion, ...portableConfig } = snapshot.config;
+  store.saveConfig({ ...portableConfig, completionInstallations: targetCompletionInstallations });
 
-  for (const runner of snapshot.runners) {
-    store.saveCustomRunner(runner);
+  for (const agent of snapshot.agents) {
+    store.saveConfiguredAgent(agent);
   }
 
   for (const role of snapshot.roles ?? []) {
@@ -178,7 +181,7 @@ function isSnapshot(value: unknown): value is TaskmuxSnapshot {
     value !== null &&
     (value as { schemaVersion?: unknown }).schemaVersion === 1 &&
     Array.isArray((value as { tasks?: unknown }).tasks) &&
-    Array.isArray((value as { runners?: unknown }).runners) &&
+    Array.isArray((value as { agents?: unknown }).agents) &&
     typeof (value as { config?: unknown }).config === "object"
   );
 }

@@ -4,7 +4,7 @@ WORKSPACE ?= $(CURDIR)
 
 .DEFAULT_GOAL := all
 
-.PHONY: all help build lint test check link unlink dev local-clean local-setup local-smoke local-board local-roles local-detail
+.PHONY: all help build lint test check link unlink local-clean local-setup local-smoke local-board local-roles local-detail
 
 all: check
 
@@ -18,9 +18,8 @@ help:
 	@printf '%s\n' '  make check         Run build, lint, and tests'
 	@printf '%s\n' '  make link          Link taskmux and install isolated taskmux-dev locally'
 	@printf '%s\n' '  make unlink        Remove the global taskmux link and local taskmux-dev launcher'
-	@printf '%s\n' '  make dev           Alias for local-smoke'
 	@printf '%s\n' '  make local-smoke   Reset output sandbox and exercise agent/role/task flow'
-	@printf '%s\n' '  make local-board   Show sandbox agent/global-role board'
+	@printf '%s\n' '  make local-board   Show the sandbox Task board'
 	@printf '%s\n' '  make local-roles   Show task-1 roles in sandbox'
 	@printf '%s\n' '  make local-detail  Show task-1 reviewer detail in sandbox'
 	@printf '%s\n' ''
@@ -47,12 +46,11 @@ unlink:
 	npm unlink -g @zq-silk/taskmux
 	node scripts/manage-dev-launcher.mjs uninstall
 
-dev: local-smoke
-
 local-clean:
 	rm -rf "$(TASKMUX_HOME)"
 
 local-setup: build local-clean
+	TASKMUX_HOME="$(TASKMUX_HOME)" node --input-type=module -e 'import { ensureStorageSchema } from "./dist/storage/storageSchema.js"; ensureStorageSchema(process.env.TASKMUX_HOME);'
 	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) agent add codex --command codex
 	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) agent add claude --command claude
 	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) config set default-agent codex
@@ -60,18 +58,18 @@ local-setup: build local-clean
 	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) role add reviewer --agent claude --workspace "$(WORKSPACE)"
 
 local-smoke: local-setup
-	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) board
+	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) task board
 	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) task create "Local test task"
 	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) task bind task-1 reviewer
 	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) task roles task-1
 	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) role update reviewer --agent codex --workspace /tmp/global-reviewer
 	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) task role update task-1 reviewer --workspace /tmp/task-reviewer
 	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) role show reviewer
-	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) role show assistant
+	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) role show operator
 	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) task detail task-1 reviewer
 
 local-board:
-	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) board
+	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) task board
 
 local-roles:
 	TASKMUX_HOME="$(TASKMUX_HOME)" $(TASKMUX) task roles task-1

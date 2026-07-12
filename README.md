@@ -137,9 +137,31 @@ taskmux task timeline task-1    # Read chronological Task activity
 taskmux task enter task-1 leader
 taskmux controller status
 taskmux doctor
+taskmux help task role          # Show help for one command scope
+taskmux version                 # Print the installed package version
 ```
 
 Append `--json` to ordinary commands for a stable success or error envelope. Inside a TaskMux-launched role session, scoped commands can omit Task and role IDs when the environment already identifies them.
+
+## Help, completion, and updates
+
+Use `taskmux help [command ...]` to inspect any command scope. `help`, `-h`, and `--help` also work within groups, for example `taskmux task role help` and `taskmux task role rename --help`. An unknown command prints its error first, then the nearest scoped help, and exits with status 2. With `--json`, the same error remains one JSON envelope without appended help.
+
+Generate path-aware completion without reading or changing TaskMux state:
+
+```sh
+taskmux completion bash > ~/.local/share/bash-completion/completions/taskmux
+taskmux completion zsh > ~/.zfunc/_taskmux
+taskmux completion fish > ~/.config/fish/completions/taskmux.fish
+```
+
+For a guided, persistent installation, run `taskmux completion install`. The installer always shows Bash, Zsh, and Fish. `$SHELL` only marks the recommended row; it never changes a saved path. Choose one shell per run, review its full script and activation paths, then answer `[Y/n/customize]`. Only `customize` asks for replacement paths, and TaskMux asks again before changing `.bashrc`, `.zshrc`, or a custom Fish activation file. Rerun the command to add another shell, Refresh a current script, or Repair a damaged managed installation. `taskmux completion uninstall` safely removes one selected TaskMux-managed installation.
+
+Completion scripts and activation blocks use ownership markers, atomic replacement, and refuse symlinks or unmanaged collisions. `taskmux setup` reuses the same one-shell wizard and accepts `skip`. Interactive setup/install/uninstall require a terminal and do not support `--json`; the three stdout generator commands above remain pipeline-safe and storage-independent.
+
+`taskmux-dev` generates and installs completion for `taskmux-dev` with separate filenames, markers, and its isolated config. Completion paths are host-local: `backup` includes them, while logical `export` omits them and `import` preserves the target machine's existing records.
+
+`taskmux version` is equivalent to `taskmux --version` and `taskmux -v`. Run `taskmux update` to directly execute `npm install --global @zq-silk/taskmux@latest` with npm's normal interactive output. Update does not support `--json`.
 
 ## Local state
 
@@ -163,7 +185,7 @@ make link
 taskmux-dev --help
 ```
 
-`taskmux-dev` always uses `output/taskmux-cli-dev` as its isolated home and is not included in the npm package. Remove the managed launcher with `make unlink`.
+`taskmux-dev` always uses `output/taskmux-cli-dev` as its isolated home and is not included in the npm package. `taskmux-dev update` updates the globally installed published `taskmux` package; it does not update this checkout, rebuild it, change the managed wrapper, or modify the isolated development data. A global npm install may replace an existing `npm link` for `taskmux`. Remove the managed launcher with `make unlink`.
 
 ## License
 
