@@ -85,6 +85,42 @@ test("prints an unknown path error before nearest scoped help", () => {
   assert.doesNotMatch(result.stderr, /TaskMux task\n/);
 });
 
+test("renders narrow help for functional value-style modes", () => {
+  const env = { ...process.env, TASKMUX_HOME: "/path/that/does/not/exist" };
+  const bash = execFileSync("node", ["dist/cli.js", "help", "completion", "bash"], { encoding: "utf8", env });
+  const tmux = execFileSync("node", ["dist/cli.js", "help", "setup", "tmux"], { encoding: "utf8", env });
+
+  assert.match(bash, /^TaskMux completion bash$/m);
+  assert.match(bash, /Generate Bash completion\./);
+  assert.match(bash, /  taskmux completion bash$/m);
+  assert.doesNotMatch(bash, /completion zsh|\binstall\b/);
+
+  assert.match(tmux, /^TaskMux setup tmux$/m);
+  assert.match(tmux, /Install tmux before setup\./);
+  assert.match(tmux, /  taskmux setup tmux$/m);
+  assert.doesNotMatch(tmux, /^TaskMux setup$/m);
+});
+
+test("unknown functional modes report the error before nearest parent help", () => {
+  const env = { ...process.env, TASKMUX_HOME: "/path/that/does/not/exist" };
+  for (const [args, expectedPath, expectedParent, expectedEntry] of [
+    [["completion", "powershell"], "completion powershell", "completion", "bash"],
+    [["setup", "screen"], "setup screen", "setup", "tmux"]
+  ]) {
+    const result = spawnSync("node", ["dist/cli.js", ...args], { encoding: "utf8", env });
+
+    assert.equal(result.status, 2, expectedPath);
+    assert.equal(result.stdout, "", expectedPath);
+    assert.match(
+      result.stderr,
+      new RegExp(`^USAGE_ERROR: Unknown command: ${expectedPath}\\n\\nTaskMux ${expectedParent}\\n`),
+      expectedPath
+    );
+    assert.match(result.stderr, new RegExp(`\\b${expectedEntry}\\b`), expectedPath);
+    assert.doesNotMatch(result.stderr, /TaskMux 0\.1\.5/, expectedPath);
+  }
+});
+
 test("keeps unknown path JSON errors to one envelope", () => {
   const result = spawnSync("node", ["dist/cli.js", "task", "role", "wat", "--json"], {
     encoding: "utf8",

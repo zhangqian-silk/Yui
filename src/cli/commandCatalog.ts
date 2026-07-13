@@ -30,6 +30,7 @@ export type CommandNode = {
   fileArguments: readonly number[];
   executableOptions: readonly string[];
   commandPathArguments: boolean;
+  acceptsArguments: boolean;
 };
 
 type NodeInput = {
@@ -48,6 +49,7 @@ type NodeInput = {
   fileArguments?: readonly number[];
   executableOptions?: readonly string[];
   commandPathArguments?: boolean;
+  acceptsArguments?: boolean;
 };
 
 function buildNode(input: NodeInput, parentPath: readonly string[] = []): CommandNode {
@@ -86,7 +88,8 @@ function buildNode(input: NodeInput, parentPath: readonly string[] = []): Comman
     fileOptions: Object.freeze([...(input.fileOptions ?? [])]),
     fileArguments: Object.freeze([...(input.fileArguments ?? [])]),
     executableOptions: Object.freeze([...(input.executableOptions ?? [])]),
-    commandPathArguments: input.commandPathArguments ?? false
+    commandPathArguments: input.commandPathArguments ?? false,
+    acceptsArguments: input.acceptsArguments ?? executable
   });
 }
 
@@ -194,19 +197,20 @@ export const ROOT_COMMAND = buildNode({
     { name: "help", summary: "Show root or scoped command help.", usage: "taskmux help [command ...]", commandPathArguments: true },
     { name: "version", summary: "Print the installed TaskMux version." },
     { name: "update", summary: "Install the latest published TaskMux package globally." },
-    { name: "completion", summary: "Generate or manage shell completion.", executable: true, usage: ["taskmux completion bash|zsh|fish", "taskmux completion install", "taskmux completion uninstall"], sections: [
+    { name: "completion", summary: "Generate or manage shell completion.", usage: ["taskmux completion bash|zsh|fish", "taskmux completion install", "taskmux completion uninstall"], sections: [
       { id: "generate", title: "Generate", entries: ["bash", "zsh", "fish"] },
       { id: "manage", title: "Manage", entries: ["install", "uninstall"] }
-    ], values: [
+    ], children: [
       { name: "bash", summary: "Generate Bash completion." },
       { name: "zsh", summary: "Generate Zsh completion." },
-      { name: "fish", summary: "Generate Fish completion." }
-    ], children: [
+      { name: "fish", summary: "Generate Fish completion." },
       { name: "install", summary: "Interactively install or repair one shell completion." },
       { name: "uninstall", summary: "Interactively remove one managed shell completion." }
     ] },
     { name: "doctor", summary: "Check local TaskMux dependencies and state." },
-    { name: "setup", summary: "Initialize TaskMux and configure an agent.", usage: "taskmux setup [tmux]", sections: [{ id: "mode", title: "Mode", entries: ["tmux"] }], values: [{ name: "tmux", summary: "Install tmux before setup." }] },
+    { name: "setup", summary: "Initialize TaskMux and configure an agent.", executable: true, acceptsArguments: false, usage: "taskmux setup [tmux]", sections: [{ id: "mode", title: "Mode", entries: ["tmux"] }], children: [
+      { name: "tmux", summary: "Install tmux before setup." }
+    ] },
     { name: "backup", summary: "Create a TaskMux state backup." },
     { name: "export", summary: "Export TaskMux state.", usage: "taskmux export --output <file>", options: ["--output"], fileOptions: ["--output"] },
     { name: "import", summary: "Import TaskMux state.", usage: "taskmux import <file>", fileArguments: [0] },

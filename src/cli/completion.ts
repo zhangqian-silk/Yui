@@ -49,7 +49,7 @@ function collectEntries(root: CommandNode): CompletionEntry[] {
         fileOptions: node.fileOptions,
         fileArguments: node.fileArguments,
         executableOptions: node.executableOptions,
-        acceptsArguments: node.kind !== "group"
+        acceptsArguments: node.acceptsArguments
       });
     }
     visibleChildren(node).forEach(addNode);
