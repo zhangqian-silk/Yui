@@ -210,7 +210,7 @@ test("catalog covers every public root, group, nested, and leaf path", async () 
   const { listPublicCommandPaths, ROOT_COMMAND } = await import("../dist/cli/commandCatalog.js");
   const paths = new Set(listPublicCommandPaths());
   const required = [
-    "help", "version", "update", "completion", "doctor", "setup", "backup", "export", "import", "prune", "operator",
+    "help", "version", "update", "completion", "completion bash", "completion zsh", "completion fish", "completion install", "completion uninstall", "doctor", "setup", "setup tmux", "backup", "export", "import", "prune", "operator",
     "controller", "controller start", "controller status", "controller stop", "controller scan",
     "config", "config show", "config set", "config set default-agent", "config set default-workspace", "config unset", "config unset default-agent", "config unset default-workspace",
     "agent", "agent add", "agent list", "agent show", "agent remove",
@@ -232,6 +232,24 @@ test("catalog covers every public root, group, nested, and leaf path", async () 
   assert.equal(paths.has("controller serve"), false);
   assert.equal(paths.has("assistant"), false);
   assert.equal(Object.isFrozen(ROOT_COMMAND), true);
+});
+
+test("catalog promotes only functional value-style modes to command paths", async () => {
+  const { listPublicCommandPaths } = await import("../dist/cli/commandCatalog.js");
+  const paths = new Set(listPublicCommandPaths());
+
+  for (const mode of ["completion bash", "completion zsh", "completion fish", "setup tmux"]) {
+    assert.equal(paths.has(mode), true, `missing functional mode: ${mode}`);
+  }
+
+  for (const argument of [
+    "config set completion bash",
+    "config unset completion zsh",
+    "task create feature",
+    "task show task-id"
+  ]) {
+    assert.equal(paths.has(argument), false, `ordinary argument became a command path: ${argument}`);
+  }
 });
 
 test("catalog is the only rendered command-help source", () => {

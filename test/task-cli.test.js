@@ -3691,7 +3691,7 @@ test("setup prompts through existing config and keeps values on enter", async ()
   assert.match(config, tableRowRegex("default-workspace", "configured", escapeRegex(join(home, "workspace"))));
 });
 
-test("setup --yes is not supported", () => {
+test("setup reports an unknown mode before scoped help", () => {
   const parent = createTaskmuxHome();
   const home = join(parent, "taskmux-home");
   const result = runTaskmuxFailure(["setup", "--yes"], {
@@ -3699,7 +3699,8 @@ test("setup --yes is not supported", () => {
   });
 
   assert.equal(result.status, 2);
-  assert.match(result.stderr, /USAGE_ERROR: Setup usage: taskmux setup \[tmux\]/);
+  assert.match(result.stderr, /^USAGE_ERROR: Unknown command: setup --yes\n\nTaskMux setup\n/);
+  assert.match(result.stderr, /\btmux\s+Install tmux before setup\./);
   assert.equal(existsSync(home), false);
 });
 

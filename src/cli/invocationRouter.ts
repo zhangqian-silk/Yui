@@ -51,7 +51,7 @@ function resolveExecutionPath(args: readonly string[]): Invocation {
     const token = args[index] ?? "";
     const child = findChild(node, token);
     if (child === undefined) {
-      if (node.kind === "hybrid") {
+      if (node.kind === "hybrid" && node.acceptsArguments) {
         break;
       }
       return {
