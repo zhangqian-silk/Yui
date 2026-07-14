@@ -2,14 +2,20 @@ import { existsSync, mkdirSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
-import { usageError } from "../errors/cliError.js";
+import { dataError, usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { createGlobalRole } from "../role/role.js";
 import { SYSTEM_LEADER_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
 import { createConfiguredAgent } from "../agent/agent.js";
 import type { AgentDefinition } from "../agent/agent.js";
 import { resolveAgent } from "../agent/agentRegistry.js";
-import { ensureTaskmuxHome, FileTaskStore, resolveTaskmuxHome, type TaskStore } from "../storage/taskStore.js";
+import {
+  ensureTaskmuxHome,
+  FileTaskStore,
+  inspectTaskmuxHome,
+  resolveTaskmuxHome,
+  type TaskStore
+} from "../storage/taskStore.js";
 import { ensureStorageSchema } from "../storage/storageSchema.js";
 import type { CommandExecutor } from "../tmux/commandExecutor.js";
 import { runCompletionWizard } from "../completion/completionWizard.js";
@@ -92,7 +98,7 @@ export async function runSetupCommand(
     const question = createSetupQuestion(readline, io);
     const taskmuxHome = resolveTaskmuxHome(env);
 
-    ensureTaskmuxHome(taskmuxHome);
+    await ensureSetupTaskmuxHome(taskmuxHome, question, io.input.isTTY === true);
     ensureStorageSchema(taskmuxHome);
 
     const store = new FileTaskStore(taskmuxHome);
@@ -123,6 +129,34 @@ export async function runSetupCommand(
   } finally {
     readline.close();
   }
+}
+
+async function ensureSetupTaskmuxHome(
+  taskmuxHome: string,
+  question: SetupQuestion,
+  permissionRepairHasRealTty: boolean
+): Promise<void> {
+  const inspection = inspectTaskmuxHome(taskmuxHome);
+  if (inspection.status !== "repair-required") {
+    ensureTaskmuxHome(taskmuxHome);
+    return;
+  }
+
+  if (!permissionRepairHasRealTty) {
+    throw dataError(
+      "Repairing an existing TASKMUX_HOME requires a real interactive terminal. Re-run taskmux setup in a TTY. No files or permissions were changed."
+    );
+  }
+
+  const answer = (await question(
+    `TASKMUX_HOME ${taskmuxHome} has mode ${inspection.mode}. Tighten existing TASKMUX_HOME to mode 0700? [y/N]: `
+  )).trim().toLowerCase();
+  if (answer !== "y" && answer !== "yes") {
+    throw dataError(
+      "Refused to repair existing TASKMUX_HOME. No files or permissions were changed."
+    );
+  }
+  ensureTaskmuxHome(taskmuxHome, { repairExisting: inspection.identity });
 }
 
 function setupCliIdentity(env: NodeJS.ProcessEnv): CliIdentity {

@@ -16,7 +16,7 @@ import { getDoctorChecks, renderDoctor, runDoctor } from "./doctor/doctor.js";
 import { CliError, dataError, usageError } from "./errors/cliError.js";
 import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
 import { runTaskShell } from "./shell/taskShell.js";
-import { FileTaskStore, resolveTaskmuxHome } from "./storage/taskStore.js";
+import { FileTaskStore, inspectTaskmuxHome, resolveTaskmuxHome } from "./storage/taskStore.js";
 import {
   inspectStorageSchema,
   requireStorageSchema,
@@ -96,6 +96,14 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (
+    args[0] === "completion" &&
+    (args[1] === "bash" || args[1] === "zsh" || args[1] === "fish")
+  ) {
+    emit(renderCompletion(args[1], resolveCliIdentity(process.env)));
+    return;
+  }
+
   const rootDir = resolveTaskmuxHome(process.env);
 
   if (args.length === 0) {
@@ -145,8 +153,9 @@ async function main(): Promise<void> {
 
   if (args[0] === "doctor") {
     const storageSchema = inspectStorageSchema(rootDir);
-    const store = new FileTaskStore(rootDir);
-    const agents = canReadStore(storageSchema) ? listConfiguredAgentsForDoctor(store) : [];
+    const agents = canReadStore(storageSchema) && isTaskmuxHomeReadyForRead(rootDir)
+      ? listConfiguredAgentsForDoctor(new FileTaskStore(rootDir))
+      : [];
 
     emit(runDoctor(process.env, new NodeCommandExecutor(), agents, storageSchema));
     return;
@@ -555,8 +564,9 @@ function operatorLaunchEnvironment(
 async function runDefaultDashboard(rootDir: string): Promise<void> {
   const commandExecutor = new NodeCommandExecutor();
   const storageSchema = inspectStorageSchema(rootDir);
-  const storeForDoctor = new FileTaskStore(rootDir);
-  const agents = canReadStore(storageSchema) ? listConfiguredAgentsForDoctor(storeForDoctor) : [];
+  const agents = canReadStore(storageSchema) && isTaskmuxHomeReadyForRead(rootDir)
+    ? listConfiguredAgentsForDoctor(new FileTaskStore(rootDir))
+    : [];
   const checks = getDoctorChecks(process.env, commandExecutor, agents, storageSchema);
   const failedChecks = checks.filter((check) => check.status !== "ok");
 
@@ -587,6 +597,14 @@ async function runDefaultDashboard(rootDir: string): Promise<void> {
     ) as { output: string };
     return result.output;
   });
+}
+
+function isTaskmuxHomeReadyForRead(rootDir: string): boolean {
+  try {
+    return inspectTaskmuxHome(rootDir).status === "ready";
+  } catch {
+    return false;
+  }
 }
 
 function readPackageVersion(): string {

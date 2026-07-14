@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { dataError } from "../errors/cliError.js";
+import { assertTaskmuxHomeReady } from "./taskStore.js";
 
 export const CURRENT_STORAGE_SCHEMA_VERSION = 3;
 export const STORAGE_SCHEMA_FILE = "schema.json";
@@ -93,6 +94,7 @@ export function ensureStorageSchema(rootDir: string): void {
 }
 
 export function requireStorageSchema(rootDir: string): void {
+  assertTaskmuxHomeReady(rootDir);
   const state = inspectStorageSchema(rootDir);
 
   switch (state.status) {
