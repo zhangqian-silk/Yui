@@ -522,9 +522,11 @@ function prepareDirectoryOperations(
   barrier: NativeStableAncestorBarrier,
   transaction: DomainTransaction
 ): void {
-  for (let index = 0; index < transaction.operations.length; index += 1) {
+  for (const index of preparedMkdirOperationIndexes(transaction)) {
     const operation = transaction.operations[index];
-    if (operation.type !== "mkdir") continue;
+    if (operation === undefined || operation.type !== "mkdir") {
+      throw new Error("Prepared directory operation is missing.");
+    }
     const current = inspectOptionalReceipt(barrier, operation.target);
     if (current !== undefined) {
       if (!isDirectoryReceipt(current)) {
@@ -540,15 +542,37 @@ function prepareDirectoryOperations(
     }
     const parentPath = parentRelativePath(operation.target);
     const expectedParent = expectedParentForOperation(transaction, index, parentPath);
+    const parent = inspectRequiredDirectory(barrier, parentPath);
+    if (!sameExactIdentityExceptNlink(parent, expectedParent)) {
+      throw new Error("Prepared directory parent changed.");
+    }
     const created = mkdirExactNoReplace(
       barrier,
       parentPath,
-      nativeIdentity(expectedParent),
+      parent,
       basenameOf(operation.target)
     );
     operation.desiredAfter = directoryStateFromIdentity(created);
     persistDomainTransaction(rootDir, barrier, transaction);
   }
+}
+
+function preparedMkdirOperationIndexes(transaction: DomainTransaction): number[] {
+  return transaction.operations
+    .map((operation, index) => ({ operation, index }))
+    .filter((candidate) => candidate.operation.type === "mkdir")
+    .sort((left, right) => {
+      const depth = pathDepth(left.operation.target) - pathDepth(right.operation.target);
+      if (depth !== 0) return depth;
+      if (left.operation.target < right.operation.target) return -1;
+      if (left.operation.target > right.operation.target) return 1;
+      return left.index - right.index;
+    })
+    .map((candidate) => candidate.index);
+}
+
+function pathDepth(path: string): number {
+  return path.split("/").length;
 }
 
 function preflightTransaction(
@@ -847,12 +871,11 @@ function assertAncestors(
     if (expected.kind !== "directory") {
       throw new Error("Domain transaction ancestor is not a directory.");
     }
-    if (current === undefined || !sameDirectoryWithPermittedLinkCount(
-      current,
-      expected,
-      transaction,
-      index
-    )) {
+    // Ancestors may gain or lose non-authoritative sibling directories while a
+    // transaction is staged (for example, controller diagnostics).  That
+    // changes only nlink, not the directory identity needed to anchor this
+    // operation's path.
+    if (current === undefined || !sameExactIdentityExceptNlink(current, expected)) {
       throw new Error("Domain transaction ancestor identity changed.");
     }
   }
