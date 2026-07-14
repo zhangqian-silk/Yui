@@ -141,7 +141,7 @@ export type TaskLifecycleRuntimeOperationClaim = RuntimeOperationClaimBase & {
   } | null;
 };
 
-export type GlobalRoleRuntimeOperationClaim = RuntimeOperationClaimBase & {
+export type GlobalRoleMutationRuntimeOperationClaim = RuntimeOperationClaimBase & {
   scope: "global-role";
   kind: "global-role-mutation";
   taskId: null;
@@ -155,6 +155,25 @@ export type GlobalRoleRuntimeOperationClaim = RuntimeOperationClaimBase & {
     activeRun: AgentRun | null;
   };
 };
+
+export type GlobalRoleLaunchRuntimeOperationClaim = RuntimeOperationClaimBase & {
+  scope: "global-role";
+  kind: "global-role-launch";
+  taskId: null;
+  roleName: string;
+  operation: "launch";
+  preparedSession: RoleAgentSession | null;
+  phase: "prepared" | "effect-started";
+  preparedState: {
+    role: GlobalRole;
+    sessionSet: GlobalRoleSessionSet | null;
+    activeRun: AgentRun | null;
+  };
+};
+
+export type GlobalRoleRuntimeOperationClaim =
+  | GlobalRoleMutationRuntimeOperationClaim
+  | GlobalRoleLaunchRuntimeOperationClaim;
 
 export type RuntimeOperationClaim =
   | RoleRuntimeOperationClaim
@@ -339,6 +358,33 @@ export function readGlobalRoleRuntimeOperationClaim(
   if (claim === null) return null;
   if (claim.scope !== "global-role") throw dataError("Invalid GlobalRole runtime operation claim.");
   return claim;
+}
+
+export function markGlobalRoleLaunchEffectStarted(
+  rootDir: string,
+  transactionId: string,
+  claim: Pick<GlobalRoleLaunchRuntimeOperationClaim, "roleName" | "token">,
+  recoveryToken: string | null = null
+): GlobalRoleLaunchRuntimeOperationClaim {
+  return executeDomainTransaction(rootDir, transactionId, (workingRoot) => {
+    const current = readGlobalRoleRuntimeOperationClaim(workingRoot, claim.roleName);
+    if (
+      current === null ||
+      current.kind !== "global-role-launch" ||
+      current.token !== claim.token ||
+      current.recoveryToken !== recoveryToken
+    ) {
+      throw usageError(`Operation token does not own GlobalRole launch intent: ${claim.roleName}.`);
+    }
+    if (current.phase === "effect-started") return current;
+    const started: GlobalRoleLaunchRuntimeOperationClaim = {
+      ...current,
+      phase: "effect-started"
+    };
+    assertRuntimeOperationClaim(started, { scope: "global-role", roleName: claim.roleName });
+    writeClaimFile(workingRoot, started, "w");
+    return started;
+  });
 }
 
 export function readRuntimeOperationClaim(
@@ -837,17 +883,33 @@ function assertGlobalRoleRuntimeOperationClaim(
     "recoveryToken", "createdAt", "leaseExpiresAt", "phase", "preparedState"
   ];
   const claim = value as Record<string, unknown>;
+  const preparedStateValid = isGlobalRolePreparedState(claim.preparedState, claim.roleName as string);
+  const launchPreparedSessionValid = claim.preparedSession === null || (
+    preparedStateValid &&
+    safelyValidate(() => isRoleAgentSessionRecord(
+      claim.preparedSession,
+      (claim.preparedState as GlobalRoleLaunchRuntimeOperationClaim["preparedState"]).role.activeAgentId
+    ))
+  );
+  const kindValid =
+    (claim.kind === "global-role-mutation" &&
+      (claim.operation === "update" || claim.operation === "remove") &&
+      claim.preparedSession === null &&
+      claim.phase === "prepared") ||
+    (claim.kind === "global-role-launch" &&
+      claim.operation === "launch" &&
+      launchPreparedSessionValid &&
+      (claim.phase === "prepared" || claim.phase === "effect-started"));
   if (
     Object.keys(descriptors).length !== expectedKeys.length ||
     expectedKeys.some((key) => !Object.hasOwn(descriptors, key)) ||
     Object.values(descriptors).some((descriptor) => descriptor.get !== undefined || descriptor.set !== undefined) ||
     claim.schemaVersion !== 1 || claim.scope !== "global-role" ||
-    claim.kind !== "global-role-mutation" || claim.taskId !== null ||
+    !kindValid || claim.taskId !== null ||
     typeof claim.roleName !== "string" || !isSafeStorageSegment(claim.roleName) ||
-    (claim.operation !== "update" && claim.operation !== "remove") ||
     typeof claim.token !== "string" || !TOKEN_PATTERN.test(claim.token) ||
     typeof claim.ownerPid !== "number" || !Number.isSafeInteger(claim.ownerPid) || claim.ownerPid <= 0 ||
-    claim.preparedSession !== null || claim.selectedWorkItem !== null || claim.pendingRun !== null ||
+    claim.selectedWorkItem !== null || claim.pendingRun !== null ||
     typeof claim.expectedStateDigest !== "string" || !DIGEST_PATTERN.test(claim.expectedStateDigest) ||
     (claim.recoveryToken !== null && (
       typeof claim.recoveryToken !== "string" || !TOKEN_PATTERN.test(claim.recoveryToken)
@@ -855,8 +917,7 @@ function assertGlobalRoleRuntimeOperationClaim(
     typeof claim.createdAt !== "string" || !isCanonicalTimestamp(claim.createdAt) ||
     typeof claim.leaseExpiresAt !== "string" || !isCanonicalTimestamp(claim.leaseExpiresAt) ||
     Date.parse(claim.leaseExpiresAt) <= Date.parse(claim.createdAt) ||
-    claim.phase !== "prepared" ||
-    !isGlobalRolePreparedState(claim.preparedState, claim.roleName) ||
+    !preparedStateValid ||
     (owner !== undefined && (owner.scope !== "global-role" || owner.roleName !== claim.roleName))
   ) {
     throw dataError("Invalid GlobalRole runtime operation claim.");

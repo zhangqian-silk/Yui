@@ -46,10 +46,6 @@ taskmux task create "交付导出功能" --template feature
 taskmux task board --with-roles
 taskmux task context task-1 --format json
 
-# 通过受控输入流程补充用户信息。
-taskmux task input draft task-1 "优先保证 CSV 兼容性。"
-taskmux task input submit task-1
-
 # 进入固定的 Leader 会话。
 taskmux task enter task-1 leader
 ```
@@ -70,12 +66,41 @@ Controller 是唯一的变更边界。它按需启动，仅监听 loopback，并
 | **Cycle** | 由输入、定时、角色结果或不活跃检查触发的一段有限推进周期。 |
 | **WorkItem** | 具有负责人和终态结果的有限执行单元。 |
 | **AgentRun** | 原生 Agent 会话中的一次派发执行。 |
-| **Operator** | 将用户意图转换为 TaskMux 命令的持久化管理角色。 |
+| **Operator** | 将用户意图转换为 TaskMux 命令的持久化、前台全局管理角色。 |
 | **Leader** | 负责方向、委派和结果综合的固定 Task 内会话。 |
+| **输入请求** | 由精确的活动 Leader 来源创建、归属某个 Task 的决策请求。 |
+| **Global Inbox** | 对所有 Task 所有开放输入请求的跨 Task 查询，不是第二份存储。 |
 | **独立角色** | 拥有独立 Agent 会话、tmux 窗口和可选 Git worktree 的 Worker。 |
 | **子角色** | 注入父角色的描述性约束，不拥有 TaskMux 管理的运行时。 |
 
+多 Agent Role 会为每个 Agent 绑定保留独立配置与原生会话，同时始终只有一个活动 Agent。前台 Operator 由其 `GlobalRoleSessionSet` 中的活动绑定和运行中会话确定。
+
 ## 核心用例
+
+### 请求并回答用户决策
+
+唯一公开的输入请求命令是 `taskmux task input request`、`taskmux task input list`、`taskmux task input show`、`taskmux task input answer` 和 `taskmux task input cancel`。Global Inbox 是 `list` 生成的跨 Task 查询，而不是单独的记录或命令。
+
+在精确匹配的活动 Leader 会话中，创建归属 Task 的请求：
+
+```sh
+taskmux task input request task-1 \
+  --question "优先保证 CSV 兼容性吗？" \
+  --choice csv="优先保证 CSV" \
+  --choice json="优先保证 JSON" \
+  --blocks task:task-1
+```
+
+前台 Operator 可以查看全局查询并记录用户决定；原始 Leader 可以取消仍处于开放状态的请求：
+
+```sh
+taskmux task input list
+taskmux task input show input-1 --task task-1
+taskmux task input answer input-1 --task task-1 --choice csv
+taskmux task input cancel task-1 input-1 --reason "不再需要该决定"
+```
+
+请求归属其 Task，并保存精确的 Leader 来源元组，因此只有该 Leader 可以创建或取消它。向 Operator 的递送只包含 Task/请求指针；其 receipt 只确认传输已被接收，不代表用户已经回复。`user-required` 请求绝不超时。`offline-recommended` 请求只有在前台 Operator 已持续确认离线达到配置时长后，才能持久化其推荐结果；在线或未知状态都不会推进该时段。
 
 ### 委派隔离任务
 
@@ -94,7 +119,7 @@ taskmux task work-item create task-1 \
   --topic testing
 
 taskmux task dispatch task-1 reviewer \
-  --mode resume \
+  --mode new \
   --work-item work-item-1 \
   --input "审查实现并报告阻塞问题。"
 ```

@@ -40,6 +40,9 @@ TaskMux has no required remote control plane, database server, or message broker
 | **TaskRole** | Is a Task-local Role with one or more Agent bindings, one active Agent, and its AgentRuns. |
 | **RoleSessionSet** | Is the sole durable session authority for one TaskRole and its per-Agent native sessions. |
 | **GlobalRoleSessionSet** | Is the sole durable session authority for the global Operator and its per-Agent native sessions. |
+| **InputRequest** | Is a Task-owned user-decision request created by one exact active Leader origin. |
+| **Global Inbox** | Is a global query over Task-owned open InputRequests, not an independent durable store. |
+| **OperatorDelivery** | Is a pointer-only transport record for notifying the foreground Operator about an InputRequest. |
 | **Cycle** | Groups one bounded period of advancement and may contain WorkItems. |
 | **WorkItem** | May span one or more AgentRuns until it reaches a terminal outcome. |
 | **AgentRun** | Records one asynchronous dispatch round and its durable result. |
@@ -50,9 +53,9 @@ A Task is a durable mission, not a ticket. It has one terminal-like marker: `arc
 
 ### Role model
 
-- **Operator** is a persistent global administrative Role. It manages TaskMux through the CLI but does not perform Task work.
+- **Operator** is a persistent global administrative Role. It manages TaskMux through the CLI but does not perform Task work. Its foreground native target is defined only by the active binding and running session in its `GlobalRoleSessionSet`.
 - **Leader** is the single fixed Task-local Role responsible for direction, decomposition, synthesis, and archival.
-- Every managed GlobalRole and TaskRole binds one or more Agents and designates one bound Agent as active. Each binding has independent adapter, model, effort, and permission configuration; when initialized, it has its own native session identity and session state.
+- Every managed GlobalRole and TaskRole binds one or more Agents, but has one active Agent at a time. Each binding has independent adapter, model, effort, and permission configuration and an independent native session identity and session state; a binding never borrows another Agent's session.
 - A TaskRole uses its task-scoped `RoleSessionSet`, and the global Operator uses its `GlobalRoleSessionSet`, as the only authority for native sessions. Switching the active Agent can recover that Agent's own underlying session rather than reuse another Agent's session.
 - **Independent roles** have their own tmux window for the active Agent, AgentRuns, and optional Git worktree.
 - **Child roles** contain descriptive constraints for a parent role. They have no TaskMux-managed session, tmux window, worktree, or AgentRun.
@@ -70,6 +73,16 @@ The command catalog is the authoritative public CLI vocabulary. It assigns every
 Before the existing execution boundary, the CLI may guide a terminal user to select an omitted reference that TaskMux can enumerate from local authoritative state. Explicit arguments are never replaced, and scripts, redirected IO, and JSON invocations remain deterministic and non-interactive. The selected value is still validated by the ordinary command path.
 
 Setup is an explicit lifecycle operation. Ordinary CLI, dashboard, Task shell, import, prune, backup, attach-state, and Scheduler mutations share the Controller boundary.
+
+### Input requests and the Global Inbox
+
+The complete public input-request surface is `taskmux task input request`, `taskmux task input list`, `taskmux task input show`, `taskmux task input answer`, and `taskmux task input cancel`. `list` without a Task scope produces the Global Inbox: a global query over Task-owned requests. It creates no second inbox record, and each request is still read, answered, and retained through its owning Task.
+
+An InputRequest records one exact Leader origin tuple: **role**, **Agent**, **adapter**, **session root**, **native session**, and **AgentRun**. Only the current active Leader tuple may create or cancel its open request; the Controller validates every element against the Task's `RoleSessionSet`. An answer writes a durable resolution and a wakeup addressed back to that same origin, rather than allowing a caller to synthesize a Leader wakeup.
+
+Creating an InputRequest also writes a pointer-only `OperatorDelivery`: its durable identity is the delivery ID plus Task and request IDs, never a duplicate question, choices, answer, or presentation payload. The foreground Operator reads the Task-owned request through those pointers. A delivery receipt records only transport acceptance by that foreground Operator target; it does not mean a user saw, approved, or answered the request.
+
+`user-required` requests never time out and never auto-resolve. An `offline-recommended` request may resolve only after a continuous confirmed-offline interval for the foreground Operator reaches its configured duration; that transition writes the persisted recommendation and its reason as the resolution. Online or unknown Operator presence does not time out a request and clears any accumulated offline interval. A window without a matching active binding and running `GlobalRoleSessionSet` session is unknown, not evidence of absence.
 
 ## Dispatch and wakeup flow
 

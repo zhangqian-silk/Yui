@@ -118,6 +118,7 @@ export function prepareStaleAgentRunExpirations(
       }
       const run = store.getActiveAgentRun(task.id, role.name);
       if (run === null || now.getTime() - Date.parse(run.updatedAt) < ttlMs) continue;
+      if (run.status === "blocked") continue;
       if (role.agentBindings[role.activeAgentId] === undefined) continue;
       const claim = createRoleRuntimeStopClaim(store, task.id, role.name, now);
       persistRoleRuntimeOperationClaim(store, claim);

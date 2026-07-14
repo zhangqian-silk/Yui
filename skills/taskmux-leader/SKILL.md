@@ -1,6 +1,6 @@
 ---
 name: taskmux-leader
-description: Lead and continuously advance one long-running TaskMux Task. Use in a Task Leader session for context recovery, planning Cycles and WorkItems, curating briefs and milestones, creating roles, dispatching independent roles, synthesizing results, scheduling reviews, yielding, and deciding archival.
+description: Lead and continuously advance one long-running TaskMux Task. Use in a Task Leader session for context recovery, planning Cycles and WorkItems, requesting user decisions, curating briefs and milestones, creating roles, dispatching independent roles, synthesizing results, scheduling reviews, yielding, and deciding archival.
 ---
 
 # TaskMux Leader
@@ -16,12 +16,22 @@ Own the Task's semantic direction until archival. Treat the Task as a long-lived
 
 Reuse the fixed Leader native session. If recovery fails, report the error; never silently start a replacement session.
 
+## Request user input
+
+The complete public input-request surface is `taskmux task input request`, `taskmux task input list`, `taskmux task input show`, `taskmux task input answer`, and `taskmux task input cancel`. The Global Inbox is the global query returned by `list`; the request body remains owned by its Task.
+
+- Create a request only when the active Leader needs a user decision to advance. The exact Leader origin tuple is role, Agent, adapter, session root, native session, and AgentRun. TaskMux validates that complete tuple against the active Leader binding and `RoleSessionSet`.
+- Create with `taskmux task input request <task-id> --question <text>` and include choices, blocked references, and an offline recommendation only when they are useful. The request blocks this Leader run until it is answered or cancelled.
+- Only the exact originating Leader tuple may call `taskmux task input cancel <task-id> <request-id> --reason <text>`. Do not imitate another Leader session or fabricate any origin fields.
+- Treat `user-required` as waiting indefinitely for a user response. An `offline-recommended` request can persist its recommendation only after a continuous confirmed-offline interval for the foreground Operator; online or unknown presence never advances that interval.
+- A user answer creates the durable resolution and wakes the exact origin. Do not manually dispatch a replacement Leader run to bypass that wakeup.
+
 ## Decompose and delegate
 
 - Create WorkItems with explicit assignees and zero or more Topics.
 - Use an independent task role when work needs its own Agent session, tmux window, worktree, or direct user interaction.
 - Use a child role only to inject name, description, responsibilities, constraints, and expected output into an existing parent. Do not expect TaskMux to execute or recover it.
-- Decide whether each non-Leader dispatch uses `--mode resume` or `--mode new`. The role's configured Agent is already authoritative.
+- Use the established native-session path for a role that already owns its session; choose a fresh dispatch only when the work truly requires one. The role's configured Agent is already authoritative.
 - Treat a successful dispatch result as control-plane acceptance; the role's work remains asynchronous until yield.
 
 Only the Leader dispatches independent roles. Let Codex or Claude create native internal subagents on its own; record only important outcomes.

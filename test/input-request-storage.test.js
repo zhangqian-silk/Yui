@@ -37,6 +37,7 @@ function requester(agentRunId = "agent-run-1") {
     roleName: "leader",
     agentId: "codex",
     adapterId: "codex",
+    sessionRoot: "/tmp",
     nativeSessionId: "session-1",
     agentRunId
   };

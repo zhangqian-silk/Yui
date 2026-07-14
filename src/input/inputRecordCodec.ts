@@ -1,4 +1,8 @@
 import type { InputRequest, InputResolution } from "./inputRequest.js";
+import {
+  isCanonicalNativeSessionId,
+  isCanonicalNativeSessionRoot
+} from "../executor/nativeSessionIdentity.js";
 
 const CHOICE_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const POINTER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -129,11 +133,15 @@ export function isInputResolutionRecord(
 
 function isRequester(value: unknown): boolean {
   return isRecord(value) &&
-    hasOnlyKeys(value, ["roleName", "agentId", "adapterId", "nativeSessionId", "agentRunId"]) &&
+    hasOnlyKeys(value, [
+      "roleName", "agentId", "adapterId", "sessionRoot", "nativeSessionId", "agentRunId"
+    ]) &&
     value.roleName === "leader" &&
     isInputRequesterField(value.agentId) &&
     isInputRequesterField(value.adapterId) &&
-    (value.nativeSessionId === undefined || isInputRequesterField(value.nativeSessionId)) &&
+    isCanonicalNativeSessionRoot(value.sessionRoot) &&
+    isInputRequesterField(value.nativeSessionId) &&
+    isCanonicalNativeSessionId(value.nativeSessionId) &&
     isInputRequesterField(value.agentRunId);
 }
 

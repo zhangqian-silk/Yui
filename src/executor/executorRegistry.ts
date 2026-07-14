@@ -29,6 +29,7 @@ export {
   isRoleRuntimeOperationRecoverable,
   listRoleRuntimeOperationClaims,
   listRuntimeOperationClaims,
+  markGlobalRoleLaunchEffectStarted,
   markTaskLifecycleOperationEffectStarted,
   markRoleRuntimeOperationEffectStarted,
   readRoleRuntimeOperationClaim,
@@ -45,6 +46,8 @@ export {
 } from "./roleRuntimeOperationClaim.js";
 export type {
   GlobalRoleRuntimeOperationClaim,
+  GlobalRoleLaunchRuntimeOperationClaim,
+  GlobalRoleMutationRuntimeOperationClaim,
   RoleLaunchRuntimeOperationClaim,
   RoleRuntimeOperationClaim,
   RoleRuntimeStateSnapshot,
@@ -56,6 +59,8 @@ export type {
   TaskLifecycleRuntimeOperationClaim
 } from "./roleRuntimeOperationClaim.js";
 
+export type ExactRoleInputDeliveryOutcome = "applied" | "receipt-present" | "fenced";
+
 export type AgentRuntime = {
   dispatchRole(
     taskId: string,
@@ -65,6 +70,11 @@ export type AgentRuntime = {
     options: { replaceExisting?: boolean; launchToken: string }
   ): boolean;
   sendRoleInput(taskId: string, roleName: string, input: string): void;
+  sendExactRoleInputOnce(
+    expected: ExactRoleInputTarget,
+    deliveryId: string,
+    input: string
+  ): ExactRoleInputDeliveryOutcome;
   stopRole(taskId: string, roleName: string): void;
   killRole(taskId: string, roleName: string): void;
   detectRoleStatus(taskId: string, roleName: string, fallback: RoleStatus): RoleStatus;
@@ -225,6 +235,35 @@ export type ExecutorDispatchInput = {
 export type ExecutorDispatchPlanInput = Omit<ExecutorDispatchInput, "runtime">;
 
 export type ExecutorControlInput = { runtime: AgentRuntime; taskId: string; role: Role };
+export type ExecutorSendInput = {
+  runtime: Pick<AgentRuntime, "sendRoleInput">;
+  taskId: string;
+  role: Role;
+  input: string;
+};
+
+/**
+ * A user-visible delivery must name the immutable native session tuple it was
+ * prepared for. The runtime transport owns the final pane-level comparison,
+ * so a same-name replacement pane is not a valid fallback.
+ */
+export type ExactRoleInputTarget = {
+  taskId: string;
+  roleName: string;
+  agentId: string;
+  adapterId: string;
+  sessionRoot: string;
+  nativeSessionId: string;
+  agentRunId: string;
+};
+
+export type ExecutorExactSendInput = {
+  runtime: Pick<AgentRuntime, "sendExactRoleInputOnce">;
+  target: ExactRoleInputTarget;
+  role: Role;
+  deliveryId: string;
+  input: string;
+};
 
 export interface AgentExecutor {
   readonly id: string;
@@ -233,7 +272,8 @@ export interface AgentExecutor {
   plan(input: ExecutorDispatchPlanInput): PreparedExecution;
   start(input: ExecutorDispatchInput): PreparedExecution;
   recover(input: ExecutorDispatchInput): PreparedExecution;
-  send(input: ExecutorControlInput & { input: string }): void;
+  send(input: ExecutorSendInput): void;
+  sendExact(input: ExecutorExactSendInput): ExactRoleInputDeliveryOutcome;
   interrupt(input: ExecutorControlInput): void;
   stop(input: ExecutorControlInput): void;
   status(input: ExecutorControlInput): AgentSessionStatus;
@@ -350,9 +390,25 @@ class AdapterBackedExecutor implements AgentExecutor {
   }
   start(input: ExecutorDispatchInput): PreparedExecution { return this.dispatch(input, "new", true); }
   recover(input: ExecutorDispatchInput): PreparedExecution { return this.dispatch(input, "resume", false); }
-  send({ runtime, taskId, role, input }: ExecutorControlInput & { input: string }): void {
+  send({ runtime, taskId, role, input }: ExecutorSendInput): void {
     assertTaskRoleOwnership(taskId, role);
     runtime.sendRoleInput(taskId, role.name, input);
+  }
+  sendExact({ runtime, target, role, deliveryId, input }: ExecutorExactSendInput): ExactRoleInputDeliveryOutcome {
+    assertTaskRoleOwnership(target.taskId, role);
+    const binding = activeRoleAgentBinding(role);
+    if (
+      target.roleName !== role.name ||
+      target.agentId !== binding.agentId ||
+      target.adapterId !== binding.adapterId ||
+      !hasNonEmptyText(target.sessionRoot) ||
+      !hasNonEmptyText(target.nativeSessionId) ||
+      !hasNonEmptyText(target.agentRunId) ||
+      !hasNonEmptyText(deliveryId)
+    ) {
+      throw new Error(`Exact input target does not match Role binding: ${role.name}.`);
+    }
+    return runtime.sendExactRoleInputOnce(target, deliveryId, input);
   }
   interrupt({ runtime, taskId, role }: ExecutorControlInput): void {
     assertTaskRoleOwnership(taskId, role);
@@ -408,6 +464,10 @@ export function resolveAgentExecutor(adapterId: string): AgentExecutor {
   const executor = executors.get(adapterId);
   if (executor === undefined) throw new Error(`Agent does not define an execution adapter: ${adapterId}.`);
   return executor;
+}
+
+function hasNonEmptyText(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 export function reserveInitialAgentSession(

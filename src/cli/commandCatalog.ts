@@ -165,7 +165,17 @@ const taskChildren: readonly NodeInput[] = [
     { name: "list", summary: "List task topics.", usage: "taskmux task topic list <task-id>" },
     { name: "summarize", summary: "Store a topic summary.", usage: "taskmux task topic summarize <task-id> --topic <topic> --summary <body>", options: ["--topic", "--summary"] }
   ] },
-  { name: "input", summary: "Manage controlled task input.", sections: [{ id: "manage", title: "Manage", entries: ["draft", "submit"] }], children: [
+  { name: "input", summary: "Manage durable task-owned input requests.", sections: [
+    { id: "inspect", title: "Inspect", entries: ["list", "show"] },
+    { id: "respond", title: "Respond", entries: ["answer"] },
+    { id: "leader", title: "Leader", entries: ["request", "cancel"] },
+    { id: "legacy", title: "Legacy drafts", entries: ["draft", "submit"] }
+  ], children: [
+    { name: "request", summary: "Request human input from the active Leader session.", usage: "taskmux task input request <task-id> --question <text> [--choice <key=label> ...] [--blocks <type:id> ...] [--policy human-only|timeout] [--recommend <choice-key> --recommendation-reason <text> --timeout <duration>]", options: ["--question", "--choice", "--blocks", "--policy", "--recommend", "--recommendation-reason", "--timeout"], optionValues: { "--policy": ["human-only", "timeout"] } },
+    { name: "list", summary: "List global or task-scoped input requests.", usage: "taskmux task input list [<task-id>] [--all]", options: ["--all"] },
+    { name: "show", summary: "Show one input request.", usage: "taskmux task input show <request-id> [--task <task-id>]", options: ["--task"] },
+    { name: "answer", summary: "Answer one open input request.", usage: "taskmux task input answer <request-id> [--task <task-id>] (--choice <choice-key> | --text <text>)", options: ["--task", "--choice", "--text"] },
+    { name: "cancel", summary: "Cancel the current Leader's open input request.", usage: "taskmux task input cancel <task-id> <request-id> --reason <text>", options: ["--reason"] },
     { name: "draft", summary: "Draft task input.", usage: "taskmux task input draft <task-id> <body>" },
     { name: "submit", summary: "Submit drafted task input.", usage: "taskmux task input submit <task-id>" }
   ] },
