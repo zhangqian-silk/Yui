@@ -6,7 +6,13 @@ import { SYSTEM_LEADER_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js
 import { resolveAgent } from "../agent/agentRegistry.js";
 import { inspectCompletionStates } from "../completion/completionState.js";
 import type { CliIdentity } from "../cli/completion.js";
-import { COMPLETION_SHELLS, type CompletionShell, type TaskStore, type TaskmuxConfig } from "../storage/taskStore.js";
+import {
+  COMPLETION_SHELLS,
+  type CompletionShell,
+  type TaskReader,
+  type TaskStore,
+  type TaskmuxConfig
+} from "../storage/taskStore.js";
 
 type ConfigKey = "default-agent" | "default-workspace";
 
@@ -15,7 +21,7 @@ export function runConfigCommand(args: string[], store: TaskStore, env: NodeJS.P
 
   switch (command) {
     case "show":
-      return showConfigCommand(store, env);
+      return store.runReadSnapshot((snapshot) => showConfigCommand(snapshot, env));
     case "set":
       return setConfigCommand(rest, store);
     case "unset":
@@ -25,13 +31,24 @@ export function runConfigCommand(args: string[], store: TaskStore, env: NodeJS.P
   }
 }
 
-function showConfigCommand(store: TaskStore, env: NodeJS.ProcessEnv): string {
+export function runConfigReadCommand(
+  args: string[],
+  store: TaskReader,
+  env: NodeJS.ProcessEnv = process.env
+): string {
+  if (args[0] !== "show") {
+    throw usageError(args[0] === undefined ? "Config command is required." : `Unknown command: config ${args[0]}`);
+  }
+  return showConfigCommand(store, env);
+}
+
+function showConfigCommand(store: TaskReader, env: NodeJS.ProcessEnv): string {
   const config = store.getConfig();
 
   return `${renderConfigStatus(store, config, env)}\n`;
 }
 
-function renderConfigStatus(store: TaskStore, config: TaskmuxConfig, env: NodeJS.ProcessEnv): string {
+function renderConfigStatus(store: TaskReader, config: TaskmuxConfig, env: NodeJS.ProcessEnv): string {
   return renderTable(
     "TaskMux config",
     [
@@ -44,7 +61,7 @@ function renderConfigStatus(store: TaskStore, config: TaskmuxConfig, env: NodeJS
   );
 }
 
-function configStatusRows(store: TaskStore, config: TaskmuxConfig, env: NodeJS.ProcessEnv): string[][] {
+function configStatusRows(store: TaskReader, config: TaskmuxConfig, env: NodeJS.ProcessEnv): string[][] {
   const rows: string[][] = [];
   const defaultAgent = config.defaultAgent?.trim() ?? "";
 

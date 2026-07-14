@@ -8,7 +8,8 @@ import {
   assertTaskmuxHomeReady,
   FileTaskStore,
   inspectTaskmuxHome,
-  resolveTaskmuxHome
+  resolveTaskmuxHome,
+  type TaskmuxConfig
 } from "../storage/taskStore.js";
 import { inspectStorageSchema, type StorageSchemaState } from "../storage/storageSchema.js";
 import {
@@ -33,21 +34,23 @@ const TASKMUX_HOME_REQUIREMENT =
 export function runDoctor(
   env: NodeJS.ProcessEnv,
   executor: CommandExecutor,
-  agents: ConfiguredAgent[] = [],
   storageSchema: StorageSchemaState = inspectStorageSchema(resolveTaskmuxHome(env))
 ): string {
-  return renderDoctor(getDoctorChecks(env, executor, agents, storageSchema));
+  return renderDoctor(getDoctorChecks(env, executor, storageSchema));
 }
 
 export function getDoctorChecks(
   env: NodeJS.ProcessEnv,
   executor: CommandExecutor,
-  agents: ConfiguredAgent[] = [],
   storageSchema: StorageSchemaState = inspectStorageSchema(resolveTaskmuxHome(env))
 ): DoctorCheck[] {
   const rootDir = resolveTaskmuxHome(env);
   const taskmuxHome = checkTaskmuxHome(rootDir);
   const taskmuxHomeReady = taskmuxHome.status === "ok";
+  const storageFacts = taskmuxHomeReady
+    ? readDoctorStorageFacts(rootDir, storageSchema)
+    : undefined;
+  const agents = storageFacts?.kind === "data" ? storageFacts.agents : [];
   return [
     checkNode(),
     checkExecutable("tmux", env.TASKMUX_TMUX_BIN ?? "tmux", ["-V"], executor),
@@ -57,19 +60,58 @@ export function getDoctorChecks(
     taskmuxHome,
     checkNativeStorage(rootDir),
     taskmuxHomeReady
-      ? checkDefaultAgent(rootDir, storageSchema, agents)
+      ? checkDefaultAgent(storageSchema, storageFacts)
       : taskmuxHomeBlockedCheck("default agent", taskmuxHome),
     checkStorageSchema(storageSchema),
     taskmuxHomeReady
       ? checkStoragePermissions(rootDir)
       : taskmuxHomeBlockedCheck("storage permissions", taskmuxHome),
     taskmuxHomeReady
-      ? checkStorageRecords(rootDir, storageSchema)
+      ? checkStorageRecords(storageSchema, storageFacts)
       : taskmuxHomeBlockedCheck("storage records", taskmuxHome)
   ];
 }
 
-function checkDefaultAgent(rootDir: string, state: StorageSchemaState, agents: ConfiguredAgent[]): DoctorCheck {
+type DoctorStorageFacts = Readonly<{
+  kind: "data";
+  config: TaskmuxConfig;
+  agents: ConfiguredAgent[];
+  taskCount: number;
+  roleCount: number;
+  globalRoleCount: number;
+}> | Readonly<{
+  kind: "error";
+  detail: string;
+}>;
+
+function readDoctorStorageFacts(
+  rootDir: string,
+  state: StorageSchemaState
+): DoctorStorageFacts | undefined {
+  if (state.status !== "current") {
+    return undefined;
+  }
+  try {
+    return new FileTaskStore(rootDir).runReadSnapshot((snapshot) => {
+      const tasks = snapshot.listTasks();
+      return Object.freeze({
+        kind: "data" as const,
+        config: snapshot.getConfig(),
+        agents: snapshot.listConfiguredAgents(),
+        taskCount: tasks.length,
+        roleCount: tasks.reduce((count, task) => count + snapshot.listRoles(task.id).length, 0),
+        globalRoleCount: snapshot.listGlobalRoles().length
+      });
+    });
+  } catch (error) {
+    return Object.freeze({ kind: "error" as const, detail: errorMessage(error) });
+  }
+}
+
+function checkDefaultAgent(
+  state: StorageSchemaState,
+  storageFacts: DoctorStorageFacts | undefined
+): DoctorCheck {
   if (state.status === "unsupported") {
     return {
       name: "default agent",
@@ -86,45 +128,37 @@ function checkDefaultAgent(rootDir: string, state: StorageSchemaState, agents: C
     };
   }
 
-  try {
-    const config = new FileTaskStore(rootDir).getConfig();
-
-    if (config.defaultAgent === undefined || config.defaultAgent.length === 0) {
-      return {
-        name: "default agent",
-        status: "missing",
-        detail: "run taskmux setup"
-      };
-    }
-
-    if (resolveAgent(config.defaultAgent, agents) === null) {
-      return {
-        name: "default agent",
-        status: "invalid",
-        detail: `${config.defaultAgent} is not configured`
-      };
-    }
-
-    return {
-      name: "default agent",
-      status: "ok",
-      detail: config.defaultAgent
-    };
-  } catch (error) {
-    const procfdCode = taskmuxHomeProcfdSystemCode(error);
-    if (procfdCode !== undefined) {
-      return {
-        name: "default agent",
-        status: "unsupported",
-        detail: procfdTraversalUnsupportedDetail(procfdCode)
-      };
-    }
+  if (storageFacts?.kind === "error") {
     return {
       name: "default agent",
       status: "invalid",
-      detail: errorMessage(error)
+      detail: storageFacts.detail
     };
   }
+  const config = storageFacts?.config ?? { schemaVersion: 1 };
+  const agents = storageFacts?.agents ?? [];
+
+  if (config.defaultAgent === undefined || config.defaultAgent.length === 0) {
+    return {
+      name: "default agent",
+      status: "missing",
+      detail: "run taskmux setup"
+    };
+  }
+
+  if (resolveAgent(config.defaultAgent, agents) === null) {
+    return {
+      name: "default agent",
+      status: "invalid",
+      detail: `${config.defaultAgent} is not configured`
+    };
+  }
+
+  return {
+    name: "default agent",
+    status: "ok",
+    detail: config.defaultAgent
+  };
 }
 
 export function renderDoctor(checks: DoctorCheck[]): string {
@@ -522,7 +556,10 @@ function checkStoragePermissions(rootDir: string): DoctorCheck {
   }
 }
 
-function checkStorageRecords(rootDir: string, state: StorageSchemaState): DoctorCheck {
+function checkStorageRecords(
+  state: StorageSchemaState,
+  storageFacts: DoctorStorageFacts | undefined
+): DoctorCheck {
   if (state.status === "uninitialized") {
     return {
       name: "storage records",
@@ -547,25 +584,26 @@ function checkStorageRecords(rootDir: string, state: StorageSchemaState): Doctor
     };
   }
 
-  try {
-    const store = new FileTaskStore(rootDir);
-    const tasks = store.listTasks();
-    const roleCount = tasks.reduce((count, task) => count + store.listRoles(task.id).length, 0);
-    const agentCount = store.listConfiguredAgents().length;
-    const globalRoleCount = store.listGlobalRoles().length;
-
-    return {
-      name: "storage records",
-      status: "ok",
-      detail: `tasks=${tasks.length} roles=${roleCount} globalRoles=${globalRoleCount} agents=${agentCount}`
-    };
-  } catch (error) {
+  if (storageFacts?.kind === "error") {
     return {
       name: "storage records",
       status: "invalid",
-      detail: errorMessage(error)
+      detail: storageFacts.detail
     };
   }
+  const facts = storageFacts;
+  if (facts === undefined) {
+    return {
+      name: "storage records",
+      status: "invalid",
+      detail: "TaskMux storage facts are unavailable."
+    };
+  }
+  return {
+    name: "storage records",
+    status: "ok",
+    detail: `tasks=${facts.taskCount} roles=${facts.roleCount} globalRoles=${facts.globalRoleCount} agents=${facts.agents.length}`
+  };
 }
 
 function errorMessage(error: unknown): string {

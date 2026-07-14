@@ -32,3 +32,13 @@ export function mergePendingWakeup(
     lastRequestedAt: timestamp
   };
 }
+
+export function pendingWakeupsMatch(left: PendingWakeup, right: PendingWakeup): boolean {
+  return left.schemaVersion === right.schemaVersion &&
+    left.taskId === right.taskId &&
+    left.requestCount === right.requestCount &&
+    left.firstRequestedAt === right.firstRequestedAt &&
+    left.lastRequestedAt === right.lastRequestedAt &&
+    left.reasons.length === right.reasons.length &&
+    left.reasons.every((reason, index) => reason === right.reasons[index]);
+}

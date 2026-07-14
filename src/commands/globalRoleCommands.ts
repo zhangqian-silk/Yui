@@ -6,7 +6,7 @@ import { createGlobalRole, updateGlobalRole } from "../role/role.js";
 import type { GlobalRole } from "../role/role.js";
 import { isSystemRoleName, SYSTEM_ROLE_NAMES, systemRoleDescription } from "../role/systemRoles.js";
 import { resolveAgent, supportedAgentIds } from "../agent/agentRegistry.js";
-import type { TaskStore } from "../storage/taskStore.js";
+import type { TaskReader, TaskStore } from "../storage/taskStore.js";
 
 type GlobalRoleCommandOptions = {
   taskmuxHome?: string;
@@ -24,9 +24,9 @@ export function runGlobalRoleCommand(
     case "add":
       return addGlobalRoleCommand(rest, store);
     case "list":
-      return listGlobalRoleCommand(store);
+      return store.runReadSnapshot((snapshot) => listGlobalRoleCommand(snapshot));
     case "show":
-      return showGlobalRoleCommand(rest, store);
+      return store.runReadSnapshot((snapshot) => showGlobalRoleCommand(rest, snapshot));
     case "update":
       return updateGlobalRoleCommand(rest, store);
     case "remove":
@@ -67,7 +67,14 @@ function addGlobalRoleCommand(args: string[], store: TaskStore): string {
   return renderGlobalRole(`Added role ${role.name}`, role);
 }
 
-function listGlobalRoleCommand(store: TaskStore): string {
+export function runGlobalRoleReadCommand(args: string[], store: TaskReader): string {
+  const [command, ...rest] = args;
+  if (command === "list") return listGlobalRoleCommand(store);
+  if (command === "show") return showGlobalRoleCommand(rest, store);
+  throw usageError(command === undefined ? "Role command is required." : `Unknown command: role ${command}`);
+}
+
+function listGlobalRoleCommand(store: TaskReader): string {
   const rows = listGlobalRoleRows(store);
 
   if (rows.length === 0) {
@@ -87,7 +94,7 @@ function listGlobalRoleCommand(store: TaskStore): string {
   )}\n`;
 }
 
-function showGlobalRoleCommand(args: string[], store: TaskStore): string {
+function showGlobalRoleCommand(args: string[], store: TaskReader): string {
   const [name] = args;
   const roleName = parseGlobalRoleName(name);
   const role = store.getGlobalRole(roleName);
@@ -175,7 +182,7 @@ function enterGlobalRoleCommand(
 ): string {
   const [name] = args;
   const roleName = parseGlobalRoleName(name);
-  const role = store.getGlobalRole(roleName);
+  const role = store.runReadSnapshot((snapshot) => snapshot.getGlobalRole(roleName));
 
   if (role === null) {
     throw roleNotFound(roleName);
@@ -210,7 +217,7 @@ type GlobalRoleRow = {
   kind: string;
 };
 
-function listGlobalRoleRows(store: TaskStore): GlobalRoleRow[] {
+function listGlobalRoleRows(store: TaskReader): GlobalRoleRow[] {
   const configured = store.listGlobalRoles();
   const rows = new Map<string, GlobalRoleRow>();
 

@@ -5,7 +5,7 @@ import { dataError, usageError } from "../errors/cliError.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { GlobalRole, Role } from "../role/role.js";
 import type { ConfiguredAgent } from "../agent/agent.js";
-import type { TaskStore, TaskmuxConfig } from "../storage/taskStore.js";
+import type { TaskReader, TaskStore, TaskmuxConfig } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
 
 type TaskSnapshot = {
@@ -26,8 +26,17 @@ type TaskmuxSnapshot = {
 
 export function runExportCommand(args: string[], store: TaskStore): string {
   const output = readOption(args, "--output");
+  const snapshot = store.runReadSnapshot((reader) => exportSnapshot(reader));
+
+  mkdirSync(dirname(output), { recursive: true });
+  writeFileSync(output, `${JSON.stringify(snapshot, null, 2)}\n`);
+
+  return `Exported TaskMux data to ${output}\n`;
+}
+
+function exportSnapshot(store: TaskReader): TaskmuxSnapshot {
   const { completionInstallations: _hostLocalCompletion, ...portableConfig } = store.getConfig();
-  const snapshot: TaskmuxSnapshot = {
+  return {
     schemaVersion: 1,
     exportedAt: new Date().toISOString(),
     config: portableConfig,
@@ -43,11 +52,6 @@ export function runExportCommand(args: string[], store: TaskStore): string {
       events: store.listEvents(task.id)
     }))
   };
-
-  mkdirSync(dirname(output), { recursive: true });
-  writeFileSync(output, `${JSON.stringify(snapshot, null, 2)}\n`);
-
-  return `Exported TaskMux data to ${output}\n`;
 }
 
 export function runImportCommand(args: string[], store: TaskStore): string {

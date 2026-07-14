@@ -1,25 +1,42 @@
 import Database from "better-sqlite3";
 import { chmodSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import type { TaskStore } from "./taskStore.js";
+import type { TaskReader, TaskStore } from "./taskStore.js";
 
 export function rebuildDerivedIndex(rootDir: string, store: TaskStore): void {
+  const snapshot = store.runReadSnapshot((reader) => captureDerivedIndex(reader));
+  rebuildDerivedIndexSnapshot(rootDir, snapshot);
+}
+
+function captureDerivedIndex(store: TaskReader) {
+  return store.listTasks().map((task) => ({
+    task,
+    roles: store.listRoles(task.id),
+    workItems: store.listWorkItems(task.id),
+    inputRequests: store.listInputRequests(task.id)
+  }));
+}
+
+function rebuildDerivedIndexSnapshot(
+  rootDir: string,
+  snapshot: ReturnType<typeof captureDerivedIndex>
+): void {
   const runtimeDir = join(rootDir, "runtime");
   const indexFile = join(runtimeDir, "index.sqlite");
   mkdirSync(runtimeDir, { recursive: true });
 
   try {
-    rebuild(indexFile, store);
+    rebuild(indexFile, snapshot);
   } catch {
     rmSync(indexFile, { force: true });
     rmSync(`${indexFile}-shm`, { force: true });
     rmSync(`${indexFile}-wal`, { force: true });
-    rebuild(indexFile, store);
+    rebuild(indexFile, snapshot);
   }
   chmodSync(indexFile, 0o600);
 }
 
-function rebuild(indexFile: string, store: TaskStore): void {
+function rebuild(indexFile: string, snapshot: ReturnType<typeof captureDerivedIndex>): void {
   const database = new Database(indexFile);
   try {
     database.pragma("journal_mode = DELETE");
@@ -79,16 +96,15 @@ function rebuild(indexFile: string, store: TaskStore): void {
     const insertInputRequest = database.prepare(
       "INSERT INTO input_requests (request_id, task_id, status, policy, requester_agent, blocked_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     );
-    const tasks = store.listTasks();
     database.transaction(() => {
       database.exec("DELETE FROM tasks; DELETE FROM roles; DELETE FROM work_items; DELETE FROM input_requests; DELETE FROM metadata;");
       database.prepare("INSERT INTO metadata (key, value) VALUES ('schemaVersion', '1')").run();
-      for (const task of tasks) {
+      for (const { task, roles, workItems, inputRequests } of snapshot) {
         insertTask.run(task.id, task.title, task.archived ? 1 : 0, task.updatedAt);
-        for (const role of store.listRoles(task.id)) {
+        for (const role of roles) {
           insertRole.run(task.id, role.name, role.agent, role.status, role.workspace);
         }
-        for (const workItem of store.listWorkItems(task.id)) {
+        for (const workItem of workItems) {
           insertWorkItem.run(
             task.id,
             workItem.id,
@@ -99,7 +115,7 @@ function rebuild(indexFile: string, store: TaskStore): void {
             JSON.stringify(workItem.topics)
           );
         }
-        for (const request of store.listInputRequests(task.id)) {
+        for (const request of inputRequests) {
           insertInputRequest.run(
             request.id,
             request.taskId,

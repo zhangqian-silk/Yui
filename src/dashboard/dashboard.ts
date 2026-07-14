@@ -1,8 +1,8 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { runTaskCommand } from "../commands/taskCommands.js";
+import { runTaskCommand, runTaskReadSnapshot } from "../commands/taskCommands.js";
 import { CliError, usageError } from "../errors/cliError.js";
-import type { TaskStore } from "../storage/taskStore.js";
+import type { TaskReader, TaskStore } from "../storage/taskStore.js";
 import type { TmuxManager } from "../tmux/tmuxManager.js";
 
 export async function runDashboard(
@@ -37,13 +37,17 @@ export async function runDashboard(
 }
 
 function renderDashboard(store: TaskStore, tmux: TmuxManager): string {
+  return store.runReadSnapshot((snapshot) => renderDashboardSnapshot(snapshot, tmux));
+}
+
+function renderDashboardSnapshot(store: TaskReader, tmux: TmuxManager): string {
   return [
     "TaskMux dashboard",
-    runTaskCommand(["current"], store, tmux).trimEnd(),
-    runTaskCommand(["last"], store, tmux).trimEnd(),
+    runTaskReadSnapshot(["current"], store).trimEnd(),
+    runTaskReadSnapshot(["last"], store).trimEnd(),
     "",
     "Board",
-    runTaskCommand(["board", "--with-roles"], store, tmux).trimEnd(),
+    runTaskReadSnapshot(["board", "--with-roles"], store).trimEnd(),
     "",
     "Type help for commands. Type q to quit."
   ].join("\n").concat("\n");
@@ -78,7 +82,8 @@ async function handleDashboardLine(
   }
 
   try {
-    output.write(await executeTaskCommand(toTaskCommand(name, args, store)));
+    const taskCommand = store.runReadSnapshot((snapshot) => toTaskCommand(name, args, snapshot));
+    output.write(await executeTaskCommand(taskCommand));
   } catch (error) {
     if (error instanceof CliError) {
       output.write(`${error.code}: ${error.message}\n`);
@@ -91,7 +96,7 @@ async function handleDashboardLine(
   return "continue";
 }
 
-function toTaskCommand(name: string, args: string[], store: TaskStore): string[] {
+function toTaskCommand(name: string, args: string[], store: TaskReader): string[] {
   const normalizedName = normalizeDashboardCommandName(name);
 
   if (normalizedName === "task") {
@@ -176,7 +181,7 @@ function normalizeDashboardCommandName(name: string): string {
   }
 }
 
-function withDefaultTaskId(args: string[], store: TaskStore): string[] {
+function withDefaultTaskId(args: string[], store: TaskReader): string[] {
   if (args[0] !== undefined && !args[0].startsWith("--")) {
     return args;
   }
@@ -190,7 +195,7 @@ function withDefaultTaskId(args: string[], store: TaskStore): string[] {
   return [taskId, ...args];
 }
 
-function withDefaultTaskIdForRoleArgs(args: string[], store: TaskStore): string[] {
+function withDefaultTaskIdForRoleArgs(args: string[], store: TaskReader): string[] {
   if (args[0] !== undefined && args[1] !== undefined && isExplicitTaskId(args[0], store)) {
     return args;
   }
@@ -198,7 +203,7 @@ function withDefaultTaskIdForRoleArgs(args: string[], store: TaskStore): string[
   return [requireCurrentTaskId(store), ...args];
 }
 
-function withDefaultTaskIdUnlessTaskExists(args: string[], store: TaskStore): string[] {
+function withDefaultTaskIdUnlessTaskExists(args: string[], store: TaskReader): string[] {
   if (args[0] !== undefined && isExplicitTaskId(args[0], store)) {
     return args;
   }
@@ -206,11 +211,11 @@ function withDefaultTaskIdUnlessTaskExists(args: string[], store: TaskStore): st
   return [requireCurrentTaskId(store), ...args];
 }
 
-function isExplicitTaskId(value: string, store: TaskStore): boolean {
+function isExplicitTaskId(value: string, store: TaskReader): boolean {
   return store.getTask(value) !== null || /^task-\d+$/.test(value);
 }
 
-function requireCurrentTaskId(store: TaskStore): string {
+function requireCurrentTaskId(store: TaskReader): string {
   const taskId = store.getConfig().currentTaskId;
 
   if (taskId === undefined || taskId.length === 0) {

@@ -22,8 +22,8 @@ export function installCompletion(
   activate: boolean
 ): void {
   validateInstallation(installation);
+  const config = store.runReadSnapshot((snapshot) => snapshot.getConfig());
   writeManagedScript(shell, installation.scriptPath, identity);
-  const config = store.getConfig();
   store.saveConfig({
     ...config,
     completionInstallations: { ...config.completionInstallations, [shell]: installation }
@@ -35,7 +35,7 @@ export function installCompletion(
 }
 
 export function uninstallCompletion(store: TaskStore, shell: CompletionShell, identity: CliIdentity): void {
-  const config = store.getConfig();
+  const config = store.runReadSnapshot((snapshot) => snapshot.getConfig());
   const installation = config.completionInstallations?.[shell];
   if (installation === undefined) {
     return;

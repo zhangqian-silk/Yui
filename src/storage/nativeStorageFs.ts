@@ -46,6 +46,7 @@ export type NativePinnedRootReader = Readonly<{
 }>;
 
 type NativeStorageFsBinding = {
+  inspectDirectoryDescriptor(descriptor: number): NativeExactIdentity;
   acquireStableAncestorSharedBarrier(
     descriptor: number,
     expectedIdentity: NativeExactIdentity
@@ -112,6 +113,15 @@ type NativeStorageFsBinding = {
     expectedTargetParent: NativeExactIdentity,
     targetName: string
   ): NativePublicationReceipt;
+  removeExactEntry(
+    barrier: NativeStableAncestorBarrier,
+    parentRelativePath: string,
+    expectedParentBefore: NativeExactIdentity,
+    targetName: string,
+    expectedTarget: NativePublicationReceipt,
+    kind: "file" | "directory",
+    expectedParentAfter: NativeExactIdentity
+  ): NativeExactIdentity;
 };
 
 type BindingFailure = {
@@ -126,6 +136,7 @@ const LINUX_O_CLOEXEC = 0o2000000;
 const MAX_MANIFEST_BYTES = 4096n;
 const MAX_NATIVE_BINARY_BYTES = 16n * 1024n * 1024n;
 const REQUIRED_EXPORTS = Object.freeze([
+  "inspectDirectoryDescriptor",
   "acquireStableAncestorSharedBarrier",
   "acquireStableAncestorExclusiveBarrier",
   "releaseStableAncestorBarrier",
@@ -139,10 +150,18 @@ const REQUIRED_EXPORTS = Object.freeze([
   "releasePinnedDirectory",
   "publishAnonymousFileNoReplace",
   "linkPreparedFileNoReplace",
-  "renameNoReplaceExact"
+  "renameNoReplaceExact",
+  "removeExactEntry"
 ]);
 
 let loadedBinding: NativeStorageFsBinding | undefined;
+
+export function inspectDirectoryDescriptor(descriptor: number): NativeExactIdentity {
+  return loadBinding({
+    kind: "native-stable-ancestor-barrier",
+    state: "not-acquired"
+  }).inspectDirectoryDescriptor(descriptor);
+}
 
 export function acquireStableAncestorSharedBarrier(
   descriptor: number,
@@ -326,6 +345,36 @@ export function renameNoReplaceExact(
     targetParentRelativePath,
     expectedTargetParent,
     targetName
+  );
+}
+
+/**
+ * Removes a TaskMux-private, descriptor-relative cleanup entry.
+ *
+ * Authoritative public targets must retire through renameNoReplaceExact so a
+ * source swapped at the final component is restored or quarantined instead
+ * of being unlinked.
+ */
+export function removeExactEntry(
+  barrier: NativeStableAncestorBarrier,
+  parentRelativePath: string,
+  expectedParentBefore: NativeExactIdentity,
+  targetName: string,
+  expectedTarget: NativePublicationReceipt,
+  kind: "file" | "directory",
+  expectedParentAfter: NativeExactIdentity
+): NativeExactIdentity {
+  return loadBinding({
+    kind: "external-publication",
+    state: "not-published"
+  }).removeExactEntry(
+    barrier,
+    parentRelativePath,
+    expectedParentBefore,
+    targetName,
+    expectedTarget,
+    kind,
+    expectedParentAfter
   );
 }
 

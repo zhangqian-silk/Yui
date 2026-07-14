@@ -24,7 +24,7 @@ export async function runTaskShell(
   executeTaskCommand: (args: string[]) => Promise<string> = async (args) => runTaskCommand(args, store, tmux),
   resolveTaskArguments?: TaskShellArgumentResolver
 ): Promise<void> {
-  if (store.getTask(taskId) === null) {
+  if (store.runReadSnapshot((snapshot) => snapshot.getTask(taskId)) === null) {
     throw taskNotFound(taskId);
   }
 

@@ -28,7 +28,10 @@ export async function runCompletionWizard(
   question: CompletionQuestion,
   options: CompletionWizardOptions = {}
 ): Promise<string> {
-  const states = inspectCompletionStates(store.getConfig(), env, identity);
+  // Collect storage-backed completion state before awaiting terminal input. A
+  // snapshot capability is synchronous and must never span the interaction.
+  const states = store.runReadSnapshot((snapshot) =>
+    inspectCompletionStates(snapshot.getConfig(), env, identity));
   const current = currentCompletionShell(env);
   const defaultSelection = options.defaultSelection ?? "current-shell";
   const defaultHint = defaultSelection === "skip" ? " [skip]" : current === undefined ? "" : ` [${current}]`;

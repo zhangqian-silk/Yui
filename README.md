@@ -174,6 +174,16 @@ TaskMux stores authoritative state under `~/.taskmux` by default. Set `TASKMUX_H
 
 The SQLite index is derived and disposable. TaskMux refreshes derived state only at explicit Controller boundaries: startup, successful command transactions, and Scheduler scans. It does **not** watch or poll storage files. Use the CLI instead of editing TaskMux files directly when a change must take effect predictably.
 
+Read-only semantic commands capture one callback-bounded Native snapshot. The snapshot uses the same stable-ancestor authority as writers, pins the storage root for the synchronous callback, and cannot be retained or awaited after that callback returns. Task, configuration, role, runtime, and input records fail closed when malformed; only derived text may use a last-valid rendering.
+
+Scheduler wakeup preparation is likewise a coherent read, not a claim on a Role, session, or run. A later Role-runtime change must claim/CAS the exact prepared Role/session/run authority before any external launch or other side effect, and revalidate it afterward; the snapshot alone must not be described as dispatch ownership.
+
+### Storage concurrency integration
+
+`src/storage/domainTransaction.ts` is shared by the A1 writer-transaction work and the A2 read-snapshot work. A2 owns the exported `executeDomainReadSnapshot` boundary, its Native pinned-root/path-witness checks, and the outer `withNativeRootBarrier(..., "exclusive", ...)` around `executeDomainTransaction`; A1 may change recovery, staging, authoritative-path, or workspace details only inside that outer callback. Keep the Native barrier imports and release ordering intact, and do not reintroduce a SQLite-only semantic-read lock or a second independent lock around the transaction body. Read consumers must use `TaskStore.runReadSnapshot`.
+
+The A2 barrier alone does **not** pin A1's current string-path copy, stage, and apply operations if an external actor renames the storage root while a writer is running. The combined A1/A2 change must either perform every authoritative writer effect through pinned root/parent capabilities or prove the exact storage-path identity before each effect and at transaction exit; add that combined rename/swap RED test when the writer implementation is integrated. Do not describe the outer exclusive barrier alone as complete writer rename fencing.
+
 See [ARCHITECTURE.md](https://github.com/zhangqian-silk/TaskMux/blob/master/ARCHITECTURE.md) for the system model, persistence rules, and runtime boundaries.
 
 ## Development

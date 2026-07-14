@@ -10,17 +10,20 @@ import { ensureControllerRunning, runControllerCommand } from "./commands/contro
 import { callController } from "./controller/controller.js";
 import { runGlobalRoleCommand } from "./commands/globalRoleCommands.js";
 import { runExportCommand, runImportCommand, runPruneCommand } from "./commands/maintenanceCommands.js";
-import { runTaskCommand } from "./commands/taskCommands.js";
+import { recordTaskRoleAttached, runTaskCommand } from "./commands/taskCommands.js";
 import { runDashboard } from "./dashboard/dashboard.js";
 import { getDoctorChecks, renderDoctor, runDoctor } from "./doctor/doctor.js";
 import { CliError, dataError, usageError } from "./errors/cliError.js";
 import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
 import { runTaskShell } from "./shell/taskShell.js";
-import { FileTaskStore, inspectTaskmuxHome, resolveTaskmuxHome } from "./storage/taskStore.js";
+import { FileTaskStore, resolveTaskmuxHome } from "./storage/taskStore.js";
+import {
+  executeDomainExclusiveBarrier,
+  executeDomainTransaction
+} from "./storage/domainTransaction.js";
 import {
   inspectStorageSchema,
-  requireStorageSchema,
-  type StorageSchemaState
+  requireStorageSchema
 } from "./storage/storageSchema.js";
 import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
@@ -153,11 +156,8 @@ async function main(): Promise<void> {
 
   if (args[0] === "doctor") {
     const storageSchema = inspectStorageSchema(rootDir);
-    const agents = canReadStore(storageSchema) && isTaskmuxHomeReadyForRead(rootDir)
-      ? listConfiguredAgentsForDoctor(new FileTaskStore(rootDir))
-      : [];
 
-    emit(runDoctor(process.env, new NodeCommandExecutor(), agents, storageSchema));
+    emit(runDoctor(process.env, new NodeCommandExecutor(), storageSchema));
     return;
   }
 
@@ -183,7 +183,7 @@ async function main(): Promise<void> {
       await printControllerCommand(rootDir, "backup", []);
       return;
     }
-    emit(runBackupCommand(rootDir));
+    emit(executeDomainExclusiveBarrier(rootDir, () => runBackupCommand(rootDir)));
     return;
   }
 
@@ -211,7 +211,16 @@ async function main(): Promise<void> {
       await printControllerCommand(rootDir, "config", resolvedArgs.slice(1), discovery);
       return;
     }
-    emit(runConfigCommand(resolvedArgs.slice(1), store, process.env));
+    const commandArgs = resolvedArgs.slice(1);
+    emit(
+      isDirectConfigSnapshotRead(commandArgs)
+        ? runConfigCommand(commandArgs, store, process.env)
+        : executeDirectDomainCommand(
+          rootDir,
+          "config",
+          (transactionStore) => runConfigCommand(commandArgs, transactionStore, process.env)
+        )
+    );
     return;
   }
 
@@ -228,8 +237,11 @@ async function main(): Promise<void> {
       await printControllerCommand(rootDir, "import", args.slice(1));
       return;
     }
-    const store = new FileTaskStore(rootDir);
-    emit(runImportCommand(args.slice(1), store));
+    emit(executeDirectDomainCommand(
+      rootDir,
+      "import",
+      (transactionStore) => runImportCommand(args.slice(1), transactionStore)
+    ));
     return;
   }
 
@@ -239,7 +251,12 @@ async function main(): Promise<void> {
       await printControllerCommand(rootDir, "prune", args.slice(1));
       return;
     }
-    emit(runPruneCommand(args.slice(1), rootDir));
+    emit(executeDirectDomainCommand(
+      rootDir,
+      "prune",
+      (_transactionStore, workingRoot) => runPruneCommand(args.slice(1), workingRoot),
+      { includeBackups: true }
+    ));
     return;
   }
 
@@ -250,7 +267,7 @@ async function main(): Promise<void> {
 
     requireStorageSchema(rootDir);
     const store = new FileTaskStore(rootDir);
-    const role = store.getGlobalRole(SYSTEM_OPERATOR_ROLE);
+    const role = store.runReadSnapshot((snapshot) => snapshot.getGlobalRole(SYSTEM_OPERATOR_ROLE));
     if (role === null) {
       throw dataError("Operator role is not configured. Run taskmux setup.");
     }
@@ -281,7 +298,16 @@ async function main(): Promise<void> {
       await printControllerCommand(rootDir, "agent", resolvedArgs.slice(1), discovery);
       return;
     }
-    emit(runAgentCommand(resolvedArgs.slice(1), store));
+    const commandArgs = resolvedArgs.slice(1);
+    emit(
+      isDirectAgentSnapshotRead(commandArgs)
+        ? runAgentCommand(commandArgs, store)
+        : executeDirectDomainCommand(
+          rootDir,
+          "agent",
+          (transactionStore) => runAgentCommand(commandArgs, transactionStore)
+        )
+    );
     return;
   }
 
@@ -300,7 +326,17 @@ async function main(): Promise<void> {
       await printControllerCommand(rootDir, "role", resolvedArgs.slice(1), discovery);
       return;
     }
-    emit(runGlobalRoleCommand(resolvedArgs.slice(1), store, { taskmuxHome: rootDir }));
+    const commandArgs = resolvedArgs.slice(1);
+    emit(
+      isDirectGlobalRoleRead(commandArgs)
+        ? runGlobalRoleCommand(commandArgs, store, { taskmuxHome: rootDir })
+        : executeDirectDomainCommand(
+          rootDir,
+          "role",
+          (transactionStore, workingRoot) =>
+            runGlobalRoleCommand(commandArgs, transactionStore, { taskmuxHome: workingRoot })
+        )
+    );
     return;
   }
 
@@ -345,7 +381,13 @@ async function main(): Promise<void> {
       };
 
       if (discovery === undefined) {
-        await runTaskShell(taskId, store, tmux, undefined, resolveShellArguments);
+        await runTaskShell(
+          taskId,
+          store,
+          tmux,
+          async (commandArgs) => runDirectTaskCommand(rootDir, commandArgs, tmux),
+          resolveShellArguments
+        );
         return;
       }
       await runTaskShell(taskId, store, tmux, async (commandArgs) => {
@@ -381,7 +423,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    emit(runTaskCommand(taskArgs, store, tmux));
+    emit(runDirectTaskCommand(rootDir, taskArgs, tmux));
     return;
   }
 
@@ -442,6 +484,82 @@ async function attachTaskRoleThroughController(
   const output = runTaskCommand(commandArgs, store, tmux, { persistAttachStatus: false });
   await callController(discovery, "task.attach-complete", randomUUID(), { taskId, roleName });
   return output;
+}
+
+function executeDirectDomainCommand<T>(
+  rootDir: string,
+  label: string,
+  execute: (store: FileTaskStore, workingRoot: string) => T,
+  options: { includeBackups?: boolean } = {}
+): T {
+  return executeDomainTransaction(
+    rootDir,
+    `cli-${label}-${randomUUID()}`,
+    (workingRoot) => execute(new FileTaskStore(workingRoot), workingRoot),
+    () => [],
+    options
+  );
+}
+
+function runDirectTaskCommand(
+  rootDir: string,
+  commandArgs: string[],
+  tmux: TmuxManager
+): string {
+  if (isDirectTaskSnapshotRead(commandArgs)) {
+    return runTaskCommand(commandArgs, new FileTaskStore(rootDir), tmux);
+  }
+  if (commandArgs[0] === "enter") {
+    const output = runTaskCommand(
+      commandArgs,
+      new FileTaskStore(rootDir),
+      tmux,
+      { persistAttachStatus: false }
+    );
+    const [taskId, roleName] = commandArgs.slice(1);
+    if (taskId !== undefined && roleName !== undefined) {
+      executeDirectDomainCommand(
+        rootDir,
+        "task-attach-complete",
+        (transactionStore) => recordTaskRoleAttached(taskId, roleName, transactionStore)
+      );
+    }
+    return output;
+  }
+  return executeDirectDomainCommand(
+    rootDir,
+    "task",
+    (transactionStore) => runTaskCommand(commandArgs, transactionStore, tmux)
+  );
+}
+
+function isDirectConfigSnapshotRead(args: readonly string[]): boolean {
+  return args[0] === "show";
+}
+
+function isDirectAgentSnapshotRead(args: readonly string[]): boolean {
+  return ["list", "show"].includes(args[0] ?? "");
+}
+
+function isDirectGlobalRoleRead(args: readonly string[]): boolean {
+  return ["list", "show", "enter"].includes(args[0] ?? "");
+}
+
+function isDirectTaskSnapshotRead(args: readonly string[]): boolean {
+  const command = args[0] ?? "";
+  if ([
+    "list", "board", "last", "roles", "comments", "events",
+    "activity", "timeline", "tail", "detail"
+  ].includes(command)) {
+    return true;
+  }
+  if (command === "current") {
+    return args.length === 1;
+  }
+  if (command === "topic" && args[1] === "list") {
+    return true;
+  }
+  return command === "transcript" && args[1] === "export";
 }
 
 function emit(output: string): void {
@@ -564,10 +682,7 @@ function operatorLaunchEnvironment(
 async function runDefaultDashboard(rootDir: string): Promise<void> {
   const commandExecutor = new NodeCommandExecutor();
   const storageSchema = inspectStorageSchema(rootDir);
-  const agents = canReadStore(storageSchema) && isTaskmuxHomeReadyForRead(rootDir)
-    ? listConfiguredAgentsForDoctor(new FileTaskStore(rootDir))
-    : [];
-  const checks = getDoctorChecks(process.env, commandExecutor, agents, storageSchema);
+  const checks = getDoctorChecks(process.env, commandExecutor, storageSchema);
   const failedChecks = checks.filter((check) => check.status !== "ok");
 
   process.stdout.write(renderDoctor(checks));
@@ -581,7 +696,11 @@ async function runDefaultDashboard(rootDir: string): Promise<void> {
   const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", commandExecutor);
 
   if (process.env.TASKMUX_CONTROLLER_MODE === "direct") {
-    await runDashboard(store, tmux);
+    await runDashboard(
+      store,
+      tmux,
+      async (commandArgs) => runDirectTaskCommand(rootDir, commandArgs, tmux)
+    );
     return;
   }
   const discovery = await ensureControllerRunning(rootDir, process.env);
@@ -599,14 +718,6 @@ async function runDefaultDashboard(rootDir: string): Promise<void> {
   });
 }
 
-function isTaskmuxHomeReadyForRead(rootDir: string): boolean {
-  try {
-    return inspectTaskmuxHome(rootDir).status === "ready";
-  } catch {
-    return false;
-  }
-}
-
 function readPackageVersion(): string {
   try {
     const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -621,16 +732,4 @@ function readPackageVersion(): string {
   }
 
   return "0.0.0";
-}
-
-function canReadStore(state: StorageSchemaState): boolean {
-  return state.status === "current";
-}
-
-function listConfiguredAgentsForDoctor(store: FileTaskStore) {
-  try {
-    return store.listConfiguredAgents();
-  } catch {
-    return [];
-  }
 }

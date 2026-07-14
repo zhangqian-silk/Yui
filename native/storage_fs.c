@@ -17,6 +17,14 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+extern int renameat2(
+  int olddirfd,
+  const char *oldpath,
+  int newdirfd,
+  const char *newpath,
+  unsigned int flags
+) __attribute__((weak));
+
 #define TASKMUX_PRIVATE_FILE_MODE 0600U
 #define TASKMUX_PRIVATE_DIRECTORY_MODE 0700U
 #define TASKMUX_MAX_PUBLICATION_BYTES (64U * 1024U * 1024U)
@@ -582,6 +590,19 @@ static int renameat2_noreplace(
   int target_parent,
   const char *target_name
 ) {
+  if (renameat2 != NULL) {
+    int result;
+    do {
+      result = renameat2(
+        source_parent,
+        source_name,
+        target_parent,
+        target_name,
+        RENAME_NOREPLACE
+      );
+    } while (result != 0 && errno == EINTR);
+    return result;
+  }
 #if defined(__linux__) && defined(SYS_renameat2)
   long result;
   do {
@@ -869,6 +890,36 @@ static int open_expected_regular(
   return 0;
 }
 
+static int open_expected_entry(
+  int parent_descriptor,
+  const char *name,
+  const exact_receipt *expected,
+  bool require_directory,
+  int *descriptor,
+  struct stat *metadata,
+  uint64_t *birthtime_ns
+) {
+  int opened = openat2_beneath(parent_descriptor, name, O_PATH);
+  if (opened < 0) return -1;
+  if (capture_identity(opened, metadata, birthtime_ns) != 0 ||
+      !stat_matches_identity(
+        metadata,
+        *birthtime_ns,
+        &expected->identity,
+        require_directory ? S_IFDIR : S_IFREG
+      ) ||
+      (!require_directory && (
+        metadata->st_size < 0 || (uint64_t)metadata->st_size != expected->size
+      ))) {
+    int number = errno == 0 ? ESTALE : errno;
+    (void)close(opened);
+    errno = number;
+    return -1;
+  }
+  *descriptor = opened;
+  return 0;
+}
+
 static int create_stable_barrier_handle(
   napi_env env,
   stable_ancestor_barrier *barrier,
@@ -913,6 +964,55 @@ static int create_pinned_directory_handle(
   }
   if (status == napi_ok) status = napi_object_freeze(env, *result);
   return status == napi_ok;
+}
+
+static napi_value inspect_directory_descriptor(
+  napi_env env,
+  napi_callback_info info
+) {
+  size_t argument_count = 1;
+  napi_value arguments[1];
+  if (napi_get_cb_info(env, info, &argument_count, arguments, NULL, NULL) != napi_ok ||
+      argument_count != 1) {
+    return throw_type_error(env, "Expected an inherited directory descriptor.");
+  }
+
+  int descriptor;
+  if (!exact_nonnegative_int(env, arguments[0], &descriptor) ||
+      descriptor <= STDERR_FILENO) {
+    return throw_type_error(
+      env,
+      "directory descriptor must be an inherited non-stdio file descriptor."
+    );
+  }
+
+  struct stat metadata;
+  uint64_t birthtime_ns = 0;
+  if (capture_identity(descriptor, &metadata, &birthtime_ns) != 0) {
+    return throw_barrier_error(env, (storage_error){
+      errno, "stat-ancestor", "not-acquired"
+    });
+  }
+  if (!S_ISDIR(metadata.st_mode) || metadata.st_uid != geteuid()) {
+    return throw_barrier_error(env, (storage_error){
+      ESTALE, "verify-ancestor", "not-acquired"
+    });
+  }
+
+  napi_value result;
+  if (create_identity_result(env, &metadata, birthtime_ns, &result) != napi_ok) {
+    bool pending = false;
+    (void)napi_is_exception_pending(env, &pending);
+    if (!pending) {
+      napi_throw_error(
+        env,
+        "ERR_NATIVE_STORAGE_IDENTITY",
+        "Could not inspect the exact native directory identity."
+      );
+    }
+    return NULL;
+  }
+  return result;
 }
 
 static napi_value acquire_stable_ancestor_barrier(
@@ -2155,7 +2255,6 @@ static napi_value link_prepared_file_no_replace(
       )) {
     return NULL;
   }
-
   int source_parent_descriptor = -1;
   int target_parent_descriptor = -1;
   int source_descriptor = -1;
@@ -2306,6 +2405,22 @@ static napi_value rename_no_replace_exact(
       )) {
     return NULL;
   }
+  bool source_is_directory =
+    (expected_source.identity.mode & (uint64_t)S_IFMT) == (uint64_t)S_IFDIR;
+  bool source_is_regular =
+    (expected_source.identity.mode & (uint64_t)S_IFMT) == (uint64_t)S_IFREG;
+  if (!source_is_directory && !source_is_regular) {
+    free_link_or_rename_paths(
+      source_parent_path,
+      source_name,
+      target_parent_path,
+      target_name
+    );
+    return throw_type_error(
+      env,
+      "renameNoReplaceExact supports only exact regular-file or directory receipts."
+    );
+  }
 
   int source_parent_descriptor = -1;
   int target_parent_descriptor = -1;
@@ -2335,10 +2450,11 @@ static napi_value rename_no_replace_exact(
     failure = (storage_error){ errno, "openat2-target-parent", "not-published" };
     goto finish_rename;
   }
-  if (open_expected_regular(
+  if (open_expected_entry(
         source_parent_descriptor,
         source_name,
         &expected_source,
+        source_is_directory,
         &source_descriptor,
         &source_metadata,
         &source_birthtime_ns
@@ -2357,19 +2473,15 @@ static napi_value rename_no_replace_exact(
       failure = (storage_error){ EEXIST, "rename-target", "conflict" };
       goto finish_rename;
     }
-    if (open_regular_basename(
+    if (open_expected_entry(
           target_parent_descriptor,
           target_name,
+          &expected_source,
+          source_is_directory,
           &target_descriptor,
           &target_metadata,
           &target_birthtime_ns
-        ) == 0 &&
-        stat_matches_receipt(
-          &target_metadata,
-          target_birthtime_ns,
-          &expected_source
-        ) &&
-        private_regular_file(&target_metadata)) {
+        ) == 0) {
       renamed = true;
       failure = (storage_error){
         rename_error, "rename-target", "published-not-durable"
@@ -2382,22 +2494,37 @@ static napi_value rename_no_replace_exact(
     goto finish_rename;
   }
   renamed = true;
-  if (open_regular_basename(
+  if (open_expected_entry(
         target_parent_descriptor,
         target_name,
+        &expected_source,
+        source_is_directory,
         &target_descriptor,
         &target_metadata,
         &target_birthtime_ns
-      ) != 0 ||
-      !stat_matches_receipt(
-        &target_metadata,
-        target_birthtime_ns,
-        &expected_source
-      ) ||
-      !private_regular_file(&target_metadata)) {
-    failure = (storage_error){
-      errno == 0 ? EIO : errno, "verify-target", "indeterminate"
-    };
+      ) != 0) {
+    int verification_error = errno == 0 ? ESTALE : errno;
+    if (renameat2_noreplace(
+          target_parent_descriptor,
+          target_name,
+          source_parent_descriptor,
+          source_name
+        ) == 0) {
+      if (fsync(target_parent_descriptor) != 0 ||
+          fsync(source_parent_descriptor) != 0) {
+        failure = (storage_error){
+          errno, "restore-source", "source-restored-not-durable"
+        };
+      } else {
+        failure = (storage_error){
+          verification_error, "verify-target", "source-restored"
+        };
+      }
+    } else {
+      failure = (storage_error){
+        verification_error, "verify-target", "source-quarantined"
+      };
+    }
     goto finish_rename;
   }
   if (fsync(target_parent_descriptor) != 0) {
@@ -2455,6 +2582,169 @@ finish_rename:
   return result;
 }
 
+static napi_value remove_exact_entry(
+  napi_env env,
+  napi_callback_info info
+) {
+  size_t argument_count = 7;
+  napi_value arguments[7];
+  if (napi_get_cb_info(env, info, &argument_count, arguments, NULL, NULL) != napi_ok ||
+      argument_count != 7) {
+    return throw_type_error(
+      env,
+      "Expected exclusive barrier, parent receipts, target basename/receipt, and entry kind."
+    );
+  }
+  stable_ancestor_barrier *barrier = NULL;
+  if (!unwrap_barrier(env, arguments[0], true, &barrier)) return NULL;
+
+  exact_identity expected_parent_before;
+  exact_identity expected_parent_after;
+  exact_receipt expected_target;
+  if (!read_expected_identity(env, arguments[2], &expected_parent_before) ||
+      !read_expected_receipt(env, arguments[4], &expected_target) ||
+      !read_expected_identity(env, arguments[6], &expected_parent_after)) {
+    return throw_type_error(
+      env,
+      "Expected exact parent identities and target receipt."
+    );
+  }
+
+  char *parent_path = NULL;
+  char *target_name = NULL;
+  char *entry_kind = NULL;
+  size_t parent_length = 0;
+  size_t target_length = 0;
+  size_t kind_length = 0;
+  int parent_status = copy_string_argument(
+    env,
+    arguments[1],
+    &parent_path,
+    &parent_length
+  );
+  int target_status = copy_string_argument(
+    env,
+    arguments[3],
+    &target_name,
+    &target_length
+  );
+  int kind_status = copy_string_argument(
+    env,
+    arguments[5],
+    &entry_kind,
+    &kind_length
+  );
+  if (parent_status < 0 || target_status < 0 || kind_status < 0) {
+    free(parent_path);
+    free(target_name);
+    free(entry_kind);
+    return throw_publication_error(env, (storage_error){
+      ENOMEM, "copy-path", "not-published"
+    });
+  }
+  bool remove_directory = kind_status > 0 &&
+    strcmp(entry_kind, "directory") == 0;
+  bool remove_file = kind_status > 0 && strcmp(entry_kind, "file") == 0;
+  if (parent_status == 0 || !valid_relative_path(parent_path, parent_length) ||
+      target_status == 0 || !valid_basename(target_name, target_length) ||
+      (!remove_file && !remove_directory)) {
+    free(parent_path);
+    free(target_name);
+    free(entry_kind);
+    return throw_type_error(
+      env,
+      "Parent path and target name must be strict, and entry kind must be file or directory."
+    );
+  }
+
+  int parent_descriptor = -1;
+  int target_descriptor = -1;
+  struct stat target_metadata;
+  struct stat parent_after_metadata;
+  uint64_t target_birthtime_ns = 0;
+  uint64_t parent_after_birthtime_ns = 0;
+  storage_error failure = {0, "", ""};
+  if (open_directory_from_barrier(
+        barrier,
+        parent_path,
+        &expected_parent_before,
+        &parent_descriptor
+      ) != 0) {
+    failure = (storage_error){ errno, "openat2-parent", "not-published" };
+    goto finish_remove;
+  }
+  if (open_expected_entry(
+        parent_descriptor,
+        target_name,
+        &expected_target,
+        remove_directory,
+        &target_descriptor,
+        &target_metadata,
+        &target_birthtime_ns
+      ) != 0) {
+    failure = (storage_error){ errno, "openat2-target", "not-published" };
+    goto finish_remove;
+  }
+  if (unlinkat(
+        parent_descriptor,
+        target_name,
+        remove_directory ? AT_REMOVEDIR : 0
+      ) != 0) {
+    failure = (storage_error){ errno, "unlinkat-target", "not-published" };
+    goto finish_remove;
+  }
+  if (fsync(parent_descriptor) != 0) {
+    failure = (storage_error){ errno, "fsync-parent", "published-not-durable" };
+    goto finish_remove;
+  }
+  if (capture_identity(
+        parent_descriptor,
+        &parent_after_metadata,
+        &parent_after_birthtime_ns
+      ) != 0 ||
+      !stat_matches_identity(
+        &parent_after_metadata,
+        parent_after_birthtime_ns,
+        &expected_parent_after,
+        S_IFDIR
+      )) {
+    failure = (storage_error){
+      errno == 0 ? ESTALE : errno,
+      "verify-parent-after-remove",
+      "published-not-durable"
+    };
+    goto finish_remove;
+  }
+
+finish_remove:
+  if (target_descriptor >= 0) (void)close(target_descriptor);
+  if (parent_descriptor >= 0) (void)close(parent_descriptor);
+  free(parent_path);
+  free(target_name);
+  free(entry_kind);
+  if (failure.number != 0) return throw_publication_error(env, failure);
+
+  napi_value result;
+  napi_status status = create_identity_result(
+    env,
+    &parent_after_metadata,
+    parent_after_birthtime_ns,
+    &result
+  );
+  if (status == napi_ok) status = napi_object_freeze(env, result);
+  if (status != napi_ok) {
+    bool pending = false;
+    (void)napi_is_exception_pending(env, &pending);
+    if (!pending) napi_throw_error(
+      env,
+      "ERR_NATIVE_REMOVE_RECEIPT",
+      "Could not create exact remove parent receipt."
+    );
+    return NULL;
+  }
+  return result;
+}
+
 static napi_status export_function(
   napi_env env,
   napi_value exports,
@@ -2489,6 +2779,7 @@ static napi_value initialize(napi_env env, napi_value exports) {
     const char *name;
     napi_callback callback;
   } functions[] = {
+    { "inspectDirectoryDescriptor", inspect_directory_descriptor },
     { "acquireStableAncestorSharedBarrier", acquire_stable_ancestor_shared_barrier },
     { "acquireStableAncestorExclusiveBarrier", acquire_stable_ancestor_exclusive_barrier },
     { "releaseStableAncestorBarrier", release_stable_ancestor_barrier },
@@ -2502,7 +2793,8 @@ static napi_value initialize(napi_env env, napi_value exports) {
     { "releasePinnedDirectory", release_pinned_directory },
     { "publishAnonymousFileNoReplace", publish_anonymous_file_no_replace },
     { "linkPreparedFileNoReplace", link_prepared_file_no_replace },
-    { "renameNoReplaceExact", rename_no_replace_exact }
+    { "renameNoReplaceExact", rename_no_replace_exact },
+    { "removeExactEntry", remove_exact_entry }
   };
   napi_status status = napi_ok;
   for (size_t index = 0; index < sizeof(functions) / sizeof(functions[0]); index += 1U) {

@@ -39,6 +39,14 @@ function runTaskmuxFailure(args, env) {
   });
 }
 
+function pendingDomainTransactionIds(home) {
+  const directory = join(home, "runtime", "domain-transactions");
+  return [...new Set(readdirSync(directory).flatMap((name) => {
+    const match = /^([A-Za-z0-9_-]+)(?:\.receipt-[0-9]{12}-[a-f0-9]{64})?\.json$/.exec(name);
+    return match === null ? [] : [match[1]];
+  }))].sort();
+}
+
 function runTaskmuxInteractive(args, input, env) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [cli, ...args], {
@@ -547,7 +555,7 @@ test("reads edited task info from the user-editable info file", () => {
   assert.match(listOutput, tableCellsRegex("task-1", "ongoing", "Edited task title"));
 });
 
-test("keeps the last valid task value while preserving an invalid direct edit", async () => {
+test("fails closed for an invalid authoritative task edit instead of serving stale state", async () => {
   const home = createConfiguredHome();
   runTaskmux(["task", "create", "Last valid title"], { TASKMUX_HOME: home });
   const { FileTaskStore } = await import("../dist/storage/taskStore.js");
@@ -558,15 +566,15 @@ test("keeps the last valid task value while preserving an invalid direct edit", 
 
   assert.equal(store.getTask("task-1").title, "Last valid title");
   writeFileSync(infoFile, "{ invalid json\n");
-  assert.equal(store.getTask("task-1").title, "Last valid title");
+  assert.throws(() => store.getTask("task-1"), /Invalid task info record/);
   assert.equal(readFileSync(infoFile, "utf8"), "{ invalid json\n");
-  assert.match(diagnostics[0], /Invalid task info record/);
+  assert.deepEqual(diagnostics, []);
 
   writeFileSync(infoFile, JSON.stringify({ schemaVersion: 1, title: "Reloaded valid title" }));
   assert.equal(store.getTask("task-1").title, "Reloaded valid title");
 });
 
-test("atomically replaces task snapshots instead of following a state-file symlink", () => {
+test("fails closed instead of following a state-file symlink", () => {
   const home = createConfiguredHome();
 
   runTaskmux(["task", "create", "Protect local state writes"], { TASKMUX_HOME: home });
@@ -576,14 +584,16 @@ test("atomically replaces task snapshots instead of following a state-file symli
   unlinkSync(taskFile);
   symlinkSync(sentinel, taskFile);
 
-  runTaskmux(["task", "archive", "task-1"], { TASKMUX_HOME: home });
+  const result = runTaskmuxFailure(["task", "archive", "task-1"], { TASKMUX_HOME: home });
 
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Authoritative storage contains an unsupported entry/);
   assert.equal(JSON.parse(readFileSync(sentinel, "utf8")).archived, false);
-  assert.equal(JSON.parse(readFileSync(taskFile, "utf8")).archived, true);
-  assert.equal(lstatSync(taskFile).isSymbolicLink(), false);
+  assert.equal(JSON.parse(readFileSync(taskFile, "utf8")).archived, false);
+  assert.equal(lstatSync(taskFile).isSymbolicLink(), true);
 });
 
-test("atomically replaces append-only domain logs instead of following symlinks", () => {
+test("fails closed instead of following an append-only domain-log symlink", () => {
   const home = createConfiguredHome();
   runTaskmux(["task", "create", "Protect event writes"], { TASKMUX_HOME: home });
   const commentsFile = join(home, "tasks", "task-1", "comments.jsonl");
@@ -591,11 +601,16 @@ test("atomically replaces append-only domain logs instead of following symlinks"
   writeFileSync(sentinel, "");
   symlinkSync(sentinel, commentsFile);
 
-  runTaskmux(["task", "comment", "task-1", "Atomic comment"], { TASKMUX_HOME: home });
+  const result = runTaskmuxFailure(
+    ["task", "comment", "task-1", "Atomic comment"],
+    { TASKMUX_HOME: home }
+  );
 
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Authoritative storage contains an unsupported entry/);
   assert.equal(readFileSync(sentinel, "utf8"), "");
-  assert.match(readFileSync(commentsFile, "utf8"), /Atomic comment/);
-  assert.equal(lstatSync(commentsFile).isSymbolicLink(), false);
+  assert.equal(readFileSync(commentsFile, "utf8"), "");
+  assert.equal(lstatSync(commentsFile).isSymbolicLink(), true);
 });
 
 test("replays a staged complete snapshot after an interrupted write", async () => {
@@ -629,7 +644,13 @@ test("replays a complete multi-file domain transaction after partial application
     { type: "write", target: second, content: "new info\n" },
     { type: "delete", target: removed }
   ]);
-  writeFileSync(first, "new task\n");
+  assert.throws(
+    () => recovery.applyStagedDomainTransaction(home, "transaction-1", {
+      initialAfterOperation: 1,
+      recoveryAfterOperation: 1
+    }),
+    (error) => error.name === "DomainTransactionRecoveryError"
+  );
 
   const replayed = recovery.replayPendingDomainTransactions(home);
 
@@ -3308,7 +3329,7 @@ test("fails the Controller closed when mid-apply synchronous recovery cannot com
       }
     }
     assert.equal(status.running, false);
-    assert.equal(readdirSync(join(home, "runtime", "domain-transactions")).length, 1);
+    assert.equal(pendingDomainTransactionIds(home).length, 1);
 
     runTaskmux(["controller", "start"], { TASKMUX_HOME: home });
     assert.match(
@@ -3347,7 +3368,7 @@ test("fails the Controller closed when a background Scheduler transaction cannot
       }
     }
     assert.equal(status.running, false);
-    assert.equal(readdirSync(join(home, "runtime", "domain-transactions")).length, 1);
+    assert.equal(pendingDomainTransactionIds(home).length, 1);
 
     runTaskmux(["controller", "start"], { TASKMUX_HOME: home });
     assert.deepEqual(readdirSync(join(home, "runtime", "domain-transactions")), []);
@@ -4237,7 +4258,7 @@ test("controller does not depend on filesystem watchers", () => {
   assert.equal(existsSync(join(process.cwd(), "src", "storage", "fileReloadWatcher.ts")), false);
 });
 
-test("controller serves the last valid value and logs an invalid direct edit", () => {
+test("controller fails closed for an invalid authoritative task edit", () => {
   const home = createConfiguredHome();
   const env = { TASKMUX_HOME: home, TASKMUX_CONTROLLER_MODE: "auto" };
   runTaskmux(["task", "create", "Controller cached title"], { TASKMUX_HOME: home });
@@ -4248,17 +4269,16 @@ test("controller serves the last valid value and logs an invalid direct edit", (
     const infoFile = join(home, "tasks", "task-1", "info.json");
     writeFileSync(infoFile, "{ invalid json\n");
 
-    assert.match(runTaskmux(["task", "show", "task-1"], env), /Controller cached title/);
+    const result = runTaskmuxFailure(["task", "show", "task-1"], env);
+    assert.equal(result.status, 4);
+    assert.match(result.stderr, /DATA_ERROR: Invalid task info record: task-1/);
     assert.equal(readFileSync(infoFile, "utf8"), "{ invalid json\n");
-    const diagnostics = readFileSync(join(home, "runtime", "logs", "controller.jsonl"), "utf8");
-    assert.match(diagnostics, /storage.invalid_edit/);
-    assert.match(diagnostics, /Invalid task info record/);
   } finally {
     runTaskmuxFailure(["controller", "stop"], env);
   }
 });
 
-test("Scheduler continues from the last valid Task after an invalid direct edit", () => {
+test("Scheduler leaves an invalid authoritative task wakeup pending", () => {
   const home = createConfiguredHome();
   const { fakeTmux, logFile, stateFile } = createStatefulTmux(home);
   runTaskmux(["task", "create", "Last valid scheduled task"], { TASKMUX_HOME: home });
@@ -4290,15 +4310,15 @@ test("Scheduler continues from the last valid Task after an invalid direct edit"
     }, null, 2)}\n`);
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700);
 
-    assert.equal(existsSync(join(pendingDir, "task-1.json")), false);
-    assert.equal(existsSync(join(home, "runtime", "active-runs", "task-1", "leader.json")), true);
+    assert.equal(existsSync(join(pendingDir, "task-1.json")), true);
+    assert.equal(existsSync(join(home, "runtime", "active-runs", "task-1", "leader.json")), false);
     assert.equal(readFileSync(infoFile, "utf8"), "{ invalid json\n");
   } finally {
     runTaskmuxFailure(["controller", "stop"], env);
   }
 });
 
-test("controller primes individual role values before an invalid direct edit", () => {
+test("controller fails closed for an invalid authoritative role edit", () => {
   const home = createConfiguredHome();
   const env = { TASKMUX_HOME: home, TASKMUX_CONTROLLER_MODE: "auto" };
   runTaskmux(["task", "create", "Cache role records"], { TASKMUX_HOME: home });
@@ -4311,14 +4331,16 @@ test("controller primes individual role values before an invalid direct edit", (
     runTaskmux(["controller", "start"], env);
     const roleInfo = join(home, "tasks", "task-1", "roles", "reviewer", "info.json");
     writeFileSync(roleInfo, "{ invalid json\n");
-    assert.match(runTaskmux(["task", "detail", "task-1", "reviewer"], env), /Role: reviewer/);
+    const result = runTaskmuxFailure(["task", "detail", "task-1", "reviewer"], env);
+    assert.equal(result.status, 4);
+    assert.match(result.stderr, /DATA_ERROR: Invalid role info record: reviewer/);
     assert.equal(readFileSync(roleInfo, "utf8"), "{ invalid json\n");
   } finally {
     runTaskmuxFailure(["controller", "stop"], env);
   }
 });
 
-test("controller serves the last valid global configuration after an invalid edit", () => {
+test("controller fails closed for an invalid authoritative global role edit", () => {
   const home = createConfiguredHome();
   runTaskmux(
     ["role", "add", "reviewer", "--agent", "codex", "--workspace", "/tmp/project-a"],
@@ -4330,7 +4352,9 @@ test("controller serves the last valid global configuration after an invalid edi
     runTaskmux(["controller", "start"], env);
     const roleInfo = join(home, "roles", "reviewer", "role.json");
     writeFileSync(roleInfo, "{ invalid json\n");
-    assert.match(runTaskmux(["role", "show", "reviewer"], env), /Role: reviewer/);
+    const result = runTaskmuxFailure(["role", "show", "reviewer"], env);
+    assert.equal(result.status, 4);
+    assert.match(result.stderr, /DATA_ERROR: Invalid global role record: reviewer/);
     assert.equal(readFileSync(roleInfo, "utf8"), "{ invalid json\n");
   } finally {
     runTaskmuxFailure(["controller", "stop"], env);

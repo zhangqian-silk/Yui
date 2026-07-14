@@ -15,14 +15,19 @@ import { CliError, dataError, type CliErrorCode } from "../errors/cliError.js";
 import { expireStaleAgentRuns, failExitedAgentRuns, readAgentRunTtl, scanTaskWakeups } from "../scheduler/inactivityScanner.js";
 import { processLeaderWakeups } from "../scheduler/leaderWakeupProcessor.js";
 import { mergePendingWakeup } from "../scheduler/pendingWakeup.js";
-import { FileTaskStore, type TaskStore } from "../storage/taskStore.js";
+import { FileTaskStore, type TaskReader, type TaskStore } from "../storage/taskStore.js";
 import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
 import { TmuxManager } from "../tmux/tmuxManager.js";
-import { recordTaskRoleAttached, rememberTask, runTaskCommand } from "../commands/taskCommands.js";
-import { runAgentCommand } from "../commands/agentCommands.js";
+import {
+  recordTaskRoleAttached,
+  rememberTask,
+  runTaskCommand,
+  runTaskReadSnapshot
+} from "../commands/taskCommands.js";
+import { runAgentCommand, runAgentReadCommand } from "../commands/agentCommands.js";
 import { runBackupCommand } from "../commands/backupCommands.js";
-import { runConfigCommand } from "../commands/configCommands.js";
-import { runGlobalRoleCommand } from "../commands/globalRoleCommands.js";
+import { runConfigCommand, runConfigReadCommand } from "../commands/configCommands.js";
+import { runGlobalRoleCommand, runGlobalRoleReadCommand } from "../commands/globalRoleCommands.js";
 import { runImportCommand, runPruneCommand } from "../commands/maintenanceCommands.js";
 import {
   DomainTransactionRecoveryError,
@@ -125,19 +130,12 @@ export async function serveController(rootDir: string): Promise<void> {
           return;
         }
         if (error instanceof CliError && error.code === "DATA_ERROR") {
-          try {
-            appendControllerDiagnostic(
-              rootDir,
-              "scheduler.last_valid_fallback",
-              error.message
-            );
-            runSchedulerPass(store, tmux, new Date(), agentRunTtl, true);
-            pruneRpcResults(rootDir, new Date(), rpcResultRetention);
-            refreshDerivedState();
-            return;
-          } catch (fallbackError) {
-            error = fallbackError;
-          }
+          appendControllerDiagnostic(
+            rootDir,
+            "scheduler.authoritative_read_failed",
+            error.message
+          );
+          return;
         }
         appendControllerDiagnostic(
           rootDir,
@@ -402,9 +400,10 @@ async function handleRequest(
         return;
       }
 
-      const task = store.getTask(rpc.params.taskId);
+      const taskId = rpc.params.taskId;
+      const task = store.runReadSnapshot((snapshot) => snapshot.getTask(taskId));
       if (task === null) {
-        sendJson(response, 404, { error: `Task not found: ${rpc.params.taskId}` });
+        sendJson(response, 404, { error: `Task not found: ${taskId}` });
         return;
       }
       if (task.archived) {
@@ -452,7 +451,7 @@ async function handleRequest(
       const commandArgs = rpc.params.args;
       if (isTaskPointerCommand(commandArgs)) {
         const taskId = commandArgs[1] ?? "";
-        const output = runTaskCommand(commandArgs, store, tmux, { rememberTaskReads: false });
+        const output = store.runReadSnapshot((snapshot) => runTaskReadSnapshot(commandArgs, snapshot));
         const body = executeRpcTransaction(
           rootDir,
           rpc,
@@ -466,7 +465,9 @@ async function handleRequest(
         return;
       }
       if (isReadOnlyTaskCommand(commandArgs)) {
-        const output = runTaskCommand(commandArgs, store, tmux);
+        const output = commandArgs[0] === "tail"
+          ? runTaskCommand(commandArgs, store, tmux)
+          : store.runReadSnapshot((snapshot) => runTaskReadSnapshot(commandArgs, snapshot));
         sendJson(response, 200, { requestId: rpc.requestId, result: { output } });
         return;
       }
@@ -550,7 +551,8 @@ async function handleRequest(
       const commandGroup = rpc.params.group;
       const commandArgs = rpc.params.args;
       if (isReadOnlyControllerCommand(commandGroup, commandArgs)) {
-        const output = runControllerCommandGroup(commandGroup, commandArgs, store, rootDir);
+        const output = store.runReadSnapshot((snapshot) =>
+          runControllerReadCommandGroup(commandGroup, commandArgs, snapshot));
         sendJson(response, 200, { requestId: rpc.requestId, result: { output } });
         return;
       }
@@ -698,6 +700,23 @@ function runControllerCommandGroup(
       return runPruneCommand(args, rootDir);
     default:
       throw new Error(`Unsupported Controller command group: ${group}`);
+  }
+}
+
+function runControllerReadCommandGroup(
+  group: string,
+  args: string[],
+  store: TaskReader
+): string {
+  switch (group) {
+    case "config":
+      return runConfigReadCommand(args, store, process.env);
+    case "agent":
+      return runAgentReadCommand(args, store);
+    case "role":
+      return runGlobalRoleReadCommand(args, store);
+    default:
+      throw new Error(`Unsupported read-only Controller command group: ${group}`);
   }
 }
 

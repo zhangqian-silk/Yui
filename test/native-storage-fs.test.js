@@ -112,6 +112,7 @@ test("native storage authority exports one exact final ABI", () => {
       "acquireStableAncestorExclusiveBarrier",
       "acquireStableAncestorSharedBarrier",
       "getPinnedDirectoryIdentity",
+      "inspectDirectoryDescriptor",
       "inspectDirectoryAt",
       "linkPreparedFileNoReplace",
       "lstatPinnedDirectory",
@@ -122,7 +123,8 @@ test("native storage authority exports one exact final ABI", () => {
       "readdirPinnedDirectory",
       "releasePinnedDirectory",
       "releaseStableAncestorBarrier",
-      "renameNoReplaceExact"
+      "renameNoReplaceExact",
+      "removeExactEntry"
     ].sort()
   );
 });
