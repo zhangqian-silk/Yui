@@ -14,7 +14,9 @@ import {
 } from "./nativeStorageFs.js";
 
 const STAGING_DIRECTORY = "runtime/domain-staging";
-const TERMINAL_STAGE_PATTERN = /^[A-Za-z0-9_-]+\.stage-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const TRANSACTION_DIRECTORY = "runtime/domain-transactions";
+const TERMINAL_STAGE_PATTERN = /^([A-Za-z0-9_-]+)\.stage-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const TRANSACTION_RECEIPT_PATTERN = /^([A-Za-z0-9_-]+)(?:\..+)?\.json$/;
 
 /**
  * Retires terminal transaction staging under A1's exclusive barrier and only
@@ -28,9 +30,11 @@ export function pruneTerminalTransactionStaging(
   return executeDomainExclusiveBarrier(rootDir, ({ barrier, rootIdentity }) =>
     withPinnedRootAt(barrier, ".", rootIdentity, (reader) => {
       if (reader === undefined || reader.lstat(STAGING_DIRECTORY) === undefined) return 0;
-      const candidates = reader.readdir(STAGING_DIRECTORY)
-        .filter((name) => TERMINAL_STAGE_PATTERN.test(name))
-        .sort();
+      requireOwnedDirectory(reader, STAGING_DIRECTORY);
+      const candidates = selectTerminalTransactionStageNames(
+        reader.readdir(STAGING_DIRECTORY),
+        transactionReceiptNames(reader)
+      );
       if (dryRun) return candidates.length;
 
       for (const name of candidates) {
@@ -39,6 +43,27 @@ export function pruneTerminalTransactionStaging(
       return candidates.length;
     })
   );
+}
+
+export function selectTerminalTransactionStageNames(
+  stageNames: readonly string[],
+  receiptNames: readonly string[]
+): string[] {
+  const pendingIds = new Set<string>();
+  for (const name of receiptNames) {
+    const id = TRANSACTION_RECEIPT_PATTERN.exec(name)?.[1];
+    if (id !== undefined) pendingIds.add(id);
+  }
+  return stageNames.filter((name) => {
+    const id = TERMINAL_STAGE_PATTERN.exec(name)?.[1];
+    return id !== undefined && !pendingIds.has(id);
+  }).sort();
+}
+
+function transactionReceiptNames(reader: NativePinnedRootReader): readonly string[] {
+  if (reader.lstat(TRANSACTION_DIRECTORY) === undefined) return [];
+  requireOwnedDirectory(reader, TRANSACTION_DIRECTORY);
+  return reader.readdir(TRANSACTION_DIRECTORY);
 }
 
 function retireAndRemoveStage(

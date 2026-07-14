@@ -187,3 +187,33 @@ test("transaction prune dry-runs and safely clears terminal private staging", (t
   assert.match(applied, /Pruned private transaction staging: [1-9]/);
   assert.deepEqual(stagingDirectories(home), []);
 });
+
+test("transaction prune replays recoverable pending work before clearing terminal staging", (t) => {
+  const home = createConfiguredHome(t);
+  runTaskmux(["task", "create", "pending prune fixture"], { TASKMUX_HOME: home });
+  const terminalStages = stagingDirectories(home);
+  assert.ok(terminalStages.length > 0);
+
+  const interrupted = runTaskmuxFailure(
+    ["task", "update", "task-1", "--title", "pending replacement"],
+    {
+      TASKMUX_HOME: home,
+      NODE_ENV: "test",
+      TASKMUX_TEST_ONLY_DOMAIN_TRANSACTION_FAILPOINT: "after-operation:1-always"
+    }
+  );
+  assert.equal(interrupted.status, 5);
+  const [pendingId] = transactionIds(home);
+  assert.ok(pendingId);
+  const pendingStage = stagingDirectories(home).find((name) => name.startsWith(`${pendingId}.stage-`));
+  assert.ok(pendingStage, JSON.stringify({ pendingId, stages: stagingDirectories(home) }));
+
+  const output = runTaskmux(["prune", "--transactions"], { TASKMUX_HOME: home });
+  assert.match(output, /Pruned private transaction staging: [1-9]/);
+  assert.deepEqual(transactionIds(home), []);
+  assert.equal(stagingDirectories(home).includes(pendingStage), false);
+  assert.equal(taskTitle(home), "pending replacement");
+  for (const terminal of terminalStages) {
+    assert.equal(stagingDirectories(home).includes(terminal), false, terminal);
+  }
+});

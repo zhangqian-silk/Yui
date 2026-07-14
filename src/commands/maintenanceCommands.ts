@@ -176,14 +176,18 @@ export function executeRestoreCommand(
   rootDir: string,
   transactionId: string,
   args: string[],
-  extraOperations: (result: RestoreCommandResult) => DomainTransactionOperation[] = () => []
+  extraOperations: (result: RestoreCommandResult) => DomainTransactionOperation[] = () => [],
+  options: {
+    executeTransaction?: typeof executeDomainTransaction;
+    replayPending?: typeof replayPendingDomainTransactions;
+  } = {}
 ): RestoreCommandResult {
   let restoreResult: RestoreCommandResult | undefined;
   const failpoint = process.env.NODE_ENV === "test"
     ? process.env.TASKMUX_TEST_ONLY_RESTORE_FAILPOINT
     : undefined;
   try {
-    return executeDomainTransaction(
+    return (options.executeTransaction ?? executeDomainTransaction)(
       rootDir,
       transactionId,
       (workingRoot) => {
@@ -197,8 +201,7 @@ export function executeRestoreCommand(
       }
     );
   } catch (error) {
-    if (!(error instanceof DomainTransactionRecoveryError) || restoreResult === undefined ||
-        (failpoint !== "after-stage" && failpoint !== "crash-after-stage")) {
+    if (!(error instanceof DomainTransactionRecoveryError) || restoreResult === undefined) {
       throw error;
     }
     if (failpoint === "crash-after-stage") {
@@ -208,7 +211,7 @@ export function executeRestoreCommand(
     // The restore is durably committed once its journal is staged. Finish that
     // transaction first, then publish the pre-created rollback snapshot as one
     // second atomic domain transaction. No partial restored state is exposed.
-    replayPendingDomainTransactions(rootDir);
+    (options.replayPending ?? replayPendingDomainTransactions)(rootDir);
     executeDomainTransaction(
       rootDir,
       `${transactionId}-rollback`,

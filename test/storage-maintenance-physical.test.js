@@ -15,8 +15,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { runPruneCommand } from "../dist/commands/maintenanceCommands.js";
+import {
+  executeRestoreCommand,
+  runPruneCommand
+} from "../dist/commands/maintenanceCommands.js";
 import { backupAuthoritativeStoragePaths } from "../dist/storage/authoritativeStorage.js";
+import { executeDomainTransaction } from "../dist/storage/domainTransaction.js";
+import { DomainTransactionRecoveryError } from "../dist/storage/recoveryJournal.js";
+import { selectTerminalTransactionStageNames } from "../dist/storage/transactionStagingPrune.js";
 import {
   createStorageBackup,
   restoreStorageBackupInWorkingRoot
@@ -183,6 +189,82 @@ test("restore rejects a changed backup identity before creating rollback state",
   assert.equal(lstatSync(taskInfo).isSymbolicLink(), true);
 });
 
+test("a controlled non-crash recovery error replays restore and atomically rolls back", (t) => {
+  const root = createHome(t);
+  rmSync(join(root, "runtime", "domain-transactions"), { recursive: true, force: true });
+  const backup = createStorageBackup(root, FIRST);
+  writeJson(join(root, "tasks", "task-1", "info.json"), {
+    schemaVersion: 1,
+    title: "must remain current"
+  });
+
+  assert.throws(
+    () => executeRestoreCommand(
+      root,
+      "controlled-restore-recovery",
+      [backup.id, "--force"],
+      undefined,
+      { executeTransaction: interruptAfterTransactionStage }
+    ),
+    /automatically rolled back/
+  );
+  assert.equal(readJson(join(root, "tasks", "task-1", "info.json")).title, "must remain current");
+  assert.deepEqual(listTransactionReceipts(root), []);
+});
+
+test("restore replay failure keeps its journal and remains fail-closed", (t) => {
+  const root = createHome(t);
+  rmSync(join(root, "runtime", "domain-transactions"), { recursive: true, force: true });
+  const backup = createStorageBackup(root, FIRST);
+  writeJson(join(root, "tasks", "task-1", "info.json"), {
+    schemaVersion: 1,
+    title: "must survive replay failure"
+  });
+  const replayFailure = new DomainTransactionRecoveryError(
+    "controlled-restore-recovery-failure",
+    new Error("controlled replay failure"),
+    new Error("controlled replay failure")
+  );
+
+  assert.throws(
+    () => executeRestoreCommand(
+      root,
+      "controlled-restore-replay-failure",
+      [backup.id, "--force"],
+      undefined,
+      {
+        executeTransaction: interruptAfterTransactionStage,
+        replayPending: () => { throw replayFailure; }
+      }
+    ),
+    (error) => error === replayFailure && !/automatically rolled back/.test(error.message)
+  );
+  assert.equal(
+    readJson(join(root, "tasks", "task-1", "info.json")).title,
+    "must survive replay failure"
+  );
+  assert.ok(listTransactionReceipts(root).length > 0);
+});
+
+test("terminal staging selection skips every transaction id with a receipt", () => {
+  assert.deepEqual(
+    selectTerminalTransactionStageNames(
+      [
+        "pending.stage-11111111-1111-4111-8111-111111111111",
+        "unexpected-receipt.stage-33333333-3333-4333-8333-333333333333",
+        "completed.stage-22222222-2222-4222-8222-222222222222",
+        "not-a-stage"
+      ],
+      [
+        "pending.json",
+        "pending.receipt-000000000001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
+        "unexpected-receipt.unparseable-receipt.json"
+      ]
+    ),
+    ["completed.stage-22222222-2222-4222-8222-222222222222"]
+  );
+});
+
 test("prune retention supports dry-run and deletes only expired trash and surplus backups", (t) => {
   const root = createHome(t);
   const first = createStorageBackup(root, FIRST);
@@ -224,4 +306,19 @@ function listBackupIds(root) {
     .filter((entry) => entry.isDirectory() && entry.name.startsWith("backup-"))
     .map((entry) => entry.name)
     .sort();
+}
+
+function listTransactionReceipts(root) {
+  const transactions = join(root, "runtime", "domain-transactions");
+  return existsSync(transactions) ? readdirSync(transactions).sort() : [];
+}
+
+function interruptAfterTransactionStage(rootDir, id, execute, extraOperations, options) {
+  return executeDomainTransaction(
+    rootDir,
+    id,
+    execute,
+    extraOperations,
+    { ...options, testFailAfterStage: true }
+  );
 }
