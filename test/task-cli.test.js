@@ -39,6 +39,14 @@ function runTaskmuxFailure(args, env) {
   });
 }
 
+function pendingDomainTransactionIds(home) {
+  const directory = join(home, "runtime", "domain-transactions");
+  return [...new Set(readdirSync(directory).flatMap((name) => {
+    const match = /^([A-Za-z0-9_-]+)(?:\.receipt-[0-9]{12}-[a-f0-9]{64})?\.json$/.exec(name);
+    return match === null ? [] : [match[1]];
+  }))].sort();
+}
+
 function runTaskmuxInteractive(args, input, env) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [cli, ...args], {
@@ -566,7 +574,7 @@ test("fails closed for an invalid authoritative task edit instead of serving sta
   assert.equal(store.getTask("task-1").title, "Reloaded valid title");
 });
 
-test("atomically replaces task snapshots instead of following a state-file symlink", () => {
+test("fails closed instead of following a state-file symlink", () => {
   const home = createConfiguredHome();
 
   runTaskmux(["task", "create", "Protect local state writes"], { TASKMUX_HOME: home });
@@ -576,14 +584,16 @@ test("atomically replaces task snapshots instead of following a state-file symli
   unlinkSync(taskFile);
   symlinkSync(sentinel, taskFile);
 
-  runTaskmux(["task", "archive", "task-1"], { TASKMUX_HOME: home });
+  const result = runTaskmuxFailure(["task", "archive", "task-1"], { TASKMUX_HOME: home });
 
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Authoritative storage contains an unsupported entry/);
   assert.equal(JSON.parse(readFileSync(sentinel, "utf8")).archived, false);
-  assert.equal(JSON.parse(readFileSync(taskFile, "utf8")).archived, true);
-  assert.equal(lstatSync(taskFile).isSymbolicLink(), false);
+  assert.equal(JSON.parse(readFileSync(taskFile, "utf8")).archived, false);
+  assert.equal(lstatSync(taskFile).isSymbolicLink(), true);
 });
 
-test("atomically replaces append-only domain logs instead of following symlinks", () => {
+test("fails closed instead of following an append-only domain-log symlink", () => {
   const home = createConfiguredHome();
   runTaskmux(["task", "create", "Protect event writes"], { TASKMUX_HOME: home });
   const commentsFile = join(home, "tasks", "task-1", "comments.jsonl");
@@ -591,11 +601,16 @@ test("atomically replaces append-only domain logs instead of following symlinks"
   writeFileSync(sentinel, "");
   symlinkSync(sentinel, commentsFile);
 
-  runTaskmux(["task", "comment", "task-1", "Atomic comment"], { TASKMUX_HOME: home });
+  const result = runTaskmuxFailure(
+    ["task", "comment", "task-1", "Atomic comment"],
+    { TASKMUX_HOME: home }
+  );
 
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Authoritative storage contains an unsupported entry/);
   assert.equal(readFileSync(sentinel, "utf8"), "");
-  assert.match(readFileSync(commentsFile, "utf8"), /Atomic comment/);
-  assert.equal(lstatSync(commentsFile).isSymbolicLink(), false);
+  assert.equal(readFileSync(commentsFile, "utf8"), "");
+  assert.equal(lstatSync(commentsFile).isSymbolicLink(), true);
 });
 
 test("replays a staged complete snapshot after an interrupted write", async () => {
@@ -629,7 +644,13 @@ test("replays a complete multi-file domain transaction after partial application
     { type: "write", target: second, content: "new info\n" },
     { type: "delete", target: removed }
   ]);
-  writeFileSync(first, "new task\n");
+  assert.throws(
+    () => recovery.applyStagedDomainTransaction(home, "transaction-1", {
+      initialAfterOperation: 1,
+      recoveryAfterOperation: 1
+    }),
+    (error) => error.name === "DomainTransactionRecoveryError"
+  );
 
   const replayed = recovery.replayPendingDomainTransactions(home);
 
@@ -3308,7 +3329,7 @@ test("fails the Controller closed when mid-apply synchronous recovery cannot com
       }
     }
     assert.equal(status.running, false);
-    assert.equal(readdirSync(join(home, "runtime", "domain-transactions")).length, 1);
+    assert.equal(pendingDomainTransactionIds(home).length, 1);
 
     runTaskmux(["controller", "start"], { TASKMUX_HOME: home });
     assert.match(
@@ -3347,7 +3368,7 @@ test("fails the Controller closed when a background Scheduler transaction cannot
       }
     }
     assert.equal(status.running, false);
-    assert.equal(readdirSync(join(home, "runtime", "domain-transactions")).length, 1);
+    assert.equal(pendingDomainTransactionIds(home).length, 1);
 
     runTaskmux(["controller", "start"], { TASKMUX_HOME: home });
     assert.deepEqual(readdirSync(join(home, "runtime", "domain-transactions")), []);
