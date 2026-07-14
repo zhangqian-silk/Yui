@@ -1,31 +1,14 @@
 export type RoleWorktree = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   taskId: string;
   roleName: string;
-  repository: string;
+  repositoryRoot: string;
+  commonDir: string;
+  repositoryFingerprint: string;
   path: string;
-  branch: string;
-  base?: string;
+  worktreeGitDir: string;
+  branchRef: string;
+  headOid: string;
+  ownerToken: string;
   createdAt: string;
 };
-
-export function createRoleWorktree(
-  taskId: string,
-  roleName: string,
-  repository: string,
-  path: string,
-  branch: string,
-  base: string | undefined,
-  now: Date
-): RoleWorktree {
-  return {
-    schemaVersion: 1,
-    taskId,
-    roleName,
-    repository,
-    path,
-    branch,
-    ...(base === undefined ? {} : { base }),
-    createdAt: now.toISOString()
-  };
-}

@@ -1,7 +1,8 @@
 import { dataError } from "../errors/cliError.js";
 import type { Role, RoleProfile } from "../role/role.js";
-import type { AgentEnvironment } from "../agent/agent.js";
+import type { RoleAgentBinding } from "../role/role.js";
 import type { Task, TaskPriority } from "../task/task.js";
+import { isRoleProfileRecord, isTaskRoleRecord } from "./recordValidation.js";
 
 export type TaskInfoRecord = {
   schemaVersion: 1;
@@ -30,11 +31,10 @@ export type RoleInfoRecord = RoleProfile & {
 };
 
 export type RoleRuntimeRecord = {
-  schemaVersion: 1;
-  agent: string;
-  command: string;
-  args: string[];
-  env: AgentEnvironment;
+  schemaVersion: 2;
+  taskId: string;
+  activeAgentId: string;
+  agentBindings: Record<string, RoleAgentBinding>;
   workspace: string;
   status: Role["status"];
   createdAt: string;
@@ -99,10 +99,9 @@ export class TaskRecordCodec {
     return {
       runtime: {
         schemaVersion: role.schemaVersion,
-        agent: role.agent,
-        command: role.command,
-        args: role.args,
-        env: role.env,
+        taskId: role.taskId,
+        activeAgentId: role.activeAgentId,
+        agentBindings: role.agentBindings,
         workspace: role.workspace,
         status: role.status,
         createdAt: role.createdAt,
@@ -121,8 +120,8 @@ export class TaskRecordCodec {
     };
   }
 
-  decodeRole(name: string, runtimeRaw: string, infoRaw: string | null): Role {
-    const runtime = this.parseRoleRuntime(name, runtimeRaw);
+  decodeRole(taskId: string, name: string, runtimeRaw: string, infoRaw: string | null): Role {
+    const runtime = this.parseRoleRuntime(taskId, name, runtimeRaw);
 
     if (infoRaw === null) {
       throw dataError(`Invalid role info record: ${name}`);
@@ -130,10 +129,8 @@ export class TaskRecordCodec {
 
     const info = this.parseRoleInfo(name, infoRaw);
 
-    return {
-      ...runtime,
-      ...info
-    };
+    const { schemaVersion: _infoSchemaVersion, ...profile } = info;
+    return { ...runtime, ...profile };
   }
 
   private parseTaskRuntime(id: string, raw: string): TaskRuntimeRecord {
@@ -141,8 +138,11 @@ export class TaskRecordCodec {
 
     if (
       !isRecord(value) ||
+      !hasExactKeys(value, [
+        "schemaVersion", "id", "archived", "createdAt", "updatedAt"
+      ], ["archivedAt", "archivedBy", "archiveReason", "archiveSummary"]) ||
       value.schemaVersion !== 1 ||
-      typeof value.id !== "string" ||
+      value.id !== id ||
       "title" in value ||
       "status" in value ||
       typeof value.archived !== "boolean" ||
@@ -174,8 +174,9 @@ export class TaskRecordCodec {
 
     if (
       !isRecord(value) ||
+      !hasExactKeys(value, ["schemaVersion", "title"], ["description", "priority", "tags", "dueAt"]) ||
       value.schemaVersion !== 1 ||
-      typeof value.title !== "string" ||
+      typeof value.title !== "string" || value.title.trim().length === 0 ||
       (value.description !== undefined && typeof value.description !== "string") ||
       (value.priority !== undefined && !isTaskPriority(value.priority)) ||
       (value.tags !== undefined && !isStringArray(value.tags)) ||
@@ -187,42 +188,26 @@ export class TaskRecordCodec {
     return value as TaskInfoRecord;
   }
 
-  private parseRoleRuntime(name: string, raw: string): RoleRuntimeRecord {
+  private parseRoleRuntime(taskId: string, name: string, raw: string): RoleRuntimeRecord {
     const value = parseJson(raw, `Invalid role record: ${name}`);
 
-    if (
-      !isRecord(value) ||
-      value.schemaVersion !== 1 ||
-      "name" in value ||
-      typeof value.agent !== "string" ||
-      typeof value.command !== "string" ||
-      !isStringArray(value.args) ||
-      !isStringRecord(value.env) ||
-      typeof value.workspace !== "string" ||
-      !["idle", "running", "detached", "exited", "failed"].includes(String(value.status)) ||
-      typeof value.createdAt !== "string" ||
-      typeof value.updatedAt !== "string"
-    ) {
+    if (!isRecord(value) || !hasExactKeys(value, [
+      "schemaVersion", "taskId", "activeAgentId", "agentBindings", "workspace", "status", "createdAt", "updatedAt"
+    ])) {
+      throw dataError(`Invalid role record: ${name}`);
+    }
+    const candidate = { ...value, name };
+    if (!isTaskRoleRecord(candidate, taskId, name)) {
       throw dataError(`Invalid role record: ${name}`);
     }
 
-    return value as RoleRuntimeRecord;
+    return value as unknown as RoleRuntimeRecord;
   }
 
   private parseRoleInfo(name: string, raw: string): RoleInfoRecord {
     const value = parseJson(raw, `Invalid role info record: ${name}`);
 
-    if (
-      !isRecord(value) ||
-      value.schemaVersion !== 1 ||
-      typeof value.name !== "string" ||
-      !isOptionalString(value.description) ||
-      (value.responsibilities !== undefined && !isStringArray(value.responsibilities)) ||
-      (value.constraints !== undefined && !isStringArray(value.constraints)) ||
-      !isOptionalString(value.expectedOutput) ||
-      !isOptionalString(value.systemPrompt) ||
-      (value.skills !== undefined && !isStringArray(value.skills))
-    ) {
+    if (!isRoleProfileRecord(value, name)) {
       throw dataError(`Invalid role info record: ${name}`);
     }
 
@@ -241,7 +226,12 @@ function parseJson(raw: string, message: string): unknown {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
+  const allowed = new Set([...required, ...optional]);
+  return required.every((key) => Object.hasOwn(value, key)) && Object.keys(value).every((key) => allowed.has(key));
 }
 
 function isStringArray(value: unknown): value is string[] {

@@ -44,7 +44,7 @@ function createHome(t) {
   mkdirSync(join(root, "runtime", "domain-staging", "old.stage-11111111-1111-4111-8111-111111111111"), { recursive: true });
   writeJson(join(root, "schema.json"), {
     schemaVersion: 1,
-    storageVersion: 3,
+    storageVersion: 4,
     updatedAt: FIRST.toISOString()
   });
   writeJson(join(root, "config.json"), { schemaVersion: 1, defaultAgent: "codex" });
@@ -124,7 +124,7 @@ test("the unified registry backs up host-bound authority but excludes operationa
   ]);
 
   const backup = createStorageBackup(root, FIRST);
-  assert.equal(readJson(join(backup.path, "schema.json")).storageVersion, 3);
+  assert.equal(readJson(join(backup.path, "schema.json")).storageVersion, 4);
   assert.equal(
     readJson(join(backup.path, "runtime", "role-sessions", "task-1", "leader.json")).nativeSessionId,
     "native-before"

@@ -6,13 +6,23 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  utimesSync,
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
 
+import {
+  createRoleSessionSet,
+  recordRoleAgentSession
+} from "../dist/executor/agentExecutor.js";
+import { createRole } from "../dist/role/role.js";
+import { FileTaskStore } from "../dist/storage/taskStore.js";
+import { createTask } from "../dist/task/task.js";
+
 const cli = join(process.cwd(), "dist", "cli.js");
+const SESSION_FINGERPRINT = "a".repeat(64);
 
 function runTaskmux(args, env = {}) {
   return execFileSync(process.execPath, [cli, ...args], {
@@ -36,7 +46,7 @@ function createConfiguredHome(t) {
   });
   writeFileSync(join(home, "schema.json"), `${JSON.stringify({
     schemaVersion: 1,
-    storageVersion: 3,
+    storageVersion: 4,
     updatedAt: "2026-07-14T00:00:00.000Z"
   }, null, 2)}\n`);
   runTaskmux(["agent", "add", "codex", "--command", "codex"], { TASKMUX_HOME: home });
@@ -81,6 +91,52 @@ function stagingDirectories(home) {
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
     .sort();
+}
+
+function createTrashedRoleTask(home, taskId, nativeSessionId) {
+  const now = new Date();
+  const store = new FileTaskStore(home);
+  store.saveTask(createTask(taskId, taskId, now));
+  store.saveRole(taskId, createRole(
+    taskId,
+    "leader",
+    [{ agentId: "codex", adapterId: "codex", config: { adapterId: "codex" } }],
+    "codex",
+    "/repo",
+    now
+  ));
+  store.saveRoleSessionSet(recordRoleAgentSession(
+    createRoleSessionSet({ scope: "task", taskId, roleName: "leader" }, "codex", now),
+    {
+      agentId: "codex",
+      adapterId: "codex",
+      nativeSessionId,
+      policy: "fixed",
+      status: "ready",
+      sessionRoot: `/sessions/${nativeSessionId}`,
+      worktreeRoot: "/repo",
+      configFingerprint: {
+        overall: SESSION_FINGERPRINT,
+        replayable: SESSION_FINGERPRINT,
+        permission: SESSION_FINGERPRINT,
+        sessionBound: SESSION_FINGERPRINT
+      },
+      permissionEnvelope: { adapterId: "codex" }
+    },
+    now
+  ));
+  assert.equal(store.deleteTask(taskId), true);
+}
+
+function nativeIdentityState(home, nativeSessionId) {
+  const ledger = JSON.parse(readFileSync(
+    join(home, "runtime", "native-session-identities.json"),
+    "utf8"
+  ));
+  const [key] = Object.keys(ledger.identities)
+    .filter((candidate) => JSON.parse(candidate)[2] === nativeSessionId);
+  assert.ok(key, `missing native session identity: ${nativeSessionId}`);
+  return ledger.identities[key].state;
 }
 
 test("catalog and doctor expose complete physical maintenance closure", (t) => {
@@ -145,6 +201,42 @@ test("Controller backup, restore, and prune return the same maintenance output c
   ));
   assert.equal(pruneJson.ok, true);
   assert.match(pruneJson.output, /Dry run/);
+});
+
+test("CLI trash retention selects source ages, retires only expired identities, and recovers staged pruning", (t) => {
+  const home = createConfiguredHome(t);
+  createTrashedRoleTask(home, "task-1", "expired-native");
+  createTrashedRoleTask(home, "task-2", "recent-native");
+  const now = Date.now();
+  const expired = new Date(now - 3 * 24 * 60 * 60 * 1000);
+  const recent = new Date(now);
+  utimesSync(join(home, "trash", "tasks", "task-1"), expired, expired);
+  utimesSync(join(home, "trash", "tasks", "task-2"), recent, recent);
+
+  const interrupted = runTaskmuxFailure(
+    ["prune", "--trash", "--keep-trash-days", "1"],
+    {
+      TASKMUX_HOME: home,
+      NODE_ENV: "test",
+      TASKMUX_TEST_ONLY_DOMAIN_TRANSACTION_FAILPOINT: "after-stage"
+    }
+  );
+  assert.equal(interrupted.status, 5, interrupted.stderr);
+  assert.equal(existsSync(join(home, "trash", "tasks", "task-1")), true);
+  assert.equal(existsSync(join(home, "trash", "tasks", "task-2")), true);
+  assert.equal(nativeIdentityState(home, "expired-native"), "owned");
+  assert.equal(nativeIdentityState(home, "recent-native"), "owned");
+  assert.equal(transactionIds(home).length, 1);
+
+  const recovered = runTaskmux(["prune", "--trash", "--keep-trash-days", "1"], {
+    TASKMUX_HOME: home
+  });
+  assert.match(recovered, /Pruned trash tasks: 0/);
+  assert.equal(existsSync(join(home, "trash", "tasks", "task-1")), false);
+  assert.equal(existsSync(join(home, "trash", "tasks", "task-2")), true);
+  assert.equal(nativeIdentityState(home, "expired-native"), "retired");
+  assert.equal(nativeIdentityState(home, "recent-native"), "owned");
+  assert.deepEqual(transactionIds(home), []);
 });
 
 test("restore failure rolls back automatically while a simulated crash replays on restart", (t) => {

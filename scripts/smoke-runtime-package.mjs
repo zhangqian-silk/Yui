@@ -70,7 +70,7 @@ try {
   const { prepareGlobalRoleLaunch } = await import(pathToFileURL(
     join(root, "dist", "operator", "operatorContext.js")
   ).href);
-  const launch = prepareGlobalRoleLaunch(operatorRole(), {
+  const launch = prepareGlobalRoleLaunch(operatorRole(), operatorAgent(), {
     taskmuxHome: home,
     baseEnv: { ...process.env, CODEX_HOME: join(home, "codex-home") }
   });
@@ -109,16 +109,34 @@ function taskRole(name) {
 
 function operatorRole() {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     name: "operator",
-    agent: "codex",
-    command: "codex",
-    args: [],
-    env: {},
+    activeAgentId: "codex",
+    agentBindings: {
+      codex: {
+        agentId: "codex",
+        adapterId: "codex",
+        config: { adapterId: "codex" }
+      }
+    },
     workspace: "/tmp/runtime-package-smoke",
     createdAt: "2026-07-14T00:00:00.000Z",
     updatedAt: "2026-07-14T00:00:00.000Z",
     responsibilities: [],
     constraints: []
+  };
+}
+
+function operatorAgent() {
+  return {
+    schemaVersion: 2,
+    id: "codex",
+    adapterId: "codex",
+    command: "taskmux-runtime-package-codex",
+    baseArgs: [],
+    environment: [],
+    source: "custom",
+    createdAt: "2026-07-14T00:00:00.000Z",
+    updatedAt: "2026-07-14T00:00:00.000Z"
   };
 }

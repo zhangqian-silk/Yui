@@ -14,7 +14,8 @@ export function withTaskmuxRunEnvironment(
   taskmuxHome: string,
   role: Role,
   run: AgentRun,
-  nativeSessionId?: string
+  nativeSessionId?: string,
+  nativeSessionRoot?: string
 ): AgentLaunchPlan {
   return {
     ...launch,
@@ -23,8 +24,11 @@ export function withTaskmuxRunEnvironment(
       TASKMUX_HOME: taskmuxHome,
       TASKMUX_TASK_ID: run.taskId,
       TASKMUX_ROLE: role.name,
+      TASKMUX_AGENT_ID: role.activeAgentId,
+      TASKMUX_ADAPTER_ID: role.agentBindings[role.activeAgentId]?.adapterId ?? "",
       TASKMUX_RUN_ID: run.id,
       TASKMUX_WORKSPACE: role.workspace,
+      ...(nativeSessionRoot === undefined ? {} : { TASKMUX_NATIVE_SESSION_ROOT: nativeSessionRoot }),
       ...(nativeSessionId === undefined ? {} : { TASKMUX_NATIVE_SESSION_ID: nativeSessionId })
     }
   };

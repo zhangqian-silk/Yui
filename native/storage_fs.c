@@ -459,6 +459,15 @@ static napi_status create_receipt_result(
     status = napi_create_bigint_uint64(env, (uint64_t)metadata->st_size, &value);
   }
   if (status == napi_ok) status = define_readonly_value(env, *result, "size", value);
+  if (status == napi_ok) {
+    status = napi_create_double(
+      env,
+      (double)metadata->st_mtim.tv_sec * 1000.0 +
+        (double)metadata->st_mtim.tv_nsec / 1000000.0,
+      &value
+    );
+  }
+  if (status == napi_ok) status = define_readonly_value(env, *result, "mtimeMs", value);
   if (status == napi_ok) status = napi_object_freeze(env, *result);
   return status;
 }

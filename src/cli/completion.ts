@@ -16,6 +16,7 @@ type CompletionEntry = {
   fileOptions: readonly string[];
   fileArguments: readonly number[];
   executableOptions: readonly string[];
+  completionProvider?: string;
   acceptsArguments: boolean;
 };
 
@@ -49,6 +50,7 @@ function collectEntries(root: CommandNode): CompletionEntry[] {
         fileOptions: node.fileOptions,
         fileArguments: node.fileArguments,
         executableOptions: node.executableOptions,
+        completionProvider: node.completionProvider,
         acceptsArguments: node.acceptsArguments
       });
     }
@@ -71,6 +73,7 @@ function collectEntries(root: CommandNode): CompletionEntry[] {
         fileOptions: [],
         fileArguments: [],
         executableOptions: [],
+        completionProvider: undefined,
         acceptsArguments: true
       });
       visibleChildren(target).forEach(addHelpPath);
@@ -85,8 +88,8 @@ function renderBash(entries: readonly CompletionEntry[], identity: CliIdentity):
   const functionName = completionFunctionName(identity);
   const containsFunction = `${functionName}_contains`;
   return `${functionName}() {
-  local path current previous argument_index command_depth
-  local -a immediate options value_keys value_lists argument_value_positions argument_value_lists file_options file_arguments executable_options candidates
+  local path current previous argument_index command_depth dynamic_provider dynamic_handled
+  local -a immediate options value_keys value_lists argument_value_positions argument_value_lists file_options file_arguments executable_options candidates dynamic_candidates
   path=""
   current="\${COMP_WORDS[COMP_CWORD]}"
   previous=""
@@ -96,13 +99,25 @@ function renderBash(entries: readonly CompletionEntry[], identity: CliIdentity):
   if (( COMP_CWORD > 1 )); then
     path="\${COMP_WORDS[*]:1:COMP_CWORD-1}"
   fi
-  immediate=(); options=(); value_keys=(); value_lists=(); argument_value_positions=(); argument_value_lists=(); file_options=(); file_arguments=(); executable_options=(); candidates=()
+  immediate=(); options=(); value_keys=(); value_lists=(); argument_value_positions=(); argument_value_lists=(); file_options=(); file_arguments=(); executable_options=(); candidates=(); dynamic_candidates=(); dynamic_provider=''; dynamic_handled=0
   case "$path" in
 ${renderBashCases(entries)}
     *) return 0;;
   esac
   argument_index=$((COMP_CWORD-command_depth-1))
-  if [[ "$current" == -* ]]; then
+  if [[ -n "$dynamic_provider" ]]; then
+    local dynamic_candidate
+    while IFS= read -r dynamic_candidate; do
+      if [[ "$dynamic_candidate" == '__TASKMUX_DYNAMIC__' ]]; then
+        dynamic_handled=1
+      elif [[ -n "$dynamic_candidate" ]]; then
+        dynamic_candidates+=("$dynamic_candidate")
+      fi
+    done < <(command ${identity} completion candidates "$current" -- "\${COMP_WORDS[@]:1:$((COMP_CWORD-1))}" 2>/dev/null)
+  fi
+  if (( dynamic_handled && \${#dynamic_candidates[@]} > 0 )); then
+    candidates=("\${dynamic_candidates[@]}")
+  elif [[ "$current" == -* ]]; then
     candidates=("\${options[@]}")
   else
     local index
@@ -179,7 +194,8 @@ function renderBashCases(entries: readonly CompletionEntry[]): string {
       `argument_value_lists=(${Object.values(entry.argumentValues).map((values) => shellQuote(values.join(" "))).join(" ")})`,
       `file_options=(${entry.fileOptions.map(shellQuote).join(" ")})`,
       `file_arguments=(${entry.fileArguments.join(" ")})`,
-      `executable_options=(${entry.executableOptions.map(shellQuote).join(" ")})`
+      `executable_options=(${entry.executableOptions.map(shellQuote).join(" ")})`,
+      `dynamic_provider=${shellQuote(entry.completionProvider ?? "")}`
     ];
     return `    ${pattern}) ${assignments.join("; ")};;`;
   }).join("\n");
@@ -187,8 +203,10 @@ function renderBashCases(entries: readonly CompletionEntry[]): string {
 
 function renderZsh(entries: readonly CompletionEntry[], identity: CliIdentity): string {
   return `#compdef ${identity}
-local path current previous argument_index command_depth
-local -a immediate options value_keys value_lists argument_value_positions argument_value_lists file_options file_arguments executable_options candidates
+local path current previous argument_index command_depth dynamic_provider
+integer dynamic_handled=0
+local -a immediate options value_keys value_lists argument_value_positions argument_value_lists file_options file_arguments executable_options candidates dynamic_candidates
+local dynamic_output
 path=""
 current="$words[CURRENT]"
 previous=""
@@ -203,7 +221,17 @@ ${renderZshCases(entries)}
   *) return 0;;
 esac
 argument_index=$((CURRENT-command_depth-2))
-if [[ "$current" == -* ]]; then
+if [[ -n "$dynamic_provider" ]]; then
+  dynamic_output="$(command ${identity} completion candidates "$current" -- "\${(@)words[2,CURRENT-1]}" 2>/dev/null)"
+  dynamic_candidates=("\${(@f)dynamic_output}")
+  if [[ "\${dynamic_candidates[1]}" == '__TASKMUX_DYNAMIC__' ]]; then
+    dynamic_handled=1
+    shift dynamic_candidates
+  fi
+fi
+if (( dynamic_handled && \${#dynamic_candidates[@]} > 0 )); then
+  candidates=("\${dynamic_candidates[@]}")
+elif [[ "$current" == -* ]]; then
   candidates=("\${options[@]}")
 else
   local index
@@ -253,7 +281,8 @@ function renderZshCases(entries: readonly CompletionEntry[]): string {
       `argument_value_lists=(${Object.values(entry.argumentValues).map((values) => shellQuote(values.join(" "))).join(" ")})`,
       `file_options=(${entry.fileOptions.map(shellQuote).join(" ")})`,
       `file_arguments=(${entry.fileArguments.join(" ")})`,
-      `executable_options=(${entry.executableOptions.map(shellQuote).join(" ")})`
+      `executable_options=(${entry.executableOptions.map(shellQuote).join(" ")})`,
+      `dynamic_provider=${shellQuote(entry.completionProvider ?? "")}`
     ];
     return `  ${pattern}) ${assignments.join("; ")};;`;
   }).join("\n");
@@ -275,7 +304,8 @@ function renderFish(entries: readonly CompletionEntry[], identity: CliIdentity):
       set argument_value_lists ${Object.values(entry.argumentValues).map((values) => shellQuote(values.join(" "))).join(" ")}
       set file_options ${entry.fileOptions.map(shellQuote).join(" ")}
       set file_arguments ${entry.fileArguments.join(" ")}
-      set executable_options ${entry.executableOptions.map(shellQuote).join(" ")}`;
+      set executable_options ${entry.executableOptions.map(shellQuote).join(" ")}
+      set dynamic_provider ${shellQuote(entry.completionProvider ?? "")}`;
   }).join("\n");
   return `function ${functionName}
   set -l prior (commandline -opc)
@@ -292,12 +322,26 @@ function renderFish(entries: readonly CompletionEntry[], identity: CliIdentity):
   set -l file_options
   set -l file_arguments
   set -l executable_options
+  set -l dynamic_provider
+  set -l dynamic_handled 0
+  set -l dynamic_candidates
   switch "$path"
 ${cases}
     case '*'
       return 0
   end
   set -l argument_index (math (count $prior) - $command_depth - 1)
+  if test -n "$dynamic_provider"
+    set dynamic_candidates (command ${identity} completion candidates "$current" -- $prior[2..-1] 2>/dev/null)
+    if test "$dynamic_candidates[1]" = '__TASKMUX_DYNAMIC__'
+      set dynamic_handled 1
+      set -e dynamic_candidates[1]
+    end
+  end
+  if test $dynamic_handled -eq 1; and test (count $dynamic_candidates) -gt 0
+    printf '%s\n' $dynamic_candidates
+    return 0
+  end
   if string match -q -- '-*' "$current"
     if test (count $options) -gt 0
       printf '%s\\n' $options

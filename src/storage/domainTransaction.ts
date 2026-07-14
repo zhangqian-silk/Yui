@@ -84,7 +84,7 @@ type PathWitness = Readonly<{
 export function executeDomainTransaction<T>(
   rootDir: string,
   id: string,
-  execute: (workingRoot: string) => T,
+  execute: (workingRoot: string, sourceReader: NativePinnedRootReader) => T,
   extraOperations: (result: T) => DomainTransactionOperation[] = () => [],
   options: { includeBackups?: boolean; testFailAfterStage?: boolean } = {}
 ): T {
@@ -103,7 +103,13 @@ export function executeDomainTransaction<T>(
         copyAuthoritativeStateFromReader(reader, workingRoot, authoritativePaths);
         const before = readAuthoritativeFilesFromReader(reader, authoritativePaths);
         const beforeDirectories = readAuthoritativeDirectoriesFromReader(reader, authoritativePaths);
-        const result = withActiveDomainTransactionWorkingRoot(workingRoot, () => execute(workingRoot));
+        // Keep the source reader pinned for the whole workspace callback so
+        // source-derived choices can be applied to the cloned workspace
+        // without trusting cloned metadata.
+        const result = withActiveDomainTransactionWorkingRoot(
+          workingRoot,
+          () => execute(workingRoot, reader)
+        );
         const after = readAuthoritativeFiles(workingRoot, authoritativePaths);
         const afterDirectories = readAuthoritativeDirectories(workingRoot, authoritativePaths);
         const operations = diffAuthoritativeFiles(

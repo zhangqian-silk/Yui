@@ -105,7 +105,7 @@ test("task assign does not repair unknown options into a writable invocation", p
 
   assert.equal(result.status, 2, result.output);
   assert.doesNotMatch(result.output, /Select agent/);
-  assert.match(result.output, /USAGE_ERROR: --agent is required/);
+  assert.match(result.output, /USAGE_ERROR: Unexpected argument: x/);
   assert.doesNotMatch(run(["task", "roles", "task-1"], home), /--bogus/);
 });
 
@@ -956,7 +956,7 @@ test("interaction policy registry covers every approved enumerable reference com
     "task topic create", "task topic summarize", "task cycle create", "task cycle end",
     "task work-item create", "task work-item update", "task session record", "task session replace",
     "task dispatch", "task yield", "task schedule set", "task brief update", "task milestone add",
-    "task decision record", "task decision supersede", "task worktree create"
+    "task decision record", "task decision supersede", "task worktree create", "task worktree remove"
   ];
 
   for (const path of expectedPaths) {
@@ -1065,7 +1065,7 @@ function createHome() {
   mkdirSync(home, { recursive: true });
   writeFileSync(join(home, "schema.json"), `${JSON.stringify({
     schemaVersion: 1,
-    storageVersion: 3,
+    storageVersion: 4,
     updatedAt: "2026-07-12T00:00:00.000Z"
   }, null, 2)}\n`);
   return home;
@@ -1081,7 +1081,7 @@ function createTaskWithLeader() {
 }
 
 function createGlobalRole(home, name, command = "codex") {
-  run(["agent", "add", "role-agent", "--command", command], home);
+  run(["agent", "add", "role-agent", "--adapter", "codex", "--command", command], home);
   run(["config", "set", "default-workspace", home], home);
   run(["role", "add", name, "--agent", "role-agent", "--workspace", home], home);
 }
@@ -1216,7 +1216,7 @@ async function selectionFixture() {
     node: invocation.node,
     resolveInteractiveArguments,
     addAgent(id) {
-      store.saveConfiguredAgent(createConfiguredAgent(id, id, [], {}, new Date("2026-07-12T00:00:00.000Z")));
+      store.saveConfiguredAgent(createConfiguredAgent(id, id, id, [], [], new Date("2026-07-12T00:00:00.000Z")));
     }
   };
 }

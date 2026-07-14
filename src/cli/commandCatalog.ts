@@ -1,6 +1,14 @@
 import { CYCLE_CAUSES } from "../cycle/cycle.js";
+import { supportedAgentAdapterIds } from "../agent/adapterCatalog.js";
+import {
+  ROLE_AGENT_FILE_OPTIONS,
+  ROLE_AGENT_SCRIPTED_OPTIONS,
+  ROLE_EXPECT_UPDATED_AT_OPTION,
+  roleAgentOptionUsage
+} from "./roleOptionCatalog.js";
 
 export type CommandNodeKind = "group" | "leaf" | "hybrid";
+export type CompletionProviderId = "role-agent";
 
 export type CommandValue = {
   name: string;
@@ -23,12 +31,15 @@ export type CommandNode = {
   children: readonly CommandNode[];
   hidden: boolean;
   options: readonly string[];
+  hiddenOptions: readonly string[];
   values: readonly CommandValue[];
   optionValues: Readonly<Record<string, readonly string[]>>;
   argumentValues: Readonly<Record<number, readonly string[]>>;
   fileOptions: readonly string[];
   fileArguments: readonly number[];
   executableOptions: readonly string[];
+  completionProvider?: CompletionProviderId;
+  completionUsesDefaultAgent: boolean;
   commandPathArguments: boolean;
   acceptsArguments: boolean;
 };
@@ -42,12 +53,15 @@ type NodeInput = {
   executable?: boolean;
   hidden?: boolean;
   options?: readonly string[];
+  hiddenOptions?: readonly string[];
   values?: readonly (string | CommandValue)[];
   optionValues?: Readonly<Record<string, readonly string[]>>;
   argumentValues?: Readonly<Record<number, readonly string[]>>;
   fileOptions?: readonly string[];
   fileArguments?: readonly number[];
   executableOptions?: readonly string[];
+  completionProvider?: CompletionProviderId;
+  completionUsesDefaultAgent?: boolean;
   commandPathArguments?: boolean;
   acceptsArguments?: boolean;
 };
@@ -80,6 +94,7 @@ function buildNode(input: NodeInput, parentPath: readonly string[] = []): Comman
     children: Object.freeze(children),
     hidden: input.hidden ?? false,
     options: Object.freeze([...(input.options ?? [])]),
+    hiddenOptions: Object.freeze([...(input.hiddenOptions ?? [])]),
     values: Object.freeze((input.values ?? []).map((value) => Object.freeze(
       typeof value === "string" ? { name: value, summary: value } : { ...value }
     ))),
@@ -88,6 +103,8 @@ function buildNode(input: NodeInput, parentPath: readonly string[] = []): Comman
     fileOptions: Object.freeze([...(input.fileOptions ?? [])]),
     fileArguments: Object.freeze([...(input.fileArguments ?? [])]),
     executableOptions: Object.freeze([...(input.executableOptions ?? [])]),
+    ...(input.completionProvider === undefined ? {} : { completionProvider: input.completionProvider }),
+    completionUsesDefaultAgent: input.completionUsesDefaultAgent ?? false,
     commandPathArguments: input.commandPathArguments ?? false,
     acceptsArguments: input.acceptsArguments ?? executable
   });
@@ -109,9 +126,9 @@ const taskChildren: readonly NodeInput[] = [
   { name: "delete", summary: "Move a task to trash.", usage: "taskmux task delete <task-id>" },
   { name: "restore", summary: "Restore a task from trash.", usage: "taskmux task restore <task-id>" },
   { name: "shell", summary: "Open the interactive task shell.", usage: "taskmux task shell <task-id>" },
-  { name: "assign", summary: "Assign or bind one task role.", usage: "taskmux task assign <task-id> <role> [--agent <agent>] [--workspace <path>] [--as <task-role>]", options: ["--agent", "--workspace", "--as"], fileOptions: ["--workspace"] },
+  { name: "assign", summary: "Assign one configured Agent to a task role; Agent is interactively selected when omitted.", usage: `taskmux task assign <task-id> <role> [--agent <agent-id>] [--workspace <path>] [--as <task-role>] ${roleAgentOptionUsage()} [--system-prompt <body>]`, options: ["--agent", "--workspace", "--as", ...ROLE_AGENT_SCRIPTED_OPTIONS, "--system-prompt"], fileOptions: ["--workspace", ...ROLE_AGENT_FILE_OPTIONS], completionProvider: "role-agent", completionUsesDefaultAgent: true },
   { name: "bind", summary: "Bind a global role to a task.", usage: "taskmux task bind <task-id> <role> [--as <task-role>] [--workspace <path>]", options: ["--as", "--workspace"], fileOptions: ["--workspace"] },
-  { name: "assign-many", summary: "Assign multiple task roles.", usage: "taskmux task assign-many <task-id> --role <role> ... [--agent <agent>] [--workspace <path>]", options: ["--role", "--agent", "--workspace"], fileOptions: ["--workspace"] },
+  { name: "assign-many", summary: "Assign multiple task roles with one Agent configuration; Agent is interactively selected when omitted.", usage: `taskmux task assign-many <task-id> --role <role> ... [--agent <agent-id>] [--workspace <path>] ${roleAgentOptionUsage()} [--system-prompt <body>]`, options: ["--role", "--agent", "--workspace", ...ROLE_AGENT_SCRIPTED_OPTIONS, "--system-prompt"], fileOptions: ["--workspace", ...ROLE_AGENT_FILE_OPTIONS], completionProvider: "role-agent", completionUsesDefaultAgent: true },
   { name: "roles", summary: "List roles assigned to a task.", usage: "taskmux task roles <task-id>" },
   { name: "enter", summary: "Enter a task role session.", usage: "taskmux task enter <task-id> <role>" },
   { name: "tail", summary: "Capture recent task role output.", usage: "taskmux task tail <task-id> <role>" },
@@ -132,11 +149,11 @@ const taskChildren: readonly NodeInput[] = [
   { name: "comments", summary: "List task comments.", usage: "taskmux task comments <task-id>" },
   { name: "events", summary: "List task events.", usage: "taskmux task events <task-id>" },
   { name: "wake", summary: "Queue a task wakeup.", usage: "taskmux task wake <task-id> --reason <reason>", options: ["--reason"] },
-  { name: "dispatch", summary: "Dispatch an agent run.", usage: "taskmux task dispatch <task-id> <role> --mode new|resume [--work-item <id>] [--topic <topic> ...] --input <body>", options: ["--mode", "--work-item", "--topic", "--input"], optionValues: { "--mode": ["new", "resume"] } },
+  { name: "dispatch", summary: "Dispatch an agent run.", usage: "taskmux task dispatch <task-id> <role> --mode new|resume [--work-item <id>] [--topic <topic> ...] [--confirm-permission-broadening] --input <body>", options: ["--mode", "--work-item", "--topic", "--confirm-permission-broadening", "--input"], optionValues: { "--mode": ["new", "resume"] } },
   { name: "yield", summary: "Yield an agent run result.", usage: "taskmux task yield <task-id> <role> --summary <body>", options: ["--summary"] },
   { name: "role", summary: "Manage roles within a task.", sections: [{ id: "manage", title: "Manage", entries: ["child", "update", "rename", "remove"] }], children: [
     { name: "child", summary: "Create a descriptive child role.", usage: "taskmux task role child <task-id> <role> [--parent <role>] --description <body> [--responsibility <body> ...] [--constraint <body> ...] --expected-output <body>", options: ["--parent", "--description", "--responsibility", "--constraint", "--expected-output"] },
-    { name: "update", summary: "Update a task role.", usage: "taskmux task role update <task-id> <role> [--agent <agent>] [--workspace <path>]", options: ["--agent", "--workspace"], fileOptions: ["--workspace"] },
+    { name: "update", summary: "Update a task role or one of its Agent bindings.", usage: `taskmux task role update <task-id> <role> [--agent <agent-id>] [--active-agent <agent-id>] [--workspace <path>] ${roleAgentOptionUsage()} [--system-prompt <body>]`, options: ["--agent", "--active-agent", "--workspace", ...ROLE_AGENT_SCRIPTED_OPTIONS, "--system-prompt"], hiddenOptions: [ROLE_EXPECT_UPDATED_AT_OPTION], fileOptions: ["--workspace", ...ROLE_AGENT_FILE_OPTIONS], completionProvider: "role-agent" },
     { name: "rename", summary: "Rename a task role.", usage: "taskmux task role rename <task-id> <role> <new-role>" },
     { name: "remove", summary: "Remove a task role.", usage: "taskmux task role remove <task-id> <role>" }
   ] },
@@ -177,8 +194,9 @@ const taskChildren: readonly NodeInput[] = [
     { name: "record", summary: "Record a task decision.", usage: "taskmux task decision record <task-id> --title <title> --rationale <body> [--topic <topic> ...]", options: ["--title", "--rationale", "--topic"] },
     { name: "supersede", summary: "Supersede a task decision.", usage: "taskmux task decision supersede <task-id> <decision-id> --reason <body>", options: ["--reason"] }
   ] },
-  { name: "worktree", summary: "Manage task role worktrees.", sections: [{ id: "manage", title: "Manage", entries: ["create"] }], children: [
-    { name: "create", summary: "Create a role worktree.", usage: "taskmux task worktree create <task-id> <role> --path <path> --branch <branch> [--base <ref>]", options: ["--path", "--branch", "--base"], fileOptions: ["--path"] }
+  { name: "worktree", summary: "Manage task role worktrees.", sections: [{ id: "manage", title: "Manage", entries: ["create", "remove"] }], children: [
+    { name: "create", summary: "Create a role worktree.", usage: "taskmux task worktree create <task-id> <role> --path <path> --branch <branch> [--base <ref>]", options: ["--path", "--branch", "--base"], fileOptions: ["--path"] },
+    { name: "remove", summary: "Remove a managed role worktree.", usage: "taskmux task worktree remove <task-id> <role>" }
   ] }
 ];
 
@@ -199,13 +217,15 @@ export const ROOT_COMMAND = buildNode({
     { name: "update", summary: "Install the latest published TaskMux package globally." },
     { name: "completion", summary: "Generate or manage shell completion.", usage: ["taskmux completion bash|zsh|fish", "taskmux completion install", "taskmux completion uninstall"], sections: [
       { id: "generate", title: "Generate", entries: ["bash", "zsh", "fish"] },
-      { id: "manage", title: "Manage", entries: ["install", "uninstall"] }
+      { id: "manage", title: "Manage", entries: ["install", "uninstall"] },
+      { id: "internal", title: "Internal", entries: ["candidates"] }
     ], children: [
       { name: "bash", summary: "Generate Bash completion." },
       { name: "zsh", summary: "Generate Zsh completion." },
       { name: "fish", summary: "Generate Fish completion." },
       { name: "install", summary: "Interactively install or repair one shell completion." },
-      { name: "uninstall", summary: "Interactively remove one managed shell completion." }
+      { name: "uninstall", summary: "Interactively remove one managed shell completion." },
+      { name: "candidates", summary: "Resolve internal dynamic completion candidates.", hidden: true }
     ] },
     { name: "doctor", summary: "Check local TaskMux dependencies and state." },
     { name: "setup", summary: "Initialize TaskMux and configure an agent.", executable: true, acceptsArguments: false, usage: "taskmux setup [tmux]", sections: [{ id: "mode", title: "Mode", entries: ["tmux"] }], children: [
@@ -252,24 +272,31 @@ export const ROOT_COMMAND = buildNode({
     ] },
     { name: "agent", summary: "Manage configured native agent CLIs.", sections: [
       { id: "inspect", title: "Inspect", entries: ["list", "show"] },
-      { id: "manage", title: "Manage", entries: ["add", "remove"] }
+      { id: "manage", title: "Manage", entries: ["add", "update", "remove"] }
     ], children: [
-      { name: "add", summary: "Add an agent.", usage: "taskmux agent add <agent-id> --command <command> [--arg <arg> ...] [--env KEY=value ...]", options: ["--command", "--arg", "--env"], executableOptions: ["--command"] },
+      { name: "add", summary: "Add an agent.", usage: "taskmux agent add <agent-id> [--adapter <adapter-id>] --command <command> [--arg <arg> ...] [--env TARGET=PROCESS_NAME ...]", options: ["--adapter", "--command", "--arg", "--env"], optionValues: { "--adapter": supportedAgentAdapterIds() }, executableOptions: ["--command"] },
       { name: "list", summary: "List agents." },
       { name: "show", summary: "Show an agent.", usage: "taskmux agent show <agent-id>" },
+      { name: "update", summary: "Update an unreferenced Agent, or refresh only a referenced Agent probe pin.", usage: "taskmux agent update <agent-id> [--adapter <adapter-id>] [--command <command>] [--arg <arg> ... | --clear-args] [--env TARGET=PROCESS_NAME ... | --clear-env] [--refresh-probe]", options: ["--adapter", "--command", "--arg", "--clear-args", "--env", "--clear-env", "--refresh-probe"], optionValues: { "--adapter": supportedAgentAdapterIds() }, executableOptions: ["--command"] },
       { name: "remove", summary: "Remove an agent.", usage: "taskmux agent remove <agent-id>" }
     ] },
     { name: "role", summary: "Manage reusable global roles.", sections: [
       { id: "inspect", title: "Inspect", entries: ["list", "show"] },
       { id: "manage", title: "Manage", entries: ["add", "update", "remove"] },
-      { id: "sessions", title: "Sessions", entries: ["enter"] }
+      { id: "sessions", title: "Sessions", entries: ["enter", "session"] }
     ], children: [
-      { name: "add", summary: "Add a global role.", usage: "taskmux role add <role> --agent <agent-id> [--workspace <path>] [--description <body>] [--responsibility <body> ...] [--constraint <body> ...] [--expected-output <body>] [--system-prompt <body>] [--skill <skill> ...]", options: ["--agent", "--workspace", "--description", "--responsibility", "--constraint", "--expected-output", "--system-prompt", "--skill"], fileOptions: ["--workspace"] },
+      { name: "add", summary: "Add a global role; Agent is interactively selected when omitted.", usage: `taskmux role add <role> [--agent <agent-id>] [--workspace <path>] ${roleAgentOptionUsage()} [--description <body>] [--responsibility <body> ...] [--constraint <body> ...] [--expected-output <body>] [--system-prompt <body>] [--skill <skill> ...]`, options: ["--agent", "--workspace", ...ROLE_AGENT_SCRIPTED_OPTIONS, "--description", "--responsibility", "--constraint", "--expected-output", "--system-prompt", "--skill"], fileOptions: ["--workspace", ...ROLE_AGENT_FILE_OPTIONS], completionProvider: "role-agent", completionUsesDefaultAgent: true },
       { name: "list", summary: "List global roles." },
       { name: "show", summary: "Show a global role.", usage: "taskmux role show <role>" },
-      { name: "update", summary: "Update a global role.", usage: "taskmux role update <role> [--agent <agent-id>] [--workspace <path>]", options: ["--agent", "--workspace"], fileOptions: ["--workspace"] },
+      { name: "update", summary: "Update a global role or one of its Agent bindings.", usage: `taskmux role update <role> [--agent <agent-id>] [--active-agent <agent-id>] [--workspace <path>] ${roleAgentOptionUsage()} [--system-prompt <body>]`, options: ["--agent", "--active-agent", "--workspace", ...ROLE_AGENT_SCRIPTED_OPTIONS, "--system-prompt"], hiddenOptions: [ROLE_EXPECT_UPDATED_AT_OPTION], fileOptions: ["--workspace", ...ROLE_AGENT_FILE_OPTIONS], completionProvider: "role-agent" },
       { name: "remove", summary: "Remove a global role.", usage: "taskmux role remove <role>" },
-      { name: "enter", summary: "Enter a global role session.", usage: "taskmux role enter <role>" }
+      { name: "enter", summary: "Enter a global role session.", usage: "taskmux role enter <role>" },
+      { name: "session", summary: "Manage a GlobalRole native session ID.", sections: [
+        { id: "manage", title: "Manage", entries: ["record", "replace"] }
+      ], children: [
+        { name: "record", summary: "Record a GlobalRole native session ID.", usage: "taskmux role session record <role> --native-id <id>", options: ["--native-id"] },
+        { name: "replace", summary: "Replace a GlobalRole native session ID.", usage: "taskmux role session replace <role> --native-id <id> --reason <reason>", options: ["--native-id", "--reason"] }
+      ] }
     ] },
     { name: "task", summary: "Manage tasks, task roles, and durable task context.", sections: [
       { id: "workflow", title: "Workflow", entries: ["create", "update", "clone", "archive", "unarchive", "delete", "restore"] },
@@ -337,6 +364,7 @@ export function validateCommandCatalog(root: CommandNode): void {
         || node.values.length > 0
         || node.sections.length > 0
         || node.options.length > 0
+        || (node.hiddenOptions?.length ?? 0) > 0
         || Object.keys(node.optionValues).length > 0
         || Object.keys(node.argumentValues).length > 0
         || node.fileOptions.length > 0
@@ -377,7 +405,7 @@ export function validateCommandCatalog(root: CommandNode): void {
     }
 
     const optionNames = new Set<string>();
-    for (const option of node.options) {
+    for (const option of [...node.options, ...(node.hiddenOptions ?? [])]) {
       if (reservedAliases.has(option)) {
         throw new Error(`Reserved alias token is not allowed: ${[...node.path, option].join(" ")}`);
       }

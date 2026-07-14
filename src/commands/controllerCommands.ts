@@ -49,7 +49,7 @@ export async function runControllerCommand(
       const result = await callController(discovery, "scheduler.scan", randomUUID()) as { output: string };
       return result.output;
     }
-    const tmux = new TmuxManager(env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandExecutor());
+    const tmux = new TmuxManager(env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandExecutor(), rootDir);
     const release = acquireControllerLock(rootDir, process.pid);
     try {
       const queued = runSchedulerTransaction(

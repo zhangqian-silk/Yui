@@ -1,4 +1,6 @@
 import type { TableColumn } from "../output/table.js";
+import { presentAgentDefinition } from "../output/roleAgentPresentation.js";
+import { configuredAgentToDefinition } from "../agent/agent.js";
 import { isSystemRoleName, SYSTEM_ROLE_NAMES, systemRoleDescription } from "../role/systemRoles.js";
 import type { TaskReader, TaskStore } from "../storage/taskStore.js";
 import { BUILTIN_TOPICS } from "../topic/topic.js";
@@ -49,13 +51,20 @@ function getSelectionCandidatesSnapshot(
         title: "Select agent",
         columns: [
           { header: "Agent", minWidth: 5, maxWidth: 24 },
-          { header: "Command", minWidth: 7, maxWidth: 80 },
+          { header: "Command", minWidth: 7, maxWidth: 16 },
           { header: "Default", minWidth: 7, maxWidth: 7 }
         ],
-        candidates: agents.map((agent) => ({
-          value: agent.id,
-          cells: [agent.id, [agent.command, ...agent.args].join(" "), agent.id === config.defaultAgent ? "yes" : ""]
-        })),
+        candidates: agents.map((agent) => {
+          const definition = presentAgentDefinition(configuredAgentToDefinition(agent));
+          return {
+            value: definition.id,
+            cells: [
+              definition.id,
+              definition.executable,
+              definition.id === config.defaultAgent ? "yes" : ""
+            ]
+          };
+        }),
         defaultValue: config.defaultAgent,
         emptyMessage: "No agents are configured. Run `taskmux agent add <agent-id> --command <command>`.",
         overflowHint: "Run `taskmux agent list` and pass the selected agent explicitly."
@@ -71,7 +80,7 @@ function getSelectionCandidatesSnapshot(
             value: name,
             cells: [
               name,
-              role?.agent ?? "?",
+              role?.activeAgentId ?? "?",
               isSystemRoleName(name)
                 ? `system:${systemRoleDescription(name)}${role === undefined ? " (not configured)" : ""}`
                 : "custom"
@@ -89,7 +98,7 @@ function getSelectionCandidatesSnapshot(
       return globalRoleCandidateSet(
         roles.map((role) => ({
           value: role.name,
-          cells: [role.name, role.agent, "custom"]
+          cells: [role.name, role.activeAgentId, "custom"]
         })),
         context.preferredRole,
         "No removable global roles are configured. Run `taskmux role add <role> --agent <agent-id>`."
@@ -102,7 +111,7 @@ function getSelectionCandidatesSnapshot(
           value: role.name,
           cells: [
             role.name,
-            role.agent,
+            role.activeAgentId,
             isSystemRoleName(role.name) ? `system:${systemRoleDescription(role.name)}` : "custom"
           ]
         })),
@@ -179,7 +188,7 @@ function getSelectionCandidatesSnapshot(
         ],
         candidates: roles.map((role) => ({
           value: role.name,
-          cells: [role.name, role.agent, role.status]
+          cells: [role.name, role.activeAgentId, role.status]
         })),
         defaultValue: context.preferredRole,
         emptyMessage: `Task ${taskId} has no roles. Run \`taskmux task roles ${taskId}\`.`,
@@ -202,6 +211,10 @@ function getSelectionCandidatesSnapshot(
       return taskRoleCandidateSet(selector, store, args, context, (taskId, roleName) =>
         roleName !== "leader" && store.getRoleWorktree(taskId, roleName) === null,
       "No task roles are eligible for a new worktree.");
+    case "managed-worktree-task-roles":
+      return taskRoleCandidateSet(selector, store, args, context, (taskId, roleName) =>
+        roleName !== "leader" && store.getRoleWorktree(taskId, roleName) !== null,
+      "No managed task role worktrees are available.");
     case "task-topics": {
       const taskId = dependentTaskId(selector, args, store);
       if (taskId === null) {
@@ -349,7 +362,7 @@ function taskRoleCandidateSet(
       { header: "Agent", minWidth: 5, maxWidth: 20 },
       { header: "Status", minWidth: 6, maxWidth: 12 }
     ],
-    candidates: roles.map((role) => ({ value: role.name, cells: [role.name, role.agent, role.status] })),
+    candidates: roles.map((role) => ({ value: role.name, cells: [role.name, role.activeAgentId, role.status] })),
     defaultValue: context.preferredRole,
     emptyMessage,
     overflowHint: `Run \`taskmux task roles ${taskId}\`.`

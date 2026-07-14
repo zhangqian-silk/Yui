@@ -223,7 +223,7 @@ test("catalog covers every public root, group, nested, and leaf path", async () 
     "task work-item", "task work-item create", "task work-item update",
     "task session", "task session record", "task session replace",
     "task schedule", "task schedule set", "task brief", "task brief update", "task milestone", "task milestone add",
-    "task decision", "task decision record", "task decision supersede", "task worktree", "task worktree create"
+    "task decision", "task decision record", "task decision supersede", "task worktree", "task worktree create", "task worktree remove"
   ];
 
   for (const path of required) {

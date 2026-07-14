@@ -1,47 +1,180 @@
-import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createTaskComment } from "../comment/comment.js";
 import { createTaskBrief, renderTaskBrief } from "../brief/taskBrief.js";
 import { CYCLE_CAUSES, createCycle, endCycle, type CycleCause } from "../cycle/cycle.js";
 import { createDecision, renderDecisionTimelineEntry, supersedeDecision } from "../decision/decision.js";
 import { compileDispatchInput } from "../context/dispatchContext.js";
-import { roleNotFound, runtimeError, taskNotFound, usageError } from "../errors/cliError.js";
+import { roleConflict, roleNotFound, runtimeError, taskNotFound, usageError } from "../errors/cliError.js";
 import { createTaskEvent } from "../event/taskEvent.js";
 import { createTaskInputDraft } from "../input/taskInput.js";
 import { createMilestone, renderMilestoneTimelineEntry } from "../milestone/milestone.js";
-import { recordAgentSession } from "../executor/agentExecutor.js";
-import { reserveInitialAgentSession, resolveAgentExecutor } from "../executor/executorRegistry.js";
+import {
+  createRoleSessionSet,
+  recordRoleAgentSession,
+  sameNativeSessionIdentity,
+  updateRoleAgentSessionStatus,
+  type TaskRoleSessionSet
+} from "../executor/agentExecutor.js";
+import { resolveAgentAdapter } from "../executor/agentAdapter.js";
+import {
+  isCanonicalNativeSessionId,
+  isCanonicalNativeSessionRoot
+} from "../executor/nativeSessionIdentity.js";
+import {
+  claimRoleRuntimeOperation,
+  claimRuntimeOperationRecovery,
+  clearRoleRuntimeOperationClaim,
+  clearRuntimeOperationClaim,
+  createRoleRuntimeOperationLease,
+  executePostCommitRoleDispatch,
+  executeReplayableRoleRuntimeOperation,
+  isRuntimeOperationRecoverable,
+  markRoleRuntimeOperationEffectStarted,
+  markTaskLifecycleOperationEffectStarted,
+  permissionEnvelopeForBinding,
+  listRuntimeOperationClaims,
+  readRoleRuntimeOperationClaim,
+  readTaskRuntimeOperationClaim,
+  readRoleRuntimeStateSnapshot,
+  recoverAbandonedRoleRuntimeOperations,
+  releaseRoleRuntimeOperationClaim,
+  releaseRuntimeOperationClaim,
+  reserveInitialAgentSession,
+  resolveAgentExecutor,
+  resolveAgentLaunchEnvironment,
+  resolveAgentSessionRoot,
+  roleRuntimeStateDigest,
+  type RoleLaunchRuntimeOperationClaim,
+  type RoleRuntimeOperationClaim,
+  type RoleStopRuntimeOperationClaim,
+  type TaskLifecycleEffectPlan,
+  type TaskLifecyclePreparedState,
+  type TaskLifecycleRuntimeOperationClaim
+} from "../executor/executorRegistry.js";
 import type { DispatchMode } from "../executor/launchPlan.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
-import { copyGlobalRoleToTaskRole, createRole, updateRole, updateRoleStatus } from "../role/role.js";
+import { activeRoleAgentBinding, copyGlobalRoleToTaskRole, createRole, createRoleAgentBinding, switchActiveRoleAgent, updateRole, updateRoleStatus } from "../role/role.js";
 import { createChildRole } from "../role/childRole.js";
-import { createAgentRun, yieldAgentRun } from "../run/agentRun.js";
+import { createAgentRun, failAgentRun, yieldAgentRun } from "../run/agentRun.js";
 import { SYSTEM_LEADER_ROLE } from "../role/systemRoles.js";
 import { resolveAgent, supportedAgentIds } from "../agent/agentRegistry.js";
 import { mergePendingWakeup } from "../scheduler/pendingWakeup.js";
+import { leaderRecoveryNotificationId } from "../scheduler/operatorNotification.js";
 import { createTaskSchedule } from "../scheduler/taskSchedule.js";
 import { createTask, updateTaskArchived, updateTaskMetadata } from "../task/task.js";
 import { BUILTIN_TOPICS, createCustomTopic, usesConventionalTopicId } from "../topic/topic.js";
-import { createWorkItem, updateWorkItemStatus, type WorkItemStatus } from "../workItem/workItem.js";
-import { createRoleWorktree } from "../worktree/worktree.js";
+import { createWorkItem, updateWorkItemStatus, type WorkItem, type WorkItemStatus } from "../workItem/workItem.js";
+import type { RoleWorktree } from "../worktree/worktree.js";
+import { GitWorktreeManager } from "../worktree/gitWorktreeManager.js";
 import type { TaskComment } from "../comment/comment.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { Role } from "../role/role.js";
+import type { RoleAgentSession } from "../executor/agentExecutor.js";
 import type { ChildRole } from "../role/childRole.js";
 import type { AgentRun } from "../run/agentRun.js";
-import type { TaskReader, TaskStore } from "../storage/taskStore.js";
+import { FileTaskStore, type TaskReader, type TaskStore } from "../storage/taskStore.js";
 import { resolveTaskmuxHome } from "../storage/taskStore.js";
+import {
+  executeDomainTransaction,
+  hasActiveDomainTransactionAuthority
+} from "../storage/domainTransaction.js";
+import { writeTextFileAtomically } from "../storage/durableFile.js";
+import {
+  assertPathOutsideTaskmuxHome,
+  canonicalProspectivePath
+} from "../storage/storagePathBoundary.js";
+import { lowerUnknownInertData, stringifyCanonicalInertData } from "../storage/inertData.js";
 import type { Task, TaskMetadata, TaskPriority } from "../task/task.js";
 import type { TmuxManager } from "../tmux/tmuxManager.js";
+import {
+  ROLE_EXPECT_UPDATED_AT_OPTION,
+  ROLE_PROFILE_INHERITABLE_FIELDS
+} from "../cli/roleOptionCatalog.js";
+import { parseRoleCommandOptions, type ParsedRoleCommandOptions } from "./roleAgentOptions.js";
+import type { ManualSessionRegistration } from "./sessionRegistration.js";
 
 const BUILTIN_LEADER_ROLE = SYSTEM_LEADER_ROLE;
+
+function transactionTaskStore(
+  workingRoot: string,
+  runtimeOperationToken?: string,
+  runtimeRecoveryToken?: string
+): FileTaskStore {
+  if (!hasActiveDomainTransactionAuthority(workingRoot)) {
+    throw runtimeError("Task storage mutation requires an active domain transaction.");
+  }
+  return FileTaskStore.forDomainTransactionWorkspace(
+    workingRoot,
+    runtimeOperationToken,
+    runtimeRecoveryToken
+  );
+}
+
+const STORAGE_ONLY_TASK_COMMANDS = new Set([
+  "create", "show", "current", "clone", "update", "unarchive", "open", "context", "restore",
+  "assign", "bind", "assign-many", "comment", "topic", "input", "cycle", "work-item", "wake",
+  "yield", "schedule", "brief", "milestone", "decision", "session", "status", "refresh", "cleanup"
+]);
+
+function taskCommandUsesStorageTransaction(args: readonly string[]): boolean {
+  const command = args[0] ?? "";
+  return STORAGE_ONLY_TASK_COMMANDS.has(command) ||
+    (command === "role" && ["child", "update"].includes(args[1] ?? ""));
+}
+
+export function taskCommandHasExternalMutation(args: readonly string[]): boolean {
+  const command = args[0] ?? "";
+  if (["archive", "delete", "detach", "worktree"].includes(command)) {
+    return true;
+  }
+  return command === "role" && ["rename", "remove"].includes(args[1] ?? "");
+}
+
+export function isTaskRoleRuntimeControlCommand(args: readonly string[]): boolean {
+  return ["stop", "kill", "restart"].includes(args[0] ?? "");
+}
+
+const TASK_ASSIGN_OPTIONS = [
+  { option: "--agent" },
+  { option: "--workspace" },
+  { option: "--as" },
+  { option: "--system-prompt" }
+] as const;
+
+const TASK_BIND_OPTIONS = [
+  { option: "--workspace" },
+  { option: "--as" }
+] as const;
+
+const TASK_ASSIGN_MANY_OPTIONS = [
+  { option: "--role", repeatable: true },
+  { option: "--agent" },
+  { option: "--workspace" },
+  { option: "--system-prompt" }
+] as const;
+
+const TASK_ROLE_UPDATE_OPTIONS = [
+  { option: ROLE_EXPECT_UPDATED_AT_OPTION },
+  { option: "--agent" },
+  { option: "--active-agent" },
+  { option: "--workspace" },
+  { option: "--system-prompt" }
+] as const;
 
 export function runTaskCommand(
   args: string[],
   store: TaskStore,
   tmux?: TmuxManager,
-  options: { persistAttachStatus?: boolean; rememberTaskReads?: boolean } = {}
+  options: {
+    persistAttachStatus?: boolean;
+    rememberTaskReads?: boolean;
+    environment?: NodeJS.ProcessEnv;
+    sessionRegistration?: ManualSessionRegistration;
+    requireManualSessionRegistration?: boolean;
+    onRoleLaunchStarted?: (session: RoleAgentSession | null) => void;
+  } = {}
 ): string {
   if (taskCommandIsReadOnlyAggregate(args)) {
     const output = store.runReadSnapshot((snapshot) => runTaskReadSnapshot(args, snapshot));
@@ -50,7 +183,29 @@ export function runTaskCommand(
     }
     return output;
   }
+
   const [command, ...rest] = args;
+  if (
+    store instanceof FileTaskStore &&
+    hasActiveDomainTransactionAuthority(store.rootDirectory()) &&
+    taskCommandHasExternalMutation(args)
+  ) {
+    throw runtimeError("Task lifecycle effects must run through a post-commit coordinator.");
+  }
+  if (
+    store instanceof FileTaskStore &&
+    !hasActiveDomainTransactionAuthority(store.rootDirectory()) &&
+    command !== undefined &&
+    taskCommandUsesStorageTransaction(args)
+  ) {
+    return executeDomainTransaction(store.rootDirectory(), `task-command-${randomUUID()}`, (workingRoot) => runTaskCommand(
+      args,
+      transactionTaskStore(workingRoot),
+      tmux,
+      options
+    ));
+  }
+  assertTaskCommandRuntimeAuthority(command, rest, store);
 
   switch (command) {
     case "create":
@@ -70,7 +225,7 @@ export function runTaskCommand(
     case "update":
       return updateTaskCommand(rest, store);
     case "archive":
-      return updateTaskArchivedCommand(rest, store, true);
+      return updateTaskArchivedCommand(rest, store, true, tmux);
     case "unarchive":
       return updateTaskArchivedCommand(rest, store, false);
     case "open":
@@ -78,7 +233,7 @@ export function runTaskCommand(
     case "context":
       return contextTaskCommand(rest, store, options.rememberTaskReads !== false);
     case "delete":
-      return deleteTaskCommand(rest, store);
+      return deleteTaskCommand(rest, store, tmux);
     case "restore":
       return restoreTaskCommand(rest, store);
     case "role":
@@ -92,7 +247,13 @@ export function runTaskCommand(
     case "roles":
       return listTaskRolesCommand(rest, store);
     case "enter":
-      return enterTaskRoleCommand(rest, store, tmux, options.persistAttachStatus !== false);
+      return enterTaskRoleCommand(
+        rest,
+        store,
+        tmux,
+        options.persistAttachStatus !== false,
+        options.onRoleLaunchStarted
+      );
     case "tail":
       return tailTaskRoleCommand(rest, store, tmux);
     case "detail":
@@ -134,7 +295,14 @@ export function runTaskCommand(
     case "wake":
       return wakeTaskCommand(rest, store);
     case "session":
-      return taskSessionCommand(rest, store);
+      return taskSessionCommand(
+        rest,
+        store,
+        options.environment ?? process.env,
+        tmux,
+        options.sessionRegistration,
+        options.requireManualSessionRegistration === true
+      );
     case "dispatch":
       return dispatchTaskRoleCommand(rest, store, tmux);
     case "yield":
@@ -148,7 +316,7 @@ export function runTaskCommand(
     case "decision":
       return taskDecisionCommand(rest, store);
     case "worktree":
-      return taskWorktreeCommand(rest, store);
+      return taskWorktreeCommand(rest, store, tmux);
     default:
       throw usageError(command === undefined ? "Task command is required." : `Unknown command: task ${command}`);
   }
@@ -190,22 +358,27 @@ export function runTaskReadSnapshot(args: string[], store: TaskReader): string {
   }
 }
 
-function taskCommandIsReadOnlyAggregate(args: string[]): boolean {
+function taskCommandIsReadOnlyAggregate(args: readonly string[]): boolean {
   const command = args[0] ?? "";
-  if ([
+  return [
     "list", "board", "show", "open", "context", "last", "roles",
     "detail", "comments", "events", "activity", "timeline"
-  ].includes(command)) {
-    return true;
-  }
-  if (command === "current") return args.length === 1;
-  return command === "topic" && args[1] === "list";
+  ].includes(command) ||
+    (command === "current" && args.length === 1) ||
+    (command === "topic" && args[1] === "list");
 }
 
-function taskWorktreeCommand(args: string[], store: TaskStore): string {
+function taskWorktreeCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
+  return runTaskLifecycleOperation(prepareTaskWorktreeOperation(args, store), store, tmux);
+}
+
+function prepareTaskWorktreeOperation(
+  args: string[],
+  store: TaskStore
+): TaskLifecycleRuntimeOperationClaim {
   const [command, taskId, roleName, ...rest] = args;
-  if (command !== "create" || taskId === undefined || roleName === undefined) {
-    throw usageError("Worktree usage: taskmux task worktree create <task-id> <role> --path <path> --branch <branch> [--base <ref>].");
+  if (!["create", "remove"].includes(command ?? "") || taskId === undefined || roleName === undefined) {
+    throw usageError("Worktree usage: taskmux task worktree create <task-id> <role> --path <path> --branch <branch> [--base <ref>] | taskmux task worktree remove <task-id> <role>.");
   }
   if (store.getTask(taskId) === null) {
     throw taskNotFound(taskId);
@@ -215,31 +388,28 @@ function taskWorktreeCommand(args: string[], store: TaskStore): string {
   }
 
   const role = store.getRole(taskId, roleName);
-  if (role === null) {
-    throw roleNotFound(roleName);
+  if (role === null) throw roleNotFound(roleName);
+  if (store.getActiveAgentRun(taskId, roleName) !== null) {
+    throw usageError(`Role has an active AgentRun: ${taskId}/${roleName}.`);
   }
+  const existing = store.getRoleWorktree(taskId, roleName);
+  if (command === "remove") {
+    if (rest.length > 0) throw usageError("Worktree remove accepts only a task id and role.");
+    if (existing === null) throw usageError(`Role has no managed worktree: ${taskId}/${roleName}.`);
+    return prepareTaskLifecycleOperation("worktree-remove", taskId, store, {
+      targetRoleName: roleName,
+      worktreeRequest: { roleName, path: null, branch: null, base: null }
+    });
+  }
+  if (existing !== null) throw usageError(`Role already has a managed worktree: ${taskId}/${roleName}.`);
+  assertKnownOptions(rest, new Set(["--path", "--branch", "--base"]));
   const path = readOption(rest, "--path").trim();
   const branch = readOption(rest, "--branch").trim();
-  const base = readOptionalOption(rest, "--base")?.trim();
-  const gitArgs = ["-C", role.workspace, "worktree", "add", "-b", branch, path];
-  if (base !== undefined) {
-    gitArgs.push(base);
-  }
-  execFileSync("git", gitArgs, { stdio: "pipe" });
-
-  const worktree = createRoleWorktree(
-    taskId,
-    roleName,
-    role.workspace,
-    path,
-    branch,
-    base,
-    new Date()
-  );
-  store.saveRoleWorktree(taskId, worktree);
-  store.saveRole(taskId, updateRole(role, { workspace: path }, new Date()));
-  recordTaskEvent(store, taskId, "role.worktree_created", { role: roleName, branch });
-  return `Created worktree for ${taskId}/${roleName}: ${path}\n`;
+  const base = readOptionalOption(rest, "--base")?.trim() ?? null;
+  return prepareTaskLifecycleOperation("worktree-create", taskId, store, {
+    targetRoleName: roleName,
+    worktreeRequest: { roleName, path, branch, base }
+  });
 }
 
 function taskBriefCommand(args: string[], store: TaskStore): string {
@@ -395,19 +565,26 @@ function yieldTaskRoleCommand(args: string[], store: TaskStore): string {
   if (role === null) {
     throw roleNotFound(roleName);
   }
-
   const activeRun = store.getActiveAgentRun(taskId, roleName);
   if (activeRun === null) {
     throw usageError(`No active agent run exists for ${taskId}/${roleName}.`);
+  }
+
+  const binding = activeRoleAgentBinding(role);
+  if (
+    binding.adapterId === "codex" &&
+    store.getRoleSessionSet(taskId, roleName)?.sessions[role.activeAgentId] === undefined
+  ) {
+    throw usageError("Codex must register its native session identity before the AgentRun can yield.");
   }
 
   const run = yieldAgentRun(activeRun, readOption(rest, "--summary"), new Date());
   store.saveAgentRun(run);
   store.clearActiveAgentRun(taskId, roleName);
   store.saveRole(taskId, updateRoleStatus(role, "idle", new Date()));
-  const session = store.getAgentSession(taskId, roleName);
-  if (session !== null) {
-    store.saveAgentSession({ ...session, status: "ready", updatedAt: new Date().toISOString() });
+  const sessionSet = store.getRoleSessionSet(taskId, roleName);
+  if (sessionSet !== null && sessionSet.sessions[role.activeAgentId] !== undefined) {
+    store.saveRoleSessionSet(updateRoleAgentSessionStatus(sessionSet, role.activeAgentId, "ready", new Date()));
   }
   if (run.workItemId !== undefined) {
     const workItem = store.getWorkItem(taskId, run.workItemId);
@@ -423,7 +600,99 @@ function yieldTaskRoleCommand(args: string[], store: TaskStore): string {
   return `Yielded ${run.id} from ${taskId}/${roleName}\n`;
 }
 
+export type PreparedTaskRoleDispatch = {
+  taskId: string;
+  role: Role;
+  expectedStateDigest: string;
+  run: AgentRun;
+  workItem: WorkItem | null;
+  expectedWorkItemUpdatedAt: string | null;
+  sessionSet: TaskRoleSessionSet | null;
+  session: RoleAgentSession | null;
+  launch: import("../executor/launchPlan.js").AgentLaunchPlan;
+  input: string;
+  mode: DispatchMode;
+};
+
 function dispatchTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
+  if (tmux === undefined) {
+    throw runtimeError("Tmux manager is not configured.");
+  }
+  const fileStore = store instanceof FileTaskStore ? store : null;
+  if (fileStore !== null && hasActiveDomainTransactionAuthority(fileStore.rootDirectory())) {
+    throw runtimeError("Role dispatch must run as a post-commit effect.");
+  }
+  if (fileStore !== null) {
+    const rootDir = fileStore.rootDirectory();
+    recoverTaskRoleRuntimeOperations(rootDir, tmux);
+  }
+  const prepared = prepareTaskRoleDispatch(args, store);
+  const intent: RoleLaunchRuntimeOperationClaim | null = fileStore !== null ? {
+    schemaVersion: 1 as const,
+    scope: "task-role" as const,
+    kind: "launch" as const,
+    token: randomUUID(),
+    taskId: prepared.taskId,
+    roleName: prepared.role.name,
+    operation: "dispatch" as const,
+    ownerPid: process.pid,
+    preparedSession: prepared.session,
+    selectedWorkItem: prepared.workItem,
+    pendingRun: {
+      id: prepared.run.id,
+      taskId: prepared.taskId,
+      roleName: prepared.role.name
+    },
+    expectedStateDigest: prepared.expectedStateDigest,
+    recoveryToken: null,
+    ...createRoleRuntimeOperationLease()
+  } : null;
+  const intentHooks = fileStore === null || intent === null ? {} : {
+    claim: () => claimRoleRuntimeOperation(
+      fileStore.rootDirectory(),
+      `task-dispatch-claim-${randomUUID()}`,
+      intent,
+      (workingRoot) => roleRuntimeStateDigest(readRoleRuntimeStateSnapshot(
+        transactionTaskStore(workingRoot),
+        intent.taskId,
+        intent.roleName,
+        {
+          workItemId: intent.selectedWorkItem?.id,
+          pendingRunId: intent.pendingRun?.id
+        }
+      ))
+    ),
+    release: () => releaseRoleRuntimeOperationClaim(
+      fileStore.rootDirectory(),
+      `task-dispatch-release-${randomUUID()}`,
+      intent
+    )
+  };
+  return executePostCommitRoleDispatch(tmux, {
+    taskId: prepared.taskId,
+    role: prepared.role,
+    launch: prepared.launch,
+    input: prepared.input,
+    replaceExisting: prepared.mode === "new",
+    launchToken: intent?.token ?? randomUUID()
+  }, () => fileStore !== null && intent !== null
+    ? executeDomainTransaction(fileStore.rootDirectory(), `task-dispatch-${randomUUID()}`, (workingRoot) => {
+        const output = persistTaskRoleDispatch(
+          prepared,
+          transactionTaskStore(workingRoot, intent.token)
+        );
+        clearRoleRuntimeOperationClaim(
+          workingRoot,
+          intent.taskId,
+          intent.roleName,
+          intent.token
+        );
+        return output;
+      })
+    : persistTaskRoleDispatch(prepared, store), intentHooks);
+}
+
+export function prepareTaskRoleDispatch(args: string[], store: TaskStore): PreparedTaskRoleDispatch {
   const [taskId, roleName, ...rest] = args;
 
   if (taskId === undefined || roleName === undefined) {
@@ -439,10 +708,6 @@ function dispatchTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxMa
     throw roleNotFound(roleName);
   }
 
-  if (tmux === undefined) {
-    throw runtimeError("Tmux manager is not configured.");
-  }
-
   if (roleName !== BUILTIN_LEADER_ROLE) {
     const leader = store.getRole(taskId, BUILTIN_LEADER_ROLE);
     const worktree = store.getRoleWorktree(taskId, roleName);
@@ -454,7 +719,8 @@ function dispatchTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxMa
     }
   }
 
-  if (store.getActiveAgentRun(taskId, roleName) !== null) {
+  const observedActiveRun = store.getActiveAgentRun(taskId, roleName);
+  if (observedActiveRun !== null) {
     throw usageError(`${taskId}/${roleName} already has an active agent run.`);
   }
 
@@ -468,7 +734,9 @@ function dispatchTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxMa
     throw usageError("Dispatch input is required.");
   }
 
-  const session = store.getAgentSession(taskId, roleName);
+  const observedSessionSet = store.getRoleSessionSet(taskId, roleName);
+  let sessionSet = observedSessionSet;
+  let session = sessionSet?.sessions[role.activeAgentId] ?? null;
   if (
     roleName === BUILTIN_LEADER_ROLE &&
     session !== null &&
@@ -518,35 +786,132 @@ function dispatchTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxMa
     { workItemId, topics }
   );
   const compiledInput = compileDispatchInput(store, taskId, role, scopedInput);
-  const executor = resolveAgentExecutor(role.agent);
+  const binding = activeRoleAgentBinding(role);
+  if (
+    mode === "new" &&
+    session === null &&
+    binding.adapterId === "codex" &&
+    store.listAgentRuns(taskId).some((candidate) => candidate.roleName === roleName)
+  ) {
+    throw usageError("Codex has an unregistered prior AgentRun; record its native session identity before continuing.");
+  }
+  const agent = resolveAgent(binding.agentId, store.listConfiguredAgents());
+  if (agent === null) throwUnsupportedAgent(binding.agentId, store);
+  const executor = resolveAgentExecutor(binding.adapterId);
+  if (mode === "new" && session === null) {
+    const reservation = reserveInitialAgentSession(
+      taskId,
+      role,
+      agent,
+      new Date(),
+      store.getRoleWorktree(taskId, roleName)?.path,
+      process.env
+    );
+    if (reservation !== null) {
+      sessionSet = reservation;
+      session = reservation.sessions[role.activeAgentId] ?? null;
+    }
+  }
   const dispatchInput = {
-    runtime: tmux,
     taskmuxHome: resolveTaskmuxHome(process.env),
     taskId,
     role,
+    agent,
     run,
     session,
     input: compiledInput,
-    now: new Date()
+    now: new Date(),
+    worktreeRoot: store.getRoleWorktree(taskId, roleName)?.path
   };
-  const prepared = mode === "new" ? executor.start(dispatchInput) : executor.recover(dispatchInput);
-  const effectiveSession = prepared.session;
-  store.saveRole(taskId, updateRoleStatus(role, "running", new Date()));
-  if (effectiveSession !== null) {
-    store.saveAgentSession({ ...effectiveSession, status: "running", updatedAt: new Date().toISOString() });
-  }
+  const prepared = executor.plan(dispatchInput);
   const storedRun = { ...run, input: compiledInput };
-  store.saveAgentRun(storedRun);
-  store.saveActiveAgentRun(storedRun);
-  if (workItem !== null) {
-    store.saveWorkItem(taskId, updateWorkItemStatus(workItem, "running", undefined, new Date()));
+  const pendingRunExisting = store.getAgentRun(taskId, run.id);
+  if (pendingRunExisting !== null) {
+    throw usageError(`AgentRun id was allocated concurrently: ${taskId}/${run.id}.`);
   }
-  recordTaskEvent(store, taskId, "role.dispatch_accepted", { role: roleName, mode });
-
-  return `Dispatch accepted for ${taskId}/${roleName} (${mode})\n`;
+  return {
+    taskId,
+    role,
+    expectedStateDigest: roleRuntimeStateDigest({
+      role,
+      sessionSet: observedSessionSet,
+      activeRun: observedActiveRun,
+      selectedWorkItem: workItem,
+      pendingRun: { id: run.id, existing: pendingRunExisting }
+    }),
+    run: storedRun,
+    workItem,
+    expectedWorkItemUpdatedAt: workItem?.updatedAt ?? null,
+    sessionSet,
+    session: prepared.session,
+    launch: prepared.launch,
+    input: compiledInput,
+    mode
+  };
 }
 
-function taskSessionCommand(args: string[], store: TaskStore): string {
+export function persistTaskRoleDispatch(
+  prepared: PreparedTaskRoleDispatch,
+  store: TaskStore,
+  options: { recordAcceptedEvent?: boolean } = {}
+): string {
+  const { taskId, role, run, workItem, session, mode } = prepared;
+  const currentState = readRoleRuntimeStateSnapshot(store, taskId, role.name, {
+    workItemId: prepared.workItem?.id,
+    pendingRunId: prepared.run.id
+  });
+  const currentRole = currentState.role;
+  const currentSessionSet = currentState.sessionSet;
+  if (currentRole === null || roleRuntimeStateDigest(currentState) !== prepared.expectedStateDigest) {
+    throw roleConflict(`${taskId}/${role.name}`);
+  }
+  if (currentState.activeRun !== null || currentState.pendingRun?.existing !== null) {
+    throw usageError(`${taskId}/${role.name} already has an active agent run.`);
+  }
+  const currentWorkItem = workItem === null ? null : store.getWorkItem(taskId, workItem.id);
+  if (
+    workItem !== null &&
+    (currentWorkItem === null || currentWorkItem.updatedAt !== prepared.expectedWorkItemUpdatedAt)
+  ) {
+    throw usageError(`Work item changed while launching: ${workItem.id}.`);
+  }
+
+  const now = new Date();
+  const effectiveSessionSet = session === null
+    ? prepared.sessionSet
+    : {
+        ...(prepared.sessionSet ?? createRoleSessionSet(
+          { scope: "task" as const, taskId, roleName: role.name },
+          role.activeAgentId,
+          now
+        )),
+        activeAgentId: role.activeAgentId,
+        sessions: {
+          ...(prepared.sessionSet?.sessions ?? {}),
+          [role.activeAgentId]: { ...session, status: "running" as const, updatedAt: now.toISOString() }
+        },
+        updatedAt: now.toISOString()
+      };
+  store.saveRoleWithSessionSet(taskId, updateRoleStatus(currentRole, "running", now), effectiveSessionSet);
+  store.saveAgentRun(run);
+  store.saveActiveAgentRun(run);
+  if (currentWorkItem !== null) {
+    store.saveWorkItem(taskId, updateWorkItemStatus(currentWorkItem, "running", undefined, now));
+  }
+  if (options.recordAcceptedEvent !== false) {
+    recordTaskEvent(store, taskId, "role.dispatch_accepted", { role: role.name, mode });
+  }
+  return `Dispatch accepted for ${taskId}/${role.name} (${mode})\n`;
+}
+
+function taskSessionCommand(
+  args: string[],
+  store: TaskStore,
+  environment: NodeJS.ProcessEnv,
+  tmux?: TmuxManager,
+  sessionRegistration?: ManualSessionRegistration,
+  requireManualSessionRegistration = false
+): string {
   const [command, taskId, roleName, ...rest] = args;
 
   if (taskId === undefined || roleName === undefined) {
@@ -561,21 +926,73 @@ function taskSessionCommand(args: string[], store: TaskStore): string {
   if (role === null) {
     throw roleNotFound(roleName);
   }
-
-  const nativeSessionId = readOption(rest, "--native-id").trim();
-  const existing = store.getAgentSession(taskId, roleName);
+  const nativeSessionId = readOption(rest, "--native-id");
+  if (!isCanonicalNativeSessionId(nativeSessionId)) {
+    throw usageError("Native session id must not contain surrounding whitespace.");
+  }
+  assertSessionRegistrationProvenance(command, taskId, roleName, nativeSessionId, role, store, environment);
+  const binding = activeRoleAgentBinding(role);
+  const existingSet = store.getRoleSessionSet(taskId, roleName) ??
+    createRoleSessionSet({ scope: "task", taskId, roleName }, role.activeAgentId, new Date());
+  const existing = existingSet.sessions[role.activeAgentId] ?? null;
+  const adapter = resolveAgentAdapter(binding.adapterId);
+  const configuredAgent = resolveAgent(binding.agentId, store.listConfiguredAgents());
+  if (configuredAgent === null) throwUnsupportedAgent(binding.agentId, store);
+  const fingerprint = adapter.fingerprint(binding.config, {
+    workspace: role.workspace,
+    systemPrompt: role.systemPrompt,
+    agent: configuredAgent
+  });
+  const ownedWorktree = store.getRoleWorktree(taskId, roleName)?.path;
+  if (requireManualSessionRegistration && sessionRegistration === undefined) {
+    throw usageError("Controller session registration provenance is required.");
+  }
+  if (sessionRegistration !== undefined && (
+    sessionRegistration.scope !== "task" ||
+    sessionRegistration.taskId !== taskId ||
+    sessionRegistration.roleName !== roleName ||
+    sessionRegistration.agentId !== binding.agentId ||
+    sessionRegistration.adapterId !== binding.adapterId ||
+    sessionRegistration.agentDefinitionUpdatedAt !== configuredAgent.updatedAt
+  )) {
+    throw usageError("Controller session registration provenance does not match the active Role binding.");
+  }
+  const sessionRoot = sessionRegistration === undefined
+    ? resolveAgentSessionRoot(binding.adapterId, {
+        ...environment,
+        ...resolveAgentLaunchEnvironment(configuredAgent, environment)
+      })
+    : sessionRegistration.sessionRoot;
+  if (!isCanonicalNativeSessionRoot(sessionRoot)) {
+    throw usageError("Native session registration root is invalid.");
+  }
+  const provenanceSessionRoot = environment.TASKMUX_NATIVE_SESSION_ROOT?.trim();
+  if (provenanceSessionRoot !== undefined && provenanceSessionRoot !== sessionRoot) {
+    throw usageError("Native session registration root does not match the Agent environment.");
+  }
+  const sessionInput = (replacementReason?: string) => ({
+    agentId: binding.agentId,
+    adapterId: binding.adapterId,
+    nativeSessionId,
+    policy: roleName === BUILTIN_LEADER_ROLE ? "fixed" as const : "leader-controlled" as const,
+    status: "ready" as const,
+    sessionRoot,
+    ...(replacementReason === undefined && existing?.worktreeRoot !== undefined
+      ? { worktreeRoot: existing.worktreeRoot }
+      : ownedWorktree === undefined ? {} : { worktreeRoot: ownedWorktree }),
+    configFingerprint: fingerprint,
+    permissionEnvelope: permissionEnvelopeForBinding(binding),
+    ...(replacementReason === undefined ? {} : { replacementReason })
+  });
 
   if (command === "record") {
-    if (
-      roleName === BUILTIN_LEADER_ROLE &&
-      existing !== null &&
-      existing.nativeSessionId !== nativeSessionId
-    ) {
-      throw usageError("Leader session replacement must be explicit.");
+    const candidateIdentity = { adapterId: binding.adapterId, sessionRoot, nativeSessionId };
+    if (existing !== null && !sameNativeSessionIdentity(existing, candidateIdentity)) {
+      throw usageError(`${roleName === BUILTIN_LEADER_ROLE ? "Leader" : "Role"} session replacement must be explicit.`);
     }
 
-    const session = recordAgentSession(taskId, roleName, role.agent, nativeSessionId, new Date(), existing);
-    store.saveAgentSession(session);
+    const sessions = recordRoleAgentSession(existingSet, sessionInput(), new Date());
+    store.saveRoleSessionSet(sessions);
     if (roleName === BUILTIN_LEADER_ROLE) {
       store.clearLeaderFailure(taskId);
       store.clearOperatorNotification(taskId);
@@ -584,21 +1001,30 @@ function taskSessionCommand(args: string[], store: TaskStore): string {
   }
 
   if (command === "replace") {
+    if (existing === null) {
+      throw usageError("Native session replacement requires an existing native session.");
+    }
+    const candidateIdentity = { adapterId: binding.adapterId, sessionRoot, nativeSessionId };
+    if (sameNativeSessionIdentity(existing, candidateIdentity)) {
+      throw usageError("Native session replacement requires a different native session identity.");
+    }
+    if (existing.previousIdentities.some((identity) => sameNativeSessionIdentity(identity, candidateIdentity))) {
+      throw usageError("A historical native session identity cannot be reused.");
+    }
+    if (store.getActiveAgentRun(taskId, roleName) !== null) {
+      throw usageError("Native session replacement requires the Role AgentRun to be idle.");
+    }
+    if (tmux === undefined) throw runtimeError("Tmux manager is not configured.");
+    if (tmux.probeRoleStatus(taskId, roleName) === "running") {
+      throw usageError("Native session replacement is blocked while the native Agent process is running.");
+    }
     const reason = readOption(rest, "--reason").trim();
     if (reason.length === 0) {
       throw usageError("Session replacement reason is required.");
     }
 
-    const session = recordAgentSession(
-      taskId,
-      roleName,
-      role.agent,
-      nativeSessionId,
-      new Date(),
-      existing,
-      reason
-    );
-    store.saveAgentSession(session);
+    const sessions = recordRoleAgentSession(existingSet, sessionInput(reason), new Date());
+    store.saveRoleSessionSet(sessions);
     if (roleName === BUILTIN_LEADER_ROLE) {
       store.clearLeaderFailure(taskId);
       store.clearOperatorNotification(taskId);
@@ -608,6 +1034,55 @@ function taskSessionCommand(args: string[], store: TaskStore): string {
   }
 
   throw usageError("Session usage: taskmux task session record|replace <task-id> <role> --native-id <id> [--reason <reason>].");
+}
+
+function assertSessionRegistrationProvenance(
+  command: string | undefined,
+  taskId: string,
+  roleName: string,
+  nativeSessionId: string,
+  role: Role,
+  store: TaskStore,
+  env: NodeJS.ProcessEnv
+): void {
+  const provenanceValues = [
+    env.TASKMUX_TASK_ID,
+    env.TASKMUX_ROLE,
+    env.TASKMUX_RUN_ID,
+    env.TASKMUX_AGENT_ID,
+    env.TASKMUX_ADAPTER_ID,
+    env.TASKMUX_NATIVE_SESSION_ROOT
+  ];
+  if (provenanceValues.every((value) => value === undefined)) return;
+  if (provenanceValues.some((value) => value === undefined || value.trim().length === 0)) {
+    throw usageError("Native session registration provenance is incomplete.");
+  }
+  if (command !== "record") {
+    throw usageError("A running Agent may record only its current native session.");
+  }
+  if (env.TASKMUX_TASK_ID !== taskId || env.TASKMUX_ROLE !== roleName) {
+    throw usageError("Native session registration target does not match the active AgentRun owner.");
+  }
+  const binding = activeRoleAgentBinding(role);
+  if (env.TASKMUX_AGENT_ID !== binding.agentId || env.TASKMUX_ADAPTER_ID !== binding.adapterId) {
+    throw usageError("Native session registration Agent does not match the active Role binding.");
+  }
+  if (env.TASKMUX_NATIVE_SESSION_ROOT === undefined ||
+      env.TASKMUX_NATIVE_SESSION_ROOT.trim().length === 0 ||
+      !isAbsolute(env.TASKMUX_NATIVE_SESSION_ROOT) ||
+      resolve(env.TASKMUX_NATIVE_SESSION_ROOT) !== env.TASKMUX_NATIVE_SESSION_ROOT) {
+    throw usageError("Native session registration root is missing or invalid.");
+  }
+  const activeRun = store.getActiveAgentRun(taskId, roleName);
+  if (activeRun === null || activeRun.id !== env.TASKMUX_RUN_ID) {
+    throw usageError("Native session registration does not match the active AgentRun.");
+  }
+  if (binding.adapterId === "codex" && (env.CODEX_THREAD_ID === undefined || env.CODEX_THREAD_ID.trim().length === 0)) {
+    throw usageError("Codex native session registration requires CODEX_THREAD_ID.");
+  }
+  if (env.CODEX_THREAD_ID !== undefined && env.CODEX_THREAD_ID.trim() !== nativeSessionId) {
+    throw usageError("Native session id does not match CODEX_THREAD_ID.");
+  }
 }
 
 function wakeTaskCommand(args: string[], store: TaskStore): string {
@@ -795,11 +1270,689 @@ function taskInputCommand(args: string[], store: TaskStore): string {
   throw usageError("Input usage: taskmux task input draft <task-id> <body> | taskmux task input submit <task-id>.");
 }
 
-function updateTaskArchivedCommand(args: string[], store: TaskStore, archived: boolean): string {
+type TaskLifecycleOperation = TaskLifecycleRuntimeOperationClaim["operation"];
+
+type TaskLifecyclePreparationOptions = {
+  targetRoleName?: string;
+  newRoleName?: string;
+  archiveMetadata?: {
+    by: "user" | "operator" | "leader";
+    reason?: string | null;
+    summary?: string | null;
+  };
+  worktreeRequest?: {
+    roleName: string;
+    path: string | null;
+    branch: string | null;
+    base: string | null;
+  };
+};
+
+export function readTaskLifecyclePreparedState(
+  store: TaskStore,
+  taskId: string
+): TaskLifecyclePreparedState {
+  const task = store.getTask(taskId);
+  if (task === null) throw taskNotFound(taskId);
+  const roles = store.listRoles(taskId).sort((left, right) => left.name.localeCompare(right.name));
+  const sessionSets = store.listRoleSessionSets(taskId)
+    .sort((left, right) => left.owner.roleName.localeCompare(right.owner.roleName));
+  const activeRuns = roles
+    .map((role) => store.getActiveAgentRun(taskId, role.name))
+    .filter((run): run is AgentRun => run !== null)
+    .sort((left, right) => left.roleName.localeCompare(right.roleName));
+  const pendingRuns = store.listAgentRuns(taskId)
+    .filter((run) => run.status === "active")
+    .sort((left, right) => left.id.localeCompare(right.id));
+  const workItems = store.listWorkItems(taskId)
+    .sort((left, right) => left.id.localeCompare(right.id));
+  const worktrees = store.listRoleWorktrees(taskId);
+  const dependencyGraphDigest = roleRuntimeStateDigest({
+    roles: roles.map((role) => role.name),
+    childRoles: store.listChildRoles(taskId)
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map((role) => ({ name: role.name, parentRole: role.parentRole, updatedAt: role.updatedAt })),
+    workItems: workItems.map((item) => ({
+      id: item.id,
+      assignee: item.assignee,
+      status: item.status,
+      updatedAt: item.updatedAt
+    })),
+    activeRuns: activeRuns.map((run) => ({ id: run.id, roleName: run.roleName, updatedAt: run.updatedAt })),
+    pendingRuns: pendingRuns.map((run) => ({ id: run.id, roleName: run.roleName, updatedAt: run.updatedAt })),
+    worktrees: worktrees.map((worktree) => ({
+      roleName: worktree.roleName,
+      ownerToken: worktree.ownerToken,
+      repositoryFingerprint: worktree.repositoryFingerprint,
+      path: worktree.path
+    }))
+  });
+  const prepared = {
+    task,
+    roles,
+    sessionSets,
+    activeRuns,
+    pendingRuns,
+    workItems,
+    worktrees,
+    dependencyGraphDigest
+  };
+  const inert = lowerUnknownInertData(prepared);
+  const serialized = inert === null ? null : stringifyCanonicalInertData(inert);
+  if (serialized === null) throw runtimeError(`Task lifecycle state is not serializable: ${taskId}.`);
+  return JSON.parse(serialized) as TaskLifecyclePreparedState;
+}
+
+export function prepareTaskLifecycleOperation(
+  operation: TaskLifecycleOperation,
+  taskId: string,
+  store: TaskStore,
+  options: TaskLifecyclePreparationOptions = {},
+  now = new Date()
+): TaskLifecycleRuntimeOperationClaim {
+  const preparedState = readTaskLifecyclePreparedState(store, taskId);
+  const targetRoleName = options.targetRoleName?.trim() || null;
+  const newRoleName = options.newRoleName?.trim() || null;
+  if (
+    ["role-detach", "role-remove", "role-rename", "worktree-create", "worktree-remove"].includes(operation) &&
+    targetRoleName === null
+  ) {
+    throw usageError("Task lifecycle Role target is required.");
+  }
+  if (targetRoleName !== null && preparedState.roles.every((role) => role.name !== targetRoleName)) {
+    throw roleNotFound(targetRoleName);
+  }
+  if (operation === "role-rename") {
+    if (newRoleName === null) throw usageError("New Role name is required.");
+    if (
+      preparedState.roles.some((role) => role.name === newRoleName) ||
+      store.getChildRole(taskId, newRoleName) !== null
+    ) {
+      throw usageError(`Role name is already owned: ${taskId}/${newRoleName}.`);
+    }
+  }
+  if (
+    operation === "role-remove" &&
+    preparedState.worktrees.some((worktree) => worktree.roleName === targetRoleName)
+  ) {
+    throw usageError(`Remove the managed worktree before removing Role ${targetRoleName}.`);
+  }
+  const archiveMetadata = operation === "archive"
+    ? {
+        by: options.archiveMetadata?.by ?? "user",
+        reason: options.archiveMetadata?.reason?.trim() || null,
+        summary: options.archiveMetadata?.summary?.trim() || null
+      }
+    : null;
+  return {
+    schemaVersion: 1,
+    scope: "task",
+    kind: "task-lifecycle",
+    token: randomUUID(),
+    taskId,
+    roleName: null,
+    operation,
+    ownerPid: process.pid,
+    preparedSession: null,
+    selectedWorkItem: null,
+    pendingRun: null,
+    expectedStateDigest: roleRuntimeStateDigest(preparedState),
+    recoveryToken: null,
+    ...createRoleRuntimeOperationLease(now),
+    phase: "prepared",
+    preparedState,
+    effectPlan: null,
+    targetRoleName,
+    newRoleName,
+    archiveMetadata,
+    worktreeRequest: options.worktreeRequest ?? null
+  };
+}
+
+type TaskLifecycleRuntime = Pick<
+  TmuxManager,
+  "probeRoleStatus" | "roleLaunchToken" | "roleOperationToken" |
+  "detachRole" | "killRoleForRestartWithOperationToken" | "renameRoleWithOperationToken"
+>;
+
+export type TaskLifecycleEffectReceipt =
+  | { kind: "git-worktree-created"; record: RoleWorktree }
+  | { kind: "git-worktree-removed" };
+
+export function probeTaskLifecycleEffectPlan(
+  claim: TaskLifecycleRuntimeOperationClaim,
+  runtime: Pick<TaskLifecycleRuntime, "probeRoleStatus" | "roleLaunchToken">,
+  gitWorktrees = new GitWorktreeManager(),
+  taskmuxHome?: string
+): TaskLifecycleEffectPlan {
+  if (claim.phase !== "prepared") {
+    if (claim.effectPlan === null) throw runtimeError("Task lifecycle effect plan is missing.");
+    return claim.effectPlan;
+  }
+  if (claim.operation === "worktree-create" || claim.operation === "worktree-remove") {
+    if (claim.targetRoleName === null || claim.worktreeRequest === null) {
+      throw runtimeError("Task worktree lifecycle plan is incomplete.");
+    }
+    if (runtime.probeRoleStatus(claim.taskId, claim.targetRoleName) === "running") {
+      throw usageError(`Role native process is running: ${claim.taskId}/${claim.targetRoleName}.`);
+    }
+    if (claim.operation === "worktree-remove") {
+      const record = claim.preparedState.worktrees.find((item) => item.roleName === claim.targetRoleName);
+      if (record === undefined) throw usageError(`Role has no managed worktree: ${claim.taskId}/${claim.targetRoleName}.`);
+      return gitWorktrees.probeRemove(record);
+    }
+    if (taskmuxHome === undefined) throw runtimeError("TaskMux home is required for worktree planning.");
+    const role = claim.preparedState.roles.find((item) => item.name === claim.targetRoleName);
+    if (role === undefined) throw roleNotFound(claim.targetRoleName);
+    const path = claim.worktreeRequest.path;
+    const branch = claim.worktreeRequest.branch;
+    if (path === null || branch === null) throw runtimeError("Task worktree creation request is incomplete.");
+    return gitWorktrees.probeCreate({
+      roleName: claim.targetRoleName,
+      repository: role.workspace,
+      path,
+      branch,
+      ...(claim.worktreeRequest.base === null ? {} : { base: claim.worktreeRequest.base }),
+      ownerToken: claim.token,
+      taskmuxHome
+    });
+  }
+  if (claim.operation === "role-rename") {
+    if (claim.targetRoleName === null || claim.newRoleName === null) {
+      throw runtimeError("Task Role rename plan is incomplete.");
+    }
+    return {
+      kind: "rename-role",
+      oldName: claim.targetRoleName,
+      newName: claim.newRoleName,
+      launchToken: probeExactLaunchToken(runtime, claim.taskId, claim.targetRoleName)
+    };
+  }
+  if (claim.operation === "role-detach") {
+    if (claim.targetRoleName === null) {
+      throw runtimeError("Task Role detach plan is incomplete.");
+    }
+    return { kind: "detach-role", roleName: claim.targetRoleName };
+  }
+  const roleNames = claim.operation === "role-remove"
+    ? [claim.targetRoleName!]
+    : claim.preparedState.roles.map((role) => role.name);
+  return {
+    kind: "stop-roles",
+    windows: roleNames.sort((left, right) => left.localeCompare(right)).map((roleName) => ({
+      roleName,
+      launchToken: probeExactLaunchToken(runtime, claim.taskId, roleName)
+    }))
+  };
+}
+
+function probeExactLaunchToken(
+  runtime: Pick<TaskLifecycleRuntime, "probeRoleStatus" | "roleLaunchToken">,
+  taskId: string,
+  roleName: string
+): string | null {
+  if (runtime.probeRoleStatus(taskId, roleName) === "exited") return null;
+  const launchToken = runtime.roleLaunchToken(taskId, roleName);
+  if (launchToken === null) {
+    throw runtimeError(`Task lifecycle requires a durable launch identity: ${taskId}/${roleName}.`);
+  }
+  return launchToken;
+}
+
+export function replayTaskLifecycleEffectPlan(
+  claim: TaskLifecycleRuntimeOperationClaim,
+  runtime: TaskLifecycleRuntime,
+  gitWorktrees = new GitWorktreeManager(),
+  now = new Date()
+): TaskLifecycleEffectReceipt | null {
+  if (claim.phase !== "effect-started" || claim.effectPlan === null) {
+    throw runtimeError(`Task lifecycle effect has not started: ${claim.taskId}.`);
+  }
+  if (claim.effectPlan.kind === "detach-role") {
+    runtime.detachRole(claim.taskId);
+    return null;
+  }
+  if (claim.effectPlan.kind === "rename-role") {
+    replayTaskRoleRenameEffect(claim, claim.effectPlan, runtime);
+    return null;
+  }
+  if (claim.effectPlan.kind === "git-worktree-create") {
+    return {
+      kind: "git-worktree-created",
+      record: gitWorktrees.applyCreate(claim.effectPlan, claim.taskId, now)
+    };
+  }
+  if (claim.effectPlan.kind === "git-worktree-remove") {
+    gitWorktrees.applyRemove(claim.effectPlan);
+    return { kind: "git-worktree-removed" };
+  }
+  for (const window of claim.effectPlan.windows) {
+    if (runtime.probeRoleStatus(claim.taskId, window.roleName) === "exited") continue;
+    const operationToken = runtime.roleOperationToken(claim.taskId, window.roleName);
+    const launchToken = runtime.roleLaunchToken(claim.taskId, window.roleName);
+    if (operationToken !== null && operationToken !== claim.token) {
+      throw runtimeError(`Task lifecycle encountered a foreign operation: ${window.roleName}.`);
+    }
+    if (launchToken !== window.launchToken) {
+      throw runtimeError(`Task lifecycle target changed before recovery: ${window.roleName}.`);
+    }
+    runtime.killRoleForRestartWithOperationToken(claim.taskId, window.roleName, claim.token);
+    if (runtime.probeRoleStatus(claim.taskId, window.roleName) !== "exited") {
+      throw runtimeError(`Task lifecycle could not confirm stopped Role: ${window.roleName}.`);
+    }
+  }
+  return null;
+}
+
+function replayTaskRoleRenameEffect(
+  claim: TaskLifecycleRuntimeOperationClaim,
+  plan: Extract<TaskLifecycleEffectPlan, { kind: "rename-role" }>,
+  runtime: TaskLifecycleRuntime
+): void {
+  const oldStatus = runtime.probeRoleStatus(claim.taskId, plan.oldName);
+  const newStatus = runtime.probeRoleStatus(claim.taskId, plan.newName);
+  if (oldStatus === "running" && newStatus === "running") {
+    throw runtimeError(`Task Role rename found both source and destination windows: ${plan.oldName}.`);
+  }
+  if (oldStatus === "exited" && newStatus === "exited") {
+    if (plan.launchToken === null) return;
+    throw runtimeError(`Task Role rename lost its token-owned window: ${plan.oldName}.`);
+  }
+  if (newStatus === "running") {
+    if (
+      runtime.roleLaunchToken(claim.taskId, plan.newName) !== plan.launchToken ||
+      runtime.roleOperationToken(claim.taskId, plan.newName) !== claim.token
+    ) {
+      throw runtimeError(`Task Role rename destination is foreign: ${plan.newName}.`);
+    }
+    return;
+  }
+  const operationToken = runtime.roleOperationToken(claim.taskId, plan.oldName);
+  if (
+    (operationToken !== null && operationToken !== claim.token) ||
+    runtime.roleLaunchToken(claim.taskId, plan.oldName) !== plan.launchToken
+  ) {
+    throw runtimeError(`Task Role rename source changed before recovery: ${plan.oldName}.`);
+  }
+  runtime.renameRoleWithOperationToken(claim.taskId, plan.oldName, plan.newName, claim.token);
+  if (
+    runtime.probeRoleStatus(claim.taskId, plan.oldName) !== "exited" ||
+    runtime.probeRoleStatus(claim.taskId, plan.newName) !== "running" ||
+    runtime.roleOperationToken(claim.taskId, plan.newName) !== claim.token
+  ) {
+    throw runtimeError(`Task Role rename could not be confirmed: ${plan.oldName}.`);
+  }
+}
+
+export function finalizeTaskLifecycleOperation(
+  claim: TaskLifecycleRuntimeOperationClaim,
+  store: TaskStore,
+  now = new Date(),
+  receipt: TaskLifecycleEffectReceipt | null = null
+): string {
+  if (claim.phase !== "effect-started") {
+    throw runtimeError(`Task lifecycle effect has not started: ${claim.taskId}.`);
+  }
+  const current = readTaskLifecyclePreparedState(store, claim.taskId);
+  if (roleRuntimeStateDigest(current) !== claim.expectedStateDigest) {
+    throw roleConflict(claim.taskId);
+  }
+  if (claim.operation === "worktree-create") {
+    if (
+      claim.targetRoleName === null ||
+      claim.effectPlan?.kind !== "git-worktree-create" ||
+      receipt?.kind !== "git-worktree-created" ||
+      receipt.record.ownerToken !== claim.token ||
+      receipt.record.roleName !== claim.targetRoleName
+    ) {
+      throw runtimeError("Task worktree creation receipt is invalid.");
+    }
+    const role = store.getRole(claim.taskId, claim.targetRoleName);
+    if (role === null) throw roleNotFound(claim.targetRoleName);
+    store.saveRoleWorktree(claim.taskId, receipt.record);
+    store.saveRole(claim.taskId, updateRole(role, { workspace: receipt.record.path }, now));
+    recordTaskEvent(store, claim.taskId, "role.worktree_created", {
+      role: claim.targetRoleName,
+      branch: receipt.record.branchRef
+    });
+    return `Created worktree for ${claim.taskId}/${claim.targetRoleName}: ${receipt.record.path}\n`;
+  }
+  if (claim.operation === "worktree-remove") {
+    if (
+      claim.targetRoleName === null ||
+      claim.effectPlan?.kind !== "git-worktree-remove" ||
+      receipt?.kind !== "git-worktree-removed"
+    ) {
+      throw runtimeError("Task worktree removal receipt is invalid.");
+    }
+    const role = store.getRole(claim.taskId, claim.targetRoleName);
+    if (role === null) throw roleNotFound(claim.targetRoleName);
+    let sessions = store.getRoleSessionSet(claim.taskId, claim.targetRoleName);
+    if (sessions !== null) {
+      for (const [agentId, session] of Object.entries(sessions.sessions)) {
+        if (session.worktreeRoot === claim.effectPlan.targetPath) {
+          sessions = updateRoleAgentSessionStatus(sessions, agentId, "broken", now);
+        }
+      }
+    }
+    store.saveRoleWithSessionSet(
+      claim.taskId,
+      updateRole(role, { workspace: claim.effectPlan.repositoryRoot }, now),
+      sessions
+    );
+    store.removeRoleWorktree(claim.taskId, claim.targetRoleName);
+    recordTaskEvent(store, claim.taskId, "role.worktree_removed", { role: claim.targetRoleName });
+    return `Removed worktree for ${claim.taskId}/${claim.targetRoleName}\n`;
+  }
+  if (claim.operation === "role-rename") {
+    if (claim.targetRoleName === null || claim.newRoleName === null) {
+      throw runtimeError("Task Role rename plan is incomplete.");
+    }
+    const role = store.getRole(claim.taskId, claim.targetRoleName);
+    if (role === null) throw roleNotFound(claim.targetRoleName);
+    store.renameRole(claim.taskId, claim.targetRoleName, updateRole(role, { name: claim.newRoleName }, now));
+    recordTaskEvent(store, claim.taskId, "role.renamed", {
+      from: claim.targetRoleName,
+      to: claim.newRoleName
+    });
+    return `Renamed role ${claim.targetRoleName} to ${claim.newRoleName} for ${claim.taskId}\n`;
+  }
+  if (claim.operation === "role-detach") {
+    if (
+      claim.targetRoleName === null ||
+      claim.effectPlan?.kind !== "detach-role" ||
+      claim.effectPlan.roleName !== claim.targetRoleName
+    ) {
+      throw runtimeError("Task Role detach plan is incomplete.");
+    }
+    const role = store.getRole(claim.taskId, claim.targetRoleName);
+    if (role === null) throw roleNotFound(claim.targetRoleName);
+    store.saveRole(
+      claim.taskId,
+      updateRoleStatus(role, "detached", now)
+    );
+    return `Detached role ${claim.targetRoleName} for ${claim.taskId}\n`;
+  }
+  const stoppedRoleNames = claim.operation === "role-remove"
+    ? [claim.targetRoleName!]
+    : current.roles.map((role) => role.name);
+  for (const roleName of stoppedRoleNames) {
+    finalizeStoppedTaskRole(claim.taskId, roleName, store, lifecycleFailureReason(claim), now);
+  }
+  if (claim.operation === "role-remove") {
+    const childNames = store.listChildRoles(claim.taskId)
+      .filter((child) => child.parentRole === claim.targetRoleName)
+      .map((child) => child.name);
+    for (const item of store.listWorkItems(claim.taskId)) {
+      if (
+        ![claim.targetRoleName, ...childNames].includes(item.assignee) ||
+        ["completed", "failed", "cancelled", "superseded"].includes(item.status)
+      ) {
+        continue;
+      }
+      store.saveWorkItem(
+        claim.taskId,
+        updateWorkItemStatus(item, "cancelled", `Role ${claim.targetRoleName} was removed.`, now)
+      );
+    }
+    const result = store.removeTaskRole(claim.taskId, claim.targetRoleName!);
+    if (!result.removed) throw roleNotFound(claim.targetRoleName!);
+    recordTaskEvent(store, claim.taskId, "role.removed", {
+      role: claim.targetRoleName!,
+      childCount: String(result.childCount)
+    });
+    return `Removed role ${claim.targetRoleName} and ${result.childCount} child role${result.childCount === 1 ? "" : "s"}\n`;
+  }
+  clearTaskRuntimePointers(store, claim.taskId);
+  if (claim.operation === "delete") {
+    recordTaskEvent(store, claim.taskId, "task.deleted", { task: claim.taskId });
+    if (!store.deleteTask(claim.taskId)) throw taskNotFound(claim.taskId);
+    return `Deleted task ${claim.taskId}\n`;
+  }
+  const metadata = claim.archiveMetadata;
+  if (metadata === null) throw runtimeError("Task archive metadata is missing.");
+  store.saveTask(updateTaskArchived(current.task, true, now, {
+    by: metadata.by,
+    ...(metadata.reason === null ? {} : { reason: metadata.reason }),
+    ...(metadata.summary === null ? {} : { summary: metadata.summary })
+  }));
+  recordTaskEvent(store, claim.taskId, "task.archived", {
+    ...(metadata.reason === null ? {} : { reason: metadata.reason })
+  });
+  return `Archived task ${claim.taskId}\n`;
+}
+
+function lifecycleFailureReason(claim: TaskLifecycleRuntimeOperationClaim): string {
+  if (claim.operation === "archive") return "Task was archived.";
+  if (claim.operation === "delete") return "Task was deleted.";
+  return "Task Role was removed.";
+}
+
+function finalizeStoppedTaskRole(
+  taskId: string,
+  roleName: string,
+  store: TaskStore,
+  reason: string,
+  now: Date
+): void {
+  const role = store.getRole(taskId, roleName);
+  if (role === null) throw roleNotFound(roleName);
+  const activeRun = store.getActiveAgentRun(taskId, roleName);
+  if (activeRun !== null) {
+    store.saveAgentRun(failAgentRun(activeRun, reason, now));
+    store.clearActiveAgentRun(taskId, roleName);
+  }
+  const sessionSet = store.getRoleSessionSet(taskId, roleName);
+  const stoppedSessions = sessionSet !== null && sessionSet.sessions[role.activeAgentId] !== undefined
+    ? updateRoleAgentSessionStatus(sessionSet, role.activeAgentId, "stopped", now)
+    : sessionSet;
+  store.saveRoleWithSessionSet(taskId, updateRoleStatus(role, "exited", now), stoppedSessions);
+}
+
+function clearTaskRuntimePointers(store: TaskStore, taskId: string): void {
+  store.clearTaskInputDraft(taskId);
+  store.clearPendingWakeup(taskId);
+  store.clearLeaderFailure(taskId);
+  const notification = store.getOperatorNotification(taskId);
+  if (notification !== null) store.clearOperatorNotification(taskId);
+}
+
+function prepareArchiveTaskOperation(
+  args: string[],
+  store: TaskStore
+): TaskLifecycleRuntimeOperationClaim {
+  const [taskId, ...rest] = args;
+  if (taskId === undefined || taskId.trim().length === 0) {
+    throw usageError("Task archive requires a task id.");
+  }
+  assertKnownOptions(rest, new Set(["--reason", "--summary"]));
+  const actor = process.env.TASKMUX_ROLE === "leader"
+    ? "leader"
+    : process.env.TASKMUX_ROLE === "operator" ? "operator" : "user";
+  return prepareTaskLifecycleOperation("archive", taskId, store, {
+    archiveMetadata: {
+      by: actor,
+      reason: readOptionalOption(rest, "--reason") ?? null,
+      summary: readOptionalOption(rest, "--summary") ?? null
+    }
+  });
+}
+
+export function executeTaskLifecycleOperation(
+  rootDir: string,
+  prepared: TaskLifecycleRuntimeOperationClaim,
+  tmux: TmuxManager,
+  finalize: (
+    claim: TaskLifecycleRuntimeOperationClaim,
+    receipt: TaskLifecycleEffectReceipt | null
+  ) => string,
+  gitWorktrees = new GitWorktreeManager()
+): string {
+  claimRoleRuntimeOperation(
+    rootDir,
+    `task-lifecycle-claim-${randomUUID()}`,
+    prepared,
+    (workingRoot) => roleRuntimeStateDigest(readTaskLifecyclePreparedState(
+      transactionTaskStore(workingRoot),
+      prepared.taskId
+    ))
+  );
+  let started: TaskLifecycleRuntimeOperationClaim;
+  try {
+    const effectPlan = probeTaskLifecycleEffectPlan(prepared, tmux, gitWorktrees, rootDir);
+    started = markTaskLifecycleOperationEffectStarted(
+      rootDir,
+      `task-lifecycle-effect-${randomUUID()}`,
+      prepared,
+      effectPlan
+    );
+  } catch (error) {
+    const current = readTaskRuntimeOperationClaim(rootDir, prepared.taskId);
+    if (current?.token === prepared.token && current.phase === "prepared" && current.recoveryToken === null) {
+      releaseRuntimeOperationClaim(rootDir, `task-lifecycle-release-${randomUUID()}`, prepared);
+    }
+    throw error;
+  }
+  const receipt = replayTaskLifecycleEffectPlan(started, tmux, gitWorktrees);
+  if (
+    process.env.NODE_ENV === "test" &&
+    process.env.TASKMUX_TEST_ONLY_TASK_LIFECYCLE_FAILPOINT === "after-effect"
+  ) {
+    throw new Error("Task lifecycle stopped after its external effect.");
+  }
+  return finalize(started, receipt);
+}
+
+export function runTaskLifecycleOperation(
+  prepared: TaskLifecycleRuntimeOperationClaim,
+  store: TaskStore,
+  tmux?: TmuxManager
+): string {
+  if (tmux === undefined) throw runtimeError("Tmux manager is not configured.");
+  if (!(store instanceof FileTaskStore)) {
+    throw runtimeError("Task lifecycle operations require the canonical FileTaskStore coordinator.");
+  }
+  const rootDir = store.rootDirectory();
+  if (hasActiveDomainTransactionAuthority(rootDir)) {
+    throw runtimeError("Task lifecycle effects must run after the prepare transaction commits.");
+  }
+  recoverTaskLifecycleRuntimeOperations(rootDir, tmux);
+  return executeTaskLifecycleOperation(rootDir, prepared, tmux, (started, receipt) =>
+    executeDomainTransaction(rootDir, `task-lifecycle-finalize-${randomUUID()}`, (workingRoot) => {
+      const current = readTaskRuntimeOperationClaim(workingRoot, started.taskId);
+      if (
+        current === null ||
+        current.token !== started.token ||
+        current.recoveryToken !== null ||
+        current.phase !== "effect-started" ||
+        roleRuntimeStateDigest(current.effectPlan) !== roleRuntimeStateDigest(started.effectPlan)
+      ) {
+        throw runtimeError(`Task lifecycle lost operation ownership: ${started.taskId}.`);
+      }
+      const output = finalizeTaskLifecycleOperation(
+        current,
+        transactionTaskStore(workingRoot, current.token),
+        new Date(),
+        receipt
+      );
+      clearRuntimeOperationClaim(
+        workingRoot,
+        { scope: "task", taskId: current.taskId },
+        current.token
+      );
+      return output;
+    })
+  );
+}
+
+export function recoverTaskLifecycleRuntimeOperations(
+  rootDir: string,
+  tmux: TmuxManager,
+  now = new Date()
+): string[] {
+  const recoveredTokens: string[] = [];
+  for (const observed of listRuntimeOperationClaims(rootDir)) {
+    if (observed.scope !== "task" || !isRuntimeOperationRecoverable(observed, now)) continue;
+    const recoveryToken = randomUUID();
+    const claimed = claimRuntimeOperationRecovery(
+      rootDir,
+      `task-lifecycle-recover-${randomUUID()}`,
+      observed,
+      recoveryToken,
+      now
+    );
+    if (claimed === null || claimed.scope !== "task") continue;
+    if (claimed.phase === "prepared") {
+      releaseRuntimeOperationClaim(
+        rootDir,
+        `task-lifecycle-prepared-release-${randomUUID()}`,
+        claimed,
+        recoveryToken
+      );
+      recoveredTokens.push(claimed.token);
+      continue;
+    }
+    const receipt = replayTaskLifecycleEffectPlan(claimed, tmux, new GitWorktreeManager(), now);
+    executeDomainTransaction(rootDir, `task-lifecycle-recovery-finalize-${randomUUID()}`, (workingRoot) => {
+      const current = readTaskRuntimeOperationClaim(workingRoot, claimed.taskId);
+      if (
+        current === null ||
+        current.token !== claimed.token ||
+        current.recoveryToken !== recoveryToken ||
+        current.phase !== "effect-started"
+      ) {
+        throw runtimeError(`Task lifecycle recovery lost ownership: ${claimed.taskId}.`);
+      }
+      finalizeTaskLifecycleOperation(
+        current,
+        transactionTaskStore(workingRoot, current.token, recoveryToken),
+        now,
+        receipt
+      );
+      clearRuntimeOperationClaim(
+        workingRoot,
+        { scope: "task", taskId: current.taskId },
+        current.token,
+        recoveryToken
+      );
+    });
+    recoveredTokens.push(claimed.token);
+  }
+  return recoveredTokens;
+}
+
+export function prepareTaskLifecycleCommand(
+  args: string[],
+  store: TaskStore
+): TaskLifecycleRuntimeOperationClaim | null {
+  if (args[0] === "archive") return prepareArchiveTaskOperation(args.slice(1), store);
+  if (args[0] === "delete") return prepareDeleteTaskOperation(args.slice(1), store);
+  if (args[0] === "role" && args[1] === "remove") {
+    return prepareRemoveTaskRoleOperation(args.slice(2), store);
+  }
+  if (args[0] === "role" && args[1] === "rename") {
+    return prepareRenameTaskRoleOperation(args.slice(2), store);
+  }
+  if (args[0] === "detach") {
+    return prepareDetachTaskRoleOperation(args.slice(1), store);
+  }
+  if (args[0] === "worktree") return prepareTaskWorktreeOperation(args.slice(1), store);
+  return null;
+}
+
+function updateTaskArchivedCommand(
+  args: string[],
+  store: TaskStore,
+  archived: boolean,
+  tmux?: TmuxManager
+): string {
   const [taskId, ...rest] = args;
 
   if (taskId === undefined || taskId.trim().length === 0) {
     throw usageError(`Task ${archived ? "archive" : "unarchive"} requires a task id.`);
+  }
+  if (archived) {
+    return runTaskLifecycleOperation(prepareArchiveTaskOperation(args, store), store, tmux);
   }
   if (archived) {
     assertKnownOptions(rest, new Set(["--reason", "--summary"]));
@@ -867,7 +2020,7 @@ function taskTopicCommand(args: string[], store: TaskStore): string {
   }
 
   if (command === "list" && rest.length === 0) {
-    return listTaskTopicsCommand([command, taskId], store);
+    return listTaskTopicsCommand(args, store);
   }
 
   if (command === "summarize") {
@@ -890,20 +2043,22 @@ function taskTopicCommand(args: string[], store: TaskStore): string {
 
 function listTaskTopicsCommand(args: string[], store: TaskReader): string {
   const [command, taskId, ...rest] = args;
-  if (command !== "list" || rest.length !== 0) {
+  if (command !== "list" || taskId === undefined || rest.length !== 0) {
     throw usageError("Topic usage: taskmux task topic list <task-id>.");
   }
-  if (taskId === undefined || taskId.trim().length === 0) {
+  if (taskId.trim().length === 0) {
     throw usageError("Task id is required.");
   }
   if (store.getTask(taskId) === null) {
     throw taskNotFound(taskId);
   }
+
+  const customTopics = store.getTaskTopics(taskId).customTopics;
   const rows = [
     ...BUILTIN_TOPICS.map((topic) => [topic.id, topic.name, "built-in", topic.description]),
-    ...store.getTaskTopics(taskId).customTopics.map((topic) =>
-      [topic.id, topic.name, "custom", topic.description])
+    ...customTopics.map((topic) => [topic.id, topic.name, "custom", topic.description])
   ];
+
   return `${renderTable(
     `Task topics: ${taskId}`,
     [
@@ -937,7 +2092,7 @@ function createTaskCommand(args: string[], store: TaskStore): string {
   const explicitWorkspace = readOptionalOption(args, "--workspace")?.trim();
   const workspace = explicitWorkspace ?? config.defaultWorkspace ?? process.cwd();
   const assignedRoles = uniqueStrings([BUILTIN_LEADER_ROLE, ...(template?.roles ?? [])])
-    .map((roleName) => createRoleFromGlobalOrAgent(roleName, {
+    .map((roleName) => createRoleFromGlobalOrAgent(task.id, roleName, {
       agent: explicitAgent,
       fallbackAgent: defaultAgent,
       workspace,
@@ -950,9 +2105,11 @@ function createTaskCommand(args: string[], store: TaskStore): string {
   assignedRoles.forEach((role) => saveRoleAndRecordEvent(task.id, role, store));
   const leader = assignedRoles.find((role) => role.name === BUILTIN_LEADER_ROLE);
   if (leader !== undefined) {
-    const reservation = reserveInitialAgentSession(task.id, leader, new Date());
+    const agent = resolveAgent(leader.activeAgentId, store.listConfiguredAgents());
+    if (agent === null) throwUnsupportedAgent(leader.activeAgentId, store);
+    const reservation = reserveInitialAgentSession(task.id, leader, agent, new Date());
     if (reservation !== null) {
-      store.saveAgentSession(reservation);
+      store.saveRoleSessionSet(reservation);
     }
   }
   if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
@@ -992,9 +2149,30 @@ function boardTaskCommand(args: string[], store: TaskReader): string {
 }
 
 function showTaskCommand(args: string[], store: TaskStore, remember: boolean): string {
-  const output = showTaskSnapshot(args, store);
-  if (remember) rememberTask(store, args[0] ?? "");
-  return output;
+  const [id] = args;
+
+  if (id === undefined || id.trim().length === 0) {
+    throw usageError("Task id is required.");
+  }
+
+  const task = store.getTask(id);
+
+  if (task === null) {
+    throw taskNotFound(id);
+  }
+
+  if (remember) {
+    rememberTask(store, task.id);
+  }
+
+  return [
+    `Task: ${task.id}`,
+    `Title: ${task.title}`,
+    `Archived: ${task.archived ? "yes" : "no"}`,
+    ...renderTaskMetadataLines(task),
+    `Created: ${task.createdAt}`,
+    `Updated: ${task.updatedAt}`
+  ].join("\n").concat("\n");
 }
 
 function showTaskSnapshot(args: string[], store: TaskReader): string {
@@ -1076,14 +2254,10 @@ function cloneTaskCommand(args: string[], store: TaskStore): string {
 
   const roles = store.listRoles(sourceTask.id).map((role) => {
     const clonedRole = createRole(
+      clonedTask.id,
       role.name,
-      {
-        id: role.agent,
-        command: role.command,
-        args: role.args,
-        env: role.env,
-        source: "custom"
-      },
+      Object.values(role.agentBindings),
+      role.activeAgentId,
       role.workspace,
       new Date(),
       {
@@ -1097,7 +2271,7 @@ function cloneTaskCommand(args: string[], store: TaskStore): string {
     );
 
     store.saveRole(clonedTask.id, clonedRole);
-    recordTaskEvent(store, clonedTask.id, "role.assigned", { role: clonedRole.name, agent: clonedRole.agent });
+    recordTaskEvent(store, clonedTask.id, "role.assigned", { role: clonedRole.name, agent: clonedRole.activeAgentId });
     return clonedRole.name;
   });
 
@@ -1136,9 +2310,31 @@ function updateTaskCommand(args: string[], store: TaskStore): string {
 }
 
 function openTaskCommand(args: string[], store: TaskStore, remember: boolean): string {
-  const output = openTaskSnapshot(args, store);
-  if (remember) rememberTask(store, args[0] ?? "");
-  return output;
+  const [id] = args;
+
+  if (id === undefined || id.trim().length === 0) {
+    throw usageError("Task id is required.");
+  }
+
+  const task = store.getTask(id);
+
+  if (task === null) {
+    throw taskNotFound(id);
+  }
+
+  if (remember) {
+    rememberTask(store, task.id);
+  }
+
+  return [
+    `Task: ${task.id}`,
+    `Title: ${task.title}`,
+    `Archived: ${task.archived ? "yes" : "no"}`,
+    ...renderTaskMetadataLines(task),
+    `Roles: ${store.listRoles(task.id).length}`,
+    `Comments: ${store.listComments(task.id).length}`,
+    `Next: taskmux task enter ${task.id} <role>`
+  ].join("\n").concat("\n");
 }
 
 function openTaskSnapshot(args: string[], store: TaskReader): string {
@@ -1166,9 +2362,30 @@ function openTaskSnapshot(args: string[], store: TaskReader): string {
 }
 
 function contextTaskCommand(args: string[], store: TaskStore, remember: boolean): string {
-  const output = contextTaskSnapshot(args, store);
-  if (remember) rememberTask(store, args[0] ?? "");
-  return output;
+  const [taskId, ...rest] = args;
+
+  if (taskId === undefined || taskId.trim().length === 0) {
+    throw usageError("Task id is required.");
+  }
+
+  const task = store.getTask(taskId);
+
+  if (task === null) {
+    throw taskNotFound(taskId);
+  }
+
+  if (remember) {
+    rememberTask(store, task.id);
+  }
+
+  const options = parseTaskContextOptions(rest);
+  const context = buildTaskContext(task, store, options.includeTranscripts);
+
+  if (options.format === "json") {
+    return `${JSON.stringify(context, null, 2)}\n`;
+  }
+
+  return renderTaskContextText(context, options.includeTranscripts);
 }
 
 function contextTaskSnapshot(args: string[], store: TaskReader): string {
@@ -1194,21 +2411,19 @@ function contextTaskSnapshot(args: string[], store: TaskReader): string {
   return renderTaskContextText(context, options.includeTranscripts);
 }
 
-function deleteTaskCommand(args: string[], store: TaskStore): string {
-  const [taskId] = args;
+function deleteTaskCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
+  return runTaskLifecycleOperation(prepareDeleteTaskOperation(args, store), store, tmux);
+}
 
-  if (taskId === undefined || taskId.trim().length === 0) {
-    throw usageError("Task id is required.");
+function prepareDeleteTaskOperation(
+  args: string[],
+  store: TaskStore
+): TaskLifecycleRuntimeOperationClaim {
+  const [taskId, ...rest] = args;
+  if (taskId === undefined || taskId.trim().length === 0 || rest.length > 0) {
+    throw usageError("Task delete requires exactly one task id.");
   }
-
-  if (store.getTask(taskId) === null) {
-    throw taskNotFound(taskId);
-  }
-
-  recordTaskEvent(store, taskId, "task.deleted", { task: taskId });
-  store.deleteTask(taskId);
-
-  return `Deleted task ${taskId}\n`;
+  return prepareTaskLifecycleOperation("delete", taskId, store);
 }
 
 function restoreTaskCommand(args: string[], store: TaskStore): string {
@@ -1234,41 +2449,39 @@ function taskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): 
     case "child":
       return createTaskChildRoleCommand(rest, store);
     case "update":
-      return updateTaskRoleCommand(rest, store);
+      return updateTaskRoleCommand(rest, store, tmux);
     case "rename":
       return renameTaskRoleCommand(rest, store, tmux);
     case "remove":
-      return removeTaskRoleCommand(rest, store);
+      return removeTaskRoleCommand(rest, store, tmux);
     default:
       throw usageError(command === undefined ? "Task role command is required." : `Unknown command: task role ${command}`);
   }
 }
 
-function removeTaskRoleCommand(args: string[], store: TaskStore): string {
-  const [taskId, roleName, ...rest] = args;
+function removeTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
+  return runTaskLifecycleOperation(prepareRemoveTaskRoleOperation(args, store), store, tmux);
+}
 
+function prepareRemoveTaskRoleOperation(
+  args: string[],
+  store: TaskStore
+): TaskLifecycleRuntimeOperationClaim {
+  const [taskId, roleName, ...rest] = args;
   if (taskId === undefined || roleName === undefined || rest.length > 0) {
     throw usageError("Role remove usage: taskmux task role remove <task-id> <role>.");
   }
-
   if (store.getTask(taskId) === null) {
     throw taskNotFound(taskId);
   }
-
   if (roleName === BUILTIN_LEADER_ROLE) {
     throw usageError("The task leader role cannot be removed.");
   }
-
-  const result = store.removeTaskRole(taskId, roleName);
-  if (!result.removed) {
-    throw roleNotFound(roleName);
+  if (roleName === BUILTIN_LEADER_ROLE) {
+    throw usageError("The task leader role cannot be removed.");
   }
-
-  recordTaskEvent(store, taskId, "role.removed", {
-    role: roleName,
-    childCount: String(result.childCount)
-  });
-  return `Removed role ${roleName} and ${result.childCount} child role${result.childCount === 1 ? "" : "s"}\n`;
+  if (store.getRole(taskId, roleName) === null) throw roleNotFound(roleName);
+  return prepareTaskLifecycleOperation("role-remove", taskId, store, { targetRoleName: roleName });
 }
 
 function createTaskChildRoleCommand(args: string[], store: TaskStore): string {
@@ -1339,25 +2552,26 @@ function assignTaskRoleCommand(args: string[], store: TaskStore): string {
     throw taskNotFound(taskId);
   }
 
-  assertKnownOptions(rest, new Set(["--agent", "--workspace", "--as"]));
-
-  const agent = readOptionalOption(rest, "--agent")?.trim();
-  const workspace = readOptionalOption(rest, "--workspace")?.trim();
-  const targetName = readOptionalOption(rest, "--as")?.trim() ?? roleName;
-  const role = agent === undefined
-    ? copyGlobalRole(roleName, store, { name: targetName, workspaceOverride: workspace })
-    : createResolvedRole(targetName, agent, requireWorkspace(workspace), store);
+  const parsed = parseRoleCommandOptions(rest, TASK_ASSIGN_OPTIONS, {
+    profileInheritableFields: ROLE_PROFILE_INHERITABLE_FIELDS
+  });
+  assertRoleSystemPromptSelection(parsed);
+  const agent = requiredRoleOption(parsed.value("--agent"), "--agent");
+  const workspace = requireWorkspace(
+    parsed.value("--workspace")?.trim() ?? store.getConfig().defaultWorkspace
+  );
+  const targetName = parsed.value("--as")?.trim() ?? roleName;
+  assertTaskRoleAssignable(taskId, targetName, store);
+  const resolvedAgent = resolveAgent(agent, store.listConfiguredAgents());
+  if (resolvedAgent === null) throwUnsupportedAgent(agent, store);
+  const binding = parsed.createBinding(resolvedAgent, workspace);
+  const role = createRole(taskId, targetName, [binding], binding.agentId, workspace, new Date(), {
+    ...(parsed.value("--system-prompt") === undefined
+      ? {}
+      : { systemPrompt: parsed.value("--system-prompt")?.trim() })
+  });
 
   saveRoleAndRecordEvent(taskId, role, store);
-
-  if (agent === undefined) {
-    return [
-      `Bound role ${role.name} to ${taskId}`,
-      `Source role: ${roleName}`,
-      `Agent: ${role.agent}`,
-      `Workspace: ${role.workspace}`
-    ].join("\n").concat("\n");
-  }
 
   return [
     `Assigned role ${role.name} to ${taskId}`,
@@ -1367,7 +2581,22 @@ function assignTaskRoleCommand(args: string[], store: TaskStore): string {
 }
 
 function bindTaskRoleCommand(args: string[], store: TaskStore): string {
-  return assignTaskRoleCommand(args, store);
+  const [taskId, roleName, ...rest] = args;
+  if (taskId === undefined || taskId.trim().length === 0) throw usageError("Task id is required.");
+  if (roleName === undefined || roleName.trim().length === 0) throw usageError("Role name is required.");
+  if (store.getTask(taskId) === null) throw taskNotFound(taskId);
+
+  const parsed = parseRoleCommandOptions(rest, TASK_BIND_OPTIONS, { allowStructured: false });
+  const workspace = parsed.value("--workspace")?.trim();
+  const targetName = parsed.value("--as")?.trim() ?? roleName;
+  const role = copyGlobalRole(taskId, roleName, store, { name: targetName, workspaceOverride: workspace });
+  saveRoleAndRecordEvent(taskId, role, store);
+  return [
+    `Bound role ${role.name} to ${taskId}`,
+    `Source role: ${roleName}`,
+    `Agent: ${role.activeAgentId}`,
+    `Workspace: ${role.workspace}`
+  ].join("\n").concat("\n");
 }
 
 function assignManyTaskRolesCommand(args: string[], store: TaskStore): string {
@@ -1381,35 +2610,59 @@ function assignManyTaskRolesCommand(args: string[], store: TaskStore): string {
     throw taskNotFound(taskId);
   }
 
-  assertKnownOptions(rest, new Set(["--role", "--agent", "--workspace"]));
-
-  const roleNames = readRepeatedOption(rest, "--role").map((role) => role.trim()).filter((role) => role.length > 0);
+  const parsed = parseRoleCommandOptions(rest, TASK_ASSIGN_MANY_OPTIONS, {
+    profileInheritableFields: ROLE_PROFILE_INHERITABLE_FIELDS
+  });
+  assertRoleSystemPromptSelection(parsed);
+  const roleNames = parsed.values("--role").map((role) => role.trim()).filter((role) => role.length > 0);
 
   if (roleNames.length === 0) {
     throw usageError("At least one --role is required.");
   }
+  if (new Set(roleNames).size !== roleNames.length) {
+    throw usageError("Role names in assign-many must be unique.");
+  }
+  const existingRole = roleNames.find((roleName) =>
+    store.getRole(taskId, roleName) !== null || store.getChildRole?.(taskId, roleName) != null);
+  if (existingRole !== undefined) {
+    throw roleConflict(existingRole);
+  }
 
-  const config = store.getConfig();
-  const agent = readOptionalOption(rest, "--agent")?.trim() ?? config.defaultAgent;
-  const explicitWorkspace = readOptionalOption(rest, "--workspace")?.trim();
-  const workspace = explicitWorkspace ?? config.defaultWorkspace;
-
-  const assignedRoles = roleNames.map((roleName) => {
-    const role = createRoleFromGlobalOrAgent(roleName, {
-      agent: undefined,
-      fallbackAgent: agent,
-      workspace,
-      workspaceOverride: explicitWorkspace
-    }, store);
-
-    saveRoleAndRecordEvent(taskId, role, store);
-    return role.name;
+  const requestedRoleNames = new Set<string>();
+  roleNames.forEach((roleName) => {
+    if (requestedRoleNames.has(roleName)) {
+      throwTaskRoleAlreadyExists(taskId, roleName);
+    }
+    requestedRoleNames.add(roleName);
+    assertTaskRoleAssignable(taskId, roleName, store);
   });
+  const agentId = requiredRoleOption(parsed.value("--agent"), "--agent");
+  const workspace = requireWorkspace(
+    parsed.value("--workspace")?.trim() ?? store.getConfig().defaultWorkspace
+  );
+  const agent = resolveAgent(agentId, store.listConfiguredAgents());
+  if (agent === null) throwUnsupportedAgent(agentId, store);
+  const binding = parsed.createBinding(agent, workspace);
+  const roles = roleNames.map((roleName) => createRole(
+    taskId,
+    roleName,
+    [createRoleAgentBinding(agent, binding.config)],
+    agent.id,
+    workspace,
+    new Date(),
+    {
+      ...(parsed.value("--system-prompt") === undefined
+        ? {}
+        : { systemPrompt: parsed.value("--system-prompt")?.trim() })
+    }
+  ));
 
-  return `Assigned roles to ${taskId}: ${assignedRoles.join(", ")}\n`;
+  for (const role of roles) saveRoleAndRecordEvent(taskId, role, store);
+
+  return `Assigned roles to ${taskId}: ${roles.map((role) => role.name).join(", ")}\n`;
 }
 
-function updateTaskRoleCommand(args: string[], store: TaskStore): string {
+function updateTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
   const [taskId, roleName, ...rest] = args;
 
   if (taskId === undefined || taskId.trim().length === 0) {
@@ -1429,31 +2682,61 @@ function updateTaskRoleCommand(args: string[], store: TaskStore): string {
   if (role === null) {
     throw roleNotFound(roleName);
   }
-
-  assertKnownOptions(rest, new Set(["--agent", "--workspace"]));
-
-  const agent = readOptionalOption(rest, "--agent")?.trim();
-  const workspace = readOptionalOption(rest, "--workspace")?.trim();
-  const patch: Partial<Pick<Role, "agent" | "command" | "args" | "env" | "workspace">> = {};
+  const parsed = parseRoleCommandOptions(rest, TASK_ROLE_UPDATE_OPTIONS, {
+    profileInheritableFields: ROLE_PROFILE_INHERITABLE_FIELDS
+  });
+  assertExpectedRoleRevision(role, parsed.value(ROLE_EXPECT_UPDATED_AT_OPTION));
+  assertRoleSystemPromptSelection(parsed);
+  const agent = parsed.value("--agent")?.trim();
+  const activeAgentId = parsed.value("--active-agent")?.trim();
+  const workspace = parsed.value("--workspace")?.trim();
+  const patch: Partial<Pick<Role, "activeAgentId" | "agentBindings" | "workspace">> = {};
+  let switchedSessions: TaskRoleSessionSet | null = null;
+  let expectedSessionSet: TaskRoleSessionSet | null = null;
+  const profileChanged = parsed.has("--system-prompt") || parsed.inherits("systemPrompt");
+  let nextBindings = role.agentBindings;
 
   if (agent !== undefined) {
     if (agent.length === 0) {
       throw usageError("--agent is required.");
     }
-    if (agent !== role.agent) {
-      throw usageError(`TaskRole Agent type is fixed after creation: ${role.agent}.`);
-    }
-
     const resolvedAgent = resolveAgent(agent, store.listConfiguredAgents());
 
     if (resolvedAgent === null) {
       throw usageError(`Unsupported agent: ${agent}\nSupported agents: ${supportedAgentIds(store.listConfiguredAgents()).join(", ")}`);
     }
 
-    patch.agent = resolvedAgent.id;
-    patch.command = resolvedAgent.command;
-    patch.args = resolvedAgent.args;
-    patch.env = resolvedAgent.env;
+    nextBindings = {
+      ...role.agentBindings,
+      [resolvedAgent.id]: parsed.createBinding(
+        resolvedAgent,
+        workspace ?? role.workspace,
+        role.agentBindings[resolvedAgent.id]
+      )
+    };
+    patch.agentBindings = nextBindings;
+    patch.activeAgentId = resolvedAgent.id;
+  } else if (parsed.hasStructuredChanges) {
+    const targetAgentId = activeAgentId ?? role.activeAgentId;
+    if (role.agentBindings[targetAgentId] === undefined) {
+      throw usageError(`Role agent is not bound: ${targetAgentId}.`);
+    }
+    const activeAgent = resolveAgent(targetAgentId, store.listConfiguredAgents());
+    if (activeAgent === null) throwUnsupportedAgent(targetAgentId, store);
+    nextBindings = {
+      ...nextBindings,
+      [activeAgent.id]: parsed.createBinding(
+        activeAgent,
+        workspace ?? role.workspace,
+        role.agentBindings[activeAgent.id]
+      )
+    };
+    patch.agentBindings = nextBindings;
+  }
+
+  if (activeAgentId !== undefined) {
+    if (nextBindings[activeAgentId] === undefined) throw usageError(`Role agent is not bound: ${activeAgentId}.`);
+    patch.activeAgentId = activeAgentId;
   }
 
   if (workspace !== undefined) {
@@ -1464,61 +2747,178 @@ function updateTaskRoleCommand(args: string[], store: TaskStore): string {
     patch.workspace = workspace;
   }
 
-  if (Object.keys(patch).length === 0) {
+  if (Object.keys(patch).length === 0 && !profileChanged) {
     throw usageError("At least one role update option is required.");
   }
 
-  const updatedRole = updateRole(role, patch, new Date());
-  store.saveRole(taskId, updatedRole);
-  recordTaskEvent(store, taskId, "role.updated", { role: updatedRole.name });
+  const profiledRole = applyRoleSystemPrompt(
+    role,
+    parsed.value("--system-prompt"),
+    parsed.inherits("systemPrompt")
+  );
+  let updatedRole = updateRole(profiledRole, { ...patch, activeAgentId: role.activeAgentId }, new Date());
+  const targetAgentId = patch.activeAgentId;
+  let switchEvent: ReturnType<typeof switchActiveRoleAgent>["event"] | null = null;
+  if (targetAgentId !== undefined && targetAgentId !== role.activeAgentId) {
+    if (tmux === undefined) {
+      throw usageError("Tmux manager is required to switch a TaskRole Agent.");
+    }
+    try {
+      expectedSessionSet = store.getRoleSessionSet(taskId, roleName);
+      const switched = switchActiveRoleAgent(
+        updatedRole,
+        expectedSessionSet ?? createRoleSessionSet(
+          { scope: "task", taskId, roleName },
+          role.activeAgentId,
+          new Date()
+        ),
+        targetAgentId,
+        {
+          activeRun: store.getActiveAgentRun(taskId, roleName) !== null,
+          nativeProcessRunning: tmux.probeRoleStatus(taskId, roleName) === "running"
+        },
+        new Date()
+      );
+      updatedRole = switched.role;
+      if (switched.sessions.owner.scope !== "task") {
+        throw new Error(`Role session owner is not task-scoped: ${roleName}.`);
+      }
+      switchedSessions = switched.sessions as TaskRoleSessionSet;
+      switchEvent = switched.event;
+    } catch (error) {
+      throw usageError(error instanceof Error ? error.message : String(error));
+    }
+  }
+  const storedRole = switchedSessions === null
+    ? store.compareAndSwapRole(taskId, role.updatedAt, updatedRole)
+    : store.compareAndSwapRoleWithSessionSet(
+        taskId,
+        role.updatedAt,
+        expectedSessionSet,
+        updatedRole,
+        switchedSessions
+      );
+  if (storedRole === null) throw roleConflict(role.name);
+  if (switchEvent !== null) recordTaskEvent(store, taskId, switchEvent.type, switchEvent.payload);
+  recordTaskEvent(store, taskId, "role.updated", { role: storedRole.name });
 
-  return `Updated role ${updatedRole.name} for ${taskId}\n`;
+  return `Updated role ${storedRole.name} for ${taskId}\n`;
+}
+
+function assertExpectedRoleRevision(role: Role, expected: string | undefined): void {
+  if (expected !== undefined && role.updatedAt !== expected) {
+    throw roleConflict(role.name);
+  }
+}
+
+function assertNoRoleRuntimeOperationClaim(store: TaskStore, taskId: string, roleName: string): void {
+  if (typeof store.rootDirectory !== "function") return;
+  if (readRoleRuntimeOperationClaim(store.rootDirectory(), taskId, roleName) !== null) {
+    throw usageError(`${taskId}/${roleName} is owned by a durable Role runtime operation claim.`);
+  }
+}
+
+function assertTaskCommandRuntimeAuthority(
+  command: string | undefined,
+  args: string[],
+  store: TaskStore
+): void {
+  const taskWideCommands = new Set(["archive", "unarchive", "delete", "refresh", "cleanup"]);
+  if (command !== undefined && taskWideCommands.has(command)) {
+    const taskId = args[0];
+    if (taskId === undefined || store.getTask(taskId) === null) return;
+    for (const role of store.listRoles(taskId)) {
+      assertNoRoleRuntimeOperationClaim(store, taskId, role.name);
+    }
+    return;
+  }
+
+  let taskId: string | undefined;
+  let roleName: string | undefined;
+  if (["enter", "status", "detach", "stop", "kill", "restart", "dispatch", "yield"].includes(command ?? "")) {
+    [taskId, roleName] = args;
+  } else if (command === "session") {
+    [, taskId, roleName] = args;
+  } else if (command === "worktree") {
+    [, taskId, roleName] = args;
+  } else if (command === "role" && ["update", "rename", "remove"].includes(args[0] ?? "")) {
+    [, taskId, roleName] = args;
+  }
+  if (
+    taskId === undefined || roleName === undefined ||
+    store.getTask(taskId) === null || store.getRole(taskId, roleName) === null
+  ) {
+    return;
+  }
+  assertNoRoleRuntimeOperationClaim(store, taskId, roleName);
 }
 
 function renameTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
-  const [taskId, oldName, newName] = args;
+  return runTaskLifecycleOperation(prepareRenameTaskRoleOperation(args, store), store, tmux);
+}
 
+function prepareRenameTaskRoleOperation(
+  args: string[],
+  store: TaskStore
+): TaskLifecycleRuntimeOperationClaim {
+  const [taskId, oldName, newName] = args;
   if (taskId === undefined || taskId.trim().length === 0) {
     throw usageError("Task id is required.");
   }
-
   if (oldName === undefined || oldName.trim().length === 0) {
     throw usageError("Role name is required.");
   }
-
   if (newName === undefined || newName.trim().length === 0) {
     throw usageError("New role name is required.");
   }
-
   if (oldName === BUILTIN_LEADER_ROLE || newName.trim() === BUILTIN_LEADER_ROLE) {
     throw usageError("Built-in leader role cannot be renamed.");
   }
-
   if (store.getTask(taskId) === null) {
     throw taskNotFound(taskId);
   }
-
-  const role = store.getRole(taskId, oldName);
-
-  if (role === null) {
-    throw roleNotFound(oldName);
+  if (oldName === BUILTIN_LEADER_ROLE || newName.trim() === BUILTIN_LEADER_ROLE) {
+    throw usageError("Built-in leader role cannot be renamed.");
   }
+  if (store.getTask(taskId) === null) throw taskNotFound(taskId);
+  if (store.getRole(taskId, oldName) === null) throw roleNotFound(oldName);
+  return prepareTaskLifecycleOperation("role-rename", taskId, store, {
+    targetRoleName: oldName,
+    newRoleName: newName
+  });
+}
 
-  if (store.getRole(taskId, newName) !== null) {
-    throw usageError(`Role already exists: ${newName}`);
+function stopTaskRuntime(
+  taskId: string,
+  store: TaskStore,
+  tmux: TmuxManager | undefined,
+  reason: string
+): void {
+  for (const role of store.listRoles(taskId)) {
+    stopRoleRuntime(taskId, role, store, tmux, reason);
   }
+}
 
-  try {
-    tmux?.renameRole(taskId, oldName, newName);
-  } catch {
-    // Role metadata is still renamed when no tmux session or window exists.
+function stopRoleRuntime(
+  taskId: string,
+  role: Role,
+  store: TaskStore,
+  tmux: TmuxManager | undefined,
+  reason: string
+): void {
+  if (tmux === undefined) throw runtimeError("Tmux manager is not configured.");
+  tmux.killRoleAndConfirmStopped(taskId, role.name);
+  const now = new Date();
+  const activeRun = store.getActiveAgentRun(taskId, role.name);
+  if (activeRun !== null) {
+    store.saveAgentRun(failAgentRun(activeRun, reason, now));
+    store.clearActiveAgentRun(taskId, role.name);
   }
-
-  const renamedRole = updateRole(role, { name: newName }, new Date());
-  store.renameRole(taskId, oldName, renamedRole);
-  recordTaskEvent(store, taskId, "role.renamed", { from: oldName, to: newName });
-
-  return `Renamed role ${oldName} to ${newName} for ${taskId}\n`;
+  store.saveRole(taskId, updateRoleStatus(role, "exited", now));
+  const sessionSet = store.getRoleSessionSet(taskId, role.name);
+  if (sessionSet !== null && sessionSet.sessions[role.activeAgentId] !== undefined) {
+    store.saveRoleSessionSet(updateRoleAgentSessionStatus(sessionSet, role.activeAgentId, "stopped", now));
+  }
 }
 
 function listTaskRolesCommand(args: string[], store: TaskReader): string {
@@ -1545,27 +2945,215 @@ function enterTaskRoleCommand(
   args: string[],
   store: TaskStore,
   tmux: TmuxManager | undefined,
-  persistStatus: boolean
+  persistStatus: boolean,
+  onRoleLaunchStarted?: (session: RoleAgentSession | null) => void
 ): string {
-  const roleLookup = findRole(args, store);
-
-  if (typeof roleLookup === "string") {
-    throw usageError(roleLookup.trim());
-  }
-
   if (tmux === undefined) {
     throw runtimeError("Tmux manager is not configured.");
   }
-
-  tmux.enterRole(roleLookup.taskId, roleLookup.role);
-  if (persistStatus) {
-    recordTaskRoleAttached(roleLookup.taskId, roleLookup.role.name, store);
+  if (store instanceof FileTaskStore && hasActiveDomainTransactionAuthority(store.rootDirectory())) {
+    throw runtimeError("Role attach must run as a post-commit effect.");
   }
 
-  return `Attached role ${roleLookup.role.name} for ${roleLookup.taskId}\n`;
+  const prepared = prepareTaskRoleEnter(args, store);
+  if (!(store instanceof FileTaskStore)) {
+    tmux.ensureRoleWindow(prepared.taskId, prepared.role, prepared.launch, {
+      onStarted: () => {
+        if (persistStatus) {
+          persistPreparedRoleLaunch(prepared.taskId, prepared.role, prepared.session, store);
+        }
+        onRoleLaunchStarted?.(prepared.session);
+      }
+    });
+    tmux.attachRole(prepared.taskId, prepared.role.name);
+    return `Attached role ${prepared.role.name} for ${prepared.taskId}\n`;
+  }
+
+  const rootDir = store.rootDirectory();
+  recoverTaskRoleRuntimeOperations(rootDir, tmux);
+  const claim = createTaskRoleEnterRuntimeClaim(prepared);
+  claimPreparedTaskRoleEnter(rootDir, prepared, claim);
+  let created = false;
+  try {
+    created = tmux.ensureRoleWindow(prepared.taskId, prepared.role, prepared.launch, {
+      launchToken: claim.token
+    });
+    if (created) {
+      commitPreparedTaskRoleEnter(rootDir, prepared, claim);
+      onRoleLaunchStarted?.(prepared.session);
+    } else {
+      releaseRoleRuntimeOperationClaim(
+        rootDir,
+        `task-enter-existing-release-${randomUUID()}`,
+        claim
+      );
+    }
+  } catch (error) {
+    const outcome = reconcilePreparedTaskRoleEnter(prepared, claim, new FileTaskStore(rootDir), tmux);
+    if (outcome !== "committed") {
+      if (created) {
+        tmux.killRoleLaunchAndConfirmStopped(prepared.taskId, prepared.role.name, claim.token);
+      }
+      const currentClaim = readRoleRuntimeOperationClaim(rootDir, prepared.taskId, prepared.role.name);
+      if (currentClaim?.token === claim.token && currentClaim.recoveryToken === null) {
+        releaseRoleRuntimeOperationClaim(
+          rootDir,
+          `task-enter-failed-release-${randomUUID()}`,
+          claim
+        );
+      }
+    }
+    throw error;
+  }
+  tmux.attachRole(prepared.taskId, prepared.role.name);
+
+  return `Attached role ${prepared.role.name} for ${prepared.taskId}\n`;
 }
 
-export function recordTaskRoleAttached(taskId: string, roleName: string, store: TaskStore): void {
+export type PreparedTaskRoleEnter = {
+  taskId: string;
+  role: Role;
+  launch: import("../executor/launchPlan.js").AgentLaunchPlan;
+  session: RoleAgentSession | null;
+  sessionSet: TaskRoleSessionSet | null;
+  activeRun: AgentRun | null;
+  expectedStateDigest: string;
+};
+
+export function prepareTaskRoleEnter(args: string[], store: TaskStore): PreparedTaskRoleEnter {
+  const roleLookup = findRole(args, store);
+  if (typeof roleLookup === "string") {
+    throw usageError(roleLookup.trim());
+  }
+  const sessionSet = store.getRoleSessionSet(roleLookup.taskId, roleLookup.role.name);
+  const activeRun = store.getActiveAgentRun(roleLookup.taskId, roleLookup.role.name);
+  const prepared = prepareRoleWindowLaunch(roleLookup.taskId, roleLookup.role, store, sessionSet);
+  return {
+    taskId: roleLookup.taskId,
+    role: roleLookup.role,
+    launch: prepared.launch,
+    session: prepared.session,
+    sessionSet,
+    activeRun,
+    expectedStateDigest: roleRuntimeStateDigest({
+      role: roleLookup.role,
+      sessionSet,
+      activeRun,
+      selectedWorkItem: null,
+      pendingRun: null
+    })
+  };
+}
+
+export function createTaskRoleEnterRuntimeClaim(
+  prepared: PreparedTaskRoleEnter,
+  now = new Date()
+): RoleLaunchRuntimeOperationClaim {
+  return {
+    schemaVersion: 1,
+    scope: "task-role",
+    kind: "launch",
+    token: randomUUID(),
+    taskId: prepared.taskId,
+    roleName: prepared.role.name,
+    operation: "enter",
+    ownerPid: process.pid,
+    preparedSession: prepared.session,
+    selectedWorkItem: null,
+    pendingRun: null,
+    expectedStateDigest: prepared.expectedStateDigest,
+    recoveryToken: null,
+    ...createRoleRuntimeOperationLease(now)
+  };
+}
+
+export function claimPreparedTaskRoleEnter(
+  rootDir: string,
+  prepared: PreparedTaskRoleEnter,
+  claim: RoleLaunchRuntimeOperationClaim
+): void {
+  claimRoleRuntimeOperation(
+    rootDir,
+    `task-enter-claim-${randomUUID()}`,
+    claim,
+    (workingRoot) => roleRuntimeStateDigest(readRoleRuntimeStateSnapshot(
+      transactionTaskStore(workingRoot),
+      prepared.taskId,
+      prepared.role.name
+    ))
+  );
+}
+
+export function commitPreparedTaskRoleEnter(
+  rootDir: string,
+  prepared: PreparedTaskRoleEnter,
+  claim: RoleLaunchRuntimeOperationClaim,
+  transactionId = `task-enter-commit-${randomUUID()}`,
+  extraResultOperations: (result: void) => import("../storage/recoveryJournal.js").DomainTransactionOperation[] = () => []
+): void {
+  executeDomainTransaction(rootDir, transactionId, (workingRoot) => {
+    const transactionStore = transactionTaskStore(workingRoot, claim.token);
+    if (
+      roleRuntimeStateDigest(readRoleRuntimeStateSnapshot(
+        transactionStore,
+        prepared.taskId,
+        prepared.role.name
+      )) !== prepared.expectedStateDigest
+    ) {
+      throw roleConflict(`${prepared.taskId}/${prepared.role.name}`);
+    }
+    recordTaskRoleAttached(
+      prepared.taskId,
+      prepared.role.name,
+      transactionStore,
+      claim.preparedSession
+    );
+    clearRoleRuntimeOperationClaim(
+      workingRoot,
+      claim.taskId,
+      claim.roleName,
+      claim.token
+    );
+  }, extraResultOperations);
+}
+
+export function reconcilePreparedTaskRoleEnter(
+  prepared: PreparedTaskRoleEnter,
+  claim: RoleLaunchRuntimeOperationClaim,
+  store: TaskStore,
+  tmux: Pick<TmuxManager, "roleLaunchToken">
+): "committed" | "pending" | "recovering" | "uncommitted" {
+  const currentClaim = store instanceof FileTaskStore
+    ? readRoleRuntimeOperationClaim(store.rootDirectory(), prepared.taskId, prepared.role.name)
+    : null;
+  if (currentClaim?.token === claim.token) {
+    return currentClaim.recoveryToken === null ? "pending" : "recovering";
+  }
+  const currentState = readRoleRuntimeStateSnapshot(store, prepared.taskId, prepared.role.name);
+  const currentRole = currentState.role;
+  if (currentRole === null || tmux.roleLaunchToken(prepared.taskId, prepared.role.name) !== claim.token) {
+    return "uncommitted";
+  }
+  const committedAt = new Date(currentRole.updatedAt);
+  if (!Number.isFinite(committedAt.getTime())) return "uncommitted";
+  const expected = buildPreparedRoleLaunchState(
+    prepared.role,
+    prepared.session,
+    prepared.sessionSet,
+    prepared.activeRun,
+    committedAt
+  );
+  return roleRuntimeStateDigest(currentState) === roleRuntimeStateDigest(expected)
+    ? "committed"
+    : "uncommitted";
+}
+
+export function recordTaskRoleAttached(
+  taskId: string,
+  roleName: string,
+  store: TaskStore,
+  preparedSession: RoleAgentSession | null = null
+): void {
   if (store.getTask(taskId) === null) {
     throw taskNotFound(taskId);
   }
@@ -1573,11 +3161,21 @@ export function recordTaskRoleAttached(taskId: string, roleName: string, store: 
   if (role === null) {
     throw roleNotFound(roleName);
   }
-  store.saveRole(taskId, updateRoleStatus(role, "running", new Date()));
+  if (preparedSession !== null) {
+    const binding = activeRoleAgentBinding(role);
+    if (preparedSession.agentId !== role.activeAgentId || preparedSession.adapterId !== binding.adapterId) {
+      throw usageError("Prepared Role Agent session does not match the active Role binding.");
+    }
+    const existing = store.getRoleSessionSet(taskId, roleName)?.sessions[role.activeAgentId];
+    if (existing !== undefined && existing.nativeSessionId !== preparedSession.nativeSessionId) {
+      throw usageError("Prepared Role Agent session does not match the owned native session.");
+    }
+  }
+  persistPreparedRoleLaunch(taskId, role, preparedSession, store);
 }
 
 function tailTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
-  const roleLookup = store.runReadSnapshot((snapshot) => findRole(args, snapshot));
+  const roleLookup = findRole(args, store);
 
   if (typeof roleLookup === "string") {
     throw usageError(roleLookup.trim());
@@ -1612,38 +3210,35 @@ function transcriptTaskRoleCommand(args: string[], store: TaskStore, tmux?: Tmux
 }
 
 function exportTranscriptCommand(args: string[], store: TaskStore): string {
+  const roleLookup = findRole(args, store);
+
+  if (typeof roleLookup === "string") {
+    throw usageError(roleLookup.trim());
+  }
+
   const rest = args.slice(2);
   assertKnownOptions(rest, new Set(["--format", "--output"]));
 
   const format = parseTranscriptExportFormat(readOptionalOption(rest, "--format"));
-  const captured = store.runReadSnapshot((snapshot) => {
-    const roleLookup = findRole(args, snapshot);
-    if (typeof roleLookup === "string") {
-      throw usageError(roleLookup.trim());
-    }
-    return {
-      taskId: roleLookup.taskId,
-      roleName: roleLookup.role.name,
-      transcript: snapshot.readTranscript(roleLookup.taskId, roleLookup.role.name)
-    };
-  });
+  const transcript = store.readTranscript(roleLookup.taskId, roleLookup.role.name);
 
-  if (captured.transcript === null) {
+  if (transcript === null) {
     return "No transcript captured.\n";
   }
 
-  const rendered = renderTranscriptExport(
-    captured.taskId,
-    captured.roleName,
-    captured.transcript,
-    format
-  );
+  const rendered = renderTranscriptExport(roleLookup.taskId, roleLookup.role.name, transcript, format);
   const output = readOptionalOption(rest, "--output")?.trim();
 
   if (output !== undefined && output.length > 0) {
-    mkdirSync(dirname(output), { recursive: true });
-    writeFileSync(output, rendered);
-    return `Exported transcript ${captured.taskId} ${captured.roleName} to ${output}\n`;
+    if (store instanceof FileTaskStore) {
+      assertPathOutsideTaskmuxHome(
+        output,
+        store.rootDirectory(),
+        "Transcript export output"
+      );
+    }
+    writeTextFileAtomically(canonicalProspectivePath(output), rendered);
+    return `Exported transcript ${roleLookup.taskId} ${roleLookup.role.name} to ${output}\n`;
   }
 
   return rendered;
@@ -1661,7 +3256,7 @@ function detailTaskRoleCommand(args: string[], store: TaskReader): string {
   return [
     `Task: ${roleLookup.taskId}`,
     `Role: ${role.name}`,
-    `Agent: ${role.agent}`,
+    `Agent: ${role.activeAgentId}`,
     `Workspace: ${role.workspace}`,
     `Status: ${role.status}`,
     `Tmux: taskmux-${roleLookup.taskId}:${role.name}`,
@@ -1736,7 +3331,7 @@ function statusTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxMana
   return [
     `Task: ${roleLookup.taskId}`,
     `Role: ${currentRole.name}`,
-    `Agent: ${currentRole.agent}`,
+    `Agent: ${currentRole.activeAgentId}`,
     `Workspace: ${currentRole.workspace}`,
     `Status: ${currentRole.status}`,
     `Tmux: taskmux-${roleLookup.taskId}:${currentRole.name}`,
@@ -1746,71 +3341,387 @@ function statusTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxMana
 }
 
 function detachTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
+  return runTaskLifecycleOperation(prepareDetachTaskRoleOperation(args, store), store, tmux);
+}
+
+function prepareDetachTaskRoleOperation(
+  args: string[],
+  store: TaskStore
+): TaskLifecycleRuntimeOperationClaim {
   const roleLookup = findRole(args, store);
 
   if (typeof roleLookup === "string") {
     throw usageError(roleLookup.trim());
   }
 
-  if (tmux === undefined) {
-    throw runtimeError("Tmux manager is not configured.");
-  }
-
-  tmux.detachRole(roleLookup.taskId);
-  store.saveRole(roleLookup.taskId, updateRoleStatus(roleLookup.role, "detached", new Date()));
-
-  return `Detached role ${roleLookup.role.name} for ${roleLookup.taskId}\n`;
+  return prepareTaskLifecycleOperation("role-detach", roleLookup.taskId, store, {
+    targetRoleName: roleLookup.role.name
+  });
 }
 
 function restartTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
-  const roleLookup = findRole(args, store);
-
-  if (typeof roleLookup === "string") {
-    throw usageError(roleLookup.trim());
-  }
-
-  if (tmux === undefined) {
-    throw runtimeError("Tmux manager is not configured.");
-  }
-
-  tmux.restartRole(roleLookup.taskId, roleLookup.role);
-  store.saveRole(roleLookup.taskId, updateRoleStatus(roleLookup.role, "running", new Date()));
-
-  return `Restarted role ${roleLookup.role.name} for ${roleLookup.taskId}\n`;
+  return runTaskRoleControlCommand("restart", args, store, tmux);
 }
 
 function stopTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
-  const roleLookup = findRole(args, store);
-
-  if (typeof roleLookup === "string") {
-    throw usageError(roleLookup.trim());
-  }
-
-  if (tmux === undefined) {
-    throw runtimeError("Tmux manager is not configured.");
-  }
-
-  tmux.stopRole(roleLookup.taskId, roleLookup.role.name);
-  store.saveRole(roleLookup.taskId, updateRoleStatus(roleLookup.role, "exited", new Date()));
-
-  return `Stopped role ${roleLookup.role.name} for ${roleLookup.taskId}\n`;
+  return runTaskRoleControlCommand("stop", args, store, tmux);
 }
 
 function killTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
-  const roleLookup = findRole(args, store);
+  return runTaskRoleControlCommand("kill", args, store, tmux);
+}
 
+export type PreparedTaskRoleControl = {
+  action: "stop" | "kill" | "restart";
+  taskId: string;
+  role: Role;
+  sessionSet: TaskRoleSessionSet | null;
+  activeRun: AgentRun | null;
+  expectedStateDigest: string;
+  launch: import("../executor/launchPlan.js").AgentLaunchPlan | null;
+  preparedSession: RoleAgentSession | null;
+};
+
+export function prepareTaskRoleControl(
+  action: PreparedTaskRoleControl["action"],
+  args: string[],
+  store: TaskStore
+): PreparedTaskRoleControl {
+  const roleLookup = findRole(args, store);
   if (typeof roleLookup === "string") {
     throw usageError(roleLookup.trim());
   }
+  const sessionSet = store.getRoleSessionSet(roleLookup.taskId, roleLookup.role.name);
+  const activeRun = store.getActiveAgentRun(roleLookup.taskId, roleLookup.role.name);
+  const restart = action === "restart"
+    ? prepareRoleWindowLaunch(roleLookup.taskId, roleLookup.role, store, sessionSet)
+    : null;
+  return {
+    action,
+    taskId: roleLookup.taskId,
+    role: roleLookup.role,
+    sessionSet,
+    activeRun,
+    expectedStateDigest: roleRuntimeStateDigest({
+      role: roleLookup.role,
+      sessionSet,
+      activeRun,
+      selectedWorkItem: null,
+      pendingRun: null
+    }),
+    launch: restart?.launch ?? null,
+    preparedSession: restart?.session ?? null
+  };
+}
 
-  if (tmux === undefined) {
-    throw runtimeError("Tmux manager is not configured.");
+export function createTaskRoleControlClaim(
+  prepared: PreparedTaskRoleControl,
+  targetLaunchToken: string | null = null,
+  now = new Date()
+): RoleStopRuntimeOperationClaim {
+  return {
+    schemaVersion: 1,
+    scope: "task-role",
+    kind: prepared.action === "restart" ? "restart" : "stop",
+    token: randomUUID(),
+    taskId: prepared.taskId,
+    roleName: prepared.role.name,
+    operation: prepared.action === "restart"
+      ? "manual-restart"
+      : prepared.action === "kill" ? "manual-kill" : "manual-stop",
+    ownerPid: process.pid,
+    preparedSession: prepared.action === "restart" ? prepared.preparedSession : null,
+    selectedWorkItem: null,
+    pendingRun: null,
+    expectedStateDigest: prepared.expectedStateDigest,
+    recoveryToken: null,
+    ...createRoleRuntimeOperationLease(now),
+    phase: "prepared",
+    targetLaunchToken,
+    preparedRole: prepared.role,
+    restartLaunch: prepared.action === "restart" ? prepared.launch : null
+  };
+}
+
+export function claimPreparedTaskRoleControl(
+  rootDir: string,
+  prepared: PreparedTaskRoleControl,
+  claim: RoleStopRuntimeOperationClaim
+): void {
+  claimRoleRuntimeOperation(
+    rootDir,
+    `task-${prepared.action}-claim-${randomUUID()}`,
+    claim,
+    (workingRoot) => roleRuntimeStateDigest(readRoleRuntimeStateSnapshot(
+      transactionTaskStore(workingRoot),
+      prepared.taskId,
+      prepared.role.name
+    ))
+  );
+}
+
+export function executeTaskRoleControlEffect(
+  prepared: PreparedTaskRoleControl,
+  claim: RoleStopRuntimeOperationClaim,
+  tmux: TmuxManager
+): boolean {
+  return replayTaskRoleControlEffect(claim, tmux) === "replacement-ready";
+}
+
+export function replayTaskRoleControlEffect(
+  claim: RoleStopRuntimeOperationClaim,
+  tmux: Pick<
+    TmuxManager,
+    "probeRoleStatus" | "roleLaunchToken" | "roleOperationToken" |
+    "stopRoleWithOperationToken" | "killRoleWithOperationToken" |
+    "killRoleForRestartWithOperationToken" | "ensureRoleWindow"
+  >
+): "stopped" | "replacement-ready" {
+  const status = tmux.probeRoleStatus(claim.taskId, claim.roleName);
+  if (claim.kind === "stop") {
+    if (status === "exited") return "stopped";
+    const operationToken = tmux.roleOperationToken(claim.taskId, claim.roleName);
+    const launchToken = tmux.roleLaunchToken(claim.taskId, claim.roleName);
+    if (operationToken !== null && operationToken !== claim.token) {
+      throw runtimeError(`Role control encountered a window owned by another operation: ${claim.roleName}.`);
+    }
+    if (operationToken !== claim.token && launchToken !== claim.targetLaunchToken) {
+      throw runtimeError(`Role control target window changed before recovery: ${claim.roleName}.`);
+    }
+    if (claim.operation === "manual-stop") {
+      tmux.stopRoleWithOperationToken(claim.taskId, claim.roleName, claim.token);
+    } else {
+      tmux.killRoleWithOperationToken(claim.taskId, claim.roleName, claim.token);
+    }
+    return "stopped";
   }
 
-  tmux.killRole(roleLookup.taskId, roleLookup.role.name);
-  store.saveRole(roleLookup.taskId, updateRoleStatus(roleLookup.role, "exited", new Date()));
+  if (status === "running") {
+    const launchToken = tmux.roleLaunchToken(claim.taskId, claim.roleName);
+    if (launchToken === claim.token) return "replacement-ready";
+    const operationToken = tmux.roleOperationToken(claim.taskId, claim.roleName);
+    if (operationToken !== null && operationToken !== claim.token) {
+      throw runtimeError(`Role restart encountered a window owned by another operation: ${claim.roleName}.`);
+    }
+    if (operationToken !== claim.token && launchToken !== claim.targetLaunchToken) {
+      throw runtimeError(`Role restart target window changed before recovery: ${claim.roleName}.`);
+    }
+    tmux.killRoleForRestartWithOperationToken(claim.taskId, claim.roleName, claim.token);
+  }
+  if (claim.restartLaunch === null) throw runtimeError("Restart launch plan is missing.");
+  const created = tmux.ensureRoleWindow(claim.taskId, claim.preparedRole, claim.restartLaunch, {
+    launchToken: claim.token
+  });
+  if (!created && tmux.roleLaunchToken(claim.taskId, claim.roleName) !== claim.token) {
+    throw runtimeError(`Role restart could not establish a token-owned replacement window: ${claim.roleName}.`);
+  }
+  return "replacement-ready";
+}
 
-  return `Killed role ${roleLookup.role.name} for ${roleLookup.taskId}\n`;
+export function recoverTaskRoleControlOperation(
+  recovered: RoleStopRuntimeOperationClaim,
+  tmux: Pick<
+    TmuxManager,
+    "probeRoleStatus" | "roleLaunchToken" | "roleOperationToken" |
+    "stopRoleWithOperationToken" | "killRoleWithOperationToken" |
+    "killRoleForRestartWithOperationToken" | "ensureRoleWindow"
+  >,
+  finalize: (claim: RoleStopRuntimeOperationClaim) => void
+): "release" | "finalized" {
+  if (recovered.recoveryToken === null) {
+    throw runtimeError(`Recovered Role control is missing recovery ownership: ${recovered.roleName}.`);
+  }
+  if (recovered.phase === "prepared") return "release";
+  replayTaskRoleControlEffect(recovered, tmux);
+  finalize(recovered);
+  return "finalized";
+}
+
+export function recoverTaskRoleRuntimeOperation(
+  recovered: RoleRuntimeOperationClaim,
+  tmux: Pick<
+    TmuxManager,
+    "killRoleLaunchAndConfirmStopped" | "probeRoleStatus" | "roleLaunchToken" |
+    "roleOperationToken" | "stopRoleWithOperationToken" | "killRoleWithOperationToken" |
+    "killRoleForRestartWithOperationToken" | "ensureRoleWindow"
+  >,
+  finalize: (claim: RoleStopRuntimeOperationClaim) => void
+): "release" | "finalized" {
+  if (recovered.kind === "launch") {
+    tmux.killRoleLaunchAndConfirmStopped(recovered.taskId, recovered.roleName, recovered.token);
+    return "release";
+  }
+  return recoverTaskRoleControlOperation(recovered, tmux, finalize);
+}
+
+export function recoverTaskRoleRuntimeOperations(
+  rootDir: string,
+  tmux: TmuxManager,
+  now = new Date()
+): string[] {
+  return recoverAbandonedRoleRuntimeOperations(rootDir, (recovered) => {
+    const outcome = recoverTaskRoleRuntimeOperation(recovered, tmux, (ownedClaim) => {
+      const recoveryToken = ownedClaim.recoveryToken;
+      if (recoveryToken === null) {
+        throw runtimeError(`Recovered Role control is missing recovery ownership: ${ownedClaim.roleName}.`);
+      }
+      executeDomainTransaction(rootDir, `task-control-recovery-finalize-${randomUUID()}`, (workingRoot) => {
+        const currentClaim = readRoleRuntimeOperationClaim(
+          workingRoot,
+          ownedClaim.taskId,
+          ownedClaim.roleName
+        );
+        if (
+          currentClaim === null ||
+          currentClaim.kind === "launch" ||
+          currentClaim.token !== ownedClaim.token ||
+          currentClaim.recoveryToken !== recoveryToken ||
+          currentClaim.phase !== "effect-started"
+        ) {
+          throw runtimeError(`Role control recovery lost ownership: ${ownedClaim.taskId}/${ownedClaim.roleName}.`);
+        }
+        const transactionStore = transactionTaskStore(
+          workingRoot,
+          ownedClaim.token,
+          recoveryToken
+        );
+        const snapshot = readRoleRuntimeStateSnapshot(
+          transactionStore,
+          ownedClaim.taskId,
+          ownedClaim.roleName
+        );
+        if (snapshot.role === null || roleRuntimeStateDigest(snapshot) !== ownedClaim.expectedStateDigest) {
+          throw roleConflict(`${ownedClaim.taskId}/${ownedClaim.roleName}`);
+        }
+        const action: PreparedTaskRoleControl["action"] = ownedClaim.kind === "restart"
+          ? "restart"
+          : ownedClaim.operation === "manual-stop" ? "stop" : "kill";
+        persistTaskRoleControl({
+          action,
+          taskId: ownedClaim.taskId,
+          role: ownedClaim.preparedRole,
+          sessionSet: snapshot.sessionSet,
+          activeRun: snapshot.activeRun,
+          expectedStateDigest: ownedClaim.expectedStateDigest,
+          launch: ownedClaim.restartLaunch,
+          preparedSession: ownedClaim.preparedSession
+        }, transactionStore);
+        clearRoleRuntimeOperationClaim(
+          workingRoot,
+          ownedClaim.taskId,
+          ownedClaim.roleName,
+          ownedClaim.token,
+          recoveryToken
+        );
+      });
+    });
+    return outcome === "finalized" ? "finalized" : undefined;
+  }, { now });
+}
+
+export function persistTaskRoleControl(
+  prepared: PreparedTaskRoleControl,
+  store: TaskStore
+): string {
+  const current = readRoleRuntimeStateSnapshot(store, prepared.taskId, prepared.role.name);
+  if (roleRuntimeStateDigest(current) !== prepared.expectedStateDigest || current.role === null) {
+    throw roleConflict(`${prepared.taskId}/${prepared.role.name}`);
+  }
+  if (prepared.action === "restart") {
+    persistPreparedRoleLaunch(prepared.taskId, current.role, prepared.preparedSession, store);
+    return `Restarted role ${prepared.role.name} for ${prepared.taskId}\n`;
+  }
+  const now = new Date();
+  if (current.activeRun !== null) {
+    store.saveAgentRun(failAgentRun(
+      current.activeRun,
+      `The Role was manually ${prepared.action === "stop" ? "stopped" : "killed"}.`,
+      now
+    ));
+    store.clearActiveAgentRun(prepared.taskId, prepared.role.name);
+  }
+  const stoppedSessions = current.sessionSet !== null &&
+      current.sessionSet.sessions[current.role.activeAgentId] !== undefined
+    ? updateRoleAgentSessionStatus(current.sessionSet, current.role.activeAgentId, "stopped", now)
+    : current.sessionSet;
+  store.saveRoleWithSessionSet(
+    prepared.taskId,
+    updateRoleStatus(current.role, "exited", now),
+    stoppedSessions
+  );
+  return `${prepared.action === "stop" ? "Stopped" : "Killed"} role ${prepared.role.name} for ${prepared.taskId}\n`;
+}
+
+export function executePreparedTaskRoleControl<T>(
+  rootDir: string,
+  prepared: PreparedTaskRoleControl,
+  tmux: TmuxManager,
+  finalize: (claim: RoleStopRuntimeOperationClaim) => T
+): T {
+  const targetStatus = tmux.probeRoleStatus(prepared.taskId, prepared.role.name);
+  const targetLaunchToken = targetStatus === "running"
+    ? tmux.roleLaunchToken(prepared.taskId, prepared.role.name)
+    : null;
+  if (targetStatus === "running" && targetLaunchToken === null) {
+    throw runtimeError(
+      `Role control requires a durable launch identity for the running window: ${prepared.role.name}.`
+    );
+  }
+  const claim = createTaskRoleControlClaim(prepared, targetLaunchToken);
+  const claimOperation = (): void => {
+    claimPreparedTaskRoleControl(rootDir, prepared, claim);
+  };
+  const beginEffect = (): void => markRoleRuntimeOperationEffectStarted(
+      rootDir,
+      `task-${prepared.action}-effect-${randomUUID()}`,
+      claim
+    );
+
+  const result = executeReplayableRoleRuntimeOperation(
+    () => { executeTaskRoleControlEffect(prepared, claim, tmux); },
+    () => finalize(claim),
+    { claim: claimOperation, beginEffect }
+  );
+
+  if (prepared.action === "restart") {
+    tmux.attachRole(prepared.taskId, prepared.role.name);
+  }
+  return result;
+}
+
+function runTaskRoleControlCommand(
+  action: PreparedTaskRoleControl["action"],
+  args: string[],
+  store: TaskStore,
+  tmux: TmuxManager | undefined
+): string {
+  if (tmux === undefined) throw runtimeError("Tmux manager is not configured.");
+  if (!(store instanceof FileTaskStore)) {
+    const prepared = prepareTaskRoleControl(action, args, store);
+    if (action === "stop") tmux.stopRole(prepared.taskId, prepared.role.name);
+    else if (action === "kill") tmux.killRole(prepared.taskId, prepared.role.name);
+    else {
+      if (prepared.launch === null) throw runtimeError("Restart launch plan is missing.");
+      tmux.restartRole(prepared.taskId, prepared.role, prepared.launch);
+    }
+    return persistTaskRoleControl(prepared, store);
+  }
+  if (hasActiveDomainTransactionAuthority(store.rootDirectory())) {
+    throw runtimeError("Role runtime control must run as a post-commit effect.");
+  }
+  recoverTaskRoleRuntimeOperations(store.rootDirectory(), tmux);
+  const prepared = prepareTaskRoleControl(action, args, store);
+  return executePreparedTaskRoleControl(
+    store.rootDirectory(),
+    prepared,
+    tmux,
+    (claim) => executeDomainTransaction(store.rootDirectory(), `task-${action}-commit-${randomUUID()}`, (workingRoot) => {
+      const transactionStore = transactionTaskStore(workingRoot, claim.token);
+      const output = persistTaskRoleControl(prepared, transactionStore);
+      clearRoleRuntimeOperationClaim(workingRoot, claim.taskId, claim.roleName, claim.token);
+      return output;
+    })
+  );
 }
 
 function addTaskCommentCommand(args: string[], store: TaskStore): string {
@@ -1920,7 +3831,7 @@ function taskActivityCommand(args: string[], store: TaskReader): string {
 
       return [
         role.name,
-        role.agent,
+        role.activeAgentId,
         role.status,
         String(countTranscriptLines(transcript)),
         role.updatedAt
@@ -1996,7 +3907,7 @@ type TaskContext = {
   workItems: ReturnType<TaskStore["listWorkItems"]>;
   milestones: ReturnType<TaskStore["listMilestones"]>;
   decisions: ReturnType<TaskStore["listDecisions"]>;
-  sessions: Record<string, NonNullable<ReturnType<TaskStore["getAgentSession"]>>>;
+  sessions: Record<string, NonNullable<ReturnType<TaskStore["getRoleSessionSet"]>>>;
   pendingWakeup: ReturnType<TaskStore["getPendingWakeup"]>;
   leaderFailure: ReturnType<TaskStore["getLeaderFailure"]>;
   comments: TaskComment[];
@@ -2048,8 +3959,8 @@ function buildTaskContext(task: Task, store: TaskReader, includeTranscripts: boo
     milestones: store.listMilestones(task.id),
     decisions: store.listDecisions(task.id),
     sessions: Object.fromEntries(store.listRoles(task.id)
-      .map((role) => [role.name, store.getAgentSession(task.id, role.name)] as const)
-      .filter((entry): entry is readonly [string, NonNullable<ReturnType<TaskStore["getAgentSession"]>>] => entry[1] !== null)),
+      .map((role) => [role.name, store.getRoleSessionSet(task.id, role.name)] as const)
+      .filter((entry): entry is readonly [string, NonNullable<ReturnType<TaskStore["getRoleSessionSet"]>>] => entry[1] !== null)),
     pendingWakeup: store.getPendingWakeup(task.id),
     leaderFailure: store.getLeaderFailure(task.id),
     comments: store.listComments(task.id),
@@ -2098,7 +4009,7 @@ function renderTaskContextRoles(roles: TaskContextRole[], includeTranscripts: bo
   ];
   const rows = roles.map((role) => [
     role.name,
-    role.agent,
+    role.activeAgentId,
     role.status,
     role.workspace,
     ...(includeTranscripts ? [role.transcript === undefined || role.transcript === null ? "not captured" : role.transcript.trimEnd()] : [])
@@ -2165,6 +4076,7 @@ function stripRepeatedOption(args: string[], name: string): string[] {
 }
 
 function createResolvedRole(
+  taskId: string,
   roleName: string,
   agent: string,
   workspace: string,
@@ -2176,10 +4088,80 @@ function createResolvedRole(
     throwUnsupportedAgent(agent, store);
   }
 
-  return createRole(roleName, resolvedAgent, workspace, new Date());
+  return createRole(taskId, roleName, [createRoleAgentBinding(resolvedAgent)], resolvedAgent.id, workspace, new Date());
+}
+
+function prepareRoleWindowLaunch(
+  taskId: string,
+  role: Role,
+  store: TaskStore,
+  sessionSet: TaskRoleSessionSet | null = store.getRoleSessionSet(taskId, role.name)
+) {
+  const binding = activeRoleAgentBinding(role);
+  const agent = resolveAgent(binding.agentId, store.listConfiguredAgents());
+  if (agent === null) throwUnsupportedAgent(binding.agentId, store);
+  const session = sessionSet?.sessions[role.activeAgentId] ?? null;
+  const mode: DispatchMode = session === null || session.status === "reserved" ? "new" : "resume";
+  if (mode === "new" && binding.adapterId === "codex") {
+    throw usageError("A Codex Role must establish its native session through task dispatch before task enter.");
+  }
+  const prepared = resolveAgentExecutor(binding.adapterId).prepare({
+    taskId,
+    role,
+    agent,
+    mode,
+    session,
+    now: new Date(),
+    worktreeRoot: store.getRoleWorktree(taskId, role.name)?.path
+  });
+  return prepared;
+}
+
+function persistPreparedRoleLaunch(
+  taskId: string,
+  role: Role,
+  preparedSession: RoleAgentSession | null,
+  store: TaskStore
+): void {
+  const now = new Date();
+  const existing = store.getRoleSessionSet(taskId, role.name);
+  const state = buildPreparedRoleLaunchState(role, preparedSession, existing, null, now);
+  store.saveRoleWithSessionSet(taskId, state.role!, state.sessionSet);
+}
+
+function buildPreparedRoleLaunchState(
+  role: Role,
+  preparedSession: RoleAgentSession | null,
+  existing: TaskRoleSessionSet | null,
+  activeRun: AgentRun | null,
+  now: Date
+): import("../executor/executorRegistry.js").RoleRuntimeStateSnapshot {
+  const sessionSet = preparedSession === null
+    ? existing
+    : updateRoleAgentSessionStatus({
+        ...(existing ?? createRoleSessionSet(
+          { scope: "task", taskId: role.taskId, roleName: role.name },
+          role.activeAgentId,
+          now
+        )),
+        activeAgentId: role.activeAgentId,
+        sessions: {
+          ...(existing?.sessions ?? {}),
+          [role.activeAgentId]: preparedSession
+        },
+        updatedAt: now.toISOString()
+      }, role.activeAgentId, "running", now);
+  return {
+    role: updateRoleStatus(role, "running", now),
+    sessionSet,
+    activeRun,
+    selectedWorkItem: null,
+    pendingRun: null
+  };
 }
 
 function createRoleFromGlobalOrAgent(
+  taskId: string,
   roleName: string,
   options: {
     agent: string | undefined;
@@ -2193,7 +4175,7 @@ function createRoleFromGlobalOrAgent(
     const globalRole = store.getGlobalRole(roleName);
 
     if (globalRole !== null) {
-      return copyGlobalRole(roleName, store, {
+      return copyGlobalRole(taskId, roleName, store, {
         workspaceOverride: options.workspaceOverride
       });
     }
@@ -2205,10 +4187,11 @@ function createRoleFromGlobalOrAgent(
     throw usageError(`Role ${roleName} requires an agent or a configured global role. Run taskmux role add ${roleName} --agent <agent-id>.`);
   }
 
-  return createResolvedRole(roleName, agent, requireWorkspace(options.workspace), store);
+  return createResolvedRole(taskId, roleName, agent, requireWorkspace(options.workspace), store);
 }
 
 function copyGlobalRole(
+  taskId: string,
   roleName: string,
   store: TaskStore,
   options: { name?: string; workspaceOverride?: string } = {}
@@ -2219,7 +4202,7 @@ function copyGlobalRole(
     throw roleNotFound(roleName);
   }
 
-  const role = copyGlobalRoleToTaskRole(globalRole, new Date(), options.name ?? globalRole.name);
+  const role = copyGlobalRoleToTaskRole(globalRole, taskId, new Date(), options.name ?? globalRole.name);
 
   if (options.workspaceOverride !== undefined) {
     if (options.workspaceOverride.length === 0) {
@@ -2233,12 +4216,30 @@ function copyGlobalRole(
 }
 
 function saveRoleAndRecordEvent(taskId: string, role: Role, store: TaskStore): void {
-  const existing = store.getRole(taskId, role.name);
-  if (existing !== null && existing.agent !== role.agent) {
-    throw usageError(`TaskRole Agent type is fixed after creation: ${existing.agent}.`);
+  assertTaskRoleAssignable(taskId, role.name, store);
+  const created = store.createRoleIfAbsent(taskId, role);
+  if (created === null) throw roleConflict(role.name);
+  recordTaskEvent(store, taskId, "role.assigned", { role: created.name, agent: created.activeAgentId });
+}
+
+function assertTaskRoleAssignable(taskId: string, roleName: string, store: TaskStore): void {
+  if (store.getChildRole(taskId, roleName) !== null) {
+    throw usageError([
+      `Role name conflict: ${roleName} is already used by a child role in ${taskId}.`,
+      `Remove it with taskmux task role remove ${taskId} ${roleName} before assigning an independent role.`
+    ].join("\n"));
   }
-  store.saveRole(taskId, role);
-  recordTaskEvent(store, taskId, "role.assigned", { role: role.name, agent: role.agent });
+
+  if (store.getRole(taskId, roleName) !== null) {
+    throwTaskRoleAlreadyExists(taskId, roleName);
+  }
+}
+
+function throwTaskRoleAlreadyExists(taskId: string, roleName: string): never {
+  throw usageError([
+    `Role already exists: ${roleName}.`,
+    `Use taskmux task role update ${taskId} ${roleName} [--agent <agent-id>] [--workspace <path>] to change it.`
+  ].join("\n"));
 }
 
 function throwUnsupportedAgent(agent: string, store: TaskStore): never {
@@ -2297,7 +4298,7 @@ function renderRoleTable(title: string, roles: Role[]): string {
       { header: "Status", minWidth: 6, maxWidth: 12 },
       { header: "Workspace", minWidth: 9, maxWidth: 54 }
     ],
-    roles.map((role) => [role.name, role.agent, role.status, role.workspace]),
+    roles.map((role) => [role.name, role.activeAgentId, role.status, role.workspace]),
     defaultTableWidth()
   );
 }
@@ -2319,7 +4320,7 @@ function renderEventTable(title: string, events: TaskEvent[]): string {
 function findRole(
   args: string[],
   store: TaskReader
-): { taskId: string; role: NonNullable<ReturnType<TaskReader["getRole"]>> } | string {
+): { taskId: string; role: NonNullable<ReturnType<TaskStore["getRole"]>> } | string {
   const [taskId, roleName] = args;
 
   if (taskId === undefined || taskId.trim().length === 0) {
@@ -2724,6 +4725,25 @@ function readOptionalOption(args: string[], name: string): string | undefined {
   }
 
   return args[index + 1];
+}
+
+function requiredRoleOption(value: string | undefined, option: string): string {
+  if (value === undefined || value.trim().length === 0) throw usageError(`${option} is required.`);
+  return value.trim();
+}
+
+function assertRoleSystemPromptSelection(parsed: ParsedRoleCommandOptions): void {
+  if (parsed.has("--system-prompt") && parsed.inherits("systemPrompt")) {
+    throw usageError("Role field cannot be set and inherited together: systemPrompt.");
+  }
+}
+
+function applyRoleSystemPrompt(role: Role, value: string | undefined, inherit: boolean): Role {
+  if (inherit) {
+    const { systemPrompt: _removed, ...remaining } = role;
+    return remaining;
+  }
+  return value === undefined ? role : { ...role, systemPrompt: value.trim() };
 }
 
 function readRepeatedOption(args: string[], name: string): string[] {

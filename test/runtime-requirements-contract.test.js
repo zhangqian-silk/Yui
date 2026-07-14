@@ -372,7 +372,7 @@ test("setup creates nested homes despite a restrictive umask and requires explic
   chmodSync(existing, 0o755);
   writeFileSync(
     join(existing, "schema.json"),
-    `${JSON.stringify({ schemaVersion: 1, storageVersion: 3, updatedAt: "2026-07-14T00:00:00.000Z" })}\n`
+    `${JSON.stringify({ schemaVersion: 1, storageVersion: 4, updatedAt: "2026-07-14T00:00:00.000Z" })}\n`
   );
   writeFileSync(join(existing, "keep.txt"), "do not touch\n");
 
@@ -640,7 +640,7 @@ test("runtime storage checks reject unsafe existing homes without mutating them"
   t.after(() => rmSync(home, { recursive: true, force: true }));
   writeFileSync(
     join(home, "schema.json"),
-    `${JSON.stringify({ schemaVersion: 1, storageVersion: 3, updatedAt: "2026-07-14T00:00:00.000Z" })}\n`
+    `${JSON.stringify({ schemaVersion: 1, storageVersion: 4, updatedAt: "2026-07-14T00:00:00.000Z" })}\n`
   );
   writeFileSync(join(home, "keep.txt"), "unchanged\n");
   chmodSync(home, 0o755);

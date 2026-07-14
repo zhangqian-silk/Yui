@@ -11,9 +11,63 @@ import {
   createInertDataSnapshot,
   digestInertDataSnapshot,
   encodeCanonicalInertData,
+  hasExactOwnKeys,
+  lowerUnknownInertData,
   parseCanonicalInertData,
   stringifyCanonicalInertData
 } from "../dist/storage/inertData.js";
+
+test("unknown lowering shares canonical branding, budgets, and descriptor safety", () => {
+  const source = { z: 2, omitted: undefined, a: [true, { value: "ok" }] };
+  const lowered = lowerUnknownInertData(source);
+  assert.ok(lowered);
+  assert.equal(stringifyCanonicalInertData(lowered), '{"a":[true,{"value":"ok"}],"z":2}');
+  assert.equal(Object.getPrototypeOf(lowered.value), null);
+  assert.equal(Object.isFrozen(lowered.value), true);
+  assert.equal(Object.isFrozen(lowered.value.a), true);
+  assert.equal(
+    digestInertDataSnapshot(lowered),
+    digestInertDataSnapshot(lowerUnknownInertData({ a: [true, { value: "ok" }], z: 2 }))
+  );
+
+  let calls = 0;
+  const accessor = {};
+  Object.defineProperty(accessor, "value", {
+    enumerable: true,
+    get() {
+      calls += 1;
+      throw new Error("must not execute");
+    }
+  });
+  const proxy = new Proxy({}, {
+    get() { calls += 1; throw new Error("must not execute"); },
+    getOwnPropertyDescriptor() { calls += 1; throw new Error("must not execute"); },
+    getPrototypeOf() { calls += 1; throw new Error("must not execute"); },
+    ownKeys() { calls += 1; throw new Error("must not execute"); }
+  });
+  assert.equal(lowerUnknownInertData(accessor), null);
+  assert.equal(lowerUnknownInertData(proxy), null);
+  assert.equal(hasExactOwnKeys(proxy, []), false);
+  assert.equal(calls, 0);
+});
+
+test("unknown lowering rejects cycles, array holes, exotic values, and budget overflow", () => {
+  const cycle = {};
+  cycle.self = cycle;
+  const hole = [1, , 3];
+  const nonEnumerable = {};
+  Object.defineProperty(nonEnumerable, "hidden", { enumerable: false, value: true });
+  for (const value of [cycle, hole, nonEnumerable, [undefined], new Date(0), -0, NaN, 1n]) {
+    assert.equal(lowerUnknownInertData(value), null);
+  }
+
+  const exact = createInertDataLimits(2, 4, 2, 2, 4, 32);
+  const shallow = createInertDataLimits(1, 4, 2, 2, 4, 32);
+  const narrow = createInertDataLimits(2, 4, 2, 2, 1, 32);
+  assert.ok(lowerUnknownInertData({ a: ["ok"] }, exact));
+  assert.equal(lowerUnknownInertData({ a: ["ok"] }, shallow), null);
+  assert.equal(lowerUnknownInertData({ a: ["ok"] }, narrow), null);
+});
 
 function inertArray(items, limits) {
   const value = createInertDataArray(items, limits);

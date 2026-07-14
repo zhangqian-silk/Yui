@@ -8,6 +8,7 @@ import { runBackupCommand } from "./commands/backupCommands.js";
 import { runConfigCommand } from "./commands/configCommands.js";
 import { ensureControllerRunning, runControllerCommand } from "./commands/controllerCommands.js";
 import { callController } from "./controller/controller.js";
+import { buildControllerCommandProvenance } from "./controller/commandProvenance.js";
 import { runGlobalRoleCommand } from "./commands/globalRoleCommands.js";
 import {
   executePruneCommand,
@@ -15,7 +16,13 @@ import {
   runExportCommand,
   runImportCommand
 } from "./commands/maintenanceCommands.js";
-import { recordTaskRoleAttached, runTaskCommand } from "./commands/taskCommands.js";
+import {
+  isTaskRoleRuntimeControlCommand,
+  prepareTaskLifecycleCommand,
+  recordTaskRoleAttached,
+  runTaskCommand,
+  runTaskLifecycleOperation
+} from "./commands/taskCommands.js";
 import { runDashboard } from "./dashboard/dashboard.js";
 import { getDoctorChecks, renderDoctor, runDoctor } from "./doctor/doctor.js";
 import { CliError, dataError, usageError } from "./errors/cliError.js";
@@ -31,7 +38,8 @@ import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
 import { SYSTEM_OPERATOR_ROLE } from "./role/systemRoles.js";
 import { prepareGlobalRoleLaunch } from "./operator/operatorContext.js";
-import type { Role } from "./role/role.js";
+import { activeRoleAgentBinding, copyGlobalRoleToTaskRole } from "./role/role.js";
+import { resolveAgent } from "./agent/agentRegistry.js";
 import { renderCommandHelp } from "./cli/helpRenderer.js";
 import { routeInvocation } from "./cli/invocationRouter.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
@@ -292,13 +300,27 @@ async function main(): Promise<void> {
     if (role === null) {
       throw dataError("Operator role is not configured. Run taskmux setup.");
     }
-    const prepared = prepareGlobalRoleLaunch(role, { taskmuxHome: rootDir, baseEnv: process.env });
-    const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandExecutor());
-    const taskRole: Role = { ...role, status: "idle" };
+    const binding = activeRoleAgentBinding(role);
+    const agent = resolveAgent(binding.agentId, store.listConfiguredAgents());
+    if (agent === null) {
+      throw dataError(`Operator Agent is not configured: ${binding.agentId}.`);
+    }
+    const sessionSet = store.getGlobalRoleSessionSet(role.name);
+    const prepared = prepareGlobalRoleLaunch(role, agent, {
+      taskmuxHome: rootDir,
+      baseEnv: process.env,
+      session: sessionSet?.sessions[role.activeAgentId] ?? null
+    });
+    const tmux = new TmuxManager(
+      process.env.TASKMUX_TMUX_BIN ?? "tmux",
+      new NodeCommandExecutor(),
+      rootDir
+    );
+    const taskRole = copyGlobalRoleToTaskRole(role, "operator", new Date());
     tmux.enterRole("operator", taskRole, {
-      command: role.command,
+      command: prepared.command,
       args: prepared.args,
-      env: operatorLaunchEnvironment(role.env, prepared.env)
+      env: prepared.explicitEnv
     });
     emit("Detached Operator session");
     return;
@@ -348,14 +370,23 @@ async function main(): Promise<void> {
       return;
     }
     const commandArgs = resolvedArgs.slice(1);
+    const tmux = new TmuxManager(
+      process.env.TASKMUX_TMUX_BIN ?? "tmux",
+      new NodeCommandExecutor(),
+      rootDir
+    );
+    const roleOptions = {
+      taskmuxHome: rootDir,
+      env: process.env,
+      tmux
+    };
     emit(
-      isDirectGlobalRoleRead(commandArgs)
-        ? runGlobalRoleCommand(commandArgs, store, { taskmuxHome: rootDir })
+      isCoordinatedGlobalRoleMutation(commandArgs) || isDirectGlobalRoleRead(commandArgs)
+        ? runGlobalRoleCommand(commandArgs, store, roleOptions)
         : executeDirectDomainCommand(
           rootDir,
           "role",
-          (transactionStore, workingRoot) =>
-            runGlobalRoleCommand(commandArgs, transactionStore, { taskmuxHome: workingRoot })
+          (transactionStore) => runGlobalRoleCommand(commandArgs, transactionStore, roleOptions)
         )
     );
     return;
@@ -367,7 +398,11 @@ async function main(): Promise<void> {
       ? undefined
       : await ensureControllerRunning(rootDir, process.env);
     const store = new FileTaskStore(rootDir);
-    const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandExecutor());
+    const tmux = new TmuxManager(
+      process.env.TASKMUX_TMUX_BIN ?? "tmux",
+      new NodeCommandExecutor(),
+      rootDir
+    );
     const scopedTaskArgs = resolveTaskCommandScope(args.slice(1), process.env);
     const resolvedFullArgs = await resolveTerminalArguments(["task", ...scopedTaskArgs], invocation.node, store);
     if (resolvedFullArgs === null) {
@@ -419,7 +454,10 @@ async function main(): Promise<void> {
           discovery,
           "task.command",
           randomUUID(),
-          { args: commandArgs }
+          {
+            args: commandArgs,
+            provenance: buildControllerCommandProvenance("task", commandArgs, store, process.env)
+          }
         ) as { output: string };
         return result.output;
       }, resolveShellArguments);
@@ -436,7 +474,10 @@ async function main(): Promise<void> {
         discovery,
         "task.command",
         randomUUID(),
-        { args: taskArgs }
+        {
+          args: taskArgs,
+          provenance: buildControllerCommandProvenance("task", taskArgs, store, process.env)
+        }
       ) as { output: string };
       if (result.output.length > 0) {
         emit(result.output);
@@ -557,10 +598,21 @@ function runDirectTaskCommand(
   if (isDirectTaskSnapshotRead(commandArgs)) {
     return runTaskCommand(commandArgs, new FileTaskStore(rootDir), tmux);
   }
+  const store = new FileTaskStore(rootDir);
+  const lifecycle = prepareTaskLifecycleCommand(commandArgs, store);
+  if (lifecycle !== null) {
+    return runTaskLifecycleOperation(lifecycle, store, tmux);
+  }
+  if (isTaskRoleRuntimeControlCommand(commandArgs)) {
+    return runTaskCommand(commandArgs, store, tmux);
+  }
+  if (commandArgs[0] === "dispatch") {
+    return runTaskCommand(commandArgs, store, tmux);
+  }
   if (commandArgs[0] === "enter") {
     const output = runTaskCommand(
       commandArgs,
-      new FileTaskStore(rootDir),
+      store,
       tmux,
       { persistAttachStatus: false }
     );
@@ -591,6 +643,10 @@ function isDirectAgentSnapshotRead(args: readonly string[]): boolean {
 
 function isDirectGlobalRoleRead(args: readonly string[]): boolean {
   return ["list", "show", "enter"].includes(args[0] ?? "");
+}
+
+function isCoordinatedGlobalRoleMutation(args: readonly string[]): boolean {
+  return args[0] === "update" || args[0] === "remove";
 }
 
 function isDirectTaskSnapshotRead(args: readonly string[]): boolean {
@@ -697,11 +753,21 @@ async function printControllerCommand(
   existingDiscovery?: Awaited<ReturnType<typeof ensureControllerRunning>>
 ): Promise<void> {
   const discovery = existingDiscovery ?? await ensureControllerRunning(rootDir, process.env);
+  const provenance = buildControllerCommandProvenance(
+    group,
+    commandArgs,
+    new FileTaskStore(rootDir),
+    process.env
+  );
   const result = await callController(
     discovery,
     "command.execute",
     randomUUID(),
-    { group, args: commandArgs }
+    {
+      group,
+      args: commandArgs,
+      ...(provenance === undefined ? {} : { provenance })
+    }
   ) as { output: string };
   if (result.output.length > 0) {
     emit(result.output);
@@ -741,7 +807,7 @@ async function runDefaultDashboard(rootDir: string): Promise<void> {
 
   requireStorageSchema(rootDir);
   const store = new FileTaskStore(rootDir);
-  const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", commandExecutor);
+  const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", commandExecutor, rootDir);
 
   if (process.env.TASKMUX_CONTROLLER_MODE === "direct") {
     await runDashboard(
@@ -760,7 +826,10 @@ async function runDefaultDashboard(rootDir: string): Promise<void> {
       discovery,
       "task.command",
       randomUUID(),
-      { args: commandArgs }
+      {
+        args: commandArgs,
+        provenance: buildControllerCommandProvenance("task", commandArgs, store, process.env)
+      }
     ) as { output: string };
     return result.output;
   });
