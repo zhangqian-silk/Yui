@@ -10,7 +10,169 @@ permissions:
   id-token: write
 
 jobs:
+  native-prebuild:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install build dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      - name: Build the N-API 8 prebuild once
+        run: npm run build:native
+
+      - name: Verify staged prebuild
+        run: node scripts/verify-native-prebuild.mjs
+
+      - name: Upload exact native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: taskmux-native-${{ matrix.arch }}
+          path: prebuilds/linux-${{ matrix.arch }}-glibc/napi-v8/taskmux_storage_fs.node
+          if-no-files-found: error
+          retention-days: 1
+
+  assemble-universal:
+    needs: native-prebuild
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install release verification dependencies with native dependency lifecycle
+        run: npm ci
+
+      - name: Download x64 native prebuild
+        uses: actions/download-artifact@v4
+        with:
+          name: taskmux-native-x64
+          path: prebuilds/linux-x64-glibc/napi-v8
+
+      - name: Download arm64 native prebuild
+        uses: actions/download-artifact@v4
+        with:
+          name: taskmux-native-arm64
+          path: prebuilds/linux-arm64-glibc/napi-v8
+
+      - name: Write the complete unified native manifest
+        run: node scripts/write-native-prebuild-manifest.mjs --all
+
+      - name: Verify release tag and complete native artifact matrix
+        run: |
+          npm run verify:release-tag
+          node scripts/verify-native-prebuild.mjs --all
+
+      - name: Build TypeScript without rebuilding native artifacts
+        run: npm run build:ts
+
+      - name: Test
+        run: npm test
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Assemble and pack the one universal runtime tarball
+        run: |
+          node scripts/assemble-runtime-package.mjs --all --output .release-stage
+          npm pack ./.release-stage --json > pack-result.json
+          node -e 'const fs=require("node:fs"); const result=JSON.parse(fs.readFileSync("pack-result.json","utf8")); fs.renameSync(result[0].filename, "taskmux-runtime.tgz");'
+
+      - name: Verify universal runtime package contents
+        run: |
+          tar -tf taskmux-runtime.tgz > package-files.txt
+          node -e 'const {execFileSync}=require("node:child_process"); const pkg=JSON.parse(execFileSync("tar",["-xOf","taskmux-runtime.tgz","package/package.json"],{encoding:"utf8"})); if (pkg.private !== false || "scripts" in pkg || "devDependencies" in pkg) throw new Error("runtime manifest must be publishable and lifecycle-free");'
+          grep -qx 'package/prebuilds/manifest.json' package-files.txt
+          grep -qx 'package/prebuilds/linux-x64-glibc/napi-v8/taskmux_storage_fs.node' package-files.txt
+          grep -qx 'package/prebuilds/linux-arm64-glibc/napi-v8/taskmux_storage_fs.node' package-files.txt
+          grep -qx 'package/skills/taskmux-leader/SKILL.md' package-files.txt
+          grep -qx 'package/skills/taskmux-worker/SKILL.md' package-files.txt
+          grep -qx 'package/skills/taskmux-operator/SKILL.md' package-files.txt
+          if [ "$(grep -Ec '^package/skills/' package-files.txt)" -ne 3 ]; then exit 1; fi
+          if grep -Eq '^package/(binding\.gyp|native/|build/|docs/superpowers/|scripts/|test/)' package-files.txt; then exit 1; fi
+
+      - name: Upload the one universal runtime tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: taskmux-runtime-tarball
+          path: taskmux-runtime.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  native-smoke:
+    needs: assemble-universal
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - node: 20
+            runner: ubuntu-latest
+            arch: x64
+          - node: 22
+            runner: ubuntu-latest
+            arch: x64
+          - node: 24
+            runner: ubuntu-latest
+            arch: x64
+          - node: 20
+            runner: ubuntu-24.04-arm
+            arch: arm64
+          - node: 22
+            runner: ubuntu-24.04-arm
+            arch: arm64
+          - node: 24
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Download the exact universal runtime tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: taskmux-runtime-tarball
+          path: release-artifact
+
+      - name: Clean-install and exercise the exact runtime tarball
+        run: |
+          TASKMUX_TGZ="$PWD/release-artifact/taskmux-runtime.tgz"
+          consumer="$(mktemp -d)"
+          npm install --prefix "$consumer" "$TASKMUX_TGZ"
+          TASKMUX_INSTALLED_ROOT="$consumer/node_modules/@zq-silk/taskmux" node scripts/smoke-runtime-package.mjs
+          TASKMUX_INSTALLED_ROOT="$consumer/node_modules/@zq-silk/taskmux" node scripts/smoke-native-prebuild.mjs
+
   publish:
+    needs: [assemble-universal, native-smoke]
     runs-on: ubuntu-latest
     environment: npm
 
@@ -25,24 +187,26 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           cache: npm
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Verify release tag
-        run: npm run verify:release-tag
-
-      - name: Build
-        run: npm run build
-
-      - name: Test
-        run: npm test
-
-      - name: Lint
-        run: npm run lint
+      - name: Download the already-tested universal runtime tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: taskmux-runtime-tarball
+          path: release-artifact
 
       - name: Verify package contents
-        run: npm run pack:dry-run
+        run: |
+          TASKMUX_TGZ="$PWD/release-artifact/taskmux-runtime.tgz"
+          tar -tf "$TASKMUX_TGZ" > package-files.txt
+          grep -qx 'package/prebuilds/manifest.json' package-files.txt
+          grep -qx 'package/prebuilds/linux-x64-glibc/napi-v8/taskmux_storage_fs.node' package-files.txt
+          grep -qx 'package/prebuilds/linux-arm64-glibc/napi-v8/taskmux_storage_fs.node' package-files.txt
+          grep -qx 'package/skills/taskmux-leader/SKILL.md' package-files.txt
+          grep -qx 'package/skills/taskmux-worker/SKILL.md' package-files.txt
+          grep -qx 'package/skills/taskmux-operator/SKILL.md' package-files.txt
+          if [ "$(grep -Ec '^package/skills/' package-files.txt)" -ne 3 ]; then exit 1; fi
+          if grep -Eq '^package/(binding\.gyp|native/|build/|docs/superpowers/|scripts/|test/)' package-files.txt; then exit 1; fi
 
-      - name: Publish to npm
-        run: npm publish --access public
-
+      - name: Publish the already-tested tarball
+        run: |
+          TASKMUX_TGZ="$PWD/release-artifact/taskmux-runtime.tgz"
+          npm publish "$TASKMUX_TGZ" --access public

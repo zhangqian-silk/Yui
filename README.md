@@ -6,7 +6,7 @@ TaskMux is a local control plane for long-running native agent CLI sessions. It 
 
 [![npm version](https://img.shields.io/npm/v/@zq-silk/taskmux.svg)](https://www.npmjs.com/package/@zq-silk/taskmux)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](package.json)
+[![node](https://img.shields.io/badge/node-20.17%2B%20%2820.x%29%20%7C%2022.9%2B%20%2822.x%29%20%7C%2024.x-brightgreen.svg)](package.json)
 
 ## Why TaskMux?
 
@@ -18,9 +18,13 @@ TaskMux is a local control plane for long-running native agent CLI sessions. It 
 
 ## Requirements
 
-- Node.js 20 or newer
+- Node.js 20.17+ (20.x), 22.9+ (22.x), or 24.x
+- Linux x64 or arm64 with glibc and kernel 5.6 or newer
+- A filesystem for `TASKMUX_HOME` and each external output destination that supports `O_TMPFILE` and linking that anonymous inode, with mounted and accessible `/proc/self/fd`
 - tmux
 - At least one native Agent CLI, such as Codex CLI or Claude Code
+
+TaskMux ships an N-API 8 storage authority prebuild for each supported architecture. That storage authority is never compiled or downloaded during installation, and TaskMux fails early if the exact prebuild for the current platform is unavailable. Native storage and external-output publication require Linux kernel 5.6 or newer with `openat2(2)`, plus `O_TMPFILE` and linking that anonymous inode through mounted `/proc/self/fd` with `linkat(..., AT_SYMLINK_FOLLOW)` on the relevant storage or output filesystem. TaskMux does not emulate weaker primitives: unavailable support fails closed with `ENOTSUP`/`EOPNOTSUPP`. Runtime dependencies may still run their own platform installation steps. Musl-based distributions and non-Linux hosts are not currently supported.
 
 ## Install
 
@@ -29,7 +33,7 @@ npm install -g @zq-silk/taskmux
 taskmux setup
 ```
 
-`setup` initializes `~/.taskmux`, checks tmux, and configures the default Agent and workspace. Run `taskmux` afterward to open the interactive dashboard.
+Run `taskmux doctor` after installation: it checks the exact Node LTS line and probes `openat2`, `O_TMPFILE`, and anonymous-inode linking through `/proc/self/fd` on `TASKMUX_HOME`. It cannot preflight arbitrary future output filesystems; each publication checks its own destination and fails closed if unsupported. `setup` initializes `~/.taskmux`, checks tmux, and configures the default Agent and workspace. Run `taskmux` afterward to open the interactive dashboard.
 
 ## Quick start
 
