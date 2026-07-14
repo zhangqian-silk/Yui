@@ -629,7 +629,11 @@ function publishPreparedFileOperation(
   const expectedParent = expectedParentForOperation(transaction, index, parentPath);
   if (state === "before" && operation.expectedBefore.kind === "file") {
     const current = inspectRequiredReceipt(barrier, operation.target);
-    if (!sameReceiptToFileState(current, operation.expectedBefore)) {
+    if (!filePathMatchesState(
+      barrier,
+      operation.target,
+      operation.expectedBefore
+    )) {
       throw new Error("Domain transaction write source changed before retirement.");
     }
     if (publication.retiredName === null) {
@@ -647,8 +651,18 @@ function publishPreparedFileOperation(
     );
     assertRetirementFailpoint(index + 1, phase, faultInjection);
   }
-  const source = inspectRequiredReceipt(barrier, `${stageRelative}/${publication.unitName}`);
-  if (!sameReceiptToFileState(source, filePublicationEntry(publication))) {
+  if (state === "retired") {
+    if (operation.expectedBefore.kind !== "file" || publication.retiredName === null) {
+      throw new Error("Prepared overwrite retirement is missing.");
+    }
+    const retiredPath = `${stageRelative}/${publication.retiredName}`;
+    if (!filePathMatchesState(barrier, retiredPath, operation.expectedBefore)) {
+      throw new Error("Domain transaction retired source changed before publication.");
+    }
+  }
+  const sourcePath = `${stageRelative}/${publication.unitName}`;
+  const source = inspectRequiredReceipt(barrier, sourcePath);
+  if (!filePathMatchesState(barrier, sourcePath, filePublicationEntry(publication))) {
     throw new Error("Prepared file identity changed.");
   }
   linkPreparedFileNoReplace(
@@ -679,7 +693,7 @@ function moveDeletedOperation(
       transaction,
       index
     )
-    : sameReceiptToPathState(current, operation.expectedBefore);
+    : pathMatchesState(barrier, operation.target, current, operation.expectedBefore);
   if (!expectedMatches) {
     throw new Error("Domain transaction delete source changed.");
   }
@@ -706,26 +720,38 @@ function operationCommitState(
   if (operation.type === "write") {
     const publication = publicationForOperation(transaction, index, "file");
     const target = inspectOptionalReceipt(barrier, operation.target);
-    const stage = inspectOptionalReceipt(
+    const stagePath = `${preparedGenerationRelative(transaction)}/${publication.unitName}`;
+    const stage = inspectOptionalReceipt(barrier, stagePath);
+    if (target !== undefined && filePathMatchesState(
       barrier,
-      `${preparedGenerationRelative(transaction)}/${publication.unitName}`
-    );
-    if (target !== undefined && sameReceiptToFileState(target, operation.desiredAfter)) {
-      if (stage !== undefined && !sameExactIdentityExceptNlink(
-        stage,
-        filePublicationEntry(publication)
+      operation.target,
+      operation.desiredAfter
+    )) {
+      if (stage !== undefined && !filePathMatchesState(
+        barrier,
+        stagePath,
+        filePublicationEntry(publication),
+        true
       )) {
         return "mismatch";
       }
       return "after";
     }
     if (target !== undefined && operation.expectedBefore.kind === "file" &&
-        sameReceiptToFileState(target, operation.expectedBefore) &&
-        stage !== undefined && sameReceiptToFileState(stage, filePublicationEntry(publication))) {
+        filePathMatchesState(barrier, operation.target, operation.expectedBefore) &&
+        stage !== undefined && filePathMatchesState(
+          barrier,
+          stagePath,
+          filePublicationEntry(publication)
+        )) {
       return "before";
     }
     if (target === undefined && operation.expectedBefore.kind === "absent" &&
-        stage !== undefined && sameReceiptToFileState(stage, filePublicationEntry(publication))) {
+        stage !== undefined && filePathMatchesState(
+          barrier,
+          stagePath,
+          filePublicationEntry(publication)
+        )) {
       return "before";
     }
     const retired = publication.retiredName === null
@@ -734,14 +760,22 @@ function operationCommitState(
         barrier,
         `${preparedGenerationRelative(transaction)}/${publication.retiredName}`
       );
+    const retiredPath = publication.retiredName === null
+      ? undefined
+      : `${preparedGenerationRelative(transaction)}/${publication.retiredName}`;
     if (target === undefined && retired !== undefined && operation.expectedBefore.kind === "file" &&
-        sameReceiptToFileState(retired, operation.expectedBefore) &&
-        stage !== undefined && sameReceiptToFileState(stage, filePublicationEntry(publication))) {
+        retiredPath !== undefined &&
+        filePathMatchesState(barrier, retiredPath, operation.expectedBefore) &&
+        stage !== undefined && filePathMatchesState(
+          barrier,
+          stagePath,
+          filePublicationEntry(publication)
+        )) {
       return "retired";
     }
     if (target === undefined && operation.expectedBefore.kind === "file" &&
         publication.retiredName === null && stage !== undefined &&
-        sameReceiptToFileState(stage, filePublicationEntry(publication))) {
+        filePathMatchesState(barrier, stagePath, filePublicationEntry(publication))) {
       return "retired";
     }
     return "mismatch";
@@ -758,7 +792,11 @@ function operationCommitState(
     ? sameDirectoryWithPermittedLinkCount(current, operation.expectedBefore, transaction, index)
       ? "before"
       : "mismatch"
-    : sameReceiptToFileState(current, operation.expectedBefore) ? "before" : "mismatch";
+    : filePathMatchesState(
+      barrier,
+      operation.target,
+      operation.expectedBefore
+    ) ? "before" : "mismatch";
 }
 
 function assertOperationMatchesBefore(
@@ -2017,19 +2055,41 @@ function identityNlink(identity: NativeExactIdentity | StoredExactIdentity): big
   return identity.nlink;
 }
 
-function sameReceiptToFileState(
-  receipt: NativePublicationReceipt,
-  state: StoredFileState
+function filePathMatchesState(
+  barrier: NativeStableAncestorBarrier,
+  relativePath: string,
+  state: StoredFileState,
+  allowNlinkChange = false
 ): boolean {
-  return sameExactIdentity(receipt, state) && receipt.size === BigInt(state.byteLength);
+  return withRootReader(barrier, (reader) => {
+    const before = reader.lstat(relativePath);
+    if (before === undefined || !isFileReceipt(before) ||
+        !(allowNlinkChange
+          ? sameExactIdentityExceptNlink(before, state)
+          : sameExactIdentity(before, state)) ||
+        before.size !== BigInt(state.byteLength)) {
+      return false;
+    }
+    const read = reader.readFileExact(relativePath, MAX_RECORD_BYTES);
+    const after = reader.lstat(relativePath);
+    return after !== undefined && isFileReceipt(after) &&
+      sameNativeExactIdentity(before, read.identity) &&
+      sameNativeExactIdentity(read.identity, after) &&
+      read.identity.size === BigInt(state.byteLength) &&
+      after.size === BigInt(state.byteLength) &&
+      read.bytes.byteLength === state.byteLength &&
+      createHash("sha256").update(read.bytes).digest("hex") === state.sha256;
+  });
 }
 
-function sameReceiptToPathState(
+function pathMatchesState(
+  barrier: NativeStableAncestorBarrier,
+  relativePath: string,
   receipt: NativePublicationReceipt,
   state: StoredFileState | StoredDirectoryState
 ): boolean {
   return state.kind === "file"
-    ? sameReceiptToFileState(receipt, state)
+    ? filePathMatchesState(barrier, relativePath, state)
     : sameExactIdentity(receipt, state);
 }
 

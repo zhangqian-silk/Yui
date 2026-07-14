@@ -71,6 +71,37 @@ test("recovery fails closed when a same-content target has a different exact ide
   assert.equal(readFileSync(target, "utf8"), "before\n");
 });
 
+function assertInPlaceSourceMutationFailsClosed(t, operation) {
+  const home = mkdtempSync(join(tmpdir(), `taskmux-recovery-v3-in-place-${operation}-`));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const target = join(home, "config.json");
+  writeFileSync(target, "before\n", { mode: 0o600 });
+  const before = lstatSync(target, { bigint: true });
+  const journal = stageDomainTransaction(home, `in-place-${operation}`, operation === "write"
+    ? [{ type: "write", target, content: "after\n" }]
+    : [{ type: "delete", target }]);
+
+  writeFileSync(target, "newest\n", { mode: 0o600 });
+  const mutated = lstatSync(target, { bigint: true });
+  assert.equal(mutated.ino, before.ino);
+  assert.equal(mutated.size, before.size);
+
+  assert.throws(
+    () => applyStagedDomainTransaction(home, `in-place-${operation}`),
+    (error) => error.name === "DomainTransactionRecoveryError"
+  );
+  assert.equal(existsSync(journal), true);
+  assert.equal(readFileSync(target, "utf8"), "newest\n");
+}
+
+test("same-inode same-size source mutation fails closed before overwrite", (t) => {
+  assertInPlaceSourceMutationFailsClosed(t, "write");
+});
+
+test("same-inode same-size source mutation fails closed before delete", (t) => {
+  assertInPlaceSourceMutationFailsClosed(t, "delete");
+});
+
 test("immutable v3 receipt replacement fails closed without overwriting the foreign receipt", (t) => {
   const home = mkdtempSync(join(tmpdir(), "taskmux-recovery-v3-receipt-swap-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
