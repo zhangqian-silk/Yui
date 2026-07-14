@@ -83,6 +83,7 @@ test("native storage exposes the final opaque barrier and fd-relative API", () =
     "acquireStableAncestorSharedBarrier",
     "acquireStableAncestorExclusiveBarrier",
     "releaseStableAncestorBarrier",
+    "inspectDirectoryDescriptor",
     "inspectDirectoryAt",
     "mkdirExactNoReplace",
     "withPinnedRootAt",

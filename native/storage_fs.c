@@ -915,6 +915,55 @@ static int create_pinned_directory_handle(
   return status == napi_ok;
 }
 
+static napi_value inspect_directory_descriptor(
+  napi_env env,
+  napi_callback_info info
+) {
+  size_t argument_count = 1;
+  napi_value arguments[1];
+  if (napi_get_cb_info(env, info, &argument_count, arguments, NULL, NULL) != napi_ok ||
+      argument_count != 1) {
+    return throw_type_error(env, "Expected an inherited directory descriptor.");
+  }
+
+  int descriptor;
+  if (!exact_nonnegative_int(env, arguments[0], &descriptor) ||
+      descriptor <= STDERR_FILENO) {
+    return throw_type_error(
+      env,
+      "directory descriptor must be an inherited non-stdio file descriptor."
+    );
+  }
+
+  struct stat metadata;
+  uint64_t birthtime_ns = 0;
+  if (capture_identity(descriptor, &metadata, &birthtime_ns) != 0) {
+    return throw_barrier_error(env, (storage_error){
+      errno, "stat-ancestor", "not-acquired"
+    });
+  }
+  if (!S_ISDIR(metadata.st_mode) || metadata.st_uid != geteuid()) {
+    return throw_barrier_error(env, (storage_error){
+      ESTALE, "verify-ancestor", "not-acquired"
+    });
+  }
+
+  napi_value result;
+  if (create_identity_result(env, &metadata, birthtime_ns, &result) != napi_ok) {
+    bool pending = false;
+    (void)napi_is_exception_pending(env, &pending);
+    if (!pending) {
+      napi_throw_error(
+        env,
+        "ERR_NATIVE_STORAGE_IDENTITY",
+        "Could not inspect the exact native directory identity."
+      );
+    }
+    return NULL;
+  }
+  return result;
+}
+
 static napi_value acquire_stable_ancestor_barrier(
   napi_env env,
   napi_callback_info info,
@@ -2489,6 +2538,7 @@ static napi_value initialize(napi_env env, napi_value exports) {
     const char *name;
     napi_callback callback;
   } functions[] = {
+    { "inspectDirectoryDescriptor", inspect_directory_descriptor },
     { "acquireStableAncestorSharedBarrier", acquire_stable_ancestor_shared_barrier },
     { "acquireStableAncestorExclusiveBarrier", acquire_stable_ancestor_exclusive_barrier },
     { "releaseStableAncestorBarrier", release_stable_ancestor_barrier },

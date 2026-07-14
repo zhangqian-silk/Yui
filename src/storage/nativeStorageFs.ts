@@ -46,6 +46,7 @@ export type NativePinnedRootReader = Readonly<{
 }>;
 
 type NativeStorageFsBinding = {
+  inspectDirectoryDescriptor(descriptor: number): NativeExactIdentity;
   acquireStableAncestorSharedBarrier(
     descriptor: number,
     expectedIdentity: NativeExactIdentity
@@ -126,6 +127,7 @@ const LINUX_O_CLOEXEC = 0o2000000;
 const MAX_MANIFEST_BYTES = 4096n;
 const MAX_NATIVE_BINARY_BYTES = 16n * 1024n * 1024n;
 const REQUIRED_EXPORTS = Object.freeze([
+  "inspectDirectoryDescriptor",
   "acquireStableAncestorSharedBarrier",
   "acquireStableAncestorExclusiveBarrier",
   "releaseStableAncestorBarrier",
@@ -143,6 +145,13 @@ const REQUIRED_EXPORTS = Object.freeze([
 ]);
 
 let loadedBinding: NativeStorageFsBinding | undefined;
+
+export function inspectDirectoryDescriptor(descriptor: number): NativeExactIdentity {
+  return loadBinding({
+    kind: "native-stable-ancestor-barrier",
+    state: "not-acquired"
+  }).inspectDirectoryDescriptor(descriptor);
+}
 
 export function acquireStableAncestorSharedBarrier(
   descriptor: number,

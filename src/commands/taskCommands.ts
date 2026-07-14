@@ -30,7 +30,7 @@ import type { TaskEvent } from "../event/taskEvent.js";
 import type { Role } from "../role/role.js";
 import type { ChildRole } from "../role/childRole.js";
 import type { AgentRun } from "../run/agentRun.js";
-import type { TaskStore } from "../storage/taskStore.js";
+import type { TaskReader, TaskStore } from "../storage/taskStore.js";
 import { resolveTaskmuxHome } from "../storage/taskStore.js";
 import type { Task, TaskMetadata, TaskPriority } from "../task/task.js";
 import type { TmuxManager } from "../tmux/tmuxManager.js";
@@ -43,6 +43,13 @@ export function runTaskCommand(
   tmux?: TmuxManager,
   options: { persistAttachStatus?: boolean; rememberTaskReads?: boolean } = {}
 ): string {
+  if (taskCommandIsReadOnlyAggregate(args)) {
+    const output = store.runReadSnapshot((snapshot) => runTaskReadSnapshot(args, snapshot));
+    if (options.rememberTaskReads !== false && ["show", "open", "context"].includes(args[0] ?? "")) {
+      rememberTask(store, args[1] ?? "");
+    }
+    return output;
+  }
   const [command, ...rest] = args;
 
   switch (command) {
@@ -145,6 +152,54 @@ export function runTaskCommand(
     default:
       throw usageError(command === undefined ? "Task command is required." : `Unknown command: task ${command}`);
   }
+}
+
+export function runTaskReadSnapshot(args: string[], store: TaskReader): string {
+  const [command, ...rest] = args;
+  switch (command) {
+    case "list":
+      return listTaskCommand(rest, store);
+    case "board":
+      return boardTaskCommand(rest, store);
+    case "show":
+      return showTaskSnapshot(rest, store);
+    case "open":
+      return openTaskSnapshot(rest, store);
+    case "context":
+      return contextTaskSnapshot(rest, store);
+    case "current":
+      return renderTaskPointer("Current task", store.getConfig().currentTaskId, store);
+    case "last":
+      return lastTaskCommand(store);
+    case "roles":
+      return listTaskRolesCommand(rest, store);
+    case "detail":
+      return detailTaskRoleCommand(rest, store);
+    case "comments":
+      return listTaskCommentsCommand(rest, store);
+    case "events":
+      return listTaskEventsCommand(rest, store);
+    case "activity":
+      return taskActivityCommand(rest, store);
+    case "timeline":
+      return taskTimelineCommand(rest, store);
+    case "topic":
+      return listTaskTopicsCommand(rest, store);
+    default:
+      throw usageError(`Task command is not a read-only aggregate: ${command ?? "(missing)"}.`);
+  }
+}
+
+function taskCommandIsReadOnlyAggregate(args: string[]): boolean {
+  const command = args[0] ?? "";
+  if ([
+    "list", "board", "show", "open", "context", "last", "roles",
+    "detail", "comments", "events", "activity", "timeline"
+  ].includes(command)) {
+    return true;
+  }
+  if (command === "current") return args.length === 1;
+  return command === "topic" && args[1] === "list";
 }
 
 function taskWorktreeCommand(args: string[], store: TaskStore): string {
@@ -812,23 +867,7 @@ function taskTopicCommand(args: string[], store: TaskStore): string {
   }
 
   if (command === "list" && rest.length === 0) {
-    const customTopics = store.getTaskTopics(taskId).customTopics;
-    const rows = [
-      ...BUILTIN_TOPICS.map((topic) => [topic.id, topic.name, "built-in", topic.description]),
-      ...customTopics.map((topic) => [topic.id, topic.name, "custom", topic.description])
-    ];
-
-    return `${renderTable(
-      `Task topics: ${taskId}`,
-      [
-        { header: "Topic", minWidth: 8, maxWidth: 24 },
-        { header: "Name", minWidth: 4, maxWidth: 16 },
-        { header: "Scope", minWidth: 7, maxWidth: 8 },
-        { header: "Description", minWidth: 11, maxWidth: 44 }
-      ],
-      rows,
-      defaultTableWidth()
-    )}\n`;
+    return listTaskTopicsCommand([command, taskId], store);
   }
 
   if (command === "summarize") {
@@ -847,6 +886,35 @@ function taskTopicCommand(args: string[], store: TaskStore): string {
   }
 
   throw usageError("Topic usage: taskmux task topic create|list|summarize <task-id>.");
+}
+
+function listTaskTopicsCommand(args: string[], store: TaskReader): string {
+  const [command, taskId, ...rest] = args;
+  if (command !== "list" || rest.length !== 0) {
+    throw usageError("Topic usage: taskmux task topic list <task-id>.");
+  }
+  if (taskId === undefined || taskId.trim().length === 0) {
+    throw usageError("Task id is required.");
+  }
+  if (store.getTask(taskId) === null) {
+    throw taskNotFound(taskId);
+  }
+  const rows = [
+    ...BUILTIN_TOPICS.map((topic) => [topic.id, topic.name, "built-in", topic.description]),
+    ...store.getTaskTopics(taskId).customTopics.map((topic) =>
+      [topic.id, topic.name, "custom", topic.description])
+  ];
+  return `${renderTable(
+    `Task topics: ${taskId}`,
+    [
+      { header: "Topic", minWidth: 8, maxWidth: 24 },
+      { header: "Name", minWidth: 4, maxWidth: 16 },
+      { header: "Scope", minWidth: 7, maxWidth: 8 },
+      { header: "Description", minWidth: 11, maxWidth: 44 }
+    ],
+    rows,
+    defaultTableWidth()
+  )}\n`;
 }
 
 function createTaskCommand(args: string[], store: TaskStore): string {
@@ -905,7 +973,7 @@ function createTaskCommand(args: string[], store: TaskStore): string {
   ].join("\n").concat("\n");
 }
 
-function listTaskCommand(args: string[], store: TaskStore): string {
+function listTaskCommand(args: string[], store: TaskReader): string {
   const filters = parseTaskListFilters(args);
   const tasks = store.listTasks().filter((task) => taskMatchesFilters(task, filters));
 
@@ -916,7 +984,7 @@ function listTaskCommand(args: string[], store: TaskStore): string {
   return `${renderTaskListTable(tasks)}\n`;
 }
 
-function boardTaskCommand(args: string[], store: TaskStore): string {
+function boardTaskCommand(args: string[], store: TaskReader): string {
   const options = parseTaskBoardViewOptions(args);
   const tasks = store.listTasks().filter((task) => taskMatchesFilters(task, options.filters));
 
@@ -924,6 +992,12 @@ function boardTaskCommand(args: string[], store: TaskStore): string {
 }
 
 function showTaskCommand(args: string[], store: TaskStore, remember: boolean): string {
+  const output = showTaskSnapshot(args, store);
+  if (remember) rememberTask(store, args[0] ?? "");
+  return output;
+}
+
+function showTaskSnapshot(args: string[], store: TaskReader): string {
   const [id] = args;
 
   if (id === undefined || id.trim().length === 0) {
@@ -934,10 +1008,6 @@ function showTaskCommand(args: string[], store: TaskStore, remember: boolean): s
 
   if (task === null) {
     throw taskNotFound(id);
-  }
-
-  if (remember) {
-    rememberTask(store, task.id);
   }
 
   return [
@@ -972,7 +1042,7 @@ function currentTaskCommand(args: string[], store: TaskStore): string {
   return `Current task: ${task.id} ${task.title}\n`;
 }
 
-function lastTaskCommand(store: TaskStore): string {
+function lastTaskCommand(store: TaskReader): string {
   return renderTaskPointer("Last task", store.getConfig().lastTaskId, store);
 }
 
@@ -1066,6 +1136,12 @@ function updateTaskCommand(args: string[], store: TaskStore): string {
 }
 
 function openTaskCommand(args: string[], store: TaskStore, remember: boolean): string {
+  const output = openTaskSnapshot(args, store);
+  if (remember) rememberTask(store, args[0] ?? "");
+  return output;
+}
+
+function openTaskSnapshot(args: string[], store: TaskReader): string {
   const [id] = args;
 
   if (id === undefined || id.trim().length === 0) {
@@ -1076,10 +1152,6 @@ function openTaskCommand(args: string[], store: TaskStore, remember: boolean): s
 
   if (task === null) {
     throw taskNotFound(id);
-  }
-
-  if (remember) {
-    rememberTask(store, task.id);
   }
 
   return [
@@ -1094,6 +1166,12 @@ function openTaskCommand(args: string[], store: TaskStore, remember: boolean): s
 }
 
 function contextTaskCommand(args: string[], store: TaskStore, remember: boolean): string {
+  const output = contextTaskSnapshot(args, store);
+  if (remember) rememberTask(store, args[0] ?? "");
+  return output;
+}
+
+function contextTaskSnapshot(args: string[], store: TaskReader): string {
   const [taskId, ...rest] = args;
 
   if (taskId === undefined || taskId.trim().length === 0) {
@@ -1104,10 +1182,6 @@ function contextTaskCommand(args: string[], store: TaskStore, remember: boolean)
 
   if (task === null) {
     throw taskNotFound(taskId);
-  }
-
-  if (remember) {
-    rememberTask(store, task.id);
   }
 
   const options = parseTaskContextOptions(rest);
@@ -1447,7 +1521,7 @@ function renameTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxMana
   return `Renamed role ${oldName} to ${newName} for ${taskId}\n`;
 }
 
-function listTaskRolesCommand(args: string[], store: TaskStore): string {
+function listTaskRolesCommand(args: string[], store: TaskReader): string {
   const [taskId] = args;
 
   if (taskId === undefined || taskId.trim().length === 0) {
@@ -1503,7 +1577,7 @@ export function recordTaskRoleAttached(taskId: string, roleName: string, store: 
 }
 
 function tailTaskRoleCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
-  const roleLookup = findRole(args, store);
+  const roleLookup = store.runReadSnapshot((snapshot) => findRole(args, snapshot));
 
   if (typeof roleLookup === "string") {
     throw usageError(roleLookup.trim());
@@ -1538,35 +1612,44 @@ function transcriptTaskRoleCommand(args: string[], store: TaskStore, tmux?: Tmux
 }
 
 function exportTranscriptCommand(args: string[], store: TaskStore): string {
-  const roleLookup = findRole(args, store);
-
-  if (typeof roleLookup === "string") {
-    throw usageError(roleLookup.trim());
-  }
-
   const rest = args.slice(2);
   assertKnownOptions(rest, new Set(["--format", "--output"]));
 
   const format = parseTranscriptExportFormat(readOptionalOption(rest, "--format"));
-  const transcript = store.readTranscript(roleLookup.taskId, roleLookup.role.name);
+  const captured = store.runReadSnapshot((snapshot) => {
+    const roleLookup = findRole(args, snapshot);
+    if (typeof roleLookup === "string") {
+      throw usageError(roleLookup.trim());
+    }
+    return {
+      taskId: roleLookup.taskId,
+      roleName: roleLookup.role.name,
+      transcript: snapshot.readTranscript(roleLookup.taskId, roleLookup.role.name)
+    };
+  });
 
-  if (transcript === null) {
+  if (captured.transcript === null) {
     return "No transcript captured.\n";
   }
 
-  const rendered = renderTranscriptExport(roleLookup.taskId, roleLookup.role.name, transcript, format);
+  const rendered = renderTranscriptExport(
+    captured.taskId,
+    captured.roleName,
+    captured.transcript,
+    format
+  );
   const output = readOptionalOption(rest, "--output")?.trim();
 
   if (output !== undefined && output.length > 0) {
     mkdirSync(dirname(output), { recursive: true });
     writeFileSync(output, rendered);
-    return `Exported transcript ${roleLookup.taskId} ${roleLookup.role.name} to ${output}\n`;
+    return `Exported transcript ${captured.taskId} ${captured.roleName} to ${output}\n`;
   }
 
   return rendered;
 }
 
-function detailTaskRoleCommand(args: string[], store: TaskStore): string {
+function detailTaskRoleCommand(args: string[], store: TaskReader): string {
   const roleLookup = findRole(args, store);
 
   if (typeof roleLookup === "string") {
@@ -1757,7 +1840,7 @@ function addTaskCommentCommand(args: string[], store: TaskStore): string {
   return `Added comment to ${taskId}: ${comment.body}\n`;
 }
 
-function listTaskCommentsCommand(args: string[], store: TaskStore): string {
+function listTaskCommentsCommand(args: string[], store: TaskReader): string {
   const [taskId] = args;
 
   if (taskId === undefined || taskId.trim().length === 0) {
@@ -1786,7 +1869,7 @@ function listTaskCommentsCommand(args: string[], store: TaskStore): string {
   )}\n`;
 }
 
-function listTaskEventsCommand(args: string[], store: TaskStore): string {
+function listTaskEventsCommand(args: string[], store: TaskReader): string {
   const [taskId] = args;
 
   if (taskId === undefined || taskId.trim().length === 0) {
@@ -1806,7 +1889,7 @@ function listTaskEventsCommand(args: string[], store: TaskStore): string {
   return `${renderEventTable(`Task events: ${taskId}`, events)}\n`;
 }
 
-function taskActivityCommand(args: string[], store: TaskStore): string {
+function taskActivityCommand(args: string[], store: TaskReader): string {
   const [taskId] = args;
 
   if (taskId === undefined || taskId.trim().length === 0) {
@@ -1847,7 +1930,7 @@ function taskActivityCommand(args: string[], store: TaskStore): string {
   )}\n`;
 }
 
-function taskTimelineCommand(args: string[], store: TaskStore): string {
+function taskTimelineCommand(args: string[], store: TaskReader): string {
   const [taskId] = args;
 
   if (taskId === undefined || taskId.trim().length === 0) {
@@ -1943,7 +2026,7 @@ function parseTaskContextFormat(value: string | undefined): TaskContextFormat {
   return value;
 }
 
-function buildTaskContext(task: Task, store: TaskStore, includeTranscripts: boolean): TaskContext {
+function buildTaskContext(task: Task, store: TaskReader, includeTranscripts: boolean): TaskContext {
   return {
     task,
     brief: store.readTaskBrief(task.id),
@@ -2185,7 +2268,7 @@ export function rememberTask(store: TaskStore, taskId: string, options: { curren
   });
 }
 
-function renderTaskPointer(label: string, taskId: string | undefined, store: TaskStore): string {
+function renderTaskPointer(label: string, taskId: string | undefined, store: TaskReader): string {
   if (taskId === undefined) {
     return `${label}: (none)\n`;
   }
@@ -2235,8 +2318,8 @@ function renderEventTable(title: string, events: TaskEvent[]): string {
 
 function findRole(
   args: string[],
-  store: TaskStore
-): { taskId: string; role: NonNullable<ReturnType<TaskStore["getRole"]>> } | string {
+  store: TaskReader
+): { taskId: string; role: NonNullable<ReturnType<TaskReader["getRole"]>> } | string {
   const [taskId, roleName] = args;
 
   if (taskId === undefined || taskId.trim().length === 0) {
@@ -2512,7 +2595,7 @@ function renderTaskListTable(tasks: Task[]): string {
   );
 }
 
-function renderTaskBoard(tasks: Task[], store: TaskStore, withRoles: boolean): string {
+function renderTaskBoard(tasks: Task[], store: TaskReader, withRoles: boolean): string {
   const groups = [
     { archived: false, title: "Ongoing" },
     { archived: true, title: "Archived" }
@@ -2549,7 +2632,7 @@ function renderTaskBoard(tasks: Task[], store: TaskStore, withRoles: boolean): s
   )}\n`;
 }
 
-function renderTaskProgressSummary(taskId: string, store: TaskStore): string {
+function renderTaskProgressSummary(taskId: string, store: TaskReader): string {
   const brief = store.readTaskBrief(taskId);
   const focus = brief?.match(/## Current focus\s+([^\n]+)/)?.[1]?.trim();
   const workCounts = store.listWorkItems(taskId).reduce<Record<string, number>>((counts, item) => {

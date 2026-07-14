@@ -112,6 +112,7 @@ test("native storage authority exports one exact final ABI", () => {
       "acquireStableAncestorExclusiveBarrier",
       "acquireStableAncestorSharedBarrier",
       "getPinnedDirectoryIdentity",
+      "inspectDirectoryDescriptor",
       "inspectDirectoryAt",
       "linkPreparedFileNoReplace",
       "lstatPinnedDirectory",

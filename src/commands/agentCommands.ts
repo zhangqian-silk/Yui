@@ -3,7 +3,7 @@ import { defaultTableWidth, renderTable } from "../output/table.js";
 import { createConfiguredAgent } from "../agent/agent.js";
 import type { AgentDefinition, AgentEnvironment } from "../agent/agent.js";
 import { listAgentDefinitions, resolveAgent } from "../agent/agentRegistry.js";
-import type { TaskStore } from "../storage/taskStore.js";
+import type { TaskReader, TaskStore } from "../storage/taskStore.js";
 
 export function runAgentCommand(args: string[], store: TaskStore): string {
   const [command, ...rest] = args;
@@ -12,9 +12,9 @@ export function runAgentCommand(args: string[], store: TaskStore): string {
     case "add":
       return addAgentCommand(rest, store);
     case "list":
-      return listAgentCommand(store);
+      return store.runReadSnapshot((snapshot) => listAgentCommand(snapshot));
     case "show":
-      return showAgentCommand(rest, store);
+      return store.runReadSnapshot((snapshot) => showAgentCommand(rest, snapshot));
     case "remove":
       return removeAgentCommand(rest, store);
     default:
@@ -57,7 +57,14 @@ function addAgentCommand(args: string[], store: TaskStore): string {
   });
 }
 
-function listAgentCommand(store: TaskStore): string {
+export function runAgentReadCommand(args: string[], store: TaskReader): string {
+  const [command, ...rest] = args;
+  if (command === "list") return listAgentCommand(store);
+  if (command === "show") return showAgentCommand(rest, store);
+  throw usageError(command === undefined ? "Agent command is required." : `Unknown command: agent ${command}`);
+}
+
+function listAgentCommand(store: TaskReader): string {
   const agents = listAgentDefinitions(store.listConfiguredAgents());
 
   if (agents.length === 0) {
@@ -76,7 +83,7 @@ function listAgentCommand(store: TaskStore): string {
   )}\n`;
 }
 
-function showAgentCommand(args: string[], store: TaskStore): string {
+function showAgentCommand(args: string[], store: TaskReader): string {
   const [id] = args;
 
   if (id === undefined || id.trim().length === 0) {

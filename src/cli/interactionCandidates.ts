@@ -1,6 +1,6 @@
 import type { TableColumn } from "../output/table.js";
 import { isSystemRoleName, SYSTEM_ROLE_NAMES, systemRoleDescription } from "../role/systemRoles.js";
-import type { TaskStore } from "../storage/taskStore.js";
+import type { TaskReader, TaskStore } from "../storage/taskStore.js";
 import { BUILTIN_TOPICS } from "../topic/topic.js";
 import type { ArgumentSelector } from "./interactionPolicy.js";
 
@@ -27,6 +27,16 @@ export type CandidateContext = {
 export function getSelectionCandidates(
   selector: ArgumentSelector,
   store: TaskStore,
+  args: readonly string[],
+  context: CandidateContext = {}
+): CandidateSet | null {
+  return store.runReadSnapshot((snapshot) =>
+    getSelectionCandidatesSnapshot(selector, snapshot, args, context));
+}
+
+function getSelectionCandidatesSnapshot(
+  selector: ArgumentSelector,
+  store: TaskReader,
   args: readonly string[],
   context: CandidateContext = {}
 ): CandidateSet | null {
@@ -281,7 +291,7 @@ export function getSelectionCandidates(
 }
 
 function taskCandidateSet(
-  store: TaskStore,
+  store: TaskReader,
   tasks: ReturnType<TaskStore["listTasks"]>,
   context: CandidateContext,
   emptyMessage: string
@@ -313,14 +323,14 @@ function taskCandidateSet(
   };
 }
 
-function dependentTaskId(selector: ArgumentSelector, args: readonly string[], store: TaskStore): string | null {
+function dependentTaskId(selector: ArgumentSelector, args: readonly string[], store: TaskReader): string | null {
   const taskId = selector.dependsOn === undefined ? undefined : args[selector.dependsOn];
   return taskId !== undefined && store.getTask(taskId) !== null ? taskId : null;
 }
 
 function taskRoleCandidateSet(
   selector: ArgumentSelector,
-  store: TaskStore,
+  store: TaskReader,
   args: readonly string[],
   context: CandidateContext,
   include: (taskId: string, roleName: string) => boolean,

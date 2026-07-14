@@ -214,7 +214,7 @@ test("rebuilds the task-scoped index when external edits violate the Controller 
   );
 });
 
-test("surfaces corrupt authoritative records and keeps the last valid resilient snapshot", (t) => {
+test("surfaces corrupt authoritative records without a stale resilient fallback", (t) => {
   const home = createHome(t);
   const direct = new FileTaskStore(home);
   saveTask(direct, "task-1");
@@ -233,20 +233,15 @@ test("surfaces corrupt authoritative records and keeps the last valid resilient 
     () => direct.getInputRequest("task-1", "input-1"),
     /Invalid input request record: task-1\/input-1/
   );
-  assert.deepEqual(store.getInputRequest("task-1", "input-1"), valid);
-  assert.deepEqual(store.listInputRequests("task-1"), [valid]);
-  assert.deepEqual(diagnostics, [
-    {
-      message: "Invalid input request record: task-1/input-1",
-      method: "getInputRequest",
-      args: ["task-1", "input-1"]
-    },
-    {
-      message: "Invalid input request record: task-1/input-1",
-      method: "listInputRequests",
-      args: ["task-1"]
-    }
-  ]);
+  assert.throws(
+    () => store.getInputRequest("task-1", "input-1"),
+    /Invalid input request record: task-1\/input-1/
+  );
+  assert.throws(
+    () => store.listInputRequests("task-1"),
+    /Invalid input request record: task-1\/input-1/
+  );
+  assert.deepEqual(diagnostics, []);
   assert.match(readFileSync(requestFile, "utf8"), /"taskId":"task-2"/);
 });
 

@@ -1,46 +1,15 @@
 import { CliError } from "../errors/cliError.js";
-import type { TaskStore } from "./taskStore.js";
+import type { TaskReader, TaskStore } from "./taskStore.js";
 
-const resilientReadMethods = new Set<keyof TaskStore>([
-  "getConfig",
-  "listTasks",
-  "getTask",
-  "getTaskTopics",
-  "getTaskInputDraft",
-  "getInputRequest",
-  "listInputRequests",
-  "getInputResolution",
-  "listInputResolutions",
-  "getPendingWakeup",
-  "listPendingWakeups",
-  "getLeaderFailure",
-  "getOperatorNotification",
-  "getTaskSchedule",
-  "getCycle",
-  "listCycles",
-  "getWorkItem",
-  "listWorkItems",
-  "getAgentSession",
-  "getAgentRun",
-  "getActiveAgentRun",
+// Only derived renderings can remain available after an isolated malformed
+// edit. Every domain record that can drive an action must fail closed rather
+// than mixing an older cached generation with current authoritative state.
+const cacheableReadMethods = new Set<keyof TaskReader>([
   "readTaskBrief",
   "readTaskTopicSummaries",
-  "getMilestone",
-  "listMilestones",
-  "getDecision",
-  "getRoleWorktree",
-  "listDecisions",
-  "listRoles",
-  "getRole",
-  "getChildRole",
-  "listChildRoles",
-  "listGlobalRoles",
-  "getGlobalRole",
   "listComments",
   "listEvents",
-  "readTranscript",
-  "listConfiguredAgents",
-  "getConfiguredAgent"
+  "readTranscript"
 ]);
 
 export function createResilientTaskStore(
@@ -48,38 +17,96 @@ export function createResilientTaskStore(
   onInvalidData: (error: CliError, method: keyof TaskStore, args: unknown[]) => void
 ): TaskStore {
   const lastValid = new Map<string, unknown>();
+  const clone = <T>(value: T): T => structuredClone(value);
+  const resilientMethod = (current: TaskReader, property: keyof TaskReader, value: Function) =>
+    (...args: unknown[]) => {
+      const key = `${String(property)}:${JSON.stringify(args)}`;
+      try {
+        const snapshot = clone(Reflect.apply(value, current, args) as unknown);
+        lastValid.set(key, snapshot);
+        return clone(snapshot);
+      } catch (error) {
+        if (
+          !(error instanceof CliError) ||
+          error.code !== "DATA_ERROR" ||
+          !lastValid.has(key)
+        ) {
+          throw error;
+        }
+        onInvalidData(error, property, args);
+        return clone(lastValid.get(key));
+      }
+    };
+  const wrapReader = (target: TaskReader): TaskReader => {
+    // The native FileTaskStore reader is already immutable and callback-bound.
+    // A Proxy cannot substitute functions on its non-configurable properties,
+    // so create a separate bounded facade when derived reads need a cache.
+    if (Object.isFrozen(target)) {
+      const reader = Object.create(null) as Record<string, unknown>;
+      for (const property of Object.keys(target) as Array<keyof TaskReader>) {
+        const value = target[property] as unknown;
+        if (property === "runReadSnapshot" && typeof value === "function") {
+          reader[property] = <T>(execute: (snapshot: TaskReader) => T): T =>
+            target.runReadSnapshot((snapshot) => execute(wrapReader(snapshot)));
+        } else if (
+          cacheableReadMethods.has(property) &&
+          typeof value === "function"
+        ) {
+          reader[property] = resilientMethod(target, property, value);
+        } else {
+          reader[property] = typeof value === "function" ? value.bind(target) : value;
+        }
+      }
+      return Object.freeze(reader) as TaskReader;
+    }
+    return new Proxy(target, {
+      get(current, property, receiver) {
+        const value = Reflect.get(current, property, receiver) as unknown;
+        if (property === "runReadSnapshot" && typeof value === "function") {
+          return <T>(execute: (snapshot: TaskReader) => T): T =>
+            current.runReadSnapshot((snapshot) => execute(wrapReader(snapshot)));
+        }
+        if (
+          typeof property === "string" &&
+          cacheableReadMethods.has(property as keyof TaskReader) &&
+          typeof value === "function"
+        ) {
+          return resilientMethod(current, property as keyof TaskReader, value);
+        }
+        return typeof value === "function" ? value.bind(current) : value;
+      }
+    }) as TaskReader;
+  };
 
   return new Proxy(store, {
-    get(target, property, receiver) {
-      const value = Reflect.get(target, property, receiver) as unknown;
-      if (
-        typeof property !== "string" ||
-        !resilientReadMethods.has(property as keyof TaskStore) ||
-        typeof value !== "function"
-      ) {
-        return typeof value === "function" ? value.bind(target) : value;
+    get(current, property, receiver) {
+      const value = Reflect.get(current, property, receiver) as unknown;
+      if (property === "runReadSnapshot" && typeof value === "function") {
+        return <T>(execute: (snapshot: TaskReader) => T): T =>
+          current.runReadSnapshot((snapshot) => execute(wrapReader(snapshot)));
       }
-
-      return (...args: unknown[]) => {
-        const key = `${property}:${JSON.stringify(args)}`;
-        try {
-          const result = Reflect.apply(value, target, args) as unknown;
-          lastValid.set(key, result);
-          return result;
-        } catch (error) {
-          if (!(error instanceof CliError) || error.code !== "DATA_ERROR" || !lastValid.has(key)) {
-            throw error;
-          }
-          onInvalidData(error, property as keyof TaskStore, args);
-          return lastValid.get(key);
-        }
-      };
+      if (
+        typeof property === "string" &&
+        cacheableReadMethods.has(property as keyof TaskReader) &&
+        typeof value === "function"
+      ) {
+        return resilientMethod(current, property as keyof TaskReader, value);
+      }
+      return typeof value === "function" ? value.bind(current) : value;
     }
   }) as TaskStore;
 }
 
 export function primeResilientTaskStore(store: TaskStore): void {
+  store.runReadSnapshot((snapshot) => primeResilientTaskStoreSnapshot(snapshot));
+}
+
+function primeResilientTaskStoreSnapshot(store: TaskReader): void {
   store.getConfig();
+  store.listTrashedTaskIds();
+  for (const wakeup of store.listPendingWakeups()) {
+    store.getPendingWakeup(wakeup.taskId);
+  }
   for (const role of store.listGlobalRoles()) {
     store.getGlobalRole(role.name);
   }
@@ -105,6 +132,9 @@ export function primeResilientTaskStore(store: TaskStore): void {
     store.readTaskTopicSummaries(task.id);
     store.listComments(task.id);
     store.listEvents(task.id);
+    for (const run of store.listAgentRuns(task.id)) {
+      store.getAgentRun(task.id, run.id);
+    }
 
     for (const cycle of store.listCycles(task.id)) {
       store.getCycle(task.id, cycle.id);

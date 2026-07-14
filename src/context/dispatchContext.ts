@@ -2,10 +2,10 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { dataError } from "../errors/cliError.js";
 import type { Role } from "../role/role.js";
-import { resolveTaskmuxHome, type TaskStore } from "../storage/taskStore.js";
+import { resolveTaskmuxHome, type TaskReader } from "../storage/taskStore.js";
 
 export function compileDispatchInput(
-  store: TaskStore,
+  store: TaskReader,
   taskId: string,
   role: Role,
   input: string

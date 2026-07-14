@@ -16,11 +16,10 @@ import { getDoctorChecks, renderDoctor, runDoctor } from "./doctor/doctor.js";
 import { CliError, dataError, usageError } from "./errors/cliError.js";
 import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
 import { runTaskShell } from "./shell/taskShell.js";
-import { FileTaskStore, inspectTaskmuxHome, resolveTaskmuxHome } from "./storage/taskStore.js";
+import { FileTaskStore, resolveTaskmuxHome } from "./storage/taskStore.js";
 import {
   inspectStorageSchema,
-  requireStorageSchema,
-  type StorageSchemaState
+  requireStorageSchema
 } from "./storage/storageSchema.js";
 import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
@@ -153,11 +152,8 @@ async function main(): Promise<void> {
 
   if (args[0] === "doctor") {
     const storageSchema = inspectStorageSchema(rootDir);
-    const agents = canReadStore(storageSchema) && isTaskmuxHomeReadyForRead(rootDir)
-      ? listConfiguredAgentsForDoctor(new FileTaskStore(rootDir))
-      : [];
 
-    emit(runDoctor(process.env, new NodeCommandExecutor(), agents, storageSchema));
+    emit(runDoctor(process.env, new NodeCommandExecutor(), storageSchema));
     return;
   }
 
@@ -250,7 +246,7 @@ async function main(): Promise<void> {
 
     requireStorageSchema(rootDir);
     const store = new FileTaskStore(rootDir);
-    const role = store.getGlobalRole(SYSTEM_OPERATOR_ROLE);
+    const role = store.runReadSnapshot((snapshot) => snapshot.getGlobalRole(SYSTEM_OPERATOR_ROLE));
     if (role === null) {
       throw dataError("Operator role is not configured. Run taskmux setup.");
     }
@@ -564,10 +560,7 @@ function operatorLaunchEnvironment(
 async function runDefaultDashboard(rootDir: string): Promise<void> {
   const commandExecutor = new NodeCommandExecutor();
   const storageSchema = inspectStorageSchema(rootDir);
-  const agents = canReadStore(storageSchema) && isTaskmuxHomeReadyForRead(rootDir)
-    ? listConfiguredAgentsForDoctor(new FileTaskStore(rootDir))
-    : [];
-  const checks = getDoctorChecks(process.env, commandExecutor, agents, storageSchema);
+  const checks = getDoctorChecks(process.env, commandExecutor, storageSchema);
   const failedChecks = checks.filter((check) => check.status !== "ok");
 
   process.stdout.write(renderDoctor(checks));
@@ -599,14 +592,6 @@ async function runDefaultDashboard(rootDir: string): Promise<void> {
   });
 }
 
-function isTaskmuxHomeReadyForRead(rootDir: string): boolean {
-  try {
-    return inspectTaskmuxHome(rootDir).status === "ready";
-  } catch {
-    return false;
-  }
-}
-
 function readPackageVersion(): string {
   try {
     const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -621,16 +606,4 @@ function readPackageVersion(): string {
   }
 
   return "0.0.0";
-}
-
-function canReadStore(state: StorageSchemaState): boolean {
-  return state.status === "current";
-}
-
-function listConfiguredAgentsForDoctor(store: FileTaskStore) {
-  try {
-    return store.listConfiguredAgents();
-  } catch {
-    return [];
-  }
 }

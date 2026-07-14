@@ -14,7 +14,8 @@ import {
 } from "node:fs";
 import type { BigIntStats } from "node:fs";
 import { userInfo } from "node:os";
-import { isAbsolute, join, parse, relative, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { types as utilTypes } from "node:util";
 import type { TaskComment } from "../comment/comment.js";
 import type { Milestone } from "../milestone/milestone.js";
 import type { Decision } from "../decision/decision.js";
@@ -38,11 +39,24 @@ import { emptyTaskTopics, type TaskTopics } from "../topic/topic.js";
 import type { WorkItem } from "../workItem/workItem.js";
 import type { RoleWorktree } from "../worktree/worktree.js";
 import { taskRecordCodec } from "./taskRecordCodec.js";
+import { executeDomainReadSnapshot } from "./domainTransaction.js";
+import type { NativePinnedRootReader } from "./nativeStorageFs.js";
 import { writeRecoverableSnapshot } from "./recoveryJournal.js";
 
 const INPUT_POINTER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const MAX_PINNED_READ_BYTES = 64 * 1024 * 1024;
+const DIRECTORY_MODE = 0o040000n;
+const REGULAR_FILE_MODE = 0o100000n;
+const FILE_TYPE_MASK = 0o170000n;
+const activeTaskReaderGrants = new WeakMap<TaskReader, { backing: FileTaskStore }>();
+const objectCreate = Object.create;
+const objectFreeze = Object.freeze;
+const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const objectGetPrototypeOf = Object.getPrototypeOf;
+const isProxy = utilTypes.isProxy;
 
 export type TaskStore = {
+  runReadSnapshot<T>(execute: (reader: TaskReader) => T): T;
   getConfig(): TaskmuxConfig;
   saveConfig(config: TaskmuxConfig): void;
   nextTaskId(): string;
@@ -87,6 +101,7 @@ export type TaskStore = {
   saveAgentSession(session: AgentSession): void;
   nextAgentRunId(taskId: string): string;
   getAgentRun(taskId: string, runId: string): AgentRun | null;
+  listAgentRuns(taskId: string): AgentRun[];
   saveAgentRun(run: AgentRun): void;
   getActiveAgentRun(taskId: string, roleName: string): AgentRun | null;
   saveActiveAgentRun(run: AgentRun): void;
@@ -131,6 +146,59 @@ export type TaskStore = {
   getConfiguredAgent(id: string): ConfiguredAgent | null;
   removeConfiguredAgent(id: string): boolean;
 };
+
+export type TaskReader = Pick<TaskStore,
+  | "runReadSnapshot"
+  | "getConfig"
+  | "nextTaskId"
+  | "listTrashedTaskIds"
+  | "listTasks"
+  | "getTask"
+  | "getTaskTopics"
+  | "getTaskInputDraft"
+  | "getInputRequest"
+  | "listInputRequests"
+  | "getInputResolution"
+  | "listInputResolutions"
+  | "getPendingWakeup"
+  | "listPendingWakeups"
+  | "getLeaderFailure"
+  | "getOperatorNotification"
+  | "getTaskSchedule"
+  | "nextCycleId"
+  | "getCycle"
+  | "listCycles"
+  | "nextWorkItemId"
+  | "getWorkItem"
+  | "listWorkItems"
+  | "getAgentSession"
+  | "nextAgentRunId"
+  | "getAgentRun"
+  | "listAgentRuns"
+  | "getActiveAgentRun"
+  | "readTaskBrief"
+  | "readTaskTopicSummaries"
+  | "nextMilestoneId"
+  | "getMilestone"
+  | "listMilestones"
+  | "nextDecisionId"
+  | "getDecision"
+  | "listDecisions"
+  | "getRoleWorktree"
+  | "listRoles"
+  | "getRole"
+  | "getChildRole"
+  | "listChildRoles"
+  | "listGlobalRoles"
+  | "getGlobalRole"
+  | "nextCommentId"
+  | "listComments"
+  | "nextEventId"
+  | "listEvents"
+  | "readTranscript"
+  | "listConfiguredAgents"
+  | "getConfiguredAgent"
+>;
 
 export type TaskmuxConfig = {
   schemaVersion: 1;
@@ -630,7 +698,19 @@ function taskmuxHomeProcfdSystemCode(error: unknown): string | undefined {
 }
 
 export class FileTaskStore implements TaskStore {
-  constructor(private readonly rootDir: string) {}
+  constructor(
+    private readonly rootDir: string,
+    private readonly pinnedReader: NativePinnedRootReader | null | undefined = undefined
+  ) {}
+
+  runReadSnapshot<T>(execute: (reader: TaskReader) => T): T {
+    if (this.pinnedReader !== undefined) {
+      return withBoundedTaskReader(this, execute);
+    }
+    return executeDomainReadSnapshot(this.rootDir, (reader) =>
+      withBoundedTaskReader(new FileTaskStore(this.rootDir, reader ?? null), execute)
+    );
+  }
 
   getConfig(): TaskmuxConfig {
     const raw = this.readOptionalText(this.configFile());
@@ -819,19 +899,10 @@ export class FileTaskStore implements TaskStore {
   }
 
   listPendingWakeups(): PendingWakeup[] {
-    try {
-      return readdirSync(this.pendingWakeupsDir(), { withFileTypes: true })
-        .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
-        .map((entry) => entry.name.slice(0, -5))
-        .map((taskId) => this.getPendingWakeup(taskId))
-        .filter((wakeup): wakeup is PendingWakeup => wakeup !== null)
-        .sort((left, right) => left.taskId.localeCompare(right.taskId));
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-        return [];
-      }
-      throw error;
-    }
+    return this.jsonRecordIds(this.pendingWakeupsDir())
+      .map((taskId) => this.getPendingWakeup(taskId))
+      .filter((wakeup): wakeup is PendingWakeup => wakeup !== null)
+      .sort((left, right) => left.taskId.localeCompare(right.taskId));
   }
 
   clearPendingWakeup(taskId: string): void {
@@ -942,6 +1013,12 @@ export class FileTaskStore implements TaskStore {
   getAgentRun(taskId: string, runId: string): AgentRun | null {
     const raw = this.readOptionalText(this.agentRunFile(taskId, runId));
     return raw === null ? null : parseAgentRun(taskId, runId, raw);
+  }
+
+  listAgentRuns(taskId: string): AgentRun[] {
+    return this.jsonRecordIds(this.agentRunsDir(taskId))
+      .map((id) => this.getAgentRun(taskId, id))
+      .filter((run): run is AgentRun => run !== null);
   }
 
   saveAgentRun(run: AgentRun): void {
@@ -1148,15 +1225,8 @@ export class FileTaskStore implements TaskStore {
   }
 
   getGlobalRole(name: string): GlobalRole | null {
-    try {
-      return parseGlobalRole(name, readFileSync(this.globalRoleFile(name), "utf8"));
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-        return null;
-      }
-
-      throw error;
-    }
+    const raw = this.readOptionalText(this.globalRoleFile(name));
+    return raw === null ? null : parseGlobalRole(name, raw);
   }
 
   removeGlobalRole(name: string): boolean {
@@ -1182,18 +1252,12 @@ export class FileTaskStore implements TaskStore {
   }
 
   listComments(taskId: string): TaskComment[] {
-    try {
-      return readFileSync(this.commentsFile(taskId), "utf8")
-        .split("\n")
+    const raw = this.readOptionalText(this.commentsFile(taskId));
+    return raw === null
+      ? []
+      : raw.split("\n")
         .filter((line) => line.trim().length > 0)
         .map((line, index) => parseComment(`${taskId}:${index + 1}`, line));
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-        return [];
-      }
-
-      throw error;
-    }
   }
 
   nextEventId(taskId: string): string {
@@ -1206,18 +1270,12 @@ export class FileTaskStore implements TaskStore {
   }
 
   listEvents(taskId: string): TaskEvent[] {
-    try {
-      return readFileSync(this.eventsFile(taskId), "utf8")
-        .split("\n")
+    const raw = this.readOptionalText(this.eventsFile(taskId));
+    return raw === null
+      ? []
+      : raw.split("\n")
         .filter((line) => line.trim().length > 0)
         .map((line, index) => parseEvent(`${taskId}:${index + 1}`, line));
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-        return [];
-      }
-
-      throw error;
-    }
   }
 
   saveTranscript(taskId: string, roleName: string, transcript: string): void {
@@ -1251,15 +1309,8 @@ export class FileTaskStore implements TaskStore {
   }
 
   getConfiguredAgent(id: string): ConfiguredAgent | null {
-    try {
-      return parseConfiguredAgent(id, readFileSync(this.agentFile(id), "utf8"));
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-        return null;
-      }
-
-      throw error;
-    }
+    const raw = this.readOptionalText(this.agentFile(id));
+    return raw === null ? null : parseConfiguredAgent(id, raw);
   }
 
   removeConfiguredAgent(id: string): boolean {
@@ -1546,6 +1597,17 @@ export class FileTaskStore implements TaskStore {
   }
 
   private directoryNames(path: string): string[] {
+    if (this.pinnedReader !== undefined) {
+      if (this.pinnedReader === null) return [];
+      const relativePath = this.pinnedRelativePath(path);
+      try {
+        return this.pinnedReader.readdir(relativePath)
+          .filter((name) => this.pinnedEntryIs(relativePath, name, DIRECTORY_MODE));
+      } catch (error) {
+        if (hasErrorCode(error, "ENOENT")) return [];
+        throw error;
+      }
+    }
     try {
       return readdirSync(path, { withFileTypes: true })
         .filter((entry) => entry.isDirectory())
@@ -1560,6 +1622,20 @@ export class FileTaskStore implements TaskStore {
   }
 
   private jsonRecordIds(path: string): string[] {
+    if (this.pinnedReader !== undefined) {
+      if (this.pinnedReader === null) return [];
+      const relativePath = this.pinnedRelativePath(path);
+      try {
+        return this.pinnedReader.readdir(relativePath)
+          .filter((name) => name.endsWith(".json"))
+          .filter((name) => this.pinnedEntryIs(relativePath, name, REGULAR_FILE_MODE))
+          .map((name) => name.slice(0, -5))
+          .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+      } catch (error) {
+        if (hasErrorCode(error, "ENOENT")) return [];
+        throw error;
+      }
+    }
     try {
       return readdirSync(path, { withFileTypes: true })
         .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
@@ -1578,6 +1654,18 @@ export class FileTaskStore implements TaskStore {
   }
 
   private readOptionalText(path: string): string | null {
+    if (this.pinnedReader !== undefined) {
+      if (this.pinnedReader === null) return null;
+      try {
+        return this.pinnedReader.readFileExact(
+          this.pinnedRelativePath(path),
+          MAX_PINNED_READ_BYTES
+        ).bytes.toString("utf8");
+      } catch (error) {
+        if (hasErrorCode(error, "ENOENT")) return null;
+        throw error;
+      }
+    }
     try {
       return readFileSync(path, "utf8");
     } catch (error) {
@@ -1587,6 +1675,24 @@ export class FileTaskStore implements TaskStore {
 
       throw error;
     }
+  }
+
+  private pinnedRelativePath(path: string): string {
+    const relativePath = relative(this.rootDir, path);
+    if (
+      relativePath === ".." ||
+      relativePath.startsWith(`..${sep}`) ||
+      isAbsolute(relativePath)
+    ) {
+      throw dataError("TaskMux pinned read path escaped its storage root.");
+    }
+    return relativePath.length === 0 ? "." : relativePath.split(sep).join("/");
+  }
+
+  private pinnedEntryIs(directory: string, name: string, type: bigint): boolean {
+    const path = directory === "." ? name : `${directory}/${name}`;
+    const identity = this.pinnedReader?.lstat(path);
+    return identity !== undefined && (identity.mode & FILE_TYPE_MASK) === type;
   }
 
   private nextRecordId(prefix: string, getRecord: (id: string) => unknown | null): string {
@@ -1599,6 +1705,121 @@ export class FileTaskStore implements TaskStore {
     return `${prefix}-${number}`;
   }
 
+}
+
+const TASK_READER_METHODS = [
+  "getConfig",
+  "nextTaskId",
+  "listTrashedTaskIds",
+  "listTasks",
+  "getTask",
+  "getTaskTopics",
+  "getTaskInputDraft",
+  "getInputRequest",
+  "listInputRequests",
+  "getInputResolution",
+  "listInputResolutions",
+  "getPendingWakeup",
+  "listPendingWakeups",
+  "getLeaderFailure",
+  "getOperatorNotification",
+  "getTaskSchedule",
+  "nextCycleId",
+  "getCycle",
+  "listCycles",
+  "nextWorkItemId",
+  "getWorkItem",
+  "listWorkItems",
+  "getAgentSession",
+  "nextAgentRunId",
+  "getAgentRun",
+  "listAgentRuns",
+  "getActiveAgentRun",
+  "readTaskBrief",
+  "readTaskTopicSummaries",
+  "nextMilestoneId",
+  "getMilestone",
+  "listMilestones",
+  "nextDecisionId",
+  "getDecision",
+  "listDecisions",
+  "getRoleWorktree",
+  "listRoles",
+  "getRole",
+  "getChildRole",
+  "listChildRoles",
+  "listGlobalRoles",
+  "getGlobalRole",
+  "nextCommentId",
+  "listComments",
+  "nextEventId",
+  "listEvents",
+  "readTranscript",
+  "listConfiguredAgents",
+  "getConfiguredAgent"
+] as const satisfies ReadonlyArray<Exclude<keyof TaskReader, "runReadSnapshot">>;
+
+function withBoundedTaskReader<T>(
+  backing: FileTaskStore,
+  execute: (reader: TaskReader) => T
+): T {
+  const reader = createTaskReaderFacade();
+  activeTaskReaderGrants.set(reader, { backing });
+  try {
+    return requireSynchronousTaskReaderResult(execute(reader));
+  } finally {
+    activeTaskReaderGrants.delete(reader);
+  }
+}
+
+function activeTaskReaderBacking(reader: TaskReader): FileTaskStore {
+  const grant = activeTaskReaderGrants.get(reader);
+  if (grant === undefined) {
+    throw new Error("TaskMux read snapshot capability is no longer active.");
+  }
+  return grant.backing;
+}
+
+function createTaskReaderFacade(): TaskReader {
+  const reader = objectCreate(null) as Record<string, unknown>;
+  const taskReader = reader as TaskReader;
+  taskReader.runReadSnapshot = <T>(execute: (nested: TaskReader) => T): T => {
+    activeTaskReaderBacking(taskReader);
+    return requireSynchronousTaskReaderResult(execute(taskReader));
+  };
+  for (const name of TASK_READER_METHODS) {
+    reader[name] = (...args: unknown[]): unknown => {
+      const backing = activeTaskReaderBacking(taskReader);
+      const method = backing[name] as unknown as (...values: unknown[]) => unknown;
+      return Reflect.apply(method, backing, args);
+    };
+  }
+  return objectFreeze(taskReader);
+}
+
+function requireSynchronousTaskReaderResult<T>(value: T): T {
+  if ((typeof value !== "object" || value === null) && typeof value !== "function") {
+    return value;
+  }
+  let candidate: object | null = value as object;
+  while (candidate !== null) {
+    if (isProxy(candidate)) {
+      throw new Error("TaskMux read snapshot callback must be synchronous.");
+    }
+    const descriptor = objectGetOwnPropertyDescriptor(candidate, "then");
+    if (descriptor !== undefined) {
+      if (descriptor.get !== undefined || typeof descriptor.value === "function") {
+        throw new Error("TaskMux read snapshot callback must be synchronous.");
+      }
+      return value;
+    }
+    candidate = objectGetPrototypeOf(candidate);
+  }
+  return value;
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
 function parseConfiguredAgent(id: string, raw: string): ConfiguredAgent {
