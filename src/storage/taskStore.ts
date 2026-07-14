@@ -1,6 +1,20 @@
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync
+} from "node:fs";
+import type { BigIntStats } from "node:fs";
+import { userInfo } from "node:os";
+import { isAbsolute, join, parse, relative, resolve } from "node:path";
 import type { TaskComment } from "../comment/comment.js";
 import type { Milestone } from "../milestone/milestone.js";
 import type { Decision } from "../decision/decision.js";
@@ -136,12 +150,483 @@ export type CompletionInstallation = {
 
 export function resolveTaskmuxHome(env: NodeJS.ProcessEnv): string {
   return env.TASKMUX_HOME === undefined || env.TASKMUX_HOME.length === 0
-    ? join(homedir(), ".taskmux")
+    ? join(trustedAccountHome().canonicalPath, ".taskmux")
     : resolve(env.TASKMUX_HOME);
 }
 
-export function ensureTaskmuxHome(rootDir: string): void {
-  mkdirSync(rootDir, { recursive: true });
+const TASKMUX_HOME_PRIVATE_MODE = 0o700n;
+const LINUX_O_PATH = 0o10000000;
+const TASKMUX_HOME_PRIVATE_REQUIREMENT =
+  "TASKMUX_HOME must be an owned real directory with exact mode 0700.";
+const TASKMUX_HOME_PROCFD_REQUIREMENT =
+  "TaskMux requires mounted and accessible /proc/self/fd descriptor traversal.";
+const TASKMUX_HOME_PROCFD_ERROR_KIND = "taskmux-home-procfd";
+
+export type TaskmuxHomeInspection =
+  | Readonly<{ status: "missing" }>
+  | Readonly<{ status: "ready"; identity: TaskmuxHomeIdentity }>
+  | Readonly<{
+      status: "repair-required";
+      mode: string;
+      identity: TaskmuxHomeIdentity;
+    }>;
+
+export type TaskmuxHomeIdentity = Readonly<{
+  dev: bigint;
+  ino: bigint;
+  uid: bigint;
+  mode: bigint;
+  nlink: bigint;
+  birthtimeNs: bigint;
+}>;
+
+export type EnsureTaskmuxHomeOptions = Readonly<{
+  repairExisting?: TaskmuxHomeIdentity;
+}>;
+
+export function inspectTaskmuxHome(rootDir: string): TaskmuxHomeInspection {
+  const normalizedRoot = assertTaskmuxHomePathAllowed(rootDir);
+  const opened = openTaskmuxHomeDirectory(normalizedRoot);
+  if (opened === undefined) {
+    return Object.freeze({ status: "missing" });
+  }
+  try {
+    assertOwnedRealTaskmuxHome(opened.metadata);
+    const mode = opened.metadata.mode & 0o7777n;
+    if (mode === TASKMUX_HOME_PRIVATE_MODE) {
+      return Object.freeze({
+        status: "ready",
+        identity: taskmuxHomeIdentity(opened.metadata)
+      });
+    }
+    return Object.freeze({
+      status: "repair-required",
+      mode: formatTaskmuxHomeMode(mode),
+      identity: taskmuxHomeIdentity(opened.metadata)
+    });
+  } finally {
+    closeSync(opened.descriptor);
+  }
+}
+
+export function assertTaskmuxHomeReady(rootDir: string): void {
+  const inspection = inspectTaskmuxHome(rootDir);
+  if (inspection.status === "ready") return;
+  if (inspection.status === "missing") {
+    throw dataError("TaskMux is not initialized. Run `taskmux setup`.");
+  }
+  throw dataError(taskmuxHomeRepairMessage(inspection.mode));
+}
+
+export function ensureTaskmuxHome(
+  rootDir: string,
+  options: EnsureTaskmuxHomeOptions = {}
+): void {
+  const normalizedRoot = assertTaskmuxHomePathAllowed(rootDir);
+  let inspection = inspectTaskmuxHome(normalizedRoot);
+  if (options.repairExisting !== undefined) {
+    if (
+      inspection.status === "missing" ||
+      !sameTaskmuxHomeIdentity(inspection.identity, options.repairExisting)
+    ) {
+      throw dataError("TASKMUX_HOME changed after repair confirmation. No changes were made.");
+    }
+    if (inspection.status === "ready") return;
+
+    repairExistingTaskmuxHome(normalizedRoot, options.repairExisting);
+    if (inspectTaskmuxHome(normalizedRoot).status !== "ready") {
+      throw dataError(TASKMUX_HOME_PRIVATE_REQUIREMENT);
+    }
+    return;
+  }
+
+  if (inspection.status === "missing") {
+    createMissingTaskmuxHome(normalizedRoot);
+    inspection = inspectTaskmuxHome(normalizedRoot);
+  }
+
+  if (inspection.status === "ready") return;
+  if (inspection.status === "missing") {
+    throw dataError("TASKMUX_HOME could not be created. Run taskmux setup again.");
+  }
+  throw dataError(taskmuxHomeRepairMessage(inspection.mode));
+}
+
+function assertTaskmuxHomePathAllowed(rootDir: string): string {
+  const normalizedRoot = resolve(rootDir);
+  if (normalizedRoot === parse(normalizedRoot).root) {
+    throw dataError("TASKMUX_HOME must not be the filesystem root.");
+  }
+  const accountHome = trustedAccountHome();
+  if (
+    normalizedRoot === accountHome.configuredPath ||
+    normalizedRoot === accountHome.canonicalPath
+  ) {
+    throw dataError(
+      "TASKMUX_HOME must not be the current user's home directory. Use a dedicated directory such as ~/.taskmux."
+    );
+  }
+  return normalizedRoot;
+}
+
+type TrustedAccountHome = Readonly<{
+  configuredPath: string;
+  canonicalPath: string;
+}>;
+
+function trustedAccountHome(): TrustedAccountHome {
+  let configuredPath: string;
+  try {
+    configuredPath = userInfo().homedir;
+  } catch {
+    throw dataError(
+      "TaskMux could not resolve the current user's home directory from operating-system account data."
+    );
+  }
+  if (configuredPath.length === 0 || !isAbsolute(configuredPath)) {
+    throw dataError(
+      "Operating-system account data returned an invalid current-user home directory."
+    );
+  }
+
+  const normalizedConfiguredPath = resolve(configuredPath);
+  let canonicalPath: string;
+  try {
+    canonicalPath = resolve(realpathSync(normalizedConfiguredPath));
+  } catch {
+    throw dataError(
+      "TaskMux could not resolve the current user's home directory from operating-system account data."
+    );
+  }
+  return Object.freeze({
+    configuredPath: normalizedConfiguredPath,
+    canonicalPath
+  });
+}
+
+function createMissingTaskmuxHome(rootDir: string): void {
+  const parsed = parse(rootDir);
+  const segments = relative(parsed.root, rootDir).split("/").filter((segment) => segment.length > 0);
+  let parentDescriptor = openSync(
+    parsed.root,
+    LINUX_O_PATH | constants.O_DIRECTORY | constants.O_NOFOLLOW
+  );
+
+  try {
+    for (const segment of segments) {
+      let child = openChildDirectory(parentDescriptor, segment);
+      let created = false;
+      if (child === undefined) {
+        const childPath = descriptorChildPath(parentDescriptor, segment);
+        try {
+          mkdirSync(childPath, { mode: Number(TASKMUX_HOME_PRIVATE_MODE) });
+          created = true;
+        } catch (error) {
+          if (errorCode(error) !== "EEXIST") throw error;
+        }
+        child = openChildDirectory(parentDescriptor, segment);
+        if (child === undefined) {
+          throw dataError("TASKMUX_HOME changed while it was being created.");
+        }
+      }
+      if (created) {
+        try {
+          assertOwnedRealTaskmuxHome(child.metadata);
+          tightenPinnedDirectory(child.descriptor);
+        } catch (error) {
+          closeSync(child.descriptor);
+          throw error;
+        }
+      }
+      parentDescriptor = replaceDirectoryDescriptor(parentDescriptor, child.descriptor);
+    }
+  } finally {
+    closeSync(parentDescriptor);
+  }
+}
+
+function repairExistingTaskmuxHome(
+  rootDir: string,
+  expectedIdentity: TaskmuxHomeIdentity
+): void {
+  const opened = openTaskmuxHomeDirectory(rootDir);
+  if (opened === undefined) {
+    throw dataError("TASKMUX_HOME disappeared before repair could begin.");
+  }
+  try {
+    assertOwnedRealTaskmuxHome(opened.metadata);
+    if (!sameTaskmuxHomeIdentity(taskmuxHomeIdentity(opened.metadata), expectedIdentity)) {
+      throw dataError("TASKMUX_HOME changed after repair confirmation. No changes were made.");
+    }
+    if ((opened.metadata.mode & 0o7777n) !== TASKMUX_HOME_PRIVATE_MODE) {
+      tightenPinnedDirectory(opened.descriptor);
+    }
+  } finally {
+    closeSync(opened.descriptor);
+  }
+}
+
+function openTaskmuxHomeDirectory(rootDir: string): {
+  descriptor: number;
+  metadata: BigIntStats;
+} | undefined {
+  const opened = openPinnedDirectory(rootDir);
+  if (opened === undefined) return undefined;
+  try {
+    assertNotFilesystemRootIdentity(opened.metadata);
+    assertNotTrustedAccountHomeIdentity(opened.metadata);
+    return opened;
+  } catch (error) {
+    closeSync(opened.descriptor);
+    throw error;
+  }
+}
+
+function openPinnedDirectory(rootDir: string): {
+  descriptor: number;
+  metadata: BigIntStats;
+} | undefined {
+  const parsed = parse(rootDir);
+  const segments = relative(parsed.root, rootDir).split("/").filter((segment) => segment.length > 0);
+  let descriptor = openSync(
+    parsed.root,
+    LINUX_O_PATH | constants.O_DIRECTORY | constants.O_NOFOLLOW
+  );
+  let metadata = fstatSync(descriptor, { bigint: true });
+  try {
+    for (const segment of segments) {
+      const child = openChildDirectory(descriptor, segment);
+      if (child === undefined) return undefined;
+      descriptor = replaceDirectoryDescriptor(descriptor, child.descriptor);
+      metadata = child.metadata;
+    }
+    const result = { descriptor, metadata };
+    descriptor = -1;
+    return result;
+  } finally {
+    if (descriptor >= 0) closeSync(descriptor);
+  }
+}
+
+function openChildDirectory(parentDescriptor: number, segment: string): {
+  descriptor: number;
+  metadata: BigIntStats;
+} | undefined {
+  assertProcfdDescriptorAnchor(parentDescriptor);
+  const childPath = descriptorChildPath(parentDescriptor, segment);
+  let pathMetadata: BigIntStats | undefined;
+  try {
+    pathMetadata = lstatSync(childPath, { bigint: true, throwIfNoEntry: false });
+  } catch (error) {
+    reclassifyProcfdTraversalFailure(parentDescriptor, error);
+  }
+  if (pathMetadata === undefined) {
+    assertProcfdDescriptorAnchor(parentDescriptor);
+    return undefined;
+  }
+  if (pathMetadata.isSymbolicLink()) {
+    throw dataError("TASKMUX_HOME must not contain a symbolic link.");
+  }
+  if (!pathMetadata.isDirectory()) {
+    throw dataError("TASKMUX_HOME must be a directory.");
+  }
+
+  let descriptor: number;
+  try {
+    descriptor = openSync(
+      childPath,
+      LINUX_O_PATH | constants.O_DIRECTORY | constants.O_NOFOLLOW
+    );
+  } catch (error) {
+    reclassifyProcfdTraversalFailure(parentDescriptor, error);
+  }
+  try {
+    const metadata = fstatSync(descriptor, { bigint: true });
+    if (
+      !metadata.isDirectory() ||
+      metadata.dev !== pathMetadata.dev ||
+      metadata.ino !== pathMetadata.ino
+    ) {
+      throw dataError("TASKMUX_HOME changed while it was being inspected.");
+    }
+    return { descriptor, metadata };
+  } catch (error) {
+    closeSync(descriptor);
+    throw error;
+  }
+}
+
+function descriptorChildPath(descriptor: number, segment: string): string {
+  return `/proc/self/fd/${descriptor}/${segment}`;
+}
+
+function assertProcfdDescriptorAnchor(descriptor: number): void {
+  const anchor = `/proc/self/fd/${descriptor}`;
+  try {
+    const metadata = lstatSync(anchor, { bigint: true, throwIfNoEntry: false });
+    if (metadata === undefined) {
+      throw taskmuxHomeProcfdError("ENOENT");
+    }
+  } catch (error) {
+    if (taskmuxHomeProcfdSystemCode(error) !== undefined) throw error;
+    const code = errorCode(error);
+    if (code === "ENOENT" || code === "EACCES") {
+      throw taskmuxHomeProcfdError(code);
+    }
+    throw error;
+  }
+}
+
+function reclassifyProcfdTraversalFailure(descriptor: number, error: unknown): never {
+  const code = errorCode(error);
+  if (code === "ENOENT" || code === "EACCES") {
+    assertProcfdDescriptorAnchor(descriptor);
+  }
+  throw error;
+}
+
+function replaceDirectoryDescriptor(current: number, next: number): number {
+  try {
+    closeSync(current);
+  } catch (error) {
+    try {
+      closeSync(next);
+    } catch {
+      // Preserve the original close failure.
+    }
+    throw error;
+  }
+  return next;
+}
+
+function assertOwnedRealTaskmuxHome(metadata: BigIntStats): void {
+  if (
+    !metadata.isDirectory() ||
+    metadata.uid !== BigInt(process.geteuid?.() ?? -1)
+  ) {
+    throw dataError(TASKMUX_HOME_PRIVATE_REQUIREMENT);
+  }
+}
+
+function assertNotFilesystemRootIdentity(metadata: BigIntStats): void {
+  let descriptor: number;
+  try {
+    descriptor = openSync(
+      "/",
+      LINUX_O_PATH | constants.O_DIRECTORY | constants.O_NOFOLLOW
+    );
+  } catch {
+    throw dataError("TaskMux could not inspect the filesystem root.");
+  }
+  try {
+    const rootMetadata = fstatSync(descriptor, { bigint: true });
+    if (metadata.dev === rootMetadata.dev && metadata.ino === rootMetadata.ino) {
+      throw dataError("TASKMUX_HOME must not be the filesystem root.");
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function assertNotTrustedAccountHomeIdentity(metadata: BigIntStats): void {
+  const accountHome = trustedAccountHome();
+  let descriptor: number;
+  try {
+    descriptor = openSync(
+      accountHome.canonicalPath,
+      LINUX_O_PATH | constants.O_DIRECTORY | constants.O_NOFOLLOW
+    );
+  } catch {
+    throw dataError(
+      "TaskMux could not inspect the current user's home directory from operating-system account data."
+    );
+  }
+  try {
+    const accountMetadata = fstatSync(descriptor, { bigint: true });
+    if (metadata.dev === accountMetadata.dev && metadata.ino === accountMetadata.ino) {
+      throw dataError(
+        "TASKMUX_HOME must not be the current user's home directory. Use a dedicated directory such as ~/.taskmux."
+      );
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function taskmuxHomeIdentity(metadata: BigIntStats): TaskmuxHomeIdentity {
+  return Object.freeze({
+    dev: metadata.dev,
+    ino: metadata.ino,
+    uid: metadata.uid,
+    mode: metadata.mode,
+    nlink: metadata.nlink,
+    birthtimeNs: metadata.birthtimeNs
+  });
+}
+
+function sameTaskmuxHomeIdentity(
+  actual: TaskmuxHomeIdentity,
+  expected: TaskmuxHomeIdentity
+): boolean {
+  return actual.dev === expected.dev &&
+    actual.ino === expected.ino &&
+    actual.uid === expected.uid &&
+    actual.mode === expected.mode &&
+    actual.nlink === expected.nlink &&
+    actual.birthtimeNs === expected.birthtimeNs;
+}
+
+function tightenPinnedDirectory(descriptor: number): void {
+  try {
+    chmodSync(`/proc/self/fd/${descriptor}`, Number(TASKMUX_HOME_PRIVATE_MODE));
+  } catch (error) {
+    const detail = error instanceof Error ? `: ${error.message}` : "";
+    throw dataError(`${TASKMUX_HOME_PRIVATE_REQUIREMENT}${detail}`);
+  }
+  const metadata = fstatSync(descriptor, { bigint: true });
+  if ((metadata.mode & 0o7777n) !== TASKMUX_HOME_PRIVATE_MODE) {
+    throw dataError(TASKMUX_HOME_PRIVATE_REQUIREMENT);
+  }
+}
+
+function taskmuxHomeRepairMessage(mode: string): string {
+  return `${TASKMUX_HOME_PRIVATE_REQUIREMENT} Existing mode is ${mode}. Refusing to change an existing directory automatically. Run taskmux setup in an interactive terminal and confirm repair.`;
+}
+
+function formatTaskmuxHomeMode(mode: bigint): string {
+  return `0${mode.toString(8).padStart(3, "0")}`;
+}
+
+function errorCode(error: unknown): string | undefined {
+  return typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string"
+    ? error.code
+    : undefined;
+}
+
+function taskmuxHomeProcfdError(systemCode: "ENOENT" | "EACCES"): ReturnType<typeof dataError> {
+  const error = dataError(`${TASKMUX_HOME_PROCFD_REQUIREMENT} ${systemCode}.`);
+  Object.defineProperties(error, {
+    kind: { value: TASKMUX_HOME_PROCFD_ERROR_KIND },
+    systemCode: { value: systemCode }
+  });
+  return error;
+}
+
+function taskmuxHomeProcfdSystemCode(error: unknown): string | undefined {
+  if (
+    error !== null &&
+    typeof error === "object" &&
+    "kind" in error &&
+    error.kind === TASKMUX_HOME_PROCFD_ERROR_KIND &&
+    "systemCode" in error &&
+    typeof error.systemCode === "string"
+  ) {
+    return error.systemCode;
+  }
+  return undefined;
 }
 
 export class FileTaskStore implements TaskStore {

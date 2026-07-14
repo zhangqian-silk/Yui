@@ -1,5 +1,5 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -3502,6 +3502,47 @@ test("setup initializes a missing taskmux home before writing storage data", asy
   assert.equal(existsSync(join(home, "workspace")), true);
 });
 
+test("setup refuses piped permission repair even when the test interactive escape is enabled", async () => {
+  const parent = createTaskmuxHome();
+  const home = join(parent, "taskmux-home");
+  const fakeBin = join(parent, "bin");
+  mkdirSync(home);
+  chmodSync(home, 0o755);
+  writeFileSync(join(home, "keep.txt"), "do not touch\n");
+  mkdirSync(fakeBin);
+  createPathExecutable(fakeBin, "codex", "process.stdout.write('codex-cli 0.144.1\\n');");
+  const env = {
+    TASKMUX_HOME: home,
+    TASKMUX_SETUP_INTERACTIVE: "1",
+    TASKMUX_TMUX_BIN: process.execPath,
+    PATH: fakeBin
+  };
+
+  await assert.rejects(
+    () => runTaskmuxInteractive(["setup"], "yes\n1\nskip\n", env),
+    /Repairing an existing TASKMUX_HOME requires a real interactive terminal/
+  );
+  assert.equal(statSync(home).mode & 0o7777, 0o755);
+  assert.equal(readFileSync(join(home, "keep.txt"), "utf8"), "do not touch\n");
+  assert.equal(existsSync(join(home, "schema.json")), false);
+});
+
+test("runtime commands fail closed without mutating an unsafe TASKMUX_HOME", () => {
+  const home = createTaskmuxHome();
+  writeStorageSchema(home, 3);
+  writeFileSync(join(home, "keep.txt"), "unchanged\n");
+  chmodSync(home, 0o755);
+
+  const result = runTaskmuxFailure(["config", "show"], {
+    TASKMUX_HOME: home
+  });
+
+  assert.equal(result.status, 4);
+  assert.match(result.stderr, /owned real directory with exact mode 0700/);
+  assert.equal(statSync(home).mode & 0o7777, 0o755);
+  assert.equal(readFileSync(join(home, "keep.txt"), "utf8"), "unchanged\n");
+});
+
 test("setup can install tmux after interactive confirmation", async () => {
   const home = createTaskmuxHome();
   const fakeBin = join(home, "bin");
@@ -4819,6 +4860,8 @@ test("creates a git worktree for an independent task role", () => {
   const worktree = join(home, "worktrees", "reviewer");
   mkdirSync(repository, { recursive: true });
   execFileSync("git", ["init"], { cwd: repository });
+  mkdirSync(join(repository, ".taskmux-test-hooks"));
+  execFileSync("git", ["config", "core.hooksPath", ".taskmux-test-hooks"], { cwd: repository });
   execFileSync("git", ["symbolic-ref", "HEAD", "refs/heads/master"], { cwd: repository });
   execFileSync("git", ["config", "user.email", "taskmux@example.invalid"], { cwd: repository });
   execFileSync("git", ["config", "user.name", "TaskMux Test"], { cwd: repository });

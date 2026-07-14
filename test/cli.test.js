@@ -194,6 +194,38 @@ test("prints shell completion scripts", () => {
   assert.match(fish, /complete -c taskmux/);
 });
 
+test("renders static shell completions without resolving the passwd account home", (t) => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "taskmux-completion-passwd-home-"));
+  const preload = join(fixtureRoot, "passwd-home-blocker.so");
+  execFileSync("cc", [
+    "-shared",
+    "-fPIC",
+    "-o",
+    preload,
+    join(process.cwd(), "test", "fixtures", "passwd-home-blocker.c")
+  ]);
+  t.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+
+  for (const [shell, expected] of [
+    ["bash", /complete -F _taskmux taskmux/],
+    ["zsh", /#compdef taskmux/],
+    ["fish", /complete -c taskmux/]
+  ]) {
+    const result = spawnSync("node", ["dist/cli.js", "completion", shell], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        LD_PRELOAD: preload,
+        TASKMUX_HOME: ""
+      }
+    });
+
+    assert.equal(result.status, 0, `${shell}: ${result.stderr}`);
+    assert.match(result.stdout, expected, shell);
+    assert.equal(result.stderr, "", shell);
+  }
+});
+
 test("generates path-aware completion from scoped catalog nodes", () => {
   const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], {
     encoding: "utf8"

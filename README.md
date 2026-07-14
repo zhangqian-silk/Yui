@@ -19,12 +19,13 @@ TaskMux is a local control plane for long-running native agent CLI sessions. It 
 ## Requirements
 
 - Node.js 20.17+ (20.x), 22.9+ (22.x), or 24.x
-- Linux x64 or arm64 with glibc and kernel 5.6 or newer
-- A filesystem for `TASKMUX_HOME` and each external output destination that supports `O_TMPFILE` and linking that anonymous inode, with mounted and accessible `/proc/self/fd`
+- Linux x64 or arm64 with glibc and an upstream Linux kernel 5.6 or newer, or a compatible vendor backport; the doctor command is the authoritative runtime probe
+- A filesystem for `TASKMUX_HOME` and each external output destination that supports `statx(..., STATX_BTIME)` birth-time identity, `O_TMPFILE`, and linking that anonymous inode, with mounted and accessible `/proc/self/fd`
+- A dedicated, owned real `TASKMUX_HOME` directory with exact mode `0700`. It must not be the filesystem root or your account home directory. `taskmux setup` creates missing path components at `0700`, never changes an existing directory automatically, and requires explicit confirmation from a real TTY before repairing an existing owned directory.
 - tmux
 - At least one native Agent CLI, such as Codex CLI or Claude Code
 
-TaskMux ships an N-API 8 storage authority prebuild for each supported architecture. That storage authority is never compiled or downloaded during installation, and TaskMux fails early if the exact prebuild for the current platform is unavailable. Native storage and external-output publication require Linux kernel 5.6 or newer with `openat2(2)`, plus `O_TMPFILE` and linking that anonymous inode through mounted `/proc/self/fd` with `linkat(..., AT_SYMLINK_FOLLOW)` on the relevant storage or output filesystem. TaskMux does not emulate weaker primitives: unavailable support fails closed with `ENOTSUP`/`EOPNOTSUPP`. Runtime dependencies may still run their own platform installation steps. Musl-based distributions and non-Linux hosts are not currently supported.
+TaskMux ships an N-API 8 storage authority prebuild for each supported architecture. That storage authority is never compiled or downloaded during installation, and TaskMux fails early if the exact prebuild for the current platform is unavailable. Native storage and external-output publication require capability support from an upstream Linux kernel 5.6 or newer or a compatible vendor backport: `openat2(2)`, filesystem `statx(..., STATX_BTIME)` birth-time identity, `O_TMPFILE`, and linking that anonymous inode through mounted and accessible `/proc/self/fd` with `linkat(..., AT_SYMLINK_FOLLOW)` on the relevant storage or output filesystem. `taskmux doctor` is the authoritative capability probe. TaskMux does not emulate weaker primitives: native syscall `ENOSYS` and `EOPNOTSUPP` failures are normalized to `ENOTSUP`; missing or inaccessible procfd descriptor traversal is unsupported with actual `ENOENT` or `EACCES`, while only an absent raw `TASKMUX_HOME` is classified as setup missing. Runtime dependencies may still run their own platform installation steps. Musl-based distributions and non-Linux hosts are not currently supported.
 
 ## Install
 
@@ -33,7 +34,7 @@ npm install -g @zq-silk/taskmux
 taskmux setup
 ```
 
-Run `taskmux doctor` after installation: it checks the exact Node LTS line and probes `openat2`, `O_TMPFILE`, and anonymous-inode linking through `/proc/self/fd` on `TASKMUX_HOME`. It cannot preflight arbitrary future output filesystems; each publication checks its own destination and fails closed if unsupported. `setup` initializes `~/.taskmux`, checks tmux, and configures the default Agent and workspace. Run `taskmux` afterward to open the interactive dashboard.
+Run `taskmux doctor` after installation: it checks the exact Node LTS line and probes `openat2`, `statx(..., STATX_BTIME)`, `O_TMPFILE`, and anonymous-inode linking through `/proc/self/fd` on an owned, real, exact-`0700` dedicated `TASKMUX_HOME`. Runtime commands fail closed without changing an unsafe home. It cannot preflight arbitrary future output filesystems; each publication checks its own destination and fails closed if unsupported. `setup` initializes `~/.taskmux`, checks tmux, and configures the default Agent and workspace. Run `taskmux` afterward to open the interactive dashboard.
 
 ## Quick start
 

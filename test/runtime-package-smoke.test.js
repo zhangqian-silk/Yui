@@ -5,10 +5,12 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  rmSync
+  rmSync,
+  cpSync,
+  symlinkSync
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 
@@ -23,6 +25,35 @@ test("source metadata is private while assembled runtime metadata is explicitly 
   assert.equal(source.private, true);
   assert.equal(source.files.includes("skills"), true);
   assert.equal(source.publishConfig?.registry, "https://registry.invalid/");
+});
+
+test("pack dry run rebuilds the host prebuild from a clean source copy", (t) => {
+  const root = process.cwd();
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "taskmux-pack-dry-run-clean-"));
+  const source = join(fixtureRoot, "source");
+  t.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+
+  cpSync(root, source, {
+    recursive: true,
+    filter: (path) => !isGeneratedOrDependencyPath(relative(root, path))
+  });
+  symlinkSync(join(root, "node_modules"), join(source, "node_modules"), "dir");
+  initializeFixtureRepository(source);
+
+  assert.equal(existsSync(join(source, "prebuilds")), false);
+  const output = execFileSync("npm", ["run", "pack:dry-run"], {
+    cwd: source,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      npm_config_cache: join(fixtureRoot, "npm-cache")
+    }
+  });
+
+  const target = `linux-${process.arch}-glibc/napi-v8/taskmux_storage_fs.node`;
+  assert.match(output, /Assembled runtime package:/);
+  assert.equal(existsSync(join(source, "prebuilds", target)), true);
+  assert.equal(existsSync(join(source, ".release-stage", "prebuilds", target)), true);
 });
 
 // This is intentionally a lifecycle-skipped package-content/context test. The release
@@ -135,4 +166,38 @@ function operatorRole() {
     responsibilities: [],
     constraints: []
   };
+}
+
+function isGeneratedOrDependencyPath(path) {
+  return [
+    ".git",
+    "node_modules",
+    "dist",
+    "prebuilds",
+    "native/build",
+    ".release-stage",
+    ".npm-cache"
+  ].some((ignored) => path === ignored || path.startsWith(`${ignored}/`));
+}
+
+function initializeFixtureRepository(directory) {
+  execFileSync("git", ["init"], { cwd: directory, encoding: "utf8" });
+  mkdirSync(join(directory, ".test-git-hooks"));
+  execFileSync("git", ["config", "core.hooksPath", ".test-git-hooks"], {
+    cwd: directory,
+    encoding: "utf8"
+  });
+  execFileSync("git", ["config", "user.name", "TaskMux package test"], {
+    cwd: directory,
+    encoding: "utf8"
+  });
+  execFileSync("git", ["config", "user.email", "taskmux-package-test@example.invalid"], {
+    cwd: directory,
+    encoding: "utf8"
+  });
+  execFileSync("git", ["add", "--all"], { cwd: directory, encoding: "utf8" });
+  execFileSync("git", ["commit", "--no-gpg-sign", "-m", "fixture"], {
+    cwd: directory,
+    encoding: "utf8"
+  });
 }

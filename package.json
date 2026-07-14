@@ -27,7 +27,7 @@
     "lint": "tsc -p tsconfig.json --noEmit",
     "verify:release-tag": "node scripts/verify-release-tag.mjs",
     "prepublishOnly": "node scripts/refuse-source-publish.mjs",
-    "pack:dry-run": "npm run build:ts && node scripts/assemble-runtime-package.mjs --host --output .release-stage && npm pack ./.release-stage --dry-run --ignore-scripts --cache ./.npm-cache"
+    "pack:dry-run": "npm run build && node scripts/assemble-runtime-package.mjs --host --output .release-stage && npm pack ./.release-stage --dry-run --ignore-scripts --cache ./.npm-cache"
   },
   "engines": {
     "node": "^20.17.0 || ^22.9.0 || ^24.0.0"

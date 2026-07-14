@@ -19,12 +19,13 @@ TaskMux 是面向长时间运行的原生 Agent CLI 会话的本地控制平面�
 ## 环境要求
 
 - Node.js 20.17+（20.x）、22.9+（22.x）或 24.x
-- 使用 glibc 且 Linux 内核 5.6 或更高版本的 x64 或 arm64
-- `TASKMUX_HOME` 所在文件系统以及每个外部输出目标所在文件系统均支持 `O_TMPFILE` 和对该匿名 inode 的链接，且 `/proc/self/fd` 已挂载并可访问
+- 使用 glibc 的 x64 或 arm64，Linux 内核须为上游 5.6 或更高版本，或为兼容的厂商回移版本；doctor 是权威的运行时探测
+- `TASKMUX_HOME` 所在文件系统以及每个外部输出目标所在文件系统均支持 `statx(..., STATX_BTIME)` 出生时间 identity、`O_TMPFILE` 和对该匿名 inode 的链接，且 `/proc/self/fd` 已挂载并可访问
+- `TASKMUX_HOME` 是专用的、当前用户拥有的真实目录且精确权限为 `0700`。它不能是文件系统根目录或操作系统账户主目录。`taskmux setup` 会以 `0700` 创建缺失路径组件，不会自动修改现有目录；修复现有的当前用户拥有目录前必须在真实 TTY 中显式确认
 - tmux
 - 至少一个原生 Agent CLI，例如 Codex CLI 或 Claude Code
 
-TaskMux 为每个受支持架构随包提供 N-API 8 存储 authority 预编译文件。该存储 authority 不会在安装时现场编译或下载；当前平台缺少精确预编译文件时会立即失败。原生存储和外部输出发布要求 Linux 内核 5.6 或更高版本并支持 `openat2(2)`，且相关存储或输出文件系统支持 `O_TMPFILE`，可通过已挂载且可访问的 `/proc/self/fd` 使用 `linkat(..., AT_SYMLINK_FOLLOW)` 链接该匿名 inode。TaskMux 不会模拟较弱的替代原语：不可用时操作会以 `ENOTSUP`/`EOPNOTSUPP` 失败关闭。运行时依赖仍可能执行各自的平台安装步骤。目前暂不支持基于 musl 的发行版和非 Linux 系统。
+TaskMux 为每个受支持架构随包提供 N-API 8 存储 authority 预编译文件。该存储 authority 不会在安装时现场编译或下载；当前平台缺少精确预编译文件时会立即失败。原生存储和外部输出发布依赖上游 Linux 内核 5.6 或更高版本或兼容的厂商回移版本所提供的能力：`openat2(2)`、相关文件系统的 `statx(..., STATX_BTIME)` 出生时间 identity、`O_TMPFILE`，以及通过已挂载且可访问的 `/proc/self/fd` 使用 `linkat(..., AT_SYMLINK_FOLLOW)` 链接匿名 inode。`taskmux doctor` 是权威的能力探测。TaskMux 不会模拟较弱的替代原语：原生系统调用的 `ENOSYS` 与 `EOPNOTSUPP` 会统一归一化为 `ENOTSUP`；procfd 描述符遍历缺失或不可访问时按实际 `ENOENT` 或 `EACCES` 归类为不支持，只有原始 `TASKMUX_HOME` 确实不存在时才归类为尚未 setup。运行时依赖仍可能执行各自的平台安装步骤。目前暂不支持基于 musl 的发行版和非 Linux 系统。
 
 ## 安装
 
@@ -33,7 +34,7 @@ npm install -g @zq-silk/taskmux
 taskmux setup
 ```
 
-安装后运行 `taskmux doctor`：它会检查精确的 Node LTS 版本线，并在 `TASKMUX_HOME` 上探测 `openat2`、`O_TMPFILE` 和通过 `/proc/self/fd` 链接匿名 inode 的能力。它无法预检未来任意外部输出文件系统；每次发布都会检查实际目标，不支持时失败关闭。`setup` 会初始化 `~/.taskmux`、检查 tmux，并配置默认 Agent 和工作目录。之后运行 `taskmux` 即可打开交互式看板。
+安装后运行 `taskmux doctor`：它会检查精确的 Node LTS 版本线，并在专用、当前用户拥有、真实且精确权限为 `0700` 的 `TASKMUX_HOME` 上探测 `openat2`、`statx(..., STATX_BTIME)`、`O_TMPFILE` 和通过 `/proc/self/fd` 链接匿名 inode 的能力。运行时命令遇到不安全的 home 会失败关闭且不会修改它。它无法预检未来任意外部输出文件系统；每次发布都会检查实际目标，不支持时失败关闭。`setup` 会初始化 `~/.taskmux`、检查 tmux，并配置默认 Agent 和工作目录。之后运行 `taskmux` 即可打开交互式看板。
 
 ## 快速开始
 
