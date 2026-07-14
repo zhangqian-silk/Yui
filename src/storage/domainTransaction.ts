@@ -1,23 +1,29 @@
 import {
   closeSync,
   constants,
-  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readdirSync,
   readFileSync,
-  rmSync
+  rmSync,
+  writeFileSync
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { types as utilTypes } from "node:util";
 import {
-  applyStagedDomainTransaction,
+  applyStagedDomainTransactionUnderBarrier,
+  assertDomainTransactionId,
+  assertExclusiveStorageRootPath,
   DomainTransactionRecoveryError,
-  stageDomainTransaction,
+  replayPendingDomainTransactionsUnderBarrier,
+  stageDomainTransactionUnderBarrier,
   type DomainTransactionOperation
 } from "./recoveryJournal.js";
+import { authoritativeStoragePaths } from "./authoritativeStorage.js";
 import {
   acquireStableAncestorExclusiveBarrier,
   acquireStableAncestorSharedBarrier,
@@ -30,19 +36,7 @@ import {
   type NativeStableAncestorBarrier
 } from "./nativeStorageFs.js";
 
-const AUTHORITATIVE_PATHS = [
-  "config.json",
-  "schema.json",
-  "agents",
-  "roles",
-  "tasks",
-  "trash",
-  "runtime/pending-wakeups",
-  "runtime/leader-failures",
-  "runtime/operator-notifications",
-  "runtime/role-sessions",
-  "runtime/active-runs"
-] as const;
+const MAX_TRANSACTION_COPY_BYTES = 16 * 1024 * 1024;
 
 const DIRECTORY_OPEN_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const SHARED_BARRIER_RETRY_MS = 10;
@@ -94,47 +88,56 @@ export function executeDomainTransaction<T>(
   extraOperations: (result: T) => DomainTransactionOperation[] = () => [],
   options: { includeBackups?: boolean; testFailAfterStage?: boolean } = {}
 ): T {
-  return withNativeRootBarrier(rootDir, "exclusive", () => {
-    const authoritativePaths = options.includeBackups
-      ? [...AUTHORITATIVE_PATHS, "backups"]
-      : [...AUTHORITATIVE_PATHS];
-    const workingRoot = join(rootDir, "runtime", "domain-workspaces", id);
-    rmSync(workingRoot, { recursive: true, force: true });
-    mkdirSync(workingRoot, { recursive: true });
-    copyAuthoritativeState(rootDir, workingRoot, authoritativePaths);
-
-    try {
-      const before = readAuthoritativeFiles(rootDir, authoritativePaths);
-      const beforeDirectories = readAuthoritativeDirectories(rootDir, authoritativePaths);
-      const result = withActiveDomainTransactionWorkingRoot(workingRoot, () => execute(workingRoot));
-      const after = readAuthoritativeFiles(workingRoot, authoritativePaths);
-      const afterDirectories = readAuthoritativeDirectories(workingRoot, authoritativePaths);
-      const operations = diffAuthoritativeFiles(
-        rootDir,
-        before,
-        after,
-        beforeDirectories,
-        afterDirectories
-      );
-      operations.push(...extraOperations(result));
-      if (operations.length > 0) {
-        stageDomainTransaction(rootDir, id, operations);
-        if (
-          options.testFailAfterStage === true ||
-          (
-            process.env.NODE_ENV === "test" &&
-            process.env.TASKMUX_TEST_ONLY_DOMAIN_TRANSACTION_FAILPOINT === "after-stage"
-          )
-        ) {
-          const interruption = new Error(`Domain transaction ${id} stopped after staging.`);
-          throw new DomainTransactionRecoveryError(id, interruption, interruption);
-        }
-        applyStagedDomainTransaction(rootDir, id);
+  assertDomainTransactionId(id);
+  return withNativeRootBarrier(rootDir, "exclusive", (root) => {
+    const rootIdentity = requireNativeWriterRoot(rootDir, root);
+    const authoritativePaths = authoritativeStoragePaths(options.includeBackups === true);
+    replayPendingDomainTransactionsUnderBarrier(rootDir, root.barrier);
+    assertExclusiveStorageRootPath(rootDir, root.barrier);
+    return withPinnedRootAt(root.barrier, ".", rootIdentity, (reader) => {
+      if (reader === undefined) {
+        throw new Error("TaskMux storage writer root disappeared.");
       }
-      return result;
-    } finally {
-      rmSync(workingRoot, { recursive: true, force: true });
-    }
+      const workingRoot = mkdtempSync(join(tmpdir(), "taskmux-domain-workspace-"));
+      try {
+        copyAuthoritativeStateFromReader(reader, workingRoot, authoritativePaths);
+        const before = readAuthoritativeFilesFromReader(reader, authoritativePaths);
+        const beforeDirectories = readAuthoritativeDirectoriesFromReader(reader, authoritativePaths);
+        const result = withActiveDomainTransactionWorkingRoot(workingRoot, () => execute(workingRoot));
+        const after = readAuthoritativeFiles(workingRoot, authoritativePaths);
+        const afterDirectories = readAuthoritativeDirectories(workingRoot, authoritativePaths);
+        const operations = diffAuthoritativeFiles(
+          rootDir,
+          before,
+          after,
+          beforeDirectories,
+          afterDirectories
+        );
+        operations.push(...extraOperations(result));
+        if (operations.length > 0) {
+          assertExclusiveStorageRootPath(rootDir, root.barrier);
+          stageDomainTransactionUnderBarrier(rootDir, root.barrier, id, operations, {
+            includeBackups: options.includeBackups === true
+          });
+          if (
+            options.testFailAfterStage === true ||
+            (
+              process.env.NODE_ENV === "test" &&
+              process.env.TASKMUX_TEST_ONLY_DOMAIN_TRANSACTION_FAILPOINT === "after-stage"
+            )
+          ) {
+            const interruption = new Error(`Domain transaction ${id} stopped after staging.`);
+            throw new DomainTransactionRecoveryError(id, interruption, interruption);
+          }
+          assertExclusiveStorageRootPath(rootDir, root.barrier);
+          applyStagedDomainTransactionUnderBarrier(rootDir, root.barrier, id);
+        }
+        assertExclusiveStorageRootPath(rootDir, root.barrier);
+        return result;
+      } finally {
+        rmSync(workingRoot, { recursive: true, force: true });
+      }
+    });
   });
 }
 
@@ -146,7 +149,29 @@ export function executeDomainExclusiveBarrier<T>(
   rootDir: string,
   execute: () => T
 ): T {
-  return withNativeRootBarrier(rootDir, "exclusive", () => execute());
+  return withNativeRootBarrier(rootDir, "exclusive", (root) => {
+    requireNativeWriterRoot(rootDir, root);
+    replayPendingDomainTransactionsUnderBarrier(rootDir, root.barrier);
+    assertExclusiveStorageRootPath(rootDir, root.barrier);
+    const result = execute();
+    assertExclusiveStorageRootPath(rootDir, root.barrier);
+    return result;
+  });
+}
+
+function requireNativeWriterRoot(
+  rootDir: string,
+  root: NativeRootBarrier
+): NativeExactIdentity {
+  if (root.rootRelativePath !== "." || root.rootIdentity === undefined) {
+    throw new Error("TaskMux storage writer root disappeared.");
+  }
+  assertExclusiveStorageRootPath(rootDir, root.barrier);
+  const current = inspectDirectoryAt(root.barrier, ".");
+  if (current === undefined) {
+    throw new Error("TaskMux storage writer root disappeared.");
+  }
+  return current;
 }
 
 export function hasActiveDomainTransactionAuthority(rootDir: string): boolean {
@@ -495,16 +520,69 @@ function collectDirectories(rootDir: string, target: string, directories: Set<st
   }
 }
 
-function copyAuthoritativeState(sourceRoot: string, targetRoot: string, authoritativePaths: string[]): void {
+function readAuthoritativeDirectoriesFromReader(
+  reader: NativePinnedRootReader,
+  authoritativePaths: string[]
+): Set<string> {
+  const directories = new Set<string>();
   for (const path of authoritativePaths) {
-    const source = join(sourceRoot, path);
-    if (!existsSync(source)) {
-      continue;
-    }
-    const target = join(targetRoot, path);
-    mkdirSync(dirname(target), { recursive: true });
-    cpSync(source, target, { recursive: true });
+    collectDirectoriesFromReader(reader, path, directories);
   }
+  return directories;
+}
+
+function collectDirectoriesFromReader(
+  reader: NativePinnedRootReader,
+  target: string,
+  directories: Set<string>
+): void {
+  const receipt = reader.lstat(target);
+  if (receipt === undefined) return;
+  if (isDirectoryReceipt(receipt)) {
+    directories.add(target);
+    for (const name of reader.readdir(target)) {
+      collectDirectoriesFromReader(reader, `${target}/${name}`, directories);
+    }
+    return;
+  }
+  if (!isFileReceipt(receipt)) {
+    throw new Error("Authoritative storage contains an unsupported entry.");
+  }
+}
+
+function copyAuthoritativeStateFromReader(
+  reader: NativePinnedRootReader,
+  targetRoot: string,
+  authoritativePaths: string[]
+): void {
+  for (const path of authoritativePaths) {
+    copyReaderEntry(reader, path, join(targetRoot, path));
+  }
+}
+
+function copyReaderEntry(
+  reader: NativePinnedRootReader,
+  source: string,
+  target: string
+): void {
+  const receipt = reader.lstat(source);
+  if (receipt === undefined) return;
+  if (isDirectoryReceipt(receipt)) {
+    mkdirSync(target, { recursive: true, mode: 0o700 });
+    for (const name of reader.readdir(source)) {
+      copyReaderEntry(reader, `${source}/${name}`, join(target, name));
+    }
+    return;
+  }
+  if (!isFileReceipt(receipt)) {
+    throw new Error("Authoritative storage contains an unsupported entry.");
+  }
+  const read = reader.readFileExact(source, MAX_TRANSACTION_COPY_BYTES);
+  if (!sameNativeReceipt(read.identity, receipt)) {
+    throw new Error("Authoritative storage changed during transaction copy.");
+  }
+  mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+  writeFileSync(target, read.bytes, { mode: 0o600 });
 }
 
 function readAuthoritativeFiles(rootDir: string, authoritativePaths: string[]): Map<string, string> {
@@ -513,6 +591,40 @@ function readAuthoritativeFiles(rootDir: string, authoritativePaths: string[]): 
     collectFiles(rootDir, join(rootDir, path), files);
   }
   return files;
+}
+
+function readAuthoritativeFilesFromReader(
+  reader: NativePinnedRootReader,
+  authoritativePaths: string[]
+): Map<string, string> {
+  const files = new Map<string, string>();
+  for (const path of authoritativePaths) {
+    collectFilesFromReader(reader, path, files);
+  }
+  return files;
+}
+
+function collectFilesFromReader(
+  reader: NativePinnedRootReader,
+  target: string,
+  files: Map<string, string>
+): void {
+  const receipt = reader.lstat(target);
+  if (receipt === undefined) return;
+  if (isFileReceipt(receipt)) {
+    const read = reader.readFileExact(target, MAX_TRANSACTION_COPY_BYTES);
+    if (!sameNativeReceipt(read.identity, receipt)) {
+      throw new Error("Authoritative storage changed during transaction read.");
+    }
+    files.set(target, read.bytes.toString("utf8"));
+    return;
+  }
+  if (!isDirectoryReceipt(receipt)) {
+    throw new Error("Authoritative storage contains an unsupported entry.");
+  }
+  for (const name of reader.readdir(target)) {
+    collectFilesFromReader(reader, `${target}/${name}`, files);
+  }
 }
 
 function collectFiles(rootDir: string, target: string, files: Map<string, string>): void {
@@ -532,6 +644,23 @@ function collectFiles(rootDir: string, target: string, files: Map<string, string
       files.set(relative(rootDir, path), readFileSync(path, "utf8"));
     }
   }
+}
+
+function isDirectoryReceipt(receipt: { mode: bigint }): boolean {
+  return (receipt.mode & 0o170000n) === 0o040000n;
+}
+
+function isFileReceipt(receipt: { mode: bigint }): boolean {
+  return (receipt.mode & 0o170000n) === 0o100000n;
+}
+
+function sameNativeReceipt(
+  left: { dev: bigint; ino: bigint; birthtimeNs: bigint; uid: bigint; mode: bigint; nlink: bigint; size: bigint },
+  right: { dev: bigint; ino: bigint; birthtimeNs: bigint; uid: bigint; mode: bigint; nlink: bigint; size: bigint }
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino &&
+    left.birthtimeNs === right.birthtimeNs && left.uid === right.uid &&
+    left.mode === right.mode && left.nlink === right.nlink && left.size === right.size;
 }
 
 function diffAuthoritativeFiles(

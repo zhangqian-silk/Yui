@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import {
   closeSync,
   constants,
+  existsSync,
   fstatSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
@@ -12,7 +14,7 @@ import {
   symlinkSync,
   writeFileSync
 } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -89,7 +91,8 @@ test("native storage exposes the final opaque barrier and fd-relative API", () =
     "withPinnedRootAt",
     "publishAnonymousFileNoReplace",
     "linkPreparedFileNoReplace",
-    "renameNoReplaceExact"
+    "renameNoReplaceExact",
+    "removeExactEntry"
   ]) {
     assert.equal(typeof nativeStorage[name], "function", `${name} must be public`);
   }
@@ -401,3 +404,202 @@ test("fd-relative publication rejects a prepared-source final-component replacem
   ), undefined);
   nativeStorage.releaseStableAncestorBarrier(barrier);
 });
+
+test("exact native removal rejects final-component replacement for files and directories", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "taskmux-native-exact-remove-"));
+  const parent = join(root, "parent");
+  const movedFile = join(root, "moved-file.txt");
+  const movedDirectory = join(root, "moved-directory");
+  mkdirSync(parent);
+  const descriptor = openSync(root, DIRECTORY_FLAGS);
+  t.after(() => {
+    closeSync(descriptor);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const barrier = nativeStorage.acquireStableAncestorExclusiveBarrier(
+    descriptor,
+    exactIdentity(descriptor)
+  );
+  if (!requireOpenat2(t, barrier)) {
+    nativeStorage.releaseStableAncestorBarrier(barrier);
+    return;
+  }
+
+  const filePath = join(parent, "target.txt");
+  writeFileSync(filePath, "original file\n", { mode: 0o600 });
+  const parentForFile = nativeStorage.inspectDirectoryAt(barrier, "parent");
+  const fileReceipt = nativeStorage.withPinnedRootAt(
+    barrier,
+    "parent",
+    parentForFile,
+    (reader) => reader.lstat("target.txt")
+  );
+  assert.notEqual(fileReceipt, undefined);
+  renameSync(filePath, movedFile);
+  writeFileSync(filePath, "attacker file\n", { mode: 0o600 });
+
+  assert.throws(
+    () => nativeStorage.removeExactEntry(
+      barrier,
+      "parent",
+      parentForFile,
+      "target.txt",
+      fileReceipt,
+      "file",
+      parentForFile
+    ),
+    (error) => error.code === "ESTALE" && error.stage === "openat2-target"
+  );
+  assert.equal(readFileSync(filePath, "utf8"), "attacker file\n");
+  assert.equal(readFileSync(movedFile, "utf8"), "original file\n");
+
+  const directoryPath = join(parent, "target-directory");
+  mkdirSync(directoryPath);
+  const parentForDirectory = nativeStorage.inspectDirectoryAt(barrier, "parent");
+  const directoryReceipt = nativeStorage.withPinnedRootAt(
+    barrier,
+    "parent",
+    parentForDirectory,
+    (reader) => reader.lstat("target-directory")
+  );
+  assert.notEqual(directoryReceipt, undefined);
+  renameSync(directoryPath, movedDirectory);
+  mkdirSync(directoryPath);
+
+  assert.throws(
+    () => nativeStorage.removeExactEntry(
+      barrier,
+      "parent",
+      parentForDirectory,
+      "target-directory",
+      directoryReceipt,
+      "directory",
+      parentForDirectory
+    ),
+    (error) => error.code === "ESTALE" && error.stage === "openat2-target"
+  );
+  assert.equal(lstatSync(directoryPath).isDirectory(), true);
+  assert.equal(lstatSync(movedDirectory).isDirectory(), true);
+  nativeStorage.releaseStableAncestorBarrier(barrier);
+});
+
+test("native exact retirement restores a foreign final-component swap at rename syscall", async (t) => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "taskmux-native-rename-pause-"));
+  const preload = join(fixtureRoot, "renameat2-pause.so");
+  execFileSync("cc", [
+    "-shared",
+    "-fPIC",
+    "-o",
+    preload,
+    join(process.cwd(), "test", "fixtures", "renameat2-pause.c"),
+    "-ldl"
+  ]);
+  t.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+
+  for (const kind of ["file", "directory"]) {
+    const root = mkdtempSync(join(tmpdir(), `taskmux-native-retirement-${kind}-`));
+    const stage = join(root, "stage");
+    const source = join(root, `source-${kind}`);
+    const original = join(fixtureRoot, `${kind}-original`);
+    const marker = join(fixtureRoot, `${kind}.marker`);
+    mkdirSync(stage);
+    if (kind === "file") {
+      writeFileSync(source, "original bytes\n", { mode: 0o600 });
+    } else {
+      mkdirSync(source);
+    }
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+
+    const script = `
+      import { closeSync, constants, fstatSync, openSync } from "node:fs";
+      import * as nativeStorage from ${JSON.stringify(
+        new URL("../dist/storage/nativeStorageFs.js", import.meta.url).href
+      )};
+      const descriptor = openSync(${JSON.stringify(root)},
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      const rootIdentity = fstatSync(descriptor, { bigint: true });
+      const barrier = nativeStorage.acquireStableAncestorExclusiveBarrier(descriptor, {
+        dev: rootIdentity.dev, ino: rootIdentity.ino, uid: rootIdentity.uid,
+        mode: rootIdentity.mode, nlink: rootIdentity.nlink, birthtimeNs: rootIdentity.birthtimeNs
+      });
+      try {
+        const stage = nativeStorage.inspectDirectoryAt(barrier, "stage");
+        const source = nativeStorage.withPinnedRootAt(
+          barrier,
+          ".",
+          nativeStorage.inspectDirectoryAt(barrier, "."),
+          (reader) => reader.lstat(${JSON.stringify(`source-${kind}`)})
+        );
+        nativeStorage.renameNoReplaceExact(
+          barrier,
+          ".",
+          nativeStorage.inspectDirectoryAt(barrier, "."),
+          ${JSON.stringify(`source-${kind}`)},
+          source,
+          "stage",
+          stage,
+          "retired"
+        );
+        process.stdout.write("unexpected-success");
+      } catch (error) {
+        process.stdout.write(JSON.stringify({ code: error.code, stage: error.stage, state: error.state }));
+      } finally {
+        nativeStorage.releaseStableAncestorBarrier(barrier);
+        closeSync(descriptor);
+      }
+    `;
+    const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        NODE_TEST_CONTEXT: undefined,
+        LD_PRELOAD: preload,
+        TASKMUX_TEST_RENAMEAT2_MARKER: marker,
+        TASKMUX_TEST_RENAMEAT2_TARGET: "retired"
+      }
+    });
+    await waitForPath(marker);
+    renameSync(source, original);
+    if (kind === "file") {
+      writeFileSync(source, "attacker bytes\n", { mode: 0o600 });
+    } else {
+      mkdirSync(source);
+    }
+    const result = await childResult(child);
+    assert.equal(result.code, 0, result.stderr);
+    const failure = JSON.parse(result.stdout);
+    assert.equal(failure.code, "ESTALE");
+    assert.equal(failure.stage, "verify-target");
+    assert.equal(failure.state, "source-restored");
+    assert.equal(existsSync(join(stage, "retired")), false);
+    if (kind === "file") {
+      assert.equal(readFileSync(source, "utf8"), "attacker bytes\n");
+      assert.equal(readFileSync(original, "utf8"), "original bytes\n");
+    } else {
+      assert.equal(lstatSync(source).isDirectory(), true);
+      assert.equal(lstatSync(original).isDirectory(), true);
+    }
+  }
+});
+
+async function waitForPath(path) {
+  const deadline = Date.now() + 5_000;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${path}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function childResult(child) {
+  return new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk) => { stdout += chunk; });
+    child.stderr?.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code) => resolve({ code, stdout, stderr }));
+  });
+}

@@ -113,6 +113,15 @@ type NativeStorageFsBinding = {
     expectedTargetParent: NativeExactIdentity,
     targetName: string
   ): NativePublicationReceipt;
+  removeExactEntry(
+    barrier: NativeStableAncestorBarrier,
+    parentRelativePath: string,
+    expectedParentBefore: NativeExactIdentity,
+    targetName: string,
+    expectedTarget: NativePublicationReceipt,
+    kind: "file" | "directory",
+    expectedParentAfter: NativeExactIdentity
+  ): NativeExactIdentity;
 };
 
 type BindingFailure = {
@@ -141,7 +150,8 @@ const REQUIRED_EXPORTS = Object.freeze([
   "releasePinnedDirectory",
   "publishAnonymousFileNoReplace",
   "linkPreparedFileNoReplace",
-  "renameNoReplaceExact"
+  "renameNoReplaceExact",
+  "removeExactEntry"
 ]);
 
 let loadedBinding: NativeStorageFsBinding | undefined;
@@ -335,6 +345,36 @@ export function renameNoReplaceExact(
     targetParentRelativePath,
     expectedTargetParent,
     targetName
+  );
+}
+
+/**
+ * Removes a TaskMux-private, descriptor-relative cleanup entry.
+ *
+ * Authoritative public targets must retire through renameNoReplaceExact so a
+ * source swapped at the final component is restored or quarantined instead
+ * of being unlinked.
+ */
+export function removeExactEntry(
+  barrier: NativeStableAncestorBarrier,
+  parentRelativePath: string,
+  expectedParentBefore: NativeExactIdentity,
+  targetName: string,
+  expectedTarget: NativePublicationReceipt,
+  kind: "file" | "directory",
+  expectedParentAfter: NativeExactIdentity
+): NativeExactIdentity {
+  return loadBinding({
+    kind: "external-publication",
+    state: "not-published"
+  }).removeExactEntry(
+    barrier,
+    parentRelativePath,
+    expectedParentBefore,
+    targetName,
+    expectedTarget,
+    kind,
+    expectedParentAfter
   );
 }
 

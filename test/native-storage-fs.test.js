@@ -123,7 +123,8 @@ test("native storage authority exports one exact final ABI", () => {
       "readdirPinnedDirectory",
       "releasePinnedDirectory",
       "releaseStableAncestorBarrier",
-      "renameNoReplaceExact"
+      "renameNoReplaceExact",
+      "removeExactEntry"
     ].sort()
   );
 });
