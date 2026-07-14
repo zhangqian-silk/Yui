@@ -22,6 +22,10 @@ import {
   type NativeStableAncestorBarrier
 } from "../storage/nativeStorageFs.js";
 import type { CommandExecutor } from "../tmux/commandExecutor.js";
+import {
+  STORAGE_PATH_REGISTRY,
+  backupAuthoritativeStoragePaths
+} from "../storage/authoritativeStorage.js";
 
 const SUPPORTED_NODE_DETAIL = "requires Node.js 20.17+ (20.x), 22.9+ (22.x), or 24.x";
 const NATIVE_STORAGE_REQUIREMENT =
@@ -63,6 +67,7 @@ export function getDoctorChecks(
       ? checkDefaultAgent(storageSchema, storageFacts)
       : taskmuxHomeBlockedCheck("default agent", taskmuxHome),
     checkStorageSchema(storageSchema),
+    checkPhysicalMaintenance(storageSchema),
     taskmuxHomeReady
       ? checkStoragePermissions(rootDir)
       : taskmuxHomeBlockedCheck("storage permissions", taskmuxHome),
@@ -70,6 +75,38 @@ export function getDoctorChecks(
       ? checkStorageRecords(storageSchema, storageFacts)
       : taskmuxHomeBlockedCheck("storage records", taskmuxHome)
   ];
+}
+
+function checkPhysicalMaintenance(state: StorageSchemaState): DoctorCheck {
+  if (state.status === "uninitialized") {
+    return { name: "physical maintenance", status: "missing", detail: "run taskmux setup" };
+  }
+  if (state.status === "unsupported") {
+    return {
+      name: "physical maintenance",
+      status: "unsupported",
+      detail: `current=${state.currentVersion} latest=${state.latestVersion}`
+    };
+  }
+  if (state.status === "invalid") {
+    return { name: "physical maintenance", status: "invalid", detail: state.detail };
+  }
+
+  const paths = backupAuthoritativeStoragePaths();
+  const contractValid = paths.includes("config.json") && paths.includes("schema.json") &&
+    !paths.includes("backups") && STORAGE_PATH_REGISTRY.some((entry) =>
+      entry.path === "runtime/domain-staging" && entry.physicalBackup === "exclude");
+  return contractValid
+    ? {
+        name: "physical maintenance",
+        status: "ok",
+        detail: `${paths.length} authoritative paths; backup/restore/rollback/prune registry ready`
+      }
+    : {
+        name: "physical maintenance",
+        status: "invalid",
+        detail: "physical maintenance registry is incomplete"
+      };
 }
 
 type DoctorStorageFacts = Readonly<{

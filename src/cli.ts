@@ -9,7 +9,12 @@ import { runConfigCommand } from "./commands/configCommands.js";
 import { ensureControllerRunning, runControllerCommand } from "./commands/controllerCommands.js";
 import { callController } from "./controller/controller.js";
 import { runGlobalRoleCommand } from "./commands/globalRoleCommands.js";
-import { runExportCommand, runImportCommand, runPruneCommand } from "./commands/maintenanceCommands.js";
+import {
+  executePruneCommand,
+  executeRestoreCommand,
+  runExportCommand,
+  runImportCommand
+} from "./commands/maintenanceCommands.js";
 import { recordTaskRoleAttached, runTaskCommand } from "./commands/taskCommands.js";
 import { runDashboard } from "./dashboard/dashboard.js";
 import { getDoctorChecks, renderDoctor, runDoctor } from "./doctor/doctor.js";
@@ -17,10 +22,7 @@ import { CliError, dataError, usageError } from "./errors/cliError.js";
 import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
 import { runTaskShell } from "./shell/taskShell.js";
 import { FileTaskStore, resolveTaskmuxHome } from "./storage/taskStore.js";
-import {
-  executeDomainExclusiveBarrier,
-  executeDomainTransaction
-} from "./storage/domainTransaction.js";
+import { executeDomainTransaction } from "./storage/domainTransaction.js";
 import {
   inspectStorageSchema,
   requireStorageSchema
@@ -183,7 +185,27 @@ async function main(): Promise<void> {
       await printControllerCommand(rootDir, "backup", []);
       return;
     }
-    emit(executeDomainExclusiveBarrier(rootDir, () => runBackupCommand(rootDir)));
+    emit(executeDirectDomainCommand(
+      rootDir,
+      "backup",
+      (_transactionStore, workingRoot) => runBackupCommand(workingRoot, rootDir),
+      { includeBackups: true }
+    ));
+    return;
+  }
+
+  if (args[0] === "restore") {
+    requireStorageSchema(rootDir);
+    const restoreArgs = await confirmPhysicalRestore(args.slice(1));
+    if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
+      await printControllerCommand(rootDir, "restore", restoreArgs);
+      return;
+    }
+    emit(executeRestoreCommand(
+      rootDir,
+      `cli-restore-${randomUUID()}`,
+      restoreArgs
+    ).output);
     return;
   }
 
@@ -251,11 +273,10 @@ async function main(): Promise<void> {
       await printControllerCommand(rootDir, "prune", args.slice(1));
       return;
     }
-    emit(executeDirectDomainCommand(
+    emit(executePruneCommand(
       rootDir,
-      "prune",
-      (_transactionStore, workingRoot) => runPruneCommand(args.slice(1), workingRoot),
-      { includeBackups: true }
+      `cli-prune-${randomUUID()}`,
+      args.slice(1)
     ));
     return;
   }
@@ -469,6 +490,33 @@ async function resolveTerminalArguments(
 
 function resolveCliIdentity(env: NodeJS.ProcessEnv): CliIdentity {
   return env.TASKMUX_CLI_NAME === "taskmux-dev" ? "taskmux-dev" : "taskmux";
+}
+
+async function confirmPhysicalRestore(commandArgs: string[]): Promise<string[]> {
+  if (commandArgs.includes("--force") || commandArgs[0] === undefined ||
+      commandArgs[0].startsWith("--")) {
+    return commandArgs;
+  }
+  if (jsonOutput || (process.stdin.isTTY !== true &&
+      process.env.TASKMUX_MAINTENANCE_INTERACTIVE !== "1")) {
+    throw usageError("Physical restore requires interactive confirmation or --force.");
+  }
+
+  const backupId = commandArgs[0];
+  const readline = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: process.stdin.isTTY === true
+  });
+  try {
+    const answer = await readline.question(`Type ${backupId} to restore this backup: `);
+    if (answer.trim() !== backupId) {
+      throw usageError("Physical restore confirmation did not match the backup id.");
+    }
+  } finally {
+    readline.close();
+  }
+  return [...commandArgs, "--force"];
 }
 
 async function attachTaskRoleThroughController(
