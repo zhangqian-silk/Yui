@@ -32,7 +32,6 @@ import {
   linkPreparedFileNoReplace,
   mkdirExactNoReplace,
   publishAnonymousFileNoReplace,
-  removeExactEntry,
   renameNoReplaceExact,
   releaseStableAncestorBarrier,
   withPinnedRootAt,
@@ -1386,29 +1385,28 @@ function removeDomainTransactionReceipts(
   if (complete === undefined) {
     throw new Error("Domain transaction completion receipt is missing.");
   }
-  let parent = inspectRequiredDirectory(barrier, directory);
+  const quarantineDirectory = preparedGenerationRelative(completeTransaction);
+  const retire = (receipt: { relativePath: string; receipt: NativePublicationReceipt }): void => {
+    renameNoReplaceExact(
+      barrier,
+      directory,
+      inspectRequiredDirectory(barrier, directory),
+      basenameOf(receipt.relativePath),
+      receipt.receipt,
+      quarantineDirectory,
+      inspectRequiredDirectory(barrier, quarantineDirectory),
+      `receipt-quarantine-${randomUUID()}`
+    );
+  };
   for (const receipt of receipts
     .filter((candidate) => candidate.relativePath !== completeRelative)
     .sort((left, right) => right.revision - left.revision)) {
-    parent = removeExactEntry(
-      barrier,
-      directory,
-      parent,
-      basenameOf(receipt.relativePath),
-      receipt.receipt,
-      "file",
-      parent
-    );
+    retire(receipt);
   }
-  removeExactEntry(
-    barrier,
-    directory,
-    parent,
-    basenameOf(complete.relativePath),
-    complete.receipt,
-    "file",
-    parent
-  );
+  // Retire the terminal receipt last so an interrupted cleanup remains
+  // restartable. Retired receipts stay in the transaction-private quarantine;
+  // no pathname unlink can consume a replacement at the public receipt name.
+  retire(complete);
 }
 
 function isDomainTransaction(value: unknown, id: string): value is DomainTransaction {

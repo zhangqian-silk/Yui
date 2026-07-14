@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
 import {
   existsSync,
   lstatSync,
@@ -102,6 +103,76 @@ test("immutable v3 receipt replacement fails closed without overwriting the fore
   );
   assert.equal(readFileSync(join(directory, latestName), "utf8"), "foreign receipt\n");
   assert.equal(readFileSync(target, "utf8"), "before\n");
+});
+
+test("immutable receipt cleanup preserves a foreign syscall-window replacement", async (t) => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "taskmux-receipt-cleanup-pause-"));
+  const preload = join(fixtureRoot, "entry-mutation-pause.so");
+  const marker = join(fixtureRoot, "mutation.marker");
+  execFileSync("cc", [
+    "-shared",
+    "-fPIC",
+    "-o",
+    preload,
+    join(process.cwd(), "test", "fixtures", "renameat2-pause.c"),
+    "-ldl"
+  ]);
+  const home = mkdtempSync(join(tmpdir(), "taskmux-receipt-cleanup-race-"));
+  t.after(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  });
+  const target = join(home, "config.json");
+  writeFileSync(target, "before\n", { mode: 0o600 });
+  stageDomainTransaction(home, "cleanup-race", [
+    { type: "write", target, content: "after\n" }
+  ]);
+
+  const script = `
+    import { applyStagedDomainTransaction } from ${JSON.stringify(
+      new URL("../dist/storage/recoveryJournal.js", import.meta.url).href
+    )};
+    try {
+      applyStagedDomainTransaction(${JSON.stringify(home)}, "cleanup-race");
+      process.stdout.write(JSON.stringify({ name: "unexpected-success" }));
+    } catch (error) {
+      const cause = error.initialError ?? error;
+      process.stdout.write(JSON.stringify({
+        name: error.name,
+        code: cause.code,
+        stage: cause.stage,
+        state: cause.state
+      }));
+    }
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      NODE_TEST_CONTEXT: undefined,
+      LD_PRELOAD: preload,
+      TASKMUX_TEST_ENTRY_MUTATION_MARKER: marker,
+      TASKMUX_TEST_ENTRY_MUTATION_SOURCE_PREFIX: "cleanup-race."
+    }
+  });
+  const receiptName = await waitForMarkerValue(marker);
+  const directory = join(home, "runtime", "domain-transactions");
+  const receipt = join(directory, receiptName);
+  const original = join(directory, `${receiptName}.original`);
+  renameSync(receipt, original);
+  writeFileSync(receipt, "foreign receipt\n", { mode: 0o600 });
+
+  const result = await childResult(child);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    name: "DomainTransactionRecoveryError",
+    code: "ESTALE",
+    stage: "verify-target",
+    state: "source-restored"
+  });
+  assert.equal(readFileSync(receipt, "utf8"), "foreign receipt\n");
+  assert.notEqual(readFileSync(original, "utf8"), "foreign receipt\n");
+  assert.equal(readFileSync(target, "utf8"), "after\n");
 });
 
 test("replay resumes a crash between immutable metadata publications", (t) => {
@@ -222,4 +293,30 @@ function latestDomainReceipt(home, id) {
   return entries.reduce((latest, entry) =>
     latest === undefined || entry.revision > latest.revision ? entry : latest
   );
+}
+
+async function waitForMarkerValue(path) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) {
+      const value = readFileSync(path, "utf8").trim();
+      if (value.length > 0) return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${path}`);
+}
+
+async function childResult(child) {
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const code = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", resolve);
+  });
+  return { code, stdout, stderr };
 }
