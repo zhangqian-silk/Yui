@@ -29,6 +29,7 @@ export function prepareGlobalRoleLaunch(
     baseEnv?: NodeJS.ProcessEnv;
     session?: RoleAgentSession | null;
     permissionBroadeningConfirmed?: boolean;
+    launchToken?: string;
   } = {}
 ): OperatorLaunch {
   const binding = activeRoleAgentBinding(role);
@@ -120,7 +121,9 @@ export function prepareGlobalRoleLaunch(
       TASKMUX_AGENT_ID: binding.agentId,
       TASKMUX_ADAPTER_ID: binding.adapterId,
       TASKMUX_NATIVE_SESSION_ROOT: nativeSessionRoot,
-      TASKMUX_WORKSPACE: role.workspace
+      TASKMUX_WORKSPACE: role.workspace,
+      ...(session === null ? {} : { TASKMUX_NATIVE_SESSION_ID: session.nativeSessionId }),
+      ...(options.launchToken === undefined ? {} : { TASKMUX_OPERATOR_LAUNCH_TOKEN: options.launchToken })
     };
     return {
       command: agent.command,
@@ -140,7 +143,9 @@ export function prepareGlobalRoleLaunch(
     TASKMUX_ADAPTER_ID: binding.adapterId,
     TASKMUX_NATIVE_SESSION_ROOT: resolveAgentSessionRoot(binding.adapterId, baseEnv),
     TASKMUX_WORKSPACE: role.workspace,
-    TASKMUX_OPERATOR_CONTEXT: contextPath
+    TASKMUX_OPERATOR_CONTEXT: contextPath,
+    ...(session === null ? {} : { TASKMUX_NATIVE_SESSION_ID: session.nativeSessionId }),
+    ...(options.launchToken === undefined ? {} : { TASKMUX_OPERATOR_LAUNCH_TOKEN: options.launchToken })
   };
 
   return {
@@ -187,7 +192,8 @@ Rules:
 - Do not edit files under \`TASKMUX_HOME\` directly unless the user explicitly asks for low-level storage repair.
 - Prefer \`taskmux task board --with-roles\`, \`taskmux task list\`, \`taskmux role list\`, and \`taskmux config show\` to inspect current state.
 - Every task has a protected \`leader\` role. The global \`operator\` and \`leader\` roles are system roles.
-- Use input draft and submit as separate steps unless user intent is already explicit.
+- For user decisions, use only \`taskmux task input request\`, \`taskmux task input list\`, \`taskmux task input show\`, \`taskmux task input answer\`, and \`taskmux task input cancel\`. \`list\` is the Global Inbox query over Task-owned requests.
+- As the foreground Operator, inspect and answer explicit user decisions only; the exact active Leader origin creates or cancels requests, and a delivery receipt is not an answer.
 - Never act as a Task Leader or independent worker.
 
 Environment:

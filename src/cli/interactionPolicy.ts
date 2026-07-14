@@ -10,6 +10,10 @@ export type CandidateProviderName =
   | "unarchived-tasks"
   | "archived-tasks"
   | "tasks-with-input-drafts"
+  | "input-requests"
+  | "open-input-requests"
+  | "task-open-input-requests"
+  | "input-answer-choices"
   | "trashed-tasks"
   | "task-roles"
   | "task-roles-with-transcripts"
@@ -24,7 +28,17 @@ export type CandidateProviderName =
   | "work-items"
   | "dispatch-work-items"
   | "active-decisions";
-export type SelectableEntity = "agent" | "global-role" | "task" | "task-role" | "topic" | "cycle" | "work-item" | "decision";
+export type SelectableEntity =
+  | "agent"
+  | "global-role"
+  | "task"
+  | "task-role"
+  | "topic"
+  | "cycle"
+  | "work-item"
+  | "decision"
+  | "input-request"
+  | "input-answer";
 export type TrailingOptionKind = "flag" | "value" | "option-like-value";
 
 export type ArgumentSelector = {
@@ -295,6 +309,60 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = [
     selectors: [
       { argumentIndex: 3, entity: "task", provider: "tasks-with-input-drafts", actionTarget: true }
     ]
+  },
+  {
+    commandPath: ["task", "input", "request"],
+    selectors: [
+      { argumentIndex: 3, entity: "task", provider: "unarchived-tasks", actionTarget: true }
+    ],
+    trailingOptions: {
+      "--question": "value",
+      "--choice": "value",
+      "--blocks": "value",
+      "--policy": "value",
+      "--recommend": "value",
+      "--recommendation-reason": "value",
+      "--timeout": "value"
+    },
+    requiredOptions: ["--question"]
+  },
+  {
+    commandPath: ["task", "input", "show"],
+    selectors: [
+      { argumentIndex: 3, entity: "input-request", provider: "input-requests", actionTarget: true }
+    ],
+    trailingOptions: { "--task": "value" }
+  },
+  {
+    commandPath: ["task", "input", "answer"],
+    selectors: [
+      { argumentIndex: 3, entity: "input-request", provider: "open-input-requests", actionTarget: true },
+      {
+        option: "--choice",
+        requiredOption: true,
+        entity: "input-answer",
+        provider: "input-answer-choices",
+        dependsOn: 3,
+        unlessOption: "--text",
+        actionTarget: false
+      }
+    ],
+    trailingOptions: { "--task": "value", "--choice": "value", "--text": "value" }
+  },
+  {
+    commandPath: ["task", "input", "cancel"],
+    selectors: [
+      { argumentIndex: 3, entity: "task", provider: "unarchived-tasks", actionTarget: true },
+      {
+        argumentIndex: 4,
+        entity: "input-request",
+        provider: "task-open-input-requests",
+        dependsOn: 3,
+        actionTarget: true
+      }
+    ],
+    trailingOptions: { "--reason": "value" },
+    requiredOptions: ["--reason"]
   },
   {
     commandPath: ["task", "cycle", "end"],
@@ -572,7 +640,10 @@ function providerSupports(provider: CandidateProviderName, entity: SelectableEnt
     || provider === "task-topics" && entity === "topic"
     || provider === "active-cycles" && entity === "cycle"
     || ["open-work-items", "work-items", "dispatch-work-items"].includes(provider) && entity === "work-item"
-    || provider === "active-decisions" && entity === "decision";
+    || provider === "active-decisions" && entity === "decision"
+    || ["input-requests", "open-input-requests", "task-open-input-requests"].includes(provider)
+      && entity === "input-request"
+    || provider === "input-answer-choices" && entity === "input-answer";
 }
 
 function findPath(root: CommandNode, path: readonly string[]): CommandNode | undefined {

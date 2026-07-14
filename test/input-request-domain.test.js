@@ -21,6 +21,7 @@ function requester(overrides = {}) {
     roleName: "leader",
     agentId: "codex",
     adapterId: "codex",
+    sessionRoot: "/tmp",
     nativeSessionId: "session-1",
     agentRunId: "agent-run-1",
     ...overrides

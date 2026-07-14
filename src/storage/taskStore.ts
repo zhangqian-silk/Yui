@@ -42,6 +42,8 @@ import { assertRuntimeOperationAllowsMutation } from "../executor/roleRuntimeOpe
 import type { TaskInputDraft } from "../input/taskInput.js";
 import type { InputRequest, InputResolution } from "../input/inputRequest.js";
 import { isInputRequestRecord, isInputResolutionRecord } from "../input/inputRecordCodec.js";
+import type { OperatorDelivery } from "../operator/operatorDelivery.js";
+import { isOperatorDelivery } from "../operator/operatorDelivery.js";
 import type { GlobalRole, Role } from "../role/role.js";
 import type { ChildRole } from "../role/childRole.js";
 import type { AgentRun } from "../run/agentRun.js";
@@ -53,6 +55,10 @@ import {
   type ProbeExecutablePin
 } from "../agent/agent.js";
 import { pendingWakeupsMatch, type PendingWakeup } from "../scheduler/pendingWakeup.js";
+import type { OfflineResolutionClock } from "../scheduler/offlineResolutionClock.js";
+import { isOfflineResolutionClock } from "../scheduler/offlineResolutionClock.js";
+import type { InputResolutionWakeup } from "../scheduler/inputResolutionWakeup.js";
+import { isInputResolutionWakeup } from "../scheduler/inputResolutionWakeup.js";
 import type { LeaderFailure } from "../scheduler/leaderFailure.js";
 import type { OperatorNotification } from "../scheduler/operatorNotification.js";
 import type { TaskSchedule } from "../scheduler/taskSchedule.js";
@@ -162,6 +168,18 @@ export type TaskStore = {
   getInputResolution(taskId: string, resolutionId: string): InputResolution | null;
   listInputResolutions(taskId: string): InputResolution[];
   saveInputResolution(resolution: InputResolution): void;
+  getOperatorDelivery(deliveryId: string): OperatorDelivery | null;
+  listOperatorDeliveries(): OperatorDelivery[];
+  saveOperatorDelivery(delivery: OperatorDelivery): void;
+  getOfflineResolutionClock(taskId: string, requestId: string): OfflineResolutionClock | null;
+  listOfflineResolutionClocks(): OfflineResolutionClock[];
+  saveOfflineResolutionClock(clock: OfflineResolutionClock): void;
+  clearOfflineResolutionClock(taskId: string, requestId: string): void;
+  clearAllOfflineResolutionClocks(): void;
+  getInputResolutionWakeup(taskId: string, requestId: string): InputResolutionWakeup | null;
+  listInputResolutionWakeups(): InputResolutionWakeup[];
+  saveInputResolutionWakeup(wakeup: InputResolutionWakeup): void;
+  clearInputResolutionWakeup(taskId: string, requestId: string): void;
   getPendingWakeup(taskId: string): PendingWakeup | null;
   savePendingWakeup(wakeup: PendingWakeup): void;
   listPendingWakeups(): PendingWakeup[];
@@ -289,6 +307,12 @@ export type TaskReader = Pick<TaskStore,
   | "listInputRequests"
   | "getInputResolution"
   | "listInputResolutions"
+  | "getOperatorDelivery"
+  | "listOperatorDeliveries"
+  | "getOfflineResolutionClock"
+  | "listOfflineResolutionClocks"
+  | "getInputResolutionWakeup"
+  | "listInputResolutionWakeups"
   | "getPendingWakeup"
   | "listPendingWakeups"
   | "getLeaderFailure"
@@ -1086,6 +1110,114 @@ export class FileTaskStore implements TaskStore {
       this.inputResolutionFile(encoded.record.taskId, encoded.record.id),
       encoded.content
     );
+  }
+
+  getOperatorDelivery(deliveryId: string): OperatorDelivery | null {
+    assertInputPointerId(deliveryId, "operator delivery");
+    const raw = this.readOptionalText(this.operatorDeliveryFile(deliveryId));
+    return raw === null ? null : parseOperatorDelivery(deliveryId, raw);
+  }
+
+  listOperatorDeliveries(): OperatorDelivery[] {
+    return this.jsonRecordIds(this.operatorDeliveriesDir())
+      .map((id) => this.getOperatorDelivery(id))
+      .filter((delivery): delivery is OperatorDelivery => delivery !== null)
+      .sort((left, right) =>
+        left.sequence - right.sequence || left.deliveryId.localeCompare(right.deliveryId)
+      );
+  }
+
+  saveOperatorDelivery(delivery: OperatorDelivery): void {
+    if (!isOperatorDelivery(delivery, delivery?.deliveryId)) {
+      throw dataError("Invalid operator delivery record");
+    }
+    mkdirSync(this.operatorDeliveriesDir(), { recursive: true });
+    this.writeSnapshot(
+      this.operatorDeliveryFile(delivery.deliveryId),
+      `${JSON.stringify(delivery, null, 2)}\n`
+    );
+  }
+
+  getOfflineResolutionClock(taskId: string, requestId: string): OfflineResolutionClock | null {
+    assertInputPointerId(taskId, "task");
+    assertInputPointerId(requestId, "input request");
+    const raw = this.readOptionalText(this.offlineResolutionClockFile(taskId, requestId));
+    return raw === null ? null : parseOfflineResolutionClock(taskId, requestId, raw);
+  }
+
+  listOfflineResolutionClocks(): OfflineResolutionClock[] {
+    const clocks: OfflineResolutionClock[] = [];
+    for (const taskId of this.directoryNames(this.offlineResolutionClocksDir())) {
+      for (const requestId of this.jsonRecordIds(this.offlineResolutionClockTaskDir(taskId))) {
+        const clock = this.getOfflineResolutionClock(taskId, requestId);
+        if (clock !== null) clocks.push(clock);
+      }
+    }
+    return clocks.sort((left, right) =>
+      left.offlineSince.localeCompare(right.offlineSince) ||
+      left.taskId.localeCompare(right.taskId) ||
+      left.requestId.localeCompare(right.requestId)
+    );
+  }
+
+  saveOfflineResolutionClock(clock: OfflineResolutionClock): void {
+    if (!isOfflineResolutionClock(clock, clock?.taskId, clock?.requestId)) {
+      throw dataError("Invalid offline resolution clock record");
+    }
+    mkdirSync(this.offlineResolutionClockTaskDir(clock.taskId), { recursive: true });
+    this.writeSnapshot(
+      this.offlineResolutionClockFile(clock.taskId, clock.requestId),
+      `${JSON.stringify(clock, null, 2)}\n`
+    );
+  }
+
+  clearOfflineResolutionClock(taskId: string, requestId: string): void {
+    assertInputPointerId(taskId, "task");
+    assertInputPointerId(requestId, "input request");
+    rmSync(this.offlineResolutionClockFile(taskId, requestId), { force: true });
+  }
+
+  clearAllOfflineResolutionClocks(): void {
+    rmSync(this.offlineResolutionClocksDir(), { recursive: true, force: true });
+  }
+
+  getInputResolutionWakeup(taskId: string, requestId: string): InputResolutionWakeup | null {
+    assertInputPointerId(taskId, "task");
+    assertInputPointerId(requestId, "input request");
+    const raw = this.readOptionalText(this.inputResolutionWakeupFile(taskId, requestId));
+    return raw === null ? null : parseInputResolutionWakeup(taskId, requestId, raw);
+  }
+
+  listInputResolutionWakeups(): InputResolutionWakeup[] {
+    const wakeups: InputResolutionWakeup[] = [];
+    for (const taskId of this.directoryNames(this.inputResolutionWakeupsDir())) {
+      for (const requestId of this.jsonRecordIds(this.inputResolutionWakeupTaskDir(taskId))) {
+        const wakeup = this.getInputResolutionWakeup(taskId, requestId);
+        if (wakeup !== null) wakeups.push(wakeup);
+      }
+    }
+    return wakeups.sort((left, right) =>
+      left.createdAt.localeCompare(right.createdAt) ||
+      left.taskId.localeCompare(right.taskId) ||
+      left.requestId.localeCompare(right.requestId)
+    );
+  }
+
+  saveInputResolutionWakeup(wakeup: InputResolutionWakeup): void {
+    if (!isInputResolutionWakeup(wakeup, wakeup?.taskId, wakeup?.requestId)) {
+      throw dataError("Invalid input resolution wakeup record");
+    }
+    mkdirSync(this.inputResolutionWakeupTaskDir(wakeup.taskId), { recursive: true });
+    this.writeSnapshot(
+      this.inputResolutionWakeupFile(wakeup.taskId, wakeup.requestId),
+      `${JSON.stringify(wakeup, null, 2)}\n`
+    );
+  }
+
+  clearInputResolutionWakeup(taskId: string, requestId: string): void {
+    assertInputPointerId(taskId, "task");
+    assertInputPointerId(requestId, "input request");
+    rmSync(this.inputResolutionWakeupFile(taskId, requestId), { force: true });
   }
 
   getPendingWakeup(taskId: string): PendingWakeup | null {
@@ -2112,6 +2244,38 @@ export class FileTaskStore implements TaskStore {
     return join(this.operatorNotificationsDir(), `${taskId}.json`);
   }
 
+  private operatorDeliveriesDir(): string {
+    return join(this.runtimeDir(), "operator-deliveries");
+  }
+
+  private operatorDeliveryFile(deliveryId: string): string {
+    return join(this.operatorDeliveriesDir(), `${deliveryId}.json`);
+  }
+
+  private offlineResolutionClocksDir(): string {
+    return join(this.runtimeDir(), "offline-resolution-clocks");
+  }
+
+  private offlineResolutionClockTaskDir(taskId: string): string {
+    return join(this.offlineResolutionClocksDir(), taskId);
+  }
+
+  private offlineResolutionClockFile(taskId: string, requestId: string): string {
+    return join(this.offlineResolutionClockTaskDir(taskId), `${requestId}.json`);
+  }
+
+  private inputResolutionWakeupsDir(): string {
+    return join(this.runtimeDir(), "input-resolution-wakeups");
+  }
+
+  private inputResolutionWakeupTaskDir(taskId: string): string {
+    return join(this.inputResolutionWakeupsDir(), taskId);
+  }
+
+  private inputResolutionWakeupFile(taskId: string, requestId: string): string {
+    return join(this.inputResolutionWakeupTaskDir(taskId), `${requestId}.json`);
+  }
+
   private cyclesDir(taskId: string): string {
     return join(this.taskDir(taskId), "cycles");
   }
@@ -2695,6 +2859,12 @@ const TASK_READER_METHODS = [
   "listInputRequests",
   "getInputResolution",
   "listInputResolutions",
+  "getOperatorDelivery",
+  "listOperatorDeliveries",
+  "getOfflineResolutionClock",
+  "listOfflineResolutionClocks",
+  "getInputResolutionWakeup",
+  "listInputResolutionWakeups",
   "getPendingWakeup",
   "listPendingWakeups",
   "getLeaderFailure",
@@ -2939,6 +3109,41 @@ function parseInputResolution(taskId: string, resolutionId: string, raw: string)
   return value;
 }
 
+function parseOperatorDelivery(deliveryId: string, raw: string): OperatorDelivery {
+  const message = `Invalid operator delivery record: ${deliveryId}`;
+  const value = parseJson(raw, message);
+  if (!isOperatorDelivery(value, deliveryId)) {
+    throw dataError(message);
+  }
+  return value;
+}
+
+function parseOfflineResolutionClock(
+  taskId: string,
+  requestId: string,
+  raw: string
+): OfflineResolutionClock {
+  const message = `Invalid offline resolution clock record: ${taskId}/${requestId}`;
+  const value = parseJson(raw, message);
+  if (!isOfflineResolutionClock(value, taskId, requestId)) {
+    throw dataError(message);
+  }
+  return value;
+}
+
+function parseInputResolutionWakeup(
+  taskId: string,
+  requestId: string,
+  raw: string
+): InputResolutionWakeup {
+  const message = `Invalid input resolution wakeup record: ${taskId}/${requestId}`;
+  const value = parseJson(raw, message);
+  if (!isInputResolutionWakeup(value, taskId, requestId)) {
+    throw dataError(message);
+  }
+  return value;
+}
+
 function parsePendingWakeup(taskId: string, raw: string): PendingWakeup {
   const value = parseJson(raw, `Invalid pending wakeup record: ${taskId}`);
 
@@ -3173,8 +3378,19 @@ function parseAgentRun(taskId: string, runId: string, raw: string): AgentRun {
     typeof value.input !== "string" ||
     (value.workItemId !== undefined && typeof value.workItemId !== "string") ||
     (value.topics !== undefined && !isStringArray(value.topics)) ||
-    !["active", "yielded", "failed", "expired"].includes(String(value.status)) ||
+    !["active", "blocked", "yielded", "failed", "expired"].includes(String(value.status)) ||
     (value.summary !== undefined && typeof value.summary !== "string") ||
+    (
+      value.status === "blocked" &&
+      (
+        !isRecord(value.blockedBy) ||
+        value.blockedBy.type !== "input-request" ||
+        typeof value.blockedBy.requestId !== "string" ||
+        !INPUT_POINTER_ID_PATTERN.test(value.blockedBy.requestId) ||
+        typeof value.blockedBy.blockedAt !== "string"
+      )
+    ) ||
+    (value.status !== "blocked" && value.blockedBy !== undefined) ||
     typeof value.createdAt !== "string" ||
     typeof value.updatedAt !== "string" ||
     (value.endedAt !== undefined && typeof value.endedAt !== "string")

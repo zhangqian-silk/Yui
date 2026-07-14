@@ -38,9 +38,9 @@ import {
 import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
 import { SYSTEM_OPERATOR_ROLE } from "./role/systemRoles.js";
-import { prepareGlobalRoleLaunch } from "./operator/operatorContext.js";
-import { activeRoleAgentBinding, copyGlobalRoleToTaskRole } from "./role/role.js";
-import { resolveAgent } from "./agent/agentRegistry.js";
+import { pumpOperatorDeliveries } from "./operator/operatorDeliveryPump.js";
+import { runTaskInputPostCommitEffects } from "./input/inputPostCommitEffects.js";
+import { launchOperatorWindow } from "./operator/operatorLaunchAuthority.js";
 import { renderCommandHelp } from "./cli/helpRenderer.js";
 import { routeInvocation } from "./cli/invocationRouter.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
@@ -302,33 +302,20 @@ async function main(): Promise<void> {
     }
 
     requireStorageSchema(rootDir);
-    const store = new FileTaskStore(rootDir);
-    const role = store.runReadSnapshot((snapshot) => snapshot.getGlobalRole(SYSTEM_OPERATOR_ROLE));
-    if (role === null) {
-      throw dataError("Operator role is not configured. Run taskmux setup.");
-    }
-    const binding = activeRoleAgentBinding(role);
-    const agent = resolveAgent(binding.agentId, store.listConfiguredAgents());
-    if (agent === null) {
-      throw dataError(`Operator Agent is not configured: ${binding.agentId}.`);
-    }
-    const sessionSet = store.getGlobalRoleSessionSet(role.name);
-    const prepared = prepareGlobalRoleLaunch(role, agent, {
-      taskmuxHome: rootDir,
-      baseEnv: process.env,
-      session: sessionSet?.sessions[role.activeAgentId] ?? null
-    });
+    const discovery = process.env.TASKMUX_CONTROLLER_MODE === "direct"
+      ? undefined
+      : await ensureControllerRunning(rootDir, process.env);
     const tmux = new TmuxManager(
       process.env.TASKMUX_TMUX_BIN ?? "tmux",
       new NodeCommandExecutor(),
       rootDir
     );
-    const taskRole = copyGlobalRoleToTaskRole(role, "operator", new Date());
-    tmux.enterRole("operator", taskRole, {
-      command: prepared.command,
-      args: prepared.args,
-      env: prepared.explicitEnv
-    });
+    const launched = launchOperatorWindow(rootDir, tmux, process.env);
+    pumpOperatorDeliveries(rootDir, tmux);
+    if (discovery !== undefined) {
+      await callController(discovery, "scheduler.scan", randomUUID());
+    }
+    tmux.attachRole("operator", launched.taskRole.name);
     emit("Detached Operator session");
     return;
   }
@@ -387,15 +374,22 @@ async function main(): Promise<void> {
       env: process.env,
       tmux
     };
-    emit(
+    const output =
       isCoordinatedGlobalRoleMutation(commandArgs) || isDirectGlobalRoleRead(commandArgs)
         ? runGlobalRoleCommand(commandArgs, store, roleOptions)
         : executeDirectDomainCommand(
           rootDir,
           "role",
           (transactionStore) => runGlobalRoleCommand(commandArgs, transactionStore, roleOptions)
-        )
-    );
+        );
+    if (
+      commandArgs[0] === "session" &&
+      commandArgs[1] === "record" &&
+      commandArgs[2] === SYSTEM_OPERATOR_ROLE
+    ) {
+      pumpOperatorDeliveries(rootDir, tmux);
+    }
+    emit(output);
     return;
   }
 
@@ -633,11 +627,13 @@ function runDirectTaskCommand(
     }
     return output;
   }
-  return executeDirectDomainCommand(
+  const output = executeDirectDomainCommand(
     rootDir,
     "task",
     (transactionStore) => runTaskCommand(commandArgs, transactionStore, tmux)
   );
+  runTaskInputPostCommitEffects(rootDir, commandArgs, tmux);
+  return output;
 }
 
 function isDirectConfigSnapshotRead(args: readonly string[]): boolean {
@@ -668,6 +664,9 @@ function isDirectTaskSnapshotRead(args: readonly string[]): boolean {
     return args.length === 1;
   }
   if (command === "topic" && args[1] === "list") {
+    return true;
+  }
+  if (command === "input" && ["list", "show"].includes(args[1] ?? "")) {
     return true;
   }
   return command === "transcript" && args[1] === "export";
@@ -740,6 +739,13 @@ function resolveTaskCommandScope(commandArgs: string[], env: NodeJS.ProcessEnv):
       ...(roleName === undefined || roleName.length === 0 ? [] : [roleName]),
       ...rest.slice(1)
     ];
+  }
+
+  if (command === "input" && ["show", "answer"].includes(rest[0] ?? "")) {
+    if (!rest.includes("--task")) {
+      return [command, ...rest, "--task", taskId];
+    }
+    return commandArgs;
   }
 
   const nestedTaskCommands = new Set([

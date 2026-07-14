@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { prepareGlobalRoleLaunch } from "../operator/operatorContext.js";
+import { confirmOperatorNativeSessionRegistration } from "../operator/operatorLaunchAuthority.js";
 import { roleConflict, roleNotFound, usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import {
@@ -12,6 +13,7 @@ import {
 import type { GlobalRole } from "../role/role.js";
 import {
   isSystemRoleName,
+  SYSTEM_OPERATOR_ROLE,
   SYSTEM_ROLE_NAMES,
   systemRoleDescription
 } from "../role/systemRoles.js";
@@ -45,6 +47,7 @@ import {
   resolveAgentLaunchEnvironment,
   resolveAgentSessionRoot,
   roleRuntimeStateDigest,
+  type GlobalRoleMutationRuntimeOperationClaim,
   type GlobalRoleRuntimeOperationClaim
 } from "../executor/executorRegistry.js";
 import type { TmuxManager } from "../tmux/tmuxManager.js";
@@ -388,7 +391,16 @@ function globalRoleSessionCommand(
     if (existing !== null && !sameNativeSessionIdentity(existing, candidateIdentity)) {
       throw usageError("GlobalRole session replacement must be explicit.");
     }
-    store.saveGlobalRoleSessionSet(recordRoleAgentSession(existingSet, sessionInput(), new Date()));
+    const next = recordRoleAgentSession(existingSet, sessionInput(), new Date());
+    if (roleName === SYSTEM_OPERATOR_ROLE && environment.TASKMUX_ROLE === roleName) {
+      const launchToken = environment.TASKMUX_OPERATOR_LAUNCH_TOKEN?.trim();
+      if (launchToken === undefined || launchToken.length === 0 || options.tmux === undefined) {
+        throw usageError("Running Operator native session registration requires its fenced launch token.");
+      }
+      confirmOperatorNativeSessionRegistration(store, role, next, launchToken, options.tmux);
+    } else {
+      store.saveGlobalRoleSessionSet(next);
+    }
     return `Recorded native session for role ${roleName}\n`;
   }
 
@@ -439,6 +451,17 @@ function assertGlobalSessionRegistrationProvenance(
   }
   if (binding.adapterId === "codex" && environment.CODEX_THREAD_ID?.trim() !== nativeSessionId) {
     throw usageError("Native session id does not match CODEX_THREAD_ID.");
+  }
+  if (
+    role.name === SYSTEM_OPERATOR_ROLE &&
+    environment.TASKMUX_NATIVE_SESSION_ID !== undefined &&
+    environment.TASKMUX_NATIVE_SESSION_ID.trim() !== nativeSessionId
+  ) {
+    throw usageError("Native session id does not match the fenced Operator launch identity.");
+  }
+  if (role.name === SYSTEM_OPERATOR_ROLE &&
+      (environment.TASKMUX_OPERATOR_LAUNCH_TOKEN?.trim().length ?? 0) === 0) {
+    throw usageError("Running Operator native session registration requires its fenced launch token.");
   }
 }
 
@@ -501,10 +524,11 @@ function readGlobalRoleRuntimeState(store: TaskStore, roleName: string): {
 }
 
 export function isExactPreparedGlobalRoleMutationClaim(
-  expected: GlobalRoleRuntimeOperationClaim,
+  expected: GlobalRoleMutationRuntimeOperationClaim,
   current: GlobalRoleRuntimeOperationClaim | null
 ): boolean {
   return current !== null &&
+    current.kind === "global-role-mutation" &&
     current.phase === "prepared" &&
     current.recoveryToken === null &&
     roleRuntimeStateDigest(current) === roleRuntimeStateDigest(expected);
@@ -512,7 +536,7 @@ export function isExactPreparedGlobalRoleMutationClaim(
 
 function releasePreparedGlobalRoleMutationClaim(
   rootDir: string,
-  expected: GlobalRoleRuntimeOperationClaim
+  expected: GlobalRoleMutationRuntimeOperationClaim
 ): void {
   executeDomainTransaction(
     rootDir,
@@ -547,7 +571,7 @@ function executeGlobalRoleMutation<T>(
   const rootDir = store.rootDirectory();
   recoverGlobalRoleRuntimeOperations(rootDir, now);
   const preparedState = readGlobalRoleRuntimeState(store, roleName);
-  const claim: GlobalRoleRuntimeOperationClaim = {
+  const claim: GlobalRoleMutationRuntimeOperationClaim = {
     schemaVersion: 1,
     scope: "global-role",
     kind: "global-role-mutation",
@@ -603,7 +627,11 @@ function executeGlobalRoleMutation<T>(
 export function recoverGlobalRoleRuntimeOperations(rootDir: string, now = new Date()): string[] {
   const recovered: string[] = [];
   for (const observed of listRuntimeOperationClaims(rootDir)) {
-    if (observed.scope !== "global-role" || !isRuntimeOperationRecoverable(observed, now)) continue;
+    if (
+      observed.scope !== "global-role" ||
+      observed.kind !== "global-role-mutation" ||
+      !isRuntimeOperationRecoverable(observed, now)
+    ) continue;
     const recoveryToken = randomUUID();
     const claimed = claimRuntimeOperationRecovery(
       rootDir,

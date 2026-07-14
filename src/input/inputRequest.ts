@@ -10,6 +10,10 @@ import {
   isInputRequestRecord,
   isInputResolutionRecord
 } from "./inputRecordCodec.js";
+import {
+  isCanonicalNativeSessionId,
+  isCanonicalNativeSessionRoot
+} from "../executor/nativeSessionIdentity.js";
 
 export {
   MAX_INPUT_ANSWER_LENGTH,
@@ -44,7 +48,8 @@ export type InputRequester = {
   roleName: "leader";
   agentId: string;
   adapterId: string;
-  nativeSessionId?: string;
+  sessionRoot: string;
+  nativeSessionId: string;
   agentRunId: string;
 };
 
@@ -416,7 +421,9 @@ function normalizeRequester(requester: InputRequester): InputRequester {
     [requester.agentId, requester.adapterId, requester.agentRunId].some(
       (value) => !isInputRequesterField(value)
     ) ||
-    (requester.nativeSessionId !== undefined && !isInputRequesterField(requester.nativeSessionId))
+    !isCanonicalNativeSessionRoot(requester.sessionRoot) ||
+    !isInputRequesterField(requester.nativeSessionId) ||
+    !isCanonicalNativeSessionId(requester.nativeSessionId)
   ) {
     throw new Error("Invalid input requester.");
   }
@@ -424,7 +431,8 @@ function normalizeRequester(requester: InputRequester): InputRequester {
     roleName: "leader",
     agentId: requester.agentId,
     adapterId: requester.adapterId,
-    ...(requester.nativeSessionId === undefined ? {} : { nativeSessionId: requester.nativeSessionId }),
+    sessionRoot: requester.sessionRoot,
+    nativeSessionId: requester.nativeSessionId,
     agentRunId: requester.agentRunId
   };
 }

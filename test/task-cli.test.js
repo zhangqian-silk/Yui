@@ -6,7 +6,7 @@ import { delimiter, dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { FileTaskStore } from "../dist/storage/taskStore.js";
-import { taskmuxTmuxSessionName, taskmuxTmuxTarget } from "../dist/tmux/tmuxManager.js";
+import { TmuxManager, taskmuxTmuxSessionName, taskmuxTmuxTarget } from "../dist/tmux/tmuxManager.js";
 
 const cli = join(process.cwd(), "dist", "cli.js");
 
@@ -161,6 +161,86 @@ process.exit(0);
   return { fakeTmux, logFile, carrierLogFile };
 }
 
+function createFencedOperatorTmux(home) {
+  const fakeTmux = join(home, "fake-fenced-operator-tmux.js");
+  const logFile = join(home, "fenced-operator-tmux-calls.jsonl");
+  const stateFile = join(home, "fenced-operator-tmux-state.json");
+  const { carrierBin, carrierLogFile } = createFakeCarrier(home);
+
+  writeFileSync(
+    fakeTmux,
+    `#!${process.execPath}
+const { appendFileSync, existsSync, readFileSync, writeFileSync } = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+const stateFile = process.env.FAKE_TMUX_STATE;
+const emptyState = () => ({ session: false, windows: {} });
+const readState = () => existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf8")) : emptyState();
+const writeState = (state) => writeFileSync(stateFile, JSON.stringify(state));
+const targetName = (target) => target.slice(target.lastIndexOf(":") + 1);
+const state = readState();
+appendFileSync(process.env.FAKE_TMUX_LOG, JSON.stringify(args) + "\\n");
+if (args[0] === "has-session") process.exit(state.session ? 0 : 1);
+if (args[0] === "new-session") {
+  state.session = true;
+  writeState(state);
+  process.exit(0);
+}
+if (args[0] === "list-windows") {
+  process.stdout.write(Object.keys(state.windows).join("\\n"));
+  process.exit(0);
+}
+if (args[0] === "new-window") {
+  const name = args[args.indexOf("-n") + 1];
+  state.windows[name] = { options: {} };
+  writeState(state);
+${privateCarrierRunner(carrierBin, carrierLogFile)}
+}
+if (args[0] === "set-option") {
+  const name = targetName(args[args.indexOf("-t") + 1]);
+  if (state.windows[name] !== undefined) {
+    state.windows[name].options[args.at(-2)] = args.at(-1);
+    writeState(state);
+  }
+  process.exit(0);
+}
+if (args[0] === "show-options") {
+  const name = targetName(args[args.indexOf("-t") + 1]);
+  process.stdout.write(state.windows[name]?.options[args.at(-1)] ?? "");
+  process.exit(0);
+}
+if (args[0] === "rename-window") {
+  const oldName = targetName(args[args.indexOf("-t") + 1]);
+  const newName = args.at(-1);
+  state.windows[newName] = state.windows[oldName];
+  delete state.windows[oldName];
+  writeState(state);
+  process.exit(0);
+}
+if (args[0] === "kill-window") {
+  delete state.windows[targetName(args[args.indexOf("-t") + 1])];
+  writeState(state);
+  process.exit(0);
+}
+if (args[0] === "capture-pane") {
+  process.stdout.write("recent reviewer output\\n");
+  process.exit(0);
+}
+process.exit(0);
+`
+  );
+  chmodSync(fakeTmux, 0o755);
+
+  return { fakeTmux, logFile, stateFile };
+}
+
+function fencedOperatorLaunchToken(stateFile) {
+  const token = JSON.parse(readFileSync(stateFile, "utf8"))
+    .windows.operator?.options["@taskmux_launch_token"];
+  assert.match(token ?? "", /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  return token;
+}
+
 function createStatusTmux(home) {
   const fakeTmux = join(home, "fake-status-tmux.js");
 
@@ -208,6 +288,7 @@ function createStatefulTmux(home) {
   const fakeTmux = join(home, "fake-stateful-tmux.js");
   const logFile = join(home, "stateful-tmux-calls.jsonl");
   const stateFile = join(home, "stateful-tmux-windows.txt");
+  const optionFile = join(home, "stateful-tmux-options.json");
   const carrierBin = join(home, "fake-stateful-carrier-bin");
   mkdirSync(carrierBin);
   writeFileSync(join(carrierBin, "env"), "#!/bin/sh\nexit 0\n");
@@ -220,10 +301,46 @@ const { appendFileSync, existsSync, readFileSync, writeFileSync } = require("nod
 const { spawnSync } = require("node:child_process");
 const args = process.argv.slice(2);
 const state = process.env.FAKE_TMUX_STATE;
+const optionFile = ${JSON.stringify(optionFile)};
+const readOptions = () => existsSync(optionFile) ? JSON.parse(readFileSync(optionFile, "utf8")) : {};
+const writeOptions = (value) => writeFileSync(optionFile, JSON.stringify(value));
+const ensurePaneOptions = (options, target) => options[target] ??= {};
 appendFileSync(process.env.FAKE_TMUX_LOG, JSON.stringify(args) + "\\n");
 if (args[0] === "has-session") process.exit(existsSync(state) ? 0 : 1);
 if (args[0] === "new-session") { writeFileSync(state, ""); process.exit(0); }
 if (args[0] === "list-windows") { if (existsSync(state)) process.stdout.write(readFileSync(state, "utf8")); process.exit(0); }
+const exactCondition = args[0] === "if-shell" && args.includes("-t") &&
+  args[args.indexOf("-F") + 1]?.includes("@taskmux_exact_role_input_binding");
+if (exactCondition) {
+  const target = args[args.indexOf("-t") + 1];
+  const condition = args[args.indexOf("-F") + 1];
+  const command = args[args.indexOf("-F") + 2];
+  const expected = /@taskmux_exact_role_input_binding},([a-f0-9]{64})}/.exec(condition)?.[1];
+  const receipt = /@taskmux_leader_input_([a-f0-9]{64})\\s+1/.exec(command)?.[1];
+  if (expected === undefined || receipt === undefined) process.exit(1);
+  const options = readOptions();
+  const pane = ensurePaneOptions(options, target);
+  if (pane["@taskmux_exact_role_input_binding"] !== expected) {
+    process.stdout.write("__TASKMUX_EXACT_INPUT_FENCED_" + receipt + "__\\n");
+    process.exit(0);
+  }
+  const receiptOption = "@taskmux_leader_input_" + receipt;
+  if (pane[receiptOption] === "1") {
+    process.stdout.write("__TASKMUX_EXACT_INPUT_RECEIPT_" + receipt + "__\\n");
+    process.exit(0);
+  }
+  pane[receiptOption] = "1";
+  writeOptions(options);
+  process.stdout.write("__TASKMUX_EXACT_INPUT_APPLIED_" + receipt + "__\\n");
+  process.exit(0);
+}
+if (args[0] === "set-option") {
+  const options = readOptions();
+  const pane = ensurePaneOptions(options, args[args.indexOf("-t") + 1]);
+  pane[args.at(-2)] = args.at(-1);
+  writeOptions(options);
+  process.exit(0);
+}
 if (args[0] === "new-window") {
   const cwdIndex = args.indexOf("-c");
   const cwd = cwdIndex === -1 ? undefined : args[cwdIndex + 1];
@@ -251,12 +368,21 @@ if (args[0] === "rename-window") {
   const index = current.indexOf(oldName);
   if (index !== -1) current[index] = newName;
   writeFileSync(state, current.length === 0 ? "" : current.join("\\n") + "\\n");
+  const options = readOptions();
+  const nextTarget = target.slice(0, target.lastIndexOf(":") + 1) + newName;
+  options[nextTarget] = options[target] ?? {};
+  delete options[target];
+  writeOptions(options);
   process.exit(0);
 }
 if (args[0] === "kill-window") {
-  const name = args.at(-1).split(":").at(-1);
+  const target = args.at(-1);
+  const name = target.split(":").at(-1);
   const current = existsSync(state) ? readFileSync(state, "utf8").split("\\n").filter((item) => item && item !== name) : [];
   writeFileSync(state, current.length === 0 ? "" : current.join("\\n") + "\\n");
+  const options = readOptions();
+  delete options[target];
+  writeOptions(options);
   process.exit(0);
 }
 process.exit(0);
@@ -2837,8 +2963,21 @@ test("detaches a task role through tmux", () => {
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line));
+    const recoveryProbe = ["has-session", "-t", taskmuxTmuxSessionName(home, "operator")];
+    const detachCall = ["detach-client", "-s", taskmuxTmuxSessionName(home, "task-1")];
+    const recoveryProbeIndex = calls.findIndex((call) => (
+      JSON.stringify(call) === JSON.stringify(recoveryProbe)
+    ));
+    const detachCallIndex = calls.findIndex((call) => (
+      JSON.stringify(call) === JSON.stringify(detachCall)
+    ));
 
-    assert.deepEqual(calls[0], ["detach-client", "-s", taskmuxTmuxSessionName(home, "task-1")]);
+    assert.notEqual(recoveryProbeIndex, -1);
+    assert.deepEqual(calls[recoveryProbeIndex], recoveryProbe);
+    assert.equal(calls.some((call) => ["new-session", "new-window"].includes(call[0])), false);
+    assert.notEqual(detachCallIndex, -1);
+    assert.deepEqual(calls[detachCallIndex], detachCall);
+    assert.ok(recoveryProbeIndex < detachCallIndex);
 
     const role = JSON.parse(
       readFileSync(join(home, "tasks", "task-1", "roles", "rd", "role.json"), "utf8")
@@ -3583,7 +3722,7 @@ test("protects system roles and shows missing system role agents as question mar
 test("runs the Operator in its own persistent tmux session", () => {
   const home = createTaskmuxHome();
   const fakeAgent = createFakeAgentCli(home, "operator-agent.js", "codex");
-  const { fakeTmux, logFile } = createFakeTmux(home);
+  const { fakeTmux, logFile, stateFile } = createFencedOperatorTmux(home);
 
   writeStorageSchema(home, 4);
   addAgent(home, "codex", fakeAgent);
@@ -3593,7 +3732,8 @@ test("runs the Operator in its own persistent tmux session", () => {
   runTaskmux(["operator"], {
     TASKMUX_HOME: home,
     TASKMUX_TMUX_BIN: fakeTmux,
-    FAKE_TMUX_LOG: logFile
+    FAKE_TMUX_LOG: logFile,
+    FAKE_TMUX_STATE: stateFile
   });
 
   const calls = readFileSync(logFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
@@ -3605,7 +3745,303 @@ test("runs the Operator in its own persistent tmux session", () => {
   assert.match(newWindow.at(-1), /\.taskmux-launch-carriers-.*\/\.pending-launch-.*\/launch\.sh$/);
   assert.match(attach?.at(-1) ?? "", /^taskmux-[a-f0-9]{12}-operator:operator$/);
   assert.doesNotMatch(JSON.stringify(newWindow), /TASKMUX_OPERATOR_CONTEXT|operator-agent\.js/);
-  assert.match(readFileSync(join(home, "operator", "TASKMUX_OPERATOR.md"), "utf8"), /Do not describe a draft as official/);
+  const context = readFileSync(join(home, "operator", "TASKMUX_OPERATOR.md"), "utf8");
+  const runtimeStart = context.indexOf("# TaskMux Operator runtime");
+  assert.notEqual(runtimeStart, -1);
+  const runtime = context.slice(runtimeStart);
+  assert.match(
+    runtime,
+    /taskmux task input request[\s\S]*taskmux task input list[\s\S]*taskmux task input show[\s\S]*taskmux task input answer[\s\S]*taskmux task input cancel/
+  );
+  assert.match(runtime, /Global Inbox[\s\S]*Task-owned/i);
+  assert.match(runtime, /foreground Operator[\s\S]*exact active Leader origin/i);
+  assert.match(runtime, /delivery receipt is not an answer/i);
+  assert.doesNotMatch(runtime, /\binput\s+(?:draft|submit)\b/i);
+  fencedOperatorLaunchToken(stateFile);
+});
+
+test("real Operator entry delivers each durable inbox pointer once to its active GlobalRoleSessionSet pane", async () => {
+  const home = createTaskmuxHome();
+  const { fakeTmux, logFile, stateFile } = createFencedOperatorTmux(home);
+  const fakeAgent = createFakeAgentCli(home, "operator-agent.js", "codex");
+  writeStorageSchema(home, 4);
+  addAgent(home, "codex", fakeAgent);
+  runTaskmux(["config", "set", "default-agent", "codex"], { TASKMUX_HOME: home });
+  runTaskmux(["config", "set", "default-workspace", home], { TASKMUX_HOME: home });
+  const operatorSessionRoot = join(home, "operator-session-root");
+  mkdirSync(operatorSessionRoot);
+  const env = {
+    TASKMUX_HOME: home,
+    TASKMUX_CONTROLLER_MODE: "direct",
+    TASKMUX_TMUX_BIN: fakeTmux,
+    FAKE_TMUX_LOG: logFile,
+    FAKE_TMUX_STATE: stateFile,
+    CODEX_HOME: operatorSessionRoot
+  };
+
+  try {
+    runTaskmux(["role", "add", "operator", "--agent", "codex", "--workspace", home], env);
+    runTaskmux(["task", "create", "Await a release decision"], env);
+    runTaskmux(["operator"], env);
+    const launchToken = fencedOperatorLaunchToken(stateFile);
+    runTaskmux(
+      ["role", "session", "record", "operator", "--native-id", "operator-native-1"],
+      {
+        ...env,
+        TASKMUX_ROLE: "operator",
+        TASKMUX_AGENT_ID: "codex",
+        TASKMUX_ADAPTER_ID: "codex",
+        TASKMUX_NATIVE_SESSION_ROOT: operatorSessionRoot,
+        CODEX_THREAD_ID: "operator-native-1",
+        TASKMUX_OPERATOR_LAUNCH_TOKEN: launchToken
+      }
+    );
+
+    const { createInputRequest } = await import("../dist/input/inputRequest.js");
+    const { createOperatorDelivery } = await import("../dist/operator/operatorDelivery.js");
+    const now = new Date(Date.now() - 1_000);
+    const store = new FileTaskStore(home);
+    store.saveInputRequest(createInputRequest(
+      "input-1",
+      "task-1",
+      {
+        roleName: "leader",
+        agentId: "codex",
+        adapterId: "codex",
+        sessionRoot: "/tmp",
+        nativeSessionId: "leader-native-1",
+        agentRunId: "leader-run-1"
+      },
+      {
+        question: "Should the safe deployment proceed?",
+        choices: [{ key: "safe", label: "Proceed with the safe deployment" }],
+        blockedRefs: [],
+        resolutionPolicy: { mode: "user-required" }
+      },
+      now
+    ));
+    store.saveOperatorDelivery(createOperatorDelivery(
+      "delivery-1",
+      1,
+      "task-1",
+      "input-1",
+      now
+    ));
+
+    runTaskmux(["operator"], env);
+    assert.equal(store.getOperatorDelivery("delivery-1").status, "accepted");
+    const firstInputs = readFileSync(logFile, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((call) => call[0] === "if-shell" && call.at(-1).includes("[TaskMux input request delivery delivery-1]"))
+      .map((call) => call.at(-1))
+      .filter((input) => input.includes("[TaskMux input request delivery delivery-1]"));
+    assert.equal(firstInputs.length, 1);
+    assert.match(firstInputs[0], /Should the safe deployment proceed\?/);
+    assert.equal(existsSync(join(home, "runtime", "operator")), false);
+
+    runTaskmux(["operator"], env);
+    const replayedInputs = readFileSync(logFile, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((call) => call[0] === "if-shell" && call.at(-1).includes("[TaskMux input request delivery delivery-1]"))
+      .map((call) => call.at(-1))
+      .filter((input) => input.includes("[TaskMux input request delivery delivery-1]"));
+    assert.equal(replayedInputs.length, 1);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("direct Controller scans time out only offline-recommended input and restore the exact blocked Leader session", async () => {
+  const home = createConfiguredHome();
+  const { fakeTmux, logFile, stateFile } = createStatefulTmux(home);
+  const env = {
+    TASKMUX_HOME: home,
+    TASKMUX_CONTROLLER_MODE: "direct",
+    TASKMUX_TMUX_BIN: fakeTmux,
+    FAKE_TMUX_LOG: logFile,
+    FAKE_TMUX_STATE: stateFile
+  };
+
+  try {
+    runTaskmux(["task", "create", "Resolve an offline decision"], env);
+    writeFileSync(stateFile, "leader\n");
+
+    const {
+      createRoleSessionSet,
+      recordRoleAgentSession
+    } = await import("../dist/executor/agentExecutor.js");
+    const { createInputRequest } = await import("../dist/input/inputRequest.js");
+    const { updateRoleStatus } = await import("../dist/role/role.js");
+    const {
+      blockAgentRunForInput,
+      createAgentRun
+    } = await import("../dist/run/agentRun.js");
+    const now = new Date();
+    const store = new FileTaskStore(home);
+    const role = store.getRole("task-1", "leader");
+    assert.ok(role);
+    store.saveRole("task-1", updateRoleStatus(role, "running", now));
+    store.saveRoleSessionSet(recordRoleAgentSession(
+      createRoleSessionSet(
+        { scope: "task", taskId: "task-1", roleName: "leader" },
+        "codex",
+        now
+      ),
+      {
+        agentId: "codex",
+        adapterId: "codex",
+        nativeSessionId: "leader-native-1",
+        policy: "fixed",
+        status: "running",
+        sessionRoot: "/tmp",
+        configFingerprint: configFingerprintFixture("offline-leader"),
+        permissionEnvelope: permissionEnvelopeFixture("codex")
+      },
+      now
+    ));
+    const request = createInputRequest(
+      "input-1",
+      "task-1",
+      {
+        roleName: "leader",
+        agentId: "codex",
+        adapterId: "codex",
+        sessionRoot: "/tmp",
+        nativeSessionId: "leader-native-1",
+        agentRunId: "leader-run-1"
+      },
+      {
+        question: "Use the safe retry?",
+        choices: [{ key: "safe", label: "Use the safe retry" }],
+        blockedRefs: [],
+        resolutionPolicy: {
+          mode: "offline-recommended",
+          recommendation: { choiceKey: "safe", reason: "The retry is reversible." },
+          offlineTimeoutMs: 1
+        }
+      },
+      now
+    );
+    const blocked = blockAgentRunForInput(
+      createAgentRun(
+        "leader-run-1",
+        "task-1",
+        "leader",
+        "resume",
+        "Continue leadership",
+        now
+      ),
+      request.id,
+      now
+    );
+    store.saveInputRequest(request);
+    store.saveAgentRun(blocked);
+    store.saveActiveAgentRun(blocked);
+    new TmuxManager(fakeTmux, {
+      run(command, args) {
+        return execFileSync(command, args, {
+          encoding: "utf8",
+          env: { ...process.env, ...env }
+        });
+      }
+    }, home).bindExactRoleInputTarget({
+      taskId: "task-1",
+      roleName: "leader",
+      agentId: "codex",
+      adapterId: "codex",
+      sessionRoot: "/tmp",
+      nativeSessionId: "leader-native-1",
+      agentRunId: "leader-run-1"
+    });
+
+    runTaskmux(["controller", "scan"], env);
+    assert.ok(store.getOfflineResolutionClock("task-1", "input-1"));
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    runTaskmux(["controller", "scan"], env);
+
+    assert.equal(store.getInputRequest("task-1", "input-1").status, "auto-resolved");
+    assert.equal(store.getInputResolutionWakeup("task-1", "input-1").status, "completed");
+    assert.equal(store.getActiveAgentRun("task-1", "leader").status, "active");
+    const session = store.getRoleSessionSet("task-1", "leader").sessions.codex;
+    assert.deepEqual(
+      {
+        adapterId: session.adapterId,
+        sessionRoot: session.sessionRoot,
+        nativeSessionId: session.nativeSessionId
+      },
+      {
+        adapterId: "codex",
+        sessionRoot: "/tmp",
+        nativeSessionId: "leader-native-1"
+      }
+    );
+
+    const replacementRequest = createInputRequest(
+      "input-2",
+      "task-1",
+      {
+        roleName: "leader",
+        agentId: "codex",
+        adapterId: "codex",
+        sessionRoot: "/tmp",
+        nativeSessionId: "leader-native-1",
+        agentRunId: "leader-run-2"
+      },
+      {
+        question: "Retry the reversible operation?",
+        choices: [{ key: "retry", label: "Retry once" }],
+        blockedRefs: [],
+        resolutionPolicy: {
+          mode: "offline-recommended",
+          recommendation: { choiceKey: "retry", reason: "The operation is reversible." },
+          offlineTimeoutMs: 1
+        }
+      },
+      new Date()
+    );
+    const replacementBlocked = blockAgentRunForInput(
+      createAgentRun(
+        "leader-run-2",
+        "task-1",
+        "leader",
+        "resume",
+        "Continue leadership",
+        new Date()
+      ),
+      replacementRequest.id,
+      new Date()
+    );
+    store.saveInputRequest(replacementRequest);
+    store.saveAgentRun(replacementBlocked);
+    store.saveActiveAgentRun(replacementBlocked);
+    runTaskmux(["controller", "scan"], env);
+
+    const currentSet = store.getRoleSessionSet("task-1", "leader");
+    const currentSession = currentSet.sessions.codex;
+    store.saveRoleSessionSet(recordRoleAgentSession(currentSet, {
+      agentId: "codex",
+      adapterId: "codex",
+      nativeSessionId: "leader-native-replacement",
+      policy: currentSession.policy,
+      status: currentSession.status,
+      sessionRoot: currentSession.sessionRoot,
+      configFingerprint: currentSession.lastLaunchConfigHash,
+      permissionEnvelope: currentSession.permissionEnvelope,
+      replacementReason: "The old native session exited."
+    }, new Date()));
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    runTaskmux(["controller", "scan"], env);
+
+    assert.equal(store.getInputRequest("task-1", "input-2").status, "auto-resolved");
+    assert.equal(store.getInputResolutionWakeup("task-1", "input-2").status, "abandoned");
+    assert.equal(store.getActiveAgentRun("task-1", "leader").status, "blocked");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("assigns configured agents and starts their commands", () => {

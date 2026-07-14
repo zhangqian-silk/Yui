@@ -1,6 +1,7 @@
 import type { TableColumn } from "../output/table.js";
 import { presentAgentDefinition } from "../output/roleAgentPresentation.js";
 import { configuredAgentToDefinition } from "../agent/agent.js";
+import { listGlobalInputRequests, resolveGlobalInputRequest } from "../input/globalInputQuery.js";
 import { isSystemRoleName, SYSTEM_ROLE_NAMES, systemRoleDescription } from "../role/systemRoles.js";
 import type { TaskReader, TaskStore } from "../storage/taskStore.js";
 import { BUILTIN_TOPICS } from "../topic/topic.js";
@@ -158,6 +159,60 @@ function getSelectionCandidatesSnapshot(
         context,
         "No tasks have drafted input."
       );
+    case "input-requests":
+      return inputRequestCandidateSet(
+        listGlobalInputRequests(store, { includeTerminal: true }),
+        "Select input request",
+        "No input requests are available."
+      );
+    case "open-input-requests":
+      return inputRequestCandidateSet(
+        listGlobalInputRequests(store),
+        "Select open input request",
+        "No open input requests are available."
+      );
+    case "task-open-input-requests": {
+      const taskId = dependentTaskId(selector, args, store);
+      if (taskId === null) {
+        return null;
+      }
+      return inputRequestCandidateSet(
+        listGlobalInputRequests(store).filter((request) => request.taskId === taskId),
+        `Select open input request: ${taskId}`,
+        `Task ${taskId} has no open input requests.`
+      );
+    }
+    case "input-answer-choices": {
+      const requestId = args[3];
+      if (requestId === undefined || requestId.startsWith("--")) {
+        return null;
+      }
+      const taskId = readOptionValue(args, "--task");
+      let request: ReturnType<typeof resolveGlobalInputRequest>;
+      try {
+        request = resolveGlobalInputRequest(store, requestId, taskId);
+      } catch {
+        return null;
+      }
+      if (request.status !== "open" || request.choices.length === 0) {
+        return null;
+      }
+      return {
+        entityLabel: "input answer",
+        title: `Select answer: ${request.taskId}/${request.id}`,
+        columns: [
+          { header: "Choice", minWidth: 6, maxWidth: 24 },
+          { header: "Label", minWidth: 8, maxWidth: 48 },
+          { header: "Description", minWidth: 8, maxWidth: 64 }
+        ],
+        candidates: request.choices.map((choice) => ({
+          value: choice.key,
+          cells: [choice.key, choice.label, choice.description ?? ""]
+        })),
+        emptyMessage: `Input request ${request.id} has no selectable choices.`,
+        overflowHint: `Pass --text for free-text input requests.`
+      };
+    }
     case "trashed-tasks": {
       const ids = store.listTrashedTaskIds();
       return {
@@ -334,6 +389,35 @@ function taskCandidateSet(
     emptyMessage,
     overflowHint: "Run `taskmux task list` and pass the selected task explicitly."
   };
+}
+
+function inputRequestCandidateSet(
+  requests: ReturnType<typeof listGlobalInputRequests>,
+  title: string,
+  emptyMessage: string
+): CandidateSet {
+  return {
+    entityLabel: "input request",
+    title,
+    columns: [
+      { header: "Task", minWidth: 6, maxWidth: 16 },
+      { header: "Request", minWidth: 8, maxWidth: 42 },
+      { header: "Status", minWidth: 7, maxWidth: 16 },
+      { header: "Question", minWidth: 12, maxWidth: 64 }
+    ],
+    candidates: requests.map((request) => ({
+      value: request.id,
+      cells: [request.taskId, request.id, request.status, request.question]
+    })),
+    emptyMessage,
+    overflowHint: "Run `taskmux task input list --all` and pass the request id explicitly."
+  };
+}
+
+function readOptionValue(args: readonly string[], option: string): string | undefined {
+  const index = args.indexOf(option);
+  const value = index === -1 ? undefined : args[index + 1];
+  return value === undefined || value.startsWith("--") ? undefined : value;
 }
 
 function dependentTaskId(selector: ArgumentSelector, args: readonly string[], store: TaskReader): string | null {

@@ -14,6 +14,10 @@ import { basename, dirname, join, resolve } from "node:path";
 import type { RoleStatus } from "../role/role.js";
 import type { Role } from "../role/role.js";
 import type { AgentLaunchPlan } from "../executor/launchPlan.js";
+import type {
+  ExactRoleInputDeliveryOutcome,
+  ExactRoleInputTarget
+} from "../executor/executorRegistry.js";
 import { CommandExecutionError, type CommandExecutor } from "./commandExecutor.js";
 
 const CARRIER_REGISTRY_PREFIX = ".taskmux-launch-carriers-";
@@ -25,6 +29,8 @@ const CARRIER_OWNER_NAME = "owner.json";
 const MAX_CARRIER_OWNER_BYTES = 256;
 const CARRIER_ACK_TIMEOUT_MS = 2_000;
 const CARRIER_ACK_POLL_MS = 10;
+const EXACT_ROLE_INPUT_BINDING_OPTION = "@taskmux_exact_role_input_binding";
+const EXACT_ROLE_INPUT_RECEIPT_PREFIX = "@taskmux_leader_input_";
 
 export class TmuxManager {
   constructor(
@@ -114,6 +120,104 @@ export class TmuxManager {
   sendRoleInput(taskId: string, roleName: string, input: string): void {
     this.executor.run(this.tmuxBin, ["send-keys", "-l", "-t", this.target(taskId, roleName), "--", input]);
     this.executor.run(this.tmuxBin, ["send-keys", "-t", this.target(taskId, roleName), "Enter"]);
+  }
+
+  /**
+   * Records an opaque receipt in the target tmux window and injects the input
+   * through one tmux command queue. A retry after a Controller crash therefore
+   * observes the receipt and becomes a no-op instead of typing the same
+   * user-visible delivery again.
+   */
+  sendRoleInputOnce(
+    taskId: string,
+    roleName: string,
+    receiptId: string,
+    input: string
+  ): void {
+    if (!/^[a-f0-9]{64}$/.test(receiptId)) {
+      throw new Error("Invalid tmux delivery receipt id.");
+    }
+    const target = this.target(taskId, roleName);
+    const option = `@taskmux_operator_delivery_${receiptId}`;
+    const command = [
+      `set-option -w -t ${tmuxWord(target)} ${option} 1`,
+      `send-keys -l -t ${tmuxWord(target)} -- ${tmuxWord(input)}`,
+      `send-keys -t ${tmuxWord(target)} Enter`
+    ].join(" ; ");
+    this.executor.run(this.tmuxBin, [
+      "if-shell",
+      "-F",
+      `#{${option}}`,
+      "display-message -p ''",
+      command
+    ]);
+  }
+
+  /**
+   * A fenced delivery uses the tuple bound to the pane at launch time, not
+   * merely its reusable task/role name. The binding check and receipt write
+   * share one tmux command queue, so a replacement pane never receives a
+   * message prepared for the prior native session and a crash replay is a
+   * no-op once the receipt is present.
+   */
+  sendExactRoleInputOnce(
+    expected: ExactRoleInputTarget,
+    deliveryId: string,
+    input: string
+  ): ExactRoleInputDeliveryOutcome {
+    assertExactRoleInputTarget(expected);
+    if (!/^input-resolution-[a-f0-9]{64}$/.test(deliveryId)) {
+      throw new Error("Invalid exact tmux delivery id.");
+    }
+    const target = this.target(expected.taskId, expected.roleName);
+    const receiptId = exactRoleInputReceiptId(deliveryId);
+    const receiptOption = `${EXACT_ROLE_INPUT_RECEIPT_PREFIX}${receiptId}`;
+    const binding = exactRoleInputBinding(expected);
+    const appliedMarker = `__TASKMUX_EXACT_INPUT_APPLIED_${receiptId}__`;
+    const receiptMarker = `__TASKMUX_EXACT_INPUT_RECEIPT_${receiptId}__`;
+    const fencedMarker = `__TASKMUX_EXACT_INPUT_FENCED_${receiptId}__`;
+    const command = [
+      `set-option -w -t ${tmuxWord(target)} ${receiptOption} 1`,
+      `send-keys -l -t ${tmuxWord(target)} -- ${tmuxWord(input)}`,
+      `send-keys -t ${tmuxWord(target)} Enter`,
+      `display-message -p ${appliedMarker}`
+    ].join(" ; ");
+    const condition = [
+      "#{&&:",
+      `#{==:#{${EXACT_ROLE_INPUT_BINDING_OPTION}},${binding}}`,
+      `,#{!=:#{${receiptOption}},1}}`
+    ].join("");
+    const result = this.executor.run(this.tmuxBin, [
+      "if-shell",
+      "-t",
+      target,
+      "-F",
+      condition,
+      command,
+      `display-message -p -t ${tmuxWord(target)} '#{?#{==:#{${EXACT_ROLE_INPUT_BINDING_OPTION}},${binding}},${receiptMarker},${fencedMarker}}'`
+    ]);
+    const marker = result.trim();
+    if (marker === appliedMarker) return "applied";
+    if (marker === receiptMarker) return "receipt-present";
+    if (marker === fencedMarker) return "fenced";
+    throw new Error("Exact tmux input delivery result is invalid.");
+  }
+
+  /**
+   * Runtime-discovered adapters (for example Codex) learn the native session
+   * id only after their pane has launched. Session registration refreshes this
+   * pane witness before any exact delivery is allowed.
+   */
+  bindExactRoleInputTarget(expected: ExactRoleInputTarget): void {
+    assertExactRoleInputTarget(expected);
+    this.executor.run(this.tmuxBin, [
+      "set-option",
+      "-w",
+      "-t",
+      this.target(expected.taskId, expected.roleName),
+      EXACT_ROLE_INPUT_BINDING_OPTION,
+      exactRoleInputBinding(expected)
+    ]);
   }
 
   detachRole(taskId: string): void {
@@ -277,6 +381,7 @@ export class TmuxManager {
     launchToken: string
   ): void {
     const temporaryName = launchWindowName(launchToken);
+    const exactInputBinding = exactRoleInputBindingFromLaunch(taskId, role, launch);
     const carrier = createLaunchCarrier(this.taskmuxHome, launch);
     const removeSignalCleanup = installCarrierSignalCleanup(carrier);
     let acknowledged = false;
@@ -305,6 +410,16 @@ export class TmuxManager {
         "@taskmux_launch_token",
         launchToken
       ]);
+      if (exactInputBinding !== null) {
+        this.executor.run(this.tmuxBin, [
+          "set-option",
+          "-w",
+          "-t",
+          this.target(taskId, temporaryName),
+          EXACT_ROLE_INPUT_BINDING_OPTION,
+          exactInputBinding
+        ]);
+      }
       this.executor.run(this.tmuxBin, [
         "rename-window",
         "-t",
@@ -879,4 +994,69 @@ function shellQuote(value: string): string {
   }
 
   return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function exactRoleInputBindingFromLaunch(
+  taskId: string,
+  role: Role,
+  launch: AgentLaunchPlan
+): string | null {
+  const target: ExactRoleInputTarget = {
+    taskId: launch.env.TASKMUX_TASK_ID ?? "",
+    roleName: launch.env.TASKMUX_ROLE ?? "",
+    agentId: launch.env.TASKMUX_AGENT_ID ?? "",
+    adapterId: launch.env.TASKMUX_ADAPTER_ID ?? "",
+    sessionRoot: launch.env.TASKMUX_NATIVE_SESSION_ROOT ?? "",
+    nativeSessionId: launch.env.TASKMUX_NATIVE_SESSION_ID ?? "",
+    agentRunId: launch.env.TASKMUX_RUN_ID ?? ""
+  };
+  if (target.taskId !== taskId || target.roleName !== role.name) {
+    return null;
+  }
+  try {
+    assertExactRoleInputTarget(target);
+    return exactRoleInputBinding(target);
+  } catch {
+    // A pane lacking a complete executor-owned identity can still support
+    // ordinary role operation, but exact wakeups must fail closed against it.
+    return null;
+  }
+}
+
+function assertExactRoleInputTarget(value: ExactRoleInputTarget): void {
+  for (const [label, field] of Object.entries({
+    taskId: value.taskId,
+    roleName: value.roleName,
+    agentId: value.agentId,
+    adapterId: value.adapterId,
+    sessionRoot: value.sessionRoot,
+    nativeSessionId: value.nativeSessionId,
+    agentRunId: value.agentRunId
+  })) {
+    if (typeof field !== "string" || field.trim().length === 0 || /[\0\r\n]/.test(field)) {
+      throw new Error(`Invalid exact tmux input ${label}.`);
+    }
+  }
+}
+
+function exactRoleInputBinding(value: ExactRoleInputTarget): string {
+  return createHash("sha256").update(JSON.stringify([
+    value.taskId,
+    value.roleName,
+    value.agentId,
+    value.adapterId,
+    value.sessionRoot,
+    value.nativeSessionId,
+    value.agentRunId
+  ])).digest("hex");
+}
+
+function exactRoleInputReceiptId(deliveryId: string): string {
+  return createHash("sha256")
+    .update(`taskmux-leader-input:${deliveryId}`)
+    .digest("hex");
+}
+
+function tmuxWord(value: string): string {
+  return JSON.stringify(value);
 }

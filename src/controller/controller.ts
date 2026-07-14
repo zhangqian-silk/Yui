@@ -20,6 +20,17 @@ import {
   readNativeSessionRegistrationTtl,
   scanTaskWakeups
 } from "../scheduler/inactivityScanner.js";
+import {
+  readOperatorPresence,
+  scanOfflineInputResolutions
+} from "../scheduler/offlineInputResolution.js";
+import {
+  recoverOperatorLaunches,
+  settleConfirmedAbsentOperatorWindow
+} from "../operator/operatorLaunchAuthority.js";
+import { processLeaderInputWakeups } from "../scheduler/leaderInputWakeupService.js";
+import { pumpOperatorDeliveries } from "../operator/operatorDeliveryPump.js";
+import { runTaskInputPostCommitEffects } from "../input/inputPostCommitEffects.js";
 import { processLeaderWakeups } from "../scheduler/leaderWakeupProcessor.js";
 import { mergePendingWakeup } from "../scheduler/pendingWakeup.js";
 import { FileTaskStore, type TaskReader, type TaskStore } from "../storage/taskStore.js";
@@ -211,11 +222,14 @@ export function runSchedulerTransaction(
   agentRunTtl: number,
   processWakeups: boolean
 ): number {
+  recoverOperatorLaunches(rootDir, tmux, now);
   const transactionId = `scheduler-${now.getTime()}-${randomBytes(6).toString("hex")}`;
   const queued = executeDomainTransaction(rootDir, transactionId, (workingRoot) => {
     const transactionStore = new FileTaskStore(workingRoot);
     return runSchedulerPass(transactionStore, tmux, now, agentRunTtl);
   });
+  processResolvedInputWakeups(rootDir, tmux, now);
+  pumpOperatorDeliveries(rootDir, tmux);
   if (processWakeups) {
     processLeaderWakeups(new FileTaskStore(rootDir), tmux, now, rootDir);
   }
@@ -228,6 +242,7 @@ function runSchedulerPass(
   now: Date,
   agentRunTtl: number
 ): number {
+  settleConfirmedAbsentOperatorWindow(store, tmux, now);
   failUnregisteredNativeSessions(
     store,
     tmux,
@@ -236,8 +251,28 @@ function runSchedulerPass(
   );
   expireStaleAgentRuns(store, tmux, now, agentRunTtl);
   failExitedAgentRuns(store, tmux, now);
+  scanOfflineInputResolutions(
+    store,
+    readOperatorPresence(store, tmux),
+    now,
+    (request) => nextOfflineResolutionId(store, request.taskId)
+  );
   const queued = scanTaskWakeups(store, now);
   return queued.length;
+}
+
+function processResolvedInputWakeups(rootDir: string, tmux: TmuxManager, now: Date): void {
+  processLeaderInputWakeups(rootDir, tmux, now, { clock: () => new Date() });
+}
+
+function nextOfflineResolutionId(store: TaskStore, taskId: string): string {
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const id = `offline-${randomBytes(12).toString("hex")}`;
+    if (store.getInputResolution(taskId, id) === null) {
+      return id;
+    }
+  }
+  throw new Error(`Could not allocate an offline input resolution id: ${taskId}`);
 }
 
 export function acquireControllerLock(rootDir: string, pid: number): () => void {
@@ -594,6 +629,7 @@ async function handleRequest(
           return { requestId: rpc.requestId, result: { output } };
         }
       );
+      runTaskInputPostCommitEffects(rootDir, commandArgs, tmux);
       processLeaderWakeups(store, tmux, new Date(), rootDir);
       sendJson(response, 200, body);
       return;
@@ -626,30 +662,26 @@ async function handleRequest(
 
     if (rpc.method === "scheduler.scan") {
       const now = new Date();
+      recoverOperatorLaunches(rootDir, tmux, now);
       const body = executeRpcTransaction(
         rootDir,
         rpc,
         refreshDerivedState,
         (workingRoot) => {
           const transactionStore = new FileTaskStore(workingRoot);
-          failUnregisteredNativeSessions(
-            transactionStore,
-            tmux,
-            now,
-            readNativeSessionRegistrationTtl(process.env.TASKMUX_NATIVE_SESSION_REGISTRATION_TTL_MS)
-          );
-          expireStaleAgentRuns(
+          const queued = runSchedulerPass(
             transactionStore,
             tmux,
             now,
             readAgentRunTtl(process.env.TASKMUX_AGENT_RUN_TTL_MS)
           );
-          failExitedAgentRuns(transactionStore, tmux, now);
-          const queued = scanTaskWakeups(transactionStore, now).length;
           const output = `Queued ${queued} task wakeup${queued === 1 ? "" : "s"}\n`;
           return { requestId: rpc.requestId, result: { output } };
         }
       );
+      processResolvedInputWakeups(rootDir, tmux, now);
+      pumpOperatorDeliveries(rootDir, tmux);
+      refreshDerivedState();
       sendJson(response, 200, body);
       return;
     }
@@ -744,6 +776,8 @@ async function handleRequest(
             { includeBackups: commandGroup === "backup" }
           );
       }
+      pumpOperatorDeliveries(rootDir, tmux);
+      refreshDerivedState();
       sendJson(response, 200, body);
       return;
     }
@@ -840,7 +874,8 @@ function isReadOnlyTaskCommand(args: string[]): boolean {
   if (command === "current") {
     return args.length === 1;
   }
-  return command === "topic" && args[1] === "list";
+  return (command === "topic" && args[1] === "list") ||
+    (command === "input" && ["list", "show"].includes(args[1] ?? ""));
 }
 
 function isTaskPointerCommand(args: string[]): boolean {

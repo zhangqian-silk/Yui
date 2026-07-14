@@ -8,6 +8,15 @@ import { createDecision, renderDecisionTimelineEntry, supersedeDecision } from "
 import { compileDispatchInput } from "../context/dispatchContext.js";
 import { roleConflict, roleNotFound, runtimeError, taskNotFound, usageError } from "../errors/cliError.js";
 import { createTaskEvent } from "../event/taskEvent.js";
+import { ControllerInputService } from "../input/controllerInputService.js";
+import { listGlobalInputRequests, resolveGlobalInputRequest } from "../input/globalInputQuery.js";
+import type {
+  BlockedRef,
+  CreateInputRequest,
+  InputChoice,
+  InputRequester,
+  ResolutionPolicy
+} from "../input/inputRequest.js";
 import { createTaskInputDraft } from "../input/taskInput.js";
 import { createMilestone, renderMilestoneTimelineEntry } from "../milestone/milestone.js";
 import {
@@ -287,7 +296,7 @@ export function runTaskCommand(
     case "topic":
       return taskTopicCommand(rest, store);
     case "input":
-      return taskInputCommand(rest, store);
+      return taskInputCommand(rest, store, options.environment ?? process.env);
     case "cycle":
       return taskCycleCommand(rest, store);
     case "work-item":
@@ -353,6 +362,8 @@ export function runTaskReadSnapshot(args: string[], store: TaskReader): string {
       return taskTimelineCommand(rest, store);
     case "topic":
       return listTaskTopicsCommand(rest, store);
+    case "input":
+      return taskInputReadCommand(rest, store);
     default:
       throw usageError(`Task command is not a read-only aggregate: ${command ?? "(missing)"}.`);
   }
@@ -365,7 +376,8 @@ function taskCommandIsReadOnlyAggregate(args: readonly string[]): boolean {
     "detail", "comments", "events", "activity", "timeline"
   ].includes(command) ||
     (command === "current" && args.length === 1) ||
-    (command === "topic" && args[1] === "list");
+    (command === "topic" && args[1] === "list") ||
+    (command === "input" && ["list", "show"].includes(args[1] ?? ""));
 }
 
 function taskWorktreeCommand(args: string[], store: TaskStore, tmux?: TmuxManager): string {
@@ -992,6 +1004,16 @@ function taskSessionCommand(
     }
 
     const sessions = recordRoleAgentSession(existingSet, sessionInput(), new Date());
+    bindRecordedLeaderPane(
+      tmux,
+      store,
+      taskId,
+      roleName,
+      binding.agentId,
+      binding.adapterId,
+      sessionRoot,
+      nativeSessionId
+    );
     store.saveRoleSessionSet(sessions);
     if (roleName === BUILTIN_LEADER_ROLE) {
       store.clearLeaderFailure(taskId);
@@ -1034,6 +1056,30 @@ function taskSessionCommand(
   }
 
   throw usageError("Session usage: taskmux task session record|replace <task-id> <role> --native-id <id> [--reason <reason>].");
+}
+
+function bindRecordedLeaderPane(
+  tmux: TmuxManager | undefined,
+  store: TaskStore,
+  taskId: string,
+  roleName: string,
+  agentId: string,
+  adapterId: string,
+  sessionRoot: string,
+  nativeSessionId: string
+): void {
+  if (tmux === undefined || roleName !== BUILTIN_LEADER_ROLE) return;
+  const activeRun = store.getActiveAgentRun(taskId, roleName);
+  if (activeRun === null) return;
+  tmux.bindExactRoleInputTarget({
+    taskId,
+    roleName,
+    agentId,
+    adapterId,
+    sessionRoot,
+    nativeSessionId,
+    agentRunId: activeRun.id
+  });
 }
 
 function assertSessionRegistrationProvenance(
@@ -1234,25 +1280,77 @@ function taskWorkItemCommand(args: string[], store: TaskStore): string {
   return `Created work item ${workItem.id} for task ${taskId}\n`;
 }
 
-function taskInputCommand(args: string[], store: TaskStore): string {
-  const [command, taskId, ...rest] = args;
+function taskInputCommand(
+  args: string[],
+  store: TaskStore,
+  environment: NodeJS.ProcessEnv
+): string {
+  const [command, ...rest] = args;
 
+  if (command === "request") {
+    const [taskId, ...inputArgs] = rest;
+    if (taskId === undefined || taskId.trim().length === 0) {
+      throw usageError("Task id is required.");
+    }
+    const requester = currentLeaderInputRequester(store, taskId, environment, "active");
+    const request = taskInputService(store).createInStore(store, {
+      taskId,
+      requester,
+      input: parseInputRequestCreate(inputArgs)
+    }, new Date());
+    return `Created input request ${request.id} for task ${request.taskId}\n`;
+  }
+
+  if (command === "answer") {
+    const [requestId, ...inputArgs] = rest;
+    if (requestId === undefined || requestId.trim().length === 0) {
+      throw usageError("Input request id is required.");
+    }
+    const { taskId, answer } = parseInputAnswer(inputArgs);
+    const result = taskInputService(store).answerInStore(store, {
+      requestId,
+      ...(taskId === undefined ? {} : { taskId }),
+      answer,
+      operatorPresence: "online"
+    }, new Date());
+    return `Answered input request ${result.request.id} for task ${result.request.taskId}\n`;
+  }
+
+  if (command === "cancel") {
+    const [taskId, requestId, ...inputArgs] = rest;
+    if (taskId === undefined || taskId.trim().length === 0) {
+      throw usageError("Task id is required.");
+    }
+    if (requestId === undefined || requestId.trim().length === 0) {
+      throw usageError("Input request id is required.");
+    }
+    const reason = parseInputCancelReason(inputArgs);
+    const requester = currentLeaderInputRequester(store, taskId, environment, "blocked");
+    const cancelled = taskInputService(store).cancelInStore(store, {
+      taskId,
+      requestId,
+      requester,
+      reason
+    }, new Date());
+    return `Cancelled input request ${cancelled.id} for task ${cancelled.taskId}\n`;
+  }
+
+  const [taskId, ...legacyArgs] = rest;
   if (taskId === undefined || taskId.trim().length === 0) {
     throw usageError("Task id is required.");
   }
-
   if (store.getTask(taskId) === null) {
     throw taskNotFound(taskId);
   }
 
   if (command === "draft") {
-    const body = rest.join(" ").trim();
+    const body = legacyArgs.join(" ").trim();
     const draft = createTaskInputDraft(taskId, body, new Date(), store.getTaskInputDraft(taskId) ?? undefined);
     store.saveTaskInputDraft(taskId, draft);
     return `Saved input draft for task ${taskId}\n`;
   }
 
-  if (command === "submit" && rest.length === 0) {
+  if (command === "submit" && legacyArgs.length === 0) {
     const draft = store.getTaskInputDraft(taskId);
 
     if (draft === null) {
@@ -1267,7 +1365,324 @@ function taskInputCommand(args: string[], store: TaskStore): string {
     return `Submitted input draft for task ${taskId}\n`;
   }
 
-  throw usageError("Input usage: taskmux task input draft <task-id> <body> | taskmux task input submit <task-id>.");
+  throw usageError([
+    "Input usage:",
+    "taskmux task input request <task-id> --question <text> [--choice <key=label> ...] [--blocks <type:id> ...] [--policy human-only|timeout] [--recommend <choice-key> --recommendation-reason <text> --timeout <duration>]",
+    "taskmux task input list [<task-id>] [--all]",
+    "taskmux task input show <request-id> [--task <task-id>]",
+    "taskmux task input answer <request-id> [--task <task-id>] (--choice <choice-key> | --text <text>)",
+    "taskmux task input cancel <task-id> <request-id> --reason <text>",
+    "taskmux task input draft <task-id> <body> | taskmux task input submit <task-id>."
+  ].join("\n"));
+}
+
+function taskInputReadCommand(args: string[], store: TaskReader): string {
+  const [command, ...rest] = args;
+  if (command === "list") {
+    assertKnownOptions(rest, new Set(["--all"]));
+    const taskIds = rest.filter((value) => !value.startsWith("--"));
+    if (taskIds.length > 1) {
+      throw usageError("Input list accepts at most one task id.");
+    }
+    const taskId = taskIds[0];
+    if (taskId !== undefined && store.getTask(taskId) === null) {
+      throw taskNotFound(taskId);
+    }
+    const requests = listGlobalInputRequests(store, { includeTerminal: hasFlag(rest, "--all") })
+      .filter((request) => taskId === undefined || request.taskId === taskId);
+    return `${renderInputRequestList(requests)}\n`;
+  }
+
+  if (command === "show") {
+    const [requestId, ...inputArgs] = rest;
+    if (requestId === undefined || requestId.trim().length === 0) {
+      throw usageError("Input request id is required.");
+    }
+    assertKnownOptions(inputArgs, new Set(["--task"]));
+    assertNoInputPositionals(inputArgs, new Set(["--task"]));
+    const taskId = readSingleInputOption(inputArgs, "--task");
+    const request = resolveGlobalInputRequest(store, requestId, taskId);
+    return renderInputRequest(request);
+  }
+
+  throw usageError("Input read usage: taskmux task input list [<task-id>] [--all] | taskmux task input show <request-id> [--task <task-id>].");
+}
+
+function taskInputService(store: TaskStore): ControllerInputService {
+  return new ControllerInputService(store.rootDirectory(), {
+    nextRequestId: () => `input-${randomUUID()}`,
+    nextResolutionId: () => `resolution-${randomUUID()}`,
+    nextDeliveryId: () => `delivery-${randomUUID()}`
+  });
+}
+
+function currentLeaderInputRequester(
+  store: TaskStore,
+  taskId: string,
+  environment: NodeJS.ProcessEnv,
+  expectedStatus: "active" | "blocked"
+): InputRequester {
+  const suppliedTaskId = environment.TASKMUX_TASK_ID?.trim();
+  const suppliedRole = environment.TASKMUX_ROLE?.trim();
+  const suppliedRunId = environment.TASKMUX_RUN_ID?.trim();
+  const suppliedAgentId = environment.TASKMUX_AGENT_ID?.trim();
+  const suppliedAdapterId = environment.TASKMUX_ADAPTER_ID?.trim();
+  const suppliedSessionRoot = environment.TASKMUX_NATIVE_SESSION_ROOT?.trim();
+  const suppliedNativeSessionId = environment.TASKMUX_NATIVE_SESSION_ID?.trim();
+  if (
+    suppliedTaskId === undefined ||
+    suppliedRole !== BUILTIN_LEADER_ROLE ||
+    suppliedRunId === undefined ||
+    suppliedAgentId === undefined ||
+    suppliedAdapterId === undefined ||
+    suppliedSessionRoot === undefined ||
+    suppliedNativeSessionId === undefined
+  ) {
+    throw usageError("task input request/cancel requires the active Leader task-role session environment.");
+  }
+  if (suppliedTaskId !== taskId) {
+    throw usageError(`Current Leader task does not match requested task: ${taskId}.`);
+  }
+
+  const activeRun = store.getActiveAgentRun(taskId, BUILTIN_LEADER_ROLE);
+  const recordedRun = activeRun === null ? null : store.getAgentRun(taskId, activeRun.id);
+  const role = store.getRole(taskId, BUILTIN_LEADER_ROLE);
+  const sessionSet = store.getRoleSessionSet(taskId, BUILTIN_LEADER_ROLE);
+  const binding = role?.agentBindings[suppliedAgentId];
+  const session = sessionSet?.sessions[suppliedAgentId];
+  if (
+    activeRun === null ||
+    recordedRun === null ||
+    activeRun.status !== expectedStatus ||
+    recordedRun.status !== expectedStatus ||
+    activeRun.id !== suppliedRunId ||
+    recordedRun.id !== suppliedRunId ||
+    role === null ||
+    role.activeAgentId !== suppliedAgentId ||
+    sessionSet === null ||
+    sessionSet.activeAgentId !== suppliedAgentId ||
+    binding === undefined ||
+    binding.adapterId !== suppliedAdapterId ||
+    session === undefined ||
+    session.agentId !== suppliedAgentId ||
+    session.adapterId !== suppliedAdapterId ||
+    session.sessionRoot !== suppliedSessionRoot ||
+    session.nativeSessionId !== suppliedNativeSessionId ||
+    session.status !== "running"
+  ) {
+    throw usageError(`Current Leader session does not match the ${expectedStatus} input origin: ${taskId}.`);
+  }
+  return {
+    roleName: BUILTIN_LEADER_ROLE,
+    agentId: role.activeAgentId,
+    adapterId: binding.adapterId,
+    sessionRoot: session.sessionRoot,
+    nativeSessionId: session.nativeSessionId,
+    agentRunId: activeRun.id
+  };
+}
+
+function parseInputRequestCreate(args: string[]): CreateInputRequest {
+  const knownOptions = new Set([
+    "--question",
+    "--choice",
+    "--blocks",
+    "--policy",
+    "--recommend",
+    "--recommendation-reason",
+    "--timeout"
+  ]);
+  assertKnownOptions(args, knownOptions);
+  assertNoInputPositionals(args, knownOptions);
+
+  const question = readRequiredInputOption(args, "--question");
+  const choices = readRepeatedOption(args, "--choice").map(parseInputChoice);
+  const blockedRefs = readRepeatedOption(args, "--blocks").map(parseInputBlockedRef);
+  const policy = readSingleInputOption(args, "--policy") ?? "human-only";
+  const recommendation = readSingleInputOption(args, "--recommend");
+  const recommendationReason = readSingleInputOption(args, "--recommendation-reason");
+  const timeout = readSingleInputOption(args, "--timeout");
+  const resolutionPolicy = parseInputResolutionPolicy(
+    policy,
+    recommendation,
+    recommendationReason,
+    timeout
+  );
+  return { question, choices, blockedRefs, resolutionPolicy };
+}
+
+function parseInputAnswer(args: string[]): {
+  taskId?: string;
+  answer: { choiceKey?: string; text: string };
+} {
+  const knownOptions = new Set(["--task", "--choice", "--text"]);
+  assertKnownOptions(args, knownOptions);
+  assertNoInputPositionals(args, knownOptions);
+  const taskId = readSingleInputOption(args, "--task");
+  const choiceKey = readSingleInputOption(args, "--choice");
+  const text = readSingleInputOption(args, "--text");
+  if ((choiceKey === undefined && text === undefined) || (choiceKey !== undefined && text !== undefined)) {
+    throw usageError("Input answer requires exactly one of --choice or --text.");
+  }
+  return {
+    ...(taskId === undefined ? {} : { taskId }),
+    answer: choiceKey === undefined
+      ? { text: text ?? "" }
+      : { choiceKey, text: "" }
+  };
+}
+
+function parseInputCancelReason(args: string[]): string {
+  const knownOptions = new Set(["--reason"]);
+  assertKnownOptions(args, knownOptions);
+  assertNoInputPositionals(args, knownOptions);
+  return readRequiredInputOption(args, "--reason");
+}
+
+function parseInputChoice(value: string): InputChoice {
+  const separator = value.indexOf("=");
+  if (separator <= 0 || separator === value.length - 1) {
+    throw usageError("--choice must use <key=label>.");
+  }
+  return {
+    key: value.slice(0, separator).trim(),
+    label: value.slice(separator + 1).trim()
+  };
+}
+
+function parseInputBlockedRef(value: string): BlockedRef {
+  const separator = value.indexOf(":");
+  const type = value.slice(0, separator);
+  const id = value.slice(separator + 1).trim();
+  if (separator <= 0 || id.length === 0 || !["work-item", "decision", "task"].includes(type)) {
+    throw usageError("--blocks must use work-item:<id>, decision:<id>, or task:<id>.");
+  }
+  return { type: type as BlockedRef["type"], id };
+}
+
+function parseInputResolutionPolicy(
+  policy: string,
+  recommendation: string | undefined,
+  recommendationReason: string | undefined,
+  timeout: string | undefined
+): ResolutionPolicy {
+  if (policy === "human-only") {
+    if (recommendation !== undefined || recommendationReason !== undefined || timeout !== undefined) {
+      throw usageError("--recommend, --recommendation-reason, and --timeout require --policy timeout.");
+    }
+    return { mode: "user-required" };
+  }
+  if (policy !== "timeout") {
+    throw usageError("--policy must be human-only or timeout.");
+  }
+  if (recommendation === undefined || recommendationReason === undefined || timeout === undefined) {
+    throw usageError("--policy timeout requires --recommend, --recommendation-reason, and --timeout.");
+  }
+  return {
+    mode: "offline-recommended",
+    recommendation: { choiceKey: recommendation, reason: recommendationReason },
+    offlineTimeoutMs: parseInputTimeout(timeout)
+  };
+}
+
+function parseInputTimeout(value: string): number {
+  const match = /^([1-9][0-9]*)(ms|s|m|h)$/.exec(value.trim());
+  if (match === null) {
+    throw usageError("--timeout must use a positive duration such as 30s, 5m, or 1h.");
+  }
+  const factor = match[2] === "ms" ? 1 : match[2] === "s" ? 1_000 : match[2] === "m" ? 60_000 : 3_600_000;
+  const milliseconds = Number(match[1]) * factor;
+  if (!Number.isSafeInteger(milliseconds)) {
+    throw usageError("--timeout is too large.");
+  }
+  return milliseconds;
+}
+
+function readRequiredInputOption(args: string[], name: string): string {
+  const value = readSingleInputOption(args, name);
+  if (value === undefined) {
+    throw usageError(`${name} is required.`);
+  }
+  return value;
+}
+
+function readSingleInputOption(args: string[], name: string): string | undefined {
+  const values = readRepeatedOption(args, name);
+  if (values.length > 1) {
+    throw usageError(`${name} may be supplied only once.`);
+  }
+  return values[0];
+}
+
+function assertNoInputPositionals(args: string[], optionsWithValues: Set<string>): void {
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index];
+    if (value.startsWith("--")) {
+      if (optionsWithValues.has(value)) {
+        index += 1;
+      }
+      continue;
+    }
+    throw usageError(`Unexpected input argument: ${value}.`);
+  }
+}
+
+function renderInputRequestList(
+  requests: ReturnType<typeof listGlobalInputRequests>
+): string {
+  return renderTable(
+    "Input requests",
+    [
+      { header: "Task", minWidth: 6, maxWidth: 16 },
+      { header: "Request", minWidth: 8, maxWidth: 42 },
+      { header: "Status", minWidth: 7, maxWidth: 14 },
+      { header: "Question", minWidth: 12, maxWidth: 64 },
+      { header: "Policy", minWidth: 10, maxWidth: 24 }
+    ],
+    requests.map((request) => [
+      request.taskId,
+      request.id,
+      request.status,
+      request.question,
+      request.resolutionPolicy.mode === "user-required"
+        ? "human-only"
+        : `timeout ${request.resolutionPolicy.offlineTimeoutMs}ms`
+    ]),
+    defaultTableWidth()
+  );
+}
+
+function renderInputRequest(
+  request: ReturnType<typeof resolveGlobalInputRequest>
+): string {
+  const policy = request.resolutionPolicy.mode === "user-required"
+    ? "human-only"
+    : [
+        `timeout=${request.resolutionPolicy.offlineTimeoutMs}ms`,
+        `recommend=${request.resolutionPolicy.recommendation.choiceKey}`,
+        `reason=${request.resolutionPolicy.recommendation.reason}`
+      ].join(" ");
+  const choices = request.choices.length === 0
+    ? "(free text)"
+    : request.choices.map((choice) =>
+      choice.description === undefined
+        ? `${choice.key}=${choice.label}`
+        : `${choice.key}=${choice.label} (${choice.description})`
+    ).join("\n");
+  const blocked = request.blockedRefs.length === 0
+    ? "(none)"
+    : request.blockedRefs.map((reference) => `${reference.type}:${reference.id}`).join(", ");
+  return [
+    `Input request: ${request.taskId}/${request.id}`,
+    `Status: ${request.status}`,
+    `Question: ${request.question}`,
+    `Choices: ${choices}`,
+    `Policy: ${policy}`,
+    `Blocked refs: ${blocked}`,
+    `Requester: ${request.requester.roleName}/${request.requester.agentId}`,
+    `Created: ${request.createdAt}`,
+    `Updated: ${request.updatedAt}`
+  ].join("\n") + "\n";
 }
 
 type TaskLifecycleOperation = TaskLifecycleRuntimeOperationClaim["operation"];

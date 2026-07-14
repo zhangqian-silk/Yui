@@ -46,10 +46,6 @@ taskmux task create "Ship the export workflow" --template feature
 taskmux task board --with-roles
 taskmux task context task-1 --format json
 
-# Add user context through the controlled input flow.
-taskmux task input draft task-1 "Prioritize CSV compatibility."
-taskmux task input submit task-1
-
 # Enter the fixed Leader session.
 taskmux task enter task-1 leader
 ```
@@ -70,12 +66,41 @@ The Controller is the single mutation boundary. It starts on demand, listens onl
 | **Cycle** | One bounded period of Task advancement caused by input, a schedule, a role result, or inactivity. |
 | **WorkItem** | A finite unit of execution with an assignee and terminal outcome. |
 | **AgentRun** | One dispatched round in a native Agent session. |
-| **Operator** | The persistent administrative role that translates user intent into TaskMux commands. |
+| **Operator** | The persistent foreground global administrative role that translates user intent into TaskMux commands. |
 | **Leader** | The fixed Task-local session that owns direction, delegation, and synthesis. |
+| **Input request** | A Task-owned decision request created by the exact active Leader origin. |
+| **Global Inbox** | A cross-Task query of open Task-owned input requests, not a second store. |
 | **Independent role** | A Worker with its own Agent session, tmux window, and optional Git worktree. |
 | **Child role** | Descriptive constraints injected into a parent role; it has no TaskMux-managed runtime. |
 
+Each multi-Agent Role keeps independent configuration and a native session for every Agent binding, with one active Agent at a time. The foreground Operator is the active binding and running session recorded in its `GlobalRoleSessionSet`.
+
 ## Core workflows
+
+### Request and answer a user decision
+
+The only public input-request commands are `taskmux task input request`, `taskmux task input list`, `taskmux task input show`, `taskmux task input answer`, and `taskmux task input cancel`. The Global Inbox is the cross-Task result of `list`, not a separate record or command.
+
+From the exact active Leader session, create a Task-owned request:
+
+```sh
+taskmux task input request task-1 \
+  --question "Prioritize CSV compatibility?" \
+  --choice csv="Keep CSV first" \
+  --choice json="Prioritize JSON" \
+  --blocks task:task-1
+```
+
+The foreground Operator can inspect the global query and record the user's decision; the originating Leader can cancel its still-open request:
+
+```sh
+taskmux task input list
+taskmux task input show input-1 --task task-1
+taskmux task input answer input-1 --task task-1 --choice csv
+taskmux task input cancel task-1 input-1 --reason "Decision is no longer needed"
+```
+
+The request is owned by its Task and carries the exact Leader origin tuple, so only that Leader can create or cancel it. Operator delivery contains only Task/request pointers; its receipt confirms transport acceptance, not a user response. A `user-required` request never times out. An `offline-recommended` request can persist its recommendation only after the foreground Operator has remained confirmed offline for the configured interval; online or unknown presence never advances that interval.
 
 ### Delegate isolated work
 
@@ -94,7 +119,7 @@ taskmux task work-item create task-1 \
   --topic testing
 
 taskmux task dispatch task-1 reviewer \
-  --mode resume \
+  --mode new \
   --work-item work-item-1 \
   --input "Review the implementation and report blocking issues."
 ```
