@@ -28,7 +28,11 @@ import { runAgentCommand, runAgentReadCommand } from "../commands/agentCommands.
 import { runBackupCommand } from "../commands/backupCommands.js";
 import { runConfigCommand, runConfigReadCommand } from "../commands/configCommands.js";
 import { runGlobalRoleCommand, runGlobalRoleReadCommand } from "../commands/globalRoleCommands.js";
-import { runImportCommand, runPruneCommand } from "../commands/maintenanceCommands.js";
+import {
+  executePruneCommand,
+  executeRestoreCommand,
+  runImportCommand
+} from "../commands/maintenanceCommands.js";
 import {
   DomainTransactionRecoveryError,
   replayPendingDomainTransactions,
@@ -558,9 +562,25 @@ async function handleRequest(
       }
 
       let body: { requestId: string; result: { output: string } };
-      if (commandGroup === "backup") {
+      if (commandGroup === "restore") {
         writeRpcIntent(rootDir, rpc.requestId, rpc.method);
-        body = runDirectControllerCommand(rootDir, rpc.requestId, commandGroup, commandArgs, store);
+        const restored = executeRestoreCommand(
+          rootDir,
+          rpc.requestId,
+          commandArgs,
+          (result) => {
+            const rpcBody = { requestId: rpc.requestId, result: { output: result.output } };
+            return [rpcResultOperation(rootDir, rpc.requestId, rpcBody)];
+          }
+        );
+        body = { requestId: rpc.requestId, result: { output: restored.output } };
+        clearRpcIntent(rootDir, rpc.requestId);
+        refreshDerivedState();
+      } else if (commandGroup === "prune") {
+        writeRpcIntent(rootDir, rpc.requestId, rpc.method);
+        const output = executePruneCommand(rootDir, rpc.requestId, commandArgs);
+        body = { requestId: rpc.requestId, result: { output } };
+        writeRpcResult(rootDir, rpc.requestId, body);
         clearRpcIntent(rootDir, rpc.requestId);
         refreshDerivedState();
       } else {
@@ -574,11 +594,12 @@ async function handleRequest(
                 commandGroup,
                 commandArgs,
                 transactionStore,
-                workingRoot
+                workingRoot,
+                rootDir
               );
               return { requestId: rpc.requestId, result: { output } };
             },
-            { includeBackups: commandGroup === "prune" }
+            { includeBackups: commandGroup === "backup" }
           );
       }
       sendJson(response, 200, body);
@@ -663,24 +684,12 @@ function isReadOnlyControllerCommand(group: string, args: string[]): boolean {
   return ["agent", "role"].includes(group) && ["list", "show"].includes(args[0] ?? "");
 }
 
-function runDirectControllerCommand(
-  rootDir: string,
-  requestId: string,
-  group: string,
-  args: string[],
-  store: TaskStore
-): { requestId: string; result: { output: string } } {
-  const output = runControllerCommandGroup(group, args, store, rootDir);
-  const body = { requestId, result: { output } };
-  writeRpcResult(rootDir, requestId, body);
-  return body;
-}
-
 function runControllerCommandGroup(
   group: string,
   args: string[],
   store: TaskStore,
-  rootDir: string
+  rootDir: string,
+  publishedRoot = rootDir
 ): string {
   switch (group) {
     case "config":
@@ -693,11 +702,9 @@ function runControllerCommandGroup(
       }
       return runGlobalRoleCommand(args, store, { taskmuxHome: rootDir });
     case "backup":
-      return runBackupCommand(rootDir);
+      return runBackupCommand(rootDir, publishedRoot);
     case "import":
       return runImportCommand(args, store);
-    case "prune":
-      return runPruneCommand(args, rootDir);
     default:
       throw new Error(`Unsupported Controller command group: ${group}`);
   }

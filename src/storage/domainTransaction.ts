@@ -145,15 +145,21 @@ export function executeDomainTransaction<T>(
  * Runs an operation under the authoritative writer barrier when it cannot be
  * expressed as a copy/diff domain transaction (for example, backup creation).
  */
+export type DomainExclusiveBarrierContext = Readonly<{
+  barrier: NativeStableAncestorBarrier;
+  rootIdentity: NativeExactIdentity;
+}>;
+
 export function executeDomainExclusiveBarrier<T>(
   rootDir: string,
-  execute: () => T
+  execute: (context: DomainExclusiveBarrierContext) => T
 ): T {
   return withNativeRootBarrier(rootDir, "exclusive", (root) => {
     requireNativeWriterRoot(rootDir, root);
     replayPendingDomainTransactionsUnderBarrier(rootDir, root.barrier);
+    const rootIdentity = requireNativeWriterRoot(rootDir, root);
     assertExclusiveStorageRootPath(rootDir, root.barrier);
-    const result = execute();
+    const result = execute({ barrier: root.barrier, rootIdentity });
     assertExclusiveStorageRootPath(rootDir, root.barrier);
     return result;
   });

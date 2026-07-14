@@ -190,7 +190,7 @@ export const ROOT_COMMAND = buildNode({
     { id: "workflow", title: "Workflow", entries: ["task", "operator"] },
     { id: "configuration", title: "Configuration", entries: ["setup", "config", "agent", "role", "completion"] },
     { id: "operations", title: "Operations", entries: ["controller", "doctor"] },
-    { id: "data", title: "Data", entries: ["backup", "export", "import", "prune"] },
+    { id: "data", title: "Data", entries: ["backup", "restore", "export", "import", "prune"] },
     { id: "support", title: "Support", entries: ["update", "version", "help"] }
   ],
   children: [
@@ -212,9 +212,10 @@ export const ROOT_COMMAND = buildNode({
       { name: "tmux", summary: "Install tmux before setup." }
     ] },
     { name: "backup", summary: "Create a TaskMux state backup." },
+    { name: "restore", summary: "Restore one physical TaskMux backup.", usage: "taskmux restore <backup-id> [--force]", options: ["--force"] },
     { name: "export", summary: "Export TaskMux state.", usage: "taskmux export --output <file>", options: ["--output"], fileOptions: ["--output"] },
     { name: "import", summary: "Import TaskMux state.", usage: "taskmux import <file>", fileArguments: [0] },
-    { name: "prune", summary: "Remove selected trash or backups.", usage: "taskmux prune [--trash] [--backups] [--keep-backups <count>]", options: ["--trash", "--backups", "--keep-backups"] },
+    { name: "prune", summary: "Remove selected expired physical state.", usage: "taskmux prune [--trash] [--backups] [--transactions] [--keep-backups <count>] [--keep-trash-days <days>] [--dry-run]", options: ["--trash", "--backups", "--transactions", "--keep-backups", "--keep-trash-days", "--dry-run"] },
     { name: "operator", summary: "Enter the persistent Operator session." },
     { name: "controller", summary: "Manage the local TaskMux Controller.", sections: [
       { id: "lifecycle", title: "Lifecycle", entries: ["start", "status", "stop"] },

@@ -256,7 +256,7 @@ test("completion preserves catalog category order and never advertises removed a
     "task", "operator",
     "setup", "config", "agent", "role", "completion",
     "controller", "doctor",
-    "backup", "export", "import", "prune",
+    "backup", "restore", "export", "import", "prune",
     "update", "version", "help"
   ];
   const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], { encoding: "utf8" });
@@ -509,7 +509,7 @@ _taskmux`,
 
     assert.deepEqual(rootCandidates.stdout.trim().split("\n"), [
       "task", "operator", "setup", "config", "agent", "role", "completion",
-      "controller", "doctor", "backup", "export", "import", "prune", "update", "version", "help"
+      "controller", "doctor", "backup", "restore", "export", "import", "prune", "update", "version", "help"
     ]);
     assert.deepEqual(optionCandidates.stdout.trim().split("\n"), [
       "--template", "--agent", "--workspace", "--description", "--priority", "--tag", "--due"

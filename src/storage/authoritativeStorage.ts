@@ -1,46 +1,82 @@
 import { sep } from "node:path";
 
-/**
- * The only persisted records that a domain transaction may mutate.
- *
- * Runtime coordination files such as locks, journals, workspaces, logs, and
- * derived indexes deliberately stay outside this namespace.
- */
-export const AUTHORITATIVE_STORAGE_PATHS = [
-  "config.json",
-  "schema.json",
-  "agents",
-  "roles",
-  "tasks",
-  "trash",
-  "runtime/pending-wakeups",
-  "runtime/leader-failures",
-  "runtime/operator-notifications",
-  "runtime/role-sessions",
-  "runtime/native-session-identities.json",
-  "runtime/active-runs",
-  "runtime/role-runtime-operations",
-  "runtime/launch-reservations",
-  "runtime/rpc-intents",
-  "runtime/rpc-results",
-  "runtime/rpc-tombstones.jsonl"
-] as const;
+export type StoragePathRegistryEntry = Readonly<{
+  path: string;
+  kind: "file" | "directory";
+  transactionAuthority: "core" | "backups" | "operational" | "derived";
+  physicalBackup: "include" | "exclude";
+}>;
 
-const AUTHORITATIVE_DIRECTORY_PATHS = new Set<string>([
-  "agents",
-  "roles",
-  "tasks",
-  "trash",
-  "runtime/pending-wakeups",
-  "runtime/leader-failures",
-  "runtime/operator-notifications",
-  "runtime/role-sessions",
-  "runtime/active-runs",
-  "runtime/role-runtime-operations",
-  "runtime/launch-reservations",
-  "runtime/rpc-intents",
-  "runtime/rpc-results"
+function storagePath(
+  path: string,
+  kind: StoragePathRegistryEntry["kind"],
+  transactionAuthority: StoragePathRegistryEntry["transactionAuthority"],
+  physicalBackup: StoragePathRegistryEntry["physicalBackup"]
+): StoragePathRegistryEntry {
+  return Object.freeze({ path, kind, transactionAuthority, physicalBackup });
+}
+
+/**
+ * The one physical storage authority registry.
+ *
+ * A physical backup is a same-host secret snapshot. It includes every core
+ * record needed to recover host-bound state, while operational coordination,
+ * derived data, transaction staging, and recursive backups stay outside it.
+ */
+export const STORAGE_PATH_REGISTRY: readonly StoragePathRegistryEntry[] = Object.freeze([
+  storagePath("config.json", "file", "core", "include"),
+  storagePath("schema.json", "file", "core", "include"),
+  storagePath("agents", "directory", "core", "include"),
+  storagePath("roles", "directory", "core", "include"),
+  storagePath("tasks", "directory", "core", "include"),
+  storagePath("trash", "directory", "core", "include"),
+  storagePath("runtime/pending-wakeups", "directory", "core", "include"),
+  storagePath("runtime/leader-failures", "directory", "core", "include"),
+  storagePath("runtime/operator-notifications", "directory", "core", "include"),
+  storagePath("runtime/role-sessions", "directory", "core", "include"),
+  storagePath("runtime/native-session-identities.json", "file", "core", "include"),
+  storagePath("runtime/active-runs", "directory", "core", "include"),
+  storagePath("runtime/role-runtime-operations", "directory", "core", "include"),
+  storagePath("runtime/launch-reservations", "directory", "core", "include"),
+  storagePath("runtime/rpc-intents", "directory", "core", "include"),
+  storagePath("runtime/rpc-results", "directory", "core", "include"),
+  storagePath("runtime/rpc-tombstones.jsonl", "file", "core", "include"),
+  storagePath("backups", "directory", "backups", "exclude"),
+  storagePath("runtime/domain-transactions", "directory", "operational", "exclude"),
+  storagePath("runtime/domain-staging", "directory", "operational", "exclude"),
+  storagePath("runtime/controller.json", "file", "operational", "exclude"),
+  storagePath("runtime/controller.lock", "file", "operational", "exclude"),
+  storagePath("runtime/controller.sock", "file", "operational", "exclude"),
+  storagePath("runtime/logs", "directory", "derived", "exclude"),
+  storagePath("runtime/index.sqlite", "file", "derived", "exclude"),
+  storagePath("runtime/index.sqlite-wal", "file", "derived", "exclude"),
+  storagePath("runtime/index.sqlite-shm", "file", "derived", "exclude"),
+  storagePath("workspace", "directory", "operational", "exclude")
 ]);
+
+export const AUTHORITATIVE_STORAGE_PATHS: readonly string[] = Object.freeze(
+  STORAGE_PATH_REGISTRY
+    .filter((entry) => entry.transactionAuthority === "core")
+    .map((entry) => entry.path)
+);
+
+const AUTHORITATIVE_DIRECTORY_PATHS = new Set(
+  STORAGE_PATH_REGISTRY
+    .filter((entry) => entry.transactionAuthority === "core" && entry.kind === "directory")
+    .map((entry) => entry.path)
+);
+
+const BACKUP_STORAGE_PATHS = Object.freeze(
+  STORAGE_PATH_REGISTRY
+    .filter((entry) => entry.physicalBackup === "include")
+    .map((entry) => entry.path)
+);
+
+const BACKUP_DIRECTORY_PATHS = new Set(
+  STORAGE_PATH_REGISTRY
+    .filter((entry) => entry.physicalBackup === "include" && entry.kind === "directory")
+    .map((entry) => entry.path)
+);
 
 export function canonicalStorageOwnerUid(stat: { uid: number | bigint }): string {
   const uid = String(BigInt(stat.uid));
@@ -61,20 +97,46 @@ export function authoritativeStoragePaths(includeBackups = false): string[] {
     : [...AUTHORITATIVE_STORAGE_PATHS];
 }
 
+export function backupAuthoritativeStoragePaths(): string[] {
+  return [...BACKUP_STORAGE_PATHS];
+}
+
 export function isAuthoritativeStorageTarget(
   relativeTarget: string,
   includeBackups = false
 ): boolean {
-  const target = relativeTarget.split(sep).join("/");
+  const target = normalizeStoragePath(relativeTarget);
   if (target.length === 0 || target === ".") return false;
   if (includeBackups && (target === "backups" || target.startsWith("backups/"))) {
     return true;
   }
-  for (const path of AUTHORITATIVE_STORAGE_PATHS) {
+  return matchesRegisteredPath(target, AUTHORITATIVE_STORAGE_PATHS, AUTHORITATIVE_DIRECTORY_PATHS);
+}
+
+export function isBackupAuthoritativeStorageTarget(relativeTarget: string): boolean {
+  const target = normalizeStoragePath(relativeTarget);
+  return target.length > 0 && target !== "." &&
+    matchesRegisteredPath(target, BACKUP_STORAGE_PATHS, BACKUP_DIRECTORY_PATHS);
+}
+
+export function isBackupAuthoritativeStorageContainer(relativeTarget: string): boolean {
+  const target = normalizeStoragePath(relativeTarget);
+  if (target.length === 0 || target === ".") return true;
+  return BACKUP_STORAGE_PATHS.some((path) => path === target || path.startsWith(`${target}/`));
+}
+
+function matchesRegisteredPath(
+  target: string,
+  paths: readonly string[],
+  directoryPaths: ReadonlySet<string>
+): boolean {
+  for (const path of paths) {
     if (target === path) return true;
-    if (AUTHORITATIVE_DIRECTORY_PATHS.has(path) && target.startsWith(`${path}/`)) {
-      return true;
-    }
+    if (directoryPaths.has(path) && target.startsWith(`${path}/`)) return true;
   }
   return false;
+}
+
+function normalizeStoragePath(path: string): string {
+  return path.split(sep).join("/");
 }
