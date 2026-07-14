@@ -255,7 +255,7 @@ test("completion preserves catalog category order and never advertises removed a
   const expectedRoot = [
     "task", "operator",
     "setup", "config", "agent", "role", "completion",
-    "controller", "doctor",
+    "controller", "doctor", "maintenance",
     "backup", "restore", "export", "import", "prune",
     "update", "version", "help"
   ];
@@ -509,7 +509,7 @@ _taskmux`,
 
     assert.deepEqual(rootCandidates.stdout.trim().split("\n"), [
       "task", "operator", "setup", "config", "agent", "role", "completion",
-      "controller", "doctor", "backup", "restore", "export", "import", "prune", "update", "version", "help"
+      "controller", "doctor", "maintenance", "backup", "restore", "export", "import", "prune", "update", "version", "help"
     ]);
     assert.deepEqual(optionCandidates.stdout.trim().split("\n"), [
       "--template", "--agent", "--workspace", "--description", "--priority", "--tag", "--due"
@@ -573,7 +573,7 @@ _taskmux
 
     assert.deepEqual(rootCandidates.stdout.trim().split("\n"), [
       "task", "operator", "setup", "config", "agent", "role", "completion",
-      "controller", "doctor", "backup", "export", "import", "prune", "update", "version", "help"
+      "controller", "doctor", "maintenance", "backup", "export", "import", "prune", "update", "version", "help"
     ]);
     assert.deepEqual(optionCandidates.stdout.trim().split("\n"), [
       "--template", "--agent", "--workspace", "--description", "--priority", "--tag", "--due"

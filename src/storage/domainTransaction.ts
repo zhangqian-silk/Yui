@@ -35,8 +35,9 @@ import {
   type NativePinnedRootReader,
   type NativeStableAncestorBarrier
 } from "./nativeStorageFs.js";
+import { MAX_AUTHORITATIVE_RECORD_BYTES } from "./storageLimits.js";
 
-const MAX_TRANSACTION_COPY_BYTES = 16 * 1024 * 1024;
+const MAX_TRANSACTION_COPY_BYTES = MAX_AUTHORITATIVE_RECORD_BYTES;
 
 const DIRECTORY_OPEN_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const SHARED_BARRIER_RETRY_MS = 10;

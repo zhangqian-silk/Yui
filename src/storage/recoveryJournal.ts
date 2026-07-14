@@ -26,6 +26,7 @@ import {
   canonicalStorageOwnerUid,
   isAuthoritativeStorageTarget
 } from "./authoritativeStorage.js";
+import { MAX_AUTHORITATIVE_RECORD_BYTES } from "./storageLimits.js";
 import {
   acquireStableAncestorExclusiveBarrier,
   inspectDirectoryAt,
@@ -174,7 +175,7 @@ export class DomainTransactionRecoveryError extends Error {
 }
 
 const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
-const MAX_RECORD_BYTES = 16 * 1024 * 1024;
+const MAX_RECORD_BYTES = MAX_AUTHORITATIVE_RECORD_BYTES;
 const FILE_MODE = 0o600;
 
 /**

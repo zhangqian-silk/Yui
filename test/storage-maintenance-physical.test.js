@@ -117,6 +117,7 @@ test("the unified registry backs up host-bound authority but excludes operationa
     "runtime/native-session-identities.json",
     "runtime/active-runs",
     "runtime/role-runtime-operations",
+    "runtime/git-lifecycle",
     "runtime/launch-reservations",
     "runtime/rpc-intents",
     "runtime/rpc-results",
