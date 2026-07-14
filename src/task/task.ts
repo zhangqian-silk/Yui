@@ -25,6 +25,9 @@ export type Task = {
 };
 
 export function createTask(id: string, title: string, now: Date, metadata: TaskMetadata = {}): Task {
+  if (id.length === 0 || ["__proto__", "prototype", "constructor", ".", ".."].includes(id) || /[\/\\\0]/.test(id)) {
+    throw new Error("Task id is invalid.");
+  }
   const trimmedTitle = title.trim();
 
   if (trimmedTitle.length === 0) {

@@ -3,6 +3,7 @@ import { delimiter, join, resolve } from "node:path";
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { SYSTEM_LEADER_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
+import { activeRoleAgentBinding } from "../role/role.js";
 import { resolveAgent } from "../agent/agentRegistry.js";
 import { inspectCompletionStates } from "../completion/completionState.js";
 import type { CliIdentity } from "../cli/completion.js";
@@ -110,7 +111,7 @@ function configStatusRows(store: TaskReader, config: TaskmuxConfig, env: NodeJS.
       rows.push([
         `role:${roleName}`,
         "configured",
-        roleConfigDetail(role.agent, role.workspace, workspace)
+        roleConfigDetail(activeRoleAgentBinding(role).agentId, role.workspace, workspace)
       ]);
     }
   }

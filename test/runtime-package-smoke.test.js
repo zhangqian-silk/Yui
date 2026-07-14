@@ -116,7 +116,7 @@ test("an assembled runtime package installed with lifecycle scripts skipped reta
       join(installedRoot, "dist", "operator", "operatorContext.js")
     ).href);
     mkdirSync(home, { recursive: true });
-    const launch = prepareGlobalRoleLaunch(operatorRole(), {
+    const launch = prepareGlobalRoleLaunch(operatorRole(), operatorAgent(), {
       taskmuxHome: home,
       baseEnv: { ...process.env, CODEX_HOME: join(home, "codex-home") }
     });
@@ -124,6 +124,11 @@ test("an assembled runtime package installed with lifecycle scripts skipped reta
       readFileSync(launch.env.TASKMUX_OPERATOR_CONTEXT, "utf8"),
       /# TaskMux Operator/
     );
+    execFileSync(process.execPath, [join(root, "scripts", "smoke-runtime-package.mjs")], {
+      cwd: root,
+      encoding: "utf8",
+      env: { ...process.env, TASKMUX_INSTALLED_ROOT: installedRoot }
+    });
   } finally {
     rmSync(stage, { recursive: true, force: true });
     rmSync(consumer, { recursive: true, force: true });
@@ -154,17 +159,35 @@ function taskRole(name) {
 
 function operatorRole() {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     name: "operator",
-    agent: "codex",
-    command: "codex",
-    args: [],
-    env: {},
+    activeAgentId: "codex",
+    agentBindings: {
+      codex: {
+        agentId: "codex",
+        adapterId: "codex",
+        config: { adapterId: "codex" }
+      }
+    },
     workspace: "/tmp/runtime-package-smoke",
     createdAt: "2026-07-14T00:00:00.000Z",
     updatedAt: "2026-07-14T00:00:00.000Z",
     responsibilities: [],
     constraints: []
+  };
+}
+
+function operatorAgent() {
+  return {
+    schemaVersion: 2,
+    id: "codex",
+    adapterId: "codex",
+    command: "taskmux-runtime-package-codex",
+    baseArgs: [],
+    environment: [],
+    source: "custom",
+    createdAt: "2026-07-14T00:00:00.000Z",
+    updatedAt: "2026-07-14T00:00:00.000Z"
   };
 }
 

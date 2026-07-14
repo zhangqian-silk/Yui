@@ -12,27 +12,49 @@ import {
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { CliError, dataError, type CliErrorCode } from "../errors/cliError.js";
-import { expireStaleAgentRuns, failExitedAgentRuns, readAgentRunTtl, scanTaskWakeups } from "../scheduler/inactivityScanner.js";
+import {
+  expireStaleAgentRuns,
+  failExitedAgentRuns,
+  failUnregisteredNativeSessions,
+  readAgentRunTtl,
+  readNativeSessionRegistrationTtl,
+  scanTaskWakeups
+} from "../scheduler/inactivityScanner.js";
 import { processLeaderWakeups } from "../scheduler/leaderWakeupProcessor.js";
 import { mergePendingWakeup } from "../scheduler/pendingWakeup.js";
 import { FileTaskStore, type TaskReader, type TaskStore } from "../storage/taskStore.js";
 import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
 import { TmuxManager } from "../tmux/tmuxManager.js";
 import {
+  executeTaskLifecycleOperation,
+  finalizeTaskLifecycleOperation,
+  isTaskRoleRuntimeControlCommand,
+  prepareTaskLifecycleCommand,
   recordTaskRoleAttached,
   rememberTask,
+  recoverTaskLifecycleRuntimeOperations,
   runTaskCommand,
   runTaskReadSnapshot
 } from "../commands/taskCommands.js";
 import { runAgentCommand, runAgentReadCommand } from "../commands/agentCommands.js";
 import { runBackupCommand } from "../commands/backupCommands.js";
 import { runConfigCommand, runConfigReadCommand } from "../commands/configCommands.js";
-import { runGlobalRoleCommand, runGlobalRoleReadCommand } from "../commands/globalRoleCommands.js";
+import {
+  recoverGlobalRoleRuntimeOperations,
+  runGlobalRoleCommand,
+  runGlobalRoleReadCommand
+} from "../commands/globalRoleCommands.js";
+import {
+  clearRuntimeOperationClaim,
+  readTaskRuntimeOperationClaim,
+  roleRuntimeStateDigest
+} from "../executor/executorRegistry.js";
 import {
   executePruneCommand,
   executeRestoreCommand,
   runImportCommand
 } from "../commands/maintenanceCommands.js";
+import type { ManualSessionRegistration } from "../commands/sessionRegistration.js";
 import {
   DomainTransactionRecoveryError,
   replayPendingDomainTransactions,
@@ -43,6 +65,7 @@ import { rebuildDerivedIndex } from "../storage/derivedIndex.js";
 import { executeDomainTransaction } from "../storage/domainTransaction.js";
 import type { DomainTransactionOperation } from "../storage/recoveryJournal.js";
 import { appendControllerDiagnostic } from "./controllerDiagnostics.js";
+import { parseControllerCommandProvenance } from "./commandProvenance.js";
 
 export const CONTROLLER_API_VERSION = 1;
 const failedDomainTransactionRoots = new Set<string>();
@@ -90,7 +113,13 @@ export async function serveController(rootDir: string): Promise<void> {
         { method, args }
       )
     );
-    const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", new NodeCommandExecutor());
+    const tmux = new TmuxManager(
+      process.env.TASKMUX_TMUX_BIN ?? "tmux",
+      new NodeCommandExecutor(),
+      rootDir
+    );
+    recoverGlobalRoleRuntimeOperations(rootDir);
+    recoverTaskLifecycleRuntimeOperations(rootDir, tmux);
     const refreshDerivedState = (): void => {
       primeResilientTaskStore(store);
       rebuildDerivedIndex(rootDir, store);
@@ -183,25 +212,31 @@ export function runSchedulerTransaction(
   processWakeups: boolean
 ): number {
   const transactionId = `scheduler-${now.getTime()}-${randomBytes(6).toString("hex")}`;
-  return executeDomainTransaction(rootDir, transactionId, (workingRoot) => {
+  const queued = executeDomainTransaction(rootDir, transactionId, (workingRoot) => {
     const transactionStore = new FileTaskStore(workingRoot);
-    return runSchedulerPass(transactionStore, tmux, now, agentRunTtl, processWakeups);
+    return runSchedulerPass(transactionStore, tmux, now, agentRunTtl);
   });
+  if (processWakeups) {
+    processLeaderWakeups(new FileTaskStore(rootDir), tmux, now, rootDir);
+  }
+  return queued;
 }
 
 function runSchedulerPass(
   store: TaskStore,
   tmux: TmuxManager,
   now: Date,
-  agentRunTtl: number,
-  processWakeups: boolean
+  agentRunTtl: number
 ): number {
-  expireStaleAgentRuns(store, now, agentRunTtl);
+  failUnregisteredNativeSessions(
+    store,
+    tmux,
+    now,
+    readNativeSessionRegistrationTtl(process.env.TASKMUX_NATIVE_SESSION_REGISTRATION_TTL_MS)
+  );
+  expireStaleAgentRuns(store, tmux, now, agentRunTtl);
   failExitedAgentRuns(store, tmux, now);
   const queued = scanTaskWakeups(store, now);
-  if (processWakeups) {
-    processLeaderWakeups(store, tmux, now);
-  }
   return queued.length;
 }
 
@@ -429,10 +464,10 @@ async function handleRequest(
             transactionStore.getPendingWakeup(task.id)
           );
           transactionStore.savePendingWakeup(wakeup);
-          processLeaderWakeups(transactionStore, tmux, new Date());
           return { requestId: rpc.requestId, result: { wakeup } };
         }
       );
+      processLeaderWakeups(store, tmux, new Date(), rootDir);
       sendJson(response, 200, body);
       return;
     }
@@ -453,6 +488,11 @@ async function handleRequest(
         return;
       }
       const commandArgs = rpc.params.args;
+      const provenance = parseControllerCommandProvenance(rpc.params);
+      if (provenance === null) {
+        sendJson(response, 400, { error: "task.command provenance is invalid." });
+        return;
+      }
       if (isTaskPointerCommand(commandArgs)) {
         const taskId = commandArgs[1] ?? "";
         const output = store.runReadSnapshot((snapshot) => runTaskReadSnapshot(commandArgs, snapshot));
@@ -470,9 +510,71 @@ async function handleRequest(
       }
       if (isReadOnlyTaskCommand(commandArgs)) {
         const output = commandArgs[0] === "tail"
-          ? runTaskCommand(commandArgs, store, tmux)
+          ? runControllerTaskCommand(commandArgs, store, tmux, provenance.environment, provenance.sessionRegistration)
           : store.runReadSnapshot((snapshot) => runTaskReadSnapshot(commandArgs, snapshot));
         sendJson(response, 200, { requestId: rpc.requestId, result: { output } });
+        return;
+      }
+
+      const lifecycle = prepareTaskLifecycleCommand(commandArgs, store);
+      if (lifecycle !== null) {
+        recoverTaskLifecycleRuntimeOperations(rootDir, tmux);
+        let body: { requestId: string; result: { output: string } } | undefined;
+        executeTaskLifecycleOperation(rootDir, lifecycle, tmux, (started, receipt) => {
+          body = executeRpcTransaction(
+            rootDir,
+            rpc,
+            refreshDerivedState,
+            (workingRoot) => {
+              const current = readTaskRuntimeOperationClaim(workingRoot, started.taskId);
+              if (
+                current === null ||
+                current.token !== started.token ||
+                current.recoveryToken !== null ||
+                current.phase !== "effect-started" ||
+                roleRuntimeStateDigest(current.effectPlan) !== roleRuntimeStateDigest(started.effectPlan)
+              ) {
+                throw dataError(`Task lifecycle lost operation ownership: ${started.taskId}.`);
+              }
+              const transactionStore = FileTaskStore.forDomainTransactionWorkspace(
+                workingRoot,
+                current.token
+              );
+              const output = finalizeTaskLifecycleOperation(
+                current,
+                transactionStore,
+                new Date(),
+                receipt
+              );
+              clearRuntimeOperationClaim(
+                workingRoot,
+                { scope: "task", taskId: current.taskId },
+                current.token
+              );
+              return { requestId: rpc.requestId, result: { output } };
+            }
+          );
+          return body.result.output;
+        });
+        if (body === undefined) {
+          throw dataError("Task lifecycle did not finalize its RPC result.");
+        }
+        processLeaderWakeups(store, tmux, new Date(), rootDir);
+        sendJson(response, 200, body);
+        return;
+      }
+
+      if (isTaskPostCommitEffectCommand(commandArgs)) {
+        const body = executeRpcPostCommitTaskCommand(
+          rootDir,
+          rpc,
+          refreshDerivedState,
+          commandArgs,
+          tmux,
+          provenance.environment,
+          provenance.sessionRegistration
+        );
+        sendJson(response, 200, body);
         return;
       }
 
@@ -482,11 +584,17 @@ async function handleRequest(
         refreshDerivedState,
         (workingRoot) => {
           const transactionStore = new FileTaskStore(workingRoot);
-          const output = runTaskCommand(commandArgs, transactionStore, tmux);
-          processLeaderWakeups(transactionStore, tmux, new Date());
+          const output = runControllerTaskCommand(
+            commandArgs,
+            transactionStore,
+            tmux,
+            provenance.environment,
+            provenance.sessionRegistration
+          );
           return { requestId: rpc.requestId, result: { output } };
         }
       );
+      processLeaderWakeups(store, tmux, new Date(), rootDir);
       sendJson(response, 200, body);
       return;
     }
@@ -524,8 +632,15 @@ async function handleRequest(
         refreshDerivedState,
         (workingRoot) => {
           const transactionStore = new FileTaskStore(workingRoot);
+          failUnregisteredNativeSessions(
+            transactionStore,
+            tmux,
+            now,
+            readNativeSessionRegistrationTtl(process.env.TASKMUX_NATIVE_SESSION_REGISTRATION_TTL_MS)
+          );
           expireStaleAgentRuns(
             transactionStore,
+            tmux,
             now,
             readAgentRunTtl(process.env.TASKMUX_AGENT_RUN_TTL_MS)
           );
@@ -554,6 +669,11 @@ async function handleRequest(
       }
       const commandGroup = rpc.params.group;
       const commandArgs = rpc.params.args;
+      const provenance = parseControllerCommandProvenance(rpc.params);
+      if (provenance === null) {
+        sendJson(response, 400, { error: "command.execute provenance is invalid." });
+        return;
+      }
       if (isReadOnlyControllerCommand(commandGroup, commandArgs)) {
         const output = store.runReadSnapshot((snapshot) =>
           runControllerReadCommandGroup(commandGroup, commandArgs, snapshot));
@@ -583,6 +703,25 @@ async function handleRequest(
         writeRpcResult(rootDir, rpc.requestId, body);
         clearRpcIntent(rootDir, rpc.requestId);
         refreshDerivedState();
+      } else if (
+        commandGroup === "role" &&
+        ["update", "remove"].includes(commandArgs[0] ?? "")
+      ) {
+        writeRpcIntent(rootDir, rpc.requestId, rpc.method);
+        const output = runControllerCommandGroup(
+          commandGroup,
+          commandArgs,
+          new FileTaskStore(rootDir),
+          rootDir,
+          rootDir,
+          tmux,
+          provenance.environment,
+          provenance.sessionRegistration
+        );
+        body = { requestId: rpc.requestId, result: { output } };
+        writeRpcResult(rootDir, rpc.requestId, body);
+        clearRpcIntent(rootDir, rpc.requestId);
+        refreshDerivedState();
       } else {
         body = executeRpcTransaction(
             rootDir,
@@ -595,7 +734,10 @@ async function handleRequest(
                 commandArgs,
                 transactionStore,
                 workingRoot,
-                rootDir
+                rootDir,
+                tmux,
+                provenance.environment,
+                provenance.sessionRegistration
               );
               return { requestId: rpc.requestId, result: { output } };
             },
@@ -659,6 +801,34 @@ function executeRpcTransaction<T>(
   return result;
 }
 
+function executeRpcPostCommitTaskCommand(
+  rootDir: string,
+  rpc: RpcRequest & { requestId: string },
+  refreshDerivedState: () => void,
+  commandArgs: string[],
+  tmux: TmuxManager,
+  environment: NodeJS.ProcessEnv,
+  sessionRegistration: ManualSessionRegistration | undefined
+): { requestId: string; result: { output: string } } {
+  writeRpcIntent(rootDir, rpc.requestId, rpc.method);
+  const output = runControllerTaskCommand(
+    commandArgs,
+    new FileTaskStore(rootDir),
+    tmux,
+    environment,
+    sessionRegistration
+  );
+  const body = { requestId: rpc.requestId, result: { output } };
+  writeRpcResult(rootDir, rpc.requestId, body);
+  clearRpcIntent(rootDir, rpc.requestId);
+  refreshDerivedState();
+  return body;
+}
+
+function isTaskPostCommitEffectCommand(args: readonly string[]): boolean {
+  return args[0] === "dispatch" || isTaskRoleRuntimeControlCommand(args);
+}
+
 function isReadOnlyTaskCommand(args: string[]): boolean {
   const command = args[0] ?? "";
   if ([
@@ -689,7 +859,10 @@ function runControllerCommandGroup(
   args: string[],
   store: TaskStore,
   rootDir: string,
-  publishedRoot = rootDir
+  publishedRoot = rootDir,
+  tmux?: TmuxManager,
+  environment: NodeJS.ProcessEnv = {},
+  sessionRegistration?: ManualSessionRegistration
 ): string {
   switch (group) {
     case "config":
@@ -700,7 +873,13 @@ function runControllerCommandGroup(
       if (args[0] === "enter") {
         throw new Error("Interactive role commands cannot run through RPC.");
       }
-      return runGlobalRoleCommand(args, store, { taskmuxHome: rootDir });
+      return runGlobalRoleCommand(args, store, {
+        taskmuxHome: publishedRoot,
+        env: environment,
+        tmux,
+        sessionRegistration,
+        requireManualSessionRegistration: true
+      });
     case "backup":
       return runBackupCommand(rootDir, publishedRoot);
     case "import":
@@ -708,6 +887,20 @@ function runControllerCommandGroup(
     default:
       throw new Error(`Unsupported Controller command group: ${group}`);
   }
+}
+
+function runControllerTaskCommand(
+  args: string[],
+  store: TaskStore,
+  tmux: TmuxManager | undefined,
+  environment: NodeJS.ProcessEnv,
+  sessionRegistration: ManualSessionRegistration | undefined
+): string {
+  return runTaskCommand(args, store, tmux, {
+    environment,
+    sessionRegistration,
+    requireManualSessionRegistration: true
+  });
 }
 
 function runControllerReadCommandGroup(

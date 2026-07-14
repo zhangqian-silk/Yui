@@ -23,6 +23,18 @@ export type ArgumentResolution =
   | { kind: "resolved"; args: string[] }
   | { kind: "cancelled"; args: string[] };
 
+type ParsedOptionOccurrence = {
+  index: number;
+  value?: string;
+  valueIndex?: number;
+};
+
+type ParsedInteractionArguments = {
+  valid: boolean;
+  positionals: { index: number; value: string }[];
+  options: Map<string, ParsedOptionOccurrence[]>;
+};
+
 export async function resolveInteractiveArguments(
   args: readonly string[],
   node: CommandNode,
@@ -49,7 +61,7 @@ export async function resolveInteractiveArguments(
   if (policy !== undefined && interactionPolicyIsReady(resolved, policy)) {
     const selectableOptions = new Set(policy.selectors.flatMap((selector) => selector.option === undefined ? [] : [selector.option]));
     for (const selector of policy.selectors) {
-      if (selector.unlessOption !== undefined && resolved.includes(selector.unlessOption)) {
+      if (selector.unlessOption !== undefined && hasStructuralOption(resolved, policy, selector.unlessOption)) {
         continue;
       }
       const missingSlot = missingSelectorSlot(resolved, selector, policy.trailingOptions, selectableOptions);
@@ -93,6 +105,7 @@ function catalogEnumsCanResolve(
   policy: InteractionPolicy | undefined
 ): boolean {
   if (policy !== undefined) {
+    const parsed = parseInteractionArguments(args, policy);
     const selectableOptions = new Set([
       ...Object.keys(node.optionValues),
       ...policy.selectors.flatMap((selector) => selector.option === undefined ? [] : [selector.option])
@@ -106,20 +119,18 @@ function catalogEnumsCanResolve(
     if (!optionPrerequisitesAreReady(args, policy)) {
       return false;
     }
-    const requiredArgumentsReady = policy.requiredArguments?.every((index) => {
-      const value = args[index];
-      return value !== undefined && !value.startsWith("--");
-    }) ?? true;
+    const requiredArgumentsReady = policy.requiredArguments?.every((index) =>
+      positionalAt(parsed, policy, index) !== undefined
+    ) ?? true;
     const requiredOptionsReady = policy.requiredOptions?.every((option) => {
-      const index = args.indexOf(option);
-      const value = index < 0 ? undefined : args[index + 1];
-      if (value !== undefined && !value.startsWith("--")) {
+      const occurrence = parsed.options.get(option)?.[0];
+      if (occurrence?.value !== undefined) {
         return true;
       }
-      return Object.hasOwn(node.optionValues, option) && index >= 0;
+      return Object.hasOwn(node.optionValues, option) && occurrence !== undefined;
     }) ?? true;
     const anyOptionsReady = policy.requiredAnyOptions === undefined
-      || policy.requiredAnyOptions.some((option) => args.includes(option));
+      || policy.requiredAnyOptions.some((option) => parsed.options.has(option));
     return requiredArgumentsReady && requiredOptionsReady && anyOptionsReady;
   }
 
@@ -153,17 +164,15 @@ function interactionPolicyIsReady(args: readonly string[], policy: InteractionPo
   if (!optionPrerequisitesAreReady(args, policy)) {
     return false;
   }
-  const requiredArgumentsReady = policy.requiredArguments?.every((index) => {
-    const value = args[index];
-    return value !== undefined && !value.startsWith("--");
-  }) ?? true;
+  const parsed = parseInteractionArguments(args, policy);
+  const requiredArgumentsReady = policy.requiredArguments?.every((index) =>
+    positionalAt(parsed, policy, index) !== undefined
+  ) ?? true;
   const requiredOptionsReady = policy.requiredOptions?.every((option) => {
-    const index = args.indexOf(option);
-    const value = index < 0 ? undefined : args[index + 1];
-    return value !== undefined && !value.startsWith("--");
+    return parsed.options.get(option)?.some((occurrence) => occurrence.value !== undefined) === true;
   }) ?? true;
   const anyOptionsReady = policy.requiredAnyOptions === undefined
-    || policy.requiredAnyOptions.some((option) => args.includes(option));
+    || policy.requiredAnyOptions.some((option) => parsed.options.has(option));
   return requiredArgumentsReady && requiredOptionsReady && anyOptionsReady;
 }
 
@@ -172,50 +181,35 @@ function trailingOptionsAreReady(
   policy: InteractionPolicy,
   selectableOptions: ReadonlySet<string>
 ): boolean {
-  for (let index = policy.commandPath.length; index < args.length; index += 1) {
-    const value = args[index] ?? "";
-    if (!value.startsWith("--")) {
-      continue;
-    }
-    const optionKind = policy.trailingOptions?.[value];
-    if (optionKind === undefined) {
-      return false;
-    }
-    if (optionKind === "flag") {
-      continue;
-    }
-    const optionValue = args[index + 1];
-    if (optionValue === undefined || optionValue.startsWith("--")) {
-      if (!selectableOptions.has(value)) {
-        return false;
-      }
-      continue;
-    }
-    index += 1;
-  }
-  return true;
+  const parsed = parseInteractionArguments(args, policy);
+  return parsed.valid && [...parsed.options].every(([option, occurrences]) =>
+    occurrences.every((occurrence) => optionOccurrenceIsComplete(
+      option,
+      occurrence,
+      policy.trailingOptions,
+      selectableOptions
+    ))
+  );
 }
 
 function optionPrerequisitesAreReady(
   args: readonly string[],
   policy: InteractionPolicy
 ): boolean {
+  const parsed = parseInteractionArguments(args, policy);
   return (policy.optionPrerequisites ?? []).every((prerequisite) => {
-    const optionIndex = args.indexOf(prerequisite.option);
-    const optionValue = optionIndex < 0 ? undefined : args[optionIndex + 1];
-    if (optionIndex < 0) {
+    const occurrence = parsed.options.get(prerequisite.option)?.[0];
+    if (occurrence === undefined) {
       return true;
     }
-    const applies = optionValue === undefined || optionValue.startsWith("--")
+    const applies = occurrence.value === undefined
       ? prerequisite.requireWhenSelecting
-      : prerequisite.values.includes(optionValue);
+      : prerequisite.values.includes(occurrence.value);
     if (!applies) {
       return true;
     }
     return prerequisite.requiredOptions.every((requiredOption) => {
-      const requiredIndex = args.indexOf(requiredOption);
-      const requiredValue = requiredIndex < 0 ? undefined : args[requiredIndex + 1];
-      return requiredValue !== undefined && !requiredValue.startsWith("--");
+      return parsed.options.get(requiredOption)?.some((candidate) => candidate.value !== undefined) === true;
     });
   });
 }
@@ -227,7 +221,7 @@ function suppressedSelectorArgumentsAreReady(
   return policy.selectors.every((selector) =>
     selector.argumentIndex === undefined
     || selector.unlessOption === undefined
-    || !args.includes(selector.unlessOption)
+    || !hasStructuralOption(args, policy, selector.unlessOption)
     || positionalArgumentIsPresent(args, policy, selector.argumentIndex)
   );
 }
@@ -237,28 +231,7 @@ function positionalArgumentIsPresent(
   policy: InteractionPolicy,
   argumentIndex: number
 ): boolean {
-  const targetPosition = argumentIndex - policy.commandPath.length;
-  let position = 0;
-
-  for (let index = policy.commandPath.length; index < args.length; index += 1) {
-    const value = args[index] ?? "";
-    const optionKind = policy.trailingOptions?.[value];
-    if (optionKind !== undefined) {
-      if (optionKind === "value" && args[index + 1] !== undefined && !args[index + 1].startsWith("--")) {
-        index += 1;
-      }
-      continue;
-    }
-    if (value.startsWith("--")) {
-      return false;
-    }
-    if (position === targetPosition) {
-      return true;
-    }
-    position += 1;
-  }
-
-  return false;
+  return positionalAt(parseInteractionArguments(args, policy), policy, argumentIndex) !== undefined;
 }
 
 function missingSelectorSlot(
@@ -277,7 +250,9 @@ function missingSelectorSlot(
   if (option === undefined) {
     return null;
   }
-  const occurrences = args.flatMap((value, index) => value === option ? [index] : []);
+  const occurrences = parseInteractionArguments(args, {
+    commandPath: [], trailingOptions
+  }).options.get(option)?.map(({ index }) => index) ?? [];
   if (occurrences.length === 0) {
     return selector.requiredOption === true ? { kind: "option", option, index: args.length, optionPresent: false } : null;
   }
@@ -312,13 +287,10 @@ async function resolveCatalogEnums(
   }
 
   for (const [option, values] of Object.entries(node.optionValues)) {
-    const missingOccurrences = args.flatMap((value, index) => {
-      if (value !== option) {
-        return [];
-      }
-      const optionValue = args[index + 1];
-      return optionValue === undefined || optionValue.startsWith("--") ? [index] : [];
-    });
+    const parsed = policyForNode(node);
+    const missingOccurrences = parseInteractionArguments(args, parsed).options.get(option)
+      ?.filter((occurrence) => occurrence.value === undefined)
+      .map((occurrence) => occurrence.index) ?? [];
     if (missingOccurrences.length !== 1) {
       continue;
     }
@@ -350,32 +322,82 @@ function selectorSlotIsMissing(
   trailingOptions: InteractionPolicy["trailingOptions"],
   selectableOptions: ReadonlySet<string> = new Set()
 ): boolean {
-  const value = args[argumentIndex];
-  if (value === undefined) {
-    return true;
-  }
-  if (!value.startsWith("--") || trailingOptions === undefined) {
-    return false;
-  }
+  const policy = { commandPath: args.slice(0, argumentIndex), selectors: [], trailingOptions };
+  const parsed = parseInteractionArguments(args, policy);
+  return parsed.valid && parsed.positionals.length === 0 &&
+    [...parsed.options].every(([option, occurrences]) =>
+      occurrences.every((occurrence) => optionOccurrenceIsComplete(
+        option,
+        occurrence,
+        trailingOptions,
+        selectableOptions
+      ))
+    );
+}
 
-  for (let index = argumentIndex; index < args.length; index += 1) {
-    const option = args[index] ?? "";
-    const kind = trailingOptions[option];
-    if (kind === undefined) {
-      return false;
+function optionOccurrenceIsComplete(
+  option: string,
+  occurrence: ParsedOptionOccurrence,
+  trailingOptions: InteractionPolicy["trailingOptions"],
+  selectableOptions: ReadonlySet<string>
+): boolean {
+  return trailingOptions?.[option] === "flag" ||
+    occurrence.value !== undefined ||
+    selectableOptions.has(option);
+}
+
+function policyForNode(node: CommandNode): InteractionPolicy {
+  return findInteractionPolicy(node) ?? {
+    commandPath: node.path.slice(1),
+    selectors: [],
+    trailingOptions: Object.fromEntries([
+      ...node.options,
+      ...node.hiddenOptions
+    ].map((option) => [option, Object.hasOwn(node.optionValues, option) ? "value" : "flag"]))
+  };
+}
+
+function hasStructuralOption(args: readonly string[], policy: InteractionPolicy, option: string): boolean {
+  return parseInteractionArguments(args, policy).options.has(option);
+}
+
+function positionalAt(
+  parsed: ParsedInteractionArguments,
+  policy: InteractionPolicy,
+  absoluteIndex: number
+): string | undefined {
+  return parsed.positionals[absoluteIndex - policy.commandPath.length]?.value;
+}
+
+function parseInteractionArguments(
+  args: readonly string[],
+  policy: Pick<InteractionPolicy, "commandPath" | "trailingOptions">
+): ParsedInteractionArguments {
+  const positionals: { index: number; value: string }[] = [];
+  const options = new Map<string, ParsedOptionOccurrence[]>();
+  let valid = true;
+  for (let index = policy.commandPath.length; index < args.length; index += 1) {
+    const token = args[index] ?? "";
+    const arity = policy.trailingOptions?.[token];
+    if (arity === undefined) {
+      if (token.startsWith("--")) valid = false;
+      else positionals.push({ index, value: token });
+      continue;
     }
-    if (kind === "value") {
-      const optionValue = args[index + 1];
-      if (optionValue === undefined || optionValue.startsWith("--")) {
-        if (selectableOptions.has(option)) {
-          continue;
-        }
-        return false;
+    const occurrence: ParsedOptionOccurrence = { index };
+    if (arity !== "flag") {
+      const candidate = args[index + 1];
+      if (candidate !== undefined && (arity === "option-like-value" || !candidate.startsWith("--"))) {
+        occurrence.value = candidate;
+        occurrence.valueIndex = index + 1;
+        index += 1;
       }
-      index += 1;
     }
+    const current = options.get(token) ?? [];
+    current.push(occurrence);
+    options.set(token, current);
   }
-  return true;
+  return { valid, positionals, options };
 }
 
 export function allowsInteractiveSelection(args: readonly string[], globalJson: boolean): boolean {

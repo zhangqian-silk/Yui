@@ -1,4 +1,5 @@
 import { findChild, ROOT_COMMAND, type CommandNode } from "./commandCatalog.js";
+import { ROLE_AGENT_OPTION_SPECS } from "./roleOptionCatalog.js";
 
 export type CandidateProviderName =
   | "configured-agents"
@@ -16,6 +17,7 @@ export type CandidateProviderName =
   | "task-roles-without-active-runs"
   | "removable-task-roles"
   | "worktree-task-roles"
+  | "managed-worktree-task-roles"
   | "task-topics"
   | "active-cycles"
   | "open-work-items"
@@ -23,6 +25,7 @@ export type CandidateProviderName =
   | "dispatch-work-items"
   | "active-decisions";
 export type SelectableEntity = "agent" | "global-role" | "task" | "task-role" | "topic" | "cycle" | "work-item" | "decision";
+export type TrailingOptionKind = "flag" | "value" | "option-like-value";
 
 export type ArgumentSelector = {
   argumentIndex?: number;
@@ -38,7 +41,7 @@ export type ArgumentSelector = {
 export type InteractionPolicy = {
   commandPath: readonly string[];
   selectors: readonly ArgumentSelector[];
-  trailingOptions?: Readonly<Record<string, "flag" | "value">>;
+  trailingOptions?: Readonly<Record<string, TrailingOptionKind>>;
   requiredArguments?: readonly number[];
   requiredOptions?: readonly string[];
   requiredAnyOptions?: readonly string[];
@@ -60,6 +63,17 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = [
     selectors: [
       { argumentIndex: 2, entity: "agent", provider: "configured-agents", actionTarget: true }
     ]
+  },
+  {
+    commandPath: ["agent", "update"],
+    selectors: [
+      { argumentIndex: 2, entity: "agent", provider: "configured-agents", actionTarget: true }
+    ],
+    trailingOptions: {
+      "--adapter": "value", "--command": "value", "--arg": "option-like-value", "--clear-args": "flag",
+      "--env": "value", "--clear-env": "flag", "--refresh-probe": "flag"
+    },
+    requiredAnyOptions: ["--adapter", "--command", "--arg", "--clear-args", "--env", "--clear-env", "--refresh-probe"]
   },
   {
     commandPath: ["agent", "remove"],
@@ -104,15 +118,11 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = [
     },
     requiredArguments: [2]
   },
-  {
-    commandPath: ["role", "update"],
-    selectors: [
-      { argumentIndex: 2, entity: "global-role", provider: "configured-global-roles", actionTarget: true },
-      { option: "--agent", entity: "agent", provider: "configured-agents", actionTarget: false }
-    ],
-    trailingOptions: { "--agent": "value", "--workspace": "value" },
-    requiredAnyOptions: ["--agent", "--workspace"]
-  },
+  roleUpdateInteractionPolicy(["role", "update"], [
+    { argumentIndex: 2, entity: "global-role", provider: "configured-global-roles", actionTarget: true },
+    { option: "--agent", entity: "agent", provider: "configured-agents", actionTarget: false },
+    { option: "--active-agent", entity: "agent", provider: "configured-agents", actionTarget: false }
+  ]),
   ...[
     "show", "open", "context", "roles", "comments", "events", "activity", "timeline"
   ].map((command): InteractionPolicy => ({
@@ -250,16 +260,12 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = [
     requiredArguments: [4],
     requiredOptions: ["--description", "--expected-output"]
   },
-  {
-    commandPath: ["task", "role", "update"],
-    selectors: [
-      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-      { argumentIndex: 4, entity: "task-role", provider: "task-roles", dependsOn: 3, actionTarget: true },
-      { option: "--agent", entity: "agent", provider: "configured-agents", actionTarget: false }
-    ],
-    trailingOptions: { "--agent": "value", "--workspace": "value" },
-    requiredAnyOptions: ["--agent", "--workspace"]
-  },
+  roleUpdateInteractionPolicy(["task", "role", "update"], [
+    { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
+    { argumentIndex: 4, entity: "task-role", provider: "task-roles", dependsOn: 3, actionTarget: true },
+    { option: "--agent", entity: "agent", provider: "configured-agents", actionTarget: false },
+    { option: "--active-agent", entity: "agent", provider: "configured-agents", actionTarget: false }
+  ]),
   {
     commandPath: ["task", "role", "remove"],
     selectors: [
@@ -424,12 +430,46 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = [
     ],
     trailingOptions: { "--path": "value", "--branch": "value", "--base": "value" },
     requiredOptions: ["--path", "--branch"]
+  },
+  {
+    commandPath: ["task", "worktree", "remove"],
+    selectors: [
+      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
+      { argumentIndex: 4, entity: "task-role", provider: "managed-worktree-task-roles", dependsOn: 3, actionTarget: true }
+    ]
   }
 ];
 
 export function findInteractionPolicy(node: CommandNode): InteractionPolicy | undefined {
   const path = node.path.slice(1);
   return INTERACTION_POLICIES.find((policy) => samePath(policy.commandPath, path));
+}
+
+function roleUpdateInteractionPolicy(
+  commandPath: readonly string[],
+  selectors: readonly ArgumentSelector[]
+): InteractionPolicy {
+  const node = findPath(ROOT_COMMAND, commandPath);
+  if (node === undefined || node.kind === "group") {
+    throw new Error(`Role update command is missing from the command catalog: ${commandPath.join(" ")}`);
+  }
+  const optionLikeValues = new Set<string>(
+    ROLE_AGENT_OPTION_SPECS
+      .filter(({ allowOptionLikeValue }) => allowOptionLikeValue === true)
+      .map(({ option }) => option)
+  );
+  const trailingOptions = Object.freeze(Object.fromEntries(
+    [...node.options, ...node.hiddenOptions].map((option) => [
+      option,
+      optionLikeValues.has(option) ? "option-like-value" : "value"
+    ])
+  )) as Readonly<Record<string, TrailingOptionKind>>;
+  return {
+    commandPath,
+    selectors,
+    trailingOptions,
+    requiredAnyOptions: node.options
+  };
 }
 
 export function validateInteractionPolicies(
@@ -507,7 +547,7 @@ export function validateInteractionPolicies(
       }
     }
     for (const option of Object.keys(policy.trailingOptions ?? {})) {
-      if (!node.options.includes(option)) {
+      if (!node.options.includes(option) && !node.hiddenOptions.includes(option)) {
         throw new Error(`Interaction trailing option is not catalog-owned for ${key}: ${option}`);
       }
     }
@@ -527,7 +567,7 @@ function providerSupports(provider: CandidateProviderName, entity: SelectableEnt
       && entity === "global-role"
     || ["tasks", "unarchived-tasks", "archived-tasks", "tasks-with-input-drafts", "trashed-tasks"].includes(provider)
       && entity === "task"
-    || ["task-roles", "task-roles-with-transcripts", "task-roles-with-active-runs", "task-roles-without-active-runs", "removable-task-roles", "worktree-task-roles"].includes(provider)
+    || ["task-roles", "task-roles-with-transcripts", "task-roles-with-active-runs", "task-roles-without-active-runs", "removable-task-roles", "worktree-task-roles", "managed-worktree-task-roles"].includes(provider)
       && entity === "task-role"
     || provider === "task-topics" && entity === "topic"
     || provider === "active-cycles" && entity === "cycle"

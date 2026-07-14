@@ -45,6 +45,8 @@ const MAX_CANONICAL_NUMBER_CODE_UNITS = 32;
 const STRING_CHUNK_CODE_UNITS = 16_384;
 
 const PARSE_FAILURE = Symbol("invalid-canonical-inert-data");
+const LOWER_FAILURE = Symbol("invalid-inert-data-source");
+const LOWER_OMIT = Symbol("omit-undefined-inert-data-property");
 const HEX = "0123456789abcdef";
 
 const SafeSet = Set;
@@ -77,6 +79,8 @@ const objectGetPrototypeOf = Object.getPrototypeOf;
 const objectHasOwn = Object.hasOwn;
 const objectIs = Object.is;
 const objectSetPrototypeOf = Object.setPrototypeOf;
+const ordinaryArrayPrototype = Array.prototype;
+const ordinaryObjectPrototype = Object.prototype;
 const reflectOwnKeys = Reflect.ownKeys;
 const setAdd = Function.call.bind(Set.prototype.add) as <T>(target: Set<T>, value: T) => Set<T>;
 const setHas = Function.call.bind(Set.prototype.has) as <T>(target: Set<T>, value: T) => boolean;
@@ -113,6 +117,10 @@ const weakSetAdd = Function.call.bind(WeakSet.prototype.add) as <T extends objec
   value: T
 ) => WeakSet<T>;
 const weakSetHas = Function.call.bind(WeakSet.prototype.has) as <T extends object>(
+  target: WeakSet<T>,
+  value: T
+) => boolean;
+const weakSetDelete = Function.call.bind(WeakSet.prototype.delete) as <T extends object>(
   target: WeakSet<T>,
   value: T
 ) => boolean;
@@ -301,6 +309,52 @@ export function createInertDataSnapshot(
   }
 }
 
+/**
+ * Lowers an untrusted ordinary JSON-shaped value through own enumerable data
+ * descriptors into the same branded, bounded, canonical authority used by the
+ * journal codec. Object properties whose value is `undefined` are omitted;
+ * `undefined` array entries and every other non-JSON value fail closed.
+ */
+export function lowerUnknownInertData(
+  value: unknown,
+  limits?: InertDataLimits
+): InertDataSnapshot | null {
+  try {
+    const resolved = resolveLimits(limits);
+    if (resolved === null) return null;
+    const ancestors = new SafeWeakSet<object>();
+    const lowered = lowerUnknownValue(value, resolved, ancestors, 0, false);
+    return lowered === LOWER_FAILURE || lowered === LOWER_OMIT
+      ? null
+      : createInertDataSnapshot(lowered, resolved);
+  } catch {
+    return null;
+  }
+}
+
+/** Checks an exact own-key contract without invoking getters or proxy traps. */
+export function hasExactOwnKeys(
+  value: unknown,
+  required: readonly string[],
+  optional: readonly string[] = []
+): boolean {
+  try {
+    if (value === null || typeof value !== "object" || utilIsProxy(value)) return false;
+    const keys = reflectOwnKeys(value);
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
+      if (typeof key !== "string" ||
+          (!containsString(required, key) && !containsString(optional, key))) return false;
+    }
+    for (let index = 0; index < required.length; index += 1) {
+      if (!objectHasOwn(value, required[index])) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Parses only canonical fatal UTF-8 JSON into branded containers under the supplied frame budget. */
 export function parseCanonicalInertData(
   bytes: Uint8Array,
@@ -339,6 +393,74 @@ export function encodeCanonicalInertData(snapshot: unknown): Buffer | null {
 /** Returns the SHA-256 digest for a genuine snapshot. */
 export function digestInertDataSnapshot(snapshot: unknown): string | null {
   return snapshotDetails(snapshot)?.sha256 ?? null;
+}
+
+function lowerUnknownValue(
+  value: unknown,
+  limits: InertDataLimits,
+  ancestors: WeakSet<object>,
+  depth: number,
+  omitUndefined: boolean
+): InertDataValue | typeof LOWER_FAILURE | typeof LOWER_OMIT {
+  if (value === undefined) return omitUndefined ? LOWER_OMIT : LOWER_FAILURE;
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    return numberIsFinite(value) && !objectIs(value, -0) ? value : LOWER_FAILURE;
+  }
+  if (typeof value !== "object" || utilIsProxy(value) || weakSetHas(ancestors, value)) {
+    return LOWER_FAILURE;
+  }
+  if (depth >= limits.maxDepth) return LOWER_FAILURE;
+
+  const prototype = objectGetPrototypeOf(value);
+  weakSetAdd(ancestors, value);
+  try {
+    if (arrayIsArray(value)) {
+      if (prototype !== ordinaryArrayPrototype && prototype !== null) return LOWER_FAILURE;
+      const length = exactSourceArrayLength(value, limits.maxArrayLength);
+      if (length === null) return LOWER_FAILURE;
+      const items = createScratchArray<InertDataValue>();
+      for (let index = 0; index < length; index += 1) {
+        const descriptor = dataElementDescriptor(value, index);
+        if (descriptor === null) return LOWER_FAILURE;
+        const lowered = lowerUnknownValue(descriptor.value, limits, ancestors, depth + 1, false);
+        if (lowered === LOWER_FAILURE || lowered === LOWER_OMIT) return LOWER_FAILURE;
+        defineArrayElement(items, index, lowered);
+      }
+      return createInertDataArray(items, limits) ?? LOWER_FAILURE;
+    }
+
+    if (prototype !== ordinaryObjectPrototype && prototype !== null) return LOWER_FAILURE;
+    const keys = reflectOwnKeys(value);
+    if (keys.length > limits.maxObjectKeys || hasNonStringKey(keys)) return LOWER_FAILURE;
+    const entries = createScratchArray<InertDataEntry>();
+    let outputIndex = 0;
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index] as string;
+      const descriptor = objectGetOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !objectHasOwn(descriptor, "value") || descriptor.enumerable !== true) {
+        return LOWER_FAILURE;
+      }
+      const lowered = lowerUnknownValue(descriptor.value, limits, ancestors, depth + 1, true);
+      if (lowered === LOWER_FAILURE) return LOWER_FAILURE;
+      if (lowered === LOWER_OMIT) continue;
+      const entry = createScratchArray<InertDataValue | string>();
+      defineArrayElement(entry, 0, key);
+      defineArrayElement(entry, 1, lowered);
+      defineArrayElement(entries, outputIndex, entry as unknown as InertDataEntry);
+      outputIndex += 1;
+    }
+    return createInertDataObject(entries, limits) ?? LOWER_FAILURE;
+  } finally {
+    weakSetDelete(ancestors, value);
+  }
+}
+
+function containsString(values: readonly string[], target: string): boolean {
+  for (let index = 0; index < values.length; index += 1) {
+    if (values[index] === target) return true;
+  }
+  return false;
 }
 
 function createLimitsUnchecked(

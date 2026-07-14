@@ -1,14 +1,23 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 import { dataError, usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
-import { createGlobalRole } from "../role/role.js";
+import { presentAgentDefinition } from "../output/roleAgentPresentation.js";
+import {
+  createGlobalRole,
+  createRoleAgentBinding,
+  switchActiveRoleAgent,
+  updateGlobalRole
+} from "../role/role.js";
 import { SYSTEM_LEADER_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
-import { createConfiguredAgent } from "../agent/agent.js";
-import type { AgentDefinition } from "../agent/agent.js";
+import { configuredAgentToDefinition, createConfiguredAgent } from "../agent/agent.js";
+import type { AgentDefinition, ConfiguredAgent } from "../agent/agent.js";
 import { resolveAgent } from "../agent/agentRegistry.js";
+import { enrollAgentCapabilityProbePin, findAgentAdapter } from "../executor/agentAdapter.js";
+import { createRoleSessionSet } from "../executor/agentExecutor.js";
 import {
   ensureTaskmuxHome,
   FileTaskStore,
@@ -16,8 +25,13 @@ import {
   resolveTaskmuxHome,
   type TaskStore
 } from "../storage/taskStore.js";
+import {
+  executeDomainTransaction,
+  hasActiveDomainTransactionAuthority
+} from "../storage/domainTransaction.js";
 import { ensureStorageSchema } from "../storage/storageSchema.js";
 import type { CommandExecutor } from "../tmux/commandExecutor.js";
+import { TmuxManager } from "../tmux/tmuxManager.js";
 import { runCompletionWizard } from "../completion/completionWizard.js";
 import type { CliIdentity } from "../cli/completion.js";
 
@@ -48,30 +62,42 @@ type InteractiveSetupIo = Required<Pick<SetupIo, "input" | "output">> & SetupIo;
 
 type SetupAgentChoice = {
   name: string;
+  adapterId: "codex" | "claude";
   description: string;
 };
 
-type SetupAgentOption = SetupAgentChoice & {
+type SetupAgentOption = {
+  name: string;
+  adapterId: string;
+  command: string;
+  executable: string;
+  description: string;
   index: number;
-  installed: boolean;
+  status: "installed" | "missing" | "unsupported version" | "probe failed" | "live probe unavailable" | "unsafe probe output" | "refresh required";
+  selectable: boolean;
   current: boolean;
 };
 
 type SetupConfigResult = {
+  configuredAgent: ConfiguredAgent;
   defaultAgent: AgentDefinition | null;
   defaultWorkspace: string | undefined;
 };
 
+type SetupRoleRuntime = {
+  activeRun: boolean;
+  nativeProcessRunning: boolean;
+};
+
+type SetupRoleRuntimeProbe = (roleName: string) => SetupRoleRuntime;
+
+type SetupTmuxProbe = Pick<TmuxManager, "probeRoleStatus">;
+
 type SetupQuestion = (prompt: string) => Promise<string>;
 
 const setupAgentChoices: SetupAgentChoice[] = [
-  { name: "codex", description: "OpenAI Codex CLI" },
-  { name: "claude", description: "Anthropic Claude Code" },
-  { name: "gemini", description: "Google Gemini CLI" },
-  { name: "qwen", description: "Qwen Code" },
-  { name: "opencode", description: "OpenCode" },
-  { name: "aider", description: "Aider" },
-  { name: "copilot", description: "GitHub Copilot CLI" }
+  { name: "codex", adapterId: "codex", description: "OpenAI Codex CLI" },
+  { name: "claude", adapterId: "claude", description: "Anthropic Claude Code" }
 ];
 
 export async function runSetupCommand(
@@ -112,7 +138,14 @@ export async function runSetupCommand(
       { width: tableWidth(io), defaultSelection: "skip" }
     );
 
-    setupSystemRoles(store, configResult.defaultAgent, configResult.defaultWorkspace);
+    if (configResult.defaultAgent !== null && configResult.defaultWorkspace !== undefined) {
+      commitSetupSystemState(
+        store,
+        configResult.configuredAgent,
+        configResult.defaultWorkspace,
+        new TmuxManager(env.TASKMUX_TMUX_BIN ?? "tmux", executor, taskmuxHome)
+      );
+    }
     outputLines.push("TaskMux home initialized.");
     outputLines.push("Workspace initialized under TaskMux home.");
     outputLines.push(completionResult.trimEnd());
@@ -207,56 +240,66 @@ async function promptForRequiredConfig(
   const currentDefaultAgent = config.defaultAgent?.trim() ?? "";
   const currentAgentDefinition =
     currentDefaultAgent.length === 0 ? null : resolveAgent(currentDefaultAgent, agents);
-  const options = buildSetupAgentOptions(env, currentAgentDefinition?.id ?? currentDefaultAgent);
-  const defaultOption = resolveDefaultAgentOption(options, currentAgentDefinition?.id ?? currentDefaultAgent, env);
+  const options = buildSetupAgentOptions(agents, env, currentAgentDefinition?.id ?? currentDefaultAgent);
+  const defaultOption = resolveDefaultAgentOption(options);
   const table = renderTable(
     "Default agent candidates",
     [
       { header: "#", minWidth: 1, maxWidth: 3 },
       { header: "Agent", minWidth: 5, maxWidth: 14 },
-      { header: "Command", minWidth: 7, maxWidth: 14 },
-      { header: "Status", minWidth: 7, maxWidth: 9 },
+      { header: "Command", minWidth: 7, maxWidth: 16 },
+      { header: "Status", minWidth: 7, maxWidth: 19 },
       { header: "Current", minWidth: 7, maxWidth: 8 },
       { header: "Note", minWidth: 10, maxWidth: 52 }
     ],
     options.map((option) => [
       String(option.index),
       option.name,
-      option.name,
-      option.installed ? "installed" : "missing",
+      option.executable,
+      option.status,
       option.current ? "yes" : "",
       option.description
     ]),
     tableWidth(io)
   );
-  const answer = await question(`${table}\nChoose default agent by number or name [${defaultOption.name}]: `);
-  const selectedAgent = parseAgentSelection(answer, options, defaultOption, env);
+  const answer = await question(`${table}\nChoose default agent by number or name [${defaultOption?.name ?? "none"}]: `);
+  const selectedAgent = parseAgentSelection(answer, options, defaultOption);
   const selectedAgentName = selectedAgent.name;
 
-  const existingAgent = resolveAgent(selectedAgentName, store.listConfiguredAgents());
-
-  if (existingAgent === null) {
-    const agent = createConfiguredAgent(selectedAgentName, selectedAgentName, [], {}, new Date());
-
-    store.saveConfiguredAgent(agent);
-  }
-
-  const defaultAgent = resolveAgent(selectedAgentName, store.listConfiguredAgents());
-
-  if (defaultAgent === null) {
-    throw usageError(`${selectedAgentName} is not configured.`);
-  }
+  const existingAgent = store.getConfiguredAgent(selectedAgentName);
+  const enrolledPin = enrollAgentCapabilityProbePin(
+    { adapterId: selectedAgent.adapterId, command: selectedAgent.command },
+    env
+  );
+  const configuredAgent = existingAgent === null || existingAgent.adapterId !== selectedAgent.adapterId
+    ? createConfiguredAgent(
+      selectedAgentName,
+      selectedAgent.adapterId,
+      selectedAgent.command,
+      [],
+      [],
+      new Date(),
+      enrolledPin
+    )
+    : createConfiguredAgent(
+      existingAgent.id,
+      existingAgent.adapterId,
+      existingAgent.command,
+      existingAgent.baseArgs,
+      existingAgent.environment,
+      new Date(),
+      enrolledPin ?? existingAgent.probePin,
+      enrolledPin === undefined && existingAgent.probePin === undefined
+        ? existingAgent.probePinRefreshRequired
+        : undefined
+    );
+  const defaultAgent = configuredAgentToDefinition(configuredAgent);
 
   const defaultWorkspace = setupWorkspace(taskmuxHome);
   mkdirSync(defaultWorkspace, { recursive: true });
 
-  store.saveConfig({
-    ...store.getConfig(),
-    defaultAgent: selectedAgentName,
-    defaultWorkspace
-  });
-
   return {
+    configuredAgent,
     defaultAgent,
     defaultWorkspace
   };
@@ -266,101 +309,118 @@ function setupWorkspace(taskmuxHome: string): string {
   return join(taskmuxHome, "workspace");
 }
 
-function buildSetupAgentOptions(env: NodeJS.ProcessEnv, currentAgent: string): SetupAgentOption[] {
-  const options = setupAgentChoices.map((choice, index) => ({
-    ...choice,
-    index: index + 1,
-    installed: commandOnPath(choice.name, env),
-    current: choice.name === currentAgent
-  }));
+function buildSetupAgentOptions(
+  configuredAgents: ReturnType<TaskStore["listConfiguredAgents"]>,
+  env: NodeJS.ProcessEnv,
+  currentAgent: string
+): SetupAgentOption[] {
+  const configuredDefinitions = configuredAgents
+    .map(configuredAgentToDefinition)
+    .filter(isSupportedSessionAgent);
+  const configuredById = new Map(configuredDefinitions
+    .filter((definition) => setupAgentChoices.some((choice) =>
+      choice.name === definition.id && choice.adapterId === definition.adapterId
+    ))
+    .map((definition) => [definition.id, definition]));
+  const definitions = [
+    ...setupAgentChoices.map((choice) => configuredById.get(choice.name) ?? configuredAgentToDefinition(
+      createConfiguredAgent(choice.name, choice.adapterId, choice.name, [], [], new Date())
+    )),
+    ...configuredDefinitions
+      .filter((agent) => !setupAgentChoices.some((choice) => choice.name === agent.id))
+  ];
 
-  if (currentAgent.length > 0 && options.every((option) => option.name !== currentAgent)) {
-    options.push({
-      name: currentAgent,
-      description: "Current custom agent",
-      index: options.length + 1,
-      installed: commandOnPath(currentAgent, env),
-      current: true
-    });
-  }
-
-  return options;
+  return definitions.map((definition, index) => {
+    const adapter = findAgentAdapter(definition.adapterId);
+    if (adapter === null) throw new Error(`Unsupported setup adapter: ${definition.adapterId}.`);
+    const enrolledProbePin = definition.probePin ?? enrollAgentCapabilityProbePin(
+      { adapterId: definition.adapterId, command: definition.command },
+      env
+    );
+    const probeDefinition = enrolledProbePin === undefined
+      ? definition
+      : { ...definition, probePin: enrolledProbePin };
+    const installation = adapter.probeInstallation(probeDefinition, new Date(), env);
+    const presented = presentAgentDefinition(definition);
+    const status = installation.status === "installed"
+      ? "installed" as const
+      : installation.status === "unsupported-version"
+        ? "unsupported version" as const
+        : installation.status === "probe-failed"
+          ? "probe failed" as const
+          : installation.status === "unsafe-output"
+            ? "unsafe probe output" as const
+            : installation.status === "unavailable"
+              ? "live probe unavailable" as const
+              : installation.status === "refresh-required"
+                ? "refresh required" as const
+                : "missing" as const;
+    const builtin = setupAgentChoices.find((choice) => choice.name === definition.id);
+    return {
+      name: definition.id,
+      adapterId: definition.adapterId,
+      command: definition.command,
+      executable: presented.executable,
+      description: builtin?.description ?? `Configured ${definition.adapterId} agent`,
+      index: index + 1,
+      status,
+      selectable: installation.status === "installed" || installation.status === "unavailable",
+      current: definition.id === currentAgent
+    };
+  });
 }
 
-function commandOnPath(command: string, env: NodeJS.ProcessEnv): boolean {
-  if (command.includes("/") || command.includes("\\")) {
-    return existsSync(command);
-  }
-
-  const pathEntries = (env.PATH ?? "").split(delimiter).filter((entry) => entry.length > 0);
-  const extensions =
-    process.platform === "win32"
-      ? (env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter((entry) => entry.length > 0)
-      : [""];
-
-  return pathEntries.some((entry) =>
-    extensions.some((extension) => existsSync(join(entry, `${command}${extension}`)))
-  );
+function isSupportedSessionAgent(definition: AgentDefinition): boolean {
+  const adapter = findAgentAdapter(definition.adapterId);
+  return adapter !== null &&
+    adapter.capabilities.recover &&
+    adapter.capabilities.nativeSessionDiscovery !== "none";
 }
 
 function parseAgentSelection(
   input: string,
   options: SetupAgentOption[],
-  defaultOption: SetupAgentOption,
-  env: NodeJS.ProcessEnv
+  defaultOption: SetupAgentOption | undefined
 ): SetupAgentOption {
   const value = input.trim();
 
   if (value.length === 0) {
+    if (defaultOption === undefined) {
+      throw usageError("No installed Codex or Claude agent is available for the Operator and Leader roles.");
+    }
     return defaultOption;
   }
 
+  let option: SetupAgentOption | undefined;
   if (/^\d+$/.test(value)) {
     const index = Number.parseInt(value, 10);
-    const option = options.find((candidate) => candidate.index === index);
+    option = options.find((candidate) => candidate.index === index);
 
     if (option === undefined) {
-      throw usageError(`Agent selection must be between 1 and ${options.length}, or a custom agent name.`);
+      throw usageError(`Agent selection must be between 1 and ${options.length}, or a listed agent name.`);
     }
-
-    return option;
+  } else {
+    option = options.find((candidate) => candidate.name === value);
+    if (option === undefined) {
+      throw usageError(`Agent ${value} is not a listed Codex or Claude definition. Configure it with taskmux agent add first.`);
+    }
   }
 
-  if (!/^[A-Za-z0-9_-]+$/.test(value)) {
-    throw usageError("Agent name may only contain letters, numbers, hyphens, and underscores.");
+  if (!option.selectable) {
+    throw usageError(
+      `Agent ${option.name} cannot be used for the Operator or Leader roles: ${option.status}.`
+    );
   }
-
-  return {
-    name: value,
-    description: "Custom agent",
-    index: options.length + 1,
-    installed: commandOnPath(value, env),
-    current: false
-  };
+  return option;
 }
 
-function resolveDefaultAgentOption(
-  options: SetupAgentOption[],
-  currentAgent: string,
-  env: NodeJS.ProcessEnv
-): SetupAgentOption {
-  const currentOption = options.find((option) => option.current);
+function resolveDefaultAgentOption(options: SetupAgentOption[]): SetupAgentOption | undefined {
+  const currentOption = options.find((option) => option.current && option.selectable);
 
   if (currentOption !== undefined) {
     return currentOption;
   }
-
-  if (currentAgent.length > 0) {
-    return {
-      name: currentAgent,
-      description: "Current custom agent",
-      index: options.length + 1,
-      installed: commandOnPath(currentAgent, env),
-      current: true
-    };
-  }
-
-  return options.find((option) => option.installed) ?? options[0];
+  return options.find((option) => option.selectable);
 }
 
 function tableWidth(io: SetupIo): number {
@@ -371,7 +431,13 @@ function shouldPrompt(io: SetupIo): io is InteractiveSetupIo {
   return io.input !== undefined && io.output !== undefined && (io.forceInteractive === true || io.input.isTTY === true);
 }
 
-function setupSystemRoles(store: TaskStore, agent: AgentDefinition | null, workspace: string | undefined): void {
+export function setupSystemRoles(
+  store: TaskStore,
+  agent: AgentDefinition | null,
+  workspace: string | undefined,
+  now = new Date(),
+  probeRuntime?: SetupRoleRuntimeProbe
+): void {
   if (agent === null) {
     return;
   }
@@ -381,8 +447,115 @@ function setupSystemRoles(store: TaskStore, agent: AgentDefinition | null, works
   }
 
   for (const roleName of [SYSTEM_OPERATOR_ROLE, SYSTEM_LEADER_ROLE]) {
-    store.saveGlobalRole(createGlobalRole(roleName, agent, workspace, new Date()));
+    const existing = store.getGlobalRole(roleName);
+    if (existing === null) {
+      store.saveGlobalRoleWithSessionSet(
+        createGlobalRole(roleName, [createRoleAgentBinding(agent)], agent.id, workspace, now),
+        null
+      );
+      continue;
+    }
+
+    const currentBinding = existing.agentBindings[agent.id];
+    const bindingMatches = currentBinding?.adapterId === agent.adapterId;
+    if (bindingMatches && existing.activeAgentId === agent.id) {
+      store.saveGlobalRoleWithSessionSet(existing, store.getGlobalRoleSessionSet(roleName));
+      continue;
+    }
+    const agentBindings = bindingMatches
+      ? existing.agentBindings
+      : { ...existing.agentBindings, [agent.id]: createRoleAgentBinding(agent) };
+    if (probeRuntime === undefined) {
+      throw usageError("Setup requires the system Role runtime guard before switching Agents.");
+    }
+    const sessionSet = store.getGlobalRoleSessionSet(roleName) ?? createRoleSessionSet(
+      { scope: "global", roleName },
+      existing.activeAgentId,
+      now
+    );
+    const boundRole = bindingMatches
+      ? existing
+      : updateGlobalRole(existing, { agentBindings }, now);
+    const switched = switchActiveRoleAgent(
+      boundRole,
+      sessionSet,
+      agent.id,
+      probeRuntime(roleName),
+      now
+    );
+    store.saveGlobalRoleWithSessionSet(switched.role, switched.sessions);
   }
+}
+
+export function commitSetupSystemState(
+  store: FileTaskStore,
+  configuredAgent: ConfiguredAgent,
+  workspace: string,
+  tmux: SetupTmuxProbe,
+  now = new Date()
+): void {
+  const persist = (transactionStore: FileTaskStore): void => {
+    const existingAgent = transactionStore.getConfiguredAgent(configuredAgent.id);
+    const persistedAgent = existingAgent === null
+      ? transactionStore.createConfiguredAgentIfAbsent(configuredAgent)
+      : sameSetupAgentConfiguration(existingAgent, configuredAgent)
+        ? existingAgent
+      : transactionStore.updateConfiguredAgent(
+        configuredAgent.id,
+        {
+          adapterId: configuredAgent.adapterId,
+          command: configuredAgent.command,
+          baseArgs: configuredAgent.baseArgs,
+          environment: configuredAgent.environment,
+          probePin: configuredAgent.probePin ?? null,
+          probePinRefreshRequired: configuredAgent.probePinRefreshRequired ?? null
+        },
+        new Date(configuredAgent.updatedAt)
+      )?.agent ?? null;
+    if (persistedAgent === null) {
+      throw usageError(`Agent registry changed during setup: ${configuredAgent.id}. Run setup again.`);
+    }
+    transactionStore.saveConfig({
+      ...transactionStore.getConfig(),
+      defaultAgent: persistedAgent.id,
+      defaultWorkspace: workspace
+    });
+    setupSystemRoles(
+      transactionStore,
+      configuredAgentToDefinition(persistedAgent),
+      workspace,
+      now,
+      (roleName) => ({
+        activeRun: transactionStore.getActiveAgentRun("operator", roleName) !== null,
+        nativeProcessRunning: tmux.probeRoleStatus("operator", roleName) === "running"
+      })
+    );
+  };
+  if (hasActiveDomainTransactionAuthority(store.rootDirectory())) {
+    persist(store);
+    return;
+  }
+  executeDomainTransaction(store.rootDirectory(), `setup-${randomUUID()}`, (workingRoot) => {
+    persist(new FileTaskStore(workingRoot));
+  });
+}
+
+function sameSetupAgentConfiguration(left: ConfiguredAgent, right: ConfiguredAgent): boolean {
+  return left.adapterId === right.adapterId &&
+    left.command === right.command &&
+    left.baseArgs.length === right.baseArgs.length &&
+    left.baseArgs.every((value, index) => value === right.baseArgs[index]) &&
+    left.environment.length === right.environment.length &&
+    left.environment.every((binding, index) => {
+      const candidate = right.environment[index];
+      return candidate !== undefined &&
+        binding.target === candidate.target &&
+        binding.source === candidate.source &&
+        binding.sourceName === candidate.sourceName &&
+        binding.required === candidate.required;
+    }) &&
+    JSON.stringify(left.probePin) === JSON.stringify(right.probePin) &&
+    left.probePinRefreshRequired === right.probePinRefreshRequired;
 }
 
 function parseSetupOptions(args: string[]): SetupOptions {

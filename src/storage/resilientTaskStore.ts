@@ -1,4 +1,14 @@
-import { CliError } from "../errors/cliError.js";
+import { CliError, dataError } from "../errors/cliError.js";
+import {
+  roleAgentSessionIdentities,
+  type GlobalRoleSessionSet,
+  type TaskRoleSessionSet
+} from "../executor/agentExecutor.js";
+import {
+  nativeSessionIdentityKey,
+  nativeSessionIdentityOwner,
+  nativeSessionIdentityOwnerKey
+} from "./taskStore.js";
 import type { TaskReader, TaskStore } from "./taskStore.js";
 
 // Only derived renderings can remain available after an isolated malformed
@@ -100,13 +110,31 @@ export function primeResilientTaskStore(store: TaskStore): void {
 }
 
 function primeResilientTaskStoreSnapshot(store: TaskReader): void {
+  const nativeSessions = new Map<string, string>();
+  const assertUniqueSessions = (set: GlobalRoleSessionSet | TaskRoleSessionSet): void => {
+    for (const [agentId, session] of Object.entries(set.sessions)) {
+      const owner = nativeSessionIdentityOwnerKey(nativeSessionIdentityOwner(set.owner, agentId));
+      for (const identity of roleAgentSessionIdentities(session)) {
+        const key = nativeSessionIdentityKey(identity);
+        const existing = nativeSessions.get(key);
+        if (existing !== undefined && existing !== owner) {
+          throw dataError("Native Agent session identity is owned by multiple Role Agents.");
+        }
+        nativeSessions.set(key, owner);
+      }
+    }
+  };
+
   store.getConfig();
   store.listTrashedTaskIds();
+  store.nativeSessionIdentityClaims();
+  for (const sessions of store.listAllRoleSessionSets()) assertUniqueSessions(sessions);
   for (const wakeup of store.listPendingWakeups()) {
     store.getPendingWakeup(wakeup.taskId);
   }
   for (const role of store.listGlobalRoles()) {
     store.getGlobalRole(role.name);
+    store.getGlobalRoleSessionSet(role.name);
   }
   for (const agent of store.listConfiguredAgents()) {
     store.getConfiguredAgent(agent.id);
@@ -153,6 +181,7 @@ function primeResilientTaskStoreSnapshot(store: TaskReader): void {
       store.getRole(task.id, role.name);
       store.getRoleWorktree(task.id, role.name);
       store.getAgentSession(task.id, role.name);
+      store.getRoleSessionSet(task.id, role.name);
       store.getActiveAgentRun(task.id, role.name);
       store.readTranscript(task.id, role.name);
     }

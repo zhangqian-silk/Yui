@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { dataError } from "../errors/cliError.js";
-import type { Role } from "../role/role.js";
+import { activeRoleAgentBinding, type Role } from "../role/role.js";
 import { resolveTaskmuxHome, type TaskReader } from "../storage/taskStore.js";
 
 export function compileDispatchInput(
@@ -31,7 +31,7 @@ export function compileDispatchInput(
       `Expected output: ${child.expectedOutput}`
     ].join("\n"));
   const configuredSkills = readConfiguredSkills(role.skills ?? []);
-  const sessionRegistration = role.agent === "codex"
+  const sessionRegistration = activeRoleAgentBinding(role).adapterId === "codex"
     ? [
         "Native session bookkeeping:",
         "Before doing Task work, if CODEX_THREAD_ID is available, register it with:",

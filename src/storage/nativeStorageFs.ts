@@ -24,6 +24,7 @@ export type NativeExactIdentity = Readonly<{
 
 export type NativePublicationReceipt = NativeExactIdentity & Readonly<{
   size: bigint;
+  mtimeMs: number;
 }>;
 
 declare const nativeStableAncestorBarrierBrand: unique symbol;

@@ -1,9 +1,11 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { dataError } from "../errors/cliError.js";
 import { assertTaskmuxHomeReady } from "./taskStore.js";
+import { writeTextFileAtomically } from "./durableFile.js";
+import { migrateStorageSchemaV3ToV4 } from "./storageSchemaMigration.js";
 
-export const CURRENT_STORAGE_SCHEMA_VERSION = 3;
+export const CURRENT_STORAGE_SCHEMA_VERSION = 4;
 export const STORAGE_SCHEMA_FILE = "schema.json";
 
 export type StorageSchemaManifest = {
@@ -78,7 +80,12 @@ export function inspectStorageSchema(rootDir: string): StorageSchemaState {
 }
 
 export function ensureStorageSchema(rootDir: string): void {
-  const state = inspectStorageSchema(rootDir);
+  let state = inspectStorageSchema(rootDir);
+
+  if (state.status === "unsupported" && state.currentVersion === 3) {
+    migrateStorageSchemaV3ToV4(rootDir);
+    state = inspectStorageSchema(rootDir);
+  }
 
   switch (state.status) {
     case "uninitialized":
@@ -95,7 +102,12 @@ export function ensureStorageSchema(rootDir: string): void {
 
 export function requireStorageSchema(rootDir: string): void {
   assertTaskmuxHomeReady(rootDir);
-  const state = inspectStorageSchema(rootDir);
+  let state = inspectStorageSchema(rootDir);
+
+  if (state.status === "unsupported" && state.currentVersion === 3) {
+    migrateStorageSchemaV3ToV4(rootDir);
+    state = inspectStorageSchema(rootDir);
+  }
 
   switch (state.status) {
     case "uninitialized":
@@ -123,7 +135,7 @@ function writeStorageManifest(rootDir: string, storageVersion: number, now: Date
   };
 
   mkdirSync(rootDir, { recursive: true });
-  writeFileSync(storageSchemaFile(rootDir), `${JSON.stringify(manifest, null, 2)}\n`);
+  writeTextFileAtomically(storageSchemaFile(rootDir), `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
 function storageSchemaFile(rootDir: string): string {

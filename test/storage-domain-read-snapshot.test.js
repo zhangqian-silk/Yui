@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   mkdtempSync,
   mkdirSync,
   renameSync,
@@ -8,7 +9,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../dist/agent/agent.js";
@@ -32,7 +33,9 @@ import { FileTaskStore } from "../dist/storage/taskStore.js";
 import { createTask } from "../dist/task/task.js";
 import { createAgentRun } from "../dist/run/agentRun.js";
 import { dataError } from "../dist/errors/cliError.js";
+import { enrollAgentCapabilityProbePin } from "../dist/executor/agentAdapter.js";
 import { processLeaderWakeups } from "../dist/scheduler/leaderWakeupProcessor.js";
+import { createRoleExpiryNotification } from "../dist/scheduler/operatorNotification.js";
 import { mergePendingWakeup } from "../dist/scheduler/pendingWakeup.js";
 import {
   expireStaleAgentRuns,
@@ -47,13 +50,36 @@ function fixtureHome(prefix = "taskmux-domain-read-") {
 }
 
 function roleFixture(store) {
-  const agent = createConfiguredAgent("codex", "codex", [], {}, now);
+  const fixtureBin = join(store.rootDirectory(), "fixture-bin");
+  mkdirSync(fixtureBin, { recursive: true });
+  const fixtureCodex = join(fixtureBin, "codex");
+  writeFileSync(
+    fixtureCodex,
+    `#!${process.execPath}\n` +
+      `if (process.argv.includes("--version")) process.stdout.write("codex-cli 0.144.1\\n");\n`
+  );
+  chmodSync(fixtureCodex, 0o700);
+  const probePin = enrollAgentCapabilityProbePin(
+    { adapterId: "codex", command: "codex" },
+    {
+      ...process.env,
+      PATH: [fixtureBin, dirname(process.execPath), process.env.PATH]
+        .filter((value) => typeof value === "string" && value.length > 0)
+        .join(delimiter)
+    }
+  );
+  assert.ok(probePin, "Expected a canonical Codex capability probe pin for the role fixture.");
+  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], now, probePin);
   store.saveConfiguredAgent(agent);
   store.saveTask(createTask("task-1", "Snapshot fixture", now));
-  store.saveRole("task-1", createRole("leader", {
-    ...agent,
-    source: "custom"
-  }, "/repo", now));
+  store.saveRole("task-1", createRole(
+    "task-1",
+    "leader",
+    [{ agentId: agent.id, adapterId: agent.adapterId, config: { adapterId: agent.adapterId } }],
+    agent.id,
+    "/repo",
+    now
+  ));
 }
 
 async function waitForLine(stream, expected, child, stderr) {
@@ -291,18 +317,20 @@ test("read-only aggregate consumers each use one coherent snapshot", (t) => {
   runTaskCommand(["board", "--with-roles"], store);
   assert.equal(snapshots, 1, "task board");
   snapshots = 0;
-  const exportFile = join(home, "export.json");
+  const exportHome = fixtureHome("taskmux-domain-read-export-");
+  t.after(() => rmSync(exportHome, { recursive: true, force: true }));
+  const exportFile = join(exportHome, "export.json");
   runExportCommand(["--output", exportFile], store);
-  assert.equal(snapshots, 1, "export");
+  assert.equal(snapshots, 0, "export uses a domain transaction");
   snapshots = 0;
   expireStaleAgentRuns(store, now, 1);
-  assert.equal(snapshots, 1, "expire stale scheduler reads");
+  assert.equal(snapshots, 0, "expire stale scheduler uses role runtime transactions");
   snapshots = 0;
   failExitedAgentRuns(store, { detectRoleStatus: () => "running" }, now);
-  assert.equal(snapshots, 1, "exited-run scheduler reads");
+  assert.equal(snapshots, 0, "exited-run scheduler uses role runtime transactions");
   snapshots = 0;
   scanTaskWakeups(store, now);
-  assert.equal(snapshots, 1, "wakeup scheduler reads");
+  assert.equal(snapshots, 0, "wakeup scheduler uses role runtime transactions");
 });
 
 test("completion reads its initial state from one snapshot before prompting", async (t) => {
@@ -412,6 +440,25 @@ test("resilient priming validates orphan pending-wakeup records", (t) => {
   assert.throws(() => primeResilientTaskStore(store), /Invalid pending wakeup/i);
 });
 
+test("Role expiry notifications round-trip through authoritative storage", (t) => {
+  const home = fixtureHome("taskmux-domain-read-role-expiry-notification-");
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const store = new FileTaskStore(home);
+  const notification = createRoleExpiryNotification(
+    "task-1",
+    "reviewer",
+    "codex",
+    "agent-run-1",
+    "role-expiry-identity-drift",
+    now,
+    null
+  );
+
+  store.saveOperatorNotification(notification);
+
+  assert.deepEqual(store.getOperatorNotification("task-1"), notification);
+});
+
 test("leader wakeups use compare-and-clear without deleting an intervening replacement", (t) => {
   const home = fixtureHome("taskmux-domain-read-wakeup-");
   t.after(() => rmSync(home, { recursive: true, force: true }));
@@ -427,10 +474,14 @@ test("leader wakeups use compare-and-clear without deleting an intervening repla
   };
   store.savePendingWakeup(wakeup);
   let replacement;
-  const clearIfUnchanged = store.clearPendingWakeupIfUnchanged;
-  let compareAndClearCalls = 0;
-  store.clearPendingWakeupIfUnchanged = (expected) => {
-    compareAndClearCalls += 1;
+  const originalSnapshot = store.runReadSnapshot.bind(store);
+  let snapshots = 0;
+  store.runReadSnapshot = (execute) => {
+    snapshots += 1;
+    return originalSnapshot(execute);
+  };
+  const runtime = {
+    dispatchRole() {
     replacement = mergePendingWakeup(
       "task-1",
       "operator-input",
@@ -438,16 +489,17 @@ test("leader wakeups use compare-and-clear without deleting an intervening repla
       store.getPendingWakeup("task-1")
     );
     store.savePendingWakeup(replacement);
-    return clearIfUnchanged.call(store, expected);
-  };
-  const runtime = {
-    dispatchRole() {}
+    return true;
+    },
+    killRoleLaunchAndConfirmStopped() {
+      return true;
+    }
   };
 
   const result = processLeaderWakeups(store, runtime, now);
 
   assert.deepEqual(result, [{ taskId: "task-1", status: "dispatched" }]);
-  assert.equal(compareAndClearCalls, 1);
+  assert.equal(snapshots, 1);
   assert.deepEqual(store.getPendingWakeup("task-1"), replacement);
 });
 

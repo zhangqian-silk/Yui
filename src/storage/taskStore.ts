@@ -3,8 +3,10 @@ import {
   chmodSync,
   closeSync,
   constants,
+  existsSync,
   fstatSync,
   lstatSync,
+  mkdtempSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -14,23 +16,42 @@ import {
   rmSync
 } from "node:fs";
 import type { BigIntStats } from "node:fs";
-import { userInfo } from "node:os";
-import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
-import { types as utilTypes } from "node:util";
+import { tmpdir, userInfo } from "node:os";
+import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import { isDeepStrictEqual, types as utilTypes } from "node:util";
 import type { TaskComment } from "../comment/comment.js";
 import type { Milestone } from "../milestone/milestone.js";
 import type { Decision } from "../decision/decision.js";
 import type { Cycle } from "../cycle/cycle.js";
-import { dataError } from "../errors/cliError.js";
+import { dataError, usageError } from "../errors/cliError.js";
 import type { TaskEvent } from "../event/taskEvent.js";
-import type { AgentSession } from "../executor/agentExecutor.js";
+import {
+  activeRoleAgentSession,
+  type GlobalRoleSessionSet,
+  type NativeSessionIdentity,
+  type RoleAgentSession,
+  roleAgentSessionIdentities,
+  type RoleSessionOwner,
+  type TaskRoleSessionSet
+} from "../executor/agentExecutor.js";
+import {
+  isCanonicalNativeSessionId,
+  isCanonicalNativeSessionRoot
+} from "../executor/nativeSessionIdentity.js";
+import { assertRuntimeOperationAllowsMutation } from "../executor/roleRuntimeOperationClaim.js";
 import type { TaskInputDraft } from "../input/taskInput.js";
 import type { InputRequest, InputResolution } from "../input/inputRequest.js";
 import { isInputRequestRecord, isInputResolutionRecord } from "../input/inputRecordCodec.js";
 import type { GlobalRole, Role } from "../role/role.js";
 import type { ChildRole } from "../role/childRole.js";
 import type { AgentRun } from "../run/agentRun.js";
-import type { ConfiguredAgent } from "../agent/agent.js";
+import {
+  createConfiguredAgent,
+  isProbeExecutablePin,
+  type ConfiguredAgent,
+  type EnvironmentBinding,
+  type ProbeExecutablePin
+} from "../agent/agent.js";
 import { pendingWakeupsMatch, type PendingWakeup } from "../scheduler/pendingWakeup.js";
 import type { LeaderFailure } from "../scheduler/leaderFailure.js";
 import type { OperatorNotification } from "../scheduler/operatorNotification.js";
@@ -41,14 +62,32 @@ import type { WorkItem } from "../workItem/workItem.js";
 import type { RoleWorktree } from "../worktree/worktree.js";
 import { taskRecordCodec } from "./taskRecordCodec.js";
 import {
+  isSafeStorageSegment,
+  sessionSetMatchesRole,
+  snapshotConfiguredAgentRecord,
+  snapshotGlobalRoleRecord,
+  snapshotGlobalRoleSessionSetRecord,
+  snapshotTaskRoleRecord,
+  snapshotTaskRoleSessionSetRecord
+} from "./recordValidation.js";
+import {
+  hasExactOwnKeys,
+  lowerUnknownInertData,
+  stringifyCanonicalInertData
+} from "./inertData.js";
+import { hasNoSurroundingWhitespace } from "./stringValidation.js";
+import {
   executeDomainReadSnapshot,
   executeDomainTransaction,
   hasActiveDomainTransactionAuthority
 } from "./domainTransaction.js";
 import type { NativePinnedRootReader } from "./nativeStorageFs.js";
 import { writeRecoverableSnapshot } from "./recoveryJournal.js";
+import { writeTextFileAtomically } from "./durableFile.js";
 
 const INPUT_POINTER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const GIT_OID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const MAX_PINNED_READ_BYTES = 64 * 1024 * 1024;
 const DIRECTORY_MODE = 0o040000n;
 const REGULAR_FILE_MODE = 0o100000n;
@@ -60,7 +99,48 @@ const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOf = Object.getPrototypeOf;
 const isProxy = utilTypes.isProxy;
 
+export type ConfiguredAgentUpdateResult = {
+  status: "updated" | "unchanged";
+  agent: ConfiguredAgent;
+};
+
+export type GlobalNativeSessionIdentityOwner = {
+  scope: "global";
+  roleName: string;
+  agentId: string;
+};
+
+export type TaskNativeSessionIdentityOwner = {
+  scope: "task";
+  taskId: string;
+  roleName: string;
+  agentId: string;
+};
+
+export type NativeSessionIdentityOwner =
+  | GlobalNativeSessionIdentityOwner
+  | TaskNativeSessionIdentityOwner;
+
+export type NativeSessionIdentityClaim =
+  | { state: "owned"; owner: NativeSessionIdentityOwner }
+  | { state: "retired" };
+
+type NativeSessionIdentityLedger = {
+  schemaVersion: 3;
+  identities: Record<string, NativeSessionIdentityClaim>;
+};
+
+export type ConfiguredAgentPatch = {
+  adapterId?: string;
+  command?: string;
+  baseArgs?: string[];
+  environment?: EnvironmentBinding[];
+  probePin?: ProbeExecutablePin | null;
+  probePinRefreshRequired?: true | null;
+};
+
 export type TaskStore = {
+  rootDirectory(): string;
   runReadSnapshot<T>(execute: (reader: TaskReader) => T): T;
   getConfig(): TaskmuxConfig;
   saveConfig(config: TaskmuxConfig): void;
@@ -103,8 +183,17 @@ export type TaskStore = {
   getWorkItem(taskId: string, workItemId: string): WorkItem | null;
   listWorkItems(taskId: string): WorkItem[];
   saveWorkItem(taskId: string, workItem: WorkItem): void;
-  getAgentSession(taskId: string, roleName: string): AgentSession | null;
-  saveAgentSession(session: AgentSession): void;
+  getRoleSessionSet(taskId: string, roleName: string): TaskRoleSessionSet | null;
+  listRoleSessionSets(taskId: string): TaskRoleSessionSet[];
+  listAllRoleSessionSets(): Array<GlobalRoleSessionSet | TaskRoleSessionSet>;
+  nativeSessionIdentityClaims(): Map<string, NativeSessionIdentityClaim>;
+  reconcileNativeSessionIdentityLedger(): void;
+  mergeImportedNativeSessionIdentityClaims(imported: Record<string, NativeSessionIdentityClaim>): void;
+  saveRoleSessionSet(sessionSet: TaskRoleSessionSet): void;
+  getGlobalRoleSessionSet(roleName: string): GlobalRoleSessionSet | null;
+  listGlobalRoleSessionSets(): GlobalRoleSessionSet[];
+  saveGlobalRoleSessionSet(sessionSet: GlobalRoleSessionSet): void;
+  getAgentSession(taskId: string, roleName: string): RoleAgentSession | null;
   nextAgentRunId(taskId: string): string;
   getAgentRun(taskId: string, runId: string): AgentRun | null;
   listAgentRuns(taskId: string): AgentRun[];
@@ -127,7 +216,24 @@ export type TaskStore = {
   saveDecision(taskId: string, decision: Decision): void;
   saveRoleWorktree(taskId: string, worktree: RoleWorktree): void;
   getRoleWorktree(taskId: string, roleName: string): RoleWorktree | null;
+  listRoleWorktrees(taskId: string): RoleWorktree[];
+  removeRoleWorktree(taskId: string, roleName: string): void;
   saveRole(taskId: string, role: Role): void;
+  saveRoleWithSessionSet(
+    taskId: string,
+    role: Role,
+    sessionSet: TaskRoleSessionSet | null,
+    allowMonotonicImport?: boolean
+  ): void;
+  createRoleIfAbsent(taskId: string, role: Role): Role | null;
+  compareAndSwapRole(taskId: string, expectedUpdatedAt: string, role: Role): Role | null;
+  compareAndSwapRoleWithSessionSet(
+    taskId: string,
+    expectedUpdatedAt: string,
+    expectedSessionSet: TaskRoleSessionSet | null,
+    role: Role,
+    sessionSet: TaskRoleSessionSet
+  ): Role | null;
   renameRole(taskId: string, oldName: string, role: Role): void;
   listRoles(taskId: string): Role[];
   getRole(taskId: string, name: string): Role | null;
@@ -136,6 +242,19 @@ export type TaskStore = {
   listChildRoles(taskId: string): ChildRole[];
   removeTaskRole(taskId: string, name: string): { removed: boolean; childCount: number };
   saveGlobalRole(role: GlobalRole): void;
+  saveGlobalRoleWithSessionSet(
+    role: GlobalRole,
+    sessionSet: GlobalRoleSessionSet | null,
+    allowMonotonicImport?: boolean
+  ): void;
+  createGlobalRoleIfAbsent(role: GlobalRole): GlobalRole | null;
+  compareAndSwapGlobalRole(expectedUpdatedAt: string, role: GlobalRole): GlobalRole | null;
+  compareAndSwapGlobalRoleWithSessionSet(
+    expectedUpdatedAt: string,
+    expectedSessionSet: GlobalRoleSessionSet | null,
+    role: GlobalRole,
+    sessionSet: GlobalRoleSessionSet
+  ): GlobalRole | null;
   listGlobalRoles(): GlobalRole[];
   getGlobalRole(name: string): GlobalRole | null;
   removeGlobalRole(name: string): boolean;
@@ -146,11 +265,15 @@ export type TaskStore = {
   saveEvent(taskId: string, event: TaskEvent): void;
   listEvents(taskId: string): TaskEvent[];
   saveTranscript(taskId: string, roleName: string, transcript: string): void;
+  clearTranscript(taskId: string, roleName: string): void;
   readTranscript(taskId: string, roleName: string): string | null;
   saveConfiguredAgent(agent: ConfiguredAgent): void;
+  createConfiguredAgentIfAbsent(agent: ConfiguredAgent): ConfiguredAgent | null;
+  updateConfiguredAgent(id: string, patch: ConfiguredAgentPatch, now: Date): ConfiguredAgentUpdateResult | null;
   listConfiguredAgents(): ConfiguredAgent[];
   getConfiguredAgent(id: string): ConfiguredAgent | null;
   removeConfiguredAgent(id: string): boolean;
+  pruneTrashedTasks(taskIds?: readonly string[]): number;
 };
 
 export type TaskReader = Pick<TaskStore,
@@ -177,6 +300,12 @@ export type TaskReader = Pick<TaskStore,
   | "nextWorkItemId"
   | "getWorkItem"
   | "listWorkItems"
+  | "getRoleSessionSet"
+  | "listRoleSessionSets"
+  | "listAllRoleSessionSets"
+  | "nativeSessionIdentityClaims"
+  | "getGlobalRoleSessionSet"
+  | "listGlobalRoleSessionSets"
   | "getAgentSession"
   | "nextAgentRunId"
   | "getAgentRun"
@@ -704,10 +833,49 @@ function taskmuxHomeProcfdSystemCode(error: unknown): string | undefined {
 }
 
 export class FileTaskStore implements TaskStore {
+  static createEphemeralWorkspace(prefix = "taskmux-ephemeral-storage-"): FileTaskStore {
+    return new FileTaskStore(mkdtempSync(join(tmpdir(), prefix)), undefined, true);
+  }
+
+  static forDomainTransactionWorkspace(
+    rootDir: string,
+    runtimeOperationToken?: string,
+    runtimeRecoveryToken?: string
+  ): FileTaskStore {
+    return new FileTaskStore(
+      rootDir,
+      undefined,
+      false,
+      runtimeOperationToken,
+      runtimeRecoveryToken
+    );
+  }
+
   constructor(
     private readonly rootDir: string,
-    private readonly pinnedReader: NativePinnedRootReader | null | undefined = undefined
+    private readonly pinnedReader: NativePinnedRootReader | null | undefined = undefined,
+    private readonly ephemeral = false,
+    private readonly runtimeOperationToken?: string,
+    private readonly runtimeRecoveryToken?: string
   ) {}
+
+  rootDirectory(): string {
+    return this.rootDir;
+  }
+
+  runDomainTransaction<T>(
+    transactionId: string,
+    execute: (workingRoot: string) => T
+  ): T {
+    return executeDomainTransaction(this.rootDir, transactionId, execute);
+  }
+
+  disposeEphemeralWorkspace(): void {
+    if (!this.ephemeral) {
+      throw new Error("TaskMux storage is not an ephemeral workspace.");
+    }
+    rmSync(this.rootDir, { recursive: true, force: true });
+  }
 
   runReadSnapshot<T>(execute: (reader: TaskReader) => T): T {
     if (this.pinnedReader !== undefined) {
@@ -761,9 +929,19 @@ export class FileTaskStore implements TaskStore {
     }
 
     const trashDir = this.trashedTaskDir(id);
+    if (existsSync(trashDir)) {
+      this.retireTrashedSessionIdentities(this.listTrashedRoleSessionSets(id));
+      rmSync(trashDir, { recursive: true, force: true });
+    }
+    for (const sessionSet of this.listRoleSessionSets(id)) {
+      this.reserveSessionIdentities(sessionSet);
+    }
     mkdirSync(this.trashedTasksDir(), { recursive: true });
-    rmSync(trashDir, { recursive: true, force: true });
     renameSync(this.taskDir(id), trashDir);
+    const roleSessionSetsDir = this.roleSessionSetsDir(id);
+    if (existsSync(roleSessionSetsDir)) {
+      renameSync(roleSessionSetsDir, this.trashedRoleSessionSetsDir(id));
+    }
     return true;
   }
 
@@ -776,7 +954,24 @@ export class FileTaskStore implements TaskStore {
       throw dataError(`Cannot restore task because active task already exists: ${id}`);
     }
 
+    const roleSessionSetsDir = this.roleSessionSetsDir(id);
+    if (existsSync(roleSessionSetsDir)) {
+      throw dataError(`Cannot restore task because active Role sessions already exist: ${id}`);
+    }
+    const trashedSessionSets = this.listTrashedRoleSessionSets(id);
+    assertIdentityOwnershipsUnique(trashedSessionSets.flatMap(sessionIdentityOwnerships));
+    for (const sessionSet of trashedSessionSets) {
+      this.assertSessionIdentitiesUnique(sessionSet);
+    }
+    for (const sessionSet of trashedSessionSets) {
+      this.reserveSessionIdentities(sessionSet);
+    }
     mkdirSync(this.tasksDir(), { recursive: true });
+    const trashedRoleSessionSetsDir = this.trashedRoleSessionSetsDir(id);
+    if (existsSync(trashedRoleSessionSetsDir)) {
+      mkdirSync(dirname(roleSessionSetsDir), { recursive: true });
+      renameSync(trashedRoleSessionSetsDir, roleSessionSetsDir);
+    }
     renameSync(this.trashedTaskDir(id), this.taskDir(id));
     return true;
   }
@@ -1009,18 +1204,116 @@ export class FileTaskStore implements TaskStore {
     this.writeSnapshot(this.workItemFile(taskId, workItem.id), `${JSON.stringify(workItem, null, 2)}\n`);
   }
 
-  getAgentSession(taskId: string, roleName: string): AgentSession | null {
-    const raw = this.readOptionalText(this.agentSessionFile(taskId, roleName));
-
-    return raw === null ? null : parseAgentSession(taskId, roleName, raw);
+  getRoleSessionSet(taskId: string, roleName: string): TaskRoleSessionSet | null {
+    const raw = this.readOptionalText(this.roleSessionSetFile(taskId, roleName));
+    if (raw === null) return null;
+    const sessionSet = parseTaskRoleSessionSet(taskId, roleName, raw);
+    const role = this.getRole(taskId, roleName);
+    if (role === null || !sessionSetMatchesRole(sessionSet, role)) {
+      throw dataError(`Invalid role session set: ${taskId}/${roleName}`);
+    }
+    return sessionSet;
   }
 
-  saveAgentSession(session: AgentSession): void {
-    mkdirSync(this.agentSessionsDir(session.taskId), { recursive: true });
-    this.writeSnapshot(
-      this.agentSessionFile(session.taskId, session.roleName),
-      `${JSON.stringify(session, null, 2)}\n`
+  listRoleSessionSets(taskId: string): TaskRoleSessionSet[] {
+    return this.jsonRecordIds(this.roleSessionSetsDir(taskId))
+      .map((roleName) => this.getRoleSessionSet(taskId, roleName))
+      .filter((sessionSet): sessionSet is TaskRoleSessionSet => sessionSet !== null);
+  }
+
+  listAllRoleSessionSets(): Array<GlobalRoleSessionSet | TaskRoleSessionSet> {
+    return [
+      ...this.listGlobalRoleSessionSets(),
+      ...this.directoryNames(join(this.roleSessionsDir(), "tasks"))
+        .flatMap((taskId) => this.listRoleSessionSets(taskId))
+    ];
+  }
+
+  nativeSessionIdentityClaims(): Map<string, NativeSessionIdentityClaim> {
+    return new Map(Object.entries(this.readNativeSessionIdentityLedger().identities));
+  }
+
+  reconcileNativeSessionIdentityLedger(): void {
+    const ledger = this.readNativeSessionIdentityLedger();
+    this.writeNativeSessionIdentityLedger(
+      this.reconcileIdentityClaims(ledger.identities, this.physicalSessionIdentityOwners())
     );
+  }
+
+  mergeImportedNativeSessionIdentityClaims(
+    imported: Record<string, NativeSessionIdentityClaim>
+  ): void {
+    const storedImported = snapshotNativeSessionIdentityClaims(imported);
+    if (storedImported === null) throw dataError("Invalid imported native session identity ledger.");
+    const ledger = this.readNativeSessionIdentityLedger();
+    const identities = { ...ledger.identities };
+    for (const [key, claim] of Object.entries(storedImported)) {
+      const existing = identities[key];
+      if (existing !== undefined && !nativeSessionIdentityClaimsMatch(existing, claim)) {
+        throw dataError("Imported native session identity conflicts with the target ledger.");
+      }
+      identities[key] = claim;
+    }
+    this.writeNativeSessionIdentityLedger(
+      this.reconcileIdentityClaims(identities, this.physicalSessionIdentityOwners())
+    );
+  }
+
+  saveRoleSessionSet(sessionSet: TaskRoleSessionSet): void {
+    const stored = snapshotTaskRoleSessionSetRecord(sessionSet);
+    if (stored === null) throw dataError("Task Role session storage requires a task owner.");
+    const role = this.getRole(stored.owner.taskId, stored.owner.roleName);
+    if (role === null || !sessionSetMatchesRole(stored, role)) {
+      throw dataError(`Invalid role session set: ${stored.owner.taskId}/${stored.owner.roleName}`);
+    }
+    const existing = this.getRoleSessionSet(stored.owner.taskId, stored.owner.roleName);
+    this.assertSessionIdentityLineagePreserved(existing, stored);
+    this.assertSessionIdentitiesUnique(stored);
+    this.reserveSessionIdentities(stored);
+    mkdirSync(this.roleSessionSetsDir(stored.owner.taskId), { recursive: true });
+    this.writeSnapshot(
+      this.roleSessionSetFile(stored.owner.taskId, stored.owner.roleName),
+      `${JSON.stringify(stored, null, 2)}\n`
+    );
+  }
+
+  getGlobalRoleSessionSet(roleName: string): GlobalRoleSessionSet | null {
+    const raw = this.readOptionalText(this.globalRoleSessionSetFile(roleName));
+    if (raw === null) return null;
+    const sessionSet = parseGlobalRoleSessionSet(roleName, raw);
+    const role = this.getGlobalRole(roleName);
+    if (role === null || !sessionSetMatchesRole(sessionSet, role)) {
+      throw dataError(`Invalid global role session set: ${roleName}`);
+    }
+    return sessionSet;
+  }
+
+  listGlobalRoleSessionSets(): GlobalRoleSessionSet[] {
+    return this.jsonRecordIds(this.globalRoleSessionSetsDir())
+      .map((roleName) => this.getGlobalRoleSessionSet(roleName))
+      .filter((sessionSet): sessionSet is GlobalRoleSessionSet => sessionSet !== null);
+  }
+
+  saveGlobalRoleSessionSet(sessionSet: GlobalRoleSessionSet): void {
+    const stored = snapshotGlobalRoleSessionSetRecord(sessionSet);
+    if (stored === null) throw dataError("Global Role session storage requires a global owner.");
+    const role = this.getGlobalRole(stored.owner.roleName);
+    if (role === null || !sessionSetMatchesRole(stored, role)) {
+      throw dataError(`Invalid global role session set: ${stored.owner.roleName}`);
+    }
+    const existing = this.getGlobalRoleSessionSet(stored.owner.roleName);
+    this.assertSessionIdentityLineagePreserved(existing, stored);
+    this.assertSessionIdentitiesUnique(stored);
+    this.reserveSessionIdentities(stored);
+    mkdirSync(this.globalRoleSessionSetsDir(), { recursive: true });
+    this.writeSnapshot(
+      this.globalRoleSessionSetFile(stored.owner.roleName),
+      `${JSON.stringify(stored, null, 2)}\n`
+    );
+  }
+
+  getAgentSession(taskId: string, roleName: string): RoleAgentSession | null {
+    return activeRoleAgentSession(this.getRoleSessionSet(taskId, roleName));
   }
 
   nextAgentRunId(taskId: string): string {
@@ -1141,26 +1434,209 @@ export class FileTaskStore implements TaskStore {
     return raw === null ? null : parseRoleWorktree(taskId, roleName, raw);
   }
 
-  saveRole(taskId: string, role: Role): void {
-    const storageName = this.resolveRoleStorageName(taskId, role.name) ?? role.name;
-    const roleDir = this.roleDir(taskId, storageName);
-    const encoded = taskRecordCodec.encodeRole(role);
+  listRoleWorktrees(taskId: string): RoleWorktree[] {
+    return this.listRoles(taskId)
+      .map((role) => this.getRoleWorktree(taskId, role.name))
+      .filter((worktree): worktree is RoleWorktree => worktree !== null)
+      .sort((left, right) => left.roleName.localeCompare(right.roleName));
+  }
 
+  removeRoleWorktree(taskId: string, roleName: string): void {
+    rmSync(this.roleWorktreeFile(taskId, roleName), { force: true });
+  }
+
+  saveRole(taskId: string, role: Role): void {
+    const storedRole = snapshotTaskRoleRecord(role, taskId);
+    if (storedRole === null) throw dataError("Invalid role record");
+    if (this.getChildRole(taskId, storedRole.name) !== null) {
+      throw dataError(`Role name is already owned by a child role: ${taskId}/${storedRole.name}`);
+    }
+    const sessionRaw = this.readOptionalText(this.roleSessionSetFile(taskId, storedRole.name));
+    if (sessionRaw !== null) {
+      const sessionSet = parseTaskRoleSessionSet(taskId, storedRole.name, sessionRaw);
+      if (!sessionSetMatchesRole(sessionSet, storedRole)) {
+        throw dataError(`Role update is incompatible with its session set: ${taskId}/${storedRole.name}`);
+      }
+      this.reserveSessionIdentities(sessionSet);
+    }
+    this.writeRoleRecord(taskId, storedRole);
+  }
+
+  saveRoleWithSessionSet(
+    taskId: string,
+    role: Role,
+    sessionSet: TaskRoleSessionSet | null,
+    allowMonotonicImport = false
+  ): void {
+    const storedRole = snapshotTaskRoleRecord(role, taskId);
+    const storedSessionSet = sessionSet === null
+      ? null
+      : snapshotTaskRoleSessionSetRecord(sessionSet, taskId, role.name);
+    if (
+      storedRole === null ||
+      (sessionSet !== null && (storedSessionSet === null || !sessionSetMatchesRole(storedSessionSet, storedRole)))
+    ) {
+      throw dataError(`Invalid Role/session state: ${taskId}/${role.name}`);
+    }
+    if (this.getChildRole(taskId, storedRole.name) !== null) {
+      throw dataError(`Role name is already owned by a child role: ${taskId}/${storedRole.name}`);
+    }
+    const existingSessionSet = this.getRoleSessionSet(taskId, storedRole.name);
+    this.assertSessionIdentityLineagePreserved(
+      existingSessionSet,
+      storedSessionSet,
+      allowMonotonicImport
+    );
+    if (existingSessionSet !== null) this.reserveSessionIdentities(existingSessionSet);
+    if (storedSessionSet !== null) {
+      this.assertSessionIdentitiesUnique(storedSessionSet);
+      this.reserveSessionIdentities(storedSessionSet);
+    }
+    this.writeRoleRecord(taskId, storedRole);
+    if (storedSessionSet === null) {
+      rmSync(this.roleSessionSetFile(taskId, storedRole.name), { force: true });
+      return;
+    }
+    mkdirSync(this.roleSessionSetsDir(taskId), { recursive: true });
+    this.writeSnapshot(
+      this.roleSessionSetFile(taskId, storedRole.name),
+      `${JSON.stringify(storedSessionSet, null, 2)}\n`
+    );
+  }
+
+  createRoleIfAbsent(taskId: string, role: Role): Role | null {
+    const storedRole = snapshotTaskRoleRecord(role, taskId);
+    if (storedRole === null) throw dataError("Invalid role record");
+    if (
+      this.getRole(taskId, storedRole.name) !== null ||
+      this.readOptionalText(this.roleInfoFile(taskId, storedRole.name)) !== null
+    ) return null;
+    this.saveRole(taskId, storedRole);
+    return storedRole;
+  }
+
+  compareAndSwapRole(taskId: string, expectedUpdatedAt: string, role: Role): Role | null {
+    const storedRole = snapshotTaskRoleRecord(role, taskId);
+    if (storedRole === null) throw dataError("Invalid role record");
+    const current = this.getRole(taskId, storedRole.name);
+    if (current === null || current.updatedAt !== expectedUpdatedAt) return null;
+    const updated = withCanonicalRoleRevision(storedRole, current.updatedAt);
+    this.saveRole(taskId, updated);
+    return updated;
+  }
+
+  compareAndSwapRoleWithSessionSet(
+    taskId: string,
+    expectedUpdatedAt: string,
+    expectedSessionSet: TaskRoleSessionSet | null,
+    role: Role,
+    sessionSet: TaskRoleSessionSet
+  ): Role | null {
+    const storedRole = snapshotTaskRoleRecord(role, taskId);
+    const storedExpected = expectedSessionSet === null
+      ? null
+      : snapshotTaskRoleSessionSetRecord(expectedSessionSet, taskId, role.name);
+    const storedSessionSet = snapshotTaskRoleSessionSetRecord(sessionSet, taskId, role.name);
+    if (
+      storedRole === null ||
+      (expectedSessionSet !== null && storedExpected === null) ||
+      storedSessionSet === null ||
+      !sessionSetMatchesRole(storedSessionSet, storedRole)
+    ) throw dataError(`Invalid Role/session state: ${taskId}/${role.name}`);
+    const current = this.getRole(taskId, storedRole.name);
+    const currentSessionSet = this.getRoleSessionSet(taskId, storedRole.name);
+    if (
+      current === null ||
+      current.updatedAt !== expectedUpdatedAt ||
+      !isDeepStrictEqual(currentSessionSet, storedExpected)
+    ) return null;
+    const updated = withCanonicalRoleRevision(storedRole, current.updatedAt);
+    this.saveRoleWithSessionSet(taskId, updated, storedSessionSet);
+    return updated;
+  }
+
+  private writeRoleRecord(taskId: string, role: Role): void {
+    const roleDir = this.roleDir(taskId, role.name);
+    const encoded = taskRecordCodec.encodeRole(role);
     mkdirSync(roleDir, { recursive: true });
-    this.writeSnapshot(this.roleFile(taskId, storageName), `${JSON.stringify(encoded.runtime, null, 2)}\n`);
-    this.writeSnapshot(this.roleInfoFile(taskId, storageName), `${JSON.stringify(encoded.info, null, 2)}\n`);
+    this.writeSnapshot(this.roleFile(taskId, role.name), `${JSON.stringify(encoded.runtime, null, 2)}\n`);
+    this.writeSnapshot(this.roleInfoFile(taskId, role.name), `${JSON.stringify(encoded.info, null, 2)}\n`);
   }
 
   renameRole(taskId: string, oldName: string, role: Role): void {
-    const storageName = this.resolveRoleStorageName(taskId, oldName);
-
-    if (storageName === null) {
-      return;
+    const storedRole = snapshotTaskRoleRecord(role, taskId);
+    if (storedRole === null) throw dataError("Invalid role record");
+    const roleName = storedRole.name;
+    if (oldName === roleName) {
+      throw dataError("Role rename requires different Role names.");
+    }
+    const storageName = this.readOptionalText(this.roleFile(taskId, oldName)) === null
+      ? null
+      : oldName;
+    if (storageName === null) return;
+    if (this.getRole(taskId, roleName) !== null || this.getChildRole(taskId, roleName) !== null) {
+      throw dataError(`Role name is already owned: ${taskId}/${roleName}`);
     }
 
-    const encoded = taskRecordCodec.encodeRole(role);
+    const existingSessions = this.getRoleSessionSet(taskId, oldName);
+    const roleWorktree = this.getRoleWorktree(taskId, oldName);
+    const activeRun = this.getActiveAgentRun(taskId, oldName);
+    const historicalRuns = this.jsonRecordIds(this.agentRunsDir(taskId))
+      .map((runId) => this.getAgentRun(taskId, runId))
+      .filter((run): run is AgentRun => run !== null && run.roleName === oldName);
+    const childRoles = this.listChildRoles(taskId).filter((child) => child.parentRole === oldName);
+    const assignedWorkItems = this.listWorkItems(taskId).filter((item) => item.assignee === oldName);
+    const renamedSessions = existingSessions === null
+      ? null
+      : snapshotTaskRoleSessionSetRecord(
+        { ...existingSessions, owner: { ...existingSessions.owner, roleName } },
+        taskId,
+        roleName
+      );
+    if (existingSessions !== null && (
+      renamedSessions === null || !sessionSetMatchesRole(renamedSessions, storedRole)
+    )) {
+      throw dataError(`Invalid role session set: ${taskId}/${roleName}`);
+    }
+    if (renamedSessions !== null) {
+      this.assertSessionIdentityTransferCompatibleWithTrash(renamedSessions);
+      this.reserveSessionIdentities(existingSessions as TaskRoleSessionSet);
+    }
+
+    const encoded = taskRecordCodec.encodeRole(storedRole);
+    taskRecordCodec.decodeRole(
+      taskId,
+      roleName,
+      JSON.stringify(encoded.runtime),
+      JSON.stringify(encoded.info)
+    );
     this.writeSnapshot(this.roleFile(taskId, storageName), `${JSON.stringify(encoded.runtime, null, 2)}\n`);
     this.writeSnapshot(this.roleInfoFile(taskId, storageName), `${JSON.stringify(encoded.info, null, 2)}\n`);
+    renameSync(this.roleDir(taskId, storageName), this.roleDir(taskId, roleName));
+
+    if (roleWorktree !== null) {
+      this.saveRoleWorktree(taskId, { ...roleWorktree, roleName });
+    }
+    if (renamedSessions !== null && existingSessions !== null) {
+      mkdirSync(this.roleSessionSetsDir(taskId), { recursive: true });
+      this.writeSnapshot(
+        this.roleSessionSetFile(taskId, roleName),
+        `${JSON.stringify(renamedSessions, null, 2)}\n`
+      );
+      rmSync(this.roleSessionSetFile(taskId, oldName), { force: true });
+      this.transferSessionIdentityOwnership(existingSessions.owner, renamedSessions.owner, renamedSessions);
+    }
+    if (activeRun !== null) {
+      this.clearActiveAgentRun(taskId, oldName);
+      this.saveActiveAgentRun({ ...activeRun, roleName });
+    }
+    for (const run of historicalRuns) this.saveAgentRun({ ...run, roleName });
+    for (const child of childRoles) {
+      this.saveChildRole(taskId, { ...child, parentRole: roleName, updatedAt: storedRole.updatedAt });
+    }
+    for (const item of assignedWorkItems) {
+      this.saveWorkItem(taskId, { ...item, assignee: roleName, updatedAt: storedRole.updatedAt });
+    }
   }
 
   listRoles(taskId: string): Role[] {
@@ -1172,7 +1648,7 @@ export class FileTaskStore implements TaskStore {
 
   getRole(taskId: string, name: string): Role | null {
     try {
-      return this.findRoleByInfoName(taskId, name) ?? this.getRoleByStorageName(taskId, name);
+      return this.getRoleByStorageName(taskId, name);
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "ENOENT") {
         return null;
@@ -1223,12 +1699,112 @@ export class FileTaskStore implements TaskStore {
     const childNames = this.directoryNames(this.rolesDir(taskId)).filter((candidate) =>
       this.getChildRole(taskId, candidate)?.parentRole === name
     );
+    const sessionSet = this.getRoleSessionSet(taskId, name);
+    if (sessionSet !== null) this.reserveSessionIdentities(sessionSet);
     rmSync(roleDir, { recursive: true, force: true });
+    rmSync(this.roleSessionSetFile(taskId, name), { force: true });
     childNames.forEach((childName) => rmSync(this.roleDir(taskId, childName), { recursive: true, force: true }));
     return { removed: true, childCount: childNames.length };
   }
 
   saveGlobalRole(role: GlobalRole): void {
+    const storedRole = snapshotGlobalRoleRecord(role);
+    if (storedRole === null) throw dataError("Invalid global role record");
+    const sessionRaw = this.readOptionalText(this.globalRoleSessionSetFile(storedRole.name));
+    if (sessionRaw !== null) {
+      const sessionSet = parseGlobalRoleSessionSet(storedRole.name, sessionRaw);
+      if (!sessionSetMatchesRole(sessionSet, storedRole)) {
+        throw dataError(`Global Role update is incompatible with its session set: ${storedRole.name}`);
+      }
+      this.reserveSessionIdentities(sessionSet);
+    }
+    this.writeGlobalRoleRecord(storedRole);
+  }
+
+  saveGlobalRoleWithSessionSet(
+    role: GlobalRole,
+    sessionSet: GlobalRoleSessionSet | null,
+    allowMonotonicImport = false
+  ): void {
+    const storedRole = snapshotGlobalRoleRecord(role);
+    const storedSessionSet = sessionSet === null
+      ? null
+      : snapshotGlobalRoleSessionSetRecord(sessionSet, role.name);
+    if (
+      storedRole === null ||
+      (sessionSet !== null && (storedSessionSet === null || !sessionSetMatchesRole(storedSessionSet, storedRole)))
+    ) throw dataError(`Invalid global Role/session state: ${role.name}`);
+    const existingSessionSet = this.getGlobalRoleSessionSet(storedRole.name);
+    this.assertSessionIdentityLineagePreserved(
+      existingSessionSet,
+      storedSessionSet,
+      allowMonotonicImport
+    );
+    if (existingSessionSet !== null) this.reserveSessionIdentities(existingSessionSet);
+    if (storedSessionSet !== null) {
+      this.assertSessionIdentitiesUnique(storedSessionSet);
+      this.reserveSessionIdentities(storedSessionSet);
+    }
+    this.writeGlobalRoleRecord(storedRole);
+    if (storedSessionSet === null) {
+      rmSync(this.globalRoleSessionSetFile(storedRole.name), { force: true });
+      return;
+    }
+    mkdirSync(this.globalRoleSessionSetsDir(), { recursive: true });
+    this.writeSnapshot(
+      this.globalRoleSessionSetFile(storedRole.name),
+      `${JSON.stringify(storedSessionSet, null, 2)}\n`
+    );
+  }
+
+  createGlobalRoleIfAbsent(role: GlobalRole): GlobalRole | null {
+    const storedRole = snapshotGlobalRoleRecord(role);
+    if (storedRole === null) throw dataError("Invalid global role record");
+    if (this.getGlobalRole(storedRole.name) !== null) return null;
+    this.saveGlobalRole(storedRole);
+    return storedRole;
+  }
+
+  compareAndSwapGlobalRole(expectedUpdatedAt: string, role: GlobalRole): GlobalRole | null {
+    const storedRole = snapshotGlobalRoleRecord(role);
+    if (storedRole === null) throw dataError("Invalid global role record");
+    const current = this.getGlobalRole(storedRole.name);
+    if (current === null || current.updatedAt !== expectedUpdatedAt) return null;
+    const updated = withCanonicalRoleRevision(storedRole, current.updatedAt);
+    this.saveGlobalRole(updated);
+    return updated;
+  }
+
+  compareAndSwapGlobalRoleWithSessionSet(
+    expectedUpdatedAt: string,
+    expectedSessionSet: GlobalRoleSessionSet | null,
+    role: GlobalRole,
+    sessionSet: GlobalRoleSessionSet
+  ): GlobalRole | null {
+    const storedRole = snapshotGlobalRoleRecord(role);
+    const storedExpected = expectedSessionSet === null
+      ? null
+      : snapshotGlobalRoleSessionSetRecord(expectedSessionSet, role.name);
+    const storedSessionSet = snapshotGlobalRoleSessionSetRecord(sessionSet, role.name);
+    if (
+      storedRole === null ||
+      (expectedSessionSet !== null && storedExpected === null) ||
+      storedSessionSet === null ||
+      !sessionSetMatchesRole(storedSessionSet, storedRole)
+    ) throw dataError(`Invalid global Role/session state: ${role.name}`);
+    const current = this.getGlobalRole(storedRole.name);
+    const currentSessionSet = this.getGlobalRoleSessionSet(storedRole.name);
+    if (
+      current === null ||
+      current.updatedAt !== expectedUpdatedAt ||
+      !isDeepStrictEqual(currentSessionSet, storedExpected)
+    ) return null;
+    const updated = withCanonicalRoleRevision(storedRole, current.updatedAt);
+    this.saveGlobalRoleWithSessionSet(updated, storedSessionSet);
+    return updated;
+  }
+
+  private writeGlobalRoleRecord(role: GlobalRole): void {
     const roleDir = this.globalRoleDir(role.name);
     mkdirSync(roleDir, { recursive: true });
     this.writeSnapshot(this.globalRoleFile(role.name), `${JSON.stringify(role, null, 2)}\n`);
@@ -1247,8 +1823,12 @@ export class FileTaskStore implements TaskStore {
   }
 
   removeGlobalRole(name: string): boolean {
+    if (this.getGlobalRole(name) === null) return false;
     try {
+      const sessionSet = this.getGlobalRoleSessionSet(name);
+      if (sessionSet !== null) this.reserveSessionIdentities(sessionSet);
       rmSync(this.globalRoleDir(name), { recursive: true });
+      rmSync(this.globalRoleSessionSetFile(name), { force: true });
       return true;
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "ENOENT") {
@@ -1302,6 +1882,11 @@ export class FileTaskStore implements TaskStore {
     this.writeSnapshot(this.transcriptFile(taskId, storageName), transcript);
   }
 
+  clearTranscript(taskId: string, roleName: string): void {
+    const storageName = this.resolveRoleStorageName(taskId, roleName) ?? roleName;
+    rmSync(this.transcriptFile(taskId, storageName), { force: true });
+  }
+
   readTranscript(taskId: string, roleName: string): string | null {
     const storageName = this.resolveRoleStorageName(taskId, roleName);
 
@@ -1313,6 +1898,69 @@ export class FileTaskStore implements TaskStore {
   }
 
   saveConfiguredAgent(agent: ConfiguredAgent): void {
+    const stored = snapshotConfiguredAgentRecord(agent);
+    if (stored === null) throw dataError("Invalid agent record");
+    this.writeConfiguredAgent(stored);
+  }
+
+  createConfiguredAgentIfAbsent(agent: ConfiguredAgent): ConfiguredAgent | null {
+    const stored = snapshotConfiguredAgentRecord(agent);
+    if (stored === null) throw dataError("Invalid agent record");
+    if (this.getConfiguredAgent(stored.id) !== null) return null;
+    this.writeConfiguredAgent(stored);
+    return stored;
+  }
+
+  updateConfiguredAgent(
+    id: string,
+    patch: ConfiguredAgentPatch,
+    now: Date
+  ): ConfiguredAgentUpdateResult | null {
+    const storedPatch = snapshotConfiguredAgentPatch(patch);
+    if (storedPatch === null || Object.keys(storedPatch).length === 0) {
+      throw usageError("Agent update requires at least one operational option.");
+    }
+    if (!Number.isFinite(now.getTime())) throw usageError("Agent update timestamp is invalid.");
+    const existing = this.getConfiguredAgent(id);
+    if (existing === null) return null;
+    let candidate: ConfiguredAgent;
+    try {
+      const probePin = storedPatch.probePin === undefined
+        ? (storedPatch.adapterId === undefined && storedPatch.command === undefined
+          ? existing.probePin
+          : undefined)
+        : storedPatch.probePin ?? undefined;
+      const refreshRequired = storedPatch.probePinRefreshRequired === undefined
+        ? (storedPatch.probePin === undefined &&
+            storedPatch.adapterId === undefined &&
+            storedPatch.command === undefined
+          ? existing.probePinRefreshRequired
+          : undefined)
+        : storedPatch.probePinRefreshRequired ?? undefined;
+      candidate = {
+        ...createConfiguredAgent(
+          existing.id,
+          storedPatch.adapterId ?? existing.adapterId,
+          storedPatch.command ?? existing.command,
+          storedPatch.baseArgs ?? existing.baseArgs,
+          storedPatch.environment ?? existing.environment,
+          now,
+          probePin,
+          probePin === undefined ? refreshRequired : undefined
+        ),
+        createdAt: existing.createdAt
+      };
+    } catch (error) {
+      throw usageError(error instanceof Error ? error.message : String(error));
+    }
+    if (sameConfiguredAgentOperation(existing, candidate)) {
+      return { status: "unchanged", agent: existing };
+    }
+    this.writeConfiguredAgent(candidate);
+    return { status: "updated", agent: candidate };
+  }
+
+  private writeConfiguredAgent(agent: ConfiguredAgent): void {
     const agentDir = this.agentDir(agent.id);
     mkdirSync(agentDir, { recursive: true });
     this.writeSnapshot(this.agentFile(agent.id), `${JSON.stringify(agent, null, 2)}\n`);
@@ -1341,6 +1989,19 @@ export class FileTaskStore implements TaskStore {
 
       throw error;
     }
+  }
+
+  pruneTrashedTasks(taskIds?: readonly string[]): number {
+    const selected = taskIds === undefined
+      ? this.directoryNames(this.trashedTasksDir())
+      : [...new Set(taskIds.map((taskId) => requireSafeStorageSegment(taskId, "task")))]
+        .filter((taskId) => existsSync(this.trashedTaskDir(taskId)));
+    const trashedSessionSets = selected.flatMap((taskId) => this.listTrashedRoleSessionSets(taskId));
+    this.retireTrashedSessionIdentities(trashedSessionSets);
+    for (const taskId of selected) {
+      rmSync(this.trashedTaskDir(taskId), { recursive: true, force: true });
+    }
+    return selected.length;
   }
 
   private tasksDir(): string {
@@ -1423,6 +2084,10 @@ export class FileTaskStore implements TaskStore {
     return join(this.rootDir, "runtime");
   }
 
+  private nativeSessionIdentityLedgerFile(): string {
+    return join(this.runtimeDir(), "native-session-identities.json");
+  }
+
   private pendingWakeupsDir(): string {
     return join(this.runtimeDir(), "pending-wakeups");
   }
@@ -1467,12 +2132,20 @@ export class FileTaskStore implements TaskStore {
     return join(this.runtimeDir(), "role-sessions");
   }
 
-  private agentSessionsDir(taskId: string): string {
-    return join(this.roleSessionsDir(), taskId);
+  private roleSessionSetsDir(taskId: string): string {
+    return join(this.roleSessionsDir(), "tasks", requireSafeStorageSegment(taskId, "task"));
   }
 
-  private agentSessionFile(taskId: string, roleName: string): string {
-    return join(this.agentSessionsDir(taskId), `${roleName}.json`);
+  private roleSessionSetFile(taskId: string, roleName: string): string {
+    return join(this.roleSessionSetsDir(taskId), `${requireSafeStorageSegment(roleName, "role")}.json`);
+  }
+
+  private globalRoleSessionSetsDir(): string {
+    return join(this.roleSessionsDir(), "global");
+  }
+
+  private globalRoleSessionSetFile(roleName: string): string {
+    return join(this.globalRoleSessionSetsDir(), `${requireSafeStorageSegment(roleName, "role")}.json`);
   }
 
   private agentRunsDir(taskId: string): string {
@@ -1509,6 +2182,33 @@ export class FileTaskStore implements TaskStore {
 
   private trashedTaskFile(id: string): string {
     return join(this.trashedTaskDir(id), "task.json");
+  }
+
+  private trashedRoleSessionSetsDir(taskId: string): string {
+    return join(this.trashedTaskDir(taskId), "role-sessions");
+  }
+
+  private trashedRoleSessionSetFile(taskId: string, roleName: string): string {
+    return join(
+      this.trashedRoleSessionSetsDir(taskId),
+      `${requireSafeStorageSegment(roleName, "role")}.json`
+    );
+  }
+
+  private trashedRolesDir(taskId: string): string {
+    return join(this.trashedTaskDir(taskId), "roles");
+  }
+
+  private trashedRoleDir(taskId: string, name: string): string {
+    return join(this.trashedRolesDir(taskId), requireSafeStorageSegment(name, "role"));
+  }
+
+  private trashedRoleFile(taskId: string, name: string): string {
+    return join(this.trashedRoleDir(taskId, name), "role.json");
+  }
+
+  private trashedRoleInfoFile(taskId: string, name: string): string {
+    return join(this.trashedRoleDir(taskId, name), "info.json");
   }
 
   private commentsFile(taskId: string): string {
@@ -1582,7 +2282,7 @@ export class FileTaskStore implements TaskStore {
 
     const infoRaw = this.readOptionalText(this.roleInfoFile(taskId, storageName));
 
-    return taskRecordCodec.decodeRole(storageName, runtimeRaw, infoRaw);
+    return taskRecordCodec.decodeRole(taskId, storageName, runtimeRaw, infoRaw);
   }
 
   private findRoleByInfoName(taskId: string, name: string): Role | null {
@@ -1667,7 +2367,42 @@ export class FileTaskStore implements TaskStore {
   }
 
   private writeSnapshot(target: string, content: string): void {
+    this.assertPathRuntimeOperationAllowsMutation(target);
+    if (this.ephemeral) {
+      writeTextFileAtomically(target, content);
+      return;
+    }
     writeRecoverableSnapshot(this.rootDir, target, content);
+  }
+
+  private assertPathRuntimeOperationAllowsMutation(target: string): void {
+    const parts = relative(this.rootDir, target).split(sep);
+    if (parts[0] === "tasks" && parts[1] !== undefined) {
+      if (parts[2] === "roles" && parts[3] !== undefined) {
+        assertRuntimeOperationAllowsMutation(
+          this.rootDir,
+          { scope: "task-role", taskId: parts[1], roleName: parts[3] },
+          this.runtimeOperationToken,
+          this.runtimeRecoveryToken
+        );
+        return;
+      }
+      assertRuntimeOperationAllowsMutation(
+        this.rootDir,
+        { scope: "task", taskId: parts[1] },
+        this.runtimeOperationToken,
+        this.runtimeRecoveryToken
+      );
+      return;
+    }
+    if (parts[0] === "roles" && parts[1] !== undefined) {
+      assertRuntimeOperationAllowsMutation(
+        this.rootDir,
+        { scope: "global-role", roleName: parts[1] },
+        this.runtimeOperationToken,
+        this.runtimeRecoveryToken
+      );
+    }
   }
 
   private readOptionalText(path: string): string | null {
@@ -1721,6 +2456,221 @@ export class FileTaskStore implements TaskStore {
     return identity !== undefined && (identity.mode & FILE_TYPE_MASK) === type;
   }
 
+  private assertSessionIdentitiesUnique(candidate: GlobalRoleSessionSet | TaskRoleSessionSet): void {
+    const candidateClaims = sessionIdentityOwnerships(candidate);
+    assertIdentityOwnershipsUnique(candidateClaims);
+    const ledger = this.readNativeSessionIdentityLedger();
+    for (const { key, owner } of candidateClaims) {
+      const existing = ledger.identities[key];
+      if (existing?.state === "retired") {
+        throw dataError("Native Agent session identity is permanently retired.");
+      }
+      if (existing?.state === "owned" && !nativeSessionIdentityOwnersMatch(existing.owner, owner)) {
+        throw dataError("Native Agent session identity is already owned by another Role Agent.");
+      }
+    }
+
+    const liveOwners = this.physicalSessionIdentityOwners();
+    for (const { key, owner } of candidateClaims) {
+      const liveOwner = liveOwners.get(key);
+      if (liveOwner !== undefined && !nativeSessionIdentityOwnersMatch(liveOwner, owner)) {
+        throw dataError("Native Agent session identity is already owned by another Role Agent.");
+      }
+    }
+  }
+
+  private reserveSessionIdentities(candidate: GlobalRoleSessionSet | TaskRoleSessionSet): void {
+    const ledger = this.readNativeSessionIdentityLedger();
+    const claims = sessionIdentityOwnerships(candidate);
+    assertIdentityOwnershipsUnique(claims);
+    const liveOwners = this.physicalSessionIdentityOwners();
+    for (const { key, owner } of claims) {
+      const liveOwner = liveOwners.get(key);
+      if (liveOwner !== undefined && !nativeSessionIdentityOwnersMatch(liveOwner, owner)) {
+        throw dataError("Native Agent session identity is already owned by another Role Agent.");
+      }
+      liveOwners.set(key, owner);
+    }
+    this.writeNativeSessionIdentityLedger(this.reconcileIdentityClaims(ledger.identities, liveOwners));
+  }
+
+  private reconcileIdentityClaims(
+    existingClaims: Record<string, NativeSessionIdentityClaim>,
+    physicalOwners: Map<string, NativeSessionIdentityOwner>
+  ): Record<string, NativeSessionIdentityClaim> {
+    const identities = { ...existingClaims };
+    for (const [key, owner] of physicalOwners) {
+      const existing = identities[key];
+      if (existing?.state === "retired") {
+        throw dataError("Native Agent session identity is permanently retired.");
+      }
+      if (existing?.state === "owned" && !nativeSessionIdentityOwnersMatch(existing.owner, owner)) {
+        throw dataError("Native Agent session identity is already owned by another Role Agent.");
+      }
+      identities[key] = { state: "owned", owner };
+    }
+    return identities;
+  }
+
+  private physicalSessionIdentityOwners(): Map<string, NativeSessionIdentityOwner> {
+    const liveSets = this.listAllRoleSessionSets();
+    const trashedSets = this.directoryNames(this.trashedTasksDir())
+      .flatMap((taskId) => this.listTrashedRoleSessionSets(taskId));
+    return compatibleIdentityOwnerMap([...liveSets, ...trashedSets].flatMap(sessionIdentityOwnerships));
+  }
+
+  private transferSessionIdentityOwnership(
+    from: RoleSessionOwner,
+    to: RoleSessionOwner,
+    sessionSet: GlobalRoleSessionSet | TaskRoleSessionSet
+  ): void {
+    const ledger = this.readNativeSessionIdentityLedger();
+    const identities = { ...ledger.identities };
+    for (const [agentId, session] of Object.entries(sessionSet.sessions)) {
+      const fromOwner = nativeSessionIdentityOwner(from, agentId);
+      const toOwner = nativeSessionIdentityOwner(to, agentId);
+      for (const identity of roleAgentSessionIdentities(session)) {
+        const key = nativeSessionIdentityKey(identity);
+        const existing = identities[key];
+        if (
+          existing === undefined ||
+          (existing.state === "owned" && nativeSessionIdentityOwnersMatch(existing.owner, fromOwner))
+        ) {
+          identities[key] = { state: "owned", owner: toOwner };
+        } else {
+          throw dataError("Native Agent session identity is already owned by another Role Agent.");
+        }
+      }
+    }
+    this.writeNativeSessionIdentityLedger(identities);
+  }
+
+  private assertSessionIdentityTransferCompatibleWithTrash(candidate: TaskRoleSessionSet): void {
+    const trashedOwners = compatibleIdentityOwnerMap(
+      this.directoryNames(this.trashedTasksDir())
+        .flatMap((taskId) => this.listTrashedRoleSessionSets(taskId))
+        .flatMap(sessionIdentityOwnerships)
+    );
+    for (const { key, owner } of sessionIdentityOwnerships(candidate)) {
+      const trashedOwner = trashedOwners.get(key);
+      if (trashedOwner !== undefined && !nativeSessionIdentityOwnersMatch(trashedOwner, owner)) {
+        throw dataError("Native Agent session identity is already owned by another trashed Role Agent.");
+      }
+    }
+  }
+
+  private retireTrashedSessionIdentities(sessionSets: TaskRoleSessionSet[]): void {
+    if (sessionSets.length === 0) return;
+    const trashClaims = sessionSets.flatMap(sessionIdentityOwnerships);
+    assertIdentityOwnershipsUnique(trashClaims);
+    const liveOwners = identityOwnerMap(this.listAllRoleSessionSets().flatMap(sessionIdentityOwnerships));
+    const ledger = this.readNativeSessionIdentityLedger();
+    const identities = { ...ledger.identities };
+
+    for (const { key, owner: trashOwner } of trashClaims) {
+      const liveOwner = liveOwners.get(key);
+      const existing = identities[key];
+      if (liveOwner !== undefined) {
+        if (
+          !nativeSessionIdentityOwnersMatch(liveOwner, trashOwner) ||
+          existing?.state === "retired" ||
+          (existing?.state === "owned" && !nativeSessionIdentityOwnersMatch(existing.owner, liveOwner))
+        ) {
+          throw dataError("Native Agent session identity ledger conflicts with live Role Agent ownership.");
+        }
+        identities[key] = { state: "owned", owner: liveOwner };
+        continue;
+      }
+
+      if (existing?.state === "owned" && !nativeSessionIdentityOwnersMatch(existing.owner, trashOwner)) {
+        throw dataError("Native Agent session identity ledger conflicts with trashed Role Agent ownership.");
+      }
+      if (existing?.state !== "retired") identities[key] = { state: "retired" };
+    }
+    this.writeNativeSessionIdentityLedger(identities);
+  }
+
+  private assertSessionIdentityLineagePreserved(
+    existing: GlobalRoleSessionSet | TaskRoleSessionSet | null,
+    candidate: GlobalRoleSessionSet | TaskRoleSessionSet | null,
+    allowMonotonicImport = false
+  ): void {
+    if (existing === null) return;
+    if (candidate === null) {
+      throw dataError("Role Agent session identity lineage cannot be removed.");
+    }
+    for (const [agentId, existingSession] of Object.entries(existing.sessions)) {
+      const candidateSession = candidate.sessions[agentId];
+      if (candidateSession === undefined) {
+        throw dataError("Role Agent session identity lineage cannot be removed.");
+      }
+      if (candidateSession.adapterId !== existingSession.adapterId) {
+        throw dataError("Role Agent session adapter cannot change in place.");
+      }
+      const before = roleAgentSessionIdentities(existingSession);
+      const after = roleAgentSessionIdentities(candidateSession);
+      const same = before.length === after.length && before.every((identity, index) =>
+        nativeSessionIdentityKeysMatch(identity, after[index])
+      );
+      const monotonicExtension = after.length > before.length && before.every((identity, index) =>
+        nativeSessionIdentityKeysMatch(identity, after[index])
+      );
+      const permittedExtension = monotonicExtension && (
+        allowMonotonicImport || after.length === before.length + 1
+      );
+      if (!same && !permittedExtension) {
+        throw dataError("Role Agent session identity lineage must be preserved exactly.");
+      }
+    }
+  }
+
+  private listTrashedRoleSessionSets(taskId: string): TaskRoleSessionSet[] {
+    return this.jsonRecordIds(this.trashedRoleSessionSetsDir(taskId))
+      .map((roleName) => {
+        const raw = this.readOptionalText(this.trashedRoleSessionSetFile(taskId, roleName));
+        if (raw === null) return null;
+        const sessionSet = parseTaskRoleSessionSet(taskId, roleName, raw);
+        const roleRuntime = this.readOptionalText(this.trashedRoleFile(taskId, roleName));
+        if (roleRuntime === null) {
+          throw dataError(`Invalid trashed role session set: ${taskId}/${roleName}`);
+        }
+        const role = taskRecordCodec.decodeRole(
+          taskId,
+          roleName,
+          roleRuntime,
+          this.readOptionalText(this.trashedRoleInfoFile(taskId, roleName))
+        );
+        if (!sessionSetMatchesRole(sessionSet, role)) {
+          throw dataError(`Invalid trashed role session set: ${taskId}/${roleName}`);
+        }
+        return sessionSet;
+      })
+      .filter((set): set is TaskRoleSessionSet => set !== null);
+  }
+
+  private writeNativeSessionIdentityLedger(
+    identities: Record<string, NativeSessionIdentityClaim>
+  ): void {
+    const encoded = encodeCanonicalStorageValue({ schemaVersion: 3, identities });
+    this.writeSnapshot(this.nativeSessionIdentityLedgerFile(), `${encoded}\n`);
+  }
+
+  private readNativeSessionIdentityLedger(): NativeSessionIdentityLedger {
+    const raw = this.readOptionalText(this.nativeSessionIdentityLedgerFile());
+    if (raw === null) return { schemaVersion: 3, identities: {} };
+    const value = parseJson(raw, "Invalid native session identity ledger");
+    if (
+      !isRecord(value) ||
+      !hasExactOwnKeys(value, ["schemaVersion", "identities"]) ||
+      value.schemaVersion !== 3 ||
+      !isRecord(value.identities) ||
+      snapshotNativeSessionIdentityClaims(value.identities) === null
+    ) {
+      throw dataError("Invalid native session identity ledger");
+    }
+    return value as NativeSessionIdentityLedger;
+  }
+
   private nextRecordId(prefix: string, getRecord: (id: string) => unknown | null): string {
     let number = 1;
 
@@ -1756,6 +2706,12 @@ const TASK_READER_METHODS = [
   "nextWorkItemId",
   "getWorkItem",
   "listWorkItems",
+  "getRoleSessionSet",
+  "listRoleSessionSets",
+  "listAllRoleSessionSets",
+  "nativeSessionIdentityClaims",
+  "getGlobalRoleSessionSet",
+  "listGlobalRoleSessionSets",
   "getAgentSession",
   "nextAgentRunId",
   "getAgentRun",
@@ -1850,48 +2806,16 @@ function hasErrorCode(error: unknown, code: string): boolean {
 
 function parseConfiguredAgent(id: string, raw: string): ConfiguredAgent {
   const value = parseJson(raw, `Invalid agent record: ${id}`);
-
-  if (
-    !isRecord(value) ||
-    value.schemaVersion !== 1 ||
-    typeof value.id !== "string" ||
-    typeof value.command !== "string" ||
-    !isStringArray(value.args) ||
-    !isStringRecord(value.env) ||
-    typeof value.createdAt !== "string" ||
-    typeof value.updatedAt !== "string"
-  ) {
-    throw dataError(`Invalid agent record: ${id}`);
-  }
-
-  return value as ConfiguredAgent;
+  const snapshot = snapshotConfiguredAgentRecord(value, id);
+  if (snapshot === null) throw dataError(`Invalid agent record: ${id}`);
+  return snapshot;
 }
 
 function parseGlobalRole(name: string, raw: string): GlobalRole {
   const value = parseJson(raw, `Invalid global role record: ${name}`);
-
-  if (
-    !isRecord(value) ||
-    value.schemaVersion !== 1 ||
-    typeof value.name !== "string" ||
-    typeof value.agent !== "string" ||
-    typeof value.command !== "string" ||
-    !isStringArray(value.args) ||
-    !isStringRecord(value.env) ||
-    typeof value.workspace !== "string" ||
-    (value.description !== undefined && typeof value.description !== "string") ||
-    (value.responsibilities !== undefined && !isStringArray(value.responsibilities)) ||
-    (value.constraints !== undefined && !isStringArray(value.constraints)) ||
-    (value.expectedOutput !== undefined && typeof value.expectedOutput !== "string") ||
-    (value.systemPrompt !== undefined && typeof value.systemPrompt !== "string") ||
-    (value.skills !== undefined && !isStringArray(value.skills)) ||
-    typeof value.createdAt !== "string" ||
-    typeof value.updatedAt !== "string"
-  ) {
-    throw dataError(`Invalid global role record: ${name}`);
-  }
-
-  return value as GlobalRole;
+  const snapshot = snapshotGlobalRoleRecord(value, name);
+  if (snapshot === null) throw dataError(`Invalid global role record: ${name}`);
+  return snapshot;
 }
 
 function parseChildRole(name: string, raw: string): ChildRole {
@@ -2079,14 +3003,27 @@ function parseOperatorNotification(taskId: string, raw: string): OperatorNotific
     !isRecord(value) ||
     value.schemaVersion !== 1 ||
     value.taskId !== taskId ||
-    value.type !== "leader-recovery-failed" ||
+    typeof value.id !== "string" ||
+    value.id.length === 0 ||
     typeof value.message !== "string" ||
     typeof value.createdAt !== "string" ||
     typeof value.updatedAt !== "string"
   ) {
     throw dataError(`Invalid Operator notification: ${taskId}`);
   }
-  return value as OperatorNotification;
+  if (value.type === "leader-recovery-failed") {
+    return value as OperatorNotification;
+  }
+  if (
+    typeof value.type === "string" &&
+    ["role-expiry-stop-failed", "role-expiry-identity-drift"].includes(value.type) &&
+    typeof value.roleName === "string" &&
+    typeof value.agentId === "string" &&
+    typeof value.runId === "string"
+  ) {
+    return value as OperatorNotification;
+  }
+  throw dataError(`Invalid Operator notification: ${taskId}`);
 }
 
 function parseMilestone(taskId: string, milestoneId: string, raw: string): Milestone {
@@ -2173,45 +3110,54 @@ function parseWorkItem(taskId: string, workItemId: string, raw: string): WorkIte
   return value as WorkItem;
 }
 
-function parseAgentSession(taskId: string, roleName: string, raw: string): AgentSession {
-  const value = parseJson(raw, `Invalid agent session record: ${taskId}/${roleName}`);
+function parseTaskRoleSessionSet(taskId: string, roleName: string, raw: string): TaskRoleSessionSet {
+  const message = `Invalid role session set: ${taskId}/${roleName}`;
+  const snapshot = snapshotTaskRoleSessionSetRecord(parseJson(raw, message), taskId, roleName);
+  if (snapshot === null) throw dataError(message);
+  return snapshot;
+}
 
-  if (
-    !isRecord(value) ||
-    value.schemaVersion !== 1 ||
-    value.taskId !== taskId ||
-    value.roleName !== roleName ||
-    typeof value.agent !== "string" ||
-    typeof value.nativeSessionId !== "string" ||
-    !["fixed", "leader-controlled"].includes(String(value.policy)) ||
-    !["unknown", "reserved", "ready", "running", "stopped", "broken"].includes(String(value.status)) ||
-    !isStringArray(value.previousSessionIds) ||
-    (value.replacementReason !== undefined && typeof value.replacementReason !== "string") ||
-    typeof value.createdAt !== "string" ||
-    typeof value.updatedAt !== "string"
-  ) {
-    throw dataError(`Invalid agent session record: ${taskId}/${roleName}`);
-  }
-
-  return value as AgentSession;
+function parseGlobalRoleSessionSet(roleName: string, raw: string): GlobalRoleSessionSet {
+  const message = `Invalid global role session set: ${roleName}`;
+  const snapshot = snapshotGlobalRoleSessionSetRecord(parseJson(raw, message), roleName);
+  if (snapshot === null) throw dataError(message);
+  return snapshot;
 }
 
 function parseRoleWorktree(taskId: string, roleName: string, raw: string): RoleWorktree {
   const value = parseJson(raw, `Invalid role worktree: ${taskId}/${roleName}`);
+  const keys = [
+    "schemaVersion", "taskId", "roleName", "repositoryRoot", "commonDir",
+    "repositoryFingerprint", "path", "worktreeGitDir", "branchRef", "headOid",
+    "ownerToken", "createdAt"
+  ];
   if (
     !isRecord(value) ||
-    value.schemaVersion !== 1 ||
+    Object.keys(value).length !== keys.length ||
+    keys.some((key) => !Object.hasOwn(value, key)) ||
+    value.schemaVersion !== 2 ||
     value.taskId !== taskId ||
     value.roleName !== roleName ||
-    typeof value.repository !== "string" ||
-    typeof value.path !== "string" ||
-    typeof value.branch !== "string" ||
-    (value.base !== undefined && typeof value.base !== "string") ||
-    typeof value.createdAt !== "string"
+    typeof value.repositoryRoot !== "string" || !isAbsolute(value.repositoryRoot) || resolve(value.repositoryRoot) !== value.repositoryRoot ||
+    typeof value.commonDir !== "string" || !isAbsolute(value.commonDir) || resolve(value.commonDir) !== value.commonDir ||
+    typeof value.repositoryFingerprint !== "string" || !/^[0-9a-f]{64}$/.test(value.repositoryFingerprint) ||
+    typeof value.path !== "string" || !isAbsolute(value.path) || resolve(value.path) !== value.path ||
+    typeof value.worktreeGitDir !== "string" || !isAbsolute(value.worktreeGitDir) || resolve(value.worktreeGitDir) !== value.worktreeGitDir ||
+    typeof value.branchRef !== "string" || !isSafeGitBranchName(value.branchRef) ||
+    typeof value.headOid !== "string" || !GIT_OID_PATTERN.test(value.headOid) ||
+    typeof value.ownerToken !== "string" || !UUID_PATTERN.test(value.ownerToken) ||
+    typeof value.createdAt !== "string" || !Number.isFinite(Date.parse(value.createdAt)) ||
+    new Date(Date.parse(value.createdAt)).toISOString() !== value.createdAt
   ) {
     throw dataError(`Invalid role worktree: ${taskId}/${roleName}`);
   }
   return value as RoleWorktree;
+}
+
+function isSafeGitBranchName(value: string): boolean {
+  return value.length > 0 && !value.startsWith("-") && !value.startsWith("/") && !value.endsWith("/") &&
+    !value.endsWith(".") && !value.includes("..") && !value.includes("//") && !value.includes("@{") &&
+    !value.endsWith(".lock") && !/[\u0000-\u0020\u007f~^:?*\[\]\\]/.test(value);
 }
 
 function parseAgentRun(taskId: string, runId: string, raw: string): AgentRun {
@@ -2296,6 +3242,220 @@ function isOptionalString(value: unknown): value is string | undefined {
 
 function isStringRecord(value: unknown): value is Record<string, string> {
   return isRecord(value) && Object.values(value).every((item) => typeof item === "string");
+}
+
+function snapshotConfiguredAgentPatch(value: unknown): ConfiguredAgentPatch | null {
+  const snapshot = lowerUnknownInertData(value);
+  if (snapshot === null) return null;
+  const encoded = stringifyCanonicalInertData(snapshot);
+  if (encoded === null) return null;
+  const inert = JSON.parse(encoded) as unknown;
+  if (!isRecord(inert)) return null;
+  const allowed = new Set([
+    "adapterId", "command", "baseArgs", "environment", "probePin", "probePinRefreshRequired"
+  ]);
+  if (Object.keys(inert).some((key) => !allowed.has(key))) return null;
+  if (inert.adapterId !== undefined &&
+      (typeof inert.adapterId !== "string" || inert.adapterId.trim().length === 0)) return null;
+  if (inert.command !== undefined &&
+      (typeof inert.command !== "string" || inert.command.trim().length === 0)) return null;
+  if (inert.baseArgs !== undefined && !isStringArray(inert.baseArgs)) return null;
+  if (inert.environment !== undefined && !Array.isArray(inert.environment)) return null;
+  if (inert.probePin !== undefined && inert.probePin !== null && !isProbeExecutablePin(inert.probePin)) return null;
+  if (inert.probePinRefreshRequired !== undefined &&
+      inert.probePinRefreshRequired !== null && inert.probePinRefreshRequired !== true) return null;
+  if (inert.probePin !== undefined && inert.probePin !== null && inert.probePinRefreshRequired === true) return null;
+  return inert as unknown as ConfiguredAgentPatch;
+}
+
+function sameConfiguredAgentOperation(left: ConfiguredAgent, right: ConfiguredAgent): boolean {
+  return left.id === right.id &&
+    left.adapterId === right.adapterId &&
+    left.command === right.command &&
+    isDeepStrictEqual(left.baseArgs, right.baseArgs) &&
+    isDeepStrictEqual(left.environment, right.environment) &&
+    isDeepStrictEqual(left.probePin, right.probePin) &&
+    left.probePinRefreshRequired === right.probePinRefreshRequired;
+}
+
+function requireSafeStorageSegment(value: string, kind: string): string {
+  if (!isSafeStorageSegment(value)) throw dataError(`Invalid ${kind} storage identity.`);
+  return value;
+}
+
+function encodeCanonicalStorageValue(value: unknown): string {
+  const snapshot = lowerUnknownInertData(value);
+  const encoded = snapshot === null ? null : stringifyCanonicalInertData(snapshot);
+  if (encoded === null) throw dataError("Invalid canonical storage value.");
+  return encoded;
+}
+
+type NativeSessionIdentityOwnership = {
+  key: string;
+  owner: NativeSessionIdentityOwner;
+};
+
+function sessionIdentityOwnerships(
+  set: GlobalRoleSessionSet | TaskRoleSessionSet
+): NativeSessionIdentityOwnership[] {
+  return Object.entries(set.sessions).flatMap(([agentId, session]) => {
+    const owner = nativeSessionIdentityOwner(set.owner, agentId);
+    return roleAgentSessionIdentities(session).map((identity) => ({
+      key: nativeSessionIdentityKey(identity),
+      owner
+    }));
+  });
+}
+
+export function nativeSessionIdentityKey(identity: NativeSessionIdentity): string {
+  return encodeCanonicalStorageValue([
+    identity.adapterId,
+    identity.sessionRoot,
+    identity.nativeSessionId
+  ]);
+}
+
+export function nativeSessionIdentityOwner(
+  owner: RoleSessionOwner,
+  agentId: string
+): NativeSessionIdentityOwner {
+  return owner.scope === "global"
+    ? { scope: "global", roleName: owner.roleName, agentId }
+    : { scope: "task", taskId: owner.taskId, roleName: owner.roleName, agentId };
+}
+
+export function nativeSessionIdentityOwnerKey(owner: NativeSessionIdentityOwner): string {
+  return encodeCanonicalStorageValue(owner.scope === "global"
+    ? ["global", owner.roleName, owner.agentId]
+    : ["task", owner.taskId, owner.roleName, owner.agentId]);
+}
+
+function nativeSessionIdentityOwnersMatch(
+  left: NativeSessionIdentityOwner,
+  right: NativeSessionIdentityOwner
+): boolean {
+  return nativeSessionIdentityOwnerKey(left) === nativeSessionIdentityOwnerKey(right);
+}
+
+function assertIdentityOwnershipsUnique(ownerships: NativeSessionIdentityOwnership[]): void {
+  identityOwnerMap(ownerships);
+}
+
+function identityOwnerMap(
+  ownerships: NativeSessionIdentityOwnership[]
+): Map<string, NativeSessionIdentityOwner> {
+  const owners = new Map<string, NativeSessionIdentityOwner>();
+  for (const { key, owner } of ownerships) {
+    const existing = owners.get(key);
+    if (existing !== undefined) {
+      throw dataError(nativeSessionIdentityOwnersMatch(existing, owner)
+        ? "A native session identity is duplicated within one Role Agent lineage."
+        : "A native session identity is already owned by another Role Agent.");
+    }
+    owners.set(key, owner);
+  }
+  return owners;
+}
+
+function compatibleIdentityOwnerMap(
+  ownerships: NativeSessionIdentityOwnership[]
+): Map<string, NativeSessionIdentityOwner> {
+  const owners = new Map<string, NativeSessionIdentityOwner>();
+  for (const { key, owner } of ownerships) {
+    const existing = owners.get(key);
+    if (existing !== undefined && !nativeSessionIdentityOwnersMatch(existing, owner)) {
+      throw dataError("A native session identity is already owned by another Role Agent.");
+    }
+    owners.set(key, owner);
+  }
+  return owners;
+}
+
+function nativeSessionIdentityKeysMatch(
+  left: NativeSessionIdentity,
+  right: NativeSessionIdentity | undefined
+): boolean {
+  return right !== undefined && nativeSessionIdentityKey(left) === nativeSessionIdentityKey(right);
+}
+
+function isNativeSessionIdentityOwner(value: unknown): value is NativeSessionIdentityOwner {
+  return isRecord(value) && (
+    (
+      hasExactOwnKeys(value, ["scope", "roleName", "agentId"]) &&
+      value.scope === "global" &&
+      isSafeStorageSegment(value.roleName) &&
+      isSafeStorageSegment(value.agentId)
+    ) ||
+    (
+      hasExactOwnKeys(value, ["scope", "taskId", "roleName", "agentId"]) &&
+      value.scope === "task" &&
+      isSafeStorageSegment(value.taskId) &&
+      isSafeStorageSegment(value.roleName) &&
+      isSafeStorageSegment(value.agentId)
+    )
+  );
+}
+
+export function snapshotNativeSessionIdentityClaims(
+  value: unknown
+): Record<string, NativeSessionIdentityClaim> | null {
+  const snapshot = lowerUnknownInertData(value);
+  if (snapshot === null || !isRecord(snapshot.value)) return null;
+  const claims: Record<string, NativeSessionIdentityClaim> = {};
+  for (const [identity, claim] of Object.entries(snapshot.value)) {
+    if (!isNativeSessionIdentityKey(identity) || !isNativeSessionIdentityClaim(claim)) return null;
+    claims[identity] = claim.state === "retired"
+      ? { state: "retired" }
+      : { state: "owned", owner: { ...claim.owner } };
+  }
+  return claims;
+}
+
+function nativeSessionIdentityClaimsMatch(
+  left: NativeSessionIdentityClaim,
+  right: NativeSessionIdentityClaim
+): boolean {
+  return left.state === right.state && (
+    left.state === "retired" ||
+    (right.state === "owned" && nativeSessionIdentityOwnersMatch(left.owner, right.owner))
+  );
+}
+
+export function isNativeSessionIdentityClaim(value: unknown): value is NativeSessionIdentityClaim {
+  return isRecord(value) && (
+    (
+      hasExactOwnKeys(value, ["state", "owner"]) &&
+      value.state === "owned" &&
+      isNativeSessionIdentityOwner(value.owner)
+    ) ||
+    (
+      hasExactOwnKeys(value, ["state"]) &&
+      value.state === "retired"
+    )
+  );
+}
+
+function isNativeSessionIdentityKey(value: string): boolean {
+  try {
+    const decoded = JSON.parse(value) as unknown;
+    return Array.isArray(decoded) &&
+      decoded.length === 3 &&
+      typeof decoded[0] === "string" && hasNoSurroundingWhitespace(decoded[0]) &&
+      isCanonicalNativeSessionRoot(decoded[1]) &&
+      isCanonicalNativeSessionId(decoded[2]) &&
+      value === encodeCanonicalStorageValue(decoded);
+  } catch {
+    return false;
+  }
+}
+
+function withCanonicalRoleRevision<T extends Role | GlobalRole>(role: T, currentUpdatedAt: string): T {
+  const currentTimestamp = Date.parse(currentUpdatedAt);
+  const nextTimestamp = Math.max(
+    Date.now(),
+    Number.isFinite(currentTimestamp) ? currentTimestamp + 1 : Number.NEGATIVE_INFINITY
+  );
+  return { ...role, updatedAt: new Date(nextTimestamp).toISOString() };
 }
 
 function assertInputPointerId(value: string, label: string): void {
