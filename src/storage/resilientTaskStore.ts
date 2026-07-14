@@ -7,8 +7,6 @@ import type { TaskReader, TaskStore } from "./taskStore.js";
 const cacheableReadMethods = new Set<keyof TaskReader>([
   "readTaskBrief",
   "readTaskTopicSummaries",
-  "listComments",
-  "listEvents",
   "readTranscript"
 ]);
 

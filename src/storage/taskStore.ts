@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -14,7 +15,7 @@ import {
 } from "node:fs";
 import type { BigIntStats } from "node:fs";
 import { userInfo } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { types as utilTypes } from "node:util";
 import type { TaskComment } from "../comment/comment.js";
 import type { Milestone } from "../milestone/milestone.js";
@@ -30,7 +31,7 @@ import type { GlobalRole, Role } from "../role/role.js";
 import type { ChildRole } from "../role/childRole.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { ConfiguredAgent } from "../agent/agent.js";
-import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
+import { pendingWakeupsMatch, type PendingWakeup } from "../scheduler/pendingWakeup.js";
 import type { LeaderFailure } from "../scheduler/leaderFailure.js";
 import type { OperatorNotification } from "../scheduler/operatorNotification.js";
 import type { TaskSchedule } from "../scheduler/taskSchedule.js";
@@ -39,7 +40,11 @@ import { emptyTaskTopics, type TaskTopics } from "../topic/topic.js";
 import type { WorkItem } from "../workItem/workItem.js";
 import type { RoleWorktree } from "../worktree/worktree.js";
 import { taskRecordCodec } from "./taskRecordCodec.js";
-import { executeDomainReadSnapshot } from "./domainTransaction.js";
+import {
+  executeDomainReadSnapshot,
+  executeDomainTransaction,
+  hasActiveDomainTransactionAuthority
+} from "./domainTransaction.js";
 import type { NativePinnedRootReader } from "./nativeStorageFs.js";
 import { writeRecoverableSnapshot } from "./recoveryJournal.js";
 
@@ -81,6 +86,7 @@ export type TaskStore = {
   savePendingWakeup(wakeup: PendingWakeup): void;
   listPendingWakeups(): PendingWakeup[];
   clearPendingWakeup(taskId: string): void;
+  clearPendingWakeupIfUnchanged(expected: PendingWakeup): boolean;
   getLeaderFailure(taskId: string): LeaderFailure | null;
   saveLeaderFailure(failure: LeaderFailure): void;
   clearLeaderFailure(taskId: string): void;
@@ -909,6 +915,17 @@ export class FileTaskStore implements TaskStore {
     rmSync(this.pendingWakeupFile(taskId), { force: true });
   }
 
+  clearPendingWakeupIfUnchanged(expected: PendingWakeup): boolean {
+    if (hasActiveDomainTransactionAuthority(this.rootDir)) {
+      return this.clearPendingWakeupIfExpected(expected);
+    }
+    return executeDomainTransaction(
+      this.rootDir,
+      `pending-wakeup-cas-${randomUUID()}`,
+      (workingRoot) => new FileTaskStore(workingRoot).clearPendingWakeupIfExpected(expected)
+    );
+  }
+
   getLeaderFailure(taskId: string): LeaderFailure | null {
     const raw = this.readOptionalText(this.leaderFailureFile(taskId));
     return raw === null ? null : parseLeaderFailure(taskId, raw);
@@ -1687,6 +1704,15 @@ export class FileTaskStore implements TaskStore {
       throw dataError("TaskMux pinned read path escaped its storage root.");
     }
     return relativePath.length === 0 ? "." : relativePath.split(sep).join("/");
+  }
+
+  private clearPendingWakeupIfExpected(expected: PendingWakeup): boolean {
+    const current = this.getPendingWakeup(expected.taskId);
+    if (current === null || !pendingWakeupsMatch(current, expected)) {
+      return false;
+    }
+    this.clearPendingWakeup(expected.taskId);
+    return true;
   }
 
   private pinnedEntryIs(directory: string, name: string, type: bigint): boolean {

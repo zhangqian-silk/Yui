@@ -176,6 +176,8 @@ The SQLite index is derived and disposable. TaskMux refreshes derived state only
 
 Read-only semantic commands capture one callback-bounded Native snapshot. The snapshot uses the same stable-ancestor authority as writers, pins the storage root for the synchronous callback, and cannot be retained or awaited after that callback returns. Task, configuration, role, runtime, and input records fail closed when malformed; only derived text may use a last-valid rendering.
 
+Scheduler wakeup preparation is likewise a coherent read, not a claim on a Role, session, or run. A later Role-runtime change must claim/CAS the exact prepared Role/session/run authority before any external launch or other side effect, and revalidate it afterward; the snapshot alone must not be described as dispatch ownership.
+
 ### Storage concurrency integration
 
 `src/storage/domainTransaction.ts` is shared by the A1 writer-transaction work and the A2 read-snapshot work. A2 owns the exported `executeDomainReadSnapshot` boundary, its Native pinned-root/path-witness checks, and the outer `withNativeRootBarrier(..., "exclusive", ...)` around `executeDomainTransaction`; A1 may change recovery, staging, authoritative-path, or workspace details only inside that outer callback. Keep the Native barrier imports and release ordering intact, and do not reintroduce a SQLite-only semantic-read lock or a second independent lock around the transaction body. Read consumers must use `TaskStore.runReadSnapshot`.

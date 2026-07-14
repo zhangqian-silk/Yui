@@ -51,6 +51,7 @@ const sharedBarrierWaitWord = new Int32Array(new SharedArrayBuffer(Int32Array.BY
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOf = Object.getPrototypeOf;
 const isProxy = utilTypes.isProxy;
+const activeDomainTransactionWorkingRoots = new Map<string, number>();
 
 type NativeRootBarrier = {
   descriptor: number;
@@ -105,7 +106,7 @@ export function executeDomainTransaction<T>(
     try {
       const before = readAuthoritativeFiles(rootDir, authoritativePaths);
       const beforeDirectories = readAuthoritativeDirectories(rootDir, authoritativePaths);
-      const result = execute(workingRoot);
+      const result = withActiveDomainTransactionWorkingRoot(workingRoot, () => execute(workingRoot));
       const after = readAuthoritativeFiles(workingRoot, authoritativePaths);
       const afterDirectories = readAuthoritativeDirectories(workingRoot, authoritativePaths);
       const operations = diffAuthoritativeFiles(
@@ -135,6 +136,21 @@ export function executeDomainTransaction<T>(
       rmSync(workingRoot, { recursive: true, force: true });
     }
   });
+}
+
+/**
+ * Runs an operation under the authoritative writer barrier when it cannot be
+ * expressed as a copy/diff domain transaction (for example, backup creation).
+ */
+export function executeDomainExclusiveBarrier<T>(
+  rootDir: string,
+  execute: () => T
+): T {
+  return withNativeRootBarrier(rootDir, "exclusive", () => execute());
+}
+
+export function hasActiveDomainTransactionAuthority(rootDir: string): boolean {
+  return (activeDomainTransactionWorkingRoots.get(resolve(rootDir)) ?? 0) > 0;
 }
 
 /**
@@ -238,11 +254,13 @@ function executeWithNativeRootBarrier<T>(
   let primaryError: unknown;
   let hasPrimaryError = false;
   try {
+    const rootIdentity = inspectDirectoryAt(barrier, plan.rootRelativePath);
+    assertOpenedRootMatchesPreOpenWitness(rootIdentity, plan.pathWitnesses.at(-1));
     return execute({
       descriptor: plan.descriptor,
       barrier,
       rootRelativePath: plan.rootRelativePath,
-      rootIdentity: inspectDirectoryAt(barrier, plan.rootRelativePath),
+      rootIdentity,
       pathWitnesses: plan.pathWitnesses
     });
   } catch (error) {
@@ -338,9 +356,32 @@ function assertOpenedAncestorMatchesPreOpenWitness(
     witness.identity.ino !== nativeIdentity.ino ||
     witness.identity.uid !== nativeIdentity.uid ||
     witness.identity.mode !== nativeIdentity.mode ||
-    witness.identity.nlink !== nativeIdentity.nlink
+    witness.identity.nlink !== nativeIdentity.nlink ||
+    witness.identity.birthtimeNs !== nativeIdentity.birthtimeNs
   ) {
     throw new Error("TaskMux storage path identity changed before Native pin.");
+  }
+}
+
+function assertOpenedRootMatchesPreOpenWitness(
+  nativeIdentity: NativeExactIdentity | undefined,
+  witness: PathWitness | undefined
+): void {
+  if (
+    witness === undefined ||
+    (
+      nativeIdentity === undefined
+        ? witness.identity !== undefined
+        : witness.identity === undefined ||
+          witness.identity.dev !== nativeIdentity.dev ||
+          witness.identity.ino !== nativeIdentity.ino ||
+          witness.identity.uid !== nativeIdentity.uid ||
+          witness.identity.mode !== nativeIdentity.mode ||
+          witness.identity.nlink !== nativeIdentity.nlink ||
+          witness.identity.birthtimeNs !== nativeIdentity.birthtimeNs
+    )
+  ) {
+    throw new Error("TaskMux read snapshot root identity changed.");
   }
 }
 
@@ -414,6 +455,24 @@ function requireSynchronousDomainReadResult<T>(value: T): T {
     candidate = objectGetPrototypeOf(candidate);
   }
   return value;
+}
+
+function withActiveDomainTransactionWorkingRoot<T>(workingRoot: string, execute: () => T): T {
+  const root = resolve(workingRoot);
+  activeDomainTransactionWorkingRoots.set(
+    root,
+    (activeDomainTransactionWorkingRoots.get(root) ?? 0) + 1
+  );
+  try {
+    return execute();
+  } finally {
+    const remaining = (activeDomainTransactionWorkingRoots.get(root) ?? 1) - 1;
+    if (remaining === 0) {
+      activeDomainTransactionWorkingRoots.delete(root);
+    } else {
+      activeDomainTransactionWorkingRoots.set(root, remaining);
+    }
+  }
 }
 
 function readAuthoritativeDirectories(rootDir: string, authoritativePaths: string[]): Set<string> {

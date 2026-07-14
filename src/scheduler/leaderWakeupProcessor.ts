@@ -106,10 +106,7 @@ export function processLeaderWakeups(
         { cycle: cycle.id, cause: cycle.cause },
         now
       ));
-      const currentWakeup = store.getPendingWakeup(task.id);
-      if (currentWakeup !== null && pendingWakeupsMatch(currentWakeup, wakeup)) {
-        store.clearPendingWakeup(task.id);
-      }
+      store.clearPendingWakeupIfUnchanged(wakeup);
       return { taskId: task.id, status: "dispatched" };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -195,16 +192,6 @@ function prepareLeaderWakeup(
     eventIds: [`event-${eventCount + 1}`, `event-${eventCount + 2}`],
     cycleId: store.nextCycleId(task.id)
   };
-}
-
-function pendingWakeupsMatch(left: PendingWakeup, right: PendingWakeup): boolean {
-  return left.schemaVersion === right.schemaVersion &&
-    left.taskId === right.taskId &&
-    left.requestCount === right.requestCount &&
-    left.firstRequestedAt === right.firstRequestedAt &&
-    left.lastRequestedAt === right.lastRequestedAt &&
-    left.reasons.length === right.reasons.length &&
-    left.reasons.every((reason, index) => reason === right.reasons[index]);
 }
 
 function cycleCauseForWakeup(reasons: string[]): CycleCause {
