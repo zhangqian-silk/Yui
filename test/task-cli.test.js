@@ -967,9 +967,12 @@ test("maintenance commands do not initialize missing storage", () => {
   const home = join(parent, "taskmux-home");
 
   const backup = runTaskmuxFailure(["backup"], { TASKMUX_HOME: home });
+  const maintenance = runTaskmuxFailure(["maintenance", "git", "recover"], { TASKMUX_HOME: home });
 
   assert.equal(backup.status, 4);
   assert.match(backup.stderr, /DATA_ERROR: TaskMux is not initialized\. Run `taskmux setup`\./);
+  assert.equal(maintenance.status, 4);
+  assert.match(maintenance.stderr, /DATA_ERROR: TaskMux is not initialized\. Run `taskmux setup`\./);
   assert.equal(existsSync(home), false);
 });
 

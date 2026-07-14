@@ -212,6 +212,7 @@ test("catalog covers every public root, group, nested, and leaf path", async () 
   const required = [
     "help", "version", "update", "completion", "completion bash", "completion zsh", "completion fish", "completion install", "completion uninstall", "doctor", "setup", "setup tmux", "backup", "export", "import", "prune", "operator",
     "controller", "controller start", "controller status", "controller stop", "controller scan",
+    "maintenance", "maintenance git", "maintenance git recover",
     "config", "config show", "config set", "config set default-agent", "config set default-workspace", "config unset", "config unset default-agent", "config unset default-workspace",
     "agent", "agent add", "agent list", "agent show", "agent remove",
     "role", "role add", "role list", "role show", "role update", "role remove", "role enter",

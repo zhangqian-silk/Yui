@@ -207,7 +207,7 @@ export const ROOT_COMMAND = buildNode({
   sections: [
     { id: "workflow", title: "Workflow", entries: ["task", "operator"] },
     { id: "configuration", title: "Configuration", entries: ["setup", "config", "agent", "role", "completion"] },
-    { id: "operations", title: "Operations", entries: ["controller", "doctor"] },
+    { id: "operations", title: "Operations", entries: ["controller", "doctor", "maintenance"] },
     { id: "data", title: "Data", entries: ["backup", "restore", "export", "import", "prune"] },
     { id: "support", title: "Support", entries: ["update", "version", "help"] }
   ],
@@ -247,6 +247,15 @@ export const ROOT_COMMAND = buildNode({
       { name: "stop", summary: "Stop the Controller." },
       { name: "scan", summary: "Run a Controller scheduler scan." },
       { name: "serve", summary: "Run the internal Controller server.", hidden: true }
+    ] },
+    { name: "maintenance", summary: "Run explicit local maintenance.", sections: [
+      { id: "git", title: "Git", entries: ["git"] }
+    ], children: [
+      { name: "git", summary: "Maintain durable Git lifecycle effects.", sections: [
+        { id: "recover", title: "Recover", entries: ["recover"] }
+      ], children: [
+        { name: "recover", summary: "Resume interrupted, effect-started Git lifecycle effects.", usage: "taskmux maintenance git recover" }
+      ] }
     ] },
     { name: "config", summary: "View and change TaskMux configuration.", sections: [
       { id: "inspect", title: "Inspect", entries: ["show"] },

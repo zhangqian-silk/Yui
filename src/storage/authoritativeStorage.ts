@@ -37,6 +37,7 @@ export const STORAGE_PATH_REGISTRY: readonly StoragePathRegistryEntry[] = Object
   storagePath("runtime/native-session-identities.json", "file", "core", "include"),
   storagePath("runtime/active-runs", "directory", "core", "include"),
   storagePath("runtime/role-runtime-operations", "directory", "core", "include"),
+  storagePath("runtime/git-lifecycle", "directory", "core", "include"),
   storagePath("runtime/launch-reservations", "directory", "core", "include"),
   storagePath("runtime/rpc-intents", "directory", "core", "include"),
   storagePath("runtime/rpc-results", "directory", "core", "include"),

@@ -7,6 +7,7 @@ import { runAgentCommand } from "./commands/agentCommands.js";
 import { runBackupCommand } from "./commands/backupCommands.js";
 import { runConfigCommand } from "./commands/configCommands.js";
 import { ensureControllerRunning, runControllerCommand } from "./commands/controllerCommands.js";
+import { runGitLifecycleMaintenanceCommand } from "./commands/gitLifecycleMaintenanceCommands.js";
 import { callController } from "./controller/controller.js";
 import { buildControllerCommandProvenance } from "./controller/commandProvenance.js";
 import { runGlobalRoleCommand } from "./commands/globalRoleCommands.js";
@@ -214,6 +215,12 @@ async function main(): Promise<void> {
       `cli-restore-${randomUUID()}`,
       restoreArgs
     ).output);
+    return;
+  }
+
+  if (args[0] === "maintenance") {
+    requireStorageSchema(rootDir);
+    emit(runGitLifecycleMaintenanceCommand(args.slice(1), rootDir));
     return;
   }
 
