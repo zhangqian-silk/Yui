@@ -6,11 +6,12 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   utimesSync,
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -18,6 +19,7 @@ import {
   recordRoleAgentSession
 } from "../dist/executor/agentExecutor.js";
 import { createRole } from "../dist/role/role.js";
+import { MAX_PORTABLE_SNAPSHOT_BYTES } from "../dist/storage/portableSchema.js";
 import { FileTaskStore } from "../dist/storage/taskStore.js";
 import { createTask } from "../dist/task/task.js";
 
@@ -84,6 +86,12 @@ function transactionIds(home) {
   }))].sort();
 }
 
+function createGitWorkspace(prefix) {
+  const workspace = mkdtempSync(join(tmpdir(), prefix));
+  execFileSync("git", ["init", "--quiet", workspace], { stdio: "ignore" });
+  return workspace;
+}
+
 function stagingDirectories(home) {
   const directory = join(home, "runtime", "domain-staging");
   if (!existsSync(directory)) return [];
@@ -91,6 +99,32 @@ function stagingDirectories(home) {
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
     .sort();
+}
+
+async function invokeControllerExport(discovery, requestId, output) {
+  const response = await fetch(`http://${discovery.host}:${discovery.port}/rpc`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${discovery.token}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      apiVersion: 1,
+      requestId,
+      method: "command.execute",
+      params: {
+        group: "export",
+        args: ["--output", output]
+      }
+    })
+  });
+  return { response, body: await response.json() };
+}
+
+function portableSnapshotWithoutExportedAt(path) {
+  const snapshot = JSON.parse(readFileSync(path, "utf8"));
+  delete snapshot.exportedAt;
+  return snapshot;
 }
 
 function createTrashedRoleTask(home, taskId, nativeSessionId) {
@@ -201,6 +235,236 @@ test("Controller backup, restore, and prune return the same maintenance output c
   ));
   assert.equal(pruneJson.ok, true);
   assert.match(pruneJson.output, /Dry run/);
+});
+
+test("portable export/import uses the same CLI contract through the Controller and rolls back failures", (t) => {
+  const source = createConfiguredHome(t);
+  const target = createConfiguredHome(t);
+  const failedTarget = createConfiguredHome(t);
+  const output = join(mkdtempSync(join(tmpdir(), "taskmux-portable-controller-")), "portable.json");
+  const targetWorkspace = createGitWorkspace("taskmux-portable-controller-target-");
+  const failedTargetWorkspace = createGitWorkspace("taskmux-portable-controller-failed-target-");
+  t.after(() => {
+    rmSync(dirname(output), { recursive: true, force: true });
+    rmSync(targetWorkspace, { recursive: true, force: true });
+    rmSync(failedTargetWorkspace, { recursive: true, force: true });
+  });
+
+  for (const home of [target, failedTarget]) {
+    new FileTaskStore(home).removeGlobalRole("leader");
+    new FileTaskStore(home).saveConfig({ schemaVersion: 1 });
+    assert.equal(new FileTaskStore(home).listGlobalRoles().length, 0);
+  }
+  runTaskmux(["task", "create", "Portable Controller task"], { TASKMUX_HOME: source });
+  const sourceEnv = { TASKMUX_HOME: source, TASKMUX_CONTROLLER_MODE: "auto" };
+  assert.match(
+    runTaskmux(["export", "--output", output], sourceEnv),
+    /Exported TaskMux portable data/
+  );
+  assert.equal(existsSync(join(source, "runtime", "controller.json")), true);
+
+  const targetEnv = { TASKMUX_HOME: target, TASKMUX_CONTROLLER_MODE: "auto" };
+  assert.match(
+    runTaskmux(["import", output, "--workspace-map", `repository-1=${targetWorkspace}`], targetEnv),
+    /Imported TaskMux portable data/
+  );
+  assert.equal(taskTitle(target), "Portable Controller task");
+  assert.equal(new FileTaskStore(target).getGlobalRole("leader").workspace, targetWorkspace);
+
+  const failed = runTaskmuxFailure(
+    ["import", output, "--workspace-map", `repository-1=${failedTargetWorkspace}`],
+    {
+      TASKMUX_HOME: failedTarget,
+      TASKMUX_CONTROLLER_MODE: "auto",
+      NODE_ENV: "test",
+      TASKMUX_TEST_ONLY_PORTABLE_IMPORT_FAILPOINT: "after-apply"
+    }
+  );
+  assert.notEqual(failed.status, 0);
+  assert.equal(existsSync(join(failedTarget, "tasks", "task-1")), false);
+});
+
+test("portable workspace-map path grammar preserves JSON usage errors", (t) => {
+  const home = createConfiguredHome(t);
+  const input = join(mkdtempSync(join(tmpdir(), "taskmux-portable-json-error-")), "snapshot.json");
+  t.after(() => rmSync(dirname(input), { recursive: true, force: true }));
+
+  const result = runTaskmuxFailure([
+    "import",
+    input,
+    "--workspace-map",
+    "repository-1=relative/workspace",
+    "--json"
+  ], { TASKMUX_HOME: home });
+
+  assert.equal(result.stdout, "");
+  assert.equal(result.status, 2);
+  assert.deepEqual(JSON.parse(result.stderr), {
+    ok: false,
+    code: "USAGE_ERROR",
+    message: "--workspace-map target must be a portable binding ID or an absolute workspace path.",
+    details: {}
+  });
+});
+
+test("portable CLI shares the library's default, exact, and +1 8 MiB import cap", (t) => {
+  const home = createConfiguredHome(t);
+  const inputDirectory = mkdtempSync(join(tmpdir(), "taskmux-portable-cli-cap-"));
+  const defaultInput = join(inputDirectory, "default.json");
+  const exactInput = join(inputDirectory, "exact.json");
+  const tooLargeInput = join(inputDirectory, "too-large.json");
+  t.after(() => rmSync(inputDirectory, { recursive: true, force: true }));
+
+  const manifest = JSON.stringify({
+    schemaVersion: 3,
+    exportedAt: "2026-07-15T00:00:00.000Z",
+    workspaceBindings: [],
+    agentRequirements: [],
+    semantic: []
+  });
+  const exactManifest = `${manifest}${" ".repeat(
+    MAX_PORTABLE_SNAPSHOT_BYTES - Buffer.byteLength(manifest, "utf8")
+  )}`;
+  assert.equal(Buffer.byteLength(exactManifest, "utf8"), MAX_PORTABLE_SNAPSHOT_BYTES);
+  writeFileSync(defaultInput, manifest);
+  writeFileSync(exactInput, exactManifest);
+  writeFileSync(tooLargeInput, `${exactManifest} `);
+
+  assert.match(
+    runTaskmux(["import", defaultInput], { TASKMUX_HOME: home }),
+    /Imported TaskMux portable data[\s\S]*Created: 0/
+  );
+  assert.match(
+    runTaskmux(["import", exactInput], { TASKMUX_HOME: home }),
+    /Imported TaskMux portable data[\s\S]*Created: 0/
+  );
+  const tooLarge = runTaskmuxFailure(["import", tooLargeInput], { TASKMUX_HOME: home });
+  assert.notEqual(tooLarge.status, 0);
+  assert.match(tooLarge.stderr, /Portable import snapshot exceeds the 8 MiB limit/);
+});
+
+test("Controller portable export validates the published TASKMUX_HOME before creating any output", (t) => {
+  const home = createConfiguredHome(t);
+  const output = join(home, "portable.json");
+  const result = runTaskmuxFailure(
+    ["export", "--output", output],
+    { TASKMUX_HOME: home, TASKMUX_CONTROLLER_MODE: "auto" }
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Export output must be outside TASKMUX_HOME/);
+  assert.equal(existsSync(output), false);
+});
+
+test("Controller portable export does not publish before its RPC intent transaction commits", (t) => {
+  const home = createConfiguredHome(t);
+  const output = join(mkdtempSync(join(tmpdir(), "taskmux-portable-stage-")), "portable.json");
+  t.after(() => rmSync(dirname(output), { recursive: true, force: true }));
+
+  const result = runTaskmuxFailure(
+    ["export", "--output", output],
+    {
+      TASKMUX_HOME: home,
+      TASKMUX_CONTROLLER_MODE: "auto",
+      NODE_ENV: "test",
+      TASKMUX_TEST_ONLY_DOMAIN_TRANSACTION_FAILPOINT: "after-stage"
+    }
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.equal(existsSync(output), false);
+  assert.equal(transactionIds(home).length, 1);
+});
+
+test("portable export has direct/Controller parity and refuses an existing destination", (t) => {
+  const home = createConfiguredHome(t);
+  const directory = mkdtempSync(join(tmpdir(), "taskmux-portable-parity-"));
+  const directOutput = join(directory, "direct.json");
+  const controllerOutput = join(directory, "controller.json");
+  const existingOutput = join(directory, "existing.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  runTaskmux(["task", "create", "Portable parity task"], { TASKMUX_HOME: home });
+  assert.match(
+    runTaskmux(["export", "--output", directOutput], {
+      TASKMUX_HOME: home,
+      TASKMUX_CONTROLLER_MODE: "direct"
+    }),
+    /Exported TaskMux portable data/
+  );
+  assert.match(
+    runTaskmux(["export", "--output", controllerOutput], {
+      TASKMUX_HOME: home,
+      TASKMUX_CONTROLLER_MODE: "auto"
+    }),
+    /Exported TaskMux portable data/
+  );
+  assert.deepEqual(
+    portableSnapshotWithoutExportedAt(controllerOutput),
+    portableSnapshotWithoutExportedAt(directOutput)
+  );
+
+  writeFileSync(existingOutput, "do not overwrite\n");
+  const refused = runTaskmuxFailure(
+    ["export", "--output", existingOutput],
+    { TASKMUX_HOME: home, TASKMUX_CONTROLLER_MODE: "auto" }
+  );
+  assert.notEqual(refused.status, 0);
+  assert.equal(readFileSync(existingOutput, "utf8"), "do not overwrite\n");
+});
+
+test("Controller portable export caches successful request ids without publishing twice", async (t) => {
+  const home = createConfiguredHome(t);
+  const output = join(mkdtempSync(join(tmpdir(), "taskmux-portable-replay-")), "portable.json");
+  t.after(() => rmSync(dirname(output), { recursive: true, force: true }));
+
+  runTaskmux(["controller", "start"], { TASKMUX_HOME: home });
+  try {
+    const discovery = JSON.parse(readFileSync(join(home, "runtime", "controller.json"), "utf8"));
+    const first = await invokeControllerExport(discovery, "portable-export-once", output);
+    assert.equal(first.response.status, 200);
+    const firstInode = statSync(output).ino;
+    const second = await invokeControllerExport(discovery, "portable-export-once", output);
+
+    assert.equal(second.response.status, 200);
+    assert.deepEqual(second.body, first.body);
+    assert.equal(statSync(output).ino, firstInode);
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], { TASKMUX_HOME: home });
+  }
+});
+
+test("Controller portable export remains fail-closed after an effect-complete crash boundary", async (t) => {
+  const home = createConfiguredHome(t);
+  const output = join(mkdtempSync(join(tmpdir(), "taskmux-portable-crash-")), "portable.json");
+  t.after(() => rmSync(dirname(output), { recursive: true, force: true }));
+  const requestId = "portable-export-after-effect";
+
+  runTaskmux(["controller", "start"], {
+    TASKMUX_HOME: home,
+    NODE_ENV: "test",
+    TASKMUX_TEST_ONLY_PORTABLE_EXPORT_FAILPOINT: "after-effect"
+  });
+  try {
+    let discovery = JSON.parse(readFileSync(join(home, "runtime", "controller.json"), "utf8"));
+    const interrupted = await invokeControllerExport(discovery, requestId, output);
+    assert.equal(interrupted.response.status, 400);
+    assert.equal(existsSync(output), true);
+    const published = readFileSync(output, "utf8");
+    const publishedInode = statSync(output).ino;
+
+    runTaskmuxFailure(["controller", "stop"], { TASKMUX_HOME: home });
+    runTaskmux(["controller", "start"], { TASKMUX_HOME: home });
+    discovery = JSON.parse(readFileSync(join(home, "runtime", "controller.json"), "utf8"));
+    const replay = await invokeControllerExport(discovery, requestId, output);
+
+    assert.equal(replay.response.status, 409);
+    assert.match(JSON.stringify(replay.body), /outcome is unknown/);
+    assert.equal(readFileSync(output, "utf8"), published);
+    assert.equal(statSync(output).ino, publishedInode);
+  } finally {
+    runTaskmuxFailure(["controller", "stop"], { TASKMUX_HOME: home });
+  }
 });
 
 test("CLI trash retention selects source ages, retires only expired identities, and recovers staged pruning", (t) => {

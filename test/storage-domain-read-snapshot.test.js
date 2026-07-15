@@ -22,6 +22,7 @@ import { runTaskCommand } from "../dist/commands/taskCommands.js";
 import { runCompletionWizard } from "../dist/completion/completionWizard.js";
 import { getDoctorChecks } from "../dist/doctor/doctor.js";
 import { createRole } from "../dist/role/role.js";
+import { createConfiguredSkillRecord } from "../dist/storage/configuredSkill.js";
 import { createResilientTaskStore, primeResilientTaskStore } from "../dist/storage/resilientTaskStore.js";
 import { rebuildDerivedIndex } from "../dist/storage/derivedIndex.js";
 import {
@@ -173,12 +174,15 @@ test("FileTaskStore exposes only a frozen, callback-bounded TaskReader", (t) => 
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const store = new FileTaskStore(home);
   roleFixture(store);
+  store.saveConfiguredSkill(createConfiguredSkillRecord("unassigned", "# Unassigned\n\nReusable skill."));
 
   let escaped;
   let escapedRead;
+  let escapedConfiguredSkillList;
   store.runReadSnapshot((reader) => {
     escaped = reader;
     escapedRead = reader.getConfig;
+    escapedConfiguredSkillList = reader.listConfiguredSkills;
     assert.equal(Object.getPrototypeOf(reader), null);
     assert.equal(Object.isFrozen(reader), true);
     for (const forbidden of ["constructor", "saveConfig", "saveTask", "deleteTask", "rootDirectory"]) {
@@ -186,10 +190,12 @@ test("FileTaskStore exposes only a frozen, callback-bounded TaskReader", (t) => 
     }
     assert.deepEqual(reader.getConfig(), { schemaVersion: 1 });
     assert.equal(reader.getRole("task-1", "leader")?.name, "leader");
+    assert.deepEqual(reader.listConfiguredSkills().map((skill) => skill.id), ["unassigned"]);
     reader.runReadSnapshot((nested) => assert.equal(nested, reader));
   });
   assert.throws(() => escaped.getConfig(), /read snapshot capability is no longer active/i);
   assert.throws(() => escapedRead(), /read snapshot capability is no longer active/i);
+  assert.throws(() => escapedConfiguredSkillList(), /read snapshot capability is no longer active/i);
 
   assert.throws(
     () => store.runReadSnapshot(async () => "escaped"),
@@ -321,7 +327,7 @@ test("read-only aggregate consumers each use one coherent snapshot", (t) => {
   t.after(() => rmSync(exportHome, { recursive: true, force: true }));
   const exportFile = join(exportHome, "export.json");
   runExportCommand(["--output", exportFile], store);
-  assert.equal(snapshots, 0, "export uses a domain transaction");
+  assert.equal(snapshots, 1, "portable export uses one coherent read snapshot");
   snapshots = 0;
   expireStaleAgentRuns(store, now, 1);
   assert.equal(snapshots, 0, "expire stale scheduler uses role runtime transactions");

@@ -46,13 +46,13 @@ export function isInputRequestRecord(
     typeof expectedRequestId !== "string" ||
     !POINTER_ID_PATTERN.test(expectedTaskId) ||
     !POINTER_ID_PATTERN.test(expectedRequestId) ||
-    !isRequester(value.requester) ||
     !isNormalizedText(value.question, MAX_INPUT_QUESTION_LENGTH) ||
     !isChoices(value.choices) ||
     !isBlockedRefs(value.blockedRefs) ||
     !isResolutionPolicy(value.resolutionPolicy, value.choices) ||
     typeof value.status !== "string" ||
     !["open", "answered", "auto-resolved", "cancelled", "superseded"].includes(value.status) ||
+    !isRequester(value.requester, value.status !== "open") ||
     !isIsoTimestamp(value.createdAt) ||
     !isIsoTimestamp(value.updatedAt) ||
     value.updatedAt < value.createdAt
@@ -131,18 +131,26 @@ export function isInputResolutionRecord(
     isNormalizedText(value.recommendationReason, MAX_INPUT_REASON_LENGTH);
 }
 
-function isRequester(value: unknown): boolean {
-  return isRecord(value) &&
-    hasOnlyKeys(value, [
-      "roleName", "agentId", "adapterId", "sessionRoot", "nativeSessionId", "agentRunId"
-    ]) &&
+function isRequester(value: unknown, allowHistoryWithoutNativeSession: boolean): boolean {
+  if (
+    !isRecord(value) ||
+    value.roleName !== "leader" ||
+    !isInputRequesterField(value.agentId) ||
+    !isInputRequesterField(value.adapterId) ||
+    !isInputRequesterField(value.agentRunId)
+  ) {
+    return false;
+  }
+  if (hasOnlyKeys(value, ["roleName", "agentId", "adapterId", "agentRunId"])) {
+    return allowHistoryWithoutNativeSession;
+  }
+  return hasOnlyKeys(value, [
+    "roleName", "agentId", "adapterId", "sessionRoot", "nativeSessionId", "agentRunId"
+  ]) &&
     value.roleName === "leader" &&
-    isInputRequesterField(value.agentId) &&
-    isInputRequesterField(value.adapterId) &&
     isCanonicalNativeSessionRoot(value.sessionRoot) &&
     isInputRequesterField(value.nativeSessionId) &&
-    isCanonicalNativeSessionId(value.nativeSessionId) &&
-    isInputRequesterField(value.agentRunId);
+    isCanonicalNativeSessionId(value.nativeSessionId);
 }
 
 function isChoices(value: unknown): value is InputRequest["choices"] {

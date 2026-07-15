@@ -6,6 +6,7 @@ import type {
   RoleSessionSet,
   TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
+import { isConfiguredSkillId } from "../storage/configuredSkill.js";
 
 export type RoleStatus = "idle" | "running" | "detached" | "exited" | "failed";
 
@@ -250,6 +251,7 @@ function validateRoleOwner<T extends GlobalRole>(role: T): T {
   requireSafeIdentity(role.name, "Role name");
   requireNonEmpty(role.workspace, "Role workspace");
   requireSafeIdentity(role.activeAgentId, "Role active Agent id");
+  validateConfiguredSkillIds(role.skills);
   const entries = Object.entries(role.agentBindings);
   if (entries.length === 0) throw new Error("Role requires at least one Agent binding.");
   for (const [key, binding] of entries) {
@@ -359,6 +361,14 @@ function validateOptionalStringArray(values: string[] | undefined, label: string
   for (const value of values) {
     if (typeof value !== "string") throw new Error(`${label} must be a string.`);
     requireNonEmpty(value, label);
+  }
+}
+
+function validateConfiguredSkillIds(values: string[] | undefined): void {
+  if (values === undefined) return;
+  if (!Array.isArray(values) || values.some((value) => !isConfiguredSkillId(value)) ||
+      new Set(values).size !== values.length) {
+    throw new Error("Configured Role Skills are invalid.");
   }
 }
 

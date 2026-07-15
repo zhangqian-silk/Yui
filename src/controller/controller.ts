@@ -63,6 +63,8 @@ import {
 import {
   executePruneCommand,
   executeRestoreCommand,
+  preparePortableExport,
+  publishPortableExport,
   runImportCommand
 } from "../commands/maintenanceCommands.js";
 import type { ManualSessionRegistration } from "../commands/sessionRegistration.js";
@@ -714,7 +716,14 @@ async function handleRequest(
       }
 
       let body: { requestId: string; result: { output: string } };
-      if (commandGroup === "restore") {
+      if (commandGroup === "export") {
+        body = executeRpcPostCommitExport(
+          rootDir,
+          rpc,
+          refreshDerivedState,
+          commandArgs
+        );
+      } else if (commandGroup === "restore") {
         writeRpcIntent(rootDir, rpc.requestId, rpc.method);
         const restored = executeRestoreCommand(
           rootDir,
@@ -859,6 +868,52 @@ function executeRpcPostCommitTaskCommand(
   return body;
 }
 
+function executeRpcPostCommitExport(
+  rootDir: string,
+  rpc: RpcRequest & { requestId: string },
+  refreshDerivedState: () => void,
+  commandArgs: string[]
+): { requestId: string; result: { output: string } } {
+  // Export is an authoritative read snapshot followed by an external effect.
+  // It must not run in the clone used for a domain mutation transaction:
+  // validate the output against the published home, commit its RPC intent,
+  // then publish only after that intent has become durable.
+  const publication = preparePortableExport(
+    commandArgs,
+    new FileTaskStore(rootDir),
+    rootDir
+  );
+  commitRpcIntent(rootDir, rpc);
+  const output = publishPortableExport(publication);
+  if (
+    process.env.NODE_ENV === "test" &&
+    process.env.TASKMUX_TEST_ONLY_PORTABLE_EXPORT_FAILPOINT === "after-effect"
+  ) {
+    throw new Error("Portable export stopped after its external effect.");
+  }
+  const body = { requestId: rpc.requestId, result: { output } };
+  executeDomainTransaction(
+    rootDir,
+    `${rpc.requestId}-export-result`,
+    () => undefined,
+    () => [
+      rpcResultOperation(rootDir, rpc.requestId, body),
+      { type: "delete", target: rpcIntentFile(rootDir, rpc.requestId) }
+    ]
+  );
+  refreshDerivedState();
+  return body;
+}
+
+function commitRpcIntent(rootDir: string, rpc: RpcRequest & { requestId: string }): void {
+  executeDomainTransaction(
+    rootDir,
+    `${rpc.requestId}-export-intent`,
+    () => undefined,
+    () => [rpcIntentOperation(rootDir, rpc.requestId, rpc.method)]
+  );
+}
+
 function isTaskPostCommitEffectCommand(args: readonly string[]): boolean {
   return args[0] === "dispatch" || isTaskRoleRuntimeControlCommand(args);
 }
@@ -917,7 +972,12 @@ function runControllerCommandGroup(
       });
     case "backup":
       return runBackupCommand(rootDir, publishedRoot);
+    case "export":
+      throw dataError("Portable export must run as a post-commit effect.");
     case "import":
+      if (!(store instanceof FileTaskStore)) {
+        throw dataError("Portable import requires a FileTaskStore transaction.");
+      }
       return runImportCommand(args, store);
     default:
       throw new Error(`Unsupported Controller command group: ${group}`);
@@ -1003,13 +1063,29 @@ function writeRpcIntent(rootDir: string, requestId: string, method: string): voi
   const target = rpcIntentFile(rootDir, requestId);
   const temporary = `${target}.${process.pid}.tmp`;
   mkdirSync(directory, { recursive: true });
-  writeFileSync(temporary, `${JSON.stringify({
+  writeFileSync(temporary, rpcIntentContent(requestId, method), { mode: 0o600 });
+  renameSync(temporary, target);
+}
+
+function rpcIntentOperation(
+  rootDir: string,
+  requestId: string,
+  method: string
+): DomainTransactionOperation {
+  return {
+    type: "write",
+    target: rpcIntentFile(rootDir, requestId),
+    content: rpcIntentContent(requestId, method)
+  };
+}
+
+function rpcIntentContent(requestId: string, method: string): string {
+  return `${JSON.stringify({
     schemaVersion: 1,
     requestId,
     method,
     createdAt: new Date().toISOString()
-  }, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temporary, target);
+  }, null, 2)}\n`;
 }
 
 function clearRpcIntent(rootDir: string, requestId: string): void {

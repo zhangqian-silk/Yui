@@ -9,6 +9,7 @@ import Database from "better-sqlite3";
 import {
   MAX_INPUT_QUESTION_LENGTH,
   answerInputRequest,
+  cancelInputRequest,
   createInputRequest
 } from "../dist/input/inputRequest.js";
 import { rebuildDerivedIndex } from "../dist/storage/derivedIndex.js";
@@ -90,6 +91,42 @@ test("persists requests and resolutions only under their owning task", (t) => {
   assert.equal(existsSync(join(home, "runtime", "inbox")), false);
   assert.match(readFileSync(requestFile, "utf8"), /Question input-1/);
   assert.match(readFileSync(resolutionFile, "utf8"), /Safe path/);
+});
+
+test("accepts portable terminal requester history while requiring the complete native tuple for open requests", (t) => {
+  const home = createHome(t);
+  const store = new FileTaskStore(home);
+  saveTask(store, "task-1");
+  const terminal = cancelInputRequest(
+    request("input-terminal-full", "task-1"),
+    "No longer needed",
+    new Date("2026-07-12T12:01:00.000Z")
+  );
+  store.saveInputRequest(terminal);
+  assert.deepEqual(store.getInputRequest("task-1", "input-terminal-full"), terminal);
+
+  const { sessionRoot: _sessionRoot, nativeSessionId: _nativeSessionId, ...portableRequester } =
+    terminal.requester;
+  const portableTerminal = {
+    ...terminal,
+    id: "input-terminal-portable",
+    requester: portableRequester
+  };
+  store.saveInputRequest(portableTerminal);
+  assert.deepEqual(store.getInputRequest("task-1", "input-terminal-portable"), portableTerminal);
+
+  const { cancelled: _cancelled, ...malformedOpen } = portableTerminal;
+  assert.throws(
+    () => store.saveInputRequest({ ...malformedOpen, status: "open" }),
+    /Invalid input request record/
+  );
+  assert.throws(
+    () => store.saveInputRequest({
+      ...portableTerminal,
+      requester: { ...portableRequester, sessionRoot: "/tmp" }
+    }),
+    /Invalid input request record/
+  );
 });
 
 test("keeps request linkage checks outside the storage codec", (t) => {

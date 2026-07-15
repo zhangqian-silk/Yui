@@ -25,6 +25,7 @@ import {
   lowerUnknownInertData,
   stringifyCanonicalInertData
 } from "./inertData.js";
+import { isConfiguredSkillId } from "./configuredSkill.js";
 import { hasNonWhitespace } from "./stringValidation.js";
 
 const PROFILE_KEYS = ["description", "responsibilities", "constraints", "expectedOutput", "systemPrompt", "skills"] as const;
@@ -407,7 +408,12 @@ function isEnvironmentBinding(value: unknown): value is EnvironmentBinding {
 function isRoleProfile(value: Record<string, unknown>): boolean {
   return isOptionalString(value.description) && isOptionalStringArray(value.responsibilities) &&
     isOptionalStringArray(value.constraints) && isOptionalString(value.expectedOutput) &&
-    isOptionalString(value.systemPrompt) && isOptionalStringArray(value.skills);
+    isOptionalString(value.systemPrompt) && isOptionalConfiguredSkillIds(value.skills);
+}
+
+function isOptionalConfiguredSkillIds(value: unknown): boolean {
+  return value === undefined || (Array.isArray(value) && value.every(isConfiguredSkillId) &&
+    new Set(value).size === value.length);
 }
 
 function hasExactKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {

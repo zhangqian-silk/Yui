@@ -44,14 +44,29 @@ export type ResolutionPolicy =
       offlineTimeoutMs: number;
     };
 
-export type InputRequester = {
+type InputRequesterIdentity = {
   roleName: "leader";
   agentId: string;
   adapterId: string;
-  sessionRoot: string;
-  nativeSessionId: string;
   agentRunId: string;
 };
+
+export type InputRequesterWithNativeSession = InputRequesterIdentity & {
+  sessionRoot: string;
+  nativeSessionId: string;
+};
+
+export type InputRequesterHistory = InputRequesterIdentity & {
+  sessionRoot?: never;
+  nativeSessionId?: never;
+};
+
+/**
+ * Terminal input history may retain the logical requester identity without
+ * retaining the host-native session tuple. Open input always uses the native
+ * session form, which is required for blocking and wakeup delivery.
+ */
+export type InputRequester = InputRequesterWithNativeSession | InputRequesterHistory;
 
 export type InputRequestStatus = "open" | "answered" | "auto-resolved" | "cancelled" | "superseded";
 
@@ -95,7 +110,7 @@ export type InputResolution = {
 };
 
 export type InputResolutionResult = {
-  request: InputRequest;
+  request: InputRequest & { requester: InputRequesterWithNativeSession };
   resolution: InputResolution;
 };
 
@@ -112,7 +127,7 @@ const POINTER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 export function createInputRequest(
   id: string,
   taskId: string,
-  requester: InputRequester,
+  requester: InputRequesterWithNativeSession,
   input: CreateInputRequest,
   now: Date
 ): InputRequest {
@@ -354,10 +369,13 @@ function normalizeAnswer(request: InputRequest, answer: InputResolution["answer"
   return { choiceKey, text: choice.label };
 }
 
-function assertOpen(request: InputRequest): void {
+function assertOpen(
+  request: InputRequest
+): asserts request is InputRequest & { status: "open"; requester: InputRequesterWithNativeSession } {
   if (request.status !== "open") {
     throw new InputRequestStateError(request.id, request.status);
   }
+  assertInputRequesterWithNativeSession(request.requester);
 }
 
 export function assertValidInputRequest(value: unknown): asserts value is InputRequest {
@@ -415,7 +433,27 @@ export function inputResolutionSourceLabel(source: InputResolution["source"]): s
   return source === "user" ? "User answer" : "Offline recommendation";
 }
 
-function normalizeRequester(requester: InputRequester): InputRequester {
+export function assertInputRequesterWithNativeSession(
+  requester: InputRequester
+): asserts requester is InputRequesterWithNativeSession {
+  if (!isInputRequesterWithNativeSession(requester)) {
+    throw new Error("Input requester native session is unavailable.");
+  }
+}
+
+function isInputRequesterWithNativeSession(
+  requester: InputRequester
+): requester is InputRequesterWithNativeSession {
+  return requester.roleName === "leader" &&
+    [requester.agentId, requester.adapterId, requester.agentRunId].every(isInputRequesterField) &&
+    isCanonicalNativeSessionRoot(requester.sessionRoot) &&
+    isInputRequesterField(requester.nativeSessionId) &&
+    isCanonicalNativeSessionId(requester.nativeSessionId);
+}
+
+function normalizeRequester(
+  requester: InputRequesterWithNativeSession
+): InputRequesterWithNativeSession {
   if (
     requester.roleName !== "leader" ||
     [requester.agentId, requester.adapterId, requester.agentRunId].some(

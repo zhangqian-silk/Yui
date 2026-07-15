@@ -13,6 +13,7 @@ import {
   runImportCommand
 } from "../dist/commands/maintenanceCommands.js";
 import { createGlobalRole, createRole } from "../dist/role/role.js";
+import { executeDomainTransaction } from "../dist/storage/domainTransaction.js";
 import { FileTaskStore } from "../dist/storage/taskStore.js";
 import { createTask } from "../dist/task/task.js";
 
@@ -59,14 +60,20 @@ function sessionSet(owner, nativeSessionId) {
   );
 }
 
-test("maintenance export and import round-trip Role SessionSets and the identity ledger", () => {
+test("portable maintenance export and import preserve semantic Roles while excluding sessions", () => {
   const source = FileTaskStore.createEphemeralWorkspace("taskmux-role-export-source-");
   const target = FileTaskStore.createEphemeralWorkspace("taskmux-role-export-target-");
   const outputDir = mkdtempSync(join(tmpdir(), "taskmux-role-export-output-"));
   const output = join(outputDir, "snapshot.json");
   try {
     source.saveConfiguredAgent(configuredAgent());
-    source.saveConfig({ schemaVersion: 1, defaultAgent: "codex" });
+    source.saveConfig({
+      schemaVersion: 1,
+      defaultAgent: "codex",
+      defaultWorkspace: "/repo"
+    });
+    target.saveConfiguredAgent(configuredAgent());
+    target.saveConfig({ schemaVersion: 1, defaultWorkspace: "/target-repo" });
 
     const globalRole = createGlobalRole("operator", [binding()], "codex", "/repo", now);
     source.saveGlobalRoleWithSessionSet(
@@ -83,24 +90,26 @@ test("maintenance export and import round-trip Role SessionSets and the identity
     );
     source.saveTranscript("task-1", "leader", "role transcript\n");
 
-    assert.match(runExportCommand(["--output", output], source), /Exported TaskMux data/);
+    assert.match(runExportCommand(["--output", output], source), /Exported TaskMux portable data/);
     const snapshot = JSON.parse(readFileSync(output, "utf8"));
-    assert.equal(snapshot.schemaVersion, 2);
-    assert.equal(snapshot.roles[0].sessionSet.sessions.codex.nativeSessionId, "global-native");
-    assert.equal(snapshot.tasks[0].roles[0].sessionSet.sessions.codex.nativeSessionId, "task-native");
-    assert.equal(Object.keys(snapshot.nativeSessionIdentities).length, 2);
+    assert.equal(snapshot.schemaVersion, 3);
+    assert.doesNotMatch(JSON.stringify(snapshot), /global-native|task-native|sessionRoot|worktreeRoot|\/repo/);
 
-    assert.match(runImportCommand([output], target), /Imported TaskMux data/);
-    assert.equal(
-      target.getGlobalRoleSessionSet("operator").sessions.codex.nativeSessionId,
-      "global-native"
+    const imported = executeDomainTransaction(
+      target.rootDirectory(),
+      "portable-role-roundtrip",
+      (workingRoot) => runImportCommand(
+        [output, "--workspace-map", "default=default"],
+        new FileTaskStore(workingRoot)
+      )
     );
-    assert.equal(
-      target.getRoleSessionSet("task-1", "leader").sessions.codex.nativeSessionId,
-      "task-native"
-    );
+    assert.match(imported, /Imported TaskMux portable data/);
+    assert.equal(target.getGlobalRole("operator").workspace, "/target-repo");
+    assert.equal(target.getRole("task-1", "leader").workspace, "/target-repo");
+    assert.equal(target.getGlobalRoleSessionSet("operator"), null);
+    assert.equal(target.getRoleSessionSet("task-1", "leader"), null);
     assert.equal(target.readTranscript("task-1", "leader"), "role transcript\n");
-    assert.equal(target.nativeSessionIdentityClaims().size, 2);
+    assert.equal(target.nativeSessionIdentityClaims().size, 0);
   } finally {
     source.disposeEphemeralWorkspace();
     target.disposeEphemeralWorkspace();

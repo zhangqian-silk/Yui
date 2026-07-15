@@ -14,7 +14,7 @@ import type {
   BlockedRef,
   CreateInputRequest,
   InputChoice,
-  InputRequester,
+  InputRequesterWithNativeSession,
   ResolutionPolicy
 } from "../input/inputRequest.js";
 import { createTaskInputDraft } from "../input/taskInput.js";
@@ -1421,7 +1421,7 @@ function currentLeaderInputRequester(
   taskId: string,
   environment: NodeJS.ProcessEnv,
   expectedStatus: "active" | "blocked"
-): InputRequester {
+): InputRequesterWithNativeSession {
   const suppliedTaskId = environment.TASKMUX_TASK_ID?.trim();
   const suppliedRole = environment.TASKMUX_ROLE?.trim();
   const suppliedRunId = environment.TASKMUX_RUN_ID?.trim();

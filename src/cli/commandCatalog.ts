@@ -36,6 +36,7 @@ export type CommandNode = {
   optionValues: Readonly<Record<string, readonly string[]>>;
   argumentValues: Readonly<Record<number, readonly string[]>>;
   fileOptions: readonly string[];
+  workspaceMapOptions: readonly string[];
   fileArguments: readonly number[];
   executableOptions: readonly string[];
   completionProvider?: CompletionProviderId;
@@ -58,6 +59,7 @@ type NodeInput = {
   optionValues?: Readonly<Record<string, readonly string[]>>;
   argumentValues?: Readonly<Record<number, readonly string[]>>;
   fileOptions?: readonly string[];
+  workspaceMapOptions?: readonly string[];
   fileArguments?: readonly number[];
   executableOptions?: readonly string[];
   completionProvider?: CompletionProviderId;
@@ -101,6 +103,7 @@ function buildNode(input: NodeInput, parentPath: readonly string[] = []): Comman
     optionValues: Object.freeze(optionValues),
     argumentValues: Object.freeze(argumentValues),
     fileOptions: Object.freeze([...(input.fileOptions ?? [])]),
+    workspaceMapOptions: Object.freeze([...(input.workspaceMapOptions ?? [])]),
     fileArguments: Object.freeze([...(input.fileArguments ?? [])]),
     executableOptions: Object.freeze([...(input.executableOptions ?? [])]),
     ...(input.completionProvider === undefined ? {} : { completionProvider: input.completionProvider }),
@@ -243,8 +246,8 @@ export const ROOT_COMMAND = buildNode({
     ] },
     { name: "backup", summary: "Create a TaskMux state backup." },
     { name: "restore", summary: "Restore one physical TaskMux backup.", usage: "taskmux restore <backup-id> [--force]", options: ["--force"] },
-    { name: "export", summary: "Export TaskMux state.", usage: "taskmux export --output <file>", options: ["--output"], fileOptions: ["--output"] },
-    { name: "import", summary: "Import TaskMux state.", usage: "taskmux import <file>", fileArguments: [0] },
+    { name: "export", summary: "Export portable TaskMux semantic state.", usage: "taskmux export --output <file>", options: ["--output"], fileOptions: ["--output"] },
+    { name: "import", summary: "Import portable TaskMux semantic state.", usage: "taskmux import <file> --workspace-map <source-binding-id>=<target-binding-id|absolute-workspace-path> ...", options: ["--workspace-map"], workspaceMapOptions: ["--workspace-map"], fileArguments: [0] },
     { name: "prune", summary: "Remove selected expired physical state.", usage: "taskmux prune [--trash] [--backups] [--transactions] [--keep-backups <count>] [--keep-trash-days <days>] [--dry-run]", options: ["--trash", "--backups", "--transactions", "--keep-backups", "--keep-trash-days", "--dry-run"] },
     { name: "operator", summary: "Enter the persistent Operator session." },
     { name: "controller", summary: "Manage the local TaskMux Controller.", sections: [

@@ -524,13 +524,14 @@ test("logical export omits completion paths and import preserves target paths", 
 
   run(["export", "--output", output], { TASKMUX_HOME: source });
   const snapshot = JSON.parse(readFileSync(output, "utf8"));
-  assert.equal(snapshot.config.completionInstallations, undefined);
+  const config = snapshot.semantic.find((record) => record.authority === "config");
+  assert.equal(config?.payload.completionInstallations, undefined);
 
   run(["import", output], { TASKMUX_HOME: target });
   assert.deepEqual(targetStore.getConfig().completionInstallations, {
     fish: { scriptPath: "/target/taskmux.fish", activationPath: "/target/config.fish" }
   });
-  assert.equal(targetStore.getConfig().defaultWorkspace, "/source");
+  assert.equal(targetStore.getConfig().defaultWorkspace, "/target");
 });
 
 test("setup reuses the completion wizard for exactly one selected shell", async () => {
