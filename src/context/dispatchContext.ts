@@ -1,8 +1,9 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+
 import { dataError } from "../errors/cliError.js";
 import { activeRoleAgentBinding, type Role } from "../role/role.js";
-import { resolveTaskmuxHome, type TaskReader } from "../storage/taskStore.js";
+import { isConfiguredSkillId } from "../storage/configuredSkill.js";
+import type { TaskReader } from "../storage/taskStore.js";
 
 export function compileDispatchInput(
   store: TaskReader,
@@ -30,7 +31,7 @@ export function compileDispatchInput(
       ...child.constraints.map((item) => `Constraint: ${item}`),
       `Expected output: ${child.expectedOutput}`
     ].join("\n"));
-  const configuredSkills = readConfiguredSkills(role.skills ?? []);
+  const configuredSkills = readConfiguredSkills(store, role.skills ?? []);
   const sessionRegistration = activeRoleAgentBinding(role).adapterId === "codex"
     ? [
         "Native session bookkeeping:",
@@ -50,22 +51,16 @@ export function compileDispatchInput(
   ].join("\n\n");
 }
 
-function readConfiguredSkills(skills: string[]): string[] {
-  const taskmuxHome = resolveTaskmuxHome(process.env);
-  return skills.map((skill) => {
-    if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(skill)) {
+function readConfiguredSkills(store: TaskReader, skills: string[]): string[] {
+  if (skills.length === 0) return [];
+  return store.runReadSnapshot((snapshot) => skills.map((skill) => {
+    if (!isConfiguredSkillId(skill)) {
       throw dataError(`Invalid configured Skill id: ${skill}`);
     }
-    const path = join(taskmuxHome, "skills", skill, "SKILL.md");
-    try {
-      return readFileSync(path, "utf8").trim();
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-        throw dataError(`Configured Skill not found: ${skill}`);
-      }
-      throw error;
-    }
-  });
+    const configured = snapshot.getConfiguredSkill(skill);
+    if (configured === null) throw dataError(`Configured Skill not found: ${skill}`);
+    return configured.content.trim();
+  }));
 }
 
 function readSystemSkill(name: "taskmux-leader" | "taskmux-worker"): string {

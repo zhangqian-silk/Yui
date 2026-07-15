@@ -38,6 +38,7 @@ function describeOption(option: string): string {
     "--due": "Set a due date.",
     "--json": "Emit native JSON output.",
     "--output": "Write output to a file.",
+    "--workspace-map": "Map a source binding to a target binding ID or absolute workspace path.",
     "--format": "Select the output format.",
     "--role": "Add a role.",
     "--topic": "Add or select a topic.",

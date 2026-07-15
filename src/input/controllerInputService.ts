@@ -2,10 +2,11 @@ import { dataError } from "../errors/cliError.js";
 import { createTaskEvent } from "../event/taskEvent.js";
 import {
   cancelInputRequest,
+  assertInputRequesterWithNativeSession,
   createInputRequest,
   createInputRequestEventPayload,
   type CreateInputRequest,
-  type InputRequester,
+  type InputRequesterWithNativeSession,
   type InputResolution,
   type InputResolutionResult,
   type OperatorPresence
@@ -29,7 +30,7 @@ export type ControllerInputIds = {
 
 export type CreateControllerInputRequest = {
   taskId: string;
-  requester: InputRequester;
+  requester: InputRequesterWithNativeSession;
   input: CreateInputRequest;
 };
 
@@ -43,7 +44,7 @@ export type ResolveControllerInputRequest = {
 export type CancelControllerInputRequest = {
   taskId: string;
   requestId: string;
-  requester: InputRequester;
+  requester: InputRequesterWithNativeSession;
   reason: string;
 };
 
@@ -183,6 +184,7 @@ export class ControllerInputService {
     if (request.status !== "open") {
       throw dataError(`Input request is not open: ${command.taskId}/${command.requestId}`);
     }
+    assertInputRequesterWithNativeSession(request.requester);
     assertSameOrigin(request.requester, command.requester);
     const origin = requireActiveLeaderOrigin(store, command.taskId, command.requester, "blocked");
     if (origin.run.blockedBy?.requestId !== request.id) {
@@ -221,7 +223,7 @@ function requireAvailableTask(store: TaskStore, taskId: string) {
 function requireActiveLeaderOrigin(
   store: TaskStore,
   taskId: string,
-  requester: InputRequester,
+  requester: InputRequesterWithNativeSession,
   expectedStatus: "active" | "blocked"
 ) {
   const active = store.getActiveAgentRun(taskId, "leader");
@@ -257,7 +259,10 @@ function requireActiveLeaderOrigin(
   return { run: active, session, sessionSet };
 }
 
-function assertSameOrigin(expected: InputRequester, actual: InputRequester): void {
+function assertSameOrigin(
+  expected: InputRequesterWithNativeSession,
+  actual: InputRequesterWithNativeSession
+): void {
   if (
     expected.roleName !== actual.roleName ||
     expected.agentId !== actual.agentId ||

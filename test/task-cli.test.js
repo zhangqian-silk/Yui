@@ -5,6 +5,12 @@ import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import {
+  readRoleRuntimeOperationClaim,
+  roleRuntimeStateDigest,
+  writeRoleRuntimeOperationClaim
+} from "../dist/executor/roleRuntimeOperationClaim.js";
+import { createAgentRun } from "../dist/run/agentRun.js";
 import { FileTaskStore } from "../dist/storage/taskStore.js";
 import { TmuxManager, taskmuxTmuxSessionName, taskmuxTmuxTarget } from "../dist/tmux/tmuxManager.js";
 
@@ -1043,6 +1049,10 @@ test("exports imports and prunes local data", () => {
   const sourceHome = createConfiguredHome();
   const targetHome = createConfiguredHome();
   const exportPath = join(mkdtempSync(join(tmpdir(), "taskmux-export-")), "snapshot.json");
+  new FileTaskStore(targetHome).saveConfig({
+    schemaVersion: 1,
+    defaultWorkspace: "/tmp/project-target"
+  });
 
   runTaskmux(["config", "set", "default-agent", "codex"], {
     TASKMUX_HOME: sourceHome
@@ -1060,13 +1070,13 @@ test("exports imports and prunes local data", () => {
   const exportOutput = runTaskmux(["export", "--output", exportPath], {
     TASKMUX_HOME: sourceHome
   });
-  assert.match(exportOutput, /Exported TaskMux data/);
+  assert.match(exportOutput, /Exported TaskMux portable data/);
   assert.equal(existsSync(exportPath), true);
 
-  const importOutput = runTaskmux(["import", exportPath], {
+  const importOutput = runTaskmux(["import", exportPath, "--workspace-map", "default=default"], {
     TASKMUX_HOME: targetHome
   });
-  assert.match(importOutput, /Imported TaskMux data/);
+  assert.match(importOutput, /Imported TaskMux portable data/);
 
   assert.match(runTaskmux(["task", "show", "task-1"], { TASKMUX_HOME: targetHome }), /Portable task/);
   assert.match(runTaskmux(["task", "roles", "task-1"], { TASKMUX_HOME: targetHome }), tableCellsRegex("rd", "codex"));
@@ -5713,21 +5723,322 @@ test("routes configuration and role mutations through the same Controller", () =
   }
 });
 
+function seedStaleActiveRunAfterDeletion(home) {
+  const run = createAgentRun(
+    "stale-after-delete",
+    "task-1",
+    "leader",
+    "new",
+    "This nonportable runtime record must not survive a portable restore.",
+    new Date()
+  );
+  new FileTaskStore(home).saveActiveAgentRun(run);
+  return run;
+}
+
+function seedOrphanRuntimeOperationClaim(home) {
+  const snapshot = {
+    role: null,
+    sessionSet: null,
+    activeRun: null,
+    selectedWorkItem: null,
+    pendingRun: null
+  };
+  const claim = {
+    schemaVersion: 1,
+    scope: "task-role",
+    kind: "launch",
+    token: "00000000-0000-4000-8000-000000000031",
+    taskId: "task-1",
+    roleName: "leader",
+    operation: "dispatch",
+    ownerPid: process.pid,
+    preparedSession: null,
+    selectedWorkItem: null,
+    pendingRun: null,
+    expectedStateDigest: roleRuntimeStateDigest(snapshot),
+    recoveryToken: null,
+    createdAt: "2026-07-15T00:00:00.000Z",
+    leaseExpiresAt: "2026-07-15T00:02:00.000Z"
+  };
+  writeRoleRuntimeOperationClaim(home, claim, claim.expectedStateDigest);
+  return claim;
+}
+
+test("direct import restores a same-id trashed task without restoring its runtime session", () => {
+  const home = createConfiguredHome();
+  const snapshotDirectory = mkdtempSync(join(tmpdir(), "taskmux-export-"));
+  const snapshot = join(snapshotDirectory, "snapshot.json");
+  const { fakeTmux, logFile } = createFakeTmux(home);
+  const env = {
+    TASKMUX_HOME: home,
+    TASKMUX_CONTROLLER_MODE: "direct",
+    TASKMUX_TMUX_BIN: fakeTmux,
+    FAKE_TMUX_LOG: logFile
+  };
+
+  try {
+    runTaskmux(["task", "create", "Restore directly"], env);
+    runTaskmux(["export", "--output", snapshot], env);
+    runTaskmux(["task", "delete", "task-1"], env);
+    seedStaleActiveRunAfterDeletion(home);
+
+    assert.match(
+      runTaskmux(["import", snapshot, "--workspace-map", "default=default"], env),
+      /Imported TaskMux portable data/
+    );
+    assert.match(
+      runTaskmux(["import", snapshot, "--workspace-map", "default=default"], env),
+      /No-op:/
+    );
+
+    const store = new FileTaskStore(home);
+    assert.equal(store.getTask("task-1")?.title, "Restore directly");
+    assert.equal(existsSync(join(home, "trash", "tasks", "task-1")), false);
+    assert.equal(store.getRoleSessionSet("task-1", "leader"), null);
+    assert.equal(store.getActiveAgentRun("task-1", "leader"), null);
+    assert.match(
+      runTaskmux(
+        ["task", "dispatch", "task-1", "leader", "--mode", "new", "--input", "Dispatch after restore"],
+        env
+      ),
+      /Dispatch accepted/
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(snapshotDirectory, { recursive: true, force: true });
+  }
+});
+
 test("routes import mutations through the Controller single-writer boundary", () => {
   const home = createConfiguredHome();
-  const snapshot = join(mkdtempSync(join(tmpdir(), "taskmux-export-")), "snapshot.json");
+  const snapshotDirectory = mkdtempSync(join(tmpdir(), "taskmux-export-"));
+  const snapshot = join(snapshotDirectory, "snapshot.json");
+  const { fakeTmux, logFile } = createFakeTmux(home);
   runTaskmux(["task", "create", "Restore through Controller"], { TASKMUX_HOME: home });
   runTaskmux(["export", "--output", snapshot], { TASKMUX_HOME: home });
   runTaskmux(["task", "delete", "task-1"], { TASKMUX_HOME: home });
-  const env = { TASKMUX_HOME: home, TASKMUX_CONTROLLER_MODE: "auto" };
+  seedStaleActiveRunAfterDeletion(home);
+  const env = {
+    TASKMUX_HOME: home,
+    TASKMUX_CONTROLLER_MODE: "auto",
+    TASKMUX_TMUX_BIN: fakeTmux,
+    FAKE_TMUX_LOG: logFile
+  };
 
   try {
-    assert.match(runTaskmux(["import", snapshot], env), /Imported TaskMux data/);
+    assert.match(
+      runTaskmux(["import", snapshot, "--workspace-map", "default=default"], env),
+      /Imported TaskMux portable data/
+    );
     assert.equal(existsSync(join(home, "runtime", "controller.json")), true);
     assert.equal(JSON.parse(readFileSync(join(home, "tasks", "task-1", "info.json"), "utf8")).title,
       "Restore through Controller");
+    assert.equal(new FileTaskStore(home).getRoleSessionSet("task-1", "leader"), null);
+    assert.equal(new FileTaskStore(home).getActiveAgentRun("task-1", "leader"), null);
+    assert.match(
+      runTaskmux(["import", snapshot, "--workspace-map", "default=default"], env),
+      /No-op:/
+    );
+    assert.match(
+      runTaskmux(
+        ["task", "dispatch", "task-1", "leader", "--mode", "new", "--input", "Dispatch after restore"],
+        env
+      ),
+      /Dispatch accepted/
+    );
   } finally {
     runTaskmuxFailure(["controller", "stop"], env);
+    rmSync(home, { recursive: true, force: true });
+    rmSync(snapshotDirectory, { recursive: true, force: true });
+  }
+});
+
+test("direct and Controller imports clear orphaned runtime after a trash prune", async (t) => {
+  for (const mode of ["direct", "auto"]) {
+    await t.test(mode, () => {
+      const home = createConfiguredHome();
+      const snapshotDirectory = mkdtempSync(join(tmpdir(), "taskmux-export-"));
+      const snapshot = join(snapshotDirectory, "snapshot.json");
+      const { fakeTmux, logFile } = createFakeTmux(home);
+      const setupEnv = {
+        TASKMUX_HOME: home,
+        TASKMUX_CONTROLLER_MODE: "direct",
+        TASKMUX_TMUX_BIN: fakeTmux,
+        FAKE_TMUX_LOG: logFile
+      };
+      const env = { ...setupEnv, TASKMUX_CONTROLLER_MODE: mode };
+
+      try {
+        runTaskmux(["task", "create", `Pruned restore ${mode}`], setupEnv);
+        runTaskmux(["export", "--output", snapshot], setupEnv);
+        runTaskmux(["task", "delete", "task-1"], setupEnv);
+        runTaskmux(["prune", "--trash"], setupEnv);
+        const stale = seedStaleActiveRunAfterDeletion(home);
+
+        assert.equal(existsSync(join(home, "trash", "tasks", "task-1")), false);
+        assert.match(
+          runTaskmux(["import", snapshot, "--workspace-map", "default=default"], env),
+          /Imported TaskMux portable data/
+        );
+        const store = new FileTaskStore(home);
+        assert.equal(store.getActiveAgentRun("task-1", "leader"), null);
+        assert.match(
+          runTaskmux(
+            ["task", "dispatch", "task-1", "leader", "--mode", "new", "--input", "Dispatch after prune"],
+            env
+          ),
+          /Dispatch accepted/
+        );
+        assert.notEqual(store.getActiveAgentRun("task-1", "leader")?.id, stale.id);
+      } finally {
+        if (mode === "auto") {
+          runTaskmuxFailure(["controller", "stop"], env);
+        }
+        rmSync(home, { recursive: true, force: true });
+        rmSync(snapshotDirectory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("portable import rejects an orphaned task runtime operation without mutation", () => {
+  const home = createConfiguredHome();
+  const snapshotDirectory = mkdtempSync(join(tmpdir(), "taskmux-export-"));
+  const snapshot = join(snapshotDirectory, "snapshot.json");
+  const env = { TASKMUX_HOME: home, TASKMUX_CONTROLLER_MODE: "direct" };
+
+  try {
+    runTaskmux(["task", "create", "Fence orphan runtime"], env);
+    runTaskmux(["export", "--output", snapshot], env);
+    runTaskmux(["task", "delete", "task-1"], env);
+    runTaskmux(["prune", "--trash"], env);
+    const stale = seedStaleActiveRunAfterDeletion(home);
+    const claim = seedOrphanRuntimeOperationClaim(home);
+
+    const failed = runTaskmuxFailure(["import", snapshot, "--workspace-map", "default=default"], env);
+
+    assert.equal(failed.status, 4);
+    assert.match(failed.stderr, /Portable import transaction is invalid|active runtime operation/i);
+    assert.equal(new FileTaskStore(home).getTask("task-1"), null);
+    assert.equal(existsSync(join(home, "trash", "tasks", "task-1")), false);
+    assert.equal(new FileTaskStore(home).getActiveAgentRun("task-1", "leader")?.id, stale.id);
+    assert.equal(readRoleRuntimeOperationClaim(home, "task-1", "leader")?.token, claim.token);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(snapshotDirectory, { recursive: true, force: true });
+  }
+});
+
+test("direct and Controller import failures preserve orphaned runtime after a trash prune", async (t) => {
+  for (const mode of ["direct", "auto"]) {
+    await t.test(mode, () => {
+      const home = createConfiguredHome();
+      const snapshotDirectory = mkdtempSync(join(tmpdir(), "taskmux-export-"));
+      const snapshot = join(snapshotDirectory, "snapshot.json");
+      const env = {
+        TASKMUX_HOME: home,
+        TASKMUX_CONTROLLER_MODE: mode,
+        NODE_ENV: "test",
+        TASKMUX_TEST_ONLY_PORTABLE_IMPORT_FAILPOINT: "after-apply"
+      };
+
+      try {
+        runTaskmux(["task", "create", `Pruned rollback ${mode}`], {
+          TASKMUX_HOME: home,
+          TASKMUX_CONTROLLER_MODE: "direct"
+        });
+        runTaskmux(["export", "--output", snapshot], {
+          TASKMUX_HOME: home,
+          TASKMUX_CONTROLLER_MODE: "direct"
+        });
+        runTaskmux(["task", "delete", "task-1"], {
+          TASKMUX_HOME: home,
+          TASKMUX_CONTROLLER_MODE: "direct"
+        });
+        runTaskmux(["prune", "--trash"], {
+          TASKMUX_HOME: home,
+          TASKMUX_CONTROLLER_MODE: "direct"
+        });
+        const stale = seedStaleActiveRunAfterDeletion(home);
+
+        const failed = runTaskmuxFailure(
+          ["import", snapshot, "--workspace-map", "default=default"],
+          env
+        );
+
+        assert.equal(failed.status, 4);
+        assert.match(failed.stderr, /Portable import failed/);
+        assert.equal(new FileTaskStore(home).getTask("task-1"), null);
+        assert.equal(existsSync(join(home, "trash", "tasks", "task-1")), false);
+        assert.equal(new FileTaskStore(home).getActiveAgentRun("task-1", "leader")?.id, stale.id);
+      } finally {
+        if (mode === "auto") {
+          runTaskmuxFailure(["controller", "stop"], {
+            TASKMUX_HOME: home,
+            TASKMUX_CONTROLLER_MODE: "auto"
+          });
+        }
+        rmSync(home, { recursive: true, force: true });
+        rmSync(snapshotDirectory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("direct and Controller import failures preserve a same-id trashed task atomically", async (t) => {
+  for (const mode of ["direct", "auto"]) {
+    await t.test(mode, () => {
+      const home = createConfiguredHome();
+      const snapshotDirectory = mkdtempSync(join(tmpdir(), "taskmux-export-"));
+      const snapshot = join(snapshotDirectory, "snapshot.json");
+      const env = {
+        TASKMUX_HOME: home,
+        TASKMUX_CONTROLLER_MODE: mode,
+        NODE_ENV: "test",
+        TASKMUX_TEST_ONLY_PORTABLE_IMPORT_FAILPOINT: "after-apply"
+      };
+
+      try {
+        runTaskmux(["task", "create", `Rollback ${mode}`], {
+          TASKMUX_HOME: home,
+          TASKMUX_CONTROLLER_MODE: "direct"
+        });
+        runTaskmux(["export", "--output", snapshot], {
+          TASKMUX_HOME: home,
+          TASKMUX_CONTROLLER_MODE: "direct"
+        });
+        runTaskmux(["task", "delete", "task-1"], {
+          TASKMUX_HOME: home,
+          TASKMUX_CONTROLLER_MODE: "direct"
+        });
+        const stale = seedStaleActiveRunAfterDeletion(home);
+
+        const failed = runTaskmuxFailure(
+          ["import", snapshot, "--workspace-map", "default=default"],
+          env
+        );
+
+        assert.equal(failed.status, 4);
+        assert.match(failed.stderr, /Portable import failed/);
+        assert.equal(new FileTaskStore(home).getTask("task-1"), null);
+        assert.equal(existsSync(join(home, "trash", "tasks", "task-1")), true);
+        assert.equal(
+          new FileTaskStore(home).readTrashedTask("task-1", (trash) => trash.getTask("task-1")?.title),
+          `Rollback ${mode}`
+        );
+        assert.equal(new FileTaskStore(home).getActiveAgentRun("task-1", "leader")?.id, stale.id);
+      } finally {
+        if (mode === "auto") {
+          runTaskmuxFailure(["controller", "stop"], {
+            TASKMUX_HOME: home,
+            TASKMUX_CONTROLLER_MODE: "auto"
+          });
+        }
+        rmSync(home, { recursive: true, force: true });
+        rmSync(snapshotDirectory, { recursive: true, force: true });
+      }
+    });
   }
 });
 

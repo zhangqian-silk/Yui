@@ -38,7 +38,10 @@ import {
   isCanonicalNativeSessionId,
   isCanonicalNativeSessionRoot
 } from "../executor/nativeSessionIdentity.js";
-import { assertRuntimeOperationAllowsMutation } from "../executor/roleRuntimeOperationClaim.js";
+import {
+  assertRuntimeOperationAllowsMutation,
+  listRuntimeOperationClaims
+} from "../executor/roleRuntimeOperationClaim.js";
 import type { TaskInputDraft } from "../input/taskInput.js";
 import type { InputRequest, InputResolution } from "../input/inputRequest.js";
 import { isInputRequestRecord, isInputResolutionRecord } from "../input/inputRecordCodec.js";
@@ -76,6 +79,12 @@ import {
   snapshotTaskRoleRecord,
   snapshotTaskRoleSessionSetRecord
 } from "./recordValidation.js";
+import {
+  createConfiguredSkillRecord,
+  isConfiguredSkillId,
+  snapshotConfiguredSkillRecord,
+  type ConfiguredSkill
+} from "./configuredSkill.js";
 import {
   hasExactOwnKeys,
   lowerUnknownInertData,
@@ -155,6 +164,7 @@ export type TaskStore = {
   deleteTask(id: string): boolean;
   restoreTask(id: string): boolean;
   listTrashedTaskIds(): string[];
+  readTrashedTask<T>(taskId: string, execute: (reader: TaskReader) => T): T | null;
   listTasks(): Task[];
   getTask(id: string): Task | null;
   getTaskTopics(taskId: string): TaskTopics;
@@ -224,6 +234,7 @@ export type TaskStore = {
   appendTaskTopicSummary(taskId: string, markdown: string): void;
   readTaskTopicSummaries(taskId: string): string | null;
   appendTaskTimeline(taskId: string, markdown: string): void;
+  readTaskTimeline(taskId: string): string | null;
   nextMilestoneId(taskId: string): string;
   getMilestone(taskId: string, milestoneId: string): Milestone | null;
   listMilestones(taskId: string): Milestone[];
@@ -291,6 +302,9 @@ export type TaskStore = {
   listConfiguredAgents(): ConfiguredAgent[];
   getConfiguredAgent(id: string): ConfiguredAgent | null;
   removeConfiguredAgent(id: string): boolean;
+  saveConfiguredSkill(skill: ConfiguredSkill): void;
+  listConfiguredSkills(): ConfiguredSkill[];
+  getConfiguredSkill(id: string): ConfiguredSkill | null;
   pruneTrashedTasks(taskIds?: readonly string[]): number;
 };
 
@@ -299,6 +313,7 @@ export type TaskReader = Pick<TaskStore,
   | "getConfig"
   | "nextTaskId"
   | "listTrashedTaskIds"
+  | "readTrashedTask"
   | "listTasks"
   | "getTask"
   | "getTaskTopics"
@@ -337,6 +352,7 @@ export type TaskReader = Pick<TaskStore,
   | "getActiveAgentRun"
   | "readTaskBrief"
   | "readTaskTopicSummaries"
+  | "readTaskTimeline"
   | "nextMilestoneId"
   | "getMilestone"
   | "listMilestones"
@@ -357,6 +373,8 @@ export type TaskReader = Pick<TaskStore,
   | "readTranscript"
   | "listConfiguredAgents"
   | "getConfiguredAgent"
+  | "listConfiguredSkills"
+  | "getConfiguredSkill"
 >;
 
 export type TaskmuxConfig = {
@@ -880,7 +898,8 @@ export class FileTaskStore implements TaskStore {
     private readonly pinnedReader: NativePinnedRootReader | null | undefined = undefined,
     private readonly ephemeral = false,
     private readonly runtimeOperationToken?: string,
-    private readonly runtimeRecoveryToken?: string
+    private readonly runtimeRecoveryToken?: string,
+    private readonly pinnedRootPrefix = ""
   ) {}
 
   rootDirectory(): string {
@@ -1001,18 +1020,33 @@ export class FileTaskStore implements TaskStore {
   }
 
   listTrashedTaskIds(): string[] {
+    const trashStore = this.trashTaskStore();
     return this.directoryNames(this.trashedTasksDir())
-      .filter((id) => this.getTask(id) === null)
-      .filter((id) => {
-        const runtimeRaw = this.readOptionalText(this.trashedTaskFile(id));
-        if (runtimeRaw === null) {
-          return false;
+      .map((id) => {
+        if (this.getTask(id) !== null) {
+          throw dataError(`Task id is present in both live and trash storage: ${id}`);
         }
-        const infoRaw = this.readOptionalText(join(this.trashedTaskDir(id), "info.json"));
-        taskRecordCodec.decodeTask(id, runtimeRaw, infoRaw);
-        return true;
+        if (trashStore.getTask(id) === null) {
+          throw dataError(`Invalid trashed task record: ${id}`);
+        }
+        return id;
       })
       .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+  }
+
+  readTrashedTask<T>(taskId: string, execute: (reader: TaskReader) => T): T | null {
+    if (this.pinnedReader === undefined) {
+      return this.runReadSnapshot((reader) => reader.readTrashedTask(taskId, execute));
+    }
+    const trashStore = this.trashTaskStore();
+    const trashedTask = trashStore.getTask(taskId);
+    if (trashedTask === null) {
+      return null;
+    }
+    if (this.getTask(taskId) !== null) {
+      throw dataError(`Task id is present in both live and trash storage: ${taskId}`);
+    }
+    return withBoundedTaskReader(trashStore, execute);
   }
 
   listTasks(): Task[] {
@@ -1511,6 +1545,10 @@ export class FileTaskStore implements TaskStore {
   appendTaskTimeline(taskId: string, markdown: string): void {
     const existing = this.readOptionalText(this.taskTimelineFile(taskId)) ?? "";
     this.writeSnapshot(this.taskTimelineFile(taskId), `${existing}${markdown}`);
+  }
+
+  readTaskTimeline(taskId: string): string | null {
+    return this.readOptionalText(this.taskTimelineFile(taskId));
   }
 
   nextMilestoneId(taskId: string): string {
@@ -2123,6 +2161,46 @@ export class FileTaskStore implements TaskStore {
     }
   }
 
+  saveConfiguredSkill(skill: ConfiguredSkill): void {
+    const stored = snapshotConfiguredSkillRecord(skill);
+    if (stored === null) throw dataError("Invalid configured Skill record.");
+    const skillDir = this.configuredSkillDir(stored.id);
+    mkdirSync(skillDir, { recursive: true });
+    this.writeSnapshot(this.configuredSkillFile(stored.id), stored.content);
+  }
+
+  listConfiguredSkills(): ConfiguredSkill[] {
+    if (this.pinnedReader === undefined) {
+      return this.runReadSnapshot((reader) => reader.listConfiguredSkills());
+    }
+    return this.directoryNames(this.configuredSkillsDir())
+      .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }))
+      .map((id) => {
+        if (!isConfiguredSkillId(id)) {
+          throw dataError(`Invalid configured Skill record: ${id}`);
+        }
+        const skill = this.getConfiguredSkill(id);
+        if (skill === null) {
+          throw dataError(`Invalid configured Skill record: ${id}`);
+        }
+        return skill;
+      });
+  }
+
+  getConfiguredSkill(id: string): ConfiguredSkill | null {
+    if (!isConfiguredSkillId(id)) throw dataError("Invalid configured Skill id.");
+    if (this.pinnedReader === undefined) {
+      return this.runReadSnapshot((reader) => reader.getConfiguredSkill(id));
+    }
+    const content = this.readOptionalText(this.configuredSkillFile(id));
+    if (content === null) return null;
+    try {
+      return createConfiguredSkillRecord(id, content);
+    } catch {
+      throw dataError(`Invalid configured Skill record: ${id}`);
+    }
+  }
+
   pruneTrashedTasks(taskIds?: readonly string[]): number {
     const selected = taskIds === undefined
       ? this.directoryNames(this.trashedTasksDir())
@@ -2134,6 +2212,70 @@ export class FileTaskStore implements TaskStore {
       rmSync(this.trashedTaskDir(taskId), { recursive: true, force: true });
     }
     return selected.length;
+  }
+
+  /**
+   * Clears task-scoped host runtime before portable import creates task
+   * semantic authority where no live Task currently exists. This only runs
+   * inside the import's caller-owned domain transaction, never restores host
+   * state, and refuses to bypass a live runtime-operation fence.
+   */
+  clearNonportableTaskRuntimeForPortableImport(taskIds: readonly string[]): void {
+    if (!hasActiveDomainTransactionAuthority(this.rootDir)) {
+      throw new Error("Portable import runtime cleanup requires an active FileTaskStore transaction.");
+    }
+    const selected = [...new Set(taskIds.map((taskId) =>
+      requireSafeStorageSegment(taskId, "task")))];
+    if (selected.length === 0) return;
+    this.assertPortableImportRuntimeUnfenced(selected);
+    const selectedIds = new Set(selected);
+    const staleSessionSets = selected.flatMap((taskId) => this.listRoleSessionSets(taskId));
+    for (const taskId of selected) {
+      rmSync(this.activeAgentRunsDir(taskId), { recursive: true, force: true });
+      rmSync(this.roleSessionSetsDir(taskId), { recursive: true, force: true });
+      rmSync(this.pendingWakeupFile(taskId), { force: true });
+      rmSync(this.leaderFailureFile(taskId), { force: true });
+      rmSync(this.operatorNotificationFile(taskId), { force: true });
+      rmSync(this.offlineResolutionClockTaskDir(taskId), { recursive: true, force: true });
+      rmSync(this.inputResolutionWakeupTaskDir(taskId), { recursive: true, force: true });
+    }
+    for (const delivery of this.listOperatorDeliveries()) {
+      if (selectedIds.has(delivery.taskId)) {
+        rmSync(this.operatorDeliveryFile(delivery.deliveryId), { force: true });
+      }
+    }
+    this.retireTrashedSessionIdentities(staleSessionSets);
+  }
+
+  /**
+   * Removes host-local Role sessions attached to existing portable trash
+   * records. This runs only inside the import transaction and never restores
+   * a discarded host session on a later Task restore.
+   */
+  clearTrashedRoleSessionsForPortableImport(taskIds: readonly string[]): void {
+    if (!hasActiveDomainTransactionAuthority(this.rootDir)) {
+      throw new Error("Portable import trash-session cleanup requires an active FileTaskStore transaction.");
+    }
+    const selected = [...new Set(taskIds.map((taskId) =>
+      requireSafeStorageSegment(taskId, "task")))]
+      .filter((taskId) => existsSync(this.trashedTaskDir(taskId)));
+    if (selected.length === 0) return;
+    this.assertPortableImportRuntimeUnfenced(selected);
+    const sessionSets = selected.flatMap((taskId) => this.listTrashedRoleSessionSets(taskId));
+    this.retireTrashedSessionIdentities(sessionSets);
+    for (const taskId of selected) {
+      rmSync(this.trashedRoleSessionSetsDir(taskId), { recursive: true, force: true });
+    }
+  }
+
+  private assertPortableImportRuntimeUnfenced(taskIds: readonly string[]): void {
+    const selectedIds = new Set(taskIds);
+    const fenced = listRuntimeOperationClaims(this.rootDir).find((claim) =>
+      claim.taskId !== null && selectedIds.has(claim.taskId)
+    );
+    if (fenced !== undefined) {
+      throw dataError(`Portable import cannot replace Task with an active runtime operation: ${fenced.taskId}.`);
+    }
   }
 
   private tasksDir(): string {
@@ -2348,6 +2490,20 @@ export class FileTaskStore implements TaskStore {
     return join(this.trashedTaskDir(id), "task.json");
   }
 
+  private trashTaskStore(): FileTaskStore {
+    const prefix = this.pinnedRootPrefix.length === 0
+      ? "trash"
+      : `${this.pinnedRootPrefix}/trash`;
+    return new FileTaskStore(
+      this.trashDir(),
+      this.pinnedReader,
+      false,
+      this.runtimeOperationToken,
+      this.runtimeRecoveryToken,
+      prefix
+    );
+  }
+
   private trashedRoleSessionSetsDir(taskId: string): string {
     return join(this.trashedTaskDir(taskId), "role-sessions");
   }
@@ -2429,6 +2585,19 @@ export class FileTaskStore implements TaskStore {
 
   private agentFile(id: string): string {
     return join(this.agentDir(id), "agent.json");
+  }
+
+  private configuredSkillsDir(): string {
+    return join(this.rootDir, "skills");
+  }
+
+  private configuredSkillDir(id: string): string {
+    if (!isConfiguredSkillId(id)) throw dataError("Invalid configured Skill id.");
+    return join(this.configuredSkillsDir(), id);
+  }
+
+  private configuredSkillFile(id: string): string {
+    return join(this.configuredSkillDir(id), "SKILL.md");
   }
 
   private getRoleByStorageName(taskId: string, storageName: string): Role | null {
@@ -2602,7 +2771,13 @@ export class FileTaskStore implements TaskStore {
     ) {
       throw dataError("TaskMux pinned read path escaped its storage root.");
     }
-    return relativePath.length === 0 ? "." : relativePath.split(sep).join("/");
+    const localPath = relativePath.length === 0 ? "." : relativePath.split(sep).join("/");
+    if (this.pinnedRootPrefix.length === 0) {
+      return localPath;
+    }
+    return localPath === "."
+      ? this.pinnedRootPrefix
+      : `${this.pinnedRootPrefix}/${localPath}`;
   }
 
   private clearPendingWakeupIfExpected(expected: PendingWakeup): boolean {
@@ -2851,6 +3026,7 @@ const TASK_READER_METHODS = [
   "getConfig",
   "nextTaskId",
   "listTrashedTaskIds",
+  "readTrashedTask",
   "listTasks",
   "getTask",
   "getTaskTopics",
@@ -2889,6 +3065,7 @@ const TASK_READER_METHODS = [
   "getActiveAgentRun",
   "readTaskBrief",
   "readTaskTopicSummaries",
+  "readTaskTimeline",
   "nextMilestoneId",
   "getMilestone",
   "listMilestones",
@@ -2908,7 +3085,9 @@ const TASK_READER_METHODS = [
   "listEvents",
   "readTranscript",
   "listConfiguredAgents",
-  "getConfiguredAgent"
+  "getConfiguredAgent",
+  "listConfiguredSkills",
+  "getConfiguredSkill"
 ] as const satisfies ReadonlyArray<Exclude<keyof TaskReader, "runReadSnapshot">>;
 
 function withBoundedTaskReader<T>(

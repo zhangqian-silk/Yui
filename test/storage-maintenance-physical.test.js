@@ -12,7 +12,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -107,6 +107,7 @@ test("the unified registry backs up host-bound authority but excludes operationa
     "config.json",
     "schema.json",
     "agents",
+    "skills",
     "roles",
     "tasks",
     "trash",
@@ -143,6 +144,28 @@ test("the unified registry backs up host-bound authority but excludes operationa
   ]) {
     assert.equal(existsSync(join(backup.path, excluded)), false, excluded);
   }
+});
+
+test("physical backup and restore round-trip configured Skill authority", (t) => {
+  const root = createHome(t);
+  const skillPath = join(root, "skills", "security-review", "SKILL.md");
+  mkdirSync(dirname(skillPath), { recursive: true });
+  writeFileSync(skillPath, "# Security review\n\nOriginal backup content.\n", { mode: 0o600 });
+
+  const backup = createStorageBackup(root, FIRST);
+  assert.equal(
+    readFileSync(join(backup.path, "skills", "security-review", "SKILL.md"), "utf8"),
+    "# Security review\n\nOriginal backup content.\n"
+  );
+
+  writeFileSync(skillPath, "# Security review\n\nChanged live content.\n", { mode: 0o600 });
+  const restored = restoreStorageBackupInWorkingRoot(root, backup.id, SECOND);
+
+  assert.equal(readFileSync(skillPath, "utf8"), "# Security review\n\nOriginal backup content.\n");
+  assert.equal(
+    readFileSync(join(root, "backups", restored.rollbackId, "skills", "security-review", "SKILL.md"), "utf8"),
+    "# Security review\n\nChanged live content.\n"
+  );
 });
 
 test("restore creates a rollback snapshot before replacing physical authoritative state", (t) => {

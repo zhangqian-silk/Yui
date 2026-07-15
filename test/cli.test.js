@@ -380,6 +380,40 @@ printf 'show:%s\\n' "\${COMPREPLY[@]}"
   }
 });
 
+test("portable import documents and completes repeatable workspace mappings", () => {
+  const help = execFileSync("node", ["dist/cli.js", "help", "import"], { encoding: "utf8" });
+  const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], { encoding: "utf8" });
+  const result = runBashCompletion(
+    bash,
+    ["taskmux", "import", "snapshot.json", "--"]
+  );
+
+  assert.match(
+    help,
+    /taskmux import <file> --workspace-map <source-binding-id>=<target-binding-id\|absolute-workspace-path> \.\.\./
+  );
+  assert.match(help, /Map a source binding to a target binding ID or absolute workspace path\./);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^<--workspace-map>$/m);
+
+  const root = mkdtempSync(join(tmpdir(), "taskmux-completion-workspace-map-"));
+  const target = join(root, "target-workspace");
+  mkdirSync(target);
+  try {
+    const mapped = runBashCompletion(
+      bash,
+      ["taskmux", "import", "snapshot.json", "--workspace-map", `repository-1=${join(root, "tar")}`]
+    );
+    assert.equal(mapped.status, 0, mapped.stderr);
+    assert.match(
+      mapped.stdout,
+      new RegExp(`^<repository-1=${target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}>$`, "m")
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("bash file completion preserves spaced candidates and filename semantics", () => {
   const bash = execFileSync("node", ["dist/cli.js", "completion", "bash"], { encoding: "utf8" });
   const root = mkdtempSync(join(tmpdir(), "taskmux-completion-spaces-"));

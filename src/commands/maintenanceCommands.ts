@@ -4,32 +4,19 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
-  renameSync,
   rmSync,
+  unlinkSync,
   writeFileSync
 } from "node:fs";
-import { basename, dirname, join } from "node:path";
-import type { TaskComment } from "../comment/comment.js";
-import { dataError, usageError } from "../errors/cliError.js";
-import type { TaskEvent } from "../event/taskEvent.js";
-import type { GlobalRole, Role } from "../role/role.js";
-import type { ConfiguredAgent } from "../agent/agent.js";
-import { validateAgentBaseArguments } from "../agent/argumentPolicy.js";
-import {
-  FileTaskStore,
-  nativeSessionIdentityKey,
-  snapshotNativeSessionIdentityClaims,
-  type NativeSessionIdentityClaim,
-  type TaskReader,
-  type TaskStore,
-  type TaskmuxConfig
-} from "../storage/taskStore.js";
-import type { Task } from "../task/task.js";
+import { basename, dirname, isAbsolute, join } from "node:path";
+import { CliError, dataError, usageError } from "../errors/cliError.js";
+import { FileTaskStore } from "../storage/taskStore.js";
 import {
   applyStorageRollbackInWorkingRoot,
   restoreStorageBackupInWorkingRoot
@@ -53,55 +40,23 @@ import {
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
 import {
-  enrollAgentCapabilityProbePin,
-  type ProbeExecutableResolutionContext
-} from "../executor/agentAdapter.js";
-import {
-  isConfiguredAgentRecord,
-  isGlobalRoleRecord,
-  isGlobalRoleSessionSetRecord,
-  isSafeStorageSegment,
-  isTaskRoleRecord,
-  isTaskRoleSessionSetRecord,
-  roleReferencesAreConsistent,
-  sessionSetMatchesRole
-} from "../storage/recordValidation.js";
-import { primeResilientTaskStore } from "../storage/resilientTaskStore.js";
-import {
   assertPathOutsideTaskmuxHome,
   canonicalProspectivePath
 } from "../storage/storagePathBoundary.js";
-
-type TaskSnapshot = {
-  task: Task;
-  roles: Array<{
-    role: Role;
-    sessionSet: TaskRoleSessionSet | null;
-    transcript: string | null;
-  }>;
-  comments: TaskComment[];
-  events: TaskEvent[];
-};
-
-type GlobalRoleSnapshot = {
-  role: GlobalRole;
-  sessionSet: GlobalRoleSessionSet | null;
-};
-
-type TaskmuxSnapshot = {
-  schemaVersion: 2;
-  exportedAt: string;
-  config: TaskmuxConfig;
-  nativeSessionIdentities: Record<string, NativeSessionIdentityClaim>;
-  agents: ConfiguredAgent[];
-  roles: GlobalRoleSnapshot[];
-  tasks: TaskSnapshot[];
-};
-
-type ImportCommandOptions = {
-  processEnvironment?: NodeJS.ProcessEnv;
-  agentProbeResolution?: ProbeExecutableResolutionContext;
-};
+import {
+  MAX_PORTABLE_SNAPSHOT_BYTES
+} from "../storage/portableSchema.js";
+import { renderPortableSnapshotV3 } from "../storage/portableExport.js";
+import {
+  PortableImportError,
+  applyPortableImportPlanInTransaction,
+  planPortableImport,
+  type PortableWorkspaceBindingMapping
+} from "../storage/portableImport.js";
+import {
+  createPortableFileStoreImportTarget,
+  createPortableFileStoreSnapshotReader
+} from "../storage/portableFileStore.js";
 
 export function mergeImportedRoleSessionSets(
   existing: GlobalRoleSessionSet | TaskRoleSessionSet | null,
@@ -147,63 +102,10 @@ function sessionSetOwnerKey(sessionSet: GlobalRoleSessionSet | TaskRoleSessionSe
     : JSON.stringify(["task", sessionSet.owner.taskId, sessionSet.owner.roleName]);
 }
 
-export function runExportCommand(args: string[], store: TaskStore): string {
-  const output = readOption(args, "--output");
-  const snapshot = store instanceof FileTaskStore
-    ? exportFileStoreSnapshot(store, output)
-    : store.runReadSnapshot((reader) => exportSnapshot(reader));
-  writeExportFileAtomically(output, `${JSON.stringify(snapshot, null, 2)}\n`);
-
-  return `Exported TaskMux data to ${output}\n`;
-}
-
-function exportFileStoreSnapshot(store: FileTaskStore, output: string): TaskmuxSnapshot {
-  assertPathOutsideTaskmuxHome(output, store.rootDirectory(), "Export output");
-  if (hasActiveDomainTransactionAuthority(store.rootDirectory())) {
-    store.reconcileNativeSessionIdentityLedger();
-    return exportSnapshot(store);
-  }
-  return executeDomainTransaction(
-    store.rootDirectory(),
-    `export-${randomUUID()}`,
-    (workingRoot) => {
-      const transactionStore = new FileTaskStore(workingRoot);
-      transactionStore.reconcileNativeSessionIdentityLedger();
-      return exportSnapshot(transactionStore);
-    }
-  );
-}
-
-function exportSnapshot(store: TaskReader): TaskmuxSnapshot {
-  const { completionInstallations: _hostLocalCompletion, ...portableConfig } = store.getConfig();
-  return {
-    schemaVersion: 2,
-    exportedAt: new Date().toISOString(),
-    config: portableConfig,
-    nativeSessionIdentities: Object.fromEntries(store.nativeSessionIdentityClaims()),
-    agents: store.listConfiguredAgents().map(portableConfiguredAgent),
-    roles: store.listGlobalRoles().map((role) => ({
-      role,
-      sessionSet: store.getGlobalRoleSessionSet(role.name)
-    })),
-    tasks: store.listTasks().map((task) => ({
-      task,
-      roles: store.listRoles(task.id).map((role) => {
-        const worktree = store.getRoleWorktree(task.id, role.name);
-        const portableRole = worktree !== null && role.workspace === worktree.path
-          ? { ...role, workspace: worktree.repositoryRoot }
-          : role;
-        return {
-          role: portableRole,
-          sessionSet: store.getRoleSessionSet(task.id, role.name),
-          transcript: store.readTranscript(task.id, role.name)
-        };
-      }),
-      comments: store.listComments(task.id),
-      events: store.listEvents(task.id)
-    }))
-  };
-}
+export type PortableExportPublication = Readonly<{
+  output: string;
+  manifest: string;
+}>;
 
 function writeExportFileAtomically(output: string, contents: string): void {
   const resolvedOutput = canonicalProspectivePath(output);
@@ -221,7 +123,10 @@ function writeExportFileAtomically(output: string, contents: string): void {
     if (process.env.TASKMUX_EXPORT_FAILPOINT === "before-rename") {
       throw new Error("Injected export failure before rename.");
     }
-    renameSync(temporary, resolvedOutput);
+    // `rename` would silently replace a concurrent caller's export. Publishing
+    // through a hard link preserves the atomic no-clobber contract instead.
+    linkSync(temporary, resolvedOutput);
+    unlinkSync(temporary);
     fsyncDirectory(outputDir);
   } catch (error) {
     if (descriptor !== null) closeSync(descriptor);
@@ -240,314 +145,142 @@ function fsyncDirectory(path: string): void {
   }
 }
 
-export function runImportCommand(
+/**
+ * Exports only the portable v3 semantic graph. Host-bound authorities remain
+ * exclusively in physical backup/restore and are never inspected here.
+ */
+export function preparePortableExport(
   args: string[],
-  store: TaskStore,
-  options: ImportCommandOptions = {}
-): string {
-  const [input] = args;
+  store: FileTaskStore,
+  publishedTaskmuxHome = store.rootDirectory()
+): PortableExportPublication {
+  if (hasActiveDomainTransactionAuthority(store.rootDirectory())) {
+    throw dataError("Portable export must run as a post-commit effect.");
+  }
+  const output = parsePortableExportOutput(args);
+  assertPathOutsideTaskmuxHome(output, publishedTaskmuxHome, "Export output");
+  const rendered = store.runReadSnapshot((reader) => renderPortableSnapshotV3(
+    createPortableFileStoreSnapshotReader(reader),
+    new Date().toISOString(),
+    MAX_PORTABLE_SNAPSHOT_BYTES
+  ));
+  return Object.freeze({ output, manifest: rendered.manifest });
+}
 
+export function publishPortableExport(publication: PortableExportPublication): string {
+  writeExportFileAtomically(publication.output, publication.manifest);
+  return `Exported TaskMux portable data to ${publication.output}\n`;
+}
+
+export function runExportCommand(args: string[], store: FileTaskStore): string {
+  return publishPortableExport(preparePortableExport(args, store));
+}
+
+/**
+ * Applies a v3 plan only against the FileTaskStore workspace already supplied
+ * by the CLI or Controller domain transaction. This intentionally never starts
+ * a nested transaction.
+ */
+export function runImportCommand(args: string[], store: FileTaskStore): string {
+  const { input, workspaceMappings } = parsePortableImportArguments(args);
+  const raw = readPortableImportFile(input);
+  if (!hasActiveDomainTransactionAuthority(store.rootDirectory())) {
+    throw dataError("Portable import requires a caller-owned FileTaskStore transaction.");
+  }
+
+  try {
+    const target = createPortableFileStoreImportTarget(store);
+    const plan = planPortableImport(raw, workspaceMappings, target, {
+      maxBytes: MAX_PORTABLE_SNAPSHOT_BYTES
+    });
+    const result = applyPortableImportPlanInTransaction(plan, target);
+    if (process.env.NODE_ENV === "test" &&
+        process.env.TASKMUX_TEST_ONLY_PORTABLE_IMPORT_FAILPOINT === "after-apply") {
+      throw new Error("Injected portable import failure after apply.");
+    }
+    return `Imported TaskMux portable data from ${input}\nCreated: ${result.created}\nNo-op: ${result.noOp}\n`;
+  } catch (error) {
+    if (error instanceof PortableImportError) throw dataError(error.message);
+    if (error instanceof CliError) throw error;
+    throw dataError("Portable import failed.");
+  }
+}
+
+function parsePortableExportOutput(args: readonly string[]): string {
+  if (args.length !== 2 || args[0] !== "--output" || args[1] === undefined ||
+      args[1].trim().length === 0 || args[1].startsWith("--")) {
+    throw usageError("Portable export usage: taskmux export --output <file>.");
+  }
+  return args[1];
+}
+
+function parsePortableImportArguments(args: readonly string[]): {
+  input: string;
+  workspaceMappings: PortableWorkspaceBindingMapping[];
+} {
+  let input: string | undefined;
+  const workspaceMappings: PortableWorkspaceBindingMapping[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index] as string;
+    if (value === "--workspace-map") {
+      const mapping = args[index + 1];
+      if (mapping === undefined || mapping.startsWith("--")) {
+        throw usageError("--workspace-map is required.");
+      }
+      workspaceMappings.push(parseWorkspaceMap(mapping));
+      index += 1;
+      continue;
+    }
+    if (value.startsWith("--")) {
+      throw usageError(`Unknown portable import option: ${value}.`);
+    }
+    if (input !== undefined) {
+      throw usageError("Portable import accepts exactly one input file.");
+    }
+    input = value;
+  }
   if (input === undefined || input.trim().length === 0) {
     throw usageError("Import file is required.");
   }
+  return { input, workspaceMappings };
+}
 
-  const snapshot = parseSnapshot(readFileSync(input, "utf8"));
-  const processEnvironment = options.processEnvironment ?? process.env;
-  validateSnapshot(snapshot, processEnvironment, options.agentProbeResolution);
-  if (!(store instanceof FileTaskStore)) {
-    throw dataError("Import requires a file-backed TaskMux store.");
-  }
-  if (!hasActiveDomainTransactionAuthority(store.rootDirectory())) {
-    return executeDomainTransaction(
-      store.rootDirectory(),
-      `import-${randomUUID()}`,
-      (workingRoot) => runImportCommand(
-        args,
-        new FileTaskStore(workingRoot),
-        { ...options, processEnvironment }
-      )
+function parseWorkspaceMap(value: string): PortableWorkspaceBindingMapping {
+  const separator = value.indexOf("=");
+  if (separator <= 0 || separator === value.length - 1) {
+    throw usageError(
+      "--workspace-map must be <source-binding-id>=<target-binding-id|absolute-workspace-path>."
     );
   }
-
-  validateImportSessionOwnership(snapshot, store);
-  applySnapshot(snapshot, store, processEnvironment, options.agentProbeResolution);
-  validateCompleteStoreGraph(store);
-
-  return `Imported TaskMux data from ${input}\n`;
+  const sourceBindingId = value.slice(0, separator);
+  const target = value.slice(separator + 1);
+  if (!isPortableBindingId(sourceBindingId)) {
+    throw usageError("--workspace-map source must be a portable binding ID.");
+  }
+  if (isPortableBindingId(target)) {
+    return { schemaVersion: 1, sourceBindingId, targetBindingId: target };
+  }
+  if (isAbsolute(target)) {
+    return { schemaVersion: 1, sourceBindingId, targetWorkspacePath: target };
+  }
+  throw usageError("--workspace-map target must be a portable binding ID or an absolute workspace path.");
 }
 
-function validateImportSessionOwnership(snapshot: TaskmuxSnapshot, store: TaskStore): void {
-  const initialSetsByOwner = new Map(
-    store.listAllRoleSessionSets().map((sessionSet) => [sessionSetOwnerKey(sessionSet), sessionSet])
-  );
-  const finalSetsByOwner = new Map(initialSetsByOwner);
-
-  for (const { role, sessionSet } of snapshot.roles) {
-    replaceImportedSessionSet(finalSetsByOwner, globalSessionOwnerKey(role.name), sessionSet);
-  }
-  for (const taskSnapshot of snapshot.tasks) {
-    for (const { role, sessionSet } of taskSnapshot.roles) {
-      replaceImportedSessionSet(
-        finalSetsByOwner,
-        taskSessionOwnerKey(taskSnapshot.task.id, role.name),
-        sessionSet
-      );
-    }
-  }
-
-  const initialOwners = new Map<string, string>();
-  const retiredIdentities = new Set<string>();
-  const importedClaims = snapshotNativeSessionIdentityClaims(snapshot.nativeSessionIdentities) as
-    Record<string, NativeSessionIdentityClaim>;
-  const targetClaims = store.nativeSessionIdentityClaims();
-  for (const [identity, claim] of Object.entries(importedClaims)) {
-    const targetClaim = targetClaims.get(identity);
-    if (targetClaim !== undefined && !nativeSessionClaimsMatch(targetClaim, claim)) {
-      throw dataError("Imported native session identity conflicts with the target ledger.");
-    }
-  }
-  for (const [identity, claim] of targetClaims) {
-    if (claim.state === "retired") {
-      retiredIdentities.add(identity);
-      continue;
-    }
-    initialOwners.set(identity, identityOwnerKeyFromClaim(claim));
-  }
-  for (const [identity, owner] of sessionIdentityOwners(initialSetsByOwner.values())) {
-    if (retiredIdentities.has(identity)) {
-      throw dataError("Native Agent session identity ledger conflicts with live Role Agent ownership.");
-    }
-    const historicalOwner = initialOwners.get(identity);
-    if (historicalOwner !== undefined && historicalOwner !== owner) {
-      throw dataError("Native Agent session identity ledger conflicts with live Role Agent ownership.");
-    }
-    initialOwners.set(identity, owner);
-  }
-  const finalOwners = sessionIdentityOwners(finalSetsByOwner.values());
-  for (const identity of retiredIdentities) {
-    if (finalOwners.has(identity)) {
-      throw dataError("Import cannot revive a retired native session identity.");
-    }
-  }
-  for (const [identity, initialOwner] of initialOwners) {
-    const finalOwner = finalOwners.get(identity);
-    if (finalOwner !== undefined && finalOwner !== initialOwner) {
-      throw dataError("Import cannot transfer a native session identity between Role Agents.");
-    }
-  }
-  for (const [identity, claim] of Object.entries(importedClaims)) {
-    const finalOwner = finalOwners.get(identity);
-    if (claim.state === "retired" && finalOwner !== undefined) {
-      throw dataError("Import cannot revive a retired native session identity.");
-    }
-    if (
-      claim.state === "owned" &&
-      finalOwner !== undefined &&
-      finalOwner !== identityOwnerKeyFromClaim(claim)
-    ) {
-      throw dataError("Imported native session identity conflicts with final Role Agent ownership.");
-    }
-  }
+function isPortableBindingId(value: string): boolean {
+  return /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(value);
 }
 
-function replaceImportedSessionSet(
-  sessionSets: Map<string, GlobalRoleSessionSet | TaskRoleSessionSet>,
-  ownerKey: string,
-  sessionSet: GlobalRoleSessionSet | TaskRoleSessionSet | null
-): void {
-  const merged = mergeImportedRoleSessionSets(sessionSets.get(ownerKey) ?? null, sessionSet);
-  if (merged !== null) sessionSets.set(ownerKey, merged);
-}
-
-function nativeSessionClaimsMatch(
-  left: NativeSessionIdentityClaim,
-  right: NativeSessionIdentityClaim
-): boolean {
-  return left.state === right.state && (
-    left.state === "retired" ||
-    (right.state === "owned" && identityOwnerKeyFromClaim(left) === identityOwnerKeyFromClaim(right))
-  );
-}
-
-function identityOwnerKeyFromClaim(
-  claim: Extract<NativeSessionIdentityClaim, { state: "owned" }>
-): string {
-  return claim.owner.scope === "global"
-    ? globalIdentityOwnerKey(claim.owner.roleName, claim.owner.agentId)
-    : taskIdentityOwnerKey(
-      claim.owner.taskId,
-      claim.owner.roleName,
-      claim.owner.agentId
-    );
-}
-
-function sessionIdentityOwners(
-  sessionSets: Iterable<GlobalRoleSessionSet | TaskRoleSessionSet>
-): Map<string, string> {
-  const owners = new Map<string, string>();
-  for (const sessionSet of sessionSets) {
-    for (const [agentId, session] of Object.entries(sessionSet.sessions)) {
-      const owner = sessionSet.owner.scope === "global"
-        ? globalIdentityOwnerKey(sessionSet.owner.roleName, agentId)
-        : taskIdentityOwnerKey(
-          sessionSet.owner.taskId,
-          sessionSet.owner.roleName,
-          agentId
-        );
-      for (const nativeIdentity of roleAgentSessionIdentities(session)) {
-        const identity = nativeSessionIdentityKey(nativeIdentity);
-        const existingOwner = owners.get(identity);
-        if (existingOwner !== undefined && existingOwner !== owner) {
-          throw dataError("A native session identity is already owned by another Role Agent.");
-        }
-        owners.set(identity, owner);
-      }
-    }
+function readPortableImportFile(input: string): string {
+  let raw: Buffer;
+  try {
+    raw = readFileSync(input);
+  } catch {
+    throw dataError("Portable import file cannot be read.");
   }
-  return owners;
-}
-
-function globalSessionOwnerKey(roleName: string): string {
-  return JSON.stringify(["global", roleName]);
-}
-
-function taskSessionOwnerKey(taskId: string, roleName: string): string {
-  return JSON.stringify(["task", taskId, roleName]);
-}
-
-function globalIdentityOwnerKey(roleName: string, agentId: string): string {
-  return JSON.stringify(["global", roleName, agentId]);
-}
-
-function taskIdentityOwnerKey(taskId: string, roleName: string, agentId: string): string {
-  return JSON.stringify(["task", taskId, roleName, agentId]);
-}
-
-function applySnapshot(
-  snapshot: TaskmuxSnapshot,
-  store: TaskStore,
-  processEnvironment: NodeJS.ProcessEnv,
-  agentProbeResolution?: ProbeExecutableResolutionContext
-): void {
-  const targetCompletionInstallations = store.getConfig().completionInstallations;
-  const { completionInstallations: _importedHostLocalCompletion, ...portableConfig } = snapshot.config;
-
-  for (const agent of snapshot.agents) {
-    persistImportedAgent(store, agent, processEnvironment, agentProbeResolution);
+  if (raw.byteLength > MAX_PORTABLE_SNAPSHOT_BYTES) {
+    throw dataError("Portable import snapshot exceeds the 8 MiB limit.");
   }
-  if (process.env.TASKMUX_IMPORT_FAILPOINT === "after-agents") {
-    throw new Error("Injected import failure after Agent writes.");
-  }
-  store.saveConfig({ ...portableConfig, completionInstallations: targetCompletionInstallations });
-
-  for (const { role, sessionSet } of snapshot.roles) {
-    store.saveGlobalRoleWithSessionSet(
-      role,
-      mergeImportedRoleSessionSets(
-        store.getGlobalRoleSessionSet(role.name),
-        sessionSet
-      ) as GlobalRoleSessionSet | null,
-      true
-    );
-  }
-
-  for (const taskSnapshot of snapshot.tasks) {
-    store.saveTask(taskSnapshot.task);
-    for (const { role, sessionSet, transcript } of taskSnapshot.roles) {
-      store.saveRoleWithSessionSet(
-        taskSnapshot.task.id,
-        role,
-        mergeImportedRoleSessionSets(
-          store.getRoleSessionSet(taskSnapshot.task.id, role.name),
-          sessionSet
-        ) as TaskRoleSessionSet | null,
-        true
-      );
-      if (transcript === null) store.clearTranscript(taskSnapshot.task.id, role.name);
-      else store.saveTranscript(taskSnapshot.task.id, role.name, transcript);
-    }
-
-    const existingComments = new Map(
-      store.listComments(taskSnapshot.task.id).map((comment) => [comment.id, comment])
-    );
-    for (const comment of taskSnapshot.comments) {
-      const existing = existingComments.get(comment.id);
-      if (existing === undefined) store.saveComment(taskSnapshot.task.id, comment);
-      else if (JSON.stringify(existing) !== JSON.stringify(comment)) {
-        throw dataError(`Imported comment conflicts with target record: ${taskSnapshot.task.id}/${comment.id}`);
-      }
-    }
-
-    const existingEvents = new Map(
-      store.listEvents(taskSnapshot.task.id).map((event) => [event.id, event])
-    );
-    for (const event of taskSnapshot.events) {
-      const existing = existingEvents.get(event.id);
-      if (existing === undefined) store.saveEvent(taskSnapshot.task.id, event);
-      else if (JSON.stringify(existing) !== JSON.stringify(event)) {
-        throw dataError(`Imported event conflicts with target record: ${taskSnapshot.task.id}/${event.id}`);
-      }
-    }
-  }
-  store.mergeImportedNativeSessionIdentityClaims(snapshot.nativeSessionIdentities);
-}
-
-function persistImportedAgent(
-  store: TaskStore,
-  agent: ConfiguredAgent,
-  processEnvironment: NodeJS.ProcessEnv,
-  agentProbeResolution?: ProbeExecutableResolutionContext
-): void {
-  const {
-    probePin: _importedHostBoundProbePin,
-    probePinRefreshRequired: _importedHostRefreshState,
-    ...portableAgent
-  } = agent;
-  const existing = store.getConfiguredAgent(agent.id);
-  const targetProbePin = existing !== null &&
-      existing.adapterId === agent.adapterId &&
-      existing.command === agent.command &&
-      existing.probePin !== undefined
-    ? existing.probePin
-    : enrollAgentCapabilityProbePin(
-      { adapterId: agent.adapterId, command: agent.command },
-      processEnvironment,
-      agentProbeResolution
-    );
-  const targetProbePinRefreshRequired = targetProbePin === undefined &&
-    existing !== null &&
-    existing.adapterId === agent.adapterId &&
-    existing.command === agent.command &&
-    existing.probePinRefreshRequired === true;
-  const persisted = existing === null
-    ? store.createConfiguredAgentIfAbsent({
-      ...portableAgent,
-      ...(targetProbePin === undefined ? {} : { probePin: targetProbePin })
-    })
-    : store.updateConfiguredAgent(
-      agent.id,
-      {
-        adapterId: agent.adapterId,
-        command: agent.command,
-        baseArgs: agent.baseArgs,
-        environment: agent.environment,
-        probePin: targetProbePin ?? null,
-        probePinRefreshRequired: targetProbePinRefreshRequired ? true : null
-      },
-      new Date(agent.updatedAt)
-    )?.agent ?? null;
-  if (persisted === null) {
-    throw dataError(`Agent registry changed during import: ${agent.id}.`);
-  }
-}
-
-function portableConfiguredAgent(agent: ConfiguredAgent): ConfiguredAgent {
-  const {
-    probePin: _hostBoundProbePin,
-    probePinRefreshRequired: _hostBoundRefreshState,
-    ...portable
-  } = agent;
-  return portable;
+  return raw.toString("utf8");
 }
 
 type PruneCommandPlan = Readonly<{
@@ -830,305 +563,6 @@ function validatePruneArguments(args: string[]): void {
     }
     throw usageError(`Unknown prune option: ${arg}.`);
   }
-}
-
-function parseSnapshot(raw: string): TaskmuxSnapshot {
-  let value: unknown;
-  try {
-    value = JSON.parse(raw) as unknown;
-  } catch {
-    throw dataError("Invalid TaskMux export snapshot");
-  }
-  if (!isRecord(value)) throw dataError("Invalid TaskMux export snapshot");
-  if (value.schemaVersion !== 2) {
-    const version = typeof value.schemaVersion === "number" ? String(value.schemaVersion) : "unknown";
-    throw dataError(`Unsupported TaskMux export snapshot version: ${version}.`);
-  }
-  if (
-    !hasExactKeys(value, [
-      "schemaVersion",
-      "exportedAt",
-      "config",
-      "nativeSessionIdentities",
-      "agents",
-      "roles",
-      "tasks"
-    ]) ||
-    typeof value.exportedAt !== "string" ||
-    !isRecord(value.config) ||
-    snapshotNativeSessionIdentityClaims(value.nativeSessionIdentities) === null ||
-    !Array.isArray(value.agents) ||
-    !Array.isArray(value.roles) ||
-    !Array.isArray(value.tasks)
-  ) {
-    throw dataError("Invalid TaskMux export snapshot");
-  }
-  return value as unknown as TaskmuxSnapshot;
-}
-
-function validateSnapshot(
-  snapshot: TaskmuxSnapshot,
-  processEnvironment: NodeJS.ProcessEnv,
-  agentProbeResolution?: ProbeExecutableResolutionContext
-): void {
-  const store = FileTaskStore.createEphemeralWorkspace("taskmux-import-preflight-");
-  try {
-    if (Object.hasOwn(snapshot.config, "completionInstallations")) {
-      throw dataError("Invalid TaskMux export snapshot config");
-    }
-    rejectDuplicate(snapshot.agents, (agent) => recordIdentity(agent, "id", "agent"), "agent");
-    for (const agent of snapshot.agents) {
-      if (
-        !isRecord(agent) ||
-        typeof agent.adapterId !== "string" ||
-        !Array.isArray(agent.baseArgs) ||
-        !agent.baseArgs.every((value) => typeof value === "string")
-      ) {
-        throw dataError("Invalid agent record");
-      }
-      validateAgentBaseArguments(agent.adapterId, agent.baseArgs);
-      if (!isConfiguredAgentRecord(agent) || !isSafeStorageSegment(agent.id)) {
-        throw dataError("Invalid agent record");
-      }
-      persistImportedAgent(store, agent, processEnvironment, agentProbeResolution);
-      store.getConfiguredAgent(agent.id);
-    }
-    const agents = new Map(store.listConfiguredAgents().map((agent) => [agent.id, agent]));
-    if (snapshot.config.defaultAgent !== undefined && !agents.has(snapshot.config.defaultAgent)) {
-      throw dataError("TaskMux export snapshot references an unknown default Agent.");
-    }
-    store.saveConfig(snapshot.config);
-    store.getConfig();
-
-    rejectDuplicate(
-      snapshot.roles,
-      (entry) => isRecord(entry) && isRecord(entry.role)
-        ? recordIdentity(entry.role, "name", "global role")
-        : invalidIdentity("global role"),
-      "global role"
-    );
-    for (const entry of snapshot.roles) {
-      if (!isRecord(entry) || !hasExactKeys(entry, ["role", "sessionSet"]) || !isRecord(entry.role)) {
-        throw dataError("Invalid global role snapshot");
-      }
-      const role = entry.role;
-      if (
-        !isGlobalRoleRecord(role) ||
-        !isSafeStorageSegment(role.name) ||
-        (entry.sessionSet !== null && (
-          !isGlobalRoleSessionSetRecord(entry.sessionSet, role.name) ||
-          !sessionSetMatchesRole(entry.sessionSet, role)
-        ))
-      ) {
-        throw dataError("Invalid global role record");
-      }
-      store.saveGlobalRoleWithSessionSet(role, entry.sessionSet);
-      const decoded = store.getGlobalRole(role.name);
-      if (decoded === null || !roleReferencesAreConsistent(decoded, agents)) {
-        throw dataError(`Invalid global role record: ${role.name}`);
-      }
-    }
-
-    rejectDuplicate(
-      snapshot.tasks,
-      (entry) => isRecord(entry) && isRecord(entry.task)
-        ? recordIdentity(entry.task, "id", "task")
-        : invalidIdentity("task"),
-      "task"
-    );
-    for (const entry of snapshot.tasks) {
-      if (
-        !isRecord(entry) ||
-        !hasExactKeys(entry, ["task", "roles", "comments", "events"]) ||
-        !isLogicalTaskRecord(entry.task) ||
-        !Array.isArray(entry.roles) ||
-        !Array.isArray(entry.comments) ||
-        !Array.isArray(entry.events)
-      ) {
-        throw dataError("Invalid TaskMux export snapshot");
-      }
-      const taskId = entry.task.id;
-      store.saveTask(entry.task);
-      if (store.getTask(taskId) === null) throw dataError(`Invalid task record: ${taskId}`);
-
-      rejectDuplicate(
-        entry.roles,
-        (item) => isRecord(item) && isRecord(item.role)
-          ? recordIdentity(item.role, "name", "role")
-          : invalidIdentity("role"),
-        `role in ${taskId}`
-      );
-      for (const item of entry.roles) {
-        if (
-          !isRecord(item) ||
-          !hasExactKeys(item, ["role", "sessionSet", "transcript"]) ||
-          !isRecord(item.role) ||
-          !isTaskRoleRecord(item.role, taskId) ||
-          item.role.taskId !== taskId ||
-          (item.sessionSet !== null && (
-            !isTaskRoleSessionSetRecord(item.sessionSet, taskId, item.role.name) ||
-            !sessionSetMatchesRole(item.sessionSet, item.role)
-          )) ||
-          (item.transcript !== null && typeof item.transcript !== "string")
-        ) {
-          throw dataError(`Invalid role record: ${taskId}`);
-        }
-        store.saveRoleWithSessionSet(taskId, item.role, item.sessionSet);
-        const role = store.getRole(taskId, item.role.name);
-        if (role === null || !roleReferencesAreConsistent(role, agents)) {
-          throw dataError(`Invalid role record: ${item.role.name}`);
-        }
-      }
-
-      rejectDuplicate(
-        entry.comments,
-        (comment) => recordIdentity(comment, "id", "comment"),
-        `comment in ${taskId}`
-      );
-      for (const comment of entry.comments) store.saveComment(taskId, comment);
-      store.listComments(taskId);
-      rejectDuplicate(
-        entry.events,
-        (event) => recordIdentity(event, "id", "event"),
-        `event in ${taskId}`
-      );
-      for (const event of entry.events) store.saveEvent(taskId, event);
-      store.listEvents(taskId);
-    }
-
-    const taskIds = new Set(snapshot.tasks.map((entry) => entry.task.id));
-    for (const pointer of [snapshot.config.currentTaskId, snapshot.config.lastTaskId]) {
-      if (pointer !== undefined && !taskIds.has(pointer)) {
-        throw dataError("TaskMux export snapshot config references an unknown Task.");
-      }
-    }
-    const importedClaims = snapshotNativeSessionIdentityClaims(snapshot.nativeSessionIdentities) as
-      Record<string, NativeSessionIdentityClaim>;
-    for (const [identity, physicalClaim] of store.nativeSessionIdentityClaims()) {
-      const importedClaim = importedClaims[identity];
-      if (importedClaim === undefined || !nativeSessionClaimsMatch(physicalClaim, importedClaim)) {
-        throw dataError(
-          "TaskMux export snapshot omits or conflicts with a physical native session identity."
-        );
-      }
-    }
-    store.mergeImportedNativeSessionIdentityClaims(importedClaims);
-    store.reconcileNativeSessionIdentityLedger();
-  } finally {
-    store.disposeEphemeralWorkspace();
-  }
-}
-
-function validateCompleteStoreGraph(store: TaskStore): void {
-  primeResilientTaskStore(store);
-  const agents = new Map(store.listConfiguredAgents().map((agent) => [agent.id, agent]));
-  const config = store.getConfig();
-  if (config.defaultAgent !== undefined && !agents.has(config.defaultAgent)) {
-    throw dataError("TaskMux config references an unknown default Agent.");
-  }
-  for (const role of store.listGlobalRoles()) {
-    if (!roleReferencesAreConsistent(role, agents)) {
-      throw dataError(`Global Role references an inconsistent Agent: ${role.name}`);
-    }
-  }
-  const tasks = store.listTasks();
-  const taskIds = new Set(tasks.map((task) => task.id));
-  for (const pointer of [config.currentTaskId, config.lastTaskId]) {
-    if (pointer !== undefined && !taskIds.has(pointer)) {
-      throw dataError("TaskMux config references an unknown Task.");
-    }
-  }
-  for (const task of tasks) {
-    for (const role of store.listRoles(task.id)) {
-      if (!roleReferencesAreConsistent(role, agents)) {
-        throw dataError(`TaskRole references an inconsistent Agent: ${task.id}/${role.name}`);
-      }
-    }
-  }
-}
-
-function rejectDuplicate<T>(values: T[], identity: (value: T) => string, label: string): void {
-  const seen = new Set<string>();
-  for (const value of values) {
-    const id = identity(value);
-    if (seen.has(id)) throw dataError(`Duplicate ${label} identity.`);
-    seen.add(id);
-  }
-}
-
-function recordIdentity(value: unknown, key: string, label: string): string {
-  if (!isRecord(value) || !isSafeStorageSegment(value[key])) return invalidIdentity(label);
-  return value[key];
-}
-
-function invalidIdentity(label: string): never {
-  throw dataError(`Invalid ${label} identity.`);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function hasExactKeys(value: Record<string, unknown>, required: readonly string[]): boolean {
-  return required.every((key) => Object.hasOwn(value, key)) &&
-    Object.keys(value).every((key) => required.includes(key));
-}
-
-function isLogicalTaskRecord(value: unknown): value is Task {
-  if (
-    !isRecord(value) ||
-    !hasExactKeysWithOptional(
-      value,
-      ["schemaVersion", "id", "title", "archived", "createdAt", "updatedAt"],
-      [
-        "description",
-        "priority",
-        "tags",
-        "dueAt",
-        "archivedAt",
-        "archivedBy",
-        "archiveReason",
-        "archiveSummary"
-      ]
-    )
-  ) return false;
-  return value.schemaVersion === 1 &&
-    isSafeStorageSegment(value.id) &&
-    typeof value.title === "string" &&
-    value.title.trim().length > 0 &&
-    typeof value.archived === "boolean" &&
-    typeof value.createdAt === "string" &&
-    typeof value.updatedAt === "string" &&
-    (value.description === undefined || typeof value.description === "string") &&
-    (value.priority === undefined || ["low", "medium", "high", "urgent"].includes(String(value.priority))) &&
-    (value.tags === undefined || (
-      Array.isArray(value.tags) && value.tags.every((tag) => typeof tag === "string")
-    )) &&
-    (value.dueAt === undefined || typeof value.dueAt === "string") &&
-    (value.archivedAt === undefined || typeof value.archivedAt === "string") &&
-    (value.archivedBy === undefined || ["user", "operator", "leader"].includes(String(value.archivedBy))) &&
-    (value.archiveReason === undefined || typeof value.archiveReason === "string") &&
-    (value.archiveSummary === undefined || typeof value.archiveSummary === "string");
-}
-
-function hasExactKeysWithOptional(
-  value: Record<string, unknown>,
-  required: readonly string[],
-  optional: readonly string[]
-): boolean {
-  const allowed = new Set([...required, ...optional]);
-  return required.every((key) => Object.hasOwn(value, key)) &&
-    Object.keys(value).every((key) => allowed.has(key));
-}
-
-function readOption(args: string[], name: string): string {
-  const value = readOptionalOption(args, name);
-
-  if (value === undefined) {
-    throw usageError(`${name} is required.`);
-  }
-
-  return value;
 }
 
 function readOptionalOption(args: string[], name: string): string | undefined {

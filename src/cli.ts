@@ -263,8 +263,11 @@ async function main(): Promise<void> {
 
   if (args[0] === "export") {
     requireStorageSchema(rootDir);
-    const store = new FileTaskStore(rootDir);
-    emit(runExportCommand(args.slice(1), store));
+    if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
+      await printControllerCommand(rootDir, "export", args.slice(1));
+      return;
+    }
+    emit(runExportCommand(args.slice(1), new FileTaskStore(rootDir)));
     return;
   }
 

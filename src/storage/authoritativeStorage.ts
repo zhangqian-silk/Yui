@@ -27,6 +27,7 @@ export const STORAGE_PATH_REGISTRY: readonly StoragePathRegistryEntry[] = Object
   storagePath("config.json", "file", "core", "include"),
   storagePath("schema.json", "file", "core", "include"),
   storagePath("agents", "directory", "core", "include"),
+  storagePath("skills", "directory", "core", "include"),
   storagePath("roles", "directory", "core", "include"),
   storagePath("tasks", "directory", "core", "include"),
   storagePath("trash", "directory", "core", "include"),

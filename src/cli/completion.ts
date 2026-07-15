@@ -14,6 +14,7 @@ type CompletionEntry = {
   optionValues: Readonly<Record<string, readonly string[]>>;
   argumentValues: Readonly<Record<number, readonly string[]>>;
   fileOptions: readonly string[];
+  workspaceMapOptions: readonly string[];
   fileArguments: readonly number[];
   executableOptions: readonly string[];
   completionProvider?: string;
@@ -48,6 +49,7 @@ function collectEntries(root: CommandNode): CompletionEntry[] {
         optionValues: node.optionValues,
         argumentValues: node.argumentValues,
         fileOptions: node.fileOptions,
+        workspaceMapOptions: node.workspaceMapOptions,
         fileArguments: node.fileArguments,
         executableOptions: node.executableOptions,
         completionProvider: node.completionProvider,
@@ -71,6 +73,7 @@ function collectEntries(root: CommandNode): CompletionEntry[] {
         optionValues: {},
         argumentValues: {},
         fileOptions: [],
+        workspaceMapOptions: [],
         fileArguments: [],
         executableOptions: [],
         completionProvider: undefined,
@@ -89,7 +92,7 @@ function renderBash(entries: readonly CompletionEntry[], identity: CliIdentity):
   const containsFunction = `${functionName}_contains`;
   return `${functionName}() {
   local path current previous argument_index command_depth dynamic_provider dynamic_handled
-  local -a immediate options value_keys value_lists argument_value_positions argument_value_lists file_options file_arguments executable_options candidates dynamic_candidates
+  local -a immediate options value_keys value_lists argument_value_positions argument_value_lists file_options workspace_map_options file_arguments executable_options candidates dynamic_candidates
   path=""
   current="\${COMP_WORDS[COMP_CWORD]}"
   previous=""
@@ -99,7 +102,7 @@ function renderBash(entries: readonly CompletionEntry[], identity: CliIdentity):
   if (( COMP_CWORD > 1 )); then
     path="\${COMP_WORDS[*]:1:COMP_CWORD-1}"
   fi
-  immediate=(); options=(); value_keys=(); value_lists=(); argument_value_positions=(); argument_value_lists=(); file_options=(); file_arguments=(); executable_options=(); candidates=(); dynamic_candidates=(); dynamic_provider=''; dynamic_handled=0
+  immediate=(); options=(); value_keys=(); value_lists=(); argument_value_positions=(); argument_value_lists=(); file_options=(); workspace_map_options=(); file_arguments=(); executable_options=(); candidates=(); dynamic_candidates=(); dynamic_provider=''; dynamic_handled=0
   case "$path" in
 ${renderBashCases(entries)}
     *) return 0;;
@@ -157,6 +160,16 @@ ${renderBashCases(entries)}
     compopt -o nosort 2>/dev/null || true
     return 0
   fi
+  if ${containsFunction} "$previous" "\${workspace_map_options[@]}" && [[ "$current" == *=/* ]]; then
+    local mapping_prefix="\${current%%=*}="
+    local mapping_path="\${current#*=}"
+    COMPREPLY=()
+    while IFS= read -r file_candidate; do
+      COMPREPLY+=("\${mapping_prefix}\${file_candidate}")
+    done < <(compgen -f -- "$mapping_path")
+    compopt -o filenames 2>/dev/null || true
+    return 0
+  fi
   if ${containsFunction} "$previous" "\${file_options[@]}" || ${containsFunction} "$argument_index" "\${file_arguments[@]}"; then
     local file_candidate
     COMPREPLY=()
@@ -193,6 +206,7 @@ function renderBashCases(entries: readonly CompletionEntry[]): string {
       `argument_value_positions=(${Object.keys(entry.argumentValues).join(" ")})`,
       `argument_value_lists=(${Object.values(entry.argumentValues).map((values) => shellQuote(values.join(" "))).join(" ")})`,
       `file_options=(${entry.fileOptions.map(shellQuote).join(" ")})`,
+      `workspace_map_options=(${entry.workspaceMapOptions.map(shellQuote).join(" ")})`,
       `file_arguments=(${entry.fileArguments.join(" ")})`,
       `executable_options=(${entry.executableOptions.map(shellQuote).join(" ")})`,
       `dynamic_provider=${shellQuote(entry.completionProvider ?? "")}`
@@ -205,7 +219,7 @@ function renderZsh(entries: readonly CompletionEntry[], identity: CliIdentity): 
   return `#compdef ${identity}
 local path current previous argument_index command_depth dynamic_provider
 integer dynamic_handled=0
-local -a immediate options value_keys value_lists argument_value_positions argument_value_lists file_options file_arguments executable_options candidates dynamic_candidates
+local -a immediate options value_keys value_lists argument_value_positions argument_value_lists file_options workspace_map_options file_arguments executable_options candidates dynamic_candidates
 local dynamic_output
 path=""
 current="$words[CURRENT]"
@@ -261,6 +275,10 @@ if (( \${executable_options[(Ie)$previous]} )); then
   _command_names -e
   return 0
 fi
+if (( \${workspace_map_options[(Ie)$previous]} )) && [[ "$current" == *=/* ]]; then
+  _files -P "\${current%%=*}="
+  return 0
+fi
 if (( \${file_options[(Ie)$previous]} || \${file_arguments[(Ie)$argument_index]} )); then
   _files
 fi
@@ -280,6 +298,7 @@ function renderZshCases(entries: readonly CompletionEntry[]): string {
       `argument_value_positions=(${Object.keys(entry.argumentValues).join(" ")})`,
       `argument_value_lists=(${Object.values(entry.argumentValues).map((values) => shellQuote(values.join(" "))).join(" ")})`,
       `file_options=(${entry.fileOptions.map(shellQuote).join(" ")})`,
+      `workspace_map_options=(${entry.workspaceMapOptions.map(shellQuote).join(" ")})`,
       `file_arguments=(${entry.fileArguments.join(" ")})`,
       `executable_options=(${entry.executableOptions.map(shellQuote).join(" ")})`,
       `dynamic_provider=${shellQuote(entry.completionProvider ?? "")}`
@@ -303,6 +322,7 @@ function renderFish(entries: readonly CompletionEntry[], identity: CliIdentity):
       set argument_value_positions ${Object.keys(entry.argumentValues).join(" ")}
       set argument_value_lists ${Object.values(entry.argumentValues).map((values) => shellQuote(values.join(" "))).join(" ")}
       set file_options ${entry.fileOptions.map(shellQuote).join(" ")}
+      set workspace_map_options ${entry.workspaceMapOptions.map(shellQuote).join(" ")}
       set file_arguments ${entry.fileArguments.join(" ")}
       set executable_options ${entry.executableOptions.map(shellQuote).join(" ")}
       set dynamic_provider ${shellQuote(entry.completionProvider ?? "")}`;
@@ -320,6 +340,7 @@ function renderFish(entries: readonly CompletionEntry[], identity: CliIdentity):
   set -l argument_value_positions
   set -l argument_value_lists
   set -l file_options
+  set -l workspace_map_options
   set -l file_arguments
   set -l executable_options
   set -l dynamic_provider
@@ -378,6 +399,12 @@ ${cases}
         printf '%s\\n' "$record"
       end
     end
+    return 0
+  end
+  if contains -- "$previous" $workspace_map_options; and string match -q -- '*=/*' "$current"
+    set -l workspace_map_prefix (string replace -r -- '=.*$' '=' "$current")
+    set -l workspace_map_path (string replace -r -- '^[^=]*=' '' "$current")
+    __fish_complete_path "$workspace_map_path" | string replace -r '^' "$workspace_map_prefix"
     return 0
   end
   if contains -- "$previous" $file_options; or contains -- "$argument_index" $file_arguments
