@@ -1,10 +1,11 @@
 TASKMUX_HOME ?= $(CURDIR)/output/taskmux-local-test
 TASKMUX ?= node dist/cli.js
 WORKSPACE ?= $(CURDIR)
+NPM_INSTALL_STAMP := node_modules/.package-lock.json
 
 .DEFAULT_GOAL := all
 
-.PHONY: all help build lint test check link unlink local-clean local-setup local-smoke local-board local-roles local-detail
+.PHONY: all help deps build lint test check link unlink local-clean local-setup local-smoke local-board local-roles local-detail
 
 all: check
 
@@ -12,6 +13,7 @@ help:
 	@printf '%s\n' 'TaskMux local targets:'
 	@printf '%s\n' '  make               Run all: check'
 	@printf '%s\n' '  make all           Run check'
+	@printf '%s\n' '  make deps          Install npm dependencies when needed'
 	@printf '%s\n' '  make build         Build dist/cli.js'
 	@printf '%s\n' '  make lint          Run TypeScript no-emit check'
 	@printf '%s\n' '  make test          Run full test suite'
@@ -27,13 +29,18 @@ help:
 	@printf '%s\n' '  TASKMUX_HOME=$(CURDIR)/output/taskmux-local-test'
 	@printf '%s\n' '  WORKSPACE=$(CURDIR)'
 
-build:
+deps: $(NPM_INSTALL_STAMP)
+
+$(NPM_INSTALL_STAMP): package.json package-lock.json
+	npm ci
+
+build: deps
 	npm run build
 
-lint:
+lint: deps
 	npm run lint
 
-test:
+test: deps
 	npm test
 
 check: build lint test

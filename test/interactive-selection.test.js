@@ -1112,6 +1112,27 @@ function runInTerminal(args, input, home, extraEnv = {}) {
   };
 }
 
+test("terminal step matching waits for a new occurrence of a repeated prompt", () => {
+  const state = { output: "", searchOffset: 0, stepIndex: 0 };
+  const answers = [];
+  const steps = [
+    { prompt: "taskmux task-1>", answer: "detail\n" },
+    { prompt: "Choose task role", answer: "\n" },
+    { prompt: "taskmux task-1>", answer: "q\n" }
+  ];
+  const consume = (chunk) => consumeTerminalStep(state, steps, chunk, (answer) => {
+    answers.push(answer);
+  });
+
+  consume("taskmux task-1>");
+  consume("Choose task role");
+  consume("\n");
+  assert.deepEqual(answers, ["detail\n", "\n"]);
+
+  consume("Role: leader\ntaskmux task-1>");
+  assert.deepEqual(answers, ["detail\n", "\n", "q\n"]);
+});
+
 function runInTerminalSteps(args, steps, home, extraEnv = {}) {
   return new Promise((resolve, reject) => {
     if (scriptSupport === null) {
@@ -1124,8 +1145,7 @@ function runInTerminalSteps(args, steps, home, extraEnv = {}) {
       stdio: ["pipe", "pipe", "pipe"],
       detached: true
     });
-    let output = "";
-    let stepIndex = 0;
+    const state = { output: "", searchOffset: 0, stepIndex: 0 };
     let settled = false;
     const timer = setTimeout(() => {
       if (settled) {
@@ -1137,17 +1157,14 @@ function runInTerminalSteps(args, steps, home, extraEnv = {}) {
       } catch {
         child.kill("SIGKILL");
       }
-      reject(new Error(`PTY command timed out after 5000ms: ${output}`));
+      reject(new Error(`PTY command timed out after 5000ms: ${state.output}`));
     }, 5_000);
-    const consume = (chunk) => {
-      output += chunk.toString().replaceAll("\r", "");
-      const step = steps[stepIndex];
-      if (step !== undefined && output.includes(step.prompt)) {
-        stepIndex += 1;
-        step.onPrompt?.();
-        child.stdin.write(step.answer);
-      }
-    };
+    const consume = (chunk) => consumeTerminalStep(
+      state,
+      steps,
+      chunk,
+      (answer) => child.stdin.write(answer)
+    );
     child.stdout.on("data", consume);
     child.stderr.on("data", consume);
     child.on("error", (error) => {
@@ -1165,9 +1182,24 @@ function runInTerminalSteps(args, steps, home, extraEnv = {}) {
       settled = true;
       clearTimeout(timer);
       child.stdin.end();
-      resolve({ status, output });
+      resolve({ status, output: state.output });
     });
   });
+}
+
+function consumeTerminalStep(state, steps, chunk, writeAnswer) {
+  state.output += chunk.toString().replaceAll("\r", "");
+  const step = steps[state.stepIndex];
+  if (step === undefined) {
+    return;
+  }
+  const promptIndex = state.output.indexOf(step.prompt, state.searchOffset);
+  if (promptIndex >= 0) {
+    state.searchOffset = promptIndex + step.prompt.length;
+    state.stepIndex += 1;
+    step.onPrompt?.();
+    writeAnswer(step.answer);
+  }
 }
 
 function stopController(home) {

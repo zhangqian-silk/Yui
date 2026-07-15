@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   closeSync,
   constants,
   copyFileSync,
@@ -196,6 +197,8 @@ test("native storage authority fails closed when its exact prebuild is unavailab
       assert.equal(error.kind, "native-stable-ancestor-barrier");
       assert.equal(error.stage, "load-binding");
       assert.equal(error.state, "not-acquired");
+      assert.match(error.message, /required native package files are missing/i);
+      assert.doesNotMatch(error.message, new RegExp(fixture));
       return true;
     }
   );
@@ -231,10 +234,72 @@ test("native storage loader rejects a symlinked prebuild without invoking it", a
     (error) => {
       assert.equal(error.code, "ENOTSUP");
       assert.equal(error.stage, "load-binding");
+      assert.match(error.message, /prebuild paths must not contain symbolic links/i);
       assert.match(String(error.cause), /symbolic link/i);
       return true;
     }
   );
+});
+
+test("native storage loader accepts owner-owned group-write and rejects world-write", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "taskmux-native-package-mode-"));
+  const directory = join(root, "directory");
+  mkdirSync(directory);
+  const descriptor = openSync(directory, DIRECTORY_FLAGS);
+  t.after(() => {
+    closeSync(descriptor);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  for (const [name, mode] of [["group", 0o664], ["world", 0o666]]) {
+    const fixture = join(root, name);
+    const fixtureStorage = join(fixture, "dist", "storage");
+    const fixturePrebuildRoot = join(fixture, "prebuilds");
+    const fixturePrebuild = join(
+      fixturePrebuildRoot,
+      `linux-${process.arch}-glibc`,
+      "napi-v8"
+    );
+    const fixtureManifest = join(fixturePrebuildRoot, "manifest.json");
+    const fixtureBinary = join(fixturePrebuild, "taskmux_storage_fs.node");
+    mkdirSync(fixtureStorage, { recursive: true });
+    mkdirSync(fixturePrebuild, { recursive: true });
+    copyFileSync(
+      join(process.cwd(), "dist", "storage", "nativeStorageFs.js"),
+      join(fixtureStorage, "nativeStorageFs.js")
+    );
+    copyFileSync(join(process.cwd(), "prebuilds", "manifest.json"), fixtureManifest);
+    copyFileSync(
+      join(
+        process.cwd(),
+        "prebuilds",
+        `linux-${process.arch}-glibc`,
+        "napi-v8",
+        "taskmux_storage_fs.node"
+      ),
+      fixtureBinary
+    );
+    chmodSync(fixtureManifest, mode);
+    chmodSync(fixtureBinary, mode);
+    writeFileSync(join(fixture, "package.json"), JSON.stringify({ type: "module" }));
+
+    const packaged = await import(pathToFileURL(
+      join(fixtureStorage, "nativeStorageFs.js")
+    ).href);
+    if (mode === 0o664) {
+      assert.equal(typeof packaged.inspectDirectoryDescriptor(descriptor).ino, "bigint");
+      continue;
+    }
+    assert.throws(
+      () => packaged.inspectDirectoryDescriptor(descriptor),
+      (error) => {
+        assert.equal(error.code, "ENOTSUP");
+        assert.match(error.message, /package files must not be world-writable/i);
+        assert.match(String(error.cause), /must not be world-writable/i);
+        return true;
+      }
+    );
+  }
 });
 
 test("native publication creates one private durable receipt from a copied Buffer", (t) => {

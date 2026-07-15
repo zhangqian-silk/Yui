@@ -204,9 +204,10 @@ SQLite 索引只是可删除、可重建的派生数据。TaskMux 只在显式 C
 ## 本地开发
 
 ```sh
-npm ci
 make check
 ```
+
+Make 会在首次运行以及 `package.json` 或 `package-lock.json` 发生变化后自动安装 npm 依赖。
 
 如需逐条测试当前 checkout，并避免写入 `~/.taskmux`：
 
