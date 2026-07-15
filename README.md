@@ -214,9 +214,10 @@ See [ARCHITECTURE.md](https://github.com/zhangqian-silk/TaskMux/blob/master/ARCH
 ## Development
 
 ```sh
-npm ci
 make check
 ```
+
+Make installs npm dependencies automatically on the first run and whenever `package.json` or `package-lock.json` changes.
 
 For command-by-command testing of the current checkout without touching `~/.taskmux`:
 

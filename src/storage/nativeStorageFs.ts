@@ -438,11 +438,7 @@ function loadBinding(failure: BindingFailure): NativeStorageFsBinding {
     loadedBinding = candidate as NativeStorageFsBinding;
     return loadedBinding;
   } catch (cause) {
-    throw unavailableBindingError(
-      "Exact native storage authority prebuild is unavailable.",
-      failure,
-      cause
-    );
+    throw unavailableBindingError(failure, cause);
   } finally {
     if (binaryDescriptor >= 0) closeSync(binaryDescriptor);
     if (manifestDescriptor >= 0) closeSync(manifestDescriptor);
@@ -498,6 +494,9 @@ function openPinnedPackageFile(path: string, maxBytes: bigint): number {
     const ownerAllowed = euid === 0n
       ? openedMetadata.uid === 0n
       : openedMetadata.uid === 0n || openedMetadata.uid === euid;
+    if ((openedMetadata.mode & 0o002n) !== 0n) {
+      throw new Error("Native package file must not be world-writable.");
+    }
     if (!pathMetadata.isFile() || !openedMetadata.isFile() ||
         pathMetadata.dev !== openedMetadata.dev ||
         pathMetadata.ino !== openedMetadata.ino ||
@@ -505,10 +504,11 @@ function openPinnedPackageFile(path: string, maxBytes: bigint): number {
         pathMetadata.nlink !== 1n || openedMetadata.nlink !== 1n ||
         !ownerAllowed ||
         (openedMetadata.mode & 0o6000n) !== 0n ||
-        (openedMetadata.mode & 0o022n) !== 0n ||
         (openedMetadata.mode & 0o400n) === 0n ||
         openedMetadata.size <= 0n || openedMetadata.size > maxBytes) {
-      throw new Error("Native package file must be one exact trusted read-only regular file.");
+      throw new Error(
+        "Native package file identity, ownership, links, permissions, or size is invalid."
+      );
     }
     return descriptor;
   } catch (error) {
@@ -581,12 +581,11 @@ function readAndValidateManifest(
   return artifact;
 }
 
-function unavailableBindingError(
-  message: string,
-  failure: BindingFailure,
-  cause?: unknown
-): Error {
-  const error = new Error(message, cause === undefined ? undefined : { cause }) as Error & {
+function unavailableBindingError(failure: BindingFailure, cause: unknown): Error {
+  const error = new Error(
+    `Exact native storage authority prebuild is unavailable. ${describeBindingFailure(cause)}`,
+    { cause }
+  ) as Error & {
     kind: string;
     stage: string;
     state: string;
@@ -601,4 +600,40 @@ function unavailableBindingError(
     code: { configurable: false, enumerable: true, value: "ENOTSUP", writable: false }
   });
   return error;
+}
+
+function describeBindingFailure(cause: unknown): string {
+  const code = cause !== null && typeof cause === "object" && "code" in cause
+    ? cause.code
+    : undefined;
+  if (code === "ENOENT") {
+    return "Required native package files are missing.";
+  }
+  if (code === "ELOOP") {
+    return "Native prebuild paths must not contain symbolic links.";
+  }
+  if (code === "EACCES" || code === "EPERM") {
+    return "Native package files cannot be opened with the current permissions.";
+  }
+
+  const message = cause instanceof Error ? cause.message : "";
+  if (message.startsWith("Native prebuild path must not contain a symbolic link:")) {
+    return "Native prebuild paths must not contain symbolic links.";
+  }
+  if (message === "Native package file must not be world-writable.") {
+    return "Native package files must not be world-writable.";
+  }
+  if (
+    message === "Native prebuild parent must be an exact directory." ||
+    message === "Native package file identity, ownership, links, permissions, or size is invalid." ||
+    message.startsWith("Native prebuild manifest ") ||
+    message === "Native prebuild bytes do not match their assembly manifest." ||
+    message.startsWith("TaskMux native storage requires ") ||
+    message.startsWith("TaskMux native storage currently requires ") ||
+    message.startsWith("Unsupported native storage ") ||
+    message.startsWith("Native storage authority ")
+  ) {
+    return message;
+  }
+  return "The packaged native module could not be validated or loaded.";
 }

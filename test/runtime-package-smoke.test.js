@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -59,7 +60,7 @@ test("pack dry run rebuilds the host prebuild from a clean source copy", (t) => 
 // This is intentionally a lifecycle-skipped package-content/context test. The release
 // workflow's Node/architecture matrix separately normal-installs this exact tarball and
 // runs scripts/smoke-runtime-package.mjs plus the native authority smoke.
-test("an assembled runtime package installed with lifecycle scripts skipped retains bundled skill contexts", async () => {
+test("an owner-installed group-writable runtime package retains bundled skill contexts", async () => {
   const root = process.cwd();
   const stage = mkdtempSync(join(root, ".runtime-package-smoke-stage-"));
   const consumer = mkdtempSync(join(tmpdir(), "taskmux-runtime-package-consumer-"));
@@ -88,6 +89,17 @@ test("an assembled runtime package installed with lifecycle scripts skipped reta
     );
 
     const installedRoot = join(consumer, "node_modules", "@zq-silk", "taskmux");
+    chmodSync(join(installedRoot, "prebuilds", "manifest.json"), 0o664);
+    chmodSync(
+      join(
+        installedRoot,
+        "prebuilds",
+        `linux-${process.arch}-glibc`,
+        "napi-v8",
+        "taskmux_storage_fs.node"
+      ),
+      0o664
+    );
     const installedPackage = JSON.parse(readFileSync(join(installedRoot, "package.json"), "utf8"));
     assert.equal(installedPackage.private, false);
     assert.equal("scripts" in installedPackage, false);
