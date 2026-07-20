@@ -17,39 +17,28 @@ export function createChildRole(
   input: Pick<ChildRole, "description" | "responsibilities" | "constraints" | "expectedOutput">,
   now: Date
 ): ChildRole {
-  const trimmedName = name.trim();
-  const trimmedParent = parentRole.trim();
-  const description = input.description.trim();
-  const expectedOutput = input.expectedOutput.trim();
-
-  if (trimmedName.length === 0) {
-    throw new Error("Child role name is required.");
-  }
-
-  if (trimmedParent.length === 0) {
-    throw new Error("Child role parent is required.");
-  }
-
-  if (description.length === 0) {
-    throw new Error("Child role description is required.");
-  }
-
-  if (expectedOutput.length === 0) {
-    throw new Error("Child role expected output is required.");
-  }
-
   const timestamp = now.toISOString();
-
   return {
     schemaVersion: 1,
-    name: trimmedName,
+    name: requireText(name, "Child role name"),
     architecture: "child",
-    parentRole: trimmedParent,
-    description,
-    responsibilities: input.responsibilities.map((item) => item.trim()).filter(Boolean),
-    constraints: input.constraints.map((item) => item.trim()).filter(Boolean),
-    expectedOutput,
+    parentRole: requireText(parentRole, "Child role parent"),
+    description: requireText(input.description, "Child role description"),
+    responsibilities: normalizeList(input.responsibilities),
+    constraints: normalizeList(input.constraints),
+    expectedOutput: requireText(input.expectedOutput, "Child role expected output"),
     createdAt: timestamp,
     updatedAt: timestamp
   };
+}
+
+function normalizeList(values: readonly string[]): string[] {
+  return values.map((value) => value.trim()).filter(Boolean);
+}
+
+function requireText(value: string, label: string): string {
+  if (typeof value !== "string" || value.includes("\0")) throw new Error(`${label} is invalid.`);
+  const normalized = value.trim();
+  if (normalized.length === 0) throw new Error(`${label} is required.`);
+  return normalized;
 }

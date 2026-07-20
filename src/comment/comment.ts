@@ -3,7 +3,8 @@ export type TaskComment = {
   id: string;
   body: string;
   topics: string[];
-  author?: "user" | "operator" | "leader";
+  /** `user`, a system Role, or any task Role name that produced the result. */
+  author?: string;
   createdAt: string;
 };
 
@@ -12,20 +13,21 @@ export function createTaskComment(
   body: string,
   now: Date,
   author?: TaskComment["author"],
-  topics: string[] = []
+  topics: readonly string[] = []
 ): TaskComment {
-  const trimmedBody = body.trim();
-
-  if (trimmedBody.length === 0) {
-    throw new Error("Comment body is required.");
-  }
-
   return {
     schemaVersion: 1,
-    id,
-    body: trimmedBody,
-    topics: [...new Set(topics)],
-    ...(author === undefined ? {} : { author }),
+    id: requireText(id, "Comment id"),
+    body: requireText(body, "Comment body"),
+    topics: [...new Set(topics.map((topic) => requireText(topic, "Comment topic")))],
+    ...(author === undefined ? {} : { author: requireText(author, "Comment author") }),
     createdAt: now.toISOString()
   };
+}
+
+function requireText(value: string, label: string): string {
+  if (typeof value !== "string" || value.includes("\0")) throw new Error(`${label} is invalid.`);
+  const normalized = value.trim();
+  if (normalized.length === 0) throw new Error(`${label} is required.`);
+  return normalized;
 }

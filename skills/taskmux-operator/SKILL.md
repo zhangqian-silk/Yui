@@ -1,36 +1,54 @@
 ---
 name: taskmux-operator
-description: Operate the local TaskMux CLI on the user's behalf without performing Task work. Use when the user asks to create or configure Tasks, roles, Topics, schedules, comments, input decisions, sessions, or archival through natural language.
+description: Use the lean TaskMux Operator to create or route tasks, register repositories, inspect work, enter sessions, and archive finished tasks.
 ---
 
 # TaskMux Operator
 
-Act as the user's administrative CLI proxy. Use the same practical TaskMux capabilities as the user, but do not accept Leader ownership, execute WorkItems, or dispatch yourself as a worker.
+Act as the task-neutral entry point for the user's work. Keep the flow simple: inspect current Tasks, submit the request to the right Task, and leave implementation decisions to that Task's Leader.
 
-## Handle user input
+## Handle a request
 
-The complete public input-request surface is `taskmux task input request`, `taskmux task input list`, `taskmux task input show`, `taskmux task input answer`, and `taskmux task input cancel`.
+1. Inspect existing work with `taskmux task list`. Use `taskmux task show <task-id>`, `taskmux task message list <task-id>`, and `taskmux task work list <task-id>` when a likely match exists.
+2. Route a request to an existing Task with:
 
-1. Inspect the Global Inbox with `taskmux task input list [<task-id>]` and `taskmux task input show <request-id> [--task <task-id>]`. It is a global query over Task-owned requests, not a second durable inbox.
-2. When the user supplies a requested decision, answer it with `taskmux task input answer <request-id> (--choice <key> | --text <text>)`. This records the resolution and queues the exact Leader wakeup; do not manually wake or dispatch the Leader.
-3. Only an active Leader task-role session may create or cancel a request with `taskmux task input request` or `taskmux task input cancel`. Never fabricate the exact Leader origin tuple: role, Agent, adapter, session root, native session, and AgentRun.
-4. Treat `user-required` as waiting indefinitely for the user. An `offline-recommended` request can persist its recommendation only after continuous confirmed-offline foreground Operator presence; online or unknown presence does not advance a timeout.
-5. Use `taskmux task comment` for explicitly chronological information that is not an input request. Do not convert ambiguous information into a request or claim that it is durable Task direction.
+   ```sh
+   taskmux operator submit "<request>" --task <task-id>
+   ```
 
-Do not describe an unrecorded conversation as official Task context.
+3. If the request is a distinct mission, create it directly through the Operator:
 
-## Respect foreground Operator delivery
+   ```sh
+   taskmux operator submit "<request>"
+   ```
 
-The foreground Operator is only the active binding with a running matching session in `GlobalRoleSessionSet`; a tmux window without that proof is unknown, not an absent Operator. Each bound Agent has independent configuration and session state, while the Role has one active Agent at a time.
+4. Keep the new Task as a Draft while the mission is still being clarified. When it is ready to execute, run `taskmux task activate <task-id>`.
+5. Report the resulting Task ID and lifecycle state to the user and keep follow-up work inside that Task.
 
-An input delivery is pointer-only: it refers to the Task-owned request and contains no second question or answer body. Its receipt means the foreground transport accepted the notification, not that a user saw or answered it.
+Use `taskmux --json ...` for non-`enter` commands when stable machine-readable output helps you retain exact IDs.
 
-## Administer Tasks
+## Repositories and direct Task creation
 
-- Create and update Tasks, task-local Topics, schedules, and role templates as requested.
-- Create independent task roles with `task assign` or `task bind`.
-- Create child-role constraints with `task role child`; bind them to an existing parent role and include only descriptive fields.
-- Record native session IDs reported by the executor. Replace the Leader session only on explicit irrecoverable-failure handling and always provide a reason.
-- Archive or unarchive only when user intent is clear. Do not simulate recurring work by archiving and reopening.
+For repository-backed work, register the repository first:
 
-Prefer stable JSON context output for reasoning. Report CLI validation and runtime errors directly instead of hiding them.
+```sh
+taskmux repository add <name> <absolute-path> --base <ref>
+taskmux repository list
+taskmux task create "<title>" --repository <repository-id> --base <ref>
+taskmux task activate <task-id>
+```
+
+For work that does not need Git, use `taskmux task create "<title>"`. Every created Draft already has one Leader record; activate it before entering the Leader or dispatching work.
+
+## Enter and administer
+
+- The user enters the global session with `taskmux operator enter`. Do not recursively run that command from inside the Operator session.
+- Activate a ready Draft with `taskmux task activate <task-id>`.
+- Enter an active Task's Leader with `taskmux task enter <task-id>`, or a named Worker with `taskmux task enter <task-id> <role-name>`.
+- Relay explicit Task-scoped information with `taskmux task message send <task-id> "<body>"`.
+- Inspect Workers with `taskmux task role list <task-id>` and queued failures with `taskmux jobs list`.
+- Detect a disappeared running Session with `taskmux task reconcile <task-id>`, which requests an immediate Controller scan. Then inspect Run history before using `taskmux task run retry <failed-run-id>`; `taskmux jobs list` only shows pending Leader wakes and Leader recovery failures.
+- Retry only an explicitly failed Job with `taskmux jobs retry <job-id>`.
+- Archive finished work with `taskmux task archive <task-id>` after confirming that no more Task work is required. Archival stops Task Sessions and removes only a clean managed worktree; a dirty worktree is preserved for deliberate cleanup and Job retry.
+
+Never edit TaskMux's authoritative files directly or manually manage TaskMux tmux sessions and worktree directories.

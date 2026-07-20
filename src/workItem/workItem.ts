@@ -21,27 +21,17 @@ export function createWorkItem(
   input: Pick<WorkItem, "title" | "assignee" | "topics" | "cycleId">,
   now: Date
 ): WorkItem {
-  const title = input.title.trim();
-  const assignee = input.assignee.trim();
-
-  if (title.length === 0) {
-    throw new Error("Work item title is required.");
-  }
-
-  if (assignee.length === 0) {
-    throw new Error("Work item assignee is required.");
-  }
-
   const timestamp = now.toISOString();
-
   return {
     schemaVersion: 1,
-    id,
-    taskId,
-    ...(input.cycleId === undefined ? {} : { cycleId: input.cycleId }),
-    title,
-    assignee,
-    topics: [...new Set(input.topics)],
+    id: requireSafeIdentity(id, "Work item id"),
+    taskId: requireSafeIdentity(taskId, "Task id"),
+    ...(input.cycleId === undefined
+      ? {}
+      : { cycleId: requireSafeIdentity(input.cycleId, "Cycle id") }),
+    title: requireText(input.title, "Work item title"),
+    assignee: requireSafeIdentity(input.assignee, "Work item assignee"),
+    topics: [...new Set(input.topics.map((topic) => requireText(topic, "Work item topic")))],
     status: "pending",
     createdAt: timestamp,
     updatedAt: timestamp
@@ -55,17 +45,33 @@ export function updateWorkItemStatus(
   now: Date
 ): WorkItem {
   const terminal = ["completed", "failed", "cancelled", "superseded"].includes(status);
-  const trimmedOutcome = outcome?.trim();
-  if (terminal && (trimmedOutcome === undefined || trimmedOutcome.length === 0)) {
+  const normalizedOutcome = outcome === undefined ? undefined : requireText(outcome, "Work item outcome");
+  if (terminal && normalizedOutcome === undefined) {
     throw new Error(`Work item outcome is required for ${status}.`);
   }
-
   const timestamp = now.toISOString();
+  const { outcome: _outcome, endedAt: _endedAt, ...base } = workItem;
   return {
-    ...workItem,
+    ...base,
     status,
-    ...(trimmedOutcome === undefined ? {} : { outcome: trimmedOutcome }),
+    ...(normalizedOutcome === undefined ? {} : { outcome: normalizedOutcome }),
     updatedAt: timestamp,
     ...(terminal ? { endedAt: timestamp } : {})
   };
+}
+
+function requireSafeIdentity(value: string, label: string): string {
+  const normalized = requireText(value, label);
+  if (["__proto__", "prototype", "constructor", ".", ".."].includes(normalized)
+    || /[\/\\\0]/.test(normalized)) {
+    throw new Error(`${label} is invalid.`);
+  }
+  return normalized;
+}
+
+function requireText(value: string, label: string): string {
+  if (typeof value !== "string" || value.includes("\0")) throw new Error(`${label} is invalid.`);
+  const normalized = value.trim();
+  if (normalized.length === 0) throw new Error(`${label} is required.`);
+  return normalized;
 }

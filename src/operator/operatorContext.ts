@@ -1,182 +1,61 @@
-import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
-import type { AgentDefinition } from "../agent/agent.js";
-import { resolveAgentAdapter } from "../executor/agentAdapter.js";
-import {
-  classifyRoleAgentSessionResume,
-  createRoleAgentSession,
-  type RoleAgentSession
-} from "../executor/agentExecutor.js";
-import { resolveAgentLaunchEnvironment, resolveAgentSessionRoot } from "../executor/executorRegistry.js";
-import { activeRoleAgentBinding, type GlobalRole } from "../role/role.js";
+import { join } from "node:path";
+import type { GlobalRole } from "../role/role.js";
 import { SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
 
-export type OperatorLaunch = {
-  command: string;
-  args: string[];
+export type OperatorLaunchContext = Readonly<{
+  args: readonly string[];
   env: NodeJS.ProcessEnv;
-  explicitEnv: Record<string, string>;
-  session: RoleAgentSession | null;
-  mode: "new" | "resume";
-};
+  systemPrompt?: string;
+  contextPath?: string;
+}>;
 
+/**
+ * Prepares durable Operator instructions without turning them into Codex's
+ * positional first prompt. Interactive Operator entry must open at the native
+ * Agent composer; launch code can pass systemPrompt through an adapter-native
+ * instruction channel when one is available.
+ */
 export function prepareGlobalRoleLaunch(
-  role: GlobalRole,
-  agent: AgentDefinition,
-  options: {
-    taskmuxHome?: string;
-    baseEnv?: NodeJS.ProcessEnv;
-    session?: RoleAgentSession | null;
-    permissionBroadeningConfirmed?: boolean;
-    launchToken?: string;
-  } = {}
-): OperatorLaunch {
-  const binding = activeRoleAgentBinding(role);
-  if (binding.agentId !== agent.id || binding.adapterId !== agent.adapterId) {
-    throw new Error(`Global Role active Agent does not match AgentDefinition: ${role.name}.`);
-  }
-  const adapter = resolveAgentAdapter(agent.adapterId);
-  const canonicalConfig = adapter.canonicalizeConfig(binding.config);
-  const now = new Date();
-  const installation = adapter.probeInstallation(agent, now);
-  if (installation.status !== "installed" &&
-    installation.status !== "probe-failed" &&
-    installation.status !== "unavailable") {
-    throw new Error(installation.reason ?? `Agent installation is unavailable: ${agent.id}.`);
-  }
-  const snapshot = installation.status === "installed" && installation.version !== undefined
-    ? adapter.discoverCapabilities({ agent, version: installation.version, now })
-    : {
-        ...adapter.unavailableCapabilities(
-          { agent, version: adapter.supportedVersion, now },
-          installation.reason ?? "Agent installation probe failed."
-        ),
-        installation
-      };
-  const inheritedEnvironment = options.baseEnv ?? process.env;
-  const agentEnvironment = resolveAgentLaunchEnvironment(agent, inheritedEnvironment);
-  const baseEnv = { ...inheritedEnvironment, ...agentEnvironment };
-  const existing = options.session ?? null;
-  const mode = existing === null || existing.status === "reserved" ? "new" : "resume";
-  const compiled = mode === "resume"
-    ? adapter.compileResume({
-        agent,
-        config: canonicalConfig,
-        workspace: role.workspace,
-        systemPrompt: role.systemPrompt,
-        snapshot,
-        validationMode: "replay",
-        nativeSessionId: requireGlobalSession(role, binding.agentId, binding.adapterId, existing).nativeSessionId
-      })
-    : adapter.compileNew({
-        agent,
-        config: canonicalConfig,
-        workspace: role.workspace,
-        systemPrompt: role.systemPrompt,
-        snapshot,
-        validationMode: "replay"
-      });
-  let session = existing;
-  let argv = compiled.argv;
-  if (mode === "new" && adapter.capabilities.nativeSessionDiscovery === "preallocated") {
-    const nativeSessionId = existing?.status === "reserved" ? existing.nativeSessionId : randomUUID();
-    session = createRoleAgentSession({
-      agentId: binding.agentId,
-      adapterId: binding.adapterId,
-      nativeSessionId,
-      policy: "fixed",
-      status: "reserved",
-      sessionRoot: resolveAgentSessionRoot(binding.adapterId, baseEnv),
-      configFingerprint: compiled.fingerprint,
-      permissionEnvelope: adapter.permissionEnvelope(canonicalConfig)
-    }, now, existing);
-    argv = [...argv, "--session-id", nativeSessionId];
-  }
-  if (mode === "resume") {
-    const current = requireGlobalSession(role, binding.agentId, binding.adapterId, existing);
-    if (current.sessionRoot !== resolveAgentSessionRoot(binding.adapterId, baseEnv)) {
-      throw new Error(`Native session root changed for Agent: ${current.agentId}.`);
-    }
-    const permissionEnvelope = adapter.permissionEnvelope(canonicalConfig);
-    const assessment = classifyRoleAgentSessionResume(current, compiled.fingerprint, permissionEnvelope);
-    if (assessment.decision === "requires-replacement") {
-      throw new Error(`Global Role session configuration changed at a session-bound boundary: ${current.agentId}.`);
-    }
-    if (assessment.decision === "requires-confirmation" && options.permissionBroadeningConfirmed !== true) {
-      throw new Error(`Global Role permission change requires explicit confirmation: ${current.agentId}.`);
-    }
-    session = {
-      ...current,
-      lastLaunchConfigHash: { ...compiled.fingerprint },
-      permissionEnvelope,
-      updatedAt: now.toISOString()
-    };
-  }
+  role: GlobalRole & Readonly<{
+    args?: readonly string[];
+    env?: Readonly<Record<string, string>>;
+  }>,
+  options: { taskmuxHome?: string; baseEnv?: NodeJS.ProcessEnv } = {}
+): OperatorLaunchContext {
+  const args = [...(role.args ?? [])];
+  const base = mergeEnv(options.baseEnv, role.env ?? {});
   if (role.name !== SYSTEM_OPERATOR_ROLE || options.taskmuxHome === undefined) {
-    const nativeSessionRoot = resolveAgentSessionRoot(binding.adapterId, baseEnv);
-    const roleEnvironment: Record<string, string> = options.taskmuxHome === undefined ? {} : {
-      TASKMUX_HOME: options.taskmuxHome,
-      TASKMUX_ROLE: role.name,
-      TASKMUX_AGENT_ID: binding.agentId,
-      TASKMUX_ADAPTER_ID: binding.adapterId,
-      TASKMUX_NATIVE_SESSION_ROOT: nativeSessionRoot,
-      TASKMUX_WORKSPACE: role.workspace,
-      ...(session === null ? {} : { TASKMUX_NATIVE_SESSION_ID: session.nativeSessionId }),
-      ...(options.launchToken === undefined ? {} : { TASKMUX_OPERATOR_LAUNCH_TOKEN: options.launchToken })
-    };
-    return {
-      command: agent.command,
-      args: argv,
-      env: { ...baseEnv, ...roleEnvironment },
-      explicitEnv: { ...agentEnvironment, ...roleEnvironment },
-      session,
-      mode
-    };
+    return { args, env: base };
   }
 
   const contextPath = writeOperatorContext(options.taskmuxHome, role.workspace);
-  const taskmuxEnv = {
-    TASKMUX_HOME: options.taskmuxHome,
-    TASKMUX_ROLE: role.name,
-    TASKMUX_AGENT_ID: binding.agentId,
-    TASKMUX_ADAPTER_ID: binding.adapterId,
-    TASKMUX_NATIVE_SESSION_ROOT: resolveAgentSessionRoot(binding.adapterId, baseEnv),
-    TASKMUX_WORKSPACE: role.workspace,
-    TASKMUX_OPERATOR_CONTEXT: contextPath,
-    ...(session === null ? {} : { TASKMUX_NATIVE_SESSION_ID: session.nativeSessionId }),
-    ...(options.launchToken === undefined ? {} : { TASKMUX_OPERATOR_LAUNCH_TOKEN: options.launchToken })
-  };
-
   return {
-    command: agent.command,
-    args: withOperatorPrompt(agent.command, argv, contextPath),
-    env: { ...baseEnv, ...taskmuxEnv },
-    explicitEnv: { ...agentEnvironment, ...taskmuxEnv },
-    session,
-    mode
+    args,
+    env: mergeEnv(base, {
+      TASKMUX_HOME: options.taskmuxHome,
+      TASKMUX_ROLE: role.name,
+      TASKMUX_WORKSPACE: role.workspace,
+      TASKMUX_OPERATOR_CONTEXT: contextPath
+    }),
+    systemPrompt: renderOperatorLaunchInstruction(contextPath),
+    contextPath
   };
 }
 
-function requireGlobalSession(
-  role: GlobalRole,
-  agentId: string,
-  adapterId: string,
-  session: RoleAgentSession | null
-): RoleAgentSession {
-  if (session === null) throw new Error(`No native session is recorded for Global Role: ${role.name}.`);
-  if (session.agentId !== agentId || session.adapterId !== adapterId) {
-    throw new Error(`Global Role session Agent does not match active binding: ${role.name}.`);
-  }
-  return session;
-}
-
-function writeOperatorContext(taskmuxHome: string, workspace: string): string {
+export function writeOperatorContext(taskmuxHome: string, workspace: string): string {
   const operatorDir = join(taskmuxHome, "operator");
   const contextPath = join(operatorDir, "TASKMUX_OPERATOR.md");
   mkdirSync(operatorDir, { recursive: true });
-  writeFileSync(contextPath, `${renderOperatorContext(taskmuxHome, workspace)}\n`);
+  writeFileSync(contextPath, `${renderOperatorContext(taskmuxHome, workspace)}\n`, { mode: 0o600 });
   return contextPath;
+}
+
+export function renderOperatorLaunchInstruction(contextPath: string): string {
+  return [
+    `Read and follow the TaskMux Operator instructions in ${contextPath}.`,
+    "Manage TaskMux through its CLI; do not perform Task work."
+  ].join(" ");
 }
 
 function renderOperatorContext(taskmuxHome: string, workspace: string): string {
@@ -188,30 +67,24 @@ You are the TaskMux Operator. Act as the user's CLI proxy and manage TaskMux wit
 
 Rules:
 
-- Use \`taskmux\` commands to create tasks, list tasks, add roles, bind roles, assign task-local roles, and inspect state.
-- Do not edit files under \`TASKMUX_HOME\` directly unless the user explicitly asks for low-level storage repair.
-- Prefer \`taskmux task board --with-roles\`, \`taskmux task list\`, \`taskmux role list\`, and \`taskmux config show\` to inspect current state.
-- Every task has a protected \`leader\` role. The global \`operator\` and \`leader\` roles are system roles.
-- For user decisions, use only \`taskmux task input request\`, \`taskmux task input list\`, \`taskmux task input show\`, \`taskmux task input answer\`, and \`taskmux task input cancel\`. \`list\` is the Global Inbox query over Task-owned requests.
-- As the foreground Operator, inspect and answer explicit user decisions only; the exact active Leader origin creates or cancels requests, and a delivery receipt is not an answer.
-- Never act as a Task Leader or independent worker.
+- Use TaskMux commands to create and inspect Tasks, manage global and Task Roles, choose Agents, and submit user input.
+- Do not edit files under TASKMUX_HOME directly.
+- Every Task has a protected leader Role; Operator is global and never acts as a Task Leader or Worker.
+- Keep native Agent session interaction intact. Do not emulate Agent slash commands or terminal input.
 
 Environment:
 
 - TASKMUX_HOME=${taskmuxHome}
-- TASKMUX_WORKSPACE=${workspace}
-`;
+- TASKMUX_WORKSPACE=${workspace}`;
 }
 
 function readOperatorSkill(): string {
   return readFileSync(new URL("../../skills/taskmux-operator/SKILL.md", import.meta.url), "utf8").trim();
 }
 
-function withOperatorPrompt(command: string, args: string[], contextPath: string): string[] {
-  if (!isCodexCommand(command)) return args;
-  return [...args, `You are entering TaskMux Operator mode. Read and follow the instructions in ${contextPath}. Before other work, if CODEX_THREAD_ID is available, run: taskmux role session record "$TASKMUX_ROLE" --native-id "$CODEX_THREAD_ID" --session-root "$TASKMUX_NATIVE_SESSION_ROOT". Use taskmux CLI commands to manage tasks and roles. Do not perform Task work or edit TaskMux JSON storage directly.`];
-}
-
-function isCodexCommand(command: string): boolean {
-  return basename(command).toLowerCase().replace(/\.(cmd|exe)$/, "") === "codex";
+function mergeEnv(
+  baseEnv: NodeJS.ProcessEnv = process.env,
+  roleEnv: Readonly<Record<string, string>>
+): NodeJS.ProcessEnv {
+  return { ...baseEnv, ...roleEnv };
 }

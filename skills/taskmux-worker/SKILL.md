@@ -1,19 +1,31 @@
 ---
 name: taskmux-worker
-description: Execute a WorkItem as an independent TaskMux task role and return important results to the Leader. Use inside non-Leader role sessions for scoped implementation, research, testing, review, deployment, or other delegated work that must end with a durable yield.
+description: Execute one lean TaskMux WorkItem in the assigned Agent session and finish the Run with a concise yielded summary.
 ---
 
 # TaskMux Worker
 
-Execute the assigned scope without taking over Task direction.
+Execute the bounded WorkItem from the launch prompt. Do not take over Task direction, create other Roles, or dispatch more work.
 
-## Work a round
+## Work the assigned round
 
-1. Read `taskmux task context <task-id> --format json` and identify the assigned WorkItem, current Cycle, relevant Topics, and constraints.
-2. Work only in the role's configured workspace or worktree. Do not change Task-wide direction or dispatch other independent roles.
-3. Record important durable findings through comments or the appropriate TaskMux command; avoid exhaustive transcript auditing.
-4. On completion, failure, or a meaningful stopping point, run `taskmux task yield <task-id> <role> --summary <summary>`.
+1. Keep the supplied Task, WorkItem, and Run IDs exact. When context is needed, inspect the current records:
 
-Make the yield summary actionable: state the result, evidence, changed artifacts, unresolved risks, and recommended next step. A yield ends the AgentRun and coalesces a Leader wakeup.
+   ```sh
+   taskmux task show <task-id>
+   taskmux task message list <task-id>
+   taskmux task work list <task-id>
+   ```
 
-If native session recovery or dispatch fails, return the exact error to the Leader. Do not silently choose a different Agent or create a replacement native session.
+2. Work only in the cwd/worktree provided for this Role. Do not manually create, move, or remove a TaskMux worktree or tmux session.
+3. Stay within the dispatched scope. If blocked, stop at a safe boundary and put the blocker, needed decision, and completed evidence in the yield summary.
+
+4. At the end of the round, yield exactly once:
+
+   ```sh
+   taskmux task run yield <run-id> --summary "<result, evidence, risks, and follow-up>"
+   ```
+
+The yield marks the current Run and WorkItem completed, records the summary as a TaskMessage, and wakes the Leader. If the round ends partial or blocked, state that plainly in the summary and leave the Leader to create follow-up work; do not claim tests, files, or results that you did not verify.
+
+Use only the current commands above. Never edit TaskMux's authoritative files directly.

@@ -1,44 +1,60 @@
 ---
 name: taskmux-leader
-description: Lead and continuously advance one long-running TaskMux Task. Use in a Task Leader session for context recovery, planning Cycles and WorkItems, requesting user decisions, curating briefs and milestones, creating roles, dispatching independent roles, synthesizing results, scheduling reviews, yielding, and deciding archival.
+description: Lead one lean TaskMux Task by reading messages, creating Worker roles and WorkItems, dispatching Runs, and collecting yielded summaries.
 ---
 
 # TaskMux Leader
 
-Own the Task's semantic direction until archival. Treat the Task as a long-lived mission; use finite Cycles and WorkItems for execution boundaries.
+Own the direction of the Task identified in the launch context. Decompose the mission into finite WorkItems, dispatch the right Worker, and synthesize the yielded summaries for the user.
 
-## Recover and decide
+## Recover current state
 
-1. Read `taskmux task context <task-id> --format json` at session recovery and after a wakeup.
-2. Reconcile submitted comments, pending wake reasons, active runs, child-role constraints, and the current brief.
-3. Create a Cycle for the current advancement trigger when useful.
-4. Update `brief.md` through `task brief update` whenever objective boundaries, current focus, or the durable Leader summary materially change.
+Use only the public current commands:
 
-Reuse the fixed Leader native session. If recovery fails, report the error; never silently start a replacement session.
+```sh
+taskmux task show <task-id>
+taskmux task message list <task-id>
+taskmux task role list <task-id>
+taskmux task work list <task-id>
+taskmux task run list <work-item-id>
+```
 
-## Request user input
+Use the Task, WorkItem, Role, and Run IDs supplied by TaskMux output or the launch prompt. Do not infer IDs from tmux names or edit TaskMux storage directly.
 
-The complete public input-request surface is `taskmux task input request`, `taskmux task input list`, `taskmux task input show`, `taskmux task input answer`, and `taskmux task input cancel`. The Global Inbox is the global query returned by `list`; the request body remains owned by its Task.
+## Decompose and dispatch
 
-- Create a request only when the active Leader needs a user decision to advance. The exact Leader origin tuple is role, Agent, adapter, session root, native session, and AgentRun. TaskMux validates that complete tuple against the active Leader binding and `RoleSessionSet`.
-- Create with `taskmux task input request <task-id> --question <text>` and include choices, blocked references, and an offline recommendation only when they are useful. The request blocks this Leader run until it is answered or cancelled.
-- Only the exact originating Leader tuple may call `taskmux task input cancel <task-id> <request-id> --reason <text>`. Do not imitate another Leader session or fabricate any origin fields.
-- Treat `user-required` as waiting indefinitely for a user response. An `offline-recommended` request can persist its recommendation only after a continuous confirmed-offline interval for the foreground Operator; online or unknown presence never advances that interval.
-- A user answer creates the durable resolution and wakes the exact origin. Do not manually dispatch a replacement Leader run to bypass that wakeup.
+1. Add a Worker only when the Task needs a separate execution role:
 
-## Decompose and delegate
+   ```sh
+   taskmux task role add <task-id> <role-name> --agent <codex-or-claude>
+   ```
 
-- Create WorkItems with explicit assignees and zero or more Topics.
-- Use an independent task role when work needs its own Agent session, tmux window, worktree, or direct user interaction.
-- Use a child role only to inject name, description, responsibilities, constraints, and expected output into an existing parent. Do not expect TaskMux to execute or recover it.
-- Use the established native-session path for a role that already owns its session; choose a fresh dispatch only when the work truly requires one. The role's configured Agent is already authoritative.
-- Treat a successful dispatch result as control-plane acceptance; the role's work remains asynchronous until yield.
+2. Create a finite WorkItem and assign it by Role name:
 
-Only the Leader dispatches independent roles. Let Codex or Claude create native internal subagents on its own; record only important outcomes.
+   ```sh
+   taskmux task work create <task-id> "<clear outcome>" --role <role-name>
+   ```
 
-## Curate durable meaning
+3. Read the WorkItem ID from the response, then dispatch one bounded round:
 
-- Add milestones for meaningful outcomes and keep the curated timeline concise.
-- Convert direct user input into comments, long-term brief changes, both, or session-local context according to lasting value.
-- Set review times while waiting on external conditions. Keep recurring Tasks active across schedule firings.
-- Yield each execution round with an outcome summary. Archive only when continued Leader stewardship is no longer useful.
+   ```sh
+   taskmux task work dispatch <work-item-id> --input "<scope, constraints, and expected evidence>"
+   ```
+
+Do not dispatch a terminal WorkItem or create a second active Run for the same WorkItem.
+
+## Collect and continue
+
+- Incoming TaskMessages contain Operator input or Worker yield summaries. Do not author a TaskMessage to direct or wake yourself.
+- A Worker finishes with `taskmux task run yield`; that yield completes its Run and WorkItem, appends the summary as a TaskMessage, and wakes the Leader.
+- Collect results with `taskmux task work list <task-id>` and `taskmux task message list <task-id>`.
+- If a running Session disappears, use `taskmux task reconcile <task-id>` to request an immediate Controller scan, inspect `taskmux task run list <work-item-id>`, then retry only the confirmed failed Run with `taskmux task run retry <run-id>`. `taskmux jobs list` only shows pending Leader wakes and Leader recovery failures. Inspect partial work first because retry may repeat it.
+- Manual bookkeeping is only for a WorkItem with no queued or running Run:
+
+  ```sh
+  taskmux task work update <work-item-id> <todo|running|done|failed> --summary "<text>"
+  ```
+
+Never use a manual WorkItem update to replace or override an active Run.
+
+Summarize the outcome, tests or evidence, remaining risks, and next action. Ask the user or Operator to archive the Task when continued Leader work is no longer useful.

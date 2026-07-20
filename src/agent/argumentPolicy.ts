@@ -1,126 +1,85 @@
-const OWNED_ARGUMENTS_BY_ADAPTER: Readonly<Record<string, readonly string[]>> = {
+import type { AgentAdapterId } from "./adapterCatalog.js";
+
+const OWNED_ARGUMENTS_BY_ADAPTER: Readonly<Record<AgentAdapterId, readonly string[]>> = {
   codex: [
-    "resume",
-    "fork",
-    "exec",
-    "e",
-    "review",
-    "--model",
-    "-m",
-    "--config",
-    "-c",
-    "--sandbox",
-    "-s",
-    "--ask-for-approval",
-    "-a",
-    "--search",
-    "--profile",
-    "-p",
-    "--add-dir",
-    "--cd",
-    "-C",
-    "--full-auto",
+    "resume", "fork", "exec", "e", "review",
+    "--model", "-m", "--config", "-c", "--sandbox", "-s",
+    "--ask-for-approval", "-a", "--search", "--profile", "-p",
+    "--add-dir", "--cd", "-C", "--full-auto",
     "--dangerously-bypass-approvals-and-sandbox",
     "--dangerously-bypass-hook-trust"
   ],
   claude: [
-    "--resume",
-    "-r",
-    "--continue",
-    "-c",
-    "--session-id",
-    "--fork-session",
-    "--model",
-    "--effort",
-    "--permission-mode",
-    "--allowed-tools",
-    "--allowedTools",
-    "--disallowed-tools",
-    "--disallowedTools",
-    "--add-dir",
-    "--settings",
-    "--setting-sources",
-    "--worktree",
-    "-w",
-    "--tmux",
-    "--print",
-    "-p",
-    "--agents",
-    "--bg",
-    "--background",
-    "--dangerously-skip-permissions",
-    "--allow-dangerously-skip-permissions",
-    "--no-session-persistence",
-    "--from-pr",
-    "--fallback-model",
-    "--tools"
+    "--resume", "-r", "--continue", "-c", "--session-id", "--fork-session",
+    "--model", "--effort", "--permission-mode", "--allowed-tools", "--allowedTools",
+    "--disallowed-tools", "--disallowedTools", "--add-dir", "--settings",
+    "--setting-sources", "--worktree", "-w", "--tmux", "--print", "-p",
+    "--agents", "--bg", "--background", "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions", "--no-session-persistence", "--from-pr",
+    "--fallback-model", "--tools"
   ]
 };
 
-export function ownedArgumentsForAdapter(adapterId: string): readonly string[] {
-  return OWNED_ARGUMENTS_BY_ADAPTER[adapterId] ?? [];
+export function ownedArgumentsForAdapter(adapterId: AgentAdapterId): readonly string[] {
+  return OWNED_ARGUMENTS_BY_ADAPTER[adapterId];
 }
 
+export function findReservedAgentArgument(adapterId: AgentAdapterId, argument: string): string | null {
+  if (argument === "--") return "--";
+  const owned = new Set(ownedArgumentsForAdapter(adapterId));
+  const equalsToken = argument.split("=", 1)[0];
+  if (owned.has(argument) || owned.has(equalsToken)) return equalsToken;
+  if (!argument.startsWith("-") || argument.startsWith("--")) return null;
+  const shortOptions = new Set([...owned].filter((value) => /^-[^-]$/.test(value)));
+  for (const flag of argument.slice(1)) {
+    const token = `-${flag}`;
+    if (shortOptions.has(token)) return token;
+  }
+  return null;
+}
+
+/** Escape-hatch arguments cannot override fields or lifecycle owned by an adapter. */
 export function validateAgentAdvancedArguments(
-  adapterId: string,
-  rawArgs: readonly string[],
-  ownedArguments: readonly string[] = ownedArgumentsForAdapter(adapterId)
+  adapterId: AgentAdapterId,
+  rawArgs: readonly string[]
 ): void {
-  validateNoSecretMaterial(rawArgs, "Advanced rawArgs");
-  const owned = new Set(ownedArguments);
+  validateArgumentList(rawArgs, "Advanced rawArgs");
   for (const argument of rawArgs) {
-    const token = reservedToken(argument, owned);
-    if (token !== undefined) {
-      throw new Error(`Advanced rawArgs contains reserved argument: ${token}.`);
-    }
+    const reserved = findReservedAgentArgument(adapterId, argument);
+    if (reserved !== null) throw new Error(`Advanced rawArgs contains reserved argument: ${reserved}.`);
   }
 }
+
+export const validateAgentRawArguments = validateAgentAdvancedArguments;
 
 export function validateAgentBaseArguments(
-  adapterId: string,
-  baseArgs: readonly string[],
-  ownedArguments: readonly string[] = ownedArgumentsForAdapter(adapterId)
+  adapterId: AgentAdapterId,
+  baseArgs: readonly string[]
 ): void {
-  validateNoSecretMaterial(baseArgs, "Agent base arguments");
-  const owned = new Set(ownedArguments);
+  validateArgumentList(baseArgs, "Agent base arguments");
   for (const argument of baseArgs) {
-    const token = reservedToken(argument, owned);
-    if (token !== undefined) {
-      throw new Error(
-        `Agent base argument is reserved by adapter ${adapterId}: ${token} (reserved argument: ${token}).`
-      );
+    const reserved = findReservedAgentArgument(adapterId, argument);
+    if (reserved !== null) {
+      throw new Error(`Agent base argument is reserved by adapter ${adapterId}: ${reserved}.`);
     }
   }
 }
 
-function reservedToken(argument: string, owned: ReadonlySet<string>): string | undefined {
-  const equalsIndex = argument.indexOf("=");
-  const token = equalsIndex === -1 ? argument : argument.slice(0, equalsIndex);
-  if (owned.has(token)) return token;
-
-  if (!argument.startsWith("-") || argument.startsWith("--")) return undefined;
-  const ownedShortOptions = new Set([...owned].filter((candidate) => /^-[^-]$/.test(candidate)));
-  for (const flag of argument.slice(1)) {
-    const candidate = `-${flag}`;
-    if (ownedShortOptions.has(candidate)) return candidate;
+function validateArgumentList(values: readonly string[], label: string): void {
+  if (!Array.isArray(values)) throw new Error(`${label} must be an array.`);
+  for (const value of values) {
+    if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+      throw new Error(`${label} entries must be non-empty strings without NUL bytes.`);
+    }
+    const option = value.split("=", 1)[0];
+    if (containsSecretMarker(option) || containsSecretJson(value) || looksLikeCredential(value)) {
+      throw new Error(`${label} cannot persist secret-bearing arguments.`);
+    }
   }
-  return undefined;
 }
 
 function containsSecretMarker(value: string): boolean {
   return /(?:api[-_]?key|token|secret|password|credential|authorization)/i.test(value);
-}
-
-function validateNoSecretMaterial(args: readonly string[], label: string): void {
-  for (const argument of args) {
-    if (argument === "--") {
-      throw new Error(`${label} contains reserved argument: --.`);
-    }
-    const optionName = argument.split("=", 1)[0];
-    if (containsSecretMarker(optionName) || containsSecretJson(argument) || looksLikeCredential(argument)) {
-      throw new Error(`${label} cannot persist secret-bearing arguments.`);
-    }
-  }
 }
 
 function containsSecretJson(value: string): boolean {
