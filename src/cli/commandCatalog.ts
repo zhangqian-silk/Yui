@@ -129,16 +129,33 @@ const agentChildren: readonly NodeInput[] = [
 ];
 
 const roleProfileOptions = [
-  "--workspace", "--description", "--responsibility", "--constraint",
+  "--description", "--responsibility", "--constraint",
   "--expected-output", "--system-prompt", "--skill"
 ] as const;
+const roleAgentOptions = [
+  "--model", "--effort", "--sandbox", "--approval", "--permission-mode", "--search"
+] as const;
+const roleProfileClearOptions = [
+  "--clear-description", "--clear-responsibilities", "--clear-constraints",
+  "--clear-expected-output", "--clear-system-prompt", "--clear-skills"
+] as const;
+const roleAgentClearOptions = [
+  "--clear-model", "--clear-effort", "--clear-sandbox", "--clear-approval",
+  "--clear-permission-mode", "--clear-search", "--clear-agent-config"
+] as const;
+const roleAgentOptionValues = {
+  "--sandbox": ["read-only", "workspace-write", "danger-full-access"],
+  "--approval": ["untrusted", "on-request", "never"],
+  "--search": ["true"]
+} as const;
 
 const roleChildren: readonly NodeInput[] = [
   {
     name: "add",
     summary: "Add a reusable global Role.",
-    usage: "taskmux role add <name> --agent <id> [--workspace <path>] [--description <text>] [--responsibility <text> ...] [--constraint <text> ...] [--expected-output <text>] [--system-prompt <text>] [--skill <skill> ...]",
-    options: ["--agent", ...roleProfileOptions],
+    usage: "taskmux role add <name> --agent <id> [Role and Agent settings]",
+    options: ["--agent", "--workspace", ...roleProfileOptions, ...roleAgentOptions],
+    optionValues: roleAgentOptionValues,
     fileOptions: ["--workspace"]
   },
   { name: "list", summary: "List global Roles." },
@@ -147,11 +164,9 @@ const roleChildren: readonly NodeInput[] = [
     name: "update",
     summary: "Update a global Role.",
     usage: "taskmux role update <name> [profile options] [clear options]",
-    options: [
-      ...roleProfileOptions,
-      "--clear-description", "--clear-responsibilities", "--clear-constraints",
-      "--clear-expected-output", "--clear-system-prompt", "--clear-skills"
-    ],
+    options: ["--agent", "--workspace", ...roleProfileOptions, ...roleAgentOptions,
+      ...roleProfileClearOptions, ...roleAgentClearOptions],
+    optionValues: roleAgentOptionValues,
     fileOptions: ["--workspace"]
   },
   { name: "remove", summary: "Remove a global Role.", usage: "taskmux role remove <name>" },
@@ -202,15 +217,28 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "role",
     summary: "Manage Roles within a Task.",
-    sections: [{ id: "manage", title: "Commands", entries: ["add", "list", "bind", "enter"] }],
+    sections: [{ id: "manage", title: "Commands", entries: [
+      "add", "list", "show", "update", "remove", "bind", "enter"
+    ] }],
     children: [
       {
         name: "add",
         summary: "Add a Role to a Task.",
-        usage: "taskmux task role add <task> <name> [--agent <id>]",
-        options: ["--agent"]
+        usage: "taskmux task role add <task> <name> [--agent <id>] [Role and Agent settings]",
+        options: ["--agent", ...roleProfileOptions, ...roleAgentOptions],
+        optionValues: roleAgentOptionValues
       },
       { name: "list", summary: "List Task Roles.", usage: "taskmux task role list <task>" },
+      { name: "show", summary: "Show one Task Role.", usage: "taskmux task role show <task> <role>" },
+      {
+        name: "update",
+        summary: "Update a Task Role.",
+        usage: "taskmux task role update <task> <role> [Role and Agent settings]",
+        options: ["--agent", ...roleProfileOptions, ...roleAgentOptions,
+          ...roleProfileClearOptions, ...roleAgentClearOptions],
+        optionValues: roleAgentOptionValues
+      },
+      { name: "remove", summary: "Remove a Task Role.", usage: "taskmux task role remove <task> <role>" },
       { name: "bind", summary: "Bind and activate an Agent for a Task Role.", usage: "taskmux task role bind <task> <role> <agent-id>" },
       { name: "enter", summary: "Enter a Task Role's native session.", usage: "taskmux task role enter <task> <role>" }
     ]

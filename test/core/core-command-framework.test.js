@@ -61,6 +61,9 @@ test("the declarative catalog exposes exactly the lean public command surface", 
     "task role",
     "task role add",
     "task role list",
+    "task role show",
+    "task role update",
+    "task role remove",
     "task role bind",
     "task role enter",
     "task work",
@@ -112,6 +115,9 @@ test("nested help resolves and renders only the requested command group", () => 
   assert.match(output, /Usage:\n  taskmux task role <command>/);
   assert.match(output, /^  add\s+/m);
   assert.match(output, /^  list\s+/m);
+  assert.match(output, /^  show\s+/m);
+  assert.match(output, /^  update\s+/m);
+  assert.match(output, /^  remove\s+/m);
   assert.doesNotMatch(output, /task work|session-notify|internal/);
 });
 

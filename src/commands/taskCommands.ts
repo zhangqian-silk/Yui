@@ -15,6 +15,7 @@ import {
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
+import { activeRoleSummary, renderRoleDetails } from "../output/rolePresentation.js";
 import {
   copyGlobalRoleToTaskRole,
   createRole,
@@ -46,6 +47,13 @@ import {
   type WorkItem,
   type WorkItemStatus
 } from "../workItem/workItem.js";
+import {
+  hasAgentConfigOptions,
+  parseRoleOptions,
+  patchRoleAgentBinding,
+  roleOptionSpecs,
+  roleProfilePatch
+} from "./roleConfiguration.js";
 
 const LEADER_ROLE = "leader";
 
@@ -344,6 +352,9 @@ function taskRoleCommand(
   const [command, ...rest] = args;
   if (command === "add") return output(addTaskRole(rest, store, options));
   if (command === "list") return output(listTaskRoles(rest, store));
+  if (command === "show") return output(showTaskRole(rest, store));
+  if (command === "update") return output(updateTaskRole(rest, store, options));
+  if (command === "remove") return output(removeTaskRole(rest, store, options));
   if (command === "bind") return output(bindTaskRole(rest, store, options));
   if (command === "enter") return enterTaskRole(rest, store, options);
   throw usageError(command === undefined
@@ -356,18 +367,36 @@ function addTaskRole(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task role add usage: taskmux task role add <task> <name> [--agent <id>].";
-  const parsed = parseTail(args, new Set(["--agent"]), usage);
-  exactPositionals(parsed.positionals, 2, usage);
-  const agentId = optionalNonEmptyOption(parsed.options, "--agent");
+  const usage = "Task role add usage: taskmux task role add <task> <name> [Role and Agent settings].";
+  const [taskId, roleName, ...tail] = args;
+  if (taskId === undefined || roleName === undefined || taskId.startsWith("--") || roleName.startsWith("--")) {
+    throw usageError("Task id and Role name are required.", usage);
+  }
+  const parsed = parseRoleOptions(tail, roleOptionSpecs({ update: false, includeAgent: true }), usage);
+  const agentId = parsed.one("--agent")?.trim();
+  if (parsed.has("--agent") && (agentId === undefined || agentId.length === 0)) {
+    throw usageError("--agent is required.", usage);
+  }
   const now = clock(options);
   const role = store.transaction((tx) => {
-    const task = requireTask(tx, parsed.positionals[0]);
+    const task = requireTask(tx, taskId);
     assertTaskOpen(task);
-    const roleName = parsed.positionals[1];
     if (roleName === LEADER_ROLE) throw usageError("The Task leader role already exists.");
     if (tx.getRole(task.id, roleName) !== null) throw usageError(`Role already exists: ${roleName}.`);
-    const created = createTaskRole(tx, task, roleName, agentId, now);
+    let created = createTaskRole(tx, task, roleName, agentId, now);
+    const profile = roleProfilePatch(parsed);
+    if (Object.keys(profile).length > 0) created = updateRole(created, profile, now);
+    if (hasAgentConfigOptions(parsed)) {
+      const targetAgentId = agentId || created.activeAgentId;
+      const binding = created.agentBindings[targetAgentId];
+      if (binding === undefined) throw usageError(`Role Agent is not bound: ${targetAgentId}.`);
+      created = updateRole(created, {
+        agentBindings: {
+          ...created.agentBindings,
+          [targetAgentId]: patchRoleAgentBinding(binding, parsed)
+        }
+      }, now);
+    }
     tx.saveRole(task.id, created);
     return created;
   });
@@ -384,13 +413,102 @@ function listTaskRoles(args: string[], store: TaskWorkflowStore): string {
     `Task roles: ${task.id}`,
     [
       { header: "Role", minWidth: 4, maxWidth: 24 },
-      { header: "Agent", minWidth: 5, maxWidth: 20 },
+      { header: "Active Agent", minWidth: 8, maxWidth: 20 },
+      { header: "Model", minWidth: 8, maxWidth: 22 },
+      { header: "Effort", minWidth: 8, maxWidth: 14 },
       { header: "Status", minWidth: 6, maxWidth: 12 },
-      { header: "Workspace", minWidth: 9, maxWidth: 54 }
     ],
-    roles.map((role) => [role.name, role.activeAgentId, role.status, role.workspace]),
+    roles.map((role) => {
+      const summary = activeRoleSummary(role);
+      return [role.name, summary.agent, summary.model, summary.effort, role.status];
+    }),
     defaultTableWidth()
   )}\n`;
+}
+
+function showTaskRole(args: string[], store: TaskWorkflowStore): string {
+  exactPositionals(args, 2, "Task role show usage: taskmux task role show <task> <role>.");
+  const task = requireTask(store, args[0]);
+  const role = requireRole(store, task.id, args[1]);
+  return renderRoleDetails(`Task Role: ${role.name}`, role, {
+    kind: "task",
+    sessions: store.getTaskRoleSessionSet(task.id, role.name)
+  });
+}
+
+function updateTaskRole(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  const usage = "Task role update usage: taskmux task role update <task> <role> [Role and Agent settings].";
+  const [taskId, roleName, ...tail] = args;
+  if (taskId === undefined || roleName === undefined || taskId.startsWith("--") || roleName.startsWith("--")) {
+    throw usageError("Task id and Role name are required.", usage);
+  }
+  const parsed = parseRoleOptions(tail, roleOptionSpecs({ update: true, includeAgent: true }), usage);
+  if (parsed.has("--agent") && (parsed.one("--agent")?.trim().length ?? 0) === 0) {
+    throw usageError("--agent is required.", usage);
+  }
+  if ([...parsed.seen].every((option) => option === "--agent")) {
+    throw usageError("At least one role update option is required.", usage);
+  }
+  const now = clock(options);
+  const updated = store.transaction((tx) => {
+    const task = requireTask(tx, taskId);
+    assertTaskOpen(task);
+    const role = requireRole(tx, task.id, roleName);
+    let bindings = role.agentBindings;
+    if (hasAgentConfigOptions(parsed)) {
+      const agentId = parsed.one("--agent")?.trim() || role.activeAgentId;
+      const agent = requireAgent(tx, agentId);
+      const binding = bindings[agentId]
+        ?? createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId });
+      const activeSession = tx.getTaskRoleSessionSet(task.id, role.name)?.sessions[agentId];
+      if (agentId === role.activeAgentId && (
+        tx.getActiveAgentRun(task.id, role.name) !== null || activeSession?.status === "running"
+      )) {
+        throw usageError("Active Agent settings cannot be changed while its Run or native process is running.");
+      }
+      bindings = { ...bindings, [agentId]: patchRoleAgentBinding(binding, parsed) };
+    }
+    const next = updateRole(role, {
+      ...(bindings === role.agentBindings ? {} : { agentBindings: bindings }),
+      ...roleProfilePatch(parsed)
+    }, now);
+    tx.saveRole(task.id, next);
+    return next;
+  });
+  options.runtime?.notifyStateChanged(updated.taskId);
+  return renderRoleDetails(`Updated Task Role: ${updated.name}`, updated, {
+    kind: "task",
+    sessions: store.getTaskRoleSessionSet(updated.taskId, updated.name)
+  });
+}
+
+function removeTaskRole(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  exactPositionals(args, 2, "Task role remove usage: taskmux task role remove <task> <role>.");
+  const removed = store.transaction((tx) => {
+    const task = requireTask(tx, args[0]);
+    assertTaskOpen(task);
+    const role = requireRole(tx, task.id, args[1]);
+    if (role.name === LEADER_ROLE) throw usageError("The Task Leader role cannot be removed.");
+    if (tx.getActiveAgentRun(task.id, role.name) !== null) {
+      throw usageError(`Task Role has an active Run and cannot be removed: ${task.id}/${role.name}.`);
+    }
+    const session = tx.getTaskRoleSessionSet(task.id, role.name)?.sessions[role.activeAgentId];
+    if (session?.status === "running") {
+      throw usageError(`Task Role has a running native Agent and cannot be removed: ${task.id}/${role.name}.`);
+    }
+    if (!tx.removeTaskRole(task.id, role.name)) throw roleNotFound(role.name);
+    return role;
+  });
+  options.runtime?.notifyStateChanged(removed.taskId);
+  return `Removed role ${removed.name} from ${removed.taskId}\n`;
 }
 
 function bindTaskRole(
@@ -427,8 +545,7 @@ function bindTaskRole(
         throw usageError(messageOf(error));
       }
     })();
-    tx.saveRole(task.id, switched.role);
-    tx.saveTaskRoleSessionSet(switched.sessions);
+    tx.saveTaskRoleWithSessionSet(switched.role, switched.sessions);
     return { role: switched.role, mode: switched.mode };
   });
   options.runtime?.notifyStateChanged(result.role.taskId);

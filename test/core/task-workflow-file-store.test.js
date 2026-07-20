@@ -219,6 +219,10 @@ test("Role bind switches the active Agent while enter remains a foreground CLI a
   run(["role", "bind", task.id, "leader", "claude"], store, options);
   assert.equal(store.getRole(task.id, "leader")?.activeAgentId, "claude");
   assert.equal(store.getTaskRoleSessionSet(task.id, "leader")?.activeAgentId, "claude");
+  run(["role", "bind", task.id, "leader", "codex"], store, options);
+  assert.equal(store.getRole(task.id, "leader")?.activeAgentId, "codex");
+  run(["role", "bind", task.id, "leader", "claude"], store, options);
+  assert.equal(store.getRole(task.id, "leader")?.activeAgentId, "claude");
 
   assert.throws(
     () => runTaskCommand(["role", "enter", task.id, "leader"], store, options),
@@ -233,6 +237,75 @@ test("Role bind switches the active Agent while enter remains a foreground CLI a
     output: `Prepared role leader for ${task.id}\n`
   });
   assert.deepEqual(calls.enter, [{ taskId: task.id, roleName: "leader" }]);
+});
+
+test("Task Role add, update, show, and remove preserve lean field-level configuration", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Role settings");
+
+  run([
+    "role", "add", task.id, "reviewer", "--agent", "codex",
+    "--description", "Review changes", "--model", "gpt-5.6-sol",
+    "--effort", "high", "--sandbox", "read-only"
+  ], store, options);
+  run([
+    "role", "update", task.id, "reviewer", "--agent", "codex",
+    "--clear-model", "--approval", "never", "--description", "Review safely"
+  ], store, options);
+
+  const role = store.getRole(task.id, "reviewer");
+  assert.equal(role.description, "Review safely");
+  assert.deepEqual(role.agentBindings.codex.config, {
+    adapterId: "codex",
+    effort: "high",
+    permission: { sandbox: "read-only", approval: "never" }
+  });
+
+  run([
+    "role", "update", task.id, "reviewer", "--agent", "claude",
+    "--model", "claude-opus", "--permission-mode", "acceptEdits"
+  ], store, options);
+  const withClaude = store.getRole(task.id, "reviewer");
+  assert.equal(withClaude.activeAgentId, "codex");
+  assert.deepEqual(withClaude.agentBindings.claude.config, {
+    adapterId: "claude",
+    model: "claude-opus",
+    permission: { mode: "acceptEdits" }
+  });
+
+  const shown = run(["role", "show", task.id, "reviewer"], store, options);
+  assert.match(shown, /Task Role: reviewer/);
+  assert.match(shown, /CLI default/);
+  assert.match(shown, /read-only/);
+  assert.doesNotMatch(shown, /\{"adapterId"/);
+
+  const listed = run(["role", "list", task.id], store, options);
+  assert.match(listed, /Model/);
+  assert.match(listed, /Effort/);
+  assert.doesNotMatch(listed, /Workspace/);
+
+  assert.match(run(["role", "remove", task.id, "reviewer"], store, options), /Removed role reviewer/);
+  assert.equal(store.getRole(task.id, "reviewer"), null);
+});
+
+test("Task Role removal is blocked for Leader and active Runs", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Role removal guard");
+  assert.throws(
+    () => runTaskCommand(["role", "remove", task.id, "leader"], store, options),
+    /Leader role cannot be removed/i
+  );
+
+  run(["role", "add", task.id, "worker"], store, options);
+  run(["work", "create", task.id, "active", "--role", "worker"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  run(["activate", task.id], store, options);
+  run(["work", "dispatch", item.id], store, options);
+  assert.throws(
+    () => runTaskCommand(["role", "remove", task.id, "worker"], store, options),
+    /active Run/i
+  );
+  assert.notEqual(store.getRole(task.id, "worker"), null);
 });
 
 test("archive fences active work and clears pending wake in one transaction", (t) => {

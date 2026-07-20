@@ -7,6 +7,7 @@ import {
 import { resolveAgentAdapter } from "../executor/agentAdapter.js";
 import { resolveAgentEnvironment } from "../agent/agent.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
+import { activeRoleSummary, renderRoleDetails } from "../output/rolePresentation.js";
 import {
   activeRoleAgentBinding,
   createGlobalRole,
@@ -21,6 +22,14 @@ import {
   systemRoleDescription
 } from "../role/systemRoles.js";
 import type { AgentCommandStore, ConfiguredAgentRecord } from "./agentCommands.js";
+import {
+  hasAgentConfigOptions,
+  parseRoleOptions,
+  patchRoleAgentBinding,
+  roleOptionSpecs,
+  roleProfileFrom,
+  roleProfilePatch
+} from "./roleConfiguration.js";
 
 type GlobalRoleStore = AgentCommandStore & Readonly<{
   getConfig(): Readonly<{ defaultWorkspace?: string }>;
@@ -76,42 +85,38 @@ export function runGlobalRoleCommand(
 function addRole(args: string[], store: GlobalRoleStore): string {
   const [rawName, ...tail] = args;
   const name = roleName(rawName);
-  const parsed = parseOptions(tail, new Map([
-    ["--agent", false], ["--workspace", false], ["--description", false],
-    ["--responsibility", true], ["--constraint", true], ["--expected-output", false],
-    ["--system-prompt", false], ["--skill", true]
-  ]));
+  const parsed = parseRoleOptions(tail, roleOptionSpecs({
+    update: false, includeAgent: true, includeWorkspace: true
+  }));
   const agentId = required(parsed.one("--agent"), "--agent");
   const agent = requireAgent(agentId, store);
-  const workspace = parsed.one("--workspace")?.trim()
+  if (parsed.has("--workspace") && trimmed(parsed.one("--workspace")) === undefined) {
+    throw usageError("--workspace is required.");
+  }
+  const workspace = trimmed(parsed.one("--workspace"))
     ?? store.getConfig().defaultWorkspace
     ?? process.cwd();
-  const binding = createRoleAgentBinding(definition(agent));
-  const role = createGlobalRole(name, [binding], agent.id, workspace, new Date(), {
-    ...(trimmed(parsed.one("--description")) === undefined ? {} : { description: trimmed(parsed.one("--description")) }),
-    responsibilities: parsed.many("--responsibility").map((value) => value.trim()),
-    constraints: parsed.many("--constraint").map((value) => value.trim()),
-    ...(trimmed(parsed.one("--expected-output")) === undefined ? {} : { expectedOutput: trimmed(parsed.one("--expected-output")) }),
-    ...(trimmed(parsed.one("--system-prompt")) === undefined ? {} : { systemPrompt: trimmed(parsed.one("--system-prompt")) }),
-    skills: parsed.many("--skill").map((value) => value.trim())
-  });
+  const binding = patchRoleAgentBinding(createRoleAgentBinding(definition(agent)), parsed);
+  const role = createGlobalRole(
+    name, [binding], agent.id, workspace, new Date(), roleProfileFrom(parsed)
+  );
   const created = store.createGlobalRoleIfAbsent(role);
   if (created === null) throw usageError(`Role already exists: ${name}.`);
-  return renderRole(`Added role ${name}`, created);
+  return presentRole(`Added role ${name}`, created, store);
 }
 
 function listRoles(args: string[], store: GlobalRoleStore): string {
   assertNoArguments(args, "Role list usage: taskmux role list");
-  const rows = new Map<string, [string, string, string, string]>();
+  const rows = new Map<string, [string, string, string, string, string, string]>();
   for (const name of SYSTEM_ROLE_NAMES) {
     const role = store.getGlobalRole(name);
     rows.set(name, role === null
-      ? [name, "?", "?", `system:${systemRoleDescription(name)}`]
-      : [role.name, role.activeAgentId, role.workspace, `system:${systemRoleDescription(name)}`]);
+      ? [name, "system", "?", "?", "?", "?"]
+      : roleListRow(role, "system"));
   }
   for (const role of store.listGlobalRoles()) {
     if (!rows.has(role.name)) {
-      rows.set(role.name, [role.name, role.activeAgentId, role.workspace, "custom"]);
+      rows.set(role.name, roleListRow(role, "global"));
     }
   }
   if (rows.size === 0) return "No roles configured.\n";
@@ -119,9 +124,11 @@ function listRoles(args: string[], store: GlobalRoleStore): string {
     "Roles",
     [
       { header: "Role", minWidth: 4, maxWidth: 24 },
-      { header: "Agent", minWidth: 5, maxWidth: 20 },
-      { header: "Workspace", minWidth: 9, maxWidth: 54 },
-      { header: "Kind", minWidth: 6, maxWidth: 34 }
+      { header: "Kind", minWidth: 6, maxWidth: 8 },
+      { header: "Active Agent", minWidth: 8, maxWidth: 20 },
+      { header: "Model", minWidth: 8, maxWidth: 22 },
+      { header: "Effort", minWidth: 8, maxWidth: 14 },
+      { header: "Workspace", minWidth: 9, maxWidth: 54 }
     ],
     [...rows.values()].sort((left, right) => left[0].localeCompare(right[0])),
     defaultTableWidth()
@@ -137,40 +144,52 @@ function showRole(args: string[], store: GlobalRoleStore): string {
     if (isSystemRoleName(name)) return renderMissingSystemRole(name);
     throw roleNotFound(name);
   }
-  return renderRole(`Role: ${name}`, role);
+  return renderRoleDetails(`Role: ${name}`, role, {
+    kind: isSystemRoleName(name) ? "system" : "global",
+    sessions: store.getGlobalRoleSessionSet(name)
+  });
 }
 
 function updateRole(args: string[], store: GlobalRoleStore): string {
   const [rawName, ...tail] = args;
   const name = roleName(rawName);
   const role = requireRole(name, store);
-  const parsed = parseOptions(tail, new Map<string, OptionKind>([
-    ["--workspace", false], ["--description", false], ["--responsibility", true],
-    ["--constraint", true], ["--expected-output", false], ["--system-prompt", false],
-    ["--skill", true], ["--clear-description", "flag"], ["--clear-responsibilities", "flag"],
-    ["--clear-constraints", "flag"], ["--clear-expected-output", "flag"],
-    ["--clear-system-prompt", "flag"], ["--clear-skills", "flag"]
-  ]));
-  if (parsed.seen.size === 0) throw usageError("At least one role update option is required.");
-  for (const [valueOption, clearOption] of [
-    ["--description", "--clear-description"],
-    ["--responsibility", "--clear-responsibilities"],
-    ["--constraint", "--clear-constraints"],
-    ["--expected-output", "--clear-expected-output"],
-    ["--system-prompt", "--clear-system-prompt"],
-    ["--skill", "--clear-skills"]
-  ]) {
-    if (parsed.has(valueOption) && parsed.has(clearOption)) {
-      throw usageError(`${valueOption} and ${clearOption} cannot be used together.`);
-    }
+  const parsed = parseRoleOptions(tail, roleOptionSpecs({
+    update: true, includeAgent: true, includeWorkspace: true
+  }));
+  if (parsed.has("--agent") && trimmed(parsed.one("--agent")) === undefined) {
+    throw usageError("--agent is required.");
+  }
+  if (parsed.has("--workspace") && trimmed(parsed.one("--workspace")) === undefined) {
+    throw usageError("--workspace is required.");
+  }
+  if ([...parsed.seen].every((option) => option === "--agent")) {
+    throw usageError("At least one role update option is required.");
   }
   const workspace = trimmed(parsed.one("--workspace"));
+  let bindings = role.agentBindings;
+  if (hasAgentConfigOptions(parsed)) {
+    const agentId = parsed.one("--agent")?.trim() || role.activeAgentId;
+    const agent = requireAgent(agentId, store);
+    const binding = role.agentBindings[agentId] ?? createRoleAgentBinding(definition(agent));
+    const activeSession = store.getGlobalRoleSessionSet(name)?.sessions[agentId];
+    if (agentId === role.activeAgentId && activeSession?.status === "running") {
+      throw usageError("Active Agent settings cannot be changed while its native process is running.");
+    }
+    bindings = { ...role.agentBindings, [agentId]: patchRoleAgentBinding(binding, parsed) };
+  }
   const next: GlobalRole = {
-    ...updateGlobalRole(role, workspace === undefined ? {} : { workspace }, new Date()),
-    ...profilePatch(parsed)
+    ...updateGlobalRole(role, {
+      ...(workspace === undefined ? {} : { workspace }),
+      ...(bindings === role.agentBindings ? {} : { agentBindings: bindings }),
+      ...roleProfilePatch(parsed)
+    }, new Date())
   };
   store.saveGlobalRole(next);
-  return renderRole(`Updated role ${name}`, next);
+  return renderRoleDetails(`Updated role ${name}`, next, {
+    kind: isSystemRoleName(name) ? "system" : "global",
+    sessions: store.getGlobalRoleSessionSet(name)
+  });
 }
 
 function bindRole(args: string[], store: GlobalRoleStore): string {
@@ -186,7 +205,7 @@ function bindRole(args: string[], store: GlobalRoleStore): string {
   }, new Date());
   if (agentId === role.activeAgentId) {
     store.saveGlobalRole(withBinding);
-    return renderRole(`Role ${name} already bound to ${agentId}`, withBinding);
+    return presentRole(`Role ${name} already bound to ${agentId}`, withBinding, store);
   }
   const existingSet = store.getGlobalRoleSessionSet(name);
   const activeSession = existingSet?.sessions[role.activeAgentId];
@@ -199,7 +218,7 @@ function bindRole(args: string[], store: GlobalRoleStore): string {
       new Date()
     );
     store.saveGlobalRoleWithSessionSet(switched.role, switched.sessions);
-    return renderRole(`Bound role ${name} to ${agentId}`, switched.role);
+    return presentRole(`Bound role ${name} to ${agentId}`, switched.role, store);
   } catch (error) {
     throw usageError(error instanceof Error ? error.message : String(error));
   }
@@ -358,23 +377,6 @@ function parseOptions(args: string[], specs: ReadonlyMap<string, OptionKind>): P
   };
 }
 
-function profilePatch(parsed: Parsed): Partial<GlobalRole> {
-  return {
-    ...(parsed.has("--description") ? { description: trimmed(parsed.one("--description")) } : {}),
-    ...(parsed.has("--clear-description") ? { description: undefined } : {}),
-    ...(parsed.has("--responsibility") ? { responsibilities: parsed.many("--responsibility").map((value) => value.trim()) } : {}),
-    ...(parsed.has("--clear-responsibilities") ? { responsibilities: [] } : {}),
-    ...(parsed.has("--constraint") ? { constraints: parsed.many("--constraint").map((value) => value.trim()) } : {}),
-    ...(parsed.has("--clear-constraints") ? { constraints: [] } : {}),
-    ...(parsed.has("--expected-output") ? { expectedOutput: trimmed(parsed.one("--expected-output")) } : {}),
-    ...(parsed.has("--clear-expected-output") ? { expectedOutput: undefined } : {}),
-    ...(parsed.has("--system-prompt") ? { systemPrompt: trimmed(parsed.one("--system-prompt")) } : {}),
-    ...(parsed.has("--clear-system-prompt") ? { systemPrompt: undefined } : {}),
-    ...(parsed.has("--skill") ? { skills: parsed.many("--skill").map((value) => value.trim()) } : {}),
-    ...(parsed.has("--clear-skills") ? { skills: [] } : {})
-  };
-}
-
 function compileGlobalRoleLaunch(
   role: GlobalRole,
   agent: ConfiguredAgentRecord,
@@ -451,37 +453,19 @@ function assertNoArguments(args: string[], message: string): void {
   if (args.length > 0) throw usageError(`${message}. Unexpected argument: ${args[0]}`);
 }
 
-function renderRole(title: string, role: GlobalRole): string {
-  const bindings = Object.values(role.agentBindings);
-  return [
-    title,
-    `Active agent: ${role.activeAgentId}`,
-    `Bound agents: ${bindings.length}`,
-    `Workspace: ${role.workspace}`,
-    `Description: ${role.description ?? ""}`,
-    `Responsibilities: ${(role.responsibilities ?? []).join("; ")}`,
-    `Constraints: ${(role.constraints ?? []).join("; ")}`,
-    `Expected output: ${role.expectedOutput ?? ""}`,
-    `System prompt: ${role.systemPrompt ?? ""}`,
-    `Skills: ${(role.skills ?? []).join(", ")}`,
-    "",
-    renderTable(
-      "Agent bindings",
-      [
-        { header: "Agent", minWidth: 5, maxWidth: 20 },
-        { header: "Active", minWidth: 6, maxWidth: 6 },
-        { header: "Adapter", minWidth: 7, maxWidth: 12 },
-        { header: "Configuration", minWidth: 13, maxWidth: 40 }
-      ],
-      bindings.map((binding) => [
-        binding.agentId,
-        binding.agentId === role.activeAgentId ? "yes" : "no",
-        binding.adapterId,
-        JSON.stringify(binding.config)
-      ]),
-      defaultTableWidth()
-    )
-  ].join("\n").concat("\n");
+function presentRole(title: string, role: GlobalRole, store: GlobalRoleStore): string {
+  return renderRoleDetails(title, role, {
+    kind: isSystemRoleName(role.name) ? "system" : "global",
+    sessions: store.getGlobalRoleSessionSet(role.name)
+  });
+}
+
+function roleListRow(
+  role: GlobalRole,
+  kind: "system" | "global"
+): [string, string, string, string, string, string] {
+  const summary = activeRoleSummary(role);
+  return [role.name, kind, summary.agent, summary.model, summary.effort, role.workspace];
 }
 
 function renderMissingSystemRole(name: string): string {

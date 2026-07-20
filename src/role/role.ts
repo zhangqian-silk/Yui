@@ -137,11 +137,13 @@ export function updateGlobalRole(
   now: Date
 ): GlobalRole {
   validateGlobalRole(role);
-  return validateGlobalRole({
+  const updated = {
     ...role,
     ...cloneRolePatch(patch),
     updatedAt: now.toISOString()
-  });
+  };
+  clearProfileFields(updated, patch);
+  return validateGlobalRole(updated);
 }
 
 export function updateRole(
@@ -150,11 +152,13 @@ export function updateRole(
   now: Date
 ): Role {
   validateTaskRole(role);
-  return validateTaskRole({
+  const updated = {
     ...role,
     ...cloneRolePatch(patch),
     updatedAt: now.toISOString()
-  });
+  };
+  clearProfileFields(updated, patch);
+  return validateTaskRole(updated);
 }
 
 export function updateRoleStatus(role: Role, status: RoleStatus, now: Date): Role {
@@ -354,6 +358,19 @@ function cloneProfile(profile: RoleProfile): RoleProfile {
     ...(profile.systemPrompt === undefined ? {} : { systemPrompt: profile.systemPrompt }),
     ...(profile.skills === undefined ? {} : { skills: [...profile.skills] })
   };
+}
+
+function clearProfileFields(role: RoleProfile, patch: RoleProfile): void {
+  for (const key of [
+    "description",
+    "responsibilities",
+    "constraints",
+    "expectedOutput",
+    "systemPrompt",
+    "skills"
+  ] as const) {
+    if (Object.hasOwn(patch, key) && patch[key] === undefined) delete role[key];
+  }
 }
 
 function cloneJson<T>(value: T): T {

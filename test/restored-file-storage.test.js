@@ -189,6 +189,22 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   assert.equal(store.getLeaderFailure(task.id)?.message, "failed");
   assert.equal(store.getOperatorNotification(task.id)?.type, "leader-recovery-failed");
   assert.equal(readdirSync(home).some((name) => name.includes(".tmp-")), false);
+
+  const switchedGlobalRole = {
+    ...globalRole,
+    activeAgentId: "claude",
+    agentBindings: {
+      ...globalRole.agentBindings,
+      claude: { agentId: "claude", adapterId: "claude", config: { adapterId: "claude" } }
+    }
+  };
+  const switchedGlobalSessions = { ...globalSessions, activeAgentId: "claude" };
+  assert.doesNotThrow(() => store.saveGlobalRoleWithSessionSet(
+    switchedGlobalRole,
+    switchedGlobalSessions
+  ));
+  assert.equal(store.getGlobalRole("operator").activeAgentId, "claude");
+  assert.equal(store.getGlobalRoleSessionSet("operator").activeAgentId, "claude");
 });
 
 test("record versions and aggregate shape are validated without silently repairing data", () => {

@@ -125,6 +125,7 @@ export type TaskStore = {
   saveRole(taskId: string, role: TaskRole): void;
   listRoles(taskId: string): TaskRole[];
   getRole(taskId: string, name: string): TaskRole | null;
+  saveTaskRoleWithSessionSet(role: TaskRole, sessions: TaskRoleSessionSet): void;
   removeTaskRole(taskId: string, name: string): boolean;
   getRoleSessionSet(taskId: string, roleName: string): TaskRoleSessionSet | null;
   getTaskRoleSessionSet(taskId: string, roleName: string): TaskRoleSessionSet | null;
@@ -276,10 +277,16 @@ export class FileTaskStore implements TaskStore {
     this.#mutate((state) => { state.globalRoles[stored.name] = stored; });
   }
   saveGlobalRoleWithSessionSet(role: GlobalRole, sessions: GlobalRoleSessionSet | null): void {
-    this.transaction((store) => {
-      store.saveGlobalRole(role);
-      if (sessions === null) this.#mutate((state) => { delete state.globalRoleSessionSets[role.name]; });
-      else store.saveGlobalRoleSessionSet(sessions);
+    const storedRole = identified<GlobalRole>(role, 2, "name", role.name, "Global Role");
+    validateGlobalRole(storedRole);
+    const storedSessions = sessions === null ? null : globalSessions(sessions);
+    if (storedSessions !== null) assertSessionsMatchRole(storedSessions, storedRole);
+    this.transaction(() => {
+      this.#mutate((state) => {
+        state.globalRoles[storedRole.name] = storedRole;
+        if (storedSessions === null) delete state.globalRoleSessionSets[storedRole.name];
+        else state.globalRoleSessionSets[storedRole.name] = storedSessions;
+      });
     });
   }
   createGlobalRoleIfAbsent(role: GlobalRole): GlobalRole | null {
@@ -337,6 +344,19 @@ export class FileTaskStore implements TaskStore {
   }
   listRoles(taskId: string): TaskRole[] { return values(this.#requireTask(taskId).roles, "name"); }
   getRole(taskId: string, name: string): TaskRole | null { return optional(this.#state().tasks[taskId]?.roles[name]); }
+  saveTaskRoleWithSessionSet(role: TaskRole, sessions: TaskRoleSessionSet): void {
+    const storedRole = identified<TaskRole>(role, 2, "name", role.name, "Task Role");
+    validateTaskRole(storedRole);
+    const storedSessions = taskSessions(sessions);
+    assertSessionsMatchRole(storedSessions, storedRole);
+    this.transaction(() => {
+      this.#requireTaskForWrite(storedRole.taskId);
+      this.#mutate((state) => {
+        state.tasks[storedRole.taskId].roles[storedRole.name] = storedRole;
+        state.tasks[storedRole.taskId].roleSessionSets[storedRole.name] = storedSessions;
+      });
+    });
+  }
   removeTaskRole(taskId: string, name: string): boolean {
     return this.transaction(() => {
       const aggregate = this.#requireTask(taskId);

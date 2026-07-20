@@ -156,3 +156,103 @@ test("global Role enter returns a control result and binding preserves dormant s
   ], store, { env: {} }), /Replaced native session/);
   assert.equal(store.sessions.get("reviewer").sessions.claude.nativeSessionId, "session-2");
 });
+
+test("global Role Agent settings support adapter-aware field patches and CLI-default clears", () => {
+  const store = roleStore();
+  runGlobalRoleCommand([
+    "add", "reviewer", "--agent", "codex",
+    "--model", "gpt-5.6-sol", "--effort", "high",
+    "--sandbox", "workspace-write", "--approval", "on-request", "--search", "true"
+  ], store);
+
+  assert.deepEqual(store.roles.get("reviewer").agentBindings.codex.config, {
+    adapterId: "codex",
+    model: "gpt-5.6-sol",
+    effort: "high",
+    permission: { sandbox: "workspace-write", approval: "on-request" },
+    search: true
+  });
+  const launch = runGlobalRoleCommand(["enter", "reviewer"], store, { env: {} });
+  assert.equal(launch.kind, "enter");
+  assert.ok(launch.launch.args.includes("gpt-5.6-sol"));
+  assert.ok(launch.launch.args.includes("workspace-write"));
+  assert.ok(launch.launch.args.includes("on-request"));
+  assert.ok(launch.launch.args.includes("--search"));
+
+  runGlobalRoleCommand([
+    "update", "reviewer", "--agent", "codex",
+    "--model", "gpt-5.6-codex", "--clear-effort", "--clear-approval"
+  ], store);
+  assert.deepEqual(store.roles.get("reviewer").agentBindings.codex.config, {
+    adapterId: "codex",
+    model: "gpt-5.6-codex",
+    permission: { sandbox: "workspace-write" },
+    search: true
+  });
+
+  runGlobalRoleCommand([
+    "update", "reviewer", "--agent", "claude", "--model", "claude-opus"
+  ], store);
+  assert.equal(store.roles.get("reviewer").activeAgentId, "codex");
+  assert.deepEqual(store.roles.get("reviewer").agentBindings.claude.config, {
+    adapterId: "claude",
+    model: "claude-opus"
+  });
+
+  const output = runGlobalRoleCommand(["show", "reviewer"], store);
+  assert.match(output, /gpt-5\.6-codex/);
+  assert.match(output, /workspace-write/);
+  assert.match(output, /CLI default/);
+  assert.doesNotMatch(output, /\{"adapterId"/);
+});
+
+test("global Role rejects adapter-specific settings before mutating the binding", () => {
+  const store = roleStore();
+  runGlobalRoleCommand(["add", "reviewer", "--agent", "claude"], store);
+  const before = structuredClone(store.roles.get("reviewer"));
+
+  assert.throws(
+    () => runGlobalRoleCommand([
+      "update", "reviewer", "--agent", "claude", "--sandbox", "read-only"
+    ], store),
+    /only supported by Codex/i
+  );
+  assert.deepEqual(store.roles.get("reviewer"), before);
+  assert.throws(
+    () => runGlobalRoleCommand([
+      "update", "reviewer", "--agent", "claude", "--permission-mode", ""
+    ], store),
+    /must not be empty|required/i
+  );
+  assert.throws(
+    () => runGlobalRoleCommand([
+      "update", "reviewer", "--agent", "", "--model", "unexpected"
+    ], store),
+    /--agent is required/i
+  );
+  assert.throws(
+    () => runGlobalRoleCommand(["update", "reviewer", "--workspace", ""], store),
+    /--workspace is required/i
+  );
+});
+
+test("Codex search uses enabled or CLI-default semantics", () => {
+  const store = roleStore();
+  runGlobalRoleCommand(["add", "reviewer", "--agent", "codex"], store);
+  assert.throws(
+    () => runGlobalRoleCommand([
+      "update", "reviewer", "--search", "false"
+    ], store),
+    /supports true only/i
+  );
+  assert.equal(store.roles.get("reviewer").agentBindings.codex.config.search, undefined);
+});
+
+test("global Role profile fields are intentionally removed only by clear options", () => {
+  const store = roleStore();
+  runGlobalRoleCommand([
+    "add", "reviewer", "--agent", "codex", "--description", "Review changes"
+  ], store);
+  runGlobalRoleCommand(["update", "reviewer", "--clear-description"], store);
+  assert.equal(Object.hasOwn(store.roles.get("reviewer"), "description"), false);
+});

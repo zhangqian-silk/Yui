@@ -13,6 +13,7 @@ import {
   type SelectionIo
 } from "./cli/interactiveSelection.js";
 import { runCompletionWizard } from "./cli/completionWizard.js";
+import { resolveRoleWizardArguments } from "./cli/roleWizard.js";
 import type { SelectionPorts } from "./cli/selectionPorts.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
 import {
@@ -338,13 +339,23 @@ async function resolveTerminalArguments(
   }
   const handle = terminalIo();
   try {
-    const result = await resolveInteractiveArguments(
-      commandArgs,
-      node,
-      selectionPorts(store),
-      handle.io
-    );
-    return result.kind === "cancelled" ? null : result.args;
+    const ports = selectionPorts(store);
+    // Global Role add owns its Agent choice so the configured default can be
+    // shown explicitly. Other commands first resolve missing positional
+    // targets through the generic selector, then enter the focused Role UI.
+    if (
+      (commandArgs[0] === "role" && commandArgs[1] === "add")
+      || (commandArgs[0] === "task" && commandArgs[1] === "role" && commandArgs[2] === "add")
+    ) {
+      const wizard = await resolveRoleWizardArguments(commandArgs, ports, handle.io);
+      if (wizard.kind === "cancelled") return null;
+      const selected = await resolveInteractiveArguments(wizard.args, node, ports, handle.io);
+      return selected.kind === "cancelled" ? null : selected.args;
+    }
+    const selected = await resolveInteractiveArguments(commandArgs, node, ports, handle.io);
+    if (selected.kind === "cancelled") return null;
+    const wizard = await resolveRoleWizardArguments(selected.args, ports, handle.io);
+    return wizard.kind === "cancelled" ? null : wizard.args;
   } finally {
     // The Agent process must be the only reader of stdin after Role enter.
     handle.close();
@@ -389,10 +400,13 @@ function selectionCall(
   const reader = store as unknown as Record<string, (...args: never[]) => unknown>;
   switch (method) {
     case "agent.list": return store.listConfiguredAgents();
+    case "config.get": return store.getConfig();
     case "role.list": return store.listGlobalRoles();
+    case "role.show": return store.getGlobalRole(String(params.name ?? ""));
     case "repository.list": return callOptional(reader, "listRepositories");
     case "task.list": return callOptional(reader, "listTasks");
     case "task.role.list": return callOptional(reader, "listRoles", [params.taskId]);
+    case "task.role.show": return callOptional(reader, "getRole", [params.taskId, params.roleName]);
     case "task.work.list": return callOptional(reader, "listWorkItems", [params.taskId]);
     case "task.run.list": return callOptional(reader, "listAgentRuns", [params.workItemId]);
     case "jobs.list": return callOptional(reader, "listJobs");

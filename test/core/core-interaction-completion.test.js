@@ -63,6 +63,9 @@ const PUBLIC_PATHS = [
   "task role",
   "task role add",
   "task role list",
+  "task role show",
+  "task role update",
+  "task role remove",
   "task role bind",
   "task role enter",
   "task work",
@@ -98,9 +101,10 @@ function createPorts() {
   const events = [];
   const responses = {
     "agent.list": [
-      { id: "codex", adapter: "codex" },
-      { id: "claude", adapter: "claude" }
+      { id: "codex", adapterId: "codex", command: "codex" },
+      { id: "claude", adapterId: "claude", command: "claude" }
     ],
+    "config.get": { defaultAgent: "claude" },
     "jobs.list": [
       { id: "job-alpha", type: "start-run", status: "failed" },
       { id: "job-beta", type: "wake-role", status: "pending" }
@@ -199,6 +203,34 @@ test("interaction policies cover missing task, work, run, and job identifiers", 
   });
 });
 
+test("Task Role detail policies select task then Role and confirm removal", () => {
+  for (const command of ["show", "update", "remove"]) {
+    const policy = findInteractionPolicy(findCommandNode(["task", "role", command]));
+    assert.ok(policy, command);
+    assert.deepEqual(policy.selectors, [
+      {
+        argumentIndex: 3,
+        entity: "task",
+        provider: "tasks",
+        actionTarget: true
+      },
+      {
+        argumentIndex: 4,
+        entity: "task-role",
+        provider: "task-roles",
+        dependsOn: 3,
+        actionTarget: true
+      }
+    ]);
+  }
+
+  const remove = findInteractionPolicy(findCommandNode(["task", "role", "remove"]));
+  assert.deepEqual(remove.confirmation, {
+    action: "Remove Task Role",
+    targetArgumentIndex: 4
+  });
+});
+
 test("candidate providers read the current core entities through CoreCliPorts.call", async () => {
   const ports = createPorts();
 
@@ -230,13 +262,18 @@ test("candidate providers read the current core entities through CoreCliPorts.ca
   assert.deepEqual(values(await getSelectionCandidates(
     selector("jobs", "job"), ports, ["jobs", "retry"]
   )), ["job-alpha", "job-beta"]);
-  assert.deepEqual(values(await getSelectionCandidates(
+  const agents = await getSelectionCandidates(
     selector("configured-agents", "agent", { option: "--agent" }),
     ports,
     ["task", "role", "add", "task-alpha", "worker", "--agent"]
-  )), ["codex", "claude"]);
+  );
+  assert.deepEqual(values(agents), ["codex", "claude"]);
+  assert.equal(agents.defaultValue, "claude");
+  assert.equal(agents.columns.at(-1).header, "Default");
+  assert.equal(agents.candidates.find(({ value }) => value === "claude").cells.at(-1), "default");
 
   assert.ok(ports.events.some(({ method }) => method === "agent.list"));
+  assert.ok(ports.events.some(({ method }) => method === "config.get"));
   assert.ok(ports.events.some(({ method }) => method === "repository.list"));
   assert.ok(ports.events.some(({ method }) => method === "task.role.list"));
   assert.ok(ports.events.some(({ method }) => method === "jobs.list"));
@@ -252,6 +289,64 @@ test("candidate providers read the current core entities through CoreCliPorts.ca
       .map(({ params }) => params.workItemId)),
     new Set(["work-alpha", "work-beta"])
   );
+});
+
+test("an empty Agent selection chooses the configured default Agent", async () => {
+  const node = findCommandNode(["task", "role", "add"]);
+  assert.ok(node);
+  const ports = createPorts();
+  const io = selectionIo([""]);
+
+  const result = await resolveInteractiveArguments(
+    ["task", "role", "add", "task-alpha", "Reviewer", "--agent"], node, ports, io
+  );
+
+  assert.deepEqual(result, {
+    kind: "resolved",
+    args: ["task", "role", "add", "task-alpha", "Reviewer", "--agent", "claude"]
+  });
+  assert.match(io.writes.join(""), /Default/);
+  assert.match(io.writes.join(""), /claude\s+claude\s+claude\s+default/);
+});
+
+test("Task Role detail selection resolves the task before its Role and confirms removal", async () => {
+  for (const command of ["show", "update"]) {
+    const node = findCommandNode(["task", "role", command]);
+    assert.ok(node);
+    const ports = createPorts();
+    const io = selectionIo(["task-alpha", "Leader"]);
+    const result = await resolveInteractiveArguments(
+      ["task", "role", command], node, ports, io
+    );
+    assert.deepEqual(result, {
+      kind: "resolved",
+      args: ["task", "role", command, "task-alpha", "Leader"]
+    });
+    assert.ok(ports.events.some(({ method, params }) =>
+      method === "task.role.list" && params.taskId === "task-alpha"));
+  }
+
+  const node = findCommandNode(["task", "role", "remove"]);
+  assert.ok(node);
+  const ports = createPorts();
+  const io = selectionIo(["task-alpha", "Leader", "yes"]);
+  const result = await resolveInteractiveArguments(
+    ["task", "role", "remove"], node, ports, io
+  );
+  assert.deepEqual(result, {
+    kind: "resolved",
+    args: ["task", "role", "remove", "task-alpha", "Leader"]
+  });
+  assert.ok(io.prompts.includes("Remove Task Role Leader? [y/N]: "));
+
+  const cancelled = await resolveInteractiveArguments(
+    ["task", "role", "remove"], node, createPorts(),
+    selectionIo(["task-alpha", "Leader", "no"])
+  );
+  assert.deepEqual(cancelled, {
+    kind: "cancelled",
+    args: ["task", "role", "remove", "task-alpha", "Leader"]
+  });
 });
 
 test("role ordering keeps Operator then Leader before task-specific roles", () => {

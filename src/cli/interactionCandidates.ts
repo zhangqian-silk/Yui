@@ -40,13 +40,23 @@ export async function getSelectionCandidates(
         await list(ports, "repository.list", {}),
         ["id", "name", "path"]
       );
-    case "configured-agents":
-      return entities(
+    case "configured-agents": {
+      const agents = await list(ports, "agent.list", {});
+      const config = await optionalEntity(ports, "config.get", {});
+      const defaultValue = config === undefined
+        ? undefined
+        : stringField(config, "defaultAgent");
+      const set = entities(
         "agent",
         "Select Agent",
-        await list(ports, "agent.list", {}),
-        ["id", "adapterId", "command"]
+        agents.map((agent) => ({
+          ...agent,
+          default: stringField(agent, "id") === defaultValue ? "default" : ""
+        })),
+        ["id", "adapterId", "command", "default"]
       );
+      return { ...set, defaultValue };
+    }
     case "global-roles":
       return entities(
         "global role",
@@ -111,6 +121,21 @@ async function list(
   return Array.isArray(value)
     ? value.filter((entry): entry is Entity => typeof entry === "object" && entry !== null && !Array.isArray(entry))
     : [];
+}
+
+async function optionalEntity(
+  ports: SelectionPorts,
+  method: string,
+  params: Readonly<Record<string, unknown>>
+): Promise<Entity | undefined> {
+  try {
+    const value = await ports.call(method, params);
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+      ? value as Entity
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function dependencyValue(selector: ArgumentSelector, args: readonly string[]): string | undefined {

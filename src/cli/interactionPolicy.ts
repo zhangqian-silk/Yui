@@ -77,7 +77,9 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     trailingOptions: {
       "--agent": "value", "--workspace": "value", "--description": "value",
       "--responsibility": "value", "--constraint": "value", "--expected-output": "value",
-      "--system-prompt": "value", "--skill": "value"
+      "--system-prompt": "value", "--skill": "value", "--model": "value",
+      "--effort": "value", "--sandbox": "value", "--approval": "value",
+      "--permission-mode": "value", "--search": "value"
     }
   },
   ...["show", "update", "remove", "enter"].map((command): InteractionPolicy => ({
@@ -153,12 +155,34 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
       { option: "--agent", entity: "agent", provider: "configured-agents", actionTarget: false }
     ],
-    trailingOptions: { "--agent": "value" }
+    trailingOptions: {
+      "--agent": "value", "--description": "value", "--responsibility": "value",
+      "--constraint": "value", "--expected-output": "value", "--system-prompt": "value",
+      "--skill": "value", "--model": "value", "--effort": "value",
+      "--sandbox": "value", "--approval": "value", "--permission-mode": "value",
+      "--search": "value"
+    }
   },
   {
     commandPath: ["task", "role", "list"],
     selectors: [{ argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true }]
   },
+  ...["show", "update", "remove"].map((command): InteractionPolicy => ({
+    commandPath: ["task", "role", command],
+    selectors: [
+      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
+      {
+        argumentIndex: 4,
+        entity: "task-role",
+        provider: "task-roles",
+        dependsOn: 3,
+        actionTarget: true
+      }
+    ],
+    ...(command === "remove"
+      ? { confirmation: { action: "Remove Task Role", targetArgumentIndex: 4 } }
+      : {})
+  })),
   {
     commandPath: ["task", "role", "bind"],
     selectors: [
