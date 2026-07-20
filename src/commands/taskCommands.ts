@@ -1,5 +1,4 @@
 import type { ConfiguredAgent } from "../agent/agent.js";
-import { createTaskComment, type TaskComment } from "../comment/comment.js";
 import { compileDispatchInput } from "../context/dispatchContext.js";
 import {
   dataError,
@@ -8,6 +7,7 @@ import {
   taskNotFound,
   usageError
 } from "../errors/cliError.js";
+import { createTaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
 import {
   createRoleSessionSet,
   roleAgentSessionResumeMode,
@@ -16,6 +16,14 @@ import {
 } from "../executor/agentExecutor.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { activeRoleSummary, renderRoleDetails } from "../output/rolePresentation.js";
+import {
+  createTaskMessage,
+  taskMessageAuthorLabel,
+  type TaskMessage,
+  type TaskMessageAuthor,
+  type TaskMessageContext,
+  type TaskMessageKind
+} from "../message/message.js";
 import {
   copyGlobalRoleToTaskRole,
   createRole,
@@ -36,9 +44,14 @@ import { queueLeaderWakeup, queueLeaderWakeupAfterYield } from "../scheduler/wak
 import {
   activateTask,
   archiveTask,
+  completeTask,
   createTask,
+  reopenTask,
+  updateTaskMetadata,
   type Task,
-  type TaskMetadata
+  type TaskCompletedBy,
+  type TaskMetadata,
+  type TaskPriority
 } from "../task/task.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
@@ -92,9 +105,12 @@ export function runTaskCommand(
   const [command, ...rest] = args;
   switch (command) {
     case "create": return output(createTaskCommand(rest, store, options));
+    case "update": return output(updateTaskCommand(rest, store, options));
     case "list": return output(listTaskCommand(rest, store));
     case "show": return output(showTaskCommand(rest, store));
     case "activate": return output(activateTaskCommand(rest, store, options));
+    case "complete": return output(completeTaskCommand(rest, store, options));
+    case "reopen": return output(reopenTaskCommand(rest, store, options));
     case "archive": return output(archiveTaskCommand(rest, store, options));
     case "reconcile": return output(reconcileTaskCommand(rest, store, options));
     case "message": return output(taskMessageCommand(rest, store, options));
@@ -107,6 +123,65 @@ export function runTaskCommand(
         ? "Task command is required."
         : `Unknown command: task ${command}`);
   }
+}
+
+function updateTaskCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  const optionNames = new Set(["--title", "--description", "--priority", "--tags", "--due-at"]);
+  const clearOptions = new Set([
+    "--clear-description", "--clear-priority", "--clear-tags", "--clear-due-at"
+  ]);
+  const usage = "Task update usage: taskmux task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at].";
+  const parsed = parseTail(args, optionNames, usage, clearOptions);
+  exactPositionals(parsed.positionals, 1, usage);
+  if (parsed.options.size === 0) throw usageError("At least one Task metadata option is required.", usage);
+  for (const [setOption, clearOption] of [
+    ["--description", "--clear-description"],
+    ["--priority", "--clear-priority"],
+    ["--tags", "--clear-tags"],
+    ["--due-at", "--clear-due-at"]
+  ] as const) {
+    if (parsed.options.has(setOption) && parsed.options.has(clearOption)) {
+      throw usageError(`${setOption} and ${clearOption} cannot be used together.`, usage);
+    }
+  }
+  const priority = parsed.options.has("--priority")
+    ? parseTaskPriority(requiredOption(parsed.options, "--priority"))
+    : undefined;
+  const dueAt = parsed.options.has("--due-at")
+    ? parseIsoTimestamp(requiredOption(parsed.options, "--due-at"), "--due-at")
+    : undefined;
+  const tags = parsed.options.has("--tags")
+    ? parseTaskTags(requiredOption(parsed.options, "--tags"))
+    : undefined;
+  const now = clock(options);
+  const task = store.transaction((tx) => {
+    const current = requireTask(tx, parsed.positionals[0]);
+    if (current.status === "archived") throw usageError(`Task is archived: ${current.id}.`);
+    const updated = updateTaskMetadata(current, {
+      ...(parsed.options.has("--title") ? { title: requiredOption(parsed.options, "--title") } : {}),
+      ...(parsed.options.has("--description")
+        ? { description: requiredOption(parsed.options, "--description") }
+        : parsed.options.has("--clear-description") ? { description: null } : {}),
+      ...(priority === undefined
+        ? parsed.options.has("--clear-priority") ? { priority: null } : {}
+        : { priority }),
+      ...(tags === undefined
+        ? parsed.options.has("--clear-tags") ? { tags: null } : {}
+        : { tags }),
+      ...(dueAt === undefined
+        ? parsed.options.has("--clear-due-at") ? { dueAt: null } : {}
+        : { dueAt })
+    }, now);
+    tx.saveTask(updated);
+    recordTaskEvent(tx, updated.id, "task.updated", { status: updated.status }, now);
+    return updated;
+  });
+  options.runtime?.notifyStateChanged(task.id);
+  return `Updated task ${task.id}\n`;
 }
 
 /** Compatibility helper for call sites that cannot yet handle foreground enter. */
@@ -133,21 +208,21 @@ export function submitOperatorMessage(
     if (taskId !== undefined) {
       const task = requireTask(tx, taskId);
       assertTaskOpen(task);
-      const comment = appendMessage(tx, task.id, body, "operator", now);
+      const message = appendMessage(tx, task.id, body, "operator", { type: "operator" }, now);
       if (task.status === "active") {
         queueLeaderWakeup(tx, task.id, "operator-input", now);
       }
-      return { task, comment, created: false } as const;
+      return { task, message, created: false } as const;
     }
 
     const created = createTaskAggregate(tx, titleFrom(body), {}, now);
-    const comment = appendMessage(tx, created.task.id, body, "operator", now);
-    return { ...created, comment, created: true } as const;
+    const message = appendMessage(tx, created.task.id, body, "operator", { type: "operator" }, now);
+    return { ...created, message, created: true } as const;
   });
   options.runtime?.notifyStateChanged(result.task.id);
   return result.created
-    ? `Created Draft task ${result.task.id}: ${result.task.title}\nSubmitted message ${result.comment.id}\n`
-    : `Submitted message ${result.comment.id} to ${result.task.id}\n`;
+    ? `Created Draft task ${result.task.id}: ${result.task.title}\nSubmitted message ${result.message.id}\n`
+    : `Submitted message ${result.message.id} to ${result.task.id}\n`;
 }
 
 function createTaskCommand(
@@ -185,6 +260,7 @@ function createTaskAggregate(
   const leader = createTaskRole(store, task, LEADER_ROLE, undefined, now);
   store.saveTask(task);
   store.saveRole(task.id, leader);
+  recordTaskEvent(store, task.id, "task.created", { status: task.status }, now);
   return { task, leader };
 }
 
@@ -210,18 +286,33 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): string {
   exactPositionals(args, 1, "Task show usage: taskmux task show <id>.");
   const task = requireTask(store, taskId);
   const roles = store.listRoles(task.id);
-  const comments = store.listComments(task.id);
+  const messages = store.listMessages(task.id);
+  const brief = store.getTaskBrief(task.id);
+  const decisions = store.listDecisions(task.id);
+  const milestones = store.listMilestones(task.id);
+  const events = store.listEvents(task.id);
   const work = store.listWorkItems(task.id);
   const runs = store.listAgentRuns(task.id);
   return [
     `Task: ${task.id}`,
     `Title: ${task.title}`,
     `Status: ${task.status}`,
+    ...(task.description === undefined ? [] : [`Description: ${task.description}`]),
+    ...(task.priority === undefined ? [] : [`Priority: ${task.priority}`]),
+    ...(task.tags === undefined ? [] : [`Tags: ${task.tags.join(", ")}`]),
+    ...(task.dueAt === undefined ? [] : [`Due: ${task.dueAt}`]),
+    ...(task.completedAt === undefined ? [] : [`Completed: ${task.completedAt}`]),
+    ...(task.completedBy === undefined ? [] : [`Completed by: ${task.completedBy}`]),
+    ...(task.completionSummary === undefined ? [] : [`Completion summary: ${task.completionSummary}`]),
     ...(task.repositoryId === undefined ? [] : [`Repository: ${task.repositoryId}`]),
     ...(task.baseRef === undefined ? [] : [`Base: ${task.baseRef}`]),
     ...(task.cwd === undefined ? [] : [`Workspace: ${task.cwd}`]),
     `Roles: ${roles.length}`,
-    `Messages: ${comments.length}`,
+    `Messages: ${messages.length}`,
+    `Brief: ${brief === null ? "no" : "yes"}`,
+    `Decisions: ${decisions.length}`,
+    `Milestones: ${milestones.length}`,
+    `Events: ${events.length}`,
     `Work items: ${work.length}`,
     `Runs: ${runs.length}`,
     `Created: ${task.createdAt}`,
@@ -239,17 +330,114 @@ function activateTaskCommand(
   const result = store.transaction((tx) => {
     const task = requireTask(tx, args[0]);
     if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
+    if (task.status === "completed") {
+      throw usageError(`Task ${task.id} is completed; use task reopen before activating it.`);
+    }
     if (task.status === "active") return { task, changed: false } as const;
     const active = activateTask(task, now);
     tx.saveTask(active);
     // Repository-backed Tasks keep this durable wake pending until the
     // Controller has prepared and recorded the Task workspace.
     queueLeaderWakeup(tx, task.id, "task-created", now);
+    recordTaskEvent(tx, task.id, "task.activated", {
+      fromStatus: task.status,
+      status: active.status
+    }, now);
     return { task: active, changed: true } as const;
   });
   if (result.changed) options.runtime?.notifyStateChanged(result.task.id);
   return result.changed
     ? `Activated task ${result.task.id}\n`
+    : `Task ${result.task.id} is already active\n`;
+}
+
+function completeTaskCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  const usage = "Task complete usage: taskmux task complete <id> --summary <text>.";
+  const parsed = parseTail(args, new Set(["--summary"]), usage);
+  exactPositionals(parsed.positionals, 1, usage);
+  const summary = requiredOption(parsed.options, "--summary");
+  const now = clock(options);
+  const result = store.transaction((tx) => {
+    const task = requireTask(tx, parsed.positionals[0]);
+    const actor = taskActor(options, task.id);
+    if (task.status === "completed") return { task, changed: false } as const;
+    if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
+    if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
+
+    const roles = tx.listRoles(task.id);
+    const activeRuns = roles
+      .map((role) => ({ role, run: tx.getActiveAgentRun(task.id, role.name) }))
+      .filter((entry): entry is { role: Role; run: AgentRun } => entry.run !== null);
+    const workerRun = activeRuns.find(({ role }) => role.name !== LEADER_ROLE);
+    if (workerRun !== undefined) {
+      throw usageError(`Task ${task.id} has an active run for Role ${workerRun.role.name}.`);
+    }
+    const runningWork = tx.listWorkItems(task.id).find((item) => item.status === "running");
+    if (runningWork !== undefined) {
+      throw usageError(`Task ${task.id} has running work: ${runningWork.id}.`);
+    }
+
+    const leaderEntry = activeRuns.find(({ role }) => role.name === LEADER_ROLE);
+    if (leaderEntry !== undefined) {
+      if (actor !== "leader") {
+        throw usageError(`Task ${task.id} has an active Leader run.`);
+      }
+      if (leaderEntry.run.workItemId !== undefined) {
+        throw usageError(`Task ${task.id} has running work: ${leaderEntry.run.workItemId}.`);
+      }
+      if (leaderEntry.run.deliveredAt === undefined) {
+        throw usageError(`Task ${task.id} Leader delivery is still pending.`);
+      }
+      tx.saveAgentRun(yieldAgentRun(leaderEntry.run, summary, now));
+      tx.clearActiveAgentRun(task.id, LEADER_ROLE);
+      tx.saveRole(task.id, updateRoleStatus(leaderEntry.role, "idle", now));
+      const sessions = tx.getTaskRoleSessionSet(task.id, LEADER_ROLE);
+      if (sessions?.sessions[leaderEntry.role.activeAgentId]?.status === "running") {
+        tx.saveTaskRoleSessionSet(
+          updateRoleAgentSessionStatus(sessions, leaderEntry.role.activeAgentId, "ready", now)
+        );
+      }
+    }
+
+    const completed = completeTask(task, now, { by: actor, summary });
+    tx.saveTask(completed);
+    tx.clearPendingWakeup(task.id);
+    tx.clearLeaderFailure(task.id);
+    tx.clearOperatorNotification(task.id);
+    recordTaskEvent(tx, task.id, "task.completed", { by: actor, summary }, now);
+    return { task: completed, changed: true } as const;
+  });
+  if (result.changed) options.runtime?.notifyStateChanged(result.task.id);
+  return result.changed
+    ? `Completed task ${result.task.id}\n`
+    : `Task ${result.task.id} is already completed\n`;
+}
+
+function reopenTaskCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  exactPositionals(args, 1, "Task reopen usage: taskmux task reopen <id>.");
+  const now = clock(options);
+  const result = store.transaction((tx) => {
+    const task = requireTask(tx, args[0]);
+    if (task.status === "active") return { task, changed: false } as const;
+    if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
+    if (task.status !== "completed") throw usageError(`Task is not completed: ${task.id}.`);
+    const active = reopenTask(task, now);
+    tx.saveTask(active);
+    queueLeaderWakeup(tx, task.id, "task-reopened", now);
+    recordTaskEvent(tx, task.id, "task.reopened", { status: active.status }, now);
+    return { task: active, changed: true } as const;
+  });
+  if (result.changed) options.runtime?.notifyStateChanged(result.task.id);
+  return result.changed
+    ? `Reopened task ${result.task.id}\n`
     : `Task ${result.task.id} is already active\n`;
 }
 
@@ -260,15 +448,15 @@ function archiveTaskCommand(
 ): string {
   exactPositionals(args, 1, "Task archive usage: taskmux task archive <id>.");
   const now = clock(options);
-  const actor = options.environment?.TASKMUX_ROLE === "leader"
-    ? "leader"
-    : options.environment?.TASKMUX_ROLE === "operator" ? "operator" : "user";
   const result = store.transaction((tx) => {
     const task = requireTask(tx, args[0]);
+    const actor = taskActor(options, task.id);
     if (task.status === "archived") return { task, changed: false } as const;
     const archived = archiveTask(task, now, { by: actor });
     tx.saveTask(archived);
     tx.clearPendingWakeup(task.id);
+    tx.clearLeaderFailure(task.id);
+    tx.clearOperatorNotification(task.id);
     for (const role of tx.listRoles(task.id)) {
       const activeRun = tx.getActiveAgentRun(task.id, role.name);
       if (activeRun === null) continue;
@@ -283,6 +471,7 @@ function archiveTaskCommand(
         }
       }
     }
+    recordTaskEvent(tx, task.id, "task.archived", { by: actor }, now);
     return { task: archived, changed: true } as const;
   });
   if (result.changed) options.runtime?.notifyStateChanged(result.task.id);
@@ -315,18 +504,18 @@ function taskMessageCommand(
     const result = store.transaction((tx) => {
       const task = requireTask(tx, rest[0]);
       assertTaskOpen(task);
-      const comment = appendMessage(tx, task.id, rest[1], "user", now);
-      if (task.status === "active") queueLeaderWakeup(tx, task.id, "user-comment", now);
-      return { task, comment };
+      const message = appendMessage(tx, task.id, rest[1], "user", { type: "user" }, now);
+      if (task.status === "active") queueLeaderWakeup(tx, task.id, "user-message", now);
+      return { task, message };
     });
     options.runtime?.notifyStateChanged(result.task.id);
-    return `Sent message ${result.comment.id} to ${result.task.id}\n`;
+    return `Sent message ${result.message.id} to ${result.task.id}\n`;
   }
   if (command === "list") {
     exactPositionals(rest, 1, "Task message list usage: taskmux task message list <id>.");
     const task = requireTask(store, rest[0]);
-    const comments = store.listComments(task.id);
-    if (comments.length === 0) return "No messages found.\n";
+    const messages = store.listMessages(task.id);
+    if (messages.length === 0) return "No messages found.\n";
     return `${renderTable(
       `Task messages: ${task.id}`,
       [
@@ -335,7 +524,12 @@ function taskMessageCommand(
         { header: "Created", minWidth: 10, maxWidth: 28 },
         { header: "Body", minWidth: 8, maxWidth: 72 }
       ],
-      comments.map((comment) => [comment.id, comment.author ?? "-", comment.createdAt, comment.body]),
+      messages.map((message) => [
+        message.id,
+        taskMessageAuthorLabel(message.author),
+        message.createdAt,
+        message.body
+      ]),
       defaultTableWidth()
     )}\n`;
   }
@@ -560,9 +754,7 @@ function enterTaskRole(
   exactPositionals(args, 2, "Task role enter usage: taskmux task role enter <task> <role>.");
   const task = requireTask(store, args[0]);
   if (task.status !== "active") {
-    throw usageError(task.status === "draft"
-      ? `Task ${task.id} is a Draft; activate it before entering a role session.`
-      : `Task is archived: ${task.id}.`);
+    throw usageError(inactiveTaskMessage(task, "entering a role session"));
   }
   const role = requireRole(store, task.id, args[1]);
   requireRuntime(options).prepareTaskRoleEnter({ taskId: task.id, roleName: role.name });
@@ -616,9 +808,7 @@ function createWork(
     requireRole(tx, task.id, roleName);
     const created = createWorkItem(tx.nextWorkItemId(task.id), task.id, {
       title: parsed.positionals[1],
-      assignee: roleName,
-      topics: [],
-      cycleId: undefined
+      assignee: roleName
     }, now);
     tx.saveWorkItem(task.id, created);
     return created;
@@ -690,9 +880,7 @@ function dispatchWork(
     const item = requireWorkItem(tx, parsed.positionals[0]);
     const task = requireTask(tx, item.taskId);
     if (task.status !== "active") {
-      throw usageError(task.status === "draft"
-        ? `Task ${task.id} is a Draft; activate it before dispatch.`
-        : `Task is archived: ${task.id}.`);
+      throw usageError(inactiveTaskMessage(task, "dispatch"));
     }
     if (item.status !== "pending") {
       throw usageError(`Work item ${item.id} cannot be dispatched from ${item.status}.`);
@@ -765,7 +953,7 @@ function retryRun(
   const now = clock(options);
   const retried = store.transaction((tx) => {
     const previous = requireRun(tx, args[0]);
-    if (previous.status !== "failed" && previous.status !== "expired") {
+    if (previous.status !== "failed") {
       throw usageError(`Run ${previous.id} is not retryable from ${previous.status}.`);
     }
     const task = requireTask(tx, previous.taskId);
@@ -782,7 +970,7 @@ function retryRun(
       roleAgentSessionResumeMode(sessions, role.activeAgentId),
       previous.input,
       now,
-      { workItemId: previous.workItemId, topics: previous.topics }
+      { workItemId: previous.workItemId }
     );
     tx.saveAgentRun(created);
     tx.saveActiveAgentRun(created);
@@ -813,13 +1001,24 @@ function yieldRun(
     if (active.status !== "active") {
       throw usageError(`Run ${active.id} is already terminal: ${active.status}.`);
     }
+    if (active.deliveredAt === undefined) {
+      throw usageError(`Run ${active.id} delivery is still pending.`);
+    }
     const task = requireTask(tx, active.taskId);
-    if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
+    if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "yielding a run"));
     const role = requireRole(tx, task.id, active.roleName);
     const pointer = tx.getActiveAgentRun(task.id, role.name);
     if (pointer?.id !== active.id) throw usageError(`Run is not active for ${task.id}/${role.name}: ${active.id}.`);
     const terminal = yieldAgentRun(active, summary, now);
-    const comment = appendMessage(tx, task.id, summary, role.name, now);
+    const message = appendMessage(
+      tx,
+      task.id,
+      summary,
+      "role-result",
+      { type: "role", roleName: role.name },
+      now,
+      { runId: terminal.id, workItemId: active.workItemId }
+    );
     tx.saveAgentRun(terminal);
     tx.clearActiveAgentRun(task.id, role.name);
     if (active.workItemId !== undefined) {
@@ -835,12 +1034,12 @@ function yieldRun(
       tx.saveTaskRoleSessionSet(updateRoleAgentSessionStatus(sessions, role.activeAgentId, "ready", now));
     }
     queueLeaderWakeupAfterYield(tx, task, terminal, now);
-    return { run: terminal, comment };
+    return { run: terminal, message };
   });
   // For a Leader yield this also advances a wake that arrived while the Leader
   // was busy; queueLeaderWakeupAfterYield deliberately does not self-wake.
   options.runtime?.notifyStateChanged(yielded.run.taskId);
-  return `Yielded ${yielded.run.id}: ${yielded.comment.body}\n`;
+  return `Yielded ${yielded.run.id}: ${yielded.message.body}\n`;
 }
 
 function createTaskRole(
@@ -871,12 +1070,25 @@ function appendMessage(
   store: TaskWorkflowStore,
   taskId: string,
   body: string,
-  author: string,
+  kind: TaskMessageKind,
+  author: TaskMessageAuthor,
+  now: Date,
+  context: TaskMessageContext = {}
+): TaskMessage {
+  const message = createTaskMessage(store.nextMessageId(taskId), body, kind, author, now, context);
+  store.saveMessage(taskId, message);
+  recordTaskEvent(store, taskId, "message.sent", { messageId: message.id, kind: message.kind }, now);
+  return message;
+}
+
+function recordTaskEvent(
+  store: TaskWorkflowStore,
+  taskId: string,
+  type: string,
+  payload: TaskEventPayload,
   now: Date
-): TaskComment {
-  const comment = createTaskComment(store.nextCommentId(taskId), body, now, author);
-  store.saveComment(taskId, comment);
-  return comment;
+): void {
+  store.saveEvent(taskId, createTaskEvent(store.nextEventId(taskId), type, payload, now));
 }
 
 function requireTask(store: TaskWorkflowStore, taskId: string | undefined): Task {
@@ -915,7 +1127,31 @@ function requireRun(store: TaskWorkflowStore, runId: string | undefined): AgentR
 }
 
 function assertTaskOpen(task: Task): void {
+  if (task.status === "completed") {
+    throw usageError(`Task ${task.id} is completed; reopen it before continuing.`);
+  }
   if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
+}
+
+function taskActor(options: TaskCommandOptions, taskId: string): TaskCompletedBy {
+  const environment = options.environment;
+  if (environment?.TASKMUX_SESSION_SCOPE === "task"
+    && environment.TASKMUX_TASK_ID === taskId
+    && environment.TASKMUX_ROLE === "leader") {
+    return "leader";
+  }
+  return environment?.TASKMUX_SESSION_SCOPE === "global"
+    && environment.TASKMUX_ROLE === "operator" ? "operator" : "user";
+}
+
+function inactiveTaskMessage(task: Task, action: string): string {
+  if (task.status === "draft") {
+    return `Task ${task.id} is a Draft; activate it before ${action}.`;
+  }
+  if (task.status === "completed") {
+    return `Task ${task.id} is completed; reopen it before ${action}.`;
+  }
+  return `Task is archived: ${task.id}.`;
 }
 
 function requireRuntime(options: TaskCommandOptions): TaskWorkflowRuntimePort {
@@ -937,12 +1173,39 @@ function presentWorkStatus(status: WorkItemStatus): string {
   return status;
 }
 
+function parseTaskPriority(value: string): TaskPriority {
+  if (["low", "medium", "high", "urgent"].includes(value)) return value as TaskPriority;
+  throw usageError(`Invalid Task priority: ${value}.`);
+}
+
+function parseTaskTags(value: string): string[] {
+  const tags = [...new Set(value.split(",").map((tag) => tag.trim()).filter(Boolean))];
+  if (tags.length === 0) throw usageError("--tags must contain at least one tag.");
+  return tags;
+}
+
+function parseIsoTimestamp(value: string, label: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(value)) {
+    throw usageError(`${label} must be an ISO/RFC 3339 timestamp with a timezone.`);
+  }
+  const timestamp = new Date(value);
+  if (!Number.isFinite(timestamp.getTime())) {
+    throw usageError(`${label} must be an ISO/RFC 3339 timestamp with a timezone.`);
+  }
+  return timestamp.toISOString();
+}
+
 type ParsedTail = Readonly<{
   positionals: string[];
   options: ReadonlyMap<string, string>;
 }>;
 
-function parseTail(args: string[], valueOptions: ReadonlySet<string>, usage: string): ParsedTail {
+function parseTail(
+  args: string[],
+  valueOptions: ReadonlySet<string>,
+  usage: string,
+  flagOptions: ReadonlySet<string> = new Set()
+): ParsedTail {
   const positionals: string[] = [];
   const options = new Map<string, string>();
   for (let index = 0; index < args.length; index += 1) {
@@ -951,8 +1214,14 @@ function parseTail(args: string[], valueOptions: ReadonlySet<string>, usage: str
       positionals.push(value);
       continue;
     }
-    if (!valueOptions.has(value)) throw usageError(`Unsupported option: ${value}.`, usage);
+    if (!valueOptions.has(value) && !flagOptions.has(value)) {
+      throw usageError(`Unsupported option: ${value}.`, usage);
+    }
     if (options.has(value)) throw usageError(`Option may only be specified once: ${value}.`, usage);
+    if (flagOptions.has(value)) {
+      options.set(value, "");
+      continue;
+    }
     const optionValue = args[index + 1];
     if (optionValue === undefined || optionValue.startsWith("--")) {
       throw usageError(`${value} is required.`, usage);

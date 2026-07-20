@@ -1,3 +1,4 @@
+import { reconciliationIntervalMilliseconds } from "../config/taskmuxConfig.js";
 import type { ControllerDispatcher } from "../core/controllerServer.js";
 import { ExecutorRegistry } from "../executor/executorRegistry.js";
 import { FileRoleLaunchPlanner } from "../executor/fileRoleLaunchPlanner.js";
@@ -56,7 +57,8 @@ export async function startFileTaskControllerRuntime(
     ?? new FileTaskWorkspacePreparer(home, store);
   const dispatcher = createSessionNotifyDispatcher(schedulerStore, options.dispatcher);
   const running = await startFileTaskController(home, schedulerStore, delivery, dispatcher, {
-    intervalMs: options.intervalMs,
+    intervalMs: options.intervalMs
+      ?? reconciliationIntervalMilliseconds(store.getConfig().reconciliationIntervalSeconds),
     now: options.now,
     onError: options.onError,
     workspacePreparer

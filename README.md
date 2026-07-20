@@ -50,11 +50,13 @@ taskmux repository add app /absolute/path/to/app --base main
 taskmux repository list
 
 taskmux task create "Ship CSV export" --repository <repository-id> --base main
+taskmux task update <task-id> --priority high --tags release,csv --due-at 2026-08-01T00:00:00Z
+taskmux task update <task-id> --clear-priority --clear-tags --clear-due-at
 taskmux task show <task-id>
 taskmux task activate <task-id>
 ```
 
-Activation queues the first durable Leader wake. For a repository-backed Task, the Controller first creates `<TASKMUX_HOME>/worktrees/<task-id>` and records it as the Task and Role workspace, then starts the Leader.
+Activation queues the first durable Leader wake. For a repository-backed Task, the Controller first creates one worktree per Role at `<TASKMUX_HOME>/worktrees/<task-id>/<role-name>` on `taskmux/<task-id>/<role-name>`, then starts the Leader. Roles added later receive their own worktree before delivery.
 
 Submit information through Operator:
 
@@ -92,6 +94,16 @@ taskmux task message list <task-id>
 taskmux task run list <work-item-id>
 ```
 
+When the requested outcome is finished, complete the Task to stop automatic Leader wakes without deleting its sessions or Role worktrees:
+
+```sh
+taskmux task complete <task-id> --summary "CSV export shipped and verified"
+taskmux task reopen <task-id>
+```
+
+Completed Tasks reject messages, dispatch, enter, retry, and late yields until explicitly reopened. Archive remains terminal and performs tmux/worktree cleanup.
+Task lifecycle completion/selection only suggests valid source states: Draft for activate, active for complete, and completed for reopen.
+
 ## Sessions and tmux
 
 TaskMux never proxies an interactive Agent terminal. Before `operator enter`, `role enter`, or `task enter` attaches, TaskMux closes readline, leaves raw mode, pauses its stdin, and synchronously hands the terminal to tmux. As a result, native Codex features such as `/model`, slash-command suggestions, full-screen rendering, and key handling remain available.
@@ -118,7 +130,7 @@ taskmux controller restart
 
 `controller restart` replaces the Controller process and its scheduler/socket services with the currently installed TaskMux version. It does not stop or restart managed tmux/Agent sessions.
 
-Its one-second pass performs only the retained runtime loop:
+Its full reconciliation pass runs every 30 seconds by default; durable state changes still request an immediate pass. The retained loop is:
 
 1. prepare active repository workspaces;
 2. stop archived Task tmux sessions and clean only clean worktrees;
@@ -139,7 +151,7 @@ taskmux task run retry <failed-run-id>
 
 `jobs` is not a restored generic queue: it presents durable pending Leader wakes and Leader recovery failures only.
 
-Archiving is terminal. It fences new work, fails active Runs, stops the Task's tmux session, and removes a clean managed worktree. A dirty worktree is preserved for deliberate cleanup.
+Completion is the reversible execution fence. Archiving is terminal: it fails active Runs, stops the Task's tmux session, and removes each clean Role worktree. Dirty Role worktrees are preserved for deliberate cleanup.
 
 ## Management commands
 

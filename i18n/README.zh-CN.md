@@ -48,11 +48,13 @@ taskmux repository add app /absolute/path/to/app --base main
 taskmux repository list
 
 taskmux task create "交付 CSV 导出" --repository <repository-id> --base main
+taskmux task update <task-id> --priority high --tags release,csv --due-at 2026-08-01T00:00:00Z
+taskmux task update <task-id> --clear-priority --clear-tags --clear-due-at
 taskmux task show <task-id>
 taskmux task activate <task-id>
 ```
 
-新 Task 是 Draft，并已创建 Leader。激活时会排入第一次持久 Leader wake。带 Repository 的 Task 会先创建 `<TASKMUX_HOME>/worktrees/<task-id>`，原子记录为 Task 和所有 Role 的 workspace，然后才启动 Leader。
+新 Task 是 Draft，并已创建 Leader。激活时会排入第一次持久 Leader wake。带 Repository 的 Task 会先为每个 Role 创建 `<TASKMUX_HOME>/worktrees/<task-id>/<role-name>`，对应分支为 `taskmux/<task-id>/<role-name>`，然后才启动 Leader；后续新增 Role 也会在执行前获得独立 worktree。
 
 通过 Operator 提交消息：
 
@@ -88,6 +90,16 @@ taskmux task message list <task-id>
 taskmux task run list <work-item-id>
 ```
 
+完成目标后，可将 Task 标记为 completed，从而停止自动唤醒，同时保留 session 和各 Role worktree：
+
+```sh
+taskmux task complete <task-id> --summary "CSV 导出已交付并验证"
+taskmux task reopen <task-id>
+```
+
+completed Task 在显式 reopen 前会拒绝消息、派发、进入 session、重试和迟到的 yield。archive 仍是终态，并负责 tmux/worktree 清理。
+Task 生命周期的交互选择只展示有效来源状态：activate 只展示 Draft，complete 只展示 active，reopen 只展示 completed。
+
 ## Session 与 tmux
 
 TaskMux 不代理交互式 Agent 终端。执行 `operator enter`、`role enter` 或 `task enter` 前，TaskMux 会关闭 readline、退出 raw mode、暂停自身 stdin，再同步把终端交给 tmux。因此 Codex 原生的 `/model`、斜杠命令提示、全屏渲染和按键处理都可正常工作。
@@ -114,7 +126,7 @@ taskmux controller restart
 
 `controller restart` 会用当前安装的 TaskMux 版本替换 Controller 进程及其调度循环、socket 服务，不会停止或重启已受管的 tmux/Agent 会话。
 
-每秒只执行保留的最小闭环：
+完整 reconciliation 默认每 30 秒执行一次；持久状态变化仍会立即请求一次扫描。保留的闭环为：
 
 1. 准备 active Task 的 repository workspace；
 2. 停止 archived Task 的 tmux，并只清理干净 worktree；
@@ -135,7 +147,7 @@ taskmux task run retry <failed-run-id>
 
 `jobs` 不是旧版通用队列，只展示持久 Leader wake 和 Leader recovery failure。
 
-归档是终态：禁止新工作、失败活动 Run、停止 Task 的 tmux session，并移除干净 worktree；脏 worktree 会保留，供人工确认处理。
+completion 是可逆的执行屏障。归档是终态：失败活动 Run、停止 Task 的 tmux session，并逐个移除干净的 Role worktree；脏 Role worktree 会保留，供人工确认处理。
 
 ## 管理命令
 

@@ -34,41 +34,47 @@ TASKMUX_HOME/
     controller.sock
   worktrees/
     <task-id>/
+      <role-name>/
 ```
 
-`schema.json` records storage version 5. `state.json` is one aggregate containing:
+`schema.json` records storage-layout version 5, aggregate-schema version 2, and a reserved `activeGeneration` pointer. `state.json` is one aggregate containing:
 
 - configuration and completion installation records;
 - configured Agents;
 - Repositories;
 - global Roles and their per-Agent session sets;
-- Tasks, Task Roles, messages, WorkItems, AgentRuns, and events;
+- Tasks, Task Roles, RoleWorkspaces, messages, WorkItems, AgentRuns, append-only events, Task Briefs, Decisions, and Milestones;
 - pending Leader wakes, Leader failures, and Operator notifications.
 
 Every persisted domain record has its own schema version and is validated when read. Unsupported aggregate or record shapes fail explicitly; TaskMux does not silently repair them.
 
 Writes acquire a cross-process lock, reread the latest aggregate, apply the mutation once, and commit one replacement. The durable write path creates a mode-`0600` temporary file, flushes it, renames it over `state.json`, and flushes the containing directory. Compound workflow operations use the same transaction callback and produce one aggregate write.
 
-The migration registry is intentionally empty in this release. Its boundary exists so later storage versions can register explicit sequential migrations; version 5 accepts only version 5 data.
+The layout and aggregate migration registries are intentionally empty in this release. Their boundaries validate complete sequential plans before applying any mutation. A reserved generation pointer allows a later layout to write and validate a new immutable generation before atomically switching the manifest; generation storage is not implemented in version 5.
 
 ## Domain model and invariants
 
-- A Task is `draft`, `active`, or `archived`. Archive is terminal.
+- A Task is `draft`, `active`, `completed`, or `archived`. Completion is a reversible execution fence; archive is terminal.
 - Creating a Task also creates its Leader Role.
-- Repository-backed active Tasks use one deterministic Task worktree; Task.cwd and every Task Role workspace agree.
+- Repository-backed active Tasks use one deterministic worktree per Role at `<TASKMUX_HOME>/worktrees/<task-id>/<role-name>`.
+- Common Role names map directly to `taskmux/<task-id>/<role-name>` branches; names that are not valid Git ref segments use a deterministic encoded branch segment without changing their worktree directory.
+- `Task.cwd` marks the Task worktree root; each Task Role workspace agrees with its persisted RoleWorkspace path.
 - A Role may bind multiple Agents but has one active Agent.
 - Each `(Role, Agent)` binding has its own native session record. Switching preserves dormant sessions.
 - A Role has at most one active AgentRun.
 - A WorkItem has at most one active Run.
 - A Worker yield atomically completes its Run/WorkItem, appends its summary, and merges a Leader wake.
 - A Leader yield never creates a self-wake, but it releases any already-pending wake for the next Controller pass.
+- Completing a Task requires no active Worker Run or running WorkItem, clears pending wakes and recovery failures, and rejects later execution until an explicit reopen.
+- A Leader control Run may atomically yield itself while completing the Task. Reopen returns the Task to active and queues one `task-reopened` wake.
+- Completed Tasks retain their Role sessions and worktrees; archived Tasks stop tmux and clean only clean worktrees.
 - Archived Tasks reject new messages, Roles, work, dispatch, enter, and recovery actions.
 
 FileTaskStore validates cross-record references after every transaction, including Repository ownership, Task/Role ownership, active-run pointers, and session-set ownership.
 
 ## Controller pass
 
-The Controller runs a non-overlapping pass every second; concurrent scan requests coalesce into one follow-up pass.
+The Controller runs a non-overlapping full reconciliation pass every 30 seconds by default. `reconciliationIntervalSeconds` may be set from 5 to 300 in TaskMux config. Durable state changes request an immediate pass through the Controller socket, and concurrent scan requests coalesce into one follow-up pass.
 
 `controller restart` stops only this process and waits for its private socket/discovery state to disappear before starting the currently installed runtime. tmux sessions are external durable runtime state and are never stopped by Controller restart.
 
@@ -76,22 +82,22 @@ The Controller runs a non-overlapping pass every second; concurrent scan request
 prepare active workspaces
   -> stop archived Task tmux sessions
   -> clean archived workspaces when clean
-  -> deliver active Worker Runs
+  -> deliver queued Role Runs
   -> reconcile exited active Role Runs
   -> dispatch pending Leader wakes
 ```
 
-Repository preparation precedes delivery. A Repository path and base ref are validated by Git. The worktree path and branch derive from the Task ID. After creation, Task.cwd and all Task Role workspaces update atomically. Existing worktrees must resolve to the expected path and Git common directory.
+Repository preparation precedes delivery. A Repository path and base ref are validated by Git. Each Role derives the path `<TASKMUX_HOME>/worktrees/<task-id>/<role-name>` and branch `taskmux/<task-id>/<role-name>`. The minimal RoleWorkspace record retains its Repository, path, branch, base ref, and starting commit; it is not a ref ledger. Existing worktrees must resolve to the expected path, branch, and Git common directory.
 
-Archive stops tmux before worktree cleanup. A clean managed worktree is removed idempotently. A dirty worktree is preserved; it is never force-removed.
+Archive stops tmux before worktree cleanup. Each clean Role worktree is removed idempotently and recorded independently. A dirty Role worktree and its RoleWorkspace record are preserved; they are never force-removed. A Git failure is isolated to its Task so other Task reconciliation continues.
 
 ## Durable wake and Run behavior
 
-Task activation, an Operator/user message, Worker yield, and exited Role failure can merge a `PendingWakeup`. Reasons are de-duplicated while request count and first/last timestamps remain durable.
+Task activation/reopen, an Operator/user message, Worker yield, and exited Role failure can merge a `PendingWakeup`. Reasons are de-duplicated while request count and first/last timestamps remain durable. Completed Tasks never dispatch a pending wake.
 
-If the Leader is busy, the Controller does not touch tmux and leaves the wake pending. When idle, it creates a real Leader AgentRun, starts or resumes the fixed Role session, waits for readiness, sends the wake input, persists the Run/session state, and only then clears the wake.
+If the Leader is busy, the Controller does not touch tmux and leaves the wake pending. When idle, it prepares the fixed Role session, then atomically claims the unchanged wake as a durable, not-yet-delivered Leader AgentRun before any tmux input. The claim clears that wake; later requests form a new pending wake. A confirmed receipt marks the Run delivered. A send failure fails the claim and restores its wake, while a Controller crash can resume the same Run with the same `agent-run:<run-id>` receipt.
 
-A dispatched Worker WorkItem creates a durable AgentRun before any terminal effect. The Controller is the only automatic delivery path. Delivery uses `agent-run:<run-id>` as its receipt and persists successful session/Role state after tmux confirms the send.
+A dispatched Worker WorkItem creates a durable AgentRun before any terminal effect. The Controller is the only automatic delivery path. Delivery uses `agent-run:<run-id>` as its receipt and persists `deliveredAt` plus successful session/Role state after tmux confirms the send. Completion and yield reject a Run whose delivery is still pending.
 
 If an active Role's tmux window disappears before yield, the Controller fails the AgentRun and running WorkItem, clears the active-run pointer, stops its session record, and merges a failure wake for the Leader. A failed Leader recovery records `LeaderFailure` plus `OperatorNotification`; `jobs retry leader-recovery:<task-id>` clears those records and queues a recovery wake.
 

@@ -30,9 +30,9 @@ export async function processActiveRoleRunDeliveries(
     if (task.status !== "active") continue;
     for (const role of store.listRoles(task.id)) {
       const run = store.getActiveAgentRun(task.id, role.name);
-      // Leader wakeups create and deliver their run atomically in the wakeup
-      // processor. Only Work AgentRuns are queued before Controller delivery.
-      if (run === null || run.workItemId === undefined) continue;
+      // A crash after a Leader wake is durably claimed but before tmux input
+      // is recoverable through the same receipt-backed delivery path.
+      if (run === null || run.deliveredAt !== undefined) continue;
       if (task.repositoryId !== undefined && task.cwd === undefined) {
         results.push({
           taskId: task.id,

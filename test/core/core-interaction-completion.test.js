@@ -52,7 +52,10 @@ const PUBLIC_PATHS = [
   "role session replace",
   "task",
   "task create",
+  "task update",
   "task activate",
+  "task complete",
+  "task reopen",
   "task list",
   "task show",
   "task archive",
@@ -174,6 +177,9 @@ test("interaction policies cover missing task, work, run, and job identifiers", 
   const expected = [
     [["task", "show"], 2, "tasks"],
     [["task", "activate"], 2, "tasks"],
+    [["task", "update"], 2, "tasks"],
+    [["task", "complete"], 2, "tasks"],
+    [["task", "reopen"], 2, "tasks"],
     [["task", "archive"], 2, "tasks"],
     [["task", "reconcile"], 2, "tasks"],
     [["task", "work", "dispatch"], 3, "work-items"],
@@ -347,6 +353,28 @@ test("Task Role detail selection resolves the task before its Role and confirms 
     kind: "cancelled",
     args: ["task", "role", "remove", "task-alpha", "Leader"]
   });
+});
+
+test("Task lifecycle selectors filter candidates by valid source status", async () => {
+  const ports = createPorts();
+  ports.call = async (method) => method === "task.list" ? [
+    { id: "draft", title: "Draft", status: "draft" },
+    { id: "active", title: "Active", status: "active" },
+    { id: "completed", title: "Completed", status: "completed" },
+    { id: "archived", title: "Archived", status: "archived" }
+  ] : [];
+
+  for (const [command, expected] of [
+    ["activate", ["draft"]],
+    ["complete", ["active"]],
+    ["reopen", ["completed"]]
+  ]) {
+    const policy = findInteractionPolicy(findCommandNode(["task", command]));
+    assert.deepEqual(
+      values(await getSelectionCandidates(policy.selectors[0], ports, ["task", command])),
+      expected
+    );
+  }
 });
 
 test("role ordering keeps Operator then Leader before task-specific roles", () => {

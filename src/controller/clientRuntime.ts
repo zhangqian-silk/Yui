@@ -199,7 +199,7 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     const task = this.store.getTask(taskId);
     if (
       task?.repositoryId !== undefined
-      && task.cwd === undefined
+      && task.status === "active"
       && this.workspacePreparer !== undefined
     ) {
       await this.workspacePreparer.prepareTaskWorkspace(taskId);

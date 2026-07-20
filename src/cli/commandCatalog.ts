@@ -200,7 +200,24 @@ const taskChildren: readonly NodeInput[] = [
     usage: "taskmux task create <title> [--repository <id>] [--base <ref>]",
     options: ["--repository", "--base"]
   },
+  {
+    name: "update",
+    summary: "Update Task metadata.",
+    usage: "taskmux task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at]",
+    options: [
+      "--title", "--description", "--priority", "--tags", "--due-at",
+      "--clear-description", "--clear-priority", "--clear-tags", "--clear-due-at"
+    ],
+    optionValues: { "--priority": ["low", "medium", "high", "urgent"] }
+  },
   { name: "activate", summary: "Activate a Draft Task.", usage: "taskmux task activate <id>" },
+  {
+    name: "complete",
+    summary: "Complete an active Task and stop automatic wakeups.",
+    usage: "taskmux task complete <id> --summary <text>",
+    options: ["--summary"]
+  },
+  { name: "reopen", summary: "Reopen a completed Task.", usage: "taskmux task reopen <id>" },
   { name: "list", summary: "List Tasks." },
   { name: "show", summary: "Show a Task.", usage: "taskmux task show <id>" },
   { name: "archive", summary: "Archive a Task.", usage: "taskmux task archive <id>" },
@@ -276,7 +293,7 @@ const taskChildren: readonly NodeInput[] = [
     sections: [{ id: "manage", title: "Commands", entries: ["list", "retry", "yield"] }],
     children: [
       { name: "list", summary: "List Runs for a work item.", usage: "taskmux task run list <work>" },
-      { name: "retry", summary: "Retry a failed or expired Run.", usage: "taskmux task run retry <run>" },
+      { name: "retry", summary: "Retry a failed Run.", usage: "taskmux task run retry <run>" },
       {
         name: "yield",
         summary: "Complete an active Run and wake the Leader.",
@@ -389,7 +406,7 @@ export const ROOT_COMMAND = buildNode({
       name: "task",
       summary: "Manage Tasks, Roles, work items, and Runs.",
       sections: [
-        { id: "lifecycle", title: "Lifecycle", entries: ["create", "activate", "list", "show", "archive", "reconcile"] },
+        { id: "lifecycle", title: "Lifecycle", entries: ["create", "update", "activate", "complete", "reopen", "list", "show", "archive", "reconcile"] },
         { id: "collaboration", title: "Collaboration", entries: ["message", "role", "work", "run", "enter"] }
       ],
       children: taskChildren

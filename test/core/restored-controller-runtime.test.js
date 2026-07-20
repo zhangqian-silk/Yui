@@ -9,9 +9,18 @@ import {
   runControllerSchedulerPass,
   startFileTaskController
 } from "../../dist/controller/controller.js";
+import {
+  DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
+  MAX_RECONCILIATION_INTERVAL_SECONDS,
+  MIN_RECONCILIATION_INTERVAL_SECONDS,
+  reconciliationIntervalMilliseconds
+} from "../../dist/config/taskmuxConfig.js";
 import { callController } from "../../dist/core/controllerClient.js";
 import { ControllerClientError } from "../../dist/core/controllerClient.js";
-import { restartFileTaskController } from "../../dist/controller/clientRuntime.js";
+import {
+  FileTaskWorkflowRuntime,
+  restartFileTaskController
+} from "../../dist/controller/clientRuntime.js";
 import { startFileTaskControllerRuntime } from "../../dist/controller/runtime.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 
@@ -205,6 +214,80 @@ test("controller pump coalesces overlap into one non-overlapping follow-up pass"
   controller.stop();
 });
 
+test("controller reconciliation defaults to 30 seconds and accepts the configured range", () => {
+  assert.equal(DEFAULT_RECONCILIATION_INTERVAL_SECONDS, 30);
+  assert.equal(MIN_RECONCILIATION_INTERVAL_SECONDS, 5);
+  assert.equal(MAX_RECONCILIATION_INTERVAL_SECONDS, 300);
+  assert.equal(reconciliationIntervalMilliseconds(), 30_000);
+  assert.equal(reconciliationIntervalMilliseconds(5), 5_000);
+  assert.equal(reconciliationIntervalMilliseconds(300), 300_000);
+  for (const value of [4, 301, 30.5, "30"]) {
+    assert.throws(
+      () => reconciliationIntervalMilliseconds(value),
+      /reconciliationIntervalSeconds must be an integer from 5 to 300/
+    );
+  }
+});
+
+test("state changes still request an immediate Controller scan", async () => {
+  const methods = [];
+  let scanCompleted;
+  const scanned = new Promise((resolve) => { scanCompleted = resolve; });
+  const runtime = new FileTaskWorkflowRuntime(
+    "/tmp/taskmux-state-change-scan",
+    { getTask: () => null },
+    {},
+    {},
+    {},
+    undefined,
+    {
+      call: async (_home, method) => {
+        methods.push(method);
+        if (method === "controller.status") return { running: true };
+        assert.equal(method, "scheduler.scan");
+        scanCompleted();
+        return {};
+      }
+    }
+  );
+
+  runtime.notifyStateChanged("task-1");
+  await scanned;
+
+  assert.deepEqual(methods, ["controller.status", "scheduler.scan"]);
+});
+
+test("foreground runtime prepares active Role worktrees but leaves archive cleanup to Controller order", async () => {
+  for (const [status, expected] of [
+    ["active", ["prepare", "controller.status", "scheduler.scan"]],
+    ["archived", ["controller.status", "scheduler.scan"]]
+  ]) {
+    const events = [];
+    let scanCompleted;
+    const scanned = new Promise((resolve) => { scanCompleted = resolve; });
+    const runtime = new FileTaskWorkflowRuntime(
+      "/tmp/taskmux-workspace-order",
+      { getTask: () => ({ id: "task-1", status, repositoryId: "repository-1" }) },
+      {},
+      {},
+      {},
+      { async prepareTaskWorkspace() { events.push("prepare"); return { taskId: "task-1", status: "ready" }; } },
+      {
+        call: async (_home, method) => {
+          events.push(method);
+          if (method === "controller.status") return { running: true };
+          scanCompleted();
+          return {};
+        }
+      }
+    );
+
+    runtime.notifyStateChanged("task-1");
+    await scanned;
+    assert.deepEqual(events, expected);
+  }
+});
+
 test("background FileTask controller exposes status, scan and stop on one private home socket", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "taskmux-file-controller-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
@@ -233,6 +316,21 @@ test("production FileTask controller composition starts without compact SQLite r
 
   assert.equal((await callController(home, "controller.status", {})).running, true);
   assert.equal(controller.store.rootDirectory(), home);
+  assert.equal(controller.runtime.reconciliationIntervalMs, 60_000);
+  await controller.close();
+});
+
+test("production Controller reads reconciliationIntervalSeconds from TaskMux config", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "taskmux-file-runtime-config-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const { FileTaskStore } = await import("../../dist/storage/taskStore.js");
+  const store = new FileTaskStore(home);
+  store.saveConfig({ schemaVersion: 1, reconciliationIntervalSeconds: 45 });
+
+  const controller = await startFileTaskControllerRuntime(home, { store });
+
+  assert.equal(controller.runtime.reconciliationIntervalMs, 45_000);
   await controller.close();
 });
 

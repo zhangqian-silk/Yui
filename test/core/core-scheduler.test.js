@@ -63,14 +63,14 @@ test("an idle Leader starts a real wakeup run, waits for readiness, sends once, 
   assert.deepEqual(result, [{ taskId: "task-1", status: "dispatched" }]);
   assert.deepEqual(delivery.calls.map((call) => call.type), ["prepare", "ready", "sendOnce"]);
   assert.equal(delivery.calls[0].input.mode, "new");
-  assert.equal(delivery.calls[2].input.receiptId.startsWith("leader-wakeup:"), true);
+  assert.equal(delivery.calls[2].input.receiptId.startsWith("agent-run:"), true);
   assert.equal(store.savedDispatches.length, 1);
   assert.equal(store.savedDispatches[0].run.mode, "new");
   assert.equal(store.savedDispatches[0].run.status, "active");
   assert.equal(store.savedDispatches[0].run.roleName, "leader");
   assert.match(store.savedDispatches[0].run.input, /role-result/);
   assert.equal(store.pending.has("task-1"), false);
-  assert.deepEqual(store.operations.slice(-2), ["save-dispatch", "clear-wakeup"]);
+  assert.deepEqual(store.operations.slice(-2), ["save-dispatch", "save-delivery"]);
 });
 
 test("a fresh runtime-discovered Leader may register its native session after dispatch", async () => {
@@ -222,6 +222,15 @@ function fakeStore(options = {}) {
       store.savedDispatches.push(input);
       store.activeRuns.set(key(input.task.id, input.role.name), input.run);
       store.sessions.set(key(input.task.id, input.role.name), input.session);
+      store.pending.delete(input.task.id);
+      return "claimed";
+    },
+    saveRoleRunDelivery: (input) => {
+      store.operations.push("save-delivery");
+      store.activeRuns.set(key(input.task.id, input.role.name), {
+        ...input.run,
+        deliveredAt: input.now.toISOString()
+      });
     },
     saveLeaderDispatchFailure: (input) => store.savedFailures.push(input),
     saveExitedRoleRun: (input) => {

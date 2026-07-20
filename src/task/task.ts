@@ -1,5 +1,6 @@
 export type TaskPriority = "low" | "medium" | "high" | "urgent";
-export type TaskStatus = "draft" | "active" | "archived";
+export type TaskStatus = "draft" | "active" | "completed" | "archived";
+export type TaskCompletedBy = "user" | "operator" | "leader";
 
 export type TaskMetadata = {
   description?: string;
@@ -10,6 +11,17 @@ export type TaskMetadata = {
   baseRef?: string;
   cwd?: string;
 };
+
+export type TaskMetadataUpdate = Partial<{
+  title: string;
+  description: string | null;
+  priority: TaskPriority | null;
+  tags: string[] | null;
+  dueAt: string | null;
+  repositoryId: string;
+  baseRef: string;
+  cwd: string;
+}>;
 
 export type Task = {
   schemaVersion: 1;
@@ -23,6 +35,9 @@ export type Task = {
   baseRef?: string;
   cwd?: string;
   status: TaskStatus;
+  completedAt?: string;
+  completedBy?: TaskCompletedBy;
+  completionSummary?: string;
   archivedAt?: string;
   archivedBy?: "user" | "operator" | "leader";
   archiveReason?: string;
@@ -46,7 +61,43 @@ export function createTask(id: string, title: string, now: Date, metadata: TaskM
 
 export function activateTask(task: Task, now: Date): Task {
   if (task.status === "archived") throw new Error(`Cannot activate archived Task: ${task.id}.`);
+  if (task.status === "completed") throw new Error(`Cannot activate completed Task ${task.id}; reopen it instead.`);
+  if (task.status === "active") return task;
   return { ...task, status: "active", updatedAt: now.toISOString() };
+}
+
+export function completeTask(
+  task: Task,
+  now: Date,
+  completion: { by: TaskCompletedBy; summary: string }
+): Task {
+  if (task.status === "completed") return task;
+  if (task.status !== "active") {
+    throw new Error(`Only an active Task can be completed: ${task.id}.`);
+  }
+  const timestamp = now.toISOString();
+  return {
+    ...task,
+    status: "completed",
+    completedAt: timestamp,
+    completedBy: completion.by,
+    completionSummary: requireText(completion.summary, "Task completion summary"),
+    updatedAt: timestamp
+  };
+}
+
+export function reopenTask(task: Task, now: Date): Task {
+  if (task.status === "archived") throw new Error(`Cannot reopen archived Task: ${task.id}.`);
+  if (task.status !== "completed") {
+    throw new Error(`Only a completed Task can be reopened: ${task.id}.`);
+  }
+  const {
+    completedAt: _completedAt,
+    completedBy: _completedBy,
+    completionSummary: _completionSummary,
+    ...reopened
+  } = task;
+  return { ...reopened, status: "active", updatedAt: now.toISOString() };
 }
 
 export function archiveTask(
@@ -82,25 +133,34 @@ export function updateTaskArchived(
 
 export function updateTaskMetadata(
   task: Task,
-  metadata: Partial<TaskMetadata & { title: string }>,
+  metadata: TaskMetadataUpdate,
   now: Date
 ): Task {
-  const updated: Task = {
-    ...task,
-    ...(metadata.title === undefined ? {} : { title: requireText(metadata.title, "Task title") }),
-    ...(metadata.description === undefined ? {} : { description: metadata.description }),
-    ...(metadata.priority === undefined ? {} : { priority: metadata.priority }),
-    ...(metadata.tags === undefined ? {} : { tags: [...metadata.tags] }),
-    ...(metadata.dueAt === undefined ? {} : { dueAt: metadata.dueAt }),
-    ...(metadata.repositoryId === undefined
-      ? {}
-      : { repositoryId: requireSafeIdentity(metadata.repositoryId, "Repository id") }),
-    ...(metadata.baseRef === undefined ? {} : { baseRef: requireText(metadata.baseRef, "Task base ref") }),
-    ...(metadata.cwd === undefined ? {} : { cwd: requireText(metadata.cwd, "Task workspace") }),
-    updatedAt: now.toISOString()
-  };
+  const updated: Task = { ...task, updatedAt: now.toISOString() };
+  if (metadata.title !== undefined) updated.title = requireText(metadata.title, "Task title");
+  applyOptional(updated, "description", metadata.description);
+  applyOptional(updated, "priority", metadata.priority);
+  applyOptional(updated, "tags", metadata.tags === undefined || metadata.tags === null
+    ? metadata.tags
+    : [...metadata.tags]);
+  applyOptional(updated, "dueAt", metadata.dueAt);
+  if (metadata.repositoryId !== undefined) {
+    updated.repositoryId = requireSafeIdentity(metadata.repositoryId, "Repository id");
+  }
+  if (metadata.baseRef !== undefined) updated.baseRef = requireText(metadata.baseRef, "Task base ref");
+  if (metadata.cwd !== undefined) updated.cwd = requireText(metadata.cwd, "Task workspace");
   validateRepositorySelection(updated);
   return updated;
+}
+
+function applyOptional<K extends "description" | "priority" | "tags" | "dueAt">(
+  task: Task,
+  key: K,
+  value: Task[K] | null | undefined
+): void {
+  if (value === undefined) return;
+  if (value === null) delete task[key];
+  else task[key] = value;
 }
 
 export function updateTaskWorkspace(task: Task, cwd: string, now: Date): Task {
@@ -109,6 +169,71 @@ export function updateTaskWorkspace(task: Task, cwd: string, now: Date): Task {
 
 export function isTaskArchived(task: Task): boolean {
   return task.status === "archived";
+}
+
+export function validateTask(task: Task): Task {
+  if (task.schemaVersion !== 1) throw new Error("Task must use schemaVersion 1.");
+  requireSafeIdentity(task.id, "Task id");
+  requireText(task.title, "Task title");
+  if (!(["draft", "active", "completed", "archived"] as const).includes(task.status)) {
+    throw new Error(`Task status is invalid: ${String(task.status)}.`);
+  }
+  requireTimestamp(task.createdAt, "Task createdAt");
+  requireTimestamp(task.updatedAt, "Task updatedAt");
+  if (Date.parse(task.updatedAt) < Date.parse(task.createdAt)) {
+    throw new Error("Task updatedAt cannot precede createdAt.");
+  }
+  if (task.priority !== undefined
+    && !(["low", "medium", "high", "urgent"] as const).includes(task.priority)) {
+    throw new Error(`Task priority is invalid: ${String(task.priority)}.`);
+  }
+  if (task.description !== undefined) requireText(task.description, "Task description");
+  if (task.tags !== undefined) {
+    if (!Array.isArray(task.tags)) throw new Error("Task tags are invalid.");
+    for (const tag of task.tags) requireText(tag, "Task tag");
+  }
+  if (task.dueAt !== undefined) requireTimestamp(task.dueAt, "Task dueAt");
+  if (task.repositoryId !== undefined) requireSafeIdentity(task.repositoryId, "Repository id");
+  if (task.baseRef !== undefined) requireText(task.baseRef, "Task base ref");
+  if (task.cwd !== undefined) requireText(task.cwd, "Task workspace");
+  validateRepositorySelection(task);
+
+  const completionFields = [task.completedAt, task.completedBy, task.completionSummary];
+  const hasAnyCompletion = completionFields.some((value) => value !== undefined);
+  const hasAllCompletion = completionFields.every((value) => value !== undefined);
+  if (hasAnyCompletion && !hasAllCompletion) {
+    throw new Error("Task completion metadata must include completedAt, completedBy, and completionSummary.");
+  }
+  if (hasAllCompletion) {
+    requireTimestamp(task.completedAt!, "Task completedAt");
+    if (!(["user", "operator", "leader"] as const).includes(task.completedBy!)) {
+      throw new Error(`Task completedBy is invalid: ${String(task.completedBy)}.`);
+    }
+    requireText(task.completionSummary!, "Task completion summary");
+  }
+  if (task.status === "completed" && !hasAllCompletion) {
+    throw new Error("A completed Task requires completedAt, completedBy, and completionSummary.");
+  }
+  if ((task.status === "draft" || task.status === "active") && hasAnyCompletion) {
+    throw new Error(`Task completion metadata is invalid for ${task.status} status.`);
+  }
+
+  const hasAnyArchive = [task.archivedAt, task.archivedBy, task.archiveReason, task.archiveSummary]
+    .some((value) => value !== undefined);
+  if (task.status === "archived") {
+    if (task.archivedAt === undefined || task.archivedBy === undefined) {
+      throw new Error("An archived Task requires archivedAt and archivedBy.");
+    }
+    requireTimestamp(task.archivedAt, "Task archivedAt");
+    if (!(["user", "operator", "leader"] as const).includes(task.archivedBy)) {
+      throw new Error(`Task archivedBy is invalid: ${String(task.archivedBy)}.`);
+    }
+    if (task.archiveReason !== undefined) requireText(task.archiveReason, "Task archive reason");
+    if (task.archiveSummary !== undefined) requireText(task.archiveSummary, "Task archive summary");
+  } else if (hasAnyArchive) {
+    throw new Error(`Task archive metadata is invalid for ${task.status} status.`);
+  }
+  return task;
 }
 
 function cloneMetadata(metadata: TaskMetadata): TaskMetadata {
@@ -147,4 +272,10 @@ function requireText(value: string, label: string): string {
   const normalized = value.trim();
   if (normalized.length === 0) throw new Error(`${label} is required.`);
   return normalized;
+}
+
+function requireTimestamp(value: string, label: string): void {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
+    throw new Error(`${label} is invalid.`);
+  }
 }

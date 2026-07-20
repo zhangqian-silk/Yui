@@ -5,7 +5,7 @@ import type { AgentRun } from "../run/agentRun.js";
 
 export type SchedulerTask = Readonly<{
   id: string;
-  status: "draft" | "active" | "archived";
+  status: "draft" | "active" | "completed" | "archived";
   repositoryId?: string;
   cwd?: string;
 }>;
@@ -32,8 +32,11 @@ export type LeaderDispatchPersistence = Readonly<{
   role: SchedulerRole;
   run: SchedulerAgentRun;
   session: SchedulerRoleSession | null;
+  wakeup: PendingWakeup;
   now: Date;
 }>;
+
+export type LeaderDispatchClaimResult = "claimed" | "busy" | "unavailable" | "state-changed";
 
 export type RoleRunDeliveryPersistence = Readonly<{
   task: SchedulerTask;
@@ -58,6 +61,7 @@ export type LeaderDispatchFailurePersistence = Readonly<{
   session: SchedulerRoleSession | null;
   failure: LeaderFailure;
   notification: OperatorNotification;
+  claimed?: Readonly<{ run: SchedulerAgentRun; wakeup: PendingWakeup }>;
   now: Date;
 }>;
 
@@ -82,7 +86,7 @@ export interface SchedulerStorePort {
   getLeaderFailure(taskId: string): LeaderFailure | null;
   getOperatorNotification(taskId: string): OperatorNotification | null;
   /** Persist the AgentRun, active-run pointer, running Role and active fixed session. */
-  saveLeaderDispatch(input: LeaderDispatchPersistence): void;
+  saveLeaderDispatch(input: LeaderDispatchPersistence): LeaderDispatchClaimResult;
   /** Persist successful delivery of a Work AgentRun and its fixed session. */
   saveRoleRunDelivery(input: RoleRunDeliveryPersistence): void;
   /** Persist LeaderFailure, OperatorNotification and failed/broken runtime state. */

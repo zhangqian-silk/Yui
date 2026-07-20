@@ -11,7 +11,9 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { validateConfiguredAgent, type ConfiguredAgent } from "../agent/agent.js";
-import type { TaskComment } from "../comment/comment.js";
+import type { TaskBrief } from "../brief/taskBrief.js";
+import { reconciliationIntervalMilliseconds } from "../config/taskmuxConfig.js";
+import type { Decision } from "../decision/decision.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import {
   validateRoleSessionSet,
@@ -19,7 +21,9 @@ import {
   type RoleAgentSession,
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
-import type { AgentRun } from "../run/agentRun.js";
+import { validateTaskMessage, type TaskMessage } from "../message/message.js";
+import type { Milestone } from "../milestone/milestone.js";
+import { validateAgentRun, type AgentRun } from "../run/agentRun.js";
 import {
   validateRepository,
   type Repository
@@ -33,8 +37,12 @@ import {
 import type { LeaderFailure } from "../scheduler/leaderFailure.js";
 import type { OperatorNotification } from "../scheduler/operatorNotification.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
-import type { Task } from "../task/task.js";
+import { validateTask, type Task } from "../task/task.js";
 import type { WorkItem } from "../workItem/workItem.js";
+import {
+  validateRoleWorkspace,
+  type RoleWorkspace
+} from "../worktree/roleWorkspace.js";
 import { writeTextFileAtomically } from "./durableFile.js";
 import { requireStorageSchema } from "./storageSchema.js";
 
@@ -55,6 +63,7 @@ export type TaskmuxConfig = Readonly<{
   defaultWorkspace?: string;
   currentTaskId?: string;
   lastTaskId?: string;
+  reconciliationIntervalSeconds?: number;
   completionInstallations?: Partial<Record<CompletionShell, CompletionInstallation>>;
 }>;
 export type ConfiguredAgentPatch = Readonly<Partial<
@@ -69,12 +78,16 @@ type ActiveRunPointer = Readonly<{ schemaVersion: 1; runId: string }>;
 type StoredTask = {
   schemaVersion: 1;
   task: Task;
+  brief: TaskBrief | null;
   roles: Record<string, TaskRole>;
+  roleWorkspaces: Record<string, RoleWorkspace>;
   roleSessionSets: Record<string, TaskRoleSessionSet>;
   workItems: Record<string, WorkItem>;
   agentRuns: Record<string, AgentRun>;
   activeRuns: Record<string, ActiveRunPointer>;
-  comments: Record<string, TaskComment>;
+  messages: Record<string, TaskMessage>;
+  decisions: Record<string, Decision>;
+  milestones: Record<string, Milestone>;
   events: Record<string, TaskEvent>;
   pendingWakeup: PendingWakeup | null;
   leaderFailure: LeaderFailure | null;
@@ -122,11 +135,18 @@ export type TaskStore = {
   saveTask(task: Task): void;
   listTasks(): Task[];
   getTask(id: string): Task | null;
+  getTaskBrief(taskId: string): TaskBrief | null;
+  saveTaskBrief(taskId: string, brief: TaskBrief): void;
+  clearTaskBrief(taskId: string): void;
   saveRole(taskId: string, role: TaskRole): void;
   listRoles(taskId: string): TaskRole[];
   getRole(taskId: string, name: string): TaskRole | null;
   saveTaskRoleWithSessionSet(role: TaskRole, sessions: TaskRoleSessionSet): void;
   removeTaskRole(taskId: string, name: string): boolean;
+  saveRoleWorkspace(taskId: string, workspace: RoleWorkspace): void;
+  listRoleWorkspaces(taskId: string): RoleWorkspace[];
+  getRoleWorkspace(taskId: string, roleName: string): RoleWorkspace | null;
+  removeRoleWorkspace(taskId: string, roleName: string): boolean;
   getRoleSessionSet(taskId: string, roleName: string): TaskRoleSessionSet | null;
   getTaskRoleSessionSet(taskId: string, roleName: string): TaskRoleSessionSet | null;
   listRoleSessionSets(taskId: string): TaskRoleSessionSet[];
@@ -146,9 +166,15 @@ export type TaskStore = {
   getActiveAgentRun(taskId: string, roleName: string): AgentRun | null;
   saveActiveAgentRun(run: AgentRun): void;
   clearActiveAgentRun(taskId: string, roleName: string): void;
-  nextCommentId(taskId: string): string;
-  saveComment(taskId: string, comment: TaskComment): void;
-  listComments(taskId: string): TaskComment[];
+  nextMessageId(taskId: string): string;
+  saveMessage(taskId: string, message: TaskMessage): void;
+  listMessages(taskId: string): TaskMessage[];
+  nextDecisionId(taskId: string): string;
+  saveDecision(taskId: string, decision: Decision): void;
+  listDecisions(taskId: string): Decision[];
+  nextMilestoneId(taskId: string): string;
+  saveMilestone(taskId: string, milestone: Milestone): void;
+  listMilestones(taskId: string): Milestone[];
   nextEventId(taskId: string): string;
   saveEvent(taskId: string, event: TaskEvent): void;
   listEvents(taskId: string): TaskEvent[];
@@ -191,6 +217,7 @@ export class FileTaskStore implements TaskStore {
   getConfig(): TaskmuxConfig { return clone(this.#state().config); }
   saveConfig(config: TaskmuxConfig): void {
     const stored = versioned<TaskmuxConfig>(config, 1, "TaskMux config");
+    validateTaskmuxConfig(stored);
     this.#mutate((state) => { state.config = stored; });
   }
 
@@ -321,7 +348,7 @@ export class FileTaskStore implements TaskStore {
 
   nextTaskId(): string { return this.#nextGlobalId("task", (state) => Object.keys(state.tasks)); }
   saveTask(task: Task): void {
-    const stored = identified<Task>(task, 1, "id", task.id, "Task");
+    const stored = validateTask(identified<Task>(task, 1, "id", task.id, "Task"));
     this.#mutate((state) => {
       if (stored.repositoryId !== undefined && state.repositories[stored.repositoryId] === undefined) {
         throw new StorageRecordError(`Task Repository not found: ${stored.repositoryId}`);
@@ -333,6 +360,18 @@ export class FileTaskStore implements TaskStore {
   }
   listTasks(): Task[] { return values(this.#state().tasks, (aggregate) => aggregate.task.id).map((entry) => clone(entry.task)); }
   getTask(id: string): Task | null { return optional(this.#state().tasks[id]?.task); }
+  getTaskBrief(taskId: string): TaskBrief | null {
+    return optional(this.#state().tasks[taskId]?.brief ?? undefined);
+  }
+  saveTaskBrief(taskId: string, brief: TaskBrief): void {
+    const stored = storedTaskBrief(brief);
+    this.#requireTaskForWrite(taskId);
+    this.#mutate((state) => { state.tasks[taskId].brief = stored; });
+  }
+  clearTaskBrief(taskId: string): void {
+    this.#requireTaskForWrite(taskId);
+    this.#mutate((state) => { state.tasks[taskId].brief = null; });
+  }
   saveRole(taskId: string, role: TaskRole): void {
     const aggregate = this.#requireTaskForWrite(taskId);
     const stored = identified<TaskRole>(role, 2, "name", role.name, "Task Role");
@@ -360,10 +399,40 @@ export class FileTaskStore implements TaskStore {
   removeTaskRole(taskId: string, name: string): boolean {
     return this.transaction(() => {
       const aggregate = this.#requireTask(taskId);
+      if (aggregate.roleWorkspaces[name] !== undefined) {
+        throw new StorageRecordError(`Task Role workspace must be cleaned before removing the Role: ${taskId}/${name}`);
+      }
       const removed = this.#remove(() => aggregate.roles, name);
       this.#mutate(() => { delete aggregate.roleSessionSets[name]; delete aggregate.activeRuns[name]; });
       return removed;
     });
+  }
+  saveRoleWorkspace(taskId: string, workspace: RoleWorkspace): void {
+    const aggregate = this.#requireTaskForWrite(taskId);
+    const stored = clone(workspace);
+    validateRoleWorkspace(stored);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`RoleWorkspace belongs to another Task: ${stored.taskId}`);
+    }
+    if (aggregate.roles[stored.roleName] === undefined) {
+      throw new StorageRecordError(`Task Role not found: ${taskId}/${stored.roleName}`);
+    }
+    if (aggregate.task.repositoryId !== stored.repositoryId) {
+      throw new StorageRecordError(`RoleWorkspace Repository does not match Task: ${taskId}/${stored.roleName}`);
+    }
+    this.#mutate((state) => {
+      state.tasks[taskId].roleWorkspaces[stored.roleName] = stored;
+    });
+  }
+  listRoleWorkspaces(taskId: string): RoleWorkspace[] {
+    return values(this.#requireTask(taskId).roleWorkspaces, "roleName");
+  }
+  getRoleWorkspace(taskId: string, roleName: string): RoleWorkspace | null {
+    return optional(this.#state().tasks[taskId]?.roleWorkspaces[roleName]);
+  }
+  removeRoleWorkspace(taskId: string, roleName: string): boolean {
+    this.#requireTaskForWrite(taskId);
+    return this.#remove((state) => state.tasks[taskId].roleWorkspaces, roleName);
   }
   getRoleSessionSet(taskId: string, roleName: string): TaskRoleSessionSet | null {
     return optional(this.#state().tasks[taskId]?.roleSessionSets[roleName]);
@@ -406,6 +475,7 @@ export class FileTaskStore implements TaskStore {
   listAgentRuns(taskId: string): AgentRun[] { return values(this.#requireTask(taskId).agentRuns, "id"); }
   saveAgentRun(run: AgentRun): void {
     const stored = identified<AgentRun>(run, 1, "id", run.id, "Agent run");
+    validateAgentRun(stored);
     this.#requireTaskForWrite(stored.taskId);
     this.#mutate((state) => { state.tasks[stored.taskId].agentRuns[stored.id] = stored; });
   }
@@ -434,11 +504,69 @@ export class FileTaskStore implements TaskStore {
     this.#mutate((state) => { const task = state.tasks[taskId]; if (task !== undefined) delete task.activeRuns[roleName]; });
   }
 
-  nextCommentId(_taskId: string): string { return this.#nextGlobalId("comment", (state) => allKeys(state, "comments")); }
-  saveComment(taskId: string, comment: TaskComment): void { this.#saveTaskRecord(taskId, "comments", comment, "Comment"); }
-  listComments(taskId: string): TaskComment[] { return values(this.#requireTask(taskId).comments, "id"); }
+  nextMessageId(_taskId: string): string { return this.#nextGlobalId("message", (state) => allKeys(state, "messages")); }
+  saveMessage(taskId: string, message: TaskMessage): void {
+    validateTaskMessage(message);
+    this.#saveTaskRecord(taskId, "messages", message, "Message");
+  }
+  listMessages(taskId: string): TaskMessage[] { return values(this.#requireTask(taskId).messages, "id"); }
+  nextDecisionId(_taskId: string): string {
+    return this.#nextGlobalId("decision", (state) => allKeys(state, "decisions"));
+  }
+  saveDecision(taskId: string, decision: Decision): void {
+    const stored = storedDecision(decision);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`Decision belongs to another Task: ${stored.taskId}`);
+    }
+    this.#mutate((state) => {
+      const aggregate = requireTaskFromState(state, taskId);
+      const owner = taskRecordOwner(state, "decisions", stored.id);
+      if (owner !== null && owner !== taskId) {
+        throw new StorageRecordError(`Decision already exists in another Task: ${stored.id}`);
+      }
+      const existing = aggregate.decisions[stored.id];
+      if (existing === undefined && stored.status !== "active") {
+        throw new StorageRecordError(`Decision must start active: ${stored.id}`);
+      }
+      if (existing !== undefined && !isValidDecisionSupersession(existing, stored)) {
+        throw new StorageRecordError(`Decision cannot be overwritten: ${stored.id}`);
+      }
+      aggregate.decisions[stored.id] = stored;
+    });
+  }
+  listDecisions(taskId: string): Decision[] {
+    return values(this.#requireTask(taskId).decisions, "id");
+  }
+  nextMilestoneId(_taskId: string): string {
+    return this.#nextGlobalId("milestone", (state) => allKeys(state, "milestones"));
+  }
+  saveMilestone(taskId: string, milestone: Milestone): void {
+    const stored = storedMilestone(milestone);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`Milestone belongs to another Task: ${stored.taskId}`);
+    }
+    this.#mutate((state) => {
+      const aggregate = requireTaskFromState(state, taskId);
+      if (taskRecordOwner(state, "milestones", stored.id) !== null) {
+        throw new StorageRecordError(`Milestone already exists: ${stored.id}`);
+      }
+      aggregate.milestones[stored.id] = stored;
+    });
+  }
+  listMilestones(taskId: string): Milestone[] {
+    return values(this.#requireTask(taskId).milestones, "id");
+  }
   nextEventId(_taskId: string): string { return this.#nextGlobalId("event", (state) => allKeys(state, "events")); }
-  saveEvent(taskId: string, event: TaskEvent): void { this.#saveTaskRecord(taskId, "events", event, "Task event"); }
+  saveEvent(taskId: string, event: TaskEvent): void {
+    const stored = storedTaskEvent(event);
+    this.#mutate((state) => {
+      const aggregate = requireTaskFromState(state, taskId);
+      if (taskRecordOwner(state, "events", stored.id) !== null) {
+        throw new StorageRecordError(`Task event already exists: ${stored.id}`);
+      }
+      aggregate.events[stored.id] = stored;
+    });
+  }
   listEvents(taskId: string): TaskEvent[] { return values(this.#requireTask(taskId).events, "id"); }
 
   getPendingWakeup(taskId: string): PendingWakeup | null { return optional(this.#state().tasks[taskId]?.pendingWakeup ?? undefined); }
@@ -464,12 +592,17 @@ export class FileTaskStore implements TaskStore {
   #clearSingleton(key: string, field: "pendingWakeup" | "leaderFailure" | "operatorNotification"): void {
     this.#mutate((state) => { if (state.tasks[key] !== undefined) state.tasks[key][field] = null; });
   }
-  #saveTaskRecord<K extends "comments" | "events">(
+  #saveTaskRecord<K extends "messages">(
     taskId: string, key: K, value: StoredTask[K][string], label: string
   ): void {
     const record = versioned<{ schemaVersion: 1; id: string }>(value, 1, label);
     this.#requireTaskForWrite(taskId);
-    this.#mutate((state) => { (state.tasks[taskId][key] as Record<string, typeof value>)[record.id] = clone(value); });
+    this.#mutate((state) => {
+      if (taskRecordOwner(state, key, record.id) !== null) {
+        throw new StorageRecordError(`${label} already exists: ${record.id}`);
+      }
+      (state.tasks[taskId][key] as Record<string, typeof value>)[record.id] = clone(value);
+    });
   }
   #requireTask(taskId: string): StoredTask {
     const aggregate = this.#state().tasks[taskId];
@@ -546,7 +679,24 @@ function emptyState(): StorageState {
   return { schemaVersion: 1, revision: 0, config: { schemaVersion: 1 }, configuredAgents: {}, repositories: {}, globalRoles: {}, globalRoleSessionSets: {}, tasks: {} };
 }
 function emptyStoredTask(task: Task): StoredTask {
-  return { schemaVersion: 1, task, roles: {}, roleSessionSets: {}, workItems: {}, agentRuns: {}, activeRuns: {}, comments: {}, events: {}, pendingWakeup: null, leaderFailure: null, operatorNotification: null };
+  return {
+    schemaVersion: 1,
+    task,
+    brief: null,
+    roles: {},
+    roleWorkspaces: {},
+    roleSessionSets: {},
+    workItems: {},
+    agentRuns: {},
+    activeRuns: {},
+    messages: {},
+    decisions: {},
+    milestones: {},
+    events: {},
+    pendingWakeup: null,
+    leaderFailure: null,
+    operatorNotification: null
+  };
 }
 
 function parseState(raw: string): StorageState {
@@ -556,7 +706,8 @@ function parseState(raw: string): StorageState {
   exact(state, ["schemaVersion", "revision", "config", "configuredAgents", "repositories", "globalRoles", "globalRoleSessionSets", "tasks"], "Storage state");
   if (state.schemaVersion !== 1 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
   const result = clone(state) as unknown as StorageState;
-  versioned(result.config, 1, "TaskMux config");
+  result.config = versioned(result.config, 1, "TaskMux config");
+  validateTaskmuxConfig(result.config);
   parseMap(result.configuredAgents, (value, key) => {
     const agent = identified<ConfiguredAgent>(value, 2, "id", key, "Configured Agent");
     validateConfiguredAgent(agent);
@@ -593,32 +744,98 @@ function parseState(raw: string): StorageState {
     for (const [name, role] of Object.entries(aggregate.roles)) {
       const sessions = aggregate.roleSessionSets[name];
       if (sessions !== undefined) assertSessionsMatchRole(sessions, role);
+      const workspace = aggregate.roleWorkspaces[name];
+      if (workspace !== undefined && workspace.path !== role.workspace) {
+        throw new StorageRecordError(`Task Role workspace path is inconsistent: ${aggregate.task.id}/${name}`);
+      }
     }
     for (const name of Object.keys(aggregate.roleSessionSets)) {
       if (aggregate.roles[name] === undefined) {
         throw new StorageRecordError(`Task Role session set has no Role: ${aggregate.task.id}/${name}`);
       }
     }
+    for (const [name, workspace] of Object.entries(aggregate.roleWorkspaces)) {
+      if (aggregate.roles[name] === undefined) {
+        throw new StorageRecordError(`RoleWorkspace has no Task Role: ${aggregate.task.id}/${name}`);
+      }
+      if (aggregate.task.repositoryId !== workspace.repositoryId) {
+        throw new StorageRecordError(`RoleWorkspace Repository does not match Task: ${aggregate.task.id}/${name}`);
+      }
+    }
   }
+  assertGloballyUniqueTaskRecordIds(result, "decisions", "Decision");
+  assertGloballyUniqueTaskRecordIds(result, "milestones", "Milestone");
+  assertGloballyUniqueTaskRecordIds(result, "events", "Task event");
+  assertGloballyUniqueTaskRecordIds(result, "messages", "Message");
   return result;
 }
 function parseStoredTask(value: unknown, taskId: string): StoredTask {
   const aggregate = object(value, `Task aggregate ${taskId}`) as unknown as StoredTask;
-  exact(aggregate as unknown as Record<string, unknown>, ["schemaVersion", "task", "roles", "roleSessionSets", "workItems", "agentRuns", "activeRuns", "comments", "events", "pendingWakeup", "leaderFailure", "operatorNotification"], `Task aggregate ${taskId}`);
+  exact(aggregate as unknown as Record<string, unknown>, ["schemaVersion", "task", "brief", "roles", "roleWorkspaces", "roleSessionSets", "workItems", "agentRuns", "activeRuns", "messages", "decisions", "milestones", "events", "pendingWakeup", "leaderFailure", "operatorNotification"], `Task aggregate ${taskId}`);
   versioned(aggregate, 1, `Task aggregate ${taskId}`);
-  identified(aggregate.task, 1, "id", taskId, "Task");
+  validateTask(identified(aggregate.task, 1, "id", taskId, "Task"));
+  if (aggregate.brief !== null) storedTaskBrief(aggregate.brief);
   parseMap(aggregate.roles, (record, key) => { const role = identified<TaskRole>(record, 2, "name", key, "Task Role"); if (role.taskId !== taskId) throw new StorageRecordError(`Task Role belongs to another Task: ${role.taskId}`); validateTaskRole(role); return role; }, "roles");
+  parseMap(aggregate.roleWorkspaces, (record, key) => {
+    const workspace = identified<RoleWorkspace>(record, 1, "roleName", key, "RoleWorkspace");
+    if (workspace.taskId !== taskId) {
+      throw new StorageRecordError(`RoleWorkspace belongs to another Task: ${workspace.taskId}`);
+    }
+    validateRoleWorkspace(workspace);
+    return workspace;
+  }, "roleWorkspaces");
   parseMap(aggregate.roleSessionSets, (record, key) => { const set = taskSessions(record); if (set.owner.taskId !== taskId || set.owner.roleName !== key) throw new StorageRecordError(`Task Role session set identity is inconsistent: ${taskId}/${key}`); return set; }, "roleSessionSets");
   parseMap(aggregate.workItems, (record, key) => { const item = identified<WorkItem>(record, 1, "id", key, "Work item"); if (item.taskId !== taskId) throw new StorageRecordError(`Work item belongs to another Task: ${item.taskId}`); return item; }, "workItems");
-  parseMap(aggregate.agentRuns, (record, key) => { const run = identified<AgentRun>(record, 1, "id", key, "Agent run"); if (run.taskId !== taskId) throw new StorageRecordError(`Agent run belongs to another Task: ${run.taskId}`); return run; }, "agentRuns");
-  parseMap(aggregate.activeRuns, (record, key) => { const pointer = versioned<ActiveRunPointer>(record, 1, `Active run ${key}`); if (typeof pointer.runId !== "string" || aggregate.agentRuns[pointer.runId] === undefined) throw new StorageRecordError(`Active run pointer is invalid: ${taskId}/${key}`); return pointer; }, "activeRuns");
-  parseMap(aggregate.comments, (record, key) => identified(record, 1, "id", key, "Comment"), "comments");
-  parseMap(aggregate.events, (record, key) => identified(record, 1, "id", key, "Task event"), "events");
+  parseMap(aggregate.agentRuns, (record, key) => { const run = identified<AgentRun>(record, 1, "id", key, "Agent run"); if (run.taskId !== taskId) throw new StorageRecordError(`Agent run belongs to another Task: ${run.taskId}`); validateAgentRun(run); return run; }, "agentRuns");
+  parseMap(aggregate.activeRuns, (record, key) => {
+    const pointer = versioned<ActiveRunPointer>(record, 1, `Active run ${key}`);
+    const run = typeof pointer.runId === "string" ? aggregate.agentRuns[pointer.runId] : undefined;
+    if (run === undefined || run.status !== "active" || run.roleName !== key) {
+      throw new StorageRecordError(`Active run pointer is invalid: ${taskId}/${key}`);
+    }
+    return pointer;
+  }, "activeRuns");
+  parseMap(aggregate.messages, (record, key) => {
+    const message = identified<TaskMessage>(record, 1, "id", key, "Message");
+    validateTaskMessage(message);
+    return message;
+  }, "messages");
+  parseMap(aggregate.decisions, (record, key) => {
+    const decision = storedDecision(record);
+    if (decision.id !== key) throw new StorageRecordError(`Decision identity is inconsistent: ${key}.`);
+    if (decision.taskId !== taskId) {
+      throw new StorageRecordError(`Decision belongs to another Task: ${decision.taskId}`);
+    }
+    return decision;
+  }, "decisions");
+  parseMap(aggregate.milestones, (record, key) => {
+    const milestone = storedMilestone(record);
+    if (milestone.id !== key) throw new StorageRecordError(`Milestone identity is inconsistent: ${key}.`);
+    if (milestone.taskId !== taskId) {
+      throw new StorageRecordError(`Milestone belongs to another Task: ${milestone.taskId}`);
+    }
+    return milestone;
+  }, "milestones");
+  parseMap(aggregate.events, (record, key) => {
+    const event = storedTaskEvent(record);
+    if (event.id !== key) throw new StorageRecordError(`Task event identity is inconsistent: ${key}.`);
+    return event;
+  }, "events");
   for (const [key, label] of [["pendingWakeup", "Pending wakeup"], ["leaderFailure", "Leader failure"], ["operatorNotification", "Operator notification"]] as const) {
     const record = aggregate[key];
     if (record !== null) identified(record, 1, "taskId", taskId, label);
   }
   return aggregate;
+}
+
+function validateTaskmuxConfig(config: TaskmuxConfig): void {
+  try {
+    reconciliationIntervalMilliseconds(config.reconciliationIntervalSeconds);
+  } catch (error) {
+    throw new StorageRecordError(
+      error instanceof Error ? error.message : "TaskMux reconciliation interval is invalid."
+    );
+  }
 }
 
 function globalSessions(value: unknown): GlobalRoleSessionSet {
@@ -659,6 +876,173 @@ function assertSessionsMatchRole(
     }
   }
 }
+
+function storedTaskBrief(value: unknown): TaskBrief {
+  const brief = versioned<TaskBrief>(value, 1, "Task Brief");
+  exact(
+    brief as unknown as Record<string, unknown>,
+    ["schemaVersion", "objective", "boundaries", "currentFocus", "leaderSummary", "updatedAt", "updatedBy"],
+    "Task Brief"
+  );
+  requireNormalizedText(brief.objective, "Task Brief objective");
+  requireNormalizedText(brief.currentFocus, "Task Brief current focus");
+  requireNormalizedText(brief.leaderSummary, "Task Brief leader summary");
+  requireNormalizedText(brief.updatedBy, "Task Brief updatedBy");
+  if (!Array.isArray(brief.boundaries)) {
+    throw new StorageRecordError("Task Brief boundaries must be an array.");
+  }
+  const boundaries = brief.boundaries.map((boundary) => (
+    requireNormalizedText(boundary, "Task Brief boundary")
+  ));
+  if (new Set(boundaries).size !== boundaries.length) {
+    throw new StorageRecordError("Task Brief boundaries must be unique.");
+  }
+  requireTimestamp(brief.updatedAt, "Task Brief updatedAt");
+  return brief;
+}
+
+function storedDecision(value: unknown): Decision {
+  const decision = versioned<Decision>(value, 1, "Decision");
+  const baseFields = [
+    "schemaVersion", "id", "taskId", "title", "rationale", "status", "createdAt", "updatedAt"
+  ];
+  if (decision.status === "active") {
+    exact(decision as unknown as Record<string, unknown>, baseFields, "Decision");
+  } else if (decision.status === "superseded") {
+    exact(
+      decision as unknown as Record<string, unknown>,
+      [...baseFields, "supersededReason", "supersededAt"],
+      "Decision"
+    );
+    requireNormalizedText(decision.supersededReason, "Decision supersededReason");
+    requireTimestamp(decision.supersededAt, "Decision supersededAt");
+    if (decision.supersededAt !== decision.updatedAt) {
+      throw new StorageRecordError("Decision supersededAt must match updatedAt.");
+    }
+  } else {
+    throw new StorageRecordError(`Decision status is invalid: ${String(decision.status)}.`);
+  }
+  requireRecordIdentity(decision.id, "Decision id");
+  requireRecordIdentity(decision.taskId, "Decision Task id");
+  requireNormalizedText(decision.title, "Decision title");
+  requireNormalizedText(decision.rationale, "Decision rationale");
+  requireTimestamp(decision.createdAt, "Decision createdAt");
+  requireTimestamp(decision.updatedAt, "Decision updatedAt");
+  if (Date.parse(decision.updatedAt) < Date.parse(decision.createdAt)) {
+    throw new StorageRecordError("Decision updatedAt cannot precede createdAt.");
+  }
+  return decision;
+}
+
+function storedMilestone(value: unknown): Milestone {
+  const milestone = versioned<Milestone>(value, 1, "Milestone");
+  exact(
+    milestone as unknown as Record<string, unknown>,
+    ["schemaVersion", "id", "taskId", "title", "summary", "createdBy", "createdAt"],
+    "Milestone"
+  );
+  requireRecordIdentity(milestone.id, "Milestone id");
+  requireRecordIdentity(milestone.taskId, "Milestone Task id");
+  requireNormalizedText(milestone.title, "Milestone title");
+  requireNormalizedText(milestone.summary, "Milestone summary");
+  if (milestone.createdBy !== "leader") {
+    throw new StorageRecordError("Milestone createdBy must be leader.");
+  }
+  requireTimestamp(milestone.createdAt, "Milestone createdAt");
+  return milestone;
+}
+
+function storedTaskEvent(value: unknown): TaskEvent {
+  const event = versioned<TaskEvent>(value, 1, "Task event");
+  exact(
+    event as unknown as Record<string, unknown>,
+    ["schemaVersion", "id", "type", "payload", "createdAt"],
+    "Task event"
+  );
+  requireRecordIdentity(event.id, "Task event id");
+  requireNormalizedText(event.type, "Task event type");
+  const payload = object(event.payload, "Task event payload");
+  for (const [key, payloadValue] of Object.entries(payload)) {
+    requireRecordIdentity(key, "Task event payload key");
+    if (typeof payloadValue !== "string" || payloadValue.includes("\0")) {
+      throw new StorageRecordError(`Task event payload value is invalid: ${key}.`);
+    }
+  }
+  requireTimestamp(event.createdAt, "Task event createdAt");
+  return event;
+}
+
+function isValidDecisionSupersession(existing: Decision, candidate: Decision): boolean {
+  return existing.status === "active"
+    && candidate.status === "superseded"
+    && candidate.id === existing.id
+    && candidate.taskId === existing.taskId
+    && candidate.title === existing.title
+    && candidate.rationale === existing.rationale
+    && candidate.createdAt === existing.createdAt
+    && Date.parse(candidate.updatedAt) >= Date.parse(existing.updatedAt);
+}
+
+function requireTaskFromState(state: StorageState, taskId: string): StoredTask {
+  const aggregate = state.tasks[taskId];
+  if (aggregate === undefined) throw new StorageRecordError(`Task not found: ${taskId}`);
+  return aggregate;
+}
+
+function taskRecordOwner(
+  state: StorageState,
+  key: "decisions" | "milestones" | "events" | "messages",
+  id: string
+): string | null {
+  for (const [taskId, aggregate] of Object.entries(state.tasks)) {
+    if (aggregate[key][id] !== undefined) return taskId;
+  }
+  return null;
+}
+
+function assertGloballyUniqueTaskRecordIds(
+  state: StorageState,
+  key: "decisions" | "milestones" | "events" | "messages",
+  label: string
+): void {
+  const owners = new Map<string, string>();
+  for (const [taskId, aggregate] of Object.entries(state.tasks)) {
+    for (const id of Object.keys(aggregate[key])) {
+      const owner = owners.get(id);
+      if (owner !== undefined) {
+        throw new StorageRecordError(`${label} id is duplicated across Tasks: ${id} (${owner}, ${taskId}).`);
+      }
+      owners.set(id, taskId);
+    }
+  }
+}
+
+function requireRecordIdentity(value: unknown, label: string): string {
+  const normalized = requireNormalizedText(value, label);
+  if (["__proto__", "prototype", "constructor", ".", ".."].includes(normalized)
+    || /[\/\\\0]/.test(normalized)) {
+    throw new StorageRecordError(`${label} is invalid.`);
+  }
+  return normalized;
+}
+
+function requireNormalizedText(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.includes("\0")) {
+    throw new StorageRecordError(`${label} is invalid.`);
+  }
+  const normalized = value.trim();
+  if (normalized.length === 0) throw new StorageRecordError(`${label} is required.`);
+  if (normalized !== value) throw new StorageRecordError(`${label} must be normalized.`);
+  return normalized;
+}
+
+function requireTimestamp(value: unknown, label: string): string {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
+    throw new StorageRecordError(`${label} is invalid.`);
+  }
+  return value;
+}
+
 function parseMap<T>(value: unknown, parse: (entry: unknown, key: string) => T, label: string): asserts value is Record<string, T> {
   const records = object(value, label);
   for (const [key, entry] of Object.entries(records)) parse(entry, key);
@@ -701,7 +1085,7 @@ function values<T>(records: Record<string, T>, identity: keyof T | ((value: T) =
   return Object.values(records).map(clone).sort((left, right) => numericCompare(typeof identity === "function" ? identity(left) : String(left[identity]), typeof identity === "function" ? identity(right) : String(right[identity])));
 }
 function numericCompare(left: string, right: string): number { return left.localeCompare(right, undefined, { numeric: true }); }
-function allKeys<K extends "workItems" | "agentRuns" | "comments" | "events">(state: StorageState, key: K): string[] { return Object.values(state.tasks).flatMap((task) => Object.keys(task[key])); }
+function allKeys<K extends "workItems" | "agentRuns" | "messages" | "decisions" | "milestones" | "events">(state: StorageState, key: K): string[] { return Object.values(state.tasks).flatMap((task) => Object.keys(task[key])); }
 function findUnique(state: StorageState, key: "workItems", id: string, label: string): WorkItem | null;
 function findUnique(state: StorageState, key: "agentRuns", id: string, label: string): AgentRun | null;
 function findUnique(state: StorageState, key: "workItems" | "agentRuns", id: string, label: string): WorkItem | AgentRun | null {

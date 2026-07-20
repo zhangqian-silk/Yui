@@ -50,13 +50,18 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
     const task = this.store.getTask(input.taskId);
     if (task === null) throw new Error(`Task not found: ${input.taskId}.`);
     if (task.status !== "active") throw new Error(`Task is not active: ${input.taskId}.`);
-    if (task.repositoryId !== undefined && task.cwd === undefined) {
-      throw new Error(`Task workspace is not ready: ${input.taskId}.`);
-    }
     const role = this.store.getRole(input.taskId, input.roleName);
     if (role === null) throw new Error(`Role not found: ${input.taskId}/${input.roleName}.`);
-    if (task.cwd !== undefined && role.workspace !== task.cwd) {
-      throw new Error(`Role workspace is not synchronized with its Task: ${input.taskId}/${input.roleName}.`);
+    if (task.repositoryId !== undefined) {
+      const workspace = this.store.getRoleWorkspace(task.id, role.name);
+      if (
+        task.cwd === undefined
+        || workspace === null
+        || workspace.repositoryId !== task.repositoryId
+        || workspace.path !== role.workspace
+      ) {
+        throw new Error(`Role workspace is not ready: ${input.taskId}/${input.roleName}.`);
+      }
     }
     return this.#compile(
       role,

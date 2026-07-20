@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-
 import { createAgentRun } from "../run/agentRun.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
 import { createLeaderRecoveryNotification } from "./operatorNotification.js";
@@ -12,7 +10,7 @@ import type {
 export type LeaderWakeupProcessingResult = Readonly<{
   taskId: string;
   status: "dispatched" | "skipped" | "failed";
-  reason?: "busy" | "unavailable" | "workspace-not-ready" | "recovery-blocked";
+  reason?: "busy" | "unavailable" | "workspace-not-ready" | "recovery-blocked" | "state-changed";
   error?: string;
 }>;
 
@@ -47,10 +45,12 @@ export async function processLeaderWakeups(
 
     const existingSession = store.getRoleSession(task.id, role.name);
     let effectiveSession: SchedulerRoleSession | null = existingSession;
+    let claimed = false;
+    let run: ReturnType<typeof createAgentRun> | null = null;
     try {
       const mode = hasNativeSession(existingSession) ? "resume" : "new";
       const input = leaderWakeupInput(task.id, wakeup.reasons);
-      const run = createAgentRun(
+      run = createAgentRun(
         store.nextAgentRunId(task.id),
         task.id,
         role.name,
@@ -67,17 +67,25 @@ export async function processLeaderWakeups(
         ...(mode === "resume" ? { nativeSessionId: existingSession!.nativeSessionId } : {})
       });
       const ready = await delivery.waitUntilReady(prepared);
+      const latestTask = store.getTask(task.id);
+      if (latestTask === null || latestTask.status !== "active") {
+        results.push({ taskId: task.id, status: "skipped", reason: "unavailable" });
+        continue;
+      }
       effectiveSession = validateReadySession(role.activeAgentId, existingSession, mode, ready.session);
+      const claim = store.saveLeaderDispatch({ task, role, run, session: effectiveSession, wakeup, now });
+      if (claim !== "claimed") {
+        results.push({ taskId: task.id, status: "skipped", reason: claim });
+        continue;
+      }
+      claimed = true;
       await delivery.sendOnce({
         delivery: ready,
-        receiptId: wakeupReceiptId(wakeup.taskId, wakeup.requestCount, wakeup.lastRequestedAt),
+        receiptId: `agent-run:${run.id}`,
         text: input
       });
 
-      store.saveLeaderDispatch({ task, role, run, session: effectiveSession, now });
-      // Clear only after the real Leader AgentRun and its fixed session have
-      // been durably recorded by the store adapter.
-      store.clearPendingWakeup(task.id);
+      store.saveRoleRunDelivery({ task, role, run, session: effectiveSession, now });
       results.push({ taskId: task.id, status: "dispatched" });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -99,6 +107,7 @@ export async function processLeaderWakeups(
           now,
           store.getOperatorNotification(task.id)
         ),
+        ...(claimed && run !== null ? { claimed: { run, wakeup } } : {}),
         now
       });
       results.push({ taskId: task.id, status: "failed", error: message });
@@ -140,12 +149,4 @@ function leaderWakeupInput(taskId: string, reasons: readonly string[]): string {
     `TaskMux wakeup reasons: ${reasons.join(", ")}.`,
     `Inspect taskmux task show ${taskId}, taskmux task message list ${taskId}, and taskmux task work list ${taskId}; then continue Leader stewardship.`
   ].join(" ");
-}
-
-function wakeupReceiptId(taskId: string, requestCount: number, lastRequestedAt: string): string {
-  const digest = createHash("sha256")
-    .update(JSON.stringify([taskId, requestCount, lastRequestedAt]))
-    .digest("hex")
-    .slice(0, 24);
-  return `leader-wakeup:${digest}`;
 }

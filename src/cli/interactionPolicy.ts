@@ -30,6 +30,7 @@ export type ArgumentSelector = Readonly<{
   provider: CandidateProviderName;
   dependsOn?: number;
   actionTarget: boolean;
+  statuses?: readonly string[];
 }>;
 
 export type InteractionPolicy = Readonly<{
@@ -42,13 +43,18 @@ export type InteractionPolicy = Readonly<{
   }>;
 }>;
 
-const taskTarget = (command: string, argumentIndex = 2): InteractionPolicy => ({
+const taskTarget = (
+  command: string,
+  argumentIndex = 2,
+  statuses?: readonly string[]
+): InteractionPolicy => ({
   commandPath: ["task", command],
   selectors: [{
     argumentIndex,
     entity: "task",
     provider: "tasks",
-    actionTarget: true
+    actionTarget: true,
+    ...(statuses === undefined ? {} : { statuses })
   }]
 });
 
@@ -114,7 +120,26 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       : { "--native-id": "value" }
   })),
   taskTarget("show"),
-  taskTarget("activate"),
+  {
+    ...taskTarget("update"),
+    trailingOptions: {
+      "--title": "value",
+      "--description": "value",
+      "--priority": "value",
+      "--tags": "value",
+      "--due-at": "value",
+      "--clear-description": "flag",
+      "--clear-priority": "flag",
+      "--clear-tags": "flag",
+      "--clear-due-at": "flag"
+    }
+  },
+  taskTarget("activate", 2, ["draft"]),
+  {
+    ...taskTarget("complete", 2, ["active"]),
+    trailingOptions: { "--summary": "value" }
+  },
+  taskTarget("reopen", 2, ["completed"]),
   {
     ...taskTarget("archive"),
     confirmation: { action: "Archive task", targetArgumentIndex: 2 }

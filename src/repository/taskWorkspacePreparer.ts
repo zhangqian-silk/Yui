@@ -1,8 +1,13 @@
+import { rmdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 import { updateRole } from "../role/role.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
+import {
+  createRoleWorkspace,
+  type RoleWorkspace
+} from "../worktree/roleWorkspace.js";
 import {
   NodeGitWorkspace,
   type GitWorkspacePort,
@@ -11,8 +16,9 @@ import {
 
 export type TaskWorkspacePreparation = Readonly<{
   taskId: string;
-  status: "ready" | "draft" | "archived-clean" | "archived-dirty";
+  status: "ready" | "pending" | "draft" | "archived-clean" | "archived-dirty" | "failed";
   path?: string;
+  error?: string;
 }>;
 
 export interface TaskWorkspacePreparer {
@@ -23,9 +29,9 @@ export interface TaskWorkspacePreparer {
 }
 
 /**
- * Prepares one deterministic worktree per repository-backed Task. There is no
- * worktree ledger: Git and the deterministic path are the physical truth,
- * while Task.cwd is recorded only after ownership checks succeed.
+ * Prepares one deterministic worktree per Task Role. Git and the deterministic
+ * path remain the physical truth; the compact RoleWorkspace records only the
+ * identity needed to validate launches and safely reconcile archive cleanup.
  */
 export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   readonly worktreeRoot: string;
@@ -42,50 +48,99 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   async prepareTaskWorkspace(taskId: string): Promise<TaskWorkspacePreparation> {
     const task = requireTask(this.store, taskId);
     if (task.repositoryId === undefined) {
-      return { taskId, status: task.status === "draft" ? "draft" : "ready", ...(task.cwd === undefined ? {} : { path: task.cwd }) };
+      return {
+        taskId,
+        status: task.status === "draft" ? "draft" : "ready",
+        ...(task.cwd === undefined ? {} : { path: task.cwd })
+      };
     }
     const repository = this.store.getRepository(task.repositoryId);
     if (repository === null) throw new Error(`Repository not found: ${task.repositoryId}.`);
     if (task.status === "draft") return { taskId, status: "draft" };
     if (task.status === "archived") return this.#cleanupArchived(task, repository.path);
 
-    const prepared = await this.git.ensureWorktree({
-      repositoryPath: repository.path,
-      container: this.worktreeRoot,
-      taskId: task.id,
-      baseRef: task.baseRef ?? repository.defaultBranch
-    });
-    if (task.cwd !== undefined && resolve(task.cwd) !== prepared.path) {
-      throw new Error(`Task workspace does not match its deterministic path: ${task.id}.`);
+    const taskRoot = this.#taskRoot(task.id);
+    if (task.cwd !== undefined && resolve(task.cwd) !== taskRoot) {
+      throw new Error(`Task workspace root does not match its deterministic path: ${task.id}.`);
+    }
+    const baseRef = task.baseRef ?? repository.defaultBranch;
+    // A Task base branch may be deleted after its first Role worktree is
+    // created. The persisted starting commit remains a stable base for Roles
+    // added later without introducing a separate ref ledger.
+    const physicalBase = this.store.listRoleWorkspaces(task.id)[0]?.baseCommit ?? baseRef;
+    const prepared = [] as Array<Readonly<{
+      roleName: string;
+      path: string;
+      branch: string;
+      baseCommit: string;
+    }>>;
+    for (const role of this.store.listRoles(task.id)) {
+      const workspace = await this.git.ensureWorktree({
+        repositoryPath: repository.path,
+        container: this.worktreeRoot,
+        taskId: task.id,
+        roleName: role.name,
+        baseRef: physicalBase
+      });
+      prepared.push({ roleName: role.name, ...workspace });
     }
 
-    const persisted = this.store.transaction((store) => {
+    const ready = this.store.transaction((store) => {
       const latest = requireTask(store, task.id);
-      if (latest.status === "archived") return false;
       if (latest.status !== "active") return false;
       if (latest.repositoryId !== repository.id) {
-        throw new Error(`Task repository changed while preparing its workspace: ${task.id}.`);
-      }
-      if (latest.cwd === prepared.path
-        && store.listRoles(task.id).every((role) => role.workspace === prepared.path)) {
-        return true;
+        throw new Error(`Task repository changed while preparing its workspaces: ${task.id}.`);
       }
       const now = this.now();
-      store.saveTask({ ...latest, cwd: prepared.path, updatedAt: now.toISOString() });
-      for (const role of store.listRoles(task.id)) {
-        if (role.workspace !== prepared.path) {
-          store.saveRole(task.id, updateRole(role, { workspace: prepared.path }, now));
+      for (const physical of prepared) {
+        const role = store.getRole(task.id, physical.roleName);
+        if (role === null) continue;
+        const existing = store.getRoleWorkspace(task.id, role.name);
+        const workspace = existing ?? createRoleWorkspace({
+          taskId: task.id,
+          roleName: role.name,
+          repositoryId: repository.id,
+          path: physical.path,
+          branch: physical.branch,
+          baseRef,
+          baseCommit: physical.baseCommit
+        }, now);
+        assertWorkspaceIdentity(workspace, {
+          taskId: task.id,
+          roleName: role.name,
+          repositoryId: repository.id,
+          path: physical.path,
+          branch: physical.branch,
+          baseRef
+        });
+        if (role.workspace !== workspace.path) {
+          store.saveRole(task.id, updateRole(role, { workspace: workspace.path }, now));
         }
+        if (existing === null) store.saveRoleWorkspace(task.id, workspace);
       }
-      return true;
-    });
-    if (persisted) return { taskId, status: "ready", path: prepared.path };
 
-    // Archive may win while Git is creating the worktree. Re-read the state
-    // and apply the same non-destructive cleanup policy before scheduling.
+      const roles = store.listRoles(task.id);
+      const allReady = roles.length > 0 && roles.every((role) => {
+        const workspace = store.getRoleWorkspace(task.id, role.name);
+        return workspace !== null
+          && workspace.repositoryId === repository.id
+          && workspace.path === role.workspace;
+      });
+      if (allReady && latest.cwd !== taskRoot) {
+        store.saveTask({ ...latest, cwd: taskRoot, updatedAt: now.toISOString() });
+      } else if (!allReady && latest.cwd !== undefined) {
+        const { cwd: _cwd, ...withoutWorkspace } = latest;
+        store.saveTask({ ...withoutWorkspace, updatedAt: now.toISOString() });
+      }
+      return allReady;
+    });
+    if (ready) return { taskId, status: "ready", path: taskRoot };
+
+    // Archive may win while Git is creating worktrees. Re-read state and use
+    // the same dirty-preserving archive policy before any scheduler delivery.
     const latest = requireTask(this.store, task.id);
     if (latest.status === "archived") return this.#cleanupArchived(latest, repository.path);
-    return { taskId, status: "draft" };
+    return { taskId, status: latest.status === "draft" ? "draft" : "pending" };
   }
 
   async reconcileTaskWorkspaces(): Promise<readonly TaskWorkspacePreparation[]> {
@@ -98,8 +153,12 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   async prepareActiveTaskWorkspaces(): Promise<readonly TaskWorkspacePreparation[]> {
     const results: TaskWorkspacePreparation[] = [];
     for (const task of this.store.listTasks()) {
-      if (task.repositoryId === undefined || task.status !== "active" || task.cwd !== undefined) continue;
-      results.push(await this.prepareTaskWorkspace(task.id));
+      if (task.repositoryId === undefined || task.status !== "active") continue;
+      try {
+        results.push(await this.prepareTaskWorkspace(task.id));
+      } catch (error) {
+        results.push(failedPreparation(task.id, error));
+      }
     }
     return results;
   }
@@ -108,44 +167,128 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     const results: TaskWorkspacePreparation[] = [];
     for (const task of this.store.listTasks()) {
       if (task.repositoryId === undefined || task.status !== "archived") continue;
-      results.push(await this.prepareTaskWorkspace(task.id));
+      try {
+        results.push(await this.prepareTaskWorkspace(task.id));
+      } catch (error) {
+        results.push(failedPreparation(task.id, error));
+      }
     }
     return results;
   }
 
-  async #cleanupArchived(task: Task, repositoryPath: string): Promise<TaskWorkspacePreparation> {
-    const removal = await this.git.removeWorktree({
-      repositoryPath,
-      container: this.worktreeRoot,
-      taskId: task.id
-    });
-    if (removal === "dirty") {
-      return { taskId: task.id, status: "archived-dirty", ...(task.cwd === undefined ? {} : { path: task.cwd }) };
+  async #cleanupArchived(
+    task: Task,
+    repositoryPath: string
+  ): Promise<TaskWorkspacePreparation> {
+    const removals = new Map<string, GitWorkspaceRemoval>();
+    const failures: string[] = [];
+    for (const role of this.store.listRoles(task.id)) {
+      try {
+        const removal = await this.git.removeWorktree({
+          repositoryPath,
+          container: this.worktreeRoot,
+          taskId: task.id,
+          roleName: role.name
+        });
+        removals.set(role.name, removal);
+        if (removal !== "dirty") {
+          this.#recordArchivedRoleCleanup(task.id, repositoryPath, role.name);
+        }
+      } catch (error) {
+        failures.push(`${role.name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
-    this.#recordArchivedCleanup(task.id, repositoryPath, removal);
-    return { taskId: task.id, status: "archived-clean" };
+    const dirty = [...removals.values()].some((removal) => removal === "dirty");
+    if (failures.length > 0) {
+      return {
+        taskId: task.id,
+        status: "failed",
+        path: this.#taskRoot(task.id),
+        error: `Role worktree cleanup failed (${failures.join("; ")})`
+      };
+    }
+    this.#recordArchivedTaskCleanup(task.id, dirty);
+    if (!dirty) await removeEmptyDirectory(this.#taskRoot(task.id));
+    return dirty
+      ? { taskId: task.id, status: "archived-dirty", path: this.#taskRoot(task.id) }
+      : { taskId: task.id, status: "archived-clean" };
   }
 
-  #recordArchivedCleanup(
+  #recordArchivedRoleCleanup(
     taskId: string,
     repositoryPath: string,
-    _removal: Exclude<GitWorkspaceRemoval, "dirty">
+    roleName: string
   ): void {
     this.store.transaction((store) => {
       const latest = requireTask(store, taskId);
       if (latest.status !== "archived") return;
-      const roles = store.listRoles(taskId);
-      if (latest.cwd === undefined && roles.every((role) => role.workspace === repositoryPath)) return;
       const now = this.now();
-      const { cwd: _cwd, ...withoutWorkspace } = latest;
-      store.saveTask({ ...withoutWorkspace, updatedAt: now.toISOString() });
-      for (const role of roles) {
-        if (role.workspace !== repositoryPath) {
-          store.saveRole(taskId, updateRole(role, { workspace: repositoryPath }, now));
-        }
+      const role = store.getRole(taskId, roleName);
+      if (role === null) return;
+      if (role.workspace === repositoryPath
+        && store.getRoleWorkspace(taskId, role.name) === null) return;
+      if (role.workspace !== repositoryPath) {
+        store.saveRole(taskId, updateRole(role, { workspace: repositoryPath }, now));
+      }
+      store.removeRoleWorkspace(taskId, role.name);
+    });
+  }
+
+  #recordArchivedTaskCleanup(taskId: string, dirty: boolean): void {
+    this.store.transaction((store) => {
+      const latest = requireTask(store, taskId);
+      if (latest.status !== "archived") return;
+      if (!dirty && latest.cwd !== undefined) {
+        const { cwd: _cwd, ...withoutWorkspace } = latest;
+        store.saveTask({ ...withoutWorkspace, updatedAt: this.now().toISOString() });
       }
     });
   }
+
+  #taskRoot(taskId: string): string {
+    return join(this.worktreeRoot, taskId);
+  }
+}
+
+function failedPreparation(taskId: string, error: unknown): TaskWorkspacePreparation {
+  return {
+    taskId,
+    status: "failed",
+    error: error instanceof Error ? error.message : String(error)
+  };
+}
+
+function assertWorkspaceIdentity(
+  workspace: RoleWorkspace,
+  expected: Readonly<{
+    taskId: string;
+    roleName: string;
+    repositoryId: string;
+    path: string;
+    branch: string;
+    baseRef: string;
+  }>
+): void {
+  for (const key of [
+    "taskId", "roleName", "repositoryId", "path", "branch", "baseRef"
+  ] as const) {
+    if (workspace[key] !== expected[key]) {
+      throw new Error(`RoleWorkspace ${key} does not match its deterministic identity: ${expected.taskId}/${expected.roleName}.`);
+    }
+  }
+}
+
+async function removeEmptyDirectory(path: string): Promise<void> {
+  try {
+    await rmdir(path);
+  } catch (error) {
+    if (!isErrno(error, "ENOENT") && !isErrno(error, "ENOTEMPTY")) throw error;
+  }
+}
+
+function isErrno(value: unknown, code: string): boolean {
+  return typeof value === "object" && value !== null && "code" in value
+    && (value as { code?: unknown }).code === code;
 }
 
 function requireTask(store: TaskStore, taskId: string): Task {

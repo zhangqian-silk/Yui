@@ -1,32 +1,26 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ChildRole } from "../role/childRole.js";
 import type { Role } from "../role/role.js";
 import { dataError } from "../errors/cliError.js";
 
-export type DispatchContextStore = Readonly<{
-  listChildRoles?(taskId: string): readonly ChildRole[];
-}>;
+export type DispatchContextStore = Readonly<Record<string, never>>;
 
 export type BuildRoleContextInput = Readonly<{
   taskId: string;
   role: Role;
   input: string;
-  childRoles?: readonly ChildRole[];
   configuredSkillBodies?: readonly string[];
 }>;
 
 /** Compatibility entry point used by the restored Task workflow. */
 export function compileDispatchInput(
-  store: DispatchContextStore,
+  _store: DispatchContextStore,
   taskId: string,
   role: Role,
   input: string
 ): string {
-  const childRoles = (store.listChildRoles?.(taskId) ?? [])
-    .filter((child) => child.parentRole === role.name);
   const configuredSkillBodies = readConfiguredSkills(role.skills ?? []);
-  return buildRoleContext({ taskId, role, input, childRoles, configuredSkillBodies });
+  return buildRoleContext({ taskId, role, input, configuredSkillBodies });
 }
 
 export function buildRoleContext(context: BuildRoleContextInput): string {
@@ -61,28 +55,13 @@ function renderDispatchContext(
       ? null
       : `Configured role skills: ${profile.skills.join(", ")}`
   ].filter((line): line is string => line !== null);
-  const childSections = kind === "leader"
-    ? (context.childRoles ?? []).map(renderChildRole)
-    : [];
-
   return [
     readSystemSkill(kind),
     profileLines.join("\n"),
     ...(context.configuredSkillBodies ?? []).map((body) => body.trim()).filter(Boolean),
-    ...childSections,
     "TaskMux dispatch:",
     requireText(context.input, "dispatch input")
   ].filter(Boolean).join("\n\n");
-}
-
-function renderChildRole(child: ChildRole): string {
-  return [
-    `Child role: ${child.name}`,
-    `Description: ${child.description}`,
-    ...child.responsibilities.map((item) => `Responsibility: ${item}`),
-    ...child.constraints.map((item) => `Constraint: ${item}`),
-    `Expected output: ${child.expectedOutput}`
-  ].join("\n");
 }
 
 function readConfiguredSkills(skills: readonly string[]): string[] {

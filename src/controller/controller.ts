@@ -1,3 +1,4 @@
+import { reconciliationIntervalMilliseconds } from "../config/taskmuxConfig.js";
 import {
   processLeaderWakeups,
   type LeaderWakeupProcessingResult
@@ -17,7 +18,7 @@ import {
 import type { JsonValue } from "../core/protocol.js";
 import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
 
-const DEFAULT_SCAN_INTERVAL_MS = 1_000;
+const DEFAULT_RECONCILIATION_INTERVAL_MS = reconciliationIntervalMilliseconds();
 
 export type ControllerSchedulerResult = Readonly<{
   stoppedArchivedTaskIds: readonly string[];
@@ -90,12 +91,16 @@ export class FileTaskController {
   ) {
     this.#intervalMs = positiveInteger(
       options.intervalMs,
-      DEFAULT_SCAN_INTERVAL_MS,
-      "Controller scan interval"
+      DEFAULT_RECONCILIATION_INTERVAL_MS,
+      "Controller reconciliation interval"
     );
     this.#now = options.now ?? (() => new Date());
     this.#onError = options.onError ?? (() => {});
     this.#workspacePreparer = options.workspacePreparer;
+  }
+
+  get reconciliationIntervalMs(): number {
+    return this.#intervalMs;
   }
 
   start(): void {

@@ -30,19 +30,7 @@ test("dispatch contexts contain the real assignment but no session-bind bootstra
   const leader = buildLeaderContext({
     taskId: "task-1",
     role,
-    input: "decide the next step",
-    childRoles: [{
-      schemaVersion: 1,
-      name: "tester",
-      architecture: "child",
-      parentRole: "leader",
-      description: "Run tests",
-      responsibilities: ["Verify behavior"],
-      constraints: [],
-      expectedOutput: "Evidence",
-      createdAt: new Date(0).toISOString(),
-      updatedAt: new Date(0).toISOString()
-    }]
+    input: "decide the next step"
   });
   const worker = buildWorkerContext({
     taskId: "task-1",
@@ -51,7 +39,8 @@ test("dispatch contexts contain the real assignment but no session-bind bootstra
   });
 
   assert.match(leader, /TaskMux Leader/);
-  assert.match(leader, /Child role: tester/);
+  assert.match(leader, /Description: Lead the implementation/);
+  assert.match(leader, /Constraint: Keep changes focused/);
   assert.match(leader, /decide the next step/);
   assert.match(worker, /TaskMux Worker/);
   assert.doesNotMatch(`${leader}\n${worker}`, /session-bind|CODEX_THREAD_ID|session record/i);

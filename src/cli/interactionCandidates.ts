@@ -30,7 +30,10 @@ export async function getSelectionCandidates(
       return entities(
         "task",
         "Select task",
-        await list(ports, "task.list", {}),
+        (await list(ports, "task.list", {})).filter((task) =>
+          selector.statuses === undefined
+          || selector.statuses.includes(stringField(task, "status") ?? "")
+        ),
         ["id", "title", "status"]
       );
     case "repositories":

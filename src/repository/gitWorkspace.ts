@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { lstat, mkdir, realpath } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 
 const executeFile = promisify(execFile);
@@ -26,12 +27,14 @@ export interface GitWorkspacePort {
     repositoryPath: string;
     container: string;
     taskId: string;
+    roleName: string;
     baseRef: string;
   }>): Promise<PreparedGitWorktree>;
   removeWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
     taskId: string;
+    roleName: string;
   }>): Promise<GitWorkspaceRemoval>;
 }
 
@@ -63,10 +66,11 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     repositoryPath: string;
     container: string;
     taskId: string;
+    roleName: string;
     baseRef: string;
   }>): Promise<PreparedGitWorktree> {
     const container = await canonicalContainer(input.container, true);
-    const identity = worktreeIdentity(input.taskId);
+    const identity = worktreeIdentity(input.taskId, input.roleName);
     const path = managedPath(container, identity.directory);
     const kind = await pathKind(path);
     if (kind === "symlink") throw new Error("Managed worktree path must not be a symbolic link.");
@@ -76,6 +80,7 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       // original base branch/tag is later deleted.
       const repository = await this.inspect(input.repositoryPath);
       await assertOwnedWorktree(repository, container, path);
+      await assertExpectedBranch(path, identity.branch);
       const head = await gitLine([
         "-C", path, "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"
       ]);
@@ -83,6 +88,7 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     }
 
     const repository = await this.inspect(input.repositoryPath, input.baseRef);
+    await canonicalContainer(dirname(path), true);
 
     const branchRef = `refs/heads/${identity.branch}`;
     const branchExists = await gitSucceeds([
@@ -96,6 +102,7 @@ export class NodeGitWorkspace implements GitWorkspacePort {
         ]);
 
     await assertOwnedWorktree(repository, container, path);
+    await assertExpectedBranch(path, identity.branch);
     return { path, branch: identity.branch, baseCommit: repository.baseCommit };
   }
 
@@ -103,9 +110,13 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     repositoryPath: string;
     container: string;
     taskId: string;
+    roleName: string;
   }>): Promise<GitWorkspaceRemoval> {
     const container = resolve(input.container);
-    const path = managedPath(container, worktreeIdentity(input.taskId).directory);
+    const path = managedPath(
+      container,
+      worktreeIdentity(input.taskId, input.roleName).directory
+    );
     const kind = await pathKind(path);
     if (kind === undefined) return "missing";
     if (kind === "symlink") throw new Error("Managed worktree path must not be a symbolic link.");
@@ -120,9 +131,34 @@ export class NodeGitWorkspace implements GitWorkspacePort {
   }
 }
 
-export function worktreeIdentity(taskId: string): Readonly<{ directory: string; branch: string }> {
-  const key = safeIdentity(taskId, "Task id");
-  return { directory: key, branch: `taskmux/${key}` };
+export function worktreeIdentity(
+  taskId: string,
+  roleName: string
+): Readonly<{ directory: string; branch: string }> {
+  const taskKey = safeIdentity(taskId, "Task id");
+  const roleKey = safeIdentity(roleName, "Role name");
+  return {
+    directory: join(taskKey, roleKey),
+    branch: `taskmux/${gitRefSegment(taskKey)}/${gitRefSegment(roleKey)}`
+  };
+}
+
+function gitRefSegment(identity: string): string {
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(identity)
+    && !identity.includes("..")
+    && !identity.endsWith(".")
+    && !identity.endsWith(".lock")) {
+    return identity;
+  }
+  const digest = createHash("sha256").update(identity).digest("hex").slice(0, 24);
+  return `encoded-${digest}`;
+}
+
+async function assertExpectedBranch(path: string, expected: string): Promise<void> {
+  const branch = await gitLine(["-C", path, "symbolic-ref", "--short", "HEAD"]);
+  if (branch !== expected) {
+    throw new Error(`Managed worktree is on an unexpected branch: ${branch}.`);
+  }
 }
 
 async function assertOwnedWorktree(

@@ -7,6 +7,7 @@ import test from "node:test";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
 import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
 import { createAgentRun } from "../../dist/run/agentRun.js";
+import { queueLeaderWakeup } from "../../dist/scheduler/wakeupQueue.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, archiveTask, createTask } from "../../dist/task/task.js";
@@ -30,6 +31,7 @@ function fixture(t) {
   store.transaction((tx) => {
     tx.saveTask(task);
     tx.saveRole(task.id, role);
+    queueLeaderWakeup(tx, task.id, "task-created", now);
   });
   return { home, store, task, role, now, adapter: new FileSchedulerStoreAdapter(store) };
 }
@@ -39,7 +41,7 @@ test("FileSchedulerStoreAdapter commits Leader run, Role and fixed session toget
   const before = JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision;
   const run = createAgentRun("agent-run-1", task.id, role.name, "resume", "continue", now);
 
-  adapter.saveLeaderDispatch({
+  const result = adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
     run,
@@ -49,9 +51,12 @@ test("FileSchedulerStoreAdapter commits Leader run, Role and fixed session toget
       nativeSessionId: "thread-1",
       status: "ready"
     },
+    wakeup: store.getPendingWakeup(task.id),
     now
   });
 
+  assert.equal(result, "claimed");
+  assert.equal(store.getPendingWakeup(task.id), null);
   assert.equal(store.getActiveAgentRun(task.id, role.name).id, run.id);
   assert.equal(store.getRole(task.id, role.name).status, "running");
   assert.equal(store.getRoleSession(task.id, role.name).nativeSessionId, "thread-1");
@@ -72,7 +77,7 @@ test("runtime native session registration is structured and exited work fails at
   const item = updateWorkItemStatus(createWorkItem(
     "work-item-1",
     task.id,
-    { title: "Implement", assignee: role.name, topics: [] },
+    { title: "Implement", assignee: role.name },
     now
   ), "running", undefined, now);
   const run = createAgentRun(
@@ -116,6 +121,7 @@ test("reconfirming an already delivered active run does not rewrite authoritativ
     now,
     { workItemId: "work-item-1" }
   );
+  run.deliveredAt = now.toISOString();
   store.transaction((tx) => {
     tx.saveRole(task.id, { ...role, status: "running" });
     tx.saveActiveAgentRun(run);

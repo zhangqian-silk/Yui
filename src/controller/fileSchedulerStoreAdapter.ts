@@ -8,9 +8,10 @@ import {
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
 import { activeRoleAgentBinding, updateRoleStatus } from "../role/role.js";
-import { failAgentRun } from "../run/agentRun.js";
+import { failAgentRun, markAgentRunDelivered } from "../run/agentRun.js";
 import type {
   LeaderDispatchFailurePersistence,
+  LeaderDispatchClaimResult,
   LeaderDispatchPersistence,
   RoleRunDeliveryPersistence,
   SchedulerRole,
@@ -18,6 +19,7 @@ import type {
   SchedulerStorePort,
   ExitedRoleRunPersistence
 } from "../scheduler/ports.js";
+import { pendingWakeupsMatch, type PendingWakeup } from "../scheduler/pendingWakeup.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { updateWorkItemStatus } from "../workItem/workItem.js";
 
@@ -56,9 +58,22 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   getLeaderFailure(taskId: string) { return this.store.getLeaderFailure(taskId); }
   getOperatorNotification(taskId: string) { return this.store.getOperatorNotification(taskId); }
 
-  saveLeaderDispatch(input: LeaderDispatchPersistence): void {
-    this.store.transaction((store) => {
+  saveLeaderDispatch(input: LeaderDispatchPersistence): LeaderDispatchClaimResult {
+    return this.store.transaction((store) => {
+      const task = store.getTask(input.task.id);
+      if (task === null || task.status !== "active") {
+        return "unavailable";
+      }
       const role = requireRole(store, input.task.id, input.role.name);
+      if (role.activeAgentId !== input.role.activeAgentId
+        || activeRoleAgentBinding(role).adapterId !== input.role.adapterId) {
+        return "state-changed";
+      }
+      if (store.getActiveAgentRun(input.task.id, input.role.name) !== null) return "busy";
+      const pending = store.getPendingWakeup(input.task.id);
+      if (pending === null || !pendingWakeupsMatch(pending, input.wakeup)) {
+        return "state-changed";
+      }
       store.saveActiveAgentRun(input.run);
       store.saveRole(input.task.id, updateRoleStatus(role, "running", input.now));
       if (input.session !== null && input.session.nativeSessionId !== undefined) {
@@ -69,15 +84,24 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       }
       store.clearLeaderFailure(input.task.id);
       store.clearOperatorNotification(input.task.id);
+      store.clearPendingWakeup(input.task.id);
+      return "claimed";
     });
   }
 
   saveRoleRunDelivery(input: RoleRunDeliveryPersistence): void {
     this.store.transaction((store) => {
+      const task = store.getTask(input.task.id);
+      if (task === null || task.status !== "active") {
+        throw new Error(`Task is not active: ${input.task.id}.`);
+      }
       const role = requireRole(store, input.task.id, input.role.name);
       const active = store.getActiveAgentRun(input.task.id, input.role.name);
       if (active === null || active.id !== input.run.id) {
         throw new Error(`Active Agent run changed before delivery was persisted: ${input.run.id}.`);
+      }
+      if (active.deliveredAt === undefined) {
+        store.saveAgentRun(markAgentRunDelivered(active, input.now));
       }
       if (role.status !== "running") {
         store.saveRole(input.task.id, updateRoleStatus(role, "running", input.now));
@@ -101,7 +125,20 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
 
   saveLeaderDispatchFailure(input: LeaderDispatchFailurePersistence): void {
     this.store.transaction((store) => {
+      const task = store.getTask(input.task.id);
+      if (task === null || task.status !== "active") return;
       const role = requireRole(store, input.task.id, input.role.name);
+      if (input.claimed !== undefined) {
+        const active = store.getActiveAgentRun(input.task.id, input.role.name);
+        if (active?.id === input.claimed.run.id) {
+          store.saveAgentRun(failAgentRun(active, input.failure.message, input.now));
+          store.clearActiveAgentRun(input.task.id, input.role.name);
+        }
+        store.savePendingWakeup(restorePendingWakeup(
+          input.claimed.wakeup,
+          store.getPendingWakeup(input.task.id)
+        ));
+      }
       store.saveRole(input.task.id, updateRoleStatus(role, "failed", input.now));
       breakTaskSessionIfPresent(store, input.task.id, role.name, role.activeAgentId, input.now);
       store.saveLeaderFailure(input.failure);
@@ -163,6 +200,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (task === null) throw new Error(`Task not found: ${input.taskId}.`);
       if (task.status === "archived") {
         throw new Error(`Cannot register a native session for archived Task: ${input.taskId}.`);
+      }
+      if (task.status !== "active") {
+        throw new Error(`Cannot register a native session for a Task that is not active: ${input.taskId}.`);
       }
       const role = requireRole(store, input.taskId, input.roleName);
       const binding = activeRoleAgentBinding(role);
@@ -227,6 +267,21 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       return updated.sessions[input.agentId]!;
     });
   }
+}
+
+function restorePendingWakeup(
+  claimed: PendingWakeup,
+  current: PendingWakeup | null
+): PendingWakeup {
+  if (current === null) return claimed;
+  return {
+    schemaVersion: 1,
+    taskId: claimed.taskId,
+    reasons: [...new Set([...claimed.reasons, ...current.reasons])],
+    requestCount: claimed.requestCount + current.requestCount,
+    firstRequestedAt: claimed.firstRequestedAt,
+    lastRequestedAt: current.lastRequestedAt
+  };
 }
 
 function mapRole(role: ReturnType<TaskStore["getRole"]> extends infer _T ? NonNullable<ReturnType<TaskStore["getRole"]>> : never): SchedulerRole {

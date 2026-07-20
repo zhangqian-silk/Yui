@@ -1,5 +1,5 @@
 export type DispatchMode = "new" | "resume";
-export type AgentRunStatus = "active" | "yielded" | "failed" | "expired";
+export type AgentRunStatus = "active" | "yielded" | "failed";
 
 export type AgentRun = {
   schemaVersion: 1;
@@ -9,8 +9,9 @@ export type AgentRun = {
   mode: DispatchMode;
   input: string;
   workItemId?: string;
-  topics?: string[];
   status: AgentRunStatus;
+  /** Set only after tmux has confirmed the receipt-backed input delivery. */
+  deliveredAt?: string;
   summary?: string;
   createdAt: string;
   updatedAt: string;
@@ -24,7 +25,7 @@ export function createAgentRun(
   mode: DispatchMode,
   input: string,
   now: Date,
-  context: { workItemId?: string; topics?: readonly string[] } = {}
+  context: { workItemId?: string } = {}
 ): AgentRun {
   if (mode !== "new" && mode !== "resume") {
     throw new Error(`Agent run dispatch mode is invalid: ${mode}.`);
@@ -40,7 +41,6 @@ export function createAgentRun(
     ...(context.workItemId === undefined
       ? {}
       : { workItemId: requireSafeIdentity(context.workItemId, "Work item id") }),
-    ...(context.topics === undefined ? {} : { topics: uniqueStrings(context.topics) }),
     status: "active",
     createdAt: timestamp,
     updatedAt: timestamp
@@ -51,21 +51,48 @@ export function isActiveAgentRun(run: AgentRun): boolean {
   return run.status === "active";
 }
 
+export function markAgentRunDelivered(run: AgentRun, now: Date): AgentRun {
+  if (run.status !== "active") {
+    throw new Error(`Cannot deliver a terminal Agent run: ${run.id}.`);
+  }
+  if (run.deliveredAt !== undefined) return run;
+  const timestamp = now.toISOString();
+  return { ...run, deliveredAt: timestamp, updatedAt: timestamp };
+}
+
+export function validateAgentRun(run: AgentRun): AgentRun {
+  if (run.schemaVersion !== 1) throw new Error("Agent run must use schemaVersion 1.");
+  requireSafeIdentity(run.id, "Agent run id");
+  requireSafeIdentity(run.taskId, "Task id");
+  requireSafeIdentity(run.roleName, "Role name");
+  if (run.mode !== "new" && run.mode !== "resume") {
+    throw new Error(`Agent run dispatch mode is invalid: ${String(run.mode)}.`);
+  }
+  requireText(run.input, "Agent run input");
+  if (run.workItemId !== undefined) requireSafeIdentity(run.workItemId, "Work item id");
+  if (!( ["active", "yielded", "failed"] as const).includes(run.status)) {
+    throw new Error(`Agent run status is invalid: ${String(run.status)}.`);
+  }
+  requireTimestamp(run.createdAt, "Agent run createdAt");
+  requireTimestamp(run.updatedAt, "Agent run updatedAt");
+  if (run.deliveredAt !== undefined) requireTimestamp(run.deliveredAt, "Agent run deliveredAt");
+  if (run.status === "active") {
+    if (run.summary !== undefined || run.endedAt !== undefined) {
+      throw new Error("An active Agent run cannot have terminal metadata.");
+    }
+  } else {
+    requireText(run.summary ?? "", "Agent run summary");
+    requireTimestamp(run.endedAt ?? "", "Agent run endedAt");
+  }
+  return run;
+}
+
 export function yieldAgentRun(run: AgentRun, summary: string, now: Date): AgentRun {
   return finishAgentRun(run, "yielded", requireText(summary, "Agent run summary"), now);
 }
 
 export function failAgentRun(run: AgentRun, summary: string, now: Date): AgentRun {
   return finishAgentRun(run, "failed", requireText(summary, "Agent run summary"), now);
-}
-
-export function expireAgentRun(run: AgentRun, now: Date): AgentRun {
-  return finishAgentRun(
-    run,
-    "expired",
-    "Controller inferred that the run is idle after its execution TTL elapsed.",
-    now
-  );
 }
 
 function finishAgentRun(
@@ -87,10 +114,6 @@ function finishAgentRun(
   };
 }
 
-function uniqueStrings(values: readonly string[]): string[] {
-  return [...new Set(values.map((value) => requireText(value, "Agent run topic")))];
-}
-
 function requireSafeIdentity(value: string, label: string): string {
   const normalized = requireText(value, label);
   if (["__proto__", "prototype", "constructor", ".", ".."].includes(normalized)
@@ -105,4 +128,10 @@ function requireText(value: string, label: string): string {
   const normalized = value.trim();
   if (normalized.length === 0) throw new Error(`${label} is required.`);
   return normalized;
+}
+
+function requireTimestamp(value: string, label: string): void {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
+    throw new Error(`${label} must be an ISO timestamp.`);
+  }
 }

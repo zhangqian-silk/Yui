@@ -227,11 +227,16 @@ export async function main(): Promise<void> {
     return;
   }
   if (resolved[0] === "task") {
-    if (
+    const enteringTask =
       (resolved[1] === "enter")
-      || (resolved[1] === "role" && resolved[2] === "enter")
-    ) {
+      || (resolved[1] === "role" && resolved[2] === "enter");
+    if (enteringTask) {
       await ensureFileTaskController(home, { environment: process.env });
+      const taskId = resolved[1] === "enter" ? resolved[2] : resolved[3];
+      const task = taskId === undefined ? null : store.getTask(taskId);
+      if (task?.status === "active" && task.repositoryId !== undefined) {
+        await workspacePreparer.prepareTaskWorkspace(task.id);
+      }
     }
     const result = runTaskCommand(resolved.slice(1), store, { runtime, environment: process.env });
     if (result.kind === "output") {

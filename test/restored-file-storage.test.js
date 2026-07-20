@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  CURRENT_AGGREGATE_SCHEMA_VERSION,
   CURRENT_STORAGE_SCHEMA_VERSION,
   ensureStorageSchema,
   inspectStorageSchema,
@@ -30,6 +31,8 @@ test("storage schema initializes v5 and rejects every non-current version", () =
   assert.deepEqual(JSON.parse(readFileSync(join(home, "schema.json"), "utf8")), {
     schemaVersion: 1,
     storageVersion: 5,
+    aggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
+    activeGeneration: null,
     updatedAt: "2026-07-19T00:00:00.000Z"
   });
   assert.equal(inspectStorageSchema(home).status, "current");
@@ -117,7 +120,6 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     taskId: task.id,
     title: "Implement",
     assignee: "leader",
-    topics: [],
     status: "running",
     createdAt: timestamp,
     updatedAt: timestamp
@@ -207,6 +209,23 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   assert.equal(store.getGlobalRoleSessionSet("operator").activeAgentId, "claude");
 });
 
+test("FileTaskStore keeps legacy config valid and enforces reconciliation interval bounds", () => {
+  const home = temporaryHome();
+  ensureStorageSchema(home);
+  const store = new FileTaskStore(home);
+
+  assert.deepEqual(store.getConfig(), { schemaVersion: 1 });
+  store.saveConfig({ schemaVersion: 1, reconciliationIntervalSeconds: 30 });
+  assert.equal(new FileTaskStore(home).getConfig().reconciliationIntervalSeconds, 30);
+
+  for (const reconciliationIntervalSeconds of [4, 301, 30.5]) {
+    assert.throws(
+      () => store.saveConfig({ schemaVersion: 1, reconciliationIntervalSeconds }),
+      /reconciliationIntervalSeconds must be an integer from 5 to 300/
+    );
+  }
+});
+
 test("record versions and aggregate shape are validated without silently repairing data", () => {
   const home = temporaryHome();
   ensureStorageSchema(home);
@@ -214,6 +233,17 @@ test("record versions and aggregate shape are validated without silently repairi
   assert.throws(
     () => store.saveTask({ schemaVersion: 2, id: "task-1" }),
     /Task.*schemaVersion 1/
+  );
+  assert.throws(
+    () => store.saveTask({
+      schemaVersion: 1,
+      id: "task-invalid",
+      title: "Invalid completion",
+      status: "completed",
+      createdAt: "2026-07-19T00:00:00.000Z",
+      updatedAt: "2026-07-19T00:00:00.000Z"
+    }),
+    /completedAt|completion metadata/i
   );
 
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify({

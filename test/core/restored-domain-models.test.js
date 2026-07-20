@@ -17,6 +17,7 @@ import {
 } from "../../dist/run/agentRun.js";
 import { activateTask, archiveTask, createTask } from "../../dist/task/task.js";
 import { createWorkItem } from "../../dist/workItem/workItem.js";
+import { createTaskMessage } from "../../dist/message/message.js";
 
 const now = new Date("2026-07-19T12:00:00.000Z");
 const later = new Date("2026-07-19T12:01:00.000Z");
@@ -139,7 +140,7 @@ test("restored persistent domain records are plain JSON with explicit schema ver
   const workItem = createWorkItem(
     "work-1",
     task.id,
-    { title: "Implement", assignee: "worker", topics: ["model", "model"] },
+    { title: "Implement", assignee: "worker" },
     now
   );
   const run = createAgentRun(
@@ -160,7 +161,6 @@ test("restored persistent domain records are plain JSON with explicit schema ver
   assert.equal(snapshot.yielded.schemaVersion, 1);
   assert.equal(snapshot.yielded.status, "yielded");
   assert.equal(snapshot.yielded.endedAt, later.toISOString());
-  assert.deepEqual(snapshot.workItem.topics, ["model"]);
 });
 
 test("Task follows the retained draft, active, archived lifecycle", () => {
@@ -176,4 +176,32 @@ test("Task follows the retained draft, active, archived lifecycle", () => {
   assert.equal(draft.repositoryId, "repo-1");
   assert.equal(draft.baseRef, "main");
   assert.throws(() => activateTask(archived, later), /archived/i);
+});
+
+test("TaskMessage represents user, operator, and Role result authors structurally", () => {
+  const user = createTaskMessage(
+    "message-1",
+    "Please continue",
+    "user",
+    { type: "user" },
+    now
+  );
+  const result = createTaskMessage(
+    "message-2",
+    "Implemented",
+    "role-result",
+    { type: "role", roleName: "worker" },
+    later,
+    { runId: "agent-run-1", workItemId: "work-1" }
+  );
+
+  assert.deepEqual(user.author, { type: "user" });
+  assert.equal(user.kind, "user");
+  assert.deepEqual(result.author, { type: "role", roleName: "worker" });
+  assert.equal(result.runId, "agent-run-1");
+  assert.equal(result.workItemId, "work-1");
+  assert.throws(
+    () => createTaskMessage("message-3", "Invalid", "role-result", { type: "user" }, now),
+    /Role result.*Role author/i
+  );
 });

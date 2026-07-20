@@ -4,10 +4,8 @@ export type WorkItem = {
   schemaVersion: 1;
   id: string;
   taskId: string;
-  cycleId?: string;
   title: string;
   assignee: string;
-  topics: string[];
   status: WorkItemStatus;
   outcome?: string;
   createdAt: string;
@@ -18,7 +16,7 @@ export type WorkItem = {
 export function createWorkItem(
   id: string,
   taskId: string,
-  input: Pick<WorkItem, "title" | "assignee" | "topics" | "cycleId">,
+  input: Pick<WorkItem, "title" | "assignee">,
   now: Date
 ): WorkItem {
   const timestamp = now.toISOString();
@@ -26,12 +24,8 @@ export function createWorkItem(
     schemaVersion: 1,
     id: requireSafeIdentity(id, "Work item id"),
     taskId: requireSafeIdentity(taskId, "Task id"),
-    ...(input.cycleId === undefined
-      ? {}
-      : { cycleId: requireSafeIdentity(input.cycleId, "Cycle id") }),
     title: requireText(input.title, "Work item title"),
     assignee: requireSafeIdentity(input.assignee, "Work item assignee"),
-    topics: [...new Set(input.topics.map((topic) => requireText(topic, "Work item topic")))],
     status: "pending",
     createdAt: timestamp,
     updatedAt: timestamp
