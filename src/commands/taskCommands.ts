@@ -40,6 +40,9 @@ import {
   yieldAgentRun,
   type AgentRun
 } from "../run/agentRun.js";
+import { createTaskBrief, updateTaskBrief } from "../brief/taskBrief.js";
+import { createDecision, supersedeDecision } from "../decision/decision.js";
+import { createMilestone } from "../milestone/milestone.js";
 import { queueLeaderWakeup, queueLeaderWakeupAfterYield } from "../scheduler/wakeupQueue.js";
 import {
   activateTask,
@@ -117,6 +120,9 @@ export function runTaskCommand(
     case "role": return taskRoleCommand(rest, store, options);
     case "work": return output(taskWorkCommand(rest, store, options));
     case "run": return output(taskRunCommand(rest, store, options));
+    case "brief": return output(taskBriefCommand(rest, store, options));
+    case "decision": return output(taskDecisionCommand(rest, store, options));
+    case "milestone": return output(taskMilestoneCommand(rest, store, options));
     case "enter": return enterTaskRoleAlias(rest, store, options);
     default:
       throw usageError(command === undefined
@@ -1193,6 +1199,262 @@ function parseIsoTimestamp(value: string, label: string): string {
     throw usageError(`${label} must be an ISO/RFC 3339 timestamp with a timezone.`);
   }
   return timestamp.toISOString();
+}
+
+function taskBriefCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  const [command, ...rest] = args;
+  if (command === "show") {
+    exactPositionals(rest, 1, "Task brief show usage: taskmux task brief show <task>.");
+    const task = requireTask(store, rest[0]);
+    const brief = store.getTaskBrief(task.id);
+    if (brief === null) return `Task ${task.id} has no brief.\n`;
+    return [
+      `Task: ${task.id}`,
+      `Objective: ${brief.objective}`,
+      `Boundaries:`,
+      ...(brief.boundaries.length === 0 ? ["  (none)"] : brief.boundaries.map((b) => `  - ${b}`)),
+      `Current focus: ${brief.currentFocus}`,
+      `Leader summary: ${brief.leaderSummary}`,
+      `Updated by: ${brief.updatedBy}`,
+      `Updated at: ${brief.updatedAt}`
+    ].join("\n").concat("\n");
+  }
+  if (command === "update") {
+    const usage = "Task brief update usage: taskmux task brief update <task> [--objective <text>] [--boundary <text> ...] [--focus <text>] [--leader-summary <text>] [--updated-by <name>].";
+    const parsed = parseMultiValueTail(rest, new Set(["--objective", "--focus", "--leader-summary", "--updated-by"]), new Set(["--boundary"]), usage);
+    exactPositionals(parsed.positionals, 1, usage);
+    const hasObjective = parsed.options.has("--objective");
+    const hasFocus = parsed.options.has("--focus");
+    const hasSummary = parsed.options.has("--leader-summary");
+    const boundaries = parsed.multiOptions.get("--boundary") ?? [];
+    if (!hasObjective && !hasFocus && !hasSummary && boundaries.length === 0) {
+      throw usageError("At least one brief field is required.", usage);
+    }
+    const now = clock(options);
+    const result = store.transaction((tx) => {
+      const task = requireTask(tx, parsed.positionals[0]);
+      const existing = tx.getTaskBrief(task.id);
+      const updatedBy = trimmed(parsed.options.get("--updated-by")) ?? existing?.updatedBy ?? "leader";
+      const brief = existing === null
+        ? createTaskBrief({
+            objective: requiredText(parsed.options.get("--objective"), "--objective"),
+            boundaries,
+            currentFocus: requiredText(parsed.options.get("--focus"), "--focus"),
+            leaderSummary: requiredText(parsed.options.get("--leader-summary"), "--leader-summary"),
+            updatedBy
+          }, now)
+        : updateTaskBrief(existing, {
+            ...(hasObjective ? { objective: parsed.options.get("--objective") } : {}),
+            ...(boundaries.length > 0 ? { boundaries } : {}),
+            ...(hasFocus ? { currentFocus: parsed.options.get("--focus") } : {}),
+            ...(hasSummary ? { leaderSummary: parsed.options.get("--leader-summary") } : {})
+          }, updatedBy, now);
+      tx.saveTaskBrief(task.id, brief);
+      recordTaskEvent(tx, task.id, "brief.updated", { updatedBy }, now);
+      return { task, brief };
+    });
+    options.runtime?.notifyStateChanged(result.task.id);
+    return `Updated brief for ${result.task.id}\n`;
+  }
+  throw usageError(command === undefined
+    ? "Task brief command is required."
+    : `Unknown command: task brief ${command}`);
+}
+
+function taskDecisionCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  const [command, ...rest] = args;
+  if (command === "record") {
+    const usage = "Task decision record usage: taskmux task decision record <task> --title <text> --rationale <text>.";
+    const parsed = parseTail(rest, new Set(["--title", "--rationale"]), usage);
+    exactPositionals(parsed.positionals, 1, usage);
+    const title = requiredOption(parsed.options, "--title");
+    const rationale = requiredOption(parsed.options, "--rationale");
+    const now = clock(options);
+    const result = store.transaction((tx) => {
+      const task = requireTask(tx, parsed.positionals[0]);
+      const decision = createDecision(tx.nextDecisionId(task.id), task.id, title, rationale, now);
+      tx.saveDecision(task.id, decision);
+      recordTaskEvent(tx, task.id, "decision.recorded", { decisionId: decision.id, title }, now);
+      return { task, decision };
+    });
+    options.runtime?.notifyStateChanged(result.task.id);
+    return `Recorded decision ${result.decision.id} for ${result.task.id}\n`;
+  }
+  if (command === "list") {
+    const usage = "Task decision list usage: taskmux task decision list <task> [--status active|superseded].";
+    const parsed = parseTail(rest, new Set(["--status"]), usage);
+    exactPositionals(parsed.positionals, 1, usage);
+    const task = requireTask(store, parsed.positionals[0]);
+    let decisions = store.listDecisions(task.id);
+    const status = parsed.options.get("--status");
+    if (status !== undefined) {
+      if (status !== "active" && status !== "superseded") {
+        throw usageError("--status must be active or superseded.", usage);
+      }
+      decisions = decisions.filter((d) => d.status === status);
+    }
+    if (decisions.length === 0) return `No decisions found for ${task.id}.\n`;
+    return `${renderTable(
+      `Decisions: ${task.id}`,
+      [
+        { header: "Decision", minWidth: 8, maxWidth: 18 },
+        { header: "Status", minWidth: 6, maxWidth: 12 },
+        { header: "Title", minWidth: 8, maxWidth: 64 },
+        { header: "Created", minWidth: 10, maxWidth: 28 }
+      ],
+      decisions.map((d) => [d.id, d.status, d.title, d.createdAt]),
+      defaultTableWidth()
+    )}\n`;
+  }
+  if (command === "show") {
+    exactPositionals(rest, 2, "Task decision show usage: taskmux task decision show <task> <decision>.");
+    const task = requireTask(store, rest[0]);
+    const decision = store.getDecision(task.id, rest[1]);
+    if (decision === null) throw dataError(`Decision not found: ${rest[1]}.`);
+    return [
+      `Decision: ${decision.id}`,
+      `Task: ${task.id}`,
+      `Title: ${decision.title}`,
+      `Rationale: ${decision.rationale}`,
+      `Status: ${decision.status}`,
+      ...(decision.supersededReason === undefined ? [] : [`Superseded reason: ${decision.supersededReason}`]),
+      ...(decision.supersededAt === undefined ? [] : [`Superseded at: ${decision.supersededAt}`]),
+      `Created: ${decision.createdAt}`,
+      `Updated: ${decision.updatedAt}`
+    ].join("\n").concat("\n");
+  }
+  if (command === "supersede") {
+    const usage = "Task decision supersede usage: taskmux task decision supersede <task> <decision> --reason <text>.";
+    const parsed = parseTail(rest, new Set(["--reason"]), usage);
+    exactPositionals(parsed.positionals, 2, usage);
+    const reason = requiredOption(parsed.options, "--reason");
+    const now = clock(options);
+    const result = store.transaction((tx) => {
+      const task = requireTask(tx, parsed.positionals[0]);
+      const existing = tx.getDecision(task.id, parsed.positionals[1]);
+      if (existing === null) throw dataError(`Decision not found: ${parsed.positionals[1]}.`);
+      const decision = supersedeDecision(existing, reason, now);
+      tx.saveDecision(task.id, decision);
+      recordTaskEvent(tx, task.id, "decision.superseded", { decisionId: decision.id, reason }, now);
+      return { task, decision };
+    });
+    options.runtime?.notifyStateChanged(result.task.id);
+    return `Superseded decision ${result.decision.id} for ${result.task.id}\n`;
+  }
+  throw usageError(command === undefined
+    ? "Task decision command is required."
+    : `Unknown command: task decision ${command}`);
+}
+
+function taskMilestoneCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  const [command, ...rest] = args;
+  if (command === "add") {
+    const usage = "Task milestone add usage: taskmux task milestone add <task> --title <text> --summary <text>.";
+    const parsed = parseTail(rest, new Set(["--title", "--summary"]), usage);
+    exactPositionals(parsed.positionals, 1, usage);
+    const title = requiredOption(parsed.options, "--title");
+    const summary = requiredOption(parsed.options, "--summary");
+    const now = clock(options);
+    const result = store.transaction((tx) => {
+      const task = requireTask(tx, parsed.positionals[0]);
+      const milestone = createMilestone(tx.nextMilestoneId(task.id), task.id, title, summary, now);
+      tx.saveMilestone(task.id, milestone);
+      recordTaskEvent(tx, task.id, "milestone.added", { milestoneId: milestone.id, title }, now);
+      return { task, milestone };
+    });
+    options.runtime?.notifyStateChanged(result.task.id);
+    return `Added milestone ${result.milestone.id} for ${result.task.id}\n`;
+  }
+  if (command === "list") {
+    exactPositionals(rest, 1, "Task milestone list usage: taskmux task milestone list <task>.");
+    const task = requireTask(store, rest[0]);
+    const milestones = store.listMilestones(task.id);
+    if (milestones.length === 0) return `No milestones found for ${task.id}.\n`;
+    return `${renderTable(
+      `Milestones: ${task.id}`,
+      [
+        { header: "Milestone", minWidth: 9, maxWidth: 18 },
+        { header: "Title", minWidth: 8, maxWidth: 64 },
+        { header: "Created", minWidth: 10, maxWidth: 28 }
+      ],
+      milestones.map((m) => [m.id, m.title, m.createdAt]),
+      defaultTableWidth()
+    )}\n`;
+  }
+  if (command === "show") {
+    exactPositionals(rest, 2, "Task milestone show usage: taskmux task milestone show <task> <milestone>.");
+    const task = requireTask(store, rest[0]);
+    const milestone = store.getMilestone(task.id, rest[1]);
+    if (milestone === null) throw dataError(`Milestone not found: ${rest[1]}.`);
+    return [
+      `Milestone: ${milestone.id}`,
+      `Task: ${task.id}`,
+      `Title: ${milestone.title}`,
+      `Summary: ${milestone.summary}`,
+      `Created by: ${milestone.createdBy}`,
+      `Created: ${milestone.createdAt}`
+    ].join("\n").concat("\n");
+  }
+  throw usageError(command === undefined
+    ? "Task milestone command is required."
+    : `Unknown command: task milestone ${command}`);
+}
+
+type ParsedMultiTail = Readonly<{
+  positionals: string[];
+  options: ReadonlyMap<string, string>;
+  multiOptions: ReadonlyMap<string, string[]>;
+}>;
+
+function parseMultiValueTail(
+  args: string[],
+  valueOptions: ReadonlySet<string>,
+  repeatOptions: ReadonlySet<string>,
+  usage: string
+): ParsedMultiTail {
+  const positionals: string[] = [];
+  const options = new Map<string, string>();
+  const multiOptions = new Map<string, string[]>();
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index];
+    if (!value.startsWith("--")) {
+      positionals.push(value);
+      continue;
+    }
+    if (!valueOptions.has(value) && !repeatOptions.has(value)) {
+      throw usageError(`Unsupported option: ${value}.`, usage);
+    }
+    if (repeatOptions.has(value)) {
+      const optionValue = args[index + 1];
+      if (optionValue === undefined || optionValue.startsWith("--")) {
+        throw usageError(`${value} is required.`, usage);
+      }
+      const existing = multiOptions.get(value) ?? [];
+      multiOptions.set(value, [...existing, optionValue]);
+      index += 1;
+      continue;
+    }
+    if (options.has(value)) throw usageError(`Option may only be specified once: ${value}.`, usage);
+    const optionValue = args[index + 1];
+    if (optionValue === undefined || optionValue.startsWith("--")) {
+      throw usageError(`${value} is required.`, usage);
+    }
+    options.set(value, optionValue);
+    index += 1;
+  }
+  return { positionals, options, multiOptions };
 }
 
 type ParsedTail = Readonly<{

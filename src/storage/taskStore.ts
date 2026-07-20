@@ -172,9 +172,11 @@ export type TaskStore = {
   nextDecisionId(taskId: string): string;
   saveDecision(taskId: string, decision: Decision): void;
   listDecisions(taskId: string): Decision[];
+  getDecision(taskId: string, decisionId: string): Decision | null;
   nextMilestoneId(taskId: string): string;
   saveMilestone(taskId: string, milestone: Milestone): void;
   listMilestones(taskId: string): Milestone[];
+  getMilestone(taskId: string, milestoneId: string): Milestone | null;
   nextEventId(taskId: string): string;
   saveEvent(taskId: string, event: TaskEvent): void;
   listEvents(taskId: string): TaskEvent[];
@@ -537,6 +539,9 @@ export class FileTaskStore implements TaskStore {
   listDecisions(taskId: string): Decision[] {
     return values(this.#requireTask(taskId).decisions, "id");
   }
+  getDecision(taskId: string, decisionId: string): Decision | null {
+    return this.#requireTask(taskId).decisions[decisionId] ?? null;
+  }
   nextMilestoneId(_taskId: string): string {
     return this.#nextGlobalId("milestone", (state) => allKeys(state, "milestones"));
   }
@@ -555,6 +560,9 @@ export class FileTaskStore implements TaskStore {
   }
   listMilestones(taskId: string): Milestone[] {
     return values(this.#requireTask(taskId).milestones, "id");
+  }
+  getMilestone(taskId: string, milestoneId: string): Milestone | null {
+    return this.#requireTask(taskId).milestones[milestoneId] ?? null;
   }
   nextEventId(_taskId: string): string { return this.#nextGlobalId("event", (state) => allKeys(state, "events")); }
   saveEvent(taskId: string, event: TaskEvent): void {
