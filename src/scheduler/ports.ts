@@ -75,9 +75,6 @@ export type LeaderDispatchFailurePersistence = Readonly<{
 export interface SchedulerStorePort {
   listTasks(): readonly SchedulerTask[];
   getTask(taskId: string): SchedulerTask | null;
-  getTaskBrief(taskId: string): import("../brief/taskBrief.js").TaskBrief | null;
-  listDecisions(taskId: string): readonly import("../decision/decision.js").Decision[];
-  listMilestones(taskId: string): readonly import("../milestone/milestone.js").Milestone[];
   listRoles(taskId: string): readonly SchedulerRole[];
   getRole(taskId: string, roleName: string): SchedulerRole | null;
   getActiveAgentRun(taskId: string, roleName: string): SchedulerAgentRun | null;

@@ -6,6 +6,9 @@ export type CandidateProviderName =
   | "jobs"
   | "repositories"
   | "runs"
+  | "task-decisions"
+  | "task-events"
+  | "task-milestones"
   | "task-roles"
   | "tasks"
   | "work-items";
@@ -17,6 +20,9 @@ export type SelectableEntity =
   | "repository"
   | "run"
   | "task"
+  | "decision"
+  | "event"
+  | "milestone"
   | "task-role"
   | "work-item";
 
@@ -120,6 +126,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       : { "--native-id": "value" }
   })),
   taskTarget("show"),
+  taskTarget("context"),
   {
     ...taskTarget("update"),
     trailingOptions: {
@@ -295,7 +302,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
   ] as const).map(([group, command]): InteractionPolicy => {
     const trailingOptions: Record<string, TrailingOptionKind> = {};
     if (group === "brief" && command === "update") {
-      Object.assign(trailingOptions, { "--objective": "value", "--boundary": "value", "--focus": "value", "--leader-summary": "value", "--updated-by": "value" });
+      Object.assign(trailingOptions, { "--objective": "value", "--boundary": "value", "--focus": "value", "--leader-summary": "value" });
     } else if (group === "decision" && command === "record") {
       Object.assign(trailingOptions, { "--title": "value", "--rationale": "value" });
     } else if (group === "decision" && command === "list") {
@@ -305,9 +312,45 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     } else if (group === "milestone" && command === "add") {
       Object.assign(trailingOptions, { "--title": "value", "--summary": "value" });
     }
+    const mutatesKnowledge = (group === "brief" && command === "update")
+      || (group === "decision" && (command === "record" || command === "supersede"))
+      || (group === "milestone" && command === "add");
+    const selectors: ArgumentSelector[] = [{
+      argumentIndex: 3,
+      entity: "task",
+      provider: "tasks",
+      actionTarget: true,
+      ...(mutatesKnowledge ? { statuses: ["draft", "active"] } : {})
+    }];
+    if (group === "decision" && (command === "show" || command === "supersede")) {
+      selectors.push({
+        argumentIndex: 4,
+        entity: "decision",
+        provider: "task-decisions",
+        dependsOn: 3,
+        actionTarget: true,
+        ...(command === "supersede" ? { statuses: ["active"] } : {})
+      });
+    } else if (group === "milestone" && command === "show") {
+      selectors.push({
+        argumentIndex: 4,
+        entity: "milestone",
+        provider: "task-milestones",
+        dependsOn: 3,
+        actionTarget: true
+      });
+    } else if (group === "event" && command === "show") {
+      selectors.push({
+        argumentIndex: 4,
+        entity: "event",
+        provider: "task-events",
+        dependsOn: 3,
+        actionTarget: true
+      });
+    }
     return {
       commandPath: ["task", group, command],
-      selectors: [{ argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true }],
+      selectors,
       ...(Object.keys(trailingOptions).length > 0 ? { trailingOptions } : {})
     };
   })

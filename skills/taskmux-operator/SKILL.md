@@ -9,7 +9,7 @@ Act as the task-neutral entry point for the user's work. Keep the flow simple: i
 
 ## Handle a request
 
-1. Inspect existing work with `taskmux task list`. Use `taskmux task show <task-id>`, `taskmux task message list <task-id>`, and `taskmux task work list <task-id>` when a likely match exists.
+1. Inspect existing work with `taskmux task list`. When a likely match exists, use `taskmux task context <task-id>` first; use the narrower show/list commands only when one collection or record needs closer inspection.
 2. Route a request to an existing Task with:
 
    ```sh
@@ -26,7 +26,7 @@ Act as the task-neutral entry point for the user's work. Keep the flow simple: i
 5. Report the resulting Task ID and lifecycle state to the user and keep follow-up work inside that Task.
 
 Use `taskmux --json ...` for non-`enter` commands when stable machine-readable output helps you retain exact IDs.
-Structured reads such as `task list` and `task show` return their payload in the top-level `data` field; consume that field directly instead of parsing terminal text from `output`.
+Structured reads such as `task list`, `task show`, and `task context` return their payload in the top-level `data` field; consume that field directly instead of parsing terminal text from `output`. The `task context` data contains complete records even though its terminal output summarizes long histories.
 
 ## Repositories and direct Task creation
 

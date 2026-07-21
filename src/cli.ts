@@ -238,7 +238,7 @@ export async function main(): Promise<void> {
         await workspacePreparer.prepareTaskWorkspace(task.id);
       }
     }
-    const result = runTaskCommand(resolved.slice(1), store, { runtime, environment: process.env, json: jsonOutput });
+    const result = runTaskCommand(resolved.slice(1), store, { runtime, environment: process.env });
     if (result.kind === "output") {
       emit(result.output, false, result.data);
       return;
@@ -414,6 +414,9 @@ function selectionCall(
     case "task.role.show": return callOptional(reader, "getRole", [params.taskId, params.roleName]);
     case "task.work.list": return callOptional(reader, "listWorkItems", [params.taskId]);
     case "task.run.list": return callOptional(reader, "listAgentRuns", [params.workItemId]);
+    case "task.decision.list": return callOptional(reader, "listDecisions", [params.taskId]);
+    case "task.milestone.list": return callOptional(reader, "listMilestones", [params.taskId]);
+    case "task.event.list": return callOptional(reader, "listEvents", [params.taskId]);
     case "jobs.list": return callOptional(reader, "listJobs");
     default: return [];
   }

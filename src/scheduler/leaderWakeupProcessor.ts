@@ -175,7 +175,7 @@ function leaderWakeupInput(
       lines.push(`Leader summary: ${brief.leaderSummary}`);
     }
   }
-  const activeDecisions = decisions.filter((d) => d.status === "active").slice(0, 3);
+  const activeDecisions = decisions.filter((d) => d.status === "active").slice(-3);
   if (activeDecisions.length > 0) {
     lines.push("Active decisions:");
     for (const decision of activeDecisions) {
@@ -192,7 +192,7 @@ function leaderWakeupInput(
     }
   }
   lines.push(
-    `Inspect taskmux task show ${taskId}, taskmux task message list ${taskId}, taskmux task work list ${taskId}, taskmux task brief show ${taskId}, taskmux task decision list ${taskId}, and taskmux task milestone list ${taskId}, and taskmux task event list ${taskId}; then continue Leader stewardship.`
+    `Inspect taskmux task context ${taskId}; then continue Leader stewardship. Use narrower show/list commands only when one record needs closer inspection.`
   );
   return lines.join("\n");
 }

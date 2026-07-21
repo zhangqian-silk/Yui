@@ -80,6 +80,35 @@ export async function getSelectionCandidates(
       const roles = orderRoleOptions(await list(ports, "task.role.list", { taskId }));
       return entities("task role", `Select Task role: ${taskId}`, roles, ["name", "kind", "agentId"]);
     }
+    case "task-decisions": {
+      const taskId = dependencyValue(selector, args);
+      if (taskId === undefined) return null;
+      const decisions = (await list(ports, "task.decision.list", { taskId })).filter((decision) =>
+        selector.statuses === undefined
+        || selector.statuses.includes(stringField(decision, "status") ?? "")
+      );
+      return entities("decision", `Select Decision: ${taskId}`, decisions, ["id", "status", "title"]);
+    }
+    case "task-milestones": {
+      const taskId = dependencyValue(selector, args);
+      if (taskId === undefined) return null;
+      return entities(
+        "milestone",
+        `Select Milestone: ${taskId}`,
+        await list(ports, "task.milestone.list", { taskId }),
+        ["id", "title", "createdAt"]
+      );
+    }
+    case "task-events": {
+      const taskId = dependencyValue(selector, args);
+      if (taskId === undefined) return null;
+      return entities(
+        "event",
+        `Select Event: ${taskId}`,
+        await list(ports, "task.event.list", { taskId }),
+        ["id", "type", "createdAt"]
+      );
+    }
     case "work-items":
       return entities(
         "work item",

@@ -53,8 +53,11 @@ taskmux task create "Ship CSV export" --repository <repository-id> --base main
 taskmux task update <task-id> --priority high --tags release,csv --due-at 2026-08-01T00:00:00Z
 taskmux task update <task-id> --clear-priority --clear-tags --clear-due-at
 taskmux task show <task-id>
+taskmux task context <task-id>
 taskmux task activate <task-id>
 ```
+
+Use `task context` as the first detailed read of an existing Task. It combines the Task, Brief, active Decisions, recent Milestones, Roles, current and recent WorkItems with their Runs, recent Messages, and recent Events. Terminal output keeps histories and long text compact; `taskmux --json task context <task-id>` returns the complete records in the top-level `data` field.
 
 Activation queues the first durable Leader wake. For a repository-backed Task, the Controller first creates one worktree per Role at `<TASKMUX_HOME>/worktrees/<task-id>/<role-name>` on `taskmux/<task-id>/<role-name>`, then starts the Leader. Roles added later receive their own worktree before delivery.
 
@@ -89,10 +92,10 @@ Yield atomically completes the Run and WorkItem, appends the result message, and
 Inspect the result:
 
 ```sh
-taskmux task work list <task-id>
-taskmux task message list <task-id>
-taskmux task run list <work-item-id>
+taskmux task context <task-id>
 ```
+
+Use the narrower `task work`, `task message`, `task run`, and Task Knowledge commands when you need one collection or record.
 
 When the requested outcome is finished, complete the Task to stop automatic Leader wakes without deleting its sessions or Role worktrees:
 

@@ -58,6 +58,7 @@ const PUBLIC_PATHS = [
   "task reopen",
   "task list",
   "task show",
+  "task context",
   "task archive",
   "task reconcile",
   "task message",
@@ -134,6 +135,16 @@ function createPorts() {
     "task.list": [
       { id: "task-alpha", title: "Alpha", status: "active" },
       { id: "task-beta", title: "Beta", status: "active" }
+    ],
+    "task.decision.list": [
+      { id: "decision-active", title: "Active", status: "active" },
+      { id: "decision-old", title: "Old", status: "superseded" }
+    ],
+    "task.milestone.list": [
+      { id: "milestone-alpha", title: "Alpha complete", createdAt: "2026-07-21T10:00:00.000Z" }
+    ],
+    "task.event.list": [
+      { id: "event-alpha", type: "brief.updated", createdAt: "2026-07-21T10:00:00.000Z" }
     ]
   };
   return {
@@ -283,6 +294,21 @@ test("candidate providers read the current core entities through CoreCliPorts.ca
   assert.deepEqual(values(await getSelectionCandidates(
     selector("jobs", "job"), ports, ["jobs", "retry"]
   )), ["job-alpha", "job-beta"]);
+  assert.deepEqual(values(await getSelectionCandidates(
+    selector("task-decisions", "decision", { argumentIndex: 4, dependsOn: 3 }),
+    ports,
+    ["task", "decision", "show", "task-alpha"]
+  )), ["decision-active", "decision-old"]);
+  assert.deepEqual(values(await getSelectionCandidates(
+    selector("task-milestones", "milestone", { argumentIndex: 4, dependsOn: 3 }),
+    ports,
+    ["task", "milestone", "show", "task-alpha"]
+  )), ["milestone-alpha"]);
+  assert.deepEqual(values(await getSelectionCandidates(
+    selector("task-events", "event", { argumentIndex: 4, dependsOn: 3 }),
+    ports,
+    ["task", "event", "show", "task-alpha"]
+  )), ["event-alpha"]);
   const agents = await getSelectionCandidates(
     selector("configured-agents", "agent", { option: "--agent" }),
     ports,
@@ -310,6 +336,42 @@ test("candidate providers read the current core entities through CoreCliPorts.ca
       .map(({ params }) => params.workItemId)),
     new Set(["work-alpha", "work-beta"])
   );
+});
+
+test("Task knowledge policies select dependent record identities", async () => {
+  const expected = [
+    [["task", "decision", "show"], "task-decisions", undefined],
+    [["task", "decision", "supersede"], "task-decisions", ["active"]],
+    [["task", "milestone", "show"], "task-milestones", undefined],
+    [["task", "event", "show"], "task-events", undefined]
+  ];
+  for (const [path, provider, statuses] of expected) {
+    const policy = findInteractionPolicy(findCommandNode(path));
+    assert.ok(policy, path.join(" "));
+    const mutatesKnowledge = path.join(" ") === "task decision supersede";
+    assert.deepEqual(policy.selectors[0], {
+      argumentIndex: 3,
+      entity: "task",
+      provider: "tasks",
+      actionTarget: true,
+      ...(mutatesKnowledge ? { statuses: ["draft", "active"] } : {})
+    });
+    assert.deepEqual(policy.selectors[1], {
+      argumentIndex: 4,
+      entity: provider === "task-decisions" ? "decision" : provider === "task-milestones" ? "milestone" : "event",
+      provider,
+      dependsOn: 3,
+      actionTarget: true,
+      ...(statuses === undefined ? {} : { statuses })
+    });
+  }
+
+  const candidates = await resolveCompletionCandidates({
+    words: ["task", "decision", "show", "task-alpha"],
+    current: "decision-",
+    ports: createPorts()
+  });
+  assert.deepEqual(candidates, ["decision-active", "decision-old"]);
 });
 
 test("an empty Agent selection chooses the configured default Agent", async () => {

@@ -69,8 +69,43 @@ test("an idle Leader starts a real wakeup run, waits for readiness, sends once, 
   assert.equal(store.savedDispatches[0].run.status, "active");
   assert.equal(store.savedDispatches[0].run.roleName, "leader");
   assert.match(store.savedDispatches[0].run.input, /role-result/);
+  assert.match(store.savedDispatches[0].run.input, /taskmux task context task-1/);
+  assert.doesNotMatch(store.savedDispatches[0].run.input, /taskmux task message list/);
   assert.equal(store.pending.has("task-1"), false);
   assert.deepEqual(store.operations.slice(-2), ["save-dispatch", "save-delivery"]);
+});
+
+test("Leader wakeup context includes the Brief and the latest active Decisions", async () => {
+  const store = fakeStore({
+    brief: {
+      schemaVersion: 1,
+      objective: "Restore useful task knowledge",
+      boundaries: ["Keep the runtime lean"],
+      currentFocus: "CLI integration",
+      leaderSummary: "Storage is ready",
+      updatedAt: NOW.toISOString(),
+      updatedBy: "leader"
+    },
+    decisions: [1, 2, 3, 4].map((number) => ({
+      schemaVersion: 1,
+      id: `decision-${number}`,
+      taskId: "task-1",
+      title: `Decision ${number}`,
+      rationale: `Reason ${number}`,
+      status: "active",
+      createdAt: NOW.toISOString(),
+      updatedAt: NOW.toISOString()
+    }))
+  });
+
+  await processLeaderWakeups(store, fakeDelivery(), NOW);
+
+  const input = store.savedDispatches[0].run.input;
+  assert.match(input, /Objective: Restore useful task knowledge/);
+  assert.match(input, /Keep the runtime lean/);
+  assert.doesNotMatch(input, /Decision 1: Reason 1/);
+  assert.match(input, /Decision 2: Reason 2/);
+  assert.match(input, /Decision 4: Reason 4/);
 });
 
 test("a fresh runtime-discovered Leader may register its native session after dispatch", async () => {
@@ -217,9 +252,9 @@ function fakeStore(options = {}) {
     },
     getLeaderFailure: () => null,
     getOperatorNotification: () => null,
-    getTaskBrief: () => null,
-    listDecisions: () => [],
-    listMilestones: () => [],
+    getTaskBrief: () => options.brief ?? null,
+    listDecisions: () => options.decisions ?? [],
+    listMilestones: () => options.milestones ?? [],
     saveLeaderDispatch: (input) => {
       store.operations.push("save-dispatch");
       store.savedDispatches.push(input);

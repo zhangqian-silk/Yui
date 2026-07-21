@@ -220,6 +220,11 @@ const taskChildren: readonly NodeInput[] = [
   { name: "reopen", summary: "Reopen a completed Task.", usage: "taskmux task reopen <id>" },
   { name: "list", summary: "List Tasks." },
   { name: "show", summary: "Show a Task.", usage: "taskmux task show <id>" },
+  {
+    name: "context",
+    summary: "Show consolidated working context for a Task.",
+    usage: "taskmux task context <task>"
+  },
   { name: "archive", summary: "Archive a Task.", usage: "taskmux task archive <id>" },
   { name: "reconcile", summary: "Run one immediate Controller reconciliation.", usage: "taskmux task reconcile <id>" },
   {
@@ -311,8 +316,8 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "update",
         summary: "Create or update the Task Brief.",
-        usage: "taskmux task brief update <task> [--objective <text>] [--boundary <text> ...] [--focus <text>] [--leader-summary <text>] [--updated-by <name>]",
-        options: ["--objective", "--boundary", "--focus", "--leader-summary", "--updated-by"]
+        usage: "taskmux task brief update <task> [--objective <text>] [--boundary <text> ...] [--focus <text>] [--leader-summary <text>]",
+        options: ["--objective", "--boundary", "--focus", "--leader-summary"]
       }
     ]
   },
@@ -471,7 +476,7 @@ export const ROOT_COMMAND = buildNode({
       name: "task",
       summary: "Manage Tasks, Roles, work items, and Runs.",
       sections: [
-        { id: "lifecycle", title: "Lifecycle", entries: ["create", "update", "activate", "complete", "reopen", "list", "show", "archive", "reconcile"] },
+        { id: "lifecycle", title: "Lifecycle", entries: ["create", "update", "activate", "complete", "reopen", "list", "show", "context", "archive", "reconcile"] },
         { id: "collaboration", title: "Collaboration", entries: ["message", "role", "work", "run", "enter"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
       ],

@@ -51,8 +51,11 @@ taskmux task create "交付 CSV 导出" --repository <repository-id> --base main
 taskmux task update <task-id> --priority high --tags release,csv --due-at 2026-08-01T00:00:00Z
 taskmux task update <task-id> --clear-priority --clear-tags --clear-due-at
 taskmux task show <task-id>
+taskmux task context <task-id>
 taskmux task activate <task-id>
 ```
+
+查看已有 Task 的详细状态时，优先使用 `task context`。它一次聚合 Task、Brief、Active Decision、最近的 Milestone、Role、当前及最近的 WorkItem 与关联 Run、最近的 Message 和 Event。终端输出会精简历史和长文本；`taskmux --json task context <task-id>` 会在顶层 `data` 中返回完整记录。
 
 新 Task 是 Draft，并已创建 Leader。激活时会排入第一次持久 Leader wake。带 Repository 的 Task 会先为每个 Role 创建 `<TASKMUX_HOME>/worktrees/<task-id>/<role-name>`，对应分支为 `taskmux/<task-id>/<role-name>`，然后才启动 Leader；后续新增 Role 也会在执行前获得独立 worktree。
 
@@ -85,10 +88,10 @@ taskmux task run yield <run-id> --summary "导出器已完成，聚焦测试通�
 yield 会原子完成 Run 和 WorkItem、追加结果消息并唤醒 Leader。Leader 不会自唤醒；Leader 忙碌时，Operator/Worker 的 pending wake 会一直保留到 Leader 空闲。
 
 ```sh
-taskmux task work list <task-id>
-taskmux task message list <task-id>
-taskmux task run list <work-item-id>
+taskmux task context <task-id>
 ```
+
+需要查看单个集合或记录时，再使用 `task work`、`task message`、`task run` 和 Task Knowledge 下的细分命令。
 
 完成目标后，可将 Task 标记为 completed，从而停止自动唤醒，同时保留 session 和各 Role worktree：
 

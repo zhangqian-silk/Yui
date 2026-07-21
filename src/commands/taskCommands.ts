@@ -70,6 +70,7 @@ import {
   roleOptionSpecs,
   roleProfilePatch
 } from "./roleConfiguration.js";
+import { runTaskContextCommand } from "./taskContextCommand.js";
 
 const LEADER_ROLE = "leader";
 
@@ -98,7 +99,6 @@ export type TaskCommandOptions = Readonly<{
   runtime?: TaskWorkflowRuntimePort;
   now?: () => Date;
   environment?: NodeJS.ProcessEnv;
-  json?: boolean;
 }>;
 
 export function runTaskCommand(
@@ -112,6 +112,7 @@ export function runTaskCommand(
     case "update": return output(updateTaskCommand(rest, store, options));
     case "list": return listTaskCommand(rest, store);
     case "show": return showTaskCommand(rest, store);
+    case "context": return runTaskContextCommand(rest, store);
     case "activate": return output(activateTaskCommand(rest, store, options));
     case "complete": return output(completeTaskCommand(rest, store, options));
     case "reopen": return output(reopenTaskCommand(rest, store, options));
@@ -121,10 +122,10 @@ export function runTaskCommand(
     case "role": return taskRoleCommand(rest, store, options);
     case "work": return output(taskWorkCommand(rest, store, options));
     case "run": return output(taskRunCommand(rest, store, options));
-    case "brief": return output(taskBriefCommand(rest, store, options));
-    case "decision": return output(taskDecisionCommand(rest, store, options));
-    case "milestone": return output(taskMilestoneCommand(rest, store, options));
-    case "event": return output(taskEventCommand(rest, store, options));
+    case "brief": return taskBriefCommand(rest, store, options);
+    case "decision": return taskDecisionCommand(rest, store, options);
+    case "milestone": return taskMilestoneCommand(rest, store, options);
+    case "event": return taskEventCommand(rest, store);
     case "enter": return enterTaskRoleAlias(rest, store, options);
     default:
       throw usageError(command === undefined
@@ -1219,19 +1220,16 @@ function taskBriefCommand(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
-): string {
+): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "show") {
     exactPositionals(rest, 1, "Task brief show usage: taskmux task brief show <task>.");
     const task = requireTask(store, rest[0]);
     const brief = store.getTaskBrief(task.id);
     if (brief === null) {
-      return options.json
-        ? JSON.stringify({ taskId: task.id, brief: null })
-        : `Task ${task.id} has no brief.\n`;
+      return output(`Task ${task.id} has no brief.\n`, { taskId: task.id, brief: null });
     }
-    if (options.json) return JSON.stringify({ taskId: task.id, brief });
-    return [
+    return output([
       `Task: ${task.id}`,
       `Objective: ${brief.objective}`,
       `Boundaries:`,
@@ -1240,11 +1238,11 @@ function taskBriefCommand(
       `Leader summary: ${brief.leaderSummary}`,
       `Updated by: ${brief.updatedBy}`,
       `Updated at: ${brief.updatedAt}`
-    ].join("\n").concat("\n");
+    ].join("\n").concat("\n"), { taskId: task.id, brief });
   }
   if (command === "update") {
-    const usage = "Task brief update usage: taskmux task brief update <task> [--objective <text>] [--boundary <text> ...] [--focus <text>] [--leader-summary <text>] [--updated-by <name>].";
-    const parsed = parseMultiValueTail(rest, new Set(["--objective", "--focus", "--leader-summary", "--updated-by"]), new Set(["--boundary"]), usage);
+    const usage = "Task brief update usage: taskmux task brief update <task> [--objective <text>] [--boundary <text> ...] [--focus <text>] [--leader-summary <text>].";
+    const parsed = parseMultiValueTail(rest, new Set(["--objective", "--focus", "--leader-summary"]), new Set(["--boundary"]), usage);
     exactPositionals(parsed.positionals, 1, usage);
     const hasObjective = parsed.options.has("--objective");
     const hasFocus = parsed.options.has("--focus");
@@ -1256,8 +1254,9 @@ function taskBriefCommand(
     const now = clock(options);
     const result = store.transaction((tx) => {
       const task = requireTask(tx, parsed.positionals[0]);
+      assertTaskOpen(task);
       const existing = tx.getTaskBrief(task.id);
-      const updatedBy = trimmed(parsed.options.get("--updated-by")) ?? existing?.updatedBy ?? "leader";
+      const updatedBy = taskActor(options, task.id);
       const brief = existing === null
         ? createTaskBrief({
             objective: requiredText(parsed.options.get("--objective"), "--objective"),
@@ -1274,13 +1273,13 @@ function taskBriefCommand(
           }, updatedBy, now);
       tx.saveTaskBrief(task.id, brief);
       recordTaskEvent(tx, task.id, "brief.updated", { updatedBy }, now);
-      if (task.status === "active") {
+      if (task.status === "active" && updatedBy !== "leader") {
         queueLeaderWakeup(tx, task.id, "brief-updated", now);
       }
       return { task, brief };
     });
     options.runtime?.notifyStateChanged(result.task.id);
-    return `Updated brief for ${result.task.id}\n`;
+    return output(`Updated brief for ${result.task.id}\n`);
   }
   throw usageError(command === undefined
     ? "Task brief command is required."
@@ -1291,7 +1290,7 @@ function taskDecisionCommand(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
-): string {
+): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "record") {
     const usage = "Task decision record usage: taskmux task decision record <task> --title <text> --rationale <text>.";
@@ -1302,16 +1301,18 @@ function taskDecisionCommand(
     const now = clock(options);
     const result = store.transaction((tx) => {
       const task = requireTask(tx, parsed.positionals[0]);
+      assertTaskOpen(task);
+      const actor = taskActor(options, task.id);
       const decision = createDecision(tx.nextDecisionId(task.id), task.id, title, rationale, now);
       tx.saveDecision(task.id, decision);
       recordTaskEvent(tx, task.id, "decision.recorded", { decisionId: decision.id, title }, now);
-      if (task.status === "active") {
+      if (task.status === "active" && actor !== "leader") {
         queueLeaderWakeup(tx, task.id, "decision-recorded", now);
       }
       return { task, decision };
     });
     options.runtime?.notifyStateChanged(result.task.id);
-    return `Recorded decision ${result.decision.id} for ${result.task.id}\n`;
+    return output(`Recorded decision ${result.decision.id} for ${result.task.id}\n`);
   }
   if (command === "list") {
     const usage = "Task decision list usage: taskmux task decision list <task> [--status active|superseded].";
@@ -1327,12 +1328,9 @@ function taskDecisionCommand(
       decisions = decisions.filter((d) => d.status === status);
     }
     if (decisions.length === 0) {
-      return options.json
-        ? JSON.stringify({ taskId: task.id, decisions: [] })
-        : `No decisions found for ${task.id}.\n`;
+      return output(`No decisions found for ${task.id}.\n`, { taskId: task.id, decisions: [] });
     }
-    if (options.json) return JSON.stringify({ taskId: task.id, decisions });
-    return `${renderTable(
+    return output(`${renderTable(
       `Decisions: ${task.id}`,
       [
         { header: "Decision", minWidth: 8, maxWidth: 18 },
@@ -1342,15 +1340,14 @@ function taskDecisionCommand(
       ],
       decisions.map((d) => [d.id, d.status, d.title, d.createdAt]),
       defaultTableWidth()
-    )}\n`;
+    )}\n`, { taskId: task.id, decisions });
   }
   if (command === "show") {
     exactPositionals(rest, 2, "Task decision show usage: taskmux task decision show <task> <decision>.");
     const task = requireTask(store, rest[0]);
     const decision = store.getDecision(task.id, rest[1]);
     if (decision === null) throw dataError(`Decision not found: ${rest[1]}.`);
-    if (options.json) return JSON.stringify({ taskId: task.id, decision });
-    return [
+    return output([
       `Decision: ${decision.id}`,
       `Task: ${task.id}`,
       `Title: ${decision.title}`,
@@ -1360,7 +1357,7 @@ function taskDecisionCommand(
       ...(decision.supersededAt === undefined ? [] : [`Superseded at: ${decision.supersededAt}`]),
       `Created: ${decision.createdAt}`,
       `Updated: ${decision.updatedAt}`
-    ].join("\n").concat("\n");
+    ].join("\n").concat("\n"), { taskId: task.id, decision });
   }
   if (command === "supersede") {
     const usage = "Task decision supersede usage: taskmux task decision supersede <task> <decision> --reason <text>.";
@@ -1370,18 +1367,20 @@ function taskDecisionCommand(
     const now = clock(options);
     const result = store.transaction((tx) => {
       const task = requireTask(tx, parsed.positionals[0]);
+      assertTaskOpen(task);
+      const actor = taskActor(options, task.id);
       const existing = tx.getDecision(task.id, parsed.positionals[1]);
       if (existing === null) throw dataError(`Decision not found: ${parsed.positionals[1]}.`);
       const decision = supersedeDecision(existing, reason, now);
       tx.saveDecision(task.id, decision);
       recordTaskEvent(tx, task.id, "decision.superseded", { decisionId: decision.id, reason }, now);
-      if (task.status === "active") {
+      if (task.status === "active" && actor !== "leader") {
         queueLeaderWakeup(tx, task.id, "decision-superseded", now);
       }
       return { task, decision };
     });
     options.runtime?.notifyStateChanged(result.task.id);
-    return `Superseded decision ${result.decision.id} for ${result.task.id}\n`;
+    return output(`Superseded decision ${result.decision.id} for ${result.task.id}\n`);
   }
   throw usageError(command === undefined
     ? "Task decision command is required."
@@ -1392,7 +1391,7 @@ function taskMilestoneCommand(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
-): string {
+): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "add") {
     const usage = "Task milestone add usage: taskmux task milestone add <task> --title <text> --summary <text>.";
@@ -1403,28 +1402,26 @@ function taskMilestoneCommand(
     const now = clock(options);
     const result = store.transaction((tx) => {
       const task = requireTask(tx, parsed.positionals[0]);
+      assertTaskOpen(task);
+      if (taskActor(options, task.id) !== "leader") {
+        throw usageError("Only the Task Leader can add a Milestone.");
+      }
       const milestone = createMilestone(tx.nextMilestoneId(task.id), task.id, title, summary, now);
       tx.saveMilestone(task.id, milestone);
       recordTaskEvent(tx, task.id, "milestone.added", { milestoneId: milestone.id, title }, now);
-      if (task.status === "active") {
-        queueLeaderWakeup(tx, task.id, "milestone-added", now);
-      }
       return { task, milestone };
     });
     options.runtime?.notifyStateChanged(result.task.id);
-    return `Added milestone ${result.milestone.id} for ${result.task.id}\n`;
+    return output(`Added milestone ${result.milestone.id} for ${result.task.id}\n`);
   }
   if (command === "list") {
     exactPositionals(rest, 1, "Task milestone list usage: taskmux task milestone list <task>.");
     const task = requireTask(store, rest[0]);
     const milestones = store.listMilestones(task.id);
     if (milestones.length === 0) {
-      return options.json
-        ? JSON.stringify({ taskId: task.id, milestones: [] })
-        : `No milestones found for ${task.id}.\n`;
+      return output(`No milestones found for ${task.id}.\n`, { taskId: task.id, milestones: [] });
     }
-    if (options.json) return JSON.stringify({ taskId: task.id, milestones });
-    return `${renderTable(
+    return output(`${renderTable(
       `Milestones: ${task.id}`,
       [
         { header: "Milestone", minWidth: 9, maxWidth: 18 },
@@ -1433,22 +1430,21 @@ function taskMilestoneCommand(
       ],
       milestones.map((m) => [m.id, m.title, m.createdAt]),
       defaultTableWidth()
-    )}\n`;
+    )}\n`, { taskId: task.id, milestones });
   }
   if (command === "show") {
     exactPositionals(rest, 2, "Task milestone show usage: taskmux task milestone show <task> <milestone>.");
     const task = requireTask(store, rest[0]);
     const milestone = store.getMilestone(task.id, rest[1]);
     if (milestone === null) throw dataError(`Milestone not found: ${rest[1]}.`);
-    if (options.json) return JSON.stringify({ taskId: task.id, milestone });
-    return [
+    return output([
       `Milestone: ${milestone.id}`,
       `Task: ${task.id}`,
       `Title: ${milestone.title}`,
       `Summary: ${milestone.summary}`,
       `Created by: ${milestone.createdBy}`,
       `Created: ${milestone.createdAt}`
-    ].join("\n").concat("\n");
+    ].join("\n").concat("\n"), { taskId: task.id, milestone });
   }
   throw usageError(command === undefined
     ? "Task milestone command is required."
@@ -1457,21 +1453,17 @@ function taskMilestoneCommand(
 
 function taskEventCommand(
   args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions
-): string {
+  store: TaskWorkflowStore
+): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "list") {
     exactPositionals(rest, 1, "Task event list usage: taskmux task event list <task>.");
     const task = requireTask(store, rest[0]);
     const events = store.listEvents(task.id);
     if (events.length === 0) {
-      return options.json
-        ? JSON.stringify({ taskId: task.id, events: [] })
-        : `No events found for ${task.id}.\n`;
+      return output(`No events found for ${task.id}.\n`, { taskId: task.id, events: [] });
     }
-    if (options.json) return JSON.stringify({ taskId: task.id, events });
-    return `${renderTable(
+    return output(`${renderTable(
       `Events: ${task.id}`,
       [
         { header: "Event", minWidth: 8, maxWidth: 18 },
@@ -1480,7 +1472,7 @@ function taskEventCommand(
       ],
       events.map((e) => [e.id, e.type, e.createdAt]),
       defaultTableWidth()
-    )}\n`;
+    )}\n`, { taskId: task.id, events });
   }
   if (command === "show") {
     exactPositionals(rest, 2, "Task event show usage: taskmux task event show <task> <event>.");
@@ -1488,8 +1480,7 @@ function taskEventCommand(
     const events = store.listEvents(task.id);
     const event = events.find((e) => e.id === rest[1]) ?? null;
     if (event === null) throw dataError(`Event not found: ${rest[1]}.`);
-    if (options.json) return JSON.stringify({ taskId: task.id, event });
-    return [
+    return output([
       `Event: ${event.id}`,
       `Task: ${task.id}`,
       `Type: ${event.type}`,
@@ -1498,7 +1489,7 @@ function taskEventCommand(
       ...(Object.keys(event.payload).length === 0
         ? ["  (none)"]
         : Object.entries(event.payload).map(([k, v]) => `  ${k}: ${v}`))
-    ].join("\n").concat("\n");
+    ].join("\n").concat("\n"), { taskId: task.id, event });
   }
   throw usageError(command === undefined
     ? "Task event command is required."
