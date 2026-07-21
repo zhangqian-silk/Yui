@@ -15,7 +15,7 @@ import {
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
-import { activeRoleSummary, renderRoleDetails } from "../output/rolePresentation.js";
+import { renderRoleDetails } from "../output/rolePresentation.js";
 import {
   createTaskMessage,
   taskMessageAuthorLabel,
@@ -57,6 +57,7 @@ import {
   type TaskPriority
 } from "../task/task.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import {
   createWorkItem,
   updateWorkItemStatus,
@@ -71,6 +72,13 @@ import {
   roleProfilePatch
 } from "./roleConfiguration.js";
 import { runTaskContextCommand } from "./taskContextCommand.js";
+import {
+  inspectTaskRoleRuntimeStatuses,
+  renderTaskRoleRuntimeStatus,
+  taskRoleActiveWorkLabel,
+  taskRoleNativeSessionLabel,
+  taskRoleTmuxLabel
+} from "./taskRoleRuntimeStatus.js";
 import {
   assertNoOpenInputRequests,
   openInputRequestCount,
@@ -96,6 +104,7 @@ export type TaskWorkflowRuntimePort = Readonly<{
   notifyStateChanged(taskId: string): void;
   reconcileTask(taskId: string): void;
   prepareTaskRoleEnter(input: Readonly<{ taskId: string; roleName: string }>): void;
+  inspectTaskRolePanes?(taskId: string): readonly TmuxRolePaneState[];
 }>;
 
 export type TaskWorkflowStore = TaskStore;
@@ -577,7 +586,8 @@ function taskRoleCommand(
 ): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "add") return output(addTaskRole(rest, store, options));
-  if (command === "list") return output(listTaskRoles(rest, store));
+  if (command === "list") return listTaskRoles(rest, store, options);
+  if (command === "status") return taskRoleStatus(rest, store, options);
   if (command === "show") return output(showTaskRole(rest, store));
   if (command === "update") return output(updateTaskRole(rest, store, options));
   if (command === "remove") return output(removeTaskRole(rest, store, options));
@@ -630,26 +640,59 @@ function addTaskRole(
   return `Added role ${role.name} to ${role.taskId} (Agent: ${role.activeAgentId})\n`;
 }
 
-function listTaskRoles(args: string[], store: TaskWorkflowStore): string {
+function listTaskRoles(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
   exactPositionals(args, 1, "Task role list usage: taskmux task role list <task>.");
   const task = requireTask(store, args[0]);
   const roles = store.listRoles(task.id);
-  if (roles.length === 0) return "No roles assigned.\n";
-  return `${renderTable(
+  const statuses = inspectTaskRoleRuntimeStatuses(
+    task.id,
+    roles,
+    store,
+    options.runtime?.inspectTaskRolePanes?.(task.id) ?? []
+  );
+  if (statuses.length === 0) return output("No roles assigned.\n", { roles: statuses });
+  return output(`${renderTable(
     `Task roles: ${task.id}`,
     [
       { header: "Role", minWidth: 4, maxWidth: 24 },
-      { header: "Active Agent", minWidth: 8, maxWidth: 20 },
-      { header: "Model", minWidth: 8, maxWidth: 22 },
-      { header: "Effort", minWidth: 8, maxWidth: 14 },
-      { header: "Status", minWidth: 6, maxWidth: 12 },
+      { header: "Agent", minWidth: 5, maxWidth: 20 },
+      { header: "Health", minWidth: 6, maxWidth: 15 },
+      { header: "Active work", minWidth: 10, maxWidth: 34 },
+      { header: "Native session", minWidth: 10, maxWidth: 28 },
+      { header: "tmux", minWidth: 6, maxWidth: 22 }
     ],
-    roles.map((role) => {
-      const summary = activeRoleSummary(role);
-      return [role.name, summary.agent, summary.model, summary.effort, role.status];
-    }),
+    statuses.map((status) => [
+      status.roleName,
+      status.agentId,
+      status.health,
+      taskRoleActiveWorkLabel(status),
+      taskRoleNativeSessionLabel(status),
+      taskRoleTmuxLabel(status)
+    ]),
     defaultTableWidth()
-  )}\n`;
+  )}\n`, { roles: statuses });
+}
+
+function taskRoleStatus(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  exactPositionals(args, 2, "Task role status usage: taskmux task role status <task> <role>.");
+  const task = requireTask(store, args[0]);
+  const role = requireRole(store, task.id, args[1]);
+  const [status] = inspectTaskRoleRuntimeStatuses(
+    task.id,
+    [role],
+    store,
+    options.runtime?.inspectTaskRolePanes?.(task.id) ?? []
+  );
+  if (status === undefined) throw roleNotFound(role.name);
+  return output(renderTaskRoleRuntimeStatus(status), { role: status });
 }
 
 function showTaskRole(args: string[], store: TaskWorkflowStore): string {

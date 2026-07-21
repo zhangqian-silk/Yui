@@ -30,6 +30,15 @@ export type TmuxPaneState = Readonly<{
   content: string;
 }>;
 
+export type TmuxRolePaneState = Readonly<{
+  taskId: string;
+  roleName: string;
+  target: string;
+  dead: boolean;
+  pid?: number;
+  currentCommand: string;
+}>;
+
 export type TmuxReadinessProbe = (pane: TmuxPaneState) => boolean;
 
 export type TmuxManagerOptions = Readonly<{
@@ -237,6 +246,44 @@ export class TmuxManager {
       currentCommand,
       content
     };
+  }
+
+  /** Reads every Role pane in one tmux call without capturing terminal output. */
+  inspectTaskRolePanes(taskId: string): TmuxRolePaneState[] {
+    const separator = "\u001f";
+    let output: string;
+    try {
+      output = this.executor.run(this.tmuxBin, [
+        "list-panes", "-s", "-t", this.sessionName(taskId), "-F",
+        `#{window_name}${separator}#{pane_dead}${separator}#{pane_pid}${separator}#{pane_current_command}`
+      ]);
+    } catch (error) {
+      if (isExplicitlyAbsentTmuxSession(error)) return [];
+      throw error;
+    }
+    return output.split("\n").flatMap((line): TmuxRolePaneState[] => {
+      if (line.length === 0) return [];
+      const [roleName, deadText, pidText, currentCommand, ...extra] = line.split(separator);
+      if (
+        roleName === undefined
+        || deadText === undefined
+        || pidText === undefined
+        || currentCommand === undefined
+        || extra.length > 0
+        || (deadText !== "0" && deadText !== "1")
+      ) {
+        throw runtimeError(`Tmux returned an invalid Task Role pane state for ${taskId}.`);
+      }
+      const pid = Number(pidText);
+      return [{
+        taskId,
+        roleName,
+        target: this.target(taskId, roleName),
+        dead: deadText === "1",
+        ...(Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),
+        currentCommand
+      }];
+    });
   }
 
   /**

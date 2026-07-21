@@ -425,8 +425,9 @@ test("Task Role add, update, show, and remove preserve lean field-level configur
   assert.doesNotMatch(shown, /\{"adapterId"/);
 
   const listed = run(["role", "list", task.id], store, options);
-  assert.match(listed, /Model/);
-  assert.match(listed, /Effort/);
+  assert.match(listed, /Agent/);
+  assert.match(listed, /Health/);
+  assert.match(listed, /Native session/);
   assert.doesNotMatch(listed, /Workspace/);
 
   assert.match(run(["role", "remove", task.id, "reviewer"], store, options), /Removed role reviewer/);

@@ -277,7 +277,7 @@ const taskChildren: readonly NodeInput[] = [
     name: "role",
     summary: "Manage Roles within a Task.",
     sections: [{ id: "manage", title: "Commands", entries: [
-      "add", "list", "show", "update", "remove", "bind", "enter"
+      "add", "list", "status", "show", "update", "remove", "bind", "enter"
     ] }],
     children: [
       {
@@ -288,6 +288,11 @@ const taskChildren: readonly NodeInput[] = [
         optionValues: roleAgentOptionValues
       },
       { name: "list", summary: "List Task Roles.", usage: "taskmux task role list <task>" },
+      {
+        name: "status",
+        summary: "Show persisted and live runtime state for one Task Role.",
+        usage: "taskmux task role status <task> <role>"
+      },
       { name: "show", summary: "Show one Task Role.", usage: "taskmux task role show <task> <role>" },
       {
         name: "update",

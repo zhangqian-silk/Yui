@@ -73,6 +73,7 @@ const PUBLIC_PATHS = [
   "task role",
   "task role add",
   "task role list",
+  "task role status",
   "task role show",
   "task role update",
   "task role remove",
@@ -248,7 +249,7 @@ test("interaction policies cover missing task, work, run, and job identifiers", 
 });
 
 test("Task Role detail policies select task then Role and confirm removal", () => {
-  for (const command of ["show", "update", "remove"]) {
+  for (const command of ["show", "status", "update", "remove"]) {
     const policy = findInteractionPolicy(findCommandNode(["task", "role", command]));
     assert.ok(policy, command);
     assert.deepEqual(policy.selectors, [
@@ -435,7 +436,7 @@ test("an empty Agent selection chooses the configured default Agent", async () =
 });
 
 test("Task Role detail selection resolves the task before its Role and confirms removal", async () => {
-  for (const command of ["show", "update"]) {
+  for (const command of ["show", "status", "update"]) {
     const node = findCommandNode(["task", "role", command]);
     assert.ok(node);
     const ports = createPorts();

@@ -261,7 +261,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     commandPath: ["task", "role", "list"],
     selectors: [{ argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true }]
   },
-  ...["show", "update", "remove"].map((command): InteractionPolicy => ({
+  ...["show", "status", "update", "remove"].map((command): InteractionPolicy => ({
     commandPath: ["task", "role", command],
     selectors: [
       { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },

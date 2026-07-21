@@ -170,6 +170,10 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     }
   }
 
+  inspectTaskRolePanes(taskId: string) {
+    return this.tmux.inspectTaskRolePanes(taskId);
+  }
+
   prepareGlobalRoleEnter(roleName: string, tmuxTaskId = "operator"): void {
     const role = this.store.getGlobalRole(roleName);
     if (role === null) throw new Error(`Global Role not found: ${roleName}.`);
