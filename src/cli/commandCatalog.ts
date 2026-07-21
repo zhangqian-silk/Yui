@@ -302,6 +302,62 @@ const taskChildren: readonly NodeInput[] = [
       }
     ]
   },
+  {
+    name: "brief",
+    summary: "Manage the Task Brief, the authoritative summary of current task state.",
+    sections: [{ id: "manage", title: "Commands", entries: ["show", "update"] }],
+    children: [
+      { name: "show", summary: "Show the Task Brief.", usage: "taskmux task brief show <task>" },
+      {
+        name: "update",
+        summary: "Create or update the Task Brief.",
+        usage: "taskmux task brief update <task> [--objective <text>] [--boundary <text> ...] [--focus <text>] [--leader-summary <text>] [--updated-by <name>]",
+        options: ["--objective", "--boundary", "--focus", "--leader-summary", "--updated-by"]
+      }
+    ]
+  },
+  {
+    name: "decision",
+    summary: "Record and supersede durable Task decisions.",
+    sections: [{ id: "manage", title: "Commands", entries: ["record", "list", "show", "supersede"] }],
+    children: [
+      {
+        name: "record",
+        summary: "Record a new active Decision.",
+        usage: "taskmux task decision record <task> --title <text> --rationale <text>",
+        options: ["--title", "--rationale"]
+      },
+      {
+        name: "list",
+        summary: "List Decisions for a Task.",
+        usage: "taskmux task decision list <task> [--status active|superseded]",
+        options: ["--status"],
+        optionValues: { "--status": ["active", "superseded"] }
+      },
+      { name: "show", summary: "Show one Decision.", usage: "taskmux task decision show <task> <decision>" },
+      {
+        name: "supersede",
+        summary: "Mark a Decision as superseded.",
+        usage: "taskmux task decision supersede <task> <decision> --reason <text>",
+        options: ["--reason"]
+      }
+    ]
+  },
+  {
+    name: "milestone",
+    summary: "Append immutable Milestone records for completed progress.",
+    sections: [{ id: "manage", title: "Commands", entries: ["add", "list", "show"] }],
+    children: [
+      {
+        name: "add",
+        summary: "Append a Milestone to a Task.",
+        usage: "taskmux task milestone add <task> --title <text> --summary <text>",
+        options: ["--title", "--summary"]
+      },
+      { name: "list", summary: "List Milestones for a Task.", usage: "taskmux task milestone list <task>" },
+      { name: "show", summary: "Show one Milestone.", usage: "taskmux task milestone show <task> <milestone>" }
+    ]
+  },
   { name: "enter", summary: "Enter a Task Role, defaulting to Leader.", usage: "taskmux task enter <task> [role]" }
 ];
 
@@ -407,7 +463,8 @@ export const ROOT_COMMAND = buildNode({
       summary: "Manage Tasks, Roles, work items, and Runs.",
       sections: [
         { id: "lifecycle", title: "Lifecycle", entries: ["create", "update", "activate", "complete", "reopen", "list", "show", "archive", "reconcile"] },
-        { id: "collaboration", title: "Collaboration", entries: ["message", "role", "work", "run", "enter"] }
+        { id: "collaboration", title: "Collaboration", entries: ["message", "role", "work", "run", "enter"] },
+        { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone"] }
       ],
       children: taskChildren
     },

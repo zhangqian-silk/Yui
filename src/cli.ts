@@ -238,7 +238,7 @@ export async function main(): Promise<void> {
         await workspacePreparer.prepareTaskWorkspace(task.id);
       }
     }
-    const result = runTaskCommand(resolved.slice(1), store, { runtime, environment: process.env });
+    const result = runTaskCommand(resolved.slice(1), store, { runtime, environment: process.env, json: jsonOutput });
     if (result.kind === "output") {
       emit(result.output);
       return;
