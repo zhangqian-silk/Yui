@@ -124,6 +124,7 @@ export function runTaskCommand(
     case "brief": return output(taskBriefCommand(rest, store, options));
     case "decision": return output(taskDecisionCommand(rest, store, options));
     case "milestone": return output(taskMilestoneCommand(rest, store, options));
+    case "event": return output(taskEventCommand(rest, store, options));
     case "enter": return enterTaskRoleAlias(rest, store, options);
     default:
       throw usageError(command === undefined
@@ -1440,6 +1441,56 @@ function taskMilestoneCommand(
   throw usageError(command === undefined
     ? "Task milestone command is required."
     : `Unknown command: task milestone ${command}`);
+}
+
+function taskEventCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  const [command, ...rest] = args;
+  if (command === "list") {
+    exactPositionals(rest, 1, "Task event list usage: taskmux task event list <task>.");
+    const task = requireTask(store, rest[0]);
+    const events = store.listEvents(task.id);
+    if (events.length === 0) {
+      return options.json
+        ? JSON.stringify({ taskId: task.id, events: [] })
+        : `No events found for ${task.id}.\n`;
+    }
+    if (options.json) return JSON.stringify({ taskId: task.id, events });
+    return `${renderTable(
+      `Events: ${task.id}`,
+      [
+        { header: "Event", minWidth: 8, maxWidth: 18 },
+        { header: "Type", minWidth: 8, maxWidth: 28 },
+        { header: "Created", minWidth: 10, maxWidth: 28 }
+      ],
+      events.map((e) => [e.id, e.type, e.createdAt]),
+      defaultTableWidth()
+    )}\n`;
+  }
+  if (command === "show") {
+    exactPositionals(rest, 2, "Task event show usage: taskmux task event show <task> <event>.");
+    const task = requireTask(store, rest[0]);
+    const events = store.listEvents(task.id);
+    const event = events.find((e) => e.id === rest[1]) ?? null;
+    if (event === null) throw dataError(`Event not found: ${rest[1]}.`);
+    if (options.json) return JSON.stringify({ taskId: task.id, event });
+    return [
+      `Event: ${event.id}`,
+      `Task: ${task.id}`,
+      `Type: ${event.type}`,
+      `Created: ${event.createdAt}`,
+      `Payload:`,
+      ...(Object.keys(event.payload).length === 0
+        ? ["  (none)"]
+        : Object.entries(event.payload).map(([k, v]) => `  ${k}: ${v}`))
+    ].join("\n").concat("\n");
+  }
+  throw usageError(command === undefined
+    ? "Task event command is required."
+    : `Unknown command: task event ${command}`);
 }
 
 type ParsedMultiTail = Readonly<{

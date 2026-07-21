@@ -358,6 +358,15 @@ const taskChildren: readonly NodeInput[] = [
       { name: "show", summary: "Show one Milestone.", usage: "taskmux task milestone show <task> <milestone>" }
     ]
   },
+  {
+    name: "event",
+    summary: "Inspect the durable Task event history.",
+    sections: [{ id: "manage", title: "Commands", entries: ["list", "show"] }],
+    children: [
+      { name: "list", summary: "List Task events.", usage: "taskmux task event list <task>" },
+      { name: "show", summary: "Show one Task event.", usage: "taskmux task event show <task> <event>" }
+    ]
+  },
   { name: "enter", summary: "Enter a Task Role, defaulting to Leader.", usage: "taskmux task enter <task> [role]" }
 ];
 
@@ -464,7 +473,7 @@ export const ROOT_COMMAND = buildNode({
       sections: [
         { id: "lifecycle", title: "Lifecycle", entries: ["create", "update", "activate", "complete", "reopen", "list", "show", "archive", "reconcile"] },
         { id: "collaboration", title: "Collaboration", entries: ["message", "role", "work", "run", "enter"] },
-        { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone"] }
+        { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
       ],
       children: taskChildren
     },

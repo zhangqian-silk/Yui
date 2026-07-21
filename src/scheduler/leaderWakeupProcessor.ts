@@ -162,15 +162,24 @@ function leaderWakeupInput(
   ];
   if (brief !== null) {
     lines.push(`Objective: ${brief.objective}`);
+    if (brief.boundaries.length > 0) {
+      lines.push("Boundaries:");
+      for (const boundary of brief.boundaries) {
+        lines.push(`  - ${boundary}`);
+      }
+    }
     if (brief.currentFocus.trim().length > 0) {
       lines.push(`Current focus: ${brief.currentFocus}`);
+    }
+    if (brief.leaderSummary.trim().length > 0) {
+      lines.push(`Leader summary: ${brief.leaderSummary}`);
     }
   }
   const activeDecisions = decisions.filter((d) => d.status === "active").slice(0, 3);
   if (activeDecisions.length > 0) {
     lines.push("Active decisions:");
     for (const decision of activeDecisions) {
-      lines.push(`  - ${decision.title}`);
+      lines.push(`  - ${decision.title}: ${decision.rationale}`);
     }
   }
   const recentMilestones = [...milestones]
@@ -183,7 +192,7 @@ function leaderWakeupInput(
     }
   }
   lines.push(
-    `Inspect taskmux task show ${taskId}, taskmux task message list ${taskId}, taskmux task work list ${taskId}, taskmux task brief show ${taskId}, taskmux task decision list ${taskId}, and taskmux task milestone list ${taskId}; then continue Leader stewardship.`
+    `Inspect taskmux task show ${taskId}, taskmux task message list ${taskId}, taskmux task work list ${taskId}, taskmux task brief show ${taskId}, taskmux task decision list ${taskId}, and taskmux task milestone list ${taskId}, and taskmux task event list ${taskId}; then continue Leader stewardship.`
   );
   return lines.join("\n");
 }
