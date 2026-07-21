@@ -217,6 +217,9 @@ function fakeStore(options = {}) {
     },
     getLeaderFailure: () => null,
     getOperatorNotification: () => null,
+    getTaskBrief: () => null,
+    listDecisions: () => [],
+    listMilestones: () => [],
     saveLeaderDispatch: (input) => {
       store.operations.push("save-dispatch");
       store.savedDispatches.push(input);

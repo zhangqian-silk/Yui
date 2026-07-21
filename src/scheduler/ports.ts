@@ -1,3 +1,6 @@
+import type { TaskBrief } from "../brief/taskBrief.js";
+import type { Decision } from "../decision/decision.js";
+import type { Milestone } from "../milestone/milestone.js";
 import type { LeaderFailure } from "./leaderFailure.js";
 import type { OperatorNotification } from "./operatorNotification.js";
 import type { PendingWakeup } from "./pendingWakeup.js";
@@ -85,6 +88,9 @@ export interface SchedulerStorePort {
 
   getLeaderFailure(taskId: string): LeaderFailure | null;
   getOperatorNotification(taskId: string): OperatorNotification | null;
+  getTaskBrief(taskId: string): TaskBrief | null;
+  listDecisions(taskId: string): readonly Decision[];
+  listMilestones(taskId: string): readonly Milestone[];
   /** Persist the AgentRun, active-run pointer, running Role and active fixed session. */
   saveLeaderDispatch(input: LeaderDispatchPersistence): LeaderDispatchClaimResult;
   /** Persist successful delivery of a Work AgentRun and its fixed session. */

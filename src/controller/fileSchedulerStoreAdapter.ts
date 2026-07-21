@@ -57,6 +57,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   clearPendingWakeup(taskId: string): void { this.store.clearPendingWakeup(taskId); }
   getLeaderFailure(taskId: string) { return this.store.getLeaderFailure(taskId); }
   getOperatorNotification(taskId: string) { return this.store.getOperatorNotification(taskId); }
+  getTaskBrief(taskId: string) { return this.store.getTaskBrief(taskId); }
+  listDecisions(taskId: string) { return this.store.listDecisions(taskId); }
+  listMilestones(taskId: string) { return this.store.listMilestones(taskId); }
 
   saveLeaderDispatch(input: LeaderDispatchPersistence): LeaderDispatchClaimResult {
     return this.store.transaction((store) => {
