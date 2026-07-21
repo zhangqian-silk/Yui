@@ -98,6 +98,7 @@ export type TaskCommandOptions = Readonly<{
   runtime?: TaskWorkflowRuntimePort;
   now?: () => Date;
   environment?: NodeJS.ProcessEnv;
+  json?: boolean;
 }>;
 
 export function runTaskCommand(
@@ -1211,7 +1212,12 @@ function taskBriefCommand(
     exactPositionals(rest, 1, "Task brief show usage: taskmux task brief show <task>.");
     const task = requireTask(store, rest[0]);
     const brief = store.getTaskBrief(task.id);
-    if (brief === null) return `Task ${task.id} has no brief.\n`;
+    if (brief === null) {
+      return options.json
+        ? JSON.stringify({ taskId: task.id, brief: null })
+        : `Task ${task.id} has no brief.\n`;
+    }
+    if (options.json) return JSON.stringify({ taskId: task.id, brief });
     return [
       `Task: ${task.id}`,
       `Objective: ${brief.objective}`,
@@ -1301,7 +1307,12 @@ function taskDecisionCommand(
       }
       decisions = decisions.filter((d) => d.status === status);
     }
-    if (decisions.length === 0) return `No decisions found for ${task.id}.\n`;
+    if (decisions.length === 0) {
+      return options.json
+        ? JSON.stringify({ taskId: task.id, decisions: [] })
+        : `No decisions found for ${task.id}.\n`;
+    }
+    if (options.json) return JSON.stringify({ taskId: task.id, decisions });
     return `${renderTable(
       `Decisions: ${task.id}`,
       [
@@ -1319,6 +1330,7 @@ function taskDecisionCommand(
     const task = requireTask(store, rest[0]);
     const decision = store.getDecision(task.id, rest[1]);
     if (decision === null) throw dataError(`Decision not found: ${rest[1]}.`);
+    if (options.json) return JSON.stringify({ taskId: task.id, decision });
     return [
       `Decision: ${decision.id}`,
       `Task: ${task.id}`,
@@ -1381,7 +1393,12 @@ function taskMilestoneCommand(
     exactPositionals(rest, 1, "Task milestone list usage: taskmux task milestone list <task>.");
     const task = requireTask(store, rest[0]);
     const milestones = store.listMilestones(task.id);
-    if (milestones.length === 0) return `No milestones found for ${task.id}.\n`;
+    if (milestones.length === 0) {
+      return options.json
+        ? JSON.stringify({ taskId: task.id, milestones: [] })
+        : `No milestones found for ${task.id}.\n`;
+    }
+    if (options.json) return JSON.stringify({ taskId: task.id, milestones });
     return `${renderTable(
       `Milestones: ${task.id}`,
       [
@@ -1398,6 +1415,7 @@ function taskMilestoneCommand(
     const task = requireTask(store, rest[0]);
     const milestone = store.getMilestone(task.id, rest[1]);
     if (milestone === null) throw dataError(`Milestone not found: ${rest[1]}.`);
+    if (options.json) return JSON.stringify({ taskId: task.id, milestone });
     return [
       `Milestone: ${milestone.id}`,
       `Task: ${task.id}`,
