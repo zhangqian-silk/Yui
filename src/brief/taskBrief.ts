@@ -1,57 +1,63 @@
 export type TaskBrief = {
+  schemaVersion: 1;
   objective: string;
   boundaries: string[];
   currentFocus: string;
   leaderSummary: string;
   updatedAt: string;
+  updatedBy: string;
 };
 
-export function createTaskBrief(
-  input: Omit<TaskBrief, "updatedAt">,
-  now: Date
-): TaskBrief {
+export type TaskBriefContent = Pick<
+  TaskBrief,
+  "objective" | "boundaries" | "currentFocus" | "leaderSummary" | "updatedBy"
+>;
+
+export type TaskBriefPatch = Partial<Pick<
+  TaskBrief,
+  "objective" | "boundaries" | "currentFocus" | "leaderSummary"
+>>;
+
+export function createTaskBrief(input: TaskBriefContent, now: Date): TaskBrief {
   return {
-    objective: required(input.objective, "Task objective"),
-    boundaries: input.boundaries.map((item) => item.trim()).filter(Boolean),
-    currentFocus: required(input.currentFocus, "Current focus"),
-    leaderSummary: required(input.leaderSummary, "Leader summary"),
-    updatedAt: now.toISOString()
+    schemaVersion: 1,
+    objective: requireText(input.objective, "Task objective"),
+    boundaries: normalizeBoundaries(input.boundaries),
+    currentFocus: requireText(input.currentFocus, "Current focus"),
+    leaderSummary: requireText(input.leaderSummary, "Leader summary"),
+    updatedAt: now.toISOString(),
+    updatedBy: requireText(input.updatedBy, "Task Brief updated by")
   };
 }
 
-export function renderTaskBrief(brief: TaskBrief): string {
-  const boundaries = brief.boundaries.length === 0
-    ? "- None recorded"
-    : brief.boundaries.map((boundary) => `- ${boundary}`).join("\n");
-
-  return [
-    "# Task Brief",
-    "",
-    "## Objective",
-    "",
-    brief.objective,
-    "",
-    "## Boundaries",
-    "",
-    boundaries,
-    "",
-    "## Current focus",
-    "",
-    brief.currentFocus,
-    "",
-    "## Leader summary",
-    "",
-    brief.leaderSummary,
-    "",
-    `Updated: ${brief.updatedAt}`,
-    ""
-  ].join("\n");
+export function updateTaskBrief(
+  brief: TaskBrief,
+  patch: TaskBriefPatch,
+  updatedBy: string,
+  now: Date
+): TaskBrief {
+  return createTaskBrief({
+    objective: patch.objective ?? brief.objective,
+    boundaries: patch.boundaries ?? brief.boundaries,
+    currentFocus: patch.currentFocus ?? brief.currentFocus,
+    leaderSummary: patch.leaderSummary ?? brief.leaderSummary,
+    updatedBy
+  }, now);
 }
 
-function required(value: string, label: string): string {
-  const trimmed = value.trim();
-  if (trimmed.length === 0) {
-    throw new Error(`${label} is required.`);
-  }
-  return trimmed;
+function normalizeBoundaries(values: readonly string[]): string[] {
+  const normalized = values.map((value) => {
+    if (typeof value !== "string" || value.includes("\0")) {
+      throw new Error("Task boundary is invalid.");
+    }
+    return value.trim();
+  }).filter(Boolean);
+  return [...new Set(normalized)];
+}
+
+function requireText(value: string, label: string): string {
+  if (typeof value !== "string" || value.includes("\0")) throw new Error(`${label} is invalid.`);
+  const normalized = value.trim();
+  if (normalized.length === 0) throw new Error(`${label} is required.`);
+  return normalized;
 }

@@ -1,1200 +1,246 @@
-import { randomBytes } from "node:crypto";
+import { reconciliationIntervalMilliseconds } from "../config/taskmuxConfig.js";
 import {
-  chmodSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  renameSync,
-  rmSync,
-  statSync,
-  writeFileSync
-} from "node:fs";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { join } from "node:path";
-import { CliError, dataError, type CliErrorCode } from "../errors/cliError.js";
+  processLeaderWakeups,
+  type LeaderWakeupProcessingResult
+} from "../scheduler/leaderWakeupProcessor.js";
 import {
-  expireStaleAgentRuns,
-  failExitedAgentRuns,
-  failUnregisteredNativeSessions,
-  readAgentRunTtl,
-  readNativeSessionRegistrationTtl,
-  scanTaskWakeups
-} from "../scheduler/inactivityScanner.js";
+  processActiveRoleRunDeliveries,
+  type ActiveRoleRunDeliveryResult
+} from "../scheduler/activeRoleRunDelivery.js";
+import { stopArchivedTaskRuntimes } from "../scheduler/archivedTaskRuntime.js";
+import type {
+  AutoResolvedInput,
+  SchedulerStorePort,
+  TmuxDeliveryPort
+} from "../scheduler/ports.js";
+import { reconcileExitedRoleRuns } from "../scheduler/roleRunLiveness.js";
 import {
-  readOperatorPresence,
-  scanOfflineInputResolutions
-} from "../scheduler/offlineInputResolution.js";
+  processOperatorInputNotifications,
+  type OperatorInputNotificationResult
+} from "../scheduler/operatorInputNotificationProcessor.js";
 import {
-  recoverOperatorLaunches,
-  settleConfirmedAbsentOperatorWindow
-} from "../operator/operatorLaunchAuthority.js";
-import { processLeaderInputWakeups } from "../scheduler/leaderInputWakeupService.js";
-import { pumpOperatorDeliveries } from "../operator/operatorDeliveryPump.js";
-import { runTaskInputPostCommitEffects } from "../input/inputPostCommitEffects.js";
-import { processLeaderWakeups } from "../scheduler/leaderWakeupProcessor.js";
-import { mergePendingWakeup } from "../scheduler/pendingWakeup.js";
-import { FileTaskStore, type TaskReader, type TaskStore } from "../storage/taskStore.js";
-import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
-import { TmuxManager } from "../tmux/tmuxManager.js";
-import {
-  executeTaskLifecycleOperation,
-  finalizeTaskLifecycleOperation,
-  isTaskRoleRuntimeControlCommand,
-  prepareTaskLifecycleCommand,
-  recordTaskRoleAttached,
-  rememberTask,
-  recoverTaskLifecycleRuntimeOperations,
-  runTaskCommand,
-  runTaskReadSnapshot
-} from "../commands/taskCommands.js";
-import { runAgentCommand, runAgentReadCommand } from "../commands/agentCommands.js";
-import { runBackupCommand } from "../commands/backupCommands.js";
-import { runConfigCommand, runConfigReadCommand } from "../commands/configCommands.js";
-import {
-  recoverGlobalRoleRuntimeOperations,
-  runGlobalRoleCommand,
-  runGlobalRoleReadCommand
-} from "../commands/globalRoleCommands.js";
-import {
-  clearRuntimeOperationClaim,
-  readTaskRuntimeOperationClaim,
-  roleRuntimeStateDigest
-} from "../executor/executorRegistry.js";
-import {
-  executePruneCommand,
-  executeRestoreCommand,
-  preparePortableExport,
-  publishPortableExport,
-  runImportCommand
-} from "../commands/maintenanceCommands.js";
-import type { ManualSessionRegistration } from "../commands/sessionRegistration.js";
-import {
-  DomainTransactionRecoveryError,
-  replayPendingDomainTransactions,
-  replayPendingSnapshotWrites
-} from "../storage/recoveryJournal.js";
-import { createResilientTaskStore, primeResilientTaskStore } from "../storage/resilientTaskStore.js";
-import { rebuildDerivedIndex } from "../storage/derivedIndex.js";
-import { executeDomainTransaction } from "../storage/domainTransaction.js";
-import type { DomainTransactionOperation } from "../storage/recoveryJournal.js";
-import { appendControllerDiagnostic } from "./controllerDiagnostics.js";
-import { parseControllerCommandProvenance } from "./commandProvenance.js";
+  startControllerServer,
+  type ControllerDispatcher,
+  type RunningControllerServer
+} from "../core/controllerServer.js";
+import type { JsonValue } from "../core/protocol.js";
+import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
 
-export const CONTROLLER_API_VERSION = 1;
-const failedDomainTransactionRoots = new Set<string>();
+const DEFAULT_RECONCILIATION_INTERVAL_MS = reconciliationIntervalMilliseconds();
 
-export type ControllerDiscovery = {
-  schemaVersion: 1;
-  apiVersion: 1;
-  host: "127.0.0.1";
-  port: number;
-  pid: number;
-  token: string;
-  startedAt: string;
-};
+export type ControllerSchedulerResult = Readonly<{
+  stoppedArchivedTaskIds: readonly string[];
+  activeRunDeliveries: readonly ActiveRoleRunDeliveryResult[];
+  failedRunIds: readonly string[];
+  wakeups: readonly LeaderWakeupProcessingResult[];
+  inputNotifications: readonly OperatorInputNotificationResult[];
+  autoResolvedInputs: readonly AutoResolvedInput[];
+}>;
 
-type RpcRequest = {
-  apiVersion: number;
-  requestId: string;
-  method: string;
-  params?: unknown;
-};
+export type ControllerRuntimeOptions = Readonly<{
+  intervalMs?: number;
+  now?: () => Date;
+  onError?: (error: unknown) => void;
+  workspacePreparer?: Pick<
+    TaskWorkspacePreparer,
+    "prepareActiveTaskWorkspaces" | "cleanupArchivedTaskWorkspaces"
+  >;
+}>;
 
-export async function serveController(rootDir: string): Promise<void> {
-  const existing = readControllerDiscovery(rootDir);
+export type RunningFileTaskController = Readonly<{
+  runtime: FileTaskController;
+  server: RunningControllerServer;
+  closed: Promise<void>;
+  close(): Promise<void>;
+}>;
 
-  if (existing !== null && isProcessAlive(existing.pid)) {
-    throw dataError(`Controller is already running with pid ${existing.pid}.`);
-  }
-
-  removeControllerDiscovery(rootDir);
-  const releaseLock = acquireControllerLock(rootDir, process.pid);
-  try {
-    replayPendingDomainTransactions(rootDir);
-    replayPendingSnapshotWrites(rootDir);
-    failedDomainTransactionRoots.delete(rootDir);
-    const rpcResultRetention = readRpcResultRetention(process.env.TASKMUX_RPC_RESULT_RETENTION_MS);
-    pruneRpcResults(rootDir, new Date(), rpcResultRetention);
-    rmSync(join(rootDir, "runtime", "domain-workspaces"), { recursive: true, force: true });
-    const token = randomBytes(32).toString("hex");
-    const store = createResilientTaskStore(
-      new FileTaskStore(rootDir),
-      (error, method, args) => appendControllerDiagnostic(
-        rootDir,
-        "storage.invalid_edit",
-        error.message,
-        { method, args }
-      )
-    );
-    const tmux = new TmuxManager(
-      process.env.TASKMUX_TMUX_BIN ?? "tmux",
-      new NodeCommandExecutor(),
-      rootDir
-    );
-    recoverGlobalRoleRuntimeOperations(rootDir);
-    recoverTaskLifecycleRuntimeOperations(rootDir, tmux);
-    const refreshDerivedState = (): void => {
-      primeResilientTaskStore(store);
-      rebuildDerivedIndex(rootDir, store);
-    };
-    refreshDerivedState();
-    const server = createServer((request, response) => {
-      void handleRequest(request, response, token, rootDir, store, tmux, refreshDerivedState);
-    });
-
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => resolve());
-    });
-
-    const address = server.address();
-    if (address === null || typeof address === "string") {
-      server.close();
-      throw new Error("Controller did not receive a loopback TCP port.");
-    }
-
-    writeControllerDiscovery(rootDir, {
-      schemaVersion: 1,
-      apiVersion: CONTROLLER_API_VERSION,
-      host: "127.0.0.1",
-      port: address.port,
-      pid: process.pid,
-      token,
-      startedAt: new Date().toISOString()
-    });
-
-    const scanInterval = readScanInterval(process.env.TASKMUX_CONTROLLER_SCAN_INTERVAL_MS);
-    const agentRunTtl = readAgentRunTtl(process.env.TASKMUX_AGENT_RUN_TTL_MS);
-    const scan = (): void => {
-      try {
-        runSchedulerTransaction(rootDir, tmux, new Date(), agentRunTtl, true);
-        pruneRpcResults(rootDir, new Date(), rpcResultRetention);
-        refreshDerivedState();
-      } catch (error) {
-        if (error instanceof DomainTransactionRecoveryError) {
-          failClosedDomainTransactions(rootDir, error);
-          return;
-        }
-        if (error instanceof CliError && error.code === "DATA_ERROR") {
-          appendControllerDiagnostic(
-            rootDir,
-            "scheduler.authoritative_read_failed",
-            error.message
-          );
-          return;
-        }
-        appendControllerDiagnostic(
-          rootDir,
-          "scheduler.scan_failed",
-          error instanceof Error ? error.message : String(error)
-        );
-      }
-    };
-    scan();
-    const scanTimer = setInterval(scan, scanInterval);
-    scanTimer.unref();
-
-    await new Promise<void>((resolve) => {
-      let stopping = false;
-      const stop = (): void => {
-        if (stopping) {
-          return;
-        }
-        stopping = true;
-        clearInterval(scanTimer);
-        server.close(() => {
-          removeControllerDiscovery(rootDir);
-          resolve();
-        });
-      };
-
-      process.once("SIGTERM", stop);
-      process.once("SIGINT", stop);
-    });
-  } finally {
-    removeControllerDiscovery(rootDir);
-    releaseLock();
-  }
-}
-
-export function runSchedulerTransaction(
-  rootDir: string,
-  tmux: TmuxManager,
+/**
+ * Runs one lean scheduler pass. Liveness always precedes wakeup processing so
+ * an exited busy Leader is cleared and reconsidered in the same pass.
+ */
+export async function runControllerSchedulerPass(
+  store: SchedulerStorePort,
+  delivery: TmuxDeliveryPort,
   now: Date,
-  agentRunTtl: number,
-  processWakeups: boolean
-): number {
-  recoverOperatorLaunches(rootDir, tmux, now);
-  const transactionId = `scheduler-${now.getTime()}-${randomBytes(6).toString("hex")}`;
-  const queued = executeDomainTransaction(rootDir, transactionId, (workingRoot) => {
-    const transactionStore = new FileTaskStore(workingRoot);
-    return runSchedulerPass(transactionStore, tmux, now, agentRunTtl);
-  });
-  processResolvedInputWakeups(rootDir, tmux, now);
-  pumpOperatorDeliveries(rootDir, tmux);
-  if (processWakeups) {
-    processLeaderWakeups(new FileTaskStore(rootDir), tmux, now, rootDir);
-  }
-  return queued;
-}
-
-function runSchedulerPass(
-  store: TaskStore,
-  tmux: TmuxManager,
-  now: Date,
-  agentRunTtl: number
-): number {
-  settleConfirmedAbsentOperatorWindow(store, tmux, now);
-  failUnregisteredNativeSessions(
-    store,
-    tmux,
-    now,
-    readNativeSessionRegistrationTtl(process.env.TASKMUX_NATIVE_SESSION_REGISTRATION_TTL_MS)
-  );
-  expireStaleAgentRuns(store, tmux, now, agentRunTtl);
-  failExitedAgentRuns(store, tmux, now);
-  scanOfflineInputResolutions(
-    store,
-    readOperatorPresence(store, tmux),
-    now,
-    (request) => nextOfflineResolutionId(store, request.taskId)
-  );
-  const queued = scanTaskWakeups(store, now);
-  return queued.length;
-}
-
-function processResolvedInputWakeups(rootDir: string, tmux: TmuxManager, now: Date): void {
-  processLeaderInputWakeups(rootDir, tmux, now, { clock: () => new Date() });
-}
-
-function nextOfflineResolutionId(store: TaskStore, taskId: string): string {
-  for (let attempt = 0; attempt < 32; attempt += 1) {
-    const id = `offline-${randomBytes(12).toString("hex")}`;
-    if (store.getInputResolution(taskId, id) === null) {
-      return id;
-    }
-  }
-  throw new Error(`Could not allocate an offline input resolution id: ${taskId}`);
-}
-
-export function acquireControllerLock(rootDir: string, pid: number): () => void {
-  const runtimeDir = join(rootDir, "runtime");
-  const target = join(runtimeDir, "controller.lock");
-  mkdirSync(runtimeDir, { recursive: true });
-
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      writeFileSync(target, `${JSON.stringify({ pid, createdAt: new Date().toISOString() })}\n`, {
-        flag: "wx",
-        mode: 0o600
-      });
-      return () => rmSync(target, { force: true });
-    } catch (error) {
-      if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) {
-        throw error;
-      }
-
-      const existingPid = readControllerLockPid(target);
-      if (existingPid !== null && isProcessAlive(existingPid)) {
-        throw dataError(`Controller startup is locked by pid ${existingPid}.`);
-      }
-      rmSync(target, { force: true });
-    }
-  }
-
-  throw dataError("Controller startup is locked.");
-}
-
-function readControllerLockPid(path: string): number | null {
-  try {
-    const value = JSON.parse(readFileSync(path, "utf8")) as { pid?: unknown };
-    return typeof value.pid === "number" ? value.pid : null;
-  } catch {
-    return null;
-  }
-}
-
-function readScanInterval(value: string | undefined): number {
-  const parsed = Number(value ?? 30_000);
-  return Number.isFinite(parsed) && parsed >= 25 ? parsed : 30_000;
-}
-
-export function readControllerDiscovery(rootDir: string): ControllerDiscovery | null {
-  try {
-    const value = JSON.parse(readFileSync(controllerFile(rootDir), "utf8")) as unknown;
-
-    if (
-      typeof value !== "object" ||
-      value === null ||
-      !("schemaVersion" in value) || value.schemaVersion !== 1 ||
-      !("apiVersion" in value) || value.apiVersion !== CONTROLLER_API_VERSION ||
-      !("host" in value) || value.host !== "127.0.0.1" ||
-      !("port" in value) || typeof value.port !== "number" ||
-      !("pid" in value) || typeof value.pid !== "number" ||
-      !("token" in value) || typeof value.token !== "string" ||
-      !("startedAt" in value) || typeof value.startedAt !== "string"
-    ) {
-      throw dataError("Invalid controller discovery record.");
-    }
-
-    return value as ControllerDiscovery;
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  }
-}
-
-export function removeControllerDiscovery(rootDir: string): void {
-  rmSync(controllerFile(rootDir), { force: true });
-}
-
-export function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export async function callController(
-  discovery: ControllerDiscovery,
-  method: string,
-  requestId: string,
-  params: unknown = {}
-): Promise<unknown> {
-  const response = await fetch(`http://${discovery.host}:${discovery.port}/rpc`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${discovery.token}`,
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      apiVersion: CONTROLLER_API_VERSION,
-      requestId,
-      method,
-      params
-    } satisfies RpcRequest),
-    signal: AbortSignal.timeout(30_000)
-  });
-
-  const body = await response.json() as {
-    result?: unknown;
-    error?: string | { code: CliErrorCode; message: string };
+  workspacePreparer?: Pick<
+    TaskWorkspacePreparer,
+    "prepareActiveTaskWorkspaces" | "cleanupArchivedTaskWorkspaces"
+  >
+): Promise<ControllerSchedulerResult> {
+  await workspacePreparer?.prepareActiveTaskWorkspaces();
+  const stoppedArchivedTaskIds = await stopArchivedTaskRuntimes(store, delivery, now);
+  await workspacePreparer?.cleanupArchivedTaskWorkspaces();
+  const activeRunDeliveries = await processActiveRoleRunDeliveries(store, delivery, now);
+  const failedRunIds = await reconcileExitedRoleRuns(store, delivery, now);
+  const autoResolvedInputs = store.resolveExpiredInputRecommendations(now);
+  const wakeups = await processLeaderWakeups(store, delivery, now);
+  const inputNotifications = await processOperatorInputNotifications(store, delivery);
+  return {
+    stoppedArchivedTaskIds,
+    activeRunDeliveries,
+    failedRunIds,
+    wakeups,
+    inputNotifications,
+    autoResolvedInputs
   };
-  if (body.error !== undefined) {
-    if (typeof body.error === "object") {
-      throw new CliError(body.error.code, body.error.message);
-    }
-    throw new Error(body.error);
-  }
-  if (!response.ok) {
-    throw new Error(`Controller RPC failed with HTTP ${response.status}.`);
-  }
-
-  return body.result;
 }
 
-async function handleRequest(
-  request: IncomingMessage,
-  response: ServerResponse,
-  token: string,
-  rootDir: string,
-  store: TaskStore,
-  tmux: TmuxManager,
-  refreshDerivedState: () => void
-): Promise<void> {
-  if (request.method !== "POST" || request.url !== "/rpc") {
-    sendJson(response, 404, { error: "Not found." });
-    return;
-  }
+/**
+ * Single-owner periodic runtime for FileTaskStore-backed scheduling. Concurrent
+ * pump requests coalesce into one follow-up pass; scheduler effects never
+ * overlap. There are deliberately no filesystem watchers or derived indexes.
+ */
+export class FileTaskController {
+  readonly #intervalMs: number;
+  readonly #now: () => Date;
+  readonly #onError: (error: unknown) => void;
+  readonly #workspacePreparer: Pick<
+    TaskWorkspacePreparer,
+    "prepareActiveTaskWorkspaces" | "cleanupArchivedTaskWorkspaces"
+  > | undefined;
+  #timer: NodeJS.Timeout | undefined;
+  #current: Promise<ControllerSchedulerResult> | undefined;
+  #rerunRequested = false;
+  #stopped = false;
 
-  if (request.headers.authorization !== `Bearer ${token}`) {
-    sendJson(response, 401, { error: "Unauthorized." });
-    return;
-  }
-
-  try {
-    const body = await readRequestBody(request);
-    const rpc = JSON.parse(body) as RpcRequest;
-
-    if (rpc.apiVersion !== CONTROLLER_API_VERSION || typeof rpc.requestId !== "string") {
-      sendJson(response, 400, { error: "Invalid RPC envelope." });
-      return;
-    }
-
-    if (failedDomainTransactionRoots.has(rootDir)) {
-      sendJson(response, 503, { error: "Controller storage is fail-closed pending restart recovery." });
-      return;
-    }
-
-    if (!/^[A-Za-z0-9_-]+$/.test(rpc.requestId)) {
-      sendJson(response, 400, { error: "Invalid request id." });
-      return;
-    }
-
-    if (rpc.method === "health") {
-      sendJson(response, 200, {
-        requestId: rpc.requestId,
-        result: { running: true, pid: process.pid, apiVersion: CONTROLLER_API_VERSION }
-      });
-      return;
-    }
-
-    const cached = readRpcResult(rootDir, rpc.requestId);
-    if (cached !== null) {
-      sendJson(response, 200, cached);
-      return;
-    }
-    if (readRpcIntent(rootDir, rpc.requestId) !== null) {
-      sendJson(response, 409, {
-        requestId: rpc.requestId,
-        error: `Request ${rpc.requestId} may have been applied before a crash; its outcome is unknown.`
-      });
-      return;
-    }
-    if (hasRpcTombstone(rootDir, rpc.requestId)) {
-      sendJson(response, 409, {
-        requestId: rpc.requestId,
-        error: `Request ${rpc.requestId} expired from the result cache and will not be reapplied.`
-      });
-      return;
-    }
-
-    if (rpc.method === "wakeup.merge") {
-      if (
-        typeof rpc.params !== "object" ||
-        rpc.params === null ||
-        !("taskId" in rpc.params) ||
-        typeof rpc.params.taskId !== "string" ||
-        !("reason" in rpc.params) ||
-        typeof rpc.params.reason !== "string"
-      ) {
-        sendJson(response, 400, { error: "wakeup.merge requires taskId and reason." });
-        return;
-      }
-
-      const taskId = rpc.params.taskId;
-      const task = store.runReadSnapshot((snapshot) => snapshot.getTask(taskId));
-      if (task === null) {
-        sendJson(response, 404, { error: `Task not found: ${taskId}` });
-        return;
-      }
-      if (task.archived) {
-        sendJson(response, 409, { error: `Cannot wake archived task: ${task.id}` });
-        return;
-      }
-      const wakeupReason = rpc.params.reason;
-
-      const body = executeRpcTransaction(
-        rootDir,
-        rpc,
-        refreshDerivedState,
-        (workingRoot) => {
-          const transactionStore = new FileTaskStore(workingRoot);
-          const wakeup = mergePendingWakeup(
-            task.id,
-            wakeupReason,
-            new Date(),
-            transactionStore.getPendingWakeup(task.id)
-          );
-          transactionStore.savePendingWakeup(wakeup);
-          return { requestId: rpc.requestId, result: { wakeup } };
-        }
-      );
-      processLeaderWakeups(store, tmux, new Date(), rootDir);
-      sendJson(response, 200, body);
-      return;
-    }
-
-    if (rpc.method === "task.command") {
-      if (
-        typeof rpc.params !== "object" ||
-        rpc.params === null ||
-        !("args" in rpc.params) ||
-        !Array.isArray(rpc.params.args) ||
-        !rpc.params.args.every((value) => typeof value === "string")
-      ) {
-        sendJson(response, 400, { error: "task.command requires a string args array." });
-        return;
-      }
-      if (["shell", "enter"].includes(rpc.params.args[0] ?? "")) {
-        sendJson(response, 400, { error: "Interactive task commands cannot run through RPC." });
-        return;
-      }
-      const commandArgs = rpc.params.args;
-      const provenance = parseControllerCommandProvenance(rpc.params);
-      if (provenance === null) {
-        sendJson(response, 400, { error: "task.command provenance is invalid." });
-        return;
-      }
-      if (isTaskPointerCommand(commandArgs)) {
-        const taskId = commandArgs[1] ?? "";
-        const output = store.runReadSnapshot((snapshot) => runTaskReadSnapshot(commandArgs, snapshot));
-        const body = executeRpcTransaction(
-          rootDir,
-          rpc,
-          refreshDerivedState,
-          (workingRoot) => {
-            rememberTask(new FileTaskStore(workingRoot), taskId);
-            return { requestId: rpc.requestId, result: { output } };
-          }
-        );
-        sendJson(response, 200, body);
-        return;
-      }
-      if (isReadOnlyTaskCommand(commandArgs)) {
-        const output = commandArgs[0] === "tail"
-          ? runControllerTaskCommand(commandArgs, store, tmux, provenance.environment, provenance.sessionRegistration)
-          : store.runReadSnapshot((snapshot) => runTaskReadSnapshot(commandArgs, snapshot));
-        sendJson(response, 200, { requestId: rpc.requestId, result: { output } });
-        return;
-      }
-
-      const lifecycle = prepareTaskLifecycleCommand(commandArgs, store);
-      if (lifecycle !== null) {
-        recoverTaskLifecycleRuntimeOperations(rootDir, tmux);
-        let body: { requestId: string; result: { output: string } } | undefined;
-        executeTaskLifecycleOperation(rootDir, lifecycle, tmux, (started, receipt) => {
-          body = executeRpcTransaction(
-            rootDir,
-            rpc,
-            refreshDerivedState,
-            (workingRoot) => {
-              const current = readTaskRuntimeOperationClaim(workingRoot, started.taskId);
-              if (
-                current === null ||
-                current.token !== started.token ||
-                current.recoveryToken !== null ||
-                current.phase !== "effect-started" ||
-                roleRuntimeStateDigest(current.effectPlan) !== roleRuntimeStateDigest(started.effectPlan)
-              ) {
-                throw dataError(`Task lifecycle lost operation ownership: ${started.taskId}.`);
-              }
-              const transactionStore = FileTaskStore.forDomainTransactionWorkspace(
-                workingRoot,
-                current.token
-              );
-              const output = finalizeTaskLifecycleOperation(
-                current,
-                transactionStore,
-                new Date(),
-                receipt
-              );
-              clearRuntimeOperationClaim(
-                workingRoot,
-                { scope: "task", taskId: current.taskId },
-                current.token
-              );
-              return { requestId: rpc.requestId, result: { output } };
-            }
-          );
-          return body.result.output;
-        });
-        if (body === undefined) {
-          throw dataError("Task lifecycle did not finalize its RPC result.");
-        }
-        processLeaderWakeups(store, tmux, new Date(), rootDir);
-        sendJson(response, 200, body);
-        return;
-      }
-
-      if (isTaskPostCommitEffectCommand(commandArgs)) {
-        const body = executeRpcPostCommitTaskCommand(
-          rootDir,
-          rpc,
-          refreshDerivedState,
-          commandArgs,
-          tmux,
-          provenance.environment,
-          provenance.sessionRegistration
-        );
-        sendJson(response, 200, body);
-        return;
-      }
-
-      const body = executeRpcTransaction(
-        rootDir,
-        rpc,
-        refreshDerivedState,
-        (workingRoot) => {
-          const transactionStore = new FileTaskStore(workingRoot);
-          const output = runControllerTaskCommand(
-            commandArgs,
-            transactionStore,
-            tmux,
-            provenance.environment,
-            provenance.sessionRegistration
-          );
-          return { requestId: rpc.requestId, result: { output } };
-        }
-      );
-      runTaskInputPostCommitEffects(rootDir, commandArgs, tmux);
-      processLeaderWakeups(store, tmux, new Date(), rootDir);
-      sendJson(response, 200, body);
-      return;
-    }
-
-    if (rpc.method === "task.attach-complete") {
-      if (
-        typeof rpc.params !== "object" ||
-        rpc.params === null ||
-        !("taskId" in rpc.params) || typeof rpc.params.taskId !== "string" ||
-        !("roleName" in rpc.params) || typeof rpc.params.roleName !== "string"
-      ) {
-        sendJson(response, 400, { error: "task.attach-complete requires taskId and roleName." });
-        return;
-      }
-      const taskId = rpc.params.taskId;
-      const roleName = rpc.params.roleName;
-      const body = executeRpcTransaction(
-        rootDir,
-        rpc,
-        refreshDerivedState,
-        (workingRoot) => {
-          recordTaskRoleAttached(taskId, roleName, new FileTaskStore(workingRoot));
-          return { requestId: rpc.requestId, result: {} };
-        }
-      );
-      sendJson(response, 200, body);
-      return;
-    }
-
-    if (rpc.method === "scheduler.scan") {
-      const now = new Date();
-      recoverOperatorLaunches(rootDir, tmux, now);
-      const body = executeRpcTransaction(
-        rootDir,
-        rpc,
-        refreshDerivedState,
-        (workingRoot) => {
-          const transactionStore = new FileTaskStore(workingRoot);
-          const queued = runSchedulerPass(
-            transactionStore,
-            tmux,
-            now,
-            readAgentRunTtl(process.env.TASKMUX_AGENT_RUN_TTL_MS)
-          );
-          const output = `Queued ${queued} task wakeup${queued === 1 ? "" : "s"}\n`;
-          return { requestId: rpc.requestId, result: { output } };
-        }
-      );
-      processResolvedInputWakeups(rootDir, tmux, now);
-      pumpOperatorDeliveries(rootDir, tmux);
-      refreshDerivedState();
-      sendJson(response, 200, body);
-      return;
-    }
-
-    if (rpc.method === "command.execute") {
-      if (
-        typeof rpc.params !== "object" ||
-        rpc.params === null ||
-        !("group" in rpc.params) ||
-        typeof rpc.params.group !== "string" ||
-        !("args" in rpc.params) ||
-        !Array.isArray(rpc.params.args) ||
-        !rpc.params.args.every((value) => typeof value === "string")
-      ) {
-        sendJson(response, 400, { error: "command.execute requires group and a string args array." });
-        return;
-      }
-      const commandGroup = rpc.params.group;
-      const commandArgs = rpc.params.args;
-      const provenance = parseControllerCommandProvenance(rpc.params);
-      if (provenance === null) {
-        sendJson(response, 400, { error: "command.execute provenance is invalid." });
-        return;
-      }
-      if (isReadOnlyControllerCommand(commandGroup, commandArgs)) {
-        const output = store.runReadSnapshot((snapshot) =>
-          runControllerReadCommandGroup(commandGroup, commandArgs, snapshot));
-        sendJson(response, 200, { requestId: rpc.requestId, result: { output } });
-        return;
-      }
-
-      let body: { requestId: string; result: { output: string } };
-      if (commandGroup === "export") {
-        body = executeRpcPostCommitExport(
-          rootDir,
-          rpc,
-          refreshDerivedState,
-          commandArgs
-        );
-      } else if (commandGroup === "restore") {
-        writeRpcIntent(rootDir, rpc.requestId, rpc.method);
-        const restored = executeRestoreCommand(
-          rootDir,
-          rpc.requestId,
-          commandArgs,
-          (result) => {
-            const rpcBody = { requestId: rpc.requestId, result: { output: result.output } };
-            return [rpcResultOperation(rootDir, rpc.requestId, rpcBody)];
-          }
-        );
-        body = { requestId: rpc.requestId, result: { output: restored.output } };
-        clearRpcIntent(rootDir, rpc.requestId);
-        refreshDerivedState();
-      } else if (commandGroup === "prune") {
-        writeRpcIntent(rootDir, rpc.requestId, rpc.method);
-        const output = executePruneCommand(rootDir, rpc.requestId, commandArgs);
-        body = { requestId: rpc.requestId, result: { output } };
-        writeRpcResult(rootDir, rpc.requestId, body);
-        clearRpcIntent(rootDir, rpc.requestId);
-        refreshDerivedState();
-      } else if (
-        commandGroup === "role" &&
-        ["update", "remove"].includes(commandArgs[0] ?? "")
-      ) {
-        writeRpcIntent(rootDir, rpc.requestId, rpc.method);
-        const output = runControllerCommandGroup(
-          commandGroup,
-          commandArgs,
-          new FileTaskStore(rootDir),
-          rootDir,
-          rootDir,
-          tmux,
-          provenance.environment,
-          provenance.sessionRegistration
-        );
-        body = { requestId: rpc.requestId, result: { output } };
-        writeRpcResult(rootDir, rpc.requestId, body);
-        clearRpcIntent(rootDir, rpc.requestId);
-        refreshDerivedState();
-      } else {
-        body = executeRpcTransaction(
-            rootDir,
-            rpc,
-            refreshDerivedState,
-            (workingRoot) => {
-              const transactionStore = new FileTaskStore(workingRoot);
-              const output = runControllerCommandGroup(
-                commandGroup,
-                commandArgs,
-                transactionStore,
-                workingRoot,
-                rootDir,
-                tmux,
-                provenance.environment,
-                provenance.sessionRegistration
-              );
-              return { requestId: rpc.requestId, result: { output } };
-            },
-            { includeBackups: commandGroup === "backup" }
-          );
-      }
-      pumpOperatorDeliveries(rootDir, tmux);
-      refreshDerivedState();
-      sendJson(response, 200, body);
-      return;
-    }
-
-    sendJson(response, 404, { requestId: rpc.requestId, error: `Unknown RPC method: ${rpc.method}` });
-  } catch (error) {
-    if (error instanceof DomainTransactionRecoveryError) {
-      failClosedDomainTransactions(rootDir, error);
-      sendJson(response, 503, { error: "Controller storage is fail-closed pending restart recovery." });
-      return;
-    }
-    sendJson(response, 400, {
-      error: error instanceof CliError
-        ? { code: error.code, message: error.message }
-        : error instanceof Error ? error.message : String(error)
-    });
-  }
-}
-
-function failClosedDomainTransactions(
-  rootDir: string,
-  error: DomainTransactionRecoveryError
-): void {
-  failedDomainTransactionRoots.add(rootDir);
-  setImmediate(() => process.kill(process.pid, "SIGTERM"));
-  try {
-    appendControllerDiagnostic(
-      rootDir,
-      "storage.domain_transaction_recovery_failed",
-      "A committed domain transaction could not complete synchronous recovery.",
-      { transactionId: error.transactionId }
-    );
-  } catch {
-    // Shutdown is already scheduled; a storage failure must not keep the Controller serving.
-  }
-}
-
-function executeRpcTransaction<T>(
-  rootDir: string,
-  rpc: RpcRequest & { requestId: string },
-  refreshDerivedState: () => void,
-  execute: (workingRoot: string) => T,
-  options: { includeBackups?: boolean } = {}
-): T {
-  writeRpcIntent(rootDir, rpc.requestId, rpc.method);
-  const result = executeDomainTransaction(
-    rootDir,
-    rpc.requestId,
-    execute,
-    (body) => [rpcResultOperation(rootDir, rpc.requestId, body)],
-    options
-  );
-  clearRpcIntent(rootDir, rpc.requestId);
-  refreshDerivedState();
-  return result;
-}
-
-function executeRpcPostCommitTaskCommand(
-  rootDir: string,
-  rpc: RpcRequest & { requestId: string },
-  refreshDerivedState: () => void,
-  commandArgs: string[],
-  tmux: TmuxManager,
-  environment: NodeJS.ProcessEnv,
-  sessionRegistration: ManualSessionRegistration | undefined
-): { requestId: string; result: { output: string } } {
-  writeRpcIntent(rootDir, rpc.requestId, rpc.method);
-  const output = runControllerTaskCommand(
-    commandArgs,
-    new FileTaskStore(rootDir),
-    tmux,
-    environment,
-    sessionRegistration
-  );
-  const body = { requestId: rpc.requestId, result: { output } };
-  writeRpcResult(rootDir, rpc.requestId, body);
-  clearRpcIntent(rootDir, rpc.requestId);
-  refreshDerivedState();
-  return body;
-}
-
-function executeRpcPostCommitExport(
-  rootDir: string,
-  rpc: RpcRequest & { requestId: string },
-  refreshDerivedState: () => void,
-  commandArgs: string[]
-): { requestId: string; result: { output: string } } {
-  // Export is an authoritative read snapshot followed by an external effect.
-  // It must not run in the clone used for a domain mutation transaction:
-  // validate the output against the published home, commit its RPC intent,
-  // then publish only after that intent has become durable.
-  const publication = preparePortableExport(
-    commandArgs,
-    new FileTaskStore(rootDir),
-    rootDir
-  );
-  commitRpcIntent(rootDir, rpc);
-  const output = publishPortableExport(publication);
-  if (
-    process.env.NODE_ENV === "test" &&
-    process.env.TASKMUX_TEST_ONLY_PORTABLE_EXPORT_FAILPOINT === "after-effect"
+  constructor(
+    readonly store: SchedulerStorePort,
+    readonly delivery: TmuxDeliveryPort,
+    options: ControllerRuntimeOptions = {}
   ) {
-    throw new Error("Portable export stopped after its external effect.");
+    this.#intervalMs = positiveInteger(
+      options.intervalMs,
+      DEFAULT_RECONCILIATION_INTERVAL_MS,
+      "Controller reconciliation interval"
+    );
+    this.#now = options.now ?? (() => new Date());
+    this.#onError = options.onError ?? (() => {});
+    this.#workspacePreparer = options.workspacePreparer;
   }
-  const body = { requestId: rpc.requestId, result: { output } };
-  executeDomainTransaction(
-    rootDir,
-    `${rpc.requestId}-export-result`,
-    () => undefined,
-    () => [
-      rpcResultOperation(rootDir, rpc.requestId, body),
-      { type: "delete", target: rpcIntentFile(rootDir, rpc.requestId) }
-    ]
-  );
-  refreshDerivedState();
-  return body;
-}
 
-function commitRpcIntent(rootDir: string, rpc: RpcRequest & { requestId: string }): void {
-  executeDomainTransaction(
-    rootDir,
-    `${rpc.requestId}-export-intent`,
-    () => undefined,
-    () => [rpcIntentOperation(rootDir, rpc.requestId, rpc.method)]
-  );
-}
-
-function isTaskPostCommitEffectCommand(args: readonly string[]): boolean {
-  return args[0] === "dispatch" || isTaskRoleRuntimeControlCommand(args);
-}
-
-function isReadOnlyTaskCommand(args: string[]): boolean {
-  const command = args[0] ?? "";
-  if ([
-    "list", "board", "last", "roles",
-    "comments", "events", "activity", "timeline", "tail", "detail"
-  ].includes(command)) {
-    return true;
+  get reconciliationIntervalMs(): number {
+    return this.#intervalMs;
   }
-  if (command === "current") {
-    return args.length === 1;
+
+  start(): void {
+    if (this.#timer !== undefined) return;
+    this.#stopped = false;
+    void this.pump().catch(this.#onError);
+    this.#timer = setInterval(() => {
+      void this.pump().catch(this.#onError);
+    }, this.#intervalMs);
+    this.#timer.unref();
   }
-  return (command === "topic" && args[1] === "list") ||
-    (command === "input" && ["list", "show"].includes(args[1] ?? ""));
-}
 
-function isTaskPointerCommand(args: string[]): boolean {
-  return ["show", "open", "context"].includes(args[0] ?? "");
-}
-
-function isReadOnlyControllerCommand(group: string, args: string[]): boolean {
-  if (group === "config") {
-    return args[0] === "show";
+  stop(): void {
+    this.#stopped = true;
+    if (this.#timer !== undefined) {
+      clearInterval(this.#timer);
+      this.#timer = undefined;
+    }
   }
-  return ["agent", "role"].includes(group) && ["list", "show"].includes(args[0] ?? "");
+
+  pump(): Promise<ControllerSchedulerResult> {
+    if (this.#stopped) {
+      return Promise.reject(new Error("Controller runtime is stopped."));
+    }
+    if (this.#current !== undefined) {
+      this.#rerunRequested = true;
+      return this.#current;
+    }
+
+    const running = this.#runCoalesced();
+    this.#current = running;
+    void running.finally(() => {
+      if (this.#current === running) this.#current = undefined;
+    }).catch(() => {});
+    return running;
+  }
+
+  async #runCoalesced(): Promise<ControllerSchedulerResult> {
+    let result: ControllerSchedulerResult = {
+      stoppedArchivedTaskIds: [],
+      activeRunDeliveries: [],
+      failedRunIds: [],
+      wakeups: [],
+      inputNotifications: [],
+      autoResolvedInputs: []
+    };
+    do {
+      this.#rerunRequested = false;
+      result = await runControllerSchedulerPass(
+        this.store,
+        this.delivery,
+        this.#now(),
+        this.#workspacePreparer
+      );
+    } while (this.#rerunRequested && !this.#stopped);
+    return result;
+  }
 }
 
-function runControllerCommandGroup(
-  group: string,
-  args: string[],
-  store: TaskStore,
-  rootDir: string,
-  publishedRoot = rootDir,
-  tmux?: TmuxManager,
-  environment: NodeJS.ProcessEnv = {},
-  sessionRegistration?: ManualSessionRegistration
-): string {
-  switch (group) {
-    case "config":
-      return runConfigCommand(args, store, process.env);
-    case "agent":
-      return runAgentCommand(args, store);
-    case "role":
-      if (args[0] === "enter") {
-        throw new Error("Interactive role commands cannot run through RPC.");
+/**
+ * Starts the single private Unix-socket Controller for one TASKMUX_HOME. The
+ * shared server owns status/stop and rejects a second live instance; this
+ * layer adds only scheduler.scan plus an optional command dispatcher.
+ */
+export async function startFileTaskController(
+  home: string,
+  store: SchedulerStorePort,
+  delivery: TmuxDeliveryPort,
+  dispatcher?: ControllerDispatcher,
+  options: ControllerRuntimeOptions = {}
+): Promise<RunningFileTaskController> {
+  const runtime = new FileTaskController(store, delivery, options);
+  const server = await startControllerServer(home, async (method, params) => {
+    if (method === "scheduler.scan") {
+      if (!isEmptyJsonObject(params)) {
+        throw controllerApplicationError("INVALID_PARAMS", "scheduler.scan params are invalid.");
       }
-      return runGlobalRoleCommand(args, store, {
-        taskmuxHome: publishedRoot,
-        env: environment,
-        tmux,
-        sessionRegistration,
-        requireManualSessionRegistration: true
-      });
-    case "backup":
-      return runBackupCommand(rootDir, publishedRoot);
-    case "export":
-      throw dataError("Portable export must run as a post-commit effect.");
-    case "import":
-      if (!(store instanceof FileTaskStore)) {
-        throw dataError("Portable import requires a FileTaskStore transaction.");
-      }
-      return runImportCommand(args, store);
-    default:
-      throw new Error(`Unsupported Controller command group: ${group}`);
-  }
-}
-
-function runControllerTaskCommand(
-  args: string[],
-  store: TaskStore,
-  tmux: TmuxManager | undefined,
-  environment: NodeJS.ProcessEnv,
-  sessionRegistration: ManualSessionRegistration | undefined
-): string {
-  return runTaskCommand(args, store, tmux, {
-    environment,
-    sessionRegistration,
-    requireManualSessionRegistration: true
+      return schedulerResultJson(await runtime.pump());
+    }
+    if (dispatcher === undefined) {
+      throw controllerApplicationError("METHOD_NOT_FOUND", "Controller method was not found.");
+    }
+    return dispatcher(method, params);
   });
-}
-
-function runControllerReadCommandGroup(
-  group: string,
-  args: string[],
-  store: TaskReader
-): string {
-  switch (group) {
-    case "config":
-      return runConfigReadCommand(args, store, process.env);
-    case "agent":
-      return runAgentReadCommand(args, store);
-    case "role":
-      return runGlobalRoleReadCommand(args, store);
-    default:
-      throw new Error(`Unsupported read-only Controller command group: ${group}`);
-  }
-}
-
-function readRpcResult(rootDir: string, requestId: string): unknown | null {
-  try {
-    return JSON.parse(readFileSync(rpcResultFile(rootDir, requestId), "utf8")) as unknown;
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  }
-}
-
-function writeRpcResult(rootDir: string, requestId: string, body: unknown): void {
-  const directory = join(rootDir, "runtime", "rpc-results");
-  const target = rpcResultFile(rootDir, requestId);
-  const temporary = `${target}.${process.pid}.tmp`;
-  mkdirSync(directory, { recursive: true });
-  writeFileSync(temporary, `${JSON.stringify(body, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temporary, target);
-}
-
-function rpcResultOperation(
-  rootDir: string,
-  requestId: string,
-  body: unknown
-): DomainTransactionOperation {
+  runtime.start();
+  const closed = server.closed.finally(() => runtime.stop());
   return {
-    type: "write",
-    target: rpcResultFile(rootDir, requestId),
-    content: `${JSON.stringify(body, null, 2)}\n`
+    runtime,
+    server,
+    closed,
+    close: async () => {
+      runtime.stop();
+      await server.close();
+    }
   };
 }
 
-function readRpcIntent(rootDir: string, requestId: string): unknown | null {
-  try {
-    return JSON.parse(readFileSync(rpcIntentFile(rootDir, requestId), "utf8")) as unknown;
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      return null;
-    }
-    throw error;
+function positiveInteger(value: number | undefined, fallback: number, label: string): number {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved <= 0) {
+    throw new TypeError(`${label} must be a positive integer`);
   }
+  return resolved;
 }
 
-function writeRpcIntent(rootDir: string, requestId: string, method: string): void {
-  const directory = join(rootDir, "runtime", "rpc-intents");
-  const target = rpcIntentFile(rootDir, requestId);
-  const temporary = `${target}.${process.pid}.tmp`;
-  mkdirSync(directory, { recursive: true });
-  writeFileSync(temporary, rpcIntentContent(requestId, method), { mode: 0o600 });
-  renameSync(temporary, target);
+function schedulerResultJson(result: ControllerSchedulerResult): JsonValue {
+  return JSON.parse(JSON.stringify(result)) as JsonValue;
 }
 
-function rpcIntentOperation(
-  rootDir: string,
-  requestId: string,
-  method: string
-): DomainTransactionOperation {
-  return {
-    type: "write",
-    target: rpcIntentFile(rootDir, requestId),
-    content: rpcIntentContent(requestId, method)
-  };
+function isEmptyJsonObject(value: JsonValue): boolean {
+  return typeof value === "object"
+    && value !== null
+    && !Array.isArray(value)
+    && Object.keys(value).length === 0;
 }
 
-function rpcIntentContent(requestId: string, method: string): string {
-  return `${JSON.stringify({
-    schemaVersion: 1,
-    requestId,
-    method,
-    createdAt: new Date().toISOString()
-  }, null, 2)}\n`;
-}
-
-function clearRpcIntent(rootDir: string, requestId: string): void {
-  rmSync(rpcIntentFile(rootDir, requestId), { force: true });
-}
-
-function rpcIntentFile(rootDir: string, requestId: string): string {
-  return join(rootDir, "runtime", "rpc-intents", `${requestId}.json`);
-}
-
-function rpcResultFile(rootDir: string, requestId: string): string {
-  return join(rootDir, "runtime", "rpc-results", `${requestId}.json`);
-}
-
-function readRpcResultRetention(value: string | undefined): number {
-  const parsed = Number(value ?? 30 * 24 * 60 * 60 * 1_000);
-  return Number.isFinite(parsed) && parsed >= 1_000
-    ? parsed
-    : 30 * 24 * 60 * 60 * 1_000;
-}
-
-function pruneRpcResults(rootDir: string, now: Date, retentionMs: number): void {
-  const directory = join(rootDir, "runtime", "rpc-results");
-  let names: string[];
-  try {
-    names = readdirSync(directory).filter((name) => name.endsWith(".json"));
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      return;
-    }
-    throw error;
-  }
-  for (const name of names) {
-    const path = join(directory, name);
-    if (now.getTime() - statSync(path).mtimeMs < retentionMs) {
-      continue;
-    }
-    const requestId = name.slice(0, -5);
-    appendRpcTombstone(rootDir, requestId, now);
-    rmSync(path, { force: true });
-  }
-}
-
-function hasRpcTombstone(rootDir: string, requestId: string): boolean {
-  return readRpcTombstones(rootDir).some((entry) => entry.requestId === requestId);
-}
-
-function appendRpcTombstone(rootDir: string, requestId: string, now: Date): void {
-  const entries = readRpcTombstones(rootDir);
-  if (entries.some((entry) => entry.requestId === requestId)) {
-    return;
-  }
-  const target = join(rootDir, "runtime", "rpc-tombstones.jsonl");
-  const temporary = `${target}.${process.pid}.tmp`;
-  mkdirSync(join(rootDir, "runtime"), { recursive: true });
-  const content = [
-    ...entries,
-    { schemaVersion: 1, requestId, expiredAt: now.toISOString() }
-  ].map((entry) => JSON.stringify(entry)).join("\n").concat("\n");
-  writeFileSync(temporary, content, { mode: 0o600 });
-  renameSync(temporary, target);
-}
-
-function readRpcTombstones(rootDir: string): Array<{
-  schemaVersion: 1;
-  requestId: string;
-  expiredAt: string;
-}> {
-  try {
-    return readFileSync(join(rootDir, "runtime", "rpc-tombstones.jsonl"), "utf8")
-      .split("\n")
-      .filter((line) => line.trim().length > 0)
-      .map((line) => JSON.parse(line) as { schemaVersion: 1; requestId: string; expiredAt: string });
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      return [];
-    }
-    throw error;
-  }
-}
-
-async function readRequestBody(request: IncomingMessage): Promise<string> {
-  let body = "";
-
-  for await (const chunk of request) {
-    body += chunk.toString();
-    if (body.length > 1_000_000) {
-      throw new Error("RPC request is too large.");
-    }
-  }
-
-  return body;
-}
-
-function sendJson(response: ServerResponse, status: number, body: unknown): void {
-  response.writeHead(status, { "content-type": "application/json" });
-  response.end(JSON.stringify(body));
-}
-
-function writeControllerDiscovery(rootDir: string, discovery: ControllerDiscovery): void {
-  const runtimeDir = join(rootDir, "runtime");
-  const target = controllerFile(rootDir);
-  const temporary = `${target}.${process.pid}.tmp`;
-  mkdirSync(runtimeDir, { recursive: true });
-  writeFileSync(temporary, `${JSON.stringify(discovery, null, 2)}\n`, { mode: 0o600 });
-  chmodSync(temporary, 0o600);
-  renameSync(temporary, target);
-}
-
-function controllerFile(rootDir: string): string {
-  return join(rootDir, "runtime", "controller.json");
+function controllerApplicationError(
+  code: "INVALID_PARAMS" | "METHOD_NOT_FOUND",
+  message: string
+): Error {
+  const error = Object.assign(new Error(message), { code });
+  error.name = "CoreApplicationError";
+  return error;
 }

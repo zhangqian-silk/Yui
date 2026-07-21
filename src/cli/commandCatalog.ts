@@ -1,27 +1,20 @@
-import { CYCLE_CAUSES } from "../cycle/cycle.js";
 import { supportedAgentAdapterIds } from "../agent/adapterCatalog.js";
-import {
-  ROLE_AGENT_FILE_OPTIONS,
-  ROLE_AGENT_SCRIPTED_OPTIONS,
-  ROLE_EXPECT_UPDATED_AT_OPTION,
-  roleAgentOptionUsage
-} from "./roleOptionCatalog.js";
 
 export type CommandNodeKind = "group" | "leaf" | "hybrid";
 export type CompletionProviderId = "role-agent";
 
-export type CommandValue = {
+export type CommandValue = Readonly<{
   name: string;
   summary: string;
-};
+}>;
 
-export type CommandSection = {
+export type CommandSection = Readonly<{
   id: string;
   title: string;
   entries: readonly string[];
-};
+}>;
 
-export type CommandNode = {
+export type CommandNode = Readonly<{
   name: string;
   path: readonly string[];
   summary: string;
@@ -43,9 +36,9 @@ export type CommandNode = {
   completionUsesDefaultAgent: boolean;
   commandPathArguments: boolean;
   acceptsArguments: boolean;
-};
+}>;
 
-type NodeInput = {
+type NodeInput = Readonly<{
   name: string;
   summary: string;
   usage?: string | readonly string[];
@@ -66,22 +59,15 @@ type NodeInput = {
   completionUsesDefaultAgent?: boolean;
   commandPathArguments?: boolean;
   acceptsArguments?: boolean;
-};
+}>;
 
 function buildNode(input: NodeInput, parentPath: readonly string[] = []): CommandNode {
   const path = [...parentPath, input.name];
   const children = (input.children ?? []).map((child) => buildNode(child, path));
   const executable = input.executable ?? children.length === 0;
-  const optionValues = Object.fromEntries(
-    Object.entries(input.optionValues ?? {}).map(([option, values]) => [option, Object.freeze([...values])])
-  );
-  const argumentValues = Object.fromEntries(
-    Object.entries(input.argumentValues ?? {}).map(([position, values]) => [position, Object.freeze([...values])])
-  );
   const usage = input.usage === undefined
     ? [`${path.join(" ")}${children.length > 0 && !executable ? " <command>" : ""}`]
     : typeof input.usage === "string" ? [input.usage] : [...input.usage];
-
   return Object.freeze({
     name: input.name,
     path: Object.freeze(path),
@@ -89,8 +75,7 @@ function buildNode(input: NodeInput, parentPath: readonly string[] = []): Comman
     kind: children.length === 0 ? "leaf" : executable ? "hybrid" : "group",
     usage: Object.freeze(usage),
     sections: Object.freeze((input.sections ?? []).map((section) => Object.freeze({
-      id: section.id,
-      title: section.title,
+      ...section,
       entries: Object.freeze([...section.entries])
     }))),
     children: Object.freeze(children),
@@ -100,8 +85,8 @@ function buildNode(input: NodeInput, parentPath: readonly string[] = []): Comman
     values: Object.freeze((input.values ?? []).map((value) => Object.freeze(
       typeof value === "string" ? { name: value, summary: value } : { ...value }
     ))),
-    optionValues: Object.freeze(optionValues),
-    argumentValues: Object.freeze(argumentValues),
+    optionValues: freezeRecord(input.optionValues),
+    argumentValues: freezeRecord(input.argumentValues),
     fileOptions: Object.freeze([...(input.fileOptions ?? [])]),
     workspaceMapOptions: Object.freeze([...(input.workspaceMapOptions ?? [])]),
     fileArguments: Object.freeze([...(input.fileArguments ?? [])]),
@@ -113,247 +98,477 @@ function buildNode(input: NodeInput, parentPath: readonly string[] = []): Comman
   });
 }
 
+function freezeRecord<T extends string | number>(
+  record: Readonly<Record<T, readonly string[]>> | undefined
+): Readonly<Record<T, readonly string[]>> {
+  return Object.freeze(Object.fromEntries(
+    Object.entries(record ?? {}).map(([key, values]) => [key, Object.freeze([...(values as readonly string[])])])
+  )) as Readonly<Record<T, readonly string[]>>;
+}
+
+const agentChildren: readonly NodeInput[] = [
+  {
+    name: "add",
+    summary: "Add a configured native Agent CLI.",
+    usage: "taskmux agent add <id> [--adapter <adapter>] --command <command> [--arg <arg> ...] [--env TARGET=PROCESS_NAME ...]",
+    options: ["--adapter", "--command", "--arg", "--env"],
+    optionValues: { "--adapter": supportedAgentAdapterIds() },
+    executableOptions: ["--command"]
+  },
+  { name: "list", summary: "List configured Agents." },
+  { name: "show", summary: "Show one configured Agent.", usage: "taskmux agent show <id>" },
+  {
+    name: "update",
+    summary: "Update a configured Agent.",
+    usage: "taskmux agent update <id> [--adapter <adapter>] [--command <command>] [--arg <arg> ... | --clear-args] [--env TARGET=PROCESS_NAME ... | --clear-env]",
+    options: ["--adapter", "--command", "--arg", "--clear-args", "--env", "--clear-env"],
+    optionValues: { "--adapter": supportedAgentAdapterIds() },
+    executableOptions: ["--command"]
+  },
+  { name: "remove", summary: "Remove a configured Agent.", usage: "taskmux agent remove <id>" }
+];
+
+const roleProfileOptions = [
+  "--description", "--responsibility", "--constraint",
+  "--expected-output", "--system-prompt", "--skill"
+] as const;
+const roleAgentOptions = [
+  "--model", "--effort", "--sandbox", "--approval", "--permission-mode", "--search"
+] as const;
+const roleProfileClearOptions = [
+  "--clear-description", "--clear-responsibilities", "--clear-constraints",
+  "--clear-expected-output", "--clear-system-prompt", "--clear-skills"
+] as const;
+const roleAgentClearOptions = [
+  "--clear-model", "--clear-effort", "--clear-sandbox", "--clear-approval",
+  "--clear-permission-mode", "--clear-search", "--clear-agent-config"
+] as const;
+const roleAgentOptionValues = {
+  "--sandbox": ["read-only", "workspace-write", "danger-full-access"],
+  "--approval": ["untrusted", "on-request", "never"],
+  "--search": ["true"]
+} as const;
+
+const roleChildren: readonly NodeInput[] = [
+  {
+    name: "add",
+    summary: "Add a reusable global Role.",
+    usage: "taskmux role add <name> --agent <id> [Role and Agent settings]",
+    options: ["--agent", "--workspace", ...roleProfileOptions, ...roleAgentOptions],
+    optionValues: roleAgentOptionValues,
+    fileOptions: ["--workspace"]
+  },
+  { name: "list", summary: "List global Roles." },
+  { name: "show", summary: "Show one global Role.", usage: "taskmux role show <name>" },
+  {
+    name: "update",
+    summary: "Update a global Role.",
+    usage: "taskmux role update <name> [profile options] [clear options]",
+    options: ["--agent", "--workspace", ...roleProfileOptions, ...roleAgentOptions,
+      ...roleProfileClearOptions, ...roleAgentClearOptions],
+    optionValues: roleAgentOptionValues,
+    fileOptions: ["--workspace"]
+  },
+  { name: "remove", summary: "Remove a global Role.", usage: "taskmux role remove <name>" },
+  { name: "bind", summary: "Bind and activate an Agent for a global Role.", usage: "taskmux role bind <role> <agent-id>" },
+  { name: "enter", summary: "Enter a global Role's native session.", usage: "taskmux role enter <role>" },
+  {
+    name: "session",
+    summary: "Manage native session IDs for a global Role.",
+    sections: [{ id: "manage", title: "Commands", entries: ["record", "replace"] }],
+    children: [
+      {
+        name: "record",
+        summary: "Record the active Agent's native session ID.",
+        usage: "taskmux role session record <role> --native-id <id>",
+        options: ["--native-id"]
+      },
+      {
+        name: "replace",
+        summary: "Explicitly replace the active Agent's native session ID.",
+        usage: "taskmux role session replace <role> --native-id <id> --reason <text>",
+        options: ["--native-id", "--reason"]
+      }
+    ]
+  }
+];
+
 const taskChildren: readonly NodeInput[] = [
-  { name: "create", summary: "Create a task.", usage: "taskmux task create <title> [--template feature|bug|review] [--agent <agent>] [--workspace <path>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD]", options: ["--template", "--agent", "--workspace", "--description", "--priority", "--tag", "--due"], optionValues: { "--template": ["feature", "bug", "review"], "--priority": ["low", "medium", "high", "urgent"] }, fileOptions: ["--workspace"] },
-  { name: "update", summary: "Update task metadata.", usage: "taskmux task update <task-id> [--title <title>] [--description <body>] [--priority low|medium|high|urgent] [--tag <tag> ...] [--due YYYY-MM-DD] [--clear-description] [--clear-priority] [--clear-tags] [--clear-due]", options: ["--title", "--description", "--priority", "--tag", "--due", "--clear-description", "--clear-priority", "--clear-tags", "--clear-due"], optionValues: { "--priority": ["low", "medium", "high", "urgent"] } },
-  { name: "list", summary: "List tasks.", usage: "taskmux task list [--archived true|false] [--tag <tag>] [--priority <priority>] [--search <text>]", options: ["--archived", "--tag", "--priority", "--search"], optionValues: { "--archived": ["true", "false"], "--priority": ["low", "medium", "high", "urgent"] } },
-  { name: "board", summary: "Show the task board.", usage: "taskmux task board [--archived true|false] [--tag <tag>] [--priority <priority>] [--search <text>] [--with-roles]", options: ["--archived", "--tag", "--priority", "--search", "--with-roles"], optionValues: { "--archived": ["true", "false"], "--priority": ["low", "medium", "high", "urgent"] } },
-  { name: "show", summary: "Show task metadata.", usage: "taskmux task show <task-id>" },
-  { name: "current", summary: "Show or select the current task.", usage: "taskmux task current [<task-id>]" },
-  { name: "last", summary: "Show the last-read task." },
-  { name: "clone", summary: "Clone a task and its roles.", usage: "taskmux task clone <task-id> [--title <title>]", options: ["--title"] },
-  { name: "archive", summary: "Archive a task.", usage: "taskmux task archive <task-id> [--reason <body>] [--summary <body>]", options: ["--reason", "--summary"] },
-  { name: "unarchive", summary: "Unarchive a task.", usage: "taskmux task unarchive <task-id>" },
-  { name: "open", summary: "Open a concise task overview.", usage: "taskmux task open <task-id>" },
-  { name: "context", summary: "Render durable task context.", usage: "taskmux task context <task-id> [--format text|json] [--include-transcripts]", options: ["--format", "--include-transcripts"], optionValues: { "--format": ["text", "json"] } },
-  { name: "delete", summary: "Move a task to trash.", usage: "taskmux task delete <task-id>" },
-  { name: "restore", summary: "Restore a task from trash.", usage: "taskmux task restore <task-id>" },
-  { name: "shell", summary: "Open the interactive task shell.", usage: "taskmux task shell <task-id>" },
-  { name: "assign", summary: "Assign one configured Agent to a task role; Agent is interactively selected when omitted.", usage: `taskmux task assign <task-id> <role> [--agent <agent-id>] [--workspace <path>] [--as <task-role>] ${roleAgentOptionUsage()} [--system-prompt <body>]`, options: ["--agent", "--workspace", "--as", ...ROLE_AGENT_SCRIPTED_OPTIONS, "--system-prompt"], fileOptions: ["--workspace", ...ROLE_AGENT_FILE_OPTIONS], completionProvider: "role-agent", completionUsesDefaultAgent: true },
-  { name: "bind", summary: "Bind a global role to a task.", usage: "taskmux task bind <task-id> <role> [--as <task-role>] [--workspace <path>]", options: ["--as", "--workspace"], fileOptions: ["--workspace"] },
-  { name: "assign-many", summary: "Assign multiple task roles with one Agent configuration; Agent is interactively selected when omitted.", usage: `taskmux task assign-many <task-id> --role <role> ... [--agent <agent-id>] [--workspace <path>] ${roleAgentOptionUsage()} [--system-prompt <body>]`, options: ["--role", "--agent", "--workspace", ...ROLE_AGENT_SCRIPTED_OPTIONS, "--system-prompt"], fileOptions: ["--workspace", ...ROLE_AGENT_FILE_OPTIONS], completionProvider: "role-agent", completionUsesDefaultAgent: true },
-  { name: "roles", summary: "List roles assigned to a task.", usage: "taskmux task roles <task-id>" },
-  { name: "enter", summary: "Enter a task role session.", usage: "taskmux task enter <task-id> <role>" },
-  { name: "tail", summary: "Capture recent task role output.", usage: "taskmux task tail <task-id> <role>" },
-  { name: "detail", summary: "Show task role details.", usage: "taskmux task detail <task-id> <role>" },
-  { name: "status", summary: "Show task role runtime status.", usage: "taskmux task status <task-id> <role>" },
-  { name: "refresh", summary: "Refresh task role runtime state.", usage: "taskmux task refresh <task-id>" },
-  { name: "transcript", summary: "Capture or export a task role transcript.", executable: true, usage: "taskmux task transcript <task-id> <role>", sections: [{ id: "export", title: "Export", entries: ["export"] }], children: [
-    { name: "export", summary: "Export a stored transcript.", usage: "taskmux task transcript export <task-id> <role> [--format text|json|markdown] [--output <file>]", options: ["--format", "--output"], optionValues: { "--format": ["text", "json", "markdown"] }, fileOptions: ["--output"] }
-  ] },
-  { name: "activity", summary: "Show task activity.", usage: "taskmux task activity <task-id>" },
-  { name: "timeline", summary: "Show the task timeline.", usage: "taskmux task timeline <task-id>" },
-  { name: "detach", summary: "Detach from a task role.", usage: "taskmux task detach <task-id> <role>" },
-  { name: "stop", summary: "Stop a task role session.", usage: "taskmux task stop <task-id> <role>" },
-  { name: "kill", summary: "Kill a task role session.", usage: "taskmux task kill <task-id> <role>" },
-  { name: "restart", summary: "Restart a task role session.", usage: "taskmux task restart <task-id> <role>" },
-  { name: "cleanup", summary: "Clean stale task role state.", usage: "taskmux task cleanup <task-id>" },
-  { name: "comment", summary: "Add a task comment.", usage: "taskmux task comment <task-id> <body>" },
-  { name: "comments", summary: "List task comments.", usage: "taskmux task comments <task-id>" },
-  { name: "events", summary: "List task events.", usage: "taskmux task events <task-id>" },
-  { name: "wake", summary: "Queue a task wakeup.", usage: "taskmux task wake <task-id> --reason <reason>", options: ["--reason"] },
-  { name: "dispatch", summary: "Dispatch an agent run.", usage: "taskmux task dispatch <task-id> <role> --mode new|resume [--work-item <id>] [--topic <topic> ...] [--confirm-permission-broadening] --input <body>", options: ["--mode", "--work-item", "--topic", "--confirm-permission-broadening", "--input"], optionValues: { "--mode": ["new", "resume"] } },
-  { name: "yield", summary: "Yield an agent run result.", usage: "taskmux task yield <task-id> <role> --summary <body>", options: ["--summary"] },
-  { name: "role", summary: "Manage roles within a task.", sections: [{ id: "manage", title: "Manage", entries: ["child", "update", "rename", "remove"] }], children: [
-    { name: "child", summary: "Create a descriptive child role.", usage: "taskmux task role child <task-id> <role> [--parent <role>] --description <body> [--responsibility <body> ...] [--constraint <body> ...] --expected-output <body>", options: ["--parent", "--description", "--responsibility", "--constraint", "--expected-output"] },
-    { name: "update", summary: "Update a task role or one of its Agent bindings.", usage: `taskmux task role update <task-id> <role> [--agent <agent-id>] [--active-agent <agent-id>] [--workspace <path>] ${roleAgentOptionUsage()} [--system-prompt <body>]`, options: ["--agent", "--active-agent", "--workspace", ...ROLE_AGENT_SCRIPTED_OPTIONS, "--system-prompt"], hiddenOptions: [ROLE_EXPECT_UPDATED_AT_OPTION], fileOptions: ["--workspace", ...ROLE_AGENT_FILE_OPTIONS], completionProvider: "role-agent" },
-    { name: "rename", summary: "Rename a task role.", usage: "taskmux task role rename <task-id> <role> <new-role>" },
-    { name: "remove", summary: "Remove a task role.", usage: "taskmux task role remove <task-id> <role>" }
-  ] },
-  { name: "topic", summary: "Manage task topics.", sections: [
-    { id: "inspect", title: "Inspect", entries: ["list"] },
-    { id: "manage", title: "Manage", entries: ["create", "summarize"] }
-  ], children: [
-    { name: "create", summary: "Create a task topic.", usage: "taskmux task topic create <task-id> --id <id> --name <name> --description <body>", options: ["--id", "--name", "--description"] },
-    { name: "list", summary: "List task topics.", usage: "taskmux task topic list <task-id>" },
-    { name: "summarize", summary: "Store a topic summary.", usage: "taskmux task topic summarize <task-id> --topic <topic> --summary <body>", options: ["--topic", "--summary"] }
-  ] },
-  { name: "input", summary: "Manage durable task-owned input requests.", sections: [
-    { id: "inspect", title: "Inspect", entries: ["list", "show"] },
-    { id: "respond", title: "Respond", entries: ["answer"] },
-    { id: "leader", title: "Leader", entries: ["request", "cancel"] },
-    { id: "legacy", title: "Legacy drafts", entries: ["draft", "submit"] }
-  ], children: [
-    { name: "request", summary: "Request human input from the active Leader session.", usage: "taskmux task input request <task-id> --question <text> [--choice <key=label> ...] [--blocks <type:id> ...] [--policy human-only|timeout] [--recommend <choice-key> --recommendation-reason <text> --timeout <duration>]", options: ["--question", "--choice", "--blocks", "--policy", "--recommend", "--recommendation-reason", "--timeout"], optionValues: { "--policy": ["human-only", "timeout"] } },
-    { name: "list", summary: "List global or task-scoped input requests.", usage: "taskmux task input list [<task-id>] [--all]", options: ["--all"] },
-    { name: "show", summary: "Show one input request.", usage: "taskmux task input show <request-id> [--task <task-id>]", options: ["--task"] },
-    { name: "answer", summary: "Answer one open input request.", usage: "taskmux task input answer <request-id> [--task <task-id>] (--choice <choice-key> | --text <text>)", options: ["--task", "--choice", "--text"] },
-    { name: "cancel", summary: "Cancel the current Leader's open input request.", usage: "taskmux task input cancel <task-id> <request-id> --reason <text>", options: ["--reason"] },
-    { name: "draft", summary: "Draft task input.", usage: "taskmux task input draft <task-id> <body>" },
-    { name: "submit", summary: "Submit drafted task input.", usage: "taskmux task input submit <task-id>" }
-  ] },
-  { name: "cycle", summary: "Manage task cycles.", sections: [{ id: "manage", title: "Manage", entries: ["create", "end"] }], children: [
-    { name: "create", summary: "Create a task cycle.", usage: "taskmux task cycle create <task-id> --cause <cause> --summary <body> [--topic <topic> ...]", options: ["--cause", "--summary", "--topic"], optionValues: { "--cause": CYCLE_CAUSES } },
-    { name: "end", summary: "End a task cycle.", usage: "taskmux task cycle end <task-id> <cycle-id> --summary <body>", options: ["--summary"] }
-  ] },
-  { name: "work-item", summary: "Manage finite work items.", sections: [{ id: "manage", title: "Manage", entries: ["create", "update"] }], children: [
-    { name: "create", summary: "Create a work item.", usage: "taskmux task work-item create <task-id> --title <title> [--cycle <cycle>] [--assignee <role>] [--topic <topic> ...]", options: ["--title", "--cycle", "--assignee", "--topic"] },
-    { name: "update", summary: "Update a work item.", usage: "taskmux task work-item update <task-id> <work-item-id> --status <status> [--outcome <body>]", options: ["--status", "--outcome"], optionValues: { "--status": ["pending", "running", "completed", "failed", "cancelled", "superseded"] } }
-  ] },
-  { name: "session", summary: "Manage native agent session IDs.", sections: [{ id: "manage", title: "Manage", entries: ["record", "replace"] }], children: [
-    { name: "record", summary: "Record a native session ID.", usage: "taskmux task session record <task-id> <role> --native-id <id>", options: ["--native-id"] },
-    { name: "replace", summary: "Replace a native session ID.", usage: "taskmux task session replace <task-id> <role> --native-id <id> --reason <reason>", options: ["--native-id", "--reason"] }
-  ] },
-  { name: "schedule", summary: "Manage task scheduling.", sections: [{ id: "manage", title: "Manage", entries: ["set"] }], children: [
-    { name: "set", summary: "Set a task schedule.", usage: "taskmux task schedule set <task-id> --inactivity-minutes <minutes> --cooldown-minutes <minutes> [--review-at <iso>] [--every-minutes <minutes> --next-at <iso>]", options: ["--inactivity-minutes", "--cooldown-minutes", "--review-at", "--every-minutes", "--next-at"] }
-  ] },
-  { name: "brief", summary: "Manage the current task brief.", sections: [{ id: "manage", title: "Manage", entries: ["update"] }], children: [
-    { name: "update", summary: "Update the task brief.", usage: "taskmux task brief update <task-id> --objective <body> [--boundary <body> ...] --focus <body> --leader-summary <body>", options: ["--objective", "--boundary", "--focus", "--leader-summary"] }
-  ] },
-  { name: "milestone", summary: "Manage task milestones.", sections: [{ id: "manage", title: "Manage", entries: ["add"] }], children: [
-    { name: "add", summary: "Add a task milestone.", usage: "taskmux task milestone add <task-id> --title <title> --summary <body> [--topic <topic> ...]", options: ["--title", "--summary", "--topic"] }
-  ] },
-  { name: "decision", summary: "Manage durable task decisions.", sections: [{ id: "manage", title: "Manage", entries: ["record", "supersede"] }], children: [
-    { name: "record", summary: "Record a task decision.", usage: "taskmux task decision record <task-id> --title <title> --rationale <body> [--topic <topic> ...]", options: ["--title", "--rationale", "--topic"] },
-    { name: "supersede", summary: "Supersede a task decision.", usage: "taskmux task decision supersede <task-id> <decision-id> --reason <body>", options: ["--reason"] }
-  ] },
-  { name: "worktree", summary: "Manage task role worktrees.", sections: [{ id: "manage", title: "Manage", entries: ["create", "remove"] }], children: [
-    { name: "create", summary: "Create a role worktree.", usage: "taskmux task worktree create <task-id> <role> --path <path> --branch <branch> [--base <ref>]", options: ["--path", "--branch", "--base"], fileOptions: ["--path"] },
-    { name: "remove", summary: "Remove a managed role worktree.", usage: "taskmux task worktree remove <task-id> <role>" }
-  ] }
+  {
+    name: "create",
+    summary: "Create a Draft Task.",
+    usage: "taskmux task create <title> [--repository <id>] [--base <ref>]",
+    options: ["--repository", "--base"]
+  },
+  {
+    name: "update",
+    summary: "Update Task metadata.",
+    usage: "taskmux task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at]",
+    options: [
+      "--title", "--description", "--priority", "--tags", "--due-at",
+      "--clear-description", "--clear-priority", "--clear-tags", "--clear-due-at"
+    ],
+    optionValues: { "--priority": ["low", "medium", "high", "urgent"] }
+  },
+  { name: "activate", summary: "Activate a Draft Task.", usage: "taskmux task activate <id>" },
+  {
+    name: "complete",
+    summary: "Complete an active Task and stop automatic wakeups.",
+    usage: "taskmux task complete <id> --summary <text>",
+    options: ["--summary"]
+  },
+  { name: "reopen", summary: "Reopen a completed Task.", usage: "taskmux task reopen <id>" },
+  { name: "list", summary: "List Tasks." },
+  { name: "show", summary: "Show a Task.", usage: "taskmux task show <id>" },
+  {
+    name: "context",
+    summary: "Show consolidated working context for a Task.",
+    usage: "taskmux task context <task>"
+  },
+  { name: "archive", summary: "Archive a Task.", usage: "taskmux task archive <id>" },
+  { name: "reconcile", summary: "Run one immediate Controller reconciliation.", usage: "taskmux task reconcile <id>" },
+  {
+    name: "message",
+    summary: "Manage durable Task messages.",
+    sections: [{ id: "manage", title: "Commands", entries: ["send", "list"] }],
+    children: [
+      { name: "send", summary: "Send a Task message.", usage: "taskmux task message send <id> <body>" },
+      { name: "list", summary: "List Task messages.", usage: "taskmux task message list <id>" }
+    ]
+  },
+  {
+    name: "input",
+    summary: "Manage durable Task-owned input requests.",
+    sections: [{ id: "manage", title: "Commands", entries: ["request", "list", "show", "answer", "cancel"] }],
+    children: [
+      {
+        name: "request",
+        summary: "Pause the active Leader Run and request user input.",
+        usage: "taskmux task input request <task> --question <text> [--choice <key=label> ...] [--blocks <work-item:id|run:id> ...] [--recommend <key> --timeout-seconds <seconds>]",
+        options: ["--question", "--choice", "--blocks", "--recommend", "--timeout-seconds"]
+      },
+      {
+        name: "list",
+        summary: "List the global Inbox or one Task's input requests.",
+        usage: "taskmux task input list [task] [--all]",
+        options: ["--all"]
+      },
+      {
+        name: "show",
+        summary: "Show one input request.",
+        usage: "taskmux task input show <input> [--task <task>]",
+        options: ["--task"]
+      },
+      {
+        name: "answer",
+        summary: "Answer one open input request.",
+        usage: "taskmux task input answer <input> [--task <task>] (--choice <key> | --text <text>)",
+        options: ["--task", "--choice", "--text"]
+      },
+      {
+        name: "cancel",
+        summary: "Cancel an open request from its originating Leader.",
+        usage: "taskmux task input cancel <task> <input> --reason <text>",
+        options: ["--reason"]
+      }
+    ]
+  },
+  {
+    name: "role",
+    summary: "Manage Roles within a Task.",
+    sections: [{ id: "manage", title: "Commands", entries: [
+      "add", "list", "status", "show", "update", "remove", "bind", "enter"
+    ] }],
+    children: [
+      {
+        name: "add",
+        summary: "Add a Role to a Task.",
+        usage: "taskmux task role add <task> <name> [--agent <id>] [Role and Agent settings]",
+        options: ["--agent", ...roleProfileOptions, ...roleAgentOptions],
+        optionValues: roleAgentOptionValues
+      },
+      { name: "list", summary: "List Task Roles.", usage: "taskmux task role list <task>" },
+      {
+        name: "status",
+        summary: "Show persisted and live runtime state for one Task Role.",
+        usage: "taskmux task role status <task> <role>"
+      },
+      { name: "show", summary: "Show one Task Role.", usage: "taskmux task role show <task> <role>" },
+      {
+        name: "update",
+        summary: "Update a Task Role.",
+        usage: "taskmux task role update <task> <role> [Role and Agent settings]",
+        options: ["--agent", ...roleProfileOptions, ...roleAgentOptions,
+          ...roleProfileClearOptions, ...roleAgentClearOptions],
+        optionValues: roleAgentOptionValues
+      },
+      { name: "remove", summary: "Remove a Task Role.", usage: "taskmux task role remove <task> <role>" },
+      { name: "bind", summary: "Bind and activate an Agent for a Task Role.", usage: "taskmux task role bind <task> <role> <agent-id>" },
+      { name: "enter", summary: "Enter a Task Role's native session.", usage: "taskmux task role enter <task> <role>" }
+    ]
+  },
+  {
+    name: "work",
+    summary: "Manage finite Task work items.",
+    sections: [{ id: "manage", title: "Commands", entries: ["create", "list", "update", "dispatch"] }],
+    children: [
+      {
+        name: "create",
+        summary: "Create a work item.",
+        usage: "taskmux task work create <task> <title> [--role <name>]",
+        options: ["--role"]
+      },
+      { name: "list", summary: "List work items for a Task.", usage: "taskmux task work list <task>" },
+      {
+        name: "update",
+        summary: "Update a work item's state.",
+        usage: "taskmux task work update <id> <todo|running|done|failed> [--summary <text>]",
+        options: ["--summary"],
+        argumentValues: { 1: ["todo", "running", "done", "failed"] }
+      },
+      {
+        name: "dispatch",
+        summary: "Dispatch a work item to its Role.",
+        usage: "taskmux task work dispatch <id> [--input <text>]",
+        options: ["--input"]
+      }
+    ]
+  },
+  {
+    name: "run",
+    summary: "Inspect and control Agent Runs.",
+    sections: [{ id: "manage", title: "Commands", entries: ["list", "retry", "yield"] }],
+    children: [
+      { name: "list", summary: "List Runs for a work item.", usage: "taskmux task run list <work>" },
+      { name: "retry", summary: "Retry a failed Run.", usage: "taskmux task run retry <run>" },
+      {
+        name: "yield",
+        summary: "Complete an active Run and wake the Leader.",
+        usage: "taskmux task run yield <run> --summary <text>",
+        options: ["--summary"]
+      }
+    ]
+  },
+  {
+    name: "brief",
+    summary: "Manage the Task Brief, the authoritative summary of current task state.",
+    sections: [{ id: "manage", title: "Commands", entries: ["show", "update"] }],
+    children: [
+      { name: "show", summary: "Show the Task Brief.", usage: "taskmux task brief show <task>" },
+      {
+        name: "update",
+        summary: "Create or update the Task Brief.",
+        usage: "taskmux task brief update <task> [--objective <text>] [--boundary <text> ...] [--focus <text>] [--leader-summary <text>]",
+        options: ["--objective", "--boundary", "--focus", "--leader-summary"]
+      }
+    ]
+  },
+  {
+    name: "decision",
+    summary: "Record and supersede durable Task decisions.",
+    sections: [{ id: "manage", title: "Commands", entries: ["record", "list", "show", "supersede"] }],
+    children: [
+      {
+        name: "record",
+        summary: "Record a new active Decision.",
+        usage: "taskmux task decision record <task> --title <text> --rationale <text>",
+        options: ["--title", "--rationale"]
+      },
+      {
+        name: "list",
+        summary: "List Decisions for a Task.",
+        usage: "taskmux task decision list <task> [--status active|superseded]",
+        options: ["--status"],
+        optionValues: { "--status": ["active", "superseded"] }
+      },
+      { name: "show", summary: "Show one Decision.", usage: "taskmux task decision show <task> <decision>" },
+      {
+        name: "supersede",
+        summary: "Mark a Decision as superseded.",
+        usage: "taskmux task decision supersede <task> <decision> --reason <text>",
+        options: ["--reason"]
+      }
+    ]
+  },
+  {
+    name: "milestone",
+    summary: "Append immutable Milestone records for completed progress.",
+    sections: [{ id: "manage", title: "Commands", entries: ["add", "list", "show"] }],
+    children: [
+      {
+        name: "add",
+        summary: "Append a Milestone to a Task.",
+        usage: "taskmux task milestone add <task> --title <text> --summary <text>",
+        options: ["--title", "--summary"]
+      },
+      { name: "list", summary: "List Milestones for a Task.", usage: "taskmux task milestone list <task>" },
+      { name: "show", summary: "Show one Milestone.", usage: "taskmux task milestone show <task> <milestone>" }
+    ]
+  },
+  {
+    name: "event",
+    summary: "Inspect the durable Task event history.",
+    sections: [{ id: "manage", title: "Commands", entries: ["list", "show"] }],
+    children: [
+      { name: "list", summary: "List Task events.", usage: "taskmux task event list <task>" },
+      { name: "show", summary: "Show one Task event.", usage: "taskmux task event show <task> <event>" }
+    ]
+  },
+  { name: "enter", summary: "Enter a Task Role, defaulting to Leader.", usage: "taskmux task enter <task> [role]" }
 ];
 
 export const ROOT_COMMAND = buildNode({
   name: "taskmux",
-  summary: "Local task board for native agent CLI sessions backed by tmux.",
-  usage: "taskmux [command]",
+  summary: "Coordinate native Agent CLI sessions through tmux.",
+  usage: "taskmux [--json] <command>",
   sections: [
-    { id: "workflow", title: "Workflow", entries: ["task", "operator"] },
-    { id: "configuration", title: "Configuration", entries: ["setup", "config", "agent", "role", "completion"] },
-    { id: "operations", title: "Operations", entries: ["controller", "doctor", "maintenance"] },
-    { id: "data", title: "Data", entries: ["backup", "restore", "export", "import", "prune"] },
-    { id: "support", title: "Support", entries: ["update", "version", "help"] }
+    { id: "general", title: "General", entries: ["help", "version", "update", "setup", "doctor", "completion"] },
+    { id: "workflow", title: "Workflow", entries: ["operator", "repository", "task"] },
+    { id: "configuration", title: "Configuration", entries: ["agent", "role"] },
+    { id: "operations", title: "Operations", entries: ["controller", "jobs"] },
+    { id: "internal", title: "Internal", entries: ["internal"] }
   ],
   children: [
     { name: "help", summary: "Show root or scoped command help.", usage: "taskmux help [command ...]", commandPathArguments: true },
     { name: "version", summary: "Print the installed TaskMux version." },
     { name: "update", summary: "Install the latest published TaskMux package globally." },
-    { name: "completion", summary: "Generate or manage shell completion.", usage: ["taskmux completion bash|zsh|fish", "taskmux completion install", "taskmux completion uninstall"], sections: [
-      { id: "generate", title: "Generate", entries: ["bash", "zsh", "fish"] },
-      { id: "manage", title: "Manage", entries: ["install", "uninstall"] },
-      { id: "internal", title: "Internal", entries: ["candidates"] }
-    ], children: [
-      { name: "bash", summary: "Generate Bash completion." },
-      { name: "zsh", summary: "Generate Zsh completion." },
-      { name: "fish", summary: "Generate Fish completion." },
-      { name: "install", summary: "Interactively install or repair one shell completion." },
-      { name: "uninstall", summary: "Interactively remove one managed shell completion." },
-      { name: "candidates", summary: "Resolve internal dynamic completion candidates.", hidden: true }
-    ] },
-    { name: "doctor", summary: "Check local TaskMux dependencies and state." },
-    { name: "setup", summary: "Initialize TaskMux and configure an agent.", executable: true, acceptsArguments: false, usage: "taskmux setup [tmux]", sections: [{ id: "mode", title: "Mode", entries: ["tmux"] }], children: [
-      { name: "tmux", summary: "Install tmux before setup." }
-    ] },
-    { name: "backup", summary: "Create a TaskMux state backup." },
-    { name: "restore", summary: "Restore one physical TaskMux backup.", usage: "taskmux restore <backup-id> [--force]", options: ["--force"] },
-    { name: "export", summary: "Export portable TaskMux semantic state.", usage: "taskmux export --output <file>", options: ["--output"], fileOptions: ["--output"] },
-    { name: "import", summary: "Import portable TaskMux semantic state.", usage: "taskmux import <file> --workspace-map <source-binding-id>=<target-binding-id|absolute-workspace-path> ...", options: ["--workspace-map"], workspaceMapOptions: ["--workspace-map"], fileArguments: [0] },
-    { name: "prune", summary: "Remove selected expired physical state.", usage: "taskmux prune [--trash] [--backups] [--transactions] [--keep-backups <count>] [--keep-trash-days <days>] [--dry-run]", options: ["--trash", "--backups", "--transactions", "--keep-backups", "--keep-trash-days", "--dry-run"] },
-    { name: "operator", summary: "Enter the persistent Operator session." },
-    { name: "controller", summary: "Manage the local TaskMux Controller.", sections: [
-      { id: "lifecycle", title: "Lifecycle", entries: ["start", "status", "stop"] },
-      { id: "operations", title: "Operations", entries: ["scan"] },
-      { id: "internal", title: "Internal", entries: ["serve"] }
-    ], children: [
-      { name: "start", summary: "Start the Controller." },
-      { name: "status", summary: "Show Controller status.", usage: "taskmux controller status [--json]", options: ["--json"] },
-      { name: "stop", summary: "Stop the Controller." },
-      { name: "scan", summary: "Run a Controller scheduler scan." },
-      { name: "serve", summary: "Run the internal Controller server.", hidden: true }
-    ] },
-    { name: "maintenance", summary: "Run explicit local maintenance.", sections: [
-      { id: "git", title: "Git", entries: ["git"] }
-    ], children: [
-      { name: "git", summary: "Maintain durable Git lifecycle effects.", sections: [
-        { id: "recover", title: "Recover", entries: ["recover"] }
-      ], children: [
-        { name: "recover", summary: "Resume interrupted, effect-started Git lifecycle effects.", usage: "taskmux maintenance git recover" }
-      ] }
-    ] },
-    { name: "config", summary: "View and change TaskMux configuration.", sections: [
-      { id: "inspect", title: "Inspect", entries: ["show"] },
-      { id: "modify", title: "Modify", entries: ["set", "unset"] }
-    ], children: [
-      { name: "show", summary: "Show current configuration." },
-      { name: "set", summary: "Set a configuration value.", sections: [
-        { id: "defaults", title: "Defaults", entries: ["default-agent", "default-workspace"] },
-        { id: "completion", title: "Completion", entries: ["completion"] }
-      ], children: [
-        { name: "default-agent", summary: "Set the default agent.", usage: "taskmux config set default-agent <agent-id>" },
-        { name: "default-workspace", summary: "Set the default workspace.", usage: "taskmux config set default-workspace <path>", fileArguments: [0] },
-        { name: "completion", summary: "Set one completion installation record.", usage: "taskmux config set completion <bash|zsh|fish> <script-path> <activation-path>", argumentValues: { 0: ["bash", "zsh", "fish"] }, fileArguments: [1, 2] }
-      ] },
-      { name: "unset", summary: "Clear a configuration value.", sections: [
-        { id: "defaults", title: "Defaults", entries: ["default-agent", "default-workspace"] },
-        { id: "completion", title: "Completion", entries: ["completion"] }
-      ], children: [
-        { name: "default-agent", summary: "Clear the default agent." },
-        { name: "default-workspace", summary: "Clear the default workspace." },
-        { name: "completion", summary: "Clear one completion installation record.", usage: "taskmux config unset completion <bash|zsh|fish>", argumentValues: { 0: ["bash", "zsh", "fish"] } }
-      ] }
-    ] },
-    { name: "agent", summary: "Manage configured native agent CLIs.", sections: [
-      { id: "inspect", title: "Inspect", entries: ["list", "show"] },
-      { id: "manage", title: "Manage", entries: ["add", "update", "remove"] }
-    ], children: [
-      { name: "add", summary: "Add an agent.", usage: "taskmux agent add <agent-id> [--adapter <adapter-id>] --command <command> [--arg <arg> ...] [--env TARGET=PROCESS_NAME ...]", options: ["--adapter", "--command", "--arg", "--env"], optionValues: { "--adapter": supportedAgentAdapterIds() }, executableOptions: ["--command"] },
-      { name: "list", summary: "List agents." },
-      { name: "show", summary: "Show an agent.", usage: "taskmux agent show <agent-id>" },
-      { name: "update", summary: "Update an unreferenced Agent, or refresh only a referenced Agent probe pin.", usage: "taskmux agent update <agent-id> [--adapter <adapter-id>] [--command <command>] [--arg <arg> ... | --clear-args] [--env TARGET=PROCESS_NAME ... | --clear-env] [--refresh-probe]", options: ["--adapter", "--command", "--arg", "--clear-args", "--env", "--clear-env", "--refresh-probe"], optionValues: { "--adapter": supportedAgentAdapterIds() }, executableOptions: ["--command"] },
-      { name: "remove", summary: "Remove an agent.", usage: "taskmux agent remove <agent-id>" }
-    ] },
-    { name: "role", summary: "Manage reusable global roles.", sections: [
-      { id: "inspect", title: "Inspect", entries: ["list", "show"] },
-      { id: "manage", title: "Manage", entries: ["add", "update", "remove"] },
-      { id: "sessions", title: "Sessions", entries: ["enter", "session"] }
-    ], children: [
-      { name: "add", summary: "Add a global role; Agent is interactively selected when omitted.", usage: `taskmux role add <role> [--agent <agent-id>] [--workspace <path>] ${roleAgentOptionUsage()} [--description <body>] [--responsibility <body> ...] [--constraint <body> ...] [--expected-output <body>] [--system-prompt <body>] [--skill <skill> ...]`, options: ["--agent", "--workspace", ...ROLE_AGENT_SCRIPTED_OPTIONS, "--description", "--responsibility", "--constraint", "--expected-output", "--system-prompt", "--skill"], fileOptions: ["--workspace", ...ROLE_AGENT_FILE_OPTIONS], completionProvider: "role-agent", completionUsesDefaultAgent: true },
-      { name: "list", summary: "List global roles." },
-      { name: "show", summary: "Show a global role.", usage: "taskmux role show <role>" },
-      { name: "update", summary: "Update a global role or one of its Agent bindings.", usage: `taskmux role update <role> [--agent <agent-id>] [--active-agent <agent-id>] [--workspace <path>] ${roleAgentOptionUsage()} [--system-prompt <body>]`, options: ["--agent", "--active-agent", "--workspace", ...ROLE_AGENT_SCRIPTED_OPTIONS, "--system-prompt"], hiddenOptions: [ROLE_EXPECT_UPDATED_AT_OPTION], fileOptions: ["--workspace", ...ROLE_AGENT_FILE_OPTIONS], completionProvider: "role-agent" },
-      { name: "remove", summary: "Remove a global role.", usage: "taskmux role remove <role>" },
-      { name: "enter", summary: "Enter a global role session.", usage: "taskmux role enter <role>" },
-      { name: "session", summary: "Manage a GlobalRole native session ID.", sections: [
-        { id: "manage", title: "Manage", entries: ["record", "replace"] }
-      ], children: [
-        { name: "record", summary: "Record a GlobalRole native session ID.", usage: "taskmux role session record <role> --native-id <id>", options: ["--native-id"] },
-        { name: "replace", summary: "Replace a GlobalRole native session ID.", usage: "taskmux role session replace <role> --native-id <id> --reason <reason>", options: ["--native-id", "--reason"] }
-      ] }
-    ] },
-    { name: "task", summary: "Manage tasks, task roles, and durable task context.", sections: [
-      { id: "workflow", title: "Workflow", entries: ["create", "update", "clone", "archive", "unarchive", "delete", "restore"] },
-      { id: "inspect", title: "Inspect", entries: ["list", "board", "show", "current", "last", "open", "context", "activity", "timeline", "comments", "events"] },
-      { id: "roles-sessions", title: "Roles and sessions", entries: ["shell", "assign", "bind", "assign-many", "roles", "enter", "tail", "detail", "status", "refresh", "transcript", "detach", "stop", "kill", "restart", "cleanup"] },
-      { id: "collaboration", title: "Collaboration", entries: ["comment", "wake", "dispatch", "yield"] },
-      { id: "resources", title: "Resources", entries: ["role", "topic", "input", "cycle", "work-item", "session", "schedule", "brief", "milestone", "decision", "worktree"] }
-    ], children: taskChildren }
+    { name: "setup", summary: "Initialize or update TaskMux configuration." },
+    { name: "doctor", summary: "Check TaskMux dependencies and file state." },
+    {
+      name: "completion",
+      summary: "Interactively configure shell completion.",
+      executable: true,
+      acceptsArguments: false,
+      usage: ["taskmux completion", "taskmux completion <bash|zsh|fish>"],
+      sections: [
+        { id: "shells", title: "Shells", entries: ["bash", "zsh", "fish"] },
+        { id: "internal", title: "Internal", entries: ["candidates"] }
+      ],
+      children: [
+        { name: "bash", summary: "Interactively configure Bash completion." },
+        { name: "zsh", summary: "Interactively configure Zsh completion." },
+        { name: "fish", summary: "Interactively configure Fish completion." },
+        {
+          name: "candidates",
+          summary: "Resolve internal dynamic completion candidates.",
+          usage: "taskmux completion candidates <prefix> -- <words...>",
+          hidden: true
+        }
+      ]
+    },
+    {
+      name: "controller",
+      summary: "Inspect, stop, or restart the local Controller.",
+      sections: [{ id: "lifecycle", title: "Commands", entries: ["status", "stop", "restart"] }],
+      children: [
+        { name: "status", summary: "Show Controller status." },
+        { name: "stop", summary: "Stop the Controller." },
+        { name: "restart", summary: "Restart internal services without stopping tmux sessions." }
+      ]
+    },
+    {
+      name: "operator",
+      summary: "Use the persistent Operator Role.",
+      sections: [{ id: "workflow", title: "Commands", entries: ["enter", "submit"] }],
+      children: [
+        { name: "enter", summary: "Enter the Operator's native session." },
+        {
+          name: "submit",
+          summary: "Submit work through the Operator.",
+          usage: "taskmux operator submit <body> [--task <id>]",
+          options: ["--task"]
+        }
+      ]
+    },
+    {
+      name: "repository",
+      summary: "Manage Git repositories available to Tasks.",
+      sections: [{ id: "manage", title: "Commands", entries: ["add", "list"] }],
+      children: [
+        {
+          name: "add",
+          summary: "Register a Git repository.",
+          usage: "taskmux repository add <name> <path> [--base <ref>]",
+          options: ["--base"],
+          fileArguments: [1]
+        },
+        { name: "list", summary: "List registered repositories." }
+      ]
+    },
+    {
+      name: "agent",
+      summary: "Manage configured native Agent CLIs.",
+      sections: [
+        { id: "inspect", title: "Inspect", entries: ["list", "show"] },
+        { id: "manage", title: "Manage", entries: ["add", "update", "remove"] }
+      ],
+      children: agentChildren
+    },
+    {
+      name: "role",
+      summary: "Manage reusable global Roles and their native sessions.",
+      sections: [
+        { id: "inspect", title: "Inspect", entries: ["list", "show"] },
+        { id: "manage", title: "Manage", entries: ["add", "update", "remove", "bind"] },
+        { id: "sessions", title: "Sessions", entries: ["enter", "session"] }
+      ],
+      children: roleChildren
+    },
+    {
+      name: "task",
+      summary: "Manage Tasks, Roles, work items, and Runs.",
+      sections: [
+        { id: "lifecycle", title: "Lifecycle", entries: ["create", "update", "activate", "complete", "reopen", "list", "show", "context", "archive", "reconcile"] },
+        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "role", "work", "run", "enter"] },
+        { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
+      ],
+      children: taskChildren
+    },
+    {
+      name: "jobs",
+      summary: "Inspect scheduler wake and recovery records.",
+      sections: [{ id: "manage", title: "Commands", entries: ["list", "retry"] }],
+      children: [
+        { name: "list", summary: "List scheduler wake and recovery records." },
+        { name: "retry", summary: "Retry a failed Leader recovery.", usage: "taskmux jobs retry <id>" }
+      ]
+    },
+    {
+      name: "internal",
+      summary: "Internal TaskMux callbacks.",
+      hidden: true,
+      sections: [{ id: "callbacks", title: "Callbacks", entries: ["session-notify"] }],
+      children: [{
+        name: "session-notify",
+        summary: "Record a structured native session notification.",
+        usage: "taskmux internal session-notify <payload>"
+      }]
+    }
   ]
 });
 
 export function visibleChildren(node: CommandNode): readonly CommandNode[] {
-  const childrenByName = new Map(node.children.map((child) => [child.name, child]));
+  const byName = new Map(node.children.map((child) => [child.name, child]));
   return node.sections.flatMap((section) => section.entries.flatMap((entry) => {
-    const child = childrenByName.get(entry);
+    const child = byName.get(entry);
     return child === undefined || child.hidden ? [] : [child];
   }));
 }
 
-export type VisibleCommandSection = {
+export type VisibleCommandSection = Readonly<{
   id: string;
   title: string;
   entries: readonly (CommandNode | CommandValue)[];
-};
+}>;
 
 export function visibleCommandSections(node: CommandNode): readonly VisibleCommandSection[] {
-  const childrenByName = new Map(node.children.map((child) => [child.name, child]));
-  const valuesByName = new Map(node.values.map((value) => [value.name, value]));
+  const children = new Map(node.children.map((child) => [child.name, child]));
+  const values = new Map(node.values.map((value) => [value.name, value]));
   return node.sections.flatMap((section) => {
     const entries = section.entries.flatMap((entry) => {
-      const child = childrenByName.get(entry);
-      if (child !== undefined) {
-        return child.hidden ? [] : [child];
-      }
-      const value = valuesByName.get(entry);
+      const child = children.get(entry);
+      if (child !== undefined) return child.hidden ? [] : [child];
+      const value = values.get(entry);
       return value === undefined ? [] : [value];
     });
     return entries.length === 0 ? [] : [{ id: section.id, title: section.title, entries }];
@@ -368,16 +583,24 @@ export function findChild(node: CommandNode, name: string): CommandNode | undefi
   return node.children.find((child) => child.name === name);
 }
 
+export function findCommandNode(path: readonly string[]): CommandNode | undefined {
+  let node = ROOT_COMMAND;
+  for (const segment of path[0] === ROOT_COMMAND.name ? path.slice(1) : path) {
+    const child = findChild(node, segment);
+    if (child === undefined) return undefined;
+    node = child;
+  }
+  return node;
+}
+
+export const findCommand = findCommandNode;
+
 export function validateCommandCatalog(root: CommandNode): void {
   const reservedAliases = new Set(["-h", "--help", "-help", "-v", "--version"]);
   const commandPathProviders: CommandNode[] = [];
   const visit = (node: CommandNode): void => {
-    if (node.summary.trim().length === 0) {
-      throw new Error(`Command summary is required: ${node.path.join(" ")}`);
-    }
-    if (node.usage.length === 0) {
-      throw new Error(`Command usage is required: ${node.path.join(" ")}`);
-    }
+    if (node.summary.trim().length === 0) throw new Error(`Command summary is required: ${node.path.join(" ")}`);
+    if (node.usage.length === 0) throw new Error(`Command usage is required: ${node.path.join(" ")}`);
     if (node.commandPathArguments) {
       commandPathProviders.push(node);
       const ownsOtherCompletionMetadata = node.kind !== "leaf"
@@ -386,7 +609,7 @@ export function validateCommandCatalog(root: CommandNode): void {
         || node.values.length > 0
         || node.sections.length > 0
         || node.options.length > 0
-        || (node.hiddenOptions?.length ?? 0) > 0
+        || node.hiddenOptions.length > 0
         || Object.keys(node.optionValues).length > 0
         || Object.keys(node.argumentValues).length > 0
         || node.fileOptions.length > 0
@@ -396,151 +619,91 @@ export function validateCommandCatalog(root: CommandNode): void {
         throw new Error(`Command-path provider must be a visible metadata-free leaf: ${node.path.join(" ")}`);
       }
     }
-    const names = new Set<string>();
+
+    const immediate = new Set<string>();
     for (const child of node.children) {
-      if (names.has(child.name)) {
-        throw new Error(`Duplicate command path: ${child.path.join(" ")}`);
-      }
-      if (reservedAliases.has(child.name)) {
-        throw new Error(`Reserved alias token is not allowed: ${child.path.join(" ")}`);
-      }
-      names.add(child.name);
+      if (immediate.has(child.name)) throw new Error(`Duplicate command path: ${child.path.join(" ")}`);
+      if (reservedAliases.has(child.name)) throw new Error(`Reserved alias token is not allowed: ${child.path.join(" ")}`);
+      immediate.add(child.name);
     }
-
-    const immediateTokens = new Set(names);
     for (const value of node.values) {
-      const valueName = typeof value === "string" ? value : value.name;
-      const valueSummary = typeof value === "string" ? value : value.summary;
-      if (valueName.trim().length === 0) {
-        throw new Error(`Command value name is required: ${node.path.join(" ")}`);
-      }
-      if (valueSummary.trim().length === 0) {
-        throw new Error(`Command value summary is required: ${[...node.path, valueName].join(" ")}`);
-      }
-      if (immediateTokens.has(valueName)) {
-        throw new Error(`Duplicate command token: ${[...node.path, valueName].join(" ")}`);
-      }
-      if (reservedAliases.has(valueName)) {
-        throw new Error(`Reserved alias token is not allowed: ${[...node.path, valueName].join(" ")}`);
-      }
-      immediateTokens.add(valueName);
+      if (value.name.trim().length === 0) throw new Error(`Command value name is required: ${node.path.join(" ")}`);
+      if (value.summary.trim().length === 0) throw new Error(`Command value summary is required: ${[...node.path, value.name].join(" ")}`);
+      if (immediate.has(value.name)) throw new Error(`Duplicate command token: ${[...node.path, value.name].join(" ")}`);
+      immediate.add(value.name);
     }
 
-    const optionNames = new Set<string>();
-    for (const option of [...node.options, ...(node.hiddenOptions ?? [])]) {
-      if (reservedAliases.has(option)) {
-        throw new Error(`Reserved alias token is not allowed: ${[...node.path, option].join(" ")}`);
-      }
-      if (optionNames.has(option) || immediateTokens.has(option)) {
-        throw new Error(`Duplicate command token: ${[...node.path, option].join(" ")}`);
-      }
-      optionNames.add(option);
+    const options = new Set<string>();
+    for (const option of [...node.options, ...node.hiddenOptions]) {
+      if (reservedAliases.has(option)) throw new Error(`Reserved alias token is not allowed: ${[...node.path, option].join(" ")}`);
+      if (options.has(option) || immediate.has(option)) throw new Error(`Duplicate command token: ${[...node.path, option].join(" ")}`);
+      options.add(option);
     }
 
     const sectionIds = new Set<string>();
     const sectionEntries = new Set<string>();
     for (const section of node.sections) {
-      if (sectionIds.has(section.id)) {
-        throw new Error(`Duplicate command section: ${[...node.path, section.id].join(" ")}`);
-      }
+      if (sectionIds.has(section.id)) throw new Error(`Duplicate command section: ${[...node.path, section.id].join(" ")}`);
       if (section.id.trim().length === 0 || section.title.trim().length === 0) {
         throw new Error(`Command section id and title are required: ${node.path.join(" ")}`);
       }
       sectionIds.add(section.id);
       for (const entry of section.entries) {
-        if (!immediateTokens.has(entry)) {
-          throw new Error(`Unknown section entry: ${[...node.path, entry].join(" ")}`);
-        }
-        if (sectionEntries.has(entry)) {
-          throw new Error(`Duplicate section entry: ${[...node.path, entry].join(" ")}`);
-        }
+        if (!immediate.has(entry)) throw new Error(`Unknown section entry: ${[...node.path, entry].join(" ")}`);
+        if (sectionEntries.has(entry)) throw new Error(`Duplicate section entry: ${[...node.path, entry].join(" ")}`);
         sectionEntries.add(entry);
       }
     }
-    for (const token of immediateTokens) {
-      if (!sectionEntries.has(token)) {
-        throw new Error(`Missing from command sections: ${[...node.path, token].join(" ")}`);
-      }
+    for (const token of immediate) {
+      if (!sectionEntries.has(token)) throw new Error(`Missing from command sections: ${[...node.path, token].join(" ")}`);
     }
 
     for (const [option, values] of Object.entries(node.optionValues)) {
-      if (!optionNames.has(option)) {
-        throw new Error(`Option values reference unknown option: ${[...node.path, option].join(" ")}`);
-      }
-      if (new Set(values).size !== values.length) {
-        throw new Error(`Duplicate option value: ${[...node.path, option].join(" ")}`);
-      }
-      if (values.some((value) => value.trim().length === 0)) {
-        throw new Error(`Empty option value is not allowed: ${[...node.path, option].join(" ")}`);
-      }
+      if (!options.has(option)) throw new Error(`Option values reference unknown option: ${[...node.path, option].join(" ")}`);
+      if (new Set(values).size !== values.length) throw new Error(`Duplicate option value: ${[...node.path, option].join(" ")}`);
     }
     const argumentValuePositions = new Set<number>();
     for (const [positionText, values] of Object.entries(node.argumentValues)) {
       const position = Number(positionText);
-      if (!Number.isInteger(position) || position < 0) {
-        throw new Error(`Argument value positions must be non-negative integers: ${node.path.join(" ")}`);
-      }
+      if (!Number.isInteger(position) || position < 0) throw new Error(`Argument value positions must be non-negative integers: ${node.path.join(" ")}`);
       argumentValuePositions.add(position);
-      if (new Set(values).size !== values.length) {
-        throw new Error(`Duplicate argument value: ${node.path.join(" ")} argument ${position}`);
-      }
-      if (values.some((value) => value.trim().length === 0)) {
-        throw new Error(`Empty argument value is not allowed: ${node.path.join(" ")} argument ${position}`);
-      }
+      if (new Set(values).size !== values.length) throw new Error(`Duplicate argument value: ${node.path.join(" ")} argument ${position}`);
     }
-    if (new Set(node.fileOptions).size !== node.fileOptions.length) {
-      throw new Error(`Duplicate file completion option: ${node.path.join(" ")}`);
-    }
+    if (new Set(node.fileOptions).size !== node.fileOptions.length) throw new Error(`Duplicate file completion option: ${node.path.join(" ")}`);
     for (const option of node.fileOptions) {
-      if (!optionNames.has(option)) {
-        throw new Error(`File completion references unknown option: ${[...node.path, option].join(" ")}`);
-      }
+      if (!options.has(option)) throw new Error(`File completion references unknown option: ${[...node.path, option].join(" ")}`);
     }
-    if (new Set(node.executableOptions).size !== node.executableOptions.length) {
-      throw new Error(`Duplicate executable completion option: ${node.path.join(" ")}`);
-    }
+    if (new Set(node.executableOptions).size !== node.executableOptions.length) throw new Error(`Duplicate executable completion option: ${node.path.join(" ")}`);
     for (const option of node.executableOptions) {
-      if (!optionNames.has(option)) {
-        throw new Error(`Executable completion references unknown option: ${[...node.path, option].join(" ")}`);
-      }
+      if (!options.has(option)) throw new Error(`Executable completion references unknown option: ${[...node.path, option].join(" ")}`);
     }
-    for (const option of optionNames) {
+    for (const option of options) {
       const owners = Number(Object.hasOwn(node.optionValues, option))
         + Number(node.fileOptions.includes(option))
         + Number(node.executableOptions.includes(option));
-      if (owners > 1) {
-        throw new Error(`Multiple completion owners for option: ${[...node.path, option].join(" ")}`);
-      }
+      if (owners > 1) throw new Error(`Multiple completion owners for option: ${[...node.path, option].join(" ")}`);
     }
-    if (new Set(node.fileArguments).size !== node.fileArguments.length || node.fileArguments.some((index) => !Number.isInteger(index) || index < 0)) {
+    if (new Set(node.fileArguments).size !== node.fileArguments.length
+      || node.fileArguments.some((index) => !Number.isInteger(index) || index < 0)) {
       throw new Error(`File argument positions must be unique non-negative integers: ${node.path.join(" ")}`);
     }
     for (const position of node.fileArguments) {
-      if (argumentValuePositions.has(position)) {
-        throw new Error(`Multiple completion owners for argument ${position}: ${node.path.join(" ")}`);
-      }
+      if (argumentValuePositions.has(position)) throw new Error(`Multiple completion owners for argument ${position}: ${node.path.join(" ")}`);
     }
-
-    for (const child of node.children) {
-      visit(child);
-    }
+    node.children.forEach(visit);
   };
   visit(root);
-  if (commandPathProviders.length > 1) {
-    throw new Error(`Multiple command-path providers are not allowed: ${root.path.join(" ")}`);
-  }
-  const commandPathProvider = commandPathProviders[0];
-  if (commandPathProvider !== undefined && commandPathProvider.path.length !== root.path.length + 1) {
-    throw new Error(`Command-path provider must be a root command: ${commandPathProvider.path.join(" ")}`);
+  if (commandPathProviders.length > 1) throw new Error(`Multiple command-path providers are not allowed: ${root.path.join(" ")}`);
+  const provider = commandPathProviders[0];
+  if (provider !== undefined && provider.path.length !== root.path.length + 1) {
+    throw new Error(`Command-path provider must be a root command: ${provider.path.join(" ")}`);
   }
 }
 
 export function listPublicCommandPaths(root: CommandNode = ROOT_COMMAND): string[] {
   const paths: string[] = [];
   const visit = (node: CommandNode): void => {
-    if (!node.hidden && node !== root) {
-      paths.push(node.path.slice(1).join(" "));
-    }
+    if (!node.hidden && node !== root) paths.push(node.path.slice(1).join(" "));
     node.children.filter((child) => !child.hidden).forEach(visit);
   };
   visit(root);

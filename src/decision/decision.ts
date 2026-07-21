@@ -1,12 +1,14 @@
+export type DecisionStatus = "active" | "superseded";
+
 export type Decision = {
   schemaVersion: 1;
   id: string;
   taskId: string;
   title: string;
   rationale: string;
-  topics: string[];
-  status: "active" | "superseded";
+  status: DecisionStatus;
   supersededReason?: string;
+  supersededAt?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -16,22 +18,15 @@ export function createDecision(
   taskId: string,
   title: string,
   rationale: string,
-  topics: string[],
   now: Date
 ): Decision {
-  const trimmedTitle = title.trim();
-  const trimmedRationale = rationale.trim();
-  if (trimmedTitle.length === 0 || trimmedRationale.length === 0) {
-    throw new Error("Decision title and rationale are required.");
-  }
   const timestamp = now.toISOString();
   return {
     schemaVersion: 1,
-    id,
-    taskId,
-    title: trimmedTitle,
-    rationale: trimmedRationale,
-    topics: [...new Set(topics)],
+    id: requireSafeIdentity(id, "Decision id"),
+    taskId: requireSafeIdentity(taskId, "Task id"),
+    title: requireText(title, "Decision title"),
+    rationale: requireText(rationale, "Decision rationale"),
     status: "active",
     createdAt: timestamp,
     updatedAt: timestamp
@@ -39,19 +34,31 @@ export function createDecision(
 }
 
 export function supersedeDecision(decision: Decision, reason: string, now: Date): Decision {
-  const trimmedReason = reason.trim();
-  if (trimmedReason.length === 0) {
-    throw new Error("Decision supersede reason is required.");
+  if (decision.status === "superseded") {
+    throw new Error(`Decision is already superseded: ${decision.id}.`);
   }
+  const timestamp = now.toISOString();
   return {
     ...decision,
     status: "superseded",
-    supersededReason: trimmedReason,
-    updatedAt: now.toISOString()
+    supersededReason: requireText(reason, "Decision supersede reason"),
+    supersededAt: timestamp,
+    updatedAt: timestamp
   };
 }
 
-export function renderDecisionTimelineEntry(decision: Decision): string {
-  const topics = decision.topics.length === 0 ? "" : ` [${decision.topics.join(", ")}]`;
-  return `## ${decision.createdAt} — Decision: ${decision.title}${topics}\n\n${decision.rationale}\n\n`;
+function requireSafeIdentity(value: string, label: string): string {
+  const normalized = requireText(value, label);
+  if (["__proto__", "prototype", "constructor", ".", ".."].includes(normalized)
+    || /[\/\\\0]/.test(normalized)) {
+    throw new Error(`${label} is invalid.`);
+  }
+  return normalized;
+}
+
+function requireText(value: string, label: string): string {
+  if (typeof value !== "string" || value.includes("\0")) throw new Error(`${label} is invalid.`);
+  const normalized = value.trim();
+  if (normalized.length === 0) throw new Error(`${label} is required.`);
+  return normalized;
 }

@@ -1,181 +1,141 @@
-# TaskMux Architecture
+# TaskMux architecture
 
-This document describes the current architectural contract of TaskMux. It is a maintained system reference, not a roadmap, requirements log, or implementation history.
-
-## Design principles
-
-1. **Local first.** Task data and Agent sessions stay on one machine unless the user explicitly moves them.
-2. **One mutation boundary.** The Controller serializes ordinary state changes and owns recovery.
-3. **Files are authoritative.** JSON, JSONL, and Markdown contain durable business state; SQLite is derived.
-4. **Native Agents remain native.** TaskMux coordinates existing Agent CLIs instead of replacing their session models.
-5. **Tasks are long-lived.** Cycles, WorkItems, and AgentRuns provide finite execution boundaries.
-6. **Meaning and runtime stay separate.** Task direction is not inferred from tmux windows or process state alone.
-
-## System context
-
-![TaskMux system context: the local Controller coordinates user commands, scheduling, durable files, the derived index, and tmux Agent sessions.](assets/taskmux-architecture.png)
-
-TaskMux has no required remote control plane, database server, or message broker. The CLI remains the public interface; the Controller is local infrastructure.
+TaskMux is a single-user local control plane. FileTaskStore is the one authority for TaskMux state, tmux is the one authority for Agent terminal/process interaction, and Git is the authority for repositories and worktrees.
 
 ## Components
 
-| Component | Responsibility |
-| --- | --- |
-| **CLI** | Parse commands, optionally resolve omitted references to locally enumerable TaskMux objects in an interactive terminal, render human or JSON output, and route ordinary operations to the Controller. |
-| **Controller** | Authenticate local RPC, serialize mutations, deduplicate request IDs, run recovery, and refresh derived state. |
-| **Domain services** | Apply Task, Role, Cycle, WorkItem, schedule, decision, milestone, and session-authority rules. |
-| **Scheduler** | Detect scheduled reviews, recurring work, inactivity, expired AgentRuns, and exited tmux windows. |
-| **File repository** | Read and write the authoritative local model. |
-| **Derived index** | Provide rebuildable Task, role, and WorkItem lookups in SQLite. |
-| **Agent executors** | Translate common start, recover, send, interrupt, stop, and status operations into Agent-specific commands. |
-| **tmux runtime** | Keep active native Agent processes alive and attachable without becoming their session authority. |
-| **System Skills** | Guide Operator, Leader, and Worker behavior without becoming a permission system. |
+```mermaid
+flowchart LR
+  CLI[taskmux CLI] --> F[(schema.json + state.json)]
+  CLI -->|private Unix socket| C[Controller]
+  C --> F
+  C --> G[Git worktrees]
+  C --> T[tmux]
+  T --> A[Codex / Claude]
+```
 
-## Domain model
+- The CLI owns parsing, interactive selection, setup/completion, and foreground attach.
+- FileTaskStore owns all persisted domain records and atomic mutations.
+- One background Controller per `TASKMUX_HOME` owns automatic Git/tmux effects.
+- tmux receives all automated input and exclusively owns interactive terminal input after attach.
+- Native Agent transcript stores remain outside TaskMux. Only explicit messages, inputs, Run state, and summaries enter `state.json`.
 
-| Entity | Relationship |
-| --- | --- |
-| **Task** | Owns Cycles, WorkItems, TaskRoles, Topics, Decisions, and Milestones. |
-| **GlobalRole** | Defines a reusable global Role. The Operator is the persistent global administrative Role. |
-| **TaskRole** | Is a Task-local Role with one or more Agent bindings, one active Agent, and its AgentRuns. |
-| **RoleSessionSet** | Is the sole durable session authority for one TaskRole and its per-Agent native sessions. |
-| **GlobalRoleSessionSet** | Is the sole durable session authority for the global Operator and its per-Agent native sessions. |
-| **InputRequest** | Is a Task-owned user-decision request created by one exact active Leader origin. |
-| **Global Inbox** | Is a global query over Task-owned open InputRequests, not an independent durable store. |
-| **OperatorDelivery** | Is a pointer-only transport record for notifying the foreground Operator about an InputRequest. |
-| **Cycle** | Groups one bounded period of advancement and may contain WorkItems. |
-| **WorkItem** | May span one or more AgentRuns until it reaches a terminal outcome. |
-| **AgentRun** | Records one asynchronous dispatch round and its durable result. |
+The Controller socket uses a private discovery file, random token, strict JSON-line protocol, and local file permissions. It is transport, not a second persistence system.
 
-### Task lifecycle
-
-A Task is a durable mission, not a ticket. It has one terminal-like marker: `archived`. Continued progress is represented by Cycles and WorkItems rather than `open`, `active`, and `done` Task states.
-
-### Role model
-
-- **Operator** is a persistent global administrative Role. It manages TaskMux through the CLI but does not perform Task work. Its foreground native target is defined only by the active binding and running session in its `GlobalRoleSessionSet`.
-- **Leader** is the single fixed Task-local Role responsible for direction, decomposition, synthesis, and archival.
-- Every managed GlobalRole and TaskRole binds one or more Agents, but has one active Agent at a time. Each binding has independent adapter, model, effort, and permission configuration and an independent native session identity and session state; a binding never borrows another Agent's session.
-- A TaskRole uses its task-scoped `RoleSessionSet`, and the global Operator uses its `GlobalRoleSessionSet`, as the only authority for native sessions. Switching the active Agent can recover that Agent's own underlying session rather than reuse another Agent's session.
-- **Independent roles** have their own tmux window for the active Agent, AgentRuns, and optional Git worktree.
-- **Child roles** contain descriptive constraints for a parent role. They have no TaskMux-managed session, tmux window, worktree, or AgentRun.
-
-Global role templates use copy semantics. Once a role is bound into a Task, later template changes do not mutate the TaskRole.
-
-## Command and transaction flow
-
-![TaskMux persistence: requests pass through the idempotent Controller, transaction journal, authoritative files, and replaceable derived index.](assets/taskmux-reliability.png)
-
-Mutating request IDs are idempotent. A committed result is returned without reapplying the command. If a process stops after a transaction is staged, Controller startup completes the staged operation before serving requests.
-
-The command catalog is the authoritative public CLI vocabulary. It assigns every command to one semantic section and defines stable order within each section; help and Bash, Zsh, and Fish completion consume that structure directly. Public operations have one canonical spelling: scoped help uses `taskmux help [command path]`, and version output uses `taskmux version`. Completion suppresses unrelated filesystem fallback at catalog-owned positions while retaining catalog-declared enum, file/path, and executable ownership.
-
-Before the existing execution boundary, the CLI may guide a terminal user to select an omitted reference that TaskMux can enumerate from local authoritative state. Explicit arguments are never replaced, and scripts, redirected IO, and JSON invocations remain deterministic and non-interactive. The selected value is still validated by the ordinary command path.
-
-Setup is an explicit lifecycle operation. Ordinary CLI, dashboard, Task shell, import, prune, backup, attach-state, and Scheduler mutations share the Controller boundary.
-
-### Input requests and the Global Inbox
-
-The complete public input-request surface is `taskmux task input request`, `taskmux task input list`, `taskmux task input show`, `taskmux task input answer`, and `taskmux task input cancel`. `list` without a Task scope produces the Global Inbox: a global query over Task-owned requests. It creates no second inbox record, and each request is still read, answered, and retained through its owning Task.
-
-An InputRequest records one exact Leader origin tuple: **role**, **Agent**, **adapter**, **session root**, **native session**, and **AgentRun**. Only the current active Leader tuple may create or cancel its open request; the Controller validates every element against the Task's `RoleSessionSet`. An answer writes a durable resolution and a wakeup addressed back to that same origin, rather than allowing a caller to synthesize a Leader wakeup.
-
-Creating an InputRequest also writes a pointer-only `OperatorDelivery`: its durable identity is the delivery ID plus Task and request IDs, never a duplicate question, choices, answer, or presentation payload. The foreground Operator reads the Task-owned request through those pointers. A delivery receipt records only transport acceptance by that foreground Operator target; it does not mean a user saw, approved, or answered the request.
-
-`user-required` requests never time out and never auto-resolve. An `offline-recommended` request may resolve only after a continuous confirmed-offline interval for the foreground Operator reaches its configured duration; that transition writes the persisted recommendation and its reason as the resolution. Online or unknown Operator presence does not time out a request and clears any accumulated offline interval. A window without a matching active binding and running `GlobalRoleSessionSet` session is unknown, not evidence of absence.
-
-## Dispatch and wakeup flow
-
-![TaskMux workflow: triggers wake the fixed Leader, which creates finite work, dispatches a Worker, and receives a durable Yield for the next Cycle.](assets/taskmux-workflow.png)
-
-Dispatch returns after the active Agent's native session accepts the work; execution remains asynchronous. Yield ends the AgentRun, updates any linked WorkItem, and queues one coalesced Leader wakeup.
-
-A recorded native session identity is never silently replaced. Permanent recovery failure pauses Leader wakeups and creates a durable Operator notification until a user explicitly records a replacement session.
-
-## Persistence
-
-The default root is `~/.taskmux`; `TASKMUX_HOME` overrides it.
+## Persistent layout
 
 ```text
 TASKMUX_HOME/
-  config.json
   schema.json
-  agents/
-  roles/<role-name>/
-    role.json
-  tasks/<task-id>/
-    info.json
-    task.json
-    brief.md
-    timeline.md
-    topic-summaries.md
-    comments.jsonl
-    events.jsonl
-    roles/<role-name>/
-      role.json
-    cycles/
-    work-items/
-    milestones/
-    decisions/
+  state.json
+  .state.lock
   runtime/
     controller.json
-    index.sqlite
-    domain-transactions/
-    recovery-journal/
-    role-sessions/
-      global/<role-name>.json
-      tasks/<task-id>/<role-name>.json
-    native-session-identities.json
-    active-runs/
-    pending-wakeups/
-    operator-notifications/
-    logs/
+    controller.sock
+  worktrees/
+    <task-id>/
+      <role-name>/
 ```
 
-`schema.json` must match the current storage contract. TaskMux rejects other schema versions.
+`schema.json` records storage-layout version 5, aggregate-schema version 2, and a reserved `activeGeneration` pointer. `state.json` is one aggregate containing:
 
-### Authoritative and derived state
+- configuration and completion installation records;
+- configured Agents;
+- Repositories;
+- global Roles and their per-Agent session sets;
+- Tasks, Task Roles, RoleWorkspaces, messages, WorkItems, AgentRuns, append-only events, Task Briefs, Decisions, and Milestones;
+- pending Leader wakes, Leader failures, and Operator notifications.
 
-- JSON stores structured snapshots and runtime records.
-- JSONL stores append-only comments, events, and diagnostics.
-- Markdown stores curated semantic context.
-- SQLite stores only derived lookup data and may be deleted and rebuilt.
+Every persisted domain record has its own schema version and is validated when read. Unsupported aggregate or record shapes fail explicitly; TaskMux does not silently repair them.
 
-Role snapshots define bindings and the active Agent. A task-scoped `RoleSessionSet` and the Operator's `GlobalRoleSessionSet` are the only session authorities; the native-session identity ledger protects ownership but does not provide another session source.
+Writes acquire a cross-process lock, reread the latest aggregate, apply the mutation once, and commit one replacement. The durable write path creates a mode-`0600` temporary file, flushes it, renames it over `state.json`, and flushes the containing directory. Compound workflow operations use the same transaction callback and produce one aggregate write.
 
-TaskMux does not run a filesystem watcher or a polling loop for direct file edits. Derived state is refreshed at explicit boundaries only:
+The layout and aggregate migration registries are intentionally empty in this release. Their boundaries validate complete sequential plans before applying any mutation. A reserved generation pointer allows a later layout to write and validate a new immutable generation before atomically switching the manifest; generation storage is not implemented in version 5.
 
-1. Controller startup;
-2. successful Controller command transactions;
-3. Scheduler scans.
+## Domain model and invariants
 
-The supported mutation path is the CLI. Direct file edits are not automatically detected and should not be used when immediate, predictable application is required.
+- A Task is `draft`, `active`, `completed`, or `archived`. Completion is a reversible execution fence; archive is terminal.
+- Creating a Task also creates its Leader Role.
+- Repository-backed active Tasks use one deterministic worktree per Role at `<TASKMUX_HOME>/worktrees/<task-id>/<role-name>`.
+- Common Role names map directly to `taskmux/<task-id>/<role-name>` branches; names that are not valid Git ref segments use a deterministic encoded branch segment without changing their worktree directory.
+- `Task.cwd` marks the Task worktree root; each Task Role workspace agrees with its persisted RoleWorkspace path.
+- A Role may bind multiple Agents but has one active Agent.
+- Each `(Role, Agent)` binding has its own native session record. Switching preserves dormant sessions.
+- A Role has at most one active AgentRun.
+- A WorkItem has at most one active Run.
+- A Worker yield atomically completes its Run/WorkItem, appends its summary, and merges a Leader wake.
+- A Leader yield never creates a self-wake, but it releases any already-pending wake for the next Controller pass.
+- Completing a Task requires no active Worker Run or running WorkItem, clears pending wakes and recovery failures, and rejects later execution until an explicit reopen.
+- A Leader control Run may atomically yield itself while completing the Task. Reopen returns the Task to active and queues one `task-reopened` wake.
+- Completed Tasks retain their Role sessions and worktrees; archived Tasks stop tmux and clean only clean worktrees.
+- Archived Tasks reject new messages, Roles, work, dispatch, enter, and recovery actions.
 
-## Agent and tmux boundaries
+FileTaskStore validates cross-record references after every transaction, including Repository ownership, Task/Role ownership, active-run pointers, and session-set ownership.
 
-One Task maps to one tmux session. Each independent TaskRole maps to one window for its active Agent; multiple Agent bindings do not create parallel Role windows. tmux is a live-process boundary, not a session authority: the Role's session set determines which native session is recovered when its active Agent changes. The global Operator may use tmux without becoming a TaskRole, and its `GlobalRoleSessionSet` remains authoritative. When the Leader workspace is a Git repository, independent roles require an explicit TaskMux worktree before dispatch.
+## Controller pass
 
-Agent-specific command construction stays behind a common executor contract. The Scheduler does not build Codex or Claude commands, the context compiler does not control tmux, and tmux does not interpret Task semantics.
+The Controller runs a non-overlapping full reconciliation pass every 30 seconds by default. `reconciliationIntervalSeconds` may be set from 5 to 300 in TaskMux config. Durable state changes request an immediate pass through the Controller socket, and concurrent scan requests coalesce into one follow-up pass.
 
-## Scheduling and recovery
+`controller restart` stops only this process and waits for its private socket/discovery state to disappear before starting the currently installed runtime. tmux sessions are external durable runtime state and are never stopped by Controller restart.
 
-The Scheduler handles recurring intervals, one-off review times, inactivity, AgentRun TTLs, and exited role windows. Trigger reasons are persisted and coalesced before the Leader is recovered.
+```text
+prepare active workspaces
+  -> stop archived Task tmux sessions
+  -> clean archived workspaces when clean
+  -> deliver queued Role Runs
+  -> reconcile exited active Role Runs
+  -> dispatch pending Leader wakes
+```
 
-Recovery guarantees focus on durable local state:
+Repository preparation precedes delivery. A Repository path and base ref are validated by Git. Each Role derives the path `<TASKMUX_HOME>/worktrees/<task-id>/<role-name>` and branch `taskmux/<task-id>/<role-name>`. The minimal RoleWorkspace record retains its Repository, path, branch, base ref, and starting commit; it is not a ref ledger. Existing worktrees must resolve to the expected path, branch, and Git common directory.
 
-- staged snapshot writes are replayed on startup;
-- staged multi-file domain transactions converge to their complete write/delete set;
-- request intents and cached results prevent duplicate mutations;
-- a missing or corrupt SQLite index is rebuilt from files;
-- invalid stored records produce explicit diagnostics instead of silent data loss.
+Archive stops tmux before worktree cleanup. Each clean Role worktree is removed idempotently and recorded independently. A dirty Role worktree and its RoleWorkspace record are preserved; they are never force-removed. A Git failure is isolated to its Task so other Task reconciliation continues.
 
-## Security boundary
+## Durable wake and Run behavior
 
-- Controller RPC binds only to `127.0.0.1`.
-- Discovery includes a random local token and API version.
-- Runtime and credential-bearing files use user-only permissions where applicable.
-- TaskMux does not provide multi-user authorization or expose a remote service.
+Task activation/reopen, an Operator/user message, Worker yield, and exited Role failure can merge a `PendingWakeup`. Reasons are de-duplicated while request count and first/last timestamps remain durable. Completed Tasks never dispatch a pending wake.
 
-## Non-goals
+If the Leader is busy, the Controller does not touch tmux and leaves the wake pending. When idle, it prepares the fixed Role session, then atomically claims the unchanged wake as a durable, not-yet-delivered Leader AgentRun before any tmux input. The claim clears that wake; later requests form a new pending wake. A confirmed receipt marks the Run delivered. A send failure fails the claim and restores its wake, while a Controller crash can resume the same Run with the same `agent-run:<run-id>` receipt.
 
-TaskMux does not currently provide team accounts, remote synchronization, a hosted control plane, a web UI, automatic Git merge or push, full Agent transcript auditing, or TaskMux-managed native subagent runtimes.
+A dispatched Worker WorkItem creates a durable AgentRun before any terminal effect. The Controller is the only automatic delivery path. Delivery uses `agent-run:<run-id>` as its receipt and persists `deliveredAt` plus successful session/Role state after tmux confirms the send. Completion and yield reject a Run whose delivery is still pending.
+
+If an active Role's tmux window disappears before yield, the Controller fails the AgentRun and running WorkItem, clears the active-run pointer, stops its session record, and merges a failure wake for the Leader. A failed Leader recovery records `LeaderFailure` plus `OperatorNotification`; `jobs retry leader-recovery:<task-id>` clears those records and queues a recovery wake.
+
+`jobs list` is a compatibility projection over pending wakes and recovery failures. There is no generic Job table or retry queue.
+
+## tmux ownership and delivery
+
+Foreground attach is a hard terminal handoff:
+
+1. close any readline interface;
+2. leave raw mode;
+3. pause TaskMux stdin;
+4. run `tmux attach-session` synchronously with inherited stdio.
+
+TaskMux does not read stdin, draw UI, or relay bytes while attached.
+
+Automatic delivery never reads stdin. It requires an adapter-specific readiness probe: Codex and Claude have separate composer markers. Before waiting for readiness, the Controller checks for an existing pane receipt, so a busy Agent does not cause a retry scan to block. Receipt check/write, literal input, and Enter execute in one tmux server command queue.
+
+## Native session identity
+
+Claude receives a preallocated session ID at new launch and resumes that fixed ID later.
+
+Codex discovers its thread ID at runtime. Managed launches add a structured Codex `notify` argv configuration. After each completed turn, Codex invokes:
+
+```text
+taskmux internal session-notify <codex-json-payload>
+```
+
+The hidden command validates the payload and TaskMux provenance environment, then records the fixed task/global Role session through the Controller. No session-binding text is placed in a model prompt.
+
+## Deliberate exclusions
+
+This version does not restore:
+
+- backup/restore, import/export, trash, or general maintenance commands;
+- native storage extensions, derived indexes, or recovery journals;
+- runtime claims, leases, fencing generations, permission fingerprints, or identity ledgers;
+- inactivity TTL, cooldown, review-time, recurring schedules, or offline resolution;
+- Web APIs, Web UI, or remote multi-user coordination.
+
+Those systems are not required for the retained single-user workflow. Future storage-schema migration is the one explicit extension boundary kept in the design.

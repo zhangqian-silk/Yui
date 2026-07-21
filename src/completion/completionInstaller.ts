@@ -1,20 +1,37 @@
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { dataError } from "../errors/cliError.js";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+
 import type { CliIdentity } from "../cli/completion.js";
-import type { CompletionInstallation, CompletionShell, TaskStore } from "../storage/taskStore.js";
+import { dataError } from "../errors/cliError.js";
 import {
   activationBlock,
   activationEnd,
   activationIsAutomatic,
   activationStart,
   completionMarker,
-  managedCompletionScript
+  managedCompletionScript,
+  type CompletionConfig,
+  type CompletionInstallation,
+  type CompletionShell
 } from "./completionState.js";
 
+export type CompletionStore = Readonly<{
+  getConfig(): CompletionConfig;
+  saveConfig(config: CompletionConfig): void;
+}>;
+
 export function installCompletion(
-  store: TaskStore,
+  store: CompletionStore,
   shell: CompletionShell,
   installation: CompletionInstallation,
   env: NodeJS.ProcessEnv,
@@ -22,24 +39,29 @@ export function installCompletion(
   activate: boolean
 ): void {
   validateInstallation(installation);
-  const config = store.runReadSnapshot((snapshot) => snapshot.getConfig());
   writeManagedScript(shell, installation.scriptPath, identity);
+  const config = store.getConfig();
   store.saveConfig({
     ...config,
-    completionInstallations: { ...config.completionInstallations, [shell]: installation }
+    completionInstallations: {
+      ...config.completionInstallations,
+      [shell]: installation
+    }
   });
-  const automatic = activationIsAutomatic(shell, installation, env, identity);
-  if (!automatic && activate) {
+  if (!activationIsAutomatic(shell, installation, env, identity) && activate) {
     writeActivationBlock(shell, installation, identity);
   }
 }
 
-export function uninstallCompletion(store: TaskStore, shell: CompletionShell, identity: CliIdentity): void {
-  const config = store.runReadSnapshot((snapshot) => snapshot.getConfig());
+export function uninstallCompletion(
+  store: CompletionStore,
+  shell: CompletionShell,
+  identity: CliIdentity
+): void {
+  const config = store.getConfig();
   const installation = config.completionInstallations?.[shell];
-  if (installation === undefined) {
-    return;
-  }
+  if (installation === undefined) return;
+
   assertManagedScriptRemovable(shell, installation.scriptPath, identity);
   assertActivationRemovable(shell, installation, identity);
   removeManagedScript(shell, installation.scriptPath, identity);
@@ -48,19 +70,33 @@ export function uninstallCompletion(store: TaskStore, shell: CompletionShell, id
   delete installations[shell];
   store.saveConfig({
     ...config,
-    completionInstallations: Object.keys(installations).length === 0 ? undefined : installations
+    completionInstallations: Object.keys(installations).length === 0
+      ? undefined
+      : installations
   });
 }
 
-function assertManagedScriptRemovable(shell: CompletionShell, path: string, identity: CliIdentity): void {
+function assertManagedScriptRemovable(
+  shell: CompletionShell,
+  path: string,
+  identity: CliIdentity
+): void {
   if (!existsSync(path)) return;
   const stat = lstatSync(path);
-  if (!stat.isFile() || stat.isSymbolicLink() || !readFileSync(path, "utf8").startsWith(completionMarker(shell, identity))) {
+  if (
+    !stat.isFile()
+    || stat.isSymbolicLink()
+    || !readFileSync(path, "utf8").startsWith(completionMarker(shell, identity))
+  ) {
     throw dataError(`Refusing to remove unmanaged completion script: ${path}`);
   }
 }
 
-function assertActivationRemovable(shell: CompletionShell, installation: CompletionInstallation, identity: CliIdentity): void {
+function assertActivationRemovable(
+  shell: CompletionShell,
+  installation: CompletionInstallation,
+  identity: CliIdentity
+): void {
   const path = installation.activationPath;
   if (!existsSync(path)) return;
   const stat = lstatSync(path);
@@ -75,7 +111,11 @@ function assertActivationRemovable(shell: CompletionShell, installation: Complet
   }
 }
 
-function writeManagedScript(shell: CompletionShell, path: string, identity: CliIdentity): void {
+function writeManagedScript(
+  shell: CompletionShell,
+  path: string,
+  identity: CliIdentity
+): void {
   if (existsSync(path)) {
     const stat = lstatSync(path);
     if (!stat.isFile() || stat.isSymbolicLink()) {
@@ -88,7 +128,11 @@ function writeManagedScript(shell: CompletionShell, path: string, identity: CliI
   writeAtomic(path, managedCompletionScript(shell, identity), 0o644);
 }
 
-function writeActivationBlock(shell: CompletionShell, installation: CompletionInstallation, identity: CliIdentity): void {
+function writeActivationBlock(
+  shell: CompletionShell,
+  installation: CompletionInstallation,
+  identity: CliIdentity
+): void {
   const path = installation.activationPath;
   let contents = "";
   let mode = 0o644;
@@ -114,22 +158,30 @@ function writeActivationBlock(shell: CompletionShell, installation: CompletionIn
   writeAtomic(path, next, mode);
 }
 
-function removeManagedScript(shell: CompletionShell, path: string, identity: CliIdentity): void {
-  if (!existsSync(path)) {
-    return;
-  }
+function removeManagedScript(
+  shell: CompletionShell,
+  path: string,
+  identity: CliIdentity
+): void {
+  if (!existsSync(path)) return;
   const stat = lstatSync(path);
-  if (!stat.isFile() || stat.isSymbolicLink() || !readFileSync(path, "utf8").startsWith(completionMarker(shell, identity))) {
+  if (
+    !stat.isFile()
+    || stat.isSymbolicLink()
+    || !readFileSync(path, "utf8").startsWith(completionMarker(shell, identity))
+  ) {
     throw dataError(`Refusing to remove unmanaged completion script: ${path}`);
   }
   rmSync(path);
 }
 
-function removeActivationBlock(shell: CompletionShell, installation: CompletionInstallation, identity: CliIdentity): void {
+function removeActivationBlock(
+  shell: CompletionShell,
+  installation: CompletionInstallation,
+  identity: CliIdentity
+): void {
   const path = installation.activationPath;
-  if (!existsSync(path)) {
-    return;
-  }
+  if (!existsSync(path)) return;
   const stat = lstatSync(path);
   if (!stat.isFile() || stat.isSymbolicLink()) {
     throw dataError(`Refusing to modify unsafe activation file: ${path}`);
@@ -142,9 +194,8 @@ function removeActivationBlock(shell: CompletionShell, installation: CompletionI
   if (starts !== ends || starts > 1) {
     throw dataError(`Refusing to remove ambiguous TaskMux activation block: ${path}`);
   }
-  if (starts === 0) {
-    return;
-  }
+  if (starts === 0) return;
+
   const blockStart = contents.indexOf(start);
   const blockEnd = contents.indexOf(end, blockStart) + end.length;
   let next = `${contents.slice(0, blockStart)}${contents.slice(blockEnd)}`;
@@ -165,12 +216,15 @@ function writeAtomic(path: string, contents: string, mode: number): void {
   }
 }
 
-function replaceManagedBlock(contents: string, start: string, end: string, block: string): string {
+function replaceManagedBlock(
+  contents: string,
+  start: string,
+  end: string,
+  block: string
+): string {
   const from = contents.indexOf(start);
   const to = contents.indexOf(end, from);
-  if (to < from) {
-    throw dataError("Invalid TaskMux activation block.");
-  }
+  if (from < 0 || to < from) throw dataError("Invalid TaskMux activation block.");
   return `${contents.slice(0, from)}${block}${contents.slice(to + end.length)}`;
 }
 
@@ -181,5 +235,8 @@ function occurrences(contents: string, value: string): number {
 function validateInstallation(installation: CompletionInstallation): void {
   if (!isAbsolute(installation.scriptPath) || !isAbsolute(installation.activationPath)) {
     throw dataError("Completion script and activation paths must be absolute.");
+  }
+  if (resolve(installation.scriptPath) === resolve(installation.activationPath)) {
+    throw dataError("Completion script and activation paths must be different.");
   }
 }

@@ -1,85 +1,88 @@
 #!/usr/bin/env node
 
 import { readFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline/promises";
-import { runAgentCommand } from "./commands/agentCommands.js";
-import { runBackupCommand } from "./commands/backupCommands.js";
-import { runConfigCommand } from "./commands/configCommands.js";
-import { ensureControllerRunning, runControllerCommand } from "./commands/controllerCommands.js";
-import { runGitLifecycleMaintenanceCommand } from "./commands/gitLifecycleMaintenanceCommands.js";
-import { callController } from "./controller/controller.js";
-import { buildControllerCommandProvenance } from "./controller/commandProvenance.js";
-import { runGlobalRoleCommand } from "./commands/globalRoleCommands.js";
-import {
-  executePruneCommand,
-  executeRestoreCommand,
-  runExportCommand,
-  runImportCommand
-} from "./commands/maintenanceCommands.js";
-import {
-  isTaskRoleRuntimeControlCommand,
-  prepareTaskLifecycleCommand,
-  recordTaskRoleAttached,
-  runTaskCommand,
-  runTaskLifecycleOperation
-} from "./commands/taskCommands.js";
-import { runDashboard } from "./dashboard/dashboard.js";
-import { getDoctorChecks, renderDoctor, runDoctor } from "./doctor/doctor.js";
-import { CliError, dataError, usageError } from "./errors/cliError.js";
-import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
-import { runTaskShell } from "./shell/taskShell.js";
-import { FileTaskStore, resolveTaskmuxHome } from "./storage/taskStore.js";
-import { executeDomainTransaction } from "./storage/domainTransaction.js";
-import {
-  inspectStorageSchema,
-  requireStorageSchema
-} from "./storage/storageSchema.js";
-import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
-import { TmuxManager } from "./tmux/tmuxManager.js";
-import { SYSTEM_OPERATOR_ROLE } from "./role/systemRoles.js";
-import { pumpOperatorDeliveries } from "./operator/operatorDeliveryPump.js";
-import { runTaskInputPostCommitEffects } from "./input/inputPostCommitEffects.js";
-import { launchOperatorWindow } from "./operator/operatorLaunchAuthority.js";
+
 import { renderCommandHelp } from "./cli/helpRenderer.js";
 import { routeInvocation } from "./cli/invocationRouter.js";
-import { runUpdateCommand } from "./cli/updateCommand.js";
 import { renderCompletion, type CliIdentity } from "./cli/completion.js";
-import { runCompletionWizard } from "./completion/completionWizard.js";
-import { allowsInteractiveSelection, resolveInteractiveArguments } from "./cli/interactiveSelection.js";
+import { resolveCompletionCandidates } from "./cli/dynamicCompletion.js";
+import {
+  allowsInteractiveSelection,
+  resolveInteractiveArguments,
+  type SelectionIo
+} from "./cli/interactiveSelection.js";
+import { runCompletionWizard } from "./cli/completionWizard.js";
+import { resolveRoleWizardArguments } from "./cli/roleWizard.js";
+import type { SelectionPorts } from "./cli/selectionPorts.js";
+import { runUpdateCommand } from "./cli/updateCommand.js";
+import {
+  runAgentCommand,
+  type AgentCommandStore
+} from "./commands/agentCommands.js";
+import {
+  runGlobalRoleCommand,
+  type GlobalRoleCommandOptions
+} from "./commands/globalRoleCommands.js";
+import { runJobCommand } from "./commands/jobCommands.js";
+import { runOperatorCommand } from "./commands/operatorCommands.js";
+import { runRepositoryCommand } from "./commands/repositoryCommands.js";
+import { runTaskCommand } from "./commands/taskCommands.js";
+import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
+import {
+  callFileTaskController,
+  ensureFileTaskController,
+  FileTaskWorkflowRuntime,
+  restartFileTaskController
+} from "./controller/clientRuntime.js";
+import { FileSchedulerStoreAdapter } from "./controller/fileSchedulerStoreAdapter.js";
+import { runSessionNotifyCommand } from "./controller/sessionNotify.js";
+import { runDoctorCommand } from "./doctor/doctor.js";
+import { CliError, usageError } from "./errors/cliError.js";
+import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
+import { FileTaskWorkspacePreparer } from "./repository/taskWorkspacePreparer.js";
+import { inspectStorageSchema, requireStorageSchema } from "./storage/storageSchema.js";
+import { FileTaskStore, resolveTaskmuxHome } from "./storage/taskStore.js";
+import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
+import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
+import { TmuxManager } from "./tmux/tmuxManager.js";
 
 const VERSION = readPackageVersion();
-
 const rawArgs = process.argv.slice(2);
-const nativeJsonCommand = rawArgs[0] === "controller" && rawArgs[1] === "status";
-const jsonOutput = rawArgs.includes("--json") && !nativeJsonCommand;
-const args = jsonOutput ? rawArgs.filter((arg) => arg !== "--json") : rawArgs;
+const jsonOutput = rawArgs.includes("--json");
+const args = normalizeAliases(
+  jsonOutput ? rawArgs.filter((argument) => argument !== "--json") : rawArgs
+);
 
-main().catch((error: unknown) => {
+void main().catch((error: unknown) => {
   if (error instanceof CliError) {
     const rendered = jsonOutput
       ? JSON.stringify({ ok: false, code: error.code, message: error.message, details: {} })
       : `${error.code}: ${error.message}${error.helpText === undefined ? "" : `\n\n${error.helpText.trimEnd()}`}`;
-    console.error(rendered);
-    process.exit(error.exitCode);
+    process.stderr.write(`${rendered}\n`);
+    process.exitCode = error.exitCode;
+    return;
   }
-
   const message = error instanceof Error ? error.message : String(error);
-  console.error(jsonOutput
+  process.stderr.write(`${jsonOutput
     ? JSON.stringify({ ok: false, code: "RUNTIME_ERROR", message, details: {} })
-    : `RUNTIME_ERROR: ${message}`);
-  process.exit(5);
+    : `RUNTIME_ERROR: ${message}`}\n`);
+  process.exitCode = 5;
 });
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
+  if (args.length === 0) {
+    emit(renderCommandHelp((await import("./cli/commandCatalog.js")).ROOT_COMMAND, VERSION));
+    return;
+  }
   if (args[0] === "version" && args.length === 1) {
-    emit(VERSION);
+    emit(VERSION, true);
     return;
   }
 
   const invocation = routeInvocation(args);
   if (invocation.kind === "help") {
-    emit(renderCommandHelp(invocation.node, VERSION));
+    emit(renderCommandHelp(invocation.node, VERSION), true);
     return;
   }
   if (invocation.kind === "path-error") {
@@ -91,409 +94,243 @@ async function main(): Promise<void> {
   if (invocation.kind === "incomplete") {
     throw usageError(
       `Command required after: ${invocation.typedPath}`,
-      `${renderCommandHelp(invocation.helpNode, VERSION)}\nRun \`taskmux help ${invocation.typedPath}\` for this command group.\n`
+      renderCommandHelp(invocation.helpNode, VERSION)
     );
   }
 
-  if (args[0] === "version") {
-    throw usageError("Version usage: taskmux version");
-  }
-
+  if (args[0] === "version") throw usageError("Version usage: taskmux version");
   if (args[0] === "update") {
-    if (jsonOutput) {
-      throw usageError("Update does not support --json.");
-    }
-    if (args.length !== 1) {
-      throw usageError("Update usage: taskmux update");
-    }
+    if (jsonOutput) throw usageError("Update does not support --json.");
+    if (args.length !== 1) throw usageError("Update usage: taskmux update");
     process.exitCode = runUpdateCommand();
     return;
   }
 
-  if (
-    args[0] === "completion" &&
-    (args[1] === "bash" || args[1] === "zsh" || args[1] === "fish")
-  ) {
-    emit(renderCompletion(args[1], resolveCliIdentity(process.env)));
-    return;
-  }
-
-  const rootDir = resolveTaskmuxHome(process.env);
-
-  if (args.length === 0) {
-    await runDefaultDashboard(rootDir);
-    return;
-  }
-
+  const home = resolveTaskmuxHome(process.env);
   if (args[0] === "completion") {
-    if (args[1] === "install" || args[1] === "uninstall") {
-      if (args.length !== 2) {
-        throw usageError(`Completion ${args[1]} usage: taskmux completion ${args[1]}`);
-      }
-      if (jsonOutput) {
-        throw usageError(`Completion ${args[1]} does not support --json.`);
-      }
-      if (process.stdin.isTTY !== true && process.env.TASKMUX_SETUP_INTERACTIVE !== "1") {
-        throw usageError(`Completion ${args[1]} requires an interactive terminal.`);
-      }
-      requireStorageSchema(rootDir);
-      const store = new FileTaskStore(rootDir);
-      const readline = createInterface({ input: process.stdin, output: process.stdout, terminal: process.stdin.isTTY === true });
-      try {
-        const iterator = process.stdin.isTTY === true ? undefined : readline[Symbol.asyncIterator]();
-        const question = process.stdin.isTTY === true
-          ? (prompt: string) => readline.question(prompt)
-          : async (prompt: string) => {
-              process.stdout.write(prompt);
-              const next = await iterator?.next();
-              return next?.done === true || next === undefined ? "skip" : next.value;
-            };
-        emit(await runCompletionWizard(
-          args[1],
-          store,
-          process.env,
-          resolveCliIdentity(process.env),
-          question,
-          { width: process.stdout.columns }
-        ));
-      } finally {
-        readline.close();
-      }
-      return;
-    }
-    emit(renderCompletion(args[1], resolveCliIdentity(process.env)));
-    return;
-  }
-
-  if (args[0] === "doctor") {
-    const storageSchema = inspectStorageSchema(rootDir);
-
-    emit(runDoctor(process.env, new NodeCommandExecutor(), storageSchema));
+    await completionCommand(home, invocation.node);
     return;
   }
 
   if (args[0] === "setup") {
-    if (jsonOutput) {
-      throw usageError("Setup does not support --json.");
-    }
+    if (jsonOutput) throw usageError("Setup does not support --json.");
     const setupIo = {
       input: process.stdin,
       output: process.stdout,
       forceInteractive: process.env.TASKMUX_SETUP_INTERACTIVE === "1"
     };
-
     validateSetupInvocation(args.slice(1), setupIo);
-    const output = await runSetupCommand(args.slice(1), process.env, new NodeCommandExecutor(), setupIo);
-    emit(output);
-    return;
-  }
-
-  if (args[0] === "backup") {
-    requireStorageSchema(rootDir);
-    if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
-      await printControllerCommand(rootDir, "backup", []);
-      return;
-    }
-    emit(executeDirectDomainCommand(
-      rootDir,
-      "backup",
-      (_transactionStore, workingRoot) => runBackupCommand(workingRoot, rootDir),
-      { includeBackups: true }
-    ));
-    return;
-  }
-
-  if (args[0] === "restore") {
-    requireStorageSchema(rootDir);
-    const restoreArgs = await confirmPhysicalRestore(args.slice(1));
-    if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
-      await printControllerCommand(rootDir, "restore", restoreArgs);
-      return;
-    }
-    emit(executeRestoreCommand(
-      rootDir,
-      `cli-restore-${randomUUID()}`,
-      restoreArgs
-    ).output);
-    return;
-  }
-
-  if (args[0] === "maintenance") {
-    requireStorageSchema(rootDir);
-    emit(runGitLifecycleMaintenanceCommand(args.slice(1), rootDir));
-    return;
-  }
-
-  if (args[0] === "controller") {
-    requireStorageSchema(rootDir);
-    const output = await runControllerCommand(args.slice(1), rootDir, process.env);
-    if (output.length > 0) {
-      emit(output);
-    }
-    return;
-  }
-
-  if (args[0] === "config") {
-    requireStorageSchema(rootDir);
-    const discovery = process.env.TASKMUX_CONTROLLER_MODE === "direct"
-      ? undefined
-      : await ensureControllerRunning(rootDir, process.env);
-    const store = new FileTaskStore(rootDir);
-    const resolvedArgs = await resolveTerminalArguments(args, invocation.node, store);
-    if (resolvedArgs === null) {
-      emit("Cancelled.");
-      return;
-    }
-    if (discovery !== undefined) {
-      await printControllerCommand(rootDir, "config", resolvedArgs.slice(1), discovery);
-      return;
-    }
-    const commandArgs = resolvedArgs.slice(1);
-    emit(
-      isDirectConfigSnapshotRead(commandArgs)
-        ? runConfigCommand(commandArgs, store, process.env)
-        : executeDirectDomainCommand(
-          rootDir,
-          "config",
-          (transactionStore) => runConfigCommand(commandArgs, transactionStore, process.env)
-        )
-    );
-    return;
-  }
-
-  if (args[0] === "export") {
-    requireStorageSchema(rootDir);
-    if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
-      await printControllerCommand(rootDir, "export", args.slice(1));
-      return;
-    }
-    emit(runExportCommand(args.slice(1), new FileTaskStore(rootDir)));
-    return;
-  }
-
-  if (args[0] === "import") {
-    requireStorageSchema(rootDir);
-    if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
-      await printControllerCommand(rootDir, "import", args.slice(1));
-      return;
-    }
-    emit(executeDirectDomainCommand(
-      rootDir,
-      "import",
-      (transactionStore) => runImportCommand(args.slice(1), transactionStore)
-    ));
-    return;
-  }
-
-  if (args[0] === "prune") {
-    requireStorageSchema(rootDir);
-    if (process.env.TASKMUX_CONTROLLER_MODE !== "direct") {
-      await printControllerCommand(rootDir, "prune", args.slice(1));
-      return;
-    }
-    emit(executePruneCommand(
-      rootDir,
-      `cli-prune-${randomUUID()}`,
-      args.slice(1)
-    ));
-    return;
-  }
-
-  if (args[0] === "operator") {
-    if (args.length > 1) {
-      throw usageError("Operator usage: taskmux operator");
-    }
-
-    requireStorageSchema(rootDir);
-    const discovery = process.env.TASKMUX_CONTROLLER_MODE === "direct"
-      ? undefined
-      : await ensureControllerRunning(rootDir, process.env);
-    const tmux = new TmuxManager(
-      process.env.TASKMUX_TMUX_BIN ?? "tmux",
+    emit(await runSetupCommand(
+      args.slice(1),
+      process.env,
       new NodeCommandExecutor(),
-      rootDir
-    );
-    const launched = launchOperatorWindow(rootDir, tmux, process.env);
-    pumpOperatorDeliveries(rootDir, tmux);
-    if (discovery !== undefined) {
-      await callController(discovery, "scheduler.scan", randomUUID());
+      setupIo
+    ));
+    return;
+  }
+  if (args[0] === "doctor") {
+    emit(runDoctorCommand(args.slice(1), process.env, new NodeCommandExecutor()));
+    return;
+  }
+  if (args[0] === "internal") {
+    if (args[1] !== "session-notify" || args.length !== 3) {
+      throw usageError("Internal session notify usage is invalid.");
     }
-    tmux.attachRole("operator", launched.taskRole.name);
-    emit("Detached Operator session");
+    await runSessionNotifyCommand(args[2], process.env);
     return;
   }
 
-  if (args[0] === "agent") {
-    requireStorageSchema(rootDir);
-    const discovery = process.env.TASKMUX_CONTROLLER_MODE === "direct"
-      ? undefined
-      : await ensureControllerRunning(rootDir, process.env);
-    const store = new FileTaskStore(rootDir);
-    const resolvedArgs = await resolveTerminalArguments(args, invocation.node, store);
-    if (resolvedArgs === null) {
-      emit("Cancelled.");
-      return;
-    }
-    if (discovery !== undefined) {
-      await printControllerCommand(rootDir, "agent", resolvedArgs.slice(1), discovery);
-      return;
-    }
-    const commandArgs = resolvedArgs.slice(1);
-    emit(
-      isDirectAgentSnapshotRead(commandArgs)
-        ? runAgentCommand(commandArgs, store)
-        : executeDirectDomainCommand(
-          rootDir,
-          "agent",
-          (transactionStore) => runAgentCommand(commandArgs, transactionStore)
-        )
-    );
+  requireStorageSchema(home);
+  const store = new FileTaskStore(home);
+  const resolved = await resolveTerminalArguments(args, invocation.node, store);
+  if (resolved === null) {
+    emit("Cancelled.");
     return;
   }
 
-  if (args[0] === "role") {
-    requireStorageSchema(rootDir);
-    const discovery = args[1] !== "enter" && process.env.TASKMUX_CONTROLLER_MODE !== "direct"
-      ? await ensureControllerRunning(rootDir, process.env)
-      : undefined;
-    const store = new FileTaskStore(rootDir);
-    const resolvedArgs = await resolveTerminalArguments(args, invocation.node, store);
-    if (resolvedArgs === null) {
-      emit("Cancelled.");
-      return;
+  if (resolved[0] === "controller") {
+    const method = resolved[1];
+    if ((method !== "status" && method !== "stop" && method !== "restart") || resolved.length !== 2) {
+      throw usageError("Controller usage: taskmux controller status|stop|restart.");
     }
-    if (discovery !== undefined) {
-      await printControllerCommand(rootDir, "role", resolvedArgs.slice(1), discovery);
-      return;
+    const controllerMethod: "status" | "stop" | "restart" = method;
+    const result = controllerMethod === "restart"
+      ? await restartFileTaskController(home, { environment: process.env })
+      : await callFileTaskController(home, `controller.${controllerMethod}`);
+    emit(renderControllerResult(controllerMethod, result));
+    return;
+  }
+
+  const executor = new NodeCommandExecutor();
+  const tmux = new TmuxManager(
+    process.env.TASKMUX_TMUX_BIN ?? "tmux",
+    executor,
+    { taskmuxHome: home, terminalInput: process.stdin }
+  );
+  const schedulerStore = new FileSchedulerStoreAdapter(store);
+  const planner = new FileRoleLaunchPlanner(home, store, { environment: process.env });
+  const workspacePreparer = new FileTaskWorkspacePreparer(home, store);
+  const runtime = new FileTaskWorkflowRuntime(
+    home,
+    store,
+    schedulerStore,
+    planner,
+    tmux,
+    workspacePreparer,
+    {
+      environment: process.env,
+      onError: (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        process.stderr.write(`Controller runtime error: ${message}\n`);
+      }
     }
-    const commandArgs = resolvedArgs.slice(1);
-    const tmux = new TmuxManager(
-      process.env.TASKMUX_TMUX_BIN ?? "tmux",
-      new NodeCommandExecutor(),
-      rootDir
-    );
-    const roleOptions = {
-      taskmuxHome: rootDir,
-      env: process.env,
-      tmux
+  );
+
+  if (resolved[0] === "agent") {
+    emit(runAgentCommand(resolved.slice(1), store as unknown as AgentCommandStore));
+    return;
+  }
+  if (resolved[0] === "repository") {
+    emit(await runRepositoryCommand(resolved.slice(1), store));
+    return;
+  }
+  if (resolved[0] === "role") {
+    const roleOptions: GlobalRoleCommandOptions = {
+      taskmuxHome: home,
+      env: process.env
     };
-    const output =
-      isCoordinatedGlobalRoleMutation(commandArgs) || isDirectGlobalRoleRead(commandArgs)
-        ? runGlobalRoleCommand(commandArgs, store, roleOptions)
-        : executeDirectDomainCommand(
-          rootDir,
-          "role",
-          (transactionStore) => runGlobalRoleCommand(commandArgs, transactionStore, roleOptions)
-        );
-    if (
-      commandArgs[0] === "session" &&
-      commandArgs[1] === "record" &&
-      commandArgs[2] === SYSTEM_OPERATOR_ROLE
-    ) {
-      pumpOperatorDeliveries(rootDir, tmux);
-    }
-    emit(output);
-    return;
-  }
-
-  if (args[0] === "task") {
-    requireStorageSchema(rootDir);
-    const discovery = process.env.TASKMUX_CONTROLLER_MODE === "direct"
-      ? undefined
-      : await ensureControllerRunning(rootDir, process.env);
-    const store = new FileTaskStore(rootDir);
-    const tmux = new TmuxManager(
-      process.env.TASKMUX_TMUX_BIN ?? "tmux",
-      new NodeCommandExecutor(),
-      rootDir
+    const result = runGlobalRoleCommand(
+      resolved.slice(1),
+      store as unknown as Parameters<typeof runGlobalRoleCommand>[1],
+      roleOptions
     );
-    const scopedTaskArgs = resolveTaskCommandScope(args.slice(1), process.env);
-    const resolvedFullArgs = await resolveTerminalArguments(["task", ...scopedTaskArgs], invocation.node, store);
-    if (resolvedFullArgs === null) {
-      emit("Cancelled.");
+    if (typeof result === "string") {
+      emit(result);
       return;
     }
-    const taskArgs = resolvedFullArgs.slice(1);
-
-    if (taskArgs[0] === "shell") {
-      const taskId = taskArgs[1];
-
-      if (taskId === undefined || taskId.trim().length === 0) {
-        throw usageError("Task id is required.");
+    await ensureFileTaskController(home, { environment: process.env });
+    runtime.prepareGlobalRoleEnter(result.role.name);
+    tmux.attachRole("operator", result.role.name);
+    return;
+  }
+  if (resolved[0] === "operator") {
+    if (resolved[1] === "enter") {
+      if (resolved.length !== 2) throw usageError("Operator enter usage: taskmux operator enter.");
+      await ensureFileTaskController(home, { environment: process.env });
+      runtime.prepareGlobalRoleEnter("operator");
+      tmux.attachRole("operator", "operator");
+      return;
+    }
+    const result = runOperatorCommand(resolved.slice(1), store, { runtime, environment: process.env });
+    if (result.kind !== "output") throw new Error("Operator submit returned an invalid control result.");
+    emit(result.output);
+    return;
+  }
+  if (resolved[0] === "task") {
+    const enteringTask =
+      (resolved[1] === "enter")
+      || (resolved[1] === "role" && resolved[2] === "enter");
+    if (enteringTask) {
+      await ensureFileTaskController(home, { environment: process.env });
+      const taskId = resolved[1] === "enter" ? resolved[2] : resolved[3];
+      const task = taskId === undefined ? null : store.getTask(taskId);
+      if (task?.status === "active" && task.repositoryId !== undefined) {
+        await workspacePreparer.prepareTaskWorkspace(task.id);
       }
-
-      const resolveShellArguments = async (
-        commandArgs: string[],
-        shellIo: import("./shell/taskShell.js").TaskShellSelectionIo
-      ): Promise<string[] | null> => {
-        const shellInvocation = routeInvocation(["task", ...commandArgs]);
-        if (shellInvocation.kind !== "execute") {
-          return commandArgs;
-        }
-        const result = await resolveInteractiveArguments(["task", ...commandArgs], shellInvocation.node, store, {
-          interactive: shellIo.interactive,
-          json: jsonOutput,
-          width: shellIo.width,
-          write: shellIo.write,
-          question: shellIo.question
-        }, { preferredRole: process.env.TASKMUX_ROLE?.trim() });
-        return result.kind === "cancelled" ? null : result.args.slice(1);
-      };
-
-      if (discovery === undefined) {
-        await runTaskShell(
-          taskId,
-          store,
-          tmux,
-          async (commandArgs) => runDirectTaskCommand(rootDir, commandArgs, tmux),
-          resolveShellArguments
-        );
-        return;
-      }
-      await runTaskShell(taskId, store, tmux, async (commandArgs) => {
-        if (commandArgs[0] === "enter") {
-          return attachTaskRoleThroughController(commandArgs, store, tmux, discovery);
-        }
-        const result = await callController(
-          discovery,
-          "task.command",
-          randomUUID(),
-          {
-            args: commandArgs,
-            provenance: buildControllerCommandProvenance("task", commandArgs, store, process.env)
-          }
-        ) as { output: string };
-        return result.output;
-      }, resolveShellArguments);
+    }
+    const result = runTaskCommand(resolved.slice(1), store, { runtime, environment: process.env });
+    if (result.kind === "output") {
+      emit(result.output, false, result.data);
       return;
     }
-
-    if (taskArgs[0] === "enter" && discovery !== undefined) {
-      emit(await attachTaskRoleThroughController(taskArgs, store, tmux, discovery));
-      return;
-    }
-
-    if (taskArgs[0] !== "enter" && discovery !== undefined) {
-      const result = await callController(
-        discovery,
-        "task.command",
-        randomUUID(),
-        {
-          args: taskArgs,
-          provenance: buildControllerCommandProvenance("task", taskArgs, store, process.env)
-        }
-      ) as { output: string };
-      if (result.output.length > 0) {
-        emit(result.output);
-      }
-      return;
-    }
-
-    emit(runDirectTaskCommand(rootDir, taskArgs, tmux));
+    if (result.output !== undefined) emit(result.output);
+    tmux.attachRole(result.taskId, result.roleName);
+    return;
+  }
+  if (resolved[0] === "jobs") {
+    emit(runJobCommand(resolved.slice(1), store, { runtime }));
     return;
   }
 
-  throw usageError(`Unknown command: ${args[0]}`);
+  throw usageError(
+    `Command is not connected to the restored FileTaskStore framework yet: ${resolved[0]}.`,
+    renderCommandHelp(invocation.node, VERSION)
+  );
+}
+
+function renderControllerResult(method: "status" | "stop" | "restart", value: unknown): string {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return JSON.stringify(value);
+  }
+  const result = value as Record<string, unknown>;
+  if (method === "status") {
+    if (result.running !== true) return "Controller is not running.";
+    return result.pid === undefined
+      ? "Controller is running."
+      : `Controller is running (PID ${String(result.pid)}).`;
+  }
+  if (method === "restart") {
+    const previousPid = Number.isSafeInteger(result.previousPid) ? String(result.previousPid) : undefined;
+    const pid = Number.isSafeInteger(result.pid) ? String(result.pid) : undefined;
+    if (previousPid !== undefined && pid !== undefined) {
+      return `Controller restarted (PID ${previousPid} -> ${pid}). tmux sessions were not stopped.`;
+    }
+    return pid === undefined
+      ? "Controller restarted. tmux sessions were not stopped."
+      : `Controller started (PID ${pid}). tmux sessions were not stopped.`;
+  }
+  return result.stopped === true
+    ? "Controller stopped."
+    : "Controller was already stopped.";
+}
+
+async function completionCommand(
+  home: string,
+  node: import("./cli/commandCatalog.js").CommandNode
+): Promise<void> {
+  if (args[1] === "candidates") {
+    const separator = args.indexOf("--");
+    const prefix = args[2];
+    if (prefix === undefined || separator !== 3) {
+      throw usageError("Completion candidates usage: taskmux completion candidates <prefix> -- <words...>");
+    }
+    const candidates = await resolveCompletionCandidates({
+      current: prefix,
+      words: args.slice(separator + 1),
+      ports: completionSelectionPorts(home)
+    });
+    process.stdout.write(candidates.length === 0 ? "" : `${candidates.join("\n")}\n`);
+    return;
+  }
+
+  if (jsonOutput) throw usageError("Completion configuration does not support --json.");
+  if (process.stdin.isTTY !== true || process.stdout.isTTY !== true) {
+    throw usageError("Completion configuration requires an interactive terminal.");
+  }
+  const shell = completionShell(args[1]);
+  if (args.length > (shell === undefined ? 1 : 2)) {
+    throw usageError("Completion usage: taskmux completion [bash|zsh|fish]");
+  }
+  requireStorageSchema(home);
+  const store = new FileTaskStore(home);
+  const ioHandle = terminalIo();
+  try {
+    const manager = new FileCompletionManager(store, process.env, resolveCliIdentity(process.env));
+    emit(await runCompletionWizard(
+      manager,
+      ioHandle.io,
+      shell === undefined ? {} : { shell }
+    ));
+  } finally {
+    ioHandle.close();
+  }
+  void node;
+}
+
+function completionShell(value: string | undefined): "bash" | "zsh" | "fish" | undefined {
+  if (value === undefined) return undefined;
+  if (value === "bash" || value === "zsh" || value === "fish") return value;
+  throw usageError("Completion shell must be one of bash, zsh, fish.");
 }
 
 async function resolveTerminalArguments(
@@ -505,364 +342,146 @@ async function resolveTerminalArguments(
   if (!interactive || !allowsInteractiveSelection(commandArgs, jsonOutput)) {
     return [...commandArgs];
   }
-
-  const readline = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+  const handle = terminalIo();
   try {
-    const result = await resolveInteractiveArguments(commandArgs, node, store, {
-      interactive,
+    const ports = selectionPorts(store);
+    // Global Role add owns its Agent choice so the configured default can be
+    // shown explicitly. Other commands first resolve missing positional
+    // targets through the generic selector, then enter the focused Role UI.
+    if (
+      (commandArgs[0] === "role" && commandArgs[1] === "add")
+      || (commandArgs[0] === "task" && commandArgs[1] === "role" && commandArgs[2] === "add")
+    ) {
+      const wizard = await resolveRoleWizardArguments(commandArgs, ports, handle.io);
+      if (wizard.kind === "cancelled") return null;
+      const selected = await resolveInteractiveArguments(wizard.args, node, ports, handle.io);
+      return selected.kind === "cancelled" ? null : selected.args;
+    }
+    const selected = await resolveInteractiveArguments(commandArgs, node, ports, handle.io);
+    if (selected.kind === "cancelled") return null;
+    const wizard = await resolveRoleWizardArguments(selected.args, ports, handle.io);
+    return wizard.kind === "cancelled" ? null : wizard.args;
+  } finally {
+    // The Agent process must be the only reader of stdin after Role enter.
+    handle.close();
+  }
+}
+
+function terminalIo(): Readonly<{ io: SelectionIo; close(): void }> {
+  const readline = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+  return {
+    io: {
+      interactive: true,
       json: jsonOutput,
       width: process.stdout.columns ?? 100,
-      write: (value) => process.stdout.write(value),
+      write: (value) => { process.stdout.write(value); },
       question: async (prompt) => {
         try {
           return await readline.question(prompt);
         } catch (error) {
-          if (
-            error instanceof Error &&
-            (error.name === "AbortError" || "code" in error && error.code === "ERR_USE_AFTER_CLOSE")
-          ) {
-            return undefined;
-          }
+          if (error instanceof Error && (
+            error.name === "AbortError"
+            || ("code" in error && error.code === "ERR_USE_AFTER_CLOSE")
+          )) return undefined;
           throw error;
         }
       }
-    }, { preferredRole: process.env.TASKMUX_ROLE?.trim() });
-    return result.kind === "cancelled" ? null : result.args;
-  } finally {
-    readline.close();
-  }
+    },
+    close: () => { readline.close(); }
+  };
 }
 
-function resolveCliIdentity(env: NodeJS.ProcessEnv): CliIdentity {
-  return env.TASKMUX_CLI_NAME === "taskmux-dev" ? "taskmux-dev" : "taskmux";
+function selectionPorts(store: FileTaskStore): SelectionPorts {
+  return {
+    call: (method, params) => selectionCall(store, method, params)
+  };
 }
 
-async function confirmPhysicalRestore(commandArgs: string[]): Promise<string[]> {
-  if (commandArgs.includes("--force") || commandArgs[0] === undefined ||
-      commandArgs[0].startsWith("--")) {
-    return commandArgs;
-  }
-  if (jsonOutput || (process.stdin.isTTY !== true &&
-      process.env.TASKMUX_MAINTENANCE_INTERACTIVE !== "1")) {
-    throw usageError("Physical restore requires interactive confirmation or --force.");
-  }
-
-  const backupId = commandArgs[0];
-  const readline = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    terminal: process.stdin.isTTY === true
-  });
-  try {
-    const answer = await readline.question(`Type ${backupId} to restore this backup: `);
-    if (answer.trim() !== backupId) {
-      throw usageError("Physical restore confirmation did not match the backup id.");
-    }
-  } finally {
-    readline.close();
-  }
-  return [...commandArgs, "--force"];
-}
-
-async function attachTaskRoleThroughController(
-  commandArgs: string[],
+function selectionCall(
   store: FileTaskStore,
-  tmux: TmuxManager,
-  discovery: Awaited<ReturnType<typeof ensureControllerRunning>>
-): Promise<string> {
-  const [, taskId, roleName] = commandArgs;
-  if (taskId === undefined || roleName === undefined) {
-    return runTaskCommand(commandArgs, store, tmux);
-  }
-  const output = runTaskCommand(commandArgs, store, tmux, { persistAttachStatus: false });
-  await callController(discovery, "task.attach-complete", randomUUID(), { taskId, roleName });
-  return output;
-}
-
-function executeDirectDomainCommand<T>(
-  rootDir: string,
-  label: string,
-  execute: (store: FileTaskStore, workingRoot: string) => T,
-  options: { includeBackups?: boolean } = {}
-): T {
-  return executeDomainTransaction(
-    rootDir,
-    `cli-${label}-${randomUUID()}`,
-    (workingRoot) => execute(new FileTaskStore(workingRoot), workingRoot),
-    () => [],
-    options
-  );
-}
-
-function runDirectTaskCommand(
-  rootDir: string,
-  commandArgs: string[],
-  tmux: TmuxManager
-): string {
-  if (isDirectTaskSnapshotRead(commandArgs)) {
-    return runTaskCommand(commandArgs, new FileTaskStore(rootDir), tmux);
-  }
-  const store = new FileTaskStore(rootDir);
-  const lifecycle = prepareTaskLifecycleCommand(commandArgs, store);
-  if (lifecycle !== null) {
-    return runTaskLifecycleOperation(lifecycle, store, tmux);
-  }
-  if (isTaskRoleRuntimeControlCommand(commandArgs)) {
-    return runTaskCommand(commandArgs, store, tmux);
-  }
-  if (commandArgs[0] === "dispatch") {
-    return runTaskCommand(commandArgs, store, tmux);
-  }
-  if (commandArgs[0] === "enter") {
-    const output = runTaskCommand(
-      commandArgs,
-      store,
-      tmux,
-      { persistAttachStatus: false }
-    );
-    const [taskId, roleName] = commandArgs.slice(1);
-    if (taskId !== undefined && roleName !== undefined) {
-      executeDirectDomainCommand(
-        rootDir,
-        "task-attach-complete",
-        (transactionStore) => recordTaskRoleAttached(taskId, roleName, transactionStore)
-      );
+  method: string,
+  params: Readonly<Record<string, unknown>>
+): unknown {
+  const reader = store as unknown as Record<string, (...args: never[]) => unknown>;
+  switch (method) {
+    case "agent.list": return store.listConfiguredAgents();
+    case "config.get": return store.getConfig();
+    case "role.list": return store.listGlobalRoles();
+    case "role.show": return store.getGlobalRole(String(params.name ?? ""));
+    case "repository.list": return callOptional(reader, "listRepositories");
+    case "task.list": return callOptional(reader, "listTasks");
+    case "task.role.list": return callOptional(reader, "listRoles", [params.taskId]);
+    case "task.role.show": return callOptional(reader, "getRole", [params.taskId, params.roleName]);
+    case "task.work.list": return callOptional(reader, "listWorkItems", [params.taskId]);
+    case "task.input.list": {
+      const taskId = typeof params.taskId === "string" ? params.taskId : undefined;
+      const requests = taskId === undefined
+        ? store.listAllInputRequests()
+        : store.listInputRequests(taskId);
+      return params.all === true ? requests : requests.filter((request) => request.status === "open");
     }
-    return output;
-  }
-  const output = executeDirectDomainCommand(
-    rootDir,
-    "task",
-    (transactionStore) => runTaskCommand(commandArgs, transactionStore, tmux)
-  );
-  runTaskInputPostCommitEffects(rootDir, commandArgs, tmux);
-  return output;
-}
-
-function isDirectConfigSnapshotRead(args: readonly string[]): boolean {
-  return args[0] === "show";
-}
-
-function isDirectAgentSnapshotRead(args: readonly string[]): boolean {
-  return ["list", "show"].includes(args[0] ?? "");
-}
-
-function isDirectGlobalRoleRead(args: readonly string[]): boolean {
-  return ["list", "show", "enter"].includes(args[0] ?? "");
-}
-
-function isCoordinatedGlobalRoleMutation(args: readonly string[]): boolean {
-  return args[0] === "update" || args[0] === "remove";
-}
-
-function isDirectTaskSnapshotRead(args: readonly string[]): boolean {
-  const command = args[0] ?? "";
-  if ([
-    "list", "board", "last", "roles", "comments", "events",
-    "activity", "timeline", "tail", "detail"
-  ].includes(command)) {
-    return true;
-  }
-  if (command === "current") {
-    return args.length === 1;
-  }
-  if (command === "topic" && args[1] === "list") {
-    return true;
-  }
-  if (command === "input" && ["list", "show"].includes(args[1] ?? "")) {
-    return true;
-  }
-  return command === "transcript" && args[1] === "export";
-}
-
-function emit(output: string): void {
-  const normalized = output.trimEnd();
-  console.log(jsonOutput ? JSON.stringify({ ok: true, output: normalized }) : normalized);
-}
-
-function resolveTaskCommandScope(commandArgs: string[], env: NodeJS.ProcessEnv): string[] {
-  const taskId = env.TASKMUX_TASK_ID?.trim();
-  const roleName = env.TASKMUX_ROLE?.trim();
-  if (taskId === undefined || taskId.length === 0 || commandArgs.length === 0) {
-    return commandArgs;
-  }
-
-  const [command, ...rest] = commandArgs;
-  const hasTaskId = (value: string | undefined): boolean => value === taskId || /^task-\d+$/.test(value ?? "");
-  const taskOnlyCommands = new Set([
-    "show", "archive", "unarchive", "open", "context", "delete", "roles", "comments",
-    "events", "activity", "timeline", "refresh", "cleanup", "wake", "shell"
-  ]);
-
-  if (taskOnlyCommands.has(command) && !hasTaskId(rest[0])) {
-    return [command, taskId, ...rest];
-  }
-  if (command === "comment" && !hasTaskId(rest[0])) {
-    return [command, taskId, ...rest];
-  }
-  if (command === "yield") {
-    if (!hasTaskId(rest[0])) {
-      return [command, taskId, ...(roleName === undefined || roleName.length === 0 ? [] : [roleName]), ...rest];
-    }
-    if ((rest[1] === undefined || rest[1].startsWith("--")) && roleName !== undefined && roleName.length > 0) {
-      return [command, rest[0], roleName, ...rest.slice(1)];
-    }
-  }
-  if (command === "dispatch" && !hasTaskId(rest[0])) {
-    return [command, taskId, ...rest];
-  }
-  if (command === "transcript" && rest[0] === "export") {
-    if (!hasTaskId(rest[1])) {
-      const transcriptArgs = rest.slice(1);
-      const hasExplicitRole = transcriptArgs[0] !== undefined && !transcriptArgs[0].startsWith("--");
-      return [
-        command,
-        "export",
-        taskId,
-        ...(hasExplicitRole || roleName === undefined || roleName.length === 0 ? [] : [roleName]),
-        ...transcriptArgs
-      ];
-    }
-    return commandArgs;
-  }
-  if (["detail", "tail", "status", "transcript"].includes(command) && !hasTaskId(rest[0])) {
-    return [
-      command,
-      taskId,
-      ...(rest.length > 0
-        ? rest
-        : roleName === undefined || roleName.length === 0 ? [] : [roleName])
-    ];
-  }
-  if (command === "session" && !hasTaskId(rest[1])) {
-    return [
-      command,
-      rest[0] ?? "",
-      taskId,
-      ...(roleName === undefined || roleName.length === 0 ? [] : [roleName]),
-      ...rest.slice(1)
-    ];
-  }
-
-  if (command === "input" && ["show", "answer"].includes(rest[0] ?? "")) {
-    if (!rest.includes("--task")) {
-      return [command, ...rest, "--task", taskId];
-    }
-    return commandArgs;
-  }
-
-  const nestedTaskCommands = new Set([
-    "role", "topic", "input", "cycle", "work-item", "schedule", "brief",
-    "milestone", "decision", "worktree"
-  ]);
-  if (nestedTaskCommands.has(command) && !hasTaskId(rest[1])) {
-    return [command, rest[0] ?? "", taskId, ...rest.slice(1)];
-  }
-
-  return commandArgs;
-}
-
-async function printControllerCommand(
-  rootDir: string,
-  group: string,
-  commandArgs: string[],
-  existingDiscovery?: Awaited<ReturnType<typeof ensureControllerRunning>>
-): Promise<void> {
-  const discovery = existingDiscovery ?? await ensureControllerRunning(rootDir, process.env);
-  const provenance = buildControllerCommandProvenance(
-    group,
-    commandArgs,
-    new FileTaskStore(rootDir),
-    process.env
-  );
-  const result = await callController(
-    discovery,
-    "command.execute",
-    randomUUID(),
-    {
-      group,
-      args: commandArgs,
-      ...(provenance === undefined ? {} : { provenance })
-    }
-  ) as { output: string };
-  if (result.output.length > 0) {
-    emit(result.output);
+    case "task.run.list": return callOptional(reader, "listAgentRuns", [params.workItemId]);
+    case "task.decision.list": return callOptional(reader, "listDecisions", [params.taskId]);
+    case "task.milestone.list": return callOptional(reader, "listMilestones", [params.taskId]);
+    case "task.event.list": return callOptional(reader, "listEvents", [params.taskId]);
+    case "jobs.list": return callOptional(reader, "listJobs");
+    default: return [];
   }
 }
 
-function operatorLaunchEnvironment(
-  roleEnvironment: Record<string, string>,
-  preparedEnvironment: NodeJS.ProcessEnv
-): Record<string, string> {
-  const result = { ...roleEnvironment };
-  for (const key of [
-    "TASKMUX_HOME",
-    "TASKMUX_ROLE",
-    "TASKMUX_WORKSPACE",
-    "TASKMUX_OPERATOR_CONTEXT"
-  ]) {
-    const value = preparedEnvironment[key];
-    if (value !== undefined) {
-      result[key] = value;
-    }
-  }
-  return result;
+function callOptional(
+  reader: Record<string, (...args: never[]) => unknown>,
+  method: string,
+  args: unknown[] = []
+): unknown {
+  const operation = reader[method];
+  return operation === undefined ? [] : Reflect.apply(operation, reader, args);
 }
 
-async function runDefaultDashboard(rootDir: string): Promise<void> {
-  const commandExecutor = new NodeCommandExecutor();
-  const storageSchema = inspectStorageSchema(rootDir);
-  const checks = getDoctorChecks(process.env, commandExecutor, storageSchema);
-  const failedChecks = checks.filter((check) => check.status !== "ok");
+function readableStore(home: string): FileTaskStore {
+  requireStorageSchema(home);
+  return new FileTaskStore(home);
+}
 
-  process.stdout.write(renderDoctor(checks));
-
-  if (failedChecks.length > 0) {
-    throw dataError(`Doctor checks failed: ${failedChecks.map((check) => `${check.name}=${check.status}`).join(", ")}`);
+function completionSelectionPorts(home: string): SelectionPorts {
+  if (inspectStorageSchema(home).status === "uninitialized") {
+    return { call: () => [] };
   }
+  return selectionPorts(readableStore(home));
+}
 
-  requireStorageSchema(rootDir);
-  const store = new FileTaskStore(rootDir);
-  const tmux = new TmuxManager(process.env.TASKMUX_TMUX_BIN ?? "tmux", commandExecutor, rootDir);
-
-  if (process.env.TASKMUX_CONTROLLER_MODE === "direct") {
-    await runDashboard(
-      store,
-      tmux,
-      async (commandArgs) => runDirectTaskCommand(rootDir, commandArgs, tmux)
-    );
-    return;
-  }
-  const discovery = await ensureControllerRunning(rootDir, process.env);
-  await runDashboard(store, tmux, async (commandArgs) => {
-    if (commandArgs[0] === "enter") {
-      return attachTaskRoleThroughController(commandArgs, store, tmux, discovery);
-    }
-    const result = await callController(
-      discovery,
-      "task.command",
-      randomUUID(),
-      {
-        args: commandArgs,
-        provenance: buildControllerCommandProvenance("task", commandArgs, store, process.env)
-      }
-    ) as { output: string };
-    return result.output;
-  });
+function emit(output: string, literal = false, data?: unknown): void {
+  const normalized = literal ? output.trimEnd() : output.trimEnd();
+  process.stdout.write(`${jsonOutput
+    ? JSON.stringify(data === undefined
+        ? { ok: true, output: normalized }
+        : { ok: true, data })
+    : normalized}\n`);
 }
 
 function readPackageVersion(): string {
   try {
-    const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+    const value = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
       version?: unknown;
     };
-
-    if (typeof packageJson.version === "string" && packageJson.version.length > 0) {
-      return packageJson.version;
-    }
+    if (typeof value.version === "string" && value.version.length > 0) return value.version;
   } catch {
-    // Keep the CLI usable even if package metadata is unavailable.
+    // Keep help/version available if package metadata is damaged.
   }
-
   return "0.0.0";
 }
+
+export function cliIdentity(env: NodeJS.ProcessEnv): CliIdentity {
+  return env.TASKMUX_CLI_NAME === "taskmux-dev" ? "taskmux-dev" : "taskmux";
+}
+
+function normalizeAliases(input: readonly string[]): string[] {
+  const normalized = [...input];
+  if (normalized.length === 1 && (normalized[0] === "-v" || normalized[0] === "--version")) {
+    return ["version"];
+  }
+  const help = normalized.findIndex((argument) => argument === "-h" || argument === "--help");
+  return help === normalized.length - 1 ? ["help", ...normalized.slice(0, help)] : normalized;
+}
+
+export { renderCompletion };

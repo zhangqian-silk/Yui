@@ -18,11 +18,17 @@ export function recordLeaderFailure(
   const timestamp = now.toISOString();
   return {
     schemaVersion: 1,
-    taskId,
-    nativeSessionId,
-    message,
+    taskId: requiredText(taskId, "Task id"),
+    nativeSessionId: requiredText(nativeSessionId, "Native session id"),
+    message: requiredText(message, "Leader failure message"),
     attemptCount: (existing?.attemptCount ?? 0) + 1,
     firstFailedAt: existing?.firstFailedAt ?? timestamp,
     lastFailedAt: timestamp
   };
+}
+
+function requiredText(value: string, label: string): string {
+  const normalized = value.trim();
+  if (normalized.length === 0) throw new Error(`${label} is required.`);
+  return normalized;
 }

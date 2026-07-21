@@ -1,4 +1,5 @@
-import { spawnSync, type SpawnSyncReturns, type SpawnSyncOptions } from "node:child_process";
+import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
+
 import { runtimeError } from "../errors/cliError.js";
 
 export type UpdateSpawner = (
@@ -7,6 +8,11 @@ export type UpdateSpawner = (
   options: SpawnSyncOptions
 ) => SpawnSyncReturns<Buffer>;
 
+/**
+ * Update the published global package. This intentionally remains an exact,
+ * shell-free npm invocation. In particular, taskmux-dev updates the published
+ * TaskMux installation; it never rewrites the current checkout.
+ */
 export function runUpdateCommand(spawn: UpdateSpawner = spawnSync): number {
   const result = spawn(
     "npm",
@@ -23,7 +29,9 @@ export function runUpdateCommand(spawn: UpdateSpawner = spawnSync): number {
     throw runtimeError(`Failed to start npm: ${result.error.message}`);
   }
   if (result.status === null) {
-    throw runtimeError(`npm update terminated${result.signal === null ? "" : ` by ${result.signal}`}.`);
+    throw runtimeError(
+      `npm update terminated${result.signal === null ? "" : ` by ${result.signal}`}.`
+    );
   }
   return result.status;
 }

@@ -1,474 +1,231 @@
 import type { TableColumn } from "../output/table.js";
-import { presentAgentDefinition } from "../output/roleAgentPresentation.js";
-import { configuredAgentToDefinition } from "../agent/agent.js";
-import { listGlobalInputRequests, resolveGlobalInputRequest } from "../input/globalInputQuery.js";
-import { isSystemRoleName, SYSTEM_ROLE_NAMES, systemRoleDescription } from "../role/systemRoles.js";
-import type { TaskReader, TaskStore } from "../storage/taskStore.js";
-import { BUILTIN_TOPICS } from "../topic/topic.js";
 import type { ArgumentSelector } from "./interactionPolicy.js";
+import { orderRoleOptions } from "./roleOptionCatalog.js";
+import type { SelectionPorts } from "./selectionPorts.js";
 
-export type SelectionCandidate = {
+export type SelectionCandidate = Readonly<{
   value: string;
-  cells: string[];
-};
+  cells: readonly string[];
+}>;
 
-export type CandidateSet = {
+export type CandidateSet = Readonly<{
   entityLabel: string;
   title: string;
-  columns: TableColumn[];
-  candidates: SelectionCandidate[];
+  columns: readonly TableColumn[];
+  candidates: readonly SelectionCandidate[];
   defaultValue?: string;
   emptyMessage: string;
   overflowHint: string;
-};
+}>;
 
-export type CandidateContext = {
-  preferredTask?: string;
-  preferredRole?: string;
-};
+type Entity = Readonly<Record<string, unknown>>;
 
-export function getSelectionCandidates(
+export async function getSelectionCandidates(
   selector: ArgumentSelector,
-  store: TaskStore,
-  args: readonly string[],
-  context: CandidateContext = {}
-): CandidateSet | null {
-  return store.runReadSnapshot((snapshot) =>
-    getSelectionCandidatesSnapshot(selector, snapshot, args, context));
-}
-
-function getSelectionCandidatesSnapshot(
-  selector: ArgumentSelector,
-  store: TaskReader,
-  args: readonly string[],
-  context: CandidateContext = {}
-): CandidateSet | null {
+  ports: SelectionPorts,
+  args: readonly string[]
+): Promise<CandidateSet | null> {
   switch (selector.provider) {
+    case "tasks":
+      return entities(
+        "task",
+        "Select task",
+        (await list(ports, "task.list", {})).filter((task) =>
+          selector.statuses === undefined
+          || selector.statuses.includes(stringField(task, "status") ?? "")
+        ),
+        ["id", "title", "status"]
+      );
+    case "repositories":
+      return entities(
+        "repository",
+        "Select repository",
+        await list(ports, "repository.list", {}),
+        ["id", "name", "path"]
+      );
     case "configured-agents": {
-      const config = store.getConfig();
-      const agents = store.listConfiguredAgents().sort((left, right) => left.id.localeCompare(right.id));
-      return {
-        entityLabel: "agent",
-        title: "Select agent",
-        columns: [
-          { header: "Agent", minWidth: 5, maxWidth: 24 },
-          { header: "Command", minWidth: 7, maxWidth: 16 },
-          { header: "Default", minWidth: 7, maxWidth: 7 }
-        ],
-        candidates: agents.map((agent) => {
-          const definition = presentAgentDefinition(configuredAgentToDefinition(agent));
-          return {
-            value: definition.id,
-            cells: [
-              definition.id,
-              definition.executable,
-              definition.id === config.defaultAgent ? "yes" : ""
-            ]
-          };
-        }),
-        defaultValue: config.defaultAgent,
-        emptyMessage: "No agents are configured. Run `taskmux agent add <agent-id> --command <command>`.",
-        overflowHint: "Run `taskmux agent list` and pass the selected agent explicitly."
-      };
-    }
-    case "global-roles-for-show": {
-      const configured = new Map(store.listGlobalRoles().map((role) => [role.name, role]));
-      const names = new Set([...SYSTEM_ROLE_NAMES, ...configured.keys()]);
-      return globalRoleCandidateSet(
-        [...names].sort((left, right) => left.localeCompare(right)).map((name) => {
-          const role = configured.get(name);
-          return {
-            value: name,
-            cells: [
-              name,
-              role?.activeAgentId ?? "?",
-              isSystemRoleName(name)
-                ? `system:${systemRoleDescription(name)}${role === undefined ? " (not configured)" : ""}`
-                : "custom"
-            ]
-          };
-        }),
-        context.preferredRole,
-        "No global roles are available."
-      );
-    }
-    case "removable-global-roles": {
-      const roles = store.listGlobalRoles()
-        .filter((role) => !isSystemRoleName(role.name))
-        .sort((left, right) => left.name.localeCompare(right.name));
-      return globalRoleCandidateSet(
-        roles.map((role) => ({
-          value: role.name,
-          cells: [role.name, role.activeAgentId, "custom"]
+      const agents = await list(ports, "agent.list", {});
+      const config = await optionalEntity(ports, "config.get", {});
+      const defaultValue = config === undefined
+        ? undefined
+        : stringField(config, "defaultAgent");
+      const set = entities(
+        "agent",
+        "Select Agent",
+        agents.map((agent) => ({
+          ...agent,
+          default: stringField(agent, "id") === defaultValue ? "default" : ""
         })),
-        context.preferredRole,
-        "No removable global roles are configured. Run `taskmux role add <role> --agent <agent-id>`."
+        ["id", "adapterId", "command", "default"]
       );
+      return { ...set, defaultValue };
     }
-    case "configured-global-roles": {
-      const roles = store.listGlobalRoles().sort((left, right) => left.name.localeCompare(right.name));
-      return globalRoleCandidateSet(
-        roles.map((role) => ({
-          value: role.name,
-          cells: [
-            role.name,
-            role.activeAgentId,
-            isSystemRoleName(role.name) ? `system:${systemRoleDescription(role.name)}` : "custom"
-          ]
-        })),
-        context.preferredRole,
-        "No configured global roles are available. Run `taskmux role add <role> --agent <agent-id>`."
+    case "global-roles":
+      return entities(
+        "global role",
+        "Select global Role",
+        await list(ports, "role.list", {}),
+        ["name", "activeAgentId", "workspace"]
       );
-    }
-    case "tasks": {
-      const config = store.getConfig();
-      const tasks = store.listTasks();
-      return {
-        entityLabel: "task",
-        title: "Select task",
-        columns: [
-          { header: "Task", minWidth: 6, maxWidth: 16 },
-          { header: "Title", minWidth: 8, maxWidth: 48 },
-          { header: "State", minWidth: 6, maxWidth: 8 },
-          { header: "Current", minWidth: 7, maxWidth: 7 },
-          { header: "Last", minWidth: 4, maxWidth: 4 }
-        ],
-        candidates: tasks.map((task) => ({
-          value: task.id,
-          cells: [
-            task.id,
-            task.title,
-            task.archived ? "archived" : "active",
-            task.id === config.currentTaskId ? "yes" : "",
-            task.id === config.lastTaskId ? "yes" : ""
-          ]
-        })),
-        defaultValue: config.currentTaskId,
-        emptyMessage: "No tasks are available. Run `taskmux task create <title>`.",
-        overflowHint: "Run `taskmux task list --search <text>` and pass the selected task explicitly."
-      };
-    }
-    case "unarchived-tasks":
-      return taskCandidateSet(store, store.listTasks().filter((task) => !task.archived), context, "No active tasks are available.");
-    case "archived-tasks":
-      return taskCandidateSet(store, store.listTasks().filter((task) => task.archived), context, "No archived tasks are available.");
-    case "tasks-with-input-drafts":
-      return taskCandidateSet(
-        store,
-        store.listTasks().filter((task) => store.getTaskInputDraft(task.id) !== null),
-        context,
-        "No tasks have drafted input."
+    case "jobs":
+      return entities(
+        "job",
+        "Select job",
+        await list(ports, "jobs.list", {}),
+        ["id", "type", "status"]
       );
-    case "input-requests":
-      return inputRequestCandidateSet(
-        listGlobalInputRequests(store, { includeTerminal: true }),
-        "Select input request",
-        "No input requests are available."
+    case "input-requests": {
+      const taskId = dependencyValue(selector, args);
+      return entities(
+        "input request",
+        taskId === undefined ? "Select input request" : `Select input request: ${taskId}`,
+        (await list(ports, "task.input.list", {
+          ...(taskId === undefined ? {} : { taskId }),
+          all: true
+        })).filter((request) => selector.statuses === undefined
+          || selector.statuses.includes(stringField(request, "status") ?? "")),
+        ["id", "taskId", "status", "question"]
       );
-    case "open-input-requests":
-      return inputRequestCandidateSet(
-        listGlobalInputRequests(store),
-        "Select open input request",
-        "No open input requests are available."
-      );
-    case "task-open-input-requests": {
-      const taskId = dependentTaskId(selector, args, store);
-      if (taskId === null) {
-        return null;
-      }
-      return inputRequestCandidateSet(
-        listGlobalInputRequests(store).filter((request) => request.taskId === taskId),
-        `Select open input request: ${taskId}`,
-        `Task ${taskId} has no open input requests.`
-      );
-    }
-    case "input-answer-choices": {
-      const requestId = args[3];
-      if (requestId === undefined || requestId.startsWith("--")) {
-        return null;
-      }
-      const taskId = readOptionValue(args, "--task");
-      let request: ReturnType<typeof resolveGlobalInputRequest>;
-      try {
-        request = resolveGlobalInputRequest(store, requestId, taskId);
-      } catch {
-        return null;
-      }
-      if (request.status !== "open" || request.choices.length === 0) {
-        return null;
-      }
-      return {
-        entityLabel: "input answer",
-        title: `Select answer: ${request.taskId}/${request.id}`,
-        columns: [
-          { header: "Choice", minWidth: 6, maxWidth: 24 },
-          { header: "Label", minWidth: 8, maxWidth: 48 },
-          { header: "Description", minWidth: 8, maxWidth: 64 }
-        ],
-        candidates: request.choices.map((choice) => ({
-          value: choice.key,
-          cells: [choice.key, choice.label, choice.description ?? ""]
-        })),
-        emptyMessage: `Input request ${request.id} has no selectable choices.`,
-        overflowHint: `Pass --text for free-text input requests.`
-      };
-    }
-    case "trashed-tasks": {
-      const ids = store.listTrashedTaskIds();
-      return {
-        entityLabel: "trashed task",
-        title: "Select trashed task",
-        columns: [{ header: "Task", minWidth: 6, maxWidth: 24 }],
-        candidates: ids.map((id) => ({ value: id, cells: [id] })),
-        emptyMessage: "No restorable tasks are in trash.",
-        overflowHint: "Run `taskmux prune --trash` only if the trash is no longer needed."
-      };
     }
     case "task-roles": {
-      const taskId = selector.dependsOn === undefined ? undefined : args[selector.dependsOn];
-      if (taskId === undefined) {
-        return null;
-      }
-      if (store.getTask(taskId) === null) {
-        return null;
-      }
-      const roles = store.listRoles(taskId);
-      return {
-        entityLabel: "task role",
-        title: `Select task role: ${taskId}`,
-        columns: [
-          { header: "Role", minWidth: 4, maxWidth: 24 },
-          { header: "Agent", minWidth: 5, maxWidth: 20 },
-          { header: "Status", minWidth: 6, maxWidth: 12 }
-        ],
-        candidates: roles.map((role) => ({
-          value: role.name,
-          cells: [role.name, role.activeAgentId, role.status]
-        })),
-        defaultValue: context.preferredRole,
-        emptyMessage: `Task ${taskId} has no roles. Run \`taskmux task roles ${taskId}\`.`,
-        overflowHint: `Run \`taskmux task roles ${taskId}\` and pass the selected role explicitly.`
-      };
+      const taskId = dependencyValue(selector, args);
+      if (taskId === undefined) return null;
+      const roles = orderRoleOptions(await list(ports, "task.role.list", { taskId }));
+      return entities("task role", `Select Task role: ${taskId}`, roles, ["name", "kind", "agentId"]);
     }
-    case "task-roles-with-transcripts":
-      return taskRoleCandidateSet(selector, store, args, context, (taskId, roleName) =>
-        store.readTranscript(taskId, roleName) !== null, "No task roles have a stored transcript.");
-    case "task-roles-with-active-runs":
-      return taskRoleCandidateSet(selector, store, args, context, (taskId, roleName) =>
-        store.getActiveAgentRun(taskId, roleName) !== null, "No task roles have an active AgentRun.");
-    case "task-roles-without-active-runs":
-      return taskRoleCandidateSet(selector, store, args, context, (taskId, roleName) =>
-        store.getActiveAgentRun(taskId, roleName) === null, "Every task role already has an active AgentRun.");
-    case "removable-task-roles":
-      return taskRoleCandidateSet(selector, store, args, context, (_taskId, roleName) =>
-        roleName !== "leader", "No removable task roles are available.");
-    case "worktree-task-roles":
-      return taskRoleCandidateSet(selector, store, args, context, (taskId, roleName) =>
-        roleName !== "leader" && store.getRoleWorktree(taskId, roleName) === null,
-      "No task roles are eligible for a new worktree.");
-    case "managed-worktree-task-roles":
-      return taskRoleCandidateSet(selector, store, args, context, (taskId, roleName) =>
-        roleName !== "leader" && store.getRoleWorktree(taskId, roleName) !== null,
-      "No managed task role worktrees are available.");
-    case "task-topics": {
-      const taskId = dependentTaskId(selector, args, store);
-      if (taskId === null) {
-        return null;
-      }
-      const topics = [...BUILTIN_TOPICS, ...store.getTaskTopics(taskId).customTopics];
-      return {
-        entityLabel: "topic",
-        title: `Select topic: ${taskId}`,
-        columns: [
-          { header: "Topic", minWidth: 5, maxWidth: 24 },
-          { header: "Name", minWidth: 4, maxWidth: 28 },
-          { header: "Description", minWidth: 11, maxWidth: 48 }
-        ],
-        candidates: topics.map((topic) => ({ value: topic.id, cells: [topic.id, topic.name, topic.description] })),
-        emptyMessage: `Task ${taskId} has no topics.`,
-        overflowHint: `Run \`taskmux task topic list ${taskId}\`.`
-      };
-    }
-    case "active-cycles": {
-      const taskId = dependentTaskId(selector, args, store);
-      if (taskId === null) {
-        return null;
-      }
-      const cycles = store.listCycles(taskId).filter((cycle) => cycle.status === "active");
-      return {
-        entityLabel: "cycle",
-        title: `Select active cycle: ${taskId}`,
-        columns: [
-          { header: "Cycle", minWidth: 5, maxWidth: 20 },
-          { header: "Cause", minWidth: 5, maxWidth: 20 },
-          { header: "Summary", minWidth: 7, maxWidth: 56 }
-        ],
-        candidates: cycles.map((cycle) => ({ value: cycle.id, cells: [cycle.id, cycle.cause, cycle.summary] })),
-        emptyMessage: `Task ${taskId} has no active cycles.`,
-        overflowHint: `Create one with \`taskmux task cycle create ${taskId} ...\`.`
-      };
-    }
-    case "open-work-items":
-    case "work-items":
-    case "dispatch-work-items": {
-      const taskId = dependentTaskId(selector, args, store);
-      if (taskId === null) {
-        return null;
-      }
-      const roleName = selector.provider === "dispatch-work-items" ? args[3] : undefined;
-      if (selector.provider === "dispatch-work-items" && (roleName === undefined || store.getRole(taskId, roleName) === null)) {
-        return null;
-      }
-      const items = store.listWorkItems(taskId).filter((item) =>
-        (selector.provider === "work-items" || ["pending", "running"].includes(item.status))
-        && (roleName === undefined || item.assignee === roleName)
+    case "task-decisions": {
+      const taskId = dependencyValue(selector, args);
+      if (taskId === undefined) return null;
+      const decisions = (await list(ports, "task.decision.list", { taskId })).filter((decision) =>
+        selector.statuses === undefined
+        || selector.statuses.includes(stringField(decision, "status") ?? "")
       );
-      return {
-        entityLabel: "work item",
-        title: `Select work item: ${taskId}`,
-        columns: [
-          { header: "Work item", minWidth: 9, maxWidth: 20 },
-          { header: "Title", minWidth: 5, maxWidth: 48 },
-          { header: "Assignee", minWidth: 8, maxWidth: 24 },
-          { header: "Status", minWidth: 6, maxWidth: 10 }
-        ],
-        candidates: items.map((item) => ({ value: item.id, cells: [item.id, item.title, item.assignee, item.status] })),
-        emptyMessage: `Task ${taskId} has no open work items.`,
-        overflowHint: `Create one with \`taskmux task work-item create ${taskId} ...\`.`
-      };
+      return entities("decision", `Select Decision: ${taskId}`, decisions, ["id", "status", "title"]);
     }
-    case "active-decisions": {
-      const taskId = dependentTaskId(selector, args, store);
-      if (taskId === null) {
-        return null;
-      }
-      const decisions = store.listDecisions(taskId).filter((decision) => decision.status === "active");
-      return {
-        entityLabel: "decision",
-        title: `Select active decision: ${taskId}`,
-        columns: [
-          { header: "Decision", minWidth: 8, maxWidth: 20 },
-          { header: "Title", minWidth: 5, maxWidth: 48 }
-        ],
-        candidates: decisions.map((decision) => ({ value: decision.id, cells: [decision.id, decision.title] })),
-        emptyMessage: `Task ${taskId} has no active decisions.`,
-        overflowHint: `Record one with \`taskmux task decision record ${taskId} ...\`.`
-      };
+    case "task-milestones": {
+      const taskId = dependencyValue(selector, args);
+      if (taskId === undefined) return null;
+      return entities(
+        "milestone",
+        `Select Milestone: ${taskId}`,
+        await list(ports, "task.milestone.list", { taskId }),
+        ["id", "title", "createdAt"]
+      );
     }
+    case "task-events": {
+      const taskId = dependencyValue(selector, args);
+      if (taskId === undefined) return null;
+      return entities(
+        "event",
+        `Select Event: ${taskId}`,
+        await list(ports, "task.event.list", { taskId }),
+        ["id", "type", "createdAt"]
+      );
+    }
+    case "work-items":
+      return entities(
+        "work item",
+        "Select work item",
+        await listAllWorkItems(ports),
+        ["id", "title", "status"]
+      );
+    case "runs":
+      return entities(
+        "run",
+        "Select run",
+        await listAllRuns(ports),
+        ["id", "status", "workItemId"]
+      );
   }
 }
 
-function taskCandidateSet(
-  store: TaskReader,
-  tasks: ReturnType<TaskStore["listTasks"]>,
-  context: CandidateContext,
-  emptyMessage: string
-): CandidateSet {
-  const config = store.getConfig();
-  return {
-    entityLabel: "task",
-    title: "Select task",
-    columns: [
-      { header: "Task", minWidth: 6, maxWidth: 16 },
-      { header: "Title", minWidth: 8, maxWidth: 48 },
-      { header: "State", minWidth: 6, maxWidth: 8 },
-      { header: "Current", minWidth: 7, maxWidth: 7 },
-      { header: "Last", minWidth: 4, maxWidth: 4 }
-    ],
-    candidates: tasks.map((task) => ({
-      value: task.id,
-      cells: [
-        task.id,
-        task.title,
-        task.archived ? "archived" : "active",
-        task.id === config.currentTaskId ? "yes" : "",
-        task.id === config.lastTaskId ? "yes" : ""
-      ]
-    })),
-    defaultValue: context.preferredTask ?? config.currentTaskId,
-    emptyMessage,
-    overflowHint: "Run `taskmux task list` and pass the selected task explicitly."
-  };
+async function listAllWorkItems(ports: SelectionPorts): Promise<Entity[]> {
+  const tasks = await list(ports, "task.list", {});
+  const groups = await Promise.all(tasks.flatMap((task) => {
+    const taskId = stringField(task, "id");
+    return taskId === undefined ? [] : [list(ports, "task.work.list", { taskId })];
+  }));
+  return groups.flat();
 }
 
-function inputRequestCandidateSet(
-  requests: ReturnType<typeof listGlobalInputRequests>,
-  title: string,
-  emptyMessage: string
-): CandidateSet {
-  return {
-    entityLabel: "input request",
-    title,
-    columns: [
-      { header: "Task", minWidth: 6, maxWidth: 16 },
-      { header: "Request", minWidth: 8, maxWidth: 42 },
-      { header: "Status", minWidth: 7, maxWidth: 16 },
-      { header: "Question", minWidth: 12, maxWidth: 64 }
-    ],
-    candidates: requests.map((request) => ({
-      value: request.id,
-      cells: [request.taskId, request.id, request.status, request.question]
-    })),
-    emptyMessage,
-    overflowHint: "Run `taskmux task input list --all` and pass the request id explicitly."
-  };
+async function listAllRuns(ports: SelectionPorts): Promise<Entity[]> {
+  const workItems = await listAllWorkItems(ports);
+  const groups = await Promise.all(workItems.flatMap((item) => {
+    const workItemId = stringField(item, "id");
+    return workItemId === undefined ? [] : [list(ports, "task.run.list", { workItemId })];
+  }));
+  return groups.flat();
 }
 
-function readOptionValue(args: readonly string[], option: string): string | undefined {
-  const index = args.indexOf(option);
-  const value = index === -1 ? undefined : args[index + 1];
+async function list(
+  ports: SelectionPorts,
+  method: string,
+  params: Readonly<Record<string, unknown>>
+): Promise<Entity[]> {
+  const value = await ports.call(method, params);
+  return Array.isArray(value)
+    ? value.filter((entry): entry is Entity => typeof entry === "object" && entry !== null && !Array.isArray(entry))
+    : [];
+}
+
+async function optionalEntity(
+  ports: SelectionPorts,
+  method: string,
+  params: Readonly<Record<string, unknown>>
+): Promise<Entity | undefined> {
+  try {
+    const value = await ports.call(method, params);
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+      ? value as Entity
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function dependencyValue(selector: ArgumentSelector, args: readonly string[]): string | undefined {
+  if (selector.dependsOn === undefined) return undefined;
+  const value = args[selector.dependsOn];
   return value === undefined || value.startsWith("--") ? undefined : value;
 }
 
-function dependentTaskId(selector: ArgumentSelector, args: readonly string[], store: TaskReader): string | null {
-  const taskId = selector.dependsOn === undefined ? undefined : args[selector.dependsOn];
-  return taskId !== undefined && store.getTask(taskId) !== null ? taskId : null;
-}
-
-function taskRoleCandidateSet(
-  selector: ArgumentSelector,
-  store: TaskReader,
-  args: readonly string[],
-  context: CandidateContext,
-  include: (taskId: string, roleName: string) => boolean,
-  emptyMessage: string
-): CandidateSet | null {
-  const taskId = dependentTaskId(selector, args, store);
-  if (taskId === null) {
-    return null;
-  }
-  const roles = store.listRoles(taskId).filter((role) => include(taskId, role.name));
-  return {
-    entityLabel: "task role",
-    title: `Select task role: ${taskId}`,
-    columns: [
-      { header: "Role", minWidth: 4, maxWidth: 24 },
-      { header: "Agent", minWidth: 5, maxWidth: 20 },
-      { header: "Status", minWidth: 6, maxWidth: 12 }
-    ],
-    candidates: roles.map((role) => ({ value: role.name, cells: [role.name, role.activeAgentId, role.status] })),
-    defaultValue: context.preferredRole,
-    emptyMessage,
-    overflowHint: `Run \`taskmux task roles ${taskId}\`.`
-  };
-}
-
-function globalRoleCandidateSet(
-  candidates: SelectionCandidate[],
-  defaultValue: string | undefined,
-  emptyMessage: string
+function entities(
+  label: string,
+  title: string,
+  input: readonly Entity[],
+  fields: readonly string[]
 ): CandidateSet {
+  const valueField = fields[0] ?? "id";
+  const candidates = input.flatMap((entity): SelectionCandidate[] => {
+    const value = stringField(entity, valueField) ?? stringField(entity, "id");
+    if (value === undefined) return [];
+    return [{ value, cells: fields.map((field) => displayField(entity[field])) }];
+  });
   return {
-    entityLabel: "global role",
-    title: "Select global role",
-    columns: [
-      { header: "Role", minWidth: 4, maxWidth: 24 },
-      { header: "Agent", minWidth: 5, maxWidth: 20 },
-      { header: "Kind", minWidth: 6, maxWidth: 46 }
-    ],
+    entityLabel: label,
+    title,
+    columns: fields.map((field) => ({
+      header: heading(field),
+      minWidth: Math.min(12, Math.max(3, field.length)),
+      maxWidth: field === "title" || field === "path" ? 48 : 24
+    })),
     candidates,
-    defaultValue,
-    emptyMessage,
-    overflowHint: "Run `taskmux role list` and pass the selected role explicitly."
+    emptyMessage: `No ${label}s are available.`,
+    overflowHint: `Pass the ${label} explicitly.`
   };
+}
+
+function stringField(entity: Entity, name: string): string | undefined {
+  const value = entity[name];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function displayField(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return "";
+}
+
+function heading(field: string): string {
+  return `${field[0]?.toUpperCase() ?? ""}${field.slice(1).replaceAll(/([A-Z])/g, " $1")}`;
 }

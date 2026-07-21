@@ -37,10 +37,6 @@ export function roleNotFound(name: string): CliError {
   return new CliError("ROLE_NOT_FOUND", `Role not found: ${name}`);
 }
 
-export function roleConflict(name: string): CliError {
-  return usageError(`Role conflict: ${name}. Refresh and retry.`);
-}
-
 export function agentNotFound(id: string): CliError {
   return new CliError("AGENT_NOT_FOUND", `Agent not found: ${id}`);
 }

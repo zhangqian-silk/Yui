@@ -1,118 +1,62 @@
-import {
-  MAX_INPUT_ANSWER_LENGTH,
-  MAX_INPUT_CHOICE_DESCRIPTION_LENGTH,
-  MAX_INPUT_CHOICE_LABEL_LENGTH,
-  MAX_INPUT_BLOCKED_REFS,
-  MAX_INPUT_CHOICES,
-  MAX_INPUT_QUESTION_LENGTH,
-  MAX_INPUT_REASON_LENGTH,
-  isInputRequesterField,
-  isInputRequestRecord,
-  isInputResolutionRecord
-} from "./inputRecordCodec.js";
-import {
-  isCanonicalNativeSessionId,
-  isCanonicalNativeSessionRoot
-} from "../executor/nativeSessionIdentity.js";
+export type InputChoice = Readonly<{ key: string; label: string }>;
+export type InputBlockedRef = Readonly<{ type: "work-item" | "run"; id: string }>;
 
-export {
-  MAX_INPUT_ANSWER_LENGTH,
-  MAX_INPUT_CHOICE_DESCRIPTION_LENGTH,
-  MAX_INPUT_CHOICE_LABEL_LENGTH,
-  MAX_INPUT_BLOCKED_REFS,
-  MAX_INPUT_CHOICES,
-  MAX_INPUT_QUESTION_LENGTH,
-  MAX_INPUT_REASON_LENGTH
-} from "./inputRecordCodec.js";
-
-export type InputChoice = {
-  key: string;
-  label: string;
-  description?: string;
-};
-
-export type BlockedRef =
-  | { type: "work-item"; id: string }
-  | { type: "decision"; id: string }
-  | { type: "task"; id: string };
-
-export type ResolutionPolicy =
-  | { mode: "user-required" }
-  | {
-      mode: "offline-recommended";
-      recommendation: { choiceKey: string; reason: string };
-      offlineTimeoutMs: number;
-    };
-
-type InputRequesterIdentity = {
+export type InputRequester = Readonly<{
   roleName: "leader";
   agentId: string;
-  adapterId: string;
-  agentRunId: string;
-};
+  runId: string;
+  nativeSessionId?: string;
+}>;
 
-export type InputRequesterWithNativeSession = InputRequesterIdentity & {
-  sessionRoot: string;
-  nativeSessionId: string;
-};
+export type InputAnswer =
+  | Readonly<{ choiceKey: string; text?: never }>
+  | Readonly<{ text: string; choiceKey?: never }>;
 
-export type InputRequesterHistory = InputRequesterIdentity & {
-  sessionRoot?: never;
-  nativeSessionId?: never;
-};
+export type InputRequestPolicy =
+  | Readonly<{ kind: "required" }>
+  | Readonly<{
+      kind: "recommended";
+      recommendedChoiceKey: string;
+      timeoutAt: string;
+    }>;
 
-/**
- * Terminal input history may retain the logical requester identity without
- * retaining the host-native session tuple. Open input always uses the native
- * session form, which is required for blocking and wakeup delivery.
- */
-export type InputRequester = InputRequesterWithNativeSession | InputRequesterHistory;
+export type InputResolution = Readonly<{
+  answer: Readonly<{ choiceKey?: string; text: string }>;
+  answeredBy: "user" | "operator" | "agent-timeout";
+  answeredAt: string;
+}>;
 
-export type InputRequestStatus = "open" | "answered" | "auto-resolved" | "cancelled" | "superseded";
+export type InputCancellation = Readonly<{
+  reason: string;
+  cancelledAt: string;
+}>;
 
-export type InputRequest = {
+type InputRequestBase = Readonly<{
   schemaVersion: 1;
   id: string;
   taskId: string;
   requester: InputRequester;
   question: string;
-  choices: InputChoice[];
-  blockedRefs: BlockedRef[];
-  resolutionPolicy: ResolutionPolicy;
-  status: InputRequestStatus;
-  resolutionId?: string;
-  cancelled?: { reason: string; cancelledAt: string };
-  superseded?: { replacementRequestId: string; reason: string; supersededAt: string };
+  choices: readonly InputChoice[];
+  blockedRefs: readonly InputBlockedRef[];
+  policy: InputRequestPolicy;
   createdAt: string;
   updatedAt: string;
-};
+}>;
 
-export type CreateInputRequest = Pick<
-  InputRequest,
-  "question" | "choices" | "blockedRefs" | "resolutionPolicy"
->;
+export type InputRequest = InputRequestBase & (
+  | Readonly<{ status: "open"; resolution?: never; cancellation?: never }>
+  | Readonly<{ status: "answered"; resolution: InputResolution; cancellation?: never }>
+  | Readonly<{ status: "cancelled"; cancellation: InputCancellation; resolution?: never }>
+);
 
-export type OperatorPresence = "online" | "offline";
-
-export type InputResolution = {
-  schemaVersion: 1;
-  id: string;
-  requestId: string;
-  taskId: string;
-  source: "user" | "offline-recommended";
-  answer: {
-    choiceKey?: string;
-    text: string;
-  };
-  recommendationReason?: string;
-  operatorPresence: OperatorPresence;
-  resolvedAt: string;
-};
-
-export type InputResolutionResult = {
-  request: InputRequest & { requester: InputRequesterWithNativeSession };
-  resolution: InputResolution;
-};
+export type InputRequestStatus = InputRequest["status"];
+export type CreateInputRequest = Readonly<{
+  question: string;
+  choices: readonly InputChoice[];
+  blockedRefs: readonly InputBlockedRef[];
+  policy?: InputRequestPolicy;
+}>;
 
 export class InputRequestStateError extends Error {
   constructor(readonly requestId: string, readonly status: InputRequestStatus) {
@@ -121,429 +65,349 @@ export class InputRequestStateError extends Error {
   }
 }
 
-const CHOICE_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const POINTER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const CHOICE_KEY = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 export function createInputRequest(
   id: string,
   taskId: string,
-  requester: InputRequesterWithNativeSession,
+  requester: InputRequester,
   input: CreateInputRequest,
   now: Date
 ): InputRequest {
-  assertPointerId(id, "Input request id");
-  assertPointerId(taskId, "Task id");
-  const normalizedRequester = normalizeRequester(requester);
-
-  const timestamp = now.toISOString();
-  const question = normalizeText(input.question);
-  if (question.length === 0) {
-    throw new Error("Input request question is required.");
-  }
-  assertTextEncodingAndSize(question, "Input request question", MAX_INPUT_QUESTION_LENGTH);
-
-  if (!isDenseArray(input.choices)) {
-    throw new Error("Input choices must be a dense array.");
-  }
-  if (input.choices.length > MAX_INPUT_CHOICES) {
-    throw new Error(`Too many input choices (maximum ${MAX_INPUT_CHOICES}).`);
-  }
-  const choices = input.choices.map(normalizeChoice);
-  if (new Set(choices.map((choice) => choice.key)).size !== choices.length) {
-    throw new Error("Choice keys must be unique.");
-  }
-
-  if (!isDenseArray(input.blockedRefs)) {
-    throw new Error("Blocked references must be a dense array.");
-  }
-  if (input.blockedRefs.length > MAX_INPUT_BLOCKED_REFS) {
-    throw new Error(`Too many blocked references (maximum ${MAX_INPUT_BLOCKED_REFS}).`);
-  }
-  const blockedRefs = input.blockedRefs.map(normalizeBlockedRef);
-  const resolutionPolicy = normalizeResolutionPolicy(input.resolutionPolicy, choices);
-
-  return {
+  const timestamp = requireDate(now, "Input request creation time");
+  const choices = normalizeChoices(input.choices);
+  return validateInputRequest({
     schemaVersion: 1,
-    id,
-    taskId,
-    requester: normalizedRequester,
-    question,
+    id: requireIdentity(id, "Input request id"),
+    taskId: requireIdentity(taskId, "Input request Task id"),
+    requester: normalizeRequester(requester),
+    question: requireText(input.question, "Input request question"),
     choices,
-    blockedRefs,
-    resolutionPolicy,
+    blockedRefs: normalizeBlockedRefs(input.blockedRefs),
+    policy: normalizePolicy(input.policy, choices, timestamp),
     status: "open",
     createdAt: timestamp,
     updatedAt: timestamp
-  };
+  });
 }
 
 export function answerInputRequest(
   request: InputRequest,
-  resolutionId: string,
-  answer: InputResolution["answer"],
-  operatorPresence: OperatorPresence,
+  answer: InputAnswer,
+  answeredBy: InputResolution["answeredBy"],
   now: Date
-): InputResolutionResult {
-  assertValidInputRequest(request);
+): InputRequest & { status: "answered"; resolution: InputResolution } {
+  validateInputRequest(request);
   assertOpen(request);
-  assertPointerId(resolutionId, "Input resolution id");
-  assertOperatorPresence(operatorPresence);
-
+  if (answeredBy !== "user" && answeredBy !== "operator" && answeredBy !== "agent-timeout") {
+    throw new Error("Input answerer must be user, operator, or agent-timeout.");
+  }
+  const answeredAt = transitionTime(request, now);
   const normalizedAnswer = normalizeAnswer(request, answer);
-  const resolvedAt = transitionTimestamp(request, now);
-  return {
-    request: {
-      ...request,
-      status: "answered",
-      resolutionId,
-      updatedAt: resolvedAt
-    },
+  if (answeredBy === "agent-timeout") {
+    assertAgentTimeoutAnswer(request, normalizedAnswer, answeredAt);
+  }
+  return validateInputRequest({
+    ...request,
+    status: "answered",
     resolution: {
-      schemaVersion: 1,
-      id: resolutionId,
-      requestId: request.id,
-      taskId: request.taskId,
-      source: "user",
       answer: normalizedAnswer,
-      operatorPresence,
-      resolvedAt
-    }
-  };
-}
-
-export function autoResolveInputRequest(
-  request: InputRequest,
-  resolutionId: string,
-  operatorPresence: OperatorPresence,
-  now: Date
-): InputResolutionResult {
-  assertValidInputRequest(request);
-  assertOpen(request);
-  assertPointerId(resolutionId, "Input resolution id");
-  if (operatorPresence !== "offline") {
-    throw new Error("Automatic resolution requires offline Operator presence.");
-  }
-  if (request.resolutionPolicy.mode !== "offline-recommended") {
-    throw new Error(`Input request ${request.id} does not allow automatic resolution.`);
-  }
-
-  const policy = request.resolutionPolicy;
-  const choice = request.choices.find(
-    (candidate) => candidate.key === policy.recommendation.choiceKey
-  );
-  if (choice === undefined) {
-    throw new Error("Recommended choice does not exist.");
-  }
-
-  const resolvedAt = transitionTimestamp(request, now);
-  return {
-    request: {
-      ...request,
-      status: "auto-resolved",
-      resolutionId,
-      updatedAt: resolvedAt
+      answeredBy,
+      answeredAt
     },
-    resolution: {
-      schemaVersion: 1,
-      id: resolutionId,
-      requestId: request.id,
-      taskId: request.taskId,
-      source: "offline-recommended",
-      answer: { choiceKey: choice.key, text: choice.label },
-      recommendationReason: policy.recommendation.reason,
-      operatorPresence: "offline",
-      resolvedAt
-    }
-  };
+    updatedAt: answeredAt
+  }) as InputRequest & { status: "answered"; resolution: InputResolution };
 }
 
 export function cancelInputRequest(request: InputRequest, reason: string, now: Date): InputRequest {
-  assertValidInputRequest(request);
+  validateInputRequest(request);
   assertOpen(request);
-  const normalizedReason = requiredText(reason, "Input request cancellation reason", MAX_INPUT_REASON_LENGTH);
-  const cancelledAt = transitionTimestamp(request, now);
-  return {
+  const cancelledAt = transitionTime(request, now);
+  return validateInputRequest({
     ...request,
     status: "cancelled",
-    cancelled: { reason: normalizedReason, cancelledAt },
+    cancellation: {
+      reason: requireText(reason, "Input cancellation reason"),
+      cancelledAt
+    },
     updatedAt: cancelledAt
+  });
+}
+
+export function validateInputRequest(value: unknown): InputRequest {
+  const request = record(value, "Input request");
+  const terminalField = request.status === "answered"
+    ? ["resolution"]
+    : request.status === "cancelled" ? ["cancellation"] : [];
+  exact(request, [
+    "schemaVersion", "id", "taskId", "requester", "question", "choices",
+    "blockedRefs", "policy", "status", "createdAt", "updatedAt", ...terminalField
+  ], "Input request");
+  if (request.schemaVersion !== 1) throw new Error("Input request must use schemaVersion 1.");
+  const choices = validateChoices(request.choices);
+  const createdAt = requireTimestamp(request.createdAt, "Input request createdAt");
+  const base: InputRequestBase = {
+    schemaVersion: 1,
+    id: requireIdentity(request.id, "Input request id"),
+    taskId: requireIdentity(request.taskId, "Input request Task id"),
+    requester: normalizeRequester(request.requester as InputRequester),
+    question: requireNormalizedText(request.question, "Input request question"),
+    choices,
+    blockedRefs: validateBlockedRefs(request.blockedRefs),
+    policy: normalizePolicy(request.policy as InputRequestPolicy, choices, createdAt),
+    createdAt,
+    updatedAt: requireTimestamp(request.updatedAt, "Input request updatedAt")
   };
-}
-
-export function supersedeInputRequest(
-  request: InputRequest,
-  replacementRequestId: string,
-  reason: string,
-  now: Date
-): InputRequest {
-  assertValidInputRequest(request);
-  assertOpen(request);
-  assertPointerId(replacementRequestId, "Replacement input request id");
-  if (replacementRequestId === request.id) {
-    throw new Error("Replacement input request must be different from the superseded request.");
+  if (Date.parse(base.updatedAt) < Date.parse(base.createdAt)) {
+    throw new Error("Input request updatedAt cannot precede createdAt.");
   }
-
-  const normalizedReason = requiredText(reason, "Input request supersede reason", MAX_INPUT_REASON_LENGTH);
-  const supersededAt = transitionTimestamp(request, now);
-  return {
-    ...request,
-    status: "superseded",
-    superseded: { replacementRequestId, reason: normalizedReason, supersededAt },
-    updatedAt: supersededAt
-  };
-}
-
-function normalizeChoice(choice: InputChoice): InputChoice {
-  if (typeof choice?.key !== "string") {
-    throw new Error("Invalid choice key.");
-  }
-  const key = choice.key.trim();
-  if (!CHOICE_KEY_PATTERN.test(key)) {
-    throw new Error("Invalid choice key.");
-  }
-
-  const label = requiredText(choice.label, "Choice label", MAX_INPUT_CHOICE_LABEL_LENGTH);
-  return {
-    key,
-    label,
-    ...(choice.description === undefined
-      ? {}
-      : {
-          description: requiredText(
-            choice.description,
-            "Choice description",
-            MAX_INPUT_CHOICE_DESCRIPTION_LENGTH
-          )
-        })
-  };
-}
-
-function normalizeBlockedRef(reference: BlockedRef): BlockedRef {
-  if (
-    !["work-item", "decision", "task"].includes(reference.type) ||
-    typeof reference.id !== "string" ||
-    !POINTER_ID_PATTERN.test(reference.id.trim())
-  ) {
-    throw new Error("Invalid blocked reference.");
-  }
-  return { type: reference.type, id: reference.id.trim() };
-}
-
-function normalizeResolutionPolicy(policy: ResolutionPolicy, choices: InputChoice[]): ResolutionPolicy {
-  if (policy.mode === "user-required") {
-    return { mode: "user-required" };
-  }
-
-  if (choices.length === 0) {
-    throw new Error("Offline recommendation requires at least one choice.");
-  }
-  const choiceKey = policy.recommendation.choiceKey.trim();
-  if (!choices.some((choice) => choice.key === choiceKey)) {
-    throw new Error("Recommended choice does not exist.");
-  }
-  const reason = requiredText(policy.recommendation.reason, "Recommendation reason", MAX_INPUT_REASON_LENGTH);
-  if (!Number.isSafeInteger(policy.offlineTimeoutMs) || policy.offlineTimeoutMs <= 0) {
-    throw new Error("Offline timeout must be positive whole milliseconds.");
-  }
-
-  return {
-    mode: "offline-recommended",
-    recommendation: { choiceKey, reason },
-    offlineTimeoutMs: policy.offlineTimeoutMs
-  };
-}
-
-function normalizeAnswer(request: InputRequest, answer: InputResolution["answer"]): InputResolution["answer"] {
-  if (request.choices.length === 0) {
-    if (answer.choiceKey !== undefined) {
-      throw new Error("Free-text input request does not accept a choice key.");
+  if (request.status === "open") return { ...base, status: "open" };
+  if (request.status === "answered") {
+    const resolution = record(request.resolution, "Input resolution");
+    exact(resolution, ["answer", "answeredBy", "answeredAt"], "Input resolution");
+    const answer = validatePersistedAnswer(base.choices, resolution.answer);
+    if (resolution.answeredBy !== "user"
+      && resolution.answeredBy !== "operator"
+      && resolution.answeredBy !== "agent-timeout") {
+      throw new Error("Input resolution answerer must be user, operator, or agent-timeout.");
     }
-    return { text: requiredText(answer.text, "Input answer", MAX_INPUT_ANSWER_LENGTH) };
+    const answeredAt = requireTimestamp(resolution.answeredAt, "Input resolution answeredAt");
+    if (answeredAt !== base.updatedAt) throw new Error("Input resolution answeredAt must match updatedAt.");
+    if (resolution.answeredBy === "agent-timeout") {
+      assertAgentTimeoutAnswer(base, answer, answeredAt);
+    }
+    return {
+      ...base,
+      status: "answered",
+      resolution: {
+        answer,
+        answeredBy: resolution.answeredBy,
+        answeredAt
+      }
+    };
   }
-
-  const choiceKey = answer.choiceKey?.trim();
-  const choice = request.choices.find((candidate) => candidate.key === choiceKey);
-  if (choiceKey === undefined || choice === undefined) {
-    throw new Error("Invalid answer choice.");
+  if (request.status === "cancelled") {
+    const cancellation = record(request.cancellation, "Input cancellation");
+    exact(cancellation, ["reason", "cancelledAt"], "Input cancellation");
+    const cancelledAt = requireTimestamp(cancellation.cancelledAt, "Input cancellation cancelledAt");
+    if (cancelledAt !== base.updatedAt) throw new Error("Input cancellation cancelledAt must match updatedAt.");
+    return {
+      ...base,
+      status: "cancelled",
+      cancellation: {
+        reason: requireNormalizedText(cancellation.reason, "Input cancellation reason"),
+        cancelledAt
+      }
+    };
   }
-  return { choiceKey, text: choice.label };
+  throw new Error(`Input request status is invalid: ${String(request.status)}.`);
 }
 
-function assertOpen(
-  request: InputRequest
-): asserts request is InputRequest & { status: "open"; requester: InputRequesterWithNativeSession } {
-  if (request.status !== "open") {
-    throw new InputRequestStateError(request.id, request.status);
+function normalizeChoices(value: readonly InputChoice[]): InputChoice[] {
+  if (!Array.isArray(value)) throw new Error("Input choices must be an array.");
+  const choices = value.map((choice) => {
+    const item = record(choice, "Input choice");
+    exact(item, ["key", "label"], "Input choice");
+    return {
+      key: requireChoiceKey(item.key),
+      label: requireText(item.label, "Input choice label")
+    };
+  });
+  if (new Set(choices.map(({ key }) => key)).size !== choices.length) {
+    throw new Error("Input choice keys must be unique.");
   }
-  assertInputRequesterWithNativeSession(request.requester);
+  return choices;
 }
 
-export function assertValidInputRequest(value: unknown): asserts value is InputRequest {
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    !("taskId" in value) ||
-    !("id" in value) ||
-    typeof value.taskId !== "string" ||
-    typeof value.id !== "string" ||
-    !isInputRequestRecord(value, value.taskId, value.id)
-  ) {
-    throw new Error("Invalid input request record.");
+function validateChoices(value: unknown): InputChoice[] {
+  const choices = normalizeChoices(value as InputChoice[]);
+  if (JSON.stringify(choices) !== JSON.stringify(value)) throw new Error("Input choices must be normalized.");
+  return choices;
+}
+
+function normalizeBlockedRefs(value: readonly InputBlockedRef[]): InputBlockedRef[] {
+  if (!Array.isArray(value)) throw new Error("Input blocked references must be an array.");
+  const references: InputBlockedRef[] = value.map((reference): InputBlockedRef => {
+    const item = record(reference, "Input blocked reference");
+    exact(item, ["type", "id"], "Input blocked reference");
+    if (item.type !== "work-item" && item.type !== "run") {
+      throw new Error("Input blocked reference type must be work-item or run.");
+    }
+    return { type: item.type, id: requireIdentity(item.id, "Input blocked reference id") };
+  });
+  const keys = references.map(({ type, id }) => `${type}:${id}`);
+  if (new Set(keys).size !== keys.length) throw new Error("Input blocked references must be unique.");
+  return references;
+}
+
+function normalizePolicy(
+  value: InputRequestPolicy | undefined,
+  choices: readonly InputChoice[],
+  createdAt: string
+): InputRequestPolicy {
+  if (value === undefined) return { kind: "required" };
+  const policy = record(value, "Input request policy");
+  if (policy.kind === "required") {
+    exact(policy, ["kind"], "Input request policy");
+    return { kind: "required" };
   }
-}
-
-export function assertValidInputResolution(value: unknown): asserts value is InputResolution {
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    !("taskId" in value) ||
-    !("id" in value) ||
-    typeof value.taskId !== "string" ||
-    typeof value.id !== "string" ||
-    !isInputResolutionRecord(value, value.taskId, value.id)
-  ) {
-    throw new Error("Invalid input resolution record.");
+  if (policy.kind !== "recommended") {
+    throw new Error("Input request policy kind is invalid.");
   }
-}
-
-export function createInputRequestEventPayload(request: InputRequest): Record<string, string> {
-  assertValidInputRequest(request);
-  return {
-    taskId: request.taskId,
-    requestId: request.id,
-    ...(request.status === "superseded"
-      ? { replacementRequestId: request.superseded!.replacementRequestId }
-      : {}),
-    status: request.status,
-    policy: request.resolutionPolicy.mode
-  };
-}
-
-export function createInputResolutionEventPayload(resolution: InputResolution): Record<string, string> {
-  assertValidInputResolution(resolution);
-  return {
-    taskId: resolution.taskId,
-    requestId: resolution.requestId,
-    resolutionId: resolution.id,
-    source: resolution.source
-  };
-}
-
-export function inputResolutionSourceLabel(source: InputResolution["source"]): string {
-  return source === "user" ? "User answer" : "Offline recommendation";
-}
-
-export function assertInputRequesterWithNativeSession(
-  requester: InputRequester
-): asserts requester is InputRequesterWithNativeSession {
-  if (!isInputRequesterWithNativeSession(requester)) {
-    throw new Error("Input requester native session is unavailable.");
+  exact(
+    policy,
+    ["kind", "recommendedChoiceKey", "timeoutAt"],
+    "Input request policy"
+  );
+  if (choices.length === 0) {
+    throw new Error("Recommended input request requires choices.");
   }
-}
-
-function isInputRequesterWithNativeSession(
-  requester: InputRequester
-): requester is InputRequesterWithNativeSession {
-  return requester.roleName === "leader" &&
-    [requester.agentId, requester.adapterId, requester.agentRunId].every(isInputRequesterField) &&
-    isCanonicalNativeSessionRoot(requester.sessionRoot) &&
-    isInputRequesterField(requester.nativeSessionId) &&
-    isCanonicalNativeSessionId(requester.nativeSessionId);
-}
-
-function normalizeRequester(
-  requester: InputRequesterWithNativeSession
-): InputRequesterWithNativeSession {
-  if (
-    requester.roleName !== "leader" ||
-    [requester.agentId, requester.adapterId, requester.agentRunId].some(
-      (value) => !isInputRequesterField(value)
-    ) ||
-    !isCanonicalNativeSessionRoot(requester.sessionRoot) ||
-    !isInputRequesterField(requester.nativeSessionId) ||
-    !isCanonicalNativeSessionId(requester.nativeSessionId)
-  ) {
-    throw new Error("Invalid input requester.");
+  const recommendedChoiceKey = requireChoiceKey(policy.recommendedChoiceKey);
+  if (!choices.some((choice) => choice.key === recommendedChoiceKey)) {
+    throw new Error(`Recommended input choice does not exist: ${recommendedChoiceKey}.`);
   }
+  const timeoutAt = requireTimestamp(policy.timeoutAt, "Input request timeoutAt");
+  if (Date.parse(timeoutAt) <= Date.parse(createdAt)) {
+    throw new Error("Input request timeoutAt must be after creation.");
+  }
+  return { kind: "recommended", recommendedChoiceKey, timeoutAt };
+}
+
+function validateBlockedRefs(value: unknown): InputBlockedRef[] {
+  const references = normalizeBlockedRefs(value as InputBlockedRef[]);
+  if (JSON.stringify(references) !== JSON.stringify(value)) {
+    throw new Error("Input blocked references must be normalized.");
+  }
+  return references;
+}
+
+function normalizeRequester(value: InputRequester): InputRequester {
+  const requester = record(value, "Input requester");
+  exact(
+    requester,
+    requester.nativeSessionId === undefined
+      ? ["roleName", "agentId", "runId"]
+      : ["roleName", "agentId", "runId", "nativeSessionId"],
+    "Input requester"
+  );
+  if (requester.roleName !== "leader") throw new Error("Input requester must be the Task Leader.");
   return {
     roleName: "leader",
-    agentId: requester.agentId,
-    adapterId: requester.adapterId,
-    sessionRoot: requester.sessionRoot,
-    nativeSessionId: requester.nativeSessionId,
-    agentRunId: requester.agentRunId
+    agentId: requireIdentity(requester.agentId, "Input requester Agent id"),
+    runId: requireIdentity(requester.runId, "Input requester Run id"),
+    ...(requester.nativeSessionId === undefined
+      ? {}
+      : { nativeSessionId: requireIdentity(requester.nativeSessionId, "Input requester native session id") })
   };
 }
 
-function transitionTimestamp(request: InputRequest, now: Date): string {
-  const timestamp = now.toISOString();
-  if (timestamp < request.createdAt) {
-    throw new Error(`Input request ${request.id} transition cannot predate request creation.`);
+function normalizeAnswer(request: InputRequest, answer: InputAnswer): InputResolution["answer"] {
+  const value = record(answer, "Input answer");
+  if (request.choices.length === 0) {
+    if (value.choiceKey !== undefined) throw new Error("Free-text input request does not accept a choice.");
+    exact(value, ["text"], "Input answer");
+    return { text: requireText(value.text, "Input answer") };
+  }
+  exact(value, ["choiceKey"], "Input answer");
+  const key = requireChoiceKey(value.choiceKey);
+  const choice = request.choices.find((candidate) => candidate.key === key);
+  if (choice === undefined) throw new Error(`Input answer choice does not exist: ${key}.`);
+  return { choiceKey: choice.key, text: choice.label };
+}
+
+function assertAgentTimeoutAnswer(
+  request: Pick<InputRequestBase, "policy">,
+  answer: InputResolution["answer"],
+  answeredAt: string
+): void {
+  if (request.policy.kind !== "recommended") {
+    throw new Error("Required input request cannot be answered by Agent timeout.");
+  }
+  if (Date.parse(answeredAt) < Date.parse(request.policy.timeoutAt)) {
+    throw new Error("Input request has not reached its timeout.");
+  }
+  if (answer.choiceKey !== request.policy.recommendedChoiceKey) {
+    throw new Error("Agent timeout must use the recommended choice.");
+  }
+}
+
+function assertOpen(request: InputRequest): asserts request is InputRequest & { status: "open" } {
+  if (request.status !== "open") throw new InputRequestStateError(request.id, request.status);
+}
+
+function transitionTime(request: InputRequest, now: Date): string {
+  const timestamp = requireDate(now, "Input request transition time");
+  if (Date.parse(timestamp) < Date.parse(request.createdAt)) {
+    throw new Error("Input request transition cannot predate creation.");
   }
   return timestamp;
 }
 
-function assertPointerId(value: string, label: string): void {
-  if (typeof value !== "string" || !POINTER_ID_PATTERN.test(value)) {
+function requireChoiceKey(value: unknown): string {
+  if (typeof value !== "string" || !CHOICE_KEY.test(value)) throw new Error("Input choice key is invalid.");
+  return value;
+}
+
+function validatePersistedAnswer(
+  choices: readonly InputChoice[],
+  value: unknown
+): InputResolution["answer"] {
+  const answer = record(value, "Input resolution answer");
+  if (choices.length === 0) {
+    exact(answer, ["text"], "Input resolution answer");
+    return { text: requireNormalizedText(answer.text, "Input answer") };
+  }
+  exact(answer, ["choiceKey", "text"], "Input resolution answer");
+  const choiceKey = requireChoiceKey(answer.choiceKey);
+  const choice = choices.find((candidate) => candidate.key === choiceKey);
+  if (choice === undefined) throw new Error(`Input answer choice does not exist: ${choiceKey}.`);
+  const text = requireNormalizedText(answer.text, "Input answer");
+  if (text !== choice.label) throw new Error("Input answer text does not match the selected choice label.");
+  return { choiceKey, text };
+}
+
+function requireIdentity(value: unknown, label: string): string {
+  const text = requireText(value, label);
+  if (["__proto__", "prototype", "constructor", ".", ".."].includes(text) || /[\/\\\0]/.test(text)) {
     throw new Error(`${label} is invalid.`);
   }
+  return text;
 }
 
-function assertOperatorPresence(value: OperatorPresence): void {
-  if (value !== "online" && value !== "offline") {
-    throw new Error(`Invalid Operator presence: ${String(value)}.`);
-  }
+function requireText(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.includes("\0")) throw new Error(`${label} is invalid.`);
+  const text = value.replaceAll("\r\n", "\n").replaceAll("\r", "\n").trim();
+  if (text.length === 0) throw new Error(`${label} is required.`);
+  return text;
 }
 
-function requiredText(value: string, label: string, maxBytes: number): string {
-  const normalized = normalizeText(value);
-  if (normalized.length === 0) {
-    throw new Error(`${label} is required.`);
-  }
-  assertTextEncodingAndSize(normalized, label, maxBytes);
-  return normalized;
+function requireNormalizedText(value: unknown, label: string): string {
+  const text = requireText(value, label);
+  if (text !== value) throw new Error(`${label} must be normalized.`);
+  return text;
 }
 
-function assertTextEncodingAndSize(value: string, label: string, maxBytes: number): void {
-  if (!isWellFormedUtf16(value)) {
-    throw new Error(`${label} is not valid Unicode.`);
-  }
-  if (Buffer.byteLength(value, "utf8") > maxBytes) {
-    throw new Error(`${label} is too long (maximum ${maxBytes} UTF-8 bytes).`);
-  }
+function requireDate(value: Date, label: string): string {
+  if (!(value instanceof Date) || !Number.isFinite(value.getTime())) throw new Error(`${label} is invalid.`);
+  return value.toISOString();
 }
 
-function isWellFormedUtf16(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      if (index + 1 >= value.length) {
-        return false;
-      }
-      const next = value.charCodeAt(index + 1);
-      if (next < 0xdc00 || next > 0xdfff) {
-        return false;
-      }
-      index += 1;
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      return false;
-    }
-  }
-  return true;
+function requireTimestamp(value: unknown, label: string): string {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) throw new Error(`${label} is invalid.`);
+  return value;
 }
 
-function normalizeText(value: string): string {
-  return value.replaceAll("\r\n", "\n").replaceAll("\r", "\n").trim();
+function record(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
+  return value as Record<string, unknown>;
 }
 
-function isDenseArray(value: unknown): value is unknown[] {
-  if (!Array.isArray(value)) {
-    return false;
-  }
-  for (let index = 0; index < value.length; index += 1) {
-    if (!Object.hasOwn(value, index)) {
-      return false;
-    }
-  }
-  return true;
+function exact(value: Record<string, unknown>, fields: readonly string[], label: string): void {
+  const allowed = new Set(fields);
+  const unknown = Object.keys(value).find((key) => !allowed.has(key));
+  if (unknown !== undefined) throw new Error(`${label} has unknown field: ${unknown}.`);
+  const missing = fields.find((key) => !Object.hasOwn(value, key));
+  if (missing !== undefined) throw new Error(`${label} is missing field: ${missing}.`);
 }

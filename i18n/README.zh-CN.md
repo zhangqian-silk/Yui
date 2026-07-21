@@ -2,221 +2,203 @@
 
 # TaskMux
 
-TaskMux 是面向长时间运行的原生 Agent CLI 会话的本地控制平面。它将持久化任务模型、单一 Controller 和 tmux Agent 会话组合在一起，使任务可以持续推进、故障恢复和并行委派，同时不把状态隐藏在远端服务中。
+TaskMux 是一个用于长期 Codex/Claude 工作的本地编排器。控制状态保存在可检查的 JSON 文件中，所有 Agent 终端完全由 tmux 主导，带 Repository 的 Task 使用确定性的 Git worktree。
 
-[![npm version](https://img.shields.io/npm/v/@zq-silk/taskmux.svg)](https://www.npmjs.com/package/@zq-silk/taskmux)
-[![license](https://img.shields.io/badge/license-MIT-blue.svg)](../LICENSE)
-[![node](https://img.shields.io/badge/node-20.17%2B%20%2820.x%29%20%7C%2022.9%2B%20%2822.x%29%20%7C%2024.x-brightgreen.svg)](../package.json)
-
-## 为什么使用 TaskMux？
-
-- **长生命周期 Task**：一个持续目标对应一个持久任务，不必把每轮 Agent 执行拆成独立工单。
-- **原生 Agent 会话**：在真实 tmux 窗口中运行 Codex、Claude 或其他已配置的 CLI。
-- **清晰的职责边界**：Operator 负责管理，Leader 负责方向，Worker 执行有限 WorkItem。
-- **可靠的本地状态**：串行化变更、恢复已暂存事务、重建派生索引。
-- **默认可检查**：Task 上下文、决策、里程碑、事件和角色输出全部保留在本地。
+当前实现恢复了实用的 Role/Agent/session 模型和 CLI 框架，但没有恢复后期膨胀的数据维护、租约、定时调度和恢复账本体系。
 
 ## 环境要求
 
-- Node.js 20.17+（20.x）、22.9+（22.x）或 24.x
-- 使用 glibc 的 x64 或 arm64，Linux 内核须为上游 5.6 或更高版本，或为兼容的厂商回移版本；doctor 是权威的运行时探测
-- `TASKMUX_HOME` 所在文件系统以及每个外部输出目标所在文件系统均支持 `statx(..., STATX_BTIME)` 出生时间 identity、`O_TMPFILE` 和对该匿名 inode 的链接，且 `/proc/self/fd` 已挂载并可访问
-- `TASKMUX_HOME` 是专用的、当前用户拥有的真实目录且精确权限为 `0700`。它不能是文件系统根目录或操作系统账户主目录。`taskmux setup` 会以 `0700` 创建缺失路径组件，不会自动修改现有目录；修复现有的当前用户拥有目录前必须在真实 TTY 中显式确认
+- Node.js 20.17+、22.9+ 或 24.x
+- Git
 - tmux
-- 至少一个原生 Agent CLI，例如 Codex CLI 或 Claude Code
+- Codex CLI 或 Claude Code CLI
 
-TaskMux 为每个受支持架构随包提供 N-API 8 存储 authority 预编译文件。该存储 authority 不会在安装时现场编译或下载；当前平台缺少精确预编译文件时会立即失败。原生存储和外部输出发布依赖上游 Linux 内核 5.6 或更高版本或兼容的厂商回移版本所提供的能力：`openat2(2)`、相关文件系统的 `statx(..., STATX_BTIME)` 出生时间 identity、`O_TMPFILE`，以及通过已挂载且可访问的 `/proc/self/fd` 使用 `linkat(..., AT_SYMLINK_FOLLOW)` 链接匿名 inode。`taskmux doctor` 是权威的能力探测。TaskMux 不会模拟较弱的替代原语：原生系统调用的 `ENOSYS` 与 `EOPNOTSUPP` 会统一归一化为 `ENOTSUP`；procfd 描述符遍历缺失或不可访问时按实际 `ENOENT` 或 `EACCES` 归类为不支持，只有原始 `TASKMUX_HOME` 确实不存在时才归类为尚未 setup。运行时依赖仍可能执行各自的平台安装步骤。目前暂不支持基于 musl 的发行版和非 Linux 系统。
-
-## 安装
+## 初始化
 
 ```sh
 npm install -g @zq-silk/taskmux
 taskmux setup
+taskmux doctor
 ```
 
-安装后运行 `taskmux doctor`：它会检查精确的 Node LTS 版本线，并在专用、当前用户拥有、真实且精确权限为 `0700` 的 `TASKMUX_HOME` 上探测 `openat2`、`statx(..., STATX_BTIME)`、`O_TMPFILE` 和通过 `/proc/self/fd` 链接匿名 inode 的能力。运行时命令遇到不安全的 home 会失败关闭且不会修改它。它无法预检未来任意外部输出文件系统；每次发布都会检查实际目标，不支持时失败关闭。`setup` 会初始化 `~/.taskmux`、检查 tmux，并配置默认 Agent 和工作目录。之后运行 `taskmux` 即可打开交互式看板。
+`setup` 是交互式的：检测已安装的 Agent CLI、选择要配置的 Agent、默认 Agent 和 Operator Agent、确认 Operator workspace，并询问 shell completion。再次运行不会删除已有 Task/Role，可用于调整配置。
+
+`completion` 无论是否指定 shell，都会进入确认流程：
+
+```sh
+taskmux completion
+taskmux completion zsh
+```
+
+流程会确认生成脚本、安装路径和 shell 启动文件修改。补全脚本直接由命令目录生成，支持二级及更深层子命令。
+
+默认 home 是 `~/.taskmux`。隔离环境可设置：
+
+```sh
+export TASKMUX_HOME=/absolute/path/to/taskmux-home
+taskmux setup
+```
+
+home 中包含 `schema.json`、权威 `state.json`、Controller 发现文件和受管理 worktree。当前存储版本严格匹配且 fresh-only；代码保留了未来版本的迁移注册表，但本版不迁移旧格式。
 
 ## 快速开始
 
 ```sh
-# 创建一个长生命周期 Task，并启动其专属 Leader。
-taskmux task create "交付导出功能" --template feature
+taskmux repository add app /absolute/path/to/app --base main
+taskmux repository list
 
-# 查看当前 Task 和持久化上下文。
-taskmux task board --with-roles
-taskmux task context task-1 --format json
-
-# 进入固定的 Leader 会话。
-taskmux task enter task-1 leader
+taskmux task create "交付 CSV 导出" --repository <repository-id> --base main
+taskmux task update <task-id> --priority high --tags release,csv --due-at 2026-08-01T00:00:00Z
+taskmux task update <task-id> --clear-priority --clear-tags --clear-due-at
+taskmux task show <task-id>
+taskmux task context <task-id>
+taskmux task activate <task-id>
 ```
 
-## 工作原理
+查看已有 Task 的详细状态时，优先使用 `task context`。它一次聚合 Task、Brief、Active Decision、最近的 Milestone、Role、当前及最近的 WorkItem 与关联 Run、最近的 Message、Open/Resolved InputRequest 和 Event。终端输出会精简历史和长文本；`taskmux --json task context <task-id>` 会在顶层 `data` 中返回完整记录。
 
-![TaskMux 架构：用户和 Scheduler 通过本地 Controller 连接持久化文件、派生索引与 tmux Agent 会话。](../assets/taskmux-architecture.png)
+新 Task 是 Draft，并已创建 Leader。激活时会排入第一次持久 Leader wake。带 Repository 的 Task 会先为每个 Role 创建 `<TASKMUX_HOME>/worktrees/<task-id>/<role-name>`，对应分支为 `taskmux/<task-id>/<role-name>`，然后才启动 Leader；后续新增 Role 也会在执行前获得独立 worktree。
 
-Controller 是唯一的变更边界。它按需启动，仅监听 loopback，并统一协调持久化、调度、Agent 派发和 tmux 状态。
-
-![TaskMux 工作流：长生命周期 Task 经过输入、Leader 规划、有限 WorkItem、Worker 执行、持久化 Yield 和下一轮 Cycle 持续推进。](../assets/taskmux-workflow.png)
-
-## 核心概念
-
-| 概念 | 作用 |
-| --- | --- |
-| **Task** | 一个长生命周期目标，直到显式归档前都持续有效。 |
-| **Cycle** | 由输入、定时、角色结果或不活跃检查触发的一段有限推进周期。 |
-| **WorkItem** | 具有负责人和终态结果的有限执行单元。 |
-| **AgentRun** | 原生 Agent 会话中的一次派发执行。 |
-| **Operator** | 将用户意图转换为 TaskMux 命令的持久化、前台全局管理角色。 |
-| **Leader** | 负责方向、委派和结果综合的固定 Task 内会话。 |
-| **输入请求** | 由精确的活动 Leader 来源创建、归属某个 Task 的决策请求。 |
-| **Global Inbox** | 对所有 Task 所有开放输入请求的跨 Task 查询，不是第二份存储。 |
-| **独立角色** | 拥有独立 Agent 会话、tmux 窗口和可选 Git worktree 的 Worker。 |
-| **子角色** | 注入父角色的描述性约束，不拥有 TaskMux 管理的运行时。 |
-
-多 Agent Role 会为每个 Agent 绑定保留独立配置与原生会话，同时始终只有一个活动 Agent。前台 Operator 由其 `GlobalRoleSessionSet` 中的活动绑定和运行中会话确定。
-
-## 核心用例
-
-### 请求并回答用户决策
-
-唯一公开的输入请求命令是 `taskmux task input request`、`taskmux task input list`、`taskmux task input show`、`taskmux task input answer` 和 `taskmux task input cancel`。Global Inbox 是 `list` 生成的跨 Task 查询，而不是单独的记录或命令。
-
-在精确匹配的活动 Leader 会话中，创建归属 Task 的请求：
+通过 Operator 提交消息：
 
 ```sh
-taskmux task input request task-1 \
-  --question "优先保证 CSV 兼容性吗？" \
-  --choice csv="优先保证 CSV" \
-  --choice json="优先保证 JSON" \
-  --blocks task:task-1
+taskmux operator submit "比较 CSV 与 JSON 的兼容性" --task <task-id>
+taskmux operator submit "研究更小的缓存设计"
+taskmux operator enter
 ```
 
-前台 Operator 可以查看全局查询并记录用户决定；原始 Leader 可以取消仍处于开放状态的请求：
+不带 `--task` 时会创建新 Draft。Draft 可以继续规划，但激活前不会执行 Agent 工作。
+
+添加 Worker 并派发 WorkItem：
 
 ```sh
+taskmux task role add <task-id> implementer --agent codex
+taskmux task role list <task-id>
+
+taskmux task work create <task-id> "实现导出器" --role implementer
+taskmux task work dispatch <work-item-id> --input "完成实现并运行聚焦测试"
+```
+
+Worker 显式结束当前 Run：
+
+```sh
+taskmux task run yield <run-id> --summary "导出器已完成，聚焦测试通过"
+```
+
+yield 会原子完成 Run 和 WorkItem、追加结果消息并唤醒 Leader。Leader 不会自唤醒；Leader 忙碌时，Operator/Worker 的 pending wake 会一直保留到 Leader 空闲。
+
+当活动 Leader Run 必须获得用户决定才能继续时，可以创建持久 InputRequest，并 yield 当前 Run：
+
+```sh
+taskmux task input request <task-id> --question "默认使用哪种格式？" \
+  --choice csv="CSV" --choice json="JSON" --blocks work-item:<work-item-id>
 taskmux task input list
-taskmux task input show input-1 --task task-1
-taskmux task input answer input-1 --task task-1 --choice csv
-taskmux task input cancel task-1 input-1 --reason "不再需要该决定"
+taskmux task input show <input-id>
+taskmux task input answer <input-id> --choice csv
 ```
 
-请求归属其 Task，并保存精确的 Leader 来源元组，因此只有该 Leader 可以创建或取消它。向 Operator 的递送只包含 Task/请求指针；其 receipt 只确认传输已被接收，不代表用户已经回复。`user-required` 请求绝不超时。`offline-recommended` 请求只有在前台 Operator 已持续确认离线达到配置时长后，才能持久化其推荐结果；在线或未知状态都不会推进该时段。
-
-### 委派隔离任务
+请求默认必须由用户回答，并保持开放直到回答或取消。当 Agent 存在安全的推荐方案时，可以为选项设置明确的超时回退：
 
 ```sh
-taskmux task assign task-1 reviewer \
-  --agent codex \
-  --workspace ~/projects/app
-
-taskmux task worktree create task-1 reviewer \
-  --path ../task-1-reviewer \
-  --branch taskmux/task-1-reviewer
-
-taskmux task work-item create task-1 \
-  --title "检查导出功能的边界情况" \
-  --assignee reviewer \
-  --topic testing
-
-taskmux task dispatch task-1 reviewer \
-  --mode new \
-  --work-item work-item-1 \
-  --input "审查实现并报告阻塞问题。"
+taskmux task input request <task-id> --question "默认使用哪种格式？" \
+  --choice csv="CSV" --choice json="JSON" \
+  --recommend csv --timeout-seconds 300
 ```
 
-在角色会话中，以持久化结果结束当前执行轮次：
+推荐项会明确展示给用户；如果截止时间前没有回答，第一轮到期后的 Controller 扫描会原子采用这个确定选项，并排队恢复固定的 Leader session。自由文本和必须由用户回答的请求永远不会自动解决。
+
+`task input list` 是权威的全局开放输入 Inbox；可附加 Task ID 限定范围，或使用 `--all` 查看已回答和已取消的请求。Controller 还会尝试向已经运行且处于输入状态的 Operator composer 投递一次带回执的提示；它不会为了通知而启动或打断 Operator。Operator 不在线或正忙时，请求仍保留在 Inbox，并在后续 Controller 扫描时重新尝试。用户和 Operator 都可回答。存在开放请求时，无关的 pending wake 不会绕过等待，Task 也不能 complete 或 archive。原 Leader 也可执行 `taskmux task input cancel <task-id> <input-id> --reason "..."`，取消不会使 Leader 自唤醒。
 
 ```sh
-taskmux task yield --summary "审查完成；发现两个需要修复的边界问题。"
+taskmux task context <task-id>
 ```
 
-### 定时持续推进
+需要查看单个集合或记录时，再使用 `task work`、`task message`、`task run` 和 Task Knowledge 下的细分命令。
+
+完成目标后，可将 Task 标记为 completed，从而停止自动唤醒，同时保留 session 和各 Role worktree：
 
 ```sh
-taskmux task schedule set task-1 \
-  --inactivity-minutes 60 \
-  --cooldown-minutes 15 \
-  --every-minutes 1440 \
-  --next-at 2030-01-01T09:00:00Z
+taskmux task complete <task-id> --summary "CSV 导出已交付并验证"
+taskmux task reopen <task-id>
 ```
 
-### 沉淀结果并归档
+completed Task 在显式 reopen 前会拒绝消息、派发、进入 session、重试和迟到的 yield。archive 仍是终态，并负责 tmux/worktree 清理。
+Task 生命周期的交互选择只展示有效来源状态：activate 只展示 Draft，complete 只展示 active，reopen 只展示 completed。
+
+## Session 与 tmux
+
+TaskMux 不代理交互式 Agent 终端。执行 `operator enter`、`role enter` 或 `task enter` 前，TaskMux 会关闭 readline、退出 raw mode、暂停自身 stdin，再同步把终端交给 tmux。因此 Codex 原生的 `/model`、斜杠命令提示、全屏渲染和按键处理都可正常工作。
 
 ```sh
-taskmux task milestone add task-1 \
-  --title "灰度验证通过" \
-  --summary "导出功能已通过生产灰度检查。"
-
-taskmux task decision record task-1 \
-  --title "继续使用 CSV 作为默认格式" \
-  --rationale "保持现有用户的兼容性。"
-
-taskmux task archive task-1 \
-  --reason "交付完成" \
-  --summary "导出功能已上线并通过灰度验证。"
+taskmux role enter <global-role>
+taskmux task enter <task-id> [role]
+taskmux task role enter <task-id> <role>
 ```
 
-## 常用命令
+每个 Role 可绑定多个 Agent，有一个 active Agent，并为每个 Agent binding 独立保存 native session。切换 Agent 会保留休眠 session；Role 有活动 Run 或 native process 时禁止切换。
+
+Claude 的 session ID 在启动前分配。受管理的 Codex 启动使用 Codex 结构化 `notify` 回调，在 turn 完成后记录 thread ID，不再向模型对话注入 session-bind prompt。
+
+## Controller 与失败处理
+
+每个 `TASKMUX_HOME` 有一个后台 Controller：
 
 ```sh
-taskmux                         # 运行 doctor，然后打开看板
-taskmux operator                # 进入持久化 Operator 会话
-taskmux task board --with-roles # 查看 Task 和角色状态
-taskmux task context task-1     # 渲染持久化 Task 上下文
-taskmux task timeline task-1    # 查看按时间排列的 Task 活动
-taskmux task enter task-1 leader
 taskmux controller status
-taskmux doctor
-taskmux help task role          # 查看指定命令范围的帮助
-taskmux version                 # 输出已安装包的版本
+taskmux controller stop
+taskmux controller restart
 ```
 
-普通命令可追加 `--json`，获得稳定的成功或错误 envelope。在 TaskMux 启动的角色会话中，如果环境变量已经标识 Task 和角色，作用域命令可以省略对应 ID。
+`controller restart` 会用当前安装的 TaskMux 版本替换 Controller 进程及其调度循环、socket 服务，不会停止或重启已受管的 tmux/Agent 会话。
 
-## 帮助、补全与更新
+完整 reconciliation 默认每 30 秒执行一次；持久状态变化仍会立即请求一次扫描。保留的闭环为：
 
-仅使用规范形式 `taskmux help [command ...]` 查看任意命令范围，例如 `taskmux help task role` 或 `taskmux help task role rename`。直接输入不完整的命令组或未知命令时，会先输出错误，再输出最近一层的帮助，并以状态码 2 退出；追加 `--json` 时仍只输出一个 JSON 错误 envelope，不附加帮助文本。帮助信息按照 command catalog 定义的用途分类，并保持 catalog 中的顺序。
+1. 准备 active Task 的 repository workspace；
+2. 停止 archived Task 的 tmux，并只清理干净 worktree；
+3. 投递排队的 Worker Run；
+4. 检测活动 Role 进程退出；
+5. Leader 空闲时投递 pending wake。
 
-生成按命令路径组织的补全脚本，不读取或修改 TaskMux 状态：
+自动输入只通过 tmux 投递，并先进行 Agent 专属 readiness 检查。pane 内 receipt 可避免 Controller 重试时重复输入同一 Run。
+
+Role 在 yield 前退出时，Controller 会失败对应 Run 和 running WorkItem，并唤醒 Leader。恢复状态通过精简的 Jobs 兼容视图呈现：
 
 ```sh
-taskmux completion bash > ~/.local/share/bash-completion/completions/taskmux
-taskmux completion zsh > ~/.zfunc/_taskmux
-taskmux completion fish > ~/.config/fish/completions/taskmux.fish
+taskmux jobs list
+taskmux jobs retry leader-recovery:<task-id>
+taskmux task reconcile <task-id>
+taskmux task run retry <failed-run-id>
 ```
 
-如需引导式持久安装，执行 `taskmux completion install`。安装器始终同时展示 Bash、Zsh 和 Fish。`$SHELL` 只标记推荐行，不会修改已保存路径。每次选择一个 Shell，确认完整脚本路径和激活文件后，再回答 `[Y/n/customize]`；只有选择 `customize` 才会询问自定义路径，修改 `.bashrc`、`.zshrc` 或自定义 Fish 激活文件前还会再次明确确认。再次运行该命令可以添加其他 Shell、刷新（Refresh）当前脚本或修复（Repair）受损的托管安装。`taskmux completion uninstall` 会安全移除一个选中的 TaskMux 托管安装。
+`jobs` 不是旧版通用队列，只展示持久 Leader wake 和 Leader recovery failure。
 
-补全脚本与激活块带有所有权标记，使用原子替换，并拒绝符号链接或非 TaskMux 管理的冲突文件。`taskmux setup` 复用同一个单 Shell 向导，并支持输入 `skip` 跳过。交互式 setup/install/uninstall 必须在终端中运行且不支持 `--json`；上面的三个 stdout 生成命令仍可安全用于管道，且不依赖存储。
+completion 是可逆的执行屏障。归档是终态：失败活动 Run、停止 Task 的 tmux session，并逐个移除干净的 Role worktree；脏 Role worktree 会保留，供人工确认处理。
 
-`taskmux-dev` 只为 `taskmux-dev` 生成和安装补全，使用独立文件名、标记和隔离配置。补全路径属于本机配置：`backup` 会包含它们，逻辑 `export` 会省略它们，`import` 会保留目标机器已有记录。
+## 管理命令
 
-仅使用规范形式 `taskmux version` 输出已安装版本。`taskmux update` 会直接执行 `npm install --global @zq-silk/taskmux@latest`，并保留 npm 正常的交互输出。update 不支持 `--json`。
+```sh
+taskmux update
+taskmux agent add|list|show|update|remove
+taskmux role add|list|show|update|remove|bind|enter
+taskmux role session record|replace
+taskmux repository add|list
+```
 
-## 本地状态
+Agent 环境变量绑定只保存进程环境变量名，不保存 secret 值；raw args 不能覆盖 adapter 管理的生命周期参数。
 
-TaskMux 默认将权威状态存储在 `~/.taskmux`。测试或自动化可通过 `TASKMUX_HOME` 使用隔离目录。
+## 范围
 
-SQLite 索引只是可删除、可重建的派生数据。TaskMux 只在显式 Controller 边界刷新派生状态：启动、成功的命令事务和 Scheduler 扫描。它**不会**监听或轮询存储文件。需要可预测地生效时，应使用 CLI，而不是直接编辑 TaskMux 文件。
+TaskMux 面向一台机器上的一个受信任本地用户。它不包含 Web/API、多用户协调、backup/import/export、trash/restore、derived index、recovery journal、runtime lease、inactivity TTL、cooldown 或 recurring schedule。
 
-系统模型、持久化规则和运行时边界见 [ARCHITECTURE.md](../ARCHITECTURE.md)。
+持久化和调度细节见 [ARCHITECTURE.md](../ARCHITECTURE.md)。
 
 ## 本地开发
 
 ```sh
-make check
+npm run build
+npm test
+npm run lint
 ```
-
-Make 会在首次运行以及 `package.json` 或 `package-lock.json` 发生变化后自动安装 npm 依赖。
-
-如需逐条测试当前 checkout，并避免写入 `~/.taskmux`：
-
-```sh
-make link
-taskmux-dev help
-```
-
-`taskmux-dev` 始终使用 `output/taskmux-cli-dev` 作为隔离数据目录，并且不会进入 npm 发布包。`taskmux-dev update` 更新的是全局安装的正式 `taskmux` 包，不会更新当前 checkout、重新构建代码、修改受管理的 wrapper，也不会改动隔离开发数据。全局 npm 安装可能替换已有的 `taskmux` npm link。运行 `make unlink` 可移除受管理的 launcher。
 
 ## 许可证
 

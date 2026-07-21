@@ -1,551 +1,120 @@
-import { randomUUID } from "node:crypto";
-import { accessSync, closeSync, constants, fsyncSync, fstatSync, openSync, rmdirSync, unlinkSync } from "node:fs";
+import { accessSync, constants, existsSync, lstatSync } from "node:fs";
 import { join } from "node:path";
-import { renderTable } from "../output/table.js";
-import type { ConfiguredAgent } from "../agent/agent.js";
-import { resolveAgent } from "../agent/agentRegistry.js";
+
+import { configuredAgentToDefinition, type ConfiguredAgent } from "../agent/agent.js";
 import {
-  assertTaskmuxHomeReady,
+  inspectAgentCapabilities,
+  type AgentProbeResult,
+  type CapabilitySnapshot
+} from "../executor/agentAdapter.js";
+import { usageError } from "../errors/cliError.js";
+import { defaultTableWidth, renderTable } from "../output/table.js";
+import {
   FileTaskStore,
-  inspectTaskmuxHome,
   resolveTaskmuxHome,
-  type TaskmuxConfig
+  STORAGE_STATE_FILE
 } from "../storage/taskStore.js";
-import { inspectStorageSchema, type StorageSchemaState } from "../storage/storageSchema.js";
 import {
-  acquireStableAncestorExclusiveBarrier,
-  inspectDirectoryAt,
-  mkdirExactNoReplace,
-  publishAnonymousFileNoReplace,
-  releaseStableAncestorBarrier,
-  type NativeExactIdentity,
-  type NativeStableAncestorBarrier
-} from "../storage/nativeStorageFs.js";
-import type { CommandExecutor } from "../tmux/commandExecutor.js";
+  inspectStorageSchema,
+  type StorageSchemaState
+} from "../storage/storageSchema.js";
 import {
-  STORAGE_PATH_REGISTRY,
-  backupAuthoritativeStoragePaths
-} from "../storage/authoritativeStorage.js";
+  CommandExecutionError,
+  type CommandExecutor
+} from "../tmux/commandExecutor.js";
 
-const SUPPORTED_NODE_DETAIL = "requires Node.js 20.17+ (20.x), 22.9+ (22.x), or 24.x";
-const NATIVE_STORAGE_REQUIREMENT =
-  "requires storage capabilities from an upstream Linux kernel 5.6+ or a compatible vendor backport: openat2, filesystem statx(..., STATX_BTIME) birth-time support, O_TMPFILE plus linkat(..., AT_SYMLINK_FOLLOW) through accessible /proc/self/fd";
-const TASKMUX_HOME_PROCFD_ERROR_KIND = "taskmux-home-procfd";
-const TASKMUX_HOME_MODE = 0o700n;
-const TASKMUX_HOME_REQUIREMENT =
-  "TASKMUX_HOME must be an owned real directory with exact mode 0700.";
+export type DoctorStatus = "ok" | "missing" | "unsupported" | "invalid";
 
-export function runDoctor(
+export type DoctorCheck = Readonly<{
+  name: string;
+  status: DoctorStatus;
+  detail: string;
+}>;
+
+type StorageInspection = Readonly<{
+  check: DoctorCheck;
+  agents: readonly ConfiguredAgent[];
+}>;
+
+type SchemaInspection = StorageSchemaState | Readonly<{
+  status: "read-error";
+  detail: string;
+}>;
+
+/** Runs the read-only FileTaskStore diagnostics used by `taskmux doctor`. */
+export function runDoctorCommand(
+  args: readonly string[],
   env: NodeJS.ProcessEnv,
-  executor: CommandExecutor,
-  storageSchema: StorageSchemaState = inspectStorageSchema(resolveTaskmuxHome(env))
+  executor: CommandExecutor
 ): string {
-  return renderDoctor(getDoctorChecks(env, executor, storageSchema));
+  if (args.length !== 0) throw usageError("Doctor usage: taskmux doctor");
+  return renderDoctor(getDoctorChecks(env, executor));
 }
 
 export function getDoctorChecks(
   env: NodeJS.ProcessEnv,
-  executor: CommandExecutor,
-  storageSchema: StorageSchemaState = inspectStorageSchema(resolveTaskmuxHome(env))
+  executor: CommandExecutor
 ): DoctorCheck[] {
-  const rootDir = resolveTaskmuxHome(env);
-  const taskmuxHome = checkTaskmuxHome(rootDir);
-  const taskmuxHomeReady = taskmuxHome.status === "ok";
-  const storageFacts = taskmuxHomeReady
-    ? readDoctorStorageFacts(rootDir, storageSchema)
-    : undefined;
-  const agents = storageFacts?.kind === "data" ? storageFacts.agents : [];
+  const home = resolveTaskmuxHome(env);
+  const homeCheck = checkHome(home);
+  const schema = readSchema(home);
+  const schemaCheck = checkSchema(schema);
+  const storage = inspectState(home, homeCheck, schema);
   return [
-    checkNode(),
+    homeCheck,
+    schemaCheck,
+    storage.check,
+    checkExecutable("git", env.TASKMUX_GIT_BIN ?? "git", ["--version"], executor),
     checkExecutable("tmux", env.TASKMUX_TMUX_BIN ?? "tmux", ["-V"], executor),
-    ...agents.map((agent) =>
-      checkExecutable(`agent:${agent.id}`, agent.command, ["--version"], executor)
-    ),
-    taskmuxHome,
-    checkNativeStorage(rootDir),
-    taskmuxHomeReady
-      ? checkDefaultAgent(storageSchema, storageFacts)
-      : taskmuxHomeBlockedCheck("default agent", taskmuxHome),
-    checkStorageSchema(storageSchema),
-    checkPhysicalMaintenance(storageSchema),
-    taskmuxHomeReady
-      ? checkStoragePermissions(rootDir)
-      : taskmuxHomeBlockedCheck("storage permissions", taskmuxHome),
-    taskmuxHomeReady
-      ? checkStorageRecords(storageSchema, storageFacts)
-      : taskmuxHomeBlockedCheck("storage records", taskmuxHome)
+    ...storage.agents.flatMap((agent) => checkAgent(agent, executor))
   ];
 }
 
-function checkPhysicalMaintenance(state: StorageSchemaState): DoctorCheck {
-  if (state.status === "uninitialized") {
-    return { name: "physical maintenance", status: "missing", detail: "run taskmux setup" };
-  }
-  if (state.status === "unsupported") {
-    return {
-      name: "physical maintenance",
-      status: "unsupported",
-      detail: `current=${state.currentVersion} latest=${state.latestVersion}`
-    };
-  }
-  if (state.status === "invalid") {
-    return { name: "physical maintenance", status: "invalid", detail: state.detail };
-  }
-
-  const paths = backupAuthoritativeStoragePaths();
-  const contractValid = paths.includes("config.json") && paths.includes("schema.json") &&
-    !paths.includes("backups") && STORAGE_PATH_REGISTRY.some((entry) =>
-      entry.path === "runtime/domain-staging" && entry.physicalBackup === "exclude");
-  return contractValid
-    ? {
-        name: "physical maintenance",
-        status: "ok",
-        detail: `${paths.length} authoritative paths; backup/restore/rollback/prune registry ready`
-      }
-    : {
-        name: "physical maintenance",
-        status: "invalid",
-        detail: "physical maintenance registry is incomplete"
-      };
-}
-
-type DoctorStorageFacts = Readonly<{
-  kind: "data";
-  config: TaskmuxConfig;
-  agents: ConfiguredAgent[];
-  taskCount: number;
-  roleCount: number;
-  globalRoleCount: number;
-}> | Readonly<{
-  kind: "error";
-  detail: string;
-}>;
-
-function readDoctorStorageFacts(
-  rootDir: string,
-  state: StorageSchemaState
-): DoctorStorageFacts | undefined {
-  if (state.status !== "current") {
-    return undefined;
-  }
-  try {
-    return new FileTaskStore(rootDir).runReadSnapshot((snapshot) => {
-      const tasks = snapshot.listTasks();
-      return Object.freeze({
-        kind: "data" as const,
-        config: snapshot.getConfig(),
-        agents: snapshot.listConfiguredAgents(),
-        taskCount: tasks.length,
-        roleCount: tasks.reduce((count, task) => count + snapshot.listRoles(task.id).length, 0),
-        globalRoleCount: snapshot.listGlobalRoles().length
-      });
-    });
-  } catch (error) {
-    return Object.freeze({ kind: "error" as const, detail: errorMessage(error) });
-  }
-}
-
-function checkDefaultAgent(
-  state: StorageSchemaState,
-  storageFacts: DoctorStorageFacts | undefined
-): DoctorCheck {
-  if (state.status === "unsupported") {
-    return {
-      name: "default agent",
-      status: "unsupported",
-      detail: `current=${state.currentVersion} latest=${state.latestVersion}`
-    };
-  }
-
-  if (state.status === "invalid") {
-    return {
-      name: "default agent",
-      status: "invalid",
-      detail: state.detail
-    };
-  }
-
-  if (storageFacts?.kind === "error") {
-    return {
-      name: "default agent",
-      status: "invalid",
-      detail: storageFacts.detail
-    };
-  }
-  const config = storageFacts?.config ?? { schemaVersion: 1 };
-  const agents = storageFacts?.agents ?? [];
-
-  if (config.defaultAgent === undefined || config.defaultAgent.length === 0) {
-    return {
-      name: "default agent",
-      status: "missing",
-      detail: "run taskmux setup"
-    };
-  }
-
-  if (resolveAgent(config.defaultAgent, agents) === null) {
-    return {
-      name: "default agent",
-      status: "invalid",
-      detail: `${config.defaultAgent} is not configured`
-    };
-  }
-
-  return {
-    name: "default agent",
-    status: "ok",
-    detail: config.defaultAgent
-  };
-}
-
-export function renderDoctor(checks: DoctorCheck[]): string {
+export function renderDoctor(checks: readonly DoctorCheck[]): string {
   return `TaskMux doctor\n${renderTable(
     "Checks",
     [
-      { header: "Check", minWidth: 8, maxWidth: 22 },
-      { header: "Status", minWidth: 7, maxWidth: 16 },
+      { header: "Check", minWidth: 8, maxWidth: 28 },
+      { header: "Status", minWidth: 7, maxWidth: 11 },
       { header: "Detail", minWidth: 12, maxWidth: 88 }
     ],
     checks.map((check) => [check.name, check.status, check.detail]),
-    Math.max(54, Math.min(process.stdout.columns ?? 100, 140))
+    defaultTableWidth()
   )}\n`;
 }
 
-export type DoctorCheck = {
-  name: string;
-  status: "ok" | "missing" | "unsupported" | "invalid";
-  detail: string;
-};
-
-function checkNode(): DoctorCheck {
-  if (!isSupportedNodeVersion(process.version)) {
-    return {
-      name: "node",
-      status: "unsupported",
-      detail: `${process.version}; ${SUPPORTED_NODE_DETAIL}`
-    };
-  }
-  return {
-    name: "node",
-    status: "ok",
-    detail: process.version
-  };
-}
-
-export function isSupportedNodeVersion(version: string): boolean {
-  const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version);
-  if (match === null) return false;
-  const major = Number(match[1]);
-  const minor = Number(match[2]);
-  const patch = Number(match[3]);
-  if (major === 20) return minor > 17 || (minor === 17 && patch >= 0);
-  if (major === 22) return minor > 9 || (minor === 9 && patch >= 0);
-  return major === 24;
-}
-
-function checkExecutable(
-  name: string,
-  executable: string,
-  args: string[],
-  executor: CommandExecutor
-): DoctorCheck {
+function checkHome(home: string): DoctorCheck {
   try {
-    return {
-      name,
-      status: "ok",
-      detail: firstLine(executor.run(executable, args))
-    };
-  } catch {
-    return {
-      name,
-      status: "missing",
-      detail: executable
-    };
-  }
-}
-
-function firstLine(output: string): string {
-  return output.trim().split("\n")[0] ?? "";
-}
-
-function checkTaskmuxHome(rootDir: string): DoctorCheck {
-  try {
-    const inspection = inspectTaskmuxHome(rootDir);
-    switch (inspection.status) {
-      case "ready":
-        return {
-          name: "taskmux home",
-          status: "ok",
-          detail: rootDir
-        };
-      case "missing":
-        return {
-          name: "taskmux home",
-          status: "missing",
-          detail: "run taskmux setup"
-        };
-      case "repair-required":
-        return {
-          name: "taskmux home",
-          status: "invalid",
-          detail: `TASKMUX_HOME must have exact mode 0700; current mode is ${inspection.mode}`
-        };
-    }
-  } catch (error) {
-    const procfdCode = taskmuxHomeProcfdSystemCode(error);
-    if (procfdCode !== undefined) {
+    const metadata = lstatSync(home);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
       return {
         name: "taskmux home",
-        status: "unsupported",
-        detail: procfdTraversalUnsupportedDetail(procfdCode)
+        status: "invalid",
+        detail: "TASKMUX_HOME must be a real directory."
       };
     }
-    return {
-      name: "taskmux home",
-      status: "invalid",
-      detail: errorMessage(error)
-    };
-  }
-}
-
-function checkNativeStorage(rootDir: string): DoctorCheck {
-  let descriptor = -1;
-  let barrier: NativeStableAncestorBarrier | undefined;
-  let probeDirectoryPath: string | undefined;
-  let probePath: string | undefined;
-  let taskmuxHomeAccepted = false;
-  let failed = false;
-  let failure: unknown;
-  let failureOrigin: NativeStorageFailureOrigin | undefined;
-  const rememberFailure = (error: unknown, origin: NativeStorageFailureOrigin): void => {
-    if (!failed) {
-      failed = true;
-      failure = error;
-      failureOrigin = origin;
-    }
-  };
-
-  try {
-    descriptor = openSync(
-      rootDir,
-      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
-    );
+    accessSync(home, constants.R_OK);
+    return { name: "taskmux home", status: "ok", detail: home };
   } catch (error) {
-    rememberFailure(error, "root-open");
-  }
-
-  if (!failed) {
-    try {
-      assertTaskmuxHomeReady(rootDir);
-      assertPrivateTaskmuxHomeDescriptor(descriptor);
-      taskmuxHomeAccepted = true;
-      const identity = nativeDescriptorIdentity(descriptor);
-      barrier = acquireStableAncestorExclusiveBarrier(descriptor, identity);
-      const directoryName = `.taskmux-doctor-native-storage-${randomUUID()}`;
-      const candidateProbeDirectoryPath = join(`/proc/self/fd/${descriptor}`, directoryName);
-      try {
-        mkdirExactNoReplace(barrier, ".", identity, directoryName);
-        probeDirectoryPath = candidateProbeDirectoryPath;
-      } catch (error) {
-        if (nativeMkdirConfirmedProbeDirectory(error)) {
-          probeDirectoryPath = candidateProbeDirectoryPath;
-        }
-        throw error;
-      }
-      const probeDirectoryIdentity = inspectDirectoryAt(barrier, directoryName);
-      if (probeDirectoryIdentity === undefined) {
-        throw new Error("Native storage could not inspect TASKMUX_HOME.");
-      }
-      const fileName = "probe";
-      probePath = join(probeDirectoryPath, fileName);
-      publishAnonymousFileNoReplace(
-        barrier,
-        directoryName,
-        probeDirectoryIdentity,
-        fileName,
-        Buffer.alloc(0)
-      );
-    } catch (error) {
-      rememberFailure(error, "probe");
+    if (systemCode(error) === "ENOENT") {
+      return { name: "taskmux home", status: "missing", detail: "run taskmux setup" };
     }
-  }
-
-  if (probePath !== undefined) {
-    try {
-      unlinkSync(probePath);
-    } catch (error) {
-      if (errorCode(error) !== "ENOENT") rememberFailure(error, "cleanup");
-    }
-  }
-  if (probeDirectoryPath !== undefined) {
-    try {
-      rmdirSync(probeDirectoryPath);
-    } catch (error) {
-      if (errorCode(error) !== "ENOENT") rememberFailure(error, "cleanup");
-    }
-  }
-  if (descriptor >= 0 && taskmuxHomeAccepted) {
-    try {
-      fsyncSync(descriptor);
-    } catch (error) {
-      rememberFailure(error, "cleanup");
-    }
-  }
-  if (barrier !== undefined) {
-    try {
-      releaseStableAncestorBarrier(barrier);
-    } catch (error) {
-      rememberFailure(error, "cleanup");
-    }
-  }
-  if (descriptor >= 0) {
-    try {
-      closeSync(descriptor);
-    } catch (error) {
-      rememberFailure(error, "cleanup");
-    }
-  }
-
-  if (failed) return nativeStorageFailure(failure, failureOrigin);
-  return {
-    name: "native storage",
-    status: "ok",
-    detail: `openat2 + statx(STATX_BTIME) + O_TMPFILE + /proc/self/fd linkat verified for ${rootDir}`
-  };
-}
-
-function taskmuxHomeBlockedCheck(name: string, taskmuxHome: DoctorCheck): DoctorCheck {
-  return {
-    name,
-    status: taskmuxHome.status,
-    detail: taskmuxHome.detail
-  };
-}
-
-function assertPrivateTaskmuxHomeDescriptor(descriptor: number): void {
-  const metadata = fstatSync(descriptor, { bigint: true });
-  const euid = BigInt(process.geteuid?.() ?? -1);
-  if (
-    !metadata.isDirectory() ||
-    metadata.uid !== euid ||
-    (metadata.mode & 0o7777n) !== TASKMUX_HOME_MODE
-  ) {
-    throw new Error(TASKMUX_HOME_REQUIREMENT);
+    return { name: "taskmux home", status: "invalid", detail: errorMessage(error) };
   }
 }
 
-function nativeDescriptorIdentity(descriptor: number): NativeExactIdentity {
-  const identity = fstatSync(descriptor, { bigint: true });
-  return Object.freeze({
-    dev: identity.dev,
-    ino: identity.ino,
-    uid: identity.uid,
-    mode: identity.mode,
-    nlink: identity.nlink,
-    birthtimeNs: identity.birthtimeNs
-  });
-}
-
-type NativeStorageFailureOrigin = "root-open" | "probe" | "cleanup";
-
-function nativeStorageFailure(
-  error: unknown,
-  origin: NativeStorageFailureOrigin | undefined
-): DoctorCheck {
-  const code = errorCode(error);
-  const procfdCode = taskmuxHomeProcfdSystemCode(error);
-  if (procfdCode !== undefined) {
-    return {
-      name: "native storage",
-      status: "unsupported",
-      detail: procfdTraversalUnsupportedDetail(procfdCode)
-    };
+function readSchema(home: string): SchemaInspection {
+  try {
+    return inspectStorageSchema(home);
+  } catch (error) {
+    return { status: "read-error", detail: errorMessage(error) };
   }
-  if (origin === "root-open" && code === "ENOENT") {
-    return {
-      name: "native storage",
-      status: "missing",
-      detail: "run taskmux setup"
-    };
-  }
-  if (
-    code === "ENOENT" &&
-    errorKind(error) === "external-publication" &&
-    errorStage(error) === "link-target"
-  ) {
-    return {
-      name: "native storage",
-      status: "unsupported",
-      detail: `${NATIVE_STORAGE_REQUIREMENT}; /proc/self/fd link-target returned ENOENT`
-    };
-  }
-  if (code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "ENOSYS") {
-    return {
-      name: "native storage",
-      status: "unsupported",
-      detail: `${NATIVE_STORAGE_REQUIREMENT}; ${code}`
-    };
-  }
-  return {
-    name: "native storage",
-    status: "invalid",
-    detail: errorMessage(error)
-  };
 }
 
-function procfdTraversalUnsupportedDetail(code: string): string {
-  return `${NATIVE_STORAGE_REQUIREMENT}; /proc/self/fd descriptor traversal returned ${code}`;
-}
-
-function taskmuxHomeProcfdSystemCode(error: unknown): string | undefined {
-  if (errorKind(error) !== TASKMUX_HOME_PROCFD_ERROR_KIND) return undefined;
-  return errorStringProperty(error, "systemCode");
-}
-
-function errorCode(error: unknown): string | undefined {
-  if (
-    error !== null &&
-    typeof error === "object" &&
-    "code" in error &&
-    typeof error.code === "string"
-  ) {
-    return error.code;
-  }
-  return undefined;
-}
-
-function errorKind(error: unknown): string | undefined {
-  return errorStringProperty(error, "kind");
-}
-
-function errorStage(error: unknown): string | undefined {
-  return errorStringProperty(error, "stage");
-}
-
-function errorStringProperty(error: unknown, property: string): string | undefined {
-  if (error === null || typeof error !== "object") return undefined;
-  const value = (error as Record<string, unknown>)[property];
-  return typeof value === "string" ? value : undefined;
-}
-
-function nativeMkdirConfirmedProbeDirectory(error: unknown): boolean {
-  if (error === null || typeof error !== "object") return false;
-  const stage = "stage" in error && typeof error.stage === "string" ? error.stage : undefined;
-  const state = "state" in error && typeof error.state === "string" ? error.state : undefined;
-  return stage === "verify-directory" ||
-    stage === "open-created" ||
-    stage === "fsync-parent" ||
-    state === "published-not-durable";
-}
-
-function checkStorageSchema(state: StorageSchemaState): DoctorCheck {
+function checkSchema(state: SchemaInspection): DoctorCheck {
   switch (state.status) {
     case "uninitialized":
-      return {
-        name: "storage schema",
-        status: "missing",
-        detail: "run taskmux setup"
-      };
+      return { name: "storage schema", status: "missing", detail: "run taskmux setup" };
     case "current":
       return {
         name: "storage schema",
@@ -556,91 +125,175 @@ function checkStorageSchema(state: StorageSchemaState): DoctorCheck {
       return {
         name: "storage schema",
         status: "unsupported",
-        detail: `current=${state.currentVersion} latest=${state.latestVersion}`
+        detail: `current=${state.currentVersion} latest=${state.latestVersion} direction=${state.direction}`
       };
     case "invalid":
-      return {
-        name: "storage schema",
-        status: "invalid",
-        detail: state.detail
-      };
+      return { name: "storage schema", status: "invalid", detail: state.detail };
+    case "read-error":
+      return { name: "storage schema", status: "invalid", detail: state.detail };
   }
 }
 
-function checkStoragePermissions(rootDir: string): DoctorCheck {
-  try {
-    accessSync(rootDir, constants.R_OK | constants.W_OK);
+function inspectState(
+  home: string,
+  homeCheck: DoctorCheck,
+  schema: SchemaInspection
+): StorageInspection {
+  if (homeCheck.status !== "ok") {
+    return blockedStorage(homeCheck.status, homeCheck.detail);
+  }
+  if (schema.status === "uninitialized") {
+    return blockedStorage("missing", "run taskmux setup");
+  }
+  if (schema.status === "unsupported") {
+    return blockedStorage(
+      "unsupported",
+      `current=${schema.currentVersion} latest=${schema.latestVersion}`
+    );
+  }
+  if (schema.status === "invalid") return blockedStorage("invalid", schema.detail);
+  if (schema.status === "read-error") return blockedStorage("invalid", schema.detail);
 
+  const statePath = join(home, STORAGE_STATE_FILE);
+  if (!existsSync(statePath)) return blockedStorage("missing", "run taskmux setup");
+  try {
+    const metadata = lstatSync(statePath);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      return blockedStorage("invalid", `${STORAGE_STATE_FILE} must be a regular file.`);
+    }
+    accessSync(statePath, constants.R_OK);
+    const store = new FileTaskStore(home);
+    const config = store.getConfig();
+    const agents = store.listConfiguredAgents();
+    const tasks = store.listTasks();
+    const globalRoles = store.listGlobalRoles();
+    const roleCount = tasks.reduce(
+      (count, task) => count + store.listRoles(task.id).length,
+      0
+    );
     return {
-      name: "storage permissions",
-      status: "ok",
-      detail: "read-write"
+      check: {
+        name: "storage state",
+        status: "ok",
+        detail: `readable agents=${agents.length} tasks=${tasks.length} roles=${roleCount} globalRoles=${globalRoles.length} defaultAgent=${config.defaultAgent ?? "none"}`
+      },
+      agents
     };
   } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      return {
-        name: "storage permissions",
-        status: "missing",
-        detail: "run taskmux setup"
-      };
-    }
+    return blockedStorage("invalid", errorMessage(error));
+  }
+}
 
+function blockedStorage(status: Exclude<DoctorStatus, "ok">, detail: string): StorageInspection {
+  return {
+    check: { name: "storage state", status, detail },
+    agents: []
+  };
+}
+
+function checkExecutable(
+  name: "git" | "tmux",
+  command: string,
+  args: string[],
+  executor: CommandExecutor
+): DoctorCheck {
+  try {
+    const output = firstLine(executor.run(command, args));
     return {
-      name: "storage permissions",
-      status: "invalid",
-      detail: errorMessage(error)
+      name,
+      status: "ok",
+      detail: output.length === 0 ? command : `${command}: ${output}`
+    };
+  } catch (error) {
+    return {
+      name,
+      status: isMissingCommand(error) ? "missing" : "invalid",
+      detail: `${command}: ${commandFailure(error)}`
     };
   }
 }
 
-function checkStorageRecords(
-  state: StorageSchemaState,
-  storageFacts: DoctorStorageFacts | undefined
-): DoctorCheck {
-  if (state.status === "uninitialized") {
-    return {
-      name: "storage records",
-      status: "missing",
-      detail: "run taskmux setup"
-    };
+function checkAgent(agent: ConfiguredAgent, executor: CommandExecutor): DoctorCheck[] {
+  let snapshot: CapabilitySnapshot;
+  try {
+    snapshot = inspectAgentCapabilities(configuredAgentToDefinition(agent), {
+      run: (command, args) => runAgentProbe(executor, command, args)
+    });
+  } catch (error) {
+    return [{
+      name: `agent:${agent.id}`,
+      status: "invalid",
+      detail: `${agent.command}: ${errorMessage(error)}`
+    }];
   }
 
-  if (state.status === "unsupported") {
-    return {
-      name: "storage records",
-      status: "unsupported",
-      detail: `current=${state.currentVersion} latest=${state.latestVersion}`
-    };
-  }
+  const installation = snapshot.installation;
+  const status: DoctorStatus = installation.status === "installed"
+    ? "ok"
+    : installation.status === "missing"
+      ? "missing"
+      : installation.status === "unsupported-version" ? "unsupported" : "invalid";
+  const commandDetail = [
+    `command=${installation.command}`,
+    `adapter=${snapshot.adapterId}`,
+    ...(installation.version === undefined ? [] : [`version=${installation.version}`]),
+    ...(installation.reason === undefined ? [] : [`reason=${installation.reason}`])
+  ].join(" ");
+  const available = snapshot.fields.filter((field) => field.status === "available").length;
+  const degraded = snapshot.fields.filter((field) => field.status === "degraded").length;
+  const unavailable = snapshot.fields.filter((field) => field.status === "unavailable").length;
+  return [
+    { name: `agent:${agent.id}:command`, status, detail: commandDetail },
+    {
+      name: `agent:${agent.id}:capability`,
+      status,
+      detail: `start resume interrupt nativeSession=${snapshot.lifecycle.nativeSessionDiscovery} fields=${available}/${degraded}/${unavailable}`
+    }
+  ];
+}
 
-  if (state.status === "invalid") {
+function runAgentProbe(
+  executor: CommandExecutor,
+  command: string,
+  args: readonly string[]
+): AgentProbeResult {
+  try {
+    return { status: 0, stdout: executor.run(command, [...args]), stderr: "" };
+  } catch (error) {
+    const missing = isMissingCommand(error);
+    const probeError = Object.assign(new Error(errorMessage(error)), {
+      ...(missing ? { code: "ENOENT" } : {})
+    });
     return {
-      name: "storage records",
-      status: "invalid",
-      detail: state.detail
+      status: error instanceof CommandExecutionError ? error.exitStatus ?? null : null,
+      stdout: "",
+      stderr: error instanceof CommandExecutionError ? error.stderr : "",
+      error: probeError
     };
   }
+}
 
-  if (storageFacts?.kind === "error") {
-    return {
-      name: "storage records",
-      status: "invalid",
-      detail: storageFacts.detail
-    };
+function isMissingCommand(error: unknown): boolean {
+  return error instanceof CommandExecutionError
+    ? error.code === "COMMAND_NOT_FOUND"
+    : systemCode(error) === "ENOENT";
+}
+
+function commandFailure(error: unknown): string {
+  if (error instanceof CommandExecutionError) {
+    return error.stderr.trim() || error.message;
   }
-  const facts = storageFacts;
-  if (facts === undefined) {
-    return {
-      name: "storage records",
-      status: "invalid",
-      detail: "TaskMux storage facts are unavailable."
-    };
-  }
-  return {
-    name: "storage records",
-    status: "ok",
-    detail: `tasks=${facts.taskCount} roles=${facts.roleCount} globalRoles=${facts.globalRoleCount} agents=${facts.agents.length}`
-  };
+  return errorMessage(error);
+}
+
+function firstLine(output: string): string {
+  return output.trim().split(/\r?\n/, 1)[0] ?? "";
+}
+
+function systemCode(error: unknown): string | undefined {
+  return error instanceof Error && "code" in error && typeof error.code === "string"
+    ? error.code
+    : undefined;
 }
 
 function errorMessage(error: unknown): string {

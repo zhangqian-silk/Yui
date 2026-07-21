@@ -1,372 +1,202 @@
-import { createTaskEvent } from "../event/taskEvent.js";
-import { createCycle, type CycleCause } from "../cycle/cycle.js";
-import { compileDispatchInput } from "../context/dispatchContext.js";
-import {
-  updateRoleAgentSessionStatus,
-  type RoleAgentSession,
-  type TaskRoleSessionSet
-} from "../executor/agentExecutor.js";
-import {
-  claimRoleRuntimeOperation,
-  clearRoleRuntimeOperationClaim,
-  createRoleRuntimeOperationLease,
-  executePostCommitRoleDispatch,
-  readRoleRuntimeOperationClaim,
-  readRoleRuntimeStateSnapshot,
-  releaseRoleRuntimeOperationClaim,
-  resolveAgentExecutor,
-  roleRuntimeStateDigest,
-  type RoleLaunchRuntimeOperationClaim
-} from "../executor/executorRegistry.js";
-import { activeRoleAgentBinding, updateRoleStatus, type Role } from "../role/role.js";
-import { resolveAgent } from "../agent/agentRegistry.js";
-import type { AgentDefinition } from "../agent/agent.js";
-import { createAgentRun, type AgentRun } from "../run/agentRun.js";
+import { createAgentRun } from "../run/agentRun.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
-import { createLeaderRecoveryNotification, leaderRecoveryNotificationId } from "./operatorNotification.js";
-import type { TaskReader, TaskStore } from "../storage/taskStore.js";
-import { FileTaskStore } from "../storage/taskStore.js";
-import { executeDomainTransaction } from "../storage/domainTransaction.js";
-import { DomainTransactionRecoveryError } from "../storage/recoveryJournal.js";
-import type { TmuxManager } from "../tmux/tmuxManager.js";
-import { randomUUID } from "node:crypto";
-import type { DispatchMode } from "../executor/launchPlan.js";
-import type { PendingWakeup } from "./pendingWakeup.js";
-import type { Task } from "../task/task.js";
-import {
-  persistTaskRoleDispatch,
-  recoverTaskRoleRuntimeOperations,
-  type PreparedTaskRoleDispatch
-} from "../commands/taskCommands.js";
+import { createLeaderRecoveryNotification } from "./operatorNotification.js";
+import type {
+  SchedulerRoleSession,
+  SchedulerStorePort,
+  TmuxDeliveryPort
+} from "./ports.js";
 
-export type LeaderWakeupProcessingResult = {
+export type LeaderWakeupProcessingResult = Readonly<{
   taskId: string;
   status: "dispatched" | "skipped" | "failed";
+  reason?: "busy" | "waiting-input" | "unavailable" | "workspace-not-ready" | "recovery-blocked" | "state-changed";
   error?: string;
-};
+}>;
 
-type PreparedLeaderWakeup =
-  | { kind: "skipped"; taskId: string }
-  | {
-      kind: "ready";
-      wakeup: PendingWakeup;
-      task: Task;
-      role: Role;
-      sessionSet: TaskRoleSessionSet | null;
-      session: RoleAgentSession | null;
-      mode: DispatchMode;
-      input: string;
-      run: AgentRun;
-      agent: AgentDefinition;
+export async function processLeaderWakeups(
+  store: SchedulerStorePort,
+  delivery: TmuxDeliveryPort,
+  now: Date
+): Promise<LeaderWakeupProcessingResult[]> {
+  const results: LeaderWakeupProcessingResult[] = [];
+  for (const wakeup of store.listPendingWakeups()) {
+    const task = store.getTask(wakeup.taskId);
+    const role = store.getRole(wakeup.taskId, "leader");
+    if (task === null || task.status !== "active" || role === null) {
+      results.push({ taskId: wakeup.taskId, status: "skipped", reason: "unavailable" });
+      continue;
     }
-  | {
-      kind: "failed";
-      task: Task;
-      role: Role;
-      error: unknown;
-    };
-
-export function processLeaderWakeups(
-  store: TaskStore,
-  tmux: TmuxManager,
-  now: Date,
-  rootDir: string = store.rootDirectory()
-): LeaderWakeupProcessingResult[] {
-  recoverTaskRoleRuntimeOperations(rootDir, tmux, now);
-  const preparations = store.runReadSnapshot((snapshot) =>
-    snapshot.listPendingWakeups().map((wakeup) => prepareLeaderWakeup(snapshot, wakeup, now, rootDir)));
-
-  return preparations.map((preparation) => {
-    if (preparation.kind === "skipped") {
-      return { taskId: preparation.taskId, status: "skipped" };
+    if (task.repositoryId !== undefined && task.cwd === undefined) {
+      results.push({ taskId: task.id, status: "skipped", reason: "workspace-not-ready" });
+      continue;
     }
-    if (preparation.kind === "failed") {
-      return recordLeaderWakeupFailure(preparation.task, preparation.role, preparation.error, tmux, now, rootDir);
+    if (store.getLeaderFailure(task.id) !== null) {
+      results.push({ taskId: task.id, status: "skipped", reason: "recovery-blocked" });
+      continue;
     }
-    return dispatchLeaderWakeup(preparation, tmux, now, rootDir);
-  });
-}
-
-function prepareLeaderWakeup(
-  store: TaskReader,
-  wakeup: PendingWakeup,
-  now: Date,
-  rootDir: string
-): PreparedLeaderWakeup {
-  const task = store.getTask(wakeup.taskId);
-  const role = store.getRole(wakeup.taskId, "leader");
-  const sessionSet = store.getRoleSessionSet(wakeup.taskId, "leader");
-  const session = role === null ? null : sessionSet?.sessions[role.activeAgentId] ?? null;
-
-  if (
-    task === null ||
-    task.archived ||
-    role === null ||
-    readRoleRuntimeOperationClaim(rootDir, wakeup.taskId, "leader") !== null ||
-    store.getLeaderFailure(wakeup.taskId) !== null ||
-    store.getActiveAgentRun(wakeup.taskId, "leader") !== null
-  ) {
-    return { kind: "skipped", taskId: wakeup.taskId };
-  }
-
-  try {
-    const mode: DispatchMode = session === null || session.status === "reserved" ? "new" : "resume";
-    const input = [
-      `TaskMux wakeup reasons: ${wakeup.reasons.join(", ")}.`,
-      `Run taskmux task context ${task.id} --format json, then continue Leader stewardship.`
-    ].join(" ");
-    const compiledInput = compileDispatchInput(store, task.id, role, input);
-    const run = createAgentRun(
-      store.nextAgentRunId(task.id),
-      task.id,
-      role.name,
-      mode,
-      compiledInput,
-      now
-    );
-    if (store.getAgentRun(task.id, run.id) !== null) {
-      throw new Error(`Leader AgentRun id was allocated concurrently: ${task.id}/${run.id}.`);
+    if (store.hasOpenInputRequest(task.id)) {
+      results.push({ taskId: task.id, status: "skipped", reason: "waiting-input" });
+      continue;
     }
-    const binding = activeRoleAgentBinding(role);
-    if (
-      mode === "new" &&
-      session === null &&
-      binding.adapterId === "codex" &&
-      store.listAgentRuns(task.id).some((candidate) => candidate.roleName === role.name)
-    ) {
-      throw new Error("Codex Leader has an unregistered prior AgentRun; native session recovery is required.");
-    }
-    const agent = resolveAgent(binding.agentId, store.listConfiguredAgents());
-    if (agent === null) throw new Error(`Leader Agent is not configured: ${binding.agentId}.`);
-    return {
-      kind: "ready",
-      wakeup,
-      task,
-      role,
-      sessionSet,
-      session,
-      mode,
-      input: compiledInput,
-      run,
-      agent
-    };
-  } catch (error) {
-    return { kind: "failed", task, role, error };
-  }
-}
 
-function dispatchLeaderWakeup(
-  preparation: Extract<PreparedLeaderWakeup, { kind: "ready" }>,
-  tmux: TmuxManager,
-  now: Date,
-  rootDir: string
-): LeaderWakeupProcessingResult {
-  const { wakeup, task, role, sessionSet, session, mode, input, run, agent } = preparation;
-  let effectiveSession: RoleAgentSession | null = session;
-  try {
-    const prepared = resolveAgentExecutor(activeRoleAgentBinding(role).adapterId).plan({
-      taskmuxHome: rootDir,
-      taskId: task.id,
-      role,
-      agent,
-      run,
-      session,
-      input,
-      now
-    });
-    effectiveSession = prepared.session;
-    const atomicDispatch: PreparedTaskRoleDispatch = {
-      taskId: task.id,
-      role,
-      expectedStateDigest: roleRuntimeStateDigest({
-        role,
-        sessionSet,
-        activeRun: null,
-        selectedWorkItem: null,
-        pendingRun: { id: run.id, existing: null }
-      }),
-      run,
-      workItem: null,
-      expectedWorkItemUpdatedAt: null,
-      sessionSet,
-      session: effectiveSession,
-      launch: prepared.launch,
-      input,
-      mode
-    };
-    const intent: RoleLaunchRuntimeOperationClaim = {
-      schemaVersion: 1 as const,
-      scope: "task-role" as const,
-      kind: "launch",
-      token: randomUUID(),
-      taskId: task.id,
-      roleName: role.name,
-      operation: "leader-wakeup" as const,
-      ownerPid: process.pid,
-      preparedSession: effectiveSession,
-      selectedWorkItem: null,
-      pendingRun: { id: run.id, taskId: task.id, roleName: role.name },
-      expectedStateDigest: atomicDispatch.expectedStateDigest,
-      recoveryToken: null,
-      ...createRoleRuntimeOperationLease(now)
-    };
-    executePostCommitRoleDispatch(tmux, {
-      taskId: task.id,
-      role,
-      launch: prepared.launch,
-      input,
-      replaceExisting: mode === "new",
-      launchToken: intent.token
-    }, () => executeDomainTransaction(rootDir, `leader-wakeup-${randomUUID()}`, (workingRoot) => {
-      const transactionStore = FileTaskStore.forDomainTransactionWorkspace(workingRoot, intent.token);
-      persistTaskRoleDispatch(atomicDispatch, transactionStore, { recordAcceptedEvent: false });
-      const schedule = transactionStore.getTaskSchedule(task.id);
-      if (schedule !== null) {
-        transactionStore.saveTaskSchedule(task.id, {
-          ...schedule,
-          lastLeaderWakeupAt: now.toISOString(),
-          updatedAt: now.toISOString()
-        });
-      }
-      transactionStore.saveEvent(task.id, createTaskEvent(
-        transactionStore.nextEventId(task.id),
-        "leader.wakeup_dispatched",
-        { reasons: wakeup.reasons.join(",") },
-        now
-      ));
-      const cycle = createCycle(
-        transactionStore.nextCycleId(task.id),
+    // This check deliberately precedes every tmux operation. A pending wake is
+    // durable state, not text that may be injected into a busy Agent composer.
+    if (store.getActiveAgentRun(task.id, role.name) !== null) {
+      results.push({ taskId: task.id, status: "skipped", reason: "busy" });
+      continue;
+    }
+
+    const existingSession = store.getRoleSession(task.id, role.name);
+    let effectiveSession: SchedulerRoleSession | null = existingSession;
+    let claimed = false;
+    let run: ReturnType<typeof createAgentRun> | null = null;
+    try {
+      const mode = hasNativeSession(existingSession) ? "resume" : "new";
+      const input = leaderWakeupInput(
         task.id,
-        cycleCauseForWakeup(wakeup.reasons),
-        `Leader wakeup: ${wakeup.reasons.join(", ")}`,
+        wakeup.reasons,
+        store.getTaskBrief(task.id),
+        store.listDecisions(task.id),
+        store.listMilestones(task.id)
+      );
+      run = createAgentRun(
+        store.nextAgentRunId(task.id),
+        task.id,
+        role.name,
+        mode,
+        input,
         now
       );
-      transactionStore.saveCycle(task.id, cycle);
-      transactionStore.saveEvent(task.id, createTaskEvent(
-        transactionStore.nextEventId(task.id),
-        "cycle.created",
-        { cycle: cycle.id, cause: cycle.cause },
+      const prepared = await delivery.prepareRoleSession({
+        taskId: task.id,
+        roleName: role.name,
+        agentId: role.activeAgentId,
+        adapterId: role.adapterId,
+        mode,
+        ...(mode === "resume" ? { nativeSessionId: existingSession!.nativeSessionId } : {})
+      });
+      const ready = await delivery.waitUntilReady(prepared);
+      const latestTask = store.getTask(task.id);
+      if (latestTask === null || latestTask.status !== "active") {
+        results.push({ taskId: task.id, status: "skipped", reason: "unavailable" });
+        continue;
+      }
+      effectiveSession = validateReadySession(role.activeAgentId, existingSession, mode, ready.session);
+      const claim = store.saveLeaderDispatch({ task, role, run, session: effectiveSession, wakeup, now });
+      if (claim !== "claimed") {
+        results.push({ taskId: task.id, status: "skipped", reason: claim });
+        continue;
+      }
+      claimed = true;
+      await delivery.sendOnce({
+        delivery: ready,
+        receiptId: `agent-run:${run.id}`,
+        text: input
+      });
+
+      store.saveRoleRunDelivery({ task, role, run, session: effectiveSession, now });
+      results.push({ taskId: task.id, status: "dispatched" });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const message = `Leader dispatch failed: ${detail}`;
+      store.saveLeaderDispatchFailure({
+        task,
+        role,
+        session: effectiveSession,
+        failure: recordLeaderFailure(
+          task.id,
+          effectiveSession?.nativeSessionId ?? "(unregistered)",
+          message,
+          now,
+          store.getLeaderFailure(task.id)
+        ),
+        notification: createLeaderRecoveryNotification(
+          task.id,
+          message,
+          now,
+          store.getOperatorNotification(task.id)
+        ),
+        ...(claimed && run !== null ? { claimed: { run, wakeup } } : {}),
         now
-      ));
-      transactionStore.clearPendingWakeupIfUnchanged(wakeup);
-      clearRoleRuntimeOperationClaim(
-        workingRoot,
-        intent.taskId,
-        intent.roleName,
-        intent.token
-      );
-    }), {
-      claim: () => claimRoleRuntimeOperation(
-        rootDir,
-        `leader-wakeup-claim-${randomUUID()}`,
-        intent,
-        (workingRoot) => roleRuntimeStateDigest(readRoleRuntimeStateSnapshot(
-          new FileTaskStore(workingRoot),
-          intent.taskId,
-          intent.roleName,
-          { pendingRunId: intent.pendingRun?.id }
-        ))
-      ),
-      release: () => releaseRoleRuntimeOperationClaim(
-        rootDir,
-        `leader-wakeup-release-${randomUUID()}`,
-        intent
-      )
-    });
-    return { taskId: task.id, status: "dispatched" };
-  } catch (error) {
-    if (error instanceof DomainTransactionRecoveryError) {
-      throw error;
+      });
+      results.push({ taskId: task.id, status: "failed", error: message });
     }
-    return recordLeaderWakeupFailure(task, role, error, tmux, now, rootDir);
   }
+  return results;
 }
 
-function recordLeaderWakeupFailure(
-  task: Task,
-  role: Role,
-  error: unknown,
-  tmux: TmuxManager,
-  now: Date,
-  rootDir: string
-): LeaderWakeupProcessingResult {
-  if (readRoleRuntimeOperationClaim(rootDir, task.id, role.name) !== null) {
-    return { taskId: task.id, status: "skipped" };
+function validateReadySession(
+  activeAgentId: string,
+  existing: SchedulerRoleSession | null,
+  mode: "new" | "resume",
+  session: SchedulerRoleSession | null
+): SchedulerRoleSession | null {
+  if (mode === "new" && session === null) return null;
+  if (session === null) throw new Error("Leader resume returned no fixed native session.");
+  if (session.agentId !== activeAgentId) {
+    throw new Error(`Ready session belongs to another Agent: ${session.agentId}.`);
   }
-  const detail = error instanceof Error ? error.message : String(error);
-  const message = `Leader dispatch failed: ${detail}`;
-  const failureRecorded = executeDomainTransaction(rootDir, `leader-wakeup-failed-${randomUUID()}`, (workingRoot) => {
-    const transactionStore = new FileTaskStore(workingRoot);
-    const currentRole = transactionStore.getRole(task.id, role.name);
-    if (
-      currentRole === null ||
-      currentRole.updatedAt !== role.updatedAt ||
-      transactionStore.getActiveAgentRun(task.id, role.name) !== null
-    ) {
-      return false;
-    }
-    const currentSessionSet = transactionStore.getRoleSessionSet(task.id, role.name);
-    const currentSession = currentSessionSet?.sessions[currentRole.activeAgentId] ?? null;
-    transactionStore.saveLeaderFailure(recordLeaderFailure(
-      task.id,
-      currentSession?.nativeSessionId ?? "(unregistered)",
-      message,
-      now,
-      transactionStore.getLeaderFailure(task.id)
-    ));
-    transactionStore.saveOperatorNotification(createLeaderRecoveryNotification(
-      task.id,
-      message,
-      now,
-      transactionStore.getOperatorNotification(task.id)
-    ));
-    if (currentSessionSet !== null && currentSession !== null && currentSession.status !== "reserved") {
-      transactionStore.saveRoleSessionSet(updateRoleAgentSessionStatus(
-        currentSessionSet,
-        currentRole.activeAgentId,
-        "broken",
-        now
-      ));
-    }
-    transactionStore.saveRole(task.id, updateRoleStatus(currentRole, "failed", now));
-    return true;
-  });
-  if (!failureRecorded) {
-    return { taskId: task.id, status: "skipped" };
+  if (!hasNativeSession(session)) {
+    throw new Error("Ready Leader session has no native session id.");
   }
-  try {
-    tmux.sendRoleInput(
-      "operator",
-      "operator",
-      `TaskMux alert: Leader recovery failed for ${task.id}. ${message}`
-    );
-  } catch {
-    // The durable notification remains available when Operator is not running.
+  if (mode === "resume" && session.nativeSessionId !== existing?.nativeSessionId) {
+    throw new Error("Leader resume changed the fixed native session id.");
   }
-  return {
-    taskId: task.id,
-    status: "failed",
-    error: message
-  };
+  return { ...session, status: "running" };
 }
 
-function cycleCauseForWakeup(reasons: string[]): CycleCause {
-  const supported = reasons.find((reason): reason is CycleCause => [
-    "task-created",
-    "user-comment",
-    "schedule",
-    "review-time",
-    "operator-input",
-    "role-result",
-    "inactivity",
-    "explicit-wake"
-  ].includes(reason));
+function hasNativeSession(
+  session: SchedulerRoleSession | null
+): session is SchedulerRoleSession & { nativeSessionId: string } {
+  return session !== null &&
+    typeof session.nativeSessionId === "string" &&
+    session.nativeSessionId.trim().length > 0;
+}
 
-  if (supported !== undefined) {
-    return supported;
+function leaderWakeupInput(
+  taskId: string,
+  reasons: readonly string[],
+  brief: import("../brief/taskBrief.js").TaskBrief | null,
+  decisions: readonly import("../decision/decision.js").Decision[],
+  milestones: readonly import("../milestone/milestone.js").Milestone[]
+): string {
+  const lines: string[] = [
+    `TaskMux wakeup reasons: ${reasons.join(", ")}.`
+  ];
+  if (brief !== null) {
+    lines.push(`Objective: ${brief.objective}`);
+    if (brief.boundaries.length > 0) {
+      lines.push("Boundaries:");
+      for (const boundary of brief.boundaries) {
+        lines.push(`  - ${boundary}`);
+      }
+    }
+    if (brief.currentFocus.trim().length > 0) {
+      lines.push(`Current focus: ${brief.currentFocus}`);
+    }
+    if (brief.leaderSummary.trim().length > 0) {
+      lines.push(`Leader summary: ${brief.leaderSummary}`);
+    }
   }
-  if (reasons.some((reason) => reason.startsWith("role-") || reason.startsWith("leader-run-"))) {
-    return "role-result";
+  const activeDecisions = decisions.filter((d) => d.status === "active").slice(-3);
+  if (activeDecisions.length > 0) {
+    lines.push("Active decisions:");
+    for (const decision of activeDecisions) {
+      lines.push(`  - ${decision.title}: ${decision.rationale}`);
+    }
   }
-  return "explicit-wake";
+  const recentMilestones = [...milestones]
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .slice(0, 3);
+  if (recentMilestones.length > 0) {
+    lines.push("Recent milestones:");
+    for (const milestone of recentMilestones) {
+      lines.push(`  - ${milestone.title}`);
+    }
+  }
+  lines.push(
+    `Inspect taskmux task context ${taskId}, which includes open and recently resolved input requests; then continue Leader stewardship. Use narrower show/list commands only when one record needs closer inspection.`
+  );
+  return lines.join("\n");
 }

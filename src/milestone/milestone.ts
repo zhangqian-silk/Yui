@@ -4,7 +4,6 @@ export type Milestone = {
   taskId: string;
   title: string;
   summary: string;
-  topics: string[];
   createdBy: "leader";
   createdAt: string;
 };
@@ -14,28 +13,31 @@ export function createMilestone(
   taskId: string,
   title: string,
   summary: string,
-  topics: string[],
   now: Date
 ): Milestone {
-  const trimmedTitle = title.trim();
-  const trimmedSummary = summary.trim();
-  if (trimmedTitle.length === 0 || trimmedSummary.length === 0) {
-    throw new Error("Milestone title and summary are required.");
-  }
-
   return {
     schemaVersion: 1,
-    id,
-    taskId,
-    title: trimmedTitle,
-    summary: trimmedSummary,
-    topics: [...new Set(topics)],
+    id: requireSafeIdentity(id, "Milestone id"),
+    taskId: requireSafeIdentity(taskId, "Task id"),
+    title: requireText(title, "Milestone title"),
+    summary: requireText(summary, "Milestone summary"),
     createdBy: "leader",
     createdAt: now.toISOString()
   };
 }
 
-export function renderMilestoneTimelineEntry(milestone: Milestone): string {
-  const topics = milestone.topics.length === 0 ? "" : ` [${milestone.topics.join(", ")}]`;
-  return `## ${milestone.createdAt} — ${milestone.title}${topics}\n\n${milestone.summary}\n\n`;
+function requireSafeIdentity(value: string, label: string): string {
+  const normalized = requireText(value, label);
+  if (["__proto__", "prototype", "constructor", ".", ".."].includes(normalized)
+    || /[\/\\\0]/.test(normalized)) {
+    throw new Error(`${label} is invalid.`);
+  }
+  return normalized;
+}
+
+function requireText(value: string, label: string): string {
+  if (typeof value !== "string" || value.includes("\0")) throw new Error(`${label} is invalid.`);
+  const normalized = value.trim();
+  if (normalized.length === 0) throw new Error(`${label} is required.`);
+  return normalized;
 }

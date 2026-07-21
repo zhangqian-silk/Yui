@@ -13,21 +13,20 @@
   },
   "files": [
     "dist",
-    "prebuilds",
     "skills",
     "README.md",
+    "ARCHITECTURE.md",
+    "i18n/README.zh-CN.md",
     "LICENSE"
   ],
   "scripts": {
-    "prebuild": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
-    "build": "npm run build:native && npm run build:ts",
-    "build:ts": "tsc -p tsconfig.json",
-    "build:native": "node-gyp rebuild --directory native && node scripts/stage-native-prebuild.mjs && node scripts/write-native-prebuild-manifest.mjs --host",
-    "test": "node --test test/*.test.js",
+    "build": "tsc -p tsconfig.json",
+    "pretest": "npm run build",
+    "test": "env -u FORCE_COLOR NO_COLOR=1 node --test test/*.test.js test/core/*.test.js",
     "lint": "tsc -p tsconfig.json --noEmit",
     "verify:release-tag": "node scripts/verify-release-tag.mjs",
     "prepublishOnly": "node scripts/refuse-source-publish.mjs",
-    "pack:dry-run": "npm run build && node scripts/assemble-runtime-package.mjs --host --output .release-stage && npm pack ./.release-stage --dry-run --ignore-scripts --cache ./.npm-cache"
+    "pack:dry-run": "npm run build && node scripts/assemble-runtime-package.mjs --output .release-stage && npm pack ./.release-stage --dry-run --ignore-scripts --cache ./.npm-cache"
   },
   "engines": {
     "node": "^20.17.0 || ^22.9.0 || ^24.0.0"
@@ -36,13 +35,11 @@
     "linux"
   ],
   "cpu": [
-    "x64",
-    "arm64"
+    "x64"
   ],
   "libc": [
     "glibc"
   ],
-  "gypfile": false,
   "keywords": [
     "taskmux",
     "tmux",
@@ -60,12 +57,7 @@
   },
   "homepage": "https://github.com/zhangqian-silk/TaskMux#readme",
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.9.3",
-    "node-gyp": "^10.3.1",
     "typescript": "^5.8.0"
-  },
-  "dependencies": {
-    "better-sqlite3": "^11.10.0"
   }
 }

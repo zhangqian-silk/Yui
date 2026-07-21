@@ -1,665 +1,448 @@
-import { findChild, ROOT_COMMAND, type CommandNode } from "./commandCatalog.js";
-import { ROLE_AGENT_OPTION_SPECS } from "./roleOptionCatalog.js";
+import type { CommandNode } from "./commandCatalog.js";
 
 export type CandidateProviderName =
   | "configured-agents"
-  | "global-roles-for-show"
-  | "removable-global-roles"
-  | "configured-global-roles"
-  | "tasks"
-  | "unarchived-tasks"
-  | "archived-tasks"
-  | "tasks-with-input-drafts"
+  | "global-roles"
   | "input-requests"
-  | "open-input-requests"
-  | "task-open-input-requests"
-  | "input-answer-choices"
-  | "trashed-tasks"
+  | "jobs"
+  | "repositories"
+  | "runs"
+  | "task-decisions"
+  | "task-events"
+  | "task-milestones"
   | "task-roles"
-  | "task-roles-with-transcripts"
-  | "task-roles-with-active-runs"
-  | "task-roles-without-active-runs"
-  | "removable-task-roles"
-  | "worktree-task-roles"
-  | "managed-worktree-task-roles"
-  | "task-topics"
-  | "active-cycles"
-  | "open-work-items"
-  | "work-items"
-  | "dispatch-work-items"
-  | "active-decisions";
+  | "tasks"
+  | "work-items";
+
 export type SelectableEntity =
   | "agent"
   | "global-role"
-  | "task"
-  | "task-role"
-  | "topic"
-  | "cycle"
-  | "work-item"
-  | "decision"
   | "input-request"
-  | "input-answer";
+  | "job"
+  | "repository"
+  | "run"
+  | "task"
+  | "decision"
+  | "event"
+  | "milestone"
+  | "task-role"
+  | "work-item";
+
 export type TrailingOptionKind = "flag" | "value" | "option-like-value";
 
-export type ArgumentSelector = {
+export type ArgumentSelector = Readonly<{
   argumentIndex?: number;
   option?: string;
   requiredOption?: boolean;
   entity: SelectableEntity;
   provider: CandidateProviderName;
   dependsOn?: number;
-  unlessOption?: string;
   actionTarget: boolean;
-};
+  statuses?: readonly string[];
+}>;
 
-export type InteractionPolicy = {
+export type InteractionPolicy = Readonly<{
   commandPath: readonly string[];
   selectors: readonly ArgumentSelector[];
   trailingOptions?: Readonly<Record<string, TrailingOptionKind>>;
-  requiredArguments?: readonly number[];
-  requiredOptions?: readonly string[];
-  requiredAnyOptions?: readonly string[];
-  optionPrerequisites?: readonly {
-    option: string;
-    values: readonly string[];
-    requireWhenSelecting: boolean;
-    requiredOptions: readonly string[];
-  }[];
-  confirmation?: {
+  confirmation?: Readonly<{
     action: string;
     targetArgumentIndex: number;
-  };
-};
+  }>;
+}>;
 
-export const INTERACTION_POLICIES: readonly InteractionPolicy[] = [
-  {
-    commandPath: ["agent", "show"],
-    selectors: [
-      { argumentIndex: 2, entity: "agent", provider: "configured-agents", actionTarget: true }
-    ]
-  },
-  {
-    commandPath: ["agent", "update"],
-    selectors: [
-      { argumentIndex: 2, entity: "agent", provider: "configured-agents", actionTarget: true }
-    ],
-    trailingOptions: {
-      "--adapter": "value", "--command": "value", "--arg": "option-like-value", "--clear-args": "flag",
-      "--env": "value", "--clear-env": "flag", "--refresh-probe": "flag"
-    },
-    requiredAnyOptions: ["--adapter", "--command", "--arg", "--clear-args", "--env", "--clear-env", "--refresh-probe"]
-  },
-  {
-    commandPath: ["agent", "remove"],
-    selectors: [
-      { argumentIndex: 2, entity: "agent", provider: "configured-agents", actionTarget: true }
-    ],
-    confirmation: { action: "Remove agent", targetArgumentIndex: 2 }
-  },
-  {
-    commandPath: ["config", "set", "default-agent"],
-    selectors: [
-      { argumentIndex: 3, entity: "agent", provider: "configured-agents", actionTarget: true }
-    ]
-  },
-  {
-    commandPath: ["role", "show"],
-    selectors: [
-      { argumentIndex: 2, entity: "global-role", provider: "global-roles-for-show", actionTarget: true }
-    ]
-  },
-  {
-    commandPath: ["role", "remove"],
-    selectors: [
-      { argumentIndex: 2, entity: "global-role", provider: "removable-global-roles", actionTarget: true }
-    ],
-    confirmation: { action: "Remove role", targetArgumentIndex: 2 }
-  },
-  {
-    commandPath: ["role", "enter"],
-    selectors: [
-      { argumentIndex: 2, entity: "global-role", provider: "configured-global-roles", actionTarget: true }
-    ]
-  },
+const taskTarget = (
+  command: string,
+  argumentIndex = 2,
+  statuses?: readonly string[]
+): InteractionPolicy => ({
+  commandPath: ["task", command],
+  selectors: [{
+    argumentIndex,
+    entity: "task",
+    provider: "tasks",
+    actionTarget: true,
+    ...(statuses === undefined ? {} : { statuses })
+  }]
+});
+
+export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze([
+  ...["show", "update", "remove"].map((command): InteractionPolicy => ({
+    commandPath: ["agent", command],
+    selectors: [{
+      argumentIndex: 2,
+      entity: "agent",
+      provider: "configured-agents",
+      actionTarget: true
+    }],
+    ...(command === "remove"
+      ? { confirmation: { action: "Remove Agent", targetArgumentIndex: 2 } }
+      : {})
+  })),
   {
     commandPath: ["role", "add"],
-    selectors: [
-      { option: "--agent", requiredOption: true, entity: "agent", provider: "configured-agents", actionTarget: false }
-    ],
-    trailingOptions: {
-      "--agent": "value", "--workspace": "value", "--description": "value", "--responsibility": "value",
-      "--constraint": "value", "--expected-output": "value", "--system-prompt": "value", "--skill": "value"
-    },
-    requiredArguments: [2]
-  },
-  roleUpdateInteractionPolicy(["role", "update"], [
-    { argumentIndex: 2, entity: "global-role", provider: "configured-global-roles", actionTarget: true },
-    { option: "--agent", entity: "agent", provider: "configured-agents", actionTarget: false },
-    { option: "--active-agent", entity: "agent", provider: "configured-agents", actionTarget: false }
-  ]),
-  ...[
-    "show", "open", "context", "roles", "comments", "events", "activity", "timeline"
-  ].map((command): InteractionPolicy => ({
-    commandPath: ["task", command],
-    selectors: [
-      { argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true }
-    ],
-    ...(command === "context"
-      ? { trailingOptions: { "--format": "value", "--include-transcripts": "flag" } as const }
-      : {})
-  })),
-  {
-    commandPath: ["task", "topic", "list"],
-    selectors: [
-      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true }
-    ]
-  },
-  {
-    commandPath: ["task", "detail"],
-    selectors: [
-      { argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true },
-      {
-        argumentIndex: 3,
-        entity: "task-role",
-        provider: "task-roles",
-        dependsOn: 2,
-        actionTarget: true
-      }
-    ]
-  },
-  {
-    commandPath: ["task", "enter"],
-    selectors: [
-      { argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true },
-      {
-        argumentIndex: 3,
-        entity: "task-role",
-        provider: "task-roles",
-        dependsOn: 2,
-        actionTarget: true
-      }
-    ]
-  },
-  ...["status", "tail", "transcript"].map((command): InteractionPolicy => ({
-    commandPath: ["task", command],
-    selectors: [
-      { argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true },
-      {
-        argumentIndex: 3,
-        entity: "task-role",
-        provider: "task-roles",
-        dependsOn: 2,
-        actionTarget: true
-      }
-    ]
-  })),
-  {
-    commandPath: ["task", "transcript", "export"],
-    selectors: [
-      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-      {
-        argumentIndex: 4,
-        entity: "task-role",
-        provider: "task-roles-with-transcripts",
-        dependsOn: 3,
-        actionTarget: true
-      }
-    ],
-    trailingOptions: { "--format": "value", "--output": "value" }
-  },
-  {
-    commandPath: ["task", "delete"],
-    selectors: [
-      { argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true }
-    ],
-    confirmation: { action: "Delete task", targetArgumentIndex: 2 }
-  },
-  ...[
-    ["clone", "tasks", { "--title": "value" }],
-    ["update", "tasks", {
-      "--title": "value", "--description": "value", "--priority": "value", "--tag": "value", "--due": "value",
-      "--clear-description": "flag", "--clear-priority": "flag", "--clear-tags": "flag", "--clear-due": "flag"
+    selectors: [{
+      option: "--agent",
+      requiredOption: true,
+      entity: "agent",
+      provider: "configured-agents",
+      actionTarget: false
     }],
-    ["archive", "unarchived-tasks", { "--reason": "value", "--summary": "value" }],
-    ["unarchive", "archived-tasks", {}],
-    ["shell", "tasks", {}],
-    ["refresh", "tasks", {}],
-    ["cleanup", "tasks", {}]
-  ].map(([command, provider, trailingOptions]): InteractionPolicy => ({
-    commandPath: ["task", command as string],
-    selectors: [{ argumentIndex: 2, entity: "task", provider: provider as CandidateProviderName, actionTarget: true }],
-    trailingOptions: trailingOptions as Readonly<Record<string, "flag" | "value">>,
-    ...(command === "update" ? { requiredAnyOptions: Object.keys(trailingOptions as object) } : {}),
-    ...(command === "archive" ? { confirmation: { action: "Archive task", targetArgumentIndex: 2 } } : {})
-  })),
-  {
-    commandPath: ["task", "wake"],
-    selectors: [{ argumentIndex: 2, entity: "task", provider: "unarchived-tasks", actionTarget: true }],
-    trailingOptions: { "--reason": "value" },
-    requiredOptions: ["--reason"]
+    trailingOptions: {
+      "--agent": "value", "--workspace": "value", "--description": "value",
+      "--responsibility": "value", "--constraint": "value", "--expected-output": "value",
+      "--system-prompt": "value", "--skill": "value", "--model": "value",
+      "--effort": "value", "--sandbox": "value", "--approval": "value",
+      "--permission-mode": "value", "--search": "value"
+    }
   },
-  {
-    commandPath: ["task", "assign"],
-    selectors: [
-      { argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true },
-      { argumentIndex: 3, entity: "global-role", provider: "configured-global-roles", dependsOn: 2, unlessOption: "--agent", actionTarget: true },
-      { option: "--agent", entity: "agent", provider: "configured-agents", actionTarget: false }
-    ],
-    trailingOptions: { "--agent": "value", "--workspace": "value", "--as": "value" }
-  },
-  {
-    commandPath: ["task", "bind"],
-    selectors: [
-      { argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true },
-      { argumentIndex: 3, entity: "global-role", provider: "configured-global-roles", dependsOn: 2, actionTarget: true }
-    ],
-    trailingOptions: { "--as": "value", "--workspace": "value" }
-  },
-  {
-    commandPath: ["task", "assign-many"],
-    selectors: [
-      { argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true },
-      { option: "--agent", entity: "agent", provider: "configured-agents", actionTarget: false }
-    ],
-    trailingOptions: { "--role": "value", "--agent": "value", "--workspace": "value" },
-    requiredOptions: ["--role"]
-  },
-  {
-    commandPath: ["task", "role", "child"],
-    selectors: [
-      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-      { option: "--parent", entity: "task-role", provider: "task-roles", dependsOn: 3, actionTarget: false }
-    ],
-    trailingOptions: { "--parent": "value", "--description": "value", "--responsibility": "value", "--constraint": "value", "--expected-output": "value" },
-    requiredArguments: [4],
-    requiredOptions: ["--description", "--expected-output"]
-  },
-  roleUpdateInteractionPolicy(["task", "role", "update"], [
-    { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-    { argumentIndex: 4, entity: "task-role", provider: "task-roles", dependsOn: 3, actionTarget: true },
-    { option: "--agent", entity: "agent", provider: "configured-agents", actionTarget: false },
-    { option: "--active-agent", entity: "agent", provider: "configured-agents", actionTarget: false }
-  ]),
-  {
-    commandPath: ["task", "role", "remove"],
-    selectors: [
-      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-      { argumentIndex: 4, entity: "task-role", provider: "removable-task-roles", dependsOn: 3, actionTarget: true }
-    ],
-    confirmation: { action: "Remove task role", targetArgumentIndex: 4 }
-  },
-  ...["detach", "stop", "kill", "restart"].map((command): InteractionPolicy => ({
-    commandPath: ["task", command],
-    selectors: [
-      { argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true },
-      { argumentIndex: 3, entity: "task-role", provider: "task-roles", dependsOn: 2, actionTarget: true }
-    ],
-    ...(["stop", "kill", "restart"].includes(command)
-      ? { confirmation: { action: `${command[0]?.toUpperCase()}${command.slice(1)} task role`, targetArgumentIndex: 3 } }
+  ...["show", "update", "remove", "enter"].map((command): InteractionPolicy => ({
+    commandPath: ["role", command],
+    selectors: [{
+      argumentIndex: 2,
+      entity: "global-role",
+      provider: "global-roles",
+      actionTarget: true
+    }],
+    ...(command === "remove"
+      ? { confirmation: { action: "Remove Role", targetArgumentIndex: 2 } }
       : {})
   })),
   {
-    commandPath: ["task", "restore"],
+    commandPath: ["role", "bind"],
     selectors: [
-      { argumentIndex: 2, entity: "task", provider: "trashed-tasks", actionTarget: true }
+      { argumentIndex: 2, entity: "global-role", provider: "global-roles", actionTarget: true },
+      { argumentIndex: 3, entity: "agent", provider: "configured-agents", actionTarget: false }
     ]
+  },
+  ...["record", "replace"].map((command): InteractionPolicy => ({
+    commandPath: ["role", "session", command],
+    selectors: [{
+      argumentIndex: 3,
+      entity: "global-role",
+      provider: "global-roles",
+      actionTarget: true
+    }],
+    trailingOptions: command === "replace"
+      ? { "--native-id": "value", "--reason": "value" }
+      : { "--native-id": "value" }
+  })),
+  taskTarget("show"),
+  taskTarget("context"),
+  {
+    ...taskTarget("update"),
+    trailingOptions: {
+      "--title": "value",
+      "--description": "value",
+      "--priority": "value",
+      "--tags": "value",
+      "--due-at": "value",
+      "--clear-description": "flag",
+      "--clear-priority": "flag",
+      "--clear-tags": "flag",
+      "--clear-due-at": "flag"
+    }
+  },
+  taskTarget("activate", 2, ["draft"]),
+  {
+    ...taskTarget("complete", 2, ["active"]),
+    trailingOptions: { "--summary": "value" }
+  },
+  taskTarget("reopen", 2, ["completed"]),
+  {
+    ...taskTarget("archive"),
+    confirmation: { action: "Archive task", targetArgumentIndex: 2 }
+  },
+  taskTarget("reconcile"),
+  {
+    commandPath: ["operator", "submit"],
+    selectors: [{
+      option: "--task",
+      entity: "task",
+      provider: "tasks",
+      actionTarget: false
+    }],
+    trailingOptions: { "--task": "value" }
   },
   {
-    commandPath: ["task", "input", "submit"],
-    selectors: [
-      { argumentIndex: 3, entity: "task", provider: "tasks-with-input-drafts", actionTarget: true }
-    ]
+    commandPath: ["task", "create"],
+    selectors: [{
+      option: "--repository",
+      entity: "repository",
+      provider: "repositories",
+      actionTarget: false
+    }],
+    trailingOptions: { "--repository": "value", "--base": "value" }
   },
+  ...["send", "list"].map((command): InteractionPolicy => ({
+    commandPath: ["task", "message", command],
+    selectors: [{
+      argumentIndex: 3,
+      entity: "task",
+      provider: "tasks",
+      actionTarget: true
+    }]
+  })),
   {
     commandPath: ["task", "input", "request"],
-    selectors: [
-      { argumentIndex: 3, entity: "task", provider: "unarchived-tasks", actionTarget: true }
-    ],
+    selectors: [{
+      argumentIndex: 3,
+      entity: "task",
+      provider: "tasks",
+      actionTarget: true,
+      statuses: ["active"]
+    }],
     trailingOptions: {
       "--question": "value",
       "--choice": "value",
       "--blocks": "value",
-      "--policy": "value",
       "--recommend": "value",
-      "--recommendation-reason": "value",
-      "--timeout": "value"
-    },
-    requiredOptions: ["--question"]
+      "--timeout-seconds": "value"
+    }
   },
   {
     commandPath: ["task", "input", "show"],
     selectors: [
-      { argumentIndex: 3, entity: "input-request", provider: "input-requests", actionTarget: true }
+      { argumentIndex: 3, entity: "input-request", provider: "input-requests", actionTarget: true },
+      { option: "--task", entity: "task", provider: "tasks", actionTarget: false }
     ],
     trailingOptions: { "--task": "value" }
   },
   {
     commandPath: ["task", "input", "answer"],
     selectors: [
-      { argumentIndex: 3, entity: "input-request", provider: "open-input-requests", actionTarget: true },
       {
-        option: "--choice",
-        requiredOption: true,
-        entity: "input-answer",
-        provider: "input-answer-choices",
-        dependsOn: 3,
-        unlessOption: "--text",
-        actionTarget: false
-      }
+        argumentIndex: 3,
+        entity: "input-request",
+        provider: "input-requests",
+        actionTarget: true,
+        statuses: ["open"]
+      },
+      { option: "--task", entity: "task", provider: "tasks", actionTarget: false }
     ],
     trailingOptions: { "--task": "value", "--choice": "value", "--text": "value" }
   },
   {
     commandPath: ["task", "input", "cancel"],
     selectors: [
-      { argumentIndex: 3, entity: "task", provider: "unarchived-tasks", actionTarget: true },
+      {
+        argumentIndex: 3,
+        entity: "task",
+        provider: "tasks",
+        actionTarget: true,
+        statuses: ["active"]
+      },
       {
         argumentIndex: 4,
         entity: "input-request",
-        provider: "task-open-input-requests",
+        provider: "input-requests",
+        dependsOn: 3,
+        actionTarget: true,
+        statuses: ["open"]
+      }
+    ],
+    trailingOptions: { "--reason": "value" }
+  },
+  {
+    commandPath: ["task", "role", "add"],
+    selectors: [
+      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
+      { option: "--agent", entity: "agent", provider: "configured-agents", actionTarget: false }
+    ],
+    trailingOptions: {
+      "--agent": "value", "--description": "value", "--responsibility": "value",
+      "--constraint": "value", "--expected-output": "value", "--system-prompt": "value",
+      "--skill": "value", "--model": "value", "--effort": "value",
+      "--sandbox": "value", "--approval": "value", "--permission-mode": "value",
+      "--search": "value"
+    }
+  },
+  {
+    commandPath: ["task", "role", "list"],
+    selectors: [{ argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true }]
+  },
+  ...["show", "status", "update", "remove"].map((command): InteractionPolicy => ({
+    commandPath: ["task", "role", command],
+    selectors: [
+      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
+      {
+        argumentIndex: 4,
+        entity: "task-role",
+        provider: "task-roles",
         dependsOn: 3,
         actionTarget: true
       }
     ],
-    trailingOptions: { "--reason": "value" },
-    requiredOptions: ["--reason"]
-  },
-  {
-    commandPath: ["task", "cycle", "end"],
-    selectors: [
-      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-      { argumentIndex: 4, entity: "cycle", provider: "active-cycles", dependsOn: 3, actionTarget: true }
-    ],
-    trailingOptions: { "--summary": "value" },
-    requiredOptions: ["--summary"],
-    confirmation: { action: "End cycle", targetArgumentIndex: 4 }
-  },
-  {
-    commandPath: ["task", "work-item", "update"],
-    selectors: [
-      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-      { argumentIndex: 4, entity: "work-item", provider: "work-items", dependsOn: 3, actionTarget: true }
-    ],
-    trailingOptions: { "--status": "value", "--outcome": "value" },
-    requiredOptions: ["--status"],
-    optionPrerequisites: [{
-      option: "--status",
-      values: ["completed", "failed", "cancelled", "superseded"],
-      requireWhenSelecting: true,
-      requiredOptions: ["--outcome"]
-    }]
-  },
-  {
-    commandPath: ["task", "decision", "supersede"],
-    selectors: [
-      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-      { argumentIndex: 4, entity: "decision", provider: "active-decisions", dependsOn: 3, actionTarget: true }
-    ],
-    trailingOptions: { "--reason": "value" },
-    requiredOptions: ["--reason"],
-    confirmation: { action: "Supersede decision", targetArgumentIndex: 4 }
-  },
-  {
-    commandPath: ["task", "topic", "summarize"],
-    selectors: [
-      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-      { option: "--topic", requiredOption: true, entity: "topic", provider: "task-topics", dependsOn: 3, actionTarget: false }
-    ],
-    trailingOptions: { "--topic": "value", "--summary": "value" },
-    requiredOptions: ["--summary"]
-  },
-  {
-    commandPath: ["task", "topic", "create"],
-    selectors: [{ argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true }],
-    trailingOptions: { "--id": "value", "--name": "value", "--description": "value" },
-    requiredOptions: ["--id", "--name", "--description"]
-  },
-  {
-    commandPath: ["task", "cycle", "create"],
-    selectors: [
-      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-      { option: "--topic", entity: "topic", provider: "task-topics", dependsOn: 3, actionTarget: false }
-    ],
-    trailingOptions: { "--cause": "value", "--summary": "value", "--topic": "value" },
-    requiredOptions: ["--cause", "--summary"]
-  },
-  {
-    commandPath: ["task", "work-item", "create"],
-    selectors: [
-      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-      { option: "--cycle", entity: "cycle", provider: "active-cycles", dependsOn: 3, actionTarget: false },
-      { option: "--assignee", entity: "task-role", provider: "task-roles", dependsOn: 3, actionTarget: false },
-      { option: "--topic", entity: "topic", provider: "task-topics", dependsOn: 3, actionTarget: false }
-    ],
-    trailingOptions: { "--title": "value", "--cycle": "value", "--assignee": "value", "--topic": "value" },
-    requiredOptions: ["--title"]
-  },
-  {
-    commandPath: ["task", "session", "record"],
-    selectors: [
-      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-      { argumentIndex: 4, entity: "task-role", provider: "task-roles", dependsOn: 3, actionTarget: true }
-    ],
-    trailingOptions: { "--native-id": "value" },
-    requiredOptions: ["--native-id"]
-  },
-  {
-    commandPath: ["task", "session", "replace"],
-    selectors: [
-      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-      { argumentIndex: 4, entity: "task-role", provider: "task-roles", dependsOn: 3, actionTarget: true }
-    ],
-    trailingOptions: { "--native-id": "value", "--reason": "value" },
-    requiredOptions: ["--native-id", "--reason"],
-    confirmation: { action: "Replace task role session", targetArgumentIndex: 4 }
-  },
-  {
-    commandPath: ["task", "dispatch"],
-    selectors: [
-      { argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true },
-      { argumentIndex: 3, entity: "task-role", provider: "task-roles-without-active-runs", dependsOn: 2, actionTarget: true },
-      { option: "--work-item", entity: "work-item", provider: "dispatch-work-items", dependsOn: 2, actionTarget: false },
-      { option: "--topic", entity: "topic", provider: "task-topics", dependsOn: 2, actionTarget: false }
-    ],
-    trailingOptions: { "--mode": "value", "--work-item": "value", "--topic": "value", "--input": "value" },
-    requiredOptions: ["--mode", "--input"]
-  },
-  {
-    commandPath: ["task", "yield"],
-    selectors: [
-      { argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true },
-      { argumentIndex: 3, entity: "task-role", provider: "task-roles-with-active-runs", dependsOn: 2, actionTarget: true }
-    ],
-    trailingOptions: { "--summary": "value" },
-    requiredOptions: ["--summary"],
-    confirmation: { action: "Yield task role", targetArgumentIndex: 3 }
-  },
-  ...[
-    ["schedule", "set", { "--inactivity-minutes": "value", "--cooldown-minutes": "value", "--review-at": "value", "--every-minutes": "value", "--next-at": "value" }, ["--inactivity-minutes", "--cooldown-minutes"]],
-    ["brief", "update", { "--objective": "value", "--boundary": "value", "--focus": "value", "--leader-summary": "value" }, ["--objective", "--focus", "--leader-summary"]],
-    ["milestone", "add", { "--title": "value", "--summary": "value", "--topic": "value" }, ["--title", "--summary"]],
-    ["decision", "record", { "--title": "value", "--rationale": "value", "--topic": "value" }, ["--title", "--rationale"]]
-  ].map(([group, command, trailingOptions, requiredOptions]): InteractionPolicy => ({
-    commandPath: ["task", group as string, command as string],
-    selectors: [
-      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-      ...(["milestone", "decision"].includes(group as string)
-        ? [{ option: "--topic", entity: "topic" as const, provider: "task-topics" as const, dependsOn: 3, actionTarget: false }]
-        : [])
-    ],
-    trailingOptions: trailingOptions as Readonly<Record<string, "value">>,
-    requiredOptions: requiredOptions as readonly string[]
+    ...(command === "remove"
+      ? { confirmation: { action: "Remove Task Role", targetArgumentIndex: 4 } }
+      : {})
   })),
   {
-    commandPath: ["task", "worktree", "create"],
+    commandPath: ["task", "role", "bind"],
     selectors: [
       { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-      { argumentIndex: 4, entity: "task-role", provider: "worktree-task-roles", dependsOn: 3, actionTarget: true }
-    ],
-    trailingOptions: { "--path": "value", "--branch": "value", "--base": "value" },
-    requiredOptions: ["--path", "--branch"]
+      {
+        argumentIndex: 4,
+        entity: "task-role",
+        provider: "task-roles",
+        dependsOn: 3,
+        actionTarget: true
+      },
+      { argumentIndex: 5, entity: "agent", provider: "configured-agents", actionTarget: false }
+    ]
   },
   {
-    commandPath: ["task", "worktree", "remove"],
+    commandPath: ["task", "role", "enter"],
     selectors: [
       { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-      { argumentIndex: 4, entity: "task-role", provider: "managed-worktree-task-roles", dependsOn: 3, actionTarget: true }
+      {
+        argumentIndex: 4,
+        entity: "task-role",
+        provider: "task-roles",
+        dependsOn: 3,
+        actionTarget: true
+      }
     ]
-  }
-];
+  },
+  {
+    commandPath: ["task", "work", "create"],
+    selectors: [
+      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
+      {
+        option: "--role",
+        entity: "task-role",
+        provider: "task-roles",
+        dependsOn: 3,
+        actionTarget: false
+      }
+    ],
+    trailingOptions: { "--role": "value" }
+  },
+  {
+    commandPath: ["task", "work", "list"],
+    selectors: [{ argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true }]
+  },
+  {
+    commandPath: ["task", "work", "update"],
+    selectors: [{ argumentIndex: 3, entity: "work-item", provider: "work-items", actionTarget: true }],
+    trailingOptions: { "--summary": "value" }
+  },
+  {
+    commandPath: ["task", "work", "dispatch"],
+    selectors: [{ argumentIndex: 3, entity: "work-item", provider: "work-items", actionTarget: true }],
+    trailingOptions: { "--input": "value" }
+  },
+  {
+    commandPath: ["task", "run", "list"],
+    selectors: [{ argumentIndex: 3, entity: "work-item", provider: "work-items", actionTarget: true }]
+  },
+  ...["retry", "yield"].map((command): InteractionPolicy => ({
+    commandPath: ["task", "run", command],
+    selectors: [{ argumentIndex: 3, entity: "run", provider: "runs", actionTarget: true }],
+    ...(command === "yield" ? { trailingOptions: { "--summary": "value" as const } } : {})
+  })),
+  {
+    commandPath: ["task", "enter"],
+    selectors: [{ argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true }]
+  },
+  {
+    commandPath: ["jobs", "retry"],
+    selectors: [{ argumentIndex: 2, entity: "job", provider: "jobs", actionTarget: true }]
+  },
+  ...([
+    ["brief", "show"],
+    ["brief", "update"],
+    ["decision", "record"],
+    ["decision", "list"],
+    ["decision", "show"],
+    ["decision", "supersede"],
+    ["milestone", "add"],
+    ["milestone", "list"],
+    ["milestone", "show"],
+    ["event", "list"],
+    ["event", "show"]
+  ] as const).map(([group, command]): InteractionPolicy => {
+    const trailingOptions: Record<string, TrailingOptionKind> = {};
+    if (group === "brief" && command === "update") {
+      Object.assign(trailingOptions, { "--objective": "value", "--boundary": "value", "--focus": "value", "--leader-summary": "value" });
+    } else if (group === "decision" && command === "record") {
+      Object.assign(trailingOptions, { "--title": "value", "--rationale": "value" });
+    } else if (group === "decision" && command === "list") {
+      Object.assign(trailingOptions, { "--status": "value" });
+    } else if (group === "decision" && command === "supersede") {
+      Object.assign(trailingOptions, { "--reason": "value" });
+    } else if (group === "milestone" && command === "add") {
+      Object.assign(trailingOptions, { "--title": "value", "--summary": "value" });
+    }
+    const mutatesKnowledge = (group === "brief" && command === "update")
+      || (group === "decision" && (command === "record" || command === "supersede"))
+      || (group === "milestone" && command === "add");
+    const selectors: ArgumentSelector[] = [{
+      argumentIndex: 3,
+      entity: "task",
+      provider: "tasks",
+      actionTarget: true,
+      ...(mutatesKnowledge ? { statuses: ["draft", "active"] } : {})
+    }];
+    if (group === "decision" && (command === "show" || command === "supersede")) {
+      selectors.push({
+        argumentIndex: 4,
+        entity: "decision",
+        provider: "task-decisions",
+        dependsOn: 3,
+        actionTarget: true,
+        ...(command === "supersede" ? { statuses: ["active"] } : {})
+      });
+    } else if (group === "milestone" && command === "show") {
+      selectors.push({
+        argumentIndex: 4,
+        entity: "milestone",
+        provider: "task-milestones",
+        dependsOn: 3,
+        actionTarget: true
+      });
+    } else if (group === "event" && command === "show") {
+      selectors.push({
+        argumentIndex: 4,
+        entity: "event",
+        provider: "task-events",
+        dependsOn: 3,
+        actionTarget: true
+      });
+    }
+    return {
+      commandPath: ["task", group, command],
+      selectors,
+      ...(Object.keys(trailingOptions).length > 0 ? { trailingOptions } : {})
+    };
+  })
+]);
 
-export function findInteractionPolicy(node: CommandNode): InteractionPolicy | undefined {
+export function findInteractionPolicy(
+  node: CommandNode | undefined
+): InteractionPolicy | undefined {
+  if (node === undefined) return undefined;
   const path = node.path.slice(1);
-  return INTERACTION_POLICIES.find((policy) => samePath(policy.commandPath, path));
-}
-
-function roleUpdateInteractionPolicy(
-  commandPath: readonly string[],
-  selectors: readonly ArgumentSelector[]
-): InteractionPolicy {
-  const node = findPath(ROOT_COMMAND, commandPath);
-  if (node === undefined || node.kind === "group") {
-    throw new Error(`Role update command is missing from the command catalog: ${commandPath.join(" ")}`);
-  }
-  const optionLikeValues = new Set<string>(
-    ROLE_AGENT_OPTION_SPECS
-      .filter(({ allowOptionLikeValue }) => allowOptionLikeValue === true)
-      .map(({ option }) => option)
+  return INTERACTION_POLICIES.find((policy) =>
+    policy.commandPath.length === path.length
+    && policy.commandPath.every((segment, index) => segment === path[index])
   );
-  const trailingOptions = Object.freeze(Object.fromEntries(
-    [...node.options, ...node.hiddenOptions].map((option) => [
-      option,
-      optionLikeValues.has(option) ? "option-like-value" : "value"
-    ])
-  )) as Readonly<Record<string, TrailingOptionKind>>;
-  return {
-    commandPath,
-    selectors,
-    trailingOptions,
-    requiredAnyOptions: node.options
-  };
 }
 
 export function validateInteractionPolicies(
-  policies: readonly InteractionPolicy[] = INTERACTION_POLICIES,
-  root: CommandNode = ROOT_COMMAND
+  policies: readonly InteractionPolicy[] = INTERACTION_POLICIES
 ): void {
-  const seen = new Set<string>();
-
+  const paths = new Set<string>();
   for (const policy of policies) {
-    const key = policy.commandPath.join(" ");
-    if (seen.has(key)) {
-      throw new Error(`Duplicate interaction policy: ${key}`);
-    }
-    seen.add(key);
-
-    const node = findPath(root, policy.commandPath);
-    if (node === undefined || node.kind === "group") {
-      throw new Error(`Interaction policy must reference an executable command: ${key}`);
-    }
-
-    const positions = new Set<number>();
-    const slots = new Set<string>();
+    const path = policy.commandPath.join(" ");
+    if (paths.has(path)) throw new Error(`Duplicate interaction policy: ${path}`);
+    paths.add(path);
     for (const selector of policy.selectors) {
       if ((selector.argumentIndex === undefined) === (selector.option === undefined)) {
-        throw new Error(`Interaction selector must define exactly one slot for ${key}`);
+        throw new Error(`Interaction selector must declare exactly one slot: ${path}`);
       }
-      if (selector.option !== undefined && !node.options.includes(selector.option)) {
-        throw new Error(`Interaction selector option is not catalog-owned for ${key}: ${selector.option}`);
-      }
-      if (selector.requiredOption === true && selector.option === undefined) {
-        throw new Error(`A required interaction option must use an option slot for ${key}`);
-      }
-      if (selector.unlessOption !== undefined && !node.options.includes(selector.unlessOption)) {
-        throw new Error(`Interaction selector guard option is not catalog-owned for ${key}: ${selector.unlessOption}`);
-      }
-      const slot = selector.option ?? `#${selector.argumentIndex}`;
-      if (slots.has(slot)) {
-        throw new Error(`Duplicate interaction selector slot for ${key}: ${slot}`);
-      }
-      slots.add(slot);
-      if (selector.dependsOn !== undefined && !positions.has(selector.dependsOn)) {
-        throw new Error(`Interaction selector dependency must reference an earlier selector for ${key}`);
-      }
-      if (!providerSupports(selector.provider, selector.entity)) {
-        throw new Error(`Interaction provider ${selector.provider} is incompatible with ${selector.entity} for ${key}`);
-      }
-      if (selector.argumentIndex !== undefined) {
-        positions.add(selector.argumentIndex);
-      }
-    }
-    for (const option of policy.requiredOptions ?? []) {
-      if (!node.options.includes(option)) {
-        throw new Error(`Interaction required option is not catalog-owned for ${key}: ${option}`);
-      }
-    }
-    for (const option of policy.requiredAnyOptions ?? []) {
-      if (!node.options.includes(option)) {
-        throw new Error(`Interaction any-required option is not catalog-owned for ${key}: ${option}`);
-      }
-    }
-    for (const prerequisite of policy.optionPrerequisites ?? []) {
-      const optionValues = node.optionValues[prerequisite.option];
-      if (optionValues === undefined) {
-        throw new Error(`Interaction option prerequisite must reference a catalog enum for ${key}: ${prerequisite.option}`);
-      }
-      for (const value of prerequisite.values) {
-        if (!optionValues.includes(value)) {
-          throw new Error(`Interaction option prerequisite value is not catalog-owned for ${key}: ${value}`);
-        }
-      }
-      for (const requiredOption of prerequisite.requiredOptions) {
-        if (!node.options.includes(requiredOption)) {
-          throw new Error(`Interaction option prerequisite is not catalog-owned for ${key}: ${requiredOption}`);
-        }
-      }
-    }
-    for (const option of Object.keys(policy.trailingOptions ?? {})) {
-      if (!node.options.includes(option) && !node.hiddenOptions.includes(option)) {
-        throw new Error(`Interaction trailing option is not catalog-owned for ${key}: ${option}`);
-      }
-    }
-    if (
-      policy.confirmation !== undefined &&
-      !policy.selectors.some((selector) =>
-        selector.argumentIndex === policy.confirmation?.targetArgumentIndex && selector.actionTarget)
-    ) {
-      throw new Error(`Interaction confirmation must reference an action target for ${key}`);
     }
   }
-}
-
-function providerSupports(provider: CandidateProviderName, entity: SelectableEntity): boolean {
-  return provider === "configured-agents" && entity === "agent"
-    || ["global-roles-for-show", "removable-global-roles", "configured-global-roles"].includes(provider)
-      && entity === "global-role"
-    || ["tasks", "unarchived-tasks", "archived-tasks", "tasks-with-input-drafts", "trashed-tasks"].includes(provider)
-      && entity === "task"
-    || ["task-roles", "task-roles-with-transcripts", "task-roles-with-active-runs", "task-roles-without-active-runs", "removable-task-roles", "worktree-task-roles", "managed-worktree-task-roles"].includes(provider)
-      && entity === "task-role"
-    || provider === "task-topics" && entity === "topic"
-    || provider === "active-cycles" && entity === "cycle"
-    || ["open-work-items", "work-items", "dispatch-work-items"].includes(provider) && entity === "work-item"
-    || provider === "active-decisions" && entity === "decision"
-    || ["input-requests", "open-input-requests", "task-open-input-requests"].includes(provider)
-      && entity === "input-request"
-    || provider === "input-answer-choices" && entity === "input-answer";
-}
-
-function findPath(root: CommandNode, path: readonly string[]): CommandNode | undefined {
-  let node = root;
-  for (const part of path) {
-    const child = findChild(node, part);
-    if (child === undefined) {
-      return undefined;
-    }
-    node = child;
-  }
-  return node;
-}
-
-function samePath(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((part, index) => part === right[index]);
 }
 
 validateInteractionPolicies();

@@ -13,20 +13,18 @@ export function mergePendingWakeup(
   now: Date,
   existing: PendingWakeup | null
 ): PendingWakeup {
-  const trimmedReason = reason.trim();
-
-  if (trimmedReason.length === 0) {
-    throw new Error("Wakeup reason is required.");
+  const normalizedTaskId = requiredText(taskId, "Task id");
+  const normalizedReason = requiredText(reason, "Wakeup reason");
+  if (existing !== null && existing.taskId !== normalizedTaskId) {
+    throw new Error(`Pending wakeup belongs to another Task: ${existing.taskId}.`);
   }
-
   const timestamp = now.toISOString();
-
   return {
     schemaVersion: 1,
-    taskId,
+    taskId: normalizedTaskId,
     reasons: existing === null
-      ? [trimmedReason]
-      : [...new Set([...existing.reasons, trimmedReason])],
+      ? [normalizedReason]
+      : [...new Set([...existing.reasons, normalizedReason])],
     requestCount: (existing?.requestCount ?? 0) + 1,
     firstRequestedAt: existing?.firstRequestedAt ?? timestamp,
     lastRequestedAt: timestamp
@@ -41,4 +39,10 @@ export function pendingWakeupsMatch(left: PendingWakeup, right: PendingWakeup): 
     left.lastRequestedAt === right.lastRequestedAt &&
     left.reasons.length === right.reasons.length &&
     left.reasons.every((reason, index) => reason === right.reasons[index]);
+}
+
+function requiredText(value: string, label: string): string {
+  const normalized = value.trim();
+  if (normalized.length === 0) throw new Error(`${label} is required.`);
+  return normalized;
 }
