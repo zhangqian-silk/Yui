@@ -49,7 +49,13 @@ export async function processLeaderWakeups(
     let run: ReturnType<typeof createAgentRun> | null = null;
     try {
       const mode = hasNativeSession(existingSession) ? "resume" : "new";
-      const input = leaderWakeupInput(task.id, wakeup.reasons);
+      const input = leaderWakeupInput(
+        task.id,
+        wakeup.reasons,
+        store.getTaskBrief(task.id),
+        store.listDecisions(task.id),
+        store.listMilestones(task.id)
+      );
       run = createAgentRun(
         store.nextAgentRunId(task.id),
         task.id,
@@ -144,9 +150,40 @@ function hasNativeSession(
     session.nativeSessionId.trim().length > 0;
 }
 
-function leaderWakeupInput(taskId: string, reasons: readonly string[]): string {
-  return [
-    `TaskMux wakeup reasons: ${reasons.join(", ")}.`,
-    `Inspect taskmux task show ${taskId}, taskmux task message list ${taskId}, and taskmux task work list ${taskId}; then continue Leader stewardship.`
-  ].join(" ");
+function leaderWakeupInput(
+  taskId: string,
+  reasons: readonly string[],
+  brief: import("../brief/taskBrief.js").TaskBrief | null,
+  decisions: readonly import("../decision/decision.js").Decision[],
+  milestones: readonly import("../milestone/milestone.js").Milestone[]
+): string {
+  const lines: string[] = [
+    `TaskMux wakeup reasons: ${reasons.join(", ")}.`
+  ];
+  if (brief !== null) {
+    lines.push(`Objective: ${brief.objective}`);
+    if (brief.currentFocus.trim().length > 0) {
+      lines.push(`Current focus: ${brief.currentFocus}`);
+    }
+  }
+  const activeDecisions = decisions.filter((d) => d.status === "active").slice(0, 3);
+  if (activeDecisions.length > 0) {
+    lines.push("Active decisions:");
+    for (const decision of activeDecisions) {
+      lines.push(`  - ${decision.title}`);
+    }
+  }
+  const recentMilestones = [...milestones]
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .slice(0, 3);
+  if (recentMilestones.length > 0) {
+    lines.push("Recent milestones:");
+    for (const milestone of recentMilestones) {
+      lines.push(`  - ${milestone.title}`);
+    }
+  }
+  lines.push(
+    `Inspect taskmux task show ${taskId}, taskmux task message list ${taskId}, taskmux task work list ${taskId}, taskmux task brief show ${taskId}, taskmux task decision list ${taskId}, and taskmux task milestone list ${taskId}; then continue Leader stewardship.`
+  );
+  return lines.join("\n");
 }
