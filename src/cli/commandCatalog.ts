@@ -110,22 +110,22 @@ const agentChildren: readonly NodeInput[] = [
   {
     name: "add",
     summary: "Add a configured native Agent CLI.",
-    usage: "taskmux agent add <id> [--adapter <adapter>] --command <command> [--arg <arg> ...] [--env TARGET=PROCESS_NAME ...]",
+    usage: "yui agent add <id> [--adapter <adapter>] --command <command> [--arg <arg> ...] [--env TARGET=PROCESS_NAME ...]",
     options: ["--adapter", "--command", "--arg", "--env"],
     optionValues: { "--adapter": supportedAgentAdapterIds() },
     executableOptions: ["--command"]
   },
   { name: "list", summary: "List configured Agents." },
-  { name: "show", summary: "Show one configured Agent.", usage: "taskmux agent show <id>" },
+  { name: "show", summary: "Show one configured Agent.", usage: "yui agent show <id>" },
   {
     name: "update",
     summary: "Update a configured Agent.",
-    usage: "taskmux agent update <id> [--adapter <adapter>] [--command <command>] [--arg <arg> ... | --clear-args] [--env TARGET=PROCESS_NAME ... | --clear-env]",
+    usage: "yui agent update <id> [--adapter <adapter>] [--command <command>] [--arg <arg> ... | --clear-args] [--env TARGET=PROCESS_NAME ... | --clear-env]",
     options: ["--adapter", "--command", "--arg", "--clear-args", "--env", "--clear-env"],
     optionValues: { "--adapter": supportedAgentAdapterIds() },
     executableOptions: ["--command"]
   },
-  { name: "remove", summary: "Remove a configured Agent.", usage: "taskmux agent remove <id>" }
+  { name: "remove", summary: "Remove a configured Agent.", usage: "yui agent remove <id>" }
 ];
 
 const roleProfileOptions = [
@@ -153,25 +153,25 @@ const roleChildren: readonly NodeInput[] = [
   {
     name: "add",
     summary: "Add a reusable global Role.",
-    usage: "taskmux role add <name> --agent <id> [Role and Agent settings]",
+    usage: "yui role add <name> --agent <id> [Role and Agent settings]",
     options: ["--agent", "--workspace", ...roleProfileOptions, ...roleAgentOptions],
     optionValues: roleAgentOptionValues,
     fileOptions: ["--workspace"]
   },
   { name: "list", summary: "List global Roles." },
-  { name: "show", summary: "Show one global Role.", usage: "taskmux role show <name>" },
+  { name: "show", summary: "Show one global Role.", usage: "yui role show <name>" },
   {
     name: "update",
     summary: "Update a global Role.",
-    usage: "taskmux role update <name> [profile options] [clear options]",
+    usage: "yui role update <name> [profile options] [clear options]",
     options: ["--agent", "--workspace", ...roleProfileOptions, ...roleAgentOptions,
       ...roleProfileClearOptions, ...roleAgentClearOptions],
     optionValues: roleAgentOptionValues,
     fileOptions: ["--workspace"]
   },
-  { name: "remove", summary: "Remove a global Role.", usage: "taskmux role remove <name>" },
-  { name: "bind", summary: "Bind and activate an Agent for a global Role.", usage: "taskmux role bind <role> <agent-id>" },
-  { name: "enter", summary: "Enter a global Role's native session.", usage: "taskmux role enter <role>" },
+  { name: "remove", summary: "Remove a global Role.", usage: "yui role remove <name>" },
+  { name: "bind", summary: "Bind and activate an Agent for a global Role.", usage: "yui role bind <role> <agent-id>" },
+  { name: "enter", summary: "Enter a global Role's native session.", usage: "yui role enter <role>" },
   {
     name: "session",
     summary: "Manage native session IDs for a global Role.",
@@ -180,13 +180,13 @@ const roleChildren: readonly NodeInput[] = [
       {
         name: "record",
         summary: "Record the active Agent's native session ID.",
-        usage: "taskmux role session record <role> --native-id <id>",
+        usage: "yui role session record <role> --native-id <id>",
         options: ["--native-id"]
       },
       {
         name: "replace",
         summary: "Explicitly replace the active Agent's native session ID.",
-        usage: "taskmux role session replace <role> --native-id <id> --reason <text>",
+        usage: "yui role session replace <role> --native-id <id> --reason <text>",
         options: ["--native-id", "--reason"]
       }
     ]
@@ -197,43 +197,43 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "create",
     summary: "Create a Draft Task.",
-    usage: "taskmux task create <title> [--repository <id>] [--base <ref>]",
+    usage: "yui task create <title> [--repository <id>] [--base <ref>]",
     options: ["--repository", "--base"]
   },
   {
     name: "update",
     summary: "Update Task metadata.",
-    usage: "taskmux task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at]",
+    usage: "yui task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at]",
     options: [
       "--title", "--description", "--priority", "--tags", "--due-at",
       "--clear-description", "--clear-priority", "--clear-tags", "--clear-due-at"
     ],
     optionValues: { "--priority": ["low", "medium", "high", "urgent"] }
   },
-  { name: "activate", summary: "Activate a Draft Task.", usage: "taskmux task activate <id>" },
+  { name: "activate", summary: "Activate a Draft Task.", usage: "yui task activate <id>" },
   {
     name: "complete",
     summary: "Complete an active Task and stop automatic wakeups.",
-    usage: "taskmux task complete <id> --summary <text>",
+    usage: "yui task complete <id> --summary <text>",
     options: ["--summary"]
   },
-  { name: "reopen", summary: "Reopen a completed Task.", usage: "taskmux task reopen <id>" },
+  { name: "reopen", summary: "Reopen a completed Task.", usage: "yui task reopen <id>" },
   { name: "list", summary: "List Tasks." },
-  { name: "show", summary: "Show a Task.", usage: "taskmux task show <id>" },
+  { name: "show", summary: "Show a Task.", usage: "yui task show <id>" },
   {
     name: "context",
     summary: "Show consolidated working context for a Task.",
-    usage: "taskmux task context <task>"
+    usage: "yui task context <task>"
   },
-  { name: "archive", summary: "Archive a Task.", usage: "taskmux task archive <id>" },
-  { name: "reconcile", summary: "Run one immediate Controller reconciliation.", usage: "taskmux task reconcile <id>" },
+  { name: "archive", summary: "Archive a Task.", usage: "yui task archive <id>" },
+  { name: "reconcile", summary: "Run one immediate Controller reconciliation.", usage: "yui task reconcile <id>" },
   {
     name: "message",
     summary: "Manage durable Task messages.",
     sections: [{ id: "manage", title: "Commands", entries: ["send", "list"] }],
     children: [
-      { name: "send", summary: "Send a Task message.", usage: "taskmux task message send <id> <body>" },
-      { name: "list", summary: "List Task messages.", usage: "taskmux task message list <id>" }
+      { name: "send", summary: "Send a Task message.", usage: "yui task message send <id> <body>" },
+      { name: "list", summary: "List Task messages.", usage: "yui task message list <id>" }
     ]
   },
   {
@@ -244,31 +244,31 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "request",
         summary: "Pause the active Leader Run and request user input.",
-        usage: "taskmux task input request <task> --question <text> [--choice <key=label> ...] [--blocks <work-item:id|run:id> ...] [--recommend <key> --timeout-seconds <seconds>]",
+        usage: "yui task input request <task> --question <text> [--choice <key=label> ...] [--blocks <work-item:id|run:id> ...] [--recommend <key> --timeout-seconds <seconds>]",
         options: ["--question", "--choice", "--blocks", "--recommend", "--timeout-seconds"]
       },
       {
         name: "list",
         summary: "List the global Inbox or one Task's input requests.",
-        usage: "taskmux task input list [task] [--all]",
+        usage: "yui task input list [task] [--all]",
         options: ["--all"]
       },
       {
         name: "show",
         summary: "Show one input request.",
-        usage: "taskmux task input show <input> [--task <task>]",
+        usage: "yui task input show <input> [--task <task>]",
         options: ["--task"]
       },
       {
         name: "answer",
         summary: "Answer one open input request.",
-        usage: "taskmux task input answer <input> [--task <task>] (--choice <key> | --text <text>)",
+        usage: "yui task input answer <input> [--task <task>] (--choice <key> | --text <text>)",
         options: ["--task", "--choice", "--text"]
       },
       {
         name: "cancel",
         summary: "Cancel an open request from its originating Leader.",
-        usage: "taskmux task input cancel <task> <input> --reason <text>",
+        usage: "yui task input cancel <task> <input> --reason <text>",
         options: ["--reason"]
       }
     ]
@@ -283,28 +283,28 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "add",
         summary: "Add a Role to a Task.",
-        usage: "taskmux task role add <task> <name> [--agent <id>] [Role and Agent settings]",
+        usage: "yui task role add <task> <name> [--agent <id>] [Role and Agent settings]",
         options: ["--agent", ...roleProfileOptions, ...roleAgentOptions],
         optionValues: roleAgentOptionValues
       },
-      { name: "list", summary: "List Task Roles.", usage: "taskmux task role list <task>" },
+      { name: "list", summary: "List Task Roles.", usage: "yui task role list <task>" },
       {
         name: "status",
         summary: "Show persisted and live runtime state for one Task Role.",
-        usage: "taskmux task role status <task> <role>"
+        usage: "yui task role status <task> <role>"
       },
-      { name: "show", summary: "Show one Task Role.", usage: "taskmux task role show <task> <role>" },
+      { name: "show", summary: "Show one Task Role.", usage: "yui task role show <task> <role>" },
       {
         name: "update",
         summary: "Update a Task Role.",
-        usage: "taskmux task role update <task> <role> [Role and Agent settings]",
+        usage: "yui task role update <task> <role> [Role and Agent settings]",
         options: ["--agent", ...roleProfileOptions, ...roleAgentOptions,
           ...roleProfileClearOptions, ...roleAgentClearOptions],
         optionValues: roleAgentOptionValues
       },
-      { name: "remove", summary: "Remove a Task Role.", usage: "taskmux task role remove <task> <role>" },
-      { name: "bind", summary: "Bind and activate an Agent for a Task Role.", usage: "taskmux task role bind <task> <role> <agent-id>" },
-      { name: "enter", summary: "Enter a Task Role's native session.", usage: "taskmux task role enter <task> <role>" }
+      { name: "remove", summary: "Remove a Task Role.", usage: "yui task role remove <task> <role>" },
+      { name: "bind", summary: "Bind and activate an Agent for a Task Role.", usage: "yui task role bind <task> <role> <agent-id>" },
+      { name: "enter", summary: "Enter a Task Role's native session.", usage: "yui task role enter <task> <role>" }
     ]
   },
   {
@@ -315,21 +315,21 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "create",
         summary: "Create a work item.",
-        usage: "taskmux task work create <task> <title> [--role <name>]",
+        usage: "yui task work create <task> <title> [--role <name>]",
         options: ["--role"]
       },
-      { name: "list", summary: "List work items for a Task.", usage: "taskmux task work list <task>" },
+      { name: "list", summary: "List work items for a Task.", usage: "yui task work list <task>" },
       {
         name: "update",
         summary: "Update a work item's state.",
-        usage: "taskmux task work update <id> <todo|running|done|failed> [--summary <text>]",
+        usage: "yui task work update <id> <todo|running|done|failed> [--summary <text>]",
         options: ["--summary"],
         argumentValues: { 1: ["todo", "running", "done", "failed"] }
       },
       {
         name: "dispatch",
         summary: "Dispatch a work item to its Role.",
-        usage: "taskmux task work dispatch <id> [--input <text>]",
+        usage: "yui task work dispatch <id> [--input <text>]",
         options: ["--input"]
       }
     ]
@@ -339,12 +339,12 @@ const taskChildren: readonly NodeInput[] = [
     summary: "Inspect and control Agent Runs.",
     sections: [{ id: "manage", title: "Commands", entries: ["list", "retry", "yield"] }],
     children: [
-      { name: "list", summary: "List Runs for a work item.", usage: "taskmux task run list <work>" },
-      { name: "retry", summary: "Retry a failed Run.", usage: "taskmux task run retry <run>" },
+      { name: "list", summary: "List Runs for a work item.", usage: "yui task run list <work>" },
+      { name: "retry", summary: "Retry a failed Run.", usage: "yui task run retry <run>" },
       {
         name: "yield",
         summary: "Complete an active Run and wake the Leader.",
-        usage: "taskmux task run yield <run> --summary <text>",
+        usage: "yui task run yield <run> --summary <text>",
         options: ["--summary"]
       }
     ]
@@ -354,11 +354,11 @@ const taskChildren: readonly NodeInput[] = [
     summary: "Manage the Task Brief, the authoritative summary of current task state.",
     sections: [{ id: "manage", title: "Commands", entries: ["show", "update"] }],
     children: [
-      { name: "show", summary: "Show the Task Brief.", usage: "taskmux task brief show <task>" },
+      { name: "show", summary: "Show the Task Brief.", usage: "yui task brief show <task>" },
       {
         name: "update",
         summary: "Create or update the Task Brief.",
-        usage: "taskmux task brief update <task> [--objective <text>] [--boundary <text> ...] [--focus <text>] [--leader-summary <text>]",
+        usage: "yui task brief update <task> [--objective <text>] [--boundary <text> ...] [--focus <text>] [--leader-summary <text>]",
         options: ["--objective", "--boundary", "--focus", "--leader-summary"]
       }
     ]
@@ -371,21 +371,21 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "record",
         summary: "Record a new active Decision.",
-        usage: "taskmux task decision record <task> --title <text> --rationale <text>",
+        usage: "yui task decision record <task> --title <text> --rationale <text>",
         options: ["--title", "--rationale"]
       },
       {
         name: "list",
         summary: "List Decisions for a Task.",
-        usage: "taskmux task decision list <task> [--status active|superseded]",
+        usage: "yui task decision list <task> [--status active|superseded]",
         options: ["--status"],
         optionValues: { "--status": ["active", "superseded"] }
       },
-      { name: "show", summary: "Show one Decision.", usage: "taskmux task decision show <task> <decision>" },
+      { name: "show", summary: "Show one Decision.", usage: "yui task decision show <task> <decision>" },
       {
         name: "supersede",
         summary: "Mark a Decision as superseded.",
-        usage: "taskmux task decision supersede <task> <decision> --reason <text>",
+        usage: "yui task decision supersede <task> <decision> --reason <text>",
         options: ["--reason"]
       }
     ]
@@ -398,11 +398,11 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "add",
         summary: "Append a Milestone to a Task.",
-        usage: "taskmux task milestone add <task> --title <text> --summary <text>",
+        usage: "yui task milestone add <task> --title <text> --summary <text>",
         options: ["--title", "--summary"]
       },
-      { name: "list", summary: "List Milestones for a Task.", usage: "taskmux task milestone list <task>" },
-      { name: "show", summary: "Show one Milestone.", usage: "taskmux task milestone show <task> <milestone>" }
+      { name: "list", summary: "List Milestones for a Task.", usage: "yui task milestone list <task>" },
+      { name: "show", summary: "Show one Milestone.", usage: "yui task milestone show <task> <milestone>" }
     ]
   },
   {
@@ -410,17 +410,17 @@ const taskChildren: readonly NodeInput[] = [
     summary: "Inspect the durable Task event history.",
     sections: [{ id: "manage", title: "Commands", entries: ["list", "show"] }],
     children: [
-      { name: "list", summary: "List Task events.", usage: "taskmux task event list <task>" },
-      { name: "show", summary: "Show one Task event.", usage: "taskmux task event show <task> <event>" }
+      { name: "list", summary: "List Task events.", usage: "yui task event list <task>" },
+      { name: "show", summary: "Show one Task event.", usage: "yui task event show <task> <event>" }
     ]
   },
-  { name: "enter", summary: "Enter a Task Role, defaulting to Leader.", usage: "taskmux task enter <task> [role]" }
+  { name: "enter", summary: "Enter a Task Role, defaulting to Leader.", usage: "yui task enter <task> [role]" }
 ];
 
 export const ROOT_COMMAND = buildNode({
-  name: "taskmux",
+  name: "yui",
   summary: "Coordinate native Agent CLI sessions through tmux.",
-  usage: "taskmux [--json] <command>",
+  usage: "yui [--json] <command>",
   sections: [
     { id: "general", title: "General", entries: ["help", "version", "update", "setup", "doctor", "completion"] },
     { id: "workflow", title: "Workflow", entries: ["operator", "repository", "task"] },
@@ -429,17 +429,17 @@ export const ROOT_COMMAND = buildNode({
     { id: "internal", title: "Internal", entries: ["internal"] }
   ],
   children: [
-    { name: "help", summary: "Show root or scoped command help.", usage: "taskmux help [command ...]", commandPathArguments: true },
-    { name: "version", summary: "Print the installed TaskMux version." },
-    { name: "update", summary: "Install the latest published TaskMux package globally." },
-    { name: "setup", summary: "Initialize or update TaskMux configuration." },
-    { name: "doctor", summary: "Check TaskMux dependencies and file state." },
+    { name: "help", summary: "Show root or scoped command help.", usage: "yui help [command ...]", commandPathArguments: true },
+    { name: "version", summary: "Print the installed Yui version." },
+    { name: "update", summary: "Install the latest published Yui package globally." },
+    { name: "setup", summary: "Initialize or update Yui configuration." },
+    { name: "doctor", summary: "Check Yui dependencies and file state." },
     {
       name: "completion",
       summary: "Interactively configure shell completion.",
       executable: true,
       acceptsArguments: false,
-      usage: ["taskmux completion", "taskmux completion <bash|zsh|fish>"],
+      usage: ["yui completion", "yui completion <bash|zsh|fish>"],
       sections: [
         { id: "shells", title: "Shells", entries: ["bash", "zsh", "fish"] },
         { id: "internal", title: "Internal", entries: ["candidates"] }
@@ -451,7 +451,7 @@ export const ROOT_COMMAND = buildNode({
         {
           name: "candidates",
           summary: "Resolve internal dynamic completion candidates.",
-          usage: "taskmux completion candidates <prefix> -- <words...>",
+          usage: "yui completion candidates <prefix> -- <words...>",
           hidden: true
         }
       ]
@@ -475,7 +475,7 @@ export const ROOT_COMMAND = buildNode({
         {
           name: "submit",
           summary: "Submit work through the Operator.",
-          usage: "taskmux operator submit <body> [--task <id>]",
+          usage: "yui operator submit <body> [--task <id>]",
           options: ["--task"]
         }
       ]
@@ -488,7 +488,7 @@ export const ROOT_COMMAND = buildNode({
         {
           name: "add",
           summary: "Register a Git repository.",
-          usage: "taskmux repository add <name> <path> [--base <ref>]",
+          usage: "yui repository add <name> <path> [--base <ref>]",
           options: ["--base"],
           fileArguments: [1]
         },
@@ -530,18 +530,18 @@ export const ROOT_COMMAND = buildNode({
       sections: [{ id: "manage", title: "Commands", entries: ["list", "retry"] }],
       children: [
         { name: "list", summary: "List scheduler wake and recovery records." },
-        { name: "retry", summary: "Retry a failed Leader recovery.", usage: "taskmux jobs retry <id>" }
+        { name: "retry", summary: "Retry a failed Leader recovery.", usage: "yui jobs retry <id>" }
       ]
     },
     {
       name: "internal",
-      summary: "Internal TaskMux callbacks.",
+      summary: "Internal Yui callbacks.",
       hidden: true,
       sections: [{ id: "callbacks", title: "Callbacks", entries: ["session-notify"] }],
       children: [{
         name: "session-notify",
         summary: "Record a structured native session notification.",
-        usage: "taskmux internal session-notify <payload>"
+        usage: "yui internal session-notify <payload>"
       }]
     }
   ]

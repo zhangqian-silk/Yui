@@ -16,7 +16,7 @@ import { activateTask, completeTask, createTask } from "../../dist/task/task.js"
 const NOW = new Date("2026-07-20T10:00:00.000Z");
 
 function fixture(t) {
-  const home = mkdtempSync(join(tmpdir(), "taskmux-completed-fence-"));
+  const home = mkdtempSync(join(tmpdir(), "yui-completed-fence-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home, NOW);
   const store = new FileTaskStore(home);
@@ -83,9 +83,9 @@ test("a claimed but undelivered Leader run fences completion before tmux input",
           {
             now: () => new Date(NOW),
             environment: {
-              TASKMUX_SESSION_SCOPE: "task",
-              TASKMUX_TASK_ID: task.id,
-              TASKMUX_ROLE: "leader"
+              YUI_SESSION_SCOPE: "task",
+              YUI_TASK_ID: task.id,
+              YUI_ROLE: "leader"
             }
           }
         );

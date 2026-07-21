@@ -11,7 +11,7 @@ import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import {
   FileTaskStore,
-  resolveTaskmuxHome,
+  resolveYuiHome,
   STORAGE_STATE_FILE
 } from "../storage/taskStore.js";
 import {
@@ -41,13 +41,13 @@ type SchemaInspection = StorageSchemaState | Readonly<{
   detail: string;
 }>;
 
-/** Runs the read-only FileTaskStore diagnostics used by `taskmux doctor`. */
+/** Runs the read-only FileTaskStore diagnostics used by `yui doctor`. */
 export function runDoctorCommand(
   args: readonly string[],
   env: NodeJS.ProcessEnv,
   executor: CommandExecutor
 ): string {
-  if (args.length !== 0) throw usageError("Doctor usage: taskmux doctor");
+  if (args.length !== 0) throw usageError("Doctor usage: yui doctor");
   return renderDoctor(getDoctorChecks(env, executor));
 }
 
@@ -55,7 +55,7 @@ export function getDoctorChecks(
   env: NodeJS.ProcessEnv,
   executor: CommandExecutor
 ): DoctorCheck[] {
-  const home = resolveTaskmuxHome(env);
+  const home = resolveYuiHome(env);
   const homeCheck = checkHome(home);
   const schema = readSchema(home);
   const schemaCheck = checkSchema(schema);
@@ -64,14 +64,14 @@ export function getDoctorChecks(
     homeCheck,
     schemaCheck,
     storage.check,
-    checkExecutable("git", env.TASKMUX_GIT_BIN ?? "git", ["--version"], executor),
-    checkExecutable("tmux", env.TASKMUX_TMUX_BIN ?? "tmux", ["-V"], executor),
+    checkExecutable("git", env.YUI_GIT_BIN ?? "git", ["--version"], executor),
+    checkExecutable("tmux", env.YUI_TMUX_BIN ?? "tmux", ["-V"], executor),
     ...storage.agents.flatMap((agent) => checkAgent(agent, executor))
   ];
 }
 
 export function renderDoctor(checks: readonly DoctorCheck[]): string {
-  return `TaskMux doctor\n${renderTable(
+  return `Yui doctor\n${renderTable(
     "Checks",
     [
       { header: "Check", minWidth: 8, maxWidth: 28 },
@@ -88,18 +88,18 @@ function checkHome(home: string): DoctorCheck {
     const metadata = lstatSync(home);
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
       return {
-        name: "taskmux home",
+        name: "yui home",
         status: "invalid",
-        detail: "TASKMUX_HOME must be a real directory."
+        detail: "YUI_HOME must be a real directory."
       };
     }
     accessSync(home, constants.R_OK);
-    return { name: "taskmux home", status: "ok", detail: home };
+    return { name: "yui home", status: "ok", detail: home };
   } catch (error) {
     if (systemCode(error) === "ENOENT") {
-      return { name: "taskmux home", status: "missing", detail: "run taskmux setup" };
+      return { name: "yui home", status: "missing", detail: "run yui setup" };
     }
-    return { name: "taskmux home", status: "invalid", detail: errorMessage(error) };
+    return { name: "yui home", status: "invalid", detail: errorMessage(error) };
   }
 }
 
@@ -114,7 +114,7 @@ function readSchema(home: string): SchemaInspection {
 function checkSchema(state: SchemaInspection): DoctorCheck {
   switch (state.status) {
     case "uninitialized":
-      return { name: "storage schema", status: "missing", detail: "run taskmux setup" };
+      return { name: "storage schema", status: "missing", detail: "run yui setup" };
     case "current":
       return {
         name: "storage schema",
@@ -143,7 +143,7 @@ function inspectState(
     return blockedStorage(homeCheck.status, homeCheck.detail);
   }
   if (schema.status === "uninitialized") {
-    return blockedStorage("missing", "run taskmux setup");
+    return blockedStorage("missing", "run yui setup");
   }
   if (schema.status === "unsupported") {
     return blockedStorage(
@@ -155,7 +155,7 @@ function inspectState(
   if (schema.status === "read-error") return blockedStorage("invalid", schema.detail);
 
   const statePath = join(home, STORAGE_STATE_FILE);
-  if (!existsSync(statePath)) return blockedStorage("missing", "run taskmux setup");
+  if (!existsSync(statePath)) return blockedStorage("missing", "run yui setup");
   try {
     const metadata = lstatSync(statePath);
     if (!metadata.isFile() || metadata.isSymbolicLink()) {

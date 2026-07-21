@@ -99,7 +99,7 @@ test("rawArgs cannot take ownership of structured, lifecycle, or secret-bearing 
 });
 
 test("Codex structured config compiles deterministically for new and resume launches", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "taskmux-agent-adapter-"));
+  const root = await mkdtemp(join(tmpdir(), "yui-agent-adapter-"));
   const first = join(root, "first");
   const second = join(root, "second");
   await mkdir(first);
@@ -149,7 +149,7 @@ test("Codex structured config compiles deterministically for new and resume laun
     }).argv,
     [...compiled.argv, "resume", "codex-session"]
   );
-  assert.ok(!compiled.argv.some((argument) => argument.startsWith("TaskMux setup:")));
+  assert.ok(!compiled.argv.some((argument) => argument.startsWith("Yui setup:")));
   t.after(async () => {
     await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }));
   });

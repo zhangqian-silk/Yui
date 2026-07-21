@@ -567,9 +567,9 @@ test("Bash, Zsh, and Fish completion are catalog-derived for the current surface
     zsh: renderCompletion("zsh"),
     fish: renderCompletion("fish")
   };
-  assert.match(scripts.bash, /complete -F _taskmux taskmux/);
-  assert.match(scripts.zsh, /^#compdef taskmux/m);
-  assert.match(scripts.fish, /complete -c taskmux/);
+  assert.match(scripts.bash, /complete -F _yui yui/);
+  assert.match(scripts.zsh, /^#compdef yui/m);
+  assert.match(scripts.fish, /complete -c yui/);
 
   for (const [shell, script] of Object.entries(scripts)) {
     for (const path of PUBLIC_PATHS) {
@@ -584,12 +584,12 @@ test("Bash, Zsh, and Fish completion are catalog-derived for the current surface
   assert.equal(listPublicCommandPaths().includes("completion candidates"), false);
   const root = findCommandNode([]);
   assert.ok(root);
-  const help = renderCommandHelp(root, "0.1.5");
+  const help = renderCommandHelp(root, "0.2.0");
   assert.match(help, /^\s{2}completion\s+/m);
   assert.doesNotMatch(help, /completion candidates/);
   const completionNode = findCommandNode(["completion"]);
   assert.ok(completionNode);
-  const completionHelp = renderCommandHelp(completionNode, "0.1.5");
+  const completionHelp = renderCommandHelp(completionNode, "0.2.0");
   assert.match(completionHelp, /^\s{2}bash\s+/m);
   assert.match(completionHelp, /^\s{2}zsh\s+/m);
   assert.match(completionHelp, /^\s{2}fish\s+/m);

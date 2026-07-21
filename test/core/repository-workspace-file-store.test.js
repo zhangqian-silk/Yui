@@ -27,13 +27,13 @@ import { activateTask, archiveTask, createTask } from "../../dist/task/task.js";
 const NOW = new Date("2026-07-19T12:00:00.000Z");
 
 function fixture(t) {
-  const root = mkdtempSync(join(tmpdir(), "taskmux-repository-"));
+  const root = mkdtempSync(join(tmpdir(), "yui-repository-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const home = join(root, "home");
   const repositoryPath = join(root, "repository");
   execFileSync("git", ["init", "-q", repositoryPath]);
-  execFileSync("git", ["-C", repositoryPath, "config", "user.name", "TaskMux Test"]);
-  execFileSync("git", ["-C", repositoryPath, "config", "user.email", "taskmux@example.invalid"]);
+  execFileSync("git", ["-C", repositoryPath, "config", "user.name", "Yui Test"]);
+  execFileSync("git", ["-C", repositoryPath, "config", "user.email", "yui@example.invalid"]);
   writeFileSync(join(repositoryPath, "tracked.txt"), "initial\n");
   execFileSync("git", ["-C", repositoryPath, "add", "tracked.txt"]);
   execFileSync("git", ["-C", repositoryPath, "commit", "-qm", "initial"]);
@@ -44,7 +44,7 @@ function fixture(t) {
 test("repository add validates Git and persists the canonical root", async (t) => {
   const { repositoryPath, store } = fixture(t);
   const output = await runRepositoryCommand(
-    ["add", "TaskMux", join(repositoryPath, "."), "--base", "HEAD"],
+    ["add", "Yui", join(repositoryPath, "."), "--base", "HEAD"],
     store,
     { now: () => new Date(NOW) }
   );
@@ -52,13 +52,13 @@ test("repository add validates Git and persists the canonical root", async (t) =
   assert.deepEqual(store.listRepositories(), [{
     schemaVersion: 1,
     id: "repository-1",
-    name: "TaskMux",
+    name: "Yui",
     path: realpathSync(repositoryPath),
     defaultBranch: "HEAD",
     createdAt: NOW.toISOString(),
     updatedAt: NOW.toISOString()
   }]);
-  assert.match(await runRepositoryCommand(["list"], store), /TaskMux/);
+  assert.match(await runRepositoryCommand(["list"], store), /Yui/);
 
   await assert.rejects(
     runRepositoryCommand(["add", "Broken", repositoryPath, "--base", "missing-ref"], store),
@@ -69,7 +69,7 @@ test("repository add validates Git and persists the canonical root", async (t) =
 
 test("active repository Task gets one deterministic worktree per Role", async (t) => {
   const { home, repositoryPath, store } = fixture(t);
-  await runRepositoryCommand(["add", "TaskMux", repositoryPath], store, {
+  await runRepositoryCommand(["add", "Yui", repositoryPath], store, {
     now: () => new Date(NOW)
   });
   const repository = store.listRepositories()[0];
@@ -133,14 +133,14 @@ test("active repository Task gets one deterministic worktree per Role", async (t
       roleName: "leader",
       repositoryId: repository.id,
       path: leaderPath,
-      branch: `taskmux/${task.id}/leader`,
+      branch: `yui/${task.id}/leader`,
       baseRef: "temporary-base"
     },
     {
       roleName: "worker",
       repositoryId: repository.id,
       path: workerPath,
-      branch: `taskmux/${task.id}/worker`,
+      branch: `yui/${task.id}/worker`,
       baseRef: "temporary-base"
     }
   ]);
@@ -148,11 +148,11 @@ test("active repository Task gets one deterministic worktree per Role", async (t
   assert.equal(existsSync(join(workerPath, ".git")), true);
   assert.equal(
     execFileSync("git", ["-C", leaderPath, "branch", "--show-current"], { encoding: "utf8" }).trim(),
-    `taskmux/${task.id}/leader`
+    `yui/${task.id}/leader`
   );
   assert.equal(
     execFileSync("git", ["-C", workerPath, "branch", "--show-current"], { encoding: "utf8" }).trim(),
-    `taskmux/${task.id}/worker`
+    `yui/${task.id}/worker`
   );
 
   const revision = JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision;
@@ -217,7 +217,7 @@ test("active repository Task gets one deterministic worktree per Role", async (t
 
 test("archived repository Task never creates a worktree", async (t) => {
   const { home, repositoryPath, store } = fixture(t);
-  await runRepositoryCommand(["add", "TaskMux", repositoryPath], store);
+  await runRepositoryCommand(["add", "Yui", repositoryPath], store);
   const repository = store.listRepositories()[0];
   const task = archiveTask(createTask("task-1", "Archived", NOW, {
     repositoryId: repository.id
@@ -231,7 +231,7 @@ test("archived repository Task never creates a worktree", async (t) => {
 
 test("one broken Task workspace does not block preparation of other Tasks", async (t) => {
   const { home, repositoryPath, store } = fixture(t);
-  await runRepositoryCommand(["add", "TaskMux", repositoryPath], store);
+  await runRepositoryCommand(["add", "Yui", repositoryPath], store);
   const repository = store.listRepositories()[0];
   const agent = createConfiguredAgent("codex", "codex", "codex", [], [], NOW);
   store.saveConfiguredAgent(agent);
@@ -255,7 +255,7 @@ test("one broken Task workspace does not block preparation of other Tasks", asyn
       if (input.taskId === "task-1") throw new Error("detached worktree");
       return {
         path: join(input.container, input.taskId, input.roleName),
-        branch: `taskmux/${input.taskId}/${input.roleName}`,
+        branch: `yui/${input.taskId}/${input.roleName}`,
         baseCommit: "0123456789abcdef0123456789abcdef01234567"
       };
     },
@@ -279,7 +279,7 @@ test("one broken Task workspace does not block preparation of other Tasks", asyn
 
 test("archive records each successful Role cleanup before a later Role fails", async (t) => {
   const { home, repositoryPath, store } = fixture(t);
-  await runRepositoryCommand(["add", "TaskMux", repositoryPath], store);
+  await runRepositoryCommand(["add", "Yui", repositoryPath], store);
   const repository = store.listRepositories()[0];
   const agent = createConfiguredAgent("codex", "codex", "codex", [], [], NOW);
   const task = activateTask(createTask("task-1", "Archive partial cleanup", NOW, {

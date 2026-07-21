@@ -34,7 +34,7 @@ test("restored tmux attach owns the terminal after an exclusive handoff", () => 
       return "";
     }
   }, {
-    taskmuxHome: "/tmp/taskmux-home",
+    yuiHome: "/tmp/yui-home",
     terminalInput: input,
     closeInteractiveInput: () => input.events.push("close")
   });
@@ -59,12 +59,12 @@ test("sendRoleInputOnce probes readiness and applies a pane receipt in one tmux 
       if (args[0] === "if-shell") {
         deliveries += 1;
         const branch = deliveries === 1 ? args.at(-1) : args.at(-2);
-        return `${branch.match(/__TASKMUX_DELIVERY_(?:SENT|PRESENT)_[a-f0-9]+__/)[0]}\n`;
+        return `${branch.match(/__YUI_DELIVERY_(?:SENT|PRESENT)_[a-f0-9]+__/)[0]}\n`;
       }
       return "";
     }
   }, {
-    taskmuxHome: "/tmp/taskmux-home",
+    yuiHome: "/tmp/yui-home",
     readinessTimeoutMs: 20,
     readinessPollMs: 1
   });
@@ -84,7 +84,7 @@ test("sendRoleInputOnce probes readiness and applies a pane receipt in one tmux 
   const sends = calls.filter((call) => call.args[0] === "if-shell");
   assert.equal(sends.length, 2);
   for (const send of sends) {
-    assert.match(send.args.join(" "), /@taskmux_delivery_[a-f0-9]{64}/);
+    assert.match(send.args.join(" "), /@yui_delivery_[a-f0-9]{64}/);
     assert.match(send.args.at(-1), /set-option.*send-keys -l.*send-keys.*Enter/s);
     assert.equal(calls.filter((call) => call.args[0] === "send-keys").length, 0);
   }
@@ -101,7 +101,7 @@ test("sendRoleInputOnce times out without injecting input when the pane is not r
       return "";
     }
   }, {
-    taskmuxHome: "/tmp/taskmux-home",
+    yuiHome: "/tmp/yui-home",
     readinessTimeoutMs: 3,
     readinessPollMs: 1,
     now: () => timestamp++,
@@ -132,7 +132,7 @@ test("best-effort delivery returns immediately when the Operator composer is bus
       if (args[0] === "capture-pane") return "Operator is working\n";
       return "";
     }
-  }, { taskmuxHome: "/tmp/taskmux-home" });
+  }, { yuiHome: "/tmp/yui-home" });
 
   assert.equal(manager.sendRoleInputOnceIfReady(
     "operator",
@@ -157,12 +157,12 @@ test("best-effort delivery sends after one readiness snapshot without entering a
       if (args[0] === "display-message") return "0|321|codex\n";
       if (args[0] === "capture-pane") return "composer ready\n";
       if (args[0] === "if-shell") {
-        return `${args.at(-1).match(/__TASKMUX_DELIVERY_SENT_[a-f0-9]+__/)[0]}\n`;
+        return `${args.at(-1).match(/__YUI_DELIVERY_SENT_[a-f0-9]+__/)[0]}\n`;
       }
       return "";
     }
   }, {
-    taskmuxHome: "/tmp/taskmux-home",
+    yuiHome: "/tmp/yui-home",
     readinessTimeoutMs: 3,
     readinessPollMs: 1,
     now: () => timestamp++,
@@ -194,7 +194,7 @@ test("an existing pane receipt bypasses readiness while the Agent is busy", () =
       if (args[0] === "show-options") return "1\n";
       throw new Error(`unexpected tmux command: ${args[0]}`);
     }
-  }, { taskmuxHome: "/tmp/taskmux-home" });
+  }, { yuiHome: "/tmp/yui-home" });
 
   assert.equal(manager.sendRoleInputOnce(
     "task-1",
@@ -226,11 +226,11 @@ test("one manager accepts distinct Codex and Claude readiness probes per deliver
           : "Claude prompt ready\n";
       }
       if (args[0] === "if-shell") {
-        return `${args.at(-1).match(/__TASKMUX_DELIVERY_SENT_[a-f0-9]+__/)[0]}\n`;
+        return `${args.at(-1).match(/__YUI_DELIVERY_SENT_[a-f0-9]+__/)[0]}\n`;
       }
       return "";
     }
-  }, { taskmuxHome: "/tmp/taskmux-home" });
+  }, { yuiHome: "/tmp/yui-home" });
 
   assert.equal(manager.sendRoleInputOnce(
     "task-1", "leader", "codex-job", "lead",
@@ -250,7 +250,7 @@ test("automated delivery refuses a live pane without an Agent-specific readiness
       calls.push({ command, args });
       return "";
     }
-  }, { taskmuxHome: "/tmp/taskmux-home" });
+  }, { yuiHome: "/tmp/yui-home" });
 
   assert.throws(
     () => manager.sendRoleInputOnce("task-1", "leader", "job-42", "do work"),

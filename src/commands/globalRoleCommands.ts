@@ -44,7 +44,7 @@ type GlobalRoleStore = AgentCommandStore & Readonly<{
 }>;
 
 export type GlobalRoleCommandOptions = Readonly<{
-  taskmuxHome?: string;
+  yuiHome?: string;
   env?: NodeJS.ProcessEnv;
 }>;
 
@@ -106,7 +106,7 @@ function addRole(args: string[], store: GlobalRoleStore): string {
 }
 
 function listRoles(args: string[], store: GlobalRoleStore): string {
-  assertNoArguments(args, "Role list usage: taskmux role list");
+  assertNoArguments(args, "Role list usage: yui role list");
   const rows = new Map<string, [string, string, string, string, string, string]>();
   for (const name of SYSTEM_ROLE_NAMES) {
     const role = store.getGlobalRole(name);
@@ -138,7 +138,7 @@ function listRoles(args: string[], store: GlobalRoleStore): string {
 function showRole(args: string[], store: GlobalRoleStore): string {
   const [rawName, ...rest] = args;
   const name = roleName(rawName);
-  assertNoArguments(rest, "Role show usage: taskmux role show <role>");
+  assertNoArguments(rest, "Role show usage: yui role show <role>");
   const role = store.getGlobalRole(name);
   if (role === null) {
     if (isSystemRoleName(name)) return renderMissingSystemRole(name);
@@ -196,7 +196,7 @@ function bindRole(args: string[], store: GlobalRoleStore): string {
   const [rawName, rawAgentId, ...rest] = args;
   const name = roleName(rawName);
   const agentId = required(rawAgentId, "Agent id");
-  assertNoArguments(rest, "Role bind usage: taskmux role bind <role> <agent-id>");
+  assertNoArguments(rest, "Role bind usage: yui role bind <role> <agent-id>");
   const role = requireRole(name, store);
   const agent = requireAgent(agentId, store);
   const binding = role.agentBindings[agentId] ?? createRoleAgentBinding(definition(agent));
@@ -227,7 +227,7 @@ function bindRole(args: string[], store: GlobalRoleStore): string {
 function removeRole(args: string[], store: GlobalRoleStore): string {
   const [rawName, ...rest] = args;
   const name = roleName(rawName);
-  assertNoArguments(rest, "Role remove usage: taskmux role remove <role>");
+  assertNoArguments(rest, "Role remove usage: yui role remove <role>");
   if (isSystemRoleName(name)) throw usageError(`System role cannot be removed: ${name}`);
   const role = requireRole(name, store);
   const active = store.getGlobalRoleSessionSet(name)?.sessions[role.activeAgentId];
@@ -245,7 +245,7 @@ function enterRole(
 ): GlobalRoleEnterControl {
   const [rawName, ...rest] = args;
   const name = roleName(rawName);
-  assertNoArguments(rest, "Role enter usage: taskmux role enter <role>");
+  assertNoArguments(rest, "Role enter usage: yui role enter <role>");
   const role = requireRole(name, store);
   const agent = requireAgent(role.activeAgentId, store);
   const set = store.getGlobalRoleSessionSet(name);
@@ -261,7 +261,7 @@ function roleSession(
 ): string {
   const [command, rawName, ...tail] = args;
   if (command !== "record" && command !== "replace") {
-    throw usageError("Role session usage: taskmux role session record|replace <role> --native-id <id> [--reason <reason>].");
+    throw usageError("Role session usage: yui role session record|replace <role> --native-id <id> [--reason <reason>].");
   }
   const name = roleName(rawName);
   const parsed = parseOptions(tail, new Map<string, OptionKind>([
@@ -285,7 +285,7 @@ function roleSession(
     adapterId: binding.adapterId,
     nativeSessionId,
     policy: "fixed" as const,
-    status: environment.TASKMUX_ROLE === name ? "running" as const : "ready" as const
+    status: environment.YUI_ROLE === name ? "running" as const : "ready" as const
   });
   if (command === "record") {
     if (existing !== null && existing.nativeSessionId !== nativeSessionId) {
@@ -315,9 +315,9 @@ function assertSessionProvenance(
   environment: NodeJS.ProcessEnv
 ): void {
   const values = [
-    environment.TASKMUX_ROLE,
-    environment.TASKMUX_AGENT_ID,
-    environment.TASKMUX_ADAPTER_ID
+    environment.YUI_ROLE,
+    environment.YUI_AGENT_ID,
+    environment.YUI_ADAPTER_ID
   ];
   if (values.every((value) => value === undefined)) return;
   if (values.some((value) => value === undefined || value.trim().length === 0)) {
@@ -328,9 +328,9 @@ function assertSessionProvenance(
   }
   const binding = activeRoleAgentBinding(role);
   if (
-    environment.TASKMUX_ROLE !== role.name
-    || environment.TASKMUX_AGENT_ID !== binding.agentId
-    || environment.TASKMUX_ADAPTER_ID !== binding.adapterId
+    environment.YUI_ROLE !== role.name
+    || environment.YUI_AGENT_ID !== binding.agentId
+    || environment.YUI_ADAPTER_ID !== binding.adapterId
   ) {
     throw usageError("Native session registration does not match the active GlobalRole binding.");
   }
@@ -400,11 +400,11 @@ function compileGlobalRoleLaunch(
     env: stringEnvironment({
       ...baseEnvironment,
       ...resolveAgentEnvironment(definition(agent), baseEnvironment),
-      ...(options.taskmuxHome === undefined ? {} : { TASKMUX_HOME: options.taskmuxHome }),
-      TASKMUX_ROLE: role.name,
-      TASKMUX_AGENT_ID: agent.id,
-      TASKMUX_ADAPTER_ID: agent.adapterId,
-      TASKMUX_WORKSPACE: role.workspace
+      ...(options.yuiHome === undefined ? {} : { YUI_HOME: options.yuiHome }),
+      YUI_ROLE: role.name,
+      YUI_AGENT_ID: agent.id,
+      YUI_ADAPTER_ID: agent.adapterId,
+      YUI_WORKSPACE: role.workspace
     })
   };
 }

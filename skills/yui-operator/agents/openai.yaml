@@ -1,0 +1,4 @@
+interface:
+  display_name: "Yui Operator"
+  short_description: "Manage Yui tasks and user input safely"
+  default_prompt: "Use $yui-operator to update and coordinate a Yui task for me."

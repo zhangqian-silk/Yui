@@ -75,7 +75,7 @@ function createRequest(
   store: TaskStore,
   options: TaskInputCommandOptions
 ): TaskInputCommandExecution {
-  const usage = "Task input request usage: taskmux task input request <task> --question <text> [--choice <key=label> ...] [--blocks <work-item:id|run:id> ...] [--recommend <key> --timeout-seconds <seconds>].";
+  const usage = "Task input request usage: yui task input request <task> --question <text> [--choice <key=label> ...] [--blocks <work-item:id|run:id> ...] [--recommend <key> --timeout-seconds <seconds>].";
   const parsed = parseMultiValueTail(
     args,
     new Set(["--question", "--recommend", "--timeout-seconds"]),
@@ -139,7 +139,7 @@ function createRequest(
 }
 
 function listRequests(args: string[], store: TaskStore): TaskInputCommandExecution {
-  const usage = "Task input list usage: taskmux task input list [task] [--all].";
+  const usage = "Task input list usage: yui task input list [task] [--all].";
   const parsed = parseTail(args, new Set(), usage, new Set(["--all"]));
   if (parsed.positionals.length > 1) throw usageError(usage);
   const taskId = parsed.positionals[0];
@@ -176,7 +176,7 @@ function listRequests(args: string[], store: TaskStore): TaskInputCommandExecuti
 }
 
 function showRequest(args: string[], store: TaskStore): TaskInputCommandExecution {
-  const usage = "Task input show usage: taskmux task input show <input> [--task <task>].";
+  const usage = "Task input show usage: yui task input show <input> [--task <task>].";
   const parsed = parseTail(args, new Set(["--task"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
   const taskId = optionalNonEmptyOption(parsed.options, "--task");
@@ -192,7 +192,7 @@ function answerRequest(
   store: TaskStore,
   options: TaskInputCommandOptions
 ): TaskInputCommandExecution {
-  const usage = "Task input answer usage: taskmux task input answer <input> [--task <task>] (--choice <key> | --text <text>).";
+  const usage = "Task input answer usage: yui task input answer <input> [--task <task>] (--choice <key> | --text <text>).";
   const parsed = parseTail(args, new Set(["--task", "--choice", "--text"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
   const choice = optionalNonEmptyOption(parsed.options, "--choice");
@@ -230,7 +230,7 @@ function cancelRequest(
   store: TaskStore,
   options: TaskInputCommandOptions
 ): TaskInputCommandExecution {
-  const usage = "Task input cancel usage: taskmux task input cancel <task> <input> --reason <text>.";
+  const usage = "Task input cancel usage: yui task input cancel <task> <input> --reason <text>.";
   const parsed = parseTail(args, new Set(["--reason"]), usage);
   exactPositionals(parsed.positionals, 2, usage);
   const reason = requiredOption(parsed.options, "--reason");
@@ -264,12 +264,12 @@ function requireLeaderInputOrigin(
   const role = requireRole(store, taskId, LEADER_ROLE);
   const run = store.getActiveAgentRun(taskId, LEADER_ROLE);
   if (
-    env.TASKMUX_SESSION_SCOPE !== "task"
-    || env.TASKMUX_TASK_ID !== taskId
-    || env.TASKMUX_ROLE !== LEADER_ROLE
-    || env.TASKMUX_AGENT_ID !== role.activeAgentId
+    env.YUI_SESSION_SCOPE !== "task"
+    || env.YUI_TASK_ID !== taskId
+    || env.YUI_ROLE !== LEADER_ROLE
+    || env.YUI_AGENT_ID !== role.activeAgentId
     || run === null
-    || env.TASKMUX_RUN_ID !== run.id
+    || env.YUI_RUN_ID !== run.id
     || run.status !== "active"
     || run.deliveredAt === undefined
     || run.workItemId !== undefined
@@ -277,7 +277,7 @@ function requireLeaderInputOrigin(
     throw usageError("Task input request requires the active Leader Run environment.");
   }
   const sessions = store.getTaskRoleSessionSet(taskId, LEADER_ROLE);
-  const nativeSessionId = trimmed(env.TASKMUX_NATIVE_SESSION_ID);
+  const nativeSessionId = trimmed(env.YUI_NATIVE_SESSION_ID);
   if (nativeSessionId !== undefined
     && sessions?.sessions[role.activeAgentId]?.nativeSessionId !== nativeSessionId) {
     throw usageError("Task input request native session does not match the active Leader session.");
@@ -301,13 +301,13 @@ function assertInputCancelOrigin(
 ): void {
   const env = environment ?? {};
   if (
-    env.TASKMUX_SESSION_SCOPE !== "task"
-    || env.TASKMUX_TASK_ID !== request.taskId
-    || env.TASKMUX_ROLE !== request.requester.roleName
-    || env.TASKMUX_AGENT_ID !== request.requester.agentId
-    || env.TASKMUX_RUN_ID !== request.requester.runId
+    env.YUI_SESSION_SCOPE !== "task"
+    || env.YUI_TASK_ID !== request.taskId
+    || env.YUI_ROLE !== request.requester.roleName
+    || env.YUI_AGENT_ID !== request.requester.agentId
+    || env.YUI_RUN_ID !== request.requester.runId
     || (request.requester.nativeSessionId !== undefined
-      && env.TASKMUX_NATIVE_SESSION_ID !== request.requester.nativeSessionId)
+      && env.YUI_NATIVE_SESSION_ID !== request.requester.nativeSessionId)
   ) {
     throw usageError("Only the originating Leader may cancel this input request.");
   }
@@ -315,8 +315,8 @@ function assertInputCancelOrigin(
 
 function inputAnswerer(environment: NodeJS.ProcessEnv | undefined): "user" | "operator" {
   const env = environment ?? {};
-  if (env.TASKMUX_SESSION_SCOPE === undefined && env.TASKMUX_ROLE === undefined) return "user";
-  if (env.TASKMUX_SESSION_SCOPE === "global" && env.TASKMUX_ROLE === "operator") return "operator";
+  if (env.YUI_SESSION_SCOPE === undefined && env.YUI_ROLE === undefined) return "user";
+  if (env.YUI_SESSION_SCOPE === "global" && env.YUI_ROLE === "operator") return "operator";
   throw usageError("Task input answers may be submitted only by the user or Operator.");
 }
 

@@ -159,7 +159,7 @@ function updateTaskCommand(
   const clearOptions = new Set([
     "--clear-description", "--clear-priority", "--clear-tags", "--clear-due-at"
   ]);
-  const usage = "Task update usage: taskmux task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at].";
+  const usage = "Task update usage: yui task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at].";
   const parsed = parseTail(args, optionNames, usage, clearOptions);
   exactPositionals(parsed.positionals, 1, usage);
   if (parsed.options.size === 0) throw usageError("At least one Task metadata option is required.", usage);
@@ -255,7 +255,7 @@ function createTaskCommand(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task create usage: taskmux task create <title> [--repository <id>] [--base <ref>].";
+  const usage = "Task create usage: yui task create <title> [--repository <id>] [--base <ref>].";
   const parsed = parseTail(args, new Set(["--repository", "--base"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
   const repositoryId = optionalNonEmptyOption(parsed.options, "--repository");
@@ -290,7 +290,7 @@ function createTaskAggregate(
 }
 
 function listTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandExecution {
-  assertNoArguments(args, "Task list usage: taskmux task list.");
+  assertNoArguments(args, "Task list usage: yui task list.");
   const tasks = store.listTasks();
   const rendered = tasks.length === 0
     ? "No tasks found.\n"
@@ -310,7 +310,7 @@ function listTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
 
 function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandExecution {
   const [taskId] = args;
-  exactPositionals(args, 1, "Task show usage: taskmux task show <id>.");
+  exactPositionals(args, 1, "Task show usage: yui task show <id>.");
   const task = requireTask(store, taskId);
   const roles = store.listRoles(task.id);
   const messages = store.listMessages(task.id);
@@ -365,7 +365,7 @@ function activateTaskCommand(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  exactPositionals(args, 1, "Task activate usage: taskmux task activate <task>.");
+  exactPositionals(args, 1, "Task activate usage: yui task activate <task>.");
   const now = clock(options);
   const result = store.transaction((tx) => {
     const task = requireTask(tx, args[0]);
@@ -396,7 +396,7 @@ function completeTaskCommand(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task complete usage: taskmux task complete <id> --summary <text>.";
+  const usage = "Task complete usage: yui task complete <id> --summary <text>.";
   const parsed = parseTail(args, new Set(["--summary"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
   const summary = requiredOption(parsed.options, "--summary");
@@ -463,7 +463,7 @@ function reopenTaskCommand(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  exactPositionals(args, 1, "Task reopen usage: taskmux task reopen <id>.");
+  exactPositionals(args, 1, "Task reopen usage: yui task reopen <id>.");
   const now = clock(options);
   const result = store.transaction((tx) => {
     const task = requireTask(tx, args[0]);
@@ -487,7 +487,7 @@ function archiveTaskCommand(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  exactPositionals(args, 1, "Task archive usage: taskmux task archive <id>.");
+  exactPositionals(args, 1, "Task archive usage: yui task archive <id>.");
   const now = clock(options);
   const result = store.transaction((tx) => {
     const task = requireTask(tx, args[0]);
@@ -527,7 +527,7 @@ function reconcileTaskCommand(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  exactPositionals(args, 1, "Task reconcile usage: taskmux task reconcile <task>.");
+  exactPositionals(args, 1, "Task reconcile usage: yui task reconcile <task>.");
   const task = requireTask(store, args[0]);
   const runtime = requireRuntime(options);
   runtime.reconcileTask(task.id);
@@ -541,7 +541,7 @@ function taskMessageCommand(
 ): string {
   const [command, ...rest] = args;
   if (command === "send") {
-    exactPositionals(rest, 2, "Task message send usage: taskmux task message send <id> <body>.");
+    exactPositionals(rest, 2, "Task message send usage: yui task message send <id> <body>.");
     const now = clock(options);
     const result = store.transaction((tx) => {
       const task = requireTask(tx, rest[0]);
@@ -554,7 +554,7 @@ function taskMessageCommand(
     return `Sent message ${result.message.id} to ${result.task.id}\n`;
   }
   if (command === "list") {
-    exactPositionals(rest, 1, "Task message list usage: taskmux task message list <id>.");
+    exactPositionals(rest, 1, "Task message list usage: yui task message list <id>.");
     const task = requireTask(store, rest[0]);
     const messages = store.listMessages(task.id);
     if (messages.length === 0) return "No messages found.\n";
@@ -604,7 +604,7 @@ function addTaskRole(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task role add usage: taskmux task role add <task> <name> [Role and Agent settings].";
+  const usage = "Task role add usage: yui task role add <task> <name> [Role and Agent settings].";
   const [taskId, roleName, ...tail] = args;
   if (taskId === undefined || roleName === undefined || taskId.startsWith("--") || roleName.startsWith("--")) {
     throw usageError("Task id and Role name are required.", usage);
@@ -646,7 +646,7 @@ function listTaskRoles(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  exactPositionals(args, 1, "Task role list usage: taskmux task role list <task>.");
+  exactPositionals(args, 1, "Task role list usage: yui task role list <task>.");
   const task = requireTask(store, args[0]);
   const roles = store.listRoles(task.id);
   const statuses = inspectTaskRoleRuntimeStatuses(
@@ -685,7 +685,7 @@ function taskRoleStatus(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  exactPositionals(args, 2, "Task role status usage: taskmux task role status <task> <role>.");
+  exactPositionals(args, 2, "Task role status usage: yui task role status <task> <role>.");
   const task = requireTask(store, args[0]);
   const role = requireRole(store, task.id, args[1]);
   const [status] = inspectTaskRoleRuntimeStatuses(
@@ -699,7 +699,7 @@ function taskRoleStatus(
 }
 
 function showTaskRole(args: string[], store: TaskWorkflowStore): string {
-  exactPositionals(args, 2, "Task role show usage: taskmux task role show <task> <role>.");
+  exactPositionals(args, 2, "Task role show usage: yui task role show <task> <role>.");
   const task = requireTask(store, args[0]);
   const role = requireRole(store, task.id, args[1]);
   return renderRoleDetails(`Task Role: ${role.name}`, role, {
@@ -713,7 +713,7 @@ function updateTaskRole(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task role update usage: taskmux task role update <task> <role> [Role and Agent settings].";
+  const usage = "Task role update usage: yui task role update <task> <role> [Role and Agent settings].";
   const [taskId, roleName, ...tail] = args;
   if (taskId === undefined || roleName === undefined || taskId.startsWith("--") || roleName.startsWith("--")) {
     throw usageError("Task id and Role name are required.", usage);
@@ -763,7 +763,7 @@ function removeTaskRole(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  exactPositionals(args, 2, "Task role remove usage: taskmux task role remove <task> <role>.");
+  exactPositionals(args, 2, "Task role remove usage: yui task role remove <task> <role>.");
   const removed = store.transaction((tx) => {
     const task = requireTask(tx, args[0]);
     assertTaskOpen(task);
@@ -788,7 +788,7 @@ function bindTaskRole(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  exactPositionals(args, 3, "Task role bind usage: taskmux task role bind <task> <role> <agent-id>.");
+  exactPositionals(args, 3, "Task role bind usage: yui task role bind <task> <role> <agent-id>.");
   const now = clock(options);
   const result = store.transaction((tx) => {
     const task = requireTask(tx, args[0]);
@@ -829,7 +829,7 @@ function enterTaskRole(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  exactPositionals(args, 2, "Task role enter usage: taskmux task role enter <task> <role>.");
+  exactPositionals(args, 2, "Task role enter usage: yui task role enter <task> <role>.");
   const task = requireTask(store, args[0]);
   if (task.status !== "active") {
     throw usageError(inactiveTaskMessage(task, "entering a role session"));
@@ -850,7 +850,7 @@ function enterTaskRoleAlias(
   options: TaskCommandOptions
 ): TaskCommandExecution {
   if (args.length < 1 || args.length > 2 || args.some((value) => value.trim().length === 0)) {
-    throw usageError("Task enter usage: taskmux task enter <task> [role].");
+    throw usageError("Task enter usage: yui task enter <task> [role].");
   }
   return enterTaskRole([args[0], args[1] ?? LEADER_ROLE], store, options);
 }
@@ -875,7 +875,7 @@ function createWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task work create usage: taskmux task work create <task> <title> [--role <name>].";
+  const usage = "Task work create usage: yui task work create <task> <title> [--role <name>].";
   const parsed = parseTail(args, new Set(["--role"]), usage);
   exactPositionals(parsed.positionals, 2, usage);
   const now = clock(options);
@@ -896,7 +896,7 @@ function createWork(
 }
 
 function listWork(args: string[], store: TaskWorkflowStore): string {
-  exactPositionals(args, 1, "Task work list usage: taskmux task work list <task>.");
+  exactPositionals(args, 1, "Task work list usage: yui task work list <task>.");
   const task = requireTask(store, args[0]);
   const items = store.listWorkItems(task.id);
   if (items.length === 0) return "No work items found.\n";
@@ -919,7 +919,7 @@ function updateWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task work update usage: taskmux task work update <id> <todo|running|done|failed> [--summary <text>].";
+  const usage = "Task work update usage: yui task work update <id> <todo|running|done|failed> [--summary <text>].";
   const parsed = parseTail(args, new Set(["--summary"]), usage);
   exactPositionals(parsed.positionals, 2, usage);
   const requested = parsed.positionals[1];
@@ -950,7 +950,7 @@ function dispatchWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task work dispatch usage: taskmux task work dispatch <id> [--input <text>].";
+  const usage = "Task work dispatch usage: yui task work dispatch <id> [--input <text>].";
   const parsed = parseTail(args, new Set(["--input"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
   const now = clock(options);
@@ -1004,7 +1004,7 @@ function taskRunCommand(
 }
 
 function listRuns(args: string[], store: TaskWorkflowStore): string {
-  exactPositionals(args, 1, "Task run list usage: taskmux task run list <work>.");
+  exactPositionals(args, 1, "Task run list usage: yui task run list <work>.");
   const item = requireWorkItem(store, args[0]);
   const runs = store.listAgentRuns(item.taskId).filter((run) => run.workItemId === item.id);
   if (runs.length === 0) return "No runs found.\n";
@@ -1027,7 +1027,7 @@ function retryRun(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  exactPositionals(args, 1, "Task run retry usage: taskmux task run retry <run>.");
+  exactPositionals(args, 1, "Task run retry usage: yui task run retry <run>.");
   const now = clock(options);
   const retried = store.transaction((tx) => {
     const previous = requireRun(tx, args[0]);
@@ -1069,7 +1069,7 @@ function yieldRun(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task run yield usage: taskmux task run yield <run> --summary <text>.";
+  const usage = "Task run yield usage: yui task run yield <run> --summary <text>.";
   const parsed = parseTail(args, new Set(["--summary"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
   const summary = requiredOption(parsed.options, "--summary");
@@ -1213,13 +1213,13 @@ function assertTaskOpen(task: Task): void {
 
 function taskActor(options: TaskCommandOptions, taskId: string): TaskCompletedBy {
   const environment = options.environment;
-  if (environment?.TASKMUX_SESSION_SCOPE === "task"
-    && environment.TASKMUX_TASK_ID === taskId
-    && environment.TASKMUX_ROLE === "leader") {
+  if (environment?.YUI_SESSION_SCOPE === "task"
+    && environment.YUI_TASK_ID === taskId
+    && environment.YUI_ROLE === "leader") {
     return "leader";
   }
-  return environment?.TASKMUX_SESSION_SCOPE === "global"
-    && environment.TASKMUX_ROLE === "operator" ? "operator" : "user";
+  return environment?.YUI_SESSION_SCOPE === "global"
+    && environment.YUI_ROLE === "operator" ? "operator" : "user";
 }
 
 function inactiveTaskMessage(task: Task, action: string): string {
@@ -1280,7 +1280,7 @@ function taskBriefCommand(
 ): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "show") {
-    exactPositionals(rest, 1, "Task brief show usage: taskmux task brief show <task>.");
+    exactPositionals(rest, 1, "Task brief show usage: yui task brief show <task>.");
     const task = requireTask(store, rest[0]);
     const brief = store.getTaskBrief(task.id);
     if (brief === null) {
@@ -1298,7 +1298,7 @@ function taskBriefCommand(
     ].join("\n").concat("\n"), { taskId: task.id, brief });
   }
   if (command === "update") {
-    const usage = "Task brief update usage: taskmux task brief update <task> [--objective <text>] [--boundary <text> ...] [--focus <text>] [--leader-summary <text>].";
+    const usage = "Task brief update usage: yui task brief update <task> [--objective <text>] [--boundary <text> ...] [--focus <text>] [--leader-summary <text>].";
     const parsed = parseMultiValueTail(rest, new Set(["--objective", "--focus", "--leader-summary"]), new Set(["--boundary"]), usage);
     exactPositionals(parsed.positionals, 1, usage);
     const hasObjective = parsed.options.has("--objective");
@@ -1350,7 +1350,7 @@ function taskDecisionCommand(
 ): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "record") {
-    const usage = "Task decision record usage: taskmux task decision record <task> --title <text> --rationale <text>.";
+    const usage = "Task decision record usage: yui task decision record <task> --title <text> --rationale <text>.";
     const parsed = parseTail(rest, new Set(["--title", "--rationale"]), usage);
     exactPositionals(parsed.positionals, 1, usage);
     const title = requiredOption(parsed.options, "--title");
@@ -1372,7 +1372,7 @@ function taskDecisionCommand(
     return output(`Recorded decision ${result.decision.id} for ${result.task.id}\n`);
   }
   if (command === "list") {
-    const usage = "Task decision list usage: taskmux task decision list <task> [--status active|superseded].";
+    const usage = "Task decision list usage: yui task decision list <task> [--status active|superseded].";
     const parsed = parseTail(rest, new Set(["--status"]), usage);
     exactPositionals(parsed.positionals, 1, usage);
     const task = requireTask(store, parsed.positionals[0]);
@@ -1400,7 +1400,7 @@ function taskDecisionCommand(
     )}\n`, { taskId: task.id, decisions });
   }
   if (command === "show") {
-    exactPositionals(rest, 2, "Task decision show usage: taskmux task decision show <task> <decision>.");
+    exactPositionals(rest, 2, "Task decision show usage: yui task decision show <task> <decision>.");
     const task = requireTask(store, rest[0]);
     const decision = store.getDecision(task.id, rest[1]);
     if (decision === null) throw dataError(`Decision not found: ${rest[1]}.`);
@@ -1417,7 +1417,7 @@ function taskDecisionCommand(
     ].join("\n").concat("\n"), { taskId: task.id, decision });
   }
   if (command === "supersede") {
-    const usage = "Task decision supersede usage: taskmux task decision supersede <task> <decision> --reason <text>.";
+    const usage = "Task decision supersede usage: yui task decision supersede <task> <decision> --reason <text>.";
     const parsed = parseTail(rest, new Set(["--reason"]), usage);
     exactPositionals(parsed.positionals, 2, usage);
     const reason = requiredOption(parsed.options, "--reason");
@@ -1451,7 +1451,7 @@ function taskMilestoneCommand(
 ): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "add") {
-    const usage = "Task milestone add usage: taskmux task milestone add <task> --title <text> --summary <text>.";
+    const usage = "Task milestone add usage: yui task milestone add <task> --title <text> --summary <text>.";
     const parsed = parseTail(rest, new Set(["--title", "--summary"]), usage);
     exactPositionals(parsed.positionals, 1, usage);
     const title = requiredOption(parsed.options, "--title");
@@ -1472,7 +1472,7 @@ function taskMilestoneCommand(
     return output(`Added milestone ${result.milestone.id} for ${result.task.id}\n`);
   }
   if (command === "list") {
-    exactPositionals(rest, 1, "Task milestone list usage: taskmux task milestone list <task>.");
+    exactPositionals(rest, 1, "Task milestone list usage: yui task milestone list <task>.");
     const task = requireTask(store, rest[0]);
     const milestones = store.listMilestones(task.id);
     if (milestones.length === 0) {
@@ -1490,7 +1490,7 @@ function taskMilestoneCommand(
     )}\n`, { taskId: task.id, milestones });
   }
   if (command === "show") {
-    exactPositionals(rest, 2, "Task milestone show usage: taskmux task milestone show <task> <milestone>.");
+    exactPositionals(rest, 2, "Task milestone show usage: yui task milestone show <task> <milestone>.");
     const task = requireTask(store, rest[0]);
     const milestone = store.getMilestone(task.id, rest[1]);
     if (milestone === null) throw dataError(`Milestone not found: ${rest[1]}.`);
@@ -1514,7 +1514,7 @@ function taskEventCommand(
 ): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "list") {
-    exactPositionals(rest, 1, "Task event list usage: taskmux task event list <task>.");
+    exactPositionals(rest, 1, "Task event list usage: yui task event list <task>.");
     const task = requireTask(store, rest[0]);
     const events = store.listEvents(task.id);
     if (events.length === 0) {
@@ -1532,7 +1532,7 @@ function taskEventCommand(
     )}\n`, { taskId: task.id, events });
   }
   if (command === "show") {
-    exactPositionals(rest, 2, "Task event show usage: taskmux task event show <task> <event>.");
+    exactPositionals(rest, 2, "Task event show usage: yui task event show <task> <event>.");
     const task = requireTask(store, rest[0]);
     const events = store.listEvents(task.id);
     const event = events.find((e) => e.id === rest[1]) ?? null;

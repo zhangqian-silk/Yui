@@ -40,7 +40,7 @@ function snapshot(root) {
 }
 
 test("FileTaskStore doctor reports schema, state, tools, and configured Agent capabilities without writes", (t) => {
-  const root = temporaryRoot(t, "taskmux-file-doctor-");
+  const root = temporaryRoot(t, "yui-file-doctor-");
   const home = join(root, "home");
   ensureStorageSchema(home, new Date("2026-07-19T00:00:00.000Z"));
   const store = new FileTaskStore(home);
@@ -75,10 +75,10 @@ test("FileTaskStore doctor reports schema, state, tools, and configured Agent ca
     }
   };
 
-  const output = runDoctorCommand([], { TASKMUX_HOME: home }, executor);
+  const output = runDoctorCommand([], { YUI_HOME: home }, executor);
 
-  assert.match(output, /^TaskMux doctor$/m);
-  assert.match(output, /taskmux home\s+ok/);
+  assert.match(output, /^Yui doctor$/m);
+  assert.match(output, /yui home\s+ok/);
   assert.match(output, /storage schema\s+ok\s+current=5 latest=5/);
   assert.match(output, /storage state\s+ok\s+readable agents=1/);
   assert.match(output, /git\s+ok\s+git: git version 2\.45\.1/);
@@ -95,7 +95,7 @@ test("FileTaskStore doctor reports schema, state, tools, and configured Agent ca
 });
 
 test("doctor reports a missing home without creating it", (t) => {
-  const root = temporaryRoot(t, "taskmux-file-doctor-missing-");
+  const root = temporaryRoot(t, "yui-file-doctor-missing-");
   const home = join(root, "does-not-exist");
   const executor = {
     run(command) {
@@ -104,25 +104,25 @@ test("doctor reports a missing home without creating it", (t) => {
     }
   };
 
-  const output = runDoctorCommand([], { TASKMUX_HOME: home }, executor);
+  const output = runDoctorCommand([], { YUI_HOME: home }, executor);
 
-  assert.match(output, /taskmux home\s+missing\s+run taskmux setup/);
-  assert.match(output, /storage schema\s+missing\s+run taskmux setup/);
-  assert.match(output, /storage state\s+missing\s+run taskmux setup/);
+  assert.match(output, /yui home\s+missing\s+run yui setup/);
+  assert.match(output, /storage schema\s+missing\s+run yui setup/);
+  assert.match(output, /storage state\s+missing\s+run yui setup/);
   assert.match(output, /git\s+ok/);
   assert.match(output, /tmux\s+missing/);
   assert.equal(existsSync(home), false);
 });
 
 test("doctor reports an unreadable state as invalid and does not repair it", (t) => {
-  const root = temporaryRoot(t, "taskmux-file-doctor-invalid-");
+  const root = temporaryRoot(t, "yui-file-doctor-invalid-");
   const home = join(root, "home");
   ensureStorageSchema(home, new Date("2026-07-19T00:00:00.000Z"));
   const statePath = join(home, "state.json");
   writeFileSync(statePath, "{not json}\n", { mode: 0o600 });
   const before = snapshot(home);
 
-  const output = runDoctorCommand([], { TASKMUX_HOME: home }, {
+  const output = runDoctorCommand([], { YUI_HOME: home }, {
     run(command) { return command === "git" ? "git version 2.45.1" : "tmux 3.4"; }
   });
 
@@ -135,12 +135,12 @@ test("doctor reports an unreadable state as invalid and does not repair it", (t)
 test("doctor rejects operands before inspecting storage or running commands", () => {
   let calls = 0;
   assert.throws(
-    () => runDoctorCommand(["repair"], { TASKMUX_HOME: "/does/not/matter" }, {
+    () => runDoctorCommand(["repair"], { YUI_HOME: "/does/not/matter" }, {
       run() { calls += 1; return ""; }
     }),
     (error) => error instanceof CliError
       && error.code === "USAGE_ERROR"
-      && /taskmux doctor/.test(error.message)
+      && /yui doctor/.test(error.message)
   );
   assert.equal(calls, 0);
 });

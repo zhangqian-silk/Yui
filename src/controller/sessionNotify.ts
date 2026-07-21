@@ -28,7 +28,7 @@ export async function runSessionNotifyCommand(
 ): Promise<void> {
   const params = parseCodexSessionNotification(payloadArgument, environment);
   await call(
-    requireText(environment.TASKMUX_HOME, "TASKMUX_HOME"),
+    requireText(environment.YUI_HOME, "YUI_HOME"),
     SESSION_BIND_METHOD,
     toJson(params)
   );
@@ -43,21 +43,21 @@ export function parseCodexSessionNotification(
     throw new Error("Codex notify payload type is invalid.");
   }
   const nativeSessionId = requireText(payload["thread-id"], "Codex thread-id");
-  const scope = environment.TASKMUX_SESSION_SCOPE;
+  const scope = environment.YUI_SESSION_SCOPE;
   if (scope !== "task" && scope !== "global") {
-    throw new Error("TASKMUX_SESSION_SCOPE must be task or global.");
+    throw new Error("YUI_SESSION_SCOPE must be task or global.");
   }
   const common = {
     scope,
-    roleName: requireText(environment.TASKMUX_ROLE, "TASKMUX_ROLE"),
-    agentId: requireText(environment.TASKMUX_AGENT_ID, "TASKMUX_AGENT_ID"),
-    adapterId: requireCodexAdapter(environment.TASKMUX_ADAPTER_ID),
+    roleName: requireText(environment.YUI_ROLE, "YUI_ROLE"),
+    agentId: requireText(environment.YUI_AGENT_ID, "YUI_AGENT_ID"),
+    adapterId: requireCodexAdapter(environment.YUI_ADAPTER_ID),
     nativeSessionId
   } as const;
   return scope === "task"
     ? {
         ...common,
-        taskId: requireText(environment.TASKMUX_TASK_ID, "TASKMUX_TASK_ID")
+        taskId: requireText(environment.YUI_TASK_ID, "YUI_TASK_ID")
       }
     : common;
 }

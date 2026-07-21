@@ -1,12 +1,12 @@
-# TaskMux architecture
+# Yui architecture
 
-TaskMux is a single-user local control plane. FileTaskStore is the one authority for TaskMux state, tmux is the one authority for Agent terminal/process interaction, and Git is the authority for repositories and worktrees.
+Yui is a single-user local control plane. FileTaskStore is the one authority for Yui state, tmux is the one authority for Agent terminal/process interaction, and Git is the authority for repositories and worktrees.
 
 ## Components
 
 ```mermaid
 flowchart LR
-  CLI[taskmux CLI] --> F[(schema.json + state.json)]
+  CLI[yui CLI] --> F[(schema.json + state.json)]
   CLI -->|private Unix socket| C[Controller]
   C --> F
   C --> G[Git worktrees]
@@ -16,16 +16,16 @@ flowchart LR
 
 - The CLI owns parsing, interactive selection, setup/completion, and foreground attach.
 - FileTaskStore owns all persisted domain records and atomic mutations.
-- One background Controller per `TASKMUX_HOME` owns automatic Git/tmux effects.
+- One background Controller per `YUI_HOME` owns automatic Git/tmux effects.
 - tmux receives all automated input and exclusively owns interactive terminal input after attach.
-- Native Agent transcript stores remain outside TaskMux. Only explicit messages, inputs, Run state, and summaries enter `state.json`.
+- Native Agent transcript stores remain outside Yui. Only explicit messages, inputs, Run state, and summaries enter `state.json`.
 
 The Controller socket uses a private discovery file, random token, strict JSON-line protocol, and local file permissions. It is transport, not a second persistence system.
 
 ## Persistent layout
 
 ```text
-TASKMUX_HOME/
+YUI_HOME/
   schema.json
   state.json
   .state.lock
@@ -46,7 +46,7 @@ TASKMUX_HOME/
 - Tasks, Task Roles, RoleWorkspaces, messages, WorkItems, AgentRuns, append-only events, Task Briefs, Decisions, and Milestones;
 - pending Leader wakes, Leader failures, and Operator notifications.
 
-Every persisted domain record has its own schema version and is validated when read. Unsupported aggregate or record shapes fail explicitly; TaskMux does not silently repair them.
+Every persisted domain record has its own schema version and is validated when read. Unsupported aggregate or record shapes fail explicitly; Yui does not silently repair them.
 
 Writes acquire a cross-process lock, reread the latest aggregate, apply the mutation once, and commit one replacement. The durable write path creates a mode-`0600` temporary file, flushes it, renames it over `state.json`, and flushes the containing directory. Compound workflow operations use the same transaction callback and produce one aggregate write.
 
@@ -56,8 +56,8 @@ The layout and aggregate migration registries are intentionally empty in this re
 
 - A Task is `draft`, `active`, `completed`, or `archived`. Completion is a reversible execution fence; archive is terminal.
 - Creating a Task also creates its Leader Role.
-- Repository-backed active Tasks use one deterministic worktree per Role at `<TASKMUX_HOME>/worktrees/<task-id>/<role-name>`.
-- Common Role names map directly to `taskmux/<task-id>/<role-name>` branches; names that are not valid Git ref segments use a deterministic encoded branch segment without changing their worktree directory.
+- Repository-backed active Tasks use one deterministic worktree per Role at `<YUI_HOME>/worktrees/<task-id>/<role-name>`.
+- Common Role names map directly to `yui/<task-id>/<role-name>` branches; names that are not valid Git ref segments use a deterministic encoded branch segment without changing their worktree directory.
 - `Task.cwd` marks the Task worktree root; each Task Role workspace agrees with its persisted RoleWorkspace path.
 - A Role may bind multiple Agents but has one active Agent.
 - Each `(Role, Agent)` binding has its own native session record. Switching preserves dormant sessions.
@@ -74,7 +74,7 @@ FileTaskStore validates cross-record references after every transaction, includi
 
 ## Controller pass
 
-The Controller runs a non-overlapping full reconciliation pass every 30 seconds by default. `reconciliationIntervalSeconds` may be set from 5 to 300 in TaskMux config. Durable state changes request an immediate pass through the Controller socket, and concurrent scan requests coalesce into one follow-up pass.
+The Controller runs a non-overlapping full reconciliation pass every 30 seconds by default. `reconciliationIntervalSeconds` may be set from 5 to 300 in Yui config. Durable state changes request an immediate pass through the Controller socket, and concurrent scan requests coalesce into one follow-up pass.
 
 `controller restart` stops only this process and waits for its private socket/discovery state to disappear before starting the currently installed runtime. tmux sessions are external durable runtime state and are never stopped by Controller restart.
 
@@ -87,7 +87,7 @@ prepare active workspaces
   -> dispatch pending Leader wakes
 ```
 
-Repository preparation precedes delivery. A Repository path and base ref are validated by Git. Each Role derives the path `<TASKMUX_HOME>/worktrees/<task-id>/<role-name>` and branch `taskmux/<task-id>/<role-name>`. The minimal RoleWorkspace record retains its Repository, path, branch, base ref, and starting commit; it is not a ref ledger. Existing worktrees must resolve to the expected path, branch, and Git common directory.
+Repository preparation precedes delivery. A Repository path and base ref are validated by Git. Each Role derives the path `<YUI_HOME>/worktrees/<task-id>/<role-name>` and branch `yui/<task-id>/<role-name>`. The minimal RoleWorkspace record retains its Repository, path, branch, base ref, and starting commit; it is not a ref ledger. Existing worktrees must resolve to the expected path, branch, and Git common directory.
 
 Archive stops tmux before worktree cleanup. Each clean Role worktree is removed idempotently and recorded independently. A dirty Role worktree and its RoleWorkspace record are preserved; they are never force-removed. A Git failure is isolated to its Task so other Task reconciliation continues.
 
@@ -109,10 +109,10 @@ Foreground attach is a hard terminal handoff:
 
 1. close any readline interface;
 2. leave raw mode;
-3. pause TaskMux stdin;
+3. pause Yui stdin;
 4. run `tmux attach-session` synchronously with inherited stdio.
 
-TaskMux does not read stdin, draw UI, or relay bytes while attached.
+Yui does not read stdin, draw UI, or relay bytes while attached.
 
 Automatic delivery never reads stdin. It requires an adapter-specific readiness probe: Codex and Claude have separate composer markers. Before waiting for readiness, the Controller checks for an existing pane receipt, so a busy Agent does not cause a retry scan to block. Receipt check/write, literal input, and Enter execute in one tmux server command queue.
 
@@ -123,10 +123,10 @@ Claude receives a preallocated session ID at new launch and resumes that fixed I
 Codex discovers its thread ID at runtime. Managed launches add a structured Codex `notify` argv configuration. After each completed turn, Codex invokes:
 
 ```text
-taskmux internal session-notify <codex-json-payload>
+yui internal session-notify <codex-json-payload>
 ```
 
-The hidden command validates the payload and TaskMux provenance environment, then records the fixed task/global Role session through the Controller. No session-binding text is placed in a model prompt.
+The hidden command validates the payload and Yui provenance environment, then records the fixed task/global Role session through the Controller. No session-binding text is placed in a model prompt.
 
 ## Deliberate exclusions
 

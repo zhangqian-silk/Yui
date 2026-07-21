@@ -17,7 +17,7 @@ import {
 } from "../../dist/storage/storageSchema.js";
 
 function temporaryHome() {
-  return mkdtempSync(join(tmpdir(), "taskmux-storage-schema-"));
+  return mkdtempSync(join(tmpdir(), "yui-storage-schema-"));
 }
 
 function writeManifest(home, overrides = {}) {

@@ -21,7 +21,7 @@ import { FileTaskStore } from "../../dist/storage/taskStore.js";
 const NOW = new Date("2026-07-19T12:00:00.000Z");
 
 function fixture(t) {
-  const root = mkdtempSync(join(tmpdir(), "taskmux-workflow-"));
+  const root = mkdtempSync(join(tmpdir(), "yui-workflow-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   ensureStorageSchema(root, NOW);
   const store = new FileTaskStore(root);
@@ -163,7 +163,7 @@ test("Task list and show emit one-pass structured JSON for Agents", (t) => {
     [join(process.cwd(), "dist", "cli.js"), "--json", ...args],
     {
       encoding: "utf8",
-      env: { ...process.env, TASKMUX_HOME: root }
+      env: { ...process.env, YUI_HOME: root }
     }
   ));
 
@@ -540,9 +540,9 @@ test("a Leader control Run can complete its Task atomically", (t) => {
     {
       ...options,
       environment: {
-        TASKMUX_SESSION_SCOPE: "task",
-        TASKMUX_TASK_ID: task.id,
-        TASKMUX_ROLE: "leader"
+        YUI_SESSION_SCOPE: "task",
+        YUI_TASK_ID: task.id,
+        YUI_ROLE: "leader"
       }
     }
   );
@@ -582,9 +582,9 @@ test("a Leader session cannot complete another Task as that Task's Leader", (t) 
       {
         ...options,
         environment: {
-          TASKMUX_SESSION_SCOPE: "task",
-          TASKMUX_TASK_ID: source.id,
-          TASKMUX_ROLE: "leader"
+          YUI_SESSION_SCOPE: "task",
+          YUI_TASK_ID: source.id,
+          YUI_ROLE: "leader"
         }
       }
     ),

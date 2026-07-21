@@ -83,5 +83,5 @@ export class FileCompletionManager implements CompletionPort {
 }
 
 export function resolveCliIdentity(env: NodeJS.ProcessEnv): CliIdentity {
-  return env.TASKMUX_CLI_NAME === "taskmux-dev" ? "taskmux-dev" : "taskmux";
+  return env.YUI_CLI_NAME === "yui-dev" ? "yui-dev" : "yui";
 }

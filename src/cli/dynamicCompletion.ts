@@ -12,7 +12,7 @@ export type DynamicCompletionInput = Readonly<{
 export async function resolveCompletionCandidates(
   input: DynamicCompletionInput
 ): Promise<string[]> {
-  const words = input.words[0] === "taskmux" || input.words[0] === "taskmux-dev"
+  const words = input.words[0] === "yui" || input.words[0] === "yui-dev"
     ? input.words.slice(1)
     : [...input.words];
   const { node, consumed } = resolveCommand(words);

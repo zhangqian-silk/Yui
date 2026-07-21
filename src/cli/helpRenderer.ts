@@ -2,8 +2,8 @@ import { visibleCommandSections, type CommandNode } from "./commandCatalog.js";
 
 export function renderCommandHelp(node: CommandNode, version: string): string {
   const title = node.path.length === 1
-    ? `TaskMux ${version}`
-    : `TaskMux ${node.path.slice(1).join(" ")}`;
+    ? `Yui ${version}`
+    : `Yui ${node.path.slice(1).join(" ")}`;
   const lines = [title, ""];
   if (node.summary.length > 0) lines.push(node.summary, "");
   lines.push("Usage:", ...node.usage.map((usage) => `  ${usage}`));

@@ -6,7 +6,7 @@ import {
   type CommandNode
 } from "./commandCatalog.js";
 
-export type CliIdentity = "taskmux" | "taskmux-dev";
+export type CliIdentity = "yui" | "yui-dev";
 
 type Entry = Readonly<{
   path: string;
@@ -16,7 +16,7 @@ type Entry = Readonly<{
 
 export function renderCompletion(
   shell: string | undefined,
-  identity: CliIdentity = "taskmux"
+  identity: CliIdentity = "yui"
 ): string {
   const entries = collectEntries(ROOT_COMMAND);
   switch (shell) {
@@ -48,8 +48,8 @@ function manifest(prefix: string): string {
 }
 
 function renderBash(entries: readonly Entry[], identity: CliIdentity): string {
-  const functionName = identity === "taskmux" ? "_taskmux" : "_taskmux_dev";
-  return `${manifest("# taskmux command:")}
+  const functionName = identity === "yui" ? "_yui" : "_yui_dev";
+  return `${manifest("# yui command:")}
 ${functionName}() {
   local current path dynamic_candidate
   local -a candidates dynamic_candidates
@@ -77,7 +77,7 @@ complete -F ${functionName} ${identity}
 
 function renderZsh(entries: readonly Entry[], identity: CliIdentity): string {
   return `#compdef ${identity}
-${manifest("# taskmux command:")}
+${manifest("# yui command:")}
 local current path dynamic_output
 local -a candidates
 current="$words[CURRENT]"
@@ -100,7 +100,7 @@ fi
 
 function renderFish(entries: readonly Entry[], identity: CliIdentity): string {
   const lines = [
-    manifest("# taskmux command:"),
+    manifest("# yui command:"),
     `function __${identity.replaceAll("-", "_")}_dynamic`,
     `  ${identity} completion candidates (commandline -ct) -- (commandline -opc | string split ' ' | tail -n +2) 2>/dev/null`,
     "end",

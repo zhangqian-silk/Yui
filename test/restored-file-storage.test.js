@@ -18,7 +18,7 @@ import {
 } from "../dist/storage/taskStore.js";
 
 function temporaryHome() {
-  return mkdtempSync(join(tmpdir(), "taskmux-file-store-"));
+  return mkdtempSync(join(tmpdir(), "yui-file-store-"));
 }
 
 test("storage schema initializes v5 and rejects every non-current version", () => {
@@ -48,7 +48,7 @@ test("storage schema initializes v5 and rejects every non-current version", () =
     }));
     assert.throws(
       () => requireStorageSchema(home),
-      storageVersion < 5 ? /older.*no migration/i : /newer.*TaskMux/i
+      storageVersion < 5 ? /older.*no migration/i : /newer.*Yui/i
     );
   }
 });

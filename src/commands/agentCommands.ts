@@ -71,13 +71,13 @@ function addAgent(args: string[], store: AgentCommandStore): string {
   }
   const created = store.createConfiguredAgentIfAbsent(agent);
   if (created === null) {
-    throw usageError(`Agent already exists: ${id}. Use taskmux agent update to change it.`);
+    throw usageError(`Agent already exists: ${id}. Use yui agent update to change it.`);
   }
   return renderAgent(`Added agent ${id}`, created);
 }
 
 function listAgents(args: string[], store: AgentCommandStore): string {
-  assertNoArguments(args, "Agent list usage: taskmux agent list");
+  assertNoArguments(args, "Agent list usage: yui agent list");
   const agents = store.listConfiguredAgents();
   if (agents.length === 0) return "No agents configured.\n";
   return `${renderTable(
@@ -101,7 +101,7 @@ function listAgents(args: string[], store: AgentCommandStore): string {
 function showAgent(args: string[], store: AgentCommandStore): string {
   const [rawId, ...rest] = args;
   const id = agentId(rawId);
-  assertNoArguments(rest, "Agent show usage: taskmux agent show <agent-id>");
+  assertNoArguments(rest, "Agent show usage: yui agent show <agent-id>");
   const agent = store.getConfiguredAgent(id);
   if (agent === null) throw agentNotFound(id);
   return renderAgent(`Agent: ${id}`, agent);
@@ -144,7 +144,7 @@ function updateAgent(args: string[], store: AgentCommandStore): string {
 function removeAgent(args: string[], store: AgentCommandStore): string {
   const [rawId, ...rest] = args;
   const id = agentId(rawId);
-  assertNoArguments(rest, "Agent remove usage: taskmux agent remove <agent-id>");
+  assertNoArguments(rest, "Agent remove usage: yui agent remove <agent-id>");
   if (!store.removeConfiguredAgent(id)) throw agentNotFound(id);
   return `Removed agent ${id}\n`;
 }

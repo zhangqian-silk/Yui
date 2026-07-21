@@ -18,7 +18,7 @@ test("RoleWorkspace records the minimal durable Role worktree identity", () => {
     roleName: "worker",
     repositoryId: "repository-1",
     path,
-    branch: "taskmux/task-1/worker",
+    branch: "yui/task-1/worker",
     baseRef: "main",
     baseCommit: "0123456789abcdef0123456789abcdef01234567"
   }, NOW);
@@ -29,7 +29,7 @@ test("RoleWorkspace records the minimal durable Role worktree identity", () => {
     roleName: "worker",
     repositoryId: "repository-1",
     path,
-    branch: "taskmux/task-1/worker",
+    branch: "yui/task-1/worker",
     baseRef: "main",
     baseCommit: "0123456789abcdef0123456789abcdef01234567",
     createdAt: NOW.toISOString(),
@@ -41,7 +41,7 @@ test("RoleWorkspace records the minimal durable Role worktree identity", () => {
 test("Role worktree identity is deterministic per Task and Role", () => {
   assert.deepEqual(worktreeIdentity("task-1", "worker"), {
     directory: join("task-1", "worker"),
-    branch: "taskmux/task-1/worker"
+    branch: "yui/task-1/worker"
   });
   assert.throws(() => worktreeIdentity("task-1", "../worker"), /Role name is invalid/);
 });
@@ -51,7 +51,7 @@ test("Role names remain usable when Git cannot use them as ref segments", () => 
   const second = worktreeIdentity("task-1", "review role@{one}");
 
   assert.equal(first.directory, join("task-1", "review role@{one}"));
-  assert.match(first.branch, /^taskmux\/task-1\/encoded-[a-f0-9]{24}$/);
+  assert.match(first.branch, /^yui\/task-1\/encoded-[a-f0-9]{24}$/);
   assert.deepEqual(second, first);
   assert.doesNotThrow(() => execFileSync("git", ["check-ref-format", "--branch", first.branch]));
 });

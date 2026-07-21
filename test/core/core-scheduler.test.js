@@ -85,8 +85,8 @@ test("an idle Leader starts a real wakeup run, waits for readiness, sends once, 
   assert.equal(store.savedDispatches[0].run.status, "active");
   assert.equal(store.savedDispatches[0].run.roleName, "leader");
   assert.match(store.savedDispatches[0].run.input, /role-result/);
-  assert.match(store.savedDispatches[0].run.input, /taskmux task context task-1/);
-  assert.doesNotMatch(store.savedDispatches[0].run.input, /taskmux task message list/);
+  assert.match(store.savedDispatches[0].run.input, /yui task context task-1/);
+  assert.doesNotMatch(store.savedDispatches[0].run.input, /yui task message list/);
   assert.equal(store.pending.has("task-1"), false);
   assert.deepEqual(store.operations.slice(-2), ["save-dispatch", "save-delivery"]);
 });

@@ -1,6 +1,6 @@
 {
-  "name": "@zq-silk/taskmux",
-  "version": "0.1.5",
+  "name": "@zq-silk/yui",
+  "version": "0.2.0",
   "description": "Local control plane for long-running native agent CLI sessions backed by tmux.",
   "license": "MIT",
   "private": true,
@@ -9,7 +9,7 @@
   },
   "type": "module",
   "bin": {
-    "taskmux": "./dist/cli.js"
+    "yui": "./dist/cli.js"
   },
   "files": [
     "dist",
@@ -41,7 +41,7 @@
     "glibc"
   ],
   "keywords": [
-    "taskmux",
+    "yui",
     "tmux",
     "cli",
     "agents",
@@ -50,12 +50,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zhangqian-silk/TaskMux.git"
+    "url": "git+https://github.com/zhangqian-silk/Yui.git"
   },
   "bugs": {
-    "url": "https://github.com/zhangqian-silk/TaskMux/issues"
+    "url": "https://github.com/zhangqian-silk/Yui/issues"
   },
-  "homepage": "https://github.com/zhangqian-silk/TaskMux#readme",
+  "homepage": "https://github.com/zhangqian-silk/Yui#readme",
   "devDependencies": {
     "@types/node": "^25.9.3",
     "typescript": "^5.8.0"

@@ -19,14 +19,14 @@ import {
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import {
-  taskmuxTmuxTarget,
+  yuiTmuxTarget,
   TmuxManager
 } from "../../dist/tmux/tmuxManager.js";
 
 const NOW = new Date("2026-07-21T12:00:00.000Z");
 
 function fixture(t) {
-  const root = mkdtempSync(join(tmpdir(), "taskmux-role-status-"));
+  const root = mkdtempSync(join(tmpdir(), "yui-role-status-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   ensureStorageSchema(root, NOW);
   const store = new FileTaskStore(root);
@@ -144,7 +144,7 @@ test("Task Role list emits its runtime summaries as a structured JSON array", (t
   const response = JSON.parse(execFileSync(
     process.execPath,
     [join(process.cwd(), "dist", "cli.js"), "--json", "task", "role", "list", task.id],
-    { encoding: "utf8", env: { ...process.env, TASKMUX_HOME: root } }
+    { encoding: "utf8", env: { ...process.env, YUI_HOME: root } }
   ));
 
   assert.equal(response.ok, true);
@@ -233,7 +233,7 @@ test("an open InputRequest blocks a healthy Leader and exposes only its count", 
   const json = JSON.parse(execFileSync(
     process.execPath,
     [join(process.cwd(), "dist", "cli.js"), "--json", "task", "role", "list", task.id],
-    { encoding: "utf8", env: { ...process.env, TASKMUX_HOME: root } }
+    { encoding: "utf8", env: { ...process.env, YUI_HOME: root } }
   ));
   assert.equal(
     json.data.roles.find((role) => role.roleName === "leader").openInputRequestCount,
@@ -274,13 +274,13 @@ test("Tmux Role inspection reads all panes in one command and never captures pan
         "worker\u001f1\u001f222\u001fzsh"
       ].join("\n");
     }
-  }, { taskmuxHome: "/tmp/taskmux-role-status" });
+  }, { yuiHome: "/tmp/yui-role-status" });
 
   assert.deepEqual(tmux.inspectTaskRolePanes("task-1"), [
     {
       taskId: "task-1",
       roleName: "leader",
-      target: taskmuxTmuxTarget("/tmp/taskmux-role-status", "task-1", "leader"),
+      target: yuiTmuxTarget("/tmp/yui-role-status", "task-1", "leader"),
       dead: false,
       pid: 111,
       currentCommand: "codex"
@@ -288,7 +288,7 @@ test("Tmux Role inspection reads all panes in one command and never captures pan
     {
       taskId: "task-1",
       roleName: "worker",
-      target: taskmuxTmuxTarget("/tmp/taskmux-role-status", "task-1", "worker"),
+      target: yuiTmuxTarget("/tmp/yui-role-status", "task-1", "worker"),
       dead: true,
       pid: 222,
       currentCommand: "zsh"

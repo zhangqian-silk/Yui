@@ -14,7 +14,7 @@ import {
   MAX_RECONCILIATION_INTERVAL_SECONDS,
   MIN_RECONCILIATION_INTERVAL_SECONDS,
   reconciliationIntervalMilliseconds
-} from "../../dist/config/taskmuxConfig.js";
+} from "../../dist/config/yuiConfig.js";
 import { callController } from "../../dist/core/controllerClient.js";
 import { ControllerClientError } from "../../dist/core/controllerClient.js";
 import {
@@ -245,7 +245,7 @@ test("state changes still request an immediate Controller scan", async () => {
   let scanCompleted;
   const scanned = new Promise((resolve) => { scanCompleted = resolve; });
   const runtime = new FileTaskWorkflowRuntime(
-    "/tmp/taskmux-state-change-scan",
+    "/tmp/yui-state-change-scan",
     { getTask: () => null },
     {},
     {},
@@ -277,7 +277,7 @@ test("foreground runtime prepares active Role worktrees but leaves archive clean
     let scanCompleted;
     const scanned = new Promise((resolve) => { scanCompleted = resolve; });
     const runtime = new FileTaskWorkflowRuntime(
-      "/tmp/taskmux-workspace-order",
+      "/tmp/yui-workspace-order",
       { getTask: () => ({ id: "task-1", status, repositoryId: "repository-1" }) },
       {},
       {},
@@ -300,7 +300,7 @@ test("foreground runtime prepares active Role worktrees but leaves archive clean
 });
 
 test("background FileTask controller exposes status, scan and stop on one private home socket", async (t) => {
-  const home = mkdtempSync(join(tmpdir(), "taskmux-file-controller-"));
+  const home = mkdtempSync(join(tmpdir(), "yui-file-controller-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const controller = await startFileTaskController(home, emptyStore(), noTmux, undefined, {
     intervalMs: 60_000
@@ -322,7 +322,7 @@ test("background FileTask controller exposes status, scan and stop on one privat
 });
 
 test("production FileTask controller composition starts without compact SQLite runtime", async (t) => {
-  const home = mkdtempSync(join(tmpdir(), "taskmux-file-runtime-"));
+  const home = mkdtempSync(join(tmpdir(), "yui-file-runtime-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home);
   const controller = await startFileTaskControllerRuntime(home, { intervalMs: 60_000 });
@@ -333,8 +333,8 @@ test("production FileTask controller composition starts without compact SQLite r
   await controller.close();
 });
 
-test("production Controller reads reconciliationIntervalSeconds from TaskMux config", async (t) => {
-  const home = mkdtempSync(join(tmpdir(), "taskmux-file-runtime-config-"));
+test("production Controller reads reconciliationIntervalSeconds from Yui config", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-file-runtime-config-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home);
   const { FileTaskStore } = await import("../../dist/storage/taskStore.js");
@@ -364,7 +364,7 @@ test("controller restart waits for the old process and starts the current runtim
     throw new ControllerClientError("CONTROLLER_UNAVAILABLE", "Controller is unavailable.");
   };
 
-  const result = await restartFileTaskController("/tmp/taskmux-restart-test", {
+  const result = await restartFileTaskController("/tmp/yui-restart-test", {
     call,
     pollIntervalMs: 1,
     startupTimeoutMs: 100,

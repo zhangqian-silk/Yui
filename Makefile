@@ -7,7 +7,7 @@ NPM_INSTALL_STAMP := node_modules/.package-lock.json
 all: build
 
 help:
-	@printf '%s\n' 'TaskMux local targets:'
+	@printf '%s\n' 'Yui local targets:'
 	@printf '%s\n' '  make               Build for local development (default)'
 	@printf '%s\n' '  make all           Build for local development'
 	@printf '%s\n' '  make deps          Install npm dependencies when needed'
@@ -15,8 +15,8 @@ help:
 	@printf '%s\n' '  make lint          Run TypeScript no-emit check'
 	@printf '%s\n' '  make test          Run full test suite'
 	@printf '%s\n' '  make check         Run full build, lint, and test verification'
-	@printf '%s\n' '  make link          Link taskmux and install the managed taskmux-dev launcher'
-	@printf '%s\n' '  make unlink        Remove the global taskmux link and local taskmux-dev launcher'
+	@printf '%s\n' '  make link          Link yui and install the managed yui-dev launcher'
+	@printf '%s\n' '  make unlink        Remove the global yui link and local yui-dev launcher'
 
 deps: $(NPM_INSTALL_STAMP)
 
@@ -39,5 +39,5 @@ link: build
 	node scripts/manage-dev-launcher.mjs install
 
 unlink:
-	npm unlink -g @zq-silk/taskmux
+	npm unlink -g @zq-silk/yui
 	node scripts/manage-dev-launcher.mjs uninstall

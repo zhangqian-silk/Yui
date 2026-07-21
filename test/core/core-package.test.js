@@ -74,7 +74,7 @@ test("runtime assembly contains only the built CLI, docs, and three skills", (t)
   assert.deepEqual(readdirSync(join(output, "i18n")), ["README.zh-CN.md"]);
   assert.deepEqual(
     readdirSync(join(output, "skills")).sort(),
-    ["taskmux-leader", "taskmux-operator", "taskmux-worker"]
+    ["yui-leader", "yui-operator", "yui-worker"]
   );
   const expectedRuntime = listFiles(join(root, "src"))
     .filter((name) => name.endsWith(".ts"))
@@ -87,13 +87,13 @@ test("runtime assembly contains only the built CLI, docs, and three skills", (t)
       cwd: output,
       encoding: "utf8"
     }),
-    /TaskMux/u
+    /Yui/u
   );
 
   const runtimePackage = readJson(join(output, "package.json"));
   const sourcePackage = readJson(join(root, "package.json"));
   assert.equal(runtimePackage.private, false);
-  assert.deepEqual(runtimePackage.bin, { taskmux: "./dist/cli.js" });
+  assert.deepEqual(runtimePackage.bin, { yui: "./dist/cli.js" });
   assert.deepEqual(runtimePackage.cpu, ["x64"]);
   assert.deepEqual(runtimePackage.files, sourcePackage.files);
   assert.equal(runtimePackage.dependencies, undefined);

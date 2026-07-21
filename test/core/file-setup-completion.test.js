@@ -40,7 +40,7 @@ function answers(...values) {
 }
 
 test("completion without a shell interactively selects one and persists it", async (t) => {
-  const userHome = mkdtempSync(join(tmpdir(), "taskmux-file-completion-"));
+  const userHome = mkdtempSync(join(tmpdir(), "yui-file-completion-"));
   t.after(() => rmSync(userHome, { recursive: true, force: true }));
   const store = memoryStore();
   const io = answers("3", "");
@@ -49,7 +49,7 @@ test("completion without a shell interactively selects one and persists it", asy
       HOME: userHome,
       SHELL: "/bin/zsh",
       XDG_CONFIG_HOME: join(userHome, ".config")
-    }, "taskmux-dev");
+    }, "yui-dev");
   const output = await runCompletionWizard(manager, io);
 
   const installation = store.getConfig().completionInstallations.fish;
@@ -59,12 +59,12 @@ test("completion without a shell interactively selects one and persists it", asy
   assert.match(io.prompts[1], /Selected: Fish \(Install\)/);
   assert.match(output, /Completion fish installed/);
   assert.equal(existsSync(installation.scriptPath), true);
-  assert.match(readFileSync(installation.scriptPath, "utf8"), /identity=taskmux-dev/);
+  assert.match(readFileSync(installation.scriptPath, "utf8"), /identity=yui-dev/);
   assert.match(readFileSync(installation.scriptPath, "utf8"), /task role/);
 });
 
 test("completion with a shell still confirms installation and startup activation", async (t) => {
-  const userHome = mkdtempSync(join(tmpdir(), "taskmux-file-completion-zsh-"));
+  const userHome = mkdtempSync(join(tmpdir(), "yui-file-completion-zsh-"));
   t.after(() => rmSync(userHome, { recursive: true, force: true }));
   const store = memoryStore();
   const io = answers("", "");
@@ -72,7 +72,7 @@ test("completion with a shell still confirms installation and startup activation
   const manager = new FileCompletionManager(
     store,
     { HOME: userHome, SHELL: "/bin/zsh", ZDOTDIR: userHome },
-    "taskmux"
+    "yui"
   );
   const output = await runCompletionWizard(manager, io, { shell: "zsh" });
 
@@ -83,11 +83,11 @@ test("completion with a shell still confirms installation and startup activation
   assert.match(io.prompts[0], /Use these paths\? \[Y\/n\/customize\]/);
   assert.match(io.prompts[1], /Update .*\.zshrc.*\[Y\/n\]/s);
   assert.match(output, /Restart the current shell to activate completion: exec zsh/);
-  assert.match(readFileSync(installation.activationPath, "utf8"), /taskmux completion shell=zsh/);
+  assert.match(readFileSync(installation.activationPath, "utf8"), /yui completion shell=zsh/);
 });
 
 test("completion install keeps unrelated FileTaskStore configuration", async (t) => {
-  const userHome = mkdtempSync(join(tmpdir(), "taskmux-file-completion-config-"));
+  const userHome = mkdtempSync(join(tmpdir(), "yui-file-completion-config-"));
   t.after(() => rmSync(userHome, { recursive: true, force: true }));
   const store = memoryStore({
     schemaVersion: 1,
@@ -99,7 +99,7 @@ test("completion install keeps unrelated FileTaskStore configuration", async (t)
   const manager = new FileCompletionManager(
     store,
     { HOME: userHome, SHELL: "/bin/bash" },
-    "taskmux"
+    "yui"
   );
   await runCompletionWizard(manager, io, { shell: "bash" });
 
@@ -113,9 +113,9 @@ test("completion install keeps unrelated FileTaskStore configuration", async (t)
 test("setup writes schema and configures selected Agents, default Agent, and Operator", async (t) => {
   const { runSetupCommand } = await import("../../dist/setup/setupCommand.js");
   const { FileTaskStore } = await import("../../dist/storage/taskStore.js");
-  const root = mkdtempSync(join(tmpdir(), "taskmux-file-setup-"));
+  const root = mkdtempSync(join(tmpdir(), "yui-file-setup-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  const home = join(root, "taskmux-home");
+  const home = join(root, "yui-home");
   const bin = join(root, "bin");
   const userHome = join(root, "user");
   const workspace = join(root, "operator-workspace");
@@ -131,8 +131,8 @@ test("setup writes schema and configures selected Agents, default Agent, and Ope
   output.on("data", (chunk) => { rendered += chunk.toString(); });
   input.end(`all\nclaude\ncodex\n${workspace}\nskip\n`);
   const env = {
-    TASKMUX_HOME: home,
-    TASKMUX_CLI_NAME: "taskmux-dev",
+    YUI_HOME: home,
+    YUI_CLI_NAME: "yui-dev",
     HOME: userHome,
     PATH: bin,
     SHELL: "/bin/zsh"

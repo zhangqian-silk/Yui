@@ -1,0 +1,4 @@
+interface:
+  display_name: "Yui Worker"
+  short_description: "Execute and report Yui work items"
+  default_prompt: "Use $yui-worker to execute the assigned Yui work item and report the result."

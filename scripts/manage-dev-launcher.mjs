@@ -5,10 +5,10 @@ import { chmodSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } 
 import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
 
-export const DEV_LAUNCHER_NAME = "taskmux-dev";
+export const DEV_LAUNCHER_NAME = "yui-dev";
 
-const managedMarker = "# taskmux-dev-wrapper: managed";
-const projectRootMarker = "# taskmux-dev-wrapper-project-root: ";
+const managedMarker = "# yui-dev-wrapper: managed";
+const projectRootMarker = "# yui-dev-wrapper-project-root: ";
 
 export function installDevLauncher(options = {}) {
   const projectRoot = normalizeProjectRoot(options.projectRoot ?? process.cwd());
@@ -108,13 +108,13 @@ function readManagedProjectRoot(contents) {
 }
 
 function renderLauncher(projectRoot) {
-  const home = join(projectRoot, "output", "taskmux-cli-dev");
+  const home = join(projectRoot, "output", "yui-cli-dev");
 
   return `#!/usr/bin/env sh
 ${managedMarker}
 ${projectRootMarker}${JSON.stringify(projectRoot)}
-export TASKMUX_HOME=${shellQuote(home)}
-export TASKMUX_CLI_NAME=taskmux-dev
+export YUI_HOME=${shellQuote(home)}
+export YUI_CLI_NAME=yui-dev
 exec node ${shellQuote(join(projectRoot, "dist", "cli.js"))} "$@"
 `;
 }
@@ -154,7 +154,7 @@ if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(
     runCli();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`TASKMUX_DEV_LAUNCHER_ERROR: ${message}`);
+    console.error(`YUI_DEV_LAUNCHER_ERROR: ${message}`);
     process.exitCode = 1;
   }
 }

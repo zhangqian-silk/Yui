@@ -1,13 +1,13 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { resolveTaskmuxHome } from "../storage/taskStore.js";
+import { resolveYuiHome } from "../storage/taskStore.js";
 import { startFileTaskControllerRuntime } from "./runtime.js";
 
 export async function runFileTaskControllerProcess(
   environment: NodeJS.ProcessEnv = process.env
 ): Promise<void> {
-  const home = resolveTaskmuxHome(environment);
+  const home = resolveYuiHome(environment);
   const controller = await startFileTaskControllerRuntime(home, {
     environment,
     onError: (error) => {

@@ -126,7 +126,7 @@ test("catalog validation rejects duplicate sibling command paths", () => {
 
   assert.throws(
     () => validateCommandCatalog(invalid),
-    /Duplicate command path: taskmux task create/
+    /Duplicate command path: yui task create/
   );
 });
 
@@ -134,11 +134,11 @@ test("nested help resolves and renders only the requested command group", () => 
   const invocation = routeInvocation(["help", "task", "role"]);
 
   assert.equal(invocation.kind, "help");
-  assert.deepEqual(invocation.node.path, ["taskmux", "task", "role"]);
+  assert.deepEqual(invocation.node.path, ["yui", "task", "role"]);
 
-  const output = renderCommandHelp(invocation.node, "0.1.5");
-  assert.match(output, /^TaskMux task role$/m);
-  assert.match(output, /Usage:\n  taskmux task role <command>/);
+  const output = renderCommandHelp(invocation.node, "0.2.0");
+  assert.match(output, /^Yui task role$/m);
+  assert.match(output, /Usage:\n  yui task role <command>/);
   assert.match(output, /^  add\s+/m);
   assert.match(output, /^  list\s+/m);
   assert.match(output, /^  show\s+/m);
@@ -159,7 +159,7 @@ test("the invocation router selects an executable without parsing business param
   ]);
 
   assert.equal(invocation.kind, "execute");
-  assert.deepEqual(invocation.node.path, ["taskmux", "task", "role", "add"]);
+  assert.deepEqual(invocation.node.path, ["yui", "task", "role", "add"]);
   assert.equal("params" in invocation, false);
 });
 
@@ -175,7 +175,7 @@ test("the invocation router reports an unknown path at the nearest group", () =>
 
   assert.equal(invocation.kind, "path-error");
   assert.equal(invocation.typedPath, "task role unknown");
-  assert.deepEqual(invocation.helpNode.path, ["taskmux", "task", "role"]);
+  assert.deepEqual(invocation.helpNode.path, ["yui", "task", "role"]);
 });
 
 test("the invocation router reports a bare group as incomplete", () => {
@@ -183,5 +183,5 @@ test("the invocation router reports a bare group as incomplete", () => {
 
   assert.equal(invocation.kind, "incomplete");
   assert.equal(invocation.typedPath, "task role");
-  assert.deepEqual(invocation.helpNode.path, ["taskmux", "task", "role"]);
+  assert.deepEqual(invocation.helpNode.path, ["yui", "task", "role"]);
 });

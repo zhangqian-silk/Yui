@@ -185,7 +185,7 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
 
   structuredArgs(config: CodexAgentConfig): string[] {
     return [
-      // TaskMux launches Codex in a detached tmux window and waits for the
+      // Yui launches Codex in a detached tmux window and waits for the
       // composer before delivering work.  The startup updater is itself an
       // interactive prompt, so leaving it enabled can consume the first
       // automated delivery as an update-menu answer.
