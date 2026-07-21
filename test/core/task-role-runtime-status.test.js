@@ -196,9 +196,10 @@ test("Task Role health distinguishes queued, orphaned delivered, and exited runt
 });
 
 test("an open InputRequest blocks a healthy Leader and exposes only its count", (t) => {
-  const { store, options } = fixture(t);
+  const { root, store, options } = fixture(t);
   execute(["create", "Await user"], store, options);
   const task = store.listTasks()[0];
+  execute(["role", "add", task.id, "worker"], store, options);
   const request = createInputRequest(
     store.nextInputRequestId(task.id),
     task.id,
@@ -222,8 +223,26 @@ test("an open InputRequest blocks a healthy Leader and exposes only its count", 
   const list = execute(["role", "list", task.id], store, noPanes);
   assert.match(list.output, /Open input/);
   assert.match(list.output, /leader\s+codex\s+blocked-input\s+1/);
-  assert.equal(list.data.roles[0].openInputRequestCount, 1);
-  assert.equal(Object.hasOwn(list.data.roles[0], "inputRequests"), false);
+  const leader = list.data.roles.find((role) => role.roleName === "leader");
+  const worker = list.data.roles.find((role) => role.roleName === "worker");
+  assert.equal(leader.openInputRequestCount, 1);
+  assert.equal(worker.openInputRequestCount, 0);
+  assert.equal(worker.health, "idle");
+  assert.equal(Object.hasOwn(leader, "inputRequests"), false);
+
+  const json = JSON.parse(execFileSync(
+    process.execPath,
+    [join(process.cwd(), "dist", "cli.js"), "--json", "task", "role", "list", task.id],
+    { encoding: "utf8", env: { ...process.env, TASKMUX_HOME: root } }
+  ));
+  assert.equal(
+    json.data.roles.find((role) => role.roleName === "leader").openInputRequestCount,
+    1
+  );
+  assert.equal(
+    json.data.roles.find((role) => role.roleName === "worker").openInputRequestCount,
+    0
+  );
 
   const deadLeader = {
     ...options,

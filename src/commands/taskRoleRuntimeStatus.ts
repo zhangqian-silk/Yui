@@ -48,7 +48,7 @@ export function inspectTaskRoleRuntimeStatuses(
   store: TaskStore,
   panes: readonly TmuxRolePaneState[]
 ): TaskRoleRuntimeStatus[] {
-  const openInputRequestCount = store.listInputRequests(taskId)
+  const taskOpenInputRequestCount = store.listInputRequests(taskId)
     .filter((request) => request.status === "open").length;
   const panesByRole = new Map<string, TmuxRolePaneState>();
   for (const pane of panes) {
@@ -60,7 +60,7 @@ export function inspectTaskRoleRuntimeStatuses(
     role,
     store,
     panesByRole.get(role.name),
-    openInputRequestCount
+    role.name === "leader" ? taskOpenInputRequestCount : 0
   ));
 }
 
