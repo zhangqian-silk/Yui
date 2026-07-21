@@ -1261,6 +1261,9 @@ function taskBriefCommand(
           }, updatedBy, now);
       tx.saveTaskBrief(task.id, brief);
       recordTaskEvent(tx, task.id, "brief.updated", { updatedBy }, now);
+      if (task.status === "active") {
+        queueLeaderWakeup(tx, task.id, "brief-updated", now);
+      }
       return { task, brief };
     });
     options.runtime?.notifyStateChanged(result.task.id);
@@ -1289,6 +1292,9 @@ function taskDecisionCommand(
       const decision = createDecision(tx.nextDecisionId(task.id), task.id, title, rationale, now);
       tx.saveDecision(task.id, decision);
       recordTaskEvent(tx, task.id, "decision.recorded", { decisionId: decision.id, title }, now);
+      if (task.status === "active") {
+        queueLeaderWakeup(tx, task.id, "decision-recorded", now);
+      }
       return { task, decision };
     });
     options.runtime?.notifyStateChanged(result.task.id);
@@ -1356,6 +1362,9 @@ function taskDecisionCommand(
       const decision = supersedeDecision(existing, reason, now);
       tx.saveDecision(task.id, decision);
       recordTaskEvent(tx, task.id, "decision.superseded", { decisionId: decision.id, reason }, now);
+      if (task.status === "active") {
+        queueLeaderWakeup(tx, task.id, "decision-superseded", now);
+      }
       return { task, decision };
     });
     options.runtime?.notifyStateChanged(result.task.id);
@@ -1384,6 +1393,9 @@ function taskMilestoneCommand(
       const milestone = createMilestone(tx.nextMilestoneId(task.id), task.id, title, summary, now);
       tx.saveMilestone(task.id, milestone);
       recordTaskEvent(tx, task.id, "milestone.added", { milestoneId: milestone.id, title }, now);
+      if (task.status === "active") {
+        queueLeaderWakeup(tx, task.id, "milestone-added", now);
+      }
       return { task, milestone };
     });
     options.runtime?.notifyStateChanged(result.task.id);
