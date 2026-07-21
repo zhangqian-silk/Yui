@@ -31,6 +31,9 @@ function emptyStore(events = []) {
     listRoles() { return []; },
     getRole() { return null; },
     getActiveAgentRun() { return null; },
+    listOpenInputRequests() { return []; },
+    getOperatorDeliveryTarget() { return null; },
+    resolveExpiredInputRecommendations() { return []; },
     getRoleSession() { return null; },
     nextAgentRunId() { return "run-1"; },
     getPendingWakeup() { return null; },
@@ -62,7 +65,12 @@ test("controller scheduler reconciles liveness before processing wakeups", async
   const events = [];
   const result = await runControllerSchedulerPass(emptyStore(events), noTmux, new Date(0));
   assert.deepEqual(result, {
-    stoppedArchivedTaskIds: [], activeRunDeliveries: [], failedRunIds: [], wakeups: []
+    stoppedArchivedTaskIds: [],
+    activeRunDeliveries: [],
+    failedRunIds: [],
+    wakeups: [],
+    inputNotifications: [],
+    autoResolvedInputs: []
   });
   assert.deepEqual(events, ["list-tasks", "list-tasks", "list-tasks", "list-wakeups"]);
 });
@@ -305,7 +313,9 @@ test("background FileTask controller exposes status, scan and stop on one privat
     stoppedArchivedTaskIds: [],
     activeRunDeliveries: [],
     failedRunIds: [],
-    wakeups: []
+    wakeups: [],
+    inputNotifications: [],
+    autoResolvedInputs: []
   });
   assert.deepEqual(await callController(home, "controller.stop", {}), { stopped: true });
   await controller.closed;

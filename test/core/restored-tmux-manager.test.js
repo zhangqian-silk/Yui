@@ -123,6 +123,30 @@ test("sendRoleInputOnce times out without injecting input when the pane is not r
   assert.equal(calls.some((call) => call.args[0] === "send-keys"), false);
 });
 
+test("best-effort delivery returns immediately when the Operator composer is busy", () => {
+  const calls = [];
+  const manager = new TmuxManager("tmux-test", {
+    run(command, args) {
+      calls.push({ command, args });
+      if (args[0] === "display-message") return "0|321|node\n";
+      if (args[0] === "capture-pane") return "Operator is working\n";
+      return "";
+    }
+  }, { taskmuxHome: "/tmp/taskmux-home" });
+
+  assert.equal(manager.sendRoleInputOnceIfReady(
+    "operator",
+    "operator",
+    "input-request:input-1",
+    "Question",
+    ({ content }) => content.includes("composer ready")
+  ), "not-ready");
+  assert.deepEqual(calls.map((call) => call.args[0]), [
+    "show-options", "display-message", "capture-pane"
+  ]);
+  assert.equal(calls.some((call) => call.args[0] === "if-shell"), false);
+});
+
 test("an existing pane receipt bypasses readiness while the Agent is busy", () => {
   const calls = [];
   let readinessProbes = 0;

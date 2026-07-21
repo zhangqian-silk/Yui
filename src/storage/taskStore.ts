@@ -16,6 +16,10 @@ import { reconciliationIntervalMilliseconds } from "../config/taskmuxConfig.js";
 import type { Decision } from "../decision/decision.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import {
+  validateInputRequest,
+  type InputRequest
+} from "../input/inputRequest.js";
+import {
   validateRoleSessionSet,
   type GlobalRoleSessionSet,
   type RoleAgentSession,
@@ -76,7 +80,7 @@ export type ConfiguredAgentUpdateResult = Readonly<{
 
 type ActiveRunPointer = Readonly<{ schemaVersion: 1; runId: string }>;
 type StoredTask = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   task: Task;
   brief: TaskBrief | null;
   roles: Record<string, TaskRole>;
@@ -86,6 +90,7 @@ type StoredTask = {
   agentRuns: Record<string, AgentRun>;
   activeRuns: Record<string, ActiveRunPointer>;
   messages: Record<string, TaskMessage>;
+  inputRequests: Record<string, InputRequest>;
   decisions: Record<string, Decision>;
   milestones: Record<string, Milestone>;
   events: Record<string, TaskEvent>;
@@ -169,6 +174,12 @@ export type TaskStore = {
   nextMessageId(taskId: string): string;
   saveMessage(taskId: string, message: TaskMessage): void;
   listMessages(taskId: string): TaskMessage[];
+  nextInputRequestId(taskId: string): string;
+  saveInputRequest(taskId: string, request: InputRequest): void;
+  getInputRequest(taskId: string, requestId: string): InputRequest | null;
+  findInputRequest(requestId: string): InputRequest | null;
+  listInputRequests(taskId: string): InputRequest[];
+  listAllInputRequests(): InputRequest[];
   nextDecisionId(taskId: string): string;
   saveDecision(taskId: string, decision: Decision): void;
   listDecisions(taskId: string): Decision[];
@@ -512,6 +523,44 @@ export class FileTaskStore implements TaskStore {
     this.#saveTaskRecord(taskId, "messages", message, "Message");
   }
   listMessages(taskId: string): TaskMessage[] { return values(this.#requireTask(taskId).messages, "id"); }
+  nextInputRequestId(_taskId: string): string {
+    return this.#nextGlobalId("input", (state) => allKeys(state, "inputRequests"));
+  }
+  saveInputRequest(taskId: string, request: InputRequest): void {
+    const stored = validateInputRequest(request);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`Input request belongs to another Task: ${stored.taskId}`);
+    }
+    this.#mutate((state) => {
+      const aggregate = requireTaskFromState(state, taskId);
+      const owner = taskRecordOwner(state, "inputRequests", stored.id);
+      if (owner !== null && owner !== taskId) {
+        throw new StorageRecordError(`Input request already exists in another Task: ${stored.id}`);
+      }
+      const existing = aggregate.inputRequests[stored.id];
+      if (existing === undefined && stored.status !== "open") {
+        throw new StorageRecordError(`Input request must start open: ${stored.id}`);
+      }
+      if (existing !== undefined && !isValidInputRequestTransition(existing, stored)) {
+        throw new StorageRecordError(`Input request cannot be overwritten: ${stored.id}`);
+      }
+      aggregate.inputRequests[stored.id] = stored;
+    });
+  }
+  getInputRequest(taskId: string, requestId: string): InputRequest | null {
+    return optional(this.#state().tasks[taskId]?.inputRequests[requestId]);
+  }
+  findInputRequest(requestId: string): InputRequest | null {
+    return findUnique(this.#state(), "inputRequests", requestId, "Input request");
+  }
+  listInputRequests(taskId: string): InputRequest[] {
+    return values(this.#requireTask(taskId).inputRequests, "id");
+  }
+  listAllInputRequests(): InputRequest[] {
+    return Object.values(this.#state().tasks)
+      .flatMap((aggregate) => Object.values(aggregate.inputRequests).map(clone))
+      .sort((left, right) => numericCompare(left.id, right.id));
+  }
   nextDecisionId(_taskId: string): string {
     return this.#nextGlobalId("decision", (state) => allKeys(state, "decisions"));
   }
@@ -688,7 +737,7 @@ function emptyState(): StorageState {
 }
 function emptyStoredTask(task: Task): StoredTask {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     task,
     brief: null,
     roles: {},
@@ -698,6 +747,7 @@ function emptyStoredTask(task: Task): StoredTask {
     agentRuns: {},
     activeRuns: {},
     messages: {},
+    inputRequests: {},
     decisions: {},
     milestones: {},
     events: {},
@@ -771,6 +821,7 @@ function parseState(raw: string): StorageState {
       }
     }
   }
+  assertGloballyUniqueTaskRecordIds(result, "inputRequests", "Input request");
   assertGloballyUniqueTaskRecordIds(result, "decisions", "Decision");
   assertGloballyUniqueTaskRecordIds(result, "milestones", "Milestone");
   assertGloballyUniqueTaskRecordIds(result, "events", "Task event");
@@ -779,8 +830,8 @@ function parseState(raw: string): StorageState {
 }
 function parseStoredTask(value: unknown, taskId: string): StoredTask {
   const aggregate = object(value, `Task aggregate ${taskId}`) as unknown as StoredTask;
-  exact(aggregate as unknown as Record<string, unknown>, ["schemaVersion", "task", "brief", "roles", "roleWorkspaces", "roleSessionSets", "workItems", "agentRuns", "activeRuns", "messages", "decisions", "milestones", "events", "pendingWakeup", "leaderFailure", "operatorNotification"], `Task aggregate ${taskId}`);
-  versioned(aggregate, 1, `Task aggregate ${taskId}`);
+  exact(aggregate as unknown as Record<string, unknown>, ["schemaVersion", "task", "brief", "roles", "roleWorkspaces", "roleSessionSets", "workItems", "agentRuns", "activeRuns", "messages", "inputRequests", "decisions", "milestones", "events", "pendingWakeup", "leaderFailure", "operatorNotification"], `Task aggregate ${taskId}`);
+  versioned(aggregate, 2, `Task aggregate ${taskId}`);
   validateTask(identified(aggregate.task, 1, "id", taskId, "Task"));
   if (aggregate.brief !== null) storedTaskBrief(aggregate.brief);
   parseMap(aggregate.roles, (record, key) => { const role = identified<TaskRole>(record, 2, "name", key, "Task Role"); if (role.taskId !== taskId) throw new StorageRecordError(`Task Role belongs to another Task: ${role.taskId}`); validateTaskRole(role); return role; }, "roles");
@@ -808,6 +859,16 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateTaskMessage(message);
     return message;
   }, "messages");
+  parseMap(aggregate.inputRequests, (record, key) => {
+    const request = validateInputRequest(record);
+    if (request.id !== key) {
+      throw new StorageRecordError(`Input request identity is inconsistent: ${key}.`);
+    }
+    if (request.taskId !== taskId) {
+      throw new StorageRecordError(`Input request belongs to another Task: ${request.taskId}`);
+    }
+    return request;
+  }, "inputRequests");
   parseMap(aggregate.decisions, (record, key) => {
     const decision = storedDecision(record);
     if (decision.id !== key) throw new StorageRecordError(`Decision identity is inconsistent: ${key}.`);
@@ -991,6 +1052,19 @@ function isValidDecisionSupersession(existing: Decision, candidate: Decision): b
     && Date.parse(candidate.updatedAt) >= Date.parse(existing.updatedAt);
 }
 
+function isValidInputRequestTransition(existing: InputRequest, candidate: InputRequest): boolean {
+  if (existing.status !== "open" || candidate.status === "open") return false;
+  return candidate.id === existing.id
+    && candidate.taskId === existing.taskId
+    && isDeepStrictEqual(candidate.requester, existing.requester)
+    && candidate.question === existing.question
+    && isDeepStrictEqual(candidate.choices, existing.choices)
+    && isDeepStrictEqual(candidate.blockedRefs, existing.blockedRefs)
+    && isDeepStrictEqual(candidate.policy, existing.policy)
+    && candidate.createdAt === existing.createdAt
+    && Date.parse(candidate.updatedAt) >= Date.parse(existing.updatedAt);
+}
+
 function requireTaskFromState(state: StorageState, taskId: string): StoredTask {
   const aggregate = state.tasks[taskId];
   if (aggregate === undefined) throw new StorageRecordError(`Task not found: ${taskId}`);
@@ -999,7 +1073,7 @@ function requireTaskFromState(state: StorageState, taskId: string): StoredTask {
 
 function taskRecordOwner(
   state: StorageState,
-  key: "decisions" | "milestones" | "events" | "messages",
+  key: "decisions" | "milestones" | "events" | "messages" | "inputRequests",
   id: string
 ): string | null {
   for (const [taskId, aggregate] of Object.entries(state.tasks)) {
@@ -1010,7 +1084,7 @@ function taskRecordOwner(
 
 function assertGloballyUniqueTaskRecordIds(
   state: StorageState,
-  key: "decisions" | "milestones" | "events" | "messages",
+  key: "decisions" | "milestones" | "events" | "messages" | "inputRequests",
   label: string
 ): void {
   const owners = new Map<string, string>();
@@ -1093,10 +1167,11 @@ function values<T>(records: Record<string, T>, identity: keyof T | ((value: T) =
   return Object.values(records).map(clone).sort((left, right) => numericCompare(typeof identity === "function" ? identity(left) : String(left[identity]), typeof identity === "function" ? identity(right) : String(right[identity])));
 }
 function numericCompare(left: string, right: string): number { return left.localeCompare(right, undefined, { numeric: true }); }
-function allKeys<K extends "workItems" | "agentRuns" | "messages" | "decisions" | "milestones" | "events">(state: StorageState, key: K): string[] { return Object.values(state.tasks).flatMap((task) => Object.keys(task[key])); }
+function allKeys<K extends "workItems" | "agentRuns" | "messages" | "inputRequests" | "decisions" | "milestones" | "events">(state: StorageState, key: K): string[] { return Object.values(state.tasks).flatMap((task) => Object.keys(task[key])); }
 function findUnique(state: StorageState, key: "workItems", id: string, label: string): WorkItem | null;
 function findUnique(state: StorageState, key: "agentRuns", id: string, label: string): AgentRun | null;
-function findUnique(state: StorageState, key: "workItems" | "agentRuns", id: string, label: string): WorkItem | AgentRun | null {
+function findUnique(state: StorageState, key: "inputRequests", id: string, label: string): InputRequest | null;
+function findUnique(state: StorageState, key: "workItems" | "agentRuns" | "inputRequests", id: string, label: string): WorkItem | AgentRun | InputRequest | null {
   const matches = Object.values(state.tasks).flatMap((task) => task[key][id] === undefined ? [] : [task[key][id]]);
   if (matches.length > 1) throw new StorageRecordError(`${label} id is ambiguous: ${id}`);
   return matches[0] === undefined ? null : clone(matches[0]);

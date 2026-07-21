@@ -64,6 +64,12 @@ const PUBLIC_PATHS = [
   "task message",
   "task message send",
   "task message list",
+  "task input",
+  "task input request",
+  "task input list",
+  "task input show",
+  "task input answer",
+  "task input cancel",
   "task role",
   "task role add",
   "task role list",
@@ -170,6 +176,12 @@ function createPorts() {
         return params.workItemId === "work-alpha"
           ? [{ id: "run-alpha", workItemId: params.workItemId, status: "failed" }]
           : [{ id: "run-beta", workItemId: params.workItemId, status: "failed" }];
+      }
+      if (method === "task.input.list") {
+        return [
+          { id: "input-open", taskId: "task-alpha", status: "open", question: "Choose?" },
+          { id: "input-answered", taskId: "task-beta", status: "answered", question: "Done?" }
+        ].filter((request) => params.taskId === undefined || request.taskId === params.taskId);
       }
       if (Object.hasOwn(responses, method)) return responses[method];
       throw new Error(`Unexpected call: ${method} ${JSON.stringify(params)}`);
@@ -372,6 +384,36 @@ test("Task knowledge policies select dependent record identities", async () => {
     ports: createPorts()
   });
   assert.deepEqual(candidates, ["decision-active", "decision-old"]);
+});
+
+test("InputRequest interaction and completion select global or Task-scoped open requests", async () => {
+  const ports = createPorts();
+  const answer = findInteractionPolicy(findCommandNode(["task", "input", "answer"]));
+  assert.ok(answer);
+  assert.deepEqual(values(await getSelectionCandidates(
+    answer.selectors[0],
+    ports,
+    ["task", "input", "answer"]
+  )), ["input-open"]);
+
+  const cancel = findInteractionPolicy(findCommandNode(["task", "input", "cancel"]));
+  assert.ok(cancel);
+  assert.deepEqual(values(await getSelectionCandidates(
+    cancel.selectors[1],
+    ports,
+    ["task", "input", "cancel", "task-alpha"]
+  )), ["input-open"]);
+
+  assert.deepEqual(await resolveCompletionCandidates({
+    words: ["task", "input", "answer"],
+    current: "input-o",
+    ports
+  }), ["input-open"]);
+  assert.deepEqual(await resolveCompletionCandidates({
+    words: ["task", "input", "cancel", "task-alpha"],
+    current: "input-",
+    ports
+  }), ["input-open"]);
 });
 
 test("an empty Agent selection chooses the configured default Agent", async () => {

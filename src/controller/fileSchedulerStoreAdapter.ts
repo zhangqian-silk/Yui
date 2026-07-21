@@ -7,7 +7,10 @@ import {
   type RoleAgentSession,
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
+import { createTaskEvent } from "../event/taskEvent.js";
+import { answerInputRequest } from "../input/inputRequest.js";
 import { activeRoleAgentBinding, updateRoleStatus } from "../role/role.js";
+import { SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
 import { failAgentRun, markAgentRunDelivered } from "../run/agentRun.js";
 import type {
   LeaderDispatchFailurePersistence,
@@ -20,6 +23,7 @@ import type {
   ExitedRoleRunPersistence
 } from "../scheduler/ports.js";
 import { pendingWakeupsMatch, type PendingWakeup } from "../scheduler/pendingWakeup.js";
+import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { updateWorkItemStatus } from "../workItem/workItem.js";
 
@@ -44,6 +48,55 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
 
   getActiveAgentRun(taskId: string, roleName: string) {
     return this.store.getActiveAgentRun(taskId, roleName);
+  }
+
+  hasOpenInputRequest(taskId: string): boolean {
+    return this.store.listInputRequests(taskId).some((request) => request.status === "open");
+  }
+
+  listOpenInputRequests() {
+    return this.store.listAllInputRequests().filter((request) => request.status === "open");
+  }
+
+  getOperatorDeliveryTarget() {
+    const role = this.store.getGlobalRole(SYSTEM_OPERATOR_ROLE);
+    if (role === null) return null;
+    return {
+      roleName: SYSTEM_OPERATOR_ROLE,
+      adapterId: activeRoleAgentBinding(role).adapterId
+    } as const;
+  }
+
+  resolveExpiredInputRecommendations(now: Date) {
+    return this.store.transaction((store) => {
+      const expired = store.listAllInputRequests().filter((request) => (
+        request.status === "open"
+        && request.policy.kind === "recommended"
+        && Date.parse(request.policy.timeoutAt) <= now.getTime()
+      ));
+      const resolved = [];
+      for (const request of expired) {
+        const task = store.getTask(request.taskId);
+        if (task?.status !== "active" || request.policy.kind !== "recommended") continue;
+        const choiceKey = request.policy.recommendedChoiceKey;
+        const answered = answerInputRequest(
+          request,
+          { choiceKey },
+          "agent-timeout",
+          now
+        );
+        store.saveInputRequest(task.id, answered);
+        store.saveEvent(task.id, createTaskEvent(
+          store.nextEventId(task.id),
+          "input.auto-answered",
+          { requestId: request.id, choiceKey },
+          now
+        ));
+        queueLeaderWakeup(store, task.id, `input-timeout:${request.id}`, now);
+        resolved.push({ inputRequestId: request.id, taskId: task.id, choiceKey });
+      }
+      return resolved;
+    });
   }
 
   getRoleSession(taskId: string, roleName: string): SchedulerRoleSession | null {

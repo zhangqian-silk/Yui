@@ -285,6 +285,23 @@ export class TmuxManager {
     throw runtimeError(`Tmux did not confirm delivery receipt ${receiptId}.`);
   }
 
+  sendRoleInputOnceIfReady(
+    taskId: string,
+    roleName: string,
+    receiptId: string,
+    input: string,
+    readinessProbe?: TmuxReadinessProbe
+  ): TmuxDeliveryOutcome | "not-ready" {
+    if (readinessProbe === undefined) {
+      throw new TmuxReadinessProbeRequiredError();
+    }
+    if (this.hasDeliveryReceipt(taskId, roleName, receiptId)) {
+      return "already-sent";
+    }
+    if (!readinessProbe(this.inspectPane(taskId, roleName))) return "not-ready";
+    return this.sendRoleInputOnce(taskId, roleName, receiptId, input, readinessProbe);
+  }
+
   hasDeliveryReceipt(taskId: string, roleName: string, receiptId: string): boolean {
     safeValue(receiptId, "tmux delivery receipt id");
     const digest = createHash("sha256").update(receiptId).digest("hex");

@@ -8,8 +8,16 @@ import {
   type ActiveRoleRunDeliveryResult
 } from "../scheduler/activeRoleRunDelivery.js";
 import { stopArchivedTaskRuntimes } from "../scheduler/archivedTaskRuntime.js";
-import type { SchedulerStorePort, TmuxDeliveryPort } from "../scheduler/ports.js";
+import type {
+  AutoResolvedInput,
+  SchedulerStorePort,
+  TmuxDeliveryPort
+} from "../scheduler/ports.js";
 import { reconcileExitedRoleRuns } from "../scheduler/roleRunLiveness.js";
+import {
+  processOperatorInputNotifications,
+  type OperatorInputNotificationResult
+} from "../scheduler/operatorInputNotificationProcessor.js";
 import {
   startControllerServer,
   type ControllerDispatcher,
@@ -25,6 +33,8 @@ export type ControllerSchedulerResult = Readonly<{
   activeRunDeliveries: readonly ActiveRoleRunDeliveryResult[];
   failedRunIds: readonly string[];
   wakeups: readonly LeaderWakeupProcessingResult[];
+  inputNotifications: readonly OperatorInputNotificationResult[];
+  autoResolvedInputs: readonly AutoResolvedInput[];
 }>;
 
 export type ControllerRuntimeOptions = Readonly<{
@@ -62,8 +72,17 @@ export async function runControllerSchedulerPass(
   await workspacePreparer?.cleanupArchivedTaskWorkspaces();
   const activeRunDeliveries = await processActiveRoleRunDeliveries(store, delivery, now);
   const failedRunIds = await reconcileExitedRoleRuns(store, delivery, now);
+  const autoResolvedInputs = store.resolveExpiredInputRecommendations(now);
   const wakeups = await processLeaderWakeups(store, delivery, now);
-  return { stoppedArchivedTaskIds, activeRunDeliveries, failedRunIds, wakeups };
+  const inputNotifications = await processOperatorInputNotifications(store, delivery);
+  return {
+    stoppedArchivedTaskIds,
+    activeRunDeliveries,
+    failedRunIds,
+    wakeups,
+    inputNotifications,
+    autoResolvedInputs
+  };
 }
 
 /**
@@ -140,7 +159,12 @@ export class FileTaskController {
 
   async #runCoalesced(): Promise<ControllerSchedulerResult> {
     let result: ControllerSchedulerResult = {
-      stoppedArchivedTaskIds: [], activeRunDeliveries: [], failedRunIds: [], wakeups: []
+      stoppedArchivedTaskIds: [],
+      activeRunDeliveries: [],
+      failedRunIds: [],
+      wakeups: [],
+      inputNotifications: [],
+      autoResolvedInputs: []
     };
     do {
       this.#rerunRequested = false;

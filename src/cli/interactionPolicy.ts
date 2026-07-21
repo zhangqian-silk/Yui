@@ -3,6 +3,7 @@ import type { CommandNode } from "./commandCatalog.js";
 export type CandidateProviderName =
   | "configured-agents"
   | "global-roles"
+  | "input-requests"
   | "jobs"
   | "repositories"
   | "runs"
@@ -16,6 +17,7 @@ export type CandidateProviderName =
 export type SelectableEntity =
   | "agent"
   | "global-role"
+  | "input-request"
   | "job"
   | "repository"
   | "run"
@@ -181,6 +183,66 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       actionTarget: true
     }]
   })),
+  {
+    commandPath: ["task", "input", "request"],
+    selectors: [{
+      argumentIndex: 3,
+      entity: "task",
+      provider: "tasks",
+      actionTarget: true,
+      statuses: ["active"]
+    }],
+    trailingOptions: {
+      "--question": "value",
+      "--choice": "value",
+      "--blocks": "value",
+      "--recommend": "value",
+      "--timeout-seconds": "value"
+    }
+  },
+  {
+    commandPath: ["task", "input", "show"],
+    selectors: [
+      { argumentIndex: 3, entity: "input-request", provider: "input-requests", actionTarget: true },
+      { option: "--task", entity: "task", provider: "tasks", actionTarget: false }
+    ],
+    trailingOptions: { "--task": "value" }
+  },
+  {
+    commandPath: ["task", "input", "answer"],
+    selectors: [
+      {
+        argumentIndex: 3,
+        entity: "input-request",
+        provider: "input-requests",
+        actionTarget: true,
+        statuses: ["open"]
+      },
+      { option: "--task", entity: "task", provider: "tasks", actionTarget: false }
+    ],
+    trailingOptions: { "--task": "value", "--choice": "value", "--text": "value" }
+  },
+  {
+    commandPath: ["task", "input", "cancel"],
+    selectors: [
+      {
+        argumentIndex: 3,
+        entity: "task",
+        provider: "tasks",
+        actionTarget: true,
+        statuses: ["active"]
+      },
+      {
+        argumentIndex: 4,
+        entity: "input-request",
+        provider: "input-requests",
+        dependsOn: 3,
+        actionTarget: true,
+        statuses: ["open"]
+      }
+    ],
+    trailingOptions: { "--reason": "value" }
+  },
   {
     commandPath: ["task", "role", "add"],
     selectors: [

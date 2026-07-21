@@ -87,6 +87,28 @@ taskmux task run yield <run-id> --summary "导出器已完成，聚焦测试通�
 
 yield 会原子完成 Run 和 WorkItem、追加结果消息并唤醒 Leader。Leader 不会自唤醒；Leader 忙碌时，Operator/Worker 的 pending wake 会一直保留到 Leader 空闲。
 
+当活动 Leader Run 必须获得用户决定才能继续时，可以创建持久 InputRequest，并 yield 当前 Run：
+
+```sh
+taskmux task input request <task-id> --question "默认使用哪种格式？" \
+  --choice csv="CSV" --choice json="JSON" --blocks work-item:<work-item-id>
+taskmux task input list
+taskmux task input show <input-id>
+taskmux task input answer <input-id> --choice csv
+```
+
+请求默认必须由用户回答，并保持开放直到回答或取消。当 Agent 存在安全的推荐方案时，可以为选项设置明确的超时回退：
+
+```sh
+taskmux task input request <task-id> --question "默认使用哪种格式？" \
+  --choice csv="CSV" --choice json="JSON" \
+  --recommend csv --timeout-seconds 300
+```
+
+推荐项会明确展示给用户；如果截止时间前没有回答，第一轮到期后的 Controller 扫描会原子采用这个确定选项，并排队恢复固定的 Leader session。自由文本和必须由用户回答的请求永远不会自动解决。
+
+`task input list` 是权威的全局开放输入 Inbox；可附加 Task ID 限定范围，或使用 `--all` 查看已回答和已取消的请求。Controller 还会尝试向已经运行且处于输入状态的 Operator composer 投递一次带回执的提示；它不会为了通知而启动或打断 Operator。Operator 不在线或正忙时，请求仍保留在 Inbox，并在后续 Controller 扫描时重新尝试。用户和 Operator 都可回答。存在开放请求时，无关的 pending wake 不会绕过等待，Task 也不能 complete 或 archive。原 Leader 也可执行 `taskmux task input cancel <task-id> <input-id> --reason "..."`，取消不会使 Leader 自唤醒。
+
 ```sh
 taskmux task context <task-id>
 ```

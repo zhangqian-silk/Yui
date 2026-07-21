@@ -45,6 +45,13 @@ export type ExecutorTmuxPort = Readonly<{
     input: string,
     readinessProbe: TmuxReadinessProbe
   ): TmuxDeliveryOutcome;
+  sendRoleInputOnceIfReady(
+    taskId: string,
+    roleName: string,
+    receiptId: string,
+    input: string,
+    readinessProbe: TmuxReadinessProbe
+  ): TmuxDeliveryOutcome | "not-ready";
   hasDeliveryReceipt(taskId: string, roleName: string, receiptId: string): boolean;
   probeRoleStatus(taskId: string, roleName: string): "running" | "exited";
   stopTask(taskId: string): boolean;
@@ -112,6 +119,24 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       input.receiptId,
       input.text,
       this.readiness(input.delivery.prepared.adapterId)
+    );
+  }
+
+  async notifyOperatorInputOnce(input: Readonly<{
+    roleName: "operator";
+    adapterId: string;
+    receiptId: string;
+    text: string;
+  }>): Promise<"sent" | "already-sent" | "unavailable" | "not-ready"> {
+    if (this.tmux.probeRoleStatus("operator", input.roleName) !== "running") {
+      return "unavailable";
+    }
+    return this.tmux.sendRoleInputOnceIfReady(
+      "operator",
+      input.roleName,
+      input.receiptId,
+      input.text,
+      this.readiness(input.adapterId)
     );
   }
 

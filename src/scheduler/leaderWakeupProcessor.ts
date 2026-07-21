@@ -10,7 +10,7 @@ import type {
 export type LeaderWakeupProcessingResult = Readonly<{
   taskId: string;
   status: "dispatched" | "skipped" | "failed";
-  reason?: "busy" | "unavailable" | "workspace-not-ready" | "recovery-blocked" | "state-changed";
+  reason?: "busy" | "waiting-input" | "unavailable" | "workspace-not-ready" | "recovery-blocked" | "state-changed";
   error?: string;
 }>;
 
@@ -33,6 +33,10 @@ export async function processLeaderWakeups(
     }
     if (store.getLeaderFailure(task.id) !== null) {
       results.push({ taskId: task.id, status: "skipped", reason: "recovery-blocked" });
+      continue;
+    }
+    if (store.hasOpenInputRequest(task.id)) {
+      results.push({ taskId: task.id, status: "skipped", reason: "waiting-input" });
       continue;
     }
 
@@ -192,7 +196,7 @@ function leaderWakeupInput(
     }
   }
   lines.push(
-    `Inspect taskmux task context ${taskId}; then continue Leader stewardship. Use narrower show/list commands only when one record needs closer inspection.`
+    `Inspect taskmux task context ${taskId}, which includes open input requests; then continue Leader stewardship. Use narrower show/list commands only when one record needs closer inspection.`
   );
   return lines.join("\n");
 }

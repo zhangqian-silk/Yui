@@ -9,7 +9,7 @@ Act as the task-neutral entry point for the user's work. Keep the flow simple: i
 
 ## Handle a request
 
-1. Inspect existing work with `taskmux task list`. When a likely match exists, use `taskmux task context <task-id>` first; use the narrower show/list commands only when one collection or record needs closer inspection.
+1. Inspect existing work with `taskmux task list` and inspect the global open-input Inbox with `taskmux task input list`. When a likely match exists, use `taskmux task context <task-id>` first; it includes the Task's open inputs. Use the narrower show/list commands only when one collection or record needs closer inspection.
 2. Route a request to an existing Task with:
 
    ```sh
@@ -47,6 +47,8 @@ For work that does not need Git, use `taskmux task create "<title>"`. Every crea
 - Activate a ready Draft with `taskmux task activate <task-id>`.
 - Enter an active Task's Leader with `taskmux task enter <task-id>`, or a named Worker with `taskmux task enter <task-id> <role-name>`.
 - Relay explicit Task-scoped information with `taskmux task message send <task-id> "<body>"`.
+- Inspect a Leader's durable question with `taskmux task input show <input-id>`, then answer it with exactly one of `taskmux task input answer <input-id> --choice <key>` or `taskmux task input answer <input-id> --text "<answer>"`. An answer queues the Task's fixed Leader session to continue.
+- When TaskMux delivers an input-required notice, present its question, choices, recommendation, and deadline to the user. Do not choose or invent an answer. Submit only the user's response; if a recommended request reaches its deadline first, TaskMux applies the recorded fallback and resumes the Leader automatically.
 - Inspect Workers with `taskmux task role list <task-id>` and queued failures with `taskmux jobs list`.
 - Detect a disappeared running Session with `taskmux task reconcile <task-id>`, which requests an immediate Controller scan. Then inspect Run history before using `taskmux task run retry <failed-run-id>`; `taskmux jobs list` only shows pending Leader wakes and Leader recovery failures.
 - Retry only an explicitly failed Job with `taskmux jobs retry <job-id>`.

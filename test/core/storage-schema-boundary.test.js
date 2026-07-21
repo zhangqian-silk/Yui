@@ -34,7 +34,7 @@ function writeManifest(home, overrides = {}) {
 test("storage inspection keeps layout and aggregate schema versions separate", () => {
   const home = temporaryHome();
   assert.equal(CURRENT_STORAGE_SCHEMA_VERSION, CURRENT_STORAGE_LAYOUT_VERSION);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 2);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 3);
   assert.deepEqual(STORAGE_MIGRATIONS, []);
 
   writeManifest(home);
@@ -69,6 +69,16 @@ test("the initial v5 aggregate remains version 1 and is never mistaken for curre
     manifestPath: join(home, "schema.json")
   });
   assert.throws(() => requireStorageSchema(home), /aggregate schema 1 is older/i);
+});
+
+test("aggregate schema 2 is rejected because this release has no historical migration", () => {
+  const home = temporaryHome();
+  writeManifest(home, { aggregateSchemaVersion: 2 });
+
+  assert.throws(
+    () => requireStorageSchema(home),
+    /aggregate schema 2 is older.*no migration/i
+  );
 });
 
 test("aggregate migrations have an independent deterministic registry", () => {

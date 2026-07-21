@@ -110,3 +110,35 @@ test("ExecutorRegistry prepares new/resume sessions and always carries the adapt
     "leader", "worker"
   ]);
 });
+
+test("Operator input notification never launches a pane or waits for a busy composer", async () => {
+  const calls = [];
+  let state = "exited";
+  const registry = new ExecutorRegistry({ plan() { throw new Error("unused"); } }, {
+    ensureRoleWindow() { throw new Error("must not launch"); },
+    waitUntilReady() { throw new Error("must not wait"); },
+    sendRoleInputOnce() { throw new Error("unused"); },
+    sendRoleInputOnceIfReady(taskId, roleName, receiptId, text, probe) {
+      calls.push([taskId, roleName, receiptId, text, probe]);
+      return state === "ready" ? "sent" : "not-ready";
+    },
+    hasDeliveryReceipt() { return false; },
+    probeRoleStatus() { return state === "exited" ? "exited" : "running"; },
+    stopTask() { return false; }
+  });
+  const input = {
+    roleName: "operator",
+    adapterId: "codex",
+    receiptId: "input-request:input-1",
+    text: "Question"
+  };
+
+  assert.equal(await registry.notifyOperatorInputOnce(input), "unavailable");
+  assert.equal(calls.length, 0);
+  state = "busy";
+  assert.equal(await registry.notifyOperatorInputOnce(input), "not-ready");
+  assert.equal(calls.length, 1);
+  state = "ready";
+  assert.equal(await registry.notifyOperatorInputOnce(input), "sent");
+  assert.equal(calls.length, 2);
+});

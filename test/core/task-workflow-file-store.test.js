@@ -182,7 +182,8 @@ test("Task list and show emit one-pass structured JSON for Agents", (t) => {
         milestones: 0,
         events: 1,
         workItems: 0,
-        runs: 0
+        runs: 0,
+        openInputs: 0
       },
       hasBrief: false
     }

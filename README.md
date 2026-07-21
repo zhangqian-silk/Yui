@@ -89,6 +89,28 @@ taskmux task run yield <run-id> --summary "Implemented the exporter; focused tes
 
 Yield atomically completes the Run and WorkItem, appends the result message, and queues the Leader. A Leader never wakes itself; any already-pending Operator or Worker wake remains durable until the Leader is idle.
 
+When an active Leader Run cannot continue without a user decision, it can create a durable InputRequest and yield its Run:
+
+```sh
+taskmux task input request <task-id> --question "Which format should be the default?" \
+  --choice csv="CSV" --choice json="JSON" --blocks work-item:<work-item-id>
+taskmux task input list
+taskmux task input show <input-id>
+taskmux task input answer <input-id> --choice csv
+```
+
+Requests are user-required by default and remain open until answered or cancelled. When the Agent has a safe recommendation, it may attach a choice fallback and explicit timeout:
+
+```sh
+taskmux task input request <task-id> --question "Which format should be the default?" \
+  --choice csv="CSV" --choice json="JSON" \
+  --recommend csv --timeout-seconds 300
+```
+
+The recommendation is shown to the user. If no answer arrives, the first Controller scan at or after the deadline atomically applies that exact choice and queues the fixed Leader session to resume. Free-text and user-required requests never auto-resolve.
+
+`task input list` is the authoritative global open-input Inbox; add a Task ID to scope it, or `--all` to include answered and cancelled requests. The Controller also makes one receipt-backed, best-effort delivery to an already-running Operator composer. It never starts or interrupts an Operator for this notification; an absent or busy Operator falls back to the durable Inbox and is reconsidered on a later Controller scan. Answers may be submitted by the user or Operator. An open request prevents unrelated pending wakes and Task completion or archival. The originating Leader may instead run `taskmux task input cancel <task-id> <input-id> --reason "..."`; cancellation does not self-wake it.
+
 Inspect the result:
 
 ```sh

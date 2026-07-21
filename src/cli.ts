@@ -413,6 +413,13 @@ function selectionCall(
     case "task.role.list": return callOptional(reader, "listRoles", [params.taskId]);
     case "task.role.show": return callOptional(reader, "getRole", [params.taskId, params.roleName]);
     case "task.work.list": return callOptional(reader, "listWorkItems", [params.taskId]);
+    case "task.input.list": {
+      const taskId = typeof params.taskId === "string" ? params.taskId : undefined;
+      const requests = taskId === undefined
+        ? store.listAllInputRequests()
+        : store.listInputRequests(taskId);
+      return params.all === true ? requests : requests.filter((request) => request.status === "open");
+    }
     case "task.run.list": return callOptional(reader, "listAgentRuns", [params.workItemId]);
     case "task.decision.list": return callOptional(reader, "listDecisions", [params.taskId]);
     case "task.milestone.list": return callOptional(reader, "listMilestones", [params.taskId]);

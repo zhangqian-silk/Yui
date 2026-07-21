@@ -71,6 +71,11 @@ import {
   roleProfilePatch
 } from "./roleConfiguration.js";
 import { runTaskContextCommand } from "./taskContextCommand.js";
+import {
+  assertNoOpenInputRequests,
+  openInputRequestCount,
+  runTaskInputCommand
+} from "./taskInputCommands.js";
 
 const LEADER_ROLE = "leader";
 
@@ -119,6 +124,7 @@ export function runTaskCommand(
     case "archive": return output(archiveTaskCommand(rest, store, options));
     case "reconcile": return output(reconcileTaskCommand(rest, store, options));
     case "message": return output(taskMessageCommand(rest, store, options));
+    case "input": return runTaskInputCommand(rest, store, options);
     case "role": return taskRoleCommand(rest, store, options);
     case "work": return output(taskWorkCommand(rest, store, options));
     case "run": return output(taskRunCommand(rest, store, options));
@@ -302,6 +308,7 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
   const decisions = store.listDecisions(task.id);
   const milestones = store.listMilestones(task.id);
   const events = store.listEvents(task.id);
+  const openInputs = openInputRequestCount(store, task.id);
   const work = store.listWorkItems(task.id);
   const runs = store.listAgentRuns(task.id);
   const counts = {
@@ -311,7 +318,8 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     milestones: milestones.length,
     events: events.length,
     workItems: work.length,
-    runs: runs.length
+    runs: runs.length,
+    openInputs
   };
   const rendered = [
     `Task: ${task.id}`,
@@ -335,6 +343,7 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     `Events: ${counts.events}`,
     `Work items: ${counts.workItems}`,
     `Runs: ${counts.runs}`,
+    `Open inputs: ${counts.openInputs}`,
     `Created: ${task.createdAt}`,
     `Updated: ${task.updatedAt}`
   ].join("\n").concat("\n");
@@ -388,6 +397,7 @@ function completeTaskCommand(
     if (task.status === "completed") return { task, changed: false } as const;
     if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
+    assertNoOpenInputRequests(tx, task.id, "completing the Task");
 
     const roles = tx.listRoles(task.id);
     const activeRuns = roles
@@ -473,6 +483,7 @@ function archiveTaskCommand(
     const task = requireTask(tx, args[0]);
     const actor = taskActor(options, task.id);
     if (task.status === "archived") return { task, changed: false } as const;
+    assertNoOpenInputRequests(tx, task.id, "archiving the Task");
     const archived = archiveTask(task, now, { by: actor });
     tx.saveTask(archived);
     tx.clearPendingWakeup(task.id);

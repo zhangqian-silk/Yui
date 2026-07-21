@@ -237,6 +237,43 @@ const taskChildren: readonly NodeInput[] = [
     ]
   },
   {
+    name: "input",
+    summary: "Manage durable Task-owned input requests.",
+    sections: [{ id: "manage", title: "Commands", entries: ["request", "list", "show", "answer", "cancel"] }],
+    children: [
+      {
+        name: "request",
+        summary: "Pause the active Leader Run and request user input.",
+        usage: "taskmux task input request <task> --question <text> [--choice <key=label> ...] [--blocks <work-item:id|run:id> ...] [--recommend <key> --timeout-seconds <seconds>]",
+        options: ["--question", "--choice", "--blocks", "--recommend", "--timeout-seconds"]
+      },
+      {
+        name: "list",
+        summary: "List the global Inbox or one Task's input requests.",
+        usage: "taskmux task input list [task] [--all]",
+        options: ["--all"]
+      },
+      {
+        name: "show",
+        summary: "Show one input request.",
+        usage: "taskmux task input show <input> [--task <task>]",
+        options: ["--task"]
+      },
+      {
+        name: "answer",
+        summary: "Answer one open input request.",
+        usage: "taskmux task input answer <input> [--task <task>] (--choice <key> | --text <text>)",
+        options: ["--task", "--choice", "--text"]
+      },
+      {
+        name: "cancel",
+        summary: "Cancel an open request from its originating Leader.",
+        usage: "taskmux task input cancel <task> <input> --reason <text>",
+        options: ["--reason"]
+      }
+    ]
+  },
+  {
     name: "role",
     summary: "Manage Roles within a Task.",
     sections: [{ id: "manage", title: "Commands", entries: [
@@ -477,7 +514,7 @@ export const ROOT_COMMAND = buildNode({
       summary: "Manage Tasks, Roles, work items, and Runs.",
       sections: [
         { id: "lifecycle", title: "Lifecycle", entries: ["create", "update", "activate", "complete", "reopen", "list", "show", "context", "archive", "reconcile"] },
-        { id: "collaboration", title: "Collaboration", entries: ["message", "role", "work", "run", "enter"] },
+        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "role", "work", "run", "enter"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
       ],
       children: taskChildren

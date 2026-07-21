@@ -74,6 +74,19 @@ export async function getSelectionCandidates(
         await list(ports, "jobs.list", {}),
         ["id", "type", "status"]
       );
+    case "input-requests": {
+      const taskId = dependencyValue(selector, args);
+      return entities(
+        "input request",
+        taskId === undefined ? "Select input request" : `Select input request: ${taskId}`,
+        (await list(ports, "task.input.list", {
+          ...(taskId === undefined ? {} : { taskId }),
+          all: true
+        })).filter((request) => selector.statuses === undefined
+          || selector.statuses.includes(stringField(request, "status") ?? "")),
+        ["id", "taskId", "status", "question"]
+      );
+    }
     case "task-roles": {
       const taskId = dependencyValue(selector, args);
       if (taskId === undefined) return null;

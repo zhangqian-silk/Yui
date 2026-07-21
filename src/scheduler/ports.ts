@@ -1,5 +1,6 @@
 import type { TaskBrief } from "../brief/taskBrief.js";
 import type { Decision } from "../decision/decision.js";
+import type { InputRequest } from "../input/inputRequest.js";
 import type { Milestone } from "../milestone/milestone.js";
 import type { LeaderFailure } from "./leaderFailure.js";
 import type { OperatorNotification } from "./operatorNotification.js";
@@ -28,6 +29,17 @@ export type SchedulerRoleSession = Readonly<{
   adapterId: string;
   nativeSessionId?: string;
   status: "reserved" | "ready" | "running" | "stopped" | "broken";
+}>;
+
+export type SchedulerOperatorDeliveryTarget = Readonly<{
+  roleName: "operator";
+  adapterId: string;
+}>;
+
+export type AutoResolvedInput = Readonly<{
+  inputRequestId: string;
+  taskId: string;
+  choiceKey: string;
 }>;
 
 export type LeaderDispatchPersistence = Readonly<{
@@ -78,6 +90,10 @@ export interface SchedulerStorePort {
   listRoles(taskId: string): readonly SchedulerRole[];
   getRole(taskId: string, roleName: string): SchedulerRole | null;
   getActiveAgentRun(taskId: string, roleName: string): SchedulerAgentRun | null;
+  hasOpenInputRequest(taskId: string): boolean;
+  listOpenInputRequests(): readonly InputRequest[];
+  getOperatorDeliveryTarget(): SchedulerOperatorDeliveryTarget | null;
+  resolveExpiredInputRecommendations(now: Date): readonly AutoResolvedInput[];
   getRoleSession(taskId: string, roleName: string): SchedulerRoleSession | null;
   nextAgentRunId(taskId: string): string;
 
@@ -140,6 +156,13 @@ export interface TmuxDeliveryPort {
     receiptId: string;
     text: string;
   }>): Promise<"sent" | "already-sent">;
+  /** Best-effort nudge to an already-running global Operator composer. */
+  notifyOperatorInputOnce?(input: Readonly<{
+    roleName: "operator";
+    adapterId: string;
+    receiptId: string;
+    text: string;
+  }>): Promise<"sent" | "already-sent" | "unavailable" | "not-ready">;
   inspectRole(input: Readonly<{
     taskId: string;
     roleName: string;

@@ -42,6 +42,22 @@ test("a busy Leader retains its pending wakeup and receives no terminal delivery
   assert.equal(store.savedDispatches.length, 0);
 });
 
+test("an open InputRequest retains pending wakeups until it is resolved", async () => {
+  const store = fakeStore();
+  store.openInputTasks.add("task-1");
+  const delivery = fakeDelivery();
+
+  assert.deepEqual(await processLeaderWakeups(store, delivery, NOW), [
+    { taskId: "task-1", status: "skipped", reason: "waiting-input" }
+  ]);
+  assert.equal(store.pending.has("task-1"), true);
+  assert.deepEqual(delivery.calls, []);
+
+  store.openInputTasks.delete("task-1");
+  assert.equal((await processLeaderWakeups(store, delivery, NOW))[0].status, "dispatched");
+  assert.equal(store.pending.has("task-1"), false);
+});
+
 test("a repository Task retains wakeup until its worktree cwd is ready", async () => {
   const store = fakeStore();
   store.tasks[0] = { ...store.tasks[0], repositoryId: "repository-1" };
@@ -230,6 +246,7 @@ function fakeStore(options = {}) {
     pending,
     sessions,
     activeRuns: new Map(),
+    openInputTasks: new Set(),
     savedDispatches: [],
     savedFailures: [],
     savedExitedRuns: [],
@@ -241,6 +258,7 @@ function fakeStore(options = {}) {
       (candidate) => candidate.taskId === taskId && candidate.name === roleName
     ) ?? null,
     getActiveAgentRun: (taskId, roleName) => store.activeRuns.get(key(taskId, roleName)) ?? null,
+    hasOpenInputRequest: (taskId) => store.openInputTasks.has(taskId),
     getRoleSession: (taskId, roleName) => store.sessions.get(key(taskId, roleName)) ?? null,
     nextAgentRunId: () => `run-${store.savedDispatches.length + 1}`,
     getPendingWakeup: (taskId) => store.pending.get(taskId) ?? null,

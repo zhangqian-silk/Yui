@@ -14,6 +14,7 @@ Use only the public current commands:
 ```sh
 taskmux task show <task-id>
 taskmux task message list <task-id>
+taskmux task input list <task-id> --all
 taskmux task role list <task-id>
 taskmux task work list <task-id>
 taskmux task run list <work-item-id>
@@ -42,6 +43,17 @@ Use the Task, WorkItem, Role, and Run IDs supplied by TaskMux output or the laun
    ```
 
 Do not dispatch a terminal WorkItem or create a second active Run for the same WorkItem.
+
+## Request a decision
+
+If the active Leader control Run cannot make progress without user input, create one durable request:
+
+```sh
+taskmux task input request <task-id> --question "<specific question>" \
+  --choice <key>=<label> --blocks work-item:<work-item-id>
+```
+
+Omit `--choice` for free text. Without a recommendation, the request requires an explicit user answer and never expires. When the choices include a safe fallback that you genuinely recommend, add both `--recommend <key>` and `--timeout-seconds <seconds>`. After that deadline, TaskMux may apply only that exact choice; never configure this fallback for a decision that inherently requires user authorization. Use repeated `--choice` or `--blocks` options only when needed. A successful request yields the current Leader Run and releases its active fence, so stop that turn and wait for TaskMux to resume the same session after an answer. If the question is no longer needed, only its originating Leader may cancel it with `taskmux task input cancel <task-id> <input-id> --reason "<reason>"`; cancellation does not self-wake the Leader.
 
 ## Collect and continue
 
