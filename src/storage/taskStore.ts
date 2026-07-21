@@ -80,7 +80,7 @@ export type ConfiguredAgentUpdateResult = Readonly<{
 
 type ActiveRunPointer = Readonly<{ schemaVersion: 1; runId: string }>;
 type StoredTask = {
-  schemaVersion: 2;
+  schemaVersion: 1;
   task: Task;
   brief: TaskBrief | null;
   roles: Record<string, TaskRole>;
@@ -737,7 +737,7 @@ function emptyState(): StorageState {
 }
 function emptyStoredTask(task: Task): StoredTask {
   return {
-    schemaVersion: 2,
+    schemaVersion: 1,
     task,
     brief: null,
     roles: {},
@@ -831,7 +831,7 @@ function parseState(raw: string): StorageState {
 function parseStoredTask(value: unknown, taskId: string): StoredTask {
   const aggregate = object(value, `Task aggregate ${taskId}`) as unknown as StoredTask;
   exact(aggregate as unknown as Record<string, unknown>, ["schemaVersion", "task", "brief", "roles", "roleWorkspaces", "roleSessionSets", "workItems", "agentRuns", "activeRuns", "messages", "inputRequests", "decisions", "milestones", "events", "pendingWakeup", "leaderFailure", "operatorNotification"], `Task aggregate ${taskId}`);
-  versioned(aggregate, 2, `Task aggregate ${taskId}`);
+  versioned(aggregate, 1, `Task aggregate ${taskId}`);
   validateTask(identified(aggregate.task, 1, "id", taskId, "Task"));
   if (aggregate.brief !== null) storedTaskBrief(aggregate.brief);
   parseMap(aggregate.roles, (record, key) => { const role = identified<TaskRole>(record, 2, "name", key, "Task Role"); if (role.taskId !== taskId) throw new StorageRecordError(`Task Role belongs to another Task: ${role.taskId}`); validateTaskRole(role); return role; }, "roles");

@@ -16,6 +16,10 @@ import { findInteractionPolicy } from "../../dist/cli/interactionPolicy.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { createDecision, supersedeDecision } from "../../dist/decision/decision.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
+import {
+  answerInputRequest,
+  createInputRequest
+} from "../../dist/input/inputRequest.js";
 import { createTaskMessage } from "../../dist/message/message.js";
 import { createMilestone } from "../../dist/milestone/milestone.js";
 import {
@@ -170,6 +174,8 @@ test("task context aggregates complete records and renders a compact recent summ
     workItems: [workItem],
     runs: [associatedRun],
     messages,
+    openInputRequests: [],
+    resolvedInputRequests: [],
     events: store.listEvents(task.id)
   });
   assert.match(result.output, /^Task context: task-1/m);
@@ -184,7 +190,81 @@ test("task context aggregates complete records and renders a compact recent summ
   assert.match(result.output, /Recent messages \(5 of 6\)/);
   assert.doesNotMatch(result.output, /Message 1/);
   assert.match(result.output, /Message 6/);
+  assert.match(result.output, /Open input requests \(0\):\n  None\./);
   assert.match(result.output, /Recent events \(5 of 7\)/);
+});
+
+test("task context includes every open input and renders a bounded actionable summary", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Input-aware context");
+  const openRequests = [];
+
+  for (let index = 1; index <= 7; index += 1) {
+    const createdAt = atMinute(index);
+    const request = createInputRequest(
+      store.nextInputRequestId(task.id),
+      task.id,
+      {
+        roleName: "leader",
+        agentId: "codex",
+        runId: `agent-run-${index}`
+      },
+      {
+        question: `Choose rollout ${index}`,
+        choices: [
+          { key: "safe", label: "Safe rollout" },
+          { key: "fast", label: "Fast rollout" }
+        ],
+        blockedRefs: [
+          { type: "work-item", id: `work-item-${index}` },
+          { type: "run", id: `agent-run-${index}` }
+        ],
+        policy: index === 7
+          ? {
+              kind: "recommended",
+              recommendedChoiceKey: "safe",
+              timeoutAt: atMinute(index + 10).toISOString()
+            }
+          : { kind: "required" }
+      },
+      createdAt
+    );
+    openRequests.push(request);
+    store.saveInputRequest(task.id, request);
+  }
+
+  const answered = createInputRequest(
+    store.nextInputRequestId(task.id),
+    task.id,
+    { roleName: "leader", agentId: "codex", runId: "agent-run-answered" },
+    { question: "Already resolved", choices: [], blockedRefs: [] },
+    atMinute(20)
+  );
+  store.saveInputRequest(task.id, answered);
+  store.saveInputRequest(task.id, answerInputRequest(
+    answered,
+    { text: "Done" },
+    "user",
+    atMinute(21)
+  ));
+
+  const result = output(["context", task.id], store, options);
+  assert.deepEqual(result.data.openInputRequests, openRequests);
+  assert.equal(result.data.resolvedInputRequests.length, 1);
+  assert.equal(result.data.resolvedInputRequests[0].id, answered.id);
+  assert.match(result.output, /Open input requests \(5 of 7\)/);
+  assert.doesNotMatch(result.output, /Choose rollout 1/);
+  assert.doesNotMatch(result.output, /Choose rollout 2/);
+  assert.match(result.output, /Choose rollout 3/);
+  assert.match(result.output, /Choose rollout 7/);
+  assert.match(result.output, /Recent resolved input requests \(1\)/);
+  assert.match(result.output, /Already resolved/);
+  assert.match(result.output, /Answer: Done/);
+  assert.match(result.output, /Answered by user/);
+  assert.match(result.output, /Choices \(2\):\n      safe: Safe rollout\n      fast: Fast rollout/);
+  assert.match(result.output, /Recommended choice: safe: Safe rollout/);
+  assert.match(result.output, new RegExp(`Timeout at: ${atMinute(17).toISOString()}`));
+  assert.match(result.output, /Blocks \(2\):\n      work-item:work-item-7\n      run:agent-run-7/);
 });
 
 test("task context bounds human-readable history while preserving complete data", (t) => {
@@ -249,6 +329,8 @@ test("task context keeps empty knowledge and work explicit and reads terminal Ta
     assert.deepEqual(result.data.workItems, []);
     assert.deepEqual(result.data.runs, []);
     assert.deepEqual(result.data.messages, []);
+    assert.deepEqual(result.data.openInputRequests, []);
+    assert.deepEqual(result.data.resolvedInputRequests, []);
     assert.match(result.output, /Brief:\n  No brief\./);
     assert.match(result.output, /Active decisions \(0\):\n  None\./);
     assert.match(result.output, /Current and recent work items \(0\):\n  None\./);
@@ -269,6 +351,8 @@ test("task context emits its structured payload in the CLI top-level data field"
   assert.equal(response.data.task.id, task.id);
   assert.equal(response.data.brief, null);
   assert.deepEqual(response.data.activeDecisions, []);
+  assert.deepEqual(response.data.openInputRequests, []);
+  assert.deepEqual(response.data.resolvedInputRequests, []);
   assert.ok(Array.isArray(response.data.events));
 });
 
@@ -296,4 +380,3 @@ test("task context is public, interactively selects any Task state, and complete
   });
   assert.deepEqual(candidates, tasks.map(({ id }) => id));
 });
-

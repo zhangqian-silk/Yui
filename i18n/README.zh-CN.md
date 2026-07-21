@@ -55,7 +55,7 @@ taskmux task context <task-id>
 taskmux task activate <task-id>
 ```
 
-查看已有 Task 的详细状态时，优先使用 `task context`。它一次聚合 Task、Brief、Active Decision、最近的 Milestone、Role、当前及最近的 WorkItem 与关联 Run、最近的 Message 和 Event。终端输出会精简历史和长文本；`taskmux --json task context <task-id>` 会在顶层 `data` 中返回完整记录。
+查看已有 Task 的详细状态时，优先使用 `task context`。它一次聚合 Task、Brief、Active Decision、最近的 Milestone、Role、当前及最近的 WorkItem 与关联 Run、最近的 Message、Open/Resolved InputRequest 和 Event。终端输出会精简历史和长文本；`taskmux --json task context <task-id>` 会在顶层 `data` 中返回完整记录。
 
 新 Task 是 Draft，并已创建 Leader。激活时会排入第一次持久 Leader wake。带 Repository 的 Task 会先为每个 Role 创建 `<TASKMUX_HOME>/worktrees/<task-id>/<role-name>`，对应分支为 `taskmux/<task-id>/<role-name>`，然后才启动 Leader；后续新增 Role 也会在执行前获得独立 worktree。
 

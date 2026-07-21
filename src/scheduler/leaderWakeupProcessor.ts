@@ -196,7 +196,7 @@ function leaderWakeupInput(
     }
   }
   lines.push(
-    `Inspect taskmux task context ${taskId}, which includes open input requests; then continue Leader stewardship. Use narrower show/list commands only when one record needs closer inspection.`
+    `Inspect taskmux task context ${taskId}, which includes open and recently resolved input requests; then continue Leader stewardship. Use narrower show/list commands only when one record needs closer inspection.`
   );
   return lines.join("\n");
 }

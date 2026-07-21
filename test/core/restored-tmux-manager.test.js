@@ -147,6 +147,44 @@ test("best-effort delivery returns immediately when the Operator composer is bus
   assert.equal(calls.some((call) => call.args[0] === "if-shell"), false);
 });
 
+test("best-effort delivery sends after one readiness snapshot without entering a wait loop", () => {
+  const calls = [];
+  let readinessProbes = 0;
+  let timestamp = 0;
+  const manager = new TmuxManager("tmux-test", {
+    run(command, args) {
+      calls.push({ command, args });
+      if (args[0] === "display-message") return "0|321|codex\n";
+      if (args[0] === "capture-pane") return "composer ready\n";
+      if (args[0] === "if-shell") {
+        return `${args.at(-1).match(/__TASKMUX_DELIVERY_SENT_[a-f0-9]+__/)[0]}\n`;
+      }
+      return "";
+    }
+  }, {
+    taskmuxHome: "/tmp/taskmux-home",
+    readinessTimeoutMs: 3,
+    readinessPollMs: 1,
+    now: () => timestamp++,
+    sleep: () => {}
+  });
+
+  assert.equal(manager.sendRoleInputOnceIfReady(
+    "operator",
+    "operator",
+    "input-request:input-1",
+    "Question",
+    () => {
+      readinessProbes += 1;
+      return readinessProbes === 1;
+    }
+  ), "sent");
+  assert.equal(readinessProbes, 1);
+  assert.equal(calls.filter((call) => call.args[0] === "display-message").length, 1);
+  assert.equal(calls.filter((call) => call.args[0] === "capture-pane").length, 1);
+  assert.equal(calls.filter((call) => call.args[0] === "if-shell").length, 1);
+});
+
 test("an existing pane receipt bypasses readiness while the Agent is busy", () => {
   const calls = [];
   let readinessProbes = 0;

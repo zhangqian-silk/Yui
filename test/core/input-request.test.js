@@ -478,7 +478,8 @@ test("Controller atomically applies an expired Agent recommendation and resumes 
   assert.equal(result.wakeups[0].status, "dispatched");
   assert.deepEqual(leaderCalls, ["prepare", "ready", "send"]);
   assert.match(leaderWakeupText, new RegExp(`input-timeout:${request.id}`));
-  assert.match(leaderWakeupText, new RegExp(`task input list ${task.id} --all`));
+  assert.match(leaderWakeupText, new RegExp(`task context ${task.id}`));
+  assert.match(leaderWakeupText, /recently resolved input requests/);
   assert.equal(notices.length, 1);
   const resolved = store.getInputRequest(task.id, request.id);
   assert.equal(resolved.status, "answered");

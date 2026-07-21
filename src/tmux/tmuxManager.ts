@@ -263,7 +263,20 @@ export class TmuxManager {
       return "already-sent";
     }
     this.waitUntilReady(taskId, roleName, readinessProbe);
+    return this.sendReadyRoleInputOnce(taskId, roleName, receiptId, input);
+  }
 
+  private sendReadyRoleInputOnce(
+    taskId: string,
+    roleName: string,
+    receiptId: string,
+    input: string
+  ): TmuxDeliveryOutcome {
+    safeValue(receiptId, "tmux delivery receipt id");
+    safeValue(input, "tmux input");
+    if (this.hasDeliveryReceipt(taskId, roleName, receiptId)) {
+      return "already-sent";
+    }
     const target = this.target(taskId, roleName);
     const digest = createHash("sha256").update(receiptId).digest("hex");
     const option = `@taskmux_delivery_${digest}`;
@@ -299,7 +312,7 @@ export class TmuxManager {
       return "already-sent";
     }
     if (!readinessProbe(this.inspectPane(taskId, roleName))) return "not-ready";
-    return this.sendRoleInputOnce(taskId, roleName, receiptId, input, readinessProbe);
+    return this.sendReadyRoleInputOnce(taskId, roleName, receiptId, input);
   }
 
   hasDeliveryReceipt(taskId: string, roleName: string, receiptId: string): boolean {

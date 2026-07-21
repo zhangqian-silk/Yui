@@ -1,8 +1,10 @@
 import { taskNotFound, usageError } from "../errors/cliError.js";
+import type { InputRequest } from "../input/inputRequest.js";
 import { taskMessageAuthorLabel } from "../message/message.js";
 import type { TaskStore } from "../storage/taskStore.js";
 
 const RECENT_RECORD_LIMIT = 5;
+const RELATED_RECORD_LIMIT = 5;
 const SUMMARY_TEXT_LIMIT = 400;
 const TERMINAL_WORK_ITEM_STATUSES = new Set([
   "completed",
@@ -21,6 +23,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     if (task === null) throw taskNotFound(taskId);
     const workItems = reader.listWorkItems(task.id);
     const workItemIds = new Set(workItems.map((item) => item.id));
+    const inputRequests = reader.listInputRequests(task.id);
     return {
       task,
       brief: reader.getTaskBrief(task.id),
@@ -32,6 +35,8 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       runs: reader.listAgentRuns(task.id)
         .filter((run) => run.workItemId !== undefined && workItemIds.has(run.workItemId)),
       messages: reader.listMessages(task.id),
+      openInputRequests: inputRequests.filter((request) => request.status === "open"),
+      resolvedInputRequests: inputRequests.filter((request) => request.status !== "open"),
       events: reader.listEvents(task.id)
     };
   });
@@ -44,10 +49,14 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     workItems,
     runs,
     messages,
+    openInputRequests,
+    resolvedInputRequests,
     events
   } = data;
   const displayedActiveDecisions = activeDecisions.slice(-RECENT_RECORD_LIMIT);
   const displayedWorkItems = currentAndRecentWorkItems(workItems);
+  const displayedOpenInputRequests = openInputRequests.slice(-RECENT_RECORD_LIMIT);
+  const displayedResolvedInputRequests = resolvedInputRequests.slice(-RECENT_RECORD_LIMIT);
 
   const lines = [
     `Task context: ${task.id}`,
@@ -133,6 +142,16 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       ]
     ),
     "",
+    `Open input requests (${displayedOpenInputRequests.length}${openInputRequests.length > displayedOpenInputRequests.length ? ` of ${openInputRequests.length}` : ""}):`,
+    ...(displayedOpenInputRequests.length === 0
+      ? ["  None."]
+      : displayedOpenInputRequests.flatMap(renderOpenInputRequest)),
+    "",
+    `Recent resolved input requests (${displayedResolvedInputRequests.length}${resolvedInputRequests.length > displayedResolvedInputRequests.length ? ` of ${resolvedInputRequests.length}` : ""}):`,
+    ...(displayedResolvedInputRequests.length === 0
+      ? ["  None."]
+      : displayedResolvedInputRequests.flatMap(renderResolvedInputRequest)),
+    "",
     ...recentSection(
       "events",
       events,
@@ -152,6 +171,56 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     output: `${lines.join("\n")}\n`,
     data
   };
+}
+
+function renderResolvedInputRequest(request: InputRequest): string[] {
+  if (request.status === "open") return [];
+  return [
+    `  ${request.id} [${request.status}]`,
+    `    Question: ${compactText(request.question)}`,
+    ...(request.status === "answered"
+      ? [
+          `    Answer: ${compactText(request.resolution.answer.text)}`,
+          `    Answered by ${request.resolution.answeredBy} at ${request.resolution.answeredAt}`
+        ]
+      : [
+          `    Cancelled: ${compactText(request.cancellation.reason)}`,
+          `    Cancelled at: ${request.cancellation.cancelledAt}`
+        ])
+  ];
+}
+
+function renderOpenInputRequest(request: InputRequest): string[] {
+  const choices = request.choices.slice(0, RELATED_RECORD_LIMIT);
+  const blockedRefs = request.blockedRefs.slice(0, RELATED_RECORD_LIMIT);
+  const recommendedChoiceKey = request.policy.kind === "recommended"
+    ? request.policy.recommendedChoiceKey
+    : undefined;
+  const recommendedChoice = recommendedChoiceKey === undefined
+    ? undefined
+    : request.choices.find((choice) => choice.key === recommendedChoiceKey);
+  return [
+    `  ${request.id} [${request.policy.kind}]`,
+    `    Question: ${compactText(request.question)}`,
+    ...(request.choices.length === 0
+      ? ["    Choices: none (free-text answer)."]
+      : [
+          `    Choices (${choices.length}${request.choices.length > choices.length ? ` of ${request.choices.length}` : ""}):`,
+          ...choices.map((choice) => `      ${choice.key}: ${compactText(choice.label)}`)
+        ]),
+    ...(request.policy.kind === "recommended"
+      ? [
+          `    Recommended choice: ${request.policy.recommendedChoiceKey}: ${compactText(recommendedChoice?.label ?? request.policy.recommendedChoiceKey)}`,
+          `    Timeout at: ${request.policy.timeoutAt}`
+        ]
+      : []),
+    ...(request.blockedRefs.length === 0
+      ? ["    Blocks: none."]
+      : [
+          `    Blocks (${blockedRefs.length}${request.blockedRefs.length > blockedRefs.length ? ` of ${request.blockedRefs.length}` : ""}):`,
+          ...blockedRefs.map((reference) => `      ${reference.type}:${reference.id}`)
+        ])
+  ];
 }
 
 function recentSection<T>(
@@ -182,4 +251,3 @@ function compactText(value: string): string {
     ? oneLine
     : `${oneLine.slice(0, SUMMARY_TEXT_LIMIT - 3)}...`;
 }
-

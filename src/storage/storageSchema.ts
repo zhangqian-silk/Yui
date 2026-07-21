@@ -5,7 +5,7 @@ import { writeTextFileAtomically } from "./durableFile.js";
 /** Version of the on-disk layout (`schema.json`, root `state.json`, and locks). */
 export const CURRENT_STORAGE_LAYOUT_VERSION = 5;
 /** Version of the authoritative aggregate stored in `state.json`. */
-export const CURRENT_AGGREGATE_SCHEMA_VERSION = 3;
+export const CURRENT_AGGREGATE_SCHEMA_VERSION = 1;
 /** @deprecated Use CURRENT_STORAGE_LAYOUT_VERSION for new code. */
 export const CURRENT_STORAGE_SCHEMA_VERSION = CURRENT_STORAGE_LAYOUT_VERSION;
 export const STORAGE_SCHEMA_FILE = "schema.json";
@@ -15,8 +15,7 @@ export type StorageSchemaManifest = Readonly<{
   schemaVersion: 1;
   /** On-disk layout version. This is not a domain-record schema version. */
   storageVersion: number;
-  /** Missing in the initial v5 manifest and therefore defaults to version 1. */
-  aggregateSchemaVersion?: number;
+  aggregateSchemaVersion: number;
   /** Reserved for a later layout that atomically switches immutable generations. */
   activeGeneration?: null;
   updatedAt: string;
@@ -325,17 +324,15 @@ function parseStorageManifest(raw: string): ParsedStorageManifest {
   const value = parseJsonObject(raw, "Storage schema manifest");
   assertKeys(
     value,
-    ["schemaVersion", "storageVersion", "updatedAt"],
-    ["aggregateSchemaVersion", "activeGeneration"],
+    ["schemaVersion", "storageVersion", "aggregateSchemaVersion", "updatedAt"],
+    ["activeGeneration"],
     "Storage schema manifest"
   );
   if (value.schemaVersion !== 1) throw new Error("schemaVersion must be 1");
   if (!Number.isInteger(value.storageVersion) || (value.storageVersion as number) < 1) {
     throw new Error("storageVersion must be a positive integer");
   }
-  // The initial v5 manifest omitted this field and always described aggregate
-  // schema 1. Keep that historical meaning when the current version advances.
-  const aggregateSchemaVersion = value.aggregateSchemaVersion ?? 1;
+  const aggregateSchemaVersion = value.aggregateSchemaVersion;
   if (!Number.isInteger(aggregateSchemaVersion) || (aggregateSchemaVersion as number) < 1) {
     throw new Error("aggregateSchemaVersion must be a positive integer");
   }

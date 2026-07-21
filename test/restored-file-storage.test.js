@@ -24,6 +24,7 @@ function temporaryHome() {
 test("storage schema initializes v5 and rejects every non-current version", () => {
   const home = temporaryHome();
   assert.equal(CURRENT_STORAGE_SCHEMA_VERSION, 5);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 1);
   assert.deepEqual(STORAGE_MIGRATIONS, []);
   assert.equal(inspectStorageSchema(home).status, "uninitialized");
 
@@ -42,6 +43,7 @@ test("storage schema initializes v5 and rejects every non-current version", () =
     writeFileSync(join(home, "schema.json"), JSON.stringify({
       schemaVersion: 1,
       storageVersion,
+      aggregateSchemaVersion: 1,
       updatedAt: "2026-07-19T00:00:00.000Z"
     }));
     assert.throws(
@@ -177,6 +179,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
 
   const onDisk = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
   assert.equal(onDisk.schemaVersion, 1);
+  assert.equal(onDisk.tasks[task.id].schemaVersion, 1);
   assert.equal(onDisk.revision, 1);
   assert.deepEqual(store.getConfiguredAgent("codex"), agent);
   assert.deepEqual(store.getGlobalRole("operator"), globalRole);
@@ -207,6 +210,14 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   ));
   assert.equal(store.getGlobalRole("operator").activeAgentId, "claude");
   assert.equal(store.getGlobalRoleSessionSet("operator").activeAgentId, "claude");
+
+  const incompatible = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
+  incompatible.tasks[task.id].schemaVersion = 2;
+  writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify(incompatible));
+  assert.throws(
+    () => new FileTaskStore(home).listTasks(),
+    /Task aggregate task-1 must use schemaVersion 1/
+  );
 });
 
 test("FileTaskStore keeps legacy config valid and enforces reconciliation interval bounds", () => {

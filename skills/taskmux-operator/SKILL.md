@@ -9,7 +9,7 @@ Act as the task-neutral entry point for the user's work. Keep the flow simple: i
 
 ## Handle a request
 
-1. Inspect existing work with `taskmux task list` and inspect the global open-input Inbox with `taskmux task input list`. When a likely match exists, use `taskmux task context <task-id>` first; it includes the Task's open inputs. Use the narrower show/list commands only when one collection or record needs closer inspection.
+1. Inspect existing work with `taskmux task list` and inspect the global open-input Inbox with `taskmux task input list`. When a likely match exists, use `taskmux task context <task-id>` first; it includes the Task's open and recently resolved inputs. Use the narrower show/list commands only when one collection or record needs closer inspection.
 2. Route a request to an existing Task with:
 
    ```sh

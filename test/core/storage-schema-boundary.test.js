@@ -34,7 +34,7 @@ function writeManifest(home, overrides = {}) {
 test("storage inspection keeps layout and aggregate schema versions separate", () => {
   const home = temporaryHome();
   assert.equal(CURRENT_STORAGE_SCHEMA_VERSION, CURRENT_STORAGE_LAYOUT_VERSION);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 3);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 1);
   assert.deepEqual(STORAGE_MIGRATIONS, []);
 
   writeManifest(home);
@@ -52,32 +52,29 @@ test("storage inspection keeps layout and aggregate schema versions separate", (
   assert.doesNotThrow(() => requireStorageSchema(home));
 });
 
-test("the initial v5 aggregate remains version 1 and is never mistaken for current", () => {
+test("a manifest without an aggregate version is invalid in this fresh-only release", () => {
   const home = temporaryHome();
   writeManifest(home, { aggregateSchemaVersion: undefined });
 
-  assert.deepEqual(inspectStorageSchema(home), {
-    status: "unsupported",
-    incompatibleComponent: "aggregate",
-    direction: "older",
-    currentVersion: 1,
-    latestVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-    currentLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
+  const state = inspectStorageSchema(home);
+  assert.deepEqual(state, {
+    status: "invalid",
+    latestVersion: CURRENT_STORAGE_LAYOUT_VERSION,
     latestLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-    currentAggregateSchemaVersion: 1,
     latestAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-    manifestPath: join(home, "schema.json")
+    manifestPath: join(home, "schema.json"),
+    detail: "Storage schema manifest is missing field: aggregateSchemaVersion"
   });
-  assert.throws(() => requireStorageSchema(home), /aggregate schema 1 is older/i);
+  assert.throws(() => requireStorageSchema(home), /missing field: aggregateSchemaVersion/i);
 });
 
-test("aggregate schema 2 is rejected because this release has no historical migration", () => {
+test("every aggregate schema version other than 1 is rejected", () => {
   const home = temporaryHome();
   writeManifest(home, { aggregateSchemaVersion: 2 });
 
   assert.throws(
     () => requireStorageSchema(home),
-    /aggregate schema 2 is older.*no migration/i
+    /aggregate schema 2 is newer than supported.*version 1/i
   );
 });
 

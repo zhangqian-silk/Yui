@@ -57,7 +57,7 @@ taskmux task context <task-id>
 taskmux task activate <task-id>
 ```
 
-Use `task context` as the first detailed read of an existing Task. It combines the Task, Brief, active Decisions, recent Milestones, Roles, current and recent WorkItems with their Runs, recent Messages, and recent Events. Terminal output keeps histories and long text compact; `taskmux --json task context <task-id>` returns the complete records in the top-level `data` field.
+Use `task context` as the first detailed read of an existing Task. It combines the Task, Brief, active Decisions, recent Milestones, Roles, current and recent WorkItems with their Runs, recent Messages, open and resolved InputRequests, and recent Events. Terminal output keeps histories and long text compact; `taskmux --json task context <task-id>` returns the complete records in the top-level `data` field.
 
 Activation queues the first durable Leader wake. For a repository-backed Task, the Controller first creates one worktree per Role at `<TASKMUX_HOME>/worktrees/<task-id>/<role-name>` on `taskmux/<task-id>/<role-name>`, then starts the Leader. Roles added later receive their own worktree before delivery.
 
