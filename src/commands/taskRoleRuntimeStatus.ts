@@ -11,6 +11,7 @@ export type TaskRoleHealth =
   | "starting"
   | "running"
   | "ready"
+  | "blocked-input"
   | "needs-attention"
   | "failed";
 
@@ -32,6 +33,7 @@ export type TaskRoleRuntimeStatus = Readonly<{
   agentId: string;
   health: TaskRoleHealth;
   healthReason: string;
+  openInputRequestCount: number;
   role: TaskRole;
   activeRun: AgentRun | null;
   activeWork: WorkItem | null;
@@ -46,6 +48,8 @@ export function inspectTaskRoleRuntimeStatuses(
   store: TaskStore,
   panes: readonly TmuxRolePaneState[]
 ): TaskRoleRuntimeStatus[] {
+  const openInputRequestCount = store.listInputRequests(taskId)
+    .filter((request) => request.status === "open").length;
   const panesByRole = new Map<string, TmuxRolePaneState>();
   for (const pane of panes) {
     const current = panesByRole.get(pane.roleName);
@@ -55,7 +59,8 @@ export function inspectTaskRoleRuntimeStatuses(
     taskId,
     role,
     store,
-    panesByRole.get(role.name)
+    panesByRole.get(role.name),
+    openInputRequestCount
   ));
 }
 
@@ -89,6 +94,7 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
     "",
     `  Health           ${status.health}`,
     `  Reason           ${status.healthReason}`,
+    `  Open inputs      ${status.openInputRequestCount}`,
     `  Agent            ${status.agentId}`,
     `  Role state       ${status.role.status}`,
     `  Active work      ${activeWork}`,
@@ -106,9 +112,13 @@ export function taskRoleActiveWorkLabel(status: TaskRoleRuntimeStatus): string {
 }
 
 export function taskRoleNativeSessionLabel(status: TaskRoleRuntimeStatus): string {
-  return status.nativeSession === null
-    ? "not recorded"
-    : `${status.nativeSession.status}: ${status.nativeSession.nativeSessionId}`;
+  return status.nativeSession?.status ?? "unbound";
+}
+
+export function taskRoleOpenInputLabel(status: TaskRoleRuntimeStatus): string {
+  return status.roleName === "leader" && status.openInputRequestCount > 0
+    ? String(status.openInputRequestCount)
+    : "-";
 }
 
 export function taskRoleTmuxLabel(status: TaskRoleRuntimeStatus): string {
@@ -122,7 +132,8 @@ function inspectTaskRoleRuntimeStatus(
   taskId: string,
   role: TaskRole,
   store: TaskStore,
-  pane: TmuxRolePaneState | undefined
+  pane: TmuxRolePaneState | undefined,
+  openInputRequestCount: number
 ): TaskRoleRuntimeStatus {
   const activeRun = store.getActiveAgentRun(taskId, role.name);
   const activeWork = activeRun?.workItemId === undefined
@@ -143,12 +154,19 @@ function inspectTaskRoleRuntimeStatus(
   const workspace: TaskRoleWorkspaceStatus = managedWorkspace === null
     ? { managed: false, path: role.workspace }
     : { ...managedWorkspace, managed: true };
-  const health = calculateHealth(role, activeRun, nativeSession, tmux);
+  const health = calculateHealth(
+    role,
+    activeRun,
+    nativeSession,
+    tmux,
+    openInputRequestCount
+  );
   return {
     taskId,
     roleName: role.name,
     agentId: role.activeAgentId,
     ...health,
+    openInputRequestCount,
     role,
     activeRun,
     activeWork,
@@ -162,7 +180,8 @@ function calculateHealth(
   role: TaskRole,
   activeRun: AgentRun | null,
   nativeSession: RoleAgentSession | null,
-  tmux: TaskRoleTmuxStatus
+  tmux: TaskRoleTmuxStatus,
+  openInputRequestCount: number
 ): Pick<TaskRoleRuntimeStatus, "health" | "healthReason"> {
   if (role.status === "failed" || role.status === "exited") {
     return { health: "failed", healthReason: `persisted Role state is ${role.status}` };
@@ -180,14 +199,11 @@ function calculateHealth(
         healthReason: `the active Run conflicts with persisted Role state ${role.status}`
       };
     }
-    if (activeRun.deliveredAt === undefined) {
-      return { health: "starting", healthReason: "the active Run is awaiting tmux delivery" };
+    if (activeRun.deliveredAt !== undefined && tmux.state !== "running") {
+      return { health: "needs-attention", healthReason: "the delivered active Run has no live tmux pane" };
     }
-    return tmux.state === "running"
-      ? { health: "running", healthReason: "the active Run has a live tmux pane" }
-      : { health: "needs-attention", healthReason: "the delivered active Run has no live tmux pane" };
   }
-  if (role.status === "running") {
+  if (activeRun === null && role.status === "running") {
     return { health: "needs-attention", healthReason: "the Role is running without an active Run" };
   }
   if (nativeSession?.status === "running" && tmux.state !== "running") {
@@ -195,6 +211,17 @@ function calculateHealth(
   }
   if (nativeSession?.status === "stopped" && tmux.state === "running") {
     return { health: "needs-attention", healthReason: "a stopped native session has a live tmux pane" };
+  }
+  if (role.name === "leader" && openInputRequestCount > 0) {
+    return {
+      health: "blocked-input",
+      healthReason: `${openInputRequestCount} open InputRequest${openInputRequestCount === 1 ? "" : "s"} require user input`
+    };
+  }
+  if (activeRun !== null) {
+    return activeRun.deliveredAt === undefined
+      ? { health: "starting", healthReason: "the active Run is awaiting tmux delivery" }
+      : { health: "running", healthReason: "the active Run has a live tmux pane" };
   }
   return tmux.state === "running"
     ? { health: "ready", healthReason: "the native Agent pane is ready without active work" }

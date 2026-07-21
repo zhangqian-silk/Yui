@@ -77,6 +77,7 @@ import {
   renderTaskRoleRuntimeStatus,
   taskRoleActiveWorkLabel,
   taskRoleNativeSessionLabel,
+  taskRoleOpenInputLabel,
   taskRoleTmuxLabel
 } from "./taskRoleRuntimeStatus.js";
 import {
@@ -661,6 +662,7 @@ function listTaskRoles(
       { header: "Role", minWidth: 4, maxWidth: 24 },
       { header: "Agent", minWidth: 5, maxWidth: 20 },
       { header: "Health", minWidth: 6, maxWidth: 15 },
+      { header: "Open input", minWidth: 5, maxWidth: 10 },
       { header: "Active work", minWidth: 10, maxWidth: 34 },
       { header: "Native session", minWidth: 10, maxWidth: 28 },
       { header: "tmux", minWidth: 6, maxWidth: 22 }
@@ -669,6 +671,7 @@ function listTaskRoles(
       status.roleName,
       status.agentId,
       status.health,
+      taskRoleOpenInputLabel(status),
       taskRoleActiveWorkLabel(status),
       taskRoleNativeSessionLabel(status),
       taskRoleTmuxLabel(status)

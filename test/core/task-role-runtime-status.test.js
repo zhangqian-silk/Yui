@@ -11,6 +11,7 @@ import {
   createRoleSessionSet,
   recordRoleAgentSession
 } from "../../dist/executor/agentExecutor.js";
+import { createInputRequest } from "../../dist/input/inputRequest.js";
 import {
   createGlobalRole,
   createRoleAgentBinding
@@ -97,8 +98,10 @@ test("Task Role list uses one tmux snapshot and returns structured runtime summa
   const before = readFileSync(join(root, "state.json"), "utf8");
   const result = execute(["role", "list", task.id], store, options);
   assert.deepEqual(paneReads, [task.id]);
-  assert.match(result.output, /Agent\s+Health\s+Active work\s+Native session\s+tmux/);
+  assert.match(result.output, /Agent\s+Health\s+Open input\s+Active work\s+Native session\s+tmux/);
   assert.match(result.output, /worker\s+codex\s+running/);
+  assert.match(result.output, /running/);
+  assert.doesNotMatch(result.output, /thread-worker/);
   assert.equal(result.data.roles.length, 2);
   const worker = result.data.roles.find((role) => role.roleName === "worker");
   assert.equal(worker.health, "running");
@@ -112,6 +115,8 @@ test("Task Role list uses one tmux snapshot and returns structured runtime summa
     pid: 4321,
     currentCommand: "codex"
   });
+  const status = execute(["role", "status", task.id, "worker"], store, options);
+  assert.match(status.output, /thread-worker/);
   assert.equal(readFileSync(join(root, "state.json"), "utf8"), before);
 });
 
@@ -186,6 +191,55 @@ test("Task Role health distinguishes queued, orphaned delivered, and exited runt
   };
   assert.equal(
     execute(["role", "status", task.id, "worker"], store, deadPane).data.role.health,
+    "failed"
+  );
+});
+
+test("an open InputRequest blocks a healthy Leader and exposes only its count", (t) => {
+  const { store, options } = fixture(t);
+  execute(["create", "Await user"], store, options);
+  const task = store.listTasks()[0];
+  const request = createInputRequest(
+    store.nextInputRequestId(task.id),
+    task.id,
+    { roleName: "leader", agentId: "codex", runId: "run-origin" },
+    { question: "Choose the rollout?", choices: [], blockedRefs: [] },
+    NOW
+  );
+  store.saveInputRequest(task.id, request);
+  const noPanes = {
+    ...options,
+    runtime: { ...options.runtime, inspectTaskRolePanes: () => [] }
+  };
+
+  const status = execute(["role", "status", task.id, "leader"], store, noPanes);
+  assert.equal(status.data.role.health, "blocked-input");
+  assert.equal(status.data.role.openInputRequestCount, 1);
+  assert.match(status.output, /Health\s+blocked-input/);
+  assert.match(status.output, /Open inputs\s+1/);
+  assert.doesNotMatch(status.output, /Choose the rollout/);
+
+  const list = execute(["role", "list", task.id], store, noPanes);
+  assert.match(list.output, /Open input/);
+  assert.match(list.output, /leader\s+codex\s+blocked-input\s+1/);
+  assert.equal(list.data.roles[0].openInputRequestCount, 1);
+  assert.equal(Object.hasOwn(list.data.roles[0], "inputRequests"), false);
+
+  const deadLeader = {
+    ...options,
+    runtime: {
+      ...options.runtime,
+      inspectTaskRolePanes: () => [{
+        taskId: task.id,
+        roleName: "leader",
+        target: `${task.id}:leader`,
+        dead: true,
+        currentCommand: "codex"
+      }]
+    }
+  };
+  assert.equal(
+    execute(["role", "status", task.id, "leader"], store, deadLeader).data.role.health,
     "failed"
   );
 });
