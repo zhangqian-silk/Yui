@@ -279,7 +279,38 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
   {
     commandPath: ["jobs", "retry"],
     selectors: [{ argumentIndex: 2, entity: "job", provider: "jobs", actionTarget: true }]
-  }
+  },
+  ...([
+    ["brief", "show"],
+    ["brief", "update"],
+    ["decision", "record"],
+    ["decision", "list"],
+    ["decision", "show"],
+    ["decision", "supersede"],
+    ["milestone", "add"],
+    ["milestone", "list"],
+    ["milestone", "show"],
+    ["event", "list"],
+    ["event", "show"]
+  ] as const).map(([group, command]): InteractionPolicy => {
+    const trailingOptions: Record<string, TrailingOptionKind> = {};
+    if (group === "brief" && command === "update") {
+      Object.assign(trailingOptions, { "--objective": "value", "--boundary": "value", "--focus": "value", "--leader-summary": "value", "--updated-by": "value" });
+    } else if (group === "decision" && command === "record") {
+      Object.assign(trailingOptions, { "--title": "value", "--rationale": "value" });
+    } else if (group === "decision" && command === "list") {
+      Object.assign(trailingOptions, { "--status": "value" });
+    } else if (group === "decision" && command === "supersede") {
+      Object.assign(trailingOptions, { "--reason": "value" });
+    } else if (group === "milestone" && command === "add") {
+      Object.assign(trailingOptions, { "--title": "value", "--summary": "value" });
+    }
+    return {
+      commandPath: ["task", group, command],
+      selectors: [{ argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true }],
+      ...(Object.keys(trailingOptions).length > 0 ? { trailingOptions } : {})
+    };
+  })
 ]);
 
 export function findInteractionPolicy(
