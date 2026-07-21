@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -152,6 +153,40 @@ test("Task metadata can be updated and is visible in Task details", (t) => {
   );
   run(["update", task.id, "--due-at", "2026-07-31T20:00:00+08:00"], store, options);
   assert.equal(store.getTask(task.id).dueAt, "2026-07-31T12:00:00.000Z");
+});
+
+test("Task list and show emit one-pass structured JSON for Agents", (t) => {
+  const { root, store, options } = fixture(t);
+  const task = createTask(store, options, "Agent-readable task");
+  const runCli = (...args) => JSON.parse(execFileSync(
+    process.execPath,
+    [join(process.cwd(), "dist", "cli.js"), "--json", ...args],
+    {
+      encoding: "utf8",
+      env: { ...process.env, TASKMUX_HOME: root }
+    }
+  ));
+
+  assert.deepEqual(runCli("task", "list"), {
+    ok: true,
+    data: { tasks: [task] }
+  });
+  assert.deepEqual(runCli("task", "show", task.id), {
+    ok: true,
+    data: {
+      task,
+      counts: {
+        roles: 1,
+        messages: 0,
+        decisions: 0,
+        milestones: 0,
+        events: 1,
+        workItems: 0,
+        runs: 0
+      },
+      hasBrief: false
+    }
+  });
 });
 
 test("Task lifecycle and messages append a durable Web timeline", (t) => {

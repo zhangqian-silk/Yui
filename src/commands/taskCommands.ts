@@ -74,7 +74,7 @@ import {
 const LEADER_ROLE = "leader";
 
 export type TaskCommandExecution =
-  | Readonly<{ kind: "output"; output: string }>
+  | Readonly<{ kind: "output"; output: string; data?: unknown }>
   | Readonly<{
       kind: "enter";
       taskId: string;
@@ -110,8 +110,8 @@ export function runTaskCommand(
   switch (command) {
     case "create": return output(createTaskCommand(rest, store, options));
     case "update": return output(updateTaskCommand(rest, store, options));
-    case "list": return output(listTaskCommand(rest, store));
-    case "show": return output(showTaskCommand(rest, store));
+    case "list": return listTaskCommand(rest, store);
+    case "show": return showTaskCommand(rest, store);
     case "activate": return output(activateTaskCommand(rest, store, options));
     case "complete": return output(completeTaskCommand(rest, store, options));
     case "reopen": return output(reopenTaskCommand(rest, store, options));
@@ -272,24 +272,26 @@ function createTaskAggregate(
   return { task, leader };
 }
 
-function listTaskCommand(args: string[], store: TaskWorkflowStore): string {
+function listTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandExecution {
   assertNoArguments(args, "Task list usage: taskmux task list.");
   const tasks = store.listTasks();
-  if (tasks.length === 0) return "No tasks found.\n";
-  return `${renderTable(
-    "Tasks",
-    [
-      { header: "Task", minWidth: 6, maxWidth: 20 },
-      { header: "Status", minWidth: 6, maxWidth: 10 },
-      { header: "Title", minWidth: 8, maxWidth: 64 },
-      { header: "Repository", minWidth: 10, maxWidth: 24 }
-    ],
-    tasks.map((task) => [task.id, task.status, task.title, task.repositoryId ?? "-"]),
-    defaultTableWidth()
-  )}\n`;
+  const rendered = tasks.length === 0
+    ? "No tasks found.\n"
+    : `${renderTable(
+        "Tasks",
+        [
+          { header: "Task", minWidth: 6, maxWidth: 20 },
+          { header: "Status", minWidth: 6, maxWidth: 10 },
+          { header: "Title", minWidth: 8, maxWidth: 64 },
+          { header: "Repository", minWidth: 10, maxWidth: 24 }
+        ],
+        tasks.map((task) => [task.id, task.status, task.title, task.repositoryId ?? "-"]),
+        defaultTableWidth()
+      )}\n`;
+  return output(rendered, { tasks });
 }
 
-function showTaskCommand(args: string[], store: TaskWorkflowStore): string {
+function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandExecution {
   const [taskId] = args;
   exactPositionals(args, 1, "Task show usage: taskmux task show <id>.");
   const task = requireTask(store, taskId);
@@ -301,7 +303,16 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): string {
   const events = store.listEvents(task.id);
   const work = store.listWorkItems(task.id);
   const runs = store.listAgentRuns(task.id);
-  return [
+  const counts = {
+    roles: roles.length,
+    messages: messages.length,
+    decisions: decisions.length,
+    milestones: milestones.length,
+    events: events.length,
+    workItems: work.length,
+    runs: runs.length
+  };
+  const rendered = [
     `Task: ${task.id}`,
     `Title: ${task.title}`,
     `Status: ${task.status}`,
@@ -315,17 +326,18 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): string {
     ...(task.repositoryId === undefined ? [] : [`Repository: ${task.repositoryId}`]),
     ...(task.baseRef === undefined ? [] : [`Base: ${task.baseRef}`]),
     ...(task.cwd === undefined ? [] : [`Workspace: ${task.cwd}`]),
-    `Roles: ${roles.length}`,
-    `Messages: ${messages.length}`,
+    `Roles: ${counts.roles}`,
+    `Messages: ${counts.messages}`,
     `Brief: ${brief === null ? "no" : "yes"}`,
-    `Decisions: ${decisions.length}`,
-    `Milestones: ${milestones.length}`,
-    `Events: ${events.length}`,
-    `Work items: ${work.length}`,
-    `Runs: ${runs.length}`,
+    `Decisions: ${counts.decisions}`,
+    `Milestones: ${counts.milestones}`,
+    `Events: ${counts.events}`,
+    `Work items: ${counts.workItems}`,
+    `Runs: ${counts.runs}`,
     `Created: ${task.createdAt}`,
     `Updated: ${task.updatedAt}`
   ].join("\n").concat("\n");
+  return output(rendered, { task, counts, hasBrief: brief !== null });
 }
 
 function activateTaskCommand(
@@ -1613,8 +1625,10 @@ function titleFrom(body: string): string {
   return oneLine.length <= 80 ? oneLine : `${oneLine.slice(0, 77)}...`;
 }
 
-function output(value: string): TaskCommandExecution {
-  return { kind: "output", output: value };
+function output(value: string, data?: unknown): TaskCommandExecution {
+  return data === undefined
+    ? { kind: "output", output: value }
+    : { kind: "output", output: value, data };
 }
 
 function clock(options: TaskCommandOptions): Date {

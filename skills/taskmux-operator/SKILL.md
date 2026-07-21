@@ -26,6 +26,7 @@ Act as the task-neutral entry point for the user's work. Keep the flow simple: i
 5. Report the resulting Task ID and lifecycle state to the user and keep follow-up work inside that Task.
 
 Use `taskmux --json ...` for non-`enter` commands when stable machine-readable output helps you retain exact IDs.
+Structured reads such as `task list` and `task show` return their payload in the top-level `data` field; consume that field directly instead of parsing terminal text from `output`.
 
 ## Repositories and direct Task creation
 

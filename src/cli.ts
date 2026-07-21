@@ -240,7 +240,7 @@ export async function main(): Promise<void> {
     }
     const result = runTaskCommand(resolved.slice(1), store, { runtime, environment: process.env, json: jsonOutput });
     if (result.kind === "output") {
-      emit(result.output);
+      emit(result.output, false, result.data);
       return;
     }
     if (result.output !== undefined) emit(result.output);
@@ -440,10 +440,12 @@ function completionSelectionPorts(home: string): SelectionPorts {
   return selectionPorts(readableStore(home));
 }
 
-function emit(output: string, literal = false): void {
+function emit(output: string, literal = false, data?: unknown): void {
   const normalized = literal ? output.trimEnd() : output.trimEnd();
   process.stdout.write(`${jsonOutput
-    ? JSON.stringify({ ok: true, output: normalized })
+    ? JSON.stringify(data === undefined
+        ? { ok: true, output: normalized }
+        : { ok: true, data })
     : normalized}\n`);
 }
 
