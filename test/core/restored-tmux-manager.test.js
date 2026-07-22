@@ -6,7 +6,8 @@ import {
   TmuxDeliveryPump,
   TmuxManager,
   TmuxReadinessProbeRequiredError,
-  TmuxReadinessTimeoutError
+  TmuxReadinessTimeoutError,
+  yuiTmuxSessionName
 } from "../../dist/tmux/tmuxManager.js";
 
 class TtyInput extends PassThrough {
@@ -25,7 +26,7 @@ class TtyInput extends PassThrough {
   }
 }
 
-test("restored tmux attach owns the terminal after an exclusive handoff", () => {
+test("restored tmux attach uses client-local native terminal scrollback", () => {
   const input = new TtyInput();
   const calls = [];
   const manager = new TmuxManager("tmux-test", {
@@ -42,10 +43,20 @@ test("restored tmux attach owns the terminal after an exclusive handoff", () => 
   manager.attachRole("task-1", "leader");
 
   assert.deepEqual(input.events, ["close", "raw:false", "pause"]);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].args[0], "attach-session");
-  assert.equal(calls[0].options.inheritStdio, true);
-  assert.deepEqual(calls[0].inputEvents, input.events);
+  const session = yuiTmuxSessionName("/tmp/yui-home", "task-1");
+  assert.deepEqual(calls.slice(0, 2).map(({ args }) => args), [
+    ["set-option", "-t", session, "status", "off"],
+    ["set-option", "-t", session, "mouse", "off"]
+  ]);
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2].args[0], "-T");
+  assert.match(calls[2].args[1], /(?:^|,)256,RGB(?:,|$)/);
+  assert.deepEqual(calls[2].args.slice(-3), [
+    "attach-session", "-t", `${session}:leader`
+  ]);
+  assert.equal(calls[2].options.inheritStdio, true);
+  assert.equal(calls[2].options.environment.TERM, "ansi");
+  assert.deepEqual(calls[2].inputEvents, input.events);
 });
 
 test("sendRoleInputOnce probes readiness and applies a pane receipt in one tmux command", () => {
