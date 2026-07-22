@@ -524,7 +524,8 @@ function launchCommand(launch: TmuxLaunchPlan): string[] {
 
 function isExplicitlyAbsentTmuxSession(error: unknown): boolean {
   if (!(error instanceof CommandExecutionError)) return false;
-  return /can't find (?:session|window|pane)|no server running/i.test(error.stderr);
+  return /can't find (?:session|window|pane)|no server running|error connecting to .+ \(No such file or directory\)/i
+    .test(error.stderr);
 }
 
 function tmuxWord(value: string): string {
