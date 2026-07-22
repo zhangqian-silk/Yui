@@ -22,6 +22,7 @@ import {
   yuiTmuxTarget,
   TmuxManager
 } from "../../dist/tmux/tmuxManager.js";
+import { CommandExecutionError } from "../../dist/tmux/commandExecutor.js";
 
 const NOW = new Date("2026-07-21T12:00:00.000Z");
 
@@ -296,4 +297,18 @@ test("Tmux Role inspection reads all panes in one command and never captures pan
   ]);
   assert.equal(calls.length, 1);
   assert.equal(calls.some(({ args }) => args.includes("capture-pane")), false);
+});
+
+test("Tmux Role inspection treats an unopened tmux server as an empty snapshot", () => {
+  const tmux = new TmuxManager("tmux-test", {
+    run() {
+      throw new CommandExecutionError(
+        "COMMAND_FAILED",
+        1,
+        "error connecting to /tmp/tmux-1001/default (No such file or directory)\n"
+      );
+    }
+  }, { yuiHome: "/tmp/yui-role-status" });
+
+  assert.deepEqual(tmux.inspectTaskRolePanes("task-1"), []);
 });
