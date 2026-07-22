@@ -26,6 +26,11 @@ jobs:
       - name: Install
         run: npm ci
 
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux
+
       - name: Verify release tag
         run: npm run verify:release-tag
 
