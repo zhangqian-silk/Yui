@@ -55,7 +55,7 @@ jobs:
           node -e 'const {execFileSync}=require("node:child_process"); const pkg=JSON.parse(execFileSync("tar",["-xOf","yui-runtime.tgz","package/package.json"],{encoding:"utf8"})); if (pkg.private !== false || "scripts" in pkg || "devDependencies" in pkg) throw new Error("runtime manifest must be publishable and lifecycle-free");'
           grep -qx 'package/dist/cli.js' package-files.txt
           grep -qx 'package/dist/cli/commandCatalog.js' package-files.txt
-          grep -qx 'package/dist/core/controllerMain.js' package-files.txt
+          grep -qx 'package/dist/controller/controllerMain.js' package-files.txt
           grep -qx 'package/dist/output/terminal.js' package-files.txt
           grep -qx 'package/ARCHITECTURE.md' package-files.txt
           grep -qx 'package/i18n/README.zh-CN.md' package-files.txt

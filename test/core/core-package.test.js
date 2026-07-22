@@ -111,6 +111,7 @@ test("publish builds once and smokes the same package on Node 20, 22, and 24", (
   assert.match(workflow, /npm run lint/u);
   assert.match(workflow, /apt-get install --yes tmux/u);
   assert.match(workflow, /dist\/cli\/commandCatalog\.js/u);
+  assert.match(workflow, /dist\/controller\/controllerMain\.js/u);
   assert.match(workflow, /dist\/output\/terminal\.js/u);
   assert.doesNotMatch(workflow, /native-prebuild|prebuilds\/|smoke-native|build:native/u);
   assert.match(smoke, /nested help/u);
