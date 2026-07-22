@@ -122,4 +122,4 @@ jobs:
           path: release-artifact
 
       - name: Publish tested package
-        run: npm publish release-artifact/yui-runtime.tgz --access public --provenance
+        run: npm publish ./release-artifact/yui-runtime.tgz --access public --provenance
