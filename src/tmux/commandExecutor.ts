@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 export type CommandRunOptions = Readonly<{
   inheritStdio?: boolean;
   timeoutMs?: number;
+  environment?: Readonly<Record<string, string | undefined>>;
 }>;
 
 export type CommandExecutor = Readonly<{
@@ -27,7 +28,12 @@ export class CommandExecutionError extends Error {
 
 export class NodeCommandExecutor implements CommandExecutor {
   run(command: string, args: string[], options: CommandRunOptions = {}): string {
-    const common = options.timeoutMs === undefined ? {} : { timeout: options.timeoutMs };
+    const common = {
+      ...(options.timeoutMs === undefined ? {} : { timeout: options.timeoutMs }),
+      ...(options.environment === undefined
+        ? {}
+        : { env: { ...process.env, ...options.environment } })
+    };
     const result = options.inheritStdio === true
       ? spawnSync(command, args, { ...common, stdio: "inherit" })
       : spawnSync(command, args, {

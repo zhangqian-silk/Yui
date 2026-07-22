@@ -7,6 +7,11 @@ import { CommandExecutionError, type CommandExecutor } from "./commandExecutor.j
 
 const DEFAULT_READINESS_TIMEOUT_MS = 15_000;
 const DEFAULT_READINESS_POLL_MS = 50;
+const NATIVE_SCROLL_TERMINAL_FEATURES = [
+  "256", "RGB", "clipboard", "ccolour", "cstyle", "extkeys", "focus",
+  "hyperlinks", "ignorefkeys", "mouse", "osc7", "overline", "rectfill",
+  "strikethrough", "sync", "title", "usstyle"
+].join(",");
 
 export type TmuxRole = Readonly<{
   name: string;
@@ -160,10 +165,24 @@ export class TmuxManager {
   }
 
   attachRole(taskId: string, roleName: string): void {
+    const session = this.sessionName(taskId);
+    // An ANSI outer terminal omits smcup/rmcup, so tmux cannot replace the
+    // terminal's native scrollback with an alternate screen. -T restores the
+    // modern rendering and input capabilities that the real terminal offers.
+    this.executor.run(this.tmuxBin, [
+      "set-option", "-t", session, "status", "off"
+    ]);
+    this.executor.run(this.tmuxBin, [
+      "set-option", "-t", session, "mouse", "off"
+    ]);
     handoffTerminal(this.#terminalInput, this.#closeInteractiveInput);
     this.executor.run(this.tmuxBin, [
+      "-T", NATIVE_SCROLL_TERMINAL_FEATURES,
       "attach-session", "-t", this.target(taskId, roleName)
-    ], { inheritStdio: true });
+    ], {
+      inheritStdio: true,
+      environment: { TERM: "ansi" }
+    });
   }
 
   captureRole(taskId: string, roleName: string, lines = 80): string {
