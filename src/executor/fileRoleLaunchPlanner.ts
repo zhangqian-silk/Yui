@@ -161,13 +161,13 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
         args,
         env: {
           ...resolveAgentEnvironment(agent, this.#environment),
-          TASKMUX_HOME: resolve(this.home),
-          TASKMUX_SESSION_SCOPE: owner.scope,
-          ...(owner.scope === "task" ? { TASKMUX_TASK_ID: owner.taskId } : {}),
-          TASKMUX_ROLE: role.name,
-          TASKMUX_AGENT_ID: configured.id,
-          TASKMUX_ADAPTER_ID: configured.adapterId,
-          TASKMUX_WORKSPACE: role.workspace
+          YUI_HOME: resolve(this.home),
+          YUI_SESSION_SCOPE: owner.scope,
+          ...(owner.scope === "task" ? { YUI_TASK_ID: owner.taskId } : {}),
+          YUI_ROLE: role.name,
+          YUI_AGENT_ID: configured.id,
+          YUI_ADAPTER_ID: configured.adapterId,
+          YUI_WORKSPACE: role.workspace
         }
       },
       session

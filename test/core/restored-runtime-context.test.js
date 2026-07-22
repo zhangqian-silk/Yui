@@ -38,27 +38,27 @@ test("dispatch contexts contain the real assignment but no session-bind bootstra
     input: "implement the bounded change"
   });
 
-  assert.match(leader, /TaskMux Leader/);
+  assert.match(leader, /Yui Leader/);
   assert.match(leader, /Description: Lead the implementation/);
   assert.match(leader, /Constraint: Keep changes focused/);
   assert.match(leader, /decide the next step/);
-  assert.match(worker, /TaskMux Worker/);
+  assert.match(worker, /Yui Worker/);
   assert.doesNotMatch(`${leader}\n${worker}`, /session-bind|CODEX_THREAD_ID|session record/i);
 });
 
 test("Operator launch keeps Codex argv prompt-free and exposes instructions separately", (t) => {
-  const home = mkdtempSync(join(tmpdir(), "taskmux-operator-context-"));
+  const home = mkdtempSync(join(tmpdir(), "yui-operator-context-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const launch = prepareGlobalRoleLaunch({
     ...role,
     name: "operator",
     args: [],
     env: {}
-  }, { taskmuxHome: home, baseEnv: {} });
+  }, { yuiHome: home, baseEnv: {} });
 
   assert.deepEqual(launch.args, []);
-  assert.equal(launch.env.TASKMUX_ROLE, "operator");
+  assert.equal(launch.env.YUI_ROLE, "operator");
   assert.ok(launch.contextPath);
-  assert.match(readFileSync(launch.contextPath, "utf8"), /TaskMux Operator runtime/);
-  assert.match(launch.systemPrompt, /TaskMux Operator instructions/);
+  assert.match(readFileSync(launch.contextPath, "utf8"), /Yui Operator runtime/);
+  assert.match(launch.systemPrompt, /Yui Operator instructions/);
 });

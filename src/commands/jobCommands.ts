@@ -42,7 +42,7 @@ export function runJobCommand(
 }
 
 function listJobs(args: string[], store: TaskStore): string {
-  if (args.length !== 0) throw usageError("Jobs list usage: taskmux jobs list.");
+  if (args.length !== 0) throw usageError("Jobs list usage: yui jobs list.");
   const jobs = collectJobs(store);
   if (jobs.length === 0) return "No scheduler jobs found.\n";
   return `${renderTable(
@@ -103,7 +103,7 @@ function retryJob(
   options: JobCommandOptions
 ): string {
   if (args.length !== 1 || args[0].trim().length === 0) {
-    throw usageError("Jobs retry usage: taskmux jobs retry <id>.");
+    throw usageError("Jobs retry usage: yui jobs retry <id>.");
   }
   const id = args[0].trim();
   if (!id.startsWith(RECOVERY_PREFIX) || id.length === RECOVERY_PREFIX.length) {

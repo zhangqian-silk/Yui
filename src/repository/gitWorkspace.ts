@@ -139,7 +139,7 @@ export function worktreeIdentity(
   const roleKey = safeIdentity(roleName, "Role name");
   return {
     directory: join(taskKey, roleKey),
-    branch: `taskmux/${gitRefSegment(taskKey)}/${gitRefSegment(roleKey)}`
+    branch: `yui/${gitRefSegment(taskKey)}/${gitRefSegment(roleKey)}`
   };
 }
 

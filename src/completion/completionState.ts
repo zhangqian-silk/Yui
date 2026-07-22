@@ -134,7 +134,7 @@ export function managedCompletionScript(
 }
 
 export function completionMarker(shell: CompletionShell, identity: CliIdentity): string {
-  return `# taskmux-completion: managed shell=${shell} identity=${identity} format=1`;
+  return `# yui-completion: managed shell=${shell} identity=${identity} format=1`;
 }
 
 export function activationBlock(
@@ -153,11 +153,11 @@ export function activationBlock(
 }
 
 export function activationStart(shell: CompletionShell, identity: CliIdentity): string {
-  return `# >>> taskmux completion shell=${shell} identity=${identity} >>>`;
+  return `# >>> yui completion shell=${shell} identity=${identity} >>>`;
 }
 
 export function activationEnd(shell: CompletionShell, identity: CliIdentity): string {
-  return `# <<< taskmux completion shell=${shell} identity=${identity} <<<`;
+  return `# <<< yui completion shell=${shell} identity=${identity} <<<`;
 }
 
 export function activationIsAutomatic(

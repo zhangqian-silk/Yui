@@ -42,7 +42,7 @@ import { CliError, usageError } from "./errors/cliError.js";
 import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
 import { FileTaskWorkspacePreparer } from "./repository/taskWorkspacePreparer.js";
 import { inspectStorageSchema, requireStorageSchema } from "./storage/storageSchema.js";
-import { FileTaskStore, resolveTaskmuxHome } from "./storage/taskStore.js";
+import { FileTaskStore, resolveYuiHome } from "./storage/taskStore.js";
 import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
 import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
@@ -98,15 +98,15 @@ export async function main(): Promise<void> {
     );
   }
 
-  if (args[0] === "version") throw usageError("Version usage: taskmux version");
+  if (args[0] === "version") throw usageError("Version usage: yui version");
   if (args[0] === "update") {
     if (jsonOutput) throw usageError("Update does not support --json.");
-    if (args.length !== 1) throw usageError("Update usage: taskmux update");
+    if (args.length !== 1) throw usageError("Update usage: yui update");
     process.exitCode = runUpdateCommand();
     return;
   }
 
-  const home = resolveTaskmuxHome(process.env);
+  const home = resolveYuiHome(process.env);
   if (args[0] === "completion") {
     await completionCommand(home, invocation.node);
     return;
@@ -117,7 +117,7 @@ export async function main(): Promise<void> {
     const setupIo = {
       input: process.stdin,
       output: process.stdout,
-      forceInteractive: process.env.TASKMUX_SETUP_INTERACTIVE === "1"
+      forceInteractive: process.env.YUI_SETUP_INTERACTIVE === "1"
     };
     validateSetupInvocation(args.slice(1), setupIo);
     emit(await runSetupCommand(
@@ -151,7 +151,7 @@ export async function main(): Promise<void> {
   if (resolved[0] === "controller") {
     const method = resolved[1];
     if ((method !== "status" && method !== "stop" && method !== "restart") || resolved.length !== 2) {
-      throw usageError("Controller usage: taskmux controller status|stop|restart.");
+      throw usageError("Controller usage: yui controller status|stop|restart.");
     }
     const controllerMethod: "status" | "stop" | "restart" = method;
     const result = controllerMethod === "restart"
@@ -163,9 +163,9 @@ export async function main(): Promise<void> {
 
   const executor = new NodeCommandExecutor();
   const tmux = new TmuxManager(
-    process.env.TASKMUX_TMUX_BIN ?? "tmux",
+    process.env.YUI_TMUX_BIN ?? "tmux",
     executor,
-    { taskmuxHome: home, terminalInput: process.stdin }
+    { yuiHome: home, terminalInput: process.stdin }
   );
   const schedulerStore = new FileSchedulerStoreAdapter(store);
   const planner = new FileRoleLaunchPlanner(home, store, { environment: process.env });
@@ -196,7 +196,7 @@ export async function main(): Promise<void> {
   }
   if (resolved[0] === "role") {
     const roleOptions: GlobalRoleCommandOptions = {
-      taskmuxHome: home,
+      yuiHome: home,
       env: process.env
     };
     const result = runGlobalRoleCommand(
@@ -215,7 +215,7 @@ export async function main(): Promise<void> {
   }
   if (resolved[0] === "operator") {
     if (resolved[1] === "enter") {
-      if (resolved.length !== 2) throw usageError("Operator enter usage: taskmux operator enter.");
+      if (resolved.length !== 2) throw usageError("Operator enter usage: yui operator enter.");
       await ensureFileTaskController(home, { environment: process.env });
       runtime.prepareGlobalRoleEnter("operator");
       tmux.attachRole("operator", "operator");
@@ -292,7 +292,7 @@ async function completionCommand(
     const separator = args.indexOf("--");
     const prefix = args[2];
     if (prefix === undefined || separator !== 3) {
-      throw usageError("Completion candidates usage: taskmux completion candidates <prefix> -- <words...>");
+      throw usageError("Completion candidates usage: yui completion candidates <prefix> -- <words...>");
     }
     const candidates = await resolveCompletionCandidates({
       current: prefix,
@@ -309,7 +309,7 @@ async function completionCommand(
   }
   const shell = completionShell(args[1]);
   if (args.length > (shell === undefined ? 1 : 2)) {
-    throw usageError("Completion usage: taskmux completion [bash|zsh|fish]");
+    throw usageError("Completion usage: yui completion [bash|zsh|fish]");
   }
   requireStorageSchema(home);
   const store = new FileTaskStore(home);
@@ -472,7 +472,7 @@ function readPackageVersion(): string {
 }
 
 export function cliIdentity(env: NodeJS.ProcessEnv): CliIdentity {
-  return env.TASKMUX_CLI_NAME === "taskmux-dev" ? "taskmux-dev" : "taskmux";
+  return env.YUI_CLI_NAME === "yui-dev" ? "yui-dev" : "yui";
 }
 
 function normalizeAliases(input: readonly string[]): string[] {

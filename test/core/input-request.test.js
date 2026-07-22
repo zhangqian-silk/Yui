@@ -163,7 +163,7 @@ test("InputRequest domain supports text or choice answers and terminal transitio
 });
 
 function fixture(t) {
-  const root = mkdtempSync(join(tmpdir(), "taskmux-input-request-"));
+  const root = mkdtempSync(join(tmpdir(), "yui-input-request-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   ensureStorageSchema(root, FIRST);
   const store = new FileTaskStore(root);
@@ -228,12 +228,12 @@ function fixture(t) {
     tx.saveTaskRoleSessionSet(sessions);
   });
   const environment = {
-    TASKMUX_SESSION_SCOPE: "task",
-    TASKMUX_TASK_ID: task.id,
-    TASKMUX_ROLE: "leader",
-    TASKMUX_AGENT_ID: role.activeAgentId,
-    TASKMUX_RUN_ID: active.id,
-    TASKMUX_NATIVE_SESSION_ID: "native-1"
+    YUI_SESSION_SCOPE: "task",
+    YUI_TASK_ID: task.id,
+    YUI_ROLE: "leader",
+    YUI_AGENT_ID: role.activeAgentId,
+    YUI_RUN_ID: active.id,
+    YUI_NATIVE_SESSION_ID: "native-1"
   };
   return { root, store, task, role, active, changed, options: { ...options, environment } };
 }
@@ -291,7 +291,7 @@ test("Leader request releases its active fence and answer durably queues a resum
   const json = JSON.parse(execFileSync(
     process.execPath,
     [join(process.cwd(), "dist", "cli.js"), "--json", "task", "input", "list", "--all"],
-    { encoding: "utf8", env: { ...process.env, TASKMUX_HOME: root } }
+    { encoding: "utf8", env: { ...process.env, YUI_HOME: root } }
   ));
   assert.deepEqual(json, { ok: true, data: { requests: [answer.data.request] } });
 });
@@ -306,7 +306,7 @@ test("first Leader run can request input before a native session id is registere
     ));
   });
   const environment = { ...options.environment };
-  delete environment.TASKMUX_NATIVE_SESSION_ID;
+  delete environment.YUI_NATIVE_SESSION_ID;
 
   run(["input", "request", task.id, "--question", "First turn question?"], store, {
     ...options,
@@ -358,7 +358,7 @@ test("a pending wake cannot bypass open input and becomes dispatchable after ans
   run(["input", "answer", request.id, "--text", "Continue"], store, {
     ...options,
     now: () => new Date(SECOND),
-    environment: { TASKMUX_SESSION_SCOPE: "global", TASKMUX_ROLE: "operator" }
+    environment: { YUI_SESSION_SCOPE: "global", YUI_ROLE: "operator" }
   });
   assert.equal(store.getInputRequest(task.id, request.id).resolution.answeredBy, "operator");
   assert.ok(store.getPendingWakeup(task.id).reasons.includes(`input-answered:${request.id}`));
@@ -511,7 +511,7 @@ test("request provenance, blocked ownership, lifecycle, and origin-only cancel a
     "input", "request", task.id, "--question", "Forged"
   ], store, {
     ...options,
-    environment: { ...options.environment, TASKMUX_RUN_ID: "agent-run-forged" }
+    environment: { ...options.environment, YUI_RUN_ID: "agent-run-forged" }
   }), /active Leader Run/i);
   assert.throws(() => runTaskCommand([
     "input", "request", task.id,
@@ -533,7 +533,7 @@ test("request provenance, blocked ownership, lifecycle, and origin-only cancel a
     "input", "cancel", task.id, request.id, "--reason", "Forged"
   ], store, {
     ...options,
-    environment: { ...options.environment, TASKMUX_NATIVE_SESSION_ID: "native-forged" }
+    environment: { ...options.environment, YUI_NATIVE_SESSION_ID: "native-forged" }
   }), /originating Leader/i);
   run([
     "input", "cancel", task.id, request.id, "--reason", "No longer needed"

@@ -36,7 +36,7 @@ export async function ensureFileTaskController(
   const timeoutMs = positive(options.startupTimeoutMs, STARTUP_TIMEOUT_MS, "startupTimeoutMs");
   const pollMs = positive(options.pollIntervalMs, POLL_INTERVAL_MS, "pollIntervalMs");
   const spawnController = options.spawnController ?? spawnDetachedFileTaskController;
-  spawnController(home, { ...process.env, ...options.environment, TASKMUX_HOME: home });
+  spawnController(home, { ...process.env, ...options.environment, YUI_HOME: home });
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {

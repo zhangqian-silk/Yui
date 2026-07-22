@@ -6,23 +6,23 @@ export type AgentLaunchPlan = Readonly<{
   env: Readonly<Record<string, string>>;
 }>;
 
-export type TaskmuxLaunchRole = Readonly<{
+export type YuiLaunchRole = Readonly<{
   name: string;
   workspace: string;
   activeAgentId?: string;
   agent?: string;
 }>;
 
-export type TaskmuxLaunchRun = Readonly<{
+export type YuiLaunchRun = Readonly<{
   id: string;
   taskId: string;
 }>;
 
-export function withTaskmuxRunEnvironment(
+export function withYuiRunEnvironment(
   launch: AgentLaunchPlan,
-  taskmuxHome: string,
-  role: TaskmuxLaunchRole,
-  run: TaskmuxLaunchRun,
+  yuiHome: string,
+  role: YuiLaunchRole,
+  run: YuiLaunchRun,
   nativeSessionId?: string,
   nativeSessionRoot?: string
 ): AgentLaunchPlan {
@@ -30,14 +30,14 @@ export function withTaskmuxRunEnvironment(
     ...launch,
     env: {
       ...launch.env,
-      TASKMUX_HOME: taskmuxHome,
-      TASKMUX_TASK_ID: run.taskId,
-      TASKMUX_ROLE: role.name,
-      TASKMUX_AGENT_ID: role.activeAgentId ?? role.agent ?? "",
-      TASKMUX_RUN_ID: run.id,
-      TASKMUX_WORKSPACE: role.workspace,
-      ...(nativeSessionRoot === undefined ? {} : { TASKMUX_NATIVE_SESSION_ROOT: nativeSessionRoot }),
-      ...(nativeSessionId === undefined ? {} : { TASKMUX_NATIVE_SESSION_ID: nativeSessionId })
+      YUI_HOME: yuiHome,
+      YUI_TASK_ID: run.taskId,
+      YUI_ROLE: role.name,
+      YUI_AGENT_ID: role.activeAgentId ?? role.agent ?? "",
+      YUI_RUN_ID: run.id,
+      YUI_WORKSPACE: role.workspace,
+      ...(nativeSessionRoot === undefined ? {} : { YUI_NATIVE_SESSION_ROOT: nativeSessionRoot }),
+      ...(nativeSessionId === undefined ? {} : { YUI_NATIVE_SESSION_ID: nativeSessionId })
     }
   };
 }

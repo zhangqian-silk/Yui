@@ -86,7 +86,7 @@ test("update uses the exact shell-free published npm command", () => {
   });
   assert.equal(status, 7);
   assert.equal(invocation.command, "npm");
-  assert.deepEqual(invocation.args, ["install", "--global", "@zq-silk/taskmux@latest"]);
+  assert.deepEqual(invocation.args, ["install", "--global", "@zq-silk/yui@latest"]);
   assert.equal(invocation.options.shell, false);
   assert.equal(invocation.options.stdio, "inherit");
 });
@@ -95,7 +95,7 @@ test("Agent add preserves adapter args and environment names without secret valu
   const store = agentStore();
   const output = runAgentCommand([
     "add", "reviewer", "--adapter", "codex", "--command", "codex",
-    "--arg", "--verbose", "--arg", "2", "--env", "OPENAI_API_KEY=TASKMUX_OPENAI_KEY"
+    "--arg", "--verbose", "--arg", "2", "--env", "OPENAI_API_KEY=YUI_OPENAI_KEY"
   ], store);
   const agent = store.records.get("reviewer");
   assert.match(output, /Added agent reviewer/);
@@ -104,10 +104,10 @@ test("Agent add preserves adapter args and environment names without secret valu
   assert.deepEqual(agent.environment, [{
     target: "OPENAI_API_KEY",
     source: "process",
-    sourceName: "TASKMUX_OPENAI_KEY",
+    sourceName: "YUI_OPENAI_KEY",
     required: true
   }]);
-  assert.equal(JSON.stringify(agent).includes(process.env.TASKMUX_OPENAI_KEY ?? "never-present"), false);
+  assert.equal(JSON.stringify(agent).includes(process.env.YUI_OPENAI_KEY ?? "never-present"), false);
 });
 
 test("Agent update supports intentional clears and rejects ambiguous replacements", () => {
@@ -138,7 +138,7 @@ test("global Role enter returns a control result and binding preserves dormant s
     /Added role reviewer/
   );
   const control = runGlobalRoleCommand(["enter", "reviewer"], store, {
-    taskmuxHome: "/tmp/taskmux",
+    yuiHome: "/tmp/yui",
     env: {}
   });
   assert.equal(control.kind, "enter");

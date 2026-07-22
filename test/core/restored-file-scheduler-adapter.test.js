@@ -14,7 +14,7 @@ import { activateTask, archiveTask, createTask } from "../../dist/task/task.js";
 import { createWorkItem, updateWorkItemStatus } from "../../dist/workItem/workItem.js";
 
 function fixture(t) {
-  const home = mkdtempSync(join(tmpdir(), "taskmux-scheduler-store-"));
+  const home = mkdtempSync(join(tmpdir(), "yui-scheduler-store-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home);
   const store = new FileTaskStore(home);

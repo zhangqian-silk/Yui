@@ -7,7 +7,7 @@ export type TerminalInput = Pick<Readable, "pause"> & Readonly<{
 }>;
 
 /**
- * Release every TaskMux claim on a terminal before a foreground tmux client
+ * Release every Yui claim on a terminal before a foreground tmux client
  * inherits it. The optional close callback is expected to be idempotent.
  */
 export function handoffTerminal(

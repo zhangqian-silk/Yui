@@ -1,4 +1,0 @@
-interface:
-  display_name: "TaskMux Leader"
-  short_description: "Lead long-running TaskMux task execution"
-  default_prompt: "Use $taskmux-leader to advance this TaskMux task and coordinate its roles."

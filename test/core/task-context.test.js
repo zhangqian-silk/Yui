@@ -41,7 +41,7 @@ function atMinute(minute) {
 }
 
 function fixture(t) {
-  const root = mkdtempSync(join(tmpdir(), "taskmux-context-"));
+  const root = mkdtempSync(join(tmpdir(), "yui-context-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   ensureStorageSchema(root, NOW);
   const store = new FileTaskStore(root);
@@ -343,7 +343,7 @@ test("task context emits its structured payload in the CLI top-level data field"
   const response = JSON.parse(execFileSync(
     process.execPath,
     [join(process.cwd(), "dist", "cli.js"), "--json", "task", "context", task.id],
-    { encoding: "utf8", env: { ...process.env, TASKMUX_HOME: root } }
+    { encoding: "utf8", env: { ...process.env, YUI_HOME: root } }
   ));
 
   assert.equal(response.ok, true);

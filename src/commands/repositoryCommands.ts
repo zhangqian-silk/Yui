@@ -32,7 +32,7 @@ async function addRepository(
   store: RepositoryCommandStore,
   options: RepositoryCommandOptions
 ): Promise<string> {
-  const usage = "Repository add usage: taskmux repository add <name> <path> [--base <ref>].";
+  const usage = "Repository add usage: yui repository add <name> <path> [--base <ref>].";
   const parsed = parseAddArguments(args, usage);
   const git = options.git ?? new NodeGitWorkspace();
   const inspected = await git.inspect(parsed.path, parsed.baseRef ?? "HEAD");
@@ -58,7 +58,7 @@ async function addRepository(
 
 function listRepositories(args: readonly string[], store: RepositoryCommandStore): string {
   if (args.length !== 0) {
-    throw usageError("Repository list usage: taskmux repository list.");
+    throw usageError("Repository list usage: yui repository list.");
   }
   const repositories = store.listRepositories();
   if (repositories.length === 0) return "No repositories found.\n";

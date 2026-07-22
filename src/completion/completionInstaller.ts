@@ -107,7 +107,7 @@ function assertActivationRemovable(
   const starts = occurrences(contents, activationStart(shell, identity));
   const ends = occurrences(contents, activationEnd(shell, identity));
   if (starts !== ends || starts > 1) {
-    throw dataError(`Refusing to remove ambiguous TaskMux activation block: ${path}`);
+    throw dataError(`Refusing to remove ambiguous Yui activation block: ${path}`);
   }
 }
 
@@ -149,7 +149,7 @@ function writeActivationBlock(
   const starts = occurrences(contents, start);
   const ends = occurrences(contents, end);
   if (starts > 1 || ends > 1 || starts !== ends) {
-    throw dataError(`Refusing to modify ambiguous TaskMux activation block: ${path}`);
+    throw dataError(`Refusing to modify ambiguous Yui activation block: ${path}`);
   }
   const block = activationBlock(shell, installation, identity);
   const next = starts === 1
@@ -192,7 +192,7 @@ function removeActivationBlock(
   const starts = occurrences(contents, start);
   const ends = occurrences(contents, end);
   if (starts !== ends || starts > 1) {
-    throw dataError(`Refusing to remove ambiguous TaskMux activation block: ${path}`);
+    throw dataError(`Refusing to remove ambiguous Yui activation block: ${path}`);
   }
   if (starts === 0) return;
 
@@ -206,7 +206,7 @@ function removeActivationBlock(
 
 function writeAtomic(path: string, contents: string, mode: number): void {
   mkdirSync(dirname(path), { recursive: true });
-  const temp = join(dirname(path), `.${randomUUID()}.taskmux-pending`);
+  const temp = join(dirname(path), `.${randomUUID()}.yui-pending`);
   try {
     writeFileSync(temp, contents, { mode });
     chmodSync(temp, mode);
@@ -224,7 +224,7 @@ function replaceManagedBlock(
 ): string {
   const from = contents.indexOf(start);
   const to = contents.indexOf(end, from);
-  if (from < 0 || to < from) throw dataError("Invalid TaskMux activation block.");
+  if (from < 0 || to < from) throw dataError("Invalid Yui activation block.");
   return `${contents.slice(0, from)}${block}${contents.slice(to + end.length)}`;
 }
 

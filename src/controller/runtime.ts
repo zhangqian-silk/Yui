@@ -1,4 +1,4 @@
-import { reconciliationIntervalMilliseconds } from "../config/taskmuxConfig.js";
+import { reconciliationIntervalMilliseconds } from "../config/yuiConfig.js";
 import type { ControllerDispatcher } from "../core/controllerServer.js";
 import { ExecutorRegistry } from "../executor/executorRegistry.js";
 import { FileRoleLaunchPlanner } from "../executor/fileRoleLaunchPlanner.js";
@@ -48,9 +48,9 @@ export async function startFileTaskControllerRuntime(
     environment: options.environment
   });
   const tmux = options.tmux ?? new TmuxManager(
-    options.environment?.TASKMUX_TMUX_BIN ?? process.env.TASKMUX_TMUX_BIN ?? "tmux",
+    options.environment?.YUI_TMUX_BIN ?? process.env.YUI_TMUX_BIN ?? "tmux",
     new NodeCommandExecutor(),
-    { taskmuxHome: home }
+    { yuiHome: home }
   );
   const delivery = options.delivery ?? new ExecutorRegistry(planner, tmux);
   const workspacePreparer = options.workspacePreparer

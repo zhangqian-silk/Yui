@@ -55,7 +55,7 @@ test("switches crowded tables to readable records without exceeding the terminal
       { header: "Action", minWidth: 7, maxWidth: 7 },
       { header: "Script", minWidth: 8, maxWidth: 88 }
     ],
-    [["2", "Zsh", "Not installed", "Install", "/home/张三/.zfunc/_taskmux"]],
+    [["2", "Zsh", "Not installed", "Install", "/home/张三/.zfunc/_yui"]],
     38
   );
 
@@ -65,8 +65,7 @@ test("switches crowded tables to readable records without exceeding the terminal
     "  2  Zsh",
     "     Status  Not installed",
     "     Action  Install",
-    "     Script  /home/张三/.zfunc/_taskmu",
-    "             x"
+    "     Script  /home/张三/.zfunc/_yui"
   ].join("\n"));
   for (const line of output.split("\n")) {
     assert.ok(visibleWidth(line) <= 38, `${visibleWidth(line)}: ${line}`);
@@ -90,14 +89,14 @@ test("wraps CJK and long unbroken values by terminal display width", () => {
 });
 
 test("provides one reusable hierarchy for sections, details, code, prompts, and outcomes", () => {
-  assert.equal(renderSection("Setup", "Configure TaskMux"), "Setup\n  Configure TaskMux");
+  assert.equal(renderSection("Setup", "Configure Yui"), "Setup\n  Configure Yui");
   assert.equal(renderDetails([
-    ["Script", "/tmp/_taskmux"],
+    ["Script", "/tmp/_yui"],
     ["Activation", "/tmp/.zshrc"]
-  ]), "  Script      /tmp/_taskmux\n  Activation  /tmp/.zshrc");
+  ]), "  Script      /tmp/_yui\n  Activation  /tmp/.zshrc");
   assert.equal(renderCodeBlock("one\ntwo"), "  │ one\n  │ two");
   assert.equal(renderPrompt("Install using these paths?", "Y/n/customize"), "› Install using these paths? [Y/n/customize]: ");
-  assert.equal(renderSuccess("TaskMux setup complete."), "✓ TaskMux setup complete.\n");
+  assert.equal(renderSuccess("Yui setup complete."), "✓ Yui setup complete.\n");
   assert.equal(renderInfo("The current shell is unchanged."), "› The current shell is unchanged.\n");
   assert.equal(renderWarning("Activation still required."), "! Activation still required.\n");
   assert.equal(renderError("Doctor checks failed."), "✕ Doctor checks failed.\n");

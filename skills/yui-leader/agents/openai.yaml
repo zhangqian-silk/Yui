@@ -1,0 +1,4 @@
+interface:
+  display_name: "Yui Leader"
+  short_description: "Lead long-running Yui task execution"
+  default_prompt: "Use $yui-leader to advance this Yui task and coordinate its roles."

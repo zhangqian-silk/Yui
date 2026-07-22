@@ -15,7 +15,7 @@ const TERMINAL_WORK_ITEM_STATUSES = new Set([
 
 export function runTaskContextCommand(args: string[], store: TaskStore) {
   if (args.length !== 1 || args[0]?.trim().length === 0) {
-    throw usageError("Task context usage: taskmux task context <task>.");
+    throw usageError("Task context usage: yui task context <task>.");
   }
   const taskId = args[0].trim();
   const data = store.transaction((reader) => {

@@ -16,7 +16,7 @@ const NOW = new Date("2026-07-20T08:00:00.000Z");
 const LATER = new Date("2026-07-20T08:05:00.000Z");
 
 function fixture(t) {
-  const root = mkdtempSync(join(tmpdir(), "taskmux-knowledge-store-"));
+  const root = mkdtempSync(join(tmpdir(), "yui-knowledge-store-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   ensureStorageSchema(root, NOW);
   const store = new FileTaskStore(root);

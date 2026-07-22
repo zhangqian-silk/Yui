@@ -21,9 +21,9 @@ import {
 } from "../role/role.js";
 import { SYSTEM_LEADER_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
 import {
-  ensureTaskmuxHome,
+  ensureYuiHome,
   FileTaskStore,
-  resolveTaskmuxHome
+  resolveYuiHome
 } from "../storage/taskStore.js";
 import { ensureStorageSchema } from "../storage/storageSchema.js";
 import type { CommandExecutor } from "../tmux/commandExecutor.js";
@@ -92,14 +92,14 @@ export async function runSetupCommand(
   });
   try {
     const question = createSetupQuestion(readline, io);
-    const home = resolveTaskmuxHome(env);
-    ensureTaskmuxHome(home);
+    const home = resolveYuiHome(env);
+    ensureYuiHome(home);
     ensureStorageSchema(home);
     const store = new FileTaskStore(home);
 
-    const result = await configureTaskmux(store, home, env, question, io);
+    const result = await configureYui(store, home, env, question, io);
     const lines = [
-      "TaskMux home initialized.",
+      "Yui home initialized.",
       `Agents configured: ${result.agentIds.join(", ")}.`,
       `Default Agent: ${result.defaultAgentId}.`,
       `Operator Agent: ${result.operatorAgentId}.`,
@@ -117,7 +117,7 @@ export async function runSetupCommand(
       { width: tableWidth(io), defaultSelection: "skip" }
     );
     lines.push(completion.trimEnd());
-    lines.push("TaskMux setup complete.");
+    lines.push("Yui setup complete.");
     return `${lines.join("\n")}\n`;
   } finally {
     readline.close();
@@ -129,7 +129,7 @@ export function validateSetupInvocation(args: readonly string[], io: SetupIo = {
   if (!shouldPrompt(io)) throw setupRequiresInteractiveError();
 }
 
-async function configureTaskmux(
+async function configureYui(
   store: SetupStore,
   home: string,
   env: NodeJS.ProcessEnv,
@@ -386,13 +386,13 @@ function tableWidth(io: SetupIo): number {
 }
 
 function cliIdentity(env: NodeJS.ProcessEnv): CliIdentity {
-  return env.TASKMUX_CLI_NAME === "taskmux-dev" ? "taskmux-dev" : "taskmux";
+  return env.YUI_CLI_NAME === "yui-dev" ? "yui-dev" : "yui";
 }
 
 function parseSetupOptions(args: readonly string[]): SetupDependency | undefined {
   if (args.length === 0) return undefined;
   if (args.length === 1 && args[0] === "tmux") return "tmux";
-  throw usageError("Setup usage: taskmux setup [tmux]");
+  throw usageError("Setup usage: yui setup [tmux]");
 }
 
 async function setupTmux(
@@ -400,12 +400,12 @@ async function setupTmux(
   executor: CommandExecutor,
   question: SetupQuestion
 ): Promise<string[]> {
-  const command = env.TASKMUX_TMUX_BIN ?? "tmux";
+  const command = env.YUI_TMUX_BIN ?? "tmux";
   if (hasExecutable(command, ["-V"], executor)) return ["Tmux already installed."];
 
   const plan = detectTmuxInstallPlan(env, executor);
   if (plan === null) {
-    return ["Tmux is not installed.", "Install tmux manually, then run taskmux doctor."];
+    return ["Tmux is not installed.", "Install tmux manually, then run yui doctor."];
   }
   const lines = [
     "Tmux is not installed.",
@@ -414,7 +414,7 @@ async function setupTmux(
   ];
   const answer = (await question("Install tmux now? [y/N]: ")).trim().toLowerCase();
   if (answer !== "y" && answer !== "yes") {
-    return [...lines, "Skipped tmux installation.", "After installing tmux, run taskmux doctor."];
+    return [...lines, "Skipped tmux installation.", "After installing tmux, run yui doctor."];
   }
   for (const step of plan.steps) executor.run(step.command, [...step.args], { inheritStdio: true });
   return hasExecutable(command, ["-V"], executor)

@@ -42,7 +42,7 @@ export type TmuxRolePaneState = Readonly<{
 export type TmuxReadinessProbe = (pane: TmuxPaneState) => boolean;
 
 export type TmuxManagerOptions = Readonly<{
-  taskmuxHome?: string;
+  yuiHome?: string;
   terminalInput?: TerminalInput;
   closeInteractiveInput?: () => void;
   readinessTimeoutMs?: number;
@@ -75,11 +75,11 @@ export class TmuxReadinessProbeRequiredError extends Error {
 
 /**
  * Owns tmux lifecycle and input delivery. Interactive attach first releases
- * every TaskMux reader from the terminal. Automated delivery is accepted only
+ * every Yui reader from the terminal. Automated delivery is accepted only
  * after a bounded readiness probe and is recorded by a pane-local receipt.
  */
 export class TmuxManager {
-  readonly #taskmuxHome: string;
+  readonly #yuiHome: string;
   readonly #terminalInput: TerminalInput;
   readonly #closeInteractiveInput: () => void;
   readonly #readinessTimeoutMs: number;
@@ -92,12 +92,12 @@ export class TmuxManager {
   constructor(
     private readonly tmuxBin: string,
     private readonly executor: CommandExecutor,
-    taskmuxHomeOrOptions: string | TmuxManagerOptions = {}
+    yuiHomeOrOptions: string | TmuxManagerOptions = {}
   ) {
-    const options = typeof taskmuxHomeOrOptions === "string"
-      ? { taskmuxHome: taskmuxHomeOrOptions }
-      : taskmuxHomeOrOptions;
-    this.#taskmuxHome = options.taskmuxHome ?? process.env.TASKMUX_HOME ?? process.cwd();
+    const options = typeof yuiHomeOrOptions === "string"
+      ? { yuiHome: yuiHomeOrOptions }
+      : yuiHomeOrOptions;
+    this.#yuiHome = options.yuiHome ?? process.env.YUI_HOME ?? process.cwd();
     this.#terminalInput = options.terminalInput ?? process.stdin as Readable & TerminalInput;
     this.#closeInteractiveInput = options.closeInteractiveInput ?? (() => {});
     this.#readinessTimeoutMs = positiveInteger(
@@ -326,9 +326,9 @@ export class TmuxManager {
     }
     const target = this.target(taskId, roleName);
     const digest = createHash("sha256").update(receiptId).digest("hex");
-    const option = `@taskmux_delivery_${digest}`;
-    const sentMarker = `__TASKMUX_DELIVERY_SENT_${digest}__`;
-    const presentMarker = `__TASKMUX_DELIVERY_PRESENT_${digest}__`;
+    const option = `@yui_delivery_${digest}`;
+    const sentMarker = `__YUI_DELIVERY_SENT_${digest}__`;
+    const presentMarker = `__YUI_DELIVERY_PRESENT_${digest}__`;
     const apply = [
       `set-option -w -t ${tmuxWord(target)} ${option} 1`,
       `send-keys -l -t ${tmuxWord(target)} -- ${tmuxWord(input)}`,
@@ -365,7 +365,7 @@ export class TmuxManager {
   hasDeliveryReceipt(taskId: string, roleName: string, receiptId: string): boolean {
     safeValue(receiptId, "tmux delivery receipt id");
     const digest = createHash("sha256").update(receiptId).digest("hex");
-    const option = `@taskmux_delivery_${digest}`;
+    const option = `@yui_delivery_${digest}`;
     return this.executor.run(this.tmuxBin, [
       "show-options", "-wqv", "-t", this.target(taskId, roleName), option
     ]).trim() === "1";
@@ -442,11 +442,11 @@ export class TmuxManager {
   }
 
   private sessionName(taskId: string): string {
-    return taskmuxTmuxSessionName(this.#taskmuxHome, taskId);
+    return yuiTmuxSessionName(this.#yuiHome, taskId);
   }
 
   private target(taskId: string, roleName: string): string {
-    return taskmuxTmuxTarget(this.#taskmuxHome, taskId, roleName);
+    return yuiTmuxTarget(this.#yuiHome, taskId, roleName);
   }
 }
 
@@ -498,14 +498,14 @@ export class TmuxDeliveryPump {
   }
 }
 
-export function taskmuxTmuxSessionName(taskmuxHome: string, taskId: string): string {
+export function yuiTmuxSessionName(yuiHome: string, taskId: string): string {
   const safeTaskId = safeValue(taskId, "Task id");
-  const namespace = createHash("sha256").update(resolve(taskmuxHome)).digest("hex").slice(0, 12);
-  return `taskmux-${namespace}-${safeTaskId}`;
+  const namespace = createHash("sha256").update(resolve(yuiHome)).digest("hex").slice(0, 12);
+  return `yui-${namespace}-${safeTaskId}`;
 }
 
-export function taskmuxTmuxTarget(taskmuxHome: string, taskId: string, roleName: string): string {
-  return `${taskmuxTmuxSessionName(taskmuxHome, taskId)}:${safeValue(roleName, "Role name")}`;
+export function yuiTmuxTarget(yuiHome: string, taskId: string, roleName: string): string {
+  return `${yuiTmuxSessionName(yuiHome, taskId)}:${safeValue(roleName, "Role name")}`;
 }
 
 function launchCommand(launch: TmuxLaunchPlan): string[] {

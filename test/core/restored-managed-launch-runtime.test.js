@@ -22,7 +22,7 @@ import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 
 function fixture(t, adapterId = "codex") {
-  const home = mkdtempSync(join(tmpdir(), "taskmux-managed-launch-"));
+  const home = mkdtempSync(join(tmpdir(), "yui-managed-launch-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home);
   const store = new FileTaskStore(home);
@@ -69,10 +69,10 @@ test("one planner adds Codex structured notify for Task and global launches", (t
     ]);
     assert.equal(plan.session, null);
   }
-  assert.equal(taskPlan.launch.env.TASKMUX_SESSION_SCOPE, "task");
-  assert.equal(taskPlan.launch.env.TASKMUX_TASK_ID, task.id);
-  assert.equal(globalPlan.launch.env.TASKMUX_SESSION_SCOPE, "global");
-  assert.equal(globalPlan.launch.env.TASKMUX_TASK_ID, undefined);
+  assert.equal(taskPlan.launch.env.YUI_SESSION_SCOPE, "task");
+  assert.equal(taskPlan.launch.env.YUI_TASK_ID, task.id);
+  assert.equal(globalPlan.launch.env.YUI_SESSION_SCOPE, "global");
+  assert.equal(globalPlan.launch.env.YUI_TASK_ID, undefined);
 });
 
 test("Claude new launch is preallocated once and persisted without a prompt", (t) => {
@@ -90,18 +90,18 @@ test("Claude new launch is preallocated once and persisted without a prompt", (t
 
   assert.deepEqual(plan.launch.args.slice(-2), ["--session-id", "claude-native-1"]);
   assert.equal(plan.session.nativeSessionId, "claude-native-1");
-  assert.equal(plan.launch.args.some((argument) => argument.includes("TaskMux setup:")), false);
+  assert.equal(plan.launch.args.some((argument) => argument.includes("Yui setup:")), false);
 });
 
 test("Codex notify payload is strictly converted to an internal fixed session bind", async (t) => {
   const { home, store, task, role, agent } = fixture(t);
   const environment = {
-    TASKMUX_HOME: home,
-    TASKMUX_SESSION_SCOPE: "task",
-    TASKMUX_TASK_ID: task.id,
-    TASKMUX_ROLE: role.name,
-    TASKMUX_AGENT_ID: agent.id,
-    TASKMUX_ADAPTER_ID: "codex"
+    YUI_HOME: home,
+    YUI_SESSION_SCOPE: "task",
+    YUI_TASK_ID: task.id,
+    YUI_ROLE: role.name,
+    YUI_AGENT_ID: agent.id,
+    YUI_ADAPTER_ID: "codex"
   };
   const payload = JSON.stringify({
     type: "agent-turn-complete",

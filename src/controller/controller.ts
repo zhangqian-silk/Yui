@@ -1,4 +1,4 @@
-import { reconciliationIntervalMilliseconds } from "../config/taskmuxConfig.js";
+import { reconciliationIntervalMilliseconds } from "../config/yuiConfig.js";
 import {
   processLeaderWakeups,
   type LeaderWakeupProcessingResult
@@ -180,7 +180,7 @@ export class FileTaskController {
 }
 
 /**
- * Starts the single private Unix-socket Controller for one TASKMUX_HOME. The
+ * Starts the single private Unix-socket Controller for one YUI_HOME. The
  * shared server owns status/stop and rejects a second live instance; this
  * layer adds only scheduler.scan plus an optional command dispatcher.
  */

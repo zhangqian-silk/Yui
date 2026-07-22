@@ -10,7 +10,7 @@ test("readiness resolver distinguishes Codex node composer and Claude prompt mar
   const base = {
     taskId: "task-1",
     roleName: "leader",
-    target: "taskmux:leader",
+    target: "yui:leader",
     dead: false,
     pid: 123
   };

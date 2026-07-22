@@ -14,7 +14,7 @@ import { FileTaskStore } from "../../dist/storage/taskStore.js";
 const NOW = new Date("2026-07-19T15:00:00.000Z");
 
 function fixture(t) {
-  const root = mkdtempSync(join(tmpdir(), "taskmux-jobs-"));
+  const root = mkdtempSync(join(tmpdir(), "yui-jobs-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   ensureStorageSchema(root, NOW);
   const store = new FileTaskStore(root);

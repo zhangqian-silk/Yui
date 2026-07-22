@@ -19,7 +19,7 @@ export function runOperatorCommand(
       : `Unknown command: operator ${command}`);
   }
 
-  const usage = "Operator submit usage: taskmux operator submit <body> [--task <id>].";
+  const usage = "Operator submit usage: yui operator submit <body> [--task <id>].";
   const positionals: string[] = [];
   let taskId: string | undefined;
   for (let index = 0; index < rest.length; index += 1) {

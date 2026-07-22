@@ -3,7 +3,7 @@ export const MIN_RECONCILIATION_INTERVAL_SECONDS = 5;
 export const MAX_RECONCILIATION_INTERVAL_SECONDS = 300;
 
 /**
- * Resolves the durable TaskMux setting used for periodic full reconciliation.
+ * Resolves the durable Yui setting used for periodic full reconciliation.
  * Command-triggered scans remain immediate and do not use this interval.
  */
 export function reconciliationIntervalMilliseconds(value?: unknown): number {

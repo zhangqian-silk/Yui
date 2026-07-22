@@ -87,10 +87,10 @@ function renderOperatorInputNotification(request: InputRequest): string {
           `Agent recommendation: ${recommendedChoice!.key}: ${recommendedChoice!.label}`,
           `Automatic fallback after: ${request.policy.timeoutAt}`
         ]),
-    `Inspect: taskmux task input show ${request.id}`,
+    `Inspect: yui task input show ${request.id}`,
     request.choices.length === 0
-      ? `After the user replies: taskmux task input answer ${request.id} --text "<answer>"`
-      : `After the user chooses: taskmux task input answer ${request.id} --choice <key>`
+      ? `After the user replies: yui task input answer ${request.id} --text "<answer>"`
+      : `After the user chooses: yui task input answer ${request.id} --choice <key>`
   ].join("\n");
 }
 

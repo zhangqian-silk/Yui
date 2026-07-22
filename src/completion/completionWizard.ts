@@ -111,7 +111,7 @@ export async function runCompletionWizard(
   if (needsActivation) {
     const activationAnswer = normalize(await question(
       `${activationBlock(shell, installation, identity)}\n`
-        + `Update ${installation.activationPath} with the managed TaskMux block? [Y/n]: `
+        + `Update ${installation.activationPath} with the managed Yui block? [Y/n]: `
     ));
     if (
       activationAnswer !== ""

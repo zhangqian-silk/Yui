@@ -21,65 +21,65 @@ export function prepareGlobalRoleLaunch(
     args?: readonly string[];
     env?: Readonly<Record<string, string>>;
   }>,
-  options: { taskmuxHome?: string; baseEnv?: NodeJS.ProcessEnv } = {}
+  options: { yuiHome?: string; baseEnv?: NodeJS.ProcessEnv } = {}
 ): OperatorLaunchContext {
   const args = [...(role.args ?? [])];
   const base = mergeEnv(options.baseEnv, role.env ?? {});
-  if (role.name !== SYSTEM_OPERATOR_ROLE || options.taskmuxHome === undefined) {
+  if (role.name !== SYSTEM_OPERATOR_ROLE || options.yuiHome === undefined) {
     return { args, env: base };
   }
 
-  const contextPath = writeOperatorContext(options.taskmuxHome, role.workspace);
+  const contextPath = writeOperatorContext(options.yuiHome, role.workspace);
   return {
     args,
     env: mergeEnv(base, {
-      TASKMUX_HOME: options.taskmuxHome,
-      TASKMUX_ROLE: role.name,
-      TASKMUX_WORKSPACE: role.workspace,
-      TASKMUX_OPERATOR_CONTEXT: contextPath
+      YUI_HOME: options.yuiHome,
+      YUI_ROLE: role.name,
+      YUI_WORKSPACE: role.workspace,
+      YUI_OPERATOR_CONTEXT: contextPath
     }),
     systemPrompt: renderOperatorLaunchInstruction(contextPath),
     contextPath
   };
 }
 
-export function writeOperatorContext(taskmuxHome: string, workspace: string): string {
-  const operatorDir = join(taskmuxHome, "operator");
-  const contextPath = join(operatorDir, "TASKMUX_OPERATOR.md");
+export function writeOperatorContext(yuiHome: string, workspace: string): string {
+  const operatorDir = join(yuiHome, "operator");
+  const contextPath = join(operatorDir, "YUI_OPERATOR.md");
   mkdirSync(operatorDir, { recursive: true });
-  writeFileSync(contextPath, `${renderOperatorContext(taskmuxHome, workspace)}\n`, { mode: 0o600 });
+  writeFileSync(contextPath, `${renderOperatorContext(yuiHome, workspace)}\n`, { mode: 0o600 });
   return contextPath;
 }
 
 export function renderOperatorLaunchInstruction(contextPath: string): string {
   return [
-    `Read and follow the TaskMux Operator instructions in ${contextPath}.`,
-    "Manage TaskMux through its CLI; do not perform Task work."
+    `Read and follow the Yui Operator instructions in ${contextPath}.`,
+    "Manage Yui through its CLI; do not perform Task work."
   ].join(" ");
 }
 
-function renderOperatorContext(taskmuxHome: string, workspace: string): string {
+function renderOperatorContext(yuiHome: string, workspace: string): string {
   return `${readOperatorSkill()}
 
-# TaskMux Operator runtime
+# Yui Operator runtime
 
-You are the TaskMux Operator. Act as the user's CLI proxy and manage TaskMux without performing Task work.
+You are the Yui Operator. Act as the user's CLI proxy and manage Yui without performing Task work.
 
 Rules:
 
-- Use TaskMux commands to create and inspect Tasks, manage global and Task Roles, choose Agents, and submit user input.
-- Do not edit files under TASKMUX_HOME directly.
+- Use Yui commands to create and inspect Tasks, manage global and Task Roles, choose Agents, and submit user input.
+- Do not edit files under YUI_HOME directly.
 - Every Task has a protected leader Role; Operator is global and never acts as a Task Leader or Worker.
 - Keep native Agent session interaction intact. Do not emulate Agent slash commands or terminal input.
 
 Environment:
 
-- TASKMUX_HOME=${taskmuxHome}
-- TASKMUX_WORKSPACE=${workspace}`;
+- YUI_HOME=${yuiHome}
+- YUI_WORKSPACE=${workspace}`;
 }
 
 function readOperatorSkill(): string {
-  return readFileSync(new URL("../../skills/taskmux-operator/SKILL.md", import.meta.url), "utf8").trim();
+  return readFileSync(new URL("../../skills/yui-operator/SKILL.md", import.meta.url), "utf8").trim();
 }
 
 function mergeEnv(

@@ -18,7 +18,7 @@ import {
 const NOW = new Date("2026-07-21T10:00:00.000Z");
 
 function fixture(t) {
-  const root = mkdtempSync(join(tmpdir(), "taskmux-knowledge-cli-"));
+  const root = mkdtempSync(join(tmpdir(), "yui-knowledge-cli-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   ensureStorageSchema(root, NOW);
   const store = new FileTaskStore(root);
@@ -34,12 +34,12 @@ function fixture(t) {
 function options(runtime, actor) {
   const environment = actor === "leader"
     ? {
-        TASKMUX_SESSION_SCOPE: "task",
-        TASKMUX_TASK_ID: "task-1",
-        TASKMUX_ROLE: "leader"
+        YUI_SESSION_SCOPE: "task",
+        YUI_TASK_ID: "task-1",
+        YUI_ROLE: "leader"
       }
     : actor === "operator"
-      ? { TASKMUX_SESSION_SCOPE: "global", TASKMUX_ROLE: "operator" }
+      ? { YUI_SESSION_SCOPE: "global", YUI_ROLE: "operator" }
       : {};
   return { runtime, now: () => new Date(NOW), environment };
 }
@@ -146,7 +146,7 @@ test("Task knowledge reads expose structured top-level JSON data", (t) => {
   const runCli = (...args) => JSON.parse(execFileSync(
     process.execPath,
     [join(process.cwd(), "dist", "cli.js"), "--json", ...args],
-    { encoding: "utf8", env: { ...process.env, TASKMUX_HOME: root } }
+    { encoding: "utf8", env: { ...process.env, YUI_HOME: root } }
   ));
 
   const reads = [

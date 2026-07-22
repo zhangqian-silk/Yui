@@ -42,29 +42,29 @@ jobs:
         run: |
           node scripts/assemble-runtime-package.mjs --output .release-stage
           npm pack ./.release-stage --json > pack-result.json
-          node -e 'const fs=require("node:fs"); const result=JSON.parse(fs.readFileSync("pack-result.json","utf8")); fs.renameSync(result[0].filename, "taskmux-runtime.tgz");'
+          node -e 'const fs=require("node:fs"); const result=JSON.parse(fs.readFileSync("pack-result.json","utf8")); fs.renameSync(result[0].filename, "yui-runtime.tgz");'
 
       - name: Verify package contents
         run: |
-          tar -tf taskmux-runtime.tgz > package-files.txt
-          node -e 'const {execFileSync}=require("node:child_process"); const pkg=JSON.parse(execFileSync("tar",["-xOf","taskmux-runtime.tgz","package/package.json"],{encoding:"utf8"})); if (pkg.private !== false || "scripts" in pkg || "devDependencies" in pkg) throw new Error("runtime manifest must be publishable and lifecycle-free");'
+          tar -tf yui-runtime.tgz > package-files.txt
+          node -e 'const {execFileSync}=require("node:child_process"); const pkg=JSON.parse(execFileSync("tar",["-xOf","yui-runtime.tgz","package/package.json"],{encoding:"utf8"})); if (pkg.private !== false || "scripts" in pkg || "devDependencies" in pkg) throw new Error("runtime manifest must be publishable and lifecycle-free");'
           grep -qx 'package/dist/cli.js' package-files.txt
           grep -qx 'package/dist/cli/commandCatalog.js' package-files.txt
           grep -qx 'package/dist/core/controllerMain.js' package-files.txt
           grep -qx 'package/dist/output/terminal.js' package-files.txt
           grep -qx 'package/ARCHITECTURE.md' package-files.txt
           grep -qx 'package/i18n/README.zh-CN.md' package-files.txt
-          grep -qx 'package/skills/taskmux-leader/SKILL.md' package-files.txt
-          grep -qx 'package/skills/taskmux-worker/SKILL.md' package-files.txt
-          grep -qx 'package/skills/taskmux-operator/SKILL.md' package-files.txt
+          grep -qx 'package/skills/yui-leader/SKILL.md' package-files.txt
+          grep -qx 'package/skills/yui-worker/SKILL.md' package-files.txt
+          grep -qx 'package/skills/yui-operator/SKILL.md' package-files.txt
           if [ "$(grep -Ec '^package/skills/' package-files.txt)" -ne 3 ]; then exit 1; fi
           if grep -Eq '^package/(binding\.gyp|native/|build/|scripts/|test/)' package-files.txt; then exit 1; fi
 
       - name: Upload tested package
         uses: actions/upload-artifact@v4
         with:
-          name: taskmux-runtime-tarball
-          path: taskmux-runtime.tgz
+          name: yui-runtime-tarball
+          path: yui-runtime.tgz
           if-no-files-found: error
           retention-days: 1
 
@@ -88,15 +88,15 @@ jobs:
       - name: Download tested package
         uses: actions/download-artifact@v4
         with:
-          name: taskmux-runtime-tarball
+          name: yui-runtime-tarball
           path: release-artifact
 
       - name: Install and exercise the package
         run: |
-          TASKMUX_TGZ="$PWD/release-artifact/taskmux-runtime.tgz"
+          YUI_TGZ="$PWD/release-artifact/yui-runtime.tgz"
           consumer="$(mktemp -d)"
-          npm install --prefix "$consumer" "$TASKMUX_TGZ"
-          TASKMUX_INSTALLED_ROOT="$consumer/node_modules/@zq-silk/taskmux" node scripts/smoke-runtime-package.mjs
+          npm install --prefix "$consumer" "$YUI_TGZ"
+          YUI_INSTALLED_ROOT="$consumer/node_modules/@zq-silk/yui" node scripts/smoke-runtime-package.mjs
 
   publish:
     needs: [build, smoke]
@@ -113,8 +113,8 @@ jobs:
       - name: Download tested package
         uses: actions/download-artifact@v4
         with:
-          name: taskmux-runtime-tarball
+          name: yui-runtime-tarball
           path: release-artifact
 
       - name: Publish tested package
-        run: npm publish release-artifact/taskmux-runtime.tgz --access public --provenance
+        run: npm publish release-artifact/yui-runtime.tgz --access public --provenance

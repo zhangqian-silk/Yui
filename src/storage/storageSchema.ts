@@ -278,7 +278,7 @@ function requireInspectedSchema(state: StorageSchemaState): void {
     case "uninitialized":
       throw new StorageSchemaError(
         "STORAGE_UNINITIALIZED",
-        "TaskMux storage is not initialized. Run `taskmux setup`."
+        "Yui storage is not initialized. Run `yui setup`."
       );
     case "invalid":
       throw new StorageSchemaError(
@@ -303,12 +303,12 @@ function unsupportedVersion(
   if (current < required) {
     return new StorageSchemaError(
       "STORAGE_SCHEMA_UNSUPPORTED",
-      `${label} ${current} is older than required ${component} version ${required}; no migration is available in this TaskMux release.`
+      `${label} ${current} is older than required ${component} version ${required}; no migration is available in this Yui release.`
     );
   }
   return new StorageSchemaError(
     "STORAGE_SCHEMA_UNSUPPORTED",
-    `${label} ${current} is newer than supported ${component} version ${required}; use a newer TaskMux release.`
+    `${label} ${current} is newer than supported ${component} version ${required}; use a newer Yui release.`
   );
 }
 

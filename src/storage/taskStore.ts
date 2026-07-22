@@ -12,7 +12,7 @@ import { join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { validateConfiguredAgent, type ConfiguredAgent } from "../agent/agent.js";
 import type { TaskBrief } from "../brief/taskBrief.js";
-import { reconciliationIntervalMilliseconds } from "../config/taskmuxConfig.js";
+import { reconciliationIntervalMilliseconds } from "../config/yuiConfig.js";
 import type { Decision } from "../decision/decision.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import {
@@ -61,7 +61,7 @@ export type CompletionInstallation = Readonly<{
   scriptPath: string;
   activationPath: string;
 }>;
-export type TaskmuxConfig = Readonly<{
+export type YuiConfig = Readonly<{
   schemaVersion: 1;
   defaultAgent?: string;
   defaultWorkspace?: string;
@@ -102,7 +102,7 @@ type StoredTask = {
 type StorageState = {
   schemaVersion: 1;
   revision: number;
-  config: TaskmuxConfig;
+  config: YuiConfig;
   configuredAgents: Record<string, ConfiguredAgent>;
   repositories: Record<string, Repository>;
   globalRoles: Record<string, GlobalRole>;
@@ -113,8 +113,8 @@ type StorageState = {
 export type TaskStore = {
   rootDirectory(): string;
   transaction<T>(execute: (store: TaskStore) => T): T;
-  getConfig(): TaskmuxConfig;
-  saveConfig(config: TaskmuxConfig): void;
+  getConfig(): YuiConfig;
+  saveConfig(config: YuiConfig): void;
   saveConfiguredAgent(agent: ConfiguredAgent): void;
   createConfiguredAgentIfAbsent(agent: ConfiguredAgent): ConfiguredAgent | null;
   updateConfiguredAgent(id: string, patch: ConfiguredAgentPatch, now: Date): ConfiguredAgentUpdateResult | null;
@@ -227,10 +227,10 @@ export class FileTaskStore implements TaskStore {
     });
   }
 
-  getConfig(): TaskmuxConfig { return clone(this.#state().config); }
-  saveConfig(config: TaskmuxConfig): void {
-    const stored = versioned<TaskmuxConfig>(config, 1, "TaskMux config");
-    validateTaskmuxConfig(stored);
+  getConfig(): YuiConfig { return clone(this.#state().config); }
+  saveConfig(config: YuiConfig): void {
+    const stored = versioned<YuiConfig>(config, 1, "Yui config");
+    validateYuiConfig(stored);
     this.#mutate((state) => { state.config = stored; });
   }
 
@@ -725,12 +725,12 @@ export class FileTaskStore implements TaskStore {
 export class StorageRecordError extends Error { constructor(message: string) { super(message); this.name = "StorageRecordError"; } }
 export class StorageConflictError extends Error { constructor(message: string) { super(message); this.name = "StorageConflictError"; } }
 
-export function resolveTaskmuxHome(env: NodeJS.ProcessEnv): string {
-  return env.TASKMUX_HOME === undefined || env.TASKMUX_HOME.length === 0
-    ? join(homedir(), ".taskmux")
-    : resolve(env.TASKMUX_HOME);
+export function resolveYuiHome(env: NodeJS.ProcessEnv): string {
+  return env.YUI_HOME === undefined || env.YUI_HOME.length === 0
+    ? join(homedir(), ".yui")
+    : resolve(env.YUI_HOME);
 }
-export function ensureTaskmuxHome(rootDir: string): void { mkdirSync(rootDir, { recursive: true, mode: 0o700 }); }
+export function ensureYuiHome(rootDir: string): void { mkdirSync(rootDir, { recursive: true, mode: 0o700 }); }
 
 function emptyState(): StorageState {
   return { schemaVersion: 1, revision: 0, config: { schemaVersion: 1 }, configuredAgents: {}, repositories: {}, globalRoles: {}, globalRoleSessionSets: {}, tasks: {} };
@@ -764,8 +764,8 @@ function parseState(raw: string): StorageState {
   exact(state, ["schemaVersion", "revision", "config", "configuredAgents", "repositories", "globalRoles", "globalRoleSessionSets", "tasks"], "Storage state");
   if (state.schemaVersion !== 1 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
   const result = clone(state) as unknown as StorageState;
-  result.config = versioned(result.config, 1, "TaskMux config");
-  validateTaskmuxConfig(result.config);
+  result.config = versioned(result.config, 1, "Yui config");
+  validateYuiConfig(result.config);
   parseMap(result.configuredAgents, (value, key) => {
     const agent = identified<ConfiguredAgent>(value, 2, "id", key, "Configured Agent");
     validateConfiguredAgent(agent);
@@ -897,12 +897,12 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
   return aggregate;
 }
 
-function validateTaskmuxConfig(config: TaskmuxConfig): void {
+function validateYuiConfig(config: YuiConfig): void {
   try {
     reconciliationIntervalMilliseconds(config.reconciliationIntervalSeconds);
   } catch (error) {
     throw new StorageRecordError(
-      error instanceof Error ? error.message : "TaskMux reconciliation interval is invalid."
+      error instanceof Error ? error.message : "Yui reconciliation interval is invalid."
     );
   }
 }
@@ -1179,7 +1179,7 @@ function findUnique(state: StorageState, key: "workItems" | "agentRuns" | "input
 function synchronousResult<T>(value: T): T { if (typeof value === "object" && value !== null && "then" in value) throw new StorageRecordError("FileTaskStore transactions must be synchronous."); return value; }
 
 function acquireStorageLock(rootDir: string): () => void {
-  ensureTaskmuxHome(rootDir);
+  ensureYuiHome(rootDir);
   const lock = join(rootDir, STORAGE_LOCK_DIRECTORY);
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
   while (true) {

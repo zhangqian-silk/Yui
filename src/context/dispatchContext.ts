@@ -59,23 +59,23 @@ function renderDispatchContext(
     readSystemSkill(kind),
     profileLines.join("\n"),
     ...(context.configuredSkillBodies ?? []).map((body) => body.trim()).filter(Boolean),
-    "TaskMux dispatch:",
+    "Yui dispatch:",
     requireText(context.input, "dispatch input")
   ].filter(Boolean).join("\n\n");
 }
 
 function readConfiguredSkills(skills: readonly string[]): string[] {
-  const taskmuxHome = process.env.TASKMUX_HOME;
+  const yuiHome = process.env.YUI_HOME;
   if (skills.length === 0) return [];
-  if (taskmuxHome === undefined) {
-    throw dataError("TASKMUX_HOME is required to load configured Role skills.");
+  if (yuiHome === undefined) {
+    throw dataError("YUI_HOME is required to load configured Role skills.");
   }
   return skills.map((skill) => {
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(skill)) {
       throw dataError(`Invalid configured Skill id: ${skill}`);
     }
     try {
-      return readFileSync(join(taskmuxHome, "skills", skill, "SKILL.md"), "utf8").trim();
+      return readFileSync(join(yuiHome, "skills", skill, "SKILL.md"), "utf8").trim();
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "ENOENT") {
         throw dataError(`Configured Skill not found: ${skill}`);
@@ -87,7 +87,7 @@ function readConfiguredSkills(skills: readonly string[]): string[] {
 
 function readSystemSkill(kind: "leader" | "worker"): string {
   return readFileSync(
-    new URL(`../../skills/taskmux-${kind}/SKILL.md`, import.meta.url),
+    new URL(`../../skills/yui-${kind}/SKILL.md`, import.meta.url),
     "utf8"
   ).trim();
 }

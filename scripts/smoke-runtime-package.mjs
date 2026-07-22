@@ -10,18 +10,18 @@ import {
 import { delimiter, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
-const root = process.env.TASKMUX_INSTALLED_ROOT ?? process.cwd();
-const sandbox = mkdtempSync(join(tmpdir(), "taskmux-runtime-package-smoke-"));
+const root = process.env.YUI_INSTALLED_ROOT ?? process.cwd();
+const sandbox = mkdtempSync(join(tmpdir(), "yui-runtime-package-smoke-"));
 const isolatedHome = join(sandbox, "home");
-const taskmuxHome = join(isolatedHome, ".taskmux");
+const yuiHome = join(isolatedHome, ".yui");
 const fakeBin = join(sandbox, "bin");
 let cli;
 let environment;
 let controllerStarted = false;
 const skills = [
-  ["taskmux-leader", "# TaskMux Leader"],
-  ["taskmux-worker", "# TaskMux Worker"],
-  ["taskmux-operator", "# TaskMux Operator"]
+  ["yui-leader", "# Yui Leader"],
+  ["yui-worker", "# Yui Worker"],
+  ["yui-operator", "# Yui Operator"]
 ];
 
 try {
@@ -42,18 +42,18 @@ try {
       throw new Error(`Installed runtime package is missing ${skill}/SKILL.md.`);
     }
   }
-  if (packageJson.bin?.taskmux !== "./dist/cli.js") {
-    throw new Error("Installed runtime package does not expose the expected taskmux bin.");
+  if (packageJson.bin?.yui !== "./dist/cli.js") {
+    throw new Error("Installed runtime package does not expose the expected yui bin.");
   }
 
-  cli = resolve(root, "..", "..", ".bin", "taskmux");
+  cli = resolve(root, "..", "..", ".bin", "yui");
   if (!existsSync(cli)) {
-    throw new Error("Installed runtime package did not create its taskmux bin.");
+    throw new Error("Installed runtime package did not create its yui bin.");
   }
   environment = {
     ...process.env,
     HOME: isolatedHome,
-    TASKMUX_HOME: taskmuxHome,
+    YUI_HOME: yuiHome,
     PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`,
     NO_COLOR: "1"
   };
@@ -62,11 +62,11 @@ try {
   if (version !== packageJson.version) {
     throw new Error(`Installed CLI reported ${version}; expected ${packageJson.version}.`);
   }
-  if (!runCli(cli, ["help"], environment).includes("TaskMux")) {
+  if (!runCli(cli, ["help"], environment).includes("Yui")) {
     throw new Error("Installed CLI help did not render.");
   }
   const scopedHelp = runCli(cli, ["help", "task", "role"], environment);
-  if (!scopedHelp.includes("taskmux task role <command>") || !scopedHelp.includes("add")) {
+  if (!scopedHelp.includes("yui task role <command>") || !scopedHelp.includes("add")) {
     throw new Error("Installed CLI nested help did not render the restored command catalog.");
   }
   const completion = runCli(
@@ -81,15 +81,15 @@ try {
   const setup = runCli(
     cli,
     ["setup"],
-    { ...environment, TASKMUX_SETUP_INTERACTIVE: "1" },
-    `\n\n\n${join(taskmuxHome, "workspace")}\n\n`
+    { ...environment, YUI_SETUP_INTERACTIVE: "1" },
+    `\n\n\n${join(yuiHome, "workspace")}\n\n`
   );
-  if (!setup.includes("TaskMux setup complete.") || !setup.includes("Agents configured: codex")) {
+  if (!setup.includes("Yui setup complete.") || !setup.includes("Agents configured: codex")) {
     throw new Error("Installed CLI setup did not initialize the FileTaskStore runtime.");
   }
 
   const doctor = runCli(cli, ["doctor"], environment);
-  if (!doctor.includes("TaskMux doctor") || !doctor.includes("storage schema")) {
+  if (!doctor.includes("Yui doctor") || !doctor.includes("storage schema")) {
     throw new Error("Installed CLI doctor did not inspect the initialized runtime.");
   }
 
