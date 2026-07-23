@@ -425,7 +425,7 @@ export const ROOT_COMMAND = buildNode({
     { id: "general", title: "General", entries: ["help", "version", "update", "setup", "doctor", "completion"] },
     { id: "workflow", title: "Workflow", entries: ["operator", "repository", "task"] },
     { id: "configuration", title: "Configuration", entries: ["agent", "role"] },
-    { id: "operations", title: "Operations", entries: ["controller", "jobs"] },
+    { id: "operations", title: "Operations", entries: ["web", "controller", "jobs"] },
     { id: "internal", title: "Internal", entries: ["internal"] }
   ],
   children: [
@@ -434,6 +434,12 @@ export const ROOT_COMMAND = buildNode({
     { name: "update", summary: "Install the latest published Yui package globally." },
     { name: "setup", summary: "Initialize or update Yui configuration." },
     { name: "doctor", summary: "Check Yui dependencies and file state." },
+    {
+      name: "web",
+      summary: "Serve the read-only local dashboard.",
+      usage: "yui web [--host <loopback>] [--port <port>]",
+      options: ["--host", "--port"]
+    },
     {
       name: "completion",
       summary: "Interactively configure shell completion.",
