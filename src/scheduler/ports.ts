@@ -6,6 +6,13 @@ import type { LeaderFailure } from "./leaderFailure.js";
 import type { OperatorNotification } from "./operatorNotification.js";
 import type { PendingWakeup } from "./pendingWakeup.js";
 import type { AgentRun } from "../run/agentRun.js";
+import type {
+  MailboxEntityRef,
+  MailboxTarget,
+  ProcessingBatch,
+  WorkMailbox
+} from "../coordination/workMailbox.js";
+import type { PendingTurnCompletion } from "../executor/turnCompletion.js";
 
 export type SchedulerTask = Readonly<{
   id: string;
@@ -19,6 +26,7 @@ export type SchedulerRole = Readonly<{
   name: string;
   activeAgentId: string;
   adapterId: string;
+  workspace: string;
   status: "idle" | "running" | "detached" | "exited" | "failed";
 }>;
 
@@ -42,6 +50,15 @@ export type AutoResolvedInput = Readonly<{
   choiceKey: string;
 }>;
 
+/** Compiled Controller scope shared by scheduler processors. */
+export type SchedulerReconcileSelection = Readonly<{
+  full: boolean;
+  taskIds: ReadonlySet<string>;
+  allRoleTaskIds: ReadonlySet<string>;
+  rolesByTask: ReadonlyMap<string, ReadonlySet<string>>;
+  operator: boolean;
+}>;
+
 export type LeaderDispatchPersistence = Readonly<{
   task: SchedulerTask;
   role: SchedulerRole;
@@ -52,6 +69,18 @@ export type LeaderDispatchPersistence = Readonly<{
 }>;
 
 export type LeaderDispatchClaimResult = "claimed" | "busy" | "unavailable" | "state-changed";
+
+export type SchedulerMailboxClaimInput = Readonly<{
+  target: MailboxTarget;
+  batchId: string;
+  owner: string;
+  now: Date;
+  executionRef?: MailboxEntityRef;
+}>;
+
+export type SchedulerMailboxClaimResult =
+  | Readonly<{ status: "claimed" | "processing"; processing: ProcessingBatch }>
+  | Readonly<{ status: "empty" }>;
 
 export type RoleRunDeliveryPersistence = Readonly<{
   task: SchedulerTask;
@@ -92,10 +121,26 @@ export interface SchedulerStorePort {
   getActiveAgentRun(taskId: string, roleName: string): SchedulerAgentRun | null;
   hasOpenInputRequest(taskId: string): boolean;
   listOpenInputRequests(): readonly InputRequest[];
+  listPendingRuntimeTurnCompletions(): readonly PendingTurnCompletion[];
+  getInputRequest(inputRequestId: string): InputRequest | null;
   getOperatorDeliveryTarget(): SchedulerOperatorDeliveryTarget | null;
-  resolveExpiredInputRecommendations(now: Date): readonly AutoResolvedInput[];
+  resolveExpiredInputRecommendations(
+    now: Date,
+    taskIds?: ReadonlySet<string>
+  ): readonly AutoResolvedInput[];
+  resolveDueRuntimeTurnCompletions(
+    now: Date,
+    taskIds?: ReadonlySet<string>
+  ): readonly string[];
   getRoleSession(taskId: string, roleName: string): SchedulerRoleSession | null;
+  hasInFlightTurn(taskId: string, roleName: string): boolean;
   nextAgentRunId(taskId: string): string;
+
+  getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
+  listWorkMailboxes(): readonly WorkMailbox[];
+  claimWorkMailbox(input: SchedulerMailboxClaimInput): SchedulerMailboxClaimResult;
+  completeWorkMailbox(target: MailboxTarget, batchId: string): boolean;
+  releaseWorkMailbox(target: MailboxTarget, batchId: string): boolean;
 
   getPendingWakeup(taskId: string): PendingWakeup | null;
   listPendingWakeups(): readonly PendingWakeup[];
@@ -109,6 +154,8 @@ export interface SchedulerStorePort {
   listMilestones(taskId: string): readonly Milestone[];
   /** Persist the AgentRun, active-run pointer, running Role and active fixed session. */
   saveLeaderDispatch(input: LeaderDispatchPersistence): LeaderDispatchClaimResult;
+  /** Persist a fixed session discovered while preparing an undelivered Run. */
+  saveRoleRunPrepared(input: RoleRunDeliveryPersistence): void;
   /** Persist successful delivery of a Work AgentRun and its fixed session. */
   saveRoleRunDelivery(input: RoleRunDeliveryPersistence): void;
   /** Persist LeaderFailure, OperatorNotification and failed/broken runtime state. */
@@ -117,6 +164,39 @@ export interface SchedulerStorePort {
   saveExitedRoleRun(input: ExitedRoleRunPersistence): void;
   /** Mark every recorded Task Role session stopped after tmux termination. */
   saveArchivedTaskStopped(taskId: string, now: Date): void;
+}
+
+/** Resolves Tasks without a global scan for a dirty reconciliation pass. */
+export function selectedSchedulerTasks(
+  store: Pick<SchedulerStorePort, "listTasks" | "getTask">,
+  selection?: SchedulerReconcileSelection
+): SchedulerTask[] {
+  if (selection === undefined || selection.full) return [...store.listTasks()];
+  return [...selection.taskIds].flatMap((taskId) => {
+    const task = store.getTask(taskId);
+    return task === null ? [] : [task];
+  });
+}
+
+/** Resolves either every Role in a selected Task or only explicit Role keys. */
+export function selectedSchedulerRoles(
+  store: Pick<SchedulerStorePort, "listRoles" | "getRole">,
+  taskId: string,
+  selection?: SchedulerReconcileSelection
+): SchedulerRole[] {
+  if (
+    selection === undefined
+    || selection.full
+    || selection.allRoleTaskIds.has(taskId)
+  ) {
+    return [...store.listRoles(taskId)];
+  }
+  const names = selection.rolesByTask.get(taskId);
+  if (names === undefined) return [];
+  return [...names].flatMap((roleName) => {
+    const role = store.getRole(taskId, roleName);
+    return role === null ? [] : [role];
+  });
 }
 
 export type RoleSessionLaunchMode = "new" | "resume";
@@ -147,6 +227,7 @@ export interface TmuxDeliveryPort {
     roleName: string;
     agentId: string;
     adapterId: string;
+    workspace: string;
     mode: RoleSessionLaunchMode;
     nativeSessionId?: string;
   }>): Promise<PreparedRoleDelivery>;
@@ -155,7 +236,7 @@ export interface TmuxDeliveryPort {
     delivery: ReadyRoleDelivery;
     receiptId: string;
     text: string;
-  }>): Promise<"sent" | "already-sent">;
+  }>): Promise<"sent" | "already-sent" | "busy" | "unavailable">;
   /** Best-effort nudge to an already-running global Operator composer. */
   notifyOperatorInputOnce?(input: Readonly<{
     roleName: "operator";
@@ -170,6 +251,18 @@ export interface TmuxDeliveryPort {
     adapterId: string;
     nativeSessionId?: string;
   }>): Promise<"present" | "absent">;
+  inspectRoles?(inputs: readonly Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    adapterId: string;
+    nativeSessionId?: string;
+  }>[]):
+    Promise<readonly Readonly<{
+      taskId: string;
+      roleName: string;
+      status: "present" | "absent";
+    }>[]>;
   /** Fast pane receipt lookup; unlike readiness, this is valid while the Agent is busy. */
   findExistingReceipt?(input: Readonly<{
     delivery: PreparedRoleDelivery;

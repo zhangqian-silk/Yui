@@ -273,6 +273,11 @@ test("Leader request releases its active fence and answer durably queues a resum
   assert.equal(store.getRole(task.id, "leader").status, "idle");
   assert.equal(store.getRoleSession(task.id, "leader").status, "ready");
   assert.equal(store.listEvents(task.id).at(-1).type, "input.requested");
+  const operatorMailbox = store.getWorkMailbox({ kind: "operator" });
+  assert.deepEqual(operatorMailbox.pending.reasons, ["input-requested"]);
+  assert.ok(operatorMailbox.pending.refs.some(
+    (ref) => ref.type === "input" && ref.id === request.id
+  ));
 
   const reloaded = new FileTaskStore(root);
   assert.deepEqual(reloaded.getInputRequest(task.id, request.id), request);
@@ -539,7 +544,7 @@ test("request provenance, blocked ownership, lifecycle, and origin-only cancel a
     "input", "cancel", task.id, request.id, "--reason", "No longer needed"
   ], store, { ...options, now: () => new Date(SECOND) });
   assert.equal(store.getInputRequest(task.id, request.id).status, "cancelled");
-  assert.equal(store.getPendingWakeup(task.id), null);
+  assert.ok(store.getPendingWakeup(task.id).reasons.includes(`input-cancelled:${request.id}`));
   const completed = run([
     "complete", task.id, "--summary", "Cancelled input before completion"
   ], store, { ...options, environment: {} });

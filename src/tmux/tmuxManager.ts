@@ -3,7 +3,11 @@ import { resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { runtimeError } from "../errors/cliError.js";
 import { handoffTerminal, type TerminalInput } from "./terminalHandoff.js";
-import { CommandExecutionError, type CommandExecutor } from "./commandExecutor.js";
+import {
+  CommandExecutionError,
+  type CommandExecutor,
+  type CommandRunOptions
+} from "./commandExecutor.js";
 
 const DEFAULT_READINESS_TIMEOUT_MS = 15_000;
 const DEFAULT_READINESS_POLL_MS = 50;
@@ -85,6 +89,7 @@ export class TmuxReadinessProbeRequiredError extends Error {
  */
 export class TmuxManager {
   readonly #yuiHome: string;
+  readonly #serverName: string;
   readonly #terminalInput: TerminalInput;
   readonly #closeInteractiveInput: () => void;
   readonly #readinessTimeoutMs: number;
@@ -103,6 +108,7 @@ export class TmuxManager {
       ? { yuiHome: yuiHomeOrOptions }
       : yuiHomeOrOptions;
     this.#yuiHome = options.yuiHome ?? process.env.YUI_HOME ?? process.cwd();
+    this.#serverName = yuiTmuxServerName(this.#yuiHome);
     this.#terminalInput = options.terminalInput ?? process.stdin as Readable & TerminalInput;
     this.#closeInteractiveInput = options.closeInteractiveInput ?? (() => {});
     this.#readinessTimeoutMs = positiveInteger(
@@ -141,7 +147,7 @@ export class TmuxManager {
     }
 
     if (!this.hasSession(taskId)) {
-      this.executor.run(this.tmuxBin, [
+      this.run([
         "new-session", "-d",
         "-x", String(this.#initialColumns),
         "-y", String(this.#initialRows),
@@ -152,7 +158,7 @@ export class TmuxManager {
         ...launchCommand(launch)
       ]);
     } else {
-      this.executor.run(this.tmuxBin, [
+      this.run([
         "new-window",
         "-t", this.sessionName(taskId),
         "-n", role.name,
@@ -169,14 +175,14 @@ export class TmuxManager {
     // An ANSI outer terminal omits smcup/rmcup, so tmux cannot replace the
     // terminal's native scrollback with an alternate screen. -T restores the
     // modern rendering and input capabilities that the real terminal offers.
-    this.executor.run(this.tmuxBin, [
+    this.run([
       "set-option", "-t", session, "status", "off"
     ]);
-    this.executor.run(this.tmuxBin, [
+    this.run([
       "set-option", "-t", session, "mouse", "off"
     ]);
     handoffTerminal(this.#terminalInput, this.#closeInteractiveInput);
-    this.executor.run(this.tmuxBin, [
+    this.run([
       "-T", NATIVE_SCROLL_TERMINAL_FEATURES,
       "attach-session", "-t", this.target(taskId, roleName)
     ], {
@@ -186,7 +192,7 @@ export class TmuxManager {
   }
 
   captureRole(taskId: string, roleName: string, lines = 80): string {
-    return this.executor.run(this.tmuxBin, [
+    return this.run([
       "capture-pane", "-p", "-t", this.target(taskId, roleName), "-S", `-${lines}`
     ]);
   }
@@ -240,7 +246,7 @@ export class TmuxManager {
 
   inspectPane(taskId: string, roleName: string): TmuxPaneState {
     const target = this.target(taskId, roleName);
-    const output = this.executor.run(this.tmuxBin, [
+    const output = this.run([
       "display-message", "-p", "-t", target,
       "#{pane_dead}|#{pane_pid}|#{pane_current_command}"
     ]).trim();
@@ -253,7 +259,7 @@ export class TmuxManager {
     const pidText = output.slice(separator + 1, secondSeparator);
     const currentCommand = output.slice(secondSeparator + 1);
     const pid = Number(pidText);
-    const content = this.executor.run(this.tmuxBin, [
+    const content = this.run([
       "capture-pane", "-p", "-t", target, "-S", "-40"
     ]);
     return {
@@ -269,12 +275,17 @@ export class TmuxManager {
 
   /** Reads every Role pane in one tmux call without capturing terminal output. */
   inspectTaskRolePanes(taskId: string): TmuxRolePaneState[] {
-    const separator = "\u001f";
+    const formatSeparator = "\u001f";
+    // tmux escapes control bytes in formatted output using backslash-octal
+    // notation, so an argv separator of 0x1f is returned as the four
+    // printable characters "\\037". Accept the raw form as well for test
+    // executors and older implementations that do not escape it.
+    const encodedSeparator = "\\037";
     let output: string;
     try {
-      output = this.executor.run(this.tmuxBin, [
+      output = this.run([
         "list-panes", "-s", "-t", this.sessionName(taskId), "-F",
-        `#{window_name}${separator}#{pane_dead}${separator}#{pane_pid}${separator}#{pane_current_command}`
+        `#{window_name}${formatSeparator}#{pane_dead}${formatSeparator}#{pane_pid}${formatSeparator}#{pane_current_command}`
       ]);
     } catch (error) {
       if (isExplicitlyAbsentTmuxSession(error)) return [];
@@ -282,6 +293,7 @@ export class TmuxManager {
     }
     return output.split("\n").flatMap((line): TmuxRolePaneState[] => {
       if (line.length === 0) return [];
+      const separator = line.includes(encodedSeparator) ? encodedSeparator : formatSeparator;
       const [roleName, deadText, pidText, currentCommand, ...extra] = line.split(separator);
       if (
         roleName === undefined
@@ -292,6 +304,71 @@ export class TmuxManager {
         || (deadText !== "0" && deadText !== "1")
       ) {
         throw runtimeError(`Tmux returned an invalid Task Role pane state for ${taskId}.`);
+      }
+      const pid = Number(pidText);
+      return [{
+        taskId,
+        roleName,
+        target: this.target(taskId, roleName),
+        dead: deadText === "1",
+        ...(Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),
+        currentCommand
+      }];
+    });
+  }
+
+  /**
+   * Reads the Role pane inventory for this YUI_HOME in one tmux server call.
+   * Terminal contents are deliberately excluded; recovery code can take a
+   * targeted readiness snapshot later for the small set of suspicious panes.
+   */
+  inspectRolePaneInventory(): TmuxRolePaneState[] {
+    const formatSeparator = "\u001f";
+    const encodedSeparator = "\\037";
+    const sessionPrefix = yuiTmuxSessionPrefix(this.#yuiHome);
+    let output: string;
+    try {
+      output = this.run([
+        "list-panes", "-a", "-F",
+        [
+          "#{session_name}",
+          "#{window_name}",
+          "#{pane_dead}",
+          "#{pane_pid}",
+          "#{pane_current_command}"
+        ].join(formatSeparator)
+      ]);
+    } catch (error) {
+      if (isExplicitlyAbsentTmuxSession(error)) return [];
+      throw error;
+    }
+
+    return output.split("\n").flatMap((line): TmuxRolePaneState[] => {
+      if (line.length === 0) return [];
+      const separator = line.includes(encodedSeparator) ? encodedSeparator : formatSeparator;
+      const [
+        sessionName,
+        roleName,
+        deadText,
+        pidText,
+        currentCommand,
+        ...extra
+      ] = line.split(separator);
+      if (
+        sessionName === undefined
+        || roleName === undefined
+        || deadText === undefined
+        || pidText === undefined
+        || currentCommand === undefined
+        || extra.length > 0
+        || (deadText !== "0" && deadText !== "1")
+      ) {
+        throw runtimeError("Tmux returned an invalid Role pane inventory row.");
+      }
+      if (!sessionName.startsWith(sessionPrefix)) return [];
+      const taskId = sessionName.slice(sessionPrefix.length);
+      if (taskId.length === 0 || roleName.length === 0) {
+        throw runtimeError("Tmux returned an invalid Yui Role pane identity.");
       }
       const pid = Number(pidText);
       return [{
@@ -351,10 +428,14 @@ export class TmuxManager {
     const apply = [
       `set-option -w -t ${tmuxWord(target)} ${option} 1`,
       `send-keys -l -t ${tmuxWord(target)} -- ${tmuxWord(input)}`,
+      // Codex consumes a long literal send as many terminal key events. Give
+      // its TUI one frame to drain those events before Enter; otherwise Enter
+      // can be consumed while the text remains visibly stranded in composer.
+      "run-shell 'sleep 0.05'",
       `send-keys -t ${tmuxWord(target)} Enter`,
       `display-message -p ${sentMarker}`
     ].join(" ; ");
-    const output = this.executor.run(this.tmuxBin, [
+    const output = this.run([
       "if-shell", "-t", target, "-F", `#{==:#{${option}},1}`,
       `display-message -p ${presentMarker}`,
       apply
@@ -385,13 +466,13 @@ export class TmuxManager {
     safeValue(receiptId, "tmux delivery receipt id");
     const digest = createHash("sha256").update(receiptId).digest("hex");
     const option = `@yui_delivery_${digest}`;
-    return this.executor.run(this.tmuxBin, [
+    return this.run([
       "show-options", "-wqv", "-t", this.target(taskId, roleName), option
     ]).trim() === "1";
   }
 
   detachRole(taskId: string): void {
-    this.executor.run(this.tmuxBin, ["detach-client", "-s", this.sessionName(taskId)]);
+    this.run(["detach-client", "-s", this.sessionName(taskId)]);
   }
 
   restartRole(taskId: string, role: TmuxRole, launch: TmuxLaunchPlan): void {
@@ -422,27 +503,27 @@ export class TmuxManager {
 
   stopTask(taskId: string): boolean {
     if (!this.hasSession(taskId)) return false;
-    this.executor.run(this.tmuxBin, ["kill-session", "-t", this.sessionName(taskId)]);
+    this.run(["kill-session", "-t", this.sessionName(taskId)]);
     return true;
   }
 
   stopRole(taskId: string, roleName: string): void {
-    this.executor.run(this.tmuxBin, ["send-keys", "-t", this.target(taskId, roleName), "C-c"]);
+    this.run(["send-keys", "-t", this.target(taskId, roleName), "C-c"]);
   }
 
   killRole(taskId: string, roleName: string): void {
-    this.executor.run(this.tmuxBin, ["kill-window", "-t", this.target(taskId, roleName)]);
+    this.run(["kill-window", "-t", this.target(taskId, roleName)]);
   }
 
   renameRole(taskId: string, oldRoleName: string, newRoleName: string): void {
-    this.executor.run(this.tmuxBin, [
+    this.run([
       "rename-window", "-t", this.target(taskId, oldRoleName), safeValue(newRoleName, "Role name")
     ]);
   }
 
   private hasSession(taskId: string): boolean {
     try {
-      this.executor.run(this.tmuxBin, ["has-session", "-t", this.sessionName(taskId)]);
+      this.run(["has-session", "-t", this.sessionName(taskId)]);
       return true;
     } catch (error) {
       if (isExplicitlyAbsentTmuxSession(error)) return false;
@@ -455,7 +536,7 @@ export class TmuxManager {
 
   private windowNames(taskId: string): string[] {
     if (!this.hasSession(taskId)) return [];
-    return this.executor.run(this.tmuxBin, [
+    return this.run([
       "list-windows", "-t", this.sessionName(taskId), "-F", "#{window_name}"
     ]).split("\n").map((name) => name.trim()).filter(Boolean);
   }
@@ -466,6 +547,11 @@ export class TmuxManager {
 
   private target(taskId: string, roleName: string): string {
     return yuiTmuxTarget(this.#yuiHome, taskId, roleName);
+  }
+
+  /** Every operation is pinned to the server derived from this YUI_HOME. */
+  private run(args: string[], options?: CommandRunOptions): string {
+    return this.executor.run(this.tmuxBin, ["-L", this.#serverName, ...args], options);
   }
 }
 
@@ -519,8 +605,24 @@ export class TmuxDeliveryPump {
 
 export function yuiTmuxSessionName(yuiHome: string, taskId: string): string {
   const safeTaskId = safeValue(taskId, "Task id");
+  return `${yuiTmuxSessionPrefix(yuiHome)}${safeTaskId}`;
+}
+
+function yuiTmuxSessionPrefix(yuiHome: string): string {
   const namespace = createHash("sha256").update(resolve(yuiHome)).digest("hex").slice(0, 12);
-  return `yui-${namespace}-${safeTaskId}`;
+  return `yui-${namespace}-`;
+}
+
+/**
+ * tmux socket labels are not paths. Keep the label in a deliberately narrow,
+ * fixed-size alphabet so it is safe as argv and leaves ample Unix socket-path
+ * headroom. resolve() makes equivalent absolute/relative YUI_HOME paths share
+ * one server without depending on whether the directory already exists.
+ */
+export function yuiTmuxServerName(yuiHome: string): string {
+  const canonicalHome = resolve(safeValue(yuiHome, "YUI_HOME"));
+  const digest = createHash("sha256").update(canonicalHome).digest("hex").slice(0, 24);
+  return `yui-${digest}`;
 }
 
 export function yuiTmuxTarget(yuiHome: string, taskId: string, roleName: string): string {

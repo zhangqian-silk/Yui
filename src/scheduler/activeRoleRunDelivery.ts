@@ -5,13 +5,18 @@ import type {
   SchedulerStorePort,
   TmuxDeliveryPort
 } from "./ports.js";
+import {
+  selectedSchedulerRoles,
+  selectedSchedulerTasks,
+  type SchedulerReconcileSelection
+} from "./ports.js";
 
 export type ActiveRoleRunDeliveryResult = Readonly<{
   taskId: string;
   roleName: string;
   runId: string;
   status: "delivered" | "already-delivered" | "skipped" | "failed";
-  reason?: "workspace-not-ready";
+  reason?: "workspace-not-ready" | "mailbox-empty" | "mailbox-busy" | "not-ready" | "runtime-unavailable" | "delivery-uncertain";
   error?: string;
 }>;
 
@@ -23,12 +28,13 @@ export type ActiveRoleRunDeliveryResult = Readonly<{
 export async function processActiveRoleRunDeliveries(
   store: SchedulerStorePort,
   delivery: TmuxDeliveryPort,
-  now: Date
+  now: Date,
+  selection?: SchedulerReconcileSelection
 ): Promise<ActiveRoleRunDeliveryResult[]> {
   const results: ActiveRoleRunDeliveryResult[] = [];
-  for (const task of store.listTasks()) {
+  for (const task of selectedSchedulerTasks(store, selection)) {
     if (task.status !== "active") continue;
-    for (const role of store.listRoles(task.id)) {
+    for (const role of selectedSchedulerRoles(store, task.id, selection)) {
       const run = store.getActiveAgentRun(task.id, role.name);
       // A crash after a Leader wake is durably claimed but before tmux input
       // is recoverable through the same receipt-backed delivery path.
@@ -46,6 +52,35 @@ export async function processActiveRoleRunDeliveries(
 
       const existingSession = store.getRoleSession(task.id, role.name);
       const receiptId = `agent-run:${run.id}`;
+      const target = { kind: "role", taskId: task.id, roleName: role.name } as const;
+      const claim = store.claimWorkMailbox({
+        target,
+        batchId: receiptId,
+        owner: "controller",
+        now,
+        executionRef: { type: "run", id: run.id }
+      });
+      if (claim.status === "empty") {
+        results.push({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          status: "skipped",
+          reason: "mailbox-empty"
+        });
+        continue;
+      }
+      const processing = claim.processing;
+      if (processing.executionRef?.type !== "run" || processing.executionRef.id !== run.id) {
+        results.push({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          status: "skipped",
+          reason: "mailbox-busy"
+        });
+        continue;
+      }
       try {
         const nativeSessionId = run.mode === "resume"
           ? requireResumeSession(role, existingSession)
@@ -55,6 +90,7 @@ export async function processActiveRoleRunDeliveries(
           roleName: role.name,
           agentId: role.activeAgentId,
           adapterId: role.adapterId,
+          workspace: role.workspace,
           mode: run.mode,
           ...(nativeSessionId === undefined ? {} : { nativeSessionId })
         });
@@ -64,22 +100,36 @@ export async function processActiveRoleRunDeliveries(
         }) ?? null;
         const ready = existingReceipt ?? await delivery.waitUntilReady(prepared);
         const session = validateReadySession(role, existingSession, run.mode, ready);
+        store.saveRoleRunPrepared({ task, role, run, session, now });
         let status: ActiveRoleRunDeliveryResult["status"] = "already-delivered";
         if (existingReceipt === null) {
-          status = await delivery.sendOnce({
+          const outcome = await delivery.sendOnce({
             delivery: ready,
             receiptId,
             text: run.input
-          }) === "sent" ? "delivered" : "already-delivered";
+          });
+          if (outcome === "busy" || outcome === "unavailable") {
+            results.push({
+              taskId: task.id,
+              roleName: role.name,
+              runId: run.id,
+              status: "skipped",
+              reason: outcome === "busy" ? "not-ready" : "runtime-unavailable"
+            });
+            continue;
+          }
+          status = outcome === "sent" ? "delivered" : "already-delivered";
         }
         store.saveRoleRunDelivery({ task, role, run, session, now });
         results.push({ taskId: task.id, roleName: role.name, runId: run.id, status });
       } catch (error) {
+        store.releaseWorkMailbox(target, processing.batchId);
         results.push({
           taskId: task.id,
           roleName: role.name,
           runId: run.id,
           status: "failed",
+          reason: "delivery-uncertain",
           error: error instanceof Error ? error.message : String(error)
         });
       }
@@ -111,6 +161,10 @@ function validateReadySession(
   }
   if (session.agentId !== role.activeAgentId || session.adapterId !== role.adapterId) {
     throw new Error(`Ready Role session identity changed: ${role.taskId}/${role.name}.`);
+  }
+  if (existing?.nativeSessionId !== undefined
+    && session.nativeSessionId !== existing.nativeSessionId) {
+    throw new Error(`Ready Role session changed the fixed native session id: ${role.taskId}/${role.name}.`);
   }
   if (mode === "resume" && session.nativeSessionId !== existing?.nativeSessionId) {
     throw new Error(`Role resume changed the fixed native session id: ${role.taskId}/${role.name}.`);

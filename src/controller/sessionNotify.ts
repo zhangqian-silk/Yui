@@ -1,7 +1,8 @@
 import type { ControllerDispatcher } from "../core/controllerServer.js";
+import { callController } from "../core/controllerClient.js";
 import type { JsonValue } from "../core/protocol.js";
-import type { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
-import { callFileTaskController } from "./clientRuntime.js";
+import { FileTaskStore } from "../storage/taskStore.js";
+import { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
 
 const SESSION_BIND_METHOD = "runtime.session.bind";
 
@@ -12,6 +13,14 @@ export type SessionBindParams = Readonly<{
   agentId: string;
   adapterId: "codex";
   nativeSessionId: string;
+  turnId: string;
+  lastAssistantMessage: string;
+}>;
+
+export type SessionTurnCompleted = Readonly<{
+  scope: "task" | "global";
+  taskId?: string;
+  roleName: string;
 }>;
 
 type ControllerCall = (
@@ -24,14 +33,45 @@ type ControllerCall = (
 export async function runSessionNotifyCommand(
   payloadArgument: string | undefined,
   environment: NodeJS.ProcessEnv = process.env,
-  call: ControllerCall = callFileTaskController
+  call?: ControllerCall
 ): Promise<void> {
   const params = parseCodexSessionNotification(payloadArgument, environment);
-  await call(
-    requireText(environment.YUI_HOME, "YUI_HOME"),
-    SESSION_BIND_METHOD,
-    toJson(params)
-  );
+  const home = requireText(environment.YUI_HOME, "YUI_HOME");
+  if (call !== undefined) {
+    await call(home, SESSION_BIND_METHOD, toJson(params));
+    return;
+  }
+  const schedulerStore = new FileSchedulerStoreAdapter(new FileTaskStore(home));
+  if (params.scope === "task") {
+    schedulerStore.observeRuntimeTurnCompleted({
+      taskId: params.taskId!,
+      roleName: params.roleName,
+      agentId: params.agentId,
+      adapterId: params.adapterId,
+      nativeSessionId: params.nativeSessionId,
+      turnId: params.turnId,
+      summary: truncateUtf8(params.lastAssistantMessage, 32 * 1024)
+    });
+  } else {
+    schedulerStore.recordGlobalRuntimeNativeSession({
+      roleName: params.roleName,
+      agentId: params.agentId,
+      adapterId: params.adapterId,
+      nativeSessionId: params.nativeSessionId
+    });
+  }
+  // The durable write is authoritative. This short socket call is only a
+  // wake-up hint and never starts or waits for a Controller process.
+  await callController(
+    home,
+    "scheduler.signal",
+    {
+      key: params.scope === "task"
+        ? `role:${encodeURIComponent(params.taskId!)}/${encodeURIComponent(params.roleName)}`
+        : "operator"
+    },
+    { timeoutMs: 100 }
+  ).catch(() => {});
 }
 
 export function parseCodexSessionNotification(
@@ -43,6 +83,8 @@ export function parseCodexSessionNotification(
     throw new Error("Codex notify payload type is invalid.");
   }
   const nativeSessionId = requireText(payload["thread-id"], "Codex thread-id");
+  const turnId = requireText(payload["turn-id"], "Codex turn-id");
+  const lastAssistantMessage = requireAssistantMessage(payload["last-assistant-message"]);
   const scope = environment.YUI_SESSION_SCOPE;
   if (scope !== "task" && scope !== "global") {
     throw new Error("YUI_SESSION_SCOPE must be task or global.");
@@ -52,7 +94,9 @@ export function parseCodexSessionNotification(
     roleName: requireText(environment.YUI_ROLE, "YUI_ROLE"),
     agentId: requireText(environment.YUI_AGENT_ID, "YUI_AGENT_ID"),
     adapterId: requireCodexAdapter(environment.YUI_ADAPTER_ID),
-    nativeSessionId
+    nativeSessionId,
+    turnId,
+    lastAssistantMessage
   } as const;
   return scope === "task"
     ? {
@@ -65,7 +109,8 @@ export function parseCodexSessionNotification(
 /** Controller-side handler; session identity never travels through an Agent prompt. */
 export function createSessionNotifyDispatcher(
   store: FileSchedulerStoreAdapter,
-  fallback?: ControllerDispatcher
+  fallback?: ControllerDispatcher,
+  onTurnCompleted?: (event: SessionTurnCompleted) => void
 ): ControllerDispatcher {
   return async (method, params) => {
     if (method !== SESSION_BIND_METHOD) {
@@ -74,12 +119,14 @@ export function createSessionNotifyDispatcher(
     }
     const input = parseSessionBindParams(params);
     const recorded = input.scope === "task"
-      ? store.recordRuntimeNativeSession({
+      ? store.recordRuntimeTurnCompleted({
           taskId: input.taskId!,
           roleName: input.roleName,
           agentId: input.agentId,
           adapterId: input.adapterId,
-          nativeSessionId: input.nativeSessionId
+          nativeSessionId: input.nativeSessionId,
+          turnId: input.turnId,
+          summary: input.lastAssistantMessage
         })
       : store.recordGlobalRuntimeNativeSession({
           roleName: input.roleName,
@@ -87,11 +134,16 @@ export function createSessionNotifyDispatcher(
           adapterId: input.adapterId,
           nativeSessionId: input.nativeSessionId
         });
+    onTurnCompleted?.(input.scope === "task"
+      ? { scope: "task", taskId: input.taskId!, roleName: input.roleName }
+      : { scope: "global", roleName: input.roleName });
     return {
       recorded: true,
       scope: input.scope,
       roleName: input.roleName,
-      nativeSessionId: recorded.nativeSessionId
+      nativeSessionId: "session" in recorded
+        ? recorded.session.nativeSessionId
+        : recorded.nativeSessionId
     };
   };
 }
@@ -101,8 +153,14 @@ function parseSessionBindParams(value: JsonValue): SessionBindParams {
   const input = value as Record<string, JsonValue>;
   const scope = input.scope;
   const expected = scope === "task"
-    ? ["scope", "taskId", "roleName", "agentId", "adapterId", "nativeSessionId"]
-    : ["scope", "roleName", "agentId", "adapterId", "nativeSessionId"];
+    ? [
+        "scope", "taskId", "roleName", "agentId", "adapterId",
+        "nativeSessionId", "turnId", "lastAssistantMessage"
+      ]
+    : [
+        "scope", "roleName", "agentId", "adapterId",
+        "nativeSessionId", "turnId", "lastAssistantMessage"
+      ];
   if ((scope !== "task" && scope !== "global") || !hasExactKeys(input, expected)) {
     throw invalidParams();
   }
@@ -112,7 +170,9 @@ function parseSessionBindParams(value: JsonValue): SessionBindParams {
       roleName: requireText(input.roleName, "Role name"),
       agentId: requireText(input.agentId, "Agent id"),
       adapterId: requireCodexAdapter(input.adapterId),
-      nativeSessionId: requireText(input.nativeSessionId, "Native session id")
+      nativeSessionId: requireText(input.nativeSessionId, "Native session id"),
+      turnId: requireText(input.turnId, "Codex turn id"),
+      lastAssistantMessage: requireAssistantMessage(input.lastAssistantMessage)
     } as const;
     return scope === "task"
       ? { ...common, taskId: requireText(input.taskId, "Task id") }
@@ -147,6 +207,24 @@ function requireText(value: unknown, label: string): string {
   const text = value.trim();
   if (text.length === 0 || text.length > 1_024) throw new Error(`${label} is invalid.`);
   return text;
+}
+
+function requireAssistantMessage(value: unknown): string {
+  if (typeof value !== "string" || value.includes("\0")) {
+    throw new Error("Codex last assistant message is required.");
+  }
+  const text = value.trim();
+  if (text.length === 0 || Buffer.byteLength(text) > 524_288) {
+    throw new Error("Codex last assistant message is invalid.");
+  }
+  return text;
+}
+
+function truncateUtf8(value: string, maximumBytes: number): string {
+  const encoded = Buffer.from(value, "utf8");
+  return encoded.length <= maximumBytes
+    ? value
+    : encoded.subarray(0, maximumBytes).toString("utf8");
 }
 
 function isObject(value: unknown): value is Record<string, any> {

@@ -1,6 +1,8 @@
 import { runtimeError, taskNotFound, usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
-import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
+import { formatTimestamp } from "../output/timePresentation.js";
+import { enqueueWork } from "../coordination/workMailboxQueue.js";
+import type { MailboxTarget } from "../coordination/workMailbox.js";
 import type { TaskStore } from "../storage/taskStore.js";
 
 const WAKEUP_PREFIX = "leader-wakeup:";
@@ -8,6 +10,7 @@ const RECOVERY_PREFIX = "leader-recovery:";
 
 export type JobCommandRuntimePort = Readonly<{
   notifyStateChanged(taskId: string): void;
+  notifyMailboxChanged?(target: MailboxTarget): void;
 }>;
 
 export type JobCommandOptions = Readonly<{
@@ -60,7 +63,7 @@ function listJobs(args: string[], store: TaskStore): string {
       job.taskId,
       job.kind,
       job.status,
-      job.updatedAt,
+      formatTimestamp(job.updatedAt, store.getConfig().timeZone),
       job.detail
     ]),
     defaultTableWidth()
@@ -124,8 +127,16 @@ function retryJob(
     }
     tx.clearLeaderFailure(task.id);
     tx.clearOperatorNotification(task.id);
-    queueLeaderWakeup(tx, task.id, "recovery-retry", now);
+    enqueueWork(
+      tx,
+      { kind: "role", taskId: task.id, roleName: "leader" },
+      "recovery-retry",
+      now,
+      [{ type: "task", id: task.id }]
+    );
   });
-  runtime.notifyStateChanged(taskId);
+  const target: MailboxTarget = { kind: "role", taskId, roleName: "leader" };
+  if (runtime.notifyMailboxChanged !== undefined) runtime.notifyMailboxChanged(target);
+  else runtime.notifyStateChanged(taskId);
   return `Retry requested for ${id}\n`;
 }

@@ -1,6 +1,9 @@
 import { reconciliationIntervalMilliseconds } from "../config/yuiConfig.js";
 import type { ControllerDispatcher } from "../core/controllerServer.js";
-import { ExecutorRegistry } from "../executor/executorRegistry.js";
+import {
+  agentComposerReadinessProbe,
+  ExecutorRegistry
+} from "../executor/executorRegistry.js";
 import { FileRoleLaunchPlanner } from "../executor/fileRoleLaunchPlanner.js";
 import { FileTaskStore, type TaskStore } from "../storage/taskStore.js";
 import {
@@ -10,12 +13,21 @@ import {
 import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
 import { TmuxManager } from "../tmux/tmuxManager.js";
 import {
+  TmuxPromptPushAdapter,
+  TmuxSessionHost,
+  type ActivePromptPushPort,
+  type SessionHostPort
+} from "../runtime/index.js";
+import {
   startFileTaskController,
   type ControllerRuntimeOptions,
   type RunningFileTaskController
 } from "./controller.js";
 import { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
-import { createSessionNotifyDispatcher } from "./sessionNotify.js";
+import {
+  createSessionNotifyDispatcher,
+  type SessionTurnCompleted
+} from "./sessionNotify.js";
 
 export type FileTaskControllerFactoryOptions = ControllerRuntimeOptions & Readonly<{
   store?: TaskStore;
@@ -23,6 +35,8 @@ export type FileTaskControllerFactoryOptions = ControllerRuntimeOptions & Readon
   planner?: FileRoleLaunchPlanner;
   tmux?: TmuxManager;
   delivery?: ExecutorRegistry;
+  sessionHost?: SessionHostPort;
+  promptPush?: ActivePromptPushPort;
   dispatcher?: ControllerDispatcher;
   environment?: NodeJS.ProcessEnv;
   workspacePreparer?: TaskWorkspacePreparer;
@@ -34,6 +48,8 @@ export type RunningFileTaskControllerRuntime = RunningFileTaskController & Reado
   planner: FileRoleLaunchPlanner;
   tmux: TmuxManager;
   delivery: ExecutorRegistry;
+  sessionHost: SessionHostPort;
+  promptPush: ActivePromptPushPort;
   workspacePreparer: TaskWorkspacePreparer;
 }>;
 
@@ -52,16 +68,52 @@ export async function startFileTaskControllerRuntime(
     new NodeCommandExecutor(),
     { yuiHome: home }
   );
-  const delivery = options.delivery ?? new ExecutorRegistry(planner, tmux);
+  const sessionHost = options.sessionHost ?? new TmuxSessionHost(planner, tmux);
+  const promptPush = options.promptPush
+    ?? new TmuxPromptPushAdapter(tmux, agentComposerReadinessProbe);
+  const delivery = options.delivery ?? new ExecutorRegistry(
+    planner,
+    tmux,
+    agentComposerReadinessProbe,
+    { sessionHost, promptPush }
+  );
   const workspacePreparer = options.workspacePreparer
     ?? new FileTaskWorkspacePreparer(home, store);
-  const dispatcher = createSessionNotifyDispatcher(schedulerStore, options.dispatcher);
+  let signalTurnCompleted: ((event: SessionTurnCompleted) => void) | undefined;
+  const pendingTurnCompletions: SessionTurnCompleted[] = [];
+  const dispatcher = createSessionNotifyDispatcher(
+    schedulerStore,
+    options.dispatcher,
+    (event) => {
+      if (signalTurnCompleted === undefined) pendingTurnCompletions.push(event);
+      else signalTurnCompleted(event);
+    }
+  );
   const running = await startFileTaskController(home, schedulerStore, delivery, dispatcher, {
     intervalMs: options.intervalMs
       ?? reconciliationIntervalMilliseconds(store.getConfig().reconciliationIntervalSeconds),
+    signalWindowMs: options.signalWindowMs,
+    deliveryRetryMs: options.deliveryRetryMs,
+    deliveryRetryLimit: options.deliveryRetryLimit,
     now: options.now,
     onError: options.onError,
     workspacePreparer
   });
-  return { ...running, store, schedulerStore, planner, tmux, delivery, workspacePreparer };
+  signalTurnCompleted = (event) => running.runtime.signal(
+    event.scope === "task"
+      ? `role:${encodeURIComponent(event.taskId!)}/${encodeURIComponent(event.roleName)}`
+      : "operator"
+  );
+  for (const event of pendingTurnCompletions) signalTurnCompleted(event);
+  return {
+    ...running,
+    store,
+    schedulerStore,
+    planner,
+    tmux,
+    delivery,
+    sessionHost,
+    promptPush,
+    workspacePreparer
+  };
 }

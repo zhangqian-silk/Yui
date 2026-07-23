@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
+import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import {
@@ -22,7 +24,21 @@ function fixture(t) {
   t.after(() => rmSync(root, { recursive: true, force: true }));
   ensureStorageSchema(root, NOW);
   const store = new FileTaskStore(root);
-  store.saveTask(activateTask(createTask("task-1", "Knowledge CLI", NOW), NOW));
+  const task = activateTask(createTask("task-1", "Knowledge CLI", NOW), NOW);
+  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], NOW);
+  store.transaction((tx) => {
+    tx.saveConfig({ schemaVersion: 1, defaultAgent: agent.id, defaultWorkspace: root });
+    tx.saveConfiguredAgent(agent);
+    tx.saveTask(task);
+    tx.saveRole(task.id, createRole(
+      task.id,
+      "leader",
+      [createRoleAgentBinding(agent)],
+      agent.id,
+      root,
+      NOW
+    ));
+  });
   const runtime = {
     notifyStateChanged() {},
     reconcileTask() {},

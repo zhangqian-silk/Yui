@@ -105,9 +105,9 @@ yui task input request <task-id> --question "默认使用哪种格式？" \
   --recommend csv --timeout-seconds 300
 ```
 
-推荐项会明确展示给用户；如果截止时间前没有回答，第一轮到期后的 Controller 扫描会原子采用这个确定选项，并排队恢复固定的 Leader session。自由文本和必须由用户回答的请求永远不会自动解决。
+推荐项会明确展示给用户；如果截止时间前没有回答，独立的最近 deadline timer 会唤醒 Controller，原子采用这个确定选项，并排队恢复固定的 Leader session。自由文本和必须由用户回答的请求永远不会自动解决。
 
-`task input list` 是权威的全局开放输入 Inbox；可附加 Task ID 限定范围，或使用 `--all` 查看已回答和已取消的请求。Controller 还会尝试向已经运行且处于输入状态的 Operator composer 投递一次带回执的提示；它不会为了通知而启动或打断 Operator。Operator 不在线或正忙时，请求仍保留在 Inbox，并在后续 Controller 扫描时重新尝试。用户和 Operator 都可回答。存在开放请求时，无关的 pending wake 不会绕过等待，Task 也不能 complete 或 archive。原 Leader 也可执行 `yui task input cancel <task-id> <input-id> --reason "..."`，取消不会使 Leader 自唤醒。
+`task input list` 是权威的全局开放输入 Inbox；可附加 Task ID 限定范围，或使用 `--all` 查看已回答和已取消的请求。Controller 还会尝试向已经运行且处于输入状态的 Operator composer 投递一次带回执的提示；它不会为了通知而启动或打断 Operator。Operator 不在线或正忙时，请求仍保留在 Inbox，并在后续 Controller 定向处理中重新尝试。用户和 Operator 都可回答。存在开放请求时，无关的 pending wake 不会绕过等待，Task 也不能 complete 或 archive。原 Leader 也可执行 `yui task input cancel <task-id> <input-id> --reason "..."`，取消会排队恢复该固定 Leader session。
 
 ```sh
 yui task context <task-id>
@@ -139,6 +139,8 @@ yui task role enter <task-id> <role>
 
 Claude 的 session ID 在启动前分配。受管理的 Codex 启动使用 Codex 结构化 `notify` 回调，在 turn 完成后记录 thread ID，不再向模型对话注入 session-bind prompt。
 
+稳定的 Role 上下文也属于启动元数据，而不是 bootstrap turn。Yui 通过 Agent 原生的 system/developer instruction 通道传入 Role 策略和 `systemPrompt`。原生 Codex CLI 没有按会话追加 Skill root 的参数，因此 developer instructions 只携带精简的 Skill 绝对路径，由 Codex 按需读取 `SKILL.md`；`skills.config` 只负责启停已发现 Skill，Yui 不会误用它。Claude 通过追加 system prompt 接收同一份 Skill 内容。因此 Operator 会停在空白的原生 composer，用户输入仍是第一条 user message；Leader wake 和 Worker Run assignment 仍是邮箱投递的真实工作消息。不具备原生指令通道的 adapter 必须拒绝这类上下文，不能静默降级为首轮 user prompt。
+
 ## Controller 与失败处理
 
 每个 `YUI_HOME` 有一个后台 Controller：
@@ -151,7 +153,7 @@ yui controller restart
 
 `controller restart` 会用当前安装的 Yui 版本替换 Controller 进程及其调度循环、socket 服务，不会停止或重启已受管的 tmux/Agent 会话。
 
-完整 reconciliation 默认每 30 秒执行一次；持久状态变化仍会立即请求一次扫描。保留的闭环为：
+恢复 reconciliation 默认每 120 秒执行一次。普通持久状态变化只会将 Task、Role 或 Operator key 放入队列并立即返回；固定 100ms 窗口内到达的 key 会合并触发一次不重叠的定向处理。Operator 呈现使用独立 lane，不会被 Task 的 Git/worktree 操作阻塞；周期 Git/worktree 处理只覆盖仍有持久 Task mailbox 工作的 Task，活动 Role 的存活检查合并为一次 tmux inventory。Codex turn-complete Hook 直接写入存储，不启动或等待 Controller，并给合法的 yield、输入请求或完成动作保留 2 秒竞争窗口；到期后才关闭被 Agent 遗忘的活动 Role Run。持久 WorkMailbox 会冻结当前 processing 批次，期间的新事件合并到下一 pending 批次；失败会释放当前批次供恢复。推荐输入与 pending Turn 共用最近 deadline 选择器，不依赖恢复扫描间隔；显式 `task reconcile` 仍会立即请求恢复扫描。保留的闭环为：
 
 1. 准备 active Task 的 repository workspace；
 2. 停止 archived Task 的 tmux，并只清理干净 worktree；
@@ -159,7 +161,7 @@ yui controller restart
 4. 检测活动 Role 进程退出；
 5. Leader 空闲时投递 pending wake。
 
-自动输入只通过 tmux 投递，并先进行 Agent 专属 readiness 检查。pane 内 receipt 可避免 Controller 重试时重复输入同一 Run。
+自动输入只通过 tmux 投递。每次处理只做一次非阻塞的 Agent 专属 readiness 检查；启动阶段忙碌时通过小型有界 mailbox timer 重试，后续忙碌会话通常由 Codex turn-complete 事件再次唤醒。pane 内 receipt 可避免 Controller 重试时重复输入同一 Run。
 
 Role 在 yield 前退出时，Controller 会失败对应 Run 和 running WorkItem，并唤醒 Leader。恢复状态通过精简的 Jobs 兼容视图呈现：
 
@@ -200,6 +202,27 @@ npm test
 npm run lint
 ```
 
+如需让所有终端及受管 Agent 会话使用当前 checkout，可逆地接管用户级 `yui` 命令：
+
+```sh
+make link
+command -v yui
+yui doctor
+```
+
+第一次执行 `make link` 会把最初的 `yui` 入口保存在同一个用户级 bin 目录，再用指向当前 checkout 的受管符号链接接管命令。之后在其他 checkout 执行 `make link` 只会移动这个受管链接：最后执行者生效，开发环境之间不会形成备份链。launcher 默认使用当前生效 checkout 的 `output/dev/home` 作为 `YUI_HOME`；显式设置的 `YUI_HOME` 仍然优先。因为替换的是命令入口，其他终端和之后创建的 Codex/Claude 会话无需 source 也会使用同一个开发版本。若已有 Controller 也需要加载新代码，请执行 `yui controller restart`。任意采用本实现的 checkout 都可以执行 `make unlink`；它会校验共享受管状态并恢复唯一一份最初 `yui` 入口。
+
+```sh
+make unlink
+```
+
 ## 许可证
 
 [MIT](../LICENSE)
+面向用户的时间默认按北京时间（`Asia/Shanghai`）显示；持久化记录和
+`--json` 数据仍使用 UTC/RFC 3339。可通过以下命令查看或修改 IANA 时区：
+
+```sh
+yui config show
+yui config set --time-zone Europe/London
+```

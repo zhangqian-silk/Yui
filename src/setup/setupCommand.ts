@@ -14,6 +14,7 @@ import type { CompletionStore } from "../completion/completionInstaller.js";
 import { runCompletionWizard } from "../completion/completionWizard.js";
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
+import { resolveTimeZone } from "../output/timePresentation.js";
 import {
   createGlobalRole,
   createRoleAgentBinding,
@@ -103,7 +104,8 @@ export async function runSetupCommand(
       `Agents configured: ${result.agentIds.join(", ")}.`,
       `Default Agent: ${result.defaultAgentId}.`,
       `Operator Agent: ${result.operatorAgentId}.`,
-      `Operator workspace: ${result.workspace}.`
+      `Operator workspace: ${result.workspace}.`,
+      `Time zone: ${resolveTimeZone(new FileTaskStore(home).getConfig().timeZone)}.`
     ];
     if (dependency === undefined || dependency === "tmux") {
       lines.push(...await setupTmux(env, executor, question));
@@ -212,7 +214,8 @@ async function configureYui(
   store.saveConfig({
     ...store.getConfig(),
     defaultAgent: defaultAgentId,
-    defaultWorkspace: workspace
+    defaultWorkspace: workspace,
+    timeZone: resolveTimeZone(store.getConfig().timeZone)
   });
   ensureSystemRole(store, SYSTEM_OPERATOR_ROLE, operatorAgent, workspace, now);
   ensureSystemRole(store, SYSTEM_LEADER_ROLE, defaultAgent, workspace, now);

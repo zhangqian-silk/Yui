@@ -13,6 +13,14 @@ import { isDeepStrictEqual } from "node:util";
 import { validateConfiguredAgent, type ConfiguredAgent } from "../agent/agent.js";
 import type { TaskBrief } from "../brief/taskBrief.js";
 import { reconciliationIntervalMilliseconds } from "../config/yuiConfig.js";
+import { resolveTimeZone } from "../output/timePresentation.js";
+import {
+  mailboxTargetKey,
+  validateWorkMailbox,
+  type MailboxEntityRef,
+  type MailboxTarget,
+  type WorkMailbox
+} from "../coordination/workMailbox.js";
 import type { Decision } from "../decision/decision.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import {
@@ -65,6 +73,7 @@ export type YuiConfig = Readonly<{
   schemaVersion: 1;
   defaultAgent?: string;
   defaultWorkspace?: string;
+  timeZone?: string;
   currentTaskId?: string;
   lastTaskId?: string;
   reconciliationIntervalSeconds?: number;
@@ -80,7 +89,7 @@ export type ConfiguredAgentUpdateResult = Readonly<{
 
 type ActiveRunPointer = Readonly<{ schemaVersion: 1; runId: string }>;
 type StoredTask = {
-  schemaVersion: 1;
+  schemaVersion: 3;
   task: Task;
   brief: TaskBrief | null;
   roles: Record<string, TaskRole>;
@@ -94,13 +103,12 @@ type StoredTask = {
   decisions: Record<string, Decision>;
   milestones: Record<string, Milestone>;
   events: Record<string, TaskEvent>;
-  pendingWakeup: PendingWakeup | null;
   leaderFailure: LeaderFailure | null;
   operatorNotification: OperatorNotification | null;
 };
 
 type StorageState = {
-  schemaVersion: 1;
+  schemaVersion: 3;
   revision: number;
   config: YuiConfig;
   configuredAgents: Record<string, ConfiguredAgent>;
@@ -108,6 +116,7 @@ type StorageState = {
   globalRoles: Record<string, GlobalRole>;
   globalRoleSessionSets: Record<string, GlobalRoleSessionSet>;
   tasks: Record<string, StoredTask>;
+  mailboxes: Record<string, WorkMailbox>;
 };
 
 export type TaskStore = {
@@ -191,6 +200,11 @@ export type TaskStore = {
   nextEventId(taskId: string): string;
   saveEvent(taskId: string, event: TaskEvent): void;
   listEvents(taskId: string): TaskEvent[];
+  getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
+  listWorkMailboxes(): WorkMailbox[];
+  saveWorkMailbox(mailbox: WorkMailbox): void;
+  removeWorkMailbox(target: MailboxTarget): boolean;
+  /** @deprecated Transitional projection over the Leader Role WorkMailbox. It cannot expose processing batches or refs. */
   getPendingWakeup(taskId: string): PendingWakeup | null;
   listPendingWakeups(): PendingWakeup[];
   savePendingWakeup(wakeup: PendingWakeup): void;
@@ -416,7 +430,11 @@ export class FileTaskStore implements TaskStore {
         throw new StorageRecordError(`Task Role workspace must be cleaned before removing the Role: ${taskId}/${name}`);
       }
       const removed = this.#remove(() => aggregate.roles, name);
-      this.#mutate(() => { delete aggregate.roleSessionSets[name]; delete aggregate.activeRuns[name]; });
+      this.#mutate((state) => {
+        delete aggregate.roleSessionSets[name];
+        delete aggregate.activeRuns[name];
+        delete state.mailboxes[mailboxTargetKey({ kind: "role", taskId, roleName: name })];
+      });
       return removed;
     });
   }
@@ -506,6 +524,12 @@ export class FileTaskStore implements TaskStore {
       const current = store.getActiveAgentRun(run.taskId, run.roleName);
       if (current !== null && current.id !== run.id) {
         throw new StorageRecordError(`Role already has an active Agent run: ${run.taskId}/${run.roleName}`);
+      }
+      const sessions = store.getTaskRoleSessionSet(run.taskId, run.roleName);
+      if (sessions !== null && sessions.inFlight !== null && sessions.inFlight.runId !== run.id) {
+        throw new StorageRecordError(
+          `Role still has an in-flight Turn: ${run.taskId}/${run.roleName}/${sessions.inFlight.runId}`
+        );
       }
       store.saveAgentRun(run);
       this.#mutate((state) => {
@@ -626,12 +650,70 @@ export class FileTaskStore implements TaskStore {
   }
   listEvents(taskId: string): TaskEvent[] { return values(this.#requireTask(taskId).events, "id"); }
 
-  getPendingWakeup(taskId: string): PendingWakeup | null { return optional(this.#state().tasks[taskId]?.pendingWakeup ?? undefined); }
-  listPendingWakeups(): PendingWakeup[] {
-    return Object.values(this.#state().tasks).flatMap((task) => task.pendingWakeup === null ? [] : [clone(task.pendingWakeup)]).sort((a, b) => numericCompare(a.taskId, b.taskId));
+  getWorkMailbox(target: MailboxTarget): WorkMailbox | null {
+    return optional(this.#state().mailboxes[mailboxTargetKey(target)]);
   }
-  savePendingWakeup(value: PendingWakeup): void { this.#saveSingleton(value.taskId, "pendingWakeup", value, "Pending wakeup"); }
-  clearPendingWakeup(taskId: string): void { this.#clearSingleton(taskId, "pendingWakeup"); }
+  listWorkMailboxes(): WorkMailbox[] {
+    return Object.entries(this.#state().mailboxes)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([, mailbox]) => clone(mailbox));
+  }
+  saveWorkMailbox(value: WorkMailbox): void {
+    let mailbox: WorkMailbox;
+    try { mailbox = validateWorkMailbox(value); }
+    catch (error) { throw new StorageRecordError(error instanceof Error ? error.message : String(error)); }
+    this.#mutate((state) => {
+      validateMailboxReferences(state, mailbox);
+      state.mailboxes[mailboxTargetKey(mailbox.target)] = clone(mailbox);
+    });
+  }
+  removeWorkMailbox(target: MailboxTarget): boolean {
+    return this.#remove((state) => state.mailboxes, mailboxTargetKey(target));
+  }
+
+  getPendingWakeup(taskId: string): PendingWakeup | null {
+    return pendingWakeupProjection(this.getWorkMailbox({ kind: "role", taskId, roleName: "leader" }));
+  }
+  listPendingWakeups(): PendingWakeup[] {
+    return this.listWorkMailboxes()
+      .flatMap((mailbox) => {
+        const wakeup = pendingWakeupProjection(mailbox);
+        return wakeup === null ? [] : [wakeup];
+      })
+      .sort((a, b) => numericCompare(a.taskId, b.taskId));
+  }
+  savePendingWakeup(value: PendingWakeup): void {
+    const wakeup = identified<PendingWakeup>(value, 1, "taskId", value.taskId, "Pending wakeup");
+    const target: MailboxTarget = { kind: "role", taskId: wakeup.taskId, roleName: "leader" };
+    this.transaction(() => {
+      const existing = this.getWorkMailbox(target);
+      if (existing !== null && existing.pending !== null
+        && wakeup.requestCount < existing.pending.requestCount) {
+        throw new StorageRecordError(`Pending wakeup is stale: ${wakeup.taskId}`);
+      }
+      const fromSequence = existing?.pending?.fromSequence ?? existing?.nextSequence ?? 1;
+      const toSequence = fromSequence + wakeup.requestCount - 1;
+      this.saveWorkMailbox({
+        schemaVersion: 1,
+        target,
+        nextSequence: Math.max(existing?.nextSequence ?? 1, toSequence + 1),
+        processing: existing?.processing ?? null,
+        pending: {
+          ...existing?.pending,
+          fromSequence,
+          toSequence,
+          reasons: [...wakeup.reasons],
+          refs: existing?.pending?.refs ?? [],
+          requestCount: wakeup.requestCount,
+          firstQueuedAt: wakeup.firstRequestedAt,
+          lastQueuedAt: wakeup.lastRequestedAt
+        }
+      });
+    });
+  }
+  clearPendingWakeup(taskId: string): void {
+    this.removeWorkMailbox({ kind: "role", taskId, roleName: "leader" });
+  }
   getLeaderFailure(taskId: string): LeaderFailure | null { return optional(this.#state().tasks[taskId]?.leaderFailure ?? undefined); }
   saveLeaderFailure(value: LeaderFailure): void { this.#saveSingleton(value.taskId, "leaderFailure", value, "Leader failure"); }
   clearLeaderFailure(taskId: string): void { this.#clearSingleton(taskId, "leaderFailure"); }
@@ -639,14 +721,14 @@ export class FileTaskStore implements TaskStore {
   saveOperatorNotification(value: OperatorNotification): void { this.#saveSingleton(value.taskId, "operatorNotification", value, "Operator notification"); }
   clearOperatorNotification(taskId: string): void { this.#clearSingleton(taskId, "operatorNotification"); }
 
-  #saveSingleton<K extends "pendingWakeup" | "leaderFailure" | "operatorNotification">(
+  #saveSingleton<K extends "leaderFailure" | "operatorNotification">(
     taskId: string, key: K, value: StoredTask[K], label: string
   ): void {
     const stored = identified<StoredTask[K]>(value, 1, "taskId", taskId, label);
     this.#requireTaskForWrite(taskId);
     this.#mutate((state) => { state.tasks[taskId][key] = stored; });
   }
-  #clearSingleton(key: string, field: "pendingWakeup" | "leaderFailure" | "operatorNotification"): void {
+  #clearSingleton(key: string, field: "leaderFailure" | "operatorNotification"): void {
     this.#mutate((state) => { if (state.tasks[key] !== undefined) state.tasks[key][field] = null; });
   }
   #saveTaskRecord<K extends "messages">(
@@ -733,11 +815,11 @@ export function resolveYuiHome(env: NodeJS.ProcessEnv): string {
 export function ensureYuiHome(rootDir: string): void { mkdirSync(rootDir, { recursive: true, mode: 0o700 }); }
 
 function emptyState(): StorageState {
-  return { schemaVersion: 1, revision: 0, config: { schemaVersion: 1 }, configuredAgents: {}, repositories: {}, globalRoles: {}, globalRoleSessionSets: {}, tasks: {} };
+  return { schemaVersion: 3, revision: 0, config: { schemaVersion: 1 }, configuredAgents: {}, repositories: {}, globalRoles: {}, globalRoleSessionSets: {}, tasks: {}, mailboxes: {} };
 }
 function emptyStoredTask(task: Task): StoredTask {
   return {
-    schemaVersion: 1,
+    schemaVersion: 3,
     task,
     brief: null,
     roles: {},
@@ -751,7 +833,6 @@ function emptyStoredTask(task: Task): StoredTask {
     decisions: {},
     milestones: {},
     events: {},
-    pendingWakeup: null,
     leaderFailure: null,
     operatorNotification: null
   };
@@ -761,8 +842,8 @@ function parseState(raw: string): StorageState {
   let parsed: unknown;
   try { parsed = JSON.parse(raw) as unknown; } catch (error) { throw new StorageRecordError(`Invalid ${STORAGE_STATE_FILE}: ${error instanceof Error ? error.message : String(error)}`); }
   const state = object(parsed, "Storage state");
-  exact(state, ["schemaVersion", "revision", "config", "configuredAgents", "repositories", "globalRoles", "globalRoleSessionSets", "tasks"], "Storage state");
-  if (state.schemaVersion !== 1 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
+  exact(state, ["schemaVersion", "revision", "config", "configuredAgents", "repositories", "globalRoles", "globalRoleSessionSets", "tasks", "mailboxes"], "Storage state");
+  if (state.schemaVersion !== 3 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
   const result = clone(state) as unknown as StorageState;
   result.config = versioned(result.config, 1, "Yui config");
   validateYuiConfig(result.config);
@@ -783,6 +864,15 @@ function parseState(raw: string): StorageState {
   }, "globalRoles");
   parseMap(result.globalRoleSessionSets, (value, key) => { const set = globalSessions(value); if (set.owner.roleName !== key) throw new StorageRecordError(`Global Role session set identity is inconsistent: ${key}`); return set; }, "globalRoleSessionSets");
   parseMap(result.tasks, (value, key) => parseStoredTask(value, key), "tasks");
+  parseMap(result.mailboxes, (value, key) => {
+    let mailbox: WorkMailbox;
+    try { mailbox = validateWorkMailbox(value); }
+    catch (error) { throw new StorageRecordError(error instanceof Error ? error.message : String(error)); }
+    if (mailboxTargetKey(mailbox.target) !== key) {
+      throw new StorageRecordError(`WorkMailbox identity is inconsistent: ${key}`);
+    }
+    return mailbox;
+  }, "mailboxes");
   for (const [name, role] of Object.entries(result.globalRoles)) {
     const sessions = result.globalRoleSessionSets[name];
     if (sessions !== undefined) assertSessionsMatchRole(sessions, role);
@@ -821,6 +911,7 @@ function parseState(raw: string): StorageState {
       }
     }
   }
+  for (const mailbox of Object.values(result.mailboxes)) validateMailboxReferences(result, mailbox);
   assertGloballyUniqueTaskRecordIds(result, "inputRequests", "Input request");
   assertGloballyUniqueTaskRecordIds(result, "decisions", "Decision");
   assertGloballyUniqueTaskRecordIds(result, "milestones", "Milestone");
@@ -830,8 +921,8 @@ function parseState(raw: string): StorageState {
 }
 function parseStoredTask(value: unknown, taskId: string): StoredTask {
   const aggregate = object(value, `Task aggregate ${taskId}`) as unknown as StoredTask;
-  exact(aggregate as unknown as Record<string, unknown>, ["schemaVersion", "task", "brief", "roles", "roleWorkspaces", "roleSessionSets", "workItems", "agentRuns", "activeRuns", "messages", "inputRequests", "decisions", "milestones", "events", "pendingWakeup", "leaderFailure", "operatorNotification"], `Task aggregate ${taskId}`);
-  versioned(aggregate, 1, `Task aggregate ${taskId}`);
+  exact(aggregate as unknown as Record<string, unknown>, ["schemaVersion", "task", "brief", "roles", "roleWorkspaces", "roleSessionSets", "workItems", "agentRuns", "activeRuns", "messages", "inputRequests", "decisions", "milestones", "events", "leaderFailure", "operatorNotification"], `Task aggregate ${taskId}`);
+  versioned(aggregate, 3, `Task aggregate ${taskId}`);
   validateTask(identified(aggregate.task, 1, "id", taskId, "Task"));
   if (aggregate.brief !== null) storedTaskBrief(aggregate.brief);
   parseMap(aggregate.roles, (record, key) => { const role = identified<TaskRole>(record, 2, "name", key, "Task Role"); if (role.taskId !== taskId) throw new StorageRecordError(`Task Role belongs to another Task: ${role.taskId}`); validateTaskRole(role); return role; }, "roles");
@@ -890,7 +981,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     if (event.id !== key) throw new StorageRecordError(`Task event identity is inconsistent: ${key}.`);
     return event;
   }, "events");
-  for (const [key, label] of [["pendingWakeup", "Pending wakeup"], ["leaderFailure", "Leader failure"], ["operatorNotification", "Operator notification"]] as const) {
+  for (const [key, label] of [["leaderFailure", "Leader failure"], ["operatorNotification", "Operator notification"]] as const) {
     const record = aggregate[key];
     if (record !== null) identified(record, 1, "taskId", taskId, label);
   }
@@ -900,6 +991,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
 function validateYuiConfig(config: YuiConfig): void {
   try {
     reconciliationIntervalMilliseconds(config.reconciliationIntervalSeconds);
+    resolveTimeZone(config.timeZone);
   } catch (error) {
     throw new StorageRecordError(
       error instanceof Error ? error.message : "Yui reconciliation interval is invalid."
@@ -908,21 +1000,21 @@ function validateYuiConfig(config: YuiConfig): void {
 }
 
 function globalSessions(value: unknown): GlobalRoleSessionSet {
-  const set = versioned<GlobalRoleSessionSet>(value, 1, "Global Role session set");
+  const set = versioned<GlobalRoleSessionSet>(value, 2, "Global Role session set");
   if (set.owner?.scope !== "global" || typeof set.owner.roleName !== "string") throw new StorageRecordError("Global Role session owner is invalid.");
   validateSessions(set.sessions);
   validateRoleSessionSet(set);
   return set;
 }
 function taskSessions(value: unknown): TaskRoleSessionSet {
-  const set = versioned<TaskRoleSessionSet>(value, 1, "Task Role session set");
+  const set = versioned<TaskRoleSessionSet>(value, 2, "Task Role session set");
   if (set.owner?.scope !== "task" || typeof set.owner.taskId !== "string" || typeof set.owner.roleName !== "string") throw new StorageRecordError("Task Role session owner is invalid.");
   validateSessions(set.sessions);
   validateRoleSessionSet(set);
   return set;
 }
 function validateSessions(sessions: Record<string, RoleAgentSession>): void {
-  parseMap(sessions, (record, key) => identified(record, 1, "agentId", key, "Role Agent session"), "sessions");
+  parseMap(sessions, (record, key) => identified(record, 2, "agentId", key, "Role Agent session"), "sessions");
 }
 function assertSessionsMatchRole(
   sessions: GlobalRoleSessionSet | TaskRoleSessionSet,
@@ -1167,6 +1259,58 @@ function values<T>(records: Record<string, T>, identity: keyof T | ((value: T) =
   return Object.values(records).map(clone).sort((left, right) => numericCompare(typeof identity === "function" ? identity(left) : String(left[identity]), typeof identity === "function" ? identity(right) : String(right[identity])));
 }
 function numericCompare(left: string, right: string): number { return left.localeCompare(right, undefined, { numeric: true }); }
+function pendingWakeupProjection(mailbox: WorkMailbox | null): PendingWakeup | null {
+  if (mailbox === null || mailbox.target.kind !== "role" || mailbox.target.roleName !== "leader"
+    || mailbox.pending === null) {
+    return null;
+  }
+  return {
+    schemaVersion: 1,
+    taskId: mailbox.target.taskId,
+    reasons: [...mailbox.pending.reasons],
+    requestCount: mailbox.pending.requestCount,
+    firstRequestedAt: mailbox.pending.firstQueuedAt,
+    lastRequestedAt: mailbox.pending.lastQueuedAt
+  };
+}
+function validateMailboxReferences(state: StorageState, mailbox: WorkMailbox): void {
+  if (mailbox.target.kind !== "operator") {
+    const aggregate = state.tasks[mailbox.target.taskId];
+    if (aggregate === undefined) {
+      throw new StorageRecordError(`WorkMailbox target Task not found: ${mailbox.target.taskId}`);
+    }
+    if (mailbox.target.kind === "role" && aggregate.roles[mailbox.target.roleName] === undefined) {
+      throw new StorageRecordError(
+        `WorkMailbox target Role not found: ${mailbox.target.taskId}/${mailbox.target.roleName}`
+      );
+    }
+  }
+  const refs: MailboxEntityRef[] = [];
+  if (mailbox.processing !== null) {
+    refs.push(...mailbox.processing.batch.refs);
+    if (mailbox.processing.executionRef !== undefined) refs.push(mailbox.processing.executionRef);
+  }
+  if (mailbox.pending !== null) refs.push(...mailbox.pending.refs);
+  for (const ref of refs) {
+    if (!mailboxReferenceExists(state, ref)) {
+      throw new StorageRecordError(`WorkMailbox reference does not exist: ${ref.type}/${ref.id}`);
+    }
+  }
+}
+function mailboxReferenceExists(state: StorageState, ref: MailboxEntityRef): boolean {
+  switch (ref.type) {
+    case "task": return state.tasks[ref.id] !== undefined;
+    case "run": return Object.values(state.tasks).some((task) => task.agentRuns[ref.id] !== undefined);
+    case "work-item": return Object.values(state.tasks).some((task) => task.workItems[ref.id] !== undefined);
+    case "input": return Object.values(state.tasks).some((task) => task.inputRequests[ref.id] !== undefined);
+    case "message": return Object.values(state.tasks).some((task) => task.messages[ref.id] !== undefined);
+    case "session":
+      return [
+        ...Object.values(state.globalRoleSessionSets),
+        ...Object.values(state.tasks).flatMap((task) => Object.values(task.roleSessionSets))
+      ].some((set) => Object.values(set.sessions).some((session) => session.nativeSessionId === ref.id));
+  }
+}
 function allKeys<K extends "workItems" | "agentRuns" | "messages" | "inputRequests" | "decisions" | "milestones" | "events">(state: StorageState, key: K): string[] { return Object.values(state.tasks).flatMap((task) => Object.keys(task[key])); }
 function findUnique(state: StorageState, key: "workItems", id: string, label: string): WorkItem | null;
 function findUnique(state: StorageState, key: "agentRuns", id: string, label: string): AgentRun | null;

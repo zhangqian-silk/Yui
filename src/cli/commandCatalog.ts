@@ -424,7 +424,7 @@ export const ROOT_COMMAND = buildNode({
   sections: [
     { id: "general", title: "General", entries: ["help", "version", "update", "setup", "doctor", "completion"] },
     { id: "workflow", title: "Workflow", entries: ["operator", "repository", "task"] },
-    { id: "configuration", title: "Configuration", entries: ["agent", "role"] },
+    { id: "configuration", title: "Configuration", entries: ["config", "agent", "role"] },
     { id: "operations", title: "Operations", entries: ["controller", "jobs"] },
     { id: "internal", title: "Internal", entries: ["internal"] }
   ],
@@ -464,6 +464,20 @@ export const ROOT_COMMAND = buildNode({
         { name: "status", summary: "Show Controller status." },
         { name: "stop", summary: "Stop the Controller." },
         { name: "restart", summary: "Restart internal services without stopping tmux sessions." }
+      ]
+    },
+    {
+      name: "config",
+      summary: "Inspect or update Yui configuration.",
+      sections: [{ id: "manage", title: "Commands", entries: ["show", "set"] }],
+      children: [
+        { name: "show", summary: "Show effective Yui configuration." },
+        {
+          name: "set",
+          summary: "Update Yui configuration.",
+          usage: "yui config set --time-zone <IANA timezone>",
+          options: ["--time-zone"]
+        }
       ]
     },
     {

@@ -16,6 +16,7 @@ import { runCompletionWizard } from "./cli/completionWizard.js";
 import { resolveRoleWizardArguments } from "./cli/roleWizard.js";
 import type { SelectionPorts } from "./cli/selectionPorts.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
+import { formatTimestamp } from "./output/timePresentation.js";
 import {
   runAgentCommand,
   type AgentCommandStore
@@ -24,6 +25,7 @@ import {
   runGlobalRoleCommand,
   type GlobalRoleCommandOptions
 } from "./commands/globalRoleCommands.js";
+import { runConfigCommand } from "./commands/configCommands.js";
 import { runJobCommand } from "./commands/jobCommands.js";
 import { runOperatorCommand } from "./commands/operatorCommands.js";
 import { runRepositoryCommand } from "./commands/repositoryCommands.js";
@@ -188,6 +190,10 @@ export async function main(): Promise<void> {
 
   if (resolved[0] === "agent") {
     emit(runAgentCommand(resolved.slice(1), store as unknown as AgentCommandStore));
+    return;
+  }
+  if (resolved[0] === "config") {
+    emit(runConfigCommand(resolved.slice(1), store));
     return;
   }
   if (resolved[0] === "repository") {
@@ -422,11 +428,31 @@ function selectionCall(
     }
     case "task.run.list": return callOptional(reader, "listAgentRuns", [params.workItemId]);
     case "task.decision.list": return callOptional(reader, "listDecisions", [params.taskId]);
-    case "task.milestone.list": return callOptional(reader, "listMilestones", [params.taskId]);
-    case "task.event.list": return callOptional(reader, "listEvents", [params.taskId]);
+    case "task.milestone.list": return presentSelectionTimes(
+      callOptional(reader, "listMilestones", [params.taskId]),
+      store
+    );
+    case "task.event.list": return presentSelectionTimes(
+      callOptional(reader, "listEvents", [params.taskId]),
+      store
+    );
     case "jobs.list": return callOptional(reader, "listJobs");
     default: return [];
   }
+}
+
+function presentSelectionTimes(value: unknown, store: FileTaskStore): unknown {
+  if (!Array.isArray(value)) return value;
+  return value.map((record) => {
+    if (typeof record !== "object" || record === null || Array.isArray(record)) return record;
+    const candidate = record as Record<string, unknown>;
+    return typeof candidate.createdAt === "string"
+      ? {
+          ...candidate,
+          createdAt: formatTimestamp(candidate.createdAt, store.getConfig().timeZone)
+        }
+      : candidate;
+  });
 }
 
 function callOptional(

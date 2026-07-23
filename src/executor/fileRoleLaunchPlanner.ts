@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -12,6 +12,7 @@ import type {
   SchedulerRoleSession
 } from "../scheduler/ports.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import { compileRoleSessionContext } from "../context/roleSessionContext.js";
 import { resolveAgentAdapter } from "./agentAdapter.js";
 import type { PlannedRoleSession, RoleLaunchPlanner } from "./executorRegistry.js";
 
@@ -27,6 +28,7 @@ export type GlobalRoleLaunchPlanInput = Readonly<{
   adapterId: string;
   mode: RoleSessionLaunchMode;
   nativeSessionId?: string;
+  launchId?: string;
 }>;
 
 /** Builds managed native Agent launches from the authoritative Task records. */
@@ -90,6 +92,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
       adapterId: string;
       mode: RoleSessionLaunchMode;
       nativeSessionId?: string;
+      launchId?: string;
     }>,
     owner: Readonly<{ scope: "task"; taskId: string } | { scope: "global" }>,
     knownNativeSessionId?: string
@@ -106,11 +109,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
 
     const agent = configuredAgentToDefinition(configured);
     const adapter = resolveAgentAdapter(binding.adapterId);
+    const sessionContext = compileRoleSessionContext(this.home, role, owner);
     const compileInput = {
       agent,
       config: binding.config,
       workspace: role.workspace,
-      systemPrompt: role.systemPrompt
+      ...sessionContext
     };
     if (
       input.mode === "resume"
@@ -143,7 +147,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
         ? readySession(input.agentId, binding.adapterId, resumeNativeSessionId!)
         : null;
     } else if (launchMode === "new") {
-      const nativeSessionId = requireText(this.#createNativeSessionId(), "Native session id");
+      const nativeSessionId = requireText(
+        input.launchId === undefined
+          ? this.#createNativeSessionId()
+          : nativeSessionIdForLaunch(this.home, input.launchId),
+        "Native session id"
+      );
       args.push("--session-id", nativeSessionId);
       session = readySession(input.agentId, binding.adapterId, nativeSessionId);
     } else {
@@ -173,6 +182,14 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
       session
     };
   }
+}
+
+function nativeSessionIdForLaunch(home: string, launchId: string): string {
+  const hex = createHash("sha256").update(JSON.stringify([
+    resolve(home),
+    requireText(launchId, "Launch id")
+  ])).digest("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
 /**

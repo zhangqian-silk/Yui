@@ -122,7 +122,8 @@ test("Codex structured config compiles deterministically for new and resume laun
     agent,
     config,
     workspace: root,
-    systemPrompt: "review carefully"
+    developerInstructions: "review carefully",
+    skills: [{ id: "review", path: canonicalFirst, content: "Review skill body" }]
   });
 
   assert.deepEqual(compiled.argv, [
@@ -136,6 +137,11 @@ test("Codex structured config compiles deterministically for new and resume laun
     "--profile", "work",
     "--add-dir", canonicalFirst,
     "--add-dir", canonicalSecond,
+    "--config", `developer_instructions=${JSON.stringify([
+      "review carefully",
+      "Yui Role Skills are available at the paths below. Before performing work governed by one, read and follow its SKILL.md on demand; do not treat this list as a user message.",
+      `- review: ${canonicalFirst}/SKILL.md`
+    ].join("\n"))}`,
     "--ansi"
   ]);
   assert.equal(compiled.sessionStrategy, "runtime-discovery");
@@ -144,7 +150,8 @@ test("Codex structured config compiles deterministically for new and resume laun
       agent,
       config,
       workspace: root,
-      systemPrompt: "review carefully",
+      developerInstructions: "review carefully",
+      skills: [{ id: "review", path: canonicalFirst, content: "Review skill body" }],
       nativeSessionId: "codex-session"
     }).argv,
     [...compiled.argv, "resume", "codex-session"]
@@ -171,7 +178,13 @@ test("Claude structured config compiles permissions and preallocated session lif
     advanced: { rawArgs: ["--verbose"] }
   };
   const adapter = resolveAgentAdapter("claude");
-  const compiled = adapter.compileNew({ agent, config, workspace: "/tmp" });
+  const compiled = adapter.compileNew({
+    agent,
+    config,
+    workspace: "/tmp",
+    developerInstructions: "Lead safely.",
+    skills: [{ id: "yui-leader", path: "/skills/yui-leader", content: "Leader skill body." }]
+  });
 
   assert.deepEqual(compiled.argv, [
     "--model", "sonnet",
@@ -181,6 +194,7 @@ test("Claude structured config compiles permissions and preallocated session lif
     "--disallowed-tools", "WebFetch",
     "--settings", "/tmp/claude-settings.json",
     "--setting-sources", "user,project",
+    "--append-system-prompt", "Lead safely.\n\n# Yui Skill: yui-leader\n\nLeader skill body.",
     "--verbose"
   ]);
   assert.equal(compiled.sessionStrategy, "preallocated");
@@ -189,6 +203,8 @@ test("Claude structured config compiles permissions and preallocated session lif
       agent,
       config,
       workspace: "/tmp",
+      developerInstructions: "Lead safely.",
+      skills: [{ id: "yui-leader", path: "/skills/yui-leader", content: "Leader skill body." }],
       nativeSessionId: "claude-session"
     }).argv,
     [...compiled.argv, "--resume", "claude-session"]

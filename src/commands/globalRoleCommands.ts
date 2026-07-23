@@ -22,6 +22,7 @@ import {
   systemRoleDescription
 } from "../role/systemRoles.js";
 import type { AgentCommandStore, ConfiguredAgentRecord } from "./agentCommands.js";
+import { compileRoleSessionContext } from "../context/roleSessionContext.js";
 import {
   hasAgentConfigOptions,
   parseRoleOptions,
@@ -384,11 +385,12 @@ function compileGlobalRoleLaunch(
   options: GlobalRoleCommandOptions
 ): Readonly<{ command: string; args: readonly string[]; env: Readonly<Record<string, string>> }> {
   const adapter = resolveAgentAdapter(agent.adapterId);
+  const sessionContext = compileRoleSessionContext(options.yuiHome, role, { scope: "global" });
   const input = {
     agent: definition(agent),
     config: activeRoleAgentBinding(role).config,
     workspace: role.workspace,
-    systemPrompt: role.systemPrompt
+    ...sessionContext
   };
   const compiled = nativeSessionId === undefined
     ? adapter.compileNew(input)

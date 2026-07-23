@@ -9,6 +9,7 @@ import type { TaskStore } from "../storage/taskStore.js";
 import type { TmuxManager } from "../tmux/tmuxManager.js";
 import type { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
 import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
+import type { MailboxTarget } from "../coordination/workMailbox.js";
 
 const STARTUP_TIMEOUT_MS = 5_000;
 const POLL_INTERVAL_MS = 50;
@@ -121,6 +122,11 @@ export async function callFileTaskController(
         : { stopped: false, alreadyStopped: true };
     }
   }
+  try {
+    return await call(home, method, params);
+  } catch (error) {
+    if (!isUnavailable(error)) throw error;
+  }
   await ensureFileTaskController(home, options);
   return call(home, method, params);
 }
@@ -138,7 +144,16 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
   ) {}
 
   notifyStateChanged(taskId: string): void {
-    void this.#prepareAndScan(taskId).catch(this.clientOptions.onError ?? (() => {}));
+    this.notifyMailboxChanged({ kind: "task", taskId });
+  }
+
+  notifyMailboxChanged(target: MailboxTarget): void {
+    void callFileTaskController(
+      this.home,
+      "scheduler.signal",
+      { key: controllerMailboxKey(target) },
+      this.clientOptions
+    ).catch(this.clientOptions.onError ?? (() => {}));
   }
 
   reconcileTask(taskId: string): void {
@@ -209,6 +224,14 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
       await this.workspacePreparer.prepareTaskWorkspace(taskId);
     }
     await callFileTaskController(this.home, "scheduler.scan", {}, this.clientOptions);
+  }
+}
+
+function controllerMailboxKey(target: MailboxTarget): string {
+  switch (target.kind) {
+    case "operator": return "operator";
+    case "task": return `task:${encodeURIComponent(target.taskId)}`;
+    case "role": return `role:${encodeURIComponent(target.taskId)}/${encodeURIComponent(target.roleName)}`;
   }
 }
 

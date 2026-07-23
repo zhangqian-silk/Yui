@@ -16,16 +16,21 @@ import {
   type InputRequester
 } from "../input/inputRequest.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
+import { formatTimestamp } from "../output/timePresentation.js";
 import { updateRoleStatus, type Role } from "../role/role.js";
 import { yieldAgentRun, type AgentRun } from "../run/agentRun.js";
-import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
+import { completeWorkExecution, enqueueWork } from "../coordination/workMailboxQueue.js";
+import type { MailboxTarget } from "../coordination/workMailbox.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
 
 const LEADER_ROLE = "leader";
 
 type TaskInputCommandOptions = Readonly<{
-  runtime?: { notifyStateChanged(taskId: string): void };
+  runtime?: {
+    notifyStateChanged(taskId: string): void;
+    notifyMailboxChanged?(target: MailboxTarget): void;
+  };
   now?: () => Date;
   environment?: NodeJS.ProcessEnv;
 }>;
@@ -112,14 +117,24 @@ function createRequest(
       now
     );
     tx.saveInputRequest(task.id, created);
+    enqueueWork(tx, { kind: "operator" }, "input-requested", now, [
+      { type: "input", id: created.id },
+      { type: "run", id: origin.run.id }
+    ]);
     tx.saveAgentRun(yieldAgentRun(
       origin.run,
       `Waiting for input ${created.id}: ${created.question}`,
       now
     ));
+    completeWorkExecution(
+      tx,
+      { kind: "role", taskId: task.id, roleName: LEADER_ROLE },
+      { type: "run", id: origin.run.id }
+    );
     tx.clearActiveAgentRun(task.id, LEADER_ROLE);
     tx.saveRole(task.id, updateRoleStatus(origin.role, "idle", now));
-    if (origin.sessions?.sessions[origin.role.activeAgentId]?.status === "running") {
+    if (origin.sessions?.inFlight === null
+      && origin.sessions.sessions[origin.role.activeAgentId]?.status === "running") {
       tx.saveTaskRoleSessionSet(updateRoleAgentSessionStatus(
         origin.sessions,
         origin.role.activeAgentId,
@@ -134,7 +149,7 @@ function createRequest(
     }, now);
     return created;
   });
-  options.runtime?.notifyStateChanged(request.taskId);
+  notifyMailbox(options, { kind: "operator" }, request.taskId);
   return output(`Created input request ${request.id} for ${request.taskId}\n`, { request });
 }
 
@@ -168,7 +183,7 @@ function listRequests(args: string[], store: TaskStore): TaskInputCommandExecuti
           request.status,
           request.policy.kind,
           request.question,
-          request.createdAt
+          formatTimestamp(request.createdAt, store.getConfig().timeZone)
         ]),
         defaultTableWidth()
       )}\n`;
@@ -184,7 +199,7 @@ function showRequest(args: string[], store: TaskStore): TaskInputCommandExecutio
     ? store.findInputRequest(parsed.positionals[0])
     : store.getInputRequest(requireTask(store, taskId).id, parsed.positionals[0]);
   if (request === null) throw dataError(`Input request not found: ${parsed.positionals[0]}.`);
-  return output(renderInputRequest(request), { request });
+  return output(renderInputRequest(request, store.getConfig().timeZone), { request });
 }
 
 function answerRequest(
@@ -218,10 +233,16 @@ function answerRequest(
       requestId: answered.id,
       answeredBy: answered.resolution.answeredBy
     }, now);
-    queueLeaderWakeup(tx, task.id, `input-answered:${answered.id}`, now);
+    enqueueWork(
+      tx,
+      { kind: "role", taskId: task.id, roleName: LEADER_ROLE },
+      `input-answered:${answered.id}`,
+      now,
+      [{ type: "input", id: answered.id }]
+    );
     return answered;
   });
-  options.runtime?.notifyStateChanged(request.taskId);
+  notifyMailbox(options, { kind: "role", taskId: request.taskId, roleName: LEADER_ROLE }, request.taskId);
   return output(`Answered input request ${request.id} for ${request.taskId}\n`, { request });
 }
 
@@ -244,9 +265,16 @@ function cancelRequest(
     const cancelled = cancelInputRequest(current, reason, now);
     tx.saveInputRequest(task.id, cancelled);
     recordTaskEvent(tx, task.id, "input.cancelled", { requestId: cancelled.id }, now);
+    enqueueWork(
+      tx,
+      { kind: "role", taskId: task.id, roleName: LEADER_ROLE },
+      `input-cancelled:${cancelled.id}`,
+      now,
+      [{ type: "input", id: cancelled.id }]
+    );
     return cancelled;
   });
-  options.runtime?.notifyStateChanged(request.taskId);
+  notifyMailbox(options, { kind: "role", taskId: request.taskId, roleName: LEADER_ROLE }, request.taskId);
   return output(`Cancelled input request ${request.id} for ${request.taskId}\n`, { request });
 }
 
@@ -354,7 +382,7 @@ function validateBlockedInputOwnership(
   }
 }
 
-function renderInputRequest(request: InputRequest): string {
+function renderInputRequest(request: InputRequest, timeZone: string | undefined): string {
   return [
     `Input: ${request.id}`,
     `Task: ${request.taskId}`,
@@ -371,22 +399,22 @@ function renderInputRequest(request: InputRequest): string {
       ? ["Policy: user response required"]
       : [
           `Policy: use recommended choice ${request.policy.recommendedChoiceKey} after timeout`,
-          `Timeout: ${request.policy.timeoutAt}`
+          `Timeout: ${formatTimestamp(request.policy.timeoutAt, timeZone)}`
         ]),
     ...(request.status === "answered"
       ? [
           `Answered by: ${request.resolution.answeredBy}`,
           `Answer: ${request.resolution.answer.text}`,
-          `Answered: ${request.resolution.answeredAt}`
+          `Answered: ${formatTimestamp(request.resolution.answeredAt, timeZone)}`
         ]
       : request.status === "cancelled"
         ? [
             `Cancellation: ${request.cancellation.reason}`,
-            `Cancelled: ${request.cancellation.cancelledAt}`
+            `Cancelled: ${formatTimestamp(request.cancellation.cancelledAt, timeZone)}`
           ]
         : []),
-    `Created: ${request.createdAt}`,
-    `Updated: ${request.updatedAt}`
+    `Created: ${formatTimestamp(request.createdAt, timeZone)}`,
+    `Updated: ${formatTimestamp(request.updatedAt, timeZone)}`
   ].join("\n").concat("\n");
 }
 
@@ -554,4 +582,16 @@ function parseMultiValueTail(
     index += 1;
   }
   return { positionals, options, multiOptions };
+}
+
+function notifyMailbox(
+  options: TaskInputCommandOptions,
+  target: MailboxTarget,
+  compatibilityTaskId: string
+): void {
+  if (options.runtime?.notifyMailboxChanged !== undefined) {
+    options.runtime.notifyMailboxChanged(target);
+  } else {
+    options.runtime?.notifyStateChanged(compatibilityTaskId);
+  }
 }

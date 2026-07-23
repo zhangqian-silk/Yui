@@ -83,7 +83,8 @@ export type CompileInput<TConfig extends RoleAgentConfig = RoleAgentConfig> = Re
   agent: AgentDefinition;
   config: TConfig;
   workspace: string;
-  systemPrompt?: string;
+  developerInstructions?: string;
+  skills?: readonly Readonly<{ id: string; path: string; content: string }>[];
 }>;
 export type ResumeInput<TConfig extends RoleAgentConfig = RoleAgentConfig> =
   CompileInput<TConfig> & Readonly<{ nativeSessionId: string }>;
@@ -122,6 +123,10 @@ abstract class BaseAdapter<TConfig extends RoleAgentConfig> implements AgentAdap
   abstract structuredArgs(config: TConfig): string[];
   abstract compileResume(input: ResumeInput<TConfig>): CompiledAgentLaunch;
 
+  launchContextArgs(_input: CompileInput<TConfig>): string[] {
+    return [];
+  }
+
   validateConfig(input: CompileInput<TConfig>): void {
     if (input.agent.adapterId !== this.id || input.config.adapterId !== this.id) {
       throw new Error(`Agent adapter identity mismatch: expected ${this.id}.`);
@@ -134,7 +139,12 @@ abstract class BaseAdapter<TConfig extends RoleAgentConfig> implements AgentAdap
     this.validateConfig(input);
     const config = this.canonicalizeConfig(input.config);
     return {
-      argv: [...input.agent.baseArgs, ...this.structuredArgs(config), ...(config.advanced?.rawArgs ?? [])],
+      argv: [
+        ...input.agent.baseArgs,
+        ...this.structuredArgs(config),
+        ...this.launchContextArgs(input),
+        ...(config.advanced?.rawArgs ?? [])
+      ],
       sessionStrategy: this.capabilities.nativeSessionDiscovery === "runtime"
         ? "runtime-discovery"
         : "preallocated"
@@ -200,6 +210,21 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
     ];
   }
 
+  override launchContextArgs(input: CompileInput<CodexAgentConfig>): string[] {
+    const instructions = [
+      input.developerInstructions,
+      ...(input.skills === undefined || input.skills.length === 0
+        ? []
+        : [
+            "Yui Role Skills are available at the paths below. Before performing work governed by one, read and follow its SKILL.md on demand; do not treat this list as a user message.",
+            ...input.skills.map((skill) => `- ${skill.id}: ${skill.path}/SKILL.md`)
+          ])
+    ].filter((value): value is string => value !== undefined && value.trim().length > 0);
+    return instructions.length === 0
+      ? []
+      : ["--config", `developer_instructions=${tomlString(instructions.join("\n"))}`];
+  }
+
   compileResume(input: ResumeInput<CodexAgentConfig>): CompiledAgentLaunch {
     const launch = this.compileNew(input);
     return { ...launch, argv: [...launch.argv, "resume", nativeId(input.nativeSessionId)] };
@@ -251,6 +276,19 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
     ];
   }
 
+  override launchContextArgs(input: CompileInput<ClaudeAgentConfig>): string[] {
+    const sections = [
+      input.developerInstructions,
+      ...(input.skills ?? []).map((skill) => [
+        `# Yui Skill: ${skill.id}`,
+        skill.content
+      ].join("\n\n"))
+    ].filter((value): value is string => value !== undefined && value.trim().length > 0);
+    return sections.length === 0
+      ? []
+      : ["--append-system-prompt", sections.join("\n\n")];
+  }
+
   compileResume(input: ResumeInput<ClaudeAgentConfig>): CompiledAgentLaunch {
     const launch = this.compileNew(input);
     return { ...launch, argv: [...launch.argv, "--resume", nativeId(input.nativeSessionId)] };
@@ -260,6 +298,11 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
 const ADAPTERS: Readonly<Record<AgentAdapterId, AgentAdapter<any>>> = {
   codex: new CodexAdapter(), claude: new ClaudeAdapter()
 };
+
+function tomlString(value: string): string {
+  if (value.includes("\0")) throw new Error("Agent launch context cannot contain NUL bytes.");
+  return JSON.stringify(value);
+}
 export { supportedAgentAdapterIds };
 export function findAgentAdapter(id: string): AgentAdapter | null {
   return id === "codex" || id === "claude" ? ADAPTERS[id] : null;

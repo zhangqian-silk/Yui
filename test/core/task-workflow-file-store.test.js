@@ -131,7 +131,7 @@ test("Task metadata can be updated and is visible in Task details", (t) => {
   assert.match(shown, /Description: Prepare the release candidate/);
   assert.match(shown, /Priority: high/);
   assert.match(shown, /Tags: release, backend/);
-  assert.match(shown, /Due: 2026-07-31T12:00:00.000Z/);
+  assert.match(shown, /Due: 2026-07-31 20:00:00 \+08:00/);
 
   run([
     "update",
@@ -268,6 +268,9 @@ test("one Role has one active Run and Worker yield completes the workflow atomic
   assert.equal(store.findWorkItem(second.id)?.status, "pending");
   const active = store.getActiveAgentRun(task.id, "worker");
   assert.equal(active?.workItemId, first.id);
+  const workerMailbox = store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: "worker" });
+  assert.deepEqual(workerMailbox.pending.reasons, ["run-dispatched"]);
+  assert.ok(workerMailbox.pending.refs.some((ref) => ref.type === "run" && ref.id === active.id));
 
   markDelivered(store, active);
   run(["run", "yield", active.id, "--summary", "implemented"], store, options);
@@ -281,6 +284,8 @@ test("one Role has one active Run and Worker yield completes the workflow atomic
   assert.equal(resultMessage.workItemId, first.id);
   assert.equal(resultMessage.body, "implemented");
   assert.ok(store.getPendingWakeup(task.id)?.reasons.includes("role-result"));
+  const leaderMailbox = store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: "leader" });
+  assert.ok(leaderMailbox.pending.refs.some((ref) => ref.type === "run" && ref.id === active.id));
 });
 
 test("Leader yield does not self-wake and preserves a wake queued while busy", (t) => {

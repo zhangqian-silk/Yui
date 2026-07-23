@@ -263,7 +263,7 @@ test("task context includes every open input and renders a bounded actionable su
   assert.match(result.output, /Answered by user/);
   assert.match(result.output, /Choices \(2\):\n      safe: Safe rollout\n      fast: Fast rollout/);
   assert.match(result.output, /Recommended choice: safe: Safe rollout/);
-  assert.match(result.output, new RegExp(`Timeout at: ${atMinute(17).toISOString()}`));
+  assert.match(result.output, /Timeout at: 2026-07-21 16:17:00 \+08:00/);
   assert.match(result.output, /Blocks \(2\):\n      work-item:work-item-7\n      run:agent-run-7/);
 });
 

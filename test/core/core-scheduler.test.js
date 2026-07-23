@@ -3,8 +3,16 @@ import test from "node:test";
 
 import { processLeaderWakeups } from "../../dist/scheduler/leaderWakeupProcessor.js";
 import { reconcileExitedRoleRuns } from "../../dist/scheduler/roleRunLiveness.js";
+import { processOperatorInputNotifications } from "../../dist/scheduler/operatorInputNotificationProcessor.js";
 import { mergePendingWakeup } from "../../dist/scheduler/pendingWakeup.js";
 import { queueLeaderWakeupAfterYield } from "../../dist/scheduler/wakeupQueue.js";
+import {
+  claimPending,
+  completeProcessing,
+  createWorkMailbox,
+  enqueueSignal,
+  releaseProcessing
+} from "../../dist/coordination/workMailbox.js";
 
 const NOW = new Date("2026-07-19T12:00:00.000Z");
 
@@ -86,9 +94,35 @@ test("an idle Leader starts a real wakeup run, waits for readiness, sends once, 
   assert.equal(store.savedDispatches[0].run.roleName, "leader");
   assert.match(store.savedDispatches[0].run.input, /role-result/);
   assert.match(store.savedDispatches[0].run.input, /yui task context task-1/);
+  assert.match(store.savedDispatches[0].run.input, /Current Leader Run: run-1/);
+  assert.match(store.savedDispatches[0].run.input, /yui task run yield run-1/);
+  assert.match(store.savedDispatches[0].run.input, /yui task complete task-1 --summary/);
   assert.doesNotMatch(store.savedDispatches[0].run.input, /yui task message list/);
   assert.equal(store.pending.has("task-1"), false);
   assert.deepEqual(store.operations.slice(-2), ["save-dispatch", "save-delivery"]);
+});
+
+test("a Leader send or post-send persistence uncertainty preserves the claimed Run and receipt", async () => {
+  for (const failAt of ["send", "persist"]) {
+    const store = fakeStore();
+    if (failAt === "persist") {
+      store.saveRoleRunDelivery = () => { throw new Error("aggregate write failed"); };
+    }
+    const delivery = fakeDelivery();
+    if (failAt === "send") {
+      delivery.sendOnce = async (input) => {
+        delivery.calls.push({ type: "sendOnce", input });
+        throw new Error("receipt response lost");
+      };
+    }
+
+    const [result] = await processLeaderWakeups(store, delivery, NOW);
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.reason, "delivery-uncertain");
+    assert.equal(store.savedFailures.length, 0);
+    assert.equal(store.activeRuns.get(key("task-1", "leader")).id, "run-1");
+  }
 });
 
 test("Leader wakeup context includes the Brief and the latest active Decisions", async () => {
@@ -206,6 +240,31 @@ test("a liveness probe error makes no state change", async () => {
   assert.deepEqual(store.pending.get("task-1").reasons, ["role-result"]);
 });
 
+test("liveness reconciliation uses one batch inventory for all active Roles", async () => {
+  const store = fakeStore();
+  store.roles.push(role("worker"));
+  store.activeRuns.set(key("task-1", "leader"), activeRun("run-leader", "leader"));
+  store.activeRuns.set(key("task-1", "worker"), activeRun("run-worker", "worker"));
+  let inventoryCalls = 0;
+  const delivery = {
+    async inspectRole() {
+      throw new Error("per-Role inspection must not run");
+    },
+    async inspectRoles(inputs) {
+      inventoryCalls += 1;
+      return inputs.map((input) => ({
+        taskId: input.taskId,
+        roleName: input.roleName,
+        status: "present"
+      }));
+    }
+  };
+
+  assert.deepEqual(await reconcileExitedRoleRuns(store, delivery, NOW), []);
+  assert.equal(inventoryCalls, 1);
+  assert.equal(store.savedExitedRuns.length, 0);
+});
+
 test("a missing Leader tmux queues recovery, while Leader yield never self-wakes", async () => {
   const store = fakeStore();
   const leaderRun = activeRun("run-leader", "leader");
@@ -233,6 +292,106 @@ test("Leader yield makes an existing pending wakeup dispatchable without adding 
   assert.equal((await processLeaderWakeups(store, delivery, NOW))[0].status, "dispatched");
   assert.equal(store.pending.has("task-1"), false);
 });
+
+test("Operator delivery releases a partial batch and receipts make the retry safe", async () => {
+  const requests = [operatorRequest("input-1"), operatorRequest("input-2")];
+  const store = operatorStore(requests);
+  const outcomes = ["sent", "already-sent", "sent"];
+  const receipts = [];
+  const delivery = {
+    async notifyOperatorInputOnce(input) {
+      receipts.push(input.receiptId);
+      return outcomes.shift();
+    }
+  };
+
+  const first = await processOperatorInputNotifications(store, delivery);
+  assert.deepEqual(first.map((result) => result.status), ["sent", "skipped"]);
+  assert.equal(store.mailbox.processing, null);
+  assert.notEqual(store.mailbox.pending, null);
+
+  const second = await processOperatorInputNotifications(store, delivery);
+  assert.deepEqual(second.map((result) => result.status), ["already-sent", "sent"]);
+  assert.deepEqual(receipts, [
+    "input-request:input-1",
+    "input-request:input-1",
+    "input-request:input-2"
+  ]);
+  assert.equal(store.mailbox.processing, null);
+  assert.equal(store.mailbox.pending, null);
+});
+
+test("Operator busy and delivery errors release the claimed mailbox batch", async () => {
+  for (const attempt of [
+    async () => "not-ready",
+    async () => { throw new Error("delivery failed"); }
+  ]) {
+    const store = operatorStore([operatorRequest("input-1")]);
+    const [result] = await processOperatorInputNotifications(store, {
+      notifyOperatorInputOnce: attempt
+    });
+    assert.equal(result.status === "failed" || result.reason === "operator-not-ready", true);
+    assert.equal(store.mailbox.processing, null);
+    assert.notEqual(store.mailbox.pending, null);
+  }
+});
+
+function operatorRequest(id) {
+  return {
+    schemaVersion: 1,
+    id,
+    taskId: "task-1",
+    requester: { roleName: "leader", agentId: "codex", runId: "run-1" },
+    question: `Question ${id}?`,
+    choices: [],
+    blockedRefs: [],
+    policy: { kind: "required" },
+    status: "open",
+    createdAt: NOW.toISOString(),
+    updatedAt: NOW.toISOString()
+  };
+}
+
+function operatorStore(requests) {
+  let mailbox = createWorkMailbox({ kind: "operator" });
+  for (const request of requests) {
+    mailbox = enqueueSignal(mailbox, {
+      reason: "input-requested",
+      refs: [{ type: "input", id: request.id }],
+      occurredAt: NOW.toISOString()
+    });
+  }
+  const byId = new Map(requests.map((request) => [request.id, request]));
+  const store = {
+    get mailbox() { return mailbox; },
+    getWorkMailbox: () => mailbox,
+    getInputRequest: (id) => byId.get(id) ?? null,
+    getOperatorDeliveryTarget: () => ({ roleName: "operator", adapterId: "codex" }),
+    claimWorkMailbox(input) {
+      if (mailbox.processing !== null) {
+        return { status: "processing", processing: mailbox.processing };
+      }
+      if (mailbox.pending === null) return { status: "empty" };
+      mailbox = claimPending(mailbox, {
+        batchId: input.batchId,
+        owner: input.owner,
+        startedAt: input.now.toISOString()
+      });
+      return { status: "claimed", processing: mailbox.processing };
+    },
+    completeWorkMailbox(_target, batchId) {
+      if (mailbox.processing?.batchId !== batchId) return false;
+      mailbox = completeProcessing(mailbox, batchId);
+      return true;
+    },
+    releaseWorkMailbox(_target, batchId) {
+      if (mailbox.processing?.batchId !== batchId) return false;
+      mailbox = releaseProcessing(mailbox, batchId);
+      return true;
+    }
+  };
+  return store;
+}
 
 function fakeStore(options = {}) {
   const task = { id: "task-1", status: "active" };

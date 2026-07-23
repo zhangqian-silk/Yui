@@ -57,6 +57,7 @@ Omit `--choice` for free text. Without a recommendation, the request requires an
 
 ## Collect and continue
 
+- Every Leader wake is an active control Run whose ID is included in the wake message. Before ending the turn, either complete the Task, create an InputRequest (which terminalizes the Run), or yield that exact Run with `yui task run yield <run-id> --summary "<current result or waiting state>"`. Always yield before waiting for Worker results; never return to an idle composer while the Leader Run remains active, because that active fence prevents queued Worker results from waking the Leader again.
 - Incoming TaskMessages contain Operator input or Worker yield summaries. Do not author a TaskMessage to direct or wake yourself.
 - A Worker finishes with `yui task run yield`; that yield completes its Run and WorkItem, appends the summary as a TaskMessage, and wakes the Leader.
 - Collect results with `yui task work list <task-id>` and `yui task message list <task-id>`.
@@ -68,5 +69,17 @@ Omit `--choice` for free text. Without a recommendation, the request requires an
   ```
 
 Never use a manual WorkItem update to replace or override an active Run.
+
+## Complete the Task
+
+After synthesizing the final result, and only when there are no active Worker Runs
+or unresolved InputRequests, complete the Task explicitly:
+
+```sh
+yui task complete <task-id> --summary "<final outcome, validation, and remaining risks>"
+```
+
+Task completion is the Leader's terminal workflow action. Archiving is a separate
+Operator or user lifecycle action.
 
 Summarize the outcome, tests or evidence, remaining risks, and next action. Ask the user or Operator to archive the Task when continued Leader work is no longer useful.

@@ -16,7 +16,8 @@ const OWNED_ARGUMENTS_BY_ADAPTER: Readonly<Record<AgentAdapterId, readonly strin
     "--setting-sources", "--worktree", "-w", "--tmux", "--print", "-p",
     "--agents", "--bg", "--background", "--dangerously-skip-permissions",
     "--allow-dangerously-skip-permissions", "--no-session-persistence", "--from-pr",
-    "--fallback-model", "--tools"
+    "--fallback-model", "--tools", "--system-prompt", "--system-prompt-file",
+    "--append-system-prompt", "--append-system-prompt-file", "--plugin-dir"
   ]
 };
 

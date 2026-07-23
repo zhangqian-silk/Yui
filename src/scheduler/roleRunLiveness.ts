@@ -1,4 +1,10 @@
-import type { SchedulerStorePort, TmuxDeliveryPort } from "./ports.js";
+import {
+  selectedSchedulerRoles,
+  selectedSchedulerTasks,
+  type SchedulerReconcileSelection,
+  type SchedulerStorePort,
+  type TmuxDeliveryPort
+} from "./ports.js";
 import { queueLeaderWakeup } from "./wakeupQueue.js";
 
 export const EXITED_ROLE_RUN_SUMMARY = "The role's tmux session exited before the run yielded.";
@@ -9,24 +15,47 @@ export const EXITED_ROLE_RUN_SUMMARY = "The role's tmux session exited before th
  */
 export async function reconcileExitedRoleRuns(
   store: SchedulerStorePort,
-  delivery: Pick<TmuxDeliveryPort, "inspectRole">,
-  now: Date
+  delivery: Pick<TmuxDeliveryPort, "inspectRole" | "inspectRoles">,
+  now: Date,
+  selection?: SchedulerReconcileSelection
 ): Promise<string[]> {
   const failed: string[] = [];
-  for (const task of store.listTasks()) {
-    for (const role of store.listRoles(task.id)) {
+  const candidates = selectedSchedulerTasks(store, selection).flatMap((task) => (
+    selectedSchedulerRoles(store, task.id, selection).flatMap((role) => {
       const run = store.getActiveAgentRun(task.id, role.name);
-      if (run === null) continue;
+      if (run === null) return [];
       const session = store.getRoleSession(task.id, role.name);
-      const status = await delivery.inspectRole({
-        taskId: task.id,
-        roleName: role.name,
-        agentId: role.activeAgentId,
-        adapterId: role.adapterId,
-        ...(session?.nativeSessionId === undefined
-          ? {}
-          : { nativeSessionId: session.nativeSessionId })
-      });
+      return [{
+        task,
+        role,
+        run,
+        session,
+        inspection: {
+          taskId: task.id,
+          roleName: role.name,
+          agentId: role.activeAgentId,
+          adapterId: role.adapterId,
+          ...(session?.nativeSessionId === undefined
+            ? {}
+            : { nativeSessionId: session.nativeSessionId })
+        }
+      }];
+    })
+  ));
+  if (candidates.length === 0) return failed;
+  const batch = delivery.inspectRoles === undefined
+    ? null
+    : await delivery.inspectRoles(candidates.map((candidate) => candidate.inspection));
+  const batchStatuses = new Map(
+    (batch ?? []).map((entry) => [
+      `${entry.taskId}\0${entry.roleName}`,
+      entry.status
+    ])
+  );
+  for (const { task, role, run, session, inspection } of candidates) {
+      const status = batch === null
+        ? await delivery.inspectRole(inspection)
+        : batchStatuses.get(`${task.id}\0${role.name}`) ?? "absent";
       if (status === "present") continue;
 
       store.saveExitedRoleRun({
@@ -46,7 +75,6 @@ export async function reconcileExitedRoleRuns(
           now
         );
       }
-    }
   }
   return failed;
 }

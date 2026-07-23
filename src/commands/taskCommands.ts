@@ -15,6 +15,7 @@ import {
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
+import { formatTimestamp } from "../output/timePresentation.js";
 import { renderRoleDetails } from "../output/rolePresentation.js";
 import {
   createTaskMessage,
@@ -43,7 +44,11 @@ import {
 import { createTaskBrief, updateTaskBrief } from "../brief/taskBrief.js";
 import { createDecision, supersedeDecision } from "../decision/decision.js";
 import { createMilestone } from "../milestone/milestone.js";
-import { queueLeaderWakeup, queueLeaderWakeupAfterYield } from "../scheduler/wakeupQueue.js";
+import {
+  completeWorkExecution,
+  enqueueWork
+} from "../coordination/workMailboxQueue.js";
+import type { MailboxEntityRef, MailboxTarget } from "../coordination/workMailbox.js";
 import {
   activateTask,
   archiveTask,
@@ -103,6 +108,7 @@ export type TaskCommandExecution =
  */
 export type TaskWorkflowRuntimePort = Readonly<{
   notifyStateChanged(taskId: string): void;
+  notifyMailboxChanged?(target: MailboxTarget): void;
   reconcileTask(taskId: string): void;
   prepareTaskRoleEnter(input: Readonly<{ taskId: string; roleName: string }>): void;
   inspectTaskRolePanes?(taskId: string): readonly TmuxRolePaneState[];
@@ -203,9 +209,10 @@ function updateTaskCommand(
     }, now);
     tx.saveTask(updated);
     recordTaskEvent(tx, updated.id, "task.updated", { status: updated.status }, now);
+    enqueueWork(tx, taskMailbox(updated.id), "task-updated", now, [taskRef(updated.id)]);
     return updated;
   });
-  options.runtime?.notifyStateChanged(task.id);
+  notifyMailbox(options.runtime, taskMailbox(task.id), task.id);
   return `Updated task ${task.id}\n`;
 }
 
@@ -235,7 +242,7 @@ export function submitOperatorMessage(
       assertTaskOpen(task);
       const message = appendMessage(tx, task.id, body, "operator", { type: "operator" }, now);
       if (task.status === "active") {
-        queueLeaderWakeup(tx, task.id, "operator-input", now);
+        enqueueWork(tx, leaderMailbox(task.id), "operator-input", now, [messageRef(message.id)]);
       }
       return { task, message, created: false } as const;
     }
@@ -244,7 +251,11 @@ export function submitOperatorMessage(
     const message = appendMessage(tx, created.task.id, body, "operator", { type: "operator" }, now);
     return { ...created, message, created: true } as const;
   });
-  options.runtime?.notifyStateChanged(result.task.id);
+  notifyMailbox(
+    options.runtime,
+    result.task.status === "active" ? leaderMailbox(result.task.id) : taskMailbox(result.task.id),
+    result.task.id
+  );
   return result.created
     ? `Created Draft task ${result.task.id}: ${result.task.title}\nSubmitted message ${result.message.id}\n`
     : `Submitted message ${result.message.id} to ${result.task.id}\n`;
@@ -271,7 +282,7 @@ function createTaskCommand(
     ...(repositoryId === undefined ? {} : { repositoryId }),
     ...(baseRef === undefined ? {} : { baseRef })
   }, now));
-  options.runtime?.notifyStateChanged(created.task.id);
+  notifyMailbox(options.runtime, taskMailbox(created.task.id), created.task.id);
   return `Created Draft task ${created.task.id}: ${created.task.title}\nAssigned role: ${created.leader.name}\n`;
 }
 
@@ -286,6 +297,7 @@ function createTaskAggregate(
   store.saveTask(task);
   store.saveRole(task.id, leader);
   recordTaskEvent(store, task.id, "task.created", { status: task.status }, now);
+  enqueueWork(store, taskMailbox(task.id), "task-created", now, [taskRef(task.id)]);
   return { task, leader };
 }
 
@@ -338,8 +350,8 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     ...(task.description === undefined ? [] : [`Description: ${task.description}`]),
     ...(task.priority === undefined ? [] : [`Priority: ${task.priority}`]),
     ...(task.tags === undefined ? [] : [`Tags: ${task.tags.join(", ")}`]),
-    ...(task.dueAt === undefined ? [] : [`Due: ${task.dueAt}`]),
-    ...(task.completedAt === undefined ? [] : [`Completed: ${task.completedAt}`]),
+    ...(task.dueAt === undefined ? [] : [`Due: ${presentTime(store, task.dueAt)}`]),
+    ...(task.completedAt === undefined ? [] : [`Completed: ${presentTime(store, task.completedAt)}`]),
     ...(task.completedBy === undefined ? [] : [`Completed by: ${task.completedBy}`]),
     ...(task.completionSummary === undefined ? [] : [`Completion summary: ${task.completionSummary}`]),
     ...(task.repositoryId === undefined ? [] : [`Repository: ${task.repositoryId}`]),
@@ -354,8 +366,8 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     `Work items: ${counts.workItems}`,
     `Runs: ${counts.runs}`,
     `Open inputs: ${counts.openInputs}`,
-    `Created: ${task.createdAt}`,
-    `Updated: ${task.updatedAt}`
+    `Created: ${presentTime(store, task.createdAt)}`,
+    `Updated: ${presentTime(store, task.updatedAt)}`
   ].join("\n").concat("\n");
   return output(rendered, { task, counts, hasBrief: brief !== null });
 }
@@ -378,14 +390,18 @@ function activateTaskCommand(
     tx.saveTask(active);
     // Repository-backed Tasks keep this durable wake pending until the
     // Controller has prepared and recorded the Task workspace.
-    queueLeaderWakeup(tx, task.id, "task-created", now);
+    enqueueWork(tx, leaderMailbox(task.id), "task-created", now, [taskRef(task.id)]);
+    enqueueWork(tx, taskMailbox(task.id), "task-activated", now, [taskRef(task.id)]);
     recordTaskEvent(tx, task.id, "task.activated", {
       fromStatus: task.status,
       status: active.status
     }, now);
     return { task: active, changed: true } as const;
   });
-  if (result.changed) options.runtime?.notifyStateChanged(result.task.id);
+  if (result.changed) {
+    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
+    notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
+  }
   return result.changed
     ? `Activated task ${result.task.id}\n`
     : `Task ${result.task.id} is already active\n`;
@@ -434,10 +450,12 @@ function completeTaskCommand(
         throw usageError(`Task ${task.id} Leader delivery is still pending.`);
       }
       tx.saveAgentRun(yieldAgentRun(leaderEntry.run, summary, now));
+      completeWorkExecution(tx, roleMailbox(task.id, LEADER_ROLE), runRef(leaderEntry.run.id));
       tx.clearActiveAgentRun(task.id, LEADER_ROLE);
       tx.saveRole(task.id, updateRoleStatus(leaderEntry.role, "idle", now));
       const sessions = tx.getTaskRoleSessionSet(task.id, LEADER_ROLE);
-      if (sessions?.sessions[leaderEntry.role.activeAgentId]?.status === "running") {
+      if (sessions?.inFlight === null
+        && sessions.sessions[leaderEntry.role.activeAgentId]?.status === "running") {
         tx.saveTaskRoleSessionSet(
           updateRoleAgentSessionStatus(sessions, leaderEntry.role.activeAgentId, "ready", now)
         );
@@ -450,9 +468,10 @@ function completeTaskCommand(
     tx.clearLeaderFailure(task.id);
     tx.clearOperatorNotification(task.id);
     recordTaskEvent(tx, task.id, "task.completed", { by: actor, summary }, now);
+    enqueueWork(tx, taskMailbox(task.id), "task-completed", now, [taskRef(task.id)]);
     return { task: completed, changed: true } as const;
   });
-  if (result.changed) options.runtime?.notifyStateChanged(result.task.id);
+  if (result.changed) notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
   return result.changed
     ? `Completed task ${result.task.id}\n`
     : `Task ${result.task.id} is already completed\n`;
@@ -472,11 +491,15 @@ function reopenTaskCommand(
     if (task.status !== "completed") throw usageError(`Task is not completed: ${task.id}.`);
     const active = reopenTask(task, now);
     tx.saveTask(active);
-    queueLeaderWakeup(tx, task.id, "task-reopened", now);
+    enqueueWork(tx, leaderMailbox(task.id), "task-reopened", now, [taskRef(task.id)]);
+    enqueueWork(tx, taskMailbox(task.id), "task-reopened", now, [taskRef(task.id)]);
     recordTaskEvent(tx, task.id, "task.reopened", { status: active.status }, now);
     return { task: active, changed: true } as const;
   });
-  if (result.changed) options.runtime?.notifyStateChanged(result.task.id);
+  if (result.changed) {
+    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
+    notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
+  }
   return result.changed
     ? `Reopened task ${result.task.id}\n`
     : `Task ${result.task.id} is already active\n`;
@@ -504,6 +527,7 @@ function archiveTaskCommand(
       if (activeRun === null) continue;
       const failed = failAgentRun(activeRun, "Task archived.", now);
       tx.saveAgentRun(failed);
+      completeWorkExecution(tx, roleMailbox(task.id, role.name), runRef(activeRun.id));
       tx.clearActiveAgentRun(task.id, role.name);
       tx.saveRole(task.id, updateRoleStatus(role, "idle", now));
       if (failed.workItemId !== undefined) {
@@ -514,9 +538,10 @@ function archiveTaskCommand(
       }
     }
     recordTaskEvent(tx, task.id, "task.archived", { by: actor }, now);
+    enqueueWork(tx, taskMailbox(task.id), "task-archived", now, [taskRef(task.id)]);
     return { task: archived, changed: true } as const;
   });
-  if (result.changed) options.runtime?.notifyStateChanged(result.task.id);
+  if (result.changed) notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
   return result.changed
     ? `Archived task ${result.task.id}\n`
     : `Task ${result.task.id} is already archived\n`;
@@ -547,10 +572,16 @@ function taskMessageCommand(
       const task = requireTask(tx, rest[0]);
       assertTaskOpen(task);
       const message = appendMessage(tx, task.id, rest[1], "user", { type: "user" }, now);
-      if (task.status === "active") queueLeaderWakeup(tx, task.id, "user-message", now);
+      if (task.status === "active") {
+        enqueueWork(tx, leaderMailbox(task.id), "user-message", now, [messageRef(message.id)]);
+      }
       return { task, message };
     });
-    options.runtime?.notifyStateChanged(result.task.id);
+    notifyMailbox(
+      options.runtime,
+      result.task.status === "active" ? leaderMailbox(result.task.id) : taskMailbox(result.task.id),
+      result.task.id
+    );
     return `Sent message ${result.message.id} to ${result.task.id}\n`;
   }
   if (command === "list") {
@@ -569,7 +600,7 @@ function taskMessageCommand(
       messages.map((message) => [
         message.id,
         taskMessageAuthorLabel(message.author),
-        message.createdAt,
+        presentTime(store, message.createdAt),
         message.body
       ]),
       defaultTableWidth()
@@ -635,9 +666,10 @@ function addTaskRole(
       }, now);
     }
     tx.saveRole(task.id, created);
+    enqueueWork(tx, taskMailbox(task.id), "role-added", now, [taskRef(task.id)]);
     return created;
   });
-  options.runtime?.notifyStateChanged(role.taskId);
+  notifyMailbox(options.runtime, taskMailbox(role.taskId), role.taskId);
   return `Added role ${role.name} to ${role.taskId} (Agent: ${role.activeAgentId})\n`;
 }
 
@@ -749,9 +781,10 @@ function updateTaskRole(
       ...roleProfilePatch(parsed)
     }, now);
     tx.saveRole(task.id, next);
+    enqueueWork(tx, taskMailbox(task.id), "role-updated", now, [taskRef(task.id)]);
     return next;
   });
-  options.runtime?.notifyStateChanged(updated.taskId);
+  notifyMailbox(options.runtime, taskMailbox(updated.taskId), updated.taskId);
   return renderRoleDetails(`Updated Task Role: ${updated.name}`, updated, {
     kind: "task",
     sessions: store.getTaskRoleSessionSet(updated.taskId, updated.name)
@@ -764,6 +797,7 @@ function removeTaskRole(
   options: TaskCommandOptions
 ): string {
   exactPositionals(args, 2, "Task role remove usage: yui task role remove <task> <role>.");
+  const now = clock(options);
   const removed = store.transaction((tx) => {
     const task = requireTask(tx, args[0]);
     assertTaskOpen(task);
@@ -777,9 +811,10 @@ function removeTaskRole(
       throw usageError(`Task Role has a running native Agent and cannot be removed: ${task.id}/${role.name}.`);
     }
     if (!tx.removeTaskRole(task.id, role.name)) throw roleNotFound(role.name);
+    enqueueWork(tx, taskMailbox(task.id), "role-removed", now, [taskRef(task.id)]);
     return role;
   });
-  options.runtime?.notifyStateChanged(removed.taskId);
+  notifyMailbox(options.runtime, taskMailbox(removed.taskId), removed.taskId);
   return `Removed role ${removed.name} from ${removed.taskId}\n`;
 }
 
@@ -800,6 +835,7 @@ function bindTaskRole(
     const bound = updateRole(role, {
       agentBindings: { ...role.agentBindings, [agent.id]: binding }
     }, now);
+    enqueueWork(tx, taskMailbox(task.id), "role-bound", now, [taskRef(task.id)]);
     if (agent.id === role.activeAgentId) {
       tx.saveRole(task.id, bound);
       return { role: bound, mode: "current" as const };
@@ -820,7 +856,7 @@ function bindTaskRole(
     tx.saveTaskRoleWithSessionSet(switched.role, switched.sessions);
     return { role: switched.role, mode: switched.mode };
   });
-  options.runtime?.notifyStateChanged(result.role.taskId);
+  notifyMailbox(options.runtime, taskMailbox(result.role.taskId), result.role.taskId);
   return `Bound ${result.role.taskId}/${result.role.name} to ${result.role.activeAgentId} (${result.mode})\n`;
 }
 
@@ -889,9 +925,10 @@ function createWork(
       assignee: roleName
     }, now);
     tx.saveWorkItem(task.id, created);
+    enqueueWork(tx, taskMailbox(task.id), "work-created", now, [workItemRef(created.id)]);
     return created;
   });
-  options.runtime?.notifyStateChanged(item.taskId);
+  notifyMailbox(options.runtime, taskMailbox(item.taskId), item.taskId);
   return `Created work item ${item.id} for ${item.taskId}\n`;
 }
 
@@ -939,9 +976,10 @@ function updateWork(
     }
     const updated = updateWorkItemStatus(current, status, trimmed(summary), now);
     tx.saveWorkItem(task.id, updated);
+    enqueueWork(tx, taskMailbox(task.id), "work-updated", now, [workItemRef(updated.id)]);
     return updated;
   });
-  options.runtime?.notifyStateChanged(item.taskId);
+  notifyMailbox(options.runtime, taskMailbox(item.taskId), item.taskId);
   return `Updated work item ${item.id} to ${requested}\n`;
 }
 
@@ -983,9 +1021,13 @@ function dispatchWork(
     tx.saveActiveAgentRun(created);
     tx.saveWorkItem(task.id, updateWorkItemStatus(item, "running", undefined, now));
     tx.saveRole(task.id, updateRoleStatus(role, "running", now));
+    enqueueWork(tx, roleMailbox(task.id, role.name), "run-dispatched", now, [
+      runRef(created.id),
+      workItemRef(item.id)
+    ]);
     return created;
   });
-  options.runtime?.notifyStateChanged(run.taskId);
+  notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName), run.taskId);
   return `Dispatch queued for ${run.taskId}/${run.roleName} (${run.id})\n`;
 }
 
@@ -1058,9 +1100,10 @@ function retryRun(
       if (item === null) throw dataError(`Work item not found for run ${previous.id}: ${previous.workItemId}.`);
       tx.saveWorkItem(task.id, updateWorkItemStatus(item, "running", undefined, now));
     }
+    enqueueWork(tx, roleMailbox(task.id, role.name), "run-retried", now, [runRef(created.id)]);
     return created;
   });
-  options.runtime?.notifyStateChanged(retried.taskId);
+  notifyMailbox(options.runtime, roleMailbox(retried.taskId, retried.roleName), retried.taskId);
   return `Retry queued as ${retried.id} for ${retried.taskId}/${retried.roleName}\n`;
 }
 
@@ -1098,6 +1141,7 @@ function yieldRun(
       { runId: terminal.id, workItemId: active.workItemId }
     );
     tx.saveAgentRun(terminal);
+    completeWorkExecution(tx, roleMailbox(task.id, role.name), runRef(terminal.id));
     tx.clearActiveAgentRun(task.id, role.name);
     if (active.workItemId !== undefined) {
       const item = tx.getWorkItem(task.id, active.workItemId);
@@ -1108,15 +1152,20 @@ function yieldRun(
     }
     tx.saveRole(task.id, updateRoleStatus(role, "idle", now));
     const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
-    if (sessions?.sessions[role.activeAgentId]?.status === "running") {
+    if (sessions?.inFlight === null
+      && sessions.sessions[role.activeAgentId]?.status === "running") {
       tx.saveTaskRoleSessionSet(updateRoleAgentSessionStatus(sessions, role.activeAgentId, "ready", now));
     }
-    queueLeaderWakeupAfterYield(tx, task, terminal, now);
+    if (role.name !== LEADER_ROLE) {
+      enqueueWork(tx, leaderMailbox(task.id), "role-result", now, [
+        runRef(terminal.id),
+        messageRef(message.id),
+        ...(terminal.workItemId === undefined ? [] : [workItemRef(terminal.workItemId)])
+      ]);
+    }
     return { run: terminal, message };
   });
-  // For a Leader yield this also advances a wake that arrived while the Leader
-  // was busy; queueLeaderWakeupAfterYield deliberately does not self-wake.
-  options.runtime?.notifyStateChanged(yielded.run.taskId);
+  notifyMailbox(options.runtime, leaderMailbox(yielded.run.taskId), yielded.run.taskId);
   return `Yielded ${yielded.run.id}: ${yielded.message.body}\n`;
 }
 
@@ -1294,7 +1343,7 @@ function taskBriefCommand(
       `Current focus: ${brief.currentFocus}`,
       `Leader summary: ${brief.leaderSummary}`,
       `Updated by: ${brief.updatedBy}`,
-      `Updated at: ${brief.updatedAt}`
+      `Updated at: ${presentTime(store, brief.updatedAt)}`
     ].join("\n").concat("\n"), { taskId: task.id, brief });
   }
   if (command === "update") {
@@ -1330,12 +1379,16 @@ function taskBriefCommand(
           }, updatedBy, now);
       tx.saveTaskBrief(task.id, brief);
       recordTaskEvent(tx, task.id, "brief.updated", { updatedBy }, now);
+      enqueueWork(tx, taskMailbox(task.id), "brief-updated", now, [taskRef(task.id)]);
       if (task.status === "active" && updatedBy !== "leader") {
-        queueLeaderWakeup(tx, task.id, "brief-updated", now);
+        enqueueWork(tx, leaderMailbox(task.id), "brief-updated", now, [taskRef(task.id)]);
       }
       return { task, brief };
     });
-    options.runtime?.notifyStateChanged(result.task.id);
+    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
+    if (result.task.status === "active") {
+      notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
+    }
     return output(`Updated brief for ${result.task.id}\n`);
   }
   throw usageError(command === undefined
@@ -1363,12 +1416,14 @@ function taskDecisionCommand(
       const decision = createDecision(tx.nextDecisionId(task.id), task.id, title, rationale, now);
       tx.saveDecision(task.id, decision);
       recordTaskEvent(tx, task.id, "decision.recorded", { decisionId: decision.id, title }, now);
+      enqueueWork(tx, taskMailbox(task.id), "decision-recorded", now, [taskRef(task.id)]);
       if (task.status === "active" && actor !== "leader") {
-        queueLeaderWakeup(tx, task.id, "decision-recorded", now);
+        enqueueWork(tx, leaderMailbox(task.id), "decision-recorded", now, [taskRef(task.id)]);
       }
       return { task, decision };
     });
-    options.runtime?.notifyStateChanged(result.task.id);
+    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
+    if (result.task.status === "active") notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
     return output(`Recorded decision ${result.decision.id} for ${result.task.id}\n`);
   }
   if (command === "list") {
@@ -1395,7 +1450,7 @@ function taskDecisionCommand(
         { header: "Title", minWidth: 8, maxWidth: 64 },
         { header: "Created", minWidth: 10, maxWidth: 28 }
       ],
-      decisions.map((d) => [d.id, d.status, d.title, d.createdAt]),
+      decisions.map((d) => [d.id, d.status, d.title, presentTime(store, d.createdAt)]),
       defaultTableWidth()
     )}\n`, { taskId: task.id, decisions });
   }
@@ -1411,9 +1466,9 @@ function taskDecisionCommand(
       `Rationale: ${decision.rationale}`,
       `Status: ${decision.status}`,
       ...(decision.supersededReason === undefined ? [] : [`Superseded reason: ${decision.supersededReason}`]),
-      ...(decision.supersededAt === undefined ? [] : [`Superseded at: ${decision.supersededAt}`]),
-      `Created: ${decision.createdAt}`,
-      `Updated: ${decision.updatedAt}`
+      ...(decision.supersededAt === undefined ? [] : [`Superseded at: ${presentTime(store, decision.supersededAt)}`]),
+      `Created: ${presentTime(store, decision.createdAt)}`,
+      `Updated: ${presentTime(store, decision.updatedAt)}`
     ].join("\n").concat("\n"), { taskId: task.id, decision });
   }
   if (command === "supersede") {
@@ -1431,12 +1486,14 @@ function taskDecisionCommand(
       const decision = supersedeDecision(existing, reason, now);
       tx.saveDecision(task.id, decision);
       recordTaskEvent(tx, task.id, "decision.superseded", { decisionId: decision.id, reason }, now);
+      enqueueWork(tx, taskMailbox(task.id), "decision-superseded", now, [taskRef(task.id)]);
       if (task.status === "active" && actor !== "leader") {
-        queueLeaderWakeup(tx, task.id, "decision-superseded", now);
+        enqueueWork(tx, leaderMailbox(task.id), "decision-superseded", now, [taskRef(task.id)]);
       }
       return { task, decision };
     });
-    options.runtime?.notifyStateChanged(result.task.id);
+    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
+    if (result.task.status === "active") notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
     return output(`Superseded decision ${result.decision.id} for ${result.task.id}\n`);
   }
   throw usageError(command === undefined
@@ -1466,9 +1523,10 @@ function taskMilestoneCommand(
       const milestone = createMilestone(tx.nextMilestoneId(task.id), task.id, title, summary, now);
       tx.saveMilestone(task.id, milestone);
       recordTaskEvent(tx, task.id, "milestone.added", { milestoneId: milestone.id, title }, now);
+      enqueueWork(tx, taskMailbox(task.id), "milestone-added", now, [taskRef(task.id)]);
       return { task, milestone };
     });
-    options.runtime?.notifyStateChanged(result.task.id);
+    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
     return output(`Added milestone ${result.milestone.id} for ${result.task.id}\n`);
   }
   if (command === "list") {
@@ -1485,7 +1543,7 @@ function taskMilestoneCommand(
         { header: "Title", minWidth: 8, maxWidth: 64 },
         { header: "Created", minWidth: 10, maxWidth: 28 }
       ],
-      milestones.map((m) => [m.id, m.title, m.createdAt]),
+      milestones.map((m) => [m.id, m.title, presentTime(store, m.createdAt)]),
       defaultTableWidth()
     )}\n`, { taskId: task.id, milestones });
   }
@@ -1500,7 +1558,7 @@ function taskMilestoneCommand(
       `Title: ${milestone.title}`,
       `Summary: ${milestone.summary}`,
       `Created by: ${milestone.createdBy}`,
-      `Created: ${milestone.createdAt}`
+      `Created: ${presentTime(store, milestone.createdAt)}`
     ].join("\n").concat("\n"), { taskId: task.id, milestone });
   }
   throw usageError(command === undefined
@@ -1527,7 +1585,7 @@ function taskEventCommand(
         { header: "Type", minWidth: 8, maxWidth: 28 },
         { header: "Created", minWidth: 10, maxWidth: 28 }
       ],
-      events.map((e) => [e.id, e.type, e.createdAt]),
+      events.map((e) => [e.id, e.type, presentTime(store, e.createdAt)]),
       defaultTableWidth()
     )}\n`, { taskId: task.id, events });
   }
@@ -1541,7 +1599,7 @@ function taskEventCommand(
       `Event: ${event.id}`,
       `Task: ${task.id}`,
       `Type: ${event.type}`,
-      `Created: ${event.createdAt}`,
+      `Created: ${presentTime(store, event.createdAt)}`,
       `Payload:`,
       ...(Object.keys(event.payload).length === 0
         ? ["  (none)"]
@@ -1673,6 +1731,10 @@ function titleFrom(body: string): string {
   return oneLine.length <= 80 ? oneLine : `${oneLine.slice(0, 77)}...`;
 }
 
+function presentTime(store: Pick<TaskWorkflowStore, "getConfig">, value: string): string {
+  return formatTimestamp(value, store.getConfig().timeZone);
+}
+
 function output(value: string, data?: unknown): TaskCommandExecution {
   return data === undefined
     ? { kind: "output", output: value }
@@ -1685,4 +1747,44 @@ function clock(options: TaskCommandOptions): Date {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function taskMailbox(taskId: string): MailboxTarget {
+  return { kind: "task", taskId };
+}
+
+function roleMailbox(taskId: string, roleName: string): MailboxTarget {
+  return { kind: "role", taskId, roleName };
+}
+
+function leaderMailbox(taskId: string): MailboxTarget {
+  return roleMailbox(taskId, LEADER_ROLE);
+}
+
+function taskRef(id: string): MailboxEntityRef {
+  return { type: "task", id };
+}
+
+function runRef(id: string): MailboxEntityRef {
+  return { type: "run", id };
+}
+
+function workItemRef(id: string): MailboxEntityRef {
+  return { type: "work-item", id };
+}
+
+function messageRef(id: string): MailboxEntityRef {
+  return { type: "message", id };
+}
+
+function notifyMailbox(
+  runtime: TaskWorkflowRuntimePort | undefined,
+  target: MailboxTarget,
+  compatibilityTaskId: string
+): void {
+  if (runtime?.notifyMailboxChanged !== undefined) {
+    runtime.notifyMailboxChanged(target);
+  } else {
+    runtime?.notifyStateChanged(compatibilityTaskId);
+  }
 }

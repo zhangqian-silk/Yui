@@ -59,6 +59,15 @@ yui task activate <task-id>
 
 Use `task context` as the first detailed read of an existing Task. It combines the Task, Brief, active Decisions, recent Milestones, Roles, current and recent WorkItems with their Runs, recent Messages, open and resolved InputRequests, and recent Events. Terminal output keeps histories and long text compact; `yui --json task context <task-id>` returns the complete records in the top-level `data` field.
 
+Human-facing timestamps default to Beijing time (`Asia/Shanghai`) while durable
+records and `--json` data remain UTC/RFC 3339. Inspect or change the IANA
+timezone with:
+
+```sh
+yui config show
+yui config set --time-zone Europe/London
+```
+
 Activation queues the first durable Leader wake. For a repository-backed Task, the Controller first creates one worktree per Role at `<YUI_HOME>/worktrees/<task-id>/<role-name>` on `yui/<task-id>/<role-name>`, then starts the Leader. Roles added later receive their own worktree before delivery.
 
 Submit information through Operator:
@@ -107,9 +116,9 @@ yui task input request <task-id> --question "Which format should be the default?
   --recommend csv --timeout-seconds 300
 ```
 
-The recommendation is shown to the user. If no answer arrives, the first Controller scan at or after the deadline atomically applies that exact choice and queues the fixed Leader session to resume. Free-text and user-required requests never auto-resolve.
+The recommendation is shown to the user. If no answer arrives, the nearest-deadline timer wakes the Controller to atomically apply that exact choice and queue the fixed Leader session to resume. Free-text and user-required requests never auto-resolve.
 
-`task input list` is the authoritative global open-input Inbox; add a Task ID to scope it, or `--all` to include answered and cancelled requests. The Controller also makes one receipt-backed, best-effort delivery to an already-running Operator composer. It never starts or interrupts an Operator for this notification; an absent or busy Operator falls back to the durable Inbox and is reconsidered on a later Controller scan. Answers may be submitted by the user or Operator. An open request prevents unrelated pending wakes and Task completion or archival. The originating Leader may instead run `yui task input cancel <task-id> <input-id> --reason "..."`; cancellation does not self-wake it.
+`task input list` is the authoritative global open-input Inbox; add a Task ID to scope it, or `--all` to include answered and cancelled requests. The Controller also makes one receipt-backed, best-effort delivery to an already-running Operator composer. It never starts or interrupts an Operator for this notification; an absent or busy Operator falls back to the durable Inbox and is reconsidered on a later Controller pass. Answers may be submitted by the user or Operator. An open request prevents unrelated pending wakes and Task completion or archival. The originating Leader may instead run `yui task input cancel <task-id> <input-id> --reason "..."`; cancellation queues that fixed Leader session to resume.
 
 Inspect the result:
 
@@ -143,6 +152,8 @@ Each Role can bind multiple configured Agents, has one active Agent, and keeps a
 
 Claude session IDs are preallocated at launch. Managed Codex launches use Codex's structured `notify` callback; after a completed turn, the callback records the native thread ID without injecting a session-binding prompt into the model conversation.
 
+Stable Role context is also launch metadata, never a bootstrap turn. Yui passes Role policy and `systemPrompt` through the Agent's native system/developer-instruction channel. Native Codex CLI has no per-launch extra-Skill-root option, so its developer instructions carry compact absolute Skill references and Codex reads each `SKILL.md` on demand; `skills.config` is not misused because it only enables or disables already-discovered Skills. Claude receives the same Skill content through its additive system-prompt channel. Operator therefore opens at an empty native composer, so the user's text remains its first user message. Leader wakeups and Worker Run assignments remain real mailbox-delivered work messages. An adapter without a native instruction channel must reject this context rather than silently converting it into a first user prompt.
+
 ## Controller and failure handling
 
 One background Controller runs per `YUI_HOME`:
@@ -155,7 +166,7 @@ yui controller restart
 
 `controller restart` replaces the Controller process and its scheduler/socket services with the currently installed Yui version. It does not stop or restart managed tmux/Agent sessions.
 
-Its full reconciliation pass runs every 30 seconds by default; durable state changes still request an immediate pass. The retained loop is:
+Its recovery reconciliation runs every 120 seconds by default. Normal durable state changes enqueue a Task, Role, or Operator key and return immediately; keys received in the same fixed 100 ms window trigger one non-overlapping targeted pass. Operator presentation has an independent lane, so a blocked Task workspace operation cannot delay a user question. Periodic Git/worktree work is limited to Tasks with durable Task-mailbox work, while active Role liveness uses one tmux inventory. A Codex turn-complete Hook writes directly to storage without starting or waiting for the Controller, then gives a legal yield/input/completion two seconds to win before closing a forgotten Run. Durable mailboxes freeze the current batch while new signals merge into the next batch; failures release the current batch for recovery. Recommended InputRequest and pending Turn deadlines share one nearest-deadline selector and therefore do not wait for the recovery interval. Explicit `task reconcile` still requests an immediate recovery pass. The retained loop is:
 
 1. prepare active repository workspaces;
 2. stop archived Task tmux sessions and clean only clean worktrees;
@@ -163,7 +174,7 @@ Its full reconciliation pass runs every 30 seconds by default; durable state cha
 4. detect exited active Role processes;
 5. dispatch pending Leader wakes when the Leader is idle.
 
-Automated input is sent only through tmux, after an Agent-specific readiness check. A pane-local receipt prevents the same Run from being typed twice after a Controller retry.
+Automated input is sent only through tmux. Each pass performs one non-blocking Agent-specific readiness check; a busy startup is retried through a small bounded mailbox timer, while later busy sessions are normally woken by Codex turn-complete events. A pane-local receipt prevents the same Run from being typed twice after a Controller retry.
 
 If a Role process exits before yielding, the Controller fails that Run and running WorkItem and queues the Leader. Recovery failures are exposed through the small compatibility Jobs view:
 
@@ -204,6 +215,20 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for persistence and scheduling details.
 npm run build
 npm test
 npm run lint
+```
+
+To make every terminal and managed Agent session use this checkout, reversibly link the user-level `yui` command:
+
+```sh
+make link
+command -v yui
+yui doctor
+```
+
+The first `make link` saves the original `yui` entry in the same user-level bin directory and replaces it with a managed symlink to this checkout. A later `make link` from another checkout only moves that managed symlink; the last checkout wins and development links never form a backup chain. The launcher defaults `YUI_HOME` to the active checkout's `output/dev/home`; an explicit `YUI_HOME` remains authoritative. Because the command path itself is replaced, other terminals and newly launched Codex/Claude sessions use the same development build without sourcing a shell script. Run `yui controller restart` if an already-running Controller must load the new build. `make unlink` from any checkout using this implementation verifies the shared managed state and restores the one original `yui` entry.
+
+```sh
+make unlink
 ```
 
 ## License
