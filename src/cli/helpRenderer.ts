@@ -33,6 +33,8 @@ function describeOption(option: string): string {
     "--agent": "Select an Agent.",
     "--base": "Set the base Git reference.",
     "--input": "Set dispatch input.",
+    "--host": "Set the loopback listen address.",
+    "--port": "Set the local listen port.",
     "--json": "Emit machine-readable JSON.",
     "--repository": "Select a repository.",
     "--role": "Select a Task role.",

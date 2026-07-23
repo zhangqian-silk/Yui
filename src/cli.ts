@@ -46,6 +46,7 @@ import { FileTaskStore, resolveYuiHome } from "./storage/taskStore.js";
 import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
 import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
+import { parseWebCommandOptions, startYuiWebServer } from "./web/webServer.js";
 
 const VERSION = readPackageVersion();
 const rawArgs = process.argv.slice(2);
@@ -145,6 +146,15 @@ export async function main(): Promise<void> {
   const resolved = await resolveTerminalArguments(args, invocation.node, store);
   if (resolved === null) {
     emit("Cancelled.");
+    return;
+  }
+
+  if (resolved[0] === "web") {
+    if (jsonOutput) throw usageError("Web does not support --json.");
+    const options = parseWebCommandOptions(resolved.slice(1));
+    await startYuiWebServer(store, options);
+    const displayHost = options.host === "::1" ? "[::1]" : options.host;
+    process.stdout.write(`Yui web dashboard: http://${displayHost}:${options.port}\n`);
     return;
   }
 
