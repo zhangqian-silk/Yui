@@ -174,7 +174,11 @@ function updateRole(args: string[], store: GlobalRoleStore): string {
     const agent = requireAgent(agentId, store);
     const binding = role.agentBindings[agentId] ?? createRoleAgentBinding(definition(agent));
     const activeSession = store.getGlobalRoleSessionSet(name)?.sessions[agentId];
-    if (agentId === role.activeAgentId && activeSession?.status === "running") {
+    if (
+      agentId === role.activeAgentId
+      && activeSession !== undefined
+      && activeSession.status !== "stopped"
+    ) {
       throw usageError("Active Agent settings cannot be changed while its native process is running.");
     }
     bindings = { ...role.agentBindings, [agentId]: patchRoleAgentBinding(binding, parsed) };
@@ -215,7 +219,11 @@ function bindRole(args: string[], store: GlobalRoleStore): string {
       withBinding,
       existingSet ?? createRoleSessionSet({ scope: "global", roleName: name }, role.activeAgentId, new Date()),
       agentId,
-      { activeRun: false, nativeProcessRunning: activeSession?.status === "running" },
+      {
+        activeRun: false,
+        nativeProcessRunning: activeSession !== undefined
+          && activeSession.status !== "stopped"
+      },
       new Date()
     );
     store.saveGlobalRoleWithSessionSet(switched.role, switched.sessions);
@@ -232,7 +240,7 @@ function removeRole(args: string[], store: GlobalRoleStore): string {
   if (isSystemRoleName(name)) throw usageError(`System role cannot be removed: ${name}`);
   const role = requireRole(name, store);
   const active = store.getGlobalRoleSessionSet(name)?.sessions[role.activeAgentId];
-  if (active?.status === "running") {
+  if (active !== undefined && active.status !== "stopped") {
     throw usageError(`GlobalRole is active and cannot be removed: ${name}.`);
   }
   if (!store.removeGlobalRole(name)) throw roleNotFound(name);
@@ -298,7 +306,7 @@ function roleSession(
   if (existing === null) {
     throw usageError("Native session replacement requires an existing native session.");
   }
-  if (existing.status === "running") {
+  if (existing.status !== "stopped") {
     throw usageError("Native session replacement is blocked while the native Agent process is running.");
   }
   if (existing.nativeSessionId === nativeSessionId) {

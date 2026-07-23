@@ -247,7 +247,11 @@ function checkAgent(agent: ConfiguredAgent, executor: CommandExecutor): DoctorCh
     {
       name: `agent:${agent.id}:capability`,
       status,
-      detail: `start resume interrupt nativeSession=${snapshot.lifecycle.nativeSessionDiscovery} fields=${available}/${degraded}/${unavailable}`
+      detail: [
+        `start resume interrupt nativeSession=${snapshot.lifecycle.nativeSessionDiscovery}`,
+        `fields=${available}/${degraded}/${unavailable}`,
+        ...snapshot.warnings.map((warning) => `warning=${warning}`)
+      ].join(" ")
     }
   ];
 }

@@ -151,6 +151,7 @@ test("global Role enter returns a control result and binding preserves dormant s
   assert.match(runGlobalRoleCommand([
     "session", "record", "reviewer", "--native-id", "session-1"
   ], store, { env: {} }), /Recorded native session/);
+  store.sessions.get("reviewer").sessions.claude.status = "stopped";
   assert.match(runGlobalRoleCommand([
     "session", "replace", "reviewer", "--native-id", "session-2", "--reason", "rotated"
   ], store, { env: {} }), /Replaced native session/);

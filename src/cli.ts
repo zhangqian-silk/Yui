@@ -193,7 +193,33 @@ export async function main(): Promise<void> {
     return;
   }
   if (resolved[0] === "config") {
-    emit(runConfigCommand(resolved.slice(1), store));
+    const configArgs = resolved.slice(1);
+    const output = runConfigCommand(configArgs, store);
+    if (
+      configArgs[0] === "set"
+      && configArgs[1] === "--reconciliation-interval-seconds"
+    ) {
+      const status = await callFileTaskController(
+        home,
+        "controller.status",
+        {},
+        { environment: process.env }
+      );
+      if (
+        typeof status === "object"
+        && status !== null
+        && !Array.isArray(status)
+        && (status as Readonly<Record<string, unknown>>).running === true
+      ) {
+        await callFileTaskController(
+          home,
+          "scheduler.configure",
+          { reconciliationIntervalSeconds: Number(configArgs[2]) },
+          { environment: process.env }
+        );
+      }
+    }
+    emit(output);
     return;
   }
   if (resolved[0] === "repository") {
@@ -215,7 +241,7 @@ export async function main(): Promise<void> {
       return;
     }
     await ensureFileTaskController(home, { environment: process.env });
-    runtime.prepareGlobalRoleEnter(result.role.name);
+    await runtime.prepareGlobalRoleEnter(result.role.name);
     tmux.attachRole("operator", result.role.name);
     return;
   }
@@ -223,7 +249,7 @@ export async function main(): Promise<void> {
     if (resolved[1] === "enter") {
       if (resolved.length !== 2) throw usageError("Operator enter usage: yui operator enter.");
       await ensureFileTaskController(home, { environment: process.env });
-      runtime.prepareGlobalRoleEnter("operator");
+      await runtime.prepareGlobalRoleEnter("operator");
       tmux.attachRole("operator", "operator");
       return;
     }
@@ -249,6 +275,10 @@ export async function main(): Promise<void> {
       emit(result.output, false, result.data);
       return;
     }
+    await runtime.prepareTaskRoleEnter({
+      taskId: result.taskId,
+      roleName: result.roleName
+    });
     if (result.output !== undefined) emit(result.output);
     tmux.attachRole(result.taskId, result.roleName);
     return;

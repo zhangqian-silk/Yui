@@ -68,7 +68,9 @@ test("FileTaskStore doctor reports schema, state, tools, and configured Agent ca
         return "codex-cli 0.144.4\n";
       }
       if (command === "codex-custom" && args[0] === "--help") {
-        return "  --sandbox [possible values: read-only, workspace-write, danger-full-access]\n"
+        return "Usage: codex [OPTIONS] [PROMPT]\n  resume [SESSION_ID]\n"
+          + "  -c, --config <key=value>\n"
+          + "  --sandbox [possible values: read-only, workspace-write, danger-full-access]\n"
           + "  --ask-for-approval [possible values: untrusted, on-request, never]\n";
       }
       throw new CommandExecutionError("COMMAND_NOT_FOUND");

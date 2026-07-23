@@ -243,7 +243,9 @@ export function roleAgentSessionResumeMode(
   if (set === null) return "new";
   validateRoleSessionSet(set);
   const session = set.sessions[requireSafeIdentity(agentId, "Agent id")];
-  return session === undefined ? "new" : "resume";
+  return session === undefined || session.nativeSessionId.trim().length === 0
+    ? "new"
+    : "resume";
 }
 
 export function bindTaskRoleRun(
@@ -364,6 +366,33 @@ export function clearTaskRoleRun(
     updatedAt: timestamp
   };
   return validateRoleSessionSet(updated);
+}
+
+/**
+ * Applies an authoritative application-level Run terminal fact to the native
+ * session fence. A later native Hook is only advisory and must not be required
+ * to make the next Run dispatchable.
+ */
+export function terminalizeTaskRoleRunSession(
+  set: TaskRoleSessionSet,
+  fence: TaskRoleRunFence,
+  terminalAt: Date
+): TaskRoleSessionSet {
+  validateRoleSessionSet(set);
+  const inFlight = set.inFlight;
+  let updated = inFlight === null
+    ? set
+    : clearTaskRoleRun(set, fence, terminalAt);
+  const session = updated.sessions[updated.activeAgentId];
+  if (session?.status === "running") {
+    updated = updateRoleAgentSessionStatus(
+      updated,
+      updated.activeAgentId,
+      "ready",
+      terminalAt
+    );
+  }
+  return updated;
 }
 
 export function settleTaskRoleCompletion(

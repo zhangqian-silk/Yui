@@ -113,6 +113,7 @@ const SANDBOXES = ["read-only", "workspace-write", "danger-full-access"] as cons
 const APPROVALS = ["untrusted", "on-request", "never"] as const;
 const PROBE_TIMEOUT_MS = 2_000;
 const PROBE_MAX_BYTES = 1024 * 1024;
+const CODEX_TESTED_THROUGH_VERSION = "0.145.0";
 
 abstract class BaseAdapter<TConfig extends RoleAgentConfig> implements AgentAdapter<TConfig> {
   abstract readonly id: AgentAdapterId;
@@ -340,17 +341,49 @@ export function inspectAgentCapabilities(
       reason: "Agent version probe did not return a semantic version.", probedAt: at
     }, baseline(agent.adapterId), at);
   }
-  const supported = supports(version, adapter.supportedVersion);
+  const supported = supports(version, adapter);
   let fields = baseline(agent.adapterId);
-  const warnings = supported ? [] : [`Installed version ${version} is not supported by adapter ${adapter.id}.`];
-  if (supported) {
-    const help = run(agent.command, ["--help"]);
-    if (failed(help) === undefined) fields = fromHelp(agent.adapterId, output(help.stdout, help.stderr));
+  const warnings: string[] = [];
+  if (!supported) {
+    return snapshot(agent, adapter, {
+      status: "unsupported-version", command: agent.command, version,
+      reason: adapter.id === "codex"
+        ? `Minimum supported version is ${adapter.supportedVersion}.`
+        : `Supported version line starts at ${adapter.supportedVersion}.`,
+      probedAt: at
+    }, fields, at, [`Installed version ${version} is not supported by adapter ${adapter.id}.`]);
+  }
+
+  const help = run(agent.command, ["--help"]);
+  const helpFailure = failed(help);
+  if (adapter.id === "codex" && helpFailure !== undefined) {
+    return snapshot(agent, adapter, {
+      status: "probe-failed", command: agent.command, version,
+      reason: `Required Codex capability probe failed: ${helpFailure}`, probedAt: at
+    }, fields, at);
+  }
+  if (helpFailure === undefined) {
+    const helpOutput = output(help.stdout, help.stderr);
+    fields = fromHelp(agent.adapterId, helpOutput);
+    if (adapter.id === "codex") {
+      const missing = missingCodexCapabilities(helpOutput);
+      if (missing.length > 0) {
+        return snapshot(agent, adapter, {
+          status: "unsupported-version", command: agent.command, version,
+          reason: `Codex CLI is missing required capabilities: ${missing.join(", ")}.`,
+          probedAt: at
+        }, fields, at);
+      }
+      if (compareVersions(version, CODEX_TESTED_THROUGH_VERSION) > 0) {
+        warnings.push(
+          `Installed Codex version ${version} is newer than the latest tested version `
+          + `${CODEX_TESTED_THROUGH_VERSION}; required capabilities were detected.`
+        );
+      }
+    }
   }
   return snapshot(agent, adapter, {
-    status: supported ? "installed" : "unsupported-version", command: agent.command, version,
-    ...(supported ? {} : { reason: `Supported version line starts at ${adapter.supportedVersion}.` }),
-    probedAt: at
+    status: "installed", command: agent.command, version, probedAt: at
   }, fields, at, warnings);
 }
 
@@ -429,9 +462,28 @@ function output(stdout: string, stderr: string): string {
   if (Buffer.byteLength(value, "utf8") > PROBE_MAX_BYTES) throw new Error("Agent probe output exceeded 1 MiB.");
   return value;
 }
-function supports(version: string, baseline: string): boolean {
-  const left = version.split(".").map(Number), right = baseline.split(".").map(Number);
+function supports(version: string, adapter: AgentAdapter): boolean {
+  if (adapter.id === "codex") return compareVersions(version, adapter.supportedVersion) >= 0;
+  const left = version.split(".").map(Number), right = adapter.supportedVersion.split(".").map(Number);
   return left[0] === right[0] && left[1] === right[1] && left[2] >= right[2];
+}
+
+function compareVersions(leftVersion: string, rightVersion: string): number {
+  const left = leftVersion.split(".").map(Number);
+  const right = rightVersion.split(".").map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    const difference = (left[index] ?? 0) - (right[index] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+
+function missingCodexCapabilities(help: string): string[] {
+  const required: readonly (readonly [RegExp, string])[] = [
+    [/(?:^|\s)--config(?:\s|[=<,]|$)/m, "--config"],
+    [/^\s*resume(?:\s|$)/m, "resume"]
+  ];
+  return required.flatMap(([pattern, label]) => pattern.test(help) ? [] : [label]);
 }
 
 function cloneConfig(config: RoleAgentConfig, paths: readonly string[] | undefined): RoleAgentConfig {

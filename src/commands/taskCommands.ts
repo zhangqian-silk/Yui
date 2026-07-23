@@ -11,6 +11,7 @@ import { createTaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
 import {
   createRoleSessionSet,
   roleAgentSessionResumeMode,
+  terminalizeTaskRoleRunSession,
   updateRoleAgentSessionStatus,
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
@@ -41,12 +42,13 @@ import {
   yieldAgentRun,
   type AgentRun
 } from "../run/agentRun.js";
+import { markYuiRunInput } from "../run/runIdentity.js";
 import { createTaskBrief, updateTaskBrief } from "../brief/taskBrief.js";
 import { createDecision, supersedeDecision } from "../decision/decision.js";
 import { createMilestone } from "../milestone/milestone.js";
 import {
-  completeWorkExecution,
-  enqueueWork
+  enqueueWork,
+  requireCompleteWorkExecution
 } from "../coordination/workMailboxQueue.js";
 import type { MailboxEntityRef, MailboxTarget } from "../coordination/workMailbox.js";
 import {
@@ -110,7 +112,6 @@ export type TaskWorkflowRuntimePort = Readonly<{
   notifyStateChanged(taskId: string): void;
   notifyMailboxChanged?(target: MailboxTarget): void;
   reconcileTask(taskId: string): void;
-  prepareTaskRoleEnter(input: Readonly<{ taskId: string; roleName: string }>): void;
   inspectTaskRolePanes?(taskId: string): readonly TmuxRolePaneState[];
 }>;
 
@@ -450,14 +451,21 @@ function completeTaskCommand(
         throw usageError(`Task ${task.id} Leader delivery is still pending.`);
       }
       tx.saveAgentRun(yieldAgentRun(leaderEntry.run, summary, now));
-      completeWorkExecution(tx, roleMailbox(task.id, LEADER_ROLE), runRef(leaderEntry.run.id));
+      requireCompleteWorkExecution(
+        tx,
+        roleMailbox(task.id, LEADER_ROLE),
+        runRef(leaderEntry.run.id)
+      );
       tx.clearActiveAgentRun(task.id, LEADER_ROLE);
       tx.saveRole(task.id, updateRoleStatus(leaderEntry.role, "idle", now));
       const sessions = tx.getTaskRoleSessionSet(task.id, LEADER_ROLE);
-      if (sessions?.inFlight === null
-        && sessions.sessions[leaderEntry.role.activeAgentId]?.status === "running") {
+      if (sessions !== null) {
         tx.saveTaskRoleSessionSet(
-          updateRoleAgentSessionStatus(sessions, leaderEntry.role.activeAgentId, "ready", now)
+          terminalizeTaskRoleRunSession(sessions, {
+            agentId: leaderEntry.role.activeAgentId,
+            runId: leaderEntry.run.id,
+            receiptId: `agent-run:${leaderEntry.run.id}`
+          }, now)
         );
       }
     }
@@ -524,12 +532,23 @@ function archiveTaskCommand(
     tx.clearOperatorNotification(task.id);
     for (const role of tx.listRoles(task.id)) {
       const activeRun = tx.getActiveAgentRun(task.id, role.name);
+      // Archival is the explicit aggregate teardown boundary. Unlike a normal
+      // Run terminal transition, it may cancel work before Controller claimed
+      // the pending delivery, so the Role mailbox is discarded as a whole.
+      tx.removeWorkMailbox(roleMailbox(task.id, role.name));
       if (activeRun === null) continue;
       const failed = failAgentRun(activeRun, "Task archived.", now);
       tx.saveAgentRun(failed);
-      completeWorkExecution(tx, roleMailbox(task.id, role.name), runRef(activeRun.id));
       tx.clearActiveAgentRun(task.id, role.name);
       tx.saveRole(task.id, updateRoleStatus(role, "idle", now));
+      const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
+      if (sessions !== null) {
+        tx.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(sessions, {
+          agentId: role.activeAgentId,
+          runId: activeRun.id,
+          receiptId: `agent-run:${activeRun.id}`
+        }, now));
+      }
       if (failed.workItemId !== undefined) {
         const item = tx.getWorkItem(task.id, failed.workItemId);
         if (item !== null && item.status === "running") {
@@ -770,7 +789,8 @@ function updateTaskRole(
         ?? createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId });
       const activeSession = tx.getTaskRoleSessionSet(task.id, role.name)?.sessions[agentId];
       if (agentId === role.activeAgentId && (
-        tx.getActiveAgentRun(task.id, role.name) !== null || activeSession?.status === "running"
+        tx.getActiveAgentRun(task.id, role.name) !== null
+        || (activeSession !== undefined && activeSession.status !== "stopped")
       )) {
         throw usageError("Active Agent settings cannot be changed while its Run or native process is running.");
       }
@@ -807,7 +827,7 @@ function removeTaskRole(
       throw usageError(`Task Role has an active Run and cannot be removed: ${task.id}/${role.name}.`);
     }
     const session = tx.getTaskRoleSessionSet(task.id, role.name)?.sessions[role.activeAgentId];
-    if (session?.status === "running") {
+    if (session !== undefined && session.status !== "stopped") {
       throw usageError(`Task Role has a running native Agent and cannot be removed: ${task.id}/${role.name}.`);
     }
     if (!tx.removeTaskRole(task.id, role.name)) throw roleNotFound(role.name);
@@ -847,7 +867,8 @@ function bindTaskRole(
       try {
         return switchActiveRoleAgent(bound, existing, agent.id, {
           activeRun: tx.getActiveAgentRun(task.id, role.name) !== null,
-          nativeProcessRunning: currentSession?.status === "running"
+          nativeProcessRunning: currentSession !== undefined
+            && currentSession.status !== "stopped"
         }, now);
       } catch (error) {
         throw usageError(messageOf(error));
@@ -871,7 +892,6 @@ function enterTaskRole(
     throw usageError(inactiveTaskMessage(task, "entering a role session"));
   }
   const role = requireRole(store, task.id, args[1]);
-  requireRuntime(options).prepareTaskRoleEnter({ taskId: task.id, roleName: role.name });
   return {
     kind: "enter",
     taskId: task.id,
@@ -1006,10 +1026,14 @@ function dispatchWork(
       throw usageError(`${task.id}/${role.name} already has an active run.`);
     }
     const rawInput = trimmed(parsed.options.get("--input")) ?? item.title;
-    const input = compileDispatchInput({}, task.id, role, rawInput);
+    const runId = tx.nextAgentRunId(task.id);
+    const input = markYuiRunInput(
+      compileDispatchInput({}, task.id, role, rawInput),
+      runId
+    );
     const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
     const created = createAgentRun(
-      tx.nextAgentRunId(task.id),
+      runId,
       task.id,
       role.name,
       roleAgentSessionResumeMode(sessions, role.activeAgentId),
@@ -1083,12 +1107,13 @@ function retryRun(
       throw usageError(`${task.id}/${role.name} already has an active run.`);
     }
     const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
+    const runId = tx.nextAgentRunId(task.id);
     const created = createAgentRun(
-      tx.nextAgentRunId(task.id),
+      runId,
       task.id,
       role.name,
       roleAgentSessionResumeMode(sessions, role.activeAgentId),
-      previous.input,
+      markYuiRunInput(previous.input, runId),
       now,
       { workItemId: previous.workItemId }
     );
@@ -1141,7 +1166,11 @@ function yieldRun(
       { runId: terminal.id, workItemId: active.workItemId }
     );
     tx.saveAgentRun(terminal);
-    completeWorkExecution(tx, roleMailbox(task.id, role.name), runRef(terminal.id));
+    requireCompleteWorkExecution(
+      tx,
+      roleMailbox(task.id, role.name),
+      runRef(terminal.id)
+    );
     tx.clearActiveAgentRun(task.id, role.name);
     if (active.workItemId !== undefined) {
       const item = tx.getWorkItem(task.id, active.workItemId);
@@ -1152,9 +1181,12 @@ function yieldRun(
     }
     tx.saveRole(task.id, updateRoleStatus(role, "idle", now));
     const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
-    if (sessions?.inFlight === null
-      && sessions.sessions[role.activeAgentId]?.status === "running") {
-      tx.saveTaskRoleSessionSet(updateRoleAgentSessionStatus(sessions, role.activeAgentId, "ready", now));
+    if (sessions !== null) {
+      tx.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(sessions, {
+        agentId: role.activeAgentId,
+        runId: active.id,
+        receiptId: `agent-run:${active.id}`
+      }, now));
     }
     if (role.name !== LEADER_ROLE) {
       enqueueWork(tx, leaderMailbox(task.id), "role-result", now, [

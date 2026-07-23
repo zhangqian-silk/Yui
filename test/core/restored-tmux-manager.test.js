@@ -127,15 +127,15 @@ test("restored tmux attach uses client-local native terminal scrollback", () => 
 
 test("sendRoleInputOnce probes readiness and applies a pane receipt in one tmux command", () => {
   const calls = [];
-  let deliveries = 0;
+  let deliveryAttempts = 0;
   const manager = new TmuxManager("tmux-test", {
     run(command, args) {
       calls.push({ command, args });
       if (tmuxCommand(args) === "display-message") return "0|321|codex\n";
       if (tmuxCommand(args) === "capture-pane") return "native composer ready\n";
-      if (tmuxCommand(args) === "if-shell") {
-        deliveries += 1;
-        const branch = deliveries === 1 ? args.at(-1) : args.at(-2);
+      if (tmuxCommand(args) === "set-buffer") {
+        deliveryAttempts += 1;
+        const branch = deliveryAttempts === 1 ? args.at(-1) : args.at(-2);
         return `${branch.match(/__YUI_DELIVERY_(?:SENT|PRESENT)_[a-f0-9]+__/)[0]}\n`;
       }
       return "";
@@ -158,14 +158,110 @@ test("sendRoleInputOnce probes readiness and applies a pane receipt in one tmux 
   );
 
   assert.equal(calls.filter((call) => tmuxCommand(call.args) === "display-message").length, 2);
-  const sends = calls.filter((call) => tmuxCommand(call.args) === "if-shell");
-  assert.equal(sends.length, 2);
-  for (const send of sends) {
-    assert.match(send.args.join(" "), /@yui_delivery_[a-f0-9]{64}/);
-    assert.match(send.args.at(-1), /set-option.*send-keys -l.*send-keys.*Enter/s);
-    assert.match(send.args.at(-1), /send-keys -l.*run-shell 'sleep 0\.05'.*send-keys.*Enter/s);
+  const deliveryBatches = calls.filter((call) => tmuxCommand(call.args) === "set-buffer");
+  assert.equal(deliveryBatches.length, 2);
+  assert.equal(
+    deliveryBatches[0].args[deliveryBatches[0].args.indexOf("--") + 1],
+    "hello\nworld"
+  );
+  for (const delivery of deliveryBatches) {
+    assert.match(delivery.args.join(" "), /@yui_delivery_[a-f0-9]{64}/);
+    assert.match(delivery.args.at(-2), /delete-buffer.*__YUI_DELIVERY_PRESENT_/s);
+    assert.match(delivery.args.at(-1), /paste-buffer -dpr.*send-keys.*Enter.*set-option/s);
+    assert.doesNotMatch(delivery.args.at(-1), /run-shell|sleep|send-keys -l/s);
     assert.equal(calls.filter((call) => tmuxCommand(call.args) === "send-keys").length, 0);
   }
+});
+
+test("buffer delivery keeps shell-like input literal and receipt application atomic", () => {
+  const calls = [];
+  const input = String.raw`-- -w ; $HOME $(touch /tmp/nope) "quotes" \slashes` + "\nnext";
+  const manager = new TmuxManager("tmux-test", {
+    run(command, args) {
+      calls.push({ command, args });
+      if (tmuxCommand(args) === "display-message") return "0|321|codex\n";
+      if (tmuxCommand(args) === "capture-pane") return "composer ready\n";
+      if (tmuxCommand(args) === "set-buffer") {
+        return `${args.at(-1).match(/__YUI_DELIVERY_SENT_[a-f0-9]+__/)[0]}\n`;
+      }
+      return "";
+    }
+  }, { yuiHome: "/tmp/yui-home" });
+
+  assert.equal(manager.sendRoleInputOnce(
+    "task-1",
+    "leader",
+    "receipt ; $HOME",
+    input,
+    () => true
+  ), "sent");
+
+  const setBuffer = calls.find((call) => tmuxCommand(call.args) === "set-buffer");
+  assert.equal(setBuffer.args[setBuffer.args.indexOf("--") + 1], input);
+  assert.doesNotMatch(setBuffer.args.at(-1), /\$HOME|touch|quotes|slashes|next/u);
+  assert.match(setBuffer.args.at(-1), /paste-buffer -dpr.*send-keys.*Enter.*set-option/s);
+});
+
+test("async tmux delivery uses only the non-blocking executor path", async () => {
+  const calls = [];
+  const input = String.raw`literal ; $HOME "quotes"` + "\nnext";
+  const manager = new TmuxManager("tmux-test", {
+    run() {
+      throw new Error("sync executor path must not be used");
+    },
+    async runAsync(command, args) {
+      calls.push({ command, args });
+      if (tmuxCommand(args) === "display-message") return "0|321|codex\n";
+      if (tmuxCommand(args) === "capture-pane") return "composer ready\n";
+      if (tmuxCommand(args) === "set-buffer") {
+        return `${args.at(-1).match(/__YUI_DELIVERY_SENT_[a-f0-9]+__/)[0]}\n`;
+      }
+      return "";
+    }
+  }, { yuiHome: "/tmp/yui-home" });
+
+  assert.equal(await manager.sendRoleInputOnceIfReadyAsync(
+    "task-1",
+    "leader",
+    "receipt-async",
+    input,
+    () => true
+  ), "sent");
+
+  assert.equal(calls.filter((call) => tmuxCommand(call.args) === "show-options").length, 2);
+  const setBuffer = calls.find((call) => tmuxCommand(call.args) === "set-buffer");
+  assert.equal(setBuffer.args[setBuffer.args.indexOf("--") + 1], input);
+  assert.match(setBuffer.args.at(-1), /paste-buffer -dpr/u);
+  assert.doesNotMatch(setBuffer.args.at(-1), /run-shell|sleep|\$HOME|quotes|next/u);
+});
+
+test("failed async delivery removes its staged tmux buffer", async () => {
+  const calls = [];
+  const manager = new TmuxManager("tmux-test", {
+    run() {
+      throw new Error("sync executor path must not be used");
+    },
+    async runAsync(command, args) {
+      calls.push({ command, args });
+      const operation = tmuxCommand(args);
+      if (operation === "display-message") return "0|321|codex\n";
+      if (operation === "capture-pane") return "composer ready\n";
+      if (operation === "set-buffer") throw new Error("pane disappeared");
+      return "";
+    }
+  }, { yuiHome: "/tmp/yui-home" });
+
+  await assert.rejects(
+    manager.sendRoleInputOnceIfReadyAsync(
+      "task-1", "leader", "receipt-failed", "input", () => true
+    ),
+    /pane disappeared/u
+  );
+  assert.deepEqual(
+    calls.slice(-2).map((call) => tmuxCommand(call.args)),
+    ["set-buffer", "delete-buffer"]
+  );
+  assert.equal(calls.at(-2).args[4], calls.at(-1).args.at(-1));
 });
 
 test("sendRoleInputOnce times out without injecting input when the pane is not ready", () => {
@@ -197,7 +293,7 @@ test("sendRoleInputOnce times out without injecting input when the pane is not r
     TmuxReadinessTimeoutError
   );
   assert.ok(calls.filter((call) => tmuxCommand(call.args) === "display-message").length >= 2);
-  assert.equal(calls.some((call) => tmuxCommand(call.args) === "if-shell"), false);
+  assert.equal(calls.some((call) => tmuxCommand(call.args) === "set-buffer"), false);
   assert.equal(calls.some((call) => tmuxCommand(call.args) === "send-keys"), false);
 });
 
@@ -222,7 +318,7 @@ test("best-effort delivery returns immediately when the Operator composer is bus
   assert.deepEqual(calls.map((call) => tmuxCommand(call.args)), [
     "show-options", "display-message", "capture-pane"
   ]);
-  assert.equal(calls.some((call) => tmuxCommand(call.args) === "if-shell"), false);
+  assert.equal(calls.some((call) => tmuxCommand(call.args) === "set-buffer"), false);
 });
 
 test("best-effort delivery sends after one readiness snapshot without entering a wait loop", () => {
@@ -234,7 +330,7 @@ test("best-effort delivery sends after one readiness snapshot without entering a
       calls.push({ command, args });
       if (tmuxCommand(args) === "display-message") return "0|321|codex\n";
       if (tmuxCommand(args) === "capture-pane") return "composer ready\n";
-      if (tmuxCommand(args) === "if-shell") {
+      if (tmuxCommand(args) === "set-buffer") {
         return `${args.at(-1).match(/__YUI_DELIVERY_SENT_[a-f0-9]+__/)[0]}\n`;
       }
       return "";
@@ -260,7 +356,7 @@ test("best-effort delivery sends after one readiness snapshot without entering a
   assert.equal(readinessProbes, 1);
   assert.equal(calls.filter((call) => tmuxCommand(call.args) === "display-message").length, 1);
   assert.equal(calls.filter((call) => tmuxCommand(call.args) === "capture-pane").length, 1);
-  assert.equal(calls.filter((call) => tmuxCommand(call.args) === "if-shell").length, 1);
+  assert.equal(calls.filter((call) => tmuxCommand(call.args) === "set-buffer").length, 1);
 });
 
 test("an existing pane receipt bypasses readiness while the Agent is busy", () => {
@@ -303,7 +399,7 @@ test("one manager accepts distinct Codex and Claude readiness probes per deliver
           ? "Codex composer ready\n"
           : "Claude prompt ready\n";
       }
-      if (tmuxCommand(args) === "if-shell") {
+      if (tmuxCommand(args) === "set-buffer") {
         return `${args.at(-1).match(/__YUI_DELIVERY_SENT_[a-f0-9]+__/)[0]}\n`;
       }
       return "";
@@ -318,7 +414,7 @@ test("one manager accepts distinct Codex and Claude readiness probes per deliver
     "task-1", "worker", "claude-job", "work",
     ({ currentCommand, content }) => currentCommand === "claude" && content.includes("Claude prompt")
   ), "sent");
-  assert.equal(calls.filter((call) => tmuxCommand(call.args) === "if-shell").length, 2);
+  assert.equal(calls.filter((call) => tmuxCommand(call.args) === "set-buffer").length, 2);
 });
 
 test("automated delivery refuses a live pane without an Agent-specific readiness probe", () => {

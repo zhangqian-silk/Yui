@@ -92,6 +92,7 @@ export async function processActiveRoleRunDeliveries(
           adapterId: role.adapterId,
           workspace: role.workspace,
           mode: run.mode,
+          runId: run.id,
           ...(nativeSessionId === undefined ? {} : { nativeSessionId })
         });
         const existingReceipt = await delivery.findExistingReceipt?.({

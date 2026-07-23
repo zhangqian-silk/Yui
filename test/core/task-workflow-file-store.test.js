@@ -9,11 +9,21 @@ import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { runOperatorCommand } from "../../dist/commands/operatorCommands.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import {
+  bindExecution,
+  claimPending,
+  createWorkMailbox,
+  enqueueSignal
+} from "../../dist/coordination/workMailbox.js";
+import {
   createGlobalRole,
   createRoleAgentBinding,
   updateRoleStatus
 } from "../../dist/role/role.js";
-import { createAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun, failAgentRun } from "../../dist/run/agentRun.js";
+import {
+  markYuiRunInput,
+  yuiRunIdFromInputMessages
+} from "../../dist/run/runIdentity.js";
 import { createRepository } from "../../dist/repository/repository.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
@@ -62,7 +72,31 @@ function createTask(store, options, title = "Plan first") {
 }
 
 function markDelivered(store, run) {
-  store.saveAgentRun({ ...run, deliveredAt: NOW.toISOString() });
+  store.transaction((tx) => {
+    const target = { kind: "role", taskId: run.taskId, roleName: run.roleName };
+    let mailbox = tx.getWorkMailbox(target) ?? createWorkMailbox(target);
+    if (mailbox.processing === null) {
+      if (mailbox.pending === null) {
+        mailbox = enqueueSignal(mailbox, {
+          reason: "fixture-run-dispatched",
+          refs: [{ type: "run", id: run.id }],
+          occurredAt: NOW.toISOString()
+        });
+      }
+      const batchId = `agent-run:${run.id}`;
+      mailbox = bindExecution(
+        claimPending(mailbox, {
+          batchId,
+          owner: "controller",
+          startedAt: NOW.toISOString()
+        }),
+        batchId,
+        { type: "run", id: run.id }
+      );
+      tx.saveWorkMailbox(mailbox);
+    }
+    tx.saveAgentRun({ ...run, deliveredAt: NOW.toISOString() });
+  });
 }
 
 test("Draft activation atomically creates one durable first Leader wake", (t) => {
@@ -288,6 +322,29 @@ test("one Role has one active Run and Worker yield completes the workflow atomic
   assert.ok(leaderMailbox.pending.refs.some((ref) => ref.type === "run" && ref.id === active.id));
 });
 
+test("retry replaces the old causal Run marker instead of reusing it", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Retry marker");
+  run(["activate", task.id], store, options);
+  const failed = failAgentRun(createAgentRun(
+    "agent-run-old",
+    task.id,
+    "leader",
+    "new",
+    markYuiRunInput("recover", "agent-run-old"),
+    NOW
+  ), "failed before delivery", NOW);
+  store.saveAgentRun(failed);
+
+  run(["run", "retry", failed.id], store, options);
+
+  const retried = store.getActiveAgentRun(task.id, "leader");
+  const markers = retried.input.match(/^Yui-Run-Id: .+$/gm);
+  assert.deepEqual(markers, [`Yui-Run-Id: ${retried.id}`]);
+  assert.equal(retried.input.includes("Yui-Run-Id: agent-run-old"), false);
+  assert.equal(yuiRunIdFromInputMessages([retried.input]), retried.id);
+});
+
 test("Leader yield does not self-wake and preserves a wake queued while busy", (t) => {
   const { store, options } = fixture(t);
   const task = createTask(store, options, "Leader work");
@@ -296,9 +353,10 @@ test("Leader yield does not self-wake and preserves a wake queued while busy", (
   const item = store.listWorkItems(task.id)[0];
   run(["work", "dispatch", item.id], store, options);
   const runRecord = store.getActiveAgentRun(task.id, "leader");
-  const pending = store.getPendingWakeup(task.id);
 
   markDelivered(store, runRecord);
+  run(["message", "send", task.id, "arrived while Leader was busy"], store, options);
+  const pending = store.getPendingWakeup(task.id);
   run(["run", "yield", runRecord.id, "--summary", "coordinated"], store, options);
   assert.deepEqual(store.getPendingWakeup(task.id), pending);
   assert.equal(store.findWorkItem(item.id)?.status, "completed");
@@ -308,7 +366,6 @@ test("Leader control Run without a WorkItem can yield and release the pending wa
   const { store, options } = fixture(t);
   const task = createTask(store, options, "Leader wake");
   run(["activate", task.id], store, options);
-  const pending = store.getPendingWakeup(task.id);
   const leader = store.getRole(task.id, "leader");
   const controlRun = createAgentRun(
     store.nextAgentRunId(task.id),
@@ -323,12 +380,13 @@ test("Leader control Run without a WorkItem can yield and release the pending wa
     tx.saveActiveAgentRun(controlRun);
     tx.saveRole(task.id, updateRoleStatus(leader, "running", NOW));
   });
+  markDelivered(store, controlRun);
 
   run(["run", "yield", controlRun.id, "--summary", "reviewed"], store, options);
   assert.equal(store.findAgentRun(controlRun.id)?.status, "yielded");
   assert.equal(store.getActiveAgentRun(task.id, "leader"), null);
   assert.equal(store.getRole(task.id, "leader")?.status, "idle");
-  assert.deepEqual(store.getPendingWakeup(task.id), pending);
+  assert.equal(store.getPendingWakeup(task.id), null);
   assert.equal(store.listMessages(task.id).at(-1).body, "reviewed");
 });
 
@@ -351,6 +409,7 @@ test("a rejected Worker control yield rolls back all staged FileTaskStore writes
     tx.saveActiveAgentRun(invalidRun);
     tx.saveRole(task.id, updateRoleStatus(worker, "running", NOW));
   });
+  markDelivered(store, invalidRun);
   const beforeMessages = store.listMessages(task.id);
 
   assert.throws(
@@ -386,7 +445,7 @@ test("Role bind switches the active Agent while enter remains a foreground CLI a
     roleName: "leader",
     output: `Prepared role leader for ${task.id}\n`
   });
-  assert.deepEqual(calls.enter, [{ taskId: task.id, roleName: "leader" }]);
+  assert.deepEqual(calls.enter, []);
 });
 
 test("Task Role add, update, show, and remove preserve lean field-level configuration", (t) => {
@@ -538,6 +597,7 @@ test("a Leader control Run can complete its Task atomically", (t) => {
     tx.saveActiveAgentRun(controlRun);
     tx.saveRole(task.id, updateRoleStatus(leader, "running", NOW));
   });
+  markDelivered(store, controlRun);
 
   run(
     ["complete", task.id, "--summary", "Final review passed."],

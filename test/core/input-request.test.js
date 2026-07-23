@@ -6,6 +6,12 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
+import {
+  bindExecution,
+  claimPending,
+  createWorkMailbox,
+  enqueueSignal
+} from "../../dist/coordination/workMailbox.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { runControllerSchedulerPass } from "../../dist/controller/controller.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
@@ -226,6 +232,24 @@ function fixture(t) {
     tx.saveActiveAgentRun(active);
     tx.saveRole(task.id, updateRoleStatus(role, "running", FIRST));
     tx.saveTaskRoleSessionSet(sessions);
+    const target = { kind: "role", taskId: task.id, roleName: role.name };
+    const queued = enqueueSignal(
+      tx.getWorkMailbox(target) ?? createWorkMailbox(target),
+      {
+        reason: "fixture-run-dispatched",
+        refs: [{ type: "run", id: active.id }],
+        occurredAt: FIRST.toISOString()
+      }
+    );
+    tx.saveWorkMailbox(bindExecution(
+      claimPending(queued, {
+        batchId: `agent-run:${active.id}`,
+        owner: "controller",
+        startedAt: FIRST.toISOString()
+      }),
+      `agent-run:${active.id}`,
+      { type: "run", id: active.id }
+    ));
   });
   const environment = {
     YUI_SESSION_SCOPE: "task",
@@ -272,6 +296,7 @@ test("Leader request releases its active fence and answer durably queues a resum
   assert.match(store.getAgentRun(task.id, active.id).summary, new RegExp(request.id));
   assert.equal(store.getRole(task.id, "leader").status, "idle");
   assert.equal(store.getRoleSession(task.id, "leader").status, "ready");
+  assert.equal(store.getTaskRoleSessionSet(task.id, "leader").inFlight, null);
   assert.equal(store.listEvents(task.id).at(-1).type, "input.requested");
   const operatorMailbox = store.getWorkMailbox({ kind: "operator" });
   assert.deepEqual(operatorMailbox.pending.reasons, ["input-requested"]);
@@ -467,7 +492,7 @@ test("Controller atomically applies an expired Agent recommendation and resumes 
   assert.deepEqual(beforeTimeout.autoResolvedInputs, []);
   assert.equal(store.getInputRequest(task.id, request.id).status, "open");
   assert.match(notices[0], /Agent recommendation: safe: Safe rollout/);
-  assert.match(notices[0], new RegExp(`Automatic fallback after: ${SECOND.toISOString()}`));
+  assert.match(notices[0], /Automatic fallback after: 2026-07-21 09:01:00 \+08:00/);
 
   const result = await runControllerSchedulerPass(
     new FileSchedulerStoreAdapter(store),
@@ -496,6 +521,46 @@ test("Controller atomically applies an expired Agent recommendation and resumes 
   assert.equal(store.listEvents(task.id).at(-1).type, "input.auto-answered");
 });
 
+test("targeted recommendation reconciliation does not mutate another Task", (t) => {
+  const { store, task, options } = fixture(t);
+  run([
+    "input", "request", task.id,
+    "--question", "First rollout?",
+    "--choice", "safe=Safe rollout",
+    "--recommend", "safe",
+    "--timeout-seconds", "60"
+  ], store, options);
+  const selectedRequest = store.listInputRequests(task.id)[0];
+
+  runTaskCommand(["create", "Other recommendation"], store, options);
+  const otherTask = store.listTasks().find((entry) => entry.id !== task.id);
+  runTaskCommand(["activate", otherTask.id], store, options);
+  const otherRequest = createInputRequest(
+    store.nextInputRequestId(otherTask.id),
+    otherTask.id,
+    requester({ runId: "agent-run-other", nativeSessionId: "native-other" }),
+    {
+      question: "Other rollout?",
+      choices: [{ key: "safe", label: "Safe rollout" }],
+      blockedRefs: [],
+      policy: {
+        kind: "recommended",
+        recommendedChoiceKey: "safe",
+        timeoutAt: SECOND.toISOString()
+      }
+    },
+    FIRST
+  );
+  store.saveInputRequest(otherTask.id, otherRequest);
+
+  const resolved = new FileSchedulerStoreAdapter(store)
+    .resolveExpiredInputRecommendations(SECOND, new Set([task.id]));
+
+  assert.deepEqual(resolved.map((entry) => entry.taskId), [task.id]);
+  assert.equal(store.getInputRequest(task.id, selectedRequest.id).status, "answered");
+  assert.equal(store.getInputRequest(otherTask.id, otherRequest.id).status, "open");
+});
+
 test("request provenance, blocked ownership, lifecycle, and origin-only cancel are fenced", (t) => {
   const { store, task, active, options } = fixture(t);
   const other = runTaskCommand(["create", "Other"], store, options);
@@ -516,7 +581,7 @@ test("request provenance, blocked ownership, lifecycle, and origin-only cancel a
     "input", "request", task.id, "--question", "Forged"
   ], store, {
     ...options,
-    environment: { ...options.environment, YUI_RUN_ID: "agent-run-forged" }
+    environment: { ...options.environment, YUI_AGENT_ID: "agent-forged" }
   }), /active Leader Run/i);
   assert.throws(() => runTaskCommand([
     "input", "request", task.id,

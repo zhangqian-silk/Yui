@@ -4,6 +4,7 @@ import test from "node:test";
 import { processLeaderWakeups } from "../../dist/scheduler/leaderWakeupProcessor.js";
 import { reconcileExitedRoleRuns } from "../../dist/scheduler/roleRunLiveness.js";
 import { processOperatorInputNotifications } from "../../dist/scheduler/operatorInputNotificationProcessor.js";
+import { repairOrphanedActiveTasks } from "../../dist/scheduler/activeTaskProgress.js";
 import { mergePendingWakeup } from "../../dist/scheduler/pendingWakeup.js";
 import { queueLeaderWakeupAfterYield } from "../../dist/scheduler/wakeupQueue.js";
 import {
@@ -35,6 +36,42 @@ test("pending wakeups merge durably without losing request history", () => {
   assert.equal(third.requestCount, 3);
   assert.equal(third.firstRequestedAt, first.firstRequestedAt);
   assert.equal(third.lastRequestedAt, "2026-07-19T12:02:00.000Z");
+});
+
+test("periodic recovery gives an orphan active Task one durable Leader wake", () => {
+  const store = fakeStore();
+  store.pending.clear();
+  store.getWorkMailbox = () => null;
+
+  assert.deepEqual(repairOrphanedActiveTasks(store, NOW), ["task-1"]);
+  assert.deepEqual(store.pending.get("task-1").reasons, ["task-orphaned"]);
+  assert.deepEqual(repairOrphanedActiveTasks(store, NOW), []);
+});
+
+test("periodic recovery does not wake a Task already owned by an active Worker", () => {
+  const store = fakeStore();
+  store.pending.clear();
+  store.getWorkMailbox = () => null;
+  store.roles.push(role("worker"));
+  store.activeRuns.set(key("task-1", "worker"), activeRun("run-worker", "worker"));
+
+  assert.deepEqual(repairOrphanedActiveTasks(store, NOW), []);
+  assert.equal(store.pending.has("task-1"), false);
+});
+
+test("a Task mailbox trigger does not count as an owner of an active Task", () => {
+  const store = fakeStore();
+  store.pending.clear();
+  store.getWorkMailbox = (target) => target.kind === "task"
+    ? {
+        target,
+        pending: { reasons: ["task-updated"] },
+        processing: null
+      }
+    : null;
+
+  assert.deepEqual(repairOrphanedActiveTasks(store, NOW), ["task-1"]);
+  assert.deepEqual(store.pending.get("task-1").reasons, ["task-orphaned"]);
 });
 
 test("a busy Leader retains its pending wakeup and receives no terminal delivery", async () => {
@@ -84,7 +121,7 @@ test("an idle Leader starts a real wakeup run, waits for readiness, sends once, 
 
   const result = await processLeaderWakeups(store, delivery, NOW);
 
-  assert.deepEqual(result, [{ taskId: "task-1", status: "dispatched" }]);
+  assert.deepEqual(result, [{ taskId: "task-1", runId: "run-1", status: "dispatched" }]);
   assert.deepEqual(delivery.calls.map((call) => call.type), ["prepare", "ready", "sendOnce"]);
   assert.equal(delivery.calls[0].input.mode, "new");
   assert.equal(delivery.calls[2].input.receiptId.startsWith("agent-run:"), true);
@@ -99,7 +136,10 @@ test("an idle Leader starts a real wakeup run, waits for readiness, sends once, 
   assert.match(store.savedDispatches[0].run.input, /yui task complete task-1 --summary/);
   assert.doesNotMatch(store.savedDispatches[0].run.input, /yui task message list/);
   assert.equal(store.pending.has("task-1"), false);
-  assert.deepEqual(store.operations.slice(-2), ["save-dispatch", "save-delivery"]);
+  assert.deepEqual(
+    store.operations.slice(-3),
+    ["save-dispatch", "save-prepared", "save-delivery"]
+  );
 });
 
 test("a Leader send or post-send persistence uncertainty preserves the claimed Run and receipt", async () => {
@@ -191,7 +231,7 @@ test("Leader resume refuses a replacement native session", async () => {
 
   assert.equal(result[0].status, "failed");
   assert.match(result[0].error, /fixed native session id/);
-  assert.equal(store.savedDispatches.length, 0);
+  assert.equal(store.savedDispatches.length, 1);
   assert.equal(store.pending.has("task-1"), true);
 });
 
@@ -207,6 +247,23 @@ test("Leader dispatch failure remains pending and records durable Operator recov
   assert.equal(store.savedFailures.length, 1);
   assert.match(store.savedFailures[0].failure.message, /tmux launch failed/);
   assert.equal(store.savedFailures[0].notification.type, "leader-recovery-failed");
+});
+
+test("a stale Leader preparation failure is ignored after authoritative state changes", async () => {
+  const store = fakeStore();
+  store.saveLeaderDispatchFailure = (input) => {
+    store.activeRuns.delete(key(input.task.id, input.role.name));
+    store.pending.set(input.task.id, input.claimed.wakeup);
+    return "state-changed";
+  };
+  const delivery = fakeDelivery({ prepareError: new Error("stale tmux launch failure") });
+
+  const [result] = await processLeaderWakeups(store, delivery, NOW);
+
+  assert.equal(result.status, "skipped");
+  assert.equal(result.reason, "state-changed");
+  assert.equal(store.pending.has("task-1"), true);
+  assert.equal(store.savedFailures.length, 0);
 });
 
 test("a missing Worker tmux fails its run and queues a Leader wakeup", async () => {
@@ -238,6 +295,111 @@ test("a liveness probe error makes no state change", async () => {
   await assert.rejects(reconcileExitedRoleRuns(store, delivery, NOW), /tmux unavailable/);
   assert.equal(store.savedExitedRuns.length, 0);
   assert.deepEqual(store.pending.get("task-1").reasons, ["role-result"]);
+});
+
+test("an observed Turn completion fences destructive liveness reconciliation", async () => {
+  const store = fakeStore();
+  store.roles.push(role("worker"));
+  const run = activeRun("run-worker", "worker");
+  store.activeRuns.set(key("task-1", "worker"), run);
+  store.listPendingRuntimeTurnCompletions = () => [{
+    taskId: "task-1",
+    roleName: "worker",
+    runId: run.id
+  }];
+  const delivery = fakeDelivery({ inspect: "absent" });
+
+  assert.deepEqual(await reconcileExitedRoleRuns(store, delivery, NOW), []);
+  assert.equal(store.savedExitedRuns.length, 0);
+});
+
+test("a delivery-uncertain Run is not failed by liveness in the same pass", async () => {
+  const store = fakeStore();
+  store.roles.push(role("worker"));
+  const run = activeRun("run-worker", "worker");
+  store.activeRuns.set(key("task-1", "worker"), run);
+  const delivery = fakeDelivery({ inspect: "absent" });
+
+  assert.deepEqual(
+    await reconcileExitedRoleRuns(store, delivery, NOW, undefined, new Set([run.id])),
+    []
+  );
+  assert.equal(store.savedExitedRuns.length, 0);
+});
+
+test("a full reconciliation recovers a delivered Run whose composer is ready", async () => {
+  const store = fakeStore();
+  store.roles.push(role("worker"));
+  const run = {
+    ...activeRun("run-worker", "worker"),
+    deliveredAt: new Date(NOW.getTime() - 120_000).toISOString()
+  };
+  store.activeRuns.set(key("task-1", "worker"), run);
+  const recovered = [];
+  store.recoverReadyRoleRun = (input) => recovered.push(input);
+  const delivery = {
+    ...fakeDelivery({ inspect: "present" }),
+    async inspectRoleReadiness() { return "ready"; }
+  };
+
+  assert.deepEqual(await reconcileExitedRoleRuns(store, delivery, NOW), []);
+  assert.deepEqual(recovered.map(({ runId }) => runId), [run.id]);
+});
+
+test("a dirty pass never uses composer readiness as a synthetic Turn boundary", async () => {
+  const store = fakeStore();
+  store.roles.push(role("worker"));
+  const run = {
+    ...activeRun("run-worker", "worker"),
+    deliveredAt: new Date(NOW.getTime() - 120_000).toISOString()
+  };
+  store.activeRuns.set(key("task-1", "worker"), run);
+  const recovered = [];
+  store.recoverReadyRoleRun = (input) => recovered.push(input);
+  const delivery = {
+    ...fakeDelivery({ inspect: "present" }),
+    async inspectRoleReadiness() { return "ready"; }
+  };
+  const selection = {
+    full: false,
+    taskIds: new Set(["task-1"]),
+    allRoleTaskIds: new Set(["task-1"]),
+    rolesByTask: new Map(),
+    operator: false
+  };
+
+  assert.deepEqual(await reconcileExitedRoleRuns(store, delivery, NOW, selection), []);
+  assert.deepEqual(recovered, []);
+});
+
+test("a full pass does not mistake a freshly delivered composer for a missing Hook", async () => {
+  const store = fakeStore();
+  store.roles.push(role("worker"));
+  const run = { ...activeRun("run-worker", "worker"), deliveredAt: NOW.toISOString() };
+  store.activeRuns.set(key("task-1", "worker"), run);
+  const recovered = [];
+  store.recoverReadyRoleRun = (input) => recovered.push(input);
+  const delivery = {
+    ...fakeDelivery({ inspect: "present" }),
+    async inspectRoleReadiness() { return "ready"; }
+  };
+
+  assert.deepEqual(await reconcileExitedRoleRuns(store, delivery, NOW), []);
+  assert.deepEqual(recovered, []);
+});
+
+test("an incomplete batch liveness snapshot is non-destructive", async () => {
+  const store = fakeStore();
+  store.roles.push(role("worker"));
+  store.activeRuns.set(key("task-1", "worker"), activeRun("run-worker", "worker"));
+  const delivery = fakeDelivery();
+  delivery.inspectRoles = async () => [];
+
+  await assert.rejects(
+    reconcileExitedRoleRuns(store, delivery, NOW),
+    /incomplete|invalid/i
+  );
+  assert.equal(store.savedExitedRuns.length, 0);
 });
 
 test("liveness reconciliation uses one batch inventory for all active Roles", async () => {
@@ -364,6 +526,7 @@ function operatorStore(requests) {
   const byId = new Map(requests.map((request) => [request.id, request]));
   const store = {
     get mailbox() { return mailbox; },
+    getPresentationContext: () => ({ timeZone: "Asia/Shanghai" }),
     getWorkMailbox: () => mailbox,
     getInputRequest: (id) => byId.get(id) ?? null,
     getOperatorDeliveryTarget: () => ({ roleName: "operator", adapterId: "codex" }),
@@ -410,6 +573,7 @@ function fakeStore(options = {}) {
     savedFailures: [],
     savedExitedRuns: [],
     operations: [],
+    getPresentationContext: () => ({ timeZone: "Asia/Shanghai" }),
     listTasks: () => store.tasks,
     getTask: (taskId) => store.tasks.find((candidate) => candidate.id === taskId) ?? null,
     listRoles: (taskId) => store.roles.filter((candidate) => candidate.taskId === taskId),
@@ -418,7 +582,11 @@ function fakeStore(options = {}) {
     ) ?? null,
     getActiveAgentRun: (taskId, roleName) => store.activeRuns.get(key(taskId, roleName)) ?? null,
     hasOpenInputRequest: (taskId) => store.openInputTasks.has(taskId),
+    hasInFlightTurn: () => false,
+    listPendingRuntimeTurnCompletions: () => [],
     getRoleSession: (taskId, roleName) => store.sessions.get(key(taskId, roleName)) ?? null,
+    getWorkMailbox: () => null,
+    releaseWorkMailbox: () => false,
     nextAgentRunId: () => `run-${store.savedDispatches.length + 1}`,
     getPendingWakeup: (taskId) => store.pending.get(taskId) ?? null,
     listPendingWakeups: () => [...store.pending.values()],
@@ -440,6 +608,10 @@ function fakeStore(options = {}) {
       store.pending.delete(input.task.id);
       return "claimed";
     },
+    saveRoleRunPrepared: (input) => {
+      store.operations.push("save-prepared");
+      store.sessions.set(key(input.task.id, input.role.name), input.session);
+    },
     saveRoleRunDelivery: (input) => {
       store.operations.push("save-delivery");
       store.activeRuns.set(key(input.task.id, input.role.name), {
@@ -447,7 +619,12 @@ function fakeStore(options = {}) {
         deliveredAt: input.now.toISOString()
       });
     },
-    saveLeaderDispatchFailure: (input) => store.savedFailures.push(input),
+    saveLeaderDispatchFailure: (input) => {
+      store.savedFailures.push(input);
+      store.activeRuns.delete(key(input.task.id, input.role.name));
+      store.pending.set(input.task.id, input.claimed.wakeup);
+      return "failed";
+    },
     saveExitedRoleRun: (input) => {
       store.savedExitedRuns.push(input);
       store.activeRuns.delete(key(input.task.id, input.role.name));

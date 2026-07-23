@@ -3,7 +3,8 @@ import test from "node:test";
 
 import {
   completeWorkExecution,
-  enqueueWork
+  enqueueWork,
+  requireCompleteWorkExecution
 } from "../../dist/coordination/workMailboxQueue.js";
 import {
   bindExecution,
@@ -55,4 +56,52 @@ test("completeWorkExecution only completes the processing batch bound to the exe
   assert.notEqual(store.getWorkMailbox(target).processing, null);
   assert.equal(completeWorkExecution(store, target, { type: "run", id: "run-1" }), true);
   assert.equal(store.getWorkMailbox(target).processing, null);
+});
+
+test("requireCompleteWorkExecution rejects a different durable execution", () => {
+  const target = { kind: "role", taskId: "task-1", roleName: "worker" };
+  const pending = enqueueWork(memoryStore(), target, "dispatch", new Date("2026-07-22T01:00:00.000Z"));
+  const processing = bindExecution(
+    claimPending(pending, {
+      batchId: "batch-1",
+      owner: "controller",
+      startedAt: "2026-07-22T01:00:01.000Z"
+    }),
+    "batch-1",
+    { type: "run", id: "run-1" }
+  );
+  const store = memoryStore([processing]);
+
+  assert.throws(
+    () => requireCompleteWorkExecution(store, target, { type: "run", id: "run-other" }),
+    /execution mismatch.*run-other/i
+  );
+  assert.equal(store.getWorkMailbox(target).processing.executionRef.id, "run-1");
+});
+
+test("requireCompleteWorkExecution rejects missing and unbound processing state", () => {
+  const target = { kind: "role", taskId: "task-1", roleName: "worker" };
+  const ref = { type: "run", id: "run-1" };
+  assert.throws(
+    () => requireCompleteWorkExecution(memoryStore(), target, ref),
+    /no processing execution/i
+  );
+
+  const pending = enqueueWork(
+    memoryStore(),
+    target,
+    "dispatch",
+    new Date("2026-07-22T01:00:00.000Z")
+  );
+  const unbound = claimPending(pending, {
+    batchId: "batch-1",
+    owner: "controller",
+    startedAt: "2026-07-22T01:00:01.000Z"
+  });
+  const store = memoryStore([unbound]);
+  assert.throws(
+    () => requireCompleteWorkExecution(store, target, ref),
+    /not bound/i
+  );
+  assert.equal(store.getWorkMailbox(target).processing.batchId, "batch-1");
 });

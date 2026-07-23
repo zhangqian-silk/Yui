@@ -223,6 +223,10 @@ test("capability inspection probes version and installed CLI metadata without la
         return {
           status: 0,
           stdout: [
+            "Commands:",
+            "  resume  Resume a previous session",
+            "Options:",
+            "  -c, --config <key=value>",
             "  --sandbox <MODE> [possible values: read-only, workspace-write, danger-full-access]",
             "  --ask-for-approval <POLICY> [possible values: untrusted, on-request, never]"
           ].join("\n"),
@@ -243,4 +247,56 @@ test("capability inspection probes version and installed CLI metadata without la
     result.fields.find(({ key }) => key === "permission.sandbox").choices,
     ["read-only", "workspace-write", "danger-full-access"]
   );
+});
+
+test("Codex compatibility uses a minimum version and required capability probe", () => {
+  const inspect = (version, help) => inspectAgentCapabilities(
+    configured("codex-personal", "codex", "codex-test"), {
+      now: NOW,
+      run(_command, args) {
+        if (args[0] === "--version") {
+          return { status: 0, stdout: `codex-cli ${version}\n`, stderr: "" };
+        }
+        if (args[0] === "--help") return { status: 0, stdout: help, stderr: "" };
+        throw new Error(`unexpected probe: ${args.join(" ")}`);
+      }
+    }
+  );
+  const compatibleHelp = [
+    "Commands:",
+    "  resume  Resume a previous session",
+    "Options:",
+    "  -c, --config <key=value>",
+    "  --sandbox <MODE> [possible values: read-only, workspace-write, danger-full-access]",
+    "  --ask-for-approval <POLICY> [possible values: untrusted, on-request, never]"
+  ].join("\n");
+
+  const current = inspect("0.145.0", compatibleHelp);
+  assert.equal(current.installation.status, "installed");
+  assert.deepEqual(current.warnings, []);
+
+  const future = inspect("0.146.0", compatibleHelp);
+  assert.equal(future.installation.status, "installed");
+  assert.match(future.warnings.join("\n"), /newer than.*tested/i);
+
+  const tooOld = inspect("0.143.9", compatibleHelp);
+  assert.equal(tooOld.installation.status, "unsupported-version");
+  assert.match(tooOld.installation.reason, /minimum supported version.*0\.144\.1/i);
+
+  const missingCapability = inspect("0.145.0", "Options:\n  --sandbox <MODE>");
+  assert.equal(missingCapability.installation.status, "unsupported-version");
+  assert.match(missingCapability.installation.reason, /--config.*resume/i);
+
+  const failedProbe = inspectAgentCapabilities(
+    configured("codex-personal", "codex", "codex-test"), {
+      now: NOW,
+      run(_command, args) {
+        return args[0] === "--version"
+          ? { status: 0, stdout: "codex-cli 0.145.0\n", stderr: "" }
+          : { status: 2, stdout: "", stderr: "help failed" };
+      }
+    }
+  );
+  assert.equal(failedProbe.installation.status, "probe-failed");
+  assert.match(failedProbe.installation.reason, /capability probe failed/i);
 });

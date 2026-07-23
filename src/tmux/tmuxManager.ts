@@ -11,6 +11,7 @@ import {
 
 const DEFAULT_READINESS_TIMEOUT_MS = 15_000;
 const DEFAULT_READINESS_POLL_MS = 50;
+const DEFAULT_COMMAND_TIMEOUT_MS = 5_000;
 const NATIVE_SCROLL_TERMINAL_FEATURES = [
   "256", "RGB", "clipboard", "ccolour", "cstyle", "extkeys", "focus",
   "hyperlinks", "ignorefkeys", "mouse", "osc7", "overline", "rectfill",
@@ -170,6 +171,41 @@ export class TmuxManager {
     return true;
   }
 
+  async ensureRoleWindowAsync(
+    taskId: string,
+    role: TmuxRole,
+    launch?: TmuxLaunchPlan
+  ): Promise<boolean> {
+    const snapshot = await this.sessionWindowNamesAsync(taskId);
+    if (snapshot.names.includes(role.name)) return false;
+    if (launch === undefined) {
+      throw runtimeError(`Agent launch plan is required to create Role window: ${role.name}.`);
+    }
+
+    if (!snapshot.exists) {
+      await this.runAsync([
+        "new-session", "-d",
+        "-x", String(this.#initialColumns),
+        "-y", String(this.#initialRows),
+        "-s", this.sessionName(taskId),
+        "-n", role.name,
+        "-c", safeValue(role.workspace, "Role workspace"),
+        "--",
+        ...launchCommand(launch)
+      ]);
+    } else {
+      await this.runAsync([
+        "new-window",
+        "-t", this.sessionName(taskId),
+        "-n", role.name,
+        "-c", safeValue(role.workspace, "Role workspace"),
+        "--",
+        ...launchCommand(launch)
+      ]);
+    }
+    return true;
+  }
+
   attachRole(taskId: string, roleName: string): void {
     const session = this.sessionName(taskId);
     // An ANSI outer terminal omits smcup/rmcup, so tmux cannot replace the
@@ -262,6 +298,38 @@ export class TmuxManager {
     const content = this.run([
       "capture-pane", "-p", "-t", target, "-S", "-40"
     ]);
+    return {
+      taskId,
+      roleName,
+      target,
+      dead: dead === "1",
+      ...(Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),
+      currentCommand,
+      content
+    };
+  }
+
+  async inspectPaneAsync(taskId: string, roleName: string): Promise<TmuxPaneState> {
+    const target = this.target(taskId, roleName);
+    const [stateOutput, content] = await Promise.all([
+      this.runAsync([
+        "display-message", "-p", "-t", target,
+        "#{pane_dead}|#{pane_pid}|#{pane_current_command}"
+      ]),
+      this.runAsync([
+        "capture-pane", "-p", "-t", target, "-S", "-40"
+      ])
+    ]);
+    const output = stateOutput.trim();
+    const separator = output.indexOf("|");
+    const secondSeparator = separator < 0 ? -1 : output.indexOf("|", separator + 1);
+    if (separator < 0 || secondSeparator < 0) {
+      throw runtimeError(`Tmux returned an invalid pane state for ${roleName}.`);
+    }
+    const dead = output.slice(0, separator);
+    const pidText = output.slice(separator + 1, secondSeparator);
+    const currentCommand = output.slice(secondSeparator + 1);
+    const pid = Number(pidText);
     return {
       taskId,
       roleName,
@@ -382,6 +450,35 @@ export class TmuxManager {
     });
   }
 
+  async inspectRolePaneInventoryAsync(): Promise<TmuxRolePaneState[]> {
+    const formatSeparator = "\u001f";
+    const encodedSeparator = "\\037";
+    const sessionPrefix = yuiTmuxSessionPrefix(this.#yuiHome);
+    let output: string;
+    try {
+      output = await this.runAsync([
+        "list-panes", "-a", "-F",
+        [
+          "#{session_name}",
+          "#{window_name}",
+          "#{pane_dead}",
+          "#{pane_pid}",
+          "#{pane_current_command}"
+        ].join(formatSeparator)
+      ]);
+    } catch (error) {
+      if (isExplicitlyAbsentTmuxSession(error)) return [];
+      throw error;
+    }
+    return parseRolePaneInventory(
+      output,
+      formatSeparator,
+      encodedSeparator,
+      sessionPrefix,
+      (taskId, roleName) => this.target(taskId, roleName)
+    );
+  }
+
   /**
    * The receipt test, receipt write, literal input and Enter all run through a
    * single tmux server command queue. Retrying the same receipt cannot type the
@@ -423,26 +520,90 @@ export class TmuxManager {
     const target = this.target(taskId, roleName);
     const digest = createHash("sha256").update(receiptId).digest("hex");
     const option = `@yui_delivery_${digest}`;
+    const buffer = `yui_delivery_${digest}`;
     const sentMarker = `__YUI_DELIVERY_SENT_${digest}__`;
     const presentMarker = `__YUI_DELIVERY_PRESENT_${digest}__`;
+    const alreadyApplied = [
+      `delete-buffer -b ${buffer}`,
+      `display-message -p ${presentMarker}`
+    ].join(" ; ");
     const apply = [
-      `set-option -w -t ${tmuxWord(target)} ${option} 1`,
-      `send-keys -l -t ${tmuxWord(target)} -- ${tmuxWord(input)}`,
-      // Codex consumes a long literal send as many terminal key events. Give
-      // its TUI one frame to drain those events before Enter; otherwise Enter
-      // can be consumed while the text remains visibly stranded in composer.
-      "run-shell 'sleep 0.05'",
+      // One bracketed paste preserves literal and multiline input without
+      // expanding it into a long sequence of tmux key events.
+      `paste-buffer -dpr -b ${buffer} -t ${tmuxWord(target)}`,
       `send-keys -t ${tmuxWord(target)} Enter`,
+      // A receipt is proof that Enter was accepted, never merely that an
+      // attempt began.
+      `set-option -w -t ${tmuxWord(target)} ${option} 1`,
       `display-message -p ${sentMarker}`
     ].join(" ; ");
-    const output = this.run([
-      "if-shell", "-t", target, "-F", `#{==:#{${option}},1}`,
-      `display-message -p ${presentMarker}`,
-      apply
-    ]).trim();
-    if (output === sentMarker) return "sent";
-    if (output === presentMarker) return "already-sent";
-    throw runtimeError(`Tmux did not confirm delivery receipt ${receiptId}.`);
+    try {
+      const output = this.run([
+        "set-buffer", "-b", buffer, "--", input,
+        ";",
+        "if-shell", "-t", target, "-F", `#{==:#{${option}},1}`,
+        alreadyApplied,
+        apply
+      ]).trim();
+      if (output === sentMarker) return "sent";
+      if (output === presentMarker) return "already-sent";
+      throw runtimeError(`Tmux did not confirm delivery receipt ${receiptId}.`);
+    } catch (error) {
+      try {
+        this.run(["delete-buffer", "-b", buffer]);
+      } catch {
+        // The apply branch normally consumed it with paste-buffer -d.
+      }
+      throw error;
+    }
+  }
+
+  private async sendReadyRoleInputOnceAsync(
+    taskId: string,
+    roleName: string,
+    receiptId: string,
+    input: string
+  ): Promise<TmuxDeliveryOutcome> {
+    safeValue(receiptId, "tmux delivery receipt id");
+    safeValue(input, "tmux input");
+    if (await this.hasDeliveryReceiptAsync(taskId, roleName, receiptId)) {
+      return "already-sent";
+    }
+    const target = this.target(taskId, roleName);
+    const digest = createHash("sha256").update(receiptId).digest("hex");
+    const option = `@yui_delivery_${digest}`;
+    const buffer = `yui_delivery_${digest}`;
+    const sentMarker = `__YUI_DELIVERY_SENT_${digest}__`;
+    const presentMarker = `__YUI_DELIVERY_PRESENT_${digest}__`;
+    const alreadyApplied = [
+      `delete-buffer -b ${buffer}`,
+      `display-message -p ${presentMarker}`
+    ].join(" ; ");
+    const apply = [
+      `paste-buffer -dpr -b ${buffer} -t ${tmuxWord(target)}`,
+      `send-keys -t ${tmuxWord(target)} Enter`,
+      `set-option -w -t ${tmuxWord(target)} ${option} 1`,
+      `display-message -p ${sentMarker}`
+    ].join(" ; ");
+    try {
+      const output = (await this.runAsync([
+        "set-buffer", "-b", buffer, "--", input,
+        ";",
+        "if-shell", "-t", target, "-F", `#{==:#{${option}},1}`,
+        alreadyApplied,
+        apply
+      ])).trim();
+      if (output === sentMarker) return "sent";
+      if (output === presentMarker) return "already-sent";
+      throw runtimeError(`Tmux did not confirm delivery receipt ${receiptId}.`);
+    } catch (error) {
+      try {
+        await this.runAsync(["delete-buffer", "-b", buffer]);
+      } catch {
+        // The apply branch normally consumed it with paste-buffer -d.
+      }
+      throw error;
+    }
   }
 
   sendRoleInputOnceIfReady(
@@ -462,6 +623,23 @@ export class TmuxManager {
     return this.sendReadyRoleInputOnce(taskId, roleName, receiptId, input);
   }
 
+  async sendRoleInputOnceIfReadyAsync(
+    taskId: string,
+    roleName: string,
+    receiptId: string,
+    input: string,
+    readinessProbe?: TmuxReadinessProbe
+  ): Promise<TmuxDeliveryOutcome | "not-ready"> {
+    if (readinessProbe === undefined) {
+      throw new TmuxReadinessProbeRequiredError();
+    }
+    if (await this.hasDeliveryReceiptAsync(taskId, roleName, receiptId)) {
+      return "already-sent";
+    }
+    if (!readinessProbe(await this.inspectPaneAsync(taskId, roleName))) return "not-ready";
+    return this.sendReadyRoleInputOnceAsync(taskId, roleName, receiptId, input);
+  }
+
   hasDeliveryReceipt(taskId: string, roleName: string, receiptId: string): boolean {
     safeValue(receiptId, "tmux delivery receipt id");
     const digest = createHash("sha256").update(receiptId).digest("hex");
@@ -469,6 +647,19 @@ export class TmuxManager {
     return this.run([
       "show-options", "-wqv", "-t", this.target(taskId, roleName), option
     ]).trim() === "1";
+  }
+
+  async hasDeliveryReceiptAsync(
+    taskId: string,
+    roleName: string,
+    receiptId: string
+  ): Promise<boolean> {
+    safeValue(receiptId, "tmux delivery receipt id");
+    const digest = createHash("sha256").update(receiptId).digest("hex");
+    const option = `@yui_delivery_${digest}`;
+    return (await this.runAsync([
+      "show-options", "-wqv", "-t", this.target(taskId, roleName), option
+    ])).trim() === "1";
   }
 
   detachRole(taskId: string): void {
@@ -501,9 +692,23 @@ export class TmuxManager {
     return this.windowNames(taskId).includes(roleName) ? "running" : "exited";
   }
 
+  async probeRoleStatusAsync(
+    taskId: string,
+    roleName: string
+  ): Promise<"running" | "exited"> {
+    const snapshot = await this.sessionWindowNamesAsync(taskId);
+    return snapshot.names.includes(roleName) ? "running" : "exited";
+  }
+
   stopTask(taskId: string): boolean {
     if (!this.hasSession(taskId)) return false;
     this.run(["kill-session", "-t", this.sessionName(taskId)]);
+    return true;
+  }
+
+  async stopTaskAsync(taskId: string): Promise<boolean> {
+    if (!(await this.hasSessionAsync(taskId))) return false;
+    await this.runAsync(["kill-session", "-t", this.sessionName(taskId)]);
     return true;
   }
 
@@ -513,6 +718,10 @@ export class TmuxManager {
 
   killRole(taskId: string, roleName: string): void {
     this.run(["kill-window", "-t", this.target(taskId, roleName)]);
+  }
+
+  async killRoleAsync(taskId: string, roleName: string): Promise<void> {
+    await this.runAsync(["kill-window", "-t", this.target(taskId, roleName)]);
   }
 
   renameRole(taskId: string, oldRoleName: string, newRoleName: string): void {
@@ -534,11 +743,36 @@ export class TmuxManager {
     }
   }
 
+  private async hasSessionAsync(taskId: string): Promise<boolean> {
+    try {
+      await this.runAsync(["has-session", "-t", this.sessionName(taskId)]);
+      return true;
+    } catch (error) {
+      if (isExplicitlyAbsentTmuxSession(error)) return false;
+      if (!(error instanceof CommandExecutionError)) return false;
+      throw error;
+    }
+  }
+
   private windowNames(taskId: string): string[] {
     if (!this.hasSession(taskId)) return [];
     return this.run([
       "list-windows", "-t", this.sessionName(taskId), "-F", "#{window_name}"
     ]).split("\n").map((name) => name.trim()).filter(Boolean);
+  }
+
+  private async windowNamesAsync(taskId: string): Promise<string[]> {
+    return (await this.sessionWindowNamesAsync(taskId)).names;
+  }
+
+  private async sessionWindowNamesAsync(
+    taskId: string
+  ): Promise<Readonly<{ exists: boolean; names: string[] }>> {
+    if (!(await this.hasSessionAsync(taskId))) return { exists: false, names: [] };
+    const names = (await this.runAsync([
+      "list-windows", "-t", this.sessionName(taskId), "-F", "#{window_name}"
+    ])).split("\n").map((name) => name.trim()).filter(Boolean);
+    return { exists: true, names };
   }
 
   private sessionName(taskId: string): string {
@@ -551,8 +785,68 @@ export class TmuxManager {
 
   /** Every operation is pinned to the server derived from this YUI_HOME. */
   private run(args: string[], options?: CommandRunOptions): string {
-    return this.executor.run(this.tmuxBin, ["-L", this.#serverName, ...args], options);
+    const bounded = options?.inheritStdio === true
+      ? options
+      : { ...options, timeoutMs: options?.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS };
+    return this.executor.run(this.tmuxBin, ["-L", this.#serverName, ...args], bounded);
   }
+
+  private runAsync(args: string[], options?: CommandRunOptions): Promise<string> {
+    const bounded = {
+      ...options,
+      timeoutMs: options?.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS
+    };
+    if (this.executor.runAsync !== undefined) {
+      return this.executor.runAsync(this.tmuxBin, ["-L", this.#serverName, ...args], bounded);
+    }
+    return Promise.resolve().then(() => this.run(args, bounded));
+  }
+}
+
+function parseRolePaneInventory(
+  output: string,
+  formatSeparator: string,
+  encodedSeparator: string,
+  sessionPrefix: string,
+  target: (taskId: string, roleName: string) => string
+): TmuxRolePaneState[] {
+  return output.split("\n").flatMap((line): TmuxRolePaneState[] => {
+    if (line.length === 0) return [];
+    const separator = line.includes(encodedSeparator) ? encodedSeparator : formatSeparator;
+    const [
+      sessionName,
+      roleName,
+      deadText,
+      pidText,
+      currentCommand,
+      ...extra
+    ] = line.split(separator);
+    if (
+      sessionName === undefined
+      || roleName === undefined
+      || deadText === undefined
+      || pidText === undefined
+      || currentCommand === undefined
+      || extra.length > 0
+      || (deadText !== "0" && deadText !== "1")
+    ) {
+      throw runtimeError("Tmux returned an invalid Role pane inventory row.");
+    }
+    if (!sessionName.startsWith(sessionPrefix)) return [];
+    const taskId = sessionName.slice(sessionPrefix.length);
+    if (taskId.length === 0 || roleName.length === 0) {
+      throw runtimeError("Tmux returned an invalid Yui Role pane identity.");
+    }
+    const pid = Number(pidText);
+    return [{
+      taskId,
+      roleName,
+      target: target(taskId, roleName),
+      dead: deadText === "1",
+      ...(Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),
+      currentCommand
+    }];
+  });
 }
 
 export type TmuxDelivery = Readonly<{

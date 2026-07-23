@@ -1,4 +1,6 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+
+const ASYNC_TIMEOUT_KILL_GRACE_MS = 100;
 
 export type CommandRunOptions = Readonly<{
   inheritStdio?: boolean;
@@ -8,6 +10,7 @@ export type CommandRunOptions = Readonly<{
 
 export type CommandExecutor = Readonly<{
   run(command: string, args: string[], options?: CommandRunOptions): string;
+  runAsync?(command: string, args: string[], options?: CommandRunOptions): Promise<string>;
 }>;
 
 export type CommandExecutionErrorCode =
@@ -46,6 +49,75 @@ export class NodeCommandExecutor implements CommandExecutor {
       throw stableCommandExecutionError(result);
     }
     return options.inheritStdio === true ? "" : String(result.stdout ?? "");
+  }
+
+  runAsync(
+    command: string,
+    args: string[],
+    options: CommandRunOptions = {}
+  ): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const inheritStdio = options.inheritStdio === true;
+      const child = spawn(command, args, {
+        ...(options.environment === undefined
+          ? {}
+          : { env: { ...process.env, ...options.environment } }),
+        stdio: inheritStdio ? "inherit" : ["ignore", "pipe", "pipe"]
+      });
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      let spawnError: unknown;
+      let timedOut = false;
+      let settled = false;
+      let killTimer: ReturnType<typeof setTimeout> | undefined;
+      const timer = options.timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            if (settled) return;
+            timedOut = true;
+            child.kill("SIGTERM");
+            killTimer = setTimeout(() => {
+              child.kill("SIGKILL");
+            }, ASYNC_TIMEOUT_KILL_GRACE_MS);
+            killTimer.unref();
+            child.stdout?.destroy();
+            child.stderr?.destroy();
+            settled = true;
+            reject(stableCommandExecutionError({
+              code: "ETIMEDOUT",
+              stderr: Buffer.concat(stderr).toString("utf8")
+            }));
+          }, options.timeoutMs);
+      timer?.unref();
+
+      child.stdout?.on("data", (chunk: Buffer | string) => {
+        stdout.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      child.stderr?.on("data", (chunk: Buffer | string) => {
+        stderr.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      child.once("error", (error) => {
+        spawnError = error;
+      });
+      child.once("close", (status, signal) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== undefined) clearTimeout(timer);
+        if (killTimer !== undefined) clearTimeout(killTimer);
+        const capturedStderr = Buffer.concat(stderr).toString("utf8");
+        if (spawnError !== undefined || timedOut || status !== 0) {
+          reject(stableCommandExecutionError({
+            ...(spawnError === undefined ? {} : { error: spawnError }),
+            ...(timedOut ? { code: "ETIMEDOUT" } : {}),
+            status,
+            signal,
+            stderr: capturedStderr
+          }));
+          return;
+        }
+        resolve(inheritStdio ? "" : Buffer.concat(stdout).toString("utf8"));
+      });
+    });
   }
 }
 

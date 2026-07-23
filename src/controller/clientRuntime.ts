@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { callController } from "../core/controllerClient.js";
+import { callController, readControllerDiscovery } from "../core/controllerClient.js";
 import type { JsonValue } from "../core/protocol.js";
 import type { FileRoleLaunchPlanner } from "../executor/fileRoleLaunchPlanner.js";
 import type { TaskWorkflowRuntimePort } from "../commands/taskCommands.js";
@@ -13,6 +13,7 @@ import type { MailboxTarget } from "../coordination/workMailbox.js";
 
 const STARTUP_TIMEOUT_MS = 5_000;
 const POLL_INTERVAL_MS = 50;
+const LIFECYCLE_REQUEST_TIMEOUT_MS = 30_000;
 
 export type FileControllerClientOptions = Readonly<{
   call?: typeof callController;
@@ -20,6 +21,7 @@ export type FileControllerClientOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
   startupTimeoutMs?: number;
   pollIntervalMs?: number;
+  requestTimeoutMs?: number;
   onError?: (error: unknown) => void;
 }>;
 
@@ -88,8 +90,10 @@ export async function restartFileTaskController(
     await callFileTaskController(home, "controller.stop", {}, options);
     const deadline = Date.now() + timeoutMs;
     for (;;) {
-      const status = await readOptionalControllerStatus(home, call);
-      if (!controllerRunning(status)) break;
+      const stillOwned = options.call === undefined
+        ? await ownedControllerDiscoveryExists(home, previousPid)
+        : controllerPid(await readOptionalControllerStatus(home, call)) === previousPid;
+      if (!stillOwned) break;
       if (Date.now() >= deadline) {
         throw new Error(`Controller did not stop within ${timeoutMs} ms.`);
       }
@@ -103,6 +107,19 @@ export async function restartFileTaskController(
     ...(previousPid === undefined ? {} : { previousPid }),
     ...(pid === undefined ? {} : { pid })
   };
+}
+
+async function ownedControllerDiscoveryExists(
+  home: string,
+  previousPid: number | undefined
+): Promise<boolean> {
+  try {
+    const discovery = await readControllerDiscovery(home);
+    return previousPid === undefined || discovery.pid === previousPid;
+  } catch (error) {
+    if (isUnavailable(error)) return false;
+    throw error;
+  }
 }
 
 export async function callFileTaskController(
@@ -123,12 +140,16 @@ export async function callFileTaskController(
     }
   }
   try {
-    return await call(home, method, params);
+    return await call(home, method, params, {
+      timeoutMs: options.requestTimeoutMs
+    });
   } catch (error) {
     if (!isUnavailable(error)) throw error;
   }
   await ensureFileTaskController(home, options);
-  return call(home, method, params);
+  return call(home, method, params, {
+    timeoutMs: options.requestTimeoutMs
+  });
 }
 
 /** Foreground command bridge. It never reads or writes Agent terminal bytes. */
@@ -160,57 +181,38 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     void this.#prepareAndScan(taskId).catch(this.clientOptions.onError ?? (() => {}));
   }
 
-  prepareTaskRoleEnter(input: Readonly<{ taskId: string; roleName: string }>): void {
-    const role = this.store.getRole(input.taskId, input.roleName);
-    if (role === null) throw new Error(`Role not found: ${input.taskId}/${input.roleName}.`);
-    const session = this.store.getRoleSession(input.taskId, input.roleName);
-    const mode = session?.nativeSessionId === undefined ? "new" : "resume";
-    const planned = this.planner.plan({
+  async prepareTaskRoleEnter(
+    input: Readonly<{ taskId: string; roleName: string }>
+  ): Promise<void> {
+    await callFileTaskController(this.home, "runtime.ensure-role-session", {
+      scope: "task",
       taskId: input.taskId,
-      roleName: input.roleName,
-      agentId: role.activeAgentId,
-      adapterId: role.agentBindings[role.activeAgentId]!.adapterId,
-      mode,
-      ...(mode === "resume" ? { nativeSessionId: session!.nativeSessionId } : {})
+      roleName: input.roleName
+    }, {
+      ...this.clientOptions,
+      requestTimeoutMs: LIFECYCLE_REQUEST_TIMEOUT_MS
     });
-    this.tmux.ensureRoleWindow(input.taskId, planned.role, planned.launch);
-    if (planned.session?.nativeSessionId !== undefined) {
-      this.schedulerStore.recordRuntimeNativeSession({
-        taskId: input.taskId,
-        roleName: input.roleName,
-        agentId: planned.session.agentId,
-        adapterId: planned.session.adapterId,
-        nativeSessionId: planned.session.nativeSessionId
-      });
-    }
   }
 
   inspectTaskRolePanes(taskId: string) {
     return this.tmux.inspectTaskRolePanes(taskId);
   }
 
-  prepareGlobalRoleEnter(roleName: string, tmuxTaskId = "operator"): void {
-    const role = this.store.getGlobalRole(roleName);
-    if (role === null) throw new Error(`Global Role not found: ${roleName}.`);
-    const sessionSet = this.store.getGlobalRoleSessionSet(roleName);
-    const session = sessionSet?.sessions[role.activeAgentId];
-    const binding = role.agentBindings[role.activeAgentId]!;
-    const mode = session?.nativeSessionId === undefined ? "new" : "resume";
-    const planned = this.planner.planGlobalRole({
-      roleName,
-      agentId: role.activeAgentId,
-      adapterId: binding.adapterId,
-      mode,
-      ...(mode === "resume" ? { nativeSessionId: session!.nativeSessionId } : {})
+  async prepareGlobalRoleEnter(roleName: string): Promise<void> {
+    await callFileTaskController(this.home, "runtime.ensure-role-session", {
+      scope: "global",
+      roleName
+    }, {
+      ...this.clientOptions,
+      requestTimeoutMs: LIFECYCLE_REQUEST_TIMEOUT_MS
     });
-    this.tmux.ensureRoleWindow(tmuxTaskId, planned.role, planned.launch);
-    if (planned.session?.nativeSessionId !== undefined) {
-      this.schedulerStore.recordGlobalRuntimeNativeSession({
-        roleName,
-        agentId: planned.session.agentId,
-        adapterId: planned.session.adapterId,
-        nativeSessionId: planned.session.nativeSessionId
-      });
+    if (roleName === "operator") {
+      await callFileTaskController(
+        this.home,
+        "scheduler.signal",
+        { key: "operator" },
+        this.clientOptions
+      );
     }
   }
 

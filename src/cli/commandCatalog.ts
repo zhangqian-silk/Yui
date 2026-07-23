@@ -475,8 +475,8 @@ export const ROOT_COMMAND = buildNode({
         {
           name: "set",
           summary: "Update Yui configuration.",
-          usage: "yui config set --time-zone <IANA timezone>",
-          options: ["--time-zone"]
+          usage: "yui config set <--time-zone <IANA timezone> | --reconciliation-interval-seconds <5-300>>",
+          options: ["--time-zone", "--reconciliation-interval-seconds"]
         }
       ]
     },

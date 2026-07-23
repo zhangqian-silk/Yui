@@ -61,8 +61,18 @@ export interface RuntimeTmuxHostPort {
     role: RuntimeTmuxRole,
     launch?: RuntimeTmuxLaunchPlan
   ): boolean;
+  ensureRoleWindowAsync?(
+    hostId: string,
+    role: RuntimeTmuxRole,
+    launch?: RuntimeTmuxLaunchPlan
+  ): Promise<boolean>;
   probeRoleStatus(hostId: string, roleName: string): "running" | "exited";
+  probeRoleStatusAsync?(
+    hostId: string,
+    roleName: string
+  ): Promise<"running" | "exited">;
   killRole(hostId: string, roleName: string): void;
+  killRoleAsync?(hostId: string, roleName: string): Promise<void>;
 }
 
 export type RuntimeTmuxPaneState = Readonly<{
@@ -81,6 +91,10 @@ export type RuntimeReadinessResolver = (adapterId: string) => RuntimeReadinessPr
 /** The non-blocking delivery subset required from TmuxManager. */
 export interface RuntimeTmuxPromptPort {
   probeRoleStatus(hostId: string, roleName: string): "running" | "exited";
+  probeRoleStatusAsync?(
+    hostId: string,
+    roleName: string
+  ): Promise<"running" | "exited">;
   sendRoleInputOnceIfReady(
     hostId: string,
     roleName: string,
@@ -88,6 +102,13 @@ export interface RuntimeTmuxPromptPort {
     input: string,
     readinessProbe: RuntimeReadinessProbe
   ): "sent" | "already-sent" | "not-ready";
+  sendRoleInputOnceIfReadyAsync?(
+    hostId: string,
+    roleName: string,
+    receiptId: string,
+    input: string,
+    readinessProbe: RuntimeReadinessProbe
+  ): Promise<"sent" | "already-sent" | "not-ready">;
 }
 
 export type TmuxSessionHostOptions = Readonly<{
@@ -103,6 +124,7 @@ export type TmuxSessionHostOptions = Readonly<{
 export class TmuxSessionHost implements SessionHostPort {
   readonly #globalHostId: string;
   readonly #createBindingId: () => string;
+  readonly #launchTails = new Map<string, Promise<void>>();
 
   constructor(
     private readonly planner: RuntimeRoleLaunchPlannerPort,
@@ -126,15 +148,15 @@ export class TmuxSessionHost implements SessionHostPort {
 
   async stop(binding: RuntimeBinding): Promise<void> {
     const ref = requireMatchingHostRef(binding);
-    if (this.tmux.probeRoleStatus(ref.hostId, ref.roleName) === "running") {
-      this.tmux.killRole(ref.hostId, ref.roleName);
+    if (await probeRoleStatus(this.tmux, ref.hostId, ref.roleName) === "running") {
+      await killRole(this.tmux, ref.hostId, ref.roleName);
     }
   }
 
   async inspect(binding: RuntimeBinding): Promise<SessionInspection> {
     const ref = requireMatchingHostRef(binding);
     try {
-      const state = this.tmux.probeRoleStatus(ref.hostId, ref.roleName) === "running"
+      const state = await probeRoleStatus(this.tmux, ref.hostId, ref.roleName) === "running"
         ? "running"
         : "stopped";
       return {
@@ -153,7 +175,32 @@ export class TmuxSessionHost implements SessionHostPort {
     }
   }
 
-  #launch(request: SessionLaunchRequest): RuntimeBinding {
+  async #launch(request: SessionLaunchRequest): Promise<RuntimeBinding> {
+    const hostId = request.owner.scope === "task"
+      ? request.owner.taskId
+      : this.#globalHostId;
+    // All Role windows for one Task share the same tmux session. Serialize the
+    // short create/ensure boundary per host so two first Roles cannot race
+    // `new-session`; different Tasks and the global Operator remain parallel.
+    const key = hostId;
+    const previous = this.#launchTails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const turn = new Promise<void>((resolve) => { release = resolve; });
+    const tail = previous.then(() => turn);
+    this.#launchTails.set(key, tail);
+    await previous;
+    try {
+      return await this.#launchUnlocked(request, hostId);
+    } finally {
+      release();
+      if (this.#launchTails.get(key) === tail) this.#launchTails.delete(key);
+    }
+  }
+
+  async #launchUnlocked(
+    request: SessionLaunchRequest,
+    hostId: string
+  ): Promise<RuntimeBinding> {
     // Validate generated identity before starting an external process.
     const bindingId = requireSafeIdentity(this.#createBindingId(), "Runtime binding id");
     const input = {
@@ -173,10 +220,6 @@ export class TmuxSessionHost implements SessionHostPort {
     if (planned.role.workspace !== request.workspace) {
       throw new Error("Planned Role workspace does not match the runtime request.");
     }
-    const hostId = request.owner.scope === "task"
-      ? request.owner.taskId
-      : this.#globalHostId;
-
     const plannedNativeSessionId = planned.session?.nativeSessionId;
     if (
       request.mode === "resume"
@@ -188,7 +231,12 @@ export class TmuxSessionHost implements SessionHostPort {
     const nativeSessionId = plannedNativeSessionId
       ?? (request.mode === "resume" ? request.nativeSessionId : undefined);
     // Process creation is last: every local invariant has already passed.
-    this.tmux.ensureRoleWindow(hostId, planned.role, planned.launch);
+    const hostCreated = await ensureRoleWindow(
+      this.tmux,
+      hostId,
+      planned.role,
+      planned.launch
+    );
     return createRuntimeBinding({
       id: bindingId,
       launchId: request.launchId,
@@ -200,6 +248,7 @@ export class TmuxSessionHost implements SessionHostPort {
         hostId,
         roleName: request.owner.roleName
       }),
+      hostCreated,
       ...(nativeSessionId === undefined ? {} : { nativeSessionId })
     });
   }
@@ -215,21 +264,66 @@ export class TmuxPromptPushAdapter implements ActivePromptPushPort {
   async tryPush(request: ActivePromptPushRequest): Promise<PromptPushResult> {
     const ref = requireMatchingHostRef(request.binding);
     try {
-      if (this.tmux.probeRoleStatus(ref.hostId, ref.roleName) !== "running") {
+      if (await probeRoleStatus(this.tmux, ref.hostId, ref.roleName) !== "running") {
         return "unavailable";
       }
     } catch {
       return "unavailable";
     }
-    const outcome = this.tmux.sendRoleInputOnceIfReady(
-      ref.hostId,
-      ref.roleName,
-      request.envelope.id,
-      request.envelope.text,
-      this.readiness(request.binding.adapterId)
-    );
+    const readinessProbe = this.readiness(request.binding.adapterId);
+    const outcome = this.tmux.sendRoleInputOnceIfReadyAsync === undefined
+      ? this.tmux.sendRoleInputOnceIfReady(
+          ref.hostId,
+          ref.roleName,
+          request.envelope.id,
+          request.envelope.text,
+          readinessProbe
+        )
+      : await this.tmux.sendRoleInputOnceIfReadyAsync(
+          ref.hostId,
+          ref.roleName,
+          request.envelope.id,
+          request.envelope.text,
+          readinessProbe
+        );
     return outcome === "not-ready" ? "busy" : "delivered";
   }
+}
+
+async function ensureRoleWindow(
+  tmux: RuntimeTmuxHostPort,
+  hostId: string,
+  role: RuntimeTmuxRole,
+  launch?: RuntimeTmuxLaunchPlan
+): Promise<boolean> {
+  return tmux.ensureRoleWindowAsync === undefined
+    ? tmux.ensureRoleWindow(hostId, role, launch)
+    : tmux.ensureRoleWindowAsync(hostId, role, launch);
+}
+
+async function probeRoleStatus(
+  tmux: Pick<
+    RuntimeTmuxHostPort,
+    "probeRoleStatus" | "probeRoleStatusAsync"
+  >,
+  hostId: string,
+  roleName: string
+): Promise<"running" | "exited"> {
+  return tmux.probeRoleStatusAsync === undefined
+    ? tmux.probeRoleStatus(hostId, roleName)
+    : tmux.probeRoleStatusAsync(hostId, roleName);
+}
+
+async function killRole(
+  tmux: RuntimeTmuxHostPort,
+  hostId: string,
+  roleName: string
+): Promise<void> {
+  if (tmux.killRoleAsync === undefined) {
+    tmux.killRole(hostId, roleName);
+    return;
+  }
+  await tmux.killRoleAsync(hostId, roleName);
 }
 
 type TmuxHostRef = Readonly<{

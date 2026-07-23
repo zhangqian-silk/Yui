@@ -1,6 +1,7 @@
 import { dataError, roleNotFound, taskNotFound, usageError } from "../errors/cliError.js";
 import { createTaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
 import {
+  terminalizeTaskRoleRunSession,
   updateRoleAgentSessionStatus,
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
@@ -19,7 +20,7 @@ import { defaultTableWidth, renderTable } from "../output/table.js";
 import { formatTimestamp } from "../output/timePresentation.js";
 import { updateRoleStatus, type Role } from "../role/role.js";
 import { yieldAgentRun, type AgentRun } from "../run/agentRun.js";
-import { completeWorkExecution, enqueueWork } from "../coordination/workMailboxQueue.js";
+import { enqueueWork, requireCompleteWorkExecution } from "../coordination/workMailboxQueue.js";
 import type { MailboxTarget } from "../coordination/workMailbox.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
@@ -126,21 +127,19 @@ function createRequest(
       `Waiting for input ${created.id}: ${created.question}`,
       now
     ));
-    completeWorkExecution(
+    requireCompleteWorkExecution(
       tx,
       { kind: "role", taskId: task.id, roleName: LEADER_ROLE },
       { type: "run", id: origin.run.id }
     );
     tx.clearActiveAgentRun(task.id, LEADER_ROLE);
     tx.saveRole(task.id, updateRoleStatus(origin.role, "idle", now));
-    if (origin.sessions?.inFlight === null
-      && origin.sessions.sessions[origin.role.activeAgentId]?.status === "running") {
-      tx.saveTaskRoleSessionSet(updateRoleAgentSessionStatus(
-        origin.sessions,
-        origin.role.activeAgentId,
-        "ready",
-        now
-      ));
+    if (origin.sessions !== null) {
+      tx.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(origin.sessions, {
+        agentId: origin.role.activeAgentId,
+        runId: origin.run.id,
+        receiptId: `agent-run:${origin.run.id}`
+      }, now));
     }
     recordTaskEvent(tx, task.id, "input.requested", {
       requestId: created.id,
@@ -297,7 +296,6 @@ function requireLeaderInputOrigin(
     || env.YUI_ROLE !== LEADER_ROLE
     || env.YUI_AGENT_ID !== role.activeAgentId
     || run === null
-    || env.YUI_RUN_ID !== run.id
     || run.status !== "active"
     || run.deliveredAt === undefined
     || run.workItemId !== undefined
@@ -333,7 +331,6 @@ function assertInputCancelOrigin(
     || env.YUI_TASK_ID !== request.taskId
     || env.YUI_ROLE !== request.requester.roleName
     || env.YUI_AGENT_ID !== request.requester.agentId
-    || env.YUI_RUN_ID !== request.requester.runId
     || (request.requester.nativeSessionId !== undefined
       && env.YUI_NATIVE_SESSION_ID !== request.requester.nativeSessionId)
   ) {

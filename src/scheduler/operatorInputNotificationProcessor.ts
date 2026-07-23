@@ -1,18 +1,30 @@
 import type { InputRequest } from "../input/inputRequest.js";
-import { createInputRequestOperatorPresentation } from "../interaction/operatorPresentation.js";
+import {
+  createInputRequestOperatorPresentation,
+  createLeaderRecoveryOperatorPresentation,
+  type OperatorAttentionPresentation
+} from "../interaction/operatorPresentation.js";
+import type { OperatorNotification } from "./operatorNotification.js";
 import type {
   SchedulerReconcileSelection,
   SchedulerStorePort,
   TmuxDeliveryPort
 } from "./ports.js";
 
-export type OperatorInputNotificationResult = Readonly<{
-  inputRequestId: string;
+type OperatorNotificationOutcome = Readonly<{
   taskId: string;
   status: "sent" | "already-sent" | "skipped" | "failed";
   reason?: "operator-unavailable" | "operator-not-ready" | "delivery-unsupported";
   error?: string;
 }>;
+
+export type OperatorInputNotificationResult =
+  | (OperatorNotificationOutcome & Readonly<{ inputRequestId: string }>)
+  | (OperatorNotificationOutcome & Readonly<{ recoveryTaskId: string }>);
+
+type PendingOperatorAttention =
+  | Readonly<{ kind: "input"; request: InputRequest }>
+  | Readonly<{ kind: "recovery"; notification: OperatorNotification }>;
 
 export async function processOperatorInputNotifications(
   store: SchedulerStorePort,
@@ -35,11 +47,18 @@ export async function processOperatorInputNotifications(
   });
   if (claim.status === "empty") return [];
   const processing = claim.processing;
-  const requests = processing.batch.refs
+  const requests: PendingOperatorAttention[] = processing.batch.refs
     .filter((ref) => ref.type === "input")
     .map((ref) => store.getInputRequest(ref.id))
-    .filter((request): request is InputRequest => request !== null && request.status === "open");
-  if (requests.length === 0) {
+    .filter((request): request is InputRequest => request !== null && request.status === "open")
+    .map((request) => ({ kind: "input", request }));
+  const recoveries: PendingOperatorAttention[] = processing.batch.refs
+    .filter((ref) => ref.type === "task")
+    .map((ref) => store.getOperatorNotification(ref.id))
+    .filter((notification): notification is OperatorNotification => notification !== null)
+    .map((notification) => ({ kind: "recovery", notification }));
+  const attentions = deduplicateAttention([...requests, ...recoveries]);
+  if (attentions.length === 0) {
     store.completeWorkMailbox(targetMailbox, processing.batchId);
     return [];
   }
@@ -47,13 +66,13 @@ export async function processOperatorInputNotifications(
   if (target === null || delivery.notifyOperatorInputOnce === undefined) {
     const reason = target === null ? "operator-unavailable" : "delivery-unsupported";
     store.releaseWorkMailbox(targetMailbox, processing.batchId);
-    return requests.map((request) => skipped(request, reason));
+    return attentions.map((attention) => skipped(attention, reason));
   }
 
   const results: OperatorInputNotificationResult[] = [];
-  for (const [index, request] of requests.entries()) {
+  for (const [index, attention] of attentions.entries()) {
     try {
-      const presentation = createInputRequestOperatorPresentation(request);
+      const presentation = createAttentionPresentation(attention, store);
       const outcome = await delivery.notifyOperatorInputOnce({
         ...target,
         receiptId: presentation.receiptId,
@@ -61,31 +80,30 @@ export async function processOperatorInputNotifications(
       });
       if (outcome === "unavailable") {
         store.releaseWorkMailbox(targetMailbox, processing.batchId);
-        results.push(skipped(request, "operator-unavailable"));
-        results.push(...requests.slice(index + 1).map((pending) => (
+        results.push(skipped(attention, "operator-unavailable"));
+        results.push(...attentions.slice(index + 1).map((pending) => (
           skipped(pending, "operator-unavailable")
         )));
         break;
       } else if (outcome === "not-ready") {
         store.releaseWorkMailbox(targetMailbox, processing.batchId);
-        results.push(skipped(request, "operator-not-ready"));
-        results.push(...requests.slice(index + 1).map((pending) => (
+        results.push(skipped(attention, "operator-not-ready"));
+        results.push(...attentions.slice(index + 1).map((pending) => (
           skipped(pending, "operator-not-ready")
         )));
         break;
       } else {
         results.push({
-          inputRequestId: request.id,
-          taskId: request.taskId,
+          ...attentionIdentity(attention),
           status: outcome
         });
         if (outcome === "sent") {
-          if (index === requests.length - 1) {
+          if (index === attentions.length - 1) {
             store.completeWorkMailbox(targetMailbox, processing.batchId);
           } else {
             store.releaseWorkMailbox(targetMailbox, processing.batchId);
           }
-          results.push(...requests.slice(index + 1).map((pending) => (
+          results.push(...attentions.slice(index + 1).map((pending) => (
             skipped(pending, "operator-not-ready")
           )));
           break;
@@ -94,8 +112,7 @@ export async function processOperatorInputNotifications(
     } catch (error) {
       store.releaseWorkMailbox(targetMailbox, processing.batchId);
       results.push({
-        inputRequestId: request.id,
-        taskId: request.taskId,
+        ...attentionIdentity(attention),
         status: "failed",
         error: error instanceof Error ? error.message : String(error)
       });
@@ -109,13 +126,46 @@ export async function processOperatorInputNotifications(
 }
 
 function skipped(
-  request: InputRequest,
+  attention: PendingOperatorAttention,
   reason: NonNullable<OperatorInputNotificationResult["reason"]>
 ): OperatorInputNotificationResult {
   return {
-    inputRequestId: request.id,
-    taskId: request.taskId,
+    ...attentionIdentity(attention),
     status: "skipped",
     reason
   };
+}
+
+function attentionIdentity(attention: PendingOperatorAttention):
+  | Readonly<{ inputRequestId: string; taskId: string }>
+  | Readonly<{ recoveryTaskId: string; taskId: string }> {
+  return attention.kind === "input"
+    ? { inputRequestId: attention.request.id, taskId: attention.request.taskId }
+    : {
+        recoveryTaskId: attention.notification.taskId,
+        taskId: attention.notification.taskId
+      };
+}
+
+function createAttentionPresentation(
+  attention: PendingOperatorAttention,
+  store: SchedulerStorePort
+): OperatorAttentionPresentation {
+  return attention.kind === "input"
+    ? createInputRequestOperatorPresentation(attention.request, store.getPresentationContext())
+    : createLeaderRecoveryOperatorPresentation(attention.notification);
+}
+
+function deduplicateAttention(
+  attentions: readonly PendingOperatorAttention[]
+): PendingOperatorAttention[] {
+  const seen = new Set<string>();
+  return attentions.filter((attention) => {
+    const key = attention.kind === "input"
+      ? `input:${attention.request.id}`
+      : `recovery:${attention.notification.taskId}:${attention.notification.createdAt}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }

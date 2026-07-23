@@ -26,18 +26,47 @@ test("timestamps support a configured IANA timezone and reject invalid values", 
   assert.throws(() => formatTimestamp("not-a-time"), /timestamp/i);
 });
 
-test("config commands expose the effective timezone and persist an override", () => {
+test("config commands expose effective recovery settings and persist overrides", () => {
   let config = { schemaVersion: 1 };
   const store = {
     getConfig: () => structuredClone(config),
     saveConfig: (next) => { config = structuredClone(next); }
   };
 
-  assert.match(runConfigCommand(["show"], store), /Time zone: Asia\/Shanghai/);
+  assert.equal(
+    runConfigCommand(["show"], store),
+    "Time zone: Asia/Shanghai\nReconciliation interval: 120 seconds\n"
+  );
   assert.equal(
     runConfigCommand(["set", "--time-zone", "Europe/London"], store),
     "Time zone set to Europe/London\n"
   );
   assert.equal(config.timeZone, "Europe/London");
-  assert.match(runConfigCommand(["show"], store), /Time zone: Europe\/London/);
+  assert.equal(
+    runConfigCommand(["set", "--reconciliation-interval-seconds", "45"], store),
+    "Reconciliation interval set to 45 seconds\n"
+  );
+  assert.equal(config.reconciliationIntervalSeconds, 45);
+  assert.equal(
+    runConfigCommand(["show"], store),
+    "Time zone: Europe/London\nReconciliation interval: 45 seconds\n"
+  );
+});
+
+test("config commands reject invalid reconciliation intervals through shared validation", () => {
+  const config = { schemaVersion: 1 };
+  const store = {
+    getConfig: () => structuredClone(config),
+    saveConfig: () => assert.fail("invalid configuration must not be persisted")
+  };
+
+  for (const value of ["4", "301", "30.5", "invalid"]) {
+    assert.throws(
+      () => runConfigCommand(
+        ["set", "--reconciliation-interval-seconds", value],
+        store
+      ),
+      /reconciliationIntervalSeconds must be an integer from 5 to 300/
+    );
+  }
 });

@@ -60,10 +60,30 @@ export type ExecutorTmuxPort = Readonly<{
     input: string,
     readinessProbe: TmuxReadinessProbe
   ): TmuxDeliveryOutcome | "not-ready";
+  sendRoleInputOnceIfReadyAsync?(
+    taskId: string,
+    roleName: string,
+    receiptId: string,
+    input: string,
+    readinessProbe: TmuxReadinessProbe
+  ): Promise<TmuxDeliveryOutcome | "not-ready">;
   hasDeliveryReceipt(taskId: string, roleName: string, receiptId: string): boolean;
+  hasDeliveryReceiptAsync?(
+    taskId: string,
+    roleName: string,
+    receiptId: string
+  ): Promise<boolean>;
   probeRoleStatus(taskId: string, roleName: string): "running" | "exited";
+  probeRoleStatusAsync?(
+    taskId: string,
+    roleName: string
+  ): Promise<"running" | "exited">;
   inspectRolePaneInventory?(): TmuxRolePaneState[];
+  inspectRolePaneInventoryAsync?(): Promise<TmuxRolePaneState[]>;
+  inspectPane?(taskId: string, roleName: string): TmuxPaneState;
+  inspectPaneAsync?(taskId: string, roleName: string): Promise<TmuxPaneState>;
   stopTask(taskId: string): boolean;
+  stopTaskAsync?(taskId: string): Promise<boolean>;
 }>;
 
 export type AgentReadinessResolver = (adapterId: string) => TmuxReadinessProbe;
@@ -74,6 +94,7 @@ export type ExecutorRuntimePorts = Readonly<{
 }>;
 
 type PreparedRuntime = Readonly<{
+  delivery: PreparedRoleDelivery;
   session: SchedulerRoleSession | null;
   planned?: PlannedRoleSession;
   binding?: RuntimeBinding;
@@ -100,12 +121,14 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     adapterId: string;
     workspace: string;
     mode: RoleSessionLaunchMode;
+    runId?: string;
     nativeSessionId?: string;
   }>): Promise<PreparedRoleDelivery> {
     if (input.mode === "resume" && !hasText(input.nativeSessionId)) {
       throw new Error("Role session resume requires a native session id.");
     }
-    const delivery: PreparedRoleDelivery = {
+    let sessionStarted = false;
+    const deliveryBase = {
       deliveryId: preparedDeliveryId(input),
       taskId: input.taskId,
       roleName: input.roleName,
@@ -113,16 +136,22 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       adapterId: input.adapterId,
       mode: input.mode
     };
+    const cached = this.#prepared.get(deliveryBase.deliveryId);
+    if (cached !== undefined) return cached.delivery;
     let binding: RuntimeBinding | undefined;
     let planned: PlannedRoleSession | undefined;
     let session: SchedulerRoleSession | null;
     if (this.runtimePorts === undefined) {
       planned = this.planner.plan(input);
-      this.tmux.ensureRoleWindow(input.taskId, planned.role, planned.launch);
+      sessionStarted = this.tmux.ensureRoleWindow(
+        input.taskId,
+        planned.role,
+        planned.launch
+      );
       session = planned.session;
     } else {
       const common = {
-        launchId: delivery.deliveryId,
+        launchId: deliveryBase.deliveryId,
         owner: { scope: "task", taskId: input.taskId, roleName: input.roleName },
         agentId: input.agentId,
         adapterId: input.adapterId,
@@ -138,6 +167,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       binding = request.mode === "new"
         ? await this.runtimePorts.sessionHost.start(request)
         : await this.runtimePorts.sessionHost.resume(request);
+      sessionStarted = binding.hostCreated === true;
       session = binding.nativeSessionId === undefined
         ? null
         : {
@@ -147,7 +177,12 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
             status: "ready"
           };
     }
+    const delivery: PreparedRoleDelivery = {
+      ...deliveryBase,
+      sessionStarted
+    };
     this.#prepared.set(delivery.deliveryId, {
+      delivery,
       session,
       ...(planned === undefined ? {} : { planned }),
       ...(binding === undefined ? {} : { binding })
@@ -183,15 +218,22 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
           createdAt: new Date()
         })
       });
+      if (outcome === "delivered") {
+        this.#prepared.delete(input.delivery.prepared.deliveryId);
+      }
       return outcome === "delivered" ? "sent" : outcome;
     }
-    return this.tmux.sendRoleInputOnce(
+    const outcome = this.tmux.sendRoleInputOnce(
       input.delivery.prepared.taskId,
       input.delivery.prepared.roleName,
       input.receiptId,
       input.text,
       this.readiness(input.delivery.prepared.adapterId)
     );
+    if (outcome === "sent" || outcome === "already-sent") {
+      this.#prepared.delete(input.delivery.prepared.deliveryId);
+    }
+    return outcome;
   }
 
   async notifyOperatorInputOnce(input: Readonly<{
@@ -200,16 +242,20 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     receiptId: string;
     text: string;
   }>): Promise<"sent" | "already-sent" | "unavailable" | "not-ready"> {
-    if (this.tmux.probeRoleStatus("operator", input.roleName) !== "running") {
+    const status = this.tmux.probeRoleStatusAsync === undefined
+      ? this.tmux.probeRoleStatus("operator", input.roleName)
+      : await this.tmux.probeRoleStatusAsync("operator", input.roleName);
+    if (status !== "running") {
       return "unavailable";
     }
-    return this.tmux.sendRoleInputOnceIfReady(
-      "operator",
-      input.roleName,
-      input.receiptId,
-      input.text,
-      this.readiness(input.adapterId)
-    );
+    const probe = this.readiness(input.adapterId);
+    return this.tmux.sendRoleInputOnceIfReadyAsync === undefined
+      ? this.tmux.sendRoleInputOnceIfReady(
+          "operator", input.roleName, input.receiptId, input.text, probe
+        )
+      : this.tmux.sendRoleInputOnceIfReadyAsync(
+          "operator", input.roleName, input.receiptId, input.text, probe
+        );
   }
 
   async inspectRole(input: Readonly<{
@@ -219,9 +265,34 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     adapterId: string;
     nativeSessionId?: string;
   }>): Promise<"present" | "absent"> {
-    return this.tmux.probeRoleStatus(input.taskId, input.roleName) === "running"
+    const status = this.tmux.probeRoleStatusAsync === undefined
+      ? this.tmux.probeRoleStatus(input.taskId, input.roleName)
+      : await this.tmux.probeRoleStatusAsync(input.taskId, input.roleName);
+    return status === "running"
       ? "present"
       : "absent";
+  }
+
+  async inspectRoleReadiness(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    adapterId: string;
+    nativeSessionId?: string;
+  }>): Promise<"ready" | "busy" | "absent"> {
+    const status = await this.inspectRole(input);
+    if (status === "absent") return "absent";
+    try {
+      const pane = this.tmux.inspectPaneAsync === undefined
+        ? this.tmux.inspectPane?.(input.taskId, input.roleName)
+        : await this.tmux.inspectPaneAsync(input.taskId, input.roleName);
+      if (pane === undefined) return "busy";
+      return this.readiness(input.adapterId)(pane) ? "ready" : "busy";
+    } catch {
+      // A pane can disappear between the inventory and content snapshot; the
+      // ordinary liveness pass will classify it on the next reconciliation.
+      return "busy";
+    }
   }
 
   async inspectRoles(inputs: readonly Readonly<{
@@ -235,15 +306,21 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     roleName: string;
     status: "present" | "absent";
   }>[]> {
-    if (this.tmux.inspectRolePaneInventory === undefined) {
+    if (
+      this.tmux.inspectRolePaneInventory === undefined
+      && this.tmux.inspectRolePaneInventoryAsync === undefined
+    ) {
       return Promise.all(inputs.map(async (input) => ({
         taskId: input.taskId,
         roleName: input.roleName,
         status: await this.inspectRole(input)
       })));
     }
+    const inventory = this.tmux.inspectRolePaneInventoryAsync === undefined
+      ? this.tmux.inspectRolePaneInventory!()
+      : await this.tmux.inspectRolePaneInventoryAsync();
     const present = new Set(
-      this.tmux.inspectRolePaneInventory()
+      inventory
         .filter((pane) => !pane.dead)
         .map((pane) => `${pane.taskId}\0${pane.roleName}`)
     );
@@ -261,16 +338,26 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     receiptId: string;
   }>): Promise<ReadyRoleDelivery | null> {
     const prepared = this.requirePrepared(input.delivery);
-    if (prepared.binding !== undefined) return null;
-    return this.tmux.hasDeliveryReceipt(
-      input.delivery.taskId,
-      input.delivery.roleName,
-      input.receiptId
-    ) ? { prepared: input.delivery, session: prepared.session } : null;
+    const found = this.tmux.hasDeliveryReceiptAsync === undefined
+      ? this.tmux.hasDeliveryReceipt(
+          input.delivery.taskId,
+          input.delivery.roleName,
+          input.receiptId
+        )
+      : await this.tmux.hasDeliveryReceiptAsync(
+          input.delivery.taskId,
+          input.delivery.roleName,
+          input.receiptId
+        );
+    if (!found) return null;
+    this.#prepared.delete(input.delivery.deliveryId);
+    return { prepared: input.delivery, session: prepared.session };
   }
 
   async stopTask(taskId: string): Promise<boolean> {
-    return this.tmux.stopTask(taskId);
+    return this.tmux.stopTaskAsync === undefined
+      ? this.tmux.stopTask(taskId)
+      : this.tmux.stopTaskAsync(taskId);
   }
 
   private requirePrepared(delivery: PreparedRoleDelivery): PreparedRuntime {
@@ -303,13 +390,29 @@ export function agentComposerReadinessProbe(adapterId: string): TmuxReadinessPro
         const currentComposer = nonEmptyLines[nonEmptyLines.length - 1]?.includes(" · ") === true
           && composerIndex >= Math.max(0, nonEmptyLines.length - 12)
           && composerIndex < nonEmptyLines.length - 1;
+        // Codex keeps the composer and footer visible while a Turn is active,
+        // including when a user has queued another prompt. Readiness must
+        // prove that no Turn is running, not merely that input can be typed.
+        const activeTurn = /(?:^|\n)\s*(?:[•●·]\s*)?(?:Working|Running)\b[^\n]*(?:esc to interrupt|•\s*esc)\b/i
+          .test(content);
         return livePane(pane)
-          && !/Press enter to continue|select.*update|update selector/i.test(content)
+          && !activeTurn
+          && !/Press enter to (?:continue|confirm)|esc to cancel|select.*update|update selector|Would you like to (?:run|allow|proceed)|Do you want to allow/i
+            .test(content)
           && (legacyComposer || currentComposer);
       };
     case "claude":
-      return (pane) => livePane(pane)
-        && /(?:^|\n)\s*❯\s*(?:$|\S)/u.test(pane.content.replace(/\r/g, ""));
+      return (pane) => {
+        const content = pane.content.replace(/\r/g, "");
+        const tail = content.split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .slice(-12);
+        const composer = tail.at(-1)?.startsWith("❯") === true;
+        const activeTurn = /(?:working|thinking|esc to interrupt|ctrl\+c to interrupt|press ctrl-c)/i
+          .test(tail.join("\n"));
+        return livePane(pane) && composer && !activeTurn;
+      };
     default:
       throw new Error(`No tmux readiness probe is registered for Agent adapter: ${adapterId}.`);
   }
@@ -325,6 +428,7 @@ function preparedDeliveryId(input: Readonly<{
   agentId: string;
   adapterId: string;
   mode: RoleSessionLaunchMode;
+  runId?: string;
   nativeSessionId?: string;
 }>): string {
   return createHash("sha256").update(JSON.stringify([
@@ -333,6 +437,7 @@ function preparedDeliveryId(input: Readonly<{
     input.agentId,
     input.adapterId,
     input.mode,
+    input.runId ?? null,
     input.nativeSessionId ?? null
   ])).digest("hex");
 }

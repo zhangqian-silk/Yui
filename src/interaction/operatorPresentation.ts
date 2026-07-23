@@ -1,8 +1,10 @@
 import type { InputRequest } from "../input/inputRequest.js";
+import type { OperatorNotification } from "../scheduler/operatorNotification.js";
 import {
   taskMessageAuthorLabel,
   type TaskMessage
 } from "../message/message.js";
+import { formatTimestamp } from "../output/timePresentation.js";
 
 export type OperatorPresentationCategory = "attention" | "terminal" | "progress";
 
@@ -14,7 +16,10 @@ type OperatorPresentationBase = Readonly<{
 
 export type OperatorAttentionPresentation = OperatorPresentationBase & Readonly<{
   category: "attention";
-  source: Readonly<{ kind: "input-request"; id: string }>;
+  source: Readonly<
+    | { kind: "input-request"; id: string }
+    | { kind: "leader-recovery"; id: string }
+  >;
 }>;
 
 export type OperatorTerminalPresentation = OperatorPresentationBase & Readonly<{
@@ -32,8 +37,13 @@ export type OperatorPresentation =
   | OperatorTerminalPresentation
   | OperatorProgressPresentation;
 
+export type OperatorPresentationContext = Readonly<{
+  timeZone?: unknown;
+}>;
+
 export function createInputRequestOperatorPresentation(
-  request: InputRequest
+  request: InputRequest,
+  context: OperatorPresentationContext
 ): OperatorAttentionPresentation {
   const policy = request.policy;
   const recommendation = policy.kind === "recommended"
@@ -63,12 +73,30 @@ export function createInputRequestOperatorPresentation(
         ? ["Decision policy: this requires the user's response; there is no automatic fallback."]
         : [
             `Agent recommendation: ${recommendation!.key}: ${recommendation!.label}`,
-            `Automatic fallback after: ${policy.timeoutAt}`
+            `Automatic fallback after: ${formatTimestamp(policy.timeoutAt, context.timeZone)}`
           ]),
       `Inspect: yui task input show ${request.id}`,
       request.choices.length === 0
         ? `After the user replies: yui task input answer ${request.id} --text "<answer>"`
         : `After the user chooses: yui task input answer ${request.id} --choice <key>`
+    ].join("\n")
+  };
+}
+
+export function createLeaderRecoveryOperatorPresentation(
+  notification: OperatorNotification
+): OperatorAttentionPresentation {
+  return {
+    category: "attention",
+    taskId: notification.taskId,
+    receiptId: `leader-recovery:${notification.taskId}:${notification.createdAt}`,
+    source: { kind: "leader-recovery", id: notification.taskId },
+    text: [
+      "A Task cannot recover its Leader automatically and needs user attention.",
+      `Task: ${notification.taskId}`,
+      `Failure: ${notification.message}`,
+      `Inspect: yui task show ${notification.taskId}`,
+      `Recovery status: yui job show ${notification.taskId}`
     ].join("\n")
   };
 }

@@ -30,7 +30,8 @@ export type RunningControllerServer = Readonly<{
 
 export async function startControllerServer(
   home: string,
-  dispatcher?: ControllerDispatcher
+  dispatcher?: ControllerDispatcher,
+  beforeDiscoveryRemoval?: () => void | Promise<void>
 ): Promise<RunningControllerServer> {
   const discoveryPath = join(home, CONTROLLER_DISCOVERY_PATH);
   const socketPath = join(home, CONTROLLER_SOCKET_PATH);
@@ -76,6 +77,7 @@ export async function startControllerServer(
     closeRunning = (): Promise<void> => {
       if (closePromise !== undefined) return closePromise;
       closePromise = (async () => {
+        await beforeDiscoveryRemoval?.();
         await closeNetServer(netServer);
         await removeOwnedDiscovery(discoveryPath, token);
         resolveClosed();

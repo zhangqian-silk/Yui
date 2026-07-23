@@ -6,8 +6,9 @@ import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
+import { createRuntimeLifecycleDispatcher } from "../../dist/controller/runtime.js";
+import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
 import {
-  createSessionNotifyDispatcher,
   parseCodexSessionNotification,
   runSessionNotifyCommand
 } from "../../dist/controller/sessionNotify.js";
@@ -52,6 +53,58 @@ function fixture(t, adapterId = "codex") {
   });
   return { home, store, task, role, globalRole, agent, now };
 }
+
+function recordParsedTurnCompletion(schedulerStore, payload, environment) {
+  const input = parseCodexSessionNotification(payload, environment);
+  assert.equal(input.scope, "task");
+  return schedulerStore.recordRuntimeTurnCompleted({
+    taskId: input.taskId,
+    roleName: input.roleName,
+    agentId: input.agentId,
+    adapterId: input.adapterId,
+    nativeSessionId: input.nativeSessionId,
+    turnId: input.turnId,
+    summary: input.lastAssistantMessage
+  });
+}
+
+test("Controller lifecycle dispatcher is the sole session creator for enter", async (t) => {
+  const { store, task, role, globalRole } = fixture(t);
+  const schedulerStore = new FileSchedulerStoreAdapter(store);
+  const starts = [];
+  const sessionHost = {
+    async start(request) {
+      starts.push(request);
+      return {
+        nativeSessionId: request.owner.scope === "task" ? "thread-task" : "thread-global"
+      };
+    },
+    async resume() {
+      throw new Error("unexpected resume");
+    }
+  };
+  const dispatch = createRuntimeLifecycleDispatcher(store, schedulerStore, sessionHost);
+
+  await dispatch("runtime.ensure-role-session", {
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  });
+  await dispatch("runtime.ensure-role-session", {
+    scope: "global",
+    roleName: globalRole.name
+  });
+
+  assert.deepEqual(starts.map(({ owner }) => owner), [
+    { scope: "task", taskId: task.id, roleName: role.name },
+    { scope: "global", roleName: globalRole.name }
+  ]);
+  assert.equal(store.getRoleSession(task.id, role.name).nativeSessionId, "thread-task");
+  assert.equal(
+    store.getGlobalRoleSessionSet(globalRole.name).sessions[globalRole.activeAgentId].nativeSessionId,
+    "thread-global"
+  );
+});
 
 test("one planner adds Codex structured notify for Task and global launches", (t) => {
   const { home, store, task, role, globalRole, agent } = fixture(t);
@@ -134,7 +187,7 @@ test("Claude launch identity is deterministic for one durable launch across retr
   assert.deepEqual(first.launch.args.slice(-2), ["--session-id", first.session.nativeSessionId]);
 });
 
-test("Codex notify payload is strictly converted to an internal fixed session bind", async (t) => {
+test("Codex notify payload is strictly converted to one durable runtime event", async (t) => {
   const { home, store, task, role, agent } = fixture(t);
   const environment = {
     YUI_HOME: home,
@@ -149,7 +202,7 @@ test("Codex notify payload is strictly converted to an internal fixed session bi
     "thread-id": "thread-native-1",
     "turn-id": "turn-1",
     cwd: home,
-    "input-messages": [],
+    "input-messages": ["Yui-Run-Id: agent-run-native-1\n\nDo the work"],
     "last-assistant-message": "done"
   });
   assert.equal(
@@ -157,47 +210,41 @@ test("Codex notify payload is strictly converted to an internal fixed session bi
     "thread-native-1"
   );
 
-  const schedulerStore = new FileSchedulerStoreAdapter(store);
-  const completedTurns = [];
-  const dispatch = createSessionNotifyDispatcher(
-    schedulerStore,
-    undefined,
-    (input) => completedTurns.push(input)
-  );
   await runSessionNotifyCommand(payload, environment, async (calledHome, method, params) => {
     assert.equal(calledHome, home);
-    assert.equal(method, "runtime.session.bind");
-    return dispatch(method, params);
+    assert.equal(method, "scheduler.signal");
+    assert.deepEqual(params, { key: `role:${task.id}/${role.name}` });
+    return {};
   });
-  assert.equal(
-    store.getRoleSession(task.id, role.name).nativeSessionId,
-    "thread-native-1"
-  );
-  assert.deepEqual(completedTurns, [{ scope: "task", taskId: task.id, roleName: role.name }]);
-  const revision = JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision;
-  await runSessionNotifyCommand(payload, environment, async (_home, method, params) => (
-    dispatch(method, params)
-  ));
-  assert.equal(completedTurns.length, 2);
-  assert.equal(JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision, revision);
-  const retryPlan = new FileRoleLaunchPlanner(home, store, { cliPath: "/dist/cli.js" }).plan({
+  const inbox = new FileRuntimeEventInbox(home);
+  assert.deepEqual(inbox.list().map((event) => ({
+    scope: event.scope,
+    taskId: event.taskId,
+    roleName: event.roleName,
+    nativeSessionId: event.nativeSessionId,
+    turnId: event.turnId,
+    runId: event.runId,
+    summary: event.summary
+  })), [{
+    scope: "task",
     taskId: task.id,
     roleName: role.name,
-    agentId: agent.id,
-    adapterId: agent.adapterId,
-    // The durable Run may still say new when Codex notify won the race. The
-    // managed planner must recover the fixed thread, not create a second one.
-    mode: "new"
-  });
-  assert.deepEqual(retryPlan.launch.args.slice(-2), ["resume", "thread-native-1"]);
-  assert.equal(retryPlan.session.nativeSessionId, "thread-native-1");
+    nativeSessionId: "thread-native-1",
+    turnId: "turn-1",
+    runId: "agent-run-native-1",
+    summary: "done"
+  }]);
+  const revision = JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision;
+  await runSessionNotifyCommand(payload, environment, async () => ({}));
+  assert.equal(inbox.list().length, 1);
+  assert.equal(JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision, revision);
   await assert.rejects(
     runSessionNotifyCommand(JSON.stringify({ type: "other", "thread-id": "x" }), environment),
     /payload type is invalid/
   );
 });
 
-test("Codex notify persists directly when the Controller is offline", async (t) => {
+test("Codex notify remains queued when the Controller is offline", async (t) => {
   const { home, store, task, role, agent } = fixture(t);
   await runSessionNotifyCommand(JSON.stringify({
     type: "agent-turn-complete",
@@ -215,11 +262,10 @@ test("Codex notify persists directly when the Controller is offline", async (t) 
     YUI_ADAPTER_ID: "codex"
   });
 
-  assert.equal(
-    store.getRoleSession(task.id, role.name).nativeSessionId,
-    "thread-offline"
-  );
-  assert.equal(store.getRoleSession(task.id, role.name).status, "ready");
+  assert.equal(store.getRoleSession(task.id, role.name), null);
+  const [event] = new FileRuntimeEventInbox(home).list();
+  assert.equal(event.nativeSessionId, "thread-offline");
+  assert.equal(event.turnId, "turn-offline");
 });
 
 test("Codex turn completion releases a forgotten Leader active fence exactly once", async (t) => {
@@ -268,11 +314,7 @@ test("Codex turn completion releases a forgotten Leader active fence exactly onc
     "input-messages": [],
     "last-assistant-message": "Workers dispatched; waiting for their results."
   });
-  const dispatch = createSessionNotifyDispatcher(schedulerStore);
-
-  await runSessionNotifyCommand(payload, environment, async (_home, method, params) => (
-    dispatch(method, params)
-  ));
+  recordParsedTurnCompletion(schedulerStore, payload, environment);
 
   assert.equal(store.getActiveAgentRun(task.id, role.name), null);
   assert.equal(store.findAgentRun(run.id).status, "yielded");
@@ -286,14 +328,12 @@ test("Codex turn completion releases a forgotten Leader active fence exactly onc
   assert.deepEqual(store.getPendingWakeup(task.id).reasons, ["role-result"]);
   assert.equal(store.listMessages(task.id).filter((message) => message.runId === run.id).length, 1);
 
-  await runSessionNotifyCommand(payload, environment, async (_home, method, params) => (
-    dispatch(method, params)
-  ));
+  recordParsedTurnCompletion(schedulerStore, payload, environment);
   assert.equal(store.listMessages(task.id).filter((message) => message.runId === run.id).length, 1);
   assert.equal(store.getRoleSession(task.id, role.name).status, "ready");
 });
 
-test("a quiescent result-driven Leader turn completes the Task when the Agent forgets", async (t) => {
+test("a quiescent result-driven Leader turn queues recovery when the Agent forgets", async (t) => {
   const { home, store, task, role, agent, now } = fixture(t);
   const run = markAgentRunDelivered(createAgentRun(
     "agent-run-1",
@@ -335,17 +375,13 @@ test("a quiescent result-driven Leader turn completes the Task when the Agent fo
     "input-messages": [],
     "last-assistant-message": "Analysis complete and verified."
   });
-  const dispatch = createSessionNotifyDispatcher(schedulerStore);
+  recordParsedTurnCompletion(schedulerStore, payload, environment);
 
-  await runSessionNotifyCommand(payload, environment, async (_home, method, params) => (
-    dispatch(method, params)
-  ));
-
-  assert.equal(store.getTask(task.id).status, "completed");
-  assert.equal(store.getTask(task.id).completionSummary, "Analysis complete and verified.");
+  assert.equal(store.getTask(task.id).status, "active");
+  assert.equal(store.getTask(task.id).completionSummary, undefined);
   assert.equal(store.findAgentRun(run.id).status, "yielded");
   assert.equal(store.getActiveAgentRun(task.id, role.name), null);
-  assert.equal(store.getPendingWakeup(task.id), null);
+  assert.deepEqual(store.getPendingWakeup(task.id).reasons, ["leader-turn-unclosed"]);
 });
 
 test("a Worker turn that forgets to yield fails visibly and wakes the Leader", async (t) => {
@@ -392,15 +428,14 @@ test("a Worker turn that forgets to yield fails visibly and wakes the Leader", a
     "input-messages": [],
     "last-assistant-message": "I returned without calling Yui yield."
   });
-  const dispatch = createSessionNotifyDispatcher(schedulerStore);
-  await runSessionNotifyCommand(payload, {
+  recordParsedTurnCompletion(schedulerStore, payload, {
     YUI_HOME: home,
     YUI_SESSION_SCOPE: "task",
     YUI_TASK_ID: task.id,
     YUI_ROLE: worker.name,
     YUI_AGENT_ID: agent.id,
     YUI_ADAPTER_ID: "codex"
-  }, async (_home, method, params) => dispatch(method, params));
+  });
 
   assert.equal(store.findAgentRun(run.id).status, "failed");
   assert.match(store.findAgentRun(run.id).summary, /without yui task run yield/i);

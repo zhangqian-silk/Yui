@@ -5,6 +5,7 @@ import { createInputRequest } from "../../dist/input/inputRequest.js";
 import { createTaskMessage } from "../../dist/message/message.js";
 import {
   createInputRequestOperatorPresentation,
+  createLeaderRecoveryOperatorPresentation,
   createTaskMessageOperatorPresentation,
   createTaskTerminalOperatorPresentation
 } from "../../dist/interaction/operatorPresentation.js";
@@ -37,7 +38,8 @@ function inputRequest(policy) {
 
 test("required InputRequest becomes an attention presentation that only the user may answer", () => {
   const presentation = createInputRequestOperatorPresentation(
-    inputRequest({ kind: "required" })
+    inputRequest({ kind: "required" }),
+    { timeZone: "Asia/Shanghai" }
   );
 
   assert.deepEqual(
@@ -64,17 +66,30 @@ test("required InputRequest becomes an attention presentation that only the user
 });
 
 test("recommended InputRequest identifies its recommendation and automatic fallback deadline", () => {
-  const presentation = createInputRequestOperatorPresentation(inputRequest({
+  const request = inputRequest({
     kind: "recommended",
     recommendedChoiceKey: "safe",
     timeoutAt: TIMEOUT_AT
-  }));
+  });
+  const presentation = createInputRequestOperatorPresentation(
+    request,
+    { timeZone: "America/New_York" }
+  );
 
   assert.equal(presentation.category, "attention");
   assert.equal(presentation.receiptId, "input-request:input-7");
   assert.match(presentation.text, /Agent recommendation: safe: Safe rollout/);
-  assert.match(presentation.text, new RegExp(`Automatic fallback after: ${TIMEOUT_AT}`));
+  assert.match(
+    presentation.text,
+    /Automatic fallback after: 2026-07-22 21:05:00 -04:00/
+  );
+  assert.doesNotMatch(presentation.text, new RegExp(TIMEOUT_AT));
   assert.match(presentation.text, /do not answer or choose on the user's behalf/i);
+
+  assert.match(
+    createInputRequestOperatorPresentation(request, {}).text,
+    /Automatic fallback after: 2026-07-23 09:05:00 \+08:00/
+  );
 });
 
 test("free-text InputRequest renders the native answer command without inventing choices", () => {
@@ -94,10 +109,37 @@ test("free-text InputRequest renders the native answer command without inventing
     CREATED_AT
   );
 
-  const presentation = createInputRequestOperatorPresentation(request);
+  const presentation = createInputRequestOperatorPresentation(request, {});
   assert.match(presentation.text, /Answer type: free text/);
   assert.match(presentation.text, /yui task input answer input-8 --text "<answer>"/);
   assert.doesNotMatch(presentation.text, /Choices:/);
+});
+
+test("Leader recovery failure is an attention-only Operator presentation", () => {
+  const presentation = createLeaderRecoveryOperatorPresentation({
+    schemaVersion: 1,
+    taskId: "task-3",
+    type: "leader-recovery-failed",
+    message: "Leader ended two consecutive Turns without closing its Run.",
+    createdAt: CREATED_AT.toISOString(),
+    updatedAt: CREATED_AT.toISOString()
+  });
+
+  assert.deepEqual(
+    {
+      category: presentation.category,
+      receiptId: presentation.receiptId,
+      source: presentation.source
+    },
+    {
+      category: "attention",
+      receiptId: `leader-recovery:task-3:${CREATED_AT.toISOString()}`,
+      source: { kind: "leader-recovery", id: "task-3" }
+    }
+  );
+  assert.match(presentation.text, /needs user attention/i);
+  assert.match(presentation.text, /Leader ended two consecutive Turns/);
+  assert.match(presentation.text, /yui job show task-3/);
 });
 
 test("TaskMessage and Task terminal constructors remain narrow and deterministic", () => {

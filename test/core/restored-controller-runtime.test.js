@@ -16,8 +16,11 @@ import {
   MIN_RECONCILIATION_INTERVAL_SECONDS,
   reconciliationIntervalMilliseconds
 } from "../../dist/config/yuiConfig.js";
-import { callController } from "../../dist/core/controllerClient.js";
-import { ControllerClientError } from "../../dist/core/controllerClient.js";
+import {
+  callController,
+  ControllerClientError,
+  readControllerDiscovery
+} from "../../dist/core/controllerClient.js";
 import {
   FileTaskWorkflowRuntime,
   restartFileTaskController
@@ -27,15 +30,20 @@ import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 
 function emptyStore(events = []) {
   return {
+    getPresentationContext() { return { timeZone: "Asia/Shanghai" }; },
     listTasks() { events.push("list-tasks"); return []; },
     getTask() { return null; },
     listRoles() { return []; },
     getRole() { return null; },
     getActiveAgentRun() { return null; },
+    hasOpenInputRequest() { return false; },
     listOpenInputRequests() { return []; },
+    listPendingRuntimeTurnCompletions() { return []; },
     getOperatorDeliveryTarget() { return null; },
     resolveExpiredInputRecommendations() { return []; },
+    resolveDueRuntimeTurnCompletions() { return []; },
     getRoleSession() { return null; },
+    hasInFlightTurn() { return false; },
     nextAgentRunId() { return "run-1"; },
     getWorkMailbox() { return null; },
     listWorkMailboxes() { return []; },
@@ -68,7 +76,7 @@ const noTmux = {
   async stopTask() { return false; }
 };
 
-test("controller scheduler reconciles liveness before processing wakeups", async () => {
+test("controller scheduler folds completion and liveness phases before wakeups", async () => {
   const events = [];
   const result = await runControllerSchedulerPass(emptyStore(events), noTmux, new Date(0));
   assert.deepEqual(result, {
@@ -79,7 +87,7 @@ test("controller scheduler reconciles liveness before processing wakeups", async
     inputNotifications: [],
     autoResolvedInputs: []
   });
-  assert.deepEqual(events, ["list-tasks", "list-tasks", "list-wakeups"]);
+  assert.deepEqual(events, ["list-tasks", "list-tasks", "list-tasks", "list-wakeups"]);
 });
 
 test("periodic recovery skips active workspace scans without durable Task work", async () => {
@@ -95,7 +103,7 @@ test("periodic recovery skips active workspace scans without durable Task work",
     workspacePreparer
   );
   assert.deepEqual(events, [
-    "list-tasks", "list-tasks", "list-wakeups"
+    "list-tasks", "list-tasks", "list-tasks", "list-wakeups"
   ]);
 });
 
@@ -424,7 +432,7 @@ test("dirty Task reconciliation filters every Task phase and preserves workspace
   assert.deepEqual(events.filter((event) => event.startsWith("deadlines:")), [
     "deadlines:task-active,task-archived"
   ]);
-  assert.deepEqual(events.filter((event) => event.startsWith("wake:")).sort(), [
+  assert.deepEqual([...new Set(events.filter((event) => event.startsWith("wake:")))].sort(), [
     "wake:task-active", "wake:task-archived"
   ]);
 });
@@ -483,7 +491,7 @@ test("an Operator-only dirty pass does not scan Task phases", async () => {
   assert.equal(mailboxReads, 1);
 });
 
-test("Operator signals are processed while the Task lane is blocked", async () => {
+test("Operator attention is not blocked by a slow Task reconciliation", async () => {
   let releaseWorkspace;
   let workspaceStarted;
   const blocked = new Promise((resolve) => { releaseWorkspace = resolve; });
@@ -519,6 +527,7 @@ test("Operator signals are processed while the Task lane is blocked", async () =
   assert.equal(operatorReads, 1);
   releaseWorkspace();
   await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(operatorReads, 1);
   controller.stop();
 });
 
@@ -569,11 +578,67 @@ test("controller pump coalesces overlap into one non-overlapping follow-up pass"
   releaseFirst();
   await first;
 
-  // Each pass visits queued Work delivery and liveness; periodic archive and
-  // workspace recovery are driven only by durable Task mailboxes.
-  assert.equal(listCalls, 4);
+  // Each pass visits queued Work delivery, liveness, and orphan recovery. The
+  // first full pass also bootstraps exact missing-Hook recovery deadlines.
+  assert.equal(listCalls, 7);
   assert.equal(inspections, 2);
   assert.equal(maxActive, 1);
+  controller.stop();
+});
+
+test("an unapplied Hook event fences destructive scheduler phases", async () => {
+  let schedulerReads = 0;
+  const store = emptyStore();
+  store.listTasks = () => {
+    schedulerReads += 1;
+    return [];
+  };
+  const controller = new FileTaskController(store, noTmux, {
+    runtimeEventProcessor: {
+      drain() {
+        return {
+          acknowledgedEventIds: [],
+          failed: [{ eventId: "turn-failed", error: new Error("state unavailable") }]
+        };
+      }
+    }
+  });
+
+  await assert.rejects(controller.pump(), /native Turn events could not be applied/i);
+
+  assert.equal(schedulerReads, 0);
+  controller.stop();
+});
+
+test("a transient Hook apply failure retries quickly without another external signal", async () => {
+  let drains = 0;
+  let schedulerReads = 0;
+  const store = emptyStore();
+  store.listTasks = () => {
+    schedulerReads += 1;
+    return [];
+  };
+  const controller = new FileTaskController(store, noTmux, {
+    deliveryRetryMs: 2,
+    runtimeEventProcessor: {
+      drain() {
+        drains += 1;
+        return drains === 1
+          ? {
+              acknowledgedEventIds: [],
+              deferred: [],
+              failed: [{ eventId: "turn-transient", error: new Error("locked") }]
+            }
+          : { acknowledgedEventIds: [], deferred: [], failed: [] };
+      }
+    }
+  });
+
+  await assert.rejects(controller.pump(), /native Turn events could not be applied/i);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.ok(drains >= 3);
+  assert.ok(schedulerReads > 0);
   controller.stop();
 });
 
@@ -621,6 +686,42 @@ test("state changes enqueue a Controller signal without waiting for a full scan"
 
   assert.deepEqual(methods, ["scheduler.signal"]);
   assert.deepEqual(params, [{ key: "task:task-1" }]);
+});
+
+test("foreground enter asks the Controller to own session creation", async () => {
+  const calls = [];
+  const runtime = new FileTaskWorkflowRuntime(
+    "/tmp/yui-controller-owned-session",
+    {},
+    {},
+    { plan() { throw new Error("CLI planner must not run"); } },
+    { ensureRoleWindow() { throw new Error("CLI tmux creator must not run"); } },
+    undefined,
+    {
+      call: async (_home, method, params) => {
+        calls.push([method, params]);
+        return { ensured: true };
+      }
+    }
+  );
+
+  await runtime.prepareTaskRoleEnter({ taskId: "task-1", roleName: "leader" });
+  await runtime.prepareGlobalRoleEnter("operator");
+
+  assert.deepEqual(calls, [
+    ["runtime.ensure-role-session", {
+      scope: "task",
+      taskId: "task-1",
+      roleName: "leader"
+    }],
+    ["runtime.ensure-role-session", {
+      scope: "global",
+      roleName: "operator"
+    }],
+    ["scheduler.signal", {
+      key: "operator"
+    }]
+  ]);
 });
 
 test("explicit reconciliation prepares active Role worktrees before requesting a full scan", async () => {
@@ -773,9 +874,123 @@ test("a non-ready Role delivery uses bounded queued retries instead of blocking 
   store.saveRoleRunDelivery = ({ now }) => { run = { ...run, deliveredAt: now.toISOString() }; };
   const delivery = {
     ...noTmux,
-    async prepareRoleSession(input) { return { ...input, deliveryId: "delivery-1" }; },
+    async prepareRoleSession(input) {
+      return { ...input, deliveryId: "delivery-1", sessionStarted: true };
+    },
     async findExistingReceipt() { return null; },
     async waitUntilReady(prepared) { return { prepared, session: null }; },
+    async sendOnce() { sends += 1; return sends < 4 ? "busy" : "sent"; },
+    async inspectRole() { return "present"; }
+  };
+  const controller = new FileTaskController(store, delivery, {
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
+    deliveryRetryLimit: 5
+  });
+
+  controller.signal("role:task-1/worker");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.equal(sends, 4);
+  assert.notEqual(run.deliveredAt, undefined);
+  controller.stop();
+});
+
+test("a fresh Controller retries an undelivered Run in an existing busy pane", async () => {
+  const task = { id: "task-1", status: "active" };
+  const roleValue = role(task.id, "worker");
+  const run = {
+    ...deliveredRun(task.id, roleValue.name),
+    mode: "resume"
+  };
+  delete run.deliveredAt;
+  let sends = 0;
+  const store = emptyStore();
+  store.getTask = () => task;
+  store.getRole = () => roleValue;
+  store.getActiveAgentRun = () => run;
+  store.getRoleSession = () => ({
+    agentId: roleValue.activeAgentId,
+    adapterId: roleValue.adapterId,
+    nativeSessionId: "thread-existing",
+    status: "running"
+  });
+  store.claimWorkMailbox = () => ({
+    status: "processing",
+    processing: {
+      batchId: `agent-run:${run.id}`,
+      batch: {
+        fromSequence: 1, toSequence: 1, reasons: ["run-dispatched"], refs: [{ type: "run", id: run.id }],
+        requestCount: 1, firstQueuedAt: new Date(0).toISOString(), lastQueuedAt: new Date(0).toISOString()
+      },
+      owner: "controller", startedAt: new Date(0).toISOString(),
+      executionRef: { type: "run", id: run.id }
+    }
+  });
+  const delivery = {
+    ...noTmux,
+    async prepareRoleSession(input) {
+      return { ...input, deliveryId: "delivery-resume", sessionStarted: false };
+    },
+    async findExistingReceipt() { return null; },
+    async waitUntilReady(prepared) {
+      return { prepared, session: store.getRoleSession() };
+    },
+    async sendOnce() { sends += 1; return sends < 3 ? "busy" : "sent"; },
+    async inspectRole() { return "present"; }
+  };
+  const controller = new FileTaskController(store, delivery, {
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
+    deliveryRetryLimit: 2
+  });
+
+  controller.signal("role:task-1/worker");
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  assert.equal(sends, 3);
+  controller.stop();
+});
+
+test("a resumed Role retries startup readiness when prepare created its missing pane", async () => {
+  const task = { id: "task-1", status: "active" };
+  const roleValue = role(task.id, "worker");
+  const run = { ...deliveredRun(task.id, roleValue.name), mode: "resume" };
+  delete run.deliveredAt;
+  let sends = 0;
+  const store = emptyStore();
+  store.getTask = () => task;
+  store.getRole = () => roleValue;
+  store.getActiveAgentRun = () => run;
+  store.getRoleSession = () => ({
+    agentId: roleValue.activeAgentId,
+    adapterId: roleValue.adapterId,
+    nativeSessionId: "thread-existing",
+    status: "running"
+  });
+  store.claimWorkMailbox = () => ({
+    status: "processing",
+    processing: {
+      batchId: `agent-run:${run.id}`,
+      batch: {
+        fromSequence: 1, toSequence: 1, reasons: ["run-dispatched"],
+        refs: [{ type: "run", id: run.id }], requestCount: 1,
+        firstQueuedAt: new Date(0).toISOString(),
+        lastQueuedAt: new Date(0).toISOString()
+      },
+      owner: "controller", startedAt: new Date(0).toISOString(),
+      executionRef: { type: "run", id: run.id }
+    }
+  });
+  const delivery = {
+    ...noTmux,
+    async prepareRoleSession(input) {
+      return { ...input, deliveryId: "delivery-resume-recreated", sessionStarted: true };
+    },
+    async findExistingReceipt() { return null; },
+    async waitUntilReady(prepared) {
+      return { prepared, session: store.getRoleSession() };
+    },
     async sendOnce() { sends += 1; return sends === 1 ? "busy" : "sent"; },
     async inspectRole() { return "present"; }
   };
@@ -789,7 +1004,6 @@ test("a non-ready Role delivery uses bounded queued retries instead of blocking 
   await new Promise((resolve) => setTimeout(resolve, 25));
 
   assert.equal(sends, 2);
-  assert.notEqual(run.deliveredAt, undefined);
   controller.stop();
 });
 
@@ -882,6 +1096,36 @@ test("a stopped Controller instance cannot be restarted or accept signals", () =
   assert.throws(() => controller.signal("task:task-1"), /stopped/i);
 });
 
+test("Controller shutdown waits for the in-flight reconciliation to drain", async () => {
+  let release;
+  let started;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  const entered = new Promise((resolve) => { started = resolve; });
+  const store = emptyStore();
+  store.listTasks = () => [{ id: "task-1", status: "active" }];
+  store.listRoles = () => [role("task-1", "worker")];
+  store.getActiveAgentRun = () => deliveredRun("task-1", "worker");
+  const delivery = {
+    ...noTmux,
+    async inspectRole() {
+      started();
+      await blocked;
+      return "present";
+    }
+  };
+  const controller = new FileTaskController(store, delivery);
+  const pass = controller.pump();
+  await entered;
+  let drained = false;
+  const shutdown = controller.shutdownAndDrain().then(() => { drained = true; });
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(drained, false);
+  release();
+  await Promise.all([pass, shutdown]);
+  assert.equal(drained, true);
+});
+
 test("background FileTask controller exposes status, scan and stop on one private home socket", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-file-controller-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
@@ -904,8 +1148,46 @@ test("background FileTask controller exposes status, scan and stop on one privat
     inputNotifications: [],
     autoResolvedInputs: []
   });
+  assert.deepEqual(await callController(home, "scheduler.configure", {
+    reconciliationIntervalSeconds: 45
+  }), {
+    configured: true,
+    reconciliationIntervalMs: 45_000
+  });
+  assert.equal(controller.runtime.reconciliationIntervalMs, 45_000);
   assert.deepEqual(await callController(home, "controller.stop", {}), { stopped: true });
   await controller.closed;
+});
+
+test("Controller stop keeps discovery owned until in-flight work has drained", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-file-controller-drain-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  let release;
+  let started;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  const entered = new Promise((resolve) => { started = resolve; });
+  const store = emptyStore();
+  store.listTasks = () => [{ id: "task-1", status: "active" }];
+  store.listRoles = () => [role("task-1", "worker")];
+  store.getActiveAgentRun = () => deliveredRun("task-1", "worker");
+  const delivery = {
+    ...noTmux,
+    async inspectRole() {
+      started();
+      await blocked;
+      return "present";
+    }
+  };
+  const controller = await startFileTaskController(home, store, delivery, undefined, {
+    intervalMs: 60_000
+  });
+  await entered;
+
+  assert.deepEqual(await callController(home, "controller.stop", {}), { stopped: true });
+  assert.equal((await readControllerDiscovery(home)).pid, process.pid);
+  release();
+  await controller.closed;
+  await assert.rejects(readControllerDiscovery(home), /not running/i);
 });
 
 test("production FileTask controller composition starts without compact SQLite runtime", async (t) => {

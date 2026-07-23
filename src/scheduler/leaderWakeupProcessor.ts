@@ -1,4 +1,5 @@
 import { createAgentRun } from "../run/agentRun.js";
+import { markYuiRunInput } from "../run/runIdentity.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
 import { createLeaderRecoveryNotification } from "./operatorNotification.js";
 import type {
@@ -69,14 +70,14 @@ export async function processLeaderWakeups(
     try {
       const mode = hasNativeSession(existingSession) ? "resume" : "new";
       const runId = store.nextAgentRunId(task.id);
-      const input = leaderWakeupInput(
+      const input = markYuiRunInput(leaderWakeupInput(
         task.id,
         runId,
         wakeup.reasons,
         store.getTaskBrief(task.id),
         store.listDecisions(task.id),
         store.listMilestones(task.id)
-      );
+      ), runId);
       run = createAgentRun(
         runId,
         task.id,
@@ -85,6 +86,19 @@ export async function processLeaderWakeups(
         input,
         now
       );
+      const claim = store.saveLeaderDispatch({
+        task,
+        role,
+        run,
+        session: existingSession,
+        wakeup,
+        now
+      });
+      if (claim !== "claimed") {
+        results.push({ taskId: task.id, status: "skipped", reason: claim });
+        continue;
+      }
+      claimed = true;
       const prepared = await delivery.prepareRoleSession({
         taskId: task.id,
         roleName: role.name,
@@ -92,6 +106,7 @@ export async function processLeaderWakeups(
         adapterId: role.adapterId,
         workspace: role.workspace,
         mode,
+        runId: run.id,
         ...(mode === "resume" ? { nativeSessionId: existingSession!.nativeSessionId } : {})
       });
       const ready = await delivery.waitUntilReady(prepared);
@@ -101,12 +116,7 @@ export async function processLeaderWakeups(
         continue;
       }
       effectiveSession = validateReadySession(role.activeAgentId, existingSession, mode, ready.session);
-      const claim = store.saveLeaderDispatch({ task, role, run, session: effectiveSession, wakeup, now });
-      if (claim !== "claimed") {
-        results.push({ taskId: task.id, status: "skipped", reason: claim });
-        continue;
-      }
-      claimed = true;
+      store.saveRoleRunPrepared({ task, role, run, session: effectiveSession, now });
       deliveryAttempted = true;
       const outcome = await delivery.sendOnce({
         delivery: ready,
@@ -124,43 +134,58 @@ export async function processLeaderWakeups(
       }
 
       store.saveRoleRunDelivery({ task, role, run, session: effectiveSession, now });
-      results.push({ taskId: task.id, status: "dispatched" });
+      results.push({ taskId: task.id, runId: run.id, status: "dispatched" });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       const message = `Leader dispatch failed: ${detail}`;
-      // Once a durable Run owns the mailbox, a send may have succeeded even
-      // when receipt observation or the following aggregate write failed.
-      // Keep that Run and receipt identity intact for active-run recovery.
       if (claimed && run !== null) {
-        results.push({
-          taskId: task.id,
-          runId: run.id,
-          status: "failed",
-          reason: deliveryAttempted ? "delivery-uncertain" : "not-ready",
-          error: message
+        // Once delivery begins, a send may have succeeded even when receipt
+        // observation or the aggregate write failed. Preserve the exact
+        // durable Run and let receipt-backed active delivery recover it.
+        if (deliveryAttempted) {
+          results.push({
+            taskId: task.id,
+            runId: run.id,
+            status: "failed",
+            reason: "delivery-uncertain",
+            error: message
+          });
+          continue;
+        }
+        const failureResult = store.saveLeaderDispatchFailure({
+          task,
+          role,
+          session: effectiveSession,
+          claimed: { run, wakeup },
+          failure: recordLeaderFailure(
+            task.id,
+            effectiveSession?.nativeSessionId ?? "(unregistered)",
+            message,
+            now,
+            store.getLeaderFailure(task.id)
+          ),
+          notification: createLeaderRecoveryNotification(
+            task.id,
+            message,
+            now,
+            store.getOperatorNotification(task.id)
+          ),
+          now
         });
+        if (failureResult === "state-changed") {
+          results.push({ taskId: task.id, status: "skipped", reason: "state-changed" });
+        } else {
+          results.push({ taskId: task.id, runId: run.id, status: "failed", error: message });
+        }
         continue;
       }
-      store.saveLeaderDispatchFailure({
-        task,
-        role,
-        session: effectiveSession,
-        failure: recordLeaderFailure(
-          task.id,
-          effectiveSession?.nativeSessionId ?? "(unregistered)",
-          message,
-          now,
-          store.getLeaderFailure(task.id)
-        ),
-        notification: createLeaderRecoveryNotification(
-          task.id,
-          message,
-          now,
-          store.getOperatorNotification(task.id)
-        ),
-        now
+      results.push({
+        taskId: task.id,
+        runId: run?.id,
+        status: "failed",
+        reason: "not-ready",
+        error: message
       });
-      results.push({ taskId: task.id, status: "failed", error: message });
     }
   }
   return results;

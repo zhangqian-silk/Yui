@@ -27,6 +27,28 @@ test("readiness resolver distinguishes Codex node composer and Claude prompt mar
     ...base,
     currentCommand: "node",
     content: [
+      "• Working (1m 10s • esc to interrupt)",
+      "",
+      "› Summarize recent commits",
+      "",
+      "gpt-5.6-sol medium · /tmp/workspace"
+    ].join("\n")
+  }), false);
+  assert.equal(codex({
+    ...base,
+    currentCommand: "node",
+    content: [
+      "Would you like to run this command?",
+      "› 1. Yes, proceed",
+      "  2. No",
+      "Press enter to confirm or esc to cancel",
+      "gpt-5.6-sol medium · /tmp/workspace"
+    ].join("\n")
+  }), false);
+  assert.equal(codex({
+    ...base,
+    currentCommand: "node",
+    content: [
       ...Array.from({ length: 40 }, (_, index) => `completed transcript line ${index}`),
       "",
       "› Summarize recent commits",
@@ -41,6 +63,11 @@ test("readiness resolver distinguishes Codex node composer and Claude prompt mar
     content: "OpenAI Codex\nUpdate available\nPress enter to continue\n› \n/model to change\n"
   }), false);
   assert.equal(claude({ ...base, currentCommand: "claude", content: "hello\n❯ \n" }), true);
+  assert.equal(claude({
+    ...base,
+    currentCommand: "claude",
+    content: "❯ old prompt\nWorking… press ctrl-c to interrupt\n"
+  }), false);
   assert.equal(claude({ ...base, currentCommand: "claude", content: "thinking…\n" }), false);
 });
 
@@ -163,8 +190,13 @@ test("production runtime ports launch and attempt delivery without the legacy re
 
   const prepared = await registry.prepareRoleSession({
     taskId: "task-1", roleName: "leader", agentId: "codex", adapterId: "codex",
-    workspace: "/tmp/workspace", mode: "new"
+    workspace: "/tmp/workspace", mode: "new", runId: "run-1"
   });
+  const retriedPrepare = await registry.prepareRoleSession({
+    taskId: "task-1", roleName: "leader", agentId: "codex", adapterId: "codex",
+    workspace: "/tmp/workspace", mode: "new", runId: "run-1"
+  });
+  assert.equal(retriedPrepare, prepared);
   const ready = await registry.waitUntilReady(prepared);
   assert.equal(await registry.sendOnce({ delivery: ready, receiptId: "agent-run:run-1", text: "lead" }), "busy");
   pushOutcome = "delivered";
@@ -213,6 +245,66 @@ test("runtime launch plans Claude once and reports the native session actually h
 
   assert.equal(plans, 1);
   assert.equal(ready.session.nativeSessionId, "claude-hosted-1");
+});
+
+test("runtime-backed delivery still checks the tmux receipt before treating a send as fresh", async () => {
+  let pushes = 0;
+  const planner = {
+    plan(input) {
+      return {
+        role: { name: input.roleName, workspace: "/tmp/workspace" },
+        launch: { command: "codex", args: [], env: {} },
+        session: null
+      };
+    }
+  };
+  const tmux = {
+    ensureRoleWindow() { throw new Error("legacy launch must not run"); },
+    waitUntilReady() { throw new Error("legacy readiness must not run"); },
+    sendRoleInputOnce() { throw new Error("legacy send must not run"); },
+    sendRoleInputOnceIfReady() { throw new Error("unused"); },
+    hasDeliveryReceipt() { throw new Error("async receipt path should win"); },
+    async hasDeliveryReceiptAsync() { return true; },
+    probeRoleStatus() { return "running"; },
+    stopTask() { return false; }
+  };
+  const registry = new ExecutorRegistry(planner, tmux, undefined, {
+    sessionHost: {
+      async start(request) {
+        return {
+          id: "binding-receipt",
+          launchId: request.launchId,
+          owner: request.owner,
+          agentId: request.agentId,
+          adapterId: request.adapterId,
+          hostRef: "opaque",
+          hostCreated: false
+        };
+      },
+      async resume() { throw new Error("unused"); },
+      async stop() {},
+      async inspect() { return { state: "running" }; }
+    },
+    promptPush: {
+      async tryPush() { pushes += 1; return "delivered"; }
+    }
+  });
+  const prepared = await registry.prepareRoleSession({
+    taskId: "task-1",
+    roleName: "leader",
+    agentId: "codex",
+    adapterId: "codex",
+    workspace: "/tmp/workspace",
+    mode: "new"
+  });
+
+  const existing = await registry.findExistingReceipt({
+    delivery: prepared,
+    receiptId: "agent-run:run-1"
+  });
+
+  assert.notEqual(existing, null);
+  assert.equal(pushes, 0);
 });
 
 test("Operator input notification never launches a pane or waits for a busy composer", async () => {

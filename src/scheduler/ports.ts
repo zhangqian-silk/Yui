@@ -103,9 +103,9 @@ export type LeaderDispatchFailurePersistence = Readonly<{
   task: SchedulerTask;
   role: SchedulerRole;
   session: SchedulerRoleSession | null;
+  claimed: Readonly<{ run: SchedulerAgentRun; wakeup: PendingWakeup }>;
   failure: LeaderFailure;
   notification: OperatorNotification;
-  claimed?: Readonly<{ run: SchedulerAgentRun; wakeup: PendingWakeup }>;
   now: Date;
 }>;
 
@@ -114,6 +114,7 @@ export type LeaderDispatchFailurePersistence = Readonly<{
  * Role/session-set model and performs each multi-record persistence operation.
  */
 export interface SchedulerStorePort {
+  getPresentationContext(): Readonly<{ timeZone?: unknown }>;
   listTasks(): readonly SchedulerTask[];
   getTask(taskId: string): SchedulerTask | null;
   listRoles(taskId: string): readonly SchedulerRole[];
@@ -141,6 +142,7 @@ export interface SchedulerStorePort {
   claimWorkMailbox(input: SchedulerMailboxClaimInput): SchedulerMailboxClaimResult;
   completeWorkMailbox(target: MailboxTarget, batchId: string): boolean;
   releaseWorkMailbox(target: MailboxTarget, batchId: string): boolean;
+  queueTaskProgress(taskId: string, reason: string, now: Date): void;
 
   getPendingWakeup(taskId: string): PendingWakeup | null;
   listPendingWakeups(): readonly PendingWakeup[];
@@ -159,9 +161,16 @@ export interface SchedulerStorePort {
   /** Persist successful delivery of a Work AgentRun and its fixed session. */
   saveRoleRunDelivery(input: RoleRunDeliveryPersistence): void;
   /** Persist LeaderFailure, OperatorNotification and failed/broken runtime state. */
-  saveLeaderDispatchFailure(input: LeaderDispatchFailurePersistence): void;
+  saveLeaderDispatchFailure(input: LeaderDispatchFailurePersistence): "failed" | "state-changed";
   /** Fail the run and running WorkItem, clear active-run, and stop the Role session. */
-  saveExitedRoleRun(input: ExitedRoleRunPersistence): void;
+  saveExitedRoleRun(input: ExitedRoleRunPersistence): "failed" | "state-changed";
+  /** Synthesizes the same durable Turn boundary when a full safety scan sees the composer ready. */
+  recoverReadyRoleRun?(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    now: Date;
+  }>): void;
   /** Mark every recorded Task Role session stopped after tmux termination. */
   saveArchivedTaskStopped(taskId: string, now: Date): void;
 }
@@ -208,6 +217,8 @@ export type PreparedRoleDelivery = Readonly<{
   agentId: string;
   adapterId: string;
   mode: RoleSessionLaunchMode;
+  /** The prepare request created a new external Role window/process. */
+  sessionStarted: boolean;
 }>;
 
 export type ReadyRoleDelivery = Readonly<{
@@ -229,6 +240,7 @@ export interface TmuxDeliveryPort {
     adapterId: string;
     workspace: string;
     mode: RoleSessionLaunchMode;
+    runId?: string;
     nativeSessionId?: string;
   }>): Promise<PreparedRoleDelivery>;
   waitUntilReady(delivery: PreparedRoleDelivery): Promise<ReadyRoleDelivery>;
@@ -251,6 +263,14 @@ export interface TmuxDeliveryPort {
     adapterId: string;
     nativeSessionId?: string;
   }>): Promise<"present" | "absent">;
+  /** Full-reconciliation safety probe for a missing native Turn Hook. */
+  inspectRoleReadiness?(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    adapterId: string;
+    nativeSessionId?: string;
+  }>): Promise<"ready" | "busy" | "absent">;
   inspectRoles?(inputs: readonly Readonly<{
     taskId: string;
     roleName: string;
