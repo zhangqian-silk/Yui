@@ -8,7 +8,12 @@ import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerSt
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
 import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
-import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
+import { updateRoleAgentSessionStatus } from "../../dist/executor/agentExecutor.js";
+import {
+  createGlobalRole,
+  createRole,
+  createRoleAgentBinding
+} from "../../dist/role/role.js";
 import { createAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
 import { processActiveRoleRunDeliveries } from "../../dist/scheduler/activeRoleRunDelivery.js";
 import { processLeaderWakeups } from "../../dist/scheduler/leaderWakeupProcessor.js";
@@ -80,7 +85,6 @@ test("a busy Leader claim is retried through active Run delivery without another
     async prepareRoleSession(input) {
       return { ...input, deliveryId: `delivery-${input.runId}`, sessionStarted: false };
     },
-    async findExistingReceipt() { return null; },
     async waitUntilReady(prepared) { return { prepared, session: null }; },
     async sendOnce() {
       sends += 1;
@@ -287,7 +291,6 @@ test("runtime Turn completion waits for the two-second grace deadline before clo
     },
     now
   });
-
   const observed = adapter.observeRuntimeTurnCompleted({
     taskId: task.id,
     roleName: role.name,
@@ -398,6 +401,234 @@ test("a matching Hook proves delivery across the receipt persistence crash windo
     run.id
   );
 });
+
+test("a Hook replay is idempotent after state commit succeeds and inbox ack crashes", (t) => {
+  const { home, store, task, role, now, adapter } = fixture(t);
+  const run = createAgentRun("agent-run-ack-crash", task.id, role.name, "new", "continue", now);
+  assert.equal(adapter.saveLeaderDispatch({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: null,
+    wakeup: store.getPendingWakeup(task.id),
+    now
+  }), "claimed");
+  adapter.saveRoleRunDelivery({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: {
+      agentId: "codex",
+      adapterId: "codex",
+      nativeSessionId: "thread-ack-crash",
+      status: "ready"
+    },
+    now
+  });
+  const inbox = new FileRuntimeEventInbox(home, () => now);
+  inbox.enqueueTurnCompleted({
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name,
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "thread-ack-crash",
+    turnId: "turn-ack-crash",
+    runId: run.id,
+    summary: "state committed before ack"
+  });
+  const crashingProcessor = new FileRuntimeEventProcessor({
+    list: () => inbox.list(),
+    acknowledge() {
+      throw new Error("process crashed before inbox ack");
+    }
+  }, adapter);
+
+  const first = crashingProcessor.drain(now);
+  assert.equal(first.failed.length, 1);
+  const pendingBeforeRestart = store
+    .getTaskRoleSessionSet(task.id, role.name)
+    .pendingTurnCompletion;
+  const stateBeforeReplay = readFileSync(join(home, "state.json"), "utf8");
+  assert.equal(inbox.list().length, 1);
+
+  const restartedStore = new FileTaskStore(home);
+  const restartedAdapter = new FileSchedulerStoreAdapter(restartedStore);
+  const replayed = new FileRuntimeEventProcessor(inbox, restartedAdapter).drain(
+    new Date(now.getTime() + 500)
+  );
+
+  assert.equal(replayed.failed.length, 0);
+  assert.equal(replayed.acknowledgedEventIds.length, 1);
+  assert.deepEqual(
+    restartedStore.getTaskRoleSessionSet(task.id, role.name).pendingTurnCompletion,
+    pendingBeforeRestart
+  );
+  assert.equal(readFileSync(join(home, "state.json"), "utf8"), stateBeforeReplay);
+  assert.deepEqual(inbox.list(), []);
+  assert.deepEqual(
+    restartedAdapter.resolveDueRuntimeTurnCompletions(
+      new Date(now.getTime() + 2_000)
+    ),
+    [run.id]
+  );
+  assert.equal(restartedStore.getActiveAgentRun(task.id, role.name), null);
+});
+
+test("an obsolete Hook cannot claim the native session of the current Run", (t) => {
+  const { home, store, task, role, now, adapter } = fixture(t);
+  const run = createAgentRun("agent-run-current-native", task.id, role.name, "new", "continue", now);
+  assert.equal(adapter.saveLeaderDispatch({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: null,
+    wakeup: store.getPendingWakeup(task.id),
+    now
+  }), "claimed");
+  adapter.saveRoleRunDelivery({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: null,
+    now
+  });
+  adapter.reserveRuntimeLaunch({
+    owner: {
+      scope: "task",
+      taskId: task.id,
+      roleName: role.name
+    },
+    launchId: "launch-current-native"
+  }, () => {});
+  const times = [
+    now,
+    new Date(now.getTime() + 1)
+  ];
+  const inbox = new FileRuntimeEventInbox(home, () => times.shift());
+  const common = {
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name,
+    agentId: "codex",
+    adapterId: "codex",
+    launchId: "launch-current-native",
+    summary: "done"
+  };
+  inbox.enqueueTurnCompleted({
+    ...common,
+    nativeSessionId: "thread-obsolete",
+    turnId: "turn-obsolete",
+    runId: "agent-run-obsolete"
+  });
+  inbox.enqueueTurnCompleted({
+    ...common,
+    nativeSessionId: "thread-current",
+    turnId: "turn-current",
+    runId: run.id
+  });
+  assert.equal(
+    adapter.classifyRuntimeTurnCompleted({
+      ...common,
+      nativeSessionId: "thread-current",
+      turnId: "turn-current",
+      runId: run.id
+    }),
+    "apply"
+  );
+  assert.equal(inbox.list()[1].launchId, "launch-current-native");
+
+  const result = new FileRuntimeEventProcessor(inbox, adapter).drain(
+    new Date(now.getTime() + 2)
+  );
+
+  assert.equal(result.failed.length, 0);
+  assert.equal(result.acknowledgedEventIds.length, 2);
+  const sessions = store.getTaskRoleSessionSet(task.id, role.name);
+  assert.equal(sessions.sessions[role.activeAgentId].nativeSessionId, "thread-current");
+  assert.equal(sessions.pendingTurnCompletion.runId, run.id);
+  assert.deepEqual(inbox.list(), []);
+});
+
+for (const terminalStatus of ["stopped", "broken"]) {
+  test(`a late Hook preserves a ${terminalStatus} native session`, (t) => {
+    const { store, task, role, now, adapter } = fixture(t);
+    adapter.recordRuntimeNativeSession({
+      taskId: task.id,
+      roleName: role.name,
+      agentId: role.activeAgentId,
+      adapterId: "codex",
+      nativeSessionId: `thread-${terminalStatus}`
+    }, now);
+    store.transaction((tx) => {
+      const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
+      tx.saveTaskRoleSessionSet(updateRoleAgentSessionStatus(
+        sessions,
+        role.activeAgentId,
+        terminalStatus,
+        new Date(now.getTime() + 1)
+      ));
+    });
+
+    adapter.observeRuntimeTurnCompleted({
+      taskId: task.id,
+      roleName: role.name,
+      agentId: role.activeAgentId,
+      adapterId: "codex",
+      nativeSessionId: `thread-${terminalStatus}`,
+      turnId: `turn-late-${terminalStatus}`,
+      summary: "late native completion"
+    }, new Date(now.getTime() + 2));
+
+    const session = store.getRoleSession(task.id, role.name);
+    assert.equal(session.status, terminalStatus);
+    assert.deepEqual(session.recentCompletedTurnIds, [`turn-late-${terminalStatus}`]);
+  });
+}
+
+for (const terminalStatus of ["stopped", "broken"]) {
+  test(`a late global Hook preserves a ${terminalStatus} native session`, (t) => {
+    const { home, store, now, adapter } = fixture(t);
+    const role = createGlobalRole(
+      `operator-${terminalStatus}`,
+      [createRoleAgentBinding({ id: "codex", adapterId: "codex" })],
+      "codex",
+      home,
+      now
+    );
+    store.saveGlobalRole(role);
+    adapter.recordGlobalRuntimeNativeSession({
+      roleName: role.name,
+      agentId: role.activeAgentId,
+      adapterId: "codex",
+      nativeSessionId: `thread-global-${terminalStatus}`
+    }, now);
+    store.transaction((tx) => {
+      const sessions = tx.getGlobalRoleSessionSet(role.name);
+      tx.saveGlobalRoleSessionSet(updateRoleAgentSessionStatus(
+        sessions,
+        role.activeAgentId,
+        terminalStatus,
+        new Date(now.getTime() + 1)
+      ));
+    });
+
+    adapter.observeGlobalRuntimeTurnCompleted({
+      roleName: role.name,
+      agentId: role.activeAgentId,
+      adapterId: "codex",
+      nativeSessionId: `thread-global-${terminalStatus}`,
+      turnId: `turn-global-late-${terminalStatus}`
+    }, new Date(now.getTime() + 2));
+
+    const session = store.getGlobalRoleSessionSet(role.name).sessions[role.activeAgentId];
+    assert.equal(session.status, terminalStatus);
+    assert.deepEqual(
+      session.recentCompletedTurnIds,
+      [`turn-global-late-${terminalStatus}`]
+    );
+  });
+}
 
 test("a Hook classified for Run A cannot close Run B after an intervening dispatch", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
@@ -735,7 +966,7 @@ test("a repeated unclosed Leader recovery escalates and notifies Operator once",
   assert.equal(store.getWorkMailbox({ kind: "operator" }).processing, null);
 });
 
-test("an explicit yield retains the Turn fence until its matching Hook arrives", (t) => {
+test("a partial low-level Run mutation remains fenced until its matching Hook repairs it", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
   const first = createAgentRun("agent-run-first", task.id, role.name, "new", "first", now);
   assert.equal(adapter.saveLeaderDispatch({
@@ -821,6 +1052,7 @@ test("Worker delivery claims and binds its mailbox before external work, then re
     enqueueWork(tx, target, "run-dispatched", now, [{ type: "run", id: run.id }]);
   });
   let observedBound = false;
+  const forgotten = [];
   const delivery = {
     async prepareRoleSession() {
       const processing = store.getWorkMailbox(target).processing;
@@ -830,6 +1062,7 @@ test("Worker delivery claims and binds its mailbox before external work, then re
     },
     async waitUntilReady() { throw new Error("unexpected readiness"); },
     async sendOnce() { throw new Error("unexpected send"); },
+    forgetPrepared(input) { forgotten.push(input); },
     async inspectRole() { return "present"; },
     async stopTask() { return true; }
   };
@@ -838,6 +1071,11 @@ test("Worker delivery claims and binds its mailbox before external work, then re
 
   assert.equal(observedBound, true);
   assert.equal(result.status, "failed");
+  assert.deepEqual(forgotten, [{
+    taskId: task.id,
+    roleName: worker.name,
+    runId: run.id
+  }]);
   const released = store.getWorkMailbox(target);
   assert.equal(released.processing, null);
   assert.ok(released.pending.refs.some((ref) => ref.type === "run" && ref.id === run.id));
@@ -865,7 +1103,6 @@ test("Worker busy retry persists and reuses the hosted native session before del
     async prepareRoleSession(input) {
       return { ...input, deliveryId: "delivery-worker" };
     },
-    async findExistingReceipt() { return null; },
     async waitUntilReady(prepared) {
       const persisted = store.getRoleSession(task.id, worker.name)?.nativeSessionId;
       return {
@@ -1019,6 +1256,226 @@ test("reconfirming an already delivered active run does not rewrite authoritativ
   });
 
   assert.equal(JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision, before);
+});
+
+test("confirmed Task and global runtime cleanup also stops their persisted sessions", (t) => {
+  const { home, store, task, role, now, adapter } = fixture(t);
+  const globalRole = createGlobalRole(
+    "operator",
+    [createRoleAgentBinding({ id: "codex", adapterId: "codex" })],
+    "codex",
+    home,
+    now
+  );
+  store.saveGlobalRole(globalRole);
+  adapter.recordRuntimeNativeSession({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-task"
+  }, now);
+  adapter.recordGlobalRuntimeNativeSession({
+    roleName: globalRole.name,
+    agentId: globalRole.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-global"
+  }, now);
+  const taskOwner = {
+    scope: "task", taskId: task.id, roleName: role.name
+  };
+  const globalOwner = { scope: "global", roleName: globalRole.name };
+  assert.deepEqual(
+    adapter.listDormantRuntimeOwners().map((candidate) => candidate.owner),
+    [taskOwner, globalOwner]
+  );
+  const taskTarget = adapter.enqueueRuntimeCleanup(taskOwner, now);
+  const globalTarget = adapter.enqueueRuntimeCleanup(globalOwner, now);
+  const stoppedAt = new Date(now.getTime() + 1);
+
+  assert.equal(adapter.completeRuntimeCleanup(taskTarget, stoppedAt), true);
+  assert.equal(adapter.completeRuntimeCleanup(globalTarget, stoppedAt), true);
+
+  assert.equal(store.getRoleSession(task.id, role.name).status, "stopped");
+  assert.equal(
+    store.getGlobalRoleSessionSet(globalRole.name)
+      .sessions[globalRole.activeAgentId].status,
+    "stopped"
+  );
+  assert.equal(store.getWorkMailbox(taskTarget), null);
+  assert.equal(store.getWorkMailbox(globalTarget), null);
+});
+
+test("a confirmed-absent exact reservation is cleared with its Task session stopped", (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  const owner = { scope: "task", taskId: task.id, roleName: role.name };
+  adapter.recordRuntimeNativeSession({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-old"
+  }, now);
+  adapter.reserveRuntimeLaunch(
+    { owner, launchId: "launch-stale" },
+    () => {},
+    now
+  );
+
+  assert.equal(adapter.completeStoppedRuntimeReservation(
+    { kind: "role-runtime", taskId: task.id, roleName: role.name },
+    "launch-stale",
+    new Date(now.getTime() + 1)
+  ), true);
+
+  assert.equal(store.getRoleSession(task.id, role.name).status, "stopped");
+  assert.equal(
+    store.getWorkMailbox({
+      kind: "role-runtime", taskId: task.id, roleName: role.name
+    }),
+    null
+  );
+});
+
+test("settling a stopped launch handles the exact reservation and Hook-won race atomically", (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  const owner = { scope: "task", taskId: task.id, roleName: role.name };
+  adapter.recordRuntimeNativeSession({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-1"
+  }, now);
+  adapter.reserveRuntimeLaunch(
+    { owner, launchId: "launch-exact" },
+    () => {},
+    now
+  );
+
+  assert.equal(adapter.settleStoppedRuntimeLaunch({
+    owner,
+    launchId: "launch-exact",
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-1"
+  }, new Date(now.getTime() + 1)), true);
+  assert.equal(store.getRoleSession(task.id, role.name).status, "stopped");
+
+  adapter.reserveRuntimeLaunch(
+    { owner, launchId: "launch-hook-won" },
+    () => {},
+    new Date(now.getTime() + 2)
+  );
+  adapter.recordReservedRuntimeNativeSession({
+    owner,
+    launchId: "launch-hook-won",
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-1"
+  }, () => {}, new Date(now.getTime() + 3));
+  assert.equal(
+    store.getWorkMailbox({
+      kind: "role-runtime", taskId: task.id, roleName: role.name
+    }),
+    null
+  );
+
+  assert.equal(adapter.settleStoppedRuntimeLaunch({
+    owner,
+    launchId: "launch-hook-won",
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-1"
+  }, new Date(now.getTime() + 4)), true);
+  assert.equal(store.getRoleSession(task.id, role.name).status, "stopped");
+});
+
+test("stopped-launch and dormant-session CAS fences preserve newer lifecycle facts", (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  const owner = { scope: "task", taskId: task.id, roleName: role.name };
+  adapter.recordRuntimeNativeSession({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-1"
+  }, now);
+  const [candidate] = adapter.listDormantRuntimeOwners();
+  assert.deepEqual(candidate.owner, owner);
+
+  adapter.reserveRuntimeLaunch(
+    { owner, launchId: "launch-newer" },
+    () => {},
+    new Date(now.getTime() + 1)
+  );
+  assert.equal(adapter.settleStoppedRuntimeLaunch({
+    owner,
+    launchId: "launch-older",
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-1"
+  }, new Date(now.getTime() + 2)), false);
+  assert.equal(
+    adapter.markRuntimeOwnerStopped(candidate, new Date(now.getTime() + 2)),
+    false
+  );
+  assert.equal(store.getRoleSession(task.id, role.name).status, "running");
+  assert.equal(adapter.completeRuntimeLaunchReservation(owner, "launch-newer"), true);
+
+  const run = createAgentRun(
+    "run-newer",
+    task.id,
+    role.name,
+    "resume",
+    "newer work",
+    new Date(now.getTime() + 3)
+  );
+  store.saveActiveAgentRun(run);
+  assert.equal(adapter.settleStoppedRuntimeLaunch({
+    owner,
+    launchId: "launch-older",
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-1"
+  }, new Date(now.getTime() + 4)), false);
+  assert.equal(
+    adapter.markRuntimeOwnerStopped(candidate, new Date(now.getTime() + 4)),
+    false
+  );
+  assert.equal(store.getRoleSession(task.id, role.name).status, "running");
+});
+
+test("dormant-session CAS rejects a Hook-updated session and stops an unchanged one", (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  adapter.recordRuntimeNativeSession({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-1"
+  }, now);
+  const [stale] = adapter.listDormantRuntimeOwners();
+  store.transaction((tx) => {
+    const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
+    tx.saveTaskRoleSessionSet(updateRoleAgentSessionStatus(
+      sessions,
+      role.activeAgentId,
+      "ready",
+      new Date(now.getTime() + 1)
+    ));
+  });
+
+  assert.equal(
+    adapter.markRuntimeOwnerStopped(stale, new Date(now.getTime() + 2)),
+    false
+  );
+  const [current] = adapter.listDormantRuntimeOwners();
+  assert.equal(
+    adapter.markRuntimeOwnerStopped(current, new Date(now.getTime() + 3)),
+    true
+  );
+  assert.equal(store.getRoleSession(task.id, role.name).status, "stopped");
 });
 
 test("a late Codex notify cannot reactivate a session after Task archive", (t) => {

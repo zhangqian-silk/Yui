@@ -18,9 +18,18 @@ const THIRD = "2026-07-22T01:02:00.000Z";
 
 const taskTarget = { kind: "task", taskId: "task-1" };
 const roleTarget = { kind: "role", taskId: "task-1", roleName: "leader" };
+const roleRuntimeTarget = {
+  kind: "role-runtime",
+  taskId: "task-1",
+  roleName: "leader"
+};
+const globalRoleRuntimeTarget = {
+  kind: "global-role-runtime",
+  roleName: "operator"
+};
 const operatorTarget = { kind: "operator" };
 
-test("WorkMailbox supports task, role, and operator targets", () => {
+test("WorkMailbox supports task, role, role-runtime, and operator targets", () => {
   assert.deepEqual(createWorkMailbox(taskTarget), {
     schemaVersion: 1,
     target: taskTarget,
@@ -29,6 +38,11 @@ test("WorkMailbox supports task, role, and operator targets", () => {
     pending: null
   });
   assert.deepEqual(createWorkMailbox(roleTarget).target, roleTarget);
+  assert.deepEqual(createWorkMailbox(roleRuntimeTarget).target, roleRuntimeTarget);
+  assert.deepEqual(
+    createWorkMailbox(globalRoleRuntimeTarget).target,
+    globalRoleRuntimeTarget
+  );
   assert.deepEqual(createWorkMailbox(operatorTarget).target, operatorTarget);
 });
 
@@ -36,6 +50,14 @@ test("mailbox targets have stable collision-free canonical keys", () => {
   assert.equal(mailboxTargetKey(operatorTarget), "operator");
   assert.equal(mailboxTargetKey(taskTarget), "task/task-1");
   assert.equal(mailboxTargetKey(roleTarget), "role/task-1/leader");
+  assert.equal(
+    mailboxTargetKey(roleRuntimeTarget),
+    "role-runtime/task-1/leader"
+  );
+  assert.equal(
+    mailboxTargetKey(globalRoleRuntimeTarget),
+    "global-role-runtime/operator"
+  );
   assert.equal(
     mailboxTargetKey({ kind: "role", taskId: "task/1", roleName: "review lead" }),
     "role/task%2F1/review%20lead"
@@ -47,6 +69,15 @@ test("persisted WorkMailbox records use a strict versioned shape", () => {
   assert.deepEqual(validateWorkMailbox(mailbox), mailbox);
   assert.throws(() => validateWorkMailbox({ ...mailbox, schemaVersion: 2 }), /schemaVersion 1/i);
   assert.throws(() => validateWorkMailbox({ ...mailbox, extra: true }), /unknown field.*extra/i);
+  const queued = enqueueSignal(mailbox, {
+    reason: "task-activated",
+    refs: [],
+    occurredAt: FIRST
+  });
+  assert.throws(() => validateWorkMailbox({
+    ...queued,
+    pending: { ...queued.pending, availableAt: SECOND }
+  }), /unknown field.*availableAt/i);
 });
 
 test("enqueueSignal immutably coalesces pending reasons and entity references", () => {

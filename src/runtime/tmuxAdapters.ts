@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 
 import { createRuntimeBinding, type RuntimeBinding } from "./runtimeBinding.js";
+import {
+  normalizeRuntimeOwner,
+  type RuntimeOwner
+} from "./runtimeOwner.js";
 import type {
   NewSessionLaunchRequest,
   ResumeSessionLaunchRequest,
@@ -43,6 +47,7 @@ export interface RuntimeRoleLaunchPlannerPort {
     mode: "new" | "resume";
     nativeSessionId?: string;
     launchId?: string;
+    environment?: Readonly<Record<string, string>>;
   }>): RuntimePlannedSession;
   planGlobalRole(input: Readonly<{
     roleName: string;
@@ -51,6 +56,7 @@ export interface RuntimeRoleLaunchPlannerPort {
     mode: "new" | "resume";
     nativeSessionId?: string;
     launchId?: string;
+    environment?: Readonly<Record<string, string>>;
   }>): RuntimePlannedSession;
 }
 
@@ -73,6 +79,16 @@ export interface RuntimeTmuxHostPort {
   ): Promise<"running" | "exited">;
   killRole(hostId: string, roleName: string): void;
   killRoleAsync?(hostId: string, roleName: string): Promise<void>;
+  inspectRolePaneInventory?(): readonly Readonly<{
+    taskId: string;
+    roleName: string;
+    dead: boolean;
+  }>[];
+  inspectRolePaneInventoryAsync?(): Promise<readonly Readonly<{
+    taskId: string;
+    roleName: string;
+    dead: boolean;
+  }>[]>;
 }
 
 export type RuntimeTmuxPaneState = Readonly<{
@@ -83,6 +99,10 @@ export type RuntimeTmuxPaneState = Readonly<{
   pid?: number;
   currentCommand: string;
   content: string;
+  styledContent?: string;
+  cursorX?: number;
+  cursorY?: number;
+  historySize?: number;
 }>;
 
 export type RuntimeReadinessProbe = (pane: RuntimeTmuxPaneState) => boolean;
@@ -101,14 +121,14 @@ export interface RuntimeTmuxPromptPort {
     receiptId: string,
     input: string,
     readinessProbe: RuntimeReadinessProbe
-  ): "sent" | "already-sent" | "not-ready";
+  ): "sent" | "already-sent" | "not-ready" | "unavailable";
   sendRoleInputOnceIfReadyAsync?(
     hostId: string,
     roleName: string,
     receiptId: string,
     input: string,
     readinessProbe: RuntimeReadinessProbe
-  ): Promise<"sent" | "already-sent" | "not-ready">;
+  ): Promise<"sent" | "already-sent" | "not-ready" | "unavailable">;
 }
 
 export type TmuxSessionHostOptions = Readonly<{
@@ -175,6 +195,91 @@ export class TmuxSessionHost implements SessionHostPort {
     }
   }
 
+  async inspectOwner(owner: RuntimeOwner): Promise<SessionInspection> {
+    const normalized = normalizeRuntimeOwner(owner);
+    const hostId = normalized.scope === "task"
+      ? normalized.taskId
+      : this.#globalHostId;
+    try {
+      return {
+        state: await probeRoleStatus(
+          this.tmux,
+          hostId,
+          normalized.roleName
+        ) === "running"
+          ? "running"
+          : "stopped"
+      };
+    } catch {
+      return { state: "unavailable" };
+    }
+  }
+
+  async inspectOwners(
+    owners: readonly RuntimeOwner[]
+  ): Promise<readonly Readonly<{
+    owner: RuntimeOwner;
+    inspection: SessionInspection;
+  }>[]> {
+    const normalized = owners.map(normalizeRuntimeOwner);
+    if (
+      this.tmux.inspectRolePaneInventory === undefined
+      && this.tmux.inspectRolePaneInventoryAsync === undefined
+    ) {
+      return Promise.all(normalized.map(async (owner) => ({
+        owner,
+        inspection: await this.inspectOwner(owner)
+      })));
+    }
+    try {
+      const inventory = this.tmux.inspectRolePaneInventoryAsync === undefined
+        ? this.tmux.inspectRolePaneInventory!()
+        : await this.tmux.inspectRolePaneInventoryAsync();
+      const running = new Set(
+        inventory
+          .filter((pane) => !pane.dead)
+          .map((pane) => `${pane.taskId}\0${pane.roleName}`)
+      );
+      return normalized.map((owner) => {
+        const hostId = owner.scope === "task"
+          ? owner.taskId
+          : this.#globalHostId;
+        return {
+          owner,
+          inspection: {
+            state: running.has(`${hostId}\0${owner.roleName}`)
+              ? "running" as const
+              : "stopped" as const
+          }
+        };
+      });
+    } catch {
+      return normalized.map((owner) => ({
+        owner,
+        inspection: { state: "unavailable" as const }
+      }));
+    }
+  }
+
+  async stopOwner(owner: RuntimeOwner): Promise<boolean> {
+    const normalized = normalizeRuntimeOwner(owner);
+    const hostId = normalized.scope === "task"
+      ? normalized.taskId
+      : this.#globalHostId;
+    try {
+      if (
+        await probeRoleStatus(this.tmux, hostId, normalized.roleName)
+        === "running"
+      ) {
+        await killRole(this.tmux, hostId, normalized.roleName);
+      }
+      return await probeRoleStatus(this.tmux, hostId, normalized.roleName)
+        === "exited";
+    } catch {
+      return false;
+    }
+  }
+
   async #launch(request: SessionLaunchRequest): Promise<RuntimeBinding> {
     const hostId = request.owner.scope === "task"
       ? request.owner.taskId
@@ -209,6 +314,9 @@ export class TmuxSessionHost implements SessionHostPort {
       adapterId: request.adapterId,
       launchId: request.launchId,
       mode: request.mode,
+      ...(request.environment === undefined
+        ? {}
+        : { environment: request.environment }),
       ...(request.mode === "resume" ? { nativeSessionId: request.nativeSessionId } : {})
     };
     const planned = request.owner.scope === "task"
@@ -263,13 +371,6 @@ export class TmuxPromptPushAdapter implements ActivePromptPushPort {
 
   async tryPush(request: ActivePromptPushRequest): Promise<PromptPushResult> {
     const ref = requireMatchingHostRef(request.binding);
-    try {
-      if (await probeRoleStatus(this.tmux, ref.hostId, ref.roleName) !== "running") {
-        return "unavailable";
-      }
-    } catch {
-      return "unavailable";
-    }
     const readinessProbe = this.readiness(request.binding.adapterId);
     const outcome = this.tmux.sendRoleInputOnceIfReadyAsync === undefined
       ? this.tmux.sendRoleInputOnceIfReady(
@@ -286,6 +387,7 @@ export class TmuxPromptPushAdapter implements ActivePromptPushPort {
           request.envelope.text,
           readinessProbe
         );
+    if (outcome === "unavailable") return "unavailable";
     return outcome === "not-ready" ? "busy" : "delivered";
   }
 }

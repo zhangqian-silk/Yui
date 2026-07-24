@@ -35,6 +35,7 @@ import {
   callFileTaskController,
   ensureFileTaskController,
   FileTaskWorkflowRuntime,
+  refreshRunningFileTaskControllerEnvironment,
   restartFileTaskController
 } from "./controller/clientRuntime.js";
 import { FileSchedulerStoreAdapter } from "./controller/fileSchedulerStoreAdapter.js";
@@ -122,12 +123,18 @@ export async function main(): Promise<void> {
       forceInteractive: process.env.YUI_SETUP_INTERACTIVE === "1"
     };
     validateSetupInvocation(args.slice(1), setupIo);
-    emit(await runSetupCommand(
+    const output = await runSetupCommand(
       args.slice(1),
       process.env,
       new NodeCommandExecutor(),
       setupIo
-    ));
+    );
+    await refreshRunningFileTaskControllerEnvironment(
+      home,
+      new FileTaskStore(home),
+      process.env
+    );
+    emit(output);
     return;
   }
   if (args[0] === "doctor") {
@@ -189,7 +196,19 @@ export async function main(): Promise<void> {
   );
 
   if (resolved[0] === "agent") {
-    emit(runAgentCommand(resolved.slice(1), store as unknown as AgentCommandStore));
+    const agentArgs = resolved.slice(1);
+    const output = runAgentCommand(
+      agentArgs,
+      store as unknown as AgentCommandStore
+    );
+    if (agentArgs[0] === "add" || agentArgs[0] === "update") {
+      await refreshRunningFileTaskControllerEnvironment(
+        home,
+        store,
+        process.env
+      );
+    }
+    emit(output);
     return;
   }
   if (resolved[0] === "config") {
@@ -270,7 +289,11 @@ export async function main(): Promise<void> {
         await workspacePreparer.prepareTaskWorkspace(task.id);
       }
     }
-    const result = runTaskCommand(resolved.slice(1), store, { runtime, environment: process.env });
+    const result = runTaskCommand(
+      resolved.slice(1),
+      store,
+      { runtime, environment: process.env, yuiHome: home }
+    );
     if (result.kind === "output") {
       emit(result.output, false, result.data);
       return;
@@ -473,13 +496,14 @@ function selectionCall(
 
 function presentSelectionTimes(value: unknown, store: FileTaskStore): unknown {
   if (!Array.isArray(value)) return value;
+  const timeZone = store.getConfig().timeZone;
   return value.map((record) => {
     if (typeof record !== "object" || record === null || Array.isArray(record)) return record;
     const candidate = record as Record<string, unknown>;
     return typeof candidate.createdAt === "string"
       ? {
           ...candidate,
-          createdAt: formatTimestamp(candidate.createdAt, store.getConfig().timeZone)
+          createdAt: formatTimestamp(candidate.createdAt, timeZone)
         }
       : candidate;
   });

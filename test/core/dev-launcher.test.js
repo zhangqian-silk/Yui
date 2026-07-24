@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import {
+import fs, {
   existsSync,
   lstatSync,
   mkdirSync,
@@ -8,11 +8,15 @@ import {
   readFileSync,
   readlinkSync,
   readdirSync,
+  renameSync,
+  rmSync,
   symlinkSync,
   writeFileSync
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
@@ -22,6 +26,13 @@ import {
   unlinkDevLauncher,
   uninstallDevLauncher
 } from "../../scripts/manage-dev-launcher.mjs";
+import { startControllerServer } from "../../dist/core/controllerServer.js";
+import { parseControllerDiscovery } from "../../dist/core/protocol.js";
+
+function currentProcessStartIdentity() {
+  const stat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
+  return stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/u)[19];
+}
 
 test("development launcher is local, named yui, and contains no checkout absolute path", () => {
   const root = mkdtempSync(join(tmpdir(), "yui-dev-launcher-"));
@@ -127,6 +138,291 @@ test("the last development checkout wins and unlink from any checkout restores p
     readFileSync(join(unrelatedRoot, "output", "dev", "bin", "yui"), "utf8"),
     "unrelated local file\n"
   );
+});
+
+test("unlink recovers an active managed launcher when the user registry moved", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-moved-registry-"));
+  const projectRoot = join(root, "checkout");
+  const globalBinDir = join(root, "global-bin");
+  const previousRegistryPath = join(root, "old-state", "dev-launcher.json");
+  const currentRegistryPath = join(root, "new-state", "dev-launcher.json");
+  mkdirSync(globalBinDir, { recursive: true });
+  writeFileSync(join(globalBinDir, "yui"), "production-yui\n");
+
+  const linked = await linkDevLauncher({
+    projectRoot,
+    globalBinDir,
+    registryPath: previousRegistryPath
+  });
+  rmSync(previousRegistryPath);
+
+  const unlinked = unlinkDevLauncher({
+    projectRoot: join(root, "unrelated-checkout"),
+    globalBinDir,
+    registryPath: currentRegistryPath
+  });
+
+  assert.equal(unlinked.restored, true);
+  assert.equal(readFileSync(join(globalBinDir, "yui"), "utf8"), "production-yui\n");
+  assert.equal(existsSync(linked.backupPath), false);
+  assert.equal(existsSync(linked.localLauncherPath), false);
+  assert.equal(existsSync(currentRegistryPath), false);
+});
+
+test("unlink refuses an orphan managed launcher when its original backup is missing", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-orphan-missing-backup-"));
+  const projectRoot = join(root, "checkout");
+  const globalBinDir = join(root, "global-bin");
+  const previousRegistryPath = join(root, "old-state", "dev-launcher.json");
+  const currentRegistryPath = join(root, "new-state", "dev-launcher.json");
+  mkdirSync(globalBinDir, { recursive: true });
+  writeFileSync(join(globalBinDir, "yui"), "production-yui\n");
+
+  const linked = await linkDevLauncher({
+    projectRoot,
+    globalBinDir,
+    registryPath: previousRegistryPath
+  });
+  rmSync(previousRegistryPath);
+  rmSync(linked.backupPath);
+
+  assert.throws(
+    () => unlinkDevLauncher({
+      projectRoot,
+      globalBinDir,
+      registryPath: currentRegistryPath
+    }),
+    /cannot safely restore.*backup is missing/is
+  );
+  assert.equal(readlinkSync(linked.globalLauncherPath), linked.localLauncherPath);
+  assert.equal(existsSync(linked.localLauncherPath), true);
+  assert.equal(existsSync(currentRegistryPath), false);
+});
+
+test("unlink restores a witnessed dangling managed launcher with a custom output directory", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-orphan-dangling-"));
+  const projectRoot = join(root, "checkout");
+  const outputDir = join(projectRoot, "custom-generated-output");
+  const globalBinDir = join(root, "global-bin");
+  const previousRegistryPath = join(root, "old-state", "dev-launcher.json");
+  const currentRegistryPath = join(root, "new-state", "dev-launcher.json");
+  const recoveryPath = join(globalBinDir, ".yui-link-recovery.json");
+  mkdirSync(globalBinDir, { recursive: true });
+  writeFileSync(join(globalBinDir, "yui"), "production-yui\n");
+  const linked = await linkDevLauncher({
+    projectRoot,
+    outputDir,
+    globalBinDir,
+    registryPath: previousRegistryPath
+  });
+  assert.equal(existsSync(recoveryPath), true);
+  rmSync(previousRegistryPath);
+  rmSync(linked.localLauncherPath);
+
+  const unlinked = unlinkDevLauncher({
+    projectRoot: join(root, "unrelated-checkout"),
+    globalBinDir,
+    registryPath: currentRegistryPath
+  });
+
+  assert.equal(unlinked.restored, true);
+  assert.equal(readFileSync(linked.globalLauncherPath, "utf8"), "production-yui\n");
+  assert.equal(existsSync(linked.backupPath), false);
+  assert.equal(existsSync(recoveryPath), false);
+  assert.equal(existsSync(currentRegistryPath), false);
+});
+
+test("orphan recovery removes a witnessed dangling launcher when no original command existed", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-orphan-no-original-"));
+  const projectRoot = join(root, "checkout");
+  const outputDir = join(projectRoot, "custom-generated-output");
+  const globalBinDir = join(root, "global-bin");
+  const previousRegistryPath = join(root, "old-state", "dev-launcher.json");
+  const currentRegistryPath = join(root, "new-state", "dev-launcher.json");
+  const recoveryPath = join(globalBinDir, ".yui-link-recovery.json");
+  mkdirSync(globalBinDir, { recursive: true });
+  const linked = await linkDevLauncher({
+    projectRoot,
+    outputDir,
+    globalBinDir,
+    registryPath: previousRegistryPath
+  });
+  assert.equal(linked.replaced, false);
+  rmSync(previousRegistryPath);
+  rmSync(linked.localLauncherPath);
+
+  const unlinked = unlinkDevLauncher({
+    projectRoot: join(root, "unrelated-checkout"),
+    globalBinDir,
+    registryPath: currentRegistryPath
+  });
+
+  assert.equal(unlinked.restored, true);
+  assert.equal(existsSync(linked.globalLauncherPath), false);
+  assert.equal(existsSync(linked.backupPath), false);
+  assert.equal(existsSync(recoveryPath), false);
+  assert.equal(existsSync(currentRegistryPath), false);
+});
+
+test("unlink never adopts a dangling symlink without a managed recovery witness", () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-third-party-dangling-"));
+  const globalBinDir = join(root, "global-bin");
+  const globalLauncherPath = join(globalBinDir, "yui");
+  const backupPath = join(globalBinDir, ".yui-link-original");
+  const thirdPartyTarget = join(root, "third-party", "bin", "yui");
+  const registryPath = join(root, "user-state", "dev-launcher.json");
+  mkdirSync(globalBinDir, { recursive: true });
+  writeFileSync(backupPath, "unrelated-backup\n");
+  symlinkSync(thirdPartyTarget, globalLauncherPath);
+
+  const unlinked = unlinkDevLauncher({
+    projectRoot: join(root, "unrelated-checkout"),
+    globalBinDir,
+    registryPath
+  });
+
+  assert.equal(unlinked.restored, false);
+  assert.equal(readlinkSync(globalLauncherPath), thirdPartyTarget);
+  assert.equal(readFileSync(backupPath, "utf8"), "unrelated-backup\n");
+  assert.equal(existsSync(registryPath), false);
+});
+
+test("unlink discovers an orphan managed launcher in another NVM version", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-orphan-cross-nvm-"));
+  const projectRoot = join(root, "checkout");
+  const nvmDir = join(root, ".nvm");
+  const previousBinDir = join(nvmDir, "versions", "node", "v20.20.2", "bin");
+  const currentBinDir = join(nvmDir, "versions", "node", "v22.17.0", "bin");
+  const previousRegistryPath = join(root, "old-state", "dev-launcher.json");
+  const currentRegistryPath = join(root, "new-state", "dev-launcher.json");
+  mkdirSync(previousBinDir, { recursive: true });
+  mkdirSync(currentBinDir, { recursive: true });
+  writeFileSync(join(previousBinDir, "yui"), "node-20-production-yui\n");
+
+  const linked = await linkDevLauncher({
+    projectRoot,
+    globalBinDir: previousBinDir,
+    registryPath: previousRegistryPath,
+    nvmDir
+  });
+  rmSync(previousRegistryPath);
+
+  const unlinked = unlinkDevLauncher({
+    projectRoot: join(root, "unrelated-checkout"),
+    globalBinDir: currentBinDir,
+    registryPath: currentRegistryPath,
+    nvmDir
+  });
+
+  assert.equal(unlinked.restored, true);
+  assert.equal(unlinked.globalLauncherPath, join(previousBinDir, "yui"));
+  assert.equal(readFileSync(join(previousBinDir, "yui"), "utf8"), "node-20-production-yui\n");
+  assert.equal(existsSync(linked.backupPath), false);
+  assert.equal(existsSync(linked.localLauncherPath), false);
+});
+
+test("link finishes activation when state was written before the original command moved", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-interrupted-link-state-"));
+  const projectRoot = join(root, "checkout");
+  const globalBinDir = join(root, "global-bin");
+  const registryPath = join(root, "user-state", "dev-launcher.json");
+  const localLauncherPath = installDevLauncher({ projectRoot }).launcherPath;
+  const globalLauncherPath = join(globalBinDir, "yui");
+  const backupPath = join(globalBinDir, ".yui-link-original");
+  mkdirSync(globalBinDir, { recursive: true });
+  mkdirSync(join(root, "user-state"), { recursive: true });
+  writeFileSync(globalLauncherPath, "production-yui\n");
+  writeFileSync(registryPath, `${JSON.stringify({
+    schemaVersion: 3,
+    activeProjectRoot: projectRoot,
+    localLauncherPath,
+    globalLauncherPath,
+    backupPath,
+    hadOriginal: true
+  })}\n`);
+
+  const linked = await linkDevLauncher({ projectRoot, globalBinDir, registryPath });
+
+  assert.equal(readlinkSync(globalLauncherPath), linked.localLauncherPath);
+  assert.equal(readFileSync(backupPath, "utf8"), "production-yui\n");
+});
+
+test("link finishes activation when the original command moved before the symlink was created", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-interrupted-link-symlink-"));
+  const projectRoot = join(root, "checkout");
+  const globalBinDir = join(root, "global-bin");
+  const registryPath = join(root, "user-state", "dev-launcher.json");
+  const localLauncherPath = installDevLauncher({ projectRoot }).launcherPath;
+  const globalLauncherPath = join(globalBinDir, "yui");
+  const backupPath = join(globalBinDir, ".yui-link-original");
+  mkdirSync(globalBinDir, { recursive: true });
+  mkdirSync(join(root, "user-state"), { recursive: true });
+  writeFileSync(backupPath, "production-yui\n");
+  writeFileSync(registryPath, `${JSON.stringify({
+    schemaVersion: 3,
+    activeProjectRoot: projectRoot,
+    localLauncherPath,
+    globalLauncherPath,
+    backupPath,
+    hadOriginal: true
+  })}\n`);
+
+  const linked = await linkDevLauncher({ projectRoot, globalBinDir, registryPath });
+
+  assert.equal(readlinkSync(globalLauncherPath), linked.localLauncherPath);
+  assert.equal(readFileSync(backupPath, "utf8"), "production-yui\n");
+});
+
+test("link adopts the new managed target after interruption before the registry update", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-interrupted-switch-"));
+  const firstProjectRoot = join(root, "first-checkout");
+  const secondProjectRoot = join(root, "second-checkout");
+  const globalBinDir = join(root, "global-bin");
+  const registryPath = join(root, "user-state", "dev-launcher.json");
+  mkdirSync(globalBinDir, { recursive: true });
+  writeFileSync(join(globalBinDir, "yui"), "production-yui\n");
+  const first = await linkDevLauncher({
+    projectRoot: firstProjectRoot,
+    globalBinDir,
+    registryPath
+  });
+  const secondLocalLauncherPath = installDevLauncher({ projectRoot: secondProjectRoot }).launcherPath;
+  rmSync(first.globalLauncherPath);
+  symlinkSync(secondLocalLauncherPath, first.globalLauncherPath);
+
+  const linked = await linkDevLauncher({
+    projectRoot: secondProjectRoot,
+    globalBinDir,
+    registryPath
+  });
+
+  assert.equal(readlinkSync(first.globalLauncherPath), secondLocalLauncherPath);
+  assert.equal(linked.localLauncherPath, secondLocalLauncherPath);
+  assert.equal(JSON.parse(readFileSync(registryPath, "utf8")).localLauncherPath, secondLocalLauncherPath);
+  assert.equal(readFileSync(first.backupPath, "utf8"), "production-yui\n");
+});
+
+test("unlink completes cleanup after the original command was already restored", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-interrupted-unlink-"));
+  const projectRoot = join(root, "checkout");
+  const globalBinDir = join(root, "global-bin");
+  const registryPath = join(root, "user-state", "dev-launcher.json");
+  mkdirSync(globalBinDir, { recursive: true });
+  writeFileSync(join(globalBinDir, "yui"), "production-yui\n");
+  const linked = await linkDevLauncher({ projectRoot, globalBinDir, registryPath });
+  rmSync(linked.globalLauncherPath);
+  renameSync(linked.backupPath, linked.globalLauncherPath);
+
+  const unlinked = unlinkDevLauncher({
+    projectRoot: join(root, "unrelated-checkout"),
+    globalBinDir,
+    registryPath
+  });
+
+  assert.equal(unlinked.restored, true);
+  assert.equal(readFileSync(linked.globalLauncherPath, "utf8"), "production-yui\n");
+  assert.equal(existsSync(linked.localLauncherPath), false);
+  assert.equal(existsSync(registryPath), false);
 });
 
 test("linking from another npm global bin restores the previous bin before the last link wins", async () => {
@@ -482,23 +778,362 @@ test("link refuses an incompatible development home schema and preserves it", as
   assert.equal(existsSync(registryPath), false);
 });
 
-test("development home reset moves the old home aside and treats a missing home as normal", () => {
+test("development home reset moves the old home aside and treats a missing home as normal", async () => {
   const root = mkdtempSync(join(tmpdir(), "yui-dev-reset-"));
   const outputDir = join(root, "output", "dev");
   const home = join(outputDir, "home");
   mkdirSync(home, { recursive: true });
   writeFileSync(join(home, "state.json"), "recoverable\n");
 
-  const reset = resetDevHome({ projectRoot: root, outputDir });
+  const reset = await resetDevHome({ projectRoot: root, outputDir });
 
   assert.equal(reset.moved, true);
   assert.equal(existsSync(home), false);
   assert.equal(readFileSync(join(reset.backupPath, "state.json"), "utf8"), "recoverable\n");
   assert.match(reset.backupPath, /home\.backup-/);
-  assert.deepEqual(resetDevHome({ projectRoot: root, outputDir }), {
+  assert.deepEqual(await resetDevHome({ projectRoot: root, outputDir }), {
     homePath: home,
     backupPath: null,
     moved: false
   });
   assert.equal(readdirSync(outputDir).filter((name) => name.startsWith("home.backup-")).length, 1);
+});
+
+test("reset-home CLI awaits the reset before reporting its backup", () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-reset-cli-"));
+  const home = join(root, "output", "dev", "home");
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, "state.json"), "recoverable\n");
+
+  const output = execFileSync(
+    process.execPath,
+    [fileURLToPath(new URL("../../scripts/manage-dev-launcher.mjs", import.meta.url)), "reset-home"],
+    { cwd: root, encoding: "utf8" }
+  );
+
+  assert.match(output, /Moved the previous development home to:/);
+  assert.equal(existsSync(home), false);
+  assert.equal(
+    readdirSync(join(root, "output", "dev"))
+      .filter((name) => name.startsWith("home.backup-"))
+      .length,
+    1
+  );
+});
+
+test("development home reset rejects malformed Controller discovery without moving data", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-reset-invalid-discovery-"));
+  const outputDir = join(root, "output", "dev");
+  const home = join(outputDir, "home");
+  const discoveryPath = join(home, "runtime", "controller.json");
+  mkdirSync(dirname(discoveryPath), { recursive: true });
+  writeFileSync(join(home, "state.json"), "keep me\n");
+  writeFileSync(discoveryPath, `${JSON.stringify({
+    pid: process.pid,
+    socketPath: join(home, "runtime", "controller.sock"),
+    token: "0".repeat(64)
+  })}\n`, { mode: 0o600 });
+
+  await assert.rejects(
+    resetDevHome({ projectRoot: root, outputDir }),
+    /cannot verify development Controller state/i
+  );
+  assert.equal(readFileSync(join(home, "state.json"), "utf8"), "keep me\n");
+});
+
+test("development home reset accepts a complete stale discovery only when its owner is dead", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-reset-stale-controller-"));
+  const outputDir = join(root, "output", "dev");
+  const home = join(outputDir, "home");
+  const discoveryPath = join(home, "runtime", "controller.json");
+  mkdirSync(dirname(discoveryPath), { recursive: true });
+  writeFileSync(join(home, "state.json"), "recoverable\n");
+  writeFileSync(discoveryPath, `${JSON.stringify({
+    pid: 2_147_483_647,
+    processStartIdentity: "1",
+    socketPath: join(home, "runtime", "controller.sock"),
+    token: "a".repeat(64)
+  })}\n`, { mode: 0o600 });
+
+  const reset = await resetDevHome({ projectRoot: root, outputDir });
+
+  assert.equal(reset.moved, true);
+  assert.equal(readFileSync(join(reset.backupPath, "state.json"), "utf8"), "recoverable\n");
+});
+
+test("development home reset recognizes a reused PID from its different process identity", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-reset-reused-pid-"));
+  const outputDir = join(root, "output", "dev");
+  const home = join(outputDir, "home");
+  const discoveryPath = join(home, "runtime", "controller.json");
+  mkdirSync(dirname(discoveryPath), { recursive: true });
+  writeFileSync(join(home, "state.json"), "keep me\n");
+  writeFileSync(discoveryPath, `${JSON.stringify({
+    pid: process.pid,
+    processStartIdentity: currentProcessStartIdentity() === "1" ? "2" : "1",
+    socketPath: join(home, "runtime", "controller.sock"),
+    token: "b".repeat(64)
+  })}\n`, { mode: 0o600 });
+
+  const reset = await resetDevHome({ projectRoot: root, outputDir });
+
+  assert.equal(reset.moved, true);
+  assert.equal(readFileSync(join(reset.backupPath, "state.json"), "utf8"), "keep me\n");
+});
+
+test("development home reset fails safely when the same process identity is still alive", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-reset-live-identity-"));
+  const outputDir = join(root, "output", "dev");
+  const home = join(outputDir, "home");
+  const discoveryPath = join(home, "runtime", "controller.json");
+  mkdirSync(dirname(discoveryPath), { recursive: true });
+  writeFileSync(join(home, "state.json"), "keep me\n");
+  writeFileSync(discoveryPath, `${JSON.stringify({
+    pid: process.pid,
+    processStartIdentity: currentProcessStartIdentity(),
+    socketPath: join(home, "runtime", "controller.sock"),
+    token: "b".repeat(64)
+  })}\n`, { mode: 0o600 });
+
+  await assert.rejects(
+    resetDevHome({ projectRoot: root, outputDir }),
+    /cannot verify development Controller state/i
+  );
+  assert.equal(readFileSync(join(home, "state.json"), "utf8"), "keep me\n");
+});
+
+test("development home reset authenticates and refuses a running Controller", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-reset-live-controller-"));
+  const outputDir = join(root, "output", "dev");
+  const home = join(outputDir, "home");
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, "state.json"), "keep me\n");
+  const controller = await startControllerServer(home);
+  t.after(() => controller.close());
+  assert.equal(controller.discovery.processStartIdentity, currentProcessStartIdentity());
+
+  await assert.rejects(
+    resetDevHome({ projectRoot: root, outputDir }),
+    /refusing to reset.*Controller.*running/is
+  );
+  assert.equal(readFileSync(join(home, "state.json"), "utf8"), "keep me\n");
+});
+
+test("Controller discovery protocol requires the Linux process start identity", () => {
+  const socketPath = "/tmp/yui-controller-protocol.sock";
+  const discovery = {
+    pid: process.pid,
+    processStartIdentity: currentProcessStartIdentity(),
+    socketPath,
+    token: "c".repeat(64)
+  };
+
+  assert.deepEqual(parseControllerDiscovery(discovery, socketPath), discovery);
+  const { processStartIdentity: _removed, ...legacyDiscovery } = discovery;
+  assert.throws(
+    () => parseControllerDiscovery(legacyDiscovery, socketPath),
+    /Controller discovery is invalid/i
+  );
+});
+
+test("development home reset fails safely when a Controller socket has lost discovery", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-reset-missing-discovery-"));
+  const outputDir = join(root, "output", "dev");
+  const home = join(outputDir, "home");
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, "state.json"), "keep me\n");
+  const controller = await startControllerServer(home);
+  t.after(() => controller.close());
+  rmSync(join(home, "runtime", "controller.json"));
+
+  await assert.rejects(
+    resetDevHome({ projectRoot: root, outputDir }),
+    /cannot verify development Controller state/i
+  );
+  assert.equal(readFileSync(join(home, "state.json"), "utf8"), "keep me\n");
+});
+
+test("Controller startup and development reset honor the same outside-home lifecycle lock", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-reset-lifecycle-lock-"));
+  const outputDir = join(root, "output", "dev");
+  const home = join(outputDir, "home");
+  const lockPath = join(outputDir, ".home.controller-lifecycle.lock");
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, "state.json"), "keep me\n");
+  writeFileSync(lockPath, `${JSON.stringify({
+    pid: process.pid,
+    token: "held-by-test",
+    createdAt: new Date().toISOString()
+  })}\n`, { mode: 0o600 });
+
+  await assert.rejects(
+    resetDevHome({ projectRoot: root, outputDir }),
+    /home lifecycle operation is already running/i
+  );
+  await assert.rejects(
+    startControllerServer(home),
+    /home lifecycle operation is already running/i
+  );
+  assert.equal(readFileSync(join(home, "state.json"), "utf8"), "keep me\n");
+  rmSync(lockPath);
+});
+
+test("development reset retries when a lifecycle owner releases between EEXIST and read", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-reset-released-lifecycle-lock-"));
+  const outputDir = join(root, "output", "dev");
+  const home = join(outputDir, "home");
+  const lockPath = join(outputDir, ".home.controller-lifecycle.lock");
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, "state.json"), "recoverable\n");
+  writeFileSync(lockPath, `${JSON.stringify({
+    pid: process.pid,
+    token: "releasing-reset-owner",
+    createdAt: "2026-07-24T00:00:00.000Z"
+  })}\n`, { mode: 0o600 });
+
+  const originalReadFileSync = fs.readFileSync;
+  let releasedBeforeRead = false;
+  fs.readFileSync = function readFileAfterSimulatedRelease(path, ...args) {
+    if (!releasedBeforeRead && String(path) === lockPath) {
+      releasedBeforeRead = true;
+      fs.rmSync(lockPath);
+    }
+    return originalReadFileSync.call(this, path, ...args);
+  };
+  syncBuiltinESMExports();
+  let reset;
+  try {
+    reset = await resetDevHome({ projectRoot: root, outputDir });
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+    syncBuiltinESMExports();
+  }
+
+  assert.equal(releasedBeforeRead, true);
+  assert.equal(reset.moved, true);
+  assert.equal(existsSync(lockPath), false);
+  assert.equal(readFileSync(join(reset.backupPath, "state.json"), "utf8"), "recoverable\n");
+});
+
+test("Controller startup retries when a lifecycle owner releases between EEXIST and read", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-start-released-lifecycle-lock-"));
+  const outputDir = join(root, "output", "dev");
+  const home = join(outputDir, "home");
+  const lockPath = join(outputDir, ".home.controller-lifecycle.lock");
+  mkdirSync(home, { recursive: true });
+  writeFileSync(lockPath, `${JSON.stringify({
+    pid: process.pid,
+    token: "releasing-start-owner",
+    createdAt: "2026-07-24T00:00:01.000Z"
+  })}\n`, { mode: 0o600 });
+
+  const originalReadFile = fs.promises.readFile;
+  const originalRm = fs.promises.rm;
+  let releasedBeforeRead = false;
+  fs.promises.readFile = async function readFileAfterSimulatedRelease(path, ...args) {
+    if (!releasedBeforeRead && String(path) === lockPath) {
+      releasedBeforeRead = true;
+      await originalRm.call(this, lockPath);
+    }
+    return originalReadFile.call(this, path, ...args);
+  };
+  syncBuiltinESMExports();
+  let controller;
+  try {
+    controller = await startControllerServer(home);
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    syncBuiltinESMExports();
+  }
+  t.after(() => controller.close());
+
+  assert.equal(releasedBeforeRead, true);
+  assert.equal(controller.discovery.pid, process.pid);
+  assert.equal(existsSync(lockPath), false);
+});
+
+test("development reset preserves a stale lifecycle lock and every recovery attempt fails safely", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-reset-stale-lifecycle-lock-"));
+  const outputDir = join(root, "output", "dev");
+  const home = join(outputDir, "home");
+  const lockPath = join(outputDir, ".home.controller-lifecycle.lock");
+  const createdAt = "2026-07-24T00:00:00.000Z";
+  const lockContents = `${JSON.stringify({
+    pid: 2_147_483_647,
+    token: "dead-reset-owner",
+    createdAt
+  })}\n`;
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, "state.json"), "recoverable\n");
+  writeFileSync(lockPath, lockContents, { mode: 0o600 });
+
+  const isExactStaleLockError = (error) => {
+    assert.match(error.message, /previous Yui home lifecycle operation left a stale lock/i);
+    assert.match(error.message, /owner PID 2147483647/);
+    assert.match(error.message, /createdAt 2026-07-24T00:00:00\.000Z/);
+    assert.equal(error.message.includes(lockPath), true);
+    assert.match(error.message, /remove this exact lock file and retry/i);
+    return true;
+  };
+  await assert.rejects(
+    resetDevHome({ projectRoot: root, outputDir }),
+    isExactStaleLockError
+  );
+  await assert.rejects(
+    resetDevHome({ projectRoot: root, outputDir }),
+    isExactStaleLockError
+  );
+
+  assert.equal(readFileSync(lockPath, "utf8"), lockContents);
+  assert.equal(readFileSync(join(home, "state.json"), "utf8"), "recoverable\n");
+});
+
+test("Controller startup preserves a stale lifecycle lock and every recovery attempt fails safely", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-start-stale-lifecycle-lock-"));
+  const outputDir = join(root, "output", "dev");
+  const home = join(outputDir, "home");
+  const lockPath = join(outputDir, ".home.controller-lifecycle.lock");
+  const createdAt = "2026-07-24T00:00:01.000Z";
+  const lockContents = `${JSON.stringify({
+    pid: 2_147_483_647,
+    token: "dead-start-owner",
+    createdAt
+  })}\n`;
+  mkdirSync(home, { recursive: true });
+  writeFileSync(lockPath, lockContents, { mode: 0o600 });
+
+  const isExactStaleLockError = (error) => {
+    assert.match(error.message, /previous Yui home lifecycle operation left a stale lock/i);
+    assert.match(error.message, /owner PID 2147483647/);
+    assert.match(error.message, /createdAt 2026-07-24T00:00:01\.000Z/);
+    assert.equal(error.message.includes(lockPath), true);
+    assert.match(error.message, /remove this exact lock file and retry/i);
+    return true;
+  };
+  await assert.rejects(startControllerServer(home), isExactStaleLockError);
+  await assert.rejects(startControllerServer(home), isExactStaleLockError);
+
+  assert.equal(readFileSync(lockPath, "utf8"), lockContents);
+  assert.equal(existsSync(join(home, "runtime", "controller.json")), false);
+});
+
+test("malformed lifecycle locks fail safely and are never removed", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-invalid-lifecycle-lock-"));
+  const outputDir = join(root, "output", "dev");
+  const home = join(outputDir, "home");
+  const lockPath = join(outputDir, ".home.controller-lifecycle.lock");
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, "state.json"), "keep me\n");
+  writeFileSync(lockPath, "partially-written");
+
+  await assert.rejects(
+    resetDevHome({ projectRoot: root, outputDir }),
+    /cannot verify the existing Yui home lifecycle lock/i
+  );
+  await assert.rejects(
+    startControllerServer(home),
+    /cannot verify the existing Yui home lifecycle lock/i
+  );
+  assert.equal(readFileSync(lockPath, "utf8"), "partially-written");
+  assert.equal(readFileSync(join(home, "state.json"), "utf8"), "keep me\n");
 });

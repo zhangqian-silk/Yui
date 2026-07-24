@@ -13,6 +13,7 @@ import type {
   WorkMailbox
 } from "../coordination/workMailbox.js";
 import type { PendingTurnCompletion } from "../executor/turnCompletion.js";
+import type { RuntimeRoleOwner } from "../runtime/lifecycleReservation.js";
 
 export type SchedulerTask = Readonly<{
   id: string;
@@ -37,6 +38,18 @@ export type SchedulerRoleSession = Readonly<{
   adapterId: string;
   nativeSessionId?: string;
   status: "reserved" | "ready" | "running" | "stopped" | "broken";
+}>;
+
+/**
+ * Exact persisted session fact used to fence a low-frequency native-host
+ * absence observation from a concurrent launch or Hook update.
+ */
+export type DormantRuntimeOwnerCandidate = Readonly<{
+  owner: RuntimeRoleOwner;
+  agentId: string;
+  adapterId: string;
+  nativeSessionId: string;
+  sessionUpdatedAt: string;
 }>;
 
 export type SchedulerOperatorDeliveryTarget = Readonly<{
@@ -87,6 +100,8 @@ export type RoleRunDeliveryPersistence = Readonly<{
   role: SchedulerRole;
   run: SchedulerAgentRun;
   session: SchedulerRoleSession | null;
+  /** Matching external-process generation, when lifecycle coordination is enabled. */
+  launchId?: string;
   now: Date;
 }>;
 
@@ -142,10 +157,53 @@ export interface SchedulerStorePort {
   claimWorkMailbox(input: SchedulerMailboxClaimInput): SchedulerMailboxClaimResult;
   completeWorkMailbox(target: MailboxTarget, batchId: string): boolean;
   releaseWorkMailbox(target: MailboxTarget, batchId: string): boolean;
+  /**
+   * After a successful targeted stop, atomically clears both a launch
+   * reservation and every coalesced cleanup request in its dedicated lane.
+   */
+  completeRuntimeCleanup?(
+    target: Extract<
+      MailboxTarget,
+      { kind: "role-runtime" | "global-role-runtime" }
+    >,
+    now: Date
+  ): boolean;
+  /** Atomically clears one confirmed-absent reservation and stops its session fact. */
+  completeStoppedRuntimeReservation?(
+    target: Extract<
+      MailboxTarget,
+      { kind: "role-runtime" | "global-role-runtime" }
+    >,
+    batchId: string,
+    now: Date
+  ): boolean;
+  /** Non-stopped native sessions with no active Task Run or lifecycle work. */
+  listDormantRuntimeOwners?(): readonly DormantRuntimeOwnerCandidate[];
+  /**
+   * Persists a confirmed absent dormant owner only while its exact session
+   * fact is still current and no launch, cleanup, or Task Run has appeared.
+   */
+  markRuntimeOwnerStopped?(
+    candidate: DormantRuntimeOwnerCandidate,
+    now: Date
+  ): boolean;
   queueTaskProgress(taskId: string, reason: string, now: Date): void;
 
   getPendingWakeup(taskId: string): PendingWakeup | null;
   listPendingWakeups(): readonly PendingWakeup[];
+  /** Atomically appends one Leader signal without a read/merge/write race. */
+  enqueueLeaderWakeup?(taskId: string, reason: string, now: Date): PendingWakeup;
+  /**
+   * Atomically releases a stranded Leader execution and appends its recovery
+   * signal. This prevents a concurrent signal from being lost between those
+   * two mailbox transitions.
+   */
+  releaseLeaderWakeupAndEnqueue?(
+    taskId: string,
+    batchId: string,
+    reason: string,
+    now: Date
+  ): boolean;
   savePendingWakeup(wakeup: PendingWakeup): void;
   clearPendingWakeup(taskId: string): void;
 
@@ -212,6 +270,10 @@ export type RoleSessionLaunchMode = "new" | "resume";
 
 export type PreparedRoleDelivery = Readonly<{
   deliveryId: string;
+  /** External process generation; distinct from the per-Run delivery id. */
+  launchId?: string;
+  /** Durable Run identity whose transient preparation this entry serves. */
+  runId?: string;
   taskId: string;
   roleName: string;
   agentId: string;
@@ -249,6 +311,16 @@ export interface TmuxDeliveryPort {
     receiptId: string;
     text: string;
   }>): Promise<"sent" | "already-sent" | "busy" | "unavailable">;
+  /**
+   * Drops transient prepared bindings after authoritative terminal/absence
+   * state. Omitting runId clears every prepared generation for the Role.
+   */
+  forgetPrepared?(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId?: string;
+    launchId?: string;
+  }>): void;
   /** Best-effort nudge to an already-running global Operator composer. */
   notifyOperatorInputOnce?(input: Readonly<{
     roleName: "operator";
@@ -283,11 +355,8 @@ export interface TmuxDeliveryPort {
       roleName: string;
       status: "present" | "absent";
     }>[]>;
-  /** Fast pane receipt lookup; unlike readiness, this is valid while the Agent is busy. */
-  findExistingReceipt?(input: Readonly<{
-    delivery: PreparedRoleDelivery;
-    receiptId: string;
-  }>): Promise<ReadyRoleDelivery | null>;
+  /** Retryable stale lifecycle cleanup for one exact Task Role pane. */
+  stopRole?(taskId: string, roleName: string): Promise<boolean>;
   /** Archive boundary: tmux owns process termination for every Role in the Task. */
   stopTask(taskId: string): Promise<boolean>;
 }

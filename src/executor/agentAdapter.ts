@@ -8,6 +8,11 @@ import {
   validateAgentAdvancedArguments,
   validateAgentBaseArguments
 } from "../agent/argumentPolicy.js";
+import { writeTextFileAtomically } from "../storage/durableFile.js";
+import {
+  inspectCodexDeveloperInstructions,
+  type CodexDeveloperInstructionsInspection
+} from "./codexConfigConflict.js";
 
 export type AdvancedAgentConfig = Readonly<{ rawArgs?: readonly string[] }>;
 export type CodexAgentConfig = Readonly<{
@@ -85,6 +90,8 @@ export type CompileInput<TConfig extends RoleAgentConfig = RoleAgentConfig> = Re
   workspace: string;
   developerInstructions?: string;
   skills?: readonly Readonly<{ id: string; path: string; content: string }>[];
+  managedContextFile?: string;
+  codexDeveloperInstructions?: CodexDeveloperInstructionsInspection;
 }>;
 export type ResumeInput<TConfig extends RoleAgentConfig = RoleAgentConfig> =
   CompileInput<TConfig> & Readonly<{ nativeSessionId: string }>;
@@ -219,11 +226,24 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
         : [
             "Yui Role Skills are available at the paths below. Before performing work governed by one, read and follow its SKILL.md on demand; do not treat this list as a user message.",
             ...input.skills.map((skill) => `- ${skill.id}: ${skill.path}/SKILL.md`)
-          ])
+        ])
     ].filter((value): value is string => value !== undefined && value.trim().length > 0);
-    return instructions.length === 0
-      ? []
-      : ["--config", `developer_instructions=${tomlString(instructions.join("\n"))}`];
+    if (instructions.length === 0) return [];
+    const nativeInstructions = input.codexDeveloperInstructions
+      ?? inspectCodexDeveloperInstructions({
+        workspace: input.workspace,
+        profile: input.config.profile
+      });
+    if (nativeInstructions.status === "configured") {
+      throw new Error(
+        "Codex developer_instructions is already configured by "
+        + `${nativeInstructions.source}; Yui refuses to replace native developer instructions.`
+      );
+    }
+    return [
+      "--config",
+      `developer_instructions=${tomlString(instructions.join("\n"))}`
+    ];
   }
 
   compileResume(input: ResumeInput<CodexAgentConfig>): CompiledAgentLaunch {
@@ -285,9 +305,15 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
         skill.content
       ].join("\n\n"))
     ].filter((value): value is string => value !== undefined && value.trim().length > 0);
-    return sections.length === 0
-      ? []
-      : ["--append-system-prompt", sections.join("\n\n")];
+    if (sections.length === 0) return [];
+    const context = sections.join("\n\n");
+    if (input.managedContextFile === undefined) {
+      throw new Error(
+        "Claude session context requires a managed context file under YUI_HOME."
+      );
+    }
+    writeTextFileAtomically(input.managedContextFile, context);
+    return ["--append-system-prompt-file", input.managedContextFile];
   }
 
   compileResume(input: ResumeInput<ClaudeAgentConfig>): CompiledAgentLaunch {

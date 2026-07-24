@@ -15,13 +15,19 @@ import test from "node:test";
 
 import { runCompletionWizard } from "../../dist/cli/completionWizard.js";
 import { FileCompletionManager } from "../../dist/completion/fileCompletionManager.js";
+import {
+  createWorkMailbox,
+  enqueueSignal
+} from "../../dist/coordination/workMailbox.js";
 
 function memoryStore(initial = { schemaVersion: 1 }) {
   let config = structuredClone(initial);
-  return {
+  const store = {
+    transaction: (execute) => execute(store),
     getConfig: () => structuredClone(config),
     saveConfig: (next) => { config = structuredClone(next); }
   };
+  return store;
 }
 
 function answers(...values) {
@@ -164,4 +170,61 @@ test("setup writes schema and configures selected Agents, default Agent, and Ope
     { input: repeatInput, output: repeatOutput, forceInteractive: true }
   ));
   assert.equal(new FileTaskStore(home).getGlobalRole("operator").activeAgentId, "codex");
+});
+
+test("setup rolls back config and both system Roles when one lifecycle gate rejects creation", async (t) => {
+  const { runSetupCommand } = await import("../../dist/setup/setupCommand.js");
+  const { ensureStorageSchema } = await import("../../dist/storage/storageSchema.js");
+  const { FileTaskStore } = await import("../../dist/storage/taskStore.js");
+  const root = mkdtempSync(join(tmpdir(), "yui-file-setup-rollback-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, "yui-home");
+  const bin = join(root, "bin");
+  const userHome = join(root, "user");
+  const workspace = join(root, "operator-workspace");
+  mkdirSync(bin);
+  const codex = join(bin, "codex");
+  writeFileSync(codex, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  chmodSync(codex, 0o755);
+  ensureStorageSchema(home);
+  const initialConfig = {
+    schemaVersion: 1,
+    reconciliationIntervalSeconds: 45,
+    timeZone: "Europe/London"
+  };
+  const store = new FileTaskStore(home);
+  store.saveConfig(initialConfig);
+  store.saveWorkMailbox(enqueueSignal(
+    createWorkMailbox({ kind: "global-role-runtime", roleName: "leader" }),
+    {
+      reason: "runtime-cleanup-required",
+      refs: [],
+      occurredAt: "2026-07-24T00:00:00.000Z"
+    }
+  ));
+  const input = new PassThrough();
+  const output = new PassThrough();
+  input.end(`codex\n\n\n${workspace}\n`);
+  const env = {
+    YUI_HOME: home,
+    HOME: userHome,
+    PATH: bin,
+    SHELL: "/bin/zsh"
+  };
+
+  await assert.rejects(
+    runSetupCommand(
+      [],
+      env,
+      { run: () => "tmux 3.4" },
+      { input, output, forceInteractive: true }
+    ),
+    /runtime lifecycle transition/i
+  );
+
+  const reloaded = new FileTaskStore(home);
+  assert.deepEqual(reloaded.getConfig(), initialConfig);
+  assert.equal(reloaded.getGlobalRole("operator"), null);
+  assert.equal(reloaded.getGlobalRole("leader"), null);
+  assert.notEqual(reloaded.getConfiguredAgent("codex"), null);
 });

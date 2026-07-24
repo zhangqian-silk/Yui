@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, realpath } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -14,6 +14,10 @@ import {
   inspectAgentCapabilities,
   resolveAgentAdapter
 } from "../../dist/executor/agentAdapter.js";
+import {
+  inspectCodexDeveloperInstructions,
+  inspectCodexLaunchConfig
+} from "../../dist/executor/codexConfigConflict.js";
 
 const NOW = new Date("2026-07-19T00:00:00.000Z");
 
@@ -122,6 +126,7 @@ test("Codex structured config compiles deterministically for new and resume laun
     agent,
     config,
     workspace: root,
+    codexDeveloperInstructions: { status: "absent" },
     developerInstructions: "review carefully",
     skills: [{ id: "review", path: canonicalFirst, content: "Review skill body" }]
   });
@@ -150,6 +155,7 @@ test("Codex structured config compiles deterministically for new and resume laun
       agent,
       config,
       workspace: root,
+      codexDeveloperInstructions: { status: "absent" },
       developerInstructions: "review carefully",
       skills: [{ id: "review", path: canonicalFirst, content: "Review skill body" }],
       nativeSessionId: "codex-session"
@@ -162,7 +168,374 @@ test("Codex structured config compiles deterministically for new and resume laun
   });
 });
 
-test("Claude structured config compiles permissions and preallocated session lifecycle", () => {
+test("Codex refuses to replace native developer_instructions from the effective config", async (t) => {
+  const codexHome = await mkdtemp(join(tmpdir(), "yui-codex-config-"));
+  await writeFile(
+    join(codexHome, "config.toml"),
+    'developer_instructions = "native safety policy"\n',
+    { mode: 0o600 }
+  );
+  const workspace = join(codexHome, "workspace");
+  await mkdir(workspace);
+  const adapter = resolveAgentAdapter("codex");
+
+  assert.throws(() => adapter.compileNew({
+    agent: configured("codex-personal", "codex", "/opt/bin/codex"),
+    config: { adapterId: "codex" },
+    workspace,
+    codexDeveloperInstructions: inspectCodexDeveloperInstructions({
+      environment: { CODEX_HOME: codexHome },
+      workspace,
+      systemConfigPath: join(codexHome, "missing-system.toml"),
+      managedConfigPath: join(codexHome, "missing-managed.toml")
+    }),
+    developerInstructions: "Yui Role policy"
+  }), /developer_instructions.*already configured/i);
+
+  t.after(async () => {
+    await import("node:fs/promises").then(({ rm }) => rm(codexHome, { recursive: true, force: true }));
+  });
+});
+
+test("Codex config inspection applies the selected profile file and project layer", async (t) => {
+  const codexHome = await mkdtemp(join(tmpdir(), "yui-codex-layers-"));
+  const workspace = join(codexHome, "workspace");
+  const projectConfig = join(workspace, ".codex");
+  const systemConfigPath = join(codexHome, "missing-system.toml");
+  const managedConfigPath = join(codexHome, "missing-managed.toml");
+  const inspection = (profile) => inspectCodexDeveloperInstructions({
+    environment: { CODEX_HOME: codexHome },
+    workspace,
+    ...(profile === undefined ? {} : { profile }),
+    systemConfigPath,
+    managedConfigPath
+  });
+  await mkdir(projectConfig, { recursive: true });
+  await writeFile(join(codexHome, "config.toml"), "", { mode: 0o600 });
+
+  assert.equal(inspection("missing").status, "absent");
+  const unreadableProfile = join(codexHome, "blocked.config.toml");
+  await writeFile(unreadableProfile, "", { mode: 0o600 });
+  await chmod(unreadableProfile, 0o000);
+  assert.throws(
+    () => inspection("blocked"),
+    /could not be inspected.*blocked\.config\.toml/i
+  );
+  await chmod(unreadableProfile, 0o600);
+
+  await writeFile(
+    join(codexHome, "work.config.toml"),
+    'developer_instructions = "selected profile"\n',
+    { mode: 0o600 }
+  );
+  assert.deepEqual(inspection("work"), {
+    status: "configured",
+    source: join(codexHome, "work.config.toml")
+  });
+
+  await writeFile(join(codexHome, "work.config.toml"), "", { mode: 0o600 });
+  await writeFile(
+    join(projectConfig, "config.toml"),
+    '"developer_instructions" = "project policy"\n',
+    { mode: 0o600 }
+  );
+  assert.deepEqual(inspection("work"), {
+    status: "configured",
+    source: join(projectConfig, "config.toml")
+  });
+
+  await writeFile(join(projectConfig, "config.toml"), "", { mode: 0o600 });
+  await writeFile(
+    join(codexHome, "work.config.toml"),
+    String.raw`"\u0064eveloper_instructions" = "escaped selected policy"` + "\n",
+    { mode: 0o600 }
+  );
+  assert.deepEqual(inspection("work"), {
+    status: "configured",
+    source: join(codexHome, "work.config.toml")
+  });
+
+  await writeFile(join(codexHome, "work.config.toml"), "", { mode: 0o600 });
+  await writeFile(
+    join(codexHome, "config.toml"),
+    String.raw`"\u0064eveloper_instructions" = "escaped root policy"` + "\n",
+    { mode: 0o600 }
+  );
+  assert.deepEqual(inspection(), {
+    status: "configured",
+    source: join(codexHome, "config.toml")
+  });
+
+  await writeFile(
+    join(codexHome, "config.toml"),
+    [
+      String.raw`"\U00000066oo" = "valid unrelated Unicode key"`,
+      'note = "developer_instructions in a value is not a setting"',
+      "# developer_instructions = \"comment only\"",
+      "[nested]",
+      'developer_instructions = "nested value"'
+    ].join("\n"),
+    { mode: 0o600 }
+  );
+  assert.equal(inspection().status, "absent");
+
+  await writeFile(
+    join(codexHome, "config.toml"),
+    String.raw`"\U00000064eveloper_instructions" = "eight-digit escape"` + "\n",
+    { mode: 0o600 }
+  );
+  assert.deepEqual(inspection(), {
+    status: "configured",
+    source: join(codexHome, "config.toml")
+  });
+
+  t.after(async () => {
+    await import("node:fs/promises").then(({ rm }) => rm(codexHome, { recursive: true, force: true }));
+  });
+});
+
+test("Codex config inspection lexes comments and string boundaries without hiding managed keys", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "yui-codex-config-lexer-"));
+  const codexHome = join(root, "codex-home");
+  const workspace = join(root, "workspace");
+  const configPath = join(codexHome, "config.toml");
+  await mkdir(codexHome);
+  await mkdir(workspace);
+  const inspect = () => inspectCodexLaunchConfig({
+    environment: { CODEX_HOME: codexHome },
+    workspace,
+    systemConfigPath: join(root, "missing-system.toml"),
+    managedConfigPath: join(root, "missing-managed.toml")
+  });
+
+  await writeFile(
+    configPath,
+    [
+      'ordinary = 1 # a comment containing """ and \'\'\'',
+      'basic = "a # is data and \'\'\' is not a multiline opener"',
+      String.raw`escaped_basic = "escaped \"\"\" stays in one basic string"`,
+      "literal = 'a # is data and \"\"\" is not a multiline opener'",
+      'developer_instructions = "native policy"',
+      'notify = ["native-notifier"]'
+    ].join("\n"),
+    { mode: 0o600 }
+  );
+  assert.deepEqual(inspect(), {
+    developerInstructions: { status: "configured", source: configPath },
+    notify: { status: "configured", source: configPath }
+  });
+
+  await writeFile(
+    configPath,
+    [
+      'ordinary = """',
+      "developer_instructions = \"multiline content, not a root assignment\"",
+      "''' is still ordinary content in a multiline basic string",
+      '"""',
+      "literal = '''",
+      'notify = ["multiline content, not a root assignment"]',
+      '""" is still ordinary content in a multiline literal string',
+      "'''",
+      'notify = ["native-notifier"]'
+    ].join("\n"),
+    { mode: 0o600 }
+  );
+  assert.deepEqual(inspect(), {
+    developerInstructions: { status: "absent" },
+    notify: { status: "configured", source: configPath }
+  });
+
+  for (const malformed of [
+    'ordinary = """\nunterminated',
+    'ordinary = "unterminated',
+    "ordinary = 'unterminated",
+    'ordinary = 1 """not a legal second value"""\nnotify = ["must-not-be-hidden"]',
+    'ordinary = [\nnotify = ["not an array element"]\n]',
+    "this is not a TOML assignment\nnotify = [\"hidden-after-ambiguous-line\"]"
+  ]) {
+    await writeFile(configPath, malformed, { mode: 0o600 });
+    assert.throws(
+      inspect,
+      /could not be inspected reliably.*(?:ambiguous|unterminated)/i
+    );
+  }
+
+  t.after(async () => {
+    await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }));
+  });
+});
+
+test("Codex config inspection cannot miss a project layer behind custom root markers", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "yui-codex-project-root-"));
+  const codexHome = join(root, "codex-home");
+  const project = join(root, "project");
+  const workspace = join(project, "nested", "workspace");
+  const projectConfig = join(project, ".codex", "config.toml");
+  await mkdir(codexHome);
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(project, ".codex"));
+  await writeFile(
+    join(codexHome, "config.toml"),
+    'project_root_markers = [".custom-root"]\n',
+    { mode: 0o600 }
+  );
+  await writeFile(join(project, ".custom-root"), "", { mode: 0o600 });
+  await writeFile(
+    projectConfig,
+    'developer_instructions = "project policy"\n',
+    { mode: 0o600 }
+  );
+
+  assert.deepEqual(inspectCodexDeveloperInstructions({
+    environment: { CODEX_HOME: codexHome },
+    workspace,
+    systemConfigPath: join(root, "missing-system.toml"),
+    managedConfigPath: join(root, "missing-managed.toml")
+  }), {
+    status: "configured",
+    source: projectConfig
+  });
+
+  t.after(async () => {
+    await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }));
+  });
+});
+
+test("Codex config inspection includes system and managed defaults and fails closed when unreadable", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "yui-codex-host-layers-"));
+  const codexHome = join(root, "codex-home");
+  const workspace = join(root, "workspace");
+  const systemConfigPath = join(root, "system-config.toml");
+  const managedConfigPath = join(root, "managed-config.toml");
+  await mkdir(codexHome);
+  await mkdir(workspace);
+  await writeFile(join(codexHome, "config.toml"), "", { mode: 0o600 });
+  const inspect = () => inspectCodexDeveloperInstructions({
+    environment: { CODEX_HOME: codexHome },
+    workspace,
+    systemConfigPath,
+    managedConfigPath
+  });
+
+  await writeFile(
+    systemConfigPath,
+    'developer_instructions = "system policy"\n',
+    { mode: 0o600 }
+  );
+  assert.deepEqual(inspect(), {
+    status: "configured",
+    source: systemConfigPath
+  });
+
+  await writeFile(systemConfigPath, "", { mode: 0o600 });
+  await writeFile(
+    managedConfigPath,
+    'developer_instructions = "managed policy"\n',
+    { mode: 0o600 }
+  );
+  assert.deepEqual(inspect(), {
+    status: "configured",
+    source: managedConfigPath
+  });
+
+  await chmod(managedConfigPath, 0o000);
+  assert.throws(inspect, /could not be inspected.*managed-config\.toml/i);
+  await chmod(managedConfigPath, 0o600);
+
+  t.after(async () => {
+    await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }));
+  });
+});
+
+test("Codex launch inspection detects notify in every native config layer", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "yui-codex-notify-layers-"));
+  const codexHome = join(root, "codex-home");
+  const workspace = join(root, "project", "workspace");
+  const systemConfigPath = join(root, "system-config.toml");
+  const userConfigPath = join(codexHome, "config.toml");
+  const profileConfigPath = join(codexHome, "work.config.toml");
+  const projectConfigPath = join(workspace, ".codex", "config.toml");
+  const managedConfigPath = join(root, "managed-config.toml");
+  const paths = [
+    systemConfigPath,
+    userConfigPath,
+    profileConfigPath,
+    projectConfigPath,
+    managedConfigPath
+  ];
+  await mkdir(codexHome);
+  await mkdir(join(workspace, ".codex"), { recursive: true });
+  const clear = async () => {
+    await Promise.all(paths.map((path) => writeFile(path, "", { mode: 0o600 })));
+  };
+  const inspect = () => inspectCodexLaunchConfig({
+    environment: { CODEX_HOME: codexHome },
+    workspace,
+    profile: "work",
+    systemConfigPath,
+    managedConfigPath
+  });
+
+  for (const path of paths) {
+    await clear();
+    await writeFile(path, 'notify = ["native-notifier"]\n', { mode: 0o600 });
+    assert.deepEqual(inspect(), {
+      developerInstructions: { status: "absent" },
+      notify: { status: "configured", source: path }
+    });
+  }
+
+  await clear();
+  await writeFile(
+    userConfigPath,
+    String.raw`"\u006eotify" = ["escaped-notifier"]` + "\n",
+    { mode: 0o600 }
+  );
+  assert.deepEqual(inspect().notify, {
+    status: "configured",
+    source: userConfigPath
+  });
+
+  await clear();
+  await chmod(managedConfigPath, 0o000);
+  assert.throws(inspect, /could not be inspected.*managed-config\.toml/i);
+  await chmod(managedConfigPath, 0o600);
+
+  t.after(async () => {
+    await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }));
+  });
+});
+
+test("Codex config inspection follows the launch HOME when CODEX_HOME is unset", async (t) => {
+  const launchHome = await mkdtemp(join(tmpdir(), "yui-codex-launch-home-"));
+  const codexHome = join(launchHome, ".codex");
+  const workspace = join(launchHome, "workspace");
+  await mkdir(codexHome, { recursive: true });
+  await mkdir(workspace);
+  await writeFile(
+    join(codexHome, "config.toml"),
+    'developer_instructions = "launch-home policy"\n',
+    { mode: 0o600 }
+  );
+
+  assert.deepEqual(inspectCodexDeveloperInstructions({
+    environment: { HOME: launchHome },
+    workspace,
+    systemConfigPath: join(launchHome, "missing-system.toml"),
+    managedConfigPath: join(launchHome, "missing-managed.toml")
+  }), {
+    status: "configured",
+    source: join(codexHome, "config.toml")
+  });
+
+  t.after(async () => {
+    await import("node:fs/promises").then(({ rm }) => rm(launchHome, { recursive: true, force: true }));
+  });
+});
+
+test("Claude structured config compiles permissions and preallocated session lifecycle", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "yui-claude-context-"));
+  const contextFile = join(root, "runtime", "session-contexts", "role.md");
   const agent = configured("claude-personal", "claude", "claude-wrapper");
   const config = {
     adapterId: "claude",
@@ -183,6 +556,7 @@ test("Claude structured config compiles permissions and preallocated session lif
     config,
     workspace: "/tmp",
     developerInstructions: "Lead safely.",
+    managedContextFile: contextFile,
     skills: [{ id: "yui-leader", path: "/skills/yui-leader", content: "Leader skill body." }]
   });
 
@@ -194,9 +568,14 @@ test("Claude structured config compiles permissions and preallocated session lif
     "--disallowed-tools", "WebFetch",
     "--settings", "/tmp/claude-settings.json",
     "--setting-sources", "user,project",
-    "--append-system-prompt", "Lead safely.\n\n# Yui Skill: yui-leader\n\nLeader skill body.",
+    "--append-system-prompt-file", contextFile,
     "--verbose"
   ]);
+  assert.equal(
+    await readFile(contextFile, "utf8"),
+    "Lead safely.\n\n# Yui Skill: yui-leader\n\nLeader skill body."
+  );
+  assert.equal((await stat(contextFile)).mode & 0o777, 0o600);
   assert.equal(compiled.sessionStrategy, "preallocated");
   assert.deepEqual(
     adapter.compileResume({
@@ -204,11 +583,37 @@ test("Claude structured config compiles permissions and preallocated session lif
       config,
       workspace: "/tmp",
       developerInstructions: "Lead safely.",
+      managedContextFile: contextFile,
       skills: [{ id: "yui-leader", path: "/skills/yui-leader", content: "Leader skill body." }],
       nativeSessionId: "claude-session"
     }).argv,
     [...compiled.argv, "--resume", "claude-session"]
   );
+  t.after(async () => {
+    await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }));
+  });
+});
+
+test("Claude writes large native session context to a private managed file instead of argv", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "yui-claude-large-context-"));
+  const contextFile = join(root, "managed", "role.md");
+  const content = "x".repeat(140 * 1024);
+  const adapter = resolveAgentAdapter("claude");
+  const compiled = adapter.compileNew({
+    agent: configured("claude-personal", "claude", "claude-wrapper"),
+    config: { adapterId: "claude" },
+    workspace: "/tmp",
+    developerInstructions: content,
+    managedContextFile: contextFile
+  });
+
+  assert.deepEqual(compiled.argv, ["--append-system-prompt-file", contextFile]);
+  assert.equal(compiled.argv.some((argument) => argument.includes(content.slice(0, 1024))), false);
+  assert.equal(await readFile(contextFile, "utf8"), content);
+  assert.equal((await stat(contextFile)).mode & 0o777, 0o600);
+  t.after(async () => {
+    await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }));
+  });
 });
 
 test("capability inspection probes version and installed CLI metadata without launch arguments", () => {

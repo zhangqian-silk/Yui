@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import type { Readable } from "node:stream";
+import { stripVTControlCharacters } from "node:util";
 import { runtimeError } from "../errors/cliError.js";
 import { handoffTerminal, type TerminalInput } from "./terminalHandoff.js";
 import {
@@ -12,6 +13,7 @@ import {
 const DEFAULT_READINESS_TIMEOUT_MS = 15_000;
 const DEFAULT_READINESS_POLL_MS = 50;
 const DEFAULT_COMMAND_TIMEOUT_MS = 5_000;
+const PANE_STATE_MARKER = "__YUI_PANE_STATE__";
 const NATIVE_SCROLL_TERMINAL_FEATURES = [
   "256", "RGB", "clipboard", "ccolour", "cstyle", "extkeys", "focus",
   "hyperlinks", "ignorefkeys", "mouse", "osc7", "overline", "rectfill",
@@ -38,6 +40,10 @@ export type TmuxPaneState = Readonly<{
   pid?: number;
   currentCommand: string;
   content: string;
+  styledContent?: string;
+  cursorX?: number;
+  cursorY?: number;
+  historySize?: number;
 }>;
 
 export type TmuxRolePaneState = Readonly<{
@@ -295,8 +301,8 @@ export class TmuxManager {
     const pidText = output.slice(separator + 1, secondSeparator);
     const currentCommand = output.slice(secondSeparator + 1);
     const pid = Number(pidText);
-    const content = this.run([
-      "capture-pane", "-p", "-t", target, "-S", "-40"
+    const styledContent = this.run([
+      "capture-pane", "-ep", "-t", target, "-S", "-40"
     ]);
     return {
       taskId,
@@ -305,39 +311,94 @@ export class TmuxManager {
       dead: dead === "1",
       ...(Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),
       currentCommand,
-      content
+      content: stripVTControlCharacters(styledContent),
+      styledContent
     };
   }
 
   async inspectPaneAsync(taskId: string, roleName: string): Promise<TmuxPaneState> {
+    return (await this.inspectDeliveryPaneAsync(taskId, roleName)).pane;
+  }
+
+  /**
+   * Reads receipt, pane identity, cursor fence and styled terminal contents
+   * through one tmux client. The styled snapshot lets adapter probes distinguish
+   * an empty placeholder from user-authored composer text.
+   */
+  private async inspectDeliveryPaneAsync(
+    taskId: string,
+    roleName: string,
+    receiptId?: string
+  ): Promise<Readonly<{ pane: TmuxPaneState; receiptPresent: boolean }>> {
     const target = this.target(taskId, roleName);
-    const [stateOutput, content] = await Promise.all([
-      this.runAsync([
-        "display-message", "-p", "-t", target,
-        "#{pane_dead}|#{pane_pid}|#{pane_current_command}"
-      ]),
-      this.runAsync([
-        "capture-pane", "-p", "-t", target, "-S", "-40"
-      ])
+    const receiptOption = receiptId === undefined
+      ? undefined
+      : deliveryReceiptOption(receiptId);
+    const receiptFormat = receiptOption === undefined ? "" : `#{${receiptOption}}`;
+    const output = await this.runAsync([
+      "display-message", "-p", "-t", target,
+      [
+        PANE_STATE_MARKER,
+        "#{pane_dead}",
+        "#{pane_pid}",
+        "#{cursor_x}",
+        "#{cursor_y}",
+        "#{history_size}",
+        "#{pane_current_command}",
+        receiptFormat
+      ].join("|"),
+      ";",
+      "capture-pane", "-ep", "-t", target, "-S", "-40"
     ]);
-    const output = stateOutput.trim();
-    const separator = output.indexOf("|");
-    const secondSeparator = separator < 0 ? -1 : output.indexOf("|", separator + 1);
-    if (separator < 0 || secondSeparator < 0) {
+    const newline = output.indexOf("\n");
+    if (newline < 0) {
       throw runtimeError(`Tmux returned an invalid pane state for ${roleName}.`);
     }
-    const dead = output.slice(0, separator);
-    const pidText = output.slice(separator + 1, secondSeparator);
-    const currentCommand = output.slice(secondSeparator + 1);
-    const pid = Number(pidText);
-    return {
-      taskId,
-      roleName,
-      target,
-      dead: dead === "1",
-      ...(Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),
+    const state = output.slice(0, newline).split("|");
+    if (state.length !== 8 || state[0] !== PANE_STATE_MARKER) {
+      throw runtimeError(`Tmux returned an invalid pane state for ${roleName}.`);
+    }
+    const [
+      ,
+      deadText,
+      pidText,
+      cursorXText,
+      cursorYText,
+      historySizeText,
       currentCommand,
-      content
+      receiptText
+    ] = state;
+    if (
+      (deadText !== "0" && deadText !== "1")
+      || currentCommand === undefined
+      || receiptText === undefined
+      || (receiptText !== "" && receiptText !== "1")
+    ) {
+      throw runtimeError(`Tmux returned an invalid pane state for ${roleName}.`);
+    }
+    const pid = positiveNumber(pidText);
+    const cursorX = nonNegativeNumber(cursorXText);
+    const cursorY = nonNegativeNumber(cursorYText);
+    const historySize = nonNegativeNumber(historySizeText);
+    if (cursorX === undefined || cursorY === undefined || historySize === undefined) {
+      throw runtimeError(`Tmux returned an invalid pane state for ${roleName}.`);
+    }
+    const styledContent = output.slice(newline + 1);
+    return {
+      pane: {
+        taskId,
+        roleName,
+        target,
+        dead: deadText === "1",
+        ...(pid === undefined ? {} : { pid }),
+        currentCommand,
+        content: stripVTControlCharacters(styledContent),
+        styledContent,
+        cursorX,
+        cursorY,
+        historySize
+      },
+      receiptPresent: receiptText === "1"
     };
   }
 
@@ -562,19 +623,18 @@ export class TmuxManager {
     taskId: string,
     roleName: string,
     receiptId: string,
-    input: string
-  ): Promise<TmuxDeliveryOutcome> {
+    input: string,
+    expectedPane?: TmuxPaneState
+  ): Promise<TmuxDeliveryOutcome | "not-ready"> {
     safeValue(receiptId, "tmux delivery receipt id");
     safeValue(input, "tmux input");
-    if (await this.hasDeliveryReceiptAsync(taskId, roleName, receiptId)) {
-      return "already-sent";
-    }
     const target = this.target(taskId, roleName);
     const digest = createHash("sha256").update(receiptId).digest("hex");
-    const option = `@yui_delivery_${digest}`;
+    const option = deliveryReceiptOption(receiptId);
     const buffer = `yui_delivery_${digest}`;
     const sentMarker = `__YUI_DELIVERY_SENT_${digest}__`;
     const presentMarker = `__YUI_DELIVERY_PRESENT_${digest}__`;
+    const notReadyMarker = `__YUI_DELIVERY_NOT_READY_${digest}__`;
     const alreadyApplied = [
       `delete-buffer -b ${buffer}`,
       `display-message -p ${presentMarker}`
@@ -585,16 +645,31 @@ export class TmuxManager {
       `set-option -w -t ${tmuxWord(target)} ${option} 1`,
       `display-message -p ${sentMarker}`
     ].join(" ; ");
+    const guard = expectedPane === undefined ? undefined : deliveryPaneGuard(expectedPane);
+    const applyIfUnchanged = guard === undefined
+      ? apply
+      : [
+          "if-shell -t",
+          tmuxWord(target),
+          "-F",
+          tmuxWord(guard),
+          tmuxWord(apply),
+          tmuxWord([
+            `delete-buffer -b ${buffer}`,
+            `display-message -p ${notReadyMarker}`
+          ].join(" ; "))
+        ].join(" ");
     try {
       const output = (await this.runAsync([
         "set-buffer", "-b", buffer, "--", input,
         ";",
         "if-shell", "-t", target, "-F", `#{==:#{${option}},1}`,
         alreadyApplied,
-        apply
+        applyIfUnchanged
       ])).trim();
       if (output === sentMarker) return "sent";
       if (output === presentMarker) return "already-sent";
+      if (output === notReadyMarker) return "not-ready";
       throw runtimeError(`Tmux did not confirm delivery receipt ${receiptId}.`);
     } catch (error) {
       try {
@@ -629,15 +704,26 @@ export class TmuxManager {
     receiptId: string,
     input: string,
     readinessProbe?: TmuxReadinessProbe
-  ): Promise<TmuxDeliveryOutcome | "not-ready"> {
+  ): Promise<TmuxDeliveryOutcome | "not-ready" | "unavailable"> {
     if (readinessProbe === undefined) {
       throw new TmuxReadinessProbeRequiredError();
     }
-    if (await this.hasDeliveryReceiptAsync(taskId, roleName, receiptId)) {
-      return "already-sent";
+    let inspected: Readonly<{ pane: TmuxPaneState; receiptPresent: boolean }>;
+    try {
+      inspected = await this.inspectDeliveryPaneAsync(taskId, roleName, receiptId);
+    } catch (error) {
+      if (isExplicitlyAbsentTmuxSession(error)) return "unavailable";
+      throw error;
     }
-    if (!readinessProbe(await this.inspectPaneAsync(taskId, roleName))) return "not-ready";
-    return this.sendReadyRoleInputOnceAsync(taskId, roleName, receiptId, input);
+    if (inspected.receiptPresent) return "already-sent";
+    if (!readinessProbe(inspected.pane)) return "not-ready";
+    return this.sendReadyRoleInputOnceAsync(
+      taskId,
+      roleName,
+      receiptId,
+      input,
+      inspected.pane
+    );
   }
 
   hasDeliveryReceipt(taskId: string, roleName: string, receiptId: string): boolean {
@@ -647,19 +733,6 @@ export class TmuxManager {
     return this.run([
       "show-options", "-wqv", "-t", this.target(taskId, roleName), option
     ]).trim() === "1";
-  }
-
-  async hasDeliveryReceiptAsync(
-    taskId: string,
-    roleName: string,
-    receiptId: string
-  ): Promise<boolean> {
-    safeValue(receiptId, "tmux delivery receipt id");
-    const digest = createHash("sha256").update(receiptId).digest("hex");
-    const option = `@yui_delivery_${digest}`;
-    return (await this.runAsync([
-      "show-options", "-wqv", "-t", this.target(taskId, roleName), option
-    ])).trim() === "1";
   }
 
   detachRole(taskId: string): void {
@@ -761,18 +834,18 @@ export class TmuxManager {
     ]).split("\n").map((name) => name.trim()).filter(Boolean);
   }
 
-  private async windowNamesAsync(taskId: string): Promise<string[]> {
-    return (await this.sessionWindowNamesAsync(taskId)).names;
-  }
-
   private async sessionWindowNamesAsync(
     taskId: string
   ): Promise<Readonly<{ exists: boolean; names: string[] }>> {
-    if (!(await this.hasSessionAsync(taskId))) return { exists: false, names: [] };
-    const names = (await this.runAsync([
-      "list-windows", "-t", this.sessionName(taskId), "-F", "#{window_name}"
-    ])).split("\n").map((name) => name.trim()).filter(Boolean);
-    return { exists: true, names };
+    try {
+      const names = (await this.runAsync([
+        "list-windows", "-t", this.sessionName(taskId), "-F", "#{window_name}"
+      ])).split("\n").map((name) => name.trim()).filter(Boolean);
+      return { exists: true, names };
+    } catch (error) {
+      if (isExplicitlyAbsentTmuxSession(error)) return { exists: false, names: [] };
+      throw error;
+    }
   }
 
   private sessionName(taskId: string): string {
@@ -932,9 +1005,10 @@ function launchCommand(launch: TmuxLaunchPlan): string[] {
     }
     return `${key}=${safeValue(value, `Agent environment ${key}`)}`;
   });
-  return environment.length === 0
-    ? [command, ...args]
-    : ["env", ...environment, command, ...args];
+  // The launch plan is a complete environment assembled by the planner for
+  // this exact Agent. Never inherit the Controller or tmux server environment:
+  // it may contain credentials belonging to another configured Agent.
+  return ["env", "-i", "--", ...environment, command, ...args];
 }
 
 function isExplicitlyAbsentTmuxSession(error: unknown): boolean {
@@ -945,6 +1019,48 @@ function isExplicitlyAbsentTmuxSession(error: unknown): boolean {
 
 function tmuxWord(value: string): string {
   return JSON.stringify(value);
+}
+
+function deliveryReceiptOption(receiptId: string): string {
+  safeValue(receiptId, "tmux delivery receipt id");
+  return `@yui_delivery_${createHash("sha256").update(receiptId).digest("hex")}`;
+}
+
+function deliveryPaneGuard(pane: TmuxPaneState): string {
+  if (
+    pane.dead
+    || pane.pid === undefined
+    || pane.cursorX === undefined
+    || pane.cursorY === undefined
+    || pane.historySize === undefined
+    || !/^[A-Za-z0-9_.+-]+$/.test(pane.currentCommand)
+  ) {
+    return "0";
+  }
+  const comparisons = [
+    "#{==:#{pane_dead},0}",
+    `#{==:#{pane_pid},${pane.pid}}`,
+    `#{==:#{cursor_x},${pane.cursorX}}`,
+    `#{==:#{cursor_y},${pane.cursorY}}`,
+    `#{==:#{history_size},${pane.historySize}}`,
+    `#{==:#{pane_current_command},${pane.currentCommand}}`
+  ];
+  return comparisons.slice(1).reduce(
+    (combined, comparison) => `#{&&:${combined},${comparison}}`,
+    comparisons[0]!
+  );
+}
+
+function positiveNumber(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function nonNegativeNumber(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 function safeValue(value: string, label: string): string {

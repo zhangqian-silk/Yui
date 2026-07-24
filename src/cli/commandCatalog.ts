@@ -171,6 +171,7 @@ const roleChildren: readonly NodeInput[] = [
   },
   { name: "remove", summary: "Remove a global Role.", usage: "yui role remove <name>" },
   { name: "bind", summary: "Bind and activate an Agent for a global Role.", usage: "yui role bind <role> <agent-id>" },
+  { name: "unbind", summary: "Unbind a dormant Agent from a global Role.", usage: "yui role unbind <role> <agent-id>" },
   { name: "enter", summary: "Enter a global Role's native session.", usage: "yui role enter <role>" },
   {
     name: "session",
@@ -277,7 +278,7 @@ const taskChildren: readonly NodeInput[] = [
     name: "role",
     summary: "Manage Roles within a Task.",
     sections: [{ id: "manage", title: "Commands", entries: [
-      "add", "list", "status", "show", "update", "remove", "bind", "enter"
+      "add", "list", "status", "show", "update", "remove", "bind", "unbind", "enter"
     ] }],
     children: [
       {
@@ -304,6 +305,7 @@ const taskChildren: readonly NodeInput[] = [
       },
       { name: "remove", summary: "Remove a Task Role.", usage: "yui task role remove <task> <role>" },
       { name: "bind", summary: "Bind and activate an Agent for a Task Role.", usage: "yui task role bind <task> <role> <agent-id>" },
+      { name: "unbind", summary: "Unbind a dormant Agent from a Task Role.", usage: "yui task role unbind <task> <role> <agent-id>" },
       { name: "enter", summary: "Enter a Task Role's native session.", usage: "yui task role enter <task> <role>" }
     ]
   },
@@ -523,7 +525,7 @@ export const ROOT_COMMAND = buildNode({
       summary: "Manage reusable global Roles and their native sessions.",
       sections: [
         { id: "inspect", title: "Inspect", entries: ["list", "show"] },
-        { id: "manage", title: "Manage", entries: ["add", "update", "remove", "bind"] },
+        { id: "manage", title: "Manage", entries: ["add", "update", "remove", "bind", "unbind"] },
         { id: "sessions", title: "Sessions", entries: ["enter", "session"] }
       ],
       children: roleChildren

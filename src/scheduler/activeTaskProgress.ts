@@ -23,18 +23,19 @@ export function repairOrphanedActiveTasks(
       store.getActiveAgentRun(task.id, role.name) !== null
     ));
     const hasInFlightTurn = roles.some((role) => store.hasInFlightTurn(task.id, role.name));
+    const leaderTarget = { kind: "role", taskId: task.id, roleName: "leader" } as const;
+    const leaderMailbox = store.getWorkMailbox(leaderTarget);
     if (
       hasActiveRun
       || hasInFlightTurn
       || store.hasOpenInputRequest(task.id)
       || store.getLeaderFailure(task.id) !== null
       || store.getOperatorNotification(task.id) !== null
-      || hasTaskOrLeaderPendingWork(store, task.id)
+      || hasUnclaimedLeaderWork(store, task.id, leaderMailbox)
     ) {
       continue;
     }
 
-    const leaderTarget = { kind: "role", taskId: task.id, roleName: "leader" } as const;
     if (
       task.repositoryId !== undefined
       && task.cwd === undefined
@@ -42,10 +43,17 @@ export function repairOrphanedActiveTasks(
     ) {
       store.queueTaskProgress(task.id, "task-orphaned", now);
     }
-    const leaderMailbox = store.getWorkMailbox(leaderTarget);
     if (leaderMailbox?.processing !== null && leaderMailbox?.processing !== undefined) {
-      if (store.releaseWorkMailbox(leaderTarget, leaderMailbox.processing.batchId)) {
-        queueLeaderWakeup(store, task.id, "task-orphaned", now);
+      const recovered = store.releaseLeaderWakeupAndEnqueue === undefined
+        ? store.releaseWorkMailbox(leaderTarget, leaderMailbox.processing.batchId)
+          && (queueLeaderWakeup(store, task.id, "task-orphaned", now), true)
+        : store.releaseLeaderWakeupAndEnqueue(
+            task.id,
+            leaderMailbox.processing.batchId,
+            "task-orphaned",
+            now
+          );
+      if (recovered) {
         repaired.push(task.id);
       }
       continue;
@@ -57,15 +65,12 @@ export function repairOrphanedActiveTasks(
   return repaired;
 }
 
-function hasTaskOrLeaderPendingWork(
-  store: SchedulerStorePort,
-  taskId: string
+function hasUnclaimedLeaderWork(
+  store: Pick<SchedulerStorePort, "getPendingWakeup">,
+  taskId: string,
+  leaderMailbox: ReturnType<SchedulerStorePort["getWorkMailbox"]>
 ): boolean {
-  if (store.getPendingWakeup(taskId) !== null) return true;
-  const leaderMailbox = store.getWorkMailbox({
-    kind: "role",
-    taskId,
-    roleName: "leader"
-  });
-  return leaderMailbox?.pending !== null && leaderMailbox?.pending !== undefined;
+  if (leaderMailbox === null) return store.getPendingWakeup(taskId) !== null;
+  return leaderMailbox?.processing === null
+    && leaderMailbox.pending !== null;
 }

@@ -77,6 +77,33 @@ test("jobs list presents pending wakeups and Leader recovery with stable ids", (
   assert.match(output, /resume failed/);
 });
 
+test("jobs list reads presentation timezone once per command", () => {
+  let getConfigCalls = 0;
+  const store = {
+    listTasks: () => [1, 2, 3].map((number) => ({
+      id: `task-${number}`,
+      updatedAt: NOW.toISOString()
+    })),
+    getPendingWakeup: (taskId) => ({
+      taskId,
+      reasons: ["changed"],
+      requestCount: 1,
+      lastRequestedAt: NOW.toISOString()
+    }),
+    getLeaderFailure: () => null,
+    getOperatorNotification: () => null,
+    getConfig() {
+      getConfigCalls += 1;
+      return { schemaVersion: 1, timeZone: "Asia/Shanghai" };
+    }
+  };
+
+  const output = runJobCommand(["list"], store);
+
+  assert.match(output, /leader-wakeup:task-3/);
+  assert.equal(getConfigCalls, 1);
+});
+
 test("jobs retry atomically replaces recovery state with a recovery-retry wake", (t) => {
   const { store, task, runtime, changed } = fixture(t);
   saveRecovery(store, task.id);

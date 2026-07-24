@@ -1,0 +1,211 @@
+import assert from "node:assert/strict";
+import {
+  mkdtempSync,
+  readFileSync,
+  rmSync
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+import { createConfiguredAgent } from "../../dist/agent/agent.js";
+import {
+  refreshRunningFileTaskControllerEnvironment
+} from "../../dist/controller/clientRuntime.js";
+import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
+import { createRuntimeLifecycleDispatcher } from "../../dist/controller/runtime.js";
+import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
+import {
+  createRole,
+  createRoleAgentBinding
+} from "../../dist/role/role.js";
+import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import { FileTaskStore } from "../../dist/storage/taskStore.js";
+import { activateTask, createTask } from "../../dist/task/task.js";
+
+const NOW = new Date("2026-07-24T00:00:00.000Z");
+
+function fixture(t) {
+  const home = mkdtempSync(join(tmpdir(), "yui-env-refresh-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new FileTaskStore(home);
+  const agent = createConfiguredAgent(
+    "codex-env",
+    "codex",
+    "codex-test",
+    [],
+    [{
+      target: "OPENAI_API_KEY",
+      source: "process",
+      sourceName: "YUI_OPENAI_KEY",
+      required: true
+    }],
+    NOW
+  );
+  const task = activateTask(createTask("task-1", "Environment refresh", NOW), NOW);
+  const role = createRole(
+    task.id,
+    "leader",
+    [createRoleAgentBinding(agent)],
+    agent.id,
+    home,
+    NOW
+  );
+  store.transaction((tx) => {
+    tx.saveConfiguredAgent(agent);
+    tx.saveTask(task);
+    tx.saveRole(task.id, role);
+  });
+  return { home, store, agent, task, role };
+}
+
+test("planner environment refresh is private, additive, and used by background launches", (t) => {
+  const { home, store, agent, task, role } = fixture(t);
+  const source = {};
+  const planner = new FileRoleLaunchPlanner(home, store, {
+    environment: source,
+    cliPath: "/dist/cli.js"
+  });
+  const input = {
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    mode: "new"
+  };
+
+  assert.throws(() => planner.plan(input), /required agent environment is missing/i);
+  planner.mergeEnvironment({ YUI_OPENAI_KEY: "secret-one" });
+  assert.equal(planner.plan(input).launch.env.OPENAI_API_KEY, "secret-one");
+  planner.mergeEnvironment({ UNRELATED_VALUE: "ignored-by-agent" });
+  assert.equal(planner.plan(input).launch.env.OPENAI_API_KEY, "secret-one");
+  assert.deepEqual(source, {});
+  assert.equal(process.env.YUI_OPENAI_KEY, undefined);
+});
+
+test("environment refresh RPC accepts only current source bindings and never persists values", async (t) => {
+  const { home, store, agent, task, role } = fixture(t);
+  const planner = new FileRoleLaunchPlanner(home, store, {
+    environment: {},
+    cliPath: "/dist/cli.js"
+  });
+  const schedulerStore = new FileSchedulerStoreAdapter(store);
+  const unusedHost = {};
+  const dispatch = createRuntimeLifecycleDispatcher(
+    store,
+    schedulerStore,
+    unusedHost,
+    undefined,
+    undefined,
+    undefined,
+    planner
+  );
+
+  const secret = "refresh-secret-not-on-disk";
+  assert.deepEqual(
+    await dispatch("runtime.merge-agent-environment", {
+      sources: { YUI_OPENAI_KEY: secret }
+    }),
+    { merged: true, count: 1 }
+  );
+  assert.equal(planner.plan({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    mode: "new"
+  }).launch.env.OPENAI_API_KEY, secret);
+  assert.equal(readFileSync(join(home, "state.json"), "utf8").includes(secret), false);
+
+  await assert.rejects(dispatch("runtime.merge-agent-environment", {
+    sources: {
+      YUI_OPENAI_KEY: "must-not-merge",
+      OPENAI_API_KEY: "target-only"
+    }
+  }), /not declared: OPENAI_API_KEY/i);
+  await assert.rejects(dispatch("runtime.merge-agent-environment", {
+    sources: { YUI_HOME: "managed" }
+  }), /source is invalid: YUI_HOME/i);
+  assert.equal(planner.plan({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    mode: "new"
+  }).launch.env.OPENAI_API_KEY, secret);
+});
+
+test("refresh helper sends present declared sources and never starts an absent Controller", async (t) => {
+  const { home, store } = fixture(t);
+  const calls = [];
+  const refreshed = await refreshRunningFileTaskControllerEnvironment(
+    home,
+    store,
+    {
+      YUI_OPENAI_KEY: "present",
+      OPENAI_API_KEY: "target-only",
+      UNDECLARED_SECRET: "not-forwarded"
+    },
+    {
+      call: async (...input) => {
+        calls.push(input);
+        return { merged: true, count: 1 };
+      },
+      spawnController: () => {
+        throw new Error("must not start Controller");
+      }
+    }
+  );
+  assert.equal(refreshed, true);
+  assert.deepEqual(calls[0].slice(1, 3), [
+    "runtime.merge-agent-environment",
+    { sources: { YUI_OPENAI_KEY: "present" } }
+  ]);
+
+  let spawnCount = 0;
+  const unavailable = await refreshRunningFileTaskControllerEnvironment(
+    home,
+    store,
+    { YUI_OPENAI_KEY: "present" },
+    {
+      call: async () => {
+        throw Object.assign(new Error("offline"), {
+          code: "CONTROLLER_UNAVAILABLE"
+        });
+      },
+      spawnController: () => { spawnCount += 1; }
+    }
+  );
+  assert.equal(unavailable, false);
+  assert.equal(spawnCount, 0);
+});
+
+test("Agent launch targets cannot overwrite Yui runtime control variables", () => {
+  assert.throws(() => createConfiguredAgent(
+    "unsafe",
+    "codex",
+    "codex",
+    [],
+    [{
+      target: "YUI_CUSTOM",
+      source: "process",
+      sourceName: "SAFE_SOURCE",
+      required: true
+    }],
+    NOW
+  ), /environment binding is invalid/i);
+  assert.doesNotThrow(() => createConfiguredAgent(
+    "safe",
+    "codex",
+    "codex",
+    [],
+    [{
+      target: "OPENAI_API_KEY",
+      source: "process",
+      sourceName: "YUI_OPENAI_KEY",
+      required: true
+    }],
+    NOW
+  ));
+});

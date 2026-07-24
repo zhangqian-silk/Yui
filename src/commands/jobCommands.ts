@@ -48,6 +48,7 @@ function listJobs(args: string[], store: TaskStore): string {
   if (args.length !== 0) throw usageError("Jobs list usage: yui jobs list.");
   const jobs = collectJobs(store);
   if (jobs.length === 0) return "No scheduler jobs found.\n";
+  const timeZone = store.getConfig().timeZone;
   return `${renderTable(
     "Scheduler jobs",
     [
@@ -63,7 +64,7 @@ function listJobs(args: string[], store: TaskStore): string {
       job.taskId,
       job.kind,
       job.status,
-      formatTimestamp(job.updatedAt, store.getConfig().timeZone),
+      formatTimestamp(job.updatedAt, timeZone),
       job.detail
     ]),
     defaultTableWidth()

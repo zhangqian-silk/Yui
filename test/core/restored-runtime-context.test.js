@@ -60,6 +60,19 @@ test("Operator context exposes native developer instructions and a Skill referen
   assert.match(context.skills[0].path, /skills\/yui-operator\/?$/);
 });
 
+test("non-Operator global Roles use neutral context without Task orchestration Skills", () => {
+  for (const name of ["leader", "reviewer"]) {
+    const context = compileRoleSessionContext(undefined, {
+      ...role,
+      name
+    }, { scope: "global" });
+
+    assert.match(context.developerInstructions, new RegExp(`global Yui Role ${name}`));
+    assert.doesNotMatch(context.developerInstructions, /Task|yui-(?:leader|worker)/);
+    assert.deepEqual(context.skills, []);
+  }
+});
+
 test("configured Role policy and Skills stay in native session context, not dispatch text", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-role-context-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
@@ -85,5 +98,19 @@ test("configured Role policy and Skills stay in native session context, not disp
   assert.match(context.developerInstructions, /PRIVATE ROLE POLICY/);
   assert.deepEqual(context.skills.map(({ id }) => id), ["yui-worker", "review-policy"]);
   assert.equal(context.skills[1].content.includes("PRIVATE SKILL BODY"), true);
+  assert.equal(
+    compileRoleSessionContext(home, configuredRole, {
+      scope: "task",
+      taskId: "task-1"
+    }).managedContextFile,
+    context.managedContextFile
+  );
+  assert.notEqual(
+    compileRoleSessionContext(home, configuredRole, {
+      scope: "task",
+      taskId: "task-2"
+    }).managedContextFile,
+    context.managedContextFile
+  );
   assert.doesNotMatch(dispatch, /PRIVATE ROLE POLICY|PRIVATE SKILL BODY/);
 });

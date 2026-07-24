@@ -7,9 +7,14 @@ import { resolveTimeZone } from "../output/timePresentation.js";
 import type { YuiConfig } from "../storage/taskStore.js";
 
 type ConfigCommandStore = Readonly<{
+  transaction<T>(execute: (store: ConfigCommandStore) => T): T;
   getConfig(): YuiConfig;
   saveConfig(config: YuiConfig): void;
 }>;
+
+const CONFIG_SET_USAGE = "Config set usage: yui config set "
+  + "<--time-zone <IANA timezone> | "
+  + "--reconciliation-interval-seconds <seconds>>.";
 
 export function runConfigCommand(args: string[], store: ConfigCommandStore): string {
   const [command, ...rest] = args;
@@ -30,14 +35,18 @@ export function runConfigCommand(args: string[], store: ConfigCommandStore): str
       throw configSetUsageError();
     }
     if (rest[0] === "--time-zone") {
-      const timeZone = resolveTimeZone(rest[1]);
-      store.saveConfig({ ...store.getConfig(), timeZone });
+      const timeZone = validatedConfigValue(() => resolveTimeZone(rest[1]));
+      store.transaction((tx) => {
+        tx.saveConfig({ ...tx.getConfig(), timeZone });
+      });
       return `Time zone set to ${timeZone}\n`;
     }
     if (rest[0] === "--reconciliation-interval-seconds") {
       const reconciliationIntervalSeconds = parseReconciliationIntervalSeconds(rest[1]);
-      reconciliationIntervalMilliseconds(reconciliationIntervalSeconds);
-      store.saveConfig({ ...store.getConfig(), reconciliationIntervalSeconds });
+      validatedConfigValue(() => reconciliationIntervalMilliseconds(reconciliationIntervalSeconds));
+      store.transaction((tx) => {
+        tx.saveConfig({ ...tx.getConfig(), reconciliationIntervalSeconds });
+      });
       return `Reconciliation interval set to ${reconciliationIntervalSeconds} seconds\n`;
     }
     throw configSetUsageError();
@@ -52,10 +61,17 @@ function parseReconciliationIntervalSeconds(value: string): number {
   return Number(value);
 }
 
+function validatedConfigValue<T>(validate: () => T): T {
+  try {
+    return validate();
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw usageError(error.message, CONFIG_SET_USAGE);
+    }
+    throw error;
+  }
+}
+
 function configSetUsageError(): Error {
-  return usageError(
-    "Config set usage: yui config set "
-    + "<--time-zone <IANA timezone> | "
-    + "--reconciliation-interval-seconds <seconds>>."
-  );
+  return usageError(CONFIG_SET_USAGE);
 }

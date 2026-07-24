@@ -183,8 +183,22 @@ test("TmuxSessionHost resumes global owners and stops only the referenced role",
   ]);
   assert.equal(binding.nativeSessionId, "native-1");
 
-  await host.stop(binding);
-  assert.deepEqual(calls.at(-1), ["kill", "global-runtime", "operator"]);
+  assert.deepEqual(
+    await host.inspectOwner({ scope: "global", roleName: "operator" }),
+    { state: "running" }
+  );
+  assert.equal(
+    await host.stopOwner({ scope: "global", roleName: "operator" }),
+    true
+  );
+  assert.equal(
+    calls.some((call) => (
+      call[0] === "kill"
+      && call[1] === "global-runtime"
+      && call[2] === "operator"
+    )),
+    true
+  );
   assert.deepEqual(await host.inspect(binding), {
     state: "stopped",
     nativeSessionId: "native-1"
@@ -242,6 +256,43 @@ test("TmuxSessionHost rejects a planned workspace mismatch before creating a pro
   assert.equal(ensured, false);
 });
 
+test("TmuxSessionHost inventories Task and global owners from one tmux snapshot", async () => {
+  let inventoryCalls = 0;
+  const host = new TmuxSessionHost(
+    { plan: () => fakePlan(), planGlobalRole: () => fakePlan() },
+    {
+      ensureRoleWindow: () => true,
+      probeRoleStatus() {
+        throw new Error("per-owner probes must not be used");
+      },
+      killRole() {},
+      inspectRolePaneInventory() {
+        throw new Error("async inventory must be preferred");
+      },
+      async inspectRolePaneInventoryAsync() {
+        inventoryCalls += 1;
+        return [
+          { taskId: "task-1", roleName: "leader", dead: false },
+          { taskId: "operator", roleName: "operator", dead: true }
+        ];
+      }
+    },
+    { createBindingId: () => "binding-inventory" }
+  );
+  const owners = [
+    { scope: "task", taskId: "task-1", roleName: "leader" },
+    { scope: "global", roleName: "operator" },
+    { scope: "task", taskId: "task-missing", roleName: "worker" }
+  ];
+
+  assert.deepEqual(await host.inspectOwners(owners), [
+    { owner: owners[0], inspection: { state: "running" } },
+    { owner: owners[1], inspection: { state: "stopped" } },
+    { owner: owners[2], inspection: { state: "stopped" } }
+  ]);
+  assert.equal(inventoryCalls, 1);
+});
+
 test("TmuxPromptPushAdapter maps tmux presence and composer readiness to portable outcomes", async () => {
   const pushes = [];
   let status = "running";
@@ -250,7 +301,7 @@ test("TmuxPromptPushAdapter maps tmux presence and composer readiness to portabl
     probeRoleStatus: () => status,
     sendRoleInputOnceIfReady(taskId, roleName, receiptId, text, readinessProbe) {
       pushes.push({ taskId, roleName, receiptId, text, readinessProbe });
-      return outcome;
+      return status === "exited" ? "unavailable" : outcome;
     }
   };
   const readiness = () => () => true;
@@ -290,25 +341,25 @@ test("TmuxPromptPushAdapter maps tmux presence and composer readiness to portabl
   assert.equal(await adapter.tryPush({ binding, envelope }), "busy");
   status = "exited";
   assert.equal(await adapter.tryPush({ binding, envelope }), "unavailable");
-  assert.equal(pushes.length, 3);
+  assert.equal(pushes.length, 4);
 });
 
 test("TmuxPromptPushAdapter prefers the async tmux path", async () => {
   const calls = [];
+  let outcome = "sent";
   const tmux = {
     probeRoleStatus() {
       throw new Error("sync probe must not be used");
     },
-    async probeRoleStatusAsync(hostId, roleName) {
-      calls.push(["probe-async", hostId, roleName]);
-      return "running";
+    async probeRoleStatusAsync() {
+      throw new Error("preflight status probe must not be used");
     },
     sendRoleInputOnceIfReady() {
       throw new Error("sync delivery must not be used");
     },
     async sendRoleInputOnceIfReadyAsync(hostId, roleName, receiptId, text) {
       calls.push(["send-async", hostId, roleName, receiptId, text]);
-      return "sent";
+      return outcome;
     }
   };
   const host = new TmuxSessionHost(
@@ -334,7 +385,8 @@ test("TmuxPromptPushAdapter prefers the async tmux path", async () => {
   const adapter = new TmuxPromptPushAdapter(tmux, () => () => true);
   assert.equal(await adapter.tryPush({ binding, envelope }), "delivered");
   assert.deepEqual(calls, [
-    ["probe-async", "task-1", "leader"],
     ["send-async", "task-1", "leader", "prompt-async", envelope.text]
   ]);
+  outcome = "unavailable";
+  assert.equal(await adapter.tryPush({ binding, envelope }), "unavailable");
 });

@@ -5,21 +5,37 @@ import { callController, readControllerDiscovery } from "../core/controllerClien
 import type { JsonValue } from "../core/protocol.js";
 import type { FileRoleLaunchPlanner } from "../executor/fileRoleLaunchPlanner.js";
 import type { TaskWorkflowRuntimePort } from "../commands/taskCommands.js";
-import type { TaskStore } from "../storage/taskStore.js";
+import {
+  AGENT_OPERATIONAL_ENVIRONMENT_NAMES,
+  nativeAgentEnvironmentNames,
+  operationalAgentEnvironment,
+  selectEnvironment,
+  YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES
+} from "../agent/launchEnvironment.js";
+import { FileTaskStore, type TaskStore } from "../storage/taskStore.js";
 import type { TmuxManager } from "../tmux/tmuxManager.js";
 import type { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
 import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
 import type { MailboxTarget } from "../coordination/workMailbox.js";
 
 const STARTUP_TIMEOUT_MS = 5_000;
+// A lifecycle RPC may legitimately occupy the Controller for 30 seconds.
+// Restart must allow that request to drain before deciding shutdown is stuck.
+const SHUTDOWN_TIMEOUT_MS = 45_000;
 const POLL_INTERVAL_MS = 50;
 const LIFECYCLE_REQUEST_TIMEOUT_MS = 30_000;
+const ENVIRONMENT_REFRESH_TIMEOUT_MS = 500;
+const CONTROLLER_OPERATIONAL_ENVIRONMENT = [
+  ...AGENT_OPERATIONAL_ENVIRONMENT_NAMES,
+  "YUI_TMUX_BIN"
+] as const;
 
 export type FileControllerClientOptions = Readonly<{
   call?: typeof callController;
   spawnController?: (home: string, environment: NodeJS.ProcessEnv) => void;
   environment?: NodeJS.ProcessEnv;
   startupTimeoutMs?: number;
+  shutdownTimeoutMs?: number;
   pollIntervalMs?: number;
   requestTimeoutMs?: number;
   onError?: (error: unknown) => void;
@@ -39,7 +55,7 @@ export async function ensureFileTaskController(
   const timeoutMs = positive(options.startupTimeoutMs, STARTUP_TIMEOUT_MS, "startupTimeoutMs");
   const pollMs = positive(options.pollIntervalMs, POLL_INTERVAL_MS, "pollIntervalMs");
   const spawnController = options.spawnController ?? spawnDetachedFileTaskController;
-  spawnController(home, { ...process.env, ...options.environment, YUI_HOME: home });
+  spawnController(home, controllerSpawnEnvironment(home, options.environment ?? process.env));
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
@@ -82,20 +98,24 @@ export async function restartFileTaskController(
   options: FileControllerClientOptions = {}
 ): Promise<FileControllerRestartResult> {
   const call = options.call ?? callController;
-  const timeoutMs = positive(options.startupTimeoutMs, STARTUP_TIMEOUT_MS, "startupTimeoutMs");
+  const shutdownTimeoutMs = positive(
+    options.shutdownTimeoutMs,
+    SHUTDOWN_TIMEOUT_MS,
+    "shutdownTimeoutMs"
+  );
   const pollMs = positive(options.pollIntervalMs, POLL_INTERVAL_MS, "pollIntervalMs");
   const current = await readOptionalControllerStatus(home, call);
   const previousPid = controllerPid(current);
   if (controllerRunning(current)) {
     await callFileTaskController(home, "controller.stop", {}, options);
-    const deadline = Date.now() + timeoutMs;
+    const deadline = Date.now() + shutdownTimeoutMs;
     for (;;) {
       const stillOwned = options.call === undefined
         ? await ownedControllerDiscoveryExists(home, previousPid)
         : controllerPid(await readOptionalControllerStatus(home, call)) === previousPid;
       if (!stillOwned) break;
       if (Date.now() >= deadline) {
-        throw new Error(`Controller did not stop within ${timeoutMs} ms.`);
+        throw new Error(`Controller did not stop within ${shutdownTimeoutMs} ms.`);
       }
       await delay(pollMs);
     }
@@ -107,6 +127,29 @@ export async function restartFileTaskController(
     ...(previousPid === undefined ? {} : { previousPid }),
     ...(pid === undefined ? {} : { pid })
   };
+}
+
+function controllerSpawnEnvironment(
+  home: string,
+  source: NodeJS.ProcessEnv
+): NodeJS.ProcessEnv {
+  const allowed = new Set<string>(CONTROLLER_OPERATIONAL_ENVIRONMENT);
+  try {
+    for (const agent of new FileTaskStore(home).listConfiguredAgents()) {
+      for (const name of nativeAgentEnvironmentNames(agent.adapterId)) allowed.add(name);
+      for (const binding of agent.environment) allowed.add(binding.sourceName);
+    }
+  } catch {
+    // The Controller remains authoritative for reporting an invalid/unavailable
+    // home. Environment filtering must never fall back to forwarding all names.
+  }
+  const environment: NodeJS.ProcessEnv = {};
+  for (const name of allowed) {
+    const value = source[name];
+    if (value !== undefined) environment[name] = value;
+  }
+  environment.YUI_HOME = home;
+  return environment;
 }
 
 async function ownedControllerDiscoveryExists(
@@ -152,6 +195,43 @@ export async function callFileTaskController(
   });
 }
 
+/**
+ * Best-effort refresh for a Controller that is already running. This path
+ * deliberately calls the authenticated socket directly: an Agent config
+ * command must not start a background Controller merely to copy secrets.
+ */
+export async function refreshRunningFileTaskControllerEnvironment(
+  home: string,
+  store: Pick<TaskStore, "listConfiguredAgents">,
+  source: NodeJS.ProcessEnv = process.env,
+  options: FileControllerClientOptions = {}
+): Promise<boolean> {
+  const sourceNames = new Set<string>();
+  for (const agent of store.listConfiguredAgents()) {
+    for (const binding of agent.environment) {
+      if (!MANAGED_RUNTIME_ENVIRONMENT.has(binding.sourceName)) {
+        sourceNames.add(binding.sourceName);
+      }
+    }
+  }
+  const sources = selectEnvironment(source, sourceNames);
+  try {
+    await (options.call ?? callController)(
+      home,
+      "runtime.merge-agent-environment",
+      { sources },
+      {
+        timeoutMs: options.requestTimeoutMs
+          ?? ENVIRONMENT_REFRESH_TIMEOUT_MS
+      }
+    );
+    return true;
+  } catch (error) {
+    if (!isUnavailable(error)) options.onError?.(error);
+    return false;
+  }
+}
+
 /** Foreground command bridge. It never reads or writes Agent terminal bytes. */
 export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
   constructor(
@@ -184,10 +264,16 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
   async prepareTaskRoleEnter(
     input: Readonly<{ taskId: string; roleName: string }>
   ): Promise<void> {
+    const environment = foregroundRoleEnvironment(
+      this.store,
+      { scope: "task", taskId: input.taskId, roleName: input.roleName },
+      this.clientOptions.environment ?? process.env
+    );
     await callFileTaskController(this.home, "runtime.ensure-role-session", {
       scope: "task",
       taskId: input.taskId,
-      roleName: input.roleName
+      roleName: input.roleName,
+      ...(environment === undefined ? {} : { environment })
     }, {
       ...this.clientOptions,
       requestTimeoutMs: LIFECYCLE_REQUEST_TIMEOUT_MS
@@ -199,9 +285,15 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
   }
 
   async prepareGlobalRoleEnter(roleName: string): Promise<void> {
+    const environment = foregroundRoleEnvironment(
+      this.store,
+      { scope: "global", roleName },
+      this.clientOptions.environment ?? process.env
+    );
     await callFileTaskController(this.home, "runtime.ensure-role-session", {
       scope: "global",
-      roleName
+      roleName,
+      ...(environment === undefined ? {} : { environment })
     }, {
       ...this.clientOptions,
       requestTimeoutMs: LIFECYCLE_REQUEST_TIMEOUT_MS
@@ -229,11 +321,44 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
   }
 }
 
+type ForegroundRoleOwner =
+  | Readonly<{ scope: "task"; taskId: string; roleName: string }>
+  | Readonly<{ scope: "global"; roleName: string }>;
+
+const MANAGED_RUNTIME_ENVIRONMENT = new Set<string>(
+  YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES
+);
+
+function foregroundRoleEnvironment(
+  store: TaskStore,
+  owner: ForegroundRoleOwner,
+  source: NodeJS.ProcessEnv
+): Readonly<Record<string, string>> | undefined {
+  const role = owner.scope === "task"
+    ? store.getRole?.(owner.taskId, owner.roleName)
+    : store.getGlobalRole?.(owner.roleName);
+  if (role === null || role === undefined) return undefined;
+  const agent = store.getConfiguredAgent?.(role.activeAgentId);
+  if (agent === null || agent === undefined) return undefined;
+  const declaredSources = new Set(
+    agent.environment.map((binding) => binding.sourceName)
+  );
+  for (const name of MANAGED_RUNTIME_ENVIRONMENT) declaredSources.delete(name);
+  return {
+    ...operationalAgentEnvironment(agent.adapterId, source),
+    ...selectEnvironment(source, declaredSources)
+  };
+}
+
 function controllerMailboxKey(target: MailboxTarget): string {
   switch (target.kind) {
     case "operator": return "operator";
     case "task": return `task:${encodeURIComponent(target.taskId)}`;
     case "role": return `role:${encodeURIComponent(target.taskId)}/${encodeURIComponent(target.roleName)}`;
+    case "role-runtime":
+      return `role:${encodeURIComponent(target.taskId)}/${encodeURIComponent(target.roleName)}`;
+    case "global-role-runtime":
+      return `global-role:${encodeURIComponent(target.roleName)}`;
   }
 }
 

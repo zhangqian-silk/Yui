@@ -2,12 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { createInputRequest } from "../../dist/input/inputRequest.js";
-import { createTaskMessage } from "../../dist/message/message.js";
 import {
   createInputRequestOperatorPresentation,
-  createLeaderRecoveryOperatorPresentation,
-  createTaskMessageOperatorPresentation,
-  createTaskTerminalOperatorPresentation
+  createLeaderRecoveryOperatorPresentation
 } from "../../dist/interaction/operatorPresentation.js";
 
 const CREATED_AT = new Date("2026-07-23T01:00:00.000Z");
@@ -139,54 +136,7 @@ test("Leader recovery failure is an attention-only Operator presentation", () =>
   );
   assert.match(presentation.text, /needs user attention/i);
   assert.match(presentation.text, /Leader ended two consecutive Turns/);
-  assert.match(presentation.text, /yui job show task-3/);
-});
-
-test("TaskMessage and Task terminal constructors remain narrow and deterministic", () => {
-  const message = createTaskMessage(
-    "message-9",
-    "Worker finished the focused checks.",
-    "role-result",
-    { type: "role", roleName: "worker-1" },
-    CREATED_AT,
-    { runId: "agent-run-9" }
-  );
-
-  const progress = createTaskMessageOperatorPresentation("task-3", message);
-  assert.deepEqual(
-    {
-      category: progress.category,
-      receiptId: progress.receiptId,
-      source: progress.source
-    },
-    {
-      category: "progress",
-      receiptId: "task-message:task-3:message-9",
-      source: { kind: "task-message", id: "message-9" }
-    }
-  );
-  assert.match(progress.text, /Worker finished the focused checks\./);
-  assert.match(progress.text, /worker-1/);
-  assert.match(progress.text, /do not describe the Task as complete/i);
-
-  const terminal = createTaskTerminalOperatorPresentation({
-    taskId: "task-3",
-    eventId: "event-12",
-    status: "failed",
-    summary: "Integration checks failed."
-  });
-  assert.deepEqual(
-    {
-      category: terminal.category,
-      receiptId: terminal.receiptId,
-      source: terminal.source
-    },
-    {
-      category: "terminal",
-      receiptId: "task-terminal:task-3:event-12",
-      source: { kind: "task-terminal", id: "event-12" }
-    }
-  );
-  assert.match(terminal.text, /Task status: failed/);
-  assert.match(terminal.text, /Integration checks failed\./);
+  assert.match(presentation.text, /yui jobs list/);
+  assert.match(presentation.text, /yui jobs retry leader-recovery:task-3/);
+  assert.doesNotMatch(presentation.text, /yui job show/);
 });

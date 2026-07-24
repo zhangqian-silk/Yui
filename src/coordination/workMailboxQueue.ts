@@ -93,5 +93,7 @@ function targetLabel(target: MailboxTarget): string {
     case "operator": return "operator";
     case "task": return `task/${target.taskId}`;
     case "role": return `role/${target.taskId}/${target.roleName}`;
+    case "role-runtime": return `role-runtime/${target.taskId}/${target.roleName}`;
+    case "global-role-runtime": return `global-role-runtime/${target.roleName}`;
   }
 }

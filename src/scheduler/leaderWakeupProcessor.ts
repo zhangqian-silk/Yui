@@ -3,6 +3,7 @@ import { markYuiRunInput } from "../run/runIdentity.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
 import { createLeaderRecoveryNotification } from "./operatorNotification.js";
 import type {
+  PreparedRoleDelivery,
   SchedulerRoleSession,
   SchedulerReconcileSelection,
   SchedulerStorePort,
@@ -67,6 +68,7 @@ export async function processLeaderWakeups(
     let claimed = false;
     let deliveryAttempted = false;
     let run: ReturnType<typeof createAgentRun> | null = null;
+    let prepared: PreparedRoleDelivery | undefined;
     try {
       const mode = hasNativeSession(existingSession) ? "resume" : "new";
       const runId = store.nextAgentRunId(task.id);
@@ -99,7 +101,7 @@ export async function processLeaderWakeups(
         continue;
       }
       claimed = true;
-      const prepared = await delivery.prepareRoleSession({
+      prepared = await delivery.prepareRoleSession({
         taskId: task.id,
         roleName: role.name,
         agentId: role.activeAgentId,
@@ -112,11 +114,28 @@ export async function processLeaderWakeups(
       const ready = await delivery.waitUntilReady(prepared);
       const latestTask = store.getTask(task.id);
       if (latestTask === null || latestTask.status !== "active") {
+        delivery.forgetPrepared?.({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          ...(prepared.launchId === undefined
+            ? {}
+            : { launchId: prepared.launchId })
+        });
         results.push({ taskId: task.id, status: "skipped", reason: "unavailable" });
         continue;
       }
       effectiveSession = validateReadySession(role.activeAgentId, existingSession, mode, ready.session);
-      store.saveRoleRunPrepared({ task, role, run, session: effectiveSession, now });
+      store.saveRoleRunPrepared({
+        task,
+        role,
+        run,
+        session: effectiveSession,
+        ...(ready.prepared.launchId === undefined
+          ? {}
+          : { launchId: ready.prepared.launchId }),
+        now
+      });
       deliveryAttempted = true;
       const outcome = await delivery.sendOnce({
         delivery: ready,
@@ -133,7 +152,16 @@ export async function processLeaderWakeups(
         continue;
       }
 
-      store.saveRoleRunDelivery({ task, role, run, session: effectiveSession, now });
+      store.saveRoleRunDelivery({
+        task,
+        role,
+        run,
+        session: effectiveSession,
+        ...(ready.prepared.launchId === undefined
+          ? {}
+          : { launchId: ready.prepared.launchId }),
+        now
+      });
       results.push({ taskId: task.id, runId: run.id, status: "dispatched" });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -152,6 +180,14 @@ export async function processLeaderWakeups(
           });
           continue;
         }
+        delivery.forgetPrepared?.({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          ...(prepared?.launchId === undefined
+            ? {}
+            : { launchId: prepared.launchId })
+        });
         const failureResult = store.saveLeaderDispatchFailure({
           task,
           role,

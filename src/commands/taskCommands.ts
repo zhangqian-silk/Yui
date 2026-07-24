@@ -31,6 +31,7 @@ import {
   createRole,
   createRoleAgentBinding,
   switchActiveRoleAgent,
+  unbindRoleAgent,
   updateRole,
   updateRoleStatus,
   type GlobalRole,
@@ -42,7 +43,7 @@ import {
   yieldAgentRun,
   type AgentRun
 } from "../run/agentRun.js";
-import { markYuiRunInput } from "../run/runIdentity.js";
+import { markYuiRunInput, retagYuiRunInput } from "../run/runIdentity.js";
 import { createTaskBrief, updateTaskBrief } from "../brief/taskBrief.js";
 import { createDecision, supersedeDecision } from "../decision/decision.js";
 import { createMilestone } from "../milestone/milestone.js";
@@ -78,6 +79,11 @@ import {
   roleOptionSpecs,
   roleProfilePatch
 } from "./roleConfiguration.js";
+import {
+  hasRoleLaunchContextOptions,
+  validateConfiguredRoleSkills
+} from "./roleSkillValidation.js";
+import { assertRoleRuntimeMutationAllowed } from "./roleRuntimeGuard.js";
 import { runTaskContextCommand } from "./taskContextCommand.js";
 import {
   inspectTaskRoleRuntimeStatuses,
@@ -121,6 +127,7 @@ export type TaskCommandOptions = Readonly<{
   runtime?: TaskWorkflowRuntimePort;
   now?: () => Date;
   environment?: NodeJS.ProcessEnv;
+  yuiHome?: string;
 }>;
 
 export function runTaskCommand(
@@ -344,6 +351,7 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     runs: runs.length,
     openInputs
   };
+  const timeZone = store.getConfig().timeZone;
   const rendered = [
     `Task: ${task.id}`,
     `Title: ${task.title}`,
@@ -351,8 +359,8 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     ...(task.description === undefined ? [] : [`Description: ${task.description}`]),
     ...(task.priority === undefined ? [] : [`Priority: ${task.priority}`]),
     ...(task.tags === undefined ? [] : [`Tags: ${task.tags.join(", ")}`]),
-    ...(task.dueAt === undefined ? [] : [`Due: ${presentTime(store, task.dueAt)}`]),
-    ...(task.completedAt === undefined ? [] : [`Completed: ${presentTime(store, task.completedAt)}`]),
+    ...(task.dueAt === undefined ? [] : [`Due: ${presentTime(task.dueAt, timeZone)}`]),
+    ...(task.completedAt === undefined ? [] : [`Completed: ${presentTime(task.completedAt, timeZone)}`]),
     ...(task.completedBy === undefined ? [] : [`Completed by: ${task.completedBy}`]),
     ...(task.completionSummary === undefined ? [] : [`Completion summary: ${task.completionSummary}`]),
     ...(task.repositoryId === undefined ? [] : [`Repository: ${task.repositoryId}`]),
@@ -367,8 +375,8 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     `Work items: ${counts.workItems}`,
     `Runs: ${counts.runs}`,
     `Open inputs: ${counts.openInputs}`,
-    `Created: ${presentTime(store, task.createdAt)}`,
-    `Updated: ${presentTime(store, task.updatedAt)}`
+    `Created: ${presentTime(task.createdAt, timeZone)}`,
+    `Updated: ${presentTime(task.updatedAt, timeZone)}`
   ].join("\n").concat("\n");
   return output(rendered, { task, counts, hasBrief: brief !== null });
 }
@@ -608,6 +616,7 @@ function taskMessageCommand(
     const task = requireTask(store, rest[0]);
     const messages = store.listMessages(task.id);
     if (messages.length === 0) return "No messages found.\n";
+    const timeZone = store.getConfig().timeZone;
     return `${renderTable(
       `Task messages: ${task.id}`,
       [
@@ -619,7 +628,7 @@ function taskMessageCommand(
       messages.map((message) => [
         message.id,
         taskMessageAuthorLabel(message.author),
-        presentTime(store, message.createdAt),
+        presentTime(message.createdAt, timeZone),
         message.body
       ]),
       defaultTableWidth()
@@ -643,6 +652,7 @@ function taskRoleCommand(
   if (command === "update") return output(updateTaskRole(rest, store, options));
   if (command === "remove") return output(removeTaskRole(rest, store, options));
   if (command === "bind") return output(bindTaskRole(rest, store, options));
+  if (command === "unbind") return output(unbindTaskRole(rest, store, options));
   if (command === "enter") return enterTaskRole(rest, store, options);
   throw usageError(command === undefined
     ? "Task role command is required."
@@ -668,6 +678,11 @@ function addTaskRole(
   const role = store.transaction((tx) => {
     const task = requireTask(tx, taskId);
     assertTaskOpen(task);
+    assertRoleRuntimeMutationAllowed(tx, {
+      scope: "task",
+      taskId: task.id,
+      roleName
+    }, "creation");
     if (roleName === LEADER_ROLE) throw usageError("The Task leader role already exists.");
     if (tx.getRole(task.id, roleName) !== null) throw usageError(`Role already exists: ${roleName}.`);
     let created = createTaskRole(tx, task, roleName, agentId, now);
@@ -684,6 +699,7 @@ function addTaskRole(
         }
       }, now);
     }
+    validateConfiguredRoleSkills(options.yuiHome, created.skills ?? []);
     tx.saveRole(task.id, created);
     enqueueWork(tx, taskMailbox(task.id), "role-added", now, [taskRef(task.id)]);
     return created;
@@ -781,18 +797,40 @@ function updateTaskRole(
     const task = requireTask(tx, taskId);
     assertTaskOpen(task);
     const role = requireRole(tx, task.id, roleName);
+    const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
+    const activeRun = tx.getActiveAgentRun(task.id, role.name);
+    const changesLaunchContext = hasRoleLaunchContextOptions(parsed);
+    const changesAgentConfig = hasAgentConfigOptions(parsed);
+    if (changesLaunchContext || changesAgentConfig) {
+      assertRoleRuntimeMutationAllowed(tx, {
+        scope: "task",
+        taskId: task.id,
+        roleName: role.name
+      }, "launch configuration update");
+    }
+    if (
+      changesLaunchContext
+      && (
+        activeRun !== null
+        || Object.values(sessions?.sessions ?? {}).some(({ status }) => status !== "stopped")
+      )
+    ) {
+      throw usageError(
+        "Role launch context cannot be changed while its Run or native process is running."
+      );
+    }
     let bindings = role.agentBindings;
-    if (hasAgentConfigOptions(parsed)) {
+    if (changesAgentConfig) {
       const agentId = parsed.one("--agent")?.trim() || role.activeAgentId;
       const agent = requireAgent(tx, agentId);
       const binding = bindings[agentId]
         ?? createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId });
-      const activeSession = tx.getTaskRoleSessionSet(task.id, role.name)?.sessions[agentId];
-      if (agentId === role.activeAgentId && (
-        tx.getActiveAgentRun(task.id, role.name) !== null
-        || (activeSession !== undefined && activeSession.status !== "stopped")
-      )) {
-        throw usageError("Active Agent settings cannot be changed while its Run or native process is running.");
+      const targetSession = sessions?.sessions[agentId];
+      if (
+        (agentId === role.activeAgentId && activeRun !== null)
+        || (targetSession !== undefined && targetSession.status !== "stopped")
+      ) {
+        throw usageError("Agent settings cannot be changed while its Run or native process is running.");
       }
       bindings = { ...bindings, [agentId]: patchRoleAgentBinding(binding, parsed) };
     }
@@ -800,6 +838,9 @@ function updateTaskRole(
       ...(bindings === role.agentBindings ? {} : { agentBindings: bindings }),
       ...roleProfilePatch(parsed)
     }, now);
+    if (changesLaunchContext) {
+      validateConfiguredRoleSkills(options.yuiHome, next.skills ?? []);
+    }
     tx.saveRole(task.id, next);
     enqueueWork(tx, taskMailbox(task.id), "role-updated", now, [taskRef(task.id)]);
     return next;
@@ -823,11 +864,16 @@ function removeTaskRole(
     assertTaskOpen(task);
     const role = requireRole(tx, task.id, args[1]);
     if (role.name === LEADER_ROLE) throw usageError("The Task Leader role cannot be removed.");
+    assertRoleRuntimeMutationAllowed(tx, {
+      scope: "task",
+      taskId: task.id,
+      roleName: role.name
+    }, "removal");
     if (tx.getActiveAgentRun(task.id, role.name) !== null) {
       throw usageError(`Task Role has an active Run and cannot be removed: ${task.id}/${role.name}.`);
     }
-    const session = tx.getTaskRoleSessionSet(task.id, role.name)?.sessions[role.activeAgentId];
-    if (session !== undefined && session.status !== "stopped") {
+    const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
+    if (Object.values(sessions?.sessions ?? {}).some(({ status }) => status !== "stopped")) {
       throw usageError(`Task Role has a running native Agent and cannot be removed: ${task.id}/${role.name}.`);
     }
     if (!tx.removeTaskRole(task.id, role.name)) throw roleNotFound(role.name);
@@ -849,6 +895,11 @@ function bindTaskRole(
     const task = requireTask(tx, args[0]);
     assertTaskOpen(task);
     const role = requireRole(tx, task.id, args[1]);
+    assertRoleRuntimeMutationAllowed(tx, {
+      scope: "task",
+      taskId: task.id,
+      roleName: role.name
+    }, "Agent binding");
     const agent = requireAgent(tx, args[2]);
     const binding = role.agentBindings[agent.id]
       ?? createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId });
@@ -879,6 +930,37 @@ function bindTaskRole(
   });
   notifyMailbox(options.runtime, taskMailbox(result.role.taskId), result.role.taskId);
   return `Bound ${result.role.taskId}/${result.role.name} to ${result.role.activeAgentId} (${result.mode})\n`;
+}
+
+function unbindTaskRole(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  exactPositionals(
+    args,
+    3,
+    "Task role unbind usage: yui task role unbind <task> <role> <agent-id>."
+  );
+  const now = clock(options);
+  const result = store.transaction((tx) => {
+    const task = requireTask(tx, args[0]);
+    const role = requireRole(tx, task.id, args[1]);
+    try {
+      const unbound = unbindRoleAgent(
+        role,
+        tx.getTaskRoleSessionSet(task.id, role.name),
+        args[2],
+        now
+      );
+      if (unbound.sessions === null) tx.saveRole(task.id, unbound.role);
+      else tx.saveTaskRoleWithSessionSet(unbound.role, unbound.sessions);
+      return unbound.role;
+    } catch (error) {
+      throw usageError(messageOf(error));
+    }
+  });
+  return `Unbound Agent ${args[2]} from ${result.taskId}/${result.name}\n`;
 }
 
 function enterTaskRole(
@@ -1113,7 +1195,7 @@ function retryRun(
       task.id,
       role.name,
       roleAgentSessionResumeMode(sessions, role.activeAgentId),
-      markYuiRunInput(previous.input, runId),
+      retagYuiRunInput(previous.input, runId),
       now,
       { workItemId: previous.workItemId }
     );
@@ -1367,6 +1449,7 @@ function taskBriefCommand(
     if (brief === null) {
       return output(`Task ${task.id} has no brief.\n`, { taskId: task.id, brief: null });
     }
+    const timeZone = store.getConfig().timeZone;
     return output([
       `Task: ${task.id}`,
       `Objective: ${brief.objective}`,
@@ -1375,7 +1458,7 @@ function taskBriefCommand(
       `Current focus: ${brief.currentFocus}`,
       `Leader summary: ${brief.leaderSummary}`,
       `Updated by: ${brief.updatedBy}`,
-      `Updated at: ${presentTime(store, brief.updatedAt)}`
+      `Updated at: ${presentTime(brief.updatedAt, timeZone)}`
     ].join("\n").concat("\n"), { taskId: task.id, brief });
   }
   if (command === "update") {
@@ -1474,6 +1557,7 @@ function taskDecisionCommand(
     if (decisions.length === 0) {
       return output(`No decisions found for ${task.id}.\n`, { taskId: task.id, decisions: [] });
     }
+    const timeZone = store.getConfig().timeZone;
     return output(`${renderTable(
       `Decisions: ${task.id}`,
       [
@@ -1482,7 +1566,7 @@ function taskDecisionCommand(
         { header: "Title", minWidth: 8, maxWidth: 64 },
         { header: "Created", minWidth: 10, maxWidth: 28 }
       ],
-      decisions.map((d) => [d.id, d.status, d.title, presentTime(store, d.createdAt)]),
+      decisions.map((d) => [d.id, d.status, d.title, presentTime(d.createdAt, timeZone)]),
       defaultTableWidth()
     )}\n`, { taskId: task.id, decisions });
   }
@@ -1491,6 +1575,7 @@ function taskDecisionCommand(
     const task = requireTask(store, rest[0]);
     const decision = store.getDecision(task.id, rest[1]);
     if (decision === null) throw dataError(`Decision not found: ${rest[1]}.`);
+    const timeZone = store.getConfig().timeZone;
     return output([
       `Decision: ${decision.id}`,
       `Task: ${task.id}`,
@@ -1498,9 +1583,9 @@ function taskDecisionCommand(
       `Rationale: ${decision.rationale}`,
       `Status: ${decision.status}`,
       ...(decision.supersededReason === undefined ? [] : [`Superseded reason: ${decision.supersededReason}`]),
-      ...(decision.supersededAt === undefined ? [] : [`Superseded at: ${presentTime(store, decision.supersededAt)}`]),
-      `Created: ${presentTime(store, decision.createdAt)}`,
-      `Updated: ${presentTime(store, decision.updatedAt)}`
+      ...(decision.supersededAt === undefined ? [] : [`Superseded at: ${presentTime(decision.supersededAt, timeZone)}`]),
+      `Created: ${presentTime(decision.createdAt, timeZone)}`,
+      `Updated: ${presentTime(decision.updatedAt, timeZone)}`
     ].join("\n").concat("\n"), { taskId: task.id, decision });
   }
   if (command === "supersede") {
@@ -1568,6 +1653,7 @@ function taskMilestoneCommand(
     if (milestones.length === 0) {
       return output(`No milestones found for ${task.id}.\n`, { taskId: task.id, milestones: [] });
     }
+    const timeZone = store.getConfig().timeZone;
     return output(`${renderTable(
       `Milestones: ${task.id}`,
       [
@@ -1575,7 +1661,7 @@ function taskMilestoneCommand(
         { header: "Title", minWidth: 8, maxWidth: 64 },
         { header: "Created", minWidth: 10, maxWidth: 28 }
       ],
-      milestones.map((m) => [m.id, m.title, presentTime(store, m.createdAt)]),
+      milestones.map((m) => [m.id, m.title, presentTime(m.createdAt, timeZone)]),
       defaultTableWidth()
     )}\n`, { taskId: task.id, milestones });
   }
@@ -1584,13 +1670,14 @@ function taskMilestoneCommand(
     const task = requireTask(store, rest[0]);
     const milestone = store.getMilestone(task.id, rest[1]);
     if (milestone === null) throw dataError(`Milestone not found: ${rest[1]}.`);
+    const timeZone = store.getConfig().timeZone;
     return output([
       `Milestone: ${milestone.id}`,
       `Task: ${task.id}`,
       `Title: ${milestone.title}`,
       `Summary: ${milestone.summary}`,
       `Created by: ${milestone.createdBy}`,
-      `Created: ${presentTime(store, milestone.createdAt)}`
+      `Created: ${presentTime(milestone.createdAt, timeZone)}`
     ].join("\n").concat("\n"), { taskId: task.id, milestone });
   }
   throw usageError(command === undefined
@@ -1610,6 +1697,7 @@ function taskEventCommand(
     if (events.length === 0) {
       return output(`No events found for ${task.id}.\n`, { taskId: task.id, events: [] });
     }
+    const timeZone = store.getConfig().timeZone;
     return output(`${renderTable(
       `Events: ${task.id}`,
       [
@@ -1617,7 +1705,7 @@ function taskEventCommand(
         { header: "Type", minWidth: 8, maxWidth: 28 },
         { header: "Created", minWidth: 10, maxWidth: 28 }
       ],
-      events.map((e) => [e.id, e.type, presentTime(store, e.createdAt)]),
+      events.map((e) => [e.id, e.type, presentTime(e.createdAt, timeZone)]),
       defaultTableWidth()
     )}\n`, { taskId: task.id, events });
   }
@@ -1627,11 +1715,12 @@ function taskEventCommand(
     const events = store.listEvents(task.id);
     const event = events.find((e) => e.id === rest[1]) ?? null;
     if (event === null) throw dataError(`Event not found: ${rest[1]}.`);
+    const timeZone = store.getConfig().timeZone;
     return output([
       `Event: ${event.id}`,
       `Task: ${task.id}`,
       `Type: ${event.type}`,
-      `Created: ${presentTime(store, event.createdAt)}`,
+      `Created: ${presentTime(event.createdAt, timeZone)}`,
       `Payload:`,
       ...(Object.keys(event.payload).length === 0
         ? ["  (none)"]
@@ -1763,8 +1852,8 @@ function titleFrom(body: string): string {
   return oneLine.length <= 80 ? oneLine : `${oneLine.slice(0, 77)}...`;
 }
 
-function presentTime(store: Pick<TaskWorkflowStore, "getConfig">, value: string): string {
-  return formatTimestamp(value, store.getConfig().timeZone);
+function presentTime(value: string, timeZone: string | undefined): string {
+  return formatTimestamp(value, timeZone);
 }
 
 function output(value: string, data?: unknown): TaskCommandExecution {

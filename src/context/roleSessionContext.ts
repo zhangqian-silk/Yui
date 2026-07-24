@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,6 +18,7 @@ export type RoleSkillContext = Readonly<{
 export type RoleSessionContext = Readonly<{
   developerInstructions: string;
   skills: readonly RoleSkillContext[];
+  managedContextFile?: string;
 }>;
 
 export type RoleSessionOwner = Readonly<
@@ -34,19 +36,28 @@ export function compileRoleSessionContext(
 ): RoleSessionContext {
   const kind = role.name === SYSTEM_OPERATOR_ROLE && owner.scope === "global"
     ? "operator"
-    : role.name === SYSTEM_LEADER_ROLE
+    : owner.scope === "global"
+      ? "global"
+      : role.name === SYSTEM_LEADER_ROLE
       ? "leader"
       : "worker";
-  const skillIds = unique([`yui-${kind}`, ...(role.skills ?? [])]);
-  const skills = skillIds.map((id) => loadSkill(yuiHome, id, id === `yui-${kind}`));
+  const builtInSkillId = kind === "global" ? undefined : `yui-${kind}`;
+  const skillIds = unique([
+    ...(builtInSkillId === undefined ? [] : [builtInSkillId]),
+    ...(role.skills ?? [])
+  ]);
+  const skills = skillIds.map((id) => loadSkill(yuiHome, id, id === builtInSkillId));
   return {
     developerInstructions: renderDeveloperInstructions(kind, role, owner),
-    skills
+    skills,
+    ...(yuiHome === undefined
+      ? {}
+      : { managedContextFile: roleContextFile(yuiHome, role, owner) })
   };
 }
 
 function renderDeveloperInstructions(
-  kind: "operator" | "leader" | "worker",
+  kind: "operator" | "global" | "leader" | "worker",
   role: GlobalRole | TaskRole,
   owner: RoleSessionOwner
 ): string {
@@ -56,6 +67,11 @@ function renderDeveloperInstructions(
         "Manage Yui through its CLI; do not perform Task implementation work.",
         "Follow the injected yui-operator Skill when coordinating Yui."
       ]
+    : kind === "global"
+      ? [
+          `You are global Yui Role ${role.name}.`,
+          "Follow the configured Role profile and the user's instructions."
+        ]
     : kind === "leader"
       ? [
           `You are the Yui Leader for Task ${owner.scope === "task" ? owner.taskId : role.name}.`,
@@ -99,4 +115,18 @@ function loadSkill(yuiHome: string | undefined, id: string, builtIn: boolean): R
 
 function unique(values: readonly string[]): string[] {
   return [...new Set(values)];
+}
+
+function roleContextFile(
+  yuiHome: string,
+  role: GlobalRole | TaskRole,
+  owner: RoleSessionOwner
+): string {
+  const identity = createHash("sha256").update(JSON.stringify([
+    owner.scope,
+    ...(owner.scope === "task" ? [owner.taskId] : []),
+    role.name,
+    role.activeAgentId
+  ])).digest("hex");
+  return resolve(join(yuiHome, "runtime", "session-contexts", `${identity}.md`));
 }

@@ -22,9 +22,15 @@ import {
 import { createAgentRun, failAgentRun } from "../../dist/run/agentRun.js";
 import {
   markYuiRunInput,
+  retagYuiRunInput,
   yuiRunIdFromInputMessages
 } from "../../dist/run/runIdentity.js";
 import { createRepository } from "../../dist/repository/repository.js";
+import {
+  bindTaskRoleRun,
+  createRoleSessionSet,
+  markTaskRoleRunDelivered
+} from "../../dist/executor/agentExecutor.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 
@@ -345,6 +351,46 @@ test("retry replaces the old causal Run marker instead of reusing it", (t) => {
   assert.equal(yuiRunIdFromInputMessages([retried.input]), retried.id);
 });
 
+test("Run marker handling preserves user-authored marker lines outside the managed header", () => {
+  const userInput = [
+    "Analyze this exact payload:",
+    "Yui-Run-Id: example-from-user",
+    "keep the line above"
+  ].join("\n");
+
+  const marked = markYuiRunInput(userInput, "agent-run-current");
+  const retried = retagYuiRunInput(marked, "agent-run-retried");
+
+  assert.equal(marked.includes("Yui-Run-Id: example-from-user"), true);
+  assert.equal(retried.includes("Yui-Run-Id: example-from-user"), true);
+  assert.equal(retried.startsWith("Yui-Run-Id: agent-run-retried\n\n"), true);
+  assert.equal(yuiRunIdFromInputMessages([retried]), "agent-run-retried");
+  assert.equal(yuiRunIdFromInputMessages([userInput]), undefined);
+});
+
+test("first Run marking preserves a user lookalike at the start of the body", () => {
+  const userInput = [
+    "Yui-Run-Id: example-from-user",
+    "",
+    "This is user-authored content, not a managed envelope."
+  ].join("\n");
+
+  const marked = markYuiRunInput(userInput, "agent-run-current");
+
+  assert.equal(
+    marked,
+    `Yui-Run-Id: agent-run-current\n\n${userInput}`
+  );
+  assert.equal(yuiRunIdFromInputMessages([marked]), "agent-run-current");
+});
+
+test("Run retagging rejects input without a managed envelope", () => {
+  assert.throws(
+    () => retagYuiRunInput("plain user input", "agent-run-retried"),
+    /managed Run input header is required/iu
+  );
+});
+
 test("Leader yield does not self-wake and preserves a wake queued while busy", (t) => {
   const { store, options } = fixture(t);
   const task = createTask(store, options, "Leader work");
@@ -381,6 +427,24 @@ test("Leader control Run without a WorkItem can yield and release the pending wa
     tx.saveRole(task.id, updateRoleStatus(leader, "running", NOW));
   });
   markDelivered(store, controlRun);
+  store.transaction((tx) => {
+    const fence = {
+      agentId: leader.activeAgentId,
+      runId: controlRun.id,
+      receiptId: `agent-run:${controlRun.id}`
+    };
+    const sessions = tx.getTaskRoleSessionSet(task.id, "leader")
+      ?? createRoleSessionSet(
+        { scope: "task", taskId: task.id, roleName: "leader" },
+        leader.activeAgentId,
+        NOW
+      );
+    tx.saveTaskRoleSessionSet(markTaskRoleRunDelivered(
+      bindTaskRoleRun(sessions, fence, NOW),
+      fence,
+      NOW
+    ));
+  });
 
   run(["run", "yield", controlRun.id, "--summary", "reviewed"], store, options);
   assert.equal(store.findAgentRun(controlRun.id)?.status, "yielded");
@@ -388,6 +452,8 @@ test("Leader control Run without a WorkItem can yield and release the pending wa
   assert.equal(store.getRole(task.id, "leader")?.status, "idle");
   assert.equal(store.getPendingWakeup(task.id), null);
   assert.equal(store.listMessages(task.id).at(-1).body, "reviewed");
+  assert.equal(store.getTaskRoleSessionSet(task.id, "leader").inFlight, null);
+  assert.equal(store.getTaskRoleSessionSet(task.id, "leader").pendingTurnCompletion, null);
 });
 
 test("a rejected Worker control yield rolls back all staged FileTaskStore writes", (t) => {

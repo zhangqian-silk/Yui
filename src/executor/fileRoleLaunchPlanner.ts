@@ -6,6 +6,7 @@ import {
   configuredAgentToDefinition,
   resolveAgentEnvironment
 } from "../agent/agent.js";
+import { operationalAgentEnvironment } from "../agent/launchEnvironment.js";
 import { activeRoleAgentBinding, type GlobalRole, type TaskRole } from "../role/role.js";
 import type {
   RoleSessionLaunchMode,
@@ -14,6 +15,7 @@ import type {
 import type { TaskStore } from "../storage/taskStore.js";
 import { compileRoleSessionContext } from "../context/roleSessionContext.js";
 import { resolveAgentAdapter } from "./agentAdapter.js";
+import { inspectCodexLaunchConfig } from "./codexConfigConflict.js";
 import type { PlannedRoleSession, RoleLaunchPlanner } from "./executorRegistry.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
@@ -29,6 +31,12 @@ export type GlobalRoleLaunchPlanInput = Readonly<{
   mode: RoleSessionLaunchMode;
   nativeSessionId?: string;
   launchId?: string;
+  environment?: Readonly<Record<string, string>>;
+}>;
+
+type TaskRoleLaunchPlanInput = Parameters<RoleLaunchPlanner["plan"]>[0] & Readonly<{
+  launchId?: string;
+  environment?: Readonly<Record<string, string>>;
 }>;
 
 /** Builds managed native Agent launches from the authoritative Task records. */
@@ -42,13 +50,19 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
     readonly store: TaskStore,
     options: FileRoleLaunchPlannerOptions = {}
   ) {
-    this.#environment = options.environment ?? process.env;
+    // Keep a private, refreshable snapshot. Runtime secret refreshes must not
+    // mutate the Controller's ambient process.env or persist secret values.
+    this.#environment = { ...(options.environment ?? process.env) };
     this.#createNativeSessionId = options.createNativeSessionId ?? randomUUID;
     this.#cliPath = options.cliPath
       ?? fileURLToPath(new URL("../cli.js", import.meta.url));
   }
 
-  plan(input: Parameters<RoleLaunchPlanner["plan"]>[0]): PlannedRoleSession {
+  mergeEnvironment(values: Readonly<Record<string, string>>): void {
+    Object.assign(this.#environment, values);
+  }
+
+  plan(input: TaskRoleLaunchPlanInput): PlannedRoleSession {
     const task = this.store.getTask(input.taskId);
     if (task === null) throw new Error(`Task not found: ${input.taskId}.`);
     if (task.status !== "active") throw new Error(`Task is not active: ${input.taskId}.`);
@@ -93,6 +107,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
       mode: RoleSessionLaunchMode;
       nativeSessionId?: string;
       launchId?: string;
+      environment?: Readonly<Record<string, string>>;
     }>,
     owner: Readonly<{ scope: "task"; taskId: string } | { scope: "global" }>,
     knownNativeSessionId?: string
@@ -108,13 +123,39 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
     }
 
     const agent = configuredAgentToDefinition(configured);
+    const sourceEnvironment = input.environment ?? this.#environment;
+    const resolvedAgentEnvironment = resolveAgentEnvironment(agent, sourceEnvironment);
+    const launchEnvironment = {
+      ...operationalAgentEnvironment(configured.adapterId, sourceEnvironment),
+      ...resolvedAgentEnvironment
+    };
     const adapter = resolveAgentAdapter(binding.adapterId);
     const sessionContext = compileRoleSessionContext(this.home, role, owner);
+    const codexConfig = binding.config.adapterId === "codex"
+      ? inspectCodexLaunchConfig({
+          environment: {
+            ...sourceEnvironment,
+            ...launchEnvironment
+          },
+          workspace: role.workspace,
+          profile: binding.config.profile
+        })
+      : undefined;
+    if (codexConfig?.notify.status === "configured") {
+      throw new Error(
+        "Codex notify is already configured by "
+        + `${codexConfig.notify.source}; Yui requires exclusive ownership of the structured `
+        + "notify callback and refuses to replace or be replaced by native configuration."
+      );
+    }
     const compileInput = {
       agent,
       config: binding.config,
       workspace: role.workspace,
-      ...sessionContext
+      ...sessionContext,
+      ...(codexConfig === undefined
+        ? {}
+        : { codexDeveloperInstructions: codexConfig.developerInstructions })
     };
     if (
       input.mode === "resume"
@@ -150,7 +191,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
       const nativeSessionId = requireText(
         input.launchId === undefined
           ? this.#createNativeSessionId()
-          : nativeSessionIdForLaunch(this.home, input.launchId),
+          : nativeSessionIdForLaunch(
+              this.home,
+              input.launchId,
+              input.agentId,
+              input.adapterId
+            ),
         "Native session id"
       );
       args.push("--session-id", nativeSessionId);
@@ -169,14 +215,17 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
         command: configured.command,
         args,
         env: {
-          ...resolveAgentEnvironment(agent, this.#environment),
+          ...launchEnvironment,
           YUI_HOME: resolve(this.home),
           YUI_SESSION_SCOPE: owner.scope,
           ...(owner.scope === "task" ? { YUI_TASK_ID: owner.taskId } : {}),
           YUI_ROLE: role.name,
           YUI_AGENT_ID: configured.id,
           YUI_ADAPTER_ID: configured.adapterId,
-          YUI_WORKSPACE: role.workspace
+          YUI_WORKSPACE: role.workspace,
+          ...(input.launchId === undefined
+            ? {}
+            : { YUI_LAUNCH_ID: input.launchId })
         }
       },
       session
@@ -184,10 +233,17 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
   }
 }
 
-function nativeSessionIdForLaunch(home: string, launchId: string): string {
+function nativeSessionIdForLaunch(
+  home: string,
+  launchId: string,
+  agentId: string,
+  adapterId: string
+): string {
   const hex = createHash("sha256").update(JSON.stringify([
     resolve(home),
-    requireText(launchId, "Launch id")
+    requireText(launchId, "Launch id"),
+    requireText(agentId, "Agent id"),
+    requireText(adapterId, "Agent adapter id")
   ])).digest("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }

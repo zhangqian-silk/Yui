@@ -1,12 +1,6 @@
 import type { InputRequest } from "../input/inputRequest.js";
 import type { OperatorNotification } from "../scheduler/operatorNotification.js";
-import {
-  taskMessageAuthorLabel,
-  type TaskMessage
-} from "../message/message.js";
 import { formatTimestamp } from "../output/timePresentation.js";
-
-export type OperatorPresentationCategory = "attention" | "terminal" | "progress";
 
 type OperatorPresentationBase = Readonly<{
   taskId: string;
@@ -21,21 +15,6 @@ export type OperatorAttentionPresentation = OperatorPresentationBase & Readonly<
     | { kind: "leader-recovery"; id: string }
   >;
 }>;
-
-export type OperatorTerminalPresentation = OperatorPresentationBase & Readonly<{
-  category: "terminal";
-  source: Readonly<{ kind: "task-terminal"; id: string }>;
-}>;
-
-export type OperatorProgressPresentation = OperatorPresentationBase & Readonly<{
-  category: "progress";
-  source: Readonly<{ kind: "task-message"; id: string }>;
-}>;
-
-export type OperatorPresentation =
-  | OperatorAttentionPresentation
-  | OperatorTerminalPresentation
-  | OperatorProgressPresentation;
 
 export type OperatorPresentationContext = Readonly<{
   timeZone?: unknown;
@@ -96,49 +75,8 @@ export function createLeaderRecoveryOperatorPresentation(
       `Task: ${notification.taskId}`,
       `Failure: ${notification.message}`,
       `Inspect: yui task show ${notification.taskId}`,
-      `Recovery status: yui job show ${notification.taskId}`
-    ].join("\n")
-  };
-}
-
-export function createTaskMessageOperatorPresentation(
-  taskId: string,
-  message: TaskMessage
-): OperatorProgressPresentation {
-  return {
-    category: "progress",
-    taskId,
-    receiptId: `task-message:${taskId}:${message.id}`,
-    source: { kind: "task-message", id: message.id },
-    text: [
-      "A Task has a progress update. Present it to the user when useful.",
-      "Treat this as progress only; do not describe the Task as complete.",
-      `Task: ${taskId}`,
-      `Message: ${message.id}`,
-      `From: ${taskMessageAuthorLabel(message.author)}`,
-      `Update: ${message.body}`
-    ].join("\n")
-  };
-}
-
-export function createTaskTerminalOperatorPresentation(
-  input: Readonly<{
-    taskId: string;
-    eventId: string;
-    status: "completed" | "failed";
-    summary?: string;
-  }>
-): OperatorTerminalPresentation {
-  return {
-    category: "terminal",
-    taskId: input.taskId,
-    receiptId: `task-terminal:${input.taskId}:${input.eventId}`,
-    source: { kind: "task-terminal", id: input.eventId },
-    text: [
-      "A Task reached a terminal state. Present this outcome to the user.",
-      `Task: ${input.taskId}`,
-      `Task status: ${input.status}`,
-      ...(input.summary === undefined ? [] : [`Summary: ${input.summary}`])
+      "Recovery status: yui jobs list",
+      `Retry after inspection: yui jobs retry leader-recovery:${notification.taskId}`
     ].join("\n")
   };
 }

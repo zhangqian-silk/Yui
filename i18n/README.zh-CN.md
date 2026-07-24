@@ -55,6 +55,14 @@ yui task context <task-id>
 yui task activate <task-id>
 ```
 
+面向用户的时间默认按北京时间（`Asia/Shanghai`）显示；持久化记录和
+`--json` 数据仍使用 UTC/RFC 3339。可通过以下命令查看或修改 IANA 时区：
+
+```sh
+yui config show
+yui config set --time-zone Europe/London
+```
+
 查看已有 Task 的详细状态时，优先使用 `task context`。它一次聚合 Task、Brief、Active Decision、最近的 Milestone、Role、当前及最近的 WorkItem 与关联 Run、最近的 Message、Open/Resolved InputRequest 和 Event。终端输出会精简历史和长文本；`yui --json task context <task-id>` 会在顶层 `data` 中返回完整记录。
 
 新 Task 是 Draft，并已创建 Leader。激活时会排入第一次持久 Leader wake。带 Repository 的 Task 会先为每个 Role 创建 `<YUI_HOME>/worktrees/<task-id>/<role-name>`，对应分支为 `yui/<task-id>/<role-name>`，然后才启动 Leader；后续新增 Role 也会在执行前获得独立 worktree。
@@ -137,9 +145,11 @@ yui task role enter <task-id> <role>
 
 每个 Role 可绑定多个 Agent，有一个 active Agent，并为每个 Agent binding 独立保存 native session。切换 Agent 会保留休眠 session；Role 有活动 Run 或 native process 时禁止切换。
 
+使用 `yui role unbind <global-role> <agent-id>` 或 `yui task role unbind <task-id> <role> <agent-id>` 可移除休眠 binding。active binding 或任何未 stopped 的 native session 都会被拒绝；stopped session 记录会和 binding 在同一事务中删除。
+
 Claude 的 session ID 在启动前分配。受管理的 Codex 启动使用 Codex 结构化 `notify` 回调，在 turn 完成后记录 thread ID，不再向模型对话注入 session-bind prompt。
 
-稳定的 Role 上下文也属于启动元数据，而不是 bootstrap turn。Yui 通过 Agent 原生的 system/developer instruction 通道传入 Role 策略和 `systemPrompt`。原生 Codex CLI 没有按会话追加 Skill root 的参数，因此 developer instructions 只携带精简的 Skill 绝对路径，由 Codex 按需读取 `SKILL.md`；`skills.config` 只负责启停已发现 Skill，Yui 不会误用它。Claude 通过追加 system prompt 接收同一份 Skill 内容。因此 Operator 会停在空白的原生 composer，用户输入仍是第一条 user message；Leader wake 和 Worker Run assignment 仍是邮箱投递的真实工作消息。不具备原生指令通道的 adapter 必须拒绝这类上下文，不能静默降级为首轮 user prompt。
+稳定的 Role 上下文也属于启动元数据，而不是 bootstrap turn。Yui 通过 Agent 原生的 system/developer instruction 通道传入 Role 策略和 `systemPrompt`。原生 Codex CLI 没有按会话追加 Skill root 的参数，因此 developer instructions 只携带精简的 Skill 绝对路径，由 Codex 按需读取 `SKILL.md`。由于 `developer_instructions` 是单一标量配置，Yui 会检查当前支持的全部 Linux Codex 配置层：`/etc/codex/config.toml`、用户配置、选中的 `$CODEX_HOME/<name>.config.toml`、项目配置以及 `/etc/codex/managed_config.toml`；任意一层已经设置该值时都会明确拒绝覆盖。受管理的 Codex 会话还必须独占用于记录原生 Turn 完成状态的结构化 `notify` 回调；任意受检配置层已经定义 `notify` 时，Yui 都会拒绝启动，避免两个回调互相静默覆盖。`skills.config` 只负责启停已发现 Skill，Yui 不会误用它。Claude 从 Yui 管理的私有 `0600` context 文件读取同一份 Skill 内容，不再把大段或敏感文本放进 argv；重试和 resume 会复用该 Role 的稳定路径。非 Operator 的 global Role 保持中性，不会注入 Task Leader 或 Worker Skill。因此 Operator 会停在空白的原生 composer，用户输入仍是第一条 user message；Leader wake 和 Worker Run assignment 仍是邮箱投递的真实工作消息。不具备原生指令通道的 adapter 必须拒绝这类上下文，不能静默降级为首轮 user prompt。
 
 ## Controller 与失败处理
 
@@ -210,7 +220,7 @@ command -v yui
 yui doctor
 ```
 
-第一次执行 `make link` 会把最初的 `yui` 入口保存在同一个用户级 bin 目录，再用指向当前 checkout 的受管符号链接接管命令。之后在其他 checkout 执行 `make link` 只会移动这个受管链接：最后执行者生效，开发环境之间不会形成备份链。launcher 默认使用当前生效 checkout 的 `output/dev/home` 作为 `YUI_HOME`；显式设置的 `YUI_HOME` 仍然优先。因为替换的是命令入口，其他终端和之后创建的 Codex/Claude 会话无需 source 也会使用同一个开发版本。若已有 Controller 也需要加载新代码，请执行 `yui controller restart`。任意采用本实现的 checkout 都可以执行 `make unlink`；它会校验共享受管状态并恢复唯一一份最初 `yui` 入口。
+第一次执行 `make link` 会把最初的 `yui` 入口保存在同一个用户级 bin 目录，再用指向当前 checkout 的受管符号链接接管命令。之后在其他 checkout 执行 `make link` 只会移动这个受管链接：最后执行者生效，开发环境之间不会形成备份链。请串行执行 `make link` 和 `make unlink`，不要从多个环境或 checkout 并发调用。launcher 默认使用当前生效 checkout 的 `output/dev/home` 作为 `YUI_HOME`；显式设置的 `YUI_HOME` 仍然优先。因为替换的是命令入口，其他终端和之后创建的 Codex/Claude 会话无需 source 也会使用同一个开发版本。若已有 Controller 也需要加载新代码，请执行 `yui controller restart`。任意采用本实现的 checkout 都可以执行 `make unlink`；它会校验共享受管状态并恢复唯一一份最初 `yui` 入口。
 
 ```sh
 make unlink
@@ -219,10 +229,3 @@ make unlink
 ## 许可证
 
 [MIT](../LICENSE)
-面向用户的时间默认按北京时间（`Asia/Shanghai`）显示；持久化记录和
-`--json` 数据仍使用 UTC/RFC 3339。可通过以下命令查看或修改 IANA 时区：
-
-```sh
-yui config show
-yui config set --time-zone Europe/London
-```

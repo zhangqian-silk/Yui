@@ -226,7 +226,9 @@ export function rememberRoleAgentCompletedTurn<TSet extends RoleSessionSet>(
       ...set.sessions,
       [normalizedAgentId]: {
         ...session,
-        status: "ready" as const,
+        status: session.status === "stopped" || session.status === "broken"
+          ? session.status
+          : "ready" as const,
         recentCompletedTurnIds,
         updatedAt: timestamp
       }

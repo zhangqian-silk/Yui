@@ -1,4 +1,5 @@
 import type {
+  PreparedRoleDelivery,
   ReadyRoleDelivery,
   SchedulerRole,
   SchedulerRoleSession,
@@ -81,11 +82,13 @@ export async function processActiveRoleRunDeliveries(
         });
         continue;
       }
+      let prepared: PreparedRoleDelivery | undefined;
+      let deliveryAttempted = false;
       try {
         const nativeSessionId = run.mode === "resume"
           ? requireResumeSession(role, existingSession)
           : undefined;
-        const prepared = await delivery.prepareRoleSession({
+        prepared = await delivery.prepareRoleSession({
           taskId: task.id,
           roleName: role.name,
           agentId: role.activeAgentId,
@@ -95,35 +98,57 @@ export async function processActiveRoleRunDeliveries(
           runId: run.id,
           ...(nativeSessionId === undefined ? {} : { nativeSessionId })
         });
-        const existingReceipt = await delivery.findExistingReceipt?.({
-          delivery: prepared,
-          receiptId
-        }) ?? null;
-        const ready = existingReceipt ?? await delivery.waitUntilReady(prepared);
+        const ready = await delivery.waitUntilReady(prepared);
         const session = validateReadySession(role, existingSession, run.mode, ready);
-        store.saveRoleRunPrepared({ task, role, run, session, now });
-        let status: ActiveRoleRunDeliveryResult["status"] = "already-delivered";
-        if (existingReceipt === null) {
-          const outcome = await delivery.sendOnce({
-            delivery: ready,
-            receiptId,
-            text: run.input
+        store.saveRoleRunPrepared({
+          task,
+          role,
+          run,
+          session,
+          ...(ready.prepared.launchId === undefined
+            ? {}
+            : { launchId: ready.prepared.launchId }),
+          now
+        });
+        deliveryAttempted = true;
+        const outcome = await delivery.sendOnce({
+          delivery: ready,
+          receiptId,
+          text: run.input
+        });
+        if (outcome === "busy" || outcome === "unavailable") {
+          results.push({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id,
+            status: "skipped",
+            reason: outcome === "busy" ? "not-ready" : "runtime-unavailable"
           });
-          if (outcome === "busy" || outcome === "unavailable") {
-            results.push({
-              taskId: task.id,
-              roleName: role.name,
-              runId: run.id,
-              status: "skipped",
-              reason: outcome === "busy" ? "not-ready" : "runtime-unavailable"
-            });
-            continue;
-          }
-          status = outcome === "sent" ? "delivered" : "already-delivered";
+          continue;
         }
-        store.saveRoleRunDelivery({ task, role, run, session, now });
+        const status = outcome === "sent" ? "delivered" : "already-delivered";
+        store.saveRoleRunDelivery({
+          task,
+          role,
+          run,
+          session,
+          ...(ready.prepared.launchId === undefined
+            ? {}
+            : { launchId: ready.prepared.launchId }),
+          now
+        });
         results.push({ taskId: task.id, roleName: role.name, runId: run.id, status });
       } catch (error) {
+        if (!deliveryAttempted) {
+          delivery.forgetPrepared?.({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id,
+            ...(prepared?.launchId === undefined
+              ? {}
+              : { launchId: prepared.launchId })
+          });
+        }
         store.releaseWorkMailbox(target, processing.batchId);
         results.push({
           taskId: task.id,

@@ -33,15 +33,28 @@ import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.
 import { MailboxScheduler } from "../coordination/mailboxScheduler.js";
 import { nearestDeadlineBatch } from "../coordination/deadlineScheduler.js";
 import type { MailboxTarget, ProcessingBatch } from "../coordination/workMailbox.js";
+import {
+  hasRuntimeCleanupObligation,
+  isRuntimeLaunchReservation,
+  type RuntimeLifecycleTarget,
+  type RuntimeRoleOwner
+} from "../runtime/lifecycleReservation.js";
+import type { SessionHostPort } from "../runtime/ports.js";
 import type { RuntimeEventProcessorPort } from "./runtimeEventProcessor.js";
 
 const DEFAULT_RECONCILIATION_INTERVAL_MS = reconciliationIntervalMilliseconds();
 const DEFAULT_SIGNAL_WINDOW_MS = 100;
 const DEFAULT_DELIVERY_RETRY_MS = 250;
 const DEFAULT_DELIVERY_RETRY_LIMIT = 60;
+const RUNTIME_RESERVATION_RECOVERY_AGE_MS = 120_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 class RuntimeEventApplyError extends AggregateError {}
+
+type RuntimeLifecycleHost = Pick<
+  SessionHostPort,
+  "inspectOwner" | "inspectOwners" | "stopOwner"
+>;
 
 export type ControllerSchedulerResult = Readonly<{
   stoppedArchivedTaskIds: readonly string[];
@@ -65,9 +78,14 @@ export type ControllerRuntimeOptions = Readonly<{
     "prepareTaskWorkspace" | "prepareActiveTaskWorkspaces" | "cleanupArchivedTaskWorkspaces"
   >;
   runtimeEventProcessor?: RuntimeEventProcessorPort;
+  lifecycleHost?: RuntimeLifecycleHost;
 }>;
 
-export type MailboxKey = `task:${string}` | `role:${string}/${string}` | "operator";
+export type MailboxKey =
+  | `task:${string}`
+  | `role:${string}/${string}`
+  | `global-role:${string}`
+  | "operator";
 
 export type ReconcileScope =
   | Readonly<{ kind: "full" }>
@@ -96,13 +114,34 @@ export async function runControllerSchedulerPass(
   >,
   scope: ReconcileScope = { kind: "full" },
   readyRecoveryAgeMs?: number,
-  includeOperator = true
+  includeOperator = true,
+  readyRecoveryRunIds: ReadonlySet<string> = new Set(),
+  runtimeCleanupOutcomes: RuntimeCleanupOutcome[] = [],
+  lifecycleHost?: RuntimeLifecycleHost
 ): Promise<ControllerSchedulerResult> {
   const compiledSelection = compileReconcileSelection(scope);
   const selection = includeOperator
     ? compiledSelection
     : { ...compiledSelection, operator: false };
-  repairOrphanedActiveTasks(store, now, selection);
+  const failedCleanupRoles = await processSelectedRoleRuntimeCleanups(
+    store,
+    delivery,
+    lifecycleHost,
+    scope,
+    now,
+    runtimeCleanupOutcomes
+  );
+  const roleSelection = selectionWithoutFailedCleanupRoles(
+    store,
+    selection,
+    failedCleanupRoles
+  );
+  const wakeupSelection = selectionWithoutFailedLeaderCleanupTasks(
+    store,
+    selection,
+    failedCleanupRoles
+  );
+  if (selection.full) repairOrphanedActiveTasks(store, now, selection);
   const claimedTaskMailboxes = claimSelectedTaskMailboxes(store, selection, now);
   try {
     const failedTaskMailboxes = await prepareActiveWorkspaces(
@@ -118,34 +157,37 @@ export async function runControllerSchedulerPass(
       failedTaskMailboxes.add(taskId);
     }
     const activeRunDeliveries = await processActiveRoleRunDeliveries(
-      store, delivery, now, selection
+      store, delivery, now, roleSelection
     );
     const uncertainRunIds = new Set(activeRunDeliveries.flatMap((result) => (
       result.reason === "delivery-uncertain" ? [result.runId] : []
     )));
-    if (typeof store.resolveDueRuntimeTurnCompletions === "function") {
-      if (selection.full) store.resolveDueRuntimeTurnCompletions(now);
-      else if (selection.taskIds.size > 0) {
-        store.resolveDueRuntimeTurnCompletions(now, selection.taskIds);
-      }
-    }
+    resolveDueRuntimeTurnCompletions(store, delivery, selection, now);
     const failedRunIds = await reconcileExitedRoleRuns(
       store,
       delivery,
       now,
-      selection,
+      roleSelection,
       uncertainRunIds,
-      readyRecoveryAgeMs
+      readyRecoveryAgeMs,
+      readyRecoveryRunIds
+    );
+    await reconcileDormantRuntimeOwners(
+      store,
+      delivery,
+      lifecycleHost,
+      scope,
+      now
     );
     const autoResolvedInputs = selection.full
       ? store.resolveExpiredInputRecommendations(now)
       : selection.taskIds.size === 0
         ? []
         : store.resolveExpiredInputRecommendations(now, selection.taskIds);
-    const wakeups = await processLeaderWakeups(store, delivery, now, selection);
-    const inputNotifications = await processOperatorInputNotifications(
-      store, delivery, selection, now
-    );
+    const wakeups = await processLeaderWakeups(store, delivery, now, wakeupSelection);
+    const inputNotifications = includeOperator
+      ? await processOperatorInputNotifications(store, delivery, selection, now)
+      : [];
     for (const claim of claimedTaskMailboxes) {
       if (failedTaskMailboxes.has(claim.target.taskId)) {
         store.releaseWorkMailbox(claim.target, claim.processing.batchId);
@@ -173,6 +215,356 @@ type ClaimedTaskMailbox = Readonly<{
   target: Extract<MailboxTarget, { kind: "task" }>;
   processing: ProcessingBatch;
 }>;
+
+type ReadyRecoveryRegistration = {
+  readonly taskId: string;
+  readonly roleName: string;
+  readonly runId: string;
+  readonly deliveredAt: string;
+  attempts: number;
+  timer?: NodeJS.Timeout;
+};
+
+type RuntimeCleanupOutcome = Readonly<{
+  target: RuntimeLifecycleTarget;
+  batchId: string;
+  status: "completed" | "failed";
+  error?: unknown;
+}>;
+
+async function processSelectedRoleRuntimeCleanups(
+  store: SchedulerStorePort,
+  delivery: TmuxDeliveryPort,
+  lifecycleHost: RuntimeLifecycleHost | undefined,
+  scope: ReconcileScope,
+  now: Date,
+  outcomes: RuntimeCleanupOutcome[]
+): Promise<ReadonlySet<string>> {
+  const targets = selectedRuntimeLifecycleTargets(store, scope);
+  const failedRoles = new Set<string>();
+  for (const target of targets) {
+    const mailbox = store.getWorkMailbox(target);
+    if (mailbox === null) continue;
+    const owner = runtimeOwner(target);
+    const batchId = runtimeLifecycleBatchIdentity(target, mailbox);
+    if (hasRuntimeCleanupObligation(mailbox)) {
+      try {
+        if (lifecycleHost === undefined) {
+          throw new Error("Role runtime cleanup host is unavailable.");
+        }
+        if (!await lifecycleHost.stopOwner(owner)) {
+          throw new Error(
+            `Role runtime cleanup could not confirm the host stopped: ${runtimeOwnerLabel(owner)}.`
+          );
+        }
+        if (
+          store.completeRuntimeCleanup === undefined
+          || !store.completeRuntimeCleanup(target, now)
+        ) {
+          throw new Error(
+            `Role runtime cleanup mailbox changed: ${runtimeOwnerLabel(owner)}.`
+          );
+        }
+        forgetPreparedRuntimeOwner(delivery, owner);
+        outcomes.push({ target, batchId, status: "completed" });
+      } catch (error) {
+        markFailedRuntimeTarget(failedRoles, target);
+        outcomes.push({ target, batchId, status: "failed", error });
+      }
+      continue;
+    }
+    const reservation = mailbox.processing;
+    if (
+      reservation === null
+      || !isRuntimeLaunchReservation(reservation)
+      || now.getTime() - Date.parse(reservation.startedAt)
+        < RUNTIME_RESERVATION_RECOVERY_AGE_MS
+    ) {
+      continue;
+    }
+    try {
+      if (lifecycleHost === undefined) {
+        throw new Error("Role runtime reservation inspection is unavailable.");
+      }
+      const inspection = await lifecycleHost.inspectOwner(owner);
+      if (inspection.state === "running" || inspection.state === "starting") {
+        continue;
+      }
+      if (inspection.state === "unavailable") {
+        throw new Error(
+          `Role runtime reservation could not inspect the host: ${runtimeOwnerLabel(owner)}.`
+        );
+      }
+      const completed = store.completeStoppedRuntimeReservation === undefined
+        ? store.completeWorkMailbox(target, reservation.batchId)
+        : store.completeStoppedRuntimeReservation(
+            target,
+            reservation.batchId,
+            now
+          );
+      if (!completed) {
+        throw new Error(
+          `Role runtime reservation mailbox changed: ${runtimeOwnerLabel(owner)}.`
+        );
+      }
+      forgetPreparedRuntimeOwner(delivery, owner);
+      outcomes.push({ target, batchId, status: "completed" });
+    } catch (error) {
+      markFailedRuntimeTarget(failedRoles, target);
+      outcomes.push({ target, batchId, status: "failed", error });
+    }
+  }
+  return failedRoles;
+}
+
+async function reconcileDormantRuntimeOwners(
+  store: SchedulerStorePort,
+  delivery: TmuxDeliveryPort,
+  lifecycleHost: RuntimeLifecycleHost | undefined,
+  scope: ReconcileScope,
+  now: Date
+): Promise<void> {
+  if (
+    scope.kind !== "full"
+    || lifecycleHost === undefined
+    || store.listDormantRuntimeOwners === undefined
+    || store.markRuntimeOwnerStopped === undefined
+  ) {
+    return;
+  }
+  const candidates = store.listDormantRuntimeOwners();
+  if (candidates.length === 0) return;
+  const owners = candidates.map((candidate) => candidate.owner);
+  let inspections: readonly Readonly<{
+    owner: RuntimeRoleOwner;
+    inspection: Awaited<ReturnType<SessionHostPort["inspectOwner"]>>;
+  }>[];
+  try {
+    inspections = lifecycleHost.inspectOwners === undefined
+      ? await Promise.all(owners.map(async (owner) => ({
+          owner,
+          inspection: await lifecycleHost.inspectOwner(owner)
+        })))
+      : await lifecycleHost.inspectOwners(owners);
+  } catch {
+    // Host inventory is an advisory safety scan. Unknown state must never
+    // mutate persisted session facts; the next full pass will retry.
+    return;
+  }
+  const requested = new Set(owners.map(runtimeOwnerIdentity));
+  const byOwner = new Map<string, (typeof inspections)[number]["inspection"]>();
+  for (const result of inspections) {
+    const identity = runtimeOwnerIdentity(result.owner);
+    if (
+      !requested.has(identity)
+      || byOwner.has(identity)
+    ) {
+      return;
+    }
+    byOwner.set(identity, result.inspection);
+  }
+  if (byOwner.size !== requested.size) return;
+  for (const candidate of candidates) {
+    if (
+      byOwner.get(runtimeOwnerIdentity(candidate.owner))?.state
+      === "stopped"
+    ) {
+      if (store.markRuntimeOwnerStopped(candidate, now)) {
+        forgetPreparedRuntimeOwner(delivery, candidate.owner);
+      }
+    }
+  }
+}
+
+function forgetPreparedRuntimeOwner(
+  delivery: TmuxDeliveryPort,
+  owner: RuntimeRoleOwner
+): void {
+  if (owner.scope !== "task") return;
+  delivery.forgetPrepared?.({
+    taskId: owner.taskId,
+    roleName: owner.roleName
+  });
+}
+
+function runtimeOwnerIdentity(owner: RuntimeRoleOwner): string {
+  return owner.scope === "task"
+    ? `task\0${owner.taskId}\0${owner.roleName}`
+    : `global\0${owner.roleName}`;
+}
+
+function resolveDueRuntimeTurnCompletions(
+  store: SchedulerStorePort,
+  delivery: TmuxDeliveryPort,
+  selection: ReconcileSelection,
+  now: Date
+): void {
+  if (typeof store.resolveDueRuntimeTurnCompletions !== "function") return;
+  const selectedTaskIds = selection.full ? undefined : selection.taskIds;
+  if (selectedTaskIds?.size === 0) return;
+  const candidates = store.listPendingRuntimeTurnCompletions().filter(
+    (completion) => (
+      selectedTaskIds === undefined
+      || selectedTaskIds.has(completion.taskId)
+    )
+  );
+  const finalized = new Set(
+    store.resolveDueRuntimeTurnCompletions(now, selectedTaskIds)
+  );
+  if (finalized.size === 0) return;
+  for (const completion of candidates) {
+    if (!finalized.has(completion.runId)) continue;
+    delivery.forgetPrepared?.({
+      taskId: completion.taskId,
+      roleName: completion.roleName,
+      runId: completion.runId
+    });
+  }
+}
+
+function selectedRuntimeLifecycleTargets(
+  store: SchedulerStorePort,
+  scope: ReconcileScope
+): RuntimeLifecycleTarget[] {
+  if (scope.kind === "full") {
+    return store.listWorkMailboxes().flatMap((mailbox) => (
+      mailbox.target.kind === "role-runtime"
+      || mailbox.target.kind === "global-role-runtime"
+        ? [mailbox.target]
+        : []
+    ));
+  }
+  const targets = new Map<string, RuntimeLifecycleTarget>();
+  for (const key of scope.keys) {
+    const parsed = parseMailboxKey(key);
+    if (parsed.kind === "task") {
+      for (const role of store.listRoles(parsed.taskId)) {
+        const target = {
+          kind: "role-runtime",
+          taskId: parsed.taskId,
+          roleName: role.name
+        } as const;
+        targets.set(runtimeTargetIdentity(target), target);
+      }
+    } else if (parsed.kind === "role") {
+      const target = {
+        kind: "role-runtime",
+        taskId: parsed.taskId,
+        roleName: parsed.roleName
+      } as const;
+      targets.set(runtimeTargetIdentity(target), target);
+    } else if (parsed.kind === "global-role") {
+      const target = {
+        kind: "global-role-runtime",
+        roleName: parsed.roleName
+      } as const;
+      targets.set(runtimeTargetIdentity(target), target);
+    }
+  }
+  return [...targets.values()];
+}
+
+function runtimeOwner(target: RuntimeLifecycleTarget): RuntimeRoleOwner {
+  return target.kind === "role-runtime"
+    ? {
+        scope: "task",
+        taskId: target.taskId,
+        roleName: target.roleName
+      }
+    : { scope: "global", roleName: target.roleName };
+}
+
+function runtimeOwnerLabel(owner: RuntimeRoleOwner): string {
+  return owner.scope === "task"
+    ? `${owner.taskId}/${owner.roleName}`
+    : `global/${owner.roleName}`;
+}
+
+function runtimeTargetIdentity(target: RuntimeLifecycleTarget): string {
+  return target.kind === "role-runtime"
+    ? `task\0${target.taskId}\0${target.roleName}`
+    : `global\0${target.roleName}`;
+}
+
+function runtimeCleanupMailboxKey(target: RuntimeLifecycleTarget): MailboxKey {
+  return target.kind === "role-runtime"
+    ? `role:${encodeURIComponent(target.taskId)}/${encodeURIComponent(target.roleName)}`
+    : `global-role:${encodeURIComponent(target.roleName)}`;
+}
+
+function runtimeLifecycleBatchIdentity(
+  target: RuntimeLifecycleTarget,
+  mailbox: NonNullable<ReturnType<SchedulerStorePort["getWorkMailbox"]>>
+): string {
+  if (mailbox.processing !== null) return mailbox.processing.batchId;
+  const pending = mailbox.pending;
+  return pending === null
+    ? runtimeTargetIdentity(target)
+    : `${runtimeTargetIdentity(target)}:${pending.fromSequence}-${pending.toSequence}`;
+}
+
+function markFailedRuntimeTarget(
+  failedRoles: Set<string>,
+  target: RuntimeLifecycleTarget
+): void {
+  if (target.kind === "role-runtime") {
+    failedRoles.add(roleIdentity(target.taskId, target.roleName));
+  }
+}
+
+function selectionWithoutFailedCleanupRoles(
+  store: SchedulerStorePort,
+  selection: ReconcileSelection,
+  failedRoles: ReadonlySet<string>
+): ReconcileSelection {
+  if (failedRoles.size === 0) return selection;
+  const taskIds = selection.full
+    ? new Set(store.listTasks().map((task) => task.id))
+    : new Set(selection.taskIds);
+  const rolesByTask = new Map<string, ReadonlySet<string>>();
+  for (const taskId of taskIds) {
+    const roleNames = selection.full || selection.allRoleTaskIds.has(taskId)
+      ? store.listRoles(taskId).map((role) => role.name)
+      : [...(selection.rolesByTask.get(taskId) ?? [])];
+    rolesByTask.set(taskId, new Set(roleNames.filter((roleName) => (
+      !failedRoles.has(roleIdentity(taskId, roleName))
+    ))));
+  }
+  return {
+    full: false,
+    taskIds,
+    allRoleTaskIds: new Set(),
+    rolesByTask,
+    operator: selection.operator
+  };
+}
+
+function selectionWithoutFailedLeaderCleanupTasks(
+  store: SchedulerStorePort,
+  selection: ReconcileSelection,
+  failedRoles: ReadonlySet<string>
+): ReconcileSelection {
+  if (![...failedRoles].some((identity) => identity.endsWith("\0leader"))) {
+    return selection;
+  }
+  const taskIds = selection.full
+    ? new Set(store.listTasks().map((task) => task.id))
+    : new Set(selection.taskIds);
+  for (const taskId of taskIds) {
+    if (failedRoles.has(roleIdentity(taskId, "leader"))) taskIds.delete(taskId);
+  }
+  return {
+    full: false,
+    taskIds,
+    allRoleTaskIds: new Set(),
+    rolesByTask: new Map(),
+    operator: selection.operator
+  };
+}
+
+function roleIdentity(taskId: string, roleName: string): string {
+  return `${taskId}\0${roleName}`;
+}
 
 function taskMailboxReconcileSelection(
   store: SchedulerStorePort
@@ -240,7 +632,7 @@ export function compileReconcileSelection(scope: ReconcileScope): ReconcileSelec
     } else if (target.kind === "task") {
       taskIds.add(target.taskId);
       allRoleTaskIds.add(target.taskId);
-    } else {
+    } else if (target.kind === "role") {
       taskIds.add(target.taskId);
       const roles = mutableRoles.get(target.taskId) ?? new Set<string>();
       roles.add(target.roleName);
@@ -273,8 +665,12 @@ async function prepareActiveWorkspaces(
   const failed = new Set<string>();
   for (const taskId of taskIds) {
     if (store.getTask(taskId)?.status === "active") {
-      const result = await workspace.prepareTaskWorkspace(taskId);
-      if (result.status === "failed") failed.add(taskId);
+      try {
+        const result = await workspace.prepareTaskWorkspace(taskId);
+        if (result.status === "failed") failed.add(taskId);
+      } catch {
+        failed.add(taskId);
+      }
     }
   }
   return failed;
@@ -297,8 +693,12 @@ async function cleanupArchivedWorkspaces(
   const failed = new Set<string>();
   for (const taskId of taskIds) {
     if (store.getTask(taskId)?.status === "archived") {
-      const result = await workspace.prepareTaskWorkspace(taskId);
-      if (result.status === "failed") failed.add(taskId);
+      try {
+        const result = await workspace.prepareTaskWorkspace(taskId);
+        if (result.status === "failed") failed.add(taskId);
+      } catch {
+        failed.add(taskId);
+      }
     }
   }
   return failed;
@@ -307,10 +707,17 @@ async function cleanupArchivedWorkspaces(
 function parseMailboxKey(key: string):
   | Readonly<{ kind: "task"; taskId: string }>
   | Readonly<{ kind: "role"; taskId: string; roleName: string }>
+  | Readonly<{ kind: "global-role"; roleName: string }>
   | Readonly<{ kind: "operator" }> {
   if (key === "operator") return { kind: "operator" };
   if (key.startsWith("task:")) {
     return { kind: "task", taskId: mailboxPart(key.slice("task:".length), key) };
+  }
+  if (key.startsWith("global-role:")) {
+    return {
+      kind: "global-role",
+      roleName: mailboxPart(key.slice("global-role:".length), key)
+    };
   }
   if (key.startsWith("role:")) {
     const value = key.slice("role:".length);
@@ -358,14 +765,18 @@ export class FileTaskController {
   readonly #deliveryRetryLimit: number;
   readonly #readyRecoveryAgeMs: number;
   readonly #runtimeEventProcessor: RuntimeEventProcessorPort | undefined;
+  readonly #lifecycleHost:
+    | RuntimeLifecycleHost
+    | undefined;
   readonly #deliveryRetryAttempts = new Map<MailboxKey, Readonly<{
     identity: string;
     attempts: number;
   }>>();
   readonly #deliveryRetryTimers = new Map<MailboxKey, NodeJS.Timeout>();
-  readonly #readyRecoveryTimers = new Map<string, NodeJS.Timeout>();
-  #runtimeEventRetryTimer: NodeJS.Timeout | undefined;
-  #runtimeEventRetryAttempt = 0;
+  readonly #readyRecoveryRegistrations = new Map<string, ReadyRecoveryRegistration>();
+  readonly #dueReadyRecoveryRunIds = new Set<string>();
+  #passRetryTimer: NodeJS.Timeout | undefined;
+  #passRetryAttempt = 0;
   #timer: NodeJS.Timeout | undefined;
   #deadlineTimer: NodeJS.Timeout | undefined;
   readonly #signalScheduler: MailboxScheduler<MailboxKey>;
@@ -407,6 +818,7 @@ export class FileTaskController {
       "Controller ready recovery age"
     );
     this.#runtimeEventProcessor = options.runtimeEventProcessor;
+    this.#lifecycleHost = options.lifecycleHost;
     this.#signalScheduler = new MailboxScheduler(
       async (keys) => { await this.#requestPass({ kind: "dirty", keys }); },
       {
@@ -488,11 +900,14 @@ export class FileTaskController {
     for (const timer of this.#deliveryRetryTimers.values()) clearTimeout(timer);
     this.#deliveryRetryTimers.clear();
     this.#deliveryRetryAttempts.clear();
-    for (const timer of this.#readyRecoveryTimers.values()) clearTimeout(timer);
-    this.#readyRecoveryTimers.clear();
-    if (this.#runtimeEventRetryTimer !== undefined) {
-      clearTimeout(this.#runtimeEventRetryTimer);
-      this.#runtimeEventRetryTimer = undefined;
+    for (const registration of this.#readyRecoveryRegistrations.values()) {
+      if (registration.timer !== undefined) clearTimeout(registration.timer);
+    }
+    this.#readyRecoveryRegistrations.clear();
+    this.#dueReadyRecoveryRunIds.clear();
+    if (this.#passRetryTimer !== undefined) {
+      clearTimeout(this.#passRetryTimer);
+      this.#passRetryTimer = undefined;
     }
   }
 
@@ -524,8 +939,10 @@ export class FileTaskController {
   armOperatorStartupRetry(): void {
     if (this.#stopped) return;
     const mailbox = this.store.getWorkMailbox({ kind: "operator" });
-    this.#operatorStartupRetryArmed = mailbox !== null
+    const shouldArm = mailbox !== null
       && (mailbox.pending !== null || mailbox.processing !== null);
+    if (shouldArm) this.#clearDeliveryRetry("operator");
+    this.#operatorStartupRetryArmed = shouldArm;
   }
 
   #requestPass(scope: ReconcileScope): Promise<ControllerSchedulerResult> {
@@ -563,16 +980,17 @@ export class FileTaskController {
       inputNotifications: [],
       autoResolvedInputs: []
     };
-    let failed = false;
     try {
       while (this.#pendingFull || this.#pendingKeys.size > 0) {
-      const scope: ReconcileScope = this.#pendingFull
-        ? { kind: "full" }
-        : { kind: "dirty", keys: [...this.#pendingKeys] };
-      this.#pendingFull = false;
-      this.#pendingKeys.clear();
+        const scope: ReconcileScope = this.#pendingFull
+          ? { kind: "full" }
+          : { kind: "dirty", keys: [...this.#pendingKeys] };
+        const dueReadyRecoveryRunIds = this.#dueReadyRecoveryRunsForScope(scope);
+        const runtimeCleanupOutcomes: RuntimeCleanupOutcome[] = [];
+        this.#pendingFull = false;
+        this.#pendingKeys.clear();
         try {
-          this.#drainRuntimeEvents();
+          const firstRuntimeDrain = this.#drainRuntimeEvents();
           result = await runControllerSchedulerPass(
             this.store,
             this.delivery,
@@ -580,36 +998,48 @@ export class FileTaskController {
             this.#workspacePreparer,
             scope,
             this.#readyRecoveryAgeMs,
-            false
+            false,
+            dueReadyRecoveryRunIds,
+            runtimeCleanupOutcomes,
+            this.#lifecycleHost
           );
-          this.#drainRuntimeEvents();
+          const secondRuntimeDrain = this.#drainRuntimeEvents();
+          this.#clearPassRetry();
+          this.#scheduleRuntimeCleanupRetries(runtimeCleanupOutcomes);
           this.#scheduleDeliveryRetries(result);
+          this.#scheduleTaskMailboxRetries(scope);
           this.#scheduleReadyRecoveryForResults(result);
-          if (scope.kind === "full") {
+          this.#settleReadyRecoveryPass(dueReadyRecoveryRunIds);
+          this.#pruneReadyRecoveryRegistrations();
+          if (
+            scope.kind === "full"
+            || scope.keys.some((key) => key !== "operator")
+            || (firstRuntimeDrain?.acknowledgedEventIds.length ?? 0) > 0
+            || (secondRuntimeDrain?.acknowledgedEventIds.length ?? 0) > 0
+          ) {
             this.#signalOperatorMailbox();
+          }
+          if (scope.kind === "full") {
             if (!this.#readyRecoveryBootstrapped) {
-              this.#readyRecoveryBootstrapped = true;
               this.#scheduleReadyRecoveryDeadlines();
+              this.#readyRecoveryBootstrapped = true;
             }
           }
         } catch (error) {
-          failed = true;
           if (scope.kind === "full") {
             this.#pendingFull = true;
             this.#pendingKeys.clear();
           } else if (!this.#pendingFull) {
             for (const key of scope.keys) this.#pendingKeys.add(key);
           }
-          if (error instanceof RuntimeEventApplyError) {
-            this.#scheduleRuntimeEventRetry();
-          }
+          this.#schedulePassRetry();
           throw error;
         }
         if (this.#stopped) break;
       }
       return result;
     } finally {
-      this.#scheduleNextInputDeadline(failed ? this.#intervalMs : 0);
+      this.#scheduleNextInputDeadline();
     }
   }
 
@@ -631,6 +1061,7 @@ export class FileTaskController {
       }
     }
     this.#scheduleDeliveryRetries(result);
+    this.#clearEmptyOperatorRetry();
     this.#scheduleNextInputDeadline();
   }
 
@@ -650,32 +1081,35 @@ export class FileTaskController {
         "One or more native Turn events could not be applied."
       );
     }
-    if (result !== undefined) {
-      this.#runtimeEventRetryAttempt = 0;
-      if (this.#runtimeEventRetryTimer !== undefined) {
-        clearTimeout(this.#runtimeEventRetryTimer);
-        this.#runtimeEventRetryTimer = undefined;
-      }
-    }
     return result;
   }
 
-  #scheduleRuntimeEventRetry(): void {
-    if (this.#stopped || this.#runtimeEventRetryTimer !== undefined) return;
+  #schedulePassRetry(): void {
+    if (
+      this.#stopped
+      || this.#passRetryTimer !== undefined
+      || this.#passRetryAttempt >= this.#deliveryRetryLimit
+    ) return;
     const delayMs = Math.min(
       2_000,
-      this.#deliveryRetryMs * (2 ** Math.min(this.#runtimeEventRetryAttempt, 3))
+      this.#deliveryRetryMs * (2 ** Math.min(this.#passRetryAttempt, 3))
     );
-    this.#runtimeEventRetryAttempt += 1;
-    this.#runtimeEventRetryTimer = setTimeout(() => {
-      this.#runtimeEventRetryTimer = undefined;
+    this.#passRetryAttempt += 1;
+    this.#passRetryTimer = setTimeout(() => {
+      this.#passRetryTimer = undefined;
       if (this.#stopped) return;
       void this.#requestPass({ kind: "dirty", keys: [] }).catch(this.#onError);
     }, delayMs);
-    this.#runtimeEventRetryTimer.unref();
+    this.#passRetryTimer.unref();
   }
 
-  #scheduleNextInputDeadline(minimumDelayMs = 0): void {
+  #clearPassRetry(): void {
+    if (this.#passRetryTimer !== undefined) clearTimeout(this.#passRetryTimer);
+    this.#passRetryTimer = undefined;
+    this.#passRetryAttempt = 0;
+  }
+
+  #scheduleNextInputDeadline(): void {
     if (this.#deadlineTimer !== undefined) {
       clearTimeout(this.#deadlineTimer);
       this.#deadlineTimer = undefined;
@@ -698,9 +1132,14 @@ export class FileTaskController {
     ];
     const nearest = nearestDeadlineBatch(deadlines);
     if (nearest === null) return;
+    const now = this.#now().getTime();
+    // Preserve an upcoming semantic deadline even while another pass backs
+    // off. Once that deadline has fired, the bounded pass retry owns failures
+    // so an overdue record cannot create a zero-delay hot loop.
+    if (nearest.at <= now && this.#passRetryAttempt > 0) return;
     const delayMs = Math.min(
       MAX_TIMER_DELAY_MS,
-      Math.max(minimumDelayMs, nearest.at - this.#now().getTime())
+      Math.max(0, nearest.at - now)
     );
     this.#deadlineTimer = setTimeout(() => {
       this.#deadlineTimer = undefined;
@@ -734,9 +1173,12 @@ export class FileTaskController {
     }
     const operatorRetries = result.inputNotifications.filter(
       (notification) => notification.reason === "operator-not-ready"
-        || notification.reason === "operator-unavailable"
+        || (
+          notification.reason === "operator-unavailable"
+          && this.#operatorStartupRetryArmed
+        )
     );
-    if (operatorRetries.length > 0 && this.#operatorStartupRetryArmed) {
+    if (operatorRetries.length > 0) {
       retry.set("operator", operatorRetries.map((notification) => (
         "inputRequestId" in notification
           ? `input:${notification.inputRequestId}`
@@ -751,25 +1193,106 @@ export class FileTaskController {
     }
     for (const key of settled) this.#clearDeliveryRetry(key);
     for (const [key, identity] of retry) {
-      const previous = this.#deliveryRetryAttempts.get(key);
-      if (previous !== undefined && previous.identity !== identity) this.#clearDeliveryRetry(key);
-      if (this.#deliveryRetryTimers.has(key)) continue;
-      const attempts = this.#deliveryRetryAttempts.get(key)?.attempts ?? 0;
-      if (attempts >= this.#deliveryRetryLimit) {
-        if (key === "operator") this.#operatorStartupRetryArmed = false;
+      this.#scheduleDeliveryRetry(key, identity);
+    }
+  }
+
+  #scheduleRuntimeCleanupRetries(outcomes: readonly RuntimeCleanupOutcome[]): void {
+    for (const outcome of outcomes) {
+      const key = runtimeCleanupMailboxKey(outcome.target);
+      const identity = `runtime-cleanup:${outcome.batchId}`;
+      if (outcome.status === "failed") {
+        if (outcome.error !== undefined) this.#onError(outcome.error);
+        this.#scheduleDeliveryRetry(key, identity);
         continue;
       }
-      this.#deliveryRetryAttempts.set(key, { identity, attempts: attempts + 1 });
-      const delayMs = Math.min(
-        2_000,
-        this.#deliveryRetryMs * (2 ** Math.min(attempts, 3))
+      if (this.#deliveryRetryAttempts.get(key)?.identity === identity) {
+        this.#clearDeliveryRetry(key);
+      }
+    }
+  }
+
+  #scheduleTaskMailboxRetries(scope: ReconcileScope): void {
+    const selection = compileReconcileSelection(scope);
+    const targets = selection.full
+      ? this.store.listWorkMailboxes().flatMap((mailbox) => (
+          mailbox.target.kind === "task" ? [mailbox.target] : []
+        ))
+      : [...selection.allRoleTaskIds].map((taskId) => (
+          { kind: "task", taskId } as const
+        ));
+    for (const target of targets) {
+      const key = `task:${encodeURIComponent(target.taskId)}` as const;
+      const mailbox = this.store.getWorkMailbox(target);
+      const batch = mailbox?.pending ?? mailbox?.processing?.batch;
+      if (batch === undefined || batch === null) {
+        this.#clearDeliveryRetry(key);
+        continue;
+      }
+      this.#scheduleDeliveryRetry(
+        key,
+        `${batch.fromSequence}-${batch.toSequence}`
       );
-      const timer = setTimeout(() => {
-        this.#deliveryRetryTimers.delete(key);
-        if (!this.#stopped) this.signal(key);
-      }, delayMs);
-      timer.unref();
-      this.#deliveryRetryTimers.set(key, timer);
+    }
+  }
+
+  #scheduleDeliveryRetry(key: MailboxKey, identity: string): void {
+    const previous = this.#deliveryRetryAttempts.get(key);
+    if (previous !== undefined && previous.identity !== identity) {
+      this.#clearDeliveryRetry(key);
+    }
+    if (this.#deliveryRetryTimers.has(key)) return;
+    const attempts = this.#deliveryRetryAttempts.get(key)?.attempts ?? 0;
+    if (attempts >= this.#deliveryRetryLimit) {
+      if (key === "operator") this.#operatorStartupRetryArmed = false;
+      this.#forgetPreparedAfterRetryExhaustion(key, identity);
+      return;
+    }
+    this.#deliveryRetryAttempts.set(key, { identity, attempts: attempts + 1 });
+    const delayMs = Math.min(
+      2_000,
+      this.#deliveryRetryMs * (2 ** Math.min(attempts, 3))
+    );
+    const timer = setTimeout(() => {
+      this.#deliveryRetryTimers.delete(key);
+      if (!this.#stopped) this.signal(key);
+    }, delayMs);
+    timer.unref();
+    this.#deliveryRetryTimers.set(key, timer);
+  }
+
+  #forgetPreparedAfterRetryExhaustion(
+    key: MailboxKey,
+    runId: string
+  ): void {
+    if (
+      this.delivery.forgetPrepared === undefined
+      || !key.startsWith("role:")
+      || runId.startsWith("runtime-cleanup:")
+    ) {
+      return;
+    }
+    const target = parseMailboxKey(key);
+    if (target.kind !== "role") return;
+    this.delivery.forgetPrepared({
+      taskId: target.taskId,
+      roleName: target.roleName,
+      runId
+    });
+  }
+
+  #clearEmptyOperatorRetry(): void {
+    if (
+      !this.#operatorStartupRetryArmed
+      && !this.#deliveryRetryAttempts.has("operator")
+    ) return;
+    const mailbox = this.store.getWorkMailbox({ kind: "operator" });
+    if (
+      mailbox === null
+      || (mailbox.pending === null && mailbox.processing === null)
+    ) {
+      this.#operatorStartupRetryArmed = false;
+      this.#clearDeliveryRetry("operator");
     }
   }
 
@@ -781,25 +1304,27 @@ export class FileTaskController {
   }
 
   #scheduleReadyRecoveryDeadlines(): void {
-    const active = new Set<string>();
+    if (!this.#readyRecoverySupported()) return;
     const now = this.#now().getTime();
     for (const task of this.store.listTasks()) {
       if (task.status !== "active") continue;
       for (const role of this.store.listRoles(task.id)) {
         const run = this.store.getActiveAgentRun(task.id, role.name);
         if (run?.deliveredAt === undefined) continue;
-        active.add(run.id);
-        this.#scheduleReadyRecoveryDeadline(run.id, run.deliveredAt, now);
+        this.#registerReadyRecovery(
+          task.id,
+          role.name,
+          run.id,
+          run.deliveredAt,
+          now
+        );
       }
     }
-    for (const [runId, timer] of this.#readyRecoveryTimers) {
-      if (active.has(runId)) continue;
-      clearTimeout(timer);
-      this.#readyRecoveryTimers.delete(runId);
-    }
+    this.#pruneReadyRecoveryRegistrations();
   }
 
   #scheduleReadyRecoveryForResults(result: ControllerSchedulerResult): void {
+    if (!this.#readyRecoverySupported()) return;
     const candidates = [
       ...result.activeRunDeliveries
         .filter((entry) => (
@@ -817,20 +1342,169 @@ export class FileTaskController {
         run?.id !== candidate.runId
         || run.deliveredAt === undefined
       ) continue;
-      this.#scheduleReadyRecoveryDeadline(run.id, run.deliveredAt, now);
+      this.#registerReadyRecovery(
+        candidate.taskId,
+        candidate.roleName,
+        run.id,
+        run.deliveredAt,
+        now
+      );
     }
   }
 
-  #scheduleReadyRecoveryDeadline(runId: string, deliveredAt: string, now: number): void {
-    if (this.#readyRecoveryTimers.has(runId)) return;
-    const remaining = Date.parse(deliveredAt) + this.#readyRecoveryAgeMs - now;
-    if (remaining <= 0) return;
+  #registerReadyRecovery(
+    taskId: string,
+    roleName: string,
+    runId: string,
+    deliveredAt: string,
+    now: number
+  ): void {
+    const dueAt = Date.parse(deliveredAt) + this.#readyRecoveryAgeMs;
+    if (!Number.isFinite(dueAt) || this.#stopped) return;
+    const existing = this.#readyRecoveryRegistrations.get(runId);
+    if (
+      existing?.taskId === taskId
+      && existing.roleName === roleName
+      && existing.deliveredAt === deliveredAt
+    ) return;
+    if (existing !== undefined) this.#clearReadyRecovery(runId);
+    const registration: ReadyRecoveryRegistration = {
+      taskId,
+      roleName,
+      runId,
+      deliveredAt,
+      attempts: 0
+    };
+    this.#readyRecoveryRegistrations.set(runId, registration);
+    this.#armReadyRecovery(registration, Math.max(0, dueAt - now));
+  }
+
+  #armReadyRecovery(
+    registration: ReadyRecoveryRegistration,
+    delayMs: number
+  ): void {
+    if (this.#stopped || this.#dueReadyRecoveryRunIds.has(registration.runId)) return;
+    if (registration.timer !== undefined) clearTimeout(registration.timer);
     const timer = setTimeout(() => {
-      this.#readyRecoveryTimers.delete(runId);
-      if (!this.#stopped) this.#requestBackgroundPump();
-    }, Math.min(MAX_TIMER_DELAY_MS, remaining));
+      if (registration.timer !== timer) return;
+      registration.timer = undefined;
+      if (this.#stopped) return;
+      try {
+        const run = this.store.getActiveAgentRun(
+          registration.taskId,
+          registration.roleName
+        );
+        if (
+          run?.id !== registration.runId
+          || run.deliveredAt !== registration.deliveredAt
+        ) {
+          this.#clearReadyRecovery(registration.runId);
+          return;
+        }
+        this.#dueReadyRecoveryRunIds.add(registration.runId);
+        this.#signalScheduler.signal(
+          `role:${encodeURIComponent(registration.taskId)}/${encodeURIComponent(registration.roleName)}`
+        );
+      } catch (error) {
+        this.#onError(error);
+        registration.attempts += 1;
+        this.#armReadyRecovery(
+          registration,
+          this.#readyRecoveryRetryDelay(registration.attempts)
+        );
+      }
+    }, Math.min(MAX_TIMER_DELAY_MS, delayMs));
     timer.unref();
-    this.#readyRecoveryTimers.set(runId, timer);
+    registration.timer = timer;
+  }
+
+  #dueReadyRecoveryRunsForScope(scope: ReconcileScope): ReadonlySet<string> {
+    const selection = compileReconcileSelection(scope);
+    const selected = new Set<string>();
+    for (const runId of this.#dueReadyRecoveryRunIds) {
+      const registration = this.#readyRecoveryRegistrations.get(runId);
+      if (registration === undefined) {
+        this.#dueReadyRecoveryRunIds.delete(runId);
+        continue;
+      }
+      if (
+        selection.full
+        || selection.allRoleTaskIds.has(registration.taskId)
+        || selection.rolesByTask.get(registration.taskId)?.has(registration.roleName)
+      ) {
+        selected.add(runId);
+      }
+    }
+    return selected;
+  }
+
+  #settleReadyRecoveryPass(runIds: ReadonlySet<string>): void {
+    if (runIds.size === 0) return;
+    const pendingCompletions = new Set(
+      this.store.listPendingRuntimeTurnCompletions().map((completion) => (
+        `${completion.taskId}\0${completion.roleName}\0${completion.runId}`
+      ))
+    );
+    for (const runId of runIds) {
+      this.#dueReadyRecoveryRunIds.delete(runId);
+      const registration = this.#readyRecoveryRegistrations.get(runId);
+      if (registration === undefined) continue;
+      const run = this.store.getActiveAgentRun(
+        registration.taskId,
+        registration.roleName
+      );
+      if (
+        run?.id !== registration.runId
+        || run.deliveredAt !== registration.deliveredAt
+      ) {
+        this.#clearReadyRecovery(runId);
+        continue;
+      }
+      if (pendingCompletions.has(
+        `${registration.taskId}\0${registration.roleName}\0${registration.runId}`
+      )) {
+        continue;
+      }
+      registration.attempts += 1;
+      this.#armReadyRecovery(
+        registration,
+        this.#readyRecoveryRetryDelay(registration.attempts)
+      );
+    }
+  }
+
+  #readyRecoveryRetryDelay(attempts: number): number {
+    return Math.min(
+      30_000,
+      this.#deliveryRetryMs * (2 ** Math.min(Math.max(0, attempts - 1), 7))
+    );
+  }
+
+  #pruneReadyRecoveryRegistrations(): void {
+    for (const [runId, registration] of this.#readyRecoveryRegistrations) {
+      const run = this.store.getActiveAgentRun(
+        registration.taskId,
+        registration.roleName
+      );
+      if (
+        run?.id !== registration.runId
+        || run.deliveredAt !== registration.deliveredAt
+      ) {
+        this.#clearReadyRecovery(runId);
+      }
+    }
+  }
+
+  #clearReadyRecovery(runId: string): void {
+    const registration = this.#readyRecoveryRegistrations.get(runId);
+    if (registration?.timer !== undefined) clearTimeout(registration.timer);
+    this.#readyRecoveryRegistrations.delete(runId);
+    this.#dueReadyRecoveryRunIds.delete(runId);
+  }
+
+  #readyRecoverySupported(): boolean {
+    return this.delivery.inspectRoleReadiness !== undefined
+      && this.store.recoverReadyRoleRun !== undefined;
   }
 }
 

@@ -688,7 +688,7 @@ export class FileTaskStore implements TaskStore {
     this.transaction(() => {
       const existing = this.getWorkMailbox(target);
       if (existing !== null && existing.pending !== null
-        && wakeup.requestCount < existing.pending.requestCount) {
+        && wakeup.requestCount <= existing.pending.requestCount) {
         throw new StorageRecordError(`Pending wakeup is stale: ${wakeup.taskId}`);
       }
       const fromSequence = existing?.pending?.fromSequence ?? existing?.nextSequence ?? 1;
@@ -1274,7 +1274,11 @@ function pendingWakeupProjection(mailbox: WorkMailbox | null): PendingWakeup | n
   };
 }
 function validateMailboxReferences(state: StorageState, mailbox: WorkMailbox): void {
-  if (mailbox.target.kind !== "operator") {
+  if (
+    mailbox.target.kind === "task"
+    || mailbox.target.kind === "role"
+    || mailbox.target.kind === "role-runtime"
+  ) {
     const aggregate = state.tasks[mailbox.target.taskId];
     if (aggregate === undefined) {
       throw new StorageRecordError(`WorkMailbox target Task not found: ${mailbox.target.taskId}`);

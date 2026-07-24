@@ -29,6 +29,7 @@ test("timestamps support a configured IANA timezone and reject invalid values", 
 test("config commands expose effective recovery settings and persist overrides", () => {
   let config = { schemaVersion: 1 };
   const store = {
+    transaction: (execute) => execute(store),
     getConfig: () => structuredClone(config),
     saveConfig: (next) => { config = structuredClone(next); }
   };
@@ -56,6 +57,7 @@ test("config commands expose effective recovery settings and persist overrides",
 test("config commands reject invalid reconciliation intervals through shared validation", () => {
   const config = { schemaVersion: 1 };
   const store = {
+    transaction: (execute) => execute(store),
     getConfig: () => structuredClone(config),
     saveConfig: () => assert.fail("invalid configuration must not be persisted")
   };
@@ -66,7 +68,61 @@ test("config commands reject invalid reconciliation intervals through shared val
         ["set", "--reconciliation-interval-seconds", value],
         store
       ),
-      /reconciliationIntervalSeconds must be an integer from 5 to 300/
+      (error) => {
+        assert.equal(error.code, "USAGE_ERROR");
+        assert.match(error.message, /reconciliationIntervalSeconds must be an integer from 5 to 300/);
+        return true;
+      }
     );
   }
+});
+
+test("config commands validate and patch config inside one store transaction", () => {
+  let config = { schemaVersion: 1, defaultAgent: "codex" };
+  let transactionDepth = 0;
+  const store = {
+    transaction(execute) {
+      transactionDepth += 1;
+      try {
+        return execute(store);
+      } finally {
+        transactionDepth -= 1;
+      }
+    },
+    getConfig() {
+      assert.equal(transactionDepth, 1, "config must be read inside the transaction");
+      return structuredClone(config);
+    },
+    saveConfig(next) {
+      assert.equal(transactionDepth, 1, "config must be saved inside the transaction");
+      config = structuredClone(next);
+    }
+  };
+
+  assert.equal(
+    runConfigCommand(["set", "--time-zone", "Europe/London"], store),
+    "Time zone set to Europe/London\n"
+  );
+  assert.deepEqual(config, {
+    schemaVersion: 1,
+    defaultAgent: "codex",
+    timeZone: "Europe/London"
+  });
+});
+
+test("config commands report invalid timezones as usage errors without starting a transaction", () => {
+  const store = {
+    transaction: () => assert.fail("invalid configuration must not start a write transaction"),
+    getConfig: () => assert.fail("invalid configuration must not be read"),
+    saveConfig: () => assert.fail("invalid configuration must not be persisted")
+  };
+
+  assert.throws(
+    () => runConfigCommand(["set", "--time-zone", "not/a-zone"], store),
+    (error) => {
+      assert.equal(error.code, "USAGE_ERROR");
+      assert.match(error.message, /timeZone must be a valid IANA timezone/);
+      return true;
+    }
+  );
 });

@@ -7,6 +7,7 @@ type SessionLaunchRequestBase = Readonly<{
   agentId: string;
   adapterId: string;
   workspace: string;
+  environment?: Readonly<Record<string, string>>;
 }>;
 
 export type NewSessionLaunchRequest = SessionLaunchRequestBase & Readonly<{
@@ -28,7 +29,10 @@ export function createSessionLaunchRequest(
     owner: normalizeRuntimeOwner(input.owner),
     agentId: requireSafeIdentity(input.agentId, "Agent id"),
     adapterId: requireSafeIdentity(input.adapterId, "Agent adapter id"),
-    workspace: requireText(input.workspace, "Session workspace")
+    workspace: requireText(input.workspace, "Session workspace"),
+    ...(input.environment === undefined
+      ? {}
+      : { environment: copyEnvironment(input.environment) })
   };
   if (input.mode === "new") return { mode: "new", ...common };
   if (input.mode === "resume") {
@@ -39,4 +43,21 @@ export function createSessionLaunchRequest(
     };
   }
   throw new Error("Session launch mode is invalid.");
+}
+
+function copyEnvironment(
+  input: Readonly<Record<string, string>>
+): Readonly<Record<string, string>> {
+  const result: Record<string, string> = {};
+  for (const [name, value] of Object.entries(input)) {
+    if (
+      !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)
+      || typeof value !== "string"
+      || value.includes("\0")
+    ) {
+      throw new TypeError("Session environment override is invalid.");
+    }
+    result[name] = value;
+  }
+  return result;
 }

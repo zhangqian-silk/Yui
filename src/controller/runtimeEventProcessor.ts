@@ -7,6 +7,7 @@ type TaskRuntimeTurnCompleted = Readonly<{
   roleName: string;
   agentId: string;
   adapterId: string;
+  launchId?: string;
   nativeSessionId: string;
   turnId: string;
   runId?: string;
@@ -17,19 +18,13 @@ type GlobalRuntimeTurnCompleted = Readonly<{
   roleName: string;
   agentId: string;
   adapterId: string;
+  launchId?: string;
   nativeSessionId: string;
   turnId: string;
 }>;
 
 export type RuntimeTurnEventObserver = Readonly<{
   getTask(taskId: string): SchedulerTask | null;
-  observeRuntimeNativeSessionFact?(input: Readonly<{
-    taskId: string;
-    roleName: string;
-    agentId: string;
-    adapterId: string;
-    nativeSessionId: string;
-  }>, now?: Date): boolean;
   observeRuntimeTurnCompleted(
     input: TaskRuntimeTurnCompleted,
     now?: Date
@@ -47,7 +42,7 @@ export type RuntimeTurnEventObserver = Readonly<{
 }>;
 
 export type RuntimeEventDrainFailure = Readonly<{
-  eventId: string;
+  eventId?: string;
   error: unknown;
 }>;
 
@@ -76,7 +71,17 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
     const acknowledgedEventIds: string[] = [];
     const deferred: RuntimeTurnCompletedEvent[] = [];
     const failed: RuntimeEventDrainFailure[] = [];
-    for (const event of this.inbox.list()) {
+    let events: readonly RuntimeTurnCompletedEvent[];
+    try {
+      events = this.inbox.list();
+    } catch (error) {
+      return {
+        acknowledgedEventIds,
+        deferred,
+        failed: [{ error }]
+      };
+    }
+    for (const event of events) {
       try {
         if (event.scope === "task") {
           const task = this.observer.getTask(event.taskId!);
@@ -89,18 +94,12 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
             roleName: event.roleName,
             agentId: event.agentId,
             adapterId: event.adapterId,
+            ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
             nativeSessionId: event.nativeSessionId,
             turnId: event.turnId,
             ...(event.runId === undefined ? {} : { runId: event.runId }),
             summary: event.summary
           };
-          this.observer.observeRuntimeNativeSessionFact?.({
-            taskId: input.taskId,
-            roleName: input.roleName,
-            agentId: input.agentId,
-            adapterId: input.adapterId,
-            nativeSessionId: input.nativeSessionId
-          }, now);
           const disposition = this.observer.classifyRuntimeTurnCompleted?.(input)
             ?? "apply";
           if (disposition === "deferred") {
@@ -117,6 +116,7 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
             roleName: event.roleName,
             agentId: event.agentId,
             adapterId: event.adapterId,
+            ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
             nativeSessionId: event.nativeSessionId,
             turnId: event.turnId
           };

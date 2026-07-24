@@ -31,6 +31,7 @@ export type RuntimeTurnCompletedInput = Readonly<{
   roleName: string;
   agentId: string;
   adapterId: "codex";
+  launchId?: string;
   nativeSessionId: string;
   turnId: string;
   runId?: string;
@@ -47,6 +48,7 @@ export type RuntimeTurnCompletedEvent = Readonly<{
   roleName: string;
   agentId: string;
   adapterId: "codex";
+  launchId?: string;
   nativeSessionId: string;
   turnId: string;
   runId?: string;
@@ -145,8 +147,19 @@ export class FileRuntimeEventInbox {
         assertEventId(id);
         const event = this.read(id);
         if (event !== null) events.push(event);
-      } catch {
-        this.quarantine(name);
+      } catch (error) {
+        if (
+          !(error instanceof RuntimeEventInboxError)
+          || error.code !== "RUNTIME_EVENT_INVALID"
+        ) {
+          throw error;
+        }
+        try {
+          this.quarantine(name);
+        } catch {
+          // Quarantine is best-effort. Leave the invalid entry in place without
+          // allowing it to block independent, readable Hook events.
+        }
       }
     }
     return events.sort((left, right) => (
@@ -248,6 +261,7 @@ function runtimeTurnEventId(input: RuntimeTurnCompletedInput): string {
     input.roleName,
     input.agentId,
     input.adapterId,
+    input.launchId ?? null,
     input.nativeSessionId,
     input.turnId,
     input.runId ?? null
@@ -268,6 +282,9 @@ function normalizeInput(input: RuntimeTurnCompletedInput): RuntimeTurnCompletedI
     roleName: requireText(input.roleName, "Role name"),
     agentId: requireText(input.agentId, "Agent id"),
     adapterId: input.adapterId,
+    ...(input.launchId === undefined
+      ? {}
+      : { launchId: requireText(input.launchId, "Launch id") }),
     nativeSessionId: requireText(input.nativeSessionId, "Native session id"),
     turnId: requireText(input.turnId, "Turn id"),
     ...(input.runId === undefined ? {} : { runId: requireText(input.runId, "Run id") }),
@@ -288,11 +305,13 @@ function parseRuntimeEvent(value: unknown): RuntimeTurnCompletedEvent {
     ? [
         "schemaVersion", "id", "type", "receivedAt", "scope", "taskId",
         "roleName", "agentId", "adapterId", "nativeSessionId", "turnId", "summary",
+        ...(value.launchId === undefined ? [] : ["launchId"]),
         ...(value.runId === undefined ? [] : ["runId"])
       ]
     : [
         "schemaVersion", "id", "type", "receivedAt", "scope",
         "roleName", "agentId", "adapterId", "nativeSessionId", "turnId", "summary",
+        ...(value.launchId === undefined ? [] : ["launchId"]),
         ...(value.runId === undefined ? [] : ["runId"])
       ];
   if (
@@ -311,6 +330,7 @@ function parseRuntimeEvent(value: unknown): RuntimeTurnCompletedEvent {
     roleName: value.roleName,
     agentId: value.agentId,
     adapterId: value.adapterId,
+    ...(value.launchId === undefined ? {} : { launchId: value.launchId }),
     nativeSessionId: value.nativeSessionId,
     turnId: value.turnId,
     ...(value.runId === undefined ? {} : { runId: value.runId }),
@@ -374,6 +394,7 @@ function hasSameIdentity(
     && left.roleName === right.roleName
     && left.agentId === right.agentId
     && left.adapterId === right.adapterId
+    && left.launchId === right.launchId
     && left.nativeSessionId === right.nativeSessionId
     && left.turnId === right.turnId
     && left.runId === right.runId;

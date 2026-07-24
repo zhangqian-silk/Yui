@@ -164,9 +164,10 @@ function listRequests(args: string[], store: TaskStore): TaskInputCommandExecuti
   const requests = parsed.options.has("--all")
     ? all
     : all.filter((request) => request.status === "open");
-  const rendered = requests.length === 0
-    ? "No input requests found.\n"
-    : `${renderTable(
+  let rendered = "No input requests found.\n";
+  if (requests.length > 0) {
+    const timeZone = store.getConfig().timeZone;
+    rendered = `${renderTable(
         taskId === undefined ? "Input inbox" : `Input requests: ${taskId}`,
         [
           { header: "Input", minWidth: 6, maxWidth: 18 },
@@ -182,10 +183,11 @@ function listRequests(args: string[], store: TaskStore): TaskInputCommandExecuti
           request.status,
           request.policy.kind,
           request.question,
-          formatTimestamp(request.createdAt, store.getConfig().timeZone)
+          formatTimestamp(request.createdAt, timeZone)
         ]),
         defaultTableWidth()
       )}\n`;
+  }
   return output(rendered, { requests });
 }
 

@@ -162,7 +162,32 @@ test("a Leader send or post-send persistence uncertainty preserves the claimed R
     assert.equal(result.reason, "delivery-uncertain");
     assert.equal(store.savedFailures.length, 0);
     assert.equal(store.activeRuns.get(key("task-1", "leader")).id, "run-1");
+    assert.equal(
+      delivery.calls.some((call) => call.type === "forget"),
+      false
+    );
   }
+});
+
+test("a pre-send Leader failure forgets its transient prepared binding", async () => {
+  const store = fakeStore();
+  const delivery = fakeDelivery();
+  delivery.waitUntilReady = async (prepared) => {
+    delivery.calls.push({ type: "ready", prepared });
+    throw new Error("composer inspection failed");
+  };
+
+  const [result] = await processLeaderWakeups(store, delivery, NOW);
+
+  assert.equal(result.status, "failed");
+  assert.deepEqual(
+    delivery.calls.find((call) => call.type === "forget")?.input,
+    {
+      taskId: "task-1",
+      roleName: "leader",
+      runId: "run-1"
+    }
+  );
 });
 
 test("Leader wakeup context includes the Brief and the latest active Decisions", async () => {
@@ -280,6 +305,10 @@ test("a missing Worker tmux fails its run and queues a Leader wakeup", async () 
 
   assert.deepEqual(failed, ["run-worker"]);
   assert.equal(store.savedExitedRuns.length, 1);
+  assert.deepEqual(
+    delivery.calls.find((call) => call.type === "forget")?.input,
+    { taskId: "task-1", roleName: "worker", runId: "run-worker" }
+  );
   assert.deepEqual(store.pending.get("task-1").reasons, ["role-result", "role-run-failed"]);
 });
 
@@ -344,6 +373,10 @@ test("a full reconciliation recovers a delivered Run whose composer is ready", a
 
   assert.deepEqual(await reconcileExitedRoleRuns(store, delivery, NOW), []);
   assert.deepEqual(recovered.map(({ runId }) => runId), [run.id]);
+  assert.deepEqual(
+    delivery.calls.find((call) => call.type === "forget")?.input,
+    { taskId: "task-1", roleName: "worker", runId: run.id }
+  );
 });
 
 test("a dirty pass never uses composer readiness as a synthetic Turn boundary", async () => {
@@ -370,6 +403,43 @@ test("a dirty pass never uses composer readiness as a synthetic Turn boundary", 
 
   assert.deepEqual(await reconcileExitedRoleRuns(store, delivery, NOW, selection), []);
   assert.deepEqual(recovered, []);
+});
+
+test("an explicitly due Run may use composer readiness in a targeted pass", async () => {
+  const store = fakeStore();
+  store.roles.push(role("worker"));
+  const run = {
+    ...activeRun("run-worker", "worker"),
+    deliveredAt: new Date(NOW.getTime() - 120_000).toISOString()
+  };
+  store.activeRuns.set(key("task-1", "worker"), run);
+  const recovered = [];
+  store.recoverReadyRoleRun = (input) => recovered.push(input);
+  const delivery = {
+    ...fakeDelivery({ inspect: "present" }),
+    async inspectRoleReadiness() { return "ready"; }
+  };
+  const selection = {
+    full: false,
+    taskIds: new Set(["task-1"]),
+    allRoleTaskIds: new Set(),
+    rolesByTask: new Map([["task-1", new Set(["worker"])]]),
+    operator: false
+  };
+
+  assert.deepEqual(
+    await reconcileExitedRoleRuns(
+      store,
+      delivery,
+      NOW,
+      selection,
+      new Set(),
+      120_000,
+      new Set([run.id])
+    ),
+    []
+  );
+  assert.deepEqual(recovered.map(({ runId }) => runId), [run.id]);
 });
 
 test("a full pass does not mistake a freshly delivered composer for a missing Hook", async () => {
@@ -663,6 +733,9 @@ function fakeDelivery(options = {}) {
     sendOnce: async (input) => {
       calls.push({ type: "sendOnce", input });
       return "sent";
+    },
+    forgetPrepared: (input) => {
+      calls.push({ type: "forget", input });
     },
     inspectRole: async (input) => {
       calls.push({ type: "inspect", input });

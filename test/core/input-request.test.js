@@ -12,6 +12,7 @@ import {
   createWorkMailbox,
   enqueueSignal
 } from "../../dist/coordination/workMailbox.js";
+import { runTaskInputCommand } from "../../dist/commands/taskInputCommands.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { runControllerSchedulerPass } from "../../dist/controller/controller.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
@@ -39,6 +40,30 @@ import { createWorkItem } from "../../dist/workItem/workItem.js";
 
 const FIRST = new Date("2026-07-21T01:00:00.000Z");
 const SECOND = new Date("2026-07-21T01:01:00.000Z");
+
+test("input list reads presentation timezone once per command", () => {
+  let getConfigCalls = 0;
+  const requests = [1, 2, 3].map((number) => ({
+    id: `input-${number}`,
+    taskId: "task-1",
+    status: "open",
+    policy: { kind: "required" },
+    question: `Question ${number}?`,
+    createdAt: FIRST.toISOString()
+  }));
+  const store = {
+    listAllInputRequests: () => requests,
+    getConfig() {
+      getConfigCalls += 1;
+      return { schemaVersion: 1, timeZone: "Asia/Shanghai" };
+    }
+  };
+
+  const result = runTaskInputCommand(["list", "--all"], store, {});
+
+  assert.match(result.output, /input-3/);
+  assert.equal(getConfigCalls, 1);
+});
 
 function requester(overrides = {}) {
   return {

@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -62,6 +69,7 @@ function recordParsedTurnCompletion(schedulerStore, payload, environment) {
     roleName: input.roleName,
     agentId: input.agentId,
     adapterId: input.adapterId,
+    launchId: input.launchId,
     nativeSessionId: input.nativeSessionId,
     turnId: input.turnId,
     summary: input.lastAssistantMessage
@@ -76,6 +84,13 @@ test("Controller lifecycle dispatcher is the sole session creator for enter", as
     async start(request) {
       starts.push(request);
       return {
+        id: `binding-${starts.length}`,
+        launchId: request.launchId,
+        owner: request.owner,
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        hostRef: `host-${starts.length}`,
+        hostCreated: true,
         nativeSessionId: request.owner.scope === "task" ? "thread-task" : "thread-global"
       };
     },
@@ -145,6 +160,29 @@ test("one planner adds Codex structured notify for Task and global launches", (t
   assert.equal(globalPlan.launch.env.YUI_TASK_ID, undefined);
 });
 
+test("managed Codex launch refuses to replace an existing native notify callback", (t) => {
+  const { home, store, task, role, agent } = fixture(t);
+  const codexHome = join(home, "native-codex");
+  mkdirSync(codexHome);
+  writeFileSync(
+    join(codexHome, "config.toml"),
+    'notify = ["existing-notifier"]\n',
+    { mode: 0o600 }
+  );
+  const planner = new FileRoleLaunchPlanner(home, store, {
+    environment: { CODEX_HOME: codexHome },
+    cliPath: "/dist/cli.js"
+  });
+
+  assert.throws(() => planner.plan({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    mode: "new"
+  }), /notify.*already configured.*exclusive ownership/i);
+});
+
 test("Claude new launch is preallocated once and persisted without a prompt", (t) => {
   const { home, store, task, role, agent } = fixture(t, "claude");
   const planner = new FileRoleLaunchPlanner(home, store, {
@@ -161,9 +199,12 @@ test("Claude new launch is preallocated once and persisted without a prompt", (t
   assert.deepEqual(plan.launch.args.slice(-2), ["--session-id", "claude-native-1"]);
   assert.equal(plan.session.nativeSessionId, "claude-native-1");
   assert.equal(plan.launch.args.some((argument) => argument.includes("Yui setup:")), false);
-  const systemPromptIndex = plan.launch.args.indexOf("--append-system-prompt");
+  const systemPromptIndex = plan.launch.args.indexOf("--append-system-prompt-file");
   assert.ok(systemPromptIndex >= 0);
-  assert.match(plan.launch.args[systemPromptIndex + 1], /injected yui-leader/);
+  const contextFile = plan.launch.args[systemPromptIndex + 1];
+  assert.match(contextFile, /runtime\/session-contexts\/[a-f0-9]+\.md$/);
+  assert.match(readFileSync(contextFile, "utf8"), /injected yui-leader/);
+  assert.equal(statSync(contextFile).mode & 0o777, 0o600);
 });
 
 test("Claude launch identity is deterministic for one durable launch across retries", (t) => {
@@ -195,7 +236,8 @@ test("Codex notify payload is strictly converted to one durable runtime event", 
     YUI_TASK_ID: task.id,
     YUI_ROLE: role.name,
     YUI_AGENT_ID: agent.id,
-    YUI_ADAPTER_ID: "codex"
+    YUI_ADAPTER_ID: "codex",
+    YUI_LAUNCH_ID: "launch-notify-strict"
   };
   const payload = JSON.stringify({
     type: "agent-turn-complete",
@@ -259,7 +301,8 @@ test("Codex notify remains queued when the Controller is offline", async (t) => 
     YUI_TASK_ID: task.id,
     YUI_ROLE: role.name,
     YUI_AGENT_ID: agent.id,
-    YUI_ADAPTER_ID: "codex"
+    YUI_ADAPTER_ID: "codex",
+    YUI_LAUNCH_ID: "launch-offline"
   });
 
   assert.equal(store.getRoleSession(task.id, role.name), null);
@@ -285,6 +328,10 @@ test("Codex turn completion releases a forgotten Leader active fence exactly onc
     enqueueWork(tx, { kind: "role", taskId: task.id, roleName: role.name }, "task-created", now);
   });
   const schedulerStore = new FileSchedulerStoreAdapter(store);
+  schedulerStore.reserveRuntimeLaunch({
+    owner: { scope: "task", taskId: task.id, roleName: role.name },
+    launchId: "launch-leader-turn"
+  }, () => {}, now);
   schedulerStore.claimWorkMailbox({
     target: { kind: "role", taskId: task.id, roleName: role.name },
     batchId: `agent-run:${run.id}`,
@@ -304,7 +351,8 @@ test("Codex turn completion releases a forgotten Leader active fence exactly onc
     YUI_TASK_ID: task.id,
     YUI_ROLE: role.name,
     YUI_AGENT_ID: agent.id,
-    YUI_ADAPTER_ID: "codex"
+    YUI_ADAPTER_ID: "codex",
+    YUI_LAUNCH_ID: "launch-leader-turn"
   };
   const payload = JSON.stringify({
     type: "agent-turn-complete",
@@ -352,6 +400,10 @@ test("a quiescent result-driven Leader turn queues recovery when the Agent forge
     ]);
   });
   const schedulerStore = new FileSchedulerStoreAdapter(store);
+  schedulerStore.reserveRuntimeLaunch({
+    owner: { scope: "task", taskId: task.id, roleName: role.name },
+    launchId: "launch-final-turn"
+  }, () => {}, now);
   schedulerStore.claimWorkMailbox({
     target: { kind: "role", taskId: task.id, roleName: role.name },
     batchId: `agent-run:${run.id}`,
@@ -365,7 +417,8 @@ test("a quiescent result-driven Leader turn queues recovery when the Agent forge
     YUI_TASK_ID: task.id,
     YUI_ROLE: role.name,
     YUI_AGENT_ID: agent.id,
-    YUI_ADAPTER_ID: "codex"
+    YUI_ADAPTER_ID: "codex",
+    YUI_LAUNCH_ID: "launch-final-turn"
   };
   const payload = JSON.stringify({
     type: "agent-turn-complete",
@@ -413,6 +466,10 @@ test("a Worker turn that forgets to yield fails visibly and wakes the Leader", a
     ]);
   });
   const schedulerStore = new FileSchedulerStoreAdapter(store);
+  schedulerStore.reserveRuntimeLaunch({
+    owner: { scope: "task", taskId: task.id, roleName: worker.name },
+    launchId: "launch-worker-turn"
+  }, () => {}, now);
   schedulerStore.claimWorkMailbox({
     target: { kind: "role", taskId: task.id, roleName: worker.name },
     batchId: `agent-run:${run.id}`,
@@ -434,7 +491,8 @@ test("a Worker turn that forgets to yield fails visibly and wakes the Leader", a
     YUI_TASK_ID: task.id,
     YUI_ROLE: worker.name,
     YUI_AGENT_ID: agent.id,
-    YUI_ADAPTER_ID: "codex"
+    YUI_ADAPTER_ID: "codex",
+    YUI_LAUNCH_ID: "launch-worker-turn"
   });
 
   assert.equal(store.findAgentRun(run.id).status, "failed");

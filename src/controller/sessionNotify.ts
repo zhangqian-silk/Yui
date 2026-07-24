@@ -2,6 +2,7 @@ import { callController } from "../core/controllerClient.js";
 import type { JsonValue } from "../core/protocol.js";
 import { FileRuntimeEventInbox } from "./runtimeEventInbox.js";
 import { yuiRunIdFromInputMessages } from "../run/runIdentity.js";
+import { runtimeLifecycleSignalKey } from "../runtime/lifecycleReservation.js";
 
 export type CodexSessionNotification = Readonly<{
   scope: "task" | "global";
@@ -9,6 +10,7 @@ export type CodexSessionNotification = Readonly<{
   roleName: string;
   agentId: string;
   adapterId: "codex";
+  launchId: string;
   nativeSessionId: string;
   turnId: string;
   runId?: string;
@@ -36,6 +38,7 @@ export async function runSessionNotifyCommand(
     roleName: params.roleName,
     agentId: params.agentId,
     adapterId: params.adapterId,
+    launchId: params.launchId,
     nativeSessionId: params.nativeSessionId,
     turnId: params.turnId,
     ...(params.runId === undefined ? {} : { runId: params.runId }),
@@ -47,9 +50,18 @@ export async function runSessionNotifyCommand(
     home,
     "scheduler.signal",
     {
-      key: params.scope === "task"
-        ? `role:${encodeURIComponent(params.taskId!)}/${encodeURIComponent(params.roleName)}`
-        : "operator"
+      key: runtimeLifecycleSignalKey(
+        params.scope === "task"
+          ? {
+              scope: "task",
+              taskId: params.taskId!,
+              roleName: params.roleName
+            }
+          : {
+              scope: "global",
+              roleName: params.roleName
+            }
+      )
     },
     { timeoutMs: 100 }
   ).catch(() => {});
@@ -76,6 +88,7 @@ export function parseCodexSessionNotification(
     roleName: requireText(environment.YUI_ROLE, "YUI_ROLE"),
     agentId: requireText(environment.YUI_AGENT_ID, "YUI_AGENT_ID"),
     adapterId: requireCodexAdapter(environment.YUI_ADAPTER_ID),
+    launchId: requireText(environment.YUI_LAUNCH_ID, "YUI_LAUNCH_ID"),
     nativeSessionId,
     turnId,
     ...(runId === undefined ? {} : { runId }),

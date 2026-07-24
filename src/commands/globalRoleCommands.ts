@@ -4,8 +4,6 @@ import {
   recordRoleAgentSession,
   type GlobalRoleSessionSet
 } from "../executor/agentExecutor.js";
-import { resolveAgentAdapter } from "../executor/agentAdapter.js";
-import { resolveAgentEnvironment } from "../agent/agent.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { activeRoleSummary, renderRoleDetails } from "../output/rolePresentation.js";
 import {
@@ -13,6 +11,7 @@ import {
   createGlobalRole,
   createRoleAgentBinding,
   switchActiveRoleAgent,
+  unbindRoleAgent,
   updateGlobalRole,
   type GlobalRole
 } from "../role/role.js";
@@ -21,8 +20,10 @@ import {
   SYSTEM_ROLE_NAMES,
   systemRoleDescription
 } from "../role/systemRoles.js";
-import type { AgentCommandStore, ConfiguredAgentRecord } from "./agentCommands.js";
-import { compileRoleSessionContext } from "../context/roleSessionContext.js";
+import type {
+  AgentCommandTransactionStore,
+  ConfiguredAgentRecord
+} from "./agentCommands.js";
 import {
   hasAgentConfigOptions,
   parseRoleOptions,
@@ -31,8 +32,16 @@ import {
   roleProfileFrom,
   roleProfilePatch
 } from "./roleConfiguration.js";
+import {
+  hasRoleLaunchContextOptions,
+  validateConfiguredRoleSkills
+} from "./roleSkillValidation.js";
+import {
+  assertRoleRuntimeMutationAllowed,
+  type RoleRuntimeGuardStore
+} from "./roleRuntimeGuard.js";
 
-type GlobalRoleStore = AgentCommandStore & Readonly<{
+type GlobalRoleTransactionStore = AgentCommandTransactionStore & RoleRuntimeGuardStore & Readonly<{
   getConfig(): Readonly<{ defaultWorkspace?: string }>;
   createGlobalRoleIfAbsent(role: GlobalRole): GlobalRole | null;
   listGlobalRoles(): GlobalRole[];
@@ -44,6 +53,10 @@ type GlobalRoleStore = AgentCommandStore & Readonly<{
   saveGlobalRoleSessionSet(sessionSet: GlobalRoleSessionSet): void;
 }>;
 
+type GlobalRoleStore = GlobalRoleTransactionStore & Readonly<{
+  transaction<T>(execute: (store: GlobalRoleTransactionStore) => T): T;
+}>;
+
 export type GlobalRoleCommandOptions = Readonly<{
   yuiHome?: string;
   env?: NodeJS.ProcessEnv;
@@ -52,11 +65,6 @@ export type GlobalRoleCommandOptions = Readonly<{
 export type GlobalRoleEnterControl = Readonly<{
   kind: "enter";
   role: GlobalRole;
-  launch: Readonly<{
-    command: string;
-    args: readonly string[];
-    env: Readonly<Record<string, string>>;
-  }>;
 }>;
 
 export type GlobalRoleCommandResult = string | GlobalRoleEnterControl;
@@ -68,13 +76,14 @@ export function runGlobalRoleCommand(
 ): GlobalRoleCommandResult {
   const [command, ...rest] = args;
   switch (command) {
-    case "add": return addRole(rest, store);
+    case "add": return addRole(rest, store, options);
     case "list": return listRoles(rest, store);
     case "show": return showRole(rest, store);
-    case "update": return updateRole(rest, store);
+    case "update": return updateRole(rest, store, options);
     case "remove": return removeRole(rest, store);
     case "bind": return bindRole(rest, store);
-    case "enter": return enterRole(rest, store, options);
+    case "unbind": return unbindRole(rest, store);
+    case "enter": return enterRole(rest, store);
     case "session": return roleSession(rest, store, options);
     default:
       throw usageError(command === undefined
@@ -83,26 +92,37 @@ export function runGlobalRoleCommand(
   }
 }
 
-function addRole(args: string[], store: GlobalRoleStore): string {
+function addRole(
+  args: string[],
+  store: GlobalRoleStore,
+  options: GlobalRoleCommandOptions
+): string {
   const [rawName, ...tail] = args;
   const name = roleName(rawName);
   const parsed = parseRoleOptions(tail, roleOptionSpecs({
     update: false, includeAgent: true, includeWorkspace: true
   }));
   const agentId = required(parsed.one("--agent"), "--agent");
-  const agent = requireAgent(agentId, store);
   if (parsed.has("--workspace") && trimmed(parsed.one("--workspace")) === undefined) {
     throw usageError("--workspace is required.");
   }
-  const workspace = trimmed(parsed.one("--workspace"))
-    ?? store.getConfig().defaultWorkspace
-    ?? process.cwd();
-  const binding = patchRoleAgentBinding(createRoleAgentBinding(definition(agent)), parsed);
-  const role = createGlobalRole(
-    name, [binding], agent.id, workspace, new Date(), roleProfileFrom(parsed)
-  );
-  const created = store.createGlobalRoleIfAbsent(role);
-  if (created === null) throw usageError(`Role already exists: ${name}.`);
+  const now = new Date();
+  const created = store.transaction((tx) => {
+    assertRoleRuntimeMutationAllowed(tx, { scope: "global", roleName: name }, "creation");
+    const agent = requireAgent(agentId, tx);
+    const workspace = trimmed(parsed.one("--workspace"))
+      ?? tx.getConfig().defaultWorkspace
+      ?? process.cwd();
+    const binding = patchRoleAgentBinding(createRoleAgentBinding(definition(agent)), parsed);
+    const profile = roleProfileFrom(parsed);
+    validateConfiguredRoleSkills(options.yuiHome, profile.skills ?? []);
+    const role = createGlobalRole(
+      name, [binding], agent.id, workspace, now, profile
+    );
+    const result = tx.createGlobalRoleIfAbsent(role);
+    if (result === null) throw usageError(`Role already exists: ${name}.`);
+    return result;
+  });
   return presentRole(`Added role ${name}`, created, store);
 }
 
@@ -151,10 +171,13 @@ function showRole(args: string[], store: GlobalRoleStore): string {
   });
 }
 
-function updateRole(args: string[], store: GlobalRoleStore): string {
+function updateRole(
+  args: string[],
+  store: GlobalRoleStore,
+  options: GlobalRoleCommandOptions
+): string {
   const [rawName, ...tail] = args;
   const name = roleName(rawName);
-  const role = requireRole(name, store);
   const parsed = parseRoleOptions(tail, roleOptionSpecs({
     update: true, includeAgent: true, includeWorkspace: true
   }));
@@ -168,29 +191,48 @@ function updateRole(args: string[], store: GlobalRoleStore): string {
     throw usageError("At least one role update option is required.");
   }
   const workspace = trimmed(parsed.one("--workspace"));
-  let bindings = role.agentBindings;
-  if (hasAgentConfigOptions(parsed)) {
-    const agentId = parsed.one("--agent")?.trim() || role.activeAgentId;
-    const agent = requireAgent(agentId, store);
-    const binding = role.agentBindings[agentId] ?? createRoleAgentBinding(definition(agent));
-    const activeSession = store.getGlobalRoleSessionSet(name)?.sessions[agentId];
-    if (
-      agentId === role.activeAgentId
-      && activeSession !== undefined
-      && activeSession.status !== "stopped"
-    ) {
-      throw usageError("Active Agent settings cannot be changed while its native process is running.");
+  const next = store.transaction((tx) => {
+    const role = requireRole(name, tx);
+    const sessions = tx.getGlobalRoleSessionSet(name);
+    const changesLaunchContext = hasRoleLaunchContextOptions(parsed);
+    const changesAgentConfig = hasAgentConfigOptions(parsed);
+    if (changesLaunchContext || changesAgentConfig) {
+      assertRoleRuntimeMutationAllowed(tx, {
+        scope: "global",
+        roleName: role.name
+      }, "launch configuration update");
     }
-    bindings = { ...role.agentBindings, [agentId]: patchRoleAgentBinding(binding, parsed) };
-  }
-  const next: GlobalRole = {
-    ...updateGlobalRole(role, {
+    if (
+      changesLaunchContext
+      && Object.values(sessions?.sessions ?? {}).some(({ status }) => status !== "stopped")
+    ) {
+      throw usageError("Role launch context cannot be changed while its native process is running.");
+    }
+    let bindings = role.agentBindings;
+    if (changesAgentConfig) {
+      const agentId = parsed.one("--agent")?.trim() || role.activeAgentId;
+      const agent = requireAgent(agentId, tx);
+      const binding = role.agentBindings[agentId] ?? createRoleAgentBinding(definition(agent));
+      const targetSession = sessions?.sessions[agentId];
+      if (
+        targetSession !== undefined
+        && targetSession.status !== "stopped"
+      ) {
+        throw usageError("Agent settings cannot be changed while its native process is running.");
+      }
+      bindings = { ...role.agentBindings, [agentId]: patchRoleAgentBinding(binding, parsed) };
+    }
+    const updated = updateGlobalRole(role, {
       ...(workspace === undefined ? {} : { workspace }),
       ...(bindings === role.agentBindings ? {} : { agentBindings: bindings }),
       ...roleProfilePatch(parsed)
-    }, new Date())
-  };
-  store.saveGlobalRole(next);
+    }, new Date());
+    if (changesLaunchContext) {
+      validateConfiguredRoleSkills(options.yuiHome, updated.skills ?? []);
+    }
+    tx.saveGlobalRole(updated);
+    return updated;
+  });
   return renderRoleDetails(`Updated role ${name}`, next, {
     kind: isSystemRoleName(name) ? "system" : "global",
     sessions: store.getGlobalRoleSessionSet(name)
@@ -202,35 +244,50 @@ function bindRole(args: string[], store: GlobalRoleStore): string {
   const name = roleName(rawName);
   const agentId = required(rawAgentId, "Agent id");
   assertNoArguments(rest, "Role bind usage: yui role bind <role> <agent-id>");
-  const role = requireRole(name, store);
-  const agent = requireAgent(agentId, store);
-  const binding = role.agentBindings[agentId] ?? createRoleAgentBinding(definition(agent));
-  const withBinding = updateGlobalRole(role, {
-    agentBindings: { ...role.agentBindings, [agentId]: binding }
-  }, new Date());
-  if (agentId === role.activeAgentId) {
-    store.saveGlobalRole(withBinding);
-    return presentRole(`Role ${name} already bound to ${agentId}`, withBinding, store);
-  }
-  const existingSet = store.getGlobalRoleSessionSet(name);
-  const activeSession = existingSet?.sessions[role.activeAgentId];
-  try {
-    const switched = switchActiveRoleAgent(
-      withBinding,
-      existingSet ?? createRoleSessionSet({ scope: "global", roleName: name }, role.activeAgentId, new Date()),
-      agentId,
-      {
-        activeRun: false,
-        nativeProcessRunning: activeSession !== undefined
-          && activeSession.status !== "stopped"
-      },
-      new Date()
-    );
-    store.saveGlobalRoleWithSessionSet(switched.role, switched.sessions);
-    return presentRole(`Bound role ${name} to ${agentId}`, switched.role, store);
-  } catch (error) {
-    throw usageError(error instanceof Error ? error.message : String(error));
-  }
+  const now = new Date();
+  const result = store.transaction((tx) => {
+    const role = requireRole(name, tx);
+    assertRoleRuntimeMutationAllowed(tx, {
+      scope: "global",
+      roleName: role.name
+    }, "Agent binding");
+    const agent = requireAgent(agentId, tx);
+    const binding = role.agentBindings[agentId] ?? createRoleAgentBinding(definition(agent));
+    const withBinding = updateGlobalRole(role, {
+      agentBindings: { ...role.agentBindings, [agentId]: binding }
+    }, now);
+    if (agentId === role.activeAgentId) {
+      tx.saveGlobalRole(withBinding);
+      return {
+        message: `Role ${name} already bound to ${agentId}`,
+        role: withBinding
+      };
+    }
+    const existingSet = tx.getGlobalRoleSessionSet(name);
+    const activeSession = existingSet?.sessions[role.activeAgentId];
+    try {
+      const switched = switchActiveRoleAgent(
+        withBinding,
+        existingSet ?? createRoleSessionSet(
+          { scope: "global", roleName: name },
+          role.activeAgentId,
+          now
+        ),
+        agentId,
+        {
+          activeRun: false,
+          nativeProcessRunning: activeSession !== undefined
+            && activeSession.status !== "stopped"
+        },
+        now
+      );
+      tx.saveGlobalRoleWithSessionSet(switched.role, switched.sessions);
+      return { message: `Bound role ${name} to ${agentId}`, role: switched.role };
+    } catch (error) {
+      throw usageError(error instanceof Error ? error.message : String(error));
+    }
+  });
+  return presentRole(result.message, result.role, store);
 }
 
 function removeRole(args: string[], store: GlobalRoleStore): string {
@@ -238,29 +295,52 @@ function removeRole(args: string[], store: GlobalRoleStore): string {
   const name = roleName(rawName);
   assertNoArguments(rest, "Role remove usage: yui role remove <role>");
   if (isSystemRoleName(name)) throw usageError(`System role cannot be removed: ${name}`);
-  const role = requireRole(name, store);
-  const active = store.getGlobalRoleSessionSet(name)?.sessions[role.activeAgentId];
-  if (active !== undefined && active.status !== "stopped") {
-    throw usageError(`GlobalRole is active and cannot be removed: ${name}.`);
-  }
-  if (!store.removeGlobalRole(name)) throw roleNotFound(name);
+  store.transaction((tx) => {
+    const role = requireRole(name, tx);
+    assertRoleRuntimeMutationAllowed(tx, {
+      scope: "global",
+      roleName: role.name
+    }, "removal");
+    const sessions = tx.getGlobalRoleSessionSet(name);
+    if (Object.values(sessions?.sessions ?? {}).some(({ status }) => status !== "stopped")) {
+      throw usageError(`GlobalRole is active and cannot be removed: ${name}.`);
+    }
+    if (!tx.removeGlobalRole(name)) throw roleNotFound(name);
+  });
   return `Removed role ${name}\n`;
+}
+
+function unbindRole(args: string[], store: GlobalRoleStore): string {
+  const [rawName, rawAgentId, ...rest] = args;
+  const name = roleName(rawName);
+  const agentId = required(rawAgentId, "Agent id");
+  assertNoArguments(rest, "Role unbind usage: yui role unbind <role> <agent-id>");
+  store.transaction((tx) => {
+    const role = requireRole(name, tx);
+    try {
+      const result = unbindRoleAgent(
+        role,
+        tx.getGlobalRoleSessionSet(name),
+        agentId,
+        new Date()
+      );
+      tx.saveGlobalRoleWithSessionSet(result.role, result.sessions);
+    } catch (error) {
+      throw usageError(error instanceof Error ? error.message : String(error));
+    }
+  });
+  return `Unbound Agent ${agentId} from role ${name}\n`;
 }
 
 function enterRole(
   args: string[],
-  store: GlobalRoleStore,
-  options: GlobalRoleCommandOptions
+  store: GlobalRoleStore
 ): GlobalRoleEnterControl {
   const [rawName, ...rest] = args;
   const name = roleName(rawName);
   assertNoArguments(rest, "Role enter usage: yui role enter <role>");
   const role = requireRole(name, store);
-  const agent = requireAgent(role.activeAgentId, store);
-  const set = store.getGlobalRoleSessionSet(name);
-  const session = set?.sessions[role.activeAgentId] ?? null;
-  const launch = compileGlobalRoleLaunch(role, agent, session?.nativeSessionId, options);
-  return { kind: "enter", role, launch };
+  return { kind: "enter", role };
 }
 
 function roleSession(
@@ -281,40 +361,47 @@ function roleSession(
   if (nativeSessionId.trim() !== nativeSessionId || nativeSessionId.length === 0) {
     throw usageError("Native session id must not contain surrounding whitespace.");
   }
-  const role = requireRole(name, store);
-  const binding = activeRoleAgentBinding(role);
-  const agent = requireAgent(binding.agentId, store);
   const environment = options.env ?? process.env;
-  assertSessionProvenance(command, role, nativeSessionId, environment);
-  const set = store.getGlobalRoleSessionSet(name)
-    ?? createRoleSessionSet({ scope: "global", roleName: name }, role.activeAgentId, new Date());
-  const existing = set.sessions[role.activeAgentId] ?? null;
-  const input = () => ({
-    agentId: binding.agentId,
-    adapterId: binding.adapterId,
-    nativeSessionId,
-    policy: "fixed" as const,
-    status: environment.YUI_ROLE === name ? "running" as const : "ready" as const
-  });
-  if (command === "record") {
-    if (existing !== null && existing.nativeSessionId !== nativeSessionId) {
-      throw usageError("GlobalRole session replacement must be explicit.");
+  return store.transaction((tx) => {
+    const role = requireRole(name, tx);
+    assertRoleRuntimeMutationAllowed(tx, {
+      scope: "global",
+      roleName: role.name
+    }, "manual native session update");
+    const binding = activeRoleAgentBinding(role);
+    requireAgent(binding.agentId, tx);
+    assertSessionProvenance(command, role, nativeSessionId, environment);
+    const now = new Date();
+    const set = tx.getGlobalRoleSessionSet(name)
+      ?? createRoleSessionSet({ scope: "global", roleName: name }, role.activeAgentId, now);
+    const existing = set.sessions[role.activeAgentId] ?? null;
+    const input = {
+      agentId: binding.agentId,
+      adapterId: binding.adapterId,
+      nativeSessionId,
+      policy: "fixed" as const,
+      status: environment.YUI_ROLE === name ? "running" as const : "ready" as const
+    };
+    if (command === "record") {
+      if (existing !== null && existing.nativeSessionId !== nativeSessionId) {
+        throw usageError("GlobalRole session replacement must be explicit.");
+      }
+      tx.saveGlobalRoleSessionSet(recordRoleAgentSession(set, input, now));
+      return `Recorded native session for role ${name}\n`;
     }
-    store.saveGlobalRoleSessionSet(recordRoleAgentSession(set, input(), new Date()));
-    return `Recorded native session for role ${name}\n`;
-  }
-  if (existing === null) {
-    throw usageError("Native session replacement requires an existing native session.");
-  }
-  if (existing.status !== "stopped") {
-    throw usageError("Native session replacement is blocked while the native Agent process is running.");
-  }
-  if (existing.nativeSessionId === nativeSessionId) {
-    throw usageError("Native session replacement requires a different native session identity.");
-  }
-  const reason = required(parsed.one("--reason"), "--reason").trim();
-  store.saveGlobalRoleSessionSet(recordRoleAgentSession(set, input(), new Date()));
-  return `Replaced native session for role ${name}\n`;
+    if (existing === null) {
+      throw usageError("Native session replacement requires an existing native session.");
+    }
+    if (existing.status !== "stopped") {
+      throw usageError("Native session replacement is blocked while the native Agent process is running.");
+    }
+    if (existing.nativeSessionId === nativeSessionId) {
+      throw usageError("Native session replacement requires a different native session identity.");
+    }
+    required(parsed.one("--reason"), "--reason");
+    tx.saveGlobalRoleSessionSet(recordRoleAgentSession(set, input, now));
+    return `Replaced native session for role ${name}\n`;
+  });
 }
 
 function assertSessionProvenance(
@@ -386,56 +473,17 @@ function parseOptions(args: string[], specs: ReadonlyMap<string, OptionKind>): P
   };
 }
 
-function compileGlobalRoleLaunch(
-  role: GlobalRole,
-  agent: ConfiguredAgentRecord,
-  nativeSessionId: string | undefined,
-  options: GlobalRoleCommandOptions
-): Readonly<{ command: string; args: readonly string[]; env: Readonly<Record<string, string>> }> {
-  const adapter = resolveAgentAdapter(agent.adapterId);
-  const sessionContext = compileRoleSessionContext(options.yuiHome, role, { scope: "global" });
-  const input = {
-    agent: definition(agent),
-    config: activeRoleAgentBinding(role).config,
-    workspace: role.workspace,
-    ...sessionContext
-  };
-  const compiled = nativeSessionId === undefined
-    ? adapter.compileNew(input)
-    : adapter.compileResume({ ...input, nativeSessionId });
-  const baseEnvironment = options.env ?? process.env;
-  return {
-    command: agent.command,
-    args: compiled.argv,
-    env: stringEnvironment({
-      ...baseEnvironment,
-      ...resolveAgentEnvironment(definition(agent), baseEnvironment),
-      ...(options.yuiHome === undefined ? {} : { YUI_HOME: options.yuiHome }),
-      YUI_ROLE: role.name,
-      YUI_AGENT_ID: agent.id,
-      YUI_ADAPTER_ID: agent.adapterId,
-      YUI_WORKSPACE: role.workspace
-    })
-  };
-}
-
-function stringEnvironment(environment: NodeJS.ProcessEnv): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(environment).filter((entry): entry is [string, string] => entry[1] !== undefined)
-  );
-}
-
 function definition(agent: ConfiguredAgentRecord) {
   return { ...agent, baseArgs: [...agent.baseArgs], environment: [...agent.environment], source: "custom" as const };
 }
 
-function requireAgent(id: string, store: GlobalRoleStore): ConfiguredAgentRecord {
+function requireAgent(id: string, store: GlobalRoleTransactionStore): ConfiguredAgentRecord {
   const agent = store.getConfiguredAgent(id);
   if (agent === null) throw usageError(`Unsupported agent: ${id}`);
   return agent;
 }
 
-function requireRole(name: string, store: GlobalRoleStore): GlobalRole {
+function requireRole(name: string, store: GlobalRoleTransactionStore): GlobalRole {
   const role = store.getGlobalRole(name);
   if (role === null) throw roleNotFound(name);
   return role;

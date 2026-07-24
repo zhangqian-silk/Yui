@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { stripVTControlCharacters } from "node:util";
 import type {
   PreparedRoleDelivery,
   ReadyRoleDelivery,
@@ -19,6 +20,7 @@ import {
   createSessionLaunchRequest,
   type ActivePromptPushPort,
   type RuntimeBinding,
+  type RuntimeLaunchPreparationPort,
   type SessionHostPort
 } from "../runtime/index.js";
 
@@ -59,25 +61,21 @@ export type ExecutorTmuxPort = Readonly<{
     receiptId: string,
     input: string,
     readinessProbe: TmuxReadinessProbe
-  ): TmuxDeliveryOutcome | "not-ready";
+  ): TmuxDeliveryOutcome | "not-ready" | "unavailable";
   sendRoleInputOnceIfReadyAsync?(
     taskId: string,
     roleName: string,
     receiptId: string,
     input: string,
     readinessProbe: TmuxReadinessProbe
-  ): Promise<TmuxDeliveryOutcome | "not-ready">;
-  hasDeliveryReceipt(taskId: string, roleName: string, receiptId: string): boolean;
-  hasDeliveryReceiptAsync?(
-    taskId: string,
-    roleName: string,
-    receiptId: string
-  ): Promise<boolean>;
+  ): Promise<TmuxDeliveryOutcome | "not-ready" | "unavailable">;
   probeRoleStatus(taskId: string, roleName: string): "running" | "exited";
   probeRoleStatusAsync?(
     taskId: string,
     roleName: string
   ): Promise<"running" | "exited">;
+  killRole(taskId: string, roleName: string): void;
+  killRoleAsync?(taskId: string, roleName: string): Promise<void>;
   inspectRolePaneInventory?(): TmuxRolePaneState[];
   inspectRolePaneInventoryAsync?(): Promise<TmuxRolePaneState[]>;
   inspectPane?(taskId: string, roleName: string): TmuxPaneState;
@@ -86,11 +84,15 @@ export type ExecutorTmuxPort = Readonly<{
   stopTaskAsync?(taskId: string): Promise<boolean>;
 }>;
 
-export type AgentReadinessResolver = (adapterId: string) => TmuxReadinessProbe;
+export type AgentReadinessResolver = (
+  adapterId: string,
+  surface?: "role" | "operator"
+) => TmuxReadinessProbe;
 
 export type ExecutorRuntimePorts = Readonly<{
   sessionHost: SessionHostPort;
   promptPush: ActivePromptPushPort;
+  launchCoordinator?: RuntimeLaunchPreparationPort;
 }>;
 
 type PreparedRuntime = Readonly<{
@@ -134,7 +136,8 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       roleName: input.roleName,
       agentId: input.agentId,
       adapterId: input.adapterId,
-      mode: input.mode
+      mode: input.mode,
+      ...(input.runId === undefined ? {} : { runId: input.runId })
     };
     const cached = this.#prepared.get(deliveryBase.deliveryId);
     if (cached !== undefined) return cached.delivery;
@@ -151,22 +154,40 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       session = planned.session;
     } else {
       const common = {
-        launchId: deliveryBase.deliveryId,
         owner: { scope: "task", taskId: input.taskId, roleName: input.roleName },
         agentId: input.agentId,
         adapterId: input.adapterId,
-        workspace: input.workspace
+        workspace: input.workspace,
+        ...(input.runId === undefined ? {} : { runId: input.runId })
       } as const;
-      const request = input.mode === "new"
-        ? createSessionLaunchRequest({ ...common, mode: "new" })
-        : createSessionLaunchRequest({
-            ...common,
-            mode: "resume",
-            nativeSessionId: input.nativeSessionId!
-          });
-      binding = request.mode === "new"
-        ? await this.runtimePorts.sessionHost.start(request)
-        : await this.runtimePorts.sessionHost.resume(request);
+      if (this.runtimePorts.launchCoordinator !== undefined) {
+        binding = await this.runtimePorts.launchCoordinator.prepare(
+          input.mode === "new"
+            ? { ...common, mode: "new" }
+            : {
+                ...common,
+                mode: "resume",
+                nativeSessionId: input.nativeSessionId!
+              },
+          "deferred"
+        );
+      } else {
+        const request = input.mode === "new"
+          ? createSessionLaunchRequest({
+              ...common,
+              launchId: deliveryBase.deliveryId,
+              mode: "new"
+            })
+          : createSessionLaunchRequest({
+              ...common,
+              launchId: deliveryBase.deliveryId,
+              mode: "resume",
+              nativeSessionId: input.nativeSessionId!
+            });
+        binding = request.mode === "new"
+          ? await this.runtimePorts.sessionHost.start(request)
+          : await this.runtimePorts.sessionHost.resume(request);
+      }
       sessionStarted = binding.hostCreated === true;
       session = binding.nativeSessionId === undefined
         ? null
@@ -179,6 +200,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     }
     const delivery: PreparedRoleDelivery = {
       ...deliveryBase,
+      ...(binding === undefined ? {} : { launchId: binding.launchId }),
       sessionStarted
     };
     this.#prepared.set(delivery.deliveryId, {
@@ -242,13 +264,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     receiptId: string;
     text: string;
   }>): Promise<"sent" | "already-sent" | "unavailable" | "not-ready"> {
-    const status = this.tmux.probeRoleStatusAsync === undefined
-      ? this.tmux.probeRoleStatus("operator", input.roleName)
-      : await this.tmux.probeRoleStatusAsync("operator", input.roleName);
-    if (status !== "running") {
-      return "unavailable";
-    }
-    const probe = this.readiness(input.adapterId);
+    const probe = this.readiness(input.adapterId, "operator");
     return this.tmux.sendRoleInputOnceIfReadyAsync === undefined
       ? this.tmux.sendRoleInputOnceIfReady(
           "operator", input.roleName, input.receiptId, input.text, probe
@@ -256,6 +272,32 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       : this.tmux.sendRoleInputOnceIfReadyAsync(
           "operator", input.roleName, input.receiptId, input.text, probe
         );
+  }
+
+  forgetPrepared(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId?: string;
+    launchId?: string;
+  }>): void {
+    for (const [deliveryId, prepared] of this.#prepared) {
+      const delivery = prepared.delivery;
+      if (
+        delivery.taskId !== input.taskId
+        || delivery.roleName !== input.roleName
+        || (
+          input.runId !== undefined
+          && delivery.runId !== input.runId
+        )
+        || (
+          input.launchId !== undefined
+          && delivery.launchId !== input.launchId
+        )
+      ) {
+        continue;
+      }
+      this.#prepared.delete(deliveryId);
+    }
   }
 
   async inspectRole(input: Readonly<{
@@ -333,31 +375,33 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     }));
   }
 
-  async findExistingReceipt(input: Readonly<{
-    delivery: PreparedRoleDelivery;
-    receiptId: string;
-  }>): Promise<ReadyRoleDelivery | null> {
-    const prepared = this.requirePrepared(input.delivery);
-    const found = this.tmux.hasDeliveryReceiptAsync === undefined
-      ? this.tmux.hasDeliveryReceipt(
-          input.delivery.taskId,
-          input.delivery.roleName,
-          input.receiptId
-        )
-      : await this.tmux.hasDeliveryReceiptAsync(
-          input.delivery.taskId,
-          input.delivery.roleName,
-          input.receiptId
-        );
-    if (!found) return null;
-    this.#prepared.delete(input.delivery.deliveryId);
-    return { prepared: input.delivery, session: prepared.session };
+  async stopTask(taskId: string): Promise<boolean> {
+    const stopped = this.tmux.stopTaskAsync === undefined
+      ? this.tmux.stopTask(taskId)
+      : await this.tmux.stopTaskAsync(taskId);
+    for (const [deliveryId, prepared] of this.#prepared) {
+      if (prepared.delivery.taskId === taskId) {
+        this.#prepared.delete(deliveryId);
+      }
+    }
+    return stopped;
   }
 
-  async stopTask(taskId: string): Promise<boolean> {
-    return this.tmux.stopTaskAsync === undefined
-      ? this.tmux.stopTask(taskId)
-      : this.tmux.stopTaskAsync(taskId);
+  async stopRole(taskId: string, roleName: string): Promise<boolean> {
+    const status = this.tmux.probeRoleStatusAsync === undefined
+      ? this.tmux.probeRoleStatus(taskId, roleName)
+      : await this.tmux.probeRoleStatusAsync(taskId, roleName);
+    if (status !== "running") {
+      this.forgetPrepared({ taskId, roleName });
+      return false;
+    }
+    if (this.tmux.killRoleAsync === undefined) {
+      this.tmux.killRole(taskId, roleName);
+    } else {
+      await this.tmux.killRoleAsync(taskId, roleName);
+    }
+    this.forgetPrepared({ taskId, roleName });
+    return true;
   }
 
   private requirePrepared(delivery: PreparedRoleDelivery): PreparedRuntime {
@@ -369,7 +413,10 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
   }
 }
 
-export function agentComposerReadinessProbe(adapterId: string): TmuxReadinessProbe {
+export function agentComposerReadinessProbe(
+  adapterId: string,
+  surface: "role" | "operator" = "role"
+): TmuxReadinessProbe {
   switch (adapterId) {
     case "codex":
       return (pane) => {
@@ -399,7 +446,11 @@ export function agentComposerReadinessProbe(adapterId: string): TmuxReadinessPro
           && !activeTurn
           && !/Press enter to (?:continue|confirm)|esc to cancel|select.*update|update selector|Would you like to (?:run|allow|proceed)|Do you want to allow/i
             .test(content)
-          && (legacyComposer || currentComposer);
+          && (legacyComposer || currentComposer)
+          && (
+            surface !== "operator"
+            || provablyEmptyStyledComposer(pane, "›", true)
+          );
       };
     case "claude":
       return (pane) => {
@@ -411,7 +462,13 @@ export function agentComposerReadinessProbe(adapterId: string): TmuxReadinessPro
         const composer = tail.at(-1)?.startsWith("❯") === true;
         const activeTurn = /(?:working|thinking|esc to interrupt|ctrl\+c to interrupt|press ctrl-c)/i
           .test(tail.join("\n"));
-        return livePane(pane) && composer && !activeTurn;
+        return livePane(pane)
+          && composer
+          && !activeTurn
+          && (
+            surface !== "operator"
+            || provablyEmptyStyledComposer(pane, "❯", false)
+          );
       };
     default:
       throw new Error(`No tmux readiness probe is registered for Agent adapter: ${adapterId}.`);
@@ -420,6 +477,77 @@ export function agentComposerReadinessProbe(adapterId: string): TmuxReadinessPro
 
 function livePane(pane: TmuxPaneState): boolean {
   return !pane.dead && pane.pid !== undefined && pane.currentCommand.trim().length > 0;
+}
+
+function provablyEmptyStyledComposer(
+  pane: TmuxPaneState,
+  marker: "›" | "❯",
+  allowDimPlaceholder: boolean
+): boolean {
+  if (pane.styledContent === undefined) return false;
+  const lines = pane.styledContent.replace(/\r/g, "").split("\n");
+  let composerIndex = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (stripVTControlCharacters(lines[index]!).trimStart().startsWith(marker)) {
+      composerIndex = index;
+      break;
+    }
+  }
+  if (composerIndex < 0) return false;
+  let regionEnd = lines.length;
+  if (marker === "›") {
+    let footerIndex = -1;
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      if (stripVTControlCharacters(lines[index]!).trim().length > 0) {
+        footerIndex = index;
+        break;
+      }
+    }
+    if (
+      footerIndex <= composerIndex
+      || !stripVTControlCharacters(lines[footerIndex]!).includes(" · ")
+    ) {
+      return false;
+    }
+    regionEnd = footerIndex;
+  }
+  const composerRegion = lines.slice(composerIndex, regionEnd).join("\n");
+  let afterMarker = false;
+  let dim = false;
+  const tokens = composerRegion.matchAll(/\u001b\[([0-9;:]*)m|([^\u001b]+)/gu);
+  for (const token of tokens) {
+    if (token[1] !== undefined) {
+      dim = nextDimState(dim, token[1]);
+      continue;
+    }
+    for (const character of token[2] ?? "") {
+      if (!afterMarker) {
+        if (character === marker) afterMarker = true;
+        continue;
+      }
+      if (/\s/u.test(character)) continue;
+      if (!allowDimPlaceholder || !dim) return false;
+    }
+  }
+  return afterMarker;
+}
+
+function nextDimState(current: boolean, sgr: string): boolean {
+  const values = sgr.length === 0 ? [0] : sgr.split(";").map((value) => Number(value));
+  let dim = current;
+  for (let index = 0; index < values.length; index += 1) {
+    const value = values[index];
+    if (value === 0) dim = false;
+    else if (value === 2) dim = true;
+    else if (value === 22) dim = false;
+    else if (
+      (value === 38 || value === 48 || value === 58)
+      && (values[index + 1] === 2 || values[index + 1] === 5)
+    ) {
+      index += values[index + 1] === 2 ? 4 : 2;
+    }
+  }
+  return dim;
 }
 
 function preparedDeliveryId(input: Readonly<{

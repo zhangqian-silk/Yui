@@ -33,6 +33,9 @@ export {
   type ActivePromptPushPort,
   type ActivePromptPushRequest,
   type PromptPushResult,
+  type RuntimeLaunchPersistence,
+  type RuntimeLaunchPreparationPort,
+  type RuntimeLaunchPreparationRequest,
   type SessionHostPort,
   type SessionInspection,
   type SessionRuntimeState

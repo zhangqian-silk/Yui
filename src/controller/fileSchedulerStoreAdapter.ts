@@ -26,6 +26,7 @@ import { activeRoleAgentBinding, updateRoleStatus } from "../role/role.js";
 import { SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
 import { failAgentRun, markAgentRunDelivered, yieldAgentRun } from "../run/agentRun.js";
 import type {
+  DormantRuntimeOwnerCandidate,
   LeaderDispatchFailurePersistence,
   LeaderDispatchClaimResult,
   LeaderDispatchPersistence,
@@ -46,10 +47,22 @@ import {
   claimPending,
   completeProcessing,
   releaseProcessing,
-  type MailboxTarget
+  type MailboxTarget,
+  type WorkMailbox
 } from "../coordination/workMailbox.js";
 import { completeWorkExecution, enqueueWork } from "../coordination/workMailboxQueue.js";
 import type { SchedulerMailboxClaimInput, SchedulerMailboxClaimResult } from "../scheduler/ports.js";
+import {
+  RUNTIME_CLEANUP_REQUIRED_REASON,
+  RUNTIME_LAUNCH_RESERVED_REASON,
+  RUNTIME_LIFECYCLE_OWNER,
+  hasRuntimeCleanupObligation,
+  hasRuntimeLifecycleWork,
+  isRuntimeLaunchReservation,
+  runtimeLifecycleTarget,
+  type RuntimeLifecycleTarget,
+  type RuntimeRoleOwner
+} from "../runtime/lifecycleReservation.js";
 
 /** Maps the authoritative FileTaskStore records to the scheduler's narrow port. */
 export class FileSchedulerStoreAdapter implements SchedulerStorePort {
@@ -153,6 +166,28 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     });
   }
 
+  enqueueLeaderWakeup(taskId: string, reason: string, now: Date) {
+    return this.store.transaction((store) => (
+      queueLeaderWakeup(store, taskId, reason, now)
+    ));
+  }
+
+  releaseLeaderWakeupAndEnqueue(
+    taskId: string,
+    batchId: string,
+    reason: string,
+    now: Date
+  ): boolean {
+    const target = { kind: "role", taskId, roleName: "leader" } as const;
+    return this.store.transaction((store) => {
+      const mailbox = store.getWorkMailbox(target);
+      if (mailbox?.processing?.batchId !== batchId) return false;
+      store.saveWorkMailbox(releaseProcessing(mailbox, batchId));
+      enqueueWork(store, target, reason, now);
+      return true;
+    });
+  }
+
   claimWorkMailbox(input: SchedulerMailboxClaimInput): SchedulerMailboxClaimResult {
     return this.store.transaction((store) => {
       const mailbox = store.getWorkMailbox(input.target);
@@ -179,7 +214,15 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return this.store.transaction((store) => {
       const mailbox = store.getWorkMailbox(target);
       if (mailbox?.processing?.batchId !== batchId) return false;
-      store.saveWorkMailbox(completeProcessing(mailbox, batchId));
+      const completed = completeProcessing(mailbox, batchId);
+      if (
+        target.kind === "role-runtime"
+        || target.kind === "global-role-runtime"
+      ) {
+        saveRuntimeLifecycleMailbox(store, completed);
+      } else {
+        store.saveWorkMailbox(completed);
+      }
       return true;
     });
   }
@@ -190,6 +233,167 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (mailbox?.processing?.batchId !== batchId) return false;
       store.saveWorkMailbox(releaseProcessing(mailbox, batchId));
       return true;
+    });
+  }
+
+  completeRuntimeCleanup(
+    target: Extract<
+      MailboxTarget,
+      { kind: "role-runtime" | "global-role-runtime" }
+    >,
+    now: Date
+  ): boolean {
+    return this.store.transaction((store) => {
+      let mailbox = store.getWorkMailbox(target);
+      if (mailbox === null || !hasRuntimeCleanupObligation(mailbox)) return false;
+      if (mailbox.processing !== null) {
+        if (
+          !isRuntimeLaunchReservation(mailbox.processing)
+          && !mailbox.processing.batch.reasons.includes(
+            RUNTIME_CLEANUP_REQUIRED_REASON
+          )
+        ) {
+          return false;
+        }
+        mailbox = completeProcessing(mailbox, mailbox.processing.batchId);
+      }
+      if (mailbox.pending !== null) {
+        if (
+          mailbox.pending.reasons.length !== 1
+          || mailbox.pending.reasons[0] !== RUNTIME_CLEANUP_REQUIRED_REASON
+        ) {
+          return false;
+        }
+        const batchId = `runtime-cleanup-complete:${mailbox.pending.fromSequence}-${mailbox.pending.toSequence}`;
+        mailbox = completeProcessing(claimPending(mailbox, {
+          batchId,
+          owner: RUNTIME_LIFECYCLE_OWNER,
+          startedAt: now.toISOString()
+        }), batchId);
+      }
+      markRuntimeOwnerSessionStopped(store, runtimeOwnerFromTarget(target), now);
+      saveRuntimeLifecycleMailbox(store, mailbox);
+      return true;
+    });
+  }
+
+  completeStoppedRuntimeReservation(
+    target: RuntimeLifecycleTarget,
+    batchId: string,
+    now: Date
+  ): boolean {
+    return this.store.transaction((store) => {
+      const mailbox = store.getWorkMailbox(target);
+      if (!isRuntimeLaunchReservation(mailbox?.processing, batchId)) {
+        return false;
+      }
+      markRuntimeOwnerSessionStopped(store, runtimeOwnerFromTarget(target), now);
+      saveRuntimeLifecycleMailbox(
+        store,
+        completeProcessing(mailbox!, batchId)
+      );
+      return true;
+    });
+  }
+
+  listDormantRuntimeOwners(): readonly DormantRuntimeOwnerCandidate[] {
+    const taskOwners = this.store.listTasks().flatMap((task) => (
+      this.store.listRoleSessionSets(task.id).flatMap((sessions) => {
+        const active = sessions.sessions[sessions.activeAgentId];
+        return active !== undefined
+          && active.status !== "stopped"
+          && !hasRuntimeLifecycleWork(
+            this.store.getWorkMailbox(runtimeLifecycleTarget(sessions.owner))
+          )
+          && this.store.getActiveAgentRun(
+            task.id,
+            sessions.owner.roleName
+          ) === null
+          ? [{
+              owner: sessions.owner,
+              agentId: active.agentId,
+              adapterId: active.adapterId,
+              nativeSessionId: active.nativeSessionId,
+              sessionUpdatedAt: active.updatedAt
+            }]
+          : [];
+      })
+    ));
+    const globalOwners = this.store.listGlobalRoleSessionSets().flatMap(
+      (sessions) => {
+        const active = sessions.sessions[sessions.activeAgentId];
+        return active !== undefined
+          && active.status !== "stopped"
+          && !hasRuntimeLifecycleWork(
+            this.store.getWorkMailbox(runtimeLifecycleTarget(sessions.owner))
+          )
+          ? [{
+              owner: sessions.owner,
+              agentId: active.agentId,
+              adapterId: active.adapterId,
+              nativeSessionId: active.nativeSessionId,
+              sessionUpdatedAt: active.updatedAt
+            }]
+          : [];
+      }
+    );
+    return [...taskOwners, ...globalOwners];
+  }
+
+  markRuntimeOwnerStopped(
+    candidate: DormantRuntimeOwnerCandidate,
+    now: Date
+  ): boolean {
+    return this.store.transaction((store) => {
+      const { owner } = candidate;
+      if (
+        hasRuntimeLifecycleWork(
+          store.getWorkMailbox(runtimeLifecycleTarget(owner))
+        )
+      ) {
+        return false;
+      }
+      if (
+        owner.scope === "task"
+        && store.getActiveAgentRun(owner.taskId, owner.roleName) !== null
+      ) {
+        return false;
+      }
+      const sessions = owner.scope === "task"
+        ? store.getTaskRoleSessionSet(owner.taskId, owner.roleName)
+        : store.getGlobalRoleSessionSet(owner.roleName);
+      const active = sessions?.sessions[sessions.activeAgentId];
+      if (
+        active === undefined
+        || active.status === "stopped"
+        || active.agentId !== candidate.agentId
+        || active.adapterId !== candidate.adapterId
+        || active.nativeSessionId !== candidate.nativeSessionId
+        || active.updatedAt !== candidate.sessionUpdatedAt
+      ) {
+        return false;
+      }
+      return markRuntimeOwnerSessionStopped(store, owner, now);
+    });
+  }
+
+  enqueueRuntimeCleanup(
+    owner: RuntimeRoleOwner,
+    now = new Date()
+  ): RuntimeLifecycleTarget | null {
+    return this.store.transaction((store) => {
+      if (owner.scope === "task" && store.getTask(owner.taskId) === null) {
+        return null;
+      }
+      const target = runtimeLifecycleTarget(owner);
+      enqueueWork(
+        store,
+        target,
+        RUNTIME_CLEANUP_REQUIRED_REASON,
+        now,
+        owner.scope === "task" ? [{ type: "task", id: owner.taskId }] : []
+      );
+      return target;
     });
   }
   getPendingWakeup(taskId: string) { return this.store.getPendingWakeup(taskId); }
@@ -274,6 +478,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       }
       if (input.session !== null && input.session.nativeSessionId !== undefined) {
         const existing = store.getRoleSession(input.task.id, input.role.name);
+        const reservation = matchingPreparedRuntimeReservation(
+          store,
+          input,
+          existing
+        );
         if (
           existing?.agentId !== input.session.agentId
           || existing.adapterId !== input.session.adapterId
@@ -285,6 +494,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             nativeSessionId: input.session.nativeSessionId
           }, "running", input.now);
         }
+        completePreparedRuntimeReservation(store, reservation);
       }
     });
   }
@@ -302,6 +512,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       }
       if (input.session !== null && input.session.nativeSessionId !== undefined) {
         const existing = store.getRoleSession(input.task.id, input.role.name);
+        const reservation = matchingPreparedRuntimeReservation(
+          store,
+          input,
+          existing
+        );
         if (existing?.nativeSessionId !== input.session.nativeSessionId
           || existing.status !== "running") {
           saveTaskSession(store, role, {
@@ -309,6 +524,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             nativeSessionId: input.session.nativeSessionId
           }, "running", input.now);
         }
+        completePreparedRuntimeReservation(store, reservation);
       }
       bindTaskRoleRunInFlight(store, role, input.run, input.now);
     });
@@ -462,81 +678,175 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string;
     agentId: string;
     adapterId: string;
+    launchId?: string;
     nativeSessionId: string;
   }>, now = new Date()): RoleAgentSession {
+    return this.store.transaction((store) => (
+      recordTaskRuntimeNativeSession(store, input, now)
+    ));
+  }
+
+  reserveRuntimeLaunch(
+    input: Readonly<{ owner: RuntimeRoleOwner; launchId: string }>,
+    assertCurrent: () => void,
+    now = new Date()
+  ): Readonly<{
+    status: "reserved" | "existing";
+    launchId: string;
+  }> {
     return this.store.transaction((store) => {
-      const task = store.getTask(input.taskId);
-      if (task === null) throw new Error(`Task not found: ${input.taskId}.`);
-      if (task.status === "archived") {
-        throw new Error(`Cannot register a native session for archived Task: ${input.taskId}.`);
+      assertCurrent();
+      const target = runtimeLifecycleTarget(input.owner);
+      const existing = store.getWorkMailbox(target);
+      if (isRuntimeLaunchReservation(existing?.processing)) {
+        if (hasRuntimeCleanupObligation(existing)) {
+          throw new Error("Runtime cleanup is still pending.");
+        }
+        return {
+          status: "existing",
+          launchId: existing!.processing!.batchId
+        };
       }
-      if (task.status !== "active") {
-        throw new Error(`Cannot register a native session for a Task that is not active: ${input.taskId}.`);
+      if (
+        existing !== null
+        && (existing.processing !== null || existing.pending !== null)
+      ) {
+        throw new Error("Runtime lifecycle work is already pending.");
       }
-      const role = requireRole(store, input.taskId, input.roleName);
-      const binding = activeRoleAgentBinding(role);
-      if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-        throw new Error("Native session registration does not match the active Role Agent binding.");
+      enqueueWork(
+        store,
+        target,
+        RUNTIME_LAUNCH_RESERVED_REASON,
+        now,
+        input.owner.scope === "task"
+          ? [{ type: "task", id: input.owner.taskId }]
+          : []
+      );
+      const queued = store.getWorkMailbox(target);
+      if (queued === null || queued.pending === null || queued.processing !== null) {
+        throw new Error("Runtime launch reservation could not be queued.");
       }
-      const current = store.getRoleSessionSet(input.taskId, input.roleName)
-        ?? createRoleSessionSet(
-          { scope: "task", taskId: input.taskId, roleName: input.roleName },
-          role.activeAgentId,
-          now
-        );
-      const existing = current.sessions[input.agentId];
-      if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
-        throw new Error("Native session registration conflicts with the fixed Role session.");
-      }
-      if (existing?.status === "running") return existing;
-      const updated = recordRoleAgentSession(current, {
-        agentId: input.agentId,
-        adapterId: input.adapterId,
-        nativeSessionId: input.nativeSessionId,
-        policy: "fixed",
-        status: "running"
-      }, now);
-      store.saveRoleSessionSet(updated);
-      return updated.sessions[input.agentId]!;
+      store.saveWorkMailbox(claimPending(queued, {
+        batchId: input.launchId,
+        owner: RUNTIME_LIFECYCLE_OWNER,
+        startedAt: now.toISOString()
+      }));
+      return { status: "reserved", launchId: input.launchId };
     });
   }
 
-  /** Persists the stable native identity independently from Run causation. */
-  observeRuntimeNativeSessionFact(input: Readonly<{
-    taskId: string;
-    roleName: string;
+  confirmRuntimeLaunchReservation(
+    input: Readonly<{ owner: RuntimeRoleOwner; launchId: string }>,
+    assertCurrent: () => void
+  ): void {
+    this.store.transaction((store) => {
+      assertCurrent();
+      requireRuntimeLaunchReservation(store, input.owner, input.launchId);
+    });
+  }
+
+  recordReservedRuntimeNativeSession(input: Readonly<{
+    owner: RuntimeRoleOwner;
+    launchId: string;
     agentId: string;
     adapterId: string;
     nativeSessionId: string;
+  }>, assertCurrent: () => void, now = new Date()): RoleAgentSession {
+    return this.store.transaction((store) => {
+      assertCurrent();
+      const mailbox = requireRuntimeLaunchReservation(
+        store,
+        input.owner,
+        input.launchId
+      );
+      if (hasRuntimeCleanupObligation(mailbox)) {
+        throw new Error("Runtime cleanup is still pending.");
+      }
+      const session = input.owner.scope === "task"
+        ? recordTaskRuntimeNativeSession(store, {
+            taskId: input.owner.taskId,
+            roleName: input.owner.roleName,
+            agentId: input.agentId,
+            adapterId: input.adapterId,
+            nativeSessionId: input.nativeSessionId
+          }, now)
+        : recordGlobalRuntimeNativeSession(store, {
+            roleName: input.owner.roleName,
+            agentId: input.agentId,
+            adapterId: input.adapterId,
+            nativeSessionId: input.nativeSessionId
+          }, now);
+      saveRuntimeLifecycleMailbox(
+        store,
+        completeProcessing(mailbox, input.launchId)
+      );
+      return session;
+    });
+  }
+
+  completeRuntimeLaunchReservation(
+    owner: RuntimeRoleOwner,
+    launchId: string
+  ): boolean {
+    return this.store.transaction((store) => {
+      const target = runtimeLifecycleTarget(owner);
+      const mailbox = store.getWorkMailbox(target);
+      if (!isRuntimeLaunchReservation(mailbox?.processing, launchId)) return false;
+      saveRuntimeLifecycleMailbox(
+        store,
+        completeProcessing(mailbox!, launchId)
+      );
+      return true;
+    });
+  }
+
+  /**
+   * Atomically settles a launch whose host is confirmed absent.
+   *
+   * The exact reservation is authoritative. If its matching Hook won the
+   * transaction race and already cleared that reservation, the session
+   * fallback is permitted only while the same Agent/native identity remains
+   * current and no later lifecycle work or Task Run exists.
+   */
+  settleStoppedRuntimeLaunch(input: Readonly<{
+    owner: RuntimeRoleOwner;
+    launchId: string;
+    agentId: string;
+    adapterId: string;
+    nativeSessionId?: string;
   }>, now = new Date()): boolean {
     return this.store.transaction((store) => {
-      const task = store.getTask(input.taskId);
-      const role = store.getRole(input.taskId, input.roleName);
-      if (task === null || task.status === "archived" || role === null) return false;
-      const binding = activeRoleAgentBinding(role);
-      if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
+      const target = runtimeLifecycleTarget(input.owner);
+      const mailbox = store.getWorkMailbox(target);
+      if (isRuntimeLaunchReservation(mailbox?.processing, input.launchId)) {
+        const sessions = runtimeOwnerSessionSet(store, input.owner);
+        const active = sessions?.sessions[sessions.activeAgentId];
+        if (runtimeSessionMatchesSettledLaunch(active, input)) {
+          markRuntimeOwnerSessionStopped(store, input.owner, now);
+        }
+        saveRuntimeLifecycleMailbox(
+          store,
+          completeProcessing(mailbox!, input.launchId)
+        );
+        return true;
+      }
+      if (hasRuntimeLifecycleWork(mailbox)) return false;
+      if (
+        input.owner.scope === "task"
+        && store.getActiveAgentRun(
+          input.owner.taskId,
+          input.owner.roleName
+        ) !== null
+      ) {
         return false;
       }
-      const current = store.getTaskRoleSessionSet(input.taskId, input.roleName)
-        ?? createRoleSessionSet(
-          { scope: "task", taskId: input.taskId, roleName: input.roleName },
-          role.activeAgentId,
-          now
-        );
-      const existing = current.sessions[input.agentId];
-      if (
-        existing !== undefined
-        && existing.nativeSessionId !== input.nativeSessionId
-      ) return false;
-      if (existing !== undefined) return true;
-      const updated = recordRoleAgentSession(current, {
-        agentId: input.agentId,
-        adapterId: input.adapterId,
-        nativeSessionId: input.nativeSessionId,
-        policy: "fixed",
-        status: current.inFlight === null ? "ready" : "running"
-      }, now);
-      store.saveTaskRoleSessionSet(updated);
+      const sessions = runtimeOwnerSessionSet(store, input.owner);
+      if (sessions === null) return true;
+      const active = sessions.sessions[sessions.activeAgentId];
+      if (!runtimeSessionMatchesSettledLaunch(active, input)) return false;
+      if (active.status !== "stopped") {
+        markRuntimeOwnerSessionStopped(store, input.owner, now);
+      }
       return true;
     });
   }
@@ -550,6 +860,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string;
     agentId: string;
     adapterId: string;
+    launchId?: string;
     nativeSessionId: string;
     turnId: string;
     runId?: string;
@@ -563,6 +874,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     }
     const sessions = this.store.getTaskRoleSessionSet(input.taskId, input.roleName);
     const existing = sessions?.sessions[input.agentId];
+    if (
+      existing === undefined
+      && !runtimeHookMatchesReservation(this.store, {
+        scope: "task",
+        taskId: input.taskId,
+        roleName: input.roleName
+      }, input.launchId)
+    ) return "obsolete";
     if (
       existing !== undefined
       && existing.nativeSessionId !== input.nativeSessionId
@@ -589,6 +908,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string;
     agentId: string;
     adapterId: string;
+    launchId?: string;
     nativeSessionId: string;
     turnId: string;
     runId?: string;
@@ -616,18 +936,61 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           now
         );
       const existing = sessions.sessions[input.agentId];
+      const owner = {
+        scope: "task" as const,
+        taskId: input.taskId,
+        roleName: input.roleName
+      };
+      if (
+        existing === undefined
+        && !runtimeHookMatchesReservation(store, owner, input.launchId)
+      ) {
+        throw new Error("Runtime turn completion does not match the launch reservation.");
+      }
       if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
         throw new Error("Runtime turn completion conflicts with the fixed Role session.");
       }
       if (existing !== undefined && hasRecentTurnId(existing.recentCompletedTurnIds, input.turnId)) {
         return { session: existing, duplicate: true };
       }
+      const pending = sessions.pendingTurnCompletion;
+      if (
+        existing !== undefined
+        && pending !== null
+        && pending.agentId === input.agentId
+        && pending.nativeSessionId === input.nativeSessionId
+        && pending.turnId === input.turnId
+        && pending.runId === input.runId
+      ) {
+        return {
+          session: existing,
+          duplicate: true,
+          pendingRunId: pending.runId
+        };
+      }
+      // Classification is only an optimization. Revalidate the Run inside the
+      // authoritative transaction before a Hook may claim a native identity.
+      if (
+        sessions.inFlight !== null
+        && (
+          input.runId === undefined
+          || sessions.inFlight.runId !== input.runId
+        )
+      ) {
+        if (existing === undefined) {
+          throw new Error("Runtime turn completion no longer matches the in-flight Run.");
+        }
+        return { session: existing, duplicate: false };
+      }
+      const idleStatus = existing?.status === "stopped" || existing?.status === "broken"
+        ? existing.status
+        : "ready";
       sessions = recordRoleAgentSession(sessions, {
         agentId: input.agentId,
         adapterId: input.adapterId,
         nativeSessionId: input.nativeSessionId,
         policy: "fixed",
-        status: sessions.inFlight === null ? "ready" : "running"
+        status: sessions.inFlight === null ? idleStatus : "running"
       }, now);
       if (sessions.inFlight === null) {
         sessions = rememberRoleAgentCompletedTurn(
@@ -638,16 +1001,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           now
         );
         store.saveTaskRoleSessionSet(sessions);
-        return { session: sessions.sessions[input.agentId]!, duplicate: false };
-      }
-      // Classification is only an optimization. This transaction is the
-      // authoritative causal fence against a CLI terminalizing Run A and the
-      // Controller dispatching Run B between classify and observe.
-      if (
-        input.runId === undefined
-        || sessions.inFlight.runId !== input.runId
-      ) {
-        store.saveTaskRoleSessionSet(sessions);
+        completeRuntimeHookReservation(store, owner, input.launchId);
         return { session: sessions.sessions[input.agentId]!, duplicate: false };
       }
 
@@ -687,9 +1041,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         }, now);
         sessions = updateRoleAgentSessionStatus(sessions, input.agentId, "ready", now);
         store.saveTaskRoleSessionSet(sessions);
+        completeRuntimeHookReservation(store, owner, input.launchId);
         return { session: sessions.sessions[input.agentId]!, duplicate: false };
       }
       store.saveTaskRoleSessionSet(sessions);
+      completeRuntimeHookReservation(store, owner, input.launchId);
       return {
         session: sessions.sessions[input.agentId]!,
         duplicate: false,
@@ -926,6 +1282,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string;
     agentId: string;
     adapterId: string;
+    launchId?: string;
     nativeSessionId: string;
     turnId: string;
     expectedRunId?: string;
@@ -952,6 +1309,17 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           now
         );
       const existing = current.sessions[input.agentId];
+      const owner = {
+        scope: "task" as const,
+        taskId: input.taskId,
+        roleName: input.roleName
+      };
+      if (
+        existing === undefined
+        && !runtimeHookMatchesReservation(store, owner, input.launchId)
+      ) {
+        throw new Error("Runtime turn completion does not match the launch reservation.");
+      }
       if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
         throw new Error("Runtime turn completion conflicts with the fixed Role session.");
       }
@@ -971,6 +1339,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         return { session: sessions.sessions[input.agentId]! };
       }
       if (sessions !== current) store.saveRoleSessionSet(sessions);
+      completeRuntimeHookReservation(store, owner, input.launchId);
       const session = sessions.sessions[input.agentId]!;
 
       const active = store.getActiveAgentRun(task.id, role.name);
@@ -1123,40 +1492,16 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     adapterId: string;
     nativeSessionId: string;
   }>, now = new Date()): RoleAgentSession {
-    return this.store.transaction((store) => {
-      const role = store.getGlobalRole(input.roleName);
-      if (role === null) throw new Error(`Global Role not found: ${input.roleName}.`);
-      const binding = activeRoleAgentBinding(role);
-      if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-        throw new Error("Native session registration does not match the active global Role Agent binding.");
-      }
-      const current: GlobalRoleSessionSet = store.getGlobalRoleSessionSet(input.roleName)
-        ?? createRoleSessionSet(
-          { scope: "global", roleName: input.roleName },
-          role.activeAgentId,
-          now
-        );
-      const existing = current.sessions[input.agentId];
-      if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
-        throw new Error("Native session registration conflicts with the fixed global Role session.");
-      }
-      if (existing?.status === "running") return existing;
-      const updated = recordRoleAgentSession(current, {
-        agentId: input.agentId,
-        adapterId: input.adapterId,
-        nativeSessionId: input.nativeSessionId,
-        policy: "fixed",
-        status: "running"
-      }, now);
-      store.saveGlobalRoleSessionSet(updated);
-      return updated.sessions[input.agentId]!;
-    });
+    return this.store.transaction((store) => (
+      recordGlobalRuntimeNativeSession(store, input, now)
+    ));
   }
 
   observeGlobalRuntimeTurnCompleted(input: Readonly<{
     roleName: string;
     agentId: string;
     adapterId: string;
+    launchId?: string;
     nativeSessionId: string;
     turnId: string;
   }>, now = new Date()): RoleAgentSession {
@@ -1174,15 +1519,30 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           now
         );
       const existing = current.sessions[input.agentId];
+      const owner = {
+        scope: "global" as const,
+        roleName: input.roleName
+      };
+      if (
+        existing === undefined
+        && !runtimeHookMatchesReservation(store, owner, input.launchId)
+      ) {
+        throw new Error(
+          "Runtime turn completion does not match the global launch reservation."
+        );
+      }
       if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
         throw new Error("Runtime turn completion conflicts with the fixed global Role session.");
       }
+      const completedStatus = existing?.status === "stopped" || existing?.status === "broken"
+        ? existing.status
+        : "ready";
       current = recordRoleAgentSession(current, {
         agentId: input.agentId,
         adapterId: input.adapterId,
         nativeSessionId: input.nativeSessionId,
         policy: "fixed",
-        status: "ready"
+        status: completedStatus
       }, now);
       current = rememberRoleAgentCompletedTurn(
         current,
@@ -1191,8 +1551,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         input.turnId,
         now
       );
-      current = updateRoleAgentSessionStatus(current, input.agentId, "ready", now);
       store.saveGlobalRoleSessionSet(current);
+      completeRuntimeHookReservation(store, owner, input.launchId);
       return current.sessions[input.agentId]!;
     });
   }
@@ -1201,6 +1561,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string;
     agentId: string;
     adapterId: string;
+    launchId?: string;
     nativeSessionId: string;
   }>): "apply" | "obsolete" {
     const role = this.store.getGlobalRole(input.roleName);
@@ -1211,11 +1572,279 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     }
     const existing = this.store.getGlobalRoleSessionSet(input.roleName)
       ?.sessions[input.agentId];
+    if (
+      existing === undefined
+      && !runtimeHookMatchesReservation(this.store, {
+        scope: "global",
+        roleName: input.roleName
+      }, input.launchId)
+    ) return "obsolete";
     return existing !== undefined
       && existing.nativeSessionId !== input.nativeSessionId
       ? "obsolete"
       : "apply";
   }
+}
+
+function requireRuntimeLaunchReservation(
+  store: TaskStore,
+  owner: RuntimeRoleOwner,
+  launchId: string
+) {
+  const mailbox = store.getWorkMailbox(runtimeLifecycleTarget(owner));
+  if (!isRuntimeLaunchReservation(mailbox?.processing, launchId)) {
+    throw new Error("Runtime launch reservation no longer matches the launch.");
+  }
+  return mailbox!;
+}
+
+function runtimeHookMatchesReservation(
+  store: TaskStore,
+  owner: RuntimeRoleOwner,
+  launchId: string | undefined
+): boolean {
+  const mailbox = store.getWorkMailbox(runtimeLifecycleTarget(owner));
+  if (hasRuntimeCleanupObligation(mailbox)) return false;
+  const processing = mailbox?.processing;
+  return launchId !== undefined
+    && isRuntimeLaunchReservation(processing, launchId);
+}
+
+function completeRuntimeHookReservation(
+  store: TaskStore,
+  owner: RuntimeRoleOwner,
+  launchId: string | undefined
+): void {
+  if (launchId === undefined) return;
+  const mailbox = store.getWorkMailbox(runtimeLifecycleTarget(owner));
+  if (!isRuntimeLaunchReservation(mailbox?.processing, launchId)) return;
+  saveRuntimeLifecycleMailbox(
+    store,
+    completeProcessing(mailbox!, launchId)
+  );
+}
+
+function saveRuntimeLifecycleMailbox(
+  store: TaskStore,
+  mailbox: WorkMailbox
+): void {
+  if (mailbox.processing === null && mailbox.pending === null) {
+    store.removeWorkMailbox(mailbox.target);
+    return;
+  }
+  store.saveWorkMailbox(mailbox);
+}
+
+function runtimeOwnerFromTarget(
+  target: RuntimeLifecycleTarget
+): RuntimeRoleOwner {
+  return target.kind === "role-runtime"
+    ? {
+        scope: "task",
+        taskId: target.taskId,
+        roleName: target.roleName
+      }
+    : {
+        scope: "global",
+        roleName: target.roleName
+      };
+}
+
+function markRuntimeOwnerSessionStopped(
+  store: TaskStore,
+  owner: RuntimeRoleOwner,
+  now: Date
+): boolean {
+  if (owner.scope === "task") {
+    const sessions = store.getTaskRoleSessionSet(
+      owner.taskId,
+      owner.roleName
+    );
+    if (sessions === null) return false;
+    const active = sessions.sessions[sessions.activeAgentId];
+    if (active === undefined || active.status === "stopped") return false;
+    store.saveTaskRoleSessionSet(updateRoleAgentSessionStatus(
+      sessions,
+      sessions.activeAgentId,
+      "stopped",
+      now
+    ));
+    return true;
+  }
+  const sessions = store.getGlobalRoleSessionSet(owner.roleName);
+  if (sessions === null) return false;
+  const active = sessions.sessions[sessions.activeAgentId];
+  if (active === undefined || active.status === "stopped") return false;
+  store.saveGlobalRoleSessionSet(updateRoleAgentSessionStatus(
+    sessions,
+    sessions.activeAgentId,
+    "stopped",
+    now
+  ));
+  return true;
+}
+
+function runtimeOwnerSessionSet(
+  store: TaskStore,
+  owner: RuntimeRoleOwner
+): TaskRoleSessionSet | GlobalRoleSessionSet | null {
+  return owner.scope === "task"
+    ? store.getTaskRoleSessionSet(owner.taskId, owner.roleName)
+    : store.getGlobalRoleSessionSet(owner.roleName);
+}
+
+function runtimeSessionMatchesSettledLaunch(
+  session: RoleAgentSession | undefined,
+  input: Readonly<{
+    agentId: string;
+    adapterId: string;
+    nativeSessionId?: string;
+  }>
+): session is RoleAgentSession {
+  return session !== undefined
+    && session.agentId === input.agentId
+    && session.adapterId === input.adapterId
+    && (
+      input.nativeSessionId === undefined
+      || session.nativeSessionId === input.nativeSessionId
+    );
+}
+
+function matchingPreparedRuntimeReservation(
+  store: TaskStore,
+  input: Readonly<{
+    task: { id: string };
+    role: { name: string };
+    session: SchedulerRoleSession | null;
+    launchId?: string;
+  }>,
+  existing: SchedulerRoleSession | null
+): WorkMailbox | null {
+  if (
+    input.launchId === undefined
+    || input.session?.nativeSessionId === undefined
+  ) {
+    return null;
+  }
+  const owner = {
+    scope: "task" as const,
+    taskId: input.task.id,
+    roleName: input.role.name
+  };
+  const mailbox = store.getWorkMailbox(runtimeLifecycleTarget(owner));
+  if (
+    isRuntimeLaunchReservation(mailbox?.processing, input.launchId)
+    && !hasRuntimeCleanupObligation(mailbox)
+  ) {
+    return mailbox;
+  }
+  if (
+    existing?.agentId === input.session.agentId
+    && existing.adapterId === input.session.adapterId
+    && existing.nativeSessionId === input.session.nativeSessionId
+  ) {
+    return null;
+  }
+  throw new Error("Prepared Role session does not match its launch generation.");
+}
+
+function completePreparedRuntimeReservation(
+  store: TaskStore,
+  mailbox: WorkMailbox | null
+): void {
+  if (mailbox === null || mailbox.processing === null) return;
+  saveRuntimeLifecycleMailbox(
+    store,
+    completeProcessing(mailbox, mailbox.processing.batchId)
+  );
+}
+
+function recordTaskRuntimeNativeSession(
+  store: TaskStore,
+  input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    adapterId: string;
+    nativeSessionId: string;
+  }>,
+  now: Date
+): RoleAgentSession {
+  const task = store.getTask(input.taskId);
+  if (task === null) throw new Error(`Task not found: ${input.taskId}.`);
+  if (task.status === "archived") {
+    throw new Error(`Cannot register a native session for archived Task: ${input.taskId}.`);
+  }
+  if (task.status !== "active") {
+    throw new Error(
+      `Cannot register a native session for a Task that is not active: ${input.taskId}.`
+    );
+  }
+  const role = requireRole(store, input.taskId, input.roleName);
+  const binding = activeRoleAgentBinding(role);
+  if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
+    throw new Error("Native session registration does not match the active Role Agent binding.");
+  }
+  const current = store.getRoleSessionSet(input.taskId, input.roleName)
+    ?? createRoleSessionSet(
+      { scope: "task", taskId: input.taskId, roleName: input.roleName },
+      role.activeAgentId,
+      now
+    );
+  const existing = current.sessions[input.agentId];
+  if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
+    throw new Error("Native session registration conflicts with the fixed Role session.");
+  }
+  if (existing?.status === "running") return existing;
+  const updated = recordRoleAgentSession(current, {
+    agentId: input.agentId,
+    adapterId: input.adapterId,
+    nativeSessionId: input.nativeSessionId,
+    policy: "fixed",
+    status: "running"
+  }, now);
+  store.saveRoleSessionSet(updated);
+  return updated.sessions[input.agentId]!;
+}
+
+function recordGlobalRuntimeNativeSession(
+  store: TaskStore,
+  input: Readonly<{
+    roleName: string;
+    agentId: string;
+    adapterId: string;
+    nativeSessionId: string;
+  }>,
+  now: Date
+): RoleAgentSession {
+  const role = store.getGlobalRole(input.roleName);
+  if (role === null) throw new Error(`Global Role not found: ${input.roleName}.`);
+  const binding = activeRoleAgentBinding(role);
+  if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
+    throw new Error(
+      "Native session registration does not match the active global Role Agent binding."
+    );
+  }
+  const current: GlobalRoleSessionSet = store.getGlobalRoleSessionSet(input.roleName)
+    ?? createRoleSessionSet(
+      { scope: "global", roleName: input.roleName },
+      role.activeAgentId,
+      now
+    );
+  const existing = current.sessions[input.agentId];
+  if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
+    throw new Error("Native session registration conflicts with the fixed global Role session.");
+  }
+  if (existing?.status === "running") return existing;
+  const updated = recordRoleAgentSession(current, {
+    agentId: input.agentId,
+    adapterId: input.adapterId,
+    nativeSessionId: input.nativeSessionId,
+    policy: "fixed",
+    status: "running"
+  }, now);
+  store.saveGlobalRoleSessionSet(updated);
+  return updated.sessions[input.agentId]!;
 }
 
 function mapRole(role: ReturnType<TaskStore["getRole"]> extends infer _T ? NonNullable<ReturnType<TaskStore["getRole"]>> : never): SchedulerRole {

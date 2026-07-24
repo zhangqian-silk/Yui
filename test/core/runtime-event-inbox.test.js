@@ -28,7 +28,8 @@ function fixture(t) {
     YUI_TASK_ID: "task-1",
     YUI_ROLE: "leader",
     YUI_AGENT_ID: "codex-personal",
-    YUI_ADAPTER_ID: "codex"
+    YUI_ADAPTER_ID: "codex",
+    YUI_LAUNCH_ID: "launch-current"
   };
   const payload = (message = "done") => JSON.stringify({
     type: "agent-turn-complete",
@@ -60,6 +61,7 @@ test("Codex notify writes an immutable event without waiting for FileTaskStore l
   assert.equal(events.length, 1);
   assert.equal(events[0].scope, "task");
   assert.equal(events[0].taskId, "task-1");
+  assert.equal(events[0].launchId, "launch-current");
   assert.equal(events[0].summary, "done");
   assert.deepEqual(calls.map(([, method, params]) => [method, params]), [[
     "scheduler.signal",
@@ -67,6 +69,32 @@ test("Codex notify writes an immutable event without waiting for FileTaskStore l
   ]]);
   const eventPath = join(home, "runtime", "inbox", `${events[0].id}.json`);
   assert.equal(statSync(eventPath).mode & 0o777, 0o600);
+});
+
+test("a global Role Hook signals only its lifecycle lane", async (t) => {
+  const { home, environment, payload } = fixture(t);
+  const calls = [];
+
+  await runSessionNotifyCommand(
+    payload(),
+    {
+      ...environment,
+      YUI_SESSION_SCOPE: "global",
+      YUI_ROLE: "reviewer"
+    },
+    async (...args) => {
+      calls.push(args);
+      return {};
+    }
+  );
+
+  assert.deepEqual(calls.map(([, method, params]) => [method, params]), [[
+    "scheduler.signal",
+    { key: "global-role:reviewer" }
+  ]]);
+  const [event] = new FileRuntimeEventInbox(home).list();
+  assert.equal(event.scope, "global");
+  assert.equal(event.roleName, "reviewer");
 });
 
 test("duplicate Codex notifications create one deterministic event and preserve first content", async (t) => {
@@ -183,6 +211,36 @@ test("Controller retains a runtime event when its state transaction fails", (t) 
   assert.equal(inbox.list()[0].id, event.id);
 });
 
+test("Controller reports a top-level inbox read failure for fast retry", () => {
+  const failure = new Error("runtime inbox temporarily unavailable");
+  const processor = new FileRuntimeEventProcessor({
+    list() {
+      throw failure;
+    },
+    acknowledge() {
+      throw new Error("unexpected acknowledge");
+    }
+  }, {
+    getTask() {
+      throw new Error("unexpected Task read");
+    },
+    observeRuntimeTurnCompleted() {
+      throw new Error("unexpected Task event");
+    },
+    observeGlobalRuntimeTurnCompleted() {
+      throw new Error("unexpected global event");
+    }
+  });
+
+  const result = processor.drain(new Date("2026-07-24T01:00:02.000Z"));
+
+  assert.deepEqual(result.acknowledgedEventIds, []);
+  assert.deepEqual(result.deferred, []);
+  assert.equal(result.failed.length, 1);
+  assert.equal(result.failed[0].eventId, undefined);
+  assert.equal(result.failed[0].error, failure);
+});
+
 test("invalid inbox files are quarantined without blocking valid Hook events", (t) => {
   const { home } = fixture(t);
   const inbox = new FileRuntimeEventInbox(home);
@@ -207,6 +265,33 @@ test("invalid inbox files are quarantined without blocking valid Hook events", (
     readdirSync(join(home, "runtime", "inbox-invalid"))
       .some((name) => name.startsWith("bad.json.")),
     true
+  );
+});
+
+test("a quarantine failure does not block readable Hook events", (t) => {
+  const { home } = fixture(t);
+  const inbox = new FileRuntimeEventInbox(home);
+  const directory = join(home, "runtime", "inbox");
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  writeFileSync(join(directory, "bad.json"), "{not-json}\n", { mode: 0o600 });
+  writeFileSync(join(home, "runtime", "inbox-invalid"), "blocked\n", { mode: 0o600 });
+
+  assert.deepEqual(inbox.list(), []);
+
+  inbox.enqueueTurnCompleted({
+    scope: "task",
+    taskId: "task-1",
+    roleName: "leader",
+    agentId: "codex-personal",
+    adapterId: "codex",
+    nativeSessionId: "thread-native-1",
+    turnId: "turn-valid-after-quarantine-failure",
+    summary: "done"
+  });
+
+  assert.deepEqual(
+    inbox.list().map((event) => event.turnId),
+    ["turn-valid-after-quarantine-failure"]
   );
 });
 

@@ -1,6 +1,10 @@
 export type MailboxTarget =
   | Readonly<{ kind: "task"; taskId: string }>
   | Readonly<{ kind: "role"; taskId: string; roleName: string }>
+  /** Independent lifecycle-obligation lane for one Task Role runtime. */
+  | Readonly<{ kind: "role-runtime"; taskId: string; roleName: string }>
+  /** Independent lifecycle-obligation lane for one global Role runtime. */
+  | Readonly<{ kind: "global-role-runtime"; roleName: string }>
   | Readonly<{ kind: "operator" }>;
 
 export type MailboxEntityType =
@@ -30,7 +34,6 @@ export type PendingBatch = Readonly<{
   requestCount: number;
   firstQueuedAt: string;
   lastQueuedAt: string;
-  availableAt?: string;
 }>;
 
 export type ProcessingBatch = Readonly<{
@@ -113,6 +116,17 @@ function copyTarget(target: MailboxTarget): MailboxTarget {
         taskId: requireText(target.taskId, "taskId"),
         roleName: requireText(target.roleName, "roleName")
       };
+    case "role-runtime":
+      return {
+        kind: "role-runtime",
+        taskId: requireText(target.taskId, "taskId"),
+        roleName: requireText(target.roleName, "roleName")
+      };
+    case "global-role-runtime":
+      return {
+        kind: "global-role-runtime",
+        roleName: requireText(target.roleName, "roleName")
+      };
     case "operator":
       return { kind: "operator" };
   }
@@ -124,6 +138,10 @@ export function mailboxTargetKey(target: MailboxTarget): string {
     case "operator": return "operator";
     case "task": return `task/${encodeURIComponent(copied.taskId)}`;
     case "role": return `role/${encodeURIComponent(copied.taskId)}/${encodeURIComponent(copied.roleName)}`;
+    case "role-runtime":
+      return `role-runtime/${encodeURIComponent(copied.taskId)}/${encodeURIComponent(copied.roleName)}`;
+    case "global-role-runtime":
+      return `global-role-runtime/${encodeURIComponent(copied.roleName)}`;
   }
 }
 
@@ -165,12 +183,6 @@ function mergeBatches(earlier: PendingBatch, later: PendingBatch): PendingBatch 
     firstQueuedAt: earlier.firstQueuedAt,
     lastQueuedAt: later.lastQueuedAt
   };
-  if (later.availableAt !== undefined) {
-    return { ...merged, availableAt: later.availableAt };
-  }
-  if (earlier.availableAt !== undefined) {
-    return { ...merged, availableAt: earlier.availableAt };
-  }
   return merged;
 }
 
@@ -235,6 +247,19 @@ function parseTarget(value: unknown): MailboxTarget {
         taskId: requireString(target.taskId, "WorkMailbox target taskId"),
         roleName: requireString(target.roleName, "WorkMailbox target roleName")
       };
+    case "role-runtime":
+      exact(target, ["kind", "taskId", "roleName"], "WorkMailbox role runtime target");
+      return {
+        kind: "role-runtime",
+        taskId: requireString(target.taskId, "WorkMailbox target taskId"),
+        roleName: requireString(target.roleName, "WorkMailbox target roleName")
+      };
+    case "global-role-runtime":
+      exact(target, ["kind", "roleName"], "WorkMailbox global role runtime target");
+      return {
+        kind: "global-role-runtime",
+        roleName: requireString(target.roleName, "WorkMailbox target roleName")
+      };
     default:
       throw new Error("WorkMailbox target kind is invalid");
   }
@@ -251,7 +276,7 @@ function parseRef(value: unknown, label: string): MailboxEntityRef {
 function parseBatch(value: unknown, label: string): PendingBatch {
   const batch = record(value, label);
   const required = ["fromSequence", "toSequence", "reasons", "refs", "requestCount", "firstQueuedAt", "lastQueuedAt"];
-  exact(batch, batch.availableAt === undefined ? required : [...required, "availableAt"], label);
+  exact(batch, required, label);
   const fromSequence = requireInteger(batch.fromSequence, 1, `${label} fromSequence`);
   const toSequence = requireInteger(batch.toSequence, fromSequence, `${label} toSequence`);
   const requestCount = requireInteger(batch.requestCount, 1, `${label} requestCount`);
@@ -273,9 +298,7 @@ function parseBatch(value: unknown, label: string): PendingBatch {
     firstQueuedAt: requireTimestamp(batch.firstQueuedAt, `${label} firstQueuedAt`),
     lastQueuedAt: requireTimestamp(batch.lastQueuedAt, `${label} lastQueuedAt`)
   };
-  return batch.availableAt === undefined
-    ? result
-    : { ...result, availableAt: requireTimestamp(batch.availableAt, `${label} availableAt`) };
+  return result;
 }
 
 function parseProcessing(value: unknown): ProcessingBatch {
@@ -366,18 +389,11 @@ export function completeProcessing(
 
 export function releaseProcessing(
   mailbox: WorkMailbox,
-  batchId: string,
-  availableAt?: string
+  batchId: string
 ): WorkMailbox {
   const processing = requireProcessing(mailbox, batchId);
-  let released = mailbox.pending === null
+  const released = mailbox.pending === null
     ? processing.batch
     : mergeBatches(processing.batch, mailbox.pending);
-  if (availableAt !== undefined) {
-    released = {
-      ...released,
-      availableAt: requireText(availableAt, "release availableAt")
-    };
-  }
   return { ...mailbox, processing: null, pending: released };
 }

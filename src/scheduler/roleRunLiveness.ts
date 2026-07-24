@@ -18,12 +18,13 @@ export async function reconcileExitedRoleRuns(
   store: SchedulerStorePort,
   delivery: Pick<
     TmuxDeliveryPort,
-    "inspectRole" | "inspectRoles" | "inspectRoleReadiness"
+    "inspectRole" | "inspectRoles" | "inspectRoleReadiness" | "forgetPrepared"
   >,
   now: Date,
   selection?: SchedulerReconcileSelection,
   excludedRunIds: ReadonlySet<string> = new Set(),
-  minimumReadyRecoveryAgeMs = DEFAULT_READY_RECOVERY_AGE_MS
+  minimumReadyRecoveryAgeMs = DEFAULT_READY_RECOVERY_AGE_MS,
+  readyRecoveryRunIds: ReadonlySet<string> = new Set()
 ): Promise<string[]> {
   const failed: string[] = [];
   const candidates = selectedSchedulerTasks(store, selection).flatMap((task) => (
@@ -71,10 +72,15 @@ export async function reconcileExitedRoleRuns(
         : batchStatuses.get(`${task.id}\0${role.name}`)!;
       if (status === "present") {
         const isFullReconciliation = selection === undefined || selection.full;
+        const readyRecoveryDue = readyRecoveryRunIds.has(run.id)
+          || (
+            isFullReconciliation
+            && run.deliveredAt !== undefined
+            && now.getTime() - Date.parse(run.deliveredAt) >= minimumReadyRecoveryAgeMs
+          );
         if (
-          isFullReconciliation
+          readyRecoveryDue
           && run.deliveredAt !== undefined
-          && now.getTime() - Date.parse(run.deliveredAt) >= minimumReadyRecoveryAgeMs
           && delivery.inspectRoleReadiness !== undefined
           && store.recoverReadyRoleRun !== undefined
           && await delivery.inspectRoleReadiness(inspection) === "ready"
@@ -84,6 +90,11 @@ export async function reconcileExitedRoleRuns(
             roleName: role.name,
             runId: run.id,
             now
+          });
+          delivery.forgetPrepared?.({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id
           });
         }
         continue;
@@ -98,6 +109,11 @@ export async function reconcileExitedRoleRuns(
         now
       });
       if (persisted === "state-changed") continue;
+      delivery.forgetPrepared?.({
+        taskId: task.id,
+        roleName: role.name,
+        runId: run.id
+      });
       failed.push(run.id);
       // Compatibility for narrow in-memory/custom ports that predate the
       // adapter's atomic failure+wake transition. Production returns
