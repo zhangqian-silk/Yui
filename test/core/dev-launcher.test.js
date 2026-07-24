@@ -683,6 +683,46 @@ test("link discovers a previous launcher state from another NVM version before t
   assert.equal(JSON.parse(readFileSync(registryPath, "utf8")).globalLauncherPath, join(currentBinDir, "yui"));
 });
 
+test("link treats aliased paths to one previous launcher state as one candidate", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-legacy-aliased-nvm-"));
+  const firstProjectRoot = join(root, "first-checkout");
+  const secondProjectRoot = join(root, "second-checkout");
+  const realNvmDir = join(root, "real-nvm");
+  const aliasedNvmDir = join(root, "aliased-nvm");
+  const nodeVersionsDir = join(realNvmDir, "versions", "node");
+  const legacyBinDir = join(nodeVersionsDir, "v20.20.2", "bin");
+  const currentBinDir = join(nodeVersionsDir, "v22.17.0", "bin");
+  const firstLocalLauncherPath = installDevLauncher({ projectRoot: firstProjectRoot }).launcherPath;
+  const legacyGlobalLauncherPath = join(legacyBinDir, "yui");
+  const legacyBackupPath = join(legacyBinDir, ".yui-link-original");
+  const legacyStatePath = join(legacyBinDir, ".yui-link-state.json");
+  const registryPath = join(root, "user-state", "dev-launcher.json");
+  mkdirSync(legacyBinDir, { recursive: true });
+  mkdirSync(currentBinDir, { recursive: true });
+  symlinkSync(realNvmDir, aliasedNvmDir, "dir");
+  writeFileSync(legacyBackupPath, "node-20-production-yui\n");
+  writeFileSync(join(currentBinDir, "yui"), "node-22-production-yui\n");
+  symlinkSync(firstLocalLauncherPath, legacyGlobalLauncherPath);
+  writeFileSync(legacyStatePath, `${JSON.stringify({
+    schemaVersion: 2,
+    activeProjectRoot: firstProjectRoot,
+    localLauncherPath: firstLocalLauncherPath,
+    hadOriginal: true
+  })}\n`);
+
+  const linked = await linkDevLauncher({
+    projectRoot: secondProjectRoot,
+    globalBinDir: currentBinDir,
+    registryPath,
+    nvmDir: aliasedNvmDir
+  });
+
+  assert.equal(readFileSync(legacyGlobalLauncherPath, "utf8"), "node-20-production-yui\n");
+  assert.equal(existsSync(legacyBackupPath), false);
+  assert.equal(existsSync(legacyStatePath), false);
+  assert.equal(readlinkSync(join(currentBinDir, "yui")), linked.localLauncherPath);
+});
+
 test("multiple previous launcher states across NVM versions fail without changing any candidate", () => {
   const root = mkdtempSync(join(tmpdir(), "yui-dev-legacy-multiple-nvm-"));
   const nodeVersionsDir = join(root, ".nvm", "versions", "node");
