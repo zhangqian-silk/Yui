@@ -9,6 +9,7 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -903,7 +904,21 @@ function findLegacyGlobalStateBinDirs(globalBinDir, nvmDir) {
 }
 
 function candidateGlobalBinDirs(globalBinDir, nvmDir) {
-  const candidates = new Set([resolve(globalBinDir)]);
+  const candidates = new Map();
+  const addCandidate = (candidate) => {
+    const resolvedCandidate = resolve(candidate);
+    let canonicalCandidate;
+    try {
+      canonicalCandidate = realpathSync(resolvedCandidate);
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      canonicalCandidate = resolvedCandidate;
+    }
+    if (!candidates.has(canonicalCandidate)) {
+      candidates.set(canonicalCandidate, resolvedCandidate);
+    }
+  };
+  addCandidate(globalBinDir);
   const nodeVersionsDirs = new Set();
   const inferredNodeVersionsDir = inferNvmNodeVersionsDir(globalBinDir);
   if (inferredNodeVersionsDir !== null) nodeVersionsDirs.add(inferredNodeVersionsDir);
@@ -912,10 +927,10 @@ function candidateGlobalBinDirs(globalBinDir, nvmDir) {
     if (!pathExists(nodeVersionsDir)) continue;
     for (const entry of readdirSync(nodeVersionsDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
-      candidates.add(join(nodeVersionsDir, entry.name, "bin"));
+      addCandidate(join(nodeVersionsDir, entry.name, "bin"));
     }
   }
-  return [...candidates].sort();
+  return [...candidates.values()].sort();
 }
 
 function inferNvmNodeVersionsDir(globalBinDir) {
