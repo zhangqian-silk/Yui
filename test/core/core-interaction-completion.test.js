@@ -27,6 +27,7 @@ const PUBLIC_PATHS = [
   "update",
   "setup",
   "doctor",
+  "web",
   "controller",
   "controller status",
   "controller stop",

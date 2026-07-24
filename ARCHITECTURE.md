@@ -59,6 +59,22 @@ YUI_HOME                         dedicated tmux server
 
 Thus a Task maps to one tmux session, a Role maps to one window/pane, and each pane hosts one independent native Agent process/session. tmux IDs, process IDs, AgentRun IDs, mailbox batch IDs, and native thread IDs remain distinct identities linked by Runtime bindings.
 
+## Web projection
+
+The optional dashboard is a read-only HTTP projection over the same `FileTaskStore`. Its frontend is deliberately split by responsibility:
+
+```text
+shell.ts                 semantic HTML and extension points
+assetManifest.ts         static asset routing
+styles.ts                theme tokens | layout | components | responsive rules
+client/i18n.ts           locale dictionaries and DOM translation
+client/theme.ts          theme registry and preference persistence
+client/view.ts           safe DOM rendering
+client/app.ts            API requests and interaction state
+```
+
+Layout and component rules consume semantic CSS custom properties rather than theme-specific colors. A theme replacement therefore changes one token set and one registry option without changing the application controller or view rendering. Locale and theme preferences live in browser `localStorage`; authoritative task state remains exclusively in `YUI_HOME/state.json`.
+
 ## Persistent layout
 
 ```text
@@ -181,6 +197,6 @@ This version does not restore:
 - native storage extensions, derived indexes, or recovery journals;
 - distributed leases, fencing generations, permission fingerprints, or identity ledgers;
 - inactivity TTL, cooldown, review-time, recurring schedules, or offline resolution;
-- Web APIs, Web UI, or remote multi-user coordination.
+- Web writes, non-loopback Web access, or remote multi-user coordination. The optional `yui web` process is a read-only projection of `FileTaskStore`; it introduces no second authority.
 
 Those systems are not required for the retained single-user workflow. Future storage-schema migration is the one explicit extension boundary kept in the design.

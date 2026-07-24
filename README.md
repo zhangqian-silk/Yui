@@ -191,6 +191,19 @@ yui task run retry <failed-run-id>
 
 Completion is the reversible execution fence. Archiving is terminal: it fails active Runs, stops the Task's tmux session, and removes each clean Role worktree. Dirty Role worktrees are preserved for deliberate cleanup.
 
+## Local web dashboard
+
+Run the read-only dashboard on the default loopback address:
+
+```sh
+yui web
+# Yui web dashboard: http://127.0.0.1:4173
+```
+
+Use `--port <port>` or `--host 127.0.0.1|::1|localhost` to change the listener. Yui rejects non-loopback hosts: the dashboard exposes Task metadata, Briefs, Roles, WorkItems, Runs, messages, Decisions, Milestones, and open InputRequests without authentication, so it is intentionally local-only. The Web surface never writes Yui state; use the CLI or an Agent session for mutations.
+
+The dashboard supports English and Simplified Chinese, selecting an initial locale from the browser and remembering manual changes. The theme selector switches between the dark Control Room and light Paper Ledger themes. Both choices are stored only in browser `localStorage`; they do not modify `YUI_HOME`.
+
 ## Management commands
 
 The restored management surface includes:
@@ -207,7 +220,7 @@ Agent environment bindings store process-environment variable names, never secre
 
 ## Scope
 
-Yui targets one trusted local user on one machine. It intentionally omits Web/API surfaces, distributed coordination, backup/import/export commands, trash/restore, derived indexes, recovery journals, runtime leases, inactivity TTLs, cooldowns, and recurring schedules.
+Yui targets one trusted local user on one machine. Its Web/API surface is loopback-only and read-only. It intentionally omits remote or multi-user Web access, distributed coordination, backup/import/export commands, trash/restore, derived indexes, recovery journals, runtime leases, inactivity TTLs, cooldowns, and recurring schedules.
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for persistence and scheduling details.
 

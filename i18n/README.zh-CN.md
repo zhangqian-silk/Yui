@@ -186,6 +186,19 @@ yui task run retry <failed-run-id>
 
 completion 是可逆的执行屏障。归档是终态：失败活动 Run、停止 Task 的 tmux session，并逐个移除干净的 Role worktree；脏 Role worktree 会保留，供人工确认处理。
 
+## 本地 Web Dashboard
+
+默认在 loopback 地址启动只读 dashboard：
+
+```sh
+yui web
+# Yui web dashboard: http://127.0.0.1:4173
+```
+
+可用 `--port <port>` 或 `--host 127.0.0.1|::1|localhost` 修改监听参数。Yui 会拒绝非 loopback host；Web 界面无需认证，因此只允许本机访问，并且不会写入 Yui 状态。所有变更仍通过 CLI 或 Agent session 完成。
+
+Dashboard 支持 English 与简体中文，首次打开时跟随浏览器语言，也可以手动切换并记住选择。主题选择器可在深色「控制室」和浅色「纸本台账」之间切换。语言与主题偏好只保存在浏览器 `localStorage`，不会修改 `YUI_HOME`。
+
 ## 管理命令
 
 ```sh
@@ -200,7 +213,7 @@ Agent 环境变量绑定只保存进程环境变量名，不保存 secret 值；
 
 ## 范围
 
-Yui 面向一台机器上的一个受信任本地用户。它不包含 Web/API、多用户协调、backup/import/export、trash/restore、derived index、recovery journal、runtime lease、inactivity TTL、cooldown 或 recurring schedule。
+Yui 面向一台机器上的一个受信任本地用户。它的 Web/API 仅支持 loopback 只读访问，不包含远程或多用户 Web、分布式协调、backup/import/export、trash/restore、derived index、recovery journal、runtime lease、inactivity TTL、cooldown 或 recurring schedule。
 
 持久化和调度细节见 [ARCHITECTURE.md](../ARCHITECTURE.md)。
 
