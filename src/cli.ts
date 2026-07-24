@@ -17,6 +17,8 @@ import { resolveRoleWizardArguments } from "./cli/roleWizard.js";
 import type { SelectionPorts } from "./cli/selectionPorts.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
 import { formatTimestamp } from "./output/timePresentation.js";
+import type { ConfiguredAgent } from "./agent/agent.js";
+import { nativeAgentEnvironmentNames } from "./agent/launchEnvironment.js";
 import {
   runAgentCommand,
   type AgentCommandStore
@@ -199,6 +201,10 @@ export async function main(): Promise<void> {
 
   if (resolved[0] === "agent") {
     const agentArgs = resolved.slice(1);
+    const affectedAgentId = agentArgs[1];
+    const previousAgent = typeof affectedAgentId === "string"
+      ? store.getConfiguredAgent(affectedAgentId)
+      : null;
     const output = runAgentCommand(
       agentArgs,
       store as unknown as AgentCommandStore
@@ -208,10 +214,19 @@ export async function main(): Promise<void> {
       || agentArgs[0] === "update"
       || agentArgs[0] === "remove"
     ) {
+      const currentAgent = typeof affectedAgentId === "string"
+        ? store.getConfiguredAgent(affectedAgentId)
+        : null;
+      const scope = agentEnvironmentRefreshScope(
+        previousAgent,
+        currentAgent,
+        store.listConfiguredAgents()
+      );
       const refresh = await refreshRunningFileTaskControllerEnvironment(
         home,
         store,
-        process.env
+        process.env,
+        scope
       );
       emit(withControllerRefreshWarning(output, refresh, "Agent environment"));
       return;
@@ -540,8 +555,39 @@ function withControllerRefreshWarning(
   label: string
 ): string {
   if (refresh.status !== "failed") return output;
+  if (label === "Agent environment") {
+    return `${output.trimEnd()}\nWarning: Agent configuration was saved, but its current `
+      + `environment values were not applied or persisted (${refresh.message}). Retry the `
+      + "Agent command with those variables present, or restart the Controller from an "
+      + "environment that provides them.\n";
+  }
   return `${output.trimEnd()}\nWarning: ${label} was saved, but the running Controller `
     + `could not be refreshed (${refresh.message}). Restart the Controller to apply it.\n`;
+}
+
+function agentEnvironmentRefreshScope(
+  previous: ConfiguredAgent | null,
+  current: ConfiguredAgent | null,
+  configured: readonly ConfiguredAgent[]
+): Readonly<{ sourceNames: readonly string[]; nativeNames: readonly string[] }> {
+  const retainedSources = new Set(configured.flatMap((agent) => (
+    agent.environment.map((binding) => binding.sourceName)
+  )));
+  const retainedNative = new Set(configured.flatMap((agent) => (
+    nativeAgentEnvironmentNames(agent.adapterId)
+  )));
+  const currentSources = current?.environment.map((binding) => binding.sourceName) ?? [];
+  const previousOnlySources = previous?.environment
+    .map((binding) => binding.sourceName)
+    .filter((name) => !retainedSources.has(name)) ?? [];
+  const currentNative = current === null ? [] : nativeAgentEnvironmentNames(current.adapterId);
+  const previousOnlyNative = previous === null
+    ? []
+    : nativeAgentEnvironmentNames(previous.adapterId).filter((name) => !retainedNative.has(name));
+  return {
+    sourceNames: [...new Set([...currentSources, ...previousOnlySources])],
+    nativeNames: [...new Set([...currentNative, ...previousOnlyNative])]
+  };
 }
 
 function readPackageVersion(): string {

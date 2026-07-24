@@ -209,10 +209,14 @@ export function createRuntimeLifecycleDispatcher(
       if (environmentRefresher === undefined) {
         throw applicationError("METHOD_NOT_FOUND", "Controller method was not found.");
       }
-      const sources = parseEnvironmentReplacement(params);
-      validateEnvironmentReplacementSources(store, sources);
-      environmentRefresher.replaceAgentEnvironment(sources);
-      return { replaced: true, count: Object.keys(sources).length };
+      const refresh = parseEnvironmentRefresh(params);
+      validateEnvironmentRefreshSources(store, refresh);
+      environmentRefresher.refreshAgentEnvironment(refresh);
+      return {
+        replaced: true,
+        count: Object.keys(refresh.sources).length
+          + Object.keys(refresh.nativeSources).length
+      };
     }
     if (method !== "runtime.ensure-role-session") {
       if (fallback !== undefined) return fallback(method, params);
@@ -560,26 +564,40 @@ const MANAGED_RUNTIME_ENVIRONMENT = new Set<string>(
   YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES
 );
 
-function parseEnvironmentReplacement(
+function parseEnvironmentRefresh(
   params: JsonValue
-): Readonly<Record<string, string>> {
+): Readonly<{
+  sources: Readonly<Record<string, string>>;
+  sourceNames: readonly string[];
+  nativeSources: Readonly<Record<string, string>>;
+  nativeNames: readonly string[];
+}> {
   if (
     typeof params !== "object"
     || params === null
     || Array.isArray(params)
-    || Object.keys(params).length !== 1
+    || Object.keys(params).length !== 4
   ) {
     throw applicationError(
       "INVALID_PARAMS",
       "Runtime Agent environment refresh params are invalid."
     );
   }
-  const value = (params as Readonly<Record<string, JsonValue>>).sources;
+  const values = params as Readonly<Record<string, JsonValue>>;
+  return {
+    sources: parseEnvironmentValues(values.sources, "sources"),
+    sourceNames: parseEnvironmentNames(values.sourceNames, "source names"),
+    nativeSources: parseEnvironmentValues(values.nativeSources, "native sources"),
+    nativeNames: parseEnvironmentNames(values.nativeNames, "native names")
+  };
+}
+
+function parseEnvironmentValues(
+  value: JsonValue | undefined,
+  label: string
+): Readonly<Record<string, string>> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw applicationError(
-      "INVALID_PARAMS",
-      "Runtime Agent environment refresh sources are invalid."
-    );
+    throw applicationError("INVALID_PARAMS", `Runtime Agent environment ${label} are invalid.`);
   }
   const entries = Object.entries(value);
   if (entries.length > 256) {
@@ -606,20 +624,61 @@ function parseEnvironmentReplacement(
   return sources;
 }
 
-function validateEnvironmentReplacementSources(
+function parseEnvironmentNames(
+  value: JsonValue | undefined,
+  label: string
+): readonly string[] {
+  if (
+    !Array.isArray(value)
+    || value.length > 256
+    || value.some((name) => (
+      typeof name !== "string"
+      || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)
+      || MANAGED_RUNTIME_ENVIRONMENT.has(name)
+    ))
+  ) {
+    throw applicationError("INVALID_PARAMS", `Runtime Agent environment ${label} are invalid.`);
+  }
+  return [...new Set(value as string[])];
+}
+
+function validateEnvironmentRefreshSources(
   store: TaskStore,
-  sources: Readonly<Record<string, string>>
+  refresh: Readonly<{
+    sources: Readonly<Record<string, string>>;
+    sourceNames: readonly string[];
+    nativeSources: Readonly<Record<string, string>>;
+    nativeNames: readonly string[];
+  }>
 ): void {
   const declared = new Set(store.listConfiguredAgents().flatMap((agent) => (
     agent.environment.map((binding) => binding.sourceName)
   )));
-  for (const name of Object.keys(sources)) {
+  for (const name of Object.keys(refresh.sources)) {
     if (!declared.has(name)) {
       throw applicationError(
         "INVALID_PARAMS",
         `Runtime Agent environment source is not declared: ${name}.`
       );
     }
+  }
+  if (Object.keys(refresh.sources).some((name) => !refresh.sourceNames.includes(name))) {
+    throw applicationError("INVALID_PARAMS", "Runtime Agent environment source scope is invalid.");
+  }
+  const native = new Set(store.listConfiguredAgents().flatMap((agent) => (
+    nativeAgentEnvironmentNames(agent.adapterId)
+  )));
+  for (const name of Object.keys(refresh.nativeSources)) {
+    if (!native.has(name) || !refresh.nativeNames.includes(name)) {
+      throw applicationError(
+        "INVALID_PARAMS",
+        `Runtime native Agent environment source is not declared: ${name}.`
+      );
+    }
+  }
+  const allowedNative = new Set(["CODEX_HOME", "CLAUDE_CONFIG_DIR"]);
+  if (refresh.nativeNames.some((name) => !allowedNative.has(name))) {
+    throw applicationError("INVALID_PARAMS", "Runtime native Agent environment scope is invalid.");
   }
 }
 

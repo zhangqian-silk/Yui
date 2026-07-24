@@ -6,7 +6,12 @@ import {
   configuredAgentToDefinition,
   resolveAgentEnvironment
 } from "../agent/agent.js";
-import { operationalAgentEnvironment } from "../agent/launchEnvironment.js";
+import {
+  NATIVE_AGENT_ENVIRONMENT_NAMES,
+  nativeAgentEnvironmentNames,
+  operationalAgentEnvironment,
+  selectEnvironment
+} from "../agent/launchEnvironment.js";
 import { activeRoleAgentBinding, type GlobalRole, type TaskRole } from "../role/role.js";
 import type {
   RoleSessionLaunchMode,
@@ -17,7 +22,10 @@ import { compileRoleSessionContext } from "../context/roleSessionContext.js";
 import { resolveAgentAdapter } from "./agentAdapter.js";
 import { inspectCodexLaunchConfig } from "./codexConfigConflict.js";
 import type { PlannedRoleSession, RoleLaunchPlanner } from "./executorRegistry.js";
-import type { AgentEnvironmentRefreshPort } from "../runtime/ports.js";
+import type {
+  AgentEnvironmentRefresh,
+  AgentEnvironmentRefreshPort
+} from "../runtime/ports.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
@@ -44,6 +52,7 @@ type TaskRoleLaunchPlanInput = Parameters<RoleLaunchPlanner["plan"]>[0] & Readon
 export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmentRefreshPort {
   readonly #operationalEnvironment: NodeJS.ProcessEnv;
   #agentEnvironment: NodeJS.ProcessEnv;
+  #nativeAgentEnvironment: NodeJS.ProcessEnv;
   readonly #createNativeSessionId: () => string;
   readonly #cliPath: string;
 
@@ -55,17 +64,33 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     // Operational launch context is stable for the Controller lifetime. Agent
     // binding sources are a separate replaceable snapshot so an unset/removed
     // secret cannot survive a later configuration refresh.
-    this.#operationalEnvironment = { ...(options.environment ?? process.env) };
+    const sourceEnvironment = { ...(options.environment ?? process.env) };
+    this.#operationalEnvironment = { ...sourceEnvironment };
+    for (const name of NATIVE_AGENT_ENVIRONMENT_NAMES) {
+      delete this.#operationalEnvironment[name];
+    }
     this.#agentEnvironment = this.#selectConfiguredAgentEnvironment(
-      this.#operationalEnvironment
+      sourceEnvironment
+    );
+    this.#nativeAgentEnvironment = this.#selectConfiguredNativeEnvironment(
+      sourceEnvironment
     );
     this.#createNativeSessionId = options.createNativeSessionId ?? randomUUID;
     this.#cliPath = options.cliPath
       ?? fileURLToPath(new URL("../cli.js", import.meta.url));
   }
 
-  replaceAgentEnvironment(values: Readonly<Record<string, string>>): void {
-    this.#agentEnvironment = this.#selectConfiguredAgentEnvironment(values);
+  refreshAgentEnvironment(refresh: AgentEnvironmentRefresh): void {
+    this.#agentEnvironment = patchEnvironment(
+      this.#agentEnvironment,
+      refresh.sourceNames,
+      refresh.sources
+    );
+    this.#nativeAgentEnvironment = patchEnvironment(
+      this.#nativeAgentEnvironment,
+      refresh.nativeNames,
+      refresh.nativeSources
+    );
   }
 
   plan(input: TaskRoleLaunchPlanInput): PlannedRoleSession {
@@ -130,7 +155,10 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
 
     const agent = configuredAgentToDefinition(configured);
     const agentSourceEnvironment = input.environment ?? this.#agentEnvironment;
-    const operationalSourceEnvironment = input.environment ?? this.#operationalEnvironment;
+    const operationalSourceEnvironment = input.environment ?? {
+      ...this.#operationalEnvironment,
+      ...this.#nativeAgentEnvironment
+    };
     const resolvedAgentEnvironment = resolveAgentEnvironment(agent, agentSourceEnvironment);
     const launchEnvironment = {
       ...operationalAgentEnvironment(configured.adapterId, operationalSourceEnvironment),
@@ -252,6 +280,26 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     }
     return selected;
   }
+
+  #selectConfiguredNativeEnvironment(
+    source: Readonly<Record<string, string | undefined>>
+  ): NodeJS.ProcessEnv {
+    const names = new Set(this.store.listConfiguredAgents().flatMap((agent) => (
+      nativeAgentEnvironmentNames(agent.adapterId)
+    )));
+    return selectEnvironment(source, names);
+  }
+}
+
+function patchEnvironment(
+  current: NodeJS.ProcessEnv,
+  names: readonly string[],
+  values: Readonly<Record<string, string>>
+): NodeJS.ProcessEnv {
+  const next = { ...current };
+  for (const name of names) delete next[name];
+  for (const [name, value] of Object.entries(values)) next[name] = value;
+  return next;
 }
 
 function nativeSessionIdForLaunch(

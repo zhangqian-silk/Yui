@@ -205,22 +205,36 @@ export async function refreshRunningFileTaskControllerEnvironment(
   home: string,
   store: Pick<TaskStore, "listConfiguredAgents">,
   source: NodeJS.ProcessEnv = process.env,
-  options: FileControllerClientOptions = {}
+  options: FileControllerClientOptions & Readonly<{
+    sourceNames?: readonly string[];
+    nativeNames?: readonly string[];
+  }> = {}
 ): Promise<RunningControllerRefreshResult> {
-  const sourceNames = new Set<string>();
+  const configuredSourceNames = new Set<string>();
+  const configuredNativeNames = new Set<string>();
   for (const agent of store.listConfiguredAgents()) {
+    for (const name of nativeAgentEnvironmentNames(agent.adapterId)) {
+      configuredNativeNames.add(name);
+    }
     for (const binding of agent.environment) {
       if (!MANAGED_RUNTIME_ENVIRONMENT.has(binding.sourceName)) {
-        sourceNames.add(binding.sourceName);
+        configuredSourceNames.add(binding.sourceName);
       }
     }
   }
+  const sourceNames = options.sourceNames === undefined
+    ? [...configuredSourceNames]
+    : [...new Set(options.sourceNames)];
+  const nativeNames = options.nativeNames === undefined
+    ? [...configuredNativeNames]
+    : [...new Set(options.nativeNames)];
   const sources = selectEnvironment(source, sourceNames);
+  const nativeSources = selectEnvironment(source, nativeNames);
   try {
     await (options.call ?? callController)(
       home,
       "runtime.replace-agent-environment",
-      { sources },
+      { sources, sourceNames, nativeSources, nativeNames },
       {
         timeoutMs: options.requestTimeoutMs
           ?? ENVIRONMENT_REFRESH_TIMEOUT_MS
@@ -402,16 +416,14 @@ function controllerMailboxKey(target: MailboxTarget): string {
 function isUnavailable(error: unknown): boolean {
   if (typeof error !== "object" || error === null || !("code" in error)) return false;
   const code = (error as { code?: unknown }).code;
-  return code === "CONTROLLER_UNAVAILABLE"
-    || code === "CONTROLLER_DISCOVERY_INVALID"
-    || code === "INVALID_RESPONSE";
+  return code === "CONTROLLER_NOT_RUNNING"
+    || code === "CONTROLLER_UNAVAILABLE";
 }
 
 function isDefinitelyNotRunning(error: unknown): boolean {
   if (typeof error !== "object" || error === null || !("code" in error)) return false;
   const code = (error as { code?: unknown }).code;
-  return code === "CONTROLLER_UNAVAILABLE"
-    || code === "CONTROLLER_DISCOVERY_INVALID";
+  return code === "CONTROLLER_NOT_RUNNING";
 }
 
 async function readOptionalControllerStatus(

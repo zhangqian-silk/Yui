@@ -41,6 +41,11 @@ function fixture(t) {
       source: "process",
       sourceName: "YUI_OPENAI_KEY",
       required: true
+    }, {
+      target: "OPTIONAL_AGENT_VALUE",
+      source: "process",
+      sourceName: "YUI_OPTIONAL_VALUE",
+      required: false
     }],
     NOW
   );
@@ -63,7 +68,7 @@ function fixture(t) {
 
 test("planner environment refresh is private, authoritative, and used by background launches", (t) => {
   const { home, store, agent, task, role } = fixture(t);
-  const source = {};
+  const source = { CODEX_HOME: "/tmp/codex-old" };
   const planner = new FileRoleLaunchPlanner(home, store, {
     environment: source,
     cliPath: "/dist/cli.js"
@@ -77,11 +82,42 @@ test("planner environment refresh is private, authoritative, and used by backgro
   };
 
   assert.throws(() => planner.plan(input), /required agent environment is missing/i);
-  planner.replaceAgentEnvironment({ YUI_OPENAI_KEY: "secret-one" });
+  planner.refreshAgentEnvironment({
+    sources: { YUI_OPENAI_KEY: "secret-one" },
+    sourceNames: ["YUI_OPENAI_KEY"],
+    nativeSources: { CODEX_HOME: "/tmp/codex-one" },
+    nativeNames: ["CODEX_HOME"]
+  });
   assert.equal(planner.plan(input).launch.env.OPENAI_API_KEY, "secret-one");
-  planner.replaceAgentEnvironment({});
+  assert.equal(planner.plan(input).launch.env.CODEX_HOME, "/tmp/codex-one");
+  planner.refreshAgentEnvironment({
+    sources: { YUI_OPTIONAL_VALUE: "keep-me" },
+    sourceNames: ["YUI_OPTIONAL_VALUE"],
+    nativeSources: {},
+    nativeNames: []
+  });
+  planner.refreshAgentEnvironment({
+    sources: { YUI_OPENAI_KEY: "secret-two" },
+    sourceNames: ["YUI_OPENAI_KEY"],
+    nativeSources: {},
+    nativeNames: []
+  });
+  assert.equal(planner.plan(input).launch.env.OPTIONAL_AGENT_VALUE, "keep-me");
+  planner.refreshAgentEnvironment({
+    sources: {},
+    sourceNames: ["YUI_OPENAI_KEY"],
+    nativeSources: {},
+    nativeNames: ["CODEX_HOME"]
+  });
   assert.throws(() => planner.plan(input), /required agent environment is missing/i);
-  assert.deepEqual(source, {});
+  planner.refreshAgentEnvironment({
+    sources: { YUI_OPENAI_KEY: "secret-three" },
+    sourceNames: ["YUI_OPENAI_KEY"],
+    nativeSources: {},
+    nativeNames: []
+  });
+  assert.equal(planner.plan(input).launch.env.CODEX_HOME, undefined);
+  assert.deepEqual(source, { CODEX_HOME: "/tmp/codex-old" });
   assert.equal(process.env.YUI_OPENAI_KEY, undefined);
 });
 
@@ -106,7 +142,10 @@ test("environment refresh RPC accepts only current source bindings and never per
   const secret = "refresh-secret-not-on-disk";
   assert.deepEqual(
     await dispatch("runtime.replace-agent-environment", {
-      sources: { YUI_OPENAI_KEY: secret }
+      sources: { YUI_OPENAI_KEY: secret },
+      sourceNames: ["YUI_OPENAI_KEY"],
+      nativeSources: {},
+      nativeNames: ["CODEX_HOME"]
     }),
     { replaced: true, count: 1 }
   );
@@ -123,10 +162,16 @@ test("environment refresh RPC accepts only current source bindings and never per
     sources: {
       YUI_OPENAI_KEY: "must-not-merge",
       OPENAI_API_KEY: "target-only"
-    }
+    },
+    sourceNames: ["YUI_OPENAI_KEY", "OPENAI_API_KEY"],
+    nativeSources: {},
+    nativeNames: []
   }), /not declared: OPENAI_API_KEY/i);
   await assert.rejects(dispatch("runtime.replace-agent-environment", {
-    sources: { YUI_HOME: "managed" }
+    sources: { YUI_HOME: "managed" },
+    sourceNames: ["YUI_HOME"],
+    nativeSources: {},
+    nativeNames: []
   }), /source is invalid: YUI_HOME/i);
   assert.equal(planner.plan({
     taskId: task.id,
@@ -161,7 +206,12 @@ test("refresh helper sends present declared sources and never starts an absent C
   assert.deepEqual(refreshed, { status: "refreshed" });
   assert.deepEqual(calls[0].slice(1, 3), [
     "runtime.replace-agent-environment",
-    { sources: { YUI_OPENAI_KEY: "present" } }
+    {
+      sources: { YUI_OPENAI_KEY: "present" },
+      sourceNames: ["YUI_OPENAI_KEY", "YUI_OPTIONAL_VALUE"],
+      nativeSources: {},
+      nativeNames: ["CODEX_HOME"]
+    }
   ]);
 
   let spawnCount = 0;
@@ -172,7 +222,7 @@ test("refresh helper sends present declared sources and never starts an absent C
     {
       call: async () => {
         throw Object.assign(new Error("offline"), {
-          code: "CONTROLLER_UNAVAILABLE"
+          code: "CONTROLLER_NOT_RUNNING"
         });
       },
       spawnController: () => { spawnCount += 1; }
@@ -224,6 +274,26 @@ test("a malformed reply is reported as refresh failure, not an absent Controller
     }
   );
   assert.deepEqual(result, { status: "failed", message: "malformed reply" });
+});
+
+test("socket and discovery failures are not mistaken for an absent Controller", async (t) => {
+  const { home, store } = fixture(t);
+  for (const [code, message] of [
+    ["CONTROLLER_UNAVAILABLE", "socket unavailable"],
+    ["CONTROLLER_DISCOVERY_INVALID", "discovery invalid"]
+  ]) {
+    const result = await refreshRunningFileTaskControllerEnvironment(
+      home,
+      store,
+      { YUI_OPENAI_KEY: "present" },
+      {
+        call: async () => {
+          throw Object.assign(new Error(message), { code });
+        }
+      }
+    );
+    assert.deepEqual(result, { status: "failed", message });
+  }
 });
 
 test("configuration refresh reads durable state in the Controller and never starts it", async () => {

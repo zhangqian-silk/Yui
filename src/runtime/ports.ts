@@ -35,9 +35,16 @@ export interface RuntimeLaunchPreparationPort {
   ): Promise<RuntimeBinding>;
 }
 
+export type AgentEnvironmentRefresh = Readonly<{
+  sources: Readonly<Record<string, string>>;
+  sourceNames: readonly string[];
+  nativeSources: Readonly<Record<string, string>>;
+  nativeNames: readonly string[];
+}>;
+
 /** Volatile, non-persisted source values used to resolve configured Agent bindings. */
 export interface AgentEnvironmentRefreshPort {
-  replaceAgentEnvironment(values: Readonly<Record<string, string>>): void;
+  refreshAgentEnvironment(refresh: AgentEnvironmentRefresh): void;
 }
 
 export interface SessionHostPort {

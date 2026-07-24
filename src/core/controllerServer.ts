@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -81,8 +81,7 @@ async function startControllerServerLocked(
       socketPath,
       token
     });
-    await writeFile(discoveryPath, `${JSON.stringify(discovery)}\n`, { mode: 0o600 });
-    await chmod(discoveryPath, 0o600);
+    await writeDiscoveryAtomically(discoveryPath, discovery);
 
     let resolveClosed: () => void = () => undefined;
     const closed = new Promise<void>((resolve) => {
@@ -103,6 +102,24 @@ async function startControllerServerLocked(
     return Object.freeze({ discovery, closed, close: closeRunning });
   } catch (error) {
     await closeNetServer(netServer);
+    throw error;
+  }
+}
+
+async function writeDiscoveryAtomically(
+  discoveryPath: string,
+  discovery: ControllerDiscovery
+): Promise<void> {
+  const temporaryPath = `${discoveryPath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  try {
+    await writeFile(temporaryPath, `${JSON.stringify(discovery)}\n`, {
+      mode: 0o600,
+      flag: "wx"
+    });
+    await chmod(temporaryPath, 0o600);
+    await rename(temporaryPath, discoveryPath);
+  } catch (error) {
+    await rm(temporaryPath, { force: true }).catch(() => undefined);
     throw error;
   }
 }

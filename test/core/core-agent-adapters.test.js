@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -413,6 +414,142 @@ test("Codex config inspection cannot miss a project layer behind custom root mar
     status: "configured",
     source: projectConfig
   });
+
+  await writeFile(
+    join(codexHome, "config.toml"),
+    [
+      'project_root_markers = ["nested/.."]',
+      `[projects.${JSON.stringify(project)}]`,
+      'trust_level = "trusted"'
+    ].join("\n")
+  );
+  assert.equal(inspectCodexDeveloperInstructions({
+    environment: { CODEX_HOME: codexHome },
+    workspace,
+    systemConfigPath: join(root, "missing-system.toml"),
+    managedConfigPath: join(root, "missing-managed.toml")
+  }).status, "configured");
+
+  t.after(async () => {
+    await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }));
+  });
+});
+
+test("Codex project trust accepts standard TOML forms and does not inherit arbitrary ancestors", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "yui-codex-trust-semantics-"));
+  const codexHome = join(root, "codex-home");
+  const project = join(root, "project");
+  const workspace = join(project, "nested");
+  const projectConfig = join(project, ".codex", "config.toml");
+  await mkdir(codexHome);
+  await mkdir(join(project, ".git"), { recursive: true });
+  await mkdir(join(project, ".codex"));
+  await mkdir(workspace);
+  await writeFile(projectConfig, 'developer_instructions = "project policy"\n');
+  const inspect = () => inspectCodexDeveloperInstructions({
+    environment: { CODEX_HOME: codexHome },
+    workspace,
+    systemConfigPath: join(root, "missing-system.toml"),
+    managedConfigPath: join(root, "missing-managed.toml")
+  });
+
+  await writeFile(
+    join(codexHome, "config.toml"),
+    `projects.${JSON.stringify(project)}.trust_level = "trusted"\n`
+  );
+  assert.deepEqual(inspect(), { status: "configured", source: projectConfig });
+
+  await writeFile(
+    join(codexHome, "config.toml"),
+    `projects = { ${JSON.stringify(project)} = { trust_level = "trusted" } }\n`
+  );
+  assert.deepEqual(inspect(), { status: "configured", source: projectConfig });
+
+  await writeFile(
+    join(codexHome, "config.toml"),
+    `[projects.${JSON.stringify(root)}]\ntrust_level = "trusted"\n`
+  );
+  assert.equal(inspect().status, "absent");
+
+  await writeFile(
+    join(codexHome, "config.toml"),
+    `[projects.${JSON.stringify(project)}]\ntrust_level = "maybe"\n`
+  );
+  assert.throws(inspect, /trust_level must be trusted or untrusted/i);
+
+  t.after(async () => {
+    await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }));
+  });
+});
+
+test("Codex project layers are trusted independently and linked worktrees use the main root", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "yui-codex-worktree-trust-"));
+  const codexHome = join(root, "codex-home");
+  const main = join(root, "main");
+  const worktree = join(root, "linked");
+  await mkdir(codexHome);
+  execFileSync("git", ["init", "-q", main]);
+  execFileSync("git", ["-C", main, "config", "user.email", "yui@example.invalid"]);
+  execFileSync("git", ["-C", main, "config", "user.name", "Yui Test"]);
+  await writeFile(join(main, "README.md"), "test\n");
+  execFileSync("git", ["-C", main, "add", "README.md"]);
+  execFileSync("git", ["-C", main, "commit", "-qm", "initial"]);
+  execFileSync("git", ["-C", main, "worktree", "add", "-q", worktree]);
+  const rootConfig = join(worktree, ".codex", "config.toml");
+  const nested = join(worktree, "nested");
+  await mkdir(join(worktree, ".codex"));
+  await mkdir(join(nested, ".codex"), { recursive: true });
+  await writeFile(rootConfig, 'developer_instructions = "root policy"\n');
+  await writeFile(
+    join(nested, ".codex", "config.toml"),
+    'developer_instructions = "untrusted nested policy"\n'
+  );
+  await writeFile(
+    join(codexHome, "config.toml"),
+    [
+      `[projects.${JSON.stringify(main)}]`,
+      'trust_level = "trusted"',
+      `[projects.${JSON.stringify(nested)}]`,
+      'trust_level = "untrusted"'
+    ].join("\n")
+  );
+
+  assert.deepEqual(inspectCodexDeveloperInstructions({
+    environment: { CODEX_HOME: codexHome },
+    workspace: nested,
+    systemConfigPath: join(root, "missing-system.toml"),
+    managedConfigPath: join(root, "missing-managed.toml")
+  }), { status: "configured", source: rootConfig });
+
+  t.after(async () => {
+    await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }));
+  });
+});
+
+test("managed Codex policy cannot enable project discovery", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "yui-codex-managed-trust-"));
+  const codexHome = join(root, "codex-home");
+  const workspace = join(root, "project");
+  const managedConfigPath = join(root, "managed.toml");
+  await mkdir(codexHome);
+  await mkdir(join(workspace, ".git"), { recursive: true });
+  await mkdir(join(workspace, ".codex"));
+  await writeFile(join(codexHome, "config.toml"), "");
+  await writeFile(
+    managedConfigPath,
+    `[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`
+  );
+  await writeFile(
+    join(workspace, ".codex", "config.toml"),
+    'developer_instructions = "must remain undiscovered"\n'
+  );
+
+  assert.equal(inspectCodexDeveloperInstructions({
+    environment: { CODEX_HOME: codexHome },
+    workspace,
+    systemConfigPath: join(root, "missing-system.toml"),
+    managedConfigPath
+  }).status, "absent");
 
   t.after(async () => {
     await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }));
