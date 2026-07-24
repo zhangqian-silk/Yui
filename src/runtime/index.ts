@@ -30,6 +30,7 @@ export {
   validateRecentTurnIds
 } from "./turnCompletion.js";
 export {
+  type AgentEnvironmentRefreshPort,
   type ActivePromptPushPort,
   type ActivePromptPushRequest,
   type PromptPushResult,

@@ -79,7 +79,12 @@ export type ControllerRuntimeOptions = Readonly<{
   >;
   runtimeEventProcessor?: RuntimeEventProcessorPort;
   lifecycleHost?: RuntimeLifecycleHost;
+  configuration?: ControllerConfigurationPort;
 }>;
+
+export interface ControllerConfigurationPort {
+  reconciliationIntervalMs(): number;
+}
 
 export type MailboxKey =
   | `task:${string}`
@@ -781,6 +786,7 @@ export class FileTaskController {
   #deadlineTimer: NodeJS.Timeout | undefined;
   readonly #signalScheduler: MailboxScheduler<MailboxKey>;
   readonly #operatorSignalScheduler: MailboxScheduler<MailboxKey>;
+  readonly #configuration: ControllerConfigurationPort | undefined;
   #current: Promise<ControllerSchedulerResult> | undefined;
   #operatorCurrent: Promise<void> | undefined;
   #pendingFull = false;
@@ -819,6 +825,7 @@ export class FileTaskController {
     );
     this.#runtimeEventProcessor = options.runtimeEventProcessor;
     this.#lifecycleHost = options.lifecycleHost;
+    this.#configuration = options.configuration;
     this.#signalScheduler = new MailboxScheduler(
       async (keys) => { await this.#requestPass({ kind: "dirty", keys }); },
       {
@@ -873,6 +880,15 @@ export class FileTaskController {
       }, this.#intervalMs);
       this.#timer.unref();
     }
+  }
+
+  reloadReconciliationInterval(): number {
+    if (this.#configuration !== undefined) {
+      this.updateReconciliationInterval(
+        this.#configuration.reconciliationIntervalMs()
+      );
+    }
+    return this.#intervalMs;
   }
 
   start(): void {
@@ -990,6 +1006,7 @@ export class FileTaskController {
         this.#pendingFull = false;
         this.#pendingKeys.clear();
         try {
+          if (scope.kind === "full") this.reloadReconciliationInterval();
           const firstRuntimeDrain = this.#drainRuntimeEvents();
           result = await runControllerSchedulerPass(
             this.store,
@@ -1538,8 +1555,8 @@ export async function startFileTaskController(
       return schedulerResultJson(await runtime.pump());
     }
     if (method === "scheduler.configure") {
-      const intervalMs = schedulerIntervalParams(params);
-      runtime.updateReconciliationInterval(intervalMs);
+      requireEmptySchedulerConfigureParams(params);
+      const intervalMs = runtime.reloadReconciliationInterval();
       return { configured: true, reconciliationIntervalMs: intervalMs };
     }
     if (dispatcher === undefined) {
@@ -1603,24 +1620,8 @@ function signalMailboxKey(value: JsonValue): MailboxKey {
   }
 }
 
-function schedulerIntervalParams(value: JsonValue): number {
-  if (
-    typeof value !== "object"
-    || value === null
-    || Array.isArray(value)
-  ) {
-    throw controllerApplicationError("INVALID_PARAMS", "scheduler.configure params are invalid.");
-  }
-  const record = value as Readonly<Record<string, JsonValue>>;
-  if (
-    Object.keys(record).length !== 1
-    || typeof record.reconciliationIntervalSeconds !== "number"
-  ) {
-    throw controllerApplicationError("INVALID_PARAMS", "scheduler.configure params are invalid.");
-  }
-  try {
-    return reconciliationIntervalMilliseconds(record.reconciliationIntervalSeconds);
-  } catch {
+function requireEmptySchedulerConfigureParams(value: JsonValue): void {
+  if (!isEmptyJsonObject(value)) {
     throw controllerApplicationError("INVALID_PARAMS", "scheduler.configure params are invalid.");
   }
 }

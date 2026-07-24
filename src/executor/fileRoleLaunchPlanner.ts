@@ -17,6 +17,7 @@ import { compileRoleSessionContext } from "../context/roleSessionContext.js";
 import { resolveAgentAdapter } from "./agentAdapter.js";
 import { inspectCodexLaunchConfig } from "./codexConfigConflict.js";
 import type { PlannedRoleSession, RoleLaunchPlanner } from "./executorRegistry.js";
+import type { AgentEnvironmentRefreshPort } from "../runtime/ports.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
@@ -40,8 +41,9 @@ type TaskRoleLaunchPlanInput = Parameters<RoleLaunchPlanner["plan"]>[0] & Readon
 }>;
 
 /** Builds managed native Agent launches from the authoritative Task records. */
-export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
-  readonly #environment: NodeJS.ProcessEnv;
+export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmentRefreshPort {
+  readonly #operationalEnvironment: NodeJS.ProcessEnv;
+  #agentEnvironment: NodeJS.ProcessEnv;
   readonly #createNativeSessionId: () => string;
   readonly #cliPath: string;
 
@@ -50,16 +52,20 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
     readonly store: TaskStore,
     options: FileRoleLaunchPlannerOptions = {}
   ) {
-    // Keep a private, refreshable snapshot. Runtime secret refreshes must not
-    // mutate the Controller's ambient process.env or persist secret values.
-    this.#environment = { ...(options.environment ?? process.env) };
+    // Operational launch context is stable for the Controller lifetime. Agent
+    // binding sources are a separate replaceable snapshot so an unset/removed
+    // secret cannot survive a later configuration refresh.
+    this.#operationalEnvironment = { ...(options.environment ?? process.env) };
+    this.#agentEnvironment = this.#selectConfiguredAgentEnvironment(
+      this.#operationalEnvironment
+    );
     this.#createNativeSessionId = options.createNativeSessionId ?? randomUUID;
     this.#cliPath = options.cliPath
       ?? fileURLToPath(new URL("../cli.js", import.meta.url));
   }
 
-  mergeEnvironment(values: Readonly<Record<string, string>>): void {
-    Object.assign(this.#environment, values);
+  replaceAgentEnvironment(values: Readonly<Record<string, string>>): void {
+    this.#agentEnvironment = this.#selectConfiguredAgentEnvironment(values);
   }
 
   plan(input: TaskRoleLaunchPlanInput): PlannedRoleSession {
@@ -123,10 +129,11 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
     }
 
     const agent = configuredAgentToDefinition(configured);
-    const sourceEnvironment = input.environment ?? this.#environment;
-    const resolvedAgentEnvironment = resolveAgentEnvironment(agent, sourceEnvironment);
+    const agentSourceEnvironment = input.environment ?? this.#agentEnvironment;
+    const operationalSourceEnvironment = input.environment ?? this.#operationalEnvironment;
+    const resolvedAgentEnvironment = resolveAgentEnvironment(agent, agentSourceEnvironment);
     const launchEnvironment = {
-      ...operationalAgentEnvironment(configured.adapterId, sourceEnvironment),
+      ...operationalAgentEnvironment(configured.adapterId, operationalSourceEnvironment),
       ...resolvedAgentEnvironment
     };
     const adapter = resolveAgentAdapter(binding.adapterId);
@@ -134,7 +141,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
     const codexConfig = binding.config.adapterId === "codex"
       ? inspectCodexLaunchConfig({
           environment: {
-            ...sourceEnvironment,
+            ...operationalSourceEnvironment,
+            ...agentSourceEnvironment,
             ...launchEnvironment
           },
           workspace: role.workspace,
@@ -230,6 +238,19 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
       },
       session
     };
+  }
+
+  #selectConfiguredAgentEnvironment(
+    source: Readonly<Record<string, string | undefined>>
+  ): NodeJS.ProcessEnv {
+    const selected: NodeJS.ProcessEnv = {};
+    for (const agent of this.store.listConfiguredAgents()) {
+      for (const binding of agent.environment) {
+        const value = source[binding.sourceName];
+        if (value !== undefined) selected[binding.sourceName] = value;
+      }
+    }
+    return selected;
   }
 }
 

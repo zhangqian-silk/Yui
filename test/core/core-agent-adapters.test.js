@@ -235,6 +235,11 @@ test("Codex config inspection applies the selected profile file and project laye
 
   await writeFile(join(codexHome, "work.config.toml"), "", { mode: 0o600 });
   await writeFile(
+    join(codexHome, "config.toml"),
+    `[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`,
+    { mode: 0o600 }
+  );
+  await writeFile(
     join(projectConfig, "config.toml"),
     '"developer_instructions" = "project policy"\n',
     { mode: 0o600 }
@@ -243,6 +248,13 @@ test("Codex config inspection applies the selected profile file and project laye
     status: "configured",
     source: join(projectConfig, "config.toml")
   });
+
+  await writeFile(
+    join(codexHome, "config.toml"),
+    `[projects.${JSON.stringify(workspace)}]\ntrust_level = "untrusted"\n`,
+    { mode: 0o600 }
+  );
+  assert.equal(inspection("work").status, "absent");
 
   await writeFile(join(projectConfig, "config.toml"), "", { mode: 0o600 });
   await writeFile(
@@ -376,7 +388,13 @@ test("Codex config inspection cannot miss a project layer behind custom root mar
   await mkdir(join(project, ".codex"));
   await writeFile(
     join(codexHome, "config.toml"),
-    'project_root_markers = [".custom-root"]\n',
+    [
+      "project_root_markers = [",
+      '  ".custom-root", # valid multiline TOML array',
+      "]",
+      `[projects.${JSON.stringify(project)}]`,
+      'trust_level = "trusted"'
+    ].join("\n"),
     { mode: 0o600 }
   );
   await writeFile(join(project, ".custom-root"), "", { mode: 0o600 });
@@ -447,7 +465,7 @@ test("Codex config inspection includes system and managed defaults and fails clo
   });
 });
 
-test("Codex launch inspection detects notify in every native config layer", async (t) => {
+test("Codex launch inspection ignores project notify and detects owned native layers", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "yui-codex-notify-layers-"));
   const codexHome = join(root, "codex-home");
   const workspace = join(root, "project", "workspace");
@@ -476,7 +494,7 @@ test("Codex launch inspection detects notify in every native config layer", asyn
     managedConfigPath
   });
 
-  for (const path of paths) {
+  for (const path of paths.filter((path) => path !== projectConfigPath)) {
     await clear();
     await writeFile(path, 'notify = ["native-notifier"]\n', { mode: 0o600 });
     assert.deepEqual(inspect(), {
@@ -484,6 +502,15 @@ test("Codex launch inspection detects notify in every native config layer", asyn
       notify: { status: "configured", source: path }
     });
   }
+
+  await clear();
+  await writeFile(
+    userConfigPath,
+    `[projects.${JSON.stringify(workspace)}]\ntrust_level = "trusted"\n`,
+    { mode: 0o600 }
+  );
+  await writeFile(projectConfigPath, 'notify = ["project-notifier"]\n', { mode: 0o600 });
+  assert.equal(inspect().notify.status, "absent");
 
   await clear();
   await writeFile(

@@ -25,6 +25,7 @@ const SHUTDOWN_TIMEOUT_MS = 45_000;
 const POLL_INTERVAL_MS = 50;
 const LIFECYCLE_REQUEST_TIMEOUT_MS = 30_000;
 const ENVIRONMENT_REFRESH_TIMEOUT_MS = 500;
+const CONFIGURATION_REFRESH_TIMEOUT_MS = 500;
 const CONTROLLER_OPERATIONAL_ENVIRONMENT = [
   ...AGENT_OPERATIONAL_ENVIRONMENT_NAMES,
   "YUI_TMUX_BIN"
@@ -205,7 +206,7 @@ export async function refreshRunningFileTaskControllerEnvironment(
   store: Pick<TaskStore, "listConfiguredAgents">,
   source: NodeJS.ProcessEnv = process.env,
   options: FileControllerClientOptions = {}
-): Promise<boolean> {
+): Promise<RunningControllerRefreshResult> {
   const sourceNames = new Set<string>();
   for (const agent of store.listConfiguredAgents()) {
     for (const binding of agent.environment) {
@@ -218,18 +219,54 @@ export async function refreshRunningFileTaskControllerEnvironment(
   try {
     await (options.call ?? callController)(
       home,
-      "runtime.merge-agent-environment",
+      "runtime.replace-agent-environment",
       { sources },
       {
         timeoutMs: options.requestTimeoutMs
           ?? ENVIRONMENT_REFRESH_TIMEOUT_MS
       }
     );
-    return true;
+    return { status: "refreshed" };
   } catch (error) {
-    if (!isUnavailable(error)) options.onError?.(error);
-    return false;
+    return classifyRefreshFailure(error, options);
   }
+}
+
+export type RunningControllerRefreshResult =
+  | Readonly<{ status: "refreshed" | "not-running" }>
+  | Readonly<{ status: "failed"; message: string }>;
+
+/** Reloads durable Controller settings without starting an absent Controller. */
+export async function refreshRunningFileTaskControllerConfiguration(
+  home: string,
+  options: FileControllerClientOptions = {}
+): Promise<RunningControllerRefreshResult> {
+  try {
+    await (options.call ?? callController)(
+      home,
+      "scheduler.configure",
+      {},
+      {
+        timeoutMs: options.requestTimeoutMs
+          ?? CONFIGURATION_REFRESH_TIMEOUT_MS
+      }
+    );
+    return { status: "refreshed" };
+  } catch (error) {
+    return classifyRefreshFailure(error, options);
+  }
+}
+
+function classifyRefreshFailure(
+  error: unknown,
+  options: FileControllerClientOptions
+): RunningControllerRefreshResult {
+  if (isDefinitelyNotRunning(error)) return { status: "not-running" };
+  options.onError?.(error);
+  return {
+    status: "failed",
+    message: error instanceof Error ? error.message : String(error)
+  };
 }
 
 /** Foreground command bridge. It never reads or writes Agent terminal bytes. */
@@ -368,6 +405,13 @@ function isUnavailable(error: unknown): boolean {
   return code === "CONTROLLER_UNAVAILABLE"
     || code === "CONTROLLER_DISCOVERY_INVALID"
     || code === "INVALID_RESPONSE";
+}
+
+function isDefinitelyNotRunning(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === "CONTROLLER_UNAVAILABLE"
+    || code === "CONTROLLER_DISCOVERY_INVALID";
 }
 
 async function readOptionalControllerStatus(

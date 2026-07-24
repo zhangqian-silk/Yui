@@ -35,6 +35,11 @@ export interface RuntimeLaunchPreparationPort {
   ): Promise<RuntimeBinding>;
 }
 
+/** Volatile, non-persisted source values used to resolve configured Agent bindings. */
+export interface AgentEnvironmentRefreshPort {
+  replaceAgentEnvironment(values: Readonly<Record<string, string>>): void;
+}
+
 export interface SessionHostPort {
   start(request: NewSessionLaunchRequest): Promise<RuntimeBinding>;
   resume(request: ResumeSessionLaunchRequest): Promise<RuntimeBinding>;

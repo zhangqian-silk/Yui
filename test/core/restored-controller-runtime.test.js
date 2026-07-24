@@ -2325,13 +2325,17 @@ test("background FileTask controller exposes status, scan and stop on one privat
     inputNotifications: [],
     autoResolvedInputs: []
   });
-  assert.deepEqual(await callController(home, "scheduler.configure", {
-    reconciliationIntervalSeconds: 45
-  }), {
+  assert.deepEqual(await callController(home, "scheduler.configure", {}), {
     configured: true,
-    reconciliationIntervalMs: 45_000
+    reconciliationIntervalMs: 60_000
   });
-  assert.equal(controller.runtime.reconciliationIntervalMs, 45_000);
+  assert.equal(controller.runtime.reconciliationIntervalMs, 60_000);
+  await assert.rejects(
+    callController(home, "scheduler.configure", {
+      reconciliationIntervalSeconds: 45
+    }),
+    /params are invalid/i
+  );
   assert.deepEqual(await callController(home, "controller.stop", {}), { stopped: true });
   await controller.closed;
 });
@@ -2403,6 +2407,17 @@ test("production Controller reads reconciliationIntervalSeconds from Yui config"
   const controller = await startFileTaskControllerRuntime(home, { store });
 
   assert.equal(controller.runtime.reconciliationIntervalMs, 45_000);
+
+  store.saveConfig({ schemaVersion: 1, reconciliationIntervalSeconds: 30 });
+  assert.deepEqual(await callController(home, "scheduler.configure", {}), {
+    configured: true,
+    reconciliationIntervalMs: 30_000
+  });
+  assert.equal(controller.runtime.reconciliationIntervalMs, 30_000);
+
+  store.saveConfig({ schemaVersion: 1, reconciliationIntervalSeconds: 20 });
+  await controller.runtime.pump();
+  assert.equal(controller.runtime.reconciliationIntervalMs, 20_000);
   await controller.close();
 });
 

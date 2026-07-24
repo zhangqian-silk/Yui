@@ -10,6 +10,7 @@ import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import {
+  refreshRunningFileTaskControllerConfiguration,
   refreshRunningFileTaskControllerEnvironment
 } from "../../dist/controller/clientRuntime.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
@@ -60,7 +61,7 @@ function fixture(t) {
   return { home, store, agent, task, role };
 }
 
-test("planner environment refresh is private, additive, and used by background launches", (t) => {
+test("planner environment refresh is private, authoritative, and used by background launches", (t) => {
   const { home, store, agent, task, role } = fixture(t);
   const source = {};
   const planner = new FileRoleLaunchPlanner(home, store, {
@@ -76,10 +77,10 @@ test("planner environment refresh is private, additive, and used by background l
   };
 
   assert.throws(() => planner.plan(input), /required agent environment is missing/i);
-  planner.mergeEnvironment({ YUI_OPENAI_KEY: "secret-one" });
+  planner.replaceAgentEnvironment({ YUI_OPENAI_KEY: "secret-one" });
   assert.equal(planner.plan(input).launch.env.OPENAI_API_KEY, "secret-one");
-  planner.mergeEnvironment({ UNRELATED_VALUE: "ignored-by-agent" });
-  assert.equal(planner.plan(input).launch.env.OPENAI_API_KEY, "secret-one");
+  planner.replaceAgentEnvironment({});
+  assert.throws(() => planner.plan(input), /required agent environment is missing/i);
   assert.deepEqual(source, {});
   assert.equal(process.env.YUI_OPENAI_KEY, undefined);
 });
@@ -104,10 +105,10 @@ test("environment refresh RPC accepts only current source bindings and never per
 
   const secret = "refresh-secret-not-on-disk";
   assert.deepEqual(
-    await dispatch("runtime.merge-agent-environment", {
+    await dispatch("runtime.replace-agent-environment", {
       sources: { YUI_OPENAI_KEY: secret }
     }),
-    { merged: true, count: 1 }
+    { replaced: true, count: 1 }
   );
   assert.equal(planner.plan({
     taskId: task.id,
@@ -118,13 +119,13 @@ test("environment refresh RPC accepts only current source bindings and never per
   }).launch.env.OPENAI_API_KEY, secret);
   assert.equal(readFileSync(join(home, "state.json"), "utf8").includes(secret), false);
 
-  await assert.rejects(dispatch("runtime.merge-agent-environment", {
+  await assert.rejects(dispatch("runtime.replace-agent-environment", {
     sources: {
       YUI_OPENAI_KEY: "must-not-merge",
       OPENAI_API_KEY: "target-only"
     }
   }), /not declared: OPENAI_API_KEY/i);
-  await assert.rejects(dispatch("runtime.merge-agent-environment", {
+  await assert.rejects(dispatch("runtime.replace-agent-environment", {
     sources: { YUI_HOME: "managed" }
   }), /source is invalid: YUI_HOME/i);
   assert.equal(planner.plan({
@@ -150,16 +151,16 @@ test("refresh helper sends present declared sources and never starts an absent C
     {
       call: async (...input) => {
         calls.push(input);
-        return { merged: true, count: 1 };
+        return { replaced: true, count: 1 };
       },
       spawnController: () => {
         throw new Error("must not start Controller");
       }
     }
   );
-  assert.equal(refreshed, true);
+  assert.deepEqual(refreshed, { status: "refreshed" });
   assert.deepEqual(calls[0].slice(1, 3), [
-    "runtime.merge-agent-environment",
+    "runtime.replace-agent-environment",
     { sources: { YUI_OPENAI_KEY: "present" } }
   ]);
 
@@ -177,8 +178,69 @@ test("refresh helper sends present declared sources and never starts an absent C
       spawnController: () => { spawnCount += 1; }
     }
   );
-  assert.equal(unavailable, false);
+  assert.deepEqual(unavailable, { status: "not-running" });
   assert.equal(spawnCount, 0);
+});
+
+test("refresh helpers distinguish a running Controller failure without starting one", async (t) => {
+  const { home, store } = fixture(t);
+  const errors = [];
+  const options = {
+    call: async () => {
+      throw Object.assign(new Error("timed out"), { code: "CONTROLLER_TIMEOUT" });
+    },
+    spawnController: () => {
+      throw new Error("must not start Controller");
+    },
+    onError: (error) => errors.push(error)
+  };
+
+  assert.deepEqual(
+    await refreshRunningFileTaskControllerEnvironment(
+      home,
+      store,
+      { YUI_OPENAI_KEY: "present" },
+      options
+    ),
+    { status: "failed", message: "timed out" }
+  );
+  assert.deepEqual(
+    await refreshRunningFileTaskControllerConfiguration(home, options),
+    { status: "failed", message: "timed out" }
+  );
+  assert.equal(errors.length, 2);
+});
+
+test("a malformed reply is reported as refresh failure, not an absent Controller", async (t) => {
+  const { home, store } = fixture(t);
+  const result = await refreshRunningFileTaskControllerEnvironment(
+    home,
+    store,
+    { YUI_OPENAI_KEY: "present" },
+    {
+      call: async () => {
+        throw Object.assign(new Error("malformed reply"), { code: "INVALID_RESPONSE" });
+      }
+    }
+  );
+  assert.deepEqual(result, { status: "failed", message: "malformed reply" });
+});
+
+test("configuration refresh reads durable state in the Controller and never starts it", async () => {
+  const calls = [];
+  assert.deepEqual(
+    await refreshRunningFileTaskControllerConfiguration("/tmp/yui-test-home", {
+      call: async (...input) => {
+        calls.push(input);
+        return { configured: true, reconciliationIntervalMs: 45_000 };
+      },
+      spawnController: () => {
+        throw new Error("must not start Controller");
+      }
+    }),
+    { status: "refreshed" }
+  );
+  assert.deepEqual(calls[0].slice(1, 3), ["scheduler.configure", {}]);
 });
 
 test("Agent launch targets cannot overwrite Yui runtime control variables", () => {

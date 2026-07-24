@@ -1,6 +1,6 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 
 export type CodexConfigKeyInspection =
   | Readonly<{ status: "absent" }>
@@ -24,12 +24,11 @@ export type CodexConfigInspectionInput = Readonly<{
 }>;
 
 /**
- * Conservatively checks the Codex config layers that can replace Yui's Role
- * context or structured Turn callback. The fail-closed lexer below only
- * determines root assignment boundaries; it does not evaluate TOML values.
- * Comments and quote modes are still lexed explicitly because guessing those
- * boundaries could hide a later managed key. Ambiguous or unterminated input
- * rejects the launch instead of being treated as an absent key.
+ * Checks only effective Codex layers: project files require a trusted project,
+ * use Codex's configured root markers, and cannot own the process-level notify
+ * callback. The fail-closed lexer determines root assignment boundaries and
+ * the narrow project-discovery settings; ambiguous input rejects the launch
+ * instead of being treated as an absent key.
  */
 export function inspectCodexDeveloperInstructions(
   input: CodexConfigInspectionInput
@@ -58,27 +57,53 @@ function inspectCodexConfigKeys(
     input.managedConfigPath ?? "/etc/codex/managed_config.toml",
     "Codex managed config path"
   );
-  const candidates = [...new Set([
+  const userPath = join(home, "config.toml");
+  const profilePath = input.profile === undefined
+    ? undefined
+    : profileConfigPath(home, input.profile);
+  const basePaths = [
     systemPath,
-    join(home, "config.toml"),
-    ...(input.profile === undefined ? [] : [profileConfigPath(home, input.profile)]),
-    ...projectConfigPaths(input.workspace),
+    userPath,
+    ...(profilePath === undefined ? [] : [profilePath]),
     managedPath
-  ])];
+  ];
+  const contentsByPath = new Map<string, string | null>(
+    basePaths.map((path) => [path, readOptionalConfig(path)])
+  );
+  const discovery = effectiveProjectDiscovery(
+    basePaths.flatMap((path) => {
+      const contents = contentsByPath.get(path);
+      if (contents === null || contents === undefined) return [];
+      try {
+        return [inspectProjectDiscovery(contents)];
+      } catch (error) {
+        throw unreliableInspection(path, error);
+      }
+    })
+  );
+  const projectPaths = projectConfigPaths(input.workspace, discovery);
+  const candidates = [
+    ...basePaths.slice(0, -1).map((path) => ({ path, keys })),
+    ...projectPaths.map((path) => ({
+      path,
+      keys: keys.filter((key) => key === "developer_instructions")
+    })),
+    { path: managedPath, keys }
+  ];
 
   let developerInstructions: CodexConfigKeyInspection = { status: "absent" };
   let notify: CodexConfigKeyInspection = { status: "absent" };
-  for (const path of candidates) {
-    const contents = readOptionalConfig(path);
+  for (const candidate of candidates) {
+    const { path } = candidate;
+    const contents = contentsByPath.has(path)
+      ? contentsByPath.get(path)!
+      : readOptionalConfig(path);
     if (contents === null) continue;
     let configured: ReadonlySet<CodexConfigKey>;
     try {
-      configured = inspectConfigContents(contents, keys);
+      configured = inspectConfigContents(contents, candidate.keys);
     } catch (error) {
-      throw new Error(
-        `Codex launch config could not be inspected reliably: ${path}: `
-        + `${error instanceof Error ? error.message : String(error)}`
-      );
+      throw unreliableInspection(path, error);
     }
     if (
       developerInstructions.status === "absent"
@@ -127,20 +152,62 @@ function profileConfigPath(home: string, profile: string): string {
   return join(home, `${name}.config.toml`);
 }
 
-function projectConfigPaths(workspace: string): string[] {
+type ProjectDiscovery = Readonly<{
+  rootMarkers?: readonly string[];
+  trust: ReadonlyMap<string, "trusted" | "untrusted">;
+}>;
+
+function effectiveProjectDiscovery(layers: readonly ProjectDiscovery[]): ProjectDiscovery {
+  let rootMarkers: readonly string[] | undefined;
+  const trust = new Map<string, "trusted" | "untrusted">();
+  for (const layer of layers) {
+    if (layer.rootMarkers !== undefined) rootMarkers = layer.rootMarkers;
+    for (const [path, value] of layer.trust) trust.set(path, value);
+  }
+  return { rootMarkers, trust };
+}
+
+function projectConfigPaths(workspace: string, discovery: ProjectDiscovery): string[] {
   const start = resolve(workspace);
-  const ancestors: string[] = [];
+  if (effectiveProjectTrust(start, discovery.trust) !== "trusted") return [];
+  const markers = discovery.rootMarkers ?? [".git"];
+  let projectRoot = start;
   let current = start;
   while (true) {
-    ancestors.push(current);
+    if (markers.some((marker) => existsSync(join(current, marker)))) {
+      projectRoot = current;
+      break;
+    }
     const parent = dirname(current);
     if (parent === current) break;
     current = parent;
   }
-  // Codex lets user config replace the default `.git` project-root marker.
-  // Scanning all ancestor candidates is deliberately conservative: it cannot
-  // miss a developer_instructions value because Yui guessed a different root.
-  return ancestors.reverse().map((path) => join(path, ".codex", "config.toml"));
+  const paths: string[] = [];
+  current = start;
+  while (true) {
+    paths.push(join(current, ".codex", "config.toml"));
+    if (current === projectRoot) break;
+    current = dirname(current);
+  }
+  return paths.reverse();
+}
+
+function effectiveProjectTrust(
+  workspace: string,
+  configured: ReadonlyMap<string, "trusted" | "untrusted">
+): "trusted" | "untrusted" | undefined {
+  let selected: Readonly<{ path: string; value: "trusted" | "untrusted" }> | undefined;
+  for (const [path, value] of configured) {
+    const candidate = resolve(path);
+    const child = relative(candidate, workspace);
+    if (child === ".." || child.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) {
+      continue;
+    }
+    if (selected === undefined || candidate.length > selected.path.length) {
+      selected = { path: candidate, value };
+    }
+  }
+  return selected?.value;
 }
 
 function readOptionalConfig(path: string): string | null {
@@ -154,6 +221,239 @@ function readOptionalConfig(path: string): string | null {
       `Codex config could not be inspected: ${path}: `
       + `${error instanceof Error ? error.message : String(error)}`
     );
+  }
+}
+
+function unreliableInspection(path: string, error: unknown): Error {
+  return new Error(
+    `Codex launch config could not be inspected reliably: ${path}: `
+    + `${error instanceof Error ? error.message : String(error)}`
+  );
+}
+
+function inspectProjectDiscovery(contents: string): ProjectDiscovery {
+  let tablePath: readonly string[] = [];
+  let rootMarkers: readonly string[] | undefined;
+  const trust = new Map<string, "trusted" | "untrusted">();
+  let pendingValue: ValueLexState | null = null;
+  let pendingRootMarkers:
+    | Readonly<{ contents: string; lineNumber: number }>
+    | null = null;
+  const lines = contents.split(/\r?\n/u);
+  for (let offset = 0; offset < lines.length; offset += 1) {
+    const line = lines[offset]!;
+    const lineNumber = offset + 1;
+    if (pendingValue !== null) {
+      if (pendingRootMarkers !== null) {
+        pendingRootMarkers = {
+          contents: `${pendingRootMarkers.contents}\n${line}`,
+          lineNumber: pendingRootMarkers.lineNumber
+        };
+      }
+      scanValueLine(line, 0, pendingValue, lineNumber);
+      if (pendingValue.multiline === null && pendingValue.containers.length === 0) {
+        if (pendingRootMarkers !== null) {
+          rootMarkers = validateProjectRootMarkers(
+            parseTomlStringArray(
+              collapseTomlArray(pendingRootMarkers.contents),
+              0,
+              pendingRootMarkers.lineNumber
+            ),
+            pendingRootMarkers.lineNumber
+          );
+          pendingRootMarkers = null;
+        }
+        pendingValue = null;
+      }
+      continue;
+    }
+
+    const start = skipHorizontalWhitespace(line, 0);
+    if (start === line.length || line[start] === "#") continue;
+    if (line[start] === "[") {
+      tablePath = parseTableHeader(line, start, lineNumber);
+      continue;
+    }
+
+    const assignment = parseAssignment(line, start, lineNumber);
+    const value: ValueLexState = {
+      containers: [],
+      multiline: null,
+      sawToken: false,
+      lastToken: "start"
+    };
+    scanValueLine(line, assignment.valueStart, value, lineNumber);
+    if (!value.sawToken) {
+      throw ambiguousConfig(lineNumber, "assignment has no value");
+    }
+    const isRootMarkers = tablePath.length === 0
+      && assignment.keys.length === 1
+      && assignment.keys[0] === "project_root_markers";
+    const isTrust = tablePath.length === 2
+      && tablePath[0] === "projects"
+      && assignment.keys.length === 1
+      && assignment.keys[0] === "trust_level";
+    if (
+      isTrust
+      && (value.multiline !== null || value.containers.length > 0)
+    ) {
+      throw ambiguousConfig(
+        lineNumber,
+        "project discovery values must be declared on one line"
+      );
+    }
+    if (isRootMarkers) {
+      if (value.multiline !== null) {
+        throw ambiguousConfig(lineNumber, "project_root_markers cannot be a string");
+      }
+      if (value.containers.length > 0) {
+        pendingRootMarkers = {
+          contents: line.slice(assignment.valueStart),
+          lineNumber
+        };
+      } else {
+        rootMarkers = validateProjectRootMarkers(
+          parseTomlStringArray(line, assignment.valueStart, lineNumber),
+          lineNumber
+        );
+      }
+    }
+    if (isTrust) {
+      const projectPath = tablePath[1]!;
+      if (resolve(projectPath) !== projectPath || projectPath.includes("\0")) {
+        throw ambiguousConfig(lineNumber, "project trust path is not absolute");
+      }
+      const level = parseTomlStringValue(line, assignment.valueStart, lineNumber);
+      if (level === "trusted" || level === "untrusted") {
+        trust.set(projectPath, level);
+      }
+    }
+    if (value.multiline !== null || value.containers.length > 0) {
+      pendingValue = value;
+    }
+  }
+  if (pendingValue?.multiline !== null && pendingValue?.multiline !== undefined) {
+    throw new Error("Codex config contains an unterminated multiline string.");
+  }
+  if (pendingValue !== null) {
+    throw new Error("Codex config is ambiguous: an array or inline table is unterminated.");
+  }
+  return { rootMarkers, trust };
+}
+
+function validateProjectRootMarkers(
+  markers: readonly string[],
+  lineNumber: number
+): readonly string[] {
+  return markers.map((marker) => {
+    if (marker.length === 0 || marker.includes("\0")) {
+      throw ambiguousConfig(lineNumber, "project root marker is invalid");
+    }
+    return marker;
+  });
+}
+
+function collapseTomlArray(contents: string): string {
+  let result = "";
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  let comment = false;
+  for (const character of contents) {
+    if (comment) {
+      if (character === "\n") {
+        comment = false;
+        result += " ";
+      }
+      continue;
+    }
+    if (quote !== null) {
+      result += character;
+      if (quote === '"' && character === "\\" && !escaped) {
+        escaped = true;
+        continue;
+      }
+      if (character === quote && !escaped) quote = null;
+      escaped = false;
+      continue;
+    }
+    if (character === "#") {
+      comment = true;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      result += character;
+      continue;
+    }
+    result += character === "\n" || character === "\r" ? " " : character;
+  }
+  return result;
+}
+
+function parseTomlStringValue(
+  line: string,
+  start: number,
+  lineNumber: number
+): string {
+  const parsed = parseTomlStringAt(line, skipHorizontalWhitespace(line, start), lineNumber);
+  requireValueEnd(line, parsed.end, lineNumber);
+  return parsed.value;
+}
+
+function parseTomlStringArray(
+  line: string,
+  start: number,
+  lineNumber: number
+): readonly string[] {
+  let index = skipHorizontalWhitespace(line, start);
+  if (line[index] !== "[") {
+    throw ambiguousConfig(lineNumber, "project_root_markers is not an array");
+  }
+  index += 1;
+  const values: string[] = [];
+  for (;;) {
+    index = skipHorizontalWhitespace(line, index);
+    if (line[index] === "]") {
+      requireValueEnd(line, index + 1, lineNumber);
+      return values;
+    }
+    const parsed = parseTomlStringAt(line, index, lineNumber);
+    values.push(parsed.value);
+    index = skipHorizontalWhitespace(line, parsed.end);
+    if (line[index] === "]") {
+      requireValueEnd(line, index + 1, lineNumber);
+      return values;
+    }
+    if (line[index] !== ",") {
+      throw ambiguousConfig(lineNumber, "project_root_markers has invalid array syntax");
+    }
+    index += 1;
+  }
+}
+
+function parseTomlStringAt(
+  line: string,
+  start: number,
+  lineNumber: number
+): Readonly<{ value: string; end: number }> {
+  if (line[start] === '"') {
+    const end = scanBasicString(line, start, line.length, lineNumber, "value");
+    return {
+      value: decodeTomlBasicString(line.slice(start + 1, end - 1)),
+      end
+    };
+  }
+  if (line[start] === "'") {
+    const end = scanLiteralString(line, start, line.length, lineNumber, "value");
+    return { value: line.slice(start + 1, end - 1), end };
+  }
+  throw ambiguousConfig(lineNumber, "project discovery value is not a string");
+}
+
+function requireValueEnd(line: string, start: number, lineNumber: number): void {
+  const end = skipHorizontalWhitespace(line, start);
+  if (end !== line.length && line[end] !== "#") {
+    throw ambiguousConfig(lineNumber, "project discovery value has trailing syntax");
   }
 }
 
@@ -255,7 +555,11 @@ function parseAssignment(
   }
 }
 
-function parseTableHeader(line: string, start: number, lineNumber: number): void {
+function parseTableHeader(
+  line: string,
+  start: number,
+  lineNumber: number
+): readonly string[] {
   const arrayHeader = line[start + 1] === "[";
   const contentStart = start + (arrayHeader ? 2 : 1);
   let index = contentStart;
@@ -289,11 +593,12 @@ function parseTableHeader(line: string, start: number, lineNumber: number): void
   if (contentEnd === null) {
     throw ambiguousConfig(lineNumber, "table header is unterminated");
   }
-  parseDottedKey(line, contentStart, contentEnd, lineNumber, "table header");
+  const keys = parseDottedKey(line, contentStart, contentEnd, lineNumber, "table header");
   index = skipHorizontalWhitespace(line, index);
   if (index < line.length && line[index] !== "#") {
     throw ambiguousConfig(lineNumber, "table header has trailing syntax");
   }
+  return keys;
 }
 
 function parseDottedKey(

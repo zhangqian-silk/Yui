@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { RoleAgentSession } from "../executor/agentExecutor.js";
 import {
   runtimeLifecycleTarget,
   type RuntimeLifecycleTarget,
@@ -32,7 +31,7 @@ export type RuntimeLaunchReservationPort = Readonly<{
     agentId: string;
     adapterId: string;
     nativeSessionId: string;
-  }>, assertCurrent: () => void, now?: Date): RoleAgentSession;
+  }>, assertCurrent: () => void, now?: Date): void;
   completeRuntimeLaunchReservation(
     owner: RuntimeRoleOwner,
     launchId: string

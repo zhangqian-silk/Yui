@@ -37,6 +37,8 @@ import {
   TmuxPromptPushAdapter,
   TmuxSessionHost,
   type ActivePromptPushPort,
+  type AgentEnvironmentRefreshPort,
+  type RuntimeLaunchPreparationPort,
   type SessionHostPort
 } from "../runtime/index.js";
 import {
@@ -154,7 +156,18 @@ export async function startFileTaskControllerRuntime(
       lifecycleHost: sessionHost,
       workspacePreparer,
       runtimeEventProcessor: options.runtimeEventProcessor
-        ?? new FileRuntimeEventProcessor(new FileRuntimeEventInbox(home), schedulerStore)
+        ?? new FileRuntimeEventProcessor(new FileRuntimeEventInbox(home), schedulerStore),
+      ...(options.configuration !== undefined
+        ? { configuration: options.configuration }
+        : options.intervalMs === undefined
+        ? {
+            configuration: {
+              reconciliationIntervalMs: () => reconciliationIntervalMilliseconds(
+                store.getConfig().reconciliationIntervalSeconds
+              )
+            }
+          }
+        : {})
     }
   );
   runningRuntime = running.runtime;
@@ -177,8 +190,8 @@ export function createRuntimeLifecycleDispatcher(
   sessionHost: SessionHostPort,
   fallback?: ControllerDispatcher,
   onCleanupRequired?: (target: RuntimeLifecycleTarget) => void,
-  sharedLaunchCoordinator?: RuntimeLaunchCoordinator,
-  environmentMerger?: Pick<FileRoleLaunchPlanner, "mergeEnvironment">
+  sharedLaunchCoordinator?: RuntimeLaunchPreparationPort,
+  environmentRefresher?: AgentEnvironmentRefreshPort
 ): ControllerDispatcher {
   const launchCoordinator = sharedLaunchCoordinator
     ?? new RuntimeLaunchCoordinator(schedulerStore, sessionHost, {
@@ -192,14 +205,14 @@ export function createRuntimeLifecycleDispatcher(
     });
   const lifecycleTails = new Map<string, Promise<void>>();
   return async (method, params) => {
-    if (method === "runtime.merge-agent-environment") {
-      if (environmentMerger === undefined) {
+    if (method === "runtime.replace-agent-environment") {
+      if (environmentRefresher === undefined) {
         throw applicationError("METHOD_NOT_FOUND", "Controller method was not found.");
       }
-      const sources = parseEnvironmentMerge(params);
-      validateEnvironmentMergeSources(store, sources);
-      environmentMerger.mergeEnvironment(sources);
-      return { merged: true, count: Object.keys(sources).length };
+      const sources = parseEnvironmentReplacement(params);
+      validateEnvironmentReplacementSources(store, sources);
+      environmentRefresher.replaceAgentEnvironment(sources);
+      return { replaced: true, count: Object.keys(sources).length };
     }
     if (method !== "runtime.ensure-role-session") {
       if (fallback !== undefined) return fallback(method, params);
@@ -547,7 +560,7 @@ const MANAGED_RUNTIME_ENVIRONMENT = new Set<string>(
   YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES
 );
 
-function parseEnvironmentMerge(
+function parseEnvironmentReplacement(
   params: JsonValue
 ): Readonly<Record<string, string>> {
   if (
@@ -593,7 +606,7 @@ function parseEnvironmentMerge(
   return sources;
 }
 
-function validateEnvironmentMergeSources(
+function validateEnvironmentReplacementSources(
   store: TaskStore,
   sources: Readonly<Record<string, string>>
 ): void {

@@ -35,7 +35,9 @@ import {
   callFileTaskController,
   ensureFileTaskController,
   FileTaskWorkflowRuntime,
+  refreshRunningFileTaskControllerConfiguration,
   refreshRunningFileTaskControllerEnvironment,
+  type RunningControllerRefreshResult,
   restartFileTaskController
 } from "./controller/clientRuntime.js";
 import { FileSchedulerStoreAdapter } from "./controller/fileSchedulerStoreAdapter.js";
@@ -129,12 +131,12 @@ export async function main(): Promise<void> {
       new NodeCommandExecutor(),
       setupIo
     );
-    await refreshRunningFileTaskControllerEnvironment(
+    const refresh = await refreshRunningFileTaskControllerEnvironment(
       home,
       new FileTaskStore(home),
       process.env
     );
-    emit(output);
+    emit(withControllerRefreshWarning(output, refresh, "Agent environment"));
     return;
   }
   if (args[0] === "doctor") {
@@ -201,12 +203,18 @@ export async function main(): Promise<void> {
       agentArgs,
       store as unknown as AgentCommandStore
     );
-    if (agentArgs[0] === "add" || agentArgs[0] === "update") {
-      await refreshRunningFileTaskControllerEnvironment(
+    if (
+      agentArgs[0] === "add"
+      || agentArgs[0] === "update"
+      || agentArgs[0] === "remove"
+    ) {
+      const refresh = await refreshRunningFileTaskControllerEnvironment(
         home,
         store,
         process.env
       );
+      emit(withControllerRefreshWarning(output, refresh, "Agent environment"));
+      return;
     }
     emit(output);
     return;
@@ -218,25 +226,12 @@ export async function main(): Promise<void> {
       configArgs[0] === "set"
       && configArgs[1] === "--reconciliation-interval-seconds"
     ) {
-      const status = await callFileTaskController(
+      const refresh = await refreshRunningFileTaskControllerConfiguration(
         home,
-        "controller.status",
-        {},
         { environment: process.env }
       );
-      if (
-        typeof status === "object"
-        && status !== null
-        && !Array.isArray(status)
-        && (status as Readonly<Record<string, unknown>>).running === true
-      ) {
-        await callFileTaskController(
-          home,
-          "scheduler.configure",
-          { reconciliationIntervalSeconds: Number(configArgs[2]) },
-          { environment: process.env }
-        );
-      }
+      emit(withControllerRefreshWarning(output, refresh, "Controller configuration"));
+      return;
     }
     emit(output);
     return;
@@ -537,6 +532,16 @@ function emit(output: string, literal = false, data?: unknown): void {
         ? { ok: true, output: normalized }
         : { ok: true, data })
     : normalized}\n`);
+}
+
+function withControllerRefreshWarning(
+  output: string,
+  refresh: RunningControllerRefreshResult,
+  label: string
+): string {
+  if (refresh.status !== "failed") return output;
+  return `${output.trimEnd()}\nWarning: ${label} was saved, but the running Controller `
+    + `could not be refreshed (${refresh.message}). Restart the Controller to apply it.\n`;
 }
 
 function readPackageVersion(): string {
