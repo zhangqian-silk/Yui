@@ -33,6 +33,7 @@ test("the source package has one TypeScript-only build and no native runtime dep
   assert.equal("node-gyp" in sourcePackage.devDependencies, false);
   assert.equal("gypfile" in sourcePackage, false);
   assert.equal(sourcePackage.dependencies?.["better-sqlite3"], undefined);
+  assert.equal(sourcePackage.dependencies?.["smol-toml"], "1.7.0");
   assert.equal(sourcePackage.devDependencies["@types/better-sqlite3"], undefined);
   assert.deepEqual(sourcePackage.cpu, ["x64"]);
   assert.deepEqual(sourcePackage.files, [
@@ -96,7 +97,7 @@ test("runtime assembly contains only the built CLI, docs, and three skills", (t)
   assert.deepEqual(runtimePackage.bin, { yui: "./dist/cli.js" });
   assert.deepEqual(runtimePackage.cpu, ["x64"]);
   assert.deepEqual(runtimePackage.files, sourcePackage.files);
-  assert.equal(runtimePackage.dependencies, undefined);
+  assert.deepEqual(runtimePackage.dependencies, { "smol-toml": "1.7.0" });
   assert.equal("scripts" in runtimePackage, false);
   assert.equal("devDependencies" in runtimePackage, false);
 });

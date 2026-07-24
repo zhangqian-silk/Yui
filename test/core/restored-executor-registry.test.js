@@ -5,6 +5,7 @@ import {
   agentComposerReadinessProbe,
   ExecutorRegistry
 } from "../../dist/executor/executorRegistry.js";
+import { TmuxSessionHost } from "../../dist/runtime/index.js";
 
 test("readiness resolver distinguishes Codex node composer and Claude prompt markers", () => {
   const base = {
@@ -22,6 +23,92 @@ test("readiness resolver distinguishes Codex node composer and Claude prompt mar
     currentCommand: "node",
     content: "OpenAI Codex\nmodel: gpt-5 /model to change\n› Find and fix a bug in @filename\n"
   }), true);
+  assert.equal(codex({
+    ...base,
+    currentCommand: "node",
+    content: [
+      "• Working (1m 10s • esc to interrupt)",
+      "",
+      "› Summarize recent commits",
+      "",
+      "gpt-5.6-sol medium · /tmp/workspace"
+    ].join("\n")
+  }), false);
+  assert.equal(codex({
+    ...base,
+    currentCommand: "node",
+    content: [
+      "Would you like to run this command?",
+      "› 1. Yes, proceed",
+      "  2. No",
+      "Press enter to confirm or esc to cancel",
+      "gpt-5.6-sol medium · /tmp/workspace"
+    ].join("\n")
+  }), false);
+  assert.equal(codex({
+    ...base,
+    currentCommand: "node",
+    content: [
+      ...Array.from({ length: 40 }, (_, index) => `completed transcript line ${index}`),
+      "",
+      "› Summarize recent commits",
+      "",
+      "gpt-5.6-sol medium · /tmp/workspace"
+    ].join("\n")
+  }), true);
+  const operatorCodex = agentComposerReadinessProbe("codex", "operator");
+  const idleOperatorContent = [
+    "completed output",
+    "",
+    "› Summarize recent commits",
+    "",
+    "gpt-5.6-sol medium · /tmp/workspace"
+  ].join("\n");
+  assert.equal(operatorCodex({
+    ...base,
+    currentCommand: "node",
+    content: idleOperatorContent,
+    styledContent: [
+      "completed output",
+      "",
+      "\u001b[1m›\u001b[0m \u001b[2mSummarize recent commits\u001b[0m",
+      "",
+      "gpt-5.6-sol medium · /tmp/workspace"
+    ].join("\n")
+  }), true);
+  assert.equal(operatorCodex({
+    ...base,
+    currentCommand: "node",
+    content: idleOperatorContent,
+    styledContent: [
+      "completed output",
+      "",
+      "\u001b[1m›\u001b[0m Summarize recent commits",
+      "",
+      "gpt-5.6-sol medium · /tmp/workspace"
+    ].join("\n")
+  }), false);
+  assert.equal(operatorCodex({
+    ...base,
+    currentCommand: "node",
+    content: idleOperatorContent
+  }), false);
+  assert.equal(operatorCodex({
+    ...base,
+    currentCommand: "node",
+    content: [
+      "completed output",
+      "›",
+      "  unsent multiline draft",
+      "gpt-5.6-sol medium · /tmp/workspace"
+    ].join("\n"),
+    styledContent: [
+      "completed output",
+      "\u001b[1m›\u001b[0m",
+      "  unsent multiline draft",
+      "gpt-5.6-sol medium · /tmp/workspace"
+    ].join("\n")
+  }), false);
   assert.equal(codex({ ...base, currentCommand: "node", content: "starting\n" }), false);
   assert.equal(codex({
     ...base,
@@ -29,7 +116,25 @@ test("readiness resolver distinguishes Codex node composer and Claude prompt mar
     content: "OpenAI Codex\nUpdate available\nPress enter to continue\n› \n/model to change\n"
   }), false);
   assert.equal(claude({ ...base, currentCommand: "claude", content: "hello\n❯ \n" }), true);
+  assert.equal(claude({
+    ...base,
+    currentCommand: "claude",
+    content: "❯ old prompt\nWorking… press ctrl-c to interrupt\n"
+  }), false);
   assert.equal(claude({ ...base, currentCommand: "claude", content: "thinking…\n" }), false);
+  const operatorClaude = agentComposerReadinessProbe("claude", "operator");
+  assert.equal(operatorClaude({
+    ...base,
+    currentCommand: "claude",
+    content: "hello\n❯ \n",
+    styledContent: "hello\n\u001b[1m❯\u001b[0m \n"
+  }), true);
+  assert.equal(operatorClaude({
+    ...base,
+    currentCommand: "claude",
+    content: "hello\n❯ unsent draft\n",
+    styledContent: "hello\n\u001b[1m❯\u001b[0m unsent draft\n"
+  }), false);
 });
 
 test("ExecutorRegistry prepares new/resume sessions and always carries the adapter probe into sendOnce", async () => {
@@ -111,6 +216,175 @@ test("ExecutorRegistry prepares new/resume sessions and always carries the adapt
   ]);
 });
 
+test("production runtime ports launch and attempt delivery without the legacy readiness loop", async () => {
+  const calls = [];
+  const planner = {
+    plan(input) {
+      return {
+        role: { name: input.roleName, workspace: "/tmp/workspace" },
+        launch: { command: "codex", args: [], env: {} },
+        session: null
+      };
+    }
+  };
+  const tmux = {
+    ensureRoleWindow() { throw new Error("legacy launch must not run"); },
+    waitUntilReady() { throw new Error("legacy readiness loop must not run"); },
+    sendRoleInputOnce() { throw new Error("legacy delivery must not run"); },
+    sendRoleInputOnceIfReady() { throw new Error("unused"); },
+    probeRoleStatus() { return "running"; },
+    stopTask() { return false; }
+  };
+  const binding = {
+    id: "binding-1", launchId: "launch-placeholder",
+    owner: { scope: "task", taskId: "task-1", roleName: "leader" },
+    agentId: "codex", adapterId: "codex", hostRef: "opaque"
+  };
+  let pushOutcome = "busy";
+  const registry = new ExecutorRegistry(planner, tmux, undefined, {
+    sessionHost: {
+      async start(request) { calls.push(["start", request]); return { ...binding, launchId: request.launchId }; },
+      async resume() { throw new Error("unused"); },
+      async stop() {},
+      async inspect() { return { state: "running" }; }
+    },
+    promptPush: {
+      async tryPush(request) { calls.push(["push", request]); return pushOutcome; }
+    }
+  });
+
+  const prepared = await registry.prepareRoleSession({
+    taskId: "task-1", roleName: "leader", agentId: "codex", adapterId: "codex",
+    workspace: "/tmp/workspace", mode: "new", runId: "run-1"
+  });
+  const retriedPrepare = await registry.prepareRoleSession({
+    taskId: "task-1", roleName: "leader", agentId: "codex", adapterId: "codex",
+    workspace: "/tmp/workspace", mode: "new", runId: "run-1"
+  });
+  assert.equal(retriedPrepare, prepared);
+  const ready = await registry.waitUntilReady(prepared);
+  assert.equal(await registry.sendOnce({ delivery: ready, receiptId: "agent-run:run-1", text: "lead" }), "busy");
+  pushOutcome = "delivered";
+  assert.equal(await registry.sendOnce({ delivery: ready, receiptId: "agent-run:run-1", text: "lead" }), "sent");
+  assert.deepEqual(calls.map(([kind]) => kind), ["start", "push", "push"]);
+});
+
+test("prepared runtime bindings survive transient unavailability but explicit terminal cleanup starts a new generation", async () => {
+  let generations = 0;
+  const launchCoordinator = {
+    async prepare(request) {
+      generations += 1;
+      return {
+        id: `binding-${generations}`,
+        launchId: `launch-${generations}`,
+        owner: request.owner,
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        hostRef: `host-${generations}`
+      };
+    }
+  };
+  const registry = new ExecutorRegistry(
+    { plan() { throw new Error("legacy planner must not run"); } },
+    {
+      ensureRoleWindow() { throw new Error("legacy launch must not run"); },
+      waitUntilReady() { throw new Error("legacy readiness must not run"); },
+      sendRoleInputOnce() { throw new Error("legacy delivery must not run"); },
+      sendRoleInputOnceIfReady() { throw new Error("unused"); },
+      probeRoleStatus() { return "running"; },
+      stopTask() { return false; }
+    },
+    undefined,
+    {
+      launchCoordinator,
+      sessionHost: {
+        async start() { throw new Error("coordinator must own launch"); },
+        async resume() { throw new Error("coordinator must own launch"); },
+        async stop() {},
+        async inspect() { return { state: "running" }; },
+        async inspectOwner() { return { state: "running" }; },
+        async stopOwner() { return true; }
+      },
+      promptPush: {
+        async tryPush() { return "unavailable"; }
+      }
+    }
+  );
+  const input = {
+    taskId: "task-1",
+    roleName: "worker",
+    agentId: "codex",
+    adapterId: "codex",
+    workspace: "/tmp/workspace",
+    mode: "new",
+    runId: "run-1"
+  };
+
+  const first = await registry.prepareRoleSession(input);
+  const ready = await registry.waitUntilReady(first);
+  assert.equal(await registry.sendOnce({
+    delivery: ready,
+    receiptId: "agent-run:run-1",
+    text: "work"
+  }), "unavailable");
+  assert.equal(await registry.prepareRoleSession(input), first);
+  assert.equal(generations, 1);
+
+  registry.forgetPrepared({
+    taskId: input.taskId,
+    roleName: input.roleName,
+    runId: input.runId,
+    launchId: first.launchId
+  });
+  const replacement = await registry.prepareRoleSession(input);
+
+  assert.equal(replacement.deliveryId, first.deliveryId);
+  assert.equal(replacement.launchId, "launch-2");
+  assert.equal(generations, 2);
+});
+
+test("runtime launch plans Claude once and reports the native session actually hosted", async () => {
+  let plans = 0;
+  const planner = {
+    plan(input) {
+      plans += 1;
+      return {
+        role: { name: input.roleName, workspace: "/tmp/workspace" },
+        launch: { command: "claude", args: [], env: {} },
+        session: {
+          agentId: input.agentId,
+          adapterId: input.adapterId,
+          nativeSessionId: "claude-hosted-1",
+          status: "ready"
+        }
+      };
+    }
+  };
+  const tmux = {
+    ensureRoleWindow() { return true; },
+    probeRoleStatus() { return "running"; },
+    killRole() {},
+    sendRoleInputOnceIfReady() { return "sent"; },
+    waitUntilReady() { throw new Error("legacy readiness loop must not run"); },
+    sendRoleInputOnce() { throw new Error("legacy send must not run"); },
+    stopTask() { return false; }
+  };
+  const host = new TmuxSessionHost(planner, tmux, { createBindingId: () => "binding-1" });
+  const registry = new ExecutorRegistry(planner, tmux, undefined, {
+    sessionHost: host,
+    promptPush: { async tryPush() { return "delivered"; } }
+  });
+
+  const prepared = await registry.prepareRoleSession({
+    taskId: "task-1", roleName: "worker", agentId: "claude", adapterId: "claude",
+    workspace: "/tmp/workspace", mode: "new"
+  });
+  const ready = await registry.waitUntilReady(prepared);
+
+  assert.equal(plans, 1);
+  assert.equal(ready.session.nativeSessionId, "claude-hosted-1");
+});
+
 test("Operator input notification never launches a pane or waits for a busy composer", async () => {
   const calls = [];
   let state = "exited";
@@ -120,9 +394,10 @@ test("Operator input notification never launches a pane or waits for a busy comp
     sendRoleInputOnce() { throw new Error("unused"); },
     sendRoleInputOnceIfReady(taskId, roleName, receiptId, text, probe) {
       calls.push([taskId, roleName, receiptId, text, probe]);
-      return state === "ready" ? "sent" : "not-ready";
+      return state === "exited"
+        ? "unavailable"
+        : state === "ready" ? "sent" : "not-ready";
     },
-    hasDeliveryReceipt() { return false; },
     probeRoleStatus() { return state === "exited" ? "exited" : "running"; },
     stopTask() { return false; }
   });
@@ -134,11 +409,11 @@ test("Operator input notification never launches a pane or waits for a busy comp
   };
 
   assert.equal(await registry.notifyOperatorInputOnce(input), "unavailable");
-  assert.equal(calls.length, 0);
+  assert.equal(calls.length, 1);
   state = "busy";
   assert.equal(await registry.notifyOperatorInputOnce(input), "not-ready");
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2);
   state = "ready";
   assert.equal(await registry.notifyOperatorInputOnce(input), "sent");
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
 });

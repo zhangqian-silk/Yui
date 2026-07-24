@@ -3,10 +3,11 @@ import type {
   CodexRoleAgentConfig,
   RoleAgentConfig
 } from "../executor/agentAdapter.js";
-import type {
-  GlobalRoleSessionSet,
-  RoleSessionSet,
-  TaskRoleSessionSet
+import {
+  validateRoleSessionSet,
+  type GlobalRoleSessionSet,
+  type RoleSessionSet,
+  type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
 
 export type {
@@ -240,6 +241,69 @@ export function switchActiveRoleAgent(
       payload: { fromAgentId, toAgentId: normalizedTarget, mode }
     }
   };
+}
+
+export function unbindRoleAgent(
+  role: Role,
+  sessions: TaskRoleSessionSet | null,
+  agentId: string,
+  now: Date
+): { role: Role; sessions: TaskRoleSessionSet | null };
+export function unbindRoleAgent(
+  role: GlobalRole,
+  sessions: GlobalRoleSessionSet | null,
+  agentId: string,
+  now: Date
+): { role: GlobalRole; sessions: GlobalRoleSessionSet | null };
+export function unbindRoleAgent(
+  role: Role | GlobalRole,
+  sessions: RoleSessionSet | null,
+  agentId: string,
+  now: Date
+): {
+  role: Role | GlobalRole;
+  sessions: RoleSessionSet | null;
+} {
+  validateRoleOwner(role);
+  const normalizedAgentId = requireSafeIdentity(agentId, "Role Agent id");
+  if (normalizedAgentId === role.activeAgentId) {
+    throw new Error(`Cannot unbind active Role Agent: ${normalizedAgentId}.`);
+  }
+  if (!Object.hasOwn(role.agentBindings, normalizedAgentId)) {
+    throw new Error(`Role Agent is not bound: ${normalizedAgentId}.`);
+  }
+
+  let updatedSessions = sessions;
+  if (sessions !== null) {
+    validateRoleSessionSet(sessions);
+    assertSessionOwnerMatchesRole(role, sessions);
+    if (sessions.activeAgentId !== role.activeAgentId) {
+      throw new Error(`Role session active Agent does not match Role: ${role.name}.`);
+    }
+    const targetSession = sessions.sessions[normalizedAgentId];
+    if (targetSession !== undefined && targetSession.status !== "stopped") {
+      throw new Error(
+        `Cannot unbind Role Agent while its native session is ${targetSession.status}: `
+        + `${normalizedAgentId}.`
+      );
+    }
+    if (targetSession !== undefined) {
+      const remainingSessions = { ...sessions.sessions };
+      delete remainingSessions[normalizedAgentId];
+      updatedSessions = validateRoleSessionSet({
+        ...sessions,
+        sessions: remainingSessions,
+        updatedAt: now.toISOString()
+      } as RoleSessionSet);
+    }
+  }
+
+  const remainingBindings = { ...role.agentBindings };
+  delete remainingBindings[normalizedAgentId];
+  const updatedRole = "taskId" in role
+    ? updateRole(role, { agentBindings: remainingBindings }, now)
+    : updateGlobalRole(role, { agentBindings: remainingBindings }, now);
+  return { role: updatedRole, sessions: updatedSessions };
 }
 
 export function validateGlobalRole(role: GlobalRole): GlobalRole {

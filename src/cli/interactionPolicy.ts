@@ -108,13 +108,13 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       ? { confirmation: { action: "Remove Role", targetArgumentIndex: 2 } }
       : {})
   })),
-  {
-    commandPath: ["role", "bind"],
+  ...["bind", "unbind"].map((command): InteractionPolicy => ({
+    commandPath: ["role", command],
     selectors: [
       { argumentIndex: 2, entity: "global-role", provider: "global-roles", actionTarget: true },
       { argumentIndex: 3, entity: "agent", provider: "configured-agents", actionTarget: false }
     ]
-  },
+  })),
   ...["record", "replace"].map((command): InteractionPolicy => ({
     commandPath: ["role", "session", command],
     selectors: [{
@@ -277,8 +277,8 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       ? { confirmation: { action: "Remove Task Role", targetArgumentIndex: 4 } }
       : {})
   })),
-  {
-    commandPath: ["task", "role", "bind"],
+  ...["bind", "unbind"].map((command): InteractionPolicy => ({
+    commandPath: ["task", "role", command],
     selectors: [
       { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
       {
@@ -290,7 +290,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       },
       { argumentIndex: 5, entity: "agent", provider: "configured-agents", actionTarget: false }
     ]
-  },
+  })),
   {
     commandPath: ["task", "role", "enter"],
     selectors: [

@@ -60,5 +60,8 @@
   "devDependencies": {
     "@types/node": "^25.9.3",
     "typescript": "^5.8.0"
+  },
+  "dependencies": {
+    "smol-toml": "1.7.0"
   }
 }

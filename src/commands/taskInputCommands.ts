@@ -1,6 +1,7 @@
 import { dataError, roleNotFound, taskNotFound, usageError } from "../errors/cliError.js";
 import { createTaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
 import {
+  terminalizeTaskRoleRunSession,
   updateRoleAgentSessionStatus,
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
@@ -16,16 +17,21 @@ import {
   type InputRequester
 } from "../input/inputRequest.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
+import { formatTimestamp } from "../output/timePresentation.js";
 import { updateRoleStatus, type Role } from "../role/role.js";
 import { yieldAgentRun, type AgentRun } from "../run/agentRun.js";
-import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
+import { enqueueWork, requireCompleteWorkExecution } from "../coordination/workMailboxQueue.js";
+import type { MailboxTarget } from "../coordination/workMailbox.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
 
 const LEADER_ROLE = "leader";
 
 type TaskInputCommandOptions = Readonly<{
-  runtime?: { notifyStateChanged(taskId: string): void };
+  runtime?: {
+    notifyStateChanged(taskId: string): void;
+    notifyMailboxChanged?(target: MailboxTarget): void;
+  };
   now?: () => Date;
   environment?: NodeJS.ProcessEnv;
 }>;
@@ -112,20 +118,28 @@ function createRequest(
       now
     );
     tx.saveInputRequest(task.id, created);
+    enqueueWork(tx, { kind: "operator" }, "input-requested", now, [
+      { type: "input", id: created.id },
+      { type: "run", id: origin.run.id }
+    ]);
     tx.saveAgentRun(yieldAgentRun(
       origin.run,
       `Waiting for input ${created.id}: ${created.question}`,
       now
     ));
+    requireCompleteWorkExecution(
+      tx,
+      { kind: "role", taskId: task.id, roleName: LEADER_ROLE },
+      { type: "run", id: origin.run.id }
+    );
     tx.clearActiveAgentRun(task.id, LEADER_ROLE);
     tx.saveRole(task.id, updateRoleStatus(origin.role, "idle", now));
-    if (origin.sessions?.sessions[origin.role.activeAgentId]?.status === "running") {
-      tx.saveTaskRoleSessionSet(updateRoleAgentSessionStatus(
-        origin.sessions,
-        origin.role.activeAgentId,
-        "ready",
-        now
-      ));
+    if (origin.sessions !== null) {
+      tx.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(origin.sessions, {
+        agentId: origin.role.activeAgentId,
+        runId: origin.run.id,
+        receiptId: `agent-run:${origin.run.id}`
+      }, now));
     }
     recordTaskEvent(tx, task.id, "input.requested", {
       requestId: created.id,
@@ -134,7 +148,7 @@ function createRequest(
     }, now);
     return created;
   });
-  options.runtime?.notifyStateChanged(request.taskId);
+  notifyMailbox(options, { kind: "operator" }, request.taskId);
   return output(`Created input request ${request.id} for ${request.taskId}\n`, { request });
 }
 
@@ -150,9 +164,10 @@ function listRequests(args: string[], store: TaskStore): TaskInputCommandExecuti
   const requests = parsed.options.has("--all")
     ? all
     : all.filter((request) => request.status === "open");
-  const rendered = requests.length === 0
-    ? "No input requests found.\n"
-    : `${renderTable(
+  let rendered = "No input requests found.\n";
+  if (requests.length > 0) {
+    const timeZone = store.getConfig().timeZone;
+    rendered = `${renderTable(
         taskId === undefined ? "Input inbox" : `Input requests: ${taskId}`,
         [
           { header: "Input", minWidth: 6, maxWidth: 18 },
@@ -168,10 +183,11 @@ function listRequests(args: string[], store: TaskStore): TaskInputCommandExecuti
           request.status,
           request.policy.kind,
           request.question,
-          request.createdAt
+          formatTimestamp(request.createdAt, timeZone)
         ]),
         defaultTableWidth()
       )}\n`;
+  }
   return output(rendered, { requests });
 }
 
@@ -184,7 +200,7 @@ function showRequest(args: string[], store: TaskStore): TaskInputCommandExecutio
     ? store.findInputRequest(parsed.positionals[0])
     : store.getInputRequest(requireTask(store, taskId).id, parsed.positionals[0]);
   if (request === null) throw dataError(`Input request not found: ${parsed.positionals[0]}.`);
-  return output(renderInputRequest(request), { request });
+  return output(renderInputRequest(request, store.getConfig().timeZone), { request });
 }
 
 function answerRequest(
@@ -218,10 +234,16 @@ function answerRequest(
       requestId: answered.id,
       answeredBy: answered.resolution.answeredBy
     }, now);
-    queueLeaderWakeup(tx, task.id, `input-answered:${answered.id}`, now);
+    enqueueWork(
+      tx,
+      { kind: "role", taskId: task.id, roleName: LEADER_ROLE },
+      `input-answered:${answered.id}`,
+      now,
+      [{ type: "input", id: answered.id }]
+    );
     return answered;
   });
-  options.runtime?.notifyStateChanged(request.taskId);
+  notifyMailbox(options, { kind: "role", taskId: request.taskId, roleName: LEADER_ROLE }, request.taskId);
   return output(`Answered input request ${request.id} for ${request.taskId}\n`, { request });
 }
 
@@ -244,9 +266,16 @@ function cancelRequest(
     const cancelled = cancelInputRequest(current, reason, now);
     tx.saveInputRequest(task.id, cancelled);
     recordTaskEvent(tx, task.id, "input.cancelled", { requestId: cancelled.id }, now);
+    enqueueWork(
+      tx,
+      { kind: "role", taskId: task.id, roleName: LEADER_ROLE },
+      `input-cancelled:${cancelled.id}`,
+      now,
+      [{ type: "input", id: cancelled.id }]
+    );
     return cancelled;
   });
-  options.runtime?.notifyStateChanged(request.taskId);
+  notifyMailbox(options, { kind: "role", taskId: request.taskId, roleName: LEADER_ROLE }, request.taskId);
   return output(`Cancelled input request ${request.id} for ${request.taskId}\n`, { request });
 }
 
@@ -269,7 +298,6 @@ function requireLeaderInputOrigin(
     || env.YUI_ROLE !== LEADER_ROLE
     || env.YUI_AGENT_ID !== role.activeAgentId
     || run === null
-    || env.YUI_RUN_ID !== run.id
     || run.status !== "active"
     || run.deliveredAt === undefined
     || run.workItemId !== undefined
@@ -305,7 +333,6 @@ function assertInputCancelOrigin(
     || env.YUI_TASK_ID !== request.taskId
     || env.YUI_ROLE !== request.requester.roleName
     || env.YUI_AGENT_ID !== request.requester.agentId
-    || env.YUI_RUN_ID !== request.requester.runId
     || (request.requester.nativeSessionId !== undefined
       && env.YUI_NATIVE_SESSION_ID !== request.requester.nativeSessionId)
   ) {
@@ -354,7 +381,7 @@ function validateBlockedInputOwnership(
   }
 }
 
-function renderInputRequest(request: InputRequest): string {
+function renderInputRequest(request: InputRequest, timeZone: string | undefined): string {
   return [
     `Input: ${request.id}`,
     `Task: ${request.taskId}`,
@@ -371,22 +398,22 @@ function renderInputRequest(request: InputRequest): string {
       ? ["Policy: user response required"]
       : [
           `Policy: use recommended choice ${request.policy.recommendedChoiceKey} after timeout`,
-          `Timeout: ${request.policy.timeoutAt}`
+          `Timeout: ${formatTimestamp(request.policy.timeoutAt, timeZone)}`
         ]),
     ...(request.status === "answered"
       ? [
           `Answered by: ${request.resolution.answeredBy}`,
           `Answer: ${request.resolution.answer.text}`,
-          `Answered: ${request.resolution.answeredAt}`
+          `Answered: ${formatTimestamp(request.resolution.answeredAt, timeZone)}`
         ]
       : request.status === "cancelled"
         ? [
             `Cancellation: ${request.cancellation.reason}`,
-            `Cancelled: ${request.cancellation.cancelledAt}`
+            `Cancelled: ${formatTimestamp(request.cancellation.cancelledAt, timeZone)}`
           ]
         : []),
-    `Created: ${request.createdAt}`,
-    `Updated: ${request.updatedAt}`
+    `Created: ${formatTimestamp(request.createdAt, timeZone)}`,
+    `Updated: ${formatTimestamp(request.updatedAt, timeZone)}`
   ].join("\n").concat("\n");
 }
 
@@ -554,4 +581,16 @@ function parseMultiValueTail(
     index += 1;
   }
   return { positionals, options, multiOptions };
+}
+
+function notifyMailbox(
+  options: TaskInputCommandOptions,
+  target: MailboxTarget,
+  compatibilityTaskId: string
+): void {
+  if (options.runtime?.notifyMailboxChanged !== undefined) {
+    options.runtime.notifyMailboxChanged(target);
+  } else {
+    options.runtime?.notifyStateChanged(compatibilityTaskId);
+  }
 }

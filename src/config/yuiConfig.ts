@@ -1,10 +1,11 @@
-export const DEFAULT_RECONCILIATION_INTERVAL_SECONDS = 30;
+export const DEFAULT_RECONCILIATION_INTERVAL_SECONDS = 120;
 export const MIN_RECONCILIATION_INTERVAL_SECONDS = 5;
 export const MAX_RECONCILIATION_INTERVAL_SECONDS = 300;
 
 /**
- * Resolves the durable Yui setting used for periodic full reconciliation.
- * Command-triggered scans remain immediate and do not use this interval.
+ * Resolves the durable Yui setting used for low-frequency recovery
+ * reconciliation. Normal durable state changes wake the Controller through
+ * its event queue and do not wait for this interval.
  */
 export function reconciliationIntervalMilliseconds(value?: unknown): number {
   const seconds = value ?? DEFAULT_RECONCILIATION_INTERVAL_SECONDS;

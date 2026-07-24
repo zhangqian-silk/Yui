@@ -1,7 +1,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 import {
   CONTROLLER_DISCOVERY_PATH,
@@ -30,7 +30,21 @@ export type RunningControllerServer = Readonly<{
 
 export async function startControllerServer(
   home: string,
-  dispatcher?: ControllerDispatcher
+  dispatcher?: ControllerDispatcher,
+  beforeDiscoveryRemoval?: () => void | Promise<void>
+): Promise<RunningControllerServer> {
+  const releaseLifecycleLock = await acquireHomeLifecycleLock(home);
+  try {
+    return await startControllerServerLocked(home, dispatcher, beforeDiscoveryRemoval);
+  } finally {
+    await releaseLifecycleLock();
+  }
+}
+
+async function startControllerServerLocked(
+  home: string,
+  dispatcher?: ControllerDispatcher,
+  beforeDiscoveryRemoval?: () => void | Promise<void>
 ): Promise<RunningControllerServer> {
   const discoveryPath = join(home, CONTROLLER_DISCOVERY_PATH);
   const socketPath = join(home, CONTROLLER_SOCKET_PATH);
@@ -60,13 +74,14 @@ export async function startControllerServer(
 
   try {
     await chmod(socketPath, 0o600);
+    const processStartIdentity = await readLinuxProcessStartIdentity(process.pid);
     const discovery: ControllerDiscovery = Object.freeze({
       pid: process.pid,
+      processStartIdentity,
       socketPath,
       token
     });
-    await writeFile(discoveryPath, `${JSON.stringify(discovery)}\n`, { mode: 0o600 });
-    await chmod(discoveryPath, 0o600);
+    await writeDiscoveryAtomically(discoveryPath, discovery);
 
     let resolveClosed: () => void = () => undefined;
     const closed = new Promise<void>((resolve) => {
@@ -76,6 +91,7 @@ export async function startControllerServer(
     closeRunning = (): Promise<void> => {
       if (closePromise !== undefined) return closePromise;
       closePromise = (async () => {
+        await beforeDiscoveryRemoval?.();
         await closeNetServer(netServer);
         await removeOwnedDiscovery(discoveryPath, token);
         resolveClosed();
@@ -86,6 +102,24 @@ export async function startControllerServer(
     return Object.freeze({ discovery, closed, close: closeRunning });
   } catch (error) {
     await closeNetServer(netServer);
+    throw error;
+  }
+}
+
+async function writeDiscoveryAtomically(
+  discoveryPath: string,
+  discovery: ControllerDiscovery
+): Promise<void> {
+  const temporaryPath = `${discoveryPath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  try {
+    await writeFile(temporaryPath, `${JSON.stringify(discovery)}\n`, {
+      mode: 0o600,
+      flag: "wx"
+    });
+    await chmod(temporaryPath, 0o600);
+    await rename(temporaryPath, discoveryPath);
+  } catch (error) {
+    await rm(temporaryPath, { force: true }).catch(() => undefined);
     throw error;
   }
 }
@@ -337,6 +371,129 @@ function safeErrorMessage(message: string): string | undefined {
     .trim()
     .slice(0, 512);
   return safe.length === 0 ? undefined : safe;
+}
+
+type HomeLifecycleLockOwner = Readonly<{
+  pid: number;
+  token: string;
+  createdAt: string;
+}>;
+
+async function acquireHomeLifecycleLock(home: string): Promise<() => Promise<void>> {
+  const lockPath = homeLifecycleLockPath(home);
+  await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
+  const owner: HomeLifecycleLockOwner = Object.freeze({
+    pid: process.pid,
+    token: randomBytes(16).toString("hex"),
+    createdAt: new Date().toISOString()
+  });
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await writeFile(lockPath, `${JSON.stringify(owner)}\n`, {
+        flag: "wx",
+        mode: 0o600
+      });
+      return () => releaseHomeLifecycleLock(lockPath, owner);
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== "EEXIST") throw error;
+    }
+    let existing: HomeLifecycleLockOwner;
+    try {
+      existing = await readHomeLifecycleLockOwner(lockPath);
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") continue;
+      throw error;
+    }
+    const ownerDescription = `owner PID ${existing.pid}, createdAt ${existing.createdAt}`;
+    if (isProcessAlive(existing.pid)) {
+      throw new Error(
+        `Another Yui home lifecycle operation is already running (${ownerDescription}): ${lockPath}`
+      );
+    }
+    throw new Error(
+      `A previous Yui home lifecycle operation left a stale lock `
+        + `(${ownerDescription}): ${lockPath}. `
+        + "If no Controller startup or development reset is running, "
+        + "remove this exact lock file and retry."
+    );
+  }
+  throw new Error(
+    `Cannot safely acquire the Yui home lifecycle lock because its owner changed repeatedly: `
+      + lockPath
+  );
+}
+
+function homeLifecycleLockPath(home: string): string {
+  const resolvedHome = resolve(home);
+  return join(dirname(resolvedHome), `.${basename(resolvedHome)}.controller-lifecycle.lock`);
+}
+
+async function readHomeLifecycleLockOwner(lockPath: string): Promise<HomeLifecycleLockOwner> {
+  try {
+    const value: unknown = JSON.parse(await readFile(lockPath, "utf8"));
+    if (
+      typeof value !== "object" || value === null
+      || !("pid" in value) || !Number.isSafeInteger(value.pid) || (value.pid as number) <= 0
+      || !("token" in value) || typeof value.token !== "string"
+      || value.token.length === 0 || value.token.length > 128
+      || !("createdAt" in value) || typeof value.createdAt !== "string"
+      || Number.isNaN(Date.parse(value.createdAt))
+    ) {
+      throw new Error("invalid owner");
+    }
+    return Object.freeze({
+      pid: value.pid as number,
+      token: value.token,
+      createdAt: value.createdAt
+    });
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") throw error;
+    throw new Error(
+      `Cannot verify the existing Yui home lifecycle lock: ${lockPath}. `
+        + "If no Controller startup or development reset is running, remove this exact lock file and retry."
+    );
+  }
+}
+
+async function releaseHomeLifecycleLock(
+  lockPath: string,
+  owner: HomeLifecycleLockOwner
+): Promise<void> {
+  let current: HomeLifecycleLockOwner;
+  try {
+    current = await readHomeLifecycleLockOwner(lockPath);
+  } catch {
+    return;
+  }
+  if (current.pid === owner.pid && current.token === owner.token) {
+    await rm(lockPath, { force: true });
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !isNodeError(error) || error.code !== "ESRCH";
+  }
+}
+
+async function readLinuxProcessStartIdentity(pid: number): Promise<string> {
+  const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+  const closingParenthesis = stat.lastIndexOf(")");
+  if (closingParenthesis < 0) {
+    throw new Error(`Cannot read Controller process identity for PID ${pid}.`);
+  }
+  const fieldsAfterCommand = stat.slice(closingParenthesis + 1).trim().split(/\s+/u);
+  const processStartIdentity = fieldsAfterCommand[19];
+  if (
+    processStartIdentity === undefined
+    || !/^[0-9]{1,32}$/u.test(processStartIdentity)
+  ) {
+    throw new Error(`Cannot read Controller process identity for PID ${pid}.`);
+  }
+  return processStartIdentity;
 }
 
 function controllerAlreadyRunning(): Error {

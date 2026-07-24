@@ -1,26 +1,37 @@
 import { createAgentRun } from "../run/agentRun.js";
+import { markYuiRunInput } from "../run/runIdentity.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
 import { createLeaderRecoveryNotification } from "./operatorNotification.js";
 import type {
+  PreparedRoleDelivery,
   SchedulerRoleSession,
+  SchedulerReconcileSelection,
   SchedulerStorePort,
   TmuxDeliveryPort
 } from "./ports.js";
 
 export type LeaderWakeupProcessingResult = Readonly<{
   taskId: string;
+  runId?: string;
   status: "dispatched" | "skipped" | "failed";
-  reason?: "busy" | "waiting-input" | "unavailable" | "workspace-not-ready" | "recovery-blocked" | "state-changed";
+  reason?: "busy" | "waiting-input" | "unavailable" | "workspace-not-ready" | "recovery-blocked" | "state-changed" | "not-ready" | "delivery-uncertain";
   error?: string;
 }>;
 
 export async function processLeaderWakeups(
   store: SchedulerStorePort,
   delivery: TmuxDeliveryPort,
-  now: Date
+  now: Date,
+  selection?: SchedulerReconcileSelection
 ): Promise<LeaderWakeupProcessingResult[]> {
   const results: LeaderWakeupProcessingResult[] = [];
-  for (const wakeup of store.listPendingWakeups()) {
+  const wakeups = selection === undefined || selection.full
+    ? store.listPendingWakeups()
+    : [...selection.taskIds].flatMap((taskId) => {
+        const wakeup = store.getPendingWakeup(taskId);
+        return wakeup === null ? [] : [wakeup];
+      });
+  for (const wakeup of wakeups) {
     const task = store.getTask(wakeup.taskId);
     const role = store.getRole(wakeup.taskId, "leader");
     if (task === null || task.status !== "active" || role === null) {
@@ -46,81 +57,171 @@ export async function processLeaderWakeups(
       results.push({ taskId: task.id, status: "skipped", reason: "busy" });
       continue;
     }
+    if (typeof store.hasInFlightTurn === "function"
+      && store.hasInFlightTurn(task.id, role.name)) {
+      results.push({ taskId: task.id, status: "skipped", reason: "busy" });
+      continue;
+    }
 
     const existingSession = store.getRoleSession(task.id, role.name);
     let effectiveSession: SchedulerRoleSession | null = existingSession;
     let claimed = false;
+    let deliveryAttempted = false;
     let run: ReturnType<typeof createAgentRun> | null = null;
+    let prepared: PreparedRoleDelivery | undefined;
     try {
       const mode = hasNativeSession(existingSession) ? "resume" : "new";
-      const input = leaderWakeupInput(
+      const runId = store.nextAgentRunId(task.id);
+      const input = markYuiRunInput(leaderWakeupInput(
         task.id,
+        runId,
         wakeup.reasons,
         store.getTaskBrief(task.id),
         store.listDecisions(task.id),
         store.listMilestones(task.id)
-      );
+      ), runId);
       run = createAgentRun(
-        store.nextAgentRunId(task.id),
+        runId,
         task.id,
         role.name,
         mode,
         input,
         now
       );
-      const prepared = await delivery.prepareRoleSession({
-        taskId: task.id,
-        roleName: role.name,
-        agentId: role.activeAgentId,
-        adapterId: role.adapterId,
-        mode,
-        ...(mode === "resume" ? { nativeSessionId: existingSession!.nativeSessionId } : {})
+      const claim = store.saveLeaderDispatch({
+        task,
+        role,
+        run,
+        session: existingSession,
+        wakeup,
+        now
       });
-      const ready = await delivery.waitUntilReady(prepared);
-      const latestTask = store.getTask(task.id);
-      if (latestTask === null || latestTask.status !== "active") {
-        results.push({ taskId: task.id, status: "skipped", reason: "unavailable" });
-        continue;
-      }
-      effectiveSession = validateReadySession(role.activeAgentId, existingSession, mode, ready.session);
-      const claim = store.saveLeaderDispatch({ task, role, run, session: effectiveSession, wakeup, now });
       if (claim !== "claimed") {
         results.push({ taskId: task.id, status: "skipped", reason: claim });
         continue;
       }
       claimed = true;
-      await delivery.sendOnce({
+      prepared = await delivery.prepareRoleSession({
+        taskId: task.id,
+        roleName: role.name,
+        agentId: role.activeAgentId,
+        adapterId: role.adapterId,
+        workspace: role.workspace,
+        mode,
+        runId: run.id,
+        ...(mode === "resume" ? { nativeSessionId: existingSession!.nativeSessionId } : {})
+      });
+      const ready = await delivery.waitUntilReady(prepared);
+      const latestTask = store.getTask(task.id);
+      if (latestTask === null || latestTask.status !== "active") {
+        delivery.forgetPrepared?.({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          ...(prepared.launchId === undefined
+            ? {}
+            : { launchId: prepared.launchId })
+        });
+        results.push({ taskId: task.id, status: "skipped", reason: "unavailable" });
+        continue;
+      }
+      effectiveSession = validateReadySession(role.activeAgentId, existingSession, mode, ready.session);
+      store.saveRoleRunPrepared({
+        task,
+        role,
+        run,
+        session: effectiveSession,
+        ...(ready.prepared.launchId === undefined
+          ? {}
+          : { launchId: ready.prepared.launchId }),
+        now
+      });
+      deliveryAttempted = true;
+      const outcome = await delivery.sendOnce({
         delivery: ready,
         receiptId: `agent-run:${run.id}`,
         text: input
       });
+      if (outcome === "busy" || outcome === "unavailable") {
+        results.push({
+          taskId: task.id,
+          runId: run.id,
+          status: "skipped",
+          reason: "not-ready"
+        });
+        continue;
+      }
 
-      store.saveRoleRunDelivery({ task, role, run, session: effectiveSession, now });
-      results.push({ taskId: task.id, status: "dispatched" });
+      store.saveRoleRunDelivery({
+        task,
+        role,
+        run,
+        session: effectiveSession,
+        ...(ready.prepared.launchId === undefined
+          ? {}
+          : { launchId: ready.prepared.launchId }),
+        now
+      });
+      results.push({ taskId: task.id, runId: run.id, status: "dispatched" });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       const message = `Leader dispatch failed: ${detail}`;
-      store.saveLeaderDispatchFailure({
-        task,
-        role,
-        session: effectiveSession,
-        failure: recordLeaderFailure(
-          task.id,
-          effectiveSession?.nativeSessionId ?? "(unregistered)",
-          message,
-          now,
-          store.getLeaderFailure(task.id)
-        ),
-        notification: createLeaderRecoveryNotification(
-          task.id,
-          message,
-          now,
-          store.getOperatorNotification(task.id)
-        ),
-        ...(claimed && run !== null ? { claimed: { run, wakeup } } : {}),
-        now
+      if (claimed && run !== null) {
+        // Once delivery begins, a send may have succeeded even when receipt
+        // observation or the aggregate write failed. Preserve the exact
+        // durable Run and let receipt-backed active delivery recover it.
+        if (deliveryAttempted) {
+          results.push({
+            taskId: task.id,
+            runId: run.id,
+            status: "failed",
+            reason: "delivery-uncertain",
+            error: message
+          });
+          continue;
+        }
+        delivery.forgetPrepared?.({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          ...(prepared?.launchId === undefined
+            ? {}
+            : { launchId: prepared.launchId })
+        });
+        const failureResult = store.saveLeaderDispatchFailure({
+          task,
+          role,
+          session: effectiveSession,
+          claimed: { run, wakeup },
+          failure: recordLeaderFailure(
+            task.id,
+            effectiveSession?.nativeSessionId ?? "(unregistered)",
+            message,
+            now,
+            store.getLeaderFailure(task.id)
+          ),
+          notification: createLeaderRecoveryNotification(
+            task.id,
+            message,
+            now,
+            store.getOperatorNotification(task.id)
+          ),
+          now
+        });
+        if (failureResult === "state-changed") {
+          results.push({ taskId: task.id, status: "skipped", reason: "state-changed" });
+        } else {
+          results.push({ taskId: task.id, runId: run.id, status: "failed", error: message });
+        }
+        continue;
+      }
+      results.push({
+        taskId: task.id,
+        runId: run?.id,
+        status: "failed",
+        reason: "not-ready",
+        error: message
       });
-      results.push({ taskId: task.id, status: "failed", error: message });
     }
   }
   return results;
@@ -156,12 +257,15 @@ function hasNativeSession(
 
 function leaderWakeupInput(
   taskId: string,
+  runId: string,
   reasons: readonly string[],
   brief: import("../brief/taskBrief.js").TaskBrief | null,
   decisions: readonly import("../decision/decision.js").Decision[],
   milestones: readonly import("../milestone/milestone.js").Milestone[]
 ): string {
   const lines: string[] = [
+    "Follow the injected yui-leader Skill for this Yui wakeup.",
+    `Current Leader Run: ${runId}.`,
     `Yui wakeup reasons: ${reasons.join(", ")}.`
   ];
   if (brief !== null) {
@@ -196,7 +300,9 @@ function leaderWakeupInput(
     }
   }
   lines.push(
-    `Inspect yui task context ${taskId}, which includes open and recently resolved input requests; then continue Leader stewardship. Use narrower show/list commands only when one record needs closer inspection.`
+    `Inspect yui task context ${taskId}, which includes open and recently resolved input requests; then continue Leader stewardship. Use narrower show/list commands only when one record needs closer inspection.`,
+    `When the requested outcome is finished and there are no active Worker Runs or unresolved inputs, complete the Task with yui task complete ${taskId} --summary "<final outcome and evidence>".`,
+    `Before ending this turn, if the Task was not completed and no InputRequest terminalized this Run, release the active fence with yui task run yield ${runId} --summary "<current result or waiting state>". In particular, yield before waiting for Worker results; do not return to an idle composer while this Run remains active.`
   );
   return lines.join("\n");
 }

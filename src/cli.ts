@@ -16,6 +16,9 @@ import { runCompletionWizard } from "./cli/completionWizard.js";
 import { resolveRoleWizardArguments } from "./cli/roleWizard.js";
 import type { SelectionPorts } from "./cli/selectionPorts.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
+import { formatTimestamp } from "./output/timePresentation.js";
+import type { ConfiguredAgent } from "./agent/agent.js";
+import { nativeAgentEnvironmentNames } from "./agent/launchEnvironment.js";
 import {
   runAgentCommand,
   type AgentCommandStore
@@ -24,6 +27,7 @@ import {
   runGlobalRoleCommand,
   type GlobalRoleCommandOptions
 } from "./commands/globalRoleCommands.js";
+import { runConfigCommand } from "./commands/configCommands.js";
 import { runJobCommand } from "./commands/jobCommands.js";
 import { runOperatorCommand } from "./commands/operatorCommands.js";
 import { runRepositoryCommand } from "./commands/repositoryCommands.js";
@@ -33,6 +37,9 @@ import {
   callFileTaskController,
   ensureFileTaskController,
   FileTaskWorkflowRuntime,
+  refreshRunningFileTaskControllerConfiguration,
+  refreshRunningFileTaskControllerEnvironment,
+  type RunningControllerRefreshResult,
   restartFileTaskController
 } from "./controller/clientRuntime.js";
 import { FileSchedulerStoreAdapter } from "./controller/fileSchedulerStoreAdapter.js";
@@ -121,12 +128,18 @@ export async function main(): Promise<void> {
       forceInteractive: process.env.YUI_SETUP_INTERACTIVE === "1"
     };
     validateSetupInvocation(args.slice(1), setupIo);
-    emit(await runSetupCommand(
+    const output = await runSetupCommand(
       args.slice(1),
       process.env,
       new NodeCommandExecutor(),
       setupIo
-    ));
+    );
+    const refresh = await refreshRunningFileTaskControllerEnvironment(
+      home,
+      new FileTaskStore(home),
+      process.env
+    );
+    emit(withControllerRefreshWarning(output, refresh, "Agent environment"));
     return;
   }
   if (args[0] === "doctor") {
@@ -197,7 +210,55 @@ export async function main(): Promise<void> {
   );
 
   if (resolved[0] === "agent") {
-    emit(runAgentCommand(resolved.slice(1), store as unknown as AgentCommandStore));
+    const agentArgs = resolved.slice(1);
+    const affectedAgentId = agentArgs[1];
+    const previousAgent = typeof affectedAgentId === "string"
+      ? store.getConfiguredAgent(affectedAgentId)
+      : null;
+    const output = runAgentCommand(
+      agentArgs,
+      store as unknown as AgentCommandStore
+    );
+    if (
+      agentArgs[0] === "add"
+      || agentArgs[0] === "update"
+      || agentArgs[0] === "remove"
+    ) {
+      const currentAgent = typeof affectedAgentId === "string"
+        ? store.getConfiguredAgent(affectedAgentId)
+        : null;
+      const scope = agentEnvironmentRefreshScope(
+        previousAgent,
+        currentAgent,
+        store.listConfiguredAgents()
+      );
+      const refresh = await refreshRunningFileTaskControllerEnvironment(
+        home,
+        store,
+        process.env,
+        scope
+      );
+      emit(withControllerRefreshWarning(output, refresh, "Agent environment"));
+      return;
+    }
+    emit(output);
+    return;
+  }
+  if (resolved[0] === "config") {
+    const configArgs = resolved.slice(1);
+    const output = runConfigCommand(configArgs, store);
+    if (
+      configArgs[0] === "set"
+      && configArgs[1] === "--reconciliation-interval-seconds"
+    ) {
+      const refresh = await refreshRunningFileTaskControllerConfiguration(
+        home,
+        { environment: process.env }
+      );
+      emit(withControllerRefreshWarning(output, refresh, "Controller configuration"));
+      return;
+    }
+    emit(output);
     return;
   }
   if (resolved[0] === "repository") {
@@ -219,7 +280,7 @@ export async function main(): Promise<void> {
       return;
     }
     await ensureFileTaskController(home, { environment: process.env });
-    runtime.prepareGlobalRoleEnter(result.role.name);
+    await runtime.prepareGlobalRoleEnter(result.role.name);
     tmux.attachRole("operator", result.role.name);
     return;
   }
@@ -227,7 +288,7 @@ export async function main(): Promise<void> {
     if (resolved[1] === "enter") {
       if (resolved.length !== 2) throw usageError("Operator enter usage: yui operator enter.");
       await ensureFileTaskController(home, { environment: process.env });
-      runtime.prepareGlobalRoleEnter("operator");
+      await runtime.prepareGlobalRoleEnter("operator");
       tmux.attachRole("operator", "operator");
       return;
     }
@@ -248,11 +309,19 @@ export async function main(): Promise<void> {
         await workspacePreparer.prepareTaskWorkspace(task.id);
       }
     }
-    const result = runTaskCommand(resolved.slice(1), store, { runtime, environment: process.env });
+    const result = runTaskCommand(
+      resolved.slice(1),
+      store,
+      { runtime, environment: process.env, yuiHome: home }
+    );
     if (result.kind === "output") {
       emit(result.output, false, result.data);
       return;
     }
+    await runtime.prepareTaskRoleEnter({
+      taskId: result.taskId,
+      roleName: result.roleName
+    });
     if (result.output !== undefined) emit(result.output);
     tmux.attachRole(result.taskId, result.roleName);
     return;
@@ -432,11 +501,32 @@ function selectionCall(
     }
     case "task.run.list": return callOptional(reader, "listAgentRuns", [params.workItemId]);
     case "task.decision.list": return callOptional(reader, "listDecisions", [params.taskId]);
-    case "task.milestone.list": return callOptional(reader, "listMilestones", [params.taskId]);
-    case "task.event.list": return callOptional(reader, "listEvents", [params.taskId]);
+    case "task.milestone.list": return presentSelectionTimes(
+      callOptional(reader, "listMilestones", [params.taskId]),
+      store
+    );
+    case "task.event.list": return presentSelectionTimes(
+      callOptional(reader, "listEvents", [params.taskId]),
+      store
+    );
     case "jobs.list": return callOptional(reader, "listJobs");
     default: return [];
   }
+}
+
+function presentSelectionTimes(value: unknown, store: FileTaskStore): unknown {
+  if (!Array.isArray(value)) return value;
+  const timeZone = store.getConfig().timeZone;
+  return value.map((record) => {
+    if (typeof record !== "object" || record === null || Array.isArray(record)) return record;
+    const candidate = record as Record<string, unknown>;
+    return typeof candidate.createdAt === "string"
+      ? {
+          ...candidate,
+          createdAt: formatTimestamp(candidate.createdAt, timeZone)
+        }
+      : candidate;
+  });
 }
 
 function callOptional(
@@ -467,6 +557,47 @@ function emit(output: string, literal = false, data?: unknown): void {
         ? { ok: true, output: normalized }
         : { ok: true, data })
     : normalized}\n`);
+}
+
+function withControllerRefreshWarning(
+  output: string,
+  refresh: RunningControllerRefreshResult,
+  label: string
+): string {
+  if (refresh.status !== "failed") return output;
+  if (label === "Agent environment") {
+    return `${output.trimEnd()}\nWarning: Agent configuration was saved, but its current `
+      + `environment values were not applied or persisted (${refresh.message}). Retry the `
+      + "Agent command with those variables present, or restart the Controller from an "
+      + "environment that provides them.\n";
+  }
+  return `${output.trimEnd()}\nWarning: ${label} was saved, but the running Controller `
+    + `could not be refreshed (${refresh.message}). Restart the Controller to apply it.\n`;
+}
+
+function agentEnvironmentRefreshScope(
+  previous: ConfiguredAgent | null,
+  current: ConfiguredAgent | null,
+  configured: readonly ConfiguredAgent[]
+): Readonly<{ sourceNames: readonly string[]; nativeNames: readonly string[] }> {
+  const retainedSources = new Set(configured.flatMap((agent) => (
+    agent.environment.map((binding) => binding.sourceName)
+  )));
+  const retainedNative = new Set(configured.flatMap((agent) => (
+    nativeAgentEnvironmentNames(agent.adapterId)
+  )));
+  const currentSources = current?.environment.map((binding) => binding.sourceName) ?? [];
+  const previousOnlySources = previous?.environment
+    .map((binding) => binding.sourceName)
+    .filter((name) => !retainedSources.has(name)) ?? [];
+  const currentNative = current === null ? [] : nativeAgentEnvironmentNames(current.adapterId);
+  const previousOnlyNative = previous === null
+    ? []
+    : nativeAgentEnvironmentNames(previous.adapterId).filter((name) => !retainedNative.has(name));
+  return {
+    sourceNames: [...new Set([...currentSources, ...previousOnlySources])],
+    nativeNames: [...new Set([...currentNative, ...previousOnlyNative])]
+  };
 }
 
 function readPackageVersion(): string {

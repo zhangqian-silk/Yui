@@ -91,7 +91,8 @@ function validateEnvironmentBinding(binding: EnvironmentBinding): EnvironmentBin
     throw new Error("Agent environment binding must be an object.");
   }
   if (binding.source !== "process" || typeof binding.required !== "boolean"
-    || !isEnvironmentName(binding.target) || !isEnvironmentName(binding.sourceName)) {
+    || !isEnvironmentName(binding.target) || !isEnvironmentName(binding.sourceName)
+    || binding.target.startsWith("YUI_")) {
     throw new Error("Agent environment binding is invalid.");
   }
   return {

@@ -38,6 +38,7 @@ export type ControllerResponse = ControllerSuccessResponse | ControllerFailureRe
 
 export type ControllerDiscovery = Readonly<{
   pid: number;
+  processStartIdentity: string;
   socketPath: string;
   token: string;
 }>;
@@ -159,9 +160,11 @@ export function parseControllerDiscovery(
 ): ControllerDiscovery {
   if (
     !isRecord(value)
-    || !hasExactKeys(value, ["pid", "socketPath", "token"])
+    || !hasExactKeys(value, ["pid", "processStartIdentity", "socketPath", "token"])
     || !Number.isSafeInteger(value.pid)
     || (value.pid as number) < 1
+    || typeof value.processStartIdentity !== "string"
+    || !/^[0-9]{1,32}$/u.test(value.processStartIdentity)
     || value.socketPath !== expectedSocketPath
     || typeof value.token !== "string"
     || !/^[a-f0-9]{64}$/u.test(value.token)
@@ -173,6 +176,7 @@ export function parseControllerDiscovery(
   }
   return Object.freeze({
     pid: value.pid as number,
+    processStartIdentity: value.processStartIdentity,
     socketPath: value.socketPath,
     token: value.token
   });

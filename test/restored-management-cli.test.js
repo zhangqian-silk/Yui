@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { listPublicCommandPaths } from "../dist/cli/commandCatalog.js";
@@ -10,6 +13,7 @@ function agentStore(seed = []) {
   const records = new Map(seed.map((agent) => [agent.id, structuredClone(agent)]));
   return {
     records,
+    transaction(execute) { return execute(this); },
     createConfiguredAgentIfAbsent(agent) {
       if (records.has(agent.id)) return null;
       records.set(agent.id, structuredClone(agent));
@@ -26,7 +30,14 @@ function agentStore(seed = []) {
     },
     listConfiguredAgents: () => [...records.values()].map(structuredClone),
     getConfiguredAgent: (id) => records.has(id) ? structuredClone(records.get(id)) : null,
-    removeConfiguredAgent: (id) => records.delete(id)
+    removeConfiguredAgent: (id) => records.delete(id),
+    getConfig: () => ({}),
+    listGlobalRoles: () => [],
+    listGlobalRoleSessionSets: () => [],
+    listTasks: () => [],
+    listRoles: () => [],
+    listRoleSessionSets: () => [],
+    getWorkMailbox: () => null
   };
 }
 
@@ -44,6 +55,7 @@ function roleStore() {
     ...base,
     roles,
     sessions,
+    transaction(execute) { return execute(this); },
     getConfig: () => ({ defaultWorkspace: "/workspace" }),
     createGlobalRoleIfAbsent(role) {
       if (roles.has(role.name)) return null;
@@ -71,7 +83,7 @@ test("public catalog restores only the requested Agent and global Role managemen
   ]);
   assert.deepEqual(paths.filter((path) => path === "role" || path.startsWith("role ")), [
     "role", "role add", "role list", "role show", "role update", "role remove",
-    "role bind", "role enter", "role session", "role session record", "role session replace"
+    "role bind", "role unbind", "role enter", "role session", "role session record", "role session replace"
   ]);
   for (const excluded of ["backup", "maintenance", "migrate", "import", "export", "prune"]) {
     assert.equal(paths.some((path) => path === excluded || path.startsWith(`${excluded} `)), false);
@@ -131,8 +143,10 @@ test("Agent update supports intentional clears and rejects ambiguous replacement
   );
 });
 
-test("global Role enter returns a control result and binding preserves dormant sessions", () => {
+test("global Role enter defers launch compilation to the Controller and preserves dormant sessions", (t) => {
   const store = roleStore();
+  const home = mkdtempSync(join(tmpdir(), "yui-global-enter-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
   assert.match(
     runGlobalRoleCommand(["add", "reviewer", "--agent", "codex"], store),
     /Added role reviewer/
@@ -142,15 +156,22 @@ test("global Role enter returns a control result and binding preserves dormant s
     env: {}
   });
   assert.equal(control.kind, "enter");
-  assert.equal(control.launch.command, "codex");
+  assert.equal("launch" in control, false);
 
   assert.match(runGlobalRoleCommand(["bind", "reviewer", "claude"], store), /Bound role/);
   assert.equal(store.roles.get("reviewer").activeAgentId, "claude");
   assert.equal(store.sessions.get("reviewer").activeAgentId, "claude");
+  const claudeControl = runGlobalRoleCommand(["enter", "reviewer"], store, {
+    yuiHome: home,
+    env: {}
+  });
+  assert.equal(claudeControl.kind, "enter");
+  assert.equal(existsSync(join(home, "runtime")), false);
 
   assert.match(runGlobalRoleCommand([
     "session", "record", "reviewer", "--native-id", "session-1"
   ], store, { env: {} }), /Recorded native session/);
+  store.sessions.get("reviewer").sessions.claude.status = "stopped";
   assert.match(runGlobalRoleCommand([
     "session", "replace", "reviewer", "--native-id", "session-2", "--reason", "rotated"
   ], store, { env: {} }), /Replaced native session/);
@@ -174,10 +195,7 @@ test("global Role Agent settings support adapter-aware field patches and CLI-def
   });
   const launch = runGlobalRoleCommand(["enter", "reviewer"], store, { env: {} });
   assert.equal(launch.kind, "enter");
-  assert.ok(launch.launch.args.includes("gpt-5.6-sol"));
-  assert.ok(launch.launch.args.includes("workspace-write"));
-  assert.ok(launch.launch.args.includes("on-request"));
-  assert.ok(launch.launch.args.includes("--search"));
+  assert.equal("launch" in launch, false);
 
   runGlobalRoleCommand([
     "update", "reviewer", "--agent", "codex",

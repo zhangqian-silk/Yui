@@ -269,10 +269,12 @@ test("Tmux Role inspection reads all panes in one command and never captures pan
   const tmux = new TmuxManager("tmux-test", {
     run(command, args) {
       calls.push({ command, args });
-      assert.equal(args[0], "list-panes");
+      assert.equal(args[0], "-L");
+      assert.match(args[1], /^yui-[a-f0-9]{24}$/);
+      assert.equal(args[2], "list-panes");
       return [
-        "leader\u001f0\u001f111\u001fcodex",
-        "worker\u001f1\u001f222\u001fzsh"
+        "leader\\0370\\037111\\037codex",
+        "worker\\0371\\037222\\037zsh"
       ].join("\n");
     }
   }, { yuiHome: "/tmp/yui-role-status" });

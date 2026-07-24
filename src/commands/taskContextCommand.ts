@@ -1,6 +1,7 @@
 import { taskNotFound, usageError } from "../errors/cliError.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import { taskMessageAuthorLabel } from "../message/message.js";
+import { formatTimestamp } from "../output/timePresentation.js";
 import type { TaskStore } from "../storage/taskStore.js";
 
 const RECENT_RECORD_LIMIT = 5;
@@ -53,6 +54,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     resolvedInputRequests,
     events
   } = data;
+  const timeZone = store.getConfig().timeZone;
   const displayedActiveDecisions = activeDecisions.slice(-RECENT_RECORD_LIMIT);
   const displayedWorkItems = currentAndRecentWorkItems(workItems);
   const displayedOpenInputRequests = openInputRequests.slice(-RECENT_RECORD_LIMIT);
@@ -65,7 +67,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     ...(task.description === undefined ? [] : [`Description: ${compactText(task.description)}`]),
     ...(task.priority === undefined ? [] : [`Priority: ${task.priority}`]),
     ...(task.tags === undefined ? [] : [`Tags: ${task.tags.join(", ")}`]),
-    ...(task.dueAt === undefined ? [] : [`Due: ${task.dueAt}`]),
+    ...(task.dueAt === undefined ? [] : [`Due: ${formatTimestamp(task.dueAt, timeZone)}`]),
     ...(task.completionSummary === undefined ? [] : [`Completion summary: ${task.completionSummary}`]),
     ...(task.archiveSummary === undefined ? [] : [`Archive summary: ${task.archiveSummary}`]),
     ...(task.repositoryId === undefined ? [] : [`Repository: ${task.repositoryId}`]),
@@ -83,7 +85,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
             : brief.boundaries.map((boundary) => `    - ${compactText(boundary)}`)),
           `  Current focus: ${compactText(brief.currentFocus)}`,
           `  Leader summary: ${compactText(brief.leaderSummary)}`,
-          `  Updated by ${brief.updatedBy} at ${brief.updatedAt}`
+          `  Updated by ${brief.updatedBy} at ${formatTimestamp(brief.updatedAt, timeZone)}`
         ]),
     "",
     `Active decisions (${displayedActiveDecisions.length}${activeDecisions.length > displayedActiveDecisions.length ? ` of ${activeDecisions.length}` : ""}):`,
@@ -98,7 +100,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       "milestones",
       milestones,
       (milestone) => [
-        `  ${milestone.id}: ${compactText(milestone.title)} (${milestone.createdAt})`,
+        `  ${milestone.id}: ${compactText(milestone.title)} (${formatTimestamp(milestone.createdAt, timeZone)})`,
         `    ${compactText(milestone.summary)}`
       ]
     ),
@@ -137,7 +139,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       "messages",
       messages,
       (message) => [
-        `  ${message.id} [${taskMessageAuthorLabel(message.author)}] ${message.createdAt}`,
+        `  ${message.id} [${taskMessageAuthorLabel(message.author)}] ${formatTimestamp(message.createdAt, timeZone)}`,
         `    ${compactText(message.body)}`
       ]
     ),
@@ -145,18 +147,18 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     `Open input requests (${displayedOpenInputRequests.length}${openInputRequests.length > displayedOpenInputRequests.length ? ` of ${openInputRequests.length}` : ""}):`,
     ...(displayedOpenInputRequests.length === 0
       ? ["  None."]
-      : displayedOpenInputRequests.flatMap(renderOpenInputRequest)),
+      : displayedOpenInputRequests.flatMap((request) => renderOpenInputRequest(request, timeZone))),
     "",
     `Recent resolved input requests (${displayedResolvedInputRequests.length}${resolvedInputRequests.length > displayedResolvedInputRequests.length ? ` of ${resolvedInputRequests.length}` : ""}):`,
     ...(displayedResolvedInputRequests.length === 0
       ? ["  None."]
-      : displayedResolvedInputRequests.flatMap(renderResolvedInputRequest)),
+      : displayedResolvedInputRequests.flatMap((request) => renderResolvedInputRequest(request, timeZone))),
     "",
     ...recentSection(
       "events",
       events,
       (event) => [
-        `  ${event.id} ${event.type} (${event.createdAt})`,
+        `  ${event.id} ${event.type} (${formatTimestamp(event.createdAt, timeZone)})`,
         ...(Object.keys(event.payload).length === 0
           ? []
           : [`    ${Object.entries(event.payload)
@@ -173,7 +175,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
   };
 }
 
-function renderResolvedInputRequest(request: InputRequest): string[] {
+function renderResolvedInputRequest(request: InputRequest, timeZone: string | undefined): string[] {
   if (request.status === "open") return [];
   return [
     `  ${request.id} [${request.status}]`,
@@ -181,16 +183,16 @@ function renderResolvedInputRequest(request: InputRequest): string[] {
     ...(request.status === "answered"
       ? [
           `    Answer: ${compactText(request.resolution.answer.text)}`,
-          `    Answered by ${request.resolution.answeredBy} at ${request.resolution.answeredAt}`
+          `    Answered by ${request.resolution.answeredBy} at ${formatTimestamp(request.resolution.answeredAt, timeZone)}`
         ]
       : [
           `    Cancelled: ${compactText(request.cancellation.reason)}`,
-          `    Cancelled at: ${request.cancellation.cancelledAt}`
+          `    Cancelled at: ${formatTimestamp(request.cancellation.cancelledAt, timeZone)}`
         ])
   ];
 }
 
-function renderOpenInputRequest(request: InputRequest): string[] {
+function renderOpenInputRequest(request: InputRequest, timeZone: string | undefined): string[] {
   const choices = request.choices.slice(0, RELATED_RECORD_LIMIT);
   const blockedRefs = request.blockedRefs.slice(0, RELATED_RECORD_LIMIT);
   const recommendedChoiceKey = request.policy.kind === "recommended"
@@ -211,7 +213,7 @@ function renderOpenInputRequest(request: InputRequest): string[] {
     ...(request.policy.kind === "recommended"
       ? [
           `    Recommended choice: ${request.policy.recommendedChoiceKey}: ${compactText(recommendedChoice?.label ?? request.policy.recommendedChoiceKey)}`,
-          `    Timeout at: ${request.policy.timeoutAt}`
+          `    Timeout at: ${formatTimestamp(request.policy.timeoutAt, timeZone)}`
         ]
       : []),
     ...(request.blockedRefs.length === 0

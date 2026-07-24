@@ -26,6 +26,7 @@ import {
 } from "./completionState.js";
 
 export type CompletionStore = Readonly<{
+  transaction<T>(execute: (store: CompletionStore) => T): T;
   getConfig(): CompletionConfig;
   saveConfig(config: CompletionConfig): void;
 }>;
@@ -40,13 +41,15 @@ export function installCompletion(
 ): void {
   validateInstallation(installation);
   writeManagedScript(shell, installation.scriptPath, identity);
-  const config = store.getConfig();
-  store.saveConfig({
-    ...config,
-    completionInstallations: {
-      ...config.completionInstallations,
-      [shell]: installation
-    }
+  store.transaction((tx) => {
+    const config = tx.getConfig();
+    tx.saveConfig({
+      ...config,
+      completionInstallations: {
+        ...config.completionInstallations,
+        [shell]: installation
+      }
+    });
   });
   if (!activationIsAutomatic(shell, installation, env, identity) && activate) {
     writeActivationBlock(shell, installation, identity);
@@ -58,21 +61,23 @@ export function uninstallCompletion(
   shell: CompletionShell,
   identity: CliIdentity
 ): void {
-  const config = store.getConfig();
-  const installation = config.completionInstallations?.[shell];
-  if (installation === undefined) return;
+  store.transaction((tx) => {
+    const config = tx.getConfig();
+    const installation = config.completionInstallations?.[shell];
+    if (installation === undefined) return;
 
-  assertManagedScriptRemovable(shell, installation.scriptPath, identity);
-  assertActivationRemovable(shell, installation, identity);
-  removeManagedScript(shell, installation.scriptPath, identity);
-  removeActivationBlock(shell, installation, identity);
-  const installations = { ...config.completionInstallations };
-  delete installations[shell];
-  store.saveConfig({
-    ...config,
-    completionInstallations: Object.keys(installations).length === 0
-      ? undefined
-      : installations
+    assertManagedScriptRemovable(shell, installation.scriptPath, identity);
+    assertActivationRemovable(shell, installation, identity);
+    removeManagedScript(shell, installation.scriptPath, identity);
+    removeActivationBlock(shell, installation, identity);
+    const installations = { ...config.completionInstallations };
+    delete installations[shell];
+    if (Object.keys(installations).length > 0) {
+      tx.saveConfig({ ...config, completionInstallations: installations });
+      return;
+    }
+    const { completionInstallations: _removed, ...withoutInstallations } = config;
+    tx.saveConfig(withoutInstallations);
   });
 }
 

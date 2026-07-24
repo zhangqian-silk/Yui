@@ -24,7 +24,7 @@ function temporaryHome() {
 test("storage schema initializes v5 and rejects every non-current version", () => {
   const home = temporaryHome();
   assert.equal(CURRENT_STORAGE_SCHEMA_VERSION, 5);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 1);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 3);
   assert.deepEqual(STORAGE_MIGRATIONS, []);
   assert.equal(inspectStorageSchema(home).status, "uninitialized");
 
@@ -92,17 +92,18 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     status: "idle"
   };
   const globalSessions = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     owner: { scope: "global", roleName: "operator" },
     activeAgentId: "codex",
     sessions: {
       codex: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         agentId: "codex",
         adapterId: "codex",
         nativeSessionId: "global-session",
         policy: "fixed",
         status: "ready",
+        recentCompletedTurnIds: [],
         createdAt: timestamp,
         updatedAt: timestamp
       }
@@ -112,6 +113,8 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   const taskSessions = {
     ...globalSessions,
     owner: { scope: "task", taskId: task.id, roleName: "leader" },
+    inFlight: null,
+    pendingTurnCompletion: null,
     sessions: {
       codex: { ...globalSessions.sessions.codex, nativeSessionId: "task-session" }
     }
@@ -178,8 +181,8 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   });
 
   const onDisk = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
-  assert.equal(onDisk.schemaVersion, 1);
-  assert.equal(onDisk.tasks[task.id].schemaVersion, 1);
+  assert.equal(onDisk.schemaVersion, 3);
+  assert.equal(onDisk.tasks[task.id].schemaVersion, 3);
   assert.equal(onDisk.revision, 1);
   assert.deepEqual(store.getConfiguredAgent("codex"), agent);
   assert.deepEqual(store.getGlobalRole("operator"), globalRole);
@@ -212,22 +215,183 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   assert.equal(store.getGlobalRoleSessionSet("operator").activeAgentId, "claude");
 
   const incompatible = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
-  incompatible.tasks[task.id].schemaVersion = 2;
+  incompatible.tasks[task.id].schemaVersion = 1;
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify(incompatible));
   assert.throws(
     () => new FileTaskStore(home).listTasks(),
-    /Task aggregate task-1 must use schemaVersion 1/
+    /Task aggregate task-1 must use schemaVersion 3/
   );
 });
 
-test("FileTaskStore keeps legacy config valid and enforces reconciliation interval bounds", () => {
+test("FileTaskStore persists strict task, role, and operator WorkMailboxes", () => {
+  const home = temporaryHome();
+  ensureStorageSchema(home);
+  const store = new FileTaskStore(home);
+  const timestamp = "2026-07-22T00:00:00.000Z";
+  const task = {
+    schemaVersion: 1,
+    id: "task-1",
+    title: "Mailbox storage",
+    status: "draft",
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+  const role = {
+    schemaVersion: 2,
+    name: "leader",
+    taskId: task.id,
+    status: "idle",
+    activeAgentId: "codex",
+    agentBindings: {
+      codex: { agentId: "codex", adapterId: "codex", config: { adapterId: "codex" } }
+    },
+    workspace: home,
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+  store.saveTask(task);
+  store.saveRole(task.id, role);
+
+  const mailboxes = [
+    {
+      schemaVersion: 1,
+      target: { kind: "task", taskId: task.id },
+      nextSequence: 2,
+      processing: null,
+      pending: {
+        fromSequence: 1,
+        toSequence: 1,
+        reasons: ["activated"],
+        refs: [{ type: "task", id: task.id }],
+        requestCount: 1,
+        firstQueuedAt: timestamp,
+        lastQueuedAt: timestamp
+      }
+    },
+    {
+      schemaVersion: 1,
+      target: { kind: "role", taskId: task.id, roleName: role.name },
+      nextSequence: 1,
+      processing: null,
+      pending: null
+    },
+    {
+      schemaVersion: 1,
+      target: { kind: "operator" },
+      nextSequence: 1,
+      processing: null,
+      pending: null
+    }
+  ];
+  store.transaction((tx) => mailboxes.forEach((mailbox) => tx.saveWorkMailbox(mailbox)));
+
+  assert.deepEqual(store.listWorkMailboxes(), [mailboxes[2], mailboxes[1], mailboxes[0]]);
+  assert.deepEqual(store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: role.name }), mailboxes[1]);
+  const state = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
+  assert.deepEqual(Object.keys(state.mailboxes), [
+    "task/task-1",
+    "role/task-1/leader",
+    "operator"
+  ]);
+  assert.equal(Object.hasOwn(state.tasks[task.id], "pendingWakeup"), false);
+
+  const processingMailbox = {
+    schemaVersion: 1,
+    target: { kind: "role", taskId: task.id, roleName: role.name },
+    nextSequence: 2,
+    processing: {
+      batchId: "batch-1",
+      batch: {
+        fromSequence: 1,
+        toSequence: 1,
+        reasons: ["initial"],
+        refs: [{ type: "task", id: task.id }],
+        requestCount: 1,
+        firstQueuedAt: timestamp,
+        lastQueuedAt: timestamp
+      },
+      owner: "controller-1",
+      startedAt: timestamp
+    },
+    pending: null
+  };
+  store.saveWorkMailbox(processingMailbox);
+  store.savePendingWakeup({
+    schemaVersion: 1,
+    taskId: task.id,
+    reasons: ["user-message"],
+    requestCount: 1,
+    firstRequestedAt: timestamp,
+    lastRequestedAt: timestamp
+  });
+  const signalledWhileProcessing = store.getWorkMailbox(processingMailbox.target);
+  assert.deepEqual(signalledWhileProcessing.processing, processingMailbox.processing);
+  assert.deepEqual(signalledWhileProcessing.pending, {
+    fromSequence: 2,
+    toSequence: 2,
+    reasons: ["user-message"],
+    refs: [],
+    requestCount: 1,
+    firstQueuedAt: timestamp,
+    lastQueuedAt: timestamp
+  });
+  assert.equal(signalledWhileProcessing.nextSequence, 3);
+
+  assert.equal(store.removeWorkMailbox({ kind: "operator" }), true);
+  assert.equal(store.removeWorkMailbox({ kind: "operator" }), false);
+});
+
+test("FileTaskStore rejects mailbox identity and dangling cross-references", () => {
+  const home = temporaryHome();
+  ensureStorageSchema(home);
+  const store = new FileTaskStore(home);
+  const timestamp = "2026-07-22T00:00:00.000Z";
+  store.saveTask({
+    schemaVersion: 1,
+    id: "task-1",
+    title: "Mailbox validation",
+    status: "draft",
+    createdAt: timestamp,
+    updatedAt: timestamp
+  });
+  const statePath = join(home, STORAGE_STATE_FILE);
+  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  state.mailboxes["task/wrong-key"] = {
+    schemaVersion: 1,
+    target: { kind: "task", taskId: "task-1" },
+    nextSequence: 2,
+    processing: null,
+    pending: {
+      fromSequence: 1,
+      toSequence: 1,
+      reasons: ["changed"],
+      refs: [{ type: "run", id: "missing-run" }],
+      requestCount: 1,
+      firstQueuedAt: timestamp,
+      lastQueuedAt: timestamp
+    }
+  };
+  writeFileSync(statePath, JSON.stringify(state));
+  assert.throws(() => new FileTaskStore(home).listTasks(), /mailbox identity.*wrong-key/i);
+
+  state.mailboxes = { "task/task-1": state.mailboxes["task/wrong-key"] };
+  writeFileSync(statePath, JSON.stringify(state));
+  assert.throws(() => new FileTaskStore(home).listTasks(), /mailbox reference.*missing-run/i);
+});
+
+test("FileTaskStore keeps legacy config valid and validates recovery and timezone settings", () => {
   const home = temporaryHome();
   ensureStorageSchema(home);
   const store = new FileTaskStore(home);
 
   assert.deepEqual(store.getConfig(), { schemaVersion: 1 });
-  store.saveConfig({ schemaVersion: 1, reconciliationIntervalSeconds: 30 });
+  store.saveConfig({
+    schemaVersion: 1,
+    reconciliationIntervalSeconds: 30,
+    timeZone: "Asia/Shanghai"
+  });
   assert.equal(new FileTaskStore(home).getConfig().reconciliationIntervalSeconds, 30);
+  assert.equal(new FileTaskStore(home).getConfig().timeZone, "Asia/Shanghai");
 
   for (const reconciliationIntervalSeconds of [4, 301, 30.5]) {
     assert.throws(
@@ -235,6 +399,10 @@ test("FileTaskStore keeps legacy config valid and enforces reconciliation interv
       /reconciliationIntervalSeconds must be an integer from 5 to 300/
     );
   }
+  assert.throws(
+    () => store.saveConfig({ schemaVersion: 1, timeZone: "not/a-zone" }),
+    /timeZone must be a valid IANA timezone/
+  );
 });
 
 test("record versions and aggregate shape are validated without silently repairing data", () => {

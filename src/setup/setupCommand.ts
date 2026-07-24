@@ -14,12 +14,15 @@ import type { CompletionStore } from "../completion/completionInstaller.js";
 import { runCompletionWizard } from "../completion/completionWizard.js";
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
+import { resolveTimeZone } from "../output/timePresentation.js";
 import {
   createGlobalRole,
   createRoleAgentBinding,
   type GlobalRole
 } from "../role/role.js";
 import { SYSTEM_LEADER_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
+import type { MailboxTarget, WorkMailbox } from "../coordination/workMailbox.js";
+import { assertRoleRuntimeMutationAllowed } from "../commands/roleRuntimeGuard.js";
 import {
   ensureYuiHome,
   FileTaskStore,
@@ -39,12 +42,14 @@ export type SetupIo = Readonly<{
 type InteractiveSetupIo = SetupIo & Required<Pick<SetupIo, "input" | "output">>;
 type SetupQuestion = (prompt: string) => Promise<string>;
 
-type SetupStore = CompletionStore & Readonly<{
+type SetupStore = Omit<CompletionStore, "transaction"> & Readonly<{
+  transaction<T>(execute: (store: SetupStore) => T): T;
   listConfiguredAgents(): ConfiguredAgent[];
   getConfiguredAgent(id: string): ConfiguredAgent | null;
   saveConfiguredAgent(agent: ConfiguredAgent): void;
   getGlobalRole(name: string): GlobalRole | null;
   saveGlobalRole(role: GlobalRole): void;
+  getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
 }>;
 
 type SetupAgentChoice = Readonly<{
@@ -103,7 +108,8 @@ export async function runSetupCommand(
       `Agents configured: ${result.agentIds.join(", ")}.`,
       `Default Agent: ${result.defaultAgentId}.`,
       `Operator Agent: ${result.operatorAgentId}.`,
-      `Operator workspace: ${result.workspace}.`
+      `Operator workspace: ${result.workspace}.`,
+      `Time zone: ${resolveTimeZone(new FileTaskStore(home).getConfig().timeZone)}.`
     ];
     if (dependency === undefined || dependency === "tmux") {
       lines.push(...await setupTmux(env, executor, question));
@@ -206,16 +212,34 @@ async function configureYui(
   if (defaultAgent === undefined || operatorAgent === undefined) {
     throw usageError("Selected setup Agent is no longer available.");
   }
-  assertSystemRoleCompatible(store, SYSTEM_OPERATOR_ROLE, operatorAgent, workspace);
-  assertSystemRoleCompatible(store, SYSTEM_LEADER_ROLE, defaultAgent, workspace);
   mkdirSync(workspace, { recursive: true, mode: 0o700 });
-  store.saveConfig({
-    ...store.getConfig(),
-    defaultAgent: defaultAgentId,
-    defaultWorkspace: workspace
+  store.transaction((tx) => {
+    const latestDefaultAgent = requireSetupAgent(tx, defaultAgentId);
+    const latestOperatorAgent = requireSetupAgent(tx, operatorAgentId);
+    const operatorRole = prepareSystemRole(
+      tx,
+      SYSTEM_OPERATOR_ROLE,
+      latestOperatorAgent,
+      workspace,
+      now
+    );
+    const leaderRole = prepareSystemRole(
+      tx,
+      SYSTEM_LEADER_ROLE,
+      latestDefaultAgent,
+      workspace,
+      now
+    );
+    const latest = tx.getConfig();
+    tx.saveConfig({
+      ...latest,
+      defaultAgent: defaultAgentId,
+      defaultWorkspace: workspace,
+      timeZone: resolveTimeZone(latest.timeZone)
+    });
+    if (operatorRole !== null) tx.saveGlobalRole(operatorRole);
+    if (leaderRole !== null) tx.saveGlobalRole(leaderRole);
   });
-  ensureSystemRole(store, SYSTEM_OPERATOR_ROLE, operatorAgent, workspace, now);
-  ensureSystemRole(store, SYSTEM_LEADER_ROLE, defaultAgent, workspace, now);
 
   return {
     agentIds: persisted.map(({ id }) => id),
@@ -267,37 +291,41 @@ function persistAgent(
   return agent;
 }
 
-function ensureSystemRole(
+function requireSetupAgent(
+  store: SetupStore,
+  agentId: string
+): ConfiguredAgent {
+  const agent = store.getConfiguredAgent(agentId);
+  if (agent === null) throw usageError(`Configured Agent not found: ${agentId}.`);
+  return agent;
+}
+
+function prepareSystemRole(
   store: SetupStore,
   name: string,
   agent: ConfiguredAgent,
   workspace: string,
   now: Date
-): void {
-  const definition = configuredAgentToDefinition(agent);
+): GlobalRole | null {
   const existing = store.getGlobalRole(name);
-  if (existing !== null) return;
-  store.saveGlobalRole(createGlobalRole(
+  if (existing !== null) {
+    if (existing.activeAgentId === agent.id && existing.workspace === workspace) return null;
+    throw usageError(
+      `Global Role ${name} is already configured with Agent ${existing.activeAgentId} `
+        + `and workspace ${existing.workspace}. Stop its Session and use role update before changing it.`
+    );
+  }
+  assertRoleRuntimeMutationAllowed(store, {
+    scope: "global",
+    roleName: name
+  }, "creation");
+  const definition = configuredAgentToDefinition(agent);
+  return createGlobalRole(
     name,
     [createRoleAgentBinding(definition)],
     definition.id,
     workspace,
     now
-  ));
-}
-
-function assertSystemRoleCompatible(
-  store: SetupStore,
-  name: string,
-  agent: ConfiguredAgent,
-  workspace: string
-): void {
-  const existing = store.getGlobalRole(name);
-  if (existing === null) return;
-  if (existing.activeAgentId === agent.id && existing.workspace === workspace) return;
-  throw usageError(
-    `Global Role ${name} is already configured with Agent ${existing.activeAgentId} `
-      + `and workspace ${existing.workspace}. Stop its Session and use role update before changing it.`
   );
 }
 

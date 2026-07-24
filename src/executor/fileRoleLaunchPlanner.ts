@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -6,14 +6,26 @@ import {
   configuredAgentToDefinition,
   resolveAgentEnvironment
 } from "../agent/agent.js";
+import {
+  NATIVE_AGENT_ENVIRONMENT_NAMES,
+  nativeAgentEnvironmentNames,
+  operationalAgentEnvironment,
+  selectEnvironment
+} from "../agent/launchEnvironment.js";
 import { activeRoleAgentBinding, type GlobalRole, type TaskRole } from "../role/role.js";
 import type {
   RoleSessionLaunchMode,
   SchedulerRoleSession
 } from "../scheduler/ports.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import { compileRoleSessionContext } from "../context/roleSessionContext.js";
 import { resolveAgentAdapter } from "./agentAdapter.js";
+import { inspectCodexLaunchConfig } from "./codexConfigConflict.js";
 import type { PlannedRoleSession, RoleLaunchPlanner } from "./executorRegistry.js";
+import type {
+  AgentEnvironmentRefresh,
+  AgentEnvironmentRefreshPort
+} from "../runtime/ports.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
@@ -27,11 +39,20 @@ export type GlobalRoleLaunchPlanInput = Readonly<{
   adapterId: string;
   mode: RoleSessionLaunchMode;
   nativeSessionId?: string;
+  launchId?: string;
+  environment?: Readonly<Record<string, string>>;
+}>;
+
+type TaskRoleLaunchPlanInput = Parameters<RoleLaunchPlanner["plan"]>[0] & Readonly<{
+  launchId?: string;
+  environment?: Readonly<Record<string, string>>;
 }>;
 
 /** Builds managed native Agent launches from the authoritative Task records. */
-export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
-  readonly #environment: NodeJS.ProcessEnv;
+export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmentRefreshPort {
+  readonly #operationalEnvironment: NodeJS.ProcessEnv;
+  #agentEnvironment: NodeJS.ProcessEnv;
+  #nativeAgentEnvironment: NodeJS.ProcessEnv;
   readonly #createNativeSessionId: () => string;
   readonly #cliPath: string;
 
@@ -40,13 +61,39 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
     readonly store: TaskStore,
     options: FileRoleLaunchPlannerOptions = {}
   ) {
-    this.#environment = options.environment ?? process.env;
+    // Operational launch context is stable for the Controller lifetime. Agent
+    // binding sources are a separate replaceable snapshot so an unset/removed
+    // secret cannot survive a later configuration refresh.
+    const sourceEnvironment = { ...(options.environment ?? process.env) };
+    this.#operationalEnvironment = { ...sourceEnvironment };
+    for (const name of NATIVE_AGENT_ENVIRONMENT_NAMES) {
+      delete this.#operationalEnvironment[name];
+    }
+    this.#agentEnvironment = this.#selectConfiguredAgentEnvironment(
+      sourceEnvironment
+    );
+    this.#nativeAgentEnvironment = this.#selectConfiguredNativeEnvironment(
+      sourceEnvironment
+    );
     this.#createNativeSessionId = options.createNativeSessionId ?? randomUUID;
     this.#cliPath = options.cliPath
       ?? fileURLToPath(new URL("../cli.js", import.meta.url));
   }
 
-  plan(input: Parameters<RoleLaunchPlanner["plan"]>[0]): PlannedRoleSession {
+  refreshAgentEnvironment(refresh: AgentEnvironmentRefresh): void {
+    this.#agentEnvironment = patchEnvironment(
+      this.#agentEnvironment,
+      refresh.sourceNames,
+      refresh.sources
+    );
+    this.#nativeAgentEnvironment = patchEnvironment(
+      this.#nativeAgentEnvironment,
+      refresh.nativeNames,
+      refresh.nativeSources
+    );
+  }
+
+  plan(input: TaskRoleLaunchPlanInput): PlannedRoleSession {
     const task = this.store.getTask(input.taskId);
     if (task === null) throw new Error(`Task not found: ${input.taskId}.`);
     if (task.status !== "active") throw new Error(`Task is not active: ${input.taskId}.`);
@@ -90,6 +137,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
       adapterId: string;
       mode: RoleSessionLaunchMode;
       nativeSessionId?: string;
+      launchId?: string;
+      environment?: Readonly<Record<string, string>>;
     }>,
     owner: Readonly<{ scope: "task"; taskId: string } | { scope: "global" }>,
     knownNativeSessionId?: string
@@ -105,12 +154,44 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
     }
 
     const agent = configuredAgentToDefinition(configured);
+    const agentSourceEnvironment = input.environment ?? this.#agentEnvironment;
+    const operationalSourceEnvironment = input.environment ?? {
+      ...this.#operationalEnvironment,
+      ...this.#nativeAgentEnvironment
+    };
+    const resolvedAgentEnvironment = resolveAgentEnvironment(agent, agentSourceEnvironment);
+    const launchEnvironment = {
+      ...operationalAgentEnvironment(configured.adapterId, operationalSourceEnvironment),
+      ...resolvedAgentEnvironment
+    };
     const adapter = resolveAgentAdapter(binding.adapterId);
+    const sessionContext = compileRoleSessionContext(this.home, role, owner);
+    const codexConfig = binding.config.adapterId === "codex"
+      ? inspectCodexLaunchConfig({
+          environment: {
+            ...operationalSourceEnvironment,
+            ...agentSourceEnvironment,
+            ...launchEnvironment
+          },
+          workspace: role.workspace,
+          profile: binding.config.profile
+        })
+      : undefined;
+    if (codexConfig?.notify.status === "configured") {
+      throw new Error(
+        "Codex notify is already configured by "
+        + `${codexConfig.notify.source}; Yui requires exclusive ownership of the structured `
+        + "notify callback and refuses to replace or be replaced by native configuration."
+      );
+    }
     const compileInput = {
       agent,
       config: binding.config,
       workspace: role.workspace,
-      systemPrompt: role.systemPrompt
+      ...sessionContext,
+      ...(codexConfig === undefined
+        ? {}
+        : { codexDeveloperInstructions: codexConfig.developerInstructions })
     };
     if (
       input.mode === "resume"
@@ -143,7 +224,17 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
         ? readySession(input.agentId, binding.adapterId, resumeNativeSessionId!)
         : null;
     } else if (launchMode === "new") {
-      const nativeSessionId = requireText(this.#createNativeSessionId(), "Native session id");
+      const nativeSessionId = requireText(
+        input.launchId === undefined
+          ? this.#createNativeSessionId()
+          : nativeSessionIdForLaunch(
+              this.home,
+              input.launchId,
+              input.agentId,
+              input.adapterId
+            ),
+        "Native session id"
+      );
       args.push("--session-id", nativeSessionId);
       session = readySession(input.agentId, binding.adapterId, nativeSessionId);
     } else {
@@ -160,19 +251,70 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner {
         command: configured.command,
         args,
         env: {
-          ...resolveAgentEnvironment(agent, this.#environment),
+          ...launchEnvironment,
           YUI_HOME: resolve(this.home),
           YUI_SESSION_SCOPE: owner.scope,
           ...(owner.scope === "task" ? { YUI_TASK_ID: owner.taskId } : {}),
           YUI_ROLE: role.name,
           YUI_AGENT_ID: configured.id,
           YUI_ADAPTER_ID: configured.adapterId,
-          YUI_WORKSPACE: role.workspace
+          YUI_WORKSPACE: role.workspace,
+          ...(input.launchId === undefined
+            ? {}
+            : { YUI_LAUNCH_ID: input.launchId })
         }
       },
       session
     };
   }
+
+  #selectConfiguredAgentEnvironment(
+    source: Readonly<Record<string, string | undefined>>
+  ): NodeJS.ProcessEnv {
+    const selected: NodeJS.ProcessEnv = {};
+    for (const agent of this.store.listConfiguredAgents()) {
+      for (const binding of agent.environment) {
+        const value = source[binding.sourceName];
+        if (value !== undefined) selected[binding.sourceName] = value;
+      }
+    }
+    return selected;
+  }
+
+  #selectConfiguredNativeEnvironment(
+    source: Readonly<Record<string, string | undefined>>
+  ): NodeJS.ProcessEnv {
+    const names = new Set(this.store.listConfiguredAgents().flatMap((agent) => (
+      nativeAgentEnvironmentNames(agent.adapterId)
+    )));
+    return selectEnvironment(source, names);
+  }
+}
+
+function patchEnvironment(
+  current: NodeJS.ProcessEnv,
+  names: readonly string[],
+  values: Readonly<Record<string, string>>
+): NodeJS.ProcessEnv {
+  const next = { ...current };
+  for (const name of names) delete next[name];
+  for (const [name, value] of Object.entries(values)) next[name] = value;
+  return next;
+}
+
+function nativeSessionIdForLaunch(
+  home: string,
+  launchId: string,
+  agentId: string,
+  adapterId: string
+): string {
+  const hex = createHash("sha256").update(JSON.stringify([
+    resolve(home),
+    requireText(launchId, "Launch id"),
+    requireText(agentId, "Agent id"),
+    requireText(adapterId, "Agent adapter id")
+  ])).digest("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
 /**

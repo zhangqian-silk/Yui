@@ -21,6 +21,7 @@ export type CompletionConfig = Readonly<{
   schemaVersion?: number;
   defaultAgent?: string;
   defaultWorkspace?: string;
+  timeZone?: string;
   completionInstallations?: Partial<Record<CompletionShell, CompletionInstallation>>;
 }>;
 

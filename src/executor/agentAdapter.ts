@@ -8,6 +8,11 @@ import {
   validateAgentAdvancedArguments,
   validateAgentBaseArguments
 } from "../agent/argumentPolicy.js";
+import { writeTextFileAtomically } from "../storage/durableFile.js";
+import {
+  inspectCodexDeveloperInstructions,
+  type CodexDeveloperInstructionsInspection
+} from "./codexConfigConflict.js";
 
 export type AdvancedAgentConfig = Readonly<{ rawArgs?: readonly string[] }>;
 export type CodexAgentConfig = Readonly<{
@@ -83,7 +88,10 @@ export type CompileInput<TConfig extends RoleAgentConfig = RoleAgentConfig> = Re
   agent: AgentDefinition;
   config: TConfig;
   workspace: string;
-  systemPrompt?: string;
+  developerInstructions?: string;
+  skills?: readonly Readonly<{ id: string; path: string; content: string }>[];
+  managedContextFile?: string;
+  codexDeveloperInstructions?: CodexDeveloperInstructionsInspection;
 }>;
 export type ResumeInput<TConfig extends RoleAgentConfig = RoleAgentConfig> =
   CompileInput<TConfig> & Readonly<{ nativeSessionId: string }>;
@@ -112,6 +120,7 @@ const SANDBOXES = ["read-only", "workspace-write", "danger-full-access"] as cons
 const APPROVALS = ["untrusted", "on-request", "never"] as const;
 const PROBE_TIMEOUT_MS = 2_000;
 const PROBE_MAX_BYTES = 1024 * 1024;
+const CODEX_TESTED_THROUGH_VERSION = "0.145.0";
 
 abstract class BaseAdapter<TConfig extends RoleAgentConfig> implements AgentAdapter<TConfig> {
   abstract readonly id: AgentAdapterId;
@@ -121,6 +130,10 @@ abstract class BaseAdapter<TConfig extends RoleAgentConfig> implements AgentAdap
   abstract validateStructured(config: TConfig): void;
   abstract structuredArgs(config: TConfig): string[];
   abstract compileResume(input: ResumeInput<TConfig>): CompiledAgentLaunch;
+
+  launchContextArgs(_input: CompileInput<TConfig>): string[] {
+    return [];
+  }
 
   validateConfig(input: CompileInput<TConfig>): void {
     if (input.agent.adapterId !== this.id || input.config.adapterId !== this.id) {
@@ -134,7 +147,12 @@ abstract class BaseAdapter<TConfig extends RoleAgentConfig> implements AgentAdap
     this.validateConfig(input);
     const config = this.canonicalizeConfig(input.config);
     return {
-      argv: [...input.agent.baseArgs, ...this.structuredArgs(config), ...(config.advanced?.rawArgs ?? [])],
+      argv: [
+        ...input.agent.baseArgs,
+        ...this.structuredArgs(config),
+        ...this.launchContextArgs(input),
+        ...(config.advanced?.rawArgs ?? [])
+      ],
       sessionStrategy: this.capabilities.nativeSessionDiscovery === "runtime"
         ? "runtime-discovery"
         : "preallocated"
@@ -200,6 +218,34 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
     ];
   }
 
+  override launchContextArgs(input: CompileInput<CodexAgentConfig>): string[] {
+    const instructions = [
+      input.developerInstructions,
+      ...(input.skills === undefined || input.skills.length === 0
+        ? []
+        : [
+            "Yui Role Skills are available at the paths below. Before performing work governed by one, read and follow its SKILL.md on demand; do not treat this list as a user message.",
+            ...input.skills.map((skill) => `- ${skill.id}: ${skill.path}/SKILL.md`)
+        ])
+    ].filter((value): value is string => value !== undefined && value.trim().length > 0);
+    if (instructions.length === 0) return [];
+    const nativeInstructions = input.codexDeveloperInstructions
+      ?? inspectCodexDeveloperInstructions({
+        workspace: input.workspace,
+        profile: input.config.profile
+      });
+    if (nativeInstructions.status === "configured") {
+      throw new Error(
+        "Codex developer_instructions is already configured by "
+        + `${nativeInstructions.source}; Yui refuses to replace native developer instructions.`
+      );
+    }
+    return [
+      "--config",
+      `developer_instructions=${tomlString(instructions.join("\n"))}`
+    ];
+  }
+
   compileResume(input: ResumeInput<CodexAgentConfig>): CompiledAgentLaunch {
     const launch = this.compileNew(input);
     return { ...launch, argv: [...launch.argv, "resume", nativeId(input.nativeSessionId)] };
@@ -251,6 +297,25 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
     ];
   }
 
+  override launchContextArgs(input: CompileInput<ClaudeAgentConfig>): string[] {
+    const sections = [
+      input.developerInstructions,
+      ...(input.skills ?? []).map((skill) => [
+        `# Yui Skill: ${skill.id}`,
+        skill.content
+      ].join("\n\n"))
+    ].filter((value): value is string => value !== undefined && value.trim().length > 0);
+    if (sections.length === 0) return [];
+    const context = sections.join("\n\n");
+    if (input.managedContextFile === undefined) {
+      throw new Error(
+        "Claude session context requires a managed context file under YUI_HOME."
+      );
+    }
+    writeTextFileAtomically(input.managedContextFile, context);
+    return ["--append-system-prompt-file", input.managedContextFile];
+  }
+
   compileResume(input: ResumeInput<ClaudeAgentConfig>): CompiledAgentLaunch {
     const launch = this.compileNew(input);
     return { ...launch, argv: [...launch.argv, "--resume", nativeId(input.nativeSessionId)] };
@@ -260,6 +325,11 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
 const ADAPTERS: Readonly<Record<AgentAdapterId, AgentAdapter<any>>> = {
   codex: new CodexAdapter(), claude: new ClaudeAdapter()
 };
+
+function tomlString(value: string): string {
+  if (value.includes("\0")) throw new Error("Agent launch context cannot contain NUL bytes.");
+  return JSON.stringify(value);
+}
 export { supportedAgentAdapterIds };
 export function findAgentAdapter(id: string): AgentAdapter | null {
   return id === "codex" || id === "claude" ? ADAPTERS[id] : null;
@@ -297,17 +367,49 @@ export function inspectAgentCapabilities(
       reason: "Agent version probe did not return a semantic version.", probedAt: at
     }, baseline(agent.adapterId), at);
   }
-  const supported = supports(version, adapter.supportedVersion);
+  const supported = supports(version, adapter);
   let fields = baseline(agent.adapterId);
-  const warnings = supported ? [] : [`Installed version ${version} is not supported by adapter ${adapter.id}.`];
-  if (supported) {
-    const help = run(agent.command, ["--help"]);
-    if (failed(help) === undefined) fields = fromHelp(agent.adapterId, output(help.stdout, help.stderr));
+  const warnings: string[] = [];
+  if (!supported) {
+    return snapshot(agent, adapter, {
+      status: "unsupported-version", command: agent.command, version,
+      reason: adapter.id === "codex"
+        ? `Minimum supported version is ${adapter.supportedVersion}.`
+        : `Supported version line starts at ${adapter.supportedVersion}.`,
+      probedAt: at
+    }, fields, at, [`Installed version ${version} is not supported by adapter ${adapter.id}.`]);
+  }
+
+  const help = run(agent.command, ["--help"]);
+  const helpFailure = failed(help);
+  if (adapter.id === "codex" && helpFailure !== undefined) {
+    return snapshot(agent, adapter, {
+      status: "probe-failed", command: agent.command, version,
+      reason: `Required Codex capability probe failed: ${helpFailure}`, probedAt: at
+    }, fields, at);
+  }
+  if (helpFailure === undefined) {
+    const helpOutput = output(help.stdout, help.stderr);
+    fields = fromHelp(agent.adapterId, helpOutput);
+    if (adapter.id === "codex") {
+      const missing = missingCodexCapabilities(helpOutput);
+      if (missing.length > 0) {
+        return snapshot(agent, adapter, {
+          status: "unsupported-version", command: agent.command, version,
+          reason: `Codex CLI is missing required capabilities: ${missing.join(", ")}.`,
+          probedAt: at
+        }, fields, at);
+      }
+      if (compareVersions(version, CODEX_TESTED_THROUGH_VERSION) > 0) {
+        warnings.push(
+          `Installed Codex version ${version} is newer than the latest tested version `
+          + `${CODEX_TESTED_THROUGH_VERSION}; required capabilities were detected.`
+        );
+      }
+    }
   }
   return snapshot(agent, adapter, {
-    status: supported ? "installed" : "unsupported-version", command: agent.command, version,
-    ...(supported ? {} : { reason: `Supported version line starts at ${adapter.supportedVersion}.` }),
-    probedAt: at
+    status: "installed", command: agent.command, version, probedAt: at
   }, fields, at, warnings);
 }
 
@@ -386,9 +488,28 @@ function output(stdout: string, stderr: string): string {
   if (Buffer.byteLength(value, "utf8") > PROBE_MAX_BYTES) throw new Error("Agent probe output exceeded 1 MiB.");
   return value;
 }
-function supports(version: string, baseline: string): boolean {
-  const left = version.split(".").map(Number), right = baseline.split(".").map(Number);
+function supports(version: string, adapter: AgentAdapter): boolean {
+  if (adapter.id === "codex") return compareVersions(version, adapter.supportedVersion) >= 0;
+  const left = version.split(".").map(Number), right = adapter.supportedVersion.split(".").map(Number);
   return left[0] === right[0] && left[1] === right[1] && left[2] >= right[2];
+}
+
+function compareVersions(leftVersion: string, rightVersion: string): number {
+  const left = leftVersion.split(".").map(Number);
+  const right = rightVersion.split(".").map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    const difference = (left[index] ?? 0) - (right[index] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+
+function missingCodexCapabilities(help: string): string[] {
+  const required: readonly (readonly [RegExp, string])[] = [
+    [/(?:^|\s)--config(?:\s|[=<,]|$)/m, "--config"],
+    [/^\s*resume(?:\s|$)/m, "resume"]
+  ];
+  return required.flatMap(([pattern, label]) => pattern.test(help) ? [] : [label]);
 }
 
 function cloneConfig(config: RoleAgentConfig, paths: readonly string[] | undefined): RoleAgentConfig {

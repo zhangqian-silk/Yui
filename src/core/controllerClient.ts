@@ -45,7 +45,7 @@ export async function readControllerDiscovery(home: string): Promise<ControllerD
     if (error instanceof ControllerClientError) throw error;
     if (isNodeError(error) && error.code === "ENOENT") {
       throw new ControllerClientError(
-        "CONTROLLER_UNAVAILABLE",
+        "CONTROLLER_NOT_RUNNING",
         "Controller is not running."
       );
     }

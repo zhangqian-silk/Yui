@@ -22,6 +22,43 @@ flowchart LR
 
 The Controller socket uses a private discovery file, random token, strict JSON-line protocol, and local file permissions. It is transport, not a second persistence system.
 
+## Domain boundaries and replaceable delivery
+
+The implementation separates five bounded contexts:
+
+- **Task** owns Task lifecycle, Role definitions, WorkItems, Decisions, Milestones, and workspace intent.
+- **Coordination** owns the shared durable `WorkMailbox` abstraction: signals merge into `pending`, a claim freezes one `processing` batch, and signals arriving during processing form the next pending batch.
+- **Execution** owns AgentRuns, Role turns, prompt envelopes, delivery acknowledgement, yield, completion, and failure.
+- **Interaction** owns InputRequests, presentation, answers, recommendations, and deadlines.
+- **Runtime** owns native Agent session identity, process/container bindings, availability observations, and delivery receipts.
+
+Domain objects and application use cases must not depend on tmux commands, composer markers, Codex Hook payloads, or Controller transport. Infrastructure implements ports selected in the composition root. In particular, session hosting and message delivery are separate capabilities:
+
+```text
+SessionHost
+  start / resume / stop / inspect a native Agent session
+
+Message delivery driver
+  decide when and how a pending application-level turn or presentation reaches it
+```
+
+The current scheduler composes its launch/send path from `TmuxSessionHost` and a non-blocking `TmuxPromptPushAdapter`; liveness and archive cleanup still use tmux as the physical session host. A future `hook-pull` driver can claim the same durable mailbox work without changing Task, Coordination, Execution, or Interaction state. Push and pull are deliberately not forced behind one direction-agnostic interface: they are alternative drivers of the same application use cases, such as claiming a Role turn, recording delivery, completing a turn, claiming an Operator presentation, and answering an InputRequest.
+
+Consequently, adopting Hook delivery later should replace the delivery driver and its tmux composer probing, not the Task, Coordination, Execution, or Interaction models. tmux may remain as the session host even when delivery becomes Hook-based.
+
+The runtime uses one dedicated tmux server per canonical `YUI_HOME`, selected through a stable Yui-specific server name. Within that server:
+
+```text
+YUI_HOME                         dedicated tmux server
+  Operator                      tmux session
+    operator Role               window/pane -> native Agent process/session
+  Task                          tmux session
+    Leader Role                 window/pane -> native Agent process/session
+    Worker Role                 window/pane -> native Agent process/session
+```
+
+Thus a Task maps to one tmux session, a Role maps to one window/pane, and each pane hosts one independent native Agent process/session. tmux IDs, process IDs, AgentRun IDs, mailbox batch IDs, and native thread IDs remain distinct identities linked by Runtime bindings.
+
 ## Web projection
 
 The optional dashboard is a read-only HTTP projection over the same `FileTaskStore`. Its frontend is deliberately split by responsibility:
@@ -53,14 +90,14 @@ YUI_HOME/
       <role-name>/
 ```
 
-`schema.json` records storage-layout version 5, aggregate-schema version 2, and a reserved `activeGeneration` pointer. `state.json` is one aggregate containing:
+`schema.json` records storage-layout version 5, aggregate-schema version 3, and a reserved `activeGeneration` pointer. `state.json` is one aggregate containing:
 
 - configuration and completion installation records;
 - configured Agents;
 - Repositories;
 - global Roles and their per-Agent session sets;
 - Tasks, Task Roles, RoleWorkspaces, messages, WorkItems, AgentRuns, append-only events, Task Briefs, Decisions, and Milestones;
-- pending Leader wakes, Leader failures, and Operator notifications.
+- shared Task/Role/Operator WorkMailboxes, Leader failures, and Operator notifications.
 
 Every persisted domain record has its own schema version and is validated when read. Unsupported aggregate or record shapes fail explicitly; Yui does not silently repair them.
 
@@ -90,7 +127,9 @@ FileTaskStore validates cross-record references after every transaction, includi
 
 ## Controller pass
 
-The Controller runs a non-overlapping full reconciliation pass every 30 seconds by default. `reconciliationIntervalSeconds` may be set from 5 to 300 in Yui config. Durable state changes request an immediate pass through the Controller socket, and concurrent scan requests coalesce into one follow-up pass.
+The Controller runs a non-overlapping recovery reconciliation pass every 120 seconds by default. `reconciliationIntervalSeconds` may be set from 5 to 300 in Yui config. Durable state changes enqueue a canonical Task, Role, or Operator key through the Controller socket and return immediately. Keys arriving in the same fixed 100 ms window are de-duplicated into one targeted pass; a change arriving during that pass is held for the next non-overlapping batch. A Task key selects that Task and all of its Roles, a Role key selects that Role plus its Task-level Leader closure, and an Operator key uses an independent presentation lane so Task workspace work cannot delay a user question. Periodic Git/worktree and archive work is restricted to Tasks that still have durable Task-mailbox work. Active Role liveness is joined against one tmux pane inventory instead of probing every Role separately. Recommended InputRequests and pending Turn completions share one nearest-deadline selector. Explicit `task reconcile` remains an immediate recovery pass.
+
+The socket queue is only a low-latency wake hint. Durable `WorkMailbox` records are the recovery boundary. A Task, Role, or Operator batch is atomically claimed into `processing`; signals arriving while it runs merge into the next `pending` batch. Successful orchestration completes the frozen batch. Failure releases it ahead of later pending work. Task workspace failures are isolated, so a full recovery pass completes successful Task mailboxes and releases only the failed ones.
 
 `controller restart` stops only this process and waits for its private socket/discovery state to disappear before starting the currently installed runtime. tmux sessions are external durable runtime state and are never stopped by Controller restart.
 
@@ -109,11 +148,11 @@ Archive stops tmux before worktree cleanup. Each clean Role worktree is removed 
 
 ## Durable wake and Run behavior
 
-Task activation/reopen, an Operator/user message, Worker yield, and exited Role failure can merge a `PendingWakeup`. Reasons are de-duplicated while request count and first/last timestamps remain durable. Completed Tasks never dispatch a pending wake.
+Task lifecycle changes, Role turns, Operator InputRequests, user messages, Worker yield, and exited Role failure enqueue the same durable `WorkMailbox` abstraction. Reasons and entity references are de-duplicated while request count, sequence range, and first/last timestamps remain durable. The old Jobs view projects pending Leader mailbox batches; it is not a separate wake store.
 
-If the Leader is busy, the Controller does not touch tmux and leaves the wake pending. When idle, it prepares the fixed Role session, then atomically claims the unchanged wake as a durable, not-yet-delivered Leader AgentRun before any tmux input. The claim clears that wake; later requests form a new pending wake. A confirmed receipt marks the Run delivered. A send failure fails the claim and restores its wake, while a Controller crash can resume the same Run with the same `agent-run:<run-id>` receipt.
+If the Leader is busy, or its active Run has not reached a native Turn boundary, the Controller does not touch tmux and leaves its mailbox pending. When idle, it prepares the fixed Role session, then atomically claims the pending batch, creates the durable AgentRun, and binds both the mailbox execution and persistent Turn fence before any tmux input. Later signals form a new pending batch. A legal yield or terminal failure closes the business Run and clears its application Turn fence immediately; a later matching Hook is advisory and cannot close a newer Run. Native composer readiness still prevents a new prompt from being injected while the old Turn is physically busy. A send failure releases the frozen batch, while a Controller crash can resume the same Run with the same `agent-run:<run-id>` receipt.
 
-A dispatched Worker WorkItem creates a durable AgentRun before any terminal effect. The Controller is the only automatic delivery path. Delivery uses `agent-run:<run-id>` as its receipt and persists `deliveredAt` plus successful session/Role state after tmux confirms the send. Completion and yield reject a Run whose delivery is still pending.
+A dispatched Worker WorkItem creates a durable AgentRun and Role mailbox signal before any terminal effect. The Controller claims and binds that mailbox batch before preparing or sending externally. Delivery uses `agent-run:<run-id>` as its receipt and persists `deliveredAt` plus successful session/Role state after tmux confirms the send. Completion and yield reject a Run whose delivery is still pending and complete its bound processing batch when accepted.
 
 If an active Role's tmux window disappears before yield, the Controller fails the AgentRun and running WorkItem, clears the active-run pointer, stops its session record, and merges a failure wake for the Leader. A failed Leader recovery records `LeaderFailure` plus `OperatorNotification`; `jobs retry leader-recovery:<task-id>` clears those records and queues a recovery wake.
 
@@ -130,7 +169,7 @@ Foreground attach is a hard terminal handoff:
 
 Yui does not read stdin, draw UI, or relay bytes while attached.
 
-Automatic delivery never reads stdin. It requires an adapter-specific readiness probe: Codex and Claude have separate composer markers. Before waiting for readiness, the Controller checks for an existing pane receipt, so a busy Agent does not cause a retry scan to block. Receipt check/write, literal input, and Enter execute in one tmux server command queue.
+Automatic delivery never reads stdin. It performs one non-blocking adapter-specific readiness probe per attempt: Codex and Claude have separate composer markers. A busy launch is retried by bounded one-shot mailbox timers; subsequent availability is normally signalled by Codex turn-complete, with the 120-second pass as recovery. There is no synchronous readiness polling in the production Controller path. Receipt check/write, literal input, and Enter execute in one tmux server command queue.
 
 ## Native session identity
 
@@ -142,7 +181,13 @@ Codex discovers its thread ID at runtime. Managed launches add a structured Code
 yui internal session-notify <codex-json-payload>
 ```
 
-The hidden command validates the payload and Yui provenance environment, then records the fixed task/global Role session through the Controller. No session-binding text is placed in a model prompt.
+The hidden command validates the payload and Yui provenance environment, then writes the fixed session and Turn fact directly to `FileTaskStore`; it does not start or wait for the Controller. A bounded best-effort socket signal is only a wake hint. The exact Task, Role, Agent, native session, Run, receipt, and Turn identities form a persistent fence, with the last assistant summary capped before storage. If the business Run is still active, the Hook records a completion due two seconds later. A legal yield, Task completion, or InputRequest during that grace period wins. Otherwise the nearest-deadline pass yields a forgotten Leader Run and queues one `leader-turn-unclosed` recovery wake; if that recovery Turn also ends without closing or continuing the Task, Yui records a visible Leader failure for the Operator. A forgotten Worker Run fails visibly and wakes the Leader. Duplicate and stale notifications cannot close a newer Run. No session-binding text is placed in a model prompt.
+
+## Native Role context
+
+`compileRoleSessionContext` is the single application boundary for stable Operator, Task Leader, and Task Worker policy. Non-Operator global Roles receive only a neutral global Role profile and explicitly configured Skills; they are never given Task orchestration Skills. The compiler produces developer instructions plus immutable Skill references; it does not produce a user message. The Agent adapter owns translation to a native launch channel. Codex has one scalar `developer_instructions` setting, so on the supported Linux runtime Yui first inspects `/etc/codex/config.toml`, user config, the selected `$CODEX_HOME/<name>.config.toml`, project configs, and `/etc/codex/managed_config.toml`; it fails explicitly if any layer already configures the setting, and only an unclaimed setting receives Yui Role policy and on-demand absolute Skill references. The same inspection reserves Codex's structured `notify` callback for Yui's native Turn-completion Hook: any existing `notify` setting rejects launch instead of allowing either native or Yui configuration to silently replace the other. Claude receives the rendered context through `--append-system-prompt-file`; Yui atomically writes a private `0600` file under `YUI_HOME/runtime/session-contexts`, using a stable owner/Role/Agent identity so launch retries and resumes reuse one path without sharing context across Roles. Codex `skills.config` is intentionally not used as discovery because it only overrides enablement for already-discovered Skills. The runtime launch request intentionally has no initial-prompt field, making a synthetic first turn unrepresentable in the session-host port.
+
+Dynamic orchestration remains separate: Leader wakeups and Worker Run assignments are prompt envelopes delivered from durable mailboxes after the native composer is ready. This separation lets a future hook-pull driver reuse the same Role context and mailbox use cases without depending on tmux input delivery. Unsupported adapters must fail at the adapter boundary instead of falling back to a bootstrap user message.
 
 ## Deliberate exclusions
 
@@ -150,7 +195,7 @@ This version does not restore:
 
 - backup/restore, import/export, trash, or general maintenance commands;
 - native storage extensions, derived indexes, or recovery journals;
-- runtime claims, leases, fencing generations, permission fingerprints, or identity ledgers;
+- distributed leases, fencing generations, permission fingerprints, or identity ledgers;
 - inactivity TTL, cooldown, review-time, recurring schedules, or offline resolution;
 - Web writes, non-loopback Web access, or remote multi-user coordination. The optional `yui web` process is a read-only projection of `FileTaskStore`; it introduces no second authority.
 

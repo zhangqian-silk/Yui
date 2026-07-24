@@ -37,21 +37,31 @@ function fixture(t) {
   return { store, task, role, adapter: new FileSchedulerStoreAdapter(store) };
 }
 
-test("completion that wins during Leader preparation prevents stale delivery", async (t) => {
+test("a durable Leader claim fences completion while tmux is still preparing", async (t) => {
   const { store, task, adapter } = fixture(t);
   let sent = false;
+  let completionError;
   const delivery = {
     async prepareRoleSession(input) {
       return { deliveryId: "delivery-1", ...input };
     },
     async waitUntilReady(prepared) {
-      store.transaction((tx) => {
-        tx.saveTask(completeTask(tx.getTask(task.id), NOW, {
-          by: "user",
-          summary: "Completed while the Controller prepared the Leader."
-        }));
-        tx.clearPendingWakeup(task.id);
-      });
+      try {
+        runTaskCommand(
+          ["complete", task.id, "--summary", "Completed during preparation"],
+          store,
+          {
+            now: () => new Date(NOW),
+            environment: {
+              YUI_SESSION_SCOPE: "task",
+              YUI_TASK_ID: task.id,
+              YUI_ROLE: "leader"
+            }
+          }
+        );
+      } catch (error) {
+        completionError = error;
+      }
       return { prepared, session: null };
     },
     async sendOnce() { sent = true; return "sent"; },
@@ -61,10 +71,15 @@ test("completion that wins during Leader preparation prevents stale delivery", a
 
   const result = await processLeaderWakeups(adapter, delivery, NOW);
 
-  assert.equal(sent, false);
-  assert.equal(store.getTask(task.id)?.status, "completed");
-  assert.equal(store.getActiveAgentRun(task.id, "leader"), null);
-  assert.deepEqual(result, [{ taskId: task.id, status: "skipped", reason: "unavailable" }]);
+  assert.match(String(completionError), /delivery is still pending/i);
+  assert.equal(sent, true);
+  assert.equal(store.getTask(task.id)?.status, "active");
+  assert.notEqual(store.getActiveAgentRun(task.id, "leader")?.deliveredAt, undefined);
+  assert.deepEqual(result, [{
+    taskId: task.id,
+    runId: "agent-run-1",
+    status: "dispatched"
+  }]);
 });
 
 test("a claimed but undelivered Leader run fences completion before tmux input", async (t) => {
@@ -103,7 +118,11 @@ test("a claimed but undelivered Leader run fences completion before tmux input",
   assert.match(String(completionError), /delivery is still pending/i);
   assert.equal(store.getTask(task.id)?.status, "active");
   assert.notEqual(store.getActiveAgentRun(task.id, "leader")?.deliveredAt, undefined);
-  assert.deepEqual(result, [{ taskId: task.id, status: "dispatched" }]);
+  assert.deepEqual(result, [{
+    taskId: task.id,
+    runId: "agent-run-1",
+    status: "dispatched"
+  }]);
 });
 
 test("late Codex session registration cannot reactivate a completed Task", (t) => {

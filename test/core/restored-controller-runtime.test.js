@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  compileReconcileSelection,
   FileTaskController,
   runControllerSchedulerPass,
   startFileTaskController
@@ -15,8 +16,11 @@ import {
   MIN_RECONCILIATION_INTERVAL_SECONDS,
   reconciliationIntervalMilliseconds
 } from "../../dist/config/yuiConfig.js";
-import { callController } from "../../dist/core/controllerClient.js";
-import { ControllerClientError } from "../../dist/core/controllerClient.js";
+import {
+  callController,
+  ControllerClientError,
+  readControllerDiscovery
+} from "../../dist/core/controllerClient.js";
 import {
   FileTaskWorkflowRuntime,
   restartFileTaskController
@@ -26,16 +30,26 @@ import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 
 function emptyStore(events = []) {
   return {
+    getPresentationContext() { return { timeZone: "Asia/Shanghai" }; },
     listTasks() { events.push("list-tasks"); return []; },
     getTask() { return null; },
     listRoles() { return []; },
     getRole() { return null; },
     getActiveAgentRun() { return null; },
+    hasOpenInputRequest() { return false; },
     listOpenInputRequests() { return []; },
+    listPendingRuntimeTurnCompletions() { return []; },
     getOperatorDeliveryTarget() { return null; },
     resolveExpiredInputRecommendations() { return []; },
+    resolveDueRuntimeTurnCompletions() { return []; },
     getRoleSession() { return null; },
+    hasInFlightTurn() { return false; },
     nextAgentRunId() { return "run-1"; },
+    getWorkMailbox() { return null; },
+    listWorkMailboxes() { return []; },
+    claimWorkMailbox() { return { status: "empty" }; },
+    completeWorkMailbox() { return false; },
+    releaseWorkMailbox() { return false; },
     getPendingWakeup() { return null; },
     listPendingWakeups() { events.push("list-wakeups"); return []; },
     savePendingWakeup() {},
@@ -46,6 +60,7 @@ function emptyStore(events = []) {
     listDecisions() { return []; },
     listMilestones() { return []; },
     saveLeaderDispatch() {},
+    saveRoleRunPrepared() {},
     saveRoleRunDelivery() {},
     saveLeaderDispatchFailure() {},
     saveExitedRoleRun() {},
@@ -61,7 +76,7 @@ const noTmux = {
   async stopTask() { return false; }
 };
 
-test("controller scheduler reconciles liveness before processing wakeups", async () => {
+test("controller scheduler folds completion and liveness phases before wakeups", async () => {
   const events = [];
   const result = await runControllerSchedulerPass(emptyStore(events), noTmux, new Date(0));
   assert.deepEqual(result, {
@@ -75,7 +90,37 @@ test("controller scheduler reconciles liveness before processing wakeups", async
   assert.deepEqual(events, ["list-tasks", "list-tasks", "list-tasks", "list-wakeups"]);
 });
 
-test("controller prepares active workspaces, stops archived tmux, then cleans archived worktrees", async () => {
+test("a due native Turn completion forgets the finalized Run preparation", async () => {
+  const store = emptyStore();
+  store.listPendingRuntimeTurnCompletions = () => [{
+    taskId: "task-1",
+    roleName: "worker",
+    runId: "run-1",
+    dueAt: new Date(0).toISOString()
+  }];
+  store.resolveDueRuntimeTurnCompletions = () => ["run-1"];
+  const forgotten = [];
+  const delivery = {
+    ...noTmux,
+    forgetPrepared(input) { forgotten.push(input); }
+  };
+
+  await runControllerSchedulerPass(
+    store,
+    delivery,
+    new Date(1),
+    undefined,
+    { kind: "full" }
+  );
+
+  assert.deepEqual(forgotten, [{
+    taskId: "task-1",
+    roleName: "worker",
+    runId: "run-1"
+  }]);
+});
+
+test("periodic recovery skips active workspace scans without durable Task work", async () => {
   const events = [];
   const workspacePreparer = {
     async prepareActiveTaskWorkspaces() { events.push("prepare-active"); return []; },
@@ -88,9 +133,950 @@ test("controller prepares active workspaces, stops archived tmux, then cleans ar
     workspacePreparer
   );
   assert.deepEqual(events, [
-    "prepare-active", "list-tasks", "cleanup-archived",
-    "list-tasks", "list-tasks", "list-wakeups"
+    "list-tasks", "list-tasks", "list-tasks", "list-wakeups"
   ]);
+});
+
+test("full recovery inventories dormant Task and global sessions once and stops only confirmed absences", async () => {
+  const taskCandidate = {
+    owner: { scope: "task", taskId: "task-1", roleName: "leader" },
+    agentId: "codex-task",
+    adapterId: "codex",
+    nativeSessionId: "thread-task",
+    sessionUpdatedAt: new Date(0).toISOString()
+  };
+  const globalCandidate = {
+    owner: { scope: "global", roleName: "operator" },
+    agentId: "codex-global",
+    adapterId: "codex",
+    nativeSessionId: "thread-global",
+    sessionUpdatedAt: new Date(0).toISOString()
+  };
+  const store = emptyStore();
+  const marked = [];
+  let candidateScans = 0;
+  store.listDormantRuntimeOwners = () => {
+    candidateScans += 1;
+    return [taskCandidate, globalCandidate];
+  };
+  store.markRuntimeOwnerStopped = (candidate) => {
+    marked.push(candidate);
+    return true;
+  };
+  let inventoryCalls = 0;
+  const lifecycleHost = {
+    async inspectOwner() { throw new Error("batch inventory must be used"); },
+    async inspectOwners(owners) {
+      inventoryCalls += 1;
+      assert.deepEqual(owners, [taskCandidate.owner, globalCandidate.owner]);
+      return [
+        { owner: taskCandidate.owner, inspection: { state: "stopped" } },
+        { owner: globalCandidate.owner, inspection: { state: "running" } }
+      ];
+    },
+    async stopOwner() { throw new Error("unused"); }
+  };
+
+  await runControllerSchedulerPass(
+    store,
+    noTmux,
+    new Date(1),
+    undefined,
+    { kind: "full" },
+    undefined,
+    true,
+    new Set(),
+    [],
+    lifecycleHost
+  );
+
+  assert.equal(candidateScans, 1);
+  assert.equal(inventoryCalls, 1);
+  assert.deepEqual(marked, [taskCandidate]);
+});
+
+test("dirty recovery never performs the dormant native-session inventory", async () => {
+  const store = emptyStore();
+  store.listDormantRuntimeOwners = () => {
+    throw new Error("dirty reconciliation must not scan dormant sessions");
+  };
+  const lifecycleHost = {
+    async inspectOwner() { throw new Error("unused"); },
+    async inspectOwners() { throw new Error("unused"); },
+    async stopOwner() { throw new Error("unused"); }
+  };
+
+  await runControllerSchedulerPass(
+    store,
+    noTmux,
+    new Date(1),
+    undefined,
+    { kind: "dirty", keys: ["role:task-1/leader"] },
+    undefined,
+    true,
+    new Set(),
+    [],
+    lifecycleHost
+  );
+});
+
+test("Task mailbox is completed only after its targeted orchestration succeeds", async () => {
+  const target = { kind: "task", taskId: "task-1" };
+  const batch = {
+    fromSequence: 1, toSequence: 1, reasons: ["task-activated"], refs: [],
+    requestCount: 1, firstQueuedAt: new Date(0).toISOString(), lastQueuedAt: new Date(0).toISOString()
+  };
+  const mailbox = { schemaVersion: 1, target, nextSequence: 2, processing: null, pending: batch };
+  const processing = {
+    batchId: "task:task-1:1-1", batch, owner: "controller", startedAt: new Date(0).toISOString()
+  };
+  const calls = [];
+  const store = emptyStore();
+  store.getTask = () => ({ id: "task-1", status: "active" });
+  store.getWorkMailbox = () => mailbox;
+  store.claimWorkMailbox = () => { calls.push("claim"); return { status: "claimed", processing }; };
+  store.completeWorkMailbox = (_target, batchId) => { calls.push(`complete:${batchId}`); return true; };
+  const workspace = {
+    async prepareTaskWorkspace() { calls.push("workspace"); return { taskId: "task-1", status: "ready" }; },
+    async prepareActiveTaskWorkspaces() { return []; },
+    async cleanupArchivedTaskWorkspaces() { return []; }
+  };
+
+  await runControllerSchedulerPass(store, noTmux, new Date(0), workspace, {
+    kind: "dirty", keys: ["task:task-1"]
+  });
+
+  assert.deepEqual(calls, ["claim", "workspace", "complete:task:task-1:1-1"]);
+});
+
+test("Task mailbox is released when targeted orchestration fails", async () => {
+  const target = { kind: "task", taskId: "task-1" };
+  const batch = {
+    fromSequence: 1, toSequence: 1, reasons: ["task-activated"], refs: [],
+    requestCount: 1, firstQueuedAt: new Date(0).toISOString(), lastQueuedAt: new Date(0).toISOString()
+  };
+  const processing = {
+    batchId: "task:task-1:1-1", batch, owner: "controller", startedAt: new Date(0).toISOString()
+  };
+  const store = emptyStore();
+  store.getTask = () => ({ id: "task-1", status: "active" });
+  store.getWorkMailbox = () => ({
+    schemaVersion: 1, target, nextSequence: 2, processing: null, pending: batch
+  });
+  store.claimWorkMailbox = () => ({ status: "claimed", processing });
+  let released = null;
+  store.releaseWorkMailbox = (_target, batchId) => { released = batchId; return true; };
+  const workspace = {
+    async prepareTaskWorkspace() { throw new Error("workspace failed"); },
+    async prepareActiveTaskWorkspaces() { return []; },
+    async cleanupArchivedTaskWorkspaces() { return []; }
+  };
+
+  await runControllerSchedulerPass(store, noTmux, new Date(0), workspace, {
+    kind: "dirty", keys: ["task:task-1"]
+  });
+  assert.equal(released, "task:task-1:1-1");
+});
+
+test("targeted archived cleanup returning failed releases its Task mailbox", async () => {
+  const target = { kind: "task", taskId: "task-1" };
+  const batch = {
+    fromSequence: 1, toSequence: 1, reasons: ["task-archived"], refs: [],
+    requestCount: 1, firstQueuedAt: new Date(0).toISOString(), lastQueuedAt: new Date(0).toISOString()
+  };
+  const processing = {
+    batchId: "task:task-1:1-1", batch, owner: "controller", startedAt: new Date(0).toISOString()
+  };
+  const settled = [];
+  const store = emptyStore();
+  store.getTask = () => ({ id: "task-1", status: "archived", repositoryId: "repository-1" });
+  store.getWorkMailbox = () => ({
+    schemaVersion: 1, target, nextSequence: 2, processing: null, pending: batch
+  });
+  store.claimWorkMailbox = () => ({ status: "claimed", processing });
+  store.completeWorkMailbox = () => { settled.push("complete"); return true; };
+  store.releaseWorkMailbox = () => { settled.push("release"); return true; };
+  const workspace = {
+    async prepareTaskWorkspace() { return { taskId: "task-1", status: "failed", error: "git failed" }; },
+    async prepareActiveTaskWorkspaces() { return []; },
+    async cleanupArchivedTaskWorkspaces() { return []; }
+  };
+
+  await runControllerSchedulerPass(store, noTmux, new Date(0), workspace, {
+    kind: "dirty", keys: ["task:task-1"]
+  });
+
+  assert.deepEqual(settled, ["release"]);
+});
+
+test("one targeted workspace failure does not skip or acknowledge later Tasks", async () => {
+  const batch = {
+    fromSequence: 1, toSequence: 1, reasons: ["task-archived"], refs: [],
+    requestCount: 1, firstQueuedAt: new Date(0).toISOString(), lastQueuedAt: new Date(0).toISOString()
+  };
+  const targets = ["task-failed", "task-ok"].map((taskId) => ({ kind: "task", taskId }));
+  const mailboxes = new Map(targets.map((target) => [target.taskId, {
+    schemaVersion: 1, target, nextSequence: 2, processing: null, pending: batch
+  }]));
+  const attempted = [];
+  const settled = [];
+  const store = emptyStore();
+  store.getTask = (taskId) => ({ id: taskId, status: "archived", repositoryId: "repository-1" });
+  store.getWorkMailbox = (target) => mailboxes.get(target.taskId) ?? null;
+  store.claimWorkMailbox = ({ target }) => ({
+    status: "claimed",
+    processing: {
+      batchId: `task:${target.taskId}:1-1`, batch, owner: "controller", startedAt: new Date(0).toISOString()
+    }
+  });
+  store.completeWorkMailbox = (target) => { settled.push(`complete:${target.taskId}`); return true; };
+  store.releaseWorkMailbox = (target) => { settled.push(`release:${target.taskId}`); return true; };
+  const workspace = {
+    async prepareTaskWorkspace(taskId) {
+      attempted.push(taskId);
+      if (taskId === "task-failed") throw new Error("git failed");
+      return { taskId, status: "archived-clean" };
+    },
+    async prepareActiveTaskWorkspaces() { return []; },
+    async cleanupArchivedTaskWorkspaces() { return []; }
+  };
+
+  await runControllerSchedulerPass(store, noTmux, new Date(0), workspace, {
+    kind: "dirty", keys: ["task:task-failed", "task:task-ok"]
+  });
+
+  assert.deepEqual(attempted, ["task-failed", "task-ok"]);
+  assert.deepEqual(settled, ["release:task-failed", "complete:task-ok"]);
+});
+
+test("a main full pass never consumes the Operator mailbox", async () => {
+  const store = emptyStore();
+  store.getWorkMailbox = (target) => {
+    if (target.kind === "operator") {
+      throw new Error("Operator mailbox belongs to the Operator lane");
+    }
+    return null;
+  };
+
+  await runControllerSchedulerPass(
+    store,
+    noTmux,
+    new Date(0),
+    undefined,
+    { kind: "full" },
+    undefined,
+    false
+  );
+});
+
+test("dirty reconciliation does not synthesize an orphan Leader wake", async () => {
+  const saved = [];
+  const store = emptyStore();
+  store.getTask = () => ({ id: "task-1", status: "active" });
+  store.savePendingWakeup = (wakeup) => saved.push(wakeup);
+
+  await runControllerSchedulerPass(store, noTmux, new Date(0), undefined, {
+    kind: "dirty",
+    keys: ["role:task-1/worker"]
+  });
+
+  assert.deepEqual(saved, []);
+});
+
+test("failed stale Role cleanup is released and retried before normal scheduling", async () => {
+  const target = { kind: "role-runtime", taskId: "task-1", roleName: "worker" };
+  const batch = {
+    fromSequence: 1, toSequence: 1, reasons: ["runtime-cleanup-required"],
+    refs: [{ type: "role", id: "worker" }], requestCount: 1,
+    firstQueuedAt: new Date(0).toISOString(),
+    lastQueuedAt: new Date(0).toISOString()
+  };
+  let mailbox = {
+    schemaVersion: 1, target, nextSequence: 2, processing: null, pending: batch
+  };
+  let stopCalls = 0;
+  let secondStop;
+  const secondStopped = new Promise((resolve) => { secondStop = resolve; });
+  const store = emptyStore();
+  store.getTask = () => ({ id: "task-1", status: "active" });
+  store.getRole = () => role("task-1", "worker");
+  store.getWorkMailbox = (mailboxTarget) => (
+    mailboxTarget.kind === "role-runtime" ? mailbox : null
+  );
+  store.claimWorkMailbox = ({ batchId, owner, now, executionRef }) => {
+    if (mailbox.processing !== null) {
+      return { status: "processing", processing: mailbox.processing };
+    }
+    if (mailbox.pending === null) return { status: "empty" };
+    mailbox = {
+      ...mailbox,
+      pending: null,
+      processing: {
+        batchId, batch: mailbox.pending, owner, startedAt: now.toISOString(),
+        ...(executionRef === undefined ? {} : { executionRef })
+      }
+    };
+    return { status: "claimed", processing: mailbox.processing };
+  };
+  store.releaseWorkMailbox = (_target, batchId) => {
+    if (mailbox.processing?.batchId !== batchId) return false;
+    mailbox = { ...mailbox, pending: mailbox.processing.batch, processing: null };
+    return true;
+  };
+  store.completeWorkMailbox = (_target, batchId) => {
+    if (mailbox.processing?.batchId !== batchId) return false;
+    mailbox = { ...mailbox, processing: null };
+    return true;
+  };
+  store.completeRuntimeCleanup = () => {
+    if (mailbox.pending === null && mailbox.processing === null) return false;
+    mailbox = { ...mailbox, pending: null, processing: null };
+    return true;
+  };
+  const lifecycleHost = {
+    async stopOwner() {
+      stopCalls += 1;
+      if (stopCalls === 1) throw new Error("tmux is temporarily unavailable");
+      secondStop();
+      return true;
+    },
+    async inspectOwner() { throw new Error("unused"); }
+  };
+  const controller = new FileTaskController(store, noTmux, {
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
+    deliveryRetryLimit: 2,
+    onError() {},
+    lifecycleHost
+  });
+
+  controller.signal("role:task-1/worker");
+  let timeout;
+  await Promise.race([
+    secondStopped,
+    new Promise((_, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("Controller did not retry stale Role cleanup.")),
+        1_000
+      );
+    })
+  ]);
+  clearTimeout(timeout);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(stopCalls, 2);
+  assert.equal(mailbox.pending, null);
+  assert.equal(mailbox.processing, null);
+  controller.stop();
+});
+
+test("one stale Role cleanup failure does not block another Role delivery", async () => {
+  const tasks = new Map([
+    ["task-cleanup", { id: "task-cleanup", status: "active" }],
+    ["task-delivery", { id: "task-delivery", status: "active" }]
+  ]);
+  const roles = new Map([
+    ["task-cleanup\0worker", role("task-cleanup", "worker")],
+    ["task-delivery\0worker", role("task-delivery", "worker")]
+  ]);
+  const cleanupTarget = {
+    kind: "role-runtime", taskId: "task-cleanup", roleName: "worker"
+  };
+  const deliveryTarget = {
+    kind: "role", taskId: "task-delivery", roleName: "worker"
+  };
+  const cleanupBatch = {
+    fromSequence: 1, toSequence: 1, reasons: ["runtime-cleanup-required"],
+    refs: [{ type: "role", id: "worker" }], requestCount: 1,
+    firstQueuedAt: new Date(0).toISOString(),
+    lastQueuedAt: new Date(0).toISOString()
+  };
+  const deliveryBatch = {
+    fromSequence: 1, toSequence: 1, reasons: ["run-dispatched"],
+    refs: [{ type: "run", id: "run-task-delivery-worker" }], requestCount: 1,
+    firstQueuedAt: new Date(0).toISOString(),
+    lastQueuedAt: new Date(0).toISOString()
+  };
+  const mailboxKey = (target) => `${target.kind}\0${target.taskId}\0${target.roleName}`;
+  const mailboxes = new Map([
+    [mailboxKey(cleanupTarget), {
+      schemaVersion: 1, target: cleanupTarget, nextSequence: 2,
+      processing: null, pending: cleanupBatch
+    }],
+    [mailboxKey(deliveryTarget), {
+      schemaVersion: 1, target: deliveryTarget, nextSequence: 2,
+      processing: null, pending: deliveryBatch
+    }]
+  ]);
+  let run = {
+    ...deliveredRun("task-delivery", "worker"),
+    deliveredAt: undefined
+  };
+  const events = [];
+  const store = emptyStore();
+  store.getTask = (taskId) => tasks.get(taskId) ?? null;
+  store.getRole = (taskId, roleName) => roles.get(`${taskId}\0${roleName}`) ?? null;
+  store.getActiveAgentRun = (taskId) => (
+    taskId === "task-delivery" ? run : null
+  );
+  store.getWorkMailbox = (target) => mailboxes.get(mailboxKey(target)) ?? null;
+  store.claimWorkMailbox = ({ target, batchId, owner, now, executionRef }) => {
+    const key = mailboxKey(target);
+    const mailbox = mailboxes.get(key);
+    if (mailbox === undefined || mailbox.pending === null) {
+      return mailbox?.processing === null || mailbox === undefined
+        ? { status: "empty" }
+        : { status: "processing", processing: mailbox.processing };
+    }
+    const processing = {
+      batchId, batch: mailbox.pending, owner, startedAt: now.toISOString(),
+      ...(executionRef === undefined ? {} : { executionRef })
+    };
+    mailboxes.set(key, { ...mailbox, pending: null, processing });
+    return { status: "claimed", processing };
+  };
+  store.releaseWorkMailbox = (target, batchId) => {
+    const key = mailboxKey(target);
+    const mailbox = mailboxes.get(key);
+    if (mailbox?.processing?.batchId !== batchId) return false;
+    mailboxes.set(key, {
+      ...mailbox, pending: mailbox.processing.batch, processing: null
+    });
+    return true;
+  };
+  store.completeRuntimeCleanup = () => {
+    throw new Error("failed cleanup must not be acknowledged");
+  };
+  store.saveRoleRunPrepared = () => {};
+  store.saveRoleRunDelivery = ({ now }) => {
+    run = { ...run, deliveredAt: now.toISOString() };
+    const mailbox = mailboxes.get(mailboxKey(deliveryTarget));
+    mailboxes.set(mailboxKey(deliveryTarget), {
+      ...mailbox, processing: null
+    });
+  };
+  const lifecycleHost = {
+    async stopOwner(owner) {
+      events.push(`stop:${owner.taskId}`);
+      throw new Error("cleanup A failed");
+    },
+    async inspectOwner() { throw new Error("unused"); }
+  };
+  const delivery = {
+    ...noTmux,
+    async prepareRoleSession(input) {
+      events.push(`prepare:${input.taskId}`);
+      return { ...input, deliveryId: "delivery-b", sessionStarted: true };
+    },
+    async waitUntilReady(prepared) { return { prepared, session: null }; },
+    async sendOnce({ delivery: { prepared } }) {
+      events.push(`send:${prepared.taskId}`);
+      return "sent";
+    },
+    async inspectRole() { return "present"; }
+  };
+
+  const result = await runControllerSchedulerPass(
+    store,
+    delivery,
+    new Date(1),
+    undefined,
+    {
+      kind: "dirty",
+      keys: [
+        "role:task-cleanup/worker",
+        "role:task-delivery/worker"
+      ]
+    },
+    undefined,
+    true,
+    new Set(),
+    [],
+    lifecycleHost
+  );
+
+  assert.deepEqual(events, [
+    "stop:task-cleanup",
+    "prepare:task-delivery",
+    "send:task-delivery"
+  ]);
+  assert.deepEqual(result.activeRunDeliveries, [{
+    taskId: "task-delivery",
+    roleName: "worker",
+    runId: run.id,
+    status: "delivered"
+  }]);
+  assert.equal(
+    mailboxes.get(mailboxKey(cleanupTarget)).pending,
+    cleanupBatch
+  );
+  assert.equal(run.deliveredAt, new Date(1).toISOString());
+});
+
+test("Task and global cleanup obligations supersede launch reservations atomically", async () => {
+  const targets = [
+    { kind: "role-runtime", taskId: "task-1", roleName: "worker" },
+    { kind: "global-role-runtime", roleName: "operator" }
+  ];
+  const key = (target) => target.kind === "role-runtime"
+    ? `task:${target.taskId}/${target.roleName}`
+    : `global:${target.roleName}`;
+  const reservationBatch = {
+    fromSequence: 1, toSequence: 1, reasons: ["runtime-launch-reserved"],
+    refs: [], requestCount: 1,
+    firstQueuedAt: new Date(0).toISOString(),
+    lastQueuedAt: new Date(0).toISOString()
+  };
+  const cleanupBatch = {
+    fromSequence: 2, toSequence: 2, reasons: ["runtime-cleanup-required"],
+    refs: [], requestCount: 1,
+    firstQueuedAt: new Date(1).toISOString(),
+    lastQueuedAt: new Date(1).toISOString()
+  };
+  const mailboxes = new Map(targets.map((target) => [key(target), {
+    schemaVersion: 1,
+    target,
+    nextSequence: 3,
+    processing: {
+      batchId: `launch:${key(target)}`,
+      batch: reservationBatch,
+      owner: "runtime-lifecycle",
+      startedAt: new Date(0).toISOString()
+    },
+    pending: cleanupBatch
+  }]));
+  const stopped = [];
+  const store = emptyStore();
+  store.getTask = () => ({ id: "task-1", status: "active" });
+  store.getRole = () => role("task-1", "worker");
+  store.getWorkMailbox = (target) => mailboxes.get(key(target)) ?? null;
+  store.completeRuntimeCleanup = (target) => {
+    const mailbox = mailboxes.get(key(target));
+    if (mailbox === undefined || mailbox.pending === null) return false;
+    mailboxes.set(key(target), { ...mailbox, processing: null, pending: null });
+    return true;
+  };
+  const lifecycleHost = {
+    async stopOwner(owner) {
+      stopped.push(owner);
+      return true;
+    },
+    async inspectOwner() { throw new Error("unused"); }
+  };
+  const forgotten = [];
+  const delivery = {
+    ...noTmux,
+    forgetPrepared(input) { forgotten.push(input); }
+  };
+
+  await runControllerSchedulerPass(
+    store,
+    delivery,
+    new Date(2),
+    undefined,
+    {
+      kind: "dirty",
+      keys: ["role:task-1/worker", "global-role:operator"]
+    },
+    undefined,
+    true,
+    new Set(),
+    [],
+    lifecycleHost
+  );
+
+  assert.deepEqual(stopped, [
+    { scope: "task", taskId: "task-1", roleName: "worker" },
+    { scope: "global", roleName: "operator" }
+  ]);
+  assert.deepEqual(forgotten, [{
+    taskId: "task-1",
+    roleName: "worker"
+  }]);
+  for (const target of targets) {
+    assert.equal(mailboxes.get(key(target)).processing, null);
+    assert.equal(mailboxes.get(key(target)).pending, null);
+  }
+});
+
+test("full recovery probes old reservations without stopping a healthy host", async () => {
+  const runningTarget = { kind: "global-role-runtime", roleName: "operator" };
+  const stoppedTarget = { kind: "global-role-runtime", roleName: "reviewer" };
+  const reservation = (target) => ({
+    schemaVersion: 1,
+    target,
+    nextSequence: 2,
+    processing: {
+      batchId: `launch:${target.roleName}`,
+      batch: {
+        fromSequence: 1, toSequence: 1, reasons: ["runtime-launch-reserved"],
+        refs: [], requestCount: 1,
+        firstQueuedAt: new Date(0).toISOString(),
+        lastQueuedAt: new Date(0).toISOString()
+      },
+      owner: "runtime-lifecycle",
+      startedAt: new Date(0).toISOString()
+    },
+    pending: null
+  });
+  const mailboxes = new Map([
+    [runningTarget.roleName, reservation(runningTarget)],
+    [stoppedTarget.roleName, reservation(stoppedTarget)]
+  ]);
+  const inspected = [];
+  const store = emptyStore();
+  store.listWorkMailboxes = () => [...mailboxes.values()];
+  store.getWorkMailbox = (target) => target.kind === "global-role-runtime"
+    ? mailboxes.get(target.roleName) ?? null
+    : null;
+  store.completeWorkMailbox = (target, batchId) => {
+    const mailbox = mailboxes.get(target.roleName);
+    if (mailbox?.processing?.batchId !== batchId) return false;
+    mailboxes.set(target.roleName, { ...mailbox, processing: null });
+    return true;
+  };
+  const lifecycleHost = {
+    async inspectOwner(owner) {
+      inspected.push(owner);
+      return {
+        state: owner.roleName === runningTarget.roleName ? "running" : "stopped"
+      };
+    },
+    async stopOwner() {
+      throw new Error("reservation-only recovery must not kill a host");
+    }
+  };
+
+  await runControllerSchedulerPass(
+    store,
+    noTmux,
+    new Date(120_001),
+    undefined,
+    { kind: "full" },
+    undefined,
+    false,
+    new Set(),
+    [],
+    lifecycleHost
+  );
+
+  assert.deepEqual(inspected, [
+    { scope: "global", roleName: "operator" },
+    { scope: "global", roleName: "reviewer" }
+  ]);
+  assert.notEqual(mailboxes.get(runningTarget.roleName).processing, null);
+  assert.equal(mailboxes.get(stoppedTarget.roleName).processing, null);
+});
+
+test("an unavailable stale reservation is re-inspected by its exact dirty retry", async () => {
+  const target = { kind: "global-role-runtime", roleName: "operator" };
+  let mailbox = {
+    schemaVersion: 1,
+    target,
+    nextSequence: 2,
+    processing: {
+      batchId: "launch-stale",
+      batch: {
+        fromSequence: 1, toSequence: 1,
+        reasons: ["runtime-launch-reserved"], refs: [], requestCount: 1,
+        firstQueuedAt: new Date(0).toISOString(),
+        lastQueuedAt: new Date(0).toISOString()
+      },
+      owner: "runtime-lifecycle",
+      startedAt: new Date(0).toISOString()
+    },
+    pending: null
+  };
+  const store = emptyStore();
+  store.listWorkMailboxes = () => mailbox === null ? [] : [mailbox];
+  store.getWorkMailbox = (mailboxTarget) => (
+    mailboxTarget.kind === "global-role-runtime" ? mailbox : null
+  );
+  let completionBatchId;
+  store.completeStoppedRuntimeReservation = (_target, batchId) => {
+    if (mailbox?.processing?.batchId !== batchId) return false;
+    completionBatchId = batchId;
+    mailbox = null;
+    return true;
+  };
+  let inspections = 0;
+  let resolveStopped;
+  const stopped = new Promise((resolve) => { resolveStopped = resolve; });
+  const lifecycleHost = {
+    async inspectOwner(owner) {
+      assert.deepEqual(owner, { scope: "global", roleName: "operator" });
+      inspections += 1;
+      if (inspections === 1) return { state: "unavailable" };
+      resolveStopped();
+      return { state: "stopped" };
+    },
+    async stopOwner() { throw new Error("reservation recovery must not kill"); }
+  };
+  const controller = new FileTaskController(store, noTmux, {
+    now: () => new Date(120_001),
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
+    deliveryRetryLimit: 2,
+    lifecycleHost,
+    onError() {}
+  });
+
+  await controller.pump();
+  let timeout;
+  await Promise.race([
+    stopped,
+    new Promise((_, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("stale reservation dirty retry did not run")),
+        1_000
+      );
+    })
+  ]);
+  clearTimeout(timeout);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(inspections, 2);
+  assert.equal(completionBatchId, "launch-stale");
+  assert.equal(mailbox, null);
+  controller.stop();
+});
+
+test("global Role cleanup retries on its own key without consuming Operator work", async () => {
+  const target = { kind: "global-role-runtime", roleName: "operator" };
+  const batch = {
+    fromSequence: 1, toSequence: 1, reasons: ["runtime-cleanup-required"],
+    refs: [], requestCount: 1,
+    firstQueuedAt: new Date(0).toISOString(),
+    lastQueuedAt: new Date(0).toISOString()
+  };
+  let mailbox = {
+    schemaVersion: 1, target, nextSequence: 2, processing: null, pending: batch
+  };
+  let stopCalls = 0;
+  let operatorReads = 0;
+  let resolveStopped;
+  const stopped = new Promise((resolve) => { resolveStopped = resolve; });
+  const store = emptyStore();
+  store.getWorkMailbox = (mailboxTarget) => {
+    if (mailboxTarget.kind === "operator") {
+      operatorReads += 1;
+      return null;
+    }
+    return mailboxTarget.kind === "global-role-runtime" ? mailbox : null;
+  };
+  store.completeRuntimeCleanup = () => {
+    mailbox = { ...mailbox, pending: null, processing: null };
+    return true;
+  };
+  const lifecycleHost = {
+    async stopOwner(owner) {
+      assert.deepEqual(owner, { scope: "global", roleName: "operator" });
+      stopCalls += 1;
+      if (stopCalls === 1) return false;
+      resolveStopped();
+      return true;
+    },
+    async inspectOwner() { throw new Error("unused"); }
+  };
+  const controller = new FileTaskController(store, noTmux, {
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
+    deliveryRetryLimit: 2,
+    onError() {},
+    lifecycleHost
+  });
+
+  controller.signal("global-role:operator");
+  let timeout;
+  await Promise.race([
+    stopped,
+    new Promise((_, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("global Role cleanup retry did not run")),
+        1_000
+      );
+    })
+  ]);
+  clearTimeout(timeout);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(stopCalls, 2);
+  assert.ok(operatorReads >= 1);
+  assert.equal(mailbox.pending, null);
+  assert.equal(mailbox.processing, null);
+  controller.stop();
+});
+
+test("stale Role cleanup finishes before a concurrently queued Run may launch", async () => {
+  const task = { id: "task-1", status: "active" };
+  const roleValue = role(task.id, "worker");
+  const cleanupTarget = {
+    kind: "role-runtime", taskId: task.id, roleName: roleValue.name
+  };
+  const runTarget = { kind: "role", taskId: task.id, roleName: roleValue.name };
+  const cleanupBatch = {
+    fromSequence: 1, toSequence: 1, reasons: ["runtime-cleanup-required"],
+    refs: [{ type: "role", id: roleValue.name }], requestCount: 1,
+    firstQueuedAt: new Date(0).toISOString(),
+    lastQueuedAt: new Date(0).toISOString()
+  };
+  const runBatch = {
+    fromSequence: 2, toSequence: 2, reasons: ["run-dispatched"],
+    refs: [{ type: "run", id: "run-new" }], requestCount: 1,
+    firstQueuedAt: new Date(1).toISOString(),
+    lastQueuedAt: new Date(1).toISOString()
+  };
+  let cleanupMailbox = {
+    schemaVersion: 1, target: cleanupTarget, nextSequence: 2,
+    processing: null, pending: cleanupBatch
+  };
+  let runMailbox = {
+    schemaVersion: 1, target: runTarget, nextSequence: 2,
+    processing: null, pending: null
+  };
+  let run = null;
+  let releaseStop;
+  let announceStop;
+  const stopBlocked = new Promise((resolve) => { releaseStop = resolve; });
+  const stopStarted = new Promise((resolve) => { announceStop = resolve; });
+  const events = [];
+  const store = emptyStore();
+  store.getTask = () => task;
+  store.getRole = () => roleValue;
+  store.getActiveAgentRun = () => run;
+  store.getWorkMailbox = (mailboxTarget) => {
+    if (mailboxTarget.kind === "role-runtime") return cleanupMailbox;
+    if (mailboxTarget.kind === "role") return runMailbox;
+    return null;
+  };
+  store.claimWorkMailbox = ({ target, batchId, owner, now, executionRef }) => {
+    let mailbox = target.kind === "role-runtime" ? cleanupMailbox : runMailbox;
+    if (mailbox.processing !== null) {
+      return { status: "processing", processing: mailbox.processing };
+    }
+    if (mailbox.pending === null) return { status: "empty" };
+    mailbox = {
+      ...mailbox,
+      pending: null,
+      processing: {
+        batchId, batch: mailbox.pending, owner, startedAt: now.toISOString(),
+        ...(executionRef === undefined ? {} : { executionRef })
+      }
+    };
+    if (target.kind === "role-runtime") cleanupMailbox = mailbox;
+    else runMailbox = mailbox;
+    return { status: "claimed", processing: mailbox.processing };
+  };
+  store.completeWorkMailbox = (target, batchId) => {
+    let mailbox = target.kind === "role-runtime" ? cleanupMailbox : runMailbox;
+    if (mailbox.processing?.batchId !== batchId) return false;
+    mailbox = { ...mailbox, processing: null };
+    if (target.kind === "role-runtime") cleanupMailbox = mailbox;
+    else runMailbox = mailbox;
+    return true;
+  };
+  store.completeRuntimeCleanup = () => {
+    cleanupMailbox = { ...cleanupMailbox, pending: null, processing: null };
+    return true;
+  };
+  store.releaseWorkMailbox = () => false;
+  store.saveRoleRunPrepared = () => {};
+  store.saveRoleRunDelivery = ({ now }) => {
+    run = { ...run, deliveredAt: now.toISOString() };
+    runMailbox = { ...runMailbox, processing: null };
+  };
+  const lifecycleHost = {
+    async stopOwner() {
+      events.push("stop-started");
+      announceStop();
+      await stopBlocked;
+      events.push("stop-finished");
+      return true;
+    },
+    async inspectOwner() { throw new Error("unused"); }
+  };
+  const delivery = {
+    ...noTmux,
+    async prepareRoleSession(input) {
+      events.push("prepare-new");
+      return { ...input, deliveryId: "delivery-new", sessionStarted: true };
+    },
+    async waitUntilReady(prepared) { return { prepared, session: null }; },
+    async sendOnce() { events.push("send-new"); return "sent"; },
+    async inspectRole() { return "present"; }
+  };
+
+  const pass = runControllerSchedulerPass(
+    store,
+    delivery,
+    new Date(2),
+    undefined,
+    {
+      kind: "dirty",
+      keys: ["role:task-1/worker"]
+    },
+    undefined,
+    true,
+    new Set(),
+    [],
+    lifecycleHost
+  );
+  await stopStarted;
+  run = {
+    ...deliveredRun(task.id, roleValue.name),
+    id: "run-new",
+    deliveredAt: undefined
+  };
+  runMailbox = { ...runMailbox, pending: runBatch, nextSequence: 3 };
+  assert.deepEqual(events, ["stop-started"]);
+
+  releaseStop();
+  await pass;
+
+  assert.deepEqual(events, [
+    "stop-started",
+    "stop-finished",
+    "prepare-new",
+    "send-new"
+  ]);
+  assert.notEqual(run.deliveredAt, undefined);
+});
+
+test("full recovery releases only Task mailboxes whose isolated workspace work failed", async () => {
+  const batch = {
+    fromSequence: 1, toSequence: 1, reasons: ["task-updated"], refs: [],
+    requestCount: 1, firstQueuedAt: new Date(0).toISOString(), lastQueuedAt: new Date(0).toISOString()
+  };
+  const targets = ["task-ok", "task-failed"].map((taskId) => ({ kind: "task", taskId }));
+  const mailboxes = new Map(targets.map((target) => [target.taskId, {
+    schemaVersion: 1, target, nextSequence: 2, processing: null, pending: batch
+  }]));
+  const settled = [];
+  const store = emptyStore();
+  store.listWorkMailboxes = () => [...mailboxes.values()];
+  store.getTask = (taskId) => ({ id: taskId, status: "active" });
+  store.getWorkMailbox = (target) => mailboxes.get(target.taskId) ?? null;
+  store.claimWorkMailbox = ({ target }) => ({
+    status: "claimed",
+    processing: {
+      batchId: `task:${target.taskId}:1-1`, batch, owner: "controller", startedAt: new Date(0).toISOString()
+    }
+  });
+  store.completeWorkMailbox = (target) => { settled.push(`complete:${target.taskId}`); return true; };
+  store.releaseWorkMailbox = (target) => { settled.push(`release:${target.taskId}`); return true; };
+  const workspace = {
+    async prepareTaskWorkspace(taskId) {
+      return taskId === "task-failed"
+        ? { taskId, status: "failed", error: "git failed" }
+        : { taskId, status: "ready" };
+    },
+    async prepareActiveTaskWorkspaces() { throw new Error("periodic full scan is forbidden"); },
+    async cleanupArchivedTaskWorkspaces() { return []; }
+  };
+
+  await runControllerSchedulerPass(store, noTmux, new Date(0), workspace);
+
+  assert.deepEqual(settled, ["complete:task-ok", "release:task-failed"]);
 });
 
 test("controller delivers a queued Work AgentRun through tmux before liveness", async () => {
@@ -117,8 +1103,22 @@ test("controller delivers a queued Work AgentRun through tmux before liveness", 
   };
   const store = emptyStore();
   store.listTasks = () => [task];
+  store.getTask = (taskId) => taskId === task.id ? task : null;
   store.listRoles = () => [role];
   store.getActiveAgentRun = () => run;
+  store.claimWorkMailbox = () => ({
+    status: "claimed",
+    processing: {
+      batchId: "agent-run:run-1",
+      batch: {
+        fromSequence: 1, toSequence: 1, reasons: ["work-dispatched"], refs: [{ type: "run", id: run.id }],
+        requestCount: 1, firstQueuedAt: new Date(0).toISOString(), lastQueuedAt: new Date(0).toISOString()
+      },
+      owner: "controller",
+      startedAt: new Date(0).toISOString(),
+      executionRef: { type: "run", id: run.id }
+    }
+  });
   store.saveRoleRunDelivery = ({ run: saved }) => events.push(`persist:${saved.id}`);
   const delivery = {
     async stopTask() { return false; },
@@ -129,7 +1129,6 @@ test("controller delivers a queued Work AgentRun through tmux before liveness", 
         agentId: role.activeAgentId, adapterId: role.adapterId, mode: "new"
       };
     },
-    async findExistingReceipt() { events.push("receipt"); return null; },
     async waitUntilReady(prepared) {
       events.push("ready");
       return { prepared, session: null };
@@ -146,7 +1145,6 @@ test("controller delivers a queued Work AgentRun through tmux before liveness", 
   assert.equal(result.activeRunDeliveries[0].status, "delivered");
   assert.deepEqual(events, [
     "prepare",
-    "receipt",
     "ready",
     "send:agent-run:run-1:implement it",
     "persist:run-1",
@@ -159,16 +1157,180 @@ test("controller archives are enforced by killing the tmux Task and stopping ses
   const calls = [];
   const store = emptyStore();
   store.listTasks = () => [task];
+  store.getTask = (taskId) => taskId === task.id ? task : null;
   store.saveArchivedTaskStopped = (taskId) => calls.push(`stored:${taskId}`);
   const delivery = {
     ...noTmux,
     async stopTask(taskId) { calls.push(`tmux:${taskId}`); return true; }
   };
 
-  const result = await runControllerSchedulerPass(store, delivery, new Date(0));
+  const result = await runControllerSchedulerPass(
+    store,
+    delivery,
+    new Date(0),
+    undefined,
+    { kind: "dirty", keys: [`task:${task.id}`] }
+  );
 
   assert.deepEqual(result.stoppedArchivedTaskIds, [task.id]);
   assert.deepEqual(calls, [`tmux:${task.id}`, `stored:${task.id}`]);
+});
+
+test("dirty mailbox keys compile into exact task, role and operator selections", () => {
+  const selection = compileReconcileSelection({
+    kind: "dirty",
+    keys: [
+      "task:task-1", "role:task-2/worker", "operator", "role:task-2/reviewer",
+      "role:task%2F3/review%2Fer"
+    ]
+  });
+
+  assert.equal(selection.full, false);
+  assert.deepEqual([...selection.taskIds], ["task-1", "task-2", "task/3"]);
+  assert.deepEqual([...selection.allRoleTaskIds], ["task-1"]);
+  assert.deepEqual([...selection.rolesByTask.get("task-2")], ["worker", "reviewer"]);
+  assert.deepEqual([...selection.rolesByTask.get("task/3")], ["review/er"]);
+  assert.equal(selection.operator, true);
+  assert.throws(
+    () => compileReconcileSelection({ kind: "dirty", keys: ["role:task-1"] }),
+    /mailbox key/i
+  );
+});
+
+test("dirty Task reconciliation filters every Task phase and preserves workspace ordering", async () => {
+  const events = [];
+  const active = { id: "task-active", status: "active", repositoryId: "repository-1" };
+  const archived = { id: "task-archived", status: "archived", repositoryId: "repository-1" };
+  const tasks = new Map([[active.id, active], [archived.id, archived]]);
+  const store = emptyStore(events);
+  store.listTasks = () => { throw new Error("dirty pass must not list every Task"); };
+  store.getTask = (taskId) => tasks.get(taskId) ?? null;
+  store.listRoles = (taskId) => { events.push(`roles:${taskId}`); return []; };
+  store.getPendingWakeup = (taskId) => { events.push(`wake:${taskId}`); return null; };
+  store.resolveExpiredInputRecommendations = (_now, taskIds) => {
+    events.push(`deadlines:${[...taskIds].join(",")}`);
+    return [];
+  };
+  store.listOpenInputRequests = () => { throw new Error("Task pass must not notify Operator"); };
+  const workspace = {
+    async prepareTaskWorkspace(taskId) { events.push(`workspace:${taskId}`); return { taskId, status: "ready" }; },
+    async prepareActiveTaskWorkspaces() { throw new Error("dirty pass must not prepare all Tasks"); },
+    async cleanupArchivedTaskWorkspaces() { throw new Error("dirty pass must not clean all Tasks"); }
+  };
+  const delivery = {
+    ...noTmux,
+    async stopTask(taskId) { events.push(`stop:${taskId}`); return true; }
+  };
+
+  await runControllerSchedulerPass(store, delivery, new Date(0), workspace, {
+    kind: "dirty",
+    keys: ["task:task-active", "task:task-archived"]
+  });
+
+  assert.ok(events.indexOf("workspace:task-active") < events.indexOf("stop:task-archived"));
+  assert.ok(events.indexOf("stop:task-archived") < events.indexOf("workspace:task-archived"));
+  assert.deepEqual(events.filter((event) => event.startsWith("deadlines:")), [
+    "deadlines:task-active,task-archived"
+  ]);
+  assert.deepEqual([...new Set(events.filter((event) => event.startsWith("wake:")))].sort(), [
+    "wake:task-active", "wake:task-archived"
+  ]);
+});
+
+test("dirty Role reconciliation inspects only that Role while retaining the Task Leader closure", async () => {
+  const task = { id: "task-1", status: "active" };
+  const roles = ["worker", "reviewer"].map((name) => ({
+    taskId: task.id, name, activeAgentId: `codex-${name}`, adapterId: "codex", status: "running"
+  }));
+  const inspected = [];
+  const store = emptyStore();
+  store.getTask = (taskId) => taskId === task.id ? task : null;
+  store.getRole = (taskId, roleName) => roles.find(
+    (role) => role.taskId === taskId && role.name === roleName
+  ) ?? null;
+  store.getActiveAgentRun = (_taskId, roleName) => ({
+    schemaVersion: 1, id: `run-${roleName}`, taskId: task.id, roleName,
+    mode: "new", input: roleName, status: "active", deliveredAt: new Date(0).toISOString(),
+    createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString()
+  });
+  store.resolveExpiredInputRecommendations = () => [];
+  const delivery = {
+    ...noTmux,
+    async inspectRole(input) { inspected.push(input.roleName); return "present"; }
+  };
+  const workspace = {
+    async prepareTaskWorkspace() {
+      throw new Error("Role-only pass must not prepare the Task workspace");
+    },
+    async prepareActiveTaskWorkspaces() {
+      throw new Error("Role-only pass must not prepare all Task workspaces");
+    },
+    async cleanupArchivedTaskWorkspaces() {
+      throw new Error("Role-only pass must not clean archived Task workspaces");
+    }
+  };
+
+  await runControllerSchedulerPass(store, delivery, new Date(0), workspace, {
+    kind: "dirty", keys: ["role:task-1/worker"]
+  });
+
+  assert.deepEqual(inspected, ["worker"]);
+});
+
+test("an Operator-only dirty pass does not scan Task phases", async () => {
+  const store = emptyStore();
+  store.listTasks = () => { throw new Error("operator pass must not list Tasks"); };
+  store.getTask = () => { throw new Error("operator pass must not read Tasks"); };
+  let mailboxReads = 0;
+  store.getWorkMailbox = (target) => { mailboxReads += 1; assert.equal(target.kind, "operator"); return null; };
+
+  await runControllerSchedulerPass(store, noTmux, new Date(0), undefined, {
+    kind: "dirty", keys: ["operator"]
+  });
+
+  assert.equal(mailboxReads, 1);
+});
+
+test("Operator attention is not blocked by a slow Task reconciliation", async () => {
+  let releaseWorkspace;
+  let workspaceStarted;
+  const blocked = new Promise((resolve) => { releaseWorkspace = resolve; });
+  const started = new Promise((resolve) => { workspaceStarted = resolve; });
+  let operatorReads = 0;
+  const store = emptyStore();
+  store.getTask = (taskId) => taskId === "task-1"
+    ? { id: taskId, status: "active" }
+    : null;
+  store.getWorkMailbox = (target) => {
+    if (target.kind === "operator") operatorReads += 1;
+    return null;
+  };
+  const workspace = {
+    async prepareTaskWorkspace() {
+      workspaceStarted();
+      await blocked;
+      return { taskId: "task-1", status: "ready" };
+    },
+    async prepareActiveTaskWorkspaces() { return []; },
+    async cleanupArchivedTaskWorkspaces() { return []; }
+  };
+  const controller = new FileTaskController(store, noTmux, {
+    signalWindowMs: 1,
+    workspacePreparer: workspace
+  });
+
+  controller.signal("task:task-1");
+  await started;
+  controller.signal("operator");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.equal(operatorReads, 1);
+  releaseWorkspace();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  // The Task pass performs one O(1) mailbox check after it can create
+  // Operator attention; the queued Operator-only fold does not rescan it.
+  assert.equal(operatorReads, 2);
+  controller.stop();
 });
 
 test("controller pump coalesces overlap into one non-overlapping follow-up pass", async () => {
@@ -218,18 +1380,75 @@ test("controller pump coalesces overlap into one non-overlapping follow-up pass"
   releaseFirst();
   await first;
 
-  // Each pass visits archived cleanup, queued Work delivery and liveness.
+  // Each pass visits queued Work delivery, liveness, and orphan recovery.
+  // Unsupported readiness recovery does not add another Task scan.
   assert.equal(listCalls, 6);
   assert.equal(inspections, 2);
   assert.equal(maxActive, 1);
   controller.stop();
 });
 
-test("controller reconciliation defaults to 30 seconds and accepts the configured range", () => {
-  assert.equal(DEFAULT_RECONCILIATION_INTERVAL_SECONDS, 30);
+test("an unapplied Hook event fences destructive scheduler phases", async () => {
+  let schedulerReads = 0;
+  const store = emptyStore();
+  store.listTasks = () => {
+    schedulerReads += 1;
+    return [];
+  };
+  const controller = new FileTaskController(store, noTmux, {
+    runtimeEventProcessor: {
+      drain() {
+        return {
+          acknowledgedEventIds: [],
+          failed: [{ eventId: "turn-failed", error: new Error("state unavailable") }]
+        };
+      }
+    }
+  });
+
+  await assert.rejects(controller.pump(), /native Turn events could not be applied/i);
+
+  assert.equal(schedulerReads, 0);
+  controller.stop();
+});
+
+test("a transient Hook apply failure retries quickly without another external signal", async () => {
+  let drains = 0;
+  let schedulerReads = 0;
+  const store = emptyStore();
+  store.listTasks = () => {
+    schedulerReads += 1;
+    return [];
+  };
+  const controller = new FileTaskController(store, noTmux, {
+    deliveryRetryMs: 2,
+    runtimeEventProcessor: {
+      drain() {
+        drains += 1;
+        return drains === 1
+          ? {
+              acknowledgedEventIds: [],
+              deferred: [],
+              failed: [{ eventId: "turn-transient", error: new Error("locked") }]
+            }
+          : { acknowledgedEventIds: [], deferred: [], failed: [] };
+      }
+    }
+  });
+
+  await assert.rejects(controller.pump(), /native Turn events could not be applied/i);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.ok(drains >= 3);
+  assert.ok(schedulerReads > 0);
+  controller.stop();
+});
+
+test("controller recovery reconciliation defaults to 120 seconds and accepts the configured range", () => {
+  assert.equal(DEFAULT_RECONCILIATION_INTERVAL_SECONDS, 120);
   assert.equal(MIN_RECONCILIATION_INTERVAL_SECONDS, 5);
   assert.equal(MAX_RECONCILIATION_INTERVAL_SECONDS, 300);
-  assert.equal(reconciliationIntervalMilliseconds(), 30_000);
+  assert.equal(reconciliationIntervalMilliseconds(), 120_000);
   assert.equal(reconciliationIntervalMilliseconds(5), 5_000);
   assert.equal(reconciliationIntervalMilliseconds(300), 300_000);
   for (const value of [4, 301, 30.5, "30"]) {
@@ -240,10 +1459,11 @@ test("controller reconciliation defaults to 30 seconds and accepts the configure
   }
 });
 
-test("state changes still request an immediate Controller scan", async () => {
+test("state changes enqueue a Controller signal without waiting for a full scan", async () => {
   const methods = [];
-  let scanCompleted;
-  const scanned = new Promise((resolve) => { scanCompleted = resolve; });
+  const params = [];
+  let signalCompleted;
+  const signalled = new Promise((resolve) => { signalCompleted = resolve; });
   const runtime = new FileTaskWorkflowRuntime(
     "/tmp/yui-state-change-scan",
     { getTask: () => null },
@@ -252,26 +1472,64 @@ test("state changes still request an immediate Controller scan", async () => {
     {},
     undefined,
     {
-      call: async (_home, method) => {
+      call: async (_home, method, input) => {
         methods.push(method);
+        params.push(input);
         if (method === "controller.status") return { running: true };
-        assert.equal(method, "scheduler.scan");
-        scanCompleted();
-        return {};
+        assert.equal(method, "scheduler.signal");
+        signalCompleted();
+        return { accepted: true };
       }
     }
   );
 
   runtime.notifyStateChanged("task-1");
-  await scanned;
+  await signalled;
 
-  assert.deepEqual(methods, ["controller.status", "scheduler.scan"]);
+  assert.deepEqual(methods, ["scheduler.signal"]);
+  assert.deepEqual(params, [{ key: "task:task-1" }]);
 });
 
-test("foreground runtime prepares active Role worktrees but leaves archive cleanup to Controller order", async () => {
+test("foreground enter asks the Controller to own session creation", async () => {
+  const calls = [];
+  const runtime = new FileTaskWorkflowRuntime(
+    "/tmp/yui-controller-owned-session",
+    {},
+    {},
+    { plan() { throw new Error("CLI planner must not run"); } },
+    { ensureRoleWindow() { throw new Error("CLI tmux creator must not run"); } },
+    undefined,
+    {
+      call: async (_home, method, params) => {
+        calls.push([method, params]);
+        return { ensured: true };
+      }
+    }
+  );
+
+  await runtime.prepareTaskRoleEnter({ taskId: "task-1", roleName: "leader" });
+  await runtime.prepareGlobalRoleEnter("operator");
+
+  assert.deepEqual(calls, [
+    ["runtime.ensure-role-session", {
+      scope: "task",
+      taskId: "task-1",
+      roleName: "leader"
+    }],
+    ["runtime.ensure-role-session", {
+      scope: "global",
+      roleName: "operator"
+    }],
+    ["scheduler.signal", {
+      key: "operator"
+    }]
+  ]);
+});
+
+test("explicit reconciliation prepares active Role worktrees before requesting a full scan", async () => {
   for (const [status, expected] of [
-    ["active", ["prepare", "controller.status", "scheduler.scan"]],
-    ["archived", ["controller.status", "scheduler.scan"]]
+    ["active", ["prepare", "scheduler.scan"]],
+    ["archived", ["scheduler.scan"]]
   ]) {
     const events = [];
     let scanCompleted;
@@ -293,10 +1551,756 @@ test("foreground runtime prepares active Role worktrees but leaves archive clean
       }
     );
 
-    runtime.notifyStateChanged("task-1");
+    runtime.reconcileTask("task-1");
     await scanned;
     assert.deepEqual(events, expected);
   }
+});
+
+test("Controller signals coalesce a burst into one delayed targeted pass", async () => {
+  const taskReads = [];
+  const store = emptyStore();
+  store.getTask = (taskId) => { taskReads.push(taskId); return null; };
+  const controller = new FileTaskController(store, noTmux, { signalWindowMs: 5 });
+
+  controller.signal("task:task-1");
+  controller.signal("task:task-1");
+  controller.signal("task:task-2");
+  assert.deepEqual(taskReads, []);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  assert.deepEqual([...new Set(taskReads)].sort(), ["task-1", "task-2"]);
+  controller.stop();
+});
+
+test("signals received during a pass are frozen into the next non-overlapping batch", async () => {
+  const tasks = ["task-1", "task-2"].map((id) => ({ id, status: "active" }));
+  let releaseFirst;
+  let announceFirst;
+  const firstStarted = new Promise((resolve) => { announceFirst = resolve; });
+  const firstBlocked = new Promise((resolve) => { releaseFirst = resolve; });
+  const inspected = [];
+  let active = 0;
+  let maxActive = 0;
+  const store = emptyStore();
+  store.getTask = (taskId) => tasks.find((task) => task.id === taskId) ?? null;
+  store.getRole = (taskId, roleName) => roleName === "worker" ? role(taskId, roleName) : null;
+  store.getActiveAgentRun = (taskId, roleName) => deliveredRun(taskId, roleName);
+  const delivery = {
+    ...noTmux,
+    async inspectRole(input) {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      inspected.push(input.taskId);
+      if (input.taskId === "task-1") {
+        announceFirst();
+        await firstBlocked;
+      }
+      active -= 1;
+      return "present";
+    }
+  };
+  const controller = new FileTaskController(store, delivery, { signalWindowMs: 1 });
+
+  controller.signal("role:task-1/worker");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await firstStarted;
+  controller.signal("role:task-2/worker");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  releaseFirst();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.deepEqual(inspected, ["task-1", "task-2"]);
+  assert.equal(maxActive, 1);
+  controller.stop();
+});
+
+test("a failed Task workspace is retried without starving peers and stops at the retry bound", async () => {
+  const target = { kind: "task", taskId: "task-1" };
+  const batch = {
+    fromSequence: 1, toSequence: 1, reasons: ["task-updated"], refs: [],
+    requestCount: 1, firstQueuedAt: new Date(0).toISOString(),
+    lastQueuedAt: new Date(0).toISOString()
+  };
+  let mailbox = {
+    schemaVersion: 1, target, nextSequence: 2, processing: null, pending: batch
+  };
+  let attempts = 0;
+  const store = emptyStore();
+  store.getTask = () => ({ id: "task-1", status: "active" });
+  store.getWorkMailbox = (mailboxTarget) => (
+    mailboxTarget.kind === "task" ? mailbox : null
+  );
+  store.claimWorkMailbox = ({ batchId, owner, now }) => {
+    if (mailbox.processing !== null) {
+      return { status: "processing", processing: mailbox.processing };
+    }
+    if (mailbox.pending === null) return { status: "empty" };
+    mailbox = {
+      ...mailbox,
+      pending: null,
+      processing: { batchId, batch: mailbox.pending, owner, startedAt: now.toISOString() }
+    };
+    return { status: "claimed", processing: mailbox.processing };
+  };
+  store.releaseWorkMailbox = (_target, batchId) => {
+    if (mailbox.processing?.batchId !== batchId) return false;
+    mailbox = {
+      ...mailbox,
+      pending: mailbox.processing.batch,
+      processing: null
+    };
+    return true;
+  };
+  store.completeWorkMailbox = () => { throw new Error("failed work must not be acknowledged"); };
+  const workspace = {
+    async prepareTaskWorkspace() {
+      attempts += 1;
+      throw new Error("transient workspace failure");
+    },
+    async prepareActiveTaskWorkspaces() { return []; },
+    async cleanupArchivedTaskWorkspaces() { return []; }
+  };
+  const controller = new FileTaskController(store, noTmux, {
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
+    deliveryRetryLimit: 2,
+    workspacePreparer: workspace,
+    onError() {}
+  });
+
+  controller.signal("task:task-1");
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  assert.equal(attempts, 3);
+  assert.notEqual(mailbox.pending, null);
+  controller.stop();
+});
+
+test("an existing busy Operator gets bounded delivery retries without startup arming", async () => {
+  const fixture = operatorRuntimeFixture();
+  fixture.enqueue();
+  let sends = 0;
+  const delivery = {
+    ...noTmux,
+    async notifyOperatorInputOnce() {
+      sends += 1;
+      return sends === 1 ? "not-ready" : "sent";
+    }
+  };
+  const controller = new FileTaskController(fixture.store, delivery, {
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
+    deliveryRetryLimit: 2
+  });
+
+  controller.signal("operator");
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  assert.equal(sends, 2);
+  assert.equal(fixture.mailbox.pending, null);
+  assert.equal(fixture.mailbox.processing, null);
+  controller.stop();
+});
+
+test("a dirty Hook fold signals Operator work created after scheduler phases", async () => {
+  const fixture = operatorRuntimeFixture();
+  let drains = 0;
+  let sends = 0;
+  const delivery = {
+    ...noTmux,
+    async notifyOperatorInputOnce() {
+      sends += 1;
+      return "sent";
+    }
+  };
+  const controller = new FileTaskController(fixture.store, delivery, {
+    signalWindowMs: 1,
+    runtimeEventProcessor: {
+      drain() {
+        drains += 1;
+        if (drains === 2) fixture.enqueue();
+        return { acknowledgedEventIds: [], deferred: [], failed: [] };
+      }
+    }
+  });
+
+  controller.signal("role:task-1/leader");
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  assert.equal(drains, 2);
+  assert.equal(sends, 1);
+  assert.equal(fixture.mailbox.pending, null);
+  controller.stop();
+});
+
+test("a non-ready Role delivery uses bounded queued retries instead of blocking readiness polling", async () => {
+  const task = { id: "task-1", status: "active" };
+  const roleValue = role(task.id, "worker");
+  let run = deliveredRun(task.id, roleValue.name);
+  delete run.deliveredAt;
+  let sends = 0;
+  const store = emptyStore();
+  store.getTask = () => task;
+  store.getRole = () => roleValue;
+  store.getActiveAgentRun = () => run;
+  store.claimWorkMailbox = () => ({
+    status: "processing",
+    processing: {
+      batchId: `agent-run:${run.id}`,
+      batch: {
+        fromSequence: 1, toSequence: 1, reasons: ["run-dispatched"], refs: [{ type: "run", id: run.id }],
+        requestCount: 1, firstQueuedAt: new Date(0).toISOString(), lastQueuedAt: new Date(0).toISOString()
+      },
+      owner: "controller", startedAt: new Date(0).toISOString(),
+      executionRef: { type: "run", id: run.id }
+    }
+  });
+  store.saveRoleRunDelivery = ({ now }) => { run = { ...run, deliveredAt: now.toISOString() }; };
+  const delivery = {
+    ...noTmux,
+    async prepareRoleSession(input) {
+      return { ...input, deliveryId: "delivery-1", sessionStarted: true };
+    },
+    async waitUntilReady(prepared) { return { prepared, session: null }; },
+    async sendOnce() { sends += 1; return sends < 4 ? "busy" : "sent"; },
+    async inspectRole() { return "present"; }
+  };
+  const controller = new FileTaskController(store, delivery, {
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
+    deliveryRetryLimit: 5
+  });
+
+  controller.signal("role:task-1/worker");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.equal(sends, 4);
+  assert.notEqual(run.deliveredAt, undefined);
+  controller.stop();
+});
+
+test("exhausting Role delivery retries forgets the transient Run preparation", async () => {
+  const task = { id: "task-1", status: "active" };
+  const roleValue = role(task.id, "worker");
+  const run = deliveredRun(task.id, roleValue.name);
+  delete run.deliveredAt;
+  const store = emptyStore();
+  store.getTask = () => task;
+  store.getRole = () => roleValue;
+  store.getActiveAgentRun = () => run;
+  store.claimWorkMailbox = () => ({
+    status: "processing",
+    processing: {
+      batchId: `agent-run:${run.id}`,
+      batch: {
+        fromSequence: 1, toSequence: 1,
+        reasons: ["run-dispatched"],
+        refs: [{ type: "run", id: run.id }],
+        requestCount: 1,
+        firstQueuedAt: new Date(0).toISOString(),
+        lastQueuedAt: new Date(0).toISOString()
+      },
+      owner: "controller",
+      startedAt: new Date(0).toISOString(),
+      executionRef: { type: "run", id: run.id }
+    }
+  });
+  let sends = 0;
+  let resolveForgotten;
+  const forgotten = new Promise((resolve) => { resolveForgotten = resolve; });
+  const delivery = {
+    ...noTmux,
+    async prepareRoleSession(input) {
+      return {
+        ...input,
+        deliveryId: "delivery-retry-exhausted",
+        sessionStarted: false
+      };
+    },
+    async waitUntilReady(prepared) {
+      return { prepared, session: null };
+    },
+    async sendOnce() {
+      sends += 1;
+      return "busy";
+    },
+    async inspectRole() { return "present"; },
+    forgetPrepared(input) { resolveForgotten(input); }
+  };
+  const controller = new FileTaskController(store, delivery, {
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
+    deliveryRetryLimit: 2
+  });
+
+  controller.signal("role:task-1/worker");
+  let timeout;
+  const forgottenInput = await Promise.race([
+    forgotten,
+    new Promise((_, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("prepared Run cache was not released")),
+        1_000
+      );
+    })
+  ]);
+  clearTimeout(timeout);
+
+  assert.equal(sends, 3);
+  assert.deepEqual(forgottenInput, {
+    taskId: task.id,
+    roleName: roleValue.name,
+    runId: run.id
+  });
+  controller.stop();
+});
+
+test("a fresh Controller retries an undelivered Run in an existing busy pane", async () => {
+  const task = { id: "task-1", status: "active" };
+  const roleValue = role(task.id, "worker");
+  const run = {
+    ...deliveredRun(task.id, roleValue.name),
+    mode: "resume"
+  };
+  delete run.deliveredAt;
+  let sends = 0;
+  const store = emptyStore();
+  store.getTask = () => task;
+  store.getRole = () => roleValue;
+  store.getActiveAgentRun = () => run;
+  store.getRoleSession = () => ({
+    agentId: roleValue.activeAgentId,
+    adapterId: roleValue.adapterId,
+    nativeSessionId: "thread-existing",
+    status: "running"
+  });
+  store.claimWorkMailbox = () => ({
+    status: "processing",
+    processing: {
+      batchId: `agent-run:${run.id}`,
+      batch: {
+        fromSequence: 1, toSequence: 1, reasons: ["run-dispatched"], refs: [{ type: "run", id: run.id }],
+        requestCount: 1, firstQueuedAt: new Date(0).toISOString(), lastQueuedAt: new Date(0).toISOString()
+      },
+      owner: "controller", startedAt: new Date(0).toISOString(),
+      executionRef: { type: "run", id: run.id }
+    }
+  });
+  const delivery = {
+    ...noTmux,
+    async prepareRoleSession(input) {
+      return { ...input, deliveryId: "delivery-resume", sessionStarted: false };
+    },
+    async waitUntilReady(prepared) {
+      return { prepared, session: store.getRoleSession() };
+    },
+    async sendOnce() { sends += 1; return sends < 3 ? "busy" : "sent"; },
+    async inspectRole() { return "present"; }
+  };
+  const controller = new FileTaskController(store, delivery, {
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
+    deliveryRetryLimit: 2
+  });
+
+  controller.signal("role:task-1/worker");
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  assert.equal(sends, 3);
+  controller.stop();
+});
+
+test("a resumed Role retries startup readiness when prepare created its missing pane", async () => {
+  const task = { id: "task-1", status: "active" };
+  const roleValue = role(task.id, "worker");
+  const run = { ...deliveredRun(task.id, roleValue.name), mode: "resume" };
+  delete run.deliveredAt;
+  let sends = 0;
+  const store = emptyStore();
+  store.getTask = () => task;
+  store.getRole = () => roleValue;
+  store.getActiveAgentRun = () => run;
+  store.getRoleSession = () => ({
+    agentId: roleValue.activeAgentId,
+    adapterId: roleValue.adapterId,
+    nativeSessionId: "thread-existing",
+    status: "running"
+  });
+  store.claimWorkMailbox = () => ({
+    status: "processing",
+    processing: {
+      batchId: `agent-run:${run.id}`,
+      batch: {
+        fromSequence: 1, toSequence: 1, reasons: ["run-dispatched"],
+        refs: [{ type: "run", id: run.id }], requestCount: 1,
+        firstQueuedAt: new Date(0).toISOString(),
+        lastQueuedAt: new Date(0).toISOString()
+      },
+      owner: "controller", startedAt: new Date(0).toISOString(),
+      executionRef: { type: "run", id: run.id }
+    }
+  });
+  const delivery = {
+    ...noTmux,
+    async prepareRoleSession(input) {
+      return { ...input, deliveryId: "delivery-resume-recreated", sessionStarted: true };
+    },
+    async waitUntilReady(prepared) {
+      return { prepared, session: store.getRoleSession() };
+    },
+    async sendOnce() { sends += 1; return sends === 1 ? "busy" : "sent"; },
+    async inspectRole() { return "present"; }
+  };
+  const controller = new FileTaskController(store, delivery, {
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
+    deliveryRetryLimit: 2
+  });
+
+  controller.signal("role:task-1/worker");
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  assert.equal(sends, 2);
+  controller.stop();
+});
+
+test("a full pump dominates dirty keys queued during the current pass", async () => {
+  const tasks = ["task-1", "task-2"].map((id) => ({ id, status: "active" }));
+  let releaseFirst;
+  let announceFirst;
+  const firstStarted = new Promise((resolve) => { announceFirst = resolve; });
+  const firstBlocked = new Promise((resolve) => { releaseFirst = resolve; });
+  const inspections = new Map();
+  const store = emptyStore();
+  store.listTasks = () => tasks;
+  store.getTask = (taskId) => tasks.find((task) => task.id === taskId) ?? null;
+  store.listRoles = (taskId) => [role(taskId, "worker")];
+  store.getRole = (taskId, roleName) => roleName === "worker" ? role(taskId, roleName) : null;
+  store.getActiveAgentRun = (taskId, roleName) => deliveredRun(taskId, roleName);
+  const delivery = {
+    ...noTmux,
+    async inspectRole(input) {
+      inspections.set(input.taskId, (inspections.get(input.taskId) ?? 0) + 1);
+      if (input.taskId === "task-1" && inspections.get(input.taskId) === 1) {
+        announceFirst();
+        await firstBlocked;
+      }
+      return "present";
+    }
+  };
+  const controller = new FileTaskController(store, delivery, { signalWindowMs: 1 });
+
+  controller.signal("role:task-1/worker");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await firstStarted;
+  controller.signal("role:task-2/worker");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const full = controller.pump();
+  releaseFirst();
+  await full;
+
+  assert.equal(inspections.get("task-1"), 2);
+  assert.equal(inspections.get("task-2"), 1);
+  controller.stop();
+});
+
+test("Controller schedules recommended InputRequest deadlines independently of recovery scans", async () => {
+  const deadline = Date.now() + 20;
+  let open = true;
+  const resolutionScopes = [];
+  const store = emptyStore();
+  store.listOpenInputRequests = () => open
+    ? [{ id: "input-1", taskId: "task-1", policy: {
+        kind: "recommended", recommendedChoiceKey: "safe",
+        timeoutAt: new Date(deadline).toISOString()
+      } }]
+    : [];
+  store.resolveExpiredInputRecommendations = (now, taskIds) => {
+    resolutionScopes.push(taskIds === undefined ? "full" : [...taskIds]);
+    if (now.getTime() >= deadline) open = false;
+    return [];
+  };
+  const controller = new FileTaskController(store, noTmux, { intervalMs: 60_000 });
+
+  controller.start();
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.equal(open, false);
+  assert.equal(resolutionScopes[0], "full");
+  assert.deepEqual(resolutionScopes.find((scope) => Array.isArray(scope)), ["task-1"]);
+  controller.stop();
+});
+
+test("a failed pass cannot postpone a pending Turn completion deadline to the full-scan interval", async () => {
+  const deadline = Date.now() + 20;
+  let pending = true;
+  let failWakeupScan = true;
+  const store = emptyStore();
+  store.listPendingRuntimeTurnCompletions = () => pending
+    ? [{
+        taskId: "task-1",
+        roleName: "leader",
+        runId: "run-1",
+        dueAt: new Date(deadline).toISOString()
+      }]
+    : [];
+  store.resolveDueRuntimeTurnCompletions = (now) => {
+    if (pending && now.getTime() >= deadline) pending = false;
+    return pending ? [] : ["run-1"];
+  };
+  store.listPendingWakeups = () => {
+    if (failWakeupScan) {
+      failWakeupScan = false;
+      throw new Error("transient wakeup scan failure");
+    }
+    return [];
+  };
+  const controller = new FileTaskController(store, noTmux, {
+    intervalMs: 60_000,
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
+    onError() {}
+  });
+
+  await assert.rejects(controller.pump(), /transient wakeup scan failure/);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.equal(pending, false);
+  controller.stop();
+});
+
+test("an overdue semantic deadline uses bounded pass backoff instead of a zero-delay loop", async () => {
+  let failures = 0;
+  const store = emptyStore();
+  store.listPendingRuntimeTurnCompletions = () => [{
+    taskId: "task-1",
+    roleName: "leader",
+    runId: "run-1",
+    dueAt: new Date(Date.now() - 1_000).toISOString()
+  }];
+  store.listPendingWakeups = () => {
+    failures += 1;
+    throw new Error("persistent scheduler failure");
+  };
+  const controller = new FileTaskController(store, noTmux, {
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
+    deliveryRetryLimit: 2,
+    onError() {}
+  });
+
+  await assert.rejects(controller.pump(), /persistent scheduler failure/);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.equal(failures, 3);
+  controller.stop();
+});
+
+test("overdue ready recovery remains targeted and retries until the composer is ready", async () => {
+  const task = { id: "task-1", status: "active" };
+  const roleValue = role(task.id, "worker");
+  let run = {
+    ...deliveredRun(task.id, roleValue.name),
+    deliveredAt: new Date(Date.now() - 1_000).toISOString()
+  };
+  let listTaskCalls = 0;
+  let readinessCalls = 0;
+  let recovered = 0;
+  const store = emptyStore();
+  store.listTasks = () => { listTaskCalls += 1; return [task]; };
+  store.getTask = () => task;
+  store.listRoles = () => [roleValue];
+  store.getRole = () => roleValue;
+  store.getActiveAgentRun = () => run;
+  store.recoverReadyRoleRun = () => {
+    recovered += 1;
+    run = null;
+  };
+  const delivery = {
+    ...noTmux,
+    async inspectRole() { return "present"; },
+    async inspectRoleReadiness() {
+      readinessCalls += 1;
+      return readinessCalls < 3 ? "busy" : "ready";
+    }
+  };
+  const controller = new FileTaskController(store, delivery, {
+    intervalMs: 60_000,
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
+    readyRecoveryAgeMs: 5
+  });
+
+  await controller.pump();
+  const fullPassTaskScans = listTaskCalls;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.equal(readinessCalls, 3);
+  assert.equal(recovered, 1);
+  assert.equal(listTaskCalls, fullPassTaskScans);
+  controller.stop();
+});
+
+test("a terminal Role clears its pending ready-recovery timer", async () => {
+  const task = { id: "task-1", status: "active" };
+  const roleValue = role(task.id, "worker");
+  let run = {
+    ...deliveredRun(task.id, roleValue.name),
+    deliveredAt: new Date().toISOString()
+  };
+  let listTaskCalls = 0;
+  let readinessCalls = 0;
+  const store = emptyStore();
+  store.listTasks = () => { listTaskCalls += 1; return [task]; };
+  store.getTask = () => task;
+  store.listRoles = () => [roleValue];
+  store.getRole = () => roleValue;
+  store.getActiveAgentRun = () => run;
+  const delivery = {
+    ...noTmux,
+    async inspectRole() { return "present"; },
+    async inspectRoleReadiness() {
+      readinessCalls += 1;
+      return "busy";
+    }
+  };
+  const controller = new FileTaskController(store, delivery, {
+    intervalMs: 60_000,
+    signalWindowMs: 1,
+    readyRecoveryAgeMs: 30
+  });
+
+  await controller.pump();
+  const fullPassTaskScans = listTaskCalls;
+  run = null;
+  controller.signal("role:task-1/worker");
+  await new Promise((resolve) => setTimeout(resolve, 70));
+
+  assert.equal(readinessCalls, 0);
+  assert.equal(listTaskCalls, fullPassTaskScans);
+  controller.stop();
+});
+
+function role(taskId, name) {
+  return {
+    taskId, name, activeAgentId: `codex-${name}`, adapterId: "codex", status: "running"
+  };
+}
+
+function deliveredRun(taskId, roleName) {
+  const at = new Date(0).toISOString();
+  return {
+    schemaVersion: 1, id: `run-${taskId}-${roleName}`, taskId, roleName,
+    mode: "new", input: "work", status: "active", deliveredAt: at,
+    createdAt: at, updatedAt: at
+  };
+}
+
+function operatorRuntimeFixture() {
+  const target = { kind: "operator" };
+  const request = {
+    schemaVersion: 1,
+    id: "input-operator",
+    taskId: "task-1",
+    requester: { roleName: "leader", agentId: "codex", runId: "run-leader" },
+    question: "Choose a recovery path?",
+    choices: [],
+    blockedRefs: [],
+    policy: { kind: "required" },
+    status: "open",
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString()
+  };
+  const batch = {
+    fromSequence: 1,
+    toSequence: 1,
+    reasons: ["input-requested"],
+    refs: [{ type: "input", id: request.id }],
+    requestCount: 1,
+    firstQueuedAt: new Date(0).toISOString(),
+    lastQueuedAt: new Date(0).toISOString()
+  };
+  let mailbox = {
+    schemaVersion: 1,
+    target,
+    nextSequence: 2,
+    processing: null,
+    pending: null
+  };
+  const store = emptyStore();
+  store.getInputRequest = (inputRequestId) => inputRequestId === request.id ? request : null;
+  store.getOperatorDeliveryTarget = () => ({ roleName: "operator", adapterId: "codex" });
+  store.getWorkMailbox = (mailboxTarget) => (
+    mailboxTarget.kind === "operator" ? mailbox : null
+  );
+  store.claimWorkMailbox = ({ batchId, owner, now }) => {
+    if (mailbox.processing !== null) {
+      return { status: "processing", processing: mailbox.processing };
+    }
+    if (mailbox.pending === null) return { status: "empty" };
+    mailbox = {
+      ...mailbox,
+      pending: null,
+      processing: { batchId, batch: mailbox.pending, owner, startedAt: now.toISOString() }
+    };
+    return { status: "claimed", processing: mailbox.processing };
+  };
+  store.releaseWorkMailbox = (_target, batchId) => {
+    if (mailbox.processing?.batchId !== batchId) return false;
+    mailbox = { ...mailbox, pending: mailbox.processing.batch, processing: null };
+    return true;
+  };
+  store.completeWorkMailbox = (_target, batchId) => {
+    if (mailbox.processing?.batchId !== batchId) return false;
+    mailbox = { ...mailbox, processing: null };
+    return true;
+  };
+  return {
+    store,
+    get mailbox() { return mailbox; },
+    enqueue() {
+      if (mailbox.pending !== null || mailbox.processing !== null) return;
+      mailbox = { ...mailbox, pending: batch };
+    }
+  };
+}
+
+test("a stopped Controller instance cannot be restarted or accept signals", () => {
+  const controller = new FileTaskController(emptyStore(), noTmux);
+  controller.stop();
+  assert.throws(() => controller.start(), /stopped/i);
+  assert.throws(() => controller.signal("task:task-1"), /stopped/i);
+});
+
+test("Controller shutdown waits for the in-flight reconciliation to drain", async () => {
+  let release;
+  let started;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  const entered = new Promise((resolve) => { started = resolve; });
+  const store = emptyStore();
+  store.listTasks = () => [{ id: "task-1", status: "active" }];
+  store.listRoles = () => [role("task-1", "worker")];
+  store.getActiveAgentRun = () => deliveredRun("task-1", "worker");
+  const delivery = {
+    ...noTmux,
+    async inspectRole() {
+      started();
+      await blocked;
+      return "present";
+    }
+  };
+  const controller = new FileTaskController(store, delivery);
+  const pass = controller.pump();
+  await entered;
+  let drained = false;
+  const shutdown = controller.shutdownAndDrain().then(() => { drained = true; });
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(drained, false);
+  release();
+  await Promise.all([pass, shutdown]);
+  assert.equal(drained, true);
 });
 
 test("background FileTask controller exposes status, scan and stop on one private home socket", async (t) => {
@@ -309,6 +2313,10 @@ test("background FileTask controller exposes status, scan and stop on one privat
   const status = await callController(home, "controller.status", {});
   assert.equal(status.running, true);
   assert.equal(status.pid, process.pid);
+  assert.deepEqual(
+    await callController(home, "scheduler.signal", { key: "task:task-1" }),
+    { accepted: true }
+  );
   assert.deepEqual(await callController(home, "scheduler.scan", {}), {
     stoppedArchivedTaskIds: [],
     activeRunDeliveries: [],
@@ -317,19 +2325,74 @@ test("background FileTask controller exposes status, scan and stop on one privat
     inputNotifications: [],
     autoResolvedInputs: []
   });
+  assert.deepEqual(await callController(home, "scheduler.configure", {}), {
+    configured: true,
+    reconciliationIntervalMs: 60_000
+  });
+  assert.equal(controller.runtime.reconciliationIntervalMs, 60_000);
+  await assert.rejects(
+    callController(home, "scheduler.configure", {
+      reconciliationIntervalSeconds: 45
+    }),
+    /params are invalid/i
+  );
   assert.deepEqual(await callController(home, "controller.stop", {}), { stopped: true });
   await controller.closed;
+});
+
+test("Controller stop keeps discovery owned until in-flight work has drained", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-file-controller-drain-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  let release;
+  let started;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  const entered = new Promise((resolve) => { started = resolve; });
+  const store = emptyStore();
+  store.listTasks = () => [{ id: "task-1", status: "active" }];
+  store.listRoles = () => [role("task-1", "worker")];
+  store.getActiveAgentRun = () => deliveredRun("task-1", "worker");
+  const delivery = {
+    ...noTmux,
+    async inspectRole() {
+      started();
+      await blocked;
+      return "present";
+    }
+  };
+  const controller = await startFileTaskController(home, store, delivery, undefined, {
+    intervalMs: 60_000
+  });
+  await entered;
+
+  assert.deepEqual(await callController(home, "controller.stop", {}), { stopped: true });
+  assert.equal((await readControllerDiscovery(home)).pid, process.pid);
+  release();
+  await controller.closed;
+  await assert.rejects(readControllerDiscovery(home), /not running/i);
 });
 
 test("production FileTask controller composition starts without compact SQLite runtime", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-file-runtime-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home);
-  const controller = await startFileTaskControllerRuntime(home, { intervalMs: 60_000 });
+  const sessionHost = {
+    async start() { throw new Error("unused"); },
+    async resume() { throw new Error("unused"); },
+    async stop() {},
+    async inspect() { return { state: "unavailable" }; }
+  };
+  const promptPush = { async tryPush() { return "unavailable"; } };
+  const controller = await startFileTaskControllerRuntime(home, {
+    intervalMs: 60_000,
+    sessionHost,
+    promptPush
+  });
 
   assert.equal((await callController(home, "controller.status", {})).running, true);
   assert.equal(controller.store.rootDirectory(), home);
   assert.equal(controller.runtime.reconciliationIntervalMs, 60_000);
+  assert.equal(controller.sessionHost, sessionHost);
+  assert.equal(controller.promptPush, promptPush);
   await controller.close();
 });
 
@@ -344,6 +2407,17 @@ test("production Controller reads reconciliationIntervalSeconds from Yui config"
   const controller = await startFileTaskControllerRuntime(home, { store });
 
   assert.equal(controller.runtime.reconciliationIntervalMs, 45_000);
+
+  store.saveConfig({ schemaVersion: 1, reconciliationIntervalSeconds: 30 });
+  assert.deepEqual(await callController(home, "scheduler.configure", {}), {
+    configured: true,
+    reconciliationIntervalMs: 30_000
+  });
+  assert.equal(controller.runtime.reconciliationIntervalMs, 30_000);
+
+  store.saveConfig({ schemaVersion: 1, reconciliationIntervalSeconds: 20 });
+  await controller.runtime.pump();
+  assert.equal(controller.runtime.reconciliationIntervalMs, 20_000);
   await controller.close();
 });
 

@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -28,6 +32,9 @@ const PUBLIC_PATHS = [
   "controller status",
   "controller stop",
   "controller restart",
+  "config",
+  "config show",
+  "config set",
   "operator",
   "operator enter",
   "operator submit",
@@ -47,6 +54,7 @@ const PUBLIC_PATHS = [
   "role update",
   "role remove",
   "role bind",
+  "role unbind",
   "role enter",
   "role session",
   "role session record",
@@ -79,6 +87,7 @@ const PUBLIC_PATHS = [
   "task role update",
   "task role remove",
   "task role bind",
+  "task role unbind",
   "task role enter",
   "task work",
   "task work create",
@@ -595,6 +604,100 @@ test("Bash, Zsh, and Fish completion are catalog-derived for the current surface
   assert.match(completionHelp, /^\s{2}zsh\s+/m);
   assert.match(completionHelp, /^\s{2}fish\s+/m);
   assert.doesNotMatch(completionHelp, /candidates/);
+});
+
+test("shell completion starts Yui only for entity-backed dynamic candidates", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "yui-completion-"));
+  const log = join(root, "calls.log");
+  const executable = join(root, "yui");
+  writeFileSync(executable, [
+    "#!/bin/sh",
+    `printf '%s\\n' "$*" >> ${JSON.stringify(log)}`,
+    "printf '%s\\n' task-alpha"
+  ].join("\n"));
+  chmodSync(executable, 0o755);
+  t.after(() => import("node:fs/promises").then(({ rm }) =>
+    rm(root, { recursive: true, force: true })));
+
+  const bash = spawnSync("bash", ["--noprofile", "--norc"], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${root}:${process.env.PATH}` },
+    input: [
+      renderCompletion("bash"),
+      "COMP_WORDS=(yui task '')",
+      "COMP_CWORD=2",
+      "_yui",
+      'printf "static=%s\\n" "${COMPREPLY[*]}"',
+      "COMP_WORDS=(yui task complete --s)",
+      "COMP_CWORD=3",
+      "_yui",
+      'printf "static-option=%s\\n" "${COMPREPLY[*]}"',
+      "COMP_WORDS=(yui task input cancel task-alpha --r)",
+      "COMP_CWORD=5",
+      "_yui",
+      'printf "trailing-option=%s\\n" "${COMPREPLY[*]}"',
+      "COMP_WORDS=(yui task show '')",
+      "COMP_CWORD=3",
+      "_yui",
+      'printf "dynamic=%s\\n" "${COMPREPLY[*]}"',
+      "COMP_WORDS=(yui task create title --repository '')",
+      "COMP_CWORD=5",
+      "_yui",
+      'printf "dynamic-option=%s\\n" "${COMPREPLY[*]}"'
+    ].join("\n")
+  });
+  assert.equal(bash.status, 0, bash.stderr);
+  assert.match(bash.stdout, /^static=.*show/m);
+  assert.match(bash.stdout, /^static-option=--summary$/m);
+  assert.match(bash.stdout, /^trailing-option=--reason$/m);
+  assert.match(bash.stdout, /^dynamic=task-alpha$/m);
+  assert.match(bash.stdout, /^dynamic-option=task-alpha$/m);
+  assert.equal(readFileSync(log, "utf8").trim().split("\n").length, 2);
+
+  writeFileSync(log, "");
+  const zshAvailable = spawnSync("zsh", ["--version"], { encoding: "utf8" });
+  if (zshAvailable.error === undefined) {
+    const zsh = spawnSync("zsh", ["-f"], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${root}:${process.env.PATH}` },
+      input: [
+        "function _yui {",
+        renderCompletion("zsh"),
+        "}",
+        "function compadd { print -r -- ${(j: :)argv[2,-1]} }",
+        "words=(yui task '')",
+        "CURRENT=3",
+        "_yui",
+        "words=(yui task complete --s)",
+        "CURRENT=4",
+        "_yui",
+        "words=(yui task input cancel task-alpha --r)",
+        "CURRENT=6",
+        "_yui",
+        "words=(yui task show '')",
+        "CURRENT=4",
+        "_yui",
+        "words=(yui task create title --repository '')",
+        "CURRENT=6",
+        "_yui"
+      ].join("\n")
+    });
+    assert.equal(zsh.status, 0, zsh.stderr);
+    assert.match(zsh.stdout, /--summary/);
+    assert.match(zsh.stdout, /--reason/);
+    assert.match(zsh.stdout, /task-alpha/);
+    assert.equal(readFileSync(log, "utf8").trim().split("\n").filter(Boolean).length, 2);
+  } else {
+    t.diagnostic("zsh is unavailable; rendered-script assertions still cover its dispatch structure.");
+  }
+
+  const zshScript = renderCompletion("zsh");
+  assert.doesNotMatch(zshScript, /\blocal\b[^\n]*\bpath\b/);
+  assert.match(zshScript, /if \[\[ "\$current" != -\* \]\]/);
+  const fish = renderCompletion("fish");
+  assert.match(fish, /completion candidates/);
+  assert.match(fish, /-n '__yui_needs_dynamic /);
+  assert.doesNotMatch(fish, /-f -a '\(__yui_dynamic\)'/);
 });
 
 test("dynamic candidates apply an exact prefix filter", async () => {

@@ -34,7 +34,7 @@ function writeManifest(home, overrides = {}) {
 test("storage inspection keeps layout and aggregate schema versions separate", () => {
   const home = temporaryHome();
   assert.equal(CURRENT_STORAGE_SCHEMA_VERSION, CURRENT_STORAGE_LAYOUT_VERSION);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 1);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 3);
   assert.deepEqual(STORAGE_MIGRATIONS, []);
 
   writeManifest(home);
@@ -68,13 +68,13 @@ test("a manifest without an aggregate version is invalid in this fresh-only rele
   assert.throws(() => requireStorageSchema(home), /missing field: aggregateSchemaVersion/i);
 });
 
-test("every aggregate schema version other than 1 is rejected", () => {
+test("the previous aggregate schema is rejected without migration", () => {
   const home = temporaryHome();
   writeManifest(home, { aggregateSchemaVersion: 2 });
 
   assert.throws(
     () => requireStorageSchema(home),
-    /aggregate schema 2 is newer than supported.*version 1/i
+    /aggregate schema 2 is older than required.*version 3.*no migration/i
   );
 });
 
