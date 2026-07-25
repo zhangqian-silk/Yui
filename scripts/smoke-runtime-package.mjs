@@ -82,7 +82,7 @@ try {
     cli,
     ["setup"],
     { ...environment, YUI_SETUP_INTERACTIVE: "1" },
-    `\n\n\n${join(yuiHome, "workspace")}\n\n`
+    `\n\n\n\n\n\n\n${join(yuiHome, "workspace")}\n\n`
   );
   if (!setup.includes("Yui setup complete.") || !setup.includes("Agents configured: codex")) {
     throw new Error("Installed CLI setup did not initialize the FileTaskStore runtime.");

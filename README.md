@@ -21,7 +21,9 @@ yui setup
 yui doctor
 ```
 
-`setup` is interactive. It detects installed Agent CLIs, asks which Agents to configure, selects the default and Operator Agent, confirms the Operator workspace, and offers shell-completion setup. Running it again preserves existing Tasks and Roles while allowing configuration changes.
+`setup` is interactive. It detects installed Agent CLIs, asks which Agents to configure, selects the default and Operator Agent, configures the model and reasoning effort for the Leader and Operator Roles, confirms the Operator workspace, and offers shell-completion setup. Leave a model or effort answer empty to keep its current value; enter `default` to follow the native CLI default. Running setup again preserves existing Tasks and Roles while allowing safe configuration changes.
+
+Model and effort are Role settings, so Leader and Operator can use different values even when both use the same Agent CLI. Configure other Roles with `--model` and `--effort` on `role add`, `role update`, `task role add`, or `task role update`.
 
 `completion` is also interactive, with or without an explicit shell:
 

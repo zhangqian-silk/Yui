@@ -2,6 +2,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { delimiter, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
+import { isDeepStrictEqual } from "node:util";
 
 import {
   configuredAgentToDefinition,
@@ -13,12 +14,16 @@ import type { CliIdentity } from "../cli/completion.js";
 import type { CompletionStore } from "../completion/completionInstaller.js";
 import { runCompletionWizard } from "../completion/completionWizard.js";
 import { usageError } from "../errors/cliError.js";
+import { resolveAgentAdapter } from "../executor/agentAdapter.js";
+import type { GlobalRoleSessionSet } from "../executor/agentExecutor.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { resolveTimeZone } from "../output/timePresentation.js";
 import {
   createGlobalRole,
   createRoleAgentBinding,
-  type GlobalRole
+  updateGlobalRole,
+  type GlobalRole,
+  type RoleAgentConfig
 } from "../role/role.js";
 import { SYSTEM_LEADER_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
 import type { MailboxTarget, WorkMailbox } from "../coordination/workMailbox.js";
@@ -49,6 +54,7 @@ type SetupStore = Omit<CompletionStore, "transaction"> & Readonly<{
   saveConfiguredAgent(agent: ConfiguredAgent): void;
   getGlobalRole(name: string): GlobalRole | null;
   saveGlobalRole(role: GlobalRole): void;
+  getGlobalRoleSessionSet(name: string): GlobalRoleSessionSet | null;
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
 }>;
 
@@ -108,6 +114,10 @@ export async function runSetupCommand(
       `Agents configured: ${result.agentIds.join(", ")}.`,
       `Default Agent: ${result.defaultAgentId}.`,
       `Operator Agent: ${result.operatorAgentId}.`,
+      `Leader model: ${result.leaderConfig.model ?? "CLI default"}.`,
+      `Leader reasoning effort: ${result.leaderConfig.effort ?? "CLI default"}.`,
+      `Operator model: ${result.operatorConfig.model ?? "CLI default"}.`,
+      `Operator reasoning effort: ${result.operatorConfig.effort ?? "CLI default"}.`,
       `Operator workspace: ${result.workspace}.`,
       `Time zone: ${resolveTimeZone(new FileTaskStore(home).getConfig().timeZone)}.`
     ];
@@ -145,6 +155,8 @@ async function configureYui(
   agentIds: readonly string[];
   defaultAgentId: string;
   operatorAgentId: string;
+  leaderConfig: RoleAgentConfig;
+  operatorConfig: RoleAgentConfig;
   workspace: string;
 }>> {
   const candidates = availableAgentChoices(store, env);
@@ -202,16 +214,28 @@ async function configureYui(
     persisted,
     operatorFallback
   );
-  const suggestedWorkspace = config.defaultWorkspace?.trim() || join(home, "workspace");
-  const workspaceAnswer = (await question(
-    `Operator workspace [${suggestedWorkspace}]: `
-  )).trim();
-  const workspace = resolveWorkspace(workspaceAnswer || suggestedWorkspace);
   const defaultAgent = persisted.find(({ id }) => id === defaultAgentId);
   const operatorAgent = persisted.find(({ id }) => id === operatorAgentId);
   if (defaultAgent === undefined || operatorAgent === undefined) {
     throw usageError("Selected setup Agent is no longer available.");
   }
+  const leaderConfig = await promptRoleAgentConfig(
+    "Leader",
+    defaultAgent,
+    store.getGlobalRole(SYSTEM_LEADER_ROLE),
+    question
+  );
+  const operatorConfig = await promptRoleAgentConfig(
+    "Operator",
+    operatorAgent,
+    store.getGlobalRole(SYSTEM_OPERATOR_ROLE),
+    question
+  );
+  const suggestedWorkspace = config.defaultWorkspace?.trim() || join(home, "workspace");
+  const workspaceAnswer = (await question(
+    `Operator workspace [${suggestedWorkspace}]: `
+  )).trim();
+  const workspace = resolveWorkspace(workspaceAnswer || suggestedWorkspace);
   mkdirSync(workspace, { recursive: true, mode: 0o700 });
   store.transaction((tx) => {
     const latestDefaultAgent = requireSetupAgent(tx, defaultAgentId);
@@ -221,14 +245,16 @@ async function configureYui(
       SYSTEM_OPERATOR_ROLE,
       latestOperatorAgent,
       workspace,
-      now
+      now,
+      operatorConfig
     );
     const leaderRole = prepareSystemRole(
       tx,
       SYSTEM_LEADER_ROLE,
       latestDefaultAgent,
       workspace,
-      now
+      now,
+      leaderConfig
     );
     const latest = tx.getConfig();
     tx.saveConfig({
@@ -245,8 +271,64 @@ async function configureYui(
     agentIds: persisted.map(({ id }) => id),
     defaultAgentId,
     operatorAgentId,
+    leaderConfig,
+    operatorConfig,
     workspace
   };
+}
+
+async function promptRoleAgentConfig(
+  label: string,
+  agent: ConfiguredAgent,
+  existingRole: GlobalRole | null,
+  question: SetupQuestion
+): Promise<RoleAgentConfig> {
+  const existing = existingRole?.activeAgentId === agent.id
+    ? existingRole.agentBindings[agent.id]?.config
+    : undefined;
+  const model = await promptOptionalAgentSetting(
+    label,
+    "model",
+    agent.id,
+    existing?.model,
+    question
+  );
+  const effort = await promptOptionalAgentSetting(
+    label,
+    "reasoning effort",
+    agent.id,
+    existing?.effort,
+    question
+  );
+  const candidate = structuredClone(
+    existing ?? { adapterId: agent.adapterId }
+  ) as unknown as Record<string, unknown>;
+  if (model === undefined) delete candidate.model;
+  else candidate.model = model;
+  if (effort === undefined) delete candidate.effort;
+  else candidate.effort = effort;
+  try {
+    return resolveAgentAdapter(agent.adapterId).canonicalizeConfig(
+      candidate as RoleAgentConfig
+    );
+  } catch (error) {
+    throw usageError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function promptOptionalAgentSetting(
+  label: string,
+  setting: string,
+  agentId: string,
+  current: string | undefined,
+  question: SetupQuestion
+): Promise<string | undefined> {
+  const clearHint = current === undefined ? "" : ' (or "default" for CLI default)';
+  const answer = (await question(
+    `${label} ${setting} for ${agentId} [${current ?? "CLI default"}]${clearHint}: `
+  )).trim();
+  if (answer.length === 0) return current;
+  return answer.toLowerCase() === "default" ? undefined : answer;
 }
 
 function availableAgentChoices(
@@ -305,15 +387,33 @@ function prepareSystemRole(
   name: string,
   agent: ConfiguredAgent,
   workspace: string,
-  now: Date
+  now: Date,
+  config: RoleAgentConfig
 ): GlobalRole | null {
   const existing = store.getGlobalRole(name);
   if (existing !== null) {
-    if (existing.activeAgentId === agent.id && existing.workspace === workspace) return null;
-    throw usageError(
-      `Global Role ${name} is already configured with Agent ${existing.activeAgentId} `
-        + `and workspace ${existing.workspace}. Stop its Session and use role update before changing it.`
-    );
+    if (existing.activeAgentId !== agent.id || existing.workspace !== workspace) {
+      throw usageError(
+        `Global Role ${name} is already configured with Agent ${existing.activeAgentId} `
+          + `and workspace ${existing.workspace}. Stop its Session and use role update before changing it.`
+      );
+    }
+    const definition = configuredAgentToDefinition(agent);
+    const binding = createRoleAgentBinding(definition, config);
+    if (isDeepStrictEqual(existing.agentBindings[agent.id], binding)) return null;
+    assertRoleRuntimeMutationAllowed(store, {
+      scope: "global",
+      roleName: name
+    }, "launch configuration update");
+    const session = store.getGlobalRoleSessionSet(name)?.sessions[agent.id];
+    if (session !== undefined && session.status !== "stopped") {
+      throw usageError(
+        `Global Role ${name} Agent settings cannot be changed while its native process is running.`
+      );
+    }
+    return updateGlobalRole(existing, {
+      agentBindings: { ...existing.agentBindings, [agent.id]: binding }
+    }, now);
   }
   assertRoleRuntimeMutationAllowed(store, {
     scope: "global",
@@ -322,7 +422,7 @@ function prepareSystemRole(
   const definition = configuredAgentToDefinition(agent);
   return createGlobalRole(
     name,
-    [createRoleAgentBinding(definition)],
+    [createRoleAgentBinding(definition, config)],
     definition.id,
     workspace,
     now
