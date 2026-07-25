@@ -21,7 +21,9 @@ yui setup
 yui doctor
 ```
 
-`setup` 是交互式的：检测已安装的 Agent CLI、选择要配置的 Agent、默认 Agent 和 Operator Agent、确认 Operator workspace，并询问 shell completion。再次运行不会删除已有 Task/Role，可用于调整配置。
+`setup` 是交互式的：检测已安装的 Agent CLI、选择要配置的 Agent、默认 Agent 和 Operator Agent，分别配置 Leader/Operator Role 的模型与思考强度，确认 Operator workspace，并询问 shell completion。模型或思考强度留空会保留当前值；输入 `default` 可恢复为原生 CLI 默认值。再次运行不会删除已有 Task/Role，可用于安全地调整配置。
+
+模型与思考强度属于 Role 设置，因此 Leader 与 Operator 即使使用同一个 Agent CLI，也可以采用不同配置。其他 Role 可通过 `role add`、`role update`、`task role add` 或 `task role update` 的 `--model` 和 `--effort` 配置。
 
 `completion` 无论是否指定 shell，都会进入确认流程：
 

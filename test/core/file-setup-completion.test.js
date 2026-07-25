@@ -116,7 +116,7 @@ test("completion install keeps unrelated FileTaskStore configuration", async (t)
   assert.ok(config.completionInstallations.bash);
 });
 
-test("setup writes schema and configures selected Agents, default Agent, and Operator", async (t) => {
+test("setup configures selected Agents plus Leader and Operator model settings", async (t) => {
   const { runSetupCommand } = await import("../../dist/setup/setupCommand.js");
   const { FileTaskStore } = await import("../../dist/storage/taskStore.js");
   const root = mkdtempSync(join(tmpdir(), "yui-file-setup-"));
@@ -135,7 +135,9 @@ test("setup writes schema and configures selected Agents, default Agent, and Ope
   const output = new PassThrough();
   let rendered = "";
   output.on("data", (chunk) => { rendered += chunk.toString(); });
-  input.end(`all\nclaude\ncodex\n${workspace}\nskip\n`);
+  input.end(
+    `all\nclaude\ncodex\nclaude-opus\nhigh\ngpt-5.6-sol\nxhigh\n${workspace}\nskip\n`
+  );
   const env = {
     YUI_HOME: home,
     YUI_CLI_NAME: "yui-dev",
@@ -157,19 +159,109 @@ test("setup writes schema and configures selected Agents, default Agent, and Ope
   assert.equal(store.getConfig().defaultWorkspace, workspace);
   assert.equal(store.getGlobalRole("operator").activeAgentId, "codex");
   assert.equal(store.getGlobalRole("leader").activeAgentId, "claude");
+  assert.deepEqual(store.getGlobalRole("operator").agentBindings.codex.config, {
+    adapterId: "codex",
+    model: "gpt-5.6-sol",
+    effort: "xhigh"
+  });
+  assert.deepEqual(store.getGlobalRole("leader").agentBindings.claude.config, {
+    adapterId: "claude",
+    model: "claude-opus",
+    effort: "high"
+  });
   assert.match(rendered, /Choose Agents by number or name/);
   assert.match(rendered, /Choose default Agent \[codex\]/);
   assert.match(rendered, /Choose Operator Agent \[claude\]/);
+  assert.match(rendered, /Leader model for claude \[CLI default\]/);
+  assert.match(rendered, /Leader reasoning effort for claude \[CLI default\]/);
+  assert.match(rendered, /Operator model for codex \[CLI default\]/);
+  assert.match(rendered, /Operator reasoning effort for codex \[CLI default\]/);
+  assert.match(result, /Leader model: claude-opus/);
+  assert.match(result, /Leader reasoning effort: high/);
+  assert.match(result, /Operator model: gpt-5\.6-sol/);
+  assert.match(result, /Operator reasoning effort: xhigh/);
   assert.match(result, /Completion install skipped/);
+
+  const operatorWithPermissions = store.getGlobalRole("operator");
+  operatorWithPermissions.agentBindings.codex.config.permission = {
+    sandbox: "workspace-write",
+    approval: "never"
+  };
+  operatorWithPermissions.agentBindings.codex.config.search = true;
+  store.saveGlobalRole(operatorWithPermissions);
 
   const repeatInput = new PassThrough();
   const repeatOutput = new PassThrough();
-  repeatInput.end("all\n\n\n\nskip\n");
+  repeatInput.end("all\n\n\n\n\n\n\n\nskip\n");
   await assert.doesNotReject(runSetupCommand(
     [], env, executor,
     { input: repeatInput, output: repeatOutput, forceInteractive: true }
   ));
-  assert.equal(new FileTaskStore(home).getGlobalRole("operator").activeAgentId, "codex");
+  const repeated = new FileTaskStore(home);
+  assert.equal(repeated.getGlobalRole("operator").activeAgentId, "codex");
+  assert.equal(
+    repeated.getGlobalRole("operator").agentBindings.codex.config.model,
+    "gpt-5.6-sol"
+  );
+  assert.equal(
+    repeated.getGlobalRole("leader").agentBindings.claude.config.effort,
+    "high"
+  );
+  assert.deepEqual(
+    repeated.getGlobalRole("operator").agentBindings.codex.config.permission,
+    { sandbox: "workspace-write", approval: "never" }
+  );
+  assert.equal(
+    repeated.getGlobalRole("operator").agentBindings.codex.config.search,
+    true
+  );
+
+  const clearInput = new PassThrough();
+  const clearOutput = new PassThrough();
+  clearInput.end("all\n\n\n\n\ndefault\ndefault\n\nskip\n");
+  await assert.doesNotReject(runSetupCommand(
+    [], env, executor,
+    { input: clearInput, output: clearOutput, forceInteractive: true }
+  ));
+  assert.deepEqual(
+    new FileTaskStore(home).getGlobalRole("operator").agentBindings.codex.config,
+    {
+      adapterId: "codex",
+      permission: { sandbox: "workspace-write", approval: "never" },
+      search: true
+    }
+  );
+
+  const { createRoleSessionSet, recordRoleAgentSession } = await import(
+    "../../dist/executor/agentExecutor.js"
+  );
+  const now = new Date("2026-07-25T00:00:00.000Z");
+  store.saveGlobalRoleSessionSet(recordRoleAgentSession(
+    createRoleSessionSet(
+      { scope: "global", roleName: "operator" },
+      "codex",
+      now
+    ),
+    {
+      agentId: "codex",
+      adapterId: "codex",
+      nativeSessionId: "codex-thread",
+      policy: "fixed",
+      status: "running"
+    },
+    now
+  ));
+  const runningInput = new PassThrough();
+  const runningOutput = new PassThrough();
+  runningInput.end("all\n\n\n\n\ngpt-new\n\n\n");
+  await assert.rejects(runSetupCommand(
+    [], env, executor,
+    { input: runningInput, output: runningOutput, forceInteractive: true }
+  ), /cannot be changed while its native process is running/i);
+  assert.equal(
+    new FileTaskStore(home).getGlobalRole("operator").agentBindings.codex.config.model,
+    undefined
+  );
 });
 
 test("setup rolls back config and both system Roles when one lifecycle gate rejects creation", async (t) => {
