@@ -61,6 +61,12 @@ function metaItem(label, value) {
   return item;
 }
 
+function statBadge(count, label) {
+  const badge = node("span", "task-stat");
+  badge.append(node("b", "", String(count)), node("span", "", label));
+  return badge;
+}
+
 function statusPill(t, namespace, status) {
   const pill = node("span", "pill", translatedStatus(t, namespace, status));
   pill.dataset.status = status;
@@ -71,6 +77,14 @@ function messageAuthor(message, t) {
   return message.author.type === "role"
     ? message.author.roleName
     : t("author." + message.author.type);
+}
+
+// completedBy is "user" | "operator" | "leader"; user/operator have author.* keys,
+// leader is a role name with no key — t() returns the key itself, so fall back to raw.
+function authorName(t, who) {
+  const key = "author." + who;
+  const label = t(key);
+  return label === key ? who : label;
 }
 
 export function renderFilters(container, state, t, onFilter) {
@@ -114,24 +128,112 @@ export function renderTasks(container, state, t, locale, onSelect) {
     main.append(metadata);
 
     const stats = node("span", "task-stats");
-    stats.append(node("span", "", String(task.workItems.running) + " " + t("stats.running")));
-    stats.append(document.createElement("br"));
-    stats.append(node("span", "", String(task.openInputCount) + " " + t("stats.inputs")));
-    button.append(dot, main, stats);
+    if (task.workItems.running > 0) stats.append(statBadge(task.workItems.running, t("stats.running")));
+    if (task.openInputCount > 0) {
+      const inputStat = statBadge(task.openInputCount, t("stats.inputs"));
+      inputStat.classList.add("has-inputs");
+      stats.append(inputStat);
+    }
+    if (stats.childNodes.length) main.append(stats);
+
+    button.append(dot, main);
     button.addEventListener("click", function () { onSelect(task.id); });
     container.append(button);
   });
 }
 
-export function renderEmptyDetail(detail, t) {
+function overviewRow(task, badgeText, badgeClass, onSelect) {
+  const row = node("button", "overview-row");
+  row.type = "button";
+  const dot = node("span", "status-dot " + task.status);
+  dot.setAttribute("aria-hidden", "true");
+  const title = node("span", "overview-row-title", task.title);
+  const badge = node("span", "task-stat" + (badgeClass ? " " + badgeClass : ""), badgeText);
+  row.append(dot, title, badge);
+  row.addEventListener("click", function () { onSelect(task.id); });
+  return row;
+}
+
+// Default view when no task is selected: a global-perspective summary.
+export function renderOverview(detail, state, t, locale, onSelect) {
   clear(detail);
-  const empty = node("div", "empty-detail");
-  empty.append(node("span", "", "↳"));
-  const title = node("h2", "");
+  const counts = state.counts;
+  const wrap = node("div", "overview");
+
+  const head = node("header", "overview-head");
+  const title = node("h2", "overview-title", t("overview.title"));
   title.id = "detail-title";
-  title.textContent = t("detail.selectTitle");
-  empty.append(title, node("p", "", t("detail.selectBody")));
-  detail.append(empty);
+  head.append(title);
+  if (counts) {
+    head.append(node("p", "overview-lede", t("overview.lede")
+      .replace("{total}", counts.total)
+      .replace("{active}", counts.active)
+      .replace("{inputs}", counts.openInputs)
+      .replace("{completed}", counts.completed)));
+  } else {
+    head.append(node("p", "overview-lede", t("page.lede")));
+  }
+  wrap.append(head);
+
+  const segments = [
+    ["active", counts ? counts.active : 0],
+    ["draft", counts ? counts.draft : 0],
+    ["completed", counts ? counts.completed : 0],
+    ["archived", counts ? counts.archived : 0]
+  ];
+  if (counts && counts.total > 0) {
+    const distBlock = node("section", "overview-block");
+    distBlock.append(node("h3", "", t("overview.distribution")));
+    const bar = node("div", "dist-bar");
+    segments.forEach(function (entry) {
+      if (entry[1] <= 0) return;
+      const seg = node("span", "dist-seg " + entry[0]);
+      seg.style.flexGrow = String(entry[1]);
+      seg.title = translatedStatus(t, "status", entry[0]) + " · " + entry[1];
+      bar.append(seg);
+    });
+    distBlock.append(bar);
+    const legend = node("div", "dist-legend");
+    segments.forEach(function (entry) {
+      const item = node("span", "legend-item");
+      const dot = node("span", "status-dot " + entry[0]);
+      dot.setAttribute("aria-hidden", "true");
+      item.append(dot, node("span", "", translatedStatus(t, "status", entry[0])), node("b", "", String(entry[1])));
+      legend.append(item);
+    });
+    distBlock.append(legend);
+    wrap.append(distBlock);
+  }
+
+  const attentionTasks = state.tasks.filter(function (task) { return task.openInputCount > 0; });
+  const attentionBlock = node("section", "overview-block");
+  attentionBlock.append(node("h3", "", t("overview.attention") + " · " + attentionTasks.length));
+  if (attentionTasks.length) {
+    const list = node("div", "overview-list");
+    attentionTasks.forEach(function (task) {
+      list.append(overviewRow(task, task.openInputCount + " " + t("stats.inputs"), "has-inputs", onSelect));
+    });
+    attentionBlock.append(list);
+  } else {
+    attentionBlock.append(node("div", "row", t("overview.attentionEmpty")));
+  }
+  wrap.append(attentionBlock);
+
+  const activeTasks = state.tasks.filter(function (task) { return task.status === "active"; });
+  const activeBlock = node("section", "overview-block");
+  activeBlock.append(node("h3", "", t("overview.activeNow") + " · " + activeTasks.length));
+  if (activeTasks.length) {
+    const list = node("div", "overview-list");
+    activeTasks.forEach(function (task) {
+      list.append(overviewRow(task, task.workItems.running + " " + t("stats.running"), "", onSelect));
+    });
+    activeBlock.append(list);
+  } else {
+    activeBlock.append(node("div", "row", t("overview.activeEmpty")));
+  }
+  wrap.append(activeBlock);
+
+  detail.append(wrap);
 }
 
 export function renderLoading(container, t, key) {
@@ -160,6 +262,19 @@ export function renderTaskDetail(detail, data, t, locale) {
   if (task.dueAt) taskMeta.append(metaItem(t("detail.due"), formatDateTime(task.dueAt, locale)));
   head.append(taskMeta);
   detail.append(head);
+
+  if (task.completionSummary) {
+    const conclusion = node("section", "conclusion");
+    conclusion.append(node("h3", "", t("detail.conclusion")));
+    conclusion.append(node("p", "", task.completionSummary));
+    const meta = node("div", "run-meta");
+    if (task.completedBy) {
+      meta.append(node("span", "", t("detail.completedBy") + " · " + authorName(t, task.completedBy)));
+    }
+    if (task.completedAt) meta.append(node("time", "", formatDateTime(task.completedAt, locale)));
+    if (meta.childNodes.length) conclusion.append(meta);
+    detail.append(conclusion);
+  }
 
   if (data.openInputs.length) {
     const inputSection = section(t("detail.attention") + " · " + data.openInputs.length);

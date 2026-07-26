@@ -1,4 +1,7 @@
 export const THEME_SCRIPT = `
+// Theme registry. To add a theme: append its name here, add a matching
+// [data-theme="name"]{...} token block in styles.ts (TOKEN_STYLES), and add an
+// <option> in shell.ts. The first entry is the default when none is stored.
 export const THEMES = Object.freeze(["control-room", "paper"]);
 
 function preferredTheme() {
