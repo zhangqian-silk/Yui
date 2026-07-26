@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync } from "node:fs";
-import { delimiter, isAbsolute, join, resolve } from "node:path";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 import { isDeepStrictEqual } from "node:util";
@@ -118,7 +118,7 @@ export async function runSetupCommand(
       `Leader reasoning effort: ${result.leaderConfig.effort ?? "CLI default"}.`,
       `Operator model: ${result.operatorConfig.model ?? "CLI default"}.`,
       `Operator reasoning effort: ${result.operatorConfig.effort ?? "CLI default"}.`,
-      `Operator workspace: ${result.workspace}.`,
+      `Project workspace: ${result.workspace}.`,
       `Time zone: ${resolveTimeZone(new FileTaskStore(home).getConfig().timeZone)}.`
     ];
     if (dependency === undefined || dependency === "tmux") {
@@ -192,17 +192,17 @@ async function configureYui(
   );
 
   const now = new Date();
-  const persisted = selected.map((choice) => persistAgent(store, choice, now));
-  const configuredIds = new Set(persisted.map(({ id }) => id));
+  const prepared = selected.map((choice) => prepareAgent(store, choice, now));
+  const configuredIds = new Set(prepared.map(({ id }) => id));
   const config = store.getConfig();
   const defaultFallback = configuredIds.has(config.defaultAgent ?? "")
     ? config.defaultAgent as string
-    : persisted[0]?.id;
+    : prepared[0]?.id;
   if (defaultFallback === undefined) throw usageError("At least one Agent must be selected.");
 
   const defaultAgentId = parseSingleAgentSelection(
     await question(`Choose default Agent [${defaultFallback}]: `),
-    persisted,
+    prepared,
     defaultFallback
   );
   const currentOperatorAgent = store.getGlobalRole(SYSTEM_OPERATOR_ROLE)?.activeAgentId;
@@ -211,11 +211,11 @@ async function configureYui(
     : defaultAgentId;
   const operatorAgentId = parseSingleAgentSelection(
     await question(`Choose Operator Agent [${operatorFallback}]: `),
-    persisted,
+    prepared,
     operatorFallback
   );
-  const defaultAgent = persisted.find(({ id }) => id === defaultAgentId);
-  const operatorAgent = persisted.find(({ id }) => id === operatorAgentId);
+  const defaultAgent = prepared.find(({ id }) => id === defaultAgentId);
+  const operatorAgent = prepared.find(({ id }) => id === operatorAgentId);
   if (defaultAgent === undefined || operatorAgent === undefined) {
     throw usageError("Selected setup Agent is no longer available.");
   }
@@ -231,13 +231,20 @@ async function configureYui(
     store.getGlobalRole(SYSTEM_OPERATOR_ROLE),
     question
   );
-  const suggestedWorkspace = config.defaultWorkspace?.trim() || join(home, "workspace");
+  const suggestedWorkspace = config.defaultWorkspace?.trim()
+    || join(dirname(resolve(home)), "workspace");
   const workspaceAnswer = (await question(
-    `Operator workspace [${suggestedWorkspace}]: `
+    `Project workspace for stable checkouts and managed worktrees [${suggestedWorkspace}]: `
   )).trim();
-  const workspace = resolveWorkspace(workspaceAnswer || suggestedWorkspace);
-  mkdirSync(workspace, { recursive: true, mode: 0o700 });
+  const workspace = resolveWorkspace(workspaceAnswer || suggestedWorkspace, home);
+  if (config.defaultWorkspace !== undefined
+    && resolve(config.defaultWorkspace) !== workspace) {
+    throw usageError(
+      `Project workspace is fixed after setup: ${resolve(config.defaultWorkspace)}.`
+    );
+  }
   store.transaction((tx) => {
+    for (const agent of prepared) tx.saveConfiguredAgent(agent);
     const latestDefaultAgent = requireSetupAgent(tx, defaultAgentId);
     const latestOperatorAgent = requireSetupAgent(tx, operatorAgentId);
     const operatorRole = prepareSystemRole(
@@ -268,7 +275,7 @@ async function configureYui(
   });
 
   return {
-    agentIds: persisted.map(({ id }) => id),
+    agentIds: prepared.map(({ id }) => id),
     defaultAgentId,
     operatorAgentId,
     leaderConfig,
@@ -348,7 +355,7 @@ function availableAgentChoices(
   });
 }
 
-function persistAgent(
+function prepareAgent(
   store: SetupStore,
   choice: SetupAgentChoice,
   now: Date
@@ -369,7 +376,6 @@ function persistAgent(
     existing?.environment ?? [],
     now
   );
-  store.saveConfiguredAgent(agent);
   return agent;
 }
 
@@ -453,7 +459,7 @@ function parseAgentSetSelection(
 
 function parseSingleAgentSelection(
   answer: string,
-  agents: readonly ConfiguredAgent[],
+  agents: readonly Pick<ConfiguredAgent, "id">[],
   fallback: string
 ): string {
   const value = answer.trim().toLowerCase();
@@ -468,9 +474,22 @@ function parseSingleAgentSelection(
   return selected.id;
 }
 
-function resolveWorkspace(value: string): string {
-  if (!isAbsolute(value)) throw usageError("Operator workspace must be an absolute path.");
-  return resolve(value);
+function resolveWorkspace(value: string, home: string): string {
+  if (!isAbsolute(value)) throw usageError("Project workspace must be an absolute path.");
+  const requested = resolve(value);
+  assertWorkspaceOutsideHome(requested, resolve(home));
+  mkdirSync(requested, { recursive: true, mode: 0o700 });
+  const workspace = realpathSync(requested);
+  const homeRoot = realpathSync(resolve(home));
+  assertWorkspaceOutsideHome(workspace, homeRoot);
+  return workspace;
+}
+
+function assertWorkspaceOutsideHome(workspace: string, homeRoot: string): void {
+  const fromHome = relative(homeRoot, workspace);
+  if (fromHome === "" || (!fromHome.startsWith("..") && !isAbsolute(fromHome))) {
+    throw usageError("Project workspace must be outside YUI_HOME.");
+  }
 }
 
 function commandOnPath(command: string, env: NodeJS.ProcessEnv): boolean {

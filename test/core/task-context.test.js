@@ -318,7 +318,9 @@ test("task context keeps empty knowledge and work explicit and reads terminal Ta
   output(["activate", completed.id], store, options);
   output(["complete", completed.id, "--summary", "Finished"], store, options);
   const archived = createTask(store, options, "Archived context");
-  output(["archive", archived.id], store, options);
+  output(["activate", archived.id], store, options);
+  output(["complete", archived.id, "--summary", "Finished"], store, options);
+  output(["archive", archived.id, "--integrated"], store, options);
 
   for (const [taskId, status] of [[completed.id, "completed"], [archived.id, "archived"]]) {
     const result = output(["context", taskId], store, options);

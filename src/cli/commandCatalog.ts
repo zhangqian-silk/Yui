@@ -198,8 +198,8 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "create",
     summary: "Create a Draft Task.",
-    usage: "yui task create <title> [--repository <id>] [--base <ref>]",
-    options: ["--repository", "--base"]
+    usage: "yui task create <title> [--project <project>] [--base <ref>]",
+    options: ["--project", "--base"]
   },
   {
     name: "update",
@@ -226,7 +226,12 @@ const taskChildren: readonly NodeInput[] = [
     summary: "Show consolidated working context for a Task.",
     usage: "yui task context <task>"
   },
-  { name: "archive", summary: "Archive a Task.", usage: "yui task archive <id>" },
+  {
+    name: "archive",
+    summary: "Archive a Task after confirming the main worktree outcome.",
+    usage: "yui task archive <id> (--integrated|--abandon)",
+    options: ["--integrated", "--abandon"]
+  },
   { name: "reconcile", summary: "Run one immediate Controller reconciliation.", usage: "yui task reconcile <id>" },
   {
     name: "message",
@@ -312,7 +317,7 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "work",
     summary: "Manage finite Task work items.",
-    sections: [{ id: "manage", title: "Commands", entries: ["create", "list", "update", "dispatch"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["create", "list", "update", "isolate", "dispatch", "cleanup"] }],
     children: [
       {
         name: "create",
@@ -324,15 +329,28 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "update",
         summary: "Update a work item's state.",
-        usage: "yui task work update <id> <todo|running|done|failed> [--summary <text>]",
+        usage: "yui task work update <id> <todo|running|done|failed|cancelled|superseded> [--summary <text>]",
         options: ["--summary"],
-        argumentValues: { 1: ["todo", "running", "done", "failed"] }
+        argumentValues: {
+          1: ["todo", "running", "done", "failed", "cancelled", "superseded"]
+        }
       },
       {
         name: "dispatch",
         summary: "Dispatch a work item to its Role.",
         usage: "yui task work dispatch <id> [--input <text>]",
         options: ["--input"]
+      },
+      {
+        name: "isolate",
+        summary: "Create a WorkItem-owned isolated worktree.",
+        usage: "yui task work isolate <work>"
+      },
+      {
+        name: "cleanup",
+        summary: "Remove a clean terminal WorkItem worktree after integration or abandonment.",
+        usage: "yui task work cleanup <work> (--integrated|--abandon)",
+        options: ["--integrated", "--abandon"]
       }
     ]
   },
@@ -425,7 +443,7 @@ export const ROOT_COMMAND = buildNode({
   usage: "yui [--json] <command>",
   sections: [
     { id: "general", title: "General", entries: ["help", "version", "update", "setup", "doctor", "completion"] },
-    { id: "workflow", title: "Workflow", entries: ["operator", "repository", "task"] },
+    { id: "workflow", title: "Workflow", entries: ["operator", "project", "task"] },
     { id: "configuration", title: "Configuration", entries: ["config", "agent", "role"] },
     { id: "operations", title: "Operations", entries: ["web", "controller", "jobs"] },
     { id: "internal", title: "Internal", entries: ["internal"] }
@@ -503,18 +521,74 @@ export const ROOT_COMMAND = buildNode({
       ]
     },
     {
-      name: "repository",
-      summary: "Manage Git repositories available to Tasks.",
-      sections: [{ id: "manage", title: "Commands", entries: ["add", "list"] }],
+      name: "project",
+      summary: "Manage Projects, stable checkouts, branches, and Yui knowledge.",
+      sections: [{ id: "manage", title: "Commands", entries: ["add", "clone", "update", "discover", "list", "show", "knowledge"] }],
       children: [
         {
           name: "add",
-          summary: "Register a Git repository.",
-          usage: "yui repository add <name> <path> [--base <ref>]",
-          options: ["--base"],
+          summary: "Bind a Project to a stable Git checkout.",
+          usage: "yui project add <name> <path> [--alias <name> ...] [--remote <url>] [--stable <ref>] [--development <ref>]",
+          options: ["--alias", "--remote", "--stable", "--development"],
           fileArguments: [1]
         },
-        { name: "list", summary: "List registered repositories." }
+        {
+          name: "clone",
+          summary: "Clone and bind a Project after user confirmation.",
+          usage: "yui project clone <name> <remote> [--alias <name> ...] [--stable <ref>] [--development <ref>]",
+          options: ["--alias", "--stable", "--development"]
+        },
+        {
+          name: "update",
+          summary: "Update a bound Project's aliases, remote, or branch refs.",
+          usage: "yui project update <project> [--alias <name> ...|--clear-aliases] [--remote <url>|--clear-remote] [--stable <ref>] [--development <ref>]",
+          options: [
+            "--alias", "--clear-aliases", "--remote", "--clear-remote",
+            "--stable", "--development"
+          ]
+        },
+        {
+          name: "discover",
+          summary: "Find Git projects directly under the configured workspace.",
+          usage: "yui project discover [name]"
+        },
+        { name: "list", summary: "List bound Projects." },
+        { name: "show", summary: "Show one Project.", usage: "yui project show <project>" },
+        {
+          name: "knowledge",
+          summary: "Manage durable Project knowledge stored by Yui.",
+          sections: [{ id: "manage", title: "Commands", entries: ["add", "update", "retire", "list", "show"] }],
+          children: [
+            {
+              name: "add",
+              summary: "Add Project knowledge.",
+              usage: "yui project knowledge add <project> <title> --body <text>",
+              options: ["--body"]
+            },
+            {
+              name: "update",
+              summary: "Update active Project knowledge.",
+              usage: "yui project knowledge update <project> <knowledge> [--title <text>] [--body <text>]",
+              options: ["--title", "--body"]
+            },
+            {
+              name: "retire",
+              summary: "Retire Project knowledge without deleting its record.",
+              usage: "yui project knowledge retire <project> <knowledge>"
+            },
+            {
+              name: "list",
+              summary: "List Project knowledge.",
+              usage: "yui project knowledge list <project> [--all]",
+              options: ["--all"]
+            },
+            {
+              name: "show",
+              summary: "Read one Project knowledge entry.",
+              usage: "yui project knowledge show <project> <knowledge>"
+            }
+          ]
+        }
       ]
     },
     {

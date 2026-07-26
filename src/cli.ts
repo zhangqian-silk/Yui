@@ -30,8 +30,11 @@ import {
 import { runConfigCommand } from "./commands/configCommands.js";
 import { runJobCommand } from "./commands/jobCommands.js";
 import { runOperatorCommand } from "./commands/operatorCommands.js";
-import { runRepositoryCommand } from "./commands/repositoryCommands.js";
-import { runTaskCommand } from "./commands/taskCommands.js";
+import { runProjectCommand } from "./commands/projectCommands.js";
+import {
+  runTaskCommand,
+  validateTaskArchiveRequest
+} from "./commands/taskCommands.js";
 import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
 import {
   callFileTaskController,
@@ -45,8 +48,9 @@ import {
 import { FileSchedulerStoreAdapter } from "./controller/fileSchedulerStoreAdapter.js";
 import { runSessionNotifyCommand } from "./controller/sessionNotify.js";
 import { runDoctorCommand } from "./doctor/doctor.js";
-import { CliError, usageError } from "./errors/cliError.js";
+import { CliError, runtimeError, usageError } from "./errors/cliError.js";
 import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
+import { TaskWorkspaceCoordinator } from "./repository/taskWorkspaceCoordinator.js";
 import { FileTaskWorkspacePreparer } from "./repository/taskWorkspacePreparer.js";
 import { inspectStorageSchema, requireStorageSchema } from "./storage/storageSchema.js";
 import { FileTaskStore, resolveYuiHome } from "./storage/taskStore.js";
@@ -208,6 +212,7 @@ export async function main(): Promise<void> {
       }
     }
   );
+  const workspaceCoordinator = new TaskWorkspaceCoordinator(store, workspacePreparer, runtime);
 
   if (resolved[0] === "agent") {
     const agentArgs = resolved.slice(1);
@@ -261,8 +266,9 @@ export async function main(): Promise<void> {
     emit(output);
     return;
   }
-  if (resolved[0] === "repository") {
-    emit(await runRepositoryCommand(resolved.slice(1), store));
+  if (resolved[0] === "project") {
+    const result = await runProjectCommand(resolved.slice(1), store);
+    emit(result.output, false, result.data);
     return;
   }
   if (resolved[0] === "role") {
@@ -305,8 +311,62 @@ export async function main(): Promise<void> {
       await ensureFileTaskController(home, { environment: process.env });
       const taskId = resolved[1] === "enter" ? resolved[2] : resolved[3];
       const task = taskId === undefined ? null : store.getTask(taskId);
-      if (task?.status === "active" && task.repositoryId !== undefined) {
+      if (task?.status === "active" && task.projectId !== undefined) {
         await workspacePreparer.prepareTaskWorkspace(task.id);
+      }
+    }
+    if (resolved[1] === "work" && resolved[2] === "isolate") {
+      const workItemId = resolved[3];
+      if (workItemId === undefined || resolved.length !== 4) {
+        throw usageError("Task work isolate usage: yui task work isolate <work>.");
+      }
+      const workspace = await workspaceCoordinator.isolateWorkItem(workItemId);
+      emit(
+        `Created isolated worktree for ${workItemId}\nWorkspace: ${workspace.path}\n`,
+        false,
+        { workItemId, workspace }
+      );
+      return;
+    }
+    if (resolved[1] === "work" && resolved[2] === "cleanup") {
+      const workItemId = resolved[3];
+      const disposition = resolved[4];
+      if (workItemId === undefined
+        || !["--integrated", "--abandon"].includes(disposition ?? "")
+        || resolved.length !== 5) {
+        throw usageError("Task work cleanup usage: yui task work cleanup <work> (--integrated|--abandon).");
+      }
+      const cleanedAs = disposition === "--integrated" ? "integrated" : "abandoned";
+      const removal = await workspaceCoordinator.cleanupWorkItem(workItemId, cleanedAs);
+      if (removal === "dirty") {
+        throw usageError(`WorkItem worktree is dirty and was retained: ${workItemId}.`);
+      }
+      emit(
+        `Cleaned WorkItem worktree ${workItemId} (${cleanedAs})\n`,
+        false,
+        {
+          workItem: store.findWorkItem(workItemId),
+          worktree: { removal, disposition: cleanedAs }
+        }
+      );
+      return;
+    }
+    if (resolved[1] === "archive") {
+      const { taskId } = validateTaskArchiveRequest(
+        resolved.slice(2),
+        store,
+        { runtime, environment: process.env, yuiHome: home }
+      );
+      const task = store.getTask(taskId);
+      if (task === null) throw new Error(`Task disappeared after archive validation: ${taskId}.`);
+      if (task.status !== "archived") {
+        const cleanup = await workspaceCoordinator.cleanupTaskForArchive(task.id);
+        if (cleanup.status === "retained-dirty") {
+          throw usageError(`Task ${task.id} has dirty managed worktrees and remains completed.`);
+        }
+        if (cleanup.status === "failed") {
+          throw usageError(`Task ${task.id} worktree cleanup failed: ${cleanup.error ?? "unknown error"}.`);
+        }
       }
     }
     const result = runTaskCommand(
@@ -315,6 +375,37 @@ export async function main(): Promise<void> {
       { runtime, environment: process.env, yuiHome: home }
     );
     if (result.kind === "output") {
+      if (resolved[1] === "create") {
+        const created = result.data as { task?: { id?: string; projectId?: string } } | undefined;
+        if (created?.task?.id !== undefined && created.task.projectId !== undefined) {
+          let workspace;
+          try {
+            workspace = await workspacePreparer.prepareTaskWorkspace(created.task.id);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            workspace = {
+              taskId: created.task.id,
+              status: "failed" as const,
+              error: message
+            };
+          }
+          const latest = store.getTask(created.task.id);
+          const leader = store.getRole(created.task.id, "leader");
+          if (latest !== null && leader !== null) {
+            const warning = workspace.status === "failed"
+              ? `Main worktree is not ready: ${workspace.error ?? "unknown error"}.\n`
+                + `After correcting the Git problem, run yui task reconcile ${created.task.id}.\n`
+              : "";
+            emit(`${result.output}${warning}`, false, {
+              ...created,
+              task: latest,
+              leader,
+              workspace
+            });
+            return;
+          }
+        }
+      }
       emit(result.output, false, result.data);
       return;
     }
@@ -487,7 +578,7 @@ function selectionCall(
     case "config.get": return store.getConfig();
     case "role.list": return store.listGlobalRoles();
     case "role.show": return store.getGlobalRole(String(params.name ?? ""));
-    case "repository.list": return callOptional(reader, "listRepositories");
+    case "project.list": return callOptional(reader, "listProjects");
     case "task.list": return callOptional(reader, "listTasks");
     case "task.role.list": return callOptional(reader, "listRoles", [params.taskId]);
     case "task.role.show": return callOptional(reader, "getRole", [params.taskId, params.roleName]);

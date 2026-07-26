@@ -7,7 +7,7 @@ export type TaskMetadata = {
   priority?: TaskPriority;
   tags?: string[];
   dueAt?: string;
-  repositoryId?: string;
+  projectId?: string;
   baseRef?: string;
   cwd?: string;
 };
@@ -18,7 +18,7 @@ export type TaskMetadataUpdate = Partial<{
   priority: TaskPriority | null;
   tags: string[] | null;
   dueAt: string | null;
-  repositoryId: string;
+  projectId: string;
   baseRef: string;
   cwd: string;
 }>;
@@ -31,7 +31,7 @@ export type Task = {
   priority?: TaskPriority;
   tags?: string[];
   dueAt?: string;
-  repositoryId?: string;
+  projectId?: string;
   baseRef?: string;
   cwd?: string;
   status: TaskStatus;
@@ -144,12 +144,12 @@ export function updateTaskMetadata(
     ? metadata.tags
     : [...metadata.tags]);
   applyOptional(updated, "dueAt", metadata.dueAt);
-  if (metadata.repositoryId !== undefined) {
-    updated.repositoryId = requireSafeIdentity(metadata.repositoryId, "Repository id");
+  if (metadata.projectId !== undefined) {
+    updated.projectId = requireSafeIdentity(metadata.projectId, "Project id");
   }
   if (metadata.baseRef !== undefined) updated.baseRef = requireText(metadata.baseRef, "Task base ref");
   if (metadata.cwd !== undefined) updated.cwd = requireText(metadata.cwd, "Task workspace");
-  validateRepositorySelection(updated);
+  validateProjectSelection(updated);
   return updated;
 }
 
@@ -193,10 +193,10 @@ export function validateTask(task: Task): Task {
     for (const tag of task.tags) requireText(tag, "Task tag");
   }
   if (task.dueAt !== undefined) requireTimestamp(task.dueAt, "Task dueAt");
-  if (task.repositoryId !== undefined) requireSafeIdentity(task.repositoryId, "Repository id");
+  if (task.projectId !== undefined) requireSafeIdentity(task.projectId, "Project id");
   if (task.baseRef !== undefined) requireText(task.baseRef, "Task base ref");
   if (task.cwd !== undefined) requireText(task.cwd, "Task workspace");
-  validateRepositorySelection(task);
+  validateProjectSelection(task);
 
   const completionFields = [task.completedAt, task.completedBy, task.completionSummary];
   const hasAnyCompletion = completionFields.some((value) => value !== undefined);
@@ -242,19 +242,19 @@ function cloneMetadata(metadata: TaskMetadata): TaskMetadata {
     ...(metadata.priority === undefined ? {} : { priority: metadata.priority }),
     ...(metadata.tags === undefined ? {} : { tags: [...metadata.tags] }),
     ...(metadata.dueAt === undefined ? {} : { dueAt: metadata.dueAt }),
-    ...(metadata.repositoryId === undefined
+    ...(metadata.projectId === undefined
       ? {}
-      : { repositoryId: requireSafeIdentity(metadata.repositoryId, "Repository id") }),
+      : { projectId: requireSafeIdentity(metadata.projectId, "Project id") }),
     ...(metadata.baseRef === undefined ? {} : { baseRef: requireText(metadata.baseRef, "Task base ref") }),
     ...(metadata.cwd === undefined ? {} : { cwd: requireText(metadata.cwd, "Task workspace") })
   };
-  validateRepositorySelection(cloned);
+  validateProjectSelection(cloned);
   return cloned;
 }
 
-function validateRepositorySelection(value: Pick<TaskMetadata, "repositoryId" | "baseRef">): void {
-  if (value.baseRef !== undefined && value.repositoryId === undefined) {
-    throw new Error("Task base ref requires a repository.");
+function validateProjectSelection(value: Pick<TaskMetadata, "projectId" | "baseRef">): void {
+  if (value.baseRef !== undefined && value.projectId === undefined) {
+    throw new Error("Task base ref requires a project.");
   }
 }
 

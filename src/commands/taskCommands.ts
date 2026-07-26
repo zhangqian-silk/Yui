@@ -65,9 +65,11 @@ import {
   type TaskPriority
 } from "../task/task.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import { resolveProject, type Project } from "../repository/project.js";
 import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import {
   createWorkItem,
+  retryFailedWorkItem,
   updateWorkItemStatus,
   type WorkItem,
   type WorkItemStatus
@@ -137,7 +139,7 @@ export function runTaskCommand(
 ): TaskCommandExecution {
   const [command, ...rest] = args;
   switch (command) {
-    case "create": return output(createTaskCommand(rest, store, options));
+    case "create": return createTaskCommand(rest, store, options);
     case "update": return output(updateTaskCommand(rest, store, options));
     case "list": return listTaskCommand(rest, store);
     case "show": return showTaskCommand(rest, store);
@@ -273,25 +275,46 @@ function createTaskCommand(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
-): string {
-  const usage = "Task create usage: yui task create <title> [--repository <id>] [--base <ref>].";
-  const parsed = parseTail(args, new Set(["--repository", "--base"]), usage);
-  exactPositionals(parsed.positionals, 1, usage);
-  const repositoryId = optionalNonEmptyOption(parsed.options, "--repository");
-  const baseRef = optionalNonEmptyOption(parsed.options, "--base");
-  if (baseRef !== undefined && repositoryId === undefined) {
-    throw usageError("--base requires --repository.");
-  }
-  if (repositoryId !== undefined && store.getRepository(repositoryId) === null) {
-    throw usageError(`Repository not found: ${repositoryId}.`);
-  }
+): TaskCommandExecution {
+  const parsed = parseTaskCreation(args, store);
+  const projectId = parsed.project?.id;
   const now = clock(options);
-  const created = store.transaction((tx) => createTaskAggregate(tx, parsed.positionals[0], {
-    ...(repositoryId === undefined ? {} : { repositoryId }),
-    ...(baseRef === undefined ? {} : { baseRef })
+  const created = store.transaction((tx) => createTaskAggregate(tx, parsed.title, {
+    ...(projectId === undefined ? {} : { projectId }),
+    ...(parsed.baseRef === undefined ? {} : { baseRef: parsed.baseRef })
   }, now));
   notifyMailbox(options.runtime, taskMailbox(created.task.id), created.task.id);
-  return `Created Draft task ${created.task.id}: ${created.task.title}\nAssigned role: ${created.leader.name}\n`;
+  return output(
+    `Created Draft task ${created.task.id}: ${created.task.title}\nAssigned role: ${created.leader.name}\n`,
+    { task: created.task, leader: created.leader }
+  );
+}
+
+function parseTaskCreation(
+  args: string[],
+  store: TaskWorkflowStore
+): Readonly<{ title: string; project: Project | null; baseRef?: string }> {
+  const usage = "Task create usage: yui task create <title> [--project <project>] [--base <ref>].";
+  const parsed = parseTail(args, new Set(["--project", "--base"]), usage);
+  exactPositionals(parsed.positionals, 1, usage);
+  const projectReference = optionalNonEmptyOption(parsed.options, "--project");
+  const baseRef = optionalNonEmptyOption(parsed.options, "--base");
+  if (baseRef !== undefined && projectReference === undefined) {
+    throw usageError("--base requires --project.");
+  }
+  const project = projectReference === undefined
+    ? null
+    : resolveProject(store.listProjects(), projectReference);
+  if (projectReference !== undefined && project === null) {
+    throw usageError(`Project not found: ${projectReference}.`);
+  }
+  return {
+    title: parsed.positionals[0],
+    project,
+    ...(project === null
+      ? {}
+      : { baseRef: baseRef ?? project.developmentBranch })
+  };
 }
 
 function createTaskAggregate(
@@ -320,9 +343,9 @@ function listTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
           { header: "Task", minWidth: 6, maxWidth: 20 },
           { header: "Status", minWidth: 6, maxWidth: 10 },
           { header: "Title", minWidth: 8, maxWidth: 64 },
-          { header: "Repository", minWidth: 10, maxWidth: 24 }
+          { header: "Project", minWidth: 8, maxWidth: 24 }
         ],
-        tasks.map((task) => [task.id, task.status, task.title, task.repositoryId ?? "-"]),
+        tasks.map((task) => [task.id, task.status, task.title, task.projectId ?? "-"]),
         defaultTableWidth()
       )}\n`;
   return output(rendered, { tasks });
@@ -363,7 +386,7 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     ...(task.completedAt === undefined ? [] : [`Completed: ${presentTime(task.completedAt, timeZone)}`]),
     ...(task.completedBy === undefined ? [] : [`Completed by: ${task.completedBy}`]),
     ...(task.completionSummary === undefined ? [] : [`Completion summary: ${task.completionSummary}`]),
-    ...(task.repositoryId === undefined ? [] : [`Repository: ${task.repositoryId}`]),
+    ...(task.projectId === undefined ? [] : [`Project: ${task.projectId}`]),
     ...(task.baseRef === undefined ? [] : [`Base: ${task.baseRef}`]),
     ...(task.cwd === undefined ? [] : [`Workspace: ${task.cwd}`]),
     `Roles: ${counts.roles}`,
@@ -397,7 +420,7 @@ function activateTaskCommand(
     if (task.status === "active") return { task, changed: false } as const;
     const active = activateTask(task, now);
     tx.saveTask(active);
-    // Repository-backed Tasks keep this durable wake pending until the
+    // Project-backed Tasks keep this durable wake pending until the
     // Controller has prepared and recorded the Task workspace.
     enqueueWork(tx, leaderMailbox(task.id), "task-created", now, [taskRef(task.id)]);
     enqueueWork(tx, taskMailbox(task.id), "task-activated", now, [taskRef(task.id)]);
@@ -442,9 +465,10 @@ function completeTaskCommand(
     if (workerRun !== undefined) {
       throw usageError(`Task ${task.id} has an active run for Role ${workerRun.role.name}.`);
     }
-    const runningWork = tx.listWorkItems(task.id).find((item) => item.status === "running");
-    if (runningWork !== undefined) {
-      throw usageError(`Task ${task.id} has running work: ${runningWork.id}.`);
+    const unsettledWork = tx.listWorkItems(task.id)
+      .find((item) => item.status === "pending" || item.status === "running");
+    if (unsettledWork !== undefined) {
+      throw usageError(`Task ${task.id} has unsettled work: ${unsettledWork.id}.`);
     }
 
     const leaderEntry = activeRuns.find(({ role }) => role.name === LEADER_ROLE);
@@ -526,12 +550,18 @@ function archiveTaskCommand(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  exactPositionals(args, 1, "Task archive usage: yui task archive <id>.");
+  const request = validateTaskArchiveRequest(args, store, options);
   const now = clock(options);
   const result = store.transaction((tx) => {
-    const task = requireTask(tx, args[0]);
+    const task = requireTask(tx, request.taskId);
     const actor = taskActor(options, task.id);
     if (task.status === "archived") return { task, changed: false } as const;
+    if (task.status !== "completed") {
+      throw usageError(`Task ${task.id} must be completed before it can be archived.`);
+    }
+    if (task.cwd !== undefined || tx.listRoleWorkspaces(task.id).length > 0) {
+      throw usageError(`Task ${task.id} still has managed worktrees; clean them before archiving.`);
+    }
     assertNoOpenInputRequests(tx, task.id, "archiving the Task");
     const archived = archiveTask(task, now, { by: actor });
     tx.saveTask(archived);
@@ -564,7 +594,10 @@ function archiveTaskCommand(
         }
       }
     }
-    recordTaskEvent(tx, task.id, "task.archived", { by: actor }, now);
+    recordTaskEvent(tx, task.id, "task.archived", {
+      by: actor,
+      workspaceDisposition: request.disposition
+    }, now);
     enqueueWork(tx, taskMailbox(task.id), "task-archived", now, [taskRef(task.id)]);
     return { task: archived, changed: true } as const;
   });
@@ -572,6 +605,36 @@ function archiveTaskCommand(
   return result.changed
     ? `Archived task ${result.task.id}\n`
     : `Task ${result.task.id} is already archived\n`;
+}
+
+export function parseTaskArchiveArguments(
+  args: readonly string[]
+): Readonly<{ taskId: string; disposition: "integrated" | "abandoned" }> {
+  const usage = "Task archive usage: yui task archive <id> (--integrated|--abandon).";
+  if (args.length !== 2 || !["--integrated", "--abandon"].includes(args[1] ?? "")) {
+    throw usageError(usage);
+  }
+  return {
+    taskId: args[0]!,
+    disposition: args[1] === "--integrated" ? "integrated" : "abandoned"
+  };
+}
+
+export function validateTaskArchiveRequest(
+  args: readonly string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions = {}
+): Readonly<{ taskId: string; disposition: "integrated" | "abandoned" }> {
+  const request = parseTaskArchiveArguments(args);
+  const task = requireTask(store, request.taskId);
+  taskActor(options, task.id);
+  if (task.status !== "archived" && task.status !== "completed") {
+    throw usageError(`Task ${task.id} must be completed before it can be archived.`);
+  }
+  if (task.status === "completed") {
+    assertNoOpenInputRequests(store, task.id, "archiving the Task");
+  }
+  return request;
 }
 
 function reconcileTaskCommand(
@@ -1058,13 +1121,14 @@ function updateWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task work update usage: yui task work update <id> <todo|running|done|failed> [--summary <text>].";
+  const usage = "Task work update usage: yui task work update <id> <todo|running|done|failed|cancelled|superseded> [--summary <text>].";
   const parsed = parseTail(args, new Set(["--summary"]), usage);
   exactPositionals(parsed.positionals, 2, usage);
   const requested = parsed.positionals[1];
   const status = parseWorkStatus(requested);
   const summary = parsed.options.get("--summary");
-  if ((status === "completed" || status === "failed") && trimmed(summary) === undefined) {
+  if (["completed", "failed", "cancelled", "superseded"].includes(status)
+    && trimmed(summary) === undefined) {
     throw usageError(`--summary is required when work becomes ${requested}.`);
   }
   const now = clock(options);
@@ -1104,6 +1168,14 @@ function dispatchWork(
       throw usageError(`Work item ${item.id} cannot be dispatched from ${item.status}.`);
     }
     const role = requireRole(tx, task.id, item.assignee);
+    const workspace = tx.getRoleWorkspace(task.id, role.name);
+    if (workspace?.owner.type === "work-item"
+      && workspace.owner.workItemId !== item.id) {
+      throw usageError(
+        `Role ${role.name} still uses the isolated worktree for ${workspace.owner.workItemId}; `
+        + `cleanup ${workspace.owner.workItemId} before dispatching ${item.id}.`
+      );
+    }
     if (tx.getActiveAgentRun(task.id, role.name) !== null) {
       throw usageError(`${task.id}/${role.name} already has an active run.`);
     }
@@ -1205,7 +1277,15 @@ function retryRun(
     if (previous.workItemId !== undefined) {
       const item = tx.getWorkItem(task.id, previous.workItemId);
       if (item === null) throw dataError(`Work item not found for run ${previous.id}: ${previous.workItemId}.`);
-      tx.saveWorkItem(task.id, updateWorkItemStatus(item, "running", undefined, now));
+      const workspace = tx.getRoleWorkspace(task.id, role.name);
+      if (workspace?.owner.type === "work-item"
+        && workspace.owner.workItemId !== item.id) {
+        throw usageError(
+          `Role ${role.name} uses the isolated worktree for ${workspace.owner.workItemId}; `
+          + `cannot retry ${item.id}.`
+        );
+      }
+      tx.saveWorkItem(task.id, retryFailedWorkItem(item, now));
     }
     enqueueWork(tx, roleMailbox(task.id, role.name), "run-retried", now, [runRef(created.id)]);
     return created;
@@ -1405,6 +1485,8 @@ function parseWorkStatus(value: string): WorkItemStatus {
   if (value === "running") return "running";
   if (value === "done") return "completed";
   if (value === "failed") return "failed";
+  if (value === "cancelled") return "cancelled";
+  if (value === "superseded") return "superseded";
   throw usageError(`Invalid work item status: ${value}.`);
 }
 

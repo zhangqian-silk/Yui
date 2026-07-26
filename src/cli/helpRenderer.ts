@@ -36,7 +36,7 @@ function describeOption(option: string): string {
     "--host": "Set the loopback listen address.",
     "--port": "Set the local listen port.",
     "--json": "Emit machine-readable JSON.",
-    "--repository": "Select a repository.",
+    "--project": "Select a Project.",
     "--role": "Select a Task role.",
     "--summary": "Set summary text.",
     "--task": "Select a Task."

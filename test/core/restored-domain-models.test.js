@@ -16,7 +16,10 @@ import {
   yieldAgentRun
 } from "../../dist/run/agentRun.js";
 import { activateTask, archiveTask, createTask } from "../../dist/task/task.js";
-import { createWorkItem } from "../../dist/workItem/workItem.js";
+import {
+  createWorkItem,
+  updateWorkItemStatus
+} from "../../dist/workItem/workItem.js";
 import { createTaskMessage } from "../../dist/message/message.js";
 
 const now = new Date("2026-07-19T12:00:00.000Z");
@@ -165,7 +168,7 @@ test("restored persistent domain records are plain JSON with explicit schema ver
 
 test("Task follows the retained draft, active, archived lifecycle", () => {
   const draft = createTask("task-1", "Lifecycle", now, {
-    repositoryId: "repo-1",
+    projectId: "repo-1",
     baseRef: "main"
   });
   const active = activateTask(draft, later);
@@ -173,9 +176,24 @@ test("Task follows the retained draft, active, archived lifecycle", () => {
 
   assert.deepEqual([draft.status, active.status, archived.status], ["draft", "active", "archived"]);
   assert.equal("archived" in draft, false);
-  assert.equal(draft.repositoryId, "repo-1");
+  assert.equal(draft.projectId, "repo-1");
   assert.equal(draft.baseRef, "main");
   assert.throws(() => activateTask(archived, later), /archived/i);
+});
+
+test("terminal WorkItems cannot be reopened", () => {
+  const pending = createWorkItem(
+    "work-1",
+    "task-1",
+    { title: "Implement", assignee: "worker" },
+    now
+  );
+  const completed = updateWorkItemStatus(pending, "completed", "Implemented.", later);
+
+  assert.throws(
+    () => updateWorkItemStatus(completed, "pending", undefined, later),
+    /terminal/i
+  );
 });
 
 test("TaskMessage represents user, operator, and Role result authors structurally", () => {

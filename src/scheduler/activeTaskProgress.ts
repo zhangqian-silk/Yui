@@ -37,7 +37,7 @@ export function repairOrphanedActiveTasks(
     }
 
     if (
-      task.repositoryId !== undefined
+      task.projectId !== undefined
       && task.cwd === undefined
       && typeof store.queueTaskProgress === "function"
     ) {

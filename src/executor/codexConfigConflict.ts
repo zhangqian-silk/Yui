@@ -30,7 +30,7 @@ export type CodexConfigInspectionInput = Readonly<{
  * Inspects the local, file-backed Codex configuration layers supported by Yui
  * that can conflict with launch-owned settings. Remote and platform-managed
  * layers are outside this compatibility boundary. Project files are considered
- * only when the directory, project root, or repository root is trusted.
+ * only when the directory, project root, or project root is trusted.
  */
 export function inspectCodexDeveloperInstructions(
   input: CodexConfigInspectionInput

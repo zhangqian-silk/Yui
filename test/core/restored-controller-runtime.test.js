@@ -123,8 +123,6 @@ test("a due native Turn completion forgets the finalized Run preparation", async
 test("periodic recovery skips active workspace scans without durable Task work", async () => {
   const events = [];
   const workspacePreparer = {
-    async prepareActiveTaskWorkspaces() { events.push("prepare-active"); return []; },
-    async cleanupArchivedTaskWorkspaces() { events.push("cleanup-archived"); return []; }
   };
   await runControllerSchedulerPass(
     emptyStore(events),
@@ -238,8 +236,6 @@ test("Task mailbox is completed only after its targeted orchestration succeeds",
   store.completeWorkMailbox = (_target, batchId) => { calls.push(`complete:${batchId}`); return true; };
   const workspace = {
     async prepareTaskWorkspace() { calls.push("workspace"); return { taskId: "task-1", status: "ready" }; },
-    async prepareActiveTaskWorkspaces() { return []; },
-    async cleanupArchivedTaskWorkspaces() { return []; }
   };
 
   await runControllerSchedulerPass(store, noTmux, new Date(0), workspace, {
@@ -268,85 +264,12 @@ test("Task mailbox is released when targeted orchestration fails", async () => {
   store.releaseWorkMailbox = (_target, batchId) => { released = batchId; return true; };
   const workspace = {
     async prepareTaskWorkspace() { throw new Error("workspace failed"); },
-    async prepareActiveTaskWorkspaces() { return []; },
-    async cleanupArchivedTaskWorkspaces() { return []; }
   };
 
   await runControllerSchedulerPass(store, noTmux, new Date(0), workspace, {
     kind: "dirty", keys: ["task:task-1"]
   });
   assert.equal(released, "task:task-1:1-1");
-});
-
-test("targeted archived cleanup returning failed releases its Task mailbox", async () => {
-  const target = { kind: "task", taskId: "task-1" };
-  const batch = {
-    fromSequence: 1, toSequence: 1, reasons: ["task-archived"], refs: [],
-    requestCount: 1, firstQueuedAt: new Date(0).toISOString(), lastQueuedAt: new Date(0).toISOString()
-  };
-  const processing = {
-    batchId: "task:task-1:1-1", batch, owner: "controller", startedAt: new Date(0).toISOString()
-  };
-  const settled = [];
-  const store = emptyStore();
-  store.getTask = () => ({ id: "task-1", status: "archived", repositoryId: "repository-1" });
-  store.getWorkMailbox = () => ({
-    schemaVersion: 1, target, nextSequence: 2, processing: null, pending: batch
-  });
-  store.claimWorkMailbox = () => ({ status: "claimed", processing });
-  store.completeWorkMailbox = () => { settled.push("complete"); return true; };
-  store.releaseWorkMailbox = () => { settled.push("release"); return true; };
-  const workspace = {
-    async prepareTaskWorkspace() { return { taskId: "task-1", status: "failed", error: "git failed" }; },
-    async prepareActiveTaskWorkspaces() { return []; },
-    async cleanupArchivedTaskWorkspaces() { return []; }
-  };
-
-  await runControllerSchedulerPass(store, noTmux, new Date(0), workspace, {
-    kind: "dirty", keys: ["task:task-1"]
-  });
-
-  assert.deepEqual(settled, ["release"]);
-});
-
-test("one targeted workspace failure does not skip or acknowledge later Tasks", async () => {
-  const batch = {
-    fromSequence: 1, toSequence: 1, reasons: ["task-archived"], refs: [],
-    requestCount: 1, firstQueuedAt: new Date(0).toISOString(), lastQueuedAt: new Date(0).toISOString()
-  };
-  const targets = ["task-failed", "task-ok"].map((taskId) => ({ kind: "task", taskId }));
-  const mailboxes = new Map(targets.map((target) => [target.taskId, {
-    schemaVersion: 1, target, nextSequence: 2, processing: null, pending: batch
-  }]));
-  const attempted = [];
-  const settled = [];
-  const store = emptyStore();
-  store.getTask = (taskId) => ({ id: taskId, status: "archived", repositoryId: "repository-1" });
-  store.getWorkMailbox = (target) => mailboxes.get(target.taskId) ?? null;
-  store.claimWorkMailbox = ({ target }) => ({
-    status: "claimed",
-    processing: {
-      batchId: `task:${target.taskId}:1-1`, batch, owner: "controller", startedAt: new Date(0).toISOString()
-    }
-  });
-  store.completeWorkMailbox = (target) => { settled.push(`complete:${target.taskId}`); return true; };
-  store.releaseWorkMailbox = (target) => { settled.push(`release:${target.taskId}`); return true; };
-  const workspace = {
-    async prepareTaskWorkspace(taskId) {
-      attempted.push(taskId);
-      if (taskId === "task-failed") throw new Error("git failed");
-      return { taskId, status: "archived-clean" };
-    },
-    async prepareActiveTaskWorkspaces() { return []; },
-    async cleanupArchivedTaskWorkspaces() { return []; }
-  };
-
-  await runControllerSchedulerPass(store, noTmux, new Date(0), workspace, {
-    kind: "dirty", keys: ["task:task-failed", "task:task-ok"]
-  });
-
-  assert.deepEqual(attempted, ["task-failed", "task-ok"]);
-  assert.deepEqual(settled, ["release:task-failed", "complete:task-ok"]);
 });
 
 test("a main full pass never consumes the Operator mailbox", async () => {
@@ -1070,8 +993,6 @@ test("full recovery releases only Task mailboxes whose isolated workspace work f
         ? { taskId, status: "failed", error: "git failed" }
         : { taskId, status: "ready" };
     },
-    async prepareActiveTaskWorkspaces() { throw new Error("periodic full scan is forbidden"); },
-    async cleanupArchivedTaskWorkspaces() { return []; }
   };
 
   await runControllerSchedulerPass(store, noTmux, new Date(0), workspace);
@@ -1197,10 +1118,10 @@ test("dirty mailbox keys compile into exact task, role and operator selections",
   );
 });
 
-test("dirty Task reconciliation filters every Task phase and preserves workspace ordering", async () => {
+test("dirty Task reconciliation prepares active work and only stops archived runtimes", async () => {
   const events = [];
-  const active = { id: "task-active", status: "active", repositoryId: "repository-1" };
-  const archived = { id: "task-archived", status: "archived", repositoryId: "repository-1" };
+  const active = { id: "task-active", status: "active", projectId: "project-1" };
+  const archived = { id: "task-archived", status: "archived", projectId: "project-1" };
   const tasks = new Map([[active.id, active], [archived.id, archived]]);
   const store = emptyStore(events);
   store.listTasks = () => { throw new Error("dirty pass must not list every Task"); };
@@ -1214,8 +1135,6 @@ test("dirty Task reconciliation filters every Task phase and preserves workspace
   store.listOpenInputRequests = () => { throw new Error("Task pass must not notify Operator"); };
   const workspace = {
     async prepareTaskWorkspace(taskId) { events.push(`workspace:${taskId}`); return { taskId, status: "ready" }; },
-    async prepareActiveTaskWorkspaces() { throw new Error("dirty pass must not prepare all Tasks"); },
-    async cleanupArchivedTaskWorkspaces() { throw new Error("dirty pass must not clean all Tasks"); }
   };
   const delivery = {
     ...noTmux,
@@ -1228,7 +1147,7 @@ test("dirty Task reconciliation filters every Task phase and preserves workspace
   });
 
   assert.ok(events.indexOf("workspace:task-active") < events.indexOf("stop:task-archived"));
-  assert.ok(events.indexOf("stop:task-archived") < events.indexOf("workspace:task-archived"));
+  assert.equal(events.includes("workspace:task-archived"), false);
   assert.deepEqual(events.filter((event) => event.startsWith("deadlines:")), [
     "deadlines:task-active,task-archived"
   ]);
@@ -1262,12 +1181,6 @@ test("dirty Role reconciliation inspects only that Role while retaining the Task
     async prepareTaskWorkspace() {
       throw new Error("Role-only pass must not prepare the Task workspace");
     },
-    async prepareActiveTaskWorkspaces() {
-      throw new Error("Role-only pass must not prepare all Task workspaces");
-    },
-    async cleanupArchivedTaskWorkspaces() {
-      throw new Error("Role-only pass must not clean archived Task workspaces");
-    }
   };
 
   await runControllerSchedulerPass(store, delivery, new Date(0), workspace, {
@@ -1311,8 +1224,6 @@ test("Operator attention is not blocked by a slow Task reconciliation", async ()
       await blocked;
       return { taskId: "task-1", status: "ready" };
     },
-    async prepareActiveTaskWorkspaces() { return []; },
-    async cleanupArchivedTaskWorkspaces() { return []; }
   };
   const controller = new FileTaskController(store, noTmux, {
     signalWindowMs: 1,
@@ -1526,6 +1437,42 @@ test("foreground enter asks the Controller to own session creation", async () =>
   ]);
 });
 
+test("workspace transitions stop the existing Role runtime before changing cwd", async () => {
+  const events = [];
+  let session = { status: "ready" };
+  const runtime = new FileTaskWorkflowRuntime(
+    "/tmp/yui-workspace-transition",
+    {
+      getActiveAgentRun: () => null,
+      getRoleSession: () => session,
+      getWorkMailbox: () => null
+    },
+    {
+      enqueueRuntimeCleanup(owner) {
+        events.push(["enqueue", owner]);
+        return { kind: "role-runtime", taskId: owner.taskId, roleName: owner.roleName };
+      }
+    },
+    {},
+    {},
+    undefined,
+    {
+      call: async (_home, method, params) => {
+        events.push([method, params]);
+        session = { status: "stopped" };
+        return {};
+      }
+    }
+  );
+
+  await runtime.stopTaskRoleSessions("task-1", ["worker"]);
+
+  assert.deepEqual(events, [
+    ["enqueue", { scope: "task", taskId: "task-1", roleName: "worker" }],
+    ["scheduler.scan", {}]
+  ]);
+});
+
 test("explicit reconciliation prepares active Role worktrees before requesting a full scan", async () => {
   for (const [status, expected] of [
     ["active", ["prepare", "scheduler.scan"]],
@@ -1536,7 +1483,7 @@ test("explicit reconciliation prepares active Role worktrees before requesting a
     const scanned = new Promise((resolve) => { scanCompleted = resolve; });
     const runtime = new FileTaskWorkflowRuntime(
       "/tmp/yui-workspace-order",
-      { getTask: () => ({ id: "task-1", status, repositoryId: "repository-1" }) },
+      { getTask: () => ({ id: "task-1", status, projectId: "project-1" }) },
       {},
       {},
       {},
@@ -1658,8 +1605,6 @@ test("a failed Task workspace is retried without starving peers and stops at the
       attempts += 1;
       throw new Error("transient workspace failure");
     },
-    async prepareActiveTaskWorkspaces() { return []; },
-    async cleanupArchivedTaskWorkspaces() { return []; }
   };
   const controller = new FileTaskController(store, noTmux, {
     signalWindowMs: 1,
@@ -2375,6 +2320,11 @@ test("production FileTask controller composition starts without compact SQLite r
   const home = mkdtempSync(join(tmpdir(), "yui-file-runtime-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home);
+  const { FileTaskStore } = await import("../../dist/storage/taskStore.js");
+  new FileTaskStore(home).saveConfig({
+    schemaVersion: 1,
+    defaultWorkspace: `${home}-workspace`
+  });
   const sessionHost = {
     async start() { throw new Error("unused"); },
     async resume() { throw new Error("unused"); },
@@ -2402,20 +2352,32 @@ test("production Controller reads reconciliationIntervalSeconds from Yui config"
   ensureStorageSchema(home);
   const { FileTaskStore } = await import("../../dist/storage/taskStore.js");
   const store = new FileTaskStore(home);
-  store.saveConfig({ schemaVersion: 1, reconciliationIntervalSeconds: 45 });
+  store.saveConfig({
+    schemaVersion: 1,
+    defaultWorkspace: `${home}-workspace`,
+    reconciliationIntervalSeconds: 45
+  });
 
   const controller = await startFileTaskControllerRuntime(home, { store });
 
   assert.equal(controller.runtime.reconciliationIntervalMs, 45_000);
 
-  store.saveConfig({ schemaVersion: 1, reconciliationIntervalSeconds: 30 });
+  store.saveConfig({
+    schemaVersion: 1,
+    defaultWorkspace: `${home}-workspace`,
+    reconciliationIntervalSeconds: 30
+  });
   assert.deepEqual(await callController(home, "scheduler.configure", {}), {
     configured: true,
     reconciliationIntervalMs: 30_000
   });
   assert.equal(controller.runtime.reconciliationIntervalMs, 30_000);
 
-  store.saveConfig({ schemaVersion: 1, reconciliationIntervalSeconds: 20 });
+  store.saveConfig({
+    schemaVersion: 1,
+    defaultWorkspace: `${home}-workspace`,
+    reconciliationIntervalSeconds: 20
+  });
   await controller.runtime.pump();
   assert.equal(controller.runtime.reconciliationIntervalMs, 20_000);
   await controller.close();

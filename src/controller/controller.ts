@@ -73,10 +73,7 @@ export type ControllerRuntimeOptions = Readonly<{
   readyRecoveryAgeMs?: number;
   now?: () => Date;
   onError?: (error: unknown) => void;
-  workspacePreparer?: Pick<
-    TaskWorkspacePreparer,
-    "prepareTaskWorkspace" | "prepareActiveTaskWorkspaces" | "cleanupArchivedTaskWorkspaces"
-  >;
+  workspacePreparer?: Pick<TaskWorkspacePreparer, "prepareTaskWorkspace">;
   runtimeEventProcessor?: RuntimeEventProcessorPort;
   lifecycleHost?: RuntimeLifecycleHost;
   configuration?: ControllerConfigurationPort;
@@ -113,10 +110,7 @@ export async function runControllerSchedulerPass(
   store: SchedulerStorePort,
   delivery: TmuxDeliveryPort,
   now: Date,
-  workspacePreparer?: Pick<
-    TaskWorkspacePreparer,
-    "prepareTaskWorkspace" | "prepareActiveTaskWorkspaces" | "cleanupArchivedTaskWorkspaces"
-  >,
+  workspacePreparer?: Pick<TaskWorkspacePreparer, "prepareTaskWorkspace">,
   scope: ReconcileScope = { kind: "full" },
   readyRecoveryAgeMs?: number,
   includeOperator = true,
@@ -158,9 +152,6 @@ export async function runControllerSchedulerPass(
     const stoppedArchivedTaskIds = await stopArchivedTaskRuntimes(
       store, delivery, now, taskWorkSelection
     );
-    for (const taskId of await cleanupArchivedWorkspaces(store, workspacePreparer, selection)) {
-      failedTaskMailboxes.add(taskId);
-    }
     const activeRunDeliveries = await processActiveRoleRunDeliveries(
       store, delivery, now, roleSelection
     );
@@ -681,34 +672,6 @@ async function prepareActiveWorkspaces(
   return failed;
 }
 
-async function cleanupArchivedWorkspaces(
-  store: SchedulerStorePort,
-  workspace: ControllerRuntimeOptions["workspacePreparer"],
-  selection: ReconcileSelection
-): Promise<Set<string>> {
-  if (workspace === undefined) return new Set();
-  const taskIds = selection.full
-    ? new Set(store.listWorkMailboxes().flatMap((mailbox) => (
-        mailbox.target.kind === "task"
-        && (mailbox.pending !== null || mailbox.processing !== null)
-          ? [mailbox.target.taskId]
-          : []
-      )))
-    : selection.taskIds;
-  const failed = new Set<string>();
-  for (const taskId of taskIds) {
-    if (store.getTask(taskId)?.status === "archived") {
-      try {
-        const result = await workspace.prepareTaskWorkspace(taskId);
-        if (result.status === "failed") failed.add(taskId);
-      } catch {
-        failed.add(taskId);
-      }
-    }
-  }
-  return failed;
-}
-
 function parseMailboxKey(key: string):
   | Readonly<{ kind: "task"; taskId: string }>
   | Readonly<{ kind: "role"; taskId: string; roleName: string }>
@@ -762,10 +725,9 @@ export class FileTaskController {
   #intervalMs: number;
   readonly #now: () => Date;
   readonly #onError: (error: unknown) => void;
-  readonly #workspacePreparer: Pick<
-    TaskWorkspacePreparer,
-    "prepareTaskWorkspace" | "prepareActiveTaskWorkspaces" | "cleanupArchivedTaskWorkspaces"
-  > | undefined;
+  readonly #workspacePreparer:
+    | Pick<TaskWorkspacePreparer, "prepareTaskWorkspace">
+    | undefined;
   readonly #deliveryRetryMs: number;
   readonly #deliveryRetryLimit: number;
   readonly #readyRecoveryAgeMs: number;

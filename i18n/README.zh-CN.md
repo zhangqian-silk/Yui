@@ -2,7 +2,7 @@
 
 # Yui
 
-Yui 是一个用于长期 Codex/Claude 工作的本地编排器。控制状态保存在可检查的 JSON 文件中，所有 Agent 终端完全由 tmux 主导，带 Repository 的 Task 使用确定性的 Git worktree。
+Yui 是一个用于长期 Codex/Claude 工作的本地编排器。控制状态、Project Catalog 和项目知识保存在可检查的 JSON 文件中，所有 Agent 终端完全由 tmux 主导，带 Project 的 Task 使用确定性的 Git worktree。
 
 当前实现恢复了实用的 Role/Agent/session 模型和 CLI 框架，但没有恢复后期膨胀的数据维护、租约、定时调度和恢复账本体系。
 
@@ -21,7 +21,7 @@ yui setup
 yui doctor
 ```
 
-`setup` 是交互式的：检测已安装的 Agent CLI、选择要配置的 Agent、默认 Agent 和 Operator Agent，分别配置 Leader/Operator Role 的模型与思考强度，确认 Operator workspace，并询问 shell completion。模型或思考强度留空会保留当前值；输入 `default` 可恢复为原生 CLI 默认值。再次运行不会删除已有 Task/Role，可用于安全地调整配置。
+`setup` 是交互式的：检测已安装的 Agent CLI、选择要配置的 Agent、默认 Agent 和 Operator Agent，分别配置 Leader/Operator Role 的模型与思考强度，确认位于 Yui home 外部的 Project workspace，并询问 shell completion。模型或思考强度留空会保留当前值；输入 `default` 可恢复为原生 CLI 默认值。再次运行不会删除已有 Task/Role，也不会改变当前安装的 Project workspace，可用于安全地调整配置。
 
 模型与思考强度属于 Role 设置，因此 Leader 与 Operator 即使使用同一个 Agent CLI，也可以采用不同配置。其他 Role 可通过 `role add`、`role update`、`task role add` 或 `task role update` 的 `--model` 和 `--effort` 配置。
 
@@ -41,15 +41,17 @@ export YUI_HOME=/absolute/path/to/yui-home
 yui setup
 ```
 
-home 中包含 `schema.json`、权威 `state.json`、Controller 发现文件和受管理 worktree。当前存储版本严格匹配且 fresh-only；代码保留了未来版本的迁移注册表，但本版不迁移旧格式。
+home 中包含 `schema.json`、权威 `state.json`、Project Catalog、项目知识和 Controller 发现文件。稳定 Project checkout 与受管理 worktree 位于 home 外部的 workspace。当前存储版本严格匹配且 fresh-only；代码保留了未来版本的迁移注册表，但本版不迁移旧格式。
 
 ## 快速开始
 
 ```sh
-yui repository add app /absolute/path/to/app --base main
-yui repository list
+yui project add app /absolute/workspace/app \
+  --remote git@example.com:team/app.git --stable main --development develop
+yui project update app --alias app-cli --development develop
+yui project list
 
-yui task create "交付 CSV 导出" --repository <repository-id> --base main
+yui task create "交付 CSV 导出" --project app
 yui task update <task-id> --priority high --tags release,csv --due-at 2026-08-01T00:00:00Z
 yui task update <task-id> --clear-priority --clear-tags --clear-due-at
 yui task show <task-id>
@@ -67,7 +69,7 @@ yui config set --time-zone Europe/London
 
 查看已有 Task 的详细状态时，优先使用 `task context`。它一次聚合 Task、Brief、Active Decision、最近的 Milestone、Role、当前及最近的 WorkItem 与关联 Run、最近的 Message、Open/Resolved InputRequest 和 Event。终端输出会精简历史和长文本；`yui --json task context <task-id>` 会在顶层 `data` 中返回完整记录。
 
-新 Task 是 Draft，并已创建 Leader。激活时会排入第一次持久 Leader wake。带 Repository 的 Task 会先为每个 Role 创建 `<YUI_HOME>/worktrees/<task-id>/<role-name>`，对应分支为 `yui/<task-id>/<role-name>`，然后才启动 Leader；后续新增 Role 也会在执行前获得独立 worktree。
+带 Project 的新 Task 会立即在 `<workspace>/worktree/<project>/<task-id>/main` 创建主 worktree。所有 Role 默认共享 Task main；任务运行中，Leader 根据并发写入冲突风险直接执行 `yui task work isolate <work-item-id>` 创建 WorkItem 所有的隔离 worktree，无需审批。清理时必须明确标记为 `--integrated` 或 `--abandon`，结果保留在 WorkItem 记录中；dirty worktree 原地保留。
 
 通过 Operator 提交消息：
 
@@ -125,14 +127,14 @@ yui task context <task-id>
 
 需要查看单个集合或记录时，再使用 `task work`、`task message`、`task run` 和 Task Knowledge 下的细分命令。
 
-完成目标后，可将 Task 标记为 completed，从而停止自动唤醒，同时保留 session 和各 Role worktree：
+完成目标后，可将 Task 标记为 completed，从而停止自动唤醒，同时保留 session 和 Task main worktree：
 
 ```sh
 yui task complete <task-id> --summary "CSV 导出已交付并验证"
 yui task reopen <task-id>
 ```
 
-completed Task 在显式 reopen 前会拒绝消息、派发、进入 session、重试和迟到的 yield。archive 仍是终态，并负责 tmux/worktree 清理。
+completed Task 在显式 reopen 前会拒绝消息、派发、进入 session、重试和迟到的 yield。每个隔离 WorkItem worktree 必须先显式清理，清理时也会删除其受管分支；archive 还必须通过 `--integrated` 或 `--abandon` 明确 Task main 的处理结果，之后才会停止 session 并清理干净的 Task main。Task 与 WorkItem 记录都会保留，Task main 分支作为恢复信息保留，不会被静默删除。
 Task 生命周期的交互选择只展示有效来源状态：activate 只展示 Draft，complete 只展示 active，reopen 只展示 completed。
 
 ## Session 与 tmux
@@ -167,7 +169,7 @@ yui controller restart
 
 恢复 reconciliation 默认每 120 秒执行一次。普通持久状态变化只会将 Task、Role 或 Operator key 放入队列并立即返回；固定 100ms 窗口内到达的 key 会合并触发一次不重叠的定向处理。Operator 呈现使用独立 lane，不会被 Task 的 Git/worktree 操作阻塞；周期 Git/worktree 处理只覆盖仍有持久 Task mailbox 工作的 Task，活动 Role 的存活检查合并为一次 tmux inventory。Codex turn-complete Hook 直接写入存储，不启动或等待 Controller，并给合法的 yield、输入请求或完成动作保留 2 秒竞争窗口；到期后才关闭被 Agent 遗忘的活动 Role Run。持久 WorkMailbox 会冻结当前 processing 批次，期间的新事件合并到下一 pending 批次；失败会释放当前批次供恢复。推荐输入与 pending Turn 共用最近 deadline 选择器，不依赖恢复扫描间隔；显式 `task reconcile` 仍会立即请求恢复扫描。保留的闭环为：
 
-1. 准备 active Task 的 repository workspace；
+1. 准备 active Project Task 的主 worktree；
 2. 停止 archived Task 的 tmux，并只清理干净 worktree；
 3. 投递排队的 Worker Run；
 4. 检测活动 Role 进程退出；
@@ -186,7 +188,7 @@ yui task run retry <failed-run-id>
 
 `jobs` 不是旧版通用队列，只展示持久 Leader wake 和 Leader recovery failure。
 
-completion 是可逆的执行屏障。归档是终态：失败活动 Run、停止 Task 的 tmux session，并逐个移除干净的 Role worktree；脏 Role worktree 会保留，供人工确认处理。
+completion 是可逆的执行屏障。只有活动工作已处理且所有 worktree 干净时才能归档；归档停止 Task 的 tmux session 并移除托管 worktree，但保留 Task 记录。脏 worktree 会让 Task 保持 completed，供后续处理。
 
 ## 本地 Web Dashboard
 
@@ -208,7 +210,7 @@ yui update
 yui agent add|list|show|update|remove
 yui role add|list|show|update|remove|bind|enter
 yui role session record|replace
-yui repository add|list
+yui project add|clone|update|discover|list|show|knowledge
 ```
 
 Agent 环境变量绑定只保存进程环境变量名，不保存 secret 值；raw args 不能覆盖 adapter 管理的生命周期参数。

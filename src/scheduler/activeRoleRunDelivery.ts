@@ -40,7 +40,7 @@ export async function processActiveRoleRunDeliveries(
       // A crash after a Leader wake is durably claimed but before tmux input
       // is recoverable through the same receipt-backed delivery path.
       if (run === null || run.deliveredAt !== undefined) continue;
-      if (task.repositoryId !== undefined && task.cwd === undefined) {
+      if (task.projectId !== undefined && task.cwd === undefined) {
         results.push({
           taskId: task.id,
           roleName: role.name,

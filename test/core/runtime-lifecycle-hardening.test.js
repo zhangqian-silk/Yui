@@ -995,8 +995,6 @@ test("production runtime forwards readyRecoveryAgeMs into the Controller", async
     promptPush: { async tryPush() { return "unavailable"; } },
     workspacePreparer: {
       async prepareTaskWorkspace() { return { taskId: task.id, status: "ready" }; },
-      async prepareActiveTaskWorkspaces() { return []; },
-      async cleanupArchivedTaskWorkspaces() { return []; }
     },
     runtimeEventProcessor: {
       drain() {

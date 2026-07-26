@@ -534,7 +534,7 @@ test("Controller atomically applies an expired Agent recommendation and resumes 
   assert.deepEqual(leaderCalls, ["prepare", "ready", "send"]);
   assert.match(leaderWakeupText, new RegExp(`input-timeout:${request.id}`));
   assert.match(leaderWakeupText, new RegExp(`task context ${task.id}`));
-  assert.match(leaderWakeupText, /recently resolved input requests/);
+  assert.match(leaderWakeupText, /Read the authoritative context with yui task context/);
   assert.equal(notices.length, 1);
   const resolved = store.getInputRequest(task.id, request.id);
   assert.equal(resolved.status, "answered");
@@ -622,8 +622,8 @@ test("request provenance, blocked ownership, lifecycle, and origin-only cancel a
     "complete", task.id, "--summary", "Cannot complete with open input"
   ], store, { ...options, environment: {} }), /open input/i);
   assert.throws(() => runTaskCommand([
-    "archive", task.id
-  ], store, { ...options, environment: {} }), /open input/i);
+    "archive", task.id, "--integrated"
+  ], store, { ...options, environment: {} }), /must be completed/i);
   assert.throws(() => runTaskCommand([
     "input", "cancel", task.id, request.id, "--reason", "Forged"
   ], store, {

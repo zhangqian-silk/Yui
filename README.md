@@ -2,7 +2,7 @@
 
 # Yui
 
-Yui is a local orchestrator for long-running Codex and Claude work. It keeps its control state in inspectable JSON files, lets tmux own every Agent terminal, and creates deterministic Git worktrees for repository-backed Tasks.
+Yui is a local orchestrator for long-running Codex and Claude work. It keeps its control state and Project knowledge in inspectable JSON files, lets tmux own every Agent terminal, and creates deterministic Git worktrees for Project-backed Tasks.
 
 The current implementation restores the useful Role/Agent/session and CLI framework without restoring the later data-maintenance, lease, schedule, and recovery-ledger systems.
 
@@ -21,7 +21,7 @@ yui setup
 yui doctor
 ```
 
-`setup` is interactive. It detects installed Agent CLIs, asks which Agents to configure, selects the default and Operator Agent, configures the model and reasoning effort for the Leader and Operator Roles, confirms the Operator workspace, and offers shell-completion setup. Leave a model or effort answer empty to keep its current value; enter `default` to follow the native CLI default. Running setup again preserves existing Tasks and Roles while allowing safe configuration changes.
+`setup` is interactive. It detects installed Agent CLIs, asks which Agents to configure, selects the default and Operator Agent, configures the model and reasoning effort for the Leader and Operator Roles, confirms the Project workspace outside Yui home, and offers shell-completion setup. Leave a model or effort answer empty to keep its current value; enter `default` to follow the native CLI default. Running setup again preserves existing Tasks, Roles, and the installation's Project workspace while allowing safe configuration changes.
 
 Model and effort are Role settings, so Leader and Operator can use different values even when both use the same Agent CLI. Configure other Roles with `--model` and `--effort` on `role add`, `role update`, `task role add`, or `task role update`.
 
@@ -41,17 +41,19 @@ export YUI_HOME=/absolute/path/to/yui-home
 yui setup
 ```
 
-The home contains `schema.json`, the authoritative `state.json`, Controller discovery files, and managed worktrees. The current storage version is exact and fresh-only; the migration registry exists for future versions, but this release does not migrate older formats.
+The home contains `schema.json`, the authoritative `state.json`, Project Catalog and knowledge, and Controller discovery files. Stable Project checkouts and managed worktrees live under the configured workspace, outside Yui home. The current storage version is exact and fresh-only; this release does not migrate older formats.
 
 ## Quick start
 
-Register a repository and create a Draft Task:
+Bind a Project and create a Draft Task:
 
 ```sh
-yui repository add app /absolute/path/to/app --base main
-yui repository list
+yui project add app /absolute/workspace/app \
+  --remote git@example.com:team/app.git --stable main --development develop
+yui project update app --alias app-cli --development develop
+yui project list
 
-yui task create "Ship CSV export" --repository <repository-id> --base main
+yui task create "Ship CSV export" --project app
 yui task update <task-id> --priority high --tags release,csv --due-at 2026-08-01T00:00:00Z
 yui task update <task-id> --clear-priority --clear-tags --clear-due-at
 yui task show <task-id>
@@ -70,7 +72,14 @@ yui config show
 yui config set --time-zone Europe/London
 ```
 
-Activation queues the first durable Leader wake. For a repository-backed Task, the Controller first creates one worktree per Role at `<YUI_HOME>/worktrees/<task-id>/<role-name>` on `yui/<task-id>/<role-name>`, then starts the Leader. Roles added later receive their own worktree before delivery.
+A Project-backed Task receives its main worktree when it is created at `<workspace>/worktree/<project>/<task-id>/main`. Roles share Task main by default. During execution, the Leader may directly create a WorkItem-owned isolated worktree when concurrent edits have meaningful conflict risk:
+
+```sh
+yui task work isolate <work-item-id>
+yui task work cleanup <work-item-id> --integrated
+```
+
+Use `--abandon` instead of `--integrated` only for a deliberate discard. The disposition remains on the WorkItem record. Dirty worktrees are retained.
 
 Submit information through Operator:
 
@@ -130,14 +139,14 @@ yui task context <task-id>
 
 Use the narrower `task work`, `task message`, `task run`, and Task Knowledge commands when you need one collection or record.
 
-When the requested outcome is finished, complete the Task to stop automatic Leader wakes without deleting its sessions or Role worktrees:
+When the requested outcome is finished, complete the Task to stop automatic Leader wakes without deleting its sessions or Task main worktree:
 
 ```sh
 yui task complete <task-id> --summary "CSV export shipped and verified"
 yui task reopen <task-id>
 ```
 
-Completed Tasks reject messages, dispatch, enter, retry, and late yields until explicitly reopened. Archive remains terminal and performs tmux/worktree cleanup.
+Completed Tasks reject messages, dispatch, enter, retry, and late yields until explicitly reopened, while retaining Task main for inspection or integration. Every isolated WorkItem worktree must be explicitly cleaned as integrated or abandoned before archive; that cleanup also removes its managed branch. Archive requires `--integrated` or `--abandon` to state the Task main outcome and is allowed only after Task main is clean. It removes managed worktrees but retains Task and WorkItem records. The Task main branch is retained as a recovery artifact instead of being silently deleted.
 Task lifecycle completion/selection only suggests valid source states: Draft for activate, active for complete, and completed for reopen.
 
 ## Sessions and tmux
@@ -172,7 +181,7 @@ yui controller restart
 
 Its recovery reconciliation runs every 120 seconds by default. Normal durable state changes enqueue a Task, Role, or Operator key and return immediately; keys received in the same fixed 100 ms window trigger one non-overlapping targeted pass. Operator presentation has an independent lane, so a blocked Task workspace operation cannot delay a user question. Periodic Git/worktree work is limited to Tasks with durable Task-mailbox work, while active Role liveness uses one tmux inventory. A Codex turn-complete Hook writes directly to storage without starting or waiting for the Controller, then gives a legal yield/input/completion two seconds to win before closing a forgotten Run. Durable mailboxes freeze the current batch while new signals merge into the next batch; failures release the current batch for recovery. Recommended InputRequest and pending Turn deadlines share one nearest-deadline selector and therefore do not wait for the recovery interval. Explicit `task reconcile` still requests an immediate recovery pass. The retained loop is:
 
-1. prepare active repository workspaces;
+1. prepare active Project Task main worktrees;
 2. stop archived Task tmux sessions and clean only clean worktrees;
 3. deliver queued Worker Runs;
 4. detect exited active Role processes;
@@ -191,7 +200,7 @@ yui task run retry <failed-run-id>
 
 `jobs` is not a restored generic queue: it presents durable pending Leader wakes and Leader recovery failures only.
 
-Completion is the reversible execution fence. Archiving is terminal: it fails active Runs, stops the Task's tmux session, and removes each clean Role worktree. Dirty Role worktrees are preserved for deliberate cleanup.
+Completion is the reversible execution fence. Archiving is terminal and is accepted only after active work is settled: it stops the Task's tmux session and removes clean managed worktrees. Dirty worktrees keep the Task completed and are preserved for deliberate resolution.
 
 ## Local web dashboard
 
@@ -215,7 +224,7 @@ yui update
 yui agent add|list|show|update|remove
 yui role add|list|show|update|remove|bind|enter
 yui role session record|replace
-yui repository add|list
+yui project add|clone|update|discover|list|show|knowledge
 ```
 
 Agent environment bindings store process-environment variable names, never secret values. Adapter-owned lifecycle arguments cannot be overridden through raw arguments.
