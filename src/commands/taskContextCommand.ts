@@ -70,7 +70,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     ...(task.dueAt === undefined ? [] : [`Due: ${formatTimestamp(task.dueAt, timeZone)}`]),
     ...(task.completionSummary === undefined ? [] : [`Completion summary: ${task.completionSummary}`]),
     ...(task.archiveSummary === undefined ? [] : [`Archive summary: ${task.archiveSummary}`]),
-    ...(task.repositoryId === undefined ? [] : [`Repository: ${task.repositoryId}`]),
+    ...(task.projectId === undefined ? [] : [`Project: ${task.projectId}`]),
     ...(task.baseRef === undefined ? [] : [`Base: ${task.baseRef}`]),
     ...(task.cwd === undefined ? [] : [`Workspace: ${task.cwd}`]),
     "",

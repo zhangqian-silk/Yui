@@ -103,9 +103,9 @@ test("an open InputRequest retains pending wakeups until it is resolved", async 
   assert.equal(store.pending.has("task-1"), false);
 });
 
-test("a repository Task retains wakeup until its worktree cwd is ready", async () => {
+test("a project Task retains wakeup until its worktree cwd is ready", async () => {
   const store = fakeStore();
-  store.tasks[0] = { ...store.tasks[0], repositoryId: "repository-1" };
+  store.tasks[0] = { ...store.tasks[0], projectId: "project-1" };
   const delivery = fakeDelivery();
 
   const result = await processLeaderWakeups(store, delivery, NOW);
@@ -190,7 +190,7 @@ test("a pre-send Leader failure forgets its transient prepared binding", async (
   );
 });
 
-test("Leader wakeup context includes the Brief and the latest active Decisions", async () => {
+test("Leader wakeup directs the Agent to CLI context without embedding records", async () => {
   const store = fakeStore({
     brief: {
       schemaVersion: 1,
@@ -216,11 +216,13 @@ test("Leader wakeup context includes the Brief and the latest active Decisions",
   await processLeaderWakeups(store, fakeDelivery(), NOW);
 
   const input = store.savedDispatches[0].run.input;
-  assert.match(input, /Objective: Restore useful task knowledge/);
-  assert.match(input, /Keep the runtime lean/);
+  assert.match(input, /yui task context task-1/);
+  assert.match(input, /yui project knowledge list/);
+  assert.doesNotMatch(input, /Restore useful task knowledge/);
+  assert.doesNotMatch(input, /Keep the runtime lean/);
   assert.doesNotMatch(input, /Decision 1: Reason 1/);
-  assert.match(input, /Decision 2: Reason 2/);
-  assert.match(input, /Decision 4: Reason 4/);
+  assert.doesNotMatch(input, /Decision 2: Reason 2/);
+  assert.doesNotMatch(input, /Decision 4: Reason 4/);
 });
 
 test("a fresh runtime-discovered Leader may register its native session after dispatch", async () => {

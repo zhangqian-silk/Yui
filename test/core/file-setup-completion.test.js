@@ -5,7 +5,9 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -180,6 +182,7 @@ test("setup configures selected Agents plus Leader and Operator model settings",
   assert.match(result, /Leader reasoning effort: high/);
   assert.match(result, /Operator model: gpt-5\.6-sol/);
   assert.match(result, /Operator reasoning effort: xhigh/);
+  assert.match(result, /Project workspace:/);
   assert.match(result, /Completion install skipped/);
 
   const operatorWithPermissions = store.getGlobalRole("operator");
@@ -215,6 +218,21 @@ test("setup configures selected Agents plus Leader and Operator model settings",
     repeated.getGlobalRole("operator").agentBindings.codex.config.search,
     true
   );
+
+  const changedWorkspace = join(root, "other-workspace");
+  const changedInput = new PassThrough();
+  const changedOutput = new PassThrough();
+  changedInput.end([
+    "all", "", "", "", "", "", "", changedWorkspace
+  ].join("\n") + "\n");
+  await assert.rejects(
+    runSetupCommand(
+      [], env, executor,
+      { input: changedInput, output: changedOutput, forceInteractive: true }
+    ),
+    /workspace is fixed/i
+  );
+  assert.equal(new FileTaskStore(home).getConfig().defaultWorkspace, workspace);
 
   const clearInput = new PassThrough();
   const clearOutput = new PassThrough();
@@ -264,6 +282,134 @@ test("setup configures selected Agents plus Leader and Operator model settings",
   );
 });
 
+test("setup persists the canonical Project workspace behind a symbolic-link path", async (t) => {
+  const { runSetupCommand } = await import("../../dist/setup/setupCommand.js");
+  const { FileTaskStore } = await import("../../dist/storage/taskStore.js");
+  const root = mkdtempSync(join(tmpdir(), "yui-file-setup-canonical-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const realRoot = join(root, "real");
+  const aliasRoot = join(root, "alias");
+  const home = join(realRoot, "yui-home");
+  const bin = join(root, "bin");
+  const userHome = join(realRoot, "user");
+  const workspace = join(aliasRoot, "workspace");
+  mkdirSync(realRoot);
+  symlinkSync(realRoot, aliasRoot);
+  mkdirSync(bin);
+  const codex = join(bin, "codex");
+  writeFileSync(codex, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  chmodSync(codex, 0o755);
+  const input = new PassThrough();
+  input.end([
+    "all", "", "", "", "", "", "", workspace, "skip"
+  ].join("\n") + "\n");
+
+  await runSetupCommand([], {
+    YUI_HOME: home,
+    HOME: userHome,
+    PATH: bin,
+    SHELL: "/bin/zsh"
+  }, {
+    run: () => "tmux 3.4"
+  }, {
+    input,
+    output: new PassThrough(),
+    forceInteractive: true
+  });
+
+  const store = new FileTaskStore(home);
+  const canonicalWorkspace = realpathSync(join(realRoot, "workspace"));
+  assert.equal(store.getConfig().defaultWorkspace, canonicalWorkspace);
+  assert.equal(store.getGlobalRole("leader").workspace, canonicalWorkspace);
+  assert.equal(store.getGlobalRole("operator").workspace, canonicalWorkspace);
+});
+
+test("rejected workspace change does not persist newly discovered Agents", async (t) => {
+  const { runSetupCommand } = await import("../../dist/setup/setupCommand.js");
+  const { FileTaskStore } = await import("../../dist/storage/taskStore.js");
+  const root = mkdtempSync(join(tmpdir(), "yui-file-setup-agent-rollback-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, "yui-home");
+  const bin = join(root, "bin");
+  const workspace = join(root, "workspace");
+  mkdirSync(bin);
+  const codex = join(bin, "codex");
+  writeFileSync(codex, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  chmodSync(codex, 0o755);
+  const baseEnv = {
+    YUI_HOME: home,
+    HOME: join(root, "user"),
+    PATH: bin,
+    SHELL: "/bin/zsh"
+  };
+  const first = new PassThrough();
+  first.end([
+    "codex", "", "", "", "", "", "", workspace, "skip"
+  ].join("\n") + "\n");
+  await runSetupCommand([], baseEnv, { run: () => "tmux 3.4" }, {
+    input: first,
+    output: new PassThrough(),
+    forceInteractive: true
+  });
+
+  const claude = join(bin, "claude");
+  writeFileSync(claude, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  chmodSync(claude, 0o755);
+  const changed = new PassThrough();
+  changed.end([
+    "all", "", "", "", "", "", "", join(root, "other-workspace")
+  ].join("\n") + "\n");
+  await assert.rejects(
+    runSetupCommand([], baseEnv, { run: () => "tmux 3.4" }, {
+      input: changed,
+      output: new PassThrough(),
+      forceInteractive: true
+    }),
+    /workspace is fixed/i
+  );
+
+  assert.deepEqual(
+    new FileTaskStore(home).listConfiguredAgents().map(({ id }) => id),
+    ["codex"]
+  );
+});
+
+test("fresh setup keeps the Project workspace outside YUI_HOME by default", async (t) => {
+  const { runSetupCommand } = await import("../../dist/setup/setupCommand.js");
+  const { FileTaskStore } = await import("../../dist/storage/taskStore.js");
+  const root = mkdtempSync(join(tmpdir(), "yui-file-setup-workspace-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, "yui-home");
+  const bin = join(root, "bin");
+  mkdirSync(bin);
+  const codex = join(bin, "codex");
+  writeFileSync(codex, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  chmodSync(codex, 0o755);
+  const input = new PassThrough();
+  const output = new PassThrough();
+  let rendered = "";
+  output.on("data", (chunk) => { rendered += chunk.toString(); });
+  input.end([
+    "codex", "", "", "", "", "", "", "", "skip"
+  ].join("\n") + "\n");
+
+  await runSetupCommand([], {
+    YUI_HOME: home,
+    HOME: join(root, "user"),
+    PATH: bin,
+    SHELL: "/bin/zsh"
+  }, {
+    run: () => "tmux 3.4"
+  }, {
+    input,
+    output,
+    forceInteractive: true
+  });
+
+  assert.equal(new FileTaskStore(home).getConfig().defaultWorkspace, join(root, "workspace"));
+  assert.match(rendered, /Project workspace for stable checkouts and managed worktrees/);
+});
+
 test("setup rolls back config and both system Roles when one lifecycle gate rejects creation", async (t) => {
   const { runSetupCommand } = await import("../../dist/setup/setupCommand.js");
   const { ensureStorageSchema } = await import("../../dist/storage/storageSchema.js");
@@ -296,7 +442,9 @@ test("setup rolls back config and both system Roles when one lifecycle gate reje
   ));
   const input = new PassThrough();
   const output = new PassThrough();
-  input.end(`codex\n\n\n${workspace}\n`);
+  input.end([
+    "codex", "", "", "", "", "", "", workspace
+  ].join("\n") + "\n");
   const env = {
     YUI_HOME: home,
     HOME: userHome,
@@ -318,5 +466,5 @@ test("setup rolls back config and both system Roles when one lifecycle gate reje
   assert.deepEqual(reloaded.getConfig(), initialConfig);
   assert.equal(reloaded.getGlobalRole("operator"), null);
   assert.equal(reloaded.getGlobalRole("leader"), null);
-  assert.notEqual(reloaded.getConfiguredAgent("codex"), null);
+  assert.equal(reloaded.getConfiguredAgent("codex"), null);
 });

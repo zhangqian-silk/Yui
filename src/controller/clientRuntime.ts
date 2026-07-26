@@ -17,6 +17,7 @@ import type { TmuxManager } from "../tmux/tmuxManager.js";
 import type { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
 import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
 import type { MailboxTarget } from "../coordination/workMailbox.js";
+import { hasRuntimeLifecycleWork } from "../runtime/lifecycleReservation.js";
 
 const STARTUP_TIMEOUT_MS = 5_000;
 // A lifecycle RPC may legitimately occupy the Controller for 30 seconds.
@@ -331,6 +332,45 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     });
   }
 
+  async stopTaskRoleSessions(taskId: string, roleNames: readonly string[]): Promise<void> {
+    const targets = [];
+    for (const roleName of [...new Set(roleNames)]) {
+      if (this.store.getActiveAgentRun(taskId, roleName) !== null) {
+        throw new Error(`Role has an active Run: ${taskId}/${roleName}.`);
+      }
+      const target = this.schedulerStore.enqueueRuntimeCleanup({
+        scope: "task",
+        taskId,
+        roleName
+      });
+      if (target === null) throw new Error(`Task not found: ${taskId}.`);
+      if (target.kind !== "role-runtime") {
+        throw new Error(`Role runtime cleanup target is invalid: ${taskId}/${roleName}.`);
+      }
+      targets.push(target);
+    }
+    if (targets.length === 0) return;
+
+    await callFileTaskController(this.home, "scheduler.scan", {}, {
+      ...this.clientOptions,
+      requestTimeoutMs: LIFECYCLE_REQUEST_TIMEOUT_MS
+    });
+
+    for (const target of targets) {
+      if (hasRuntimeLifecycleWork(this.store.getWorkMailbox(target))) {
+        throw new Error(
+          `Role runtime did not stop: ${target.taskId}/${target.roleName}.`
+        );
+      }
+      const session = this.store.getRoleSession(target.taskId, target.roleName);
+      if (session !== null && session.status !== "stopped") {
+        throw new Error(
+          `Role runtime session is still active: ${target.taskId}/${target.roleName}.`
+        );
+      }
+    }
+  }
+
   inspectTaskRolePanes(taskId: string) {
     return this.tmux.inspectTaskRolePanes(taskId);
   }
@@ -362,8 +402,8 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
   async #prepareAndScan(taskId: string): Promise<void> {
     const task = this.store.getTask(taskId);
     if (
-      task?.repositoryId !== undefined
-      && task.status === "active"
+      task?.projectId !== undefined
+      && (task.status === "draft" || task.status === "active")
       && this.workspacePreparer !== undefined
     ) {
       await this.workspacePreparer.prepareTaskWorkspace(taskId);

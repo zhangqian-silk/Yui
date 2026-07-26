@@ -84,7 +84,7 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
       ].filter((value): value is string => value !== undefined).join(", ");
   const workspaceDetails = status.workspace.managed
     ? [
-        `  Repository       ${status.workspace.repositoryId}`,
+        `  Project          ${status.workspace.projectId}`,
         `  Branch           ${status.workspace.branch}`,
         `  Base             ${status.workspace.baseRef} (${status.workspace.baseCommit})`
       ]

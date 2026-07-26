@@ -36,11 +36,11 @@ export async function getSelectionCandidates(
         ),
         ["id", "title", "status"]
       );
-    case "repositories":
+    case "projects":
       return entities(
-        "repository",
-        "Select repository",
-        await list(ports, "repository.list", {}),
+        "project",
+        "Select Project",
+        await list(ports, "project.list", {}),
         ["id", "name", "path"]
       );
     case "configured-agents": {

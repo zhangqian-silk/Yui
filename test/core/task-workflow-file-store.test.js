@@ -25,7 +25,7 @@ import {
   retagYuiRunInput,
   yuiRunIdFromInputMessages
 } from "../../dist/run/runIdentity.js";
-import { createRepository } from "../../dist/repository/repository.js";
+import { createProject } from "../../dist/repository/project.js";
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
@@ -33,6 +33,7 @@ import {
 } from "../../dist/executor/agentExecutor.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
+import { updateWorkItemStatus } from "../../dist/workItem/workItem.js";
 
 const NOW = new Date("2026-07-19T12:00:00.000Z");
 
@@ -107,12 +108,18 @@ function markDelivered(store, run) {
 
 test("Draft activation atomically creates one durable first Leader wake", (t) => {
   const { root, store, options } = fixture(t);
-  store.saveRepository(createRepository("repo-1", "fixture", root, "main", NOW));
-  run(["create", "Repository task", "--repository", "repo-1", "--base", "main"], store, options);
+  store.saveProject(createProject(
+    "repo-1",
+    "fixture",
+    root,
+    { stable: "main", development: "main" },
+    NOW
+  ));
+  run(["create", "Project task", "--project", "repo-1", "--base", "main"], store, options);
   const task = store.listTasks()[0];
 
   assert.equal(task.status, "draft");
-  assert.equal(task.repositoryId, "repo-1");
+  assert.equal(task.projectId, "repo-1");
   assert.equal(task.baseRef, "main");
   assert.equal(store.getRole(task.id, "leader")?.activeAgentId, "codex");
   assert.equal(store.getPendingWakeup(task.id), null);
@@ -127,11 +134,11 @@ test("Draft activation atomically creates one durable first Leader wake", (t) =>
   assert.deepEqual(store.getPendingWakeup(task.id), first);
 });
 
-test("invalid repository and Role options fail before mutating the aggregate", (t) => {
+test("invalid project and Role options fail before mutating the aggregate", (t) => {
   const { store, options } = fixture(t);
   assert.throws(
     () => runTaskCommand(["create", "invalid", "--base", "main"], store, options),
-    /requires --repository/i
+    /requires --project/i
   );
   assert.equal(store.listTasks().length, 0);
   const task = createTask(store, options, "Valid");
@@ -238,7 +245,12 @@ test("Task lifecycle and messages append a durable Web timeline", (t) => {
   run(["message", "send", task.id, "Proceed"], store, options);
   run(["complete", task.id, "--summary", "Finished"], store, options);
   run(["reopen", task.id], store, options);
-  run(["archive", task.id], store, options);
+  run(["complete", task.id, "--summary", "Finished after reopen"], store, options);
+  assert.throws(
+    () => run(["archive", task.id], store, options),
+    /--integrated|--abandon/
+  );
+  run(["archive", task.id, "--integrated"], store, options);
 
   assert.deepEqual(
     store.listEvents(task.id).map((event) => event.type),
@@ -249,6 +261,7 @@ test("Task lifecycle and messages append a durable Web timeline", (t) => {
       "message.sent",
       "task.completed",
       "task.reopened",
+      "task.completed",
       "task.archived"
     ]
   );
@@ -256,6 +269,7 @@ test("Task lifecycle and messages append a durable Web timeline", (t) => {
     messageId: store.listMessages(task.id)[0].id,
     kind: "user"
   });
+  assert.equal(store.listEvents(task.id).at(-1).payload.workspaceDisposition, "integrated");
   const message = store.listMessages(task.id)[0];
   assert.throws(
     () => store.saveMessage(task.id, { ...message, body: "Rewritten history" }),
@@ -349,6 +363,37 @@ test("retry replaces the old causal Run marker instead of reusing it", (t) => {
   assert.deepEqual(markers, [`Yui-Run-Id: ${retried.id}`]);
   assert.equal(retried.input.includes("Yui-Run-Id: agent-run-old"), false);
   assert.equal(yuiRunIdFromInputMessages([retried.input]), retried.id);
+});
+
+test("a failed Worker Run can retry its failed WorkItem", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Retry Worker work");
+  run(["activate", task.id], store, options);
+  run(["role", "add", task.id, "worker"], store, options);
+  run(["work", "create", task.id, "recover", "--role", "worker"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  run(["work", "dispatch", item.id], store, options);
+  const active = store.getActiveAgentRun(task.id, "worker");
+  store.transaction((tx) => {
+    tx.saveAgentRun(failAgentRun(active, "transient failure", NOW));
+    tx.clearActiveAgentRun(task.id, "worker");
+    tx.saveRole(task.id, updateRoleStatus(
+      tx.getRole(task.id, "worker"),
+      "idle",
+      NOW
+    ));
+    tx.saveWorkItem(task.id, updateWorkItemStatus(
+      tx.getWorkItem(task.id, item.id),
+      "failed",
+      "transient failure",
+      NOW
+    ));
+  });
+
+  run(["run", "retry", active.id], store, options);
+
+  assert.equal(store.findWorkItem(item.id)?.status, "running");
+  assert.equal(store.getActiveAgentRun(task.id, "worker")?.workItemId, item.id);
 });
 
 test("Run marker handling preserves user-authored marker lines outside the managed header", () => {
@@ -584,7 +629,7 @@ test("Task Role removal is blocked for Leader and active Runs", (t) => {
   assert.notEqual(store.getRole(task.id, "worker"), null);
 });
 
-test("archive fences active work and clears pending wake in one transaction", (t) => {
+test("archive refuses active work and leaves its runtime ownership intact", (t) => {
   const { store, options } = fixture(t);
   const task = createTask(store, options, "Archive");
   run(["activate", task.id], store, options);
@@ -593,16 +638,14 @@ test("archive fences active work and clears pending wake in one transaction", (t
   run(["work", "dispatch", item.id], store, options);
   const active = store.getActiveAgentRun(task.id, "leader");
 
-  run(["archive", task.id], store, options);
-  assert.equal(store.getTask(task.id)?.status, "archived");
-  assert.equal(store.findAgentRun(active.id)?.status, "failed");
-  assert.equal(store.findWorkItem(item.id)?.status, "failed");
-  assert.equal(store.getActiveAgentRun(task.id, "leader"), null);
-  assert.equal(store.getPendingWakeup(task.id), null);
   assert.throws(
-    () => runTaskCommand(["message", "send", task.id, "too late"], store, options),
-    /archived/i
+    () => run(["archive", task.id, "--integrated"], store, options),
+    /must be completed/i
   );
+  assert.equal(store.getTask(task.id)?.status, "active");
+  assert.equal(store.findAgentRun(active.id)?.status, "active");
+  assert.equal(store.findWorkItem(item.id)?.status, "running");
+  assert.equal(store.getActiveAgentRun(task.id, "leader")?.id, active.id);
 });
 
 test("completion fences active behavior until an explicit reopen", (t) => {
@@ -643,6 +686,25 @@ test("completion fences active behavior until an explicit reopen", (t) => {
   assert.deepEqual(store.getPendingWakeup(task.id)?.reasons, ["task-reopened"]);
   run(["message", "send", task.id, "continue"], store, options);
   assert.ok(store.getPendingWakeup(task.id)?.reasons.includes("user-message"));
+});
+
+test("Task completion requires every WorkItem to be terminal", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Settle work first");
+  run(["activate", task.id], store, options);
+  run(["work", "create", task.id, "not needed"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+
+  assert.throws(
+    () => runTaskCommand(["complete", task.id, "--summary", "Done"], store, options),
+    /unsettled work|work-item-1/i
+  );
+  assert.equal(store.getTask(task.id)?.status, "active");
+
+  run(["work", "update", item.id, "cancelled", "--summary", "No longer needed."], store, options);
+  run(["complete", task.id, "--summary", "Done"], store, options);
+  assert.equal(store.getTask(task.id)?.status, "completed");
+  assert.equal(store.findWorkItem(item.id)?.status, "cancelled");
 });
 
 test("a Leader control Run can complete its Task atomically", (t) => {

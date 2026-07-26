@@ -99,14 +99,27 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     if (task.status !== "active") throw new Error(`Task is not active: ${input.taskId}.`);
     const role = this.store.getRole(input.taskId, input.roleName);
     if (role === null) throw new Error(`Role not found: ${input.taskId}/${input.roleName}.`);
-    if (task.repositoryId !== undefined) {
+    if (task.projectId !== undefined) {
       const workspace = this.store.getRoleWorkspace(task.id, role.name);
-      if (
-        task.cwd === undefined
-        || workspace === null
-        || workspace.repositoryId !== task.repositoryId
-        || workspace.path !== role.workspace
-      ) {
+      const main = this.store.getRoleWorkspace(task.id, "leader");
+      const sharedMain = (workspace === null || workspace.owner.type === "task")
+        && main?.owner.type === "task"
+        && main.projectId === task.projectId
+        && role.workspace === main.path;
+      const isolatedWorkItem = workspace?.owner.type === "work-item"
+        ? this.store.getWorkItem(task.id, workspace.owner.workItemId)
+        : null;
+      const activeRun = this.store.getActiveAgentRun(task.id, role.name);
+      const isolated = workspace !== null
+        && workspace.owner.type === "work-item"
+        && isolatedWorkItem !== null
+        && isolatedWorkItem.assignee === role.name
+        && !["completed", "failed", "cancelled", "superseded"].includes(isolatedWorkItem.status)
+        && (activeRun === null
+          || activeRun.workItemId === workspace.owner.workItemId)
+        && workspace.projectId === task.projectId
+        && workspace.path === role.workspace;
+      if (task.cwd === undefined || main === null || (!sharedMain && !isolated)) {
         throw new Error(`Role workspace is not ready: ${input.taskId}/${input.roleName}.`);
       }
     }

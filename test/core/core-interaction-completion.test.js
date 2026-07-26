@@ -38,9 +38,19 @@ const PUBLIC_PATHS = [
   "operator",
   "operator enter",
   "operator submit",
-  "repository",
-  "repository add",
-  "repository list",
+  "project",
+  "project add",
+  "project clone",
+  "project update",
+  "project discover",
+  "project list",
+  "project show",
+  "project knowledge",
+  "project knowledge add",
+  "project knowledge update",
+  "project knowledge retire",
+  "project knowledge list",
+  "project knowledge show",
   "agent",
   "agent add",
   "agent list",
@@ -94,6 +104,8 @@ const PUBLIC_PATHS = [
   "task work list",
   "task work update",
   "task work dispatch",
+  "task work isolate",
+  "task work cleanup",
   "task run",
   "task run list",
   "task run retry",
@@ -145,7 +157,7 @@ function createPorts() {
       { id: "job-alpha", type: "start-run", status: "failed" },
       { id: "job-beta", type: "wake-role", status: "pending" }
     ],
-    "repository.list": [
+    "project.list": [
       { id: "repo-alpha", name: "Alpha" },
       { id: "repo-beta", name: "Beta" }
     ],
@@ -293,9 +305,9 @@ test("candidate providers read the current core entities through CoreCliPorts.ca
     selector("tasks", "task"), ports, ["task", "show"]
   )), ["task-alpha", "task-beta"]);
   assert.deepEqual(values(await getSelectionCandidates(
-    selector("repositories", "repository", { option: "--repository" }),
+    selector("projects", "project", { option: "--project" }),
     ports,
-    ["task", "create", "Title", "--repository"]
+    ["task", "create", "Title", "--project"]
   )), ["repo-alpha", "repo-beta"]);
   const roles = values(await getSelectionCandidates(
     selector("task-roles", "task-role", { argumentIndex: 3, dependsOn: 2 }),
@@ -344,7 +356,7 @@ test("candidate providers read the current core entities through CoreCliPorts.ca
 
   assert.ok(ports.events.some(({ method }) => method === "agent.list"));
   assert.ok(ports.events.some(({ method }) => method === "config.get"));
-  assert.ok(ports.events.some(({ method }) => method === "repository.list"));
+  assert.ok(ports.events.some(({ method }) => method === "project.list"));
   assert.ok(ports.events.some(({ method }) => method === "task.role.list"));
   assert.ok(ports.events.some(({ method }) => method === "jobs.list"));
   assert.deepEqual(
@@ -497,7 +509,8 @@ test("Task lifecycle selectors filter candidates by valid source status", async 
   for (const [command, expected] of [
     ["activate", ["draft"]],
     ["complete", ["active"]],
-    ["reopen", ["completed"]]
+    ["reopen", ["completed"]],
+    ["archive", ["completed"]]
   ]) {
     const policy = findInteractionPolicy(findCommandNode(["task", command]));
     assert.deepEqual(
@@ -529,24 +542,29 @@ test("interactive resolution selects a missing archive target and confirms it", 
   assert.ok(node);
 
   const cancelledPorts = createPorts();
+  cancelledPorts.call = async (method) => method === "task.list" ? [
+    { id: "task-alpha", title: "Alpha", status: "completed" },
+    { id: "task-beta", title: "Beta", status: "completed" }
+  ] : [];
   const cancelledIo = selectionIo(["task-beta", "no"]);
   const cancelled = await resolveInteractiveArguments(
-    ["task", "archive"], node, cancelledPorts, cancelledIo
+    ["task", "archive", "--integrated"], node, cancelledPorts, cancelledIo
   );
   assert.deepEqual(cancelled, {
     kind: "cancelled",
-    args: ["task", "archive", "task-beta"]
+    args: ["task", "archive", "task-beta", "--integrated"]
   });
   assert.ok(cancelledIo.prompts.includes("Archive task task-beta? [y/N]: "));
 
   const acceptedPorts = createPorts();
+  acceptedPorts.call = cancelledPorts.call;
   const acceptedIo = selectionIo(["task-alpha", "yes"]);
   const accepted = await resolveInteractiveArguments(
-    ["task", "archive"], node, acceptedPorts, acceptedIo
+    ["task", "archive", "--integrated"], node, acceptedPorts, acceptedIo
   );
   assert.deepEqual(accepted, {
     kind: "resolved",
-    args: ["task", "archive", "task-alpha"]
+    args: ["task", "archive", "task-alpha", "--integrated"]
   });
 });
 
@@ -640,7 +658,7 @@ test("shell completion starts Yui only for entity-backed dynamic candidates", (t
       "COMP_CWORD=3",
       "_yui",
       'printf "dynamic=%s\\n" "${COMPREPLY[*]}"',
-      "COMP_WORDS=(yui task create title --repository '')",
+      "COMP_WORDS=(yui task create title --project '')",
       "COMP_CWORD=5",
       "_yui",
       'printf "dynamic-option=%s\\n" "${COMPREPLY[*]}"'
@@ -677,7 +695,7 @@ test("shell completion starts Yui only for entity-backed dynamic candidates", (t
         "words=(yui task show '')",
         "CURRENT=4",
         "_yui",
-        "words=(yui task create title --repository '')",
+        "words=(yui task create title --project '')",
         "CURRENT=6",
         "_yui"
       ].join("\n")

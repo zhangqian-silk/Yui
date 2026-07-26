@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, realpath } from "node:fs/promises";
+import { lstat, mkdir, realpath, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 
@@ -20,9 +20,21 @@ export type PreparedGitWorktree = Readonly<{
 }>;
 
 export type GitWorkspaceRemoval = "removed" | "missing" | "dirty";
+export type GitWorkspaceState = "missing" | "clean" | "dirty";
 
 export interface GitWorkspacePort {
   inspect(repositoryPath: string, baseRef?: string): Promise<GitRepositoryInspection>;
+  headRef(repositoryPath: string): Promise<string>;
+  isClean(repositoryPath: string): Promise<boolean>;
+  clone(input: Readonly<{
+    remoteUrl: string;
+    destination: string;
+    branch?: string;
+  }>): Promise<GitRepositoryInspection>;
+  ensureLocalBranch(
+    repositoryPath: string,
+    branch: string
+  ): Promise<GitRepositoryInspection>;
   ensureWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
@@ -30,22 +42,75 @@ export interface GitWorkspacePort {
     roleName: string;
     baseRef: string;
   }>): Promise<PreparedGitWorktree>;
+  inspectWorktree(input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    taskId: string;
+    roleName: string;
+  }>): Promise<GitWorkspaceState>;
   removeWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
     taskId: string;
     roleName: string;
+    deleteBranch?: boolean;
   }>): Promise<GitWorkspaceRemoval>;
 }
 
-/** The small Git boundary used by repository registration and Task workspaces. */
+/** The small Git boundary used by project registration and Task workspaces. */
 export class NodeGitWorkspace implements GitWorkspacePort {
+  async clone(input: Readonly<{
+    remoteUrl: string;
+    destination: string;
+    branch?: string;
+  }>): Promise<GitRepositoryInspection> {
+    const remote = safeRemote(input.remoteUrl);
+    const destination = resolve(requireText(input.destination, "Project destination"));
+    if (await pathKind(destination) !== undefined) {
+      throw new Error(`Project destination already exists: ${destination}.`);
+    }
+    await canonicalContainer(dirname(destination), true);
+    const branch = input.branch === undefined ? undefined : safeRef(input.branch);
+    try {
+      await git([
+        "clone",
+        ...(branch === undefined ? [] : ["--branch", branch]),
+        "--",
+        remote,
+        destination
+      ]);
+    } catch (error) {
+      await rm(destination, { recursive: true, force: true });
+      throw error;
+    }
+    return this.inspect(destination, "HEAD");
+  }
+
+  async ensureLocalBranch(
+    repositoryPath: string,
+    branch: string
+  ): Promise<GitRepositoryInspection> {
+    try {
+      return await this.inspect(repositoryPath, branch);
+    } catch (originalError) {
+      const root = (await this.inspect(repositoryPath, "HEAD")).root;
+      const name = safeRef(branch);
+      if (!await gitSucceeds(["check-ref-format", "--branch", name])) throw originalError;
+      const remoteRef = `refs/remotes/origin/${name}`;
+      if (!await gitSucceeds([
+        "-C", root, "show-ref", "--verify", "--quiet", remoteRef
+      ])) throw originalError;
+      await git(["-C", root, "branch", "--", name, remoteRef]);
+      return this.inspect(root, name);
+    }
+  }
+
   async inspect(repositoryPath: string, baseRef = "HEAD"): Promise<GitRepositoryInspection> {
-    const requested = await canonicalDirectory(repositoryPath, "Repository");
+    const requested = await canonicalDirectory(repositoryPath, "Project");
     const ref = safeRef(baseRef);
     const root = await canonicalDirectory(
       await gitLine(["-C", requested, "rev-parse", "--show-toplevel"]),
-      "Repository root"
+      "Project root"
     );
     const gitDirectory = await canonicalDirectory(
       await gitLine([
@@ -59,7 +124,25 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(baseCommit)) {
       throw new Error("Git returned an invalid base commit.");
     }
-    return { root, gitDirectory, baseRef: ref, baseCommit: baseCommit.toLowerCase() };
+    return {
+      root,
+      gitDirectory,
+      baseRef: ref,
+      baseCommit: baseCommit.toLowerCase()
+    };
+  }
+
+  async headRef(repositoryPath: string): Promise<string> {
+    const requested = await canonicalDirectory(repositoryPath, "Project");
+    return gitLine(["-C", requested, "rev-parse", "--abbrev-ref", "HEAD"]);
+  }
+
+  async isClean(repositoryPath: string): Promise<boolean> {
+    const root = (await this.inspect(repositoryPath)).root;
+    const status = await git([
+      "-C", root, "status", "--porcelain=v1", "--untracked-files=all"
+    ]);
+    return status.length === 0;
   }
 
   async ensureWorktree(input: Readonly<{
@@ -78,8 +161,8 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     if (kind === "directory") {
       // A worktree already created before a crash remains usable even if the
       // original base branch/tag is later deleted.
-      const repository = await this.inspect(input.repositoryPath);
-      await assertOwnedWorktree(repository, container, path);
+      const project = await this.inspect(input.repositoryPath);
+      await assertOwnedWorktree(project, container, path);
       await assertExpectedBranch(path, identity.branch);
       const head = await gitLine([
         "-C", path, "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"
@@ -87,23 +170,26 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       return { path, branch: identity.branch, baseCommit: head.toLowerCase() };
     }
 
-    const repository = await this.inspect(input.repositoryPath, input.baseRef);
+    const project = await this.inspect(input.repositoryPath, input.baseRef);
     await canonicalContainer(dirname(path), true);
 
     const branchRef = `refs/heads/${identity.branch}`;
     const branchExists = await gitSucceeds([
-      "-C", repository.root, "show-ref", "--verify", "--quiet", branchRef
+      "-C", project.root, "show-ref", "--verify", "--quiet", branchRef
     ]);
     await git(branchExists
-      ? ["-C", repository.root, "worktree", "add", "--", path, identity.branch]
+      ? ["-C", project.root, "worktree", "add", "--", path, identity.branch]
       : [
-          "-C", repository.root, "worktree", "add", "-b", identity.branch,
-          "--", path, repository.baseCommit
+          "-C", project.root, "worktree", "add", "-b", identity.branch,
+          "--", path, project.baseCommit
         ]);
 
-    await assertOwnedWorktree(repository, container, path);
+    await assertOwnedWorktree(project, container, path);
     await assertExpectedBranch(path, identity.branch);
-    return { path, branch: identity.branch, baseCommit: repository.baseCommit };
+    const head = await gitLine([
+      "-C", path, "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"
+    ]);
+    return { path, branch: identity.branch, baseCommit: head.toLowerCase() };
   }
 
   async removeWorktree(input: Readonly<{
@@ -111,7 +197,34 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     container: string;
     taskId: string;
     roleName: string;
+    deleteBranch?: boolean;
   }>): Promise<GitWorkspaceRemoval> {
+    const state = await this.inspectWorktree(input);
+    if (state === "dirty") return state;
+    const container = resolve(input.container);
+    const identity = worktreeIdentity(input.taskId, input.roleName);
+    const path = managedPath(container, identity.directory);
+    const project = await this.inspect(input.repositoryPath);
+    if (state === "missing") {
+      if (input.deleteBranch === true) {
+        await git(["-C", project.root, "worktree", "prune"]);
+        await deleteBranchIfPresent(project.root, identity.branch);
+      }
+      return state;
+    }
+    await git(["-C", project.root, "worktree", "remove", "--", path]);
+    if (input.deleteBranch === true) {
+      await deleteBranchIfPresent(project.root, identity.branch);
+    }
+    return "removed";
+  }
+
+  async inspectWorktree(input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    taskId: string;
+    roleName: string;
+  }>): Promise<GitWorkspaceState> {
     const container = resolve(input.container);
     const path = managedPath(
       container,
@@ -122,13 +235,19 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     if (kind === "symlink") throw new Error("Managed worktree path must not be a symbolic link.");
 
     const canonicalContainerPath = await canonicalContainer(container, false);
-    const repository = await this.inspect(input.repositoryPath);
-    await assertOwnedWorktree(repository, canonicalContainerPath, path);
+    const project = await this.inspect(input.repositoryPath);
+    await assertOwnedWorktree(project, canonicalContainerPath, path);
     const porcelain = await git(["-C", path, "status", "--porcelain=v1", "--untracked-files=all"]);
-    if (porcelain.length > 0) return "dirty";
-    await git(["-C", repository.root, "worktree", "remove", "--", path]);
-    return "removed";
+    return porcelain.length > 0 ? "dirty" : "clean";
   }
+}
+
+async function deleteBranchIfPresent(repositoryRoot: string, branch: string): Promise<void> {
+  const branchRef = `refs/heads/${branch}`;
+  if (!await gitSucceeds([
+    "-C", repositoryRoot, "show-ref", "--verify", "--quiet", branchRef
+  ])) return;
+  await git(["-C", repositoryRoot, "branch", "-D", "--", branch]);
 }
 
 export function worktreeIdentity(
@@ -162,7 +281,7 @@ async function assertExpectedBranch(path: string, expected: string): Promise<voi
 }
 
 async function assertOwnedWorktree(
-  repository: GitRepositoryInspection,
+  project: GitRepositoryInspection,
   container: string,
   path: string
 ): Promise<void> {
@@ -178,8 +297,8 @@ async function assertOwnedWorktree(
     await gitLine(["-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"]),
     "Managed Git common directory"
   );
-  if (common !== repository.gitDirectory) {
-    throw new Error("Managed worktree belongs to another repository.");
+  if (common !== project.gitDirectory) {
+    throw new Error("Managed worktree belongs to another project.");
   }
 }
 
@@ -270,6 +389,14 @@ function safeRef(value: string): string {
   const ref = requireText(value, "Git base ref");
   if (ref.startsWith("-") || /[\r\n]/.test(ref)) throw new Error("Git base ref is invalid.");
   return ref;
+}
+
+function safeRemote(value: string): string {
+  const remote = requireText(value, "Git remote URL");
+  if (remote.startsWith("-") || /[\r\n]/.test(remote)) {
+    throw new Error("Git remote URL is invalid.");
+  }
+  return remote;
 }
 
 function requireText(value: string, label: string): string {

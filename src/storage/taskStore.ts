@@ -37,9 +37,10 @@ import { validateTaskMessage, type TaskMessage } from "../message/message.js";
 import type { Milestone } from "../milestone/milestone.js";
 import { validateAgentRun, type AgentRun } from "../run/agentRun.js";
 import {
-  validateRepository,
-  type Repository
-} from "../repository/repository.js";
+  assertProjectCatalog,
+  validateProject,
+  type Project
+} from "../repository/project.js";
 import {
   validateGlobalRole,
   validateTaskRole,
@@ -50,7 +51,7 @@ import type { LeaderFailure } from "../scheduler/leaderFailure.js";
 import type { OperatorNotification } from "../scheduler/operatorNotification.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import { validateTask, type Task } from "../task/task.js";
-import type { WorkItem } from "../workItem/workItem.js";
+import { validateWorkItem, type WorkItem } from "../workItem/workItem.js";
 import {
   validateRoleWorkspace,
   type RoleWorkspace
@@ -89,7 +90,7 @@ export type ConfiguredAgentUpdateResult = Readonly<{
 
 type ActiveRunPointer = Readonly<{ schemaVersion: 1; runId: string }>;
 type StoredTask = {
-  schemaVersion: 3;
+  schemaVersion: 4;
   task: Task;
   brief: TaskBrief | null;
   roles: Record<string, TaskRole>;
@@ -108,11 +109,11 @@ type StoredTask = {
 };
 
 type StorageState = {
-  schemaVersion: 3;
+  schemaVersion: 4;
   revision: number;
   config: YuiConfig;
   configuredAgents: Record<string, ConfiguredAgent>;
-  repositories: Record<string, Repository>;
+  projects: Record<string, Project>;
   globalRoles: Record<string, GlobalRole>;
   globalRoleSessionSets: Record<string, GlobalRoleSessionSet>;
   tasks: Record<string, StoredTask>;
@@ -130,12 +131,12 @@ export type TaskStore = {
   listConfiguredAgents(): ConfiguredAgent[];
   getConfiguredAgent(id: string): ConfiguredAgent | null;
   removeConfiguredAgent(id: string): boolean;
-  nextRepositoryId(): string;
-  saveRepository(repository: Repository): void;
-  createRepositoryIfAbsent(repository: Repository): Repository | null;
-  listRepositories(): Repository[];
-  getRepository(id: string): Repository | null;
-  removeRepository(id: string): boolean;
+  nextProjectId(): string;
+  saveProject(project: Project): void;
+  createProjectIfAbsent(project: Project): Project | null;
+  listProjects(): Project[];
+  getProject(id: string): Project | null;
+  removeProject(id: string): boolean;
   saveGlobalRole(role: GlobalRole): void;
   saveGlobalRoleWithSessionSet(role: GlobalRole, sessions: GlobalRoleSessionSet | null): void;
   createGlobalRoleIfAbsent(role: GlobalRole): GlobalRole | null;
@@ -288,38 +289,47 @@ export class FileTaskStore implements TaskStore {
     return this.#remove((state) => state.configuredAgents, id);
   }
 
-  nextRepositoryId(): string {
-    return this.#nextGlobalId("repository", (state) => Object.keys(state.repositories));
+  nextProjectId(): string {
+    return this.#nextGlobalId("project", (state) => Object.keys(state.projects));
   }
-  saveRepository(repository: Repository): void {
-    const stored = identified<Repository>(
-      repository,
-      1,
+  saveProject(project: Project): void {
+    const stored = identified<Project>(
+      project,
+      2,
       "id",
-      repository.id,
-      "Repository"
+      project.id,
+      "Project"
     );
-    validateRepository(stored);
-    this.#mutate((state) => { state.repositories[stored.id] = stored; });
-  }
-  createRepositoryIfAbsent(repository: Repository): Repository | null {
-    return this.transaction((store) => {
-      if (store.getRepository(repository.id) !== null) return null;
-      if (store.listRepositories().some((entry) => (
-        entry.name === repository.name || entry.path === repository.path
-      ))) return null;
-      store.saveRepository(repository);
-      return clone(repository);
+    validateProject(stored);
+    this.#mutate((state) => {
+      assertProjectCatalog([
+        ...Object.values(state.projects).filter(({ id }) => id !== stored.id),
+        stored
+      ]);
+      state.projects[stored.id] = stored;
     });
   }
-  listRepositories(): Repository[] { return values(this.#state().repositories, "id"); }
-  getRepository(id: string): Repository | null { return optional(this.#state().repositories[id]); }
-  removeRepository(id: string): boolean {
+  createProjectIfAbsent(project: Project): Project | null {
+    validateProject(project);
     return this.transaction((store) => {
-      if (store.listTasks().some((task) => task.repositoryId === id)) {
-        throw new StorageRecordError(`Repository is still used by a Task: ${id}`);
+      if (store.getProject(project.id) !== null) return null;
+      try {
+        assertProjectCatalog([...store.listProjects(), project]);
+      } catch {
+        return null;
       }
-      return this.#remove((state) => state.repositories, id);
+      store.saveProject(project);
+      return clone(project);
+    });
+  }
+  listProjects(): Project[] { return values(this.#state().projects, "id"); }
+  getProject(id: string): Project | null { return optional(this.#state().projects[id]); }
+  removeProject(id: string): boolean {
+    return this.transaction((store) => {
+      if (store.listTasks().some((task) => task.projectId === id)) {
+        throw new StorageRecordError(`Project is still used by a Task: ${id}`);
+      }
+      return this.#remove((state) => state.projects, id);
     });
   }
 
@@ -377,8 +387,8 @@ export class FileTaskStore implements TaskStore {
   saveTask(task: Task): void {
     const stored = validateTask(identified<Task>(task, 1, "id", task.id, "Task"));
     this.#mutate((state) => {
-      if (stored.repositoryId !== undefined && state.repositories[stored.repositoryId] === undefined) {
-        throw new StorageRecordError(`Task Repository not found: ${stored.repositoryId}`);
+      if (stored.projectId !== undefined && state.projects[stored.projectId] === undefined) {
+        throw new StorageRecordError(`Task Project not found: ${stored.projectId}`);
       }
       const aggregate = state.tasks[stored.id] ?? emptyStoredTask(stored);
       aggregate.task = stored;
@@ -448,8 +458,8 @@ export class FileTaskStore implements TaskStore {
     if (aggregate.roles[stored.roleName] === undefined) {
       throw new StorageRecordError(`Task Role not found: ${taskId}/${stored.roleName}`);
     }
-    if (aggregate.task.repositoryId !== stored.repositoryId) {
-      throw new StorageRecordError(`RoleWorkspace Repository does not match Task: ${taskId}/${stored.roleName}`);
+    if (aggregate.task.projectId !== stored.projectId) {
+      throw new StorageRecordError(`RoleWorkspace Project does not match Task: ${taskId}/${stored.roleName}`);
     }
     this.#mutate((state) => {
       state.tasks[taskId].roleWorkspaces[stored.roleName] = stored;
@@ -495,6 +505,7 @@ export class FileTaskStore implements TaskStore {
   listWorkItems(taskId: string): WorkItem[] { return values(this.#requireTask(taskId).workItems, "id"); }
   saveWorkItem(taskId: string, item: WorkItem): void {
     const stored = identified<WorkItem>(item, 1, "id", item.id, "Work item");
+    validateWorkItem(stored);
     if (stored.taskId !== taskId) throw new StorageRecordError(`Work item belongs to another Task: ${stored.taskId}`);
     this.#requireTaskForWrite(taskId);
     this.#mutate((state) => { state.tasks[taskId].workItems[stored.id] = stored; });
@@ -815,11 +826,11 @@ export function resolveYuiHome(env: NodeJS.ProcessEnv): string {
 export function ensureYuiHome(rootDir: string): void { mkdirSync(rootDir, { recursive: true, mode: 0o700 }); }
 
 function emptyState(): StorageState {
-  return { schemaVersion: 3, revision: 0, config: { schemaVersion: 1 }, configuredAgents: {}, repositories: {}, globalRoles: {}, globalRoleSessionSets: {}, tasks: {}, mailboxes: {} };
+  return { schemaVersion: 4, revision: 0, config: { schemaVersion: 1 }, configuredAgents: {}, projects: {}, globalRoles: {}, globalRoleSessionSets: {}, tasks: {}, mailboxes: {} };
 }
 function emptyStoredTask(task: Task): StoredTask {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     task,
     brief: null,
     roles: {},
@@ -842,8 +853,8 @@ function parseState(raw: string): StorageState {
   let parsed: unknown;
   try { parsed = JSON.parse(raw) as unknown; } catch (error) { throw new StorageRecordError(`Invalid ${STORAGE_STATE_FILE}: ${error instanceof Error ? error.message : String(error)}`); }
   const state = object(parsed, "Storage state");
-  exact(state, ["schemaVersion", "revision", "config", "configuredAgents", "repositories", "globalRoles", "globalRoleSessionSets", "tasks", "mailboxes"], "Storage state");
-  if (state.schemaVersion !== 3 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
+  exact(state, ["schemaVersion", "revision", "config", "configuredAgents", "projects", "globalRoles", "globalRoleSessionSets", "tasks", "mailboxes"], "Storage state");
+  if (state.schemaVersion !== 4 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
   const result = clone(state) as unknown as StorageState;
   result.config = versioned(result.config, 1, "Yui config");
   validateYuiConfig(result.config);
@@ -852,11 +863,16 @@ function parseState(raw: string): StorageState {
     validateConfiguredAgent(agent);
     return agent;
   }, "configuredAgents");
-  parseMap(result.repositories, (value, key) => {
-    const repository = identified<Repository>(value, 1, "id", key, "Repository");
-    validateRepository(repository);
-    return repository;
-  }, "repositories");
+  parseMap(result.projects, (value, key) => {
+    const project = identified<Project>(value, 2, "id", key, "Project");
+    validateProject(project);
+    return project;
+  }, "projects");
+  try {
+    assertProjectCatalog(Object.values(result.projects));
+  } catch (error) {
+    throw new StorageRecordError(error instanceof Error ? error.message : String(error));
+  }
   parseMap(result.globalRoles, (value, key) => {
     const role = identified<GlobalRole>(value, 2, "name", key, "Global Role");
     validateGlobalRole(role);
@@ -883,10 +899,10 @@ function parseState(raw: string): StorageState {
     }
   }
   for (const aggregate of Object.values(result.tasks)) {
-    if (aggregate.task.repositoryId !== undefined
-      && result.repositories[aggregate.task.repositoryId] === undefined) {
+    if (aggregate.task.projectId !== undefined
+      && result.projects[aggregate.task.projectId] === undefined) {
       throw new StorageRecordError(
-        `Task Repository not found: ${aggregate.task.id}/${aggregate.task.repositoryId}`
+        `Task Project not found: ${aggregate.task.id}/${aggregate.task.projectId}`
       );
     }
     for (const [name, role] of Object.entries(aggregate.roles)) {
@@ -906,8 +922,8 @@ function parseState(raw: string): StorageState {
       if (aggregate.roles[name] === undefined) {
         throw new StorageRecordError(`RoleWorkspace has no Task Role: ${aggregate.task.id}/${name}`);
       }
-      if (aggregate.task.repositoryId !== workspace.repositoryId) {
-        throw new StorageRecordError(`RoleWorkspace Repository does not match Task: ${aggregate.task.id}/${name}`);
+      if (aggregate.task.projectId !== workspace.projectId) {
+        throw new StorageRecordError(`RoleWorkspace Project does not match Task: ${aggregate.task.id}/${name}`);
       }
     }
   }
@@ -922,12 +938,12 @@ function parseState(raw: string): StorageState {
 function parseStoredTask(value: unknown, taskId: string): StoredTask {
   const aggregate = object(value, `Task aggregate ${taskId}`) as unknown as StoredTask;
   exact(aggregate as unknown as Record<string, unknown>, ["schemaVersion", "task", "brief", "roles", "roleWorkspaces", "roleSessionSets", "workItems", "agentRuns", "activeRuns", "messages", "inputRequests", "decisions", "milestones", "events", "leaderFailure", "operatorNotification"], `Task aggregate ${taskId}`);
-  versioned(aggregate, 3, `Task aggregate ${taskId}`);
+  versioned(aggregate, 4, `Task aggregate ${taskId}`);
   validateTask(identified(aggregate.task, 1, "id", taskId, "Task"));
   if (aggregate.brief !== null) storedTaskBrief(aggregate.brief);
   parseMap(aggregate.roles, (record, key) => { const role = identified<TaskRole>(record, 2, "name", key, "Task Role"); if (role.taskId !== taskId) throw new StorageRecordError(`Task Role belongs to another Task: ${role.taskId}`); validateTaskRole(role); return role; }, "roles");
   parseMap(aggregate.roleWorkspaces, (record, key) => {
-    const workspace = identified<RoleWorkspace>(record, 1, "roleName", key, "RoleWorkspace");
+    const workspace = identified<RoleWorkspace>(record, 2, "roleName", key, "Managed worktree");
     if (workspace.taskId !== taskId) {
       throw new StorageRecordError(`RoleWorkspace belongs to another Task: ${workspace.taskId}`);
     }
@@ -935,7 +951,14 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     return workspace;
   }, "roleWorkspaces");
   parseMap(aggregate.roleSessionSets, (record, key) => { const set = taskSessions(record); if (set.owner.taskId !== taskId || set.owner.roleName !== key) throw new StorageRecordError(`Task Role session set identity is inconsistent: ${taskId}/${key}`); return set; }, "roleSessionSets");
-  parseMap(aggregate.workItems, (record, key) => { const item = identified<WorkItem>(record, 1, "id", key, "Work item"); if (item.taskId !== taskId) throw new StorageRecordError(`Work item belongs to another Task: ${item.taskId}`); return item; }, "workItems");
+  parseMap(aggregate.workItems, (record, key) => {
+    const item = identified<WorkItem>(record, 1, "id", key, "Work item");
+    validateWorkItem(item);
+    if (item.taskId !== taskId) {
+      throw new StorageRecordError(`Work item belongs to another Task: ${item.taskId}`);
+    }
+    return item;
+  }, "workItems");
   parseMap(aggregate.agentRuns, (record, key) => { const run = identified<AgentRun>(record, 1, "id", key, "Agent run"); if (run.taskId !== taskId) throw new StorageRecordError(`Agent run belongs to another Task: ${run.taskId}`); validateAgentRun(run); return run; }, "agentRuns");
   parseMap(aggregate.activeRuns, (record, key) => {
     const pointer = versioned<ActiveRunPointer>(record, 1, `Active run ${key}`);

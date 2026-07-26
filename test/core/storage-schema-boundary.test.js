@@ -34,7 +34,7 @@ function writeManifest(home, overrides = {}) {
 test("storage inspection keeps layout and aggregate schema versions separate", () => {
   const home = temporaryHome();
   assert.equal(CURRENT_STORAGE_SCHEMA_VERSION, CURRENT_STORAGE_LAYOUT_VERSION);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 3);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 4);
   assert.deepEqual(STORAGE_MIGRATIONS, []);
 
   writeManifest(home);
@@ -74,7 +74,7 @@ test("the previous aggregate schema is rejected without migration", () => {
 
   assert.throws(
     () => requireStorageSchema(home),
-    /aggregate schema 2 is older than required.*version 3.*no migration/i
+    /aggregate schema 2 is older than required.*version 4.*no migration/i
   );
 });
 

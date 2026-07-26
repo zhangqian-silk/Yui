@@ -156,6 +156,7 @@ function interactionPrerequisitesReady(
   for (const option of node.options) {
     const optionIndex = args.indexOf(option);
     if (optionIndex < 0) continue;
+    if (policy?.trailingOptions?.[option] === "flag") continue;
     const value = args[optionIndex + 1];
     const selectable = policy?.selectors.some((selector) => selector.option === option) === true
       || Object.hasOwn(node.optionValues, option);

@@ -5,7 +5,7 @@ export type CandidateProviderName =
   | "global-roles"
   | "input-requests"
   | "jobs"
-  | "repositories"
+  | "projects"
   | "runs"
   | "task-decisions"
   | "task-events"
@@ -19,7 +19,7 @@ export type SelectableEntity =
   | "global-role"
   | "input-request"
   | "job"
-  | "repository"
+  | "project"
   | "run"
   | "task"
   | "decision"
@@ -67,6 +67,39 @@ const taskTarget = (
 });
 
 export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze([
+  {
+    commandPath: ["project", "update"],
+    selectors: [{
+      argumentIndex: 2,
+      entity: "project",
+      provider: "projects",
+      actionTarget: true
+    }],
+    trailingOptions: {
+      "--alias": "value",
+      "--clear-aliases": "flag",
+      "--remote": "value",
+      "--clear-remote": "flag",
+      "--stable": "value",
+      "--development": "value"
+    }
+  },
+  ...["add", "update", "retire", "list", "show"].map((command): InteractionPolicy => ({
+    commandPath: ["project", "knowledge", command],
+    selectors: [{
+      argumentIndex: 3,
+      entity: "project",
+      provider: "projects",
+      actionTarget: command !== "list"
+    }],
+    ...(command === "add"
+      ? { trailingOptions: { "--body": "value" as const } }
+      : command === "update"
+        ? { trailingOptions: { "--title": "value" as const, "--body": "value" as const } }
+        : command === "list"
+          ? { trailingOptions: { "--all": "flag" as const } }
+          : {})
+  })),
   ...["show", "update", "remove"].map((command): InteractionPolicy => ({
     commandPath: ["agent", command],
     selectors: [{
@@ -150,7 +183,8 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
   },
   taskTarget("reopen", 2, ["completed"]),
   {
-    ...taskTarget("archive"),
+    ...taskTarget("archive", 2, ["completed"]),
+    trailingOptions: { "--integrated": "flag", "--abandon": "flag" },
     confirmation: { action: "Archive task", targetArgumentIndex: 2 }
   },
   taskTarget("reconcile"),
@@ -167,12 +201,12 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
   {
     commandPath: ["task", "create"],
     selectors: [{
-      option: "--repository",
-      entity: "repository",
-      provider: "repositories",
+      option: "--project",
+      entity: "project",
+      provider: "projects",
       actionTarget: false
     }],
-    trailingOptions: { "--repository": "value", "--base": "value" }
+    trailingOptions: { "--project": "value", "--base": "value" }
   },
   ...["send", "list"].map((command): InteractionPolicy => ({
     commandPath: ["task", "message", command],

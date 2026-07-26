@@ -24,7 +24,7 @@ function temporaryHome() {
 test("storage schema initializes v5 and rejects every non-current version", () => {
   const home = temporaryHome();
   assert.equal(CURRENT_STORAGE_SCHEMA_VERSION, 5);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 3);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 4);
   assert.deepEqual(STORAGE_MIGRATIONS, []);
   assert.equal(inspectStorageSchema(home).status, "uninitialized");
 
@@ -181,8 +181,8 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   });
 
   const onDisk = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
-  assert.equal(onDisk.schemaVersion, 3);
-  assert.equal(onDisk.tasks[task.id].schemaVersion, 3);
+  assert.equal(onDisk.schemaVersion, 4);
+  assert.equal(onDisk.tasks[task.id].schemaVersion, 4);
   assert.equal(onDisk.revision, 1);
   assert.deepEqual(store.getConfiguredAgent("codex"), agent);
   assert.deepEqual(store.getGlobalRole("operator"), globalRole);
@@ -219,7 +219,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify(incompatible));
   assert.throws(
     () => new FileTaskStore(home).listTasks(),
-    /Task aggregate task-1 must use schemaVersion 3/
+    /Task aggregate task-1 must use schemaVersion 4/
   );
 });
 
@@ -423,6 +423,35 @@ test("record versions and aggregate shape are validated without silently repairi
       updatedAt: "2026-07-19T00:00:00.000Z"
     }),
     /completedAt|completion metadata/i
+  );
+
+  const timestamp = "2026-07-19T00:00:00.000Z";
+  const task = {
+    schemaVersion: 1,
+    id: "task-1",
+    title: "Validate WorkItem cleanup",
+    status: "draft",
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+  const item = {
+    schemaVersion: 1,
+    id: "work-1",
+    taskId: task.id,
+    title: "Implement",
+    assignee: "leader",
+    status: "completed",
+    outcome: "Done",
+    endedAt: timestamp,
+    workspaceDisposition: "integrated",
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+  store.saveTask(task);
+  store.saveWorkItem(task.id, item);
+  assert.equal(
+    new FileTaskStore(home).getWorkItem(task.id, item.id).workspaceDisposition,
+    "integrated"
   );
 
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify({

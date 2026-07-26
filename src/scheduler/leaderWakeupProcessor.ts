@@ -38,7 +38,7 @@ export async function processLeaderWakeups(
       results.push({ taskId: wakeup.taskId, status: "skipped", reason: "unavailable" });
       continue;
     }
-    if (task.repositoryId !== undefined && task.cwd === undefined) {
+    if (task.projectId !== undefined && task.cwd === undefined) {
       results.push({ taskId: task.id, status: "skipped", reason: "workspace-not-ready" });
       continue;
     }
@@ -75,10 +75,7 @@ export async function processLeaderWakeups(
       const input = markYuiRunInput(leaderWakeupInput(
         task.id,
         runId,
-        wakeup.reasons,
-        store.getTaskBrief(task.id),
-        store.listDecisions(task.id),
-        store.listMilestones(task.id)
+        wakeup.reasons
       ), runId);
       run = createAgentRun(
         runId,
@@ -258,51 +255,17 @@ function hasNativeSession(
 function leaderWakeupInput(
   taskId: string,
   runId: string,
-  reasons: readonly string[],
-  brief: import("../brief/taskBrief.js").TaskBrief | null,
-  decisions: readonly import("../decision/decision.js").Decision[],
-  milestones: readonly import("../milestone/milestone.js").Milestone[]
+  reasons: readonly string[]
 ): string {
   const lines: string[] = [
     "Follow the injected yui-leader Skill for this Yui wakeup.",
     `Current Leader Run: ${runId}.`,
-    `Yui wakeup reasons: ${reasons.join(", ")}.`
-  ];
-  if (brief !== null) {
-    lines.push(`Objective: ${brief.objective}`);
-    if (brief.boundaries.length > 0) {
-      lines.push("Boundaries:");
-      for (const boundary of brief.boundaries) {
-        lines.push(`  - ${boundary}`);
-      }
-    }
-    if (brief.currentFocus.trim().length > 0) {
-      lines.push(`Current focus: ${brief.currentFocus}`);
-    }
-    if (brief.leaderSummary.trim().length > 0) {
-      lines.push(`Leader summary: ${brief.leaderSummary}`);
-    }
-  }
-  const activeDecisions = decisions.filter((d) => d.status === "active").slice(-3);
-  if (activeDecisions.length > 0) {
-    lines.push("Active decisions:");
-    for (const decision of activeDecisions) {
-      lines.push(`  - ${decision.title}: ${decision.rationale}`);
-    }
-  }
-  const recentMilestones = [...milestones]
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-    .slice(0, 3);
-  if (recentMilestones.length > 0) {
-    lines.push("Recent milestones:");
-    for (const milestone of recentMilestones) {
-      lines.push(`  - ${milestone.title}`);
-    }
-  }
-  lines.push(
-    `Inspect yui task context ${taskId}, which includes open and recently resolved input requests; then continue Leader stewardship. Use narrower show/list commands only when one record needs closer inspection.`,
+    `Yui wakeup reasons: ${reasons.join(", ")}.`,
+    `Read the authoritative context with yui task context ${taskId}.`,
+    `If the Task is Project-backed, read its catalog entry with yui project show <project> and inspect relevant Yui-maintained knowledge with yui project knowledge list <project> and yui project knowledge show <project> <knowledge>.`,
+    "Use narrower Task message, WorkItem, decision, milestone, and input commands only when a specific record needs closer inspection.",
     `When the requested outcome is finished and there are no active Worker Runs or unresolved inputs, complete the Task with yui task complete ${taskId} --summary "<final outcome and evidence>".`,
     `Before ending this turn, if the Task was not completed and no InputRequest terminalized this Run, release the active fence with yui task run yield ${runId} --summary "<current result or waiting state>". In particular, yield before waiting for Worker results; do not return to an idle composer while this Run remains active.`
-  );
+  ];
   return lines.join("\n");
 }

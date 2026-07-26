@@ -1,10 +1,19 @@
 import { resolve } from "node:path";
 
+export type WorktreeOwner =
+  | Readonly<{ type: "task" }>
+  | Readonly<{ type: "work-item"; workItemId: string }>;
+
+/**
+ * A managed worktree is owned by a Task or WorkItem. roleName only records
+ * which Role currently launches there; it is not the lifecycle owner.
+ */
 export type RoleWorkspace = Readonly<{
-  schemaVersion: 1;
+  schemaVersion: 2;
   taskId: string;
   roleName: string;
-  repositoryId: string;
+  owner: WorktreeOwner;
+  projectId: string;
   path: string;
   branch: string;
   baseRef: string;
@@ -15,7 +24,7 @@ export type RoleWorkspace = Readonly<{
 
 export type RoleWorkspaceIdentity = Readonly<Pick<
   RoleWorkspace,
-  "taskId" | "roleName" | "repositoryId" | "path" | "branch" | "baseRef" | "baseCommit"
+  "taskId" | "roleName" | "owner" | "projectId" | "path" | "branch" | "baseRef" | "baseCommit"
 >>;
 
 export function createRoleWorkspace(
@@ -24,10 +33,11 @@ export function createRoleWorkspace(
 ): RoleWorkspace {
   const timestamp = now.toISOString();
   return validateRoleWorkspace({
-    schemaVersion: 1,
+    schemaVersion: 2,
     taskId: requireIdentity(input.taskId, "Task id"),
     roleName: requireIdentity(input.roleName, "Role name"),
-    repositoryId: requireIdentity(input.repositoryId, "Repository id"),
+    owner: validateOwner(input.owner),
+    projectId: requireIdentity(input.projectId, "Project id"),
     path: resolve(requireText(input.path, "Role workspace path")),
     branch: requireText(input.branch, "Role workspace branch"),
     baseRef: requireText(input.baseRef, "Role workspace base ref"),
@@ -38,12 +48,13 @@ export function createRoleWorkspace(
 }
 
 export function validateRoleWorkspace(workspace: RoleWorkspace): RoleWorkspace {
-  if (workspace.schemaVersion !== 1) {
-    throw new Error("RoleWorkspace must use schemaVersion 1.");
+  if (workspace.schemaVersion !== 2) {
+    throw new Error("Managed worktree must use schemaVersion 2.");
   }
   requireIdentity(workspace.taskId, "Task id");
   requireIdentity(workspace.roleName, "Role name");
-  requireIdentity(workspace.repositoryId, "Repository id");
+  validateOwner(workspace.owner);
+  requireIdentity(workspace.projectId, "Project id");
   if (resolve(requireText(workspace.path, "Role workspace path")) !== workspace.path) {
     throw new Error("Role workspace path must be absolute and normalized.");
   }
@@ -53,6 +64,18 @@ export function validateRoleWorkspace(workspace: RoleWorkspace): RoleWorkspace {
   requireTimestamp(workspace.createdAt, "RoleWorkspace createdAt");
   requireTimestamp(workspace.updatedAt, "RoleWorkspace updatedAt");
   return workspace;
+}
+
+export function managedWorktreeName(owner: WorktreeOwner): string {
+  return owner.type === "task" ? "main" : owner.workItemId;
+}
+
+function validateOwner(owner: WorktreeOwner): WorktreeOwner {
+  if (owner.type === "task") return { type: "task" };
+  if (owner.type === "work-item") {
+    return { type: "work-item", workItemId: requireIdentity(owner.workItemId, "Work item id") };
+  }
+  throw new Error("Managed worktree owner is invalid.");
 }
 
 function requireIdentity(value: string, label: string): string {
