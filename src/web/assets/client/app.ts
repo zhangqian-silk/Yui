@@ -2,10 +2,10 @@ export const APP_SCRIPT = `
 import { createI18n } from "/assets/js/i18n.js";
 import { createThemeController } from "/assets/js/theme.js";
 import {
-  renderEmptyDetail,
   renderError,
   renderFilters,
   renderLoading,
+  renderOverview,
   renderTaskDetail,
   renderTasks
 } from "/assets/js/view.js";
@@ -18,6 +18,7 @@ const elements = {
   filters: document.querySelector("#status-filters"),
   tasks: document.querySelector("#task-list"),
   detail: document.querySelector("#detail"),
+  detailBack: document.querySelector("#detail-back"),
   toast: document.querySelector("#toast"),
   lastSync: document.querySelector("#last-sync"),
   active: document.querySelector("#metric-active"),
@@ -50,6 +51,15 @@ function updateMetrics() {
     : "—";
 }
 
+function setDetailActive(active) {
+  document.body.classList.toggle("detail-active", active);
+  elements.detailBack.hidden = !active;
+}
+
+function showOverview() {
+  renderOverview(elements.detail, state, i18n.t, i18n.getLocale(), selectTask);
+}
+
 function renderDynamicContent() {
   renderFilters(elements.filters, state, i18n.t, function (filter) {
     state.filter = filter;
@@ -57,7 +67,7 @@ function renderDynamicContent() {
   });
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
   if (state.detail) renderTaskDetail(elements.detail, state.detail, i18n.t, i18n.getLocale());
-  else if (!state.selected) renderEmptyDetail(elements.detail, i18n.t);
+  else if (!state.selected) showOverview();
   updateMetrics();
 }
 
@@ -67,10 +77,12 @@ function showToast(message) {
   window.setTimeout(function () { elements.toast.classList.remove("show"); }, 3200);
 }
 
-function revealStackedDetail() {
-  if (window.matchMedia("(max-width: 850px)").matches) {
-    elements.detail.scrollIntoView({ block: "start" });
-  }
+function clearSelection() {
+  state.selected = null;
+  state.detail = null;
+  setDetailActive(false);
+  showOverview();
+  renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
 }
 
 async function requestJson(path) {
@@ -82,9 +94,10 @@ async function requestJson(path) {
 async function selectTask(taskId) {
   state.selected = taskId;
   state.detail = null;
+  setDetailActive(true);
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
   renderLoading(elements.detail, i18n.t, "loading.detail");
-  revealStackedDetail();
+  elements.detail.scrollTop = 0;
   try {
     const detail = await requestJson("/api/tasks/" + encodeURIComponent(taskId));
     if (state.selected !== taskId) return;
@@ -106,8 +119,7 @@ async function refreshDashboard() {
     state.counts = dashboard.counts;
     state.generatedAt = dashboard.generatedAt;
     if (state.selected && !state.tasks.some(function (task) { return task.id === state.selected; })) {
-      state.selected = null;
-      state.detail = null;
+      clearSelection();
     }
     renderDynamicContent();
   } catch {
@@ -123,14 +135,19 @@ elements.search.addEventListener("input", function () {
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
 });
 elements.refresh.addEventListener("click", refreshDashboard);
+elements.detailBack.addEventListener("click", clearSelection);
 document.addEventListener("keydown", function (event) {
-  if (event.key.toLowerCase() === "r" && !event.metaKey && !event.ctrlKey && !event.altKey
-    && !["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName)) {
+  const typing = ["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName);
+  if (event.key === "Escape" && state.selected) {
+    clearSelection();
+    return;
+  }
+  if (event.key.toLowerCase() === "r" && !event.metaKey && !event.ctrlKey && !event.altKey && !typing) {
     refreshDashboard();
   }
 });
 i18n.subscribe(function () { renderDynamicContent(); });
-renderEmptyDetail(elements.detail, i18n.t);
+showOverview();
 refreshDashboard();
 window.setInterval(refreshDashboard, 30000);
 `;
