@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+
 import { APP_SCRIPT } from "./client/app.js";
 import { I18N_SCRIPT } from "./client/i18n.js";
 import { THEME_SCRIPT } from "./client/theme.js";
@@ -12,6 +15,8 @@ import {
 
 export type WebAsset = Readonly<{ contentType: string; body: string }>;
 
+const require = createRequire(import.meta.url);
+
 export const WEB_ASSETS: Readonly<Record<string, WebAsset>> = Object.freeze({
   "/assets/css/tokens.css": { contentType: "text/css; charset=utf-8", body: TOKEN_STYLES },
   "/assets/css/layout.css": { contentType: "text/css; charset=utf-8", body: LAYOUT_STYLES },
@@ -20,11 +25,30 @@ export const WEB_ASSETS: Readonly<Record<string, WebAsset>> = Object.freeze({
   "/assets/js/i18n.js": { contentType: "text/javascript; charset=utf-8", body: I18N_SCRIPT },
   "/assets/js/theme.js": { contentType: "text/javascript; charset=utf-8", body: THEME_SCRIPT },
   "/assets/js/view.js": { contentType: "text/javascript; charset=utf-8", body: VIEW_SCRIPT },
-  "/assets/app.js": { contentType: "text/javascript; charset=utf-8", body: APP_SCRIPT }
+  "/assets/app.js": { contentType: "text/javascript; charset=utf-8", body: APP_SCRIPT },
+  "/assets/vendor/xterm.mjs": vendorAsset(
+    "@xterm/xterm/lib/xterm.mjs",
+    "text/javascript; charset=utf-8"
+  ),
+  "/assets/vendor/addon-fit.mjs": vendorAsset(
+    "@xterm/addon-fit/lib/addon-fit.mjs",
+    "text/javascript; charset=utf-8"
+  ),
+  "/assets/vendor/xterm.css": vendorAsset(
+    "@xterm/xterm/css/xterm.css",
+    "text/css; charset=utf-8"
+  )
 });
 
 export { DASHBOARD_HTML };
 
 export function findWebAsset(pathname: string): WebAsset | null {
   return WEB_ASSETS[pathname] ?? null;
+}
+
+function vendorAsset(specifier: string, contentType: string): WebAsset {
+  return {
+    contentType,
+    body: readFileSync(require.resolve(specifier), "utf8")
+  };
 }

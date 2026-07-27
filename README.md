@@ -206,7 +206,23 @@ Task lifecycle completion/selection only suggests valid source states: Draft for
 
 ## Sessions and tmux
 
-Yui never proxies an interactive Agent terminal. Before `operator enter`, `role enter`, or `task enter` attaches, Yui closes readline, leaves raw mode, pauses its stdin, and synchronously hands the terminal to tmux. As a result, native Codex features such as `/model`, slash-command suggestions, full-screen rendering, and key handling remain available.
+tmux owns every long-lived interactive Agent process. Before `operator enter`,
+`role enter`, or `task enter` attaches, Yui closes readline, leaves raw mode,
+pauses its stdin, and synchronously hands the terminal to tmux. The attach uses
+the real outer terminal capabilities and a clean alternate screen; mouse
+scrolling stays in the Agent pane's 100,000-line tmux history instead of mixing
+with the shell or IDE terminal history that preceded the attach. Native Agent
+features such as `/model`, slash-command suggestions, full-screen rendering,
+and key handling remain available.
+
+tmux fixes a pane's history capacity when that pane is created. Roles created
+before this limit was configured keep their earlier capacity; Yui warns on
+Terminal attach and in Web so the user can exit and re-enter that Role once to
+create a 100,000-line pane while retaining the native Agent conversation.
+
+The first terminal attached to one Operator or Task tmux session is writable.
+Additional Terminal or Web viewers attach read-only, preventing two surfaces
+from typing into the same Agent at once.
 
 ```sh
 yui role enter <global-role>
@@ -257,18 +273,29 @@ yui task run retry <failed-run-id>
 
 Completion is the reversible execution fence. Archiving is terminal and is accepted only after active work is settled: it stops the Task's tmux session and removes clean managed worktrees. Dirty worktrees keep the Task completed and are preserved for deliberate resolution.
 
-## Local web dashboard
+## Local web control room
 
-Run the read-only dashboard on the default loopback address:
+Run the local control room on the default loopback address:
 
 ```sh
 yui web
-# Yui web dashboard: http://127.0.0.1:4173
+# Yui web control room: http://127.0.0.1:4173
 ```
 
-Use `--port <port>` or `--host 127.0.0.1|::1|localhost` to change the listener. Yui rejects non-loopback hosts: the dashboard exposes Task metadata, Briefs, Roles, WorkItems, Runs, messages, Decisions, Milestones, and open InputRequests without authentication, so it is intentionally local-only. The Web surface never writes Yui state; use the CLI or an Agent session for mutations.
+Use `--port <port>` or `--host 127.0.0.1|::1|localhost` to change the
+listener. Yui rejects non-loopback hosts because the control room exposes Task
+metadata, Briefs, Roles, WorkItems, Runs, messages, Decisions, Milestones, and
+InputRequests. A random token embedded in the served page protects its write
+and terminal endpoints.
 
-The dashboard supports English and Simplified Chinese, selecting an initial locale from the browser and remembering manual changes. The theme selector switches between the dark Control Room and light Paper Ledger themes. Both choices are stored only in browser `localStorage`; they do not modify `YUI_HOME`.
+The Web surface can answer an open InputRequest through the same durable CLI
+mutation used by Terminal users. It can also attach to the existing Operator,
+Leader, or Worker tmux pane through a native xterm client. Closing the browser
+terminal detaches only that tmux client; the Agent process and conversation
+continue running in tmux. The Web surface does not duplicate transcripts or
+maintain another session state.
+
+The control room supports English and Simplified Chinese, selecting an initial locale from the browser and remembering manual changes. The theme selector switches between the dark Control Room and light Paper Ledger themes. Both choices are stored only in browser `localStorage`; they do not modify `YUI_HOME`.
 
 ## Management commands
 
@@ -286,7 +313,11 @@ Agent environment bindings store process-environment variable names, never secre
 
 ## Scope
 
-Yui targets one trusted local user on one machine. Its Web/API surface is loopback-only and read-only. It intentionally omits remote or multi-user Web access, distributed coordination, backup/import/export commands, trash/restore, derived indexes, recovery journals, runtime leases, inactivity TTLs, cooldowns, and recurring schedules.
+Yui targets one trusted local user on one machine. Its Web/API surface is
+loopback-only and intentionally omits remote or multi-user Web access,
+distributed coordination, backup/import/export commands, trash/restore,
+derived indexes, recovery journals, runtime leases, inactivity TTLs,
+cooldowns, and recurring schedules.
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for persistence and scheduling details.
 

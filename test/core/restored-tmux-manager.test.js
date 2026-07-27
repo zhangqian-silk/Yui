@@ -101,7 +101,13 @@ test("Role launches clear inherited process environment and use only the complet
     }
   });
 
-  const launch = calls.find(({ args }) => tmuxCommand(args) === "new-session");
+  const launch = calls.find(({ args }) => args.includes("new-session"));
+  assert.deepEqual(launch.args.slice(2, 8), [
+    "start-server",
+    ";",
+    "set-option", "-g", "history-limit", "100000"
+  ]);
+  assert.ok(launch.args.indexOf("history-limit") < launch.args.indexOf("new-session"));
   const commandIndex = launch.args.indexOf("--");
   assert.deepEqual(launch.args.slice(commandIndex + 1), [
     "env",
@@ -132,7 +138,7 @@ class TtyInput extends PassThrough {
   }
 }
 
-test("restored tmux attach uses client-local native terminal scrollback", () => {
+test("restored tmux attach isolates the native session in tmux scrollback", () => {
   const input = new TtyInput();
   const calls = [];
   const manager = new TmuxManager("tmux-test", {
@@ -150,19 +156,194 @@ test("restored tmux attach uses client-local native terminal scrollback", () => 
 
   assert.deepEqual(input.events, ["close", "raw:false", "pause"]);
   const session = yuiTmuxSessionName("/tmp/yui-home", "task-1");
-  assert.deepEqual(calls.slice(0, 2).map(({ args }) => args.slice(2)), [
-    ["set-option", "-t", session, "status", "off"],
-    ["set-option", "-t", session, "mouse", "off"]
+  const clientSession = calls
+    .find(({ args }) => tmuxCommand(args) === "new-session")
+    .args.at(-1);
+  assert.match(clientSession, /^yui-client-[a-f0-9]{24}$/);
+  assert.deepEqual(calls.map(({ args }) => args.slice(2)), [
+    [
+      "list-clients", "-F",
+      "#{session_name}\u001f#{session_group}\u001f#{client_readonly}"
+    ],
+    ["new-session", "-d", "-t", session, "-s", clientSession],
+    ["set-option", "-t", clientSession, "status", "off"],
+    ["set-option", "-t", clientSession, "mouse", "on"],
+    [
+      "set-hook", "-t", clientSession, "client-detached",
+      `kill-session -t ${clientSession}`
+    ],
+    ["attach-session", "-t", `${clientSession}:leader`],
+    ["kill-session", "-t", clientSession]
   ]);
-  assert.equal(calls.length, 3);
-  assert.equal(calls[2].args[2], "-T");
-  assert.match(calls[2].args[3], /(?:^|,)256,RGB(?:,|$)/);
-  assert.deepEqual(calls[2].args.slice(-3), [
-    "attach-session", "-t", `${session}:leader`
+  const attach = calls.find(({ args }) => tmuxCommand(args) === "attach-session");
+  assert.equal(attach.options.inheritStdio, true);
+  assert.equal(attach.options.environment, undefined);
+  assert.deepEqual(attach.inputEvents, input.events);
+});
+
+test("attaching an existing pane reports when its history cannot be enlarged live", () => {
+  const warnings = [];
+  const calls = [];
+  const manager = new TmuxManager("tmux-test", {
+    run(_command, args) {
+      calls.push(args);
+      if (tmuxCommand(args) === "display-message") return "2000\n";
+      return "";
+    }
+  }, {
+    yuiHome: "/tmp/yui-home",
+    terminalInput: new TtyInput(),
+    historyLimit: 100_000,
+    onWarning(message) { warnings.push(message); }
+  });
+
+  manager.attachRole("task-1", "leader");
+
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /existing Role.*2,000-line tmux history/u);
+  assert.match(warnings[0], /exit and re-enter.*100,000 lines/u);
+  const attachedNotice = calls.find((args) => (
+    tmuxCommand(args) === "set-hook" && args.includes("client-attached")
+  ));
+  assert.match(attachedNotice.at(-1), /display-message -d 10000.*2,000-line/u);
+});
+
+test("a real legacy pane stays limited while a re-entered Role receives the configured history", (t) => {
+  if (spawnSync("tmux", ["-V"], { stdio: "ignore" }).status !== 0) {
+    t.skip("tmux is unavailable");
+    return;
+  }
+  const yuiHome = join(tmpdir(), `yui-real-tmux-history-${process.pid}`);
+  const server = yuiTmuxServerName(yuiHome);
+  const taskId = "history-task";
+  const session = yuiTmuxSessionName(yuiHome, taskId);
+  const manager = new TmuxManager("tmux", new NodeCommandExecutor(), {
+    yuiHome,
+    historyLimit: 100_000
+  });
+  t.after(() => {
+    manager.stopTask(taskId);
+  });
+  assert.equal(spawnSync(
+    "tmux",
+    [
+      "-L", server,
+      "-f", "/dev/null",
+      "new-session", "-d", "-s", session, "-n", "leader", "/bin/sh"
+    ],
+    { stdio: "ignore" }
+  ).status, 0);
+
+  assert.equal(manager.ensureRoleWindow(taskId, {
+    name: "leader",
+    workspace: process.cwd()
+  }), false);
+  assert.deepEqual(manager.inspectRoleHistory(taskId, "leader"), {
+    actual: 2_000,
+    configured: 100_000,
+    limited: true
+  });
+
+  assert.equal(manager.stopTask(taskId), true);
+  manager.ensureRoleWindow(taskId, {
+    name: "leader",
+    workspace: process.cwd()
+  }, {
+    command: "/bin/sh",
+    args: [],
+    env: {}
+  });
+  assert.deepEqual(manager.inspectRoleHistory(taskId, "leader"), {
+    actual: 100_000,
+    configured: 100_000,
+    limited: false
+  });
+});
+
+test("a second interactive tmux client attaches read-only", () => {
+  const calls = [];
+  const manager = new TmuxManager("tmux-test", {
+    run(command, args, options) {
+      calls.push({ command, args, options });
+      return tmuxCommand(args) === "list-clients"
+        ? `${yuiTmuxSessionName("/tmp/yui-home", "task-1")}\u001f\u001f0\n`
+        : "";
+    }
+  }, {
+    yuiHome: "/tmp/yui-home",
+    terminalInput: new TtyInput()
+  });
+
+  manager.attachRole("task-1", "leader");
+
+  const attach = calls.find(({ args }) => tmuxCommand(args) === "attach-session");
+  const clientSession = calls
+    .find(({ args }) => tmuxCommand(args) === "new-session")
+    .args.at(-1);
+  assert.deepEqual(attach.args.slice(-4), [
+    "attach-session", "-r", "-t",
+    `${clientSession}:leader`
   ]);
-  assert.equal(calls[2].options.inheritStdio, true);
-  assert.equal(calls[2].options.environment.TERM, "ansi");
-  assert.deepEqual(calls[2].inputEvents, input.events);
+});
+
+test("interactive clients use an isolated grouped session with native scrolling", () => {
+  const calls = [];
+  const manager = new TmuxManager("tmux-test", {
+    run(command, args) {
+      calls.push({ command, args });
+      return "";
+    }
+  }, { yuiHome: "/tmp/yui-home" });
+  const taskSession = yuiTmuxSessionName("/tmp/yui-home", "task-1");
+
+  const clientSession = manager.createInteractiveClientSession("task-1");
+  manager.destroyInteractiveClientSession(clientSession);
+
+  assert.match(clientSession, /^yui-client-[a-f0-9]{24}$/);
+  assert.deepEqual(calls.map(({ args }) => args.slice(2)), [
+    ["new-session", "-d", "-t", taskSession, "-s", clientSession],
+    ["set-option", "-t", clientSession, "status", "off"],
+    ["set-option", "-t", clientSession, "mouse", "on"],
+    [
+      "set-hook", "-t", clientSession, "client-detached",
+      `kill-session -t ${clientSession}`
+    ],
+    ["kill-session", "-t", clientSession]
+  ]);
+});
+
+test("stopping a real Task removes its detached interactive client sessions", (t) => {
+  if (spawnSync("tmux", ["-V"], { stdio: "ignore" }).status !== 0) {
+    t.skip("tmux is unavailable");
+    return;
+  }
+  const yuiHome = join(tmpdir(), `yui-real-tmux-stop-${process.pid}`);
+  const manager = new TmuxManager("tmux", new NodeCommandExecutor(), { yuiHome });
+  const taskId = "grouped-task";
+  t.after(() => {
+    manager.stopTask(taskId);
+  });
+  manager.ensureRoleWindow(taskId, {
+    name: "leader",
+    workspace: process.cwd()
+  }, {
+    command: "/bin/sh",
+    args: [],
+    env: {}
+  });
+  manager.createInteractiveClientSession(taskId);
+  manager.createInteractiveClientSession(taskId);
+
+  assert.equal(manager.stopTask(taskId), true);
+  const sessions = spawnSync(
+    "tmux",
+    [
+      "-L", yuiTmuxServerName(yuiHome),
+      "list-sessions", "-F", "#{session_name}"
+    ],
+    { encoding: "utf8" }
+  );
+  assert.equal(sessions.stdout.trim(), "");
 });
 
 test("sendRoleInputOnce probes readiness and applies a pane receipt in one tmux command", () => {

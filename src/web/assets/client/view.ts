@@ -246,7 +246,8 @@ export function renderError(container, message) {
   container.append(node("div", "error", message));
 }
 
-export function renderTaskDetail(detail, data, t, locale) {
+export function renderTaskDetail(detail, data, t, locale, actions) {
+  actions = actions || {};
   clear(detail);
   const task = data.task;
   const head = node("header", "detail-head");
@@ -281,6 +282,34 @@ export function renderTaskDetail(detail, data, t, locale) {
     data.openInputs.forEach(function (input) {
       const card = node("div", "input-card");
       card.append(node("small", "", t("detail.openInput")), node("span", "", input.question));
+      const answers = node("div", "input-actions");
+      if (input.choices && input.choices.length) {
+        input.choices.forEach(function (choice) {
+          const button = node("button", "input-answer", choice.label);
+          button.type = "button";
+          button.dataset.choice = choice.key;
+          button.addEventListener("click", function () {
+            if (actions.answerInput) actions.answerInput(input, { choiceKey: choice.key });
+          });
+          answers.append(button);
+        });
+      } else {
+        const form = node("form", "input-form");
+        const field = node("input", "");
+        field.type = "text";
+        field.required = true;
+        field.placeholder = t("input.freeText");
+        const submit = node("button", "input-answer", t("actions.answer"));
+        submit.type = "submit";
+        form.append(field, submit);
+        form.addEventListener("submit", function (event) {
+          event.preventDefault();
+          const text = field.value.trim();
+          if (text && actions.answerInput) actions.answerInput(input, { text: text });
+        });
+        answers.append(form);
+      }
+      card.append(answers);
       inputSection.append(card);
     });
     detail.append(inputSection);
@@ -353,7 +382,19 @@ export function renderTaskDetail(detail, data, t, locale) {
     const row = node("div", "row record-head");
     row.append(node("strong", "", role.name), statusPill(t, "role", role.status));
     card.append(row);
-    card.append(node("div", "run-meta", t("detail.agent") + " · " + role.activeAgentId));
+    const roleActions = node("div", "record-actions");
+    roleActions.append(node("div", "run-meta", t("detail.agent") + " · " + role.activeAgentId));
+    const open = node("button", "input-answer", t("actions.openRole"));
+    open.type = "button";
+    open.addEventListener("click", function () {
+      if (actions.openTerminal) actions.openTerminal({
+        scope: "task",
+        taskId: task.id,
+        roleName: role.name
+      });
+    });
+    roleActions.append(open);
+    card.append(roleActions);
     if (role.description) card.append(node("p", "record-copy", role.description));
     roles.append(card);
   });

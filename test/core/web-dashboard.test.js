@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { once } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { get } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import WebSocket from "ws";
 
 import {
   createYuiWebServer,
@@ -105,8 +111,11 @@ function fixtureStore() {
   };
 }
 
-async function withServer(run) {
-  const server = createYuiWebServer(fixtureStore(), { now: () => now });
+async function withServer(run, dependencies = {}) {
+  const server = createYuiWebServer(fixtureStore(), {
+    now: () => now,
+    ...dependencies
+  });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const address = server.address();
@@ -119,12 +128,72 @@ async function withServer(run) {
   }
 }
 
+function requestWithHost(origin, host, path = "/") {
+  const url = new URL(origin);
+  return new Promise((resolve, reject) => {
+    const request = get({
+      hostname: url.hostname,
+      port: url.port,
+      path,
+      headers: { host }
+    }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve({
+        status: response.statusCode,
+        body: Buffer.concat(chunks).toString("utf8")
+      }));
+    });
+    request.on("error", reject);
+  });
+}
+
 test("web options default to a safe loopback listener and validate the port", () => {
   assert.deepEqual(parseWebCommandOptions([]), { host: "127.0.0.1", port: 4173 });
   assert.deepEqual(parseWebCommandOptions(["--port", "8090"]), { host: "127.0.0.1", port: 8090 });
   assert.throws(() => parseWebCommandOptions(["--host", "0.0.0.0"]), /loopback/i);
   assert.throws(() => parseWebCommandOptions(["--port", "0"]), /between 1 and 65535/i);
   assert.throws(() => parseWebCommandOptions(["--wat"]), /Web usage/);
+});
+
+test("web rejects a non-loopback Host before exposing its token or terminal", async () => {
+  let opened = 0;
+  await withServer(async (origin) => {
+    const port = new URL(origin).port;
+    for (const loopbackHost of [`localhost:${port}`, `[::1]:${port}`]) {
+      assert.equal((await requestWithHost(origin, loopbackHost)).status, 200);
+    }
+    const hostileHost = `evil.example:${port}`;
+    const page = await requestWithHost(origin, hostileHost);
+    assert.equal(page.status, 403);
+    assert.doesNotMatch(page.body, /yui-web-token/u);
+
+    const socket = new WebSocket(
+      `${origin.replace(/^http/u, "ws")}/api/terminal?scope=global&role=operator&cols=80&rows=24&token=test-token`,
+      {
+        origin: `http://${hostileHost}`,
+        headers: { host: hostileHost }
+      }
+    );
+    const status = await new Promise((resolve, reject) => {
+      socket.once("open", () => reject(new Error("Hostile terminal unexpectedly opened.")));
+      socket.once("error", () => {});
+      socket.once("unexpected-response", (_request, response) => {
+        response.resume();
+        resolve(response.statusCode);
+      });
+    });
+    assert.equal(status, 403);
+  }, {
+    token: "test-token",
+    terminal: {
+      async open() {
+        opened += 1;
+        throw new Error("terminal should not open");
+      }
+    }
+  });
+  assert.equal(opened, 0);
 });
 
 test("dashboard API summarizes tasks and exposes one consolidated task detail", async () => {
@@ -174,11 +243,187 @@ test("web server serves the application shell and rejects unsupported routes and
   });
 });
 
+test("web input answers require the page token and use the durable mutation port", async () => {
+  const calls = [];
+  await withServer(async (origin) => {
+    const body = JSON.stringify({ choiceKey: "csv" });
+    const rejected = await fetch(`${origin}/api/tasks/task-1/inputs/input-1/answer`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body
+    });
+    assert.equal(rejected.status, 403);
+
+    const answered = await fetch(`${origin}/api/tasks/task-1/inputs/input-1/answer`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-yui-web-token": "test-token"
+      },
+      body
+    });
+    assert.equal(answered.status, 200);
+    assert.deepEqual(await answered.json(), {
+      request: { id: "input-1", taskId: "task-1", status: "answered" }
+    });
+  }, {
+    token: "test-token",
+    async answerInput(input) {
+      calls.push(input);
+      return { id: input.inputId, taskId: input.taskId, status: "answered" };
+    }
+  });
+
+  assert.deepEqual(calls, [{
+    taskId: "task-1",
+    inputId: "input-1",
+    answer: { choiceKey: "csv" }
+  }]);
+});
+
+test("web terminal upgrades to one injected PTY bridge and detaches it on close", async () => {
+  const events = {
+    writes: [],
+    resizes: [],
+    closed: 0,
+    data: undefined,
+    exit: undefined
+  };
+  const terminal = {
+    async open(request) {
+      assert.deepEqual(request, {
+        scope: "task",
+        taskId: "task-1",
+        roleName: "leader",
+        columns: 100,
+        rows: 30
+      });
+      return {
+        readOnly: false,
+        history: { limit: 2_000, target: 100_000 },
+        onData(listener) {
+          events.data = listener;
+          return () => { events.data = undefined; };
+        },
+        onExit(listener) {
+          events.exit = listener;
+          return () => { events.exit = undefined; };
+        },
+        write(data) { events.writes.push(data); },
+        resize(columns, rows) { events.resizes.push([columns, rows]); },
+        close() { events.closed += 1; }
+      };
+    }
+  };
+
+  await withServer(async (origin) => {
+    const wsOrigin = origin.replace(/^http/, "ws");
+    const socket = new WebSocket(
+      `${wsOrigin}/api/terminal?scope=task&task=task-1&role=leader&cols=100&rows=30&token=test-token`,
+      { origin }
+    );
+    const messages = [];
+    socket.on("message", (payload) => messages.push(JSON.parse(String(payload))));
+    await once(socket, "open");
+    while (messages.length === 0) await once(socket, "message");
+    assert.deepEqual(messages.shift(), {
+      type: "ready",
+      readOnly: false,
+      history: { limit: 2_000, target: 100_000 }
+    });
+
+    events.data("native output");
+    while (messages.length === 0) await once(socket, "message");
+    assert.deepEqual(messages.shift(), { type: "data", data: "native output" });
+
+    socket.send(JSON.stringify({ type: "input", data: "/status\r" }));
+    socket.send(JSON.stringify({ type: "resize", columns: 120, rows: 40 }));
+    while (events.writes.length === 0 || events.resizes.length === 0) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.deepEqual(events.writes, ["/status\r"]);
+    assert.deepEqual(events.resizes, [[120, 40]]);
+
+    socket.close();
+    await once(socket, "close");
+  }, { token: "test-token", terminal });
+
+  assert.equal(events.closed, 1);
+});
+
+test("web terminal closes cleanly when the PTY exited before subscriptions attach", async () => {
+  let closed = 0;
+  const terminal = {
+    async open() {
+      return {
+        readOnly: false,
+        onData() { return () => {}; },
+        onExit(listener) {
+          listener({ exitCode: 9 });
+          return () => {};
+        },
+        write() {},
+        resize() {},
+        close() { closed += 1; }
+      };
+    }
+  };
+
+  await withServer(async (origin) => {
+    const socket = new WebSocket(
+      `${origin.replace(/^http/, "ws")}/api/terminal?scope=global&role=operator&cols=80&rows=24&token=test-token`,
+      { origin }
+    );
+    const messages = [];
+    socket.on("message", (payload) => messages.push(JSON.parse(String(payload))));
+    await once(socket, "close");
+    assert.deepEqual(messages, [{ type: "exit", exitCode: 9 }]);
+  }, { token: "test-token", terminal });
+
+  assert.equal(closed, 1);
+});
+
+test("web terminal closes a late PTY when the browser disconnects during Role startup", async () => {
+  let resolveOpen;
+  const pendingOpen = new Promise((resolve) => {
+    resolveOpen = resolve;
+  });
+  let closed = 0;
+  const terminal = {
+    async open() { return pendingOpen; }
+  };
+
+  await withServer(async (origin) => {
+    const socket = new WebSocket(
+      `${origin.replace(/^http/, "ws")}/api/terminal?scope=global&role=operator&cols=80&rows=24&token=test-token`,
+      { origin }
+    );
+    await once(socket, "open");
+    socket.close();
+    await once(socket, "close");
+    resolveOpen({
+      readOnly: false,
+      onData() { return () => {}; },
+      onExit() { return () => {}; },
+      write() {},
+      resize() {},
+      close() { closed += 1; }
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+  }, { token: "test-token", terminal });
+
+  assert.equal(closed, 1);
+});
+
 test("web shell composes modular i18n, theme, layout, and client assets", async () => {
   await withServer(async (origin) => {
     const shell = await fetch(origin).then((response) => response.text());
     assert.match(shell, /id="locale-select"/);
     assert.match(shell, /id="theme-select"/);
+    assert.match(shell, /id="operator-terminal"/);
+    assert.match(shell, /id="terminal-dialog"/);
+    assert.match(shell, /name="yui-web-token" content="[^"]+"/);
+    assert.doesNotMatch(shell, /__YUI_WEB_TOKEN__/);
     assert.match(shell, /data-i18n="page\.title"/);
 
     const assets = [
@@ -189,7 +434,10 @@ test("web shell composes modular i18n, theme, layout, and client assets", async 
       ["/assets/js/i18n.js", "text/javascript"],
       ["/assets/js/theme.js", "text/javascript"],
       ["/assets/js/view.js", "text/javascript"],
-      ["/assets/app.js", "text/javascript"]
+      ["/assets/app.js", "text/javascript"],
+      ["/assets/vendor/xterm.mjs", "text/javascript"],
+      ["/assets/vendor/addon-fit.mjs", "text/javascript"],
+      ["/assets/vendor/xterm.css", "text/css"]
     ];
     for (const [path, contentType] of assets) {
       const response = await fetch(`${origin}${path}`);
@@ -204,5 +452,22 @@ test("web shell composes modular i18n, theme, layout, and client assets", async 
     const tokens = await fetch(`${origin}/assets/css/tokens.css`).then((response) => response.text());
     assert.match(tokens, /data-theme="control-room"/);
     assert.match(tokens, /data-theme="paper"/);
+
+    const scripts = [
+      ["/assets/app.js", "app.mjs"],
+      ["/assets/js/view.js", "view.mjs"]
+    ];
+    const directory = mkdtempSync(join(tmpdir(), "yui-web-syntax-"));
+    try {
+      for (const [path, filename] of scripts) {
+        writeFileSync(join(directory, filename), await fetch(`${origin}${path}`).then((response) => response.text()));
+        const checked = spawnSync(process.execPath, ["--check", join(directory, filename)], {
+          encoding: "utf8"
+        });
+        assert.equal(checked.status, 0, checked.stderr);
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

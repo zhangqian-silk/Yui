@@ -17,7 +17,7 @@ function readJson(path) {
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
-test("the source package has one TypeScript-only build and no native runtime dependency", () => {
+test("the source package keeps one TypeScript build and declares its Web runtime dependencies", () => {
   const sourcePackage = readJson(join(root, "package.json"));
   const tsconfig = readJson(join(root, "tsconfig.json"));
 
@@ -34,6 +34,10 @@ test("the source package has one TypeScript-only build and no native runtime dep
   assert.equal("gypfile" in sourcePackage, false);
   assert.equal(sourcePackage.dependencies?.["better-sqlite3"], undefined);
   assert.equal(sourcePackage.dependencies?.["smol-toml"], "1.7.0");
+  assert.equal(sourcePackage.dependencies?.["node-pty"], "^1.1.0");
+  assert.equal(sourcePackage.dependencies?.["ws"], "^8.21.1");
+  assert.equal(sourcePackage.dependencies?.["@xterm/xterm"], "^6.0.0");
+  assert.equal(sourcePackage.dependencies?.["@xterm/addon-fit"], "^0.11.0");
   assert.equal(sourcePackage.devDependencies["@types/better-sqlite3"], undefined);
   assert.deepEqual(sourcePackage.cpu, ["x64"]);
   assert.deepEqual(sourcePackage.files, [
@@ -97,7 +101,13 @@ test("runtime assembly contains only the built CLI, docs, and three skills", (t)
   assert.deepEqual(runtimePackage.bin, { yui: "./dist/cli.js" });
   assert.deepEqual(runtimePackage.cpu, ["x64"]);
   assert.deepEqual(runtimePackage.files, sourcePackage.files);
-  assert.deepEqual(runtimePackage.dependencies, { "smol-toml": "1.7.0" });
+  assert.deepEqual(runtimePackage.dependencies, {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "node-pty": "^1.1.0",
+    "smol-toml": "1.7.0",
+    "ws": "^8.21.1"
+  });
   assert.equal("scripts" in runtimePackage, false);
   assert.equal("devDependencies" in runtimePackage, false);
 });
