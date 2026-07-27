@@ -13,10 +13,15 @@ import {
   type SelectionIo
 } from "./cli/interactiveSelection.js";
 import { runCompletionWizard } from "./cli/completionWizard.js";
+import {
+  renderAgentConfigurationResolutionNotice
+} from "./cli/agentConfigurationPicker.js";
+import { resolveProfileWizardArguments } from "./cli/profileWizard.js";
 import { resolveRoleWizardArguments } from "./cli/roleWizard.js";
 import type { SelectionPorts } from "./cli/selectionPorts.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
 import { formatTimestamp } from "./output/timePresentation.js";
+import { renderAgentConfigurationCatalog } from "./output/agentConfigurationPresentation.js";
 import type { ConfiguredAgent } from "./agent/agent.js";
 import { nativeAgentEnvironmentNames } from "./agent/launchEnvironment.js";
 import {
@@ -51,7 +56,7 @@ import {
 import { FileSchedulerStoreAdapter } from "./controller/fileSchedulerStoreAdapter.js";
 import { runSessionNotifyCommand } from "./controller/sessionNotify.js";
 import { runDoctorCommand } from "./doctor/doctor.js";
-import { CliError, runtimeError, usageError } from "./errors/cliError.js";
+import { agentNotFound, CliError, runtimeError, usageError } from "./errors/cliError.js";
 import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
 import { TaskWorkspaceCoordinator } from "./repository/taskWorkspaceCoordinator.js";
 import { FileTaskWorkspacePreparer } from "./repository/taskWorkspacePreparer.js";
@@ -61,6 +66,10 @@ import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.j
 import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
 import { parseWebCommandOptions, startYuiWebServer } from "./web/webServer.js";
+import {
+  AgentConfigurationCatalogService
+} from "./executor/agentConfigurationCatalog.js";
+import type { RoleAgentConfig } from "./executor/agentAdapter.js";
 
 const VERSION = readPackageVersion();
 const rawArgs = process.argv.slice(2);
@@ -163,11 +172,15 @@ export async function main(): Promise<void> {
 
   requireStorageSchema(home);
   const store = new FileTaskStore(home);
-  const resolved = await resolveTerminalArguments(args, invocation.node, store);
+  const catalogs = new AgentConfigurationCatalogService(home, {
+    environment: process.env
+  });
+  const resolved = await resolveTerminalArguments(args, invocation.node, store, catalogs);
   if (resolved === null) {
     emit("Cancelled.");
     return;
   }
+  await preflightAgentConfigurationMutation(resolved, store, catalogs);
 
   if (resolved[0] === "web") {
     if (jsonOutput) throw usageError("Web does not support --json.");
@@ -219,6 +232,19 @@ export async function main(): Promise<void> {
 
   if (resolved[0] === "agent") {
     const agentArgs = resolved.slice(1);
+    if (agentArgs[0] === "capabilities") {
+      if (agentArgs.length !== 2) {
+        throw usageError("Agent capabilities usage: yui agent capabilities <agent-id>");
+      }
+      const agent = store.getConfiguredAgent(agentArgs[1] ?? "");
+      if (agent === null) throw agentNotFound(agentArgs[1] ?? "");
+      const result = await catalogs.resolve({
+        agent,
+        cwd: store.getConfig().defaultWorkspace ?? process.cwd()
+      });
+      emit(renderAgentConfigurationCatalog(result), false, result);
+      return;
+    }
     const affectedAgentId = agentArgs[1];
     const previousAgent = typeof affectedAgentId === "string"
       ? store.getConfiguredAgent(affectedAgentId)
@@ -235,6 +261,13 @@ export async function main(): Promise<void> {
       const currentAgent = typeof affectedAgentId === "string"
         ? store.getConfiguredAgent(affectedAgentId)
         : null;
+      const capabilityNotice = currentAgent !== null
+        && (agentArgs[0] === "add" || agentArgs[0] === "update")
+        ? renderAgentConfigurationResolutionNotice(await catalogs.resolve({
+            agent: currentAgent,
+            cwd: store.getConfig().defaultWorkspace ?? process.cwd()
+          }))
+        : "";
       const scope = agentEnvironmentRefreshScope(
         previousAgent,
         currentAgent,
@@ -246,7 +279,11 @@ export async function main(): Promise<void> {
         process.env,
         scope
       );
-      emit(withControllerRefreshWarning(output, refresh, "Agent environment"));
+      emit(withControllerRefreshWarning(
+        `${output.trimEnd()}${capabilityNotice.length === 0 ? "\n" : `\n${capabilityNotice}`}`,
+        refresh,
+        "Agent environment"
+      ));
       return;
     }
     emit(output);
@@ -529,7 +566,8 @@ function completionShell(value: string | undefined): "bash" | "zsh" | "fish" | u
 async function resolveTerminalArguments(
   commandArgs: readonly string[],
   node: import("./cli/commandCatalog.js").CommandNode,
-  store: FileTaskStore
+  store: FileTaskStore,
+  catalogs: AgentConfigurationCatalogService
 ): Promise<string[] | null> {
   const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
   if (!interactive || !allowsInteractiveSelection(commandArgs, jsonOutput)) {
@@ -537,7 +575,7 @@ async function resolveTerminalArguments(
   }
   const handle = terminalIo();
   try {
-    const ports = selectionPorts(store);
+    const ports = selectionPorts(store, catalogs);
     // Global Role add owns its Agent choice so the configured default can be
     // shown explicitly. Other commands first resolve missing positional
     // targets through the generic selector, then enter the focused Role UI.
@@ -552,8 +590,10 @@ async function resolveTerminalArguments(
     }
     const selected = await resolveInteractiveArguments(commandArgs, node, ports, handle.io);
     if (selected.kind === "cancelled") return null;
-    const wizard = await resolveRoleWizardArguments(selected.args, ports, handle.io);
-    return wizard.kind === "cancelled" ? null : wizard.args;
+    const profileWizard = await resolveProfileWizardArguments(selected.args, ports, handle.io);
+    if (profileWizard.kind === "cancelled") return null;
+    const roleWizard = await resolveRoleWizardArguments(profileWizard.args, ports, handle.io);
+    return roleWizard.kind === "cancelled" ? null : roleWizard.args;
   } finally {
     // The Agent process must be the only reader of stdin after Role enter.
     handle.close();
@@ -584,20 +624,92 @@ function terminalIo(): Readonly<{ io: SelectionIo; close(): void }> {
   };
 }
 
-function selectionPorts(store: FileTaskStore): SelectionPorts {
+function selectionPorts(
+  store: FileTaskStore,
+  catalogs: AgentConfigurationCatalogService
+): SelectionPorts {
   return {
-    call: (method, params) => selectionCall(store, method, params)
+    call: (method, params) => selectionCall(store, catalogs, method, params)
   };
+}
+
+async function preflightAgentConfigurationMutation(
+  commandArgs: readonly string[],
+  store: FileTaskStore,
+  catalogs: AgentConfigurationCatalogService
+): Promise<void> {
+  if (!hasModelOrEffortMutation(commandArgs)) return;
+  const agentId = configurationMutationAgentId(commandArgs, store);
+  if (agentId === undefined) return;
+  const agent = store.getConfiguredAgent(agentId);
+  if (agent === null) return;
+  await catalogs.resolve({
+    agent,
+    cwd: store.getConfig().defaultWorkspace ?? process.cwd()
+  });
+}
+
+function hasModelOrEffortMutation(args: readonly string[]): boolean {
+  const operation = args[0] === "profile"
+    || args[0] === "role"
+    || (args[0] === "task" && args[1] === "role");
+  return operation && [
+    "--model", "--effort", "--clear-model", "--clear-effort"
+  ].some((option) => args.includes(option));
+}
+
+function configurationMutationAgentId(
+  args: readonly string[],
+  store: FileTaskStore
+): string | undefined {
+  const explicit = optionValue(args, "--agent");
+  if (explicit !== undefined) return explicit;
+  if (args[0] === "profile" && args[1] === "update") {
+    return store.getAgentProfile(args[2] ?? "")?.agentId;
+  }
+  if (args[0] === "role" && args[1] === "update") {
+    return store.getGlobalRole(args[2] ?? "")?.activeAgentId;
+  }
+  if (args[0] === "task" && args[1] === "role") {
+    if (args[2] === "add") return store.getConfig().defaultAgent;
+    if (args[2] === "update") {
+      return store.getRole(args[3] ?? "", args[4] ?? "")?.activeAgentId;
+    }
+  }
+  return undefined;
+}
+
+function optionValue(args: readonly string[], option: string): string | undefined {
+  const index = args.lastIndexOf(option);
+  const value = index < 0 ? undefined : args[index + 1];
+  return typeof value === "string" && !value.startsWith("--") ? value : undefined;
 }
 
 function selectionCall(
   store: FileTaskStore,
+  catalogs: AgentConfigurationCatalogService,
   method: string,
   params: Readonly<Record<string, unknown>>
 ): unknown {
   const reader = store as unknown as Record<string, (...args: never[]) => unknown>;
   switch (method) {
     case "agent.list": return store.listConfiguredAgents();
+    case "agent.capabilities": {
+      const agent = store.getConfiguredAgent(String(params.agentId ?? ""));
+      if (agent === null) return null;
+      const configuredWorkspace = store.getConfig().defaultWorkspace;
+      const cwd = typeof params.cwd === "string" && params.cwd.length > 0
+        ? params.cwd
+        : configuredWorkspace ?? process.cwd();
+      const config = typeof params.config === "object" && params.config !== null
+        ? params.config as RoleAgentConfig
+        : undefined;
+      return catalogs.resolve({
+        agent,
+        cwd,
+        ...(config === undefined ? {} : { config })
+      });
+    }
     case "config.get": return store.getConfig();
     case "profile.list": return store.listAgentProfiles();
     case "profile.show": return store.getAgentProfile(String(params.id ?? ""));
@@ -666,7 +778,11 @@ function completionSelectionPorts(home: string): SelectionPorts {
   if (inspectStorageSchema(home).status === "uninitialized") {
     return { call: () => [] };
   }
-  return selectionPorts(readableStore(home));
+  const store = readableStore(home);
+  return selectionPorts(
+    store,
+    new AgentConfigurationCatalogService(home, { environment: process.env })
+  );
 }
 
 function emit(output: string, literal = false, data?: unknown): void {

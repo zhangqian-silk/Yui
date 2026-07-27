@@ -55,6 +55,7 @@ const PUBLIC_PATHS = [
   "agent add",
   "agent list",
   "agent show",
+  "agent capabilities",
   "agent update",
   "agent remove",
   "role",

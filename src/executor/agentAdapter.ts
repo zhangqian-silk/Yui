@@ -13,6 +13,14 @@ import {
   inspectCodexDeveloperInstructions,
   type CodexDeveloperInstructionsInspection
 } from "./codexConfigConflict.js";
+import type {
+  AgentConfigurationCatalog,
+  AgentConfigurationDiscoveryInput
+} from "./agentConfigurationCatalog.js";
+import {
+  discoverClaudeConfiguration,
+  discoverCodexConfiguration
+} from "./agentConfigurationProbe.js";
 
 export type AdvancedAgentConfig = Readonly<{ rawArgs?: readonly string[] }>;
 export type CodexAgentConfig = Readonly<{
@@ -114,6 +122,7 @@ export interface AgentAdapter<TConfig extends RoleAgentConfig = RoleAgentConfig>
   compileResume(input: ResumeInput<TConfig>): CompiledAgentLaunch;
   canonicalizeConfig(config: TConfig): TConfig;
   reservedArguments(): readonly string[];
+  discoverConfiguration(input: AgentConfigurationDiscoveryInput): Promise<AgentConfigurationCatalog>;
 }
 
 const SANDBOXES = ["read-only", "workspace-write", "danger-full-access"] as const;
@@ -130,6 +139,9 @@ abstract class BaseAdapter<TConfig extends RoleAgentConfig> implements AgentAdap
   abstract validateStructured(config: TConfig): void;
   abstract structuredArgs(config: TConfig): string[];
   abstract compileResume(input: ResumeInput<TConfig>): CompiledAgentLaunch;
+  abstract discoverConfiguration(
+    input: AgentConfigurationDiscoveryInput
+  ): Promise<AgentConfigurationCatalog>;
 
   launchContextArgs(_input: CompileInput<TConfig>): string[] {
     return [];
@@ -177,6 +189,10 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
   readonly label = "Codex";
   readonly supportedVersion = "0.144.1";
   readonly capabilities = { recover: true, interrupt: true, nativeSessionDiscovery: "runtime" } as const;
+
+  discoverConfiguration(input: AgentConfigurationDiscoveryInput): Promise<AgentConfigurationCatalog> {
+    return discoverCodexConfiguration(input);
+  }
 
   validateStructured(config: CodexAgentConfig): void {
     exact(config, ["adapterId", "model", "effort", "permission", "search", "profile",
@@ -257,6 +273,10 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
   readonly label = "Claude";
   readonly supportedVersion = "2.1.207";
   readonly capabilities = { recover: true, interrupt: true, nativeSessionDiscovery: "preallocated" } as const;
+
+  discoverConfiguration(input: AgentConfigurationDiscoveryInput): Promise<AgentConfigurationCatalog> {
+    return discoverClaudeConfiguration(input);
+  }
 
   validateStructured(config: ClaudeAgentConfig): void {
     exact(config, ["adapterId", "model", "effort", "permission", "additionalDirectories",

@@ -108,7 +108,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
           ? { trailingOptions: { "--all": "flag" as const } }
           : {})
   })),
-  ...["show", "update", "remove"].map((command): InteractionPolicy => ({
+  ...["show", "capabilities", "update", "remove"].map((command): InteractionPolicy => ({
     commandPath: ["agent", command],
     selectors: [{
       argumentIndex: 2,

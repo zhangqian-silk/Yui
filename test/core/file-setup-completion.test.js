@@ -200,10 +200,10 @@ test("setup configures selected Agents plus Leader and Operator model settings",
   assert.match(rendered, /Choose Agents by number or name/);
   assert.match(rendered, /Choose default Agent \[codex\]/);
   assert.match(rendered, /Choose Operator Agent \[codex\]/);
-  assert.match(rendered, /Leader model for codex \[CLI default\]/);
-  assert.match(rendered, /Leader reasoning effort for codex \[CLI default\]/);
-  assert.match(rendered, /Operator model for codex \[CLI default\]/);
-  assert.match(rendered, /Operator reasoning effort for codex \[CLI default\]/);
+  assert.match(rendered, /Leader Agent configuration: codex/);
+  assert.match(rendered, /Operator Agent configuration: codex/);
+  assert.match(rendered, /Select model/);
+  assert.match(rendered, /Select reasoning effort/);
   assert.match(result, /Leader model: gpt-5\.6-sol/);
   assert.match(result, /Leader reasoning effort: xhigh/);
   assert.match(result, /Operator model: gpt-5\.6-sol/);
