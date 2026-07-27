@@ -79,7 +79,8 @@ test("public catalog exposes Agent, Agent Profile, and persistent Role managemen
   const paths = listPublicCommandPaths();
   assert.ok(paths.includes("update"));
   assert.deepEqual(paths.filter((path) => path === "agent" || path.startsWith("agent ")), [
-    "agent", "agent add", "agent list", "agent show", "agent update", "agent remove"
+    "agent", "agent add", "agent list", "agent show", "agent capabilities",
+    "agent update", "agent remove"
   ]);
   assert.deepEqual(paths.filter((path) => path === "profile" || path.startsWith("profile ")), [
     "profile", "profile add", "profile list", "profile show", "profile update",

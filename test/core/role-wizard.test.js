@@ -47,6 +47,7 @@ function ports(input = {}) {
     call: async (method, params) => {
       calls.push({ method, params });
       if (method === "agent.list") return [codex, claude];
+      if (method === "agent.capabilities") return capabilityCatalog(params.agentId);
       if (method === "config.get") return { schemaVersion: 1, defaultAgent: "codex" };
       if (method === "task.list") return [
         { id: "task-1", title: "First task", status: "active" },
@@ -55,6 +56,86 @@ function ports(input = {}) {
       if (method === "role.show") return input.globalRole ?? role();
       if (method === "task.role.show") return input.taskRole ?? { ...role(), taskId: "task-1", status: "idle" };
       throw new Error(`Unexpected call: ${method}`);
+    }
+  };
+}
+
+function capabilityCatalog(agentId) {
+  const adapterId = agentId === "claude" ? "claude" : "codex";
+  return {
+    source: "live",
+    attemptedAt: "2026-07-27T08:00:00.000Z",
+    fetchedAt: "2026-07-27T08:00:00.000Z",
+    catalog: {
+      schemaVersion: 1,
+      agentId,
+      adapterId,
+      models: adapterId === "codex"
+        ? [
+            {
+              value: "gpt-5.6-sol",
+              label: "GPT-5.6 Sol",
+              isDefault: true,
+              defaultEffort: "medium",
+              efforts: [
+                { value: "medium", label: "medium" },
+                { value: "high", label: "high" }
+              ]
+            },
+            {
+              value: "gpt-5.6-terra",
+              label: "GPT-5.6 Terra",
+              isDefault: false,
+              defaultEffort: "medium",
+              efforts: [
+                { value: "medium", label: "medium" },
+                { value: "high", label: "high" }
+              ]
+            }
+          ]
+        : [{
+            value: "default",
+            label: "Default",
+            isDefault: true,
+            efforts: [
+              { value: "medium", label: "medium" },
+              { value: "high", label: "high" }
+            ]
+          }],
+      fields: [
+        {
+          key: "permission.sandbox",
+          choices: [
+            { value: "read-only", label: "read-only" },
+            { value: "workspace-write", label: "workspace-write" },
+            { value: "danger-full-access", label: "danger-full-access" }
+          ],
+          allowCustom: false
+        },
+        {
+          key: "permission.approval",
+          choices: [
+            { value: "untrusted", label: "untrusted" },
+            { value: "on-request", label: "on-request" },
+            { value: "never", label: "never" }
+          ],
+          allowCustom: false
+        },
+        {
+          key: "search",
+          choices: [{ value: "true", label: "true" }],
+          allowCustom: false
+        },
+        {
+          key: "permission.mode",
+          choices: [
+            { value: "acceptEdits", label: "acceptEdits" },
+            { value: "plan", label: "plan" }
+          ],
+          allowCustom: true
+        }
+      ],
+      warnings: []
     }
   };
 }
@@ -76,8 +157,8 @@ function io(answers, input = {}) {
   };
 }
 
-test("Role update uses a compact two-item top level and clears one Agent field", async () => {
-  const terminal = io(["2", "codex", "model", "2"]);
+test("Role update uses a compact two-item top level and clears model plus effort through the runtime picker", async () => {
+  const terminal = io(["2", "codex", "model", "default", "default"]);
   const result = await resolveRoleWizardArguments(
     ["role", "update", "reviewer"],
     ports(),
@@ -86,7 +167,10 @@ test("Role update uses a compact two-item top level and clears one Agent field",
 
   assert.deepEqual(result, {
     kind: "resolved",
-    args: ["role", "update", "reviewer", "--agent", "codex", "--clear-model"]
+    args: [
+      "role", "update", "reviewer", "--agent", "codex",
+      "--clear-model", "--clear-effort"
+    ]
   });
   assert.match(terminal.writes[0], /Role settings/);
   assert.match(terminal.writes[0], /Agent settings/);

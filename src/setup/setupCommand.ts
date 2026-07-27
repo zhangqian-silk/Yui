@@ -11,10 +11,17 @@ import {
 } from "../agent/agent.js";
 import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import type { CliIdentity } from "../cli/completion.js";
+import {
+  selectAgentModelAndEffort
+} from "../cli/agentConfigurationPicker.js";
+import type { SelectionIo } from "../cli/interactiveSelection.js";
 import type { CompletionStore } from "../completion/completionInstaller.js";
 import { runCompletionWizard } from "../completion/completionWizard.js";
 import { usageError } from "../errors/cliError.js";
 import { resolveAgentAdapter } from "../executor/agentAdapter.js";
+import {
+  AgentConfigurationCatalogService
+} from "../executor/agentConfigurationCatalog.js";
 import type { GlobalRoleSessionSet } from "../executor/agentExecutor.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { resolveTimeZone } from "../output/timePresentation.js";
@@ -115,8 +122,16 @@ export async function runSetupCommand(
     ensureYuiHome(home);
     ensureStorageSchema(home);
     const store = new FileTaskStore(home);
-
-    const result = await configureYui(store, home, env, question, io);
+    const catalogs = new AgentConfigurationCatalogService(home, { environment: env });
+    const result = await configureYui(
+      store,
+      home,
+      env,
+      question,
+      setupSelectionIo(question, io),
+      catalogs,
+      io
+    );
     const lines = [
       "Yui home initialized.",
       `Agents configured: ${result.agentIds.join(", ")}.`,
@@ -158,6 +173,8 @@ async function configureYui(
   home: string,
   env: NodeJS.ProcessEnv,
   question: SetupQuestion,
+  selectionIo: SelectionIo,
+  catalogs: AgentConfigurationCatalogService,
   io: SetupIo
 ): Promise<Readonly<{
   agentIds: readonly string[];
@@ -238,13 +255,17 @@ async function configureYui(
     "Leader",
     defaultAgent,
     store.getGlobalRole(SYSTEM_LEADER_ROLE),
-    question
+    home,
+    selectionIo,
+    catalogs
   );
   const operatorConfig = await promptRoleAgentConfig(
     "Operator",
     operatorAgent,
     store.getGlobalRole(SYSTEM_OPERATOR_ROLE),
-    question
+    home,
+    selectionIo,
+    catalogs
   );
   const suggestedWorkspace = config.defaultWorkspace?.trim()
     || join(dirname(resolve(home)), "workspace");
@@ -342,32 +363,36 @@ async function promptRoleAgentConfig(
   label: string,
   agent: ConfiguredAgent,
   existingRole: GlobalRole | null,
-  question: SetupQuestion
+  cwd: string,
+  io: SelectionIo,
+  catalogs: AgentConfigurationCatalogService
 ): Promise<RoleAgentConfig> {
   const existing = existingRole?.activeAgentId === agent.id
     ? existingRole.agentBindings[agent.id]?.config
     : undefined;
-  const model = await promptOptionalAgentSetting(
-    label,
-    "model",
-    agent.id,
-    existing?.model,
-    question
+  io.write(`\n${label} Agent configuration: ${agent.id}\n`);
+  const selection = await selectAgentModelAndEffort(
+    await catalogs.resolve({
+      agent,
+      cwd,
+      ...(existing === undefined ? {} : { config: existing })
+    }),
+    io,
+    {
+      currentModel: existing?.model,
+      currentEffort: existing?.effort
+    }
   );
-  const effort = await promptOptionalAgentSetting(
-    label,
-    "reasoning effort",
-    agent.id,
-    existing?.effort,
-    question
-  );
+  if (selection.kind === "cancelled") {
+    throw usageError(`${label} Agent configuration was cancelled.`);
+  }
   const candidate = structuredClone(
     existing ?? { adapterId: agent.adapterId }
   ) as unknown as Record<string, unknown>;
-  if (model === undefined) delete candidate.model;
-  else candidate.model = model;
-  if (effort === undefined) delete candidate.effort;
-  else candidate.effort = effort;
+  if (selection.model === undefined) delete candidate.model;
+  else candidate.model = selection.model;
+  if (selection.effort === undefined) delete candidate.effort;
+  else candidate.effort = selection.effort;
   try {
     return resolveAgentAdapter(agent.adapterId).canonicalizeConfig(
       candidate as RoleAgentConfig
@@ -375,21 +400,6 @@ async function promptRoleAgentConfig(
   } catch (error) {
     throw usageError(error instanceof Error ? error.message : String(error));
   }
-}
-
-async function promptOptionalAgentSetting(
-  label: string,
-  setting: string,
-  agentId: string,
-  current: string | undefined,
-  question: SetupQuestion
-): Promise<string | undefined> {
-  const clearHint = current === undefined ? "" : ' (or "default" for CLI default)';
-  const answer = (await question(
-    `${label} ${setting} for ${agentId} [${current ?? "CLI default"}]${clearHint}: `
-  )).trim();
-  if (answer.length === 0) return current;
-  return answer.toLowerCase() === "default" ? undefined : answer;
 }
 
 function availableAgentChoices(
@@ -407,6 +417,19 @@ function availableAgentChoices(
       command
     }];
   });
+}
+
+function setupSelectionIo(
+  question: SetupQuestion,
+  io: InteractiveSetupIo
+): SelectionIo {
+  return {
+    interactive: true,
+    json: false,
+    width: tableWidth(io),
+    write: (value) => { io.output.write(value); },
+    question
+  };
 }
 
 function prepareAgent(

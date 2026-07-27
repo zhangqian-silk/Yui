@@ -118,6 +118,11 @@ const agentChildren: readonly NodeInput[] = [
   { name: "list", summary: "List configured Agents." },
   { name: "show", summary: "Show one configured Agent.", usage: "yui agent show <id>" },
   {
+    name: "capabilities",
+    summary: "Probe one Agent CLI for runtime configuration options.",
+    usage: "yui agent capabilities <id>"
+  },
+  {
     name: "update",
     summary: "Update a configured Agent.",
     usage: "yui agent update <id> [--adapter <adapter>] [--command <command>] [--arg <arg> ... | --clear-args] [--env TARGET=PROCESS_NAME ... | --clear-env]",
@@ -704,7 +709,7 @@ export const ROOT_COMMAND = buildNode({
       name: "agent",
       summary: "Manage configured native Agent CLIs.",
       sections: [
-        { id: "inspect", title: "Inspect", entries: ["list", "show"] },
+        { id: "inspect", title: "Inspect", entries: ["list", "show", "capabilities"] },
         { id: "manage", title: "Manage", entries: ["add", "update", "remove"] }
       ],
       children: agentChildren

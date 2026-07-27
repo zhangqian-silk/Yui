@@ -1,4 +1,12 @@
 import { renderTable, type TableColumn } from "../output/table.js";
+import type {
+  AgentConfigurationCatalog,
+  ResolvedAgentConfigurationCatalog
+} from "../executor/agentConfigurationCatalog.js";
+import {
+  selectAgentEffort,
+  selectAgentModelAndEffort
+} from "./agentConfigurationPicker.js";
 import type { SelectionIo } from "./interactiveSelection.js";
 import type { SelectionPorts } from "./selectionPorts.js";
 
@@ -230,7 +238,7 @@ async function configureRoleCreation(
   if (section === undefined) return { kind: "cancelled", args };
   return section === "role"
     ? configureNewRoleField(args, agent, ports, io, taskRole)
-    : configureNewAgentField(args, agent, io);
+    : configureNewAgentField(args, agent, ports, io);
 }
 
 async function configureNewRoleField(
@@ -276,13 +284,16 @@ async function configureNewRoleField(
 async function configureNewAgentField(
   args: string[],
   agent: AgentChoice,
+  ports: SelectionPorts,
   io: SelectionIo
 ): Promise<RoleWizardResolution> {
-  const fields = agentFields({
+  const binding = {
     agentId: agent.id,
     adapterId: agent.adapterId,
     config: { adapterId: agent.adapterId }
-  });
+  };
+  const resolved = await loadAgentCatalog(ports, binding);
+  const fields = agentFields(binding, resolved?.catalog);
   const field = await choose(
     `Agent settings: ${agent.id}`,
     fields.map((candidate) => ({ value: candidate.value, cells: [candidate.label, "CLI default"] })),
@@ -293,6 +304,23 @@ async function configureNewAgentField(
   );
   const selected = fields.find((candidate) => candidate.value === field);
   if (selected === undefined) return { kind: "cancelled", args };
+  if (selected.value === "model") {
+    if (resolved === undefined) return { kind: "cancelled", args };
+    const selection = await selectAgentModelAndEffort(resolved, io, {});
+    return selection.kind === "cancelled"
+      ? { kind: "cancelled", args }
+      : { kind: "resolved", args: appendModelEffortPatch(args, selection, false) };
+  }
+  if (selected.value === "effort") {
+    if (resolved === undefined) return { kind: "cancelled", args };
+    const selection = await selectAgentEffort(resolved, io, {});
+    return selection.kind === "cancelled"
+      ? { kind: "cancelled", args }
+      : {
+          kind: "resolved",
+          args: selection.effort === undefined ? args : [...args, "--effort", selection.effort]
+        };
+  }
   const value = await promptAgentFieldValue(selected, io);
   return value === undefined
     ? { kind: "cancelled", args }
@@ -333,7 +361,7 @@ async function updateRole(
   if (section === undefined) return { kind: "cancelled", args };
   return section === "role"
     ? updateRoleSettings(args, role, ports, io, taskRole)
-    : updateAgentSettings(args, role, io);
+    : updateAgentSettings(args, role, ports, io);
 }
 
 async function settingsSection(
@@ -446,6 +474,7 @@ async function setProfileField(
 async function updateAgentSettings(
   args: string[],
   role: RoleView,
+  ports: SelectionPorts,
   io: SelectionIo
 ): Promise<RoleWizardResolution> {
   const bindings = Object.values(role.agentBindings);
@@ -468,7 +497,8 @@ async function updateAgentSettings(
   const binding = role.agentBindings[selectedId];
   if (binding === undefined) return { kind: "cancelled", args };
 
-  const fields = agentFields(binding);
+  const resolved = await loadAgentCatalog(ports, binding, role.workspace);
+  const fields = agentFields(binding, resolved?.catalog);
   const field = await choose(
     `Agent settings: ${binding.agentId}`,
     [
@@ -492,6 +522,40 @@ async function updateAgentSettings(
   }
   const selectedField = fields.find((candidate) => candidate.value === field);
   if (selectedField === undefined) return { kind: "cancelled", args };
+  if (selectedField.value === "model") {
+    if (resolved === undefined) return { kind: "cancelled", args };
+    const selection = await selectAgentModelAndEffort(resolved, io, {
+      currentModel: stringField(binding.config, "model"),
+      currentEffort: stringField(binding.config, "effort")
+    });
+    return selection.kind === "cancelled"
+      ? { kind: "cancelled", args }
+      : {
+          kind: "resolved",
+          args: appendModelEffortPatch(
+            [...args, "--agent", binding.agentId],
+            selection,
+            true
+          )
+        };
+  }
+  if (selectedField.value === "effort") {
+    if (resolved === undefined) return { kind: "cancelled", args };
+    const selection = await selectAgentEffort(resolved, io, {
+      model: stringField(binding.config, "model"),
+      currentEffort: stringField(binding.config, "effort")
+    });
+    if (selection.kind === "cancelled") return { kind: "cancelled", args };
+    return {
+      kind: "resolved",
+      args: [
+        ...args,
+        "--agent", binding.agentId,
+        ...(selection.effort === undefined
+          ? ["--clear-effort"] : ["--effort", selection.effort])
+      ]
+    };
+  }
 
   const action = await choose(
     `Update ${selectedField.label}`,
@@ -529,21 +593,26 @@ type AgentField = Readonly<{
   choices?: readonly string[];
 }>;
 
-function agentFields(binding: RoleBinding): AgentField[] {
+function agentFields(
+  binding: RoleBinding,
+  catalog?: AgentConfigurationCatalog
+): AgentField[] {
   const config = binding.config;
   const permission = entity(config.permission) ?? {};
   return [
     agentField("model", "Model", config.model, "--model", "--clear-model"),
     agentField("effort", "Effort", config.effort, "--effort", "--clear-effort"),
     ...(binding.adapterId === "codex" ? [
-      agentField("sandbox", "Sandbox", permission.sandbox, "--sandbox", "--clear-sandbox", [
-        "read-only", "workspace-write", "danger-full-access"
-      ]),
-      agentField("approval", "Approval", permission.approval, "--approval", "--clear-approval", [
-        "untrusted", "on-request", "never"
-      ]),
+      agentField("sandbox", "Sandbox", permission.sandbox, "--sandbox", "--clear-sandbox",
+        catalogChoices(catalog, "permission.sandbox", [
+          "read-only", "workspace-write", "danger-full-access"
+        ])),
+      agentField("approval", "Approval", permission.approval, "--approval", "--clear-approval",
+        catalogChoices(catalog, "permission.approval", [
+          "untrusted", "on-request", "never"
+        ])),
       agentField("search", "Web search", config.search, "--search", "--clear-search", [
-        "true"
+        ...catalogChoices(catalog, "search", ["true"])
       ])
     ] : []),
     ...(binding.adapterId === "claude" ? [
@@ -552,9 +621,53 @@ function agentFields(binding: RoleBinding): AgentField[] {
         "Permission mode",
         permission.mode,
         "--permission-mode",
-        "--clear-permission-mode"
+        "--clear-permission-mode",
+        catalogChoices(catalog, "permission.mode")
       )
     ] : [])
+  ];
+}
+
+async function loadAgentCatalog(
+  ports: SelectionPorts,
+  binding: RoleBinding,
+  cwd?: string
+): Promise<ResolvedAgentConfigurationCatalog | undefined> {
+  const value = await ports.call("agent.capabilities", {
+    agentId: binding.agentId,
+    config: binding.config,
+    ...(cwd === undefined ? {} : { cwd })
+  });
+  const input = entity(value);
+  return input !== undefined
+    && (input.source === "live" || input.source === "cache" || input.source === "fallback")
+    && entity(input.catalog) !== undefined
+    ? value as ResolvedAgentConfigurationCatalog
+    : undefined;
+}
+
+function catalogChoices(
+  catalog: AgentConfigurationCatalog | undefined,
+  key: string,
+  fallback: readonly string[] = []
+): string[] {
+  const field = catalog?.fields.find((candidate) => candidate.key === key);
+  return field === undefined ? [...fallback] : field.choices.map(({ value }) => value);
+}
+
+function appendModelEffortPatch(
+  args: string[],
+  selection: Readonly<{ model: string | undefined; effort: string | undefined }>,
+  update: boolean
+): string[] {
+  return [
+    ...args,
+    ...(selection.model === undefined
+      ? update ? ["--clear-model"] : []
+      : ["--model", selection.model]),
+    ...(selection.effort === undefined
+      ? update ? ["--clear-effort"] : []
+      : ["--effort", selection.effort])
   ];
 }
 

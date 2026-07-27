@@ -21,9 +21,11 @@ yui setup
 yui doctor
 ```
 
-`setup` is interactive. It detects installed Agent CLIs, asks which Agents to configure, selects the default and Operator Agent, configures the model and reasoning effort for the Leader and Operator Roles, confirms the Project workspace outside Yui home, and offers shell-completion setup. Leave a model or effort answer empty to keep its current value; enter `default` to follow the native CLI default. Running setup again preserves existing Tasks, Roles, and the installation's Project workspace while allowing safe configuration changes.
+`setup` is interactive. It detects installed Agent CLIs, asks which Agents to configure, selects the default and Operator Agent, probes each selected CLI for its current models, then selects model followed by that model's supported reasoning efforts for the Leader and Operator Roles. It also confirms the Project workspace outside Yui home and offers shell-completion setup. The picker includes the native CLI default and a custom-value option. Running setup again preserves existing Tasks, Roles, and the installation's Project workspace while allowing safe configuration changes.
 
-Model and effort are Role settings, so Leader and Operator can use different values even when both use the same Agent CLI. Configure other Roles with `--model` and `--effort` on `role add`, `role update`, `task role add`, or `task role update`.
+Model and effort are Role settings, so Leader and Operator can use different values even when both use the same Agent CLI. The same runtime picker is used by interactive Role and Agent Profile add/update flows. Explicit `--model` and `--effort` values remain scriptable custom overrides.
+
+Runtime catalogs are refreshed per command and cached under Yui home. If a live probe times out or fails, Yui shows the last cache for the same Agent launch context and clearly marks it as potentially stale; without a matching cache, it offers CLI defaults and custom values. `yui agent capabilities <id>` exposes the same one-pass catalog, including models, model-specific efforts, and other runtime choices such as permissions, search availability, profiles, settings sources, and service tiers.
 
 `completion` is also interactive, with or without an explicit shell:
 
@@ -274,7 +276,7 @@ The restored management surface includes:
 
 ```sh
 yui update
-yui agent add|list|show|update|remove
+yui agent add|list|show|capabilities|update|remove
 yui role add|list|show|update|remove|bind|enter
 yui role session record|replace
 yui project add|clone|update|discover|list|show|knowledge
