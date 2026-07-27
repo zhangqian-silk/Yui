@@ -55,6 +55,34 @@ export interface GitWorkspacePort {
     roleName: string;
     deleteBranch?: boolean;
   }>): Promise<GitWorkspaceRemoval>;
+  ensureAttemptWorktree(input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    taskId: string;
+    attemptId: string;
+    baseRef: string;
+  }>): Promise<PreparedGitWorktree>;
+  ensureIntegrationWorktree(input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    taskId: string;
+    integrationId: string;
+    baseRef: string;
+  }>): Promise<PreparedGitWorktree>;
+  removeAttemptWorktree(input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    taskId: string;
+    attemptId: string;
+    expectedBaseCommit?: string;
+    allowCommittedChanges?: boolean;
+  }>): Promise<GitWorkspaceRemoval>;
+  removeIntegrationWorktree(input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    taskId: string;
+    integrationId: string;
+  }>): Promise<GitWorkspaceRemoval>;
 }
 
 /** The small Git boundary used by project registration and Task workspaces. */
@@ -152,8 +180,52 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     roleName: string;
     baseRef: string;
   }>): Promise<PreparedGitWorktree> {
+    return this.#ensureManagedWorktree({
+      repositoryPath: input.repositoryPath,
+      container: input.container,
+      identity: worktreeIdentity(input.taskId, input.roleName),
+      baseRef: input.baseRef
+    });
+  }
+
+  async ensureAttemptWorktree(input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    taskId: string;
+    attemptId: string;
+    baseRef: string;
+  }>): Promise<PreparedGitWorktree> {
+    return this.#ensureManagedWorktree({
+      repositoryPath: input.repositoryPath,
+      container: input.container,
+      identity: attemptWorktreeIdentity(input.taskId, input.attemptId),
+      baseRef: input.baseRef
+    });
+  }
+
+  async ensureIntegrationWorktree(input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    taskId: string;
+    integrationId: string;
+    baseRef: string;
+  }>): Promise<PreparedGitWorktree> {
+    return this.#ensureManagedWorktree({
+      repositoryPath: input.repositoryPath,
+      container: input.container,
+      identity: integrationWorktreeIdentity(input.taskId, input.integrationId),
+      baseRef: input.baseRef
+    });
+  }
+
+  async #ensureManagedWorktree(input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    identity: Readonly<{ directory: string; branch: string }>;
+    baseRef: string;
+  }>): Promise<PreparedGitWorktree> {
     const container = await canonicalContainer(input.container, true);
-    const identity = worktreeIdentity(input.taskId, input.roleName);
+    const identity = input.identity;
     const path = managedPath(container, identity.directory);
     const kind = await pathKind(path);
     if (kind === "symlink") throw new Error("Managed worktree path must not be a symbolic link.");
@@ -240,6 +312,78 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     const porcelain = await git(["-C", path, "status", "--porcelain=v1", "--untracked-files=all"]);
     return porcelain.length > 0 ? "dirty" : "clean";
   }
+
+  async removeAttemptWorktree(input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    taskId: string;
+    attemptId: string;
+    expectedBaseCommit?: string;
+    allowCommittedChanges?: boolean;
+  }>): Promise<GitWorkspaceRemoval> {
+    return this.#removeManagedWorktree({
+      repositoryPath: input.repositoryPath,
+      container: input.container,
+      identity: attemptWorktreeIdentity(input.taskId, input.attemptId),
+      ...(input.expectedBaseCommit === undefined
+        ? {}
+        : { expectedBaseCommit: input.expectedBaseCommit }),
+      allowCommittedChanges: input.allowCommittedChanges ?? false
+    });
+  }
+
+  async removeIntegrationWorktree(input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    taskId: string;
+    integrationId: string;
+  }>): Promise<GitWorkspaceRemoval> {
+    return this.#removeManagedWorktree({
+      repositoryPath: input.repositoryPath,
+      container: input.container,
+      identity: integrationWorktreeIdentity(input.taskId, input.integrationId)
+    });
+  }
+
+  async #removeManagedWorktree(input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    identity: Readonly<{ directory: string; branch: string }>;
+    expectedBaseCommit?: string;
+    allowCommittedChanges?: boolean;
+  }>): Promise<GitWorkspaceRemoval> {
+    const container = resolve(input.container);
+    const path = managedPath(container, input.identity.directory);
+    const kind = await pathKind(path);
+    if (kind === "symlink") throw new Error("Managed worktree path must not be a symbolic link.");
+    const repository = await this.inspect(input.repositoryPath);
+    if (kind === "directory") {
+      const canonicalContainerPath = await canonicalContainer(container, false);
+      await assertOwnedWorktree(repository, canonicalContainerPath, path);
+      await assertExpectedBranch(path, input.identity.branch);
+      const porcelain = await git([
+        "-C", path, "status", "--porcelain=v1", "--untracked-files=all"
+      ]);
+      if (porcelain.length > 0) return "dirty";
+      if (
+        input.expectedBaseCommit !== undefined
+        && input.allowCommittedChanges !== true
+      ) {
+        const head = await gitLine([
+          "-C", path, "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"
+        ]);
+        if (head.toLowerCase() !== input.expectedBaseCommit.toLowerCase()) return "dirty";
+      }
+      await git(["-C", repository.root, "worktree", "remove", "--", path]);
+    }
+    const branchRef = `refs/heads/${input.identity.branch}`;
+    if (await gitSucceeds([
+      "-C", repository.root, "show-ref", "--verify", "--quiet", branchRef
+    ])) {
+      await git(["-C", repository.root, "branch", "-D", "--", input.identity.branch]);
+    }
+    return kind === "directory" ? "removed" : "missing";
+  }
 }
 
 async function deleteBranchIfPresent(repositoryRoot: string, branch: string): Promise<void> {
@@ -259,6 +403,30 @@ export function worktreeIdentity(
   return {
     directory: join(taskKey, roleKey),
     branch: `yui/${gitRefSegment(taskKey)}/${gitRefSegment(roleKey)}`
+  };
+}
+
+export function attemptWorktreeIdentity(
+  taskId: string,
+  attemptId: string
+): Readonly<{ directory: string; branch: string }> {
+  const taskKey = safeIdentity(taskId, "Task id");
+  const attemptKey = safeIdentity(attemptId, "Execution Attempt id");
+  return {
+    directory: join(taskKey, "attempts", attemptKey),
+    branch: `yui/${gitRefSegment(taskKey)}/attempt/${gitRefSegment(attemptKey)}`
+  };
+}
+
+export function integrationWorktreeIdentity(
+  taskId: string,
+  integrationId: string
+): Readonly<{ directory: string; branch: string }> {
+  const taskKey = safeIdentity(taskId, "Task id");
+  const integrationKey = safeIdentity(integrationId, "Integration Attempt id");
+  return {
+    directory: join(taskKey, "integrations", integrationKey),
+    branch: `yui/${gitRefSegment(taskKey)}/integration/${gitRefSegment(integrationKey)}`
   };
 }
 

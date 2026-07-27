@@ -57,13 +57,24 @@ export function roleOptionSpecs(input: Readonly<{
   update: boolean;
   includeAgent?: boolean;
   includeWorkspace?: boolean;
+  agentOptions?: "all" | "execution";
 }>): ReadonlyMap<string, RoleOptionKind> {
+  const agentValueOptions = input.agentOptions === "execution"
+    ? AGENT_VALUE_OPTIONS.filter(([option]) => option === "--model" || option === "--effort")
+    : AGENT_VALUE_OPTIONS;
+  const agentClearOptions = input.agentOptions === "execution"
+    ? AGENT_CLEAR_OPTIONS.filter(([option]) => (
+        option === "--clear-model"
+        || option === "--clear-effort"
+        || option === "--clear-agent-config"
+      ))
+    : AGENT_CLEAR_OPTIONS;
   return new Map<string, RoleOptionKind>([
     ...(input.includeAgent === true ? [["--agent", "value"] as const] : []),
     ...(input.includeWorkspace === true ? [["--workspace", "value"] as const] : []),
     ...PROFILE_OPTIONS,
-    ...AGENT_VALUE_OPTIONS,
-    ...(input.update ? [...PROFILE_CLEAR_OPTIONS, ...AGENT_CLEAR_OPTIONS] : [])
+    ...agentValueOptions,
+    ...(input.update ? [...PROFILE_CLEAR_OPTIONS, ...agentClearOptions] : [])
   ]);
 }
 

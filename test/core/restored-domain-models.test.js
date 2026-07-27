@@ -18,6 +18,7 @@ import {
 import { activateTask, archiveTask, createTask } from "../../dist/task/task.js";
 import {
   createWorkItem,
+  recordWorkItemWorkspaceDisposition,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { createTaskMessage } from "../../dist/message/message.js";
@@ -160,7 +161,7 @@ test("restored persistent domain records are plain JSON with explicit schema ver
 
   assert.equal(snapshot.task.schemaVersion, 1);
   assert.equal(snapshot.task.status, "draft");
-  assert.equal(snapshot.workItem.schemaVersion, 1);
+  assert.equal(snapshot.workItem.schemaVersion, 2);
   assert.equal(snapshot.yielded.schemaVersion, 1);
   assert.equal(snapshot.yielded.status, "yielded");
   assert.equal(snapshot.yielded.endedAt, later.toISOString());
@@ -188,12 +189,27 @@ test("terminal WorkItems cannot be reopened", () => {
     { title: "Implement", assignee: "worker" },
     now
   );
-  const completed = updateWorkItemStatus(pending, "completed", "Implemented.", later);
+  const completed = updateWorkItemStatus(pending, "completed", later, "Implemented.");
 
   assert.throws(
-    () => updateWorkItemStatus(completed, "pending", undefined, later),
+    () => updateWorkItemStatus(completed, "pending", later),
     /terminal/i
   );
+});
+
+test("updating a terminal WorkItem outcome preserves its workspace disposition", () => {
+  const completed = updateWorkItemStatus(createWorkItem(
+    "work-1",
+    "task-1",
+    { title: "Implement", assignee: "worker" },
+    now
+  ), "completed", later, "Implemented.");
+  const disposed = recordWorkItemWorkspaceDisposition(completed, "integrated", later);
+  const corrected = updateWorkItemStatus(disposed, "completed", later, "Implemented and tested.");
+
+  assert.equal(corrected.outcome, "Implemented and tested.");
+  assert.equal(corrected.workspaceDisposition, "integrated");
+  assert.equal(corrected.endedAt, completed.endedAt);
 });
 
 test("TaskMessage represents user, operator, and Role result authors structurally", () => {

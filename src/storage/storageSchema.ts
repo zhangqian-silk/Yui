@@ -3,11 +3,9 @@ import { join } from "node:path";
 import { writeTextFileAtomically } from "./durableFile.js";
 
 /** Version of the on-disk layout (`schema.json`, root `state.json`, and locks). */
-export const CURRENT_STORAGE_LAYOUT_VERSION = 5;
+export const CURRENT_STORAGE_LAYOUT_VERSION = 6;
 /** Version of the authoritative aggregate stored in `state.json`. */
-export const CURRENT_AGGREGATE_SCHEMA_VERSION = 4;
-/** @deprecated Use CURRENT_STORAGE_LAYOUT_VERSION for new code. */
-export const CURRENT_STORAGE_SCHEMA_VERSION = CURRENT_STORAGE_LAYOUT_VERSION;
+export const CURRENT_AGGREGATE_SCHEMA_VERSION = 6;
 export const STORAGE_SCHEMA_FILE = "schema.json";
 
 export type StorageSchemaManifest = Readonly<{
@@ -16,30 +14,8 @@ export type StorageSchemaManifest = Readonly<{
   /** On-disk layout version. This is not a domain-record schema version. */
   storageVersion: number;
   aggregateSchemaVersion: number;
-  /** Reserved for a later layout that atomically switches immutable generations. */
-  activeGeneration?: null;
   updatedAt: string;
 }>;
-
-export type StorageMigration = Readonly<{
-  fromVersion: number;
-  toVersion: number;
-  migrate(rootDir: string): void;
-}>;
-
-export type AggregateMigration<T = unknown> = Readonly<{
-  fromVersion: number;
-  toVersion: number;
-  migrate(state: T): T;
-}>;
-
-/**
- * The dispatcher is intentionally present from the first v5 release. There
- * are no v4-to-v5 migrations: v5 is a fresh authoritative storage contract.
- */
-export const STORAGE_MIGRATIONS: readonly StorageMigration[] = Object.freeze([]);
-/** No historical aggregate is supported by this development release yet. */
-export const AGGREGATE_MIGRATIONS: readonly AggregateMigration[] = Object.freeze([]);
 
 export type StorageSchemaState =
   | Readonly<{
@@ -57,7 +33,6 @@ export type StorageSchemaState =
       latestLayoutVersion: number;
       currentAggregateSchemaVersion: number;
       latestAggregateSchemaVersion: number;
-      activeGeneration: null;
       manifestPath: string;
     }>
   | Readonly<{
@@ -85,8 +60,7 @@ export class StorageSchemaError extends Error {
   readonly code:
     | "STORAGE_UNINITIALIZED"
     | "STORAGE_SCHEMA_INVALID"
-    | "STORAGE_SCHEMA_UNSUPPORTED"
-    | "STORAGE_MIGRATION_INVALID";
+    | "STORAGE_SCHEMA_UNSUPPORTED";
 
   constructor(
     code: StorageSchemaError["code"],
@@ -152,7 +126,6 @@ export function inspectStorageSchema(rootDir: string): StorageSchemaState {
       latestLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
       currentAggregateSchemaVersion: manifest.aggregateSchemaVersion,
       latestAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-      activeGeneration: manifest.activeGeneration,
       manifestPath
     };
   } catch (error) {
@@ -180,89 +153,11 @@ export function requireStorageSchema(rootDir: string): void {
   requireInspectedSchema(inspectStorageSchema(rootDir));
 }
 
-export function dispatchStorageMigrations(
-  rootDir: string,
-  fromVersion: number,
-  targetVersion = CURRENT_STORAGE_LAYOUT_VERSION,
-  migrations: readonly StorageMigration[] = STORAGE_MIGRATIONS
-): void {
-  assertLayoutVersion(fromVersion, "Migration source");
-  assertLayoutVersion(targetVersion, "Migration target");
-  if (fromVersion > targetVersion) {
-    throw unsupportedVersion(fromVersion, targetVersion, "layout");
-  }
-
-  // Build and validate the complete plan before invoking any filesystem mutation.
-  const bySource = new Map<number, StorageMigration>();
-  for (const migration of migrations) {
-    assertLayoutVersion(migration.fromVersion, "Migration fromVersion");
-    assertLayoutVersion(migration.toVersion, "Migration toVersion");
-    if (migration.toVersion !== migration.fromVersion + 1) {
-      throw invalidMigration(
-        `Migration ${migration.fromVersion}->${migration.toVersion} must advance exactly one layout version.`
-      );
-    }
-    if (bySource.has(migration.fromVersion)) {
-      throw invalidMigration(`Duplicate migration from layout version ${migration.fromVersion}.`);
-    }
-    bySource.set(migration.fromVersion, migration);
-  }
-
-  const plan: StorageMigration[] = [];
-  for (let current = fromVersion; current < targetVersion; current += 1) {
-    const migration = bySource.get(current);
-    if (migration === undefined || migration.toVersion !== current + 1) {
-      throw unsupportedVersion(current, targetVersion, "layout");
-    }
-    plan.push(migration);
-  }
-  for (const migration of plan) migration.migrate(rootDir);
-}
-
-export function dispatchAggregateMigrations<T>(
-  state: T,
-  fromVersion: number,
-  targetVersion = CURRENT_AGGREGATE_SCHEMA_VERSION,
-  migrations: readonly AggregateMigration<T>[] = AGGREGATE_MIGRATIONS as readonly AggregateMigration<T>[]
-): T {
-  assertLayoutVersion(fromVersion, "Aggregate migration source");
-  assertLayoutVersion(targetVersion, "Aggregate migration target");
-  if (fromVersion > targetVersion) {
-    throw unsupportedVersion(fromVersion, targetVersion, "aggregate");
-  }
-
-  const bySource = new Map<number, AggregateMigration<T>>();
-  for (const migration of migrations) {
-    assertLayoutVersion(migration.fromVersion, "Aggregate migration fromVersion");
-    assertLayoutVersion(migration.toVersion, "Aggregate migration toVersion");
-    if (migration.toVersion !== migration.fromVersion + 1) {
-      throw invalidMigration(
-        `Aggregate migration ${migration.fromVersion}->${migration.toVersion} must advance exactly one schema version.`
-      );
-    }
-    if (bySource.has(migration.fromVersion)) {
-      throw invalidMigration(`Duplicate migration from aggregate schema version ${migration.fromVersion}.`);
-    }
-    bySource.set(migration.fromVersion, migration);
-  }
-
-  const plan: AggregateMigration<T>[] = [];
-  for (let current = fromVersion; current < targetVersion; current += 1) {
-    const migration = bySource.get(current);
-    if (migration === undefined || migration.toVersion !== current + 1) {
-      throw unsupportedVersion(current, targetVersion, "aggregate");
-    }
-    plan.push(migration);
-  }
-  return plan.reduce((current, migration) => migration.migrate(current), state);
-}
-
 function writeStorageManifest(rootDir: string, now: Date): void {
   const manifest: StorageSchemaManifest = {
     schemaVersion: 1,
     storageVersion: CURRENT_STORAGE_LAYOUT_VERSION,
     aggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-    activeGeneration: null,
     updatedAt: now.toISOString()
   };
   writeTextFileAtomically(
@@ -316,7 +211,6 @@ type ParsedStorageManifest = Readonly<{
   schemaVersion: 1;
   storageVersion: number;
   aggregateSchemaVersion: number;
-  activeGeneration: null;
   updatedAt: string;
 }>;
 
@@ -325,7 +219,7 @@ function parseStorageManifest(raw: string): ParsedStorageManifest {
   assertKeys(
     value,
     ["schemaVersion", "storageVersion", "aggregateSchemaVersion", "updatedAt"],
-    ["activeGeneration"],
+    [],
     "Storage schema manifest"
   );
   if (value.schemaVersion !== 1) throw new Error("schemaVersion must be 1");
@@ -336,12 +230,6 @@ function parseStorageManifest(raw: string): ParsedStorageManifest {
   if (!Number.isInteger(aggregateSchemaVersion) || (aggregateSchemaVersion as number) < 1) {
     throw new Error("aggregateSchemaVersion must be a positive integer");
   }
-  const activeGeneration = value.activeGeneration ?? null;
-  if (activeGeneration !== null) {
-    throw new Error(
-      `activeGeneration is not supported by storage layout ${String(value.storageVersion)}`
-    );
-  }
   if (typeof value.updatedAt !== "string" || !Number.isFinite(Date.parse(value.updatedAt))) {
     throw new Error("updatedAt must be an ISO timestamp");
   }
@@ -349,7 +237,6 @@ function parseStorageManifest(raw: string): ParsedStorageManifest {
     schemaVersion: 1,
     storageVersion: value.storageVersion as number,
     aggregateSchemaVersion: aggregateSchemaVersion as number,
-    activeGeneration,
     updatedAt: value.updatedAt
   };
 }
@@ -378,15 +265,6 @@ function assertKeys(
   if (missing.length > 0) throw new Error(`${label} is missing field: ${missing[0]}`);
 }
 
-function assertLayoutVersion(version: number, label: string): void {
-  if (!Number.isInteger(version) || version < 1) {
-    throw invalidMigration(`${label} must be a positive integer.`);
-  }
-}
-
-function invalidMigration(message: string): StorageSchemaError {
-  return new StorageSchemaError("STORAGE_MIGRATION_INVALID", message);
-}
 
 function readOptionalText(path: string): string | null {
   try {

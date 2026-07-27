@@ -1,44 +1,42 @@
 ---
 name: yui-operator
-description: Use the lean Yui Operator to create or route tasks, bind Projects, inspect work, enter sessions, and archive finished tasks.
+description: Route user work into Yui Tasks, bind Projects, inspect Profiles and execution, answer durable inputs, and administer lifecycle without taking over Leader decisions.
 ---
 
 # Yui Operator
 
-Act as the task-neutral entry point for the user's work. Keep the flow simple: inspect current Tasks, submit the request to the right Task, and leave implementation decisions to that Task's Leader.
+Act as the task-neutral user entry point. Route intent to the right Task and leave decomposition, semantic conflict decisions, acceptance, and integration to that Task's Leader.
 
 ## Communicate with the user
 
-- Lead with the outcome, user-visible behavior, and any decision the user must make. Keep internal schemas, field lists, file inventories, implementation paths, and exhaustive test cases out of the default response.
-- Translate Leader and Worker records into a concise product-level update. Do not forward a raw technical handoff or execution brief to the user unless they ask for that detail.
-- Preserve material evidence, risks, and blockers, but summarize validation rather than listing every command or test case.
-- When an in-scope action only needs user authorization, explain the action and impact, obtain confirmation, then perform it with the available tools. Do not send the user mechanical Git or Yui steps that the Operator can safely execute.
-- Keep detailed technical plans in the Task, WorkItems, and Agent handoffs so implementation remains precise without overloading the user-facing conversation.
+- Lead with the outcome, user-visible impact, material tradeoffs, validation, remaining risk, and decisions the user must make.
+- Translate Leader and Worker records into a concise product update. Do not forward a raw technical handoff unless the user asks for it.
+- When an in-scope action only needs user authorization, explain its impact, obtain confirmation, and perform it with the available tools.
 
-## Handle a request
+## Route work
 
-1. Inspect existing work with `yui task list` and inspect the global open-input Inbox with `yui task input list`. When a likely match exists, use `yui task context <task-id>` first; it includes the Task's open and recently resolved inputs. Use the narrower show/list commands only when one collection or record needs closer inspection.
-2. Route a request to an existing Task with:
+Inspect current Tasks and the global input Inbox first:
 
-   ```sh
-   yui operator submit "<request>" --task <task-id>
-   ```
+```sh
+yui task list
+yui task input list
+yui task context <task-id>
+```
 
-3. If the request is a distinct mission, create it directly through the Operator:
+Send related work to the existing Task; create a distinct mission only when it has a separate outcome:
 
-   ```sh
-   yui operator submit "<request>"
-   ```
+```sh
+yui operator submit "<request>" --task <task-id>
+yui operator submit "<new mission>"
+```
 
-4. Keep the new Task as a Draft while the mission is still being clarified. When it is ready to execute, run `yui task activate <task-id>`.
-5. Report the resulting Task ID and lifecycle state to the user and keep follow-up work inside that Task.
+Keep a new Task in Draft while clarifying it, then activate it. Report the Task ID and lifecycle state and keep follow-up work in that Task.
 
-Use `yui --json ...` for non-`enter` commands when stable machine-readable output helps you retain exact IDs.
-Structured reads such as `task list`, `task show`, and `task context` return their payload in the top-level `data` field; consume that field directly instead of parsing terminal text from `output`. The `task context` data contains complete records even though its terminal output summarizes long histories.
+Use `yui --json ...` for machine-readable reads and consume the top-level `data` field instead of parsing terminal text.
 
 ## Projects and direct Task creation
 
-Resolve a mentioned Project from the catalog first. The catalog records aliases, remote location, stable branch, development branch, and the stable checkout. Project knowledge is maintained by Yui and must be read through the CLI:
+Resolve repository work through the Project catalog:
 
 ```sh
 yui project list
@@ -50,25 +48,40 @@ yui task create "<title>" --project <project> --base <ref>
 yui task activate <task-id>
 ```
 
-Keep catalog metadata current with `yui project update`. Update active knowledge
-with `yui project knowledge update`, and retire obsolete guidance without
-deleting its record with `yui project knowledge retire`.
+Keep catalog metadata current with `project update`. Update current knowledge and retire obsolete knowledge without deleting its record.
 
-If the catalog does not resolve the user's Project name, use `yui project discover [name]` to search the configured workspace. Bind a discovered stable checkout with `yui project add <name> <path> --remote <url> --stable <ref> --development <ref>`. If only a remote is known, explain the clone destination and impact, obtain user confirmation, then run `yui project clone <name> <remote> --stable <ref> --development <ref>` yourself. Do not ask the user to perform the clone.
+If discovery finds an existing stable checkout, bind it with `project add`. If only a remote is known, explain the clone destination and impact, obtain confirmation, then run `project clone`; do not send the user mechanical clone steps.
 
-For work that does not need Git, use `yui task create "<title>"`. Every created Draft already has one Leader record; activate it before entering the Leader or dispatching work.
+For work that does not need Git, use `yui task create "<title>"`. Every Draft already has a Leader record and must be activated before execution.
+
+## Inspect execution
+
+Profiles are reusable versioned Worker templates, not running Sessions:
+
+```sh
+yui profile list
+yui profile show <profile>
+yui task work list <task-id>
+yui task attempt list <task-id>
+yui task attempt show <attempt-id>
+yui task integration list <task-id>
+```
+
+Bounded execution should normally use a Leader child-thread Attempt. `auto` never creates an independent Session; if no compatible Leader thread exists, resume the Leader and retry. A root Session requires an explicit hard boundary and recorded `--session-reason`.
+
+Provider transcripts remain native to the Agent. Yui stores provider references and a compact Attempt result.
 
 ## Enter and administer
 
-- The user enters the global session with `yui operator enter`. Do not recursively run that command from inside the Operator session.
-- Activate a ready Draft with `yui task activate <task-id>`.
-- Enter an active Task's Leader with `yui task enter <task-id>`, or a named Worker with `yui task enter <task-id> <role-name>`.
-- Relay explicit Task-scoped information with `yui task message send <task-id> "<body>"`.
-- Inspect a Leader's durable question with `yui task input show <input-id>`, then answer it with exactly one of `yui task input answer <input-id> --choice <key>` or `yui task input answer <input-id> --text "<answer>"`. An answer queues the Task's fixed Leader session to continue.
-- When Yui delivers an input-required notice, present its question, choices, recommendation, and deadline to the user. Do not choose or invent an answer. Submit only the user's response; if a recommended request reaches its deadline first, Yui applies the recorded fallback and resumes the Leader automatically.
-- Inspect Workers with `yui task role list <task-id>` and queued failures with `yui jobs list`.
-- Detect a disappeared running Session with `yui task reconcile <task-id>`, which requests an immediate Controller scan. Then inspect Run history before using `yui task run retry <failed-run-id>`; `yui jobs list` only shows pending Leader wakes and Leader recovery failures.
-- Retry only an explicitly failed Job with `yui jobs retry <job-id>`.
-- Archive finished work with `yui task archive <task-id> --integrated` or `--abandon` only after active work is settled and every isolated WorkItem worktree has been explicitly cleaned as integrated or abandoned. If a worktree is dirty, report the blocker and leave the Task unarchived. Archival stops Task Sessions and removes Task main; it does not delete Task or WorkItem records.
+- The user enters the global session with `yui operator enter`; do not recursively run it from inside Operator.
+- Enter an active Task's Leader with `yui task enter <task-id>`, or a persistent named Role with `yui task enter <task-id> <role-name>`.
+- Relay explicit Task information with `yui task message send <task-id> "<body>"`.
+- Present InputRequest questions, choices, recommendations, and deadlines exactly. Submit only the user's answer with `task input answer`.
+- Do not resolve code, semantic, or requirement conflicts on the Leader's behalf.
+- Use `task attempt interrupt` only when the user asks to stop a confirmed running Attempt.
+- Reconcile a disappeared native Session with `task reconcile`; inspect the Run before retrying a confirmed failure.
+- Retry only an explicitly failed recovery Job.
 
-Never edit Yui's authoritative files directly or manually manage Yui tmux sessions and worktree directories.
+Archive with `yui task archive <task-id> --integrated` or `--abandon` only after the Task is completed, active work is settled, and every managed WorkItem worktree has an explicit disposition. Dirty worktrees are blockers and must remain available. Archive stops Task Sessions and removes clean Task-managed worktrees; it retains Task and WorkItem records. Attempt and Integration worktrees use their own explicit cleanup commands.
+
+Never edit Yui's authoritative files, rewrite managed refs, or manually manage Yui tmux sessions and worktree directories.

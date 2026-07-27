@@ -25,6 +25,12 @@ export type RoleSessionOwner = Readonly<
   { scope: "global" } | { scope: "task"; taskId: string }
 >;
 
+const BUILTIN_YUI_SKILLS = new Set([
+  "yui-operator",
+  "yui-leader",
+  "yui-worker"
+]);
+
 /**
  * Compiles stable Role policy for an Agent-native instruction channel.
  * Dynamic wakeups and Run assignments deliberately remain outside this value.
@@ -46,7 +52,7 @@ export function compileRoleSessionContext(
     ...(builtInSkillId === undefined ? [] : [builtInSkillId]),
     ...(role.skills ?? [])
   ]);
-  const skills = skillIds.map((id) => loadSkill(yuiHome, id, id === builtInSkillId));
+  const skills = loadYuiSkillContexts(yuiHome, skillIds);
   return {
     developerInstructions: renderDeveloperInstructions(kind, role, owner),
     skills,
@@ -91,6 +97,17 @@ function renderDeveloperInstructions(
     role.systemPrompt === undefined ? null : `Additional Role instructions:\n${role.systemPrompt}`
   ].filter((value): value is string => value !== null);
   return [...core, ...profile].join("\n");
+}
+
+export function loadYuiSkillContexts(
+  yuiHome: string | undefined,
+  skillIds: readonly string[]
+): RoleSkillContext[] {
+  return unique(skillIds).map((id) => loadSkill(
+    yuiHome,
+    id,
+    BUILTIN_YUI_SKILLS.has(id)
+  ));
 }
 
 function loadSkill(yuiHome: string | undefined, id: string, builtIn: boolean): RoleSkillContext {

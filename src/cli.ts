@@ -31,10 +31,13 @@ import { runConfigCommand } from "./commands/configCommands.js";
 import { runJobCommand } from "./commands/jobCommands.js";
 import { runOperatorCommand } from "./commands/operatorCommands.js";
 import { runProjectCommand } from "./commands/projectCommands.js";
+import { runProfileCommand } from "./commands/profileCommands.js";
 import {
   runTaskCommand,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
+import { runTaskAttemptCommand } from "./commands/taskAttemptCommands.js";
+import { runTaskIntegrationCommand } from "./commands/taskIntegrationCommands.js";
 import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
 import {
   callFileTaskController,
@@ -271,6 +274,11 @@ export async function main(): Promise<void> {
     emit(result.output, false, result.data);
     return;
   }
+  if (resolved[0] === "profile") {
+    const result = runProfileCommand(resolved.slice(1), store);
+    emit(result.output, false, result.data);
+    return;
+  }
   if (resolved[0] === "role") {
     const roleOptions: GlobalRoleCommandOptions = {
       yuiHome: home,
@@ -304,6 +312,21 @@ export async function main(): Promise<void> {
     return;
   }
   if (resolved[0] === "task") {
+    if (resolved[1] === "attempt") {
+      const result = await runTaskAttemptCommand(resolved.slice(2), store, home);
+      emit(result.output, false, result.data);
+      return;
+    }
+    if (resolved[1] === "integration") {
+      const result = await runTaskIntegrationCommand(
+        resolved.slice(2),
+        store,
+        home,
+        { environment: process.env }
+      );
+      emit(result.output, false, result.data);
+      return;
+    }
     const enteringTask =
       (resolved[1] === "enter")
       || (resolved[1] === "role" && resolved[2] === "enter");
@@ -576,10 +599,15 @@ function selectionCall(
   switch (method) {
     case "agent.list": return store.listConfiguredAgents();
     case "config.get": return store.getConfig();
+    case "profile.list": return store.listAgentProfiles();
+    case "profile.show": return store.getAgentProfile(String(params.id ?? ""));
     case "role.list": return store.listGlobalRoles();
     case "role.show": return store.getGlobalRole(String(params.name ?? ""));
     case "project.list": return callOptional(reader, "listProjects");
     case "task.list": return callOptional(reader, "listTasks");
+    case "task.attempt.list": return store.listExecutionAttempts(String(params.taskId ?? ""));
+    case "task.integration.list": return store.listIntegrationAttempts(String(params.taskId ?? ""));
+    case "task.change-set.list": return store.listChangeSets(String(params.taskId ?? ""));
     case "task.role.list": return callOptional(reader, "listRoles", [params.taskId]);
     case "task.role.show": return callOptional(reader, "getRole", [params.taskId, params.roleName]);
     case "task.work.list": return callOptional(reader, "listWorkItems", [params.taskId]);
@@ -590,7 +618,7 @@ function selectionCall(
         : store.listInputRequests(taskId);
       return params.all === true ? requests : requests.filter((request) => request.status === "open");
     }
-    case "task.run.list": return callOptional(reader, "listAgentRuns", [params.workItemId]);
+    case "task.run.list": return callOptional(reader, "listAgentRuns", [params.taskId]);
     case "task.decision.list": return callOptional(reader, "listDecisions", [params.taskId]);
     case "task.milestone.list": return presentSelectionTimes(
       callOptional(reader, "listMilestones", [params.taskId]),

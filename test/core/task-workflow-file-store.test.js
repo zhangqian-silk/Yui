@@ -106,6 +106,88 @@ function markDelivered(store, run) {
   });
 }
 
+test("Work Item rejection and cancellation close the acceptance loop without new states", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options);
+  run(["activate", task.id], store, options);
+  run(["work", "create", task.id, "Review result"], store, options);
+  const rejected = store.listWorkItems(task.id).at(-1);
+  const running = updateWorkItemStatus(rejected, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  store.saveWorkItem(
+    task.id,
+    updateWorkItemStatus(running, "awaiting_acceptance", NOW)
+  );
+
+  assert.throws(
+    () => runTaskCommand(
+      ["work", "reject", rejected.id, "--summary", "Needs another pass."],
+      store,
+      options
+    ),
+    /Only the Task Leader may reject/
+  );
+  const leaderOptions = {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+  assert.match(
+    run(["work", "reject", rejected.id, "--summary", "Needs another pass."], store, leaderOptions),
+    /Rejected Work Item/
+  );
+  assert.equal(store.getWorkItem(task.id, rejected.id).status, "failed");
+
+  assert.match(
+    run(["work", "cancel", rejected.id, "--summary", "No longer needed."], store, options),
+    /Cancelled Work Item/
+  );
+  assert.equal(store.getWorkItem(task.id, rejected.id).status, "cancelled");
+  assert.equal(
+    store.listEvents(task.id).some(({ type }) => type === "work.rejected"),
+    true
+  );
+  assert.equal(
+    store.listEvents(task.id).some(({ type }) => type === "work.cancelled"),
+    true
+  );
+});
+
+function dispatchTestRun(store, taskId, roleName, workItemId, input = "test run") {
+  const role = store.getRole(taskId, roleName);
+  if (store.getActiveAgentRun(taskId, roleName) !== null) {
+    throw new Error(`${taskId}/${roleName} already has an active run.`);
+  }
+  const runId = store.nextAgentRunId(taskId);
+  const run = createAgentRun(
+    runId,
+    taskId,
+    roleName,
+    "new",
+    markYuiRunInput(input, runId),
+    NOW,
+    { workItemId }
+  );
+  store.transaction((tx) => {
+    tx.saveAgentRun(run);
+    tx.saveActiveAgentRun(run);
+    tx.saveRole(taskId, updateRoleStatus(role, "running", NOW));
+    const item = tx.getWorkItem(taskId, workItemId);
+    tx.saveWorkItem(taskId, updateWorkItemStatus(item, "running", NOW));
+    const target = { kind: "role", taskId, roleName };
+    const mailbox = enqueueSignal(tx.getWorkMailbox(target) ?? createWorkMailbox(target), {
+      reason: "run-dispatched",
+      refs: [{ type: "run", id: run.id }, { type: "work-item", id: workItemId }],
+      occurredAt: NOW.toISOString()
+    });
+    tx.saveWorkMailbox(mailbox);
+  });
+  return run;
+}
+
 test("Draft activation atomically creates one durable first Leader wake", (t) => {
   const { root, store, options } = fixture(t);
   store.saveProject(createProject(
@@ -223,17 +305,22 @@ test("Task list and show emit one-pass structured JSON for Agents", (t) => {
     data: {
       task,
       counts: {
-        roles: 1,
         messages: 0,
         decisions: 0,
         milestones: 0,
         events: 1,
         workItems: 0,
-        runs: 0,
+        attempts: 0,
+        changeSets: 0,
+        integrations: 0,
         openInputs: 0
       },
       hasBrief: false
     }
+  });
+  assert.deepEqual(runCli("task", "work", "list", task.id), {
+    ok: true,
+    data: { workItems: [] }
   });
 });
 
@@ -310,13 +397,13 @@ test("one Role has one active Run and Worker yield completes the workflow atomic
   const task = createTask(store, options, "Dispatch");
   run(["activate", task.id], store, options);
   run(["role", "add", task.id, "worker"], store, options);
-  run(["work", "create", task.id, "first", "--role", "worker"], store, options);
-  run(["work", "create", task.id, "second", "--role", "worker"], store, options);
+  run(["work", "create", task.id, "first"], store, options);
+  run(["work", "create", task.id, "second"], store, options);
   const [first, second] = store.listWorkItems(task.id);
 
-  run(["work", "dispatch", first.id, "--input", "implement"], store, options);
+  dispatchTestRun(store, task.id, "worker", first.id, "implement");
   assert.throws(
-    () => runTaskCommand(["work", "dispatch", second.id], store, options),
+    () => dispatchTestRun(store, task.id, "worker", second.id),
     /already has an active run/i
   );
   assert.equal(store.findWorkItem(second.id)?.status, "pending");
@@ -385,8 +472,8 @@ test("a failed Worker Run can retry its failed WorkItem", (t) => {
     tx.saveWorkItem(task.id, updateWorkItemStatus(
       tx.getWorkItem(task.id, item.id),
       "failed",
-      "transient failure",
-      NOW
+      NOW,
+      "transient failure"
     ));
   });
 
@@ -442,7 +529,7 @@ test("Leader yield does not self-wake and preserves a wake queued while busy", (
   run(["activate", task.id], store, options);
   run(["work", "create", task.id, "coordinate"], store, options);
   const item = store.listWorkItems(task.id)[0];
-  run(["work", "dispatch", item.id], store, options);
+  dispatchTestRun(store, task.id, "leader", item.id);
   const runRecord = store.getActiveAgentRun(task.id, "leader");
 
   markDelivered(store, runRecord);
@@ -524,7 +611,11 @@ test("a rejected Worker control yield rolls back all staged FileTaskStore writes
   const beforeMessages = store.listMessages(task.id);
 
   assert.throws(
-    () => runTaskCommand(["run", "yield", invalidRun.id, "--summary", "must roll back"], store, options),
+    () => runTaskCommand(
+      ["run", "yield", invalidRun.id, "--summary", "must roll back"],
+      store,
+      options
+    ),
     /not a work run/i
   );
   assert.equal(store.findAgentRun(invalidRun.id)?.status, "active");
@@ -618,10 +709,10 @@ test("Task Role removal is blocked for Leader and active Runs", (t) => {
   );
 
   run(["role", "add", task.id, "worker"], store, options);
-  run(["work", "create", task.id, "active", "--role", "worker"], store, options);
+  run(["work", "create", task.id, "active"], store, options);
   const item = store.listWorkItems(task.id)[0];
   run(["activate", task.id], store, options);
-  run(["work", "dispatch", item.id], store, options);
+  dispatchTestRun(store, task.id, "worker", item.id);
   assert.throws(
     () => runTaskCommand(["role", "remove", task.id, "worker"], store, options),
     /active Run/i
@@ -635,7 +726,7 @@ test("archive refuses active work and leaves its runtime ownership intact", (t) 
   run(["activate", task.id], store, options);
   run(["work", "create", task.id, "unfinished"], store, options);
   const item = store.listWorkItems(task.id)[0];
-  run(["work", "dispatch", item.id], store, options);
+  dispatchTestRun(store, task.id, "leader", item.id);
   const active = store.getActiveAgentRun(task.id, "leader");
 
   assert.throws(
@@ -653,13 +744,13 @@ test("completion fences active behavior until an explicit reopen", (t) => {
   const task = createTask(store, options, "Complete and reopen");
   run(["activate", task.id], store, options);
   run(["role", "add", task.id, "worker"], store, options);
-  run(["work", "create", task.id, "in flight", "--role", "worker"], store, options);
+  run(["work", "create", task.id, "in flight"], store, options);
   const item = store.listWorkItems(task.id)[0];
-  run(["work", "dispatch", item.id], store, options);
+  dispatchTestRun(store, task.id, "worker", item.id);
 
   assert.throws(
     () => runTaskCommand(["complete", task.id, "--summary", "premature"], store, options),
-    /active run|running work/i
+    /active run|running work|unaccepted work/i
   );
   const workerRun = store.getActiveAgentRun(task.id, "worker");
   markDelivered(store, workerRun);
@@ -701,7 +792,7 @@ test("Task completion requires every WorkItem to be terminal", (t) => {
   );
   assert.equal(store.getTask(task.id)?.status, "active");
 
-  run(["work", "update", item.id, "cancelled", "--summary", "No longer needed."], store, options);
+  run(["work", "cancel", item.id, "--summary", "No longer needed."], store, options);
   run(["complete", task.id, "--summary", "Done"], store, options);
   assert.equal(store.getTask(task.id)?.status, "completed");
   assert.equal(store.findWorkItem(item.id)?.status, "cancelled");

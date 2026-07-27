@@ -136,10 +136,12 @@ function interactionPrerequisitesReady(
     if (token.startsWith("--")) {
       const optionIndex = args.indexOf(token);
       const next = tail[index + 1];
-      if (optionIndex < 0) return false;
+      const selectable = policy?.selectors.some((selector) => selector.option === token) === true
+        || Object.hasOwn(node.optionValues, token);
+      if (optionIndex < 0 && !selectable) return false;
       if (next?.startsWith("<") === true) {
         const value = args[optionIndex + 1];
-        if (value === undefined || value.startsWith("--")) return false;
+        if ((value === undefined || value.startsWith("--")) && !selectable) return false;
         index += 1;
       }
       continue;

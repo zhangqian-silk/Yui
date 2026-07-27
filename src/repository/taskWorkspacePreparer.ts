@@ -159,6 +159,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (task.projectId === undefined) {
       throw new Error(`WorkItem isolation requires a Project-backed Task: ${task.id}.`);
     }
+    if (item.assignee === undefined) {
+      throw new Error(`WorkItem isolation requires a Task Role assignee: ${item.id}.`);
+    }
     if (item.assignee === LEADER_ROLE) {
       throw new Error("The Leader must remain in the Task main worktree.");
     }
@@ -237,6 +240,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   async inspectWorkItemWorkspace(workItemId: string): Promise<GitWorkspaceState> {
     const item = this.store.findWorkItem(workItemId);
     if (item === null) throw new Error(`Work item not found: ${workItemId}.`);
+    if (item.assignee === undefined) return "missing";
     const workspace = this.store.getRoleWorkspace(item.taskId, item.assignee);
     if (workspace === null) return "missing";
     if (workspace.owner.type !== "work-item" || workspace.owner.workItemId !== item.id) {
@@ -267,6 +271,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       throw new Error(
         `Work item workspace is already recorded as ${item.workspaceDisposition}.`
       );
+    }
+    if (item.assignee === undefined) {
+      throw new Error(`WorkItem has no Task Role workspace: ${item.id}.`);
     }
     const workspace = this.store.getRoleWorkspace(task.id, item.assignee);
     if (workspace === null) {
@@ -474,7 +481,7 @@ function safePathSegment(value: string): string {
   return normalized;
 }
 
-function resolveWorktreeRoot(home: string, workspace: string | undefined): string {
+export function resolveWorktreeRoot(home: string, workspace: string | undefined): string {
   if (workspace === undefined) {
     throw new Error("Project workspace is not configured; run yui setup.");
   }

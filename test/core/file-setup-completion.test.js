@@ -68,6 +68,7 @@ test("completion without a shell interactively selects one and persists it", asy
   assert.match(output, /Completion fish installed/);
   assert.equal(existsSync(installation.scriptPath), true);
   assert.match(readFileSync(installation.scriptPath, "utf8"), /identity=yui-dev/);
+  assert.match(readFileSync(installation.scriptPath, "utf8"), /task attempt/);
   assert.match(readFileSync(installation.scriptPath, "utf8"), /task role/);
 });
 
@@ -120,6 +121,7 @@ test("completion install keeps unrelated FileTaskStore configuration", async (t)
 
 test("setup configures selected Agents plus Leader and Operator model settings", async (t) => {
   const { runSetupCommand } = await import("../../dist/setup/setupCommand.js");
+  const { BUILTIN_PROFILE_IDS } = await import("../../dist/profile/agentProfile.js");
   const { FileTaskStore } = await import("../../dist/storage/taskStore.js");
   const root = mkdtempSync(join(tmpdir(), "yui-file-setup-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -137,9 +139,6 @@ test("setup configures selected Agents plus Leader and Operator model settings",
   const output = new PassThrough();
   let rendered = "";
   output.on("data", (chunk) => { rendered += chunk.toString(); });
-  input.end(
-    `all\nclaude\ncodex\nclaude-opus\nhigh\ngpt-5.6-sol\nxhigh\n${workspace}\nskip\n`
-  );
   const env = {
     YUI_HOME: home,
     YUI_CLI_NAME: "yui-dev",
@@ -149,6 +148,24 @@ test("setup configures selected Agents plus Leader and Operator model settings",
   };
   const executor = { run: (command) => command === "tmux" ? "tmux 3.4" : "" };
 
+  const rejectedInput = new PassThrough();
+  const rejectedOutput = new PassThrough();
+  rejectedInput.end("all\nclaude\n");
+  await assert.rejects(
+    runSetupCommand(
+      [], env, executor,
+      {
+        input: rejectedInput,
+        output: rejectedOutput,
+        forceInteractive: true
+      }
+    ),
+    /Codex.*Execution Attempt/
+  );
+
+  input.end(
+    `all\ncodex\ncodex\ngpt-5.6-sol\nxhigh\ngpt-5.6-sol\nxhigh\n${workspace}\nskip\n`
+  );
   const result = await runSetupCommand(
     [], env, executor,
     { input, output, forceInteractive: true }
@@ -157,29 +174,38 @@ test("setup configures selected Agents plus Leader and Operator model settings",
   assert.equal(existsSync(join(home, "schema.json")), true);
   const store = new FileTaskStore(home);
   assert.deepEqual(store.listConfiguredAgents().map(({ id }) => id).sort(), ["claude", "codex"]);
-  assert.equal(store.getConfig().defaultAgent, "claude");
+  assert.equal(store.getConfig().defaultAgent, "codex");
   assert.equal(store.getConfig().defaultWorkspace, workspace);
   assert.equal(store.getGlobalRole("operator").activeAgentId, "codex");
-  assert.equal(store.getGlobalRole("leader").activeAgentId, "claude");
+  assert.equal(store.getGlobalRole("leader").activeAgentId, "codex");
+  assert.deepEqual(
+    store.listAgentProfiles().map(({ id }) => id).sort(),
+    [...BUILTIN_PROFILE_IDS].sort()
+  );
+  assert.equal(store.getAgentProfile("worker").agentId, "codex");
+  assert.equal(store.getAgentProfile("explorer").defaultAccess, "read");
+  assert.equal(store.getAgentProfile("implementer").defaultAccess, "write");
+  assert.equal(store.getAgentProfile("reviewer").defaultAccess, "read");
+  assert.equal(existsSync(join(home, "worktrees")), false);
   assert.deepEqual(store.getGlobalRole("operator").agentBindings.codex.config, {
     adapterId: "codex",
     model: "gpt-5.6-sol",
     effort: "xhigh"
   });
-  assert.deepEqual(store.getGlobalRole("leader").agentBindings.claude.config, {
-    adapterId: "claude",
-    model: "claude-opus",
-    effort: "high"
+  assert.deepEqual(store.getGlobalRole("leader").agentBindings.codex.config, {
+    adapterId: "codex",
+    model: "gpt-5.6-sol",
+    effort: "xhigh"
   });
   assert.match(rendered, /Choose Agents by number or name/);
   assert.match(rendered, /Choose default Agent \[codex\]/);
-  assert.match(rendered, /Choose Operator Agent \[claude\]/);
-  assert.match(rendered, /Leader model for claude \[CLI default\]/);
-  assert.match(rendered, /Leader reasoning effort for claude \[CLI default\]/);
+  assert.match(rendered, /Choose Operator Agent \[codex\]/);
+  assert.match(rendered, /Leader model for codex \[CLI default\]/);
+  assert.match(rendered, /Leader reasoning effort for codex \[CLI default\]/);
   assert.match(rendered, /Operator model for codex \[CLI default\]/);
   assert.match(rendered, /Operator reasoning effort for codex \[CLI default\]/);
-  assert.match(result, /Leader model: claude-opus/);
-  assert.match(result, /Leader reasoning effort: high/);
+  assert.match(result, /Leader model: gpt-5\.6-sol/);
+  assert.match(result, /Leader reasoning effort: xhigh/);
   assert.match(result, /Operator model: gpt-5\.6-sol/);
   assert.match(result, /Operator reasoning effort: xhigh/);
   assert.match(result, /Project workspace:/);
@@ -192,6 +218,13 @@ test("setup configures selected Agents plus Leader and Operator model settings",
   };
   operatorWithPermissions.agentBindings.codex.config.search = true;
   store.saveGlobalRole(operatorWithPermissions);
+  const { updateAgentProfile } = await import("../../dist/profile/agentProfile.js");
+  const reviewerProfile = store.getAgentProfile("reviewer");
+  store.saveAgentProfile(updateAgentProfile(
+    reviewerProfile,
+    { description: "Custom reviewer instructions." },
+    new Date(Date.parse(reviewerProfile.updatedAt) + 1_000)
+  ));
 
   const repeatInput = new PassThrough();
   const repeatOutput = new PassThrough();
@@ -207,8 +240,8 @@ test("setup configures selected Agents plus Leader and Operator model settings",
     "gpt-5.6-sol"
   );
   assert.equal(
-    repeated.getGlobalRole("leader").agentBindings.claude.config.effort,
-    "high"
+    repeated.getGlobalRole("leader").agentBindings.codex.config.effort,
+    "xhigh"
   );
   assert.deepEqual(
     repeated.getGlobalRole("operator").agentBindings.codex.config.permission,
@@ -217,6 +250,10 @@ test("setup configures selected Agents plus Leader and Operator model settings",
   assert.equal(
     repeated.getGlobalRole("operator").agentBindings.codex.config.search,
     true
+  );
+  assert.equal(
+    repeated.getAgentProfile("reviewer").description,
+    "Custom reviewer instructions."
   );
 
   const changedWorkspace = join(root, "other-workspace");
@@ -250,6 +287,34 @@ test("setup configures selected Agents plus Leader and Operator model settings",
     }
   );
 
+  const switchOperatorInput = new PassThrough();
+  const switchOperatorOutput = new PassThrough();
+  switchOperatorInput.end("all\n\nclaude\n\n\n\n\n\nskip\n");
+  await assert.doesNotReject(runSetupCommand(
+    [], env, executor,
+    { input: switchOperatorInput, output: switchOperatorOutput, forceInteractive: true }
+  ));
+  assert.equal(
+    new FileTaskStore(home).getGlobalRole("operator").activeAgentId,
+    "claude"
+  );
+  assert.equal(
+    new FileTaskStore(home).getGlobalRole("leader").activeAgentId,
+    "codex"
+  );
+
+  const restoreOperatorInput = new PassThrough();
+  const restoreOperatorOutput = new PassThrough();
+  restoreOperatorInput.end("all\n\ncodex\n\n\n\n\n\nskip\n");
+  await assert.doesNotReject(runSetupCommand(
+    [], env, executor,
+    { input: restoreOperatorInput, output: restoreOperatorOutput, forceInteractive: true }
+  ));
+  assert.equal(
+    new FileTaskStore(home).getGlobalRole("operator").activeAgentId,
+    "codex"
+  );
+
   const { createRoleSessionSet, recordRoleAgentSession } = await import(
     "../../dist/executor/agentExecutor.js"
   );
@@ -275,7 +340,7 @@ test("setup configures selected Agents plus Leader and Operator model settings",
   await assert.rejects(runSetupCommand(
     [], env, executor,
     { input: runningInput, output: runningOutput, forceInteractive: true }
-  ), /cannot be changed while its native process is running/i);
+  ), /cannot be reconfigured.*Session is running.*rerun yui setup/i);
   assert.equal(
     new FileTaskStore(home).getGlobalRole("operator").agentBindings.codex.config.model,
     undefined

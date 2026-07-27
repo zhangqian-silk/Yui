@@ -634,7 +634,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         if (workItem !== null && !["completed", "failed", "cancelled", "superseded"].includes(workItem.status)) {
           store.saveWorkItem(
             task.id,
-            updateWorkItemStatus(workItem, "failed", input.summary, input.now)
+            updateWorkItemStatus(workItem, "failed", input.now, input.summary)
           );
         }
       }
@@ -1135,7 +1135,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         if (active.workItemId !== undefined) {
           const item = store.getWorkItem(task.id, active.workItemId);
           if (item !== null && !["completed", "failed", "cancelled", "superseded"].includes(item.status)) {
-            store.saveWorkItem(task.id, updateWorkItemStatus(item, "failed", detail, input.now));
+            store.saveWorkItem(
+              task.id,
+              updateWorkItemStatus(item, "failed", input.now, summary)
+            );
           }
         }
         store.saveRole(task.id, updateRoleStatus(currentRole, "idle", input.now));
@@ -1375,7 +1378,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           if (item !== null && !["completed", "failed", "cancelled", "superseded"].includes(item.status)) {
             store.saveWorkItem(
               task.id,
-              updateWorkItemStatus(item, "failed", summary, now)
+              updateWorkItemStatus(item, "failed", now, summary)
             );
           }
         }

@@ -69,6 +69,13 @@ const PUBLIC_PATHS = [
   "role session",
   "role session record",
   "role session replace",
+  "profile",
+  "profile add",
+  "profile list",
+  "profile show",
+  "profile update",
+  "profile remove",
+  "profile reset",
   "task",
   "task create",
   "task update",
@@ -106,10 +113,28 @@ const PUBLIC_PATHS = [
   "task work dispatch",
   "task work isolate",
   "task work cleanup",
+  "task work accept",
+  "task work reject",
+  "task work cancel",
   "task run",
   "task run list",
   "task run retry",
   "task run yield",
+  "task attempt",
+  "task attempt dispatch",
+  "task attempt list",
+  "task attempt show",
+  "task attempt retry",
+  "task attempt interrupt",
+  "task attempt cleanup",
+  "task integration",
+  "task integration start",
+  "task integration continue",
+  "task integration resolve",
+  "task integration abort",
+  "task integration list",
+  "task integration show",
+  "task integration cleanup",
   "task brief",
   "task brief show",
   "task brief update",
@@ -153,6 +178,13 @@ function createPorts() {
       { id: "claude", adapterId: "claude", command: "claude" }
     ],
     "config.get": { defaultAgent: "claude" },
+    "profile.list": [
+      { id: "worker", revision: 1, defaultAccess: "read", agentId: "codex" },
+      { id: "implementer", revision: 1, defaultAccess: "write", agentId: "codex" }
+    ],
+    "role.list": [
+      { name: "operator", activeAgentId: "codex", workspace: "/workspace" }
+    ],
     "jobs.list": [
       { id: "job-alpha", type: "start-run", status: "failed" },
       { id: "job-beta", type: "wake-role", status: "pending" }
@@ -183,11 +215,16 @@ function createPorts() {
     attach: async () => {},
     call: async (method, params) => {
       events.push({ method, params });
+      if (method === "task.actor.list") {
+        return [
+          { id: "reviewer", kind: "worker", profileId: "reviewer", status: "idle" },
+          { id: "leader", kind: "leader", profileId: "leader", status: "idle" }
+        ];
+      }
       if (method === "task.role.list") {
         return [
-          { id: "reviewer", name: "Reviewer", kind: "worker" },
-          { id: "leader", name: "Leader", kind: "leader" },
-          { id: "builder", name: "Builder", kind: "worker" }
+          { name: "leader", kind: "leader", activeAgentId: "codex" },
+          { name: "reviewer", kind: "worker", activeAgentId: "codex" }
         ];
       }
       if (method === "task.work.list") {
@@ -195,10 +232,18 @@ function createPorts() {
           ? [{ id: "work-alpha", title: "Alpha work", taskId: params.taskId }]
           : [{ id: "work-beta", title: "Beta work", taskId: params.taskId }];
       }
-      if (method === "task.run.list") {
-        return params.workItemId === "work-alpha"
-          ? [{ id: "run-alpha", workItemId: params.workItemId, status: "failed" }]
-          : [{ id: "run-beta", workItemId: params.workItemId, status: "failed" }];
+      if (method === "task.attempt.list") {
+        return params.taskId === "task-alpha"
+          ? [{ id: "attempt-alpha", workItemId: "work-alpha", state: "failed", executor: "fork" }]
+          : [{ id: "attempt-beta", workItemId: "work-beta", state: "interrupted", executor: "session" }];
+      }
+      if (method === "task.integration.list") {
+        return params.taskId === "task-alpha"
+          ? [{ id: "integration-alpha", status: "blocked", targetRef: "main" }]
+          : [];
+      }
+      if (method === "task.change-set.list") {
+        return [{ id: "change-set-alpha", attemptId: "attempt-alpha", baseCommit: "a", headCommit: "b" }];
       }
       if (method === "task.input.list") {
         return [
@@ -234,7 +279,7 @@ function values(set) {
   return set.candidates.map((candidate) => candidate.value);
 }
 
-test("interaction policies cover missing task, work, run, and job identifiers", () => {
+test("interaction policies cover missing task, work, Attempt, Integration, and job identifiers", () => {
   const expected = [
     [["task", "show"], 2, "tasks"],
     [["task", "activate"], 2, "tasks"],
@@ -243,10 +288,15 @@ test("interaction policies cover missing task, work, run, and job identifiers", 
     [["task", "reopen"], 2, "tasks"],
     [["task", "archive"], 2, "tasks"],
     [["task", "reconcile"], 2, "tasks"],
-    [["task", "work", "dispatch"], 3, "work-items"],
-    [["task", "run", "list"], 3, "work-items"],
-    [["task", "run", "retry"], 3, "runs"],
-    [["task", "run", "yield"], 3, "runs"],
+    [["role", "show"], 2, "global-roles"],
+    [["task", "role", "show"], 4, "task-roles"],
+    [["task", "work", "accept"], 3, "work-items"],
+    [["task", "attempt", "dispatch"], 3, "work-items"],
+    [["task", "attempt", "list"], 3, "tasks"],
+    [["task", "attempt", "retry"], 3, "execution-attempts"],
+    [["task", "attempt", "interrupt"], 3, "execution-attempts"],
+    [["task", "integration", "list"], 3, "tasks"],
+    [["task", "integration", "resolve"], 3, "integration-attempts"],
     [["jobs", "retry"], 2, "jobs"]
   ];
 
@@ -270,34 +320,6 @@ test("interaction policies cover missing task, work, run, and job identifiers", 
   });
 });
 
-test("Task Role detail policies select task then Role and confirm removal", () => {
-  for (const command of ["show", "status", "update", "remove"]) {
-    const policy = findInteractionPolicy(findCommandNode(["task", "role", command]));
-    assert.ok(policy, command);
-    assert.deepEqual(policy.selectors, [
-      {
-        argumentIndex: 3,
-        entity: "task",
-        provider: "tasks",
-        actionTarget: true
-      },
-      {
-        argumentIndex: 4,
-        entity: "task-role",
-        provider: "task-roles",
-        dependsOn: 3,
-        actionTarget: true
-      }
-    ]);
-  }
-
-  const remove = findInteractionPolicy(findCommandNode(["task", "role", "remove"]));
-  assert.deepEqual(remove.confirmation, {
-    action: "Remove Task Role",
-    targetArgumentIndex: 4
-  });
-});
-
 test("candidate providers read the current core entities through CoreCliPorts.call", async () => {
   const ports = createPorts();
 
@@ -309,23 +331,26 @@ test("candidate providers read the current core entities through CoreCliPorts.ca
     ports,
     ["task", "create", "Title", "--project"]
   )), ["repo-alpha", "repo-beta"]);
-  const roles = values(await getSelectionCandidates(
-    selector("task-roles", "task-role", { argumentIndex: 3, dependsOn: 2 }),
-    ports,
-    ["task", "enter", "task-alpha"]
-  ));
-  assert.equal(roles[0], "Leader");
-  assert.deepEqual(new Set(roles.slice(1)), new Set(["Reviewer", "Builder"]));
   assert.deepEqual(values(await getSelectionCandidates(
     selector("work-items", "work-item", { argumentIndex: 3 }),
     ports,
-    ["task", "work", "dispatch"]
+    ["task", "attempt", "dispatch"]
   )), ["work-alpha", "work-beta"]);
   assert.deepEqual(values(await getSelectionCandidates(
-    selector("runs", "run", { argumentIndex: 3 }),
+    selector("task-roles", "task-role", { argumentIndex: 4, dependsOn: 3 }),
     ports,
-    ["task", "run", "retry"]
-  )), ["run-alpha", "run-beta"]);
+    ["task", "role", "show", "task-alpha"]
+  )), ["leader", "reviewer"]);
+  assert.deepEqual(values(await getSelectionCandidates(
+    selector("execution-attempts", "execution-attempt", { argumentIndex: 3 }),
+    ports,
+    ["task", "attempt", "retry"]
+  )), ["attempt-alpha", "attempt-beta"]);
+  assert.deepEqual(values(await getSelectionCandidates(
+    selector("integration-attempts", "integration-attempt", { argumentIndex: 3 }),
+    ports,
+    ["task", "integration", "show"]
+  )), ["integration-alpha"]);
   assert.deepEqual(values(await getSelectionCandidates(
     selector("jobs", "job"), ports, ["jobs", "retry"]
   )), ["job-alpha", "job-beta"]);
@@ -347,7 +372,7 @@ test("candidate providers read the current core entities through CoreCliPorts.ca
   const agents = await getSelectionCandidates(
     selector("configured-agents", "agent", { option: "--agent" }),
     ports,
-    ["task", "role", "add", "task-alpha", "worker", "--agent"]
+    ["profile", "add", "reviewer", "--agent"]
   );
   assert.deepEqual(values(agents), ["codex", "claude"]);
   assert.equal(agents.defaultValue, "claude");
@@ -367,9 +392,9 @@ test("candidate providers read the current core entities through CoreCliPorts.ca
   );
   assert.deepEqual(
     new Set(ports.events
-      .filter(({ method }) => method === "task.run.list")
-      .map(({ params }) => params.workItemId)),
-    new Set(["work-alpha", "work-beta"])
+      .filter(({ method }) => method === "task.attempt.list")
+      .map(({ params }) => params.taskId)),
+    new Set(["task-alpha", "task-beta"])
   );
 });
 
@@ -440,61 +465,21 @@ test("InputRequest interaction and completion select global or Task-scoped open 
 });
 
 test("an empty Agent selection chooses the configured default Agent", async () => {
-  const node = findCommandNode(["task", "role", "add"]);
+  const node = findCommandNode(["profile", "add"]);
   assert.ok(node);
   const ports = createPorts();
   const io = selectionIo([""]);
 
   const result = await resolveInteractiveArguments(
-    ["task", "role", "add", "task-alpha", "Reviewer", "--agent"], node, ports, io
+    ["profile", "add", "reviewer", "--agent"], node, ports, io
   );
 
   assert.deepEqual(result, {
     kind: "resolved",
-    args: ["task", "role", "add", "task-alpha", "Reviewer", "--agent", "claude"]
+    args: ["profile", "add", "reviewer", "--agent", "claude"]
   });
   assert.match(io.writes.join(""), /Default/);
   assert.match(io.writes.join(""), /claude\s+claude\s+claude\s+default/);
-});
-
-test("Task Role detail selection resolves the task before its Role and confirms removal", async () => {
-  for (const command of ["show", "status", "update"]) {
-    const node = findCommandNode(["task", "role", command]);
-    assert.ok(node);
-    const ports = createPorts();
-    const io = selectionIo(["task-alpha", "Leader"]);
-    const result = await resolveInteractiveArguments(
-      ["task", "role", command], node, ports, io
-    );
-    assert.deepEqual(result, {
-      kind: "resolved",
-      args: ["task", "role", command, "task-alpha", "Leader"]
-    });
-    assert.ok(ports.events.some(({ method, params }) =>
-      method === "task.role.list" && params.taskId === "task-alpha"));
-  }
-
-  const node = findCommandNode(["task", "role", "remove"]);
-  assert.ok(node);
-  const ports = createPorts();
-  const io = selectionIo(["task-alpha", "Leader", "yes"]);
-  const result = await resolveInteractiveArguments(
-    ["task", "role", "remove"], node, ports, io
-  );
-  assert.deepEqual(result, {
-    kind: "resolved",
-    args: ["task", "role", "remove", "task-alpha", "Leader"]
-  });
-  assert.ok(io.prompts.includes("Remove Task Role Leader? [y/N]: "));
-
-  const cancelled = await resolveInteractiveArguments(
-    ["task", "role", "remove"], node, createPorts(),
-    selectionIo(["task-alpha", "Leader", "no"])
-  );
-  assert.deepEqual(cancelled, {
-    kind: "cancelled",
-    args: ["task", "role", "remove", "task-alpha", "Leader"]
-  });
 });
 
 test("Task lifecycle selectors filter candidates by valid source status", async () => {

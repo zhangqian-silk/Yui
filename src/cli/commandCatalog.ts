@@ -143,6 +143,13 @@ const roleAgentClearOptions = [
   "--clear-model", "--clear-effort", "--clear-sandbox", "--clear-approval",
   "--clear-permission-mode", "--clear-search", "--clear-agent-config"
 ] as const;
+const agentProfileOptions = [
+  "--description", "--instructions", "--skill", "--model", "--effort"
+] as const;
+const agentProfileClearOptions = [
+  "--clear-description", "--clear-instructions", "--clear-skills",
+  "--clear-model", "--clear-effort"
+] as const;
 const roleAgentOptionValues = {
   "--sandbox": ["read-only", "workspace-write", "danger-full-access"],
   "--approval": ["untrusted", "on-request", "never"],
@@ -192,6 +199,27 @@ const roleChildren: readonly NodeInput[] = [
       }
     ]
   }
+];
+
+const profileChildren: readonly NodeInput[] = [
+  {
+    name: "add",
+    summary: "Add a reusable Agent Profile.",
+    usage: "yui profile add <id> --agent <id> [--access <read|write>] [Profile settings]",
+    options: ["--agent", "--access", ...agentProfileOptions],
+    optionValues: { "--access": ["read", "write"] }
+  },
+  { name: "list", summary: "List Agent Profiles." },
+  { name: "show", summary: "Show one Agent Profile.", usage: "yui profile show <id>" },
+  {
+    name: "update",
+    summary: "Update an Agent Profile.",
+    usage: "yui profile update <id> [--agent <id>] [--access <read|write>] [Profile settings]",
+    options: ["--agent", "--access", ...agentProfileOptions, ...agentProfileClearOptions],
+    optionValues: { "--access": ["read", "write"] }
+  },
+  { name: "remove", summary: "Remove a custom Agent Profile.", usage: "yui profile remove <id>" },
+  { name: "reset", summary: "Reset all built-in Agent Profiles." }
 ];
 
 const taskChildren: readonly NodeInput[] = [
@@ -317,13 +345,20 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "work",
     summary: "Manage finite Task work items.",
-    sections: [{ id: "manage", title: "Commands", entries: ["create", "list", "update", "isolate", "dispatch", "cleanup"] }],
+    sections: [{
+      id: "manage",
+      title: "Commands",
+      entries: [
+        "create", "list", "update", "dispatch", "isolate", "cleanup",
+        "accept", "reject", "cancel"
+      ]
+    }],
     children: [
       {
         name: "create",
         summary: "Create a work item.",
-        usage: "yui task work create <task> <title> [--role <name>]",
-        options: ["--role"]
+        usage: "yui task work create <task> <title> [--objective <text>] [--accept <criterion> ...] [--after <work> ...] [--role <name>]",
+        options: ["--objective", "--accept", "--after", "--role"]
       },
       { name: "list", summary: "List work items for a Task.", usage: "yui task work list <task>" },
       {
@@ -351,12 +386,30 @@ const taskChildren: readonly NodeInput[] = [
         summary: "Remove a clean terminal WorkItem worktree after integration or abandonment.",
         usage: "yui task work cleanup <work> (--integrated|--abandon)",
         options: ["--integrated", "--abandon"]
+      },
+      {
+        name: "accept",
+        summary: "Accept a successful, validated, integrated Work Item.",
+        usage: "yui task work accept <work> --summary <text>",
+        options: ["--summary"]
+      },
+      {
+        name: "reject",
+        summary: "Reject an awaiting Work Item so it can be retried.",
+        usage: "yui task work reject <work> --summary <text>",
+        options: ["--summary"]
+      },
+      {
+        name: "cancel",
+        summary: "Cancel a non-running Work Item.",
+        usage: "yui task work cancel <work> --summary <text>",
+        options: ["--summary"]
       }
     ]
   },
   {
     name: "run",
-    summary: "Inspect and control Agent Runs.",
+    summary: "Inspect and control Task Role Agent Runs.",
     sections: [{ id: "manage", title: "Commands", entries: ["list", "retry", "yield"] }],
     children: [
       { name: "list", summary: "List Runs for a work item.", usage: "yui task run list <work>" },
@@ -367,6 +420,62 @@ const taskChildren: readonly NodeInput[] = [
         usage: "yui task run yield <run> --summary <text>",
         options: ["--summary"]
       }
+    ]
+  },
+  {
+    name: "attempt",
+    summary: "Dispatch and inspect Execution Attempts.",
+    sections: [{ id: "manage", title: "Commands", entries: ["dispatch", "list", "show", "retry", "interrupt", "cleanup"] }],
+    children: [
+      {
+        name: "dispatch",
+        summary: "Execute a Work Item in a forked Leader thread or explicit root Session.",
+        usage: "yui task attempt dispatch <work> [--profile <id>] [--mode <auto|fork|session>] [--access <read|write>] [--input <text>] [--session-reason <text>]",
+        options: ["--profile", "--mode", "--access", "--input", "--session-reason"],
+        optionValues: {
+          "--mode": ["auto", "fork", "session"],
+          "--access": ["read", "write"]
+        }
+      },
+      { name: "list", summary: "List Execution Attempts.", usage: "yui task attempt list <task>" },
+      { name: "show", summary: "Show one Execution Attempt.", usage: "yui task attempt show <attempt>" },
+      { name: "retry", summary: "Retry a failed Execution Attempt.", usage: "yui task attempt retry <attempt>" },
+      { name: "interrupt", summary: "Interrupt a running Execution Attempt.", usage: "yui task attempt interrupt <attempt>" },
+      { name: "cleanup", summary: "Remove a terminal integrated Attempt worktree and branch.", usage: "yui task attempt cleanup <attempt>" }
+    ]
+  },
+  {
+    name: "integration",
+    summary: "Safely integrate ChangeSets with Leader-owned conflict decisions.",
+    sections: [{ id: "manage", title: "Commands", entries: ["start", "continue", "resolve", "abort", "list", "show", "cleanup"] }],
+    children: [
+      {
+        name: "start",
+        summary: "Build, validate, and CAS-commit an integration candidate.",
+        usage: "yui task integration start <task> --change-set <id> [--change-set <id> ...] [--target <ref>] [--check <command> ...]",
+        options: ["--change-set", "--target", "--check"]
+      },
+      {
+        name: "continue",
+        summary: "Continue a Leader-approved manual resolution.",
+        usage: "yui task integration continue <integration>"
+      },
+      {
+        name: "resolve",
+        summary: "Record the Leader's semantic conflict decision.",
+        usage: "yui task integration resolve <integration> --option <manual-resolution|reject> --rationale <text>",
+        options: ["--option", "--rationale"],
+        optionValues: { "--option": ["manual-resolution", "reject"] }
+      },
+      {
+        name: "abort",
+        summary: "Abandon a running or blocked Integration Attempt.",
+        usage: "yui task integration abort <integration> --reason <text>",
+        options: ["--reason"]
+      },
+      { name: "list", summary: "List Integration Attempts.", usage: "yui task integration list <task>" },
+      { name: "show", summary: "Show one Integration Attempt.", usage: "yui task integration show <integration>" },
+      { name: "cleanup", summary: "Remove a terminal Integration worktree and branch.", usage: "yui task integration cleanup <integration>" }
     ]
   },
   {
@@ -439,12 +548,12 @@ const taskChildren: readonly NodeInput[] = [
 
 export const ROOT_COMMAND = buildNode({
   name: "yui",
-  summary: "Coordinate native Agent CLI sessions through tmux.",
+  summary: "Coordinate durable, isolated Agent work.",
   usage: "yui [--json] <command>",
   sections: [
     { id: "general", title: "General", entries: ["help", "version", "update", "setup", "doctor", "completion"] },
     { id: "workflow", title: "Workflow", entries: ["operator", "project", "task"] },
-    { id: "configuration", title: "Configuration", entries: ["config", "agent", "role"] },
+    { id: "configuration", title: "Configuration", entries: ["config", "agent", "profile", "role"] },
     { id: "operations", title: "Operations", entries: ["web", "controller", "jobs"] },
     { id: "internal", title: "Internal", entries: ["internal"] }
   ],
@@ -508,7 +617,7 @@ export const ROOT_COMMAND = buildNode({
     },
     {
       name: "operator",
-      summary: "Use the persistent Operator Role.",
+      summary: "Use the persistent Operator Actor.",
       sections: [{ id: "workflow", title: "Commands", entries: ["enter", "submit"] }],
       children: [
         { name: "enter", summary: "Enter the Operator's native session." },
@@ -601,6 +710,15 @@ export const ROOT_COMMAND = buildNode({
       children: agentChildren
     },
     {
+      name: "profile",
+      summary: "Manage reusable Agent Profiles.",
+      sections: [
+        { id: "inspect", title: "Inspect", entries: ["list", "show"] },
+        { id: "manage", title: "Manage", entries: ["add", "update", "remove", "reset"] }
+      ],
+      children: profileChildren
+    },
+    {
       name: "role",
       summary: "Manage reusable global Roles and their native sessions.",
       sections: [
@@ -612,10 +730,10 @@ export const ROOT_COMMAND = buildNode({
     },
     {
       name: "task",
-      summary: "Manage Tasks, Roles, work items, and Runs.",
+      summary: "Manage Tasks, WorkItems, Attempts, and integration.",
       sections: [
         { id: "lifecycle", title: "Lifecycle", entries: ["create", "update", "activate", "complete", "reopen", "list", "show", "context", "archive", "reconcile"] },
-        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "role", "work", "run", "enter"] },
+        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "work", "run", "attempt", "integration", "role", "enter"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
       ],
       children: taskChildren

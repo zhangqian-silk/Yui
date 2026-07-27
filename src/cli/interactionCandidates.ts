@@ -60,6 +60,13 @@ export async function getSelectionCandidates(
       );
       return { ...set, defaultValue };
     }
+    case "agent-profiles":
+      return entities(
+        "Agent Profile",
+        "Select Agent Profile",
+        await list(ports, "profile.list", {}),
+        ["id", "revision", "defaultAccess", "agentId"]
+      );
     case "global-roles":
       return entities(
         "global role",
@@ -91,7 +98,9 @@ export async function getSelectionCandidates(
       const taskId = dependencyValue(selector, args);
       if (taskId === undefined) return null;
       const roles = orderRoleOptions(await list(ports, "task.role.list", { taskId }));
-      return entities("task role", `Select Task role: ${taskId}`, roles, ["name", "kind", "agentId"]);
+      return entities("task role", `Select Task role: ${taskId}`, roles, [
+        "name", "kind", "activeAgentId"
+      ]);
     }
     case "task-decisions": {
       const taskId = dependencyValue(selector, args);
@@ -129,13 +138,47 @@ export async function getSelectionCandidates(
         await listAllWorkItems(ports),
         ["id", "title", "status"]
       );
-    case "runs":
+    case "runs": {
+      const workItemId = dependencyValue(selector, args);
+      const runs = await listAllByTask(ports, "task.run.list", "runs");
       return entities(
         "run",
-        "Select run",
-        await listAllRuns(ports),
-        ["id", "status", "workItemId"]
+        workItemId === undefined ? "Select Run" : `Select Run: ${workItemId}`,
+        runs.filter((run) => workItemId === undefined
+          || stringField(run, "workItemId") === workItemId),
+        ["id", "roleName", "status", "summary"]
       );
+    }
+    case "execution-attempts":
+      return entities(
+        "Execution Attempt",
+        "Select Execution Attempt",
+        (await listAllByTask(ports, "task.attempt.list", "attempts")).filter((attempt) =>
+          selector.statuses === undefined
+          || selector.statuses.includes(stringField(attempt, "state") ?? "")
+        ),
+        ["id", "state", "executor", "workItemId"]
+      );
+    case "integration-attempts":
+      return entities(
+        "Integration Attempt",
+        "Select Integration Attempt",
+        (await listAllByTask(ports, "task.integration.list", "integrations")).filter((attempt) =>
+          selector.statuses === undefined
+          || selector.statuses.includes(stringField(attempt, "status") ?? "")
+        ),
+        ["id", "status", "targetRef"]
+      );
+    case "change-sets": {
+      const taskId = dependencyValue(selector, args);
+      if (taskId === undefined) return null;
+      return entities(
+        "ChangeSet",
+        `Select ChangeSet: ${taskId}`,
+        await list(ports, "task.change-set.list", { taskId }),
+        ["id", "attemptId", "baseCommit", "headCommit"]
+      );
+    }
   }
 }
 
@@ -148,11 +191,15 @@ async function listAllWorkItems(ports: SelectionPorts): Promise<Entity[]> {
   return groups.flat();
 }
 
-async function listAllRuns(ports: SelectionPorts): Promise<Entity[]> {
-  const workItems = await listAllWorkItems(ports);
-  const groups = await Promise.all(workItems.flatMap((item) => {
-    const workItemId = stringField(item, "id");
-    return workItemId === undefined ? [] : [list(ports, "task.run.list", { workItemId })];
+async function listAllByTask(
+  ports: SelectionPorts,
+  method: string,
+  resultKey: string
+): Promise<Entity[]> {
+  const tasks = await list(ports, "task.list", {});
+  const groups = await Promise.all(tasks.flatMap((task) => {
+    const taskId = stringField(task, "id");
+    return taskId === undefined ? [] : [list(ports, method, { taskId, resultKey })];
   }));
   return groups.flat();
 }
