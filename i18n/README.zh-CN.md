@@ -202,7 +202,11 @@ Task 生命周期的交互选择只展示有效来源状态：activate 只展示
 
 ## Session 与 tmux
 
-Yui 不代理交互式 Agent 终端。执行 `operator enter`、`role enter` 或 `task enter` 前，Yui 会关闭 readline、退出 raw mode、暂停自身 stdin，再同步把终端交给 tmux。因此 Codex 原生的 `/model`、斜杠命令提示、全屏渲染和按键处理都可正常工作。
+所有长时间运行的交互式 Agent 进程都由 tmux 承载。执行 `operator enter`、`role enter` 或 `task enter` 前，Yui 会关闭 readline、退出 raw mode、暂停自身 stdin，再同步把终端交给 tmux。attach 会继承外层终端的真实能力并进入干净的 alternate screen；鼠标滚动只查看 Agent pane 的 100,000 行 tmux 历史，不再混入 attach 之前的 shell 或 IDE Terminal 历史。因此 Agent 原生的 `/model`、斜杠命令提示、全屏渲染和按键处理都可正常工作。
+
+tmux 会在 pane 创建时固定其历史容量。配置该限制之前创建的 Role 会保留原容量；Yui 会在 Terminal attach 和 Web 中提示用户退出并重新进入一次，从而在保留 Agent 原生对话的同时创建具有 100,000 行历史的新 pane。
+
+同一个 Operator 或 Task tmux session 中，第一个 Terminal/Web 客户端可写，后续查看者自动只读，避免多个入口同时向同一个 Agent 输入。
 
 ```sh
 yui role enter <global-role>
@@ -253,18 +257,20 @@ yui task run retry <failed-run-id>
 
 completion 是可逆的执行屏障。只有活动工作已处理且所有 worktree 干净时才能归档；归档停止 Task 的 tmux session 并移除托管 worktree，但保留 Task 记录。脏 worktree 会让 Task 保持 completed，供后续处理。
 
-## 本地 Web Dashboard
+## 本地 Web 控制室
 
-默认在 loopback 地址启动只读 dashboard：
+默认在 loopback 地址启动本地控制室：
 
 ```sh
 yui web
-# Yui web dashboard: http://127.0.0.1:4173
+# Yui web control room: http://127.0.0.1:4173
 ```
 
-可用 `--port <port>` 或 `--host 127.0.0.1|::1|localhost` 修改监听参数。Yui 会拒绝非 loopback host；Web 界面无需认证，因此只允许本机访问，并且不会写入 Yui 状态。所有变更仍通过 CLI 或 Agent session 完成。
+可用 `--port <port>` 或 `--host 127.0.0.1|::1|localhost` 修改监听参数。Yui 会拒绝非 loopback host，因为控制室会展示 Task、Role、WorkItem、Run、Message、Decision、Milestone 和 InputRequest 等信息。服务启动时生成的随机 token 会嵌入页面，并保护写操作和终端连接。
 
-Dashboard 支持 English 与简体中文，首次打开时跟随浏览器语言，也可以手动切换并记住选择。主题选择器可在深色「控制室」和浅色「纸本台账」之间切换。语言与主题偏好只保存在浏览器 `localStorage`，不会修改 `YUI_HOME`。
+Web 端可以通过与 Terminal 相同的持久化 CLI 路径回答 open InputRequest，也可以通过原生 xterm 客户端 attach 到已有 Operator、Leader 或 Worker tmux pane。关闭浏览器终端只会 detach 当前 tmux client，Agent 进程与对话继续保留；Web 不复制 transcript，也不维护第二套会话状态。
+
+控制室支持 English 与简体中文，首次打开时跟随浏览器语言，也可以手动切换并记住选择。主题选择器可在深色「控制室」和浅色「纸本台账」之间切换。语言与主题偏好只保存在浏览器 `localStorage`，不会修改 `YUI_HOME`。
 
 ## 管理命令
 
@@ -280,7 +286,7 @@ Agent 环境变量绑定只保存进程环境变量名，不保存 secret 值；
 
 ## 范围
 
-Yui 面向一台机器上的一个受信任本地用户。它的 Web/API 仅支持 loopback 只读访问，不包含远程或多用户 Web、分布式协调、backup/import/export、trash/restore、derived index、recovery journal、runtime lease、inactivity TTL、cooldown 或 recurring schedule。
+Yui 面向一台机器上的一个受信任本地用户。它的 Web/API 仅支持 loopback，不包含远程或多用户 Web、分布式协调、backup/import/export、trash/restore、derived index、recovery journal、runtime lease、inactivity TTL、cooldown 或 recurring schedule。
 
 持久化和调度细节见 [ARCHITECTURE.md](../ARCHITECTURE.md)。
 

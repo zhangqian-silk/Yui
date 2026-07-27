@@ -4,11 +4,13 @@ export const DASHBOARD_HTML = `<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
+  <meta name="yui-web-token" content="__YUI_WEB_TOKEN__">
   <title>Yui Control Room</title>
   <link rel="stylesheet" href="/assets/css/tokens.css">
   <link rel="stylesheet" href="/assets/css/layout.css">
   <link rel="stylesheet" href="/assets/css/components.css">
   <link rel="stylesheet" href="/assets/css/responsive.css">
+  <link rel="stylesheet" href="/assets/vendor/xterm.css">
 </head>
 <body>
   <a class="skip-link" href="#task-list" data-i18n="a11y.skip">Skip to task board</a>
@@ -41,7 +43,7 @@ export const DASHBOARD_HTML = `<!doctype html>
               <option value="paper" data-i18n="theme.paper">Paper ledger</option>
             </select>
           </label>
-          <div class="live"><i aria-hidden="true"></i><span data-i18n="brand.connection">Loopback · read only</span></div>
+          <div class="live"><i aria-hidden="true"></i><span data-i18n="brand.connection">Loopback · local control</span></div>
         </div>
       </div>
     </aside>
@@ -55,6 +57,7 @@ export const DASHBOARD_HTML = `<!doctype html>
           </div>
         </div>
         <div class="topbar-actions">
+          <button id="operator-terminal" class="refresh" type="button" data-i18n="actions.operator">Open Operator</button>
           <div class="clock">
             <span data-i18n="sync.label">LAST SYNC</span>
             <time id="last-sync">—</time>
@@ -71,6 +74,16 @@ export const DASHBOARD_HTML = `<!doctype html>
       <main id="detail" class="detail" aria-labelledby="detail-title"></main>
     </div>
   </div>
+  <dialog id="terminal-dialog" class="terminal-dialog" aria-labelledby="terminal-title">
+    <header class="terminal-head">
+      <div>
+        <span id="terminal-state" class="live"><i aria-hidden="true"></i><span data-i18n="terminal.connecting">Connecting</span></span>
+        <h2 id="terminal-title">Operator</h2>
+      </div>
+      <button id="terminal-close" class="detail-back terminal-close" type="button" aria-label="Close terminal" data-i18n-aria-label="terminal.close">×</button>
+    </header>
+    <div id="terminal-host" class="terminal-host"></div>
+  </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script type="module" src="/assets/app.js"></script>
 </body>

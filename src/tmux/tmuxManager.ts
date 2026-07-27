@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { stripVTControlCharacters } from "node:util";
@@ -13,12 +13,8 @@ import {
 const DEFAULT_READINESS_TIMEOUT_MS = 15_000;
 const DEFAULT_READINESS_POLL_MS = 50;
 const DEFAULT_COMMAND_TIMEOUT_MS = 5_000;
+const DEFAULT_HISTORY_LIMIT = 100_000;
 const PANE_STATE_MARKER = "__YUI_PANE_STATE__";
-const NATIVE_SCROLL_TERMINAL_FEATURES = [
-  "256", "RGB", "clipboard", "ccolour", "cstyle", "extkeys", "focus",
-  "hyperlinks", "ignorefkeys", "mouse", "osc7", "overline", "rectfill",
-  "strikethrough", "sync", "title", "usstyle"
-].join(",");
 
 export type TmuxRole = Readonly<{
   name: string;
@@ -55,6 +51,12 @@ export type TmuxRolePaneState = Readonly<{
   currentCommand: string;
 }>;
 
+export type TmuxRoleHistory = Readonly<{
+  actual: number;
+  configured: number;
+  limited: boolean;
+}>;
+
 export type TmuxReadinessProbe = (pane: TmuxPaneState) => boolean;
 
 export type TmuxManagerOptions = Readonly<{
@@ -65,6 +67,8 @@ export type TmuxManagerOptions = Readonly<{
   readinessPollMs?: number;
   initialColumns?: number;
   initialRows?: number;
+  historyLimit?: number;
+  onWarning?: (message: string) => void;
   now?: () => number;
   sleep?: (milliseconds: number) => void;
 }>;
@@ -103,6 +107,8 @@ export class TmuxManager {
   readonly #readinessPollMs: number;
   readonly #initialColumns: number;
   readonly #initialRows: number;
+  readonly #historyLimit: number;
+  readonly #onWarning: ((message: string) => void) | undefined;
   readonly #now: () => number;
   readonly #sleep: (milliseconds: number) => void;
 
@@ -130,6 +136,12 @@ export class TmuxManager {
     );
     this.#initialColumns = positiveInteger(options.initialColumns, 120, "initial tmux columns");
     this.#initialRows = positiveInteger(options.initialRows, 40, "initial tmux rows");
+    this.#historyLimit = positiveInteger(
+      options.historyLimit,
+      DEFAULT_HISTORY_LIMIT,
+      "tmux history limit"
+    );
+    this.#onWarning = options.onWarning;
     this.#now = options.now ?? Date.now;
     this.#sleep = options.sleep ?? blockingSleep;
   }
@@ -148,13 +160,20 @@ export class TmuxManager {
     role: TmuxRole,
     launch?: TmuxLaunchPlan
   ): boolean {
-    if (this.windowNames(taskId).includes(role.name)) return false;
+    if (this.windowNames(taskId).includes(role.name)) {
+      this.configureServerHistory();
+      return false;
+    }
     if (launch === undefined) {
       throw runtimeError(`Agent launch plan is required to create Role window: ${role.name}.`);
     }
 
     if (!this.hasSession(taskId)) {
       this.run([
+        "start-server",
+        ";",
+        "set-option", "-g", "history-limit", String(this.#historyLimit),
+        ";",
         "new-session", "-d",
         "-x", String(this.#initialColumns),
         "-y", String(this.#initialRows),
@@ -165,6 +184,7 @@ export class TmuxManager {
         ...launchCommand(launch)
       ]);
     } else {
+      this.configureServerHistory();
       this.run([
         "new-window",
         "-t", this.sessionName(taskId),
@@ -183,13 +203,19 @@ export class TmuxManager {
     launch?: TmuxLaunchPlan
   ): Promise<boolean> {
     const snapshot = await this.sessionWindowNamesAsync(taskId);
-    if (snapshot.names.includes(role.name)) return false;
+    if (snapshot.names.includes(role.name)) {
+      await this.configureServerHistoryAsync();
+      return false;
+    }
     if (launch === undefined) {
       throw runtimeError(`Agent launch plan is required to create Role window: ${role.name}.`);
     }
-
     if (!snapshot.exists) {
       await this.runAsync([
+        "start-server",
+        ";",
+        "set-option", "-g", "history-limit", String(this.#historyLimit),
+        ";",
         "new-session", "-d",
         "-x", String(this.#initialColumns),
         "-y", String(this.#initialRows),
@@ -200,6 +226,7 @@ export class TmuxManager {
         ...launchCommand(launch)
       ]);
     } else {
+      await this.configureServerHistoryAsync();
       await this.runAsync([
         "new-window",
         "-t", this.sessionName(taskId),
@@ -213,24 +240,118 @@ export class TmuxManager {
   }
 
   attachRole(taskId: string, roleName: string): void {
-    const session = this.sessionName(taskId);
-    // An ANSI outer terminal omits smcup/rmcup, so tmux cannot replace the
-    // terminal's native scrollback with an alternate screen. -T restores the
-    // modern rendering and input capabilities that the real terminal offers.
+    let historyNotice: string | undefined;
+    if (this.#onWarning !== undefined) {
+      const history = this.inspectRoleHistory(taskId, roleName);
+      if (history.limited) {
+        historyNotice = roleHistoryWarning(history);
+        this.#onWarning(historyNotice);
+      }
+    }
+    const readOnly = this.hasWritableClient(taskId);
+    const clientSession = this.createInteractiveClientSession(taskId, historyNotice);
+    try {
+      handoffTerminal(this.#terminalInput, this.#closeInteractiveInput);
+      this.run([
+        "attach-session",
+        ...(readOnly ? ["-r"] : []),
+        "-t", `${clientSession}:${safeValue(roleName, "Role name")}`
+      ], {
+        inheritStdio: true
+      });
+    } finally {
+      this.destroyInteractiveClientSession(clientSession);
+    }
+  }
+
+  /**
+   * A grouped session shares the Agent windows while keeping the selected
+   * window and terminal options local to this one human client.
+   */
+  createInteractiveClientSession(taskId: string, attachedNotice?: string): string {
+    const clientSession = `yui-client-${randomBytes(12).toString("hex")}`;
     this.run([
-      "set-option", "-t", session, "status", "off"
+      "new-session", "-d",
+      "-t", this.sessionName(taskId),
+      "-s", clientSession
     ]);
-    this.run([
-      "set-option", "-t", session, "mouse", "off"
-    ]);
-    handoffTerminal(this.#terminalInput, this.#closeInteractiveInput);
-    this.run([
-      "-T", NATIVE_SCROLL_TERMINAL_FEATURES,
-      "attach-session", "-t", this.target(taskId, roleName)
-    ], {
-      inheritStdio: true,
-      environment: { TERM: "ansi" }
-    });
+    try {
+      // Let tmux use the outer terminal's native alternate screen. Mouse mode
+      // keeps scrollback inside the long-lived Role pane instead of mixing it
+      // with terminal output that predates this attach.
+      this.run(["set-option", "-t", clientSession, "status", "off"]);
+      this.run(["set-option", "-t", clientSession, "mouse", "on"]);
+      this.run([
+        "set-hook", "-t", clientSession, "client-detached",
+        `kill-session -t ${clientSession}`
+      ]);
+      if (attachedNotice !== undefined) {
+        this.run([
+          "set-hook", "-t", clientSession, "client-attached",
+          `display-message -d 10000 ${tmuxWord(attachedNotice)}`
+        ]);
+      }
+      return clientSession;
+    } catch (error) {
+      this.destroyInteractiveClientSession(clientSession);
+      throw error;
+    }
+  }
+
+  destroyInteractiveClientSession(clientSession: string): void {
+    try {
+      this.run(["kill-session", "-t", safeValue(clientSession, "tmux client session")]);
+    } catch (error) {
+      if (!isExplicitlyAbsentTmuxSession(error)) throw error;
+    }
+  }
+
+  inspectRoleHistory(taskId: string, roleName: string): TmuxRoleHistory {
+    const output = this.run([
+      "display-message", "-p",
+      "-t", this.target(taskId, roleName),
+      "#{history_limit}"
+    ]).trim();
+    const actual = Number(output);
+    if (!Number.isSafeInteger(actual) || actual <= 0) {
+      throw runtimeError(`Tmux returned an invalid history limit for ${taskId}/${roleName}.`);
+    }
+    return {
+      actual,
+      configured: this.#historyLimit,
+      limited: actual < this.#historyLimit
+    };
+  }
+
+  /** Multiple viewers are safe, but only the first attached human may type. */
+  hasWritableClient(taskId: string): boolean {
+    const formatSeparator = "\u001f";
+    const encodedSeparator = "\\037";
+    const taskSession = this.sessionName(taskId);
+    try {
+      const clients = this.run([
+        "list-clients",
+        "-F",
+        `#{session_name}${formatSeparator}#{session_group}${formatSeparator}#{client_readonly}`
+      ]);
+      return clients.split("\n").some((line) => {
+        if (line.length === 0) return false;
+        const separator = line.includes(encodedSeparator) ? encodedSeparator : formatSeparator;
+        const [sessionName, sessionGroup, readOnly, ...extra] = line.split(separator);
+        if (
+          sessionName === undefined
+          || sessionGroup === undefined
+          || readOnly === undefined
+          || extra.length > 0
+        ) {
+          throw runtimeError("Tmux returned an invalid client state row.");
+        }
+        return (sessionName === taskSession || sessionGroup === taskSession) && readOnly === "0";
+      });
+    } catch (error) {
+      if (isExplicitlyAbsentTmuxSession(error)) return false;
+      throw error;
+    }
   }
 
   captureRole(taskId: string, roleName: string, lines = 80): string {
@@ -774,14 +895,30 @@ export class TmuxManager {
   }
 
   stopTask(taskId: string): boolean {
-    if (!this.hasSession(taskId)) return false;
-    this.run(["kill-session", "-t", this.sessionName(taskId)]);
+    const taskSession = this.sessionName(taskId);
+    const sessions = this.taskSessionGroupNames(taskId);
+    if (sessions.length === 0 && !this.hasSession(taskId)) return false;
+    for (const session of [...sessions.filter((name) => name !== taskSession), taskSession]) {
+      try {
+        this.run(["kill-session", "-t", session]);
+      } catch (error) {
+        if (!isExplicitlyAbsentTmuxSession(error)) throw error;
+      }
+    }
     return true;
   }
 
   async stopTaskAsync(taskId: string): Promise<boolean> {
-    if (!(await this.hasSessionAsync(taskId))) return false;
-    await this.runAsync(["kill-session", "-t", this.sessionName(taskId)]);
+    const taskSession = this.sessionName(taskId);
+    const sessions = await this.taskSessionGroupNamesAsync(taskId);
+    if (sessions.length === 0 && !(await this.hasSessionAsync(taskId))) return false;
+    for (const session of [...sessions.filter((name) => name !== taskSession), taskSession]) {
+      try {
+        await this.runAsync(["kill-session", "-t", session]);
+      } catch (error) {
+        if (!isExplicitlyAbsentTmuxSession(error)) throw error;
+      }
+    }
     return true;
   }
 
@@ -852,8 +989,68 @@ export class TmuxManager {
     return yuiTmuxSessionName(this.#yuiHome, taskId);
   }
 
+  private taskSessionGroupNames(taskId: string): string[] {
+    const formatSeparator = "\u001f";
+    const encodedSeparator = "\\037";
+    const taskSession = this.sessionName(taskId);
+    let output: string;
+    try {
+      output = this.run([
+        "list-sessions", "-F",
+        `#{session_name}${formatSeparator}#{session_group}`
+      ]);
+    } catch (error) {
+      if (isExplicitlyAbsentTmuxSession(error)) return [];
+      throw error;
+    }
+    return parseTaskSessionGroupNames(
+      output,
+      taskSession,
+      formatSeparator,
+      encodedSeparator
+    );
+  }
+
+  private async taskSessionGroupNamesAsync(taskId: string): Promise<string[]> {
+    const formatSeparator = "\u001f";
+    const encodedSeparator = "\\037";
+    const taskSession = this.sessionName(taskId);
+    let output: string;
+    try {
+      output = await this.runAsync([
+        "list-sessions", "-F",
+        `#{session_name}${formatSeparator}#{session_group}`
+      ]);
+    } catch (error) {
+      if (isExplicitlyAbsentTmuxSession(error)) return [];
+      throw error;
+    }
+    return parseTaskSessionGroupNames(
+      output,
+      taskSession,
+      formatSeparator,
+      encodedSeparator
+    );
+  }
+
   private target(taskId: string, roleName: string): string {
     return yuiTmuxTarget(this.#yuiHome, taskId, roleName);
+  }
+
+  private configureServerHistory(): void {
+    this.run([
+      "start-server",
+      ";",
+      "set-option", "-g", "history-limit", String(this.#historyLimit)
+    ]);
+  }
+
+  private async configureServerHistoryAsync(): Promise<void> {
+    await this.runAsync([
+      "start-server",
+      ";",
+      "set-option", "-g", "history-limit", String(this.#historyLimit)
+    ]);
   }
 
   /** Every operation is pinned to the server derived from this YUI_HOME. */
@@ -919,6 +1116,23 @@ function parseRolePaneInventory(
       ...(Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),
       currentCommand
     }];
+  });
+}
+
+function parseTaskSessionGroupNames(
+  output: string,
+  taskSession: string,
+  formatSeparator: string,
+  encodedSeparator: string
+): string[] {
+  return output.split("\n").flatMap((line): string[] => {
+    if (line.length === 0) return [];
+    const separator = line.includes(encodedSeparator) ? encodedSeparator : formatSeparator;
+    const [sessionName, sessionGroup, ...extra] = line.split(separator);
+    if (sessionName === undefined || sessionGroup === undefined || extra.length > 0) {
+      throw runtimeError("Tmux returned an invalid session group row.");
+    }
+    return sessionName === taskSession || sessionGroup === taskSession ? [sessionName] : [];
   });
 }
 
@@ -1076,6 +1290,13 @@ function positiveInteger(value: number | undefined, fallback: number, label: str
     throw new TypeError(`${label} must be a positive integer`);
   }
   return resolved;
+}
+
+function roleHistoryWarning(history: TmuxRoleHistory): string {
+  return "This existing Role has a "
+    + `${history.actual.toLocaleString("en-US")}-line tmux history. `
+    + "Please exit and re-enter the Role to use "
+    + `${history.configured.toLocaleString("en-US")} lines.`;
 }
 
 function blockingSleep(milliseconds: number): void {

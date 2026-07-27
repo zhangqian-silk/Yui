@@ -70,6 +70,7 @@ import {
   AgentConfigurationCatalogService
 } from "./executor/agentConfigurationCatalog.js";
 import type { RoleAgentConfig } from "./executor/agentAdapter.js";
+import { TmuxWebTerminalService } from "./web/tmuxWebTerminal.js";
 
 const VERSION = readPackageVersion();
 const rawArgs = process.argv.slice(2);
@@ -182,15 +183,6 @@ export async function main(): Promise<void> {
   }
   await preflightAgentConfigurationMutation(resolved, store, catalogs);
 
-  if (resolved[0] === "web") {
-    if (jsonOutput) throw usageError("Web does not support --json.");
-    const options = parseWebCommandOptions(resolved.slice(1));
-    await startYuiWebServer(store, options);
-    const displayHost = options.host === "::1" ? "[::1]" : options.host;
-    process.stdout.write(`Yui web dashboard: http://${displayHost}:${options.port}\n`);
-    return;
-  }
-
   if (resolved[0] === "controller") {
     const method = resolved[1];
     if ((method !== "status" && method !== "stop" && method !== "restart") || resolved.length !== 2) {
@@ -208,7 +200,11 @@ export async function main(): Promise<void> {
   const tmux = new TmuxManager(
     process.env.YUI_TMUX_BIN ?? "tmux",
     executor,
-    { yuiHome: home, terminalInput: process.stdin }
+    {
+      yuiHome: home,
+      terminalInput: process.stdin,
+      onWarning: (message) => process.stderr.write(`Warning: ${message}\n`)
+    }
   );
   const schedulerStore = new FileSchedulerStoreAdapter(store);
   const planner = new FileRoleLaunchPlanner(home, store, { environment: process.env });
@@ -229,6 +225,50 @@ export async function main(): Promise<void> {
     }
   );
   const workspaceCoordinator = new TaskWorkspaceCoordinator(store, workspacePreparer, runtime);
+
+  if (resolved[0] === "web") {
+    if (jsonOutput) throw usageError("Web does not support --json.");
+    const options = parseWebCommandOptions(resolved.slice(1));
+    const terminal = new TmuxWebTerminalService({
+      yuiHome: home,
+      tmuxBin: process.env.YUI_TMUX_BIN ?? "tmux",
+      tmux,
+      prepareTaskRole: (input) => runtime.prepareTaskRoleEnter(input),
+      prepareGlobalRole: (roleName) => runtime.prepareGlobalRoleEnter(roleName),
+      environment: process.env,
+      onError: (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        process.stderr.write(`Web terminal cleanup error: ${message}\n`);
+      }
+    });
+    await startYuiWebServer(store, options, {
+      terminal,
+      answerInput: async ({ taskId, inputId, answer }) => {
+        const command = [
+          "input", "answer", inputId, "--task", taskId,
+          ...("choiceKey" in answer
+            ? ["--choice", answer.choiceKey]
+            : ["--text", answer.text])
+        ];
+        const result = runTaskCommand(command, store, {
+          runtime,
+          environment: {},
+          yuiHome: home
+        });
+        if (result.kind !== "output") {
+          throw new Error("Input answer returned an invalid control result.");
+        }
+        const data = result.data as Readonly<{ request?: unknown }> | undefined;
+        if (data?.request === undefined) {
+          throw new Error("Input answer did not return the updated request.");
+        }
+        return data.request;
+      }
+    });
+    const displayHost = options.host === "::1" ? "[::1]" : options.host;
+    process.stdout.write(`Yui web control room: http://${displayHost}:${options.port}\n`);
+    return;
+  }
 
   if (resolved[0] === "agent") {
     const agentArgs = resolved.slice(1);
