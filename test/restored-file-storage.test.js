@@ -6,11 +6,10 @@ import test from "node:test";
 
 import {
   CURRENT_AGGREGATE_SCHEMA_VERSION,
-  CURRENT_STORAGE_SCHEMA_VERSION,
+  CURRENT_STORAGE_LAYOUT_VERSION,
   ensureStorageSchema,
   inspectStorageSchema,
-  requireStorageSchema,
-  STORAGE_MIGRATIONS
+  requireStorageSchema
 } from "../dist/storage/storageSchema.js";
 import {
   FileTaskStore,
@@ -21,25 +20,23 @@ function temporaryHome() {
   return mkdtempSync(join(tmpdir(), "yui-file-store-"));
 }
 
-test("storage schema initializes v5 and rejects every non-current version", () => {
+test("storage schema initializes v6 and rejects every non-current version", () => {
   const home = temporaryHome();
-  assert.equal(CURRENT_STORAGE_SCHEMA_VERSION, 5);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 4);
-  assert.deepEqual(STORAGE_MIGRATIONS, []);
+  assert.equal(CURRENT_STORAGE_LAYOUT_VERSION, 6);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 6);
   assert.equal(inspectStorageSchema(home).status, "uninitialized");
 
   ensureStorageSchema(home, new Date("2026-07-19T00:00:00.000Z"));
   assert.deepEqual(JSON.parse(readFileSync(join(home, "schema.json"), "utf8")), {
     schemaVersion: 1,
-    storageVersion: 5,
+    storageVersion: 6,
     aggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-    activeGeneration: null,
     updatedAt: "2026-07-19T00:00:00.000Z"
   });
   assert.equal(inspectStorageSchema(home).status, "current");
   assert.doesNotThrow(() => requireStorageSchema(home));
 
-  for (const storageVersion of [4, 6]) {
+  for (const storageVersion of [5, 7]) {
     writeFileSync(join(home, "schema.json"), JSON.stringify({
       schemaVersion: 1,
       storageVersion,
@@ -48,7 +45,7 @@ test("storage schema initializes v5 and rejects every non-current version", () =
     }));
     assert.throws(
       () => requireStorageSchema(home),
-      storageVersion < 5 ? /older.*no migration/i : /newer.*Yui/i
+      storageVersion < 6 ? /older.*no migration/i : /newer.*Yui/i
     );
   }
 });
@@ -120,11 +117,14 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     }
   };
   const item = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: "work-1",
     taskId: task.id,
     title: "Implement",
-    assignee: "leader",
+    objective: "Implement",
+    acceptance: [],
+    dependsOn: [],
+    revision: 1,
     status: "running",
     createdAt: timestamp,
     updatedAt: timestamp
@@ -181,8 +181,8 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   });
 
   const onDisk = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
-  assert.equal(onDisk.schemaVersion, 4);
-  assert.equal(onDisk.tasks[task.id].schemaVersion, 4);
+  assert.equal(onDisk.schemaVersion, 6);
+  assert.equal(onDisk.tasks[task.id].schemaVersion, 5);
   assert.equal(onDisk.revision, 1);
   assert.deepEqual(store.getConfiguredAgent("codex"), agent);
   assert.deepEqual(store.getGlobalRole("operator"), globalRole);
@@ -219,7 +219,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify(incompatible));
   assert.throws(
     () => new FileTaskStore(home).listTasks(),
-    /Task aggregate task-1 must use schemaVersion 4/
+    /Task aggregate task-1 must use schemaVersion 5/
   );
 });
 
@@ -435,10 +435,14 @@ test("record versions and aggregate shape are validated without silently repairi
     updatedAt: timestamp
   };
   const item = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: "work-1",
     taskId: task.id,
     title: "Implement",
+    objective: "Implement",
+    acceptance: [],
+    dependsOn: [],
+    revision: 1,
     assignee: "leader",
     status: "completed",
     outcome: "Done",

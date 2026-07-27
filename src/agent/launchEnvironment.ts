@@ -1,4 +1,8 @@
 import type { AgentAdapterId } from "./adapterCatalog.js";
+import {
+  resolveAgentEnvironment,
+  type ConfiguredAgent
+} from "./agent.js";
 import { homedir, tmpdir } from "node:os";
 import { dirname } from "node:path";
 
@@ -109,5 +113,19 @@ export function operationalAgentEnvironment(
       ...AGENT_OPERATIONAL_ENVIRONMENT_NAMES,
       ...nativeAgentEnvironmentNames(adapterId)
     ])
+  };
+}
+
+export function configuredAgentLaunchEnvironment(
+  agent: ConfiguredAgent,
+  source: NodeJS.ProcessEnv
+): Record<string, string> {
+  const {
+    SSH_AUTH_SOCK: _sshAgent,
+    ...operational
+  } = operationalAgentEnvironment(agent.adapterId, source);
+  return {
+    ...operational,
+    ...resolveAgentEnvironment(agent, source)
   };
 }

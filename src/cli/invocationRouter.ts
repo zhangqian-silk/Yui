@@ -34,7 +34,11 @@ function resolveExecutionPath(args: readonly string[]): Invocation {
   while (index < args.length) {
     if (node.kind === "leaf") break;
     const child = findChild(node, args[index] ?? "");
-    if (child === undefined) {
+    const internalExecutable = child !== undefined && (
+      (node === ROOT_COMMAND && child.name === "internal")
+      || (node.path.join(" ") === "yui completion" && child.name === "candidates")
+    );
+    if (child === undefined || (child.hidden && !internalExecutable)) {
       if (node.kind === "hybrid" && node.acceptsArguments) break;
       return {
         kind: "path-error",

@@ -2,9 +2,25 @@
 
 # Yui
 
-Yui 是一个用于长期 Codex/Claude 工作的本地编排器。控制状态、Project Catalog 和项目知识保存在可检查的 JSON 文件中，所有 Agent 终端完全由 tmux 主导，带 Project 的 Task 使用确定性的 Git worktree。
+Yui 是面向持久 Codex/Claude 工作的本地控制平面。它把可检查的控制状态与 Project 知识、tmux 原生 Agent 终端、可复用 AgentProfile、Leader 上下文 fork、显式验收和隔离 Git worktree 组合成一条完整链路。
 
-当前实现恢复了实用的 Role/Agent/session 模型和 CLI 框架，但没有恢复后期膨胀的数据维护、租约、定时调度和恢复账本体系。
+当前实现保留实用的 Role/Agent/session 与 CLI 框架，不恢复后期膨胀的数据维护、租约、定时调度和恢复账本体系。
+
+## 核心模型
+
+- `AgentProfile`：可复用的 Worker 执行模板，保存单一 Codex Agent、模型、最大权限、指令和 Skill；不持有 Session 或 workspace。
+- `WorkItem`：只保存 objective、acceptance、dependsOn、revision 和状态。
+- `ExecutionAttempt`：一次执行，保存精确输入、Profile revision、executor、access、可选 Git base、provider ID 和精简结果。
+- `ChangeSet`：可集成的 base/head commit、branch 和 changed paths。
+- `IntegrationAttempt`：候选集成、检查、冲突报告和 Leader 决策。
+
+内置 Profile：
+
+```text
+worker  explorer  implementer  reviewer
+```
+
+AgentProfile 是由一个已配置 Codex Agent 支撑的版本化 Worker 执行模板，保存默认值和指令，但不持有 Session 或 workspace。Operator 与 Leader 仍是运行时 Role。
 
 ## 环境要求
 
@@ -41,7 +57,7 @@ export YUI_HOME=/absolute/path/to/yui-home
 yui setup
 ```
 
-home 中包含 `schema.json`、权威 `state.json`、Project Catalog、项目知识和 Controller 发现文件。稳定 Project checkout 与受管理 worktree 位于 home 外部的 workspace。当前存储版本严格匹配且 fresh-only；代码保留了未来版本的迁移注册表，但本版不迁移旧格式。
+home 中包含 `schema.json`、权威 `state.json`、Project Catalog、项目知识和 Controller 发现文件。稳定 Project checkout 与受管理 worktree 位于 home 外部的 workspace。当前存储版本严格匹配且 fresh-only；旧格式会被直接拒绝，不做迁移。
 
 ## 快速开始
 
@@ -98,6 +114,51 @@ yui task run yield <run-id> --summary "导出器已完成，聚焦测试通过"
 ```
 
 yield 会原子完成 Run 和 WorkItem、追加结果消息并唤醒 Leader。Leader 不会自唤醒；Leader 忙碌时，Operator/Worker 的 pending wake 会一直保留到 Leader 空闲。
+
+对于不需要持久、用户所有 Session 的有界工作，Leader 可以派发 ExecutionAttempt：
+
+```sh
+yui task work create <task-id> "审查实现" \
+  --objective "返回有源码依据的问题" \
+  --accept "每个问题都标明受影响路径"
+yui task attempt dispatch <work-item-id> --profile reviewer --mode auto --access read
+
+yui task work create <task-id> "实现已接受的改动" \
+  --objective "实现并验证请求行为" \
+  --accept "聚焦测试通过"
+yui task attempt dispatch <work-item-id> --profile implementer --mode auto --access write
+```
+
+`auto` 只 fork 当前活动 Leader thread；不存在兼容 Leader thread 时会直接失败，不会静默创建 root Session。显式 root Session 必须同时提供 `--mode session` 和 `--session-reason`。
+
+Attempt 派发只传递稳定的 Yui 记录引用，不再复制当前 Brief、决策和消息形成第二份快照。Worker 使用受控 `YUI_HOME` 通过 `yui task context` 和 Project Knowledge 命令读取最新上下文，但不会获得 Task Role 身份。
+
+写 Attempt 使用 `<workspace>/worktree/<project>/<task-id>/attempts/<attempt-id>` 下的独立 worktree，因此不同工作即使路径重叠也可以并发进行；重叠只会增加集成成本，不是派发时的文件锁。成功的写 Attempt 生成 ChangeSet。集成会在候选 worktree 应用变更、运行检查，并且只在目标 HEAD 仍与记录值相同时推进目标：
+
+```sh
+yui task integration start <task-id> \
+  --change-set <change-set-id> \
+  --check "npm test"
+```
+
+Integration 主状态只保存紧凑的检查结果和失败诊断。完整 stdout/stderr 不截断地流式写入 `YUI_HOME/artifacts/integration-checks/...`；`task integration show` 会显示相对日志路径，`task integration cleanup` 会同时清理候选 worktree 和这些日志。
+
+代码或语义冲突会保持 blocked，直到该 Task 的 Leader 记录决策：
+
+```sh
+yui task integration resolve <integration-id> \
+  --option manual-resolution \
+  --rationale "保留公开契约并组合两边实现"
+yui task integration continue <integration-id>
+```
+
+Attempt 成功不等于 WorkItem 完成。Leader 审查结果、验证和 ChangeSet 集成后再显式验收：
+
+```sh
+yui task work accept <work-item-id> --summary "验收标准满足。"
+```
+
+使用 `task work reject` 退回待验收结果以便重试，使用 `task work cancel` 关闭不再需要且未运行的工作。Attempt、Integration worktree 与 Integration 检查日志会作为证据保留，直到显式清理。
 
 当活动 Leader Run 必须获得用户决定才能继续时，可以创建持久 InputRequest，并 yield 当前 Run：
 
@@ -224,6 +285,7 @@ Yui 面向一台机器上的一个受信任本地用户。它的 Web/API 仅支�
 ## 本地开发
 
 ```sh
+npm ci
 npm run build
 npm test
 npm run lint

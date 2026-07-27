@@ -1144,9 +1144,9 @@ test("runtime native session registration is structured and exited work fails at
   const item = updateWorkItemStatus(createWorkItem(
     "work-item-1",
     task.id,
-    { title: "Implement", assignee: role.name },
+    { title: "Implement" },
     now
-  ), "running", undefined, now);
+  ), "running", now);
   const run = createAgentRun(
     "agent-run-1",
     task.id,

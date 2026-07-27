@@ -756,7 +756,12 @@ test("Leader can directly create and clean a WorkItem-owned isolated worktree", 
   assert.equal(store.getRole(task.id, "worker").workspace, isolated.path);
   assert.equal(store.getTask(task.id).cwd, main);
 
-  store.saveWorkItem(task.id, updateWorkItemStatus(item, "completed", "Integrated into main.", NOW));
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  store.saveWorkItem(
+    task.id,
+    updateWorkItemStatus(running, "completed", NOW, "Integrated into main.")
+  );
   const planner = new FileRoleLaunchPlanner(home, store, { cliPath: "/dist/cli.js" });
   assert.throws(() => planner.plan({
     taskId: task.id,
@@ -811,7 +816,10 @@ test("WorkItem cleanup validates its disposition before removing the worktree", 
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
   await preparer.prepareTaskWorkspace(task.id);
   const isolated = await preparer.prepareWorkItemWorkspace(item.id);
-  const completed = updateWorkItemStatus(item, "completed", "Integrated.", NOW);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  const completed = updateWorkItemStatus(running, "completed", NOW, "Integrated.");
+  store.saveWorkItem(task.id, completed);
   store.saveWorkItem(
     task.id,
     recordWorkItemWorkspaceDisposition(completed, "integrated", NOW)
@@ -835,7 +843,7 @@ test("WorkItem cleanup cannot record a disposition without an isolated worktree"
   const item = updateWorkItemStatus(createWorkItem("work-1", task.id, {
     title: "Shared work",
     assignee: "worker"
-  }, NOW), "completed", "Done in main.", NOW);
+  }, NOW), "completed", NOW, "Done in main.");
   store.saveWorkItem(task.id, item);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
   await preparer.prepareTaskWorkspace(task.id);
@@ -897,11 +905,13 @@ test("Task archive requires explicit WorkItem cleanup and preserves its record",
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
   const main = (await preparer.prepareTaskWorkspace(active.id)).path;
   const isolated = await preparer.prepareWorkItemWorkspace(item.id);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(active.id, running);
   store.saveWorkItem(active.id, updateWorkItemStatus(
-    item,
+    running,
     "completed",
-    "Integrated into main.",
-    NOW
+    NOW,
+    "Integrated into main."
   ));
   store.saveTask(completeTask(store.getTask(active.id), NOW, {
     summary: "Done",

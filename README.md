@@ -2,7 +2,7 @@
 
 # Yui
 
-Yui is a local orchestrator for long-running Codex and Claude work. It keeps its control state and Project knowledge in inspectable JSON files, lets tmux own every Agent terminal, and creates deterministic Git worktrees for Project-backed Tasks.
+Yui is a local control plane for durable Codex and Claude work. It keeps control state and Project knowledge in inspectable JSON, lets tmux own native Agent terminals, and combines reusable Agent Profiles, Leader-context forks, explicit acceptance, and isolated Git worktrees for Project-backed Tasks.
 
 The current implementation restores the useful Role/Agent/session and CLI framework without restoring the later data-maintenance, lease, schedule, and recovery-ledger systems.
 
@@ -42,6 +42,14 @@ yui setup
 ```
 
 The home contains `schema.json`, the authoritative `state.json`, Project Catalog and knowledge, and Controller discovery files. Stable Project checkouts and managed worktrees live under the configured workspace, outside Yui home. The current storage version is exact and fresh-only; this release does not migrate older formats.
+
+Setup also seeds four reusable Agent Profiles:
+
+```text
+worker  explorer  implementer  reviewer
+```
+
+Profiles are versioned Worker execution templates backed by one configured Codex Agent. They hold defaults and instructions, but do not own a Session or workspace. Operator and Leader remain runtime Roles.
 
 ## Quick start
 
@@ -108,6 +116,51 @@ yui task run yield <run-id> --summary "Implemented the exporter; focused tests p
 ```
 
 Yield atomically completes the Run and WorkItem, appends the result message, and queues the Leader. A Leader never wakes itself; any already-pending Operator or Worker wake remains durable until the Leader is idle.
+
+For bounded work that does not need a persistent, user-owned Session, the Leader can dispatch an Execution Attempt:
+
+```sh
+yui task work create <task-id> "Review the implementation" \
+  --objective "Return source-backed findings" \
+  --accept "Every finding identifies an affected path"
+yui task attempt dispatch <work-item-id> --profile reviewer --mode auto --access read
+
+yui task work create <task-id> "Implement the accepted change" \
+  --objective "Implement and validate the requested behavior" \
+  --accept "Focused tests pass"
+yui task attempt dispatch <work-item-id> --profile implementer --mode auto --access write
+```
+
+`auto` forks the active Leader thread and fails fast when no compatible Leader thread is available; it never silently creates a root Session. Explicit root Session execution requires both `--mode session` and `--session-reason`.
+
+Attempt dispatch passes stable Yui record references instead of copying the current Brief, decisions, and messages into another snapshot. Workers can read current context through `yui task context` and Project Knowledge commands using the managed `YUI_HOME`, while their Task Role identity remains unset.
+
+Write Attempts use separate worktrees under `<workspace>/worktree/<project>/<task-id>/attempts/<attempt-id>`, so independent work may proceed concurrently even when paths overlap. A successful write emits a ChangeSet. Integration applies it in a candidate worktree, runs the requested checks, and advances the target only if its recorded head still matches:
+
+```sh
+yui task integration start <task-id> \
+  --change-set <change-set-id> \
+  --check "npm test"
+```
+
+Integration state stores compact check outcomes and failure diagnoses. Full stdout and stderr are streamed without truncation to `YUI_HOME/artifacts/integration-checks/...`; `task integration show` exposes the relative log path, and `task integration cleanup` removes both the candidate worktree and those logs.
+
+Code or semantic conflicts remain blocked until that Task's Leader records a decision:
+
+```sh
+yui task integration resolve <integration-id> \
+  --option manual-resolution \
+  --rationale "Preserve the public contract while combining both implementations"
+yui task integration continue <integration-id>
+```
+
+Attempt success is not WorkItem completion. The Leader accepts only after reviewing the result, validations, and any ChangeSet integration:
+
+```sh
+yui task work accept <work-item-id> --summary "Acceptance criteria met."
+```
+
+Use `task work reject` to return an awaiting result for retry and `task work cancel` for obsolete non-running work. Attempt and Integration worktrees and Integration check logs remain available as evidence until explicit cleanup.
 
 When an active Leader Run cannot continue without a user decision, it can create a durable InputRequest and yield its Run:
 
@@ -238,6 +291,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for persistence and scheduling details.
 ## Development
 
 ```sh
+npm ci
 npm run build
 npm test
 npm run lint

@@ -60,7 +60,6 @@ import {
   reopenTask,
   updateTaskMetadata,
   type Task,
-  type TaskCompletedBy,
   type TaskMetadata,
   type TaskPriority
 } from "../task/task.js";
@@ -100,6 +99,7 @@ import {
   openInputRequestCount,
   runTaskInputCommand
 } from "./taskInputCommands.js";
+import { taskActor as resolveTaskActor } from "./taskActor.js";
 
 const LEADER_ROLE = "leader";
 
@@ -152,7 +152,7 @@ export function runTaskCommand(
     case "message": return output(taskMessageCommand(rest, store, options));
     case "input": return runTaskInputCommand(rest, store, options);
     case "role": return taskRoleCommand(rest, store, options);
-    case "work": return output(taskWorkCommand(rest, store, options));
+    case "work": return taskWorkCommand(rest, store, options);
     case "run": return output(taskRunCommand(rest, store, options));
     case "brief": return taskBriefCommand(rest, store, options);
     case "decision": return taskDecisionCommand(rest, store, options);
@@ -355,7 +355,6 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
   const [taskId] = args;
   exactPositionals(args, 1, "Task show usage: yui task show <id>.");
   const task = requireTask(store, taskId);
-  const roles = store.listRoles(task.id);
   const messages = store.listMessages(task.id);
   const brief = store.getTaskBrief(task.id);
   const decisions = store.listDecisions(task.id);
@@ -363,15 +362,18 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
   const events = store.listEvents(task.id);
   const openInputs = openInputRequestCount(store, task.id);
   const work = store.listWorkItems(task.id);
-  const runs = store.listAgentRuns(task.id);
+  const attempts = store.listExecutionAttempts(task.id);
+  const changeSets = store.listChangeSets(task.id);
+  const integrations = store.listIntegrationAttempts(task.id);
   const counts = {
-    roles: roles.length,
     messages: messages.length,
     decisions: decisions.length,
     milestones: milestones.length,
     events: events.length,
     workItems: work.length,
-    runs: runs.length,
+    attempts: attempts.length,
+    changeSets: changeSets.length,
+    integrations: integrations.length,
     openInputs
   };
   const timeZone = store.getConfig().timeZone;
@@ -389,14 +391,15 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     ...(task.projectId === undefined ? [] : [`Project: ${task.projectId}`]),
     ...(task.baseRef === undefined ? [] : [`Base: ${task.baseRef}`]),
     ...(task.cwd === undefined ? [] : [`Workspace: ${task.cwd}`]),
-    `Roles: ${counts.roles}`,
     `Messages: ${counts.messages}`,
     `Brief: ${brief === null ? "no" : "yes"}`,
     `Decisions: ${counts.decisions}`,
     `Milestones: ${counts.milestones}`,
     `Events: ${counts.events}`,
     `Work items: ${counts.workItems}`,
-    `Runs: ${counts.runs}`,
+    `Execution Attempts: ${counts.attempts}`,
+    `ChangeSets: ${counts.changeSets}`,
+    `Integration Attempts: ${counts.integrations}`,
     `Open inputs: ${counts.openInputs}`,
     `Created: ${presentTime(task.createdAt, timeZone)}`,
     `Updated: ${presentTime(task.updatedAt, timeZone)}`
@@ -456,6 +459,30 @@ function completeTaskCommand(
     if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
     assertNoOpenInputRequests(tx, task.id, "completing the Task");
+    const activeAttempt = tx.listExecutionAttempts(task.id).find((attempt) => (
+      attempt.state === "running"
+    ));
+    if (activeAttempt !== undefined) {
+      throw usageError(`Task ${task.id} has an active Execution Attempt: ${activeAttempt.id}.`);
+    }
+    const incompleteWork = tx.listWorkItems(task.id).find((item) => (
+      item.status !== "completed"
+      && item.status !== "cancelled"
+      && item.status !== "superseded"
+    ));
+    if (incompleteWork !== undefined) {
+      throw usageError(`Task ${task.id} has unaccepted work: ${incompleteWork.id}/${incompleteWork.status}.`);
+    }
+    const unresolvedIntegration = tx.listIntegrationAttempts(task.id).find((integration) => (
+      integration.status === "running"
+      || integration.status === "blocked"
+      || integration.status === "validating"
+    ));
+    if (unresolvedIntegration !== undefined) {
+      throw usageError(
+        `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
+      );
+    }
 
     const roles = tx.listRoles(task.id);
     const activeRuns = roles
@@ -563,6 +590,22 @@ function archiveTaskCommand(
       throw usageError(`Task ${task.id} still has managed worktrees; clean them before archiving.`);
     }
     assertNoOpenInputRequests(tx, task.id, "archiving the Task");
+    const activeAttempt = tx.listExecutionAttempts(task.id).find((attempt) => (
+      attempt.state === "running"
+    ));
+    if (activeAttempt !== undefined) {
+      throw usageError(`Task ${task.id} has an active Execution Attempt: ${activeAttempt.id}.`);
+    }
+    const unresolvedIntegration = tx.listIntegrationAttempts(task.id).find((integration) => (
+      integration.status === "running"
+      || integration.status === "blocked"
+      || integration.status === "validating"
+    ));
+    if (unresolvedIntegration !== undefined) {
+      throw usageError(
+        `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
+      );
+    }
     const archived = archiveTask(task, now, { by: actor });
     tx.saveTask(archived);
     tx.clearPendingWakeup(task.id);
@@ -590,7 +633,7 @@ function archiveTaskCommand(
       if (failed.workItemId !== undefined) {
         const item = tx.getWorkItem(task.id, failed.workItemId);
         if (item !== null && item.status === "running") {
-          tx.saveWorkItem(task.id, updateWorkItemStatus(item, "failed", "Task archived.", now));
+          tx.saveWorkItem(task.id, updateWorkItemStatus(item, "failed", now, "Task archived."));
         }
       }
     }
@@ -1060,12 +1103,15 @@ function taskWorkCommand(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
-): string {
+): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "create") return createWork(rest, store, options);
   if (command === "list") return listWork(rest, store);
-  if (command === "update") return updateWork(rest, store, options);
-  if (command === "dispatch") return dispatchWork(rest, store, options);
+  if (command === "update") return output(updateWork(rest, store, options));
+  if (command === "dispatch") return output(dispatchWork(rest, store, options));
+  if (command === "accept") return acceptWork(rest, store, options);
+  if (command === "reject") return rejectWork(rest, store, options);
+  if (command === "cancel") return cancelWork(rest, store, options);
   throw usageError(command === undefined
     ? "Task work command is required."
     : `Unknown command: task work ${command}`);
@@ -1075,45 +1121,32 @@ function createWork(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
-): string {
-  const usage = "Task work create usage: yui task work create <task> <title> [--role <name>].";
-  const parsed = parseTail(args, new Set(["--role"]), usage);
+): TaskCommandExecution {
+  const usage = "Task work create usage: yui task work create <task> <title> [--objective <text>] [--accept <criterion> ...] [--after <work> ...] [--role <name>].";
+  const parsed = parseWorkCreateArgs(args, usage);
   exactPositionals(parsed.positionals, 2, usage);
   const now = clock(options);
   const item = store.transaction((tx) => {
     const task = requireTask(tx, parsed.positionals[0]);
     assertTaskOpen(task);
-    const roleName = parsed.options.get("--role")?.trim() ?? LEADER_ROLE;
-    requireRole(tx, task.id, roleName);
+    for (const dependencyId of parsed.after) {
+      const dependency = tx.getWorkItem(task.id, dependencyId);
+      if (dependency === null) throw usageError(`Work Item dependency not found: ${dependencyId}.`);
+    }
+    if (parsed.role !== undefined) requireRole(tx, task.id, parsed.role);
     const created = createWorkItem(tx.nextWorkItemId(task.id), task.id, {
       title: parsed.positionals[1],
-      assignee: roleName
+      objective: parsed.objective ?? parsed.positionals[1],
+      acceptance: parsed.acceptance,
+      dependsOn: parsed.after,
+      ...(parsed.role === undefined ? {} : { assignee: parsed.role })
     }, now);
     tx.saveWorkItem(task.id, created);
     enqueueWork(tx, taskMailbox(task.id), "work-created", now, [workItemRef(created.id)]);
     return created;
   });
   notifyMailbox(options.runtime, taskMailbox(item.taskId), item.taskId);
-  return `Created work item ${item.id} for ${item.taskId}\n`;
-}
-
-function listWork(args: string[], store: TaskWorkflowStore): string {
-  exactPositionals(args, 1, "Task work list usage: yui task work list <task>.");
-  const task = requireTask(store, args[0]);
-  const items = store.listWorkItems(task.id);
-  if (items.length === 0) return "No work items found.\n";
-  return `${renderTable(
-    `Task work: ${task.id}`,
-    [
-      { header: "Work", minWidth: 6, maxWidth: 20 },
-      { header: "Status", minWidth: 6, maxWidth: 12 },
-      { header: "Role", minWidth: 4, maxWidth: 22 },
-      { header: "Title", minWidth: 8, maxWidth: 64 },
-      { header: "Summary", minWidth: 8, maxWidth: 48 }
-    ],
-    items.map((item) => [item.id, presentWorkStatus(item.status), item.assignee, item.title, item.outcome ?? "-"]),
-    defaultTableWidth()
-  )}\n`;
+  return output(`Created work item ${item.id} for ${item.taskId}\n`, { workItem: item });
 }
 
 function updateWork(
@@ -1126,9 +1159,9 @@ function updateWork(
   exactPositionals(parsed.positionals, 2, usage);
   const requested = parsed.positionals[1];
   const status = parseWorkStatus(requested);
-  const summary = parsed.options.get("--summary");
+  const summary = trimmed(parsed.options.get("--summary"));
   if (["completed", "failed", "cancelled", "superseded"].includes(status)
-    && trimmed(summary) === undefined) {
+    && summary === undefined) {
     throw usageError(`--summary is required when work becomes ${requested}.`);
   }
   const now = clock(options);
@@ -1136,11 +1169,14 @@ function updateWork(
     const current = requireWorkItem(tx, parsed.positionals[0]);
     const task = requireTask(tx, current.taskId);
     assertTaskOpen(task);
+    if (current.assignee === undefined) {
+      throw usageError(`Attempt-backed Work Item must use accept, reject, or cancel: ${current.id}.`);
+    }
     const active = tx.getActiveAgentRun(task.id, current.assignee);
     if (active?.workItemId === current.id && status !== "running") {
       throw usageError(`Work item ${current.id} has an active run; yield the run instead.`);
     }
-    const updated = updateWorkItemStatus(current, status, trimmed(summary), now);
+    const updated = updateWorkItemStatus(current, status, now, summary);
     tx.saveWorkItem(task.id, updated);
     enqueueWork(tx, taskMailbox(task.id), "work-updated", now, [workItemRef(updated.id)]);
     return updated;
@@ -1167,6 +1203,9 @@ function dispatchWork(
     if (item.status !== "pending") {
       throw usageError(`Work item ${item.id} cannot be dispatched from ${item.status}.`);
     }
+    if (item.assignee === undefined) {
+      throw usageError(`Work Item has no Task Role assignee; use task attempt dispatch: ${item.id}.`);
+    }
     const role = requireRole(tx, task.id, item.assignee);
     const workspace = tx.getRoleWorkspace(task.id, role.name);
     if (workspace?.owner.type === "work-item"
@@ -1179,7 +1218,7 @@ function dispatchWork(
     if (tx.getActiveAgentRun(task.id, role.name) !== null) {
       throw usageError(`${task.id}/${role.name} already has an active run.`);
     }
-    const rawInput = trimmed(parsed.options.get("--input")) ?? item.title;
+    const rawInput = trimmed(parsed.options.get("--input")) ?? item.objective;
     const runId = tx.nextAgentRunId(task.id);
     const input = markYuiRunInput(
       compileDispatchInput({}, task.id, role, rawInput),
@@ -1197,7 +1236,7 @@ function dispatchWork(
     );
     tx.saveAgentRun(created);
     tx.saveActiveAgentRun(created);
-    tx.saveWorkItem(task.id, updateWorkItemStatus(item, "running", undefined, now));
+    tx.saveWorkItem(task.id, updateWorkItemStatus(item, "running", now));
     tx.saveRole(task.id, updateRoleStatus(role, "running", now));
     enqueueWork(tx, roleMailbox(task.id, role.name), "run-dispatched", now, [
       runRef(created.id),
@@ -1207,6 +1246,171 @@ function dispatchWork(
   });
   notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName), run.taskId);
   return `Dispatch queued for ${run.taskId}/${run.roleName} (${run.id})\n`;
+}
+
+function acceptWork(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task work accept usage: yui task work accept <work> --summary <text>.";
+  const parsed = parseTail(args, new Set(["--summary"]), usage);
+  exactPositionals(parsed.positionals, 1, usage);
+  const summary = requiredOption(parsed.options, "--summary");
+  const now = clock(options);
+  const accepted = store.transaction((tx) => {
+    const item = requireWorkItem(tx, parsed.positionals[0]);
+    const task = requireTask(tx, item.taskId);
+    if (task.status !== "active") {
+      throw usageError(`Task is not active: ${task.id}/${task.status}.`);
+    }
+    if (taskActor(options, task.id) !== "leader") {
+      throw usageError("Only the Task Leader may accept a Work Item.");
+    }
+    if (item.status !== "awaiting_acceptance") {
+      throw usageError(`Work Item is not awaiting acceptance: ${item.id}/${item.status}.`);
+    }
+    const attempts = tx.listExecutionAttempts(item.taskId)
+      .filter((attempt) => attempt.workItemId === item.id && attempt.state === "succeeded")
+      .sort((left, right) => (
+        (left.endedAt ?? left.updatedAt).localeCompare(right.endedAt ?? right.updatedAt)
+        || left.createdAt.localeCompare(right.createdAt)
+        || left.id.localeCompare(right.id)
+      ));
+    const attempt = attempts.at(-1);
+    if (attempt === undefined) {
+      throw usageError(`Work Item has no successful Execution Attempt: ${item.id}.`);
+    }
+    if (attempt.result?.checks?.some((check) => check.outcome === "failed") === true) {
+      throw usageError(`Work Item has failed validation checks: ${item.id}.`);
+    }
+    const changeSetId = attempt.result?.changeSetId;
+    if (
+      changeSetId !== undefined
+      && !tx.listIntegrationAttempts(item.taskId).some((integration) => (
+        integration.status === "committed" && integration.changeSetIds.includes(changeSetId)
+      ))
+    ) {
+      throw usageError(`Work Item ChangeSet is not integrated: ${changeSetId}.`);
+    }
+    const completed = updateWorkItemStatus(item, "completed", now, summary);
+    tx.saveWorkItem(item.taskId, completed);
+    recordTaskEvent(tx, item.taskId, "work.accepted", {
+      workItemId: item.id,
+      attemptId: attempt.id,
+      acceptedBy: "leader",
+      summary
+    }, now);
+    return completed;
+  });
+  return output(`Accepted Work Item ${accepted.id}\n`, { workItem: accepted });
+}
+
+function rejectWork(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task work reject usage: yui task work reject <work> --summary <text>.";
+  const parsed = parseTail(args, new Set(["--summary"]), usage);
+  exactPositionals(parsed.positionals, 1, usage);
+  const summary = requiredOption(parsed.options, "--summary");
+  const now = clock(options);
+  const rejected = store.transaction((tx) => {
+    const item = requireWorkItem(tx, parsed.positionals[0]);
+    const task = requireTask(tx, item.taskId);
+    if (task.status !== "active") {
+      throw usageError(`Task is not active: ${task.id}/${task.status}.`);
+    }
+    if (taskActor(options, task.id) !== "leader") {
+      throw usageError("Only the Task Leader may reject a Work Item.");
+    }
+    if (item.status !== "awaiting_acceptance") {
+      throw usageError(`Work Item is not awaiting acceptance: ${item.id}/${item.status}.`);
+    }
+    const failed = updateWorkItemStatus(item, "failed", now, summary);
+    tx.saveWorkItem(item.taskId, failed);
+    recordTaskEvent(tx, item.taskId, "work.rejected", {
+      workItemId: item.id,
+      rejectedBy: "leader",
+      summary
+    }, now);
+    return failed;
+  });
+  return output(`Rejected Work Item ${rejected.id}\n`, { workItem: rejected });
+}
+
+function cancelWork(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task work cancel usage: yui task work cancel <work> --summary <text>.";
+  const parsed = parseTail(args, new Set(["--summary"]), usage);
+  exactPositionals(parsed.positionals, 1, usage);
+  const summary = requiredOption(parsed.options, "--summary");
+  const now = clock(options);
+  const result = store.transaction((tx) => {
+    const item = requireWorkItem(tx, parsed.positionals[0]);
+    const task = requireTask(tx, item.taskId);
+    if (task.status !== "active") {
+      throw usageError(`Task is not active: ${task.id}/${task.status}.`);
+    }
+    if (!["pending", "failed", "awaiting_acceptance"].includes(item.status)) {
+      throw usageError(
+        item.status === "running"
+          ? `Work Item is running; interrupt its Execution Attempt first: ${item.id}.`
+          : `Work Item cannot be cancelled from ${item.status}: ${item.id}.`
+      );
+    }
+    const actor = taskActor(options, task.id);
+    const cancelled = updateWorkItemStatus(item, "cancelled", now, summary);
+    tx.saveWorkItem(item.taskId, cancelled);
+    recordTaskEvent(tx, item.taskId, "work.cancelled", {
+      workItemId: item.id,
+      cancelledBy: actor,
+      summary
+    }, now);
+    if (actor !== "leader") {
+      enqueueWork(tx, leaderMailbox(task.id), "work-cancelled", now, [
+        workItemRef(item.id)
+      ]);
+    }
+    return { item: cancelled, notifyLeader: actor !== "leader" };
+  });
+  if (result.notifyLeader) {
+    notifyMailbox(options.runtime, leaderMailbox(result.item.taskId), result.item.taskId);
+  }
+  return output(`Cancelled Work Item ${result.item.id}\n`, { workItem: result.item });
+}
+
+function listWork(args: string[], store: TaskWorkflowStore): TaskCommandExecution {
+  exactPositionals(args, 1, "Task work list usage: yui task work list <task>.");
+  const task = requireTask(store, args[0]);
+  const items = store.listWorkItems(task.id);
+  const rendered = items.length === 0
+    ? "No work items found.\n"
+    : `${renderTable(
+        `Task work: ${task.id}`,
+        [
+          { header: "Work", minWidth: 6, maxWidth: 20 },
+          { header: "Status", minWidth: 6, maxWidth: 12 },
+          { header: "Role", minWidth: 4, maxWidth: 18 },
+          { header: "Title", minWidth: 8, maxWidth: 64 },
+          { header: "Acceptance", minWidth: 10, maxWidth: 16 },
+          { header: "Outcome", minWidth: 8, maxWidth: 40 }
+        ],
+        items.map((item) => [
+          item.id,
+          presentWorkStatus(item.status),
+          item.assignee ?? "Attempt",
+          item.title,
+          String(item.acceptance.length),
+          item.outcome ?? "-"
+        ]),
+        defaultTableWidth()
+      )}\n`;
+  return output(rendered, { workItems: items });
 }
 
 function taskRunCommand(
@@ -1276,7 +1480,9 @@ function retryRun(
     tx.saveRole(task.id, updateRoleStatus(role, "running", now));
     if (previous.workItemId !== undefined) {
       const item = tx.getWorkItem(task.id, previous.workItemId);
-      if (item === null) throw dataError(`Work item not found for run ${previous.id}: ${previous.workItemId}.`);
+      if (item === null) {
+        throw dataError(`Work item not found for run ${previous.id}: ${previous.workItemId}.`);
+      }
       const workspace = tx.getRoleWorkspace(task.id, role.name);
       if (workspace?.owner.type === "work-item"
         && workspace.owner.workItemId !== item.id) {
@@ -1337,7 +1543,7 @@ function yieldRun(
     if (active.workItemId !== undefined) {
       const item = tx.getWorkItem(task.id, active.workItemId);
       if (item === null) throw dataError(`Work item not found for run ${active.id}: ${active.workItemId}.`);
-      tx.saveWorkItem(task.id, updateWorkItemStatus(item, "completed", summary, now));
+      tx.saveWorkItem(task.id, updateWorkItemStatus(item, "completed", now, summary));
     } else if (role.name !== LEADER_ROLE) {
       throw usageError(`Run ${active.id} is not a work run.`);
     }
@@ -1454,15 +1660,8 @@ function assertTaskOpen(task: Task): void {
   if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
 }
 
-function taskActor(options: TaskCommandOptions, taskId: string): TaskCompletedBy {
-  const environment = options.environment;
-  if (environment?.YUI_SESSION_SCOPE === "task"
-    && environment.YUI_TASK_ID === taskId
-    && environment.YUI_ROLE === "leader") {
-    return "leader";
-  }
-  return environment?.YUI_SESSION_SCOPE === "global"
-    && environment.YUI_ROLE === "operator" ? "operator" : "user";
+function taskActor(options: TaskCommandOptions, taskId: string) {
+  return resolveTaskActor(options.environment, taskId);
 }
 
 function inactiveTaskMessage(task: Task, action: string): string {
@@ -1494,6 +1693,58 @@ function presentWorkStatus(status: WorkItemStatus): string {
   if (status === "pending") return "todo";
   if (status === "completed") return "done";
   return status;
+}
+
+function parseWorkCreateArgs(
+  args: readonly string[],
+  usage: string
+): Readonly<{
+  positionals: string[];
+  objective?: string;
+  acceptance: string[];
+  after: string[];
+  role?: string;
+}> {
+  const positionals: string[] = [];
+  const acceptance: string[] = [];
+  const after: string[] = [];
+  let objective: string | undefined;
+  let role: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (!argument.startsWith("--")) {
+      positionals.push(argument);
+      continue;
+    }
+    if (
+      argument !== "--objective"
+      && argument !== "--accept"
+      && argument !== "--after"
+      && argument !== "--role"
+    ) {
+      throw usageError(`Unsupported option: ${argument}.`, usage);
+    }
+    const value = args[index + 1];
+    if (value === undefined || value.startsWith("--")) {
+      throw usageError(`${argument} is required.`, usage);
+    }
+    if (argument === "--objective") {
+      if (objective !== undefined) throw usageError("--objective may only be specified once.", usage);
+      objective = value;
+    } else if (argument === "--role") {
+      if (role !== undefined) throw usageError("--role may only be specified once.", usage);
+      role = value;
+    } else if (argument === "--accept") acceptance.push(value);
+    else if (argument === "--after") after.push(value);
+    index += 1;
+  }
+  return {
+    positionals,
+    ...(objective === undefined ? {} : { objective }),
+    ...(role === undefined ? {} : { role }),
+    acceptance,
+    after
+  };
 }
 
 function parseTaskPriority(value: string): TaskPriority {

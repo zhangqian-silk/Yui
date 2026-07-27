@@ -27,6 +27,11 @@ import {
 } from "../role/role.js";
 import { SYSTEM_LEADER_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
 import type { MailboxTarget, WorkMailbox } from "../coordination/workMailbox.js";
+import {
+  builtinAgentProfileInputs,
+  createAgentProfile,
+  type AgentProfile
+} from "../profile/agentProfile.js";
 import { assertRoleRuntimeMutationAllowed } from "../commands/roleRuntimeGuard.js";
 import {
   ensureYuiHome,
@@ -54,8 +59,11 @@ type SetupStore = Omit<CompletionStore, "transaction"> & Readonly<{
   saveConfiguredAgent(agent: ConfiguredAgent): void;
   getGlobalRole(name: string): GlobalRole | null;
   saveGlobalRole(role: GlobalRole): void;
+  saveGlobalRoleWithSessionSet(role: GlobalRole, sessions: GlobalRoleSessionSet | null): void;
   getGlobalRoleSessionSet(name: string): GlobalRoleSessionSet | null;
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
+  getAgentProfile(id: string): AgentProfile | null;
+  saveAgentProfile(profile: AgentProfile): void;
 }>;
 
 type SetupAgentChoice = Readonly<{
@@ -195,16 +203,23 @@ async function configureYui(
   const prepared = selected.map((choice) => prepareAgent(store, choice, now));
   const configuredIds = new Set(prepared.map(({ id }) => id));
   const config = store.getConfig();
-  const defaultFallback = configuredIds.has(config.defaultAgent ?? "")
+  const codexAgents = prepared.filter(({ adapterId }) => adapterId === "codex");
+  if (codexAgents.length === 0) {
+    throw usageError("Codex is required for the Leader and Execution Attempts.");
+  }
+  const defaultFallback = codexAgents.some(({ id }) => id === config.defaultAgent)
     ? config.defaultAgent as string
-    : prepared[0]?.id;
-  if (defaultFallback === undefined) throw usageError("At least one Agent must be selected.");
+    : codexAgents[0]!.id;
 
   const defaultAgentId = parseSingleAgentSelection(
     await question(`Choose default Agent [${defaultFallback}]: `),
     prepared,
     defaultFallback
   );
+  const selectedDefaultAgent = prepared.find(({ id }) => id === defaultAgentId);
+  if (selectedDefaultAgent?.adapterId !== "codex") {
+    throw usageError("Codex is required for the Leader and Execution Attempts.");
+  }
   const currentOperatorAgent = store.getGlobalRole(SYSTEM_OPERATOR_ROLE)?.activeAgentId;
   const operatorFallback = configuredIds.has(currentOperatorAgent ?? "")
     ? currentOperatorAgent as string
@@ -270,8 +285,14 @@ async function configureYui(
       defaultWorkspace: workspace,
       timeZone: resolveTimeZone(latest.timeZone)
     });
-    if (operatorRole !== null) tx.saveGlobalRole(operatorRole);
-    if (leaderRole !== null) tx.saveGlobalRole(leaderRole);
+    if (operatorRole !== null) savePreparedSystemRole(tx, operatorRole, now);
+    if (leaderRole !== null) savePreparedSystemRole(tx, leaderRole, now);
+    seedBuiltinProfiles(tx, {
+      defaultAgent: latestDefaultAgent,
+      operatorAgent: latestOperatorAgent,
+      leaderConfig,
+      operatorConfig
+    }, now);
   });
 
   return {
@@ -282,6 +303,39 @@ async function configureYui(
     operatorConfig,
     workspace
   };
+}
+
+function savePreparedSystemRole(
+  store: SetupStore,
+  role: GlobalRole,
+  now: Date
+): void {
+  const sessions = store.getGlobalRoleSessionSet(role.name);
+  if (sessions === null || sessions.activeAgentId === role.activeAgentId) {
+    store.saveGlobalRole(role);
+    return;
+  }
+  store.saveGlobalRoleWithSessionSet(role, {
+    ...sessions,
+    activeAgentId: role.activeAgentId,
+    updatedAt: now.toISOString()
+  });
+}
+
+function seedBuiltinProfiles(
+  store: SetupStore,
+  agents: Readonly<{
+    defaultAgent: ConfiguredAgent;
+    operatorAgent: ConfiguredAgent;
+    leaderConfig: RoleAgentConfig;
+    operatorConfig: RoleAgentConfig;
+  }>,
+  now: Date
+): void {
+  for (const desired of builtinAgentProfileInputs(agents.defaultAgent.id)) {
+    const existing = store.getAgentProfile(desired.id);
+    if (existing === null) store.saveAgentProfile(createAgentProfile(desired, now));
+  }
 }
 
 async function promptRoleAgentConfig(
@@ -398,26 +452,32 @@ function prepareSystemRole(
 ): GlobalRole | null {
   const existing = store.getGlobalRole(name);
   if (existing !== null) {
-    if (existing.activeAgentId !== agent.id || existing.workspace !== workspace) {
-      throw usageError(
-        `Global Role ${name} is already configured with Agent ${existing.activeAgentId} `
-          + `and workspace ${existing.workspace}. Stop its Session and use role update before changing it.`
-      );
-    }
     const definition = configuredAgentToDefinition(agent);
     const binding = createRoleAgentBinding(definition, config);
-    if (isDeepStrictEqual(existing.agentBindings[agent.id], binding)) return null;
+    if (
+      existing.activeAgentId === agent.id
+      && existing.workspace === workspace
+      && isDeepStrictEqual(existing.agentBindings[agent.id], binding)
+    ) {
+      return null;
+    }
     assertRoleRuntimeMutationAllowed(store, {
       scope: "global",
       roleName: name
     }, "launch configuration update");
-    const session = store.getGlobalRoleSessionSet(name)?.sessions[agent.id];
-    if (session !== undefined && session.status !== "stopped") {
+    const liveSession = Object.values(
+      store.getGlobalRoleSessionSet(name)?.sessions ?? {}
+    ).find(({ status }) => status !== "stopped");
+    if (liveSession !== undefined) {
       throw usageError(
-        `Global Role ${name} Agent settings cannot be changed while its native process is running.`
+        `Global Role ${name} cannot be reconfigured while its native Session is ${
+          liveSession.status
+        }. Exit or stop that Session, then rerun yui setup.`
       );
     }
     return updateGlobalRole(existing, {
+      activeAgentId: agent.id,
+      workspace,
       agentBindings: { ...existing.agentBindings, [agent.id]: binding }
     }, now);
   }

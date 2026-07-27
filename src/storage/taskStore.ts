@@ -7,6 +7,7 @@ import {
   statSync,
   writeFileSync
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -41,6 +42,22 @@ import {
   validateProject,
   type Project
 } from "../repository/project.js";
+import {
+  validateExecutionAttempt,
+  type ExecutionAttempt
+} from "../execution/executionAttempt.js";
+import {
+  validateAgentProfile,
+  type AgentProfile
+} from "../profile/agentProfile.js";
+import {
+  validateChangeSet,
+  type ChangeSet
+} from "../integration/changeSet.js";
+import {
+  validateIntegrationAttempt,
+  type IntegrationAttempt
+} from "../integration/integrationAttempt.js";
 import {
   validateGlobalRole,
   validateTaskRole,
@@ -90,9 +107,12 @@ export type ConfiguredAgentUpdateResult = Readonly<{
 
 type ActiveRunPointer = Readonly<{ schemaVersion: 1; runId: string }>;
 type StoredTask = {
-  schemaVersion: 4;
+  schemaVersion: 5;
   task: Task;
   brief: TaskBrief | null;
+  executionAttempts: Record<string, ExecutionAttempt>;
+  changeSets: Record<string, ChangeSet>;
+  integrationAttempts: Record<string, IntegrationAttempt>;
   roles: Record<string, TaskRole>;
   roleWorkspaces: Record<string, RoleWorkspace>;
   roleSessionSets: Record<string, TaskRoleSessionSet>;
@@ -109,11 +129,13 @@ type StoredTask = {
 };
 
 type StorageState = {
-  schemaVersion: 4;
+  schemaVersion: 6;
   revision: number;
   config: YuiConfig;
   configuredAgents: Record<string, ConfiguredAgent>;
   projects: Record<string, Project>;
+  agentProfiles: Record<string, AgentProfile>;
+  agentProfileRevisions: Record<string, Record<string, AgentProfile>>;
   globalRoles: Record<string, GlobalRole>;
   globalRoleSessionSets: Record<string, GlobalRoleSessionSet>;
   tasks: Record<string, StoredTask>;
@@ -137,6 +159,13 @@ export type TaskStore = {
   listProjects(): Project[];
   getProject(id: string): Project | null;
   removeProject(id: string): boolean;
+  saveAgentProfile(profile: AgentProfile): void;
+  createAgentProfileIfAbsent(profile: AgentProfile): AgentProfile | null;
+  listAgentProfiles(): AgentProfile[];
+  listAgentProfileRevisions(): AgentProfile[];
+  getAgentProfile(id: string): AgentProfile | null;
+  getAgentProfileRevision(id: string, revision: number): AgentProfile | null;
+  removeAgentProfile(id: string): boolean;
   saveGlobalRole(role: GlobalRole): void;
   saveGlobalRoleWithSessionSet(role: GlobalRole, sessions: GlobalRoleSessionSet | null): void;
   createGlobalRoleIfAbsent(role: GlobalRole): GlobalRole | null;
@@ -153,6 +182,19 @@ export type TaskStore = {
   getTaskBrief(taskId: string): TaskBrief | null;
   saveTaskBrief(taskId: string, brief: TaskBrief): void;
   clearTaskBrief(taskId: string): void;
+  nextExecutionAttemptId(taskId: string): string;
+  saveExecutionAttempt(taskId: string, attempt: ExecutionAttempt): void;
+  listExecutionAttempts(taskId: string): ExecutionAttempt[];
+  getExecutionAttempt(taskId: string, attemptId: string): ExecutionAttempt | null;
+  findExecutionAttempt(attemptId: string): ExecutionAttempt | null;
+  nextChangeSetId(taskId: string): string;
+  saveChangeSet(taskId: string, changeSet: ChangeSet): void;
+  listChangeSets(taskId: string): ChangeSet[];
+  getChangeSet(taskId: string, changeSetId: string): ChangeSet | null;
+  nextIntegrationAttemptId(taskId: string): string;
+  saveIntegrationAttempt(taskId: string, attempt: IntegrationAttempt): void;
+  listIntegrationAttempts(taskId: string): IntegrationAttempt[];
+  getIntegrationAttempt(taskId: string, integrationId: string): IntegrationAttempt | null;
   saveRole(taskId: string, role: TaskRole): void;
   listRoles(taskId: string): TaskRole[];
   getRole(taskId: string, name: string): TaskRole | null;
@@ -286,7 +328,15 @@ export class FileTaskStore implements TaskStore {
   listConfiguredAgents(): ConfiguredAgent[] { return values(this.#state().configuredAgents, "id"); }
   getConfiguredAgent(id: string): ConfiguredAgent | null { return optional(this.#state().configuredAgents[id]); }
   removeConfiguredAgent(id: string): boolean {
-    return this.#remove((state) => state.configuredAgents, id);
+    return this.transaction(() => {
+      const profile = Object.values(this.#state().agentProfileRevisions)
+        .flatMap((revisions) => Object.values(revisions))
+        .find((entry) => entry.agentId === id);
+      if (profile !== undefined) {
+        throw new StorageRecordError(`Configured Agent is still used by Agent Profile: ${profile.id}/${id}.`);
+      }
+      return this.#remove((state) => state.configuredAgents, id);
+    });
   }
 
   nextProjectId(): string {
@@ -330,6 +380,98 @@ export class FileTaskStore implements TaskStore {
         throw new StorageRecordError(`Project is still used by a Task: ${id}`);
       }
       return this.#remove((state) => state.projects, id);
+    });
+  }
+
+  saveAgentProfile(profile: AgentProfile): void {
+    const stored = identified<AgentProfile>(
+      profile,
+      1,
+      "id",
+      profile.id,
+      "Agent Profile"
+    );
+    validateAgentProfile(stored);
+    this.#mutate((state) => {
+      const agent = state.configuredAgents[stored.agentId];
+      if (agent === undefined) {
+        throw new StorageRecordError(
+          `Agent Profile Configured Agent not found: ${stored.id}/${stored.agentId}.`
+        );
+      }
+      if (agent.adapterId !== "codex") {
+        throw new StorageRecordError(
+          `Agent Profile requires a Codex Configured Agent: ${stored.id}/${stored.agentId}.`
+        );
+      }
+      const existing = state.agentProfiles[stored.id];
+      if (existing !== undefined) {
+        if (stored.revision < existing.revision) {
+          throw new StorageRecordError(
+            `Agent Profile revision cannot move backwards: ${stored.id}.`
+          );
+        }
+        if (
+          stored.revision === existing.revision
+          && !isDeepStrictEqual(stored, existing)
+        ) {
+          throw new StorageRecordError(
+            `Agent Profile revision cannot be overwritten: ${stored.id}/${stored.revision}.`
+          );
+        }
+        if (stored.revision > existing.revision + 1) {
+          throw new StorageRecordError(
+            `Agent Profile revision must be contiguous: ${stored.id}/${stored.revision}.`
+          );
+        }
+      } else if (stored.revision !== 1) {
+        throw new StorageRecordError(
+          `A new Agent Profile must start at revision 1: ${stored.id}.`
+        );
+      }
+      const revisions = state.agentProfileRevisions[stored.id] ?? {};
+      const snapshot = revisions[String(stored.revision)];
+      if (snapshot !== undefined && !isDeepStrictEqual(snapshot, stored)) {
+        throw new StorageRecordError(
+          `Agent Profile revision is immutable: ${stored.id}/${stored.revision}.`
+        );
+      }
+      revisions[String(stored.revision)] = stored;
+      state.agentProfileRevisions[stored.id] = revisions;
+      state.agentProfiles[stored.id] = stored;
+    });
+  }
+  createAgentProfileIfAbsent(profile: AgentProfile): AgentProfile | null {
+    return this.transaction((store) => {
+      if (store.getAgentProfile(profile.id) !== null) return null;
+      store.saveAgentProfile(profile);
+      return clone(profile);
+    });
+  }
+  listAgentProfiles(): AgentProfile[] {
+    return values(this.#state().agentProfiles, "id");
+  }
+  listAgentProfileRevisions(): AgentProfile[] {
+    return Object.values(this.#state().agentProfileRevisions)
+      .flatMap((revisions) => Object.values(revisions))
+      .map(clone);
+  }
+  getAgentProfile(id: string): AgentProfile | null {
+    return optional(this.#state().agentProfiles[id]);
+  }
+  getAgentProfileRevision(id: string, revision: number): AgentProfile | null {
+    return optional(this.#state().agentProfileRevisions[id]?.[String(revision)]);
+  }
+  removeAgentProfile(id: string): boolean {
+    return this.transaction(() => {
+      for (const aggregate of Object.values(this.#state().tasks)) {
+        if (Object.values(aggregate.executionAttempts).some((attempt) => attempt.profileId === id)) {
+          throw new StorageRecordError(`Agent Profile is still used by an Execution Attempt: ${id}.`);
+        }
+      }
+      const removed = this.#remove((state) => state.agentProfiles, id);
+      if (removed) this.#mutate((state) => { delete state.agentProfileRevisions[id]; });
+      return removed;
     });
   }
 
@@ -409,6 +551,131 @@ export class FileTaskStore implements TaskStore {
     this.#requireTaskForWrite(taskId);
     this.#mutate((state) => { state.tasks[taskId].brief = null; });
   }
+
+  nextExecutionAttemptId(_taskId: string): string {
+    return `attempt-${randomUUID()}`;
+  }
+  saveExecutionAttempt(taskId: string, attempt: ExecutionAttempt): void {
+    const stored = identified<ExecutionAttempt>(
+      attempt,
+      1,
+      "id",
+      attempt.id,
+      "Execution Attempt"
+    );
+    validateExecutionAttempt(stored);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`Execution Attempt belongs to another Task: ${stored.taskId}.`);
+    }
+    const aggregate = this.#requireTaskForWrite(taskId);
+    if (aggregate.workItems[stored.workItemId] === undefined) {
+      throw new StorageRecordError(`Execution Attempt Work Item not found: ${stored.workItemId}.`);
+    }
+    if (this.getAgentProfileRevision(stored.profileId, stored.profileRevision) === null) {
+      throw new StorageRecordError(
+        `Execution Attempt Agent Profile revision not found: ${
+          stored.profileId
+        }/${stored.profileRevision}.`
+      );
+    }
+    const existing = aggregate.executionAttempts[stored.id];
+    if (existing !== undefined && !validAttemptTransition(existing, stored)) {
+      throw new StorageRecordError(`Execution Attempt transition is invalid: ${stored.id}.`);
+    }
+    this.#mutate((state) => {
+      state.tasks[taskId].executionAttempts[stored.id] = stored;
+    });
+  }
+  listExecutionAttempts(taskId: string): ExecutionAttempt[] {
+    return values(this.#requireTask(taskId).executionAttempts, "id");
+  }
+  getExecutionAttempt(taskId: string, attemptId: string): ExecutionAttempt | null {
+    return optional(this.#state().tasks[taskId]?.executionAttempts[attemptId]);
+  }
+  findExecutionAttempt(attemptId: string): ExecutionAttempt | null {
+    return findUnique(this.#state(), "executionAttempts", attemptId, "Execution Attempt");
+  }
+
+  nextChangeSetId(_taskId: string): string {
+    return `change-set-${randomUUID()}`;
+  }
+  saveChangeSet(taskId: string, changeSet: ChangeSet): void {
+    const stored = identified<ChangeSet>(
+      changeSet,
+      1,
+      "id",
+      changeSet.id,
+      "ChangeSet"
+    );
+    validateChangeSet(stored);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`ChangeSet belongs to another Task: ${stored.taskId}.`);
+    }
+    const aggregate = this.#requireTaskForWrite(taskId);
+    if (aggregate.task.projectId !== stored.projectId) {
+      throw new StorageRecordError(`ChangeSet Project does not match Task: ${stored.id}.`);
+    }
+    if (aggregate.executionAttempts[stored.attemptId] === undefined) {
+      throw new StorageRecordError(`ChangeSet Attempt not found: ${stored.attemptId}.`);
+    }
+    const existing = aggregate.changeSets[stored.id];
+    if (existing !== undefined && !isDeepStrictEqual(existing, stored)) {
+      throw new StorageRecordError(`ChangeSet is immutable: ${stored.id}.`);
+    }
+    this.#mutate((state) => {
+      state.tasks[taskId].changeSets[stored.id] = stored;
+    });
+  }
+  listChangeSets(taskId: string): ChangeSet[] {
+    return values(this.#requireTask(taskId).changeSets, "id");
+  }
+  getChangeSet(taskId: string, changeSetId: string): ChangeSet | null {
+    return optional(this.#state().tasks[taskId]?.changeSets[changeSetId]);
+  }
+
+  nextIntegrationAttemptId(_taskId: string): string {
+    return `integration-${randomUUID()}`;
+  }
+  saveIntegrationAttempt(taskId: string, attempt: IntegrationAttempt): void {
+    const stored = identified<IntegrationAttempt>(
+      attempt,
+      1,
+      "id",
+      attempt.id,
+      "Integration Attempt"
+    );
+    validateIntegrationAttempt(stored);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`Integration Attempt belongs to another Task: ${stored.taskId}.`);
+    }
+    const aggregate = this.#requireTaskForWrite(taskId);
+    for (const changeSetId of stored.changeSetIds) {
+      if (aggregate.changeSets[changeSetId] === undefined) {
+        throw new StorageRecordError(`Integration ChangeSet not found: ${changeSetId}.`);
+      }
+    }
+    const existing = aggregate.integrationAttempts[stored.id];
+    if (existing !== undefined) {
+      if (Date.parse(stored.updatedAt) < Date.parse(existing.updatedAt)) {
+        throw new StorageRecordError(
+          `Integration Attempt updatedAt cannot move backwards: ${stored.id}.`
+        );
+      }
+      if (!validIntegrationTransition(existing, stored)) {
+        throw new StorageRecordError(`Integration Attempt transition is invalid: ${stored.id}.`);
+      }
+    }
+    this.#mutate((state) => {
+      state.tasks[taskId].integrationAttempts[stored.id] = stored;
+    });
+  }
+  listIntegrationAttempts(taskId: string): IntegrationAttempt[] {
+    return values(this.#requireTask(taskId).integrationAttempts, "id");
+  }
+  getIntegrationAttempt(taskId: string, integrationId: string): IntegrationAttempt | null {
+    return optional(this.#state().tasks[taskId]?.integrationAttempts[integrationId]);
+  }
+
   saveRole(taskId: string, role: TaskRole): void {
     const aggregate = this.#requireTaskForWrite(taskId);
     const stored = identified<TaskRole>(role, 2, "name", role.name, "Task Role");
@@ -504,10 +771,24 @@ export class FileTaskStore implements TaskStore {
   findWorkItem(id: string): WorkItem | null { return findUnique(this.#state(), "workItems", id, "Work item"); }
   listWorkItems(taskId: string): WorkItem[] { return values(this.#requireTask(taskId).workItems, "id"); }
   saveWorkItem(taskId: string, item: WorkItem): void {
-    const stored = identified<WorkItem>(item, 1, "id", item.id, "Work item");
-    validateWorkItem(stored);
+    const stored = identified<WorkItem>(item, 2, "id", item.id, "Work item");
     if (stored.taskId !== taskId) throw new StorageRecordError(`Work item belongs to another Task: ${stored.taskId}`);
+    validateWorkItem(stored);
     this.#requireTaskForWrite(taskId);
+    for (const dependencyId of stored.dependsOn) {
+      const dependency = this.getWorkItem(taskId, dependencyId);
+      if (dependency === null) {
+        throw new StorageRecordError(`Work Item dependency not found: ${dependencyId}.`);
+      }
+    }
+    assertAcyclicWorkItems({
+      ...this.#requireTask(taskId).workItems,
+      [stored.id]: stored
+    });
+    const existing = this.getWorkItem(taskId, stored.id);
+    if (existing !== null && !validWorkItemTransition(existing, stored)) {
+      throw new StorageRecordError(`Work Item transition is invalid: ${stored.id}.`);
+    }
     this.#mutate((state) => { state.tasks[taskId].workItems[stored.id] = stored; });
   }
 
@@ -826,13 +1107,28 @@ export function resolveYuiHome(env: NodeJS.ProcessEnv): string {
 export function ensureYuiHome(rootDir: string): void { mkdirSync(rootDir, { recursive: true, mode: 0o700 }); }
 
 function emptyState(): StorageState {
-  return { schemaVersion: 4, revision: 0, config: { schemaVersion: 1 }, configuredAgents: {}, projects: {}, globalRoles: {}, globalRoleSessionSets: {}, tasks: {}, mailboxes: {} };
+  return {
+    schemaVersion: 6,
+    revision: 0,
+    config: { schemaVersion: 1 },
+    configuredAgents: {},
+    projects: {},
+    agentProfiles: {},
+    agentProfileRevisions: {},
+    globalRoles: {},
+    globalRoleSessionSets: {},
+    tasks: {},
+    mailboxes: {}
+  };
 }
 function emptyStoredTask(task: Task): StoredTask {
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     task,
     brief: null,
+    executionAttempts: {},
+    changeSets: {},
+    integrationAttempts: {},
     roles: {},
     roleWorkspaces: {},
     roleSessionSets: {},
@@ -853,8 +1149,20 @@ function parseState(raw: string): StorageState {
   let parsed: unknown;
   try { parsed = JSON.parse(raw) as unknown; } catch (error) { throw new StorageRecordError(`Invalid ${STORAGE_STATE_FILE}: ${error instanceof Error ? error.message : String(error)}`); }
   const state = object(parsed, "Storage state");
-  exact(state, ["schemaVersion", "revision", "config", "configuredAgents", "projects", "globalRoles", "globalRoleSessionSets", "tasks", "mailboxes"], "Storage state");
-  if (state.schemaVersion !== 4 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
+  exact(state, [
+    "schemaVersion",
+    "revision",
+    "config",
+    "configuredAgents",
+    "projects",
+    "agentProfiles",
+    "agentProfileRevisions",
+    "globalRoles",
+    "globalRoleSessionSets",
+    "tasks",
+    "mailboxes"
+  ], "Storage state");
+  if (state.schemaVersion !== 6 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
   const result = clone(state) as unknown as StorageState;
   result.config = versioned(result.config, 1, "Yui config");
   validateYuiConfig(result.config);
@@ -872,6 +1180,72 @@ function parseState(raw: string): StorageState {
     assertProjectCatalog(Object.values(result.projects));
   } catch (error) {
     throw new StorageRecordError(error instanceof Error ? error.message : String(error));
+  }
+  parseMap(result.agentProfiles, (value, key) => {
+    const profile = identified<AgentProfile>(value, 1, "id", key, "Agent Profile");
+    validateAgentProfile(profile);
+    return profile;
+  }, "agentProfiles");
+  parseMap(result.agentProfileRevisions, (value, profileId) => {
+    const revisions = object(value, `Agent Profile revisions ${profileId}`);
+    parseMap(revisions, (snapshot, revisionKey) => {
+      const profile = identified<AgentProfile>(
+        snapshot,
+        1,
+        "id",
+        profileId,
+        "Agent Profile revision"
+      );
+      validateAgentProfile(profile);
+      if (String(profile.revision) !== revisionKey) {
+        throw new StorageRecordError(
+          `Agent Profile revision identity is inconsistent: ${profileId}/${revisionKey}.`
+        );
+      }
+      return profile;
+    }, `agentProfileRevisions.${profileId}`);
+    return revisions as Record<string, AgentProfile>;
+  }, "agentProfileRevisions");
+  for (const profile of Object.values(result.agentProfiles)) {
+    const snapshot = result.agentProfileRevisions[profile.id]?.[String(profile.revision)];
+    if (snapshot === undefined || !isDeepStrictEqual(snapshot, profile)) {
+      throw new StorageRecordError(
+        `Current Agent Profile has no matching revision snapshot: ${profile.id}/${profile.revision}.`
+      );
+    }
+    const agent = result.configuredAgents[profile.agentId];
+    if (agent === undefined) {
+      throw new StorageRecordError(
+        `Agent Profile Configured Agent not found: ${profile.id}/${profile.agentId}.`
+      );
+    }
+    if (agent.adapterId !== "codex") {
+      throw new StorageRecordError(
+        `Agent Profile requires a Codex Configured Agent: ${profile.id}/${profile.agentId}.`
+      );
+    }
+  }
+  for (const [profileId, revisions] of Object.entries(result.agentProfileRevisions)) {
+    if (result.agentProfiles[profileId] === undefined) {
+      throw new StorageRecordError(`Agent Profile revision ledger has no current Profile: ${profileId}.`);
+    }
+    for (const profile of Object.values(revisions)) {
+      const agent = result.configuredAgents[profile.agentId];
+      if (agent === undefined) {
+        throw new StorageRecordError(
+          `Agent Profile revision Configured Agent not found: ${profile.id}/${
+            profile.revision
+          }/${profile.agentId}.`
+        );
+      }
+      if (agent.adapterId !== "codex") {
+        throw new StorageRecordError(
+          `Agent Profile revision requires a Codex Configured Agent: ${profile.id}/${
+            profile.revision
+          }/${profile.agentId}.`
+        );
+      }
+    }
   }
   parseMap(result.globalRoles, (value, key) => {
     const role = identified<GlobalRole>(value, 2, "name", key, "Global Role");
@@ -926,6 +1300,7 @@ function parseState(raw: string): StorageState {
         throw new StorageRecordError(`RoleWorkspace Project does not match Task: ${aggregate.task.id}/${name}`);
       }
     }
+    validateCanonicalTaskReferences(result, aggregate);
   }
   for (const mailbox of Object.values(result.mailboxes)) validateMailboxReferences(result, mailbox);
   assertGloballyUniqueTaskRecordIds(result, "inputRequests", "Input request");
@@ -937,8 +1312,68 @@ function parseState(raw: string): StorageState {
 }
 function parseStoredTask(value: unknown, taskId: string): StoredTask {
   const aggregate = object(value, `Task aggregate ${taskId}`) as unknown as StoredTask;
-  exact(aggregate as unknown as Record<string, unknown>, ["schemaVersion", "task", "brief", "roles", "roleWorkspaces", "roleSessionSets", "workItems", "agentRuns", "activeRuns", "messages", "inputRequests", "decisions", "milestones", "events", "leaderFailure", "operatorNotification"], `Task aggregate ${taskId}`);
-  versioned(aggregate, 4, `Task aggregate ${taskId}`);
+  exact(aggregate as unknown as Record<string, unknown>, [
+    "schemaVersion",
+    "task",
+    "brief",
+    "executionAttempts",
+    "changeSets",
+    "integrationAttempts",
+    "roles",
+    "roleWorkspaces",
+    "roleSessionSets",
+    "workItems",
+    "agentRuns",
+    "activeRuns",
+    "messages",
+    "inputRequests",
+    "decisions",
+    "milestones",
+    "events",
+    "leaderFailure",
+    "operatorNotification"
+  ], `Task aggregate ${taskId}`);
+  parseMap(aggregate.executionAttempts, (record, key) => {
+    const attempt = identified<ExecutionAttempt>(
+      record,
+      1,
+      "id",
+      key,
+      "Execution Attempt"
+    );
+    if (attempt.taskId !== taskId) {
+      throw new StorageRecordError(
+        `Execution Attempt belongs to another Task: ${attempt.taskId}.`
+      );
+    }
+    validateExecutionAttempt(attempt);
+    return attempt;
+  }, "executionAttempts");
+  parseMap(aggregate.changeSets, (record, key) => {
+    const changeSet = identified<ChangeSet>(record, 1, "id", key, "ChangeSet");
+    if (changeSet.taskId !== taskId) {
+      throw new StorageRecordError(`ChangeSet belongs to another Task: ${changeSet.taskId}.`);
+    }
+    validateChangeSet(changeSet);
+    return changeSet;
+  }, "changeSets");
+  parseMap(aggregate.integrationAttempts, (record, key) => {
+    const attempt = identified<IntegrationAttempt>(
+      record,
+      1,
+      "id",
+      key,
+      "Integration Attempt"
+    );
+    if (attempt.taskId !== taskId) {
+      throw new StorageRecordError(
+        `Integration Attempt belongs to another Task: ${attempt.taskId}.`
+      );
+    }
+    validateIntegrationAttempt(attempt);
+    return attempt;
+  }, "integrationAttempts");
+  versioned(aggregate, 5, `Task aggregate ${taskId}`);
   validateTask(identified(aggregate.task, 1, "id", taskId, "Task"));
   if (aggregate.brief !== null) storedTaskBrief(aggregate.brief);
   parseMap(aggregate.roles, (record, key) => { const role = identified<TaskRole>(record, 2, "name", key, "Task Role"); if (role.taskId !== taskId) throw new StorageRecordError(`Task Role belongs to another Task: ${role.taskId}`); validateTaskRole(role); return role; }, "roles");
@@ -952,11 +1387,11 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
   }, "roleWorkspaces");
   parseMap(aggregate.roleSessionSets, (record, key) => { const set = taskSessions(record); if (set.owner.taskId !== taskId || set.owner.roleName !== key) throw new StorageRecordError(`Task Role session set identity is inconsistent: ${taskId}/${key}`); return set; }, "roleSessionSets");
   parseMap(aggregate.workItems, (record, key) => {
-    const item = identified<WorkItem>(record, 1, "id", key, "Work item");
-    validateWorkItem(item);
+    const item = identified<WorkItem>(record, 2, "id", key, "Work item");
     if (item.taskId !== taskId) {
       throw new StorageRecordError(`Work item belongs to another Task: ${item.taskId}`);
     }
+    validateWorkItem(item);
     return item;
   }, "workItems");
   parseMap(aggregate.agentRuns, (record, key) => { const run = identified<AgentRun>(record, 1, "id", key, "Agent run"); if (run.taskId !== taskId) throw new StorageRecordError(`Agent run belongs to another Task: ${run.taskId}`); validateAgentRun(run); return run; }, "agentRuns");
@@ -1324,6 +1759,85 @@ function validateMailboxReferences(state: StorageState, mailbox: WorkMailbox): v
     }
   }
 }
+
+function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredTask): void {
+  const taskId = aggregate.task.id;
+  assertAcyclicWorkItems(aggregate.workItems);
+  for (const item of Object.values(aggregate.workItems)) {
+    for (const dependencyId of item.dependsOn) {
+      if (aggregate.workItems[dependencyId] === undefined) {
+        throw new StorageRecordError(`Work Item dependency not found: ${taskId}/${dependencyId}.`);
+      }
+    }
+  }
+  for (const attempt of Object.values(aggregate.executionAttempts)) {
+    if (aggregate.workItems[attempt.workItemId] === undefined) {
+      throw new StorageRecordError(`Execution Attempt Work Item not found: ${attempt.id}.`);
+    }
+    const profile = state.agentProfileRevisions[attempt.profileId]?.[
+      String(attempt.profileRevision)
+    ];
+    if (profile === undefined) {
+      throw new StorageRecordError(`Execution Attempt Profile revision is unavailable: ${attempt.id}.`);
+    }
+  }
+  for (const changeSet of Object.values(aggregate.changeSets)) {
+    if (aggregate.executionAttempts[changeSet.attemptId] === undefined) {
+      throw new StorageRecordError(`ChangeSet Execution Attempt not found: ${changeSet.id}.`);
+    }
+    if (aggregate.task.projectId !== changeSet.projectId) {
+      throw new StorageRecordError(`ChangeSet Project does not match Task: ${changeSet.id}.`);
+    }
+  }
+  for (const integration of Object.values(aggregate.integrationAttempts)) {
+    for (const changeSetId of integration.changeSetIds) {
+      if (aggregate.changeSets[changeSetId] === undefined) {
+        throw new StorageRecordError(`Integration ChangeSet not found: ${integration.id}/${changeSetId}.`);
+      }
+    }
+  }
+}
+
+function validIntegrationTransition(
+  before: IntegrationAttempt,
+  after: IntegrationAttempt
+): boolean {
+  if (
+    before.id !== after.id
+    || before.taskId !== after.taskId
+    || before.targetRef !== after.targetRef
+    || before.expectedHead !== after.expectedHead
+    || !isDeepStrictEqual(before.changeSetIds, after.changeSetIds)
+    || !isDeepStrictEqual(before.checkCommands, after.checkCommands)
+    || before.createdAt !== after.createdAt
+  ) return false;
+  const allowed: Readonly<Record<IntegrationAttempt["status"], readonly IntegrationAttempt["status"][]>> = {
+    running: ["running", "blocked", "validating", "failed"],
+    blocked: ["blocked", "validating", "failed"],
+    validating: ["validating", "committed", "failed"],
+    committed: ["committed"],
+    failed: ["failed"]
+  };
+  return allowed[before.status].includes(after.status);
+}
+
+function assertAcyclicWorkItems(items: Readonly<Record<string, WorkItem>>): void {
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (id: string): void => {
+    if (visited.has(id)) return;
+    if (visiting.has(id)) throw new StorageRecordError(`Work Item dependency cycle detected: ${id}.`);
+    visiting.add(id);
+    const item = items[id];
+    if (item !== undefined) {
+      for (const dependencyId of item.dependsOn) visit(dependencyId);
+    }
+    visiting.delete(id);
+    visited.add(id);
+  };
+  for (const id of Object.keys(items)) visit(id);
+}
+
 function mailboxReferenceExists(state: StorageState, ref: MailboxEntityRef): boolean {
   switch (ref.type) {
     case "task": return state.tasks[ref.id] !== undefined;
@@ -1338,14 +1852,108 @@ function mailboxReferenceExists(state: StorageState, ref: MailboxEntityRef): boo
       ].some((set) => Object.values(set.sessions).some((session) => session.nativeSessionId === ref.id));
   }
 }
-function allKeys<K extends "workItems" | "agentRuns" | "messages" | "inputRequests" | "decisions" | "milestones" | "events">(state: StorageState, key: K): string[] { return Object.values(state.tasks).flatMap((task) => Object.keys(task[key])); }
+function allKeys<K extends
+  | "workItems"
+  | "agentRuns"
+  | "executionAttempts"
+  | "changeSets"
+  | "integrationAttempts"
+  | "messages"
+  | "inputRequests"
+  | "decisions"
+  | "milestones"
+  | "events"
+>(state: StorageState, key: K): string[] {
+  return Object.values(state.tasks).flatMap((task) => Object.keys(task[key]));
+}
 function findUnique(state: StorageState, key: "workItems", id: string, label: string): WorkItem | null;
 function findUnique(state: StorageState, key: "agentRuns", id: string, label: string): AgentRun | null;
+function findUnique(state: StorageState, key: "executionAttempts", id: string, label: string): ExecutionAttempt | null;
 function findUnique(state: StorageState, key: "inputRequests", id: string, label: string): InputRequest | null;
-function findUnique(state: StorageState, key: "workItems" | "agentRuns" | "inputRequests", id: string, label: string): WorkItem | AgentRun | InputRequest | null {
+function findUnique(
+  state: StorageState,
+  key: "workItems" | "agentRuns" | "executionAttempts" | "inputRequests",
+  id: string,
+  label: string
+): WorkItem | AgentRun | ExecutionAttempt | InputRequest | null {
   const matches = Object.values(state.tasks).flatMap((task) => task[key][id] === undefined ? [] : [task[key][id]]);
   if (matches.length > 1) throw new StorageRecordError(`${label} id is ambiguous: ${id}`);
   return matches[0] === undefined ? null : clone(matches[0]);
+}
+
+function validAttemptTransition(
+  existing: ExecutionAttempt,
+  candidate: ExecutionAttempt
+): boolean {
+  if (
+    existing.id !== candidate.id
+    || existing.taskId !== candidate.taskId
+    || existing.workItemId !== candidate.workItemId
+    || existing.profileId !== candidate.profileId
+    || existing.profileRevision !== candidate.profileRevision
+    || existing.executor !== candidate.executor
+    || existing.access !== candidate.access
+    || existing.input !== candidate.input
+    || existing.baseCommit !== candidate.baseCommit
+    || existing.sessionReason !== candidate.sessionReason
+    || existing.createdAt !== candidate.createdAt
+    || Date.parse(candidate.updatedAt) < Date.parse(existing.updatedAt)
+  ) {
+    return false;
+  }
+  const allowed: Readonly<Record<
+    ExecutionAttempt["state"],
+    readonly ExecutionAttempt["state"][]
+  >> = {
+    running: ["running", "succeeded", "failed", "interrupted"],
+    succeeded: ["succeeded"],
+    failed: ["failed"],
+    interrupted: ["interrupted"]
+  };
+  return allowed[existing.state].includes(candidate.state);
+}
+function validWorkItemTransition(existing: WorkItem, candidate: WorkItem): boolean {
+  if (isDeepStrictEqual(existing, candidate)) return true;
+  if (
+    existing.id !== candidate.id
+    || existing.taskId !== candidate.taskId
+    || existing.assignee !== candidate.assignee
+    || existing.createdAt !== candidate.createdAt
+    || candidate.revision !== existing.revision + 1
+    || Date.parse(candidate.updatedAt) < Date.parse(existing.updatedAt)
+  ) return false;
+  if (
+    existing.status !== candidate.status
+    && (
+      existing.title !== candidate.title
+      || existing.objective !== candidate.objective
+      || !isDeepStrictEqual(existing.acceptance, candidate.acceptance)
+      || !isDeepStrictEqual(existing.dependsOn, candidate.dependsOn)
+    )
+  ) return false;
+  const allowed: Readonly<Record<WorkItem["status"], readonly WorkItem["status"][]>> = {
+    pending: ["pending", "running", "cancelled", "superseded"],
+    running: [
+      "running",
+      "awaiting_acceptance",
+      "completed",
+      "failed",
+      "cancelled",
+      "superseded"
+    ],
+    awaiting_acceptance: [
+      "awaiting_acceptance",
+      "completed",
+      "failed",
+      "cancelled",
+      "superseded"
+    ],
+    completed: ["completed"],
+    failed: ["failed", "running", "cancelled", "superseded"],
+    cancelled: ["cancelled"],
+    superseded: ["superseded"]
+  };
+  return allowed[existing.status].includes(candidate.status);
 }
 function synchronousResult<T>(value: T): T { if (typeof value === "object" && value !== null && "then" in value) throw new StorageRecordError("FileTaskStore transactions must be synchronous."); return value; }
 

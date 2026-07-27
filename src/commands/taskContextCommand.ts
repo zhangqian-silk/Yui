@@ -23,7 +23,6 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     const task = reader.getTask(taskId);
     if (task === null) throw taskNotFound(taskId);
     const workItems = reader.listWorkItems(task.id);
-    const workItemIds = new Set(workItems.map((item) => item.id));
     const inputRequests = reader.listInputRequests(task.id);
     return {
       task,
@@ -31,10 +30,10 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       activeDecisions: reader.listDecisions(task.id)
         .filter((decision) => decision.status === "active"),
       milestones: reader.listMilestones(task.id),
-      roles: reader.listRoles(task.id),
       workItems,
-      runs: reader.listAgentRuns(task.id)
-        .filter((run) => run.workItemId !== undefined && workItemIds.has(run.workItemId)),
+      attempts: chronological(reader.listExecutionAttempts(task.id)),
+      changeSets: chronological(reader.listChangeSets(task.id)),
+      integrations: chronological(reader.listIntegrationAttempts(task.id)),
       messages: reader.listMessages(task.id),
       openInputRequests: inputRequests.filter((request) => request.status === "open"),
       resolvedInputRequests: inputRequests.filter((request) => request.status !== "open"),
@@ -46,9 +45,10 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     brief,
     activeDecisions,
     milestones,
-    roles,
     workItems,
-    runs,
+    attempts,
+    changeSets,
+    integrations,
     messages,
     openInputRequests,
     resolvedInputRequests,
@@ -105,35 +105,46 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       ]
     ),
     "",
-    `Roles (${roles.length}):`,
-    ...(roles.length === 0
-      ? ["  None."]
-      : roles.map((role) => (
-          `  ${role.name} [${role.status}] — Agent: ${role.activeAgentId}`
-        ))),
-    "",
     `Current and recent work items (${displayedWorkItems.length}${workItems.length > displayedWorkItems.length ? ` of ${workItems.length}` : ""}):`,
     ...(displayedWorkItems.length === 0
       ? ["  None."]
       : displayedWorkItems.flatMap((item) => {
-          const itemRuns = runs.filter((run) => run.workItemId === item.id);
-          const latestRun = itemRuns.at(-1);
+          const itemAttempts = attempts.filter((attempt) => attempt.workItemId === item.id);
+          const latestAttempt = itemAttempts.at(-1);
           return [
-            `  ${item.id} [${item.status}] ${item.assignee}: ${compactText(item.title)}`,
-            ...(item.outcome === undefined
+            `  ${item.id} [${item.status}]: ${compactText(item.title)}`,
+            `    Objective: ${compactText(item.objective)}`,
+            ...(item.acceptance.length === 0
               ? []
-              : [`    Outcome: ${compactText(item.outcome)}`]),
-            ...(latestRun === undefined
-              ? ["    Runs: none."]
+              : [`    Acceptance: ${item.acceptance.map(compactText).join("; ")}`]),
+            ...(latestAttempt === undefined
+              ? ["    Attempts: none."]
               : [
-                  `    Runs: ${itemRuns.length}; latest ${latestRun.id} [${latestRun.status}] ${latestRun.roleName}`,
-                  `      Input: ${compactText(latestRun.input)}`,
-                  ...(latestRun.summary === undefined
+                  `    Attempts: ${itemAttempts.length}; latest ${latestAttempt.id} [${latestAttempt.state}] ${latestAttempt.profileId}/${latestAttempt.executor}`,
+                  `      Input: ${compactText(latestAttempt.input)}`,
+                  ...(latestAttempt.result?.summary === undefined
                     ? []
-                    : [`      Summary: ${compactText(latestRun.summary)}`])
+                    : [`      Summary: ${compactText(latestAttempt.result.summary)}`]),
+                  ...(latestAttempt.result?.changeSetId === undefined
+                    ? []
+                    : [`      ChangeSet: ${latestAttempt.result.changeSetId}`])
                 ])
           ];
         })),
+    "",
+    `ChangeSets (${changeSets.length}):`,
+    ...(changeSets.length === 0
+      ? ["  None."]
+      : changeSets.slice(-RECENT_RECORD_LIMIT).map((changeSet) => (
+          `  ${changeSet.id}: ${changeSet.baseCommit.slice(0, 12)}..${changeSet.headCommit.slice(0, 12)} (${changeSet.changedPaths.length} paths)`
+        ))),
+    "",
+    `Integration Attempts (${integrations.length}):`,
+    ...(integrations.length === 0
+      ? ["  None."]
+      : integrations.slice(-RECENT_RECORD_LIMIT).map((integration) => (
+          `  ${integration.id} [${integration.status}] — ${integration.targetRef}; ${integration.changeSetIds.join(", ")}`
+        ))),
     "",
     ...recentSection(
       "messages",
@@ -245,6 +256,15 @@ function currentAndRecentWorkItems<T extends { status: string }>(records: readon
     .slice(-(RECENT_RECORD_LIMIT - current.length));
   const selected = new Set([...current, ...recentTerminal]);
   return records.filter((record) => selected.has(record));
+}
+
+function chronological<T extends { id: string; createdAt: string }>(
+  records: readonly T[]
+): T[] {
+  return [...records].sort((left, right) => (
+    Date.parse(left.createdAt) - Date.parse(right.createdAt)
+    || left.id.localeCompare(right.id)
+  ));
 }
 
 function compactText(value: string): string {

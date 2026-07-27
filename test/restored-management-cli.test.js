@@ -75,15 +75,20 @@ function roleStore() {
   };
 }
 
-test("public catalog restores only the requested Agent and global Role management groups", () => {
+test("public catalog exposes Agent, Agent Profile, and persistent Role management groups", () => {
   const paths = listPublicCommandPaths();
   assert.ok(paths.includes("update"));
   assert.deepEqual(paths.filter((path) => path === "agent" || path.startsWith("agent ")), [
     "agent", "agent add", "agent list", "agent show", "agent update", "agent remove"
   ]);
+  assert.deepEqual(paths.filter((path) => path === "profile" || path.startsWith("profile ")), [
+    "profile", "profile add", "profile list", "profile show", "profile update",
+    "profile remove", "profile reset"
+  ]);
   assert.deepEqual(paths.filter((path) => path === "role" || path.startsWith("role ")), [
     "role", "role add", "role list", "role show", "role update", "role remove",
-    "role bind", "role unbind", "role enter", "role session", "role session record", "role session replace"
+    "role bind", "role unbind", "role enter", "role session", "role session record",
+    "role session replace"
   ]);
   for (const excluded of ["backup", "maintenance", "migrate", "import", "export", "prune"]) {
     assert.equal(paths.some((path) => path === excluded || path.startsWith(`${excluded} `)), false);

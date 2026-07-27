@@ -16,12 +16,14 @@ import { findInteractionPolicy } from "../../dist/cli/interactionPolicy.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { createDecision, supersedeDecision } from "../../dist/decision/decision.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
+import { createExecutionAttempt } from "../../dist/execution/executionAttempt.js";
 import {
   answerInputRequest,
   createInputRequest
 } from "../../dist/input/inputRequest.js";
 import { createTaskMessage } from "../../dist/message/message.js";
 import { createMilestone } from "../../dist/milestone/milestone.js";
+import { createAgentProfile } from "../../dist/profile/agentProfile.js";
 import {
   createGlobalRole,
   createRoleAgentBinding
@@ -49,6 +51,11 @@ function fixture(t) {
   store.transaction((tx) => {
     tx.saveConfig({ schemaVersion: 1, defaultAgent: codex.id, defaultWorkspace: root });
     tx.saveConfiguredAgent(codex);
+    tx.saveAgentProfile(createAgentProfile({
+      id: "worker",
+      agentId: codex.id,
+      defaultAccess: "read",
+    }, NOW));
     tx.saveGlobalRole(createGlobalRole(
       "leader",
       [createRoleAgentBinding(codex)],
@@ -170,9 +177,10 @@ test("task context aggregates complete records and renders a compact recent summ
     brief,
     activeDecisions: [activeDecision],
     milestones,
-    roles: store.listRoles(task.id),
     workItems: [workItem],
-    runs: [associatedRun],
+    attempts: [],
+    changeSets: [],
+    integrations: [],
     messages,
     openInputRequests: [],
     resolvedInputRequests: [],
@@ -186,7 +194,7 @@ test("task context aggregates complete records and renders a compact recent summ
   assert.doesNotMatch(result.output, /Milestone 1/);
   assert.match(result.output, /Milestone 6/);
   assert.match(result.output, /Implement context/);
-  assert.match(result.output, /agent-run-1.*active/);
+  assert.match(result.output, /Attempts: none/);
   assert.match(result.output, /Recent messages \(5 of 6\)/);
   assert.doesNotMatch(result.output, /Message 1/);
   assert.match(result.output, /Message 6/);
@@ -288,7 +296,12 @@ test("task context bounds human-readable history while preserving complete data"
     );
     store.saveWorkItem(
       task.id,
-      updateWorkItemStatus(created, "completed", `Outcome ${index}`, atMinute(index + 1))
+      updateWorkItemStatus(
+        created,
+        "completed",
+        atMinute(index + 1),
+        `Completed historical work ${index}.`
+      )
     );
   }
   store.saveMessage(task.id, createTaskMessage(
@@ -312,6 +325,48 @@ test("task context bounds human-readable history while preserving complete data"
   assert.doesNotMatch(result.output, /x{500}/);
 });
 
+test("task context orders UUID-backed execution records by time rather than identity", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Chronological execution context");
+  output(["activate", task.id], store, options);
+  const work = createWorkItem(
+    store.nextWorkItemId(task.id),
+    task.id,
+    { title: "Order attempts" },
+    atMinute(1)
+  );
+  store.saveWorkItem(task.id, work);
+  const older = createExecutionAttempt({
+    id: "attempt-z-old",
+    taskId: task.id,
+    workItemId: work.id,
+    profileId: "worker",
+    profileRevision: 1,
+    executor: "fork",
+    access: "read",
+    input: "older"
+  }, atMinute(2));
+  const newer = createExecutionAttempt({
+    id: "attempt-a-new",
+    taskId: task.id,
+    workItemId: work.id,
+    profileId: "worker",
+    profileRevision: 1,
+    executor: "fork",
+    access: "read",
+    input: "newer"
+  }, atMinute(3));
+  store.saveExecutionAttempt(task.id, older);
+  store.saveExecutionAttempt(task.id, newer);
+
+  const result = output(["context", task.id], store, options);
+  assert.deepEqual(result.data.attempts.map(({ id }) => id), [
+    older.id,
+    newer.id
+  ]);
+  assert.match(result.output, /latest attempt-a-new/);
+});
+
 test("task context keeps empty knowledge and work explicit and reads terminal Task states", (t) => {
   const { store, options } = fixture(t);
   const completed = createTask(store, options, "Completed context");
@@ -329,7 +384,9 @@ test("task context keeps empty knowledge and work explicit and reads terminal Ta
     assert.deepEqual(result.data.activeDecisions, []);
     assert.deepEqual(result.data.milestones, []);
     assert.deepEqual(result.data.workItems, []);
-    assert.deepEqual(result.data.runs, []);
+    assert.deepEqual(result.data.attempts, []);
+    assert.deepEqual(result.data.changeSets, []);
+    assert.deepEqual(result.data.integrations, []);
     assert.deepEqual(result.data.messages, []);
     assert.deepEqual(result.data.openInputRequests, []);
     assert.deepEqual(result.data.resolvedInputRequests, []);

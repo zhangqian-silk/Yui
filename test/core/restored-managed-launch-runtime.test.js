@@ -444,9 +444,9 @@ test("a Worker turn that forgets to yield fails visibly and wakes the Leader", a
   const item = updateWorkItemStatus(createWorkItem(
     "work-item-1",
     task.id,
-    { title: "Analyze", assignee: worker.name },
+    { title: "Analyze" },
     now
-  ), "running", undefined, now);
+  ), "running", now);
   const run = markAgentRunDelivered(createAgentRun(
     "agent-run-1",
     task.id,

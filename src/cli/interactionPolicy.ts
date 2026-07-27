@@ -1,9 +1,13 @@
 import type { CommandNode } from "./commandCatalog.js";
 
 export type CandidateProviderName =
+  | "agent-profiles"
+  | "change-sets"
   | "configured-agents"
+  | "execution-attempts"
   | "global-roles"
   | "input-requests"
+  | "integration-attempts"
   | "jobs"
   | "projects"
   | "runs"
@@ -16,8 +20,12 @@ export type CandidateProviderName =
 
 export type SelectableEntity =
   | "agent"
+  | "agent-profile"
+  | "change-set"
+  | "execution-attempt"
   | "global-role"
   | "input-request"
+  | "integration-attempt"
   | "job"
   | "project"
   | "run"
@@ -159,6 +167,42 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     trailingOptions: command === "replace"
       ? { "--native-id": "value", "--reason": "value" }
       : { "--native-id": "value" }
+  })),
+  {
+    commandPath: ["profile", "add"],
+    selectors: [{
+      option: "--agent",
+      requiredOption: true,
+      entity: "agent",
+      provider: "configured-agents",
+      actionTarget: false
+    }],
+    trailingOptions: {
+      "--agent": "value", "--description": "value", "--instructions": "value",
+      "--skill": "value", "--model": "value", "--effort": "value", "--access": "value"
+    }
+  },
+  ...["show", "update", "remove"].map((command): InteractionPolicy => ({
+    commandPath: ["profile", command],
+    selectors: [{
+      argumentIndex: 2,
+      entity: "agent-profile",
+      provider: "agent-profiles",
+      actionTarget: true
+    }],
+    ...(command === "update"
+      ? {
+          trailingOptions: {
+            "--agent": "value", "--description": "option-like-value",
+            "--instructions": "option-like-value", "--skill": "value",
+            "--model": "option-like-value", "--effort": "option-like-value",
+            "--access": "value"
+          }
+        }
+      : {}),
+    ...(command === "remove"
+      ? { confirmation: { action: "Remove Agent Profile", targetArgumentIndex: 2 } }
+      : {})
   })),
   taskTarget("show"),
   taskTarget("context"),
@@ -350,30 +394,135 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
         actionTarget: false
       }
     ],
-    trailingOptions: { "--role": "value" }
+    trailingOptions: {
+      "--objective": "value", "--accept": "value", "--after": "value", "--role": "value"
+    }
   },
   {
     commandPath: ["task", "work", "list"],
     selectors: [{ argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true }]
   },
-  {
-    commandPath: ["task", "work", "update"],
-    selectors: [{ argumentIndex: 3, entity: "work-item", provider: "work-items", actionTarget: true }],
-    trailingOptions: { "--summary": "value" }
-  },
-  {
-    commandPath: ["task", "work", "dispatch"],
-    selectors: [{ argumentIndex: 3, entity: "work-item", provider: "work-items", actionTarget: true }],
-    trailingOptions: { "--input": "value" }
-  },
+  ...["update", "dispatch", "isolate", "cleanup", "accept", "reject", "cancel"]
+    .map((command): InteractionPolicy => ({
+      commandPath: ["task", "work", command],
+      selectors: [{
+        argumentIndex: 3,
+        entity: "work-item",
+        provider: "work-items",
+        actionTarget: true
+      }],
+      ...(command === "update"
+        ? { trailingOptions: { "--summary": "value" as const } }
+        : command === "dispatch"
+          ? { trailingOptions: { "--input": "value" as const } }
+          : command === "cleanup"
+            ? {
+                trailingOptions: {
+                  "--integrated": "flag" as const,
+                  "--abandon": "flag" as const
+                }
+              }
+            : ["accept", "reject", "cancel"].includes(command)
+              ? { trailingOptions: { "--summary": "value" as const } }
+              : {})
+    })),
   {
     commandPath: ["task", "run", "list"],
-    selectors: [{ argumentIndex: 3, entity: "work-item", provider: "work-items", actionTarget: true }]
+    selectors: [{ argumentIndex: 3, entity: "work-item", provider: "work-items", actionTarget: true }],
   },
   ...["retry", "yield"].map((command): InteractionPolicy => ({
     commandPath: ["task", "run", command],
-    selectors: [{ argumentIndex: 3, entity: "run", provider: "runs", actionTarget: true }],
-    ...(command === "yield" ? { trailingOptions: { "--summary": "value" as const } } : {})
+    selectors: [{
+      argumentIndex: 3,
+      entity: "run",
+      provider: "runs",
+      actionTarget: true
+    }],
+    ...(command === "yield"
+      ? { trailingOptions: { "--summary": "value" as const } }
+      : {})
+  })),
+  {
+    commandPath: ["task", "attempt", "cleanup"],
+    selectors: [{
+      argumentIndex: 3,
+      entity: "execution-attempt",
+      provider: "execution-attempts",
+      actionTarget: true,
+      statuses: ["succeeded", "failed", "interrupted"]
+    }]
+  },
+  {
+    commandPath: ["task", "attempt", "dispatch"],
+    selectors: [
+      { argumentIndex: 3, entity: "work-item", provider: "work-items", actionTarget: true },
+      { option: "--profile", entity: "agent-profile", provider: "agent-profiles", actionTarget: false }
+    ],
+    trailingOptions: {
+      "--profile": "value", "--mode": "value", "--access": "value",
+      "--input": "value", "--session-reason": "value"
+    }
+  },
+  {
+    commandPath: ["task", "attempt", "list"],
+    selectors: [{ argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true }]
+  },
+  ...["show", "retry", "interrupt"].map((command): InteractionPolicy => ({
+    commandPath: ["task", "attempt", command],
+    selectors: [{
+      argumentIndex: 3,
+      entity: "execution-attempt",
+      provider: "execution-attempts",
+      actionTarget: true,
+      ...(command === "retry" ? { statuses: ["failed", "interrupted"] } : {}),
+      ...(command === "interrupt" ? { statuses: ["running"] } : {})
+    }]
+  })),
+  {
+    commandPath: ["task", "integration", "start"],
+    selectors: [
+      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
+      {
+        option: "--change-set",
+        requiredOption: true,
+        entity: "change-set",
+        provider: "change-sets",
+        dependsOn: 3,
+        actionTarget: false
+      }
+    ],
+    trailingOptions: { "--change-set": "value", "--target": "value", "--check": "value" }
+  },
+  {
+    commandPath: ["task", "integration", "list"],
+    selectors: [{ argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true }]
+  },
+  {
+    commandPath: ["task", "integration", "cleanup"],
+    selectors: [{
+      argumentIndex: 3,
+      entity: "integration-attempt",
+      provider: "integration-attempts",
+      actionTarget: true,
+      statuses: ["committed", "failed"]
+    }]
+  },
+  ...["show", "continue", "resolve", "abort"].map((command): InteractionPolicy => ({
+    commandPath: ["task", "integration", command],
+    selectors: [{
+      argumentIndex: 3,
+      entity: "integration-attempt",
+      provider: "integration-attempts",
+      actionTarget: true,
+      ...(command === "continue" ? { statuses: ["blocked", "validating"] } : {}),
+      ...(command === "resolve" ? { statuses: ["blocked"] } : {}),
+      ...(command === "abort" ? { statuses: ["running", "blocked"] } : {})
+    }],
+    ...(command === "resolve"
+        ? { trailingOptions: { "--option": "value" as const, "--rationale": "value" as const } }
+        : command === "abort"
+          ? { trailingOptions: { "--reason": "value" as const } }
+        : {})
   })),
   {
     commandPath: ["task", "enter"],

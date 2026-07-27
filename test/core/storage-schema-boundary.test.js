@@ -5,15 +5,10 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
-  AGGREGATE_MIGRATIONS,
   CURRENT_AGGREGATE_SCHEMA_VERSION,
   CURRENT_STORAGE_LAYOUT_VERSION,
-  CURRENT_STORAGE_SCHEMA_VERSION,
-  dispatchStorageMigrations,
-  dispatchAggregateMigrations,
   inspectStorageSchema,
-  requireStorageSchema,
-  STORAGE_MIGRATIONS
+  requireStorageSchema
 } from "../../dist/storage/storageSchema.js";
 
 function temporaryHome() {
@@ -25,7 +20,6 @@ function writeManifest(home, overrides = {}) {
     schemaVersion: 1,
     storageVersion: CURRENT_STORAGE_LAYOUT_VERSION,
     aggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-    activeGeneration: null,
     updatedAt: "2026-07-20T00:00:00.000Z",
     ...overrides
   }));
@@ -33,9 +27,7 @@ function writeManifest(home, overrides = {}) {
 
 test("storage inspection keeps layout and aggregate schema versions separate", () => {
   const home = temporaryHome();
-  assert.equal(CURRENT_STORAGE_SCHEMA_VERSION, CURRENT_STORAGE_LAYOUT_VERSION);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 4);
-  assert.deepEqual(STORAGE_MIGRATIONS, []);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 6);
 
   writeManifest(home);
   assert.deepEqual(inspectStorageSchema(home), {
@@ -46,7 +38,6 @@ test("storage inspection keeps layout and aggregate schema versions separate", (
     latestLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
     currentAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
     latestAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-    activeGeneration: null,
     manifestPath: join(home, "schema.json")
   });
   assert.doesNotThrow(() => requireStorageSchema(home));
@@ -70,36 +61,11 @@ test("a manifest without an aggregate version is invalid in this fresh-only rele
 
 test("the previous aggregate schema is rejected without migration", () => {
   const home = temporaryHome();
-  writeManifest(home, { aggregateSchemaVersion: 2 });
+  writeManifest(home, { aggregateSchemaVersion: 5 });
 
   assert.throws(
     () => requireStorageSchema(home),
-    /aggregate schema 2 is older than required.*version 4.*no migration/i
-  );
-});
-
-test("aggregate migrations have an independent deterministic registry", () => {
-  assert.deepEqual(AGGREGATE_MIGRATIONS, []);
-  const migrations = [
-    {
-      fromVersion: 2,
-      toVersion: 3,
-      migrate: (state) => ({ ...state, second: true })
-    },
-    {
-      fromVersion: 1,
-      toVersion: 2,
-      migrate: (state) => ({ ...state, first: true })
-    }
-  ];
-
-  assert.deepEqual(
-    dispatchAggregateMigrations({ schemaVersion: 1 }, 1, 3, migrations),
-    { schemaVersion: 1, first: true, second: true }
-  );
-  assert.throws(
-    () => dispatchAggregateMigrations({}, 1, 3, [migrations[1]]),
-    /no migration is available/i
+    /aggregate schema 5 is older than required.*version 6.*no migration/i
   );
 });
 
@@ -121,46 +87,14 @@ test("storage inspection rejects future layout and aggregate versions", () => {
   writeManifest(home, { activeGeneration: "generation-000001" });
   assert.throws(
     () => requireStorageSchema(home),
-    /activeGeneration.*not supported/i
+    /unknown field: activeGeneration/i
   );
 });
 
-test("migration dispatch validates the complete sequential chain before writing", () => {
-  const applied = [];
-  const migrations = [
-    { fromVersion: 2, toVersion: 3, migrate: () => applied.push("2->3") },
-    { fromVersion: 1, toVersion: 2, migrate: () => applied.push("1->2") }
-  ];
-
-  dispatchStorageMigrations("/unused", 1, 3, migrations);
-  assert.deepEqual(applied, ["1->2", "2->3"]);
-
-  applied.length = 0;
-  assert.throws(
-    () => dispatchStorageMigrations("/unused", 1, 3, [migrations[1]]),
-    /no migration is available/i
-  );
-  assert.deepEqual(applied, []);
-});
-
-test("migration registry rejects ambiguous and non-sequential entries before writing", () => {
-  const applied = [];
-  const first = { fromVersion: 1, toVersion: 2, migrate: () => applied.push("first") };
-
-  assert.throws(
-    () => dispatchStorageMigrations("/unused", 1, 2, [
-      first,
-      { fromVersion: 1, toVersion: 2, migrate: () => applied.push("duplicate") }
-    ]),
-    /duplicate migration.*layout version 1/i
-  );
-  assert.deepEqual(applied, []);
-
-  assert.throws(
-    () => dispatchStorageMigrations("/unused", 1, 3, [
-      { fromVersion: 1, toVersion: 3, migrate: () => applied.push("jump") }
-    ]),
-    /must advance exactly one layout version/i
-  );
-  assert.deepEqual(applied, []);
+test("the development schema exposes no migration API", async () => {
+  const schema = await import("../../dist/storage/storageSchema.js");
+  assert.equal("dispatchStorageMigrations" in schema, false);
+  assert.equal("dispatchAggregateMigrations" in schema, false);
+  assert.equal("STORAGE_MIGRATIONS" in schema, false);
+  assert.equal("AGGREGATE_MIGRATIONS" in schema, false);
 });

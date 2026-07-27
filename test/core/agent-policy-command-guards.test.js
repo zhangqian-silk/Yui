@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   createConfiguredAgent
 } from "../../dist/agent/agent.js";
+import { createAgentProfile } from "../../dist/profile/agentProfile.js";
 import {
   runAgentCommand
 } from "../../dist/commands/agentCommands.js";
@@ -394,6 +395,24 @@ test("Agent update permits an adapter change when the Agent has no Role referenc
   );
   assert.equal(storedAgent(store, secondary.id).adapterId, "claude");
   assert.equal(storedAgent(store, secondary.id).command, "claude");
+});
+
+test("Agent update rejects an adapter change referenced by any Agent Profile revision", (t) => {
+  const { store, secondary } = fixture(t);
+  store.saveAgentProfile(createAgentProfile({
+    id: "reviewer",
+    agentId: secondary.id,
+    defaultAccess: "read"
+  }, NOW));
+
+  assert.throws(
+    () => runAgentCommand([
+      "update", secondary.id, "--adapter", "claude", "--command", "claude"
+    ], store),
+    (error) => error?.code === "USAGE_ERROR"
+      && /Agent Profile reviewer revision 1/u.test(error.message)
+  );
+  assert.equal(storedAgent(store, secondary.id).adapterId, "codex");
 });
 
 test("Agent remove refuses config and Role references, but removes an unused Agent", async (t) => {

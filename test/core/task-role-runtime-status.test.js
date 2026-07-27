@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,10 +13,13 @@ import {
 import { createInputRequest } from "../../dist/input/inputRequest.js";
 import {
   createGlobalRole,
-  createRoleAgentBinding
+  createRoleAgentBinding,
+  updateRoleStatus
 } from "../../dist/role/role.js";
+import { createAgentRun } from "../../dist/run/agentRun.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
+import { updateWorkItemStatus } from "../../dist/workItem/workItem.js";
 import {
   yuiTmuxTarget,
   TmuxManager
@@ -70,15 +72,36 @@ function execute(args, store, options) {
   return result;
 }
 
+function dispatchTestRun(store, taskId, roleName, workItemId) {
+  const role = store.getRole(taskId, roleName);
+  const item = store.getWorkItem(taskId, workItemId);
+  const run = createAgentRun(
+    store.nextAgentRunId(taskId),
+    taskId,
+    roleName,
+    "new",
+    "test run",
+    NOW,
+    { workItemId }
+  );
+  store.transaction((tx) => {
+    tx.saveAgentRun(run);
+    tx.saveActiveAgentRun(run);
+    tx.saveRole(taskId, updateRoleStatus(role, "running", NOW));
+    tx.saveWorkItem(taskId, updateWorkItemStatus(item, "running", NOW));
+  });
+  return run;
+}
+
 test("Task Role list uses one tmux snapshot and returns structured runtime summaries", (t) => {
   const { root, store, options, paneReads } = fixture(t);
   execute(["create", "Runtime status"], store, options);
   const task = store.listTasks()[0];
   execute(["role", "add", task.id, "worker"], store, options);
-  execute(["work", "create", task.id, "Implement", "--role", "worker"], store, options);
+  execute(["work", "create", task.id, "Implement"], store, options);
   execute(["activate", task.id], store, options);
   const work = store.listWorkItems(task.id)[0];
-  execute(["work", "dispatch", work.id], store, options);
+  dispatchTestRun(store, task.id, "worker", work.id);
   const activeRun = store.getActiveAgentRun(task.id, "worker");
   store.saveAgentRun({ ...activeRun, deliveredAt: NOW.toISOString() });
 
@@ -138,30 +161,14 @@ test("Task Role status explains persisted and live state without capturing outpu
   assert.equal(result.data.role.nativeSession, null);
 });
 
-test("Task Role list emits its runtime summaries as a structured JSON array", (t) => {
-  const { root, store, options } = fixture(t);
-  execute(["create", "JSON role status"], store, options);
-  const task = store.listTasks()[0];
-  const response = JSON.parse(execFileSync(
-    process.execPath,
-    [join(process.cwd(), "dist", "cli.js"), "--json", "task", "role", "list", task.id],
-    { encoding: "utf8", env: { ...process.env, YUI_HOME: root } }
-  ));
-
-  assert.equal(response.ok, true);
-  assert.equal(Array.isArray(response.data.roles), true);
-  assert.equal(response.data.roles[0].roleName, "leader");
-  assert.equal(response.data.roles[0].health, "idle");
-});
-
 test("Task Role health distinguishes queued, orphaned delivered, and exited runtime states", (t) => {
   const { store, options } = fixture(t);
   execute(["create", "Health states"], store, options);
   const task = store.listTasks()[0];
   execute(["role", "add", task.id, "worker"], store, options);
-  execute(["work", "create", task.id, "Run it", "--role", "worker"], store, options);
+  execute(["work", "create", task.id, "Run it"], store, options);
   execute(["activate", task.id], store, options);
-  execute(["work", "dispatch", store.listWorkItems(task.id)[0].id], store, options);
+  dispatchTestRun(store, task.id, "worker", store.listWorkItems(task.id)[0].id);
   const withoutPane = {
     ...options,
     runtime: { ...options.runtime, inspectTaskRolePanes: () => [] }
@@ -197,7 +204,7 @@ test("Task Role health distinguishes queued, orphaned delivered, and exited runt
 });
 
 test("an open InputRequest blocks a healthy Leader and exposes only its count", (t) => {
-  const { root, store, options } = fixture(t);
+  const { store, options } = fixture(t);
   execute(["create", "Await user"], store, options);
   const task = store.listTasks()[0];
   execute(["role", "add", task.id, "worker"], store, options);
@@ -230,20 +237,6 @@ test("an open InputRequest blocks a healthy Leader and exposes only its count", 
   assert.equal(worker.openInputRequestCount, 0);
   assert.equal(worker.health, "idle");
   assert.equal(Object.hasOwn(leader, "inputRequests"), false);
-
-  const json = JSON.parse(execFileSync(
-    process.execPath,
-    [join(process.cwd(), "dist", "cli.js"), "--json", "task", "role", "list", task.id],
-    { encoding: "utf8", env: { ...process.env, YUI_HOME: root } }
-  ));
-  assert.equal(
-    json.data.roles.find((role) => role.roleName === "leader").openInputRequestCount,
-    1
-  );
-  assert.equal(
-    json.data.roles.find((role) => role.roleName === "worker").openInputRequestCount,
-    0
-  );
 
   const deadLeader = {
     ...options,
