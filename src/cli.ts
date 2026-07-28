@@ -33,6 +33,12 @@ import {
   type GlobalRoleCommandOptions
 } from "./commands/globalRoleCommands.js";
 import { runConfigCommand } from "./commands/configCommands.js";
+import {
+  parseControllerCleanupOptions,
+  parseControllerStatusOptions,
+  renderControllerResourceStatus,
+  runInteractiveControllerCleanup
+} from "./commands/controllerCommands.js";
 import { runJobCommand } from "./commands/jobCommands.js";
 import { runOperatorCommand } from "./commands/operatorCommands.js";
 import { runProjectCommand } from "./commands/projectCommands.js";
@@ -51,9 +57,12 @@ import {
   refreshRunningFileTaskControllerConfiguration,
   refreshRunningFileTaskControllerEnvironment,
   type RunningControllerRefreshResult,
-  restartFileTaskController
+  restartFileTaskController,
+  stopFileTaskController
 } from "./controller/clientRuntime.js";
 import { FileSchedulerStoreAdapter } from "./controller/fileSchedulerStoreAdapter.js";
+import { cleanControllerResource } from "./controller/resourceCleanupLinux.js";
+import { scanControllerResourceInventory } from "./controller/resourceInventoryLinux.js";
 import { runSessionNotifyCommand } from "./controller/sessionNotify.js";
 import { runDoctorCommand } from "./doctor/doctor.js";
 import { agentNotFound, CliError, runtimeError, usageError } from "./errors/cliError.js";
@@ -171,6 +180,69 @@ export async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "controller") {
+    const method = args[1];
+    if (method === "status") {
+      const options = parseControllerStatusOptions(args.slice(2));
+      const snapshot = await scanControllerResourceInventory({
+        currentHome: home,
+        scope: options.scope,
+        environment: process.env
+      });
+      emit(
+        renderControllerResourceStatus(snapshot, options.verbose),
+        false,
+        snapshot
+      );
+      return;
+    }
+    if (method === "cleanup") {
+      if (jsonOutput) throw usageError("Controller cleanup does not support --json.");
+      const options = parseControllerCleanupOptions(args.slice(2));
+      const readline = createInterface({
+        input: process.stdin,
+        output: process.stdout
+      });
+      try {
+        const result = await runInteractiveControllerCleanup({
+          io: {
+            interactive: process.stdin.isTTY === true && process.stdout.isTTY === true,
+            write: (value) => process.stdout.write(value),
+            question: async (prompt) => readline.question(prompt)
+          },
+          scan: () => scanControllerResourceInventory({
+            currentHome: home,
+            scope: options.scope,
+            environment: process.env
+          }),
+          clean: (resource) => cleanControllerResource(resource, {
+            environment: process.env
+          })
+        });
+        if (result.data.failed.length > 0 || result.data.skipped.length > 0) {
+          process.exitCode = 5;
+        }
+        emit(result.output, false, result.data);
+      } finally {
+        readline.close();
+      }
+      return;
+    }
+    if ((method !== "stop" && method !== "restart") || args.length !== 2) {
+      throw usageError(
+        "Controller usage: yui controller status [--all] [--verbose] | "
+          + "cleanup [--all] | stop | restart."
+      );
+    }
+    requireStorageSchema(home);
+    const controllerMethod: "stop" | "restart" = method;
+    const result = controllerMethod === "restart"
+      ? await restartFileTaskController(home, { environment: process.env })
+      : await stopFileTaskController(home, { environment: process.env });
+    emit(renderControllerResult(controllerMethod, result));
+    return;
+  }
+
   requireStorageSchema(home);
   const store = new FileTaskStore(home);
   const catalogs = new AgentConfigurationCatalogService(home, {
@@ -182,19 +254,6 @@ export async function main(): Promise<void> {
     return;
   }
   await preflightAgentConfigurationMutation(resolved, store, catalogs);
-
-  if (resolved[0] === "controller") {
-    const method = resolved[1];
-    if ((method !== "status" && method !== "stop" && method !== "restart") || resolved.length !== 2) {
-      throw usageError("Controller usage: yui controller status|stop|restart.");
-    }
-    const controllerMethod: "status" | "stop" | "restart" = method;
-    const result = controllerMethod === "restart"
-      ? await restartFileTaskController(home, { environment: process.env })
-      : await callFileTaskController(home, `controller.${controllerMethod}`);
-    emit(renderControllerResult(controllerMethod, result));
-    return;
-  }
 
   const executor = new NodeCommandExecutor();
   const tmux = new TmuxManager(
@@ -528,17 +587,11 @@ export async function main(): Promise<void> {
   );
 }
 
-function renderControllerResult(method: "status" | "stop" | "restart", value: unknown): string {
+function renderControllerResult(method: "stop" | "restart", value: unknown): string {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return JSON.stringify(value);
   }
   const result = value as Record<string, unknown>;
-  if (method === "status") {
-    if (result.running !== true) return "Controller is not running.";
-    return result.pid === undefined
-      ? "Controller is running."
-      : `Controller is running (PID ${String(result.pid)}).`;
-  }
   if (method === "restart") {
     const previousPid = Number.isSafeInteger(result.previousPid) ? String(result.previousPid) : undefined;
     const pid = Number.isSafeInteger(result.pid) ? String(result.pid) : undefined;

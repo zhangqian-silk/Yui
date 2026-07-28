@@ -94,6 +94,47 @@ export type FileControllerRestartResult = Readonly<{
   pid?: number;
 }>;
 
+export type FileControllerStopResult = Readonly<{
+  stopped: boolean;
+  alreadyStopped?: true;
+  pid?: number;
+}>;
+
+/** Stops the per-home Controller and waits until its owned discovery is gone. */
+export async function stopFileTaskController(
+  home: string,
+  options: FileControllerClientOptions = {}
+): Promise<FileControllerStopResult> {
+  const call = options.call ?? callController;
+  const shutdownTimeoutMs = positive(
+    options.shutdownTimeoutMs,
+    SHUTDOWN_TIMEOUT_MS,
+    "shutdownTimeoutMs"
+  );
+  const pollMs = positive(options.pollIntervalMs, POLL_INTERVAL_MS, "pollIntervalMs");
+  const current = await readOptionalControllerStatus(home, call);
+  const pid = controllerPid(current);
+  if (!controllerRunning(current)) {
+    return { stopped: false, alreadyStopped: true };
+  }
+  await callFileTaskController(home, "controller.stop", {}, options);
+  const deadline = Date.now() + shutdownTimeoutMs;
+  for (;;) {
+    const stillOwned = options.call === undefined
+      ? await ownedControllerDiscoveryExists(home, pid)
+      : controllerPid(await readOptionalControllerStatus(home, call)) === pid;
+    if (!stillOwned) break;
+    if (Date.now() >= deadline) {
+      throw new Error(`Controller did not stop within ${shutdownTimeoutMs} ms.`);
+    }
+    await delay(pollMs);
+  }
+  return {
+    stopped: true,
+    ...(pid === undefined ? {} : { pid })
+  };
+}
+
 /** Restarts only the per-home Controller process; managed tmux sessions remain untouched. */
 export async function restartFileTaskController(
   home: string,

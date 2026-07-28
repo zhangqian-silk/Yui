@@ -30,6 +30,7 @@ const PUBLIC_PATHS = [
   "web",
   "controller",
   "controller status",
+  "controller cleanup",
   "controller stop",
   "controller restart",
   "config",

@@ -244,9 +244,25 @@ One background Controller runs per `YUI_HOME`:
 
 ```sh
 yui controller status
+yui controller status --all
+yui controller status --all --verbose
+yui controller cleanup
+yui controller cleanup --all
 yui controller stop
 yui controller restart
 ```
+
+`controller status` scans the current `YUI_HOME` without starting a Controller. It
+shows a bounded summary of the current Controller, owned Agent sessions, residual
+resources, and live anomalies. `--all` also discovers other same-user Yui homes
+from running processes; `--verbose` expands the resource details. `--json`
+returns the complete typed snapshot even when the human view is abbreviated.
+
+`controller cleanup` is interactive and never selects active Task or Role
+resources. It separates safe and review-required candidates, confirms live
+process cleanup explicitly, and revalidates process, tmux pane, and socket
+identity immediately before acting. Partial failures are reported without
+hiding the resources that remain. Use `--all` to include discovered Yui homes.
 
 `controller restart` replaces the Controller process and its scheduler/socket services with the currently installed Yui version. It does not stop or restart managed tmux/Agent sessions.
 

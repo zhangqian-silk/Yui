@@ -598,10 +598,25 @@ export const ROOT_COMMAND = buildNode({
     },
     {
       name: "controller",
-      summary: "Inspect, stop, or restart the local Controller.",
-      sections: [{ id: "lifecycle", title: "Commands", entries: ["status", "stop", "restart"] }],
+      summary: "Inspect and recover local Controller runtime resources.",
+      sections: [{
+        id: "lifecycle",
+        title: "Commands",
+        entries: ["status", "cleanup", "stop", "restart"]
+      }],
       children: [
-        { name: "status", summary: "Show Controller status." },
+        {
+          name: "status",
+          summary: "Show Controller and Agent runtime resources.",
+          usage: "yui controller status [--all] [--verbose]",
+          options: ["--all", "--verbose"]
+        },
+        {
+          name: "cleanup",
+          summary: "Interactively clean confirmed unused runtime resources.",
+          usage: "yui controller cleanup [--all]",
+          options: ["--all"]
+        },
         { name: "stop", summary: "Stop the Controller." },
         { name: "restart", summary: "Restart internal services without stopping tmux sessions." }
       ]
