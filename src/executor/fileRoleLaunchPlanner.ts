@@ -26,6 +26,7 @@ import type {
   AgentEnvironmentRefresh,
   AgentEnvironmentRefreshPort
 } from "../runtime/ports.js";
+import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
@@ -127,6 +128,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       role,
       input,
       { scope: "task", taskId: task.id },
+      taskRoleSessionTitle(task, role.name),
       this.store.getRoleSession(task.id, role.name)?.nativeSessionId
     );
   }
@@ -138,6 +140,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       role,
       input,
       { scope: "global" },
+      undefined,
       this.store.getGlobalRoleSessionSet(role.name)?.sessions[role.activeAgentId]?.nativeSessionId
     );
   }
@@ -154,6 +157,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       environment?: Readonly<Record<string, string>>;
     }>,
     owner: Readonly<{ scope: "task"; taskId: string } | { scope: "global" }>,
+    sessionTitle: string | undefined,
     knownNativeSessionId?: string
   ): PlannedRoleSession {
     const binding = activeRoleAgentBinding(role);
@@ -201,6 +205,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       agent,
       config: binding.config,
       workspace: role.workspace,
+      ...(sessionTitle === undefined ? {} : { sessionTitle }),
       ...sessionContext,
       ...(codexConfig === undefined
         ? {}
@@ -272,6 +277,17 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           YUI_AGENT_ID: configured.id,
           YUI_ADAPTER_ID: configured.adapterId,
           YUI_WORKSPACE: role.workspace,
+          ...(sessionTitle === undefined
+            ? {}
+            : {
+                YUI_SESSION_TITLE: sessionTitle,
+                ...(configured.adapterId === "codex"
+                  ? {
+                      YUI_AGENT_COMMAND: configured.command,
+                      YUI_AGENT_BASE_ARGS: JSON.stringify(configured.baseArgs)
+                    }
+                  : {})
+              }),
           ...(input.launchId === undefined
             ? {}
             : { YUI_LAUNCH_ID: input.launchId })

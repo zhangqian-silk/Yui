@@ -44,6 +44,7 @@ import {
   type AgentRun
 } from "../run/agentRun.js";
 import { markYuiRunInput, retagYuiRunInput } from "../run/runIdentity.js";
+import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import { createTaskBrief, updateTaskBrief } from "../brief/taskBrief.js";
 import { createDecision, supersedeDecision } from "../decision/decision.js";
 import { createMilestone } from "../milestone/milestone.js";
@@ -1222,7 +1223,8 @@ function dispatchWork(
     const runId = tx.nextAgentRunId(task.id);
     const input = markYuiRunInput(
       compileDispatchInput({}, task.id, role, rawInput),
-      runId
+      runId,
+      taskRoleSessionTitle(task, role.name)
     );
     const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
     const created = createAgentRun(
@@ -1471,7 +1473,11 @@ function retryRun(
       task.id,
       role.name,
       roleAgentSessionResumeMode(sessions, role.activeAgentId),
-      retagYuiRunInput(previous.input, runId),
+      retagYuiRunInput(
+        previous.input,
+        runId,
+        taskRoleSessionTitle(task, role.name)
+      ),
       now,
       { workItemId: previous.workItemId }
     );

@@ -25,6 +25,7 @@ import {
   retagYuiRunInput,
   yuiRunIdFromInputMessages
 } from "../../dist/run/runIdentity.js";
+import { taskRoleSessionTitle } from "../../dist/runtime/sessionTitle.js";
 import { createProject } from "../../dist/repository/project.js";
 import {
   bindTaskRoleRun,
@@ -167,7 +168,11 @@ function dispatchTestRun(store, taskId, roleName, workItemId, input = "test run"
     taskId,
     roleName,
     "new",
-    markYuiRunInput(input, runId),
+    markYuiRunInput(
+      input,
+      runId,
+      taskRoleSessionTitle(store.getTask(taskId), roleName)
+    ),
     NOW,
     { workItemId }
   );
@@ -438,7 +443,11 @@ test("retry replaces the old causal Run marker instead of reusing it", (t) => {
     task.id,
     "leader",
     "new",
-    markYuiRunInput("recover", "agent-run-old"),
+    markYuiRunInput(
+      "recover",
+      "agent-run-old",
+      `Yui · ${task.id} · Retry marker · Leader`
+    ),
     NOW
   ), "failed before delivery", NOW);
   store.saveAgentRun(failed);
@@ -446,9 +455,11 @@ test("retry replaces the old causal Run marker instead of reusing it", (t) => {
   run(["run", "retry", failed.id], store, options);
 
   const retried = store.getActiveAgentRun(task.id, "leader");
-  const markers = retried.input.match(/^Yui-Run-Id: .+$/gm);
-  assert.deepEqual(markers, [`Yui-Run-Id: ${retried.id}`]);
-  assert.equal(retried.input.includes("Yui-Run-Id: agent-run-old"), false);
+  const markers = retried.input.match(/^Yui · .+ · Retry marker · Leader · Run .+$/gm);
+  assert.deepEqual(markers, [
+    `Yui · ${task.id} · Retry marker · Leader · Run ${retried.id}`
+  ]);
+  assert.equal(retried.input.includes("Run agent-run-old"), false);
   assert.equal(yuiRunIdFromInputMessages([retried.input]), retried.id);
 });
 
@@ -486,39 +497,74 @@ test("a failed Worker Run can retry its failed WorkItem", (t) => {
 test("Run marker handling preserves user-authored marker lines outside the managed header", () => {
   const userInput = [
     "Analyze this exact payload:",
-    "Yui-Run-Id: example-from-user",
+    "Yui-Run: example-from-user",
     "keep the line above"
   ].join("\n");
 
-  const marked = markYuiRunInput(userInput, "agent-run-current");
-  const retried = retagYuiRunInput(marked, "agent-run-retried");
+  const marked = markYuiRunInput(
+    userInput,
+    "agent-run-current",
+    "Yui · task-7 · Test Task · Worker"
+  );
+  const retried = retagYuiRunInput(
+    marked,
+    "agent-run-retried",
+    "Yui · task-7 · Test Task · Worker"
+  );
 
-  assert.equal(marked.includes("Yui-Run-Id: example-from-user"), true);
-  assert.equal(retried.includes("Yui-Run-Id: example-from-user"), true);
-  assert.equal(retried.startsWith("Yui-Run-Id: agent-run-retried\n\n"), true);
+  assert.equal(marked.includes("Yui-Run: example-from-user"), true);
+  assert.equal(retried.includes("Yui-Run: example-from-user"), true);
+  assert.equal(
+    retried.startsWith(
+      "Yui · task-7 · Test Task · Worker · Run agent-run-retried\n\n"
+    ),
+    true
+  );
   assert.equal(yuiRunIdFromInputMessages([retried]), "agent-run-retried");
   assert.equal(yuiRunIdFromInputMessages([userInput]), undefined);
 });
 
 test("first Run marking preserves a user lookalike at the start of the body", () => {
   const userInput = [
-    "Yui-Run-Id: example-from-user",
+    "Yui-Run: example-from-user",
     "",
     "This is user-authored content, not a managed envelope."
   ].join("\n");
 
-  const marked = markYuiRunInput(userInput, "agent-run-current");
+  const marked = markYuiRunInput(
+    userInput,
+    "agent-run-current",
+    "Yui · task-7 · Test Task · Worker"
+  );
 
   assert.equal(
     marked,
-    `Yui-Run-Id: agent-run-current\n\n${userInput}`
+    `Yui · task-7 · Test Task · Worker · Run agent-run-current\n\n${userInput}`
   );
   assert.equal(yuiRunIdFromInputMessages([marked]), "agent-run-current");
 });
 
+test("Run parsing rejects previous marker formats", () => {
+  const legacy = "Yui-Run-Id: agent-run-legacy\n\nContinue the existing Run.";
+
+  assert.equal(yuiRunIdFromInputMessages([legacy]), undefined);
+  assert.throws(
+    () => retagYuiRunInput(
+      legacy,
+      "agent-run-current",
+      "Yui · task-7 · Existing Task · Leader"
+    ),
+    /managed Run input header is required/iu
+  );
+});
+
 test("Run retagging rejects input without a managed envelope", () => {
   assert.throws(
-    () => retagYuiRunInput("plain user input", "agent-run-retried"),
+    () => retagYuiRunInput(
+      "plain user input",
+      "agent-run-retried",
+      "Yui · task-7 · Test Task · Worker"
+    ),
     /managed Run input header is required/iu
   );
 });

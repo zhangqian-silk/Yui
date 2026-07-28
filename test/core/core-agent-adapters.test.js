@@ -91,7 +91,14 @@ test("rawArgs cannot take ownership of structured, lifecycle, or secret-bearing 
       argument
     );
   }
-  for (const argument of ["--resume=session", "--permission-mode", "-pr", "--allowedTools"]) {
+  for (const argument of [
+    "--resume=session",
+    "--permission-mode",
+    "-pr",
+    "--allowedTools",
+    "--name=custom",
+    "-n"
+  ]) {
     assert.throws(
       () => validateAgentRawArguments("claude", [argument]),
       /reserved/i,
