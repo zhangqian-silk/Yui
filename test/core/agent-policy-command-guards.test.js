@@ -189,7 +189,12 @@ test("Agent update rejects a real change used by an active Task Role session wit
 
 test("Agent update rejects dormant live sessions but permits stopped sessions", (t) => {
   const { store, primary, secondary } = fixture(t);
-  const globalRole = saveGlobalRole(store, [primary, secondary], secondary.id);
+  const globalRole = saveGlobalRole(
+    store,
+    [primary, secondary],
+    secondary.id,
+    "reviewer"
+  );
   const owner = {
     scope: "global",
     roleName: globalRole.name
@@ -211,7 +216,7 @@ test("Agent update rejects dormant live sessions but permits stopped sessions", 
   assert.throws(
     () => runAgentCommand(["update", primary.id, "--command", "codex-next"], store),
     (error) => error?.code === "USAGE_ERROR"
-      && /Global Role operator/u.test(error.message)
+      && /Global Role reviewer/u.test(error.message)
       && /non-stopped|stop/u.test(error.message)
   );
   assert.deepEqual(storedAgent(store), beforeDormant);
@@ -249,7 +254,7 @@ test("Agent update rejects dormant live sessions but permits stopped sessions", 
   assert.throws(
     () => runAgentCommand(["update", primary.id, "--adapter", "claude"], store),
     (error) => error?.code === "USAGE_ERROR"
-      && /Global Role operator/u.test(error.message)
+      && /Global Role reviewer/u.test(error.message)
       && /new Agent ID|bind/u.test(error.message)
   );
   assert.deepEqual(storedAgent(store), beforeAdapter);
@@ -337,13 +342,13 @@ test("Agent update and remove reject pending Task Role runtime cleanup", (t) => 
 test("adapter changes are rejected for both Global and Task Role bindings, even when inactive", async (t) => {
   await t.test("Global Role binding", (t) => {
     const { store, primary, secondary } = fixture(t);
-    saveGlobalRole(store, [primary, secondary], secondary.id);
+    saveGlobalRole(store, [primary, secondary], secondary.id, "reviewer");
     const before = storedAgent(store);
 
     assert.throws(
       () => runAgentCommand(["update", primary.id, "--adapter", "claude"], store),
       (error) => error?.code === "USAGE_ERROR"
-        && /Global Role operator/u.test(error.message)
+        && /Global Role reviewer/u.test(error.message)
     );
     assert.deepEqual(storedAgent(store), before);
   });

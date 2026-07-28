@@ -14,6 +14,7 @@ export type CodexSessionNotification = Readonly<{
   nativeSessionId: string;
   turnId: string;
   runId?: string;
+  title?: string;
   lastAssistantMessage: string;
 }>;
 
@@ -42,6 +43,7 @@ export async function runSessionNotifyCommand(
     nativeSessionId: params.nativeSessionId,
     turnId: params.turnId,
     ...(params.runId === undefined ? {} : { runId: params.runId }),
+    ...(params.title === undefined ? {} : { title: params.title }),
     summary: params.lastAssistantMessage
   });
   // The durable write is authoritative. This short socket call is only a
@@ -79,6 +81,7 @@ export function parseCodexSessionNotification(
   const turnId = requireText(payload["turn-id"], "Codex turn-id");
   const lastAssistantMessage = requireAssistantMessage(payload["last-assistant-message"]);
   const runId = yuiRunIdFromInputMessages(payload["input-messages"]);
+  const title = sessionTitleFromInputMessages(payload["input-messages"]);
   const scope = environment.YUI_SESSION_SCOPE;
   if (scope !== "task" && scope !== "global") {
     throw new Error("YUI_SESSION_SCOPE must be task or global.");
@@ -92,6 +95,7 @@ export function parseCodexSessionNotification(
     nativeSessionId,
     turnId,
     ...(runId === undefined ? {} : { runId }),
+    ...(title === undefined ? {} : { title }),
     lastAssistantMessage
   } as const;
   return scope === "task"
@@ -138,6 +142,29 @@ function requireAssistantMessage(value: unknown): string {
     throw new Error("Codex last assistant message is invalid.");
   }
   return text;
+}
+
+function sessionTitleFromInputMessages(value: unknown): string | undefined {
+  if (!Array.isArray(value)) return undefined;
+  for (const entry of value) {
+    if (typeof entry !== "string") continue;
+    const lines = entry.replace(/\r/g, "").trim().split("\n");
+    const body = lines.length >= 3
+      && lines[0]!.startsWith("Yui-Run-Id: ")
+      && lines[1] === ""
+      ? lines.slice(2).join("\n")
+      : lines.join("\n");
+    const normalized = body.trim().replaceAll(/\s+/g, " ");
+    if (normalized.length > 0) return truncateSessionText(normalized);
+  }
+  return undefined;
+}
+
+function truncateSessionText(value: string): string {
+  const truncated = value.slice(0, 1_024);
+  return /[\uD800-\uDBFF]$/.test(truncated)
+    ? truncated.slice(0, -1)
+    : truncated;
 }
 
 function isObject(value: unknown): value is Record<string, any> {

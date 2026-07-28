@@ -21,6 +21,8 @@ type GlobalRuntimeTurnCompleted = Readonly<{
   launchId?: string;
   nativeSessionId: string;
   turnId: string;
+  title?: string;
+  summary: string;
 }>;
 
 export type RuntimeTurnEventObserver = Readonly<{
@@ -118,7 +120,9 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
             adapterId: event.adapterId,
             ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
             nativeSessionId: event.nativeSessionId,
-            turnId: event.turnId
+            turnId: event.turnId,
+            ...(event.title === undefined ? {} : { title: event.title }),
+            summary: event.summary
           };
           if (this.observer.classifyGlobalRuntimeTurnCompleted?.(input) !== "obsolete") {
             this.observer.observeGlobalRuntimeTurnCompleted(input, now);

@@ -35,3 +35,18 @@ export function formatTimestamp(value: string, configuredTimeZone?: unknown): st
   if (offset === undefined) throw new TypeError("Timezone offset is unavailable.");
   return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} ${offset}`;
 }
+
+/** Compact elapsed time for recent human-facing activity lists. */
+export function formatRelativeTimestamp(value: string, now = new Date()): string {
+  const instant = new Date(value);
+  if (!Number.isFinite(instant.getTime()) || !Number.isFinite(now.getTime())) {
+    throw new TypeError("Timestamp is invalid.");
+  }
+  const seconds = Math.floor(Math.max(0, now.getTime() - instant.getTime()) / 1_000);
+  if (seconds < 60) return seconds <= 5 ? "now" : `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}

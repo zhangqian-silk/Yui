@@ -1507,6 +1507,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     launchId?: string;
     nativeSessionId: string;
     turnId: string;
+    title?: string;
+    summary?: string;
   }>, now = new Date()): RoleAgentSession {
     return this.store.transaction((store) => {
       const role = store.getGlobalRole(input.roleName);
@@ -1544,6 +1546,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         agentId: input.agentId,
         adapterId: input.adapterId,
         nativeSessionId: input.nativeSessionId,
+        title: existing?.title ?? input.title,
+        preview: existing?.preview ?? (
+          input.summary === undefined ? undefined : sessionPreview(input.summary)
+        ),
         policy: "fixed",
         status: completedStatus
       }, now);
@@ -1587,6 +1593,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       ? "obsolete"
       : "apply";
   }
+}
+
+function sessionPreview(value: string): string {
+  const normalized = value.trim().replaceAll(/\s+/g, " ");
+  const truncated = normalized.slice(0, 1_024);
+  return /[\uD800-\uDBFF]$/.test(truncated)
+    ? truncated.slice(0, -1)
+    : truncated;
 }
 
 function requireRuntimeLaunchReservation(
