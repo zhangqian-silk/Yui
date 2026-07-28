@@ -33,8 +33,27 @@ const NOW = new Date("2026-07-19T12:00:00.000Z");
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), "yui-project-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
   const home = join(root, "home");
+  t.after(() => {
+    const discovery = join(home, "runtime", "controller.json");
+    if (existsSync(discovery)) {
+      const stopped = spawnSync(
+        process.execPath,
+        [join(process.cwd(), "dist", "cli.js"), "controller", "stop"],
+        {
+          encoding: "utf8",
+          env: { ...process.env, YUI_HOME: home },
+          timeout: 10_000
+        }
+      );
+      assert.equal(
+        stopped.status,
+        0,
+        `Fixture Controller cleanup failed: ${stopped.stderr || stopped.error?.message}`
+      );
+    }
+    rmSync(root, { recursive: true, force: true });
+  });
   const workspace = join(root, "workspace");
   const repositoryPath = join(workspace, "Yui");
   execFileSync("git", ["init", "-q", repositoryPath]);

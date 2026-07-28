@@ -23,7 +23,8 @@ import {
 } from "../../dist/core/controllerClient.js";
 import {
   FileTaskWorkflowRuntime,
-  restartFileTaskController
+  restartFileTaskController,
+  stopFileTaskController
 } from "../../dist/controller/clientRuntime.js";
 import { startFileTaskControllerRuntime } from "../../dist/controller/runtime.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
@@ -2418,6 +2419,32 @@ test("controller restart waits for the old process and starts the current runtim
     "controller.status",
     "controller.status",
     "spawn",
+    "controller.status"
+  ]);
+});
+
+test("controller stop waits until the owned process is no longer reachable", async () => {
+  const events = [];
+  let statusCalls = 0;
+  const call = async (_home, method) => {
+    events.push(method);
+    if (method === "controller.stop") return { stopped: true };
+    assert.equal(method, "controller.status");
+    if (statusCalls++ < 2) return { running: true, pid: 10 };
+    throw new ControllerClientError("CONTROLLER_UNAVAILABLE", "Controller is unavailable.");
+  };
+
+  const result = await stopFileTaskController("/tmp/yui-stop-test", {
+    call,
+    pollIntervalMs: 1,
+    shutdownTimeoutMs: 100
+  });
+
+  assert.deepEqual(result, { stopped: true, pid: 10 });
+  assert.deepEqual(events, [
+    "controller.status",
+    "controller.stop",
+    "controller.status",
     "controller.status"
   ]);
 });

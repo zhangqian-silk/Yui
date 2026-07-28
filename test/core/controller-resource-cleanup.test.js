@@ -1,0 +1,237 @@
+import assert from "node:assert/strict";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+import {
+  cleanControllerResource
+} from "../../dist/controller/resourceCleanupLinux.js";
+import {
+  scanControllerResourceInventory
+} from "../../dist/controller/resourceInventoryLinux.js";
+
+function processResource(overrides = {}) {
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  return {
+    id: "controller:/tmp/yui:100:1000",
+    fingerprint: "controller:100:1000",
+    kind: "controller",
+    state: "superseded",
+    disposition: "safe",
+    reasonCode: "superseded-controller",
+    yuiHome: "/tmp/yui",
+    owner: { kind: "controller-domain", yuiHome: "/tmp/yui" },
+    processes: [{
+      pid: 100,
+      ppid: 1,
+      uid,
+      startIdentity: "1000",
+      command: "node",
+      rssBytes: 64,
+      cpuTimeMs: 1,
+      ageMs: 1000
+    }],
+    rssBytes: 64,
+    cpuTimeMs: 1,
+    ageMs: 1000,
+    ...overrides
+  };
+}
+
+test("process cleanup refuses a reused PID before sending any signal", async () => {
+  const signals = [];
+  await assert.rejects(
+    cleanControllerResource(processResource(), {
+      ports: {
+        processStartIdentity: () => "different",
+        signal: (pid, signal) => signals.push([pid, signal]),
+        sleep: async () => {},
+        artifactFingerprint: () => undefined,
+        socketActive: () => false,
+        removeArtifact() {},
+        killPane: async () => {}
+      }
+    }),
+    /changed since scan/
+  );
+  assert.deepEqual(signals, []);
+});
+
+test("process cleanup escalates only a still-matching stubborn process", async () => {
+  const identities = new Map([[100, "1000"]]);
+  const signals = [];
+  await cleanControllerResource(processResource(), {
+    termGraceMs: 1,
+    killGraceMs: 1,
+    pollMs: 1,
+    ports: {
+      processStartIdentity: (pid) => identities.get(pid),
+      signal(pid, signal) {
+        signals.push([pid, signal]);
+        if (signal === "SIGKILL") identities.delete(pid);
+      },
+      sleep: async () => {},
+      artifactFingerprint: () => undefined,
+      socketActive: () => false,
+      removeArtifact() {},
+      killPane: async () => {}
+    }
+  });
+
+  assert.deepEqual(signals, [
+    [100, "SIGTERM"],
+    [100, "SIGKILL"]
+  ]);
+});
+
+test("tmux server cleanup refuses to signal while Role panes remain", async () => {
+  const signals = [];
+  const tmuxServer = processResource({
+    id: "tmux-server:/tmp/yui:100:1000",
+    kind: "tmux-server",
+    state: "orphaned",
+    disposition: "review",
+    reasonCode: "orphan-tmux-server"
+  });
+  await assert.rejects(
+    cleanControllerResource(tmuxServer, {
+      ports: {
+        processStartIdentity: () => "1000",
+        signal: (pid, signal) => signals.push([pid, signal]),
+        sleep: async () => {},
+        artifactFingerprint: () => undefined,
+        socketActive: () => false,
+        removeArtifact() {},
+        killPane: async () => {},
+        inspectTmuxServerPanes: async () => ["task-1/leader", "task-2/worker"]
+      }
+    }),
+    /task-1\/leader, task-2\/worker/
+  );
+  assert.deepEqual(signals, []);
+});
+
+test("artifact cleanup revalidates fingerprint and socket liveness", async () => {
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const path = `/tmp/tmux-${uid}/yui-0123456789abcdef01234567`;
+  const artifact = processResource({
+    id: `artifact:${path}`,
+    fingerprint: "before",
+    kind: "artifact",
+    state: "stale",
+    disposition: "safe",
+    reasonCode: "stale-tmux-socket",
+    owner: { kind: "none" },
+    processes: [],
+    rssBytes: 0,
+    cpuTimeMs: 0,
+    ageMs: 0,
+    artifact: {
+      artifactKind: "tmux-socket",
+      path,
+      active: false,
+      fingerprint: "before"
+    }
+  });
+  let removed = false;
+  const basePorts = {
+    processStartIdentity: () => undefined,
+    signal() {},
+    sleep: async () => {},
+    socketActive: () => false,
+    removeArtifact() {
+      removed = true;
+    },
+    killPane: async () => {}
+  };
+
+  await assert.rejects(
+    cleanControllerResource(artifact, {
+      ports: { ...basePorts, artifactFingerprint: () => "after" }
+    }),
+    /changed since scan/
+  );
+  assert.equal(removed, false);
+
+  await assert.rejects(
+    cleanControllerResource(artifact, {
+      ports: {
+        ...basePorts,
+        artifactFingerprint: () => "before",
+        socketActive: () => true
+      }
+    }),
+    /active/
+  );
+  assert.equal(removed, false);
+
+  await cleanControllerResource(artifact, {
+    ports: { ...basePorts, artifactFingerprint: () => "before" }
+  });
+  assert.equal(removed, true);
+});
+
+test("pane cleanup delegates only after the command layer revalidated the exact resource", async () => {
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const pane = processResource({
+    id: "agent-session:/tmp/yui:task-1:worker",
+    fingerprint: "agent-session:200:2000:task-1:worker",
+    kind: "agent-session",
+    state: "orphaned",
+    disposition: "review",
+    reasonCode: "orphan-pane",
+    target: "yui-task-1:worker",
+    processes: [{
+      pid: 200,
+      ppid: 150,
+      uid,
+      startIdentity: "2000",
+      command: "codex",
+      rssBytes: 64,
+      cpuTimeMs: 1,
+      ageMs: 1000
+    }]
+  });
+  const killed = [];
+  await cleanControllerResource(pane, {
+    ports: {
+      processStartIdentity: () => "2000",
+      signal() {},
+      sleep: async () => {},
+      artifactFingerprint: () => undefined,
+      socketActive: () => false,
+      removeArtifact() {},
+      killPane: async (resource) => killed.push(resource.target)
+    }
+  });
+  assert.deepEqual(killed, ["yui-task-1:worker"]);
+});
+
+test("Linux scanner and cleanup remove an exact inactive Controller socket artifact", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-controller-cleanup-"));
+  const runtime = join(home, "runtime");
+  const socket = join(runtime, "controller.sock");
+  mkdirSync(runtime);
+  writeFileSync(socket, "");
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+
+  const snapshot = await scanControllerResourceInventory({
+    currentHome: home,
+    scope: "current"
+  });
+  const artifact = snapshot.resources.find((resource) => (
+    resource.artifact?.path === socket
+  ));
+  assert.ok(artifact);
+  assert.equal(artifact.disposition, "safe");
+
+  await cleanControllerResource(artifact);
+  assert.equal(existsSync(socket), false);
+});
