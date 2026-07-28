@@ -35,6 +35,7 @@ export type RuntimeTurnCompletedInput = Readonly<{
   nativeSessionId: string;
   turnId: string;
   runId?: string;
+  title?: string;
   summary: string;
 }>;
 
@@ -52,6 +53,7 @@ export type RuntimeTurnCompletedEvent = Readonly<{
   nativeSessionId: string;
   turnId: string;
   runId?: string;
+  title?: string;
   summary: string;
 }>;
 
@@ -288,6 +290,7 @@ function normalizeInput(input: RuntimeTurnCompletedInput): RuntimeTurnCompletedI
     nativeSessionId: requireText(input.nativeSessionId, "Native session id"),
     turnId: requireText(input.turnId, "Turn id"),
     ...(input.runId === undefined ? {} : { runId: requireText(input.runId, "Run id") }),
+    ...(input.title === undefined ? {} : { title: requireText(input.title, "Session title") }),
     summary: truncateUtf8(input.summary.trim(), MAX_RUNTIME_TURN_SUMMARY_BYTES)
   } as const;
   if (common.adapterId !== "codex" || common.summary.length === 0) {
@@ -306,13 +309,15 @@ function parseRuntimeEvent(value: unknown): RuntimeTurnCompletedEvent {
         "schemaVersion", "id", "type", "receivedAt", "scope", "taskId",
         "roleName", "agentId", "adapterId", "nativeSessionId", "turnId", "summary",
         ...(value.launchId === undefined ? [] : ["launchId"]),
-        ...(value.runId === undefined ? [] : ["runId"])
+        ...(value.runId === undefined ? [] : ["runId"]),
+        ...(value.title === undefined ? [] : ["title"])
       ]
     : [
         "schemaVersion", "id", "type", "receivedAt", "scope",
         "roleName", "agentId", "adapterId", "nativeSessionId", "turnId", "summary",
         ...(value.launchId === undefined ? [] : ["launchId"]),
-        ...(value.runId === undefined ? [] : ["runId"])
+        ...(value.runId === undefined ? [] : ["runId"]),
+        ...(value.title === undefined ? [] : ["title"])
       ];
   if (
     (scope !== "task" && scope !== "global")
@@ -334,6 +339,7 @@ function parseRuntimeEvent(value: unknown): RuntimeTurnCompletedEvent {
     nativeSessionId: value.nativeSessionId,
     turnId: value.turnId,
     ...(value.runId === undefined ? {} : { runId: value.runId }),
+    ...(value.title === undefined ? {} : { title: value.title }),
     summary: value.summary
   } as RuntimeTurnCompletedInput);
   return Object.freeze({

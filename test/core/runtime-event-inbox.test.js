@@ -36,7 +36,7 @@ function fixture(t) {
     "thread-id": "thread-native-1",
     "turn-id": "turn-1",
     cwd: home,
-    "input-messages": [],
+    "input-messages": ["Plan a lean session picker"],
     "last-assistant-message": message
   });
   return { home, environment, payload };
@@ -62,6 +62,7 @@ test("Codex notify writes an immutable event without waiting for FileTaskStore l
   assert.equal(events[0].scope, "task");
   assert.equal(events[0].taskId, "task-1");
   assert.equal(events[0].launchId, "launch-current");
+  assert.equal(events[0].title, "Plan a lean session picker");
   assert.equal(events[0].summary, "done");
   assert.deepEqual(calls.map(([, method, params]) => [method, params]), [[
     "scheduler.signal",

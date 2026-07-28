@@ -638,9 +638,26 @@ export const ROOT_COMMAND = buildNode({
     {
       name: "operator",
       summary: "Use the persistent Operator Actor.",
-      sections: [{ id: "workflow", title: "Commands", entries: ["enter", "submit"] }],
+      sections: [{
+        id: "workflow",
+        title: "Commands",
+        entries: ["enter", "new", "list", "resume", "submit"]
+      }],
       children: [
         { name: "enter", summary: "Enter the Operator's native session." },
+        {
+          name: "new",
+          summary: "Start a new Operator session.",
+          usage: "yui operator new [--agent <id>]",
+          options: ["--agent"]
+        },
+        { name: "list", summary: "List Operator session history." },
+        {
+          name: "resume",
+          summary: "Resume a previous Operator session.",
+          usage: "yui operator resume [<ref> | --last]",
+          options: ["--last"]
+        },
         {
           name: "submit",
           summary: "Submit work through the Operator.",

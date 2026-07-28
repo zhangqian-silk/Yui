@@ -477,6 +477,18 @@ function prepareSystemRole(
   if (existing !== null) {
     const definition = configuredAgentToDefinition(agent);
     const binding = createRoleAgentBinding(definition, config);
+    if (name === "operator" && !Object.hasOwn(existing.agentBindings, agent.id)) {
+      const sameAdapter = Object.values(existing.agentBindings).find(
+        (candidate) => candidate.adapterId === agent.adapterId
+      );
+      if (sameAdapter !== undefined) {
+        throw usageError(
+          `${name} already has a ${agent.adapterId} Agent: ${sameAdapter.agentId}. `
+          + "Update that Agent's configuration, or activate another adapter and "
+          + "unbind it before selecting this Agent."
+        );
+      }
+    }
     if (
       existing.activeAgentId === agent.id
       && existing.workspace === workspace

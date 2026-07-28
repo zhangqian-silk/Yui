@@ -17,7 +17,11 @@ import {
   renderAgentConfigurationResolutionNotice
 } from "./cli/agentConfigurationPicker.js";
 import { resolveProfileWizardArguments } from "./cli/profileWizard.js";
-import { resolveRoleWizardArguments } from "./cli/roleWizard.js";
+import {
+  resolveGlobalRoleAgentConfigurationArguments,
+  resolveRoleWizardArguments
+} from "./cli/roleWizard.js";
+import { resolveOperatorWizardArguments } from "./cli/operatorWizard.js";
 import type { SelectionPorts } from "./cli/selectionPorts.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
 import { formatTimestamp } from "./output/timePresentation.js";
@@ -40,7 +44,11 @@ import {
   runInteractiveControllerCleanup
 } from "./commands/controllerCommands.js";
 import { runJobCommand } from "./commands/jobCommands.js";
-import { runOperatorCommand } from "./commands/operatorCommands.js";
+import {
+  applyOperatorSessionControl,
+  runOperatorCommand,
+  type OperatorSessionControl
+} from "./commands/operatorCommands.js";
 import { runProjectCommand } from "./commands/projectCommands.js";
 import { runProfileCommand } from "./commands/profileCommands.js";
 import {
@@ -51,7 +59,6 @@ import { runTaskAttemptCommand } from "./commands/taskAttemptCommands.js";
 import { runTaskIntegrationCommand } from "./commands/taskIntegrationCommands.js";
 import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
 import {
-  callFileTaskController,
   ensureFileTaskController,
   FileTaskWorkflowRuntime,
   refreshRunningFileTaskControllerConfiguration,
@@ -80,6 +87,10 @@ import {
 } from "./executor/agentConfigurationCatalog.js";
 import type { RoleAgentConfig } from "./executor/agentAdapter.js";
 import { TmuxWebTerminalService } from "./web/tmuxWebTerminal.js";
+import {
+  listOperatorSessions,
+  operatorSessionRef
+} from "./operator/operatorSessionHistory.js";
 
 const VERSION = readPackageVersion();
 const rawArgs = process.argv.slice(2);
@@ -443,8 +454,21 @@ export async function main(): Promise<void> {
       return;
     }
     const result = runOperatorCommand(resolved.slice(1), store, { runtime, environment: process.env });
-    if (result.kind !== "output") throw new Error("Operator submit returned an invalid control result.");
-    emit(result.output);
+    if (result.kind === "output") {
+      emit(result.output, false, result.data);
+      return;
+    }
+    if (result.kind !== "session") {
+      throw new Error("Operator command returned an invalid control result.");
+    }
+    await executeOperatorSessionControl(
+      result,
+      home,
+      store,
+      runtime,
+      tmux,
+      catalogs
+    );
     return;
   }
   if (resolved[0] === "task") {
@@ -587,6 +611,111 @@ export async function main(): Promise<void> {
   );
 }
 
+async function executeOperatorSessionControl(
+  control: OperatorSessionControl,
+  home: string,
+  store: FileTaskStore,
+  runtime: FileTaskWorkflowRuntime,
+  tmux: TmuxManager,
+  catalogs: AgentConfigurationCatalogService
+): Promise<void> {
+  if (jsonOutput) throw usageError("Operator new and resume do not support --json.");
+  if (process.stdin.isTTY !== true || process.stdout.isTTY !== true) {
+    throw usageError("Operator new and resume require an interactive terminal.");
+  }
+  const role = store.getGlobalRole("operator");
+  if (role === null) throw usageError("Operator is not configured. Run yui setup first.");
+  const sessionSet = store.getGlobalRoleSessionSet(role.name);
+  const active = sessionSet?.sessions[role.activeAgentId];
+  const paneRunning = tmux.detectRoleStatus("operator", "operator") === "running";
+  if (
+    control.action === "resume"
+    && paneRunning
+    && control.targetAgentId === role.activeAgentId
+    && active !== undefined
+    && operatorSessionRef(active) === control.ref
+  ) {
+    tmux.attachRole("operator", "operator");
+    return;
+  }
+
+  const handle = terminalIo();
+  try {
+    if (control.targetAgentId !== role.activeAgentId) {
+      const binding = role.agentBindings[control.targetAgentId];
+      if (binding === undefined) {
+        throw usageError(`Operator Agent is not bound: ${control.targetAgentId}.`);
+      }
+      handle.io.write([
+        `Switching to ${adapterLabel(binding.adapterId)} (${binding.agentId})`,
+        "",
+        "Saved configuration",
+        `  Model   ${binding.config.model ?? "CLI default"}`,
+        `  Effort  ${binding.config.effort ?? "CLI default"}`,
+        ""
+      ].join("\n"));
+      const update = (await handle.io.question(
+        "Update this configuration? [y/N]: "
+      ))?.trim().toLowerCase();
+      if (update === "y" || update === "yes") {
+        const resolution = await resolveGlobalRoleAgentConfigurationArguments(
+          role.name,
+          binding.agentId,
+          selectionPorts(store, catalogs),
+          handle.io
+        );
+        if (resolution.kind !== "resolved") {
+          process.stdout.write("Cancelled.\n");
+          return;
+        }
+        const updated = runGlobalRoleCommand(
+          resolution.args.slice(1),
+          store as unknown as Parameters<typeof runGlobalRoleCommand>[1],
+          { yuiHome: home, env: process.env }
+        );
+        if (typeof updated !== "string") {
+          throw new Error("Operator Agent configuration returned an invalid control result.");
+        }
+        handle.io.write(`\nUpdated ${adapterLabel(binding.adapterId)} configuration.\n`);
+      }
+    }
+    if (paneRunning) {
+      const answer = (await handle.io.question(
+        "Operator is running. Switch session? [y/N]: "
+      ))?.trim().toLowerCase();
+      if (answer !== "y" && answer !== "yes") {
+        process.stdout.write("Cancelled.\n");
+        return;
+      }
+    }
+  } finally {
+    handle.close();
+  }
+
+  await ensureFileTaskController(home, { environment: process.env });
+  if (
+    paneRunning
+    || (
+      active !== undefined
+      && active.status !== "stopped"
+      && active.status !== "broken"
+    )
+  ) {
+    await runtime.stopGlobalRoleSession(role.name);
+  }
+  applyOperatorSessionControl(control, store);
+  await runtime.prepareGlobalRoleEnter(role.name);
+  tmux.attachRole("operator", role.name);
+}
+
+function adapterLabel(adapterId: string): string {
+  return adapterId === "codex"
+    ? "Codex"
+    : adapterId === "claude"
+      ? "Claude"
+      : adapterId;
+}
+
 function renderControllerResult(method: "stop" | "restart", value: unknown): string {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return JSON.stringify(value);
@@ -669,19 +798,27 @@ async function resolveTerminalArguments(
   const handle = terminalIo();
   try {
     const ports = selectionPorts(store, catalogs);
+    const operatorWizard = await resolveOperatorWizardArguments(
+      commandArgs,
+      store.getGlobalRole("operator"),
+      listOperatorSessions(store.getGlobalRoleSessionSet("operator")),
+      handle.io
+    );
+    if (operatorWizard.kind === "cancelled") return null;
+    const operatorArgs = operatorWizard.args;
     // Global Role add owns its Agent choice so the configured default can be
     // shown explicitly. Other commands first resolve missing positional
     // targets through the generic selector, then enter the focused Role UI.
     if (
-      (commandArgs[0] === "role" && commandArgs[1] === "add")
-      || (commandArgs[0] === "task" && commandArgs[1] === "role" && commandArgs[2] === "add")
+      (operatorArgs[0] === "role" && operatorArgs[1] === "add")
+      || (operatorArgs[0] === "task" && operatorArgs[1] === "role" && operatorArgs[2] === "add")
     ) {
-      const wizard = await resolveRoleWizardArguments(commandArgs, ports, handle.io);
+      const wizard = await resolveRoleWizardArguments(operatorArgs, ports, handle.io);
       if (wizard.kind === "cancelled") return null;
       const selected = await resolveInteractiveArguments(wizard.args, node, ports, handle.io);
       return selected.kind === "cancelled" ? null : selected.args;
     }
-    const selected = await resolveInteractiveArguments(commandArgs, node, ports, handle.io);
+    const selected = await resolveInteractiveArguments(operatorArgs, node, ports, handle.io);
     if (selected.kind === "cancelled") return null;
     const profileWizard = await resolveProfileWizardArguments(selected.args, ports, handle.io);
     if (profileWizard.kind === "cancelled") return null;

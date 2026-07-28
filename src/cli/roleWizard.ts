@@ -65,6 +65,22 @@ export async function resolveRoleWizardArguments(
   return { kind: "unchanged", args };
 }
 
+export async function resolveGlobalRoleAgentConfigurationArguments(
+  roleName: string,
+  agentId: string,
+  ports: SelectionPorts,
+  io: SelectionIo
+): Promise<RoleWizardResolution> {
+  const args = ["role", "update", roleName];
+  if (!io.interactive || io.json) return { kind: "unchanged", args };
+  const role = asRole(await ports.call("role.show", { name: roleName }));
+  const binding = role?.agentBindings[agentId];
+  if (role === undefined || binding === undefined) {
+    return { kind: "cancelled", args };
+  }
+  return updateAgentBindingSettings(args, role, binding, ports, io);
+}
+
 function isGlobalRoleAdd(args: readonly string[]): boolean {
   return args[0] === "role" && args[1] === "add";
 }
@@ -496,7 +512,16 @@ async function updateAgentSettings(
   if (selectedId === undefined) return { kind: "cancelled", args };
   const binding = role.agentBindings[selectedId];
   if (binding === undefined) return { kind: "cancelled", args };
+  return updateAgentBindingSettings(args, role, binding, ports, io);
+}
 
+async function updateAgentBindingSettings(
+  args: string[],
+  role: RoleView,
+  binding: RoleBinding,
+  ports: SelectionPorts,
+  io: SelectionIo
+): Promise<RoleWizardResolution> {
   const resolved = await loadAgentCatalog(ports, binding, role.workspace);
   const fields = agentFields(binding, resolved?.catalog);
   const field = await choose(

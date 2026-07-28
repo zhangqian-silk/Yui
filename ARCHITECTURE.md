@@ -81,6 +81,14 @@ The development format is layout 6 / aggregate 6 and is fresh-only. Older or new
 
 Every state write uses a process lock and atomic replacement. The store validates record identities, Profile revision references, dependency cycles, cross-record references, immutable records, and legal transitions.
 
+Operator conversation history is stored as lightweight pointers in its global
+Role session set. Each entry records the owning Agent/adapter plus a readable
+title or preview and an opaque Yui reference; the provider remains the authority
+for the transcript and native session ID. When an adapter has not supplied a
+title or preview, the human-facing identity combines its provider with a short
+stable Yui reference. Only one Operator native process and tmux pane are current
+at a time.
+
 The existing tmux mailbox runtime remains the Operator/Leader control loop and the persistent Task Role execution path. AgentRuns belong to that native-session path; ExecutionAttempts are the default for bounded child-thread delegation. Leaders release their active run with:
 
 ```sh

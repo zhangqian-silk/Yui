@@ -412,6 +412,31 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     }
   }
 
+  async stopGlobalRoleSession(roleName: string): Promise<void> {
+    if (this.store.getGlobalRole(roleName) === null) {
+      throw new Error(`Global Role not found: ${roleName}.`);
+    }
+    const target = this.schedulerStore.enqueueRuntimeCleanup({
+      scope: "global",
+      roleName
+    });
+    if (target?.kind !== "global-role-runtime") {
+      throw new Error(`Global Role runtime cleanup target is invalid: ${roleName}.`);
+    }
+    await callFileTaskController(this.home, "scheduler.scan", {}, {
+      ...this.clientOptions,
+      requestTimeoutMs: LIFECYCLE_REQUEST_TIMEOUT_MS
+    });
+    if (hasRuntimeLifecycleWork(this.store.getWorkMailbox(target))) {
+      throw new Error(`Global Role runtime did not stop: ${roleName}.`);
+    }
+    const sessions = this.store.getGlobalRoleSessionSet(roleName);
+    const active = sessions?.sessions[sessions.activeAgentId];
+    if (active !== undefined && active.status !== "stopped") {
+      throw new Error(`Global Role runtime session is still active: ${roleName}.`);
+    }
+  }
+
   inspectTaskRolePanes(taskId: string) {
     return this.tmux.inspectTaskRolePanes(taskId);
   }

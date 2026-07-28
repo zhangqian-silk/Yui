@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { resolveRoleWizardArguments } from "../../dist/cli/roleWizard.js";
+import {
+  resolveGlobalRoleAgentConfigurationArguments,
+  resolveRoleWizardArguments
+} from "../../dist/cli/roleWizard.js";
 
 const codex = {
   schemaVersion: 2,
@@ -175,6 +178,26 @@ test("Role update uses a compact two-item top level and clears model plus effort
   assert.match(terminal.writes[0], /Role settings/);
   assert.match(terminal.writes[0], /Agent settings/);
   assert.doesNotMatch(terminal.writes[0], /Role profile|Clear overrides/);
+});
+
+test("Operator switching reuses the focused Role Agent configuration picker", async () => {
+  const terminal = io(["model", "default", "default"]);
+  const result = await resolveGlobalRoleAgentConfigurationArguments(
+    "reviewer",
+    "codex",
+    ports(),
+    terminal
+  );
+
+  assert.deepEqual(result, {
+    kind: "resolved",
+    args: [
+      "role", "update", "reviewer", "--agent", "codex",
+      "--clear-model", "--clear-effort"
+    ]
+  });
+  assert.match(terminal.writes[0], /Agent settings: codex/);
+  assert.doesNotMatch(terminal.writes[0], /Select Role Agent binding/);
 });
 
 test("Task Role Active Agent selection becomes task role bind and does not offer workspace", async () => {

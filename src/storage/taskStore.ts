@@ -1488,7 +1488,14 @@ function assertSessionsMatchRole(
   if (!("taskId" in role) && sessions.owner.scope !== "global") {
     throw new StorageRecordError(`Global Role session owner is inconsistent: ${role.name}`);
   }
-  for (const [agentId, session] of Object.entries(sessions.sessions)) {
+  const ownedSessions = [
+    ...Object.entries(sessions.sessions),
+    ...(sessions.owner.scope === "global"
+      ? Object.entries((sessions as GlobalRoleSessionSet).history ?? {})
+      : [])
+  ];
+  for (const [, session] of ownedSessions) {
+    const agentId = session.agentId;
     const binding = role.agentBindings[agentId];
     if (binding === undefined || binding.adapterId !== session.adapterId) {
       throw new StorageRecordError(`Role Agent session has no matching binding: ${role.name}/${agentId}`);

@@ -1474,6 +1474,45 @@ test("workspace transitions stop the existing Role runtime before changing cwd",
   ]);
 });
 
+test("Operator session transitions stop the one global runtime before changing history", async () => {
+  const events = [];
+  let session = { status: "ready" };
+  const runtime = new FileTaskWorkflowRuntime(
+    "/tmp/yui-operator-session-transition",
+    {
+      getGlobalRole: () => ({ name: "operator" }),
+      getGlobalRoleSessionSet: () => ({
+        activeAgentId: "codex",
+        sessions: { codex: session }
+      }),
+      getWorkMailbox: () => null
+    },
+    {
+      enqueueRuntimeCleanup(owner) {
+        events.push(["enqueue", owner]);
+        return { kind: "global-role-runtime", roleName: owner.roleName };
+      }
+    },
+    {},
+    {},
+    undefined,
+    {
+      call: async (_home, method, params) => {
+        events.push([method, params]);
+        session = { status: "stopped" };
+        return {};
+      }
+    }
+  );
+
+  await runtime.stopGlobalRoleSession("operator");
+
+  assert.deepEqual(events, [
+    ["enqueue", { scope: "global", roleName: "operator" }],
+    ["scheduler.scan", {}]
+  ]);
+});
+
 test("explicit reconciliation prepares active Role worktrees before requesting a full scan", async () => {
   for (const [status, expected] of [
     ["active", ["prepare", "scheduler.scan"]],

@@ -94,10 +94,20 @@ yui config set --time-zone Europe/London
 ```sh
 yui operator submit "比较 CSV 与 JSON 的兼容性" --task <task-id>
 yui operator submit "研究更小的缓存设计"
+yui operator list
+yui operator resume
+yui operator resume --last
+yui operator new
 yui operator enter
 ```
 
 不带 `--task` 时会创建新 Draft。Draft 可以继续规划，但激活前不会执行 Agent 工作。
+`operator list` 按固定的最近更新时间倒序展示历史对话，并显示 Agent
+及可读的标题或摘要；底层 provider session ID 始终保持内部实现细节。
+若 adapter 尚未提供这些元数据，Yui 会显示 provider 和稳定的 Yui
+短引用，确保无标题会话仍可区分。`operator resume` 使用同一个轻量编号列表，
+`--last` 可直接恢复最近一条；
+`operator new` 创建空白对话，并把原对话保留在历史中。
 
 添加 Worker 并派发 WorkItem：
 
@@ -214,7 +224,14 @@ yui task enter <task-id> [role]
 yui task role enter <task-id> <role>
 ```
 
-每个 Role 可绑定多个 Agent，有一个 active Agent，并为每个 Agent binding 独立保存 native session。切换 Agent 会保留休眠 session；Role 有活动 Run 或 native process 时禁止切换。
+每个 Role 可绑定多个 Agent，但任一时刻只有一个 active Agent，并为每个
+Agent binding 独立保存 native session。Operator 进一步限制为同一种
+adapter 最多绑定一个，例如可同时绑定一个 Codex 和一个 Claude；这些
+binding 是预先保存、可随时切换的配置，而不是并行身份。Operator 可为
+每个 binding 保留多条历史对话。`operator new` 与 `operator resume`
+复用唯一的 Operator tmux pane；存在运行中进程时，Yui 会先确认再停止
+并切换。跨 Agent 切换默认复用已保存的 model/effort，只有用户明确选择
+更新时才进入现有配置选择流程。
 
 使用 `yui role unbind <global-role> <agent-id>` 或 `yui task role unbind <task-id> <role> <agent-id>` 可移除休眠 binding。active binding 或任何未 stopped 的 native session 都会被拒绝；stopped session 记录会和 binding 在同一事务中删除。
 

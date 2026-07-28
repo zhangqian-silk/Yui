@@ -287,12 +287,26 @@ export function unbindRoleAgent(
         + `${normalizedAgentId}.`
       );
     }
-    if (targetSession !== undefined) {
+    const globalSessions = sessions.owner.scope === "global"
+      ? sessions as GlobalRoleSessionSet
+      : null;
+    const targetHistory = globalSessions === null
+      ? []
+      : Object.entries(globalSessions.history ?? {}).filter(([, session]) => (
+          session.agentId === normalizedAgentId
+        ));
+    if (targetSession !== undefined || targetHistory.length > 0) {
       const remainingSessions = { ...sessions.sessions };
       delete remainingSessions[normalizedAgentId];
+      const remainingHistory = globalSessions === null
+        ? undefined
+        : Object.fromEntries(Object.entries(globalSessions.history ?? {}).filter(([, session]) => (
+            session.agentId !== normalizedAgentId
+          )));
       updatedSessions = validateRoleSessionSet({
         ...sessions,
         sessions: remainingSessions,
+        ...(remainingHistory === undefined ? {} : { history: remainingHistory }),
         updatedAt: now.toISOString()
       } as RoleSessionSet);
     }
@@ -352,10 +366,21 @@ function validateRoleOwner<T extends GlobalRole>(role: T): T {
   requireText(role.workspace, "Role workspace");
   const entries = Object.entries(role.agentBindings);
   if (entries.length === 0) throw new Error("Role requires at least one Agent binding.");
+  const operatorAdapters = new Map<string, string>();
   for (const [agentId, binding] of entries) {
     validateRoleAgentBinding(binding);
     if (agentId !== binding.agentId) {
       throw new Error(`Role Agent binding identity is inconsistent: ${agentId}.`);
+    }
+    if (!("taskId" in role) && role.name === "operator") {
+      const existingAgentId = operatorAdapters.get(binding.adapterId);
+      if (existingAgentId !== undefined) {
+        throw new Error(
+          "Operator supports one Agent per adapter; "
+          + `${binding.adapterId} is bound to both ${existingAgentId} and ${agentId}.`
+        );
+      }
+      operatorAdapters.set(binding.adapterId, agentId);
     }
   }
   if (!Object.hasOwn(role.agentBindings, role.activeAgentId)) {

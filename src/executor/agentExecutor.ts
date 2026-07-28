@@ -27,6 +27,8 @@ export type RoleAgentSession = {
   agentId: string;
   adapterId: string;
   nativeSessionId: string;
+  title?: string;
+  preview?: string;
   policy: "fixed" | "leader-controlled";
   status: AgentSessionStatus;
   recentCompletedTurnIds: readonly string[];
@@ -50,7 +52,10 @@ export type TaskRoleInFlight = Readonly<{
   deliveredAt?: string;
 }>;
 
-export type GlobalRoleSessionSet = RoleSessionSetBase<GlobalRoleSessionOwner>;
+export type GlobalRoleSessionSet = RoleSessionSetBase<GlobalRoleSessionOwner> & {
+  /** Dormant Operator conversations keyed by an opaque Yui reference. */
+  history?: Record<string, RoleAgentSession>;
+};
 export type TaskRoleSessionSet = RoleSessionSetBase<TaskRoleSessionOwner> & {
   inFlight: TaskRoleInFlight | null;
   pendingTurnCompletion: PendingTurnCompletion | null;
@@ -67,6 +72,8 @@ export type RecordRoleAgentSessionInput = {
   agentId: string;
   adapterId: string;
   nativeSessionId: string;
+  title?: string;
+  preview?: string;
   policy: RoleAgentSession["policy"];
   status: AgentSessionStatus;
 };
@@ -139,6 +146,8 @@ export function recordRoleAgentSession<TSet extends RoleSessionSet>(
     agentId,
     adapterId,
     nativeSessionId,
+    ...optionalSessionText("title", input.title ?? existing?.title),
+    ...optionalSessionText("preview", input.preview ?? existing?.preview),
     policy: input.policy,
     status: input.status,
     recentCompletedTurnIds: existing?.recentCompletedTurnIds ?? [],
@@ -153,6 +162,19 @@ export function recordRoleAgentSession<TSet extends RoleSessionSet>(
   } as TSet;
   validateRoleSessionSet(updated);
   return updated;
+}
+
+/**
+ * Session titles and previews can originate in native Agent output. Keep them
+ * single-line and inert before they are persisted or rendered in a terminal.
+ */
+export function normalizeRoleAgentSessionText(value: string): string {
+  return value
+    .replaceAll(/\u001B\][^\u0007]*(?:\u0007|\u001B\\|\u009C)/gu, " ")
+    .replaceAll(/\u001B\[[0-?]*[ -/]*[@-~]/gu, " ")
+    .replaceAll(/[\u0000-\u001F\u007F-\u009F]/gu, " ")
+    .trim()
+    .replaceAll(/\s+/gu, " ");
 }
 
 export function createRoleAgentSession(
@@ -461,6 +483,16 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
         "Global Role session set must not contain inFlight or pendingTurnCompletion."
       );
     }
+    const history = (set as GlobalRoleSessionSet).history;
+    if (history !== undefined) {
+      for (const [ref, session] of Object.entries(history)) {
+        requireSafeIdentity(ref, "Operator session ref");
+        validateRoleAgentSession(session);
+        if (session.status !== "stopped" && session.status !== "broken") {
+          throw new Error(`Operator history session must be stopped: ${ref}.`);
+        }
+      }
+    }
   } else {
     if (!Object.hasOwn(set, "inFlight") || !Object.hasOwn(set, "pendingTurnCompletion")) {
       throw new Error("Task Role session set must contain its Turn fence.");
@@ -513,6 +545,18 @@ export function validateRoleAgentSession(
   }
   requireText(session.adapterId, "Agent adapter id");
   requireText(session.nativeSessionId, "Native session id");
+  if (
+    session.title !== undefined
+    && optionalSessionText("title", session.title).title !== session.title
+  ) {
+    throw new Error("Role Agent session title is invalid.");
+  }
+  if (
+    session.preview !== undefined
+    && optionalSessionText("preview", session.preview).preview !== session.preview
+  ) {
+    throw new Error("Role Agent session preview is invalid.");
+  }
   if (session.policy !== "fixed" && session.policy !== "leader-controlled") {
     throw new Error(`Role Agent session policy is invalid: ${agentId}.`);
   }
@@ -523,6 +567,21 @@ export function validateRoleAgentSession(
   requireText(session.createdAt, "Role Agent session creation timestamp");
   requireText(session.updatedAt, "Role Agent session update timestamp");
   return session;
+}
+
+function optionalSessionText(
+  field: "title" | "preview",
+  value: string | undefined
+): Partial<Pick<RoleAgentSession, "title" | "preview">> {
+  if (value === undefined) return {};
+  if (typeof value !== "string" || value.includes("\0")) {
+    throw new Error(`Role Agent session ${field} is invalid.`);
+  }
+  const normalized = normalizeRoleAgentSessionText(value);
+  if (normalized.length === 0 || normalized.length > 1_024) {
+    throw new Error(`Role Agent session ${field} is invalid.`);
+  }
+  return { [field]: normalized };
 }
 
 function assertTaskRoleSessionSet(

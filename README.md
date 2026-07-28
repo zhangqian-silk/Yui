@@ -96,10 +96,21 @@ Submit information through Operator:
 ```sh
 yui operator submit "Compare CSV and JSON compatibility" --task <task-id>
 yui operator submit "Investigate a smaller cache design"
+yui operator list
+yui operator resume
+yui operator resume --last
+yui operator new
 yui operator enter
 ```
 
 Without `--task`, `operator submit` creates a new Draft. Drafts accept planning changes but must be activated before Agent execution.
+`operator list` shows recent conversations in fixed most-recently-updated order using
+their Agent and readable title or preview; native provider session IDs remain
+internal. Until an adapter supplies that metadata, Yui shows the provider plus
+a stable short Yui reference so untitled conversations remain distinguishable.
+`operator resume` opens the same lightweight numbered list, while
+`--last` resumes the newest entry directly. `operator new` starts a clean
+conversation and preserves the previous one in history.
 
 Add a Worker and dispatch a WorkItem:
 
@@ -230,7 +241,15 @@ yui task enter <task-id> [role]
 yui task role enter <task-id> <role>
 ```
 
-Each Role can bind multiple configured Agents, has one active Agent, and keeps a separate native session per Agent binding. Switching Agents preserves dormant sessions; switching is blocked while that Role has an active Run or native process.
+Each Role can bind multiple configured Agents, has one active Agent, and keeps
+a separate native session per Agent binding. Operator narrows this to at most
+one Agent per adapter—for example, one Codex and one Claude—so its bindings are
+ready-to-switch configurations rather than parallel identities. Operator can
+keep multiple conversations for each binding. `operator new` and
+`operator resume` reuse the single Operator tmux pane: when a process is
+running, Yui asks before stopping it and switching the conversation. On a
+cross-Agent switch, the saved model and effort are reused unless the user
+explicitly chooses to update them.
 
 Use `yui role unbind <global-role> <agent-id>` or `yui task role unbind <task-id> <role> <agent-id>` to retire a dormant binding. The active binding and any non-stopped native session are rejected; a stopped session record is removed atomically with the binding.
 
