@@ -103,6 +103,10 @@ test("AttemptCoordinator persists the Profile revision and frozen input before a
   assert.match(result.attempt.input, /Return source-backed scheduler boundaries/);
   assert.equal(calls[0].executor, "session");
   assert.equal(calls[0].profile.revision, 1);
+  assert.equal(
+    calls[0].title,
+    "Yui · task-1 · Read architecture · Inspect the scheduler · worker"
+  );
 });
 
 test("auto only forks a ready or running Codex Leader thread", async () => {

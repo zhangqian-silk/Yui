@@ -17,6 +17,7 @@ import type { RuntimeRoleOwner } from "../runtime/lifecycleReservation.js";
 
 export type SchedulerTask = Readonly<{
   id: string;
+  title: string;
   status: "draft" | "active" | "completed" | "archived";
   projectId?: string;
   cwd?: string;

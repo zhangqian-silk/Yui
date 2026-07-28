@@ -20,6 +20,10 @@ import {
   runSessionNotifyCommand
 } from "../../dist/controller/sessionNotify.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
+import {
+  MAX_SESSION_TITLE_LENGTH,
+  taskRoleSessionTitle
+} from "../../dist/runtime/sessionTitle.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import {
   createGlobalRole,
@@ -75,6 +79,16 @@ function recordParsedTurnCompletion(schedulerStore, payload, environment) {
     summary: input.lastAssistantMessage
   });
 }
+
+test("managed session titles stay compact without losing the role", () => {
+  const title = taskRoleSessionTitle(
+    { id: "task-123", title: "A".repeat(300) },
+    "leader"
+  );
+  assert.equal(title.length, MAX_SESSION_TITLE_LENGTH);
+  assert.match(title, /^Yui · task-123 · /);
+  assert.match(title, /… · Leader$/);
+});
 
 test("Controller lifecycle dispatcher is the sole session creator for enter", async (t) => {
   const { store, task, role, globalRole } = fixture(t);
@@ -156,8 +170,15 @@ test("one planner adds Codex structured notify for Task and global launches", (t
   assert.equal(taskPlan.launch.args.some((argument) => argument === "Yui setup:"), false);
   assert.equal(taskPlan.launch.env.YUI_SESSION_SCOPE, "task");
   assert.equal(taskPlan.launch.env.YUI_TASK_ID, task.id);
+  assert.equal(
+    taskPlan.launch.env.YUI_SESSION_TITLE,
+    "Yui · task-1 · Managed launch · Leader"
+  );
   assert.equal(globalPlan.launch.env.YUI_SESSION_SCOPE, "global");
   assert.equal(globalPlan.launch.env.YUI_TASK_ID, undefined);
+  assert.equal(globalPlan.launch.env.YUI_SESSION_TITLE, undefined);
+  assert.equal(globalPlan.launch.env.YUI_AGENT_COMMAND, undefined);
+  assert.equal(globalPlan.launch.env.YUI_AGENT_BASE_ARGS, undefined);
 });
 
 test("managed Codex launch refuses to replace an existing native notify callback", (t) => {
@@ -197,6 +218,10 @@ test("Claude new launch is preallocated once and persisted without a prompt", (t
   });
 
   assert.deepEqual(plan.launch.args.slice(-2), ["--session-id", "claude-native-1"]);
+  assert.deepEqual(
+    plan.launch.args.slice(plan.launch.args.indexOf("--name"), plan.launch.args.indexOf("--name") + 2),
+    ["--name", "Yui · task-1 · Managed launch · Leader"]
+  );
   assert.equal(plan.session.nativeSessionId, "claude-native-1");
   assert.equal(plan.launch.args.some((argument) => argument.includes("Yui setup:")), false);
   const systemPromptIndex = plan.launch.args.indexOf("--append-system-prompt-file");
@@ -205,6 +230,42 @@ test("Claude new launch is preallocated once and persisted without a prompt", (t
   assert.match(contextFile, /runtime\/session-contexts\/[a-f0-9]+\.md$/);
   assert.match(readFileSync(contextFile, "utf8"), /injected yui-leader/);
   assert.equal(statSync(contextFile).mode & 0o777, 0o600);
+});
+
+test("Claude resume preserves a user-renamed native session", (t) => {
+  const { home, store, task, role, agent } = fixture(t, "claude");
+  const planner = new FileRoleLaunchPlanner(home, store);
+  const plan = planner.plan({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    mode: "resume",
+    nativeSessionId: "claude-existing"
+  });
+
+  assert.equal(plan.launch.args.includes("--name"), false);
+  assert.deepEqual(plan.launch.args.slice(-2), ["--resume", "claude-existing"]);
+});
+
+test("Claude global Operator keeps its native conversation title", (t) => {
+  const { home, store, globalRole, agent } = fixture(t, "claude");
+  const planner = new FileRoleLaunchPlanner(home, store, {
+    createNativeSessionId: () => "claude-operator-native-1"
+  });
+  const plan = planner.planGlobalRole({
+    roleName: globalRole.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    mode: "new"
+  });
+
+  assert.equal(plan.launch.args.includes("--name"), false);
+  assert.equal(plan.launch.env.YUI_SESSION_TITLE, undefined);
+  assert.deepEqual(
+    plan.launch.args.slice(-2),
+    ["--session-id", "claude-operator-native-1"]
+  );
 });
 
 test("Claude launch identity is deterministic for one durable launch across retries", (t) => {
@@ -229,7 +290,15 @@ test("Claude launch identity is deterministic for one durable launch across retr
 });
 
 test("Codex notify payload is strictly converted to one durable runtime event", async (t) => {
-  const { home, store, task, role, agent } = fixture(t);
+  const { home, store, task, role, agent, now } = fixture(t);
+  store.saveAgentRun(createAgentRun(
+    "agent-run-native-1",
+    task.id,
+    role.name,
+    "new",
+    "Do the work",
+    now
+  ));
   const environment = {
     YUI_HOME: home,
     YUI_SESSION_SCOPE: "task",
@@ -237,14 +306,19 @@ test("Codex notify payload is strictly converted to one durable runtime event", 
     YUI_ROLE: role.name,
     YUI_AGENT_ID: agent.id,
     YUI_ADAPTER_ID: "codex",
-    YUI_LAUNCH_ID: "launch-notify-strict"
+    YUI_LAUNCH_ID: "launch-notify-strict",
+    YUI_SESSION_TITLE: "Yui · task-1 · Managed launch · Leader",
+    YUI_AGENT_COMMAND: "codex-test",
+    YUI_AGENT_BASE_ARGS: "[\"--profile\",\"test\"]"
   };
   const payload = JSON.stringify({
     type: "agent-turn-complete",
     "thread-id": "thread-native-1",
     "turn-id": "turn-1",
     cwd: home,
-    "input-messages": ["Yui-Run-Id: agent-run-native-1\n\nDo the work"],
+    "input-messages": [
+      "Yui · task-1 · Managed launch · Leader · Run agent-run-native-1\n\nDo the work"
+    ],
     "last-assistant-message": "done"
   });
   assert.equal(
@@ -252,12 +326,25 @@ test("Codex notify payload is strictly converted to one durable runtime event", 
     "thread-native-1"
   );
 
-  await runSessionNotifyCommand(payload, environment, async (calledHome, method, params) => {
-    assert.equal(calledHome, home);
-    assert.equal(method, "scheduler.signal");
-    assert.deepEqual(params, { key: `role:${task.id}/${role.name}` });
-    return {};
-  });
+  const names = [];
+  await runSessionNotifyCommand(
+    payload,
+    environment,
+    async (calledHome, method, params) => {
+      assert.equal(calledHome, home);
+      assert.equal(method, "scheduler.signal");
+      assert.deepEqual(params, { key: `role:${task.id}/${role.name}` });
+      return {};
+    },
+    async (request) => { names.push(request); }
+  );
+  assert.deepEqual(names, [{
+    command: "codex-test",
+    baseArgs: ["--profile", "test"],
+    environment,
+    threadId: "thread-native-1",
+    name: "Yui · task-1 · Managed launch · Leader"
+  }]);
   const inbox = new FileRuntimeEventInbox(home);
   assert.deepEqual(inbox.list().map((event) => ({
     scope: event.scope,
@@ -277,13 +364,52 @@ test("Codex notify payload is strictly converted to one durable runtime event", 
     summary: "done"
   }]);
   const revision = JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision;
-  await runSessionNotifyCommand(payload, environment, async () => ({}));
+  await runSessionNotifyCommand(
+    payload,
+    environment,
+    async () => ({}),
+    async (request) => { names.push(request); }
+  );
+  assert.equal(names.length, 1);
   assert.equal(inbox.list().length, 1);
   assert.equal(JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision, revision);
   await assert.rejects(
     runSessionNotifyCommand(JSON.stringify({ type: "other", "thread-id": "x" }), environment),
     /payload type is invalid/
   );
+});
+
+test("Codex global Operator keeps the native title from its first user message", async (t) => {
+  const { home, globalRole, agent } = fixture(t);
+  const environment = {
+    YUI_HOME: home,
+    YUI_SESSION_SCOPE: "global",
+    YUI_ROLE: globalRole.name,
+    YUI_AGENT_ID: agent.id,
+    YUI_ADAPTER_ID: "codex",
+    YUI_LAUNCH_ID: "launch-operator-native"
+  };
+  const payload = JSON.stringify({
+    type: "agent-turn-complete",
+    "thread-id": "thread-operator-native",
+    "turn-id": "turn-operator-native",
+    cwd: home,
+    "input-messages": ["Plan the next release"],
+    "last-assistant-message": "I created the plan."
+  });
+  const names = [];
+
+  await runSessionNotifyCommand(
+    payload,
+    environment,
+    async () => ({}),
+    async (request) => { names.push(request); }
+  );
+
+  assert.deepEqual(names, []);
+  const [event] = new FileRuntimeEventInbox(home).list();
+  assert.equal(event.scope, "global");
+  assert.equal(event.title, "Plan the next release");
 });
 
 test("Codex notify remains queued when the Controller is offline", async (t) => {

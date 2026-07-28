@@ -129,6 +129,12 @@ test("an idle Leader starts a real wakeup run, waits for readiness, sends once, 
   assert.equal(store.savedDispatches[0].run.mode, "new");
   assert.equal(store.savedDispatches[0].run.status, "active");
   assert.equal(store.savedDispatches[0].run.roleName, "leader");
+  assert.equal(
+    store.savedDispatches[0].run.input.startsWith(
+      "Yui · task-1 · Test task · Leader · Run run-1\n\n"
+    ),
+    true
+  );
   assert.match(store.savedDispatches[0].run.input, /role-result/);
   assert.match(store.savedDispatches[0].run.input, /yui task context task-1/);
   assert.match(store.savedDispatches[0].run.input, /Current Leader Run: run-1/);
@@ -629,7 +635,7 @@ function operatorStore(requests) {
 }
 
 function fakeStore(options = {}) {
-  const task = { id: "task-1", status: "active" };
+  const task = { id: "task-1", title: "Test task", status: "active" };
   const roles = [role("leader")];
   const pending = new Map([["task-1", mergePendingWakeup("task-1", "role-result", NOW, null)]]);
   const sessions = new Map();

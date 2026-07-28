@@ -6,7 +6,8 @@ import test from "node:test";
 
 import {
   CodexAppServerAttemptExecutor,
-  parseAttemptResult
+  parseAttemptResult,
+  setCodexThreadName
 } from "../../dist/execution/codexAppServerExecutor.js";
 import { createAgentProfile } from "../../dist/profile/agentProfile.js";
 import { loadYuiSkillContexts } from "../../dist/context/roleSessionContext.js";
@@ -20,6 +21,7 @@ test("Codex App Server driver forks the Leader thread and captures only structur
   writeFileSync(command, `#!${process.execPath}
 const readline = require("node:readline");
 const lines = readline.createInterface({ input: process.stdin });
+let threadNamed = false;
 function send(value) { process.stdout.write(JSON.stringify(value) + "\\n"); }
 lines.on("line", (line) => {
   const message = JSON.parse(line);
@@ -35,7 +37,13 @@ lines.on("line", (line) => {
       thread: { id: "child-thread", sessionId: "session-tree" },
       model: "fake", modelProvider: "fake", cwd: ${JSON.stringify(root)}
     } });
+  } else if (message.method === "thread/name/set") {
+    if (message.params.threadId !== "child-thread") process.exit(10);
+    if (message.params.name !== "Yui · task-1 · Read architecture · Inspect scheduler · explorer") process.exit(11);
+    threadNamed = true;
+    send({ id: message.id, result: {} });
   } else if (message.method === "turn/start") {
+    if (!threadNamed) process.exit(12);
     if (message.params.sandboxPolicy.type !== "readOnly") process.exit(4);
     const prompt = message.params.input[0].text;
     if (!prompt.includes("Follow the Profile instruction sentinel.")) process.exit(8);
@@ -73,6 +81,7 @@ lines.on("line", (line) => {
     access: "read",
     profile,
     skills: loadYuiSkillContexts(root, ["yui-worker", "source-review"]),
+    title: "Yui · task-1 · Read architecture · Inspect scheduler · explorer",
     parentThreadId: "leader-thread"
   }, (ref) => { started = ref; });
 
@@ -111,6 +120,37 @@ test("Attempt result parsing rejects plain text and malformed checks", () => {
   );
 });
 
+test("Codex thread naming is bounded when App Server does not respond", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-app-server-name-timeout-"));
+  const command = join(root, "fake-codex");
+  writeFileSync(command, `#!${process.execPath}
+const readline = require("node:readline");
+const lines = readline.createInterface({ input: process.stdin });
+lines.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    process.stdout.write(JSON.stringify({ id: message.id, result: {
+      userAgent: "fake", codexHome: "/tmp", platformFamily: "unix", platformOs: "linux"
+    } }) + "\\n");
+  }
+});
+`);
+  chmodSync(command, 0o700);
+
+  const startedAt = Date.now();
+  await assert.rejects(
+    setCodexThreadName({
+      command,
+      environment: process.env,
+      threadId: "thread-1",
+      name: "Yui · Bounded naming",
+      timeoutMs: 500
+    }),
+    /Timed out setting Codex thread name/
+  );
+  assert.ok(Date.now() - startedAt < 1_500);
+});
+
 test("a second CLI connection interrupts the active turn through its shared control socket", async () => {
   const root = mkdtempSync(join(tmpdir(), "yui-app-server-interrupt-"));
   const command = join(root, "fake-codex");
@@ -136,6 +176,8 @@ if (args.includes("--listen")) {
         send(socket, { id: message.id, result: {
           thread: { id: "thread-1", sessionId: "session-1" }
         } });
+      } else if (message.method === "thread/name/set") {
+        send(socket, { id: message.id, result: {} });
       } else if (message.method === "turn/start") {
         turnSocket = socket;
         send(socket, { id: message.id, result: { turn: { id: "turn-1" } } });
@@ -172,6 +214,7 @@ if (args.includes("--listen")) {
     access: "read",
     profile,
     skills: loadYuiSkillContexts(root, ["yui-worker"]),
+    title: "Yui · Interrupt attempt · worker",
     controlSocketPath: socketPath
   }, (providerRef) => { markStarted(providerRef); });
   const providerRef = await started;

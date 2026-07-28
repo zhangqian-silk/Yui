@@ -24,6 +24,7 @@ import {
   type AttemptExecutionPort
 } from "./codexAppServerExecutor.js";
 import { loadYuiSkillContexts } from "../context/roleSessionContext.js";
+import { executionAttemptSessionTitle } from "../runtime/sessionTitle.js";
 
 export type AttemptDispatchInput = Readonly<{
   workItemId: string;
@@ -137,6 +138,7 @@ export class AttemptCoordinator {
         access,
         profile,
         skills,
+        title: executionAttemptSessionTitle(task, workItem.title, profile.id),
         command: configuredAgent.command,
         baseArgs: configuredAgent.baseArgs,
         environment: {

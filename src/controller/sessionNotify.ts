@@ -1,8 +1,16 @@
 import { callController } from "../core/controllerClient.js";
 import type { JsonValue } from "../core/protocol.js";
 import { FileRuntimeEventInbox } from "./runtimeEventInbox.js";
-import { yuiRunIdFromInputMessages } from "../run/runIdentity.js";
+import {
+  yuiRunBodyFromInputMessage,
+  yuiRunIdFromInputMessages
+} from "../run/runIdentity.js";
 import { runtimeLifecycleSignalKey } from "../runtime/lifecycleReservation.js";
+import {
+  setCodexThreadName,
+  type CodexThreadNameRequest
+} from "../execution/codexAppServerExecutor.js";
+import { FileTaskStore } from "../storage/taskStore.js";
 
 export type CodexSessionNotification = Readonly<{
   scope: "task" | "global";
@@ -25,15 +33,18 @@ type ControllerCall = (
   options?: Readonly<{ timeoutMs?: number }>
 ) => Promise<JsonValue>;
 
+type CodexThreadNameSetter = (request: CodexThreadNameRequest) => Promise<void>;
+
 /** Hidden CLI entrypoint used by Codex's structured notify hook. */
 export async function runSessionNotifyCommand(
   payloadArgument: string | undefined,
   environment: NodeJS.ProcessEnv = process.env,
-  call?: ControllerCall
+  call?: ControllerCall,
+  setThreadName: CodexThreadNameSetter = setCodexThreadName
 ): Promise<void> {
   const params = parseCodexSessionNotification(payloadArgument, environment);
   const home = requireText(environment.YUI_HOME, "YUI_HOME");
-  new FileRuntimeEventInbox(home).enqueueTurnCompleted({
+  const enqueued = new FileRuntimeEventInbox(home).enqueueTurnCompleted({
     scope: params.scope,
     ...(params.scope === "task" ? { taskId: params.taskId } : {}),
     roleName: params.roleName,
@@ -67,6 +78,10 @@ export async function runSessionNotifyCommand(
     },
     { timeoutMs: 100 }
   ).catch(() => {});
+  if (enqueued.created && shouldSetThreadName(home, params)) {
+    const request = threadNameRequest(params, environment);
+    if (request !== null) await setThreadName(request).catch(() => {});
+  }
 }
 
 export function parseCodexSessionNotification(
@@ -81,7 +96,9 @@ export function parseCodexSessionNotification(
   const turnId = requireText(payload["turn-id"], "Codex turn-id");
   const lastAssistantMessage = requireAssistantMessage(payload["last-assistant-message"]);
   const runId = yuiRunIdFromInputMessages(payload["input-messages"]);
-  const title = sessionTitleFromInputMessages(payload["input-messages"]);
+  const title = environment.YUI_SESSION_TITLE === undefined
+    ? sessionTitleFromInputMessages(payload["input-messages"])
+    : requireText(environment.YUI_SESSION_TITLE, "YUI_SESSION_TITLE");
   const scope = environment.YUI_SESSION_SCOPE;
   if (scope !== "task" && scope !== "global") {
     throw new Error("YUI_SESSION_SCOPE must be task or global.");
@@ -148,16 +165,56 @@ function sessionTitleFromInputMessages(value: unknown): string | undefined {
   if (!Array.isArray(value)) return undefined;
   for (const entry of value) {
     if (typeof entry !== "string") continue;
-    const lines = entry.replace(/\r/g, "").trim().split("\n");
-    const body = lines.length >= 3
-      && lines[0]!.startsWith("Yui-Run-Id: ")
-      && lines[1] === ""
-      ? lines.slice(2).join("\n")
-      : lines.join("\n");
+    const body = yuiRunBodyFromInputMessage(entry);
     const normalized = body.trim().replaceAll(/\s+/g, " ");
     if (normalized.length > 0) return truncateSessionText(normalized);
   }
   return undefined;
+}
+
+function shouldSetThreadName(
+  home: string,
+  params: CodexSessionNotification
+): boolean {
+  if (
+    params.scope !== "task"
+    || params.title === undefined
+    || params.runId === undefined
+  ) return false;
+  try {
+    const store = new FileTaskStore(home);
+    return store.getAgentRun(params.taskId!, params.runId)?.mode === "new";
+  } catch {
+    return false;
+  }
+}
+
+function threadNameRequest(
+  params: CodexSessionNotification,
+  environment: NodeJS.ProcessEnv
+): CodexThreadNameRequest | null {
+  if (params.title === undefined) return null;
+  const command = environment.YUI_AGENT_COMMAND;
+  const encodedBaseArgs = environment.YUI_AGENT_BASE_ARGS;
+  if (command === undefined || encodedBaseArgs === undefined) return null;
+  try {
+    const parsed: unknown = JSON.parse(encodedBaseArgs);
+    if (
+      !Array.isArray(parsed)
+      || parsed.some((value) => typeof value !== "string" || value.includes("\0"))
+    ) {
+      return null;
+    }
+    return {
+      command: requireText(command, "YUI_AGENT_COMMAND"),
+      baseArgs: parsed,
+      environment,
+      threadId: params.nativeSessionId,
+      name: params.title
+    };
+  } catch {
+    return null;
+  }
 }
 
 function truncateSessionText(value: string): string {

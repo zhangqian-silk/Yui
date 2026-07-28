@@ -24,6 +24,7 @@ export type CodexExecutionRequest = Readonly<{
   access: AttemptAccess;
   profile: AgentProfile;
   skills?: readonly RoleSkillContext[];
+  title: string;
   parentThreadId?: string;
   command?: string;
   baseArgs?: readonly string[];
@@ -37,6 +38,17 @@ export type CodexExecutionResponse = Readonly<{
   providerRef: ProviderRef;
   result: AttemptResult;
 }>;
+
+export type CodexThreadNameRequest = Readonly<{
+  command: string;
+  baseArgs?: readonly string[];
+  environment: NodeJS.ProcessEnv;
+  threadId: string;
+  name: string;
+  timeoutMs?: number;
+}>;
+
+const CODEX_THREAD_NAME_TIMEOUT_MS = 1_000;
 
 export interface AttemptExecutionPort {
   execute(
@@ -72,6 +84,7 @@ export class CodexAppServerAttemptExecutor implements AttemptExecutionPort {
       const thread = await prepareThread(client, request);
       const threadId = requiredId(thread.id, "Codex thread id");
       const sessionId = requiredId(thread.sessionId, "Codex session id");
+      await setThreadName(client, threadId, request.title).catch(() => {});
       const turnResponse = await client.request("turn/start", {
         threadId,
         input: [{ type: "text", text: compilePrompt(request), text_elements: [] }],
@@ -130,6 +143,23 @@ export class CodexAppServerAttemptExecutor implements AttemptExecutionPort {
   }
 }
 
+export async function setCodexThreadName(
+  request: CodexThreadNameRequest
+): Promise<void> {
+  const timeoutMs = threadNameTimeout(request.timeoutMs);
+  const client = await AppServerClient.startBounded(
+    request.command,
+    request.environment,
+    request.baseArgs ?? [],
+    timeoutMs
+  );
+  try {
+    await setThreadName(client, request.threadId, request.name, timeoutMs);
+  } finally {
+    client.close();
+  }
+}
+
 async function prepareThread(
   client: AppServerClient,
   request: CodexExecutionRequest
@@ -159,6 +189,22 @@ async function prepareThread(
     ephemeral: false
   });
   return object(response.thread, "Codex started thread");
+}
+
+async function setThreadName(
+  client: AppServerClient,
+  threadId: string,
+  name: string,
+  timeoutMs = CODEX_THREAD_NAME_TIMEOUT_MS
+): Promise<void> {
+  await withTimeout(
+    client.request("thread/name/set", {
+      threadId: requiredId(threadId, "Codex thread id"),
+      name: requiredThreadName(name)
+    }),
+    timeoutMs,
+    "Timed out setting Codex thread name."
+  );
 }
 
 function compilePrompt(request: CodexExecutionRequest): string {
@@ -317,6 +363,20 @@ class AppServerClient {
     }
   }
 
+  static async startBounded(
+    command: string,
+    environment: NodeJS.ProcessEnv,
+    baseArgs: readonly string[],
+    timeoutMs: number
+  ): Promise<AppServerClient> {
+    const client = new AppServerClient(spawn(
+      command,
+      [...baseArgs, "app-server", "--stdio"],
+      { env: environment, stdio: ["pipe", "pipe", "pipe"] }
+    ));
+    return this.initialize(client, timeoutMs);
+  }
+
   static async connect(
     command: string,
     environment: NodeJS.ProcessEnv,
@@ -337,16 +397,32 @@ class AppServerClient {
     return this.initialize(new AppServerClient(child));
   }
 
-  private static async initialize(client: AppServerClient): Promise<AppServerClient> {
-    await client.request("initialize", {
-      clientInfo: { name: "yui", title: "Yui", version: "0.2.0" },
-      capabilities: {
-        experimentalApi: true,
-        requestAttestation: false
+  private static async initialize(
+    client: AppServerClient,
+    timeoutMs?: number
+  ): Promise<AppServerClient> {
+    try {
+      const initialization = client.request("initialize", {
+        clientInfo: { name: "yui", title: "Yui", version: "0.2.0" },
+        capabilities: {
+          experimentalApi: true,
+          requestAttestation: false
+        }
+      });
+      if (timeoutMs === undefined) await initialization;
+      else {
+        await withTimeout(
+          initialization,
+          timeoutMs,
+          "Timed out initializing Codex App Server for thread naming."
+        );
       }
-    });
-    client.notify("initialized", {});
-    return client;
+      client.notify("initialized", {});
+      return client;
+    } catch (error) {
+      client.close();
+      throw error;
+    }
   }
 
   request(method: string, params: JsonObject): Promise<JsonObject> {
@@ -547,4 +623,39 @@ function requiredId(value: unknown, label: string): string {
     throw new Error(`${label} is invalid.`);
   }
   return value;
+}
+
+function requiredThreadName(value: unknown): string {
+  if (typeof value !== "string" || value.includes("\0")) {
+    throw new Error("Codex thread name is invalid.");
+  }
+  const normalized = value.trim();
+  if (normalized.length === 0 || normalized.length > 1_024) {
+    throw new Error("Codex thread name is invalid.");
+  }
+  return normalized;
+}
+
+function threadNameTimeout(value: unknown): number {
+  if (value === undefined) return CODEX_THREAD_NAME_TIMEOUT_MS;
+  if (!Number.isInteger(value) || Number(value) < 1 || Number(value) > 10_000) {
+    throw new Error("Codex thread name timeout is invalid.");
+  }
+  return Number(value);
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => { reject(new Error(message)); }, timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }

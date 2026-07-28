@@ -17,7 +17,8 @@ const OWNED_ARGUMENTS_BY_ADAPTER: Readonly<Record<AgentAdapterId, readonly strin
     "--agents", "--bg", "--background", "--dangerously-skip-permissions",
     "--allow-dangerously-skip-permissions", "--no-session-persistence", "--from-pr",
     "--fallback-model", "--tools", "--system-prompt", "--system-prompt-file",
-    "--append-system-prompt", "--append-system-prompt-file", "--plugin-dir"
+    "--append-system-prompt", "--append-system-prompt-file", "--plugin-dir",
+    "--name", "-n"
   ]
 };
 

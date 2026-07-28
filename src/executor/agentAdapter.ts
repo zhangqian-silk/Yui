@@ -96,6 +96,7 @@ export type CompileInput<TConfig extends RoleAgentConfig = RoleAgentConfig> = Re
   agent: AgentDefinition;
   config: TConfig;
   workspace: string;
+  sessionTitle?: string;
   developerInstructions?: string;
   skills?: readonly Readonly<{ id: string; path: string; content: string }>[];
   managedContextFile?: string;
@@ -317,6 +318,16 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
     ];
   }
 
+  override compileNew(input: CompileInput<ClaudeAgentConfig>): CompiledAgentLaunch {
+    const launch = super.compileNew(input);
+    return input.sessionTitle === undefined
+      ? launch
+      : {
+          ...launch,
+          argv: [...launch.argv, "--name", sessionTitle(input.sessionTitle)]
+        };
+  }
+
   override launchContextArgs(input: CompileInput<ClaudeAgentConfig>): string[] {
     const sections = [
       input.developerInstructions,
@@ -337,7 +348,7 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
   }
 
   compileResume(input: ResumeInput<ClaudeAgentConfig>): CompiledAgentLaunch {
-    const launch = this.compileNew(input);
+    const launch = super.compileNew(input);
     return { ...launch, argv: [...launch.argv, "--resume", nativeId(input.nativeSessionId)] };
   }
 }
@@ -349,6 +360,17 @@ const ADAPTERS: Readonly<Record<AgentAdapterId, AgentAdapter<any>>> = {
 function tomlString(value: string): string {
   if (value.includes("\0")) throw new Error("Agent launch context cannot contain NUL bytes.");
   return JSON.stringify(value);
+}
+
+function sessionTitle(value: string): string {
+  if (typeof value !== "string" || value.includes("\0")) {
+    throw new Error("Agent session title is invalid.");
+  }
+  const normalized = value.trim();
+  if (normalized.length === 0 || normalized.length > 1_024) {
+    throw new Error("Agent session title is invalid.");
+  }
+  return normalized;
 }
 export { supportedAgentAdapterIds };
 export function findAgentAdapter(id: string): AgentAdapter | null {

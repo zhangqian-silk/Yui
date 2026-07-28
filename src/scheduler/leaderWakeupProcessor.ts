@@ -1,5 +1,6 @@
 import { createAgentRun } from "../run/agentRun.js";
 import { markYuiRunInput } from "../run/runIdentity.js";
+import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
 import { createLeaderRecoveryNotification } from "./operatorNotification.js";
 import type {
@@ -76,7 +77,7 @@ export async function processLeaderWakeups(
         task.id,
         runId,
         wakeup.reasons
-      ), runId);
+      ), runId, taskRoleSessionTitle(task, role.name));
       run = createAgentRun(
         runId,
         task.id,
