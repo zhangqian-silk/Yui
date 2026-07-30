@@ -128,13 +128,19 @@ Task/WorkItem 模型，不增加额外任务类型。
 ```sh
 yui task role add <task-id> implementer --profile implementer --agent codex
 yui task role update <task-id> implementer \
-  --agent claude --model claude-opus --permission-mode acceptEdits
+  --agent claude --model claude-opus --effort high --yolo true
 yui task role bind <task-id> implementer claude
 yui task role list <task-id>
 
 yui task work create <task-id> "实现导出器" --role implementer
 yui task work dispatch <work-item-id> --input "完成实现并运行聚焦测试"
 ```
+
+`--yolo true` 是 Role 的一等配置。Yui 会分别为 Codex 编译
+`--dangerously-bypass-approvals-and-sandbox`，为 Claude 编译
+`--dangerously-skip-permissions`；`--clear-yolo` 会恢复已保存的权限设置或
+CLI 默认值。创建 Task Role 时不传 `--agent`，会复制同名全局 Role 的完整
+Agent bindings，Leader 无需重新拼接 model、effort 和权限。
 
 Worker 显式交付当前 Run：
 
@@ -364,7 +370,7 @@ npm test
 npm run lint
 ```
 
-如需让所有终端及受管 Agent 会话使用当前 checkout，可逆地接管用户级 `yui` 命令：
+如需让用户终端使用当前 checkout，可逆地接管用户级 `yui` 命令：
 
 ```sh
 make link
@@ -372,7 +378,7 @@ command -v yui
 yui doctor
 ```
 
-第一次执行 `make link` 会把最初的 `yui` 入口保存在同一个用户级 bin 目录，再用指向当前 checkout 的受管符号链接接管命令。之后在其他 checkout 执行 `make link` 只会移动这个受管链接：最后执行者生效，开发环境之间不会形成备份链。请串行执行 `make link` 和 `make unlink`，不要从多个环境或 checkout 并发调用。launcher 默认使用当前生效 checkout 的 `output/dev/home` 作为 `YUI_HOME`；显式设置的 `YUI_HOME` 仍然优先。因为替换的是命令入口，其他终端和之后创建的 Codex/Claude 会话无需 source 也会使用同一个开发版本。若已有 Controller 也需要加载新代码，请执行 `yui controller restart`。任意采用本实现的 checkout 都可以执行 `make unlink`；它会校验共享受管状态并恢复唯一一份最初 `yui` 入口。
+第一次执行 `make link` 会把最初的 `yui` 入口保存在同一个用户级 bin 目录，再用指向当前 checkout 的受管符号链接接管命令。之后在其他 checkout 执行 `make link` 只会移动这个受管链接：最后执行者生效，开发环境之间不会形成备份链。请串行执行 `make link` 和 `make unlink`，不要从多个环境或 checkout 并发调用。launcher 默认使用当前生效 checkout 的 `output/dev/home` 作为 `YUI_HOME`；显式设置的 `YUI_HOME` 仍然优先。受管 Agent 不依赖这个全局链接：Controller 会把指向自身 Yui CLI 和 `YUI_HOME` 的私有 launcher 放到 PATH 最前面。若已有 Controller 也需要加载新代码，请执行 `yui controller restart`。任意采用本实现的 checkout 都可以执行 `make unlink`；它会校验共享受管状态并恢复唯一一份最初 `yui` 入口。
 
 ```sh
 make unlink

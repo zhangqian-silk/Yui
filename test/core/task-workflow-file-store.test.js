@@ -914,6 +914,38 @@ test("Task Role add, update, show, and remove preserve lean field-level configur
   assert.equal(store.getRole(task.id, "reviewer"), null);
 });
 
+test("Task Role creation copies a same-named global Role's complete Agent binding", (t) => {
+  const { root, store, options } = fixture(t);
+  store.saveGlobalRole(createGlobalRole(
+    "implementer",
+    [createRoleAgentBinding(
+      store.getConfiguredAgent("claude"),
+      {
+        adapterId: "claude",
+        model: "sonnet",
+        effort: "max",
+        yolo: true
+      }
+    )],
+    "claude",
+    root,
+    NOW
+  ));
+  const task = createTask(store, options, "Copy configured Worker Role");
+
+  run(["role", "add", task.id, "implementer"], store, options);
+
+  assert.deepEqual(
+    store.getRole(task.id, "implementer")?.agentBindings.claude.config,
+    {
+      adapterId: "claude",
+      model: "sonnet",
+      effort: "max",
+      yolo: true
+    }
+  );
+});
+
 test("Leader creates a profiled Worker instance, binds Claude config, then launches Claude", (t) => {
   const { root, store, options } = fixture(t);
   const task = createTask(store, options, "Generic Worker instance");
@@ -934,7 +966,8 @@ test("Leader creates a profiled Worker instance, binds Claude config, then launc
     "role", "update", task.id, "worker",
     "--agent", "claude",
     "--model", "claude-opus",
-    "--permission-mode", "acceptEdits"
+    "--permission-mode", "acceptEdits",
+    "--yolo", "true"
   ], store, options);
   run(["role", "bind", task.id, "worker", "claude"], store, options);
 
@@ -949,7 +982,8 @@ test("Leader creates a profiled Worker instance, binds Claude config, then launc
   assert.deepEqual(worker.agentBindings.claude.config, {
     adapterId: "claude",
     model: "claude-opus",
-    permission: { mode: "acceptEdits" }
+    permission: { mode: "acceptEdits" },
+    yolo: true
   });
   assert.equal(worker.agentBindings.codex.config.model, undefined);
 
@@ -979,13 +1013,8 @@ test("Leader creates a profiled Worker instance, binds Claude config, then launc
     ),
     ["--model", "claude-opus"]
   );
-  assert.deepEqual(
-    plan.launch.args.slice(
-      plan.launch.args.indexOf("--permission-mode"),
-      plan.launch.args.indexOf("--permission-mode") + 2
-    ),
-    ["--permission-mode", "acceptEdits"]
-  );
+  assert.ok(plan.launch.args.includes("--dangerously-skip-permissions"));
+  assert.equal(plan.launch.args.includes("--permission-mode"), false);
   assert.equal(plan.session.nativeSessionId, "claude-worker-session");
 });
 

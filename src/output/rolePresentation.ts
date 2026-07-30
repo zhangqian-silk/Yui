@@ -85,6 +85,7 @@ function bindingRow(
 }
 
 function permission(binding: RoleAgentBinding): string {
+  if (binding.config.yolo === true) return "YOLO";
   if (binding.config.adapterId === "codex") {
     const sandbox = binding.config.permission?.sandbox;
     const approval = binding.config.permission?.approval;

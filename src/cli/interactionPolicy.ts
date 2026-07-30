@@ -132,7 +132,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       "--agent": "value", "--workspace": "value", "--description": "value",
       "--responsibility": "value", "--constraint": "value", "--expected-output": "value",
       "--system-prompt": "value", "--skill": "value", "--model": "value",
-      "--effort": "value", "--sandbox": "value", "--approval": "value",
+      "--effort": "value", "--yolo": "value", "--sandbox": "value", "--approval": "value",
       "--permission-mode": "value", "--search": "value"
     }
   },
@@ -330,7 +330,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       "--profile": "value", "--agent": "value", "--description": "value", "--responsibility": "value",
       "--constraint": "value", "--expected-output": "value", "--system-prompt": "value",
       "--skill": "value", "--model": "value", "--effort": "value",
-      "--sandbox": "value", "--approval": "value", "--permission-mode": "value",
+      "--yolo": "value", "--sandbox": "value", "--approval": "value", "--permission-mode": "value",
       "--search": "value"
     }
   },

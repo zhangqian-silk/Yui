@@ -32,6 +32,7 @@ const PROFILE_CLEAR_OPTIONS: readonly [string, RoleOptionKind][] = [
 const AGENT_VALUE_OPTIONS: readonly [string, RoleOptionKind][] = [
   ["--model", "value"],
   ["--effort", "value"],
+  ["--yolo", "value"],
   ["--sandbox", "value"],
   ["--approval", "value"],
   ["--permission-mode", "value"],
@@ -41,6 +42,7 @@ const AGENT_VALUE_OPTIONS: readonly [string, RoleOptionKind][] = [
 const AGENT_CLEAR_OPTIONS: readonly [string, RoleOptionKind][] = [
   ["--clear-model", "flag"],
   ["--clear-effort", "flag"],
+  ["--clear-yolo", "flag"],
   ["--clear-sandbox", "flag"],
   ["--clear-approval", "flag"],
   ["--clear-permission-mode", "flag"],
@@ -172,6 +174,7 @@ export function patchRoleAgentBinding(
   const config = structuredClone(binding.config) as unknown as Record<string, unknown>;
   patchText(config, parsed, "--model", "--clear-model", "model");
   patchText(config, parsed, "--effort", "--clear-effort", "effort");
+  patchTrue(config, parsed, "--yolo", "--clear-yolo", "yolo");
 
   const permission = {
     ...((config.permission as Readonly<Record<string, unknown>> | undefined) ?? {})
@@ -215,6 +218,7 @@ function assertAgentOptionConflicts(parsed: ParsedRoleOptions): void {
   assertPairs(parsed, [
     ["--model", "--clear-model"],
     ["--effort", "--clear-effort"],
+    ["--yolo", "--clear-yolo"],
     ["--sandbox", "--clear-sandbox"],
     ["--approval", "--clear-approval"],
     ["--permission-mode", "--clear-permission-mode"],
@@ -224,6 +228,22 @@ function assertAgentOptionConflicts(parsed: ParsedRoleOptions): void {
     && [...parsed.seen].some((option) => option !== "--clear-agent-config" && AGENT_CONFIG_OPTIONS.has(option))) {
     throw usageError("--clear-agent-config cannot be combined with another Agent setting.");
   }
+}
+
+function patchTrue(
+  target: Record<string, unknown>,
+  parsed: ParsedRoleOptions,
+  valueOption: string,
+  clearOption: string,
+  key: string
+): void {
+  if (parsed.has(valueOption)) {
+    if (parsed.one(valueOption) !== "true") {
+      throw usageError(`${valueOption} supports true only; use ${clearOption} to follow the CLI default.`);
+    }
+    target[key] = true;
+  }
+  if (parsed.has(clearOption)) delete target[key];
 }
 
 function assertAdapterOptions(adapterId: string, parsed: ParsedRoleOptions): void {

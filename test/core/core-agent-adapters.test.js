@@ -110,6 +110,34 @@ test("rawArgs cannot take ownership of structured, lifecycle, or secret-bearing 
   assert.doesNotThrow(() => validateAgentRawArguments("claude", ["--verbose"]));
 });
 
+test("YOLO config compiles to each Agent CLI's owned dangerous flag", () => {
+  const codex = resolveAgentAdapter("codex").compileNew({
+    agent: configured("codex-yolo", "codex", "codex"),
+    config: {
+      adapterId: "codex",
+      yolo: true,
+      permission: { sandbox: "workspace-write", approval: "on-request" }
+    },
+    workspace: "/tmp",
+    codexDeveloperInstructions: { status: "absent" }
+  });
+  assert.ok(codex.argv.includes("--dangerously-bypass-approvals-and-sandbox"));
+  assert.equal(codex.argv.includes("--sandbox"), false);
+  assert.equal(codex.argv.includes("--ask-for-approval"), false);
+
+  const claude = resolveAgentAdapter("claude").compileNew({
+    agent: configured("claude-yolo", "claude", "claude"),
+    config: {
+      adapterId: "claude",
+      yolo: true,
+      permission: { mode: "acceptEdits" }
+    },
+    workspace: "/tmp"
+  });
+  assert.ok(claude.argv.includes("--dangerously-skip-permissions"));
+  assert.equal(claude.argv.includes("--permission-mode"), false);
+});
+
 test("Codex structured config compiles deterministically for new and resume launches", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "yui-agent-adapter-"));
   const first = join(root, "first");

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { resolve } from "node:path";
+import { chmodSync, realpathSync } from "node:fs";
+import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -18,6 +19,7 @@ import type {
   SchedulerRoleSession
 } from "../scheduler/ports.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import { writeTextFileAtomically } from "../storage/durableFile.js";
 import { compileRoleSessionContext } from "../context/roleSessionContext.js";
 import { resolveAgentAdapter } from "./agentAdapter.js";
 import { inspectCodexLaunchConfig } from "./codexConfigConflict.js";
@@ -56,6 +58,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   #nativeAgentEnvironment: NodeJS.ProcessEnv;
   readonly #createNativeSessionId: () => string;
   readonly #cliPath: string;
+  readonly #managedBinPath: string;
 
   constructor(
     readonly home: string,
@@ -77,8 +80,9 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       sourceEnvironment
     );
     this.#createNativeSessionId = options.createNativeSessionId ?? randomUUID;
-    this.#cliPath = options.cliPath
-      ?? fileURLToPath(new URL("../cli.js", import.meta.url));
+    this.#cliPath = canonicalPath(options.cliPath
+      ?? fileURLToPath(new URL("../cli.js", import.meta.url)));
+    this.#managedBinPath = ensureManagedYuiLauncher(this.home, this.#cliPath);
   }
 
   refreshAgentEnvironment(refresh: AgentEnvironmentRefresh): void {
@@ -177,9 +181,17 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       ...this.#nativeAgentEnvironment
     };
     const resolvedAgentEnvironment = resolveAgentEnvironment(agent, agentSourceEnvironment);
-    const launchEnvironment = {
+    const inheritedLaunchEnvironment = {
       ...operationalAgentEnvironment(configured.adapterId, operationalSourceEnvironment),
       ...resolvedAgentEnvironment
+    };
+    const launchEnvironment = {
+      ...inheritedLaunchEnvironment,
+      PATH: [
+        this.#managedBinPath,
+        inheritedLaunchEnvironment.PATH
+      ].filter((value): value is string => value !== undefined && value.length > 0)
+        .join(delimiter)
     };
     const adapter = resolveAgentAdapter(binding.adapterId);
     const sessionContext = compileRoleSessionContext(this.home, role, owner);
@@ -318,6 +330,34 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     )));
     return selectEnvironment(source, names);
   }
+}
+
+function ensureManagedYuiLauncher(home: string, cliPath: string): string {
+  const binPath = join(resolve(home), "runtime", "bin");
+  const launcherPath = join(binPath, "yui");
+  writeTextFileAtomically(
+    launcherPath,
+    [
+      "#!/bin/sh",
+      `exec ${shellQuote(canonicalPath(process.execPath))} ${shellQuote(cliPath)} "$@"`,
+      ""
+    ].join("\n")
+  );
+  chmodSync(launcherPath, 0o700);
+  return binPath;
+}
+
+function canonicalPath(path: string): string {
+  const absolute = resolve(path);
+  try {
+    return realpathSync(absolute);
+  } catch {
+    return absolute;
+  }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\"'\"'")}'`;
 }
 
 function patchEnvironment(

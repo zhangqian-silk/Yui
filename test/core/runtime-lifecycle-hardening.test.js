@@ -7,7 +7,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
@@ -840,7 +840,10 @@ test("launch environment keeps native context and excludes other Agents' credent
     launchId: "environment-isolation"
   });
 
-  assert.equal(plan.launch.env.PATH, "/native/bin");
+  assert.equal(
+    plan.launch.env.PATH,
+    `${join(home, "runtime", "bin")}${delimiter}/native/bin`
+  );
   assert.equal(plan.launch.env.HOME, "/native/home");
   assert.equal(plan.launch.env.TERM, "screen-256color");
   assert.equal(plan.launch.env.CODEX_HOME, codexHome);
@@ -871,7 +874,11 @@ test("launch environment keeps native context and excludes other Agents' credent
   });
   assert.match(
     fallbackPlan.launch.env.PATH,
-    new RegExp(`^${dirname(process.execPath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:`)
+    new RegExp(
+      `^${join(home, "runtime", "bin").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`
+      + `${delimiter}${dirname(process.execPath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`
+      + `${delimiter}`
+    )
   );
   assert.equal(fallbackPlan.launch.env.HOME, homedir());
   assert.equal(fallbackPlan.launch.env.TERM, "xterm-256color");

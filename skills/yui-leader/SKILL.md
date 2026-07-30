@@ -87,6 +87,20 @@ A direct or native-subagent WorkItem is roleless. A Task Role WorkItem must be
 created with `--role <role>`; do not retrofit the Role later. Reuse a compatible
 Role instead of creating duplicates.
 
+Before the first delegated WorkItem, or after the Profile catalog changes,
+inspect the available Profiles:
+
+```sh
+yui profile list
+```
+
+Choose the Profile by the work's meaning. Use `explorer`, `reviewer`, or another
+read-only Profile for inspection and review. Use `implementer` for work expected
+to modify files or external state. Do not send an implementation brief to a
+read-only Worker and rely on that Worker to repair the routing mistake. If one
+WorkItem may write at any stage, use a write-capable Profile; split out a
+read-only investigation only when it is independently useful.
+
 ## Decompose
 
 Create finite WorkItems that describe intent:
@@ -178,10 +192,8 @@ settings:
 
 ```sh
 yui task role add <task-id> <role> \
-  --profile <worker-profile> --agent <initial-agent>
-yui task role update <task-id> <role> \
-  --agent <agent-id> --model <model> --effort <effort>
-yui task role bind <task-id> <role> <agent-id>
+  --profile <worker-profile>
+yui task role show <task-id> <role>
 yui task work create <task-id> "<outcome>" --role <role>
 yui task work dispatch <work-id> --input "<execution brief>"
 ```
@@ -190,6 +202,16 @@ The Profile is not linked to an Agent. Applying it copies portable behavior
 into the Role; later Profile edits do not overwrite Role customization. Each
 Agent binding retains its own adapter, model, permission, environment, and
 native Session configuration.
+
+When a same-named global Role exists, add the Task Role without `--agent` so
+Yui copies that Role's complete bindings. This is the preferred path. Before
+dispatch, inspect `task role show`; if Agent, model, effort, or permission
+settings are missing or inconsistent, do not dispatch or guess them.
+
+Do not reconstruct Agent/model/effort or YOLO settings during execution. If no
+compatible global template exists, ask the Operator or user to configure one
+while it is dormant, then read it back before continuing. Provider permission
+bypass does not change the selected Profile's read/write boundary.
 
 For meaningful concurrent-write risk, isolate the WorkItem before dispatch:
 
