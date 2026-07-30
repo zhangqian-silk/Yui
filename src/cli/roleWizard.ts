@@ -627,6 +627,8 @@ function agentFields(
   return [
     agentField("model", "Model", config.model, "--model", "--clear-model"),
     agentField("effort", "Effort", config.effort, "--effort", "--clear-effort"),
+    agentField("yolo", "YOLO", config.yolo, "--yolo", "--clear-yolo",
+      catalogChoices(catalog, "yolo", ["true"])),
     ...(binding.adapterId === "codex" ? [
       agentField("sandbox", "Sandbox", permission.sandbox, "--sandbox", "--clear-sandbox",
         catalogChoices(catalog, "permission.sandbox", [

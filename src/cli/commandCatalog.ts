@@ -138,14 +138,14 @@ const roleProfileOptions = [
   "--expected-output", "--system-prompt", "--skill"
 ] as const;
 const roleAgentOptions = [
-  "--model", "--effort", "--sandbox", "--approval", "--permission-mode", "--search"
+  "--model", "--effort", "--yolo", "--sandbox", "--approval", "--permission-mode", "--search"
 ] as const;
 const roleProfileClearOptions = [
   "--clear-description", "--clear-responsibilities", "--clear-constraints",
   "--clear-expected-output", "--clear-system-prompt", "--clear-skills"
 ] as const;
 const roleAgentClearOptions = [
-  "--clear-model", "--clear-effort", "--clear-sandbox", "--clear-approval",
+  "--clear-model", "--clear-effort", "--clear-yolo", "--clear-sandbox", "--clear-approval",
   "--clear-permission-mode", "--clear-search", "--clear-agent-config"
 ] as const;
 const agentProfileOptions = [
@@ -158,6 +158,7 @@ const agentProfileClearOptions = [
 const roleAgentOptionValues = {
   "--sandbox": ["read-only", "workspace-write", "danger-full-access"],
   "--approval": ["untrusted", "on-request", "never"],
+  "--yolo": ["true"],
   "--search": ["true"]
 } as const;
 

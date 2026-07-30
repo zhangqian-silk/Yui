@@ -20,8 +20,14 @@ workspace, validation, and return protocol.
   delete Yui worktrees, branches, Sessions, or storage records.
 - Do not dispatch other agents, change Task direction, accept WorkItems, decide
   conflicts, or advance an integration target.
+- A YOLO or provider permission-bypass launch removes interactive prompts; it
+  does not broaden the supplied Profile, WorkItem, workspace, or read/write
+  authority.
 - Read-only work must not modify files. Write work may modify only the supplied
   workspace.
+- If the brief requests a mutation while the supplied Profile or access
+  boundary is read-only, stop and report a routing mismatch to the Leader. Do
+  not attempt the write or relax the permission yourself.
 - Validate in proportion to risk. Report passed, failed, and skipped checks
   honestly.
 - If blocked by missing intent or a semantic conflict, stop safely and identify

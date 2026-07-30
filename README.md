@@ -134,13 +134,20 @@ dispatch a WorkItem:
 ```sh
 yui task role add <task-id> implementer --profile implementer --agent codex
 yui task role update <task-id> implementer \
-  --agent claude --model claude-opus --permission-mode acceptEdits
+  --agent claude --model claude-opus --effort high --yolo true
 yui task role bind <task-id> implementer claude
 yui task role list <task-id>
 
 yui task work create <task-id> "Implement the exporter" --role implementer
 yui task work dispatch <work-item-id> --input "Implement and run focused tests"
 ```
+
+`--yolo true` is a first-class Role setting. Yui compiles it to
+`--dangerously-bypass-approvals-and-sandbox` for Codex and
+`--dangerously-skip-permissions` for Claude; `--clear-yolo` returns to the
+stored permission settings or CLI default. A Task Role created without
+`--agent` copies a same-named global Role's complete Agent bindings, so model,
+effort, and permissions do not need to be reconstructed by the Leader.
 
 The Worker delivers its current Run explicitly:
 
@@ -415,7 +422,7 @@ npm test
 npm run lint
 ```
 
-To make every terminal and managed Agent session use this checkout, reversibly link the user-level `yui` command:
+To make user terminals use this checkout, reversibly link the user-level `yui` command:
 
 ```sh
 make link
@@ -423,7 +430,7 @@ command -v yui
 yui doctor
 ```
 
-The first `make link` saves the original `yui` entry in the same user-level bin directory and replaces it with a managed symlink to this checkout. A later `make link` from another checkout only moves that managed symlink; the last checkout wins and development links never form a backup chain. Run `make link` and `make unlink` serially—do not invoke them concurrently from multiple environments or checkouts. The launcher defaults `YUI_HOME` to the active checkout's `output/dev/home`; an explicit `YUI_HOME` remains authoritative. Because the command path itself is replaced, other terminals and newly launched Codex/Claude sessions use the same development build without sourcing a shell script. Run `yui controller restart` if an already-running Controller must load the new build. `make unlink` from any checkout using this implementation verifies the shared managed state and restores the one original `yui` entry.
+The first `make link` saves the original `yui` entry in the same user-level bin directory and replaces it with a managed symlink to this checkout. A later `make link` from another checkout only moves that managed symlink; the last checkout wins and development links never form a backup chain. Run `make link` and `make unlink` serially—do not invoke them concurrently from multiple environments or checkouts. The launcher defaults `YUI_HOME` to the active checkout's `output/dev/home`; an explicit `YUI_HOME` remains authoritative. Managed Agent launches do not depend on this global link: the Controller prepends a private launcher for its own Yui CLI and `YUI_HOME`. Run `yui controller restart` if an already-running Controller must load the new build. `make unlink` from any checkout using this implementation verifies the shared managed state and restores the one original `yui` entry.
 
 ```sh
 make unlink

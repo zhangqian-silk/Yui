@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
@@ -179,6 +180,40 @@ test("one planner adds Codex structured notify for Task and global launches", (t
   assert.equal(globalPlan.launch.env.YUI_SESSION_TITLE, undefined);
   assert.equal(globalPlan.launch.env.YUI_AGENT_COMMAND, undefined);
   assert.equal(globalPlan.launch.env.YUI_AGENT_BASE_ARGS, undefined);
+});
+
+test("managed Agent PATH resolves yui to the current Controller CLI", (t) => {
+  const { home, store, task, role, agent } = fixture(t);
+  const cliPath = join(home, "current-cli.js");
+  writeFileSync(
+    cliPath,
+    "process.stdout.write(JSON.stringify({ args: process.argv.slice(2), home: process.env.YUI_HOME }));\n",
+    { mode: 0o600 }
+  );
+  const plan = new FileRoleLaunchPlanner(home, store, {
+    environment: { PATH: "/old-workspace/bin" },
+    cliPath
+  }).plan({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    mode: "new"
+  });
+
+  const invoked = spawnSync("yui", ["identity"], {
+    encoding: "utf8",
+    env: plan.launch.env
+  });
+  assert.equal(invoked.status, 0, invoked.stderr);
+  assert.deepEqual(JSON.parse(invoked.stdout), {
+    args: ["identity"],
+    home
+  });
+  assert.equal(
+    plan.launch.env.PATH.split(":")[0],
+    join(home, "runtime", "bin")
+  );
 });
 
 test("managed Codex launch refuses to replace an existing native notify callback", (t) => {

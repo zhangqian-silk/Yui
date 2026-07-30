@@ -30,13 +30,20 @@
 
 ### 2.1 先探测，不先启动
 
-在创建测试 Session 前，只执行配置和能力读取：
+先创建本次运行专用的 `E2E_RUN_ROOT`、隔离 `YUI_HOME` 和外部 workspace，
+并在这个 `YUI_HOME` 中完成 `yui setup`。`setup` 只建立 Agent 定义、内置
+Profile、system Role 和 workspace 配置；此时不得执行 `operator enter`、
+`task enter` 或 dispatch。
+
+随后在创建任何测试 Session 前，只执行配置和能力读取：
 
 ```sh
 yui agent list
 yui agent capabilities <agent-id>
+yui role list
 yui role show operator
 yui role show leader
+yui role show <planned-task-role-template>
 yui profile list
 ```
 
@@ -49,10 +56,10 @@ yui profile list
 
 | 执行位置 | 必须确认 |
 |---|---|
-| Operator | Agent、model、effort，以及复用当前会话还是创建新会话 |
-| Task Leader | Agent、model、effort |
+| Operator | Agent、model、effort、权限/YOLO，以及复用当前会话还是创建新会话 |
+| Task Leader | Agent、model、effort、权限/YOLO |
 | native subagent | 继承 Leader，还是在 native API 支持时覆盖 model/effort |
-| Task Role | 每个 Role 的 Agent、model、effort 和必要的 adapter 配置 |
+| Task Role | 每个 Role 的 Agent、model、effort、权限/YOLO 和必要的 adapter 配置 |
 | 兼容性冒烟 | 需要覆盖哪些额外 Agent/adapter |
 | 运行预算 | 最大测试时长、可接受调用成本、是否允许并行 Agent |
 
@@ -80,12 +87,138 @@ yui profile list
 - runtime 不暴露 child 实际 model 时，结果记录 `inherited` 或 `unknown`，
   不得猜测。
 - 用户指定的 Agent/model 不可用时，停止并重新询问；不得静默回退。
+- 用户选择 YOLO 时，将它保存为 Role 的 `yolo=true`。Codex 和 Claude 必须
+  分别出现 `--dangerously-bypass-approvals-and-sandbox` 和
+  `--dangerously-skip-permissions`；不再通过手动确认 workspace trust
+  或临场修改 CLI 参数实现。
 - 如果当前 active Session 阻止重新配置，应先说明需要停止或切换哪些 Session
   及影响，再获得用户授权。
 - 将最终确认值写入本次测试报告，并用实际 AgentRun/session 事实核对。
 
 未获得确认是阻塞条件，不是失败用例。确定性的本地单元测试可以独立运行，
 但不能借此声称真实 Agent 端到端测试已完成。
+
+### 2.4 配置先行，Session 按需创建
+
+用户确认的是本次测试的运行控制面，不是交给 Leader 临场复述的业务上下文。
+启动任何真实 Agent 前，测试驱动器必须先把 Operator、Leader 和计划使用的
+Task Role 的 Agent/model/effort、权限及必要 adapter 配置持久化，并读取回来
+核对。不得只把这些值写进 Operator 或 Leader 消息，再依赖 Agent 在创建 Role
+时重新拼接命令。
+
+配置预置不等于提前启动 Worker Session：
+
+- 全局 Operator、Leader 以及已知的 Worker Role 模板在测试前完成配置；
+- Task 创建时复制已确认的 Leader binding；
+- Leader 运行中仍负责选择 Direct、native subagent 或 Task Role，选择
+  provider-neutral Profile，并创建 WorkItem；
+- Task Role 可以在 Task 运行中按需实例化，但必须从已确认的同名全局 Role
+  复制完整 Agent binding；不得仅指定 adapter/Agent 后把 model/effort 留给
+  CLI default；
+- native Session 只在实际 enter/dispatch 时创建。预配置 dormant Role 不得
+  启动 provider Session 或消耗调用预算。
+
+完整 E2E 只从同名全局 Role 复制完整 binding，创建时不使用会绕过模板的
+Agent override。若场景需要计划外的新 Role，使用语义最接近的已配置模板；确实
+需要不同 runtime binding 时，停止该路径，由测试驱动器在 Role dormant 时补齐
+配置并重新回读，不能让 Leader 从自然语言或历史 transcript 重建。
+
+测试驱动器必须在 dispatch 前执行只读核对：
+
+```sh
+yui task role show <task-id> <role>
+yui task role status <task-id> <role>
+```
+
+实际 active binding 必须与用户确认完全一致。只有用户明确选择 `CLI default`
+时，空 model/effort 才是合法值。发现缺失、不可用或不一致时，必须在 native
+Session 启动前快速失败；不得静默回退、先启动再修配置，或把错误配置的 Run
+计入覆盖结果。若 Run 已意外启动，应停止该测试路径、记录实际 AgentRun 和影响，
+不得继续产生调用。
+
+Controller 为 managed Agent 提供当前 Yui CLI 的私有 PATH 入口。首次真实
+Agent 启动后应记录 `command -v yui` 和 `YUI_HOME`；若没有指向本次测试的
+Controller/YUI_HOME，立即停止该路径，不用全局 `make link` 修补。
+
+运行配置与业务上下文是两条独立契约：
+
+- native subagent 通过 provider 的 child 机制继承 Leader 当前 Agent、
+  credentials 和可用 conversation context；
+- Task Role AgentRun 是独立 Session，无论 Role 在测试前还是运行中创建，都
+  不继承 Leader transcript。它必须从 Task Brief、WorkItem、Decision、
+  Project Knowledge 和 dispatch brief 读取最新权威上下文；
+- 因此，提前配置 Task Role 不会丢失 Task 上下文；如果一项工作必须依赖 Leader
+  当前对话的隐式上下文，应选择 native subagent，而不是独立 Task Role。
+
+### 2.5 构造完整运行配置
+
+完整 E2E 的主路径应在无 active Session 的阶段一次性构造所有已知 binding。
+如果用户已经明确授权“放开权限”，Operator、Leader 和计划使用的 Task Role
+模板统一保存 `yolo=true`。这表示测试期间不出现 workspace trust、工具审批或
+权限确认页面；它不改变 Profile 和 WorkItem 的职责边界。
+
+下面是配置形态示例。`<model>` 和 `<effort>` 必须替换为本次 capability
+探测后用户确认的精确值，不能照抄历史测试：
+
+```sh
+yui role update operator \
+  --agent <operator-agent> --model <operator-model> \
+  --effort <operator-effort> --yolo true
+yui role bind operator <operator-agent>
+
+yui role update leader \
+  --agent <worker-agent> --model <worker-model> \
+  --effort <worker-effort> --yolo true
+yui role bind leader <worker-agent>
+
+yui role add worker \
+  --agent <worker-agent> --model <worker-model> \
+  --effort <worker-effort> --yolo true
+yui role add explorer \
+  --agent <worker-agent> --model <worker-model> \
+  --effort <worker-effort> --yolo true
+yui role add implementer \
+  --agent <worker-agent> --model <worker-model> \
+  --effort <worker-effort> --yolo true
+yui role add reviewer \
+  --agent <worker-agent> --model <worker-model> \
+  --effort <worker-effort> --yolo true
+```
+
+只需创建本次场景会用到的 Worker 模板；上面列出四个内置 Profile 是完整运行
+的推荐集合。Task 内创建同名 Role 时，必须同时应用 Profile 且不传
+`--agent`，从而复制预先确认的完整 binding：
+
+```sh
+yui task role add <task-id> implementer --profile implementer
+yui task role show <task-id> implementer
+```
+
+启动第一个 Session 前，回读并保存下面的结构化结果：
+
+```sh
+yui --json role show operator
+yui --json role show leader
+yui --json role show worker
+yui --json role show explorer
+yui --json role show implementer
+yui --json role show reviewer
+```
+
+门禁要求：
+
+- active Agent、model、effort、`yolo=true` 必须与确认清单一致；
+- Codex YOLO 的实际启动参数必须是
+  `--dangerously-bypass-approvals-and-sandbox`；
+- Claude YOLO 的实际启动参数必须是
+  `--dangerously-skip-permissions`；
+- YOLO 开启时，即使 binding 仍保留普通 permission 字段，实际启动不得再
+  传递冲突的 `--sandbox`、`--ask-for-approval` 或 `--permission-mode`；
+- 任一模板缺失或不一致时停止，不得先启动 Session 再补配置。
+
+权限边界负向测试不要混入这个无提示主路径。需要验证 read-only sandbox、
+Claude plan mode 或审批页面时，使用另一个隔离 `YUI_HOME`，清除对应 Role 的
+YOLO 后单独执行，并在报告中标记为 permission-boundary run。
 
 ## 3. 当前产品边界
 
@@ -100,6 +233,12 @@ yui profile list
 `WorkerProfile` 是 provider-neutral 行为模板。`TaskRole` 是 Task 内可变的
 Worker 实例，可以绑定多个 Agent；每个绑定保留自己的 model、effort、权限和
 Session 配置。Profile 不选择 provider，也不保存凭据。
+
+Leader 根据工作语义选择 Profile：只读调查和评审使用 read-only Profile，
+修改代码或外部状态使用 `implementer`。这依赖 Leader 判断，不为 WorkItem
+增加新的权限状态。未开启 YOLO 且配置了只读 provider 权限时，原生权限是最后
+安全网；完整 E2E 的无提示 YOLO 主路径则直接验证 Agent 即使具备底层写能力，
+仍然遵守只读 Profile 和 WorkItem 边界。
 
 Task Role Worker yield 只提交结果，不能完成 WorkItem。代码结果必须经过：
 
@@ -171,6 +310,56 @@ yui --json jobs list
 ```
 
 native transcript 是输入和沟通证据，不是 Task 状态 authority。
+
+### 4.3 数据落点与保留
+
+每次运行必须先选择一个绝对的 `E2E_RUN_ROOT` 并写入报告。推荐使用当前
+checkout 已忽略的 `output/e2e-runs/<run-id>`；如果测试环境不允许写入
+checkout，则使用用户指定的外部绝对目录。目录布局统一为：
+
+```text
+<E2E_RUN_ROOT>/
+  yui-home/
+  projects/
+  workspace/
+  evidence/
+```
+
+其中 `YUI_HOME=<E2E_RUN_ROOT>/yui-home`，Yui 的
+`config.defaultWorkspace=<E2E_RUN_ROOT>/workspace`。`projects/` 保存本次
+fixture 的稳定 Git checkout；它不能位于 `workspace/worktree/` 中。
+
+数据分别落在：
+
+| 数据 | 位置与含义 |
+|---|---|
+| Yui 权威状态 | `<E2E_RUN_ROOT>/yui-home/state.json`；包含配置、Project、Profile、Role、Task、WorkItem、AgentRun、Session 指针、mailbox、Decision、Milestone、InputRequest、ChangeSet 和 integration 记录 |
+| 存储版本 | `<E2E_RUN_ROOT>/yui-home/schema.json` |
+| Controller 临时文件 | `<E2E_RUN_ROOT>/yui-home/runtime/`，包括 discovery/socket、managed `yui` launcher、Session context 和 runtime inbox；它们不是测试结论 authority |
+| integration 完整日志 | `<E2E_RUN_ROOT>/yui-home/artifacts/integration-checks/<task-id>/<integration-id>/` |
+| fixture checkout | `<E2E_RUN_ROOT>/projects/<project>/` |
+| Task 主 worktree | `<E2E_RUN_ROOT>/workspace/worktree/<project>/<task-id>/main` |
+| isolated WorkItem worktree | `<E2E_RUN_ROOT>/workspace/worktree/<project>/<task-id>/<work-item-id>` |
+| integration candidate | `<E2E_RUN_ROOT>/workspace/worktree/<project>/<task-id>/integrations/<integration-id>` |
+| 测试报告和 JSON/Git 快照 | `<E2E_RUN_ROOT>/evidence/`；这是测试驱动器产物，不是 Yui source of truth |
+
+Codex/Claude 的完整 transcript 仍由各自原生 CLI 保存到当前 provider data
+home，不进入 `YUI_HOME`。Yui 只在 `state.json` 保存必要的 native Session
+指针和紧凑结果。报告必须记录实际 `CODEX_HOME` 以及可观察到的 Claude
+data/config home；不得复制凭据或完整 transcript 到 `evidence/`。删除
+`E2E_RUN_ROOT` 也不会删除 provider 原生会话历史。
+
+tmux socket 等进程资源位于系统临时目录，只是运行态资源，不作为结果保存。
+测试失败或出现 dirty/conflict workspace 时保留整个 `E2E_RUN_ROOT`。测试通过
+后也至少保留到报告完成；需要清理时先使用 Yui 支持的 cleanup/archive 和
+Controller stop，再按用户确认删除该 run root。不要删除 provider 原生数据。
+
+正常完整运行执行 integration cleanup、WorkItem cleanup 和 Task archive 后，
+clean managed worktree、integration candidate 及其完整检查日志会被 Yui 删除；
+`state.json` 中的 Task/WorkItem/Run/integration 历史、fixture checkout、
+`evidence/` 报告以及 provider 原生会话历史仍保留。若还要删除这些测试数据，
+删除目标应当是报告中记录的单个 `E2E_RUN_ROOT`，而不是活动的 `~/.yui` 或
+共享 workspace。
 
 ## 5. 路由动作词汇
 
@@ -383,6 +572,8 @@ Q01-Q08 需要在其他会话改变 Task 状态后，通过 `RESUME`/`STALE` 再
 - Profile 复制到 Role，但不绑定 Agent；
 - Role 绑定运行前用户确认的 Agent/model/effort；
 - AgentRun 快照与实际 dispatch 配置一致；
+- 无提示主路径的 Role 均使用用户确认的 YOLO，且不出现 trust/approval 页面；
+- read-only Profile 即使在 YOLO 下也不修改文件或外部状态；
 - isolate、yield、review、capture、integration、accept、cleanup 顺序成立。
 
 额外覆盖：
@@ -454,7 +645,13 @@ Q01-Q08 需要在其他会话改变 Task 状态后，通过 `RESUME`/`STALE` 再
 
 ```text
 Run:
+E2E_RUN_ROOT:
+YUI_HOME:
+Configured workspace:
+Provider data homes:
 User-confirmed Agent/model configuration:
+Persisted Role configuration snapshot:
+Pre-dispatch Role configuration check:
 Environment and fixture commits:
 Observed Task counts and Task IDs:
 Case:
@@ -504,7 +701,13 @@ Issue:
 - 每个 WorkItem 有 bounded objective 和可观察 acceptance；
 - 执行路径符合任务约束；
 - 实际 Agent/model 与用户确认及 AgentRun 记录一致；
+- 无提示主路径的权限确认或 workspace trust 阻塞：0；
+- YOLO 主路径中 read-only Profile 产生的文件或外部状态修改：0；
+- 未经 pre-dispatch 配置核对而启动的 Task Role Run：0；
+- 用户未选择 `CLI default` 时，空 model/effort 的 Task Role Run：0；
+- Leader 临场复述或从 transcript 猜测运行配置的次数：0；
 - native subagent 无伪造 Yui Session/Run；
+- native subagent 与 Task Role 的上下文来源符合各自契约；
 - Worker yield 被描述为 awaiting Leader review，而不是完成；
 - reject/redispatch 保留每一轮结果和证据；
 - 最新 isolated result 未集成时 accept 次数：0。
@@ -515,6 +718,7 @@ Issue:
 - 跨 Project context 污染：0；
 - Task context 足以在不依赖 transcript 的情况下恢复；
 - stable Project checkout 未被直接修改；
+- stable checkout 落后不会触发 Task reopen、二次 integration 或 Leader wake；
 - integration check 失败、冲突或 target movement 不推进目标；
 - dirty/conflict workspace 未经明确处理不会被删除；
 - Task completed 时没有 active Run、未解决 InputRequest 或未验收 WorkItem。
@@ -526,16 +730,20 @@ lifecycle、clarification、execution path、持久事实和 forbidden mutation�
 
 ### 13.1 单次发布前
 
-1. 探测 Agent 能力；
-2. 向用户确认本次 Agent/model/effort、兼容范围和预算；
-3. 初始化隔离环境和 fixture；
-4. 运行 build、lint 和确定性自动化测试；
-5. 运行 Project/Task 原子路由；
-6. 运行跨会话交错故事线；
-7. 运行三种 Leader 执行路径；
-8. 运行长期黄金任务和故障注入；
-9. 运行用户确认的额外 adapter 冒烟；
-10. 汇总证据、问题和残余风险。
+1. 选择并记录 `E2E_RUN_ROOT`；
+2. 初始化隔离 `YUI_HOME`、外部 workspace 和 fixture，但不启动 Agent Session；
+3. 在隔离 `YUI_HOME` 中完成 setup 并探测 Agent 能力；
+4. 向用户确认本次 Agent/model/effort、权限/YOLO、兼容范围和预算；
+5. 持久化并回读 Operator、Leader 和计划使用的全局 Worker Role 模板；
+6. 运行 build、lint 和确定性自动化测试；
+7. 启动第一个 Session，核对 `command -v yui`、`YUI_HOME` 和实际启动参数；
+8. 在每次 Task Role dispatch 前核对 active binding，失败则停止该路径；
+9. 运行 Project/Task 原子路由；
+10. 运行跨会话交错故事线；
+11. 运行三种 Leader 执行路径；
+12. 运行长期黄金任务和故障注入；
+13. 运行用户确认的额外 adapter 冒烟；
+14. 汇总证据、数据路径、问题和残余风险。
 
 ### 13.2 推荐重复次数
 

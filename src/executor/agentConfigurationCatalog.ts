@@ -214,6 +214,7 @@ export function fallbackAgentConfigurationCatalog(
         models: [],
         fields: [
           ...common,
+          field("yolo", [choice("true")], false),
           field("permission.sandbox", [
             "read-only", "workspace-write", "danger-full-access"
           ].map(choice), false),
@@ -233,6 +234,7 @@ export function fallbackAgentConfigurationCatalog(
         models: [],
         fields: [
           ...common,
+          field("yolo", [choice("true")], false),
           field("permission.mode", [
             "acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"
           ].map(choice), true),

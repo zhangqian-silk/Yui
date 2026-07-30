@@ -62,6 +62,13 @@ to the same Task rather than silently rewriting history. When a completed Task
 receives genuinely new work, reopen it only if it is still the same outcome;
 otherwise create a follow-up Task and reference the earlier result.
 
+A Project's stable checkout is read-only reference state and may lag a
+completed Task's result branch. That lag is not unfinished work and must not
+trigger `task reopen`, a second Integration, or a Leader wake. Reopen only when
+the user explicitly asks to continue or correct the same outcome. If the user
+only wants an existing result published or synchronized elsewhere, explain the
+delivery action and perform it separately without reopening execution.
+
 ## Projects
 
 Resolve repository work through the Project catalog:
@@ -101,6 +108,9 @@ before routing:
 ```sh
 yui profile list
 yui profile show <profile>
+yui role list
+yui role show leader
+yui role show <global-worker-template>
 yui task role list <task-id>
 yui task work list <task-id>
 yui task integration list <task-id>
@@ -108,7 +118,17 @@ yui task integration list <task-id>
 
 A Profile never selects the provider. Preserve multiple Role Agent bindings
 and each binding's model and permission settings unless the user requests a
-change. Put the provider constraint in the Task message for the Leader.
+change. Record the provider constraint in the Task message so the Leader knows
+the requirement, but do not treat that message as the runtime binding.
+
+Treat Agent/model/effort and permission settings as launch configuration, not
+Task prose. When the user explicitly authorizes a binding change, update only a
+dormant Role, persist the complete binding, and read it back before that Role
+enters or dispatches a Session. YOLO may be enabled only by explicit user
+authorization; it removes provider prompts but does not expand Operator,
+Leader, or Worker responsibilities. If a live Session prevents the change,
+report the affected Session and stop rather than partially updating the
+configuration or telling the Leader to reconstruct it.
 
 Provider transcripts remain native to the Agent. Yui stores durable Task
 context, WorkItems, AgentRuns, compact results, and Git integration evidence.
