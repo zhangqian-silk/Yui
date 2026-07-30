@@ -24,6 +24,8 @@ function fixtureStore() {
       description: "Make task state visible without replacing the CLI.",
       priority: "high",
       tags: ["web", "release"],
+      projectId: "project-1",
+      baseRef: "master",
       status: "active",
       createdAt: "2026-07-22T08:00:00.000Z",
       updatedAt: "2026-07-23T07:30:00.000Z"
@@ -44,6 +46,20 @@ function fixtureStore() {
     transaction(execute) { return execute(this); },
     listTasks() { return structuredClone(tasks); },
     getTask(id) { return structuredClone(tasks.find((task) => task.id === id) ?? null); },
+    listProjects() {
+      return [{
+        schemaVersion: 2,
+        id: "project-1",
+        name: "Yui Web",
+        aliases: [],
+        path: "/repos/yui",
+        stableBranch: "master",
+        developmentBranch: "develop",
+        knowledge: [],
+        createdAt: "2026-07-01T08:00:00.000Z",
+        updatedAt: "2026-07-01T08:00:00.000Z"
+      }];
+    },
     getTaskBrief(taskId) {
       return taskId === "task-1" ? {
         schemaVersion: 1,
@@ -206,12 +222,14 @@ test("dashboard API summarizes tasks and exposes one consolidated task detail", 
     assert.equal(dashboard.generatedAt, now.toISOString());
     assert.deepEqual(dashboard.counts, { total: 2, draft: 0, active: 1, completed: 1, archived: 0, openInputs: 1 });
     assert.equal(dashboard.tasks[0].id, "task-1");
+    assert.equal(dashboard.tasks[0].projectName, "Yui Web");
     assert.deepEqual(dashboard.tasks[0].workItems, { total: 2, pending: 1, running: 1, completed: 0, failed: 0 });
 
     const detailResponse = await fetch(`${origin}/api/tasks/task-1`);
     assert.equal(detailResponse.status, 200);
     const detail = await detailResponse.json();
     assert.equal(detail.task.title, "Ship web dashboard");
+    assert.equal(detail.task.projectName, "Yui Web");
     assert.equal(detail.brief.objective, "Deliver the web dashboard.");
     assert.equal(detail.roles[0].status, "running");
     assert.equal(detail.openInputs[0].question, "Choose a port");
@@ -421,7 +439,7 @@ test("web shell composes modular i18n, theme, layout, and client assets", async 
     assert.match(shell, /id="locale-select"/);
     assert.match(shell, /id="theme-select"/);
     assert.match(shell, /id="operator-terminal"/);
-    assert.match(shell, /id="terminal-dialog"/);
+    assert.match(shell, /id="terminal-panel"/);
     assert.match(shell, /name="yui-web-token" content="[^"]+"/);
     assert.doesNotMatch(shell, /__YUI_WEB_TOKEN__/);
     assert.match(shell, /data-i18n="page\.title"/);

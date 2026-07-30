@@ -28,7 +28,7 @@ const elements = {
   inputs: document.querySelector("#metric-inputs"),
   completed: document.querySelector("#metric-completed"),
   total: document.querySelector("#metric-total"),
-  terminalDialog: document.querySelector("#terminal-dialog"),
+  terminalPanel: document.querySelector("#terminal-panel"),
   terminalHost: document.querySelector("#terminal-host"),
   terminalTitle: document.querySelector("#terminal-title"),
   terminalState: document.querySelector("#terminal-state span"),
@@ -235,6 +235,23 @@ function setTerminalState(key) {
   elements.terminalState.textContent = i18n.t(key);
 }
 
+function terminalPanelOpen() {
+  return !elements.terminalPanel.hidden;
+}
+
+function openTerminalPanel() {
+  elements.terminalPanel.hidden = false;
+  elements.terminalPanel.setAttribute("aria-hidden", "false");
+  document.body.classList.add("terminal-active");
+}
+
+function closeTerminalPanel() {
+  disposeTerminal();
+  document.body.classList.remove("terminal-active");
+  elements.terminalPanel.setAttribute("aria-hidden", "true");
+  elements.terminalPanel.hidden = true;
+}
+
 function disposeTerminal() {
   if (!terminalSession) return;
   const current = terminalSession;
@@ -252,7 +269,7 @@ function openTerminal(target) {
     ? target.taskId + " / " + target.roleName
     : target.roleName;
   setTerminalState("terminal.connecting");
-  if (!elements.terminalDialog.open) elements.terminalDialog.showModal();
+  openTerminalPanel();
 
   const terminal = new Terminal({
     cursorBlink: true,
@@ -341,20 +358,21 @@ elements.operatorTerminal.addEventListener("click", function () {
   openTerminal({ scope: "global", roleName: "operator" });
 });
 elements.detailBack.addEventListener("click", clearSelection);
-elements.terminalClose.addEventListener("click", function () {
-  elements.terminalDialog.close();
-});
-elements.terminalDialog.addEventListener("close", disposeTerminal);
+elements.terminalClose.addEventListener("click", closeTerminalPanel);
 document.addEventListener("keydown", function (event) {
   const active = document.activeElement;
   const typing = active && ["INPUT", "SELECT", "TEXTAREA"].includes(active.tagName);
-  if (event.key === "Escape" && state.selected && !elements.terminalDialog.open) {
+  if (event.key === "Escape" && terminalPanelOpen()) {
+    closeTerminalPanel();
+    return;
+  }
+  if (event.key === "Escape" && state.selected) {
     clearSelection();
     return;
   }
   if (event.key.toLowerCase() === "r"
     && !event.metaKey && !event.ctrlKey && !event.altKey
-    && !typing && !elements.terminalDialog.open) {
+    && !typing && !terminalPanelOpen()) {
     refreshDashboard();
   }
 });

@@ -73,17 +73,17 @@ export const DASHBOARD_HTML = `<!doctype html>
       </section>
       <main id="detail" class="detail" aria-labelledby="detail-title"></main>
     </div>
+    <aside id="terminal-panel" class="terminal-panel" aria-labelledby="terminal-title" aria-hidden="true" hidden>
+      <header class="terminal-head">
+        <div>
+          <span id="terminal-state" class="live"><i aria-hidden="true"></i><span data-i18n="terminal.connecting">Connecting</span></span>
+          <h2 id="terminal-title">Operator</h2>
+        </div>
+        <button id="terminal-close" class="detail-back terminal-close" type="button" aria-label="Close terminal" data-i18n-aria-label="terminal.close">×</button>
+      </header>
+      <div id="terminal-host" class="terminal-host"></div>
+    </aside>
   </div>
-  <dialog id="terminal-dialog" class="terminal-dialog" aria-labelledby="terminal-title">
-    <header class="terminal-head">
-      <div>
-        <span id="terminal-state" class="live"><i aria-hidden="true"></i><span data-i18n="terminal.connecting">Connecting</span></span>
-        <h2 id="terminal-title">Operator</h2>
-      </div>
-      <button id="terminal-close" class="detail-back terminal-close" type="button" aria-label="Close terminal" data-i18n-aria-label="terminal.close">×</button>
-    </header>
-    <div id="terminal-host" class="terminal-host"></div>
-  </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script type="module" src="/assets/app.js"></script>
 </body>
