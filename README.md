@@ -2,7 +2,7 @@
 
 # Yui
 
-Yui is a local control plane for durable Codex and Claude work. It keeps control state and Project knowledge in inspectable JSON, lets tmux own native Agent terminals, and combines reusable Agent Profiles, Leader-context forks, explicit acceptance, and isolated Git worktrees for Project-backed Tasks.
+Yui is a local control plane for durable Codex and Claude work. It keeps control state and Project knowledge in inspectable JSON, lets tmux own native Agent terminals, and combines reusable Worker Profiles, Leader-owned delegation, explicit acceptance, and isolated Git worktrees for Project-backed Tasks.
 
 The current implementation restores the useful Role/Agent/session and CLI framework without restoring the later data-maintenance, lease, schedule, and recovery-ledger systems.
 
@@ -23,7 +23,7 @@ yui doctor
 
 `setup` is interactive. It detects installed Agent CLIs, asks which Agents to configure, selects the default and Operator Agent, probes each selected CLI for its current models, then selects model followed by that model's supported reasoning efforts for the Leader and Operator Roles. It also confirms the Project workspace outside Yui home and offers shell-completion setup. The picker includes the native CLI default and a custom-value option. Running setup again preserves existing Tasks, Roles, and the installation's Project workspace while allowing safe configuration changes.
 
-Model and effort are Role settings, so Leader and Operator can use different values even when both use the same Agent CLI. The same runtime picker is used by interactive Role and Agent Profile add/update flows. Explicit `--model` and `--effort` values remain scriptable custom overrides.
+Model and effort are per-Agent Role settings, so Leader and Operator can use different values even when both use the same Agent CLI. Interactive Role flows validate those settings against the selected Agent runtime. Worker Profile model and effort fields are provider-neutral child-execution hints and therefore remain explicit, scriptable values rather than Agent capability selections.
 
 Runtime catalogs are refreshed per command and cached under Yui home. If a live probe times out or fails, Yui shows the last cache for the same Agent launch context and clearly marks it as potentially stale; without a matching cache, it offers CLI defaults and custom values. `yui agent capabilities <id>` exposes the same one-pass catalog, including models, model-specific efforts, and other runtime choices such as permissions, search availability, profiles, settings sources, and service tiers.
 
@@ -45,13 +45,13 @@ yui setup
 
 The home contains `schema.json`, the authoritative `state.json`, Project Catalog and knowledge, and Controller discovery files. Stable Project checkouts and managed worktrees live under the configured workspace, outside Yui home. The current storage version is exact and fresh-only; this release does not migrate older formats.
 
-Setup also seeds four reusable Agent Profiles:
+Setup also seeds four reusable Worker Profiles:
 
 ```text
 worker  explorer  implementer  reviewer
 ```
 
-Profiles are versioned Worker execution templates backed by one configured Codex Agent. They hold defaults and instructions, but do not own a Session or workspace. Operator and Leader remain runtime Roles.
+Profiles are versioned, provider-neutral Worker behavior templates. They hold portable prompt instructions, Skills, access expectations, and optional model and effort hints, but do not bind an Agent or own a Session or workspace. A Task Role is the Task-bound Worker instance: applying a Profile copies its portable behavior into that mutable instance, while each Agent binding keeps its own runtime configuration.
 
 ## Quick start
 
@@ -86,10 +86,21 @@ A Project-backed Task receives its main worktree when it is created at `<workspa
 
 ```sh
 yui task work isolate <work-item-id>
+yui task work capture <work-item-id>
+yui task integration start <task-id> --change-set <change-set-id> --check "<validation command>"
+yui task integration cleanup <integration-id>
 yui task work cleanup <work-item-id> --integrated
 ```
 
-Use `--abandon` instead of `--integrated` only for a deliberate discard. The disposition remains on the WorkItem record. Dirty worktrees are retained.
+`capture` records the current isolated HEAD as an immutable WorkItem ChangeSet.
+Repeat capture at the same HEAD reuses the record; a repaired HEAD produces a
+new candidate. The Leader reviews semantics before capture and accepts only
+after the latest candidate is integrated. Yui refuses integrated cleanup while
+that result remains unintegrated. Use `--abandon` only for deliberate discard.
+Dirty worktrees are retained. Native Agent Sessions may be scoped to their
+launch directory, so Yui retires a stopped Role Session whenever the Role moves
+between Task main and an isolated WorkItem worktree. The next dispatch starts a
+Session in the new workspace while durable Yui records preserve context.
 
 Submit information through Operator:
 
@@ -104,6 +115,11 @@ yui operator enter
 ```
 
 Without `--task`, `operator submit` creates a new Draft. Drafts accept planning changes but must be activated before Agent execution.
+Operator resolves every request against the Project catalog and existing Task
+context. Follow-up requirements, fixes, reviews, and questions for the same
+bounded outcome stay in that Task; a different Project, outcome, base ref, or
+lifecycle creates a separate Task. Features, bugs, and questions use the same
+Task/WorkItem model rather than separate workflow types.
 `operator list` shows recent conversations in fixed most-recently-updated order using
 their Agent and readable title or preview; native provider session IDs remain
 internal. Until an adapter supplies that metadata, Yui shows the provider plus
@@ -112,43 +128,67 @@ a stable short Yui reference so untitled conversations remain distinguishable.
 `--last` resumes the newest entry directly. `operator new` starts a clean
 conversation and preserves the previous one in history.
 
-Add a Worker and dispatch a WorkItem:
+Add a Task-bound Worker instance, attach Claude configuration, select it, and
+dispatch a WorkItem:
 
 ```sh
-yui task role add <task-id> implementer --agent codex
+yui task role add <task-id> implementer --profile implementer --agent codex
+yui task role update <task-id> implementer \
+  --agent claude --model claude-opus --permission-mode acceptEdits
+yui task role bind <task-id> implementer claude
 yui task role list <task-id>
 
 yui task work create <task-id> "Implement the exporter" --role implementer
 yui task work dispatch <work-item-id> --input "Implement and run focused tests"
 ```
 
-The Worker completes its current Run explicitly:
+The Worker delivers its current Run explicitly:
 
 ```sh
 yui task run yield <run-id> --summary "Implemented the exporter; focused tests pass"
 ```
 
-Yield atomically completes the Run and WorkItem, appends the result message, and queues the Leader. A Leader never wakes itself; any already-pending Operator or Worker wake remains durable until the Leader is idle.
+Yield completes the AgentRun, submits the WorkItem for Leader review, appends
+the result message, and queues the Leader. It does not accept the WorkItem. A
+Leader never wakes itself; any pending Operator or Worker wake remains durable
+until the Leader is idle.
 
-For bounded work that does not need a persistent, user-owned Session, the Leader can dispatch an Execution Attempt:
+For bounded work, the Leader owns a roleless WorkItem and may execute it
+directly or create a native subagent through the current Agent conversation:
 
 ```sh
 yui task work create <task-id> "Review the implementation" \
   --objective "Return source-backed findings" \
   --accept "Every finding identifies an affected path"
-yui task attempt dispatch <work-item-id> --profile reviewer --mode auto --access read
-
-yui task work create <task-id> "Implement the accepted change" \
-  --objective "Implement and validate the requested behavior" \
-  --accept "Focused tests pass"
-yui task attempt dispatch <work-item-id> --profile implementer --mode auto --access write
+yui task work update <work-item-id> running
+yui profile show reviewer
 ```
 
-`auto` forks the active Leader thread and fails fast when no compatible Leader thread is available; it never silently creates a root Session. Explicit root Session execution requires both `--mode session` and `--session-reason`.
+Subagent creation and result delivery happen inside the Leader's native Agent
+runtime; there is no Yui subagent launch command and Yui does not manage the
+child Session. The Leader must select and read an explicit Worker Profile,
+using `worker` when no specialist fits, and include its revision, instructions,
+Skills, access expectations, validation, and supported model/effort hints in
+the child brief. Agent bindings on Task Roles are ignored: the child inherits
+the Leader Agent, credentials, and conversation context. The Leader reviews the
+returned result and records the actual execution facts:
 
-Attempt dispatch passes stable Yui record references instead of copying the current Brief, decisions, and messages into another snapshot. Workers can read current context through `yui task context` and Project Knowledge commands using the managed `YUI_HOME`, while their Task Role identity remains unset.
+```sh
+yui task work update <work-item-id> done \
+  --summary "executor=subagent; profile=reviewer@3; model=inherited; round=1; result=reviewed; checks=npm test passed"
+```
 
-Write Attempts use separate worktrees under `<workspace>/worktree/<project>/<task-id>/attempts/<attempt-id>`, so independent work may proceed concurrently even when paths overlap. A successful write emits a ChangeSet. Integration applies it in a candidate worktree, runs the requested checks, and advances the target only if its recorded head still matches:
+Use `inherited` or `unknown` when the native runtime does not expose an actual
+model or effort; do not guess. The three supported paths remain deliberately
+small: Leader direct execution, a conversation-native subagent, or a Task Role
+AgentRun when work needs its own provider, credentials, interaction, or durable
+Session.
+
+For an isolated Task Role result, the Leader first reviews the yielded result.
+An insufficient result is rejected with feedback and redispatched in the same
+workspace. An acceptable result is captured and integrated in a candidate
+worktree. Checks run there, and the target advances only if its recorded HEAD
+still matches:
 
 ```sh
 yui task integration start <task-id> \
@@ -167,13 +207,21 @@ yui task integration resolve <integration-id> \
 yui task integration continue <integration-id>
 ```
 
-Attempt success is not WorkItem completion. The Leader accepts only after reviewing the result, validations, and any ChangeSet integration:
+Worker yield is not WorkItem completion. The Leader accepts only after reviewing
+the result, validations, and the latest ChangeSet integration:
 
 ```sh
 yui task work accept <work-item-id> --summary "Acceptance criteria met."
 ```
 
-Use `task work reject` to return an awaiting result for retry and `task work cancel` for obsolete non-running work. Attempt and Integration worktrees and Integration check logs remain available as evidence until explicit cleanup.
+Use `task work reject` to return an awaiting result for repair and redispatch,
+and `task work cancel` for obsolete non-running work. WorkItem and Integration
+worktrees and check logs remain available as evidence until explicit cleanup.
+
+For long-running Tasks, the Leader keeps Yui—not a native transcript—as the
+recovery authority. It updates Brief focus and Leader summary before every
+yield, records material choices as Decisions, adds phase outcomes as
+Milestones, and promotes only cross-Task stable facts to Project Knowledge.
 
 When an active Leader Run cannot continue without a user decision, it can create a durable InputRequest and yield its Run:
 
@@ -241,7 +289,7 @@ yui task enter <task-id> [role]
 yui task role enter <task-id> <role>
 ```
 
-Each Role can bind multiple configured Agents, has one active Agent, and keeps
+Each Role, including a Task-bound Worker instance, can bind multiple configured Agents, has one active Agent, and keeps
 a separate native session per Agent binding. Operator narrows this to at most
 one Agent per adapter—for example, one Codex and one Claude—so its bindings are
 ready-to-switch configurations rather than parallel identities. Operator can

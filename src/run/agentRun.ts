@@ -1,3 +1,5 @@
+import { isAgentAdapterId, type AgentAdapterId } from "../agent/adapterCatalog.js";
+
 export type DispatchMode = "new" | "resume";
 export type AgentRunStatus = "active" | "yielded" | "failed";
 
@@ -9,6 +11,10 @@ export type AgentRun = {
   mode: DispatchMode;
   input: string;
   workItemId?: string;
+  agentId?: string;
+  adapterId?: AgentAdapterId;
+  model?: string;
+  effort?: string;
   status: AgentRunStatus;
   /** Set only after tmux has confirmed the receipt-backed input delivery. */
   deliveredAt?: string;
@@ -25,7 +31,15 @@ export function createAgentRun(
   mode: DispatchMode,
   input: string,
   now: Date,
-  context: { workItemId?: string } = {}
+  context: {
+    workItemId?: string;
+    agent?: Readonly<{
+      agentId: string;
+      adapterId: AgentAdapterId;
+      model?: string;
+      effort?: string;
+    }>;
+  } = {}
 ): AgentRun {
   if (mode !== "new" && mode !== "resume") {
     throw new Error(`Agent run dispatch mode is invalid: ${mode}.`);
@@ -41,6 +55,18 @@ export function createAgentRun(
     ...(context.workItemId === undefined
       ? {}
       : { workItemId: requireSafeIdentity(context.workItemId, "Work item id") }),
+    ...(context.agent === undefined
+      ? {}
+      : {
+          agentId: requireSafeIdentity(context.agent.agentId, "Agent id"),
+          adapterId: requireAdapterId(context.agent.adapterId),
+          ...(context.agent.model === undefined
+            ? {}
+            : { model: requireText(context.agent.model, "Agent model") }),
+          ...(context.agent.effort === undefined
+            ? {}
+            : { effort: requireText(context.agent.effort, "Agent effort") })
+        }),
     status: "active",
     createdAt: timestamp,
     updatedAt: timestamp
@@ -70,6 +96,16 @@ export function validateAgentRun(run: AgentRun): AgentRun {
   }
   requireText(run.input, "Agent run input");
   if (run.workItemId !== undefined) requireSafeIdentity(run.workItemId, "Work item id");
+  if ((run.agentId === undefined) !== (run.adapterId === undefined)) {
+    throw new Error("Agent run snapshot requires both agentId and adapterId.");
+  }
+  if (run.agentId !== undefined) requireSafeIdentity(run.agentId, "Agent id");
+  if (run.adapterId !== undefined) requireAdapterId(run.adapterId);
+  if (run.model !== undefined) requireText(run.model, "Agent model");
+  if (run.effort !== undefined) requireText(run.effort, "Agent effort");
+  if ((run.model !== undefined || run.effort !== undefined) && run.agentId === undefined) {
+    throw new Error("Agent run model and effort require an Agent snapshot.");
+  }
   if (!( ["active", "yielded", "failed"] as const).includes(run.status)) {
     throw new Error(`Agent run status is invalid: ${String(run.status)}.`);
   }
@@ -121,6 +157,11 @@ function requireSafeIdentity(value: string, label: string): string {
     throw new Error(`${label} is invalid.`);
   }
   return normalized;
+}
+
+function requireAdapterId(value: string): AgentAdapterId {
+  if (!isAgentAdapterId(value)) throw new Error(`Agent adapter is unsupported: ${value}.`);
+  return value;
 }
 
 function requireText(value: string, label: string): string {

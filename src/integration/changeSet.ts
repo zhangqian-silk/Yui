@@ -5,11 +5,9 @@ import {
   requireTimestamp
 } from "../domain/validation.js";
 
-export type ChangeSet = Readonly<{
-  schemaVersion: 1;
+type ChangeSetIdentity = Readonly<{
   id: string;
   taskId: string;
-  attemptId: string;
   projectId: string;
   baseCommit: string;
   headCommit: string;
@@ -18,22 +16,34 @@ export type ChangeSet = Readonly<{
   createdAt: string;
 }>;
 
-export type CreateChangeSetInput = Readonly<Omit<ChangeSet, "schemaVersion" | "createdAt">>;
+export type WorkItemChangeSet = ChangeSetIdentity & Readonly<{
+  schemaVersion: 2;
+  workItemId: string;
+}>;
 
-export function createChangeSet(input: CreateChangeSetInput, now: Date): ChangeSet {
+export type ChangeSet = WorkItemChangeSet;
+
+export type CreateWorkItemChangeSetInput = Readonly<
+  Omit<WorkItemChangeSet, "schemaVersion" | "createdAt">
+>;
+
+export function createWorkItemChangeSet(
+  input: CreateWorkItemChangeSetInput,
+  now: Date
+): WorkItemChangeSet {
   return validateChangeSet({
-    schemaVersion: 1,
+    schemaVersion: 2,
     ...input,
     changedPaths: [...input.changedPaths],
     createdAt: now.toISOString()
   });
 }
 
-export function validateChangeSet(changeSet: ChangeSet): ChangeSet {
-  if (changeSet.schemaVersion !== 1) throw new Error("ChangeSet must use schemaVersion 1.");
+export function validateChangeSet<T extends ChangeSet>(changeSet: T): T {
+  if (changeSet.schemaVersion !== 2) throw new Error("ChangeSet must use schemaVersion 2.");
+  requireIdentity(changeSet.workItemId, "Work Item id");
   requireIdentity(changeSet.id, "ChangeSet id");
   requireIdentity(changeSet.taskId, "Task id");
-  requireIdentity(changeSet.attemptId, "Execution Attempt id");
   requireIdentity(changeSet.projectId, "Project id");
   requireCommit(changeSet.baseCommit, "ChangeSet base commit");
   requireCommit(changeSet.headCommit, "ChangeSet head commit");

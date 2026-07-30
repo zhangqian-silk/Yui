@@ -13,6 +13,7 @@ import test from "node:test";
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import {
+  assertFileTaskControllerStorageCompatible,
   ensureFileTaskController,
   FileTaskWorkflowRuntime,
   restartFileTaskController
@@ -23,6 +24,7 @@ import {
   startFileTaskControllerRuntime
 } from "../../dist/controller/runtime.js";
 import { ControllerClientError } from "../../dist/core/controllerClient.js";
+import { FILE_TASK_CONTROLLER_PROTOCOL_VERSION } from "../../dist/core/protocol.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import {
   createGlobalRole,
@@ -39,6 +41,40 @@ import { activateTask, archiveTask, createTask } from "../../dist/task/task.js";
 
 const FIRST = new Date("2026-07-24T00:00:00.000Z");
 const SECOND = new Date("2026-07-24T00:00:01.000Z");
+
+test("storage writes reject a running Controller with an incompatible protocol", async () => {
+  await assert.rejects(
+    assertFileTaskControllerStorageCompatible("/tmp/yui-old-controller", {
+      call: async () => ({ running: true, pid: 42 })
+    }),
+    /Controller protocol is incompatible.*controller restart/i
+  );
+  await assert.doesNotReject(
+    assertFileTaskControllerStorageCompatible("/tmp/yui-current-controller", {
+      call: async () => ({
+        running: true,
+        pid: 43,
+        protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION
+      })
+    })
+  );
+  await assert.doesNotReject(
+    assertFileTaskControllerStorageCompatible("/tmp/yui-no-controller", {
+      call: async () => {
+        throw new ControllerClientError(
+          "CONTROLLER_NOT_RUNNING",
+          "Controller is not running."
+        );
+      }
+    })
+  );
+  await assert.rejects(
+    ensureFileTaskController("/tmp/yui-old-controller", {
+      call: async () => ({ running: true, pid: 42 })
+    }),
+    /Controller protocol is incompatible.*controller restart/i
+  );
+});
 
 function fixture(t, adapterId = "codex") {
   const home = mkdtempSync(join(tmpdir(), "yui-runtime-hardening-"));
@@ -638,7 +674,11 @@ test("Controller startup forwards only operational names and declared Agent envi
     },
     call: async () => {
       if (!running) throw unavailable();
-      return { running: true, pid: 42 };
+      return {
+        running: true,
+        pid: 42,
+        protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION
+      };
     },
     spawnController(_home, environment) {
       spawnedEnvironment = environment;
@@ -812,6 +852,12 @@ test("launch environment keeps native context and excludes other Agents' credent
 
   const fallbackPlan = new FileRoleLaunchPlanner(home, store, {
     environment: {
+      PATH: "",
+      HOME: "",
+      TERM: "",
+      TMPDIR: "",
+      COLORTERM: "",
+      LANG: "",
       CODEX_HOME: join(home, "clean-codex-home"),
       CURRENT_AGENT_SECRET: "current-value"
     }
@@ -830,6 +876,8 @@ test("launch environment keeps native context and excludes other Agents' credent
   assert.equal(fallbackPlan.launch.env.HOME, homedir());
   assert.equal(fallbackPlan.launch.env.TERM, "xterm-256color");
   assert.equal(fallbackPlan.launch.env.TMPDIR, tmpdir());
+  assert.equal(fallbackPlan.launch.env.COLORTERM, undefined);
+  assert.equal(fallbackPlan.launch.env.LANG, undefined);
 });
 
 test("foreground CODEX_HOME is authoritative for native config inspection", (t) => {
@@ -877,14 +925,18 @@ test("Controller restart gives shutdown drain an independent timeout budget", as
       phase = "stopping";
       return { stopped: true };
     }
-    if (phase === "running") return { running: true, pid: 10 };
+    if (phase === "running") {
+      return { running: true, pid: 10, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+    }
     if (phase === "stopping") {
-      if (stoppingPolls++ < 2) return { running: true, pid: 10 };
+      if (stoppingPolls++ < 2) {
+        return { running: true, pid: 10, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+      }
       phase = "stopped";
       throw unavailable();
     }
     if (phase === "stopped") throw unavailable();
-    return { running: true, pid: 20 };
+    return { running: true, pid: 20, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
   };
 
   const result = await restartFileTaskController("/tmp/yui-restart-long-drain", {
@@ -914,17 +966,19 @@ test("Controller restart default shutdown budget exceeds lifecycle request timeo
       phase = "stopping";
       return { stopped: true };
     }
-    if (phase === "running") return { running: true, pid: 10 };
+    if (phase === "running") {
+      return { running: true, pid: 10, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+    }
     if (phase === "stopping") {
       if (stoppingPolls++ === 0) {
         currentTime = 40_000;
-        return { running: true, pid: 10 };
+        return { running: true, pid: 10, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
       }
       phase = "stopped";
       throw unavailable();
     }
     if (phase === "stopped") throw unavailable();
-    return { running: true, pid: 20 };
+    return { running: true, pid: 20, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
   };
 
   const result = await restartFileTaskController("/tmp/yui-restart-default-drain", {

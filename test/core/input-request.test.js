@@ -108,6 +108,12 @@ test("InputRequest domain supports text or choice answers and terminal transitio
   assert.equal(answered.resolution.answeredBy, "operator");
   assert.equal(answered.resolution.answeredAt, SECOND.toISOString());
   assert.throws(() => answerInputRequest(
+    choice,
+    { text: "Use a third path" },
+    "user",
+    SECOND
+  ), /requires a choice/i);
+  assert.throws(() => answerInputRequest(
     answered,
     { choiceKey: "fast" },
     "user",

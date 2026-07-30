@@ -655,15 +655,24 @@ function probeController(discovery) {
       try {
         const response = JSON.parse(buffer.subarray(0, newline).toString("utf8"));
         const result = response?.result;
+        const resultKeys = typeof result === "object" && result !== null
+          ? Reflect.ownKeys(result)
+          : [];
         if (
           typeof response !== "object" || response === null
           || Reflect.ownKeys(response).length !== 3
           || response.id !== requestId
           || response.ok !== true
           || typeof result !== "object" || result === null
-          || Reflect.ownKeys(result).length !== 2
+          || resultKeys.length < 2
+          || resultKeys.length > 3
+          || resultKeys.some((key) => !["pid", "running", "protocolVersion"].includes(key))
           || result.running !== true
           || !Number.isSafeInteger(result.pid) || result.pid <= 0
+          || (
+            Object.hasOwn(result, "protocolVersion")
+            && (!Number.isSafeInteger(result.protocolVersion) || result.protocolVersion <= 0)
+          )
         ) {
           finish({ status: "invalid" });
           return;

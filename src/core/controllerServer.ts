@@ -6,6 +6,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import {
   CONTROLLER_DISCOVERY_PATH,
   CONTROLLER_SOCKET_PATH,
+  FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
   MAX_CONTROLLER_MESSAGE_BYTES,
   ControllerProtocolError,
   controllerFailure,
@@ -210,7 +211,11 @@ async function routeRequest(
     sendResponse(socket, {
       id: request.id,
       ok: true,
-      result: { pid: process.pid, running: true }
+      result: {
+        pid: process.pid,
+        running: true,
+        protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION
+      }
     });
     return;
   }

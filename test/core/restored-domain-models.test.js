@@ -9,7 +9,9 @@ import {
 } from "../../dist/role/role.js";
 import {
   createRoleSessionSet,
-  recordRoleAgentSession
+  recordRoleAgentSession,
+  retireTaskRoleSessionsForWorkspace,
+  updateRoleAgentSessionStatus
 } from "../../dist/executor/agentExecutor.js";
 import {
   createAgentRun,
@@ -139,6 +141,39 @@ test("Agent switching rejects active runs and mismatched GlobalRole/TaskRole ses
   );
 });
 
+test("workspace migration retires only after every bound native session is stopped", () => {
+  let sessions = createRoleSessionSet(
+    { scope: "task", taskId: "task-1", roleName: "worker" },
+    "codex",
+    now
+  );
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "codex-stopped",
+    policy: "fixed",
+    status: "stopped"
+  }, now);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "claude",
+    adapterId: "claude",
+    nativeSessionId: "claude-dormant-ready",
+    policy: "fixed",
+    status: "ready"
+  }, now);
+
+  assert.throws(
+    () => retireTaskRoleSessionsForWorkspace(sessions, later),
+    /claude.*stopped|stopped.*claude/i
+  );
+
+  const stopped = updateRoleAgentSessionStatus(sessions, "claude", "stopped", later);
+  assert.deepEqual(
+    retireTaskRoleSessionsForWorkspace(stopped, later).sessions,
+    {}
+  );
+});
+
 test("restored persistent domain records are plain JSON with explicit schema versions", () => {
   const task = createTask("task-1", "Restore models", now);
   const workItem = createWorkItem(
@@ -210,6 +245,26 @@ test("updating a terminal WorkItem outcome preserves its workspace disposition",
   assert.equal(corrected.outcome, "Implemented and tested.");
   assert.equal(corrected.workspaceDisposition, "integrated");
   assert.equal(corrected.endedAt, completed.endedAt);
+});
+
+test("closing an abandoned failed WorkItem preserves its workspace disposition", () => {
+  const failed = updateWorkItemStatus(createWorkItem(
+    "work-1",
+    "task-1",
+    { title: "Implement", assignee: "worker" },
+    now
+  ), "failed", later, "Native session exited.");
+  const abandoned = recordWorkItemWorkspaceDisposition(failed, "abandoned", later);
+  const superseded = updateWorkItemStatus(
+    abandoned,
+    "superseded",
+    later,
+    "Replacement work completed."
+  );
+
+  assert.equal(superseded.status, "superseded");
+  assert.equal(superseded.workspaceDisposition, "abandoned");
+  assert.equal(superseded.outcome, "Replacement work completed.");
 });
 
 test("TaskMessage represents user, operator, and Role result authors structurally", () => {

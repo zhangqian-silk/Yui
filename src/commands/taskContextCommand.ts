@@ -30,8 +30,9 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       activeDecisions: reader.listDecisions(task.id)
         .filter((decision) => decision.status === "active"),
       milestones: reader.listMilestones(task.id),
+      roles: reader.listRoles(task.id),
       workItems,
-      attempts: chronological(reader.listExecutionAttempts(task.id)),
+      agentRuns: chronological(reader.listAgentRuns(task.id)),
       changeSets: chronological(reader.listChangeSets(task.id)),
       integrations: chronological(reader.listIntegrationAttempts(task.id)),
       messages: reader.listMessages(task.id),
@@ -45,8 +46,9 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     brief,
     activeDecisions,
     milestones,
+    roles,
     workItems,
-    attempts,
+    agentRuns,
     changeSets,
     integrations,
     messages,
@@ -105,38 +107,56 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       ]
     ),
     "",
+    `Task Roles (${roles.length}):`,
+    ...(roles.length === 0
+      ? ["  None."]
+      : roles.flatMap((role) => {
+          const binding = role.agentBindings[role.activeAgentId];
+          return [
+            `  ${role.name} [${role.status}]: ${role.activeAgentId}/${binding.adapterId}`,
+            `    Model: ${binding.config.model ?? "default"}; effort: ${binding.config.effort ?? "default"}`
+          ];
+        })),
+    "",
     `Current and recent work items (${displayedWorkItems.length}${workItems.length > displayedWorkItems.length ? ` of ${workItems.length}` : ""}):`,
     ...(displayedWorkItems.length === 0
       ? ["  None."]
       : displayedWorkItems.flatMap((item) => {
-          const itemAttempts = attempts.filter((attempt) => attempt.workItemId === item.id);
-          const latestAttempt = itemAttempts.at(-1);
+          const itemRuns = agentRuns.filter((run) => run.workItemId === item.id);
+          const latestRun = itemRuns.at(-1);
           return [
             `  ${item.id} [${item.status}]: ${compactText(item.title)}`,
             `    Objective: ${compactText(item.objective)}`,
             ...(item.acceptance.length === 0
               ? []
               : [`    Acceptance: ${item.acceptance.map(compactText).join("; ")}`]),
-            ...(latestAttempt === undefined
-              ? ["    Attempts: none."]
+            ...(latestRun === undefined
+              ? ["    AgentRuns: none."]
               : [
-                  `    Attempts: ${itemAttempts.length}; latest ${latestAttempt.id} [${latestAttempt.state}] ${latestAttempt.profileId}/${latestAttempt.executor}`,
-                  `      Input: ${compactText(latestAttempt.input)}`,
-                  ...(latestAttempt.result?.summary === undefined
+                  `    AgentRuns: ${itemRuns.length}; latest ${latestRun.id} [${latestRun.status}] ${latestRun.agentId ?? "unknown"}/${latestRun.adapterId ?? "unknown"}`,
+                  `      Input: ${compactText(latestRun.input)}`,
+                  ...(latestRun.summary === undefined
                     ? []
-                    : [`      Summary: ${compactText(latestAttempt.result.summary)}`]),
-                  ...(latestAttempt.result?.changeSetId === undefined
-                    ? []
-                    : [`      ChangeSet: ${latestAttempt.result.changeSetId}`])
+                    : [`      Summary: ${compactText(latestRun.summary)}`])
                 ])
           ];
         })),
+    "",
+    ...recentSection(
+      "AgentRuns",
+      agentRuns,
+      (run) => [
+        `  ${run.id} [${run.status}] ${run.roleName} via ${run.agentId ?? "unknown"}/${run.adapterId ?? "unknown"}`,
+        `    Model: ${run.model ?? "default"}; effort: ${run.effort ?? "default"}`,
+        ...(run.summary === undefined ? [] : [`    Result: ${compactText(run.summary)}`])
+      ]
+    ),
     "",
     `ChangeSets (${changeSets.length}):`,
     ...(changeSets.length === 0
       ? ["  None."]
       : changeSets.slice(-RECENT_RECORD_LIMIT).map((changeSet) => (
-          `  ${changeSet.id}: ${changeSet.baseCommit.slice(0, 12)}..${changeSet.headCommit.slice(0, 12)} (${changeSet.changedPaths.length} paths)`
+          `  ${changeSet.id}: ${changeSet.baseCommit.slice(0, 12)}..${changeSet.headCommit.slice(0, 12)} (${changeSet.changedPaths.length} paths; WorkItem ${changeSet.workItemId})`
         ))),
     "",
     `Integration Attempts (${integrations.length}):`,

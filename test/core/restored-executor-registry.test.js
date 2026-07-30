@@ -119,6 +119,45 @@ test("readiness resolver distinguishes Codex node composer and Claude prompt mar
   assert.equal(claude({
     ...base,
     currentCommand: "claude",
+    content: [
+      "Yui · task-1 · Fix the boundary bug · Leader",
+      "──",
+      "❯ Try \"fix lint errors\"",
+      "────────────────────────────────────────────────────────────────",
+      "───",
+      "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+    ].join("\n")
+  }), true);
+  assert.equal(claude({
+    ...base,
+    currentCommand: "claude",
+    content: [
+      "I yielded without disturbing the working implementer.",
+      "✻ Crunched for 56s",
+      "❯ continue",
+      "────────────────────────────────────────────────────────────────",
+      "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+    ].join("\n"),
+    styledContent: [
+      "I yielded without disturbing the working implementer.",
+      "✻ Crunched for 56s",
+      "❯ \u001b[2mcontinue\u001b[0m",
+      "────────────────────────────────────────────────────────────────",
+      "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+    ].join("\n")
+  }), true);
+  assert.equal(claude({
+    ...base,
+    currentCommand: "claude",
+    content: [
+      "❯ old prompt",
+      "Completed an earlier request",
+      "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+    ].join("\n")
+  }), false);
+  assert.equal(claude({
+    ...base,
+    currentCommand: "claude",
     content: "❯ old prompt\nWorking… press ctrl-c to interrupt\n"
   }), false);
   assert.equal(claude({ ...base, currentCommand: "claude", content: "thinking…\n" }), false);
@@ -135,6 +174,28 @@ test("readiness resolver distinguishes Codex node composer and Claude prompt mar
     content: "hello\n❯ unsent draft\n",
     styledContent: "hello\n\u001b[1m❯\u001b[0m unsent draft\n"
   }), false);
+  assert.equal(operatorClaude({
+    ...base,
+    currentCommand: "claude",
+    content: "hello\n❯ continue\n",
+    styledContent: "hello\n\u001b[1m❯\u001b[0m \u001b[2mcontinue\u001b[0m\n"
+  }), true);
+  assert.equal(operatorClaude({
+    ...base,
+    currentCommand: "claude",
+    content: [
+      "I yielded without disturbing the working implementer.",
+      "❯ continue",
+      "────────────────────────────────────────────────────────────────",
+      "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+    ].join("\n"),
+    styledContent: [
+      "I yielded without disturbing the working implementer.",
+      "\u001b[1m❯\u001b[0m \u001b[2mcontinue\u001b[0m",
+      "────────────────────────────────────────────────────────────────",
+      "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+    ].join("\n")
+  }), true);
 });
 
 test("ExecutorRegistry prepares new/resume sessions and always carries the adapter probe into sendOnce", async () => {

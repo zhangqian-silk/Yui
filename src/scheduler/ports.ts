@@ -14,6 +14,7 @@ import type {
 } from "../coordination/workMailbox.js";
 import type { PendingTurnCompletion } from "../executor/turnCompletion.js";
 import type { RuntimeRoleOwner } from "../runtime/lifecycleReservation.js";
+import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 
 export type SchedulerTask = Readonly<{
   id: string;
@@ -27,7 +28,9 @@ export type SchedulerRole = Readonly<{
   taskId: string;
   name: string;
   activeAgentId: string;
-  adapterId: string;
+  adapterId: AgentAdapterId;
+  model?: string;
+  effort?: string;
   workspace: string;
   status: "idle" | "running" | "detached" | "exited" | "failed";
 }>;

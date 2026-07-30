@@ -249,16 +249,6 @@ function assertOwnedArtifactPath(resource: RuntimeResource): void {
     }
     return;
   }
-  if (artifact.artifactKind === "attempt-socket") {
-    const directory = join(tmpdir(), `yui-${uid}`);
-    if (
-      dirname(path) !== directory
-      || !/^attempt-[a-f0-9]{32}\.sock$/u.test(basename(path))
-    ) {
-      throw new Error(`Artifact path is outside the Yui Attempt namespace: ${path}.`);
-    }
-    return;
-  }
   const home = resource.yuiHome;
   if (
     home === undefined

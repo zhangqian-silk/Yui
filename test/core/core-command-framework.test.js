@@ -111,6 +111,7 @@ test("the declarative catalog exposes exactly the lean public command surface", 
     "task work update",
     "task work dispatch",
     "task work isolate",
+    "task work capture",
     "task work cleanup",
     "task work accept",
     "task work reject",
@@ -119,13 +120,6 @@ test("the declarative catalog exposes exactly the lean public command surface", 
     "task run list",
     "task run retry",
     "task run yield",
-    "task attempt",
-    "task attempt dispatch",
-    "task attempt list",
-    "task attempt show",
-    "task attempt retry",
-    "task attempt interrupt",
-    "task attempt cleanup",
     "task integration",
     "task integration start",
     "task integration continue",
@@ -179,34 +173,30 @@ test("catalog validation rejects duplicate sibling command paths", () => {
 });
 
 test("nested help resolves and renders only the requested command group", () => {
-  const invocation = routeInvocation(["help", "task", "attempt"]);
+  const invocation = routeInvocation(["help", "task", "integration"]);
 
   assert.equal(invocation.kind, "help");
-  assert.deepEqual(invocation.node.path, ["yui", "task", "attempt"]);
+  assert.deepEqual(invocation.node.path, ["yui", "task", "integration"]);
 
   const output = renderCommandHelp(invocation.node, "0.2.0");
-  assert.match(output, /^Yui task attempt$/m);
-  assert.match(output, /Usage:\n  yui task attempt <command>/);
-  assert.match(output, /^  dispatch\s+/m);
+  assert.match(output, /^Yui task integration$/m);
+  assert.match(output, /Usage:\n  yui task integration <command>/);
+  assert.match(output, /^  start\s+/m);
   assert.match(output, /^  list\s+/m);
   assert.match(output, /^  show\s+/m);
-  assert.match(output, /^  retry\s+/m);
-  assert.match(output, /^  interrupt\s+/m);
   assert.doesNotMatch(output, /task work|session-notify|internal/);
 });
 
 test("the invocation router selects an executable without parsing business params", () => {
   const invocation = routeInvocation([
     "task",
-    "attempt",
-    "dispatch",
-    "work-item-1",
-    "--profile",
-    "implementer"
+    "integration",
+    "show",
+    "integration-1"
   ]);
 
   assert.equal(invocation.kind, "execute");
-  assert.deepEqual(invocation.node.path, ["yui", "task", "attempt", "dispatch"]);
+  assert.deepEqual(invocation.node.path, ["yui", "task", "integration", "show"]);
   assert.equal("params" in invocation, false);
 });
 
@@ -218,19 +208,19 @@ test("the invocation router handles root help", () => {
 });
 
 test("the invocation router reports an unknown path at the nearest group", () => {
-  const invocation = routeInvocation(["task", "attempt", "unknown"]);
+  const invocation = routeInvocation(["task", "integration", "unknown"]);
 
   assert.equal(invocation.kind, "path-error");
-  assert.equal(invocation.typedPath, "task attempt unknown");
-  assert.deepEqual(invocation.helpNode.path, ["yui", "task", "attempt"]);
+  assert.equal(invocation.typedPath, "task integration unknown");
+  assert.deepEqual(invocation.helpNode.path, ["yui", "task", "integration"]);
 });
 
 test("the invocation router reports a bare group as incomplete", () => {
-  const invocation = routeInvocation(["task", "attempt"]);
+  const invocation = routeInvocation(["task", "integration"]);
 
   assert.equal(invocation.kind, "incomplete");
-  assert.equal(invocation.typedPath, "task attempt");
-  assert.deepEqual(invocation.helpNode.path, ["yui", "task", "attempt"]);
+  assert.equal(invocation.typedPath, "task integration");
+  assert.deepEqual(invocation.helpNode.path, ["yui", "task", "integration"]);
 });
 
 test("the canonical execution commands are callable while the redundant yield alias stays hidden", () => {

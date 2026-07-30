@@ -1,5 +1,8 @@
 import type { ConfiguredAgent } from "../agent/agent.js";
-import { compileDispatchInput } from "../context/dispatchContext.js";
+import {
+  compileDispatchInput,
+  ensureWorkerRunCompletionRequirement
+} from "../context/dispatchContext.js";
 import {
   dataError,
   roleNotFound,
@@ -26,7 +29,9 @@ import {
   type TaskMessageContext,
   type TaskMessageKind
 } from "../message/message.js";
+import type { WorkItemIntegrationProof } from "../workspace/workItemChangeSetManager.js";
 import {
+  activeRoleAgentBinding,
   copyGlobalRoleToTaskRole,
   createRole,
   createRoleAgentBinding,
@@ -65,6 +70,7 @@ import {
   type TaskPriority
 } from "../task/task.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import type { AgentProfile } from "../profile/agentProfile.js";
 import { resolveProject, type Project } from "../repository/project.js";
 import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import {
@@ -131,6 +137,7 @@ export type TaskCommandOptions = Readonly<{
   now?: () => Date;
   environment?: NodeJS.ProcessEnv;
   yuiHome?: string;
+  workItemIntegrationProof?: WorkItemIntegrationProof;
 }>;
 
 export function runTaskCommand(
@@ -363,7 +370,6 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
   const events = store.listEvents(task.id);
   const openInputs = openInputRequestCount(store, task.id);
   const work = store.listWorkItems(task.id);
-  const attempts = store.listExecutionAttempts(task.id);
   const changeSets = store.listChangeSets(task.id);
   const integrations = store.listIntegrationAttempts(task.id);
   const counts = {
@@ -372,7 +378,7 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     milestones: milestones.length,
     events: events.length,
     workItems: work.length,
-    attempts: attempts.length,
+    agentRuns: store.listAgentRuns(task.id).length,
     changeSets: changeSets.length,
     integrations: integrations.length,
     openInputs
@@ -398,7 +404,7 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     `Milestones: ${counts.milestones}`,
     `Events: ${counts.events}`,
     `Work items: ${counts.workItems}`,
-    `Execution Attempts: ${counts.attempts}`,
+    `Agent Runs: ${counts.agentRuns}`,
     `ChangeSets: ${counts.changeSets}`,
     `Integration Attempts: ${counts.integrations}`,
     `Open inputs: ${counts.openInputs}`,
@@ -460,12 +466,6 @@ function completeTaskCommand(
     if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
     assertNoOpenInputRequests(tx, task.id, "completing the Task");
-    const activeAttempt = tx.listExecutionAttempts(task.id).find((attempt) => (
-      attempt.state === "running"
-    ));
-    if (activeAttempt !== undefined) {
-      throw usageError(`Task ${task.id} has an active Execution Attempt: ${activeAttempt.id}.`);
-    }
     const incompleteWork = tx.listWorkItems(task.id).find((item) => (
       item.status !== "completed"
       && item.status !== "cancelled"
@@ -482,6 +482,14 @@ function completeTaskCommand(
     if (unresolvedIntegration !== undefined) {
       throw usageError(
         `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
+      );
+    }
+    const isolatedWorkspace = tx.listRoleWorkspaces(task.id)
+      .find(({ owner }) => owner.type === "work-item");
+    if (isolatedWorkspace?.owner.type === "work-item") {
+      throw usageError(
+        `Task ${task.id} has an isolated WorkItem workspace: `
+        + `${isolatedWorkspace.owner.workItemId}. Capture, integrate or abandon it, then clean it up.`
       );
     }
 
@@ -591,12 +599,6 @@ function archiveTaskCommand(
       throw usageError(`Task ${task.id} still has managed worktrees; clean them before archiving.`);
     }
     assertNoOpenInputRequests(tx, task.id, "archiving the Task");
-    const activeAttempt = tx.listExecutionAttempts(task.id).find((attempt) => (
-      attempt.state === "running"
-    ));
-    if (activeAttempt !== undefined) {
-      throw usageError(`Task ${task.id} has an active Execution Attempt: ${activeAttempt.id}.`);
-    }
     const unresolvedIntegration = tx.listIntegrationAttempts(task.id).find((integration) => (
       integration.status === "running"
       || integration.status === "blocked"
@@ -776,7 +778,10 @@ function addTaskRole(
   if (taskId === undefined || roleName === undefined || taskId.startsWith("--") || roleName.startsWith("--")) {
     throw usageError("Task id and Role name are required.", usage);
   }
-  const parsed = parseRoleOptions(tail, roleOptionSpecs({ update: false, includeAgent: true }), usage);
+  const parsed = parseRoleOptions(tail, new Map([
+    ...roleOptionSpecs({ update: false, includeAgent: true }),
+    ["--profile", "value" as const]
+  ]), usage);
   const agentId = parsed.one("--agent")?.trim();
   if (parsed.has("--agent") && (agentId === undefined || agentId.length === 0)) {
     throw usageError("--agent is required.", usage);
@@ -793,6 +798,12 @@ function addTaskRole(
     if (roleName === LEADER_ROLE) throw usageError("The Task leader role already exists.");
     if (tx.getRole(task.id, roleName) !== null) throw usageError(`Role already exists: ${roleName}.`);
     let created = createTaskRole(tx, task, roleName, agentId, now);
+    const profileId = parsed.one("--profile");
+    if (profileId !== undefined) {
+      created = updateRole(created, workerProfileRolePatch(
+        requireAgentProfile(tx, profileId)
+      ), now);
+    }
     const profile = roleProfilePatch(parsed);
     if (Object.keys(profile).length > 0) created = updateRole(created, profile, now);
     if (hasAgentConfigOptions(parsed)) {
@@ -892,7 +903,10 @@ function updateTaskRole(
   if (taskId === undefined || roleName === undefined || taskId.startsWith("--") || roleName.startsWith("--")) {
     throw usageError("Task id and Role name are required.", usage);
   }
-  const parsed = parseRoleOptions(tail, roleOptionSpecs({ update: true, includeAgent: true }), usage);
+  const parsed = parseRoleOptions(tail, new Map([
+    ...roleOptionSpecs({ update: true, includeAgent: true }),
+    ["--profile", "value" as const]
+  ]), usage);
   if (parsed.has("--agent") && (parsed.one("--agent")?.trim().length ?? 0) === 0) {
     throw usageError("--agent is required.", usage);
   }
@@ -906,7 +920,7 @@ function updateTaskRole(
     const role = requireRole(tx, task.id, roleName);
     const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
     const activeRun = tx.getActiveAgentRun(task.id, role.name);
-    const changesLaunchContext = hasRoleLaunchContextOptions(parsed);
+    const changesLaunchContext = hasRoleLaunchContextOptions(parsed) || parsed.has("--profile");
     const changesAgentConfig = hasAgentConfigOptions(parsed);
     if (changesLaunchContext || changesAgentConfig) {
       assertRoleRuntimeMutationAllowed(tx, {
@@ -941,7 +955,11 @@ function updateTaskRole(
       }
       bindings = { ...bindings, [agentId]: patchRoleAgentBinding(binding, parsed) };
     }
-    const next = updateRole(role, {
+    const profileId = parsed.one("--profile");
+    const withProfile = profileId === undefined
+      ? role
+      : updateRole(role, workerProfileRolePatch(requireAgentProfile(tx, profileId)), now);
+    const next = updateRole(withProfile, {
       ...(bindings === role.agentBindings ? {} : { agentBindings: bindings }),
       ...roleProfilePatch(parsed)
     }, now);
@@ -1171,16 +1189,50 @@ function updateWork(
     const task = requireTask(tx, current.taskId);
     assertTaskOpen(task);
     if (current.assignee === undefined) {
-      throw usageError(`Attempt-backed Work Item must use accept, reject, or cancel: ${current.id}.`);
+      if (taskActor(options, task.id) !== "leader") {
+        throw usageError(
+          `Only the Task Leader may update unassigned Work Item execution: ${current.id}.`
+        );
+      }
+      if (status === "running") {
+        assertWorkItemDependenciesCompleted(tx, current);
+      }
+      const updated = current.status === "failed" && status === "running"
+        ? retryFailedWorkItem(current, now)
+        : updateWorkItemStatus(
+            current,
+            status,
+            now,
+            isTerminalWorkItemStatus(status) ? summary : undefined
+          );
+      tx.saveWorkItem(task.id, updated);
+      if (summary !== undefined) {
+        recordTaskEvent(tx, task.id, "work.updated", {
+          workItemId: updated.id,
+          status: updated.status,
+          summary
+        }, now);
+      }
+      enqueueWork(tx, taskMailbox(task.id), "work-updated", now, [
+        workItemRef(updated.id)
+      ]);
+      return updated;
     }
-    const active = tx.getActiveAgentRun(task.id, current.assignee);
-    if (active?.workItemId === current.id && status !== "running") {
-      throw usageError(`Work item ${current.id} has an active run; yield the run instead.`);
+    if (
+      current.workspaceDisposition !== undefined
+      && isTerminalWorkItemStatus(current.status)
+      && status === "superseded"
+    ) {
+      const updated = updateWorkItemStatus(current, status, now, summary);
+      tx.saveWorkItem(task.id, updated);
+      enqueueWork(tx, taskMailbox(task.id), "work-updated", now, [workItemRef(updated.id)]);
+      return updated;
     }
-    const updated = updateWorkItemStatus(current, status, now, summary);
-    tx.saveWorkItem(task.id, updated);
-    enqueueWork(tx, taskMailbox(task.id), "work-updated", now, [workItemRef(updated.id)]);
-    return updated;
+    throw usageError(
+      `Assigned Work Item execution cannot use task work update: ${current.id}. `
+      + "Use dispatch and run yield, then let the Task Leader accept or reject the result; "
+      + "use task work cancel to cancel it."
+    );
   });
   notifyMailbox(options.runtime, taskMailbox(item.taskId), item.taskId);
   return `Updated work item ${item.id} to ${requested}\n`;
@@ -1201,12 +1253,17 @@ function dispatchWork(
     if (task.status !== "active") {
       throw usageError(inactiveTaskMessage(task, "dispatch"));
     }
-    if (item.status !== "pending") {
+    if (item.status !== "pending" && item.status !== "failed") {
       throw usageError(`Work item ${item.id} cannot be dispatched from ${item.status}.`);
     }
     if (item.assignee === undefined) {
-      throw usageError(`Work Item has no Task Role assignee; use task attempt dispatch: ${item.id}.`);
+      throw usageError(
+        `Work Item has no Task Role assignee: ${item.id}. `
+        + `The Task Leader must run "yui task work update ${item.id} running", `
+        + "then execute it directly or create a native subagent in the Leader conversation."
+      );
     }
+    assertWorkItemDependenciesCompleted(tx, item);
     const role = requireRole(tx, task.id, item.assignee);
     const workspace = tx.getRoleWorkspace(task.id, role.name);
     if (workspace?.owner.type === "work-item"
@@ -1234,11 +1291,13 @@ function dispatchWork(
       roleAgentSessionResumeMode(sessions, role.activeAgentId),
       input,
       now,
-      { workItemId: item.id }
+      { workItemId: item.id, agent: agentRunSnapshot(role) }
     );
     tx.saveAgentRun(created);
     tx.saveActiveAgentRun(created);
-    tx.saveWorkItem(task.id, updateWorkItemStatus(item, "running", now));
+    tx.saveWorkItem(task.id, item.status === "failed"
+      ? retryFailedWorkItem(item, now)
+      : updateWorkItemStatus(item, "running", now));
     tx.saveRole(task.id, updateRoleStatus(role, "running", now));
     enqueueWork(tx, roleMailbox(task.id, role.name), "run-dispatched", now, [
       runRef(created.id),
@@ -1272,40 +1331,108 @@ function acceptWork(
     if (item.status !== "awaiting_acceptance") {
       throw usageError(`Work Item is not awaiting acceptance: ${item.id}/${item.status}.`);
     }
-    const attempts = tx.listExecutionAttempts(item.taskId)
-      .filter((attempt) => attempt.workItemId === item.id && attempt.state === "succeeded")
-      .sort((left, right) => (
-        (left.endedAt ?? left.updatedAt).localeCompare(right.endedAt ?? right.updatedAt)
-        || left.createdAt.localeCompare(right.createdAt)
-        || left.id.localeCompare(right.id)
-      ));
-    const attempt = attempts.at(-1);
-    if (attempt === undefined) {
-      throw usageError(`Work Item has no successful Execution Attempt: ${item.id}.`);
+    const latestRun = chronologicalAgentRuns(tx.listAgentRuns(item.taskId)
+      .filter((run) => run.workItemId === item.id)).at(-1);
+    if (latestRun === undefined || latestRun.status !== "yielded") {
+      throw usageError(`Work Item has no latest yielded AgentRun: ${item.id}.`);
     }
-    if (attempt.result?.checks?.some((check) => check.outcome === "failed") === true) {
-      throw usageError(`Work Item has failed validation checks: ${item.id}.`);
-    }
-    const changeSetId = attempt.result?.changeSetId;
+    const isolatedWorkspace = item.assignee === undefined
+      ? null
+      : tx.getRoleWorkspace(item.taskId, item.assignee);
     if (
-      changeSetId !== undefined
-      && !tx.listIntegrationAttempts(item.taskId).some((integration) => (
-        integration.status === "committed" && integration.changeSetIds.includes(changeSetId)
-      ))
+      isolatedWorkspace?.owner.type === "work-item"
+      && isolatedWorkspace.owner.workItemId === item.id
     ) {
-      throw usageError(`Work Item ChangeSet is not integrated: ${changeSetId}.`);
+      assertWorkItemIntegrationProof(
+        tx,
+        item.id,
+        item.assignee!,
+        isolatedWorkspace,
+        options.workItemIntegrationProof
+      );
     }
     const completed = updateWorkItemStatus(item, "completed", now, summary);
     tx.saveWorkItem(item.taskId, completed);
     recordTaskEvent(tx, item.taskId, "work.accepted", {
       workItemId: item.id,
-      attemptId: attempt.id,
+      runId: latestRun.id,
       acceptedBy: "leader",
       summary
     }, now);
     return completed;
   });
   return output(`Accepted Work Item ${accepted.id}\n`, { workItem: accepted });
+}
+
+function assertWorkItemIntegrationProof(
+  store: TaskWorkflowStore,
+  workItemId: string,
+  assignee: string,
+  workspace: NonNullable<ReturnType<TaskWorkflowStore["getRoleWorkspace"]>>,
+  proof: WorkItemIntegrationProof | undefined
+): void {
+  if (
+    proof === undefined
+    || proof.workItemId !== workItemId
+    || proof.assignee !== assignee
+    || !sameProvenWorkspace(proof.workspace, workspace)
+  ) {
+    throw usageError(
+      `WorkItem workspace has not been verified for acceptance: ${workItemId}.`
+    );
+  }
+  const latestChangeSet = store.listChangeSets(workspace.taskId)
+    .filter((changeSet) => changeSet.workItemId === workItemId)
+    .sort((left, right) => (
+      left.createdAt.localeCompare(right.createdAt)
+      || left.id.localeCompare(right.id)
+    ))
+    .at(-1);
+  if (proof.headCommit === workspace.baseCommit) {
+    if (proof.changeSetId !== undefined || latestChangeSet !== undefined) {
+      throw usageError(
+        `WorkItem integration verification is stale: ${workItemId}.`
+      );
+    }
+    return;
+  }
+  if (
+    proof.changeSetId === undefined
+    || latestChangeSet?.id !== proof.changeSetId
+    || latestChangeSet.baseCommit !== workspace.baseCommit
+    || latestChangeSet.headCommit !== proof.headCommit
+    || latestChangeSet.projectId !== workspace.projectId
+    || latestChangeSet.branch !== workspace.branch
+  ) {
+    throw usageError(
+      `WorkItem integration verification is stale: ${workItemId}.`
+    );
+  }
+  if (!store.listIntegrationAttempts(workspace.taskId).some((integration) => (
+    integration.status === "committed"
+    && integration.changeSetIds.includes(proof.changeSetId!)
+  ))) {
+    throw usageError(`Work Item ChangeSet is not integrated: ${proof.changeSetId}.`);
+  }
+}
+
+function sameProvenWorkspace(
+  left: WorkItemIntegrationProof["workspace"],
+  right: WorkItemIntegrationProof["workspace"]
+): boolean {
+  return left.schemaVersion === right.schemaVersion
+    && left.taskId === right.taskId
+    && left.roleName === right.roleName
+    && left.owner.type === "work-item"
+    && right.owner.type === "work-item"
+    && left.owner.workItemId === right.owner.workItemId
+    && left.projectId === right.projectId
+    && left.path === right.path
+    && left.branch === right.branch
+    && left.baseRef === right.baseRef
+    && left.baseCommit === right.baseCommit
+    && left.createdAt === right.createdAt
+    && left.updatedAt === right.updatedAt;
 }
 
 function rejectWork(
@@ -1361,7 +1488,7 @@ function cancelWork(
     if (!["pending", "failed", "awaiting_acceptance"].includes(item.status)) {
       throw usageError(
         item.status === "running"
-          ? `Work Item is running; interrupt its Execution Attempt first: ${item.id}.`
+          ? `Work Item is running; stop or fail its active AgentRun first: ${item.id}.`
           : `Work Item cannot be cancelled from ${item.status}: ${item.id}.`
       );
     }
@@ -1405,7 +1532,7 @@ function listWork(args: string[], store: TaskWorkflowStore): TaskCommandExecutio
         items.map((item) => [
           item.id,
           presentWorkStatus(item.status),
-          item.assignee ?? "Attempt",
+          item.assignee ?? "Leader",
           item.title,
           String(item.acceptance.length),
           item.outcome ?? "-"
@@ -1468,18 +1595,24 @@ function retryRun(
     }
     const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
     const runId = tx.nextAgentRunId(task.id);
+    const retaggedInput = retagYuiRunInput(
+      previous.input,
+      runId,
+      taskRoleSessionTitle(task, role.name)
+    );
     const created = createAgentRun(
       runId,
       task.id,
       role.name,
       roleAgentSessionResumeMode(sessions, role.activeAgentId),
-      retagYuiRunInput(
-        previous.input,
-        runId,
-        taskRoleSessionTitle(task, role.name)
-      ),
+      previous.workItemId === undefined
+        ? retaggedInput
+        : ensureWorkerRunCompletionRequirement(retaggedInput),
       now,
-      { workItemId: previous.workItemId }
+      {
+        ...(previous.workItemId === undefined ? {} : { workItemId: previous.workItemId }),
+        agent: agentRunSnapshot(role)
+      }
     );
     tx.saveAgentRun(created);
     tx.saveActiveAgentRun(created);
@@ -1549,7 +1682,12 @@ function yieldRun(
     if (active.workItemId !== undefined) {
       const item = tx.getWorkItem(task.id, active.workItemId);
       if (item === null) throw dataError(`Work item not found for run ${active.id}: ${active.workItemId}.`);
-      tx.saveWorkItem(task.id, updateWorkItemStatus(item, "completed", now, summary));
+      tx.saveWorkItem(task.id, updateWorkItemStatus(
+        item,
+        role.name === LEADER_ROLE ? "completed" : "awaiting_acceptance",
+        now,
+        role.name === LEADER_ROLE ? summary : undefined
+      ));
     } else if (role.name !== LEADER_ROLE) {
       throw usageError(`Run ${active.id} is not a work run.`);
     }
@@ -1597,6 +1735,23 @@ function createTaskRole(
   const agent = requireAgent(store, agentId);
   const binding = createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId });
   return createRole(task.id, roleName, [binding], agent.id, workspace, now);
+}
+
+function requireAgentProfile(store: TaskWorkflowStore, id: string): AgentProfile {
+  const profile = store.getAgentProfile(id);
+  if (profile === null) throw usageError(`Agent Profile not found: ${id}.`);
+  return profile;
+}
+
+function workerProfileRolePatch(profile: AgentProfile) {
+  return {
+    description: profile.description,
+    systemPrompt: profile.instructions,
+    skills: profile.skills === undefined ? undefined : [...profile.skills],
+    constraints: profile.defaultAccess === "read"
+      ? ["Do not modify files or external state."]
+      : undefined
+  };
 }
 
 function appendMessage(
@@ -1657,6 +1812,41 @@ function requireRun(store: TaskWorkflowStore, runId: string | undefined): AgentR
   const run = store.findAgentRun(id);
   if (run === null) throw usageError(`Run not found: ${id}.`);
   return run;
+}
+
+function assertWorkItemDependenciesCompleted(
+  store: TaskWorkflowStore,
+  item: WorkItem
+): void {
+  for (const dependencyId of item.dependsOn) {
+    const dependency = requireWorkItem(store, dependencyId);
+    if (dependency.taskId !== item.taskId || dependency.status !== "completed") {
+      throw usageError(`Work Item dependency is not completed: ${dependencyId}.`);
+    }
+  }
+}
+
+function chronologicalAgentRuns(runs: readonly AgentRun[]): AgentRun[] {
+  return [...runs].sort((left, right) => (
+    left.createdAt.localeCompare(right.createdAt)
+    || left.id.localeCompare(right.id)
+  ));
+}
+
+function agentRunSnapshot(role: Role): NonNullable<
+  NonNullable<Parameters<typeof createAgentRun>[6]>["agent"]
+> {
+  const binding = activeRoleAgentBinding(role);
+  return {
+    agentId: binding.agentId,
+    adapterId: binding.adapterId,
+    ...(binding.config.model === undefined ? {} : { model: binding.config.model }),
+    ...(binding.config.effort === undefined ? {} : { effort: binding.config.effort })
+  };
+}
+
+function isTerminalWorkItemStatus(status: WorkItemStatus): boolean {
+  return ["completed", "failed", "cancelled", "superseded"].includes(status);
 }
 
 function assertTaskOpen(task: Task): void {

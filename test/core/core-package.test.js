@@ -112,6 +112,25 @@ test("runtime assembly contains only the built CLI, docs, and three skills", (t)
   assert.equal("devDependencies" in runtimePackage, false);
 });
 
+test("Leader and Operator keep native subagent creation inside the Leader conversation", () => {
+  const leader = readFileSync(join(root, "skills", "yui-leader", "SKILL.md"), "utf8");
+  const operator = readFileSync(join(root, "skills", "yui-operator", "SKILL.md"), "utf8");
+  const worker = readFileSync(join(root, "skills", "yui-worker", "SKILL.md"), "utf8");
+
+  assert.match(leader, /create a native subagent inside this Leader's current Agent conversation/u);
+  assert.match(leader, /Do not invent another execution entity or a `yui \.\.\. subagent` command/u);
+  assert.match(leader, /yui task work update <work-id> running/u);
+  assert.match(leader, /A Profile is required for this path/u);
+  assert.match(leader, /Ignore all Task Role Agent bindings/u);
+  assert.match(leader, /executor=subagent; profile=reviewer@3/u);
+  assert.match(operator, /Leader chooses among direct execution, a native subagent, and a Task Role\s+AgentRun/u);
+  assert.match(operator, /inherits\s+the Leader Agent, ignores Task Role Agent bindings/u);
+  assert.match(operator, /has no Yui launch\s+command/u);
+  assert.match(worker, /native subagent inherits the Leader Agent/u);
+  assert.match(worker, /Do not run Yui lifecycle commands/u);
+  assert.match(worker, /result and records the actual Profile revision/u);
+});
+
 test("publish builds once and smokes the same package on Node 20, 22, and 24", () => {
   const workflow = readFileSync(join(root, ".github", "workflows", "publish.yml"), "utf8");
   const smoke = readFileSync(join(root, "scripts", "smoke-runtime-package.mjs"), "utf8");

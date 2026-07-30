@@ -32,6 +32,22 @@ export function buildWorkerContext(context: BuildRoleContextInput): string {
   return renderDispatchContext("worker", context);
 }
 
+const WORKER_RUN_COMPLETION_MARKER = "Yui Role Run completion requirement:";
+const WORKER_RUN_COMPLETION_REQUIREMENT = [
+  WORKER_RUN_COMPLETION_MARKER,
+  "Before ending, read the exact current Run ID from the managed first line and execute "
+    + "`yui task run yield <current-run-id> --summary \"<outcome and evidence>\"`, "
+    + "replacing the placeholder with that ID.",
+  "Yielding closes the Run and hands the WorkItem to the Leader for acceptance; "
+    + "a final response alone does neither."
+].join("\n");
+
+export function ensureWorkerRunCompletionRequirement(input: string): string {
+  return input.endsWith(`\n\n${WORKER_RUN_COMPLETION_REQUIREMENT}`)
+    ? input
+    : `${input}\n\n${WORKER_RUN_COMPLETION_REQUIREMENT}`;
+}
+
 function renderDispatchContext(
   kind: "leader" | "worker",
   context: BuildRoleContextInput
@@ -46,12 +62,15 @@ function renderDispatchContext(
     ...(profile.constraints ?? []).map((item) => `Constraint: ${item}`),
     profile.expectedOutput === undefined ? null : `Expected output: ${profile.expectedOutput}`
   ].filter((line): line is string => line !== null);
-  return [
+  const rendered = [
     `Follow the injected yui-${kind} Skill for this Yui dispatch.`,
     profileLines.join("\n"),
     "Yui dispatch:",
     requireText(context.input, "dispatch input")
   ].filter(Boolean).join("\n\n");
+  return kind === "worker"
+    ? ensureWorkerRunCompletionRequirement(rendered)
+    : rendered;
 }
 
 function requireText(value: string, label: string): string {

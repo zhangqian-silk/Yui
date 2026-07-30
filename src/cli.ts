@@ -16,7 +16,6 @@ import { runCompletionWizard } from "./cli/completionWizard.js";
 import {
   renderAgentConfigurationResolutionNotice
 } from "./cli/agentConfigurationPicker.js";
-import { resolveProfileWizardArguments } from "./cli/profileWizard.js";
 import {
   resolveGlobalRoleAgentConfigurationArguments,
   resolveRoleWizardArguments
@@ -55,10 +54,10 @@ import {
   runTaskCommand,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
-import { runTaskAttemptCommand } from "./commands/taskAttemptCommands.js";
 import { runTaskIntegrationCommand } from "./commands/taskIntegrationCommands.js";
 import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
 import {
+  assertFileTaskControllerStorageCompatible,
   ensureFileTaskController,
   FileTaskWorkflowRuntime,
   refreshRunningFileTaskControllerConfiguration,
@@ -81,6 +80,7 @@ import { FileTaskStore, resolveYuiHome } from "./storage/taskStore.js";
 import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
 import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
+import { WorkItemChangeSetManager } from "./workspace/workItemChangeSetManager.js";
 import { parseWebCommandOptions, startYuiWebServer } from "./web/webServer.js";
 import {
   AgentConfigurationCatalogService
@@ -159,6 +159,7 @@ export async function main(): Promise<void> {
 
   if (args[0] === "setup") {
     if (jsonOutput) throw usageError("Setup does not support --json.");
+    await assertFileTaskControllerStorageCompatible(home);
     const setupIo = {
       input: process.stdin,
       output: process.stdout,
@@ -255,6 +256,7 @@ export async function main(): Promise<void> {
   }
 
   requireStorageSchema(home);
+  await assertFileTaskControllerStorageCompatible(home);
   const store = new FileTaskStore(home);
   const catalogs = new AgentConfigurationCatalogService(home, {
     environment: process.env
@@ -472,11 +474,6 @@ export async function main(): Promise<void> {
     return;
   }
   if (resolved[0] === "task") {
-    if (resolved[1] === "attempt") {
-      const result = await runTaskAttemptCommand(resolved.slice(2), store, home);
-      emit(result.output, false, result.data);
-      return;
-    }
     if (resolved[1] === "integration") {
       const result = await runTaskIntegrationCommand(
         resolved.slice(2),
@@ -511,6 +508,21 @@ export async function main(): Promise<void> {
       );
       return;
     }
+    if (resolved[1] === "work" && resolved[2] === "capture") {
+      const workItemId = resolved[3];
+      if (workItemId === undefined || resolved.length !== 4) {
+        throw usageError("Task work capture usage: yui task work capture <work>.");
+      }
+      const changeSet = await new WorkItemChangeSetManager(store).capture(workItemId);
+      emit(
+        changeSet === null
+          ? `WorkItem worktree has no changes to capture: ${workItemId}\n`
+          : `Captured ChangeSet ${changeSet.id} from ${workItemId}\n`,
+        false,
+        { workItemId, changeSet }
+      );
+      return;
+    }
     if (resolved[1] === "work" && resolved[2] === "cleanup") {
       const workItemId = resolved[3];
       const disposition = resolved[4];
@@ -520,6 +532,13 @@ export async function main(): Promise<void> {
         throw usageError("Task work cleanup usage: yui task work cleanup <work> (--integrated|--abandon).");
       }
       const cleanedAs = disposition === "--integrated" ? "integrated" : "abandoned";
+      if (cleanedAs === "integrated") {
+        try {
+          await new WorkItemChangeSetManager(store).assertIntegrated(workItemId);
+        } catch (error) {
+          throw usageError(error instanceof Error ? error.message : String(error));
+        }
+      }
       const removal = await workspaceCoordinator.cleanupWorkItem(workItemId, cleanedAs);
       if (removal === "dirty") {
         throw usageError(`WorkItem worktree is dirty and was retained: ${workItemId}.`);
@@ -552,10 +571,27 @@ export async function main(): Promise<void> {
         }
       }
     }
+    let workItemIntegrationProof;
+    if (resolved[1] === "work" && resolved[2] === "accept") {
+      const workItemId = resolved[3];
+      if (workItemId !== undefined && !workItemId.startsWith("--")) {
+        try {
+          workItemIntegrationProof = await new WorkItemChangeSetManager(store)
+            .assertIntegrated(workItemId) ?? undefined;
+        } catch (error) {
+          throw usageError(error instanceof Error ? error.message : String(error));
+        }
+      }
+    }
     const result = runTaskCommand(
       resolved.slice(1),
       store,
-      { runtime, environment: process.env, yuiHome: home }
+      {
+        runtime,
+        environment: process.env,
+        yuiHome: home,
+        ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof })
+      }
     );
     if (result.kind === "output") {
       if (resolved[1] === "create") {
@@ -820,9 +856,7 @@ async function resolveTerminalArguments(
     }
     const selected = await resolveInteractiveArguments(operatorArgs, node, ports, handle.io);
     if (selected.kind === "cancelled") return null;
-    const profileWizard = await resolveProfileWizardArguments(selected.args, ports, handle.io);
-    if (profileWizard.kind === "cancelled") return null;
-    const roleWizard = await resolveRoleWizardArguments(profileWizard.args, ports, handle.io);
+    const roleWizard = await resolveRoleWizardArguments(selected.args, ports, handle.io);
     return roleWizard.kind === "cancelled" ? null : roleWizard.args;
   } finally {
     // The Agent process must be the only reader of stdin after Role enter.
@@ -880,8 +914,7 @@ async function preflightAgentConfigurationMutation(
 }
 
 function hasModelOrEffortMutation(args: readonly string[]): boolean {
-  const operation = args[0] === "profile"
-    || args[0] === "role"
+  const operation = args[0] === "role"
     || (args[0] === "task" && args[1] === "role");
   return operation && [
     "--model", "--effort", "--clear-model", "--clear-effort"
@@ -894,9 +927,6 @@ function configurationMutationAgentId(
 ): string | undefined {
   const explicit = optionValue(args, "--agent");
   if (explicit !== undefined) return explicit;
-  if (args[0] === "profile" && args[1] === "update") {
-    return store.getAgentProfile(args[2] ?? "")?.agentId;
-  }
   if (args[0] === "role" && args[1] === "update") {
     return store.getGlobalRole(args[2] ?? "")?.activeAgentId;
   }
@@ -947,7 +977,6 @@ function selectionCall(
     case "role.show": return store.getGlobalRole(String(params.name ?? ""));
     case "project.list": return callOptional(reader, "listProjects");
     case "task.list": return callOptional(reader, "listTasks");
-    case "task.attempt.list": return store.listExecutionAttempts(String(params.taskId ?? ""));
     case "task.integration.list": return store.listIntegrationAttempts(String(params.taskId ?? ""));
     case "task.change-set.list": return store.listChangeSets(String(params.taskId ?? ""));
     case "task.role.list": return callOptional(reader, "listRoles", [params.taskId]);

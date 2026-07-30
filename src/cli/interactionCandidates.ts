@@ -44,11 +44,17 @@ export async function getSelectionCandidates(
         ["id", "name", "path"]
       );
     case "configured-agents": {
-      const agents = await list(ports, "agent.list", {});
+      const agents = (await list(ports, "agent.list", {})).filter((agent) =>
+        selector.adapterIds === undefined
+        || selector.adapterIds.includes(stringField(agent, "adapterId") ?? "")
+      );
       const config = await optionalEntity(ports, "config.get", {});
-      const defaultValue = config === undefined
+      const configuredDefault = config === undefined
         ? undefined
         : stringField(config, "defaultAgent");
+      const defaultValue = agents.some((agent) =>
+        stringField(agent, "id") === configuredDefault
+      ) ? configuredDefault : undefined;
       const set = entities(
         "agent",
         "Select Agent",
@@ -149,16 +155,6 @@ export async function getSelectionCandidates(
         ["id", "roleName", "status", "summary"]
       );
     }
-    case "execution-attempts":
-      return entities(
-        "Execution Attempt",
-        "Select Execution Attempt",
-        (await listAllByTask(ports, "task.attempt.list", "attempts")).filter((attempt) =>
-          selector.statuses === undefined
-          || selector.statuses.includes(stringField(attempt, "state") ?? "")
-        ),
-        ["id", "state", "executor", "workItemId"]
-      );
     case "integration-attempts":
       return entities(
         "Integration Attempt",
@@ -176,7 +172,7 @@ export async function getSelectionCandidates(
         "ChangeSet",
         `Select ChangeSet: ${taskId}`,
         await list(ports, "task.change-set.list", { taskId }),
-        ["id", "attemptId", "baseCommit", "headCommit"]
+        ["id", "workItemId", "baseCommit", "headCommit"]
       );
     }
   }

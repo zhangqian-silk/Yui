@@ -17,7 +17,6 @@ import type {
   TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
 import type { GlobalRole, TaskRole } from "../role/role.js";
-import type { AgentProfile } from "../profile/agentProfile.js";
 import {
   hasRuntimeLifecycleWork,
   runtimeLifecycleTarget
@@ -41,7 +40,6 @@ export type AgentCommandTransactionStore = Readonly<{
   ): Readonly<{ status: "updated" | "unchanged"; agent: ConfiguredAgentRecord }> | null;
   listConfiguredAgents(): ConfiguredAgentRecord[];
   getConfiguredAgent(id: string): ConfiguredAgentRecord | null;
-  listAgentProfileRevisions(): AgentProfile[];
   removeConfiguredAgent(id: string): boolean;
   getConfig(): Readonly<{ defaultAgent?: string; defaultWorkspace?: string }>;
   listGlobalRoles(): GlobalRole[];
@@ -187,16 +185,6 @@ function updateAgent(args: string[], store: AgentCommandStore): string {
       );
     }
     if (changes.adapter) {
-      const profile = tx.listAgentProfileRevisions()
-        .find((candidate) => candidate.agentId === id);
-      if (profile !== undefined) {
-        throw usageError(
-          `Agent ${id} adapter cannot change because Agent Profile ${
-            profile.id
-          } revision ${profile.revision} references it. `
-          + "Create a new Agent ID and update the Profile instead."
-        );
-      }
       const binding = findRoleBindingReference(tx, id);
       if (binding !== null) {
         throw usageError(

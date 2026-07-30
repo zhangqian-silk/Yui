@@ -21,6 +21,7 @@ import {
   ControllerClientError,
   readControllerDiscovery
 } from "../../dist/core/controllerClient.js";
+import { FILE_TASK_CONTROLLER_PROTOCOL_VERSION } from "../../dist/core/protocol.js";
 import {
   FileTaskWorkflowRuntime,
   restartFileTaskController,
@@ -1387,7 +1388,9 @@ test("state changes enqueue a Controller signal without waiting for a full scan"
       call: async (_home, method, input) => {
         methods.push(method);
         params.push(input);
-        if (method === "controller.status") return { running: true };
+        if (method === "controller.status") {
+          return { running: true, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+        }
         assert.equal(method, "scheduler.signal");
         signalCompleted();
         return { accepted: true };
@@ -1531,7 +1534,9 @@ test("explicit reconciliation prepares active Role worktrees before requesting a
       {
         call: async (_home, method) => {
           events.push(method);
-          if (method === "controller.status") return { running: true };
+          if (method === "controller.status") {
+            return { running: true, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+          }
           scanCompleted();
           return {};
         }
@@ -2298,6 +2303,7 @@ test("background FileTask controller exposes status, scan and stop on one privat
   const status = await callController(home, "controller.status", {});
   assert.equal(status.running, true);
   assert.equal(status.pid, process.pid);
+  assert.equal(status.protocolVersion, FILE_TASK_CONTROLLER_PROTOCOL_VERSION);
   assert.deepEqual(
     await callController(home, "scheduler.signal", { key: "task:task-1" }),
     { accepted: true }
@@ -2434,9 +2440,15 @@ test("controller restart waits for the old process and starts the current runtim
       return { stopped: true };
     }
     assert.equal(method, "controller.status");
-    if (phase === "running") return { running: true, pid: 10 };
-    if (phase === "started") return { running: true, pid: 20 };
-    if (stoppingStatusCalls++ === 0) return { running: true, pid: 10 };
+    if (phase === "running") {
+      return { running: true, pid: 10, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+    }
+    if (phase === "started") {
+      return { running: true, pid: 20, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+    }
+    if (stoppingStatusCalls++ === 0) {
+      return { running: true, pid: 10, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+    }
     throw new ControllerClientError("CONTROLLER_UNAVAILABLE", "Controller is unavailable.");
   };
 
@@ -2469,7 +2481,9 @@ test("controller stop waits until the owned process is no longer reachable", asy
     events.push(method);
     if (method === "controller.stop") return { stopped: true };
     assert.equal(method, "controller.status");
-    if (statusCalls++ < 2) return { running: true, pid: 10 };
+    if (statusCalls++ < 2) {
+      return { running: true, pid: 10, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+    }
     throw new ControllerClientError("CONTROLLER_UNAVAILABLE", "Controller is unavailable.");
   };
 

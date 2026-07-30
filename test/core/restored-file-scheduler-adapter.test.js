@@ -12,7 +12,8 @@ import { updateRoleAgentSessionStatus } from "../../dist/executor/agentExecutor.
 import {
   createGlobalRole,
   createRole,
-  createRoleAgentBinding
+  createRoleAgentBinding,
+  updateRole
 } from "../../dist/role/role.js";
 import { createAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
 import { processActiveRoleRunDeliveries } from "../../dist/scheduler/activeRoleRunDelivery.js";
@@ -34,7 +35,10 @@ function fixture(t) {
   const role = createRole(
     task.id,
     "leader",
-    [createRoleAgentBinding({ id: "codex", adapterId: "codex" })],
+    [createRoleAgentBinding(
+      { id: "codex", adapterId: "codex" },
+      { adapterId: "codex", model: "gpt-test", effort: "high" }
+    )],
     "codex",
     home,
     now
@@ -78,6 +82,65 @@ test("FileSchedulerStoreAdapter commits Leader run, Role and fixed session toget
   assert.equal(JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision, before + 1);
 });
 
+test("Leader dispatch rejects a stale launch configuration snapshot", (t) => {
+  const { home, store, task, role, now, adapter } = fixture(t);
+  const snapshot = adapter.getRole(task.id, role.name);
+  const changedAt = new Date(now.getTime() + 1);
+  store.saveRole(task.id, updateRole(role, {
+    agentBindings: {
+      ...role.agentBindings,
+      codex: createRoleAgentBinding(
+        { id: "codex", adapterId: "codex" },
+        { adapterId: "codex", model: "gpt-new", effort: "medium" }
+      )
+    }
+  }, changedAt));
+  const run = createAgentRun("agent-run-stale", task.id, role.name, "resume", "continue", now);
+
+  const result = adapter.saveLeaderDispatch({
+    task,
+    role: snapshot,
+    run,
+    session: null,
+    wakeup: store.getPendingWakeup(task.id),
+    now
+  });
+
+  assert.equal(result, "state-changed");
+  assert.equal(store.getActiveAgentRun(task.id, role.name), null);
+  assert.notEqual(store.getPendingWakeup(task.id), null);
+  assert.equal(adapter.getRole(task.id, role.name).model, "gpt-new");
+  assert.equal(adapter.getRole(task.id, role.name).effort, "medium");
+  assert.equal(adapter.getRole(task.id, role.name).workspace, home);
+
+  const current = adapter.getRole(task.id, role.name);
+  const mismatchedRun = createAgentRun(
+    "agent-run-mismatched",
+    task.id,
+    role.name,
+    "resume",
+    "continue",
+    now,
+    {
+      agent: {
+        agentId: current.activeAgentId,
+        adapterId: current.adapterId,
+        model: "gpt-test",
+        effort: "high"
+      }
+    }
+  );
+  assert.equal(adapter.saveLeaderDispatch({
+    task,
+    role: current,
+    run: mismatchedRun,
+    session: null,
+    wakeup: store.getPendingWakeup(task.id),
+    now
+  }), "state-changed");
+  assert.equal(store.getActiveAgentRun(task.id, role.name), null);
+});
+
 test("a busy Leader claim is retried through active Run delivery without another wakeup", async (t) => {
   const { store, task, role, now, adapter } = fixture(t);
   let sends = 0;
@@ -95,7 +158,12 @@ test("a busy Leader claim is retried through active Run delivery without another
   const [claimed] = await processLeaderWakeups(adapter, delivery, now);
   assert.equal(claimed.reason, "not-ready");
   assert.equal(store.getPendingWakeup(task.id), null);
-  assert.equal(store.getActiveAgentRun(task.id, role.name).deliveredAt, undefined);
+  const active = store.getActiveAgentRun(task.id, role.name);
+  assert.equal(active.deliveredAt, undefined);
+  assert.equal(active.agentId, role.activeAgentId);
+  assert.equal(active.adapterId, "codex");
+  assert.equal(active.model, "gpt-test");
+  assert.equal(active.effort, "high");
 
   const [retried] = await processActiveRoleRunDeliveries(adapter, delivery, now);
   assert.equal(retried.status, "delivered");

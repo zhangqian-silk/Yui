@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { runProfileCommand } from "../../dist/commands/profileCommands.js";
 import { updateAgentProfile } from "../../dist/profile/agentProfile.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
@@ -16,12 +15,9 @@ test("Profile CLI uses the same AgentProfile record name and revisions updates",
   const now = new Date("2026-07-26T00:00:00.000Z");
   ensureStorageSchema(home, now);
   const store = new FileTaskStore(home);
-  store.saveConfiguredAgent(createConfiguredAgent("codex", "codex", "codex", [], [], now));
-  store.saveConfiguredAgent(createConfiguredAgent("claude", "claude", "claude", [], [], now));
 
   assert.equal(runProfileCommand([
     "add", "security-reviewer",
-    "--agent", "codex",
     "--access", "read",
     "--description", "Review authentication changes.",
     "--instructions", "Do not modify files."
@@ -35,20 +31,18 @@ test("Profile CLI uses the same AgentProfile record name and revisions updates",
   const profile = store.getAgentProfile("security-reviewer");
   assert.equal(profile.revision, 2);
   assert.equal(profile.effort, "high");
-  assert.equal(store.getAgentProfileRevision("security-reviewer", 1).revision, 1);
-  assert.equal(store.getAgentProfileRevision("security-reviewer", 2).revision, 2);
+  assert.equal(store.listAgentProfiles().filter(({ id }) => id === "security-reviewer").length, 1);
   assert.throws(
     () => runProfileCommand([
       "update", "security-reviewer", "--sandbox", "read-only"
     ], store, () => new Date("2026-07-26T00:02:00.000Z")),
     /Unsupported option: --sandbox/
   );
-  assert.throws(
-    () => runProfileCommand([
-      "add", "claude-reviewer", "--agent", "claude", "--access", "read"
-    ], store, () => new Date("2026-07-26T00:02:00.000Z")),
-    /Codex/
-  );
+  runProfileCommand([
+    "add", "portable-reviewer", "--access", "read",
+    "--instructions", "Return findings to the Leader."
+  ], store, () => new Date("2026-07-26T00:02:00.000Z"));
+  assert.equal("agentId" in store.getAgentProfile("portable-reviewer"), false);
   runProfileCommand(
     ["reset"],
     store,

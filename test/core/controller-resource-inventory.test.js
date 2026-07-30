@@ -29,7 +29,7 @@ function processFact(overrides) {
   };
 }
 
-test("inventory attributes live Controller, Role, and Attempt resources without inventing a Role", () => {
+test("inventory attributes live Controller and Role resources", () => {
   const current = processFact({ pid: 101, startIdentity: "1001" });
   const superseded = processFact({ pid: 102, startIdentity: "1002" });
   const paneRoot = processFact({
@@ -41,35 +41,6 @@ test("inventory attributes live Controller, Role, and Attempt resources without 
     args: ["codex"],
     rssBytes: 512 * 1024 * 1024
   });
-  const attemptServer = processFact({
-    pid: 301,
-    ppid: 250,
-    startIdentity: "3001",
-    kind: "app-server",
-    command: "codex",
-    args: ["codex", "app-server", "--listen", "unix:///tmp/attempt-1.sock"],
-    rssBytes: 256 * 1024 * 1024
-  });
-  const lookalikeAttemptServer = processFact({
-    pid: 302,
-    ppid: 250,
-    startIdentity: "3002",
-    kind: "app-server",
-    command: "codex",
-    args: ["codex", "app-server", "--listen", "unix:///tmp/attempt-1.sock.backup"],
-    rssBytes: 128 * 1024 * 1024
-  });
-  const attemptChild = processFact({
-    pid: 303,
-    ppid: attemptServer.pid,
-    startIdentity: "3003",
-    yuiHome: undefined,
-    kind: "other",
-    command: "node",
-    args: ["node", "attempt-child.js"],
-    rssBytes: 32 * 1024 * 1024
-  });
-
   const snapshot = buildControllerResourceInventory({
     schemaVersion: 1,
     observedAt: NOW,
@@ -78,10 +49,7 @@ test("inventory attributes live Controller, Role, and Attempt resources without 
     processes: [
       current,
       superseded,
-      paneRoot,
-      attemptServer,
-      lookalikeAttemptServer,
-      attemptChild
+      paneRoot
     ],
     homes: [{
       yuiHome: HOME,
@@ -113,18 +81,6 @@ test("inventory attributes live Controller, Role, and Attempt resources without 
         adapterId: "codex",
         nativeSessionId: "thread-role"
       }],
-      attempts: [{
-        attemptId: "attempt-1",
-        taskId: "task-1",
-        taskTitle: "Inventory",
-        taskStatus: "active",
-        workItemId: "work-1",
-        profileId: "worker",
-        state: "running",
-        providerSessionId: "provider-session",
-        providerThreadId: "provider-thread",
-        controlSocketPath: "/tmp/attempt-1.sock"
-      }],
       artifacts: []
     }],
     globalArtifacts: []
@@ -153,30 +109,6 @@ test("inventory attributes live Controller, Role, and Attempt resources without 
     nativeSessionId: "thread-role"
   });
 
-  const attempt = snapshot.resources.find(({ kind }) => kind === "execution-attempt");
-  assert.equal(attempt.disposition, "protected");
-  assert.deepEqual(attempt.owner, {
-    kind: "attempt",
-    attemptId: "attempt-1",
-    taskId: "task-1",
-    taskTitle: "Inventory",
-    taskStatus: "active",
-    workItemId: "work-1",
-    profileId: "worker",
-    providerSessionId: "provider-session",
-    providerThreadId: "provider-thread"
-  });
-  assert.equal("roleName" in attempt.owner, false);
-  assert.deepEqual(
-    attempt.processes.map(({ pid }) => pid),
-    [attemptServer.pid, attemptChild.pid]
-  );
-  assert.equal(
-    snapshot.resources.find(({ processes }) => (
-      processes.some(({ pid }) => pid === lookalikeAttemptServer.pid)
-    ))?.reasonCode,
-    "orphan-app-server"
-  );
 });
 
 test("inventory separates orphaned, unattributed, and stale resources by cleanup safety", () => {
@@ -207,7 +139,6 @@ test("inventory separates orphaned, unattributed, and stale resources by cleanup
         discovery: { status: "absent" },
         panes: [],
         roles: [],
-        attempts: [],
         artifacts: []
       },
       {
@@ -224,7 +155,6 @@ test("inventory separates orphaned, unattributed, and stale resources by cleanup
           currentCommand: "claude"
         }],
         roles: [],
-        attempts: [],
         artifacts: []
       }
     ],
@@ -308,7 +238,6 @@ test("a tmux server hosting known Role panes remains protected", () => {
         agentId: "codex",
         adapterId: "codex"
       }],
-      attempts: [],
       artifacts: []
     }],
     globalArtifacts: []
@@ -319,48 +248,6 @@ test("a tmux server hosting known Role panes remains protected", () => {
   assert.equal(server.disposition, "protected");
   assert.equal(server.reasonCode, "owned-tmux-server");
   assert.deepEqual(server.owner, { kind: "controller-domain", yuiHome: HOME });
-});
-
-test("a residual app-server for a terminal Attempt is safe to clean", () => {
-  const attemptServer = processFact({
-    pid: 701,
-    startIdentity: "7001",
-    kind: "app-server",
-    command: "codex",
-    args: ["codex", "app-server", "--listen", "unix:///tmp/attempt-terminal.sock"]
-  });
-  const snapshot = buildControllerResourceInventory({
-    schemaVersion: 1,
-    observedAt: NOW,
-    currentHome: HOME,
-    scope: "current",
-    processes: [attemptServer],
-    homes: [{
-      yuiHome: HOME,
-      exists: true,
-      storageStatus: "current",
-      discovery: { status: "absent" },
-      panes: [],
-      roles: [],
-      attempts: [{
-        attemptId: "attempt-terminal",
-        taskId: "task-1",
-        taskTitle: "Finished task",
-        taskStatus: "active",
-        workItemId: "work-1",
-        profileId: "worker",
-        state: "succeeded",
-        controlSocketPath: "/tmp/attempt-terminal.sock"
-      }],
-      artifacts: []
-    }],
-    globalArtifacts: []
-  });
-
-  const attempt = snapshot.resources.find(({ kind }) => kind === "execution-attempt");
-  assert.equal(attempt.state, "running");
-  assert.equal(attempt.disposition, "safe");
-  assert.equal(attempt.reasonCode, "terminal-attempt-process");
 });
 
 test("an exact Controller discovery identity remains protected while its socket is unavailable", () => {
@@ -385,7 +272,6 @@ test("an exact Controller discovery identity remains protected while its socket 
       },
       panes: [],
       roles: [],
-      attempts: [],
       artifacts: []
     }],
     globalArtifacts: []
@@ -425,7 +311,6 @@ test("a deleted-home Controller with an untagged child still requires review", (
       discovery: { status: "absent" },
       panes: [],
       roles: [],
-      attempts: [],
       artifacts: []
     }],
     globalArtifacts: []

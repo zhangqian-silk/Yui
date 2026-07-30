@@ -68,7 +68,7 @@ test("completion without a shell interactively selects one and persists it", asy
   assert.match(output, /Completion fish installed/);
   assert.equal(existsSync(installation.scriptPath), true);
   assert.match(readFileSync(installation.scriptPath, "utf8"), /identity=yui-dev/);
-  assert.match(readFileSync(installation.scriptPath, "utf8"), /task attempt/);
+  assert.match(readFileSync(installation.scriptPath, "utf8"), /task integration/);
   assert.match(readFileSync(installation.scriptPath, "utf8"), /task role/);
 });
 
@@ -148,21 +148,6 @@ test("setup configures selected Agents plus Leader and Operator model settings",
   };
   const executor = { run: (command) => command === "tmux" ? "tmux 3.4" : "" };
 
-  const rejectedInput = new PassThrough();
-  const rejectedOutput = new PassThrough();
-  rejectedInput.end("all\nclaude\n");
-  await assert.rejects(
-    runSetupCommand(
-      [], env, executor,
-      {
-        input: rejectedInput,
-        output: rejectedOutput,
-        forceInteractive: true
-      }
-    ),
-    /Codex.*Execution Attempt/
-  );
-
   input.end(
     `all\ncodex\ncodex\ngpt-5.6-sol\nxhigh\ngpt-5.6-sol\nxhigh\n${workspace}\nskip\n`
   );
@@ -182,7 +167,7 @@ test("setup configures selected Agents plus Leader and Operator model settings",
     store.listAgentProfiles().map(({ id }) => id).sort(),
     [...BUILTIN_PROFILE_IDS].sort()
   );
-  assert.equal(store.getAgentProfile("worker").agentId, "codex");
+  assert.equal("agentId" in store.getAgentProfile("worker"), false);
   assert.equal(store.getAgentProfile("explorer").defaultAccess, "read");
   assert.equal(store.getAgentProfile("implementer").defaultAccess, "write");
   assert.equal(store.getAgentProfile("reviewer").defaultAccess, "read");
@@ -345,6 +330,45 @@ test("setup configures selected Agents plus Leader and Operator model settings",
     new FileTaskStore(home).getGlobalRole("operator").agentBindings.codex.config.model,
     undefined
   );
+});
+
+test("setup supports Claude defaults for Leader, Operator, and Worker Profiles", async (t) => {
+  const { runSetupCommand } = await import("../../dist/setup/setupCommand.js");
+  const { FileTaskStore } = await import("../../dist/storage/taskStore.js");
+  const root = mkdtempSync(join(tmpdir(), "yui-claude-setup-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, "yui-home");
+  const bin = join(root, "bin");
+  const workspace = join(root, "workspace");
+  mkdirSync(bin);
+  writeFileSync(join(bin, "claude"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  chmodSync(join(bin, "claude"), 0o755);
+  const input = new PassThrough();
+  const output = new PassThrough();
+  input.end(`all\n\n\n\n\n\n\n${workspace}\nskip\n`);
+
+  await runSetupCommand(
+    [],
+    {
+      YUI_HOME: home,
+      HOME: join(root, "user"),
+      PATH: bin,
+      SHELL: "/bin/zsh"
+    },
+    { run: (command) => command === "tmux" ? "tmux 3.4" : "" },
+    { input, output, forceInteractive: true }
+  );
+
+  const store = new FileTaskStore(home);
+  assert.equal(store.getConfig().defaultAgent, "claude");
+  assert.equal(store.getGlobalRole("leader").activeAgentId, "claude");
+  assert.equal(store.getGlobalRole("operator").activeAgentId, "claude");
+  assert.deepEqual(
+    store.getGlobalRole("leader").agentBindings.claude.config,
+    { adapterId: "claude" }
+  );
+  assert.equal("agentId" in store.getAgentProfile("worker"), false);
+  assert.equal("agentId" in store.getAgentProfile("implementer"), false);
 });
 
 test("setup persists the canonical Project workspace behind a symbolic-link path", async (t) => {

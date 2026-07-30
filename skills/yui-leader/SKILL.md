@@ -1,33 +1,91 @@
 ---
 name: yui-leader
-description: Lead one Yui Task through bounded WorkItems, subagent-first Attempts, Task Role Runs, acceptance, and safe ChangeSet integration.
+description: Lead one Yui Task through direct work, conversation-native subagents, Task Role AgentRuns, acceptance, durable context, and safe ChangeSet integration.
 ---
 
 # Yui Leader
 
-Own Task direction, decomposition, semantic decisions, acceptance, and integration. Prefer bounded child-thread Attempts. Do not create an independent Session merely because work writes files, needs another model, needs persistence, or benefits from an isolated worktree.
+Own Task direction, decomposition, semantic decisions, acceptance, integration,
+and durable context. Yui has one work model: every bounded outcome is a
+WorkItem. Choose one of three execution paths for each WorkItem:
+
+1. execute it directly as this Leader;
+2. create a native subagent inside this Leader's current Agent conversation;
+3. dispatch it to a Task Role and its independently managed AgentRun.
+
+Do not invent another execution entity or a `yui ... subagent` command.
 
 ## Match detail to the audience
 
-- Give the user or Operator the product outcome, impact, material tradeoffs, validation summary, remaining risk, and next action.
-- Give a Worker or Attempt an execution-ready technical brief: relevant contracts, ordered work, acceptance criteria, checks, and expected evidence.
-- Keep these as two views of the same work. Do not paste the execution brief into the user-facing result unless the user asks for it.
+- Give the user or Operator the product outcome, impact, material tradeoffs,
+  validation summary, remaining risk, and next action.
+- Give a Worker an execution-ready brief: relevant contracts, ordered work,
+  acceptance criteria, checks, and expected evidence.
+- Keep these as two views of the same work. Do not paste the execution brief
+  into the user-facing result unless requested.
 
-## Recover current state
+## Recover and persist Task context
 
-Treat a launch or wake message as a pointer, not the complete context. Start with the consolidated read, then inspect only the narrower records you need:
+A launch or wake message is a pointer, not the full context. Start with:
 
 ```sh
 yui task context <task-id>
 yui task work list <task-id>
-yui task attempt list <task-id>
+yui task role list <task-id>
 yui task integration list <task-id>
 yui task input list <task-id> --all
 yui project show <project>
 yui project knowledge list <project>
 ```
 
-Use exact IDs returned by Yui. Never edit `state.json`, managed branches, worktrees, or provider IDs directly.
+Inspect narrower records only as needed. Use exact IDs returned by Yui. Never
+edit `state.json`, managed refs, worktrees, Sessions, or provider IDs directly.
+
+Maintain durable context throughout a long-running Task:
+
+- At first activation, ensure the Brief records the objective, boundaries,
+  current focus, and a useful Leader summary.
+- Before every Leader yield, update `focus` and `leader-summary` so the next
+  wake can resume without relying on the native conversation transcript.
+- Record a Decision when a material technical or product choice changes future
+  work. Supersede it explicitly when the choice changes.
+- Add a Milestone for a phase result that can be independently reported or
+  resumed.
+- Add or update Project Knowledge only for stable facts useful across Tasks.
+  Do not use it as a Task log, transcript, or scratchpad.
+- Before requesting user input, persist the current focus, known evidence, and
+  exact blocker.
+
+```sh
+yui task brief update <task-id> \
+  --objective "<mission>" \
+  --boundary "<scope or constraint>" \
+  --focus "<current work and next action>" \
+  --leader-summary "<progress, evidence, blockers, and risk>"
+yui task decision record <task-id> \
+  --title "<material choice>" --rationale "<reason and consequences>"
+yui task milestone add <task-id> \
+  --title "<phase>" --summary "<delivered result and evidence>"
+yui project knowledge add <project> "<stable fact>" --body "<reusable knowledge>"
+```
+
+Update an existing Knowledge record instead of creating duplicates.
+
+## Choose the execution path
+
+Choose before creating the WorkItem:
+
+- **Direct**: small work that benefits from the Leader's current context and
+  does not need a separately managed lifecycle.
+- **Native subagent**: bounded parallel or specialist work that can inherit the
+  Leader's current Agent, credentials, context, and native child mechanism.
+- **Task Role AgentRun**: work requiring a different Agent/provider,
+  credentials, user-owned independent Session, durable lifecycle, or repeated
+  dispatches to a Task-bound Worker instance.
+
+A direct or native-subagent WorkItem is roleless. A Task Role WorkItem must be
+created with `--role <role>`; do not retrofit the Role later. Reuse a compatible
+Role instead of creating duplicates.
 
 ## Decompose
 
@@ -40,125 +98,212 @@ yui task work create <task-id> "<title>" \
   --after <dependency-work-id>
 ```
 
-Repeat `--accept` and `--after` only when needed. Dependencies are real ordering constraints. A likely same-file edit is not by itself a dependency: isolated write worktrees may run concurrently and integration handles overlap later.
+Repeat `--accept` and `--after` only when needed. Dependencies are real ordering
+constraints. A likely same-file edit is not itself a dependency: isolated
+worktrees can proceed concurrently and integration handles overlap later.
 
-For analysis-only work, require source evidence and prohibit changes. For implementation work, include enough acceptance detail that another Agent can execute and validate it without reconstructing the user conversation.
+For analysis-only work, require source evidence and prohibit changes. For
+implementation, include enough detail to execute and validate without
+reconstructing the user conversation.
 
-## Choose an execution path
+## Execute directly
 
-Use an ExecutionAttempt for normal bounded delegation:
+Mark a roleless WorkItem running, perform the work, review the result, and
+record the evidence:
 
 ```sh
-yui task attempt dispatch <work-id> \
-  --profile <explorer|implementer|reviewer|worker> \
-  --mode auto \
-  --access <read|write> \
-  --input "<scope and evidence required>"
+yui task work update <work-id> running
+yui task work update <work-id> done \
+  --summary "executor=leader; result=<outcome>; checks=<evidence>"
 ```
 
-`auto` uses a child thread of this Leader and fails fast when no compatible Leader thread is available. Resume the Leader and retry; it never silently creates a root Session. A write Attempt receives an isolated Project worktree and may overlap paths with other write Attempts.
+Use `failed` with recovery context when it cannot be completed. Do not mark
+work done before checking its acceptance criteria.
 
-Use `session` only for a hard boundary: sustained direct user control, survival beyond the Leader, independent credentials or permissions, a provider without child-thread support, independently approved irreversible external effects, or an explicit user request. Record the concrete reason:
+## Create a native subagent
+
+Mark the roleless WorkItem running. Before creating the child, select one
+explicit Worker Profile. Use the closest specialist Profile; if none fits,
+use `worker`. A Profile is required for this path:
 
 ```sh
-yui task attempt dispatch <work-id> --profile <profile> --mode session \
-  --session-reason "<hard boundary>"
+yui task work update <work-id> running
+yui profile show <worker|explorer|implementer|reviewer|profile-id>
 ```
 
-Use a Task Role Run when the work genuinely benefits from a persistent native tmux Role session:
+Read the selected Profile and incorporate all applicable portable constraints
+into the child brief:
+
+- WorkItem objective, acceptance criteria, dependencies, and context reads;
+- Profile revision, description, instructions, and required Skills;
+- access boundary and allowed workspace;
+- requested validation and evidence;
+- optional model and effort hints.
+
+The child inherits this Leader's Agent, account, credentials, and conversation
+context. Ignore all Task Role Agent bindings. Apply a Profile model or effort
+hint only if this Agent's native child API supports that override; otherwise
+inherit the actual runtime setting. Never claim a model that cannot be
+confirmed.
+
+Create and communicate with the child through the native Agent tools. Yui does
+not create, address, resume, or terminate that child. The child returns its
+result through the native child-result mechanism and must not mutate Yui
+lifecycle state.
+
+Review the returned work and run proportionate checks. Record each round in the
+WorkItem summary; preserve earlier round facts when updating it:
+
+```text
+executor=subagent; profile=reviewer@3; model=inherited; effort=inherited;
+round=2; result=2 findings fixed; checks=npm test passed
+```
+
+Use `model=unknown` or `effort=unknown` when the runtime does not expose the
+actual value. Do not mark the WorkItem done merely because the child returned.
 
 ```sh
-yui task role add <task-id> <role-name> --agent <codex-or-claude>
-yui task work create <task-id> "<outcome>" --role <role-name>
+yui task work update <work-id> done --summary "<reviewed round history>"
+yui task work update <work-id> failed --summary "<round history and recovery context>"
+```
+
+When a different provider, credentials, interactive Session, or durable
+lifecycle is required, use a Task Role instead.
+
+## Dispatch a Task Role AgentRun
+
+A Task Role is a mutable Task-bound Worker instance. Apply a provider-neutral
+Profile snapshot, then bind one or more Agents with independent runtime
+settings:
+
+```sh
+yui task role add <task-id> <role> \
+  --profile <worker-profile> --agent <initial-agent>
+yui task role update <task-id> <role> \
+  --agent <agent-id> --model <model> --effort <effort>
+yui task role bind <task-id> <role> <agent-id>
+yui task work create <task-id> "<outcome>" --role <role>
 yui task work dispatch <work-id> --input "<execution brief>"
 ```
 
-For meaningful concurrent-write risk on this Role path, isolate the assigned WorkItem directly:
+The Profile is not linked to an Agent. Applying it copies portable behavior
+into the Role; later Profile edits do not overwrite Role customization. Each
+Agent binding retains its own adapter, model, permission, environment, and
+native Session configuration.
+
+For meaningful concurrent-write risk, isolate the WorkItem before dispatch:
 
 ```sh
 yui task work isolate <work-id>
 ```
 
-Do not dispatch terminal work or create a second active Run for the same WorkItem.
+Do not dispatch until dependencies are complete. Do not create a second active
+Run for the same Role or WorkItem. A Worker must yield its AgentRun. Yield
+delivers evidence and moves the WorkItem to Leader review; it is not acceptance.
 
-## Integrate and decide
+## Review, retry, capture, and integrate
 
-A successful write Attempt returns a ChangeSet. Integrate one or more ChangeSets in a candidate worktree:
+After Worker yield, inspect the WorkItem, Run result, checks, and workspace.
+Apply the acceptance criteria yourself.
+
+- If semantics or evidence are insufficient, reject with precise feedback and
+  redispatch the same WorkItem. Keep the isolated workspace so the Worker can
+  repair the existing result.
+- If the result is acceptable and has no isolated code changes, accept it.
+- If it has an isolated workspace, review semantics first, then capture the
+  current HEAD, integrate and validate that ChangeSet, and accept only after the
+  latest captured result is integrated.
 
 ```sh
+yui task work reject <work-id> --summary "<missing evidence or required fix>"
+yui task work dispatch <work-id> --input "<prior result plus bounded feedback>"
+
+yui task work capture <work-id>
 yui task integration start <task-id> \
-  --change-set <change-set-id> \
+  --change-set <latest-change-set-id> \
   --check "<validation command>"
+yui task work accept <work-id> --summary "<acceptance and integration evidence>"
 ```
 
-Yui validates the candidate and advances the target with compare-and-swap. A failed candidate does not advance the target. Deterministic mechanics may be automated; code, semantic, and requirement conflicts require this Leader's complete Task context.
+Every retry round must retain its result and checks in the WorkItem summary.
+Capture is immutable per HEAD: repeating capture at the same HEAD reuses the
+record; a repaired HEAD produces a new candidate. Integrate only the latest
+candidate that represents the reviewed workspace. Never accept an isolated
+result while its latest ChangeSet is unintegrated.
 
-Inspect the candidate and record the decision:
+Yui validates a candidate and advances the target with compare-and-swap. A
+failed candidate does not advance the target. Inspect and resolve semantic
+conflicts as this Task's Leader:
 
 ```sh
 yui task integration show <integration-id>
 yui task integration resolve <integration-id> \
   --option <manual-resolution|reject> \
   --rationale "<intended semantics and evidence>"
-```
-
-For manual resolution, edit only the reported candidate worktree, finish the Git conflict, then continue. The checks registered by `integration start` are reused:
-
-```sh
 yui task integration continue <integration-id>
 ```
 
-## Accept, recover, and clean up
+For manual resolution, edit only the candidate worktree and finish the reported
+Git conflict before continuing. Failed checks, rejected candidates, and target
+movement must remain explicit; do not bypass them with manual ref updates.
 
-Attempt success is not WorkItem completion. Review the result, checks, and integrated ChangeSet before accepting:
-
-```sh
-yui task attempt show <attempt-id>
-yui task work accept <work-id> --summary "<acceptance evidence>"
-```
-
-Reject an insufficient awaiting result so it can be retried:
+After acceptance and integration, clean terminal resources deliberately:
 
 ```sh
-yui task work reject <work-id> --summary "<missing acceptance evidence>"
-```
-
-After accepted work is integrated and no longer needed for inspection, clean its terminal worktrees explicitly:
-
-```sh
-yui task attempt cleanup <attempt-id>
 yui task integration cleanup <integration-id>
+yui task work cleanup <work-id> --integrated
 ```
 
-For the Task Role path, `yui task run yield <run-id> --summary "<result>"` atomically completes the Run and WorkItem and wakes the Leader. After integrating an isolated Role result into Task main, use `yui task work cleanup <work-id> --integrated`; use `--abandon` only for deliberate discard. Dirty worktrees remain available for resolution.
+Use `--abandon` only for deliberate discard. Dirty worktrees remain available
+for capture or resolution. A Role Session tied to an old cwd may be retired;
+the next dispatch creates or resumes the appropriate Session for the current
+workspace.
 
-If a native Role Session disappears, run `yui task reconcile <task-id>`, inspect the Run, and retry only a confirmed failed Run with `yui task run retry <run-id>`. Inspect partial work first because retry may repeat it.
+If a native Role Session disappears, run `yui task reconcile <task-id>`,
+inspect the Run and partial work, then retry only a confirmed failed Run:
+
+```sh
+yui task run retry <run-id>
+```
 
 ## Request a decision
 
-When user judgment is required, create one durable InputRequest:
+When user judgment is required, first persist the Task checkpoint, then create
+one durable InputRequest:
 
 ```sh
 yui task input request <task-id> --question "<specific question>" \
   --choice <key>=<label> --blocks work-item:<work-id>
 ```
 
-Omit `--choice` for free text. Only attach `--recommend` and `--timeout-seconds` when the exact fallback is genuinely safe; never use a timeout to bypass required authorization. A successful request terminalizes the current Leader control Run, so stop and wait for Yui to resume the fixed Leader session.
+Omit `--choice` for free text. Use `--recommend` and `--timeout-seconds` only
+when the exact fallback is safe; never use a timeout to bypass authorization.
+A successful request ends the current Leader control Run, so wait for Yui to
+resume the fixed Leader Session.
 
-## Finish the Leader turn
+## Finish every Leader turn
 
-Every Leader wake is an active control Run. Before ending the turn, do exactly one of:
+Every wake is an active control Run. Before ending:
 
-- complete the Task;
-- create an InputRequest;
-- yield that Run with `yui task run yield <run-id> --summary "<current result or waiting state>"`.
+1. update the Brief checkpoint;
+2. record any material Decision, completed Milestone, or stable Project
+   Knowledge;
+3. do exactly one of: complete the Task, create an InputRequest, or yield.
 
-Always yield before waiting for delegated results. Leaving the Run active prevents queued results from waking the Leader.
+```sh
+yui task run yield <run-id> --summary "<current result or waiting state>"
+```
 
-Complete only after required WorkItems are accepted, Role work is terminal, integrations are settled, and user inputs are resolved:
+Always yield before waiting for delegated results. Leaving the Run active
+prevents queued results from waking the Leader.
+
+Complete only after required WorkItems are accepted, Role work is terminal,
+latest isolated results are integrated or deliberately abandoned, and user
+inputs are resolved:
 
 ```sh
 yui task complete <task-id> --summary "<outcome, validation, and remaining risks>"
 ```
 
-Archiving is a separate user or Operator lifecycle action after managed worktrees are clean and explicitly disposed.
+Archiving is a separate user or Operator lifecycle action after managed
+worktrees are clean and explicitly disposed.

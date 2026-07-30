@@ -83,8 +83,7 @@ export function updateWorkItemStatus(
   validateStatus(status);
   const alreadyTerminal = isTerminalStatus(workItem.status);
   const closingFailedWork = workItem.status === "failed"
-    && (status === "cancelled" || status === "superseded")
-    && workItem.workspaceDisposition === undefined;
+    && (status === "cancelled" || status === "superseded");
   if (alreadyTerminal && status !== workItem.status && !closingFailedWork) {
     throw new Error(`Terminal Work Item status cannot change: ${workItem.id}.`);
   }
@@ -107,7 +106,7 @@ export function updateWorkItemStatus(
   const {
     endedAt: _endedAt,
     outcome: _outcome,
-    workspaceDisposition: _workspaceDisposition,
+    workspaceDisposition,
     ...base
   } = workItem;
   return validateWorkItem({
@@ -115,6 +114,11 @@ export function updateWorkItemStatus(
     status,
     revision: workItem.revision + 1,
     ...(normalizedOutcome === undefined ? {} : { outcome: normalizedOutcome }),
+    // An isolated result's disposition is still durable evidence after the
+    // failed WorkItem is explicitly cancelled or superseded.
+    ...(closingFailedWork && workspaceDisposition !== undefined
+      ? { workspaceDisposition }
+      : {}),
     updatedAt: timestamp,
     ...(terminal ? { endedAt: timestamp } : {})
   });

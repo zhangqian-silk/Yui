@@ -117,6 +117,7 @@ const PUBLIC_PATHS = [
   "task work update",
   "task work dispatch",
   "task work isolate",
+  "task work capture",
   "task work cleanup",
   "task work accept",
   "task work reject",
@@ -125,13 +126,6 @@ const PUBLIC_PATHS = [
   "task run list",
   "task run retry",
   "task run yield",
-  "task attempt",
-  "task attempt dispatch",
-  "task attempt list",
-  "task attempt show",
-  "task attempt retry",
-  "task attempt interrupt",
-  "task attempt cleanup",
   "task integration",
   "task integration start",
   "task integration continue",
@@ -237,18 +231,13 @@ function createPorts() {
           ? [{ id: "work-alpha", title: "Alpha work", taskId: params.taskId }]
           : [{ id: "work-beta", title: "Beta work", taskId: params.taskId }];
       }
-      if (method === "task.attempt.list") {
-        return params.taskId === "task-alpha"
-          ? [{ id: "attempt-alpha", workItemId: "work-alpha", state: "failed", executor: "fork" }]
-          : [{ id: "attempt-beta", workItemId: "work-beta", state: "interrupted", executor: "session" }];
-      }
       if (method === "task.integration.list") {
         return params.taskId === "task-alpha"
           ? [{ id: "integration-alpha", status: "blocked", targetRef: "main" }]
           : [];
       }
       if (method === "task.change-set.list") {
-        return [{ id: "change-set-alpha", attemptId: "attempt-alpha", baseCommit: "a", headCommit: "b" }];
+        return [{ id: "change-set-alpha", workItemId: "work-alpha", baseCommit: "a", headCommit: "b" }];
       }
       if (method === "task.input.list") {
         return [
@@ -284,7 +273,7 @@ function values(set) {
   return set.candidates.map((candidate) => candidate.value);
 }
 
-test("interaction policies cover missing task, work, Attempt, Integration, and job identifiers", () => {
+test("interaction policies cover missing task, work, Integration, and job identifiers", () => {
   const expected = [
     [["task", "show"], 2, "tasks"],
     [["task", "activate"], 2, "tasks"],
@@ -296,10 +285,6 @@ test("interaction policies cover missing task, work, Attempt, Integration, and j
     [["role", "show"], 2, "global-roles"],
     [["task", "role", "show"], 4, "task-roles"],
     [["task", "work", "accept"], 3, "work-items"],
-    [["task", "attempt", "dispatch"], 3, "work-items"],
-    [["task", "attempt", "list"], 3, "tasks"],
-    [["task", "attempt", "retry"], 3, "execution-attempts"],
-    [["task", "attempt", "interrupt"], 3, "execution-attempts"],
     [["task", "integration", "list"], 3, "tasks"],
     [["task", "integration", "resolve"], 3, "integration-attempts"],
     [["jobs", "retry"], 2, "jobs"]
@@ -339,18 +324,13 @@ test("candidate providers read the current core entities through CoreCliPorts.ca
   assert.deepEqual(values(await getSelectionCandidates(
     selector("work-items", "work-item", { argumentIndex: 3 }),
     ports,
-    ["task", "attempt", "dispatch"]
+    ["task", "work", "accept"]
   )), ["work-alpha", "work-beta"]);
   assert.deepEqual(values(await getSelectionCandidates(
     selector("task-roles", "task-role", { argumentIndex: 4, dependsOn: 3 }),
     ports,
     ["task", "role", "show", "task-alpha"]
   )), ["leader", "reviewer"]);
-  assert.deepEqual(values(await getSelectionCandidates(
-    selector("execution-attempts", "execution-attempt", { argumentIndex: 3 }),
-    ports,
-    ["task", "attempt", "retry"]
-  )), ["attempt-alpha", "attempt-beta"]);
   assert.deepEqual(values(await getSelectionCandidates(
     selector("integration-attempts", "integration-attempt", { argumentIndex: 3 }),
     ports,
@@ -392,12 +372,6 @@ test("candidate providers read the current core entities through CoreCliPorts.ca
   assert.deepEqual(
     new Set(ports.events
       .filter(({ method }) => method === "task.work.list")
-      .map(({ params }) => params.taskId)),
-    new Set(["task-alpha", "task-beta"])
-  );
-  assert.deepEqual(
-    new Set(ports.events
-      .filter(({ method }) => method === "task.attempt.list")
       .map(({ params }) => params.taskId)),
     new Set(["task-alpha", "task-beta"])
   );
@@ -470,18 +444,18 @@ test("InputRequest interaction and completion select global or Task-scoped open 
 });
 
 test("an empty Agent selection chooses the configured default Agent", async () => {
-  const node = findCommandNode(["profile", "add"]);
+  const node = findCommandNode(["task", "role", "add"]);
   assert.ok(node);
   const ports = createPorts();
   const io = selectionIo([""]);
 
   const result = await resolveInteractiveArguments(
-    ["profile", "add", "reviewer", "--agent"], node, ports, io
+    ["task", "role", "add", "task-alpha", "reviewer", "--agent"], node, ports, io
   );
 
   assert.deepEqual(result, {
     kind: "resolved",
-    args: ["profile", "add", "reviewer", "--agent", "claude"]
+    args: ["task", "role", "add", "task-alpha", "reviewer", "--agent", "claude"]
   });
   assert.match(io.writes.join(""), /Default/);
   assert.match(io.writes.join(""), /claude\s+claude\s+claude\s+default/);

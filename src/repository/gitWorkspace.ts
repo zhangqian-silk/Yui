@@ -55,13 +55,6 @@ export interface GitWorkspacePort {
     roleName: string;
     deleteBranch?: boolean;
   }>): Promise<GitWorkspaceRemoval>;
-  ensureAttemptWorktree(input: Readonly<{
-    repositoryPath: string;
-    container: string;
-    taskId: string;
-    attemptId: string;
-    baseRef: string;
-  }>): Promise<PreparedGitWorktree>;
   ensureIntegrationWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
@@ -69,14 +62,6 @@ export interface GitWorkspacePort {
     integrationId: string;
     baseRef: string;
   }>): Promise<PreparedGitWorktree>;
-  removeAttemptWorktree(input: Readonly<{
-    repositoryPath: string;
-    container: string;
-    taskId: string;
-    attemptId: string;
-    expectedBaseCommit?: string;
-    allowCommittedChanges?: boolean;
-  }>): Promise<GitWorkspaceRemoval>;
   removeIntegrationWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
@@ -184,21 +169,6 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       repositoryPath: input.repositoryPath,
       container: input.container,
       identity: worktreeIdentity(input.taskId, input.roleName),
-      baseRef: input.baseRef
-    });
-  }
-
-  async ensureAttemptWorktree(input: Readonly<{
-    repositoryPath: string;
-    container: string;
-    taskId: string;
-    attemptId: string;
-    baseRef: string;
-  }>): Promise<PreparedGitWorktree> {
-    return this.#ensureManagedWorktree({
-      repositoryPath: input.repositoryPath,
-      container: input.container,
-      identity: attemptWorktreeIdentity(input.taskId, input.attemptId),
       baseRef: input.baseRef
     });
   }
@@ -313,25 +283,6 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     return porcelain.length > 0 ? "dirty" : "clean";
   }
 
-  async removeAttemptWorktree(input: Readonly<{
-    repositoryPath: string;
-    container: string;
-    taskId: string;
-    attemptId: string;
-    expectedBaseCommit?: string;
-    allowCommittedChanges?: boolean;
-  }>): Promise<GitWorkspaceRemoval> {
-    return this.#removeManagedWorktree({
-      repositoryPath: input.repositoryPath,
-      container: input.container,
-      identity: attemptWorktreeIdentity(input.taskId, input.attemptId),
-      ...(input.expectedBaseCommit === undefined
-        ? {}
-        : { expectedBaseCommit: input.expectedBaseCommit }),
-      allowCommittedChanges: input.allowCommittedChanges ?? false
-    });
-  }
-
   async removeIntegrationWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
@@ -403,18 +354,6 @@ export function worktreeIdentity(
   return {
     directory: join(taskKey, roleKey),
     branch: `yui/${gitRefSegment(taskKey)}/${gitRefSegment(roleKey)}`
-  };
-}
-
-export function attemptWorktreeIdentity(
-  taskId: string,
-  attemptId: string
-): Readonly<{ directory: string; branch: string }> {
-  const taskKey = safeIdentity(taskId, "Task id");
-  const attemptKey = safeIdentity(attemptId, "Execution Attempt id");
-  return {
-    directory: join(taskKey, "attempts", attemptKey),
-    branch: `yui/${gitRefSegment(taskKey)}/attempt/${gitRefSegment(attemptKey)}`
   };
 }
 

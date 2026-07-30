@@ -402,22 +402,20 @@ test("Agent update permits an adapter change when the Agent has no Role referenc
   assert.equal(storedAgent(store, secondary.id).command, "claude");
 });
 
-test("Agent update rejects an adapter change referenced by any Agent Profile revision", (t) => {
+test("provider-neutral Agent Profiles do not fence Configured Agent changes", (t) => {
   const { store, secondary } = fixture(t);
   store.saveAgentProfile(createAgentProfile({
     id: "reviewer",
-    agentId: secondary.id,
     defaultAccess: "read"
   }, NOW));
 
-  assert.throws(
-    () => runAgentCommand([
+  assert.match(
+    runAgentCommand([
       "update", secondary.id, "--adapter", "claude", "--command", "claude"
     ], store),
-    (error) => error?.code === "USAGE_ERROR"
-      && /Agent Profile reviewer revision 1/u.test(error.message)
+    /Updated agent secondary/u
   );
-  assert.equal(storedAgent(store, secondary.id).adapterId, "codex");
+  assert.equal(storedAgent(store, secondary.id).adapterId, "claude");
 });
 
 test("Agent remove refuses config and Role references, but removes an unused Agent", async (t) => {

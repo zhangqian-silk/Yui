@@ -3,7 +3,7 @@ import { mkdir, open, rm, stat } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
-import type { CheckResult } from "../execution/executionAttempt.js";
+import type { CheckResult } from "./checkResult.js";
 import { NodeGitWorkspace, type GitWorkspacePort } from "../repository/gitWorkspace.js";
 import type { GitWorkspaceRemoval } from "../repository/gitWorkspace.js";
 import { resolveWorktreeRoot } from "../repository/taskWorkspacePreparer.js";
