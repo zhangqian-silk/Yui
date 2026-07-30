@@ -352,6 +352,8 @@ Agent 环境变量绑定只保存进程环境变量名，不保存 secret 值；
 Yui 面向一台机器上的一个受信任本地用户。它的 Web/API 仅支持 loopback，不包含远程或多用户 Web、分布式协调、backup/import/export、trash/restore、derived index、recovery journal、runtime lease、inactivity TTL、cooldown 或 recurring schedule。
 
 持久化和调度细节见 [ARCHITECTURE.md](../ARCHITECTURE.md)。
+可复用的用户视角验收方案见
+[Operator 路由与长期任务端到端测试方案](../docs/testing/operator-routing-e2e-plan.md)。
 
 ## 本地开发
 

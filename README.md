@@ -403,6 +403,8 @@ derived indexes, recovery journals, runtime leases, inactivity TTLs,
 cooldowns, and recurring schedules.
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for persistence and scheduling details.
+The reusable, user-driven acceptance plan is documented in
+[Operator routing and long-running Task E2E testing](./docs/testing/operator-routing-e2e-plan.md).
 
 ## Development
 
