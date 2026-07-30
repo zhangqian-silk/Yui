@@ -13,14 +13,6 @@ export function taskRoleSessionTitle(
   return sessionTitle(["Yui", task.id, task.title, roleLabel(roleName)]);
 }
 
-export function executionAttemptSessionTitle(
-  task: TaskSessionIdentity,
-  workItemTitle: string,
-  profileId: string
-): string {
-  return sessionTitle(["Yui", task.id, task.title, workItemTitle, profileId]);
-}
-
 function sessionTitle(segments: readonly string[]): string {
   const normalized = segments.map(normalizeSegment);
   const full = normalized.join(TITLE_SEPARATOR);

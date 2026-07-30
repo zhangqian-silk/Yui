@@ -114,7 +114,7 @@ export function renderControllerResourceStatus(
   }
 
   const sessions = snapshot.resources.filter((resource) => (
-    (resource.kind === "agent-session" || resource.kind === "execution-attempt")
+    resource.kind === "agent-session"
     && (verbose || resource.disposition === "protected")
   ));
   if (sessions.length > 0) {
@@ -122,7 +122,7 @@ export function renderControllerResourceStatus(
       "Agent sessions",
       [
         { header: "Task", minWidth: 8, maxWidth: 18 },
-        { header: "Role/Attempt", minWidth: 12, maxWidth: 22 },
+        { header: "Role", minWidth: 12, maxWidth: 22 },
         { header: "Agent", minWidth: 7, maxWidth: 14 },
         { header: "State", minWidth: 8, maxWidth: 12 },
         { header: "PID", minWidth: 5, maxWidth: 8 },
@@ -321,16 +321,6 @@ function sessionRow(resource: RuntimeResource): string[] {
       formatBytes(resource.rssBytes)
     ];
   }
-  if (resource.owner.kind === "attempt") {
-    return [
-      resource.owner.taskId,
-      resource.owner.attemptId,
-      resource.owner.profileId,
-      resource.state,
-      pid === undefined ? "—" : String(pid),
-      formatBytes(resource.rssBytes)
-    ];
-  }
   return [
     "—",
     resource.target ?? resource.kind,
@@ -390,7 +380,6 @@ function ownerLabel(owner: RuntimeOwner): string {
     case "controller-domain": return owner.yuiHome;
     case "task-role": return `${owner.taskId}/${owner.roleName}`;
     case "global-role": return `global/${owner.roleName}`;
-    case "attempt": return `${owner.taskId}/${owner.attemptId}`;
     case "none": return "unattributed";
   }
 }

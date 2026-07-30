@@ -2,7 +2,10 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { callController, readControllerDiscovery } from "../core/controllerClient.js";
-import type { JsonValue } from "../core/protocol.js";
+import {
+  FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+  type JsonValue
+} from "../core/protocol.js";
 import type { FileRoleLaunchPlanner } from "../executor/fileRoleLaunchPlanner.js";
 import type { TaskWorkflowRuntimePort } from "../commands/taskCommands.js";
 import {
@@ -43,6 +46,31 @@ export type FileControllerClientOptions = Readonly<{
   onError?: (error: unknown) => void;
 }>;
 
+/**
+ * Direct FileTaskStore writers must not extend state while an older Controller
+ * is still reading the same YUI_HOME.
+ */
+export async function assertFileTaskControllerStorageCompatible(
+  home: string,
+  options: Pick<FileControllerClientOptions, "call"> = {}
+): Promise<void> {
+  const call = options.call ?? callController;
+  let status: JsonValue;
+  try {
+    status = await call(home, "controller.status", {});
+  } catch (error) {
+    if (isDefinitelyNotRunning(error)) return;
+    if (isUnavailable(error)) {
+      throw new Error(
+        "Controller compatibility could not be verified. Retry or run `yui controller restart`.",
+        { cause: error }
+      );
+    }
+    throw error;
+  }
+  assertCompatibleControllerStatus(status);
+}
+
 /** Starts the per-home FileTask Controller on demand and waits until callable. */
 export async function ensureFileTaskController(
   home: string,
@@ -50,7 +78,9 @@ export async function ensureFileTaskController(
 ): Promise<JsonValue> {
   const call = options.call ?? callController;
   try {
-    return await call(home, "controller.status", {});
+    const status = await call(home, "controller.status", {});
+    assertCompatibleControllerStatus(status);
+    return status;
   } catch (error) {
     if (!isUnavailable(error)) throw error;
   }
@@ -61,7 +91,9 @@ export async function ensureFileTaskController(
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
-      return await call(home, "controller.status", {});
+      const status = await call(home, "controller.status", {});
+      assertCompatibleControllerStatus(status);
+      return status;
     } catch (error) {
       if (!isUnavailable(error)) throw error;
       if (Date.now() >= deadline) {
@@ -69,6 +101,19 @@ export async function ensureFileTaskController(
       }
       await delay(pollMs);
     }
+  }
+}
+
+function assertCompatibleControllerStatus(status: JsonValue): void {
+  const statusRecord = isJsonRecord(status) && status.running === true ? status : null;
+  const actual = statusRecord?.protocolVersion;
+  if (statusRecord === null || actual !== FILE_TASK_CONTROLLER_PROTOCOL_VERSION) {
+    throw new Error(
+      `Controller protocol is incompatible (expected ${
+        FILE_TASK_CONTROLLER_PROTOCOL_VERSION
+      }, found ${typeof actual === "number" ? actual : "unknown"}). `
+        + "Run `yui controller restart` before writing new task records."
+    );
   }
 }
 

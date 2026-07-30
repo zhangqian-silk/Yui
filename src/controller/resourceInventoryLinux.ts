@@ -10,7 +10,6 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
 import { activeRoleAgentSession } from "../executor/agentExecutor.js";
-import { attemptControlSocketPath } from "../execution/attemptCoordinator.js";
 import { inspectStorageSchema } from "../storage/storageSchema.js";
 import { FileTaskStore } from "../storage/taskStore.js";
 import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
@@ -29,7 +28,6 @@ import {
   type ControllerInventoryScope,
   type ControllerResourceInventory,
   type RuntimeArtifactFact,
-  type RuntimeAttemptFact,
   type RuntimeHomeFact,
   type RuntimeProcessFact,
   type RuntimeProcessKind,
@@ -73,13 +71,6 @@ export async function scanControllerResourceInventory(
     "tmux-socket",
     activeSockets
   );
-  const rawAttemptArtifacts = listSocketArtifacts(
-    join(tmpdir(), `yui-${uid}`),
-    /^attempt-[a-f0-9]{32}\.sock$/u,
-    "attempt-socket",
-    activeSockets
-  );
-
   const homeFacts: RuntimeHomeFact[] = [];
   const associatedArtifacts = new Set<string>();
   for (const home of [...homes].sort()) {
@@ -131,13 +122,6 @@ export async function scanControllerResourceInventory(
       artifacts.push(fileArtifact(controllerSocketPath, "controller-socket", false));
     }
 
-    for (const attempt of state.attempts) {
-      const artifact = rawAttemptArtifacts.find(({ path }) => path === attempt.controlSocketPath);
-      if (artifact === undefined) continue;
-      associatedArtifacts.add(artifact.path);
-      if (attempt.state !== "running") artifacts.push(artifact);
-    }
-
     homeFacts.push({
       yuiHome: home,
       exists: existsSync(home),
@@ -145,13 +129,12 @@ export async function scanControllerResourceInventory(
       discovery,
       panes,
       roles: state.roles,
-      attempts: state.attempts,
       artifacts
     });
   }
 
   const globalArtifacts = options.scope === "all"
-    ? [...rawTmuxArtifacts, ...rawAttemptArtifacts].filter(({ path }) => (
+    ? rawTmuxArtifacts.filter(({ path }) => (
         !associatedArtifacts.has(path)
       ))
     : [];
@@ -397,14 +380,12 @@ function loadHomeState(
 ): Readonly<{
   storageStatus: RuntimeHomeFact["storageStatus"];
   roles: RuntimeRoleFact[];
-  attempts: RuntimeAttemptFact[];
 }> {
   const schema = inspectStorageSchema(home);
   if (schema.status !== "current") {
     return {
       storageStatus: schema.status,
-      roles: [],
-      attempts: []
+      roles: []
     };
   }
   try {
@@ -420,7 +401,6 @@ function loadHomeState(
         ...(session === null ? {} : { nativeSessionId: session.nativeSessionId })
       };
     });
-    const attempts: RuntimeAttemptFact[] = [];
     for (const task of store.listTasks()) {
       for (const role of store.listRoles(task.id)) {
         const session = activeRoleAgentSession(store.getRoleSessionSet(task.id, role.name));
@@ -436,29 +416,11 @@ function loadHomeState(
           ...(session === null ? {} : { nativeSessionId: session.nativeSessionId })
         });
       }
-      for (const attempt of store.listExecutionAttempts(task.id)) {
-        attempts.push({
-          attemptId: attempt.id,
-          taskId: task.id,
-          taskTitle: task.title,
-          taskStatus: task.status,
-          workItemId: attempt.workItemId,
-          profileId: attempt.profileId,
-          state: attempt.state,
-          ...(attempt.providerRef === undefined
-            ? {}
-            : {
-                providerSessionId: attempt.providerRef.sessionId,
-                providerThreadId: attempt.providerRef.threadId
-              }),
-          controlSocketPath: attemptControlSocketPath(home, attempt.id)
-        });
-      }
     }
-    return { storageStatus: "current", roles, attempts };
+    return { storageStatus: "current", roles };
   } catch (error) {
     warnings.push(`Cannot load runtime ownership for ${home}: ${message(error)}`);
-    return { storageStatus: "invalid", roles: [], attempts: [] };
+    return { storageStatus: "invalid", roles: [] };
   }
 }
 

@@ -9,7 +9,7 @@ import { runtimeLifecycleSignalKey } from "../runtime/lifecycleReservation.js";
 import {
   setCodexThreadName,
   type CodexThreadNameRequest
-} from "../execution/codexAppServerExecutor.js";
+} from "../execution/codexThreadNaming.js";
 import { FileTaskStore } from "../storage/taskStore.js";
 
 export type CodexSessionNotification = Readonly<{

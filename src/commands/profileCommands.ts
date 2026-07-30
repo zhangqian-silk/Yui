@@ -1,4 +1,3 @@
-import type { ConfiguredAgent } from "../agent/agent.js";
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import {
@@ -8,7 +7,7 @@ import {
   updateAgentProfile,
   type AgentProfile,
   type AgentProfileInput,
-  type AttemptAccess
+  type WorkerAccess
 } from "../profile/agentProfile.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
@@ -20,9 +19,6 @@ import {
 export type ProfileCommandStore = Pick<
 TaskStore,
 | "transaction"
-| "getConfiguredAgent"
-| "listConfiguredAgents"
-| "getConfig"
 | "getAgentProfile"
 | "listAgentProfiles"
 | "saveAgentProfile"
@@ -54,14 +50,12 @@ function addProfile(
   store: ProfileCommandStore,
   now: Date
 ): Readonly<{ output: string; data: unknown }> {
-  const usage = "Profile add usage: yui profile add <id> --agent <id> [--access <read|write>] [Profile settings].";
+  const usage = "Profile add usage: yui profile add <id> [--access <read|write>] [Profile settings].";
   const [id, ...tail] = args;
   if (id === undefined || id.startsWith("--")) throw usageError("Profile id is required.", usage);
   const parsed = parseProfileOptions(tail, false, usage);
-  const agent = requireCodexAgent(store, required(parsed.one("--agent"), "--agent", usage));
   const profile = createAgentProfile({
     id,
-    agentId: agent.id,
     defaultAccess: parseAccess(parsed.one("--access") ?? "read"),
     ...profileValues(parsed)
   }, now);
@@ -88,14 +82,12 @@ function listProfiles(
           { header: "Profile", minWidth: 7, maxWidth: 24 },
           { header: "Revision", minWidth: 8, maxWidth: 10 },
           { header: "Access", minWidth: 6, maxWidth: 8 },
-          { header: "Agent", minWidth: 5, maxWidth: 18 },
           { header: "Description", minWidth: 12, maxWidth: 54 }
         ],
         profiles.map((profile) => [
           profile.id,
           String(profile.revision),
           profile.defaultAccess,
-          profile.agentId,
           profile.description ?? "-"
         ]),
         defaultTableWidth()
@@ -112,7 +104,6 @@ function showProfile(
     output: `${[
       `Agent Profile: ${profile.id}`,
       `Revision: ${profile.revision}`,
-      `Agent: ${profile.agentId}`,
       `Default access: ${profile.defaultAccess}`,
       `Description: ${profile.description ?? "-"}`,
       `Instructions: ${profile.instructions ?? "-"}`,
@@ -129,17 +120,14 @@ function updateProfile(
   store: ProfileCommandStore,
   now: Date
 ): Readonly<{ output: string; data: unknown }> {
-  const usage = "Profile update usage: yui profile update <id> [--agent <id>] [--access <read|write>] [Profile settings].";
+  const usage = "Profile update usage: yui profile update <id> [--access <read|write>] [Profile settings].";
   const [id, ...tail] = args;
   if (id === undefined || id.startsWith("--")) throw usageError("Profile id is required.", usage);
   const parsed = parseProfileOptions(tail, true, usage);
   if (parsed.seen.size === 0) throw usageError("At least one Profile option is required.", usage);
   assertOptionPairs(parsed);
   const current = requireProfile(store, id);
-  const agentId = parsed.one("--agent");
-  if (agentId !== undefined) requireCodexAgent(store, agentId);
   const updated = updateAgentProfile(current, {
-    ...(agentId === undefined ? {} : { agentId }),
     ...(parsed.has("--access") ? { defaultAccess: parseAccess(parsed.one("--access")) } : {}),
     ...profilePatch(parsed)
   }, now);
@@ -168,14 +156,12 @@ function resetProfiles(
   now: Date
 ): Readonly<{ output: string; data: unknown }> {
   noArgs(args, "Profile reset usage: yui profile reset.");
-  const agent = defaultCodexAgent(store);
   store.transaction((tx) => {
-    for (const desired of builtinAgentProfileInputs(agent.id)) {
+    for (const desired of builtinAgentProfileInputs()) {
       const existing = tx.getAgentProfile(desired.id);
       tx.saveAgentProfile(existing === null
         ? createAgentProfile(desired, now)
         : updateAgentProfile(existing, {
-            agentId: desired.agentId,
             defaultAccess: desired.defaultAccess,
             description: desired.description,
             instructions: desired.instructions,
@@ -193,7 +179,6 @@ function resetProfiles(
 }
 
 const BASE_OPTIONS: readonly [string, RoleOptionKind][] = [
-  ["--agent", "value"],
   ["--access", "value"],
   ["--description", "value"],
   ["--instructions", "value"],
@@ -256,40 +241,15 @@ function assertOptionPairs(parsed: ParsedRoleOptions): void {
   }
 }
 
-function defaultCodexAgent(store: ProfileCommandStore): ConfiguredAgent {
-  const configuredDefault = store.getConfig().defaultAgent;
-  const agents = store.listConfiguredAgents();
-  const agent = agents.find(({ id, adapterId }) => id === configuredDefault && adapterId === "codex")
-    ?? agents.find(({ adapterId }) => adapterId === "codex");
-  if (agent === undefined) {
-    throw usageError("A configured Codex Agent is required to reset built-in Agent Profiles.");
-  }
-  return agent;
-}
-
-function requireCodexAgent(store: ProfileCommandStore, id: string): ConfiguredAgent {
-  const agent = store.getConfiguredAgent(id);
-  if (agent === null) throw usageError(`Agent not found: ${id}.`);
-  if (agent.adapterId !== "codex") {
-    throw usageError("Agent Profiles require a Codex Agent.");
-  }
-  return agent;
-}
-
 function requireProfile(store: ProfileCommandStore, id: string): AgentProfile {
   const profile = store.getAgentProfile(id);
   if (profile === null) throw usageError(`Agent Profile not found: ${id}.`);
   return profile;
 }
 
-function parseAccess(value: string | undefined): AttemptAccess {
+function parseAccess(value: string | undefined): WorkerAccess {
   if (value === "read" || value === "write") return value;
   throw usageError(`Invalid Profile access: ${String(value)}.`);
-}
-
-function required(value: string | undefined, option: string, usage: string): string {
-  if (value === undefined || value.trim().length === 0) throw usageError(`${option} is required.`, usage);
-  return value.trim();
 }
 
 function requiredText(value: string | undefined): string {

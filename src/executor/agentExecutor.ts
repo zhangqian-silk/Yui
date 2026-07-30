@@ -218,6 +218,31 @@ export function updateRoleAgentSessionStatus<TSet extends RoleSessionSet>(
   return updated;
 }
 
+export function retireTaskRoleSessionsForWorkspace(
+  set: TaskRoleSessionSet,
+  now: Date
+): TaskRoleSessionSet {
+  validateRoleSessionSet(set);
+  if (set.inFlight !== null || set.pendingTurnCompletion !== null) {
+    throw new Error("Cannot retire a Task Role session with unsettled Run state.");
+  }
+  const live = Object.values(set.sessions).find(
+    (session) => session.status !== "stopped" && session.status !== "broken"
+  );
+  if (live !== undefined) {
+    throw new Error(
+      `Task Role session must be stopped before workspace migration: ${live.agentId}.`
+    );
+  }
+  return validateRoleSessionSet({
+    ...set,
+    // Native sessions may be scoped to their launch cwd. Every binding must
+    // receive a fresh identity after the Role workspace changes.
+    sessions: {},
+    updatedAt: now.toISOString()
+  });
+}
+
 export function rememberRoleAgentCompletedTurn<TSet extends RoleSessionSet>(
   set: TSet,
   agentId: string,

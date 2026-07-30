@@ -15,14 +15,13 @@ export const BUILTIN_PROFILE_IDS = Object.freeze([
 ] as const);
 
 export type BuiltinProfileId = typeof BUILTIN_PROFILE_IDS[number];
-export type AttemptAccess = "read" | "write";
+export type WorkerAccess = "read" | "write";
 
 export type AgentProfile = Readonly<{
-  schemaVersion: 1;
+  schemaVersion: 2;
   id: string;
   revision: number;
-  agentId: string;
-  defaultAccess: AttemptAccess;
+  defaultAccess: WorkerAccess;
   description?: string;
   instructions?: string;
   skills?: readonly string[];
@@ -34,8 +33,7 @@ export type AgentProfile = Readonly<{
 
 export type AgentProfileInput = Readonly<{
   id: string;
-  agentId: string;
-  defaultAccess?: AttemptAccess;
+  defaultAccess?: WorkerAccess;
   description?: string;
   instructions?: string;
   skills?: readonly string[];
@@ -46,7 +44,7 @@ export type AgentProfileInput = Readonly<{
 export function createAgentProfile(input: AgentProfileInput, now: Date): AgentProfile {
   const timestamp = now.toISOString();
   return validateAgentProfile({
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: requireIdentity(input.id, "Agent Profile id"),
     revision: 1,
     ...normalizeInput(input),
@@ -74,12 +72,11 @@ export function updateAgentProfile(
 }
 
 export function validateAgentProfile(profile: AgentProfile): AgentProfile {
-  if (profile.schemaVersion !== 1) {
-    throw new Error("AgentProfile must use schemaVersion 1.");
+  if (profile.schemaVersion !== 2) {
+    throw new Error("AgentProfile must use schemaVersion 2.");
   }
   requireIdentity(profile.id, "Agent Profile id");
   requirePositiveInteger(profile.revision, "Agent Profile revision");
-  requireIdentity(profile.agentId, "Agent Profile Agent id");
   validateAccess(profile.defaultAccess);
   if (profile.description !== undefined) optionalText(profile.description, "Profile description");
   if (profile.instructions !== undefined) optionalText(profile.instructions, "Profile instructions");
@@ -94,30 +91,26 @@ export function validateAgentProfile(profile: AgentProfile): AgentProfile {
   return profile;
 }
 
-export function builtinAgentProfileInputs(agentId: string): readonly AgentProfileInput[] {
+export function builtinAgentProfileInputs(): readonly AgentProfileInput[] {
   return [
     {
       id: "worker",
-      agentId,
-      description: "Complete one bounded delegated Attempt.",
+      description: "Complete one bounded delegated WorkItem.",
       defaultAccess: "read"
     },
     {
       id: "explorer",
-      agentId,
       description: "Inspect sources and return evidence without modifying them.",
       instructions: "Do not modify files or external state.",
       defaultAccess: "read"
     },
     {
       id: "implementer",
-      agentId,
-      description: "Implement and validate one bounded ChangeSet.",
+      description: "Implement and validate one bounded result.",
       defaultAccess: "write"
     },
     {
       id: "reviewer",
-      agentId,
       description: "Review behavior, evidence, and regression risk.",
       instructions: "Report actionable findings with direct evidence. Do not modify files.",
       defaultAccess: "read"
@@ -130,7 +123,6 @@ AgentProfile,
 "schemaVersion" | "id" | "revision" | "createdAt" | "updatedAt"
 > {
   return {
-    agentId: requireIdentity(input.agentId, "Agent Profile Agent id"),
     defaultAccess: validatedAccess(input.defaultAccess ?? "read"),
     ...(input.description === undefined
       ? {}
@@ -150,9 +142,6 @@ function normalizePatch(
   patch: Readonly<Partial<Omit<AgentProfileInput, "id">>>
 ): Partial<AgentProfile> {
   const result: Record<string, unknown> = {};
-  if (Object.hasOwn(patch, "agentId")) {
-    result.agentId = requireIdentity(patch.agentId ?? "", "Agent Profile Agent id");
-  }
   if (Object.hasOwn(patch, "defaultAccess")) {
     result.defaultAccess = validatedAccess(patch.defaultAccess);
   }
@@ -170,13 +159,13 @@ function normalizePatch(
   return result as Partial<AgentProfile>;
 }
 
-function validatedAccess(value: AttemptAccess | undefined): AttemptAccess {
+function validatedAccess(value: WorkerAccess | undefined): WorkerAccess {
   if (value === undefined) throw new Error("Agent Profile default access is required.");
   validateAccess(value);
   return value;
 }
 
-function validateAccess(value: AttemptAccess): void {
+function validateAccess(value: WorkerAccess): void {
   if (value !== "read" && value !== "write") {
     throw new Error(`Agent Profile default access is invalid: ${String(value)}.`);
   }

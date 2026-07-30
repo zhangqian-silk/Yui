@@ -459,20 +459,33 @@ export function agentComposerReadinessProbe(
           .map((line) => line.trim())
           .filter(Boolean)
           .slice(-12);
-        const composer = tail.at(-1)?.startsWith("❯") === true;
-        const activeTurn = /(?:working|thinking|esc to interrupt|ctrl\+c to interrupt|press ctrl-c)/i
-          .test(tail.join("\n"));
+        const reverseComposerIndex = [...tail]
+          .reverse()
+          .findIndex((line) => line.startsWith("❯"));
+        const composerIndex = reverseComposerIndex < 0
+          ? -1
+          : tail.length - reverseComposerIndex - 1;
+        const composer = composerIndex >= 0
+          && tail.slice(composerIndex + 1).every(claudeComposerChromeLine);
+        const activeTurn = tail.some((line) => (
+          /(?:esc to interrupt|ctrl\+c to interrupt|press ctrl-c)/i.test(line)
+          || /^(?:[•●·*✢✶✽✻]\s*)?(?:working|thinking)\b/i.test(line)
+        ));
         return livePane(pane)
           && composer
           && !activeTurn
           && (
             surface !== "operator"
-            || provablyEmptyStyledComposer(pane, "❯", false)
+            || provablyEmptyStyledComposer(pane, "❯", true)
           );
       };
     default:
       throw new Error(`No tmux readiness probe is registered for Agent adapter: ${adapterId}.`);
   }
+}
+
+function claudeComposerChromeLine(line: string): boolean {
+  return /^[─━═\-\s]+$/u.test(line) || line.startsWith("⏵⏵");
 }
 
 function livePane(pane: TmuxPaneState): boolean {
@@ -510,6 +523,12 @@ function provablyEmptyStyledComposer(
       return false;
     }
     regionEnd = footerIndex;
+  } else {
+    const footerIndex = lines.findIndex((line, index) => (
+      index > composerIndex
+      && claudeComposerChromeLine(stripVTControlCharacters(line).trim())
+    ));
+    if (footerIndex > composerIndex) regionEnd = footerIndex;
   }
   const composerRegion = lines.slice(composerIndex, regionEnd).join("\n");
   let afterMarker = false;

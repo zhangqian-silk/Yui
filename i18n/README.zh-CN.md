@@ -2,17 +2,24 @@
 
 # Yui
 
-Yui 是面向持久 Codex/Claude 工作的本地控制平面。它把可检查的控制状态与 Project 知识、tmux 原生 Agent 终端、可复用 AgentProfile、Leader 上下文 fork、显式验收和隔离 Git worktree 组合成一条完整链路。
+Yui 是面向持久 Codex/Claude 工作的本地控制平面。用户只需和 Operator
+对话；Operator 将不同 Project 的需求、Bug、审查和问题咨询路由到对应
+Task，Leader 再负责拆解、执行选择、验收和安全集成。
 
 当前实现保留实用的 Role/Agent/session 与 CLI 框架，不恢复后期膨胀的数据维护、租约、定时调度和恢复账本体系。
 
 ## 核心模型
 
-- `AgentProfile`：可复用的 Worker 执行模板，保存单一 Codex Agent、模型、最大权限、指令和 Skill；不持有 Session 或 workspace。
-- `WorkItem`：只保存 objective、acceptance、dependsOn、revision 和状态。
-- `ExecutionAttempt`：一次执行，保存精确输入、Profile revision、executor、access、可选 Git base、provider ID 和精简结果。
-- `ChangeSet`：可集成的 base/head commit、branch 和 changed paths。
-- `IntegrationAttempt`：候选集成、检查、冲突报告和 Leader 决策。
+- `WorkItem`：唯一的有界工作单元，保存目标、验收条件、依赖、状态和精简结果。
+- `WorkerProfile`：可复用且与 provider 无关的行为模板，保存指令、Skill、访问要求及可选 model/effort hint。
+- `TaskRole`：Task 内可修改的 Worker 实例，可绑定多个 Agent，并分别保存运行配置。
+- `AgentRun`：Task Role 的一次受管派发与结果交付。
+- `ChangeSet`：隔离 WorkItem 当前 HEAD 的不可变 Git 结果。
+- Integration：候选集成、检查、冲突报告和 Leader 决策。
+
+每个 WorkItem 只选择三条路径之一：Leader 直接执行、Leader 在当前
+Agent 对话内创建 native subagent，或交给 Task Role AgentRun。Yui
+不提供 subagent 启动命令，也不创建 child Session 记录。
 
 内置 Profile：
 
@@ -20,7 +27,8 @@ Yui 是面向持久 Codex/Claude 工作的本地控制平面。它把可检查�
 worker  explorer  implementer  reviewer
 ```
 
-AgentProfile 是由一个已配置 Codex Agent 支撑的版本化 Worker 执行模板，保存默认值和指令，但不持有 Session 或 workspace。Operator 与 Leader 仍是运行时 Role。
+Profile 不绑定 Agent，也不持有 Session 或 workspace。Operator、Leader
+与 Task Role 是运行时 Role。
 
 ## 环境要求
 
@@ -39,7 +47,9 @@ yui doctor
 
 `setup` 是交互式的：检测已安装的 Agent CLI、选择要配置的 Agent、默认 Agent 和 Operator Agent，实时探测所选 CLI 当前支持的模型，再按“模型 → 该模型支持的思考强度”分别配置 Leader/Operator Role；随后确认位于 Yui home 外部的 Project workspace，并询问 shell completion。选择器同时提供原生 CLI 默认值和自定义值入口。再次运行不会删除已有 Task/Role，也不会改变当前安装的 Project workspace，可用于安全地调整配置。
 
-模型与思考强度属于 Role 设置，因此 Leader 与 Operator 即使使用同一个 Agent CLI，也可以采用不同配置。交互式 Role 和 Agent Profile 的新增/更新共用同一运行时选择器；显式传入 `--model`、`--effort` 时仍可作为脚本化的自定义覆盖值。
+模型与思考强度属于 Agent binding 设置，因此 Leader、Operator 和 Task
+Role 即使使用同一个 Agent CLI，也可以采用不同配置。Profile 中的
+model/effort 只是 native child 的可移植 hint。
 
 运行时能力目录会在每次命令中刷新，并缓存在 Yui home。实时探测超时或失败时，Yui 会展示同一 Agent 启动上下文最近一次成功的缓存并明确提示数据可能过期；没有匹配缓存时，则提供 CLI 默认值和自定义入口。`yui agent capabilities <id>` 可一次性读取同一份目录，包括模型、逐模型思考强度，以及权限、搜索可用性、profile、settings source、service tier 等其他运行时选项。
 
@@ -102,6 +112,10 @@ yui operator enter
 ```
 
 不带 `--task` 时会创建新 Draft。Draft 可以继续规划，但激活前不会执行 Agent 工作。
+Operator 会结合 Project Catalog 和现有 Task context 路由请求。同一目标
+的追加需求、修复、审查和咨询继续进入原 Task；Project、目标、base ref
+或生命周期不同则创建独立 Task。需求、Bug 和咨询共用同一
+Task/WorkItem 模型，不增加额外任务类型。
 `operator list` 按固定的最近更新时间倒序展示历史对话，并显示 Agent
 及可读的标题或摘要；底层 provider session ID 始终保持内部实现细节。
 若 adapter 尚未提供这些元数据，Yui 会显示 provider 和稳定的 Yui
@@ -109,51 +123,75 @@ yui operator enter
 `--last` 可直接恢复最近一条；
 `operator new` 创建空白对话，并把原对话保留在历史中。
 
-添加 Worker 并派发 WorkItem：
+添加 Task Role Worker，绑定 Claude 配置并派发 WorkItem：
 
 ```sh
-yui task role add <task-id> implementer --agent codex
+yui task role add <task-id> implementer --profile implementer --agent codex
+yui task role update <task-id> implementer \
+  --agent claude --model claude-opus --permission-mode acceptEdits
+yui task role bind <task-id> implementer claude
 yui task role list <task-id>
 
 yui task work create <task-id> "实现导出器" --role implementer
 yui task work dispatch <work-item-id> --input "完成实现并运行聚焦测试"
 ```
 
-Worker 显式结束当前 Run：
+Worker 显式交付当前 Run：
 
 ```sh
 yui task run yield <run-id> --summary "导出器已完成，聚焦测试通过"
 ```
 
-yield 会原子完成 Run 和 WorkItem、追加结果消息并唤醒 Leader。Leader 不会自唤醒；Leader 忙碌时，Operator/Worker 的 pending wake 会一直保留到 Leader 空闲。
+yield 会结束 AgentRun，将 WorkItem 提交给 Leader 审查，并追加结果消息和
+唤醒 Leader；它不会验收或完成 WorkItem。Leader 不会自唤醒，pending wake
+会保留到 Leader 空闲。
 
-对于不需要持久、用户所有 Session 的有界工作，Leader 可以派发 ExecutionAttempt：
+对于有界工作，Leader 可以直接执行 roleless WorkItem，也可以在当前
+Agent 对话中创建 native subagent：
 
 ```sh
 yui task work create <task-id> "审查实现" \
   --objective "返回有源码依据的问题" \
   --accept "每个问题都标明受影响路径"
-yui task attempt dispatch <work-item-id> --profile reviewer --mode auto --access read
-
-yui task work create <task-id> "实现已接受的改动" \
-  --objective "实现并验证请求行为" \
-  --accept "聚焦测试通过"
-yui task attempt dispatch <work-item-id> --profile implementer --mode auto --access write
+yui task work update <work-item-id> running
+yui profile show reviewer
 ```
 
-`auto` 只 fork 当前活动 Leader thread；不存在兼容 Leader thread 时会直接失败，不会静默创建 root Session。显式 root Session 必须同时提供 `--mode session` 和 `--session-reason`。
+subagent 的创建与结果返回完全由 Leader 当前 Agent 的 native child 能力
+完成，没有 `yui ... subagent` 命令。Leader 必须选择并读取一个显式
+Worker Profile；没有合适的专用 Profile 时使用 `worker`。child brief
+需要包含 Profile revision、instructions、Skills、访问边界、验证要求及
+当前 runtime 支持的 model/effort hint。
 
-Attempt 派发只传递稳定的 Yui 记录引用，不再复制当前 Brief、决策和消息形成第二份快照。Worker 使用受控 `YUI_HOME` 通过 `yui task context` 和 Project Knowledge 命令读取最新上下文，但不会获得 Task Role 身份。
-
-写 Attempt 使用 `<workspace>/worktree/<project>/<task-id>/attempts/<attempt-id>` 下的独立 worktree，因此不同工作即使路径重叠也可以并发进行；重叠只会增加集成成本，不是派发时的文件锁。成功的写 Attempt 生成 ChangeSet。集成会在候选 worktree 应用变更、运行检查，并且只在目标 HEAD 仍与记录值相同时推进目标：
+native subagent 继承 Leader Agent、凭据和对话上下文，忽略 Task Role 的
+Agent bindings。Leader 审查返回结果后，在 WorkItem summary 中登记真实
+执行信息：
 
 ```sh
-yui task integration start <task-id> \
-  --change-set <change-set-id> \
-  --check "npm test"
+yui task work update <work-item-id> done \
+  --summary "executor=subagent; profile=reviewer@3; model=inherited; round=1; result=reviewed; checks=npm test passed"
 ```
 
-Integration 主状态只保存紧凑的检查结果和失败诊断。完整 stdout/stderr 不截断地流式写入 `YUI_HOME/artifacts/integration-checks/...`；`task integration show` 会显示相对日志路径，`task integration cleanup` 会同时清理候选 worktree 和这些日志。
+无法确认实际 model/effort 时使用 `inherited` 或 `unknown`，不能猜测。
+需要独立 provider、凭据、交互 Session 或持久生命周期时，使用 Task Role
+AgentRun。
+
+隔离 Task Role 的结果按“Worker yield → Leader 语义审查 → capture 当前
+HEAD → candidate 集成和检查 → Leader accept”的顺序处理。审查不通过时，
+Leader reject 并在同一 workspace 重新派发。相同 HEAD 重复 capture 复用
+原 ChangeSet；修复后的新 HEAD 形成新候选：
+
+```sh
+yui task work reject <work-item-id> --summary "需要修复的具体问题"
+yui task work dispatch <work-item-id> --input "结合上一轮结果修复"
+yui task work capture <work-item-id>
+yui task integration start <task-id> \
+  --change-set <latest-change-set-id> --check "npm test"
+```
+
+Integration 只保存紧凑检查结果和失败诊断。完整 stdout/stderr 流式写入
+`YUI_HOME/artifacts/integration-checks/...`；`task integration show`
+展示相对日志路径，cleanup 同时清理候选 worktree 和日志。
 
 代码或语义冲突会保持 blocked，直到该 Task 的 Leader 记录决策：
 
@@ -164,13 +202,21 @@ yui task integration resolve <integration-id> \
 yui task integration continue <integration-id>
 ```
 
-Attempt 成功不等于 WorkItem 完成。Leader 审查结果、验证和 ChangeSet 集成后再显式验收：
+Worker yield 不等于 WorkItem 完成。Leader 审查结果、验证和最新
+ChangeSet 集成后再显式验收：
 
 ```sh
 yui task work accept <work-item-id> --summary "验收标准满足。"
 ```
 
-使用 `task work reject` 退回待验收结果以便重试，使用 `task work cancel` 关闭不再需要且未运行的工作。Attempt、Integration worktree 与 Integration 检查日志会作为证据保留，直到显式清理。
+使用 `task work reject` 退回待验收结果以便修复和重新派发，使用
+`task work cancel` 关闭不再需要且未运行的工作。WorkItem、Integration
+worktree 与检查日志会作为证据保留，直到显式清理。
+
+长期 Task 不依赖 native transcript 恢复。Leader 每次 yield 前更新 Brief
+的 focus 和 leader summary；材料性技术选择写入 Decision；可独立汇报的
+阶段成果写入 Milestone；只有跨 Task 稳定有效的信息才进入 Project
+Knowledge。
 
 当活动 Leader Run 必须获得用户决定才能继续时，可以创建持久 InputRequest，并 yield 当前 Run：
 

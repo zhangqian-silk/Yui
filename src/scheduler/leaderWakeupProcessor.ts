@@ -84,7 +84,15 @@ export async function processLeaderWakeups(
         role.name,
         mode,
         input,
-        now
+        now,
+        {
+          agent: {
+            agentId: role.activeAgentId,
+            adapterId: role.adapterId,
+            ...(role.model === undefined ? {} : { model: role.model }),
+            ...(role.effort === undefined ? {} : { effort: role.effort })
+          }
+        }
       );
       const claim = store.saveLeaderDispatch({
         task,

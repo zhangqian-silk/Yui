@@ -1,6 +1,7 @@
 import { rmdir } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
+import { retireTaskRoleSessionsForWorkspace } from "../executor/agentExecutor.js";
 import { updateRole } from "../role/role.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
@@ -133,6 +134,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           const isolated = tx.getRoleWorkspace(task.id, role.name);
           if (isolated !== null && isolated.owner.type === "work-item") continue;
           if (role.workspace !== physical.path) {
+            retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
             tx.saveRole(task.id, updateRole(role, { workspace: physical.path }, timestamp));
           }
         }
@@ -185,6 +187,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       if (existing.owner.type === "work-item" && existing.owner.workItemId === item.id) return existing;
       throw new Error(`Role already has an isolated WorkItem worktree: ${task.id}/${role.name}.`);
     }
+    assertWorkspaceSessionsRetirable(this.store, task.id, role.name, this.now());
     const head = await this.git.inspect(main.path, "HEAD");
     const physical = await this.git.ensureWorktree({
       repositoryPath: project.path,
@@ -227,8 +230,10 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             && current.owner.workItemId === item.id) return current;
           throw new Error(`Role workspace changed: ${task.id}/${role.name}.`);
         }
+        const timestamp = this.now();
+        retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
         tx.saveRoleWorkspace(task.id, workspace);
-        tx.saveRole(task.id, updateRole(latestRole, { workspace: workspace.path }, this.now()));
+        tx.saveRole(task.id, updateRole(latestRole, { workspace: workspace.path }, timestamp));
         return workspace;
       });
     } catch (error) {
@@ -285,6 +290,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     }
     const project = this.store.getProject(workspace.projectId);
     if (project === null) throw new Error(`Project not found: ${workspace.projectId}.`);
+    assertWorkspaceSessionsRetirable(this.store, task.id, workspace.roleName, this.now());
     const removal = await this.git.removeWorktree({
       repositoryPath: project.path,
       container: this.#projectContainer(project.name),
@@ -293,10 +299,20 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       deleteBranch: true
     });
     if (removal === "dirty") return removal;
-    this.#recordWorkspaceRemoval(task, workspace, project.path, {
-      workItemId: item.id,
-      disposition
-    });
+    try {
+      this.#recordWorkspaceRemoval(task, workspace, project.path, {
+        workItemId: item.id,
+        disposition
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Managed WorkItem worktree was removed, but durable cleanup was not recorded for ${
+          item.id
+        }. Stop the Task Role session and retry cleanup. ${detail}`,
+        { cause: error }
+      );
+    }
     return removal;
   }
 
@@ -414,21 +430,29 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     }>
   ): void {
     this.store.transaction((tx) => {
+      const current = tx.getRoleWorkspace(task.id, workspace.roleName);
+      if (current === null || !sameRoleWorkspace(current, workspace)) {
+        if (workItem === undefined) {
+          throw new Error(
+            `Managed workspace changed before cleanup was recorded: ${
+              task.id
+            }/${workspace.roleName}.`
+          );
+        }
+        recordWorkspaceDisposition(tx, task.id, workItem, this.now());
+        return;
+      }
       const role = tx.getRole(task.id, workspace.roleName);
       tx.removeRoleWorkspace(task.id, workspace.roleName);
       const main = tx.getRoleWorkspace(task.id, LEADER_ROLE);
       const target = workspace.owner.type === "task" ? fallback : main?.path ?? fallback;
       if (role !== null && role.workspace !== target) {
-        tx.saveRole(task.id, updateRole(role, { workspace: target }, this.now()));
+        const timestamp = this.now();
+        retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
+        tx.saveRole(task.id, updateRole(role, { workspace: target }, timestamp));
       }
       if (workItem !== undefined) {
-        const item = tx.getWorkItem(task.id, workItem.workItemId);
-        if (item === null) throw new Error(`Work item not found: ${workItem.workItemId}.`);
-        tx.saveWorkItem(task.id, recordWorkItemWorkspaceDisposition(
-          item,
-          workItem.disposition,
-          this.now()
-        ));
+        recordWorkspaceDisposition(tx, task.id, workItem, this.now());
       }
     });
   }
@@ -438,7 +462,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       const latest = requireTask(tx, task.id);
       for (const role of tx.listRoles(task.id)) {
         if (role.workspace !== fallback) {
-          tx.saveRole(task.id, updateRole(role, { workspace: fallback }, this.now()));
+          const timestamp = this.now();
+          retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
+          tx.saveRole(task.id, updateRole(role, { workspace: fallback }, timestamp));
         }
       }
       if (latest.cwd !== undefined) {
@@ -453,6 +479,73 @@ function requireTask(store: TaskStore, taskId: string): Task {
   const task = store.getTask(taskId);
   if (task === null) throw new Error(`Task not found: ${taskId}.`);
   return task;
+}
+
+function assertWorkspaceSessionsRetirable(
+  store: TaskStore,
+  taskId: string,
+  roleName: string,
+  now: Date
+): void {
+  if (store.getActiveAgentRun(taskId, roleName) !== null) {
+    throw new Error(`Role has an active Run: ${taskId}/${roleName}.`);
+  }
+  const sessions = store.getTaskRoleSessionSet(taskId, roleName);
+  if (sessions === null) return;
+  // Validation only: the returned copy is persisted atomically with the
+  // workspace change after the physical Git operation succeeds.
+  retireTaskRoleSessionsForWorkspace(sessions, now);
+}
+
+function retireWorkspaceBoundSession(
+  store: TaskStore,
+  taskId: string,
+  roleName: string,
+  now: Date
+): void {
+  if (store.getActiveAgentRun(taskId, roleName) !== null) {
+    throw new Error(`Role has an active Run: ${taskId}/${roleName}.`);
+  }
+  const sessions = store.getTaskRoleSessionSet(taskId, roleName);
+  if (sessions === null) return;
+  store.saveTaskRoleSessionSet(
+    retireTaskRoleSessionsForWorkspace(sessions, now)
+  );
+}
+
+function sameRoleWorkspace(left: RoleWorkspace, right: RoleWorkspace): boolean {
+  return left.schemaVersion === right.schemaVersion
+    && left.taskId === right.taskId
+    && left.roleName === right.roleName
+    && left.owner.type === right.owner.type
+    && (left.owner.type !== "work-item"
+      || (right.owner.type === "work-item"
+        && left.owner.workItemId === right.owner.workItemId))
+    && left.projectId === right.projectId
+    && left.path === right.path
+    && left.branch === right.branch
+    && left.baseRef === right.baseRef
+    && left.baseCommit === right.baseCommit
+    && left.createdAt === right.createdAt
+    && left.updatedAt === right.updatedAt;
+}
+
+function recordWorkspaceDisposition(
+  store: TaskStore,
+  taskId: string,
+  workItem: Readonly<{
+    workItemId: string;
+    disposition: WorkItemWorkspaceDisposition;
+  }>,
+  now: Date
+): void {
+  const item = store.getWorkItem(taskId, workItem.workItemId);
+  if (item === null) throw new Error(`Work item not found: ${workItem.workItemId}.`);
+  store.saveWorkItem(taskId, recordWorkItemWorkspaceDisposition(
+    item,
+    workItem.disposition,
+    now
+  ));
 }
 
 function assertWorkspaceIdentity(

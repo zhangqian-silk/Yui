@@ -210,8 +210,8 @@ const profileChildren: readonly NodeInput[] = [
   {
     name: "add",
     summary: "Add a reusable Agent Profile.",
-    usage: "yui profile add <id> --agent <id> [--access <read|write>] [Profile settings]",
-    options: ["--agent", "--access", ...agentProfileOptions],
+    usage: "yui profile add <id> [--access <read|write>] [Profile settings]",
+    options: ["--access", ...agentProfileOptions],
     optionValues: { "--access": ["read", "write"] }
   },
   { name: "list", summary: "List Agent Profiles." },
@@ -219,8 +219,8 @@ const profileChildren: readonly NodeInput[] = [
   {
     name: "update",
     summary: "Update an Agent Profile.",
-    usage: "yui profile update <id> [--agent <id>] [--access <read|write>] [Profile settings]",
-    options: ["--agent", "--access", ...agentProfileOptions, ...agentProfileClearOptions],
+    usage: "yui profile update <id> [--access <read|write>] [Profile settings]",
+    options: ["--access", ...agentProfileOptions, ...agentProfileClearOptions],
     optionValues: { "--access": ["read", "write"] }
   },
   { name: "remove", summary: "Remove a custom Agent Profile.", usage: "yui profile remove <id>" },
@@ -322,8 +322,8 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "add",
         summary: "Add a Role to a Task.",
-        usage: "yui task role add <task> <name> [--agent <id>] [Role and Agent settings]",
-        options: ["--agent", ...roleProfileOptions, ...roleAgentOptions],
+        usage: "yui task role add <task> <name> [--profile <id>] [--agent <id>] [Role and Agent settings]",
+        options: ["--profile", "--agent", ...roleProfileOptions, ...roleAgentOptions],
         optionValues: roleAgentOptionValues
       },
       { name: "list", summary: "List Task Roles.", usage: "yui task role list <task>" },
@@ -337,7 +337,7 @@ const taskChildren: readonly NodeInput[] = [
         name: "update",
         summary: "Update a Task Role.",
         usage: "yui task role update <task> <role> [Role and Agent settings]",
-        options: ["--agent", ...roleProfileOptions, ...roleAgentOptions,
+        options: ["--profile", "--agent", ...roleProfileOptions, ...roleAgentOptions,
           ...roleProfileClearOptions, ...roleAgentClearOptions],
         optionValues: roleAgentOptionValues
       },
@@ -354,7 +354,7 @@ const taskChildren: readonly NodeInput[] = [
       id: "manage",
       title: "Commands",
       entries: [
-        "create", "list", "update", "dispatch", "isolate", "cleanup",
+        "create", "list", "update", "dispatch", "isolate", "capture", "cleanup",
         "accept", "reject", "cancel"
       ]
     }],
@@ -385,6 +385,11 @@ const taskChildren: readonly NodeInput[] = [
         name: "isolate",
         summary: "Create a WorkItem-owned isolated worktree.",
         usage: "yui task work isolate <work>"
+      },
+      {
+        name: "capture",
+        summary: "Capture a terminal isolated WorkItem result as a ChangeSet.",
+        usage: "yui task work capture <work>"
       },
       {
         name: "cleanup",
@@ -425,28 +430,6 @@ const taskChildren: readonly NodeInput[] = [
         usage: "yui task run yield <run> --summary <text>",
         options: ["--summary"]
       }
-    ]
-  },
-  {
-    name: "attempt",
-    summary: "Dispatch and inspect Execution Attempts.",
-    sections: [{ id: "manage", title: "Commands", entries: ["dispatch", "list", "show", "retry", "interrupt", "cleanup"] }],
-    children: [
-      {
-        name: "dispatch",
-        summary: "Execute a Work Item in a forked Leader thread or explicit root Session.",
-        usage: "yui task attempt dispatch <work> [--profile <id>] [--mode <auto|fork|session>] [--access <read|write>] [--input <text>] [--session-reason <text>]",
-        options: ["--profile", "--mode", "--access", "--input", "--session-reason"],
-        optionValues: {
-          "--mode": ["auto", "fork", "session"],
-          "--access": ["read", "write"]
-        }
-      },
-      { name: "list", summary: "List Execution Attempts.", usage: "yui task attempt list <task>" },
-      { name: "show", summary: "Show one Execution Attempt.", usage: "yui task attempt show <attempt>" },
-      { name: "retry", summary: "Retry a failed Execution Attempt.", usage: "yui task attempt retry <attempt>" },
-      { name: "interrupt", summary: "Interrupt a running Execution Attempt.", usage: "yui task attempt interrupt <attempt>" },
-      { name: "cleanup", summary: "Remove a terminal integrated Attempt worktree and branch.", usage: "yui task attempt cleanup <attempt>" }
     ]
   },
   {
@@ -767,10 +750,10 @@ export const ROOT_COMMAND = buildNode({
     },
     {
       name: "task",
-      summary: "Manage Tasks, WorkItems, Attempts, and integration.",
+      summary: "Manage Tasks, WorkItems, Agent Runs, and integration.",
       sections: [
         { id: "lifecycle", title: "Lifecycle", entries: ["create", "update", "activate", "complete", "reopen", "list", "show", "context", "archive", "reconcile"] },
-        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "work", "run", "attempt", "integration", "role", "enter"] },
+        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "work", "run", "integration", "role", "enter"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
       ],
       children: taskChildren

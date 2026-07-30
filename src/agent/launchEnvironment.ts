@@ -99,20 +99,32 @@ export function selectEnvironment(
   return selected;
 }
 
+function selectNonEmptyEnvironment(
+  source: NodeJS.ProcessEnv,
+  names: Iterable<string>
+): Record<string, string> {
+  const selected: Record<string, string> = {};
+  for (const name of names) {
+    const value = source[name];
+    if (value !== undefined && value.length > 0) selected[name] = value;
+  }
+  return selected;
+}
+
 export function operationalAgentEnvironment(
   adapterId: AgentAdapterId,
   source: NodeJS.ProcessEnv
 ): Record<string, string> {
   return {
-    PATH: source.PATH
-      ?? `${dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`,
-    HOME: source.HOME ?? homedir(),
-    TERM: source.TERM ?? "xterm-256color",
-    TMPDIR: source.TMPDIR ?? tmpdir(),
-    ...selectEnvironment(source, [
+    ...selectNonEmptyEnvironment(source, [
       ...AGENT_OPERATIONAL_ENVIRONMENT_NAMES,
       ...nativeAgentEnvironmentNames(adapterId)
-    ])
+    ]),
+    PATH: source.PATH
+      || `${dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`,
+    HOME: source.HOME || homedir(),
+    TERM: source.TERM || "xterm-256color",
+    TMPDIR: source.TMPDIR || tmpdir()
   };
 }
 

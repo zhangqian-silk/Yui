@@ -308,6 +308,9 @@ function normalizeAnswer(request: InputRequest, answer: InputAnswer): InputResol
     exact(value, ["text"], "Input answer");
     return { text: requireText(value.text, "Input answer") };
   }
+  if (value.text !== undefined) {
+    throw new Error("Choice input request requires a choice answer.");
+  }
   exact(value, ["choiceKey"], "Input answer");
   const key = requireChoiceKey(value.choiceKey);
   const choice = request.choices.find((candidate) => candidate.key === key);

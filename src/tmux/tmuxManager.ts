@@ -713,6 +713,10 @@ export class TmuxManager {
       // One bracketed paste preserves literal and multiline input without
       // expanding it into a long sequence of tmux key events.
       `paste-buffer -dpr -b ${buffer} -t ${tmuxWord(target)}`,
+      // Full-screen clients can finish handling the bracketed paste after tmux
+      // has already queued the next key. Let the client settle before Enter so
+      // the receipt proves that a submission key followed the completed paste.
+      `run-shell ${tmuxWord("sleep 0.05")}`,
       `send-keys -t ${tmuxWord(target)} Enter`,
       // A receipt is proof that Enter was accepted, never merely that an
       // attempt began.
@@ -762,6 +766,7 @@ export class TmuxManager {
     ].join(" ; ");
     const apply = [
       `paste-buffer -dpr -b ${buffer} -t ${tmuxWord(target)}`,
+      `run-shell ${tmuxWord("sleep 0.05")}`,
       `send-keys -t ${tmuxWord(target)} Enter`,
       `set-option -w -t ${tmuxWord(target)} ${option} 1`,
       `display-message -p ${sentMarker}`

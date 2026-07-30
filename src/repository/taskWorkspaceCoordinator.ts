@@ -71,7 +71,7 @@ export class TaskWorkspaceCoordinator {
     }
     const state = await this.preparer.inspectWorkItemWorkspace(item.id);
     if (state === "dirty") return "dirty";
-    if (state === "clean") await this.#stopLiveRoles(item.taskId, [item.assignee]);
+    await this.#stopLiveRoles(item.taskId, [item.assignee]);
     return this.preparer.cleanupWorkItemWorkspace(item.id, disposition);
   }
 
@@ -104,8 +104,14 @@ export class TaskWorkspaceCoordinator {
 
   async #stopLiveRoles(taskId: string, roleNames: readonly string[]): Promise<void> {
     const live = roleNames.filter((roleName) => {
-      const session = this.store.getRoleSession(taskId, roleName);
-      return session !== null && session.status !== "stopped";
+      const sessions = this.store.getTaskRoleSessionSet(taskId, roleName);
+      return sessions !== null && (
+        sessions.inFlight !== null
+        || sessions.pendingTurnCompletion !== null
+        || Object.values(sessions.sessions).some(
+          ({ status }) => status !== "stopped" && status !== "broken"
+        )
+      );
     });
     if (live.length > 0) await this.runtime.stopTaskRoleSessions(taskId, live);
   }

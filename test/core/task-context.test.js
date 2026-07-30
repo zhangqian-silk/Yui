@@ -16,7 +16,6 @@ import { findInteractionPolicy } from "../../dist/cli/interactionPolicy.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { createDecision, supersedeDecision } from "../../dist/decision/decision.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
-import { createExecutionAttempt } from "../../dist/execution/executionAttempt.js";
 import {
   answerInputRequest,
   createInputRequest
@@ -138,7 +137,10 @@ test("task context aggregates complete records and renders a compact recent summ
     "new",
     "Implement the read model",
     atMinute(12),
-    { workItemId: workItem.id }
+    {
+      workItemId: workItem.id,
+      agent: { agentId: "codex", adapterId: "codex", model: "gpt-5.6-sol", effort: "high" }
+    }
   );
   store.saveAgentRun(associatedRun);
   store.saveAgentRun(createAgentRun(
@@ -147,8 +149,11 @@ test("task context aggregates complete records and renders a compact recent summ
     "leader",
     "new",
     "Inspect progress",
-    atMinute(13)
+    atMinute(13),
+    { agent: { agentId: "codex", adapterId: "codex" } }
   ));
+  const roles = store.listRoles(task.id);
+  const agentRuns = store.listAgentRuns(task.id);
 
   const messages = [];
   for (let index = 1; index <= 6; index += 1) {
@@ -177,8 +182,9 @@ test("task context aggregates complete records and renders a compact recent summ
     brief,
     activeDecisions: [activeDecision],
     milestones,
+    roles,
     workItems: [workItem],
-    attempts: [],
+    agentRuns,
     changeSets: [],
     integrations: [],
     messages,
@@ -193,8 +199,11 @@ test("task context aggregates complete records and renders a compact recent summ
   assert.match(result.output, /Recent milestones \(5 of 6\)/);
   assert.doesNotMatch(result.output, /Milestone 1/);
   assert.match(result.output, /Milestone 6/);
+  assert.match(result.output, /Task Roles \(2\)/);
   assert.match(result.output, /Implement context/);
-  assert.match(result.output, /Attempts: none/);
+  assert.match(result.output, /AgentRuns: 1; latest/);
+  assert.match(result.output, /gpt-5\.6-sol/);
+  assert.match(result.output, /Recent AgentRuns \(2\)/);
   assert.match(result.output, /Recent messages \(5 of 6\)/);
   assert.doesNotMatch(result.output, /Message 1/);
   assert.match(result.output, /Message 6/);
@@ -325,46 +334,44 @@ test("task context bounds human-readable history while preserving complete data"
   assert.doesNotMatch(result.output, /x{500}/);
 });
 
-test("task context orders UUID-backed execution records by time rather than identity", (t) => {
+test("task context orders AgentRuns by time rather than identity", (t) => {
   const { store, options } = fixture(t);
   const task = createTask(store, options, "Chronological execution context");
   output(["activate", task.id], store, options);
   const work = createWorkItem(
     store.nextWorkItemId(task.id),
     task.id,
-    { title: "Order attempts" },
+    { title: "Order AgentRuns", assignee: "leader" },
     atMinute(1)
   );
   store.saveWorkItem(task.id, work);
-  const older = createExecutionAttempt({
-    id: "attempt-z-old",
-    taskId: task.id,
-    workItemId: work.id,
-    profileId: "worker",
-    profileRevision: 1,
-    executor: "fork",
-    access: "read",
-    input: "older"
-  }, atMinute(2));
-  const newer = createExecutionAttempt({
-    id: "attempt-a-new",
-    taskId: task.id,
-    workItemId: work.id,
-    profileId: "worker",
-    profileRevision: 1,
-    executor: "fork",
-    access: "read",
-    input: "newer"
-  }, atMinute(3));
-  store.saveExecutionAttempt(task.id, older);
-  store.saveExecutionAttempt(task.id, newer);
+  const older = createAgentRun(
+    "agent-run-z-old",
+    task.id,
+    "leader",
+    "new",
+    "older",
+    atMinute(2),
+    { workItemId: work.id, agent: { agentId: "codex", adapterId: "codex" } }
+  );
+  const newer = createAgentRun(
+    "agent-run-a-new",
+    task.id,
+    "leader",
+    "resume",
+    "newer",
+    atMinute(3),
+    { workItemId: work.id, agent: { agentId: "codex", adapterId: "codex" } }
+  );
+  store.saveAgentRun(older);
+  store.saveAgentRun(newer);
 
   const result = output(["context", task.id], store, options);
-  assert.deepEqual(result.data.attempts.map(({ id }) => id), [
+  assert.deepEqual(result.data.agentRuns.map(({ id }) => id), [
     older.id,
     newer.id
   ]);
-  assert.match(result.output, /latest attempt-a-new/);
+  assert.match(result.output, /latest agent-run-a-new/);
 });
 
 test("task context keeps empty knowledge and work explicit and reads terminal Task states", (t) => {
@@ -383,8 +390,9 @@ test("task context keeps empty knowledge and work explicit and reads terminal Ta
     assert.equal(result.data.brief, null);
     assert.deepEqual(result.data.activeDecisions, []);
     assert.deepEqual(result.data.milestones, []);
+    assert.equal(result.data.roles.length, 1);
     assert.deepEqual(result.data.workItems, []);
-    assert.deepEqual(result.data.attempts, []);
+    assert.deepEqual(result.data.agentRuns, []);
     assert.deepEqual(result.data.changeSets, []);
     assert.deepEqual(result.data.integrations, []);
     assert.deepEqual(result.data.messages, []);

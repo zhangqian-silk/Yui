@@ -11,7 +11,6 @@ export type RuntimeProcessKind =
 export type RuntimeResourceKind =
   | "controller"
   | "agent-session"
-  | "execution-attempt"
   | "tmux-server"
   | "app-server"
   | "web"
@@ -63,21 +62,8 @@ export type RuntimeRoleFact = Readonly<{
   nativeSessionId?: string;
 }>;
 
-export type RuntimeAttemptFact = Readonly<{
-  attemptId: string;
-  taskId: string;
-  taskTitle: string;
-  taskStatus: "draft" | "active" | "completed" | "archived";
-  workItemId: string;
-  profileId: string;
-  state: "running" | "succeeded" | "failed" | "interrupted";
-  providerSessionId?: string;
-  providerThreadId?: string;
-  controlSocketPath: string;
-}>;
-
 export type RuntimeArtifactFact = Readonly<{
-  artifactKind: "controller-discovery" | "controller-socket" | "tmux-socket" | "attempt-socket";
+  artifactKind: "controller-discovery" | "controller-socket" | "tmux-socket";
   path: string;
   active: boolean;
   fingerprint: string;
@@ -105,7 +91,6 @@ export type RuntimeHomeFact = Readonly<{
   discovery: ControllerDiscoveryFact;
   panes: readonly RuntimePaneFact[];
   roles: readonly RuntimeRoleFact[];
-  attempts: readonly RuntimeAttemptFact[];
   artifacts: readonly RuntimeArtifactFact[];
 }>;
 
@@ -127,17 +112,6 @@ export type RuntimeOwner =
       agentId: string;
       adapterId?: string;
       nativeSessionId?: string;
-    }>
-  | Readonly<{
-      kind: "attempt";
-      attemptId: string;
-      taskId: string;
-      taskTitle: string;
-      taskStatus: "draft" | "active" | "completed" | "archived";
-      workItemId: string;
-      profileId: string;
-      providerSessionId?: string;
-      providerThreadId?: string;
     }>
   | Readonly<{ kind: "none" }>;
 
@@ -257,48 +231,6 @@ export function buildControllerResourceInventory(
         owner: role === undefined ? { kind: "none" } : roleOwner(role),
         processes: paneProcesses,
         target: pane.target
-      }));
-    }
-
-    for (const attempt of homeFact.attempts) {
-      const matchingRoots = homeProcesses.filter((process) => (
-        process.kind === "app-server"
-        && process.args.some((argument) => (
-          argument === attempt.controlSocketPath
-          || argument === `unix://${attempt.controlSocketPath}`
-        ))
-        && !claimed.has(process.pid)
-      ));
-      const matching = [
-        ...new Map(matchingRoots.flatMap((root) => processTree(processes, root.pid))
-          .filter(({ pid }) => !claimed.has(pid))
-          .map((process) => [process.pid, process])).values()
-      ];
-      if (matching.length === 0 && attempt.state !== "running") continue;
-      for (const process of matching) claimed.add(process.pid);
-      const observed = matching.length > 0;
-      const attemptRunning = attempt.state === "running";
-      const archived = attempt.taskStatus === "archived";
-      resources.push(processResource({
-        kind: "execution-attempt",
-        state: observed ? "running" : "dead",
-        disposition: archived
-          ? "safe"
-          : observed && attemptRunning
-            ? "protected"
-            : observed
-              ? "safe"
-              : "report-only",
-        reasonCode: archived
-          ? "archived-task-attempt"
-          : observed && attemptRunning
-            ? "owned-execution-attempt"
-            : observed
-              ? "terminal-attempt-process"
-              : "attempt-process-not-observed",
-        yuiHome,
-        owner: attemptOwner(attempt),
-        processes: matching
       }));
     }
 
@@ -442,24 +374,6 @@ function roleOwner(role: RuntimeRoleFact): RuntimeOwner {
   };
 }
 
-function attemptOwner(attempt: RuntimeAttemptFact): RuntimeOwner {
-  return {
-    kind: "attempt",
-    attemptId: attempt.attemptId,
-    taskId: attempt.taskId,
-    taskTitle: attempt.taskTitle,
-    taskStatus: attempt.taskStatus,
-    workItemId: attempt.workItemId,
-    profileId: attempt.profileId,
-    ...(attempt.providerSessionId === undefined
-      ? {}
-      : { providerSessionId: attempt.providerSessionId }),
-    ...(attempt.providerThreadId === undefined
-      ? {}
-      : { providerThreadId: attempt.providerThreadId })
-  };
-}
-
 function processTree(
   processes: readonly RuntimeProcessFact[],
   rootPid: number
@@ -582,7 +496,6 @@ function resourceKindOrder(kind: RuntimeResourceKind): number {
   return [
     "controller",
     "agent-session",
-    "execution-attempt",
     "tmux-server",
     "app-server",
     "web",

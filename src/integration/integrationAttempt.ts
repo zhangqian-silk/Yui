@@ -8,7 +8,7 @@ import {
 import {
   normalizeCheckResult,
   type CheckResult
-} from "../execution/executionAttempt.js";
+} from "./checkResult.js";
 
 export type IntegrationAttemptStatus =
   | "running"

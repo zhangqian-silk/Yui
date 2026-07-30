@@ -3,6 +3,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   unlinkSync,
@@ -13,10 +14,18 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
+import {
+  bindTaskRoleRun,
+  createRoleSessionSet,
+  recordRoleAgentSession,
+  updateRoleAgentSessionStatus
+} from "../../dist/executor/agentExecutor.js";
 import { runProjectCommand } from "../../dist/commands/projectCommands.js";
+import { runTaskIntegrationCommand } from "../../dist/commands/taskIntegrationCommands.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
-import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
+import { createRole, createRoleAgentBinding, updateRole } from "../../dist/role/role.js";
+import { createAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
 import { createProject } from "../../dist/repository/project.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
 import { TaskWorkspaceCoordinator } from "../../dist/repository/taskWorkspaceCoordinator.js";
@@ -28,6 +37,8 @@ import {
   recordWorkItemWorkspaceDisposition,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
+import { createRoleWorkspace } from "../../dist/worktree/roleWorkspace.js";
+import { WorkItemChangeSetManager } from "../../dist/workspace/workItemChangeSetManager.js";
 
 const NOW = new Date("2026-07-19T12:00:00.000Z");
 
@@ -98,6 +109,14 @@ function addTaskRoles(store, task, repositoryPath, names = ["leader", "worker"])
   return agent;
 }
 
+function liveSessionSet(status = "ready") {
+  return {
+    sessions: { codex: { status } },
+    inFlight: null,
+    pendingTurnCompletion: null
+  };
+}
+
 test("workspace coordination stops a live Role only after a clean preflight", async () => {
   const events = [];
   const item = {
@@ -112,7 +131,7 @@ test("workspace coordination stops a live Role only after a clean preflight", as
     getActiveAgentRun: () => null,
     getRole: () => ({ name: "worker" }),
     getRoleWorkspace: () => null,
-    getRoleSession: () => ({ status: "ready" })
+    getTaskRoleSessionSet: () => liveSessionSet()
   };
   const runtime = {
     async stopTaskRoleSessions(taskId, roles) {
@@ -155,6 +174,40 @@ test("workspace coordination stops a live Role only after a clean preflight", as
   ]);
 });
 
+test("workspace cleanup stops a restored Role before converging a missing worktree", async () => {
+  const events = [];
+  const item = {
+    id: "work-1",
+    taskId: "task-1",
+    assignee: "worker",
+    status: "completed"
+  };
+  const coordinator = new TaskWorkspaceCoordinator({
+    findWorkItem: () => item,
+    getTaskRoleSessionSet: () => liveSessionSet()
+  }, {
+    async inspectWorkItemWorkspace() {
+      events.push(["inspect"]);
+      return "missing";
+    },
+    async cleanupWorkItemWorkspace(_id, disposition) {
+      events.push(["cleanup", disposition]);
+      return "missing";
+    }
+  }, {
+    async stopTaskRoleSessions(taskId, roles) {
+      events.push(["stop", taskId, roles]);
+    }
+  });
+
+  assert.equal(await coordinator.cleanupWorkItem(item.id, "integrated"), "missing");
+  assert.deepEqual(events, [
+    ["inspect"],
+    ["stop", "task-1", ["worker"]],
+    ["cleanup", "integrated"]
+  ]);
+});
+
 test("dirty WorkItem preflight retains both runtime and worktree", async () => {
   const item = {
     id: "work-1",
@@ -166,7 +219,7 @@ test("dirty WorkItem preflight retains both runtime and worktree", async () => {
   let cleaned = false;
   const coordinator = new TaskWorkspaceCoordinator({
     findWorkItem: () => item,
-    getRoleSession: () => ({ status: "ready" })
+    getTaskRoleSessionSet: () => liveSessionSet()
   }, {
     async inspectWorkItemWorkspace() { return "dirty"; },
     async cleanupWorkItemWorkspace() {
@@ -197,7 +250,7 @@ test("invalid WorkItem isolation leaves a live Role session untouched", async ()
     getActiveAgentRun: () => null,
     getRole: () => ({ name: "worker" }),
     getRoleWorkspace: () => null,
-    getRoleSession: () => ({ status: "ready" })
+    getTaskRoleSessionSet: () => liveSessionSet()
   }, {
     async prepareTaskWorkspace() {
       preparedMain = true;
@@ -227,7 +280,7 @@ test("invalid WorkItem cleanup leaves a live Role session untouched", async () =
   let stopped = false;
   const coordinator = new TaskWorkspaceCoordinator({
     findWorkItem: () => item,
-    getRoleSession: () => ({ status: "ready" })
+    getTaskRoleSessionSet: () => liveSessionSet()
   }, {
     async inspectWorkItemWorkspace() {
       inspected = true;
@@ -820,6 +873,386 @@ test("Leader can directly create and clean a WorkItem-owned isolated worktree", 
   ));
 });
 
+test("Leader acceptance consumes an exact workspace integration proof", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Acceptance proof", NOW, {
+    projectId: project.id
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const item = createWorkItem("work-1", task.id, {
+    title: "No-change review",
+    assignee: "worker"
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const isolated = await preparer.prepareWorkItemWorkspace(item.id);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  store.saveWorkItem(task.id, updateWorkItemStatus(
+    running,
+    "awaiting_acceptance",
+    NOW
+  ));
+  const yielded = yieldAgentRun(createAgentRun(
+    "run-1",
+    task.id,
+    "worker",
+    "new",
+    "Review without changes",
+    NOW,
+    { workItemId: item.id }
+  ), "No changes required.", NOW);
+  store.saveAgentRun(yielded);
+  const leader = {
+    now: () => new Date(NOW),
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+
+  assert.throws(
+    () => runTaskCommand(
+      ["work", "accept", item.id, "--summary", "Reviewed."],
+      store,
+      {
+        ...leader,
+        verifiedWorkItemId: item.id,
+        workItemIntegrationProof: {
+          workItemId: item.id,
+          assignee: "worker",
+          workspace: isolated,
+          headCommit: "b".repeat(40)
+        }
+      }
+    ),
+    /integration verification is stale/i
+  );
+  assert.equal(store.getWorkItem(task.id, item.id).status, "awaiting_acceptance");
+
+  const proof = await new WorkItemChangeSetManager(store, () => new Date(NOW))
+    .assertIntegrated(item.id);
+  assert.notEqual(proof, null);
+  runTaskCommand(
+    ["work", "accept", item.id, "--summary", "Reviewed."],
+    store,
+    { ...leader, workItemIntegrationProof: proof }
+  );
+  assert.equal(store.getWorkItem(task.id, item.id).status, "completed");
+});
+
+test("a Role workspace migration retires its cwd-bound stopped native session", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Move a persistent Role", NOW, {
+    projectId: project.id
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const item = createWorkItem("work-1", task.id, {
+    title: "Use an isolated cwd",
+    assignee: "worker"
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: "worker"
+  }, "codex", NOW);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "native-main-cwd",
+    policy: "fixed",
+    status: "stopped"
+  }, NOW);
+  store.saveTaskRoleSessionSet(sessions);
+
+  await preparer.prepareWorkItemWorkspace(item.id);
+  assert.equal(store.getRoleSession(task.id, "worker"), null);
+
+  sessions = recordRoleAgentSession(
+    store.getTaskRoleSessionSet(task.id, "worker"),
+    {
+      agentId: "codex",
+      adapterId: "codex",
+      nativeSessionId: "native-isolated-cwd",
+      policy: "fixed",
+      status: "stopped"
+    },
+    NOW
+  );
+  store.saveTaskRoleSessionSet(sessions);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  const completed = updateWorkItemStatus(running, "completed", NOW, "Done.");
+  store.saveWorkItem(task.id, completed);
+
+  assert.equal(await preparer.cleanupWorkItemWorkspace(item.id, "integrated"), "removed");
+  assert.equal(store.getRoleSession(task.id, "worker"), null);
+});
+
+test("Leader can capture, integrate, and clean an isolated Role result before follow-up work", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Long-running Role delivery", NOW, {
+    projectId: project.id
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const item = createWorkItem("work-1", task.id, {
+    title: "Implement the first increment",
+    assignee: "worker"
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  const main = (await preparer.prepareTaskWorkspace(task.id)).path;
+  const isolated = await preparer.prepareWorkItemWorkspace(item.id);
+  writeFileSync(join(isolated.path, "delivered.txt"), "first increment\n");
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  store.saveWorkItem(
+    task.id,
+    updateWorkItemStatus(running, "completed", NOW, "Implemented and tested.")
+  );
+
+  const capture = spawnSync(
+    process.execPath,
+    [join(process.cwd(), "dist", "cli.js"), "task", "work", "capture", item.id],
+    {
+      encoding: "utf8",
+      env: { ...process.env, YUI_HOME: home },
+      timeout: 10_000
+    }
+  );
+  assert.equal(capture.status, 0, capture.stderr || capture.error?.message);
+  assert.match(capture.stdout, /Captured ChangeSet/);
+  const [changeSet] = store.listChangeSets(task.id);
+  assert.equal(changeSet.schemaVersion, 2);
+  assert.equal(changeSet.workItemId, item.id);
+  assert.deepEqual(changeSet.changedPaths, ["delivered.txt"]);
+  const repeatedCapture = spawnSync(
+    process.execPath,
+    [join(process.cwd(), "dist", "cli.js"), "task", "work", "capture", item.id],
+    {
+      encoding: "utf8",
+      env: { ...process.env, YUI_HOME: home },
+      timeout: 10_000
+    }
+  );
+  assert.equal(repeatedCapture.status, 0, repeatedCapture.stderr || repeatedCapture.error?.message);
+  assert.match(repeatedCapture.stdout, new RegExp(changeSet.id));
+  assert.equal(store.listChangeSets(task.id).length, 1);
+  const lateFile = join(isolated.path, "late-mutation.txt");
+  writeFileSync(lateFile, "must not alter the captured result\n");
+  const mutatedCapture = spawnSync(
+    process.execPath,
+    [join(process.cwd(), "dist", "cli.js"), "task", "work", "capture", item.id],
+    {
+      encoding: "utf8",
+      env: { ...process.env, YUI_HOME: home },
+      timeout: 10_000
+    }
+  );
+  assert.equal(mutatedCapture.status, 0, mutatedCapture.stderr || mutatedCapture.error?.message);
+  const latestChangeSet = store.listChangeSets(task.id).find(
+    ({ id }) => id !== changeSet.id
+  );
+  assert.notEqual(latestChangeSet, undefined);
+  assert.match(mutatedCapture.stdout, new RegExp(latestChangeSet.id));
+  assert.equal(store.listChangeSets(task.id).length, 2);
+  assert.equal(
+    execFileSync("git", ["-C", isolated.path, "status", "--porcelain"], {
+      encoding: "utf8"
+    }),
+    ""
+  );
+
+  const prematureCleanup = spawnSync(
+    process.execPath,
+    [
+      join(process.cwd(), "dist", "cli.js"),
+      "task", "work", "cleanup", item.id, "--integrated"
+    ],
+    {
+      encoding: "utf8",
+      env: { ...process.env, YUI_HOME: home },
+      timeout: 10_000
+    }
+  );
+  assert.equal(prematureCleanup.status, 2);
+  assert.match(prematureCleanup.stderr, /ChangeSet is not integrated/);
+  assert.equal(existsSync(isolated.path), true);
+
+  const integration = await runTaskIntegrationCommand([
+    "start",
+    task.id,
+    "--change-set",
+    latestChangeSet.id,
+    "--check",
+    "test -f delivered.txt && test -f late-mutation.txt"
+  ], store, home, { now: () => new Date(NOW) });
+  assert.match(integration.output, /Integrated/);
+  assert.equal(readFileSync(join(main, "delivered.txt"), "utf8"), "first increment\n");
+  const proof = await new WorkItemChangeSetManager(store, () => new Date(NOW))
+    .assertIntegrated(item.id);
+  assert.equal(proof.workItemId, item.id);
+  assert.equal(proof.assignee, "worker");
+  assert.equal(proof.workspace.path, isolated.path);
+  assert.equal(proof.headCommit, latestChangeSet.headCommit);
+  assert.equal(proof.changeSetId, latestChangeSet.id);
+
+  const cleanup = spawnSync(
+    process.execPath,
+    [
+      join(process.cwd(), "dist", "cli.js"),
+      "task", "work", "cleanup", item.id, "--integrated"
+    ],
+    {
+      encoding: "utf8",
+      env: { ...process.env, YUI_HOME: home },
+      timeout: 10_000
+    }
+  );
+  assert.equal(cleanup.status, 0, cleanup.stderr || cleanup.error?.message);
+  assert.equal(existsSync(isolated.path), false);
+  assert.equal(store.getRoleWorkspace(task.id, "worker"), null);
+
+  const followUp = createWorkItem("work-2", task.id, {
+    title: "Implement the follow-up increment",
+    assignee: "worker",
+    dependsOn: [item.id]
+  }, NOW);
+  store.saveWorkItem(task.id, followUp);
+  assert.doesNotThrow(
+    () => runTaskCommand(["work", "dispatch", followUp.id], store, {
+      now: () => new Date(NOW)
+    })
+  );
+});
+
+test("integrated cleanup retains a clean self-committed Role result until it is captured", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Preserve uncaptured delivery", NOW, {
+    projectId: project.id
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const item = createWorkItem("work-1", task.id, {
+    title: "Commit before yielding",
+    assignee: "worker"
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const isolated = await preparer.prepareWorkItemWorkspace(item.id);
+  writeFileSync(join(isolated.path, "self-committed.txt"), "preserve me\n");
+  execFileSync("git", ["-C", isolated.path, "add", "self-committed.txt"]);
+  execFileSync("git", ["-C", isolated.path, "commit", "-qm", "worker result"]);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  store.saveWorkItem(
+    task.id,
+    updateWorkItemStatus(running, "completed", NOW, "Committed and yielded.")
+  );
+
+  const cleanup = spawnSync(
+    process.execPath,
+    [
+      join(process.cwd(), "dist", "cli.js"),
+      "task", "work", "cleanup", item.id, "--integrated"
+    ],
+    {
+      encoding: "utf8",
+      env: { ...process.env, YUI_HOME: home },
+      timeout: 10_000
+    }
+  );
+
+  assert.equal(cleanup.status, 2);
+  assert.match(cleanup.stderr, /uncaptured commits/i);
+  assert.equal(existsSync(isolated.path), true);
+  assert.equal(store.getRoleWorkspace(task.id, "worker")?.owner.workItemId, item.id);
+  assert.equal(store.listChangeSets(task.id).length, 0);
+});
+
+test("concurrent WorkItem capture persists one semantic ChangeSet", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Capture one durable result", NOW, {
+    projectId: project.id
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const item = createWorkItem("work-1", task.id, {
+    title: "Commit once",
+    assignee: "worker"
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const isolated = await preparer.prepareWorkItemWorkspace(item.id);
+  writeFileSync(join(isolated.path, "concurrent.txt"), "one semantic result\n");
+  execFileSync("git", ["-C", isolated.path, "add", "concurrent.txt"]);
+  execFileSync("git", ["-C", isolated.path, "commit", "-qm", "worker result"]);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  store.saveWorkItem(
+    task.id,
+    updateWorkItemStatus(running, "completed", NOW, "Ready for capture.")
+  );
+
+  const [first, second] = await Promise.all([
+    new WorkItemChangeSetManager(new FileTaskStore(home), () => new Date(NOW)).capture(item.id),
+    new WorkItemChangeSetManager(new FileTaskStore(home), () => new Date(NOW)).capture(item.id)
+  ]);
+
+  assert.notEqual(first, null);
+  assert.notEqual(second, null);
+  assert.equal(first.id, second.id);
+  assert.equal(new FileTaskStore(home).listChangeSets(task.id).length, 1);
+});
+
+test("an awaiting WorkItem can capture successive immutable ChangeSets", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Review successive results", NOW, {
+    projectId: project.id
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const item = createWorkItem("work-1", task.id, {
+    title: "Revise before acceptance",
+    assignee: "worker"
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const isolated = await preparer.prepareWorkItemWorkspace(item.id);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  store.saveWorkItem(
+    task.id,
+    updateWorkItemStatus(running, "awaiting_acceptance", NOW)
+  );
+  const manager = new WorkItemChangeSetManager(store, () => new Date(NOW));
+
+  writeFileSync(join(isolated.path, "reviewed.txt"), "round one\n");
+  const first = await manager.capture(item.id);
+  assert.notEqual(first, null);
+  assert.equal((await manager.capture(item.id)).id, first.id);
+
+  writeFileSync(join(isolated.path, "reviewed.txt"), "round two\n");
+  const second = await manager.capture(item.id);
+  assert.notEqual(second, null);
+  assert.notEqual(second.id, first.id);
+  assert.notEqual(second.headCommit, first.headCommit);
+  assert.ok(Date.parse(second.createdAt) > Date.parse(first.createdAt));
+  assert.equal(store.listChangeSets(task.id).length, 2);
+  await assert.rejects(manager.assertIntegrated(item.id), new RegExp(second.id));
+});
+
 test("WorkItem cleanup validates its disposition before removing the worktree", async (t) => {
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
@@ -850,6 +1283,213 @@ test("WorkItem cleanup validates its disposition before removing the worktree", 
   );
   assert.equal(existsSync(isolated.path), true);
   assert.notEqual(store.getRoleWorkspace(task.id, "worker"), null);
+});
+
+test("WorkItem cleanup reports a post-removal race and converges on retry", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Cleanup retry", NOW, {
+    projectId: project.id
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const item = createWorkItem("work-1", task.id, {
+    title: "Remove an isolated result",
+    assignee: "worker"
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const setup = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await setup.prepareTaskWorkspace(task.id);
+  await setup.prepareWorkItemWorkspace(item.id);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  store.saveWorkItem(
+    task.id,
+    updateWorkItemStatus(running, "completed", NOW, "Ready for cleanup.")
+  );
+
+  let removalCount = 0;
+  const racingGit = {
+    async inspectWorktree() {
+      return "missing";
+    },
+    async removeWorktree() {
+      if (removalCount++ === 0) {
+        let sessions = createRoleSessionSet({
+          scope: "task",
+          taskId: task.id,
+          roleName: "worker"
+        }, "codex", NOW);
+        sessions = recordRoleAgentSession(sessions, {
+          agentId: "codex",
+          adapterId: "codex",
+          nativeSessionId: "restored-during-cleanup",
+          policy: "fixed",
+          status: "ready"
+        }, NOW);
+        store.saveTaskRoleSessionSet(sessions);
+        return "removed";
+      }
+      return "missing";
+    }
+  };
+  const preparer = new FileTaskWorkspacePreparer(
+    home,
+    store,
+    racingGit,
+    () => new Date(NOW)
+  );
+
+  await assert.rejects(
+    preparer.cleanupWorkItemWorkspace(item.id, "integrated"),
+    /worktree was removed.*durable cleanup was not recorded.*retry/i
+  );
+  assert.notEqual(store.getRoleWorkspace(task.id, "worker"), null);
+  assert.equal(store.getWorkItem(task.id, item.id).workspaceDisposition, undefined);
+
+  const coordinator = new TaskWorkspaceCoordinator(store, preparer, {
+    async stopTaskRoleSessions() {
+      const sessions = store.getTaskRoleSessionSet(task.id, "worker");
+      store.saveTaskRoleSessionSet(
+        updateRoleAgentSessionStatus(sessions, "codex", "stopped", NOW)
+      );
+    }
+  });
+  assert.equal(await coordinator.cleanupWorkItem(item.id, "integrated"), "missing");
+  assert.equal(store.getRoleWorkspace(task.id, "worker"), null);
+  assert.equal(store.getWorkItem(task.id, item.id).workspaceDisposition, "integrated");
+});
+
+test("WorkItem cleanup cannot commit across a newly prepared in-flight Role run", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Cleanup in-flight fence", NOW, {
+    projectId: project.id
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const item = createWorkItem("work-1", task.id, {
+    title: "Remove after run settles",
+    assignee: "worker"
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const setup = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await setup.prepareTaskWorkspace(task.id);
+  await setup.prepareWorkItemWorkspace(item.id);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  store.saveWorkItem(task.id, updateWorkItemStatus(
+    running,
+    "completed",
+    NOW,
+    "Ready for cleanup."
+  ));
+
+  const racingGit = {
+    async inspectWorktree() {
+      return "missing";
+    },
+    async removeWorktree() {
+      let sessions = createRoleSessionSet({
+        scope: "task",
+        taskId: task.id,
+        roleName: "worker"
+      }, "codex", NOW);
+      sessions = bindTaskRoleRun(sessions, {
+        agentId: "codex",
+        runId: "run-prepared-during-cleanup",
+        receiptId: "receipt-prepared-during-cleanup"
+      }, NOW);
+      store.saveTaskRoleSessionSet(sessions);
+      return "removed";
+    }
+  };
+  const preparer = new FileTaskWorkspacePreparer(
+    home,
+    store,
+    racingGit,
+    () => new Date(NOW)
+  );
+
+  await assert.rejects(
+    preparer.cleanupWorkItemWorkspace(item.id, "integrated"),
+    /worktree was removed.*durable cleanup was not recorded.*retry/i
+  );
+  assert.notEqual(store.getRoleWorkspace(task.id, "worker"), null);
+  assert.equal(store.getWorkItem(task.id, item.id).workspaceDisposition, undefined);
+  assert.equal(
+    store.getTaskRoleSessionSet(task.id, "worker").inFlight.runId,
+    "run-prepared-during-cleanup"
+  );
+});
+
+test("late WorkItem cleanup preserves a replacement workspace owned by newer work", async (t) => {
+  const { root, home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Cleanup workspace CAS", NOW, {
+    projectId: project.id
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const first = createWorkItem("work-1", task.id, {
+    title: "Old isolated work",
+    assignee: "worker"
+  }, NOW);
+  const second = createWorkItem("work-2", task.id, {
+    title: "New isolated work",
+    assignee: "worker"
+  }, NOW);
+  store.saveWorkItem(task.id, first);
+  store.saveWorkItem(task.id, second);
+  const setup = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await setup.prepareTaskWorkspace(task.id);
+  const oldWorkspace = await setup.prepareWorkItemWorkspace(first.id);
+  const running = updateWorkItemStatus(first, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  store.saveWorkItem(task.id, updateWorkItemStatus(
+    running,
+    "completed",
+    NOW,
+    "Ready for cleanup."
+  ));
+  const replacement = createRoleWorkspace({
+    taskId: task.id,
+    roleName: "worker",
+    owner: { type: "work-item", workItemId: second.id },
+    projectId: project.id,
+    path: join(root, "replacement-worktree"),
+    branch: "yui/task-1/work-2",
+    baseRef: oldWorkspace.baseRef,
+    baseCommit: oldWorkspace.baseCommit
+  }, new Date(NOW.getTime() + 1));
+
+  const racingGit = {
+    async inspectWorktree() {
+      return "missing";
+    },
+    async removeWorktree() {
+      store.transaction((tx) => {
+        tx.saveRoleWorkspace(task.id, replacement);
+        tx.saveRole(task.id, updateRole(
+          tx.getRole(task.id, "worker"),
+          { workspace: replacement.path },
+          new Date(NOW.getTime() + 1)
+        ));
+      });
+      return "removed";
+    }
+  };
+  const preparer = new FileTaskWorkspacePreparer(
+    home,
+    store,
+    racingGit,
+    () => new Date(NOW)
+  );
+
+  assert.equal(
+    await preparer.cleanupWorkItemWorkspace(first.id, "integrated"),
+    "removed"
+  );
+  assert.deepEqual(store.getRoleWorkspace(task.id, "worker"), replacement);
+  assert.equal(store.getRole(task.id, "worker").workspace, replacement.path);
+  assert.equal(store.getWorkItem(task.id, first.id).workspaceDisposition, "integrated");
 });
 
 test("WorkItem cleanup cannot record a disposition without an isolated worktree", async (t) => {

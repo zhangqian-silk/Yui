@@ -412,8 +412,19 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         return "unavailable";
       }
       const role = requireRole(store, input.task.id, input.role.name);
+      const binding = activeRoleAgentBinding(role);
       if (role.activeAgentId !== input.role.activeAgentId
-        || activeRoleAgentBinding(role).adapterId !== input.role.adapterId) {
+        || binding.adapterId !== input.role.adapterId
+        || binding.config.model !== input.role.model
+        || binding.config.effort !== input.role.effort
+        || role.workspace !== input.role.workspace) {
+        return "state-changed";
+      }
+      if (input.run.agentId !== undefined
+        && (input.run.agentId !== input.role.activeAgentId
+        || input.run.adapterId !== input.role.adapterId
+        || input.run.model !== input.role.model
+        || input.run.effort !== input.role.effort)) {
         return "state-changed";
       }
       if (store.getAgentRun(input.task.id, input.run.id) !== null) return "state-changed";
@@ -1871,6 +1882,8 @@ function mapRole(role: ReturnType<TaskStore["getRole"]> extends infer _T ? NonNu
     name: role.name,
     activeAgentId: role.activeAgentId,
     adapterId: binding.adapterId,
+    ...(binding.config.model === undefined ? {} : { model: binding.config.model }),
+    ...(binding.config.effort === undefined ? {} : { effort: binding.config.effort }),
     workspace: role.workspace,
     status: role.status
   };

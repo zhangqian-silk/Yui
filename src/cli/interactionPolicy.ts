@@ -4,7 +4,6 @@ export type CandidateProviderName =
   | "agent-profiles"
   | "change-sets"
   | "configured-agents"
-  | "execution-attempts"
   | "global-roles"
   | "input-requests"
   | "integration-attempts"
@@ -22,7 +21,6 @@ export type SelectableEntity =
   | "agent"
   | "agent-profile"
   | "change-set"
-  | "execution-attempt"
   | "global-role"
   | "input-request"
   | "integration-attempt"
@@ -47,6 +45,7 @@ export type ArgumentSelector = Readonly<{
   dependsOn?: number;
   actionTarget: boolean;
   statuses?: readonly string[];
+  adapterIds?: readonly string[];
 }>;
 
 export type InteractionPolicy = Readonly<{
@@ -170,15 +169,9 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
   })),
   {
     commandPath: ["profile", "add"],
-    selectors: [{
-      option: "--agent",
-      requiredOption: true,
-      entity: "agent",
-      provider: "configured-agents",
-      actionTarget: false
-    }],
+    selectors: [],
     trailingOptions: {
-      "--agent": "value", "--description": "value", "--instructions": "value",
+      "--description": "value", "--instructions": "value",
       "--skill": "value", "--model": "value", "--effort": "value", "--access": "value"
     }
   },
@@ -193,7 +186,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     ...(command === "update"
       ? {
           trailingOptions: {
-            "--agent": "value", "--description": "option-like-value",
+            "--description": "option-like-value",
             "--instructions": "option-like-value", "--skill": "value",
             "--model": "option-like-value", "--effort": "option-like-value",
             "--access": "value"
@@ -325,10 +318,16 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     commandPath: ["task", "role", "add"],
     selectors: [
       { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
-      { option: "--agent", entity: "agent", provider: "configured-agents", actionTarget: false }
+      { option: "--profile", entity: "agent-profile", provider: "agent-profiles", actionTarget: false },
+      {
+        option: "--agent",
+        entity: "agent",
+        provider: "configured-agents",
+        actionTarget: false
+      }
     ],
     trailingOptions: {
-      "--agent": "value", "--description": "value", "--responsibility": "value",
+      "--profile": "value", "--agent": "value", "--description": "value", "--responsibility": "value",
       "--constraint": "value", "--expected-output": "value", "--system-prompt": "value",
       "--skill": "value", "--model": "value", "--effort": "value",
       "--sandbox": "value", "--approval": "value", "--permission-mode": "value",
@@ -349,7 +348,13 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
         provider: "task-roles",
         dependsOn: 3,
         actionTarget: true
-      }
+      },
+      ...(command === "update"
+        ? [
+            { option: "--profile", entity: "agent-profile", provider: "agent-profiles", actionTarget: false } as const,
+            { option: "--agent", entity: "agent", provider: "configured-agents", actionTarget: false } as const
+          ]
+        : [])
     ],
     ...(command === "remove"
       ? { confirmation: { action: "Remove Task Role", targetArgumentIndex: 4 } }
@@ -402,7 +407,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     commandPath: ["task", "work", "list"],
     selectors: [{ argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true }]
   },
-  ...["update", "dispatch", "isolate", "cleanup", "accept", "reject", "cancel"]
+  ...["update", "dispatch", "isolate", "capture", "cleanup", "accept", "reject", "cancel"]
     .map((command): InteractionPolicy => ({
       commandPath: ["task", "work", command],
       selectors: [{
@@ -441,42 +446,6 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     ...(command === "yield"
       ? { trailingOptions: { "--summary": "value" as const } }
       : {})
-  })),
-  {
-    commandPath: ["task", "attempt", "cleanup"],
-    selectors: [{
-      argumentIndex: 3,
-      entity: "execution-attempt",
-      provider: "execution-attempts",
-      actionTarget: true,
-      statuses: ["succeeded", "failed", "interrupted"]
-    }]
-  },
-  {
-    commandPath: ["task", "attempt", "dispatch"],
-    selectors: [
-      { argumentIndex: 3, entity: "work-item", provider: "work-items", actionTarget: true },
-      { option: "--profile", entity: "agent-profile", provider: "agent-profiles", actionTarget: false }
-    ],
-    trailingOptions: {
-      "--profile": "value", "--mode": "value", "--access": "value",
-      "--input": "value", "--session-reason": "value"
-    }
-  },
-  {
-    commandPath: ["task", "attempt", "list"],
-    selectors: [{ argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true }]
-  },
-  ...["show", "retry", "interrupt"].map((command): InteractionPolicy => ({
-    commandPath: ["task", "attempt", command],
-    selectors: [{
-      argumentIndex: 3,
-      entity: "execution-attempt",
-      provider: "execution-attempts",
-      actionTarget: true,
-      ...(command === "retry" ? { statuses: ["failed", "interrupted"] } : {}),
-      ...(command === "interrupt" ? { statuses: ["running"] } : {})
-    }]
   })),
   {
     commandPath: ["task", "integration", "start"],

@@ -388,8 +388,11 @@ test("sendRoleInputOnce probes readiness and applies a pane receipt in one tmux 
   for (const delivery of deliveryBatches) {
     assert.match(delivery.args.join(" "), /@yui_delivery_[a-f0-9]{64}/);
     assert.match(delivery.args.at(-2), /delete-buffer.*__YUI_DELIVERY_PRESENT_/s);
-    assert.match(delivery.args.at(-1), /paste-buffer -dpr.*send-keys.*Enter.*set-option/s);
-    assert.doesNotMatch(delivery.args.at(-1), /run-shell|sleep|send-keys -l/s);
+    assert.match(
+      delivery.args.at(-1),
+      /paste-buffer -dpr.*run-shell.*sleep 0\.05.*send-keys.*Enter.*set-option/s
+    );
+    assert.doesNotMatch(delivery.args.at(-1), /send-keys -l/s);
     assert.equal(calls.filter((call) => tmuxCommand(call.args) === "send-keys").length, 0);
   }
 });
@@ -420,7 +423,10 @@ test("buffer delivery keeps shell-like input literal and receipt application ato
   const setBuffer = calls.find((call) => tmuxCommand(call.args) === "set-buffer");
   assert.equal(setBuffer.args[setBuffer.args.indexOf("--") + 1], input);
   assert.doesNotMatch(setBuffer.args.at(-1), /\$HOME|touch|quotes|slashes|next/u);
-  assert.match(setBuffer.args.at(-1), /paste-buffer -dpr.*send-keys.*Enter.*set-option/s);
+  assert.match(
+    setBuffer.args.at(-1),
+    /paste-buffer -dpr.*run-shell.*sleep 0\.05.*send-keys.*Enter.*set-option/s
+  );
 });
 
 test("async tmux delivery uses only the non-blocking executor path", async () => {
@@ -465,8 +471,11 @@ test("async tmux delivery uses only the non-blocking executor path", async () =>
   );
   const setBuffer = calls.find((call) => tmuxCommand(call.args) === "set-buffer");
   assert.equal(setBuffer.args[setBuffer.args.indexOf("--") + 1], input);
-  assert.match(setBuffer.args.at(-1), /paste-buffer -dpr/u);
-  assert.doesNotMatch(setBuffer.args.at(-1), /run-shell|sleep|\$HOME|quotes|next/u);
+  assert.match(
+    setBuffer.args.at(-1),
+    /paste-buffer -dpr.*run-shell.*sleep 0\.05.*send-keys.*Enter.*set-option/s
+  );
+  assert.doesNotMatch(setBuffer.args.at(-1), /\$HOME|quotes|next/u);
 });
 
 test("a busy async delivery uses one tmux client snapshot", async () => {

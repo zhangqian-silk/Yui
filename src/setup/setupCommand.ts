@@ -220,23 +220,15 @@ async function configureYui(
   const prepared = selected.map((choice) => prepareAgent(store, choice, now));
   const configuredIds = new Set(prepared.map(({ id }) => id));
   const config = store.getConfig();
-  const codexAgents = prepared.filter(({ adapterId }) => adapterId === "codex");
-  if (codexAgents.length === 0) {
-    throw usageError("Codex is required for the Leader and Execution Attempts.");
-  }
-  const defaultFallback = codexAgents.some(({ id }) => id === config.defaultAgent)
+  const defaultFallback = prepared.some(({ id }) => id === config.defaultAgent)
     ? config.defaultAgent as string
-    : codexAgents[0]!.id;
+    : prepared[0]!.id;
 
   const defaultAgentId = parseSingleAgentSelection(
     await question(`Choose default Agent [${defaultFallback}]: `),
     prepared,
     defaultFallback
   );
-  const selectedDefaultAgent = prepared.find(({ id }) => id === defaultAgentId);
-  if (selectedDefaultAgent?.adapterId !== "codex") {
-    throw usageError("Codex is required for the Leader and Execution Attempts.");
-  }
   const currentOperatorAgent = store.getGlobalRole(SYSTEM_OPERATOR_ROLE)?.activeAgentId;
   const operatorFallback = configuredIds.has(currentOperatorAgent ?? "")
     ? currentOperatorAgent as string
@@ -308,12 +300,7 @@ async function configureYui(
     });
     if (operatorRole !== null) savePreparedSystemRole(tx, operatorRole, now);
     if (leaderRole !== null) savePreparedSystemRole(tx, leaderRole, now);
-    seedBuiltinProfiles(tx, {
-      defaultAgent: latestDefaultAgent,
-      operatorAgent: latestOperatorAgent,
-      leaderConfig,
-      operatorConfig
-    }, now);
+    seedBuiltinProfiles(tx, now);
   });
 
   return {
@@ -345,15 +332,9 @@ function savePreparedSystemRole(
 
 function seedBuiltinProfiles(
   store: SetupStore,
-  agents: Readonly<{
-    defaultAgent: ConfiguredAgent;
-    operatorAgent: ConfiguredAgent;
-    leaderConfig: RoleAgentConfig;
-    operatorConfig: RoleAgentConfig;
-  }>,
   now: Date
 ): void {
-  for (const desired of builtinAgentProfileInputs(agents.defaultAgent.id)) {
+  for (const desired of builtinAgentProfileInputs()) {
     const existing = store.getAgentProfile(desired.id);
     if (existing === null) store.saveAgentProfile(createAgentProfile(desired, now));
   }

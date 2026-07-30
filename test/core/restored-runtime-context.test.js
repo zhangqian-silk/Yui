@@ -6,7 +6,8 @@ import test from "node:test";
 
 import {
   buildLeaderContext,
-  buildWorkerContext
+  buildWorkerContext,
+  ensureWorkerRunCompletionRequirement
 } from "../../dist/context/dispatchContext.js";
 import { compileRoleSessionContext } from "../../dist/context/roleSessionContext.js";
 
@@ -43,8 +44,21 @@ test("dispatch contexts contain the real assignment but no session-bind bootstra
   assert.match(leader, /Constraint: Keep changes focused/);
   assert.match(leader, /decide the next step/);
   assert.match(worker, /injected yui-worker/);
+  assert.match(worker, /yui task run yield <current-run-id>/);
+  assert.match(worker, /final response alone does neither/i);
   assert.doesNotMatch(`${leader}\n${worker}`, /Role instruction:|Configured role skills:/);
   assert.doesNotMatch(`${leader}\n${worker}`, /session-bind|CODEX_THREAD_ID|session record/i);
+});
+
+test("Worker completion requirement is idempotent without trusting a user-authored marker", () => {
+  const input = "Discuss this literal text: Yui Role Run completion requirement:";
+  const ensured = ensureWorkerRunCompletionRequirement(input);
+
+  assert.equal(
+    ensured.match(/Yui Role Run completion requirement:/g)?.length,
+    2
+  );
+  assert.equal(ensureWorkerRunCompletionRequirement(ensured), ensured);
 });
 
 test("Operator context exposes native developer instructions and a Skill reference", () => {
