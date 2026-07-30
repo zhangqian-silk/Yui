@@ -14,6 +14,7 @@ export type WebDashboardStore = Pick<TaskStore,
   | "listMessages"
   | "listDecisions"
   | "listMilestones"
+  | "listProjects"
 >;
 
 type WorkItemCounts = Readonly<{
@@ -28,6 +29,7 @@ type DashboardTask = Task & Readonly<{
   workItems: WorkItemCounts;
   roleCount: number;
   openInputCount: number;
+  projectName?: string;
 }>;
 
 export type WebDashboardSnapshot = Readonly<{
@@ -47,14 +49,17 @@ export function buildWebDashboardSnapshot(
       completed: 0,
       archived: 0
     };
+    const projectNames = new Map(reader.listProjects().map((project) => [project.id, project.name]));
     let openInputs = 0;
     const tasks = reader.listTasks().map((task): DashboardTask => {
       statusCounts[task.status] += 1;
       const taskOpenInputs = reader.listInputRequests(task.id)
         .filter((request) => request.status === "open").length;
       openInputs += taskOpenInputs;
+      const projectName = task.projectId ? projectNames.get(task.projectId) : undefined;
       return {
         ...task,
+        ...(projectName === undefined ? {} : { projectName }),
         workItems: countWorkItems(reader.listWorkItems(task.id)),
         roleCount: reader.listRoles(task.id).length,
         openInputCount: taskOpenInputs
@@ -74,8 +79,11 @@ export function buildWebTaskDetail(store: WebDashboardStore, taskId: string): ob
     const task = reader.getTask(taskId);
     if (task === null) return null;
     const inputs = reader.listInputRequests(taskId);
+    const projectName = task.projectId
+      ? new Map(reader.listProjects().map((project) => [project.id, project.name])).get(task.projectId)
+      : undefined;
     return {
-      task,
+      task: projectName === undefined ? task : { ...task, projectName },
       brief: reader.getTaskBrief(taskId),
       roles: reader.listRoles(taskId),
       workItems: reader.listWorkItems(taskId),

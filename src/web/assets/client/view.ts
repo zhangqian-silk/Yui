@@ -61,10 +61,75 @@ function metaItem(label, value) {
   return item;
 }
 
+// Like metaItem, but for long paths: monospace value with a full-path tooltip.
+function pathMetaItem(label, value) {
+  const item = node("span", "detail-meta-item");
+  const path = node("span", "meta-path", value);
+  path.title = value;
+  item.append(node("small", "", label), path);
+  return item;
+}
+
 function statBadge(count, label) {
   const badge = node("span", "task-stat");
   badge.append(node("b", "", String(count)), node("span", "", label));
   return badge;
+}
+
+// view.ts compiles to a standalone browser script with no imports, so the
+// adapter catalog (src/agent/adapterCatalog.ts) is mirrored inline here.
+const adapterLabels = { codex: "Codex", claude: "Claude" };
+function adapterLabel(adapterId) {
+  return adapterLabels[adapterId] || adapterId;
+}
+
+function chip(text, extraClass) {
+  return node("span", "chip" + (extraClass ? " " + extraClass : ""), text);
+}
+
+// Compact adapter/model/effort chips for a run or an active Role binding.
+function agentBadge(agent) {
+  if (!agent) return null;
+  const badge = node("span", "agent-badge");
+  if (agent.adapterId) badge.append(chip(adapterLabel(agent.adapterId), "is-adapter"));
+  if (agent.model) badge.append(chip(agent.model));
+  if (agent.effort) badge.append(chip(agent.effort));
+  return badge.childNodes.length ? badge : null;
+}
+
+// A small eyebrow label above a wrapping row of chips. Returns null when empty
+// so callers can guard with a truthy check.
+function chipRow(label, values, activeValue) {
+  const list = (values || []).filter(function (value) { return value !== undefined && value !== null && value !== ""; });
+  if (!list.length) return null;
+  const block = node("div", "chip-block");
+  block.append(node("small", "", label));
+  const row = node("div", "chip-row");
+  list.forEach(function (value) {
+    row.append(chip(String(value), activeValue !== undefined && value === activeValue ? "is-active" : ""));
+  });
+  block.append(row);
+  return block;
+}
+
+// A small eyebrow label above a bulleted criteria list. Returns null when empty.
+function criteriaList(label, items) {
+  const list = (items || []).filter(Boolean);
+  if (!list.length) return null;
+  const block = node("div", "chip-block");
+  block.append(node("small", "", label));
+  const listElement = node("ul", "criteria-list");
+  list.forEach(function (item) { listElement.append(node("li", "", item)); });
+  block.append(listElement);
+  return block;
+}
+
+// A small eyebrow label above a paragraph of copy. Returns null when empty.
+function labeledCopy(label, text) {
+  if (!text) return null;
+  const block = node("div", "labeled-copy");
+  block.append(node("small", "", label), node("p", "record-copy", text));
+  return block;
 }
 
 function statusPill(t, namespace, status) {
@@ -261,6 +326,9 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
   taskMeta.append(statusPill(t, "status", task.status));
   if (task.priority) taskMeta.append(statusPill(t, "priority", task.priority));
   if (task.dueAt) taskMeta.append(metaItem(t("detail.due"), formatDateTime(task.dueAt, locale)));
+  if (task.projectName) taskMeta.append(metaItem(t("detail.project"), task.projectName));
+  if (task.baseRef) taskMeta.append(metaItem(t("detail.baseRef"), task.baseRef));
+  if (task.cwd) taskMeta.append(pathMetaItem(t("detail.workspace"), task.cwd));
   head.append(taskMeta);
   detail.append(head);
 
@@ -275,6 +343,18 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     if (task.completedAt) meta.append(node("time", "", formatDateTime(task.completedAt, locale)));
     if (meta.childNodes.length) conclusion.append(meta);
     detail.append(conclusion);
+  } else if (task.status === "archived" || task.archiveSummary || task.archiveReason) {
+    const conclusion = node("section", "conclusion archived");
+    conclusion.append(node("h3", "", t("detail.archived")));
+    if (task.archiveSummary) conclusion.append(node("p", "", task.archiveSummary));
+    if (task.archiveReason) conclusion.append(node("p", "record-copy muted", task.archiveReason));
+    const meta = node("div", "run-meta");
+    if (task.archivedBy) {
+      meta.append(node("span", "", t("detail.archivedBy") + " · " + authorName(t, task.archivedBy)));
+    }
+    if (task.archivedAt) meta.append(node("time", "", formatDateTime(task.archivedAt, locale)));
+    if (meta.childNodes.length) conclusion.append(meta);
+    detail.append(conclusion);
   }
 
   if (data.openInputs.length) {
@@ -282,6 +362,24 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     data.openInputs.forEach(function (input) {
       const card = node("div", "input-card");
       card.append(node("small", "", t("detail.openInput")), node("span", "", input.question));
+      if (input.policy) {
+        const policyMeta = node("div", "input-policy");
+        if (input.policy.kind === "recommended") {
+          policyMeta.append(statusPill(t, "policy", "recommended"));
+          if (input.policy.timeoutAt) {
+            policyMeta.append(node("span", "", t("input.timeoutAt") + " · " + relativeTime(input.policy.timeoutAt, locale, t)));
+          }
+        } else {
+          policyMeta.append(statusPill(t, "policy", "required"));
+        }
+        card.append(policyMeta);
+      }
+      if (input.blockedRefs && input.blockedRefs.length) {
+        const blocking = chipRow(t("input.blocking"), input.blockedRefs.map(function (ref) {
+          return ref.type + " · " + ref.id;
+        }));
+        if (blocking) card.append(blocking);
+      }
       const answers = node("div", "input-actions");
       if (input.choices && input.choices.length) {
         input.choices.forEach(function (choice) {
@@ -333,12 +431,17 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     const runHead = node("div", "run-head");
     const identity = node("div", "");
     identity.append(node("strong", "", run.roleName), node("span", "run-id", run.id));
+    if (run.workItemId) {
+      identity.append(node("span", "run-id", t("detail.workItem") + " · " + run.workItemId));
+    }
     runHead.append(identity, statusPill(t, "run", run.status));
     card.append(runHead);
 
     const metadata = node("div", "run-meta");
     metadata.append(node("span", "", t("mode." + run.mode)));
     metadata.append(node("span", "", t(run.deliveredAt ? "delivery.delivered" : "delivery.pending")));
+    const badge = run.agentId ? agentBadge(run) : null;
+    if (badge) metadata.append(badge);
     metadata.append(node("time", "", formatDateTime(run.updatedAt, locale)));
     card.append(metadata);
 
@@ -358,16 +461,33 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
   const workSection = section(t("detail.workItems") + " · " + data.workItems.length);
   const work = node("div", "row-list");
   if (!data.workItems.length) work.append(emptyRow(t));
+  const workItemTitles = {};
+  data.workItems.forEach(function (item) { workItemTitles[item.id] = item.title; });
   data.workItems.slice().sort(byNewest).forEach(function (item) {
     const card = node("article", "record-card");
     const row = node("div", "row record-head");
-    row.append(node("strong", "", item.title), statusPill(t, "work", item.status));
+    const headPills = node("span", "record-head-pills");
+    headPills.append(statusPill(t, "work", item.status));
+    if (item.workspaceDisposition) headPills.append(statusPill(t, "disposition", item.workspaceDisposition));
+    row.append(node("strong", "", item.title), headPills);
     card.append(row);
     const metadata = node("div", "run-meta");
-    metadata.append(node("span", "", t("detail.assignee") + " · " + item.assignee));
+    if (item.assignee) metadata.append(node("span", "", t("detail.assignee") + " · " + item.assignee));
     metadata.append(node("span", "", item.id));
     metadata.append(node("time", "", formatDateTime(item.updatedAt, locale)));
     card.append(metadata);
+    if (item.objective && item.objective !== item.title) {
+      const objective = labeledCopy(t("detail.objective"), item.objective);
+      if (objective) card.append(objective);
+    }
+    const acceptance = criteriaList(t("detail.acceptance"), item.acceptance);
+    if (acceptance) card.append(acceptance);
+    if (item.dependsOn && item.dependsOn.length) {
+      const deps = chipRow(t("detail.dependsOn"), item.dependsOn.map(function (id) {
+        return workItemTitles[id] || id;
+      }));
+      if (deps) card.append(deps);
+    }
     if (item.outcome) card.append(node("p", "record-copy", item.outcome));
     work.append(card);
   });
@@ -383,7 +503,18 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     row.append(node("strong", "", role.name), statusPill(t, "role", role.status));
     card.append(row);
     const roleActions = node("div", "record-actions");
-    roleActions.append(node("div", "run-meta", t("detail.agent") + " · " + role.activeAgentId));
+    const activeBinding = role.agentBindings && role.agentBindings[role.activeAgentId];
+    const activeBadge = activeBinding
+      ? agentBadge({
+          adapterId: activeBinding.adapterId,
+          model: activeBinding.config && activeBinding.config.model,
+          effort: activeBinding.config && activeBinding.config.effort
+        })
+      : null;
+    const agentMeta = node("div", "run-meta");
+    agentMeta.append(node("span", "", t("detail.agent") + " · " + role.activeAgentId));
+    if (activeBadge) agentMeta.append(activeBadge);
+    roleActions.append(agentMeta);
     const open = node("button", "input-answer", t("actions.openRole"));
     open.type = "button";
     open.addEventListener("click", function () {
@@ -396,6 +527,35 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     roleActions.append(open);
     card.append(roleActions);
     if (role.description) card.append(node("p", "record-copy", role.description));
+    const bindingIds = role.agentBindings ? Object.keys(role.agentBindings) : [];
+    if (bindingIds.length > 1) {
+      const bindings = chipRow(
+        t("detail.agents"),
+        bindingIds.map(function (id) {
+          const binding = role.agentBindings[id];
+          const model = binding.config && binding.config.model;
+          return adapterLabel(binding.adapterId) + (model ? " · " + model : "");
+        }),
+        activeBinding
+          ? adapterLabel(activeBinding.adapterId)
+            + (activeBinding.config && activeBinding.config.model ? " · " + activeBinding.config.model : "")
+          : undefined
+      );
+      if (bindings) card.append(bindings);
+    }
+    const skills = chipRow(t("detail.skills"), role.skills);
+    if (skills) card.append(skills);
+    const responsibilities = criteriaList(t("detail.responsibilities"), role.responsibilities);
+    if (responsibilities) card.append(responsibilities);
+    const constraints = criteriaList(t("detail.constraints"), role.constraints);
+    if (constraints) card.append(constraints);
+    const expected = labeledCopy(t("detail.expectedOutput"), role.expectedOutput);
+    if (expected) card.append(expected);
+    if (role.workspace) {
+      const workspace = node("div", "run-meta");
+      workspace.append(pathMetaItem(t("detail.workspace"), role.workspace));
+      card.append(workspace);
+    }
     roles.append(card);
   });
   roleSection.append(roles);
@@ -434,6 +594,7 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
   data.messages.slice().sort(byNewest).forEach(function (message) {
     const item = node("article", "timeline-item");
     const metadata = node("div", "run-meta");
+    if (message.kind) metadata.append(statusPill(t, "messageKind", message.kind));
     metadata.append(node("strong", "", messageAuthor(message, t)));
     metadata.append(node("time", "", formatDateTime(message.createdAt, locale)));
     item.append(metadata, node("p", "", message.body));

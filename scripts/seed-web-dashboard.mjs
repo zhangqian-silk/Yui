@@ -12,7 +12,7 @@ import {
 } from "../dist/input/inputRequest.js";
 import { createTaskMessage } from "../dist/message/message.js";
 import { createMilestone } from "../dist/milestone/milestone.js";
-import { createRepository } from "../dist/repository/repository.js";
+import { createProject } from "../dist/repository/project.js";
 import {
   createRole,
   createRoleAgentBinding,
@@ -59,8 +59,9 @@ const task1 = activateTask(createTask("task-1", "Ship the Yui web dashboard", at
   priority: "high",
   tags: ["web", "release", "ux"],
   dueAt: "2026-07-28T10:00:00Z",
-  repositoryId: "repository-1",
-  baseRef: "master"
+  projectId: "project-1",
+  baseRef: "master",
+  cwd: resolve(projectRoot)
 }), at("2026-07-18T02:00:00Z"));
 const task2 = activateTask(createTask("task-2", "Resolve deployment approval", at("2026-07-19T02:00:00Z"), {
   description: "A blocked urgent task with open user input and an overdue date.",
@@ -106,11 +107,11 @@ store.transaction((writer) => {
     currentTaskId: "task-1",
     lastTaskId: "task-6"
   });
-  writer.saveRepository(createRepository(
-    "repository-1",
+  writer.saveProject(createProject(
+    "project-1",
     "Yui Web",
     projectRoot,
-    "master",
+    { stable: "master", development: "develop" },
     at("2026-07-01T08:10:00Z")
   ));
   for (const task of [task1, task2, task3, task4, task5, task6]) writer.saveTask(task);
@@ -146,12 +147,12 @@ store.transaction((writer) => {
   ];
   for (const role of roles) writer.saveRole(role.taskId, role);
 
-  const work1 = updateWorkItemStatus(createWorkItem("work-item-1", "task-1", { title: "Build HTTP and snapshot API", assignee: "leader" }, at("2026-07-18T03:00:00Z")), "completed", "API and security headers verified.", at("2026-07-22T08:00:00Z"));
-  const work2 = updateWorkItemStatus(createWorkItem("work-item-2", "task-1", { title: "Polish responsive dashboard", assignee: "frontend" }, at("2026-07-20T03:00:00Z")), "running", undefined, at("2026-07-23T06:30:00Z"));
-  const work3 = createWorkItem("work-item-3", "task-1", { title: "Run accessibility review", assignee: "reviewer" }, at("2026-07-22T04:00:00Z"));
-  const work4 = updateWorkItemStatus(createWorkItem("work-item-4", "task-1", { title: "Try abandoned card-grid concept", assignee: "frontend" }, at("2026-07-19T04:00:00Z")), "superseded", "Replaced by the control-room composition.", at("2026-07-20T04:00:00Z"));
-  const work5 = updateWorkItemStatus(createWorkItem("work-item-5", "task-1", { title: "Capture obsolete screenshot set", assignee: "reviewer" }, at("2026-07-20T05:00:00Z")), "cancelled", "Browser runtime was unavailable at the time.", at("2026-07-20T06:00:00Z"));
-  const work6 = updateWorkItemStatus(createWorkItem("work-item-6", "task-6", { title: "Publish release artifact", assignee: "release-worker" }, at("2026-07-22T05:00:00Z")), "failed", "Worker exited before upload completed.", at("2026-07-23T04:55:00Z"));
+  const work1 = updateWorkItemStatus(createWorkItem("work-item-1", "task-1", { title: "Build HTTP and snapshot API", objective: "Serve a read-only dashboard snapshot and task detail over loopback HTTP.", acceptance: ["Snapshot and detail endpoints return validated JSON", "Security headers are set on every response"], assignee: "leader" }, at("2026-07-18T03:00:00Z")), "completed", at("2026-07-22T08:00:00Z"), "API and security headers verified.");
+  const work2 = updateWorkItemStatus(createWorkItem("work-item-2", "task-1", { title: "Polish responsive dashboard", objective: "Make every task legible from mobile to wide desktop.", acceptance: ["Master-detail collapses below 900px", "No horizontal overflow at 320px"], dependsOn: ["work-item-1"], assignee: "frontend" }, at("2026-07-20T03:00:00Z")), "running", at("2026-07-23T06:30:00Z"));
+  const work3 = createWorkItem("work-item-3", "task-1", { title: "Run accessibility review", objective: "Confirm keyboard and screen-reader access across the dashboard.", acceptance: ["All controls reachable by keyboard", "Live regions announce updates"], dependsOn: ["work-item-2"], assignee: "reviewer" }, at("2026-07-22T04:00:00Z"));
+  const work4 = updateWorkItemStatus(createWorkItem("work-item-4", "task-1", { title: "Try abandoned card-grid concept", assignee: "frontend" }, at("2026-07-19T04:00:00Z")), "superseded", at("2026-07-20T04:00:00Z"), "Replaced by the control-room composition.");
+  const work5 = updateWorkItemStatus(createWorkItem("work-item-5", "task-1", { title: "Capture obsolete screenshot set", assignee: "reviewer" }, at("2026-07-20T05:00:00Z")), "cancelled", at("2026-07-20T06:00:00Z"), "Browser runtime was unavailable at the time.");
+  const work6 = updateWorkItemStatus(createWorkItem("work-item-6", "task-6", { title: "Publish release artifact", objective: "Upload the verified build to the release channel.", acceptance: ["Artifact checksum matches the build"], assignee: "release-worker" }, at("2026-07-22T05:00:00Z")), "failed", at("2026-07-23T04:55:00Z"), "Worker exited before upload completed.");
   const work7 = createWorkItem("work-item-7", "task-2", { title: "Wait for deployment approval", assignee: "leader" }, at("2026-07-23T03:00:00Z"));
   for (const item of [work1, work2, work3, work4, work5, work6, work7]) writer.saveWorkItem(item.taskId, item);
 
