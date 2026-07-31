@@ -17,6 +17,7 @@ import {
   type TaskCommandOptions,
   type TaskWorkflowStore
 } from "./taskCommands.js";
+import { readCommandText } from "./textInput.js";
 
 export type OperatorSessionControl =
   | Readonly<{
@@ -61,11 +62,20 @@ function submit(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Operator submit usage: yui operator submit <body> [--task <id>].";
+  const usage = "Operator submit usage: yui operator submit (<body>|--body-file <path|->) [--task <id>].";
   const positionals: string[] = [];
   let taskId: string | undefined;
+  let bodyFile: string | undefined;
   for (let index = 0; index < rest.length; index += 1) {
     const value = rest[index];
+    if (value === "--body-file") {
+      if (bodyFile !== undefined) throw usageError("Option may only be specified once: --body-file.", usage);
+      const candidate = rest[index + 1];
+      if (candidate === undefined || candidate.startsWith("--")) throw usageError("--body-file is required.", usage);
+      bodyFile = candidate;
+      index += 1;
+      continue;
+    }
     if (value !== "--task") {
       if (value.startsWith("--")) throw usageError(`Unsupported option: ${value}.`, usage);
       positionals.push(value);
@@ -79,12 +89,11 @@ function submit(
     taskId = candidate.trim();
     index += 1;
   }
-  if (positionals.length !== 1 || positionals[0].trim().length === 0) {
-    throw usageError(usage);
-  }
+  if (positionals.length > 1) throw usageError(usage);
+  const body = readCommandText(positionals[0], bodyFile, "--body", usage);
   return {
     kind: "output",
-    output: submitOperatorMessage(positionals[0], taskId, store, options)
+    output: submitOperatorMessage(body, taskId, store, options)
   };
 }
 

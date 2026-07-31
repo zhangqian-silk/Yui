@@ -57,11 +57,19 @@ function fixture(t) {
     root,
     NOW
   );
+  const worker = createGlobalRole(
+    "worker",
+    [createRoleAgentBinding(codex)],
+    codex.id,
+    root,
+    NOW
+  );
   store.transaction((tx) => {
     tx.saveConfig({ schemaVersion: 1, defaultAgent: codex.id, defaultWorkspace: root });
     tx.saveConfiguredAgent(codex);
     tx.saveConfiguredAgent(claude);
     tx.saveGlobalRole(leader);
+    tx.saveGlobalRole(worker);
   });
   const calls = { changed: [], reconcile: [], enter: [] };
   const runtime = {
@@ -229,6 +237,58 @@ test("Draft activation atomically creates one durable first Leader wake", (t) =>
   assert.deepEqual(store.getPendingWakeup(task.id), first);
 });
 
+test("Task create binds multiple Projects with independent base refs", (t) => {
+  const { root, store, options } = fixture(t);
+  store.saveProject(createProject(
+    "repo-1",
+    "backend",
+    join(root, "backend"),
+    { stable: "main", development: "develop" },
+    NOW
+  ));
+  store.saveProject(createProject(
+    "repo-2",
+    "frontend",
+    join(root, "frontend"),
+    { stable: "main", development: "release" },
+    NOW
+  ));
+
+  run([
+    "create",
+    "Coordinated release",
+    "--project", "backend",
+    "--project", "frontend",
+    "--base", "backend=develop",
+    "--base", "frontend=release",
+    "--require-integration"
+  ], store, options);
+  const task = store.listTasks()[0];
+
+  assert.deepEqual(task.projectBindings, [
+    { projectId: "repo-1", directory: "backend", baseRef: "develop" },
+    { projectId: "repo-2", directory: "frontend", baseRef: "release" }
+  ]);
+  assert.equal(task.requireIntegration, true);
+  assert.match(run(["project", "list", task.id], store, options), /backend\s+repo-1\s+develop/);
+  assert.match(run(["project", "list", task.id], store, options), /frontend\s+repo-2\s+release/);
+  const context = run(["context", task.id], store, options);
+  assert.match(context, /- backend: repo-1 @ develop/);
+  assert.match(context, /- frontend: repo-2 @ release/);
+
+  assert.throws(
+    () => runTaskCommand([
+      "create",
+      "Ambiguous bases",
+      "--project", "backend",
+      "--project", "frontend",
+      "--base", "main"
+    ], store, options),
+    /must use <project>=<ref>.*multiple Projects/i
+  );
+  assert.equal(store.listTasks().length, 1);
+});
+
 test("Leader can expand an active Task and WorkItem Project scope", (t) => {
   const { root, store, options } = fixture(t);
   for (const [id, name] of [["repo-1", "backend"], ["repo-2", "frontend"]]) {
@@ -361,6 +421,36 @@ test("Task metadata can be updated and is visible in Task details", (t) => {
   );
   run(["update", task.id, "--due-at", "2026-07-31T20:00:00+08:00"], store, options);
   assert.equal(store.getTask(task.id).dueAt, "2026-07-31T12:00:00.000Z");
+});
+
+test("an active read-only Task can enable integration evidence exactly once", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Investigate first");
+  run(["activate", task.id], store, options);
+
+  assert.match(
+    run(["update", task.id, "--require-integration"], store, options),
+    /Completion evidence enabled/
+  );
+  assert.equal(store.getTask(task.id).requireIntegration, true);
+  assert.match(run(["show", task.id], store, options), /Completion evidence: required/);
+  assert.deepEqual(store.listEvents(task.id).at(-1).payload, {
+    status: "active",
+    completionEvidence: "integration-required"
+  });
+
+  assert.match(
+    run(["update", task.id, "--require-integration"], store, options),
+    /already enabled/
+  );
+
+  const completed = createTask(store, options, "Completed investigation");
+  run(["activate", completed.id], store, options);
+  run(["complete", completed.id, "--summary", "Investigation done"], store, options);
+  assert.throws(
+    () => run(["update", completed.id, "--require-integration"], store, options),
+    /reopen/i
+  );
 });
 
 test("Task list and show emit one-pass structured JSON for Agents", (t) => {
@@ -983,10 +1073,10 @@ test("Task Role add, update, show, and remove preserve lean field-level configur
   assert.equal(store.getRole(task.id, "reviewer"), null);
 });
 
-test("Task Role creation copies a same-named global Role's complete Agent binding", (t) => {
+test("Task Role creation copies the global worker Role's complete Agent binding and reports it", (t) => {
   const { root, store, options } = fixture(t);
   store.saveGlobalRole(createGlobalRole(
-    "implementer",
+    "worker",
     [createRoleAgentBinding(
       store.getConfiguredAgent("claude"),
       {
@@ -1002,16 +1092,53 @@ test("Task Role creation copies a same-named global Role's complete Agent bindin
   ));
   const task = createTask(store, options, "Copy configured Worker Role");
 
-  run(["role", "add", task.id, "implementer"], store, options);
+  const receipt = run(["role", "add", task.id, "investigator"], store, options);
 
   assert.deepEqual(
-    store.getRole(task.id, "implementer")?.agentBindings.claude.config,
+    store.getRole(task.id, "investigator")?.agentBindings.claude.config,
     {
       adapterId: "claude",
       model: "sonnet",
       effort: "max",
       yolo: true
     }
+  );
+  assert.match(receipt, /Runtime source: Global Role worker/);
+  assert.match(receipt, /Agent: claude\/claude/);
+  assert.match(receipt, /Model: sonnet; effort: max; YOLO: enabled/);
+  const context = run(["context", task.id], store, options);
+  assert.match(context, /Runtime source at creation: Global Role worker/);
+  assert.match(context, /Model: sonnet; effort: max; YOLO: enabled/);
+});
+
+test("integration-required Task cannot complete without delivery evidence", (t) => {
+  const { store, options } = fixture(t);
+  const created = run(
+    ["create", "Deliver a change", "--require-integration"],
+    store,
+    options
+  );
+  const task = store.listTasks().at(-1);
+  assert.match(created, /Completion: WorkItem, ChangeSet, and committed Integration required/);
+  run(["activate", task.id], store, options);
+
+  assert.throws(
+    () => runTaskCommand(["complete", task.id, "--summary", "Done"], store, options),
+    /requires at least one WorkItem/i
+  );
+});
+
+test("file-backed Agent text preserves shell metacharacters literally", (t) => {
+  const { root, store, options } = fixture(t);
+  const task = createTask(store, options, "Preserve Agent text");
+  const bodyPath = join(root, "message.txt");
+  writeFileSync(bodyPath, "Total is -$12.34 and shell token is $0.\n");
+
+  run(["message", "send", task.id, "--body-file", bodyPath], store, options);
+
+  assert.equal(
+    store.listMessages(task.id).at(-1).body,
+    "Total is -$12.34 and shell token is $0."
   );
 });
 

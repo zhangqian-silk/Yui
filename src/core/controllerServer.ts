@@ -5,7 +5,6 @@ import { basename, dirname, join, resolve } from "node:path";
 
 import {
   CONTROLLER_DISCOVERY_PATH,
-  CONTROLLER_SOCKET_PATH,
   FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
   MAX_CONTROLLER_MESSAGE_BYTES,
   ControllerProtocolError,
@@ -17,6 +16,7 @@ import {
   type ControllerResponse,
   type JsonValue
 } from "./protocol.js";
+import { controllerSocketPath } from "./controllerEndpoint.js";
 
 export type ControllerDispatcher = (
   method: string,
@@ -48,10 +48,13 @@ async function startControllerServerLocked(
   beforeDiscoveryRemoval?: () => void | Promise<void>
 ): Promise<RunningControllerServer> {
   const discoveryPath = join(home, CONTROLLER_DISCOVERY_PATH);
-  const socketPath = join(home, CONTROLLER_SOCKET_PATH);
+  const socketPath = controllerSocketPath(home);
   const runtimeDirectory = dirname(discoveryPath);
+  const socketDirectory = dirname(socketPath);
   await mkdir(runtimeDirectory, { recursive: true, mode: 0o700 });
   await chmod(runtimeDirectory, 0o700);
+  await mkdir(socketDirectory, { recursive: true, mode: 0o700 });
+  await chmod(socketDirectory, 0o700);
 
   const token = randomBytes(32).toString("hex");
   let closeRunning: () => Promise<void> = async () => undefined;

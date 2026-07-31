@@ -669,6 +669,12 @@ async function executeOperatorSessionControl(
   const sessionSet = store.getGlobalRoleSessionSet(role.name);
   const active = sessionSet?.sessions[role.activeAgentId];
   const paneRunning = tmux.detectRoleStatus("operator", "operator") === "running";
+  if (paneRunning && active === undefined) {
+    throw usageError(
+      "Operator is running but its native session has not been recorded yet. "
+      + "Wait for the first turn to settle before switching sessions."
+    );
+  }
   if (
     control.action === "resume"
     && paneRunning

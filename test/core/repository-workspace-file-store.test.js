@@ -956,6 +956,11 @@ test("a multi-Project Task and WorkItem expose one root with per-Project access"
     expanded.entries.find(({ projectId }) => projectId === backend.id).baseCommit,
     backendBaseCommit
   );
+  writeFileSync(join(expanded.root, "frontend", "client.txt"), "v2\n");
+  execFileSync("git", ["-C", join(expanded.root, "frontend"), "add", "client.txt"]);
+  execFileSync("git", [
+    "-C", join(expanded.root, "frontend"), "commit", "-qm", "update frontend client"
+  ]);
 
   const running = updateWorkItemStatus(
     expandedItem,
@@ -976,18 +981,38 @@ test("a multi-Project Task and WorkItem expose one root with per-Project access"
     () => new Date(NOW.getTime() + 4)
   );
   const changeSets = await manager.capture(item.id);
-  assert.deepEqual(changeSets.map(({ projectId }) => projectId), [backend.id]);
-  const integration = await runTaskIntegrationCommand([
-    "start", task.id, "--change-set", changeSets[0].id
-  ], store, home, { now: () => new Date(NOW.getTime() + 5) });
-  assert.equal(integration.data.status, "committed");
-  assert.equal(integration.data.attempt.projectId, backend.id);
-  const proof = await manager.assertIntegrated(item.id);
-  assert.deepEqual(proof.projects.map(({ projectId }) => projectId), [
+  assert.deepEqual(changeSets.map(({ projectId }) => projectId), [
     backend.id,
     frontend.id
   ]);
+  const backendChangeSet = changeSets.find(({ projectId }) => projectId === backend.id);
+  const frontendChangeSet = changeSets.find(({ projectId }) => projectId === frontend.id);
+  assert.notEqual(backendChangeSet, undefined);
+  assert.notEqual(frontendChangeSet, undefined);
+  const backendIntegration = await runTaskIntegrationCommand([
+    "start", task.id, "--project", backend.id, "--change-set", backendChangeSet.id
+  ], store, home, { now: () => new Date(NOW.getTime() + 5) });
+  assert.equal(backendIntegration.data.status, "committed");
+  assert.equal(backendIntegration.data.attempt.projectId, backend.id);
+  await assert.rejects(
+    manager.assertIntegrated(item.id),
+    new RegExp(`not integrated: ${frontendChangeSet.id}`, "i")
+  );
+  const frontendIntegration = await runTaskIntegrationCommand([
+    "start", task.id, "--project", frontend.id, "--change-set", frontendChangeSet.id
+  ], store, home, { now: () => new Date(NOW.getTime() + 6) });
+  assert.equal(frontendIntegration.data.status, "committed");
+  assert.equal(frontendIntegration.data.attempt.projectId, frontend.id);
+  const proof = await manager.assertIntegrated(item.id);
+  assert.deepEqual(
+    proof.projects.map(({ projectId, changeSetId }) => ({ projectId, changeSetId })),
+    [
+      { projectId: backend.id, changeSetId: backendChangeSet.id },
+      { projectId: frontend.id, changeSetId: frontendChangeSet.id }
+    ]
+  );
   assert.equal(readFileSync(join(main.root, "backend", "contract.txt"), "utf8"), "v2\n");
+  assert.equal(readFileSync(join(main.root, "frontend", "client.txt"), "utf8"), "v2\n");
 });
 
 test("a new Task reuses its managed branch after interrupted preparation", async (t) => {

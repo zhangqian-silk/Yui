@@ -21,9 +21,9 @@ yui setup
 yui doctor
 ```
 
-`setup` is interactive. It detects installed Agent CLIs, asks which Agents to configure, selects the default and Operator Agent, probes each selected CLI for its current models, then selects model followed by that model's supported reasoning efforts for the Leader and Operator Roles. It also confirms the Project workspace outside Yui home and offers shell-completion setup. The picker includes the native CLI default and a custom-value option. Running setup again preserves existing Tasks, Roles, and the installation's Project workspace while allowing safe configuration changes.
+`setup` is interactive. It detects installed Agent CLIs, asks which Agents to configure, selects the default and Operator Agent, and probes each selected CLI for its current models. It configures the Leader and Operator, then explains that the global Worker configuration is copied into new Task Roles and asks whether Worker should reuse Leader or be configured separately. Model selection is followed by that model's supported reasoning efforts. Setup also confirms the Project workspace outside Yui home and offers shell-completion setup. The picker includes the native CLI default and a custom-value option. Running setup again preserves existing Tasks, Roles, and the installation's Project workspace while allowing safe configuration changes.
 
-Model and effort are per-Agent Role settings, so Leader and Operator can use different values even when both use the same Agent CLI. Interactive Role flows validate those settings against the selected Agent runtime. Worker Profile model and effort fields are provider-neutral child-execution hints and therefore remain explicit, scriptable values rather than Agent capability selections.
+Model and effort are per-Agent Role settings, so Operator, Leader, and the global Worker can use different values even when they share an Agent CLI. Interactive Role flows validate those settings against the selected Agent runtime. Worker Profile model and effort fields are provider-neutral child-execution hints and therefore remain explicit, scriptable values rather than Agent capability selections.
 
 Runtime catalogs are refreshed per command and cached under Yui home. If a live probe times out or fails, Yui shows the last cache for the same Agent launch context and clearly marks it as potentially stale; without a matching cache, it offers CLI defaults and custom values. `yui agent capabilities <id>` exposes the same one-pass catalog, including models, model-specific efforts, and other runtime choices such as permissions, search availability, profiles, settings sources, and service tiers.
 
@@ -82,8 +82,9 @@ yui config show
 yui config set --time-zone Europe/London
 ```
 
-A repository-backed Task may bind multiple Projects, each with its own base
-ref. Yui exposes them under one Task workspace root:
+Task identity follows one bounded outcome, not the number of repositories
+involved. A repository-backed Task may bind multiple Projects, each with its
+own base ref. Yui exposes them under one Task workspace root:
 
 ```text
 <workspace>/tasks/<task-id>/main/
@@ -169,26 +170,29 @@ a stable short Yui reference so untitled conversations remain distinguishable.
 `--last` resumes the newest entry directly. `operator new` starts a clean
 conversation and preserves the previous one in history.
 
-Add a Task-bound Worker instance, attach Claude configuration, select it, and
-dispatch a WorkItem:
+Create a Task-bound Worker instance from the configured global Worker, apply a
+Profile, and dispatch a WorkItem:
 
 ```sh
-yui task role add <task-id> implementer --profile implementer --agent codex
-yui task role update <task-id> implementer \
-  --agent claude --model claude-opus --effort high --yolo true
-yui task role bind <task-id> implementer claude
-yui task role list <task-id>
+yui role show worker
+yui task role add <task-id> implementer --profile implementer
+yui task role show <task-id> implementer
 
-yui task work create <task-id> "Implement the exporter" --role implementer
+yui task work create <task-id> "Implement the exporter" \
+  --project app --role implementer
+yui task work isolate <work-item-id>
 yui task work dispatch <work-item-id> --input "Implement and run focused tests"
 ```
 
 `--yolo true` is a first-class Role setting. Yui compiles it to
 `--dangerously-bypass-approvals-and-sandbox` for Codex and
 `--dangerously-skip-permissions` for Claude; `--clear-yolo` returns to the
-stored permission settings or CLI default. A Task Role created without
-`--agent` copies a same-named global Role's complete Agent bindings, so model,
-effort, and permissions do not need to be reconstructed by the Leader.
+stored permission settings or CLI default. Any non-Leader Task Role created
+without `--agent` copies the global Worker Role's complete Agent bindings, so
+model, effort, and permissions do not need to be reconstructed by the Leader.
+The creation receipt and `task context` record that runtime source and the
+effective Agent/model/effort/YOLO values. An explicit `--agent` is a deliberate
+Task-specific override and must be configured completely before dispatch.
 
 The Worker delivers its current Run explicitly:
 

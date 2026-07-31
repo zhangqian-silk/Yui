@@ -19,9 +19,9 @@ import {
 } from "../tmux/tmuxManager.js";
 import { readControllerDiscovery } from "../core/controllerClient.js";
 import {
-  CONTROLLER_DISCOVERY_PATH,
-  CONTROLLER_SOCKET_PATH
+  CONTROLLER_DISCOVERY_PATH
 } from "../core/protocol.js";
+import { controllerSocketPath } from "../core/controllerEndpoint.js";
 import {
   buildControllerResourceInventory,
   type ControllerDiscoveryFact,
@@ -106,7 +106,7 @@ export async function scanControllerResourceInventory(
         && candidate.startIdentity === discovery.processStartIdentity
       ));
     const discoveryPath = join(home, CONTROLLER_DISCOVERY_PATH);
-    const controllerSocketPath = join(home, CONTROLLER_SOCKET_PATH);
+    const expectedControllerSocketPath = controllerSocketPath(home);
     if (
       discovery.status === "valid"
       && !validDiscoveryProcess
@@ -115,11 +115,11 @@ export async function scanControllerResourceInventory(
       artifacts.push(fileArtifact(discoveryPath, "controller-discovery", false));
     }
     if (
-      existsSync(controllerSocketPath)
-      && !activeSockets.has(controllerSocketPath)
+      existsSync(expectedControllerSocketPath)
+      && !activeSockets.has(expectedControllerSocketPath)
       && !validDiscoveryProcess
     ) {
-      artifacts.push(fileArtifact(controllerSocketPath, "controller-socket", false));
+      artifacts.push(fileArtifact(expectedControllerSocketPath, "controller-socket", false));
     }
 
     homeFacts.push({

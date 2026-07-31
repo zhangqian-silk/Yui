@@ -32,7 +32,11 @@ import {
   type GlobalRole,
   type RoleAgentConfig
 } from "../role/role.js";
-import { SYSTEM_LEADER_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
+import {
+  SYSTEM_LEADER_ROLE,
+  SYSTEM_OPERATOR_ROLE,
+  SYSTEM_WORKER_ROLE
+} from "../role/systemRoles.js";
 import type { MailboxTarget, WorkMailbox } from "../coordination/workMailbox.js";
 import {
   builtinAgentProfileInputs,
@@ -141,6 +145,13 @@ export async function runSetupCommand(
       `Leader reasoning effort: ${result.leaderConfig.effort ?? "CLI default"}.`,
       `Operator model: ${result.operatorConfig.model ?? "CLI default"}.`,
       `Operator reasoning effort: ${result.operatorConfig.effort ?? "CLI default"}.`,
+      `Worker Agent: ${result.workerAgentId}.`,
+      `Worker configuration: ${result.workerReusesLeader
+        ? "Reused Leader configuration"
+        : "Configured separately"}.`,
+      `Worker model: ${result.workerConfig.model ?? "CLI default"}.`,
+      `Worker reasoning effort: ${result.workerConfig.effort ?? "CLI default"}.`,
+      `Worker YOLO: ${result.workerConfig.yolo === true ? "enabled" : "disabled"}.`,
       `Project workspace: ${result.workspace}.`,
       `Time zone: ${resolveTimeZone(new FileTaskStore(home).getConfig().timeZone)}.`
     ];
@@ -182,6 +193,9 @@ async function configureYui(
   operatorAgentId: string;
   leaderConfig: RoleAgentConfig;
   operatorConfig: RoleAgentConfig;
+  workerAgentId: string;
+  workerConfig: RoleAgentConfig;
+  workerReusesLeader: boolean;
   workspace: string;
 }>> {
   const candidates = availableAgentChoices(store, env);
@@ -259,6 +273,49 @@ async function configureYui(
     selectionIo,
     catalogs
   );
+  const existingWorker = store.getGlobalRole(SYSTEM_WORKER_ROLE);
+  const workerModeFallback = workerConfigurationModeFallback(
+    existingWorker,
+    defaultAgentId,
+    leaderConfig
+  );
+  io.output?.write(
+    "\nWorker is the default Agent configuration copied into Task Roles such as "
+    + "investigator and implementer. Each Task Role gets its own Session.\n"
+  );
+  const workerReusesLeader = parseWorkerConfigurationMode(
+    await question(
+      `Choose Worker configuration (reuse Leader/configure separately) [${
+        workerModeFallback === "reuse-leader" ? "reuse Leader" : "configure separately"
+      }]: `
+    ),
+    workerModeFallback
+  ) === "reuse-leader";
+  let workerAgentId = defaultAgentId;
+  let workerConfig = structuredClone(leaderConfig);
+  if (!workerReusesLeader) {
+    const existingWorkerAgent = existingWorker?.activeAgentId;
+    const workerFallback = configuredIds.has(existingWorkerAgent ?? "")
+      ? existingWorkerAgent as string
+      : defaultAgentId;
+    workerAgentId = parseSingleAgentSelection(
+      await question(`Choose Worker Agent [${workerFallback}]: `),
+      prepared,
+      workerFallback
+    );
+    const workerAgent = prepared.find(({ id }) => id === workerAgentId);
+    if (workerAgent === undefined) {
+      throw usageError("Selected Worker Agent is no longer available.");
+    }
+    workerConfig = await promptRoleAgentConfig(
+      "Worker",
+      workerAgent,
+      existingWorker,
+      home,
+      selectionIo,
+      catalogs
+    );
+  }
   const suggestedWorkspace = config.defaultWorkspace?.trim()
     || join(dirname(resolve(home)), "workspace");
   const workspaceAnswer = (await question(
@@ -275,6 +332,7 @@ async function configureYui(
     for (const agent of prepared) tx.saveConfiguredAgent(agent);
     const latestDefaultAgent = requireSetupAgent(tx, defaultAgentId);
     const latestOperatorAgent = requireSetupAgent(tx, operatorAgentId);
+    const latestWorkerAgent = requireSetupAgent(tx, workerAgentId);
     const operatorRole = prepareSystemRole(
       tx,
       SYSTEM_OPERATOR_ROLE,
@@ -291,6 +349,14 @@ async function configureYui(
       now,
       leaderConfig
     );
+    const workerRole = prepareSystemRole(
+      tx,
+      SYSTEM_WORKER_ROLE,
+      latestWorkerAgent,
+      workspace,
+      now,
+      workerConfig
+    );
     const latest = tx.getConfig();
     tx.saveConfig({
       ...latest,
@@ -300,6 +366,7 @@ async function configureYui(
     });
     if (operatorRole !== null) savePreparedSystemRole(tx, operatorRole, now);
     if (leaderRole !== null) savePreparedSystemRole(tx, leaderRole, now);
+    if (workerRole !== null) savePreparedSystemRole(tx, workerRole, now);
     seedBuiltinProfiles(tx, now);
   });
 
@@ -309,8 +376,38 @@ async function configureYui(
     operatorAgentId,
     leaderConfig,
     operatorConfig,
+    workerAgentId,
+    workerConfig,
+    workerReusesLeader,
     workspace
   };
+}
+
+type WorkerConfigurationMode = "reuse-leader" | "configure-separately";
+
+function workerConfigurationModeFallback(
+  existing: GlobalRole | null,
+  leaderAgentId: string,
+  leaderConfig: RoleAgentConfig
+): WorkerConfigurationMode {
+  if (existing === null) return "reuse-leader";
+  return existing.activeAgentId === leaderAgentId
+    && isDeepStrictEqual(existing.agentBindings[leaderAgentId]?.config, leaderConfig)
+    ? "reuse-leader"
+    : "configure-separately";
+}
+
+function parseWorkerConfigurationMode(
+  answer: string,
+  fallback: WorkerConfigurationMode
+): WorkerConfigurationMode {
+  const value = answer.trim().toLowerCase();
+  if (value.length === 0) return fallback;
+  if (["1", "reuse", "reuse leader", "leader"].includes(value)) return "reuse-leader";
+  if (["2", "configure", "configure separately", "separate"].includes(value)) {
+    return "configure-separately";
+  }
+  throw usageError("Choose reuse Leader or configure separately for Worker.");
 }
 
 function savePreparedSystemRole(

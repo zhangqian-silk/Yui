@@ -27,6 +27,7 @@ import {
   uninstallDevLauncher
 } from "../../scripts/manage-dev-launcher.mjs";
 import { startControllerServer } from "../../dist/core/controllerServer.js";
+import { controllerSocketPath } from "../../dist/core/controllerEndpoint.js";
 import { parseControllerDiscovery } from "../../dist/core/protocol.js";
 
 function currentProcessStartIdentity() {
@@ -870,7 +871,7 @@ test("development home reset rejects malformed Controller discovery without movi
   writeFileSync(join(home, "state.json"), "keep me\n");
   writeFileSync(discoveryPath, `${JSON.stringify({
     pid: process.pid,
-    socketPath: join(home, "runtime", "controller.sock"),
+    socketPath: controllerSocketPath(home),
     token: "0".repeat(64)
   })}\n`, { mode: 0o600 });
 
@@ -891,7 +892,7 @@ test("development home reset accepts a complete stale discovery only when its ow
   writeFileSync(discoveryPath, `${JSON.stringify({
     pid: 2_147_483_647,
     processStartIdentity: "1",
-    socketPath: join(home, "runtime", "controller.sock"),
+    socketPath: controllerSocketPath(home),
     token: "a".repeat(64)
   })}\n`, { mode: 0o600 });
 
@@ -911,7 +912,7 @@ test("development home reset recognizes a reused PID from its different process 
   writeFileSync(discoveryPath, `${JSON.stringify({
     pid: process.pid,
     processStartIdentity: currentProcessStartIdentity() === "1" ? "2" : "1",
-    socketPath: join(home, "runtime", "controller.sock"),
+    socketPath: controllerSocketPath(home),
     token: "b".repeat(64)
   })}\n`, { mode: 0o600 });
 
@@ -931,7 +932,7 @@ test("development home reset fails safely when the same process identity is stil
   writeFileSync(discoveryPath, `${JSON.stringify({
     pid: process.pid,
     processStartIdentity: currentProcessStartIdentity(),
-    socketPath: join(home, "runtime", "controller.sock"),
+    socketPath: controllerSocketPath(home),
     token: "b".repeat(64)
   })}\n`, { mode: 0o600 });
 

@@ -37,8 +37,16 @@ function fixture(t) {
   store.transaction((tx) => {
     tx.saveConfig({ schemaVersion: 1, defaultAgent: codex.id, defaultWorkspace: root });
     tx.saveConfiguredAgent(codex);
-    tx.saveGlobalRole(createGlobalRole(
+    const leader = createGlobalRole(
       "leader",
+      [createRoleAgentBinding(codex)],
+      codex.id,
+      root,
+      NOW
+    );
+    tx.saveGlobalRole(leader);
+    tx.saveGlobalRole(createGlobalRole(
+      "worker",
       [createRoleAgentBinding(codex)],
       codex.id,
       root,

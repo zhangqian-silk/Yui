@@ -15,6 +15,7 @@ export type TaskMetadata = {
   dueAt?: string;
   projectBindings?: readonly TaskProjectBinding[];
   cwd?: string;
+  requireIntegration?: true;
 };
 
 export type TaskMetadataUpdate = Partial<{
@@ -25,6 +26,7 @@ export type TaskMetadataUpdate = Partial<{
   dueAt: string | null;
   projectBindings: readonly TaskProjectBinding[];
   cwd: string;
+  requireIntegration: true;
 }>;
 
 export type Task = {
@@ -37,6 +39,7 @@ export type Task = {
   dueAt?: string;
   projectBindings: readonly TaskProjectBinding[];
   cwd?: string;
+  requireIntegration?: true;
   status: TaskStatus;
   completedAt?: string;
   completedBy?: TaskCompletedBy;
@@ -151,6 +154,7 @@ export function updateTaskMetadata(
     updated.projectBindings = normalizeProjectBindings(metadata.projectBindings);
   }
   if (metadata.cwd !== undefined) updated.cwd = requireText(metadata.cwd, "Task workspace");
+  if (metadata.requireIntegration === true) updated.requireIntegration = true;
   return updated;
 }
 
@@ -196,6 +200,9 @@ export function validateTask(task: Task): Task {
   if (task.dueAt !== undefined) requireTimestamp(task.dueAt, "Task dueAt");
   normalizeProjectBindings(task.projectBindings);
   if (task.cwd !== undefined) requireText(task.cwd, "Task workspace");
+  if (task.requireIntegration !== undefined && task.requireIntegration !== true) {
+    throw new Error("Task requireIntegration must be true when present.");
+  }
   const completionFields = [task.completedAt, task.completedBy, task.completionSummary];
   const hasAnyCompletion = completionFields.some((value) => value !== undefined);
   const hasAllCompletion = completionFields.every((value) => value !== undefined);
@@ -243,7 +250,8 @@ function cloneMetadata(
     ...(metadata.tags === undefined ? {} : { tags: [...metadata.tags] }),
     ...(metadata.dueAt === undefined ? {} : { dueAt: metadata.dueAt }),
     projectBindings: normalizeProjectBindings(metadata.projectBindings ?? []),
-    ...(metadata.cwd === undefined ? {} : { cwd: requireText(metadata.cwd, "Task workspace") })
+    ...(metadata.cwd === undefined ? {} : { cwd: requireText(metadata.cwd, "Task workspace") }),
+    ...(metadata.requireIntegration === true ? { requireIntegration: true as const } : {})
   };
   return cloned;
 }

@@ -273,8 +273,8 @@ function leaderWakeupInput(
     `Read the authoritative context with yui task context ${taskId}.`,
     `If the Task is Project-backed, read its catalog entry with yui project show <project> and inspect relevant Yui-maintained knowledge with yui project knowledge list <project> and yui project knowledge show <project> <knowledge>.`,
     "Use narrower Task message, WorkItem, decision, milestone, and input commands only when a specific record needs closer inspection.",
-    `When the requested outcome is finished and there are no active Worker Runs or unresolved inputs, complete the Task with yui task complete ${taskId} --summary "<final outcome and evidence>".`,
-    `Before ending this turn, if the Task was not completed and no InputRequest terminalized this Run, release the active fence with yui task run yield ${runId} --summary "<current result or waiting state>". In particular, yield before waiting for Worker results; do not return to an idle composer while this Run remains active.`
+    `When the requested outcome is finished and there are no active Worker Runs or unresolved inputs, complete the Task with yui task complete ${taskId} --summary-file - and a quoted heredoc containing the final outcome and evidence.`,
+    `Before ending this turn, if the Task was not completed and no InputRequest terminalized this Run, release the active fence with yui task run yield ${runId} --summary-file - and a quoted heredoc containing the current result or waiting state. In particular, yield before waiting for Worker results; do not return to an idle composer while this Run remains active. The yield command must be the final tool action: after it succeeds, stop immediately and do not inspect, poll, accept, or perform further work in the same native turn.`
   ];
   return lines.join("\n");
 }

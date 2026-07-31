@@ -213,7 +213,7 @@ test("task context aggregates complete records and renders a compact recent summ
   assert.doesNotMatch(result.output, /Message 1/);
   assert.match(result.output, /Message 6/);
   assert.match(result.output, /Open input requests \(0\):\n  None\./);
-  assert.match(result.output, /Recent events \(5 of 7\)/);
+  assert.match(result.output, /Recent events \(5 of 8\)/);
 });
 
 test("task context includes every open input and renders a bounded actionable summary", (t) => {

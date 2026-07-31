@@ -81,6 +81,9 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
           ))
         ]),
     ...(task.cwd === undefined ? [] : [`Workspace: ${task.cwd}`]),
+    `Completion evidence: ${task.requireIntegration
+      ? "WorkItem, ChangeSet, and committed Integration required"
+      : "delivery integration not required"}`,
     "",
     "Brief:",
     ...(brief === null
@@ -123,9 +126,15 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       ? ["  None."]
       : roles.flatMap((role) => {
           const binding = role.agentBindings[role.activeAgentId];
+          const creation = [...events].reverse().find((event) => (
+            event.type === "role.added" && event.payload.role === role.name
+          ));
           return [
             `  ${role.name} [${role.status}]: ${role.activeAgentId}/${binding.adapterId}`,
-            `    Model: ${binding.config.model ?? "default"}; effort: ${binding.config.effort ?? "default"}`
+            `    Model: ${binding.config.model ?? "default"}; effort: ${binding.config.effort ?? "default"}; YOLO: ${binding.config.yolo === true ? "enabled" : "disabled"}`,
+            ...(creation?.payload.runtimeSource === undefined
+              ? []
+              : [`    Runtime source at creation: ${creation.payload.runtimeSource}`])
           ];
         })),
     "",

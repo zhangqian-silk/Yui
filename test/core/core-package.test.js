@@ -126,6 +126,8 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
   assert.match(operator, /Leader chooses among direct execution, a native subagent, and a Task Role\s+AgentRun/u);
   assert.match(operator, /inherits\s+the Leader Agent, ignores Task Role Agent bindings/u);
   assert.match(operator, /has no Yui launch\s+command/u);
+  assert.match(operator, /Use `--require-integration` whenever completing the mission requires changing\s+and delivering Project files/u);
+  assert.match(operator, /requires a WorkItem, ChangeSet, and\s+committed Integration before completion/u);
   assert.match(worker, /native subagent inherits the Leader Agent/u);
   assert.match(worker, /Do not run Yui lifecycle commands/u);
   assert.match(worker, /result and records the actual Profile revision/u);
