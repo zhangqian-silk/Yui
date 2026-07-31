@@ -1102,7 +1102,7 @@ test("generic mailbox claim and release preserve signals queued during processin
   assert.equal(released.pending.requestCount, 2);
 });
 
-test("Worker delivery claims and binds its mailbox before external work, then releases on failure", async (t) => {
+test("Worker delivery claims and binds its mailbox before external work, then fails deterministically before send", async (t) => {
   const { store, task, now, adapter } = fixture(t);
   const worker = createRole(
     task.id,
@@ -1144,9 +1144,12 @@ test("Worker delivery claims and binds its mailbox before external work, then re
     roleName: worker.name,
     runId: run.id
   }]);
-  const released = store.getWorkMailbox(target);
-  assert.equal(released.processing, null);
-  assert.ok(released.pending.refs.some((ref) => ref.type === "run" && ref.id === run.id));
+  const completed = store.getWorkMailbox(target);
+  assert.equal(completed.processing, null);
+  assert.equal(completed.pending, null);
+  assert.equal(store.getActiveAgentRun(task.id, worker.name), null);
+  assert.equal(store.getAgentRun(task.id, run.id).status, "failed");
+  assert.ok(store.getPendingWakeup(task.id).reasons.includes("role-run-failed"));
 });
 
 test("Worker busy retry persists and reuses the hosted native session before delivery", async (t) => {

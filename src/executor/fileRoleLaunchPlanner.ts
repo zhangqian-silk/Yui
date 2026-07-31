@@ -111,6 +111,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     if (task.status !== "active") throw new Error(`Task is not active: ${input.taskId}.`);
     const role = this.store.getRole(input.taskId, input.roleName);
     if (role === null) throw new Error(`Role not found: ${input.taskId}/${input.roleName}.`);
+    const activeRun = this.store.getActiveAgentRun(task.id, role.name);
+    const runWorkspace = activeRun?.workspace;
     if (task.projectBindings.length > 0) {
       const workspace = this.store.getRoleWorkspace(task.id, role.name);
       const main = this.store.getRoleWorkspace(task.id, "leader");
@@ -121,7 +123,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       const isolatedWorkItem = workspace?.owner.type === "work-item"
         ? this.store.getWorkItem(task.id, workspace.owner.workItemId)
         : null;
-      const activeRun = this.store.getActiveAgentRun(task.id, role.name);
       const isolated = workspace !== null
         && workspace.owner.type === "work-item"
         && isolatedWorkItem !== null
@@ -132,7 +133,15 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         && sameWorkspaceProjects(workspace, task.projectBindings.map(({ projectId }) => projectId))
         && sameWritableProjects(workspace, isolatedWorkItem.writeProjectIds)
         && workspace.root === role.workspace;
-      if (task.cwd === undefined || main === null || (!sharedMain && !isolated)) {
+      const runScoped = runWorkspace !== undefined
+        && runWorkspace.taskId === task.id
+        && sameWorkspaceProjects(
+          runWorkspace,
+          task.projectBindings.map(({ projectId }) => projectId)
+        )
+        && (runWorkspace.owner.type === "task"
+          || runWorkspace.owner.workItemId === activeRun?.workItemId);
+      if (task.cwd === undefined || main === null || (!runScoped && !sharedMain && !isolated)) {
         throw new Error(`Role workspace is not ready: ${input.taskId}/${input.roleName}.`);
       }
     }
@@ -141,7 +150,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       input,
       { scope: "task", taskId: task.id },
       taskRoleSessionTitle(task, role.name),
-      this.store.getRoleSession(task.id, role.name)?.nativeSessionId
+      this.store.getRoleSession(task.id, role.name)?.nativeSessionId,
+      runWorkspace
     );
   }
 
@@ -170,7 +180,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     }>,
     owner: Readonly<{ scope: "task"; taskId: string } | { scope: "global" }>,
     sessionTitle: string | undefined,
-    knownNativeSessionId?: string
+    knownNativeSessionId?: string,
+    workspaceOverride?: RoleWorkspace
   ): PlannedRoleSession {
     const binding = activeRoleAgentBinding(role);
     if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
@@ -202,6 +213,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         .join(delimiter)
     };
     const adapter = resolveAgentAdapter(binding.adapterId);
+    const effectiveWorkspace = workspaceOverride?.root ?? role.workspace;
     const sessionContext = compileRoleSessionContext(this.home, role, owner);
     const codexConfig = binding.config.adapterId === "codex"
       ? inspectCodexLaunchConfig({
@@ -210,7 +222,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
             ...agentSourceEnvironment,
             ...launchEnvironment
           },
-          workspace: role.workspace,
+          workspace: effectiveWorkspace,
           profile: binding.config.profile
         })
       : undefined;
@@ -224,7 +236,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const compileInput = {
       agent,
       config: binding.config,
-      workspace: role.workspace,
+      workspace: effectiveWorkspace,
       ...(sessionTitle === undefined ? {} : { sessionTitle }),
       ...sessionContext,
       ...(codexConfig === undefined
@@ -290,7 +302,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         YUI_ROLE: role.name,
         YUI_AGENT_ID: configured.id,
         YUI_ADAPTER_ID: configured.adapterId,
-        YUI_WORKSPACE: role.workspace,
+        YUI_WORKSPACE: effectiveWorkspace,
         ...(sessionTitle === undefined
           ? {}
           : {
@@ -308,12 +320,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       }
     };
     const protectedLaunch = owner.scope === "task"
-      ? this.#protectReadOnlyWorkspace(owner.taskId, role, launch)
+      ? this.#protectReadOnlyWorkspace(owner.taskId, role, launch, workspaceOverride)
       : launch;
     return {
       role: {
         name: role.name,
-        workspace: role.workspace,
+        workspace: effectiveWorkspace,
         ...(owner.scope === "task" ? { status: (role as TaskRole).status } : {})
       },
       launch: protectedLaunch,
@@ -328,10 +340,11 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       command: string;
       args: readonly string[];
       env: Readonly<Record<string, string>>;
-    }>
+    }>,
+    workspaceOverride?: RoleWorkspace
   ): typeof launch {
-    const workspace = this.store.getRoleWorkspace(taskId, role.name);
-    if (workspace === null || workspace.owner.type !== "work-item") return launch;
+    const workspace = workspaceOverride ?? this.store.getRoleWorkspace(taskId, role.name);
+    if (workspace === null || workspace === undefined) return launch;
     const readOnlyEntries = workspace.entries.filter(({ access }) => access === "read");
     if (readOnlyEntries.length === 0) {
       return {

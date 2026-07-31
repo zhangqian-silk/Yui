@@ -1,4 +1,4 @@
 interface:
   display_name: "Yui Leader"
-  short_description: "Lead long-running Yui task execution"
-  default_prompt: "Use $yui-leader to advance this Yui task and coordinate its roles."
+  short_description: "Lead Yui tasks with agent-centered judgment"
+  default_prompt: "Use $yui-leader to solve the task's core problem and coordinate the simplest sufficient execution."

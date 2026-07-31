@@ -50,6 +50,12 @@ import {
   yieldAgentRun,
   type AgentRun
 } from "../run/agentRun.js";
+import {
+  createReviewRound,
+  finishReviewRound,
+  startReviewRound,
+  type ReviewRound
+} from "../review/reviewRound.js";
 import { markYuiRunInput, retagYuiRunInput } from "../run/runIdentity.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import { createTaskBrief, updateTaskBrief } from "../brief/taskBrief.js";
@@ -78,13 +84,18 @@ import type { AgentProfile } from "../profile/agentProfile.js";
 import { resolveProject, type Project } from "../repository/project.js";
 import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import {
+  currentWorkItemCandidate,
   createWorkItem,
   retryFailedWorkItem,
+  submitWorkItemCandidate,
   updateWorkItemWriteProjects,
   updateWorkItemStatus,
   type WorkItem,
+  type WorkItemCandidate,
   type WorkItemStatus
 } from "../workItem/workItem.js";
+import type { ReviewConfig } from "../review/reviewConfig.js";
+import { validateRoleWorkspace, type RoleWorkspace } from "../worktree/roleWorkspace.js";
 import {
   hasAgentConfigOptions,
   parseRoleOptions,
@@ -1315,6 +1326,7 @@ function taskWorkCommand(
   if (command === "update") return output(updateWork(rest, store, options));
   if (command === "scope") return output(updateWorkScope(rest, store, options));
   if (command === "dispatch") return output(dispatchWork(rest, store, options));
+  if (command === "review") return output(reviewWork(rest, store, options));
   if (command === "accept") return acceptWork(rest, store, options);
   if (command === "reject") return rejectWork(rest, store, options);
   if (command === "cancel") return cancelWork(rest, store, options);
@@ -1435,7 +1447,7 @@ function updateWork(
     throw usageError(`--summary is required when work becomes ${requested}.`);
   }
   const now = clock(options);
-  const item = store.transaction((tx) => {
+  const result = store.transaction((tx) => {
     const current = requireWorkItem(tx, parsed.positionals[0]);
     const task = requireTask(tx, current.taskId);
     assertTaskOpen(task);
@@ -1448,7 +1460,20 @@ function updateWork(
       if (status === "running") {
         assertWorkItemDependenciesCompleted(tx, current);
       }
-      const updated = current.status === "failed" && status === "running"
+      const reviewConfig = status === "completed" && !isTerminalWorkItemStatus(current.status)
+        ? tx.getReviewConfig()
+        : null;
+      const candidateRequired = reviewConfig !== null;
+      const updated = candidateRequired
+        ? submitWorkItemCandidate(current, {
+            summary: summary!,
+            source: { type: "direct" },
+            reviewPolicy: reviewConfig,
+            ...(tx.getRoleWorkspace(task.id, LEADER_ROLE) === null
+              ? {}
+              : { workspace: tx.getRoleWorkspace(task.id, LEADER_ROLE)! })
+          }, now)
+        : current.status === "failed" && status === "running"
         ? retryFailedWorkItem(current, now)
         : updateWorkItemStatus(
             current,
@@ -1467,7 +1492,20 @@ function updateWork(
       enqueueWork(tx, taskMailbox(task.id), "work-updated", now, [
         workItemRef(updated.id)
       ]);
-      return updated;
+      const reviewDispatch = reviewConfig?.trigger === "always"
+        ? queueReviewRound(
+            tx,
+            updated,
+            reviewConfig,
+            "policy",
+            now
+          )
+        : null;
+      return {
+        item: updated,
+        reviewDispatch,
+        reviewTrigger: candidateRequired ? reviewConfig.trigger : null
+      };
     }
     if (
       current.workspaceDisposition !== undefined
@@ -1477,7 +1515,7 @@ function updateWork(
       const updated = updateWorkItemStatus(current, status, now, summary);
       tx.saveWorkItem(task.id, updated);
       enqueueWork(tx, taskMailbox(task.id), "work-updated", now, [workItemRef(updated.id)]);
-      return updated;
+      return { item: updated, reviewDispatch: null, reviewTrigger: null };
     }
     throw usageError(
       `Assigned Work Item execution cannot use task work update: ${current.id}. `
@@ -1485,8 +1523,25 @@ function updateWork(
       + "use task work cancel to cancel it."
     );
   });
-  notifyMailbox(options.runtime, taskMailbox(item.taskId), item.taskId);
-  return `Updated work item ${item.id} to ${requested}\n`;
+  notifyMailbox(options.runtime, taskMailbox(result.item.taskId), result.item.taskId);
+  if (result.reviewDispatch?.run !== null
+    && result.reviewDispatch?.run !== undefined) {
+    notifyMailbox(
+      options.runtime,
+      roleMailbox(result.reviewDispatch.run.taskId, result.reviewDispatch.run.roleName),
+      result.reviewDispatch.run.taskId
+    );
+  }
+  if (result.item.status === "awaiting_acceptance" && status === "completed") {
+    const failure = result.reviewDispatch?.round.status === "failed"
+      ? `Review could not start: ${result.reviewDispatch.round.summary}\n`
+      : "";
+    const destination = result.reviewTrigger === "always"
+      ? "review"
+      : "Leader decision";
+    return `Submitted work item ${result.item.id} for ${destination}\n${failure}`;
+  }
+  return `Updated work item ${result.item.id} to ${requested}\n`;
 }
 
 function dispatchWork(
@@ -1565,14 +1620,32 @@ function dispatchWork(
       taskRoleSessionTitle(task, role.name)
     );
     const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
+    const dispatchMode = roleAgentSessionResumeMode(sessions, role.activeAgentId);
+    if (item.status === "failed"
+      && item.candidates.length > 0
+      && dispatchMode !== "resume") {
+      throw usageError(
+        `Work Item ${item.id} repair requires the original ${role.name} native Session. `
+        + "Restore it or ask the user how to proceed; Yui will not create a replacement "
+        + "Session implicitly."
+      );
+    }
     const created = createAgentRun(
       runId,
       task.id,
       role.name,
-      roleAgentSessionResumeMode(sessions, role.activeAgentId),
+      dispatchMode,
       input,
       now,
-      { workItemId: item.id, agent: agentRunSnapshot(role) }
+      {
+        workItemId: item.id,
+        ...(workspace === null
+          ? (tx.getRoleWorkspace(task.id, LEADER_ROLE) === null
+            ? {}
+            : { workspace: tx.getRoleWorkspace(task.id, LEADER_ROLE)! })
+          : { workspace }),
+        agent: agentRunSnapshot(role)
+      }
     );
     tx.saveAgentRun(created);
     tx.saveActiveAgentRun(created);
@@ -1612,10 +1685,18 @@ function acceptWork(
     if (item.status !== "awaiting_acceptance") {
       throw usageError(`Work Item is not awaiting acceptance: ${item.id}/${item.status}.`);
     }
-    const latestRun = chronologicalAgentRuns(tx.listAgentRuns(item.taskId)
-      .filter((run) => run.workItemId === item.id)).at(-1);
-    if (latestRun === undefined || latestRun.status !== "yielded") {
-      throw usageError(`Work Item has no latest yielded AgentRun: ${item.id}.`);
+    const candidate = requireWorkItemCandidate(item);
+    const latestReview = chronologicalReviewRounds(tx.listReviewRounds(item.taskId)
+      .filter((round) => round.candidateId === candidate.id)).at(-1);
+    if (latestReview !== undefined
+      && (latestReview.status === "pending" || latestReview.status === "running")) {
+      throw usageError(
+        `ReviewRound is not completed: ${latestReview.id}/${latestReview.status}.`
+      );
+    }
+    if (candidate.reviewPolicy?.trigger === "always"
+      && latestReview === undefined) {
+      throw usageError(`Work Item candidate has no required ReviewRound: ${item.id}.`);
     }
     const isolatedWorkspace = item.assignee === undefined
       ? null
@@ -1636,7 +1717,10 @@ function acceptWork(
     tx.saveWorkItem(item.taskId, completed);
     recordTaskEvent(tx, item.taskId, "work.accepted", {
       workItemId: item.id,
-      runId: latestRun.id,
+      candidateId: candidate.id,
+      ...(candidate.source.type === "run"
+        ? { runId: candidate.source.runId }
+        : { workItemRevision: String(candidate.workItemRevision) }),
       acceptedBy: "leader",
       summary
     }, now);
@@ -1730,10 +1814,16 @@ function rejectWork(
     if (item.status !== "awaiting_acceptance") {
       throw usageError(`Work Item is not awaiting acceptance: ${item.id}/${item.status}.`);
     }
+    const candidate = requireWorkItemCandidate(item);
+    const activeReview = activeReviewRoundForCandidate(tx, item, candidate);
+    if (activeReview !== undefined) {
+      throw usageError(`ReviewRound is still active: ${activeReview.id}/${activeReview.status}.`);
+    }
     const failed = updateWorkItemStatus(item, "failed", now, summary);
     tx.saveWorkItem(item.taskId, failed);
     recordTaskEvent(tx, item.taskId, "work.rejected", {
       workItemId: item.id,
+      candidateId: candidate.id,
       rejectedBy: "leader",
       summary
     }, now);
@@ -1766,6 +1856,13 @@ function cancelWork(
       );
     }
     const actor = taskActor(options, task.id);
+    if (item.status === "awaiting_acceptance") {
+      const candidate = requireWorkItemCandidate(item);
+      const activeReview = activeReviewRoundForCandidate(tx, item, candidate);
+      if (activeReview !== undefined) {
+        throw usageError(`ReviewRound is still active: ${activeReview.id}/${activeReview.status}.`);
+      }
+    }
     const cancelled = updateWorkItemStatus(item, "cancelled", now, summary);
     tx.saveWorkItem(item.taskId, cancelled);
     recordTaskEvent(tx, item.taskId, "work.cancelled", {
@@ -1817,6 +1914,52 @@ function listWork(args: string[], store: TaskWorkflowStore): TaskCommandExecutio
   return output(rendered, { workItems: items });
 }
 
+function reviewWork(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  exactPositionals(args, 1, "Task work review usage: yui task work review <work>.");
+  const now = clock(options);
+  const result = store.transaction((tx) => {
+    const item = requireWorkItem(tx, args[0]);
+    const task = requireTask(tx, item.taskId);
+    if (task.status !== "active") {
+      throw usageError(`Task is not active: ${task.id}/${task.status}.`);
+    }
+    if (taskActor(options, task.id) !== "leader") {
+      throw usageError("Only the Task Leader may request a Work Item review.");
+    }
+    if (item.status !== "awaiting_acceptance") {
+      throw usageError(`Work Item is not awaiting acceptance: ${item.id}/${item.status}.`);
+    }
+    const candidate = requireWorkItemCandidate(item);
+    const config = candidate.reviewPolicy;
+    if (config === undefined) {
+      throw usageError(`Candidate has no review policy: ${candidate.id}.`);
+    }
+    const activeRound = chronologicalReviewRounds(tx.listReviewRounds(task.id)
+      .filter((round) => (
+        round.candidateId === candidate.id
+        && (round.status === "pending" || round.status === "running")
+      ))).at(-1);
+    if (activeRound !== undefined) {
+      throw usageError(`ReviewRound is already active: ${activeRound.id}/${activeRound.status}.`);
+    }
+    return queueReviewRound(tx, item, config, "leader", now);
+  });
+  if (result.run !== null) {
+    notifyMailbox(
+      options.runtime,
+      roleMailbox(result.run.taskId, result.run.roleName),
+      result.run.taskId
+    );
+  }
+  return result.run === null
+    ? `Review could not start for ${result.round.workItemId}: ${result.round.summary}\n`
+    : `Review queued as ${result.round.id} (${result.run.id})\n`;
+}
+
 function taskRunCommand(
   args: string[],
   store: TaskWorkflowStore,
@@ -1841,11 +1984,19 @@ function listRuns(args: string[], store: TaskWorkflowStore): string {
     [
       { header: "Run", minWidth: 6, maxWidth: 20 },
       { header: "Role", minWidth: 4, maxWidth: 22 },
+      { header: "Purpose", minWidth: 6, maxWidth: 10 },
       { header: "Mode", minWidth: 4, maxWidth: 8 },
       { header: "Status", minWidth: 6, maxWidth: 12 },
       { header: "Summary", minWidth: 8, maxWidth: 58 }
     ],
-    runs.map((run) => [run.id, run.roleName, run.mode, run.status, run.summary ?? "-"]),
+    runs.map((run) => [
+      run.id,
+      run.roleName,
+      run.purpose,
+      run.mode,
+      run.status,
+      run.summary ?? "-"
+    ]),
     defaultTableWidth()
   )}\n`;
 }
@@ -1861,6 +2012,11 @@ function retryRun(
     const previous = requireRun(tx, args[0]);
     if (previous.status !== "failed") {
       throw usageError(`Run ${previous.id} is not retryable from ${previous.status}.`);
+    }
+    if (previous.purpose === "review") {
+      throw usageError(
+        `Review Run ${previous.id} is not retried directly; request a new WorkItem review.`
+      );
     }
     const task = requireTask(tx, previous.taskId);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
@@ -1886,6 +2042,7 @@ function retryRun(
       now,
       {
         ...(previous.workItemId === undefined ? {} : { workItemId: previous.workItemId }),
+        ...(previous.workspace === undefined ? {} : { workspace: previous.workspace }),
         agent: agentRunSnapshot(role)
       }
     );
@@ -1959,15 +2116,32 @@ function yieldRun(
       runRef(terminal.id)
     );
     tx.clearActiveAgentRun(task.id, role.name);
-    if (active.workItemId !== undefined) {
+    let automaticReview: Readonly<{
+      item: WorkItem;
+      config: ReviewConfig;
+    }> | null = null;
+    let submittedItem: WorkItem | null = null;
+    if (active.purpose === "review") {
+      // Saving the terminal review Run completes its ReviewRound in the same
+      // aggregate transaction. The WorkItem remains the candidate under review.
+    } else if (active.workItemId !== undefined) {
       const item = tx.getWorkItem(task.id, active.workItemId);
       if (item === null) throw dataError(`Work item not found for run ${active.id}: ${active.workItemId}.`);
-      tx.saveWorkItem(task.id, updateWorkItemStatus(
-        item,
-        role.name === LEADER_ROLE ? "completed" : "awaiting_acceptance",
-        now,
-        role.name === LEADER_ROLE ? summary : undefined
-      ));
+      const reviewConfig = tx.getReviewConfig();
+      const candidateRequired = role.name !== LEADER_ROLE || reviewConfig !== null;
+      const yieldedItem = candidateRequired
+          ? submitWorkItemCandidate(item, {
+            summary,
+            source: { type: "run", runId: terminal.id },
+            ...(reviewConfig === null ? {} : { reviewPolicy: reviewConfig }),
+            ...(active.workspace === undefined ? {} : { workspace: active.workspace })
+          }, now)
+        : updateWorkItemStatus(item, "completed", now, summary);
+      tx.saveWorkItem(task.id, yieldedItem);
+      if (candidateRequired) submittedItem = yieldedItem;
+      if (reviewConfig?.trigger === "always") {
+        automaticReview = { item: yieldedItem, config: reviewConfig };
+      }
     } else if (role.name !== LEADER_ROLE) {
       throw usageError(`Run ${active.id} is not a work run.`);
     }
@@ -1980,17 +2154,202 @@ function yieldRun(
         receiptId: `agent-run:${active.id}`
       }, now));
     }
-    if (role.name !== LEADER_ROLE) {
-      enqueueWork(tx, leaderMailbox(task.id), "role-result", now, [
+    const reviewDispatch = automaticReview === null
+      ? null
+      : queueReviewRound(
+          tx,
+          automaticReview.item,
+          automaticReview.config,
+          "policy",
+          now
+        );
+    const leaderHandoff = active.purpose === "review"
+      ? "review-result"
+      : submittedItem === null
+        || (reviewDispatch !== null && reviewDispatch.run !== null)
+        ? null
+        : reviewDispatch?.round.status === "failed"
+          ? "review-failed"
+          : "candidate-ready";
+    if (leaderHandoff !== null) {
+      enqueueWork(tx, leaderMailbox(task.id), leaderHandoff, now, [
         runRef(terminal.id),
         messageRef(message.id),
         ...(terminal.workItemId === undefined ? [] : [workItemRef(terminal.workItemId)])
       ]);
     }
-    return { run: terminal, message };
+    return {
+      run: terminal,
+      message,
+      reviewDispatch,
+      notifyLeader: leaderHandoff !== null
+    };
   });
-  notifyMailbox(options.runtime, leaderMailbox(yielded.run.taskId), yielded.run.taskId);
+  if (yielded.notifyLeader) {
+    notifyMailbox(options.runtime, leaderMailbox(yielded.run.taskId), yielded.run.taskId);
+  }
+  if (yielded.reviewDispatch?.run !== null
+    && yielded.reviewDispatch?.run !== undefined) {
+    notifyMailbox(
+      options.runtime,
+      roleMailbox(
+        yielded.reviewDispatch.run.taskId,
+        yielded.reviewDispatch.run.roleName
+      ),
+      yielded.reviewDispatch.run.taskId
+    );
+  }
   return `Yielded ${yielded.run.id}: ${yielded.message.body}\n`;
+}
+
+function queueReviewRound(
+  store: TaskWorkflowStore,
+  item: WorkItem,
+  config: ReviewConfig,
+  requestedBy: "policy" | "leader",
+  now: Date
+): Readonly<{ round: ReviewRound; run: AgentRun | null }> {
+  const candidate = requireWorkItemCandidate(item);
+  const candidateRun = candidate.source.type === "run"
+    ? store.getAgentRun(item.taskId, candidate.source.runId)
+    : null;
+  const pending = createReviewRound(
+    store.nextReviewRoundId(item.taskId),
+    item.taskId,
+    item.id,
+    candidate.id,
+    config.roleName,
+    requestedBy,
+    now
+  );
+  store.saveReviewRound(item.taskId, pending);
+  let reviewer = store.getRole(item.taskId, config.roleName);
+  if (reviewer === null) {
+    const globalRole = store.getGlobalRole(config.roleName);
+    if (globalRole === null) {
+      const failed = finishReviewRound(
+        pending,
+        "failed",
+        `Global Role not found: ${config.roleName}.`,
+        now
+      );
+      store.saveReviewRound(item.taskId, failed);
+      return { round: failed, run: null };
+    }
+    const task = requireTask(store, item.taskId);
+    reviewer = createTaskRole(store, task, config.roleName, undefined, now, config.roleName);
+    store.saveRole(task.id, reviewer);
+  }
+  if (store.getActiveAgentRun(item.taskId, reviewer.name) !== null) {
+    const failed = finishReviewRound(
+      pending,
+      "failed",
+      `Reviewer Role already has an active run: ${reviewer.name}.`,
+      now
+    );
+    store.saveReviewRound(item.taskId, failed);
+    return { round: failed, run: null };
+  }
+  const task = requireTask(store, item.taskId);
+  const candidateRoleName = candidateRun?.roleName;
+  const candidateRole = candidateRoleName === undefined
+    ? null
+    : store.getRole(item.taskId, candidateRoleName);
+  const candidateWorkspaceRecord = candidate.workspace
+    ?? candidateRun?.workspace
+    ?? (candidateRole === null
+      ? store.getRoleWorkspace(item.taskId, LEADER_ROLE) ?? undefined
+      : store.getRoleWorkspace(item.taskId, candidateRole.name)
+        ?? store.getRoleWorkspace(item.taskId, LEADER_ROLE)
+        ?? undefined);
+  const candidateWorkspace = candidateWorkspaceRecord?.root
+    ?? candidateRole?.workspace
+    ?? task.cwd;
+  const candidateLabel = candidate.source.type === "run"
+    ? `candidate Run ${candidate.source.runId}`
+    : `revision ${candidate.workItemRevision}`;
+  const rawInput = [
+    `Review WorkItem ${item.id} ${candidateLabel}.`,
+    `Candidate summary: ${candidate.summary}`,
+    `Candidate workspace: ${candidateWorkspace ?? "Task workspace"}`,
+    `Acceptance criteria: ${item.acceptance.length === 0 ? "none" : item.acceptance.join("; ")}`,
+    "Start from the user's core outcome and the WorkItem intent. The candidate summary is a pointer, not proof: inspect the complete relevant change, context, callers, and proportionate checks.",
+    "Report only reachable, material, actionable problems with concrete evidence. Separate defects from verification gaps and prefer the smallest sufficient correction; do not design state, retries, fallbacks, or protocol for speculative extreme cases.",
+    "Review the candidate only. Do not modify files or create another WorkItem. Expose evidence and options; the Leader decides whether to accept, fix, review again, or ask the user."
+  ].join("\n");
+  const runId = store.nextAgentRunId(item.taskId);
+  const input = markYuiRunInput(
+    compileDispatchInput({}, item.taskId, reviewer, rawInput, { workItem: item }),
+    runId,
+    taskRoleSessionTitle(task, reviewer.name)
+  );
+  const sessions = store.getTaskRoleSessionSet(item.taskId, reviewer.name);
+  const run = createAgentRun(
+    runId,
+    item.taskId,
+    reviewer.name,
+    roleAgentSessionResumeMode(sessions, reviewer.activeAgentId),
+    input,
+    now,
+    {
+      workItemId: item.id,
+      purpose: "review",
+      reviewRoundId: pending.id,
+      ...(candidateWorkspaceRecord === undefined
+        ? {}
+        : { workspace: readOnlyReviewWorkspace(candidateWorkspaceRecord, reviewer.name, now) }),
+      agent: agentRunSnapshot(reviewer)
+    }
+  );
+  store.saveAgentRun(run);
+  const running = startReviewRound(pending, run.id);
+  store.saveReviewRound(item.taskId, running);
+  store.saveActiveAgentRun(run);
+  store.saveRole(item.taskId, updateRoleStatus(reviewer, "running", now));
+  enqueueWork(store, roleMailbox(item.taskId, reviewer.name), "review-requested", now, [
+    runRef(run.id),
+    workItemRef(item.id)
+  ]);
+  return { round: running, run };
+}
+
+function requireWorkItemCandidate(item: WorkItem): WorkItemCandidate {
+  const candidate = currentWorkItemCandidate(item);
+  if (candidate === undefined) {
+    throw dataError(`Work Item has no submitted candidate: ${item.id}.`);
+  }
+  return candidate;
+}
+
+function readOnlyReviewWorkspace(
+  workspace: RoleWorkspace,
+  reviewerRoleName: string,
+  now: Date
+): RoleWorkspace {
+  return validateRoleWorkspace({
+    ...workspace,
+    roleName: reviewerRoleName,
+    entries: workspace.entries.map((entry) => ({ ...entry, access: "read" as const })),
+    updatedAt: now.toISOString()
+  });
+}
+
+function chronologicalReviewRounds(rounds: ReviewRound[]): ReviewRound[] {
+  return [...rounds].sort((left, right) => (
+    left.createdAt.localeCompare(right.createdAt)
+      || left.id.localeCompare(right.id, undefined, {numeric: true})
+  ));
+}
+
+function activeReviewRoundForCandidate(
+  store: TaskWorkflowStore,
+  item: WorkItem,
+  candidate: WorkItemCandidate
+): ReviewRound | undefined {
+  return chronologicalReviewRounds(store.listReviewRounds(item.taskId)
+    .filter((round) => round.candidateId === candidate.id
+      && (round.status === "pending" || round.status === "running")))
+    .at(-1);
 }
 
 function createTaskRole(
@@ -1998,11 +2357,13 @@ function createTaskRole(
   task: Task,
   roleName: string,
   explicitAgentId: string | undefined,
-  now: Date
+  now: Date,
+  sourceGlobalRoleName?: string
 ): Role {
   const workspace = task.cwd ?? store.getConfig().defaultWorkspace ?? process.cwd();
   if (explicitAgentId === undefined) {
-    const sourceRoleName = roleName === LEADER_ROLE ? LEADER_ROLE : "worker";
+    const sourceRoleName = sourceGlobalRoleName
+      ?? (roleName === LEADER_ROLE ? LEADER_ROLE : "worker");
     const globalRole = store.getGlobalRole(sourceRoleName);
     if (globalRole !== null) {
       const copied = copyGlobalRoleToTaskRole(globalRole, task.id, now, roleName);

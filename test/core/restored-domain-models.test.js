@@ -196,8 +196,9 @@ test("restored persistent domain records are plain JSON with explicit schema ver
 
   assert.equal(snapshot.task.schemaVersion, 2);
   assert.equal(snapshot.task.status, "draft");
-  assert.equal(snapshot.workItem.schemaVersion, 3);
-  assert.equal(snapshot.yielded.schemaVersion, 1);
+  assert.equal(snapshot.workItem.schemaVersion, 5);
+  assert.equal(snapshot.yielded.schemaVersion, 3);
+  assert.equal(snapshot.yielded.purpose, "execution");
   assert.equal(snapshot.yielded.status, "yielded");
   assert.equal(snapshot.yielded.endedAt, later.toISOString());
 });

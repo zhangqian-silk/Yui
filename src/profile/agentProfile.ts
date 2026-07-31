@@ -111,8 +111,8 @@ export function builtinAgentProfileInputs(): readonly AgentProfileInput[] {
     },
     {
       id: "reviewer",
-      description: "Review behavior, evidence, and regression risk.",
-      instructions: "Report actionable findings with direct evidence. Do not modify files.",
+      description: "Review one candidate against the user's core outcome, supported behavior, and direct evidence.",
+      instructions: "Start from user intent and acceptance criteria. Inspect the complete relevant change and report only reachable, material, actionable problems with direct evidence. Separate defects from verification gaps, and prefer the smallest sufficient correction. Do not turn speculative or extreme edge cases into new state, retries, fallbacks, or protocol. Expose evidence and options to the Leader, who decides. Do not modify files or external state.",
       defaultAccess: "read"
     }
   ];

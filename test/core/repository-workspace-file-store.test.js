@@ -24,7 +24,12 @@ import { runProjectCommand } from "../../dist/commands/projectCommands.js";
 import { runTaskIntegrationCommand } from "../../dist/commands/taskIntegrationCommands.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
-import { createRole, createRoleAgentBinding, updateRole } from "../../dist/role/role.js";
+import {
+  createGlobalRole,
+  createRole,
+  createRoleAgentBinding,
+  updateRole
+} from "../../dist/role/role.js";
 import { createAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
 import { createProject } from "../../dist/repository/project.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
@@ -35,6 +40,7 @@ import { activateTask, completeTask, createTask } from "../../dist/task/task.js"
 import {
   createWorkItem,
   recordWorkItemWorkspaceDisposition,
+  submitWorkItemCandidate,
   updateWorkItemWriteProjects,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
@@ -806,6 +812,190 @@ test("a Project-backed Task owns one main worktree shared by Roles", async (t) =
   }));
 });
 
+test("a lazily copied reviewer starts from the prepared Project Task workspace", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Review a Project Task", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], NOW);
+  store.transaction((tx) => {
+    tx.saveConfiguredAgent(agent);
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(agent)],
+      agent.id,
+      workspace,
+      NOW
+    ));
+    tx.saveConfig({
+      ...tx.getConfig(),
+      review: { roleName: "reviewer", trigger: "leader" }
+    });
+    tx.saveTask(task);
+    for (const name of ["leader", "worker"]) {
+      tx.saveRole(task.id, createRole(
+        task.id,
+        name,
+        [createRoleAgentBinding(agent)],
+        agent.id,
+        repositoryPath,
+        NOW
+      ));
+    }
+  });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  const main = (await preparer.prepareTaskWorkspace(task.id)).path;
+  const item = createWorkItem("work-1", task.id, {
+    title: "Review the result",
+    assignee: "worker"
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  const candidateRun = yieldAgentRun(createAgentRun(
+    "run-1",
+    task.id,
+    "worker",
+    "new",
+    "Produce a candidate.",
+    NOW,
+    { workItemId: item.id }
+  ), "Candidate ready.", NOW);
+  store.saveAgentRun(candidateRun);
+  const mainWorkspace = store.getRoleWorkspace(task.id, "leader");
+  assert.throws(
+    () => store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
+      summary: candidateRun.summary,
+      source: { type: "run", runId: candidateRun.id },
+      reviewPolicy: { roleName: "reviewer", trigger: "leader" },
+      workspace: mainWorkspace
+    }, NOW)),
+    /workspace does not match its source Run/
+  );
+  store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
+    summary: candidateRun.summary,
+    source: { type: "run", runId: candidateRun.id },
+    reviewPolicy: { roleName: "reviewer", trigger: "leader" }
+  }, NOW));
+
+  runTaskCommand(["work", "review", item.id], store, {
+    now: () => new Date(NOW),
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  });
+
+  assert.equal(store.getRole(task.id, "reviewer").workspace, main);
+  assert.doesNotThrow(() => new FileRoleLaunchPlanner(home, store, {
+    cliPath: "/dist/cli.js",
+    bubblewrapCommand: "/usr/bin/true"
+  }).plan({
+    taskId: task.id,
+    roleName: "reviewer",
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    mode: "new"
+  }));
+});
+
+test("a reviewer launches from the candidate Run workspace instead of its previous Role workspace", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Review an isolated candidate", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], NOW);
+  store.transaction((tx) => {
+    tx.saveConfiguredAgent(agent);
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(agent)],
+      agent.id,
+      workspace,
+      NOW
+    ));
+    tx.saveConfig({
+      ...tx.getConfig(),
+      review: { roleName: "reviewer", trigger: "leader" }
+    });
+    tx.saveTask(task);
+    for (const name of ["leader", "worker"]) {
+      tx.saveRole(task.id, createRole(
+        task.id,
+        name,
+        [createRoleAgentBinding(agent)],
+        agent.id,
+        repositoryPath,
+        NOW
+      ));
+    }
+  });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const item = createWorkItem("work-1", task.id, {
+    title: "Review the isolated result",
+    assignee: "worker",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const isolated = await preparer.prepareWorkItemWorkspace(item.id);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  const candidateRun = yieldAgentRun(createAgentRun(
+    "run-1",
+    task.id,
+    "worker",
+    "new",
+    "Produce an isolated candidate.",
+    NOW,
+    { workItemId: item.id, workspace: isolated }
+  ), "Candidate ready.", NOW);
+  store.saveAgentRun(candidateRun);
+  store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
+    summary: candidateRun.summary,
+    source: { type: "run", runId: candidateRun.id },
+    reviewPolicy: { roleName: "reviewer", trigger: "leader" },
+    workspace: isolated
+  }, NOW));
+
+  runTaskCommand(["work", "review", item.id], store, {
+    now: () => new Date(NOW),
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  });
+
+  const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
+  assert.equal(reviewRun.workspace.root, isolated.root);
+  assert.equal(reviewRun.workspace.owner.workItemId, item.id);
+  assert.equal(reviewRun.workspace.entries.every(({ access }) => access === "read"), true);
+  const plan = new FileRoleLaunchPlanner(home, store, {
+    cliPath: "/dist/cli.js",
+    bubblewrapCommand: "/usr/bin/true"
+  }).plan({
+    taskId: task.id,
+    roleName: "reviewer",
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    mode: "new"
+  });
+  assert.equal(plan.role.workspace, isolated.root);
+  assert.equal(plan.launch.env.YUI_WORKSPACE, isolated.root);
+});
+
 test("a multi-Project Task and WorkItem expose one root with per-Project access", async (t) => {
   const { root, home, workspace, repositoryPath, store } = fixture(t);
   await runProjectCommand([
@@ -968,13 +1158,22 @@ test("a multi-Project Task and WorkItem expose one root with per-Project access"
     new Date(NOW.getTime() + 2)
   );
   store.saveWorkItem(task.id, running);
+  const candidateRun = yieldAgentRun(createAgentRun(
+    store.nextAgentRunId(task.id),
+    task.id,
+    "worker",
+    "new",
+    "Prepare multi-Project candidate.",
+    new Date(NOW.getTime() + 3),
+    { workItemId: item.id }
+  ), "Candidate ready.", new Date(NOW.getTime() + 3));
+  store.saveAgentRun(candidateRun);
   store.saveWorkItem(
     task.id,
-    updateWorkItemStatus(
-      running,
-      "awaiting_acceptance",
-      new Date(NOW.getTime() + 3)
-    )
+    submitWorkItemCandidate(running, {
+      summary: candidateRun.summary,
+      source: { type: "run", runId: candidateRun.id }
+    }, new Date(NOW.getTime() + 3))
   );
   const manager = new WorkItemChangeSetManager(
     store,
@@ -1168,11 +1367,6 @@ test("Leader acceptance consumes an exact workspace integration proof", async (t
   const isolated = await preparer.prepareWorkItemWorkspace(item.id);
   const running = updateWorkItemStatus(item, "running", NOW);
   store.saveWorkItem(task.id, running);
-  store.saveWorkItem(task.id, updateWorkItemStatus(
-    running,
-    "awaiting_acceptance",
-    NOW
-  ));
   const yielded = yieldAgentRun(createAgentRun(
     "run-1",
     task.id,
@@ -1183,6 +1377,10 @@ test("Leader acceptance consumes an exact workspace integration proof", async (t
     { workItemId: item.id }
   ), "No changes required.", NOW);
   store.saveAgentRun(yielded);
+  store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
+    summary: yielded.summary,
+    source: { type: "run", runId: yielded.id }
+  }, NOW));
   const leader = {
     now: () => new Date(NOW),
     environment: {
@@ -1522,9 +1720,22 @@ test("an awaiting WorkItem can capture successive immutable ChangeSets", async (
   const isolated = await preparer.prepareWorkItemWorkspace(item.id);
   const running = updateWorkItemStatus(item, "running", NOW);
   store.saveWorkItem(task.id, running);
+  const candidateRun = yieldAgentRun(createAgentRun(
+    store.nextAgentRunId(task.id),
+    task.id,
+    "worker",
+    "new",
+    "Prepare successive results.",
+    NOW,
+    { workItemId: item.id }
+  ), "Candidate ready.", NOW);
+  store.saveAgentRun(candidateRun);
   store.saveWorkItem(
     task.id,
-    updateWorkItemStatus(running, "awaiting_acceptance", NOW)
+    submitWorkItemCandidate(running, {
+      summary: candidateRun.summary,
+      source: { type: "run", runId: candidateRun.id }
+    }, NOW)
   );
   const manager = new WorkItemChangeSetManager(store, () => new Date(NOW));
 

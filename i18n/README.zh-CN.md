@@ -102,6 +102,29 @@ yui config show
 yui config set --time-zone Europe/London
 ```
 
+WorkItem 审查只有一条可选的全局规则，并直接复用已有 Global Role 的
+Agent、model、权限、prompt 和 Skills：
+
+```sh
+yui config review set --role reviewer --trigger always
+yui config review show
+yui config review clear
+```
+
+每个进入 Leader 验收阶段的结果，都会成为原 WorkItem 上一个明确的候选。
+当前全局规则对所有新旧 Task 的下一个候选生效，并在候选提交时形成快照；
+后续 `set`/`clear` 不会改变已经在途的判断。
+`always` 会为每个候选启动 ReviewRound，包括 Role yield 的结果和 Leader 直接管理的
+结果；`leader` 则让候选保持等待验收，由 Leader 直接 accept 或执行
+`yui task work review <work-item-id>`。因此只要配置了审查规则，Leader
+管理的候选也不会直接标记为完成。ReviewRound 引用不可变候选，审查
+AgentRun 不创建新 WorkItem，也不会递归触发审查。审查以自然语言结果
+唤醒 Leader；Leader 决定验收、reject 后在原 Role 与原 Session 中修复、
+再次审查，或通过 InputRequest 询问用户。审查失败会保留为可见证据并
+唤醒 Leader，但不会取代 Leader 的最终判断。
+所有候选、ReviewRound 和 Leader 决策都集中在原 WorkItem 下；reject
+后的下一轮会复用原执行 Role、Session 与 workspace，并追加新候选。
+
 查看已有 Task 的详细状态时，优先使用 `task context`。它一次聚合 Task、Brief、Active Decision、最近的 Milestone、Role、当前及最近的 WorkItem 与关联 Run、最近的 Message、Open/Resolved InputRequest 和 Event。终端输出会精简历史和长文本；`yui --json task context <task-id>` 会在顶层 `data` 中返回完整记录。
 
 Task identity 由一个有界交付目标决定，而不是由涉及几个仓库决定。带仓库的

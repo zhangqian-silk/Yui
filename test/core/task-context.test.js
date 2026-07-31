@@ -180,12 +180,14 @@ test("task context aggregates complete records and renders a compact recent summ
   const result = output(["context", task.id], store, options);
   assert.deepEqual(result.data, {
     task,
+    reviewConfig: null,
     brief,
     activeDecisions: [activeDecision],
     milestones,
     roles,
     workItems: [workItem],
     agentRuns,
+    reviewRounds: [],
     changeSets: [],
     integrations: [],
     messages,
