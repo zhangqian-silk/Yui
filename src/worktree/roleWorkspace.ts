@@ -4,27 +4,32 @@ export type WorktreeOwner =
   | Readonly<{ type: "task" }>
   | Readonly<{ type: "work-item"; workItemId: string }>;
 
-/**
- * A managed worktree is owned by a Task or WorkItem. roleName only records
- * which Role currently launches there; it is not the lifecycle owner.
- */
-export type RoleWorkspace = Readonly<{
-  schemaVersion: 2;
-  taskId: string;
-  roleName: string;
-  owner: WorktreeOwner;
+export type WorkspaceProjectAccess = "read" | "write";
+
+export type WorkspaceProjectEntry = Readonly<{
   projectId: string;
+  directory: string;
+  access: WorkspaceProjectAccess;
   path: string;
   branch: string;
   baseRef: string;
   baseCommit: string;
+}>;
+
+export type RoleWorkspace = Readonly<{
+  schemaVersion: 3;
+  taskId: string;
+  roleName: string;
+  owner: WorktreeOwner;
+  root: string;
+  entries: readonly WorkspaceProjectEntry[];
   createdAt: string;
   updatedAt: string;
 }>;
 
 export type RoleWorkspaceIdentity = Readonly<Pick<
   RoleWorkspace,
-  "taskId" | "roleName" | "owner" | "projectId" | "path" | "branch" | "baseRef" | "baseCommit"
+  "taskId" | "roleName" | "owner" | "root" | "entries"
 >>;
 
 export function createRoleWorkspace(
@@ -33,37 +38,70 @@ export function createRoleWorkspace(
 ): RoleWorkspace {
   const timestamp = now.toISOString();
   return validateRoleWorkspace({
-    schemaVersion: 2,
+    schemaVersion: 3,
     taskId: requireIdentity(input.taskId, "Task id"),
     roleName: requireIdentity(input.roleName, "Role name"),
     owner: validateOwner(input.owner),
-    projectId: requireIdentity(input.projectId, "Project id"),
-    path: resolve(requireText(input.path, "Role workspace path")),
-    branch: requireText(input.branch, "Role workspace branch"),
-    baseRef: requireText(input.baseRef, "Role workspace base ref"),
-    baseCommit: requireCommit(input.baseCommit),
+    root: resolve(requireText(input.root, "Role workspace root")),
+    entries: normalizeEntries(input.entries),
     createdAt: timestamp,
     updatedAt: timestamp
   });
 }
 
 export function validateRoleWorkspace(workspace: RoleWorkspace): RoleWorkspace {
-  if (workspace.schemaVersion !== 2) {
-    throw new Error("Managed worktree must use schemaVersion 2.");
+  if (workspace.schemaVersion !== 3) {
+    throw new Error("Managed workspace must use schemaVersion 3.");
   }
   requireIdentity(workspace.taskId, "Task id");
   requireIdentity(workspace.roleName, "Role name");
   validateOwner(workspace.owner);
-  requireIdentity(workspace.projectId, "Project id");
-  if (resolve(requireText(workspace.path, "Role workspace path")) !== workspace.path) {
-    throw new Error("Role workspace path must be absolute and normalized.");
+  if (resolve(requireText(workspace.root, "Role workspace root")) !== workspace.root) {
+    throw new Error("Role workspace root must be absolute and normalized.");
   }
-  requireText(workspace.branch, "Role workspace branch");
-  requireText(workspace.baseRef, "Role workspace base ref");
-  requireCommit(workspace.baseCommit);
+  normalizeEntries(workspace.entries);
   requireTimestamp(workspace.createdAt, "RoleWorkspace createdAt");
   requireTimestamp(workspace.updatedAt, "RoleWorkspace updatedAt");
   return workspace;
+}
+
+export function workspaceProjectEntry(
+  workspace: RoleWorkspace,
+  projectId: string
+): WorkspaceProjectEntry | undefined {
+  return workspace.entries.find((entry) => entry.projectId === projectId);
+}
+
+function normalizeEntries(
+  entries: readonly WorkspaceProjectEntry[]
+): readonly WorkspaceProjectEntry[] {
+  if (!Array.isArray(entries)) throw new Error("Workspace Project entries are invalid.");
+  const projectIds = new Set<string>();
+  const directories = new Set<string>();
+  return entries.map((entry) => {
+    const projectId = requireIdentity(entry.projectId, "Project id");
+    const directory = requireIdentity(entry.directory, "Project directory");
+    if (!["read", "write"].includes(entry.access)) {
+      throw new Error(`Workspace Project access is invalid: ${String(entry.access)}.`);
+    }
+    if (projectIds.has(projectId)) throw new Error(`Workspace Project is duplicated: ${projectId}.`);
+    if (directories.has(directory)) {
+      throw new Error(`Workspace Project directory is duplicated: ${directory}.`);
+    }
+    projectIds.add(projectId);
+    directories.add(directory);
+    const path = resolve(requireText(entry.path, "Workspace Project path"));
+    if (path !== entry.path) throw new Error("Workspace Project path must be absolute and normalized.");
+    return {
+      projectId,
+      directory,
+      access: entry.access,
+      path,
+      branch: requireText(entry.branch, "Workspace Project branch"),
+      baseRef: requireText(entry.baseRef, "Workspace Project base ref"),
+      baseCommit: requireCommit(entry.baseCommit)
+    };
+  });
 }
 
 export function managedWorktreeName(owner: WorktreeOwner): string {

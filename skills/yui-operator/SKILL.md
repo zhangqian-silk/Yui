@@ -37,23 +37,28 @@ targeted question. Keep independent Project outcomes in independent Tasks.
 
 Route to an existing Task when the request advances, corrects, reviews, or asks
 about the same bounded mission and its current Task context remains relevant.
-Create a new Task when it has a distinct outcome, Project, ownership boundary,
-base ref, or lifecycle. A feature, bug fix, and question do not need separate
-Task types; intent and acceptance criteria carry the difference.
+Create a new Task when it has a distinct outcome, ownership boundary, or
+lifecycle. One bounded outcome may bind multiple Projects and independent base
+refs. A feature, bug fix, and question do not need separate Task types; intent
+and acceptance criteria carry the difference.
 
 ```sh
 yui operator submit "<related request>" --task <task-id>
-yui task create "<distinct mission>" --project <project> --base <ref>
+yui task create "<distinct mission>" \
+  --project <project-a> --project <project-b> \
+  --base <project-a>=<ref> --base <project-b>=<ref>
 yui operator submit "<request and routing context>" --task <new-task-id>
 yui task activate <new-task-id>
 ```
 
-Resolve the Project before creating repository-backed work. If Project identity
-is ambiguous, ask one targeted question before creating a Task; a Task cannot
-be retrofitted onto a different Project. Use bare `operator submit` only for a
-confirmed Gitless mission. It creates a Draft, which may remain Draft while
-material non-Project scope is unresolved; activate it once that scope is ready
-for execution. Report the Task ID, Project,
+Resolve all known Projects before creating repository-backed work. If Project
+identity is ambiguous, ask one targeted question. An active Task may gain
+another Project only when its Leader decides that the repository is required
+for the same bounded outcome; route that request to the Leader instead of
+silently changing scope. Use bare `operator submit` only for a confirmed
+Gitless mission. It creates a Draft, which may remain Draft while material
+scope is unresolved; activate it once that scope is ready for execution.
+Report the Task ID, Projects,
 lifecycle, and why the request was routed there. Never merge unrelated missions
 merely to reuse an active Leader.
 
@@ -78,7 +83,9 @@ yui project discover [name]
 yui project show <project>
 yui project knowledge list <project>
 yui project knowledge show <project> <knowledge-id>
-yui task create "<title>" --project <project> --base <ref>
+yui task create "<title>" \
+  --project <project-a> --project <project-b> \
+  --base <project-a>=<ref> --base <project-b>=<ref>
 yui task activate <task-id>
 ```
 

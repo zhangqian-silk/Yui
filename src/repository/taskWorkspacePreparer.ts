@@ -1,5 +1,13 @@
-import { rmdir } from "node:fs/promises";
+import {
+  mkdir,
+  readlink,
+  readdir,
+  rmdir,
+  symlink,
+  unlink
+} from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import { retireTaskRoleSessionsForWorkspace } from "../executor/agentExecutor.js";
 import { updateRole } from "../role/role.js";
@@ -7,12 +15,14 @@ import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
 import {
   recordWorkItemWorkspaceDisposition,
+  type WorkItem,
   type WorkItemWorkspaceDisposition
 } from "../workItem/workItem.js";
 import {
   createRoleWorkspace,
   managedWorktreeName,
-  type RoleWorkspace
+  type RoleWorkspace,
+  type WorkspaceProjectEntry
 } from "../worktree/roleWorkspace.js";
 import {
   NodeGitWorkspace,
@@ -20,6 +30,7 @@ import {
   type GitWorkspaceRemoval,
   type GitWorkspaceState
 } from "./gitWorkspace.js";
+import type { Project } from "./project.js";
 
 const MAIN_WORKTREE = "main";
 const LEADER_ROLE = "leader";
@@ -43,9 +54,9 @@ export interface TaskWorkspacePreparer {
 }
 
 /**
- * Projects remain stable checkouts. A Project-backed Task owns one main
- * worktree, while an optional additional worktree is owned by a WorkItem and
- * merely assigned to the Role executing it.
+ * A Task owns one workspace root containing every bound Project. A WorkItem
+ * owns another root: writable Projects point at isolated worktrees while the
+ * remaining entries point at the Task main worktrees as read-only context.
  */
 export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   constructor(
@@ -57,167 +68,178 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
 
   async prepareTaskWorkspace(taskId: string): Promise<TaskWorkspacePreparation> {
     const task = requireTask(this.store, taskId);
-    if (task.projectId === undefined) {
+    if (!["draft", "active"].includes(task.status)) {
+      throw new Error(`Task is not open for workspace preparation: ${task.id}.`);
+    }
+    if (task.projectBindings.length === 0) {
       return {
         taskId,
         status: "ready",
         ...(task.cwd === undefined ? {} : { path: task.cwd })
       };
     }
-    const project = this.store.getProject(task.projectId);
-    if (project === null) throw new Error(`Project not found: ${task.projectId}.`);
-    if (!["draft", "active"].includes(task.status)) {
-      throw new Error(`Task is not open for workspace preparation: ${task.id}.`);
-    }
-
     const leader = this.store.getRole(task.id, LEADER_ROLE);
     if (leader === null) throw new Error(`Task leader Role not found: ${task.id}.`);
     const existing = this.store.getRoleWorkspace(task.id, LEADER_ROLE);
     if (existing !== null && existing.owner.type !== "task") {
-      throw new Error(`Task main worktree ownership is invalid: ${task.id}.`);
+      throw new Error(`Task main workspace ownership is invalid: ${task.id}.`);
     }
-    const container = this.#projectContainer(project.name);
-    const baseRef = task.baseRef ?? project.developmentBranch;
-    const physical = await this.git.ensureWorktree({
-      repositoryPath: project.path,
-      container,
-      taskId: task.id,
-      roleName: MAIN_WORKTREE,
-      baseRef: existing?.baseCommit ?? baseRef
-    });
-    const workspace = existing ?? createRoleWorkspace({
-      taskId: task.id,
-      roleName: LEADER_ROLE,
-      owner: { type: "task" },
-      projectId: project.id,
-      path: physical.path,
-      branch: physical.branch,
-      baseRef,
-      baseCommit: physical.baseCommit
-    }, this.now());
-    assertWorkspaceIdentity(workspace, {
-      taskId: task.id,
-      roleName: LEADER_ROLE,
-      projectId: project.id,
-      path: physical.path,
-      branch: physical.branch,
-      baseRef
-    });
 
+    const root = this.#taskWorkspaceRoot(task.id);
+    const prepared: Array<Readonly<{ project: Project; entry: WorkspaceProjectEntry }>> = [];
     try {
+      for (const binding of task.projectBindings) {
+        const project = requireProject(this.store, binding.projectId);
+        const previous = existing?.entries.find(({ projectId }) => projectId === project.id);
+        const physical = await this.git.ensureWorktree({
+          repositoryPath: project.path,
+          container: this.#projectContainer(project.name),
+          taskId: task.id,
+          roleName: MAIN_WORKTREE,
+          baseRef: previous?.baseCommit ?? binding.baseRef
+        });
+        prepared.push({
+          project,
+          entry: {
+            projectId: project.id,
+            directory: binding.directory,
+            access: "write",
+            path: physical.path,
+            branch: physical.branch,
+            baseRef: binding.baseRef,
+            baseCommit: physical.baseCommit
+          }
+        });
+      }
+      await ensureWorkspaceView(root, prepared.map(({ entry }) => entry));
+      const workspace = createRoleWorkspace({
+        taskId: task.id,
+        roleName: LEADER_ROLE,
+        owner: { type: "task" },
+        root,
+        entries: prepared.map(({ entry }) => entry)
+      }, this.now());
       this.store.transaction((tx) => {
         const latest = requireTask(tx, task.id);
         if (!["draft", "active"].includes(latest.status)) {
-          throw new Error(`Task changed while preparing its worktree: ${task.id}.`);
+          throw new Error(`Task changed while preparing its workspace: ${task.id}.`);
         }
-        if (latest.projectId !== project.id) {
-          throw new Error(`Task Project changed while preparing its worktree: ${task.id}.`);
+        if (!isDeepStrictEqual(latest.projectBindings, task.projectBindings)) {
+          throw new Error(`Task Projects changed while preparing its workspace: ${task.id}.`);
         }
         const current = tx.getRoleWorkspace(task.id, LEADER_ROLE);
-        if (current !== null) {
-          if (current.owner.type !== "task") {
-            throw new Error(`Task main worktree ownership is invalid: ${task.id}.`);
-          }
-          assertWorkspaceIdentity(current, {
-            taskId: task.id,
-            roleName: LEADER_ROLE,
-            projectId: project.id,
-            path: physical.path,
-            branch: physical.branch,
-            baseRef
-          });
-        } else {
-          tx.saveRoleWorkspace(task.id, workspace);
+        if (current !== null && current.owner.type !== "task") {
+          throw new Error(`Task main workspace ownership is invalid: ${task.id}.`);
         }
+        tx.saveRoleWorkspace(task.id, preserveWorkspaceCreatedAt(workspace, current));
         const timestamp = this.now();
         for (const role of tx.listRoles(task.id)) {
-          const isolated = tx.getRoleWorkspace(task.id, role.name);
-          if (isolated !== null && isolated.owner.type === "work-item") continue;
-          if (role.workspace !== physical.path) {
+          const assigned = tx.getRoleWorkspace(task.id, role.name);
+          if (assigned !== null && assigned.owner.type === "work-item") continue;
+          if (role.workspace !== root) {
             retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
-            tx.saveRole(task.id, updateRole(role, { workspace: physical.path }, timestamp));
+            tx.saveRole(task.id, updateRole(role, { workspace: root }, timestamp));
           }
         }
-        if (latest.cwd !== physical.path) {
-          tx.saveTask({ ...latest, cwd: physical.path, updatedAt: timestamp.toISOString() });
+        if (latest.cwd !== root) {
+          tx.saveTask({ ...latest, cwd: root, updatedAt: timestamp.toISOString() });
         }
       });
+      return { taskId, status: "ready", path: root };
     } catch (error) {
-      await this.#discardUnadoptedWorkspace(project.path, project.name, workspace);
+      await this.#discardUnadoptedEntries(task, prepared, MAIN_WORKTREE);
       throw error;
     }
-    return {
-      taskId,
-      status: "ready",
-      path: physical.path
-    };
   }
 
   async prepareWorkItemWorkspace(workItemId: string): Promise<RoleWorkspace> {
-    const item = this.store.findWorkItem(workItemId);
-    if (item === null) throw new Error(`Work item not found: ${workItemId}.`);
+    const item = requireWorkItem(this.store, workItemId);
     const task = requireTask(this.store, item.taskId);
-    if (task.status !== "active") throw new Error(`Task is not active: ${task.id}.`);
-    if (task.projectId === undefined) {
-      throw new Error(`WorkItem isolation requires a Project-backed Task: ${task.id}.`);
-    }
-    if (item.assignee === undefined) {
-      throw new Error(`WorkItem isolation requires a Task Role assignee: ${item.id}.`);
-    }
-    if (item.assignee === LEADER_ROLE) {
-      throw new Error("The Leader must remain in the Task main worktree.");
-    }
-    if (["completed", "failed", "cancelled", "superseded"].includes(item.status)) {
-      throw new Error(`Work item is already terminal: ${item.id}.`);
-    }
-    if (this.store.getActiveAgentRun(task.id, item.assignee) !== null) {
-      throw new Error(`Role has an active Run: ${task.id}/${item.assignee}.`);
-    }
-    const project = this.store.getProject(task.projectId);
-    if (project === null) throw new Error(`Project not found: ${task.projectId}.`);
+    assertWorkItemWorkspaceEligible(this.store, task, item);
     await this.prepareTaskWorkspace(task.id);
     const main = this.store.getRoleWorkspace(task.id, LEADER_ROLE);
     if (main === null || main.owner.type !== "task") {
-      throw new Error(`Task main worktree is not ready: ${task.id}.`);
+      throw new Error(`Task main workspace is not ready: ${task.id}.`);
     }
-    const role = this.store.getRole(task.id, item.assignee);
+    const role = this.store.getRole(task.id, item.assignee!);
     if (role === null) throw new Error(`Role not found: ${task.id}/${item.assignee}.`);
     const existing = this.store.getRoleWorkspace(task.id, role.name);
-    if (existing !== null) {
-      if (existing.owner.type === "work-item" && existing.owner.workItemId === item.id) return existing;
-      throw new Error(`Role already has an isolated WorkItem worktree: ${task.id}/${role.name}.`);
+    if (existing !== null && (
+      existing.owner.type !== "work-item"
+      || existing.owner.workItemId !== item.id
+    )) {
+      throw new Error(`Role already has another WorkItem workspace: ${task.id}/${role.name}.`);
     }
     assertWorkspaceSessionsRetirable(this.store, task.id, role.name, this.now());
-    const head = await this.git.inspect(main.path, "HEAD");
-    const physical = await this.git.ensureWorktree({
-      repositoryPath: project.path,
-      container: this.#projectContainer(project.name),
-      taskId: task.id,
-      roleName: item.id,
-      baseRef: head.baseCommit
-    });
-    const workspace = createRoleWorkspace({
-      taskId: task.id,
-      roleName: role.name,
-      owner: { type: "work-item", workItemId: item.id },
-      projectId: project.id,
-      path: physical.path,
-      branch: physical.branch,
-      baseRef: head.baseCommit,
-      baseCommit: physical.baseCommit
-    }, this.now());
+
+    const writeProjects = new Set(item.writeProjectIds);
+    const root = this.#workItemWorkspaceRoot(task.id, item.id);
+    const prepared: Array<Readonly<{ project: Project; entry: WorkspaceProjectEntry }>> = [];
     try {
+      for (const binding of task.projectBindings) {
+        const project = requireProject(this.store, binding.projectId);
+        const mainEntry = requireWorkspaceEntry(main, project.id);
+        if (!writeProjects.has(project.id)) {
+          prepared.push({
+            project,
+            entry: { ...mainEntry, access: "read" }
+          });
+          continue;
+        }
+        const previous = existing?.entries.find(({ projectId }) => projectId === project.id);
+        const head = await this.git.inspect(mainEntry.path, "HEAD");
+        const physical = await this.git.ensureWorktree({
+          repositoryPath: project.path,
+          container: this.#projectContainer(project.name),
+          taskId: task.id,
+          roleName: item.id,
+          baseRef: previous?.access === "write" ? previous.baseCommit : head.baseCommit
+        });
+        if (previous?.access === "write" && (
+          physical.path !== previous.path
+          || physical.branch !== previous.branch
+        )) {
+          throw new Error(
+            `Existing WorkItem Project workspace identity changed: ${item.id}/${project.id}.`
+          );
+        }
+        prepared.push({
+          project,
+          entry: {
+            projectId: project.id,
+            directory: binding.directory,
+            access: "write",
+            path: physical.path,
+            branch: physical.branch,
+            baseRef: previous?.access === "write" ? previous.baseRef : head.baseCommit,
+            // The recorded base is the immutable capture boundary. An existing
+            // worktree reports its current HEAD from ensureWorktree(), which
+            // may already contain committed Worker changes and must never
+            // replace that boundary during scope expansion or reconciliation.
+            baseCommit: previous?.access === "write"
+              ? previous.baseCommit
+              : physical.baseCommit
+          }
+        });
+      }
+      await ensureWorkspaceView(root, prepared.map(({ entry }) => entry));
+      const workspace = createRoleWorkspace({
+        taskId: task.id,
+        roleName: role.name,
+        owner: { type: "work-item", workItemId: item.id },
+        root,
+        entries: prepared.map(({ entry }) => entry)
+      }, this.now());
       return this.store.transaction((tx) => {
         const latestTask = requireTask(tx, task.id);
-        if (latestTask.status !== "active") {
-          throw new Error(`Task is not active: ${latestTask.id}.`);
-        }
         const latestItem = tx.getWorkItem(task.id, item.id);
-        if (latestItem === null || latestItem.assignee !== role.name) {
-          throw new Error(`Work item changed while preparing isolation: ${item.id}.`);
+        if (latestTask.status !== "active" || latestItem === null) {
+          throw new Error(`Work item changed while preparing its workspace: ${item.id}.`);
         }
-        if (["completed", "failed", "cancelled", "superseded"].includes(latestItem.status)) {
-          throw new Error(`Work item is already terminal: ${item.id}.`);
+        if (latestItem.revision !== item.revision
+          || latestItem.assignee !== role.name
+          || !isDeepStrictEqual(latestItem.writeProjectIds, item.writeProjectIds)) {
+          throw new Error(`Work item changed while preparing its workspace: ${item.id}.`);
         }
         if (tx.getActiveAgentRun(task.id, role.name) !== null) {
           throw new Error(`Role has an active Run: ${task.id}/${role.name}.`);
@@ -225,57 +247,49 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         const latestRole = tx.getRole(task.id, role.name);
         if (latestRole === null) throw new Error(`Role not found: ${task.id}/${role.name}.`);
         const current = tx.getRoleWorkspace(task.id, role.name);
-        if (current !== null) {
-          if (current.owner.type === "work-item"
-            && current.owner.workItemId === item.id) return current;
+        if (current !== null && (
+          current.owner.type !== "work-item"
+          || current.owner.workItemId !== item.id
+        )) {
           throw new Error(`Role workspace changed: ${task.id}/${role.name}.`);
         }
         const timestamp = this.now();
         retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
-        tx.saveRoleWorkspace(task.id, workspace);
-        tx.saveRole(task.id, updateRole(latestRole, { workspace: workspace.path }, timestamp));
-        return workspace;
+        const stored = preserveWorkspaceCreatedAt(workspace, current);
+        tx.saveRoleWorkspace(task.id, stored);
+        tx.saveRole(task.id, updateRole(latestRole, { workspace: root }, timestamp));
+        return stored;
       });
     } catch (error) {
-      await this.#discardUnadoptedWorkspace(project.path, project.name, workspace);
+      await this.#discardUnadoptedEntries(task, prepared, item.id);
       throw error;
     }
   }
 
   async inspectWorkItemWorkspace(workItemId: string): Promise<GitWorkspaceState> {
-    const item = this.store.findWorkItem(workItemId);
-    if (item === null) throw new Error(`Work item not found: ${workItemId}.`);
+    const item = requireWorkItem(this.store, workItemId);
     if (item.assignee === undefined) return "missing";
     const workspace = this.store.getRoleWorkspace(item.taskId, item.assignee);
     if (workspace === null) return "missing";
-    if (workspace.owner.type !== "work-item" || workspace.owner.workItemId !== item.id) {
-      throw new Error(`WorkItem does not own the Role workspace: ${item.id}.`);
-    }
-    const project = this.store.getProject(workspace.projectId);
-    if (project === null) throw new Error(`Project not found: ${workspace.projectId}.`);
-    return this.git.inspectWorktree({
-      repositoryPath: project.path,
-      container: this.#projectContainer(project.name),
-      taskId: item.taskId,
-      roleName: managedWorktreeName(workspace.owner)
-    });
+    assertWorkItemOwnsWorkspace(item, workspace);
+    return this.#inspectEntries(
+      item.taskId,
+      managedWorktreeName(workspace.owner),
+      workspace.entries.filter(({ access }) => access === "write")
+    );
   }
 
   async cleanupWorkItemWorkspace(
     workItemId: string,
     disposition: WorkItemWorkspaceDisposition
   ): Promise<GitWorkspaceRemoval> {
-    const item = this.store.findWorkItem(workItemId);
-    if (item === null) throw new Error(`Work item not found: ${workItemId}.`);
+    const item = requireWorkItem(this.store, workItemId);
     const task = requireTask(this.store, item.taskId);
     if (!["completed", "failed", "cancelled", "superseded"].includes(item.status)) {
       throw new Error(`Work item must be terminal before cleanup: ${item.id}.`);
     }
-    if (item.workspaceDisposition !== undefined
-      && item.workspaceDisposition !== disposition) {
-      throw new Error(
-        `Work item workspace is already recorded as ${item.workspaceDisposition}.`
-      );
+    if (item.workspaceDisposition !== undefined && item.workspaceDisposition !== disposition) {
+      throw new Error(`Work item workspace is already recorded as ${item.workspaceDisposition}.`);
     }
     if (item.assignee === undefined) {
       throw new Error(`WorkItem has no Task Role workspace: ${item.id}.`);
@@ -283,37 +297,46 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     const workspace = this.store.getRoleWorkspace(task.id, item.assignee);
     if (workspace === null) {
       if (item.workspaceDisposition === disposition) return "missing";
-      throw new Error(`WorkItem has no managed isolated worktree: ${item.id}.`);
+      throw new Error(`WorkItem has no managed isolated worktree workspace: ${item.id}.`);
     }
-    if (workspace.owner.type !== "work-item" || workspace.owner.workItemId !== item.id) {
-      throw new Error(`WorkItem does not own the Role workspace: ${item.id}.`);
-    }
-    const project = this.store.getProject(workspace.projectId);
-    if (project === null) throw new Error(`Project not found: ${workspace.projectId}.`);
+    assertWorkItemOwnsWorkspace(item, workspace);
     assertWorkspaceSessionsRetirable(this.store, task.id, workspace.roleName, this.now());
-    const removal = await this.git.removeWorktree({
-      repositoryPath: project.path,
-      container: this.#projectContainer(project.name),
-      taskId: task.id,
-      roleName: managedWorktreeName(workspace.owner),
-      deleteBranch: true
-    });
-    if (removal === "dirty") return removal;
+    const writable = workspace.entries.filter(({ access }) => access === "write");
+    if (await this.#inspectEntries(
+      task.id,
+      managedWorktreeName(workspace.owner),
+      writable
+    ) === "dirty") return "dirty";
+    let removed = false;
+    for (const entry of writable) {
+      const project = requireProject(this.store, entry.projectId);
+      const result = await this.git.removeWorktree({
+        repositoryPath: project.path,
+        container: this.#projectContainer(project.name),
+        taskId: task.id,
+        roleName: managedWorktreeName(workspace.owner),
+        deleteBranch: true
+      });
+      if (result === "dirty") {
+        throw new Error(`WorkItem workspace changed after cleanup preflight: ${item.id}.`);
+      }
+      removed ||= result === "removed";
+    }
+    await removeWorkspaceView(workspace.root);
     try {
-      this.#recordWorkspaceRemoval(task, workspace, project.path, {
+      this.#recordWorkspaceRemoval(task, workspace, this.#fallbackWorkspace(), {
         workItemId: item.id,
         disposition
       });
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
+      if (!removed) throw error;
       throw new Error(
-        `Managed WorkItem worktree was removed, but durable cleanup was not recorded for ${
-          item.id
-        }. Stop the Task Role session and retry cleanup. ${detail}`,
-        { cause: error }
+        `WorkItem worktree was removed but durable cleanup was not recorded; retry cleanup: ${
+          error instanceof Error ? error.message : String(error)
+        }`
       );
     }
-    return removal;
+    return removed ? "removed" : "missing";
   }
 
   async inspectTaskMainWorkspace(taskId: string): Promise<GitWorkspaceState> {
@@ -322,38 +345,21 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       .filter(({ owner }) => owner.type === "work-item");
     if (isolated.length > 0) {
       throw new Error(
-        `Task has WorkItem worktrees that require explicit cleanup: ${
-          isolated.map(({ owner }) => owner.type === "work-item" ? owner.workItemId : "")
-            .join(", ")
+        `Task has WorkItem workspaces that require explicit cleanup: ${
+          isolated.map(({ owner }) => owner.type === "work-item" ? owner.workItemId : "").join(", ")
         }.`
       );
     }
     const main = this.store.getRoleWorkspace(task.id, LEADER_ROLE);
-    if (main === null || task.projectId === undefined) return "missing";
+    if (main === null) return "missing";
     if (main.owner.type !== "task") {
-      throw new Error(`Task main worktree ownership is invalid: ${task.id}.`);
+      throw new Error(`Task main workspace ownership is invalid: ${task.id}.`);
     }
-    const project = this.store.getProject(task.projectId);
-    if (project === null) throw new Error(`Project not found: ${task.projectId}.`);
-    return this.git.inspectWorktree({
-      repositoryPath: project.path,
-      container: this.#projectContainer(project.name),
-      taskId: task.id,
-      roleName: managedWorktreeName(main.owner)
-    });
+    return this.#inspectEntries(task.id, MAIN_WORKTREE, main.entries);
   }
 
   async cleanupTaskForArchive(taskId: string): Promise<TaskWorkspaceCleanup> {
     const task = requireTask(this.store, taskId);
-    if (task.projectId === undefined) {
-      this.#clearTaskWorkspace(
-        task,
-        this.store.getConfig().defaultWorkspace ?? process.cwd()
-      );
-      return { taskId, status: "removed" };
-    }
-    const project = this.store.getProject(task.projectId);
-    if (project === null) throw new Error(`Project not found: ${task.projectId}.`);
     const isolated = this.store.listRoleWorkspaces(task.id)
       .filter(({ owner }) => owner.type === "work-item");
     if (isolated.length > 0) {
@@ -361,32 +367,58 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         taskId,
         status: "failed",
         ...(task.cwd === undefined ? {} : { path: task.cwd }),
-        error: `WorkItem worktrees require explicit cleanup: ${
-          isolated.map(({ owner }) => owner.type === "work-item" ? owner.workItemId : "")
-            .join(", ")
+        error: `WorkItem workspaces require explicit cleanup: ${
+          isolated.map(({ owner }) => owner.type === "work-item" ? owner.workItemId : "").join(", ")
         }.`
       };
     }
     const main = this.store.getRoleWorkspace(task.id, LEADER_ROLE);
     if (main !== null) {
-      const removal = await this.git.removeWorktree({
-        repositoryPath: project.path,
-        container: this.#projectContainer(project.name),
-        taskId: task.id,
-        roleName: managedWorktreeName(main.owner)
-      });
-      if (removal === "dirty") {
+      if (await this.#inspectEntries(task.id, MAIN_WORKTREE, main.entries) === "dirty") {
         return {
           taskId,
           status: "retained-dirty",
           ...(task.cwd === undefined ? {} : { path: task.cwd })
         };
       }
-      this.#recordWorkspaceRemoval(task, main, project.path);
+      for (const entry of main.entries) {
+        const project = requireProject(this.store, entry.projectId);
+        const result = await this.git.removeWorktree({
+          repositoryPath: project.path,
+          container: this.#projectContainer(project.name),
+          taskId: task.id,
+          roleName: MAIN_WORKTREE
+        });
+        if (result === "dirty") {
+          throw new Error(`Task workspace changed after cleanup preflight: ${task.id}.`);
+        }
+      }
+      await removeWorkspaceView(main.root);
+      this.#recordWorkspaceRemoval(task, main, this.#fallbackWorkspace());
     }
-    this.#clearTaskWorkspace(requireTask(this.store, task.id), project.path);
-    await removeEmptyDirectory(this.#taskContainer(project.name, task.id));
+    this.#clearTaskWorkspace(requireTask(this.store, task.id), this.#fallbackWorkspace());
     return { taskId, status: "removed" };
+  }
+
+  async #inspectEntries(
+    taskId: string,
+    roleName: string,
+    entries: readonly WorkspaceProjectEntry[]
+  ): Promise<GitWorkspaceState> {
+    if (entries.length === 0) return "missing";
+    let found = false;
+    for (const entry of entries) {
+      const project = requireProject(this.store, entry.projectId);
+      const state = await this.git.inspectWorktree({
+        repositoryPath: project.path,
+        container: this.#projectContainer(project.name),
+        taskId,
+        roleName
+      });
+      if (state === "dirty") return "dirty";
+      found ||= state === "clean";
+    }
+    return found ? "clean" : "missing";
   }
 
   #projectContainer(projectName: string): string {
@@ -394,29 +426,41 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       safePathSegment(projectName));
   }
 
-  #taskContainer(projectName: string, taskId: string): string {
-    return join(this.#projectContainer(projectName), taskId);
+  #taskWorkspaceRoot(taskId: string): string {
+    return join(resolveTaskRoot(this.home, this.store.getConfig().defaultWorkspace),
+      safePathSegment(taskId), "main");
   }
 
-  async #discardUnadoptedWorkspace(
-    repositoryPath: string,
-    projectName: string,
-    workspace: RoleWorkspace
+  #workItemWorkspaceRoot(taskId: string, workItemId: string): string {
+    return join(resolveTaskRoot(this.home, this.store.getConfig().defaultWorkspace),
+      safePathSegment(taskId), "work-items", safePathSegment(workItemId));
+  }
+
+  #fallbackWorkspace(): string {
+    return this.store.getConfig().defaultWorkspace ?? process.cwd();
+  }
+
+  async #discardUnadoptedEntries(
+    task: Task,
+    prepared: readonly Readonly<{ project: Project; entry: WorkspaceProjectEntry }>[],
+    roleName: string
   ): Promise<void> {
-    const current = this.store.getRoleWorkspace(workspace.taskId, workspace.roleName);
-    if (current !== null
-      && managedWorktreeName(current.owner) === managedWorktreeName(workspace.owner)
-      && current.path === workspace.path) return;
-    const removal = await this.git.removeWorktree({
-      repositoryPath,
-      container: this.#projectContainer(projectName),
-      taskId: workspace.taskId,
-      roleName: managedWorktreeName(workspace.owner)
-    });
-    if (removal === "dirty") {
-      throw new Error(
-        `Unadopted managed worktree is dirty and was retained at ${workspace.path}; inspect it and retry.`
-      );
+    const adoptedPaths = new Set(this.store.listRoleWorkspaces(task.id)
+      .flatMap((workspace) => workspace.entries.map(({ path }) => path)));
+    for (const { project, entry } of prepared.filter(
+      ({ entry }) => entry.access === "write" && !adoptedPaths.has(entry.path)
+    )) {
+      const removal = await this.git.removeWorktree({
+        repositoryPath: project.path,
+        container: this.#projectContainer(project.name),
+        taskId: task.id,
+        roleName
+      });
+      if (removal === "dirty") {
+        throw new Error(
+          `Unadopted managed worktree is dirty and was retained at ${entry.path}; inspect it and retry.`
+        );
+      }
     }
   }
 
@@ -433,11 +477,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       const current = tx.getRoleWorkspace(task.id, workspace.roleName);
       if (current === null || !sameRoleWorkspace(current, workspace)) {
         if (workItem === undefined) {
-          throw new Error(
-            `Managed workspace changed before cleanup was recorded: ${
-              task.id
-            }/${workspace.roleName}.`
-          );
+          throw new Error(`Managed workspace changed before cleanup was recorded: ${
+            task.id
+          }/${workspace.roleName}.`);
         }
         recordWorkspaceDisposition(tx, task.id, workItem, this.now());
         return;
@@ -445,7 +487,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       const role = tx.getRole(task.id, workspace.roleName);
       tx.removeRoleWorkspace(task.id, workspace.roleName);
       const main = tx.getRoleWorkspace(task.id, LEADER_ROLE);
-      const target = workspace.owner.type === "task" ? fallback : main?.path ?? fallback;
+      const target = workspace.owner.type === "task" ? fallback : main?.root ?? fallback;
       if (role !== null && role.workspace !== target) {
         const timestamp = this.now();
         retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
@@ -481,6 +523,62 @@ function requireTask(store: TaskStore, taskId: string): Task {
   return task;
 }
 
+function requireProject(store: TaskStore, projectId: string): Project {
+  const project = store.getProject(projectId);
+  if (project === null) throw new Error(`Project not found: ${projectId}.`);
+  return project;
+}
+
+function requireWorkItem(store: TaskStore, workItemId: string): WorkItem {
+  const item = store.findWorkItem(workItemId);
+  if (item === null) throw new Error(`Work item not found: ${workItemId}.`);
+  return item;
+}
+
+function requireWorkspaceEntry(
+  workspace: RoleWorkspace,
+  projectId: string
+): WorkspaceProjectEntry {
+  const entry = workspace.entries.find((candidate) => candidate.projectId === projectId);
+  if (entry === undefined) throw new Error(`Workspace Project not found: ${projectId}.`);
+  return entry;
+}
+
+function assertWorkItemWorkspaceEligible(
+  store: TaskStore,
+  task: Task,
+  item: WorkItem
+): void {
+  if (task.status !== "active") throw new Error(`Task is not active: ${task.id}.`);
+  if (item.assignee === undefined) {
+    throw new Error(`WorkItem workspace requires a Task Role assignee: ${item.id}.`);
+  }
+  if (item.assignee === LEADER_ROLE) {
+    throw new Error("The Leader must remain in the Task main workspace.");
+  }
+  if (["completed", "failed", "cancelled", "superseded"].includes(item.status)) {
+    throw new Error(`Work item is already terminal: ${item.id}.`);
+  }
+  if (store.getActiveAgentRun(task.id, item.assignee) !== null) {
+    throw new Error(`Role has an active Run: ${task.id}/${item.assignee}.`);
+  }
+}
+
+function assertWorkItemOwnsWorkspace(item: WorkItem, workspace: RoleWorkspace): void {
+  if (workspace.owner.type !== "work-item" || workspace.owner.workItemId !== item.id) {
+    throw new Error(`WorkItem does not own the Role workspace: ${item.id}.`);
+  }
+}
+
+function preserveWorkspaceCreatedAt(
+  workspace: RoleWorkspace,
+  previous: RoleWorkspace | null
+): RoleWorkspace {
+  return previous === null
+    ? workspace
+    : { ...workspace, createdAt: previous.createdAt };
+}
+
 function assertWorkspaceSessionsRetirable(
   store: TaskStore,
   taskId: string,
@@ -491,10 +589,7 @@ function assertWorkspaceSessionsRetirable(
     throw new Error(`Role has an active Run: ${taskId}/${roleName}.`);
   }
   const sessions = store.getTaskRoleSessionSet(taskId, roleName);
-  if (sessions === null) return;
-  // Validation only: the returned copy is persisted atomically with the
-  // workspace change after the physical Git operation succeeds.
-  retireTaskRoleSessionsForWorkspace(sessions, now);
+  if (sessions !== null) retireTaskRoleSessionsForWorkspace(sessions, now);
 }
 
 function retireWorkspaceBoundSession(
@@ -507,27 +602,13 @@ function retireWorkspaceBoundSession(
     throw new Error(`Role has an active Run: ${taskId}/${roleName}.`);
   }
   const sessions = store.getTaskRoleSessionSet(taskId, roleName);
-  if (sessions === null) return;
-  store.saveTaskRoleSessionSet(
-    retireTaskRoleSessionsForWorkspace(sessions, now)
-  );
+  if (sessions !== null) {
+    store.saveTaskRoleSessionSet(retireTaskRoleSessionsForWorkspace(sessions, now));
+  }
 }
 
 function sameRoleWorkspace(left: RoleWorkspace, right: RoleWorkspace): boolean {
-  return left.schemaVersion === right.schemaVersion
-    && left.taskId === right.taskId
-    && left.roleName === right.roleName
-    && left.owner.type === right.owner.type
-    && (left.owner.type !== "work-item"
-      || (right.owner.type === "work-item"
-        && left.owner.workItemId === right.owner.workItemId))
-    && left.projectId === right.projectId
-    && left.path === right.path
-    && left.branch === right.branch
-    && left.baseRef === right.baseRef
-    && left.baseCommit === right.baseCommit
-    && left.createdAt === right.createdAt
-    && left.updatedAt === right.updatedAt;
+  return isDeepStrictEqual(left, right);
 }
 
 function recordWorkspaceDisposition(
@@ -548,33 +629,68 @@ function recordWorkspaceDisposition(
   ));
 }
 
-function assertWorkspaceIdentity(
-  workspace: RoleWorkspace,
-  expected: Readonly<{
-    taskId: string;
-    roleName: string;
-    projectId: string;
-    path: string;
-    branch: string;
-    baseRef: string;
-  }>
-): void {
-  for (const key of Object.keys(expected) as Array<keyof typeof expected>) {
-    if (workspace[key] !== expected[key]) {
-      throw new Error(`Managed worktree identity changed: ${expected.taskId}/${expected.roleName}.`);
+async function ensureWorkspaceView(
+  root: string,
+  entries: readonly WorkspaceProjectEntry[]
+): Promise<void> {
+  await mkdir(root, { recursive: true });
+  const expected = new Map(entries.map((entry) => [entry.directory, entry.path]));
+  for (const current of await readdir(root, { withFileTypes: true })) {
+    const target = expected.get(current.name);
+    if (!current.isSymbolicLink()) {
+      throw new Error(`Managed workspace contains an unexpected entry: ${join(root, current.name)}.`);
     }
+    const path = join(root, current.name);
+    const linked = resolve(root, await readlink(path));
+    if (target === undefined) {
+      await unlink(path);
+      continue;
+    }
+    if (linked !== target) {
+      await unlink(path);
+      await symlink(target, path, "dir");
+    }
+    expected.delete(current.name);
   }
+  for (const [directory, target] of expected) {
+    await symlink(target, join(root, directory), "dir");
+  }
+}
+
+async function removeWorkspaceView(root: string): Promise<void> {
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (!entry.isSymbolicLink()) {
+      throw new Error(`Managed workspace contains an unexpected entry: ${join(root, entry.name)}.`);
+    }
+    await unlink(join(root, entry.name));
+  }
+  await rmdir(root);
 }
 
 function safePathSegment(value: string): string {
   const normalized = value.trim();
   if (normalized.length === 0 || [".", ".."].includes(normalized) || /[\/\\\0]/.test(normalized)) {
-    throw new Error("Project name is invalid for managed workspace layout.");
+    throw new Error("Identity is invalid for managed workspace layout.");
   }
   return normalized;
 }
 
 export function resolveWorktreeRoot(home: string, workspace: string | undefined): string {
+  return join(resolveWorkspaceRoot(home, workspace), "worktree");
+}
+
+export function resolveTaskRoot(home: string, workspace: string | undefined): string {
+  return join(resolveWorkspaceRoot(home, workspace), "tasks");
+}
+
+function resolveWorkspaceRoot(home: string, workspace: string | undefined): string {
   if (workspace === undefined) {
     throw new Error("Project workspace is not configured; run yui setup.");
   }
@@ -584,15 +700,11 @@ export function resolveWorktreeRoot(home: string, workspace: string | undefined)
   if (fromHome === "" || (!fromHome.startsWith("..") && !isAbsolute(fromHome))) {
     throw new Error("Project workspace must be outside YUI_HOME.");
   }
-  return join(workspaceRoot, "worktree");
+  return workspaceRoot;
 }
 
-async function removeEmptyDirectory(path: string): Promise<void> {
-  try {
-    await rmdir(path);
-  } catch (error) {
-    if (typeof error === "object" && error !== null && "code" in error
-      && ["ENOENT", "ENOTEMPTY"].includes(String((error as { code?: unknown }).code))) return;
-    throw error;
-  }
+function errorCode(error: unknown): string | undefined {
+  return typeof error === "object" && error !== null && "code" in error
+    ? String((error as { code?: unknown }).code)
+    : undefined;
 }

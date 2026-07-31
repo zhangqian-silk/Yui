@@ -6,6 +6,18 @@ export type BuildRoleContextInput = Readonly<{
   taskId: string;
   role: Role;
   input: string;
+  workItem?: Readonly<{
+    id: string;
+    writeProjectIds: readonly string[];
+  }>;
+  workspace?: Readonly<{
+    root: string;
+    entries: readonly Readonly<{
+      projectId: string;
+      directory: string;
+      access: "read" | "write";
+    }>[];
+  }>;
 }>;
 
 /** Compatibility entry point used by the restored Task workflow. */
@@ -13,9 +25,10 @@ export function compileDispatchInput(
   _store: DispatchContextStore,
   taskId: string,
   role: Role,
-  input: string
+  input: string,
+  workContext: Pick<BuildRoleContextInput, "workItem" | "workspace"> = {}
 ): string {
-  return buildRoleContext({ taskId, role, input });
+  return buildRoleContext({ taskId, role, input, ...workContext });
 }
 
 export function buildRoleContext(context: BuildRoleContextInput): string {
@@ -62,15 +75,45 @@ function renderDispatchContext(
     ...(profile.constraints ?? []).map((item) => `Constraint: ${item}`),
     profile.expectedOutput === undefined ? null : `Expected output: ${profile.expectedOutput}`
   ].filter((line): line is string => line !== null);
+  const workLines = kind === "worker"
+    ? renderWorkerScope(context)
+    : [];
   const rendered = [
     `Follow the injected yui-${kind} Skill for this Yui dispatch.`,
     profileLines.join("\n"),
+    workLines.length === 0 ? null : workLines.join("\n"),
     "Yui dispatch:",
     requireText(context.input, "dispatch input")
-  ].filter(Boolean).join("\n\n");
+  ].filter((section): section is string => section !== null && section.length > 0)
+    .join("\n\n");
   return kind === "worker"
     ? ensureWorkerRunCompletionRequirement(rendered)
     : rendered;
+}
+
+function renderWorkerScope(context: BuildRoleContextInput): string[] {
+  if (context.workItem === undefined || context.workspace === undefined) return [];
+  const writable = context.workspace.entries.filter(({ access }) => access === "write");
+  const contextOnly = context.workspace.entries.filter(({ access }) => access === "read");
+  const projectLines = (
+    label: string,
+    entries: typeof context.workspace.entries
+  ): string[] => [
+    `${label}:`,
+    ...(entries.length === 0
+      ? ["- none"]
+      : entries.map(({ directory, projectId }) => `- ${directory} (${projectId})`))
+  ];
+  return [
+    `WorkItem: ${context.workItem.id}`,
+    `Workspace root: ${context.workspace.root}`,
+    ...projectLines("Writable Projects", writable),
+    ...projectLines("Context-only Projects", contextOnly),
+    `Read the full Task state with \`yui task context ${context.taskId}\`.`,
+    `Read the current WorkItem scope with \`yui task work list ${context.taskId}\`.`,
+    "Modify only Writable Projects. If another Project must change, stop and ask "
+      + "the Task Leader to expand this WorkItem scope before continuing."
+  ];
 }
 
 function requireText(value: string, label: string): string {

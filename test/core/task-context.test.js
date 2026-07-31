@@ -86,6 +86,7 @@ test("task context aggregates complete records and renders a compact recent summ
   const brief = createTaskBrief({
     objective: "Give the Leader one useful read",
     boundaries: ["No cache", "No transcript"],
+    technicalApproach: "Update the domain model, CLI context, and dashboard together",
     currentFocus: "CLI aggregation",
     leaderSummary: "Models are already durable",
     updatedBy: "leader"
@@ -194,6 +195,10 @@ test("task context aggregates complete records and renders a compact recent summ
   });
   assert.match(result.output, /^Task context: task-1/m);
   assert.match(result.output, /Objective: Give the Leader one useful read/);
+  assert.match(
+    result.output,
+    /Technical approach: Update the domain model, CLI context, and dashboard together/
+  );
   assert.match(result.output, /Keep context read-only/);
   assert.doesNotMatch(result.output, /Cache context/);
   assert.match(result.output, /Recent milestones \(5 of 6\)/);

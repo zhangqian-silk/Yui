@@ -18,22 +18,26 @@ const now = new Date("2026-07-23T08:00:00.000Z");
 function fixtureStore() {
   const tasks = [
     {
-      schemaVersion: 1,
+      schemaVersion: 2,
       id: "task-1",
       title: "Ship web dashboard",
       description: "Make task state visible without replacing the CLI.",
       priority: "high",
       tags: ["web", "release"],
-      projectId: "project-1",
-      baseRef: "master",
+      projectBindings: [{
+        projectId: "project-1",
+        directory: "fixture",
+        baseRef: "master"
+      }],
       status: "active",
       createdAt: "2026-07-22T08:00:00.000Z",
       updatedAt: "2026-07-23T07:30:00.000Z"
     },
     {
-      schemaVersion: 1,
+      schemaVersion: 2,
       id: "task-2",
       title: "Document release",
+      projectBindings: [],
       status: "completed",
       completionSummary: "Published the guide.",
       completedAt: "2026-07-23T06:00:00.000Z",
@@ -62,10 +66,11 @@ function fixtureStore() {
     },
     getTaskBrief(taskId) {
       return taskId === "task-1" ? {
-        schemaVersion: 1,
+        schemaVersion: 2,
         taskId,
         objective: "Deliver the web dashboard.",
         boundaries: ["Read-only"],
+        technicalApproach: "Expose the Task read model without duplicating its authority.",
         currentFocus: "HTTP surface",
         leaderSummary: "Implementation underway.",
         updatedAt: "2026-07-23T07:20:00.000Z",
@@ -222,15 +227,16 @@ test("dashboard API summarizes tasks and exposes one consolidated task detail", 
     assert.equal(dashboard.generatedAt, now.toISOString());
     assert.deepEqual(dashboard.counts, { total: 2, draft: 0, active: 1, completed: 1, archived: 0, openInputs: 1 });
     assert.equal(dashboard.tasks[0].id, "task-1");
-    assert.equal(dashboard.tasks[0].projectName, "Yui Web");
+    assert.deepEqual(dashboard.tasks[0].projectNames, ["Yui Web"]);
     assert.deepEqual(dashboard.tasks[0].workItems, { total: 2, pending: 1, running: 1, completed: 0, failed: 0 });
 
     const detailResponse = await fetch(`${origin}/api/tasks/task-1`);
     assert.equal(detailResponse.status, 200);
     const detail = await detailResponse.json();
     assert.equal(detail.task.title, "Ship web dashboard");
-    assert.equal(detail.task.projectName, "Yui Web");
+    assert.deepEqual(detail.task.projectNames, ["Yui Web"]);
     assert.equal(detail.brief.objective, "Deliver the web dashboard.");
+    assert.match(detail.brief.technicalApproach, /Task read model/);
     assert.equal(detail.roles[0].status, "running");
     assert.equal(detail.openInputs[0].question, "Choose a port");
     assert.equal(detail.runs[0].summary, "Dashboard verified.");

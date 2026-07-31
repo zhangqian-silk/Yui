@@ -105,7 +105,14 @@ test("an open InputRequest retains pending wakeups until it is resolved", async 
 
 test("a project Task retains wakeup until its worktree cwd is ready", async () => {
   const store = fakeStore();
-  store.tasks[0] = { ...store.tasks[0], projectId: "project-1" };
+  store.tasks[0] = {
+    ...store.tasks[0],
+    projectBindings: [{
+      projectId: "project-1",
+      directory: "fixture",
+      baseRef: "main"
+    }]
+  };
   const delivery = fakeDelivery();
 
   const result = await processLeaderWakeups(store, delivery, NOW);
@@ -199,9 +206,10 @@ test("a pre-send Leader failure forgets its transient prepared binding", async (
 test("Leader wakeup directs the Agent to CLI context without embedding records", async () => {
   const store = fakeStore({
     brief: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       objective: "Restore useful task knowledge",
       boundaries: ["Keep the runtime lean"],
+      technicalApproach: "Keep the Task Brief as the current plan.",
       currentFocus: "CLI integration",
       leaderSummary: "Storage is ready",
       updatedAt: NOW.toISOString(),
@@ -635,7 +643,12 @@ function operatorStore(requests) {
 }
 
 function fakeStore(options = {}) {
-  const task = { id: "task-1", title: "Test task", status: "active" };
+  const task = {
+    id: "task-1",
+    title: "Test task",
+    status: "active",
+    projectBindings: []
+  };
   const roles = [role("leader")];
   const pending = new Map([["task-1", mergePendingWakeup("task-1", "role-result", NOW, null)]]);
   const sessions = new Map();

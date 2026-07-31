@@ -73,10 +73,15 @@ test("Task knowledge writes respect lifecycle, provenance, and Leader self-wake 
   run([
     "brief", "update", "task-1",
     "--objective", "Keep the task model small",
+    "--approach", "Keep one Task-level plan and Project-scoped execution evidence",
     "--focus", "Knowledge CLI",
     "--leader-summary", "Implementation in progress"
   ], store, leader);
   assert.equal(store.getTaskBrief("task-1")?.updatedBy, "leader");
+  assert.equal(
+    store.getTaskBrief("task-1")?.technicalApproach,
+    "Keep one Task-level plan and Project-scoped execution evidence"
+  );
   assert.equal(store.getPendingWakeup("task-1"), null);
 
   run([

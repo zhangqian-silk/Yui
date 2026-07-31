@@ -1,28 +1,35 @@
 export type TaskBrief = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   objective: string;
   boundaries: string[];
+  technicalApproach: string;
   currentFocus: string;
   leaderSummary: string;
   updatedAt: string;
   updatedBy: string;
 };
 
-export type TaskBriefContent = Pick<
+export type TaskBriefContent = Omit<Pick<
   TaskBrief,
-  "objective" | "boundaries" | "currentFocus" | "leaderSummary" | "updatedBy"
->;
+  | "objective"
+  | "boundaries"
+  | "technicalApproach"
+  | "currentFocus"
+  | "leaderSummary"
+  | "updatedBy"
+>, "technicalApproach"> & Readonly<{ technicalApproach?: string }>;
 
 export type TaskBriefPatch = Partial<Pick<
   TaskBrief,
-  "objective" | "boundaries" | "currentFocus" | "leaderSummary"
+  "objective" | "boundaries" | "technicalApproach" | "currentFocus" | "leaderSummary"
 >>;
 
 export function createTaskBrief(input: TaskBriefContent, now: Date): TaskBrief {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     objective: requireText(input.objective, "Task objective"),
     boundaries: normalizeBoundaries(input.boundaries),
+    technicalApproach: optionalText(input.technicalApproach, "Task technical approach"),
     currentFocus: requireText(input.currentFocus, "Current focus"),
     leaderSummary: requireText(input.leaderSummary, "Leader summary"),
     updatedAt: now.toISOString(),
@@ -39,6 +46,7 @@ export function updateTaskBrief(
   return createTaskBrief({
     objective: patch.objective ?? brief.objective,
     boundaries: patch.boundaries ?? brief.boundaries,
+    technicalApproach: patch.technicalApproach ?? brief.technicalApproach,
     currentFocus: patch.currentFocus ?? brief.currentFocus,
     leaderSummary: patch.leaderSummary ?? brief.leaderSummary,
     updatedBy
@@ -60,4 +68,12 @@ function requireText(value: string, label: string): string {
   const normalized = value.trim();
   if (normalized.length === 0) throw new Error(`${label} is required.`);
   return normalized;
+}
+
+function optionalText(value: string | undefined, label: string): string {
+  if (value === undefined) return "";
+  if (typeof value !== "string" || value.includes("\0")) {
+    throw new Error(`${label} is invalid.`);
+  }
+  return value.trim();
 }

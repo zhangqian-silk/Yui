@@ -39,7 +39,7 @@ export async function processLeaderWakeups(
       results.push({ taskId: wakeup.taskId, status: "skipped", reason: "unavailable" });
       continue;
     }
-    if (task.projectId !== undefined && task.cwd === undefined) {
+    if (task.projectBindings.length > 0 && task.cwd === undefined) {
       results.push({ taskId: task.id, status: "skipped", reason: "workspace-not-ready" });
       continue;
     }

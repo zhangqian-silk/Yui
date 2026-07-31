@@ -491,7 +491,7 @@ export async function main(): Promise<void> {
       await ensureFileTaskController(home, { environment: process.env });
       const taskId = resolved[1] === "enter" ? resolved[2] : resolved[3];
       const task = taskId === undefined ? null : store.getTask(taskId);
-      if (task?.status === "active" && task.projectId !== undefined) {
+      if (task?.status === "active" && task.projectBindings.length > 0) {
         await workspacePreparer.prepareTaskWorkspace(task.id);
       }
     }
@@ -502,7 +502,7 @@ export async function main(): Promise<void> {
       }
       const workspace = await workspaceCoordinator.isolateWorkItem(workItemId);
       emit(
-        `Created isolated worktree for ${workItemId}\nWorkspace: ${workspace.path}\n`,
+        `Created WorkItem workspace for ${workItemId}\nWorkspace: ${workspace.root}\n`,
         false,
         { workItemId, workspace }
       );
@@ -513,13 +513,15 @@ export async function main(): Promise<void> {
       if (workItemId === undefined || resolved.length !== 4) {
         throw usageError("Task work capture usage: yui task work capture <work>.");
       }
-      const changeSet = await new WorkItemChangeSetManager(store).capture(workItemId);
+      const changeSets = await new WorkItemChangeSetManager(store).capture(workItemId);
       emit(
-        changeSet === null
-          ? `WorkItem worktree has no changes to capture: ${workItemId}\n`
-          : `Captured ChangeSet ${changeSet.id} from ${workItemId}\n`,
+        changeSets.length === 0
+          ? `WorkItem workspace has no changes to capture: ${workItemId}\n`
+          : `Captured ChangeSets ${changeSets.map(({ id }) => id).join(", ")} from ${
+              workItemId
+            }\n`,
         false,
-        { workItemId, changeSet }
+        { workItemId, changeSets }
       );
       return;
     }
@@ -595,8 +597,11 @@ export async function main(): Promise<void> {
     );
     if (result.kind === "output") {
       if (resolved[1] === "create") {
-        const created = result.data as { task?: { id?: string; projectId?: string } } | undefined;
-        if (created?.task?.id !== undefined && created.task.projectId !== undefined) {
+        const created = result.data as {
+          task?: { id?: string; projectBindings?: readonly unknown[] }
+        } | undefined;
+        if (created?.task?.id !== undefined
+          && (created.task.projectBindings?.length ?? 0) > 0) {
           let workspace;
           try {
             workspace = await workspacePreparer.prepareTaskWorkspace(created.task.id);

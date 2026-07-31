@@ -211,8 +211,11 @@ test("Draft activation atomically creates one durable first Leader wake", (t) =>
   const task = store.listTasks()[0];
 
   assert.equal(task.status, "draft");
-  assert.equal(task.projectId, "repo-1");
-  assert.equal(task.baseRef, "main");
+  assert.deepEqual(task.projectBindings, [{
+    projectId: "repo-1",
+    directory: "fixture",
+    baseRef: "main"
+  }]);
   assert.equal(store.getRole(task.id, "leader")?.activeAgentId, "codex");
   assert.equal(store.getPendingWakeup(task.id), null);
 
@@ -224,6 +227,72 @@ test("Draft activation atomically creates one durable first Leader wake", (t) =>
 
   run(["activate", task.id], store, options);
   assert.deepEqual(store.getPendingWakeup(task.id), first);
+});
+
+test("Leader can expand an active Task and WorkItem Project scope", (t) => {
+  const { root, store, options } = fixture(t);
+  for (const [id, name] of [["repo-1", "backend"], ["repo-2", "frontend"]]) {
+    store.saveProject(createProject(
+      id,
+      name,
+      join(root, id),
+      { stable: "main", development: "main" },
+      NOW
+    ));
+  }
+  run(["create", "Cross-project change", "--project", "repo-1"], store, options);
+  const task = store.listTasks()[0];
+  run(["activate", task.id], store, options);
+  const leader = {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+
+  run(["project", "add", task.id, "repo-2"], store, leader);
+  assert.deepEqual(store.getTask(task.id).projectBindings.map(({ projectId }) => projectId), [
+    "repo-1",
+    "repo-2"
+  ]);
+  run(["role", "add", task.id, "worker"], store, leader);
+  run([
+    "work", "create", task.id, "Update both",
+    "--project", "repo-1",
+    "--role", "worker"
+  ], store, leader);
+  const item = store.listWorkItems(task.id)[0];
+  run([
+    "work", "scope", item.id,
+    "--project", "repo-1",
+    "--project", "repo-2"
+  ], store, leader);
+  assert.deepEqual(store.getWorkItem(task.id, item.id).writeProjectIds, [
+    "repo-1",
+    "repo-2"
+  ]);
+  const expanded = store.getWorkItem(task.id, item.id);
+  const eventCount = store.listEvents(task.id).length;
+  assert.match(run([
+    "work", "scope", item.id,
+    "--project", "repo-2",
+    "--project", "repo-1"
+  ], store, leader), /Unchanged Work Item Project scope/i);
+  assert.equal(store.getWorkItem(task.id, item.id).revision, expanded.revision);
+  assert.equal(store.listEvents(task.id).length, eventCount);
+  assert.throws(
+    () => run([
+      "work", "scope", item.id,
+      "--project", "repo-2"
+    ], store, leader),
+    /cannot remove.*repo-1/i
+  );
+  assert.throws(
+    () => run(["work", "dispatch", item.id], store, leader),
+    /must be isolated.*Project scope/i
+  );
 });
 
 test("invalid project and Role options fail before mutating the aggregate", (t) => {

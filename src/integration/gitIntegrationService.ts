@@ -46,14 +46,16 @@ export class GitIntegrationService {
   async integrate(integrationId: string): Promise<IntegrationResult> {
     const initial = requireIntegration(this.store, integrationId);
     const task = this.store.getTask(initial.taskId);
-    if (task === null || task.projectId === undefined) {
+    if (task === null || !task.projectBindings.some(
+      ({ projectId }) => projectId === initial.projectId
+    )) {
       throw new Error(`Integration Task Project is unavailable: ${initial.taskId}.`);
     }
     if (task.status !== "active") {
       throw new Error(`Integration Task is not active: ${task.id}/${task.status}.`);
     }
-    const project = this.store.getProject(task.projectId);
-    if (project === null) throw new Error(`Project not found: ${task.projectId}.`);
+    const project = this.store.getProject(initial.projectId);
+    if (project === null) throw new Error(`Project not found: ${initial.projectId}.`);
     let prepared: Readonly<{ path: string; branch: string; baseCommit: string }>;
     let workspace: IntegrationWorkspace;
     try {
@@ -151,11 +153,13 @@ export class GitIntegrationService {
 
   async cleanup(integration: IntegrationAttempt): Promise<GitWorkspaceRemoval> {
     const task = this.store.getTask(integration.taskId);
-    if (task?.projectId === undefined) {
+    if (task === null || !task.projectBindings.some(
+      ({ projectId }) => projectId === integration.projectId
+    )) {
       throw new Error(`Integration Task Project is unavailable: ${integration.id}.`);
     }
-    const project = this.store.getProject(task.projectId);
-    if (project === null) throw new Error(`Project not found: ${task.projectId}.`);
+    const project = this.store.getProject(integration.projectId);
+    if (project === null) throw new Error(`Project not found: ${integration.projectId}.`);
     const result = await this.git.removeIntegrationWorktree({
       repositoryPath: project.path,
       container: join(this.worktreeRoot, project.name),

@@ -103,7 +103,7 @@ export type ConfiguredAgentUpdateResult = Readonly<{
 
 type ActiveRunPointer = Readonly<{ schemaVersion: 1; runId: string }>;
 type StoredTask = {
-  schemaVersion: 6;
+  schemaVersion: 7;
   task: Task;
   brief: TaskBrief | null;
   changeSets: Record<string, ChangeSet>;
@@ -124,7 +124,7 @@ type StoredTask = {
 };
 
 type StorageState = {
-  schemaVersion: 7;
+  schemaVersion: 8;
   revision: number;
   config: YuiConfig;
   configuredAgents: Record<string, ConfiguredAgent>;
@@ -355,7 +355,9 @@ export class FileTaskStore implements TaskStore {
   getProject(id: string): Project | null { return optional(this.#state().projects[id]); }
   removeProject(id: string): boolean {
     return this.transaction((store) => {
-      if (store.listTasks().some((task) => task.projectId === id)) {
+      if (store.listTasks().some((task) => task.projectBindings.some(
+        (binding) => binding.projectId === id
+      ))) {
         throw new StorageRecordError(`Project is still used by a Task: ${id}`);
       }
       return this.#remove((state) => state.projects, id);
@@ -469,10 +471,12 @@ export class FileTaskStore implements TaskStore {
 
   nextTaskId(): string { return this.#nextGlobalId("task", (state) => Object.keys(state.tasks)); }
   saveTask(task: Task): void {
-    const stored = validateTask(identified<Task>(task, 1, "id", task.id, "Task"));
+    const stored = validateTask(identified<Task>(task, 2, "id", task.id, "Task"));
     this.#mutate((state) => {
-      if (stored.projectId !== undefined && state.projects[stored.projectId] === undefined) {
-        throw new StorageRecordError(`Task Project not found: ${stored.projectId}`);
+      for (const binding of stored.projectBindings) {
+        if (state.projects[binding.projectId] === undefined) {
+          throw new StorageRecordError(`Task Project not found: ${binding.projectId}`);
+        }
       }
       const aggregate = state.tasks[stored.id] ?? emptyStoredTask(stored);
       aggregate.task = stored;
@@ -504,7 +508,7 @@ export class FileTaskStore implements TaskStore {
       throw new StorageRecordError(`ChangeSet belongs to another Task: ${stored.taskId}.`);
     }
     const aggregate = this.#requireTaskForWrite(taskId);
-    if (aggregate.task.projectId !== stored.projectId) {
+    if (!aggregate.task.projectBindings.some(({ projectId }) => projectId === stored.projectId)) {
       throw new StorageRecordError(`ChangeSet Project does not match Task: ${stored.id}.`);
     }
     if (aggregate.workItems[stored.workItemId] === undefined) {
@@ -531,7 +535,7 @@ export class FileTaskStore implements TaskStore {
   saveIntegrationAttempt(taskId: string, attempt: IntegrationAttempt): void {
     const stored = identified<IntegrationAttempt>(
       attempt,
-      1,
+      2,
       "id",
       attempt.id,
       "Integration Attempt"
@@ -541,9 +545,18 @@ export class FileTaskStore implements TaskStore {
       throw new StorageRecordError(`Integration Attempt belongs to another Task: ${stored.taskId}.`);
     }
     const aggregate = this.#requireTaskForWrite(taskId);
+    if (!aggregate.task.projectBindings.some(
+      ({ projectId }) => projectId === stored.projectId
+    )) {
+      throw new StorageRecordError(`Integration Project does not match Task: ${stored.id}.`);
+    }
     for (const changeSetId of stored.changeSetIds) {
-      if (aggregate.changeSets[changeSetId] === undefined) {
+      const changeSet = aggregate.changeSets[changeSetId];
+      if (changeSet === undefined) {
         throw new StorageRecordError(`Integration ChangeSet not found: ${changeSetId}.`);
+      }
+      if (changeSet.projectId !== stored.projectId) {
+        throw new StorageRecordError(`Integration ChangeSet belongs to another Project: ${changeSetId}.`);
       }
     }
     const existing = aggregate.integrationAttempts[stored.id];
@@ -617,7 +630,8 @@ export class FileTaskStore implements TaskStore {
     if (aggregate.roles[stored.roleName] === undefined) {
       throw new StorageRecordError(`Task Role not found: ${taskId}/${stored.roleName}`);
     }
-    if (aggregate.task.projectId !== stored.projectId) {
+    const boundProjects = new Set(aggregate.task.projectBindings.map(({ projectId }) => projectId));
+    if (stored.entries.some(({ projectId }) => !boundProjects.has(projectId))) {
       throw new StorageRecordError(`RoleWorkspace Project does not match Task: ${taskId}/${stored.roleName}`);
     }
     this.#mutate((state) => {
@@ -663,10 +677,14 @@ export class FileTaskStore implements TaskStore {
   findWorkItem(id: string): WorkItem | null { return findUnique(this.#state(), "workItems", id, "Work item"); }
   listWorkItems(taskId: string): WorkItem[] { return values(this.#requireTask(taskId).workItems, "id"); }
   saveWorkItem(taskId: string, item: WorkItem): void {
-    const stored = identified<WorkItem>(item, 2, "id", item.id, "Work item");
+    const stored = identified<WorkItem>(item, 3, "id", item.id, "Work item");
     if (stored.taskId !== taskId) throw new StorageRecordError(`Work item belongs to another Task: ${stored.taskId}`);
     validateWorkItem(stored);
-    this.#requireTaskForWrite(taskId);
+    const aggregate = this.#requireTaskForWrite(taskId);
+    const boundProjects = new Set(aggregate.task.projectBindings.map(({ projectId }) => projectId));
+    if (stored.writeProjectIds.some((projectId) => !boundProjects.has(projectId))) {
+      throw new StorageRecordError(`Work Item writable Project does not belong to Task: ${stored.id}.`);
+    }
     for (const dependencyId of stored.dependsOn) {
       const dependency = this.getWorkItem(taskId, dependencyId);
       if (dependency === null) {
@@ -674,7 +692,7 @@ export class FileTaskStore implements TaskStore {
       }
     }
     assertAcyclicWorkItems({
-      ...this.#requireTask(taskId).workItems,
+      ...aggregate.workItems,
       [stored.id]: stored
     });
     const existing = this.getWorkItem(taskId, stored.id);
@@ -1000,7 +1018,7 @@ export function ensureYuiHome(rootDir: string): void { mkdirSync(rootDir, { recu
 
 function emptyState(): StorageState {
   return {
-    schemaVersion: 7,
+    schemaVersion: 8,
     revision: 0,
     config: { schemaVersion: 1 },
     configuredAgents: {},
@@ -1014,7 +1032,7 @@ function emptyState(): StorageState {
 }
 function emptyStoredTask(task: Task): StoredTask {
   return {
-    schemaVersion: 6,
+    schemaVersion: 7,
     task,
     brief: null,
     changeSets: {},
@@ -1051,7 +1069,7 @@ function parseState(raw: string): StorageState {
     "tasks",
     "mailboxes"
   ], "Storage state");
-  if (state.schemaVersion !== 7 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
+  if (state.schemaVersion !== 8 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
   const result = clone(state) as unknown as StorageState;
   result.config = versioned(result.config, 1, "Yui config");
   validateYuiConfig(result.config);
@@ -1101,17 +1119,18 @@ function parseState(raw: string): StorageState {
     }
   }
   for (const aggregate of Object.values(result.tasks)) {
-    if (aggregate.task.projectId !== undefined
-      && result.projects[aggregate.task.projectId] === undefined) {
-      throw new StorageRecordError(
-        `Task Project not found: ${aggregate.task.id}/${aggregate.task.projectId}`
-      );
+    for (const binding of aggregate.task.projectBindings) {
+      if (result.projects[binding.projectId] === undefined) {
+        throw new StorageRecordError(
+          `Task Project not found: ${aggregate.task.id}/${binding.projectId}`
+        );
+      }
     }
     for (const [name, role] of Object.entries(aggregate.roles)) {
       const sessions = aggregate.roleSessionSets[name];
       if (sessions !== undefined) assertSessionsMatchRole(sessions, role);
       const workspace = aggregate.roleWorkspaces[name];
-      if (workspace !== undefined && workspace.path !== role.workspace) {
+      if (workspace !== undefined && workspace.root !== role.workspace) {
         throw new StorageRecordError(`Task Role workspace path is inconsistent: ${aggregate.task.id}/${name}`);
       }
     }
@@ -1124,7 +1143,8 @@ function parseState(raw: string): StorageState {
       if (aggregate.roles[name] === undefined) {
         throw new StorageRecordError(`RoleWorkspace has no Task Role: ${aggregate.task.id}/${name}`);
       }
-      if (aggregate.task.projectId !== workspace.projectId) {
+      const boundProjects = new Set(aggregate.task.projectBindings.map(({ projectId }) => projectId));
+      if (workspace.entries.some(({ projectId }) => !boundProjects.has(projectId))) {
         throw new StorageRecordError(`RoleWorkspace Project does not match Task: ${aggregate.task.id}/${name}`);
       }
     }
@@ -1171,7 +1191,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
   parseMap(aggregate.integrationAttempts, (record, key) => {
     const attempt = identified<IntegrationAttempt>(
       record,
-      1,
+      2,
       "id",
       key,
       "Integration Attempt"
@@ -1184,12 +1204,12 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateIntegrationAttempt(attempt);
     return attempt;
   }, "integrationAttempts");
-  versioned(aggregate, 6, `Task aggregate ${taskId}`);
-  validateTask(identified(aggregate.task, 1, "id", taskId, "Task"));
+  versioned(aggregate, 7, `Task aggregate ${taskId}`);
+  validateTask(identified(aggregate.task, 2, "id", taskId, "Task"));
   if (aggregate.brief !== null) storedTaskBrief(aggregate.brief);
   parseMap(aggregate.roles, (record, key) => { const role = identified<TaskRole>(record, 2, "name", key, "Task Role"); if (role.taskId !== taskId) throw new StorageRecordError(`Task Role belongs to another Task: ${role.taskId}`); validateTaskRole(role); return role; }, "roles");
   parseMap(aggregate.roleWorkspaces, (record, key) => {
-    const workspace = identified<RoleWorkspace>(record, 2, "roleName", key, "Managed worktree");
+    const workspace = identified<RoleWorkspace>(record, 3, "roleName", key, "Managed workspace");
     if (workspace.taskId !== taskId) {
       throw new StorageRecordError(`RoleWorkspace belongs to another Task: ${workspace.taskId}`);
     }
@@ -1198,7 +1218,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
   }, "roleWorkspaces");
   parseMap(aggregate.roleSessionSets, (record, key) => { const set = taskSessions(record); if (set.owner.taskId !== taskId || set.owner.roleName !== key) throw new StorageRecordError(`Task Role session set identity is inconsistent: ${taskId}/${key}`); return set; }, "roleSessionSets");
   parseMap(aggregate.workItems, (record, key) => {
-    const item = identified<WorkItem>(record, 2, "id", key, "Work item");
+    const item = identified<WorkItem>(record, 3, "id", key, "Work item");
     if (item.taskId !== taskId) {
       throw new StorageRecordError(`Work item belongs to another Task: ${item.taskId}`);
     }
@@ -1315,13 +1335,23 @@ function assertSessionsMatchRole(
 }
 
 function storedTaskBrief(value: unknown): TaskBrief {
-  const brief = versioned<TaskBrief>(value, 1, "Task Brief");
+  const brief = versioned<TaskBrief>(value, 2, "Task Brief");
   exact(
     brief as unknown as Record<string, unknown>,
-    ["schemaVersion", "objective", "boundaries", "currentFocus", "leaderSummary", "updatedAt", "updatedBy"],
+    [
+      "schemaVersion",
+      "objective",
+      "boundaries",
+      "technicalApproach",
+      "currentFocus",
+      "leaderSummary",
+      "updatedAt",
+      "updatedBy"
+    ],
     "Task Brief"
   );
   requireNormalizedText(brief.objective, "Task Brief objective");
+  requireOptionalNormalizedText(brief.technicalApproach, "Task Brief technical approach");
   requireNormalizedText(brief.currentFocus, "Task Brief current focus");
   requireNormalizedText(brief.leaderSummary, "Task Brief leader summary");
   requireNormalizedText(brief.updatedBy, "Task Brief updatedBy");
@@ -1486,6 +1516,15 @@ function requireNormalizedText(value: unknown, label: string): string {
   return normalized;
 }
 
+function requireOptionalNormalizedText(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.includes("\0")) {
+    throw new StorageRecordError(`${label} is invalid.`);
+  }
+  const normalized = value.trim();
+  if (normalized !== value) throw new StorageRecordError(`${label} must be normalized.`);
+  return normalized;
+}
+
 function requireTimestamp(value: unknown, label: string): string {
   if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
     throw new StorageRecordError(`${label} is invalid.`);
@@ -1593,6 +1632,7 @@ function validateMailboxReferences(state: StorageState, mailbox: WorkMailbox): v
 
 function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredTask): void {
   const taskId = aggregate.task.id;
+  const boundProjects = new Set(aggregate.task.projectBindings.map(({ projectId }) => projectId));
   assertAcyclicWorkItems(aggregate.workItems);
   for (const item of Object.values(aggregate.workItems)) {
     for (const dependencyId of item.dependsOn) {
@@ -1600,19 +1640,37 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
         throw new StorageRecordError(`Work Item dependency not found: ${taskId}/${dependencyId}.`);
       }
     }
+    if (item.writeProjectIds.some((projectId) => !boundProjects.has(projectId))) {
+      throw new StorageRecordError(
+        `Work Item writable Project does not belong to Task: ${taskId}/${item.id}.`
+      );
+    }
   }
   for (const changeSet of Object.values(aggregate.changeSets)) {
     if (aggregate.workItems[changeSet.workItemId] === undefined) {
       throw new StorageRecordError(`ChangeSet Work Item not found: ${changeSet.id}.`);
     }
-    if (aggregate.task.projectId !== changeSet.projectId) {
+    if (!aggregate.task.projectBindings.some(
+      ({ projectId }) => projectId === changeSet.projectId
+    )) {
       throw new StorageRecordError(`ChangeSet Project does not match Task: ${changeSet.id}.`);
     }
   }
   for (const integration of Object.values(aggregate.integrationAttempts)) {
+    if (!boundProjects.has(integration.projectId)) {
+      throw new StorageRecordError(
+        `Integration Project does not match Task: ${integration.id}.`
+      );
+    }
     for (const changeSetId of integration.changeSetIds) {
-      if (aggregate.changeSets[changeSetId] === undefined) {
+      const changeSet = aggregate.changeSets[changeSetId];
+      if (changeSet === undefined) {
         throw new StorageRecordError(`Integration ChangeSet not found: ${integration.id}/${changeSetId}.`);
+      }
+      if (changeSet.projectId !== integration.projectId) {
+        throw new StorageRecordError(
+          `Integration ChangeSet belongs to another Project: ${integration.id}/${changeSetId}.`
+        );
       }
     }
   }
@@ -1625,6 +1683,7 @@ function validIntegrationTransition(
   if (
     before.id !== after.id
     || before.taskId !== after.taskId
+    || before.projectId !== after.projectId
     || before.targetRef !== after.targetRef
     || before.expectedHead !== after.expectedHead
     || !isDeepStrictEqual(before.changeSetIds, after.changeSetIds)
@@ -1716,8 +1775,13 @@ function validWorkItemTransition(existing: WorkItem, candidate: WorkItem): boole
       || existing.objective !== candidate.objective
       || !isDeepStrictEqual(existing.acceptance, candidate.acceptance)
       || !isDeepStrictEqual(existing.dependsOn, candidate.dependsOn)
+      || !isDeepStrictEqual(existing.writeProjectIds, candidate.writeProjectIds)
     )
   ) return false;
+  const candidateProjects = new Set(candidate.writeProjectIds);
+  if (existing.writeProjectIds.some((projectId) => !candidateProjects.has(projectId))) {
+    return false;
+  }
   const allowed: Readonly<Record<WorkItem["status"], readonly WorkItem["status"][]>> = {
     pending: ["pending", "running", "cancelled", "superseded"],
     running: [

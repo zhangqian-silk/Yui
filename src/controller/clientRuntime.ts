@@ -513,7 +513,8 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
   async #prepareAndScan(taskId: string): Promise<void> {
     const task = this.store.getTask(taskId);
     if (
-      task?.projectId !== undefined
+      task !== null
+      && task.projectBindings.length > 0
       && (task.status === "draft" || task.status === "active")
       && this.workspacePreparer !== undefined
     ) {

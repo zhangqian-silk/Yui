@@ -232,7 +232,7 @@ test("Task mailbox is completed only after its targeted orchestration succeeds",
   };
   const calls = [];
   const store = emptyStore();
-  store.getTask = () => ({ id: "task-1", status: "active" });
+  store.getTask = () => ({ id: "task-1", status: "active", projectBindings: [] });
   store.getWorkMailbox = () => mailbox;
   store.claimWorkMailbox = () => { calls.push("claim"); return { status: "claimed", processing }; };
   store.completeWorkMailbox = (_target, batchId) => { calls.push(`complete:${batchId}`); return true; };
@@ -257,7 +257,7 @@ test("Task mailbox is released when targeted orchestration fails", async () => {
     batchId: "task:task-1:1-1", batch, owner: "controller", startedAt: new Date(0).toISOString()
   };
   const store = emptyStore();
-  store.getTask = () => ({ id: "task-1", status: "active" });
+  store.getTask = () => ({ id: "task-1", status: "active", projectBindings: [] });
   store.getWorkMailbox = () => ({
     schemaVersion: 1, target, nextSequence: 2, processing: null, pending: batch
   });
@@ -297,7 +297,7 @@ test("a main full pass never consumes the Operator mailbox", async () => {
 test("dirty reconciliation does not synthesize an orphan Leader wake", async () => {
   const saved = [];
   const store = emptyStore();
-  store.getTask = () => ({ id: "task-1", status: "active" });
+  store.getTask = () => ({ id: "task-1", status: "active", projectBindings: [] });
   store.savePendingWakeup = (wakeup) => saved.push(wakeup);
 
   await runControllerSchedulerPass(store, noTmux, new Date(0), undefined, {
@@ -323,7 +323,7 @@ test("failed stale Role cleanup is released and retried before normal scheduling
   let secondStop;
   const secondStopped = new Promise((resolve) => { secondStop = resolve; });
   const store = emptyStore();
-  store.getTask = () => ({ id: "task-1", status: "active" });
+  store.getTask = () => ({ id: "task-1", status: "active", projectBindings: [] });
   store.getRole = () => role("task-1", "worker");
   store.getWorkMailbox = (mailboxTarget) => (
     mailboxTarget.kind === "role-runtime" ? mailbox : null
@@ -397,8 +397,8 @@ test("failed stale Role cleanup is released and retried before normal scheduling
 
 test("one stale Role cleanup failure does not block another Role delivery", async () => {
   const tasks = new Map([
-    ["task-cleanup", { id: "task-cleanup", status: "active" }],
-    ["task-delivery", { id: "task-delivery", status: "active" }]
+    ["task-cleanup", { id: "task-cleanup", status: "active", projectBindings: [] }],
+    ["task-delivery", { id: "task-delivery", status: "active", projectBindings: [] }]
   ]);
   const roles = new Map([
     ["task-cleanup\0worker", role("task-cleanup", "worker")],
@@ -572,7 +572,7 @@ test("Task and global cleanup obligations supersede launch reservations atomical
   }]));
   const stopped = [];
   const store = emptyStore();
-  store.getTask = () => ({ id: "task-1", status: "active" });
+  store.getTask = () => ({ id: "task-1", status: "active", projectBindings: [] });
   store.getRole = () => role("task-1", "worker");
   store.getWorkMailbox = (target) => mailboxes.get(key(target)) ?? null;
   store.completeRuntimeCleanup = (target) => {
@@ -833,7 +833,7 @@ test("global Role cleanup retries on its own key without consuming Operator work
 });
 
 test("stale Role cleanup finishes before a concurrently queued Run may launch", async () => {
-  const task = { id: "task-1", status: "active" };
+  const task = { id: "task-1", status: "active", projectBindings: [] };
   const roleValue = role(task.id, "worker");
   const cleanupTarget = {
     kind: "role-runtime", taskId: task.id, roleName: roleValue.name
@@ -1004,7 +1004,7 @@ test("full recovery releases only Task mailboxes whose isolated workspace work f
 
 test("controller delivers a queued Work AgentRun through tmux before liveness", async () => {
   const events = [];
-  const task = { id: "task-1", status: "active" };
+  const task = { id: "task-1", status: "active", projectBindings: [] };
   const role = {
     taskId: task.id,
     name: "worker",
@@ -1076,7 +1076,7 @@ test("controller delivers a queued Work AgentRun through tmux before liveness", 
 });
 
 test("controller archives are enforced by killing the tmux Task and stopping sessions", async () => {
-  const task = { id: "task-archived", status: "archived" };
+  const task = { id: "task-archived", status: "archived", projectBindings: [] };
   const calls = [];
   const store = emptyStore();
   store.listTasks = () => [task];
@@ -1122,8 +1122,8 @@ test("dirty mailbox keys compile into exact task, role and operator selections",
 
 test("dirty Task reconciliation prepares active work and only stops archived runtimes", async () => {
   const events = [];
-  const active = { id: "task-active", status: "active", projectId: "project-1" };
-  const archived = { id: "task-archived", status: "archived", projectId: "project-1" };
+  const active = { id: "task-active", status: "active", projectBindings: [{ projectId: "project-1" }] };
+  const archived = { id: "task-archived", status: "archived", projectBindings: [{ projectId: "project-1" }] };
   const tasks = new Map([[active.id, active], [archived.id, archived]]);
   const store = emptyStore(events);
   store.listTasks = () => { throw new Error("dirty pass must not list every Task"); };
@@ -1159,7 +1159,7 @@ test("dirty Task reconciliation prepares active work and only stops archived run
 });
 
 test("dirty Role reconciliation inspects only that Role while retaining the Task Leader closure", async () => {
-  const task = { id: "task-1", status: "active" };
+  const task = { id: "task-1", status: "active", projectBindings: [] };
   const roles = ["worker", "reviewer"].map((name) => ({
     taskId: task.id, name, activeAgentId: `codex-${name}`, adapterId: "codex", status: "running"
   }));
@@ -1256,7 +1256,7 @@ test("controller pump coalesces overlap into one non-overlapping follow-up pass"
   const store = emptyStore();
   store.listTasks = () => {
     listCalls += 1;
-    return [{ id: "task-1", status: "active" }];
+    return [{ id: "task-1", status: "active", projectBindings: [] }];
   };
   store.listRoles = () => [];
   const delivery = {
@@ -1526,7 +1526,7 @@ test("explicit reconciliation prepares active Role worktrees before requesting a
     const scanned = new Promise((resolve) => { scanCompleted = resolve; });
     const runtime = new FileTaskWorkflowRuntime(
       "/tmp/yui-workspace-order",
-      { getTask: () => ({ id: "task-1", status, projectId: "project-1" }) },
+      { getTask: () => ({ id: "task-1", status, projectBindings: [{ projectId: "project-1" }] }) },
       {},
       {},
       {},
@@ -1619,7 +1619,7 @@ test("a failed Task workspace is retried without starving peers and stops at the
   };
   let attempts = 0;
   const store = emptyStore();
-  store.getTask = () => ({ id: "task-1", status: "active" });
+  store.getTask = () => ({ id: "task-1", status: "active", projectBindings: [] });
   store.getWorkMailbox = (mailboxTarget) => (
     mailboxTarget.kind === "task" ? mailbox : null
   );
@@ -1725,7 +1725,7 @@ test("a dirty Hook fold signals Operator work created after scheduler phases", a
 });
 
 test("a non-ready Role delivery uses bounded queued retries instead of blocking readiness polling", async () => {
-  const task = { id: "task-1", status: "active" };
+  const task = { id: "task-1", status: "active", projectBindings: [] };
   const roleValue = role(task.id, "worker");
   let run = deliveredRun(task.id, roleValue.name);
   delete run.deliveredAt;
@@ -1771,7 +1771,7 @@ test("a non-ready Role delivery uses bounded queued retries instead of blocking 
 });
 
 test("exhausting Role delivery retries forgets the transient Run preparation", async () => {
-  const task = { id: "task-1", status: "active" };
+  const task = { id: "task-1", status: "active", projectBindings: [] };
   const roleValue = role(task.id, "worker");
   const run = deliveredRun(task.id, roleValue.name);
   delete run.deliveredAt;
@@ -1847,7 +1847,7 @@ test("exhausting Role delivery retries forgets the transient Run preparation", a
 });
 
 test("a fresh Controller retries an undelivered Run in an existing busy pane", async () => {
-  const task = { id: "task-1", status: "active" };
+  const task = { id: "task-1", status: "active", projectBindings: [] };
   const roleValue = role(task.id, "worker");
   const run = {
     ...deliveredRun(task.id, roleValue.name),
@@ -1902,7 +1902,7 @@ test("a fresh Controller retries an undelivered Run in an existing busy pane", a
 });
 
 test("a resumed Role retries startup readiness when prepare created its missing pane", async () => {
-  const task = { id: "task-1", status: "active" };
+  const task = { id: "task-1", status: "active", projectBindings: [] };
   const roleValue = role(task.id, "worker");
   const run = { ...deliveredRun(task.id, roleValue.name), mode: "resume" };
   delete run.deliveredAt;
@@ -2088,7 +2088,7 @@ test("an overdue semantic deadline uses bounded pass backoff instead of a zero-d
 });
 
 test("overdue ready recovery remains targeted and retries until the composer is ready", async () => {
-  const task = { id: "task-1", status: "active" };
+  const task = { id: "task-1", status: "active", projectBindings: [] };
   const roleValue = role(task.id, "worker");
   let run = {
     ...deliveredRun(task.id, roleValue.name),
@@ -2133,7 +2133,7 @@ test("overdue ready recovery remains targeted and retries until the composer is 
 });
 
 test("a terminal Role clears its pending ready-recovery timer", async () => {
-  const task = { id: "task-1", status: "active" };
+  const task = { id: "task-1", status: "active", projectBindings: [] };
   const roleValue = role(task.id, "worker");
   let run = {
     ...deliveredRun(task.id, roleValue.name),
@@ -2269,7 +2269,7 @@ test("Controller shutdown waits for the in-flight reconciliation to drain", asyn
   const blocked = new Promise((resolve) => { release = resolve; });
   const entered = new Promise((resolve) => { started = resolve; });
   const store = emptyStore();
-  store.listTasks = () => [{ id: "task-1", status: "active" }];
+  store.listTasks = () => [{ id: "task-1", status: "active", projectBindings: [] }];
   store.listRoles = () => [role("task-1", "worker")];
   store.getActiveAgentRun = () => deliveredRun("task-1", "worker");
   const delivery = {
@@ -2339,7 +2339,7 @@ test("Controller stop keeps discovery owned until in-flight work has drained", a
   const blocked = new Promise((resolve) => { release = resolve; });
   const entered = new Promise((resolve) => { started = resolve; });
   const store = emptyStore();
-  store.listTasks = () => [{ id: "task-1", status: "active" }];
+  store.listTasks = () => [{ id: "task-1", status: "active", projectBindings: [] }];
   store.listRoles = () => [role("task-1", "worker")];
   store.getActiveAgentRun = () => deliveredRun("task-1", "worker");
   const delivery = {

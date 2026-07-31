@@ -12,21 +12,44 @@ import { worktreeIdentity } from "../../dist/repository/gitWorkspace.js";
 
 const NOW = new Date("2026-07-20T12:00:00.000Z");
 
-test("managed worktree records Task or WorkItem ownership independently from Role", () => {
-  const path = join(process.cwd(), "worktree", "Yui", "task-1", "work-1");
+test("managed workspace records a root with per-Project read and write entries", () => {
+  const root = join(process.cwd(), "tasks", "task-1", "work-items", "work-1");
+  const backend = join(process.cwd(), "worktree", "backend", "task-1", "work-1");
+  const frontend = join(process.cwd(), "worktree", "frontend", "task-1", "main");
   const workspace = createRoleWorkspace({
     taskId: "task-1",
     roleName: "worker",
     owner: { type: "work-item", workItemId: "work-1" },
-    projectId: "project-1",
-    path,
-    branch: "yui/task-1/work-1",
-    baseRef: "main",
-    baseCommit: "0123456789abcdef0123456789abcdef01234567"
+    root,
+    entries: [
+      {
+        projectId: "project-1",
+        directory: "backend",
+        access: "write",
+        path: backend,
+        branch: "yui/task-1/work-1",
+        baseRef: "main",
+        baseCommit: "0123456789abcdef0123456789abcdef01234567"
+      },
+      {
+        projectId: "project-2",
+        directory: "frontend",
+        access: "read",
+        path: frontend,
+        branch: "yui/task-1/main",
+        baseRef: "main",
+        baseCommit: "fedcba9876543210fedcba9876543210fedcba98"
+      }
+    ]
   }, NOW);
 
-  assert.equal(workspace.schemaVersion, 2);
+  assert.equal(workspace.schemaVersion, 3);
   assert.deepEqual(workspace.owner, { type: "work-item", workItemId: "work-1" });
+  assert.equal(workspace.root, root);
+  assert.deepEqual(workspace.entries.map(({ projectId, access }) => ({ projectId, access })), [
+    { projectId: "project-1", access: "write" },
+    { projectId: "project-2", access: "read" }
+  ]);
   assert.equal(managedWorktreeName(workspace.owner), "work-1");
   assert.equal(validateRoleWorkspace(workspace), workspace);
 });

@@ -44,7 +44,10 @@ edit `state.json`, managed refs, worktrees, Sessions, or provider IDs directly.
 Maintain durable context throughout a long-running Task:
 
 - At first activation, ensure the Brief records the objective, boundaries,
-  current focus, and a useful Leader summary.
+  Task-level technical approach, current focus, and a useful Leader summary.
+- Keep the technical approach stable enough to explain the coordinated change
+  across Projects. Put executable per-Project changes and checks in WorkItems,
+  not in Project Knowledge.
 - Before every Leader yield, update `focus` and `leader-summary` so the next
   wake can resume without relying on the native conversation transcript.
 - Record a Decision when a material technical or product choice changes future
@@ -60,6 +63,7 @@ Maintain durable context throughout a long-running Task:
 yui task brief update <task-id> \
   --objective "<mission>" \
   --boundary "<scope or constraint>" \
+  --approach "<overall technical approach across Projects>" \
   --focus "<current work and next action>" \
   --leader-summary "<progress, evidence, blockers, and risk>"
 yui task decision record <task-id> \
@@ -107,6 +111,7 @@ Create finite WorkItems that describe intent:
 
 ```sh
 yui task work create <task-id> "<title>" \
+  --project <project-to-modify> \
   --objective "<bounded outcome>" \
   --accept "<observable criterion>" \
   --after <dependency-work-id>
@@ -115,6 +120,8 @@ yui task work create <task-id> "<title>" \
 Repeat `--accept` and `--after` only when needed. Dependencies are real ordering
 constraints. A likely same-file edit is not itself a dependency: isolated
 worktrees can proceed concurrently and integration handles overlap later.
+Task main contains every bound Project. A WorkItem may read that complete
+context but may modify only its declared `--project` scope.
 
 For analysis-only work, require source evidence and prohibit changes. For
 implementation, include enough detail to execute and validate without
@@ -219,6 +226,29 @@ For meaningful concurrent-write risk, isolate the WorkItem before dispatch:
 yui task work isolate <work-id>
 ```
 
+WorkItem write scope is monotonic: it may expand but never shrink. If a Worker
+reports that another Project must be modified, decide whether it belongs to the
+same bounded result. The Worker yields without touching that Project. If
+approved, add an unbound Project to the Task when necessary, update the
+awaiting WorkItem scope with the complete old-plus-new Project set, isolate it
+again, reject the yielded round with the scope-expansion reason, then
+redispatch:
+
+```sh
+yui task project add <task-id> <project> --base <ref>
+yui task work scope <work-id> \
+  --project <existing-project> --project <new-project>
+yui task work isolate <work-id>
+yui task work reject <work-id> \
+  --summary "Write scope expanded; continue in the refreshed workspace."
+yui task work dispatch <work-id> --input "<continue with the expanded scope>"
+```
+
+Never omit an already-approved Project from `task work scope`; Yui rejects
+scope shrink. Do not hot-swap an active Session. Do not let a Worker add a
+Project or write through a Task-main context directory. Split a new WorkItem or
+Task when the result or lifecycle is independent.
+
 Do not dispatch until dependencies are complete. Do not create a second active
 Run for the same Role or WorkItem. A Worker must yield its AgentRun. Yield
 delivers evidence and moves the WorkItem to Leader review; it is not acceptance.
@@ -241,17 +271,18 @@ yui task work reject <work-id> --summary "<missing evidence or required fix>"
 yui task work dispatch <work-id> --input "<prior result plus bounded feedback>"
 
 yui task work capture <work-id>
-yui task integration start <task-id> \
-  --change-set <latest-change-set-id> \
+yui task integration start <task-id> --project <project> \
+  --change-set <latest-project-change-set-id> \
   --check "<validation command>"
 yui task work accept <work-id> --summary "<acceptance and integration evidence>"
 ```
 
 Every retry round must retain its result and checks in the WorkItem summary.
-Capture is immutable per HEAD: repeating capture at the same HEAD reuses the
-record; a repaired HEAD produces a new candidate. Integrate only the latest
-candidate that represents the reviewed workspace. Never accept an isolated
-result while its latest ChangeSet is unintegrated.
+Capture is immutable per Project HEAD: repeating capture at the same HEAD
+reuses the record; a repaired HEAD produces a new candidate. Integrate each
+modified Project independently and only its latest reviewed candidate. Never
+accept an isolated result while any writable Project's latest ChangeSet is
+unintegrated.
 
 Yui validates a candidate and advances the target with compare-and-swap. A
 failed candidate does not advance the target. Inspect and resolve semantic
