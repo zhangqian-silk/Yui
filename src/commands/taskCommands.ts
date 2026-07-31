@@ -12,6 +12,7 @@ import {
   usageError
 } from "../errors/cliError.js";
 import { createTaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
+import { readCommandText } from "./textInput.js";
 import {
   createRoleSessionSet,
   roleAgentSessionResumeMode,
@@ -250,11 +251,12 @@ function updateTaskCommand(
   options: TaskCommandOptions
 ): string {
   const optionNames = new Set(["--title", "--description", "--priority", "--tags", "--due-at"]);
-  const clearOptions = new Set([
-    "--clear-description", "--clear-priority", "--clear-tags", "--clear-due-at"
+  const flagOptions = new Set([
+    "--clear-description", "--clear-priority", "--clear-tags", "--clear-due-at",
+    "--require-integration"
   ]);
-  const usage = "Task update usage: yui task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at].";
-  const parsed = parseTail(args, optionNames, usage, clearOptions);
+  const usage = "Task update usage: yui task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at] [--require-integration].";
+  const parsed = parseTail(args, optionNames, usage, flagOptions);
   exactPositionals(parsed.positionals, 1, usage);
   if (parsed.options.size === 0) throw usageError("At least one Task metadata option is required.", usage);
   for (const [setOption, clearOption] of [
@@ -277,9 +279,21 @@ function updateTaskCommand(
     ? parseTaskTags(requiredOption(parsed.options, "--tags"))
     : undefined;
   const now = clock(options);
-  const task = store.transaction((tx) => {
+  const result = store.transaction((tx) => {
     const current = requireTask(tx, parsed.positionals[0]);
     if (current.status === "archived") throw usageError(`Task is archived: ${current.id}.`);
+    if (parsed.options.has("--require-integration") && current.status === "completed") {
+      throw usageError(
+        `Task ${current.id} is completed; use task reopen before enabling integration evidence.`
+      );
+    }
+    if (
+      parsed.options.size === 1
+      && parsed.options.has("--require-integration")
+      && current.requireIntegration === true
+    ) {
+      return { task: current, integrationState: "already-enabled" as const };
+    }
     const updated = updateTaskMetadata(current, {
       ...(parsed.options.has("--title") ? { title: requiredOption(parsed.options, "--title") } : {}),
       ...(parsed.options.has("--description")
@@ -293,15 +307,32 @@ function updateTaskCommand(
         : { tags }),
       ...(dueAt === undefined
         ? parsed.options.has("--clear-due-at") ? { dueAt: null } : {}
-        : { dueAt })
+        : { dueAt }),
+      ...(parsed.options.has("--require-integration") ? { requireIntegration: true } : {})
     }, now);
     tx.saveTask(updated);
-    recordTaskEvent(tx, updated.id, "task.updated", { status: updated.status }, now);
+    recordTaskEvent(tx, updated.id, "task.updated", {
+      status: updated.status,
+      ...(parsed.options.has("--require-integration")
+        ? { completionEvidence: "integration-required" }
+        : {})
+    }, now);
     enqueueWork(tx, taskMailbox(updated.id), "task-updated", now, [taskRef(updated.id)]);
-    return updated;
+    return {
+      task: updated,
+      integrationState: parsed.options.has("--require-integration")
+        ? "enabled" as const
+        : "unchanged" as const
+    };
   });
-  notifyMailbox(options.runtime, taskMailbox(task.id), task.id);
-  return `Updated task ${task.id}\n`;
+  if (result.integrationState !== "already-enabled") {
+    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
+  }
+  return result.integrationState === "enabled"
+    ? `Updated task ${result.task.id}\nCompletion evidence enabled: WorkItem, ChangeSet, and committed Integration required\n`
+    : result.integrationState === "already-enabled"
+      ? `Task ${result.task.id} completion evidence is already enabled\n`
+      : `Updated task ${result.task.id}\n`;
 }
 
 /** Compatibility helper for call sites that cannot yet handle foreground enter. */
@@ -357,11 +388,16 @@ function createTaskCommand(
   const parsed = parseTaskCreation(args, store);
   const now = clock(options);
   const created = store.transaction((tx) => createTaskAggregate(tx, parsed.title, {
-    projectBindings: parsed.projectBindings
+    projectBindings: parsed.projectBindings,
+    ...(parsed.requireIntegration ? { requireIntegration: true } : {})
   }, now));
   notifyMailbox(options.runtime, taskMailbox(created.task.id), created.task.id);
   return output(
-    `Created Draft task ${created.task.id}: ${created.task.title}\nAssigned role: ${created.leader.name}\n`,
+    `Created Draft task ${created.task.id}: ${created.task.title}\n`
+      + `Assigned role: ${created.leader.name}\n`
+      + (created.task.requireIntegration
+        ? "Completion: WorkItem, ChangeSet, and committed Integration required\n"
+        : "Completion: delivery integration not required\n"),
     { task: created.task, leader: created.leader }
   );
 }
@@ -369,13 +405,18 @@ function createTaskCommand(
 function parseTaskCreation(
   args: string[],
   store: TaskWorkflowStore
-): Readonly<{ title: string; projectBindings: readonly TaskProjectBinding[] }> {
-  const usage = "Task create usage: yui task create <title> [--project <project> ...] [--base <project>=<ref> ...].";
+): Readonly<{
+  title: string;
+  projectBindings: readonly TaskProjectBinding[];
+  requireIntegration: boolean;
+}> {
+  const usage = "Task create usage: yui task create <title> [--project <project> ...] [--base <project>=<ref> ...] [--require-integration].";
   const parsed = parseMultiValueTail(
     args,
     new Set(),
     new Set(["--project", "--base"]),
-    usage
+    usage,
+    new Set(["--require-integration"])
   );
   exactPositionals(parsed.positionals, 1, usage);
   const projectReferences = parsed.multiOptions.get("--project") ?? [];
@@ -414,7 +455,8 @@ function parseTaskCreation(
       projectId: project.id,
       directory: project.name,
       baseRef: bases.get(project.id) ?? project.developmentBranch
-    }))
+    })),
+    requireIntegration: parsed.options.has("--require-integration")
   };
 }
 
@@ -490,6 +532,7 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     ...(task.priority === undefined ? [] : [`Priority: ${task.priority}`]),
     ...(task.tags === undefined ? [] : [`Tags: ${task.tags.join(", ")}`]),
     ...(task.dueAt === undefined ? [] : [`Due: ${presentTime(task.dueAt, timeZone)}`]),
+    `Completion evidence: ${task.requireIntegration === true ? "required" : "not required"}`,
     ...(task.completedAt === undefined ? [] : [`Completed: ${presentTime(task.completedAt, timeZone)}`]),
     ...(task.completedBy === undefined ? [] : [`Completed by: ${task.completedBy}`]),
     ...(task.completionSummary === undefined ? [] : [`Completion summary: ${task.completionSummary}`]),
@@ -558,10 +601,15 @@ function completeTaskCommand(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task complete usage: yui task complete <id> --summary <text>.";
-  const parsed = parseTail(args, new Set(["--summary"]), usage);
+  const usage = "Task complete usage: yui task complete <id> (--summary <text>|--summary-file <path|->).";
+  const parsed = parseTail(args, new Set(["--summary", "--summary-file"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
-  const summary = requiredOption(parsed.options, "--summary");
+  const summary = readCommandText(
+    parsed.options.get("--summary"),
+    parsed.options.get("--summary-file"),
+    "--summary",
+    usage
+  );
   const now = clock(options);
   const result = store.transaction((tx) => {
     const task = requireTask(tx, parsed.positionals[0]);
@@ -577,6 +625,17 @@ function completeTaskCommand(
     ));
     if (incompleteWork !== undefined) {
       throw usageError(`Task ${task.id} has unaccepted work: ${incompleteWork.id}/${incompleteWork.status}.`);
+    }
+    if (task.requireIntegration) {
+      if (tx.listWorkItems(task.id).length === 0) {
+        throw usageError(`Task ${task.id} requires at least one WorkItem before completion.`);
+      }
+      if (tx.listChangeSets(task.id).length === 0) {
+        throw usageError(`Task ${task.id} requires at least one ChangeSet before completion.`);
+      }
+      if (!tx.listIntegrationAttempts(task.id).some(({ status }) => status === "committed")) {
+        throw usageError(`Task ${task.id} requires a committed Integration Attempt before completion.`);
+      }
     }
     const unresolvedIntegration = tx.listIntegrationAttempts(task.id).find((integration) => (
       integration.status === "running"
@@ -806,12 +865,20 @@ function taskMessageCommand(
 ): string {
   const [command, ...rest] = args;
   if (command === "send") {
-    exactPositionals(rest, 2, "Task message send usage: yui task message send <id> <body>.");
+    const usage = "Task message send usage: yui task message send <id> (<body>|--body-file <path|->).";
+    const parsed = parseTail(rest, new Set(["--body-file"]), usage);
+    if (parsed.positionals.length < 1 || parsed.positionals.length > 2) throw usageError(usage);
+    const body = readCommandText(
+      parsed.positionals[1],
+      parsed.options.get("--body-file"),
+      "--body",
+      usage
+    );
     const now = clock(options);
     const result = store.transaction((tx) => {
-      const task = requireTask(tx, rest[0]);
+      const task = requireTask(tx, parsed.positionals[0]);
       assertTaskOpen(task);
-      const message = appendMessage(tx, task.id, rest[1], "user", { type: "user" }, now);
+      const message = appendMessage(tx, task.id, body, "user", { type: "user" }, now);
       if (task.status === "active") {
         enqueueWork(tx, leaderMailbox(task.id), "user-message", now, [messageRef(message.id)]);
       }
@@ -891,7 +958,7 @@ function addTaskRole(
     throw usageError("--agent is required.", usage);
   }
   const now = clock(options);
-  const role = store.transaction((tx) => {
+  const result = store.transaction((tx) => {
     const task = requireTask(tx, taskId);
     assertTaskOpen(task);
     assertRoleRuntimeMutationAllowed(tx, {
@@ -924,10 +991,25 @@ function addTaskRole(
     validateConfiguredRoleSkills(options.yuiHome, created.skills ?? []);
     tx.saveRole(task.id, created);
     enqueueWork(tx, taskMailbox(task.id), "role-added", now, [taskRef(task.id)]);
-    return created;
+    const binding = created.agentBindings[created.activeAgentId];
+    recordTaskEvent(tx, task.id, "role.added", {
+      role: created.name,
+      runtimeSource: agentId === undefined ? "Global Role worker" : `Explicit Agent ${agentId}`,
+      agent: `${created.activeAgentId}/${binding.adapterId}`,
+      model: binding.config.model ?? "CLI default",
+      effort: binding.config.effort ?? "CLI default",
+      yolo: binding.config.yolo === true ? "enabled" : "disabled"
+    }, now);
+    return { role: created, binding };
   });
-  notifyMailbox(options.runtime, taskMailbox(role.taskId), role.taskId);
-  return `Added role ${role.name} to ${role.taskId} (Agent: ${role.activeAgentId})\n`;
+  notifyMailbox(options.runtime, taskMailbox(result.role.taskId), result.role.taskId);
+  return [
+    `Added role ${result.role.name} to ${result.role.taskId}`,
+    `Runtime source: ${agentId === undefined ? "Global Role worker" : `Explicit Agent ${agentId}`}`,
+    `Agent: ${result.role.activeAgentId}/${result.binding.adapterId}`,
+    `Model: ${result.binding.config.model ?? "CLI default"}; effort: ${result.binding.config.effort ?? "CLI default"}; YOLO: ${result.binding.config.yolo === true ? "enabled" : "disabled"}`,
+    "Next: create a WorkItem and start this Role when it has assigned work."
+  ].join("\n").concat("\n");
 }
 
 function listTaskRoles(
@@ -1837,10 +1919,15 @@ function yieldRun(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task run yield usage: yui task run yield <run> --summary <text>.";
-  const parsed = parseTail(args, new Set(["--summary"]), usage);
+  const usage = "Task run yield usage: yui task run yield <run> (--summary <text>|--summary-file <path|->).";
+  const parsed = parseTail(args, new Set(["--summary", "--summary-file"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
-  const summary = requiredOption(parsed.options, "--summary");
+  const summary = readCommandText(
+    parsed.options.get("--summary"),
+    parsed.options.get("--summary-file"),
+    "--summary",
+    usage
+  );
   const now = clock(options);
   const yielded = store.transaction((tx) => {
     const active = requireRun(tx, parsed.positionals[0]);
@@ -1915,10 +2002,14 @@ function createTaskRole(
 ): Role {
   const workspace = task.cwd ?? store.getConfig().defaultWorkspace ?? process.cwd();
   if (explicitAgentId === undefined) {
-    const globalRole = store.getGlobalRole(roleName);
+    const sourceRoleName = roleName === LEADER_ROLE ? LEADER_ROLE : "worker";
+    const globalRole = store.getGlobalRole(sourceRoleName);
     if (globalRole !== null) {
       const copied = copyGlobalRoleToTaskRole(globalRole, task.id, now, roleName);
       return copied.workspace === workspace ? copied : updateRole(copied, { workspace }, now);
+    }
+    if (roleName !== LEADER_ROLE) {
+      throw dataError(`Global Role ${sourceRoleName} is not configured for Task role: ${roleName}.`);
     }
   }
   const agentId = explicitAgentId?.trim() || store.getConfig().defaultAgent;
@@ -2491,7 +2582,8 @@ function parseMultiValueTail(
   args: string[],
   valueOptions: ReadonlySet<string>,
   repeatOptions: ReadonlySet<string>,
-  usage: string
+  usage: string,
+  flagOptions: ReadonlySet<string> = new Set()
 ): ParsedMultiTail {
   const positionals: string[] = [];
   const options = new Map<string, string>();
@@ -2502,8 +2594,13 @@ function parseMultiValueTail(
       positionals.push(value);
       continue;
     }
-    if (!valueOptions.has(value) && !repeatOptions.has(value)) {
+    if (!valueOptions.has(value) && !repeatOptions.has(value) && !flagOptions.has(value)) {
       throw usageError(`Unsupported option: ${value}.`, usage);
+    }
+    if (flagOptions.has(value)) {
+      if (options.has(value)) throw usageError(`Option may only be specified once: ${value}.`, usage);
+      options.set(value, "");
+      continue;
     }
     if (repeatOptions.has(value)) {
       const optionValue = args[index + 1];

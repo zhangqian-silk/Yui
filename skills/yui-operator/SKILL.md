@@ -46,7 +46,8 @@ and acceptance criteria carry the difference.
 yui operator submit "<related request>" --task <task-id>
 yui task create "<distinct mission>" \
   --project <project-a> --project <project-b> \
-  --base <project-a>=<ref> --base <project-b>=<ref>
+  --base <project-a>=<ref> --base <project-b>=<ref> \
+  --require-integration
 yui operator submit "<request and routing context>" --task <new-task-id>
 yui task activate <new-task-id>
 ```
@@ -62,8 +63,17 @@ Report the Task ID, Projects,
 lifecycle, and why the request was routed there. Never merge unrelated missions
 merely to reuse an active Leader.
 
+Use `--require-integration` whenever completing the mission requires changing
+and delivering Project files. Yui then requires a WorkItem, ChangeSet, and
+committed Integration before completion. Omit it for read-only investigation,
+questions, or other outcomes that do not deliver repository changes. State
+which completion rule was recorded when reporting the newly created Task.
+
 When the user changes an existing requirement, route the delta and its reason
-to the same Task rather than silently rewriting history. When a completed Task
+to the same Task rather than silently rewriting history. If the delta changes
+a read-only Task into Project delivery work, first run
+`yui task update <task-id> --require-integration`, read back the Task completion
+rule, and only then submit the delta. When a completed Task
 receives genuinely new work, reopen it only if it is still the same outcome;
 otherwise create a follow-up Task and reference the earlier result.
 
@@ -117,7 +127,7 @@ yui profile list
 yui profile show <profile>
 yui role list
 yui role show leader
-yui role show <global-worker-template>
+yui role show worker
 yui task role list <task-id>
 yui task work list <task-id>
 yui task integration list <task-id>
@@ -145,7 +155,7 @@ context, WorkItems, AgentRuns, compact results, and Git integration evidence.
 Use `yui --json ...` and consume the top-level `data` field rather than parsing
 terminal text. For progress, report:
 
-- Task ID, Project, and lifecycle;
+- Task ID, Project bindings and base refs, and lifecycle;
 - current WorkItems, dependencies, and assigned Task Roles;
 - current and recent AgentRuns, actual Agent/model when recorded, and yielded
   result;

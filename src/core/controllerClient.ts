@@ -5,7 +5,6 @@ import { join } from "node:path";
 
 import {
   CONTROLLER_DISCOVERY_PATH,
-  CONTROLLER_SOCKET_PATH,
   MAX_CONTROLLER_MESSAGE_BYTES,
   ControllerProtocolError,
   encodeControllerRequest,
@@ -14,6 +13,7 @@ import {
   type ControllerDiscovery,
   type JsonValue
 } from "./protocol.js";
+import { controllerSocketPath } from "./controllerEndpoint.js";
 
 export class ControllerClientError extends Error {
   constructor(readonly code: string, message: string) {
@@ -29,7 +29,7 @@ export type ControllerCallOptions = Readonly<{
 
 export async function readControllerDiscovery(home: string): Promise<ControllerDiscovery> {
   const discoveryPath = join(home, CONTROLLER_DISCOVERY_PATH);
-  const expectedSocketPath = join(home, CONTROLLER_SOCKET_PATH);
+  const expectedSocketPath = controllerSocketPath(home);
   try {
     const metadata = await lstat(discoveryPath);
     if (

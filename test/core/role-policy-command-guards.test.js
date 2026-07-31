@@ -23,6 +23,10 @@ import {
   runtimeLifecycleTarget
 } from "../../dist/runtime/lifecycleReservation.js";
 import { createAgentRun } from "../../dist/run/agentRun.js";
+import {
+  createGlobalRole,
+  createRoleAgentBinding
+} from "../../dist/role/role.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 
@@ -43,6 +47,13 @@ function fixture(t) {
     });
     tx.saveConfiguredAgent(codex);
     tx.saveConfiguredAgent(claude);
+    tx.saveGlobalRole(createGlobalRole(
+      "worker",
+      [createRoleAgentBinding(codex)],
+      codex.id,
+      root,
+      NOW
+    ));
   });
   const options = { now: () => new Date(NOW), yuiHome: root };
   return { root, store, options };

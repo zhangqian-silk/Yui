@@ -73,10 +73,13 @@ late results until explicitly reopened.
 
 ## Project workspaces and integration
 
-Stable Project checkouts are read-only references. A Task binds zero or more
-Projects and owns one workspace root containing a managed main worktree for
-each binding. The Leader runs from this root and sees every Project as a
-peer directory.
+Stable Project checkouts are read-only references. Task identity follows one
+bounded outcome rather than Project count. A Task binds zero or more Projects,
+records an independent base ref for each binding, and owns one workspace root
+containing a managed main worktree for each binding. The Leader runs from this
+root and sees every Project as a peer directory. The active Leader may append a
+Project when the same outcome expands; replacing an existing binding is not a
+scope-repair mechanism.
 
 A WorkItem can read the full Task workspace but has an explicit Project write
 scope. Isolation creates a second root with independent worktrees for writable

@@ -634,7 +634,7 @@ test("shell completion starts Yui only for entity-backed dynamic candidates", (t
   });
   assert.equal(bash.status, 0, bash.stderr);
   assert.match(bash.stdout, /^static=.*show/m);
-  assert.match(bash.stdout, /^static-option=--summary$/m);
+  assert.match(bash.stdout, /^static-option=--summary --summary-file$/m);
   assert.match(bash.stdout, /^trailing-option=--reason$/m);
   assert.match(bash.stdout, /^dynamic=task-alpha$/m);
   assert.match(bash.stdout, /^dynamic-option=task-alpha$/m);

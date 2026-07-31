@@ -7,7 +7,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -16,6 +16,7 @@ import {
 import {
   scanControllerResourceInventory
 } from "../../dist/controller/resourceInventoryLinux.js";
+import { controllerSocketPath } from "../../dist/core/controllerEndpoint.js";
 
 function processResource(overrides = {}) {
   const uid = typeof process.getuid === "function" ? process.getuid() : 0;
@@ -216,9 +217,9 @@ test("pane cleanup delegates only after the command layer revalidated the exact 
 
 test("Linux scanner and cleanup remove an exact inactive Controller socket artifact", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-controller-cleanup-"));
-  const runtime = join(home, "runtime");
-  const socket = join(runtime, "controller.sock");
-  mkdirSync(runtime);
+  const socket = controllerSocketPath(home);
+  mkdirSync(join(home, "runtime"));
+  mkdirSync(dirname(socket), { recursive: true });
   writeFileSync(socket, "");
   t.after(() => rmSync(home, { recursive: true, force: true }));
 
@@ -232,6 +233,25 @@ test("Linux scanner and cleanup remove an exact inactive Controller socket artif
   assert.ok(artifact);
   assert.equal(artifact.disposition, "safe");
 
+  await cleanControllerResource(artifact);
+  assert.equal(existsSync(socket), false);
+});
+
+test("Controller socket identity survives deletion of YUI_HOME", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-controller-deleted-home-"));
+  const socket = controllerSocketPath(home);
+  mkdirSync(dirname(socket), { recursive: true });
+  writeFileSync(socket, "");
+  rmSync(home, { recursive: true, force: true });
+  t.after(() => rmSync(socket, { force: true }));
+
+  assert.equal(controllerSocketPath(home), socket);
+  const snapshot = await scanControllerResourceInventory({
+    currentHome: home,
+    scope: "current"
+  });
+  const artifact = snapshot.resources.find((resource) => resource.artifact?.path === socket);
+  assert.ok(artifact);
   await cleanControllerResource(artifact);
   assert.equal(existsSync(socket), false);
 });

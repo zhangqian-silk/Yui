@@ -5,6 +5,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
 import { TmuxManager } from "../tmux/tmuxManager.js";
 import type { RuntimeResource } from "./resourceInventory.js";
+import { controllerSocketPath } from "../core/controllerEndpoint.js";
 
 const DEFAULT_TERM_GRACE_MS = 1_000;
 const DEFAULT_KILL_GRACE_MS = 1_000;
@@ -250,6 +251,13 @@ function assertOwnedArtifactPath(resource: RuntimeResource): void {
     return;
   }
   const home = resource.yuiHome;
+  if (
+    home !== undefined
+    && artifact.artifactKind === "controller-socket"
+    && path === controllerSocketPath(home)
+  ) {
+    return;
+  }
   if (
     home === undefined
     || dirname(path) !== join(resolve(home), "runtime")

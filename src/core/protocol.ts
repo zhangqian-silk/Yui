@@ -1,6 +1,5 @@
 export const MAX_CONTROLLER_MESSAGE_BYTES = 1_048_576;
 export const CONTROLLER_DISCOVERY_PATH = "runtime/controller.json";
-export const CONTROLLER_SOCKET_PATH = "runtime/controller.sock";
 /** Bump when a running Controller cannot safely share one YUI_HOME with this CLI. */
 export const FILE_TASK_CONTROLLER_PROTOCOL_VERSION = 2;
 

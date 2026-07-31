@@ -210,9 +210,10 @@ into the Role; later Profile edits do not overwrite Role customization. Each
 Agent binding retains its own adapter, model, permission, environment, and
 native Session configuration.
 
-When a same-named global Role exists, add the Task Role without `--agent` so
-Yui copies that Role's complete bindings. This is the preferred path. Before
-dispatch, inspect `task role show`; if Agent, model, effort, or permission
+Add a non-Leader Task Role without `--agent` so Yui copies the configured global
+Worker Role's complete bindings, regardless of the Task Role name. The Profile
+still defines portable behavior; Worker defines runtime Agent configuration.
+Before dispatch, inspect `task role show`; if Agent, model, effort, or permission
 settings are missing or inconsistent, do not dispatch or guess them.
 
 Do not reconstruct Agent/model/effort or YOLO settings during execution. If no

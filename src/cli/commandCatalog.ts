@@ -232,8 +232,8 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "create",
     summary: "Create a Draft Task.",
-    usage: "yui task create <title> [--project <project> ...] [--base <project>=<ref> ...]",
-    options: ["--project", "--base"]
+    usage: "yui task create <title> [--project <project> ...] [--base <project>=<ref> ...] [--require-integration]",
+    options: ["--project", "--base", "--require-integration"]
   },
   {
     name: "project",
@@ -256,10 +256,11 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "update",
     summary: "Update Task metadata.",
-    usage: "yui task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at]",
+    usage: "yui task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at] [--require-integration]",
     options: [
       "--title", "--description", "--priority", "--tags", "--due-at",
-      "--clear-description", "--clear-priority", "--clear-tags", "--clear-due-at"
+      "--clear-description", "--clear-priority", "--clear-tags", "--clear-due-at",
+      "--require-integration"
     ],
     optionValues: { "--priority": ["low", "medium", "high", "urgent"] }
   },
@@ -267,8 +268,9 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "complete",
     summary: "Complete an active Task and stop automatic wakeups.",
-    usage: "yui task complete <id> --summary <text>",
-    options: ["--summary"]
+    usage: "yui task complete <id> (--summary <text>|--summary-file <path|->)",
+    options: ["--summary", "--summary-file"],
+    fileOptions: ["--summary-file"]
   },
   { name: "reopen", summary: "Reopen a completed Task.", usage: "yui task reopen <id>" },
   { name: "list", summary: "List Tasks." },
@@ -290,7 +292,13 @@ const taskChildren: readonly NodeInput[] = [
     summary: "Manage durable Task messages.",
     sections: [{ id: "manage", title: "Commands", entries: ["send", "list"] }],
     children: [
-      { name: "send", summary: "Send a Task message.", usage: "yui task message send <id> <body>" },
+      {
+        name: "send",
+        summary: "Send a Task message.",
+        usage: "yui task message send <id> (<body>|--body-file <path|->)",
+        options: ["--body-file"],
+        fileOptions: ["--body-file"]
+      },
       { name: "list", summary: "List Task messages.", usage: "yui task message list <id>" }
     ]
   },
@@ -452,8 +460,9 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "yield",
         summary: "Complete an active Run and wake the Leader.",
-        usage: "yui task run yield <run> --summary <text>",
-        options: ["--summary"]
+        usage: "yui task run yield <run> (--summary <text>|--summary-file <path|->)",
+        options: ["--summary", "--summary-file"],
+        fileOptions: ["--summary-file"]
       }
     ]
   },
@@ -669,8 +678,9 @@ export const ROOT_COMMAND = buildNode({
         {
           name: "submit",
           summary: "Submit work through the Operator.",
-          usage: "yui operator submit <body> [--task <id>]",
-          options: ["--task"]
+          usage: "yui operator submit (<body>|--body-file <path|->) [--task <id>]",
+          options: ["--task", "--body-file"],
+          fileOptions: ["--body-file"]
         }
       ]
     },

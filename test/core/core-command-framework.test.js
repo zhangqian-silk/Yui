@@ -191,6 +191,26 @@ test("nested help resolves and renders only the requested command group", () => 
   assert.doesNotMatch(output, /task work|session-notify|internal/);
 });
 
+test("help describes every supported file-input and integration-evidence option", () => {
+  const expected = [
+    [["yui", "task", "create"], "--require-integration"],
+    [["yui", "task", "update"], "--require-integration"],
+    [["yui", "task", "complete"], "--summary-file"],
+    [["yui", "task", "message", "send"], "--body-file"],
+    [["yui", "task", "run", "yield"], "--summary-file"],
+    [["yui", "operator", "submit"], "--body-file"]
+  ];
+  for (const [path, option] of expected) {
+    const node = path.slice(1).reduce(
+      (current, name) => current?.children.find((child) => child.name === name),
+      ROOT_COMMAND
+    );
+    assert.ok(node, path.join(" "));
+    assert.ok(node.options.includes(option), `${path.join(" ")} must expose ${option}`);
+    assert.match(renderCommandHelp(node, "0.2.0"), new RegExp(option));
+  }
+});
+
 test("the invocation router selects an executable without parsing business params", () => {
   const invocation = routeInvocation([
     "task",

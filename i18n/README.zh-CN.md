@@ -45,10 +45,17 @@ yui setup
 yui doctor
 ```
 
-`setup` 是交互式的：检测已安装的 Agent CLI、选择要配置的 Agent、默认 Agent 和 Operator Agent，实时探测所选 CLI 当前支持的模型，再按“模型 → 该模型支持的思考强度”分别配置 Leader/Operator Role；随后确认位于 Yui home 外部的 Project workspace，并询问 shell completion。选择器同时提供原生 CLI 默认值和自定义值入口。再次运行不会删除已有 Task/Role，也不会改变当前安装的 Project workspace，可用于安全地调整配置。
+`setup` 是交互式的：检测已安装的 Agent CLI，选择要配置的 Agent、默认
+Agent 和 Operator Agent，并实时探测所选 CLI 当前支持的模型。它先配置
+Leader 和 Operator，再说明全局 Worker 配置会复制到新建的 Task Role，
+让用户选择 Worker 复用 Leader 配置还是单独配置。模型选择后只展示该模型
+支持的思考强度。随后 setup 会确认位于 Yui home 外部的 Project workspace，
+并询问 shell completion。选择器同时提供原生 CLI 默认值和自定义值入口。
+再次运行不会删除已有 Task/Role，也不会改变当前安装的 Project workspace，
+可用于安全地调整配置。
 
-模型与思考强度属于 Agent binding 设置，因此 Leader、Operator 和 Task
-Role 即使使用同一个 Agent CLI，也可以采用不同配置。Profile 中的
+模型与思考强度属于 Agent binding 设置，因此 Operator、Leader 和全局
+Worker 即使使用同一个 Agent CLI，也可以采用不同配置。Profile 中的
 model/effort 只是 native child 的可移植 hint。
 
 运行时能力目录会在每次命令中刷新，并缓存在 Yui home。实时探测超时或失败时，Yui 会展示同一 Agent 启动上下文最近一次成功的缓存并明确提示数据可能过期；没有匹配缓存时，则提供 CLI 默认值和自定义入口。`yui agent capabilities <id>` 可一次性读取同一份目录，包括模型、逐模型思考强度，以及权限、搜索可用性、profile、settings source、service tier 等其他运行时选项。
@@ -97,7 +104,61 @@ yui config set --time-zone Europe/London
 
 查看已有 Task 的详细状态时，优先使用 `task context`。它一次聚合 Task、Brief、Active Decision、最近的 Milestone、Role、当前及最近的 WorkItem 与关联 Run、最近的 Message、Open/Resolved InputRequest 和 Event。终端输出会精简历史和长文本；`yui --json task context <task-id>` 会在顶层 `data` 中返回完整记录。
 
-带 Project 的新 Task 会立即在 `<workspace>/worktree/<project>/<task-id>/main` 创建主 worktree。所有 Role 默认共享 Task main；任务运行中，Leader 根据并发写入冲突风险直接执行 `yui task work isolate <work-item-id>` 创建 WorkItem 所有的隔离 worktree，无需审批。清理时必须明确标记为 `--integrated` 或 `--abandon`，结果保留在 WorkItem 记录中；dirty worktree 原地保留。
+Task identity 由一个有界交付目标决定，而不是由涉及几个仓库决定。带仓库的
+Task 可以绑定多个 Project，并为每个 Project 记录独立 base ref。Leader 从
+同一个 Task workspace 根目录工作：
+
+```text
+<workspace>/tasks/<task-id>/main/
+├── backend/
+├── frontend/
+└── shared-sdk/
+```
+
+每个目录背后都是该 Project 独立的受管 Git worktree。创建时应一次绑定已知
+Project；如果同一目标在执行中确认还需要另一个仓库，只能由 active Task 的
+Leader 追加：
+
+```sh
+yui task create "升级认证协议" \
+  --project backend --project frontend \
+  --base backend=develop --base frontend=main
+yui task project add <task-id> shared-sdk --base main
+```
+
+实现型 WorkItem 必须声明允许修改的 Project。它保留与 Task main 一致的
+相对目录布局，只为写入范围创建隔离 worktree，其他 Task Project 作为上下文
+从 Task main 暴露。混合读写 workspace 在 Linux 上通过 `bubblewrap`
+（`bwrap`）启动，把上下文 Project 独立挂载为只读；派发此类 WorkItem 前
+必须安装 `bubblewrap`。
+
+写入范围只能扩大，不能缩小。Worker yield 并报告还需要另一个仓库后，
+Leader 使用完整的“旧范围 + 新范围”更新并重新派发：
+
+```sh
+yui task work create <task-id> "升级协议与客户端" \
+  --project backend --project frontend --role implementer
+yui task work scope <work-item-id> \
+  --project backend --project frontend --project shared-sdk
+yui task work isolate <work-item-id>
+yui task work reject <work-item-id> \
+  --summary "已扩大写入范围，请在刷新后的 workspace 继续。"
+yui task work dispatch <work-item-id>
+yui task work capture <work-item-id>
+yui task integration start <task-id> --project backend \
+  --change-set <backend-change-set-id> --check "<validation command>"
+yui task integration cleanup <integration-id>
+yui task work cleanup <work-item-id> --integrated
+```
+
+`capture` 为每个实际修改的 Project 记录一个不可变 ChangeSet；同一 HEAD
+重复 capture 会复用记录，修复后的新 HEAD 会产生新候选。Integration 保持
+单 Project Git 事务，所以 Leader 分别集成每个 Project。只有所有已修改
+Project 的最新候选都完成集成，WorkItem 才能验收；仍有未集成结果时不能执行
+`--integrated` 清理。`--abandon` 只用于明确放弃，dirty worktree 会原地保留。
+原生 Agent Session 可能绑定启动目录，因此 Role 在 Task main 与隔离
+WorkItem workspace 之间移动时，Yui 会退役已停止的旧 Session；下一次派发
+在新目录创建 Session，持久 Yui 记录继续提供上下文。
 
 通过 Operator 提交消息：
 
@@ -112,9 +173,9 @@ yui operator enter
 ```
 
 不带 `--task` 时会创建新 Draft。Draft 可以继续规划，但激活前不会执行 Agent 工作。
-Operator 会结合 Project Catalog 和现有 Task context 路由请求。同一目标
-的追加需求、修复、审查和咨询继续进入原 Task；Project、目标、base ref
-或生命周期不同则创建独立 Task。需求、Bug 和咨询共用同一
+Operator 会结合 Project Catalog 和现有 Task context 路由请求。同一有界
+目标的追加需求、修复、审查和咨询继续进入原 Task，即使它涉及多个 Project。
+目标、所有权边界或生命周期独立时才创建新 Task。需求、Bug 和咨询共用同一
 Task/WorkItem 模型，不增加额外任务类型。
 `operator list` 按固定的最近更新时间倒序展示历史对话，并显示 Agent
 及可读的标题或摘要；底层 provider session ID 始终保持内部实现细节。
@@ -123,24 +184,27 @@ Task/WorkItem 模型，不增加额外任务类型。
 `--last` 可直接恢复最近一条；
 `operator new` 创建空白对话，并把原对话保留在历史中。
 
-添加 Task Role Worker，绑定 Claude 配置并派发 WorkItem：
+从已配置的全局 Worker 创建 Task Role，应用 Profile 并派发 WorkItem：
 
 ```sh
-yui task role add <task-id> implementer --profile implementer --agent codex
-yui task role update <task-id> implementer \
-  --agent claude --model claude-opus --effort high --yolo true
-yui task role bind <task-id> implementer claude
-yui task role list <task-id>
+yui role show worker
+yui task role add <task-id> implementer --profile implementer
+yui task role show <task-id> implementer
 
-yui task work create <task-id> "实现导出器" --role implementer
+yui task work create <task-id> "实现导出器" \
+  --project app --role implementer
+yui task work isolate <work-item-id>
 yui task work dispatch <work-item-id> --input "完成实现并运行聚焦测试"
 ```
 
 `--yolo true` 是 Role 的一等配置。Yui 会分别为 Codex 编译
 `--dangerously-bypass-approvals-and-sandbox`，为 Claude 编译
 `--dangerously-skip-permissions`；`--clear-yolo` 会恢复已保存的权限设置或
-CLI 默认值。创建 Task Role 时不传 `--agent`，会复制同名全局 Role 的完整
-Agent bindings，Leader 无需重新拼接 model、effort 和权限。
+CLI 默认值。任意非 Leader Task Role 在创建时不传 `--agent`，都会复制全局
+Worker Role 的完整 Agent bindings，Leader 无需重新拼接 model、effort 和
+权限。创建回执和 `task context` 会记录配置来源及生效的
+Agent/model/effort/YOLO。显式 `--agent` 属于 Task 专用覆盖，必须在派发前
+补全并回读配置。
 
 Worker 显式交付当前 Run：
 

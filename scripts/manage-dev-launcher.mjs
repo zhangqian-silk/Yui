@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   lstatSync,
@@ -15,7 +15,7 @@ import {
   symlinkSync,
   writeFileSync
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createConnection } from "node:net";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -29,7 +29,6 @@ const legacyGlobalStateName = ".yui-link-state.json";
 const registrySchemaVersion = 3;
 const recoverySchemaVersion = 1;
 const controllerDiscoveryName = "controller.json";
-const controllerSocketName = "controller.sock";
 const controllerProbeTimeoutMs = 500;
 
 export function installDevLauncher(options = {}) {
@@ -293,7 +292,7 @@ export async function resetDevHome(options = {}) {
   try {
     if (!pathExists(homePath)) return { homePath, backupPath: null, moved: false };
     const discoveryPath = join(homePath, "runtime", controllerDiscoveryName);
-    const socketPath = join(homePath, "runtime", controllerSocketName);
+    const socketPath = controllerSocketPath(homePath);
     if (pathExists(discoveryPath)) {
       const discovery = readControllerDiscoveryForReset(homePath, discoveryPath);
       const probe = await probeController(discovery);
@@ -562,7 +561,7 @@ function readControllerDiscoveryForReset(homePath, discoveryPath) {
       throw new Error("invalid metadata");
     }
     const discovery = JSON.parse(readFileSync(discoveryPath, "utf8"));
-    const expectedSocketPath = join(homePath, "runtime", controllerSocketName);
+    const expectedSocketPath = controllerSocketPath(homePath);
     if (
       typeof discovery !== "object" || discovery === null
       || Reflect.ownKeys(discovery).length !== 4
@@ -583,6 +582,15 @@ function readControllerDiscoveryForReset(homePath, discoveryPath) {
   } catch (error) {
     throw cannotVerifyController(discoveryPath, error);
   }
+}
+
+function controllerSocketPath(homePath) {
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const identity = createHash("sha256")
+    .update(resolve(homePath))
+    .digest("hex")
+    .slice(0, 24);
+  return join(tmpdir(), `yui-${uid}`, `${identity}.sock`);
 }
 
 function cannotVerifyController(discoveryPath, cause) {

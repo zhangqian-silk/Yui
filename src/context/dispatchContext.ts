@@ -49,10 +49,13 @@ const WORKER_RUN_COMPLETION_MARKER = "Yui Role Run completion requirement:";
 const WORKER_RUN_COMPLETION_REQUIREMENT = [
   WORKER_RUN_COMPLETION_MARKER,
   "Before ending, read the exact current Run ID from the managed first line and execute "
-    + "`yui task run yield <current-run-id> --summary \"<outcome and evidence>\"`, "
+    + "`yui task run yield <current-run-id> --summary-file - <<'YUI_SUMMARY'` "
+    + "followed by the outcome, evidence, and a closing `YUI_SUMMARY` line, "
     + "replacing the placeholder with that ID.",
   "Yielding closes the Run and hands the WorkItem to the Leader for acceptance; "
-    + "a final response alone does neither."
+    + "a final response alone does neither.",
+  "The yield command must be your final tool action. After it succeeds, stop immediately: "
+    + "do not inspect, poll, accept, or perform any further work in the same native turn."
 ].join("\n");
 
 export function ensureWorkerRunCompletionRequirement(input: string): string {
@@ -66,10 +69,12 @@ function renderDispatchContext(
   context: BuildRoleContextInput
 ): string {
   const profile = context.role;
+  const binding = profile.agentBindings[profile.activeAgentId];
   const profileLines = [
     `Task: ${context.taskId}`,
     `Role: ${profile.name}`,
     `Active Agent: ${profile.activeAgentId}`,
+    `Runtime: ${binding.adapterId}; model: ${binding.config.model ?? "CLI default"}; effort: ${binding.config.effort ?? "CLI default"}; YOLO: ${binding.config.yolo === true ? "enabled" : "disabled"}`,
     profile.description === undefined ? null : `Description: ${profile.description}`,
     ...(profile.responsibilities ?? []).map((item) => `Responsibility: ${item}`),
     ...(profile.constraints ?? []).map((item) => `Constraint: ${item}`),
