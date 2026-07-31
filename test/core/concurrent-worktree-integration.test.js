@@ -17,6 +17,7 @@ import { runTaskIntegrationCommand } from "../../dist/commands/taskIntegrationCo
 import { createIntegrationAttempt } from "../../dist/integration/integrationAttempt.js";
 import { GitIntegrationService } from "../../dist/integration/gitIntegrationService.js";
 import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
+import { createAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
 import { createProject } from "../../dist/repository/project.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
@@ -24,6 +25,7 @@ import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import {
   createWorkItem,
+  submitWorkItemCandidate,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { WorkItemChangeSetManager } from "../../dist/workspace/workItemChangeSetManager.js";
@@ -382,10 +384,7 @@ test("ChangeSet capture rejects a branch escape and a HEAD unrelated to the reco
   const branchEntry = branchWorkspace.entries.find(({ access }) => access === "write");
   const branchRunning = updateWorkItemStatus(branchWork, "running", now);
   store.saveWorkItem(task.id, branchRunning);
-  store.saveWorkItem(
-    task.id,
-    updateWorkItemStatus(branchRunning, "awaiting_acceptance", now)
-  );
+  saveAwaitingCandidate(store, branchRunning);
   git(["-C", branchEntry.path, "checkout", "-b", "unexpected-branch"]);
   writeFileSync(join(branchEntry.path, "shared.txt"), "unexpected\n");
   await assert.rejects(
@@ -413,10 +412,7 @@ test("ChangeSet capture rejects a branch escape and a HEAD unrelated to the reco
   const ancestryEntry = ancestryWorkspace.entries.find(({ access }) => access === "write");
   const ancestryRunning = updateWorkItemStatus(ancestryWork, "running", now);
   store.saveWorkItem(task.id, ancestryRunning);
-  store.saveWorkItem(
-    task.id,
-    updateWorkItemStatus(ancestryRunning, "awaiting_acceptance", now)
-  );
+  saveAwaitingCandidate(store, ancestryRunning);
   const tree = git(["-C", ancestryEntry.path, "rev-parse", "HEAD^{tree}"]).trim();
   const unrelatedCommit = git([
     "-C", ancestryEntry.path,
@@ -458,13 +454,27 @@ async function createWriteResult(
   }
   const running = updateWorkItemStatus(workItem, "running", now);
   store.saveWorkItem(workItem.taskId, running);
-  store.saveWorkItem(
-    workItem.taskId,
-    updateWorkItemStatus(running, "awaiting_acceptance", now)
-  );
+  saveAwaitingCandidate(store, running);
   const [changeSet] = await manager.capture(workItem.id);
   assert.notEqual(changeSet, undefined);
   return { workspace, entry, changeSet };
+}
+
+function saveAwaitingCandidate(store, running) {
+  const run = yieldAgentRun(createAgentRun(
+    store.nextAgentRunId(running.taskId),
+    running.taskId,
+    running.assignee ?? "leader",
+    "new",
+    "Prepare candidate.",
+    now,
+    { workItemId: running.id }
+  ), "Candidate ready.", now);
+  store.saveAgentRun(run);
+  store.saveWorkItem(running.taskId, submitWorkItemCandidate(running, {
+    summary: run.summary,
+    source: { type: "run", runId: run.id }
+  }, now));
 }
 
 function git(args) {

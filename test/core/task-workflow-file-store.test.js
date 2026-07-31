@@ -31,13 +31,16 @@ import { createProject } from "../../dist/repository/project.js";
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
-  markTaskRoleRunDelivered
+  markTaskRoleRunDelivered,
+  recordRoleAgentSession
 } from "../../dist/executor/agentExecutor.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
+import { createRoleWorkspace } from "../../dist/worktree/roleWorkspace.js";
 import {
   recordWorkItemWorkspaceDisposition,
+  submitWorkItemCandidate,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 
@@ -120,6 +123,22 @@ function markDelivered(store, run) {
   });
 }
 
+function recordReadyNativeSession(store, taskId, roleName, nativeSessionId) {
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId,
+    roleName
+  }, "codex", NOW);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId,
+    policy: "fixed",
+    status: "ready"
+  }, NOW);
+  store.saveTaskRoleSessionSet(sessions);
+}
+
 test("Work Item rejection and cancellation close the acceptance loop without new states", (t) => {
   const { store, options } = fixture(t);
   const task = createTask(store, options);
@@ -130,7 +149,10 @@ test("Work Item rejection and cancellation close the acceptance loop without new
   store.saveWorkItem(task.id, running);
   store.saveWorkItem(
     task.id,
-    updateWorkItemStatus(running, "awaiting_acceptance", NOW)
+    submitWorkItemCandidate(running, {
+      summary: "Candidate ready.",
+      source: { type: "direct" }
+    }, NOW)
   );
 
   assert.throws(
@@ -599,7 +621,7 @@ test("assigned Work dispatch honors dependencies and Worker yield awaits Leader 
   assert.equal(resultMessage.runId, active.id);
   assert.equal(resultMessage.workItemId, first.id);
   assert.equal(resultMessage.body, "implemented");
-  assert.ok(store.getPendingWakeup(task.id)?.reasons.includes("role-result"));
+  assert.ok(store.getPendingWakeup(task.id)?.reasons.includes("candidate-ready"));
   const leaderMailbox = store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: "leader" });
   assert.ok(leaderMailbox.pending.refs.some((ref) => ref.type === "run" && ref.id === active.id));
   assert.throws(
@@ -626,6 +648,500 @@ test("assigned Work dispatch honors dependencies and Worker yield awaits Leader 
   assert.equal(store.findWorkItem(second.id)?.status, "running");
 });
 
+test("always review creates a ReviewRound under the same WorkItem and never reviews the review", (t) => {
+  const { root, store, options } = fixture(t);
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(tx.getConfiguredAgent("codex"))],
+      "codex",
+      root,
+      NOW
+    ));
+    tx.saveConfig({
+      ...tx.getConfig(),
+      review: { roleName: "reviewer", trigger: "always" }
+    });
+  });
+  const task = createTask(store, options, "Automatic review");
+  assert.deepEqual(store.getReviewConfig(), {
+    roleName: "reviewer",
+    trigger: "always"
+  });
+  run(["activate", task.id], store, options);
+  run(["role", "add", task.id, "worker"], store, options);
+  run(["work", "create", task.id, "candidate", "--role", "worker"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  run(["work", "dispatch", item.id], store, options);
+  const execution = store.getActiveAgentRun(task.id, "worker");
+  assert.equal(execution.purpose, "execution");
+  markDelivered(store, execution);
+  run(["run", "yield", execution.id, "--summary", "candidate ready"], store, options);
+
+  assert.equal(store.listWorkItems(task.id).length, 1);
+  const rounds = store.listReviewRounds(task.id);
+  assert.equal(rounds.length, 1);
+  assert.equal(rounds[0].workItemId, item.id);
+  const candidate = store.getWorkItem(task.id, item.id).candidates.at(-1);
+  assert.equal(rounds[0].candidateId, candidate.id);
+  assert.equal(candidate.workItemRevision, store.getWorkItem(task.id, item.id).revision);
+  assert.equal(candidate.summary, "candidate ready");
+  assert.deepEqual(candidate.source, { type: "run", runId: execution.id });
+  assert.equal(rounds[0].status, "running");
+  const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
+  assert.equal(reviewRun.purpose, "review");
+  assert.equal(reviewRun.reviewRoundId, rounds[0].id);
+  assert.match(reviewRun.input, /Do not modify files or create another WorkItem/);
+  assert.match(reviewRun.input, /candidate summary is a pointer, not proof/i);
+  assert.match(reviewRun.input, /reachable, material, actionable problems/i);
+  assert.match(reviewRun.input, /speculative extreme cases/i);
+  assert.match(reviewRun.input, /the Leader decides/i);
+
+  const leaderOptions = {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+  assert.throws(
+    () => run(["work", "accept", item.id, "--summary", "accept"], store, leaderOptions),
+    /ReviewRound.*running/
+  );
+  assert.throws(
+    () => run(["work", "reject", item.id, "--summary", "reject early"], store, leaderOptions),
+    /ReviewRound is still active/
+  );
+
+  markDelivered(store, reviewRun);
+  run(["run", "yield", reviewRun.id, "--summary", "One issue to consider."], store, options);
+  assert.equal(store.listReviewRounds(task.id).length, 1);
+  assert.equal(store.listWorkItems(task.id).length, 1);
+  assert.deepEqual(store.getReviewRound(task.id, rounds[0].id), {
+    ...rounds[0],
+    reviewerRunId: reviewRun.id,
+    status: "completed",
+    summary: "One issue to consider.",
+    endedAt: NOW.toISOString()
+  });
+  assert.equal(store.findWorkItem(item.id)?.status, "awaiting_acceptance");
+  run(["work", "accept", item.id, "--summary", "Leader considered the review."], store, leaderOptions);
+  assert.equal(store.findWorkItem(item.id)?.status, "completed");
+});
+
+test("global review policy is snapshotted by each candidate, not by Task creation", (t) => {
+  const { root, store, options } = fixture(t);
+  const task = createTask(store, options, "Live global review policy");
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(tx.getConfiguredAgent("codex"))],
+      "codex",
+      root,
+      NOW
+    ));
+    tx.saveConfig({
+      ...tx.getConfig(),
+      review: { roleName: "reviewer", trigger: "always" }
+    });
+  });
+  run(["activate", task.id], store, options);
+  run(["role", "add", task.id, "worker"], store, options);
+  run(["work", "create", task.id, "candidate", "--role", "worker"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  run(["work", "dispatch", item.id], store, options);
+  const firstExecution = store.getActiveAgentRun(task.id, "worker");
+  markDelivered(store, firstExecution);
+  run(["run", "yield", firstExecution.id, "--summary", "first candidate"], store, options);
+
+  const firstCandidate = store.getWorkItem(task.id, item.id).candidates.at(-1);
+  assert.deepEqual(firstCandidate.reviewPolicy, {
+    roleName: "reviewer",
+    trigger: "always"
+  });
+  assert.equal(store.listReviewRounds(task.id).length, 1);
+
+  const { review: _review, ...configWithoutReview } = store.getConfig();
+  store.saveConfig(configWithoutReview);
+  const firstReview = store.getActiveAgentRun(task.id, "reviewer");
+  markDelivered(store, firstReview);
+  run(["run", "yield", firstReview.id, "--summary", "reviewed first candidate"], store, options);
+  const leaderOptions = {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+  recordReadyNativeSession(store, task.id, "worker", "native-worker-policy-snapshot");
+  run(["work", "reject", item.id, "--summary", "repair"], store, leaderOptions);
+  run(["work", "dispatch", item.id, "--input", "repair the candidate"], store, options);
+  const secondExecution = store.getActiveAgentRun(task.id, "worker");
+  markDelivered(store, secondExecution);
+  run(["run", "yield", secondExecution.id, "--summary", "second candidate"], store, options);
+
+  const updated = store.getWorkItem(task.id, item.id);
+  assert.equal(updated.candidates.length, 2);
+  assert.equal(updated.candidates[0].id, firstCandidate.id);
+  assert.equal(updated.candidates[1].reviewPolicy, undefined);
+  assert.equal(store.listReviewRounds(task.id).length, 1);
+  run(["work", "accept", item.id, "--summary", "accepted without a cleared policy"], store, leaderOptions);
+});
+
+test("always review covers a Leader-managed WorkItem without inventing an execution Run", (t) => {
+  const { root, store, options } = fixture(t);
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(tx.getConfiguredAgent("codex"))],
+      "codex",
+      root,
+      NOW
+    ));
+    tx.saveConfig({
+      ...tx.getConfig(),
+      review: { roleName: "reviewer", trigger: "always" }
+    });
+  });
+  const task = createTask(store, options, "Review native subagent work");
+  run(["activate", task.id], store, options);
+  run(["work", "create", task.id, "native candidate"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  const leaderOptions = {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+
+  run(["work", "update", item.id, "running"], store, leaderOptions);
+  const running = store.getWorkItem(task.id, item.id);
+  const foreignWorkspace = createRoleWorkspace({
+    taskId: "foreign-task",
+    roleName: "leader",
+    owner: { type: "task" },
+    root,
+    entries: []
+  }, new Date(NOW));
+  assert.throws(
+    () => store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
+      summary: "Invalid cross-Task candidate.",
+      source: { type: "direct" },
+      reviewPolicy: { roleName: "reviewer", trigger: "leader" },
+      workspace: foreignWorkspace
+    }, NOW)),
+    /workspace belongs to another Task/
+  );
+  run([
+    "work", "update", item.id, "done",
+    "--summary", "Native subagent result is ready."
+  ], store, leaderOptions);
+
+  const awaiting = store.findWorkItem(item.id);
+  assert.equal(awaiting.status, "awaiting_acceptance");
+  assert.deepEqual(store.listAgentRuns(task.id).filter(({ purpose }) => purpose === "execution"), []);
+  const [round] = store.listReviewRounds(task.id);
+  const candidate = awaiting.candidates.at(-1);
+  assert.equal(round.candidateId, candidate.id);
+  assert.equal(candidate.workItemRevision, awaiting.revision);
+  assert.equal(candidate.summary, "Native subagent result is ready.");
+  assert.deepEqual(candidate.source, { type: "direct" });
+  assert.equal(round.status, "running");
+  const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
+  assert.equal(reviewRun.purpose, "review");
+  assert.match(reviewRun.input, /Native subagent result is ready\./);
+});
+
+test("always review covers a yielded Leader execution candidate", (t) => {
+  const { root, store, options } = fixture(t);
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(tx.getConfiguredAgent("codex"))],
+      "codex",
+      root,
+      NOW
+    ));
+    tx.saveConfig({
+      ...tx.getConfig(),
+      review: { roleName: "reviewer", trigger: "always" }
+    });
+  });
+  const task = createTask(store, options, "Review Leader execution");
+  run(["activate", task.id], store, options);
+  run(["work", "create", task.id, "leader candidate"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  const execution = dispatchTestRun(store, task.id, "leader", item.id);
+  markDelivered(store, execution);
+
+  run(["run", "yield", execution.id, "--summary", "Leader candidate ready."], store, options);
+
+  assert.equal(store.findWorkItem(item.id).status, "awaiting_acceptance");
+  const candidate = store.getWorkItem(task.id, item.id).candidates.at(-1);
+  assert.equal(store.listReviewRounds(task.id)[0].candidateId, candidate.id);
+  assert.equal(candidate.summary, "Leader candidate ready.");
+  assert.deepEqual(candidate.source, { type: "run", runId: execution.id });
+  assert.equal(store.getActiveAgentRun(task.id, "reviewer").purpose, "review");
+});
+
+test("review can reuse the candidate Role without leaving its active status idle", (t) => {
+  const { root, store, options } = fixture(t);
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "worker",
+      [createRoleAgentBinding(tx.getConfiguredAgent("codex"))],
+      "codex",
+      root,
+      NOW
+    ));
+    tx.saveConfig({
+      ...tx.getConfig(),
+      review: { roleName: "worker", trigger: "always" }
+    });
+  });
+  const task = createTask(store, options, "Self review lifecycle");
+  run(["activate", task.id], store, options);
+  run(["role", "add", task.id, "worker"], store, options);
+  run(["work", "create", task.id, "candidate", "--role", "worker"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  run(["work", "dispatch", item.id], store, options);
+  const execution = store.getActiveAgentRun(task.id, "worker");
+  markDelivered(store, execution);
+
+  run(["run", "yield", execution.id, "--summary", "candidate ready"], store, options);
+
+  const reviewRun = store.getActiveAgentRun(task.id, "worker");
+  assert.equal(reviewRun.purpose, "review");
+  assert.equal(store.getRole(task.id, "worker").status, "running");
+});
+
+test("a failed ReviewRound remains evidence but does not override Leader judgment", (t) => {
+  const { root, store, options } = fixture(t);
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(tx.getConfiguredAgent("codex"))],
+      "codex",
+      root,
+      NOW
+    ));
+    tx.saveConfig({
+      ...tx.getConfig(),
+      review: { roleName: "reviewer", trigger: "always" }
+    });
+  });
+  const task = createTask(store, options, "Review failure judgment");
+  run(["activate", task.id], store, options);
+  run(["role", "add", task.id, "worker"], store, options);
+  run(["work", "create", task.id, "candidate", "--role", "worker"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  run(["work", "dispatch", item.id], store, options);
+  const execution = store.getActiveAgentRun(task.id, "worker");
+  markDelivered(store, execution);
+  run(["run", "yield", execution.id, "--summary", "candidate ready"], store, options);
+  const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
+  store.transaction((tx) => {
+    tx.saveAgentRun(failAgentRun(reviewRun, "Reviewer runtime unavailable.", NOW));
+    tx.clearActiveAgentRun(task.id, "reviewer");
+  });
+  assert.equal(store.listReviewRounds(task.id)[0].status, "failed");
+
+  const leaderOptions = {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+  run([
+    "work", "accept", item.id,
+    "--summary", "User authorized acceptance after the review failure."
+  ], store, leaderOptions);
+  assert.equal(store.findWorkItem(item.id).status, "completed");
+});
+
+test("leader-triggered review starts only when the Leader requests it", (t) => {
+  const { root, store, options } = fixture(t);
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(tx.getConfiguredAgent("codex"))],
+      "codex",
+      root,
+      NOW
+    ));
+    tx.saveConfig({
+      ...tx.getConfig(),
+      review: { roleName: "reviewer", trigger: "leader" }
+    });
+  });
+  const task = createTask(store, options, "Leader review");
+  run(["activate", task.id], store, options);
+  run(["role", "add", task.id, "worker"], store, options);
+  run(["work", "create", task.id, "candidate", "--role", "worker"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  run(["work", "dispatch", item.id], store, options);
+  const execution = store.getActiveAgentRun(task.id, "worker");
+  markDelivered(store, execution);
+  run(["run", "yield", execution.id, "--summary", "candidate ready"], store, options);
+  assert.deepEqual(store.listReviewRounds(task.id), []);
+
+  const leaderOptions = {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+  assert.match(
+    run(["work", "review", item.id], store, leaderOptions),
+    /Review queued/
+  );
+  assert.equal(store.listReviewRounds(task.id).length, 1);
+  assert.equal(store.getActiveAgentRun(task.id, "reviewer")?.purpose, "review");
+});
+
+test("the latest ReviewRound stays authoritative when timestamps tie", (t) => {
+  const { root, store, options } = fixture(t);
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(tx.getConfiguredAgent("codex"))],
+      "codex",
+      root,
+      NOW
+    ));
+    tx.saveConfig({
+      ...tx.getConfig(),
+      review: { roleName: "reviewer", trigger: "leader" }
+    });
+  });
+  const task = createTask(store, options, "Many review rounds");
+  run(["activate", task.id], store, options);
+  run(["role", "add", task.id, "worker"], store, options);
+  run(["work", "create", task.id, "candidate", "--role", "worker"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  run(["work", "dispatch", item.id], store, options);
+  const execution = store.getActiveAgentRun(task.id, "worker");
+  markDelivered(store, execution);
+  run(["run", "yield", execution.id, "--summary", "candidate ready"], store, options);
+  const leaderOptions = {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+
+  for (let round = 1; round <= 10; round += 1) {
+    run(["work", "review", item.id], store, leaderOptions);
+    const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
+    markDelivered(store, reviewRun);
+    run(["run", "yield", reviewRun.id, "--summary", `review ${round}`], store, options);
+  }
+  run(["work", "review", item.id], store, leaderOptions);
+
+  assert.throws(
+    () => run(["work", "accept", item.id, "--summary", "accept"], store, leaderOptions),
+    /ReviewRound.*running/
+  );
+});
+
+test("leader-triggered review can inspect a Leader-managed direct candidate", (t) => {
+  const { root, store, options } = fixture(t);
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(tx.getConfiguredAgent("codex"))],
+      "codex",
+      root,
+      NOW
+    ));
+    tx.saveConfig({
+      ...tx.getConfig(),
+      review: { roleName: "reviewer", trigger: "leader" }
+    });
+  });
+  const task = createTask(store, options, "Leader direct review");
+  run(["activate", task.id], store, options);
+  run(["work", "create", task.id, "direct candidate"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  const leaderOptions = {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+
+  run(["work", "update", item.id, "running"], store, leaderOptions);
+  run([
+    "work", "update", item.id, "done",
+    "--summary", "Leader-managed candidate is ready."
+  ], store, leaderOptions);
+
+  const awaiting = store.getWorkItem(task.id, item.id);
+  assert.equal(awaiting.status, "awaiting_acceptance");
+  const candidate = awaiting.candidates.at(-1);
+  assert.equal(candidate.workItemRevision, awaiting.revision);
+  assert.equal(candidate.summary, "Leader-managed candidate is ready.");
+  assert.deepEqual(candidate.source, { type: "direct" });
+  assert.deepEqual(store.listReviewRounds(task.id), []);
+  assert.match(
+    run(["work", "review", item.id], store, leaderOptions),
+    /Review queued/
+  );
+  assert.equal(store.listReviewRounds(task.id)[0].candidateId, candidate.id);
+});
+
+test("a failed automatic review after Leader yield durably wakes the Leader", (t) => {
+  const { root, store, options } = fixture(t);
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(tx.getConfiguredAgent("codex"))],
+      "codex",
+      root,
+      NOW
+    ));
+    tx.saveConfig({
+      ...tx.getConfig(),
+      review: { roleName: "reviewer", trigger: "always" }
+    });
+  });
+  const task = createTask(store, options, "Failed review handoff");
+  run(["activate", task.id], store, options);
+  run(["work", "create", task.id, "leader candidate"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  const execution = dispatchTestRun(store, task.id, "leader", item.id);
+  markDelivered(store, execution);
+  assert.equal(store.removeGlobalRole("reviewer"), true);
+
+  run(["run", "yield", execution.id, "--summary", "Candidate ready."], store, options);
+
+  const [round] = store.listReviewRounds(task.id);
+  assert.equal(round.status, "failed");
+  assert.match(round.summary, /Global Role not found/);
+  const leaderMailbox = store.getWorkMailbox({
+    kind: "role",
+    taskId: task.id,
+    roleName: "leader"
+  });
+  assert.deepEqual(leaderMailbox.pending?.reasons, ["review-failed"]);
+  assert.equal(
+    leaderMailbox.pending?.refs.some((ref) => ref.type === "work-item" && ref.id === item.id),
+    true
+  );
+});
+
 test("Leader rejection preserves a Worker WorkItem for another dispatch round", (t) => {
   const { store, options } = fixture(t);
   const task = createTask(store, options, "Review rounds");
@@ -647,10 +1163,16 @@ test("Leader rejection preserves a Worker WorkItem for another dispatch round", 
     }
   };
   run(["work", "reject", item.id, "--summary", "Fix the review findings."], store, leaderOptions);
+  assert.throws(
+    () => run(["work", "dispatch", item.id, "--input", "Apply the review findings."], store, options),
+    /repair requires the original Worker native Session/i
+  );
+  recordReadyNativeSession(store, task.id, "worker", "native-worker-history");
   run(["work", "dispatch", item.id, "--input", "Apply the review findings."], store, options);
 
   const second = store.getActiveAgentRun(task.id, "worker");
   assert.notEqual(second.id, first.id);
+  assert.equal(second.mode, "resume");
   assert.equal(second.workItemId, item.id);
   assert.equal(store.findWorkItem(item.id)?.status, "running");
 });

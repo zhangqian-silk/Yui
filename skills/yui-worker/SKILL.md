@@ -61,9 +61,10 @@ yui task run yield <current-run-id> --summary "<outcome and evidence>"
 
 Include the result, changed paths, checks, residual risk, and blockers. Printing
 a final response without executing `yield` does not deliver the Run. Yield ends
-the AgentRun and submits the WorkItem for Leader review; it does not accept or
-complete the WorkItem.
+the AgentRun and appends an immutable Candidate to the same WorkItem; it does
+not accept or complete the WorkItem.
 
 Leave an isolated workspace intact. If the Leader rejects the result, continue
-the next dispatched round in that same workspace and address the recorded
-feedback. The Leader owns capture, integration, acceptance, and cleanup.
+the next dispatched round in that same workspace and original native Session,
+then append a new Candidate and address the recorded feedback. The Leader owns
+review selection, capture, integration, acceptance, and cleanup.

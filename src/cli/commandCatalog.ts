@@ -382,7 +382,7 @@ const taskChildren: readonly NodeInput[] = [
       title: "Commands",
       entries: [
         "create", "list", "update", "scope", "dispatch", "isolate", "capture", "cleanup",
-        "accept", "reject", "cancel"
+        "review", "accept", "reject", "cancel"
       ]
     }],
     children: [
@@ -429,6 +429,11 @@ const taskChildren: readonly NodeInput[] = [
         summary: "Remove a clean terminal WorkItem worktree after integration or abandonment.",
         usage: "yui task work cleanup <work> (--integrated|--abandon)",
         options: ["--integrated", "--abandon"]
+      },
+      {
+        name: "review",
+        summary: "Ask the configured reviewer to inspect a WorkItem candidate.",
+        usage: "yui task work review <work>"
       },
       {
         name: "accept",
@@ -641,7 +646,7 @@ export const ROOT_COMMAND = buildNode({
     {
       name: "config",
       summary: "Inspect or update Yui configuration.",
-      sections: [{ id: "manage", title: "Commands", entries: ["show", "set"] }],
+      sections: [{ id: "manage", title: "Commands", entries: ["show", "set", "review"] }],
       children: [
         { name: "show", summary: "Show effective Yui configuration." },
         {
@@ -649,6 +654,22 @@ export const ROOT_COMMAND = buildNode({
           summary: "Update Yui configuration.",
           usage: "yui config set <--time-zone <IANA timezone> | --reconciliation-interval-seconds <5-300>>",
           options: ["--time-zone", "--reconciliation-interval-seconds"]
+        },
+        {
+          name: "review",
+          summary: "Configure WorkItem review.",
+          sections: [{ id: "manage", title: "Commands", entries: ["show", "set", "clear"] }],
+          children: [
+            { name: "show", summary: "Show the global review rule." },
+            {
+              name: "set",
+              summary: "Enable review with a Global Role.",
+              usage: "yui config review set --role <global-role> --trigger <always|leader>",
+              options: ["--role", "--trigger"],
+              optionValues: { "--trigger": ["always", "leader"] }
+            },
+            { name: "clear", summary: "Disable global review." }
+          ]
         }
       ]
     },

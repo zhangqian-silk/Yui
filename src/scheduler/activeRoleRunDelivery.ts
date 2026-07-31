@@ -17,7 +17,7 @@ export type ActiveRoleRunDeliveryResult = Readonly<{
   roleName: string;
   runId: string;
   status: "delivered" | "already-delivered" | "skipped" | "failed";
-  reason?: "workspace-not-ready" | "mailbox-empty" | "mailbox-busy" | "not-ready" | "runtime-unavailable" | "delivery-uncertain";
+  reason?: "workspace-not-ready" | "launch-failed" | "mailbox-empty" | "mailbox-busy" | "not-ready" | "runtime-unavailable" | "delivery-uncertain";
   error?: string;
 }>;
 
@@ -93,7 +93,7 @@ export async function processActiveRoleRunDeliveries(
           roleName: role.name,
           agentId: role.activeAgentId,
           adapterId: role.adapterId,
-          workspace: role.workspace,
+          workspace: run.workspace?.root ?? role.workspace,
           mode: run.mode,
           runId: run.id,
           ...(nativeSessionId === undefined ? {} : { nativeSessionId })
@@ -139,6 +139,7 @@ export async function processActiveRoleRunDeliveries(
         });
         results.push({ taskId: task.id, roleName: role.name, runId: run.id, status });
       } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
         if (!deliveryAttempted) {
           delivery.forgetPrepared?.({
             taskId: task.id,
@@ -148,6 +149,23 @@ export async function processActiveRoleRunDeliveries(
               ? {}
               : { launchId: prepared.launchId })
           });
+          const persisted = store.saveExitedRoleRun({
+            task,
+            role,
+            run,
+            session: existingSession,
+            summary: `Role Run could not start: ${message}`,
+            now
+          });
+          results.push({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id,
+            status: "failed",
+            reason: "launch-failed",
+            error: persisted === "state-changed" ? "Run state changed during launch failure." : message
+          });
+          continue;
         }
         store.releaseWorkMailbox(target, processing.batchId);
         results.push({
@@ -156,7 +174,7 @@ export async function processActiveRoleRunDeliveries(
           runId: run.id,
           status: "failed",
           reason: "delivery-uncertain",
-          error: error instanceof Error ? error.message : String(error)
+          error: message
         });
       }
     }

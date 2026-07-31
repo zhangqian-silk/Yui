@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   BUILTIN_PROFILE_IDS,
+  builtinAgentProfileInputs,
   createAgentProfile,
   updateAgentProfile
 } from "../../dist/profile/agentProfile.js";
@@ -25,6 +26,17 @@ test("built-in Agent Profiles are the complete stable product set", () => {
     "implementer",
     "reviewer"
   ]);
+});
+
+test("the built-in reviewer delegates evidence-backed judgment without engineering edge cases", () => {
+  const reviewer = builtinAgentProfileInputs().find(({ id }) => id === "reviewer");
+
+  assert.match(reviewer.description, /user's core outcome.*direct evidence/i);
+  assert.match(reviewer.instructions, /reachable, material, actionable problems/i);
+  assert.match(reviewer.instructions, /smallest sufficient correction/i);
+  assert.match(reviewer.instructions, /speculative or extreme edge cases/i);
+  assert.match(reviewer.instructions, /Leader, who decides/i);
+  assert.equal(reviewer.defaultAccess, "read");
 });
 
 test("AgentProfile is versioned independently from Actor and has no workspace or session", () => {
@@ -56,6 +68,7 @@ test("WorkItem contains intent without provider-specific execution fields", () =
   }, now);
   assert.deepEqual(Object.keys(work).sort(), [
     "acceptance",
+    "candidates",
     "createdAt",
     "dependsOn",
     "id",

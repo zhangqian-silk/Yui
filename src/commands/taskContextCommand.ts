@@ -26,6 +26,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     const inputRequests = reader.listInputRequests(task.id);
     return {
       task,
+      reviewConfig: reader.getReviewConfig(),
       brief: reader.getTaskBrief(task.id),
       activeDecisions: reader.listDecisions(task.id)
         .filter((decision) => decision.status === "active"),
@@ -33,6 +34,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       roles: reader.listRoles(task.id),
       workItems,
       agentRuns: chronological(reader.listAgentRuns(task.id)),
+      reviewRounds: chronological(reader.listReviewRounds(task.id)),
       changeSets: chronological(reader.listChangeSets(task.id)),
       integrations: chronological(reader.listIntegrationAttempts(task.id)),
       messages: reader.listMessages(task.id),
@@ -43,12 +45,14 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
   });
   const {
     task,
+    reviewConfig,
     brief,
     activeDecisions,
     milestones,
     roles,
     workItems,
     agentRuns,
+    reviewRounds,
     changeSets,
     integrations,
     messages,
@@ -84,6 +88,9 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     `Completion evidence: ${task.requireIntegration
       ? "WorkItem, ChangeSet, and committed Integration required"
       : "delivery integration not required"}`,
+    `Global review: ${reviewConfig === null
+      ? "disabled"
+      : `${reviewConfig.roleName} (${reviewConfig.trigger})`}`,
     "",
     "Brief:",
     ...(brief === null
@@ -155,6 +162,13 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
             ...(item.acceptance.length === 0
               ? []
               : [`    Acceptance: ${item.acceptance.map(compactText).join("; ")}`]),
+            ...(item.candidates.length === 0
+              ? []
+              : item.candidates.flatMap((candidate) => [
+                  `    Candidate ${candidate.sequence}: ${candidate.id}${item.status === "awaiting_acceptance" && candidate === item.candidates.at(-1) ? " [current]" : ""} (${candidate.source.type === "run" ? candidate.source.runId : "direct"})`,
+                  `      Review policy: ${candidate.reviewPolicy === undefined ? "none" : `${candidate.reviewPolicy.roleName} (${candidate.reviewPolicy.trigger})`}`,
+                  `      Summary: ${compactText(candidate.summary)}`
+                ])),
             ...(latestRun === undefined
               ? ["    AgentRuns: none."]
               : [
@@ -163,7 +177,10 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
                   ...(latestRun.summary === undefined
                     ? []
                     : [`      Summary: ${compactText(latestRun.summary)}`])
-                ])
+                ]),
+            ...renderWorkItemReviews(reviewRounds.filter(
+              (round) => round.workItemId === item.id
+            ))
           ];
         })),
     "",
@@ -171,7 +188,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       "AgentRuns",
       agentRuns,
       (run) => [
-        `  ${run.id} [${run.status}] ${run.roleName} via ${run.agentId ?? "unknown"}/${run.adapterId ?? "unknown"}`,
+        `  ${run.id} [${run.status}/${run.purpose}] ${run.roleName} via ${run.agentId ?? "unknown"}/${run.adapterId ?? "unknown"}`,
         `    Model: ${run.model ?? "default"}; effort: ${run.effort ?? "default"}`,
         ...(run.summary === undefined ? [] : [`    Result: ${compactText(run.summary)}`])
       ]
@@ -235,6 +252,19 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     output: `${lines.join("\n")}\n`,
     data
   };
+}
+
+function renderWorkItemReviews(
+  rounds: ReturnType<TaskStore["listReviewRounds"]>
+): string[] {
+  const latest = rounds.at(-1);
+  if (latest === undefined) return ["    ReviewRounds: none."];
+  return [
+    `    ReviewRounds: ${rounds.length}; latest ${latest.id} [${latest.status}] for ${latest.candidateId} via ${latest.reviewerRoleName} (${latest.requestedBy})`,
+    ...(latest.summary === undefined
+      ? []
+      : [`      Review summary: ${compactText(latest.summary)}`])
+  ];
 }
 
 function renderResolvedInputRequest(request: InputRequest, timeZone: string | undefined): string[] {

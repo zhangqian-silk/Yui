@@ -1,16 +1,21 @@
 import { isAgentAdapterId, type AgentAdapterId } from "../agent/adapterCatalog.js";
+import { validateRoleWorkspace, type RoleWorkspace } from "../worktree/roleWorkspace.js";
 
 export type DispatchMode = "new" | "resume";
 export type AgentRunStatus = "active" | "yielded" | "failed";
+export type AgentRunPurpose = "execution" | "review";
 
 export type AgentRun = {
-  schemaVersion: 1;
+  schemaVersion: 3;
   id: string;
   taskId: string;
   roleName: string;
   mode: DispatchMode;
   input: string;
+  purpose: AgentRunPurpose;
   workItemId?: string;
+  reviewRoundId?: string;
+  workspace?: RoleWorkspace;
   agentId?: string;
   adapterId?: AgentAdapterId;
   model?: string;
@@ -33,6 +38,9 @@ export function createAgentRun(
   now: Date,
   context: {
     workItemId?: string;
+    purpose?: AgentRunPurpose;
+    reviewRoundId?: string;
+    workspace?: RoleWorkspace;
     agent?: Readonly<{
       agentId: string;
       adapterId: AgentAdapterId;
@@ -46,15 +54,22 @@ export function createAgentRun(
   }
   const timestamp = now.toISOString();
   return {
-    schemaVersion: 1,
+    schemaVersion: 3,
     id: requireSafeIdentity(id, "Agent run id"),
     taskId: requireSafeIdentity(taskId, "Task id"),
     roleName: requireSafeIdentity(roleName, "Role name"),
     mode,
     input: requireText(input, "Agent run input"),
+    purpose: context.purpose ?? "execution",
     ...(context.workItemId === undefined
       ? {}
       : { workItemId: requireSafeIdentity(context.workItemId, "Work item id") }),
+    ...(context.reviewRoundId === undefined
+      ? {}
+      : { reviewRoundId: requireSafeIdentity(context.reviewRoundId, "ReviewRound id") }),
+    ...(context.workspace === undefined
+      ? {}
+      : { workspace: validateRoleWorkspace(context.workspace) }),
     ...(context.agent === undefined
       ? {}
       : {
@@ -87,7 +102,7 @@ export function markAgentRunDelivered(run: AgentRun, now: Date): AgentRun {
 }
 
 export function validateAgentRun(run: AgentRun): AgentRun {
-  if (run.schemaVersion !== 1) throw new Error("Agent run must use schemaVersion 1.");
+  if (run.schemaVersion !== 3) throw new Error("Agent run must use schemaVersion 3.");
   requireSafeIdentity(run.id, "Agent run id");
   requireSafeIdentity(run.taskId, "Task id");
   requireSafeIdentity(run.roleName, "Role name");
@@ -95,7 +110,31 @@ export function validateAgentRun(run: AgentRun): AgentRun {
     throw new Error(`Agent run dispatch mode is invalid: ${String(run.mode)}.`);
   }
   requireText(run.input, "Agent run input");
+  if (!["execution", "review"].includes(run.purpose)) {
+    throw new Error(`Agent run purpose is invalid: ${String(run.purpose)}.`);
+  }
   if (run.workItemId !== undefined) requireSafeIdentity(run.workItemId, "Work item id");
+  if (run.reviewRoundId !== undefined) requireSafeIdentity(run.reviewRoundId, "ReviewRound id");
+  if (run.workspace !== undefined) {
+    validateRoleWorkspace(run.workspace);
+    if (run.workspace.taskId !== run.taskId) {
+      throw new Error("Agent run workspace belongs to another Task.");
+    }
+    if (run.workspace.owner.type === "work-item"
+      && run.workspace.owner.workItemId !== run.workItemId) {
+      throw new Error("Agent run workspace belongs to another Work Item.");
+    }
+  }
+  if (run.purpose === "review") {
+    if (run.workItemId === undefined || run.reviewRoundId === undefined) {
+      throw new Error("A review Agent run requires WorkItem and ReviewRound references.");
+    }
+    if (run.workspace?.entries.some(({ access }) => access !== "read")) {
+      throw new Error("A review Agent run workspace must be read-only.");
+    }
+  } else if (run.reviewRoundId !== undefined) {
+    throw new Error("An execution Agent run cannot reference a ReviewRound.");
+  }
   if ((run.agentId === undefined) !== (run.adapterId === undefined)) {
     throw new Error("Agent run snapshot requires both agentId and adapterId.");
   }

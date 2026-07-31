@@ -117,6 +117,10 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
   const operator = readFileSync(join(root, "skills", "yui-operator", "SKILL.md"), "utf8");
   const worker = readFileSync(join(root, "skills", "yui-worker", "SKILL.md"), "utf8");
 
+  assert.match(leader, /Start from the user's core problem, desired outcome, and real constraints/u);
+  assert.match(leader, /Give Agents the relevant Task context/u);
+  assert.match(leader, /Do not encode semantic judgment or every possible\s+exception into workflow states/u);
+  assert.match(leader, /Do not turn speculative or extreme edge cases into requirements/u);
   assert.match(leader, /create a native subagent inside this Leader's current Agent conversation/u);
   assert.match(leader, /Do not invent another execution entity or a `yui \.\.\. subagent` command/u);
   assert.match(leader, /yui task work update <work-id> running/u);

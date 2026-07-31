@@ -82,6 +82,35 @@ yui config show
 yui config set --time-zone Europe/London
 ```
 
+WorkItem review is one global, optional rule that reuses an existing Global
+Role's Agent, model, permissions, prompt, and Skills:
+
+```sh
+yui config review set --role reviewer --trigger always
+yui config review show
+yui config review clear
+```
+
+Every result entering Leader acceptance is one explicit candidate on its
+existing WorkItem. The current global rule applies to the next candidate in
+every existing or new Task; that candidate snapshots the rule, so later
+`set`/`clear` changes do not rewrite an in-flight decision.
+`always` starts a ReviewRound for every candidate, including a yielded Role Run
+or a Leader-managed direct result; `leader` leaves the candidate awaiting
+acceptance so the Leader can accept it directly or run
+`yui task work review <work-item-id>`. A configured review rule therefore keeps
+Leader-managed candidates awaiting a decision instead of marking them done.
+A ReviewRound references that immutable candidate, and its review AgentRun never creates
+another WorkItem or recursively triggers review. The natural-language review
+result wakes the Leader, who decides whether to accept, reject and redispatch
+the original Role in its existing Session, review again, or request user input.
+A failed review remains visible evidence and wakes the Leader, but does not
+take that decision away from the Leader.
+Candidate history, every ReviewRound, and the Leader decision remain grouped
+under the original WorkItem. A rejected result creates a new Candidate on the
+next dispatch while reusing the original execution Role, Session, and
+workspace.
+
 Task identity follows one bounded outcome, not the number of repositories
 involved. A repository-backed Task may bind multiple Projects, each with its
 own base ref. Yui exposes them under one Task workspace root:

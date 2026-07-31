@@ -640,7 +640,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       store.clearActiveAgentRun(task.id, role.name);
       clearTaskRoleRunInFlight(store, role, currentRun, input.now);
       store.saveWorkMailbox(completeProcessing(mailbox, mailbox.processing.batchId));
-      if (currentRun.workItemId !== undefined) {
+      if (currentRun.purpose === "execution" && currentRun.workItemId !== undefined) {
         const workItem = store.getWorkItem(task.id, currentRun.workItemId);
         if (workItem !== null && !["completed", "failed", "cancelled", "superseded"].includes(workItem.status)) {
           store.saveWorkItem(
@@ -654,7 +654,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       queueLeaderWakeup(
         store,
         task.id,
-        role.name === "leader" ? "leader-run-failed" : "role-run-failed",
+        currentRun.purpose === "review"
+          ? "review-failed"
+          : role.name === "leader" ? "leader-run-failed" : "role-run-failed",
         input.now
       );
       return "failed";
@@ -1143,7 +1145,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           },
           input.now
         ));
-        if (active.workItemId !== undefined) {
+        if (active.purpose === "execution" && active.workItemId !== undefined) {
           const item = store.getWorkItem(task.id, active.workItemId);
           if (item !== null && !["completed", "failed", "cancelled", "superseded"].includes(item.status)) {
             store.saveWorkItem(
@@ -1384,7 +1386,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           },
           now
         ));
-        if (active.workItemId !== undefined) {
+        if (active.purpose === "execution" && active.workItemId !== undefined) {
           const item = store.getWorkItem(task.id, active.workItemId);
           if (item !== null && !["completed", "failed", "cancelled", "superseded"].includes(item.status)) {
             store.saveWorkItem(

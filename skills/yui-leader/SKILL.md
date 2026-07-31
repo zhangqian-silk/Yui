@@ -1,6 +1,6 @@
 ---
 name: yui-leader
-description: Lead one Yui Task through direct work, conversation-native subagents, Task Role AgentRuns, acceptance, durable context, and safe ChangeSet integration.
+description: Lead one Yui Task from the user's core outcome by reasoning from first principles, exposing durable context to Agents, delegating judgment-rich work, and owning acceptance and integration without overengineering.
 ---
 
 # Yui Leader
@@ -14,6 +14,25 @@ WorkItem. Choose one of three execution paths for each WorkItem:
 3. dispatch it to a Task Role and its independently managed AgentRun.
 
 Do not invent another execution entity or a `yui ... subagent` command.
+
+## Lead with judgment
+
+- Start from the user's core problem, desired outcome, and real constraints.
+  Derive the smallest sufficient design from first principles before choosing
+  an implementation pattern.
+- Give Agents the relevant Task context, WorkItem intent, repository evidence,
+  and available tools. Delegate investigation and other judgment-rich work;
+  use the returned evidence to make the integrated Leader decision.
+- Use Yui to preserve authority, identity, access, durable handoffs, and
+  observable results. Do not encode semantic judgment or every possible
+  exception into workflow states, hooks, retries, or fallback protocols.
+- Prefer an existing state, a clear prompt, an observable failure, or a bounded
+  manual retry when it satisfies the normal path. Add engineering machinery
+  only for a concrete product commitment, data-integrity boundary, or common
+  operational failure.
+- Do not turn speculative or extreme edge cases into requirements. When the
+  remaining uncertainty is a material product choice or needs new authority,
+  persist the evidence and ask the user.
 
 ## Match detail to the audience
 
@@ -139,7 +158,9 @@ yui task work update <work-id> done \
 ```
 
 Use `failed` with recovery context when it cannot be completed. Do not mark
-work done before checking its acceptance criteria.
+work done before checking its acceptance criteria. When global review is
+enabled, `done` submits a Candidate instead of completing the WorkItem. Read
+`yui task context <task-id>` and follow that Candidate's snapshotted policy.
 
 ## Create a native subagent
 
@@ -181,7 +202,8 @@ round=2; result=2 findings fixed; checks=npm test passed
 ```
 
 Use `model=unknown` or `effort=unknown` when the runtime does not expose the
-actual value. Do not mark the WorkItem done merely because the child returned.
+actual value. Do not treat the WorkItem as accepted merely because the child
+returned or `done` submitted its Candidate.
 
 ```sh
 yui task work update <work-id> done --summary "<reviewed round history>"
@@ -256,12 +278,25 @@ delivers evidence and moves the WorkItem to Leader review; it is not acceptance.
 
 ## Review, retry, capture, and integrate
 
-After Worker yield, inspect the WorkItem, Run result, checks, and workspace.
-Apply the acceptance criteria yourself.
+After any Candidate is submitted, inspect its exact policy, Run result,
+ReviewRounds, checks, and workspace through `task context`.
+
+- `always`: wait for the automatically requested ReviewRound to become
+  terminal. Never bypass an active round.
+- `leader`: decide whether the existing evidence is sufficient. Request Agent
+  review with `yui task work review <work-id>` when it adds useful evidence.
+- A completed review is advice. Decide whether to accept, reject, review again,
+  or ask the user.
+- A failed review is terminal evidence, not an automatic retry. Retry with a
+  new `task work review`, accept with an explicit rationale, or ask the user.
+- If the same ambiguity or external choice repeats, persist context and create
+  an InputRequest instead of looping.
 
 - If semantics or evidence are insufficient, reject with precise feedback and
   redispatch the same WorkItem. Keep the isolated workspace so the Worker can
-  repair the existing result.
+  repair the existing result. This creates another AgentRun and Candidate but
+  must resume the original execution Role's native Session; do not create a
+  replacement Session silently.
 - If the result is acceptable and has no isolated code changes, accept it.
 - If it has an isolated workspace, review semantics first, then capture the
   current HEAD, integrate and validate that ChangeSet, and accept only after the
@@ -278,7 +313,8 @@ yui task integration start <task-id> --project <project> \
 yui task work accept <work-id> --summary "<acceptance and integration evidence>"
 ```
 
-Every retry round must retain its result and checks in the WorkItem summary.
+Candidate and ReviewRound history is retained under the same WorkItem. Every
+retry round must also retain its result and checks in the WorkItem summary.
 Capture is immutable per Project HEAD: repeating capture at the same HEAD
 reuses the record; a repaired HEAD produces a new candidate. Integrate each
 modified Project independently and only its latest reviewed candidate. Never
@@ -309,9 +345,9 @@ yui task work cleanup <work-id> --integrated
 ```
 
 Use `--abandon` only for deliberate discard. Dirty worktrees remain available
-for capture or resolution. A Role Session tied to an old cwd may be retired;
-the next dispatch creates or resumes the appropriate Session for the current
-workspace.
+for capture or resolution. If the original execution Session cannot be
+resumed, surface the recovery decision to the user; do not silently discard
+its context by creating a replacement.
 
 If a native Role Session disappears, run `yui task reconcile <task-id>`,
 inspect the Run and partial work, then retry only a confirmed failed Run:

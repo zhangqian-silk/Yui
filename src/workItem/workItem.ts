@@ -5,6 +5,8 @@ import {
   requireText,
   requireTimestamp
 } from "../domain/validation.js";
+import { validateReviewConfig, type ReviewConfig } from "../review/reviewConfig.js";
+import { validateRoleWorkspace, type RoleWorkspace } from "../worktree/roleWorkspace.js";
 
 export type WorkItemStatus =
   | "pending"
@@ -17,8 +19,22 @@ export type WorkItemStatus =
 
 export type WorkItemWorkspaceDisposition = "integrated" | "abandoned";
 
+export type WorkItemCandidate = Readonly<{
+  schemaVersion: 1;
+  id: string;
+  sequence: number;
+  workItemRevision: number;
+  summary: string;
+  source:
+    | Readonly<{ type: "direct" }>
+    | Readonly<{ type: "run"; runId: string }>;
+  reviewPolicy?: ReviewConfig;
+  workspace?: RoleWorkspace;
+  createdAt: string;
+}>;
+
 export type WorkItem = {
-  schemaVersion: 3;
+  schemaVersion: 5;
   id: string;
   taskId: string;
   title: string;
@@ -29,6 +45,7 @@ export type WorkItem = {
   revision: number;
   assignee?: string;
   status: WorkItemStatus;
+  candidates: readonly WorkItemCandidate[];
   outcome?: string;
   workspaceDisposition?: WorkItemWorkspaceDisposition;
   createdAt: string;
@@ -58,7 +75,7 @@ export function createWorkItem(
 ): WorkItem {
   const timestamp = now.toISOString();
   return validateWorkItem({
-    schemaVersion: 3,
+    schemaVersion: 5,
     id: requireIdentity(id, "Work Item id"),
     taskId: requireIdentity(taskId, "Task id"),
     title: requireText(input.title, "Work item title"),
@@ -74,8 +91,50 @@ export function createWorkItem(
       ? {}
       : { assignee: requireIdentity(input.assignee, "Work item assignee") }),
     status: "pending",
+    candidates: [],
     createdAt: timestamp,
     updatedAt: timestamp
+  });
+}
+
+export function submitWorkItemCandidate(
+  workItem: WorkItem,
+  input: Readonly<{
+    summary: string;
+    source:
+      | Readonly<{ type: "direct" }>
+      | Readonly<{ type: "run"; runId: string }>;
+    reviewPolicy?: ReviewConfig;
+    workspace?: RoleWorkspace;
+  }>,
+  now: Date
+): WorkItem {
+  validateWorkItem(workItem);
+  if (workItem.status !== "running") {
+    throw new Error(
+      `Work Item candidate can only be submitted from running: ${workItem.id}/${workItem.status}.`
+    );
+  }
+  const revision = workItem.revision + 1;
+  const sequence = workItem.candidates.length + 1;
+  const candidate = validateWorkItemCandidate({
+    schemaVersion: 1,
+    id: `${workItem.id}-candidate-${sequence}`,
+    sequence,
+    workItemRevision: revision,
+    summary: input.summary,
+    source: input.source,
+    ...(input.reviewPolicy === undefined ? {} : { reviewPolicy: input.reviewPolicy }),
+    ...(input.workspace === undefined ? {} : { workspace: input.workspace }),
+    createdAt: now.toISOString()
+  });
+  const { outcome: _outcome, endedAt: _endedAt, ...base } = workItem;
+  return validateWorkItem({
+    ...base,
+    status: "awaiting_acceptance",
+    candidates: [...workItem.candidates, candidate],
+    revision,
+    updatedAt: now.toISOString()
   });
 }
 
@@ -173,7 +232,7 @@ export function recordWorkItemWorkspaceDisposition(
 }
 
 export function validateWorkItem(workItem: WorkItem): WorkItem {
-  if (workItem.schemaVersion !== 3) throw new Error("WorkItem must use schemaVersion 3.");
+  if (workItem.schemaVersion !== 5) throw new Error("WorkItem must use schemaVersion 5.");
   requireIdentity(workItem.id, "Work Item id");
   requireIdentity(workItem.taskId, "Task id");
   requireText(workItem.title, "Work item title");
@@ -191,6 +250,27 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
     requireIdentity(workItem.assignee, "Work item assignee");
   }
   validateStatus(workItem.status);
+  if (!Array.isArray(workItem.candidates)) {
+    throw new Error("Work Item candidates are invalid.");
+  }
+  const candidateIds = new Set<string>();
+  workItem.candidates.forEach((candidate, index) => {
+    validateWorkItemCandidate(candidate);
+    if (candidate.sequence !== index + 1) {
+      throw new Error("Work Item candidate sequence is invalid.");
+    }
+    if (candidateIds.has(candidate.id)) {
+      throw new Error(`Work Item candidate is duplicated: ${candidate.id}.`);
+    }
+    candidateIds.add(candidate.id);
+    if (candidate.workItemRevision > workItem.revision) {
+      throw new Error("Work Item candidate revision cannot exceed the Work Item revision.");
+    }
+  });
+  const currentCandidate = currentWorkItemCandidate(workItem);
+  if (workItem.status === "awaiting_acceptance" && currentCandidate === undefined) {
+    throw new Error("A Work Item awaiting acceptance requires a candidate.");
+  }
   if (workItem.outcome !== undefined) requireText(workItem.outcome, "Work item outcome");
   requireTimestamp(workItem.createdAt, "Work Item createdAt");
   requireTimestamp(workItem.updatedAt, "Work Item updatedAt");
@@ -215,6 +295,47 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
     }
   }
   return workItem;
+}
+
+export function validateWorkItemCandidate(
+  candidate: WorkItemCandidate
+): WorkItemCandidate {
+  if (typeof candidate !== "object" || candidate === null) {
+    throw new Error("Work Item candidate is required.");
+  }
+  if (candidate.schemaVersion !== 1) {
+    throw new Error("Work Item candidate must use schemaVersion 1.");
+  }
+  requireIdentity(candidate.id, "Work Item candidate id");
+  if (!Number.isSafeInteger(candidate.sequence) || candidate.sequence < 1) {
+    throw new Error("Work Item candidate sequence must be a positive integer.");
+  }
+  if (!Number.isSafeInteger(candidate.workItemRevision)
+    || candidate.workItemRevision < 1) {
+    throw new Error("Work Item candidate revision must be a positive integer.");
+  }
+  requireText(candidate.summary, "Work Item candidate summary");
+  if (typeof candidate.source !== "object" || candidate.source === null) {
+    throw new Error("Work Item candidate source is required.");
+  }
+  if (candidate.source.type !== "direct" && candidate.source.type !== "run") {
+    throw new Error("Work Item candidate source is invalid.");
+  }
+  if (candidate.source.type === "run") {
+    requireIdentity(candidate.source.runId, "Work Item candidate Run id");
+  }
+  if (candidate.reviewPolicy !== undefined) validateReviewConfig(candidate.reviewPolicy);
+  if (candidate.workspace !== undefined) validateRoleWorkspace(candidate.workspace);
+  requireTimestamp(candidate.createdAt, "Work Item candidate createdAt");
+  return candidate;
+}
+
+export function currentWorkItemCandidate(
+  workItem: WorkItem
+): WorkItemCandidate | undefined {
+  return workItem.status === "awaiting_acceptance"
+    ? workItem.candidates.at(-1)
+    : undefined;
 }
 
 export function updateWorkItemWriteProjects(

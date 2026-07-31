@@ -33,7 +33,13 @@ independent execution additionally records an AgentRun.
   copies its portable behavior. The Role may bind multiple Agents; every
   binding retains independent runtime configuration.
 - `AgentRun` records one managed dispatch, its selected Agent and runtime
-  configuration, delivery state, and compact result.
+  configuration, delivery state, compact result, and whether its purpose is
+  execution or review.
+- A `WorkItemCandidate` is the explicit result currently awaiting Leader
+  acceptance. It snapshots the WorkItem revision, summary, and either a
+  yielded execution Run or a Leader-managed direct source.
+- `ReviewRound` records review of one candidate under the same WorkItem and
+  references that immutable candidate. It is not another WorkItem.
 
 Adding another Agent requires an explicit adapter implementation. Profiles do
 not choose adapters, own Sessions, or carry credentials.
@@ -52,6 +58,7 @@ Direct and native-subagent work follows:
 
 ```text
 todo -> running -> done | failed
+                -> awaiting Leader decision  (when review is configured)
 ```
 
 Task Role work follows:
@@ -66,6 +73,20 @@ Worker yield ends the AgentRun and submits its result for review. It never
 accepts the WorkItem. The Leader checks semantics, evidence, and Git state,
 then accepts or rejects with bounded feedback. A rejected isolated WorkItem
 keeps its workspace so the next Run can repair the same result.
+
+An optional global review rule names one existing Global Role and chooses
+`always` or `leader`. It is a live default for every Task; each Candidate
+snapshots the effective two-field rule when submitted.
+Every result awaiting acceptance is stored as an explicit WorkItem candidate.
+`always` dispatches a review AgentRun for every candidate, whether it comes
+from a yielded execution Run or a Leader-managed direct result; `leader`
+leaves every candidate for the Leader to accept directly or review explicitly.
+Review Runs complete their ReviewRound, leave the WorkItem awaiting acceptance,
+and never trigger another review. Successful and failed review attempts both
+wake the Leader and remain evidence for judgment, not a machine verdict.
+Roles describe Agent capability. An AgentRun snapshots its effective workspace;
+review Runs use the Candidate workspace with every Project forced read-only,
+so a Reviewer's previous Role workspace cannot redirect the review.
 
 Dependencies are enforced at dispatch. A Role cannot have overlapping active
 Runs, and terminal Task state fences new messages, dispatches, retries, and

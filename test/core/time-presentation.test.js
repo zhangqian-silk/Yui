@@ -54,6 +54,50 @@ test("config commands expose effective recovery settings and persist overrides",
   );
 });
 
+test("review configuration stays small and reuses an existing Global Role", () => {
+  let config = { schemaVersion: 1 };
+  const reviewer = { name: "reviewer" };
+  const store = {
+    transaction: (execute) => execute(store),
+    getConfig: () => structuredClone(config),
+    saveConfig: (next) => { config = structuredClone(next); },
+    getGlobalRole: (name) => name === reviewer.name ? reviewer : null
+  };
+
+  assert.equal(
+    runConfigCommand(["review", "show"], store),
+    "Review: disabled\n"
+  );
+  assert.equal(
+    runConfigCommand(
+      ["review", "set", "--role", "reviewer", "--trigger", "always"],
+      store
+    ),
+    "Review set to reviewer (always)\n"
+  );
+  assert.deepEqual(config.review, {
+    roleName: "reviewer",
+    trigger: "always"
+  });
+  assert.equal(
+    runConfigCommand(["review", "show"], store),
+    "Review: reviewer (always)\n"
+  );
+  assert.equal(
+    runConfigCommand(["review", "clear"], store),
+    "Review disabled\n"
+  );
+  assert.equal(config.review, undefined);
+
+  assert.throws(
+    () => runConfigCommand(
+      ["review", "set", "--role", "missing", "--trigger", "leader"],
+      store
+    ),
+    /Global Role not found: missing/
+  );
+});
+
 test("config commands reject invalid reconciliation intervals through shared validation", () => {
   const config = { schemaVersion: 1 };
   const store = {

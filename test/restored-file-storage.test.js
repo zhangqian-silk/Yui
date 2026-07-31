@@ -20,10 +20,10 @@ function temporaryHome() {
   return mkdtempSync(join(tmpdir(), "yui-file-store-"));
 }
 
-test("storage schema initializes layout v6 with aggregate v8 and rejects non-current versions", () => {
+test("storage schema initializes layout v6 with aggregate v10 and rejects non-current versions", () => {
   const home = temporaryHome();
   assert.equal(CURRENT_STORAGE_LAYOUT_VERSION, 6);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 8);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 10);
   assert.equal(inspectStorageSchema(home).status, "uninitialized");
 
   ensureStorageSchema(home, new Date("2026-07-19T00:00:00.000Z"));
@@ -118,7 +118,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     }
   };
   const item = {
-    schemaVersion: 3,
+    schemaVersion: 5,
     id: "work-1",
     taskId: task.id,
     title: "Implement",
@@ -128,16 +128,18 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     writeProjectIds: [],
     revision: 1,
     status: "running",
+    candidates: [],
     createdAt: timestamp,
     updatedAt: timestamp
   };
   const run = {
-    schemaVersion: 1,
+    schemaVersion: 3,
     id: "agent-run-1",
     taskId: task.id,
     roleName: "leader",
     mode: "new",
     input: "implement",
+    purpose: "execution",
     workItemId: item.id,
     status: "active",
     createdAt: timestamp,
@@ -183,8 +185,8 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   });
 
   const onDisk = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
-  assert.equal(onDisk.schemaVersion, 8);
-  assert.equal(onDisk.tasks[task.id].schemaVersion, 7);
+  assert.equal(onDisk.schemaVersion, 10);
+  assert.equal(onDisk.tasks[task.id].schemaVersion, 9);
   assert.equal(onDisk.revision, 1);
   assert.deepEqual(store.getConfiguredAgent("codex"), agent);
   assert.deepEqual(store.getGlobalRole("operator"), globalRole);
@@ -221,7 +223,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify(incompatible));
   assert.throws(
     () => new FileTaskStore(home).listTasks(),
-    /Task aggregate task-1 must use schemaVersion 7/
+    /Task aggregate task-1 must use schemaVersion 9/
   );
 });
 
@@ -441,7 +443,7 @@ test("record versions and aggregate shape are validated without silently repairi
     updatedAt: timestamp
   };
   const item = {
-    schemaVersion: 3,
+    schemaVersion: 5,
     id: "work-1",
     taskId: task.id,
     title: "Implement",
@@ -452,6 +454,7 @@ test("record versions and aggregate shape are validated without silently repairi
     revision: 1,
     assignee: "leader",
     status: "completed",
+    candidates: [],
     outcome: "Done",
     endedAt: timestamp,
     workspaceDisposition: "integrated",
@@ -466,7 +469,7 @@ test("record versions and aggregate shape are validated without silently repairi
   );
 
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify({
-    schemaVersion: 8,
+    schemaVersion: 10,
     revision: 1,
     config: { schemaVersion: 1 },
     configuredAgents: {},
