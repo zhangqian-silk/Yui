@@ -73,16 +73,25 @@ late results until explicitly reopened.
 
 ## Project workspaces and integration
 
-Stable Project checkouts are read-only references. Every Project-backed Task
-receives a managed main worktree. When concurrent writes warrant it, the Leader
-may isolate a WorkItem directly without an approval workflow.
+Stable Project checkouts are read-only references. A Task binds zero or more
+Projects and owns one workspace root containing a managed main worktree for
+each binding. The Leader runs from this root and sees every Project as a
+peer directory.
+
+A WorkItem can read the full Task workspace but has an explicit Project write
+scope. Isolation creates a second root with independent worktrees for writable
+Projects and Task-main context for the rest. Yui launches that Worker through
+`bubblewrap`: Task-main context paths are read-only bind mounts while isolated
+worktrees remain writable. Scope is monotonic. A Worker cannot expand it
+directly: it reports the need, and the Leader either adds Projects to the
+existing scope, creates another WorkItem, or adds the Project to the Task.
 
 An isolated result is handled in this order:
 
 1. the Worker yields;
 2. the Leader reviews semantics and evidence;
-3. Yui captures the current WorkItem HEAD as an immutable ChangeSet;
-4. integration applies the latest reviewed ChangeSet in a candidate worktree;
+3. Yui captures each writable Project HEAD as an immutable Project ChangeSet;
+4. each Project integration applies its latest reviewed ChangeSet in a candidate worktree;
 5. configured checks run;
 6. compare-and-swap advances the target only if its HEAD is unchanged;
 7. the Leader accepts the WorkItem;
@@ -90,8 +99,10 @@ An isolated result is handled in this order:
 
 Capture at the same HEAD reuses the existing ChangeSet. A repaired HEAD creates
 a new candidate; only the latest reviewed candidate may satisfy acceptance.
-An isolated WorkItem cannot be accepted or a Task completed while its latest
-result is uncaptured or unintegrated.
+An isolated WorkItem cannot be accepted or a Task completed while any writable
+Project's latest result is uncaptured or unintegrated. Workspace roots are
+multi-Project; ChangeSets and Integration Attempts remain single-Project Git
+boundaries.
 
 Conflicts store a compact report and block. The Leader chooses rejection or
 manual resolution in the retained candidate worktree. Failed checks, rejected
@@ -104,7 +115,8 @@ records retain compact evidence.
 Native transcripts remain native to their Agent. Yui persists only the control
 and knowledge needed to resume and audit work:
 
-- Task Brief: objective, boundaries, current focus, and Leader summary;
+- Task Brief: objective, boundaries, cross-Project technical approach, current
+  focus, and Leader summary;
 - Decisions: material choices and supersession;
 - Milestones: independently useful phase outcomes;
 - Project Knowledge: stable facts reusable across Tasks;

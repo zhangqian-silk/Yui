@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, realpathSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { accessSync, chmodSync, constants, realpathSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -29,11 +30,13 @@ import type {
   AgentEnvironmentRefreshPort
 } from "../runtime/ports.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
+import type { RoleWorkspace } from "../worktree/roleWorkspace.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
   createNativeSessionId?: () => string;
   cliPath?: string;
+  bubblewrapCommand?: string;
 }>;
 
 export type GlobalRoleLaunchPlanInput = Readonly<{
@@ -59,6 +62,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   readonly #createNativeSessionId: () => string;
   readonly #cliPath: string;
   readonly #managedBinPath: string;
+  readonly #bubblewrapCommand: string | undefined;
 
   constructor(
     readonly home: string,
@@ -83,6 +87,9 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     this.#cliPath = canonicalPath(options.cliPath
       ?? fileURLToPath(new URL("../cli.js", import.meta.url)));
     this.#managedBinPath = ensureManagedYuiLauncher(this.home, this.#cliPath);
+    this.#bubblewrapCommand = options.bubblewrapCommand === undefined
+      ? findExecutable("bwrap", sourceEnvironment.PATH)
+      : canonicalPath(options.bubblewrapCommand);
   }
 
   refreshAgentEnvironment(refresh: AgentEnvironmentRefresh): void {
@@ -104,13 +111,13 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     if (task.status !== "active") throw new Error(`Task is not active: ${input.taskId}.`);
     const role = this.store.getRole(input.taskId, input.roleName);
     if (role === null) throw new Error(`Role not found: ${input.taskId}/${input.roleName}.`);
-    if (task.projectId !== undefined) {
+    if (task.projectBindings.length > 0) {
       const workspace = this.store.getRoleWorkspace(task.id, role.name);
       const main = this.store.getRoleWorkspace(task.id, "leader");
       const sharedMain = (workspace === null || workspace.owner.type === "task")
         && main?.owner.type === "task"
-        && main.projectId === task.projectId
-        && role.workspace === main.path;
+        && sameWorkspaceProjects(main, task.projectBindings.map(({ projectId }) => projectId))
+        && role.workspace === main.root;
       const isolatedWorkItem = workspace?.owner.type === "work-item"
         ? this.store.getWorkItem(task.id, workspace.owner.workItemId)
         : null;
@@ -122,8 +129,9 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         && !["completed", "failed", "cancelled", "superseded"].includes(isolatedWorkItem.status)
         && (activeRun === null
           || activeRun.workItemId === workspace.owner.workItemId)
-        && workspace.projectId === task.projectId
-        && workspace.path === role.workspace;
+        && sameWorkspaceProjects(workspace, task.projectBindings.map(({ projectId }) => projectId))
+        && sameWritableProjects(workspace, isolatedWorkItem.writeProjectIds)
+        && workspace.root === role.workspace;
       if (task.cwd === undefined || main === null || (!sharedMain && !isolated)) {
         throw new Error(`Role workspace is not ready: ${input.taskId}/${input.roleName}.`);
       }
@@ -271,41 +279,97 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       session = readySession(input.agentId, binding.adapterId, resumeNativeSessionId!);
     }
 
+    const launch = {
+      command: configured.command,
+      args,
+      env: {
+        ...launchEnvironment,
+        YUI_HOME: resolve(this.home),
+        YUI_SESSION_SCOPE: owner.scope,
+        ...(owner.scope === "task" ? { YUI_TASK_ID: owner.taskId } : {}),
+        YUI_ROLE: role.name,
+        YUI_AGENT_ID: configured.id,
+        YUI_ADAPTER_ID: configured.adapterId,
+        YUI_WORKSPACE: role.workspace,
+        ...(sessionTitle === undefined
+          ? {}
+          : {
+              YUI_SESSION_TITLE: sessionTitle,
+              ...(configured.adapterId === "codex"
+                ? {
+                    YUI_AGENT_COMMAND: configured.command,
+                    YUI_AGENT_BASE_ARGS: JSON.stringify(configured.baseArgs)
+                  }
+                : {})
+            }),
+        ...(input.launchId === undefined
+          ? {}
+          : { YUI_LAUNCH_ID: input.launchId })
+      }
+    };
+    const protectedLaunch = owner.scope === "task"
+      ? this.#protectReadOnlyWorkspace(owner.taskId, role, launch)
+      : launch;
     return {
       role: {
         name: role.name,
         workspace: role.workspace,
         ...(owner.scope === "task" ? { status: (role as TaskRole).status } : {})
       },
-      launch: {
-        command: configured.command,
-        args,
-        env: {
-          ...launchEnvironment,
-          YUI_HOME: resolve(this.home),
-          YUI_SESSION_SCOPE: owner.scope,
-          ...(owner.scope === "task" ? { YUI_TASK_ID: owner.taskId } : {}),
-          YUI_ROLE: role.name,
-          YUI_AGENT_ID: configured.id,
-          YUI_ADAPTER_ID: configured.adapterId,
-          YUI_WORKSPACE: role.workspace,
-          ...(sessionTitle === undefined
-            ? {}
-            : {
-                YUI_SESSION_TITLE: sessionTitle,
-                ...(configured.adapterId === "codex"
-                  ? {
-                      YUI_AGENT_COMMAND: configured.command,
-                      YUI_AGENT_BASE_ARGS: JSON.stringify(configured.baseArgs)
-                    }
-                  : {})
-              }),
-          ...(input.launchId === undefined
-            ? {}
-            : { YUI_LAUNCH_ID: input.launchId })
-        }
-      },
+      launch: protectedLaunch,
       session
+    };
+  }
+
+  #protectReadOnlyWorkspace(
+    taskId: string,
+    role: TaskRole | GlobalRole,
+    launch: Readonly<{
+      command: string;
+      args: readonly string[];
+      env: Readonly<Record<string, string>>;
+    }>
+  ): typeof launch {
+    const workspace = this.store.getRoleWorkspace(taskId, role.name);
+    if (workspace === null || workspace.owner.type !== "work-item") return launch;
+    const readOnlyEntries = workspace.entries.filter(({ access }) => access === "read");
+    if (readOnlyEntries.length === 0) {
+      return {
+        ...launch,
+        env: workspaceScopeEnvironment(launch.env, workspace)
+      };
+    }
+    if (this.#bubblewrapCommand === undefined) {
+      throw new Error(
+        `bubblewrap is required to enforce read-only Project context for ${
+          taskId
+        }/${role.name}; install bwrap before launching this WorkItem.`
+      );
+    }
+    const readOnlyPaths = [...new Set(readOnlyEntries.flatMap((entry) => {
+      const project = this.store.getProject(entry.projectId);
+      if (project === null) {
+        throw new Error(`Project not found for read-only workspace: ${entry.projectId}.`);
+      }
+      // Protect both the visible Task-main worktree and its stable checkout.
+      // The latter owns the shared Git common directory, so a Worker cannot
+      // advance the read-only Project through Git plumbing.
+      return [entry.path, project.path, gitCommonDirectory(entry.path)];
+    }))];
+    return {
+      command: this.#bubblewrapCommand,
+      args: [
+        "--die-with-parent",
+        "--dev-bind", "/", "/",
+        ...readOnlyPaths.flatMap((path) => ["--ro-bind", path, path]),
+        "--chdir", workspace.root,
+        "--",
+        launch.command,
+        ...launch.args
+      ],
+      env: {
+        ...workspaceScopeEnvironment(launch.env, workspace)
+      }
     };
   }
 
@@ -332,6 +396,31 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   }
 }
 
+function workspaceScopeEnvironment(
+  environment: Readonly<Record<string, string>>,
+  workspace: RoleWorkspace
+): Readonly<Record<string, string>> {
+  return {
+    ...environment,
+    YUI_WRITABLE_PROJECT_IDS: JSON.stringify(
+      workspace.entries
+        .filter(({ access }) => access === "write")
+        .map(({ projectId }) => projectId)
+    ),
+    YUI_CONTEXT_PROJECT_IDS: JSON.stringify(
+      workspace.entries
+        .filter(({ access }) => access === "read")
+        .map(({ projectId }) => projectId)
+    ),
+    YUI_WORKSPACE_PROJECTS: JSON.stringify(Object.fromEntries(
+      workspace.entries.map(({ projectId, directory, access, path }) => [
+        projectId,
+        { directory, access, path }
+      ])
+    ))
+  };
+}
+
 function ensureManagedYuiLauncher(home: string, cliPath: string): string {
   const binPath = join(resolve(home), "runtime", "bin");
   const launcherPath = join(binPath, "yui");
@@ -354,6 +443,39 @@ function canonicalPath(path: string): string {
   } catch {
     return absolute;
   }
+}
+
+function findExecutable(command: string, path: string | undefined): string | undefined {
+  for (const directory of (path ?? "").split(delimiter).filter(Boolean)) {
+    const candidate = resolve(directory, command);
+    try {
+      accessSync(candidate, constants.X_OK);
+      return realpathSync(candidate);
+    } catch {
+      // Continue through PATH. Missing bubblewrap is reported only when an
+      // isolated WorkItem actually exposes read-only Project context.
+    }
+  }
+  return undefined;
+}
+
+function gitCommonDirectory(worktree: string): string {
+  const path = execFileSync(
+    "git",
+    [
+      "-C",
+      worktree,
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir"
+    ],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 5_000
+    }
+  ).trim();
+  return canonicalPath(path);
 }
 
 function shellQuote(value: string): string {
@@ -425,4 +547,27 @@ function requireText(value: string | undefined, label: string): string {
     throw new Error(`${label} is required.`);
   }
   return value.trim();
+}
+
+function sameWorkspaceProjects(
+  workspace: RoleWorkspace,
+  projectIds: readonly string[]
+): boolean {
+  const actual = workspace.entries.map(({ projectId }) => projectId).sort();
+  const expected = [...projectIds].sort();
+  return actual.length === expected.length
+    && actual.every((projectId, index) => projectId === expected[index]);
+}
+
+function sameWritableProjects(
+  workspace: RoleWorkspace,
+  projectIds: readonly string[]
+): boolean {
+  const actual = workspace.entries
+    .filter(({ access }) => access === "write")
+    .map(({ projectId }) => projectId)
+    .sort();
+  const expected = [...projectIds].sort();
+  return actual.length === expected.length
+    && actual.every((projectId, index) => projectId === expected[index]);
 }

@@ -20,10 +20,10 @@ function temporaryHome() {
   return mkdtempSync(join(tmpdir(), "yui-file-store-"));
 }
 
-test("storage schema initializes layout v6 with aggregate v7 and rejects non-current versions", () => {
+test("storage schema initializes layout v6 with aggregate v8 and rejects non-current versions", () => {
   const home = temporaryHome();
   assert.equal(CURRENT_STORAGE_LAYOUT_VERSION, 6);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 7);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 8);
   assert.equal(inspectStorageSchema(home).status, "uninitialized");
 
   ensureStorageSchema(home, new Date("2026-07-19T00:00:00.000Z"));
@@ -66,9 +66,10 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     updatedAt: timestamp
   };
   const task = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: "task-1",
     title: "Restore storage",
+    projectBindings: [],
     status: "draft",
     createdAt: timestamp,
     updatedAt: timestamp
@@ -117,13 +118,14 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     }
   };
   const item = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: "work-1",
     taskId: task.id,
     title: "Implement",
     objective: "Implement",
     acceptance: [],
     dependsOn: [],
+    writeProjectIds: [],
     revision: 1,
     status: "running",
     createdAt: timestamp,
@@ -181,8 +183,8 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   });
 
   const onDisk = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
-  assert.equal(onDisk.schemaVersion, 7);
-  assert.equal(onDisk.tasks[task.id].schemaVersion, 6);
+  assert.equal(onDisk.schemaVersion, 8);
+  assert.equal(onDisk.tasks[task.id].schemaVersion, 7);
   assert.equal(onDisk.revision, 1);
   assert.deepEqual(store.getConfiguredAgent("codex"), agent);
   assert.deepEqual(store.getGlobalRole("operator"), globalRole);
@@ -219,7 +221,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify(incompatible));
   assert.throws(
     () => new FileTaskStore(home).listTasks(),
-    /Task aggregate task-1 must use schemaVersion 6/
+    /Task aggregate task-1 must use schemaVersion 7/
   );
 });
 
@@ -229,9 +231,10 @@ test("FileTaskStore persists strict task, role, and operator WorkMailboxes", () 
   const store = new FileTaskStore(home);
   const timestamp = "2026-07-22T00:00:00.000Z";
   const task = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: "task-1",
     title: "Mailbox storage",
+    projectBindings: [],
     status: "draft",
     createdAt: timestamp,
     updatedAt: timestamp
@@ -347,9 +350,10 @@ test("FileTaskStore rejects mailbox identity and dangling cross-references", () 
   const store = new FileTaskStore(home);
   const timestamp = "2026-07-22T00:00:00.000Z";
   store.saveTask({
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: "task-1",
     title: "Mailbox validation",
+    projectBindings: [],
     status: "draft",
     createdAt: timestamp,
     updatedAt: timestamp
@@ -410,14 +414,15 @@ test("record versions and aggregate shape are validated without silently repairi
   ensureStorageSchema(home);
   const store = new FileTaskStore(home);
   assert.throws(
-    () => store.saveTask({ schemaVersion: 2, id: "task-1" }),
-    /Task.*schemaVersion 1/
+    () => store.saveTask({ schemaVersion: 1, id: "task-1" }),
+    /Task.*schemaVersion 2/
   );
   assert.throws(
     () => store.saveTask({
-      schemaVersion: 1,
+      schemaVersion: 2,
       id: "task-invalid",
       title: "Invalid completion",
+      projectBindings: [],
       status: "completed",
       createdAt: "2026-07-19T00:00:00.000Z",
       updatedAt: "2026-07-19T00:00:00.000Z"
@@ -427,21 +432,23 @@ test("record versions and aggregate shape are validated without silently repairi
 
   const timestamp = "2026-07-19T00:00:00.000Z";
   const task = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: "task-1",
     title: "Validate WorkItem cleanup",
+    projectBindings: [],
     status: "draft",
     createdAt: timestamp,
     updatedAt: timestamp
   };
   const item = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: "work-1",
     taskId: task.id,
     title: "Implement",
     objective: "Implement",
     acceptance: [],
     dependsOn: [],
+    writeProjectIds: [],
     revision: 1,
     assignee: "leader",
     status: "completed",
@@ -459,7 +466,7 @@ test("record versions and aggregate shape are validated without silently repairi
   );
 
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 8,
     revision: 1,
     config: { schemaVersion: 1 },
     configuredAgents: {},

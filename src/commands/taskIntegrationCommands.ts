@@ -1,4 +1,6 @@
 import { NodeGitWorkspace } from "../repository/gitWorkspace.js";
+import { resolveProject } from "../repository/project.js";
+import { workspaceProjectEntry } from "../worktree/roleWorkspace.js";
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import type { TaskStore } from "../storage/taskStore.js";
@@ -76,28 +78,46 @@ async function start(
   home: string,
   now: () => Date
 ): Promise<Readonly<{ output: string; data: unknown }>> {
-  const usage = "Task Integration start usage: yui task integration start <task> --change-set <id> [--change-set <id> ...] [--target <ref>] [--check <command> ...].";
-  const parsed = parseRepeatable(args, new Set(["--change-set", "--check"]), new Set(["--target"]), usage);
+  const usage = "Task Integration start usage: yui task integration start <task> [--project <project>] --change-set <id> [--change-set <id> ...] [--target <ref>] [--check <command> ...].";
+  const parsed = parseRepeatable(
+    args,
+    new Set(["--change-set", "--check"]),
+    new Set(["--project", "--target"]),
+    usage
+  );
   if (parsed.positionals.length !== 1) throw usageError(usage);
   const task = store.getTask(parsed.positionals[0]);
   if (task === null) throw usageError(`Task not found: ${parsed.positionals[0]}.`);
   if (task.status !== "active") {
     throw usageError(`Task is not active: ${task.id}/${task.status}.`);
   }
-  if (task.projectId === undefined) throw usageError(`Task has no Project: ${task.id}.`);
-  const project = store.getProject(task.projectId);
-  if (project === null) throw usageError(`Project not found: ${task.projectId}.`);
   const changeSetIds = parsed.many.get("--change-set") ?? [];
   if (changeSetIds.length === 0) throw usageError("--change-set is required.", usage);
-  for (const id of changeSetIds) {
+  const changeSets = changeSetIds.map((id) => {
     const changeSet = store.getChangeSet(task.id, id);
     if (changeSet === null) throw usageError(`ChangeSet not found: ${id}.`);
-    if (changeSet.projectId !== project.id) {
-      throw usageError(`ChangeSet belongs to another Project: ${id}.`);
-    }
+    return changeSet;
+  });
+  const projectIds = [...new Set(changeSets.map(({ projectId }) => projectId))];
+  if (projectIds.length !== 1) {
+    throw usageError("An Integration may only contain ChangeSets from one Project.");
+  }
+  const requestedProject = parsed.one.get("--project");
+  const project = requestedProject === undefined
+    ? store.getProject(projectIds[0])
+    : resolveProject(store.listProjects(), requestedProject);
+  if (project === null) throw usageError(`Project not found: ${requestedProject ?? projectIds[0]}.`);
+  if (project.id !== projectIds[0]) {
+    throw usageError(`ChangeSets belong to another Project: ${projectIds[0]}.`);
+  }
+  if (!task.projectBindings.some(({ projectId }) => projectId === project.id)) {
+    throw usageError(`Project does not belong to Task: ${project.id}.`);
   }
   const mainWorkspace = store.getRoleWorkspace(task.id, "leader");
-  const targetRef = parsed.one.get("--target") ?? mainWorkspace?.branch;
+  const mainEntry = mainWorkspace === null
+    ? undefined
+    : workspaceProjectEntry(mainWorkspace, project.id);
+  const targetRef = parsed.one.get("--target") ?? mainEntry?.branch;
   if (targetRef === undefined) {
     throw usageError(`Task main worktree is not ready; reconcile the Task first: ${task.id}.`);
   }
@@ -105,6 +125,7 @@ async function start(
   const integration = createIntegrationAttempt({
     id: store.nextIntegrationAttemptId(task.id),
     taskId: task.id,
+    projectId: project.id,
     targetRef,
     expectedHead,
     changeSetIds,
@@ -240,12 +261,14 @@ function list(
         `Integration Attempts: ${task.id}`,
         [
           { header: "Integration", minWidth: 11, maxWidth: 24 },
+          { header: "Project", minWidth: 8, maxWidth: 20 },
           { header: "Target", minWidth: 8, maxWidth: 30 },
           { header: "Changes", minWidth: 7, maxWidth: 10 },
           { header: "Status", minWidth: 7, maxWidth: 20 }
         ],
         integrations.map((entry) => [
           entry.id,
+          entry.projectId,
           entry.targetRef,
           String(entry.changeSetIds.length),
           entry.status
@@ -265,6 +288,7 @@ function show(
     output: `${[
       `Integration Attempt: ${integration.id}`,
       `Task: ${integration.taskId}`,
+      `Project: ${integration.projectId}`,
       `Target: ${integration.targetRef}`,
       `Expected head: ${integration.expectedHead}`,
       `Candidate: ${integration.candidateCommit ?? "-"}`,

@@ -23,8 +23,9 @@ workspace, validation, and return protocol.
 - A YOLO or provider permission-bypass launch removes interactive prompts; it
   does not broaden the supplied Profile, WorkItem, workspace, or read/write
   authority.
-- Read-only work must not modify files. Write work may modify only the supplied
-  workspace.
+- Read-only work must not modify files. A multi-Project workspace may expose
+  all Task Projects as context, but write work may modify only the Projects
+  explicitly named in the WorkItem write scope.
 - If the brief requests a mutation while the supplied Profile or access
   boundary is read-only, stop and report a routing mismatch to the Leader. Do
   not attempt the write or relax the permission yourself.
@@ -32,6 +33,11 @@ workspace, validation, and return protocol.
   honestly.
 - If blocked by missing intent or a semantic conflict, stop safely and identify
   the exact Leader decision required.
+- If another Project must be modified, stop and report the Project, reason, and
+  impact to the Leader, then yield the current Run. Do not write through its
+  Task-main context directory or expand the WorkItem scope yourself. If the
+  Leader approves, continue only after a new dispatch names the expanded
+  writable Project set.
 
 ## Native subagent
 

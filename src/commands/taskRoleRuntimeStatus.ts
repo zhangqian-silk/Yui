@@ -83,11 +83,11 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
         status.tmux.target
       ].filter((value): value is string => value !== undefined).join(", ");
   const workspaceDetails = status.workspace.managed
-    ? [
-        `  Project          ${status.workspace.projectId}`,
-        `  Branch           ${status.workspace.branch}`,
-        `  Base             ${status.workspace.baseRef} (${status.workspace.baseCommit})`
-      ]
+    ? status.workspace.entries.map((entry) => (
+        `  Project          ${entry.directory} (${entry.access}) ${entry.branch} @ ${
+          entry.baseCommit
+        }`
+      ))
     : [];
   return [
     `Task Role status: ${status.taskId}/${status.roleName}`,
@@ -101,7 +101,9 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
     `  Active run       ${activeRun}`,
     `  Native session   ${nativeSession}`,
     `  tmux pane        ${tmux}`,
-    `  Workspace        ${status.workspace.path}`,
+    `  Workspace        ${
+      status.workspace.managed ? status.workspace.root : status.workspace.path
+    }`,
     ...workspaceDetails
   ].join("\n").concat("\n");
 }

@@ -194,9 +194,9 @@ test("restored persistent domain records are plain JSON with explicit schema ver
   const yielded = yieldAgentRun(run, "Implemented", later);
   const snapshot = JSON.parse(JSON.stringify({ task, workItem, yielded }));
 
-  assert.equal(snapshot.task.schemaVersion, 1);
+  assert.equal(snapshot.task.schemaVersion, 2);
   assert.equal(snapshot.task.status, "draft");
-  assert.equal(snapshot.workItem.schemaVersion, 2);
+  assert.equal(snapshot.workItem.schemaVersion, 3);
   assert.equal(snapshot.yielded.schemaVersion, 1);
   assert.equal(snapshot.yielded.status, "yielded");
   assert.equal(snapshot.yielded.endedAt, later.toISOString());
@@ -204,17 +204,36 @@ test("restored persistent domain records are plain JSON with explicit schema ver
 
 test("Task follows the retained draft, active, archived lifecycle", () => {
   const draft = createTask("task-1", "Lifecycle", now, {
-    projectId: "repo-1",
-    baseRef: "main"
+    projectBindings: [
+      { projectId: "repo-1", directory: "backend", baseRef: "main" },
+      { projectId: "repo-2", directory: "frontend", baseRef: "develop" }
+    ]
   });
   const active = activateTask(draft, later);
   const archived = archiveTask(active, new Date("2026-07-19T12:02:00.000Z"));
 
   assert.deepEqual([draft.status, active.status, archived.status], ["draft", "active", "archived"]);
   assert.equal("archived" in draft, false);
-  assert.equal(draft.projectId, "repo-1");
-  assert.equal(draft.baseRef, "main");
+  assert.deepEqual(draft.projectBindings, [
+    { projectId: "repo-1", directory: "backend", baseRef: "main" },
+    { projectId: "repo-2", directory: "frontend", baseRef: "develop" }
+  ]);
   assert.throws(() => activateTask(archived, later), /archived/i);
+});
+
+test("WorkItems keep the Leader-approved writable Project subset", () => {
+  const item = createWorkItem(
+    "work-1",
+    "task-1",
+    {
+      title: "Update the contract",
+      assignee: "worker",
+      writeProjectIds: ["repo-1", "repo-2"]
+    },
+    now
+  );
+
+  assert.deepEqual(item.writeProjectIds, ["repo-1", "repo-2"]);
 });
 
 test("terminal WorkItems cannot be reopened", () => {

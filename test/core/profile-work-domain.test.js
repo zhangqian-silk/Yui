@@ -7,7 +7,8 @@ import {
   updateAgentProfile
 } from "../../dist/profile/agentProfile.js";
 import {
-  createWorkItem
+  createWorkItem,
+  updateWorkItemWriteProjects
 } from "../../dist/workItem/workItem.js";
 import {
   createIntegrationAttempt,
@@ -64,17 +65,54 @@ test("WorkItem contains intent without provider-specific execution fields", () =
     "status",
     "taskId",
     "title",
-    "updatedAt"
+    "updatedAt",
+    "writeProjectIds"
   ]);
 
   assert.equal("agentId" in work, false);
   assert.equal("providerRef" in work, false);
 });
 
+test("WorkItem write scope is monotonic and idempotent", () => {
+  const work = createWorkItem("work-item-1", "task-1", {
+    title: "Update backend",
+    writeProjectIds: ["project-backend"]
+  }, now);
+  const later = new Date("2026-07-26T00:01:00.000Z");
+
+  const unchanged = updateWorkItemWriteProjects(
+    work,
+    ["project-backend"],
+    later
+  );
+  assert.equal(unchanged, work);
+
+  const expanded = updateWorkItemWriteProjects(
+    work,
+    ["project-backend", "project-frontend"],
+    later
+  );
+  assert.deepEqual(expanded.writeProjectIds, [
+    "project-backend",
+    "project-frontend"
+  ]);
+  assert.equal(expanded.revision, work.revision + 1);
+
+  assert.throws(
+    () => updateWorkItemWriteProjects(
+      expanded,
+      ["project-frontend"],
+      later
+    ),
+    /cannot remove.*project-backend/i
+  );
+});
+
 test("a later conflict replaces the consumed Leader decision without adding another state", () => {
   const integration = createIntegrationAttempt({
     id: "integration-1",
     taskId: "task-1",
+    projectId: "project-1",
     targetRef: "main",
     expectedHead: "a".repeat(40),
     changeSetIds: ["change-1"]

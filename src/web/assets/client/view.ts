@@ -326,8 +326,9 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
   taskMeta.append(statusPill(t, "status", task.status));
   if (task.priority) taskMeta.append(statusPill(t, "priority", task.priority));
   if (task.dueAt) taskMeta.append(metaItem(t("detail.due"), formatDateTime(task.dueAt, locale)));
-  if (task.projectName) taskMeta.append(metaItem(t("detail.project"), task.projectName));
-  if (task.baseRef) taskMeta.append(metaItem(t("detail.baseRef"), task.baseRef));
+  if (task.projectNames?.length) {
+    taskMeta.append(metaItem(t("detail.project"), task.projectNames.join(", ")));
+  }
   if (task.cwd) taskMeta.append(pathMetaItem(t("detail.workspace"), task.cwd));
   head.append(taskMeta);
   detail.append(head);
@@ -416,6 +417,13 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
   const briefSection = section(t("detail.focus"));
   if (data.brief) {
     briefSection.append(node("div", "brief-focus", data.brief.currentFocus || data.brief.objective));
+    if (data.brief.technicalApproach) {
+      const approach = labeledCopy(
+        t("detail.technicalApproach"),
+        data.brief.technicalApproach
+      );
+      if (approach) briefSection.append(approach);
+    }
     if (data.brief.leaderSummary) briefSection.append(node("p", "detail-description", data.brief.leaderSummary));
   } else {
     briefSection.append(node("div", "row", t("empty.brief")));
@@ -480,6 +488,11 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
       const objective = labeledCopy(t("detail.objective"), item.objective);
       if (objective) card.append(objective);
     }
+    const writeProjects = chipRow(
+      t("detail.writeProjects"),
+      item.writeProjectIds || []
+    );
+    if (writeProjects) card.append(writeProjects);
     const acceptance = criteriaList(t("detail.acceptance"), item.acceptance);
     if (acceptance) card.append(acceptance);
     if (item.dependsOn && item.dependsOn.length) {

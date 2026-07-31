@@ -232,8 +232,26 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "create",
     summary: "Create a Draft Task.",
-    usage: "yui task create <title> [--project <project>] [--base <ref>]",
+    usage: "yui task create <title> [--project <project> ...] [--base <project>=<ref> ...]",
     options: ["--project", "--base"]
+  },
+  {
+    name: "project",
+    summary: "Manage Projects bound to a Task.",
+    sections: [{ id: "manage", title: "Commands", entries: ["list", "add"] }],
+    children: [
+      {
+        name: "list",
+        summary: "List the Projects bound to a Task.",
+        usage: "yui task project list <task>"
+      },
+      {
+        name: "add",
+        summary: "Add a Project to a Task.",
+        usage: "yui task project add <task> <project> [--base <ref>] [--directory <name>]",
+        options: ["--base", "--directory"]
+      }
+    ]
   },
   {
     name: "update",
@@ -355,7 +373,7 @@ const taskChildren: readonly NodeInput[] = [
       id: "manage",
       title: "Commands",
       entries: [
-        "create", "list", "update", "dispatch", "isolate", "capture", "cleanup",
+        "create", "list", "update", "scope", "dispatch", "isolate", "capture", "cleanup",
         "accept", "reject", "cancel"
       ]
     }],
@@ -363,8 +381,8 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "create",
         summary: "Create a work item.",
-        usage: "yui task work create <task> <title> [--objective <text>] [--accept <criterion> ...] [--after <work> ...] [--role <name>]",
-        options: ["--objective", "--accept", "--after", "--role"]
+        usage: "yui task work create <task> <title> [--project <project> ...] [--objective <text>] [--accept <criterion> ...] [--after <work> ...] [--role <name>]",
+        options: ["--project", "--objective", "--accept", "--after", "--role"]
       },
       { name: "list", summary: "List work items for a Task.", usage: "yui task work list <task>" },
       {
@@ -375,6 +393,12 @@ const taskChildren: readonly NodeInput[] = [
         argumentValues: {
           1: ["todo", "running", "done", "failed", "cancelled", "superseded"]
         }
+      },
+      {
+        name: "scope",
+        summary: "Expand the Projects a WorkItem may modify.",
+        usage: "yui task work scope <work> [--project <project> ...]",
+        options: ["--project"]
       },
       {
         name: "dispatch",
@@ -441,8 +465,8 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "start",
         summary: "Build, validate, and CAS-commit an integration candidate.",
-        usage: "yui task integration start <task> --change-set <id> [--change-set <id> ...] [--target <ref>] [--check <command> ...]",
-        options: ["--change-set", "--target", "--check"]
+        usage: "yui task integration start <task> [--project <project>] --change-set <id> [--change-set <id> ...] [--target <ref>] [--check <command> ...]",
+        options: ["--project", "--change-set", "--target", "--check"]
       },
       {
         name: "continue",
@@ -476,8 +500,8 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "update",
         summary: "Create or update the Task Brief.",
-        usage: "yui task brief update <task> [--objective <text>] [--boundary <text> ...] [--focus <text>] [--leader-summary <text>]",
-        options: ["--objective", "--boundary", "--focus", "--leader-summary"]
+        usage: "yui task brief update <task> [--objective <text>] [--boundary <text> ...] [--approach <text>] [--focus <text>] [--leader-summary <text>]",
+        options: ["--objective", "--boundary", "--approach", "--focus", "--leader-summary"]
       }
     ]
   },
@@ -753,7 +777,7 @@ export const ROOT_COMMAND = buildNode({
       name: "task",
       summary: "Manage Tasks, WorkItems, Agent Runs, and integration.",
       sections: [
-        { id: "lifecycle", title: "Lifecycle", entries: ["create", "update", "activate", "complete", "reopen", "list", "show", "context", "archive", "reconcile"] },
+        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "update", "activate", "complete", "reopen", "list", "show", "context", "archive", "reconcile"] },
         { id: "collaboration", title: "Collaboration", entries: ["message", "input", "work", "run", "integration", "role", "enter"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
       ],

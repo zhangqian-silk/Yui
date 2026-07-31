@@ -82,21 +82,61 @@ yui config show
 yui config set --time-zone Europe/London
 ```
 
-A Project-backed Task receives its main worktree when it is created at `<workspace>/worktree/<project>/<task-id>/main`. Roles share Task main by default. During execution, the Leader may directly create a WorkItem-owned isolated worktree when concurrent edits have meaningful conflict risk:
+A repository-backed Task may bind multiple Projects, each with its own base
+ref. Yui exposes them under one Task workspace root:
+
+```text
+<workspace>/tasks/<task-id>/main/
+├── backend/
+├── frontend/
+└── shared-sdk/
+```
+
+Each Project directory is backed by its own managed Git worktree. The Leader
+starts at the root and sees the complete Task context. Create all known
+bindings together, or let the active Task Leader add one when the same outcome
+expands:
 
 ```sh
+yui task create "Update authentication" \
+  --project backend --project frontend \
+  --base backend=develop --base frontend=main
+yui task project add <task-id> shared-sdk --base main
+```
+
+Implementation WorkItems declare the Projects they may modify. Their workspace
+keeps the same relative layout, creates isolated worktrees only for that write
+scope, and exposes the other Task Projects as context from Task main. Yui uses
+Linux `bubblewrap` (`bwrap`) when launching this mixed-access workspace so
+context Projects are mounted read-only independently of the native Agent's own
+permission mode. Install `bubblewrap` before dispatching such a WorkItem.
+
+Write scope may only expand. The Leader supplies the complete old-plus-new set
+after a Worker yields and reports that another repository is required; an
+existing writable Project cannot be removed:
+
+```sh
+yui task work create <task-id> "Update contract" \
+  --project backend --project frontend --role implementer
+yui task work scope <work-item-id> \
+  --project backend --project frontend --project shared-sdk
 yui task work isolate <work-item-id>
+yui task work reject <work-item-id> \
+  --summary "Write scope expanded; continue in the refreshed workspace."
+yui task work dispatch <work-item-id>
 yui task work capture <work-item-id>
-yui task integration start <task-id> --change-set <change-set-id> --check "<validation command>"
+yui task integration start <task-id> --project backend \
+  --change-set <backend-change-set-id> --check "<validation command>"
 yui task integration cleanup <integration-id>
 yui task work cleanup <work-item-id> --integrated
 ```
 
-`capture` records the current isolated HEAD as an immutable WorkItem ChangeSet.
-Repeat capture at the same HEAD reuses the record; a repaired HEAD produces a
-new candidate. The Leader reviews semantics before capture and accepts only
-after the latest candidate is integrated. Yui refuses integrated cleanup while
-that result remains unintegrated. Use `--abandon` only for deliberate discard.
+`capture` records one immutable ChangeSet per modified Project. Repeat capture
+at the same HEAD reuses the record; a repaired HEAD produces a new candidate.
+Integration remains a single-Project Git transaction, so the Leader integrates
+each Project independently. Acceptance succeeds only after every modified
+Project's latest candidate is integrated. Yui refuses integrated cleanup while
+any result remains unintegrated. Use `--abandon` only for deliberate discard.
 Dirty worktrees are retained. Native Agent Sessions may be scoped to their
 launch directory, so Yui retires a stopped Role Session whenever the Role moves
 between Task main and an isolated WorkItem worktree. The next dispatch starts a
@@ -117,8 +157,9 @@ yui operator enter
 Without `--task`, `operator submit` creates a new Draft. Drafts accept planning changes but must be activated before Agent execution.
 Operator resolves every request against the Project catalog and existing Task
 context. Follow-up requirements, fixes, reviews, and questions for the same
-bounded outcome stay in that Task; a different Project, outcome, base ref, or
-lifecycle creates a separate Task. Features, bugs, and questions use the same
+bounded outcome stay in that Task even when they involve multiple Projects.
+A distinct outcome, ownership boundary, or lifecycle creates a separate Task.
+Features, bugs, and questions use the same
 Task/WorkItem model rather than separate workflow types.
 `operator list` shows recent conversations in fixed most-recently-updated order using
 their Agent and readable title or preview; native provider session IDs remain
@@ -226,9 +267,12 @@ and `task work cancel` for obsolete non-running work. WorkItem and Integration
 worktrees and check logs remain available as evidence until explicit cleanup.
 
 For long-running Tasks, the Leader keeps Yui—not a native transcript—as the
-recovery authority. It updates Brief focus and Leader summary before every
-yield, records material choices as Decisions, adds phase outcomes as
-Milestones, and promotes only cross-Task stable facts to Project Knowledge.
+recovery authority. The Task Brief owns the overall technical approach,
+including how coordinated Project changes fit together. WorkItems own the
+executable per-Project modifications and acceptance checks. The Leader updates
+Brief focus and Leader summary before every yield, records material choices as
+Decisions, adds phase outcomes as Milestones, and promotes only cross-Task
+stable facts to Project Knowledge.
 
 When an active Leader Run cannot continue without a user decision, it can create a durable InputRequest and yield its Run:
 

@@ -59,8 +59,7 @@ test("same-file WorkItems run in separate worktrees and a conflicting integratio
   );
   store.saveProject(project);
   const task = activateTask(createTask(store.nextTaskId(), "Concurrent edits", now, {
-    projectId: project.id,
-    baseRef: "master"
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: "master" }]
   }), now);
   store.saveTask(task);
   for (const roleName of ["leader", "worker-1", "worker-2"]) {
@@ -77,14 +76,16 @@ test("same-file WorkItems run in separate worktrees and a conflicting integratio
     title: "First edit",
     acceptance: [],
     dependsOn: [],
-    assignee: "worker-1"
+    assignee: "worker-1",
+    writeProjectIds: [project.id]
   }, now);
   store.saveWorkItem(task.id, first);
   const second = createWorkItem(store.nextWorkItemId(task.id), task.id, {
     title: "Second edit",
     acceptance: [],
     dependsOn: [],
-    assignee: "worker-2"
+    assignee: "worker-2",
+    writeProjectIds: [project.id]
   }, now);
   store.saveWorkItem(task.id, second);
   const leaderOptions = {
@@ -109,7 +110,7 @@ test("same-file WorkItems run in separate worktrees and a conflicting integratio
     { path: "later.txt", content: "later\n" }
   );
 
-  assert.notEqual(firstResult.workspace.path, secondResult.workspace.path);
+  assert.notEqual(firstResult.workspace.root, secondResult.workspace.root);
   assert.equal(firstResult.changeSet.baseCommit, baseCommit);
   assert.equal(secondResult.changeSet.baseCommit, baseCommit);
   assert.deepEqual(firstResult.changeSet.changedPaths, ["shared.txt"]);
@@ -119,6 +120,7 @@ test("same-file WorkItems run in separate worktrees and a conflicting integratio
   const failedCheckIntegration = createIntegrationAttempt({
     id: store.nextIntegrationAttemptId(task.id),
     taskId: task.id,
+    projectId: project.id,
     targetRef: "master",
     expectedHead: baseCommit,
     changeSetIds: [firstResult.changeSet.id],
@@ -143,6 +145,7 @@ test("same-file WorkItems run in separate worktrees and a conflicting integratio
   const firstIntegration = createIntegrationAttempt({
     id: store.nextIntegrationAttemptId(task.id),
     taskId: task.id,
+    projectId: project.id,
     targetRef: "master",
     expectedHead: baseCommit,
     changeSetIds: [firstResult.changeSet.id],
@@ -154,6 +157,7 @@ test("same-file WorkItems run in separate worktrees and a conflicting integratio
   const preparationFailure = createIntegrationAttempt({
     id: store.nextIntegrationAttemptId(task.id),
     taskId: task.id,
+    projectId: project.id,
     targetRef: "master",
     expectedHead: baseCommit,
     changeSetIds: [firstResult.changeSet.id]
@@ -208,12 +212,12 @@ test("same-file WorkItems run in separate worktrees and a conflicting integratio
     )).output,
     /Cleaned Integration worktree/
   );
-  assert.equal(existsSync(firstResult.workspace.path), false);
+  assert.equal(existsSync(firstResult.workspace.root), false);
   assert.equal(existsSync(firstIntegrated.workspace.path), false);
   assert.equal(existsSync(successfulCheckLog), false);
   assert.throws(() => git([
     "-C", repositoryPath, "show-ref", "--verify", "--quiet",
-    `refs/heads/${firstResult.workspace.branch}`
+    `refs/heads/${firstResult.entry.branch}`
   ]));
   assert.throws(() => git([
     "-C", repositoryPath, "show-ref", "--verify", "--quiet",
@@ -223,6 +227,7 @@ test("same-file WorkItems run in separate worktrees and a conflicting integratio
   const secondIntegration = createIntegrationAttempt({
     id: store.nextIntegrationAttemptId(task.id),
     taskId: task.id,
+    projectId: project.id,
     targetRef: "master",
     expectedHead: advancedHead,
     changeSetIds: [secondResult.changeSet.id],
@@ -234,8 +239,8 @@ test("same-file WorkItems run in separate worktrees and a conflicting integratio
   assert.equal(conflicted.status, "blocked");
   assert.deepEqual(conflicted.attempt.conflict.affectedPaths, ["shared.txt"]);
   assert.equal(git(["-C", repositoryPath, "rev-parse", "master"]).trim(), advancedHead);
-  assert.equal(existsSync(firstResult.workspace.path), false);
-  assert.equal(existsSync(secondResult.workspace.path), true);
+  assert.equal(existsSync(firstResult.workspace.root), false);
+  assert.equal(existsSync(secondResult.workspace.root), true);
   assert.equal(existsSync(conflicted.workspace.path), true);
   assert.throws(() => git([
     "-C", repositoryPath, "show-ref", "--verify", "--quiet",
@@ -348,8 +353,7 @@ test("ChangeSet capture rejects a branch escape and a HEAD unrelated to the reco
   );
   store.saveProject(project);
   const task = activateTask(createTask(store.nextTaskId(), "ChangeSet integrity", now, {
-    projectId: project.id,
-    baseRef: "master"
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: "master" }]
   }), now);
   store.saveTask(task);
   for (const roleName of ["leader", "branch-worker", "ancestry-worker"]) {
@@ -370,28 +374,30 @@ test("ChangeSet capture rejects a branch escape and a HEAD unrelated to the reco
     title: "Branch escape",
     acceptance: [],
     dependsOn: [],
-    assignee: "branch-worker"
+    assignee: "branch-worker",
+    writeProjectIds: [project.id]
   }, now);
   store.saveWorkItem(task.id, branchWork);
   const branchWorkspace = await preparer.prepareWorkItemWorkspace(branchWork.id);
+  const branchEntry = branchWorkspace.entries.find(({ access }) => access === "write");
   const branchRunning = updateWorkItemStatus(branchWork, "running", now);
   store.saveWorkItem(task.id, branchRunning);
   store.saveWorkItem(
     task.id,
     updateWorkItemStatus(branchRunning, "awaiting_acceptance", now)
   );
-  git(["-C", branchWorkspace.path, "checkout", "-b", "unexpected-branch"]);
-  writeFileSync(join(branchWorkspace.path, "shared.txt"), "unexpected\n");
+  git(["-C", branchEntry.path, "checkout", "-b", "unexpected-branch"]);
+  writeFileSync(join(branchEntry.path, "shared.txt"), "unexpected\n");
   await assert.rejects(
     manager.capture(branchWork.id),
     /left its managed branch/
   );
   assert.equal(
-    git(["-C", branchWorkspace.path, "rev-parse", "HEAD"]).trim(),
-    branchWorkspace.baseCommit
+    git(["-C", branchEntry.path, "rev-parse", "HEAD"]).trim(),
+    branchEntry.baseCommit
   );
   assert.match(
-    git(["-C", branchWorkspace.path, "status", "--porcelain", "--untracked-files=all"]),
+    git(["-C", branchEntry.path, "status", "--porcelain", "--untracked-files=all"]),
     /shared\.txt/
   );
 
@@ -399,25 +405,27 @@ test("ChangeSet capture rejects a branch escape and a HEAD unrelated to the reco
     title: "Unrelated history",
     acceptance: [],
     dependsOn: [],
-    assignee: "ancestry-worker"
+    assignee: "ancestry-worker",
+    writeProjectIds: [project.id]
   }, now);
   store.saveWorkItem(task.id, ancestryWork);
   const ancestryWorkspace = await preparer.prepareWorkItemWorkspace(ancestryWork.id);
+  const ancestryEntry = ancestryWorkspace.entries.find(({ access }) => access === "write");
   const ancestryRunning = updateWorkItemStatus(ancestryWork, "running", now);
   store.saveWorkItem(task.id, ancestryRunning);
   store.saveWorkItem(
     task.id,
     updateWorkItemStatus(ancestryRunning, "awaiting_acceptance", now)
   );
-  const tree = git(["-C", ancestryWorkspace.path, "rev-parse", "HEAD^{tree}"]).trim();
+  const tree = git(["-C", ancestryEntry.path, "rev-parse", "HEAD^{tree}"]).trim();
   const unrelatedCommit = git([
-    "-C", ancestryWorkspace.path,
+    "-C", ancestryEntry.path,
     "-c", "user.name=Test",
     "-c", "user.email=test@example.com",
     "commit-tree", tree,
     "-m", "unrelated root"
   ]).trim();
-  git(["-C", ancestryWorkspace.path, "reset", "--hard", unrelatedCommit]);
+  git(["-C", ancestryEntry.path, "reset", "--hard", unrelatedCommit]);
   await assert.rejects(
     manager.capture(ancestryWork.id),
     /does not descend from its recorded base/
@@ -433,17 +441,18 @@ async function createWriteResult(
   additionalCommit
 ) {
   const workspace = await preparer.prepareWorkItemWorkspace(workItem.id);
-  writeFileSync(join(workspace.path, "shared.txt"), content);
+  const entry = workspace.entries.find(({ access }) => access === "write");
+  writeFileSync(join(entry.path, "shared.txt"), content);
   if (additionalCommit !== undefined) {
-    git(["-C", workspace.path, "add", "shared.txt"]);
+    git(["-C", entry.path, "add", "shared.txt"]);
     git([
-      "-C", workspace.path,
+      "-C", entry.path,
       "-c", "user.name=Test",
       "-c", "user.email=test@example.com",
       "commit", "-m", "first change"
     ]);
     writeFileSync(
-      join(workspace.path, additionalCommit.path),
+      join(entry.path, additionalCommit.path),
       additionalCommit.content
     );
   }
@@ -453,9 +462,9 @@ async function createWriteResult(
     workItem.taskId,
     updateWorkItemStatus(running, "awaiting_acceptance", now)
   );
-  const changeSet = await manager.capture(workItem.id);
-  assert.notEqual(changeSet, null);
-  return { workspace, changeSet };
+  const [changeSet] = await manager.capture(workItem.id);
+  assert.notEqual(changeSet, undefined);
+  return { workspace, entry, changeSet };
 }
 
 function git(args) {

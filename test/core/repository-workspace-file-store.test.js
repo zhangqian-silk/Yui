@@ -35,6 +35,7 @@ import { activateTask, completeTask, createTask } from "../../dist/task/task.js"
 import {
   createWorkItem,
   recordWorkItemWorkspaceDisposition,
+  updateWorkItemWriteProjects,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { createRoleWorkspace } from "../../dist/worktree/roleWorkspace.js";
@@ -123,11 +124,16 @@ test("workspace coordination stops a live Role only after a clean preflight", as
     id: "work-1",
     taskId: "task-1",
     assignee: "worker",
+    writeProjectIds: ["project-1"],
     status: "pending"
   };
   const store = {
     findWorkItem: () => item,
-    getTask: () => ({ id: "task-1", status: "active", projectId: "project-1" }),
+    getTask: () => ({
+      id: "task-1",
+      status: "active",
+      projectBindings: [{ projectId: "project-1" }]
+    }),
     getActiveAgentRun: () => null,
     getRole: () => ({ name: "worker" }),
     getRoleWorkspace: () => null,
@@ -180,6 +186,7 @@ test("workspace cleanup stops a restored Role before converging a missing worktr
     id: "work-1",
     taskId: "task-1",
     assignee: "worker",
+    writeProjectIds: ["project-1"],
     status: "completed"
   };
   const coordinator = new TaskWorkspaceCoordinator({
@@ -206,6 +213,52 @@ test("workspace cleanup stops a restored Role before converging a missing worktr
     ["stop", "task-1", ["worker"]],
     ["cleanup", "integrated"]
   ]);
+});
+
+test("WorkItem isolation refreshes read context after the Task gains a Project", async () => {
+  const item = {
+    id: "work-1",
+    taskId: "task-1",
+    assignee: "worker",
+    writeProjectIds: ["project-1"],
+    status: "pending"
+  };
+  const task = {
+    id: "task-1",
+    status: "active",
+    projectBindings: [{ projectId: "project-1" }, { projectId: "project-2" }]
+  };
+  const stale = {
+    owner: { type: "work-item", workItemId: item.id },
+    entries: [{ projectId: "project-1", access: "write" }]
+  };
+  const refreshed = {
+    ...stale,
+    entries: [
+      { projectId: "project-1", access: "write" },
+      { projectId: "project-2", access: "read" }
+    ]
+  };
+  let refreshes = 0;
+  const coordinator = new TaskWorkspaceCoordinator({
+    findWorkItem: () => item,
+    getTask: () => task,
+    getRole: () => ({ name: "worker" }),
+    getRoleWorkspace: () => stale,
+    getActiveAgentRun: () => null,
+    getTaskRoleSessionSet: () => null
+  }, {
+    async prepareTaskWorkspace() {},
+    async prepareWorkItemWorkspace() {
+      refreshes += 1;
+      return refreshed;
+    }
+  }, {
+    async stopTaskRoleSessions() {}
+  });
+
+  assert.equal(await coordinator.isolateWorkItem(item.id), refreshed);
+  assert.equal(refreshes, 1);
 });
 
 test("dirty WorkItem preflight retains both runtime and worktree", async () => {
@@ -246,7 +299,11 @@ test("invalid WorkItem isolation leaves a live Role session untouched", async ()
   let stopped = false;
   const coordinator = new TaskWorkspaceCoordinator({
     findWorkItem: () => item,
-    getTask: () => ({ id: "task-1", status: "active", projectId: "project-1" }),
+    getTask: () => ({
+      id: "task-1",
+      status: "active",
+      projectBindings: [{ projectId: "project-1" }]
+    }),
     getActiveAgentRun: () => null,
     getRole: () => ({ name: "worker" }),
     getRoleWorkspace: () => null,
@@ -708,8 +765,7 @@ test("a Project-backed Task owns one main worktree shared by Roles", async (t) =
   const { home, workspace, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "Project Task", NOW, {
-    projectId: project.id,
-    baseRef: project.developmentBranch
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   const agent = addTaskRoles(store, task, repositoryPath, ["leader", "worker", "reviewer"]);
   const planner = new FileRoleLaunchPlanner(home, store, { cliPath: "/dist/cli.js" });
@@ -722,7 +778,8 @@ test("a Project-backed Task owns one main worktree shared by Roles", async (t) =
   }), /workspace is not ready/i);
 
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
-  const main = join(workspace, "worktree", "Yui", task.id, "main");
+  const main = join(workspace, "tasks", task.id, "main");
+  const mainProject = join(workspace, "worktree", "Yui", task.id, "main");
   assert.deepEqual(await preparer.prepareTaskWorkspace(task.id), {
     taskId: task.id,
     status: "ready",
@@ -733,13 +790,13 @@ test("a Project-backed Task owns one main worktree shared by Roles", async (t) =
   assert.deepEqual(store.listRoleWorkspaces(task.id).map((entry) => ({
     owner: entry.owner,
     roleName: entry.roleName,
-    path: entry.path
+    root: entry.root
   })), [{
     owner: { type: "task" },
     roleName: "leader",
-    path: main
+    root: main
   }]);
-  assert.equal(existsSync(join(main, ".git")), true);
+  assert.equal(existsSync(join(mainProject, ".git")), true);
   assert.doesNotThrow(() => planner.plan({
     taskId: task.id,
     roleName: "reviewer",
@@ -747,6 +804,190 @@ test("a Project-backed Task owns one main worktree shared by Roles", async (t) =
     adapterId: agent.adapterId,
     mode: "new"
   }));
+});
+
+test("a multi-Project Task and WorkItem expose one root with per-Project access", async (t) => {
+  const { root, home, workspace, repositoryPath, store } = fixture(t);
+  await runProjectCommand([
+    "add", "Backend", repositoryPath,
+    "--remote", "git@example.invalid:backend.git",
+    "--stable", "HEAD",
+    "--development", "HEAD"
+  ], store, { now: () => new Date(NOW) });
+  const frontendPath = join(root, "frontend");
+  execFileSync("git", ["init", "-q", frontendPath]);
+  execFileSync("git", ["-C", frontendPath, "config", "user.name", "Yui Test"]);
+  execFileSync("git", ["-C", frontendPath, "config", "user.email", "yui@example.invalid"]);
+  writeFileSync(join(frontendPath, "tracked.txt"), "frontend\n");
+  execFileSync("git", ["-C", frontendPath, "add", "tracked.txt"]);
+  execFileSync("git", ["-C", frontendPath, "commit", "-qm", "initial"]);
+  await runProjectCommand([
+    "add", "Frontend", frontendPath,
+    "--remote", "git@example.invalid:frontend.git",
+    "--stable", "HEAD",
+    "--development", "HEAD"
+  ], store, { now: () => new Date(NOW) });
+  const backend = store.listProjects().find(({ name }) => name === "Backend");
+  const frontend = store.listProjects().find(({ name }) => name === "Frontend");
+  assert.notEqual(backend, undefined);
+  assert.notEqual(frontend, undefined);
+  const task = activateTask(createTask("task-1", "Cross-repository change", NOW, {
+    projectBindings: [
+      { projectId: backend.id, directory: "backend", baseRef: backend.developmentBranch }
+    ]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const item = createWorkItem("work-1", task.id, {
+    title: "Update backend using frontend context",
+    assignee: "worker",
+    writeProjectIds: [backend.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+
+  await preparer.prepareTaskWorkspace(task.id);
+  runTaskCommand([
+    "project", "add", task.id, frontend.id, "--directory", "frontend"
+  ], store, {
+    now: () => new Date(NOW),
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  });
+  const mainResult = await preparer.prepareTaskWorkspace(task.id);
+  assert.equal(mainResult.path, join(workspace, "tasks", task.id, "main"));
+  const main = store.getRoleWorkspace(task.id, "leader");
+  assert.equal(main.root, mainResult.path);
+  assert.deepEqual(main.entries.map(({ directory, access }) => ({ directory, access })), [
+    { directory: "backend", access: "write" },
+    { directory: "frontend", access: "write" }
+  ]);
+
+  const work = await preparer.prepareWorkItemWorkspace(item.id);
+  assert.equal(work.root, join(workspace, "tasks", task.id, "work-items", item.id));
+  assert.deepEqual(work.entries.map(({ directory, access }) => ({ directory, access })), [
+    { directory: "backend", access: "write" },
+    { directory: "frontend", access: "read" }
+  ]);
+  assert.notEqual(
+    realpathSync(join(work.root, "backend")),
+    realpathSync(join(main.root, "backend"))
+  );
+  assert.equal(
+    realpathSync(join(work.root, "frontend")),
+    realpathSync(join(main.root, "frontend"))
+  );
+  const isolatedPlan = new FileRoleLaunchPlanner(home, store, {
+    cliPath: "/dist/cli.js",
+    bubblewrapCommand: "/usr/bin/test-bwrap"
+  }).plan({
+    taskId: task.id,
+    roleName: "worker",
+    agentId: store.getRole(task.id, "worker").activeAgentId,
+    adapterId: "codex",
+    mode: "new"
+  });
+  assert.equal(isolatedPlan.launch.command, "/usr/bin/test-bwrap");
+  const readOnlyBind = isolatedPlan.launch.args.indexOf("--ro-bind");
+  assert.notEqual(readOnlyBind, -1);
+  assert.deepEqual(
+    isolatedPlan.launch.args.slice(readOnlyBind, readOnlyBind + 3),
+    ["--ro-bind", main.entries[1].path, main.entries[1].path]
+  );
+  const frontendGitDirectory = execFileSync(
+    "git",
+    [
+      "-C",
+      main.entries[1].path,
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir"
+    ],
+    { encoding: "utf8" }
+  ).trim();
+  assert.equal(
+    isolatedPlan.launch.args.some((argument, index, args) => (
+      argument === "--ro-bind"
+      && args[index + 1] === frontendGitDirectory
+      && args[index + 2] === frontendGitDirectory
+    )),
+    true
+  );
+  assert.match(isolatedPlan.launch.args.join(" "), /--chdir .*work-items.*work-1/);
+  assert.throws(
+    () => new FileRoleLaunchPlanner(home, store, {
+      cliPath: "/dist/cli.js",
+      environment: { PATH: join(root, "missing-bin") }
+    }).plan({
+      taskId: task.id,
+      roleName: "worker",
+      agentId: store.getRole(task.id, "worker").activeAgentId,
+      adapterId: "codex",
+      mode: "new"
+    }),
+    /bubblewrap is required.*read-only Project context/i
+  );
+
+  writeFileSync(join(work.root, "backend", "contract.txt"), "v2\n");
+  execFileSync("git", ["-C", join(work.root, "backend"), "add", "contract.txt"]);
+  execFileSync("git", [
+    "-C", join(work.root, "backend"), "commit", "-qm", "update backend contract"
+  ]);
+  const backendBaseCommit = work.entries.find(
+    ({ projectId }) => projectId === backend.id
+  ).baseCommit;
+  const expandedItem = updateWorkItemWriteProjects(
+    item,
+    [backend.id, frontend.id],
+    new Date(NOW.getTime() + 1)
+  );
+  store.saveWorkItem(task.id, expandedItem);
+  const expanded = await preparer.prepareWorkItemWorkspace(item.id);
+  assert.deepEqual(
+    expanded.entries.map(({ directory, access }) => ({ directory, access })),
+    [
+      { directory: "backend", access: "write" },
+      { directory: "frontend", access: "write" }
+    ]
+  );
+  assert.equal(
+    expanded.entries.find(({ projectId }) => projectId === backend.id).baseCommit,
+    backendBaseCommit
+  );
+
+  const running = updateWorkItemStatus(
+    expandedItem,
+    "running",
+    new Date(NOW.getTime() + 2)
+  );
+  store.saveWorkItem(task.id, running);
+  store.saveWorkItem(
+    task.id,
+    updateWorkItemStatus(
+      running,
+      "awaiting_acceptance",
+      new Date(NOW.getTime() + 3)
+    )
+  );
+  const manager = new WorkItemChangeSetManager(
+    store,
+    () => new Date(NOW.getTime() + 4)
+  );
+  const changeSets = await manager.capture(item.id);
+  assert.deepEqual(changeSets.map(({ projectId }) => projectId), [backend.id]);
+  const integration = await runTaskIntegrationCommand([
+    "start", task.id, "--change-set", changeSets[0].id
+  ], store, home, { now: () => new Date(NOW.getTime() + 5) });
+  assert.equal(integration.data.status, "committed");
+  assert.equal(integration.data.attempt.projectId, backend.id);
+  const proof = await manager.assertIntegrated(item.id);
+  assert.deepEqual(proof.projects.map(({ projectId }) => projectId), [
+    backend.id,
+    frontend.id
+  ]);
+  assert.equal(readFileSync(join(main.root, "backend", "contract.txt"), "utf8"), "v2\n");
 });
 
 test("a new Task reuses its managed branch after interrupted preparation", async (t) => {
@@ -767,18 +1008,20 @@ test("a new Task reuses its managed branch after interrupted preparation", async
 
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "Reject branch collision", NOW, {
-    projectId: project.id,
-    baseRef: project.developmentBranch
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   addTaskRoles(store, task, repositoryPath, ["leader"]);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
 
   const prepared = await preparer.prepareTaskWorkspace(task.id);
+  const preparedEntry = store.getRoleWorkspace(task.id, "leader").entries[0];
   assert.equal(
-    execFileSync("git", ["-C", prepared.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+    execFileSync("git", ["-C", preparedEntry.path, "rev-parse", "HEAD"], {
+      encoding: "utf8"
+    }).trim(),
     collisionCommit
   );
-  assert.equal(store.getRoleWorkspace(task.id, "leader").path, prepared.path);
+  assert.equal(store.getRoleWorkspace(task.id, "leader").root, prepared.path);
   assert.equal(store.getTask(task.id).cwd, prepared.path);
 });
 
@@ -786,24 +1029,27 @@ test("a persisted Task workspace can restore its retained branch after the direc
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "Restore retained branch", NOW, {
-    projectId: project.id,
-    baseRef: project.developmentBranch
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   addTaskRoles(store, task, repositoryPath, ["leader"]);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
   const first = await preparer.prepareTaskWorkspace(task.id);
-  writeFileSync(join(first.path, "progress.txt"), "retained progress\n");
-  execFileSync("git", ["-C", first.path, "add", "progress.txt"]);
-  execFileSync("git", ["-C", first.path, "commit", "-qm", "retained progress"]);
+  const firstEntry = store.getRoleWorkspace(task.id, "leader").entries[0];
+  writeFileSync(join(firstEntry.path, "progress.txt"), "retained progress\n");
+  execFileSync("git", ["-C", firstEntry.path, "add", "progress.txt"]);
+  execFileSync("git", ["-C", firstEntry.path, "commit", "-qm", "retained progress"]);
   const retainedCommit = execFileSync(
-    "git", ["-C", first.path, "rev-parse", "HEAD"], { encoding: "utf8" }
+    "git", ["-C", firstEntry.path, "rev-parse", "HEAD"], { encoding: "utf8" }
   ).trim();
-  execFileSync("git", ["-C", repositoryPath, "worktree", "remove", first.path]);
+  execFileSync("git", ["-C", repositoryPath, "worktree", "remove", firstEntry.path]);
 
   const restored = await preparer.prepareTaskWorkspace(task.id);
   assert.equal(restored.path, first.path);
+  const restoredEntry = store.getRoleWorkspace(task.id, "leader").entries[0];
   assert.equal(
-    execFileSync("git", ["-C", restored.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+    execFileSync("git", ["-C", restoredEntry.path, "rev-parse", "HEAD"], {
+      encoding: "utf8"
+    }).trim(),
     retainedCommit
   );
 });
@@ -812,20 +1058,25 @@ test("Leader can directly create and clean a WorkItem-owned isolated worktree", 
   const { home, workspace, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "Parallel Task", NOW, {
-    projectId: project.id
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   addTaskRoles(store, task, repositoryPath);
   const item = createWorkItem("work-1", task.id, {
     title: "Parallel edit",
-    assignee: "worker"
+    assignee: "worker",
+    writeProjectIds: [project.id]
   }, NOW);
   store.saveWorkItem(task.id, item);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
   const main = (await preparer.prepareTaskWorkspace(task.id)).path;
   const isolated = await preparer.prepareWorkItemWorkspace(item.id);
+  const isolatedEntry = isolated.entries[0];
   assert.deepEqual(isolated.owner, { type: "work-item", workItemId: item.id });
-  assert.equal(isolated.path, join(workspace, "worktree", "Yui", task.id, item.id));
-  assert.equal(store.getRole(task.id, "worker").workspace, isolated.path);
+  assert.equal(
+    isolatedEntry.path,
+    join(workspace, "worktree", "Yui", task.id, item.id)
+  );
+  assert.equal(store.getRole(task.id, "worker").workspace, isolated.root);
   assert.equal(store.getTask(task.id).cwd, main);
 
   const running = updateWorkItemStatus(item, "running", NOW);
@@ -844,7 +1095,8 @@ test("Leader can directly create and clean a WorkItem-owned isolated worktree", 
   }), /workspace is not ready/i);
   const next = createWorkItem("work-2", task.id, {
     title: "Next edit",
-    assignee: "worker"
+    assignee: "worker",
+    writeProjectIds: [project.id]
   }, NOW);
   store.saveWorkItem(task.id, next);
   assert.throws(
@@ -852,17 +1104,17 @@ test("Leader can directly create and clean a WorkItem-owned isolated worktree", 
     /work-1.*cleanup|cleanup.*work-1/i
   );
 
-  const dirtyFile = join(isolated.path, "dirty.txt");
+  const dirtyFile = join(isolatedEntry.path, "dirty.txt");
   writeFileSync(dirtyFile, "preserve\n");
   assert.equal(await preparer.cleanupWorkItemWorkspace(item.id, "integrated"), "dirty");
-  assert.equal(existsSync(isolated.path), true);
+  assert.equal(existsSync(isolated.root), true);
   assert.deepEqual(store.getRoleWorkspace(task.id, "worker").owner, {
     type: "work-item",
     workItemId: item.id
   });
   unlinkSync(dirtyFile);
   assert.equal(await preparer.cleanupWorkItemWorkspace(item.id, "integrated"), "removed");
-  assert.equal(existsSync(isolated.path), false);
+  assert.equal(existsSync(isolated.root), false);
   assert.equal(store.getRoleWorkspace(task.id, "worker"), null);
   assert.equal(store.getRole(task.id, "worker").workspace, main);
   assert.equal(store.getWorkItem(task.id, item.id).workspaceDisposition, "integrated");
@@ -877,12 +1129,13 @@ test("Leader acceptance consumes an exact workspace integration proof", async (t
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "Acceptance proof", NOW, {
-    projectId: project.id
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   addTaskRoles(store, task, repositoryPath);
   const item = createWorkItem("work-1", task.id, {
     title: "No-change review",
-    assignee: "worker"
+    assignee: "worker",
+    writeProjectIds: [project.id]
   }, NOW);
   store.saveWorkItem(task.id, item);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
@@ -925,7 +1178,11 @@ test("Leader acceptance consumes an exact workspace integration proof", async (t
           workItemId: item.id,
           assignee: "worker",
           workspace: isolated,
-          headCommit: "b".repeat(40)
+          projects: [{
+            projectId: project.id,
+            baseCommit: isolated.entries[0].baseCommit,
+            headCommit: "b".repeat(40)
+          }]
         }
       }
     ),
@@ -948,12 +1205,13 @@ test("a Role workspace migration retires its cwd-bound stopped native session", 
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "Move a persistent Role", NOW, {
-    projectId: project.id
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   addTaskRoles(store, task, repositoryPath);
   const item = createWorkItem("work-1", task.id, {
     title: "Use an isolated cwd",
-    assignee: "worker"
+    assignee: "worker",
+    writeProjectIds: [project.id]
   }, NOW);
   store.saveWorkItem(task.id, item);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
@@ -1000,18 +1258,20 @@ test("Leader can capture, integrate, and clean an isolated Role result before fo
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "Long-running Role delivery", NOW, {
-    projectId: project.id
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   addTaskRoles(store, task, repositoryPath);
   const item = createWorkItem("work-1", task.id, {
     title: "Implement the first increment",
-    assignee: "worker"
+    assignee: "worker",
+    writeProjectIds: [project.id]
   }, NOW);
   store.saveWorkItem(task.id, item);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
-  const main = (await preparer.prepareTaskWorkspace(task.id)).path;
+  await preparer.prepareTaskWorkspace(task.id);
+  const main = store.getRoleWorkspace(task.id, "leader").entries[0].path;
   const isolated = await preparer.prepareWorkItemWorkspace(item.id);
-  writeFileSync(join(isolated.path, "delivered.txt"), "first increment\n");
+  writeFileSync(join(isolated.entries[0].path, "delivered.txt"), "first increment\n");
   const running = updateWorkItemStatus(item, "running", NOW);
   store.saveWorkItem(task.id, running);
   store.saveWorkItem(
@@ -1046,7 +1306,7 @@ test("Leader can capture, integrate, and clean an isolated Role result before fo
   assert.equal(repeatedCapture.status, 0, repeatedCapture.stderr || repeatedCapture.error?.message);
   assert.match(repeatedCapture.stdout, new RegExp(changeSet.id));
   assert.equal(store.listChangeSets(task.id).length, 1);
-  const lateFile = join(isolated.path, "late-mutation.txt");
+  const lateFile = join(isolated.entries[0].path, "late-mutation.txt");
   writeFileSync(lateFile, "must not alter the captured result\n");
   const mutatedCapture = spawnSync(
     process.execPath,
@@ -1065,7 +1325,7 @@ test("Leader can capture, integrate, and clean an isolated Role result before fo
   assert.match(mutatedCapture.stdout, new RegExp(latestChangeSet.id));
   assert.equal(store.listChangeSets(task.id).length, 2);
   assert.equal(
-    execFileSync("git", ["-C", isolated.path, "status", "--porcelain"], {
+    execFileSync("git", ["-C", isolated.entries[0].path, "status", "--porcelain"], {
       encoding: "utf8"
     }),
     ""
@@ -1085,7 +1345,7 @@ test("Leader can capture, integrate, and clean an isolated Role result before fo
   );
   assert.equal(prematureCleanup.status, 2);
   assert.match(prematureCleanup.stderr, /ChangeSet is not integrated/);
-  assert.equal(existsSync(isolated.path), true);
+  assert.equal(existsSync(isolated.entries[0].path), true);
 
   const integration = await runTaskIntegrationCommand([
     "start",
@@ -1101,9 +1361,9 @@ test("Leader can capture, integrate, and clean an isolated Role result before fo
     .assertIntegrated(item.id);
   assert.equal(proof.workItemId, item.id);
   assert.equal(proof.assignee, "worker");
-  assert.equal(proof.workspace.path, isolated.path);
-  assert.equal(proof.headCommit, latestChangeSet.headCommit);
-  assert.equal(proof.changeSetId, latestChangeSet.id);
+  assert.equal(proof.workspace.root, isolated.root);
+  assert.equal(proof.projects[0].headCommit, latestChangeSet.headCommit);
+  assert.equal(proof.projects[0].changeSetId, latestChangeSet.id);
 
   const cleanup = spawnSync(
     process.execPath,
@@ -1118,15 +1378,17 @@ test("Leader can capture, integrate, and clean an isolated Role result before fo
     }
   );
   assert.equal(cleanup.status, 0, cleanup.stderr || cleanup.error?.message);
-  assert.equal(existsSync(isolated.path), false);
+  assert.equal(existsSync(isolated.entries[0].path), false);
   assert.equal(store.getRoleWorkspace(task.id, "worker"), null);
 
   const followUp = createWorkItem("work-2", task.id, {
     title: "Implement the follow-up increment",
     assignee: "worker",
+    writeProjectIds: [project.id],
     dependsOn: [item.id]
   }, NOW);
   store.saveWorkItem(task.id, followUp);
+  await preparer.prepareWorkItemWorkspace(followUp.id);
   assert.doesNotThrow(
     () => runTaskCommand(["work", "dispatch", followUp.id], store, {
       now: () => new Date(NOW)
@@ -1138,20 +1400,21 @@ test("integrated cleanup retains a clean self-committed Role result until it is 
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "Preserve uncaptured delivery", NOW, {
-    projectId: project.id
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   addTaskRoles(store, task, repositoryPath);
   const item = createWorkItem("work-1", task.id, {
     title: "Commit before yielding",
-    assignee: "worker"
+    assignee: "worker",
+    writeProjectIds: [project.id]
   }, NOW);
   store.saveWorkItem(task.id, item);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
   await preparer.prepareTaskWorkspace(task.id);
   const isolated = await preparer.prepareWorkItemWorkspace(item.id);
-  writeFileSync(join(isolated.path, "self-committed.txt"), "preserve me\n");
-  execFileSync("git", ["-C", isolated.path, "add", "self-committed.txt"]);
-  execFileSync("git", ["-C", isolated.path, "commit", "-qm", "worker result"]);
+  writeFileSync(join(isolated.entries[0].path, "self-committed.txt"), "preserve me\n");
+  execFileSync("git", ["-C", isolated.entries[0].path, "add", "self-committed.txt"]);
+  execFileSync("git", ["-C", isolated.entries[0].path, "commit", "-qm", "worker result"]);
   const running = updateWorkItemStatus(item, "running", NOW);
   store.saveWorkItem(task.id, running);
   store.saveWorkItem(
@@ -1174,7 +1437,7 @@ test("integrated cleanup retains a clean self-committed Role result until it is 
 
   assert.equal(cleanup.status, 2);
   assert.match(cleanup.stderr, /uncaptured commits/i);
-  assert.equal(existsSync(isolated.path), true);
+  assert.equal(existsSync(isolated.entries[0].path), true);
   assert.equal(store.getRoleWorkspace(task.id, "worker")?.owner.workItemId, item.id);
   assert.equal(store.listChangeSets(task.id).length, 0);
 });
@@ -1183,20 +1446,21 @@ test("concurrent WorkItem capture persists one semantic ChangeSet", async (t) =>
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "Capture one durable result", NOW, {
-    projectId: project.id
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   addTaskRoles(store, task, repositoryPath);
   const item = createWorkItem("work-1", task.id, {
     title: "Commit once",
-    assignee: "worker"
+    assignee: "worker",
+    writeProjectIds: [project.id]
   }, NOW);
   store.saveWorkItem(task.id, item);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
   await preparer.prepareTaskWorkspace(task.id);
   const isolated = await preparer.prepareWorkItemWorkspace(item.id);
-  writeFileSync(join(isolated.path, "concurrent.txt"), "one semantic result\n");
-  execFileSync("git", ["-C", isolated.path, "add", "concurrent.txt"]);
-  execFileSync("git", ["-C", isolated.path, "commit", "-qm", "worker result"]);
+  writeFileSync(join(isolated.entries[0].path, "concurrent.txt"), "one semantic result\n");
+  execFileSync("git", ["-C", isolated.entries[0].path, "add", "concurrent.txt"]);
+  execFileSync("git", ["-C", isolated.entries[0].path, "commit", "-qm", "worker result"]);
   const running = updateWorkItemStatus(item, "running", NOW);
   store.saveWorkItem(task.id, running);
   store.saveWorkItem(
@@ -1204,7 +1468,7 @@ test("concurrent WorkItem capture persists one semantic ChangeSet", async (t) =>
     updateWorkItemStatus(running, "completed", NOW, "Ready for capture.")
   );
 
-  const [first, second] = await Promise.all([
+  const [[first], [second]] = await Promise.all([
     new WorkItemChangeSetManager(new FileTaskStore(home), () => new Date(NOW)).capture(item.id),
     new WorkItemChangeSetManager(new FileTaskStore(home), () => new Date(NOW)).capture(item.id)
   ]);
@@ -1219,12 +1483,13 @@ test("an awaiting WorkItem can capture successive immutable ChangeSets", async (
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "Review successive results", NOW, {
-    projectId: project.id
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   addTaskRoles(store, task, repositoryPath);
   const item = createWorkItem("work-1", task.id, {
     title: "Revise before acceptance",
-    assignee: "worker"
+    assignee: "worker",
+    writeProjectIds: [project.id]
   }, NOW);
   store.saveWorkItem(task.id, item);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
@@ -1238,14 +1503,14 @@ test("an awaiting WorkItem can capture successive immutable ChangeSets", async (
   );
   const manager = new WorkItemChangeSetManager(store, () => new Date(NOW));
 
-  writeFileSync(join(isolated.path, "reviewed.txt"), "round one\n");
-  const first = await manager.capture(item.id);
-  assert.notEqual(first, null);
-  assert.equal((await manager.capture(item.id)).id, first.id);
+  writeFileSync(join(isolated.entries[0].path, "reviewed.txt"), "round one\n");
+  const [first] = await manager.capture(item.id);
+  assert.notEqual(first, undefined);
+  assert.equal((await manager.capture(item.id))[0].id, first.id);
 
-  writeFileSync(join(isolated.path, "reviewed.txt"), "round two\n");
-  const second = await manager.capture(item.id);
-  assert.notEqual(second, null);
+  writeFileSync(join(isolated.entries[0].path, "reviewed.txt"), "round two\n");
+  const [second] = await manager.capture(item.id);
+  assert.notEqual(second, undefined);
   assert.notEqual(second.id, first.id);
   assert.notEqual(second.headCommit, first.headCommit);
   assert.ok(Date.parse(second.createdAt) > Date.parse(first.createdAt));
@@ -1257,12 +1522,13 @@ test("WorkItem cleanup validates its disposition before removing the worktree", 
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "Disposition safety", NOW, {
-    projectId: project.id
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   addTaskRoles(store, task, repositoryPath);
   const item = createWorkItem("work-1", task.id, {
     title: "Parallel edit",
-    assignee: "worker"
+    assignee: "worker",
+    writeProjectIds: [project.id]
   }, NOW);
   store.saveWorkItem(task.id, item);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
@@ -1281,7 +1547,7 @@ test("WorkItem cleanup validates its disposition before removing the worktree", 
     preparer.cleanupWorkItemWorkspace(item.id, "abandoned"),
     /already recorded as integrated/i
   );
-  assert.equal(existsSync(isolated.path), true);
+  assert.equal(existsSync(isolated.entries[0].path), true);
   assert.notEqual(store.getRoleWorkspace(task.id, "worker"), null);
 });
 
@@ -1289,12 +1555,13 @@ test("WorkItem cleanup reports a post-removal race and converges on retry", asyn
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "Cleanup retry", NOW, {
-    projectId: project.id
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   addTaskRoles(store, task, repositoryPath);
   const item = createWorkItem("work-1", task.id, {
     title: "Remove an isolated result",
-    assignee: "worker"
+    assignee: "worker",
+    writeProjectIds: [project.id]
   }, NOW);
   store.saveWorkItem(task.id, item);
   const setup = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
@@ -1363,12 +1630,13 @@ test("WorkItem cleanup cannot commit across a newly prepared in-flight Role run"
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "Cleanup in-flight fence", NOW, {
-    projectId: project.id
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   addTaskRoles(store, task, repositoryPath);
   const item = createWorkItem("work-1", task.id, {
     title: "Remove after run settles",
-    assignee: "worker"
+    assignee: "worker",
+    writeProjectIds: [project.id]
   }, NOW);
   store.saveWorkItem(task.id, item);
   const setup = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
@@ -1425,16 +1693,18 @@ test("late WorkItem cleanup preserves a replacement workspace owned by newer wor
   const { root, home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "Cleanup workspace CAS", NOW, {
-    projectId: project.id
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   addTaskRoles(store, task, repositoryPath);
   const first = createWorkItem("work-1", task.id, {
     title: "Old isolated work",
-    assignee: "worker"
+    assignee: "worker",
+    writeProjectIds: [project.id]
   }, NOW);
   const second = createWorkItem("work-2", task.id, {
     title: "New isolated work",
-    assignee: "worker"
+    assignee: "worker",
+    writeProjectIds: [project.id]
   }, NOW);
   store.saveWorkItem(task.id, first);
   store.saveWorkItem(task.id, second);
@@ -1453,11 +1723,12 @@ test("late WorkItem cleanup preserves a replacement workspace owned by newer wor
     taskId: task.id,
     roleName: "worker",
     owner: { type: "work-item", workItemId: second.id },
-    projectId: project.id,
-    path: join(root, "replacement-worktree"),
-    branch: "yui/task-1/work-2",
-    baseRef: oldWorkspace.baseRef,
-    baseCommit: oldWorkspace.baseCommit
+    root: join(root, "replacement"),
+    entries: [{
+      ...oldWorkspace.entries[0],
+      path: join(root, "replacement-worktree"),
+      branch: "yui/task-1/work-2"
+    }]
   }, new Date(NOW.getTime() + 1));
 
   const racingGit = {
@@ -1469,7 +1740,7 @@ test("late WorkItem cleanup preserves a replacement workspace owned by newer wor
         tx.saveRoleWorkspace(task.id, replacement);
         tx.saveRole(task.id, updateRole(
           tx.getRole(task.id, "worker"),
-          { workspace: replacement.path },
+          { workspace: replacement.root },
           new Date(NOW.getTime() + 1)
         ));
       });
@@ -1488,7 +1759,7 @@ test("late WorkItem cleanup preserves a replacement workspace owned by newer wor
     "removed"
   );
   assert.deepEqual(store.getRoleWorkspace(task.id, "worker"), replacement);
-  assert.equal(store.getRole(task.id, "worker").workspace, replacement.path);
+  assert.equal(store.getRole(task.id, "worker").workspace, replacement.root);
   assert.equal(store.getWorkItem(task.id, first.id).workspaceDisposition, "integrated");
 });
 
@@ -1496,12 +1767,13 @@ test("WorkItem cleanup cannot record a disposition without an isolated worktree"
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "No isolation", NOW, {
-    projectId: project.id
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   addTaskRoles(store, task, repositoryPath);
   const item = updateWorkItemStatus(createWorkItem("work-1", task.id, {
     title: "Shared work",
-    assignee: "worker"
+    assignee: "worker",
+    writeProjectIds: [project.id]
   }, NOW), "completed", NOW, "Done in main.");
   store.saveWorkItem(task.id, item);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
@@ -1521,16 +1793,17 @@ test("dirty worktrees keep a completed Task out of Archived while its record rem
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const active = activateTask(createTask("task-1", "Archive safely", NOW, {
-    projectId: project.id
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   addTaskRoles(store, active, repositoryPath);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
   const main = (await preparer.prepareTaskWorkspace(active.id)).path;
+  const mainEntry = store.getRoleWorkspace(active.id, "leader").entries[0];
   store.saveTask(completeTask(store.getTask(active.id), NOW, {
     summary: "Done",
     by: "user"
   }));
-  const dirtyFile = join(main, "dirty.txt");
+  const dirtyFile = join(mainEntry.path, "dirty.txt");
   writeFileSync(dirtyFile, "preserve\n");
   assert.equal((await preparer.cleanupTaskForArchive(active.id)).status, "retained-dirty");
   assert.equal(store.getTask(active.id).status, "completed");
@@ -1553,12 +1826,13 @@ test("Task archive requires explicit WorkItem cleanup and preserves its record",
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const active = activateTask(createTask("task-1", "Archive isolated work", NOW, {
-    projectId: project.id
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: project.developmentBranch }]
   }), NOW);
   addTaskRoles(store, active, repositoryPath);
   const item = createWorkItem("work-1", active.id, {
     title: "Isolated edit",
-    assignee: "worker"
+    assignee: "worker",
+    writeProjectIds: [project.id]
   }, NOW);
   store.saveWorkItem(active.id, item);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
@@ -1581,7 +1855,7 @@ test("Task archive requires explicit WorkItem cleanup and preserves its record",
   assert.equal(blocked.status, "failed");
   assert.match(blocked.error, /explicit cleanup.*work-1/i);
   assert.equal(existsSync(main), true);
-  assert.equal(existsSync(isolated.path), true);
+  assert.equal(existsSync(isolated.entries[0].path), true);
   assert.equal(store.getTask(active.id).cwd, main);
 
   assert.equal(await preparer.cleanupWorkItemWorkspace(item.id, "integrated"), "removed");

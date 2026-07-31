@@ -36,6 +36,25 @@ test("dispatch contexts contain the real assignment but no session-bind bootstra
   const worker = buildWorkerContext({
     taskId: "task-1",
     role: { ...role, name: "worker" },
+    workItem: {
+      id: "work-item-1",
+      writeProjectIds: ["project-backend"]
+    },
+    workspace: {
+      root: "/tmp/workspace",
+      entries: [
+        {
+          projectId: "project-backend",
+          directory: "backend",
+          access: "write"
+        },
+        {
+          projectId: "project-frontend",
+          directory: "frontend",
+          access: "read"
+        }
+      ]
+    },
     input: "implement the bounded change"
   });
 
@@ -44,6 +63,11 @@ test("dispatch contexts contain the real assignment but no session-bind bootstra
   assert.match(leader, /Constraint: Keep changes focused/);
   assert.match(leader, /decide the next step/);
   assert.match(worker, /injected yui-worker/);
+  assert.match(worker, /WorkItem: work-item-1/);
+  assert.match(worker, /Writable Projects:\n- backend \(project-backend\)/);
+  assert.match(worker, /Context-only Projects:\n- frontend \(project-frontend\)/);
+  assert.match(worker, /ask the Task Leader to expand/i);
+  assert.match(worker, /yui task context task-1/);
   assert.match(worker, /yui task run yield <current-run-id>/);
   assert.match(worker, /final response alone does neither/i);
   assert.doesNotMatch(`${leader}\n${worker}`, /Role instruction:|Configured role skills:/);

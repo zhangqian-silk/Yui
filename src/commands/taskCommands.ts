@@ -1,4 +1,5 @@
 import type { ConfiguredAgent } from "../agent/agent.js";
+import { isDeepStrictEqual } from "node:util";
 import {
   compileDispatchInput,
   ensureWorkerRunCompletionRequirement
@@ -60,6 +61,7 @@ import {
 import type { MailboxEntityRef, MailboxTarget } from "../coordination/workMailbox.js";
 import {
   activateTask,
+  addTaskProjectBinding,
   archiveTask,
   completeTask,
   createTask,
@@ -67,6 +69,7 @@ import {
   updateTaskMetadata,
   type Task,
   type TaskMetadata,
+  type TaskProjectBinding,
   type TaskPriority
 } from "../task/task.js";
 import type { TaskStore } from "../storage/taskStore.js";
@@ -76,6 +79,7 @@ import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import {
   createWorkItem,
   retryFailedWorkItem,
+  updateWorkItemWriteProjects,
   updateWorkItemStatus,
   type WorkItem,
   type WorkItemStatus
@@ -158,6 +162,7 @@ export function runTaskCommand(
     case "archive": return output(archiveTaskCommand(rest, store, options));
     case "reconcile": return output(reconcileTaskCommand(rest, store, options));
     case "message": return output(taskMessageCommand(rest, store, options));
+    case "project": return taskProjectCommand(rest, store, options);
     case "input": return runTaskInputCommand(rest, store, options);
     case "role": return taskRoleCommand(rest, store, options);
     case "work": return taskWorkCommand(rest, store, options);
@@ -172,6 +177,71 @@ export function runTaskCommand(
         ? "Task command is required."
         : `Unknown command: task ${command}`);
   }
+}
+
+function taskProjectCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const [command, ...rest] = args;
+  if (command === "list") {
+    exactPositionals(rest, 1, "Task project list usage: yui task project list <task>.");
+    const task = requireTask(store, rest[0]);
+    const rendered = task.projectBindings.length === 0
+      ? `Task ${task.id} has no Projects.\n`
+      : `${renderTable(
+          `Task Projects: ${task.id}`,
+          [
+            { header: "Directory", minWidth: 8, maxWidth: 24 },
+            { header: "Project", minWidth: 8, maxWidth: 24 },
+            { header: "Base", minWidth: 6, maxWidth: 36 }
+          ],
+          task.projectBindings.map(({ directory, projectId, baseRef }) => [
+            directory, projectId, baseRef
+          ]),
+          defaultTableWidth()
+        )}\n`;
+    return output(rendered, { projectBindings: task.projectBindings });
+  }
+  if (command !== "add") {
+    throw usageError(command === undefined
+      ? "Task project command is required."
+      : `Unknown command: task project ${command}`);
+  }
+  const usage = "Task project add usage: yui task project add <task> <project> [--base <ref>] [--directory <name>].";
+  const parsed = parseTail(rest, new Set(["--base", "--directory"]), usage);
+  exactPositionals(parsed.positionals, 2, usage);
+  const now = clock(options);
+  const updated = store.transaction((tx) => {
+    const task = requireTask(tx, parsed.positionals[0]);
+    assertTaskOpen(task);
+    if (task.status === "active" && taskActor(options, task.id) !== "leader") {
+      throw usageError("Only the Task Leader may add a Project to an active Task.");
+    }
+    const project = resolveProject(tx.listProjects(), parsed.positionals[1]);
+    if (project === null) throw usageError(`Project not found: ${parsed.positionals[1]}.`);
+    const next = addTaskProjectBinding(task, {
+      projectId: project.id,
+      directory: parsed.options.get("--directory") ?? project.name,
+      baseRef: parsed.options.get("--base") ?? project.developmentBranch
+    }, now);
+    tx.saveTask(next);
+    recordTaskEvent(tx, task.id, "task.project-added", {
+      projectId: project.id,
+      directory: next.projectBindings.at(-1)!.directory
+    }, now);
+    enqueueWork(tx, taskMailbox(task.id), "task-project-added", now, [taskRef(task.id)]);
+    if (task.status === "active") {
+      enqueueWork(tx, leaderMailbox(task.id), "task-project-added", now, [taskRef(task.id)]);
+    }
+    return next;
+  });
+  notifyMailbox(options.runtime, taskMailbox(updated.id), updated.id);
+  if (updated.status === "active") {
+    notifyMailbox(options.runtime, leaderMailbox(updated.id), updated.id);
+  }
+  return output(`Added Project to ${updated.id}\n`, { task: updated });
 }
 
 function updateTaskCommand(
@@ -285,11 +355,9 @@ function createTaskCommand(
   options: TaskCommandOptions
 ): TaskCommandExecution {
   const parsed = parseTaskCreation(args, store);
-  const projectId = parsed.project?.id;
   const now = clock(options);
   const created = store.transaction((tx) => createTaskAggregate(tx, parsed.title, {
-    ...(projectId === undefined ? {} : { projectId }),
-    ...(parsed.baseRef === undefined ? {} : { baseRef: parsed.baseRef })
+    projectBindings: parsed.projectBindings
   }, now));
   notifyMailbox(options.runtime, taskMailbox(created.task.id), created.task.id);
   return output(
@@ -301,27 +369,52 @@ function createTaskCommand(
 function parseTaskCreation(
   args: string[],
   store: TaskWorkflowStore
-): Readonly<{ title: string; project: Project | null; baseRef?: string }> {
-  const usage = "Task create usage: yui task create <title> [--project <project>] [--base <ref>].";
-  const parsed = parseTail(args, new Set(["--project", "--base"]), usage);
+): Readonly<{ title: string; projectBindings: readonly TaskProjectBinding[] }> {
+  const usage = "Task create usage: yui task create <title> [--project <project> ...] [--base <project>=<ref> ...].";
+  const parsed = parseMultiValueTail(
+    args,
+    new Set(),
+    new Set(["--project", "--base"]),
+    usage
+  );
   exactPositionals(parsed.positionals, 1, usage);
-  const projectReference = optionalNonEmptyOption(parsed.options, "--project");
-  const baseRef = optionalNonEmptyOption(parsed.options, "--base");
-  if (baseRef !== undefined && projectReference === undefined) {
+  const projectReferences = parsed.multiOptions.get("--project") ?? [];
+  const baseOptions = parsed.multiOptions.get("--base") ?? [];
+  if (baseOptions.length > 0 && projectReferences.length === 0) {
     throw usageError("--base requires --project.");
   }
-  const project = projectReference === undefined
-    ? null
-    : resolveProject(store.listProjects(), projectReference);
-  if (projectReference !== undefined && project === null) {
-    throw usageError(`Project not found: ${projectReference}.`);
+  const projects = projectReferences.map((reference) => {
+    const project = resolveProject(store.listProjects(), reference);
+    if (project === null) throw usageError(`Project not found: ${reference}.`);
+    return project;
+  });
+  if (new Set(projects.map(({ id }) => id)).size !== projects.length) {
+    throw usageError("A Task cannot bind the same Project more than once.");
+  }
+  const bases = new Map<string, string>();
+  for (const option of baseOptions) {
+    const separator = option.indexOf("=");
+    if (separator < 0) {
+      if (projects.length !== 1) {
+        throw usageError("--base must use <project>=<ref> when a Task has multiple Projects.");
+      }
+      bases.set(projects[0].id, requiredText(option, "--base"));
+      continue;
+    }
+    const reference = requiredText(option.slice(0, separator), "--base Project");
+    const baseRef = requiredText(option.slice(separator + 1), "--base ref");
+    const project = resolveProject(projects, reference);
+    if (project === null) throw usageError(`Task Project not found for --base: ${reference}.`);
+    if (bases.has(project.id)) throw usageError(`Project base may only be specified once: ${reference}.`);
+    bases.set(project.id, baseRef);
   }
   return {
     title: parsed.positionals[0],
-    project,
-    ...(project === null
-      ? {}
-      : { baseRef: baseRef ?? project.developmentBranch })
+    projectBindings: projects.map((project) => ({
+      projectId: project.id,
+      directory: project.name,
+      baseRef: bases.get(project.id) ?? project.developmentBranch
+    }))
   };
 }
 
@@ -351,9 +444,14 @@ function listTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
           { header: "Task", minWidth: 6, maxWidth: 20 },
           { header: "Status", minWidth: 6, maxWidth: 10 },
           { header: "Title", minWidth: 8, maxWidth: 64 },
-          { header: "Project", minWidth: 8, maxWidth: 24 }
+          { header: "Projects", minWidth: 8, maxWidth: 24 }
         ],
-        tasks.map((task) => [task.id, task.status, task.title, task.projectId ?? "-"]),
+        tasks.map((task) => [
+          task.id,
+          task.status,
+          task.title,
+          task.projectBindings.map(({ directory }) => directory).join(", ") || "-"
+        ]),
         defaultTableWidth()
       )}\n`;
   return output(rendered, { tasks });
@@ -395,8 +493,14 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     ...(task.completedAt === undefined ? [] : [`Completed: ${presentTime(task.completedAt, timeZone)}`]),
     ...(task.completedBy === undefined ? [] : [`Completed by: ${task.completedBy}`]),
     ...(task.completionSummary === undefined ? [] : [`Completion summary: ${task.completionSummary}`]),
-    ...(task.projectId === undefined ? [] : [`Project: ${task.projectId}`]),
-    ...(task.baseRef === undefined ? [] : [`Base: ${task.baseRef}`]),
+    ...(task.projectBindings.length === 0
+      ? []
+      : [
+          "Projects:",
+          ...task.projectBindings.map((binding) => (
+            `- ${binding.directory}: ${binding.projectId} @ ${binding.baseRef}`
+          ))
+        ]),
     ...(task.cwd === undefined ? [] : [`Workspace: ${task.cwd}`]),
     `Messages: ${counts.messages}`,
     `Brief: ${brief === null ? "no" : "yes"}`,
@@ -1127,6 +1231,7 @@ function taskWorkCommand(
   if (command === "create") return createWork(rest, store, options);
   if (command === "list") return listWork(rest, store);
   if (command === "update") return output(updateWork(rest, store, options));
+  if (command === "scope") return output(updateWorkScope(rest, store, options));
   if (command === "dispatch") return output(dispatchWork(rest, store, options));
   if (command === "accept") return acceptWork(rest, store, options);
   if (command === "reject") return rejectWork(rest, store, options);
@@ -1141,7 +1246,7 @@ function createWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task work create usage: yui task work create <task> <title> [--objective <text>] [--accept <criterion> ...] [--after <work> ...] [--role <name>].";
+  const usage = "Task work create usage: yui task work create <task> <title> [--project <project> ...] [--objective <text>] [--accept <criterion> ...] [--after <work> ...] [--role <name>].";
   const parsed = parseWorkCreateArgs(args, usage);
   exactPositionals(parsed.positionals, 2, usage);
   const now = clock(options);
@@ -1153,11 +1258,20 @@ function createWork(
       if (dependency === null) throw usageError(`Work Item dependency not found: ${dependencyId}.`);
     }
     if (parsed.role !== undefined) requireRole(tx, task.id, parsed.role);
+    const writeProjectIds = parsed.projects.map((reference) => {
+      const project = resolveProject(
+        task.projectBindings.map(({ projectId }) => requireProject(tx, projectId)),
+        reference
+      );
+      if (project === null) throw usageError(`Task Project not found: ${reference}.`);
+      return project.id;
+    });
     const created = createWorkItem(tx.nextWorkItemId(task.id), task.id, {
       title: parsed.positionals[1],
       objective: parsed.objective ?? parsed.positionals[1],
       acceptance: parsed.acceptance,
       dependsOn: parsed.after,
+      writeProjectIds,
       ...(parsed.role === undefined ? {} : { assignee: parsed.role })
     }, now);
     tx.saveWorkItem(task.id, created);
@@ -1166,6 +1280,61 @@ function createWork(
   });
   notifyMailbox(options.runtime, taskMailbox(item.taskId), item.taskId);
   return output(`Created work item ${item.id} for ${item.taskId}\n`, { workItem: item });
+}
+
+function updateWorkScope(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  const usage = "Task work scope usage: yui task work scope <work> [--project <project> ...].";
+  const parsed = parseMultiValueTail(
+    args,
+    new Set(),
+    new Set(["--project"]),
+    usage
+  );
+  exactPositionals(parsed.positionals, 1, usage);
+  const now = clock(options);
+  const updated = store.transaction((tx) => {
+    const item = requireWorkItem(tx, parsed.positionals[0]);
+    const task = requireTask(tx, item.taskId);
+    if (taskActor(options, task.id) !== "leader") {
+      throw usageError("Only the Task Leader may change a Work Item Project scope.");
+    }
+    if (tx.getActiveAgentRun(task.id, item.assignee ?? "") !== null) {
+      throw usageError(`Stop the active Work Item Run before changing scope: ${item.id}.`);
+    }
+    const requestedProjectIds = (parsed.multiOptions.get("--project") ?? []).map((reference) => {
+      const project = resolveProject(
+        task.projectBindings.map(({ projectId }) => requireProject(tx, projectId)),
+        reference
+      );
+      if (project === null) throw usageError(`Task Project not found: ${reference}.`);
+      return project.id;
+    });
+    const requested = new Set(requestedProjectIds);
+    const projectIds = task.projectBindings
+      .map(({ projectId }) => projectId)
+      .filter((projectId) => requested.has(projectId));
+    const next = updateWorkItemWriteProjects(item, projectIds, now);
+    if (next === item) return { item, changed: false } as const;
+    tx.saveWorkItem(task.id, next);
+    recordTaskEvent(tx, task.id, "work.scope-updated", {
+      workItemId: item.id,
+      projectIds: projectIds.join(",")
+    }, now);
+    enqueueWork(tx, taskMailbox(task.id), "work-scope-updated", now, [workItemRef(item.id)]);
+    return { item: next, changed: true } as const;
+  });
+  if (updated.changed) {
+    notifyMailbox(options.runtime, taskMailbox(updated.item.taskId), updated.item.taskId);
+  }
+  return `${updated.changed ? "Updated" : "Unchanged"} Work Item Project scope ${
+    updated.item.id
+  }: ${
+    updated.item.writeProjectIds.join(", ") || "read-only"
+  }\n`;
 }
 
 function updateWork(
@@ -1273,13 +1442,43 @@ function dispatchWork(
         + `cleanup ${workspace.owner.workItemId} before dispatching ${item.id}.`
       );
     }
+    if (item.writeProjectIds.length > 0) {
+      const writable = workspace?.owner.type === "work-item"
+        && workspace.owner.workItemId === item.id
+        ? workspace.entries
+          .filter(({ access }) => access === "write")
+          .map(({ projectId }) => projectId)
+          .sort()
+        : [];
+      const visible = workspace?.owner.type === "work-item"
+        && workspace.owner.workItemId === item.id
+        ? workspace.entries.map(({ projectId }) => projectId).sort()
+        : [];
+      if (
+        !isDeepStrictEqual(writable, [...item.writeProjectIds].sort())
+        || !isDeepStrictEqual(
+          visible,
+          task.projectBindings.map(({ projectId }) => projectId).sort()
+        )
+      ) {
+        throw usageError(
+          `Work Item ${item.id} must be isolated with its approved Project scope before dispatch.`
+        );
+      }
+    }
     if (tx.getActiveAgentRun(task.id, role.name) !== null) {
       throw usageError(`${task.id}/${role.name} already has an active run.`);
     }
     const rawInput = trimmed(parsed.options.get("--input")) ?? item.objective;
     const runId = tx.nextAgentRunId(task.id);
     const input = markYuiRunInput(
-      compileDispatchInput({}, task.id, role, rawInput),
+      compileDispatchInput({}, task.id, role, rawInput, {
+        workItem: item,
+        ...(workspace?.owner.type === "work-item"
+          && workspace.owner.workItemId === item.id
+          ? { workspace }
+          : {})
+      }),
       runId,
       taskRoleSessionTitle(task, role.name)
     );
@@ -1375,64 +1574,56 @@ function assertWorkItemIntegrationProof(
     proof === undefined
     || proof.workItemId !== workItemId
     || proof.assignee !== assignee
-    || !sameProvenWorkspace(proof.workspace, workspace)
+    || !isDeepStrictEqual(proof.workspace, workspace)
   ) {
     throw usageError(
       `WorkItem workspace has not been verified for acceptance: ${workItemId}.`
     );
   }
-  const latestChangeSet = store.listChangeSets(workspace.taskId)
-    .filter((changeSet) => changeSet.workItemId === workItemId)
-    .sort((left, right) => (
-      left.createdAt.localeCompare(right.createdAt)
-      || left.id.localeCompare(right.id)
-    ))
-    .at(-1);
-  if (proof.headCommit === workspace.baseCommit) {
-    if (proof.changeSetId !== undefined || latestChangeSet !== undefined) {
+  const writable = workspace.entries.filter(({ access }) => access === "write");
+  if (proof.projects.length !== writable.length) {
+    throw usageError(`WorkItem integration verification is stale: ${workItemId}.`);
+  }
+  for (const entry of writable) {
+    const projectProof = proof.projects.find(({ projectId }) => projectId === entry.projectId);
+    if (projectProof === undefined || projectProof.baseCommit !== entry.baseCommit) {
+      throw usageError(`WorkItem integration verification is stale: ${workItemId}.`);
+    }
+    const latestChangeSet = store.listChangeSets(workspace.taskId)
+      .filter((changeSet) => (
+        changeSet.workItemId === workItemId
+        && changeSet.projectId === entry.projectId
+      ))
+      .sort((left, right) => (
+        left.createdAt.localeCompare(right.createdAt)
+        || left.id.localeCompare(right.id)
+      ))
+      .at(-1);
+    if (projectProof.headCommit === entry.baseCommit) {
+      if (projectProof.changeSetId !== undefined || latestChangeSet !== undefined) {
+        throw usageError(`WorkItem integration verification is stale: ${workItemId}.`);
+      }
+      continue;
+    }
+    if (
+      projectProof.changeSetId === undefined
+      || latestChangeSet?.id !== projectProof.changeSetId
+      || latestChangeSet.baseCommit !== entry.baseCommit
+      || latestChangeSet.headCommit !== projectProof.headCommit
+      || latestChangeSet.branch !== entry.branch
+    ) {
       throw usageError(
         `WorkItem integration verification is stale: ${workItemId}.`
       );
     }
-    return;
+    if (!store.listIntegrationAttempts(workspace.taskId).some((integration) => (
+      integration.status === "committed"
+      && integration.projectId === entry.projectId
+      && integration.changeSetIds.includes(projectProof.changeSetId!)
+    ))) {
+      throw usageError(`Work Item ChangeSet is not integrated: ${projectProof.changeSetId}.`);
+    }
   }
-  if (
-    proof.changeSetId === undefined
-    || latestChangeSet?.id !== proof.changeSetId
-    || latestChangeSet.baseCommit !== workspace.baseCommit
-    || latestChangeSet.headCommit !== proof.headCommit
-    || latestChangeSet.projectId !== workspace.projectId
-    || latestChangeSet.branch !== workspace.branch
-  ) {
-    throw usageError(
-      `WorkItem integration verification is stale: ${workItemId}.`
-    );
-  }
-  if (!store.listIntegrationAttempts(workspace.taskId).some((integration) => (
-    integration.status === "committed"
-    && integration.changeSetIds.includes(proof.changeSetId!)
-  ))) {
-    throw usageError(`Work Item ChangeSet is not integrated: ${proof.changeSetId}.`);
-  }
-}
-
-function sameProvenWorkspace(
-  left: WorkItemIntegrationProof["workspace"],
-  right: WorkItemIntegrationProof["workspace"]
-): boolean {
-  return left.schemaVersion === right.schemaVersion
-    && left.taskId === right.taskId
-    && left.roleName === right.roleName
-    && left.owner.type === "work-item"
-    && right.owner.type === "work-item"
-    && left.owner.workItemId === right.owner.workItemId
-    && left.projectId === right.projectId
-    && left.path === right.path
-    && left.branch === right.branch
-    && left.baseRef === right.baseRef
-    && left.baseCommit === right.baseCommit
-    && left.createdAt === right.createdAt
-    && left.updatedAt === right.updatedAt;
 }
 
 function rejectWork(
@@ -1525,6 +1716,7 @@ function listWork(args: string[], store: TaskWorkflowStore): TaskCommandExecutio
           { header: "Work", minWidth: 6, maxWidth: 20 },
           { header: "Status", minWidth: 6, maxWidth: 12 },
           { header: "Role", minWidth: 4, maxWidth: 18 },
+          { header: "Write Projects", minWidth: 8, maxWidth: 28 },
           { header: "Title", minWidth: 8, maxWidth: 64 },
           { header: "Acceptance", minWidth: 10, maxWidth: 16 },
           { header: "Outcome", minWidth: 8, maxWidth: 40 }
@@ -1533,6 +1725,7 @@ function listWork(args: string[], store: TaskWorkflowStore): TaskCommandExecutio
           item.id,
           presentWorkStatus(item.status),
           item.assignee ?? "Leader",
+          item.writeProjectIds.join(", ") || "-",
           item.title,
           String(item.acceptance.length),
           item.outcome ?? "-"
@@ -1793,6 +1986,12 @@ function requireRole(store: TaskWorkflowStore, taskId: string, roleName: string 
   return role;
 }
 
+function requireProject(store: TaskWorkflowStore, projectId: string): Project {
+  const project = store.getProject(projectId);
+  if (project === null) throw usageError(`Project not found: ${projectId}.`);
+  return project;
+}
+
 function requireAgent(store: TaskWorkflowStore, agentId: string | undefined): ConfiguredAgent {
   const id = requiredText(agentId, "Agent id");
   const agent = store.getConfiguredAgent(id);
@@ -1899,11 +2098,13 @@ function parseWorkCreateArgs(
   objective?: string;
   acceptance: string[];
   after: string[];
+  projects: string[];
   role?: string;
 }> {
   const positionals: string[] = [];
   const acceptance: string[] = [];
   const after: string[] = [];
+  const projects: string[] = [];
   let objective: string | undefined;
   let role: string | undefined;
   for (let index = 0; index < args.length; index += 1) {
@@ -1916,6 +2117,7 @@ function parseWorkCreateArgs(
       argument !== "--objective"
       && argument !== "--accept"
       && argument !== "--after"
+      && argument !== "--project"
       && argument !== "--role"
     ) {
       throw usageError(`Unsupported option: ${argument}.`, usage);
@@ -1932,6 +2134,7 @@ function parseWorkCreateArgs(
       role = value;
     } else if (argument === "--accept") acceptance.push(value);
     else if (argument === "--after") after.push(value);
+    else if (argument === "--project") projects.push(value);
     index += 1;
   }
   return {
@@ -1939,7 +2142,8 @@ function parseWorkCreateArgs(
     ...(objective === undefined ? {} : { objective }),
     ...(role === undefined ? {} : { role }),
     acceptance,
-    after
+    after,
+    projects
   };
 }
 
@@ -1984,6 +2188,7 @@ function taskBriefCommand(
       `Objective: ${brief.objective}`,
       `Boundaries:`,
       ...(brief.boundaries.length === 0 ? ["  (none)"] : brief.boundaries.map((b) => `  - ${b}`)),
+      `Technical approach: ${brief.technicalApproach || "(not defined)"}`,
       `Current focus: ${brief.currentFocus}`,
       `Leader summary: ${brief.leaderSummary}`,
       `Updated by: ${brief.updatedBy}`,
@@ -1991,14 +2196,20 @@ function taskBriefCommand(
     ].join("\n").concat("\n"), { taskId: task.id, brief });
   }
   if (command === "update") {
-    const usage = "Task brief update usage: yui task brief update <task> [--objective <text>] [--boundary <text> ...] [--focus <text>] [--leader-summary <text>].";
-    const parsed = parseMultiValueTail(rest, new Set(["--objective", "--focus", "--leader-summary"]), new Set(["--boundary"]), usage);
+    const usage = "Task brief update usage: yui task brief update <task> [--objective <text>] [--boundary <text> ...] [--approach <text>] [--focus <text>] [--leader-summary <text>].";
+    const parsed = parseMultiValueTail(
+      rest,
+      new Set(["--objective", "--approach", "--focus", "--leader-summary"]),
+      new Set(["--boundary"]),
+      usage
+    );
     exactPositionals(parsed.positionals, 1, usage);
     const hasObjective = parsed.options.has("--objective");
+    const hasApproach = parsed.options.has("--approach");
     const hasFocus = parsed.options.has("--focus");
     const hasSummary = parsed.options.has("--leader-summary");
     const boundaries = parsed.multiOptions.get("--boundary") ?? [];
-    if (!hasObjective && !hasFocus && !hasSummary && boundaries.length === 0) {
+    if (!hasObjective && !hasApproach && !hasFocus && !hasSummary && boundaries.length === 0) {
       throw usageError("At least one brief field is required.", usage);
     }
     const now = clock(options);
@@ -2011,6 +2222,12 @@ function taskBriefCommand(
         ? createTaskBrief({
             objective: requiredText(parsed.options.get("--objective"), "--objective"),
             boundaries,
+            ...(hasApproach
+              ? { technicalApproach: requiredText(
+                  parsed.options.get("--approach"),
+                  "--approach"
+                ) }
+              : {}),
             currentFocus: requiredText(parsed.options.get("--focus"), "--focus"),
             leaderSummary: requiredText(parsed.options.get("--leader-summary"), "--leader-summary"),
             updatedBy
@@ -2018,6 +2235,9 @@ function taskBriefCommand(
         : updateTaskBrief(existing, {
             ...(hasObjective ? { objective: parsed.options.get("--objective") } : {}),
             ...(boundaries.length > 0 ? { boundaries } : {}),
+            ...(hasApproach
+              ? { technicalApproach: parsed.options.get("--approach") }
+              : {}),
             ...(hasFocus ? { currentFocus: parsed.options.get("--focus") } : {}),
             ...(hasSummary ? { leaderSummary: parsed.options.get("--leader-summary") } : {})
           }, updatedBy, now);

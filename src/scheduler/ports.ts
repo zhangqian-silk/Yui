@@ -15,14 +15,12 @@ import type {
 import type { PendingTurnCompletion } from "../executor/turnCompletion.js";
 import type { RuntimeRoleOwner } from "../runtime/lifecycleReservation.js";
 import type { AgentAdapterId } from "../agent/adapterCatalog.js";
+import type { Task } from "../task/task.js";
 
-export type SchedulerTask = Readonly<{
-  id: string;
-  title: string;
-  status: "draft" | "active" | "completed" | "archived";
-  projectId?: string;
-  cwd?: string;
-}>;
+export type SchedulerTask = Readonly<Pick<
+  Task,
+  "id" | "title" | "status" | "projectBindings" | "cwd"
+>>;
 
 export type SchedulerRole = Readonly<{
   taskId: string;

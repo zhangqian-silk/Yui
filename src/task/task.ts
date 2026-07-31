@@ -2,13 +2,18 @@ export type TaskPriority = "low" | "medium" | "high" | "urgent";
 export type TaskStatus = "draft" | "active" | "completed" | "archived";
 export type TaskCompletedBy = "user" | "operator" | "leader";
 
+export type TaskProjectBinding = Readonly<{
+  projectId: string;
+  directory: string;
+  baseRef: string;
+}>;
+
 export type TaskMetadata = {
   description?: string;
   priority?: TaskPriority;
   tags?: string[];
   dueAt?: string;
-  projectId?: string;
-  baseRef?: string;
+  projectBindings?: readonly TaskProjectBinding[];
   cwd?: string;
 };
 
@@ -18,21 +23,19 @@ export type TaskMetadataUpdate = Partial<{
   priority: TaskPriority | null;
   tags: string[] | null;
   dueAt: string | null;
-  projectId: string;
-  baseRef: string;
+  projectBindings: readonly TaskProjectBinding[];
   cwd: string;
 }>;
 
 export type Task = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   id: string;
   title: string;
   description?: string;
   priority?: TaskPriority;
   tags?: string[];
   dueAt?: string;
-  projectId?: string;
-  baseRef?: string;
+  projectBindings: readonly TaskProjectBinding[];
   cwd?: string;
   status: TaskStatus;
   completedAt?: string;
@@ -49,7 +52,7 @@ export type Task = {
 export function createTask(id: string, title: string, now: Date, metadata: TaskMetadata = {}): Task {
   const timestamp = now.toISOString();
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: requireSafeIdentity(id, "Task id"),
     title: requireText(title, "Task title"),
     ...cloneMetadata(metadata),
@@ -144,12 +147,10 @@ export function updateTaskMetadata(
     ? metadata.tags
     : [...metadata.tags]);
   applyOptional(updated, "dueAt", metadata.dueAt);
-  if (metadata.projectId !== undefined) {
-    updated.projectId = requireSafeIdentity(metadata.projectId, "Project id");
+  if (metadata.projectBindings !== undefined) {
+    updated.projectBindings = normalizeProjectBindings(metadata.projectBindings);
   }
-  if (metadata.baseRef !== undefined) updated.baseRef = requireText(metadata.baseRef, "Task base ref");
   if (metadata.cwd !== undefined) updated.cwd = requireText(metadata.cwd, "Task workspace");
-  validateProjectSelection(updated);
   return updated;
 }
 
@@ -172,7 +173,7 @@ export function isTaskArchived(task: Task): boolean {
 }
 
 export function validateTask(task: Task): Task {
-  if (task.schemaVersion !== 1) throw new Error("Task must use schemaVersion 1.");
+  if (task.schemaVersion !== 2) throw new Error("Task must use schemaVersion 2.");
   requireSafeIdentity(task.id, "Task id");
   requireText(task.title, "Task title");
   if (!(["draft", "active", "completed", "archived"] as const).includes(task.status)) {
@@ -193,11 +194,8 @@ export function validateTask(task: Task): Task {
     for (const tag of task.tags) requireText(tag, "Task tag");
   }
   if (task.dueAt !== undefined) requireTimestamp(task.dueAt, "Task dueAt");
-  if (task.projectId !== undefined) requireSafeIdentity(task.projectId, "Project id");
-  if (task.baseRef !== undefined) requireText(task.baseRef, "Task base ref");
+  normalizeProjectBindings(task.projectBindings);
   if (task.cwd !== undefined) requireText(task.cwd, "Task workspace");
-  validateProjectSelection(task);
-
   const completionFields = [task.completedAt, task.completedBy, task.completionSummary];
   const hasAnyCompletion = completionFields.some((value) => value !== undefined);
   const hasAllCompletion = completionFields.every((value) => value !== undefined);
@@ -236,26 +234,70 @@ export function validateTask(task: Task): Task {
   return task;
 }
 
-function cloneMetadata(metadata: TaskMetadata): TaskMetadata {
-  const cloned: TaskMetadata = {
+function cloneMetadata(
+  metadata: TaskMetadata
+): TaskMetadata & Readonly<{ projectBindings: readonly TaskProjectBinding[] }> {
+  const cloned: TaskMetadata & { projectBindings: readonly TaskProjectBinding[] } = {
     ...(metadata.description === undefined ? {} : { description: metadata.description }),
     ...(metadata.priority === undefined ? {} : { priority: metadata.priority }),
     ...(metadata.tags === undefined ? {} : { tags: [...metadata.tags] }),
     ...(metadata.dueAt === undefined ? {} : { dueAt: metadata.dueAt }),
-    ...(metadata.projectId === undefined
-      ? {}
-      : { projectId: requireSafeIdentity(metadata.projectId, "Project id") }),
-    ...(metadata.baseRef === undefined ? {} : { baseRef: requireText(metadata.baseRef, "Task base ref") }),
+    projectBindings: normalizeProjectBindings(metadata.projectBindings ?? []),
     ...(metadata.cwd === undefined ? {} : { cwd: requireText(metadata.cwd, "Task workspace") })
   };
-  validateProjectSelection(cloned);
   return cloned;
 }
 
-function validateProjectSelection(value: Pick<TaskMetadata, "projectId" | "baseRef">): void {
-  if (value.baseRef !== undefined && value.projectId === undefined) {
-    throw new Error("Task base ref requires a project.");
+function normalizeProjectBindings(
+  bindings: readonly TaskProjectBinding[]
+): readonly TaskProjectBinding[] {
+  if (!Array.isArray(bindings)) throw new Error("Task Project bindings are invalid.");
+  const projectIds = new Set<string>();
+  const directories = new Set<string>();
+  return bindings.map((binding) => {
+    const projectId = requireSafeIdentity(binding.projectId, "Project id");
+    const directory = requireSafeIdentity(binding.directory, "Project directory");
+    const baseRef = requireText(binding.baseRef, "Task base ref");
+    if (projectIds.has(projectId)) {
+      throw new Error(`Task Project is duplicated: ${projectId}.`);
+    }
+    if (directories.has(directory)) {
+      throw new Error(`Task Project directory is duplicated: ${directory}.`);
+    }
+    projectIds.add(projectId);
+    directories.add(directory);
+    return { projectId, directory, baseRef };
+  });
+}
+
+export function taskProjectBinding(
+  task: Task,
+  projectId: string
+): TaskProjectBinding | undefined {
+  return task.projectBindings.find((binding) => binding.projectId === projectId);
+}
+
+export function taskHasProjects(task: Task): boolean {
+  return task.projectBindings.length > 0;
+}
+
+export function taskProjectIds(task: Task): readonly string[] {
+  return task.projectBindings.map(({ projectId }) => projectId);
+}
+
+export function addTaskProjectBinding(
+  task: Task,
+  binding: TaskProjectBinding,
+  now: Date
+): Task {
+  if (taskProjectBinding(task, binding.projectId) !== undefined) {
+    throw new Error(`Task already contains Project: ${binding.projectId}.`);
   }
+  return validateTask({
+    ...task,
+    projectBindings: normalizeProjectBindings([...task.projectBindings, binding]),
+    updatedAt: now.toISOString()
+  });
 }
 
 function requireSafeIdentity(value: string, label: string): string {

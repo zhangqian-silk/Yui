@@ -1075,7 +1075,7 @@ test("production runtime forwards readyRecoveryAgeMs into the Controller", async
 
 test("orphan recovery uses the store's atomic Leader enqueue operation", () => {
   const queued = [];
-  const task = { id: "task-1", status: "active" };
+  const task = { id: "task-1", status: "active", projectBindings: [] };
   const store = {
     listTasks: () => [task],
     getTask: () => task,

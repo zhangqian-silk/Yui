@@ -30,9 +30,10 @@ export type ResolutionDecision = Readonly<{
 }>;
 
 export type IntegrationAttempt = Readonly<{
-  schemaVersion: 1;
+  schemaVersion: 2;
   id: string;
   taskId: string;
+  projectId: string;
   targetRef: string;
   expectedHead: string;
   changeSetIds: readonly string[];
@@ -50,7 +51,7 @@ export type IntegrationAttempt = Readonly<{
 export function createIntegrationAttempt(
   input: Readonly<Pick<
     IntegrationAttempt,
-    "id" | "taskId" | "targetRef" | "expectedHead" | "changeSetIds"
+    "id" | "taskId" | "projectId" | "targetRef" | "expectedHead" | "changeSetIds"
   > & Partial<Pick<
     IntegrationAttempt,
     "checkCommands"
@@ -59,9 +60,10 @@ export function createIntegrationAttempt(
 ): IntegrationAttempt {
   const timestamp = now.toISOString();
   return validateIntegrationAttempt({
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: input.id,
     taskId: input.taskId,
+    projectId: input.projectId,
     targetRef: input.targetRef,
     expectedHead: input.expectedHead,
     changeSetIds: [...input.changeSetIds],
@@ -149,11 +151,12 @@ export function updateIntegrationAttempt(
 }
 
 export function validateIntegrationAttempt(attempt: IntegrationAttempt): IntegrationAttempt {
-  if (attempt.schemaVersion !== 1) {
-    throw new Error("IntegrationAttempt must use schemaVersion 1.");
+  if (attempt.schemaVersion !== 2) {
+    throw new Error("IntegrationAttempt must use schemaVersion 2.");
   }
   requireIdentity(attempt.id, "Integration Attempt id");
   requireIdentity(attempt.taskId, "Task id");
+  requireIdentity(attempt.projectId, "Project id");
   requireText(attempt.targetRef, "Integration target ref");
   requireCommit(attempt.expectedHead, "Integration expected head");
   normalizedUniqueIdentities(attempt.changeSetIds, "ChangeSet id");

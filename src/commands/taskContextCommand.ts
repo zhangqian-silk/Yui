@@ -72,8 +72,14 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     ...(task.dueAt === undefined ? [] : [`Due: ${formatTimestamp(task.dueAt, timeZone)}`]),
     ...(task.completionSummary === undefined ? [] : [`Completion summary: ${task.completionSummary}`]),
     ...(task.archiveSummary === undefined ? [] : [`Archive summary: ${task.archiveSummary}`]),
-    ...(task.projectId === undefined ? [] : [`Project: ${task.projectId}`]),
-    ...(task.baseRef === undefined ? [] : [`Base: ${task.baseRef}`]),
+    ...(task.projectBindings.length === 0
+      ? []
+      : [
+          "Projects:",
+          ...task.projectBindings.map((binding) => (
+            `- ${binding.directory}: ${binding.projectId} @ ${binding.baseRef}`
+          ))
+        ]),
     ...(task.cwd === undefined ? [] : [`Workspace: ${task.cwd}`]),
     "",
     "Brief:",
@@ -85,6 +91,11 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
           ...(brief.boundaries.length === 0
             ? ["    None."]
             : brief.boundaries.map((boundary) => `    - ${compactText(boundary)}`)),
+          `  Technical approach: ${
+            brief.technicalApproach.length === 0
+              ? "Not defined."
+              : compactText(brief.technicalApproach)
+          }`,
           `  Current focus: ${compactText(brief.currentFocus)}`,
           `  Leader summary: ${compactText(brief.leaderSummary)}`,
           `  Updated by ${brief.updatedBy} at ${formatTimestamp(brief.updatedAt, timeZone)}`
@@ -127,6 +138,11 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
           return [
             `  ${item.id} [${item.status}]: ${compactText(item.title)}`,
             `    Objective: ${compactText(item.objective)}`,
+            `    Writable Projects: ${
+              item.writeProjectIds.length === 0
+                ? "none"
+                : item.writeProjectIds.join(", ")
+            }`,
             ...(item.acceptance.length === 0
               ? []
               : [`    Acceptance: ${item.acceptance.map(compactText).join("; ")}`]),
@@ -156,14 +172,20 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     ...(changeSets.length === 0
       ? ["  None."]
       : changeSets.slice(-RECENT_RECORD_LIMIT).map((changeSet) => (
-          `  ${changeSet.id}: ${changeSet.baseCommit.slice(0, 12)}..${changeSet.headCommit.slice(0, 12)} (${changeSet.changedPaths.length} paths; WorkItem ${changeSet.workItemId})`
+          `  ${changeSet.id} [${changeSet.projectId}]: ${
+            changeSet.baseCommit.slice(0, 12)
+          }..${changeSet.headCommit.slice(0, 12)} (${
+            changeSet.changedPaths.length
+          } paths; WorkItem ${changeSet.workItemId})`
         ))),
     "",
     `Integration Attempts (${integrations.length}):`,
     ...(integrations.length === 0
       ? ["  None."]
       : integrations.slice(-RECENT_RECORD_LIMIT).map((integration) => (
-          `  ${integration.id} [${integration.status}] — ${integration.targetRef}; ${integration.changeSetIds.join(", ")}`
+          `  ${integration.id} [${integration.status}/${integration.projectId}] — ${
+            integration.targetRef
+          }; ${integration.changeSetIds.join(", ")}`
         ))),
     "",
     ...recentSection(

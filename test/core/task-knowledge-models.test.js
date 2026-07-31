@@ -14,6 +14,7 @@ test("TaskBrief is a normalized replaceable current snapshot", () => {
   const brief = createTaskBrief({
     objective: " restore the useful task model ",
     boundaries,
+    technicalApproach: " coordinate the storage and CLI changes ",
     currentFocus: " domain records ",
     leaderSummary: " implementation has started ",
     updatedBy: " leader "
@@ -21,9 +22,10 @@ test("TaskBrief is a normalized replaceable current snapshot", () => {
 
   boundaries.push("mutated afterwards");
   assert.deepEqual(brief, {
-    schemaVersion: 1,
+    schemaVersion: 2,
     objective: "restore the useful task model",
     boundaries: ["stay local", "no schedules"],
+    technicalApproach: "coordinate the storage and CLI changes",
     currentFocus: "domain records",
     leaderSummary: "implementation has started",
     updatedAt: now.toISOString(),
@@ -31,12 +33,17 @@ test("TaskBrief is a normalized replaceable current snapshot", () => {
   });
 
   const updated = updateTaskBrief(brief, {
+    technicalApproach: " persist the Task plan and expose it through context ",
     currentFocus: " storage integration ",
     leaderSummary: " domain records are ready "
   }, "operator", later);
 
   assert.equal(brief.currentFocus, "domain records");
   assert.equal(updated.objective, brief.objective);
+  assert.equal(
+    updated.technicalApproach,
+    "persist the Task plan and expose it through context"
+  );
   assert.equal(updated.currentFocus, "storage integration");
   assert.equal(updated.leaderSummary, "domain records are ready");
   assert.equal(updated.updatedBy, "operator");
@@ -58,6 +65,18 @@ test("TaskBrief rejects empty required content", () => {
     leaderSummary: "summary",
     updatedBy: "\0leader"
   }, now), /updated by.*invalid/i);
+});
+
+test("TaskBrief allows a simple Task to leave its technical approach unset", () => {
+  const brief = createTaskBrief({
+    objective: "Answer one question",
+    boundaries: [],
+    currentFocus: "Investigation",
+    leaderSummary: "Not started",
+    updatedBy: "leader"
+  }, now);
+
+  assert.equal(brief.technicalApproach, "");
 });
 
 test("Decision has a one-way active to superseded lifecycle", () => {

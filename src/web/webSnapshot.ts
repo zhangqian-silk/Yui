@@ -29,7 +29,7 @@ type DashboardTask = Task & Readonly<{
   workItems: WorkItemCounts;
   roleCount: number;
   openInputCount: number;
-  projectName?: string;
+  projectNames?: readonly string[];
 }>;
 
 export type WebDashboardSnapshot = Readonly<{
@@ -56,10 +56,13 @@ export function buildWebDashboardSnapshot(
       const taskOpenInputs = reader.listInputRequests(task.id)
         .filter((request) => request.status === "open").length;
       openInputs += taskOpenInputs;
-      const projectName = task.projectId ? projectNames.get(task.projectId) : undefined;
+      const names = task.projectBindings.flatMap(({ projectId }) => {
+        const name = projectNames.get(projectId);
+        return name === undefined ? [] : [name];
+      });
       return {
         ...task,
-        ...(projectName === undefined ? {} : { projectName }),
+        ...(names.length === 0 ? {} : { projectNames: names }),
         workItems: countWorkItems(reader.listWorkItems(task.id)),
         roleCount: reader.listRoles(task.id).length,
         openInputCount: taskOpenInputs
@@ -79,11 +82,15 @@ export function buildWebTaskDetail(store: WebDashboardStore, taskId: string): ob
     const task = reader.getTask(taskId);
     if (task === null) return null;
     const inputs = reader.listInputRequests(taskId);
-    const projectName = task.projectId
-      ? new Map(reader.listProjects().map((project) => [project.id, project.name])).get(task.projectId)
-      : undefined;
+    const projectNamesById = new Map(
+      reader.listProjects().map((project) => [project.id, project.name])
+    );
+    const projectNames = task.projectBindings.flatMap(({ projectId }) => {
+      const name = projectNamesById.get(projectId);
+      return name === undefined ? [] : [name];
+    });
     return {
-      task: projectName === undefined ? task : { ...task, projectName },
+      task: projectNames.length === 0 ? task : { ...task, projectNames },
       brief: reader.getTaskBrief(taskId),
       roles: reader.listRoles(taskId),
       workItems: reader.listWorkItems(taskId),

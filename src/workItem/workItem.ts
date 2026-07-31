@@ -18,13 +18,14 @@ export type WorkItemStatus =
 export type WorkItemWorkspaceDisposition = "integrated" | "abandoned";
 
 export type WorkItem = {
-  schemaVersion: 2;
+  schemaVersion: 3;
   id: string;
   taskId: string;
   title: string;
   objective: string;
   acceptance: readonly string[];
   dependsOn: readonly string[];
+  writeProjectIds: readonly string[];
   revision: number;
   assignee?: string;
   status: WorkItemStatus;
@@ -51,18 +52,23 @@ export function createWorkItem(
     acceptance?: readonly string[];
     dependsOn?: readonly string[];
     assignee?: string;
+    writeProjectIds?: readonly string[];
   }>,
   now: Date
 ): WorkItem {
   const timestamp = now.toISOString();
   return validateWorkItem({
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: requireIdentity(id, "Work Item id"),
     taskId: requireIdentity(taskId, "Task id"),
     title: requireText(input.title, "Work item title"),
     objective: requireText(input.objective ?? input.title, "Work item objective"),
     acceptance: normalizedUniqueText(input.acceptance ?? [], "Work item acceptance criterion"),
     dependsOn: normalizedUniqueIdentities(input.dependsOn ?? [], "Work item dependency"),
+    writeProjectIds: normalizedUniqueIdentities(
+      input.writeProjectIds ?? [],
+      "Work item writable Project"
+    ),
     revision: 1,
     ...(input.assignee === undefined
       ? {}
@@ -167,13 +173,14 @@ export function recordWorkItemWorkspaceDisposition(
 }
 
 export function validateWorkItem(workItem: WorkItem): WorkItem {
-  if (workItem.schemaVersion !== 2) throw new Error("WorkItem must use schemaVersion 2.");
+  if (workItem.schemaVersion !== 3) throw new Error("WorkItem must use schemaVersion 3.");
   requireIdentity(workItem.id, "Work Item id");
   requireIdentity(workItem.taskId, "Task id");
   requireText(workItem.title, "Work item title");
   requireText(workItem.objective, "Work item objective");
   normalizedUniqueText(workItem.acceptance, "Work item acceptance criterion");
   const dependsOn = normalizedUniqueIdentities(workItem.dependsOn, "Work item dependency");
+  normalizedUniqueIdentities(workItem.writeProjectIds, "Work item writable Project");
   if (dependsOn.includes(workItem.id)) {
     throw new Error("A Work Item cannot depend on itself.");
   }
@@ -208,6 +215,40 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
     }
   }
   return workItem;
+}
+
+export function updateWorkItemWriteProjects(
+  workItem: WorkItem,
+  writeProjectIds: readonly string[],
+  now: Date
+): WorkItem {
+  validateWorkItem(workItem);
+  if (isTerminalStatus(workItem.status)) {
+    throw new Error(`Terminal Work Item write scope cannot change: ${workItem.id}.`);
+  }
+  const normalized = normalizedUniqueIdentities(
+    writeProjectIds,
+    "Work item writable Project"
+  );
+  const requested = new Set(normalized);
+  const removed = workItem.writeProjectIds.filter((projectId) => !requested.has(projectId));
+  if (removed.length > 0) {
+    throw new Error(
+      `Work Item write scope cannot remove approved Projects: ${removed.join(", ")}.`
+    );
+  }
+  if (
+    normalized.length === workItem.writeProjectIds.length
+    && workItem.writeProjectIds.every((projectId) => requested.has(projectId))
+  ) {
+    return workItem;
+  }
+  return validateWorkItem({
+    ...workItem,
+    writeProjectIds: normalized,
+    revision: workItem.revision + 1,
+    updatedAt: now.toISOString()
+  });
 }
 
 function isTerminalStatus(status: WorkItemStatus): boolean {
