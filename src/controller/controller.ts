@@ -283,8 +283,21 @@ async function processSelectedRoleRuntimeCleanups(
         throw new Error("Role runtime reservation inspection is unavailable.");
       }
       const inspection = await lifecycleHost.inspectOwner(owner);
-      if (inspection.state === "running" || inspection.state === "starting") {
+      if (inspection.state === "starting") {
         continue;
+      }
+      if (inspection.state === "running") {
+        const readiness = await inspectUnregisteredRuntimeReadiness(
+          store,
+          delivery,
+          target
+        );
+        if (readiness !== "ready") continue;
+        if (!await lifecycleHost.stopOwner(owner)) {
+          throw new Error(
+            `Role runtime reservation could not confirm the ready unregistered host stopped: ${runtimeOwnerLabel(owner)}.`
+          );
+        }
       }
       if (inspection.state === "unavailable") {
         throw new Error(
@@ -311,6 +324,41 @@ async function processSelectedRoleRuntimeCleanups(
     }
   }
   return failedRoles;
+}
+
+async function inspectUnregisteredRuntimeReadiness(
+  store: SchedulerStorePort,
+  delivery: TmuxDeliveryPort,
+  target: RuntimeLifecycleTarget
+): Promise<"ready" | "busy" | "absent" | "unsupported"> {
+  if (target.kind === "global-role-runtime") {
+    const operator = store.getOperatorDeliveryTarget();
+    if (
+      operator === null
+      || operator.roleName !== "operator"
+      || delivery.inspectGlobalRoleReadiness === undefined
+    ) {
+      return "unsupported";
+    }
+    return delivery.inspectGlobalRoleReadiness({
+      roleName: "operator",
+      adapterId: operator.adapterId
+    });
+  }
+  const role = store.getRole(target.taskId, target.roleName);
+  if (role === null || delivery.inspectRoleReadiness === undefined) {
+    return "unsupported";
+  }
+  const session = store.getRoleSession(target.taskId, target.roleName);
+  return delivery.inspectRoleReadiness({
+    taskId: target.taskId,
+    roleName: target.roleName,
+    agentId: role.activeAgentId,
+    adapterId: role.adapterId,
+    ...(session?.nativeSessionId === undefined
+      ? {}
+      : { nativeSessionId: session.nativeSessionId })
+  });
 }
 
 async function reconcileDormantRuntimeOwners(
@@ -1483,7 +1531,7 @@ export class FileTaskController {
 
   #readyRecoverySupported(): boolean {
     return this.delivery.inspectRoleReadiness !== undefined
-      && this.store.recoverReadyRoleRun !== undefined;
+      && this.delivery.stopRole !== undefined;
   }
 }
 

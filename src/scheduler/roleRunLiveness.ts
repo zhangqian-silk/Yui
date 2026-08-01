@@ -8,6 +8,8 @@ import {
 import { queueLeaderWakeup } from "./wakeupQueue.js";
 
 export const EXITED_ROLE_RUN_SUMMARY = "The role's tmux session exited before the run yielded.";
+export const MISSING_TURN_HOOK_SUMMARY =
+  "The role returned to its composer without a matching native Turn Hook.";
 export const DEFAULT_READY_RECOVERY_AGE_MS = 120_000;
 
 /**
@@ -18,7 +20,7 @@ export async function reconcileExitedRoleRuns(
   store: SchedulerStorePort,
   delivery: Pick<
     TmuxDeliveryPort,
-    "inspectRole" | "inspectRoles" | "inspectRoleReadiness" | "forgetPrepared"
+    "inspectRole" | "inspectRoles" | "inspectRoleReadiness" | "stopRole" | "forgetPrepared"
   >,
   now: Date,
   selection?: SchedulerReconcileSelection,
@@ -82,20 +84,36 @@ export async function reconcileExitedRoleRuns(
           readyRecoveryDue
           && run.deliveredAt !== undefined
           && delivery.inspectRoleReadiness !== undefined
-          && store.recoverReadyRoleRun !== undefined
+          && delivery.stopRole !== undefined
           && await delivery.inspectRoleReadiness(inspection) === "ready"
         ) {
-          store.recoverReadyRoleRun({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id,
+          // Readiness proves quiescence, not Turn completion. Stop the exact
+          // generation before releasing durable state so a late Hook is stale.
+          if (!await delivery.stopRole(task.id, role.name)) continue;
+          const persisted = store.saveExitedRoleRun({
+            task,
+            role,
+            run,
+            session,
+            reason: "missing-turn-hook",
+            summary: MISSING_TURN_HOOK_SUMMARY,
             now
           });
+          if (persisted === "state-changed") continue;
           delivery.forgetPrepared?.({
             taskId: task.id,
             roleName: role.name,
             runId: run.id
           });
+          failed.push(run.id);
+          if (persisted === undefined && task.status === "active") {
+            queueLeaderWakeup(
+              store,
+              task.id,
+              role.name === "leader" ? "leader-run-failed" : "role-run-failed",
+              now
+            );
+          }
         }
         continue;
       }
@@ -105,6 +123,7 @@ export async function reconcileExitedRoleRuns(
         role,
         run,
         session,
+        reason: "host-exited",
         summary: EXITED_ROLE_RUN_SUMMARY,
         now
       });

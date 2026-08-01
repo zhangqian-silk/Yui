@@ -1,6 +1,7 @@
 import type { RoleAgentSession } from "../executor/agentExecutor.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { TaskRole } from "../role/role.js";
+import { hasRuntimeLaunchReservation } from "../runtime/lifecycleReservation.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import type { WorkItem } from "../workItem/workItem.js";
@@ -9,6 +10,7 @@ import type { RoleWorkspace } from "../worktree/roleWorkspace.js";
 export type TaskRoleHealth =
   | "idle"
   | "starting"
+  | "registration-pending"
   | "running"
   | "ready"
   | "blocked-input"
@@ -161,7 +163,12 @@ function inspectTaskRoleRuntimeStatus(
     activeRun,
     nativeSession,
     tmux,
-    openInputRequestCount
+    openInputRequestCount,
+    hasRuntimeLaunchReservation(store.getWorkMailbox({
+      kind: "role-runtime",
+      taskId,
+      roleName: role.name
+    }))
   );
   return {
     taskId,
@@ -183,7 +190,8 @@ function calculateHealth(
   activeRun: AgentRun | null,
   nativeSession: RoleAgentSession | null,
   tmux: TaskRoleTmuxStatus,
-  openInputRequestCount: number
+  openInputRequestCount: number,
+  launchRegistrationPending: boolean
 ): Pick<TaskRoleRuntimeStatus, "health" | "healthReason"> {
   if (role.status === "failed" || role.status === "exited") {
     return { health: "failed", healthReason: `persisted Role state is ${role.status}` };
@@ -193,6 +201,16 @@ function calculateHealth(
   }
   if (tmux.state === "exited") {
     return { health: "failed", healthReason: "the tmux pane has exited" };
+  }
+  if (
+    launchRegistrationPending
+    && nativeSession === null
+    && tmux.state === "running"
+  ) {
+    return {
+      health: "registration-pending",
+      healthReason: "the native process is live but its session Hook has not registered"
+    };
   }
   if (activeRun !== null) {
     if (role.status !== "running") {

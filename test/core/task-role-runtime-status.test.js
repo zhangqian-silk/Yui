@@ -169,6 +169,38 @@ test("Task Role status explains persisted and live state without capturing outpu
   assert.equal(result.data.role.nativeSession, null);
 });
 
+test("Task Role status exposes a live process waiting for native Hook registration", (t) => {
+  const { store, options } = fixture(t);
+  execute(["create", "Pending registration"], store, options);
+  const task = store.listTasks()[0];
+  execute(["role", "add", task.id, "worker"], store, options);
+  store.saveWorkMailbox({
+    schemaVersion: 1,
+    target: { kind: "role-runtime", taskId: task.id, roleName: "worker" },
+    nextSequence: 2,
+    processing: {
+      batchId: "launch-worker",
+      batch: {
+        fromSequence: 1,
+        toSequence: 1,
+        reasons: ["runtime-launch-reserved"],
+        refs: [],
+        requestCount: 1,
+        firstQueuedAt: NOW.toISOString(),
+        lastQueuedAt: NOW.toISOString()
+      },
+      owner: "runtime-lifecycle",
+      startedAt: NOW.toISOString()
+    },
+    pending: null
+  });
+
+  const result = execute(["role", "status", task.id, "worker"], store, options);
+  assert.equal(result.data.role.health, "registration-pending");
+  assert.match(result.output, /Health\s+registration-pending/);
+  assert.match(result.output, /session Hook has not registered/i);
+});
+
 test("Task Role health distinguishes queued, orphaned delivered, and exited runtime states", (t) => {
   const { store, options } = fixture(t);
   execute(["create", "Health states"], store, options);

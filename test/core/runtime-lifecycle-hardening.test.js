@@ -1111,14 +1111,15 @@ test("production runtime forwards readyRecoveryAgeMs into the Controller", async
     session: null,
     now: FIRST
   });
-  const recovered = [];
-  const recoverReadyRoleRun = schedulerStore.recoverReadyRoleRun.bind(schedulerStore);
-  schedulerStore.recoverReadyRoleRun = (input) => {
-    recovered.push(input);
-    return recoverReadyRoleRun(input);
+  const failed = [];
+  const saveExitedRoleRun = schedulerStore.saveExitedRoleRun.bind(schedulerStore);
+  schedulerStore.saveExitedRoleRun = (input) => {
+    failed.push(input);
+    return saveExitedRoleRun(input);
   };
   const delivery = {
     async stopTask() { return false; },
+    async stopRole() { return true; },
     async inspectRole() { return "present"; },
     async inspectRoleReadiness() { return "ready"; }
   };
@@ -1152,7 +1153,8 @@ test("production runtime forwards readyRecoveryAgeMs into the Controller", async
 
   await running.runtime.pump();
 
-  assert.deepEqual(recovered.map(({ runId }) => runId), [run.id]);
+  assert.deepEqual(failed.map(({ run: failedRun }) => failedRun.id), [run.id]);
+  assert.equal(failed[0].reason, "missing-turn-hook");
 });
 
 test("orphan recovery uses the store's atomic Leader enqueue operation", () => {

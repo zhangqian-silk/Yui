@@ -636,6 +636,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       ) {
         return "state-changed";
       }
+      const repeatedMissingLeaderHook = input.reason === "missing-turn-hook"
+        && role.name === "leader"
+        && mailbox.processing.batch.reasons.includes("leader-runtime-recovery");
       store.saveAgentRun(failAgentRun(currentRun, input.summary, input.now));
       store.clearActiveAgentRun(task.id, role.name);
       clearTaskRoleRunInFlight(store, role, currentRun, input.now);
@@ -651,12 +654,37 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       }
       store.saveRole(task.id, updateRoleStatus(role, "exited", input.now));
       stopTaskSessionIfPresent(store, task.id, role.name, role.activeAgentId, input.now);
+      if (repeatedMissingLeaderHook) {
+        const detail = "Leader runtime registration failed again after one controlled recovery generation.";
+        store.saveLeaderFailure(recordLeaderFailure(
+          task.id,
+          input.session?.nativeSessionId ?? "(unregistered)",
+          detail,
+          input.now,
+          store.getLeaderFailure(task.id)
+        ));
+        store.saveOperatorNotification(createLeaderRecoveryNotification(
+          task.id,
+          detail,
+          input.now,
+          store.getOperatorNotification(task.id)
+        ));
+        enqueueWork(store, { kind: "operator" }, "leader-recovery-failed", input.now, [
+          { type: "task", id: task.id },
+          { type: "run", id: currentRun.id }
+        ]);
+        return "failed";
+      }
       queueLeaderWakeup(
         store,
         task.id,
         currentRun.purpose === "review"
           ? "review-failed"
-          : role.name === "leader" ? "leader-run-failed" : "role-run-failed",
+          : role.name === "leader"
+            ? input.reason === "missing-turn-hook"
+              ? "leader-runtime-recovery"
+              : "leader-run-failed"
+            : "role-run-failed",
         input.now
       );
       return "failed";
@@ -1073,171 +1101,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         sessions.pendingTurnCompletion === null ? [] : [sessions.pendingTurnCompletion]
       ))
     ));
-  }
-
-  recoverReadyRoleRun(input: Readonly<{
-    taskId: string;
-    roleName: string;
-    runId: string;
-    now: Date;
-  }>): void {
-    const role = this.store.getRole(input.taskId, input.roleName);
-    const run = this.store.getActiveAgentRun(input.taskId, input.roleName);
-    const sessions = this.store.getTaskRoleSessionSet(input.taskId, input.roleName);
-    if (
-      role === null
-      || run === null
-      || run.id !== input.runId
-      || run.deliveredAt === undefined
-      || sessions === null
-    ) return;
-    const agent = sessions.sessions[role.activeAgentId];
-    const summary = "Controller recovery observed the Agent composer ready without a native Turn Hook.";
-    if (agent !== undefined && agent.nativeSessionId.trim().length > 0) {
-      this.recordRuntimeTurnCompleted({
-        taskId: input.taskId,
-        roleName: input.roleName,
-        agentId: role.activeAgentId,
-        adapterId: activeRoleAgentBinding(role).adapterId,
-        nativeSessionId: agent.nativeSessionId,
-        turnId: `recovery-${run.id}`,
-        expectedRunId: run.id,
-        summary
-      }, input.now);
-      return;
-    }
-
-    // A fresh Codex session learns its native id from the very Hook that may
-    // be missing. Readiness is independently authoritative for "Turn ended",
-    // so it must close the Run even when no native identity was ever observed.
-    this.store.transaction((store) => {
-      const task = store.getTask(input.taskId);
-      const currentRole = store.getRole(input.taskId, input.roleName);
-      const active = store.getActiveAgentRun(input.taskId, input.roleName);
-      const currentSessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
-      if (
-        task === null
-        || task.status !== "active"
-        || currentRole === null
-        || active?.id !== input.runId
-        || active.deliveredAt === undefined
-        || currentSessions?.inFlight?.runId !== input.runId
-      ) return;
-      const target = {
-        kind: "role",
-        taskId: task.id,
-        roleName: currentRole.name
-      } as const;
-      if (currentRole.name !== "leader" || active.workItemId !== undefined) {
-        const detail = `Role turn completed without yui task run yield. Last assistant message: ${summary}`;
-        const terminal = failAgentRun(active, detail, input.now);
-        store.saveAgentRun(terminal);
-        if (!completeWorkExecution(store, target, { type: "run", id: terminal.id })) {
-          throw new Error(`Role Run mailbox execution is inconsistent: ${terminal.id}.`);
-        }
-        store.clearActiveAgentRun(task.id, currentRole.name);
-        store.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(
-          currentSessions,
-          {
-            agentId: currentRole.activeAgentId,
-            runId: active.id,
-            receiptId: `agent-run:${active.id}`
-          },
-          input.now
-        ));
-        if (active.purpose === "execution" && active.workItemId !== undefined) {
-          const item = store.getWorkItem(task.id, active.workItemId);
-          if (item !== null && !["completed", "failed", "cancelled", "superseded"].includes(item.status)) {
-            store.saveWorkItem(
-              task.id,
-              updateWorkItemStatus(item, "failed", input.now, summary)
-            );
-          }
-        }
-        store.saveRole(task.id, updateRoleStatus(currentRole, "idle", input.now));
-        enqueueWork(store, {
-          kind: "role",
-          taskId: task.id,
-          roleName: "leader"
-        }, "role-run-failed", input.now, [
-          { type: "run", id: terminal.id },
-          ...(terminal.workItemId === undefined
-            ? []
-            : [{ type: "work-item" as const, id: terminal.workItemId }])
-        ]);
-        return;
-      }
-
-      const terminal = yieldAgentRun(active, summary, input.now);
-      const mailbox = store.getWorkMailbox(target);
-      const recoveryTurn = mailbox?.processing?.executionRef?.type === "run"
-        && mailbox.processing.executionRef.id === active.id
-        && mailbox.processing.batch.reasons.includes("leader-turn-unclosed");
-      const quiescent = mailbox?.pending === null
-        && !store.listRoles(task.id).some((candidate) => (
-          candidate.name !== "leader"
-          && store.getActiveAgentRun(task.id, candidate.name) !== null
-        ))
-        && !store.listWorkItems(task.id).some((item) => item.status === "running")
-        && !store.listInputRequests(task.id).some((request) => request.status === "open");
-      const message = createTaskMessage(
-        store.nextMessageId(task.id),
-        summary,
-        "role-result",
-        { type: "role", roleName: currentRole.name },
-        input.now,
-        { runId: terminal.id }
-      );
-      store.saveAgentRun(terminal);
-      store.saveMessage(task.id, message);
-      store.saveEvent(task.id, createTaskEvent(
-        store.nextEventId(task.id),
-        "message.sent",
-        { messageId: message.id, kind: message.kind },
-        input.now
-      ));
-      if (!completeWorkExecution(store, target, { type: "run", id: terminal.id })) {
-        throw new Error(`Leader Run mailbox execution is inconsistent: ${terminal.id}.`);
-      }
-      store.clearActiveAgentRun(task.id, currentRole.name);
-      store.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(
-        currentSessions,
-        {
-          agentId: currentRole.activeAgentId,
-          runId: active.id,
-          receiptId: `agent-run:${active.id}`
-        },
-        input.now
-      ));
-      store.saveRole(task.id, updateRoleStatus(currentRole, "idle", input.now));
-      if (!quiescent) return;
-      if (recoveryTurn) {
-        const detail = "Leader ended a recovery Turn without completing, blocking, or continuing the Task.";
-        store.saveLeaderFailure(recordLeaderFailure(
-          task.id,
-          "(unregistered)",
-          detail,
-          input.now,
-          store.getLeaderFailure(task.id)
-        ));
-        store.saveOperatorNotification(createLeaderRecoveryNotification(
-          task.id,
-          detail,
-          input.now,
-          store.getOperatorNotification(task.id)
-        ));
-        store.saveRole(task.id, updateRoleStatus(currentRole, "failed", input.now));
-        enqueueWork(store, { kind: "operator" }, "leader-recovery-failed", input.now, [
-          { type: "task", id: task.id },
-          { type: "run", id: terminal.id }
-        ]);
-      } else {
-        enqueueWork(store, target, "leader-turn-unclosed", input.now, [
-          { type: "task", id: task.id },
-          { type: "run", id: terminal.id }
-        ]);
-      }
-    });
   }
 
   /** Resolves only completions whose grace deadline has elapsed. */

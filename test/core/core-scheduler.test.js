@@ -372,7 +372,7 @@ test("a delivery-uncertain Run is not failed by liveness in the same pass", asyn
   assert.equal(store.savedExitedRuns.length, 0);
 });
 
-test("a full reconciliation recovers a delivered Run whose composer is ready", async () => {
+test("a full reconciliation fail-stops a delivered Run whose Hook never arrived", async () => {
   const store = fakeStore();
   store.roles.push(role("worker"));
   const run = {
@@ -380,15 +380,21 @@ test("a full reconciliation recovers a delivered Run whose composer is ready", a
     deliveredAt: new Date(NOW.getTime() - 120_000).toISOString()
   };
   store.activeRuns.set(key("task-1", "worker"), run);
-  const recovered = [];
-  store.recoverReadyRoleRun = (input) => recovered.push(input);
+  const stopped = [];
   const delivery = {
     ...fakeDelivery({ inspect: "present" }),
-    async inspectRoleReadiness() { return "ready"; }
+    async inspectRoleReadiness() { return "ready"; },
+    async stopRole(taskId, roleName) {
+      stopped.push({ taskId, roleName });
+      return true;
+    }
   };
 
-  assert.deepEqual(await reconcileExitedRoleRuns(store, delivery, NOW), []);
-  assert.deepEqual(recovered.map(({ runId }) => runId), [run.id]);
+  assert.deepEqual(await reconcileExitedRoleRuns(store, delivery, NOW), [run.id]);
+  assert.deepEqual(stopped, [{ taskId: "task-1", roleName: "worker" }]);
+  assert.equal(store.savedExitedRuns.length, 1);
+  assert.equal(store.savedExitedRuns[0].reason, "missing-turn-hook");
+  assert.match(store.savedExitedRuns[0].summary, /native Turn Hook/i);
   assert.deepEqual(
     delivery.calls.find((call) => call.type === "forget")?.input,
     { taskId: "task-1", roleName: "worker", runId: run.id }
@@ -403,8 +409,6 @@ test("a dirty pass never uses composer readiness as a synthetic Turn boundary", 
     deliveredAt: new Date(NOW.getTime() - 120_000).toISOString()
   };
   store.activeRuns.set(key("task-1", "worker"), run);
-  const recovered = [];
-  store.recoverReadyRoleRun = (input) => recovered.push(input);
   const delivery = {
     ...fakeDelivery({ inspect: "present" }),
     async inspectRoleReadiness() { return "ready"; }
@@ -418,10 +422,9 @@ test("a dirty pass never uses composer readiness as a synthetic Turn boundary", 
   };
 
   assert.deepEqual(await reconcileExitedRoleRuns(store, delivery, NOW, selection), []);
-  assert.deepEqual(recovered, []);
 });
 
-test("an explicitly due Run may use composer readiness in a targeted pass", async () => {
+test("an explicitly due Run may be fail-stopped in a targeted pass", async () => {
   const store = fakeStore();
   store.roles.push(role("worker"));
   const run = {
@@ -429,11 +432,14 @@ test("an explicitly due Run may use composer readiness in a targeted pass", asyn
     deliveredAt: new Date(NOW.getTime() - 120_000).toISOString()
   };
   store.activeRuns.set(key("task-1", "worker"), run);
-  const recovered = [];
-  store.recoverReadyRoleRun = (input) => recovered.push(input);
+  const stopped = [];
   const delivery = {
     ...fakeDelivery({ inspect: "present" }),
-    async inspectRoleReadiness() { return "ready"; }
+    async inspectRoleReadiness() { return "ready"; },
+    async stopRole(taskId, roleName) {
+      stopped.push({ taskId, roleName });
+      return true;
+    }
   };
   const selection = {
     full: false,
@@ -453,9 +459,9 @@ test("an explicitly due Run may use composer readiness in a targeted pass", asyn
       120_000,
       new Set([run.id])
     ),
-    []
+    [run.id]
   );
-  assert.deepEqual(recovered.map(({ runId }) => runId), [run.id]);
+  assert.deepEqual(stopped, [{ taskId: "task-1", roleName: "worker" }]);
 });
 
 test("a full pass does not mistake a freshly delivered composer for a missing Hook", async () => {
@@ -463,15 +469,12 @@ test("a full pass does not mistake a freshly delivered composer for a missing Ho
   store.roles.push(role("worker"));
   const run = { ...activeRun("run-worker", "worker"), deliveredAt: NOW.toISOString() };
   store.activeRuns.set(key("task-1", "worker"), run);
-  const recovered = [];
-  store.recoverReadyRoleRun = (input) => recovered.push(input);
   const delivery = {
     ...fakeDelivery({ inspect: "present" }),
     async inspectRoleReadiness() { return "ready"; }
   };
 
   assert.deepEqual(await reconcileExitedRoleRuns(store, delivery, NOW), []);
-  assert.deepEqual(recovered, []);
 });
 
 test("an incomplete batch liveness snapshot is non-destructive", async () => {

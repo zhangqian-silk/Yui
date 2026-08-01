@@ -112,6 +112,7 @@ export type ExitedRoleRunPersistence = Readonly<{
   role: SchedulerRole;
   run: SchedulerAgentRun;
   session: SchedulerRoleSession | null;
+  reason?: "host-exited" | "missing-turn-hook";
   summary: string;
   now: Date;
 }>;
@@ -224,13 +225,6 @@ export interface SchedulerStorePort {
   saveLeaderDispatchFailure(input: LeaderDispatchFailurePersistence): "failed" | "state-changed";
   /** Fail the run and running WorkItem, clear active-run, and stop the Role session. */
   saveExitedRoleRun(input: ExitedRoleRunPersistence): "failed" | "state-changed";
-  /** Synthesizes the same durable Turn boundary when a full safety scan sees the composer ready. */
-  recoverReadyRoleRun?(input: Readonly<{
-    taskId: string;
-    roleName: string;
-    runId: string;
-    now: Date;
-  }>): void;
   /** Mark every recorded Task Role session stopped after tmux termination. */
   saveArchivedTaskStopped(taskId: string, now: Date): void;
 }
@@ -344,6 +338,11 @@ export interface TmuxDeliveryPort {
     agentId: string;
     adapterId: string;
     nativeSessionId?: string;
+  }>): Promise<"ready" | "busy" | "absent">;
+  /** Readiness probe for a global Role whose fresh native session is not registered yet. */
+  inspectGlobalRoleReadiness?(input: Readonly<{
+    roleName: "operator";
+    adapterId: string;
   }>): Promise<"ready" | "busy" | "absent">;
   inspectRoles?(inputs: readonly Readonly<{
     taskId: string;

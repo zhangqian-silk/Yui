@@ -375,6 +375,25 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     }));
   }
 
+  async inspectGlobalRoleReadiness(input: Readonly<{
+    roleName: "operator";
+    adapterId: string;
+  }>): Promise<"ready" | "busy" | "absent"> {
+    const status = this.tmux.probeRoleStatusAsync === undefined
+      ? this.tmux.probeRoleStatus("operator", input.roleName)
+      : await this.tmux.probeRoleStatusAsync("operator", input.roleName);
+    if (status !== "running") return "absent";
+    try {
+      const pane = this.tmux.inspectPaneAsync === undefined
+        ? this.tmux.inspectPane?.("operator", input.roleName)
+        : await this.tmux.inspectPaneAsync("operator", input.roleName);
+      if (pane === undefined) return "busy";
+      return this.readiness(input.adapterId, "operator")(pane) ? "ready" : "busy";
+    } catch {
+      return "busy";
+    }
+  }
+
   async stopTask(taskId: string): Promise<boolean> {
     const stopped = this.tmux.stopTaskAsync === undefined
       ? this.tmux.stopTask(taskId)

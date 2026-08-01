@@ -693,6 +693,134 @@ test("full recovery probes old reservations without stopping a healthy host", as
   assert.equal(mailboxes.get(stoppedTarget.roleName).processing, null);
 });
 
+test("a stale unregistered global Role is stopped only after its composer is ready", async () => {
+  const target = { kind: "global-role-runtime", roleName: "operator" };
+  let mailbox = {
+    schemaVersion: 1,
+    target,
+    nextSequence: 2,
+    processing: {
+      batchId: "launch-unregistered-operator",
+      batch: {
+        fromSequence: 1, toSequence: 1, reasons: ["runtime-launch-reserved"],
+        refs: [], requestCount: 1,
+        firstQueuedAt: new Date(0).toISOString(),
+        lastQueuedAt: new Date(0).toISOString()
+      },
+      owner: "runtime-lifecycle",
+      startedAt: new Date(0).toISOString()
+    },
+    pending: null
+  };
+  const store = emptyStore();
+  store.listWorkMailboxes = () => mailbox === null ? [] : [mailbox];
+  store.getWorkMailbox = (candidate) => candidate.kind === "global-role-runtime"
+    ? mailbox
+    : null;
+  store.getOperatorDeliveryTarget = () => ({ roleName: "operator", adapterId: "codex" });
+  store.completeStoppedRuntimeReservation = (_target, batchId) => {
+    if (mailbox?.processing?.batchId !== batchId) return false;
+    mailbox = null;
+    return true;
+  };
+  const stopped = [];
+  const lifecycleHost = {
+    async inspectOwner() { return { state: "running" }; },
+    async stopOwner(owner) {
+      stopped.push(owner);
+      return true;
+    }
+  };
+  const delivery = {
+    ...noTmux,
+    async inspectGlobalRoleReadiness(input) {
+      assert.deepEqual(input, { roleName: "operator", adapterId: "codex" });
+      return "ready";
+    }
+  };
+
+  await runControllerSchedulerPass(
+    store,
+    delivery,
+    new Date(120_001),
+    undefined,
+    { kind: "full" },
+    undefined,
+    false,
+    new Set(),
+    [],
+    lifecycleHost
+  );
+
+  assert.deepEqual(stopped, [{ scope: "global", roleName: "operator" }]);
+  assert.equal(mailbox, null);
+});
+
+test("a stale unregistered Task Role uses the same ready-gated generation cleanup", async () => {
+  const task = { id: "task-1", status: "active", projectBindings: [] };
+  const roleValue = role(task.id, "worker");
+  const target = { kind: "role-runtime", taskId: task.id, roleName: roleValue.name };
+  let mailbox = {
+    schemaVersion: 1,
+    target,
+    nextSequence: 2,
+    processing: {
+      batchId: "launch-unregistered-worker",
+      batch: {
+        fromSequence: 1, toSequence: 1, reasons: ["runtime-launch-reserved"],
+        refs: [], requestCount: 1,
+        firstQueuedAt: new Date(0).toISOString(),
+        lastQueuedAt: new Date(0).toISOString()
+      },
+      owner: "runtime-lifecycle",
+      startedAt: new Date(0).toISOString()
+    },
+    pending: null
+  };
+  const store = emptyStore();
+  store.listTasks = () => [task];
+  store.getTask = () => task;
+  store.listRoles = () => [roleValue];
+  store.getRole = () => roleValue;
+  store.listWorkMailboxes = () => mailbox === null ? [] : [mailbox];
+  store.getWorkMailbox = (candidate) => candidate.kind === "role-runtime"
+    ? mailbox
+    : null;
+  store.completeStoppedRuntimeReservation = (_target, batchId) => {
+    if (mailbox?.processing?.batchId !== batchId) return false;
+    mailbox = null;
+    return true;
+  };
+  const stopped = [];
+  const lifecycleHost = {
+    async inspectOwner() { return { state: "running" }; },
+    async stopOwner(owner) {
+      stopped.push(owner);
+      return true;
+    }
+  };
+  const delivery = {
+    ...noTmux,
+    async inspectRoleReadiness(input) {
+      assert.deepEqual(input, {
+        taskId: task.id,
+        roleName: roleValue.name,
+        agentId: roleValue.activeAgentId,
+        adapterId: roleValue.adapterId
+      });
+      return "ready";
+    }
+  };
+
+  await runControllerSchedulerPass(
+    store, delivery, new Date(120_001), undefined, { kind: "full" },
+    undefined, false, new Set(), [], lifecycleHost
+  );
+
+  assert.deepEqual(stopped, [{ scope: "task", taskId: task.id, roleName: roleValue.name }]);
+  assert.equal(mailbox, null);
+});
+
 test("an unavailable stale reservation is re-inspected by its exact dirty retry", async () => {
   const target = { kind: "global-role-runtime", roleName: "operator" };
   let mailbox = {
@@ -2096,16 +2224,17 @@ test("overdue ready recovery remains targeted and retries until the composer is 
   };
   let listTaskCalls = 0;
   let readinessCalls = 0;
-  let recovered = 0;
+  let failed = 0;
   const store = emptyStore();
   store.listTasks = () => { listTaskCalls += 1; return [task]; };
   store.getTask = () => task;
   store.listRoles = () => [roleValue];
   store.getRole = () => roleValue;
   store.getActiveAgentRun = () => run;
-  store.recoverReadyRoleRun = () => {
-    recovered += 1;
+  store.saveExitedRoleRun = () => {
+    failed += 1;
     run = null;
+    return "failed";
   };
   const delivery = {
     ...noTmux,
@@ -2113,6 +2242,9 @@ test("overdue ready recovery remains targeted and retries until the composer is 
     async inspectRoleReadiness() {
       readinessCalls += 1;
       return readinessCalls < 3 ? "busy" : "ready";
+    },
+    async stopRole() {
+      return true;
     }
   };
   const controller = new FileTaskController(store, delivery, {
@@ -2127,7 +2259,7 @@ test("overdue ready recovery remains targeted and retries until the composer is 
   await new Promise((resolve) => setTimeout(resolve, 50));
 
   assert.equal(readinessCalls, 3);
-  assert.equal(recovered, 1);
+  assert.equal(failed, 1);
   assert.equal(listTaskCalls, fullPassTaskScans);
   controller.stop();
 });
