@@ -136,10 +136,12 @@ yui task project add <task-id> shared-sdk --base main
 
 Implementation WorkItems declare the Projects they may modify. Their workspace
 keeps the same relative layout, creates isolated worktrees only for that write
-scope, and exposes the other Task Projects as context from Task main. Yui uses
-Linux `bubblewrap` (`bwrap`) when launching this mixed-access workspace so
-context Projects are mounted read-only independently of the native Agent's own
-permission mode. Install `bubblewrap` before dispatching such a WorkItem.
+scope, and exposes the other Task Projects as context from Task main. Yui puts
+the exact writable and context-only Project lists into the managed dispatch and
+the `yui-worker` Skill requires the Agent to honor that boundary. Native Agent
+permissions remain session-wide: use a write-capable session for implementation
+and a native read-only session (Codex `read-only` or Claude `dontAsk` with a
+small allow list) for explorer and reviewer Roles.
 
 Write scope may only expand. The Leader supplies the complete old-plus-new set
 after a Worker yields and reports that another repository is required; an
@@ -222,6 +224,24 @@ model, effort, and permissions do not need to be reconstructed by the Leader.
 The creation receipt and `task context` record that runtime source and the
 effective Agent/model/effort/YOLO values. An explicit `--agent` is a deliberate
 Task-specific override and must be configured completely before dispatch.
+
+A Claude reviewer can use native `dontAsk` mode so unapproved tools fail closed
+without an interactive prompt while the exact Yui handoff remains available.
+Pre-approve the read tools and that handoff when configuring the Role:
+
+```sh
+yui role update reviewer --agent claude --model <model> --effort <effort> \
+  --permission-mode dontAsk \
+  --allowed-tool Read --allowed-tool Grep --allowed-tool Glob \
+  --allowed-tool 'Bash(yui task run yield *)'
+```
+
+This does not enable file-editing tools or relax the review Profile; everything
+that is neither read-only nor explicitly allowed is denied. The reviewer must
+invoke the yield command directly, not through a shell loop or wrapper that
+would stop matching the rule. Repeat `--allowed-tool` or `--disallowed-tool` to
+replace the corresponding Claude tool-rule list; `--clear-allowed-tools` and
+`--clear-disallowed-tools` remove those stored rules.
 
 The Worker delivers its current Run explicitly:
 

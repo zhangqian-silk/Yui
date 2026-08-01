@@ -207,8 +207,9 @@ yui --json role show worker
 - 全局 Worker 缺失或不一致时停止，不得先启动 Session 再补配置。
 
 权限边界负向测试不要混入这个无提示主路径。需要验证 read-only sandbox、
-Claude plan mode 或审批页面时，使用另一个隔离 `YUI_HOME`，清除对应 Role 的
-YOLO 后单独执行，并在报告中标记为 permission-boundary run。
+Claude `dontAsk` allow/deny 规则或审批页面时，使用另一个隔离 `YUI_HOME`，
+清除对应 Role 的 YOLO 后单独执行，并在报告中标记为
+permission-boundary run。
 
 ## 3. 当前产品边界
 
@@ -231,16 +232,21 @@ Project 时，只能由 active Leader 使用 `task project add` 追加。Yui 不
 替换既有 binding 修复错误路由。
 
 Task main 是一个包含全部 Project peer directory 的逻辑根。WorkItem 可以读取
-全部 Task Project，但只允许修改其重复 `--project` 声明的写入范围；混合读写
-workspace 必须经 `bwrap` 把上下文 Project 挂载为只读。写入范围只能扩大。
+全部 Task Project，但只允许修改其重复 `--project` 声明的写入范围；受管派发
+和 `yui-worker` Skill 必须清楚列出可写与仅上下文 Project。原生 Agent 权限是
+会话级而不是逐 Project 的；实现会话可写，reviewer 会话使用带最小 allow list
+的 Claude `dontAsk` 或 Codex `read-only`。写入范围只能扩大。
+Claude reviewer 的会话配置只预批准 `Read`、`Grep`、`Glob` 和
+`Bash(yui task run yield *)`：其余非只读工具直接拒绝，同时审查仍可完成 Yui
+控制面交接。yield 必须直接执行一次，不能包进 shell 循环或复合命令；不得启用
+编辑工具、切到 YOLO，或依赖需要在线分类器的权限模式。
 `capture` 对每个实际修改的 Project 生成独立 ChangeSet，integration 保持
 单 Project 事务，所有修改 Project 的最新候选都已集成后才能 accept。
 
 Leader 根据工作语义选择 Profile：只读调查和评审使用 read-only Profile，
-修改代码或外部状态使用 `implementer`。这依赖 Leader 判断，不为 WorkItem
-增加新的权限状态。未开启 YOLO 且配置了只读 provider 权限时，原生权限是最后
-安全网；完整 E2E 的无提示 YOLO 主路径则直接验证 Agent 即使具备底层写能力，
-仍然遵守只读 Profile 和 WorkItem 边界。
+修改代码或外部状态使用 `implementer`。reviewer Role 不承担实现 WorkItem，
+也不复用写权限会话；完整 E2E 必须回读 reviewer 的原生只读权限，并验证它仍然
+遵守只读 Profile、Skill 和 WorkItem 边界。
 
 Task Role Worker yield 只提交结果，不能完成 WorkItem。代码结果必须经过：
 

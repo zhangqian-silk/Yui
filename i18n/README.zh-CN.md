@@ -151,9 +151,10 @@ yui task project add <task-id> shared-sdk --base main
 
 实现型 WorkItem 必须声明允许修改的 Project。它保留与 Task main 一致的
 相对目录布局，只为写入范围创建隔离 worktree，其他 Task Project 作为上下文
-从 Task main 暴露。混合读写 workspace 在 Linux 上通过 `bubblewrap`
-（`bwrap`）启动，把上下文 Project 独立挂载为只读；派发此类 WorkItem 前
-必须安装 `bubblewrap`。
+从 Task main 暴露。Yui 会在受管派发和 `yui-worker` Skill 中明确列出可写与
+仅上下文 Project，由 Agent 严格遵守该边界。原生 Agent 权限作用于整个会话：
+实现 Role 使用可写会话，explorer 和 reviewer Role 使用原生只读会话（Codex
+`read-only`，或带最小 allow list 的 Claude `dontAsk`）。
 
 写入范围只能扩大，不能缩小。Worker yield 并报告还需要另一个仓库后，
 Leader 使用完整的“旧范围 + 新范围”更新并重新派发：
@@ -228,6 +229,22 @@ Worker Role 的完整 Agent bindings，Leader 无需重新拼接 model、effort 
 权限。创建回执和 `task context` 会记录配置来源及生效的
 Agent/model/effort/YOLO。显式 `--agent` 属于 Task 专用覆盖，必须在派发前
 补全并回读配置。
+
+Claude reviewer 可以使用原生 `dontAsk` 模式：未预批准的工具会直接拒绝且不会
+弹出交互确认，同时精确放行只读工具和向 Yui 交回结果所需的控制面命令：
+
+```sh
+yui role update reviewer --agent claude --model <model> --effort <effort> \
+  --permission-mode dontAsk \
+  --allowed-tool Read --allowed-tool Grep --allowed-tool Glob \
+  --allowed-tool 'Bash(yui task run yield *)'
+```
+
+这不会启用文件编辑工具，也不会放宽只读 reviewer Profile；既非只读、又未
+显式允许的动作都会被拒绝。reviewer 必须直接执行 yield 命令，不能包进 shell
+循环或其他导致规则不再匹配的复合命令。重复传入 `--allowed-tool` 或
+`--disallowed-tool` 会替换对应的 Claude 工具规则列表；`--clear-allowed-tools`
+和 `--clear-disallowed-tools` 可移除已保存的规则。
 
 Worker 显式交付当前 Run：
 

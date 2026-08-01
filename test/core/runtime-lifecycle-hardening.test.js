@@ -106,6 +106,88 @@ function fixture(t, adapterId = "codex") {
   return { home, store, agent, task, role };
 }
 
+test("an active Role Run may launch from its snapshotted workspace", async (t) => {
+  const { home, store, agent, task, role } = fixture(t);
+  const schedulerStore = new FileSchedulerStoreAdapter(store);
+  const reviewer = createRole(
+    task.id,
+    "reviewer",
+    [createRoleAgentBinding(agent)],
+    agent.id,
+    home,
+    FIRST
+  );
+  const workspace = {
+    schemaVersion: 3,
+    taskId: task.id,
+    roleName: reviewer.name,
+    owner: { type: "task" },
+    root: join(home, "candidate"),
+    entries: [],
+    createdAt: FIRST.toISOString(),
+    updatedAt: FIRST.toISOString()
+  };
+  const run = createAgentRun(
+    "agent-run-workspace",
+    task.id,
+    reviewer.name,
+    "new",
+    "Review the candidate.",
+    FIRST,
+    { workspace }
+  );
+  const target = { kind: "role", taskId: task.id, roleName: reviewer.name };
+  store.transaction((tx) => {
+    tx.saveRole(task.id, reviewer);
+    tx.saveActiveAgentRun(run);
+    enqueueWork(tx, target, "review-requested", FIRST, [{ type: "run", id: run.id }]);
+  });
+  const starts = [];
+  const sessionHost = {
+    async start(request) {
+      starts.push(request);
+      return {
+        id: "binding-workspace",
+        launchId: request.launchId,
+        owner: request.owner,
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        hostRef: "opaque-workspace",
+        hostCreated: true
+      };
+    },
+    async resume() { throw new Error("unexpected resume"); },
+    async stop() {},
+    async inspect() { return { state: "running" }; },
+    async inspectOwner() { return { state: "running" }; }
+  };
+  const running = await startFileTaskControllerRuntime(home, {
+    store,
+    schedulerStore,
+    planner: {},
+    tmux: { probeRoleStatus() { return "running"; } },
+    sessionHost,
+    promptPush: { async tryPush() { return "delivered"; } },
+    workspacePreparer: {
+      async prepareTaskWorkspace() { return { taskId: task.id, status: "ready" }; }
+    },
+    runtimeEventProcessor: {
+      drain() { return { appliedEventIds: [], acknowledgedEventIds: [], failed: [] }; }
+    },
+    intervalMs: 60_000,
+    now: () => FIRST
+  });
+  t.after(() => running.close());
+
+  await running.runtime.pump();
+
+  const reviewerStart = starts.find(({ owner }) => owner.roleName === reviewer.name);
+  assert.ok(reviewerStart);
+  assert.equal(reviewerStart.workspace, workspace.root);
+  assert.notEqual(reviewerStart.workspace, role.workspace);
+  assert.notEqual(store.getActiveAgentRun(task.id, reviewer.name).deliveredAt, undefined);
+});
+
 test("a Role host created after Task archival is stopped without a false cleanup signal", async (t) => {
   const { store, task, role } = fixture(t);
   const schedulerStore = new FileSchedulerStoreAdapter(store);
@@ -857,7 +939,7 @@ test("launch environment keeps native context and excludes other Agents' credent
     environment: {
       PATH: "",
       HOME: "",
-      TERM: "",
+      TERM: "dumb",
       TMPDIR: "",
       COLORTERM: "",
       LANG: "",

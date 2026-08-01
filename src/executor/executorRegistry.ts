@@ -485,7 +485,9 @@ export function agentComposerReadinessProbe(
 }
 
 function claudeComposerChromeLine(line: string): boolean {
-  return /^[─━═\-\s]+$/u.test(line) || line.startsWith("⏵⏵");
+  return /^[─━═\-\s]+$/u.test(line)
+    || line.startsWith("⏵⏵")
+    || /^⏸\s+plan mode on\b/iu.test(line);
 }
 
 function livePane(pane: TmuxPaneState): boolean {

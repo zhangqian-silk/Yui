@@ -127,6 +127,11 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
   assert.match(leader, /A Profile is required for this path/u);
   assert.match(leader, /Ignore all Task Role Agent bindings/u);
   assert.match(leader, /executor=subagent; profile=reviewer@3/u);
+  assert.match(leader, /Bash\(yui task run yield \*\).*control-plane handoff/us);
+  assert.match(
+    leader,
+    /`--check` commands run from the selected Project's integration candidate root[\s\S]*not\s+`cd <project> && npm test`/u
+  );
   assert.match(operator, /Leader chooses among direct execution, a native subagent, and a Task Role\s+AgentRun/u);
   assert.match(operator, /inherits\s+the Leader Agent, ignores Task Role Agent bindings/u);
   assert.match(operator, /has no Yui launch\s+command/u);
@@ -135,6 +140,15 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
   assert.match(worker, /native subagent inherits the Leader Agent/u);
   assert.match(worker, /Do not run Yui lifecycle commands/u);
   assert.match(worker, /result and records the actual Profile revision/u);
+  assert.match(
+    worker,
+    /review Run uses a native read-only permission mode[\s\S]*Do not request approval[\s\S]*yield\s+the Run/u
+  );
+  assert.match(
+    worker,
+    /one bounded evidence pass[\s\S]*Do not repeat successful checks[\s\S]*yield\s+immediately/u
+  );
+  assert.match(worker, /do not wrap it in `until`[\s\S]*If the direct command is denied[\s\S]*stop instead of retrying/u);
 });
 
 test("publish builds once and smokes the same package on Node 20, 22, and 24", () => {

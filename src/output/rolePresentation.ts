@@ -95,9 +95,17 @@ function permission(binding: RoleAgentBinding): string {
       approval === undefined ? undefined : `approval=${approval}`
     ].filter((value): value is string => value !== undefined).join(", ");
   }
-  return binding.config.permission?.mode === undefined
-    ? "CLI default"
-    : `mode=${binding.config.permission.mode}`;
+  const permission = binding.config.permission;
+  const rules = [
+    permission?.mode === undefined ? undefined : `mode=${permission.mode}`,
+    permission?.allowedTools === undefined
+      ? undefined
+      : `allow=${permission.allowedTools.join(", ")}`,
+    permission?.disallowedTools === undefined
+      ? undefined
+      : `deny=${permission.disallowedTools.join(", ")}`
+  ].filter((value): value is string => value !== undefined);
+  return rules.length === 0 ? "CLI default" : rules.join("; ");
 }
 
 function present(value: string | undefined): string {

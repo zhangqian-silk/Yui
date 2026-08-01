@@ -387,17 +387,19 @@ function assertRuntimeLaunchRequestCurrent(
   store: TaskStore,
   request: CoordinatedRuntimeLaunchRequest
 ): void {
+  let activeRun: ReturnType<TaskStore["getActiveAgentRun"]> = null;
   if (request.owner.scope === "task") {
     const task = store.getTask(request.owner.taskId);
     if (task === null || task.status !== "active") {
       throw new Error(`Task is no longer active: ${request.owner.taskId}.`);
     }
+    activeRun = store.getActiveAgentRun(
+      request.owner.taskId,
+      request.owner.roleName
+    );
     if (
       request.runId !== undefined
-      && store.getActiveAgentRun(
-        request.owner.taskId,
-        request.owner.roleName
-      )?.id !== request.runId
+      && activeRun?.id !== request.runId
     ) {
       throw new Error(`Role Run is no longer current: ${request.runId}.`);
     }
@@ -409,10 +411,14 @@ function assertRuntimeLaunchRequestCurrent(
     throw new Error(`Role no longer exists: ${request.owner.roleName}.`);
   }
   const binding = activeRoleAgentBinding(role);
+  const expectedWorkspace = request.owner.scope === "task"
+    && request.runId !== undefined
+    ? activeRun?.workspace?.root ?? role.workspace
+    : role.workspace;
   if (
     role.activeAgentId !== request.agentId
     || binding.adapterId !== request.adapterId
-    || role.workspace !== request.workspace
+    || expectedWorkspace !== request.workspace
   ) {
     throw new Error(`Role launch state changed: ${request.owner.roleName}.`);
   }

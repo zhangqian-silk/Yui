@@ -149,6 +149,7 @@ test("restored tmux attach isolates the native session in tmux scrollback", () =
   }, {
     yuiHome: "/tmp/yui-home",
     terminalInput: input,
+    terminalType: "dumb",
     closeInteractiveInput: () => input.events.push("close")
   });
 
@@ -177,7 +178,7 @@ test("restored tmux attach isolates the native session in tmux scrollback", () =
   ]);
   const attach = calls.find(({ args }) => tmuxCommand(args) === "attach-session");
   assert.equal(attach.options.inheritStdio, true);
-  assert.equal(attach.options.environment, undefined);
+  assert.deepEqual(attach.options.environment, { TERM: "xterm-256color" });
   assert.deepEqual(attach.inputEvents, input.events);
 });
 

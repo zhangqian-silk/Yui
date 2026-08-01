@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
-import { accessSync, chmodSync, constants, realpathSync } from "node:fs";
+import { chmodSync, realpathSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -36,7 +35,6 @@ export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
   createNativeSessionId?: () => string;
   cliPath?: string;
-  bubblewrapCommand?: string;
 }>;
 
 export type GlobalRoleLaunchPlanInput = Readonly<{
@@ -62,7 +60,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   readonly #createNativeSessionId: () => string;
   readonly #cliPath: string;
   readonly #managedBinPath: string;
-  readonly #bubblewrapCommand: string | undefined;
 
   constructor(
     readonly home: string,
@@ -87,9 +84,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     this.#cliPath = canonicalPath(options.cliPath
       ?? fileURLToPath(new URL("../cli.js", import.meta.url)));
     this.#managedBinPath = ensureManagedYuiLauncher(this.home, this.#cliPath);
-    this.#bubblewrapCommand = options.bubblewrapCommand === undefined
-      ? findExecutable("bwrap", sourceEnvironment.PATH)
-      : canonicalPath(options.bubblewrapCommand);
   }
 
   refreshAgentEnvironment(refresh: AgentEnvironmentRefresh): void {
@@ -319,8 +313,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           : { YUI_LAUNCH_ID: input.launchId })
       }
     };
-    const protectedLaunch = owner.scope === "task"
-      ? this.#protectReadOnlyWorkspace(owner.taskId, role, launch, workspaceOverride)
+    const scopedLaunch = owner.scope === "task"
+      ? this.#applyWorkspaceScope(owner.taskId, role, launch, workspaceOverride)
       : launch;
     return {
       role: {
@@ -328,12 +322,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         workspace: effectiveWorkspace,
         ...(owner.scope === "task" ? { status: (role as TaskRole).status } : {})
       },
-      launch: protectedLaunch,
+      launch: scopedLaunch,
       session
     };
   }
 
-  #protectReadOnlyWorkspace(
+  #applyWorkspaceScope(
     taskId: string,
     role: TaskRole | GlobalRole,
     launch: Readonly<{
@@ -345,41 +339,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   ): typeof launch {
     const workspace = workspaceOverride ?? this.store.getRoleWorkspace(taskId, role.name);
     if (workspace === null || workspace === undefined) return launch;
-    const readOnlyEntries = workspace.entries.filter(({ access }) => access === "read");
-    if (readOnlyEntries.length === 0) {
-      return {
-        ...launch,
-        env: workspaceScopeEnvironment(launch.env, workspace)
-      };
-    }
-    if (this.#bubblewrapCommand === undefined) {
-      throw new Error(
-        `bubblewrap is required to enforce read-only Project context for ${
-          taskId
-        }/${role.name}; install bwrap before launching this WorkItem.`
-      );
-    }
-    const readOnlyPaths = [...new Set(readOnlyEntries.flatMap((entry) => {
-      const project = this.store.getProject(entry.projectId);
-      if (project === null) {
-        throw new Error(`Project not found for read-only workspace: ${entry.projectId}.`);
-      }
-      // Protect both the visible Task-main worktree and its stable checkout.
-      // The latter owns the shared Git common directory, so a Worker cannot
-      // advance the read-only Project through Git plumbing.
-      return [entry.path, project.path, gitCommonDirectory(entry.path)];
-    }))];
     return {
-      command: this.#bubblewrapCommand,
-      args: [
-        "--die-with-parent",
-        "--dev-bind", "/", "/",
-        ...readOnlyPaths.flatMap((path) => ["--ro-bind", path, path]),
-        "--chdir", workspace.root,
-        "--",
-        launch.command,
-        ...launch.args
-      ],
+      ...launch,
       env: {
         ...workspaceScopeEnvironment(launch.env, workspace)
       }
@@ -456,39 +417,6 @@ function canonicalPath(path: string): string {
   } catch {
     return absolute;
   }
-}
-
-function findExecutable(command: string, path: string | undefined): string | undefined {
-  for (const directory of (path ?? "").split(delimiter).filter(Boolean)) {
-    const candidate = resolve(directory, command);
-    try {
-      accessSync(candidate, constants.X_OK);
-      return realpathSync(candidate);
-    } catch {
-      // Continue through PATH. Missing bubblewrap is reported only when an
-      // isolated WorkItem actually exposes read-only Project context.
-    }
-  }
-  return undefined;
-}
-
-function gitCommonDirectory(worktree: string): string {
-  const path = execFileSync(
-    "git",
-    [
-      "-C",
-      worktree,
-      "rev-parse",
-      "--path-format=absolute",
-      "--git-common-dir"
-    ],
-    {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 5_000
-    }
-  ).trim();
-  return canonicalPath(path);
 }
 
 function shellQuote(value: string): string {

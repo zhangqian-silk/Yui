@@ -82,6 +82,15 @@ export function terminalSupportsColor(
   return stream.isTTY === true && env.TERM !== "dumb";
 }
 
+export function usableInteractiveTerminal(value: string | undefined): string {
+  const normalized = value?.trim();
+  return normalized === undefined
+    || normalized.length === 0
+    || normalized.toLowerCase() === "dumb"
+    ? "xterm-256color"
+    : normalized;
+}
+
 export function defaultTerminalWidth(stream: TerminalStream = process.stdout): number {
   const columns = stream.columns;
   return columns === undefined || !Number.isFinite(columns) || columns <= 0

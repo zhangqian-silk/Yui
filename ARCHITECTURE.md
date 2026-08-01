@@ -104,11 +104,14 @@ scope-repair mechanism.
 
 A WorkItem can read the full Task workspace but has an explicit Project write
 scope. Isolation creates a second root with independent worktrees for writable
-Projects and Task-main context for the rest. Yui launches that Worker through
-`bubblewrap`: Task-main context paths are read-only bind mounts while isolated
-worktrees remain writable. Scope is monotonic. A Worker cannot expand it
-directly: it reports the need, and the Leader either adds Projects to the
-existing scope, creates another WorkItem, or adds the Project to the Task.
+Projects and Task-main context for the rest. The managed dispatch and
+`yui-worker` Skill name both sets explicitly; the Agent must modify only the
+writable set. Native Agent permissions apply to the whole Role Session rather
+than individual Project directories, so implementation Roles use write-capable
+sessions while explorer and reviewer Roles use native read-only sessions. Scope
+is monotonic. A Worker cannot expand it directly: it reports the need, and the
+Leader either adds Projects to the existing scope, creates another WorkItem, or
+adds the Project to the Task.
 
 An isolated result is handled in this order:
 
