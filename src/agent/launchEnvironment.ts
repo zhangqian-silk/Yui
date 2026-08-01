@@ -5,6 +5,7 @@ import {
 } from "./agent.js";
 import { homedir, tmpdir } from "node:os";
 import { dirname } from "node:path";
+import { usableInteractiveTerminal } from "../output/terminal.js";
 
 /**
  * Non-secret process context needed by native Agent CLIs after tmux starts
@@ -123,7 +124,7 @@ export function operationalAgentEnvironment(
     PATH: source.PATH
       || `${dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`,
     HOME: source.HOME || homedir(),
-    TERM: source.TERM || "xterm-256color",
+    TERM: usableInteractiveTerminal(source.TERM),
     TMPDIR: source.TMPDIR || tmpdir()
   };
 }

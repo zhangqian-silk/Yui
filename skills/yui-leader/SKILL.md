@@ -106,6 +106,16 @@ Choose before creating the WorkItem:
   credentials, user-owned independent Session, durable lifecycle, or repeated
   dispatches to a Task-bound Worker instance.
 
+Keep review execution separate from implementation. A reviewer Role uses a
+read-only Profile and native read-only Agent permission, and must not receive a
+writable WorkItem or reuse an implementation Role Session. A Claude reviewer
+uses native `dontAsk` mode with only `Read`, `Grep`, `Glob`, and
+`Bash(yui task run yield *)` pre-approved. Unapproved tools are denied while
+the exact Yui control-plane handoff remains available without a classifier or
+approval prompt. Do not enable editing tools, YOLO, or a writable permission
+mode for review. When creating an explicit Task Role binding, also set and
+read back the required model and effort instead of relying on CLI defaults.
+
 A direct or native-subagent WorkItem is roleless. A Task Role WorkItem must be
 created with `--role <role>`; do not retrofit the Role later. Reuse a compatible
 Role instead of creating duplicates.
@@ -312,6 +322,10 @@ yui task integration start <task-id> --project <project> \
   --check "<validation command>"
 yui task work accept <work-id> --summary "<acceptance and integration evidence>"
 ```
+
+`--check` commands run from the selected Project's integration candidate root.
+Keep them Project-relative, for example `npm test`, not
+`cd <project> && npm test`.
 
 Candidate and ReviewRound history is retained under the same WorkItem. Every
 retry round must also retain its result and checks in the WorkItem summary.

@@ -741,9 +741,9 @@ test("Claude structured config compiles permissions and preallocated session lif
     model: "sonnet",
     effort: "high",
     permission: {
-      mode: "acceptEdits",
-      allowedTools: ["Read", "Bash(git status)"],
-      disallowedTools: ["WebFetch"]
+      mode: "dontAsk",
+      allowedTools: ["Read", "Grep", "Glob", "Bash(yui task run yield *)"],
+      disallowedTools: ["Edit", "Write"]
     },
     settingsFile: "/tmp/claude-settings.json",
     settingsSources: ["user", "project"],
@@ -762,9 +762,9 @@ test("Claude structured config compiles permissions and preallocated session lif
   assert.deepEqual(compiled.argv, [
     "--model", "sonnet",
     "--effort", "high",
-    "--permission-mode", "acceptEdits",
-    "--allowed-tools", "Read", "Bash(git status)",
-    "--disallowed-tools", "WebFetch",
+    "--permission-mode", "dontAsk",
+    "--allowed-tools", "Read", "Grep", "Glob", "Bash(yui task run yield *)",
+    "--disallowed-tools", "Edit", "Write",
     "--settings", "/tmp/claude-settings.json",
     "--setting-sources", "user,project",
     "--append-system-prompt-file", contextFile,

@@ -39,6 +39,11 @@ const AGENT_VALUE_OPTIONS: readonly [string, RoleOptionKind][] = [
   ["--search", "value"]
 ];
 
+const AGENT_REPEATABLE_OPTIONS: readonly [string, RoleOptionKind][] = [
+  ["--allowed-tool", "repeatable"],
+  ["--disallowed-tool", "repeatable"]
+];
+
 const AGENT_CLEAR_OPTIONS: readonly [string, RoleOptionKind][] = [
   ["--clear-model", "flag"],
   ["--clear-effort", "flag"],
@@ -46,12 +51,15 @@ const AGENT_CLEAR_OPTIONS: readonly [string, RoleOptionKind][] = [
   ["--clear-sandbox", "flag"],
   ["--clear-approval", "flag"],
   ["--clear-permission-mode", "flag"],
+  ["--clear-allowed-tools", "flag"],
+  ["--clear-disallowed-tools", "flag"],
   ["--clear-search", "flag"],
   ["--clear-agent-config", "flag"]
 ];
 
 const AGENT_CONFIG_OPTIONS = new Set([
   ...AGENT_VALUE_OPTIONS.map(([option]) => option),
+  ...AGENT_REPEATABLE_OPTIONS.map(([option]) => option),
   ...AGENT_CLEAR_OPTIONS.map(([option]) => option)
 ]);
 
@@ -71,11 +79,15 @@ export function roleOptionSpecs(input: Readonly<{
         || option === "--clear-agent-config"
       ))
     : AGENT_CLEAR_OPTIONS;
+  const agentRepeatableOptions = input.agentOptions === "execution"
+    ? []
+    : AGENT_REPEATABLE_OPTIONS;
   return new Map<string, RoleOptionKind>([
     ...(input.includeAgent === true ? [["--agent", "value"] as const] : []),
     ...(input.includeWorkspace === true ? [["--workspace", "value"] as const] : []),
     ...PROFILE_OPTIONS,
     ...agentValueOptions,
+    ...agentRepeatableOptions,
     ...(input.update ? [...PROFILE_CLEAR_OPTIONS, ...agentClearOptions] : [])
   ]);
 }
@@ -182,6 +194,14 @@ export function patchRoleAgentBinding(
   patchText(permission, parsed, "--sandbox", "--clear-sandbox", "sandbox");
   patchText(permission, parsed, "--approval", "--clear-approval", "approval");
   patchText(permission, parsed, "--permission-mode", "--clear-permission-mode", "mode");
+  patchTexts(permission, parsed, "--allowed-tool", "--clear-allowed-tools", "allowedTools");
+  patchTexts(
+    permission,
+    parsed,
+    "--disallowed-tool",
+    "--clear-disallowed-tools",
+    "disallowedTools"
+  );
   if (Object.keys(permission).length === 0) delete config.permission;
   else config.permission = permission;
 
@@ -214,6 +234,17 @@ function patchText(
   if (parsed.has(clearOption)) delete target[key];
 }
 
+function patchTexts(
+  target: Record<string, unknown>,
+  parsed: ParsedRoleOptions,
+  valueOption: string,
+  clearOption: string,
+  key: string
+): void {
+  if (parsed.has(valueOption)) target[key] = parsed.many(valueOption).map(requiredText);
+  if (parsed.has(clearOption)) delete target[key];
+}
+
 function assertAgentOptionConflicts(parsed: ParsedRoleOptions): void {
   assertPairs(parsed, [
     ["--model", "--clear-model"],
@@ -222,6 +253,8 @@ function assertAgentOptionConflicts(parsed: ParsedRoleOptions): void {
     ["--sandbox", "--clear-sandbox"],
     ["--approval", "--clear-approval"],
     ["--permission-mode", "--clear-permission-mode"],
+    ["--allowed-tool", "--clear-allowed-tools"],
+    ["--disallowed-tool", "--clear-disallowed-tools"],
     ["--search", "--clear-search"]
   ]);
   if (parsed.has("--clear-agent-config")
@@ -249,12 +282,16 @@ function patchTrue(
 function assertAdapterOptions(adapterId: string, parsed: ParsedRoleOptions): void {
   const codex = ["--sandbox", "--clear-sandbox", "--approval", "--clear-approval",
     "--search", "--clear-search"];
-  const claude = ["--permission-mode", "--clear-permission-mode"];
+  const claude = [
+    "--permission-mode", "--clear-permission-mode",
+    "--allowed-tool", "--clear-allowed-tools",
+    "--disallowed-tool", "--clear-disallowed-tools"
+  ];
   if (adapterId !== "codex" && codex.some((option) => parsed.has(option))) {
     throw usageError("Sandbox, approval, and search settings are only supported by Codex.");
   }
   if (adapterId !== "claude" && claude.some((option) => parsed.has(option))) {
-    throw usageError("Permission mode is only supported by Claude.");
+    throw usageError("Permission mode and tool rules are only supported by Claude.");
   }
 }
 

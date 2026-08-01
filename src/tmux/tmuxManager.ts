@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { stripVTControlCharacters } from "node:util";
 import { runtimeError } from "../errors/cliError.js";
+import { usableInteractiveTerminal } from "../output/terminal.js";
 import { handoffTerminal, type TerminalInput } from "./terminalHandoff.js";
 import {
   CommandExecutionError,
@@ -62,6 +63,7 @@ export type TmuxReadinessProbe = (pane: TmuxPaneState) => boolean;
 export type TmuxManagerOptions = Readonly<{
   yuiHome?: string;
   terminalInput?: TerminalInput;
+  terminalType?: string;
   closeInteractiveInput?: () => void;
   readinessTimeoutMs?: number;
   readinessPollMs?: number;
@@ -102,6 +104,7 @@ export class TmuxManager {
   readonly #yuiHome: string;
   readonly #serverName: string;
   readonly #terminalInput: TerminalInput;
+  readonly #terminalType: string;
   readonly #closeInteractiveInput: () => void;
   readonly #readinessTimeoutMs: number;
   readonly #readinessPollMs: number;
@@ -123,6 +126,7 @@ export class TmuxManager {
     this.#yuiHome = options.yuiHome ?? process.env.YUI_HOME ?? process.cwd();
     this.#serverName = yuiTmuxServerName(this.#yuiHome);
     this.#terminalInput = options.terminalInput ?? process.stdin as Readable & TerminalInput;
+    this.#terminalType = usableInteractiveTerminal(options.terminalType ?? process.env.TERM);
     this.#closeInteractiveInput = options.closeInteractiveInput ?? (() => {});
     this.#readinessTimeoutMs = positiveInteger(
       options.readinessTimeoutMs,
@@ -257,7 +261,8 @@ export class TmuxManager {
         ...(readOnly ? ["-r"] : []),
         "-t", `${clientSession}:${safeValue(roleName, "Role name")}`
       ], {
-        inheritStdio: true
+        inheritStdio: true,
+        environment: { TERM: this.#terminalType }
       });
     } finally {
       this.destroyInteractiveClientSession(clientSession);

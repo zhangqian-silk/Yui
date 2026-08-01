@@ -1569,14 +1569,38 @@ test("Task Role add, update, show, and remove preserve lean field-level configur
 
   run([
     "role", "update", task.id, "reviewer", "--agent", "claude",
-    "--model", "claude-opus", "--permission-mode", "acceptEdits"
+    "--model", "claude-opus", "--permission-mode", "dontAsk",
+    "--allowed-tool", "Bash(yui task run yield *)",
+    "--allowed-tool", "Read", "--allowed-tool", "Grep", "--allowed-tool", "Glob",
+    "--disallowed-tool", "Edit"
   ], store, options);
   const withClaude = store.getRole(task.id, "reviewer");
   assert.equal(withClaude.activeAgentId, "codex");
   assert.deepEqual(withClaude.agentBindings.claude.config, {
     adapterId: "claude",
     model: "claude-opus",
-    permission: { mode: "acceptEdits" }
+    permission: {
+      mode: "dontAsk",
+      allowedTools: ["Bash(yui task run yield *)", "Read", "Grep", "Glob"],
+      disallowedTools: ["Edit"]
+    }
+  });
+  const shownWithToolRules = run(["role", "show", task.id, "reviewer"], store, options);
+  assert.match(shownWithToolRules, /mode=dontAsk/u);
+  assert.match(
+    shownWithToolRules,
+    /allow=Bash\(yui task[\s\S]*run yield \*\),\s+Read,\s+Grep,\s+Glob;/u
+  );
+  assert.match(shownWithToolRules, /deny=Edit/u);
+
+  run([
+    "role", "update", task.id, "reviewer", "--agent", "claude",
+    "--clear-allowed-tools", "--clear-disallowed-tools"
+  ], store, options);
+  assert.deepEqual(store.getRole(task.id, "reviewer").agentBindings.claude.config, {
+    adapterId: "claude",
+    model: "claude-opus",
+    permission: { mode: "dontAsk" }
   });
 
   const shown = run(["role", "show", task.id, "reviewer"], store, options);

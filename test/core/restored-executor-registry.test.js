@@ -132,6 +132,16 @@ test("readiness resolver distinguishes Codex node composer and Claude prompt mar
     ...base,
     currentCommand: "claude",
     content: [
+      "Yui · task-1 · Review candidate · reviewer",
+      "❯ Try \"fix lint errors\"",
+      "────────────────────────────────────────────────────────────────",
+      "  ⏸ plan mode on (shift+tab to cycle) · ← for agents"
+    ].join("\n")
+  }), true);
+  assert.equal(claude({
+    ...base,
+    currentCommand: "claude",
+    content: [
       "I yielded without disturbing the working implementer.",
       "✻ Crunched for 56s",
       "❯ continue",

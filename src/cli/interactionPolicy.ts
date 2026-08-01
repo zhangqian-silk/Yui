@@ -133,7 +133,8 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       "--responsibility": "value", "--constraint": "value", "--expected-output": "value",
       "--system-prompt": "value", "--skill": "value", "--model": "value",
       "--effort": "value", "--yolo": "value", "--sandbox": "value", "--approval": "value",
-      "--permission-mode": "value", "--search": "value"
+      "--permission-mode": "value", "--allowed-tool": "value", "--disallowed-tool": "value",
+      "--search": "value"
     }
   },
   ...["show", "update", "remove", "enter"].map((command): InteractionPolicy => ({
@@ -331,7 +332,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       "--constraint": "value", "--expected-output": "value", "--system-prompt": "value",
       "--skill": "value", "--model": "value", "--effort": "value",
       "--yolo": "value", "--sandbox": "value", "--approval": "value", "--permission-mode": "value",
-      "--search": "value"
+      "--allowed-tool": "value", "--disallowed-tool": "value", "--search": "value"
     }
   },
   {

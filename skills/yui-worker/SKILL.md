@@ -59,6 +59,21 @@ The managed input names the current Run ID. Before ending, execute its exact:
 yui task run yield <current-run-id> --summary "<outcome and evidence>"
 ```
 
+When a review Run uses a native read-only permission mode, treat that mode only
+as the execution boundary. Do not request approval, change permission mode, or
+present an implementation plan. Complete the review, report its evidence, and
+yield the Run through the required Yui command. Invoke that exact `yui task run
+yield ...` command directly once; do not wrap it in `until`, `while`, `sh -c`,
+`cd ... &&`, or another compound shell command that no longer matches its
+session allow rule. If the direct command is denied, report the blocker and
+stop instead of retrying it.
+
+For every review Run, make one bounded evidence pass: inspect the relevant
+change and callers, run proportionate checks available inside the read-only
+session once, and judge the core outcome. Do not repeat successful checks or
+invent extra edge-case probes without concrete defect evidence. Once the
+requested evidence is sufficient, yield immediately.
+
 Include the result, changed paths, checks, residual risk, and blockers. Printing
 a final response without executing `yield` does not deliver the Run. Yield ends
 the AgentRun and appends an immutable Candidate to the same WorkItem; it does

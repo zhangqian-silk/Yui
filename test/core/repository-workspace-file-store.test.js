@@ -894,8 +894,7 @@ test("a lazily copied reviewer starts from the prepared Project Task workspace",
 
   assert.equal(store.getRole(task.id, "reviewer").workspace, main);
   assert.doesNotThrow(() => new FileRoleLaunchPlanner(home, store, {
-    cliPath: "/dist/cli.js",
-    bubblewrapCommand: "/usr/bin/true"
+    cliPath: "/dist/cli.js"
   }).plan({
     taskId: task.id,
     roleName: "reviewer",
@@ -983,8 +982,7 @@ test("a reviewer launches from the candidate Run workspace instead of its previo
   assert.equal(reviewRun.workspace.owner.workItemId, item.id);
   assert.equal(reviewRun.workspace.entries.every(({ access }) => access === "read"), true);
   const plan = new FileRoleLaunchPlanner(home, store, {
-    cliPath: "/dist/cli.js",
-    bubblewrapCommand: "/usr/bin/true"
+    cliPath: "/dist/cli.js"
   }).plan({
     taskId: task.id,
     roleName: "reviewer",
@@ -1070,8 +1068,7 @@ test("a multi-Project Task and WorkItem expose one root with per-Project access"
     realpathSync(join(main.root, "frontend"))
   );
   const isolatedPlan = new FileRoleLaunchPlanner(home, store, {
-    cliPath: "/dist/cli.js",
-    bubblewrapCommand: "/usr/bin/test-bwrap"
+    cliPath: "/dist/cli.js"
   }).plan({
     taskId: task.id,
     roleName: "worker",
@@ -1079,46 +1076,21 @@ test("a multi-Project Task and WorkItem expose one root with per-Project access"
     adapterId: "codex",
     mode: "new"
   });
-  assert.equal(isolatedPlan.launch.command, "/usr/bin/test-bwrap");
-  const readOnlyBind = isolatedPlan.launch.args.indexOf("--ro-bind");
-  assert.notEqual(readOnlyBind, -1);
-  assert.deepEqual(
-    isolatedPlan.launch.args.slice(readOnlyBind, readOnlyBind + 3),
-    ["--ro-bind", main.entries[1].path, main.entries[1].path]
-  );
-  const frontendGitDirectory = execFileSync(
-    "git",
-    [
-      "-C",
-      main.entries[1].path,
-      "rev-parse",
-      "--path-format=absolute",
-      "--git-common-dir"
-    ],
-    { encoding: "utf8" }
-  ).trim();
-  assert.equal(
-    isolatedPlan.launch.args.some((argument, index, args) => (
-      argument === "--ro-bind"
-      && args[index + 1] === frontendGitDirectory
-      && args[index + 2] === frontendGitDirectory
-    )),
-    true
-  );
-  assert.match(isolatedPlan.launch.args.join(" "), /--chdir .*work-items.*work-1/);
-  assert.throws(
-    () => new FileRoleLaunchPlanner(home, store, {
-      cliPath: "/dist/cli.js",
-      environment: { PATH: join(root, "missing-bin") }
-    }).plan({
-      taskId: task.id,
-      roleName: "worker",
-      agentId: store.getRole(task.id, "worker").activeAgentId,
-      adapterId: "codex",
-      mode: "new"
-    }),
-    /bubblewrap is required.*read-only Project context/i
-  );
+  assert.equal(isolatedPlan.launch.command, "codex");
+  assert.deepEqual(JSON.parse(isolatedPlan.launch.env.YUI_WRITABLE_PROJECT_IDS), [backend.id]);
+  assert.deepEqual(JSON.parse(isolatedPlan.launch.env.YUI_CONTEXT_PROJECT_IDS), [frontend.id]);
+  const directAgentPlan = new FileRoleLaunchPlanner(home, store, {
+    cliPath: "/dist/cli.js",
+    environment: { PATH: join(root, "missing-bin") }
+  }).plan({
+    taskId: task.id,
+    roleName: "worker",
+    agentId: store.getRole(task.id, "worker").activeAgentId,
+    adapterId: "codex",
+    mode: "new"
+  });
+  assert.equal(directAgentPlan.launch.command, "codex");
+  assert.deepEqual(JSON.parse(directAgentPlan.launch.env.YUI_CONTEXT_PROJECT_IDS), [frontend.id]);
 
   writeFileSync(join(work.root, "backend", "contract.txt"), "v2\n");
   execFileSync("git", ["-C", join(work.root, "backend"), "add", "contract.txt"]);
