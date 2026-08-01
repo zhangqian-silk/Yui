@@ -1,4 +1,5 @@
 import type { TaskStore } from "../storage/taskStore.js";
+import type { InputRequest } from "../input/inputRequest.js";
 import type { Task, TaskStatus } from "../task/task.js";
 import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
 
@@ -32,9 +33,16 @@ type DashboardTask = Task & Readonly<{
   projectNames?: readonly string[];
 }>;
 
+export type WebAttentionItem = Readonly<{
+  taskId: string;
+  taskTitle: string;
+  request: InputRequest;
+}>;
+
 export type WebDashboardSnapshot = Readonly<{
   generatedAt: string;
   counts: Readonly<Record<TaskStatus, number> & { total: number; openInputs: number }>;
+  attention: readonly WebAttentionItem[];
   tasks: readonly DashboardTask[];
 }>;
 
@@ -51,11 +59,15 @@ export function buildWebDashboardSnapshot(
     };
     const projectNames = new Map(reader.listProjects().map((project) => [project.id, project.name]));
     let openInputs = 0;
+    const attention: WebAttentionItem[] = [];
     const tasks = reader.listTasks().map((task): DashboardTask => {
       statusCounts[task.status] += 1;
-      const taskOpenInputs = reader.listInputRequests(task.id)
-        .filter((request) => request.status === "open").length;
-      openInputs += taskOpenInputs;
+      const taskOpen = reader.listInputRequests(task.id)
+        .filter((request) => request.status === "open");
+      openInputs += taskOpen.length;
+      for (const request of taskOpen) {
+        attention.push({ taskId: task.id, taskTitle: task.title, request });
+      }
       const names = task.projectBindings.flatMap(({ projectId }) => {
         const name = projectNames.get(projectId);
         return name === undefined ? [] : [name];
@@ -65,13 +77,14 @@ export function buildWebDashboardSnapshot(
         ...(names.length === 0 ? {} : { projectNames: names }),
         workItems: countWorkItems(reader.listWorkItems(task.id)),
         roleCount: reader.listRoles(task.id).length,
-        openInputCount: taskOpenInputs
+        openInputCount: taskOpen.length
       };
     }).sort(compareDashboardTasks);
 
     return {
       generatedAt: now.toISOString(),
       counts: { total: tasks.length, ...statusCounts, openInputs },
+      attention: attention.sort(compareAttention),
       tasks
     };
   });
@@ -125,4 +138,9 @@ function compareDashboardTasks(left: DashboardTask, right: DashboardTask): numbe
   return statusOrder[left.status] - statusOrder[right.status]
     || Date.parse(right.updatedAt) - Date.parse(left.updatedAt)
     || left.id.localeCompare(right.id);
+}
+
+function compareAttention(left: WebAttentionItem, right: WebAttentionItem): number {
+  return Date.parse(left.request.createdAt) - Date.parse(right.request.createdAt)
+    || left.request.id.localeCompare(right.request.id);
 }
