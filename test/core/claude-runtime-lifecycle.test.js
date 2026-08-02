@@ -226,6 +226,29 @@ test("Claude Stop with pending background or scheduled work is not a terminal re
   assert.deepEqual(signals, []);
 });
 
+test("Claude Stop without complete task-registry facts is not a terminal result", async (t) => {
+  const { home, environment } = fixture(t);
+  const signals = [];
+
+  for (const incompleteRegistry of [
+    { session_crons: [] },
+    { background_tasks: [] }
+  ]) {
+    await assert.doesNotReject(runClaudeLifecycleHookCommand(JSON.stringify({
+      ...currentClaudeHookCommon("Stop"),
+      stop_hook_active: false,
+      last_assistant_message: "The provider task registry is unavailable.",
+      ...incompleteRegistry
+    }), environment, async (...args) => {
+      signals.push(args);
+      return {};
+    }));
+  }
+
+  assert.deepEqual(new FileRuntimeEventInbox(home).list(), []);
+  assert.deepEqual(signals, []);
+});
+
 test("Claude lifecycle stdin is strict and never infers an active Run", async (t) => {
   const { home, environment } = fixture(t);
   await assert.rejects(

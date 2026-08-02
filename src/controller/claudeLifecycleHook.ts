@@ -294,8 +294,12 @@ function assertSessionCrons(value: unknown): void {
 }
 
 function hasPendingStopWork(payload: Record<string, unknown>): boolean {
-  return (Array.isArray(payload.background_tasks) && payload.background_tasks.length > 0)
-    || (Array.isArray(payload.session_crons) && payload.session_crons.length > 0);
+  // The provider only includes both arrays when its task registry is
+  // reachable. Missing registry facts cannot prove that the session is done.
+  return !Array.isArray(payload.background_tasks)
+    || !Array.isArray(payload.session_crons)
+    || payload.background_tasks.length > 0
+    || payload.session_crons.length > 0;
 }
 
 function requireProviderText(value: unknown, field: string): string {
