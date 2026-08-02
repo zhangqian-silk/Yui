@@ -140,7 +140,7 @@ export interface SchedulerStorePort {
   hasOpenInputRequest(taskId: string): boolean;
   listOpenInputRequests(): readonly InputRequest[];
   listPendingRuntimeTurnCompletions(): readonly PendingTurnCompletion[];
-  getInputRequest(inputRequestId: string): InputRequest | null;
+  getInputRequest(taskId: string, inputRequestId: string): InputRequest | null;
   getOperatorDeliveryTarget(): SchedulerOperatorDeliveryTarget | null;
   resolveExpiredInputRecommendations(
     now: Date,
@@ -152,7 +152,7 @@ export interface SchedulerStorePort {
   ): readonly string[];
   getRoleSession(taskId: string, roleName: string): SchedulerRoleSession | null;
   hasInFlightTurn(taskId: string, roleName: string): boolean;
-  nextAgentRunId(taskId: string): string;
+  peekNextAgentRunId(taskId: string): string;
 
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
   listWorkMailboxes(): readonly WorkMailbox[];

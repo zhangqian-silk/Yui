@@ -1,0 +1,81 @@
+# Task-local identity and offline conversion
+
+Yui treats a Task as the aggregate boundary for durable workflow records. Each
+Task owns an independent, monotonically increasing sequence for every record
+family:
+
+- WorkItem
+- AgentRun
+- ReviewRound
+- ChangeSet
+- IntegrationAttempt
+- Message
+- InputRequest
+- Decision
+- Milestone
+- Event
+
+The first record of each family in each Task is therefore local `-1`. Deleted,
+cancelled, completed, reopened, and archived records never lower the persisted
+high-water mark, so a local ID is never reused inside its Task. Each allocation
+advances that aggregate high-water mark under the storage process lock.
+
+Candidate identity is narrower: `candidate-N` is a WorkItem-local sequence.
+Every Candidate stores its `taskId` and `workItemId`, in addition to the source
+Run when one exists.
+
+## Reference contract
+
+The portable form of a Task-owned reference is:
+
+```text
+<task-id>/<local-id>
+```
+
+For example, `task-7/work-item-1` and `task-9/work-item-1` are distinct. CLI,
+JSON, mailbox, Controller, Hook, receipt, Web, and error paths retain the Task
+scope. Context-free commands reject a bare local ID instead of searching all
+Tasks, even if that ID currently happens to be unique.
+
+A managed Task session may use `work-item-1` or `agent-run-1` because its
+`YUI_TASK_ID` is explicit. A command that already receives the Task as another
+argument may also use a subordinate local ID. Outside those two cases, use the
+qualified form. Delivery receipts use the same provenance, for example:
+
+```text
+agent-run:task-7/agent-run-1
+input-request:task-7/input-1
+```
+
+There is no compatibility lookup, cross-Task guess, or bare-ID fallback.
+
+## Offline conversion
+
+Runtime opens only the current aggregate schema. It does not read the legacy
+global-ID shape. Conversion is an explicit, stopped-system operation from the
+supported aggregate-v10 source into a separate fresh output:
+
+```sh
+yui storage convert-task-identity \
+  --source /absolute/path/to/old-yui-home \
+  --output /absolute/path/to/fresh-yui-home
+```
+
+Before running it:
+
+1. Stop the Controller that owns the source home.
+2. Preserve a backup or immutable snapshot of that home.
+3. Choose an output path that does not exist and is not inside the source.
+
+The converter reads a stable source snapshot, deterministically remaps every
+Task-owned family and nested reference, writes current-schema state into the
+fresh directory, and validates that output through the normal `FileTaskStore`.
+It also writes `identity-conversion.json` with the source hash and per-Task
+record counts, then checks the source bytes again before returning. The
+operation fails on a dangling or ambiguous legacy reference and removes only
+the fresh output that it created; the source is never rewritten.
+
+After conversion, inspect the report and representative `yui --json task
+context <task-id>` results with `YUI_HOME` pointed at the fresh directory. Move
+the runtime binding only after that verification. Keep the source snapshot as
+the rollback boundary; do not merge converted records back into it.

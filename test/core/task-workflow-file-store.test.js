@@ -80,7 +80,11 @@ function fixture(t) {
     reconcileTask(taskId) { calls.reconcile.push(taskId); },
     prepareTaskRoleEnter(input) { calls.enter.push(input); }
   };
-  const options = { runtime, now: () => new Date(NOW) };
+  const options = {
+    runtime,
+    now: () => new Date(NOW),
+    environment: { YUI_TASK_ID: "task-1" }
+  };
   return { root, store, calls, options };
 }
 
@@ -103,11 +107,11 @@ function markDelivered(store, run) {
       if (mailbox.pending === null) {
         mailbox = enqueueSignal(mailbox, {
           reason: "fixture-run-dispatched",
-          refs: [{ type: "run", id: run.id }],
+          refs: [{ type: "run", taskId: run.taskId, id: run.id }],
           occurredAt: NOW.toISOString()
         });
       }
-      const batchId = `agent-run:${run.id}`;
+      const batchId = `agent-run:${run.taskId}/${run.id}`;
       mailbox = bindExecution(
         claimPending(mailbox, {
           batchId,
@@ -115,7 +119,7 @@ function markDelivered(store, run) {
           startedAt: NOW.toISOString()
         }),
         batchId,
-        { type: "run", id: run.id }
+        { type: "run", taskId: run.taskId, id: run.id }
       );
       tx.saveWorkMailbox(mailbox);
     }
@@ -220,7 +224,10 @@ function dispatchTestRun(store, taskId, roleName, workItemId, input = "test run"
     const target = { kind: "role", taskId, roleName };
     const mailbox = enqueueSignal(tx.getWorkMailbox(target) ?? createWorkMailbox(target), {
       reason: "run-dispatched",
-      refs: [{ type: "run", id: run.id }, { type: "work-item", id: workItemId }],
+      refs: [
+        { type: "run", taskId, id: run.id },
+        { type: "work-item", taskId, id: workItemId }
+      ],
       occurredAt: NOW.toISOString()
     });
     tx.saveWorkMailbox(mailbox);
@@ -601,7 +608,7 @@ test("assigned Work dispatch honors dependencies and Worker yield awaits Leader 
     new RegExp(`Work Item dependency is not completed: ${first.id}`)
   );
   run(["work", "dispatch", first.id, "--input", "implement"], store, options);
-  assert.equal(store.findWorkItem(second.id)?.status, "pending");
+  assert.equal(store.getWorkItem(second.taskId, second.id)?.status, "pending");
   const active = store.getActiveAgentRun(task.id, "worker");
   assert.equal(active?.workItemId, first.id);
   assert.equal(active?.agentId, "codex");
@@ -612,8 +619,8 @@ test("assigned Work dispatch honors dependencies and Worker yield awaits Leader 
 
   markDelivered(store, active);
   run(["run", "yield", active.id, "--summary", "implemented"], store, options);
-  assert.equal(store.findAgentRun(active.id)?.status, "yielded");
-  assert.equal(store.findWorkItem(first.id)?.status, "awaiting_acceptance");
+  assert.equal(store.getAgentRun(active.taskId, active.id)?.status, "yielded");
+  assert.equal(store.getWorkItem(first.taskId, first.id)?.status, "awaiting_acceptance");
   assert.equal(store.getActiveAgentRun(task.id, "worker"), null);
   const resultMessage = store.listMessages(task.id).at(-1);
   assert.deepEqual(resultMessage.author, { type: "role", roleName: "worker" });
@@ -632,7 +639,7 @@ test("assigned Work dispatch honors dependencies and Worker yield awaits Leader 
     ),
     /assigned Work Item.*accept or reject/iu
   );
-  assert.equal(store.findWorkItem(first.id)?.status, "awaiting_acceptance");
+  assert.equal(store.getWorkItem(first.taskId, first.id)?.status, "awaiting_acceptance");
 
   const leaderOptions = {
     ...options,
@@ -643,9 +650,9 @@ test("assigned Work dispatch honors dependencies and Worker yield awaits Leader 
     }
   };
   run(["work", "accept", first.id, "--summary", "reviewed"], store, leaderOptions);
-  assert.equal(store.findWorkItem(first.id)?.status, "completed");
+  assert.equal(store.getWorkItem(first.taskId, first.id)?.status, "completed");
   run(["work", "dispatch", second.id], store, options);
-  assert.equal(store.findWorkItem(second.id)?.status, "running");
+  assert.equal(store.getWorkItem(second.taskId, second.id)?.status, "running");
 });
 
 test("always review creates a ReviewRound under the same WorkItem and never reviews the review", (t) => {
@@ -725,9 +732,9 @@ test("always review creates a ReviewRound under the same WorkItem and never revi
     summary: "One issue to consider.",
     endedAt: NOW.toISOString()
   });
-  assert.equal(store.findWorkItem(item.id)?.status, "awaiting_acceptance");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "awaiting_acceptance");
   run(["work", "accept", item.id, "--summary", "Leader considered the review."], store, leaderOptions);
-  assert.equal(store.findWorkItem(item.id)?.status, "completed");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "completed");
 });
 
 test("global review policy is snapshotted by each candidate, not by Task creation", (t) => {
@@ -841,7 +848,7 @@ test("always review covers a Leader-managed WorkItem without inventing an execut
     "--summary", "Native subagent result is ready."
   ], store, leaderOptions);
 
-  const awaiting = store.findWorkItem(item.id);
+  const awaiting = store.getWorkItem(item.taskId, item.id);
   assert.equal(awaiting.status, "awaiting_acceptance");
   assert.deepEqual(store.listAgentRuns(task.id).filter(({ purpose }) => purpose === "execution"), []);
   const [round] = store.listReviewRounds(task.id);
@@ -880,7 +887,7 @@ test("always review covers a yielded Leader execution candidate", (t) => {
 
   run(["run", "yield", execution.id, "--summary", "Leader candidate ready."], store, options);
 
-  assert.equal(store.findWorkItem(item.id).status, "awaiting_acceptance");
+  assert.equal(store.getWorkItem(item.taskId, item.id).status, "awaiting_acceptance");
   const candidate = store.getWorkItem(task.id, item.id).candidates.at(-1);
   assert.equal(store.listReviewRounds(task.id)[0].candidateId, candidate.id);
   assert.equal(candidate.summary, "Leader candidate ready.");
@@ -962,7 +969,7 @@ test("a failed ReviewRound remains evidence but does not override Leader judgmen
     "work", "accept", item.id,
     "--summary", "User authorized acceptance after the review failure."
   ], store, leaderOptions);
-  assert.equal(store.findWorkItem(item.id).status, "completed");
+  assert.equal(store.getWorkItem(item.taskId, item.id).status, "completed");
 });
 
 test("leader-triggered review starts only when the Leader requests it", (t) => {
@@ -1174,7 +1181,7 @@ test("Leader rejection preserves a Worker WorkItem for another dispatch round", 
   assert.notEqual(second.id, first.id);
   assert.equal(second.mode, "resume");
   assert.equal(second.workItemId, item.id);
-  assert.equal(store.findWorkItem(item.id)?.status, "running");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "running");
 });
 
 test("retry replaces the old causal Run marker instead of reusing it", (t) => {
@@ -1182,13 +1189,13 @@ test("retry replaces the old causal Run marker instead of reusing it", (t) => {
   const task = createTask(store, options, "Retry marker");
   run(["activate", task.id], store, options);
   const failed = failAgentRun(createAgentRun(
-    "agent-run-old",
+    "agent-run-99",
     task.id,
     "leader",
     "new",
     markYuiRunInput(
       "recover",
-      "agent-run-old",
+      "agent-run-99",
       `Yui · ${task.id} · Retry marker · Leader`
     ),
     NOW
@@ -1238,7 +1245,7 @@ test("a failed Worker Run can retry its failed WorkItem", (t) => {
 
   run(["run", "retry", active.id], store, options);
 
-  assert.equal(store.findWorkItem(item.id)?.status, "running");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "running");
   const retried = store.getActiveAgentRun(task.id, "worker");
   assert.equal(retried?.workItemId, item.id);
   assert.match(retried.input, /yui task run yield <current-run-id>/);
@@ -1334,7 +1341,7 @@ test("Leader yield does not self-wake and preserves a wake queued while busy", (
   const pending = store.getPendingWakeup(task.id);
   run(["run", "yield", runRecord.id, "--summary", "coordinated"], store, options);
   assert.deepEqual(store.getPendingWakeup(task.id), pending);
-  assert.equal(store.findWorkItem(item.id)?.status, "completed");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "completed");
 });
 
 test("Leader can track conversation-internal work without a Task Role", (t) => {
@@ -1368,17 +1375,17 @@ test("Leader can track conversation-internal work without a Task Role", (t) => {
     "work", "update", item.id, "running",
     "--summary", "executor=subagent; profile=reviewer@3; model=inherited"
   ], store, leaderOptions);
-  assert.equal(store.findWorkItem(item.id)?.status, "running");
-  assert.equal(store.findWorkItem(item.id)?.outcome, undefined);
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "running");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.outcome, undefined);
   assert.equal(store.getActiveAgentRun(task.id, "leader"), null);
 
   run([
     "work", "update", item.id, "done",
     "--summary", "Leader reviewed the native subagent result and verified the evidence."
   ], store, leaderOptions);
-  assert.equal(store.findWorkItem(item.id)?.status, "completed");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "completed");
   assert.equal(
-    store.findWorkItem(item.id)?.outcome,
+    store.getWorkItem(item.taskId, item.id)?.outcome,
     "Leader reviewed the native subagent result and verified the evidence."
   );
   const progress = store.listEvents(task.id)
@@ -1431,8 +1438,8 @@ test("Leader-owned work honors dependencies and can retry directly", (t) => {
     "--summary", "First native subagent result did not pass review."
   ], store, leaderOptions);
   run(["work", "update", implementation.id, "running"], store, leaderOptions);
-  assert.equal(store.findWorkItem(implementation.id)?.status, "running");
-  assert.equal(store.findWorkItem(implementation.id)?.outcome, undefined);
+  assert.equal(store.getWorkItem(implementation.taskId, implementation.id)?.status, "running");
+  assert.equal(store.getWorkItem(implementation.taskId, implementation.id)?.outcome, undefined);
 });
 
 test("Leader control Run without a WorkItem can yield and release the pending wake boundary", (t) => {
@@ -1458,7 +1465,7 @@ test("Leader control Run without a WorkItem can yield and release the pending wa
     const fence = {
       agentId: leader.activeAgentId,
       runId: controlRun.id,
-      receiptId: `agent-run:${controlRun.id}`
+      receiptId: `agent-run:${task.id}/${controlRun.id}`
     };
     const sessions = tx.getTaskRoleSessionSet(task.id, "leader")
       ?? createRoleSessionSet(
@@ -1474,7 +1481,7 @@ test("Leader control Run without a WorkItem can yield and release the pending wa
   });
 
   run(["run", "yield", controlRun.id, "--summary", "reviewed"], store, options);
-  assert.equal(store.findAgentRun(controlRun.id)?.status, "yielded");
+  assert.equal(store.getAgentRun(controlRun.taskId, controlRun.id)?.status, "yielded");
   assert.equal(store.getActiveAgentRun(task.id, "leader"), null);
   assert.equal(store.getRole(task.id, "leader")?.status, "idle");
   assert.equal(store.getPendingWakeup(task.id), null);
@@ -1513,7 +1520,7 @@ test("a rejected Worker control yield rolls back all staged FileTaskStore writes
     ),
     /not a work run/i
   );
-  assert.equal(store.findAgentRun(invalidRun.id)?.status, "active");
+  assert.equal(store.getAgentRun(invalidRun.taskId, invalidRun.id)?.status, "active");
   assert.equal(store.getActiveAgentRun(task.id, "worker")?.id, invalidRun.id);
   assert.equal(store.getRole(task.id, "worker")?.status, "running");
   assert.deepEqual(store.listMessages(task.id), beforeMessages);
@@ -1840,8 +1847,8 @@ test("archive refuses active work and leaves its runtime ownership intact", (t) 
     /must be completed/i
   );
   assert.equal(store.getTask(task.id)?.status, "active");
-  assert.equal(store.findAgentRun(active.id)?.status, "active");
-  assert.equal(store.findWorkItem(item.id)?.status, "running");
+  assert.equal(store.getAgentRun(active.taskId, active.id)?.status, "active");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "running");
   assert.equal(store.getActiveAgentRun(task.id, "leader")?.id, active.id);
 });
 
@@ -1911,7 +1918,7 @@ test("Task completion requires every WorkItem to be terminal", (t) => {
   run(["work", "cancel", item.id, "--summary", "No longer needed."], store, options);
   run(["complete", task.id, "--summary", "Done"], store, options);
   assert.equal(store.getTask(task.id)?.status, "completed");
-  assert.equal(store.findWorkItem(item.id)?.status, "cancelled");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "cancelled");
 });
 
 test("a failed WorkItem can be explicitly closed after its isolated workspace was abandoned", (t) => {
@@ -1937,8 +1944,8 @@ test("a failed WorkItem can be explicitly closed after its isolated workspace wa
   run(["complete", task.id, "--summary", "Recovered and delivered."], store, options);
 
   assert.equal(store.getTask(task.id)?.status, "completed");
-  assert.equal(store.findWorkItem(item.id)?.status, "superseded");
-  assert.equal(store.findWorkItem(item.id)?.workspaceDisposition, "abandoned");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "superseded");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.workspaceDisposition, "abandoned");
 });
 
 test("a Leader control Run can complete its Task atomically", (t) => {
@@ -1975,8 +1982,8 @@ test("a Leader control Run can complete its Task atomically", (t) => {
   );
 
   assert.equal(store.getTask(task.id)?.status, "completed");
-  assert.equal(store.findAgentRun(controlRun.id)?.status, "yielded");
-  assert.equal(store.findAgentRun(controlRun.id)?.summary, "Final review passed.");
+  assert.equal(store.getAgentRun(controlRun.taskId, controlRun.id)?.status, "yielded");
+  assert.equal(store.getAgentRun(controlRun.taskId, controlRun.id)?.summary, "Final review passed.");
   assert.equal(store.getActiveAgentRun(task.id, "leader"), null);
   assert.equal(store.getRole(task.id, "leader")?.status, "idle");
 });

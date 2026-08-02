@@ -327,7 +327,7 @@ test("Claude launch identity is deterministic for one durable launch across retr
 test("Codex notify payload is strictly converted to one durable runtime event", async (t) => {
   const { home, store, task, role, agent, now } = fixture(t);
   store.saveAgentRun(createAgentRun(
-    "agent-run-native-1",
+    "agent-run-1",
     task.id,
     role.name,
     "new",
@@ -352,7 +352,7 @@ test("Codex notify payload is strictly converted to one durable runtime event", 
     "turn-id": "turn-1",
     cwd: home,
     "input-messages": [
-      "Yui · task-1 · Managed launch · Leader · Run agent-run-native-1\n\nDo the work"
+      "Yui · task-1 · Managed launch · Leader · Run agent-run-1\n\nDo the work"
     ],
     "last-assistant-message": "done"
   });
@@ -395,7 +395,7 @@ test("Codex notify payload is strictly converted to one durable runtime event", 
     roleName: role.name,
     nativeSessionId: "thread-native-1",
     turnId: "turn-1",
-    runId: "agent-run-native-1",
+    runId: "agent-run-1",
     summary: "done"
   }]);
   const revision = JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision;
@@ -498,11 +498,11 @@ test("Codex turn completion releases a forgotten Leader active fence exactly onc
     batchId: `agent-run:${run.id}`,
     owner: "controller",
     now,
-    executionRef: { type: "run", id: run.id }
+    executionRef: { type: "run", taskId: task.id, id: run.id }
   });
   store.transaction((tx) => {
     enqueueWork(tx, { kind: "role", taskId: task.id, roleName: role.name }, "role-result", now, [
-      { type: "run", id: run.id }
+      { type: "run", taskId: task.id, id: run.id }
     ]);
   });
 
@@ -526,9 +526,9 @@ test("Codex turn completion releases a forgotten Leader active fence exactly onc
   recordParsedTurnCompletion(schedulerStore, payload, environment);
 
   assert.equal(store.getActiveAgentRun(task.id, role.name), null);
-  assert.equal(store.findAgentRun(run.id).status, "yielded");
+  assert.equal(store.getAgentRun(task.id, run.id).status, "yielded");
   assert.equal(
-    store.findAgentRun(run.id).summary,
+    store.getAgentRun(task.id, run.id).summary,
     "Workers dispatched; waiting for their results."
   );
   assert.equal(store.getRole(task.id, role.name).status, "idle");
@@ -557,7 +557,7 @@ test("a quiescent result-driven Leader turn queues recovery when the Agent forge
     tx.saveActiveAgentRun(run);
     tx.saveRole(task.id, updateRoleStatus(role, "running", now));
     enqueueWork(tx, { kind: "role", taskId: task.id, roleName: role.name }, "role-result", now, [
-      { type: "run", id: run.id }
+      { type: "run", taskId: task.id, id: run.id }
     ]);
   });
   const schedulerStore = new FileSchedulerStoreAdapter(store);
@@ -570,7 +570,7 @@ test("a quiescent result-driven Leader turn queues recovery when the Agent forge
     batchId: `agent-run:${run.id}`,
     owner: "controller",
     now,
-    executionRef: { type: "run", id: run.id }
+    executionRef: { type: "run", taskId: task.id, id: run.id }
   });
   const environment = {
     YUI_HOME: home,
@@ -593,7 +593,7 @@ test("a quiescent result-driven Leader turn queues recovery when the Agent forge
 
   assert.equal(store.getTask(task.id).status, "active");
   assert.equal(store.getTask(task.id).completionSummary, undefined);
-  assert.equal(store.findAgentRun(run.id).status, "yielded");
+  assert.equal(store.getAgentRun(task.id, run.id).status, "yielded");
   assert.equal(store.getActiveAgentRun(task.id, role.name), null);
   assert.deepEqual(store.getPendingWakeup(task.id).reasons, ["leader-turn-unclosed"]);
 });
@@ -623,7 +623,7 @@ test("a Worker turn that forgets to yield fails visibly and wakes the Leader", a
     tx.saveAgentRun(run);
     tx.saveActiveAgentRun(run);
     enqueueWork(tx, { kind: "role", taskId: task.id, roleName: worker.name }, "run-dispatched", now, [
-      { type: "run", id: run.id }
+      { type: "run", taskId: task.id, id: run.id }
     ]);
   });
   const schedulerStore = new FileSchedulerStoreAdapter(store);
@@ -636,7 +636,7 @@ test("a Worker turn that forgets to yield fails visibly and wakes the Leader", a
     batchId: `agent-run:${run.id}`,
     owner: "controller",
     now,
-    executionRef: { type: "run", id: run.id }
+    executionRef: { type: "run", taskId: task.id, id: run.id }
   });
   const payload = JSON.stringify({
     type: "agent-turn-complete",
@@ -656,8 +656,8 @@ test("a Worker turn that forgets to yield fails visibly and wakes the Leader", a
     YUI_LAUNCH_ID: "launch-worker-turn"
   });
 
-  assert.equal(store.findAgentRun(run.id).status, "failed");
-  assert.match(store.findAgentRun(run.id).summary, /without yui task run yield/i);
+  assert.equal(store.getAgentRun(task.id, run.id).status, "failed");
+  assert.match(store.getAgentRun(task.id, run.id).summary, /without yui task run yield/i);
   assert.equal(store.getWorkItem(task.id, item.id).status, "failed");
   assert.equal(store.getActiveAgentRun(task.id, worker.name), null);
   assert.equal(store.getRole(task.id, worker.name).status, "idle");

@@ -216,10 +216,19 @@ test("an open InputRequest blocks a healthy Leader and exposes only its count", 
   execute(["create", "Await user"], store, options);
   const task = store.listTasks()[0];
   execute(["role", "add", task.id, "worker"], store, options);
+  const origin = createAgentRun(
+    store.nextAgentRunId(task.id),
+    task.id,
+    "leader",
+    "new",
+    "Ask for input",
+    NOW
+  );
+  store.saveAgentRun(origin);
   const request = createInputRequest(
     store.nextInputRequestId(task.id),
     task.id,
-    { roleName: "leader", agentId: "codex", runId: "run-origin" },
+    { taskId: task.id, roleName: "leader", agentId: "codex", runId: origin.id },
     { question: "Choose the rollout?", choices: [], blockedRefs: [] },
     NOW
   );

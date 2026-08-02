@@ -218,13 +218,13 @@ test("a busy retry for one delivery reuses the prepared binding without starting
     pushes += 1;
     return "busy";
   });
-  const input = prepareInput(fx, "worker", "run-busy");
+  const input = prepareInput(fx, "worker", "agent-run-1");
 
   const first = await delivery.prepareRoleSession(input);
   const ready = await delivery.waitUntilReady(first);
   assert.equal(await delivery.sendOnce({
     delivery: ready,
-    receiptId: "agent-run:run-busy",
+    receiptId: `agent-run:${fx.task.id}/agent-run-1`,
     text: "work"
   }), "busy");
   const retried = await delivery.prepareRoleSession(input);
@@ -253,7 +253,7 @@ test("a known Claude native session and its reservation are persisted together b
     now: () => NOW
   });
   const delivery = registry(coordinator, host);
-  const input = prepareInput(fx, "worker", "run-claude");
+  const input = prepareInput(fx, "worker", "agent-run-1");
   const run = createAgentRun(
     input.runId,
     fx.task.id,

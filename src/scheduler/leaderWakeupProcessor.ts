@@ -1,6 +1,7 @@
 import { createAgentRun } from "../run/agentRun.js";
 import { markYuiRunInput } from "../run/runIdentity.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
+import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
 import { createLeaderRecoveryNotification } from "./operatorNotification.js";
 import type {
@@ -72,7 +73,7 @@ export async function processLeaderWakeups(
     let prepared: PreparedRoleDelivery | undefined;
     try {
       const mode = hasNativeSession(existingSession) ? "resume" : "new";
-      const runId = store.nextAgentRunId(task.id);
+      const runId = store.peekNextAgentRunId(task.id);
       const input = markYuiRunInput(leaderWakeupInput(
         task.id,
         runId,
@@ -145,7 +146,7 @@ export async function processLeaderWakeups(
       deliveryAttempted = true;
       const outcome = await delivery.sendOnce({
         delivery: ready,
-        receiptId: `agent-run:${run.id}`,
+        receiptId: formatAgentRunReceiptId(task.id, run.id),
         text: input
       });
       if (outcome === "busy" || outcome === "unavailable") {

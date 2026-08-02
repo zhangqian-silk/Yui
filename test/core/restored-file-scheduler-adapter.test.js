@@ -54,7 +54,10 @@ function fixture(t) {
 test("FileSchedulerStoreAdapter commits Leader run, Role and fixed session together", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
   const before = JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision;
-  const run = createAgentRun("agent-run-1", task.id, role.name, "resume", "continue", now);
+  const proposedRunId = adapter.peekNextAgentRunId(task.id);
+  assert.equal(proposedRunId, "agent-run-1");
+  assert.equal(JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision, before);
+  const run = createAgentRun(proposedRunId, task.id, role.name, "resume", "continue", now);
 
   const result = adapter.saveLeaderDispatch({
     task,
@@ -95,7 +98,7 @@ test("Leader dispatch rejects a stale launch configuration snapshot", (t) => {
       )
     }
   }, changedAt));
-  const run = createAgentRun("agent-run-stale", task.id, role.name, "resume", "continue", now);
+  const run = createAgentRun("agent-run-118", task.id, role.name, "resume", "continue", now);
 
   const result = adapter.saveLeaderDispatch({
     task,
@@ -115,7 +118,7 @@ test("Leader dispatch rejects a stale launch configuration snapshot", (t) => {
 
   const current = adapter.getRole(task.id, role.name);
   const mismatchedRun = createAgentRun(
-    "agent-run-mismatched",
+    "agent-run-105",
     task.id,
     role.name,
     "resume",
@@ -197,7 +200,7 @@ test("Leader preparation owns its durable Run before awaiting tmux", async (t) =
   assert.equal(store.getPendingWakeup(task.id), null);
   assert.throws(
     () => store.saveActiveAgentRun(createAgentRun(
-      "agent-run-concurrent",
+      "agent-run-119",
       task.id,
       role.name,
       "new",
@@ -214,7 +217,7 @@ test("Leader preparation owns its durable Run before awaiting tmux", async (t) =
 test("Leader dispatch rejects a Run id that already exists in Task history", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
   const historic = createAgentRun(
-    "agent-run-existing",
+    "agent-run-101",
     task.id,
     role.name,
     "new",
@@ -284,7 +287,7 @@ test("a stale Leader preparation failure cannot overwrite a newer active Run", (
   const { store, task, role, now, adapter } = fixture(t);
   const wakeup = store.getPendingWakeup(task.id);
   const replacement = createAgentRun(
-    "agent-run-replacement",
+    "agent-run-102",
     task.id,
     role.name,
     "new",
@@ -299,7 +302,7 @@ test("a stale Leader preparation failure cannot overwrite a newer active Run", (
     session: null,
     claimed: {
       run: createAgentRun(
-        "agent-run-stale",
+        "agent-run-118",
         task.id,
         role.name,
         "new",
@@ -338,7 +341,7 @@ test("a stale Leader preparation failure cannot overwrite a newer active Run", (
 
 test("runtime Turn completion waits for the two-second grace deadline before closing a Leader Run", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
-  const run = createAgentRun("agent-run-grace", task.id, role.name, "new", "continue", now);
+  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -379,10 +382,10 @@ test("runtime Turn completion waits for the two-second grace deadline before clo
   );
   assert.deepEqual(
     adapter.resolveDueRuntimeTurnCompletions(new Date(now.getTime() + 2_000)),
-    [run.id]
+    [`${task.id}/${run.id}`]
   );
   assert.equal(store.getActiveAgentRun(task.id, role.name), null);
-  assert.equal(store.findAgentRun(run.id).status, "yielded");
+  assert.equal(store.getAgentRun(task.id, run.id).status, "yielded");
   assert.equal(store.getRoleSession(task.id, role.name).status, "ready");
   assert.equal(store.getTaskRoleSessionSet(task.id, role.name).inFlight, null);
   assert.equal(store.getTask(task.id).status, "active");
@@ -391,7 +394,7 @@ test("runtime Turn completion waits for the two-second grace deadline before clo
 
 test("an unrelated Hook cannot prove that a prepared Leader Run was delivered", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
-  const run = createAgentRun("agent-run-prepared", task.id, role.name, "new", "continue", now);
+  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -413,7 +416,7 @@ test("an unrelated Hook cannot prove that a prepared Leader Run was delivered", 
     adapterId: "codex",
     nativeSessionId: "thread-prepared",
     turnId: "turn-unrelated",
-    runId: "agent-run-older-turn",
+    runId: "agent-run-114",
     summary: "This was an unrelated native turn."
   }, now);
 
@@ -431,7 +434,7 @@ test("an unrelated Hook cannot prove that a prepared Leader Run was delivered", 
 
 test("a matching Hook proves delivery across the receipt persistence crash window", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
-  const run = createAgentRun("agent-run-crash-window", task.id, role.name, "new", "continue", now);
+  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -472,7 +475,7 @@ test("a matching Hook proves delivery across the receipt persistence crash windo
 
 test("a Hook replay is idempotent after state commit succeeds and inbox ack crashes", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
-  const run = createAgentRun("agent-run-ack-crash", task.id, role.name, "new", "continue", now);
+  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -538,14 +541,14 @@ test("a Hook replay is idempotent after state commit succeeds and inbox ack cras
     restartedAdapter.resolveDueRuntimeTurnCompletions(
       new Date(now.getTime() + 2_000)
     ),
-    [run.id]
+    [`${task.id}/${run.id}`]
   );
   assert.equal(restartedStore.getActiveAgentRun(task.id, role.name), null);
 });
 
 test("an obsolete Hook cannot claim the native session of the current Run", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
-  const run = createAgentRun("agent-run-current-native", task.id, role.name, "new", "continue", now);
+  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -587,7 +590,7 @@ test("an obsolete Hook cannot claim the native session of the current Run", (t) 
     ...common,
     nativeSessionId: "thread-obsolete",
     turnId: "turn-obsolete",
-    runId: "agent-run-obsolete"
+    runId: "agent-run-109"
   });
   inbox.enqueueTurnCompleted({
     ...common,
@@ -700,7 +703,7 @@ for (const terminalStatus of ["stopped", "broken"]) {
 
 test("a Hook classified for Run A cannot close Run B after an intervening dispatch", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
-  const first = createAgentRun("agent-run-race-a", task.id, role.name, "new", "A", now);
+  const first = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "A", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -737,7 +740,7 @@ test("a Hook classified for Run A cannot close Run B after an intervening dispat
     ...event,
     expectedRunId: first.id
   }, now);
-  const second = createAgentRun("agent-run-race-b", task.id, role.name, "resume", "B", now);
+  const second = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "resume", "B", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -765,7 +768,7 @@ test("a Hook classified for Run A cannot close Run B after an intervening dispat
 
 test("a Hook for an older Run is acknowledged without closing the fresh Run", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
-  const run = createAgentRun("agent-run-fresh-send", task.id, role.name, "new", "continue", now);
+  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -788,7 +791,7 @@ test("a Hook for an older Run is acknowledged without closing the fresh Run", (t
     adapterId: "codex",
     nativeSessionId: "thread-fresh-send",
     turnId: "turn-before-send",
-    runId: "agent-run-before-fresh-send",
+    runId: "agent-run-112",
     summary: "old turn"
   });
   const processor = new FileRuntimeEventProcessor(inbox, adapter);
@@ -814,7 +817,7 @@ test("a Hook for an older Run is acknowledged without closing the fresh Run", (t
 
 test("a second Hook waits behind the first grace closure instead of poisoning reconciliation", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
-  const run = createAgentRun("agent-run-two-hooks", task.id, role.name, "new", "continue", now);
+  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -874,7 +877,7 @@ test("a quiescent result-driven Leader Turn is recovered instead of inferring Ta
       [{ type: "task", id: task.id }]
     );
   });
-  const run = createAgentRun("agent-run-result", task.id, role.name, "new", "synthesize", now);
+  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "synthesize", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -928,7 +931,7 @@ test("a repeated unclosed Leader recovery escalates and notifies Operator once",
       [{ type: "task", id: task.id }]
     );
   });
-  const run = createAgentRun("agent-run-recovery", task.id, role.name, "new", "recover", now);
+  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "recover", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -994,7 +997,7 @@ test("a repeated unclosed Leader recovery escalates and notifies Operator once",
 
 test("a partial low-level Run mutation remains fenced until its matching Hook repairs it", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
-  const first = createAgentRun("agent-run-first", task.id, role.name, "new", "first", now);
+  const first = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "first", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -1020,7 +1023,7 @@ test("a partial low-level Run mutation remains fenced until its matching Hook re
     tx.clearActiveAgentRun(task.id, role.name);
   });
 
-  const second = createAgentRun("agent-run-second", task.id, role.name, "resume", "second", now);
+  const second = createAgentRun("agent-run-121", task.id, role.name, "resume", "second", now);
   assert.throws(
     () => store.saveActiveAgentRun(second),
     /still has an in-flight Turn/u
@@ -1070,12 +1073,14 @@ test("Worker delivery claims and binds its mailbox before external work, then fa
     "/repo",
     now
   );
-  const run = createAgentRun("agent-run-worker", task.id, worker.name, "new", "work", now);
+  const run = createAgentRun("agent-run-122", task.id, worker.name, "new", "work", now);
   const target = { kind: "role", taskId: task.id, roleName: worker.name };
   store.transaction((tx) => {
     tx.saveRole(task.id, worker);
     tx.saveActiveAgentRun(run);
-    enqueueWork(tx, target, "run-dispatched", now, [{ type: "run", id: run.id }]);
+    enqueueWork(tx, target, "run-dispatched", now, [
+      { type: "run", taskId: task.id, id: run.id }
+    ]);
   });
   let observedBound = false;
   const forgotten = [];
@@ -1120,12 +1125,14 @@ test("Worker busy retry persists and reuses the hosted native session before del
     "/repo",
     now
   );
-  const run = createAgentRun("agent-run-worker", task.id, worker.name, "new", "work", now);
+  const run = createAgentRun("agent-run-122", task.id, worker.name, "new", "work", now);
   const target = { kind: "role", taskId: task.id, roleName: worker.name };
   store.transaction((tx) => {
     tx.saveRole(task.id, worker);
     tx.saveActiveAgentRun(run);
-    enqueueWork(tx, target, "run-dispatched", now, [{ type: "run", id: run.id }]);
+    enqueueWork(tx, target, "run-dispatched", now, [
+      { type: "run", taskId: task.id, id: run.id }
+    ]);
   });
   let sends = 0;
   const delivery = {
@@ -1189,15 +1196,15 @@ test("runtime native session registration is structured and exited work fails at
     tx.saveWorkItem(task.id, item);
     tx.saveActiveAgentRun(run);
     enqueueWork(tx, { kind: "role", taskId: task.id, roleName: role.name }, "run-dispatched", now, [
-      { type: "run", id: run.id }
+      { type: "run", taskId: task.id, id: run.id }
     ]);
   });
   adapter.claimWorkMailbox({
     target: { kind: "role", taskId: task.id, roleName: role.name },
-    batchId: `agent-run:${run.id}`,
+    batchId: `agent-run:${task.id}/${run.id}`,
     owner: "controller",
     now,
-    executionRef: { type: "run", id: run.id }
+    executionRef: { type: "run", taskId: task.id, id: run.id }
   });
   const deliveredAt = new Date(now.getTime() + 1_000).toISOString();
   store.saveActiveAgentRun({ ...run, deliveredAt });
@@ -1224,7 +1231,7 @@ test("runtime native session registration is structured and exited work fails at
   assert.ok(store.getPendingWakeup(task.id).reasons.includes("leader-run-failed"));
 
   const replacement = createAgentRun(
-    "agent-run-replacement",
+    "agent-run-102",
     task.id,
     role.name,
     "new",
@@ -1237,14 +1244,16 @@ test("runtime native session registration is structured and exited work fails at
       kind: "role",
       taskId: task.id,
       roleName: role.name
-    }, "run-dispatched", now, [{ type: "run", id: replacement.id }]);
+    }, "run-dispatched", now, [
+      { type: "run", taskId: task.id, id: replacement.id }
+    ]);
   });
   adapter.claimWorkMailbox({
     target: { kind: "role", taskId: task.id, roleName: role.name },
-    batchId: `agent-run:${replacement.id}`,
+    batchId: `agent-run:${task.id}/${replacement.id}`,
     owner: "controller",
     now,
-    executionRef: { type: "run", id: replacement.id }
+    executionRef: { type: "run", taskId: task.id, id: replacement.id }
   });
 
   assert.equal(adapter.saveExitedRoleRun({
@@ -1266,8 +1275,7 @@ test("reconfirming an already delivered active run does not rewrite authoritativ
     role.name,
     "new",
     "work",
-    now,
-    { workItemId: "work-item-1" }
+    now
   );
   run.deliveredAt = now.toISOString();
   store.transaction((tx) => {
@@ -1453,7 +1461,7 @@ test("stopped-launch and dormant-session CAS fences preserve newer lifecycle fac
   assert.equal(adapter.completeRuntimeLaunchReservation(owner, "launch-newer"), true);
 
   const run = createAgentRun(
-    "run-newer",
+    "agent-run-123",
     task.id,
     role.name,
     "resume",

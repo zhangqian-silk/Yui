@@ -5,6 +5,7 @@ import {
   type SchedulerStorePort,
   type TmuxDeliveryPort
 } from "./ports.js";
+import { formatTaskRecordReference } from "../task/taskRecordReference.js";
 import { queueLeaderWakeup } from "./wakeupQueue.js";
 
 export const EXITED_ROLE_RUN_SUMMARY = "The role's tmux session exited before the run yielded.";
@@ -21,7 +22,7 @@ export async function reconcileExitedRoleRuns(
   >,
   now: Date,
   selection?: SchedulerReconcileSelection,
-  excludedRunIds: ReadonlySet<string> = new Set()
+  excludedRunRefs: ReadonlySet<string> = new Set()
 ): Promise<string[]> {
   const failed: string[] = [];
   const candidates = selectedSchedulerTasks(store, selection).flatMap((task) => (
@@ -53,7 +54,7 @@ export async function reconcileExitedRoleRuns(
     ))
   );
   const eligible = candidates.filter(({ task, role, run }) => (
-    !excludedRunIds.has(run.id)
+    !excludedRunRefs.has(formatTaskRecordReference(task.id, run.id, "agentRun"))
     && !completing.has(`${task.id}\0${role.name}\0${run.id}`)
   ));
   if (eligible.length === 0) return failed;
@@ -83,7 +84,7 @@ export async function reconcileExitedRoleRuns(
         roleName: role.name,
         runId: run.id
       });
-      failed.push(run.id);
+      failed.push(formatTaskRecordReference(task.id, run.id, "agentRun"));
       // Compatibility for narrow in-memory/custom ports that predate the
       // adapter's atomic failure+wake transition. Production returns
       // "failed" and already enqueued this wake in the same transaction.

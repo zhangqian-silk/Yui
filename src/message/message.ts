@@ -1,3 +1,5 @@
+import { validateTaskRecordReference } from "../task/taskRecordReference.js";
+
 export const TASK_MESSAGE_KINDS = ["user", "operator", "role-result", "system"] as const;
 
 export type TaskMessageKind = typeof TASK_MESSAGE_KINDS[number];
@@ -9,8 +11,9 @@ export type TaskMessageAuthor =
   | Readonly<{ type: "system" }>;
 
 export type TaskMessage = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   id: string;
+  taskId: string;
   kind: TaskMessageKind;
   author: TaskMessageAuthor;
   body: string;
@@ -26,6 +29,7 @@ export type TaskMessageContext = Readonly<{
 
 export function createTaskMessage(
   id: string,
+  taskId: string,
   body: string,
   kind: TaskMessageKind,
   author: TaskMessageAuthor,
@@ -34,8 +38,9 @@ export function createTaskMessage(
 ): TaskMessage {
   validateKindAndAuthor(kind, author);
   const message: TaskMessage = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: requireSafeIdentity(id, "Message id"),
+    taskId: requireSafeIdentity(taskId, "Message Task id"),
     kind,
     author: normalizeAuthor(author),
     body: requireText(body, "Message body"),
@@ -56,14 +61,20 @@ export function taskMessageAuthorLabel(author: TaskMessageAuthor): string {
 }
 
 export function validateTaskMessage(message: TaskMessage): void {
-  if (message.schemaVersion !== 1) throw new Error("Task Message must use schemaVersion 1.");
-  requireSafeIdentity(message.id, "Message id");
+  if (message.schemaVersion !== 2) throw new Error("Task Message must use schemaVersion 2.");
+  validateTaskRecordReference({ taskId: message.taskId, localId: message.id }, "message");
   requireText(message.body, "Message body");
   validateKindAndAuthor(message.kind, message.author);
   normalizeAuthor(message.author);
   if (message.runId !== undefined) requireSafeIdentity(message.runId, "Message Run id");
   if (message.workItemId !== undefined) {
-    requireSafeIdentity(message.workItemId, "Message Work item id");
+    validateTaskRecordReference({
+      taskId: message.taskId,
+      localId: message.workItemId
+    }, "workItem");
+  }
+  if (message.runId !== undefined) {
+    validateTaskRecordReference({ taskId: message.taskId, localId: message.runId }, "agentRun");
   }
   if (typeof message.createdAt !== "string" || Number.isNaN(Date.parse(message.createdAt))) {
     throw new Error("Message createdAt is invalid.");

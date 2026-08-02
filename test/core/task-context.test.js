@@ -160,6 +160,7 @@ test("task context aggregates complete records and renders a compact recent summ
   for (let index = 1; index <= 6; index += 1) {
     const message = createTaskMessage(
       store.nextMessageId(task.id),
+      task.id,
       `Message ${index}`,
       "user",
       { type: "user" },
@@ -171,6 +172,7 @@ test("task context aggregates complete records and renders a compact recent summ
   for (let index = 1; index <= 6; index += 1) {
     store.saveEvent(task.id, createTaskEvent(
       store.nextEventId(task.id),
+      task.id,
       `context.event.${index}`,
       { sequence: String(index) },
       atMinute(19 + index)
@@ -225,13 +227,22 @@ test("task context includes every open input and renders a bounded actionable su
 
   for (let index = 1; index <= 7; index += 1) {
     const createdAt = atMinute(index);
+    const blockedWorkItem = createWorkItem(
+      store.nextWorkItemId(task.id), task.id, { title: `Blocked work ${index}` }, createdAt
+    );
+    store.saveWorkItem(task.id, blockedWorkItem);
+    const originRun = createAgentRun(
+      store.nextAgentRunId(task.id), task.id, "leader", "new", `Origin ${index}`, createdAt
+    );
+    store.saveAgentRun(originRun);
     const request = createInputRequest(
       store.nextInputRequestId(task.id),
       task.id,
       {
+        taskId: task.id,
         roleName: "leader",
         agentId: "codex",
-        runId: `agent-run-${index}`
+        runId: originRun.id
       },
       {
         question: `Choose rollout ${index}`,
@@ -240,8 +251,8 @@ test("task context includes every open input and renders a bounded actionable su
           { key: "fast", label: "Fast rollout" }
         ],
         blockedRefs: [
-          { type: "work-item", id: `work-item-${index}` },
-          { type: "run", id: `agent-run-${index}` }
+          { type: "work-item", taskId: task.id, id: blockedWorkItem.id },
+          { type: "run", taskId: task.id, id: originRun.id }
         ],
         policy: index === 7
           ? {
@@ -257,10 +268,14 @@ test("task context includes every open input and renders a bounded actionable su
     store.saveInputRequest(task.id, request);
   }
 
+  const answeredRun = createAgentRun(
+    store.nextAgentRunId(task.id), task.id, "leader", "new", "Answered origin", atMinute(20)
+  );
+  store.saveAgentRun(answeredRun);
   const answered = createInputRequest(
     store.nextInputRequestId(task.id),
     task.id,
-    { roleName: "leader", agentId: "codex", runId: "agent-run-answered" },
+    { taskId: task.id, roleName: "leader", agentId: "codex", runId: answeredRun.id },
     { question: "Already resolved", choices: [], blockedRefs: [] },
     atMinute(20)
   );
@@ -322,6 +337,7 @@ test("task context bounds human-readable history while preserving complete data"
   }
   store.saveMessage(task.id, createTaskMessage(
     store.nextMessageId(task.id),
+    task.id,
     `Large message ${"x".repeat(1_000)}`,
     "user",
     { type: "user" },
@@ -353,7 +369,7 @@ test("task context orders AgentRuns by time rather than identity", (t) => {
   );
   store.saveWorkItem(task.id, work);
   const older = createAgentRun(
-    "agent-run-z-old",
+    "agent-run-20",
     task.id,
     "leader",
     "new",
@@ -362,7 +378,7 @@ test("task context orders AgentRuns by time rather than identity", (t) => {
     { workItemId: work.id, agent: { agentId: "codex", adapterId: "codex" } }
   );
   const newer = createAgentRun(
-    "agent-run-a-new",
+    "agent-run-10",
     task.id,
     "leader",
     "resume",
@@ -378,7 +394,7 @@ test("task context orders AgentRuns by time rather than identity", (t) => {
     older.id,
     newer.id
   ]);
-  assert.match(result.output, /latest agent-run-a-new/);
+  assert.match(result.output, /latest agent-run-10/);
 });
 
 test("task context keeps empty knowledge and work explicit and reads terminal Task states", (t) => {

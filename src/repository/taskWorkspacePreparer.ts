@@ -152,8 +152,11 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     }
   }
 
-  async prepareWorkItemWorkspace(workItemId: string): Promise<RoleWorkspace> {
-    const item = requireWorkItem(this.store, workItemId);
+  async prepareWorkItemWorkspace(
+    taskId: string,
+    workItemId: string
+  ): Promise<RoleWorkspace> {
+    const item = requireWorkItem(this.store, taskId, workItemId);
     const task = requireTask(this.store, item.taskId);
     assertWorkItemWorkspaceEligible(this.store, task, item);
     await this.prepareTaskWorkspace(task.id);
@@ -266,8 +269,11 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     }
   }
 
-  async inspectWorkItemWorkspace(workItemId: string): Promise<GitWorkspaceState> {
-    const item = requireWorkItem(this.store, workItemId);
+  async inspectWorkItemWorkspace(
+    taskId: string,
+    workItemId: string
+  ): Promise<GitWorkspaceState> {
+    const item = requireWorkItem(this.store, taskId, workItemId);
     if (item.assignee === undefined) return "missing";
     const workspace = this.store.getRoleWorkspace(item.taskId, item.assignee);
     if (workspace === null) return "missing";
@@ -280,10 +286,11 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   }
 
   async cleanupWorkItemWorkspace(
+    taskId: string,
     workItemId: string,
     disposition: WorkItemWorkspaceDisposition
   ): Promise<GitWorkspaceRemoval> {
-    const item = requireWorkItem(this.store, workItemId);
+    const item = requireWorkItem(this.store, taskId, workItemId);
     const task = requireTask(this.store, item.taskId);
     if (!["completed", "failed", "cancelled", "superseded"].includes(item.status)) {
       throw new Error(`Work item must be terminal before cleanup: ${item.id}.`);
@@ -529,9 +536,13 @@ function requireProject(store: TaskStore, projectId: string): Project {
   return project;
 }
 
-function requireWorkItem(store: TaskStore, workItemId: string): WorkItem {
-  const item = store.findWorkItem(workItemId);
-  if (item === null) throw new Error(`Work item not found: ${workItemId}.`);
+function requireWorkItem(
+  store: TaskStore,
+  taskId: string,
+  workItemId: string
+): WorkItem {
+  const item = store.getWorkItem(taskId, workItemId);
+  if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
   return item;
 }
 

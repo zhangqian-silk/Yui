@@ -43,6 +43,10 @@ import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { updateWorkItemStatus } from "../workItem/workItem.js";
 import {
+  formatAgentRunReceiptId,
+  formatTaskRecordReference
+} from "../task/taskRecordReference.js";
+import {
   bindExecution,
   claimPending,
   completeProcessing,
@@ -98,8 +102,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return this.store.listAllInputRequests().filter((request) => request.status === "open");
   }
 
-  getInputRequest(inputRequestId: string) {
-    return this.store.findInputRequest(inputRequestId);
+  getInputRequest(taskId: string, inputRequestId: string) {
+    return this.store.getInputRequest(taskId, inputRequestId);
   }
 
   getOperatorDeliveryTarget() {
@@ -133,6 +137,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         store.saveInputRequest(task.id, answered);
         store.saveEvent(task.id, createTaskEvent(
           store.nextEventId(task.id),
+          task.id,
           "input.auto-answered",
           { requestId: request.id, choiceKey },
           now
@@ -154,7 +159,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return sessions !== null && sessions.inFlight !== null;
   }
 
-  nextAgentRunId(taskId: string): string { return this.store.nextAgentRunId(taskId); }
+  peekNextAgentRunId(taskId: string): string {
+    return this.store.peekNextAgentRunId(taskId);
+  }
   getWorkMailbox(target: MailboxTarget) { return this.store.getWorkMailbox(target); }
   listWorkMailboxes() { return this.store.listWorkMailboxes(); }
 
@@ -437,7 +444,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       const mailbox = store.getWorkMailbox(target);
       if (mailbox === null || mailbox.pending === null) return "state-changed";
       if (mailbox.processing !== null) return "busy";
-      const batchId = `agent-run:${input.run.id}`;
+      if (store.peekNextAgentRunId(input.task.id) !== input.run.id) {
+        return "state-changed";
+      }
+      const allocatedRunId = store.nextAgentRunId(input.task.id);
+      if (allocatedRunId !== input.run.id) {
+        throw new Error(`Leader Run allocation changed unexpectedly: ${input.task.id}.`);
+      }
+      const batchId = formatAgentRunReceiptId(input.task.id, input.run.id);
       const claimed = bindExecution(
         claimPending(mailbox, {
           batchId,
@@ -445,7 +459,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           startedAt: input.now.toISOString()
         }),
         batchId,
-        { type: "run", id: input.run.id }
+        { type: "run", taskId: input.task.id, id: input.run.id }
       );
       store.saveActiveAgentRun(input.run);
       store.saveWorkMailbox(claimed);
@@ -564,6 +578,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         || active.id !== input.claimed.run.id
         || active.status !== "active"
         || mailbox?.processing?.executionRef?.type !== "run"
+        || mailbox.processing.executionRef.taskId !== input.task.id
         || mailbox.processing.executionRef.id !== input.claimed.run.id
         || !schedulerRoleSessionsMatch(
           store.getRoleSession(input.task.id, input.role.name),
@@ -623,7 +638,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         && (
           sessions.inFlight.agentId !== role.activeAgentId
           || sessions.inFlight.runId !== currentRun.id
-          || sessions.inFlight.receiptId !== `agent-run:${currentRun.id}`
+          || sessions.inFlight.receiptId !== formatAgentRunReceiptId(task.id, currentRun.id)
         )
       ) {
         return "state-changed";
@@ -632,6 +647,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       const mailbox = store.getWorkMailbox(target);
       if (
         mailbox?.processing?.executionRef?.type !== "run"
+        || mailbox.processing.executionRef.taskId !== task.id
         || mailbox.processing.executionRef.id !== currentRun.id
       ) {
         return "state-changed";
@@ -1107,7 +1123,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             expectedRunId: completion.runId,
             summary: completion.summary
           }, now);
-          if (result.finalizedRunId !== undefined) finalized.push(result.finalizedRunId);
+          if (result.finalizedRunId !== undefined) {
+            finalized.push(formatTaskRecordReference(
+              completion.taskId,
+              result.finalizedRunId,
+              "agentRun"
+            ));
+          }
         }
         let settled = store.getTaskRoleSessionSet(completion.taskId, completion.roleName);
         if (settled?.pendingTurnCompletion?.turnId !== completion.turnId) return;
@@ -1208,7 +1230,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         const terminal = failAgentRun(active, summary, now);
         const target = { kind: "role", taskId: task.id, roleName: role.name } as const;
         store.saveAgentRun(terminal);
-        if (!completeWorkExecution(store, target, { type: "run", id: terminal.id })) {
+        if (!completeWorkExecution(store, target, {
+          type: "run",
+          taskId: task.id,
+          id: terminal.id
+        })) {
           throw new Error(`Role Run mailbox execution is inconsistent: ${terminal.id}.`);
         }
         store.clearActiveAgentRun(task.id, role.name);
@@ -1217,7 +1243,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           {
             agentId: role.activeAgentId,
             runId: active.id,
-            receiptId: `agent-run:${active.id}`
+            receiptId: formatAgentRunReceiptId(task.id, active.id)
           },
           now
         ));
@@ -1237,10 +1263,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           "role-run-failed",
           now,
           [
-            { type: "run", id: terminal.id },
+            { type: "run", taskId: task.id, id: terminal.id },
             ...(terminal.workItemId === undefined
               ? []
-              : [{ type: "work-item" as const, id: terminal.workItemId }])
+              : [{
+                  type: "work-item" as const,
+                  taskId: task.id,
+                  id: terminal.workItemId
+                }])
           ]
         );
         return { session, finalizedRunId: terminal.id };
@@ -1250,6 +1280,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       const leaderTarget = { kind: "role", taskId: task.id, roleName: role.name } as const;
       const leaderMailbox = store.getWorkMailbox(leaderTarget);
       const recoveryTurn = leaderMailbox?.processing?.executionRef?.type === "run"
+        && leaderMailbox.processing.executionRef.taskId === task.id
         && leaderMailbox.processing.executionRef.id === active.id
         && leaderMailbox.processing.batch.reasons.includes("leader-turn-unclosed");
       const quiescent = leaderMailbox?.pending === null
@@ -1261,6 +1292,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         && !store.listInputRequests(task.id).some((request) => request.status === "open");
       const message = createTaskMessage(
         store.nextMessageId(task.id),
+        task.id,
         input.summary,
         "role-result",
         { type: "role", roleName: role.name },
@@ -1271,6 +1303,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       store.saveMessage(task.id, message);
       store.saveEvent(task.id, createTaskEvent(
         store.nextEventId(task.id),
+        task.id,
         "message.sent",
         { messageId: message.id, kind: message.kind },
         now
@@ -1278,7 +1311,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (!completeWorkExecution(
         store,
         leaderTarget,
-        { type: "run", id: terminal.id }
+        { type: "run", taskId: task.id, id: terminal.id }
       )) {
         throw new Error(`Leader Run mailbox execution is inconsistent: ${terminal.id}.`);
       }
@@ -1288,7 +1321,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         {
           agentId: role.activeAgentId,
           runId: active.id,
-          receiptId: `agent-run:${active.id}`
+          receiptId: formatAgentRunReceiptId(task.id, active.id)
         },
         now
       ));
@@ -1317,7 +1350,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             now,
             [
               { type: "task", id: task.id },
-              { type: "run", id: terminal.id }
+              { type: "run", taskId: task.id, id: terminal.id }
             ]
           );
         } else {
@@ -1328,7 +1361,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             now,
             [
               { type: "task", id: task.id },
-              { type: "run", id: terminal.id }
+              { type: "run", taskId: task.id, id: terminal.id }
             ]
           );
         }
@@ -1773,7 +1806,7 @@ function bindTaskRoleRunInFlight(
   const updated = bindTaskRoleRun(current, {
     agentId: role.activeAgentId,
     runId: run.id,
-    receiptId: `agent-run:${run.id}`
+    receiptId: formatAgentRunReceiptId(role.taskId, run.id)
   }, now);
   store.saveRoleSessionSet(updated);
 }
@@ -1791,7 +1824,7 @@ function markTaskRoleRunDeliveredInFlight(
   const updated = markTaskRoleRunDelivered(current, {
     agentId: role.activeAgentId,
     runId: run.id,
-    receiptId: `agent-run:${run.id}`
+    receiptId: formatAgentRunReceiptId(role.taskId, run.id)
   }, now);
   store.saveRoleSessionSet(updated);
 }
@@ -1808,7 +1841,7 @@ function clearTaskRoleRunInFlight(
   const updated = clearTaskRoleRun(current, {
     agentId: role.activeAgentId,
     runId: run.id,
-    receiptId: `agent-run:${run.id}`
+    receiptId: formatAgentRunReceiptId(role.taskId, run.id)
   }, now);
   store.saveRoleSessionSet(updated);
 }

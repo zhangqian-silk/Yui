@@ -43,7 +43,35 @@ export YUI_HOME=/absolute/path/to/yui-home
 yui setup
 ```
 
-The home contains `schema.json`, the authoritative `state.json`, Project Catalog and knowledge, and Controller discovery files. Stable Project checkouts and managed worktrees live under the configured workspace, outside Yui home. The current storage version is exact and fresh-only; this release does not migrate older formats.
+The home contains `schema.json`, the authoritative `state.json`, Project Catalog and knowledge, and Controller discovery files. Stable Project checkouts and managed worktrees live under the configured workspace, outside Yui home. Runtime storage is exact and fresh-only: it never dual-reads an older schema or guesses an old identifier.
+
+Every Task-owned record family allocates a monotonically increasing local ID
+inside its Task. Different Tasks may therefore both contain `work-item-1`,
+`agent-run-1`, or `input-1`. A managed Task session may use that short local ID
+because `YUI_TASK_ID` supplies the scope. Outside a Task session, use the
+qualified form `<task-id>/<local-id>`; Yui never searches every Task for a bare
+ID. Commands that already take a Task explicitly, such as `task work create`
+and `task integration start`, keep their subordinate IDs local to that Task.
+Candidate IDs are local to their WorkItem and carry both Task and WorkItem
+provenance.
+
+One offline converter is available for the immediately preceding aggregate-v10
+identity layout. Stop the source Controller, keep the source home immutable,
+and select a new path that does not exist:
+
+```sh
+yui storage convert-task-identity \
+  --source /absolute/path/to/old-yui-home \
+  --output /absolute/path/to/fresh-yui-home
+```
+
+The converter remaps all Task-owned records and references, validates the fresh
+output with the current runtime, writes `identity-conversion.json`, and verifies
+that the source bytes did not change. It rejects dangling or ambiguous legacy
+references and never modifies the source in place. Inspect the report and the
+fresh Task contexts before switching `YUI_HOME`. See
+[Task-local identity and offline conversion](docs/task-local-identity.md) for
+the complete boundary.
 
 Setup also seeds four reusable Worker Profiles:
 
@@ -106,7 +134,7 @@ every existing or new Task; that candidate snapshots the rule, so later
 `always` starts a ReviewRound for every candidate, including a yielded Role Run
 or a Leader-managed direct result; `leader` leaves the candidate awaiting
 acceptance so the Leader can accept it directly or run
-`yui task work review <work-item-id>`. A configured review rule therefore keeps
+`yui task work review <task-id>/<work-item-id>`. A configured review rule therefore keeps
 Leader-managed candidates awaiting a decision instead of marking them done.
 A ReviewRound references that immutable candidate, and its review AgentRun never creates
 another WorkItem or recursively triggers review. The natural-language review
@@ -158,17 +186,17 @@ existing writable Project cannot be removed:
 ```sh
 yui task work create <task-id> "Update contract" \
   --project backend --project frontend --role implementer
-yui task work scope <work-item-id> \
+yui task work scope <task-id>/<work-item-id> \
   --project backend --project frontend --project shared-sdk
-yui task work isolate <work-item-id>
-yui task work reject <work-item-id> \
+yui task work isolate <task-id>/<work-item-id>
+yui task work reject <task-id>/<work-item-id> \
   --summary "Write scope expanded; continue in the refreshed workspace."
-yui task work dispatch <work-item-id>
-yui task work capture <work-item-id>
+yui task work dispatch <task-id>/<work-item-id>
+yui task work capture <task-id>/<work-item-id>
 yui task integration start <task-id> --project backend \
   --change-set <backend-change-set-id> --check "<validation command>"
-yui task integration cleanup <integration-id>
-yui task work cleanup <work-item-id> --integrated
+yui task integration cleanup <task-id>/<integration-id>
+yui task work cleanup <task-id>/<work-item-id> --integrated
 ```
 
 `capture` records one immutable ChangeSet per modified Project. Repeat capture
@@ -219,8 +247,8 @@ yui task role show <task-id> implementer
 
 yui task work create <task-id> "Implement the exporter" \
   --project app --role implementer
-yui task work isolate <work-item-id>
-yui task work dispatch <work-item-id> --input "Implement and run focused tests"
+yui task work isolate <task-id>/<work-item-id>
+yui task work dispatch <task-id>/<work-item-id> --input "Implement and run focused tests"
 ```
 
 `--yolo true` is a first-class Role setting. Yui compiles it to
@@ -254,7 +282,7 @@ replace the corresponding Claude tool-rule list; `--clear-allowed-tools` and
 The Worker delivers its current Run explicitly:
 
 ```sh
-yui task run yield <run-id> --summary "Implemented the exporter; focused tests pass"
+yui task run yield <task-id>/<run-id> --summary "Implemented the exporter; focused tests pass"
 ```
 
 Yield completes the AgentRun, submits the WorkItem for Leader review, appends
@@ -269,7 +297,7 @@ directly or create a native subagent through the current Agent conversation:
 yui task work create <task-id> "Review the implementation" \
   --objective "Return source-backed findings" \
   --accept "Every finding identifies an affected path"
-yui task work update <work-item-id> running
+yui task work update <task-id>/<work-item-id> running
 yui profile show reviewer
 ```
 
@@ -283,7 +311,7 @@ the Leader Agent, credentials, and conversation context. The Leader reviews the
 returned result and records the actual execution facts:
 
 ```sh
-yui task work update <work-item-id> done \
+yui task work update <task-id>/<work-item-id> done \
   --summary "executor=subagent; profile=reviewer@3; model=inherited; round=1; result=reviewed; checks=npm test passed"
 ```
 
@@ -310,17 +338,17 @@ Integration state stores compact check outcomes and failure diagnoses. Full stdo
 Code or semantic conflicts remain blocked until that Task's Leader records a decision:
 
 ```sh
-yui task integration resolve <integration-id> \
+yui task integration resolve <task-id>/<integration-id> \
   --option manual-resolution \
   --rationale "Preserve the public contract while combining both implementations"
-yui task integration continue <integration-id>
+yui task integration continue <task-id>/<integration-id>
 ```
 
 Worker yield is not WorkItem completion. The Leader accepts only after reviewing
 the result, validations, and the latest ChangeSet integration:
 
 ```sh
-yui task work accept <work-item-id> --summary "Acceptance criteria met."
+yui task work accept <task-id>/<work-item-id> --summary "Acceptance criteria met."
 ```
 
 Use `task work reject` to return an awaiting result for repair and redispatch,
@@ -341,8 +369,8 @@ When an active Leader Run cannot continue without a user decision, it can create
 yui task input request <task-id> --question "Which format should be the default?" \
   --choice csv="CSV" --choice json="JSON" --blocks work-item:<work-item-id>
 yui task input list
-yui task input show <input-id>
-yui task input answer <input-id> --choice csv
+yui task input show <task-id>/<input-id>
+yui task input answer <task-id>/<input-id> --choice csv
 ```
 
 Requests are user-required by default and remain open until answered or cancelled. When the Agent has a safe recommendation, it may attach a choice fallback and explicit timeout:

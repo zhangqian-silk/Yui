@@ -77,6 +77,8 @@ import { TaskWorkspaceCoordinator } from "./repository/taskWorkspaceCoordinator.
 import { FileTaskWorkspacePreparer } from "./repository/taskWorkspacePreparer.js";
 import { inspectStorageSchema, requireStorageSchema } from "./storage/storageSchema.js";
 import { FileTaskStore, resolveYuiHome } from "./storage/taskStore.js";
+import { convertLegacyTaskIdentityStorage } from "./storage/taskIdentityConverter.js";
+import { resolveTaskRecordReference } from "./task/taskRecordReference.js";
 import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
 import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
@@ -148,6 +150,34 @@ export async function main(): Promise<void> {
     if (jsonOutput) throw usageError("Update does not support --json.");
     if (args.length !== 1) throw usageError("Update usage: yui update");
     process.exitCode = runUpdateCommand();
+    return;
+  }
+
+  if (args[0] === "storage") {
+    const usage = "Storage conversion usage: yui storage convert-task-identity --source <old-yui-home> --output <fresh-yui-home>";
+    if (args[1] !== "convert-task-identity") throw usageError(usage);
+    const options = new Map<string, string>();
+    for (let index = 2; index < args.length; index += 2) {
+      const option = args[index];
+      const value = args[index + 1];
+      if ((option !== "--source" && option !== "--output")
+        || value === undefined || value.startsWith("--") || options.has(option)) {
+        throw usageError(usage);
+      }
+      options.set(option, value);
+    }
+    if (args.length !== 6 || options.size !== 2) throw usageError(usage);
+    const report = convertLegacyTaskIdentityStorage({
+      source: options.get("--source")!,
+      output: options.get("--output")!
+    });
+    emit(
+      `Converted ${report.taskIds.length} Tasks into fresh storage ${report.output}\n`
+      + `Source remained unchanged: ${report.source}\n`
+      + `Report: ${report.output}/identity-conversion.json`,
+      false,
+      report
+    );
     return;
   }
 
@@ -498,30 +528,39 @@ export async function main(): Promise<void> {
     if (resolved[1] === "work" && resolved[2] === "isolate") {
       const workItemId = resolved[3];
       if (workItemId === undefined || resolved.length !== 4) {
-        throw usageError("Task work isolate usage: yui task work isolate <work>.");
+        throw usageError("Task work isolate usage: yui task work isolate <task>/<work>.");
       }
-      const workspace = await workspaceCoordinator.isolateWorkItem(workItemId);
+      const reference = cliWorkItemReference(workItemId, process.env);
+      const workspace = await workspaceCoordinator.isolateWorkItem(
+        reference.taskId,
+        reference.localId
+      );
       emit(
-        `Created WorkItem workspace for ${workItemId}\nWorkspace: ${workspace.root}\n`,
+        `Created WorkItem workspace for ${reference.taskId}/${reference.localId}\nWorkspace: ${workspace.root}\n`,
         false,
-        { workItemId, workspace }
+        { workItemRef: reference, workspace }
       );
       return;
     }
     if (resolved[1] === "work" && resolved[2] === "capture") {
       const workItemId = resolved[3];
       if (workItemId === undefined || resolved.length !== 4) {
-        throw usageError("Task work capture usage: yui task work capture <work>.");
+        throw usageError("Task work capture usage: yui task work capture <task>/<work>.");
       }
-      const changeSets = await new WorkItemChangeSetManager(store).capture(workItemId);
+      const reference = cliWorkItemReference(workItemId, process.env);
+      const changeSets = await new WorkItemChangeSetManager(store).capture(
+        reference.taskId,
+        reference.localId
+      );
+      const qualified = `${reference.taskId}/${reference.localId}`;
       emit(
         changeSets.length === 0
-          ? `WorkItem workspace has no changes to capture: ${workItemId}\n`
+          ? `WorkItem workspace has no changes to capture: ${qualified}\n`
           : `Captured ChangeSets ${changeSets.map(({ id }) => id).join(", ")} from ${
-              workItemId
+              qualified
             }\n`,
         false,
-        { workItemId, changeSets }
+        { workItemRef: reference, changeSets }
       );
       return;
     }
@@ -531,25 +570,34 @@ export async function main(): Promise<void> {
       if (workItemId === undefined
         || !["--integrated", "--abandon"].includes(disposition ?? "")
         || resolved.length !== 5) {
-        throw usageError("Task work cleanup usage: yui task work cleanup <work> (--integrated|--abandon).");
+        throw usageError("Task work cleanup usage: yui task work cleanup <task>/<work> (--integrated|--abandon).");
       }
       const cleanedAs = disposition === "--integrated" ? "integrated" : "abandoned";
+      const reference = cliWorkItemReference(workItemId, process.env);
+      const qualified = `${reference.taskId}/${reference.localId}`;
       if (cleanedAs === "integrated") {
         try {
-          await new WorkItemChangeSetManager(store).assertIntegrated(workItemId);
+          await new WorkItemChangeSetManager(store).assertIntegrated(
+            reference.taskId,
+            reference.localId
+          );
         } catch (error) {
           throw usageError(error instanceof Error ? error.message : String(error));
         }
       }
-      const removal = await workspaceCoordinator.cleanupWorkItem(workItemId, cleanedAs);
+      const removal = await workspaceCoordinator.cleanupWorkItem(
+        reference.taskId,
+        reference.localId,
+        cleanedAs
+      );
       if (removal === "dirty") {
-        throw usageError(`WorkItem worktree is dirty and was retained: ${workItemId}.`);
+        throw usageError(`WorkItem worktree is dirty and was retained: ${qualified}.`);
       }
       emit(
-        `Cleaned WorkItem worktree ${workItemId} (${cleanedAs})\n`,
+        `Cleaned WorkItem worktree ${qualified} (${cleanedAs})\n`,
         false,
         {
-          workItem: store.findWorkItem(workItemId),
+          workItem: store.getWorkItem(reference.taskId, reference.localId),
           worktree: { removal, disposition: cleanedAs }
         }
       );
@@ -578,8 +626,9 @@ export async function main(): Promise<void> {
       const workItemId = resolved[3];
       if (workItemId !== undefined && !workItemId.startsWith("--")) {
         try {
+          const reference = cliWorkItemReference(workItemId, process.env);
           workItemIntegrationProof = await new WorkItemChangeSetManager(store)
-            .assertIntegrated(workItemId) ?? undefined;
+            .assertIntegrated(reference.taskId, reference.localId) ?? undefined;
         } catch (error) {
           throw usageError(error instanceof Error ? error.message : String(error));
         }
@@ -650,6 +699,23 @@ export async function main(): Promise<void> {
     `Command is not connected to the restored FileTaskStore framework yet: ${resolved[0]}.`,
     renderCommandHelp(invocation.node, VERSION)
   );
+}
+
+function cliWorkItemReference(
+  value: string,
+  environment: NodeJS.ProcessEnv
+) {
+  try {
+    return resolveTaskRecordReference(value, {
+      kind: "workItem",
+      label: "Work Item reference",
+      ...(environment.YUI_TASK_ID === undefined
+        ? {}
+        : { contextTaskId: environment.YUI_TASK_ID })
+    });
+  } catch (error) {
+    throw usageError(error instanceof Error ? error.message : String(error));
+  }
 }
 
 async function executeOperatorSessionControl(

@@ -76,7 +76,30 @@ export YUI_HOME=/absolute/path/to/yui-home
 yui setup
 ```
 
-home 中包含 `schema.json`、权威 `state.json`、Project Catalog、项目知识和 Controller 发现文件。稳定 Project checkout 与受管理 worktree 位于 home 外部的 workspace。当前存储版本严格匹配且 fresh-only；旧格式会被直接拒绝，不做迁移。
+home 中包含 `schema.json`、权威 `state.json`、Project Catalog、项目知识和 Controller 发现文件。稳定 Project checkout 与受管理 worktree 位于 home 外部的 workspace。运行时存储严格匹配且 fresh-only：不会双读旧 schema，也不会猜测旧 ID。
+
+所有 Task-owned 记录族都在各自 Task 内分配单调递增的本地 ID。因此，不同
+Task 可以同时拥有 `work-item-1`、`agent-run-1` 或 `input-1`。受管 Task
+session 可由 `YUI_TASK_ID` 提供作用域并使用本地短 ID；Task session 外必须
+使用 `<task-id>/<local-id>`。Yui 不会拿裸 ID 扫描所有 Task。已经显式接收
+Task 的命令（例如 `task work create`、`task integration start`）仍使用该
+Task 内的本地子记录 ID。Candidate 只在所属 WorkItem 内递增，并同时保存
+Task 与 WorkItem provenance。
+
+对于紧邻本版本的 aggregate-v10 identity 布局，只提供一个离线转换器。先
+停止源 Controller，保持源 home 不可变，并选择一个尚不存在的新路径：
+
+```sh
+yui storage convert-task-identity \
+  --source /absolute/path/to/old-yui-home \
+  --output /absolute/path/to/fresh-yui-home
+```
+
+转换器会重映射全部 Task-owned 记录与引用，使用当前 runtime 验证新输出，
+生成 `identity-conversion.json`，并核对源文件字节未改变。悬空或歧义旧引用
+会令转换失败；转换器绝不原地修改源 home。切换 `YUI_HOME` 前，应检查报告
+和 fresh home 中的 Task context。完整边界见
+[Task 本地 ID 与离线转换](../docs/task-local-identity.md)。
 
 ## 快速开始
 
@@ -116,7 +139,7 @@ yui config review clear
 后续 `set`/`clear` 不会改变已经在途的判断。
 `always` 会为每个候选启动 ReviewRound，包括 Role yield 的结果和 Leader 直接管理的
 结果；`leader` 则让候选保持等待验收，由 Leader 直接 accept 或执行
-`yui task work review <work-item-id>`。因此只要配置了审查规则，Leader
+`yui task work review <task-id>/<work-item-id>`。因此只要配置了审查规则，Leader
 管理的候选也不会直接标记为完成。ReviewRound 引用不可变候选，审查
 AgentRun 不创建新 WorkItem，也不会递归触发审查。审查以自然语言结果
 唤醒 Leader；Leader 决定验收、reject 后在原 Role 与原 Session 中修复、
@@ -162,17 +185,17 @@ Leader 使用完整的“旧范围 + 新范围”更新并重新派发：
 ```sh
 yui task work create <task-id> "升级协议与客户端" \
   --project backend --project frontend --role implementer
-yui task work scope <work-item-id> \
+yui task work scope <task-id>/<work-item-id> \
   --project backend --project frontend --project shared-sdk
-yui task work isolate <work-item-id>
-yui task work reject <work-item-id> \
+yui task work isolate <task-id>/<work-item-id>
+yui task work reject <task-id>/<work-item-id> \
   --summary "已扩大写入范围，请在刷新后的 workspace 继续。"
-yui task work dispatch <work-item-id>
-yui task work capture <work-item-id>
+yui task work dispatch <task-id>/<work-item-id>
+yui task work capture <task-id>/<work-item-id>
 yui task integration start <task-id> --project backend \
   --change-set <backend-change-set-id> --check "<validation command>"
-yui task integration cleanup <integration-id>
-yui task work cleanup <work-item-id> --integrated
+yui task integration cleanup <task-id>/<integration-id>
+yui task work cleanup <task-id>/<work-item-id> --integrated
 ```
 
 `capture` 为每个实际修改的 Project 记录一个不可变 ChangeSet；同一 HEAD
@@ -217,8 +240,8 @@ yui task role show <task-id> implementer
 
 yui task work create <task-id> "实现导出器" \
   --project app --role implementer
-yui task work isolate <work-item-id>
-yui task work dispatch <work-item-id> --input "完成实现并运行聚焦测试"
+yui task work isolate <task-id>/<work-item-id>
+yui task work dispatch <task-id>/<work-item-id> --input "完成实现并运行聚焦测试"
 ```
 
 `--yolo true` 是 Role 的一等配置。Yui 会分别为 Codex 编译
@@ -249,7 +272,7 @@ yui role update reviewer --agent claude --model <model> --effort <effort> \
 Worker 显式交付当前 Run：
 
 ```sh
-yui task run yield <run-id> --summary "导出器已完成，聚焦测试通过"
+yui task run yield <task-id>/<run-id> --summary "导出器已完成，聚焦测试通过"
 ```
 
 yield 会结束 AgentRun，将 WorkItem 提交给 Leader 审查，并追加结果消息和
@@ -263,7 +286,7 @@ Agent 对话中创建 native subagent：
 yui task work create <task-id> "审查实现" \
   --objective "返回有源码依据的问题" \
   --accept "每个问题都标明受影响路径"
-yui task work update <work-item-id> running
+yui task work update <task-id>/<work-item-id> running
 yui profile show reviewer
 ```
 
@@ -278,7 +301,7 @@ Agent bindings。Leader 审查返回结果后，在 WorkItem summary 中登记�
 执行信息：
 
 ```sh
-yui task work update <work-item-id> done \
+yui task work update <task-id>/<work-item-id> done \
   --summary "executor=subagent; profile=reviewer@3; model=inherited; round=1; result=reviewed; checks=npm test passed"
 ```
 
@@ -292,9 +315,9 @@ Leader reject 并在同一 workspace 重新派发。相同 HEAD 重复 capture �
 原 ChangeSet；修复后的新 HEAD 形成新候选：
 
 ```sh
-yui task work reject <work-item-id> --summary "需要修复的具体问题"
-yui task work dispatch <work-item-id> --input "结合上一轮结果修复"
-yui task work capture <work-item-id>
+yui task work reject <task-id>/<work-item-id> --summary "需要修复的具体问题"
+yui task work dispatch <task-id>/<work-item-id> --input "结合上一轮结果修复"
+yui task work capture <task-id>/<work-item-id>
 yui task integration start <task-id> \
   --change-set <latest-change-set-id> --check "npm test"
 ```
@@ -306,17 +329,17 @@ Integration 只保存紧凑检查结果和失败诊断。完整 stdout/stderr �
 代码或语义冲突会保持 blocked，直到该 Task 的 Leader 记录决策：
 
 ```sh
-yui task integration resolve <integration-id> \
+yui task integration resolve <task-id>/<integration-id> \
   --option manual-resolution \
   --rationale "保留公开契约并组合两边实现"
-yui task integration continue <integration-id>
+yui task integration continue <task-id>/<integration-id>
 ```
 
 Worker yield 不等于 WorkItem 完成。Leader 审查结果、验证和最新
 ChangeSet 集成后再显式验收：
 
 ```sh
-yui task work accept <work-item-id> --summary "验收标准满足。"
+yui task work accept <task-id>/<work-item-id> --summary "验收标准满足。"
 ```
 
 使用 `task work reject` 退回待验收结果以便修复和重新派发，使用
@@ -334,8 +357,8 @@ Knowledge。
 yui task input request <task-id> --question "默认使用哪种格式？" \
   --choice csv="CSV" --choice json="JSON" --blocks work-item:<work-item-id>
 yui task input list
-yui task input show <input-id>
-yui task input answer <input-id> --choice csv
+yui task input show <task-id>/<input-id>
+yui task input answer <task-id>/<input-id> --choice csv
 ```
 
 请求默认必须由用户回答，并保持开放直到回答或取消。当 Agent 存在安全的推荐方案时，可以为选项设置明确的超时回退：

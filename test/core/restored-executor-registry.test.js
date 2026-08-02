@@ -326,17 +326,25 @@ test("production runtime ports launch and attempt delivery without the legacy re
 
   const prepared = await registry.prepareRoleSession({
     taskId: "task-1", roleName: "leader", agentId: "codex", adapterId: "codex",
-    workspace: "/tmp/workspace", mode: "new", runId: "run-1"
+    workspace: "/tmp/workspace", mode: "new", runId: "agent-run-1"
   });
   const retriedPrepare = await registry.prepareRoleSession({
     taskId: "task-1", roleName: "leader", agentId: "codex", adapterId: "codex",
-    workspace: "/tmp/workspace", mode: "new", runId: "run-1"
+    workspace: "/tmp/workspace", mode: "new", runId: "agent-run-1"
   });
   assert.equal(retriedPrepare, prepared);
   const ready = await registry.waitUntilReady(prepared);
-  assert.equal(await registry.sendOnce({ delivery: ready, receiptId: "agent-run:run-1", text: "lead" }), "busy");
+  assert.equal(await registry.sendOnce({
+    delivery: ready,
+    receiptId: "agent-run:task-1/agent-run-1",
+    text: "lead"
+  }), "busy");
   pushOutcome = "delivered";
-  assert.equal(await registry.sendOnce({ delivery: ready, receiptId: "agent-run:run-1", text: "lead" }), "sent");
+  assert.equal(await registry.sendOnce({
+    delivery: ready,
+    receiptId: "agent-run:task-1/agent-run-1",
+    text: "lead"
+  }), "sent");
   assert.deepEqual(calls.map(([kind]) => kind), ["start", "push", "push"]);
 });
 
@@ -388,14 +396,14 @@ test("prepared runtime bindings survive transient unavailability but explicit te
     adapterId: "codex",
     workspace: "/tmp/workspace",
     mode: "new",
-    runId: "run-1"
+    runId: "agent-run-1"
   };
 
   const first = await registry.prepareRoleSession(input);
   const ready = await registry.waitUntilReady(first);
   assert.equal(await registry.sendOnce({
     delivery: ready,
-    receiptId: "agent-run:run-1",
+    receiptId: "agent-run:task-1/agent-run-1",
     text: "work"
   }), "unavailable");
   assert.equal(await registry.prepareRoleSession(input), first);

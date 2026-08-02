@@ -128,7 +128,7 @@ test("an active Role Run may launch from its snapshotted workspace", async (t) =
     updatedAt: FIRST.toISOString()
   };
   const run = createAgentRun(
-    "agent-run-workspace",
+    "agent-run-101",
     task.id,
     reviewer.name,
     "new",
@@ -140,7 +140,9 @@ test("an active Role Run may launch from its snapshotted workspace", async (t) =
   store.transaction((tx) => {
     tx.saveRole(task.id, reviewer);
     tx.saveActiveAgentRun(run);
-    enqueueWork(tx, target, "review-requested", FIRST, [{ type: "run", id: run.id }]);
+    enqueueWork(tx, target, "review-requested", FIRST, [
+      { type: "run", taskId: task.id, id: run.id }
+    ]);
   });
   const starts = [];
   const sessionHost = {

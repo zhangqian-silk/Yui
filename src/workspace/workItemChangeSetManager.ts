@@ -40,8 +40,11 @@ export class WorkItemChangeSetManager {
     readonly now: () => Date = () => new Date()
   ) {}
 
-  async capture(workItemId: string): Promise<readonly WorkItemChangeSet[]> {
-    const context = requireCapturableContext(this.store, workItemId);
+  async capture(
+    taskId: string,
+    workItemId: string
+  ): Promise<readonly WorkItemChangeSet[]> {
+    const context = requireCapturableContext(this.store, taskId, workItemId);
     const captured: WorkItemChangeSet[] = [];
     for (const entry of writableEntries(context.workspace)) {
       const changeSet = await this.#captureProject(context, entry);
@@ -50,9 +53,12 @@ export class WorkItemChangeSetManager {
     return captured;
   }
 
-  async assertIntegrated(workItemId: string): Promise<WorkItemIntegrationProof | null> {
-    const item = this.store.findWorkItem(workItemId);
-    if (item === null) throw new Error(`Work item not found: ${workItemId}.`);
+  async assertIntegrated(
+    taskId: string,
+    workItemId: string
+  ): Promise<WorkItemIntegrationProof | null> {
+    const item = this.store.getWorkItem(taskId, workItemId);
+    if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
     if (item.assignee === undefined) return null;
     const workspace = this.store.getRoleWorkspace(item.taskId, item.assignee);
     if (
@@ -203,10 +209,11 @@ type CapturableContext = Readonly<{
 
 function requireCapturableContext(
   store: TaskStore,
+  taskId: string,
   workItemId: string
 ): CapturableContext {
-  const item = store.findWorkItem(workItemId);
-  if (item === null) throw new Error(`Work item not found: ${workItemId}.`);
+  const item = store.getWorkItem(taskId, workItemId);
+  if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
   if (!CAPTURABLE_WORK_ITEM_STATUSES.has(item.status)) {
     throw new Error(
       `Work item must be awaiting acceptance or terminal before capture: ${item.id}.`

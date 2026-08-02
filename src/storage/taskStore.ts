@@ -7,7 +7,6 @@ import {
   statSync,
   writeFileSync
 } from "node:fs";
-import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -74,6 +73,12 @@ import type { OperatorNotification } from "../scheduler/operatorNotification.js"
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import { validateTask, type Task } from "../task/task.js";
 import {
+  formatAgentRunReceiptId,
+  TASK_RECORD_ID_PREFIXES,
+  validateTaskRecordReference,
+  type TaskRecordKind
+} from "../task/taskRecordReference.js";
+import {
   validateWorkItem,
   type WorkItem,
   type WorkItemCandidate
@@ -116,9 +121,13 @@ export type ConfiguredAgentUpdateResult = Readonly<{
 }>;
 
 type ActiveRunPointer = Readonly<{ schemaVersion: 1; runId: string }>;
+
+type TaskIdHighWaterMarks = Record<TaskRecordKind, number>;
+
 type StoredTask = {
-  schemaVersion: 9;
+  schemaVersion: 10;
   task: Task;
+  idHighWaterMarks: TaskIdHighWaterMarks;
   brief: TaskBrief | null;
   changeSets: Record<string, ChangeSet>;
   integrationAttempts: Record<string, IntegrationAttempt>;
@@ -139,7 +148,7 @@ type StoredTask = {
 };
 
 type StorageState = {
-  schemaVersion: 10;
+  schemaVersion: 11;
   revision: number;
   config: YuiConfig;
   configuredAgents: Record<string, ConfiguredAgent>;
@@ -215,12 +224,11 @@ export type TaskStore = {
   getRoleSession(taskId: string, roleName: string): RoleAgentSession | null;
   nextWorkItemId(taskId: string): string;
   getWorkItem(taskId: string, workItemId: string): WorkItem | null;
-  findWorkItem(workItemId: string): WorkItem | null;
   listWorkItems(taskId: string): WorkItem[];
   saveWorkItem(taskId: string, item: WorkItem): void;
   nextAgentRunId(taskId: string): string;
+  peekNextAgentRunId(taskId: string): string;
   getAgentRun(taskId: string, runId: string): AgentRun | null;
-  findAgentRun(runId: string): AgentRun | null;
   listAgentRuns(taskId: string): AgentRun[];
   saveAgentRun(run: AgentRun): void;
   nextReviewRoundId(taskId: string): string;
@@ -236,7 +244,6 @@ export type TaskStore = {
   nextInputRequestId(taskId: string): string;
   saveInputRequest(taskId: string, request: InputRequest): void;
   getInputRequest(taskId: string, requestId: string): InputRequest | null;
-  findInputRequest(requestId: string): InputRequest | null;
   listInputRequests(taskId: string): InputRequest[];
   listAllInputRequests(): InputRequest[];
   nextDecisionId(taskId: string): string;
@@ -521,8 +528,8 @@ export class FileTaskStore implements TaskStore {
     this.#mutate((state) => { state.tasks[taskId].brief = null; });
   }
 
-  nextChangeSetId(_taskId: string): string {
-    return `change-set-${randomUUID()}`;
+  nextChangeSetId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "changeSet");
   }
   saveChangeSet(taskId: string, changeSet: ChangeSet): void {
     const stored = identifiedChangeSet(changeSet, changeSet.id);
@@ -542,7 +549,9 @@ export class FileTaskStore implements TaskStore {
       throw new StorageRecordError(`ChangeSet is immutable: ${stored.id}.`);
     }
     this.#mutate((state) => {
-      state.tasks[taskId].changeSets[stored.id] = stored;
+      const task = state.tasks[taskId];
+      observeTaskRecordId(task, "changeSet", stored.id);
+      task.changeSets[stored.id] = stored;
     });
   }
   listChangeSets(taskId: string): ChangeSet[] {
@@ -552,8 +561,8 @@ export class FileTaskStore implements TaskStore {
     return optional(this.#state().tasks[taskId]?.changeSets[changeSetId]);
   }
 
-  nextIntegrationAttemptId(_taskId: string): string {
-    return `integration-${randomUUID()}`;
+  nextIntegrationAttemptId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "integrationAttempt");
   }
   saveIntegrationAttempt(taskId: string, attempt: IntegrationAttempt): void {
     const stored = identified<IntegrationAttempt>(
@@ -594,7 +603,9 @@ export class FileTaskStore implements TaskStore {
       }
     }
     this.#mutate((state) => {
-      state.tasks[taskId].integrationAttempts[stored.id] = stored;
+      const task = state.tasks[taskId];
+      observeTaskRecordId(task, "integrationAttempt", stored.id);
+      task.integrationAttempts[stored.id] = stored;
     });
   }
   listIntegrationAttempts(taskId: string): IntegrationAttempt[] {
@@ -695,12 +706,13 @@ export class FileTaskStore implements TaskStore {
     return set === null ? null : optional(set.sessions[set.activeAgentId]);
   }
 
-  nextWorkItemId(_taskId: string): string { return this.#nextGlobalId("work-item", (state) => allKeys(state, "workItems")); }
+  nextWorkItemId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "workItem");
+  }
   getWorkItem(taskId: string, id: string): WorkItem | null { return optional(this.#state().tasks[taskId]?.workItems[id]); }
-  findWorkItem(id: string): WorkItem | null { return findUnique(this.#state(), "workItems", id, "Work item"); }
   listWorkItems(taskId: string): WorkItem[] { return values(this.#requireTask(taskId).workItems, "id"); }
   saveWorkItem(taskId: string, item: WorkItem): void {
-    const stored = identified<WorkItem>(item, 5, "id", item.id, "Work item");
+    const stored = identified<WorkItem>(item, 6, "id", item.id, "Work item");
     if (stored.taskId !== taskId) throw new StorageRecordError(`Work item belongs to another Task: ${stored.taskId}`);
     validateWorkItem(stored);
     const aggregate = this.#requireTaskForWrite(taskId);
@@ -725,12 +737,20 @@ export class FileTaskStore implements TaskStore {
     if (existing !== null && !validWorkItemTransition(existing, stored)) {
       throw new StorageRecordError(`Work Item transition is invalid: ${stored.id}.`);
     }
-    this.#mutate((state) => { state.tasks[taskId].workItems[stored.id] = stored; });
+    this.#mutate((state) => {
+      const task = state.tasks[taskId];
+      observeTaskRecordId(task, "workItem", stored.id);
+      task.workItems[stored.id] = stored;
+    });
   }
 
-  nextAgentRunId(_taskId: string): string { return this.#nextGlobalId("agent-run", (state) => allKeys(state, "agentRuns")); }
+  nextAgentRunId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "agentRun");
+  }
+  peekNextAgentRunId(taskId: string): string {
+    return this.#peekTaskRecordId(taskId, "agentRun");
+  }
   getAgentRun(taskId: string, id: string): AgentRun | null { return optional(this.#state().tasks[taskId]?.agentRuns[id]); }
-  findAgentRun(id: string): AgentRun | null { return findUnique(this.#state(), "agentRuns", id, "Agent run"); }
   listAgentRuns(taskId: string): AgentRun[] { return values(this.#requireTask(taskId).agentRuns, "id"); }
   saveAgentRun(run: AgentRun): void {
     const stored = identified<AgentRun>(run, 3, "id", run.id, "Agent run");
@@ -747,6 +767,7 @@ export class FileTaskStore implements TaskStore {
     }
     this.#mutate((state) => {
       const task = state.tasks[stored.taskId];
+      observeTaskRecordId(task, "agentRun", stored.id);
       task.agentRuns[stored.id] = stored;
       if (stored.reviewRoundId === undefined || stored.status === "active") return;
       const round = task.reviewRounds[stored.reviewRoundId];
@@ -759,8 +780,8 @@ export class FileTaskStore implements TaskStore {
       );
     });
   }
-  nextReviewRoundId(_taskId: string): string {
-    return this.#nextGlobalId("review-round", (state) => allKeys(state, "reviewRounds"));
+  nextReviewRoundId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "reviewRound");
   }
   getReviewRound(taskId: string, reviewRoundId: string): ReviewRound | null {
     return optional(this.#state().tasks[taskId]?.reviewRounds[reviewRoundId]);
@@ -796,7 +817,9 @@ export class FileTaskStore implements TaskStore {
       throw new StorageRecordError(`ReviewRound transition is invalid: ${stored.id}.`);
     }
     this.#mutate((state) => {
-      state.tasks[taskId].reviewRounds[stored.id] = stored;
+      const task = state.tasks[taskId];
+      observeTaskRecordId(task, "reviewRound", stored.id);
+      task.reviewRounds[stored.id] = stored;
     });
   }
   getActiveAgentRun(taskId: string, roleName: string): AgentRun | null {
@@ -830,14 +853,19 @@ export class FileTaskStore implements TaskStore {
     this.#mutate((state) => { const task = state.tasks[taskId]; if (task !== undefined) delete task.activeRuns[roleName]; });
   }
 
-  nextMessageId(_taskId: string): string { return this.#nextGlobalId("message", (state) => allKeys(state, "messages")); }
+  nextMessageId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "message");
+  }
   saveMessage(taskId: string, message: TaskMessage): void {
     validateTaskMessage(message);
+    if (message.taskId !== taskId) {
+      throw new StorageRecordError(`Message belongs to another Task: ${message.taskId}`);
+    }
     this.#saveTaskRecord(taskId, "messages", message, "Message");
   }
   listMessages(taskId: string): TaskMessage[] { return values(this.#requireTask(taskId).messages, "id"); }
-  nextInputRequestId(_taskId: string): string {
-    return this.#nextGlobalId("input", (state) => allKeys(state, "inputRequests"));
+  nextInputRequestId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "inputRequest");
   }
   saveInputRequest(taskId: string, request: InputRequest): void {
     const stored = validateInputRequest(request);
@@ -846,10 +874,6 @@ export class FileTaskStore implements TaskStore {
     }
     this.#mutate((state) => {
       const aggregate = requireTaskFromState(state, taskId);
-      const owner = taskRecordOwner(state, "inputRequests", stored.id);
-      if (owner !== null && owner !== taskId) {
-        throw new StorageRecordError(`Input request already exists in another Task: ${stored.id}`);
-      }
       const existing = aggregate.inputRequests[stored.id];
       if (existing === undefined && stored.status !== "open") {
         throw new StorageRecordError(`Input request must start open: ${stored.id}`);
@@ -857,14 +881,12 @@ export class FileTaskStore implements TaskStore {
       if (existing !== undefined && !isValidInputRequestTransition(existing, stored)) {
         throw new StorageRecordError(`Input request cannot be overwritten: ${stored.id}`);
       }
+      observeTaskRecordId(aggregate, "inputRequest", stored.id);
       aggregate.inputRequests[stored.id] = stored;
     });
   }
   getInputRequest(taskId: string, requestId: string): InputRequest | null {
     return optional(this.#state().tasks[taskId]?.inputRequests[requestId]);
-  }
-  findInputRequest(requestId: string): InputRequest | null {
-    return findUnique(this.#state(), "inputRequests", requestId, "Input request");
   }
   listInputRequests(taskId: string): InputRequest[] {
     return values(this.#requireTask(taskId).inputRequests, "id");
@@ -872,10 +894,14 @@ export class FileTaskStore implements TaskStore {
   listAllInputRequests(): InputRequest[] {
     return Object.values(this.#state().tasks)
       .flatMap((aggregate) => Object.values(aggregate.inputRequests).map(clone))
-      .sort((left, right) => numericCompare(left.id, right.id));
+      .sort((left, right) => (
+        left.createdAt.localeCompare(right.createdAt)
+        || left.taskId.localeCompare(right.taskId)
+        || numericCompare(left.id, right.id)
+      ));
   }
-  nextDecisionId(_taskId: string): string {
-    return this.#nextGlobalId("decision", (state) => allKeys(state, "decisions"));
+  nextDecisionId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "decision");
   }
   saveDecision(taskId: string, decision: Decision): void {
     const stored = storedDecision(decision);
@@ -884,10 +910,6 @@ export class FileTaskStore implements TaskStore {
     }
     this.#mutate((state) => {
       const aggregate = requireTaskFromState(state, taskId);
-      const owner = taskRecordOwner(state, "decisions", stored.id);
-      if (owner !== null && owner !== taskId) {
-        throw new StorageRecordError(`Decision already exists in another Task: ${stored.id}`);
-      }
       const existing = aggregate.decisions[stored.id];
       if (existing === undefined && stored.status !== "active") {
         throw new StorageRecordError(`Decision must start active: ${stored.id}`);
@@ -895,6 +917,7 @@ export class FileTaskStore implements TaskStore {
       if (existing !== undefined && !isValidDecisionSupersession(existing, stored)) {
         throw new StorageRecordError(`Decision cannot be overwritten: ${stored.id}`);
       }
+      observeTaskRecordId(aggregate, "decision", stored.id);
       aggregate.decisions[stored.id] = stored;
     });
   }
@@ -904,8 +927,8 @@ export class FileTaskStore implements TaskStore {
   getDecision(taskId: string, decisionId: string): Decision | null {
     return this.#requireTask(taskId).decisions[decisionId] ?? null;
   }
-  nextMilestoneId(_taskId: string): string {
-    return this.#nextGlobalId("milestone", (state) => allKeys(state, "milestones"));
+  nextMilestoneId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "milestone");
   }
   saveMilestone(taskId: string, milestone: Milestone): void {
     const stored = storedMilestone(milestone);
@@ -914,9 +937,10 @@ export class FileTaskStore implements TaskStore {
     }
     this.#mutate((state) => {
       const aggregate = requireTaskFromState(state, taskId);
-      if (taskRecordOwner(state, "milestones", stored.id) !== null) {
-        throw new StorageRecordError(`Milestone already exists: ${stored.id}`);
+      if (aggregate.milestones[stored.id] !== undefined) {
+        throw new StorageRecordError(`Milestone already exists: ${taskId}/${stored.id}`);
       }
+      observeTaskRecordId(aggregate, "milestone", stored.id);
       aggregate.milestones[stored.id] = stored;
     });
   }
@@ -926,14 +950,20 @@ export class FileTaskStore implements TaskStore {
   getMilestone(taskId: string, milestoneId: string): Milestone | null {
     return this.#requireTask(taskId).milestones[milestoneId] ?? null;
   }
-  nextEventId(_taskId: string): string { return this.#nextGlobalId("event", (state) => allKeys(state, "events")); }
+  nextEventId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "event");
+  }
   saveEvent(taskId: string, event: TaskEvent): void {
     const stored = storedTaskEvent(event);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`Task event belongs to another Task: ${stored.taskId}`);
+    }
     this.#mutate((state) => {
       const aggregate = requireTaskFromState(state, taskId);
-      if (taskRecordOwner(state, "events", stored.id) !== null) {
-        throw new StorageRecordError(`Task event already exists: ${stored.id}`);
+      if (aggregate.events[stored.id] !== undefined) {
+        throw new StorageRecordError(`Task event already exists: ${taskId}/${stored.id}`);
       }
+      observeTaskRecordId(aggregate, "event", stored.id);
       aggregate.events[stored.id] = stored;
     });
   }
@@ -1023,12 +1053,13 @@ export class FileTaskStore implements TaskStore {
   #saveTaskRecord<K extends "messages">(
     taskId: string, key: K, value: StoredTask[K][string], label: string
   ): void {
-    const record = versioned<{ schemaVersion: 1; id: string }>(value, 1, label);
+    const record = versioned<{ schemaVersion: 2; id: string }>(value, 2, label);
     this.#requireTaskForWrite(taskId);
     this.#mutate((state) => {
-      if (taskRecordOwner(state, key, record.id) !== null) {
-        throw new StorageRecordError(`${label} already exists: ${record.id}`);
+      if (state.tasks[taskId][key][record.id] !== undefined) {
+        throw new StorageRecordError(`${label} already exists: ${taskId}/${record.id}`);
       }
+      observeTaskRecordId(state.tasks[taskId], "message", record.id);
       (state.tasks[taskId][key] as Record<string, typeof value>)[record.id] = clone(value);
     });
   }
@@ -1071,6 +1102,24 @@ export class FileTaskStore implements TaskStore {
     return `${prefix}-${maximum + 1}`;
   }
 
+  #nextTaskRecordId(taskId: string, kind: TaskRecordKind): string {
+    return this.#mutateResult((state) => {
+      const aggregate = requireTaskFromState(state, taskId);
+      const next = nextTaskRecordSequence(aggregate, taskId, kind);
+      aggregate.idHighWaterMarks[kind] = next;
+      return `${TASK_RECORD_ID_PREFIXES[kind]}-${next}`;
+    });
+  }
+
+  #peekTaskRecordId(taskId: string, kind: TaskRecordKind): string {
+    const aggregate = this.#requireTask(taskId);
+    return `${TASK_RECORD_ID_PREFIXES[kind]}-${nextTaskRecordSequence(
+      aggregate,
+      taskId,
+      kind
+    )}`;
+  }
+
   #readState(): StorageState {
     requireStorageSchema(this.rootDir);
     const path = join(this.rootDir, STORAGE_STATE_FILE);
@@ -1105,7 +1154,7 @@ export function ensureYuiHome(rootDir: string): void { mkdirSync(rootDir, { recu
 
 function emptyState(): StorageState {
   return {
-    schemaVersion: 10,
+    schemaVersion: 11,
     revision: 0,
     config: { schemaVersion: 1 },
     configuredAgents: {},
@@ -1119,8 +1168,9 @@ function emptyState(): StorageState {
 }
 function emptyStoredTask(task: Task): StoredTask {
   return {
-    schemaVersion: 9,
+    schemaVersion: 10,
     task,
+    idHighWaterMarks: emptyTaskIdHighWaterMarks(),
     brief: null,
     changeSets: {},
     integrationAttempts: {},
@@ -1141,6 +1191,46 @@ function emptyStoredTask(task: Task): StoredTask {
   };
 }
 
+function emptyTaskIdHighWaterMarks(): TaskIdHighWaterMarks {
+  return {
+    workItem: 0,
+    agentRun: 0,
+    reviewRound: 0,
+    changeSet: 0,
+    integrationAttempt: 0,
+    message: 0,
+    inputRequest: 0,
+    decision: 0,
+    milestone: 0,
+    event: 0
+  };
+}
+
+function nextTaskRecordSequence(
+  aggregate: StoredTask,
+  taskId: string,
+  kind: TaskRecordKind
+): number {
+  const next = aggregate.idHighWaterMarks[kind] + 1;
+  if (!Number.isSafeInteger(next)) {
+    throw new StorageRecordError(`Task ${kind} id space is exhausted: ${taskId}.`);
+  }
+  return next;
+}
+
+function validateTaskIdHighWaterMarks(value: unknown, taskId: string): void {
+  const marks = object(value, `Task id high-water marks ${taskId}`);
+  const kinds = Object.keys(TASK_RECORD_ID_PREFIXES) as TaskRecordKind[];
+  exact(marks, kinds, `Task id high-water marks ${taskId}`);
+  for (const kind of kinds) {
+    if (!Number.isSafeInteger(marks[kind]) || (marks[kind] as number) < 0) {
+      throw new StorageRecordError(
+        `Task id high-water mark is invalid: ${taskId}/${kind}.`
+      );
+    }
+  }
+}
+
 function parseState(raw: string): StorageState {
   let parsed: unknown;
   try { parsed = JSON.parse(raw) as unknown; } catch (error) { throw new StorageRecordError(`Invalid ${STORAGE_STATE_FILE}: ${error instanceof Error ? error.message : String(error)}`); }
@@ -1157,7 +1247,7 @@ function parseState(raw: string): StorageState {
     "tasks",
     "mailboxes"
   ], "Storage state");
-  if (state.schemaVersion !== 10 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
+  if (state.schemaVersion !== 11 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
   const result = clone(state) as unknown as StorageState;
   result.config = versioned(result.config, 1, "Yui config");
   validateYuiConfig(result.config);
@@ -1239,11 +1329,6 @@ function parseState(raw: string): StorageState {
     validateCanonicalTaskReferences(result, aggregate);
   }
   for (const mailbox of Object.values(result.mailboxes)) validateMailboxReferences(result, mailbox);
-  assertGloballyUniqueTaskRecordIds(result, "inputRequests", "Input request");
-  assertGloballyUniqueTaskRecordIds(result, "decisions", "Decision");
-  assertGloballyUniqueTaskRecordIds(result, "milestones", "Milestone");
-  assertGloballyUniqueTaskRecordIds(result, "events", "Task event");
-  assertGloballyUniqueTaskRecordIds(result, "messages", "Message");
   return result;
 }
 function parseStoredTask(value: unknown, taskId: string): StoredTask {
@@ -1251,6 +1336,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
   exact(aggregate as unknown as Record<string, unknown>, [
     "schemaVersion",
     "task",
+    "idHighWaterMarks",
     "brief",
     "changeSets",
     "integrationAttempts",
@@ -1293,7 +1379,8 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateIntegrationAttempt(attempt);
     return attempt;
   }, "integrationAttempts");
-  versioned(aggregate, 9, `Task aggregate ${taskId}`);
+  versioned(aggregate, 10, `Task aggregate ${taskId}`);
+  validateTaskIdHighWaterMarks(aggregate.idHighWaterMarks, taskId);
   validateTask(identified(aggregate.task, 2, "id", taskId, "Task"));
   if (aggregate.brief !== null) storedTaskBrief(aggregate.brief);
   parseMap(aggregate.roles, (record, key) => { const role = identified<TaskRole>(record, 2, "name", key, "Task Role"); if (role.taskId !== taskId) throw new StorageRecordError(`Task Role belongs to another Task: ${role.taskId}`); validateTaskRole(role); return role; }, "roles");
@@ -1307,7 +1394,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
   }, "roleWorkspaces");
   parseMap(aggregate.roleSessionSets, (record, key) => { const set = taskSessions(record); if (set.owner.taskId !== taskId || set.owner.roleName !== key) throw new StorageRecordError(`Task Role session set identity is inconsistent: ${taskId}/${key}`); return set; }, "roleSessionSets");
   parseMap(aggregate.workItems, (record, key) => {
-    const item = identified<WorkItem>(record, 5, "id", key, "Work item");
+    const item = identified<WorkItem>(record, 6, "id", key, "Work item");
     if (item.taskId !== taskId) {
       throw new StorageRecordError(`Work item belongs to another Task: ${item.taskId}`);
     }
@@ -1332,7 +1419,10 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     return pointer;
   }, "activeRuns");
   parseMap(aggregate.messages, (record, key) => {
-    const message = identified<TaskMessage>(record, 1, "id", key, "Message");
+    const message = identified<TaskMessage>(record, 2, "id", key, "Message");
+    if (message.taskId !== taskId) {
+      throw new StorageRecordError(`Message belongs to another Task: ${message.taskId}`);
+    }
     validateTaskMessage(message);
     return message;
   }, "messages");
@@ -1365,13 +1455,65 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
   parseMap(aggregate.events, (record, key) => {
     const event = storedTaskEvent(record);
     if (event.id !== key) throw new StorageRecordError(`Task event identity is inconsistent: ${key}.`);
+    if (event.taskId !== taskId) {
+      throw new StorageRecordError(`Task event belongs to another Task: ${event.taskId}`);
+    }
     return event;
   }, "events");
   for (const [key, label] of [["leaderFailure", "Leader failure"], ["operatorNotification", "Operator notification"]] as const) {
     const record = aggregate[key];
     if (record !== null) identified(record, 1, "taskId", taskId, label);
   }
+  validateTaskIdHighWaterCoverage(aggregate, taskId);
   return aggregate;
+}
+
+function validateTaskIdHighWaterCoverage(
+  aggregate: StoredTask,
+  taskId: string
+): void {
+  const records: Readonly<Record<TaskRecordKind, Readonly<Record<string, unknown>>>> = {
+    workItem: aggregate.workItems,
+    agentRun: aggregate.agentRuns,
+    reviewRound: aggregate.reviewRounds,
+    changeSet: aggregate.changeSets,
+    integrationAttempt: aggregate.integrationAttempts,
+    message: aggregate.messages,
+    inputRequest: aggregate.inputRequests,
+    decision: aggregate.decisions,
+    milestone: aggregate.milestones,
+    event: aggregate.events
+  };
+  for (const kind of Object.keys(TASK_RECORD_ID_PREFIXES) as TaskRecordKind[]) {
+    const pattern = new RegExp(`^${TASK_RECORD_ID_PREFIXES[kind]}-(\\d+)$`);
+    for (const id of Object.keys(records[kind])) {
+      const match = pattern.exec(id);
+      if (match === null) {
+        throw new StorageRecordError(`Task-local ${kind} id is invalid: ${taskId}/${id}.`);
+      }
+      const sequence = Number.parseInt(match[1]!, 10);
+      if (sequence > aggregate.idHighWaterMarks[kind]) {
+        throw new StorageRecordError(
+          `Task id high-water mark is behind ${taskId}/${kind}: ${id}.`
+        );
+      }
+    }
+  }
+}
+
+function observeTaskRecordId(
+  aggregate: StoredTask,
+  kind: TaskRecordKind,
+  id: string
+): void {
+  validateTaskRecordReference({ taskId: aggregate.task.id, localId: id }, kind);
+  const match = new RegExp(`^${TASK_RECORD_ID_PREFIXES[kind]}-(\\d+)$`).exec(id);
+  if (match === null) throw new StorageRecordError(`Task-local ${kind} id is invalid: ${id}.`);
+  const sequence = Number.parseInt(match[1]!, 10);
+  aggregate.idHighWaterMarks[kind] = Math.max(
+    aggregate.idHighWaterMarks[kind],
+    sequence
+  );
 }
 
 function validateYuiConfig(config: YuiConfig): void {
@@ -1489,6 +1631,7 @@ function storedDecision(value: unknown): Decision {
   }
   requireRecordIdentity(decision.id, "Decision id");
   requireRecordIdentity(decision.taskId, "Decision Task id");
+  validateTaskRecordReference({ taskId: decision.taskId, localId: decision.id }, "decision");
   requireNormalizedText(decision.title, "Decision title");
   requireNormalizedText(decision.rationale, "Decision rationale");
   requireTimestamp(decision.createdAt, "Decision createdAt");
@@ -1508,6 +1651,7 @@ function storedMilestone(value: unknown): Milestone {
   );
   requireRecordIdentity(milestone.id, "Milestone id");
   requireRecordIdentity(milestone.taskId, "Milestone Task id");
+  validateTaskRecordReference({ taskId: milestone.taskId, localId: milestone.id }, "milestone");
   requireNormalizedText(milestone.title, "Milestone title");
   requireNormalizedText(milestone.summary, "Milestone summary");
   if (milestone.createdBy !== "leader") {
@@ -1518,13 +1662,15 @@ function storedMilestone(value: unknown): Milestone {
 }
 
 function storedTaskEvent(value: unknown): TaskEvent {
-  const event = versioned<TaskEvent>(value, 1, "Task event");
+  const event = versioned<TaskEvent>(value, 2, "Task event");
   exact(
     event as unknown as Record<string, unknown>,
-    ["schemaVersion", "id", "type", "payload", "createdAt"],
+    ["schemaVersion", "id", "taskId", "type", "payload", "createdAt"],
     "Task event"
   );
   requireRecordIdentity(event.id, "Task event id");
+  requireRecordIdentity(event.taskId, "Task event Task id");
+  validateTaskRecordReference({ taskId: event.taskId, localId: event.id }, "event");
   requireNormalizedText(event.type, "Task event type");
   const payload = object(event.payload, "Task event payload");
   for (const [key, payloadValue] of Object.entries(payload)) {
@@ -1565,34 +1711,6 @@ function requireTaskFromState(state: StorageState, taskId: string): StoredTask {
   const aggregate = state.tasks[taskId];
   if (aggregate === undefined) throw new StorageRecordError(`Task not found: ${taskId}`);
   return aggregate;
-}
-
-function taskRecordOwner(
-  state: StorageState,
-  key: "decisions" | "milestones" | "events" | "messages" | "inputRequests",
-  id: string
-): string | null {
-  for (const [taskId, aggregate] of Object.entries(state.tasks)) {
-    if (aggregate[key][id] !== undefined) return taskId;
-  }
-  return null;
-}
-
-function assertGloballyUniqueTaskRecordIds(
-  state: StorageState,
-  key: "decisions" | "milestones" | "events" | "messages" | "inputRequests",
-  label: string
-): void {
-  const owners = new Map<string, string>();
-  for (const [taskId, aggregate] of Object.entries(state.tasks)) {
-    for (const id of Object.keys(aggregate[key])) {
-      const owner = owners.get(id);
-      if (owner !== undefined) {
-        throw new StorageRecordError(`${label} id is duplicated across Tasks: ${id} (${owner}, ${taskId}).`);
-      }
-      owners.set(id, taskId);
-    }
-  }
 }
 
 function requireRecordIdentity(value: unknown, label: string): string {
@@ -1646,17 +1764,7 @@ function identified<T>(value: unknown, schemaVersion: number, key: string, expec
   return record as T;
 }
 function identifiedChangeSet(value: unknown, expectedId: string): ChangeSet {
-  const record = object(value, "ChangeSet");
-  if (record.schemaVersion !== 1 && record.schemaVersion !== 2) {
-    throw new StorageRecordError("ChangeSet must use schemaVersion 1 or 2.");
-  }
-  return identified<ChangeSet>(
-    value,
-    record.schemaVersion,
-    "id",
-    expectedId,
-    "ChangeSet"
-  );
+  return identified<ChangeSet>(value, 2, "id", expectedId, "ChangeSet");
 }
 function object(value: unknown, label: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new StorageRecordError(`${label} must be an object.`);
@@ -1723,7 +1831,8 @@ function validateMailboxReferences(state: StorageState, mailbox: WorkMailbox): v
   if (mailbox.pending !== null) refs.push(...mailbox.pending.refs);
   for (const ref of refs) {
     if (!mailboxReferenceExists(state, ref)) {
-      throw new StorageRecordError(`WorkMailbox reference does not exist: ${ref.type}/${ref.id}`);
+      const identity = "taskId" in ref ? `${ref.taskId}/${ref.id}` : ref.id;
+      throw new StorageRecordError(`WorkMailbox reference does not exist: ${ref.type}/${identity}`);
     }
   }
 }
@@ -1750,6 +1859,65 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
         candidate,
         `Work Item candidate ${item.id}`
       );
+    }
+  }
+  for (const workspace of Object.values(aggregate.roleWorkspaces)) {
+    if (workspace.owner.type === "work-item"
+      && aggregate.workItems[workspace.owner.workItemId] === undefined) {
+      throw new StorageRecordError(
+        `RoleWorkspace Work Item not found: ${taskId}/${workspace.owner.workItemId}.`
+      );
+    }
+  }
+  for (const [roleName, sessions] of Object.entries(aggregate.roleSessionSets)) {
+    if (sessions.inFlight !== null) {
+      const run = aggregate.agentRuns[sessions.inFlight.runId];
+      if (run === undefined || run.roleName !== roleName
+        || sessions.inFlight.receiptId !== formatAgentRunReceiptId(taskId, run.id)) {
+        throw new StorageRecordError(`Task Role in-flight Run is invalid: ${taskId}/${roleName}.`);
+      }
+    }
+    if (sessions.pendingTurnCompletion !== null) {
+      const completion = sessions.pendingTurnCompletion;
+      const run = aggregate.agentRuns[completion.runId];
+      if (completion.taskId !== taskId || run === undefined || run.roleName !== roleName) {
+        throw new StorageRecordError(
+          `Task Role pending completion Run is invalid: ${taskId}/${roleName}.`
+        );
+      }
+    }
+  }
+  for (const run of Object.values(aggregate.agentRuns)) {
+    if (run.workItemId !== undefined && aggregate.workItems[run.workItemId] === undefined) {
+      throw new StorageRecordError(`Agent Run Work Item not found: ${taskId}/${run.id}.`);
+    }
+    if (run.reviewRoundId !== undefined
+      && aggregate.reviewRounds[run.reviewRoundId] === undefined) {
+      throw new StorageRecordError(`Agent Run ReviewRound not found: ${taskId}/${run.id}.`);
+    }
+  }
+  for (const message of Object.values(aggregate.messages)) {
+    if (message.runId !== undefined && aggregate.agentRuns[message.runId] === undefined) {
+      throw new StorageRecordError(`Message Run not found: ${taskId}/${message.id}.`);
+    }
+    if (message.workItemId !== undefined
+      && aggregate.workItems[message.workItemId] === undefined) {
+      throw new StorageRecordError(`Message Work Item not found: ${taskId}/${message.id}.`);
+    }
+  }
+  for (const request of Object.values(aggregate.inputRequests)) {
+    if (aggregate.agentRuns[request.requester.runId] === undefined) {
+      throw new StorageRecordError(`Input requester Run not found: ${taskId}/${request.id}.`);
+    }
+    for (const reference of request.blockedRefs) {
+      const found = reference.type === "run"
+        ? aggregate.agentRuns[reference.id]
+        : aggregate.workItems[reference.id];
+      if (found === undefined) {
+        throw new StorageRecordError(
+          `Input blocked ${reference.type} not found: ${taskId}/${request.id}/${reference.id}.`
+        );
+      }
     }
   }
   for (const round of Object.values(aggregate.reviewRounds)) {
@@ -1843,47 +2011,26 @@ function assertAcyclicWorkItems(items: Readonly<Record<string, WorkItem>>): void
 }
 
 function mailboxReferenceExists(state: StorageState, ref: MailboxEntityRef): boolean {
+  if ("taskId" in ref) {
+    const aggregate = state.tasks[ref.taskId];
+    if (aggregate === undefined) return false;
+    switch (ref.type) {
+      case "run": return aggregate.agentRuns[ref.id] !== undefined;
+      case "work-item": return aggregate.workItems[ref.id] !== undefined;
+      case "input": return aggregate.inputRequests[ref.id] !== undefined;
+      case "message": return aggregate.messages[ref.id] !== undefined;
+    }
+  }
   switch (ref.type) {
     case "task": return state.tasks[ref.id] !== undefined;
-    case "run": return Object.values(state.tasks).some((task) => task.agentRuns[ref.id] !== undefined);
-    case "work-item": return Object.values(state.tasks).some((task) => task.workItems[ref.id] !== undefined);
-    case "input": return Object.values(state.tasks).some((task) => task.inputRequests[ref.id] !== undefined);
-    case "message": return Object.values(state.tasks).some((task) => task.messages[ref.id] !== undefined);
     case "session":
       return [
         ...Object.values(state.globalRoleSessionSets),
         ...Object.values(state.tasks).flatMap((task) => Object.values(task.roleSessionSets))
       ].some((set) => Object.values(set.sessions).some((session) => session.nativeSessionId === ref.id));
+    default: return false;
   }
 }
-function allKeys<K extends
-  | "workItems"
-  | "agentRuns"
-  | "reviewRounds"
-  | "changeSets"
-  | "integrationAttempts"
-  | "messages"
-  | "inputRequests"
-  | "decisions"
-  | "milestones"
-  | "events"
->(state: StorageState, key: K): string[] {
-  return Object.values(state.tasks).flatMap((task) => Object.keys(task[key]));
-}
-function findUnique(state: StorageState, key: "workItems", id: string, label: string): WorkItem | null;
-function findUnique(state: StorageState, key: "agentRuns", id: string, label: string): AgentRun | null;
-function findUnique(state: StorageState, key: "inputRequests", id: string, label: string): InputRequest | null;
-function findUnique(
-  state: StorageState,
-  key: "workItems" | "agentRuns" | "inputRequests",
-  id: string,
-  label: string
-): WorkItem | AgentRun | InputRequest | null {
-  const matches = Object.values(state.tasks).flatMap((task) => task[key][id] === undefined ? [] : [task[key][id]]);
-  if (matches.length > 1) throw new StorageRecordError(`${label} id is ambiguous: ${id}`);
-  return matches[0] === undefined ? null : clone(matches[0]);
-}
-
 function validWorkItemTransition(existing: WorkItem, candidate: WorkItem): boolean {
   if (isDeepStrictEqual(existing, candidate)) return true;
   if (

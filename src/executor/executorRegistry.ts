@@ -231,11 +231,19 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
   }>): Promise<"sent" | "already-sent" | "busy" | "unavailable"> {
     const prepared = this.requirePrepared(input.delivery.prepared);
     if (prepared.binding !== undefined && this.runtimePorts !== undefined) {
+      const runId = input.delivery.prepared.runId;
+      if (runId === undefined) {
+        throw new Error("Runtime prompt delivery requires a Task-local Run id.");
+      }
       const outcome = await this.runtimePorts.promptPush.tryPush({
         binding: prepared.binding,
         envelope: createPromptEnvelope({
           id: input.receiptId,
-          source: { kind: "agent-run", id: input.receiptId },
+          source: {
+            kind: "agent-run",
+            taskId: input.delivery.prepared.taskId,
+            localId: runId
+          },
           text: input.text,
           createdAt: new Date()
         })

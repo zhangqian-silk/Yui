@@ -37,6 +37,7 @@ import {
   type RuntimeRoleOwner
 } from "../runtime/lifecycleReservation.js";
 import type { SessionHostPort } from "../runtime/ports.js";
+import { formatTaskRecordReference } from "../task/taskRecordReference.js";
 import type { RuntimeEventProcessorPort } from "./runtimeEventProcessor.js";
 
 const DEFAULT_RECONCILIATION_INTERVAL_MS = reconciliationIntervalMilliseconds();
@@ -56,7 +57,7 @@ type RuntimeLifecycleHost = Pick<
 export type ControllerSchedulerResult = Readonly<{
   stoppedArchivedTaskIds: readonly string[];
   activeRunDeliveries: readonly ActiveRoleRunDeliveryResult[];
-  failedRunIds: readonly string[];
+  failedRunRefs: readonly string[];
   wakeups: readonly LeaderWakeupProcessingResult[];
   inputNotifications: readonly OperatorInputNotificationResult[];
   autoResolvedInputs: readonly AutoResolvedInput[];
@@ -149,16 +150,18 @@ export async function runControllerSchedulerPass(
     const activeRunDeliveries = await processActiveRoleRunDeliveries(
       store, delivery, now, roleSelection
     );
-    const uncertainRunIds = new Set(activeRunDeliveries.flatMap((result) => (
-      result.reason === "delivery-uncertain" ? [result.runId] : []
+    const uncertainRunRefs = new Set(activeRunDeliveries.flatMap((result) => (
+      result.reason === "delivery-uncertain"
+        ? [formatTaskRecordReference(result.taskId, result.runId, "agentRun")]
+        : []
     )));
     resolveDueRuntimeTurnCompletions(store, delivery, selection, now);
-    const failedRunIds = await reconcileExitedRoleRuns(
+    const failedRunRefs = await reconcileExitedRoleRuns(
       store,
       delivery,
       now,
       roleSelection,
-      uncertainRunIds
+      uncertainRunRefs
     );
     await reconcileDormantRuntimeOwners(
       store,
@@ -186,7 +189,7 @@ export async function runControllerSchedulerPass(
     return {
       stoppedArchivedTaskIds,
       activeRunDeliveries,
-      failedRunIds,
+      failedRunRefs,
       wakeups,
       inputNotifications,
       autoResolvedInputs
@@ -392,7 +395,11 @@ function resolveDueRuntimeTurnCompletions(
   );
   if (finalized.size === 0) return;
   for (const completion of candidates) {
-    if (!finalized.has(completion.runId)) continue;
+    if (!finalized.has(formatTaskRecordReference(
+      completion.taskId,
+      completion.runId,
+      "agentRun"
+    ))) continue;
     delivery.forgetPrepared?.({
       taskId: completion.taskId,
       roleName: completion.roleName,
@@ -922,7 +929,7 @@ export class FileTaskController {
     let result: ControllerSchedulerResult = {
       stoppedArchivedTaskIds: [],
       activeRunDeliveries: [],
-      failedRunIds: [],
+      failedRunRefs: [],
       wakeups: [],
       inputNotifications: [],
       autoResolvedInputs: []

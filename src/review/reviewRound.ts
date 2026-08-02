@@ -3,6 +3,7 @@ import {
   requireText,
   requireTimestamp
 } from "../domain/validation.js";
+import { validateTaskRecordReference } from "../task/taskRecordReference.js";
 export type ReviewRoundStatus = "pending" | "running" | "completed" | "failed";
 export type ReviewRequestSource = "policy" | "leader";
 
@@ -78,17 +79,21 @@ export function finishReviewRound(
 
 export function validateReviewRound(round: ReviewRound): ReviewRound {
   if (round.schemaVersion !== 2) throw new Error("ReviewRound must use schemaVersion 2.");
-  requireIdentity(round.id, "ReviewRound id");
-  requireIdentity(round.taskId, "Task id");
-  requireIdentity(round.workItemId, "Work Item id");
-  requireIdentity(round.candidateId, "Candidate id");
+  validateTaskRecordReference({ taskId: round.taskId, localId: round.id }, "reviewRound");
+  validateTaskRecordReference({ taskId: round.taskId, localId: round.workItemId }, "workItem");
+  if (!/^candidate-[1-9]\d*$/.test(round.candidateId)) {
+    throw new Error(`Candidate local id is invalid: ${round.candidateId}.`);
+  }
   requireIdentity(round.reviewerRoleName, "Reviewer Role");
   validateReviewRequestSource(round.requestedBy);
   if (!["pending", "running", "completed", "failed"].includes(round.status)) {
     throw new Error(`ReviewRound status is invalid: ${String(round.status)}.`);
   }
   if (round.reviewerRunId !== undefined) {
-    requireIdentity(round.reviewerRunId, "Reviewer Run id");
+    validateTaskRecordReference({
+      taskId: round.taskId,
+      localId: round.reviewerRunId
+    }, "agentRun");
   }
   requireTimestamp(round.createdAt, "ReviewRound createdAt");
   const terminal = round.status === "completed" || round.status === "failed";

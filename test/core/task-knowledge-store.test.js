@@ -50,7 +50,7 @@ test("TaskBrief is one replaceable snapshot that can be cleared and reloaded", (
   assert.equal(new FileTaskStore(root).getTaskBrief("task-1"), null);
 });
 
-test("Decision IDs are generated globally and only allow active to superseded updates", (t) => {
+test("Decision IDs are generated per Task and only allow active to superseded updates", (t) => {
   const { root, store } = fixture(t);
   const decision = createDecision(
     store.nextDecisionId("task-1"),
@@ -61,7 +61,7 @@ test("Decision IDs are generated globally and only allow active to superseded up
   );
   store.saveDecision("task-1", decision);
 
-  assert.equal(store.nextDecisionId("task-2"), "decision-2");
+  assert.equal(store.nextDecisionId("task-2"), "decision-1");
   const invalidInitialState = supersedeDecision(
     createDecision("decision-2", "task-2", "Already stale", "Invalid initial state", NOW),
     "No active record was persisted",
@@ -106,7 +106,7 @@ test("Milestones are append-only and enforce Task ownership", (t) => {
   );
   store.saveMilestone("task-1", milestone);
 
-  assert.equal(store.nextMilestoneId("task-2"), "milestone-2");
+  assert.equal(store.nextMilestoneId("task-2"), "milestone-1");
   assert.deepEqual(new FileTaskStore(root).listMilestones("task-1"), [milestone]);
   assert.throws(
     () => store.saveMilestone("task-1", { ...milestone, summary: "Overwritten" }),
@@ -122,13 +122,14 @@ test("TaskEvent persistence is truly append-only", (t) => {
   const { root, store } = fixture(t);
   const event = createTaskEvent(
     store.nextEventId("task-1"),
+    "task-1",
     "task.created",
     { status: "draft" },
     NOW
   );
   store.saveEvent("task-1", event);
 
-  assert.equal(store.nextEventId("task-2"), "event-2");
+  assert.equal(store.nextEventId("task-2"), "event-1");
   assert.deepEqual(new FileTaskStore(root).listEvents("task-1"), [event]);
   assert.throws(
     () => store.saveEvent("task-1", { ...event, type: "task.activated" }),

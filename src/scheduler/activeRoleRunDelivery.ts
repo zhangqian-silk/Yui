@@ -11,6 +11,7 @@ import {
   selectedSchedulerTasks,
   type SchedulerReconcileSelection
 } from "./ports.js";
+import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 
 export type ActiveRoleRunDeliveryResult = Readonly<{
   taskId: string;
@@ -52,14 +53,14 @@ export async function processActiveRoleRunDeliveries(
       }
 
       const existingSession = store.getRoleSession(task.id, role.name);
-      const receiptId = `agent-run:${run.id}`;
+      const receiptId = formatAgentRunReceiptId(task.id, run.id);
       const target = { kind: "role", taskId: task.id, roleName: role.name } as const;
       const claim = store.claimWorkMailbox({
         target,
         batchId: receiptId,
         owner: "controller",
         now,
-        executionRef: { type: "run", id: run.id }
+        executionRef: { type: "run", taskId: task.id, id: run.id }
       });
       if (claim.status === "empty") {
         results.push({
@@ -72,7 +73,11 @@ export async function processActiveRoleRunDeliveries(
         continue;
       }
       const processing = claim.processing;
-      if (processing.executionRef?.type !== "run" || processing.executionRef.id !== run.id) {
+      if (
+        processing.executionRef?.type !== "run"
+        || processing.executionRef.taskId !== task.id
+        || processing.executionRef.id !== run.id
+      ) {
         results.push({
           taskId: task.id,
           roleName: role.name,

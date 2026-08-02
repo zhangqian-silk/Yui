@@ -79,6 +79,10 @@ import {
   type TaskProjectBinding,
   type TaskPriority
 } from "../task/task.js";
+import {
+  formatAgentRunReceiptId,
+  resolveTaskRecordReference
+} from "../task/taskRecordReference.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { AgentProfile } from "../profile/agentProfile.js";
 import { resolveProject, type Project } from "../repository/project.js";
@@ -372,7 +376,7 @@ export function submitOperatorMessage(
       assertTaskOpen(task);
       const message = appendMessage(tx, task.id, body, "operator", { type: "operator" }, now);
       if (task.status === "active") {
-        enqueueWork(tx, leaderMailbox(task.id), "operator-input", now, [messageRef(message.id)]);
+        enqueueWork(tx, leaderMailbox(task.id), "operator-input", now, [messageRef(task.id, message.id)]);
       }
       return { task, message, created: false } as const;
     }
@@ -696,7 +700,7 @@ function completeTaskCommand(
       requireCompleteWorkExecution(
         tx,
         roleMailbox(task.id, LEADER_ROLE),
-        runRef(leaderEntry.run.id)
+        runRef(task.id, leaderEntry.run.id)
       );
       tx.clearActiveAgentRun(task.id, LEADER_ROLE);
       tx.saveRole(task.id, updateRoleStatus(leaderEntry.role, "idle", now));
@@ -706,7 +710,7 @@ function completeTaskCommand(
           terminalizeTaskRoleRunSession(sessions, {
             agentId: leaderEntry.role.activeAgentId,
             runId: leaderEntry.run.id,
-            receiptId: `agent-run:${leaderEntry.run.id}`
+            receiptId: formatAgentRunReceiptId(task.id, leaderEntry.run.id)
           }, now)
         );
       }
@@ -804,7 +808,7 @@ function archiveTaskCommand(
         tx.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(sessions, {
           agentId: role.activeAgentId,
           runId: activeRun.id,
-          receiptId: `agent-run:${activeRun.id}`
+          receiptId: formatAgentRunReceiptId(task.id, activeRun.id)
         }, now));
       }
       if (failed.workItemId !== undefined) {
@@ -891,7 +895,7 @@ function taskMessageCommand(
       assertTaskOpen(task);
       const message = appendMessage(tx, task.id, body, "user", { type: "user" }, now);
       if (task.status === "active") {
-        enqueueWork(tx, leaderMailbox(task.id), "user-message", now, [messageRef(message.id)]);
+        enqueueWork(tx, leaderMailbox(task.id), "user-message", now, [messageRef(task.id, message.id)]);
       }
       return { task, message };
     });
@@ -1369,7 +1373,7 @@ function createWork(
       ...(parsed.role === undefined ? {} : { assignee: parsed.role })
     }, now);
     tx.saveWorkItem(task.id, created);
-    enqueueWork(tx, taskMailbox(task.id), "work-created", now, [workItemRef(created.id)]);
+    enqueueWork(tx, taskMailbox(task.id), "work-created", now, [workItemRef(task.id, created.id)]);
     return created;
   });
   notifyMailbox(options.runtime, taskMailbox(item.taskId), item.taskId);
@@ -1381,7 +1385,7 @@ function updateWorkScope(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task work scope usage: yui task work scope <work> [--project <project> ...].";
+  const usage = "Task work scope usage: yui task work scope <task>/<work> [--project <project> ...].";
   const parsed = parseMultiValueTail(
     args,
     new Set(),
@@ -1391,7 +1395,7 @@ function updateWorkScope(
   exactPositionals(parsed.positionals, 1, usage);
   const now = clock(options);
   const updated = store.transaction((tx) => {
-    const item = requireWorkItem(tx, parsed.positionals[0]);
+    const item = requireWorkItem(tx, parsed.positionals[0], options);
     const task = requireTask(tx, item.taskId);
     if (taskActor(options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may change a Work Item Project scope.");
@@ -1418,7 +1422,7 @@ function updateWorkScope(
       workItemId: item.id,
       projectIds: projectIds.join(",")
     }, now);
-    enqueueWork(tx, taskMailbox(task.id), "work-scope-updated", now, [workItemRef(item.id)]);
+    enqueueWork(tx, taskMailbox(task.id), "work-scope-updated", now, [workItemRef(task.id, item.id)]);
     return { item: next, changed: true } as const;
   });
   if (updated.changed) {
@@ -1436,7 +1440,7 @@ function updateWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task work update usage: yui task work update <id> <todo|running|done|failed|cancelled|superseded> [--summary <text>].";
+  const usage = "Task work update usage: yui task work update <task>/<work> <todo|running|done|failed|cancelled|superseded> [--summary <text>].";
   const parsed = parseTail(args, new Set(["--summary"]), usage);
   exactPositionals(parsed.positionals, 2, usage);
   const requested = parsed.positionals[1];
@@ -1448,7 +1452,7 @@ function updateWork(
   }
   const now = clock(options);
   const result = store.transaction((tx) => {
-    const current = requireWorkItem(tx, parsed.positionals[0]);
+    const current = requireWorkItem(tx, parsed.positionals[0], options);
     const task = requireTask(tx, current.taskId);
     assertTaskOpen(task);
     if (current.assignee === undefined) {
@@ -1490,7 +1494,7 @@ function updateWork(
         }, now);
       }
       enqueueWork(tx, taskMailbox(task.id), "work-updated", now, [
-        workItemRef(updated.id)
+        workItemRef(task.id, updated.id)
       ]);
       const reviewDispatch = reviewConfig?.trigger === "always"
         ? queueReviewRound(
@@ -1514,7 +1518,7 @@ function updateWork(
     ) {
       const updated = updateWorkItemStatus(current, status, now, summary);
       tx.saveWorkItem(task.id, updated);
-      enqueueWork(tx, taskMailbox(task.id), "work-updated", now, [workItemRef(updated.id)]);
+      enqueueWork(tx, taskMailbox(task.id), "work-updated", now, [workItemRef(task.id, updated.id)]);
       return { item: updated, reviewDispatch: null, reviewTrigger: null };
     }
     throw usageError(
@@ -1549,12 +1553,12 @@ function dispatchWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task work dispatch usage: yui task work dispatch <id> [--input <text>].";
+  const usage = "Task work dispatch usage: yui task work dispatch <task>/<work> [--input <text>].";
   const parsed = parseTail(args, new Set(["--input"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
   const now = clock(options);
   const run = store.transaction((tx) => {
-    const item = requireWorkItem(tx, parsed.positionals[0]);
+    const item = requireWorkItem(tx, parsed.positionals[0], options);
     const task = requireTask(tx, item.taskId);
     if (task.status !== "active") {
       throw usageError(inactiveTaskMessage(task, "dispatch"));
@@ -1654,8 +1658,8 @@ function dispatchWork(
       : updateWorkItemStatus(item, "running", now));
     tx.saveRole(task.id, updateRoleStatus(role, "running", now));
     enqueueWork(tx, roleMailbox(task.id, role.name), "run-dispatched", now, [
-      runRef(created.id),
-      workItemRef(item.id)
+      runRef(task.id, created.id),
+      workItemRef(task.id, item.id)
     ]);
     return created;
   });
@@ -1668,13 +1672,13 @@ function acceptWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task work accept usage: yui task work accept <work> --summary <text>.";
+  const usage = "Task work accept usage: yui task work accept <task>/<work> --summary <text>.";
   const parsed = parseTail(args, new Set(["--summary"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
   const summary = requiredOption(parsed.options, "--summary");
   const now = clock(options);
   const accepted = store.transaction((tx) => {
-    const item = requireWorkItem(tx, parsed.positionals[0]);
+    const item = requireWorkItem(tx, parsed.positionals[0], options);
     const task = requireTask(tx, item.taskId);
     if (task.status !== "active") {
       throw usageError(`Task is not active: ${task.id}/${task.status}.`);
@@ -1687,7 +1691,8 @@ function acceptWork(
     }
     const candidate = requireWorkItemCandidate(item);
     const latestReview = chronologicalReviewRounds(tx.listReviewRounds(item.taskId)
-      .filter((round) => round.candidateId === candidate.id)).at(-1);
+      .filter((round) => round.workItemId === item.id
+        && round.candidateId === candidate.id)).at(-1);
     if (latestReview !== undefined
       && (latestReview.status === "pending" || latestReview.status === "running")) {
       throw usageError(
@@ -1797,13 +1802,13 @@ function rejectWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task work reject usage: yui task work reject <work> --summary <text>.";
+  const usage = "Task work reject usage: yui task work reject <task>/<work> --summary <text>.";
   const parsed = parseTail(args, new Set(["--summary"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
   const summary = requiredOption(parsed.options, "--summary");
   const now = clock(options);
   const rejected = store.transaction((tx) => {
-    const item = requireWorkItem(tx, parsed.positionals[0]);
+    const item = requireWorkItem(tx, parsed.positionals[0], options);
     const task = requireTask(tx, item.taskId);
     if (task.status !== "active") {
       throw usageError(`Task is not active: ${task.id}/${task.status}.`);
@@ -1837,13 +1842,13 @@ function cancelWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task work cancel usage: yui task work cancel <work> --summary <text>.";
+  const usage = "Task work cancel usage: yui task work cancel <task>/<work> --summary <text>.";
   const parsed = parseTail(args, new Set(["--summary"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
   const summary = requiredOption(parsed.options, "--summary");
   const now = clock(options);
   const result = store.transaction((tx) => {
-    const item = requireWorkItem(tx, parsed.positionals[0]);
+    const item = requireWorkItem(tx, parsed.positionals[0], options);
     const task = requireTask(tx, item.taskId);
     if (task.status !== "active") {
       throw usageError(`Task is not active: ${task.id}/${task.status}.`);
@@ -1872,7 +1877,7 @@ function cancelWork(
     }, now);
     if (actor !== "leader") {
       enqueueWork(tx, leaderMailbox(task.id), "work-cancelled", now, [
-        workItemRef(item.id)
+        workItemRef(task.id, item.id)
       ]);
     }
     return { item: cancelled, notifyLeader: actor !== "leader" };
@@ -1919,10 +1924,10 @@ function reviewWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  exactPositionals(args, 1, "Task work review usage: yui task work review <work>.");
+  exactPositionals(args, 1, "Task work review usage: yui task work review <task>/<work>.");
   const now = clock(options);
   const result = store.transaction((tx) => {
-    const item = requireWorkItem(tx, args[0]);
+    const item = requireWorkItem(tx, args[0], options);
     const task = requireTask(tx, item.taskId);
     if (task.status !== "active") {
       throw usageError(`Task is not active: ${task.id}/${task.status}.`);
@@ -1940,7 +1945,8 @@ function reviewWork(
     }
     const activeRound = chronologicalReviewRounds(tx.listReviewRounds(task.id)
       .filter((round) => (
-        round.candidateId === candidate.id
+        round.workItemId === item.id
+        && round.candidateId === candidate.id
         && (round.status === "pending" || round.status === "running")
       ))).at(-1);
     if (activeRound !== undefined) {
@@ -1966,7 +1972,7 @@ function taskRunCommand(
   options: TaskCommandOptions
 ): string {
   const [command, ...rest] = args;
-  if (command === "list") return listRuns(rest, store);
+  if (command === "list") return listRuns(rest, store, options);
   if (command === "retry") return retryRun(rest, store, options);
   if (command === "yield") return yieldRun(rest, store, options);
   throw usageError(command === undefined
@@ -1974,9 +1980,13 @@ function taskRunCommand(
     : `Unknown command: task run ${command}`);
 }
 
-function listRuns(args: string[], store: TaskWorkflowStore): string {
-  exactPositionals(args, 1, "Task run list usage: yui task run list <work>.");
-  const item = requireWorkItem(store, args[0]);
+function listRuns(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  exactPositionals(args, 1, "Task run list usage: yui task run list <task>/<work>.");
+  const item = requireWorkItem(store, args[0], options);
   const runs = store.listAgentRuns(item.taskId).filter((run) => run.workItemId === item.id);
   if (runs.length === 0) return "No runs found.\n";
   return `${renderTable(
@@ -2006,10 +2016,10 @@ function retryRun(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  exactPositionals(args, 1, "Task run retry usage: yui task run retry <run>.");
+  exactPositionals(args, 1, "Task run retry usage: yui task run retry <task>/<run>.");
   const now = clock(options);
   const retried = store.transaction((tx) => {
-    const previous = requireRun(tx, args[0]);
+    const previous = requireRun(tx, args[0], options);
     if (previous.status !== "failed") {
       throw usageError(`Run ${previous.id} is not retryable from ${previous.status}.`);
     }
@@ -2064,7 +2074,7 @@ function retryRun(
       }
       tx.saveWorkItem(task.id, retryFailedWorkItem(item, now));
     }
-    enqueueWork(tx, roleMailbox(task.id, role.name), "run-retried", now, [runRef(created.id)]);
+    enqueueWork(tx, roleMailbox(task.id, role.name), "run-retried", now, [runRef(task.id, created.id)]);
     return created;
   });
   notifyMailbox(options.runtime, roleMailbox(retried.taskId, retried.roleName), retried.taskId);
@@ -2076,7 +2086,7 @@ function yieldRun(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task run yield usage: yui task run yield <run> (--summary <text>|--summary-file <path|->).";
+  const usage = "Task run yield usage: yui task run yield <task>/<run> (--summary <text>|--summary-file <path|->).";
   const parsed = parseTail(args, new Set(["--summary", "--summary-file"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
   const summary = readCommandText(
@@ -2087,7 +2097,7 @@ function yieldRun(
   );
   const now = clock(options);
   const yielded = store.transaction((tx) => {
-    const active = requireRun(tx, parsed.positionals[0]);
+    const active = requireRun(tx, parsed.positionals[0], options);
     if (active.status !== "active") {
       throw usageError(`Run ${active.id} is already terminal: ${active.status}.`);
     }
@@ -2113,7 +2123,7 @@ function yieldRun(
     requireCompleteWorkExecution(
       tx,
       roleMailbox(task.id, role.name),
-      runRef(terminal.id)
+      runRef(task.id, terminal.id)
     );
     tx.clearActiveAgentRun(task.id, role.name);
     let automaticReview: Readonly<{
@@ -2151,7 +2161,7 @@ function yieldRun(
       tx.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(sessions, {
         agentId: role.activeAgentId,
         runId: active.id,
-        receiptId: `agent-run:${active.id}`
+        receiptId: formatAgentRunReceiptId(task.id, active.id)
       }, now));
     }
     const reviewDispatch = automaticReview === null
@@ -2173,9 +2183,9 @@ function yieldRun(
           : "candidate-ready";
     if (leaderHandoff !== null) {
       enqueueWork(tx, leaderMailbox(task.id), leaderHandoff, now, [
-        runRef(terminal.id),
-        messageRef(message.id),
-        ...(terminal.workItemId === undefined ? [] : [workItemRef(terminal.workItemId)])
+        runRef(task.id, terminal.id),
+        messageRef(task.id, message.id),
+        ...(terminal.workItemId === undefined ? [] : [workItemRef(task.id, terminal.workItemId)])
       ]);
     }
     return {
@@ -2307,8 +2317,8 @@ function queueReviewRound(
   store.saveActiveAgentRun(run);
   store.saveRole(item.taskId, updateRoleStatus(reviewer, "running", now));
   enqueueWork(store, roleMailbox(item.taskId, reviewer.name), "review-requested", now, [
-    runRef(run.id),
-    workItemRef(item.id)
+    runRef(item.taskId, run.id),
+    workItemRef(item.taskId, item.id)
   ]);
   return { round: running, run };
 }
@@ -2347,7 +2357,8 @@ function activeReviewRoundForCandidate(
   candidate: WorkItemCandidate
 ): ReviewRound | undefined {
   return chronologicalReviewRounds(store.listReviewRounds(item.taskId)
-    .filter((round) => round.candidateId === candidate.id
+    .filter((round) => round.workItemId === item.id
+      && round.candidateId === candidate.id
       && (round.status === "pending" || round.status === "running")))
     .at(-1);
 }
@@ -2408,7 +2419,9 @@ function appendMessage(
   now: Date,
   context: TaskMessageContext = {}
 ): TaskMessage {
-  const message = createTaskMessage(store.nextMessageId(taskId), body, kind, author, now, context);
+  const message = createTaskMessage(
+    store.nextMessageId(taskId), taskId, body, kind, author, now, context
+  );
   store.saveMessage(taskId, message);
   recordTaskEvent(store, taskId, "message.sent", { messageId: message.id, kind: message.kind }, now);
   return message;
@@ -2421,7 +2434,9 @@ function recordTaskEvent(
   payload: TaskEventPayload,
   now: Date
 ): void {
-  store.saveEvent(taskId, createTaskEvent(store.nextEventId(taskId), type, payload, now));
+  store.saveEvent(taskId, createTaskEvent(
+    store.nextEventId(taskId), taskId, type, payload, now
+  ));
 }
 
 function requireTask(store: TaskWorkflowStore, taskId: string | undefined): Task {
@@ -2451,18 +2466,59 @@ function requireAgent(store: TaskWorkflowStore, agentId: string | undefined): Co
   return agent;
 }
 
-function requireWorkItem(store: TaskWorkflowStore, workItemId: string | undefined): WorkItem {
-  const id = requiredText(workItemId, "Work item id");
-  const item = store.findWorkItem(id);
-  if (item === null) throw usageError(`Work item not found: ${id}.`);
+function requireWorkItem(
+  store: TaskWorkflowStore,
+  workItemId: string | undefined,
+  options: TaskCommandOptions
+): WorkItem {
+  const reference = taskRecordReference(
+    workItemId,
+    "workItem",
+    "Work Item reference",
+    options
+  );
+  const item = store.getWorkItem(reference.taskId, reference.localId);
+  if (item === null) {
+    throw usageError(`Work Item not found: ${reference.taskId}/${reference.localId}.`);
+  }
   return item;
 }
 
-function requireRun(store: TaskWorkflowStore, runId: string | undefined): AgentRun {
-  const id = requiredText(runId, "Run id");
-  const run = store.findAgentRun(id);
-  if (run === null) throw usageError(`Run not found: ${id}.`);
+function requireRun(
+  store: TaskWorkflowStore,
+  runId: string | undefined,
+  options: TaskCommandOptions
+): AgentRun {
+  const reference = taskRecordReference(
+    runId,
+    "agentRun",
+    "Agent Run reference",
+    options
+  );
+  const run = store.getAgentRun(reference.taskId, reference.localId);
+  if (run === null) {
+    throw usageError(`Agent Run not found: ${reference.taskId}/${reference.localId}.`);
+  }
   return run;
+}
+
+function taskRecordReference(
+  value: string | undefined,
+  kind: "workItem" | "agentRun",
+  label: string,
+  options: TaskCommandOptions
+) {
+  try {
+    return resolveTaskRecordReference(requiredText(value, label), {
+      kind,
+      label,
+      ...(options.environment?.YUI_TASK_ID === undefined
+        ? {}
+        : { contextTaskId: options.environment.YUI_TASK_ID })
+    });
+  } catch (error) {
+    throw usageError(error instanceof Error ? error.message : String(error));
+  }
 }
 
 function assertWorkItemDependenciesCompleted(
@@ -2470,8 +2526,8 @@ function assertWorkItemDependenciesCompleted(
   item: WorkItem
 ): void {
   for (const dependencyId of item.dependsOn) {
-    const dependency = requireWorkItem(store, dependencyId);
-    if (dependency.taskId !== item.taskId || dependency.status !== "completed") {
+    const dependency = store.getWorkItem(item.taskId, dependencyId);
+    if (dependency === null || dependency.status !== "completed") {
       throw usageError(`Work Item dependency is not completed: ${dependencyId}.`);
     }
   }
@@ -3093,16 +3149,16 @@ function taskRef(id: string): MailboxEntityRef {
   return { type: "task", id };
 }
 
-function runRef(id: string): MailboxEntityRef {
-  return { type: "run", id };
+function runRef(taskId: string, id: string): MailboxEntityRef {
+  return { type: "run", taskId, id };
 }
 
-function workItemRef(id: string): MailboxEntityRef {
-  return { type: "work-item", id };
+function workItemRef(taskId: string, id: string): MailboxEntityRef {
+  return { type: "work-item", taskId, id };
 }
 
-function messageRef(id: string): MailboxEntityRef {
-  return { type: "message", id };
+function messageRef(taskId: string, id: string): MailboxEntityRef {
+  return { type: "message", taskId, id };
 }
 
 function notifyMailbox(

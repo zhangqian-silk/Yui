@@ -177,13 +177,13 @@ test("workspace migration retires only after every bound native session is stopp
 test("restored persistent domain records are plain JSON with explicit schema versions", () => {
   const task = createTask("task-1", "Restore models", now);
   const workItem = createWorkItem(
-    "work-1",
+    "work-item-1",
     task.id,
     { title: "Implement", assignee: "worker" },
     now
   );
   const run = createAgentRun(
-    "run-1",
+    "agent-run-1",
     task.id,
     "worker",
     "new",
@@ -196,7 +196,7 @@ test("restored persistent domain records are plain JSON with explicit schema ver
 
   assert.equal(snapshot.task.schemaVersion, 2);
   assert.equal(snapshot.task.status, "draft");
-  assert.equal(snapshot.workItem.schemaVersion, 5);
+  assert.equal(snapshot.workItem.schemaVersion, 6);
   assert.equal(snapshot.yielded.schemaVersion, 3);
   assert.equal(snapshot.yielded.purpose, "execution");
   assert.equal(snapshot.yielded.status, "yielded");
@@ -224,7 +224,7 @@ test("Task follows the retained draft, active, archived lifecycle", () => {
 
 test("WorkItems keep the Leader-approved writable Project subset", () => {
   const item = createWorkItem(
-    "work-1",
+    "work-item-1",
     "task-1",
     {
       title: "Update the contract",
@@ -239,7 +239,7 @@ test("WorkItems keep the Leader-approved writable Project subset", () => {
 
 test("terminal WorkItems cannot be reopened", () => {
   const pending = createWorkItem(
-    "work-1",
+    "work-item-1",
     "task-1",
     { title: "Implement", assignee: "worker" },
     now
@@ -254,7 +254,7 @@ test("terminal WorkItems cannot be reopened", () => {
 
 test("updating a terminal WorkItem outcome preserves its workspace disposition", () => {
   const completed = updateWorkItemStatus(createWorkItem(
-    "work-1",
+    "work-item-1",
     "task-1",
     { title: "Implement", assignee: "worker" },
     now
@@ -269,7 +269,7 @@ test("updating a terminal WorkItem outcome preserves its workspace disposition",
 
 test("closing an abandoned failed WorkItem preserves its workspace disposition", () => {
   const failed = updateWorkItemStatus(createWorkItem(
-    "work-1",
+    "work-item-1",
     "task-1",
     { title: "Implement", assignee: "worker" },
     now
@@ -290,6 +290,7 @@ test("closing an abandoned failed WorkItem preserves its workspace disposition",
 test("TaskMessage represents user, operator, and Role result authors structurally", () => {
   const user = createTaskMessage(
     "message-1",
+    "task-1",
     "Please continue",
     "user",
     { type: "user" },
@@ -297,20 +298,23 @@ test("TaskMessage represents user, operator, and Role result authors structurall
   );
   const result = createTaskMessage(
     "message-2",
+    "task-1",
     "Implemented",
     "role-result",
     { type: "role", roleName: "worker" },
     later,
-    { runId: "agent-run-1", workItemId: "work-1" }
+    { runId: "agent-run-1", workItemId: "work-item-1" }
   );
 
   assert.deepEqual(user.author, { type: "user" });
   assert.equal(user.kind, "user");
   assert.deepEqual(result.author, { type: "role", roleName: "worker" });
   assert.equal(result.runId, "agent-run-1");
-  assert.equal(result.workItemId, "work-1");
+  assert.equal(result.workItemId, "work-item-1");
   assert.throws(
-    () => createTaskMessage("message-3", "Invalid", "role-result", { type: "user" }, now),
+    () => createTaskMessage(
+      "message-3", "task-1", "Invalid", "role-result", { type: "user" }, now
+    ),
     /Role result.*Role author/i
   );
 });

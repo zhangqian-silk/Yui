@@ -27,6 +27,8 @@ const PUBLIC_PATHS = [
   "update",
   "setup",
   "doctor",
+  "storage",
+  "storage convert-task-identity",
   "web",
   "controller",
   "controller status",
@@ -241,9 +243,23 @@ function createPorts() {
           ? [{ id: "work-alpha", title: "Alpha work", taskId: params.taskId }]
           : [{ id: "work-beta", title: "Beta work", taskId: params.taskId }];
       }
+      if (method === "task.run.list") {
+        return [{
+          id: "agent-run-1",
+          taskId: params.taskId,
+          workItemId: "work-item-1",
+          roleName: "worker",
+          status: "active"
+        }];
+      }
       if (method === "task.integration.list") {
         return params.taskId === "task-alpha"
-          ? [{ id: "integration-alpha", status: "blocked", targetRef: "main" }]
+          ? [{
+              id: "integration-alpha",
+              taskId: "task-alpha",
+              status: "blocked",
+              targetRef: "main"
+            }]
           : [];
       }
       if (method === "task.change-set.list") {
@@ -336,7 +352,7 @@ test("candidate providers read the current core entities through CoreCliPorts.ca
     selector("work-items", "work-item", { argumentIndex: 3 }),
     ports,
     ["task", "work", "accept"]
-  )), ["work-alpha", "work-beta"]);
+  )), ["task-alpha/work-alpha", "task-beta/work-beta"]);
   assert.deepEqual(values(await getSelectionCandidates(
     selector("task-roles", "task-role", { argumentIndex: 4, dependsOn: 3 }),
     ports,
@@ -346,7 +362,18 @@ test("candidate providers read the current core entities through CoreCliPorts.ca
     selector("integration-attempts", "integration-attempt", { argumentIndex: 3 }),
     ports,
     ["task", "integration", "show"]
-  )), ["integration-alpha"]);
+  )), ["task-alpha/integration-alpha"]);
+  const runSelector = selector("runs", "run", { argumentIndex: 4, dependsOn: 3 });
+  assert.deepEqual(values(await getSelectionCandidates(
+    runSelector,
+    ports,
+    ["task", "run", "retry", "task-alpha/work-item-1"]
+  )), ["task-alpha/agent-run-1"]);
+  assert.deepEqual(values(await getSelectionCandidates(
+    runSelector,
+    ports,
+    ["task", "run", "retry", "work-item-1"]
+  )), []);
   assert.deepEqual(values(await getSelectionCandidates(
     selector("jobs", "job"), ports, ["jobs", "retry"]
   )), ["job-alpha", "job-beta"]);
@@ -432,7 +459,7 @@ test("InputRequest interaction and completion select global or Task-scoped open 
     answer.selectors[0],
     ports,
     ["task", "input", "answer"]
-  )), ["input-open"]);
+  )), ["task-alpha/input-open"]);
 
   const cancel = findInteractionPolicy(findCommandNode(["task", "input", "cancel"]));
   assert.ok(cancel);
@@ -444,9 +471,9 @@ test("InputRequest interaction and completion select global or Task-scoped open 
 
   assert.deepEqual(await resolveCompletionCandidates({
     words: ["task", "input", "answer"],
-    current: "input-o",
+    current: "task-alpha/input-o",
     ports
-  }), ["input-open"]);
+  }), ["task-alpha/input-open"]);
   assert.deepEqual(await resolveCompletionCandidates({
     words: ["task", "input", "cancel", "task-alpha"],
     current: "input-",

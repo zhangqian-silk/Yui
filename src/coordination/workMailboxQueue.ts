@@ -2,6 +2,7 @@ import {
   completeProcessing,
   createWorkMailbox,
   enqueueSignal,
+  mailboxEntityRefKey,
   type MailboxEntityRef,
   type MailboxTarget,
   type WorkMailbox
@@ -42,8 +43,8 @@ export function completeWorkExecution(
     mailbox === null
     || processing === undefined
     || processing === null
-    || processing.executionRef?.type !== executionRef.type
-    || processing.executionRef.id !== executionRef.id
+    || processing.executionRef === undefined
+    || mailboxEntityRefKey(processing.executionRef) !== mailboxEntityRefKey(executionRef)
   ) {
     return false;
   }

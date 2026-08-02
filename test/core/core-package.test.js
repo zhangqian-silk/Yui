@@ -43,6 +43,7 @@ test("the source package keeps one TypeScript build and declares its Web runtime
   assert.deepEqual(sourcePackage.files, [
     "dist",
     "skills",
+    "docs",
     "README.md",
     "ARCHITECTURE.md",
     "i18n/README.zh-CN.md",
@@ -74,8 +75,9 @@ test("runtime assembly contains only the built CLI, docs, and three skills", (t)
 
   assert.deepEqual(
     readdirSync(output).sort(),
-    ["ARCHITECTURE.md", "LICENSE", "README.md", "dist", "i18n", "package.json", "skills"]
+    ["ARCHITECTURE.md", "LICENSE", "README.md", "dist", "docs", "i18n", "package.json", "skills"]
   );
+  assert.deepEqual(readdirSync(join(output, "docs")), ["task-local-identity.md"]);
   assert.deepEqual(readdirSync(join(output, "i18n")), ["README.zh-CN.md"]);
   assert.deepEqual(
     readdirSync(join(output, "skills")).sort(),

@@ -324,13 +324,13 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "show",
         summary: "Show one input request.",
-        usage: "yui task input show <input> [--task <task>]",
+        usage: "yui task input show (<task>/<input> | <input> --task <task>)",
         options: ["--task"]
       },
       {
         name: "answer",
         summary: "Answer one open input request.",
-        usage: "yui task input answer <input> [--task <task>] (--choice <key> | --text <text>)",
+        usage: "yui task input answer (<task>/<input> | <input> --task <task>) (--choice <key> | --text <text>)",
         options: ["--task", "--choice", "--text"]
       },
       {
@@ -398,7 +398,7 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "update",
         summary: "Update a work item's state.",
-        usage: "yui task work update <id> <todo|running|done|failed|cancelled|superseded> [--summary <text>]",
+        usage: "yui task work update <task>/<work> <todo|running|done|failed|cancelled|superseded> [--summary <text>]",
         options: ["--summary"],
         argumentValues: {
           1: ["todo", "running", "done", "failed", "cancelled", "superseded"]
@@ -407,52 +407,52 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "scope",
         summary: "Expand the Projects a WorkItem may modify.",
-        usage: "yui task work scope <work> [--project <project> ...]",
+        usage: "yui task work scope <task>/<work> [--project <project> ...]",
         options: ["--project"]
       },
       {
         name: "dispatch",
         summary: "Dispatch a work item to its Role.",
-        usage: "yui task work dispatch <id> [--input <text>]",
+        usage: "yui task work dispatch <task>/<work> [--input <text>]",
         options: ["--input"]
       },
       {
         name: "isolate",
         summary: "Create a WorkItem-owned isolated worktree.",
-        usage: "yui task work isolate <work>"
+        usage: "yui task work isolate <task>/<work>"
       },
       {
         name: "capture",
         summary: "Capture a terminal isolated WorkItem result as a ChangeSet.",
-        usage: "yui task work capture <work>"
+        usage: "yui task work capture <task>/<work>"
       },
       {
         name: "cleanup",
         summary: "Remove a clean terminal WorkItem worktree after integration or abandonment.",
-        usage: "yui task work cleanup <work> (--integrated|--abandon)",
+        usage: "yui task work cleanup <task>/<work> (--integrated|--abandon)",
         options: ["--integrated", "--abandon"]
       },
       {
         name: "review",
         summary: "Ask the configured reviewer to inspect a WorkItem candidate.",
-        usage: "yui task work review <work>"
+        usage: "yui task work review <task>/<work>"
       },
       {
         name: "accept",
         summary: "Accept a successful, validated, integrated Work Item.",
-        usage: "yui task work accept <work> --summary <text>",
+        usage: "yui task work accept <task>/<work> --summary <text>",
         options: ["--summary"]
       },
       {
         name: "reject",
         summary: "Reject an awaiting Work Item so it can be retried.",
-        usage: "yui task work reject <work> --summary <text>",
+        usage: "yui task work reject <task>/<work> --summary <text>",
         options: ["--summary"]
       },
       {
         name: "cancel",
         summary: "Cancel a non-running Work Item.",
-        usage: "yui task work cancel <work> --summary <text>",
+        usage: "yui task work cancel <task>/<work> --summary <text>",
         options: ["--summary"]
       }
     ]
@@ -462,12 +462,12 @@ const taskChildren: readonly NodeInput[] = [
     summary: "Inspect and control Task Role Agent Runs.",
     sections: [{ id: "manage", title: "Commands", entries: ["list", "retry", "yield"] }],
     children: [
-      { name: "list", summary: "List Runs for a work item.", usage: "yui task run list <work>" },
-      { name: "retry", summary: "Retry a failed Run.", usage: "yui task run retry <run>" },
+      { name: "list", summary: "List Runs for a work item.", usage: "yui task run list <task>/<work>" },
+      { name: "retry", summary: "Retry a failed Run.", usage: "yui task run retry <task>/<run>" },
       {
         name: "yield",
         summary: "Complete an active Run and wake the Leader.",
-        usage: "yui task run yield <run> (--summary <text>|--summary-file <path|->)",
+        usage: "yui task run yield <task>/<run> (--summary <text>|--summary-file <path|->)",
         options: ["--summary", "--summary-file"],
         fileOptions: ["--summary-file"]
       }
@@ -487,24 +487,24 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "continue",
         summary: "Continue a Leader-approved manual resolution.",
-        usage: "yui task integration continue <integration>"
+        usage: "yui task integration continue <task>/<integration>"
       },
       {
         name: "resolve",
         summary: "Record the Leader's semantic conflict decision.",
-        usage: "yui task integration resolve <integration> --option <manual-resolution|reject> --rationale <text>",
+        usage: "yui task integration resolve <task>/<integration> --option <manual-resolution|reject> --rationale <text>",
         options: ["--option", "--rationale"],
         optionValues: { "--option": ["manual-resolution", "reject"] }
       },
       {
         name: "abort",
         summary: "Abandon a running or blocked Integration Attempt.",
-        usage: "yui task integration abort <integration> --reason <text>",
+        usage: "yui task integration abort <task>/<integration> --reason <text>",
         options: ["--reason"]
       },
       { name: "list", summary: "List Integration Attempts.", usage: "yui task integration list <task>" },
-      { name: "show", summary: "Show one Integration Attempt.", usage: "yui task integration show <integration>" },
-      { name: "cleanup", summary: "Remove a terminal Integration worktree and branch.", usage: "yui task integration cleanup <integration>" }
+      { name: "show", summary: "Show one Integration Attempt.", usage: "yui task integration show <task>/<integration>" },
+      { name: "cleanup", summary: "Remove a terminal Integration worktree and branch.", usage: "yui task integration cleanup <task>/<integration>" }
     ]
   },
   {
@@ -580,7 +580,9 @@ export const ROOT_COMMAND = buildNode({
   summary: "Coordinate durable, isolated Agent work.",
   usage: "yui [--json] <command>",
   sections: [
-    { id: "general", title: "General", entries: ["help", "version", "update", "setup", "doctor", "completion"] },
+    { id: "general", title: "General", entries: [
+      "help", "version", "update", "setup", "doctor", "storage", "completion"
+    ] },
     { id: "workflow", title: "Workflow", entries: ["operator", "project", "task"] },
     { id: "configuration", title: "Configuration", entries: ["config", "agent", "profile", "role"] },
     { id: "operations", title: "Operations", entries: ["web", "controller", "jobs"] },
@@ -592,6 +594,18 @@ export const ROOT_COMMAND = buildNode({
     { name: "update", summary: "Install the latest published Yui package globally." },
     { name: "setup", summary: "Initialize or update Yui configuration." },
     { name: "doctor", summary: "Check Yui dependencies and file state." },
+    {
+      name: "storage",
+      summary: "Perform explicit offline storage operations.",
+      sections: [{ id: "manage", title: "Commands", entries: ["convert-task-identity"] }],
+      children: [{
+        name: "convert-task-identity",
+        summary: "Convert aggregate v10 global record ids into a fresh Task-local output.",
+        usage: "yui storage convert-task-identity --source <old-yui-home> --output <fresh-yui-home>",
+        options: ["--source", "--output"],
+        fileOptions: ["--source", "--output"]
+      }]
+    },
     {
       name: "web",
       summary: "Serve the local Task and Agent control room.",

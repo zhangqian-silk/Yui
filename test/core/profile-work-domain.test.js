@@ -128,7 +128,7 @@ test("a later conflict replaces the consumed Leader decision without adding anot
     projectId: "project-1",
     targetRef: "main",
     expectedHead: "a".repeat(40),
-    changeSetIds: ["change-1"]
+    changeSetIds: ["change-set-1"]
   }, now);
   const firstConflict = requireLeaderDecision(integration, {
     affectedPaths: ["first.ts"],

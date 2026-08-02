@@ -7,6 +7,7 @@ import {
 } from "../domain/validation.js";
 import { validateReviewConfig, type ReviewConfig } from "../review/reviewConfig.js";
 import { validateRoleWorkspace, type RoleWorkspace } from "../worktree/roleWorkspace.js";
+import { validateTaskRecordReference } from "../task/taskRecordReference.js";
 
 export type WorkItemStatus =
   | "pending"
@@ -20,8 +21,10 @@ export type WorkItemStatus =
 export type WorkItemWorkspaceDisposition = "integrated" | "abandoned";
 
 export type WorkItemCandidate = Readonly<{
-  schemaVersion: 1;
+  schemaVersion: 2;
   id: string;
+  taskId: string;
+  workItemId: string;
   sequence: number;
   workItemRevision: number;
   summary: string;
@@ -34,7 +37,7 @@ export type WorkItemCandidate = Readonly<{
 }>;
 
 export type WorkItem = {
-  schemaVersion: 5;
+  schemaVersion: 6;
   id: string;
   taskId: string;
   title: string;
@@ -75,7 +78,7 @@ export function createWorkItem(
 ): WorkItem {
   const timestamp = now.toISOString();
   return validateWorkItem({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id: requireIdentity(id, "Work Item id"),
     taskId: requireIdentity(taskId, "Task id"),
     title: requireText(input.title, "Work item title"),
@@ -118,8 +121,10 @@ export function submitWorkItemCandidate(
   const revision = workItem.revision + 1;
   const sequence = workItem.candidates.length + 1;
   const candidate = validateWorkItemCandidate({
-    schemaVersion: 1,
-    id: `${workItem.id}-candidate-${sequence}`,
+    schemaVersion: 2,
+    id: `candidate-${sequence}`,
+    taskId: workItem.taskId,
+    workItemId: workItem.id,
     sequence,
     workItemRevision: revision,
     summary: input.summary,
@@ -232,8 +237,8 @@ export function recordWorkItemWorkspaceDisposition(
 }
 
 export function validateWorkItem(workItem: WorkItem): WorkItem {
-  if (workItem.schemaVersion !== 5) throw new Error("WorkItem must use schemaVersion 5.");
-  requireIdentity(workItem.id, "Work Item id");
+  if (workItem.schemaVersion !== 6) throw new Error("WorkItem must use schemaVersion 6.");
+  validateTaskRecordReference({ taskId: workItem.taskId, localId: workItem.id }, "workItem");
   requireIdentity(workItem.taskId, "Task id");
   requireText(workItem.title, "Work item title");
   requireText(workItem.objective, "Work item objective");
@@ -256,6 +261,9 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
   const candidateIds = new Set<string>();
   workItem.candidates.forEach((candidate, index) => {
     validateWorkItemCandidate(candidate);
+    if (candidate.taskId !== workItem.taskId || candidate.workItemId !== workItem.id) {
+      throw new Error("Work Item candidate provenance is invalid.");
+    }
     if (candidate.sequence !== index + 1) {
       throw new Error("Work Item candidate sequence is invalid.");
     }
@@ -303,10 +311,17 @@ export function validateWorkItemCandidate(
   if (typeof candidate !== "object" || candidate === null) {
     throw new Error("Work Item candidate is required.");
   }
-  if (candidate.schemaVersion !== 1) {
-    throw new Error("Work Item candidate must use schemaVersion 1.");
+  if (candidate.schemaVersion !== 2) {
+    throw new Error("Work Item candidate must use schemaVersion 2.");
   }
-  requireIdentity(candidate.id, "Work Item candidate id");
+  requireIdentity(candidate.taskId, "Work Item candidate Task id");
+  validateTaskRecordReference({
+    taskId: candidate.taskId,
+    localId: candidate.workItemId
+  }, "workItem");
+  if (candidate.id !== `candidate-${candidate.sequence}`) {
+    throw new Error("Work Item candidate local id is invalid.");
+  }
   if (!Number.isSafeInteger(candidate.sequence) || candidate.sequence < 1) {
     throw new Error("Work Item candidate sequence must be a positive integer.");
   }
@@ -322,7 +337,10 @@ export function validateWorkItemCandidate(
     throw new Error("Work Item candidate source is invalid.");
   }
   if (candidate.source.type === "run") {
-    requireIdentity(candidate.source.runId, "Work Item candidate Run id");
+    validateTaskRecordReference({
+      taskId: candidate.taskId,
+      localId: candidate.source.runId
+    }, "agentRun");
   }
   if (candidate.reviewPolicy !== undefined) validateReviewConfig(candidate.reviewPolicy);
   if (candidate.workspace !== undefined) validateRoleWorkspace(candidate.workspace);
