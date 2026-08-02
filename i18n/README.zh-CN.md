@@ -253,26 +253,18 @@ Worker Role 的完整 Agent bindings，Leader 无需重新拼接 model、effort 
 Agent/model/effort/YOLO。显式 `--agent` 属于 Task 专用覆盖，必须在派发前
 补全并回读配置。
 
-Claude reviewer 可以使用原生 `dontAsk` 模式：未预批准的工具会直接拒绝且不会
-弹出交互确认，同时精确放行只读工具和向 Yui 交回结果所需的控制面命令：
-
-```sh
-yui role update reviewer --agent claude --model <model> --effort <effort> \
-  --permission-mode dontAsk \
-  --allowed-tool Read --allowed-tool Grep --allowed-tool Glob \
-  --allowed-tool 'Bash(yui task run yield *)'
-```
-
-这不会启用文件编辑工具，也不会放宽只读 reviewer Profile；既非只读、又未
-显式允许的动作都会被拒绝。reviewer 必须直接执行 yield 命令，不能包进 shell
-循环或其他导致规则不再匹配的复合命令。重复传入 `--allowed-tool` 或
-`--disallowed-tool` 会替换对应的 Claude 工具规则列表；`--clear-allowed-tools`
-和 `--clear-disallowed-tools` 可移除已保存的规则。
+ReviewRound 从冻结 Candidate SHA 创建独立的可写 worktree。Codex/Claude 只在
+该 exact ReviewRound owner、reviewRoundId 与 workspace 全部匹配时获得配置上限
+内的正常 full capability；Skill 仍禁止 push、Integration、Task state、其他
+workspace 与真实 YUI_HOME 变更。两种 provider 都必须直接执行当前 Run 的 exact
+stdin yield；最终回复本身不是持久交付。
 
 Worker 显式交付当前 Run：
 
 ```sh
-yui task run yield <task-id>/<run-id> --summary "导出器已完成，聚焦测试通过"
+yui task run yield <task-id>/<run-id> --summary-file - <<'YUI_SUMMARY'
+导出器已完成，聚焦测试通过
+YUI_SUMMARY
 ```
 
 yield 会结束 AgentRun，将 WorkItem 提交给 Leader 审查，并追加结果消息和

@@ -85,6 +85,29 @@ test("Worker completion requirement is idempotent without trusting a user-author
   assert.equal(ensureWorkerRunCompletionRequirement(ensured), ensured);
 });
 
+test("Claude Worker completion requires the exact explicit yield transport", () => {
+  const worker = buildWorkerContext({
+    taskId: "task-1",
+    role: {
+      ...role,
+      name: "worker",
+      activeAgentId: "claude",
+      agentBindings: {
+        claude: {
+          agentId: "claude",
+          adapterId: "claude",
+          config: { adapterId: "claude" }
+        }
+      }
+    },
+    input: "return the bounded result"
+  });
+
+  assert.match(worker, /yui task run yield <current-run-id> --summary-file -/u);
+  assert.match(worker, /final response alone does neither/iu);
+  assert.doesNotMatch(worker, /managed Stop hook|final assistant message/iu);
+});
+
 test("Operator context exposes native developer instructions and a Skill reference", () => {
   const context = compileRoleSessionContext(undefined, {
     ...role,

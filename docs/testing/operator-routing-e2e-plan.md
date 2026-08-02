@@ -237,9 +237,9 @@ Task main 是一个包含全部 Project peer directory 的逻辑根。WorkItem �
 会话级而不是逐 Project 的；实现会话只写 WorkItem scope，reviewer 会话仅在
 exact ReviewRound-owned workspace 中使用正常 Codex/Claude full capability。
 Review 权限来自 frozen Candidate SHA、purpose、reviewRoundId 与 workspace owner
-的联合校验，并且必须回读真实启动参数。yield 仍直接执行一次，不能包进 shell
-循环或复合命令；Skill 禁止 push、Integration、Task state、其他 workspace 与
-真实 YUI_HOME 变更。
+的联合校验，并且必须回读真实启动参数。Codex/Claude 都必须直接执行一次 exact
+`--summary-file -` yield，不能包进 shell 循环或复合命令；Skill 禁止 push、
+Integration、Task state、其他 workspace 与真实 YUI_HOME 变更。
 `capture` 对每个实际修改的 Project 生成独立 ChangeSet，integration 保持
 单 Project 事务，所有修改 Project 的最新候选都已集成后才能 accept。
 

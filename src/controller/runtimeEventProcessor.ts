@@ -1,7 +1,6 @@
 import type { SchedulerTask } from "../scheduler/ports.js";
 import type {
   FileRuntimeEventInbox,
-  RuntimeClaudeStopEvent,
   RuntimeClaudeStopFailureEvent,
   RuntimeLifecycleEvent,
   RuntimeTurnCompletedEvent
@@ -32,9 +31,9 @@ export type GlobalRuntimeTurnCompleted = Readonly<{
   summary: string;
 }>;
 
-export type TaskClaudeLifecycleEvent = Readonly<{
+export type TaskClaudeStopFailureEvent = Readonly<{
   eventId: string;
-  type: "claude-stop" | "claude-stop-failure";
+  type: "claude-stop-failure";
   taskId: string;
   roleName: string;
   agentId: string;
@@ -42,8 +41,7 @@ export type TaskClaudeLifecycleEvent = Readonly<{
   launchId: string;
   nativeSessionId: string;
   runId: string;
-  result?: string;
-  error?: string;
+  error: string;
   errorDetails?: string;
   lastAssistantMessage?: string;
 }>;
@@ -64,11 +62,11 @@ export type RuntimeTurnEventObserver = Readonly<{
   classifyGlobalRuntimeTurnCompleted?(
     input: GlobalRuntimeTurnCompleted
   ): "apply" | "obsolete";
-  classifyClaudeLifecycleEvent?(
-    input: TaskClaudeLifecycleEvent
+  classifyClaudeStopFailureEvent?(
+    input: TaskClaudeStopFailureEvent
   ): "apply" | "obsolete";
-  observeClaudeLifecycleEvent?(
-    input: TaskClaudeLifecycleEvent,
+  observeClaudeStopFailureEvent?(
+    input: TaskClaudeStopFailureEvent,
     now?: Date
   ): unknown;
   observeObsoleteRuntimeEvent?(
@@ -128,7 +126,7 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
             continue;
           }
         } else {
-          this.applyClaude(event, now);
+          this.applyClaudeStopFailure(event, now);
         }
         this.acknowledge(event.id, acknowledgedEventIds);
       } catch (error) {
@@ -196,43 +194,30 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
     return "obsolete";
   }
 
-  private applyClaude(
-    event: RuntimeClaudeStopEvent | RuntimeClaudeStopFailureEvent,
+  private applyClaudeStopFailure(
+    event: RuntimeClaudeStopFailureEvent,
     now: Date
   ): void {
     const task = this.observer.getTask(event.taskId);
     if (task === null) return;
-    const input: TaskClaudeLifecycleEvent = event.type === "claude-stop"
-      ? {
-          eventId: event.id,
-          type: event.type,
-          taskId: event.taskId,
-          roleName: event.roleName,
-          agentId: event.agentId,
-          adapterId: event.adapterId,
-          launchId: event.launchId,
-          nativeSessionId: event.nativeSessionId,
-          runId: event.runId,
-          result: event.result
-        }
-      : {
-          eventId: event.id,
-          type: event.type,
-          taskId: event.taskId,
-          roleName: event.roleName,
-          agentId: event.agentId,
-          adapterId: event.adapterId,
-          launchId: event.launchId,
-          nativeSessionId: event.nativeSessionId,
-          runId: event.runId,
-          error: event.error,
-          ...(event.errorDetails === undefined ? {} : { errorDetails: event.errorDetails }),
-          ...(event.lastAssistantMessage === undefined
-            ? {}
-            : { lastAssistantMessage: event.lastAssistantMessage })
-        };
+    const input: TaskClaudeStopFailureEvent = {
+      eventId: event.id,
+      type: event.type,
+      taskId: event.taskId,
+      roleName: event.roleName,
+      agentId: event.agentId,
+      adapterId: event.adapterId,
+      launchId: event.launchId,
+      nativeSessionId: event.nativeSessionId,
+      runId: event.runId,
+      error: event.error,
+      ...(event.errorDetails === undefined ? {} : { errorDetails: event.errorDetails }),
+      ...(event.lastAssistantMessage === undefined
+        ? {}
+        : { lastAssistantMessage: event.lastAssistantMessage })
+    };
     if (task.status !== "active"
-      || this.observer.classifyClaudeLifecycleEvent?.(input) === "obsolete") {
+      || this.observer.classifyClaudeStopFailureEvent?.(input) === "obsolete") {
       this.recordObsolete(
         event,
         task.status === "archived"
@@ -244,9 +229,10 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       );
       return;
     }
-    const observe = this.observer.observeClaudeLifecycleEvent;
-    if (observe === undefined) throw new Error("Claude lifecycle observer is unavailable.");
-    observe(input, now);
+    if (this.observer.observeClaudeStopFailureEvent === undefined) {
+      throw new Error("Claude StopFailure observer is unavailable.");
+    }
+    this.observer.observeClaudeStopFailureEvent(input, now);
   }
 
   private recordObsolete(event: RuntimeLifecycleEvent, reason: string, now: Date): void {

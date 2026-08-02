@@ -115,6 +115,9 @@ that isolated worktree; the behavioral boundary forbids push, Integration,
 Task mutation, other workspaces, stable checkouts, and real YUI_HOME. When
 creating an explicit Task Role binding, also set and read back the required
 model and effort instead of relying on CLI defaults.
+Every managed reviewer must deliver through the current Run's exact
+`--summary-file -` yield command; a final response alone is not a durable
+handoff.
 
 A direct or native-subagent WorkItem is roleless. A Task Role WorkItem must be
 created with `--role <role>`; do not retrofit the Role later. Reuse a compatible
@@ -400,7 +403,9 @@ Every wake is an active control Run. Before ending:
 3. do exactly one of: complete the Task, create an InputRequest, or yield.
 
 ```sh
-yui task run yield <run-id> --summary "<current result or waiting state>"
+yui task run yield <run-id> --summary-file - <<'YUI_SUMMARY'
+<current result or waiting state>
+YUI_SUMMARY
 ```
 
 Always yield before waiting for delegated results. Leaving the Run active

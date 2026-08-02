@@ -131,6 +131,7 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
   assert.match(leader, /executor=subagent; profile=reviewer@3/u);
   assert.match(leader, /fresh ReviewRound-owned worktree.*frozen Candidate/usi);
   assert.match(leader, /never capture, integrate, accept,\s+or auto-merge the review workspace/usi);
+  assert.match(leader, /current Run's[\s\S]*--summary-file -[\s\S]*durable\s+handoff/u);
   assert.match(
     leader,
     /`--check` commands run from the selected Project's integration candidate root[\s\S]*not\s+`cd <project> && npm test`/u
@@ -162,7 +163,7 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
   assert.match(worker, /do not wrap it in `until`[\s\S]*duplicate or late\s+review yield is obsolete/u);
   assert.match(
     worker,
-    /For a managed Claude Run[\s\S]*managed Stop hook[\s\S]*never successful Candidates/u
+    /managed Codex or\s+Claude Run[\s\S]*--summary-file -[\s\S]*final\s+response[\s\S]*does not deliver/u
   );
 });
 

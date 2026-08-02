@@ -436,9 +436,9 @@ test("Task retirement closes the exact Run and makes its late provider Hook obso
   assert.equal(store.getAgentRun(task.id, run.id).status, "failed");
   assert.equal(store.getWorkItem(task.id, item.id).status, "cancelled");
   const adapter = new FileSchedulerStoreAdapter(store);
-  assert.equal(adapter.classifyClaudeLifecycleEvent({
+  assert.equal(adapter.classifyClaudeStopFailureEvent({
     eventId: "late-after-retirement",
-    type: "claude-stop",
+    type: "claude-stop-failure",
     taskId: task.id,
     roleName: run.roleName,
     agentId: "claude-primary",
@@ -446,7 +446,8 @@ test("Task retirement closes the exact Run and makes its late provider Hook obso
     launchId: "launch-1",
     nativeSessionId: "native-1",
     runId: run.id,
-    result: "Late result"
+    error: "server_error",
+    errorDetails: "Late provider failure"
   }), "obsolete");
   assert.deepEqual(
     store.getWorkMailbox({

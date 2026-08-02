@@ -278,10 +278,16 @@ hot-mutates an existing process. `task context`, Role views, Run history,
 Events, and Web show desired/effective revisions, access, provenance, and
 pending next-launch drift.
 
+Both Codex and Claude deliver a managed Run only through its exact injected
+stdin-yield command. A final assistant message alone is not a durable handoff;
+permission denial, a missing or wrong Run yield, and StopFailure fail closed.
+
 The Worker delivers its current Run explicitly:
 
 ```sh
-yui task run yield <task-id>/<run-id> --summary "Implemented the exporter; focused tests pass"
+yui task run yield <task-id>/<run-id> --summary-file - <<'YUI_SUMMARY'
+Implemented the exporter; focused tests pass
+YUI_SUMMARY
 ```
 
 Yield completes the AgentRun, submits the WorkItem for Leader review, appends

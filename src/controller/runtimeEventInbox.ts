@@ -19,7 +19,7 @@ import {
 import { join } from "node:path";
 
 export const MAX_RUNTIME_TURN_SUMMARY_BYTES = 32 * 1024;
-export const MAX_CLAUDE_RESULT_BYTES = 4 * 1024 * 1024;
+export const MAX_CLAUDE_HOOK_TEXT_BYTES = 4 * 1024 * 1024;
 export const MAX_RUNTIME_EVENT_FILE_BYTES = 16 * 1024 * 1024;
 
 const RUNTIME_EVENT_DIRECTORY = join("runtime", "inbox");
@@ -58,22 +58,11 @@ type ClaudeEventEnvelope = Readonly<{
   runId: string;
 }>;
 
-export type RuntimeClaudeStopInput = ClaudeEventEnvelope & Readonly<{
-  result: string;
-}>;
-
 export type RuntimeClaudeStopFailureInput = ClaudeEventEnvelope & Readonly<{
   error: string;
   errorDetails?: string;
   lastAssistantMessage?: string;
 }>;
-
-export type RuntimeClaudeStopEvent = Readonly<{
-  schemaVersion: 1;
-  id: string;
-  type: "claude-stop";
-  receivedAt: string;
-}> & RuntimeClaudeStopInput;
 
 export type RuntimeClaudeStopFailureEvent = Readonly<{
   schemaVersion: 1;
@@ -84,7 +73,6 @@ export type RuntimeClaudeStopFailureEvent = Readonly<{
 
 export type RuntimeLifecycleEvent =
   | RuntimeTurnCompletedEvent
-  | RuntimeClaudeStopEvent
   | RuntimeClaudeStopFailureEvent;
 
 export type RuntimeEventEnqueueResult<TEvent extends RuntimeLifecycleEvent = RuntimeLifecycleEvent> =
@@ -113,19 +101,6 @@ export class FileRuntimeEventInbox {
       schemaVersion: 1,
       id: runtimeEventId("native-turn-completed", normalized),
       type: "native-turn-completed",
-      receivedAt: this.now().toISOString(),
-      ...normalized
-    }));
-  }
-
-  enqueueClaudeStop(
-    input: RuntimeClaudeStopInput
-  ): RuntimeEventEnqueueResult<RuntimeClaudeStopEvent> {
-    const normalized = normalizeClaudeStopInput(input);
-    return this.publish(Object.freeze({
-      schemaVersion: 1,
-      id: runtimeEventId("claude-stop", normalized),
-      type: "claude-stop",
       receivedAt: this.now().toISOString(),
       ...normalized
     }));
@@ -299,7 +274,7 @@ export class RuntimeEventInboxError extends Error {
 
 function runtimeEventId(
   type: RuntimeLifecycleEvent["type"],
-  input: RuntimeTurnCompletedInput | RuntimeClaudeStopInput | RuntimeClaudeStopFailureInput
+  input: RuntimeTurnCompletedInput | RuntimeClaudeStopFailureInput
 ): string {
   const common = [
     1,
@@ -359,13 +334,6 @@ function normalizeClaudeEnvelope(input: ClaudeEventEnvelope): ClaudeEventEnvelop
   };
 }
 
-function normalizeClaudeStopInput(input: RuntimeClaudeStopInput): RuntimeClaudeStopInput {
-  return {
-    ...normalizeClaudeEnvelope(input),
-    result: requireLongText(input.result, "Claude result")
-  };
-}
-
 function normalizeClaudeStopFailureInput(
   input: RuntimeClaudeStopFailureInput
 ): RuntimeClaudeStopFailureInput {
@@ -390,7 +358,6 @@ function parseRuntimeEvent(value: unknown): RuntimeLifecycleEvent {
   if (!isObject(value)) throw invalidEvent();
   switch (value.type) {
     case "native-turn-completed": return parseCodexEvent(value);
-    case "claude-stop": return parseClaudeStopEvent(value);
     case "claude-stop-failure": return parseClaudeStopFailureEvent(value);
     default: throw invalidEvent();
   }
@@ -439,22 +406,6 @@ function parseCodexEvent(value: Record<string, any>): RuntimeTurnCompletedEvent 
   });
 }
 
-function parseClaudeStopEvent(value: Record<string, any>): RuntimeClaudeStopEvent {
-  const expected = [
-    "schemaVersion", "id", "type", "receivedAt", "scope", "taskId", "roleName",
-    "agentId", "adapterId", "launchId", "nativeSessionId", "runId", "result"
-  ];
-  if (value.schemaVersion !== 1 || !hasExactKeys(value, expected)) throw invalidEvent();
-  const normalized = normalizeClaudeStopInput(value as RuntimeClaudeStopInput);
-  return Object.freeze({
-    schemaVersion: 1,
-    id: requireIdentityText(value.id, "Event id"),
-    type: "claude-stop",
-    receivedAt: requireTimestamp(value.receivedAt),
-    ...normalized
-  });
-}
-
 function parseClaudeStopFailureEvent(
   value: Record<string, any>
 ): RuntimeClaudeStopFailureEvent {
@@ -488,7 +439,7 @@ function requireLongText(value: unknown, label: string): string {
   if (typeof value !== "string" || value.includes("\0") || value.trim().length === 0) {
     throw invalidEvent(`${label} is required.`);
   }
-  if (Buffer.byteLength(value, "utf8") > MAX_CLAUDE_RESULT_BYTES) {
+  if (Buffer.byteLength(value, "utf8") > MAX_CLAUDE_HOOK_TEXT_BYTES) {
     throw new RuntimeEventInboxError(
       "RUNTIME_EVENT_TOO_LARGE",
       `${label} exceeds the durable inbox limit.`

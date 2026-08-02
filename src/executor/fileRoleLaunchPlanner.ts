@@ -534,7 +534,6 @@ function ensureManagedClaudeLifecyclePlugin(home: string, cliPath: string): stri
     join(root, "hooks", "hooks.json"),
     `${JSON.stringify({
       hooks: {
-        Stop: [{ hooks: [command] }],
         StopFailure: [{ hooks: [command] }]
       }
     }, null, 2)}\n`
@@ -554,9 +553,10 @@ function managedClaudeControlPlaneConfig(
     ...(workItemId === undefined
       ? []
       : [`Bash(yui --json task work show ${workItemId})`]),
-    `Bash(yui task run yield ${runId}:*)`
+    `Bash(yui task run yield ${runId} --summary-file -:*)`
   ];
-  const existing = config.permission?.allowedTools ?? [];
+  const existing = (config.permission?.allowedTools ?? [])
+    .filter((rule) => !isManagedYuiBashRule(rule));
   return {
     ...config,
     permission: {
@@ -564,6 +564,10 @@ function managedClaudeControlPlaneConfig(
       allowedTools: [...new Set([...existing, ...managed])]
     }
   };
+}
+
+function isManagedYuiBashRule(rule: string): boolean {
+  return /^Bash\(yui(?:\s|:\*|\*|\))/u.test(rule.trim());
 }
 
 function canonicalPath(path: string): string {

@@ -53,11 +53,13 @@ round, result, and checks in the WorkItem summary.
 
 ## Task Role AgentRun
 
-The managed input names the current Run ID. Before ending a Codex Run, execute
-its exact:
+The managed input names the current Run ID. Before ending a managed Codex or
+Claude Run, execute its exact:
 
 ```sh
-yui task run yield <current-run-id> --summary "<outcome and evidence>"
+yui task run yield <current-run-id> --summary-file - <<'YUI_SUMMARY'
+<outcome and evidence>
+YUI_SUMMARY
 ```
 
 Every review Run is bound to one frozen Candidate commit and a separate
@@ -75,21 +77,18 @@ the requested evidence is sufficient, yield immediately. Invoke the exact
 `yui task run yield ...` command directly once; do not wrap it in `until`,
 `while`, `sh -c`, `cd ... &&`, or another compound command. A duplicate or late
 review yield is obsolete; do not retry it.
+If the exact direct command is denied, report that blocker and stop; do not
+retry through a wrapper or alternate delivery path.
 
 Include the result, changed paths, review base, optional evidence commit,
-checks, residual risk, and blockers. Printing a final response without
-executing `yield` does not deliver the Run. Execution yield ends the AgentRun
+checks, residual risk, and blockers in the stdin summary. Printing a final
+response without executing `yield` does not deliver either provider's managed
+Run. Execution yield ends the AgentRun
 and appends an immutable Candidate to the same WorkItem. Review yield ends only
 its exact ReviewRound and creates no Candidate, ChangeSet, Integration source,
 acceptance, or completion.
-
-For a managed Claude Run, return the complete outcome and evidence in the final
-assistant message. Yui's managed Stop hook durably records that exact result and
-terminalizes the exact Run; an explicit direct `yui task run yield <run>
---summary "<outcome and evidence>"` remains supported. Do not require a heredoc,
-temporary file, permission bypass, or user/project `.claude` configuration for
-result transport. Permission denial, missing result, and StopFailure are
-failures, never successful Candidates or completed ReviewRounds.
+Permission denial, a missing or wrong Run yield, and StopFailure are failures,
+never successful Candidates or completed ReviewRounds.
 
 Leave managed workspaces intact. The Leader may route a ReviewRound evidence
 SHA or findings back to the original Worker, which continues in its unchanged

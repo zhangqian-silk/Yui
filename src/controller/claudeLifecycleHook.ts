@@ -23,56 +23,39 @@ type ClaudeHookEnvelope = Readonly<{
   nativeSessionId: string;
 }>;
 
-export type ClaudeLifecycleHookNotification =
-  | (ClaudeHookEnvelope & Readonly<{
-      type: "Stop";
-      result: string;
-      pendingWork: boolean;
-    }>)
-  | (ClaudeHookEnvelope & Readonly<{
-      type: "StopFailure";
-      error: string;
-      errorDetails?: string;
-      lastAssistantMessage?: string;
-    }>);
+export type ClaudeStopFailureHookNotification = ClaudeHookEnvelope & Readonly<{
+  type: "StopFailure";
+  error: string;
+  errorDetails?: string;
+  lastAssistantMessage?: string;
+}>;
 
-/** Hidden CLI entrypoint used by managed Claude Stop lifecycle hooks. */
+/** Hidden CLI entrypoint used by the managed Claude StopFailure hook. */
 export async function runClaudeLifecycleHookCommand(
   stdinJson: string | undefined,
   environment: NodeJS.ProcessEnv = process.env,
   call: ControllerCall = callController
 ): Promise<void> {
-  const notification = parseClaudeLifecycleHookNotification(stdinJson, environment);
+  const notification = parseClaudeStopFailureHookNotification(stdinJson, environment);
   const home = requireIdentity(environment.YUI_HOME, "YUI_HOME");
-  // Stop is also emitted while Claude is paused for background or scheduled
-  // work. That provider fact is not a terminal Run result; a later empty Stop
-  // owns completion after the pending work wakes the same session.
-  if (notification.type === "Stop" && notification.pendingWork) return;
   const inbox = new FileRuntimeEventInbox(home);
-  const common = {
-    scope: "task" as const,
+  inbox.enqueueClaudeStopFailure({
+    scope: "task",
     taskId: notification.taskId,
     roleName: notification.roleName,
     agentId: notification.agentId,
     adapterId: notification.adapterId,
     launchId: notification.launchId,
     nativeSessionId: notification.nativeSessionId,
-    runId: notification.runId
-  };
-  if (notification.type === "Stop") {
-    inbox.enqueueClaudeStop({ ...common, result: notification.result });
-  } else {
-    inbox.enqueueClaudeStopFailure({
-      ...common,
-      error: notification.error,
-      ...(notification.errorDetails === undefined
-        ? {}
-        : { errorDetails: notification.errorDetails }),
-      ...(notification.lastAssistantMessage === undefined
-        ? {}
-        : { lastAssistantMessage: notification.lastAssistantMessage })
-    });
-  }
+    runId: notification.runId,
+    error: notification.error,
+    ...(notification.errorDetails === undefined
+      ? {}
+      : { errorDetails: notification.errorDetails }),
+    ...(notification.lastAssistantMessage === undefined
+      ? {}
+      : { lastAssistantMessage: notification.lastAssistantMessage })
+  });
   // The immutable event is authoritative; the socket call is only a hint.
   await call(
     home,
@@ -88,16 +71,15 @@ export async function runClaudeLifecycleHookCommand(
   ).catch(() => {});
 }
 
-export function parseClaudeLifecycleHookNotification(
+export function parseClaudeStopFailureHookNotification(
   stdinJson: string | undefined,
   environment: NodeJS.ProcessEnv
-): ClaudeLifecycleHookNotification {
+): ClaudeStopFailureHookNotification {
   const payload = parseObject(stdinJson);
-  const type = payload.hook_event_name;
-  if (type !== "Stop" && type !== "StopFailure") {
-    throw new Error("Claude lifecycle hook event is invalid.");
+  if (payload.hook_event_name !== "StopFailure") {
+    throw new Error("Managed Claude lifecycle ingestion accepts only StopFailure.");
   }
-  assertHookKeys(payload, type);
+  assertStopFailureHookKeys(payload);
   if (environment.YUI_SESSION_SCOPE !== "task") {
     throw new Error("Claude lifecycle hook requires a Task session scope.");
   }
@@ -112,30 +94,24 @@ export function parseClaudeLifecycleHookNotification(
   if (nativeSessionId !== expectedNativeSessionId) {
     throw new Error("Claude lifecycle hook native session does not match its launch envelope.");
   }
-  const common: ClaudeHookEnvelope = {
+  return {
     taskId: requireIdentity(environment.YUI_TASK_ID, "Task id"),
     roleName: requireIdentity(environment.YUI_ROLE, "Role name"),
     agentId: requireIdentity(environment.YUI_AGENT_ID, "Agent id"),
     adapterId: "claude",
     launchId: requireIdentity(environment.YUI_LAUNCH_ID, "Launch id"),
     runId: requireIdentity(environment.YUI_RUN_ID, "Run id"),
-    nativeSessionId
-  };
-  if (type === "Stop") {
-    return {
-      ...common,
-      type,
-      result: requireResult(payload.last_assistant_message, "Claude last_assistant_message"),
-      pendingWork: hasPendingStopWork(payload)
-    };
-  }
-  return {
-    ...common,
-    type,
+    nativeSessionId,
+    type: "StopFailure",
     error: requireResult(payload.error, "Claude StopFailure error"),
     ...(payload.error_details === undefined
       ? {}
-      : { errorDetails: requireResult(payload.error_details, "Claude StopFailure error_details") }),
+      : {
+          errorDetails: requireResult(
+            payload.error_details,
+            "Claude StopFailure error_details"
+          )
+        }),
     ...(payload.last_assistant_message === undefined
       ? {}
       : {
@@ -161,11 +137,8 @@ function parseObject(value: string | undefined): Record<string, unknown> {
   }
 }
 
-function assertHookKeys(
-  payload: Record<string, unknown>,
-  type: "Stop" | "StopFailure"
-): void {
-  const common = new Set([
+function assertStopFailureHookKeys(payload: Record<string, unknown>): void {
+  const allowed = new Set([
     "hook_event_name",
     "session_id",
     "prompt_id",
@@ -174,36 +147,22 @@ function assertHookKeys(
     "permission_mode",
     "effort",
     "agent_id",
-    "agent_type"
+    "agent_type",
+    "error",
+    "error_details",
+    "last_assistant_message"
   ]);
-  const allowed = type === "Stop"
-    ? new Set([
-        ...common,
-        "stop_hook_active",
-        "last_assistant_message",
-        "background_tasks",
-        "session_crons"
-      ])
-    : new Set([...common, "error", "error_details", "last_assistant_message"]);
   const unexpected = Object.keys(payload).find((key) => !allowed.has(key));
   if (unexpected !== undefined) {
     throw new Error(`Claude lifecycle hook stdin JSON has unexpected field: ${unexpected}.`);
   }
-  for (const required of type === "Stop"
-    ? ["hook_event_name", "session_id", "stop_hook_active", "last_assistant_message"]
-    : ["hook_event_name", "session_id", "error"]) {
+  for (const required of ["hook_event_name", "session_id", "error"]) {
     if (!Object.hasOwn(payload, required)) {
       throw new Error(`Claude lifecycle hook stdin JSON is missing ${required}.`);
     }
   }
   assertCurrentCommonFields(payload);
-  if (type === "Stop") {
-    if (typeof payload.stop_hook_active !== "boolean") {
-      invalidHookField("stop_hook_active");
-    }
-    assertBackgroundTasks(payload.background_tasks);
-    assertSessionCrons(payload.session_crons);
-  } else if (!CLAUDE_STOP_FAILURE_ERRORS.has(payload.error as string)) {
+  if (!CLAUDE_STOP_FAILURE_ERRORS.has(payload.error as string)) {
     invalidHookField("error");
   }
 }
@@ -250,56 +209,6 @@ function assertCurrentCommonFields(payload: Record<string, unknown>): void {
       invalidHookField("effort");
     }
   }
-}
-
-function assertBackgroundTasks(value: unknown): void {
-  if (value === undefined) return;
-  if (!Array.isArray(value)) invalidHookField("background_tasks");
-  for (const entry of value) {
-    if (!isObject(entry)
-      || !hasExactKeys(entry, [
-        "id", "type", "status", "description",
-        ...(entry.command === undefined ? [] : ["command"]),
-        ...(entry.agent_type === undefined ? [] : ["agent_type"]),
-        ...(entry.server === undefined ? [] : ["server"]),
-        ...(entry.tool === undefined ? [] : ["tool"]),
-        ...(entry.name === undefined ? [] : ["name"])
-      ])) {
-      invalidHookField("background_tasks");
-    }
-    for (const key of ["id", "type", "status", "description"] as const) {
-      requireProviderText(entry[key], `background_tasks.${key}`);
-    }
-    for (const key of ["command", "agent_type", "server", "tool", "name"] as const) {
-      if (entry[key] !== undefined) {
-        requireProviderText(entry[key], `background_tasks.${key}`);
-      }
-    }
-  }
-}
-
-function assertSessionCrons(value: unknown): void {
-  if (value === undefined) return;
-  if (!Array.isArray(value)) invalidHookField("session_crons");
-  for (const entry of value) {
-    if (!isObject(entry)
-      || !hasExactKeys(entry, ["id", "schedule", "recurring", "prompt"])
-      || typeof entry.recurring !== "boolean") {
-      invalidHookField("session_crons");
-    }
-    for (const key of ["id", "schedule", "prompt"] as const) {
-      requireProviderText(entry[key], `session_crons.${key}`);
-    }
-  }
-}
-
-function hasPendingStopWork(payload: Record<string, unknown>): boolean {
-  // The provider only includes both arrays when its task registry is
-  // reachable. Missing registry facts cannot prove that the session is done.
-  return !Array.isArray(payload.background_tasks)
-    || !Array.isArray(payload.session_crons)
-    || payload.background_tasks.length > 0
-    || payload.session_crons.length > 0;
 }
 
 function requireProviderText(value: unknown, field: string): string {

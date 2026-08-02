@@ -40,8 +40,7 @@ import {
   type AgentRun
 } from "../run/agentRun.js";
 import { terminalizeExactTaskRun } from "../lifecycle/exactRunTerminalization.js";
-import { queueReviewRound } from "../commands/taskCommands.js";
-import type { TaskClaudeLifecycleEvent } from "./runtimeEventProcessor.js";
+import type { TaskClaudeStopFailureEvent } from "./runtimeEventProcessor.js";
 import type {
   DormantRuntimeOwnerCandidate,
   LeaderDispatchFailurePersistence,
@@ -58,10 +57,7 @@ import { createLeaderRecoveryNotification } from "../scheduler/operatorNotificat
 import { pendingWakeupsMatch } from "../scheduler/pendingWakeup.js";
 import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import {
-  submitWorkItemCandidate,
-  updateWorkItemStatus
-} from "../workItem/workItem.js";
+import { updateWorkItemStatus } from "../workItem/workItem.js";
 import {
   formatAgentRunReceiptId,
   formatTaskRecordReference
@@ -1488,8 +1484,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     });
   }
 
-  classifyClaudeLifecycleEvent(
-    input: TaskClaudeLifecycleEvent
+  classifyClaudeStopFailureEvent(
+    input: TaskClaudeStopFailureEvent
   ): "apply" | "obsolete" {
     const task = this.store.getTask(input.taskId);
     if (task?.status !== "active") return "obsolete";
@@ -1519,8 +1515,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return "apply";
   }
 
-  observeClaudeLifecycleEvent(
-    input: TaskClaudeLifecycleEvent,
+  observeClaudeStopFailureEvent(
+    input: TaskClaudeStopFailureEvent,
     now = new Date()
   ): Readonly<{ disposition: "applied" | "obsolete"; runId: string }> {
     return this.store.transaction((store) => {
@@ -1529,9 +1525,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         recordObsoleteRuntimeEvent(store, input, "run-missing", now);
         return { disposition: "obsolete", runId: input.runId };
       }
-      const summary = input.type === "claude-stop"
-        ? input.result!
-        : claudeStopFailureSummary(input);
+      const summary = claudeStopFailureSummary(input);
       const result = terminalizeExactTaskRun(store, {
         taskId: input.taskId,
         roleName: input.roleName,
@@ -1541,7 +1535,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         nativeSessionId: input.nativeSessionId,
         launchId: input.launchId,
         outcome: {
-          status: input.type === "claude-stop" ? "yielded" : "failed",
+          status: "failed",
           summary
         }
       }, now);
@@ -1577,71 +1571,29 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         now
       ));
 
-      let leaderReason: string | null = null;
-      if (input.type === "claude-stop") {
-        if (before.purpose === "review") {
-          leaderReason = "review-result";
-        } else if (before.workItemId !== undefined) {
-          const item = store.getWorkItem(input.taskId, before.workItemId);
-          if (item === null) {
-            throw new Error(`Work Item not found for Claude Run: ${before.workItemId}.`);
-          }
-          const reviewConfig = store.getReviewConfig();
-          const candidateRequired = input.roleName !== "leader" || reviewConfig !== null;
-          const updated = candidateRequired
-            ? submitWorkItemCandidate(item, {
-                summary,
-                source: { type: "run", runId: terminal.id },
-                ...(reviewConfig === null ? {} : { reviewPolicy: reviewConfig }),
-                ...(before.workspace === undefined ? {} : { workspace: before.workspace })
-              }, now)
-            : updateWorkItemStatus(item, "completed", now, summary);
-          store.saveWorkItem(input.taskId, updated);
-          if (candidateRequired) {
-            if (reviewConfig?.trigger === "always") {
-              const review = queueReviewRound(
-                store,
-                updated,
-                reviewConfig,
-                "policy",
-                now
-              );
-              if (review.run === null) leaderReason = "review-failed";
-            } else {
-              leaderReason = "candidate-ready";
-            }
-          }
-        } else if (input.roleName !== "leader") {
-          throw new Error(`Claude Run is not a WorkItem Run: ${input.runId}.`);
-        }
-      } else {
-        if (before.purpose === "execution" && before.workItemId !== undefined) {
-          const item = store.getWorkItem(input.taskId, before.workItemId);
-          if (item !== null && ![
-            "completed", "failed", "cancelled", "superseded", "abandoned"
-          ].includes(item.status)) {
-            store.saveWorkItem(
-              input.taskId,
-              updateWorkItemStatus(item, "failed", now, summary)
-            );
-          }
-        }
-        const role = store.getRole(input.taskId, input.roleName);
-        if (role !== null) {
-          store.saveRole(
+      if (before.purpose === "execution" && before.workItemId !== undefined) {
+        const item = store.getWorkItem(input.taskId, before.workItemId);
+        if (item !== null && ![
+          "completed", "failed", "cancelled", "superseded", "abandoned"
+        ].includes(item.status)) {
+          store.saveWorkItem(
             input.taskId,
-            updateRoleStatus(role, input.roleName === "leader" ? "failed" : "idle", now)
+            updateWorkItemStatus(item, "failed", now, summary)
           );
         }
-        leaderReason = before.purpose === "review" ? "review-failed" : "role-run-failed";
+      }
+      const role = store.getRole(input.taskId, input.roleName);
+      if (role !== null) {
+        store.saveRole(
+          input.taskId,
+          updateRoleStatus(role, input.roleName === "leader" ? "failed" : "idle", now)
+        );
       }
 
       store.saveEvent(input.taskId, createTaskEvent(
         store.nextEventId(input.taskId),
         input.taskId,
-        input.type === "claude-stop"
-          ? "runtime.claude-stop"
-          : "runtime.claude-stop-failure",
+        "runtime.claude-stop-failure",
         {
           eventId: input.eventId,
           runId: input.runId,
@@ -1651,11 +1603,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         now
       ));
 
-      if (leaderReason !== null) {
+      if (input.roleName !== "leader") {
         enqueueWork(
           store,
           { kind: "role", taskId: input.taskId, roleName: "leader" },
-          leaderReason,
+          before.purpose === "review" ? "review-failed" : "role-run-failed",
           now,
           [
             { type: "run", taskId: input.taskId, id: terminal.id },
@@ -1665,7 +1617,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
               : [{ type: "work-item" as const, taskId: input.taskId, id: terminal.workItemId }])
           ]
         );
-      } else if (input.type === "claude-stop-failure" && input.roleName === "leader") {
+      } else {
         store.saveOperatorNotification(createLeaderRecoveryNotification(
           input.taskId,
           summary,
@@ -1830,10 +1782,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }
 }
 
-function claudeStopFailureSummary(input: TaskClaudeLifecycleEvent): string {
+function claudeStopFailureSummary(input: TaskClaudeStopFailureEvent): string {
   return [
     "Claude StopFailure.",
-    `error: ${input.error ?? "Unknown Claude failure."}`,
+    `error: ${input.error}`,
     ...(input.errorDetails === undefined
       ? []
       : [`error_details: ${input.errorDetails}`]),

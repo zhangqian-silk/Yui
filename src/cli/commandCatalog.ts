@@ -881,7 +881,7 @@ export const ROOT_COMMAND = buildNode({
         },
         {
           name: "claude-hook",
-          summary: "Record a managed Claude lifecycle event from stdin.",
+          summary: "Record a managed Claude StopFailure event from stdin.",
           usage: "yui internal claude-hook"
         }
       ]

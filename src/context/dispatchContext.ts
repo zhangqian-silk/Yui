@@ -1,5 +1,4 @@
 import type { Role } from "../role/role.js";
-import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 
 export type DispatchContextStore = Readonly<Record<string, never>>;
 
@@ -47,7 +46,7 @@ export function buildWorkerContext(context: BuildRoleContextInput): string {
 }
 
 const WORKER_RUN_COMPLETION_MARKER = "Yui Role Run completion requirement:";
-const CODEX_WORKER_RUN_COMPLETION_REQUIREMENT = [
+const WORKER_RUN_COMPLETION_REQUIREMENT = [
   WORKER_RUN_COMPLETION_MARKER,
   "Before ending, read the exact current Run ID from the managed first line and execute "
     + "`yui task run yield <current-run-id> --summary-file - <<'YUI_SUMMARY'` "
@@ -59,27 +58,12 @@ const CODEX_WORKER_RUN_COMPLETION_REQUIREMENT = [
     + "do not inspect, poll, accept, or perform any further work in the same native turn."
 ].join("\n");
 
-const CLAUDE_WORKER_RUN_COMPLETION_REQUIREMENT = [
-  WORKER_RUN_COMPLETION_MARKER,
-  "Return the complete outcome and evidence in the final assistant message. Yui's managed "
-    + "Claude Stop hook durably records that exact UTF-8 result and yields the exact current Run.",
-  "If you explicitly yield instead, invoke `yui task run yield <current-run-id> --summary "
-    + '"<outcome and evidence>"` directly. Result transport must not require a heredoc, '
-    + "temporary file, or permission bypass.",
-  "Permission denial, a missing result, or StopFailure must never be reported as success. "
-    + "After the final message or a successful explicit yield, stop immediately."
-].join("\n");
-
 export function ensureWorkerRunCompletionRequirement(
-  input: string,
-  adapterId: AgentAdapterId = "codex"
+  input: string
 ): string {
-  const requirement = adapterId === "claude"
-    ? CLAUDE_WORKER_RUN_COMPLETION_REQUIREMENT
-    : CODEX_WORKER_RUN_COMPLETION_REQUIREMENT;
-  return input.endsWith(`\n\n${requirement}`)
+  return input.endsWith(`\n\n${WORKER_RUN_COMPLETION_REQUIREMENT}`)
     ? input
-    : `${input}\n\n${requirement}`;
+    : `${input}\n\n${WORKER_RUN_COMPLETION_REQUIREMENT}`;
 }
 
 function renderDispatchContext(
@@ -110,7 +94,7 @@ function renderDispatchContext(
   ].filter((section): section is string => section !== null && section.length > 0)
     .join("\n\n");
   return kind === "worker"
-    ? ensureWorkerRunCompletionRequirement(rendered, binding.adapterId)
+    ? ensureWorkerRunCompletionRequirement(rendered)
     : rendered;
 }
 

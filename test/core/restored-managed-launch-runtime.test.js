@@ -480,14 +480,22 @@ test("Claude launch identity is deterministic for one durable launch across retr
   assert.deepEqual(first.launch.args.slice(-2), ["--session-id", first.session.nativeSessionId]);
 });
 
-test("managed Claude Task Runs inject exact Stop hooks and permission-aware control-plane access", (t) => {
+test("managed Claude Task Runs inject only StopFailure and exact explicit-yield access", (t) => {
   const { home, store, task, role, agent, now } = fixture(t, "claude");
   const controlledRole = createRole(
     task.id,
     role.name,
     [createRoleAgentBinding(agent, {
       adapterId: "claude",
-      permission: { mode: "dontAsk", allowedTools: ["Read"] }
+      permission: {
+        mode: "dontAsk",
+        allowedTools: [
+          "Read",
+          "Bash(yui task run yield *)",
+          "Bash(yui --json task context *)",
+          "Bash(yui:*)"
+        ]
+      }
     })],
     agent.id,
     role.workspace,
@@ -531,12 +539,10 @@ test("managed Claude Task Runs inject exact Stop hooks and permission-aware cont
   const pluginRoot = plan.launch.args[pluginIndex + 1];
   assert.ok(pluginRoot.startsWith(join(home, "runtime")));
   const hooks = JSON.parse(readFileSync(join(pluginRoot, "hooks", "hooks.json"), "utf8"));
-  assert.deepEqual(Object.keys(hooks.hooks).sort(), ["Stop", "StopFailure"]);
-  for (const eventName of ["Stop", "StopFailure"]) {
-    const command = hooks.hooks[eventName][0].hooks[0];
-    assert.equal(command.command, process.execPath);
-    assert.deepEqual(command.args, ["/dist/cli.js", "internal", "claude-hook"]);
-  }
+  assert.deepEqual(Object.keys(hooks.hooks), ["StopFailure"]);
+  const command = hooks.hooks.StopFailure[0].hooks[0];
+  assert.equal(command.command, process.execPath);
+  assert.deepEqual(command.args, ["/dist/cli.js", "internal", "claude-hook"]);
   assert.equal(plan.launch.env.YUI_RUN_ID, run.id);
   assert.equal(plan.launch.env.YUI_LAUNCH_ID, "launch-1");
   assert.equal(plan.launch.env.YUI_NATIVE_SESSION_ID, plan.session.nativeSessionId);
@@ -546,7 +552,13 @@ test("managed Claude Task Runs inject exact Stop hooks and permission-aware cont
   assert.ok(allowed.includes(`Bash(yui --json task context ${task.id})`));
   assert.ok(allowed.includes(`Bash(yui --json task work list ${task.id})`));
   assert.ok(allowed.includes(`Bash(yui --json task work show ${item.id})`));
-  assert.ok(allowed.includes(`Bash(yui task run yield ${run.id}:*)`));
+  assert.ok(allowed.includes(
+    `Bash(yui task run yield ${run.id} --summary-file -:*)`
+  ));
+  assert.ok(!allowed.includes(`Bash(yui task run yield ${run.id}:*)`));
+  assert.ok(!allowed.includes("Bash(yui task run yield *)"));
+  assert.ok(!allowed.includes("Bash(yui --json task context *)"));
+  assert.ok(!allowed.includes("Bash(yui:*)"));
 });
 
 test("Codex notify payload is strictly converted to one durable runtime event", async (t) => {

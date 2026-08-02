@@ -2408,10 +2408,7 @@ function retryRun(
       roleAgentSessionResumeMode(sessions, effective.agentId, effective),
       previous.workItemId === undefined
         ? retaggedInput
-        : ensureWorkerRunCompletionRequirement(
-            retaggedInput,
-            activeRoleAgentBinding(role).adapterId
-          ),
+        : ensureWorkerRunCompletionRequirement(retaggedInput),
       now,
       {
         ...(previous.workItemId === undefined ? {} : { workItemId: previous.workItemId }),
