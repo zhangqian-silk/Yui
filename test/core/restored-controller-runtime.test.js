@@ -183,9 +183,7 @@ test("full recovery inventories dormant Task and global sessions once and stops 
     new Date(1),
     undefined,
     { kind: "full" },
-    undefined,
     true,
-    new Set(),
     [],
     lifecycleHost
   );
@@ -212,9 +210,7 @@ test("dirty recovery never performs the dormant native-session inventory", async
     new Date(1),
     undefined,
     { kind: "dirty", keys: ["role:task-1/leader"] },
-    undefined,
     true,
-    new Set(),
     [],
     lifecycleHost
   );
@@ -289,7 +285,6 @@ test("a main full pass never consumes the Operator mailbox", async () => {
     new Date(0),
     undefined,
     { kind: "full" },
-    undefined,
     false
   );
 });
@@ -513,9 +508,7 @@ test("one stale Role cleanup failure does not block another Role delivery", asyn
         "role:task-delivery/worker"
       ]
     },
-    undefined,
     true,
-    new Set(),
     [],
     lifecycleHost
   );
@@ -603,9 +596,7 @@ test("Task and global cleanup obligations supersede launch reservations atomical
       kind: "dirty",
       keys: ["role:task-1/worker", "global-role:operator"]
     },
-    undefined,
     true,
-    new Set(),
     [],
     lifecycleHost
   );
@@ -678,9 +669,7 @@ test("full recovery probes old reservations without stopping a healthy host", as
     new Date(120_001),
     undefined,
     { kind: "full" },
-    undefined,
     false,
-    new Set(),
     [],
     lifecycleHost
   );
@@ -940,9 +929,7 @@ test("stale Role cleanup finishes before a concurrently queued Run may launch", 
       kind: "dirty",
       keys: ["role:task-1/worker"]
     },
-    undefined,
     true,
-    new Set(),
     [],
     lifecycleHost
   );
@@ -2084,91 +2071,6 @@ test("an overdue semantic deadline uses bounded pass backoff instead of a zero-d
   await new Promise((resolve) => setTimeout(resolve, 50));
 
   assert.equal(failures, 3);
-  controller.stop();
-});
-
-test("overdue ready recovery remains targeted and retries until the composer is ready", async () => {
-  const task = { id: "task-1", status: "active", projectBindings: [] };
-  const roleValue = role(task.id, "worker");
-  let run = {
-    ...deliveredRun(task.id, roleValue.name),
-    deliveredAt: new Date(Date.now() - 1_000).toISOString()
-  };
-  let listTaskCalls = 0;
-  let readinessCalls = 0;
-  let recovered = 0;
-  const store = emptyStore();
-  store.listTasks = () => { listTaskCalls += 1; return [task]; };
-  store.getTask = () => task;
-  store.listRoles = () => [roleValue];
-  store.getRole = () => roleValue;
-  store.getActiveAgentRun = () => run;
-  store.recoverReadyRoleRun = () => {
-    recovered += 1;
-    run = null;
-  };
-  const delivery = {
-    ...noTmux,
-    async inspectRole() { return "present"; },
-    async inspectRoleReadiness() {
-      readinessCalls += 1;
-      return readinessCalls < 3 ? "busy" : "ready";
-    }
-  };
-  const controller = new FileTaskController(store, delivery, {
-    intervalMs: 60_000,
-    signalWindowMs: 1,
-    deliveryRetryMs: 2,
-    readyRecoveryAgeMs: 5
-  });
-
-  await controller.pump();
-  const fullPassTaskScans = listTaskCalls;
-  await new Promise((resolve) => setTimeout(resolve, 50));
-
-  assert.equal(readinessCalls, 3);
-  assert.equal(recovered, 1);
-  assert.equal(listTaskCalls, fullPassTaskScans);
-  controller.stop();
-});
-
-test("a terminal Role clears its pending ready-recovery timer", async () => {
-  const task = { id: "task-1", status: "active", projectBindings: [] };
-  const roleValue = role(task.id, "worker");
-  let run = {
-    ...deliveredRun(task.id, roleValue.name),
-    deliveredAt: new Date().toISOString()
-  };
-  let listTaskCalls = 0;
-  let readinessCalls = 0;
-  const store = emptyStore();
-  store.listTasks = () => { listTaskCalls += 1; return [task]; };
-  store.getTask = () => task;
-  store.listRoles = () => [roleValue];
-  store.getRole = () => roleValue;
-  store.getActiveAgentRun = () => run;
-  const delivery = {
-    ...noTmux,
-    async inspectRole() { return "present"; },
-    async inspectRoleReadiness() {
-      readinessCalls += 1;
-      return "busy";
-    }
-  };
-  const controller = new FileTaskController(store, delivery, {
-    intervalMs: 60_000,
-    signalWindowMs: 1,
-    readyRecoveryAgeMs: 30
-  });
-
-  await controller.pump();
-  const fullPassTaskScans = listTaskCalls;
-  run = null;
-  controller.signal("role:task-1/worker");
-  await new Promise((resolve) => setTimeout(resolve, 70));
-
-  assert.equal(readinessCalls, 0);
-  assert.equal(listTaskCalls, fullPassTaskScans);
   controller.stop();
 });
 

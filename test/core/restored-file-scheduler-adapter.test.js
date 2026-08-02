@@ -862,48 +862,6 @@ test("a second Hook waits behind the first grace closure instead of poisoning re
   assert.equal(store.getActiveAgentRun(task.id, role.name), null);
 });
 
-test("ready-composer recovery closes a fresh Leader run without a native session id", (t) => {
-  const { store, task, role, now, adapter } = fixture(t);
-  const run = createAgentRun(
-    "agent-run-fresh-missing-hook",
-    task.id,
-    role.name,
-    "new",
-    "continue",
-    now
-  );
-  assert.equal(adapter.saveLeaderDispatch({
-    task,
-    role: adapter.getRole(task.id, role.name),
-    run,
-    session: null,
-    wakeup: store.getPendingWakeup(task.id),
-    now
-  }), "claimed");
-  adapter.saveRoleRunDelivery({
-    task,
-    role: adapter.getRole(task.id, role.name),
-    run,
-    session: null,
-    now
-  });
-
-  adapter.recoverReadyRoleRun({
-    taskId: task.id,
-    roleName: role.name,
-    runId: run.id,
-    now: new Date(now.getTime() + 120_000)
-  });
-
-  assert.equal(store.getActiveAgentRun(task.id, role.name), null);
-  assert.equal(store.getTaskRoleSessionSet(task.id, role.name).inFlight, null);
-  assert.equal(store.getAgentRun(task.id, run.id).status, "yielded");
-  assert.deepEqual(
-    store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: role.name }).pending.reasons,
-    ["leader-turn-unclosed"]
-  );
-});
-
 test("a quiescent result-driven Leader Turn is recovered instead of inferring Task completion", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
   store.transaction((tx) => {

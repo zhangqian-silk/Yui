@@ -8,7 +8,6 @@ import {
 import { queueLeaderWakeup } from "./wakeupQueue.js";
 
 export const EXITED_ROLE_RUN_SUMMARY = "The role's tmux session exited before the run yielded.";
-export const DEFAULT_READY_RECOVERY_AGE_MS = 120_000;
 
 /**
  * Lightweight liveness only: an active AgentRun whose tmux role is absent is
@@ -18,13 +17,11 @@ export async function reconcileExitedRoleRuns(
   store: SchedulerStorePort,
   delivery: Pick<
     TmuxDeliveryPort,
-    "inspectRole" | "inspectRoles" | "inspectRoleReadiness" | "forgetPrepared"
+    "inspectRole" | "inspectRoles" | "forgetPrepared"
   >,
   now: Date,
   selection?: SchedulerReconcileSelection,
-  excludedRunIds: ReadonlySet<string> = new Set(),
-  minimumReadyRecoveryAgeMs = DEFAULT_READY_RECOVERY_AGE_MS,
-  readyRecoveryRunIds: ReadonlySet<string> = new Set()
+  excludedRunIds: ReadonlySet<string> = new Set()
 ): Promise<string[]> {
   const failed: string[] = [];
   const candidates = selectedSchedulerTasks(store, selection).flatMap((task) => (
@@ -70,35 +67,7 @@ export async function reconcileExitedRoleRuns(
       const status = batch === null
         ? await delivery.inspectRole(inspection)
         : batchStatuses.get(`${task.id}\0${role.name}`)!;
-      if (status === "present") {
-        const isFullReconciliation = selection === undefined || selection.full;
-        const readyRecoveryDue = readyRecoveryRunIds.has(run.id)
-          || (
-            isFullReconciliation
-            && run.deliveredAt !== undefined
-            && now.getTime() - Date.parse(run.deliveredAt) >= minimumReadyRecoveryAgeMs
-          );
-        if (
-          readyRecoveryDue
-          && run.deliveredAt !== undefined
-          && delivery.inspectRoleReadiness !== undefined
-          && store.recoverReadyRoleRun !== undefined
-          && await delivery.inspectRoleReadiness(inspection) === "ready"
-        ) {
-          store.recoverReadyRoleRun({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id,
-            now
-          });
-          delivery.forgetPrepared?.({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id
-          });
-        }
-        continue;
-      }
+      if (status === "present") continue;
 
       const persisted = store.saveExitedRoleRun({
         task,

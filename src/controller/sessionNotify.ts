@@ -35,6 +35,9 @@ type ControllerCall = (
 
 type CodexThreadNameSetter = (request: CodexThreadNameRequest) => Promise<void>;
 
+const NO_FINAL_ASSISTANT_MESSAGE_SUMMARY =
+  "Native Turn completed without a final assistant message.";
+
 /** Hidden CLI entrypoint used by Codex's structured notify hook. */
 export async function runSessionNotifyCommand(
   payloadArgument: string | undefined,
@@ -151,6 +154,7 @@ function requireText(value: unknown, label: string): string {
 }
 
 function requireAssistantMessage(value: unknown): string {
+  if (value === null) return NO_FINAL_ASSISTANT_MESSAGE_SUMMARY;
   if (typeof value !== "string" || value.includes("\0")) {
     throw new Error("Codex last assistant message is required.");
   }

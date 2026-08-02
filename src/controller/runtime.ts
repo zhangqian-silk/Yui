@@ -150,7 +150,6 @@ export async function startFileTaskControllerRuntime(
       signalWindowMs: options.signalWindowMs,
       deliveryRetryMs: options.deliveryRetryMs,
       deliveryRetryLimit: options.deliveryRetryLimit,
-      readyRecoveryAgeMs: options.readyRecoveryAgeMs,
       now: options.now,
       onError: options.onError,
       lifecycleHost: sessionHost,
