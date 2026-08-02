@@ -137,6 +137,13 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
   assert.match(operator, /has no Yui launch\s+command/u);
   assert.match(operator, /Use `--require-integration` whenever completing the mission requires changing\s+and delivering Project files/u);
   assert.match(operator, /requires a WorkItem, ChangeSet, and\s+committed Integration before completion/u);
+  assert.match(operator, /advances, corrects, shrinks, or\s+extends the same bounded outcome/u);
+  assert.match(operator, /share one final\s+acceptance, release, migration, or runtime upgrade/u);
+  assert.match(operator, /Same repository, same file, or a\s+potential Git conflict is neutral to Task identity/u);
+  assert.match(operator, /not a permanent backlog/u);
+  assert.match(operator, /direction change that shrinks or redirects the mission[\s\S]*Do not open a new\s+Task for a course correction/u);
+  assert.match(operator, /Do not pre-split WorkItems or decide their dependsOn, execution path,\s+acceptance, or Integration/u);
+  assert.match(operator, /Raise an InputRequest only for a real user choice[\s\S]*never ask the user to confirm "continue" as a\s+scheduler/u);
   assert.match(worker, /native subagent inherits the Leader Agent/u);
   assert.match(worker, /Do not run Yui lifecycle commands/u);
   assert.match(worker, /result and records the actual Profile revision/u);

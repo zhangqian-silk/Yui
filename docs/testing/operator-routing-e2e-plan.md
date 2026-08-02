@@ -451,7 +451,7 @@ P08、P09 是发布阻塞场景：歧义必须在创建前解决，不能靠替�
 修复错误路由。`task project add` 只允许 active Leader 为同一 outcome 追加
 确实需要的 Project，不是 Operator 猜错后的纠偏手段。
 
-### 7.2 Existing Task 归并：T01-T14
+### 7.2 Existing Task 归并：T01-T15
 
 | ID | 场景 | 预期 |
 |---|---|---|
@@ -469,9 +469,11 @@ P08、P09 是发布阻塞场景：歧义必须在创建前解决，不能靠替�
 | T12 | 新要求与旧要求冲突 | `UPDATE` 并保留变更原因 |
 | T13 | “继续”且候选唯一 | 使用唯一候选 |
 | T14 | “继续”但有多个相似 active Task | `ASK` |
+| T15 | 把原方案（如全量物化）收缩为更窄方案（如按需刷新） | `UPDATE` 原 Task，只路由 delta 和原因；替代 WorkItem 由 Leader cancel/supersede，不新建 Task |
 
-T01-T14 至少覆盖 `SAME`、`NEW`、`RESUME` 和 `STALE`；T07、T14 额外覆盖
-`SWITCH`、`RESTART` 和 `RETRY`。
+T01-T15 至少覆盖 `SAME`、`NEW`、`RESUME` 和 `STALE`；T07、T14 额外覆盖
+`SWITCH`、`RESTART` 和 `RETRY`。T15 验证方向收缩只路由 delta，不因课程修正
+新建 Task，替代由 Leader 管理。
 
 ### 7.3 生命周期：L01-L08
 
@@ -488,7 +490,7 @@ T01-T14 至少覆盖 `SAME`、`NEW`、`RESUME` 和 `STALE`；T07、T14 额外覆
 
 L03-L08 必须在 `RESUME` 或 `STALE` 会话中至少执行一次。
 
-### 7.4 复合请求：C01-C08
+### 7.4 复合请求：C01-C11
 
 | ID | 场景 | 预期 |
 |---|---|---|
@@ -500,6 +502,9 @@ L03-L08 必须在 `RESUME` 或 `STALE` 会话中至少执行一次。
 | C06 | 一个功能包含多个依赖步骤 | 一个 Task；Operator 不拆 WorkItem |
 | C07 | 一次提交多个互不相关的小需求 | 按独立 outcome 拆 Task |
 | C08 | 跨两个 Project 且共同验收的迁移 | 一个多 Project Task；Leader 可按 Project 拆 WorkItem |
+| C09 | 一次控制面升级同时含 disposition、Role config、权限、ID 迁移，要求一次性上线 | 一个 Task（共享发布/验收边界），Leader 排序多 WorkItem；Operator 不预拆 |
+| C10 | 两件事各自能独立验收、发布、回滚（如 Project 目录刷新 vs 独立 runtime 生命周期） | `SPLIT` 两个可并行 Task；潜在同文件冲突交 Git，不因此合并 |
+| C11 | 要求把“仓库以后要做的事”都记进同一个长期 Task | `DECLINE` 永久 backlog；解释 Task=有界共同交付，按独立 outcome 分别建 Task 或澄清 |
 
 ### 7.5 查询和汇报：Q01-Q08
 
@@ -516,7 +521,7 @@ L03-L08 必须在 `RESUME` 或 `STALE` 会话中至少执行一次。
 
 Q01-Q08 需要在其他会话改变 Task 状态后，通过 `RESUME`/`STALE` 再查询。
 
-### 7.6 安全和职责边界：S01-S09
+### 7.6 安全和职责边界：S01-S10
 
 | ID | 场景 | 预期 |
 |---|---|---|
@@ -529,6 +534,7 @@ Q01-Q08 需要在其他会话改变 Task 状态后，通过 `RESUME`/`STALE` 再
 | S07 | 指定 Agent/provider | 将约束传给 Leader，不污染 Profile |
 | S08 | 要求 Operator 代替 Leader 决定冲突 | 转交 Leader/InputRequest |
 | S09 | active Task 的同一结果确认还需 B | `UPDATE` 原 Task，由 Leader `task project add` |
+| S10 | active Task 正等 Worker yield/committed Integration/runtime version 等可机器观测条件，用户问“还要我做点啥让它继续” | `READ` 当前状态并报告；不创建 InputRequest、不让用户充当 scheduler、不擅自 retry/reopen |
 
 ### 7.7 跨会话交错：CS01-CS20
 
