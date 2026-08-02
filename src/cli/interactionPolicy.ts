@@ -75,6 +75,15 @@ const taskTarget = (
 
 export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze([
   {
+    commandPath: ["project", "refresh"],
+    selectors: [{
+      argumentIndex: 2,
+      entity: "project",
+      provider: "projects",
+      actionTarget: true
+    }]
+  },
+  {
     commandPath: ["project", "update"],
     selectors: [{
       argumentIndex: 2,
