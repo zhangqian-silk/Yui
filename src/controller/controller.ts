@@ -16,7 +16,8 @@ import type {
 } from "../scheduler/ports.js";
 import {
   DEFAULT_READY_RECOVERY_AGE_MS,
-  reconcileExitedRoleRuns
+  reconcileExitedRoleRuns,
+  type ReadyRecoveryControl
 } from "../scheduler/roleRunLiveness.js";
 import { repairOrphanedActiveTasks } from "../scheduler/activeTaskProgress.js";
 import {
@@ -116,7 +117,8 @@ export async function runControllerSchedulerPass(
   includeOperator = true,
   readyRecoveryRunIds: ReadonlySet<string> = new Set(),
   runtimeCleanupOutcomes: RuntimeCleanupOutcome[] = [],
-  lifecycleHost?: RuntimeLifecycleHost
+  lifecycleHost?: RuntimeLifecycleHost,
+  readyRecoveryControl?: ReadyRecoveryControl
 ): Promise<ControllerSchedulerResult> {
   const compiledSelection = compileReconcileSelection(scope);
   const selection = includeOperator
@@ -166,7 +168,8 @@ export async function runControllerSchedulerPass(
       roleSelection,
       uncertainRunIds,
       readyRecoveryAgeMs,
-      readyRecoveryRunIds
+      readyRecoveryRunIds,
+      readyRecoveryControl
     );
     await reconcileDormantRuntimeOwners(
       store,
@@ -217,6 +220,7 @@ type ReadyRecoveryRegistration = {
   readonly roleName: string;
   readonly runId: string;
   readonly deliveredAt: string;
+  readyObserved: boolean;
   attempts: number;
   timer?: NodeJS.Timeout;
 };
@@ -287,6 +291,8 @@ async function processSelectedRoleRuntimeCleanups(
         continue;
       }
       if (inspection.state === "running") {
+        if (target.kind === "global-role-runtime") continue;
+        if (store.getActiveAgentRun(target.taskId, target.roleName) === null) continue;
         const readiness = await inspectUnregisteredRuntimeReadiness(
           store,
           delivery,
@@ -329,22 +335,8 @@ async function processSelectedRoleRuntimeCleanups(
 async function inspectUnregisteredRuntimeReadiness(
   store: SchedulerStorePort,
   delivery: TmuxDeliveryPort,
-  target: RuntimeLifecycleTarget
+  target: Extract<RuntimeLifecycleTarget, { kind: "role-runtime" }>
 ): Promise<"ready" | "busy" | "absent" | "unsupported"> {
-  if (target.kind === "global-role-runtime") {
-    const operator = store.getOperatorDeliveryTarget();
-    if (
-      operator === null
-      || operator.roleName !== "operator"
-      || delivery.inspectGlobalRoleReadiness === undefined
-    ) {
-      return "unsupported";
-    }
-    return delivery.inspectGlobalRoleReadiness({
-      roleName: "operator",
-      adapterId: operator.adapterId
-    });
-  }
   const role = store.getRole(target.taskId, target.roleName);
   if (role === null || delivery.inspectRoleReadiness === undefined) {
     return "unsupported";
@@ -1012,6 +1004,13 @@ export class FileTaskController {
           ? { kind: "full" }
           : { kind: "dirty", keys: [...this.#pendingKeys] };
         const dueReadyRecoveryRunIds = this.#dueReadyRecoveryRunsForScope(scope);
+        const observedReadyRecoveryRunIds = new Set<string>();
+        const readyRecoveryControl: ReadyRecoveryControl = {
+          confirmedRunIds: new Set([...dueReadyRecoveryRunIds].filter((runId) => (
+            this.#readyRecoveryRegistrations.get(runId)?.readyObserved === true
+          ))),
+          observedRunIds: observedReadyRecoveryRunIds
+        };
         const runtimeCleanupOutcomes: RuntimeCleanupOutcome[] = [];
         this.#pendingFull = false;
         this.#pendingKeys.clear();
@@ -1028,7 +1027,8 @@ export class FileTaskController {
             false,
             dueReadyRecoveryRunIds,
             runtimeCleanupOutcomes,
-            this.#lifecycleHost
+            this.#lifecycleHost,
+            readyRecoveryControl
           );
           const secondRuntimeDrain = this.#drainRuntimeEvents();
           this.#clearPassRetry();
@@ -1036,7 +1036,10 @@ export class FileTaskController {
           this.#scheduleDeliveryRetries(result);
           this.#scheduleTaskMailboxRetries(scope);
           this.#scheduleReadyRecoveryForResults(result);
-          this.#settleReadyRecoveryPass(dueReadyRecoveryRunIds);
+          this.#settleReadyRecoveryPass(
+            dueReadyRecoveryRunIds,
+            observedReadyRecoveryRunIds
+          );
           this.#pruneReadyRecoveryRegistrations();
           if (
             scope.kind === "full"
@@ -1400,6 +1403,7 @@ export class FileTaskController {
       roleName,
       runId,
       deliveredAt,
+      readyObserved: false,
       attempts: 0
     };
     this.#readyRecoveryRegistrations.set(runId, registration);
@@ -1465,7 +1469,10 @@ export class FileTaskController {
     return selected;
   }
 
-  #settleReadyRecoveryPass(runIds: ReadonlySet<string>): void {
+  #settleReadyRecoveryPass(
+    runIds: ReadonlySet<string>,
+    observedRunIds: ReadonlySet<string>
+  ): void {
     if (runIds.size === 0) return;
     const pendingCompletions = new Set(
       this.store.listPendingRuntimeTurnCompletions().map((completion) => (
@@ -1492,6 +1499,7 @@ export class FileTaskController {
       )) {
         continue;
       }
+      registration.readyObserved = observedRunIds.has(runId);
       registration.attempts += 1;
       this.#armReadyRecovery(
         registration,

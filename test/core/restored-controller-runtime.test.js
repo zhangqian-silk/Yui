@@ -693,7 +693,7 @@ test("full recovery probes old reservations without stopping a healthy host", as
   assert.equal(mailboxes.get(stoppedTarget.roleName).processing, null);
 });
 
-test("a stale unregistered global Role is stopped only after its composer is ready", async () => {
+test("a foreground global Role awaiting its first Turn is preserved", async () => {
   const target = { kind: "global-role-runtime", roleName: "operator" };
   let mailbox = {
     schemaVersion: 1,
@@ -726,22 +726,12 @@ test("a stale unregistered global Role is stopped only after its composer is rea
   const stopped = [];
   const lifecycleHost = {
     async inspectOwner() { return { state: "running" }; },
-    async stopOwner(owner) {
-      stopped.push(owner);
-      return true;
-    }
-  };
-  const delivery = {
-    ...noTmux,
-    async inspectGlobalRoleReadiness(input) {
-      assert.deepEqual(input, { roleName: "operator", adapterId: "codex" });
-      return "ready";
-    }
+    async stopOwner(owner) { stopped.push(owner); return true; }
   };
 
   await runControllerSchedulerPass(
     store,
-    delivery,
+    noTmux,
     new Date(120_001),
     undefined,
     { kind: "full" },
@@ -752,11 +742,11 @@ test("a stale unregistered global Role is stopped only after its composer is rea
     lifecycleHost
   );
 
-  assert.deepEqual(stopped, [{ scope: "global", roleName: "operator" }]);
-  assert.equal(mailbox, null);
+  assert.deepEqual(stopped, []);
+  assert.notEqual(mailbox, null);
 });
 
-test("a stale unregistered Task Role uses the same ready-gated generation cleanup", async () => {
+test("a stale unregistered Task Role with an active Run uses ready-gated cleanup", async () => {
   const task = { id: "task-1", status: "active", projectBindings: [] };
   const roleValue = role(task.id, "worker");
   const target = { kind: "role-runtime", taskId: task.id, roleName: roleValue.name };
@@ -782,6 +772,7 @@ test("a stale unregistered Task Role uses the same ready-gated generation cleanu
   store.getTask = () => task;
   store.listRoles = () => [roleValue];
   store.getRole = () => roleValue;
+  store.getActiveAgentRun = () => ({ id: "run-1", status: "active" });
   store.listWorkMailboxes = () => mailbox === null ? [] : [mailbox];
   store.getWorkMailbox = (candidate) => candidate.kind === "role-runtime"
     ? mailbox
@@ -801,6 +792,7 @@ test("a stale unregistered Task Role uses the same ready-gated generation cleanu
   };
   const delivery = {
     ...noTmux,
+    async inspectRole() { return "present"; },
     async inspectRoleReadiness(input) {
       assert.deepEqual(input, {
         taskId: task.id,
@@ -819,6 +811,53 @@ test("a stale unregistered Task Role uses the same ready-gated generation cleanu
 
   assert.deepEqual(stopped, [{ scope: "task", taskId: task.id, roleName: roleValue.name }]);
   assert.equal(mailbox, null);
+});
+
+test("a foreground Task Role without an active Run is preserved", async () => {
+  const task = { id: "task-1", status: "active", projectBindings: [] };
+  const roleValue = role(task.id, "worker");
+  const target = { kind: "role-runtime", taskId: task.id, roleName: roleValue.name };
+  let mailbox = {
+    schemaVersion: 1,
+    target,
+    nextSequence: 2,
+    processing: {
+      batchId: "launch-unregistered-worker",
+      batch: {
+        fromSequence: 1, toSequence: 1, reasons: ["runtime-launch-reserved"],
+        refs: [], requestCount: 1,
+        firstQueuedAt: new Date(0).toISOString(),
+        lastQueuedAt: new Date(0).toISOString()
+      },
+      owner: "runtime-lifecycle",
+      startedAt: new Date(0).toISOString()
+    },
+    pending: null
+  };
+  const store = emptyStore();
+  store.listTasks = () => [task];
+  store.getTask = () => task;
+  store.listRoles = () => [roleValue];
+  store.getRole = () => roleValue;
+  store.listWorkMailboxes = () => [mailbox];
+  store.getWorkMailbox = () => mailbox;
+  const stopped = [];
+  const lifecycleHost = {
+    async inspectOwner() { return { state: "running" }; },
+    async stopOwner(owner) { stopped.push(owner); return true; }
+  };
+  const delivery = {
+    ...noTmux,
+    async inspectRoleReadiness() { return "ready"; }
+  };
+
+  await runControllerSchedulerPass(
+    store, delivery, new Date(120_001), undefined, { kind: "full" },
+    undefined, false, new Set(), [], lifecycleHost
+  );
+
+  assert.deepEqual(stopped, []);
+  assert.notEqual(mailbox, null);
 });
 
 test("an unavailable stale reservation is re-inspected by its exact dirty retry", async () => {
@@ -2258,9 +2297,59 @@ test("overdue ready recovery remains targeted and retries until the composer is 
   const fullPassTaskScans = listTaskCalls;
   await new Promise((resolve) => setTimeout(resolve, 50));
 
-  assert.equal(readinessCalls, 3);
+  // Two busy probes are followed by one observation and one confirmation.
+  assert.equal(readinessCalls, 4);
   assert.equal(failed, 1);
   assert.equal(listTaskCalls, fullPassTaskScans);
+  controller.stop();
+});
+
+test("a Hook drained after the first ready observation fences the confirmation pass", async () => {
+  const task = { id: "task-1", status: "active", projectBindings: [] };
+  const roleValue = role(task.id, "worker");
+  const run = {
+    ...deliveredRun(task.id, roleValue.name),
+    deliveredAt: new Date(Date.now() - 1_000).toISOString()
+  };
+  let hookObserved = false;
+  let drains = 0;
+  let stopped = 0;
+  let failed = 0;
+  const store = emptyStore();
+  store.listTasks = () => [task];
+  store.getTask = () => task;
+  store.listRoles = () => [roleValue];
+  store.getRole = () => roleValue;
+  store.getActiveAgentRun = () => run;
+  store.listPendingRuntimeTurnCompletions = () => hookObserved
+    ? [{ taskId: task.id, roleName: roleValue.name, runId: run.id }]
+    : [];
+  store.saveExitedRoleRun = () => { failed += 1; return "failed"; };
+  const delivery = {
+    ...noTmux,
+    async inspectRole() { return "present"; },
+    async inspectRoleReadiness() { return "ready"; },
+    async stopRole() { stopped += 1; return true; }
+  };
+  const controller = new FileTaskController(store, delivery, {
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
+    readyRecoveryAgeMs: 5,
+    runtimeEventProcessor: {
+      drain() {
+        drains += 1;
+        if (drains === 2) hookObserved = true;
+        return { acknowledgedEventIds: [], deferred: [], failed: [] };
+      }
+    }
+  });
+
+  await controller.pump();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(hookObserved, true);
+  assert.equal(stopped, 0);
+  assert.equal(failed, 0);
   controller.stop();
 });
 

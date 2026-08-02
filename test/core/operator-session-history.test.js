@@ -232,6 +232,41 @@ test("Operator list presents readable history while JSON data keeps native IDs p
   assert.match(result.data.sessions[0].ref, /^op-/);
 });
 
+test("Operator list exposes a fresh session that is awaiting first-Turn registration", () => {
+  const sessions = createRoleSessionSet(
+    { scope: "global", roleName: "operator" },
+    "codex",
+    FIRST
+  );
+  const target = { kind: "global-role-runtime", roleName: "operator" };
+  const result = runOperatorCommand(["list"], {
+    getGlobalRoleSessionSet: () => sessions,
+    getWorkMailbox: (candidate) => candidate.kind === "global-role-runtime"
+      ? {
+          schemaVersion: 1,
+          target,
+          nextSequence: 2,
+          processing: {
+            batchId: "launch-operator",
+            batch: {
+              fromSequence: 1, toSequence: 1,
+              reasons: ["runtime-launch-reserved"], refs: [], requestCount: 1,
+              firstQueuedAt: FIRST.toISOString(), lastQueuedAt: FIRST.toISOString()
+            },
+            owner: "runtime-lifecycle",
+            startedAt: FIRST.toISOString()
+          },
+          pending: null
+        }
+      : null
+  });
+
+  assert.equal(result.kind, "output");
+  assert.match(result.output, /registration is pending/i);
+  assert.doesNotMatch(result.output, /No Operator sessions/i);
+  assert.equal(result.data.registrationPending, true);
+});
+
 test("Operator resume --last resolves an opaque control and applies Agent switching atomically", () => {
   const { store } = operatorStore();
   const control = runOperatorCommand(["resume", "--last"], store, {

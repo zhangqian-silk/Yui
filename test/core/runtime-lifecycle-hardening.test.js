@@ -1146,12 +1146,15 @@ test("production runtime forwards readyRecoveryAgeMs into the Controller", async
       }
     },
     intervalMs: 60_000,
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
     readyRecoveryAgeMs: 10,
     now: () => new Date(FIRST.getTime() + 1_000)
   });
   t.after(() => running.close());
 
   await running.runtime.pump();
+  await new Promise((resolve) => setTimeout(resolve, 50));
 
   assert.deepEqual(failed.map(({ run: failedRun }) => failedRun.id), [run.id]);
   assert.equal(failed[0].reason, "missing-turn-hook");

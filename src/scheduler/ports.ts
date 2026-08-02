@@ -339,11 +339,6 @@ export interface TmuxDeliveryPort {
     adapterId: string;
     nativeSessionId?: string;
   }>): Promise<"ready" | "busy" | "absent">;
-  /** Readiness probe for a global Role whose fresh native session is not registered yet. */
-  inspectGlobalRoleReadiness?(input: Readonly<{
-    roleName: "operator";
-    adapterId: string;
-  }>): Promise<"ready" | "busy" | "absent">;
   inspectRoles?(inputs: readonly Readonly<{
     taskId: string;
     roleName: string;

@@ -636,9 +636,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       ) {
         return "state-changed";
       }
-      const repeatedMissingLeaderHook = input.reason === "missing-turn-hook"
-        && role.name === "leader"
-        && mailbox.processing.batch.reasons.includes("leader-runtime-recovery");
+      const missingLeaderHook = input.reason === "missing-turn-hook"
+        && role.name === "leader";
       store.saveAgentRun(failAgentRun(currentRun, input.summary, input.now));
       store.clearActiveAgentRun(task.id, role.name);
       clearTaskRoleRunInFlight(store, role, currentRun, input.now);
@@ -652,10 +651,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           );
         }
       }
-      store.saveRole(task.id, updateRoleStatus(role, "exited", input.now));
+      store.saveRole(task.id, updateRoleStatus(
+        role,
+        missingLeaderHook ? "failed" : "exited",
+        input.now
+      ));
       stopTaskSessionIfPresent(store, task.id, role.name, role.activeAgentId, input.now);
-      if (repeatedMissingLeaderHook) {
-        const detail = "Leader runtime registration failed again after one controlled recovery generation.";
+      if (missingLeaderHook) {
+        const detail = "Leader runtime registration failed because the native Turn Hook did not arrive.";
         store.saveLeaderFailure(recordLeaderFailure(
           task.id,
           input.session?.nativeSessionId ?? "(unregistered)",
@@ -681,9 +684,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         currentRun.purpose === "review"
           ? "review-failed"
           : role.name === "leader"
-            ? input.reason === "missing-turn-hook"
-              ? "leader-runtime-recovery"
-              : "leader-run-failed"
+            ? "leader-run-failed"
             : "role-run-failed",
         input.now
       );

@@ -12,6 +12,11 @@ export const MISSING_TURN_HOOK_SUMMARY =
   "The role returned to its composer without a matching native Turn Hook.";
 export const DEFAULT_READY_RECOVERY_AGE_MS = 120_000;
 
+export type ReadyRecoveryControl = Readonly<{
+  confirmedRunIds: ReadonlySet<string>;
+  observedRunIds: Set<string>;
+}>;
+
 /**
  * Lightweight liveness only: an active AgentRun whose tmux role is absent is
  * failed, then the Leader is durably queued. No TTL, cooldown, or schedules.
@@ -26,7 +31,8 @@ export async function reconcileExitedRoleRuns(
   selection?: SchedulerReconcileSelection,
   excludedRunIds: ReadonlySet<string> = new Set(),
   minimumReadyRecoveryAgeMs = DEFAULT_READY_RECOVERY_AGE_MS,
-  readyRecoveryRunIds: ReadonlySet<string> = new Set()
+  readyRecoveryRunIds: ReadonlySet<string> = new Set(),
+  readyRecoveryControl?: ReadyRecoveryControl
 ): Promise<string[]> {
   const failed: string[] = [];
   const candidates = selectedSchedulerTasks(store, selection).flatMap((task) => (
@@ -87,6 +93,8 @@ export async function reconcileExitedRoleRuns(
           && delivery.stopRole !== undefined
           && await delivery.inspectRoleReadiness(inspection) === "ready"
         ) {
+          readyRecoveryControl?.observedRunIds.add(run.id);
+          if (!readyRecoveryControl?.confirmedRunIds.has(run.id)) continue;
           // Readiness proves quiescence, not Turn completion. Stop the exact
           // generation before releasing durable state so a late Hook is stale.
           if (!await delivery.stopRole(task.id, role.name)) continue;

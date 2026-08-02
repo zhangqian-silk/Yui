@@ -10,6 +10,7 @@ import {
 } from "../operator/operatorSessionHistory.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { formatRelativeTimestamp } from "../output/timePresentation.js";
+import { hasRuntimeLaunchReservation } from "../runtime/lifecycleReservation.js";
 import { updateGlobalRole, type GlobalRole } from "../role/role.js";
 import {
   submitOperatorMessage,
@@ -104,9 +105,17 @@ function listSessions(
 ): TaskCommandExecution {
   if (args.length !== 0) throw usageError("Operator list usage: yui operator list.");
   const sessions = listOperatorSessions(store.getGlobalRoleSessionSet("operator"));
+  const registrationPending = hasRuntimeLaunchReservation(
+    store.getWorkMailbox?.({
+      kind: "global-role-runtime",
+      roleName: "operator"
+    }) ?? null
+  );
   const now = options.now?.() ?? new Date();
   const output = sessions.length === 0
-    ? "○ No Operator sessions are available.\n"
+    ? registrationPending
+      ? "◌ Operator session registration is pending.\n"
+      : "○ No Operator sessions are available.\n"
     : `${renderTable(
         "Operator sessions",
         [
@@ -122,11 +131,13 @@ function listSessions(
           session.state
         ]),
         options.width ?? defaultTableWidth()
-      )}\n\n${sessions.length} session${sessions.length === 1 ? "" : "s"}\n`;
+      )}\n\n${sessions.length} session${sessions.length === 1 ? "" : "s"}${
+        registrationPending ? " · registration pending" : ""
+      }\n`;
   return {
     kind: "output",
     output,
-    data: { sessions }
+    data: { sessions, registrationPending }
   };
 }
 
