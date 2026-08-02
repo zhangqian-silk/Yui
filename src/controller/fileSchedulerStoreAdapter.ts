@@ -990,10 +990,21 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         ? "apply"
         : "deferred";
     }
-    // A first native Turn may be explicitly terminalized by the CLI before
-    // its Hook arrives. The Hook still owns the native-session fact even
-    // though there is no Run left to close.
-    if (sessions?.inFlight === null || sessions === null) return "apply";
+    // A normal explicit CLI yield may precede its native Hook; that Hook still
+    // owns the turn fact. A forced cleanup boundary or stopped process instead
+    // makes the old generation obsolete.
+    if (sessions?.inFlight === null || sessions === null) {
+      const cleanup = hasRuntimeCleanupObligation(this.store.getWorkMailbox(
+        runtimeLifecycleTarget({
+          scope: "task",
+          taskId: input.taskId,
+          roleName: input.roleName
+        })
+      ));
+      return cleanup || isLeaderDisposedWorkItemRun(this.store, input)
+        ? "obsolete"
+        : "apply";
+    }
     if (input.runId === undefined || sessions.inFlight.runId !== input.runId) {
       return "obsolete";
     }
@@ -1016,6 +1027,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     session: RoleAgentSession;
     duplicate: boolean;
     pendingRunId?: string;
+    disposition?: "obsolete";
   }> {
     return this.store.transaction((store) => {
       const task = store.getTask(input.taskId);
@@ -1078,6 +1090,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           duplicate: true,
           pendingRunId: pending.runId
         };
+      }
+      if (sessions.inFlight === null
+        && existing !== undefined
+        && (
+          hasRuntimeCleanupObligation(store.getWorkMailbox(runtimeLifecycleTarget(owner)))
+          || isLeaderDisposedWorkItemRun(store, input)
+        )) {
+        return { session: existing, duplicate: false, disposition: "obsolete" };
       }
       // Classification is only an optimization. Revalidate the Run inside the
       // authoritative transaction before a Hook may claim a native identity.
@@ -1859,6 +1879,27 @@ function recordObsoleteRuntimeEvent(
     },
     now
   ));
+}
+
+function isLeaderDisposedWorkItemRun(
+  store: TaskStore,
+  input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    runId?: string;
+  }>
+): boolean {
+  if (input.runId === undefined) return false;
+  const run = store.getAgentRun(input.taskId, input.runId);
+  if (run === null
+    || run.status !== "failed"
+    || run.roleName !== input.roleName
+    || run.effective.agentId !== input.agentId
+    || run.workItemId === undefined) {
+    return false;
+  }
+  return store.getWorkItem(input.taskId, run.workItemId)?.disposition !== undefined;
 }
 
 function sessionPreview(value: string): string {

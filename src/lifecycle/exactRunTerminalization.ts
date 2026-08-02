@@ -27,6 +27,8 @@ export type ExactRunTerminalizationInput = Readonly<{
   launchId?: string;
   /** Aggregate retirement owns every queued Role signal, not only this Run. */
   mailboxDisposition?: "exact" | "discard";
+  /** Leader-forced control boundaries must stop the native process on every provider. */
+  runtimeCleanup?: "provider-default" | "required";
   outcome: Readonly<{
     status: "yielded" | "failed";
     summary: string;
@@ -126,11 +128,12 @@ export function terminalizeExactTaskRun(
       receiptId: input.receiptId
     }, now));
   }
-  // Claude's native Hook payload has no provider turn id. End the managed
-  // process generation at every exact Run boundary, then resume the same
-  // native session in a fresh process whose immutable launch environment is
-  // bound to the next Run. Cleanup is durable and runs before later delivery.
-  if (run.effective.adapterId === "claude") {
+  // Claude's native Hook payload has no provider turn id, so its default exact
+  // Run boundary ends the process generation. A caller may additionally make
+  // cleanup mandatory for a provider-independent control action such as
+  // Leader disposition. The durable Session identity itself is preserved.
+  if (input.runtimeCleanup === "required"
+    || run.effective.adapterId === "claude") {
     enqueueWork(
       store,
       runtimeLifecycleTarget({

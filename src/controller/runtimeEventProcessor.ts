@@ -171,7 +171,11 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
         this.recordObsolete(event, "identity-mismatch-or-terminal", now);
         return disposition;
       }
-      this.observer.observeRuntimeTurnCompleted(input, now);
+      const observed = this.observer.observeRuntimeTurnCompleted(input, now);
+      if (isObsoleteRuntimeTurnObservation(observed)) {
+        this.recordObsolete(event, "runtime-cleanup-or-stopped-session", now);
+        return "obsolete";
+      }
       return "applied";
     }
     const input: GlobalRuntimeTurnCompleted = {
@@ -264,4 +268,10 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
     this.inbox.acknowledge(id);
     acknowledged.push(id);
   }
+}
+
+function isObsoleteRuntimeTurnObservation(value: unknown): boolean {
+  return typeof value === "object"
+    && value !== null
+    && (value as { disposition?: unknown }).disposition === "obsolete";
 }

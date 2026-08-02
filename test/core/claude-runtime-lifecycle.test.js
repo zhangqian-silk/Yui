@@ -51,6 +51,18 @@ function fixture(t) {
   };
 }
 
+function currentClaudeHookCommon(hookEventName) {
+  return {
+    session_id: "native-1",
+    prompt_id: "550e8400-e29b-41d4-a716-446655440000",
+    transcript_path: "/tmp/claude/native-1.jsonl",
+    cwd: "/tmp/managed-workspace",
+    permission_mode: "dontAsk",
+    effort: { level: "max" },
+    hook_event_name: hookEventName
+  };
+}
+
 function workflowFixture(t) {
   const home = mkdtempSync(join(tmpdir(), "yui-claude-lifecycle-state-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
@@ -131,9 +143,11 @@ test("Claude Stop durably preserves a complete long multiline UTF-8 result befor
   const signals = [];
 
   await runClaudeLifecycleHookCommand(JSON.stringify({
-    hook_event_name: "Stop",
-    session_id: "native-1",
-    last_assistant_message: result
+    ...currentClaudeHookCommon("Stop"),
+    stop_hook_active: false,
+    last_assistant_message: result,
+    background_tasks: [],
+    session_crons: []
   }), environment, async (...args) => {
     signals.push(args);
     assert.equal(new FileRuntimeEventInbox(home).list().length, 1);
@@ -155,45 +169,120 @@ test("Claude StopFailure captures structured evidence and remains durable when w
   const { home, environment } = fixture(t);
 
   await assert.doesNotReject(runClaudeLifecycleHookCommand(JSON.stringify({
-    hook_event_name: "StopFailure",
-    session_id: "native-1",
-    error: "API request failed",
+    ...currentClaudeHookCommon("StopFailure"),
+    agent_type: "managed-worker",
+    error: "server_error",
     error_details: "upstream 503\nrequest-id: abc",
-    last_assistant_message: "Partial but not successful"
+    last_assistant_message: "API Error: upstream 503"
   }), environment, async () => {
     throw new Error("Controller offline");
   }));
 
   const [event] = new FileRuntimeEventInbox(home).list();
   assert.equal(event.type, "claude-stop-failure");
-  assert.equal(event.error, "API request failed");
+  assert.equal(event.error, "server_error");
   assert.equal(event.errorDetails, "upstream 503\nrequest-id: abc");
-  assert.equal(event.lastAssistantMessage, "Partial but not successful");
+  assert.equal(event.lastAssistantMessage, "API Error: upstream 503");
+  assert.equal(event.agentId, "claude-primary");
+});
+
+test("Claude Stop with pending background or scheduled work is not a terminal result", async (t) => {
+  const { home, environment } = fixture(t);
+  const signals = [];
+
+  for (const pending of [
+    {
+      background_tasks: [{
+        id: "task-001",
+        type: "shell",
+        status: "running",
+        description: "tail logs",
+        command: "tail -f /tmp/service.log"
+      }],
+      session_crons: []
+    },
+    {
+      background_tasks: [],
+      session_crons: [{
+        id: "cron-001",
+        schedule: "0 9 * * 1-5",
+        recurring: true,
+        prompt: "check the build"
+      }]
+    }
+  ]) {
+    await assert.doesNotReject(runClaudeLifecycleHookCommand(JSON.stringify({
+      ...currentClaudeHookCommon("Stop"),
+      stop_hook_active: false,
+      last_assistant_message: "Waiting for managed background work.",
+      ...pending
+    }), environment, async (...args) => {
+      signals.push(args);
+      return {};
+    }));
+  }
+
+  assert.deepEqual(new FileRuntimeEventInbox(home).list(), []);
+  assert.deepEqual(signals, []);
 });
 
 test("Claude lifecycle stdin is strict and never infers an active Run", async (t) => {
   const { home, environment } = fixture(t);
   await assert.rejects(
     runClaudeLifecycleHookCommand(JSON.stringify({
-      hook_event_name: "Stop",
-      session_id: "native-1"
+      ...currentClaudeHookCommon("Stop"),
+      stop_hook_active: false,
+      background_tasks: [],
+      session_crons: []
     }), environment, async () => ({})),
     /last_assistant_message/i
   );
   await assert.rejects(
     runClaudeLifecycleHookCommand(JSON.stringify({
-      hook_event_name: "Stop",
-      session_id: "native-1",
+      ...currentClaudeHookCommon("Stop"),
+      stop_hook_active: false,
       last_assistant_message: "done",
+      background_tasks: [],
+      session_crons: [],
       unexpected: true
     }), environment, async () => ({})),
     /invalid|unexpected/i
   );
   await assert.rejects(
     runClaudeLifecycleHookCommand(JSON.stringify({
-      hook_event_name: "Stop",
-      session_id: "native-1",
-      last_assistant_message: "done"
+      ...currentClaudeHookCommon("Stop"),
+      effort: { level: "ultra" },
+      stop_hook_active: false,
+      last_assistant_message: "done",
+      background_tasks: [],
+      session_crons: []
+    }), environment, async () => ({})),
+    /effort/i
+  );
+  await assert.rejects(
+    runClaudeLifecycleHookCommand(JSON.stringify({
+      ...currentClaudeHookCommon("Stop"),
+      stop_hook_active: false,
+      last_assistant_message: "waiting",
+      background_tasks: [{
+        id: "task-001",
+        type: "shell",
+        status: "running",
+        description: "tail logs",
+        command: "tail -f /tmp/service.log",
+        inferred_run_id: "agent-run-wrong"
+      }],
+      session_crons: []
+    }), environment, async () => ({})),
+    /background_tasks/i
+  );
+  await assert.rejects(
+    runClaudeLifecycleHookCommand(JSON.stringify({
+      ...currentClaudeHookCommon("Stop"),
+      stop_hook_active: false,
+      last_assistant_message: "done",
+      background_tasks: [],
+      session_crons: []
     }), { ...environment, YUI_RUN_ID: undefined }, async () => ({})),
     /Run id/i
   );

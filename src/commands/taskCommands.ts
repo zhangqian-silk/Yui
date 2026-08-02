@@ -2165,6 +2165,7 @@ function disposeWork(
         agentId: run.effective.agentId,
         runId: run.id,
         receiptId: formatAgentRunReceiptId(task.id, run.id),
+        runtimeCleanup: "required",
         outcome: {
           status: "failed",
           summary: `Work Item ${kind}: ${summary}`

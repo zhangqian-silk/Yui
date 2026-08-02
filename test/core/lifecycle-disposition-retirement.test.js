@@ -37,16 +37,25 @@ const FIRST = new Date("2026-08-02T01:00:00.000Z");
 const SECOND = new Date("2026-08-02T01:00:01.000Z");
 const THIRD = new Date("2026-08-02T01:00:02.000Z");
 
-function fixture(t) {
+function fixture(t, { adapterId = "claude" } = {}) {
   const home = mkdtempSync(join(tmpdir(), "yui-terminal-disposition-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home);
   const store = new FileTaskStore(home);
-  const agent = createConfiguredAgent("claude-primary", "claude", "claude", [], [], FIRST);
+  const agentId = `${adapterId}-primary`;
+  const agent = createConfiguredAgent(agentId, adapterId, adapterId, [], [], FIRST);
   const task = activateTask(createTask("task-1", "Retire stale task", FIRST), FIRST);
   const role = createRole(
     task.id,
     "worker",
+    [createRoleAgentBinding(agent)],
+    agent.id,
+    home,
+    FIRST
+  );
+  const leader = createRole(
+    task.id,
+    "leader",
     [createRoleAgentBinding(agent)],
     agent.id,
     home,
@@ -60,13 +69,20 @@ function fixture(t) {
   store.transaction((tx) => {
     tx.saveConfiguredAgent(agent);
     tx.saveTask(task);
+    tx.saveRole(task.id, leader);
     tx.saveRole(task.id, updateRoleStatus(role, "running", FIRST));
     tx.saveWorkItem(task.id, item);
   });
   return { home, store, agent, task, role, item };
 }
 
-function prepareRun(store, { delivered, id = "agent-run-1", nativeSessionId = "native-1" }) {
+function prepareRun(store, {
+  delivered,
+  id = "agent-run-1",
+  nativeSessionId = "native-1",
+  agentId = "claude-primary",
+  adapterId = "claude"
+}) {
   let run = createAgentRun(
     id,
     "task-1",
@@ -76,7 +92,7 @@ function prepareRun(store, { delivered, id = "agent-run-1", nativeSessionId = "n
     FIRST,
     {
       workItemId: "work-item-1",
-      agent: { agentId: "claude-primary", adapterId: "claude" }
+      agent: { agentId, adapterId }
     }
   );
   if (delivered) run = markAgentRunDelivered(run, SECOND);
@@ -104,18 +120,18 @@ function prepareRun(store, { delivered, id = "agent-run-1", nativeSessionId = "n
     }
     let sessions = createRoleSessionSet(
       { scope: "task", taskId: "task-1", roleName: "worker" },
-      "claude-primary",
+      agentId,
       FIRST
     );
     sessions = recordRoleAgentSession(sessions, {
-      agentId: "claude-primary",
-      adapterId: "claude",
+      agentId,
+      adapterId,
       nativeSessionId,
       policy: "fixed",
       status: "running"
     }, FIRST);
     sessions = bindTaskRoleRun(sessions, {
-      agentId: "claude-primary",
+      agentId,
       runId: run.id,
       receiptId: `agent-run:${run.taskId}/${run.id}`
     }, FIRST);
@@ -187,6 +203,110 @@ test("Leader disposition atomically closes delivered and undelivered WorkItem Ru
     assert.equal(mailbox.processing, null);
     assert.equal(store.getTaskRoleSessionSet(task.id, run.roleName).inFlight, null);
   }
+});
+
+test("Leader disposition forces cleanup and obsoletes late Hooks for delivered and prepared Codex Runs", (t) => {
+  for (const delivered of [false, true]) {
+    const { store, task, item, agent } = fixture(t, { adapterId: "codex" });
+    const run = prepareRun(store, {
+      delivered,
+      id: "agent-run-1",
+      agentId: agent.id,
+      adapterId: "codex"
+    });
+    runTaskCommand([
+      "work", "dispose", item.id, "cancelled", "--summary", "The attempt is obsolete."
+    ], store, {
+      now: () => THIRD,
+      environment: {
+        YUI_SESSION_SCOPE: "task",
+        YUI_TASK_ID: task.id,
+        YUI_ROLE: "leader"
+      }
+    });
+
+    assert.equal(store.getAgentRun(task.id, run.id).status, "failed");
+    assert.equal(store.getActiveAgentRun(task.id, run.roleName), null);
+    const sessions = store.getTaskRoleSessionSet(task.id, run.roleName);
+    assert.equal(sessions.inFlight, null);
+    assert.equal(sessions.sessions[agent.id].status, "ready");
+    assert.equal(sessions.sessions[agent.id].nativeSessionId, "native-1");
+    const runtimeTarget = {
+      kind: "role-runtime",
+      taskId: task.id,
+      roleName: run.roleName
+    };
+    assert.deepEqual(
+      store.getWorkMailbox(runtimeTarget).pending.reasons,
+      ["runtime-cleanup-required"]
+    );
+
+    const adapter = new FileSchedulerStoreAdapter(store);
+    const lateHook = {
+      taskId: task.id,
+      roleName: run.roleName,
+      agentId: agent.id,
+      adapterId: "codex",
+      nativeSessionId: "native-1",
+      turnId: delivered ? "turn-delivered" : "turn-prepared",
+      runId: run.id
+    };
+    assert.equal(adapter.classifyRuntimeTurnCompleted(lateHook), "obsolete");
+    assert.equal(adapter.observeRuntimeTurnCompleted({
+      ...lateHook,
+      summary: "Late result from the disposed Run."
+    }, THIRD).disposition, "obsolete");
+    assert.deepEqual(
+      store.getTaskRoleSessionSet(task.id, run.roleName).sessions[agent.id].recentCompletedTurnIds,
+      []
+    );
+    assert.equal(adapter.completeRuntimeCleanup(runtimeTarget, THIRD), true);
+    const stopped = store.getTaskRoleSessionSet(task.id, run.roleName);
+    assert.equal(stopped.sessions[agent.id].status, "stopped");
+    assert.equal(stopped.sessions[agent.id].nativeSessionId, "native-1");
+    assert.equal(adapter.classifyRuntimeTurnCompleted(lateHook), "obsolete");
+  }
+});
+
+test("normal Codex explicit yield keeps its resumable runtime and Hook behavior", (t) => {
+  const { store, task, agent } = fixture(t, { adapterId: "codex" });
+  const run = prepareRun(store, {
+    delivered: true,
+    id: "agent-run-1",
+    agentId: agent.id,
+    adapterId: "codex"
+  });
+
+  runTaskCommand([
+    "run", "yield", run.id, "--summary", "Normal explicit result."
+  ], store, {
+    now: () => THIRD,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "worker"
+    }
+  });
+
+  const runtimeTarget = {
+    kind: "role-runtime",
+    taskId: task.id,
+    roleName: run.roleName
+  };
+  assert.equal(store.getWorkMailbox(runtimeTarget), null);
+  assert.equal(
+    store.getTaskRoleSessionSet(task.id, run.roleName).sessions[agent.id].nativeSessionId,
+    "native-1"
+  );
+  assert.equal(new FileSchedulerStoreAdapter(store).classifyRuntimeTurnCompleted({
+    taskId: task.id,
+    roleName: run.roleName,
+    agentId: agent.id,
+    adapterId: "codex",
+    nativeSessionId: "native-1",
+    turnId: "turn-normal-yield",
+    runId: run.id
+  }), "apply");
 });
 
 test("explicit terminal state wins and a late old-session Hook cannot close its successor", (t) => {

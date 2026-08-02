@@ -27,6 +27,7 @@ export type ClaudeLifecycleHookNotification =
   | (ClaudeHookEnvelope & Readonly<{
       type: "Stop";
       result: string;
+      pendingWork: boolean;
     }>)
   | (ClaudeHookEnvelope & Readonly<{
       type: "StopFailure";
@@ -43,6 +44,10 @@ export async function runClaudeLifecycleHookCommand(
 ): Promise<void> {
   const notification = parseClaudeLifecycleHookNotification(stdinJson, environment);
   const home = requireIdentity(environment.YUI_HOME, "YUI_HOME");
+  // Stop is also emitted while Claude is paused for background or scheduled
+  // work. That provider fact is not a terminal Run result; a later empty Stop
+  // owns completion after the pending work wakes the same session.
+  if (notification.type === "Stop" && notification.pendingWork) return;
   const inbox = new FileRuntimeEventInbox(home);
   const common = {
     scope: "task" as const,
@@ -120,7 +125,8 @@ export function parseClaudeLifecycleHookNotification(
     return {
       ...common,
       type,
-      result: requireResult(payload.last_assistant_message, "Claude last_assistant_message")
+      result: requireResult(payload.last_assistant_message, "Claude last_assistant_message"),
+      pendingWork: hasPendingStopWork(payload)
     };
   }
   return {
@@ -162,24 +168,150 @@ function assertHookKeys(
   const common = new Set([
     "hook_event_name",
     "session_id",
+    "prompt_id",
     "transcript_path",
     "cwd",
-    "permission_mode"
+    "permission_mode",
+    "effort",
+    "agent_id",
+    "agent_type"
   ]);
   const allowed = type === "Stop"
-    ? new Set([...common, "stop_hook_active", "last_assistant_message"])
+    ? new Set([
+        ...common,
+        "stop_hook_active",
+        "last_assistant_message",
+        "background_tasks",
+        "session_crons"
+      ])
     : new Set([...common, "error", "error_details", "last_assistant_message"]);
   const unexpected = Object.keys(payload).find((key) => !allowed.has(key));
   if (unexpected !== undefined) {
     throw new Error(`Claude lifecycle hook stdin JSON has unexpected field: ${unexpected}.`);
   }
   for (const required of type === "Stop"
-    ? ["hook_event_name", "session_id", "last_assistant_message"]
+    ? ["hook_event_name", "session_id", "stop_hook_active", "last_assistant_message"]
     : ["hook_event_name", "session_id", "error"]) {
     if (!Object.hasOwn(payload, required)) {
       throw new Error(`Claude lifecycle hook stdin JSON is missing ${required}.`);
     }
   }
+  assertCurrentCommonFields(payload);
+  if (type === "Stop") {
+    if (typeof payload.stop_hook_active !== "boolean") {
+      invalidHookField("stop_hook_active");
+    }
+    assertBackgroundTasks(payload.background_tasks);
+    assertSessionCrons(payload.session_crons);
+  } else if (!CLAUDE_STOP_FAILURE_ERRORS.has(payload.error as string)) {
+    invalidHookField("error");
+  }
+}
+
+const CLAUDE_PERMISSION_MODES = new Set([
+  "default",
+  "plan",
+  "acceptEdits",
+  "auto",
+  "dontAsk",
+  "bypassPermissions"
+]);
+const CLAUDE_EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
+const CLAUDE_STOP_FAILURE_ERRORS = new Set([
+  "rate_limit",
+  "overloaded",
+  "authentication_failed",
+  "oauth_org_not_allowed",
+  "billing_error",
+  "invalid_request",
+  "model_not_found",
+  "server_error",
+  "max_output_tokens",
+  "unknown"
+]);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+function assertCurrentCommonFields(payload: Record<string, unknown>): void {
+  for (const key of ["transcript_path", "cwd", "agent_id", "agent_type"] as const) {
+    if (payload[key] !== undefined) requireProviderText(payload[key], key);
+  }
+  if (payload.prompt_id !== undefined) {
+    const promptId = requireProviderText(payload.prompt_id, "prompt_id");
+    if (!UUID_PATTERN.test(promptId)) invalidHookField("prompt_id");
+  }
+  if (payload.permission_mode !== undefined
+    && !CLAUDE_PERMISSION_MODES.has(payload.permission_mode as string)) {
+    invalidHookField("permission_mode");
+  }
+  if (payload.effort !== undefined) {
+    if (!isObject(payload.effort)
+      || !hasExactKeys(payload.effort, ["level"])
+      || !CLAUDE_EFFORT_LEVELS.has(payload.effort.level as string)) {
+      invalidHookField("effort");
+    }
+  }
+}
+
+function assertBackgroundTasks(value: unknown): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) invalidHookField("background_tasks");
+  for (const entry of value) {
+    if (!isObject(entry)
+      || !hasExactKeys(entry, [
+        "id", "type", "status", "description",
+        ...(entry.command === undefined ? [] : ["command"]),
+        ...(entry.agent_type === undefined ? [] : ["agent_type"]),
+        ...(entry.server === undefined ? [] : ["server"]),
+        ...(entry.tool === undefined ? [] : ["tool"]),
+        ...(entry.name === undefined ? [] : ["name"])
+      ])) {
+      invalidHookField("background_tasks");
+    }
+    for (const key of ["id", "type", "status", "description"] as const) {
+      requireProviderText(entry[key], `background_tasks.${key}`);
+    }
+    for (const key of ["command", "agent_type", "server", "tool", "name"] as const) {
+      if (entry[key] !== undefined) {
+        requireProviderText(entry[key], `background_tasks.${key}`);
+      }
+    }
+  }
+}
+
+function assertSessionCrons(value: unknown): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) invalidHookField("session_crons");
+  for (const entry of value) {
+    if (!isObject(entry)
+      || !hasExactKeys(entry, ["id", "schedule", "recurring", "prompt"])
+      || typeof entry.recurring !== "boolean") {
+      invalidHookField("session_crons");
+    }
+    for (const key of ["id", "schedule", "prompt"] as const) {
+      requireProviderText(entry[key], `session_crons.${key}`);
+    }
+  }
+}
+
+function hasPendingStopWork(payload: Record<string, unknown>): boolean {
+  return (Array.isArray(payload.background_tasks) && payload.background_tasks.length > 0)
+    || (Array.isArray(payload.session_crons) && payload.session_crons.length > 0);
+}
+
+function requireProviderText(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.includes("\0") || value.trim().length === 0) {
+    invalidHookField(field);
+  }
+  return value;
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  return Object.keys(value).length === expected.length
+    && expected.every((key) => Object.hasOwn(value, key));
+}
+
+function invalidHookField(field: string): never {
+  throw new Error(`Claude lifecycle hook stdin JSON has invalid ${field}.`);
 }
 
 function requireIdentity(value: unknown, label: string): string {
