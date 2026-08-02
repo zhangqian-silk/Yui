@@ -2,6 +2,7 @@ import { createAgentRun } from "../run/agentRun.js";
 import { markYuiRunInput } from "../run/runIdentity.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
+import { effectiveLaunchSnapshotsCompatible } from "../executor/effectiveLaunch.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
 import { createLeaderRecoveryNotification } from "./operatorNotification.js";
 import type {
@@ -65,14 +66,26 @@ export async function processLeaderWakeups(
       continue;
     }
 
-    const existingSession = store.getRoleSession(task.id, role.name);
+    const existingSession = store.getRoleSession(
+      task.id,
+      role.name,
+      role.effective.agentId
+    );
     let effectiveSession: SchedulerRoleSession | null = existingSession;
     let claimed = false;
     let deliveryAttempted = false;
     let run: ReturnType<typeof createAgentRun> | null = null;
     let prepared: PreparedRoleDelivery | undefined;
     try {
-      const mode = hasNativeSession(existingSession) ? "resume" : "new";
+      const compatibleSession = existingSession !== null
+        && effectiveLaunchSnapshotsCompatible(existingSession.effective, role.effective);
+      if (hasNativeSession(existingSession) && !compatibleSession
+        && existingSession.status !== "stopped" && existingSession.status !== "broken") {
+        throw new Error(
+          `Leader Session is incompatible with desired effective launch: ${task.id}/${role.name}.`
+        );
+      }
+      const mode = hasNativeSession(existingSession) && compatibleSession ? "resume" : "new";
       const runId = store.peekNextAgentRunId(task.id);
       const input = markYuiRunInput(leaderWakeupInput(
         task.id,
@@ -87,12 +100,7 @@ export async function processLeaderWakeups(
         input,
         now,
         {
-          agent: {
-            agentId: role.activeAgentId,
-            adapterId: role.adapterId,
-            ...(role.model === undefined ? {} : { model: role.model }),
-            ...(role.effort === undefined ? {} : { effort: role.effort })
-          }
+          effective: role.effective
         }
       );
       const claim = store.saveLeaderDispatch({
@@ -111,9 +119,10 @@ export async function processLeaderWakeups(
       prepared = await delivery.prepareRoleSession({
         taskId: task.id,
         roleName: role.name,
-        agentId: role.activeAgentId,
-        adapterId: role.adapterId,
-        workspace: role.workspace,
+        agentId: role.effective.agentId,
+        adapterId: role.effective.adapterId,
+        effective: role.effective,
+        workspace: role.effective.workspace.root,
         mode,
         runId: run.id,
         ...(mode === "resume" ? { nativeSessionId: existingSession!.nativeSessionId } : {})
@@ -132,7 +141,12 @@ export async function processLeaderWakeups(
         results.push({ taskId: task.id, status: "skipped", reason: "unavailable" });
         continue;
       }
-      effectiveSession = validateReadySession(role.activeAgentId, existingSession, mode, ready.session);
+      effectiveSession = validateReadySession(
+        run.effective,
+        existingSession,
+        mode,
+        ready.session
+      );
       store.saveRoleRunPrepared({
         task,
         role,
@@ -235,15 +249,18 @@ export async function processLeaderWakeups(
 }
 
 function validateReadySession(
-  activeAgentId: string,
+  effective: import("../executor/effectiveLaunch.js").EffectiveLaunchSnapshot,
   existing: SchedulerRoleSession | null,
   mode: "new" | "resume",
   session: SchedulerRoleSession | null
 ): SchedulerRoleSession | null {
   if (mode === "new" && session === null) return null;
   if (session === null) throw new Error("Leader resume returned no fixed native session.");
-  if (session.agentId !== activeAgentId) {
+  if (session.agentId !== effective.agentId || session.adapterId !== effective.adapterId) {
     throw new Error(`Ready session belongs to another Agent: ${session.agentId}.`);
+  }
+  if (!effectiveLaunchSnapshotsCompatible(session.effective, effective)) {
+    throw new Error("Ready Leader session effective snapshot changed.");
   }
   if (!hasNativeSession(session)) {
     throw new Error("Ready Leader session has no native session id.");

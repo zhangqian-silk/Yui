@@ -27,7 +27,7 @@ import {
   createGlobalRole,
   createRoleAgentBinding
 } from "../../dist/role/role.js";
-import { createAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun } from "../helpers/effectiveLaunch.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import {
@@ -187,6 +187,7 @@ test("task context aggregates complete records and renders a compact recent summ
     activeDecisions: [activeDecision],
     milestones,
     roles,
+    roleSessions: { leader: null, worker: null },
     workItems: [workItem],
     agentRuns,
     reviewRounds: [],

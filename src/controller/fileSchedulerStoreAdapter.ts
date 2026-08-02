@@ -1,4 +1,7 @@
+import { isDeepStrictEqual } from "node:util";
+
 import {
+  activeLiveRoleAgentSession,
   bindTaskRoleRun,
   clearTaskRoleRun,
   createRoleSessionSet,
@@ -23,8 +26,19 @@ import { createTaskEvent } from "../event/taskEvent.js";
 import { createTaskMessage } from "../message/message.js";
 import { answerInputRequest } from "../input/inputRequest.js";
 import { activeRoleAgentBinding, updateRoleStatus } from "../role/role.js";
+import {
+  effectiveLaunchSnapshotsCompatible,
+  resolveEffectiveLaunch,
+  validateEffectiveLaunchSnapshot,
+  type EffectiveLaunchSnapshot
+} from "../executor/effectiveLaunch.js";
 import { SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
-import { failAgentRun, markAgentRunDelivered, yieldAgentRun } from "../run/agentRun.js";
+import {
+  failAgentRun,
+  markAgentRunDelivered,
+  yieldAgentRun,
+  type AgentRun
+} from "../run/agentRun.js";
 import type {
   DormantRuntimeOwnerCandidate,
   LeaderDispatchFailurePersistence,
@@ -82,12 +96,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   listMilestones(taskId: string) { return this.store.listMilestones(taskId); }
 
   listRoles(taskId: string): SchedulerRole[] {
-    return this.store.listRoles(taskId).map(mapRole);
+    return this.store.listRoles(taskId).map((role) => mapRole(this.store, role));
   }
 
   getRole(taskId: string, roleName: string): SchedulerRole | null {
     const role = this.store.getRole(taskId, roleName);
-    return role === null ? null : mapRole(role);
+    return role === null ? null : mapRole(this.store, role);
   }
 
   getActiveAgentRun(taskId: string, roleName: string) {
@@ -109,9 +123,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   getOperatorDeliveryTarget() {
     const role = this.store.getGlobalRole(SYSTEM_OPERATOR_ROLE);
     if (role === null) return null;
+    const sessions = this.store.getGlobalRoleSessionSet(SYSTEM_OPERATOR_ROLE);
+    const effectiveSession = sessions?.sessions[sessions.activeAgentId];
     return {
       roleName: SYSTEM_OPERATOR_ROLE,
-      adapterId: activeRoleAgentBinding(role).adapterId
+      adapterId: effectiveSession?.effective.adapterId
+        ?? activeRoleAgentBinding(role).adapterId
     } as const;
   }
 
@@ -149,9 +166,16 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     });
   }
 
-  getRoleSession(taskId: string, roleName: string): SchedulerRoleSession | null {
-    const session = this.store.getRoleSession(taskId, roleName);
-    return session === null ? null : mapSession(session);
+  getRoleSession(
+    taskId: string,
+    roleName: string,
+    agentId?: string
+  ): SchedulerRoleSession | null {
+    const sessions = this.store.getTaskRoleSessionSet(taskId, roleName);
+    const session = agentId === undefined
+      ? sessions?.sessions[sessions.activeAgentId]
+      : sessions?.sessions[agentId];
+    return session === undefined ? null : mapSession(session);
   }
 
   hasInFlightTurn(taskId: string, roleName: string): boolean {
@@ -427,11 +451,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         || role.workspace !== input.role.workspace) {
         return "state-changed";
       }
-      if (input.run.agentId !== undefined
-        && (input.run.agentId !== input.role.activeAgentId
-        || input.run.adapterId !== input.role.adapterId
-        || input.run.model !== input.role.model
-        || input.run.effort !== input.role.effort)) {
+      if (!isDeepStrictEqual(input.run.effective, input.role.effective)) {
         return "state-changed";
       }
       if (store.getAgentRun(input.task.id, input.run.id) !== null) return "state-changed";
@@ -465,6 +485,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       store.saveWorkMailbox(claimed);
       store.saveRole(input.task.id, updateRoleStatus(role, "running", input.now));
       bindTaskRoleRunInFlight(store, role, input.run, input.now);
+      store.saveEvent(input.task.id, createTaskEvent(
+        store.nextEventId(input.task.id),
+        input.task.id,
+        "run.dispatched",
+        runLaunchEventPayload(input.run),
+        input.now
+      ));
       if (input.session !== null && input.session.nativeSessionId !== undefined) {
         saveTaskSession(store, role, {
           ...input.session,
@@ -491,6 +518,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (active.deliveredAt === undefined) {
         store.saveAgentRun(markAgentRunDelivered(active, input.now));
         markTaskRoleRunDeliveredInFlight(store, role, input.run, input.now);
+        store.saveEvent(input.task.id, createTaskEvent(
+          store.nextEventId(input.task.id),
+          input.task.id,
+          "run.delivered",
+          runLaunchEventPayload(active),
+          input.now
+        ));
       } else {
         const sessions = store.getTaskRoleSessionSet(input.task.id, input.role.name);
         if (sessions?.inFlight?.runId === input.run.id
@@ -572,8 +606,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         task === null
         || task.status !== "active"
         || role === null
-        || role.activeAgentId !== input.role.activeAgentId
-        || activeRoleAgentBinding(role).adapterId !== input.role.adapterId
         || active === null
         || active.id !== input.claimed.run.id
         || active.status !== "active"
@@ -592,7 +624,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       clearTaskRoleRunInFlight(store, role, active, input.now);
       store.saveWorkMailbox(releaseProcessing(mailbox, mailbox.processing.batchId));
       store.saveRole(input.task.id, updateRoleStatus(role, "failed", input.now));
-      breakTaskSessionIfPresent(store, input.task.id, role.name, role.activeAgentId, input.now);
+      breakTaskSessionIfPresent(
+        store,
+        input.task.id,
+        role.name,
+        active.effective.agentId,
+        input.now
+      );
       const failure = recordLeaderFailure(
         input.task.id,
         input.failure.nativeSessionId,
@@ -623,8 +661,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         task === null
         || task.status !== "active"
         || role === null
-        || role.activeAgentId !== input.role.activeAgentId
-        || activeRoleAgentBinding(role).adapterId !== input.role.adapterId
         || currentRun === null
         || currentRun.id !== input.run.id
         || currentRun.status !== "active"
@@ -636,7 +672,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         sessions?.inFlight !== null
         && sessions !== null
         && (
-          sessions.inFlight.agentId !== role.activeAgentId
+          sessions.inFlight.agentId !== currentRun.effective.agentId
           || sessions.inFlight.runId !== currentRun.id
           || sessions.inFlight.receiptId !== formatAgentRunReceiptId(task.id, currentRun.id)
         )
@@ -666,7 +702,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         }
       }
       store.saveRole(task.id, updateRoleStatus(role, "exited", input.now));
-      stopTaskSessionIfPresent(store, task.id, role.name, role.activeAgentId, input.now);
+      stopTaskSessionIfPresent(
+        store,
+        task.id,
+        role.name,
+        currentRun.effective.agentId,
+        input.now
+      );
       queueLeaderWakeup(
         store,
         task.id,
@@ -780,6 +822,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     agentId: string;
     adapterId: string;
     nativeSessionId: string;
+    effective: EffectiveLaunchSnapshot;
   }>, assertCurrent: () => void, now = new Date()): RoleAgentSession {
     return this.store.transaction((store) => {
       assertCurrent();
@@ -797,13 +840,17 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             roleName: input.owner.roleName,
             agentId: input.agentId,
             adapterId: input.adapterId,
-            nativeSessionId: input.nativeSessionId
+            nativeSessionId: input.nativeSessionId,
+            launchId: input.launchId,
+            effective: input.effective
           }, now)
         : recordGlobalRuntimeNativeSession(store, {
             roleName: input.owner.roleName,
             agentId: input.agentId,
             adapterId: input.adapterId,
-            nativeSessionId: input.nativeSessionId
+            nativeSessionId: input.nativeSessionId,
+            launchId: input.launchId,
+            effective: input.effective
           }, now);
       saveRuntimeLifecycleMailbox(
         store,
@@ -897,24 +944,39 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     const task = this.store.getTask(input.taskId);
     const role = this.store.getRole(input.taskId, input.roleName);
     if (task === null || task.status === "archived" || role === null) return "obsolete";
-    const binding = activeRoleAgentBinding(role);
-    if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-      return "obsolete";
-    }
     const sessions = this.store.getTaskRoleSessionSet(input.taskId, input.roleName);
     const existing = sessions?.sessions[input.agentId];
+    const owner = {
+      scope: "task" as const,
+      taskId: input.taskId,
+      roleName: input.roleName
+    };
     if (
       existing === undefined
-      && !runtimeHookMatchesReservation(this.store, {
-        scope: "task",
-        taskId: input.taskId,
-        roleName: input.roleName
-      }, input.launchId)
+      && !runtimeHookMatchesReservation(this.store, owner, input.launchId)
     ) return "obsolete";
-    if (
-      existing !== undefined
-      && existing.nativeSessionId !== input.nativeSessionId
-    ) return "obsolete";
+    try {
+      const effectiveExisting = nativeTransitionExisting(
+        this.store,
+        owner,
+        existing,
+        input.nativeSessionId,
+        input.launchId,
+        "Runtime turn completion conflicts with the fixed Role session."
+      );
+      const effective = taskSessionEffective(
+        this.store,
+        input.taskId,
+        input.roleName,
+        input.agentId,
+        effectiveExisting
+      );
+      if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
+        return "obsolete";
+      }
+    } catch {
+      return "obsolete";
+    }
     if (sessions?.pendingTurnCompletion !== null && sessions !== null) {
       return sessions.pendingTurnCompletion.turnId === input.turnId
         ? "apply"
@@ -954,14 +1016,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         throw new Error(`Cannot complete a runtime turn for archived Task: ${input.taskId}.`);
       }
       const role = requireRole(store, input.taskId, input.roleName);
-      const binding = activeRoleAgentBinding(role);
-      if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-        throw new Error("Runtime turn completion does not match the active Role Agent binding.");
-      }
       let sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName)
         ?? createRoleSessionSet(
           { scope: "task", taskId: input.taskId, roleName: input.roleName },
-          role.activeAgentId,
+          input.agentId,
           now
         );
       const existing = sessions.sessions[input.agentId];
@@ -976,15 +1034,31 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       ) {
         throw new Error("Runtime turn completion does not match the launch reservation.");
       }
-      if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
-        throw new Error("Runtime turn completion conflicts with the fixed Role session.");
+      const effectiveExisting = nativeTransitionExisting(
+        store,
+        owner,
+        existing,
+        input.nativeSessionId,
+        input.launchId,
+        "Runtime turn completion conflicts with the fixed Role session."
+      );
+      const effective = taskSessionEffective(
+        store,
+        task.id,
+        role.name,
+        input.agentId,
+        effectiveExisting
+      );
+      if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
+        throw new Error("Runtime turn completion does not match the effective launch identity.");
       }
-      if (existing !== undefined && hasRecentTurnId(existing.recentCompletedTurnIds, input.turnId)) {
-        return { session: existing, duplicate: true };
+      if (effectiveExisting !== undefined
+        && hasRecentTurnId(effectiveExisting.recentCompletedTurnIds, input.turnId)) {
+        return { session: effectiveExisting, duplicate: true };
       }
       const pending = sessions.pendingTurnCompletion;
       if (
-        existing !== undefined
+        effectiveExisting !== undefined
         && pending !== null
         && pending.agentId === input.agentId
         && pending.nativeSessionId === input.nativeSessionId
@@ -992,7 +1066,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         && pending.runId === input.runId
       ) {
         return {
-          session: existing,
+          session: effectiveExisting,
           duplicate: true,
           pendingRunId: pending.runId
         };
@@ -1006,20 +1080,22 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           || sessions.inFlight.runId !== input.runId
         )
       ) {
-        if (existing === undefined) {
+        if (effectiveExisting === undefined) {
           throw new Error("Runtime turn completion no longer matches the in-flight Run.");
         }
-        return { session: existing, duplicate: false };
+        return { session: effectiveExisting, duplicate: false };
       }
-      const idleStatus = existing?.status === "stopped" || existing?.status === "broken"
-        ? existing.status
+      const idleStatus = effectiveExisting?.status === "stopped"
+        || effectiveExisting?.status === "broken"
+        ? effectiveExisting.status
         : "ready";
       sessions = recordRoleAgentSession(sessions, {
         agentId: input.agentId,
         adapterId: input.adapterId,
         nativeSessionId: input.nativeSessionId,
         policy: "fixed",
-        status: sessions.inFlight === null ? idleStatus : "running"
+        status: sessions.inFlight === null ? idleStatus : "running",
+        effective
       }, now);
       if (sessions.inFlight === null) {
         sessions = rememberRoleAgentCompletedTurn(
@@ -1171,14 +1247,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         throw new Error(`Cannot complete a runtime turn for archived Task: ${input.taskId}.`);
       }
       const role = requireRole(store, input.taskId, input.roleName);
-      const binding = activeRoleAgentBinding(role);
-      if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-        throw new Error("Runtime turn completion does not match the active Role Agent binding.");
-      }
       const current = store.getRoleSessionSet(input.taskId, input.roleName)
         ?? createRoleSessionSet(
           { scope: "task", taskId: input.taskId, roleName: input.roleName },
-          role.activeAgentId,
+          input.agentId,
           now
         );
       const existing = current.sessions[input.agentId];
@@ -1193,17 +1265,33 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       ) {
         throw new Error("Runtime turn completion does not match the launch reservation.");
       }
-      if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
-        throw new Error("Runtime turn completion conflicts with the fixed Role session.");
+      const effectiveExisting = nativeTransitionExisting(
+        store,
+        owner,
+        existing,
+        input.nativeSessionId,
+        input.launchId,
+        "Runtime turn completion conflicts with the fixed Role session."
+      );
+      const effective = taskSessionEffective(
+        store,
+        task.id,
+        role.name,
+        input.agentId,
+        effectiveExisting
+      );
+      if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
+        throw new Error("Runtime turn completion does not match the effective launch identity.");
       }
-      const sessions = existing?.status === "ready"
+      const sessions = effectiveExisting?.status === "ready"
         ? current
         : recordRoleAgentSession(current, {
             agentId: input.agentId,
             adapterId: input.adapterId,
             nativeSessionId: input.nativeSessionId,
             policy: "fixed",
-            status: "ready"
+            status: "ready",
+            effective
           }, now);
       if (
         input.expectedRunId !== undefined
@@ -1241,7 +1329,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         store.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(
           store.getTaskRoleSessionSet(task.id, role.name)!,
           {
-            agentId: role.activeAgentId,
+            agentId: active.effective.agentId,
             runId: active.id,
             receiptId: formatAgentRunReceiptId(task.id, active.id)
           },
@@ -1319,7 +1407,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       store.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(
         store.getTaskRoleSessionSet(task.id, role.name)!,
         {
-          agentId: role.activeAgentId,
+          agentId: active.effective.agentId,
           runId: active.id,
           receiptId: formatAgentRunReceiptId(task.id, active.id)
         },
@@ -1394,14 +1482,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return this.store.transaction((store) => {
       const role = store.getGlobalRole(input.roleName);
       if (role === null) throw new Error(`Global Role not found: ${input.roleName}.`);
-      const binding = activeRoleAgentBinding(role);
-      if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-        throw new Error("Runtime turn completion does not match the active global Role Agent binding.");
-      }
       let current: GlobalRoleSessionSet = store.getGlobalRoleSessionSet(input.roleName)
         ?? createRoleSessionSet(
           { scope: "global", roleName: input.roleName },
-          role.activeAgentId,
+          input.agentId,
           now
         );
       const existing = current.sessions[input.agentId];
@@ -1417,22 +1501,33 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           "Runtime turn completion does not match the global launch reservation."
         );
       }
-      if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
-        throw new Error("Runtime turn completion conflicts with the fixed global Role session.");
+      const effectiveExisting = nativeTransitionExisting(
+        store,
+        owner,
+        existing,
+        input.nativeSessionId,
+        input.launchId,
+        "Runtime turn completion conflicts with the fixed global Role session."
+      );
+      const effective = globalSessionEffective(role, effectiveExisting);
+      if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
+        throw new Error("Runtime turn completion does not match the effective global launch identity.");
       }
-      const completedStatus = existing?.status === "stopped" || existing?.status === "broken"
-        ? existing.status
+      const completedStatus = effectiveExisting?.status === "stopped"
+        || effectiveExisting?.status === "broken"
+        ? effectiveExisting.status
         : "ready";
       current = recordRoleAgentSession(current, {
         agentId: input.agentId,
         adapterId: input.adapterId,
         nativeSessionId: input.nativeSessionId,
-        title: existing?.title ?? input.title,
-        preview: existing?.preview ?? (
+        title: effectiveExisting?.title ?? input.title,
+        preview: effectiveExisting?.preview ?? (
           input.summary === undefined ? undefined : sessionPreview(input.summary)
         ),
         policy: "fixed",
-        status: completedStatus
+        status: completedStatus,
+        effective
       }, now);
       current = rememberRoleAgentCompletedTurn(
         current,
@@ -1456,23 +1551,34 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }>): "apply" | "obsolete" {
     const role = this.store.getGlobalRole(input.roleName);
     if (role === null) return "obsolete";
-    const binding = activeRoleAgentBinding(role);
-    if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-      return "obsolete";
-    }
     const existing = this.store.getGlobalRoleSessionSet(input.roleName)
       ?.sessions[input.agentId];
+    const owner = {
+      scope: "global" as const,
+      roleName: input.roleName
+    };
     if (
       existing === undefined
-      && !runtimeHookMatchesReservation(this.store, {
-        scope: "global",
-        roleName: input.roleName
-      }, input.launchId)
+      && !runtimeHookMatchesReservation(this.store, owner, input.launchId)
     ) return "obsolete";
-    return existing !== undefined
-      && existing.nativeSessionId !== input.nativeSessionId
-      ? "obsolete"
-      : "apply";
+    let effectiveExisting: RoleAgentSession | undefined;
+    try {
+      effectiveExisting = nativeTransitionExisting(
+        this.store,
+        owner,
+        existing,
+        input.nativeSessionId,
+        input.launchId,
+        "Runtime turn completion conflicts with the fixed global Role session."
+      );
+    } catch {
+      return "obsolete";
+    }
+    const effective = globalSessionEffective(role, effectiveExisting);
+    if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
+      return "obsolete";
+    }
+    return "apply";
   }
 }
 
@@ -1665,6 +1771,8 @@ function recordTaskRuntimeNativeSession(
     agentId: string;
     adapterId: string;
     nativeSessionId: string;
+    launchId?: string;
+    effective?: EffectiveLaunchSnapshot;
   }>,
   now: Date
 ): RoleAgentSession {
@@ -1679,27 +1787,45 @@ function recordTaskRuntimeNativeSession(
     );
   }
   const role = requireRole(store, input.taskId, input.roleName);
-  const binding = activeRoleAgentBinding(role);
-  if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-    throw new Error("Native session registration does not match the active Role Agent binding.");
-  }
   const current = store.getRoleSessionSet(input.taskId, input.roleName)
     ?? createRoleSessionSet(
       { scope: "task", taskId: input.taskId, roleName: input.roleName },
-      role.activeAgentId,
+      input.agentId,
       now
     );
   const existing = current.sessions[input.agentId];
-  if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
-    throw new Error("Native session registration conflicts with the fixed Role session.");
-  }
+  const effectiveExisting = nativeTransitionExisting(
+    store,
+    { scope: "task", taskId: input.taskId, roleName: input.roleName },
+    existing,
+    input.nativeSessionId,
+    input.launchId,
+    "Native session registration conflicts with the fixed Role session."
+  );
   if (existing?.status === "running") return existing;
+  const resolvedEffective = taskSessionEffective(
+    store,
+    input.taskId,
+    input.roleName,
+    input.agentId,
+    effectiveExisting
+  );
+  const effective = input.effective === undefined
+    ? resolvedEffective
+    : validateEffectiveLaunchSnapshot(input.effective);
+  if (!effectiveLaunchSnapshotsCompatible(resolvedEffective, effective)) {
+    throw new Error("Reserved native Session effective launch changed before persistence.");
+  }
+  if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
+    throw new Error("Native session registration does not match the effective launch identity.");
+  }
   const updated = recordRoleAgentSession(current, {
     agentId: input.agentId,
     adapterId: input.adapterId,
     nativeSessionId: input.nativeSessionId,
     policy: "fixed",
-    status: "running"
+    status: "running",
+    effective
   }, now);
   store.saveRoleSessionSet(updated);
   return updated.sessions[input.agentId]!;
@@ -1712,41 +1838,84 @@ function recordGlobalRuntimeNativeSession(
     agentId: string;
     adapterId: string;
     nativeSessionId: string;
+    launchId?: string;
+    effective?: EffectiveLaunchSnapshot;
   }>,
   now: Date
 ): RoleAgentSession {
   const role = store.getGlobalRole(input.roleName);
   if (role === null) throw new Error(`Global Role not found: ${input.roleName}.`);
-  const binding = activeRoleAgentBinding(role);
-  if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-    throw new Error(
-      "Native session registration does not match the active global Role Agent binding."
-    );
-  }
   const current: GlobalRoleSessionSet = store.getGlobalRoleSessionSet(input.roleName)
     ?? createRoleSessionSet(
       { scope: "global", roleName: input.roleName },
-      role.activeAgentId,
+      input.agentId,
       now
     );
   const existing = current.sessions[input.agentId];
-  if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
-    throw new Error("Native session registration conflicts with the fixed global Role session.");
-  }
+  const effectiveExisting = nativeTransitionExisting(
+    store,
+    { scope: "global", roleName: input.roleName },
+    existing,
+    input.nativeSessionId,
+    input.launchId,
+    "Native session registration conflicts with the fixed global Role session."
+  );
   if (existing?.status === "running") return existing;
+  const resolvedEffective = globalSessionEffective(role, effectiveExisting);
+  const effective = input.effective === undefined
+    ? resolvedEffective
+    : validateEffectiveLaunchSnapshot(input.effective);
+  if (!effectiveLaunchSnapshotsCompatible(resolvedEffective, effective)) {
+    throw new Error("Reserved global native Session effective launch changed before persistence.");
+  }
+  if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
+    throw new Error("Native session registration does not match the effective global launch identity.");
+  }
   const updated = recordRoleAgentSession(current, {
     agentId: input.agentId,
     adapterId: input.adapterId,
     nativeSessionId: input.nativeSessionId,
     policy: "fixed",
-    status: "running"
+    status: "running",
+    effective
   }, now);
   store.saveGlobalRoleSessionSet(updated);
   return updated.sessions[input.agentId]!;
 }
 
-function mapRole(role: ReturnType<TaskStore["getRole"]> extends infer _T ? NonNullable<ReturnType<TaskStore["getRole"]>> : never): SchedulerRole {
+function nativeTransitionExisting(
+  store: TaskStore,
+  owner: RuntimeRoleOwner,
+  existing: RoleAgentSession | undefined,
+  nativeSessionId: string,
+  launchId: string | undefined,
+  conflictMessage: string
+): RoleAgentSession | undefined {
+  if (existing === undefined || existing.nativeSessionId === nativeSessionId) {
+    return existing;
+  }
+  if (
+    (existing.status === "stopped" || existing.status === "broken")
+    && runtimeHookMatchesReservation(store, owner, launchId)
+  ) {
+    return undefined;
+  }
+  throw new Error(conflictMessage);
+}
+
+function mapRole(
+  store: TaskStore,
+  role: NonNullable<ReturnType<TaskStore["getRole"]>>
+): SchedulerRole {
   const binding = activeRoleAgentBinding(role);
+  const workspace = store.getRoleWorkspace(role.taskId, role.name) ?? undefined;
+  const effective = activeLiveRoleAgentSession(
+    store.getTaskRoleSessionSet(role.taskId, role.name)
+  )?.effective ?? resolveEffectiveLaunch({
+      role,
+      purpose: "execution",
+      ...(workspace === undefined ? {} : { workspace })
+    });
   return {
     taskId: role.taskId,
     name: role.name,
@@ -1754,9 +1923,54 @@ function mapRole(role: ReturnType<TaskStore["getRole"]> extends infer _T ? NonNu
     adapterId: binding.adapterId,
     ...(binding.config.model === undefined ? {} : { model: binding.config.model }),
     ...(binding.config.effort === undefined ? {} : { effort: binding.config.effort }),
+    effective,
     workspace: role.workspace,
     status: role.status
   };
+}
+
+function taskSessionEffective(
+  store: TaskStore,
+  taskId: string,
+  roleName: string,
+  agentId: string,
+  existing: RoleAgentSession | undefined
+) {
+  const active = store.getActiveAgentRun(taskId, roleName);
+  if (active !== null) {
+    if (active.effective.agentId !== agentId) {
+      throw new Error(
+        `Native Session registration does not match the effective Run Agent: ${taskId}/${roleName}.`
+      );
+    }
+    return active.effective;
+  }
+  if (existing !== undefined) return existing.effective;
+  const role = store.getRole(taskId, roleName);
+  if (role === null) throw new Error(`Role not found: ${taskId}/${roleName}.`);
+  const workspace = store.getRoleWorkspace(taskId, roleName)
+    ?? store.getRoleWorkspace(taskId, "leader")
+    ?? undefined;
+  const item = workspace?.owner.type === "work-item"
+    ? store.getWorkItem(taskId, workspace.owner.workItemId)
+    : null;
+  const effective = resolveEffectiveLaunch({
+    role,
+    purpose: "execution",
+    ...(workspace === undefined ? {} : { workspace }),
+    ...(item === null ? {} : { workItemWriteProjectIds: item.writeProjectIds })
+  });
+  if (effective.agentId !== agentId) {
+    throw new Error(`Native Session registration does not match Role desired Agent: ${agentId}.`);
+  }
+  return effective;
+}
+
+function globalSessionEffective(
+  role: Parameters<typeof resolveEffectiveLaunch>[0]["role"],
+  existing: RoleAgentSession | undefined,
+) {
+  return existing?.effective ?? resolveEffectiveLaunch({ role, purpose: "execution" });
 }
 
 function mapSession(session: RoleAgentSession): SchedulerRoleSession {
@@ -1764,7 +1978,8 @@ function mapSession(session: RoleAgentSession): SchedulerRoleSession {
     agentId: session.agentId,
     adapterId: session.adapterId,
     nativeSessionId: session.nativeSessionId,
-    status: session.status
+    status: session.status,
+    effective: session.effective
   };
 }
 
@@ -1778,7 +1993,7 @@ function saveTaskSession(
   const current = store.getRoleSessionSet(role.taskId, role.name)
     ?? createRoleSessionSet(
       { scope: "task", taskId: role.taskId, roleName: role.name },
-      role.activeAgentId,
+      session.agentId,
       now
     );
   const updated = recordRoleAgentSession(current, {
@@ -1786,7 +2001,8 @@ function saveTaskSession(
     adapterId: session.adapterId,
     nativeSessionId: session.nativeSessionId,
     policy: "fixed",
-    status
+    status,
+    effective: session.effective
   }, now);
   store.saveRoleSessionSet(updated);
 }
@@ -1794,17 +2010,38 @@ function saveTaskSession(
 function bindTaskRoleRunInFlight(
   store: TaskStore,
   role: NonNullable<ReturnType<TaskStore["getRole"]>>,
-  run: { id: string },
+  run: { id: string; effective: { agentId: string } },
   now: Date
 ): void {
-  const current = store.getRoleSessionSet(role.taskId, role.name)
+  const agentId = run.effective.agentId;
+  let current = store.getRoleSessionSet(role.taskId, role.name)
     ?? createRoleSessionSet(
       { scope: "task", taskId: role.taskId, roleName: role.name },
-      role.activeAgentId,
+      agentId,
       now
     );
+  if (current.activeAgentId !== agentId) {
+    if (current.inFlight !== null || current.pendingTurnCompletion !== null) {
+      throw new Error("Task Role Session identity cannot change with an unsettled Run fence.");
+    }
+    const liveConflict = Object.values(current.sessions).find((session) => (
+      session.agentId !== agentId
+      && session.status !== "stopped"
+      && session.status !== "broken"
+    ));
+    if (liveConflict !== undefined) {
+      throw new Error(
+        `Task Role Session identity cannot change while ${liveConflict.agentId} is live.`
+      );
+    }
+    current = {
+      ...current,
+      activeAgentId: agentId,
+      updatedAt: now.toISOString()
+    };
+  }
   const updated = bindTaskRoleRun(current, {
-    agentId: role.activeAgentId,
+    agentId,
     runId: run.id,
     receiptId: formatAgentRunReceiptId(role.taskId, run.id)
   }, now);
@@ -1814,7 +2051,7 @@ function bindTaskRoleRunInFlight(
 function markTaskRoleRunDeliveredInFlight(
   store: TaskStore,
   role: NonNullable<ReturnType<TaskStore["getRole"]>>,
-  run: { id: string },
+  run: { id: string; effective: { agentId: string } },
   now: Date
 ): void {
   const current = store.getRoleSessionSet(role.taskId, role.name);
@@ -1822,7 +2059,7 @@ function markTaskRoleRunDeliveredInFlight(
     throw new Error(`Task Role session set is missing for delivered Run: ${run.id}.`);
   }
   const updated = markTaskRoleRunDelivered(current, {
-    agentId: role.activeAgentId,
+    agentId: run.effective.agentId,
     runId: run.id,
     receiptId: formatAgentRunReceiptId(role.taskId, run.id)
   }, now);
@@ -1832,14 +2069,14 @@ function markTaskRoleRunDeliveredInFlight(
 function clearTaskRoleRunInFlight(
   store: TaskStore,
   role: NonNullable<ReturnType<TaskStore["getRole"]>>,
-  run: { id: string },
+  run: { id: string; effective: { agentId: string } },
   now: Date
 ): void {
   const current = store.getRoleSessionSet(role.taskId, role.name);
   if (current === null) return;
   if (current.inFlight?.runId !== run.id) return;
   const updated = clearTaskRoleRun(current, {
-    agentId: role.activeAgentId,
+    agentId: run.effective.agentId,
     runId: run.id,
     receiptId: formatAgentRunReceiptId(role.taskId, run.id)
   }, now);
@@ -1886,11 +2123,26 @@ function schedulerRoleSessionsMatch(
   if (current === null || expected === null) return current === expected;
   return current.agentId === expected.agentId
     && current.adapterId === expected.adapterId
-    && current.nativeSessionId === expected.nativeSessionId;
+    && current.nativeSessionId === expected.nativeSessionId
+    && isDeepStrictEqual(current.effective, expected.effective);
 }
 
 function requireRole(store: TaskStore, taskId: string, roleName: string) {
   const role = store.getRole(taskId, roleName);
   if (role === null) throw new Error(`Role not found: ${taskId}/${roleName}.`);
   return role;
+}
+
+function runLaunchEventPayload(run: AgentRun): Record<string, string> {
+  return {
+    runId: run.id,
+    role: run.roleName,
+    purpose: run.purpose,
+    mode: run.mode,
+    agent: `${run.effective.agentId}/${run.effective.adapterId}`,
+    effectiveRevision: String(run.effective.sourceDesiredRevision),
+    effectiveAccess: run.effective.access,
+    provenance: run.effective.provenance,
+    writeProjectIds: run.effective.writeProjectIds.join(",") || "none"
+  };
 }

@@ -51,9 +51,10 @@ There is no compatibility lookup, cross-Task guess, or bare-ID fallback.
 
 ## Offline conversion
 
-Runtime opens only the current aggregate schema. It does not read the legacy
-global-ID shape. Conversion is an explicit, stopped-system operation from the
-supported aggregate-v10 source into a separate fresh output:
+Runtime opens only the current aggregate-v12 / StoredTask-v11 schema. It does
+not read the legacy global-ID shape or an identity-only intermediate shape.
+Conversion is an explicit, stopped-system operation from the supported
+aggregate-v10 / StoredTask-v9 source into a separate fresh output:
 
 ```sh
 yui storage convert-task-identity \
@@ -68,12 +69,16 @@ Before running it:
 3. Choose an output path that does not exist and is not inside the source.
 
 The converter reads a stable source snapshot, deterministically remaps every
-Task-owned family and nested reference, writes current-schema state into the
-fresh directory, and validates that output through the normal `FileTaskStore`.
-It also writes `identity-conversion.json` with the source hash and per-Task
-record counts, then checks the source bytes again before returning. The
-operation fails on a dangling or ambiguous legacy reference and removes only
-the fresh output that it created; the source is never rewritten.
+Task-owned family and nested reference, and writes current-schema state into
+the fresh directory. In the same direct cutover it creates versioned Role
+desired configuration and immutable effective AgentRun/RoleSession snapshots.
+Missing legacy permission facts are never guessed: legacy effective snapshots
+are marked `legacy-cutover`, forced read-only, and are not resumable. The output
+is validated through the normal `FileTaskStore` with zero dangling references.
+The converter also writes `identity-conversion.json` with the source hash and
+per-Task record counts, then checks the source bytes again before returning.
+The operation fails on a dangling or ambiguous legacy reference and removes
+only the fresh output that it created; the source is never rewritten.
 
 After conversion, inspect the report and representative `yui --json task
 context <task-id>` results with `YUI_HOME` pointed at the fresh directory. Move

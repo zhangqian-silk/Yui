@@ -56,8 +56,8 @@ Candidate IDs are local to their WorkItem and carry both Task and WorkItem
 provenance.
 
 One offline converter is available for the immediately preceding aggregate-v10
-identity layout. Stop the source Controller, keep the source home immutable,
-and select a new path that does not exist:
+identity layout (StoredTask v9). Stop the source Controller, keep the source
+home immutable, and select a new path that does not exist:
 
 ```sh
 yui storage convert-task-identity \
@@ -65,11 +65,16 @@ yui storage convert-task-identity \
   --output /absolute/path/to/fresh-yui-home
 ```
 
-The converter remaps all Task-owned records and references, validates the fresh
-output with the current runtime, writes `identity-conversion.json`, and verifies
-that the source bytes did not change. It rejects dangling or ambiguous legacy
-references and never modifies the source in place. Inspect the report and the
-fresh Task contexts before switching `YUI_HOME`. See
+The converter remaps all Task-owned records and references and writes the one
+current combined schema directly: aggregate v12 / StoredTask v11 with Role
+desired revisions and immutable effective Run/Session launch snapshots. Legacy
+launch facts are provenance-marked and closed to read-only. The converter
+validates the fresh output with the current runtime, writes
+`identity-conversion.json`, and verifies that the source bytes did not change.
+It rejects dangling or ambiguous legacy references and never modifies the
+source in place. There is no identity-only intermediate format or runtime dual
+read. Inspect the report and the fresh Task contexts before switching
+`YUI_HOME`. See
 [Task-local identity and offline conversion](docs/task-local-identity.md) for
 the complete boundary.
 
@@ -251,33 +256,23 @@ yui task work isolate <task-id>/<work-item-id>
 yui task work dispatch <task-id>/<work-item-id> --input "Implement and run focused tests"
 ```
 
-`--yolo true` is a first-class Role setting. Yui compiles it to
-`--dangerously-bypass-approvals-and-sandbox` for Codex and
-`--dangerously-skip-permissions` for Claude; `--clear-yolo` returns to the
-stored permission settings or CLI default. Any non-Leader Task Role created
-without `--agent` copies the global Worker Role's complete Agent bindings, so
-model, effort, and permissions do not need to be reconstructed by the Leader.
-The creation receipt and `task context` record that runtime source and the
-effective Agent/model/effort/YOLO values. An explicit `--agent` is a deliberate
-Task-specific override and must be configured completely before dispatch.
+`--yolo true` is a desired Role ceiling, not an unconditional process flag. It
+can compile to `--dangerously-bypass-approvals-and-sandbox` for Codex or
+`--dangerously-skip-permissions` for Claude only when a write Profile, an exact
+WorkItem write scope, and a matching writable managed workspace all agree.
+`--clear-yolo` affects the next launch. A Gitless Task, a non-WorkItem Run, an
+empty write scope, a read Profile, or any ReviewRound is native read-only;
+ReviewRound launches enforce this for both Codex and Claude and fail closed if
+the adapter cannot express it. The exact Yui yield command remains available
+inside that read-only boundary.
 
-A Claude reviewer can use native `dontAsk` mode so unapproved tools fail closed
-without an interactive prompt while the exact Yui handoff remains available.
-Pre-approve the read tools and that handoff when configuring the Role:
-
-```sh
-yui role update reviewer --agent claude --model <model> --effort <effort> \
-  --permission-mode dontAsk \
-  --allowed-tool Read --allowed-tool Grep --allowed-tool Glob \
-  --allowed-tool 'Bash(yui task run yield *)'
-```
-
-This does not enable file-editing tools or relax the review Profile; everything
-that is neither read-only nor explicitly allowed is denied. The reviewer must
-invoke the yield command directly, not through a shell loop or wrapper that
-would stop matching the rule. Repeat `--allowed-tool` or `--disallowed-tool` to
-replace the corresponding Claude tool-rule list; `--clear-allowed-tools` and
-`--clear-disallowed-tools` remove those stored rules.
+Every Role desired launch change increments its revision and applies only to a
+future launch. Each AgentRun and native Role Session stores the complete actual
+agent, adapter, model, effort, access, permission, workspace, context, and
+source desired revision. Updating, switching, or clearing Role overrides never
+hot-mutates an existing process. `task context`, Role views, Run history,
+Events, and Web show desired/effective revisions, access, provenance, and
+pending next-launch drift.
 
 The Worker delivers its current Run explicitly:
 
@@ -438,6 +433,15 @@ keep multiple conversations for each binding. `operator new` and
 running, Yui asks before stopping it and switching the conversation. On a
 cross-Agent switch, the saved model and effort are reused unless the user
 explicitly chooses to update them.
+
+The Role's active binding is desired state for the next compatible launch. A
+running AgentRun and its native Session continue under their immutable
+effective snapshot even if the Role is edited or switched. Resume is allowed
+only when the complete effective snapshot and workspace remain compatible;
+otherwise Yui starts a new Session after the old process has stopped and keeps
+the terminal Session's immutable effective snapshot in history. Until that
+process terminates, exact control-plane wakes continue through its actual
+snapshot instead of applying desired drift as a hot change.
 
 Use `yui role unbind <global-role> <agent-id>` or `yui task role unbind <task-id> <role> <agent-id>` to retire a dormant binding. The active binding and any non-stopped native session are rejected; a stopped session record is removed atomically with the binding.
 

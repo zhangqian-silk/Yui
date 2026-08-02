@@ -14,6 +14,7 @@ import {
   enqueueSignal,
   releaseProcessing
 } from "../../dist/coordination/workMailbox.js";
+import { testEffectiveLaunch } from "../helpers/effectiveLaunch.js";
 
 const NOW = new Date("2026-07-19T12:00:00.000Z");
 
@@ -753,34 +754,49 @@ function fakeDelivery(options = {}) {
 }
 
 function role(name) {
+  const agentId = name === "leader" ? "codex-leader" : "codex-worker";
   return {
     taskId: "task-1",
     name,
-    activeAgentId: name === "leader" ? "codex-leader" : "codex-worker",
+    activeAgentId: agentId,
     adapterId: "codex",
+    effective: testEffectiveLaunch({ agentId, workspaceRoot: "/repo" }),
+    workspace: "/repo",
     status: "running"
   };
 }
 
 function roleSession(patch = {}) {
-  return {
+  const session = {
     agentId: "codex-leader",
     adapterId: "codex",
     nativeSessionId: "native-leader-1",
     status: "running",
     ...patch
   };
+  return {
+    ...session,
+    effective: patch.effective ?? testEffectiveLaunch({
+      agentId: session.agentId,
+      adapterId: session.adapterId,
+      workspaceRoot: "/repo"
+    })
+  };
 }
 
 function activeRun(id, roleName) {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     id,
     taskId: "task-1",
     roleName,
     mode: "new",
     input: "continue",
     purpose: "execution",
+    effective: testEffectiveLaunch({
+      agentId: roleName === "leader" ? "codex-leader" : "codex-worker",
+      workspaceRoot: "/repo"
+    }),
     status: "active",
     createdAt: NOW.toISOString(),
     updatedAt: NOW.toISOString()

@@ -13,9 +13,9 @@ import {
   prepareOperatorResumeSession
 } from "../../dist/operator/operatorSessionHistory.js";
 import {
-  createRoleSessionSet,
-  recordRoleAgentSession
+  createRoleSessionSet
 } from "../../dist/executor/agentExecutor.js";
+import { recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 import {
   applyOperatorSessionControl,
   runOperatorCommand

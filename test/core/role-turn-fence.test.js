@@ -7,10 +7,10 @@ import {
   createRoleSessionSet,
   markTaskRoleRunDelivered,
   recordObservedTaskRoleCompletion,
-  recordRoleAgentSession,
   settleTaskRoleCompletion,
   validateRoleSessionSet
 } from "../../dist/executor/agentExecutor.js";
+import { recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 import { createPendingTurnCompletion } from "../../dist/runtime/turnCompletion.js";
 
 const PREPARED_AT = new Date("2026-07-23T02:00:00.000Z");

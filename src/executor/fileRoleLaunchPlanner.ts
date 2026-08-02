@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, realpathSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 import {
   configuredAgentToDefinition,
@@ -30,6 +31,14 @@ import type {
 } from "../runtime/ports.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import type { RoleWorkspace } from "../worktree/roleWorkspace.js";
+import { activeLiveRoleAgentSession } from "./agentExecutor.js";
+import {
+  assertReadOnlyAgentArgv,
+  effectiveLaunchSnapshotsCompatible,
+  effectiveRoleForLaunch,
+  resolveEffectiveLaunch,
+  type EffectiveLaunchSnapshot
+} from "./effectiveLaunch.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
@@ -41,6 +50,7 @@ export type GlobalRoleLaunchPlanInput = Readonly<{
   roleName: string;
   agentId: string;
   adapterId: string;
+  effective?: EffectiveLaunchSnapshot;
   mode: RoleSessionLaunchMode;
   nativeSessionId?: string;
   launchId?: string;
@@ -139,25 +149,62 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         throw new Error(`Role workspace is not ready: ${input.taskId}/${input.roleName}.`);
       }
     }
+    const sessionSet = this.store.getTaskRoleSessionSet(task.id, role.name);
+    const resolvedEffective = activeRun?.effective
+      ?? activeLiveRoleAgentSession(sessionSet)?.effective
+      ?? resolveTaskRoleEffectiveLaunch(this.store, role);
+    if (input.effective !== undefined
+      && !isDeepStrictEqual(resolvedEffective, input.effective)) {
+      throw new Error(`Role launch effective Run snapshot changed: ${input.taskId}/${input.roleName}.`);
+    }
+    if (activeRun !== null && input.effective === undefined) {
+      throw new Error(`Role launch is missing the effective Run snapshot: ${input.taskId}/${input.roleName}.`);
+    }
+    const effective = input.effective ?? resolvedEffective;
+    const existing = sessionSet?.sessions[effective.agentId];
+    const compatibleExisting = existing !== undefined
+      && effectiveLaunchSnapshotsCompatible(existing.effective, effective);
+    if (input.mode === "resume" && !compatibleExisting) {
+      throw new Error(
+        `Task Role resume effective snapshot drifted: ${task.id}/${role.name}.`
+      );
+    }
     return this.#compile(
       role,
       input,
       { scope: "task", taskId: task.id },
       taskRoleSessionTitle(task, role.name),
-      this.store.getRoleSession(task.id, role.name)?.nativeSessionId,
-      runWorkspace
+      compatibleExisting ? existing.nativeSessionId : undefined,
+      runWorkspace,
+      effective
     );
   }
 
   planGlobalRole(input: GlobalRoleLaunchPlanInput): PlannedRoleSession {
     const role = this.store.getGlobalRole(input.roleName);
     if (role === null) throw new Error(`Global Role not found: ${input.roleName}.`);
+    const sessionSet = this.store.getGlobalRoleSessionSet(role.name);
+    const resolvedEffective = activeLiveRoleAgentSession(sessionSet)?.effective
+      ?? resolveEffectiveLaunch({ role, purpose: "execution" });
+    if (input.effective !== undefined
+      && !isDeepStrictEqual(resolvedEffective, input.effective)) {
+      throw new Error(`Global Role launch effective snapshot changed: ${role.name}.`);
+    }
+    const effective = input.effective ?? resolvedEffective;
+    const existing = sessionSet?.sessions[effective.agentId];
+    const compatibleExisting = existing !== undefined
+      && effectiveLaunchSnapshotsCompatible(existing.effective, effective);
+    if (input.mode === "resume" && !compatibleExisting) {
+      throw new Error(`Global Role resume effective snapshot drifted: ${role.name}.`);
+    }
     return this.#compile(
       role,
       input,
       { scope: "global" },
       undefined,
-      this.store.getGlobalRoleSessionSet(role.name)?.sessions[role.activeAgentId]?.nativeSessionId
+      compatibleExisting ? existing.nativeSessionId : undefined,
+      undefined,
+      effective
     );
   }
 
@@ -174,10 +221,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     }>,
     owner: Readonly<{ scope: "task"; taskId: string } | { scope: "global" }>,
     sessionTitle: string | undefined,
-    knownNativeSessionId?: string,
-    workspaceOverride?: RoleWorkspace
+    knownNativeSessionId: string | undefined,
+    workspaceOverride: RoleWorkspace | undefined,
+    effective: EffectiveLaunchSnapshot
   ): PlannedRoleSession {
-    const binding = activeRoleAgentBinding(role);
+    const launchRole = effectiveRoleForLaunch(role, effective);
+    const binding = activeRoleAgentBinding(launchRole);
     if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
       throw new Error(`Role launch identity changed: ${role.name}.`);
     }
@@ -207,8 +256,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         .join(delimiter)
     };
     const adapter = resolveAgentAdapter(binding.adapterId);
-    const effectiveWorkspace = workspaceOverride?.root ?? role.workspace;
-    const sessionContext = compileRoleSessionContext(this.home, role, owner);
+    const effectiveWorkspace = effective.workspace.root;
+    const sessionContext = compileRoleSessionContext(this.home, launchRole, owner);
     const codexConfig = binding.config.adapterId === "codex"
       ? inspectCodexLaunchConfig({
           environment: {
@@ -261,11 +310,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       : adapter.compileNew(compileInput);
 
     let args = [...compiled.argv];
+    if (effective.access === "read") assertReadOnlyAgentArgv(effective, args);
     let session: SchedulerRoleSession | null;
     if (binding.adapterId === "codex") {
       args = addCodexSessionNotify(args, launchMode, this.#cliPath);
       session = launchMode === "resume"
-        ? readySession(input.agentId, binding.adapterId, resumeNativeSessionId!)
+        ? readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective)
         : null;
     } else if (launchMode === "new") {
       const nativeSessionId = requireText(
@@ -280,9 +330,9 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         "Native session id"
       );
       args.push("--session-id", nativeSessionId);
-      session = readySession(input.agentId, binding.adapterId, nativeSessionId);
+      session = readySession(input.agentId, binding.adapterId, nativeSessionId, effective);
     } else {
-      session = readySession(input.agentId, binding.adapterId, resumeNativeSessionId!);
+      session = readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective);
     }
 
     const launch = {
@@ -368,6 +418,24 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     )));
     return selectEnvironment(source, names);
   }
+}
+
+function resolveTaskRoleEffectiveLaunch(
+  store: TaskStore,
+  role: TaskRole
+): EffectiveLaunchSnapshot {
+  const workspace = store.getRoleWorkspace(role.taskId, role.name)
+    ?? store.getRoleWorkspace(role.taskId, "leader")
+    ?? undefined;
+  const item = workspace?.owner.type === "work-item"
+    ? store.getWorkItem(role.taskId, workspace.owner.workItemId)
+    : null;
+  return resolveEffectiveLaunch({
+    role,
+    purpose: "execution",
+    ...(workspace === undefined ? {} : { workspace }),
+    ...(item === null ? {} : { workItemWriteProjectIds: item.writeProjectIds })
+  });
 }
 
 function workspaceScopeEnvironment(
@@ -473,13 +541,15 @@ function addCodexSessionNotify(
 function readySession(
   agentId: string,
   adapterId: string,
-  nativeSessionId: string
+  nativeSessionId: string,
+  effective: EffectiveLaunchSnapshot
 ): SchedulerRoleSession {
   return {
     agentId,
     adapterId,
     nativeSessionId: requireText(nativeSessionId, "Native session id"),
-    status: "ready"
+    status: "ready",
+    effective
   };
 }
 

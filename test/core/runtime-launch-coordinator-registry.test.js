@@ -19,7 +19,7 @@ import {
   createRoleAgentBinding,
   updateRoleStatus
 } from "../../dist/role/role.js";
-import { createAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun } from "../helpers/effectiveLaunch.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
@@ -119,6 +119,7 @@ function registry(coordinator, host, promptPush = async () => "busy") {
 }
 
 function prepareInput(fx, roleName, runId, adapterId = fx.agent.adapterId) {
+  const effective = fx.schedulerStore.getRole(fx.task.id, roleName).effective;
   return {
     taskId: fx.task.id,
     roleName,
@@ -126,7 +127,8 @@ function prepareInput(fx, roleName, runId, adapterId = fx.agent.adapterId) {
     adapterId,
     workspace: fx.home,
     mode: "new",
-    runId
+    runId,
+    effective
   };
 }
 
@@ -260,7 +262,8 @@ test("a known Claude native session and its reservation are persisted together b
     input.roleName,
     "new",
     "work",
-    NOW
+    NOW,
+    { effective: input.effective }
   );
   fx.store.transaction((tx) => {
     tx.saveAgentRun(run);
@@ -459,6 +462,7 @@ test("a host recreated after a running reservation probe is fenced into a fresh 
       owner: owner(fx, "leader"),
       agentId: fx.agent.id,
       adapterId: fx.agent.adapterId,
+      effective: fx.schedulerStore.getRole(fx.task.id, "leader").effective,
       workspace: fx.home,
       mode: "new",
       runId: "run-raced-recovery"
@@ -474,6 +478,7 @@ test("a host recreated after a running reservation probe is fenced into a fresh 
     owner: owner(fx, "leader"),
     agentId: fx.agent.id,
     adapterId: fx.agent.adapterId,
+    effective: fx.schedulerStore.getRole(fx.task.id, "leader").effective,
     workspace: fx.home,
     mode: "new",
     runId: "run-raced-recovery"
@@ -545,6 +550,7 @@ test("a foreground preflight failure cannot enqueue cleanup for an existing heal
       owner: owner(fx, "leader"),
       agentId: fx.agent.id,
       adapterId: fx.agent.adapterId,
+      effective: fx.schedulerStore.getRole(fx.task.id, "leader").effective,
       workspace: fx.home,
       environment: { CODEX_HOME: join(fx.home, "foreground-codex") },
       mode: "new"
@@ -594,6 +600,7 @@ for (const [label, corrupt] of [
         owner: owner(fx, "leader"),
         agentId: fx.agent.id,
         adapterId: fx.agent.adapterId,
+        effective: fx.schedulerStore.getRole(fx.task.id, "leader").effective,
         workspace: fx.home,
         mode: "new"
       }, "deferred"),
@@ -643,6 +650,7 @@ test("a resume binding with the wrong native identity is fenced into owner clean
       owner: owner(fx, "leader"),
       agentId: fx.agent.id,
       adapterId: fx.agent.adapterId,
+      effective: fx.schedulerStore.getRole(fx.task.id, "leader").effective,
       workspace: fx.home,
       mode: "resume",
       nativeSessionId: "thread-current"

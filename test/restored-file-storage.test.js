@@ -20,10 +20,41 @@ function temporaryHome() {
   return mkdtempSync(join(tmpdir(), "yui-file-store-"));
 }
 
-test("storage schema initializes layout v6 with aggregate v11 and rejects non-current versions", () => {
+function readEffective(agentId, adapterId, workspace) {
+  return {
+    schemaVersion: 1,
+    provenance: "resolved",
+    sourceDesiredRevision: 1,
+    agentId,
+    adapterId,
+    access: "read",
+    yolo: false,
+    search: false,
+    permission: adapterId === "codex"
+      ? { sandbox: "read-only", approval: "never" }
+      : {
+          mode: "dontAsk",
+          allowedTools: [
+            "Read", "Grep", "Glob",
+            "Bash(yui --json task context *)",
+            "Bash(yui --json task work show *)",
+            "Bash(yui --json task work list *)",
+            "Bash(git diff *)", "Bash(git status *)", "Bash(git show *)",
+            "Bash(git log *)", "Bash(yui task run yield *)"
+          ],
+          disallowedTools: ["Edit", "Write", "NotebookEdit"]
+        },
+    ...(adapterId === "claude" ? { settingsSources: [] } : {}),
+    writeProjectIds: [],
+    workspace: { root: workspace, entries: [] },
+    context: {}
+  };
+}
+
+test("storage schema initializes layout v6 with aggregate v12 and rejects non-current versions", () => {
   const home = temporaryHome();
   assert.equal(CURRENT_STORAGE_LAYOUT_VERSION, 6);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 11);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 12);
   assert.equal(inspectStorageSchema(home).status, "uninitialized");
 
   ensureStorageSchema(home, new Date("2026-07-19T00:00:00.000Z"));
@@ -75,7 +106,9 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     updatedAt: timestamp
   };
   const globalRole = {
-    schemaVersion: 2,
+    schemaVersion: 3,
+    launchRevision: 1,
+    defaultAccess: "write",
     name: "operator",
     activeAgentId: "codex",
     agentBindings: { codex: { agentId: "codex", adapterId: "codex", config: { adapterId: "codex" } } },
@@ -95,11 +128,12 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     activeAgentId: "codex",
     sessions: {
       codex: {
-        schemaVersion: 2,
+        schemaVersion: 3,
         agentId: "codex",
         adapterId: "codex",
         nativeSessionId: "global-session",
         policy: "fixed",
+        effective: readEffective("codex", "codex", home),
         status: "ready",
         recentCompletedTurnIds: [],
         createdAt: timestamp,
@@ -133,13 +167,14 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     updatedAt: timestamp
   };
   const run = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     id: "agent-run-1",
     taskId: task.id,
     roleName: "leader",
     mode: "new",
     input: "implement",
     purpose: "execution",
+    effective: readEffective("codex", "codex", home),
     workItemId: item.id,
     status: "active",
     createdAt: timestamp,
@@ -185,8 +220,8 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   });
 
   const onDisk = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
-  assert.equal(onDisk.schemaVersion, 11);
-  assert.equal(onDisk.tasks[task.id].schemaVersion, 10);
+  assert.equal(onDisk.schemaVersion, 12);
+  assert.equal(onDisk.tasks[task.id].schemaVersion, 11);
   assert.equal(onDisk.revision, 1);
   assert.deepEqual(store.getConfiguredAgent("codex"), agent);
   assert.deepEqual(store.getGlobalRole("operator"), globalRole);
@@ -223,7 +258,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify(incompatible));
   assert.throws(
     () => new FileTaskStore(home).listTasks(),
-    /Task aggregate task-1 must use schemaVersion 10/
+    /Task aggregate task-1 must use schemaVersion 11/
   );
 });
 
@@ -242,7 +277,9 @@ test("FileTaskStore persists strict task, role, and operator WorkMailboxes", () 
     updatedAt: timestamp
   };
   const role = {
-    schemaVersion: 2,
+    schemaVersion: 3,
+    launchRevision: 1,
+    defaultAccess: "write",
     name: "leader",
     taskId: task.id,
     status: "idle",

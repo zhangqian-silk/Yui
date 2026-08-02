@@ -15,6 +15,25 @@ import {
 
 const now = new Date("2026-07-23T08:00:00.000Z");
 
+function effectiveLaunch() {
+  return {
+    schemaVersion: 1,
+    provenance: "resolved",
+    sourceDesiredRevision: 2,
+    agentId: "codex",
+    adapterId: "codex",
+    model: "gpt-5.6-sol",
+    effort: "max",
+    access: "read",
+    yolo: false,
+    search: false,
+    permission: { sandbox: "read-only", approval: "never" },
+    writeProjectIds: [],
+    workspace: { root: "/tasks/task-1", entries: [] },
+    context: {}
+  };
+}
+
 function fixtureStore() {
   const tasks = [
     {
@@ -78,7 +97,49 @@ function fixtureStore() {
       } : null;
     },
     listRoles(taskId) {
-      return taskId === "task-1" ? [{ name: "leader", status: "running", activeAgentId: "codex" }] : [];
+      return taskId === "task-1" ? [{
+        schemaVersion: 3,
+        taskId,
+        name: "leader",
+        status: "running",
+        launchRevision: 3,
+        defaultAccess: "write",
+        activeAgentId: "codex",
+        agentBindings: {
+          codex: {
+            agentId: "codex",
+            adapterId: "codex",
+            config: { adapterId: "codex", model: "gpt-5.6-sol", effort: "max" }
+          }
+        },
+        workspace: "/tasks/task-1",
+        createdAt: "2026-07-22T08:00:00.000Z",
+        updatedAt: "2026-07-23T07:30:00.000Z"
+      }] : [];
+    },
+    getTaskRoleSessionSet(taskId, roleName) {
+      return taskId === "task-1" && roleName === "leader" ? {
+        schemaVersion: 2,
+        owner: { scope: "task", taskId, roleName },
+        activeAgentId: "codex",
+        sessions: {
+          codex: {
+            schemaVersion: 3,
+            agentId: "codex",
+            adapterId: "codex",
+            nativeSessionId: "thread-1",
+            policy: "fixed",
+            effective: effectiveLaunch(),
+            status: "ready",
+            recentCompletedTurnIds: [],
+            createdAt: "2026-07-23T07:00:00.000Z",
+            updatedAt: "2026-07-23T07:30:00.000Z"
+          }
+        },
+        inFlight: null,
+        pendingTurnCompletion: null,
+        updatedAt: "2026-07-23T07:30:00.000Z"
+      } : null;
     },
     listWorkItems(taskId) {
       return taskId === "task-1" ? [
@@ -92,6 +153,8 @@ function fixtureStore() {
         taskId,
         roleName: "leader",
         mode: "resume",
+        purpose: "execution",
+        effective: effectiveLaunch(),
         input: "Finish the dashboard.",
         status: "yielded",
         summary: "Dashboard verified.",
@@ -238,8 +301,11 @@ test("dashboard API summarizes tasks and exposes one consolidated task detail", 
     assert.equal(detail.brief.objective, "Deliver the web dashboard.");
     assert.match(detail.brief.technicalApproach, /Task read model/);
     assert.equal(detail.roles[0].status, "running");
+    assert.equal(detail.roles[0].effectiveLaunch.sourceDesiredRevision, 2);
+    assert.equal(detail.roles[0].launchDrift, true);
     assert.equal(detail.openInputs[0].question, "Choose a port");
     assert.equal(detail.runs[0].summary, "Dashboard verified.");
+    assert.equal(detail.runs[0].effective.access, "read");
     assert.equal(detail.messages[0].author.roleName, "leader");
     assert.equal(detail.decisions[0].title, "Keep it read-only");
     assert.equal(detail.milestones[0].title, "Dashboard verified");

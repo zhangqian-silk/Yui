@@ -1,3 +1,6 @@
+import { isDeepStrictEqual } from "node:util";
+
+import type { WorkerAccess } from "../profile/agentProfile.js";
 import type {
   ClaudeRoleAgentConfig,
   CodexRoleAgentConfig,
@@ -34,7 +37,11 @@ export type RoleAgentBinding = {
 };
 
 type RoleAgentOwner = RoleProfile & {
-  schemaVersion: 2;
+  schemaVersion: 3;
+  /** Monotonic desired configuration revision. It only affects the next launch. */
+  launchRevision: number;
+  /** Maximum access the Role may receive after scope and purpose are applied. */
+  defaultAccess: WorkerAccess;
   name: string;
   activeAgentId: string;
   agentBindings: Record<string, RoleAgentBinding>;
@@ -84,9 +91,10 @@ export function createRole(
   activeAgentId: string,
   workspace: string,
   now: Date,
-  profile: RoleProfile = {}
+  profile: RoleProfile = {},
+  defaultAccess: WorkerAccess = "write"
 ): Role {
-  const owner = createRoleOwner(name, bindings, activeAgentId, workspace, now, profile);
+  const owner = createRoleOwner(name, bindings, activeAgentId, workspace, now, profile, defaultAccess);
   return validateTaskRole({
     ...owner,
     taskId: requireSafeIdentity(taskId, "Task id"),
@@ -100,9 +108,10 @@ export function createGlobalRole(
   activeAgentId: string,
   workspace: string,
   now: Date,
-  profile: RoleProfile = {}
+  profile: RoleProfile = {},
+  defaultAccess: WorkerAccess = "write"
 ): GlobalRole {
-  return createRoleOwner(name, bindings, activeAgentId, workspace, now, profile);
+  return createRoleOwner(name, bindings, activeAgentId, workspace, now, profile, defaultAccess);
 }
 
 export function copyGlobalRoleToTaskRole(
@@ -115,7 +124,9 @@ export function copyGlobalRoleToTaskRole(
   const timestamp = now.toISOString();
   return validateTaskRole({
     ...cloneProfile(globalRole),
-    schemaVersion: 2,
+    schemaVersion: 3,
+    launchRevision: 1,
+    defaultAccess: globalRole.defaultAccess,
     taskId: requireSafeIdentity(taskId, "Task id"),
     name: requireSafeIdentity(name, "Role name"),
     activeAgentId: globalRole.activeAgentId,
@@ -134,31 +145,41 @@ export function activeRoleAgentBinding(role: Role | GlobalRole): RoleAgentBindin
 
 export function updateGlobalRole(
   role: GlobalRole,
-  patch: Partial<Pick<GlobalRole, "name" | "activeAgentId" | "agentBindings" | "workspace">> & RoleProfile,
+  patch: Partial<Pick<GlobalRole,
+    "name" | "activeAgentId" | "agentBindings" | "workspace" | "defaultAccess">> & RoleProfile,
   now: Date
 ): GlobalRole {
   validateGlobalRole(role);
+  const desiredBefore = desiredLaunchProjection(role);
   const updated = {
     ...role,
     ...cloneRolePatch(patch),
     updatedAt: now.toISOString()
   };
   clearProfileFields(updated, patch);
+  updated.launchRevision = isDeepStrictEqual(desiredBefore, desiredLaunchProjection(updated))
+    ? role.launchRevision
+    : role.launchRevision + 1;
   return validateGlobalRole(updated);
 }
 
 export function updateRole(
   role: Role,
-  patch: Partial<Pick<Role, "name" | "activeAgentId" | "agentBindings" | "workspace">> & RoleProfile,
+  patch: Partial<Pick<Role,
+    "name" | "activeAgentId" | "agentBindings" | "workspace" | "defaultAccess">> & RoleProfile,
   now: Date
 ): Role {
   validateTaskRole(role);
+  const desiredBefore = desiredLaunchProjection(role);
   const updated = {
     ...role,
     ...cloneRolePatch(patch),
     updatedAt: now.toISOString()
   };
   clearProfileFields(updated, patch);
+  updated.launchRevision = isDeepStrictEqual(desiredBefore, desiredLaunchProjection(updated))
+    ? role.launchRevision
+    : role.launchRevision + 1;
   return validateTaskRole(updated);
 }
 
@@ -205,20 +226,11 @@ export function switchActiveRoleAgent(
   event: RoleAgentSwitchEvent;
 } {
   validateRoleOwner(role);
-  if (runtime.activeRun) {
-    throw new Error("Cannot switch Role Agent while an active AgentRun exists.");
-  }
-  if (runtime.nativeProcessRunning) {
-    throw new Error("Cannot switch Role Agent while the native Agent process is running.");
-  }
   const normalizedTarget = requireSafeIdentity(targetAgentId, "Target Agent id");
   if (!Object.hasOwn(role.agentBindings, normalizedTarget)) {
     throw new Error(`Role Agent is not bound: ${normalizedTarget}.`);
   }
   assertSessionOwnerMatchesRole(role, sessions);
-  if (sessions.activeAgentId !== role.activeAgentId) {
-    throw new Error(`Role session active Agent does not match Role: ${role.name}.`);
-  }
 
   const fromAgentId = role.activeAgentId;
   const mode = sessions.sessions[normalizedTarget] === undefined ? "new" : "resume";
@@ -226,11 +238,15 @@ export function switchActiveRoleAgent(
   const updatedRole = "taskId" in role
     ? updateRole(role, { activeAgentId: normalizedTarget }, now)
     : updateGlobalRole(role, { activeAgentId: normalizedTarget }, now);
-  const updatedSessions = {
-    ...sessions,
-    activeAgentId: normalizedTarget,
-    updatedAt: timestamp
-  } as RoleSessionSet;
+  // A running process keeps its immutable effective identity. The desired
+  // switch becomes visible only when the next launch is planned.
+  const updatedSessions = runtime.activeRun || runtime.nativeProcessRunning
+    ? sessions
+    : {
+        ...sessions,
+        activeAgentId: normalizedTarget,
+        updatedAt: timestamp
+      } as RoleSessionSet;
 
   return {
     role: updatedRole,
@@ -277,8 +293,11 @@ export function unbindRoleAgent(
   if (sessions !== null) {
     validateRoleSessionSet(sessions);
     assertSessionOwnerMatchesRole(role, sessions);
-    if (sessions.activeAgentId !== role.activeAgentId) {
-      throw new Error(`Role session active Agent does not match Role: ${role.name}.`);
+    const taskSessions = sessions.owner.scope === "task"
+      ? sessions as TaskRoleSessionSet
+      : null;
+    if (taskSessions?.inFlight?.agentId === normalizedAgentId) {
+      throw new Error(`Cannot unbind Role Agent with an active Run: ${normalizedAgentId}.`);
     }
     const targetSession = sessions.sessions[normalizedAgentId];
     if (targetSession !== undefined && targetSession.status !== "stopped") {
@@ -295,7 +314,10 @@ export function unbindRoleAgent(
       : Object.entries(globalSessions.history ?? {}).filter(([, session]) => (
           session.agentId === normalizedAgentId
         ));
-    if (targetSession !== undefined || targetHistory.length > 0) {
+    const targetTaskHistory = (taskSessions?.history ?? []).filter((session) => (
+      session.agentId === normalizedAgentId
+    ));
+    if (targetSession !== undefined || targetHistory.length > 0 || targetTaskHistory.length > 0) {
       const remainingSessions = { ...sessions.sessions };
       delete remainingSessions[normalizedAgentId];
       const remainingHistory = globalSessions === null
@@ -303,10 +325,16 @@ export function unbindRoleAgent(
         : Object.fromEntries(Object.entries(globalSessions.history ?? {}).filter(([, session]) => (
             session.agentId !== normalizedAgentId
           )));
+      const remainingTaskHistory = taskSessions === null
+        ? undefined
+        : (taskSessions.history ?? []).filter((session) => (
+            session.agentId !== normalizedAgentId
+          ));
       updatedSessions = validateRoleSessionSet({
         ...sessions,
         sessions: remainingSessions,
         ...(remainingHistory === undefined ? {} : { history: remainingHistory }),
+        ...(remainingTaskHistory === undefined ? {} : { history: remainingTaskHistory }),
         updatedAt: now.toISOString()
       } as RoleSessionSet);
     }
@@ -336,7 +364,8 @@ function createRoleOwner(
   activeAgentId: string,
   workspace: string,
   now: Date,
-  profile: RoleProfile
+  profile: RoleProfile,
+  defaultAccess: WorkerAccess
 ): GlobalRole {
   const mappedBindings: Record<string, RoleAgentBinding> = {};
   for (const sourceBinding of bindings) {
@@ -349,7 +378,9 @@ function createRoleOwner(
   const timestamp = now.toISOString();
   return validateGlobalRole({
     ...cloneProfile(profile),
-    schemaVersion: 2,
+    schemaVersion: 3,
+    launchRevision: 1,
+    defaultAccess,
     name: requireSafeIdentity(name, "Role name"),
     activeAgentId: requireSafeIdentity(activeAgentId, "Role active Agent id"),
     agentBindings: mappedBindings,
@@ -360,7 +391,13 @@ function createRoleOwner(
 }
 
 function validateRoleOwner<T extends GlobalRole>(role: T): T {
-  if (role.schemaVersion !== 2) throw new Error("Role schema version is invalid.");
+  if (role.schemaVersion !== 3) throw new Error("Role schema version is invalid.");
+  if (!Number.isSafeInteger(role.launchRevision) || role.launchRevision < 1) {
+    throw new Error("Role launch revision must be a positive integer.");
+  }
+  if (role.defaultAccess !== "read" && role.defaultAccess !== "write") {
+    throw new Error("Role default access is invalid.");
+  }
   requireSafeIdentity(role.name, "Role name");
   requireSafeIdentity(role.activeAgentId, "Role active Agent id");
   requireText(role.workspace, "Role workspace");
@@ -411,7 +448,8 @@ function assertSessionOwnerMatchesRole(role: Role | GlobalRole, sessions: RoleSe
 }
 
 function cloneRolePatch(
-  patch: Partial<Pick<GlobalRole, "name" | "activeAgentId" | "agentBindings" | "workspace">> & RoleProfile
+  patch: Partial<Pick<GlobalRole,
+    "name" | "activeAgentId" | "agentBindings" | "workspace" | "defaultAccess">> & RoleProfile
 ): typeof patch {
   return {
     ...(patch.name === undefined ? {} : { name: requireSafeIdentity(patch.name, "Role name") }),
@@ -419,8 +457,20 @@ function cloneRolePatch(
       ? {}
       : { activeAgentId: requireSafeIdentity(patch.activeAgentId, "Role active Agent id") }),
     ...(patch.workspace === undefined ? {} : { workspace: requireText(patch.workspace, "Role workspace") }),
+    ...(patch.defaultAccess === undefined ? {} : { defaultAccess: patch.defaultAccess }),
     ...(patch.agentBindings === undefined ? {} : { agentBindings: cloneBindings(patch.agentBindings) }),
     ...cloneProfile(patch)
+  };
+}
+
+function desiredLaunchProjection(role: GlobalRole): unknown {
+  return {
+    name: role.name,
+    activeAgentId: role.activeAgentId,
+    agentBindings: role.agentBindings,
+    workspace: role.workspace,
+    defaultAccess: role.defaultAccess,
+    ...cloneProfile(role)
   };
 }
 

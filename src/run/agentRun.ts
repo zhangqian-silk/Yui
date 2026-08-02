@@ -1,4 +1,7 @@
-import { isAgentAdapterId, type AgentAdapterId } from "../agent/adapterCatalog.js";
+import {
+  validateEffectiveLaunchSnapshot,
+  type EffectiveLaunchSnapshot
+} from "../executor/effectiveLaunch.js";
 import { validateRoleWorkspace, type RoleWorkspace } from "../worktree/roleWorkspace.js";
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
 
@@ -7,7 +10,7 @@ export type AgentRunStatus = "active" | "yielded" | "failed";
 export type AgentRunPurpose = "execution" | "review";
 
 export type AgentRun = {
-  schemaVersion: 3;
+  schemaVersion: 4;
   id: string;
   taskId: string;
   roleName: string;
@@ -17,10 +20,8 @@ export type AgentRun = {
   workItemId?: string;
   reviewRoundId?: string;
   workspace?: RoleWorkspace;
-  agentId?: string;
-  adapterId?: AgentAdapterId;
-  model?: string;
-  effort?: string;
+  /** Immutable actual launch configuration and provenance. */
+  effective: EffectiveLaunchSnapshot;
   status: AgentRunStatus;
   /** Set only after tmux has confirmed the receipt-backed input delivery. */
   deliveredAt?: string;
@@ -42,20 +43,15 @@ export function createAgentRun(
     purpose?: AgentRunPurpose;
     reviewRoundId?: string;
     workspace?: RoleWorkspace;
-    agent?: Readonly<{
-      agentId: string;
-      adapterId: AgentAdapterId;
-      model?: string;
-      effort?: string;
-    }>;
-  } = {}
+    effective: EffectiveLaunchSnapshot;
+  }
 ): AgentRun {
   if (mode !== "new" && mode !== "resume") {
     throw new Error(`Agent run dispatch mode is invalid: ${mode}.`);
   }
   const timestamp = now.toISOString();
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     id: requireSafeIdentity(id, "Agent run id"),
     taskId: requireSafeIdentity(taskId, "Task id"),
     roleName: requireSafeIdentity(roleName, "Role name"),
@@ -71,18 +67,7 @@ export function createAgentRun(
     ...(context.workspace === undefined
       ? {}
       : { workspace: validateRoleWorkspace(context.workspace) }),
-    ...(context.agent === undefined
-      ? {}
-      : {
-          agentId: requireSafeIdentity(context.agent.agentId, "Agent id"),
-          adapterId: requireAdapterId(context.agent.adapterId),
-          ...(context.agent.model === undefined
-            ? {}
-            : { model: requireText(context.agent.model, "Agent model") }),
-          ...(context.agent.effort === undefined
-            ? {}
-            : { effort: requireText(context.agent.effort, "Agent effort") })
-        }),
+    effective: validateEffectiveLaunchSnapshot(context.effective),
     status: "active",
     createdAt: timestamp,
     updatedAt: timestamp
@@ -103,7 +88,7 @@ export function markAgentRunDelivered(run: AgentRun, now: Date): AgentRun {
 }
 
 export function validateAgentRun(run: AgentRun): AgentRun {
-  if (run.schemaVersion !== 3) throw new Error("Agent run must use schemaVersion 3.");
+  if (run.schemaVersion !== 4) throw new Error("Agent run must use schemaVersion 4.");
   validateTaskRecordReference({ taskId: run.taskId, localId: run.id }, "agentRun");
   requireSafeIdentity(run.roleName, "Role name");
   if (run.mode !== "new" && run.mode !== "resume") {
@@ -139,15 +124,14 @@ export function validateAgentRun(run: AgentRun): AgentRun {
   } else if (run.reviewRoundId !== undefined) {
     throw new Error("An execution Agent run cannot reference a ReviewRound.");
   }
-  if ((run.agentId === undefined) !== (run.adapterId === undefined)) {
-    throw new Error("Agent run snapshot requires both agentId and adapterId.");
+  validateEffectiveLaunchSnapshot(run.effective);
+  if (run.workspace !== undefined
+    && (run.effective.workspace.root !== run.workspace.root
+      || JSON.stringify(run.effective.workspace.entries) !== JSON.stringify(run.workspace.entries))) {
+    throw new Error("Agent run effective workspace does not match its managed workspace.");
   }
-  if (run.agentId !== undefined) requireSafeIdentity(run.agentId, "Agent id");
-  if (run.adapterId !== undefined) requireAdapterId(run.adapterId);
-  if (run.model !== undefined) requireText(run.model, "Agent model");
-  if (run.effort !== undefined) requireText(run.effort, "Agent effort");
-  if ((run.model !== undefined || run.effort !== undefined) && run.agentId === undefined) {
-    throw new Error("Agent run model and effort require an Agent snapshot.");
+  if (run.purpose === "review" && run.effective.access !== "read") {
+    throw new Error("A review Agent run must have read-only effective access.");
   }
   if (!( ["active", "yielded", "failed"] as const).includes(run.status)) {
     throw new Error(`Agent run status is invalid: ${String(run.status)}.`);
@@ -200,11 +184,6 @@ function requireSafeIdentity(value: string, label: string): string {
     throw new Error(`${label} is invalid.`);
   }
   return normalized;
-}
-
-function requireAdapterId(value: string): AgentAdapterId {
-  if (!isAgentAdapterId(value)) throw new Error(`Agent adapter is unsupported: ${value}.`);
-  return value;
 }
 
 function requireText(value: string, label: string): string {

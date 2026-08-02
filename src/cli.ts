@@ -733,7 +733,7 @@ async function executeOperatorSessionControl(
   const role = store.getGlobalRole("operator");
   if (role === null) throw usageError("Operator is not configured. Run yui setup first.");
   const sessionSet = store.getGlobalRoleSessionSet(role.name);
-  const active = sessionSet?.sessions[role.activeAgentId];
+  const active = sessionSet?.sessions[sessionSet.activeAgentId];
   const paneRunning = tmux.detectRoleStatus("operator", "operator") === "running";
   if (paneRunning && active === undefined) {
     throw usageError(
@@ -744,7 +744,7 @@ async function executeOperatorSessionControl(
   if (
     control.action === "resume"
     && paneRunning
-    && control.targetAgentId === role.activeAgentId
+    && control.targetAgentId === active?.agentId
     && active !== undefined
     && operatorSessionRef(active) === control.ref
   ) {

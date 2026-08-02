@@ -17,7 +17,8 @@ import { runTaskIntegrationCommand } from "../../dist/commands/taskIntegrationCo
 import { createIntegrationAttempt } from "../../dist/integration/integrationAttempt.js";
 import { GitIntegrationService } from "../../dist/integration/gitIntegrationService.js";
 import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
-import { createAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
+import { yieldAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun } from "../helpers/effectiveLaunch.js";
 import { createProject } from "../../dist/repository/project.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";

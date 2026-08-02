@@ -141,7 +141,7 @@ function createRequest(
     tx.saveRole(task.id, updateRoleStatus(origin.role, "idle", now));
     if (origin.sessions !== null) {
       tx.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(origin.sessions, {
-        agentId: origin.role.activeAgentId,
+        agentId: origin.run.effective.agentId,
         runId: origin.run.id,
         receiptId: formatAgentRunReceiptId(task.id, origin.run.id)
       }, now));
@@ -315,8 +315,8 @@ function requireLeaderInputOrigin(
     env.YUI_SESSION_SCOPE !== "task"
     || env.YUI_TASK_ID !== taskId
     || env.YUI_ROLE !== LEADER_ROLE
-    || env.YUI_AGENT_ID !== role.activeAgentId
     || run === null
+    || env.YUI_AGENT_ID !== run.effective.agentId
     || run.status !== "active"
     || run.deliveredAt === undefined
     || run.workItemId !== undefined
@@ -326,14 +326,14 @@ function requireLeaderInputOrigin(
   const sessions = store.getTaskRoleSessionSet(taskId, LEADER_ROLE);
   const nativeSessionId = trimmed(env.YUI_NATIVE_SESSION_ID);
   if (nativeSessionId !== undefined
-    && sessions?.sessions[role.activeAgentId]?.nativeSessionId !== nativeSessionId) {
+    && sessions?.sessions[run.effective.agentId]?.nativeSessionId !== nativeSessionId) {
     throw usageError("Task input request native session does not match the active Leader session.");
   }
   return {
     requester: {
       taskId,
       roleName: "leader",
-      agentId: role.activeAgentId,
+      agentId: run.effective.agentId,
       runId: run.id,
       ...(nativeSessionId === undefined ? {} : { nativeSessionId })
     },

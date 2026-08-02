@@ -7,8 +7,7 @@ import test from "node:test";
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import {
-  createRoleSessionSet,
-  recordRoleAgentSession
+  createRoleSessionSet
 } from "../../dist/executor/agentExecutor.js";
 import { createInputRequest } from "../../dist/input/inputRequest.js";
 import {
@@ -16,7 +15,7 @@ import {
   createRoleAgentBinding,
   updateRoleStatus
 } from "../../dist/role/role.js";
-import { createAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun, recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { updateWorkItemStatus } from "../../dist/workItem/workItem.js";

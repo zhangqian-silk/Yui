@@ -9,6 +9,12 @@ import {
   statSync
 } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
+import {
+  legacyEffectiveLaunchSnapshot,
+  type EffectiveLaunchContext,
+  type EffectiveLaunchWorkspace
+} from "../executor/effectiveLaunch.js";
+import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 
 import {
   formatAgentRunReceiptId,
@@ -276,19 +282,128 @@ function convertState(state: JsonObject, conversions: readonly TaskConversion[])
   for (const [key, value] of Object.entries(object(state.mailboxes, "Source WorkMailboxes"))) {
     mailboxes[key] = convertMailbox(value, owners);
   }
+  const globalRoles = Object.fromEntries(Object.entries(
+    object(state.globalRoles, "Source Global Roles")
+  ).map(([name, value]) => [name, convertLegacyRole(value, `Global Role ${name}`)]));
+  const globalRoleSessionSets = Object.fromEntries(Object.entries(object(
+    state.globalRoleSessionSets,
+    "Source Global Role sessions"
+  )).map(([name, value]) => [name, convertRoleSessionSet(
+    value,
+    object(globalRoles[name], `Converted Global Role ${name}`),
+    undefined
+  )]));
   return {
     ...clone(state),
     schemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
+    globalRoles,
+    globalRoleSessionSets,
     tasks,
     mailboxes
   };
 }
 
+function convertLegacyRole(value: unknown, label: string): JsonObject {
+  const role = clone(object(value, label));
+  if (role.schemaVersion !== 2) {
+    throw new Error(`${label} must use legacy schemaVersion 2.`);
+  }
+  return {
+    ...role,
+    schemaVersion: 3,
+    launchRevision: 1,
+    // Legacy prompt/config did not prove an authorized write scope. The one
+    // offline cutover therefore closes desired access to read-only.
+    defaultAccess: "read"
+  };
+}
+
+function legacyRoleContext(role: JsonObject): EffectiveLaunchContext {
+  return {
+    ...(role.description === undefined
+      ? {}
+      : { description: text(role.description, "Source Role description") }),
+    ...(role.responsibilities === undefined
+      ? {}
+      : { responsibilities: array(role.responsibilities, "Source Role responsibilities").map(
+          (value) => text(value, "Source Role responsibility")
+        ) }),
+    ...(role.constraints === undefined
+      ? {}
+      : { constraints: array(role.constraints, "Source Role constraints").map(
+          (value) => text(value, "Source Role constraint")
+        ) }),
+    ...(role.expectedOutput === undefined
+      ? {}
+      : { expectedOutput: text(role.expectedOutput, "Source Role expected output") }),
+    ...(role.systemPrompt === undefined
+      ? {}
+      : { systemPrompt: text(role.systemPrompt, "Source Role system prompt") }),
+    ...(role.skills === undefined
+      ? {}
+      : { skills: array(role.skills, "Source Role Skills").map(
+          (value) => text(value, "Source Role Skill id")
+        ) })
+  };
+}
+
+function legacyRoleWorkspace(
+  roleValue: unknown,
+  taskValue?: unknown
+): EffectiveLaunchWorkspace {
+  const role = roleValue === undefined ? undefined : object(roleValue, "Source Role");
+  const task = taskValue === undefined ? undefined : object(taskValue, "Source Task");
+  const root = role?.workspace ?? task?.cwd;
+  return { root: text(root, "Source effective workspace"), entries: [] };
+}
+
+function effectiveWorkspace(value: unknown): EffectiveLaunchWorkspace {
+  const workspace = object(value, "Converted managed workspace");
+  return {
+    root: text(workspace.root, "Converted workspace root"),
+    entries: array(workspace.entries, "Converted workspace entries").map((entryValue) => {
+      const entry = object(entryValue, "Converted workspace entry");
+      const access = text(entry.access, "Converted workspace access");
+      if (access !== "read" && access !== "write") {
+        throw new Error(`Converted workspace access is invalid: ${access}.`);
+      }
+      return {
+        projectId: text(entry.projectId, "Converted workspace Project id"),
+        directory: text(entry.directory, "Converted workspace directory"),
+        access,
+        path: text(entry.path, "Converted workspace path"),
+        branch: text(entry.branch, "Converted workspace branch"),
+        baseRef: text(entry.baseRef, "Converted workspace base ref"),
+        baseCommit: text(entry.baseCommit, "Converted workspace base commit")
+      };
+    })
+  };
+}
+
+function agentAdapterId(value: unknown, label: string): AgentAdapterId {
+  const result = text(value, label);
+  if (result !== "codex" && result !== "claude") {
+    throw new Error(`${label} is unsupported: ${result}.`);
+  }
+  return result;
+}
+
 function convertTaskAggregate(conversion: TaskConversion): JsonObject {
   const source = conversion.source;
+  const roles = Object.fromEntries(Object.entries(object(
+    source.roles,
+    `Source Task Roles ${conversion.taskId}`
+  )).map(([name, value]) => [name, convertLegacyRole(
+    value,
+    `Task Role ${conversion.taskId}/${name}`
+  )]));
+  const workspaces = convertNamedMap(source.roleWorkspaces, (value) => (
+    convertWorkspace(value, conversion)
+  ));
   return {
     ...clone(source),
-    schemaVersion: 10,
+    schemaVersion: 11,
+    roles,
     idHighWaterMarks: Object.fromEntries(
       (Object.keys(FAMILY_FIELDS) as TaskRecordKind[]).map((kind) => [
         kind, conversion.maps[kind].size
@@ -311,12 +426,16 @@ function convertTaskAggregate(conversion: TaskConversion): JsonObject {
         ))
       })
     ),
-    roleWorkspaces: convertNamedMap(source.roleWorkspaces, (value) => (
-      convertWorkspace(value, conversion)
-    )),
-    roleSessionSets: convertNamedMap(source.roleSessionSets, (value) => (
-      convertTaskRoleSessionSet(value, conversion)
-    )),
+    roleWorkspaces: workspaces,
+    roleSessionSets: Object.fromEntries(Object.entries(object(
+      source.roleSessionSets,
+      `Source Task Role sessions ${conversion.taskId}`
+    )).map(([name, value]) => [name, convertTaskRoleSessionSet(
+      value,
+      conversion,
+      object(roles[name], `Converted Task Role ${conversion.taskId}/${name}`),
+      workspaces[name]
+    )])),
     workItems: convertFamily(conversion, "workItem", (record, oldId, id) => (
       convertWorkItem(record, oldId, id, conversion)
     )),
@@ -448,8 +567,22 @@ function convertAgentRun(
   id: string,
   conversion: TaskConversion
 ): JsonObject {
+  if (record.schemaVersion !== 3) throw new Error("Source AgentRun must use schemaVersion 3.");
+  const agentId = text(record.agentId, "Source Agent Run agent id");
+  const adapterId = agentAdapterId(record.adapterId, "Source Agent Run adapter id");
+  const convertedWorkspace = record.workspace === undefined
+    ? undefined
+    : convertWorkspace(record.workspace, conversion);
+  const role = object(conversion.source.roles, `Source Task Roles ${conversion.taskId}`)[
+    text(record.roleName, "Source Agent Run Role name")
+  ];
+  const workspace = convertedWorkspace === undefined
+    ? legacyRoleWorkspace(role, conversion.source.task)
+    : effectiveWorkspace(convertedWorkspace);
+  const { agentId: _agentId, adapterId: _adapterId, model: _model, effort: _effort, ...rest } = record;
   return {
-    ...record,
+    ...rest,
+    schemaVersion: 4,
     id,
     taskId: conversion.taskId,
     input: rewriteManagedRunHeader(text(record.input, "Agent Run input"), oldId, id),
@@ -461,9 +594,18 @@ function convertAgentRun(
       : { reviewRoundId: mapped(
           conversion, "reviewRound", record.reviewRoundId, "Agent Run ReviewRound"
         ) }),
-    ...(record.workspace === undefined
+    ...(convertedWorkspace === undefined
       ? {}
-      : { workspace: convertWorkspace(record.workspace, conversion) })
+      : { workspace: convertedWorkspace }),
+    effective: clone(legacyEffectiveLaunchSnapshot({
+      sourceDesiredRevision: 1,
+      agentId,
+      adapterId,
+      ...(record.model === undefined ? {} : { model: text(record.model, "Source Agent Run model") }),
+      ...(record.effort === undefined ? {} : { effort: text(record.effort, "Source Agent Run effort") }),
+      workspace,
+      context: role === undefined ? {} : legacyRoleContext(object(role, "Source Agent Run Role"))
+    }))
   };
 }
 
@@ -522,7 +664,12 @@ function convertWorkspace(value: unknown, conversion: TaskConversion): JsonObjec
   };
 }
 
-function convertTaskRoleSessionSet(value: unknown, conversion: TaskConversion): JsonObject {
+function convertTaskRoleSessionSet(
+  value: unknown,
+  conversion: TaskConversion,
+  role: JsonObject,
+  workspaceValue: unknown
+): JsonObject {
   const sessions = clone(object(value, "Task Role session set"));
   const owner = object(sessions.owner, "Task Role session owner");
   const inFlight = sessions.inFlight === null
@@ -533,6 +680,13 @@ function convertTaskRoleSessionSet(value: unknown, conversion: TaskConversion): 
     : object(sessions.pendingTurnCompletion, "Pending Turn completion");
   return {
     ...sessions,
+    sessions: convertSessionMap(
+      sessions.sessions,
+      role,
+      workspaceValue === undefined
+        ? legacyRoleWorkspace(role, conversion.source.task)
+        : effectiveWorkspace(workspaceValue)
+    ),
     owner: { ...clone(owner), taskId: conversion.taskId },
     inFlight: inFlight === null
       ? null
@@ -552,6 +706,62 @@ function convertTaskRoleSessionSet(value: unknown, conversion: TaskConversion): 
           runId: mapped(conversion, "agentRun", pending.runId, "Pending completion Run")
         }
   };
+}
+
+function convertRoleSessionSet(
+  value: unknown,
+  role: JsonObject,
+  workspaceValue: unknown
+): JsonObject {
+  const set = clone(object(value, "Global Role session set"));
+  const workspace = workspaceValue === undefined
+    ? legacyRoleWorkspace(role)
+    : effectiveWorkspace(workspaceValue);
+  return {
+    ...set,
+    sessions: convertSessionMap(set.sessions, role, workspace),
+    ...(set.history === undefined
+      ? {}
+      : { history: convertSessionMap(set.history, role, workspace) })
+  };
+}
+
+function convertSessionMap(
+  value: unknown,
+  role: JsonObject,
+  workspace: EffectiveLaunchWorkspace
+): JsonObject {
+  return Object.fromEntries(Object.entries(object(value, "Source Role Agent sessions")).map(
+    ([key, sessionValue]) => {
+      const session = clone(object(sessionValue, `Source Role Agent session ${key}`));
+      if (session.schemaVersion !== 2) {
+        throw new Error("Source Role Agent session must use schemaVersion 2.");
+      }
+      const agentId = text(session.agentId, "Source Session Agent id");
+      const adapterId = agentAdapterId(session.adapterId, "Source Session adapter id");
+      const binding = object(role.agentBindings, "Source Role Agent bindings")[agentId];
+      const config = binding === undefined
+        ? undefined
+        : object(object(binding, "Source Role Agent binding").config, "Source Role Agent config");
+      return [key, {
+        ...session,
+        schemaVersion: 3,
+        effective: clone(legacyEffectiveLaunchSnapshot({
+          sourceDesiredRevision: 1,
+          agentId,
+          adapterId,
+          ...(config?.model === undefined
+            ? {}
+            : { model: text(config.model, "Source Session model") }),
+          ...(config?.effort === undefined
+            ? {}
+            : { effort: text(config.effort, "Source Session effort") }),
+          workspace,
+          context: legacyRoleContext(role)
+        }))
+      }];
+    }
+  ));
 }
 
 type OwnerIndex = Readonly<Record<"run" | "work-item" | "input" | "message", Map<

@@ -9,13 +9,15 @@ import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.j
 import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { updateRoleAgentSessionStatus } from "../../dist/executor/agentExecutor.js";
+import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import {
   createGlobalRole,
   createRole,
   createRoleAgentBinding,
   updateRole
 } from "../../dist/role/role.js";
-import { createAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
+import { yieldAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun as createTestAgentRun } from "../helpers/effectiveLaunch.js";
 import { processActiveRoleRunDeliveries } from "../../dist/scheduler/activeRoleRunDelivery.js";
 import { processLeaderWakeups } from "../../dist/scheduler/leaderWakeupProcessor.js";
 import { processOperatorInputNotifications } from "../../dist/scheduler/operatorInputNotificationProcessor.js";
@@ -51,24 +53,40 @@ function fixture(t) {
   return { home, store, task, role, now, adapter: new FileSchedulerStoreAdapter(store) };
 }
 
+function schedulerSession(run, nativeSessionId, status = "ready") {
+  return {
+    agentId: run.effective.agentId,
+    adapterId: run.effective.adapterId,
+    nativeSessionId,
+    status,
+    effective: run.effective
+  };
+}
+
+function createAgentRun(adapter, ...args) {
+  const context = args[6] ?? {};
+  if (context.effective !== undefined || context.agent !== undefined) {
+    return createTestAgentRun(...args);
+  }
+  return createTestAgentRun(...args.slice(0, 6), {
+    ...context,
+    effective: adapter.getRole(args[1], args[2]).effective
+  });
+}
+
 test("FileSchedulerStoreAdapter commits Leader run, Role and fixed session together", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
   const before = JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision;
   const proposedRunId = adapter.peekNextAgentRunId(task.id);
   assert.equal(proposedRunId, "agent-run-1");
   assert.equal(JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision, before);
-  const run = createAgentRun(proposedRunId, task.id, role.name, "resume", "continue", now);
+  const run = createAgentRun(adapter, proposedRunId, task.id, role.name, "resume", "continue", now);
 
   const result = adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
     run,
-    session: {
-      agentId: "codex",
-      adapterId: "codex",
-      nativeSessionId: "thread-1",
-      status: "ready"
-    },
+    session: schedulerSession(run, "thread-1"),
     wakeup: store.getPendingWakeup(task.id),
     now
   });
@@ -98,7 +116,7 @@ test("Leader dispatch rejects a stale launch configuration snapshot", (t) => {
       )
     }
   }, changedAt));
-  const run = createAgentRun("agent-run-118", task.id, role.name, "resume", "continue", now);
+  const run = createAgentRun(adapter, "agent-run-118", task.id, role.name, "resume", "continue", now);
 
   const result = adapter.saveLeaderDispatch({
     task,
@@ -117,7 +135,7 @@ test("Leader dispatch rejects a stale launch configuration snapshot", (t) => {
   assert.equal(adapter.getRole(task.id, role.name).workspace, home);
 
   const current = adapter.getRole(task.id, role.name);
-  const mismatchedRun = createAgentRun(
+  const mismatchedRun = createAgentRun(adapter,
     "agent-run-105",
     task.id,
     role.name,
@@ -163,15 +181,67 @@ test("a busy Leader claim is retried through active Run delivery without another
   assert.equal(store.getPendingWakeup(task.id), null);
   const active = store.getActiveAgentRun(task.id, role.name);
   assert.equal(active.deliveredAt, undefined);
-  assert.equal(active.agentId, role.activeAgentId);
-  assert.equal(active.adapterId, "codex");
-  assert.equal(active.model, "gpt-test");
-  assert.equal(active.effort, "high");
+  assert.equal(active.effective.agentId, role.activeAgentId);
+  assert.equal(active.effective.adapterId, "codex");
+  assert.equal(active.effective.model, "gpt-test");
+  assert.equal(active.effective.effort, "high");
 
   const [retried] = await processActiveRoleRunDeliveries(adapter, delivery, now);
   assert.equal(retried.status, "delivered");
   assert.equal(sends, 2);
   assert.notEqual(store.getActiveAgentRun(task.id, role.name).deliveredAt, undefined);
+});
+
+test("desired drift does not block a wake delivered to the still-live Leader Session", async (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  adapter.recordRuntimeNativeSession({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-before-drift"
+  }, now);
+  adapter.observeRuntimeTurnCompleted({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-before-drift",
+    turnId: "turn-before-drift",
+    summary: "idle before desired drift"
+  }, now);
+  const immutable = structuredClone(adapter.getRoleSession(task.id, role.name).effective);
+  const changedAt = new Date(now.getTime() + 1);
+  store.saveRole(task.id, updateRole(role, {
+    agentBindings: {
+      codex: createRoleAgentBinding(
+        { id: "codex", adapterId: "codex" },
+        { adapterId: "codex", model: "gpt-next", effort: "medium" }
+      )
+    }
+  }, changedAt));
+
+  let preparedInput;
+  const [result] = await processLeaderWakeups(adapter, {
+    async prepareRoleSession(input) {
+      preparedInput = input;
+      return { ...input, deliveryId: "wake-after-drift", sessionStarted: false };
+    },
+    async waitUntilReady(prepared) {
+      return {
+        prepared,
+        session: { ...adapter.getRoleSession(task.id, role.name), status: "running" }
+      };
+    },
+    async sendOnce() { return "sent"; }
+  }, changedAt);
+
+  assert.equal(result.status, "dispatched");
+  assert.equal(preparedInput.mode, "resume");
+  assert.equal(preparedInput.nativeSessionId, "thread-before-drift");
+  assert.deepEqual(preparedInput.effective, immutable);
+  assert.deepEqual(store.getActiveAgentRun(task.id, role.name).effective, immutable);
+  assert.ok(store.getRole(task.id, role.name).launchRevision > immutable.sourceDesiredRevision);
 });
 
 test("Leader preparation owns its durable Run before awaiting tmux", async (t) => {
@@ -199,7 +269,7 @@ test("Leader preparation owns its durable Run before awaiting tmux", async (t) =
   assert.notEqual(claimed, null);
   assert.equal(store.getPendingWakeup(task.id), null);
   assert.throws(
-    () => store.saveActiveAgentRun(createAgentRun(
+    () => store.saveActiveAgentRun(createAgentRun(adapter,
       "agent-run-119",
       task.id,
       role.name,
@@ -216,7 +286,7 @@ test("Leader preparation owns its durable Run before awaiting tmux", async (t) =
 
 test("Leader dispatch rejects a Run id that already exists in Task history", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
-  const historic = createAgentRun(
+  const historic = createAgentRun(adapter,
     "agent-run-101",
     task.id,
     role.name,
@@ -229,7 +299,7 @@ test("Leader dispatch rejects a Run id that already exists in Task history", (t)
   const result = adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
-    run: createAgentRun(
+    run: createAgentRun(adapter,
       historic.id,
       task.id,
       role.name,
@@ -286,7 +356,7 @@ test("prepare failure terminates a claimed Run with an existing fixed session", 
 test("a stale Leader preparation failure cannot overwrite a newer active Run", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
   const wakeup = store.getPendingWakeup(task.id);
-  const replacement = createAgentRun(
+  const replacement = createAgentRun(adapter,
     "agent-run-102",
     task.id,
     role.name,
@@ -301,7 +371,7 @@ test("a stale Leader preparation failure cannot overwrite a newer active Run", (
     role: adapter.getRole(task.id, role.name),
     session: null,
     claimed: {
-      run: createAgentRun(
+      run: createAgentRun(adapter,
         "agent-run-118",
         task.id,
         role.name,
@@ -341,7 +411,7 @@ test("a stale Leader preparation failure cannot overwrite a newer active Run", (
 
 test("runtime Turn completion waits for the two-second grace deadline before closing a Leader Run", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
-  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
+  const run = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -354,12 +424,7 @@ test("runtime Turn completion waits for the two-second grace deadline before clo
     task,
     role: adapter.getRole(task.id, role.name),
     run,
-    session: {
-      agentId: "codex",
-      adapterId: "codex",
-      nativeSessionId: "thread-grace",
-      status: "ready"
-    },
+    session: schedulerSession(run, "thread-grace"),
     now
   });
   const observed = adapter.observeRuntimeTurnCompleted({
@@ -394,17 +459,12 @@ test("runtime Turn completion waits for the two-second grace deadline before clo
 
 test("an unrelated Hook cannot prove that a prepared Leader Run was delivered", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
-  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
+  const run = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
     run,
-    session: {
-      agentId: "codex",
-      adapterId: "codex",
-      nativeSessionId: "thread-prepared",
-      status: "ready"
-    },
+    session: schedulerSession(run, "thread-prepared"),
     wakeup: store.getPendingWakeup(task.id),
     now
   }), "claimed");
@@ -434,17 +494,12 @@ test("an unrelated Hook cannot prove that a prepared Leader Run was delivered", 
 
 test("a matching Hook proves delivery across the receipt persistence crash window", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
-  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
+  const run = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
     run,
-    session: {
-      agentId: "codex",
-      adapterId: "codex",
-      nativeSessionId: "thread-crash-window",
-      status: "ready"
-    },
+    session: schedulerSession(run, "thread-crash-window"),
     wakeup: store.getPendingWakeup(task.id),
     now
   }), "claimed");
@@ -475,7 +530,7 @@ test("a matching Hook proves delivery across the receipt persistence crash windo
 
 test("a Hook replay is idempotent after state commit succeeds and inbox ack crashes", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
-  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
+  const run = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -488,12 +543,7 @@ test("a Hook replay is idempotent after state commit succeeds and inbox ack cras
     task,
     role: adapter.getRole(task.id, role.name),
     run,
-    session: {
-      agentId: "codex",
-      adapterId: "codex",
-      nativeSessionId: "thread-ack-crash",
-      status: "ready"
-    },
+    session: schedulerSession(run, "thread-ack-crash"),
     now
   });
   const inbox = new FileRuntimeEventInbox(home, () => now);
@@ -548,7 +598,7 @@ test("a Hook replay is idempotent after state commit succeeds and inbox ack cras
 
 test("an obsolete Hook cannot claim the native session of the current Run", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
-  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
+  const run = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -703,17 +753,12 @@ for (const terminalStatus of ["stopped", "broken"]) {
 
 test("a Hook classified for Run A cannot close Run B after an intervening dispatch", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
-  const first = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "A", now);
+  const first = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "A", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
     run: first,
-    session: {
-      agentId: "codex",
-      adapterId: "codex",
-      nativeSessionId: "thread-race",
-      status: "ready"
-    },
+    session: schedulerSession(first, "thread-race"),
     wakeup: store.getPendingWakeup(task.id),
     now
   }), "claimed");
@@ -740,7 +785,7 @@ test("a Hook classified for Run A cannot close Run B after an intervening dispat
     ...event,
     expectedRunId: first.id
   }, now);
-  const second = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "resume", "B", now);
+  const second = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "resume", "B", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -768,17 +813,12 @@ test("a Hook classified for Run A cannot close Run B after an intervening dispat
 
 test("a Hook for an older Run is acknowledged without closing the fresh Run", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
-  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
+  const run = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
     run,
-    session: {
-      agentId: "codex",
-      adapterId: "codex",
-      nativeSessionId: "thread-fresh-send",
-      status: "ready"
-    },
+    session: schedulerSession(run, "thread-fresh-send"),
     wakeup: store.getPendingWakeup(task.id),
     now
   }), "claimed");
@@ -803,12 +843,7 @@ test("a Hook for an older Run is acknowledged without closing the fresh Run", (t
     task,
     role: adapter.getRole(task.id, role.name),
     run,
-    session: {
-      agentId: "codex",
-      adapterId: "codex",
-      nativeSessionId: "thread-fresh-send",
-      status: "ready"
-    },
+    session: schedulerSession(run, "thread-fresh-send"),
     now
   });
   assert.equal(processor.drain(now).acknowledgedEventIds.length, 0);
@@ -817,7 +852,7 @@ test("a Hook for an older Run is acknowledged without closing the fresh Run", (t
 
 test("a second Hook waits behind the first grace closure instead of poisoning reconciliation", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
-  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
+  const run = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -830,12 +865,7 @@ test("a second Hook waits behind the first grace closure instead of poisoning re
     task,
     role: adapter.getRole(task.id, role.name),
     run,
-    session: {
-      agentId: "codex",
-      adapterId: "codex",
-      nativeSessionId: "thread-two-hooks",
-      status: "ready"
-    },
+    session: schedulerSession(run, "thread-two-hooks"),
     now
   });
   const inbox = new FileRuntimeEventInbox(home, () => now);
@@ -877,7 +907,7 @@ test("a quiescent result-driven Leader Turn is recovered instead of inferring Ta
       [{ type: "task", id: task.id }]
     );
   });
-  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "synthesize", now);
+  const run = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "synthesize", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -890,12 +920,7 @@ test("a quiescent result-driven Leader Turn is recovered instead of inferring Ta
     task,
     role: adapter.getRole(task.id, role.name),
     run,
-    session: {
-      agentId: "codex",
-      adapterId: "codex",
-      nativeSessionId: "thread-result",
-      status: "ready"
-    },
+    session: schedulerSession(run, "thread-result"),
     now
   });
   adapter.observeRuntimeTurnCompleted({
@@ -931,7 +956,7 @@ test("a repeated unclosed Leader recovery escalates and notifies Operator once",
       [{ type: "task", id: task.id }]
     );
   });
-  const run = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "recover", now);
+  const run = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "recover", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -944,12 +969,7 @@ test("a repeated unclosed Leader recovery escalates and notifies Operator once",
     task,
     role: adapter.getRole(task.id, role.name),
     run,
-    session: {
-      agentId: "codex",
-      adapterId: "codex",
-      nativeSessionId: "thread-recovery",
-      status: "ready"
-    },
+    session: schedulerSession(run, "thread-recovery"),
     now
   });
   adapter.observeRuntimeTurnCompleted({
@@ -997,7 +1017,7 @@ test("a repeated unclosed Leader recovery escalates and notifies Operator once",
 
 test("a partial low-level Run mutation remains fenced until its matching Hook repairs it", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
-  const first = createAgentRun(adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "first", now);
+  const first = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "first", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
     role: adapter.getRole(task.id, role.name),
@@ -1010,12 +1030,7 @@ test("a partial low-level Run mutation remains fenced until its matching Hook re
     task,
     role: adapter.getRole(task.id, role.name),
     run: first,
-    session: {
-      agentId: "codex",
-      adapterId: "codex",
-      nativeSessionId: "thread-first",
-      status: "ready"
-    },
+    session: schedulerSession(first, "thread-first"),
     now
   });
   store.transaction((tx) => {
@@ -1023,7 +1038,7 @@ test("a partial low-level Run mutation remains fenced until its matching Hook re
     tx.clearActiveAgentRun(task.id, role.name);
   });
 
-  const second = createAgentRun("agent-run-121", task.id, role.name, "resume", "second", now);
+  const second = createAgentRun(adapter, "agent-run-121", task.id, role.name, "resume", "second", now);
   assert.throws(
     () => store.saveActiveAgentRun(second),
     /still has an in-flight Turn/u
@@ -1073,7 +1088,16 @@ test("Worker delivery claims and binds its mailbox before external work, then fa
     "/repo",
     now
   );
-  const run = createAgentRun("agent-run-122", task.id, worker.name, "new", "work", now);
+  const run = createAgentRun(
+    adapter,
+    "agent-run-122",
+    task.id,
+    worker.name,
+    "new",
+    "work",
+    now,
+    { effective: resolveEffectiveLaunch({ role: worker, purpose: "execution" }) }
+  );
   const target = { kind: "role", taskId: task.id, roleName: worker.name };
   store.transaction((tx) => {
     tx.saveRole(task.id, worker);
@@ -1125,7 +1149,16 @@ test("Worker busy retry persists and reuses the hosted native session before del
     "/repo",
     now
   );
-  const run = createAgentRun("agent-run-122", task.id, worker.name, "new", "work", now);
+  const run = createAgentRun(
+    adapter,
+    "agent-run-122",
+    task.id,
+    worker.name,
+    "new",
+    "work",
+    now,
+    { effective: resolveEffectiveLaunch({ role: worker, purpose: "execution" }) }
+  );
   const target = { kind: "role", taskId: task.id, roleName: worker.name };
   store.transaction((tx) => {
     tx.saveRole(task.id, worker);
@@ -1143,12 +1176,7 @@ test("Worker busy retry persists and reuses the hosted native session before del
       const persisted = store.getRoleSession(task.id, worker.name)?.nativeSessionId;
       return {
         prepared,
-        session: {
-          agentId: worker.activeAgentId,
-          adapterId: "codex",
-          nativeSessionId: persisted ?? "hosted-native-b",
-          status: "ready"
-        }
+        session: schedulerSession(run, persisted ?? "hosted-native-b")
       };
     },
     async sendOnce() { sends += 1; return sends === 1 ? "busy" : "sent"; },
@@ -1183,7 +1211,7 @@ test("runtime native session registration is structured and exited work fails at
     { title: "Implement" },
     now
   ), "running", now);
-  const run = createAgentRun(
+  const run = createAgentRun(adapter,
     "agent-run-1",
     task.id,
     role.name,
@@ -1230,7 +1258,7 @@ test("runtime native session registration is structured and exited work fails at
   );
   assert.ok(store.getPendingWakeup(task.id).reasons.includes("leader-run-failed"));
 
-  const replacement = createAgentRun(
+  const replacement = createAgentRun(adapter,
     "agent-run-102",
     task.id,
     role.name,
@@ -1269,7 +1297,7 @@ test("runtime native session registration is structured and exited work fails at
 
 test("reconfirming an already delivered active run does not rewrite authoritative state", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
-  const run = createAgentRun(
+  const run = createAgentRun(adapter,
     "agent-run-1",
     task.id,
     role.name,
@@ -1409,7 +1437,8 @@ test("settling a stopped launch handles the exact reservation and Hook-won race 
     launchId: "launch-hook-won",
     agentId: role.activeAgentId,
     adapterId: "codex",
-    nativeSessionId: "thread-1"
+    nativeSessionId: "thread-1",
+    effective: store.getRoleSession(task.id, role.name).effective
   }, () => {}, new Date(now.getTime() + 3));
   assert.equal(
     store.getWorkMailbox({
@@ -1426,6 +1455,61 @@ test("settling a stopped launch handles the exact reservation and Hook-won race 
     nativeSessionId: "thread-1"
   }, new Date(now.getTime() + 4)), true);
   assert.equal(store.getRoleSession(task.id, role.name).status, "stopped");
+});
+
+test("an exact fresh-launch reservation replaces and archives a stopped incompatible Session", (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  const owner = { scope: "task", taskId: task.id, roleName: role.name };
+  adapter.recordRuntimeNativeSession({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-old"
+  }, now);
+  const previous = structuredClone(store.getRoleSession(task.id, role.name));
+  store.saveTaskRoleSessionSet(updateRoleAgentSessionStatus(
+    store.getTaskRoleSessionSet(task.id, role.name),
+    role.activeAgentId,
+    "stopped",
+    new Date(now.getTime() + 1)
+  ));
+  const desired = updateRole(role, {
+    agentBindings: {
+      codex: createRoleAgentBinding(
+        { id: "codex", adapterId: "codex" },
+        { adapterId: "codex", model: "gpt-next", effort: "high" }
+      )
+    }
+  }, new Date(now.getTime() + 2));
+  store.saveRole(task.id, desired);
+  const effective = resolveEffectiveLaunch({ role: desired, purpose: "execution" });
+  adapter.reserveRuntimeLaunch(
+    { owner, launchId: "launch-fresh-effective" },
+    () => {},
+    new Date(now.getTime() + 3)
+  );
+
+  adapter.recordReservedRuntimeNativeSession({
+    owner,
+    launchId: "launch-fresh-effective",
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-new",
+    effective
+  }, () => {}, new Date(now.getTime() + 4));
+
+  const sessions = store.getTaskRoleSessionSet(task.id, role.name);
+  assert.equal(sessions.sessions.codex.nativeSessionId, "thread-new");
+  assert.deepEqual(sessions.sessions.codex.effective, effective);
+  assert.deepEqual(sessions.history, [
+    { ...previous, status: "stopped", updatedAt: new Date(now.getTime() + 1).toISOString() }
+  ]);
+  assert.equal(store.getWorkMailbox({
+    kind: "role-runtime",
+    taskId: task.id,
+    roleName: role.name
+  }), null);
 });
 
 test("stopped-launch and dormant-session CAS fences preserve newer lifecycle facts", (t) => {
@@ -1460,7 +1544,7 @@ test("stopped-launch and dormant-session CAS fences preserve newer lifecycle fac
   assert.equal(store.getRoleSession(task.id, role.name).status, "running");
   assert.equal(adapter.completeRuntimeLaunchReservation(owner, "launch-newer"), true);
 
-  const run = createAgentRun(
+  const run = createAgentRun(adapter,
     "agent-run-123",
     task.id,
     role.name,

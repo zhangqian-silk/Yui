@@ -9,14 +9,16 @@ import {
 } from "../../dist/role/role.js";
 import {
   createRoleSessionSet,
-  recordRoleAgentSession,
   retireTaskRoleSessionsForWorkspace,
   updateRoleAgentSessionStatus
 } from "../../dist/executor/agentExecutor.js";
 import {
-  createAgentRun,
   yieldAgentRun
 } from "../../dist/run/agentRun.js";
+import {
+  createAgentRun,
+  recordRoleAgentSession
+} from "../helpers/effectiveLaunch.js";
 import { activateTask, archiveTask, createTask } from "../../dist/task/task.js";
 import {
   createWorkItem,
@@ -46,8 +48,11 @@ test("GlobalRole copies into an isolated TaskRole with independent Agent binding
   );
   const taskRole = copyGlobalRoleToTaskRole(globalRole, "task-1", later);
 
-  assert.equal(globalRole.schemaVersion, 2);
-  assert.equal(taskRole.schemaVersion, 2);
+  assert.equal(globalRole.schemaVersion, 3);
+  assert.equal(taskRole.schemaVersion, 3);
+  assert.equal(globalRole.launchRevision, 1);
+  assert.equal(taskRole.launchRevision, 1);
+  assert.equal(taskRole.defaultAccess, "write");
   assert.equal(taskRole.taskId, "task-1");
   assert.equal(taskRole.status, "idle");
   assert.notEqual(taskRole.agentBindings, globalRole.agentBindings);
@@ -99,7 +104,7 @@ test("Agent switching preserves dormant sessions and resumes the target native s
   assert.equal(switched.sessions.sessions.claude.nativeSessionId, "claude-session");
 });
 
-test("Agent switching rejects active runs and mismatched GlobalRole/TaskRole session owners", () => {
+test("Agent switching during a Run updates only desired identity and still rejects mismatched owners", () => {
   const role = createRole(
     "task-1",
     "leader",
@@ -113,16 +118,16 @@ test("Agent switching rejects active runs and mismatched GlobalRole/TaskRole ses
     "codex",
     now
   );
-  assert.throws(
-    () => switchActiveRoleAgent(
-      role,
-      taskSessions,
-      "claude",
-      { activeRun: true, nativeProcessRunning: false },
-      later
-    ),
-    /active AgentRun/i
+  const desired = switchActiveRoleAgent(
+    role,
+    taskSessions,
+    "claude",
+    { activeRun: true, nativeProcessRunning: false },
+    later
   );
+  assert.equal(desired.role.activeAgentId, "claude");
+  assert.equal(desired.role.launchRevision, role.launchRevision + 1);
+  assert.equal(desired.sessions.activeAgentId, "codex");
 
   const globalSessions = createRoleSessionSet(
     { scope: "global", roleName: "leader" },
@@ -168,10 +173,77 @@ test("workspace migration retires only after every bound native session is stopp
   );
 
   const stopped = updateRoleAgentSessionStatus(sessions, "claude", "stopped", later);
+  const retired = retireTaskRoleSessionsForWorkspace(stopped, later);
+  assert.deepEqual(retired.sessions, {});
   assert.deepEqual(
-    retireTaskRoleSessionsForWorkspace(stopped, later).sessions,
-    {}
+    retired.history.map(({ agentId, nativeSessionId }) => ({ agentId, nativeSessionId })),
+    [
+      { agentId: "codex", nativeSessionId: "codex-stopped" },
+      { agentId: "claude", nativeSessionId: "claude-dormant-ready" }
+    ]
   );
+});
+
+test("a fresh Task native Session archives the immutable stopped snapshot", () => {
+  let sessions = createRoleSessionSet(
+    { scope: "task", taskId: "task-1", roleName: "worker" },
+    "codex",
+    now
+  );
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "codex-old",
+    policy: "fixed",
+    status: "stopped"
+  }, now);
+  const previous = structuredClone(sessions.sessions.codex);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "codex-new",
+    policy: "fixed",
+    status: "ready",
+    effective: {
+      ...previous.effective,
+      sourceDesiredRevision: previous.effective.sourceDesiredRevision + 1,
+      model: "gpt-next"
+    }
+  }, later);
+
+  assert.equal(sessions.sessions.codex.nativeSessionId, "codex-new");
+  assert.deepEqual(sessions.history, [previous]);
+});
+
+test("a fresh global native Session archives the immutable stopped snapshot", () => {
+  let sessions = createRoleSessionSet(
+    { scope: "global", roleName: "worker" },
+    "codex",
+    now
+  );
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "codex-global-old",
+    policy: "fixed",
+    status: "stopped"
+  }, now);
+  const previous = structuredClone(sessions.sessions.codex);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "codex-global-new",
+    policy: "fixed",
+    status: "ready",
+    effective: {
+      ...previous.effective,
+      sourceDesiredRevision: previous.effective.sourceDesiredRevision + 1,
+      model: "gpt-next"
+    }
+  }, later);
+
+  assert.equal(sessions.sessions.codex.nativeSessionId, "codex-global-new");
+  assert.deepEqual(Object.values(sessions.history), [previous]);
 });
 
 test("restored persistent domain records are plain JSON with explicit schema versions", () => {
@@ -197,7 +269,8 @@ test("restored persistent domain records are plain JSON with explicit schema ver
   assert.equal(snapshot.task.schemaVersion, 2);
   assert.equal(snapshot.task.status, "draft");
   assert.equal(snapshot.workItem.schemaVersion, 6);
-  assert.equal(snapshot.yielded.schemaVersion, 3);
+  assert.equal(snapshot.yielded.schemaVersion, 4);
+  assert.equal(snapshot.yielded.effective.schemaVersion, 1);
   assert.equal(snapshot.yielded.purpose, "execution");
   assert.equal(snapshot.yielded.status, "yielded");
   assert.equal(snapshot.yielded.endedAt, later.toISOString());

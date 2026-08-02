@@ -125,7 +125,7 @@ type ActiveRunPointer = Readonly<{ schemaVersion: 1; runId: string }>;
 type TaskIdHighWaterMarks = Record<TaskRecordKind, number>;
 
 type StoredTask = {
-  schemaVersion: 10;
+  schemaVersion: 11;
   task: Task;
   idHighWaterMarks: TaskIdHighWaterMarks;
   brief: TaskBrief | null;
@@ -148,7 +148,7 @@ type StoredTask = {
 };
 
 type StorageState = {
-  schemaVersion: 11;
+  schemaVersion: 12;
   revision: number;
   config: YuiConfig;
   configuredAgents: Record<string, ConfiguredAgent>;
@@ -447,14 +447,14 @@ export class FileTaskStore implements TaskStore {
   }
 
   saveGlobalRole(role: GlobalRole): void {
-    const stored = identified<GlobalRole>(role, 2, "name", role.name, "Global Role");
+    const stored = identified<GlobalRole>(role, 3, "name", role.name, "Global Role");
     validateGlobalRole(stored);
     const sessions = this.getGlobalRoleSessionSet(stored.name);
     if (sessions !== null) assertSessionsMatchRole(sessions, stored);
     this.#mutate((state) => { state.globalRoles[stored.name] = stored; });
   }
   saveGlobalRoleWithSessionSet(role: GlobalRole, sessions: GlobalRoleSessionSet | null): void {
-    const storedRole = identified<GlobalRole>(role, 2, "name", role.name, "Global Role");
+    const storedRole = identified<GlobalRole>(role, 3, "name", role.name, "Global Role");
     validateGlobalRole(storedRole);
     const storedSessions = sessions === null ? null : globalSessions(sessions);
     if (storedSessions !== null) assertSessionsMatchRole(storedSessions, storedRole);
@@ -617,7 +617,7 @@ export class FileTaskStore implements TaskStore {
 
   saveRole(taskId: string, role: TaskRole): void {
     const aggregate = this.#requireTaskForWrite(taskId);
-    const stored = identified<TaskRole>(role, 2, "name", role.name, "Task Role");
+    const stored = identified<TaskRole>(role, 3, "name", role.name, "Task Role");
     if (stored.taskId !== taskId) throw new StorageRecordError(`Task Role belongs to another Task: ${stored.taskId}`);
     validateTaskRole(stored);
     const sessions = this.getRoleSessionSet(taskId, stored.name);
@@ -627,7 +627,7 @@ export class FileTaskStore implements TaskStore {
   listRoles(taskId: string): TaskRole[] { return values(this.#requireTask(taskId).roles, "name"); }
   getRole(taskId: string, name: string): TaskRole | null { return optional(this.#state().tasks[taskId]?.roles[name]); }
   saveTaskRoleWithSessionSet(role: TaskRole, sessions: TaskRoleSessionSet): void {
-    const storedRole = identified<TaskRole>(role, 2, "name", role.name, "Task Role");
+    const storedRole = identified<TaskRole>(role, 3, "name", role.name, "Task Role");
     validateTaskRole(storedRole);
     const storedSessions = taskSessions(sessions);
     assertSessionsMatchRole(storedSessions, storedRole);
@@ -753,7 +753,7 @@ export class FileTaskStore implements TaskStore {
   getAgentRun(taskId: string, id: string): AgentRun | null { return optional(this.#state().tasks[taskId]?.agentRuns[id]); }
   listAgentRuns(taskId: string): AgentRun[] { return values(this.#requireTask(taskId).agentRuns, "id"); }
   saveAgentRun(run: AgentRun): void {
-    const stored = identified<AgentRun>(run, 3, "id", run.id, "Agent run");
+    const stored = identified<AgentRun>(run, 4, "id", run.id, "Agent run");
     validateAgentRun(stored);
     const aggregate = this.#requireTaskForWrite(stored.taskId);
     if (stored.reviewRoundId !== undefined) {
@@ -1154,7 +1154,7 @@ export function ensureYuiHome(rootDir: string): void { mkdirSync(rootDir, { recu
 
 function emptyState(): StorageState {
   return {
-    schemaVersion: 11,
+    schemaVersion: 12,
     revision: 0,
     config: { schemaVersion: 1 },
     configuredAgents: {},
@@ -1168,7 +1168,7 @@ function emptyState(): StorageState {
 }
 function emptyStoredTask(task: Task): StoredTask {
   return {
-    schemaVersion: 10,
+    schemaVersion: 11,
     task,
     idHighWaterMarks: emptyTaskIdHighWaterMarks(),
     brief: null,
@@ -1247,7 +1247,7 @@ function parseState(raw: string): StorageState {
     "tasks",
     "mailboxes"
   ], "Storage state");
-  if (state.schemaVersion !== 11 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
+  if (state.schemaVersion !== 12 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
   const result = clone(state) as unknown as StorageState;
   result.config = versioned(result.config, 1, "Yui config");
   validateYuiConfig(result.config);
@@ -1272,7 +1272,7 @@ function parseState(raw: string): StorageState {
     return profile;
   }, "agentProfiles");
   parseMap(result.globalRoles, (value, key) => {
-    const role = identified<GlobalRole>(value, 2, "name", key, "Global Role");
+    const role = identified<GlobalRole>(value, 3, "name", key, "Global Role");
     validateGlobalRole(role);
     return role;
   }, "globalRoles");
@@ -1379,11 +1379,11 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateIntegrationAttempt(attempt);
     return attempt;
   }, "integrationAttempts");
-  versioned(aggregate, 10, `Task aggregate ${taskId}`);
+  versioned(aggregate, 11, `Task aggregate ${taskId}`);
   validateTaskIdHighWaterMarks(aggregate.idHighWaterMarks, taskId);
   validateTask(identified(aggregate.task, 2, "id", taskId, "Task"));
   if (aggregate.brief !== null) storedTaskBrief(aggregate.brief);
-  parseMap(aggregate.roles, (record, key) => { const role = identified<TaskRole>(record, 2, "name", key, "Task Role"); if (role.taskId !== taskId) throw new StorageRecordError(`Task Role belongs to another Task: ${role.taskId}`); validateTaskRole(role); return role; }, "roles");
+  parseMap(aggregate.roles, (record, key) => { const role = identified<TaskRole>(record, 3, "name", key, "Task Role"); if (role.taskId !== taskId) throw new StorageRecordError(`Task Role belongs to another Task: ${role.taskId}`); validateTaskRole(role); return role; }, "roles");
   parseMap(aggregate.roleWorkspaces, (record, key) => {
     const workspace = identified<RoleWorkspace>(record, 3, "roleName", key, "Managed workspace");
     if (workspace.taskId !== taskId) {
@@ -1401,7 +1401,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateWorkItem(item);
     return item;
   }, "workItems");
-  parseMap(aggregate.agentRuns, (record, key) => { const run = identified<AgentRun>(record, 3, "id", key, "Agent run"); if (run.taskId !== taskId) throw new StorageRecordError(`Agent run belongs to another Task: ${run.taskId}`); validateAgentRun(run); return run; }, "agentRuns");
+  parseMap(aggregate.agentRuns, (record, key) => { const run = identified<AgentRun>(record, 4, "id", key, "Agent run"); if (run.taskId !== taskId) throw new StorageRecordError(`Agent run belongs to another Task: ${run.taskId}`); validateAgentRun(run); return run; }, "agentRuns");
   parseMap(aggregate.reviewRounds, (record, key) => {
     const round = identified<ReviewRound>(record, 2, "id", key, "ReviewRound");
     if (round.taskId !== taskId) {
@@ -1543,14 +1543,14 @@ function taskSessions(value: unknown): TaskRoleSessionSet {
   return set;
 }
 function validateSessions(sessions: Record<string, RoleAgentSession>): void {
-  parseMap(sessions, (record, key) => identified(record, 2, "agentId", key, "Role Agent session"), "sessions");
+  parseMap(sessions, (record, key) => identified(record, 3, "agentId", key, "Role Agent session"), "sessions");
 }
 function assertSessionsMatchRole(
   sessions: GlobalRoleSessionSet | TaskRoleSessionSet,
   role: GlobalRole | TaskRole
 ): void {
   validateRoleSessionSet(sessions);
-  if (sessions.owner.roleName !== role.name || sessions.activeAgentId !== role.activeAgentId) {
+  if (sessions.owner.roleName !== role.name) {
     throw new StorageRecordError(`Role session set does not match Role: ${role.name}`);
   }
   if ("taskId" in role && (sessions.owner.scope !== "task" || sessions.owner.taskId !== role.taskId)) {
@@ -1563,7 +1563,9 @@ function assertSessionsMatchRole(
     ...Object.entries(sessions.sessions),
     ...(sessions.owner.scope === "global"
       ? Object.entries((sessions as GlobalRoleSessionSet).history ?? {})
-      : [])
+      : ((sessions as TaskRoleSessionSet).history ?? []).map((session, index) => (
+          [String(index), session] as const
+        )))
   ];
   for (const [, session] of ownedSessions) {
     const agentId = session.agentId;

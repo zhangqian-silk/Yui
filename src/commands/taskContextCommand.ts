@@ -24,6 +24,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     if (task === null) throw taskNotFound(taskId);
     const workItems = reader.listWorkItems(task.id);
     const inputRequests = reader.listInputRequests(task.id);
+    const roles = reader.listRoles(task.id);
     return {
       task,
       reviewConfig: reader.getReviewConfig(),
@@ -31,7 +32,11 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       activeDecisions: reader.listDecisions(task.id)
         .filter((decision) => decision.status === "active"),
       milestones: reader.listMilestones(task.id),
-      roles: reader.listRoles(task.id),
+      roles,
+      roleSessions: Object.fromEntries(roles.map((role) => [
+        role.name,
+        reader.getTaskRoleSessionSet(task.id, role.name)
+      ])),
       workItems,
       agentRuns: chronological(reader.listAgentRuns(task.id)),
       reviewRounds: chronological(reader.listReviewRounds(task.id)),
@@ -50,6 +55,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     activeDecisions,
     milestones,
     roles,
+    roleSessions,
     workItems,
     agentRuns,
     reviewRounds,
@@ -133,12 +139,27 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       ? ["  None."]
       : roles.flatMap((role) => {
           const binding = role.agentBindings[role.activeAgentId];
+          const activeRun = agentRuns.find((run) => (
+            run.roleName === role.name && run.status === "active"
+          ));
+          const sessions = roleSessions[role.name];
+          const activeSession = sessions?.sessions[sessions.activeAgentId];
+          const effective = activeRun?.effective ?? activeSession?.effective;
+          const effectiveSource = activeRun === undefined ? "Session" : "Run";
           const creation = [...events].reverse().find((event) => (
             event.type === "role.added" && event.payload.role === role.name
           ));
           return [
             `  ${role.name} [${role.status}]: ${role.activeAgentId}/${binding.adapterId}`,
-            `    Model: ${binding.config.model ?? "default"}; effort: ${binding.config.effort ?? "default"}; YOLO: ${binding.config.yolo === true ? "enabled" : "disabled"}`,
+            `    Desired: r${role.launchRevision}; access ceiling: ${role.defaultAccess}; Model: ${binding.config.model ?? "default"}; effort: ${binding.config.effort ?? "default"}; YOLO: ${binding.config.yolo === true ? "enabled" : "disabled"}`,
+            `    Effective: ${effective === undefined
+              ? "not started"
+              : `${effectiveSource} ${effective.agentId}/${effective.adapterId}; r${effective.sourceDesiredRevision}; access: ${effective.access}; provenance: ${effective.provenance}`}`,
+            `    Desired drift: ${effective === undefined
+              ? "-"
+              : effective.sourceDesiredRevision === role.launchRevision
+                ? "none"
+                : "pending next launch"}`,
             ...(creation?.payload.runtimeSource === undefined
               ? []
               : [`    Runtime source at creation: ${creation.payload.runtimeSource}`])
@@ -172,7 +193,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
             ...(latestRun === undefined
               ? ["    AgentRuns: none."]
               : [
-                  `    AgentRuns: ${itemRuns.length}; latest ${latestRun.id} [${latestRun.status}] ${latestRun.agentId ?? "unknown"}/${latestRun.adapterId ?? "unknown"}`,
+                  `    AgentRuns: ${itemRuns.length}; latest ${latestRun.id} [${latestRun.status}] ${latestRun.effective.agentId}/${latestRun.effective.adapterId} · effective r${latestRun.effective.sourceDesiredRevision}/${latestRun.effective.access}`,
                   `      Input: ${compactText(latestRun.input)}`,
                   ...(latestRun.summary === undefined
                     ? []
@@ -188,8 +209,8 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       "AgentRuns",
       agentRuns,
       (run) => [
-        `  ${run.id} [${run.status}/${run.purpose}] ${run.roleName} via ${run.agentId ?? "unknown"}/${run.adapterId ?? "unknown"}`,
-        `    Model: ${run.model ?? "default"}; effort: ${run.effort ?? "default"}`,
+        `  ${run.id} [${run.status}/${run.purpose}] ${run.roleName} via ${run.effective.agentId}/${run.effective.adapterId}`,
+        `    Effective: r${run.effective.sourceDesiredRevision}; access: ${run.effective.access}; model: ${run.effective.model ?? "default"}; effort: ${run.effective.effort ?? "default"}`,
         ...(run.summary === undefined ? [] : [`    Result: ${compactText(run.summary)}`])
       ]
     ),

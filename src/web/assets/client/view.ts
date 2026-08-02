@@ -448,8 +448,16 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     const metadata = node("div", "run-meta");
     metadata.append(node("span", "", t("mode." + run.mode)));
     metadata.append(node("span", "", t(run.deliveredAt ? "delivery.delivered" : "delivery.pending")));
-    const badge = run.agentId ? agentBadge(run) : null;
+    const badge = run.effective ? agentBadge(run.effective) : null;
     if (badge) metadata.append(badge);
+    if (run.effective) {
+      metadata.append(node("span", "", t("detail.effective") + " · r"
+        + run.effective.sourceDesiredRevision));
+      metadata.append(node("span", "", t("detail.access") + " · "
+        + run.effective.access));
+      metadata.append(node("span", "", t("detail.provenance") + " · "
+        + run.effective.provenance));
+    }
     metadata.append(node("time", "", formatDateTime(run.updatedAt, locale)));
     card.append(metadata);
 
@@ -525,8 +533,12 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
         })
       : null;
     const agentMeta = node("div", "run-meta");
-    agentMeta.append(node("span", "", t("detail.agent") + " · " + role.activeAgentId));
+    agentMeta.append(node("span", "", t("detail.desiredAgent") + " · " + role.activeAgentId));
     if (activeBadge) agentMeta.append(activeBadge);
+    agentMeta.append(node("span", "", t("detail.desired") + " · r"
+      + role.launchRevision));
+    agentMeta.append(node("span", "", t("detail.accessCeiling") + " · "
+      + role.defaultAccess));
     roleActions.append(agentMeta);
     const open = node("button", "input-answer", t("actions.openRole"));
     open.type = "button";
@@ -539,6 +551,23 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     });
     roleActions.append(open);
     card.append(roleActions);
+    if (role.effectiveLaunch) {
+      const effectiveMeta = node("div", "run-meta");
+      effectiveMeta.append(node("span", "", t("detail.effectiveAgent") + " · "
+        + role.effectiveLaunch.agentId));
+      const effectiveBadge = agentBadge(role.effectiveLaunch);
+      if (effectiveBadge) effectiveMeta.append(effectiveBadge);
+      effectiveMeta.append(node("span", "", t("detail.effective") + " · r"
+        + role.effectiveLaunch.sourceDesiredRevision));
+      effectiveMeta.append(node("span", "", t("detail.access") + " · "
+        + role.effectiveLaunch.access));
+      effectiveMeta.append(node("span", "", t("detail.provenance") + " · "
+        + role.effectiveLaunch.provenance));
+      effectiveMeta.append(node("span", "", role.launchDrift
+        ? t("launch.drift")
+        : t("launch.current")));
+      card.append(effectiveMeta);
+    }
     if (role.description) card.append(node("p", "record-copy", role.description));
     const bindingIds = role.agentBindings ? Object.keys(role.agentBindings) : [];
     if (bindingIds.length > 1) {

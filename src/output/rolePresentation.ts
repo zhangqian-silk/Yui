@@ -1,4 +1,7 @@
-import type { RoleSessionSet } from "../executor/agentExecutor.js";
+import {
+  activeRoleAgentSession,
+  type RoleSessionSet
+} from "../executor/agentExecutor.js";
 import type { GlobalRole, Role, RoleAgentBinding } from "../role/role.js";
 import { defaultTableWidth, renderTable } from "./table.js";
 
@@ -24,6 +27,7 @@ export function renderRoleDetails(
 ): string {
   const bindings = Object.values(role.agentBindings)
     .sort((left, right) => left.agentId.localeCompare(right.agentId));
+  const effective = activeRoleAgentSession(input.sessions ?? null)?.effective;
   const profile = [
     `  Description      ${present(role.description)}`,
     `  Responsibilities ${presentList(role.responsibilities)}`,
@@ -36,7 +40,16 @@ export function renderRoleDetails(
     `  Kind             ${input.kind}`,
     `  Active Agent     ${role.activeAgentId}`,
     ...("status" in role ? [`  Status           ${role.status}`] : []),
-    `  Workspace        ${role.workspace}`
+    `  Workspace        ${role.workspace}`,
+    `  Desired launch   r${role.launchRevision}; access ceiling=${role.defaultAccess}`,
+    `  Effective launch ${effective === undefined
+      ? "not started"
+      : `${effective.agentId}/${effective.adapterId}; r${effective.sourceDesiredRevision}; access=${effective.access}; provenance=${effective.provenance}`}`,
+    `  Desired drift    ${effective === undefined
+      ? "-"
+      : effective.sourceDesiredRevision === role.launchRevision
+        ? "none"
+        : "pending next launch"}`
   ];
   return [
     title,

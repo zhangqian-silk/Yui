@@ -23,6 +23,7 @@ import {
   type RuntimeLaunchPreparationPort,
   type SessionHostPort
 } from "../runtime/index.js";
+import type { EffectiveLaunchSnapshot } from "./effectiveLaunch.js";
 
 export type PlannedRoleSession = Readonly<{
   role: TmuxRole;
@@ -36,6 +37,7 @@ export interface RoleLaunchPlanner {
     roleName: string;
     agentId: string;
     adapterId: string;
+    effective?: EffectiveLaunchSnapshot;
     mode: RoleSessionLaunchMode;
     nativeSessionId?: string;
   }>): PlannedRoleSession;
@@ -121,6 +123,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     roleName: string;
     agentId: string;
     adapterId: string;
+    effective: EffectiveLaunchSnapshot;
     workspace: string;
     mode: RoleSessionLaunchMode;
     runId?: string;
@@ -157,6 +160,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
         owner: { scope: "task", taskId: input.taskId, roleName: input.roleName },
         agentId: input.agentId,
         adapterId: input.adapterId,
+        effective: input.effective,
         workspace: input.workspace,
         ...(input.runId === undefined ? {} : { runId: input.runId })
       } as const;
@@ -195,7 +199,8 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
             agentId: binding.agentId,
             adapterId: binding.adapterId,
             nativeSessionId: binding.nativeSessionId,
-            status: "ready"
+            status: "ready",
+            effective: input.effective
           };
     }
     const delivery: PreparedRoleDelivery = {
@@ -582,9 +587,10 @@ function nextDimState(current: boolean, sgr: string): boolean {
 function preparedDeliveryId(input: Readonly<{
   taskId: string;
   roleName: string;
-  agentId: string;
-  adapterId: string;
-  mode: RoleSessionLaunchMode;
+    agentId: string;
+    adapterId: string;
+    effective: EffectiveLaunchSnapshot;
+    mode: RoleSessionLaunchMode;
   runId?: string;
   nativeSessionId?: string;
 }>): string {
@@ -593,6 +599,7 @@ function preparedDeliveryId(input: Readonly<{
     input.roleName,
     input.agentId,
     input.adapterId,
+    input.effective,
     input.mode,
     input.runId ?? null,
     input.nativeSessionId ?? null

@@ -20,7 +20,8 @@ import {
   createRoleAgentBinding,
   updateRoleStatus
 } from "../../dist/role/role.js";
-import { createAgentRun, failAgentRun } from "../../dist/run/agentRun.js";
+import { failAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun, recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 import {
   markYuiRunInput,
   retagYuiRunInput,
@@ -31,8 +32,7 @@ import { createProject } from "../../dist/repository/project.js";
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
-  markTaskRoleRunDelivered,
-  recordRoleAgentSession
+  markTaskRoleRunDelivered
 } from "../../dist/executor/agentExecutor.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
@@ -128,17 +128,22 @@ function markDelivered(store, run) {
 }
 
 function recordReadyNativeSession(store, taskId, roleName, nativeSessionId) {
+  const effective = store.listAgentRuns(taskId)
+    .filter((run) => run.roleName === roleName)
+    .at(-1)?.effective;
+  assert.ok(effective, `missing historical effective launch for ${taskId}/${roleName}`);
   let sessions = createRoleSessionSet({
     scope: "task",
     taskId,
     roleName
-  }, "codex", NOW);
+  }, effective.agentId, NOW);
   sessions = recordRoleAgentSession(sessions, {
-    agentId: "codex",
-    adapterId: "codex",
+    agentId: effective.agentId,
+    adapterId: effective.adapterId,
     nativeSessionId,
     policy: "fixed",
-    status: "ready"
+    status: "ready",
+    effective
   }, NOW);
   store.saveTaskRoleSessionSet(sessions);
 }
@@ -611,8 +616,8 @@ test("assigned Work dispatch honors dependencies and Worker yield awaits Leader 
   assert.equal(store.getWorkItem(second.taskId, second.id)?.status, "pending");
   const active = store.getActiveAgentRun(task.id, "worker");
   assert.equal(active?.workItemId, first.id);
-  assert.equal(active?.agentId, "codex");
-  assert.equal(active?.adapterId, "codex");
+  assert.equal(active?.effective.agentId, "codex");
+  assert.equal(active?.effective.adapterId, "codex");
   const workerMailbox = store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: "worker" });
   assert.deepEqual(workerMailbox.pending.reasons, ["run-dispatched"]);
   assert.ok(workerMailbox.pending.refs.some((ref) => ref.type === "run" && ref.id === active.id));
@@ -653,6 +658,49 @@ test("assigned Work dispatch honors dependencies and Worker yield awaits Leader 
   assert.equal(store.getWorkItem(first.taskId, first.id)?.status, "completed");
   run(["work", "dispatch", second.id], store, options);
   assert.equal(store.getWorkItem(second.taskId, second.id)?.status, "running");
+});
+
+test("desired Agent drift preserves the in-flight Run's exact yield authority", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Immutable yield identity");
+  run(["activate", task.id], store, options);
+  run(["role", "add", task.id, "worker"], store, options);
+  run(["work", "create", task.id, "implementation", "--role", "worker"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+
+  run(["work", "dispatch", item.id], store, options);
+  const active = store.getActiveAgentRun(task.id, "worker");
+  assert.equal(active?.effective.agentId, "codex");
+  markDelivered(store, active);
+  recordReadyNativeSession(store, task.id, "worker", "codex-session");
+  store.transaction((tx) => {
+    const fence = {
+      agentId: active.effective.agentId,
+      runId: active.id,
+      receiptId: `agent-run:${task.id}/${active.id}`
+    };
+    const sessions = tx.getTaskRoleSessionSet(task.id, "worker");
+    tx.saveTaskRoleSessionSet(markTaskRoleRunDelivered(
+      bindTaskRoleRun(sessions, fence, NOW),
+      fence,
+      NOW
+    ));
+  });
+
+  const runSnapshot = structuredClone(active.effective);
+  run(["role", "bind", task.id, "worker", "claude"], store, options);
+  assert.equal(store.getRole(task.id, "worker")?.activeAgentId, "claude");
+  assert.deepEqual(store.getActiveAgentRun(task.id, "worker")?.effective, runSnapshot);
+  assert.equal(store.getTaskRoleSessionSet(task.id, "worker")?.activeAgentId, "codex");
+  assert.equal(store.getTaskRoleSessionSet(task.id, "worker")?.inFlight?.agentId, "codex");
+
+  run(["run", "yield", active.id, "--summary", "old snapshot completed"], store, options);
+  assert.equal(store.getAgentRun(task.id, active.id)?.status, "yielded");
+  assert.equal(store.getActiveAgentRun(task.id, "worker"), null);
+  assert.equal(store.getTaskRoleSessionSet(task.id, "worker")?.inFlight, null);
+  assert.equal(store.getTaskRoleSessionSet(task.id, "worker")?.activeAgentId, "codex");
+  assert.equal(store.getRole(task.id, "worker")?.activeAgentId, "claude");
+  assert.deepEqual(store.getAgentRun(task.id, active.id)?.effective, runSnapshot);
 });
 
 test("always review creates a ReviewRound under the same WorkItem and never reviews the review", (t) => {
@@ -1752,7 +1800,8 @@ test("Leader creates a profiled Worker instance, binds Claude config, then launc
     roleName: "worker",
     agentId: "claude",
     adapterId: "claude",
-    mode: "new"
+    mode: "new",
+    effective: store.getActiveAgentRun(task.id, "worker").effective
   });
   assert.equal(plan.launch.command, "claude");
   assert.deepEqual(
@@ -1762,8 +1811,16 @@ test("Leader creates a profiled Worker instance, binds Claude config, then launc
     ),
     ["--model", "claude-opus"]
   );
-  assert.ok(plan.launch.args.includes("--dangerously-skip-permissions"));
-  assert.equal(plan.launch.args.includes("--permission-mode"), false);
+  assert.equal(plan.session.effective.access, "read");
+  assert.equal(plan.launch.args.includes("--dangerously-skip-permissions"), false);
+  assert.deepEqual(
+    plan.launch.args.slice(
+      plan.launch.args.indexOf("--permission-mode"),
+      plan.launch.args.indexOf("--permission-mode") + 2
+    ),
+    ["--permission-mode", "dontAsk"]
+  );
+  assert.ok(plan.launch.args.includes("--disallowed-tools"));
   assert.equal(plan.session.nativeSessionId, "claude-worker-session");
 });
 

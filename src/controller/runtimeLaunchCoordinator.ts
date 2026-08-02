@@ -12,6 +12,7 @@ import {
   type RuntimeLaunchPreparationRequest,
   type SessionHostPort
 } from "../runtime/index.js";
+import { validateEffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 
 export type CoordinatedRuntimeLaunchRequest = RuntimeLaunchPreparationRequest;
 
@@ -31,6 +32,7 @@ export type RuntimeLaunchReservationPort = Readonly<{
     agentId: string;
     adapterId: string;
     nativeSessionId: string;
+    effective: import("../executor/effectiveLaunch.js").EffectiveLaunchSnapshot;
   }>, assertCurrent: () => void, now?: Date): void;
   completeRuntimeLaunchReservation(
     owner: RuntimeRoleOwner,
@@ -126,6 +128,16 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
     persistence: RuntimeLaunchPersistence,
     assertCurrent?: () => void
   ): Promise<RuntimeBinding> {
+    const effective = validateEffectiveLaunchSnapshot(request.effective);
+    if (
+      effective.agentId !== request.agentId
+      || effective.adapterId !== request.adapterId
+      || effective.workspace.root !== request.workspace
+    ) {
+      throw new TypeError(
+        "Runtime launch request does not match its effective snapshot."
+      );
+    }
     const expectedFingerprint = requireText(
       this.#launchFingerprint(request),
       "Launch fingerprint"
@@ -197,6 +209,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
             owner: request.owner,
             agentId: request.agentId,
             adapterId: request.adapterId,
+            effective: request.effective,
             workspace: request.workspace,
             ...(request.environment === undefined
               ? {}
@@ -208,6 +221,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
             owner: request.owner,
             agentId: request.agentId,
             adapterId: request.adapterId,
+            effective: request.effective,
             workspace: request.workspace,
             ...(request.environment === undefined
               ? {}
@@ -254,7 +268,8 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
           launchId,
           agentId: request.agentId,
           adapterId: request.adapterId,
-          nativeSessionId: binding.nativeSessionId
+          nativeSessionId: binding.nativeSessionId,
+          effective: request.effective
         }, assertLaunchCurrent, this.#now());
       } else {
         // Deferred scheduler persistence clears a known native identity in the
@@ -410,6 +425,7 @@ function defaultLaunchFingerprint(
     request.owner,
     request.agentId,
     request.adapterId,
+    request.effective,
     request.workspace
   ])).digest("hex");
 }

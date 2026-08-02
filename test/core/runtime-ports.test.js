@@ -6,8 +6,14 @@ import {
   createRuntimeBinding,
   createSessionLaunchRequest
 } from "../../dist/runtime/index.js";
+import { testEffectiveLaunch } from "../helpers/effectiveLaunch.js";
 
 const NOW = new Date("2026-07-22T08:00:00.000Z");
+const EFFECTIVE = testEffectiveLaunch({
+  agentId: "codex-personal",
+  adapterId: "codex",
+  workspaceRoot: "/repo"
+});
 
 test("runtime values retain only portable identities and an opaque host reference", () => {
   const owner = { scope: "task", taskId: " task-1 ", roleName: " leader " };
@@ -40,6 +46,7 @@ test("session launch requests distinguish fresh and resumable native sessions wi
     owner: { scope: "global", roleName: "operator" },
     agentId: "codex-personal",
     adapterId: "codex",
+    effective: EFFECTIVE,
     workspace: " /repo "
   });
   const resumed = createSessionLaunchRequest({
@@ -48,6 +55,7 @@ test("session launch requests distinguish fresh and resumable native sessions wi
     owner: { scope: "task", taskId: "task-1", roleName: "leader" },
     agentId: "codex-personal",
     adapterId: "codex",
+    effective: EFFECTIVE,
     workspace: "/repo",
     nativeSessionId: " thread-1 "
   });
@@ -104,6 +112,7 @@ test("runtime constructors reject ambiguous or unsafe identities", () => {
       owner: { scope: "task", taskId: "task-1", roleName: "leader" },
       agentId: "codex",
       adapterId: "codex",
+      effective: testEffectiveLaunch({ workspaceRoot: "/repo" }),
       workspace: "/repo",
       nativeSessionId: " "
     }),

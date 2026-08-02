@@ -9,7 +9,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
@@ -32,7 +32,7 @@ import {
   updateWorkItemStatus,
   validateWorkItem
 } from "../../dist/workItem/workItem.js";
-import { createAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun } from "../helpers/effectiveLaunch.js";
 import { createReviewRound } from "../../dist/review/reviewRound.js";
 import { createTaskMessage } from "../../dist/message/message.js";
 import { createInputRequest } from "../../dist/input/inputRequest.js";
@@ -559,8 +559,17 @@ test("delivery receipt ids serialize qualified Task record references", async ()
 });
 
 test("offline identity conversion writes a fresh zero-dangling output without touching source", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "yui-identity-convert-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const requestedRoot = process.env.YUI_CONVERTER_E2E_ROOT;
+  const root = requestedRoot === undefined
+    ? mkdtempSync(join(tmpdir(), "yui-identity-convert-"))
+    : resolve(requestedRoot);
+  if (requestedRoot !== undefined) {
+    assert.equal(existsSync(root), false, `Converter artifact root already exists: ${root}`);
+    mkdirSync(root, { recursive: true });
+  }
+  t.after(() => {
+    if (requestedRoot === undefined) rmSync(root, { recursive: true, force: true });
+  });
   const source = join(root, "source");
   const output = join(root, "output");
   mkdirSync(source);
@@ -587,8 +596,10 @@ test("offline identity conversion writes a fresh zero-dangling output without to
   assert.deepEqual(report.taskIds, ["task-1", "task-2"]);
   assert.deepEqual(readFileSync(join(source, STORAGE_STATE_FILE)), sourceBefore);
   const converted = JSON.parse(readFileSync(join(output, STORAGE_STATE_FILE), "utf8"));
+  assert.equal(converted.schemaVersion, 12);
   for (const taskId of report.taskIds) {
     const task = converted.tasks[taskId];
+    assert.equal(task.schemaVersion, 11);
     assert.deepEqual(Object.keys(task.workItems), ["work-item-1"]);
     assert.deepEqual(Object.keys(task.agentRuns), ["agent-run-1"]);
     assert.deepEqual(Object.keys(task.messages), ["message-1"]);
@@ -631,6 +642,14 @@ test("offline identity conversion writes a fresh zero-dangling output without to
     "change-set-1"
   ]);
   const second = converted.tasks["task-2"];
+  assert.equal(second.roles.leader.schemaVersion, 3);
+  assert.equal(second.roles.leader.launchRevision, 1);
+  assert.equal(second.roles.leader.defaultAccess, "read");
+  assert.equal(second.agentRuns["agent-run-1"].schemaVersion, 4);
+  assert.equal(second.agentRuns["agent-run-1"].effective.access, "read");
+  assert.equal(second.agentRuns["agent-run-1"].effective.sourceDesiredRevision, 1);
+  assert.equal(second.roleSessionSets.leader.sessions.codex.schemaVersion, 3);
+  assert.equal(second.roleSessionSets.leader.sessions.codex.effective.access, "read");
   assert.equal(second.activeRuns.leader.runId, "agent-run-1");
   assert.deepEqual(second.roleSessionSets.leader.inFlight, {
     agentId: "codex",
@@ -902,6 +921,8 @@ function legacyIdentityState() {
           input: "Legacy run",
           purpose: "execution",
           workItemId,
+          agentId: "codex",
+          adapterId: "codex",
           status: "active",
           createdAt: stamp,
           updatedAt: stamp
@@ -1035,15 +1056,22 @@ function legacyIdentityState() {
     updatedAt: firstStamp
   };
   const secondStamp = new Date(NOW.getTime() + 2_000).toISOString();
-  tasks["task-2"].roles.leader = {
-    ...createRole(
+  const currentLeader = createRole(
       "task-2",
       "leader",
       [binding],
       agent.id,
       "/fixture/task-2",
       new Date(secondStamp)
-    ),
+    );
+  const {
+    launchRevision: _launchRevision,
+    defaultAccess: _defaultAccess,
+    ...legacyLeader
+  } = currentLeader;
+  tasks["task-2"].roles.leader = {
+    ...legacyLeader,
+    schemaVersion: 2,
     status: "running"
   };
   tasks["task-2"].activeRuns.leader = {

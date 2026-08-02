@@ -8,6 +8,15 @@ import {
   createRuntimeBinding,
   createSessionLaunchRequest
 } from "../../dist/runtime/index.js";
+import { testEffectiveLaunch } from "../helpers/effectiveLaunch.js";
+
+function effective(workspace = "/repo") {
+  return testEffectiveLaunch({
+    agentId: "codex-personal",
+    adapterId: "codex",
+    workspaceRoot: workspace
+  });
+}
 
 function fakePlan(nativeSessionId = undefined) {
   return {
@@ -58,6 +67,7 @@ test("TmuxSessionHost starts task owners through the task planner and returns an
     owner: { scope: "task", taskId: "task-1", roleName: "leader" },
     agentId: "codex-personal",
     adapterId: "codex",
+    effective: effective(),
     workspace: "/repo"
   });
 
@@ -69,6 +79,7 @@ test("TmuxSessionHost starts task owners through the task planner and returns an
       roleName: "leader",
       agentId: "codex-personal",
       adapterId: "codex",
+      effective: effective(),
       launchId: "launch-1",
       mode: "new"
     }],
@@ -115,6 +126,7 @@ test("TmuxSessionHost serializes first Role windows that share one Task host", a
     owner: { scope: "task", taskId: "task-1", roleName },
     agentId: "codex-personal",
     adapterId: "codex",
+    effective: effective(),
     workspace: "/repo"
   });
 
@@ -166,6 +178,7 @@ test("TmuxSessionHost resumes global owners and stops only the referenced role",
     owner: { scope: "global", roleName: "operator" },
     agentId: "codex-personal",
     adapterId: "codex",
+    effective: effective(),
     workspace: "/repo",
     nativeSessionId: "native-1"
   }));
@@ -175,6 +188,7 @@ test("TmuxSessionHost resumes global owners and stops only the referenced role",
       roleName: "operator",
       agentId: "codex-personal",
       adapterId: "codex",
+      effective: effective(),
       launchId: "launch-2",
       mode: "resume",
       nativeSessionId: "native-1"
@@ -249,6 +263,7 @@ test("TmuxSessionHost rejects a planned workspace mismatch before creating a pro
       owner: { scope: "task", taskId: "task-1", roleName: "leader" },
       agentId: "codex-personal",
       adapterId: "codex",
+      effective: effective("/expected"),
       workspace: "/expected"
     })),
     /workspace does not match the runtime request/u
@@ -317,6 +332,7 @@ test("TmuxPromptPushAdapter maps tmux presence and composer readiness to portabl
     owner: { scope: "task", taskId: "task-1", roleName: "leader" },
     agentId: "codex-personal",
     adapterId: "codex",
+    effective: effective(),
     workspace: "/repo"
   }));
   const envelope = createPromptEnvelope({
@@ -373,6 +389,7 @@ test("TmuxPromptPushAdapter prefers the async tmux path", async () => {
     owner: { scope: "task", taskId: "task-1", roleName: "leader" },
     agentId: "codex-personal",
     adapterId: "codex",
+    effective: effective(),
     workspace: "/repo"
   }));
   const envelope = createPromptEnvelope({

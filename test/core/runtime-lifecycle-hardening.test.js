@@ -32,7 +32,8 @@ import {
   createRoleAgentBinding,
   updateRole
 } from "../../dist/role/role.js";
-import { createAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun } from "../helpers/effectiveLaunch.js";
+import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import { repairOrphanedActiveTasks } from "../../dist/scheduler/activeTaskProgress.js";
 import { mergePendingWakeup } from "../../dist/scheduler/pendingWakeup.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
@@ -134,7 +135,14 @@ test("an active Role Run may launch from its snapshotted workspace", async (t) =
     "new",
     "Review the candidate.",
     FIRST,
-    { workspace }
+    {
+      workspace,
+      effective: resolveEffectiveLaunch({
+        role: reviewer,
+        purpose: "execution",
+        workspace
+      })
+    }
   );
   const target = { kind: "role", taskId: task.id, roleName: reviewer.name };
   store.transaction((tx) => {

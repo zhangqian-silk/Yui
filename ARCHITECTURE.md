@@ -30,11 +30,13 @@ independent execution additionally records an AgentRun.
 - `WorkerProfile` is a versioned, provider-neutral behavior template containing
   instructions, Skills, access expectations, and optional model/effort hints.
 - `TaskRole` is a mutable Worker instance inside one Task. Applying a Profile
-  copies its portable behavior. The Role may bind multiple Agents; every
-  binding retains independent runtime configuration.
-- `AgentRun` records one managed dispatch, its selected Agent and runtime
-  configuration, delivery state, compact result, and whether its purpose is
-  execution or review.
+  copies its portable behavior. Its versioned desired launch configuration is
+  next-launch-only. The Role may bind multiple Agents; every binding retains
+  independent runtime configuration.
+- `AgentRun` records one managed dispatch and an immutable effective snapshot:
+  actual Agent, adapter, model, effort, access, permission boundary, workspace,
+  Role context, and source desired revision. A native Role Session stores the
+  same snapshot; running processes are never hot-mutated by later Role edits.
 - A `WorkItemCandidate` is the explicit result currently awaiting Leader
   acceptance. It snapshots the WorkItem revision, summary, and either a
   yielded execution Run or a Leader-managed direct source.
@@ -106,12 +108,14 @@ A WorkItem can read the full Task workspace but has an explicit Project write
 scope. Isolation creates a second root with independent worktrees for writable
 Projects and Task-main context for the rest. The managed dispatch and
 `yui-worker` Skill name both sets explicitly; the Agent must modify only the
-writable set. Native Agent permissions apply to the whole Role Session rather
-than individual Project directories, so implementation Roles use write-capable
-sessions while explorer and reviewer Roles use native read-only sessions. Scope
-is monotonic. A Worker cannot expand it directly: it reports the need, and the
-Leader either adds Projects to the existing scope, creates another WorkItem, or
-adds the Project to the Task.
+writable set. Effective native permission is derived once at dispatch from the
+Profile access ceiling, exact WorkItem write scope, matching workspace access,
+and Run purpose. A write-capable process is possible only when all write facts
+agree. Gitless and non-WorkItem Runs, empty scopes, read Profiles, and every
+ReviewRound are native read-only; unsupported read-only adapters fail closed.
+Scope is monotonic. A Worker cannot expand it directly: it reports the need,
+and the Leader either adds Projects to the existing scope, creates another
+WorkItem, or adds the Project to the Task.
 
 An isolated result is handled in this order:
 
@@ -162,6 +166,16 @@ tmux owns native Agent terminals. The Controller owns mailbox delivery,
 wakeups, Role liveness, reconciliation, and read-only Web observation. Operator
 and Leader Sessions are fixed Task/global Roles; Task Worker Sessions are
 selected through Role Agent bindings.
+
+Role desired revisions and Run/Session effective snapshots keep configuration
+history explicit. Resume compares the complete effective snapshot and
+workspace compatibility rather than revision alone. Desired drift is expected
+while an old process is running and becomes effective only on a later launch;
+control-plane wakes continue through the live Session's actual snapshot, and
+fresh replacement archives the stopped snapshot instead of rewriting it.
+Mailbox generations, reservations, liveness, native Turn Hooks, and exact yield
+remain the control-plane authority; configuration snapshots do not replace any
+of those completion fences.
 
 All durable writes use process locking and atomic replacement. Storage validates
 record identity, legal transitions, dependency cycles, cross-record ownership,

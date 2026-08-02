@@ -29,7 +29,7 @@ export async function reconcileExitedRoleRuns(
     selectedSchedulerRoles(store, task.id, selection).flatMap((role) => {
       const run = store.getActiveAgentRun(task.id, role.name);
       if (run === null) return [];
-      const session = store.getRoleSession(task.id, role.name);
+      const session = store.getRoleSession(task.id, role.name, run.effective.agentId);
       return [{
         task,
         role,
@@ -38,8 +38,8 @@ export async function reconcileExitedRoleRuns(
         inspection: {
           taskId: task.id,
           roleName: role.name,
-          agentId: role.activeAgentId,
-          adapterId: role.adapterId,
+          agentId: run.effective.agentId,
+          adapterId: run.effective.adapterId,
           ...(session?.nativeSessionId === undefined
             ? {}
             : { nativeSessionId: session.nativeSessionId })

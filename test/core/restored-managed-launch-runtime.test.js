@@ -21,6 +21,11 @@ import {
   runSessionNotifyCommand
 } from "../../dist/controller/sessionNotify.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
+import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
+import {
+  createRoleSessionSet,
+  recordRoleAgentSession
+} from "../../dist/executor/agentExecutor.js";
 import {
   MAX_SESSION_TITLE_LENGTH,
   taskRoleSessionTitle
@@ -30,12 +35,13 @@ import {
   createGlobalRole,
   createRole,
   createRoleAgentBinding,
+  updateRole,
   updateRoleStatus
 } from "../../dist/role/role.js";
 import {
-  createAgentRun,
   markAgentRunDelivered
 } from "../../dist/run/agentRun.js";
+import { createAgentRun } from "../helpers/effectiveLaunch.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
@@ -134,6 +140,55 @@ test("Controller lifecycle dispatcher is the sole session creator for enter", as
     store.getGlobalRoleSessionSet(globalRole.name).sessions[globalRole.activeAgentId].nativeSessionId,
     "thread-global"
   );
+});
+
+test("Controller keeps a live Session effective snapshot across desired drift", async (t) => {
+  const { store, task, role, agent, now } = fixture(t);
+  const schedulerStore = new FileSchedulerStoreAdapter(store);
+  schedulerStore.recordRuntimeNativeSession({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    nativeSessionId: "thread-before-desired-drift"
+  }, now);
+  const immutable = structuredClone(store.getRoleSession(task.id, role.name).effective);
+  store.saveRole(task.id, updateRole(role, {
+    agentBindings: {
+      [agent.id]: createRoleAgentBinding(agent, {
+        adapterId: "codex",
+        model: "gpt-next"
+      })
+    }
+  }, new Date(now.getTime() + 1)));
+  const resumes = [];
+  const dispatch = createRuntimeLifecycleDispatcher(store, schedulerStore, {
+    async start() { throw new Error("desired drift must not start over a live Session"); },
+    async resume(request) {
+      resumes.push(request);
+      return {
+        id: "binding-live-drift",
+        launchId: request.launchId,
+        owner: request.owner,
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        hostRef: "host-live-drift",
+        hostCreated: false,
+        nativeSessionId: request.nativeSessionId
+      };
+    }
+  });
+
+  await dispatch("runtime.ensure-role-session", {
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  });
+
+  assert.equal(resumes.length, 1);
+  assert.deepEqual(resumes[0].effective, immutable);
+  assert.equal(resumes[0].nativeSessionId, "thread-before-desired-drift");
+  assert.deepEqual(store.getRoleSession(task.id, role.name).effective, immutable);
 });
 
 test("one planner adds Codex structured notify for Task and global launches", (t) => {
@@ -268,7 +323,21 @@ test("Claude new launch is preallocated once and persisted without a prompt", (t
 });
 
 test("Claude resume preserves a user-renamed native session", (t) => {
-  const { home, store, task, role, agent } = fixture(t, "claude");
+  const { home, store, task, role, agent, now } = fixture(t, "claude");
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  }, agent.id, now);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    nativeSessionId: "claude-existing",
+    policy: "fixed",
+    status: "ready",
+    effective: resolveEffectiveLaunch({ role, purpose: "execution" })
+  }, now);
+  store.saveTaskRoleSessionSet(sessions);
   const planner = new FileRoleLaunchPlanner(home, store);
   const plan = planner.plan({
     taskId: task.id,
@@ -281,6 +350,93 @@ test("Claude resume preserves a user-renamed native session", (t) => {
 
   assert.equal(plan.launch.args.includes("--name"), false);
   assert.deepEqual(plan.launch.args.slice(-2), ["--resume", "claude-existing"]);
+});
+
+test("an incompatible stopped Session cannot turn a new Run into a native resume", (t) => {
+  const { home, store, task, role, agent, now } = fixture(t, "claude");
+  const previous = resolveEffectiveLaunch({ role, purpose: "execution" });
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  }, agent.id, now);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    nativeSessionId: "claude-stopped-old",
+    policy: "fixed",
+    status: "stopped",
+    effective: previous
+  }, now);
+  store.saveTaskRoleSessionSet(sessions);
+
+  const effective = { ...previous, model: "claude-next" };
+  const run = createAgentRun(
+    "agent-run-1",
+    task.id,
+    role.name,
+    "new",
+    "Use the new effective snapshot",
+    now,
+    { effective }
+  );
+  store.saveAgentRun(run);
+  store.saveActiveAgentRun(run);
+  const plan = new FileRoleLaunchPlanner(home, store, {
+    createNativeSessionId: () => "claude-native-new"
+  }).plan({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    effective,
+    mode: "new"
+  });
+
+  assert.equal(plan.launch.args.includes("--resume"), false);
+  assert.deepEqual(plan.launch.args.slice(-2), ["--session-id", "claude-native-new"]);
+  assert.equal(plan.session.nativeSessionId, "claude-native-new");
+});
+
+test("planner resumes a live Session with its immutable effective snapshot after desired drift", (t) => {
+  const { home, store, task, role, agent, now } = fixture(t, "claude");
+  const immutable = resolveEffectiveLaunch({ role, purpose: "execution" });
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  }, agent.id, now);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    nativeSessionId: "claude-live-before-drift",
+    policy: "fixed",
+    status: "ready",
+    effective: immutable
+  }, now);
+  store.saveTaskRoleSessionSet(sessions);
+  store.saveRole(task.id, updateRole(role, {
+    agentBindings: {
+      [agent.id]: createRoleAgentBinding(agent, {
+        adapterId: "claude",
+        model: "claude-next"
+      })
+    }
+  }, new Date(now.getTime() + 1)));
+
+  const plan = new FileRoleLaunchPlanner(home, store).plan({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    effective: immutable,
+    mode: "resume",
+    nativeSessionId: "claude-live-before-drift"
+  });
+
+  assert.deepEqual(plan.session.effective, immutable);
+  assert.deepEqual(plan.launch.args.slice(-2), ["--resume", "claude-live-before-drift"]);
+  assert.equal(plan.launch.args.includes("claude-next"), false);
 });
 
 test("Claude global Operator keeps its native conversation title", (t) => {
@@ -332,7 +488,8 @@ test("Codex notify payload is strictly converted to one durable runtime event", 
     role.name,
     "new",
     "Do the work",
-    now
+    now,
+    { effective: resolveEffectiveLaunch({ role, purpose: "execution" }) }
   ));
   const environment = {
     YUI_HOME: home,
@@ -480,7 +637,8 @@ test("Codex turn completion releases a forgotten Leader active fence exactly onc
     role.name,
     "new",
     "dispatch workers",
-    now
+    now,
+    { effective: resolveEffectiveLaunch({ role, purpose: "execution" }) }
   ), now);
   store.transaction((tx) => {
     tx.saveAgentRun(run);
@@ -550,7 +708,8 @@ test("a quiescent result-driven Leader turn queues recovery when the Agent forge
     role.name,
     "new",
     "synthesize worker results",
-    now
+    now,
+    { effective: resolveEffectiveLaunch({ role, purpose: "execution" }) }
   ), now);
   store.transaction((tx) => {
     tx.saveAgentRun(run);
@@ -615,7 +774,14 @@ test("a Worker turn that forgets to yield fails visibly and wakes the Leader", a
     "new",
     "analyze",
     now,
-    { workItemId: item.id }
+    {
+      workItemId: item.id,
+      effective: resolveEffectiveLaunch({
+        role: worker,
+        purpose: "execution",
+        workItemWriteProjectIds: item.writeProjectIds
+      })
+    }
   ), now);
   store.transaction((tx) => {
     tx.saveRole(task.id, updateRoleStatus(worker, "running", now));

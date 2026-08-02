@@ -20,6 +20,10 @@ import {
   updateRoleAgentSessionStatus,
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
+import {
+  resolveEffectiveLaunch,
+  type EffectiveLaunchSnapshot
+} from "../executor/effectiveLaunch.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { formatTimestamp } from "../output/timePresentation.js";
 import { renderRoleDetails } from "../output/rolePresentation.js";
@@ -708,7 +712,7 @@ function completeTaskCommand(
       if (sessions !== null) {
         tx.saveTaskRoleSessionSet(
           terminalizeTaskRoleRunSession(sessions, {
-            agentId: leaderEntry.role.activeAgentId,
+            agentId: leaderEntry.run.effective.agentId,
             runId: leaderEntry.run.id,
             receiptId: formatAgentRunReceiptId(task.id, leaderEntry.run.id)
           }, now)
@@ -806,7 +810,7 @@ function archiveTaskCommand(
       const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
       if (sessions !== null) {
         tx.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(sessions, {
-          agentId: role.activeAgentId,
+          agentId: activeRun.effective.agentId,
           runId: activeRun.id,
           receiptId: formatAgentRunReceiptId(task.id, activeRun.id)
         }, now));
@@ -1013,7 +1017,8 @@ function addTaskRole(
       agent: `${created.activeAgentId}/${binding.adapterId}`,
       model: binding.config.model ?? "CLI default",
       effort: binding.config.effort ?? "CLI default",
-      yolo: binding.config.yolo === true ? "enabled" : "disabled"
+      yolo: binding.config.yolo === true ? "enabled" : "disabled",
+      ...roleLaunchEventPayload(created, null)
     }, now);
     return { role: created, binding };
   });
@@ -1119,8 +1124,6 @@ function updateTaskRole(
     const task = requireTask(tx, taskId);
     assertTaskOpen(task);
     const role = requireRole(tx, task.id, roleName);
-    const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
-    const activeRun = tx.getActiveAgentRun(task.id, role.name);
     const changesLaunchContext = hasRoleLaunchContextOptions(parsed) || parsed.has("--profile");
     const changesAgentConfig = hasAgentConfigOptions(parsed);
     if (changesLaunchContext || changesAgentConfig) {
@@ -1128,18 +1131,7 @@ function updateTaskRole(
         scope: "task",
         taskId: task.id,
         roleName: role.name
-      }, "launch configuration update");
-    }
-    if (
-      changesLaunchContext
-      && (
-        activeRun !== null
-        || Object.values(sessions?.sessions ?? {}).some(({ status }) => status !== "stopped")
-      )
-    ) {
-      throw usageError(
-        "Role launch context cannot be changed while its Run or native process is running."
-      );
+      }, "desired launch configuration update");
     }
     let bindings = role.agentBindings;
     if (changesAgentConfig) {
@@ -1147,13 +1139,6 @@ function updateTaskRole(
       const agent = requireAgent(tx, agentId);
       const binding = bindings[agentId]
         ?? createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId });
-      const targetSession = sessions?.sessions[agentId];
-      if (
-        (agentId === role.activeAgentId && activeRun !== null)
-        || (targetSession !== undefined && targetSession.status !== "stopped")
-      ) {
-        throw usageError("Agent settings cannot be changed while its Run or native process is running.");
-      }
       bindings = { ...bindings, [agentId]: patchRoleAgentBinding(binding, parsed) };
     }
     const profileId = parsed.one("--profile");
@@ -1169,6 +1154,13 @@ function updateTaskRole(
     }
     tx.saveRole(task.id, next);
     enqueueWork(tx, taskMailbox(task.id), "role-updated", now, [taskRef(task.id)]);
+    recordTaskEvent(
+      tx,
+      task.id,
+      "role.updated",
+      roleLaunchEventPayload(next, tx.getTaskRoleSessionSet(task.id, next.name)),
+      now
+    );
     return next;
   });
   notifyMailbox(options.runtime, taskMailbox(updated.taskId), updated.taskId);
@@ -1225,7 +1217,7 @@ function bindTaskRole(
       scope: "task",
       taskId: task.id,
       roleName: role.name
-    }, "Agent binding");
+    }, "desired Agent binding update");
     const agent = requireAgent(tx, args[2]);
     const binding = role.agentBindings[agent.id]
       ?? createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId });
@@ -1235,11 +1227,19 @@ function bindTaskRole(
     enqueueWork(tx, taskMailbox(task.id), "role-bound", now, [taskRef(task.id)]);
     if (agent.id === role.activeAgentId) {
       tx.saveRole(task.id, bound);
+      recordTaskEvent(tx, task.id, "role.agent-bound", {
+        role: bound.name,
+        agentId: agent.id,
+        ...roleLaunchEventPayload(
+          bound,
+          tx.getTaskRoleSessionSet(task.id, bound.name)
+        )
+      }, now);
       return { role: bound, mode: "current" as const };
     }
     const existing = tx.getTaskRoleSessionSet(task.id, role.name)
       ?? createRoleSessionSet({ scope: "task", taskId: task.id, roleName: role.name }, role.activeAgentId, now);
-    const currentSession = existing.sessions[role.activeAgentId];
+    const currentSession = existing.sessions[existing.activeAgentId];
     const switched = (() => {
       try {
         return switchActiveRoleAgent(bound, existing, agent.id, {
@@ -1252,6 +1252,11 @@ function bindTaskRole(
       }
     })();
     tx.saveTaskRoleWithSessionSet(switched.role, switched.sessions);
+    recordTaskEvent(tx, task.id, "role.agent-bound", {
+      role: switched.role.name,
+      agentId: agent.id,
+      ...roleLaunchEventPayload(switched.role, switched.sessions)
+    }, now);
     return { role: switched.role, mode: switched.mode };
   });
   notifyMailbox(options.runtime, taskMailbox(result.role.taskId), result.role.taskId);
@@ -1281,6 +1286,11 @@ function unbindTaskRole(
       );
       if (unbound.sessions === null) tx.saveRole(task.id, unbound.role);
       else tx.saveTaskRoleWithSessionSet(unbound.role, unbound.sessions);
+      recordTaskEvent(tx, task.id, "role.agent-unbound", {
+        role: unbound.role.name,
+        agentId: args[2],
+        ...roleLaunchEventPayload(unbound.role, unbound.sessions)
+      }, now);
       return unbound.role;
     } catch (error) {
       throw usageError(messageOf(error));
@@ -1623,8 +1633,15 @@ function dispatchWork(
       runId,
       taskRoleSessionTitle(task, role.name)
     );
+    const runWorkspace = workspace ?? tx.getRoleWorkspace(task.id, LEADER_ROLE) ?? undefined;
+    const effective = resolveEffectiveLaunch({
+      role,
+      purpose: "execution",
+      ...(runWorkspace === undefined ? {} : { workspace: runWorkspace }),
+      workItemWriteProjectIds: item.writeProjectIds
+    });
     const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
-    const dispatchMode = roleAgentSessionResumeMode(sessions, role.activeAgentId);
+    const dispatchMode = roleAgentSessionResumeMode(sessions, effective.agentId, effective);
     if (item.status === "failed"
       && item.candidates.length > 0
       && dispatchMode !== "resume") {
@@ -1643,12 +1660,8 @@ function dispatchWork(
       now,
       {
         workItemId: item.id,
-        ...(workspace === null
-          ? (tx.getRoleWorkspace(task.id, LEADER_ROLE) === null
-            ? {}
-            : { workspace: tx.getRoleWorkspace(task.id, LEADER_ROLE)! })
-          : { workspace }),
-        agent: agentRunSnapshot(role)
+        ...(runWorkspace === undefined ? {} : { workspace: runWorkspace }),
+        effective
       }
     );
     tx.saveAgentRun(created);
@@ -1661,6 +1674,7 @@ function dispatchWork(
       runRef(task.id, created.id),
       workItemRef(task.id, item.id)
     ]);
+    recordTaskEvent(tx, task.id, "run.dispatched", runLaunchEventPayload(created), now);
     return created;
   });
   notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName), run.taskId);
@@ -1996,6 +2010,9 @@ function listRuns(
       { header: "Role", minWidth: 4, maxWidth: 22 },
       { header: "Purpose", minWidth: 6, maxWidth: 10 },
       { header: "Mode", minWidth: 4, maxWidth: 8 },
+      { header: "Effective", minWidth: 10, maxWidth: 30 },
+      { header: "Access", minWidth: 6, maxWidth: 8 },
+      { header: "Source", minWidth: 8, maxWidth: 16 },
       { header: "Status", minWidth: 6, maxWidth: 12 },
       { header: "Summary", minWidth: 8, maxWidth: 58 }
     ],
@@ -2004,6 +2021,9 @@ function listRuns(
       run.roleName,
       run.purpose,
       run.mode,
+      `${run.effective.agentId}/${run.effective.adapterId} r${run.effective.sourceDesiredRevision}`,
+      run.effective.access,
+      run.effective.provenance,
       run.status,
       run.summary ?? "-"
     ]),
@@ -2035,6 +2055,21 @@ function retryRun(
       throw usageError(`${task.id}/${role.name} already has an active run.`);
     }
     const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
+    const retryItem = previous.workItemId === undefined
+      ? null
+      : tx.getWorkItem(task.id, previous.workItemId);
+    if (previous.workItemId !== undefined && retryItem === null) {
+      throw dataError(`Work item not found for run ${previous.id}: ${previous.workItemId}.`);
+    }
+    const runWorkspace = previous.workspace
+      ?? tx.getRoleWorkspace(task.id, role.name)
+      ?? undefined;
+    const effective = resolveEffectiveLaunch({
+      role,
+      purpose: "execution",
+      ...(runWorkspace === undefined ? {} : { workspace: runWorkspace }),
+      ...(retryItem === null ? {} : { workItemWriteProjectIds: retryItem.writeProjectIds })
+    });
     const runId = tx.nextAgentRunId(task.id);
     const retaggedInput = retagYuiRunInput(
       previous.input,
@@ -2045,25 +2080,22 @@ function retryRun(
       runId,
       task.id,
       role.name,
-      roleAgentSessionResumeMode(sessions, role.activeAgentId),
+      roleAgentSessionResumeMode(sessions, effective.agentId, effective),
       previous.workItemId === undefined
         ? retaggedInput
         : ensureWorkerRunCompletionRequirement(retaggedInput),
       now,
       {
         ...(previous.workItemId === undefined ? {} : { workItemId: previous.workItemId }),
-        ...(previous.workspace === undefined ? {} : { workspace: previous.workspace }),
-        agent: agentRunSnapshot(role)
+        ...(runWorkspace === undefined ? {} : { workspace: runWorkspace }),
+        effective
       }
     );
     tx.saveAgentRun(created);
     tx.saveActiveAgentRun(created);
     tx.saveRole(task.id, updateRoleStatus(role, "running", now));
     if (previous.workItemId !== undefined) {
-      const item = tx.getWorkItem(task.id, previous.workItemId);
-      if (item === null) {
-        throw dataError(`Work item not found for run ${previous.id}: ${previous.workItemId}.`);
-      }
+      const item = retryItem!;
       const workspace = tx.getRoleWorkspace(task.id, role.name);
       if (workspace?.owner.type === "work-item"
         && workspace.owner.workItemId !== item.id) {
@@ -2075,6 +2107,10 @@ function retryRun(
       tx.saveWorkItem(task.id, retryFailedWorkItem(item, now));
     }
     enqueueWork(tx, roleMailbox(task.id, role.name), "run-retried", now, [runRef(task.id, created.id)]);
+    recordTaskEvent(tx, task.id, "run.retried", {
+      ...runLaunchEventPayload(created),
+      previousRunId: previous.id
+    }, now);
     return created;
   });
   notifyMailbox(options.runtime, roleMailbox(retried.taskId, retried.roleName), retried.taskId);
@@ -2159,7 +2195,7 @@ function yieldRun(
     const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
     if (sessions !== null) {
       tx.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(sessions, {
-        agentId: role.activeAgentId,
+        agentId: active.effective.agentId,
         runId: active.id,
         receiptId: formatAgentRunReceiptId(task.id, active.id)
       }, now));
@@ -2294,21 +2330,28 @@ function queueReviewRound(
     taskRoleSessionTitle(task, reviewer.name)
   );
   const sessions = store.getTaskRoleSessionSet(item.taskId, reviewer.name);
+  const reviewWorkspace = candidateWorkspaceRecord === undefined
+    ? undefined
+    : readOnlyReviewWorkspace(candidateWorkspaceRecord, reviewer.name, now);
+  const effective = resolveEffectiveLaunch({
+    role: reviewer,
+    purpose: "review",
+    ...(reviewWorkspace === undefined ? {} : { workspace: reviewWorkspace }),
+    workItemWriteProjectIds: []
+  });
   const run = createAgentRun(
     runId,
     item.taskId,
     reviewer.name,
-    roleAgentSessionResumeMode(sessions, reviewer.activeAgentId),
+    roleAgentSessionResumeMode(sessions, effective.agentId, effective),
     input,
     now,
     {
       workItemId: item.id,
       purpose: "review",
       reviewRoundId: pending.id,
-      ...(candidateWorkspaceRecord === undefined
-        ? {}
-        : { workspace: readOnlyReviewWorkspace(candidateWorkspaceRecord, reviewer.name, now) }),
-      agent: agentRunSnapshot(reviewer)
+      ...(reviewWorkspace === undefined ? {} : { workspace: reviewWorkspace }),
+      effective
     }
   );
   store.saveAgentRun(run);
@@ -2320,6 +2363,13 @@ function queueReviewRound(
     runRef(item.taskId, run.id),
     workItemRef(item.taskId, item.id)
   ]);
+  recordTaskEvent(
+    store,
+    item.taskId,
+    "run.review-dispatched",
+    runLaunchEventPayload(run),
+    now
+  );
   return { round: running, run };
 }
 
@@ -2401,6 +2451,7 @@ function requireAgentProfile(store: TaskWorkflowStore, id: string): AgentProfile
 
 function workerProfileRolePatch(profile: AgentProfile) {
   return {
+    defaultAccess: profile.defaultAccess,
     description: profile.description,
     systemPrompt: profile.instructions,
     skills: profile.skills === undefined ? undefined : [...profile.skills],
@@ -2437,6 +2488,41 @@ function recordTaskEvent(
   store.saveEvent(taskId, createTaskEvent(
     store.nextEventId(taskId), taskId, type, payload, now
   ));
+}
+
+function roleLaunchEventPayload(
+  role: Role,
+  sessions: TaskRoleSessionSet | null
+): TaskEventPayload {
+  const effective = sessions?.sessions[sessions.activeAgentId]?.effective;
+  return {
+    desiredRevision: String(role.launchRevision),
+    defaultAccess: role.defaultAccess,
+    effectiveRevision: effective === undefined
+      ? "none"
+      : String(effective.sourceDesiredRevision),
+    effectiveAccess: effective?.access ?? "none",
+    provenance: effective?.provenance ?? "none",
+    desiredDrift: effective === undefined
+      ? "not-started"
+      : effective.sourceDesiredRevision === role.launchRevision
+        ? "none"
+        : "pending-next-launch"
+  };
+}
+
+function runLaunchEventPayload(run: AgentRun): TaskEventPayload {
+  return {
+    runId: run.id,
+    role: run.roleName,
+    purpose: run.purpose,
+    mode: run.mode,
+    agent: `${run.effective.agentId}/${run.effective.adapterId}`,
+    effectiveRevision: String(run.effective.sourceDesiredRevision),
+    effectiveAccess: run.effective.access,
+    provenance: run.effective.provenance,
+    writeProjectIds: run.effective.writeProjectIds.join(",") || "none"
+  };
 }
 
 function requireTask(store: TaskWorkflowStore, taskId: string | undefined): Task {
@@ -2538,18 +2624,6 @@ function chronologicalAgentRuns(runs: readonly AgentRun[]): AgentRun[] {
     left.createdAt.localeCompare(right.createdAt)
     || left.id.localeCompare(right.id)
   ));
-}
-
-function agentRunSnapshot(role: Role): NonNullable<
-  NonNullable<Parameters<typeof createAgentRun>[6]>["agent"]
-> {
-  const binding = activeRoleAgentBinding(role);
-  return {
-    agentId: binding.agentId,
-    adapterId: binding.adapterId,
-    ...(binding.config.model === undefined ? {} : { model: binding.config.model }),
-    ...(binding.config.effort === undefined ? {} : { effort: binding.config.effort })
-  };
 }
 
 function isTerminalWorkItemStatus(status: WorkItemStatus): boolean {

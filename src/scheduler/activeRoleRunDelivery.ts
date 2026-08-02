@@ -12,6 +12,7 @@ import {
   type SchedulerReconcileSelection
 } from "./ports.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
+import { effectiveLaunchSnapshotsCompatible } from "../executor/effectiveLaunch.js";
 
 export type ActiveRoleRunDeliveryResult = Readonly<{
   taskId: string;
@@ -52,7 +53,11 @@ export async function processActiveRoleRunDeliveries(
         continue;
       }
 
-      const existingSession = store.getRoleSession(task.id, role.name);
+      const existingSession = store.getRoleSession(
+        task.id,
+        role.name,
+        run.effective.agentId
+      );
       const receiptId = formatAgentRunReceiptId(task.id, run.id);
       const target = { kind: "role", taskId: task.id, roleName: role.name } as const;
       const claim = store.claimWorkMailbox({
@@ -91,20 +96,27 @@ export async function processActiveRoleRunDeliveries(
       let deliveryAttempted = false;
       try {
         const nativeSessionId = run.mode === "resume"
-          ? requireResumeSession(role, existingSession)
+          ? requireResumeSession(role, run.effective, existingSession)
           : undefined;
         prepared = await delivery.prepareRoleSession({
           taskId: task.id,
           roleName: role.name,
-          agentId: role.activeAgentId,
-          adapterId: role.adapterId,
-          workspace: run.workspace?.root ?? role.workspace,
+          agentId: run.effective.agentId,
+          adapterId: run.effective.adapterId,
+          effective: run.effective,
+          workspace: run.effective.workspace.root,
           mode: run.mode,
           runId: run.id,
           ...(nativeSessionId === undefined ? {} : { nativeSessionId })
         });
         const ready = await delivery.waitUntilReady(prepared);
-        const session = validateReadySession(role, existingSession, run.mode, ready);
+        const session = validateReadySession(
+          role,
+          run.effective,
+          existingSession,
+          run.mode,
+          ready
+        );
         store.saveRoleRunPrepared({
           task,
           role,
@@ -189,16 +201,21 @@ export async function processActiveRoleRunDeliveries(
 
 function requireResumeSession(
   role: SchedulerRole,
+  effective: import("../executor/effectiveLaunch.js").EffectiveLaunchSnapshot,
   session: SchedulerRoleSession | null
 ): string {
   if (session === null || !hasText(session.nativeSessionId)) {
     throw new Error(`Role resume has no fixed native session: ${role.taskId}/${role.name}.`);
+  }
+  if (!effectiveLaunchSnapshotsCompatible(session.effective, effective)) {
+    throw new Error(`Role resume effective snapshot drifted: ${role.taskId}/${role.name}.`);
   }
   return session.nativeSessionId;
 }
 
 function validateReadySession(
   role: SchedulerRole,
+  effective: import("../executor/effectiveLaunch.js").EffectiveLaunchSnapshot,
   existing: SchedulerRoleSession | null,
   mode: "new" | "resume",
   ready: ReadyRoleDelivery
@@ -208,10 +225,14 @@ function validateReadySession(
   if (session === null || !hasText(session.nativeSessionId)) {
     throw new Error(`Ready Role session has no native session id: ${role.taskId}/${role.name}.`);
   }
-  if (session.agentId !== role.activeAgentId || session.adapterId !== role.adapterId) {
+  if (session.agentId !== effective.agentId || session.adapterId !== effective.adapterId) {
     throw new Error(`Ready Role session identity changed: ${role.taskId}/${role.name}.`);
   }
+  if (!effectiveLaunchSnapshotsCompatible(session.effective, effective)) {
+    throw new Error(`Ready Role session effective snapshot changed: ${role.taskId}/${role.name}.`);
+  }
   if (existing?.nativeSessionId !== undefined
+    && effectiveLaunchSnapshotsCompatible(existing.effective, effective)
     && session.nativeSessionId !== existing.nativeSessionId) {
     throw new Error(`Ready Role session changed the fixed native session id: ${role.taskId}/${role.name}.`);
   }

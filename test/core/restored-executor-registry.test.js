@@ -6,6 +6,11 @@ import {
   ExecutorRegistry
 } from "../../dist/executor/executorRegistry.js";
 import { TmuxSessionHost } from "../../dist/runtime/index.js";
+import { testEffectiveLaunch } from "../helpers/effectiveLaunch.js";
+
+function effective(agentId, adapterId, workspace = "/tmp/workspace") {
+  return testEffectiveLaunch({ agentId, adapterId, workspaceRoot: workspace });
+}
 
 test("readiness resolver distinguishes Codex node composer and Claude prompt markers", () => {
   const base = {
@@ -326,10 +331,12 @@ test("production runtime ports launch and attempt delivery without the legacy re
 
   const prepared = await registry.prepareRoleSession({
     taskId: "task-1", roleName: "leader", agentId: "codex", adapterId: "codex",
+    effective: effective("codex", "codex"),
     workspace: "/tmp/workspace", mode: "new", runId: "agent-run-1"
   });
   const retriedPrepare = await registry.prepareRoleSession({
     taskId: "task-1", roleName: "leader", agentId: "codex", adapterId: "codex",
+    effective: effective("codex", "codex"),
     workspace: "/tmp/workspace", mode: "new", runId: "agent-run-1"
   });
   assert.equal(retriedPrepare, prepared);
@@ -394,6 +401,7 @@ test("prepared runtime bindings survive transient unavailability but explicit te
     roleName: "worker",
     agentId: "codex",
     adapterId: "codex",
+    effective: effective("codex", "codex"),
     workspace: "/tmp/workspace",
     mode: "new",
     runId: "agent-run-1"
@@ -456,6 +464,7 @@ test("runtime launch plans Claude once and reports the native session actually h
 
   const prepared = await registry.prepareRoleSession({
     taskId: "task-1", roleName: "worker", agentId: "claude", adapterId: "claude",
+    effective: effective("claude", "claude"),
     workspace: "/tmp/workspace", mode: "new"
   });
   const ready = await registry.waitUntilReady(prepared);

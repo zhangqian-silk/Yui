@@ -320,9 +320,10 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
     "codex"
   );
 
-  const { createRoleSessionSet, recordRoleAgentSession } = await import(
+  const { createRoleSessionSet } = await import(
     "../../dist/executor/agentExecutor.js"
   );
+  const { recordRoleAgentSession } = await import("../helpers/effectiveLaunch.js");
   const now = new Date("2026-07-25T00:00:00.000Z");
   store.saveGlobalRoleSessionSet(recordRoleAgentSession(
     createRoleSessionSet(
@@ -342,13 +343,20 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
   const runningInput = new PassThrough();
   const runningOutput = new PassThrough();
   runningInput.end("all\n\n\n\n\ngpt-new\n\n\n");
-  await assert.rejects(runSetupCommand(
+  const runningEffective = structuredClone(
+    store.getGlobalRoleSessionSet("operator").sessions.codex.effective
+  );
+  await assert.doesNotReject(runSetupCommand(
     [], env, executor,
     { input: runningInput, output: runningOutput, forceInteractive: true }
-  ), /cannot be reconfigured.*Session is running.*rerun yui setup/i);
+  ));
   assert.equal(
     new FileTaskStore(home).getGlobalRole("operator").agentBindings.codex.config.model,
-    undefined
+    "gpt-new"
+  );
+  assert.deepEqual(
+    new FileTaskStore(home).getGlobalRoleSessionSet("operator").sessions.codex.effective,
+    runningEffective
   );
 });
 

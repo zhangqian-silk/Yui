@@ -8,6 +8,7 @@ export type WebDashboardStore = Pick<TaskStore,
   | "getTask"
   | "getTaskBrief"
   | "listRoles"
+  | "getTaskRoleSessionSet"
   | "listWorkItems"
   | "listAgentRuns"
   | "listInputRequests"
@@ -89,12 +90,31 @@ export function buildWebTaskDetail(store: WebDashboardStore, taskId: string): ob
       const name = projectNamesById.get(projectId);
       return name === undefined ? [] : [name];
     });
+    const runs = reader.listAgentRuns(taskId);
+    const activeRuns = new Map(runs
+      .filter((run) => run.status === "active")
+      .map((run) => [run.roleName, run]));
+    const roles = reader.listRoles(taskId).map((role) => {
+      const activeRun = activeRuns.get(role.name);
+      const sessions = reader.getTaskRoleSessionSet(taskId, role.name);
+      const activeSession = sessions?.sessions[sessions.activeAgentId];
+      const effectiveLaunch = activeRun?.effective ?? activeSession?.effective ?? null;
+      return {
+        ...role,
+        effectiveLaunch,
+        effectiveLaunchSource: activeRun === undefined
+          ? activeSession === undefined ? null : "session"
+          : "run",
+        launchDrift: effectiveLaunch !== null
+          && effectiveLaunch.sourceDesiredRevision !== role.launchRevision
+      };
+    });
     return {
       task: projectNames.length === 0 ? task : { ...task, projectNames },
       brief: reader.getTaskBrief(taskId),
-      roles: reader.listRoles(taskId),
+      roles,
       workItems: reader.listWorkItems(taskId),
-      runs: reader.listAgentRuns(taskId),
+      runs,
       openInputs: inputs.filter((request) => request.status === "open"),
       messages: reader.listMessages(taskId),
       decisions: reader.listDecisions(taskId),

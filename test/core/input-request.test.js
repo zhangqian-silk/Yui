@@ -17,9 +17,9 @@ import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { runControllerSchedulerPass } from "../../dist/controller/controller.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
 import {
-  createRoleSessionSet,
-  recordRoleAgentSession
+  createRoleSessionSet
 } from "../../dist/executor/agentExecutor.js";
+import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import {
   answerInputRequest,
   cancelInputRequest,
@@ -31,7 +31,7 @@ import {
   createRoleAgentBinding,
   updateRoleStatus
 } from "../../dist/role/role.js";
-import { createAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun, recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 import { processLeaderWakeups } from "../../dist/scheduler/leaderWakeupProcessor.js";
 import { mergePendingWakeup } from "../../dist/scheduler/pendingWakeup.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
@@ -237,6 +237,7 @@ function fixture(t) {
   runTaskCommand(["activate", task.id], store, options);
   store.clearPendingWakeup(task.id);
   const role = store.getRole(task.id, "leader");
+  const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
   const active = {
     ...createAgentRun(
       store.nextAgentRunId(task.id),
@@ -244,7 +245,8 @@ function fixture(t) {
       role.name,
       "resume",
       "Steward the task",
-      FIRST
+      FIRST,
+      { effective }
     ),
     deliveredAt: FIRST.toISOString()
   };
@@ -258,7 +260,8 @@ function fixture(t) {
     adapterId: role.agentBindings[role.activeAgentId].adapterId,
     nativeSessionId: "native-1",
     policy: "fixed",
-    status: "running"
+    status: "running",
+    effective
   }, FIRST);
   store.transaction((tx) => {
     tx.saveActiveAgentRun(active);
@@ -401,7 +404,8 @@ test("a pending wake cannot bypass open input and becomes dispatchable after ans
           agentId: session.agentId,
           adapterId: session.adapterId,
           nativeSessionId: session.nativeSessionId,
-          status: "running"
+          status: "running",
+          effective: session.effective
         }
       };
     },
@@ -550,7 +554,10 @@ test("Controller atomically applies an expired Agent recommendation and resumes 
     choiceKey: "safe",
     text: "Safe rollout"
   });
-  assert.equal(store.listEvents(task.id).at(-1).type, "input.auto-answered");
+  assert.deepEqual(
+    store.listEvents(task.id).slice(-3).map((event) => event.type),
+    ["input.auto-answered", "run.dispatched", "run.delivered"]
+  );
 });
 
 test("targeted recommendation reconciliation does not mutate another Task", (t) => {

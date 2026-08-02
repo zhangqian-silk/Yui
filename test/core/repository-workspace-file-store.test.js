@@ -17,7 +17,6 @@ import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
-  recordRoleAgentSession,
   updateRoleAgentSessionStatus
 } from "../../dist/executor/agentExecutor.js";
 import { runProjectCommand } from "../../dist/commands/projectCommands.js";
@@ -30,7 +29,8 @@ import {
   createRoleAgentBinding,
   updateRole
 } from "../../dist/role/role.js";
-import { createAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
+import { yieldAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun, recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 import { createProject } from "../../dist/repository/project.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
 import { TaskWorkspaceCoordinator } from "../../dist/repository/taskWorkspaceCoordinator.js";
@@ -114,6 +114,21 @@ function addTaskRoles(store, task, repositoryPath, names = ["leader", "worker"])
     }
   });
   return agent;
+}
+
+function savePlannerRun(store, taskId, roleName, context = {}) {
+  const run = createAgentRun(
+    store.nextAgentRunId(taskId),
+    taskId,
+    roleName,
+    "new",
+    "Planner fixture launch.",
+    NOW,
+    context
+  );
+  store.saveAgentRun(run);
+  store.saveActiveAgentRun(run);
+  return run;
 }
 
 function liveSessionSet(status = "ready") {
@@ -803,11 +818,15 @@ test("a Project-backed Task owns one main worktree shared by Roles", async (t) =
     root: main
   }]);
   assert.equal(existsSync(join(mainProject, ".git")), true);
+  const reviewerRun = savePlannerRun(store, task.id, "reviewer", {
+    workspace: store.getRoleWorkspace(task.id, "leader")
+  });
   assert.doesNotThrow(() => planner.plan({
     taskId: task.id,
     roleName: "reviewer",
     agentId: agent.id,
     adapterId: agent.adapterId,
+    effective: reviewerRun.effective,
     mode: "new"
   }));
 });
@@ -893,6 +912,7 @@ test("a lazily copied reviewer starts from the prepared Project Task workspace",
   });
 
   assert.equal(store.getRole(task.id, "reviewer").workspace, main);
+  const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
   assert.doesNotThrow(() => new FileRoleLaunchPlanner(home, store, {
     cliPath: "/dist/cli.js"
   }).plan({
@@ -900,6 +920,7 @@ test("a lazily copied reviewer starts from the prepared Project Task workspace",
     roleName: "reviewer",
     agentId: agent.id,
     adapterId: agent.adapterId,
+    effective: reviewRun.effective,
     mode: "new"
   }));
 });
@@ -988,6 +1009,7 @@ test("a reviewer launches from the candidate Run workspace instead of its previo
     roleName: "reviewer",
     agentId: agent.id,
     adapterId: agent.adapterId,
+    effective: reviewRun.effective,
     mode: "new"
   });
   assert.equal(plan.role.workspace, isolated.root);
@@ -1067,6 +1089,10 @@ test("a multi-Project Task and WorkItem expose one root with per-Project access"
     realpathSync(join(work.root, "frontend")),
     realpathSync(join(main.root, "frontend"))
   );
+  const workerRun = savePlannerRun(store, task.id, "worker", {
+    workItemId: item.id,
+    workspace: work
+  });
   const isolatedPlan = new FileRoleLaunchPlanner(home, store, {
     cliPath: "/dist/cli.js"
   }).plan({
@@ -1074,6 +1100,7 @@ test("a multi-Project Task and WorkItem expose one root with per-Project access"
     roleName: "worker",
     agentId: store.getRole(task.id, "worker").activeAgentId,
     adapterId: "codex",
+    effective: workerRun.effective,
     mode: "new"
   });
   assert.equal(isolatedPlan.launch.command, "codex");
@@ -1087,10 +1114,12 @@ test("a multi-Project Task and WorkItem expose one root with per-Project access"
     roleName: "worker",
     agentId: store.getRole(task.id, "worker").activeAgentId,
     adapterId: "codex",
+    effective: workerRun.effective,
     mode: "new"
   });
   assert.equal(directAgentPlan.launch.command, "codex");
   assert.deepEqual(JSON.parse(directAgentPlan.launch.env.YUI_CONTEXT_PROJECT_IDS), [frontend.id]);
+  store.clearActiveAgentRun(task.id, "worker");
 
   writeFileSync(join(work.root, "backend", "contract.txt"), "v2\n");
   execFileSync("git", ["-C", join(work.root, "backend"), "add", "contract.txt"]);

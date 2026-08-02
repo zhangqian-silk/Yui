@@ -29,6 +29,7 @@ import {
 } from "../../dist/controller/clientRuntime.js";
 import { startFileTaskControllerRuntime } from "../../dist/controller/runtime.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import { testEffectiveLaunch } from "../helpers/effectiveLaunch.js";
 
 function emptyStore(events = []) {
   return {
@@ -1022,16 +1023,19 @@ test("controller delivers a queued Work AgentRun through tmux before liveness", 
     name: "worker",
     activeAgentId: "codex",
     adapterId: "codex",
+    effective: testEffectiveLaunch({ agentId: "codex" }),
+    workspace: "/fixture/workspace",
     status: "running"
   };
   const run = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     id: "agent-run-1",
     taskId: task.id,
     roleName: role.name,
     mode: "new",
     input: "implement it",
     purpose: "execution",
+    effective: testEffectiveLaunch({ agentId: "codex" }),
     workItemId: "work-item-1",
     status: "active",
     createdAt: new Date(0).toISOString(),
@@ -1184,7 +1188,7 @@ test("dirty Role reconciliation inspects only that Role while retaining the Task
     (role) => role.taskId === taskId && role.name === roleName
   ) ?? null;
   store.getActiveAgentRun = (_taskId, roleName) => ({
-    schemaVersion: 3,
+    schemaVersion: 4,
     id: roleName === "worker" ? "agent-run-1" : "agent-run-2",
     taskId: task.id,
     roleName,
@@ -1192,6 +1196,7 @@ test("dirty Role reconciliation inspects only that Role while retaining the Task
     input: roleName,
     purpose: "execution",
     status: "active",
+    effective: testEffectiveLaunch({ agentId: `codex-${roleName}` }),
     deliveredAt: new Date(0).toISOString(),
     createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString()
   });
@@ -1296,13 +1301,15 @@ test("controller pump coalesces overlap into one non-overlapping follow-up pass"
     taskId: "task-1", name: "worker", activeAgentId: "codex", adapterId: "codex", status: "running"
   }];
   store.getActiveAgentRun = () => ({
-    schemaVersion: 1,
+    schemaVersion: 4,
     id: "agent-run-1",
     taskId: "task-1",
     roleName: "worker",
     mode: "new",
     input: "work",
+    purpose: "execution",
     status: "active",
+    effective: testEffectiveLaunch({ agentId: "codex" }),
     createdAt: new Date(0).toISOString(),
     updatedAt: new Date(0).toISOString()
   });
@@ -1885,7 +1892,8 @@ test("a fresh Controller retries an undelivered Run in an existing busy pane", a
     agentId: roleValue.activeAgentId,
     adapterId: roleValue.adapterId,
     nativeSessionId: "thread-existing",
-    status: "running"
+    status: "running",
+    effective: run.effective
   });
   store.claimWorkMailbox = () => ({
     status: "processing",
@@ -1938,7 +1946,8 @@ test("a resumed Role retries startup readiness when prepare created its missing 
     agentId: roleValue.activeAgentId,
     adapterId: roleValue.adapterId,
     nativeSessionId: "thread-existing",
-    status: "running"
+    status: "running",
+    effective: run.effective
   });
   store.claimWorkMailbox = () => ({
     status: "processing",
@@ -2111,16 +2120,25 @@ test("an overdue semantic deadline uses bounded pass backoff instead of a zero-d
 });
 
 function role(taskId, name) {
+  const agentId = `codex-${name}`;
   return {
-    taskId, name, activeAgentId: `codex-${name}`, adapterId: "codex", status: "running"
+    taskId,
+    name,
+    activeAgentId: agentId,
+    adapterId: "codex",
+    effective: testEffectiveLaunch({ agentId }),
+    workspace: "/fixture/workspace",
+    status: "running"
   };
 }
 
 function deliveredRun(taskId, roleName) {
   const at = new Date(0).toISOString();
+  const agentId = `codex-${roleName}`;
   return {
-    schemaVersion: 3, id: "agent-run-1", taskId, roleName,
+    schemaVersion: 4, id: "agent-run-1", taskId, roleName,
     mode: "new", input: "work", purpose: "execution", status: "active", deliveredAt: at,
+    effective: testEffectiveLaunch({ agentId }),
     createdAt: at, updatedAt: at
   };
 }

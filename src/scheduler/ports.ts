@@ -16,6 +16,7 @@ import type { PendingTurnCompletion } from "../executor/turnCompletion.js";
 import type { RuntimeRoleOwner } from "../runtime/lifecycleReservation.js";
 import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import type { Task } from "../task/task.js";
+import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 
 export type SchedulerTask = Readonly<Pick<
   Task,
@@ -29,6 +30,7 @@ export type SchedulerRole = Readonly<{
   adapterId: AgentAdapterId;
   model?: string;
   effort?: string;
+  effective: EffectiveLaunchSnapshot;
   workspace: string;
   status: "idle" | "running" | "detached" | "exited" | "failed";
 }>;
@@ -40,6 +42,7 @@ export type SchedulerRoleSession = Readonly<{
   adapterId: string;
   nativeSessionId?: string;
   status: "reserved" | "ready" | "running" | "stopped" | "broken";
+  effective: EffectiveLaunchSnapshot;
 }>;
 
 /**
@@ -150,7 +153,11 @@ export interface SchedulerStorePort {
     now: Date,
     taskIds?: ReadonlySet<string>
   ): readonly string[];
-  getRoleSession(taskId: string, roleName: string): SchedulerRoleSession | null;
+  getRoleSession(
+    taskId: string,
+    roleName: string,
+    agentId?: string
+  ): SchedulerRoleSession | null;
   hasInFlightTurn(taskId: string, roleName: string): boolean;
   peekNextAgentRunId(taskId: string): string;
 
@@ -295,6 +302,7 @@ export interface TmuxDeliveryPort {
     roleName: string;
     agentId: string;
     adapterId: string;
+    effective: EffectiveLaunchSnapshot;
     workspace: string;
     mode: RoleSessionLaunchMode;
     runId?: string;

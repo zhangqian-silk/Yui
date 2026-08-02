@@ -1,6 +1,7 @@
 import type { PromptEnvelope } from "./promptEnvelope.js";
 import type { RuntimeBinding } from "./runtimeBinding.js";
 import type { RuntimeOwner } from "./runtimeOwner.js";
+import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 import type {
   NewSessionLaunchRequest,
   ResumeSessionLaunchRequest
@@ -17,6 +18,7 @@ export type RuntimeLaunchPreparationRequest = Readonly<{
   owner: RuntimeOwner;
   agentId: string;
   adapterId: string;
+  effective: EffectiveLaunchSnapshot;
   workspace: string;
   environment?: Readonly<Record<string, string>>;
   mode: "new" | "resume";

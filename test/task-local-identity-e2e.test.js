@@ -195,7 +195,7 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
     at(4),
     taskSelection(primaryTask.id)
   );
-  assert.equal(initialWake.status, "dispatched");
+  assert.equal(initialWake.status, "dispatched", JSON.stringify(initialWake));
   assert.equal(delivery.receipts[0], "agent-run:task-1/agent-run-1");
 
   const firstLeaderRun = store.getActiveAgentRun(primaryTask.id, "leader");
@@ -567,7 +567,8 @@ function recordingDelivery() {
           adapterId: prepared.adapterId,
           nativeSessionId: prepared.nativeSessionId
             ?? `native-${prepared.taskId}-${prepared.roleName}`,
-          status: "running"
+          status: "running",
+          effective: prepared.effective
         }
       };
     },

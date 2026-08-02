@@ -416,7 +416,12 @@ function savePreparedSystemRole(
   now: Date
 ): void {
   const sessions = store.getGlobalRoleSessionSet(role.name);
-  if (sessions === null || sessions.activeAgentId === role.activeAgentId) {
+  const activeSession = sessions?.sessions[sessions.activeAgentId];
+  if (
+    sessions === null
+    || sessions.activeAgentId === role.activeAgentId
+    || (activeSession !== undefined && activeSession.status !== "stopped")
+  ) {
     store.saveGlobalRole(role);
     return;
   }
@@ -577,17 +582,7 @@ function prepareSystemRole(
     assertRoleRuntimeMutationAllowed(store, {
       scope: "global",
       roleName: name
-    }, "launch configuration update");
-    const liveSession = Object.values(
-      store.getGlobalRoleSessionSet(name)?.sessions ?? {}
-    ).find(({ status }) => status !== "stopped");
-    if (liveSession !== undefined) {
-      throw usageError(
-        `Global Role ${name} cannot be reconfigured while its native Session is ${
-          liveSession.status
-        }. Exit or stop that Session, then rerun yui setup.`
-      );
-    }
+    }, "desired launch configuration update");
     return updateGlobalRole(existing, {
       activeAgentId: agent.id,
       workspace,

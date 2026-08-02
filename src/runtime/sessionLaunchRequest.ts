@@ -1,11 +1,16 @@
 import { normalizeRuntimeOwner, type RuntimeOwner } from "./runtimeOwner.js";
 import { requireSafeIdentity, requireText } from "./validation.js";
+import {
+  validateEffectiveLaunchSnapshot,
+  type EffectiveLaunchSnapshot
+} from "../executor/effectiveLaunch.js";
 
 type SessionLaunchRequestBase = Readonly<{
   launchId: string;
   owner: RuntimeOwner;
   agentId: string;
   adapterId: string;
+  effective: EffectiveLaunchSnapshot;
   workspace: string;
   environment?: Readonly<Record<string, string>>;
 }>;
@@ -24,12 +29,22 @@ export type SessionLaunchRequest = NewSessionLaunchRequest | ResumeSessionLaunch
 export function createSessionLaunchRequest(
   input: SessionLaunchRequest
 ): SessionLaunchRequest {
+  const agentId = requireSafeIdentity(input.agentId, "Agent id");
+  const adapterId = requireSafeIdentity(input.adapterId, "Agent adapter id");
+  const workspace = requireText(input.workspace, "Session workspace");
+  const effective = validateEffectiveLaunchSnapshot(input.effective);
+  if (effective.agentId !== agentId
+    || effective.adapterId !== adapterId
+    || effective.workspace.root !== workspace) {
+    throw new TypeError("Session launch request does not match its effective snapshot.");
+  }
   const common = {
     launchId: requireSafeIdentity(input.launchId, "Launch id"),
     owner: normalizeRuntimeOwner(input.owner),
-    agentId: requireSafeIdentity(input.agentId, "Agent id"),
-    adapterId: requireSafeIdentity(input.adapterId, "Agent adapter id"),
-    workspace: requireText(input.workspace, "Session workspace"),
+    agentId,
+    adapterId,
+    effective,
+    workspace,
     ...(input.environment === undefined
       ? {}
       : { environment: copyEnvironment(input.environment) })

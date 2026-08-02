@@ -18,6 +18,7 @@ import type {
   SessionInspection
 } from "./ports.js";
 import { requireSafeIdentity } from "./validation.js";
+import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 
 export type RuntimeTmuxRole = Readonly<{
   name: string;
@@ -44,6 +45,7 @@ export interface RuntimeRoleLaunchPlannerPort {
     roleName: string;
     agentId: string;
     adapterId: string;
+    effective: EffectiveLaunchSnapshot;
     mode: "new" | "resume";
     nativeSessionId?: string;
     launchId?: string;
@@ -53,6 +55,7 @@ export interface RuntimeRoleLaunchPlannerPort {
     roleName: string;
     agentId: string;
     adapterId: string;
+    effective: EffectiveLaunchSnapshot;
     mode: "new" | "resume";
     nativeSessionId?: string;
     launchId?: string;
@@ -312,6 +315,7 @@ export class TmuxSessionHost implements SessionHostPort {
       roleName: request.owner.roleName,
       agentId: request.agentId,
       adapterId: request.adapterId,
+      effective: request.effective,
       launchId: request.launchId,
       mode: request.mode,
       ...(request.environment === undefined

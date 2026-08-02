@@ -1,4 +1,7 @@
+import { isDeepStrictEqual } from "node:util";
+
 import type { RoleAgentSession } from "../executor/agentExecutor.js";
+import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { TaskRole } from "../role/role.js";
 import type { TaskStore } from "../storage/taskStore.js";
@@ -31,6 +34,10 @@ export type TaskRoleRuntimeStatus = Readonly<{
   taskId: string;
   roleName: string;
   agentId: string;
+  desiredRevision: number;
+  effectiveLaunch: EffectiveLaunchSnapshot | null;
+  launchDrift: boolean;
+  runSessionDrift: boolean;
   health: TaskRoleHealth;
   healthReason: string;
   openInputRequestCount: number;
@@ -73,7 +80,10 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
     : `${status.activeWork.id} (${status.activeWork.status}) ${status.activeWork.title}`;
   const nativeSession = status.nativeSession === null
     ? "not recorded"
-    : `${status.nativeSession.nativeSessionId} (${status.nativeSession.status}, ${status.nativeSession.adapterId})`;
+    : `${status.nativeSession.nativeSessionId} (${status.nativeSession.status}, ${status.nativeSession.adapterId}, effective r${status.nativeSession.effective.sourceDesiredRevision})`;
+  const effectiveLaunch = status.effectiveLaunch === null
+    ? "not started"
+    : `${status.effectiveLaunch.agentId}/${status.effectiveLaunch.adapterId}; r${status.effectiveLaunch.sourceDesiredRevision}; access=${status.effectiveLaunch.access}; provenance=${status.effectiveLaunch.provenance}`;
   const tmux = status.tmux.state === "missing"
     ? "missing"
     : [
@@ -96,6 +106,12 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
     `  Reason           ${status.healthReason}`,
     `  Open inputs      ${status.openInputRequestCount}`,
     `  Agent            ${status.agentId}`,
+    `  Desired launch   r${status.desiredRevision}; access ceiling=${status.role.defaultAccess}`,
+    `  Effective launch ${effectiveLaunch}`,
+    `  Desired drift    ${status.effectiveLaunch === null
+      ? "-"
+      : status.launchDrift ? "pending next launch" : "none"}`,
+    `  Run/session      ${status.runSessionDrift ? "snapshot mismatch" : "snapshot consistent"}`,
     `  Role state       ${status.role.status}`,
     `  Active work      ${activeWork}`,
     `  Active run       ${activeRun}`,
@@ -142,7 +158,14 @@ function inspectTaskRoleRuntimeStatus(
     ? null
     : store.getWorkItem(taskId, activeRun.workItemId);
   const sessions = store.getTaskRoleSessionSet(taskId, role.name);
-  const nativeSession = sessions?.sessions[role.activeAgentId] ?? null;
+  const effectiveAgentId = activeRun?.effective.agentId ?? sessions?.activeAgentId;
+  const nativeSession = effectiveAgentId === undefined
+    ? null
+    : sessions?.sessions[effectiveAgentId] ?? null;
+  const effectiveLaunch = activeRun?.effective ?? nativeSession?.effective ?? null;
+  const runSessionDrift = activeRun !== null
+    && nativeSession !== null
+    && !isDeepStrictEqual(activeRun.effective, nativeSession.effective);
   const tmux: TaskRoleTmuxStatus = pane === undefined
     ? { state: "missing" }
     : {
@@ -166,7 +189,12 @@ function inspectTaskRoleRuntimeStatus(
   return {
     taskId,
     roleName: role.name,
-    agentId: role.activeAgentId,
+    agentId: effectiveLaunch?.agentId ?? role.activeAgentId,
+    desiredRevision: role.launchRevision,
+    effectiveLaunch,
+    launchDrift: effectiveLaunch !== null
+      && effectiveLaunch.sourceDesiredRevision !== role.launchRevision,
+    runSessionDrift,
     ...health,
     openInputRequestCount,
     role,

@@ -15,9 +15,9 @@ import {
   unbindRoleAgent
 } from "../../dist/role/role.js";
 import {
-  createRoleSessionSet,
-  recordRoleAgentSession
+  createRoleSessionSet
 } from "../../dist/executor/agentExecutor.js";
+import { recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 
@@ -37,7 +37,7 @@ function roleSessions(owner, status) {
     policy: "fixed",
     status
   }, NOW);
-  return sessions;
+  return { ...sessions, activeAgentId: "codex" };
 }
 
 function fixture(t) {
