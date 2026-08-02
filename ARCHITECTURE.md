@@ -83,12 +83,13 @@ Every result awaiting acceptance is stored as an explicit WorkItem candidate.
 `always` dispatches a review AgentRun for every candidate, whether it comes
 from a yielded execution Run or a Leader-managed direct result; `leader`
 leaves every candidate for the Leader to accept directly or review explicitly.
-Review Runs complete their ReviewRound, leave the WorkItem awaiting acceptance,
-and never trigger another review. Successful and failed review attempts both
-wake the Leader and remain evidence for judgment, not a machine verdict.
-Roles describe Agent capability. An AgentRun snapshots its effective workspace;
-review Runs use the Candidate workspace with every Project forced read-only,
-so a Reviewer's previous Role workspace cannot redirect the review.
+Review Runs complete only their exact ReviewRound, leave the WorkItem awaiting
+acceptance, and never trigger another review or append a Candidate. Successful
+and failed review attempts both wake the Leader and remain evidence for
+judgment, not a machine verdict. The ReviewRound stores its frozen Candidate
+base, isolated workspace provenance, terminal checks, and optional diagnostic
+commit. The Leader may route that evidence to the original Worker, but Yui
+never merges it automatically.
 
 Dependencies are enforced at dispatch. A Role cannot have overlapping active
 Runs, and terminal Task state fences new messages, dispatches, retries, and
@@ -109,10 +110,11 @@ scope. Isolation creates a second root with independent worktrees for writable
 Projects and Task-main context for the rest. The managed dispatch and
 `yui-worker` Skill name both sets explicitly; the Agent must modify only the
 writable set. Effective native permission is derived once at dispatch from the
-Profile access ceiling, exact WorkItem write scope, matching workspace access,
-and Run purpose. A write-capable process is possible only when all write facts
-agree. Gitless and non-WorkItem Runs, empty scopes, read Profiles, and every
-ReviewRound are native read-only; unsupported read-only adapters fail closed.
+Profile access ceiling, exact scope, matching workspace ownership/access, and
+Run purpose. A normal write process requires a WorkItem write scope. A review
+write process instead requires an exact ReviewRound owner and frozen Candidate
+base. Gitless and non-WorkItem Runs, empty scopes, and read Profiles are native
+read-only; unsupported read-only adapters fail closed.
 Scope is monotonic. A Worker cannot expand it directly: it reports the need,
 and the Leader either adds Projects to the existing scope, creates another
 WorkItem, or adds the Project to the Task.

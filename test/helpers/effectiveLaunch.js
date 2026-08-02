@@ -42,7 +42,13 @@ export function testEffectiveLaunch(input = {}) {
   return resolveEffectiveLaunch({
     role,
     purpose: input.purpose ?? (input.access === "read" ? "review" : "execution"),
-    ...(taskScoped ? { workspace, workItemWriteProjectIds: writeProjectIds } : {})
+    ...(taskScoped ? { workspace, workItemWriteProjectIds: writeProjectIds } : {}),
+    ...(input.purpose === "review"
+      ? {
+          reviewRoundId: input.reviewRoundId ?? "review-round-1",
+          reviewBaseCommit: input.reviewBaseCommit ?? workspace.entries[0].baseCommit
+        }
+      : {})
   });
 }
 
@@ -55,7 +61,9 @@ export function createAgentRun(...args) {
     model: oldAgent.model,
     effort: oldAgent.effort,
     workspace: context.workspace,
-    purpose: context.purpose
+    purpose: context.purpose,
+    reviewRoundId: context.reviewRoundId,
+    reviewBaseCommit: context.reviewBaseCommit
   });
   const { agent: _agent, ...current } = context;
   return createDomainAgentRun(...args.slice(0, 6), { ...current, effective });

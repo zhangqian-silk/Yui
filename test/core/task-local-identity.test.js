@@ -47,6 +47,7 @@ import {
 } from "../../dist/coordination/workMailbox.js";
 
 const NOW = new Date("2026-08-02T00:00:00.000Z");
+const REVIEW_BASE_COMMIT = "a".repeat(40);
 
 test("WorkItem ids start at one independently inside each Task", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-task-local-id-"));
@@ -120,6 +121,7 @@ test("every remaining Task-owned family allocates independently per Task", (t) =
       item.candidates[0].id,
       "reviewer",
       "leader",
+      REVIEW_BASE_COMMIT,
       NOW
     ));
     tx.saveMessage(task.id, createTaskMessage(
@@ -496,6 +498,7 @@ test("WorkItem-local candidate ids never match another WorkItem review", (t) => 
       awaiting[0].candidates[0].id,
       "reviewer",
       "leader",
+      REVIEW_BASE_COMMIT,
       NOW
     ));
   });
@@ -634,6 +637,12 @@ test("offline identity conversion writes a fresh zero-dangling output without to
     runId: "agent-run-1"
   }]);
   assert.equal(first.reviewRounds["review-round-1"].candidateId, "candidate-1");
+  assert.equal(
+    first.reviewRounds["review-round-1"].reviewBaseProvenance,
+    "legacy-unavailable"
+  );
+  assert.equal(first.reviewRounds["review-round-1"].reviewBaseCommit, undefined);
+  assert.deepEqual(first.reviewRounds["review-round-1"].checks, []);
   assert.deepEqual(
     first.workItems["work-item-1"].candidates[0].workspace.owner,
     { type: "work-item", workItemId: "work-item-1" }
@@ -1027,8 +1036,10 @@ function legacyIdentityState() {
     candidateId: "work-item-10-candidate-1",
     reviewerRoleName: "reviewer",
     requestedBy: "leader",
-    status: "pending",
-    createdAt: firstStamp
+    status: "completed",
+    summary: "Legacy review completed.",
+    createdAt: firstStamp,
+    endedAt: firstStamp
   };
   tasks["task-1"].changeSets["change-set-10"] = {
     schemaVersion: 2,

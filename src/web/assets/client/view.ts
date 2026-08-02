@@ -474,6 +474,38 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
   executionSection.append(runs);
   detail.append(executionSection);
 
+  const reviewSection = section(t("detail.reviews") + " · " + data.reviewRounds.length);
+  const reviews = node("div", "row-list");
+  if (!data.reviewRounds.length) reviews.append(emptyRow(t));
+  data.reviewRounds.slice().sort(byNewest).forEach(function (round) {
+    const card = node("article", "record-card");
+    const row = node("div", "row record-head");
+    row.append(node("strong", "", round.id), statusPill(t, "review", round.status));
+    card.append(row);
+    const metadata = node("div", "run-meta");
+    metadata.append(node("span", "", round.reviewerRoleName));
+    metadata.append(node("span", "", round.workItemId + " · " + round.candidateId));
+    metadata.append(node("span", "", t("detail.reviewBase") + " · "
+      + round.reviewBaseProvenance + " · " + (round.reviewBaseCommit || "unavailable")));
+    if (round.workspace) {
+      metadata.append(node("span", "", t("detail.workspace") + " · " + round.workspace.root));
+    }
+    if (round.evidenceCommit) {
+      metadata.append(node("span", "", t("detail.evidence") + " · " + round.evidenceCommit));
+    }
+    card.append(metadata);
+    if (round.checks && round.checks.length) {
+      card.append(node("p", "record-copy", t("detail.checks") + " · "
+        + round.checks.map(function (check) {
+          return check.name + "=" + check.outcome;
+        }).join(", ")));
+    }
+    if (round.summary) card.append(node("p", "record-copy", round.summary));
+    reviews.append(card);
+  });
+  reviewSection.append(reviews);
+  detail.append(reviewSection);
+
   const workSection = section(t("detail.workItems") + " · " + data.workItems.length);
   const work = node("div", "row-list");
   if (!data.workItems.length) work.append(emptyRow(t));

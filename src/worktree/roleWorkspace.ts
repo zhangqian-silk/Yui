@@ -2,7 +2,8 @@ import { resolve } from "node:path";
 
 export type WorktreeOwner =
   | Readonly<{ type: "task" }>
-  | Readonly<{ type: "work-item"; workItemId: string }>;
+  | Readonly<{ type: "work-item"; workItemId: string }>
+  | Readonly<{ type: "review-round"; reviewRoundId: string }>;
 
 export type WorkspaceProjectAccess = "read" | "write";
 
@@ -105,13 +106,20 @@ function normalizeEntries(
 }
 
 export function managedWorktreeName(owner: WorktreeOwner): string {
-  return owner.type === "task" ? "main" : owner.workItemId;
+  if (owner.type === "task") return "main";
+  return owner.type === "work-item" ? owner.workItemId : owner.reviewRoundId;
 }
 
 function validateOwner(owner: WorktreeOwner): WorktreeOwner {
   if (owner.type === "task") return { type: "task" };
   if (owner.type === "work-item") {
     return { type: "work-item", workItemId: requireIdentity(owner.workItemId, "Work item id") };
+  }
+  if (owner.type === "review-round") {
+    return {
+      type: "review-round",
+      reviewRoundId: requireIdentity(owner.reviewRoundId, "ReviewRound id")
+    };
   }
   throw new Error("Managed worktree owner is invalid.");
 }

@@ -15,13 +15,22 @@ import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import {
+  bindExecution,
+  claimPending,
+  createWorkMailbox,
+  enqueueSignal
+} from "../../dist/coordination/workMailbox.js";
+import {
   bindTaskRoleRun,
   createRoleSessionSet,
   updateRoleAgentSessionStatus
 } from "../../dist/executor/agentExecutor.js";
 import { runProjectCommand } from "../../dist/commands/projectCommands.js";
 import { runTaskIntegrationCommand } from "../../dist/commands/taskIntegrationCommands.js";
-import { runTaskCommand } from "../../dist/commands/taskCommands.js";
+import {
+  dispatchPreparedReviewRound,
+  runTaskCommand
+} from "../../dist/commands/taskCommands.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import {
   createGlobalRole,
@@ -30,8 +39,12 @@ import {
   updateRole
 } from "../../dist/role/role.js";
 import { yieldAgentRun } from "../../dist/run/agentRun.js";
+import {
+  createReviewRound
+} from "../../dist/review/reviewRound.js";
 import { createAgentRun, recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 import { createProject } from "../../dist/repository/project.js";
+import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
 import { TaskWorkspaceCoordinator } from "../../dist/repository/taskWorkspaceCoordinator.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
@@ -39,6 +52,7 @@ import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, completeTask, createTask } from "../../dist/task/task.js";
 import {
   createWorkItem,
+  createCandidateGitSnapshot,
   recordWorkItemWorkspaceDisposition,
   submitWorkItemCandidate,
   updateWorkItemWriteProjects,
@@ -129,6 +143,34 @@ function savePlannerRun(store, taskId, roleName, context = {}) {
   store.saveAgentRun(run);
   store.saveActiveAgentRun(run);
   return run;
+}
+
+function markDelivered(store, run) {
+  store.transaction((tx) => {
+    const target = { kind: "role", taskId: run.taskId, roleName: run.roleName };
+    let mailbox = tx.getWorkMailbox(target) ?? createWorkMailbox(target);
+    if (mailbox.processing === null) {
+      if (mailbox.pending === null) {
+        mailbox = enqueueSignal(mailbox, {
+          reason: "fixture-run-dispatched",
+          refs: [{ type: "run", taskId: run.taskId, id: run.id }],
+          occurredAt: NOW.toISOString()
+        });
+      }
+      const batchId = `agent-run:${run.taskId}/${run.id}`;
+      mailbox = bindExecution(
+        claimPending(mailbox, {
+          batchId,
+          owner: "controller",
+          startedAt: NOW.toISOString()
+        }),
+        batchId,
+        { type: "run", taskId: run.taskId, id: run.id }
+      );
+      tx.saveWorkMailbox(mailbox);
+    }
+    tx.saveAgentRun({ ...run, deliveredAt: NOW.toISOString() });
+  });
 }
 
 function liveSessionSet(status = "ready") {
@@ -876,6 +918,7 @@ test("a lazily copied reviewer starts from the prepared Project Task workspace",
   store.saveWorkItem(task.id, item);
   const running = updateWorkItemStatus(item, "running", NOW);
   store.saveWorkItem(task.id, running);
+  const mainWorkspace = store.getRoleWorkspace(task.id, "leader");
   const candidateRun = yieldAgentRun(createAgentRun(
     "agent-run-1",
     task.id,
@@ -883,23 +926,16 @@ test("a lazily copied reviewer starts from the prepared Project Task workspace",
     "new",
     "Produce a candidate.",
     NOW,
-    { workItemId: item.id }
+    { workItemId: item.id, workspace: mainWorkspace }
   ), "Candidate ready.", NOW);
   store.saveAgentRun(candidateRun);
-  const mainWorkspace = store.getRoleWorkspace(task.id, "leader");
-  assert.throws(
-    () => store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
-      summary: candidateRun.summary,
-      source: { type: "run", runId: candidateRun.id },
-      reviewPolicy: { roleName: "reviewer", trigger: "leader" },
-      workspace: mainWorkspace
-    }, NOW)),
-    /workspace does not match its source Run/
-  );
+  const gitSnapshot = await preparer.snapshotCandidateWorkspace(mainWorkspace);
   store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
     summary: candidateRun.summary,
     source: { type: "run", runId: candidateRun.id },
-    reviewPolicy: { roleName: "reviewer", trigger: "leader" }
+    reviewPolicy: { roleName: "reviewer", trigger: "leader" },
+    workspace: mainWorkspace,
+    gitSnapshot
   }, NOW));
 
   runTaskCommand(["work", "review", item.id], store, {
@@ -911,8 +947,19 @@ test("a lazily copied reviewer starts from the prepared Project Task workspace",
     }
   });
 
-  assert.equal(store.getRole(task.id, "reviewer").workspace, main);
-  const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
+  const round = store.listReviewRounds(task.id)[0];
+  assert.equal(round.status, "pending");
+  const reviewWorkspace = await preparer.prepareReviewRoundWorkspace(task.id, round.id);
+  const reviewRun = dispatchPreparedReviewRound(task.id, round.id, store, {
+    now: () => new Date(NOW)
+  });
+  assert.notEqual(reviewWorkspace.root, main);
+  assert.deepEqual(reviewWorkspace.owner, {
+    type: "review-round",
+    reviewRoundId: round.id
+  });
+  assert.equal(reviewWorkspace.entries.every(({ access }) => access === "write"), true);
+  assert.equal(store.getRole(task.id, "reviewer").workspace, reviewWorkspace.root);
   assert.doesNotThrow(() => new FileRoleLaunchPlanner(home, store, {
     cliPath: "/dist/cli.js"
   }).plan({
@@ -982,11 +1029,13 @@ test("a reviewer launches from the candidate Run workspace instead of its previo
     { workItemId: item.id, workspace: isolated }
   ), "Candidate ready.", NOW);
   store.saveAgentRun(candidateRun);
+  const gitSnapshot = await preparer.snapshotCandidateWorkspace(isolated);
   store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
     summary: candidateRun.summary,
     source: { type: "run", runId: candidateRun.id },
     reviewPolicy: { roleName: "reviewer", trigger: "leader" },
-    workspace: isolated
+    workspace: isolated,
+    gitSnapshot
   }, NOW));
 
   runTaskCommand(["work", "review", item.id], store, {
@@ -998,10 +1047,17 @@ test("a reviewer launches from the candidate Run workspace instead of its previo
     }
   });
 
-  const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
-  assert.equal(reviewRun.workspace.root, isolated.root);
-  assert.equal(reviewRun.workspace.owner.workItemId, item.id);
-  assert.equal(reviewRun.workspace.entries.every(({ access }) => access === "read"), true);
+  const round = store.listReviewRounds(task.id)[0];
+  const reviewWorkspace = await preparer.prepareReviewRoundWorkspace(task.id, round.id);
+  const reviewRun = dispatchPreparedReviewRound(task.id, round.id, store, {
+    now: () => new Date(NOW)
+  });
+  assert.notEqual(reviewRun.workspace.root, isolated.root);
+  assert.deepEqual(reviewRun.workspace.owner, {
+    type: "review-round",
+    reviewRoundId: round.id
+  });
+  assert.equal(reviewRun.workspace.entries.every(({ access }) => access === "write"), true);
   const plan = new FileRoleLaunchPlanner(home, store, {
     cliPath: "/dist/cli.js"
   }).plan({
@@ -1012,8 +1068,179 @@ test("a reviewer launches from the candidate Run workspace instead of its previo
     effective: reviewRun.effective,
     mode: "new"
   });
-  assert.equal(plan.role.workspace, isolated.root);
-  assert.equal(plan.launch.env.YUI_WORKSPACE, isolated.root);
+  assert.equal(plan.role.workspace, reviewWorkspace.root);
+  assert.equal(plan.launch.env.YUI_WORKSPACE, reviewWorkspace.root);
+});
+
+test("a ReviewRound worktree starts at the frozen Candidate commit and cleans up independently", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Review an immutable Candidate", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath, ["leader", "worker", "reviewer"]);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const item = createWorkItem("work-item-1", task.id, {
+    title: "Review the isolated result",
+    assignee: "worker",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const workerWorkspace = await preparer.prepareWorkItemWorkspace(task.id, item.id);
+  const workerEntry = workerWorkspace.entries[0];
+  writeFileSync(join(workerEntry.path, "candidate.txt"), "candidate bytes\n");
+  execFileSync("git", ["-C", workerEntry.path, "add", "candidate.txt"]);
+  execFileSync("git", ["-C", workerEntry.path, "commit", "-qm", "candidate"]);
+  const candidateCommit = execFileSync("git", ["-C", workerEntry.path, "rev-parse", "HEAD"], {
+    encoding: "utf8"
+  }).trim();
+  const candidateBytes = readFileSync(join(workerEntry.path, "candidate.txt"), "utf8");
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  const candidateRun = yieldAgentRun(createAgentRun(
+    "agent-run-1",
+    task.id,
+    "worker",
+    "new",
+    "Produce the Candidate.",
+    NOW,
+    { workItemId: item.id, workspace: workerWorkspace }
+  ), "Candidate ready.", NOW);
+  store.saveAgentRun(candidateRun);
+  const gitSnapshot = createCandidateGitSnapshot(workerWorkspace, [{
+    projectId: project.id,
+    commit: candidateCommit
+  }]);
+  const submitted = submitWorkItemCandidate(running, {
+    summary: candidateRun.summary,
+    source: { type: "run", runId: candidateRun.id },
+    reviewPolicy: { roleName: "reviewer", trigger: "leader" },
+    workspace: workerWorkspace,
+    gitSnapshot
+  }, NOW);
+  store.saveWorkItem(task.id, submitted);
+  const round = createReviewRound(
+    "review-round-1",
+    task.id,
+    item.id,
+    submitted.candidates[0].id,
+    "reviewer",
+    "leader",
+    candidateCommit,
+    NOW
+  );
+  store.saveReviewRound(task.id, round);
+
+  const reviewWorkspace = await preparer.prepareReviewRoundWorkspace(task.id, round.id);
+  const reviewRun = dispatchPreparedReviewRound(task.id, round.id, store, {
+    now: () => new Date(NOW)
+  });
+  markDelivered(store, reviewRun);
+  const reviewEntry = reviewWorkspace.entries[0];
+  assert.deepEqual(reviewWorkspace.owner, {
+    type: "review-round",
+    reviewRoundId: round.id
+  });
+  assert.equal(reviewEntry.access, "write");
+  assert.notEqual(reviewEntry.path, workerEntry.path);
+  assert.equal(
+    execFileSync("git", ["-C", reviewEntry.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+    candidateCommit
+  );
+  writeFileSync(join(reviewEntry.path, "reproduction.test.js"), "review evidence\n");
+  execFileSync("git", ["-C", reviewEntry.path, "add", "reproduction.test.js"]);
+  execFileSync("git", ["-C", reviewEntry.path, "commit", "-qm", "diagnostic evidence"]);
+  const evidenceCommit = execFileSync(
+    "git",
+    ["-C", reviewEntry.path, "rev-parse", "HEAD"],
+    { encoding: "utf8" }
+  ).trim();
+  assert.notEqual(evidenceCommit, candidateCommit);
+  assert.equal(
+    execFileSync("git", ["-C", workerEntry.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+    candidateCommit
+  );
+  assert.equal(readFileSync(join(workerEntry.path, "candidate.txt"), "utf8"), candidateBytes);
+
+  const candidateCount = store.getWorkItem(task.id, item.id).candidates.length;
+  runTaskCommand([
+    "run", "yield", reviewRun.id,
+    "--summary", "Diagnostic evidence recorded."
+  ], store, {
+    now: () => new Date(NOW),
+    environment: { YUI_TASK_ID: task.id },
+    reviewResult: {
+      checks: [{ name: "fixture test", outcome: "passed" }],
+      evidenceCommit
+    }
+  });
+  assert.equal(store.getReviewRound(task.id, round.id).evidenceCommit, evidenceCommit);
+  assert.equal(store.getReviewRound(task.id, round.id).status, "completed");
+  assert.deepEqual(store.getReviewRound(task.id, round.id).checks, [{
+    name: "fixture test",
+    outcome: "passed"
+  }]);
+  assert.equal(store.getWorkItem(task.id, item.id).candidates.length, candidateCount);
+  assert.deepEqual(store.listChangeSets(task.id), []);
+  assert.throws(
+    () => runTaskCommand([
+      "run", "yield", reviewRun.id,
+      "--summary", "Late duplicate."
+    ], store, {
+      now: () => new Date(NOW),
+      environment: { YUI_TASK_ID: task.id }
+    }),
+    /already terminal/i
+  );
+  assert.throws(
+    () => store.saveChangeSet(task.id, createWorkItemChangeSet({
+      id: store.nextChangeSetId(task.id),
+      taskId: task.id,
+      workItemId: item.id,
+      projectId: project.id,
+      baseCommit: candidateCommit,
+      headCommit: evidenceCommit,
+      branch: reviewEntry.branch,
+      changedPaths: ["reproduction.test.js"]
+    }, NOW)),
+    /ReviewRound evidence commit.*cannot become a ChangeSet/i
+  );
+  assert.throws(
+    () => runTaskCommand([
+      "work", "accept", item.id,
+      "--summary", "Do not accept review evidence."
+    ], store, {
+      now: () => new Date(NOW),
+      environment: {
+        YUI_SESSION_SCOPE: "task",
+        YUI_TASK_ID: task.id,
+        YUI_ROLE: "leader"
+      },
+      workItemIntegrationProof: {
+        workItemId: item.id,
+        assignee: "reviewer",
+        workspace: reviewWorkspace,
+        projects: [{
+          projectId: project.id,
+          baseCommit: candidateCommit,
+          headCommit: evidenceCommit
+        }]
+      }
+    }),
+    /ReviewRound-owned workspace.*acceptance/i
+  );
+  assert.equal(await preparer.cleanupReviewRoundWorkspace(task.id, round.id), "removed");
+  assert.equal(existsSync(reviewEntry.path), false);
+  assert.equal(existsSync(workerEntry.path), true);
+  assert.equal(
+    execFileSync("git", ["-C", workerEntry.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+    candidateCommit
+  );
 });
 
 test("a multi-Project Task and WorkItem expose one root with per-Project access", async (t) => {

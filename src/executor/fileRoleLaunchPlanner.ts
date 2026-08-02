@@ -144,7 +144,10 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           task.projectBindings.map(({ projectId }) => projectId)
         )
         && (runWorkspace.owner.type === "task"
-          || runWorkspace.owner.workItemId === activeRun?.workItemId);
+          || (runWorkspace.owner.type === "work-item"
+            && runWorkspace.owner.workItemId === activeRun?.workItemId)
+          || (runWorkspace.owner.type === "review-round"
+            && runWorkspace.owner.reviewRoundId === activeRun?.reviewRoundId));
       if (task.cwd === undefined || main === null || (!runScoped && !sharedMain && !isolated)) {
         throw new Error(`Role workspace is not ready: ${input.taskId}/${input.roleName}.`);
       }

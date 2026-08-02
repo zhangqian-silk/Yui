@@ -29,7 +29,11 @@ import {
 } from "../dist/executor/effectiveLaunch.js";
 import { FileRoleLaunchPlanner } from "../dist/executor/fileRoleLaunchPlanner.js";
 import { createProject } from "../dist/repository/project.js";
-import { createReviewRound, startReviewRound } from "../dist/review/reviewRound.js";
+import {
+  attachReviewRoundWorkspace,
+  createReviewRound,
+  startReviewRound
+} from "../dist/review/reviewRound.js";
 import {
   createRole,
   createRoleAgentBinding,
@@ -134,6 +138,11 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
   for (const [roleName, , , workspace, ,] of roleInputs) {
     if (workspace !== "pending") continue;
     const number = workspaces.size + 1;
+    const reviewRoundId = roleName === "codex-review"
+      ? "review-round-1"
+      : roleName === "claude-review"
+        ? "review-round-2"
+        : undefined;
     workspaces.set(roleName, fixtureWorkspace({
       root,
       sourceRepository,
@@ -141,8 +150,10 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
       taskId,
       roleName,
       label: roleName,
-      owner: { type: "work-item", workItemId: `work-item-${number}` },
-      access: roleName.includes("review") ? "read" : "write"
+      owner: reviewRoundId === undefined
+        ? { type: "work-item", workItemId: `work-item-${number}` }
+        : { type: "review-round", reviewRoundId },
+      access: "write"
     }));
   }
   const roles = new Map(roleInputs.map(([
@@ -248,12 +259,16 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
     claudeReview: reviews[1].effective
   };
 
-  for (const key of ["codexRead", "claudeRead", "codexReview", "claudeReview"]) {
+  for (const key of ["codexRead", "claudeRead"]) {
     assert.equal(effective[key].access, "read");
     assertReadOnlyAgentArgv(effective[key], plans[key].launch.args);
   }
   assertCodexWrite(plans.codexWrite.launch.args);
   assertClaudeWrite(plans.claudeWrite.launch.args);
+  assert.equal(effective.codexReview.access, "write");
+  assert.equal(effective.claudeReview.access, "write");
+  assertCodexWrite(plans.codexReview.launch.args);
+  assertClaudeWrite(plans.claudeReview.launch.args);
   for (const plan of Object.values(plans)) executePlan(plan);
   const initialCaptures = readCaptures(home);
 
@@ -384,15 +399,23 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
       .get("claude-write").entries.map((entry) => ({ ...entry, access: "read" })) },
     workItemWriteProjectIds: [project.id]
   }), /write scope does not match/i);
-  for (const reviewRole of ["codex-review", "claude-review"]) {
-    assert.throws(() => resolveEffectiveLaunch({
-      role: store.getRole(taskId, reviewRole),
-      purpose: "review",
-      workspace: workspaces.get(reviewRole),
-      workItemWriteProjectIds: [],
-      nativeReadOnlySupported: false
-    }), /cannot express native read-only access/i);
-  }
+  assert.throws(() => resolveEffectiveLaunch({
+    role: store.getRole(taskId, "codex-review"),
+    purpose: "review",
+    workspace: {
+      ...workspaces.get("codex-review"),
+      owner: { type: "review-round", reviewRoundId: "review-round-2" }
+    },
+    reviewRoundId: "review-round-1",
+    reviewBaseCommit: commit
+  }), /workspace owner does not match/i);
+  assert.throws(() => resolveEffectiveLaunch({
+    role: store.getRole(taskId, "profile-read"),
+    purpose: "execution",
+    workspace: workspaces.get("profile-read"),
+    workItemWriteProjectIds: [project.id],
+    nativeReadOnlySupported: false
+  }), /cannot express native read-only access/i);
 
   const context = runTaskCommand(["context", taskId], store).output;
   assert.match(context, /Desired drift:\s+pending next launch/i);
@@ -423,7 +446,7 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
       claudeReadOnly: true,
       codexWriteBypass: true,
       claudeWriteBypass: true,
-      reviewsForcedReadOnly: true,
+      isolatedReviewsFullCapability: true,
       desiredChangeNextLaunchOnly: true,
       scopeMismatchFailedClosed: true,
       nativeReadOnlyUnsupportedFailedClosed: true
@@ -465,23 +488,28 @@ function reviewFixture(store, role, workspace, workItemId, roundId, runId) {
   const running = runningItem(workItemId, role.taskId, undefined, ["project-1"]);
   const item = submitWorkItemCandidate(running, {
     summary: `Candidate for ${workItemId}`,
-    source: { type: "direct" },
-    workspace
+    source: { type: "direct" }
   }, START);
-  const round = startReviewRound(createReviewRound(
+  const pending = createReviewRound(
     roundId,
     role.taskId,
     workItemId,
     item.candidates[0].id,
     role.name,
     "leader",
+    workspace.entries[0].baseCommit,
     START
-  ), runId);
+  );
+  const round = startReviewRound(
+    attachReviewRoundWorkspace(pending, workspace),
+    runId
+  );
   const effective = resolveEffectiveLaunch({
     role,
     purpose: "review",
     workspace,
-    workItemWriteProjectIds: []
+    reviewRoundId: roundId,
+    reviewBaseCommit: workspace.entries[0].baseCommit
   });
   const run = createAgentRun(
     runId,
@@ -500,8 +528,8 @@ function reviewFixture(store, role, workspace, workItemId, roundId, runId) {
   );
   store.transaction((tx) => {
     tx.saveWorkItem(role.taskId, item);
-    tx.saveRoleWorkspace(role.taskId, workspace);
     tx.saveReviewRound(role.taskId, round);
+    tx.saveRoleWorkspace(role.taskId, workspace);
     tx.saveAgentRun(run);
     tx.saveActiveAgentRun(run);
     tx.saveRole(role.taskId, updateRoleStatus(role, "running", START));

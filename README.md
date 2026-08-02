@@ -141,10 +141,13 @@ or a Leader-managed direct result; `leader` leaves the candidate awaiting
 acceptance so the Leader can accept it directly or run
 `yui task work review <task-id>/<work-item-id>`. A configured review rule therefore keeps
 Leader-managed candidates awaiting a decision instead of marking them done.
-A ReviewRound references that immutable candidate, and its review AgentRun never creates
-another WorkItem or recursively triggers review. The natural-language review
-result wakes the Leader, who decides whether to accept, reject and redispatch
-the original Role in its existing Session, review again, or request user input.
+A ReviewRound freezes the Candidate's exact Git commit and creates a fresh,
+ReviewRound-owned writable worktree on a unique branch. Its AgentRun may edit,
+test, and optionally commit diagnostic evidence there, but never changes the
+Candidate or Worker workspace and never creates another WorkItem, Candidate,
+ChangeSet, or recursive review. The result wakes the Leader, who decides whether
+to route evidence to the original Worker, accept, reject and redispatch that
+Worker in its existing Session, review again, or request user input.
 A failed review remains visible evidence and wakes the Leader, but does not
 take that decision away from the Leader.
 Candidate history, every ReviewRound, and the Leader decision remain grouped
@@ -180,9 +183,9 @@ keeps the same relative layout, creates isolated worktrees only for that write
 scope, and exposes the other Task Projects as context from Task main. Yui puts
 the exact writable and context-only Project lists into the managed dispatch and
 the `yui-worker` Skill requires the Agent to honor that boundary. Native Agent
-permissions remain session-wide: use a write-capable session for implementation
-and a native read-only session (Codex `read-only` or Claude `dontAsk` with a
-small allow list) for explorer and reviewer Roles.
+permissions remain session-wide: use native read-only for an explorer, and
+allow the configured reviewer full local capability only in its exact
+ReviewRound-owned worktree.
 
 Write scope may only expand. The Leader supplies the complete old-plus-new set
 after a Worker yields and reports that another repository is required; an
@@ -261,10 +264,11 @@ can compile to `--dangerously-bypass-approvals-and-sandbox` for Codex or
 `--dangerously-skip-permissions` for Claude only when a write Profile, an exact
 WorkItem write scope, and a matching writable managed workspace all agree.
 `--clear-yolo` affects the next launch. A Gitless Task, a non-WorkItem Run, an
-empty write scope, a read Profile, or any ReviewRound is native read-only;
-ReviewRound launches enforce this for both Codex and Claude and fail closed if
-the adapter cannot express it. The exact Yui yield command remains available
-inside that read-only boundary.
+empty write scope, or a read Profile is native read-only. A ReviewRound is the
+only non-WorkItem write purpose: it receives write/bypass only when its Run,
+reviewRoundId, frozen base, and ReviewRound-owned workspace match exactly;
+every mismatch fails closed. Its diagnostic commit is visible history but is
+explicitly rejected by capture, ChangeSet, Integration, and acceptance paths.
 
 Every Role desired launch change increments its revision and applies only to a
 future launch. Each AgentRun and native Role Session stores the complete actual

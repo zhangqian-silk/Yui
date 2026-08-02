@@ -13,6 +13,7 @@ import {
   updateRoleAgentSessionStatus
 } from "../../dist/executor/agentExecutor.js";
 import {
+  validateAgentRun,
   yieldAgentRun
 } from "../../dist/run/agentRun.js";
 import {
@@ -26,6 +27,7 @@ import {
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { createTaskMessage } from "../../dist/message/message.js";
+import { createRoleWorkspace } from "../../dist/worktree/roleWorkspace.js";
 
 const now = new Date("2026-07-19T12:00:00.000Z");
 const later = new Date("2026-07-19T12:01:00.000Z");
@@ -274,6 +276,62 @@ test("restored persistent domain records are plain JSON with explicit schema ver
   assert.equal(snapshot.yielded.purpose, "execution");
   assert.equal(snapshot.yielded.status, "yielded");
   assert.equal(snapshot.yielded.endedAt, later.toISOString());
+});
+
+test("a writable Review Run requires its exact ReviewRound-owned workspace", () => {
+  const reviewWorkspace = createRoleWorkspace({
+    taskId: "task-1",
+    roleName: "reviewer",
+    owner: { type: "review-round", reviewRoundId: "review-round-1" },
+    root: "/fixture/reviews/review-round-1",
+    entries: [{
+      projectId: "project-1",
+      directory: "Yui",
+      access: "write",
+      path: "/fixture/reviews/review-round-1/Yui",
+      branch: "yui/task-1/review-round-1",
+      baseRef: "b".repeat(40),
+      baseCommit: "b".repeat(40)
+    }]
+  }, now);
+  const run = createAgentRun(
+    "agent-run-1",
+    "task-1",
+    "reviewer",
+    "new",
+    "Review the Candidate.",
+    now,
+    {
+      purpose: "review",
+      workItemId: "work-item-1",
+      reviewRoundId: "review-round-1",
+      reviewBaseCommit: "b".repeat(40),
+      workspace: reviewWorkspace
+    }
+  );
+
+  assert.doesNotThrow(() => validateAgentRun(run));
+  assert.equal(run.effective.access, "write");
+  assert.equal(run.effective.reviewRoundId, "review-round-1");
+  assert.equal(run.workspace.owner.reviewRoundId, "review-round-1");
+  assert.throws(
+    () => validateAgentRun(createAgentRun(
+      "agent-run-2",
+      "task-1",
+      "reviewer",
+      "new",
+      "Review from a mismatched Round.",
+      now,
+      {
+        purpose: "review",
+        workItemId: "work-item-1",
+        reviewRoundId: "review-round-2",
+        reviewBaseCommit: "b".repeat(40),
+        workspace: reviewWorkspace
+      }
+    )),
+    /ReviewRound workspace owner.*review-round-2/i
+  );
 });
 
 test("Task follows the retained draft, active, archived lifecycle", () => {

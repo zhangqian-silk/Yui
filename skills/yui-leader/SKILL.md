@@ -106,15 +106,15 @@ Choose before creating the WorkItem:
   credentials, user-owned independent Session, durable lifecycle, or repeated
   dispatches to a Task-bound Worker instance.
 
-Keep review execution separate from implementation. A reviewer Role uses a
-read-only Profile and native read-only Agent permission, and must not receive a
-writable WorkItem or reuse an implementation Role Session. A Claude reviewer
-uses native `dontAsk` mode with only `Read`, `Grep`, `Glob`, and
-`Bash(yui task run yield *)` pre-approved. Unapproved tools are denied while
-the exact Yui control-plane handoff remains available without a classifier or
-approval prompt. Do not enable editing tools, YOLO, or a writable permission
-mode for review. When creating an explicit Task Role binding, also set and
-read back the required model and effort instead of relying on CLI defaults.
+Keep review execution separate from implementation. A reviewer uses the single
+built-in write-capable `reviewer` Profile, but Yui grants that capability only
+inside a fresh ReviewRound-owned worktree created from the frozen Candidate
+commit. Never reuse the Candidate/Worker workspace or its implementation Role
+Session. Codex and Claude may use their normal configured full capability in
+that isolated worktree; the behavioral boundary forbids push, Integration,
+Task mutation, other workspaces, stable checkouts, and real YUI_HOME. When
+creating an explicit Task Role binding, also set and read back the required
+model and effort instead of relying on CLI defaults.
 
 A direct or native-subagent WorkItem is roleless. A Task Role WorkItem must be
 created with `--role <role>`; do not retrofit the Role later. Reuse a compatible
@@ -127,12 +127,12 @@ inspect the available Profiles:
 yui profile list
 ```
 
-Choose the Profile by the work's meaning. Use `explorer`, `reviewer`, or another
-read-only Profile for inspection and review. Use `implementer` for work expected
-to modify files or external state. Do not send an implementation brief to a
-read-only Worker and rely on that Worker to repair the routing mistake. If one
-WorkItem may write at any stage, use a write-capable Profile; split out a
-read-only investigation only when it is independently useful.
+Choose the Profile by the work's meaning. Use `explorer` for read-only
+inspection, `reviewer` only for ReviewRound isolation, and `implementer` for a
+Worker expected to modify its declared Project scope. Do not use the reviewer
+Profile as a general implementation Role. If one WorkItem may write at any
+stage, use a write-capable implementation Profile; split out a read-only
+investigation only when it is independently useful.
 
 ## Decompose
 
@@ -301,6 +301,11 @@ ReviewRounds, checks, and workspace through `task context`.
   new `task work review`, accept with an explicit rationale, or ask the user.
 - If the same ambiguity or external choice repeats, persist context and create
   an InputRequest instead of looping.
+- A Reviewer may leave an optional diagnostic commit. Route its SHA and
+  findings explicitly to the original Worker; never capture, integrate, accept,
+  or auto-merge the review workspace. After routing, use
+  `yui task work review cleanup <task>/<review-round>` or preserve it explicitly
+  for further diagnosis. Cleanup removes only the ReviewRound workspace.
 
 - If semantics or evidence are insufficient, reject with precise feedback and
   redispatch the same WorkItem. Keep the isolated workspace so the Worker can

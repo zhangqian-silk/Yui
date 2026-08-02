@@ -129,7 +129,8 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
   assert.match(leader, /A Profile is required for this path/u);
   assert.match(leader, /Ignore all Task Role Agent bindings/u);
   assert.match(leader, /executor=subagent; profile=reviewer@3/u);
-  assert.match(leader, /Bash\(yui task run yield \*\).*control-plane handoff/us);
+  assert.match(leader, /fresh ReviewRound-owned worktree.*frozen Candidate/usi);
+  assert.match(leader, /never capture, integrate, accept,\s+or auto-merge the review workspace/usi);
   assert.match(
     leader,
     /`--check` commands run from the selected Project's integration candidate root[\s\S]*not\s+`cd <project> && npm test`/u
@@ -152,13 +153,13 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
   assert.match(worker, /result and records the actual Profile revision/u);
   assert.match(
     worker,
-    /review Run uses a native read-only permission mode[\s\S]*Do not request approval[\s\S]*yield\s+the Run/u
+    /Every review Run is bound to one frozen Candidate commit[\s\S]*separate\s+ReviewRound-owned writable worktree[\s\S]*only authority to work locally/u
   );
   assert.match(
     worker,
-    /one bounded evidence pass[\s\S]*Do not repeat successful checks[\s\S]*yield\s+immediately/u
+    /one bounded evidence pass[\s\S]*Do not repeat successful\s+checks[\s\S]*yield immediately/ui
   );
-  assert.match(worker, /do not wrap it in `until`[\s\S]*If the direct command is denied[\s\S]*stop instead of retrying/u);
+  assert.match(worker, /do not wrap it in `until`[\s\S]*duplicate or late\s+review yield is obsolete/u);
 });
 
 test("publish builds once and smokes the same package on Node 20, 22, and 24", () => {

@@ -104,6 +104,14 @@ async function start(
     if (changeSet === null) throw usageError(`ChangeSet not found: ${id}.`);
     return changeSet;
   });
+  const reviewEvidence = new Set(store.listReviewRounds(task.id)
+    .flatMap(({ evidenceCommit }) => evidenceCommit === undefined ? [] : [evidenceCommit]));
+  const reviewSource = changeSets.find(({ headCommit }) => reviewEvidence.has(headCommit));
+  if (reviewSource !== undefined) {
+    throw usageError(
+      `ReviewRound evidence commit cannot become an Integration source: ${reviewSource.id}.`
+    );
+  }
   const projectIds = [...new Set(changeSets.map(({ projectId }) => projectId))];
   if (projectIds.length !== 1) {
     throw usageError("An Integration may only contain ChangeSets from one Project.");

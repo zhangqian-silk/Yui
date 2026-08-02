@@ -74,7 +74,11 @@ the fresh directory. In the same direct cutover it creates versioned Role
 desired configuration and immutable effective AgentRun/RoleSession snapshots.
 Missing legacy permission facts are never guessed: legacy effective snapshots
 are marked `legacy-cutover`, forced read-only, and are not resumable. The output
-is validated through the normal `FileTaskStore` with zero dangling references.
+also records historical terminal ReviewRounds as `legacy-unavailable` when the
+old format did not persist a frozen Candidate commit. An active legacy review
+cannot be reconstructed safely and makes conversion fail closed. New reviews
+always carry a frozen commit and ReviewRound-owned workspace. The output is
+validated through the normal `FileTaskStore` with zero dangling references.
 The converter also writes `identity-conversion.json` with the source hash and
 per-Task record counts, then checks the source bytes again before returning.
 The operation fails on a dangling or ambiguous legacy reference and removes

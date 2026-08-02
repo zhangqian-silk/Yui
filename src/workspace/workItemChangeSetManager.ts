@@ -61,6 +61,11 @@ export class WorkItemChangeSetManager {
     if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
     if (item.assignee === undefined) return null;
     const workspace = this.store.getRoleWorkspace(item.taskId, item.assignee);
+    if (workspace?.owner.type === "review-round") {
+      throw new Error(
+        `ReviewRound-owned workspace cannot provide WorkItem integration proof: ${workspace.owner.reviewRoundId}.`
+      );
+    }
     if (
       workspace === null
       || workspace.owner.type !== "work-item"
@@ -233,6 +238,11 @@ function requireCapturableContext(
     throw new Error(`Task is not active: ${task.id}/${task.status}.`);
   }
   const workspace = store.getRoleWorkspace(task.id, item.assignee);
+  if (workspace?.owner.type === "review-round") {
+    throw new Error(
+      `ReviewRound-owned workspace cannot be captured: ${workspace.owner.reviewRoundId}.`
+    );
+  }
   if (
     workspace === null
     || workspace.owner.type !== "work-item"

@@ -188,6 +188,9 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
               : item.candidates.flatMap((candidate) => [
                   `    Candidate ${candidate.sequence}: ${candidate.id}${item.status === "awaiting_acceptance" && candidate === item.candidates.at(-1) ? " [current]" : ""} (${candidate.source.type === "run" ? candidate.source.runId : "direct"})`,
                   `      Review policy: ${candidate.reviewPolicy === undefined ? "none" : `${candidate.reviewPolicy.roleName} (${candidate.reviewPolicy.trigger})`}`,
+                  `      Frozen Git: ${candidate.gitSnapshot === undefined
+                    ? "unavailable"
+                    : `${candidate.gitSnapshot.reviewBaseCommit} (${candidate.gitSnapshot.projects.length} Projects)`}`,
                   `      Summary: ${compactText(candidate.summary)}`
                 ])),
             ...(latestRun === undefined
@@ -282,6 +285,15 @@ function renderWorkItemReviews(
   if (latest === undefined) return ["    ReviewRounds: none."];
   return [
     `    ReviewRounds: ${rounds.length}; latest ${latest.id} [${latest.status}] for ${latest.candidateId} via ${latest.reviewerRoleName} (${latest.requestedBy})`,
+    `      Review base: ${latest.reviewBaseProvenance}; ${latest.reviewBaseCommit ?? "unavailable"}`,
+    `      Review workspace: ${latest.workspace === undefined
+      ? "not prepared"
+      : `${latest.workspace.root} (${latest.workspace.entries.length} writable Projects)`}`,
+    `      Workspace disposition: ${latest.workspaceDisposition?.kind ?? "pending"}`,
+    `      Diagnostic evidence: ${latest.evidenceCommit ?? "none"}`,
+    `      Checks: ${latest.checks === undefined || latest.checks.length === 0
+      ? "none"
+      : latest.checks.map(({ name, outcome }) => `${name}=${outcome}`).join(", ")}`,
     ...(latest.summary === undefined
       ? []
       : [`      Review summary: ${compactText(latest.summary)}`])

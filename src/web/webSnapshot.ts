@@ -11,6 +11,7 @@ export type WebDashboardStore = Pick<TaskStore,
   | "getTaskRoleSessionSet"
   | "listWorkItems"
   | "listAgentRuns"
+  | "listReviewRounds"
   | "listInputRequests"
   | "listMessages"
   | "listDecisions"
@@ -115,6 +116,7 @@ export function buildWebTaskDetail(store: WebDashboardStore, taskId: string): ob
       roles,
       workItems: reader.listWorkItems(taskId),
       runs,
+      reviewRounds: reader.listReviewRounds(taskId),
       openInputs: inputs.filter((request) => request.status === "open"),
       messages: reader.listMessages(taskId),
       decisions: reader.listDecisions(taskId),

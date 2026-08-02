@@ -175,7 +175,7 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
   assert.equal("agentId" in store.getAgentProfile("worker"), false);
   assert.equal(store.getAgentProfile("explorer").defaultAccess, "read");
   assert.equal(store.getAgentProfile("implementer").defaultAccess, "write");
-  assert.equal(store.getAgentProfile("reviewer").defaultAccess, "read");
+  assert.equal(store.getAgentProfile("reviewer").defaultAccess, "write");
   assert.equal(existsSync(join(home, "worktrees")), false);
   assert.deepEqual(store.getGlobalRole("operator").agentBindings.codex.config, {
     adapterId: "codex",

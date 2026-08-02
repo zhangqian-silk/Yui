@@ -59,27 +59,31 @@ The managed input names the current Run ID. Before ending, execute its exact:
 yui task run yield <current-run-id> --summary "<outcome and evidence>"
 ```
 
-When a review Run uses a native read-only permission mode, treat that mode only
-as the execution boundary. Do not request approval, change permission mode, or
-present an implementation plan. Complete the review, report its evidence, and
-yield the Run through the required Yui command. Invoke that exact `yui task run
-yield ...` command directly once; do not wrap it in `until`, `while`, `sh -c`,
-`cd ... &&`, or another compound shell command that no longer matches its
-session allow rule. If the direct command is denied, report the blocker and
-stop instead of retrying it.
+Every review Run is bound to one frozen Candidate commit and a separate
+ReviewRound-owned writable worktree. Full native Codex or Claude capability is
+only authority to work locally inside that exact review worktree. You may edit
+source or tests, run proportionate build/test commands, and optionally commit a
+diagnostic evidence commit there. Never push, integrate, mutate Task records,
+touch the Candidate or Worker workspace, another Task/worktree, a stable
+checkout, or real YUI_HOME.
 
-For every review Run, make one bounded evidence pass: inspect the relevant
-change and callers, run proportionate checks available inside the read-only
-session once, and judge the core outcome. Do not repeat successful checks or
-invent extra edge-case probes without concrete defect evidence. Once the
-requested evidence is sufficient, yield immediately.
+Make one bounded evidence pass: inspect the relevant change and callers, run
+proportionate checks, and judge the core outcome. Do not repeat successful
+checks or invent extra edge-case probes without concrete defect evidence. Once
+the requested evidence is sufficient, yield immediately. Invoke the exact
+`yui task run yield ...` command directly once; do not wrap it in `until`,
+`while`, `sh -c`, `cd ... &&`, or another compound command. A duplicate or late
+review yield is obsolete; do not retry it.
 
-Include the result, changed paths, checks, residual risk, and blockers. Printing
-a final response without executing `yield` does not deliver the Run. Yield ends
-the AgentRun and appends an immutable Candidate to the same WorkItem; it does
-not accept or complete the WorkItem.
+Include the result, changed paths, review base, optional evidence commit,
+checks, residual risk, and blockers. Printing a final response without
+executing `yield` does not deliver the Run. Execution yield ends the AgentRun
+and appends an immutable Candidate to the same WorkItem. Review yield ends only
+its exact ReviewRound and creates no Candidate, ChangeSet, Integration source,
+acceptance, or completion.
 
-Leave an isolated workspace intact. If the Leader rejects the result, continue
-the next dispatched round in that same workspace and original native Session,
-then append a new Candidate and address the recorded feedback. The Leader owns
-review selection, capture, integration, acceptance, and cleanup.
+Leave managed workspaces intact. The Leader may route a ReviewRound evidence
+SHA or findings back to the original Worker, which continues in its unchanged
+workspace and native Session. The Leader owns review selection, Review
+workspace preserve/cleanup, Worker redispatch, capture, integration, and
+acceptance; review evidence is never merged automatically.

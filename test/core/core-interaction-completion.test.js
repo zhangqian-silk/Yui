@@ -131,6 +131,8 @@ const PUBLIC_PATHS = [
   "task work capture",
   "task work cleanup",
   "task work review",
+  "task work review cleanup",
+  "task work review preserve",
   "task work accept",
   "task work reject",
   "task work cancel",

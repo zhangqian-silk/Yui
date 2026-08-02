@@ -442,22 +442,9 @@ function convertTaskAggregate(conversion: TaskConversion): JsonObject {
     agentRuns: convertFamily(conversion, "agentRun", (record, oldId, id) => (
       convertAgentRun(record, oldId, id, conversion)
     )),
-    reviewRounds: convertFamily(conversion, "reviewRound", (record, oldId, id) => ({
-      ...record,
-      id,
-      taskId: conversion.taskId,
-      workItemId: mapped(conversion, "workItem", record.workItemId, "ReviewRound Work Item"),
-      candidateId: mappedCandidate(
-        conversion,
-        text(record.workItemId, "ReviewRound Work Item id"),
-        record.candidateId
-      ),
-      ...(record.reviewerRunId === undefined
-        ? {}
-        : { reviewerRunId: mapped(
-            conversion, "agentRun", record.reviewerRunId, "ReviewRound Reviewer Run"
-          ) })
-    })),
+    reviewRounds: convertFamily(conversion, "reviewRound", (record, oldId, id) => (
+      convertReviewRound(record, id, conversion)
+    )),
     activeRuns: convertNamedMap(source.activeRuns, (value) => {
       const pointer = object(value, "Active Run pointer");
       return {
@@ -579,6 +566,14 @@ function convertAgentRun(
   const workspace = convertedWorkspace === undefined
     ? legacyRoleWorkspace(role, conversion.source.task)
     : effectiveWorkspace(convertedWorkspace);
+  const convertedReviewRoundId = record.reviewRoundId === undefined
+    ? undefined
+    : mapped(conversion, "reviewRound", record.reviewRoundId, "Agent Run ReviewRound");
+  if (convertedReviewRoundId !== undefined && record.status === "active") {
+    throw new Error(
+      `Source active review Run cannot be converted without frozen launch provenance: ${oldId}.`
+    );
+  }
   const { agentId: _agentId, adapterId: _adapterId, model: _model, effort: _effort, ...rest } = record;
   return {
     ...rest,
@@ -589,11 +584,9 @@ function convertAgentRun(
     ...(record.workItemId === undefined
       ? {}
       : { workItemId: mapped(conversion, "workItem", record.workItemId, "Agent Run Work Item") }),
-    ...(record.reviewRoundId === undefined
+    ...(convertedReviewRoundId === undefined
       ? {}
-      : { reviewRoundId: mapped(
-          conversion, "reviewRound", record.reviewRoundId, "Agent Run ReviewRound"
-        ) }),
+      : { reviewRoundId: convertedReviewRoundId }),
     ...(convertedWorkspace === undefined
       ? {}
       : { workspace: convertedWorkspace }),
@@ -604,8 +597,43 @@ function convertAgentRun(
       ...(record.model === undefined ? {} : { model: text(record.model, "Source Agent Run model") }),
       ...(record.effort === undefined ? {} : { effort: text(record.effort, "Source Agent Run effort") }),
       workspace,
-      context: role === undefined ? {} : legacyRoleContext(object(role, "Source Agent Run Role"))
+      context: role === undefined ? {} : legacyRoleContext(object(role, "Source Agent Run Role")),
+      ...(convertedReviewRoundId === undefined
+        ? {}
+        : { reviewRoundId: convertedReviewRoundId })
     }))
+  };
+}
+
+function convertReviewRound(
+  record: JsonObject,
+  id: string,
+  conversion: TaskConversion
+): JsonObject {
+  const status = text(record.status, "Source ReviewRound status");
+  if (status === "pending" || status === "running") {
+    throw new Error(
+      `Source active ReviewRound cannot be converted without a frozen Candidate commit: ${record.id}.`
+    );
+  }
+  return {
+    ...record,
+    schemaVersion: 2,
+    id,
+    taskId: conversion.taskId,
+    workItemId: mapped(conversion, "workItem", record.workItemId, "ReviewRound Work Item"),
+    candidateId: mappedCandidate(
+      conversion,
+      text(record.workItemId, "ReviewRound Work Item id"),
+      record.candidateId
+    ),
+    reviewBaseProvenance: "legacy-unavailable",
+    checks: [],
+    ...(record.reviewerRunId === undefined
+      ? {}
+      : { reviewerRunId: mapped(
+          conversion, "agentRun", record.reviewerRunId, "ReviewRound Reviewer Run"
+        ) })
   };
 }
 

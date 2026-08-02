@@ -80,6 +80,21 @@ export class TaskWorkspaceCoordinator {
     return this.preparer.cleanupWorkItemWorkspace(item.taskId, item.id, disposition);
   }
 
+  async cleanupReviewRound(
+    taskId: string,
+    reviewRoundId: string
+  ): Promise<GitWorkspaceRemoval> {
+    const round = this.store.getReviewRound(taskId, reviewRoundId);
+    if (round === null) throw new Error(`ReviewRound not found: ${taskId}/${reviewRoundId}.`);
+    if (round.status !== "completed" && round.status !== "failed") {
+      throw new Error(`ReviewRound must be terminal before cleanup: ${round.id}.`);
+    }
+    const state = await this.preparer.inspectReviewRoundWorkspace(taskId, reviewRoundId);
+    if (state === "dirty") return "dirty";
+    await this.#stopLiveRoles(taskId, [round.reviewerRoleName]);
+    return this.preparer.cleanupReviewRoundWorkspace(taskId, reviewRoundId);
+  }
+
   async cleanupTaskForArchive(taskId: string): Promise<TaskWorkspaceCleanup> {
     try {
       const state = await this.preparer.inspectTaskMainWorkspace(taskId);

@@ -234,19 +234,19 @@ Project 时，只能由 active Leader 使用 `task project add` 追加。Yui 不
 Task main 是一个包含全部 Project peer directory 的逻辑根。WorkItem 可以读取
 全部 Task Project，但只允许修改其重复 `--project` 声明的写入范围；受管派发
 和 `yui-worker` Skill 必须清楚列出可写与仅上下文 Project。原生 Agent 权限是
-会话级而不是逐 Project 的；实现会话可写，reviewer 会话使用带最小 allow list
-的 Claude `dontAsk` 或 Codex `read-only`。写入范围只能扩大。
-Claude reviewer 的会话配置只预批准 `Read`、`Grep`、`Glob` 和
-`Bash(yui task run yield *)`：其余非只读工具直接拒绝，同时审查仍可完成 Yui
-控制面交接。yield 必须直接执行一次，不能包进 shell 循环或复合命令；不得启用
-编辑工具、切到 YOLO，或依赖需要在线分类器的权限模式。
+会话级而不是逐 Project 的；实现会话只写 WorkItem scope，reviewer 会话仅在
+exact ReviewRound-owned workspace 中使用正常 Codex/Claude full capability。
+Review 权限来自 frozen Candidate SHA、purpose、reviewRoundId 与 workspace owner
+的联合校验，并且必须回读真实启动参数。yield 仍直接执行一次，不能包进 shell
+循环或复合命令；Skill 禁止 push、Integration、Task state、其他 workspace 与
+真实 YUI_HOME 变更。
 `capture` 对每个实际修改的 Project 生成独立 ChangeSet，integration 保持
 单 Project 事务，所有修改 Project 的最新候选都已集成后才能 accept。
 
-Leader 根据工作语义选择 Profile：只读调查和评审使用 read-only Profile，
-修改代码或外部状态使用 `implementer`。reviewer Role 不承担实现 WorkItem，
-也不复用写权限会话；完整 E2E 必须回读 reviewer 的原生只读权限，并验证它仍然
-遵守只读 Profile、Skill 和 WorkItem 边界。
+Leader 根据工作语义选择 Profile：只读调查使用 `explorer`，正常实现使用
+`implementer`，评审仅使用单一 `reviewer` Profile 与独立 ReviewRound
+worktree。reviewer 不承担实现 WorkItem，也不复用 Worker Session；完整 E2E
+必须回读 Codex/Claude full-capability argv，并验证修改只发生在 Review workspace。
 
 Task Role Worker yield 只提交结果，不能完成 WorkItem。代码结果必须经过：
 

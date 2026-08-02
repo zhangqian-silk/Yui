@@ -35,8 +35,10 @@ test("the built-in reviewer delegates evidence-backed judgment without engineeri
   assert.match(reviewer.instructions, /reachable, material, actionable problems/i);
   assert.match(reviewer.instructions, /smallest sufficient correction/i);
   assert.match(reviewer.instructions, /speculative or extreme edge cases/i);
+  assert.match(reviewer.instructions, /ReviewRound-owned workspace/i);
+  assert.match(reviewer.instructions, /Never push, integrate, mutate Task state/i);
   assert.match(reviewer.instructions, /Leader, who decides/i);
-  assert.equal(reviewer.defaultAccess, "read");
+  assert.equal(reviewer.defaultAccess, "write");
 });
 
 test("AgentProfile is versioned independently from Actor and has no workspace or session", () => {

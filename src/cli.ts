@@ -51,6 +51,9 @@ import {
 import { runProjectCommand } from "./commands/projectCommands.js";
 import { runProfileCommand } from "./commands/profileCommands.js";
 import {
+  dispatchPreparedReviewRound,
+  failPendingReviewRound,
+  preserveReviewRoundWorkspace,
   runTaskCommand,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
@@ -603,6 +606,54 @@ export async function main(): Promise<void> {
       );
       return;
     }
+    if (resolved[1] === "work" && resolved[2] === "review"
+      && resolved[3] === "cleanup") {
+      const reviewRef = resolved[4];
+      if (reviewRef === undefined || resolved.length !== 5) {
+        throw usageError(
+          "Task work review cleanup usage: yui task work review cleanup <task>/<review-round>."
+        );
+      }
+      const reference = cliTaskRecordReference(reviewRef, "reviewRound", process.env);
+      const removal = await workspaceCoordinator.cleanupReviewRound(
+        reference.taskId,
+        reference.localId
+      );
+      if (removal === "dirty") {
+        throw usageError(
+          `ReviewRound worktree is dirty and was retained: ${reference.taskId}/${reference.localId}.`
+        );
+      }
+      emit(
+        `Cleaned ReviewRound worktree ${reference.taskId}/${reference.localId}\n`,
+        false,
+        {
+          reviewRound: store.getReviewRound(reference.taskId, reference.localId),
+          worktree: { removal }
+        }
+      );
+      return;
+    }
+    if (resolved[1] === "work" && resolved[2] === "review"
+      && resolved[3] === "preserve") {
+      const reviewRef = resolved[4];
+      if (reviewRef === undefined || resolved.length !== 5) {
+        throw usageError(
+          "Task work review preserve usage: yui task work review preserve <task>/<review-round>."
+        );
+      }
+      const reference = cliTaskRecordReference(reviewRef, "reviewRound", process.env);
+      const round = preserveReviewRoundWorkspace(
+        reference.taskId,
+        reference.localId,
+        store,
+        { runtime, environment: process.env, yuiHome: home }
+      );
+      emit(`Preserved ReviewRound worktree ${reference.taskId}/${reference.localId}\n`, false, {
+        reviewRound: round
+      });
+      return;
+    }
     if (resolved[1] === "archive") {
       const { taskId } = validateTaskArchiveRequest(
         resolved.slice(2),
@@ -634,6 +685,18 @@ export async function main(): Promise<void> {
         }
       }
     }
+    const candidateGitSnapshot = await candidateSnapshotForTaskCommand(
+      resolved,
+      store,
+      workspacePreparer,
+      process.env
+    );
+    const reviewResult = await reviewResultForTaskCommand(
+      resolved,
+      store,
+      workspacePreparer,
+      process.env
+    );
     const result = runTaskCommand(
       resolved.slice(1),
       store,
@@ -641,10 +704,46 @@ export async function main(): Promise<void> {
         runtime,
         environment: process.env,
         yuiHome: home,
-        ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof })
+        ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
+        ...(candidateGitSnapshot === undefined ? {} : { candidateGitSnapshot }),
+        ...(reviewResult === undefined ? {} : { reviewResult })
       }
     );
     if (result.kind === "output") {
+      const requestedRound = reviewRoundFromCommandData(result.data);
+      let reviewOutput = "";
+      let reviewData: unknown;
+      if (requestedRound?.status === "pending") {
+        try {
+          const workspace = await workspacePreparer.prepareReviewRoundWorkspace(
+            requestedRound.taskId,
+            requestedRound.id
+          );
+          const run = dispatchPreparedReviewRound(
+            requestedRound.taskId,
+            requestedRound.id,
+            store,
+            { runtime, environment: process.env, yuiHome: home }
+          );
+          reviewOutput = `Review queued as ${requestedRound.id} (${run.id})\n`;
+          reviewData = {
+            reviewRound: store.getReviewRound(requestedRound.taskId, requestedRound.id),
+            reviewRun: run,
+            workspace
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const failed = failPendingReviewRound(
+            requestedRound.taskId,
+            requestedRound.id,
+            message,
+            store,
+            { runtime, environment: process.env, yuiHome: home }
+          );
+          reviewOutput = `Review could not start: ${message}\n`;
+          reviewData = { reviewRound: failed };
+        }
+      }
       if (resolved[1] === "create") {
         const created = result.data as {
           task?: { id?: string; projectBindings?: readonly unknown[] }
@@ -679,7 +778,9 @@ export async function main(): Promise<void> {
           }
         }
       }
-      emit(result.output, false, result.data);
+      emit(`${result.output}${reviewOutput}`, false, reviewData === undefined
+        ? result.data
+        : { command: result.data, ...reviewData as object });
       return;
     }
     await runtime.prepareTaskRoleEnter({
@@ -716,6 +817,94 @@ function cliWorkItemReference(
   } catch (error) {
     throw usageError(error instanceof Error ? error.message : String(error));
   }
+}
+
+function cliTaskRecordReference(
+  value: string,
+  kind: "agentRun" | "reviewRound",
+  environment: NodeJS.ProcessEnv
+) {
+  try {
+    return resolveTaskRecordReference(value, {
+      kind,
+      label: kind === "agentRun" ? "Agent Run reference" : "ReviewRound reference",
+      ...(environment.YUI_TASK_ID === undefined
+        ? {}
+        : { contextTaskId: environment.YUI_TASK_ID })
+    });
+  } catch (error) {
+    throw usageError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function candidateSnapshotForTaskCommand(
+  args: readonly string[],
+  store: FileTaskStore,
+  preparer: FileTaskWorkspacePreparer,
+  environment: NodeJS.ProcessEnv
+) {
+  if (args[0] !== "task" || store.getReviewConfig() === null) return undefined;
+  if (args[1] === "run" && args[2] === "yield" && args[3] !== undefined) {
+    const reference = cliTaskRecordReference(args[3], "agentRun", environment);
+    const run = store.getAgentRun(reference.taskId, reference.localId);
+    if (run === null || run.purpose !== "execution" || run.workItemId === undefined) {
+      return undefined;
+    }
+    if (run.workspace === undefined) {
+      throw usageError(`Reviewable Run has no managed Candidate workspace: ${run.id}.`);
+    }
+    return preparer.snapshotCandidateWorkspace(run.workspace);
+  }
+  if (args[1] === "work" && args[2] === "update"
+    && args[3] !== undefined && args[4] === "done") {
+    const reference = cliWorkItemReference(args[3], environment);
+    const workspace = store.getRoleWorkspace(reference.taskId, "leader");
+    if (workspace === null) {
+      throw usageError(
+        `Reviewable direct WorkItem has no managed Candidate workspace: ${reference.localId}.`
+      );
+    }
+    return preparer.snapshotCandidateWorkspace(workspace);
+  }
+  return undefined;
+}
+
+async function reviewResultForTaskCommand(
+  args: readonly string[],
+  store: FileTaskStore,
+  preparer: FileTaskWorkspacePreparer,
+  environment: NodeJS.ProcessEnv
+) {
+  if (args[0] !== "task" || args[1] !== "run" || args[2] !== "yield"
+    || args[3] === undefined) return undefined;
+  const reference = cliTaskRecordReference(args[3], "agentRun", environment);
+  const run = store.getAgentRun(reference.taskId, reference.localId);
+  if (run === null || run.purpose !== "review" || run.reviewRoundId === undefined) {
+    return undefined;
+  }
+  return {
+    checks: [],
+    ...await preparer.snapshotReviewRoundResult(
+      reference.taskId,
+      run.reviewRoundId
+    )
+  };
+}
+
+function reviewRoundFromCommandData(data: unknown): Readonly<{
+  id: string;
+  taskId: string;
+  status: string;
+}> | undefined {
+  if (typeof data !== "object" || data === null || !("reviewRound" in data)) return undefined;
+  const round = (data as { reviewRound?: unknown }).reviewRound;
+  if (typeof round !== "object" || round === null) return undefined;
+  const value = round as { id?: unknown; taskId?: unknown; status?: unknown };
+  return typeof value.id === "string"
+    && typeof value.taskId === "string"
+    && typeof value.status === "string"
+    ? { id: value.id, taskId: value.taskId, status: value.status }
+    : undefined;
 }
 
 async function executeOperatorSessionControl(

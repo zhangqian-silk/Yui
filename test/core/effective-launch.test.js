@@ -89,7 +89,7 @@ test("write Profile plus exact WorkItem and workspace scope preserves configured
   assert.ok(argv.includes("--search"));
 });
 
-test("Review purpose forces Claude native read-only even over a bypass desired config", () => {
+test("Review purpose retains Claude bypass only in its exact ReviewRound workspace", () => {
   const role = desiredRole("claude", {
     adapterId: "claude",
     model: "opus",
@@ -100,36 +100,67 @@ test("Review purpose forces Claude native read-only even over a bypass desired c
   const effective = resolveEffectiveLaunch({
     role,
     purpose: "review",
-    workspace: workspace("write"),
-    workItemWriteProjectIds: ["project-1"]
+    reviewRoundId: "review-round-1",
+    reviewBaseCommit: "b".repeat(40),
+    workspace: reviewWorkspace("review-round-1")
   });
 
-  assert.equal(effective.access, "read");
-  assert.equal(effective.yolo, false);
-  assert.equal(effective.permission.mode, "dontAsk");
-  assert.ok(effective.permission.allowedTools.includes("Read"));
-  assert.ok(effective.permission.disallowedTools.includes("Write"));
+  assert.equal(effective.access, "write");
+  assert.equal(effective.yolo, true);
+  assert.equal(effective.permission, undefined);
+  assert.equal(effective.reviewRoundId, "review-round-1");
+  assert.equal(effective.reviewBaseCommit, "b".repeat(40));
   const argv = compileArgv(role, effective);
-  assertReadOnlyAgentArgv(effective, argv);
-  assert.equal(argv.includes("--dangerously-skip-permissions"), false);
-  assert.ok(argv.includes("--permission-mode"));
-  assert.ok(argv.includes("dontAsk"));
+  assert.equal(argv.includes("--dangerously-skip-permissions"), true);
 });
 
-test("read-only resolution fails closed when the native adapter boundary is unavailable", () => {
+test("Review purpose retains Codex YOLO in its exact ReviewRound workspace", () => {
+  const role = desiredRole("codex", {
+    adapterId: "codex",
+    yolo: true,
+    search: true,
+    permission: { sandbox: "danger-full-access", approval: "never" }
+  });
+  const effective = resolveEffectiveLaunch({
+    role,
+    purpose: "review",
+    reviewRoundId: "review-round-1",
+    reviewBaseCommit: "b".repeat(40),
+    workspace: reviewWorkspace("review-round-1")
+  });
+
+  assert.equal(effective.access, "write");
+  assert.equal(effective.yolo, true);
+  assert.equal(effective.search, true);
+  assert.deepEqual(effective.writeProjectIds, ["project-1"]);
+  assert.ok(compileArgv(role, effective).includes("--dangerously-bypass-approvals-and-sandbox"));
+});
+
+test("Review purpose fails closed on workspace owner or ReviewRound mismatch", () => {
   const role = desiredRole("claude", {
     adapterId: "claude",
-    yolo: true
+    yolo: true,
+    permission: { mode: "bypassPermissions" }
   });
   assert.throws(
     () => resolveEffectiveLaunch({
       role,
       purpose: "review",
-      workspace: workspace("read"),
-      workItemWriteProjectIds: [],
-      nativeReadOnlySupported: false
+      reviewRoundId: "review-round-2",
+      reviewBaseCommit: "b".repeat(40),
+      workspace: reviewWorkspace("review-round-1")
     }),
-    /cannot express native read-only access/i
+    /ReviewRound workspace owner.*review-round-2/i
+  );
+  assert.throws(
+    () => resolveEffectiveLaunch({
+      role,
+      purpose: "review",
+      reviewRoundId: "review-round-1",
+      reviewBaseCommit: "b".repeat(40),
+      workspace: workspace("write")
+    }),
+    /ReviewRound-owned workspace/i
   );
 });
 
@@ -194,6 +225,22 @@ function workspace(access) {
     }],
     createdAt: NOW.toISOString(),
     updatedAt: NOW.toISOString()
+  };
+}
+
+function reviewWorkspace(reviewRoundId) {
+  return {
+    ...workspace("write"),
+    roleName: "reviewer",
+    owner: { type: "review-round", reviewRoundId },
+    root: `/fixture/reviews/${reviewRoundId}`,
+    entries: workspace("write").entries.map((entry) => ({
+      ...entry,
+      path: `/fixture/reviews/${reviewRoundId}/fixture`,
+      branch: `fixture-${reviewRoundId}`,
+      baseRef: "b".repeat(40),
+      baseCommit: "b".repeat(40)
+    }))
   };
 }
 

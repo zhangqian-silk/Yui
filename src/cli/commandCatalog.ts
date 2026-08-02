@@ -435,7 +435,21 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "review",
         summary: "Ask the configured reviewer to inspect a WorkItem candidate.",
-        usage: "yui task work review <task>/<work>"
+        usage: "yui task work review <task>/<work>",
+        executable: true,
+        sections: [{ id: "workspace", title: "Review workspace", entries: ["cleanup", "preserve"] }],
+        children: [
+          {
+            name: "cleanup",
+            summary: "Remove only a clean terminal ReviewRound worktree.",
+            usage: "yui task work review cleanup <task>/<review-round>"
+          },
+          {
+            name: "preserve",
+            summary: "Record that a terminal ReviewRound worktree is retained for diagnosis.",
+            usage: "yui task work review preserve <task>/<review-round>"
+          }
+        ]
       },
       {
         name: "accept",

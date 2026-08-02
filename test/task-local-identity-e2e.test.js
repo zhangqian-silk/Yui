@@ -13,7 +13,10 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../dist/agent/agent.js";
-import { runTaskCommand } from "../dist/commands/taskCommands.js";
+import {
+  dispatchPreparedReviewRound,
+  runTaskCommand
+} from "../dist/commands/taskCommands.js";
 import { FileSchedulerStoreAdapter } from "../dist/controller/fileSchedulerStoreAdapter.js";
 import { FileRuntimeEventInbox } from "../dist/controller/runtimeEventInbox.js";
 import { runSessionNotifyCommand } from "../dist/controller/sessionNotify.js";
@@ -290,6 +293,13 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
     join(isolated.entries[0].path, "qualified-identity.txt"),
     "task-1/work-item-1\n"
   );
+  execFileSync("git", ["-C", isolated.entries[0].path, "add", "qualified-identity.txt"]);
+  execFileSync("git", [
+    "-C", isolated.entries[0].path,
+    "-c", "user.name=Yui Identity E2E",
+    "-c", "user.email=identity@example.invalid",
+    "commit", "-qm", "qualified identity candidate"
+  ]);
   runTaskCommand([
     "work", "dispatch", `${primaryTask.id}/${primaryWork.id}`,
     "--input", "Implement the Task-local identity cutover."
@@ -305,10 +315,11 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   );
   const workerRun = store.getActiveAgentRun(primaryTask.id, "worker");
   assert.notEqual(workerRun, null);
+  const candidateGitSnapshot = await preparer.snapshotCandidateWorkspace(isolated);
   runTaskCommand([
     "run", "yield", `${primaryTask.id}/${workerRun.id}`,
     "--summary", "Task-local identity candidate is ready."
-  ], store, postAnswerWorker);
+  ], store, { ...postAnswerWorker, candidateGitSnapshot });
   const candidate = store.getWorkItem(primaryTask.id, primaryWork.id).candidates[0];
   assert.deepEqual(
     { id: candidate.id, taskId: candidate.taskId, workItemId: candidate.workItemId },
@@ -318,6 +329,13 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   runTaskCommand([
     "work", "review", `${primaryTask.id}/${primaryWork.id}`
   ], store, postAnswerLeader);
+  const pendingReview = store.listReviewRounds(primaryTask.id)[0];
+  workspaceNow = postAnswerNow;
+  const reviewWorkspace = await preparer.prepareReviewRoundWorkspace(
+    primaryTask.id,
+    pendingReview.id
+  );
+  dispatchPreparedReviewRound(primaryTask.id, pendingReview.id, store, postAnswerLeader);
   assert.equal(
     (await processActiveRoleRunDeliveries(
       scheduler,
@@ -332,10 +350,18 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   runTaskCommand([
     "run", "yield", `${primaryTask.id}/${reviewRun.id}`,
     "--summary", "Review passed with no material findings."
-  ], store, postAnswerReviewer);
+  ], store, {
+    ...postAnswerReviewer,
+    reviewResult: {
+      checks: [{ name: "identity E2E review", outcome: "passed" }]
+    }
+  });
   const review = store.listReviewRounds(primaryTask.id)[0];
   assert.equal(review.id, "review-round-1");
   assert.equal(review.status, "completed");
+  assert.equal(review.reviewBaseCommit, candidateGitSnapshot.reviewBaseCommit);
+  assert.notEqual(reviewWorkspace.root, isolated.root);
+  assert.equal(await coordinator.cleanupReviewRound(primaryTask.id, review.id), "removed");
 
   const captureResult = runCliJson(home, [
     "task", "work", "capture", `${primaryTask.id}/${primaryWork.id}`

@@ -19,6 +19,7 @@ import {
 
 export type EffectiveLaunchAccess = WorkerAccess;
 export type EffectiveLaunchProvenance = "resolved" | "legacy-cutover";
+export type EffectiveReviewBaseProvenance = "frozen-candidate" | "legacy-unavailable";
 
 export type EffectiveLaunchWorkspace = Readonly<{
   root: string;
@@ -42,6 +43,9 @@ type EffectiveLaunchBase = Readonly<{
   writeProjectIds: readonly string[];
   workspace: EffectiveLaunchWorkspace;
   context: EffectiveLaunchContext;
+  reviewRoundId?: string;
+  reviewBaseProvenance?: EffectiveReviewBaseProvenance;
+  reviewBaseCommit?: string;
 }>;
 
 export type CodexEffectiveLaunchSnapshot = EffectiveLaunchBase & Readonly<{
@@ -69,6 +73,8 @@ export type ResolveEffectiveLaunchInput = Readonly<{
   workspace?: RoleWorkspace;
   /** Undefined means a non-WorkItem run; [] is an explicit read-only WorkItem scope. */
   workItemWriteProjectIds?: readonly string[];
+  reviewRoundId?: string;
+  reviewBaseCommit?: string;
   nativeReadOnlySupported?: boolean;
 }>;
 
@@ -99,11 +105,10 @@ export function resolveEffectiveLaunch(
   const binding = input.role.agentBindings[input.role.activeAgentId]!;
   const workspace = snapshotWorkspace(input.role.workspace, input.workspace);
   const writeProjectIds = effectiveWriteProjects(input, workspace);
-  const writeAuthorized = !("taskId" in input.role)
-    ? input.role.defaultAccess === "write" && input.purpose !== "review"
-    : writeProjectIds.length > 0;
-  const access: EffectiveLaunchAccess = input.purpose === "review"
-    || input.role.defaultAccess === "read"
+  const writeAuthorized = "taskId" in input.role
+    && input.role.defaultAccess === "write"
+    && writeProjectIds.length > 0;
+  const access: EffectiveLaunchAccess = input.role.defaultAccess === "read"
     || !writeAuthorized
     ? "read"
     : "write";
@@ -122,7 +127,14 @@ export function resolveEffectiveLaunch(
     access,
     writeProjectIds,
     workspace,
-    context: snapshotContext(input.role)
+    context: snapshotContext(input.role),
+    ...(input.purpose === "review"
+      ? {
+          reviewRoundId: identity(input.reviewRoundId ?? "", "ReviewRound id"),
+          reviewBaseProvenance: "frozen-candidate" as const,
+          reviewBaseCommit: commit(input.reviewBaseCommit ?? "", "Review base commit")
+        }
+      : {})
   });
 }
 
@@ -139,6 +151,7 @@ export function legacyEffectiveLaunchSnapshot(input: Readonly<{
   effort?: string;
   workspace: EffectiveLaunchWorkspace;
   context?: EffectiveLaunchContext;
+  reviewRoundId?: string;
 }>): EffectiveLaunchSnapshot {
   return snapshotFromConfig({
     sourceDesiredRevision: positiveInteger(
@@ -155,7 +168,13 @@ export function legacyEffectiveLaunchSnapshot(input: Readonly<{
     access: "read",
     writeProjectIds: [],
     workspace: cloneWorkspace(input.workspace),
-    context: cloneContext(input.context ?? {})
+    context: cloneContext(input.context ?? {}),
+    ...(input.reviewRoundId === undefined
+      ? {}
+      : {
+          reviewRoundId: identity(input.reviewRoundId, "Legacy ReviewRound id"),
+          reviewBaseProvenance: "legacy-unavailable" as const
+        })
   });
 }
 
@@ -262,6 +281,26 @@ export function validateEffectiveLaunchSnapshot<T extends EffectiveLaunchSnapsho
   if (snapshot.access === "read" && snapshot.writeProjectIds.length !== 0) {
     throw new Error("Read-only effective launch cannot carry writable Projects.");
   }
+  if ((snapshot.reviewRoundId === undefined) !== (snapshot.reviewBaseProvenance === undefined)) {
+    throw new Error("Effective Review provenance is incomplete.");
+  }
+  if (snapshot.reviewRoundId !== undefined) {
+    identity(snapshot.reviewRoundId, "Effective ReviewRound id");
+    if (snapshot.reviewBaseProvenance === "frozen-candidate") {
+      commit(snapshot.reviewBaseCommit ?? "", "Effective review base commit");
+      if (snapshot.provenance !== "resolved") {
+        throw new Error("Legacy effective launch cannot claim a frozen Review base.");
+      }
+    } else if (snapshot.reviewBaseProvenance === "legacy-unavailable") {
+      if (snapshot.reviewBaseCommit !== undefined || snapshot.provenance !== "legacy-cutover") {
+        throw new Error("Effective legacy Review provenance is invalid.");
+      }
+    } else {
+      throw new Error("Effective Review base provenance is invalid.");
+    }
+  } else if (snapshot.reviewBaseCommit !== undefined) {
+    throw new Error("Effective Review provenance is incomplete.");
+  }
   validateWorkspace(snapshot.workspace);
   cloneContext(snapshot.context);
   const config = effectiveLaunchConfigUnchecked(snapshot);
@@ -334,6 +373,9 @@ function snapshotFromConfig(input: Readonly<{
   writeProjectIds: readonly string[];
   workspace: EffectiveLaunchWorkspace;
   context: EffectiveLaunchContext;
+  reviewRoundId?: string;
+  reviewBaseProvenance?: EffectiveReviewBaseProvenance;
+  reviewBaseCommit?: string;
 }>): EffectiveLaunchSnapshot {
   const config = clone(input.config);
   const common = {
@@ -355,7 +397,14 @@ function snapshotFromConfig(input: Readonly<{
     ...(config.advanced === undefined ? {} : { advanced: clone(config.advanced) }),
     writeProjectIds: [...input.writeProjectIds],
     workspace: cloneWorkspace(input.workspace),
-    context: cloneContext(input.context)
+    context: cloneContext(input.context),
+    ...(input.reviewRoundId === undefined
+      ? {}
+      : {
+          reviewRoundId: identity(input.reviewRoundId, "ReviewRound id"),
+          reviewBaseProvenance: input.reviewBaseProvenance ?? "frozen-candidate",
+          reviewBaseCommit: commit(input.reviewBaseCommit ?? "", "Review base commit")
+        })
   };
   const snapshot: EffectiveLaunchSnapshot = config.adapterId === "codex"
     ? {
@@ -443,7 +492,32 @@ function effectiveWriteProjects(
   input: ResolveEffectiveLaunchInput,
   workspace: EffectiveLaunchWorkspace
 ): string[] {
-  if (input.purpose === "review" || input.role.defaultAccess === "read") return [];
+  if (input.purpose === "review") {
+    if (!("taskId" in input.role)) {
+      throw new Error("Review launch requires a Task Role.");
+    }
+    if (input.reviewRoundId === undefined || input.reviewBaseCommit === undefined) {
+      throw new Error("Review launch requires exact ReviewRound provenance.");
+    }
+    commit(input.reviewBaseCommit, "Review base commit");
+    if (input.workspace === undefined || input.workspace.owner.type !== "review-round") {
+      throw new Error("Review launch requires a ReviewRound-owned workspace.");
+    }
+    if (input.workspace.owner.reviewRoundId !== input.reviewRoundId) {
+      throw new Error(
+        `ReviewRound workspace owner does not match ${input.reviewRoundId}.`
+      );
+    }
+    if (input.workspace.entries.length === 0
+      || input.workspace.entries.some(({ access }) => access !== "write")) {
+      throw new Error("Every ReviewRound workspace Project must be an isolated writable entry.");
+    }
+    return uniqueIdentities(
+      workspace.entries.map(({ projectId }) => projectId),
+      "Review workspace Project"
+    );
+  }
+  if (input.role.defaultAccess === "read") return [];
   const workspaceWrite = uniqueIdentities(
     workspace.entries
       .filter(({ access }) => access === "write")
@@ -569,6 +643,14 @@ function identity(value: string, label: string): string {
   const result = text(value, label);
   if (["__proto__", "prototype", "constructor", ".", ".."].includes(result)
     || /[/\\\0]/u.test(result)) {
+    throw new Error(`${label} is invalid.`);
+  }
+  return result;
+}
+
+function commit(value: string, label: string): string {
+  const result = text(value, label).toLowerCase();
+  if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u.test(result)) {
     throw new Error(`${label} is invalid.`);
   }
   return result;

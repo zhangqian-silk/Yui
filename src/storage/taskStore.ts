@@ -538,6 +538,14 @@ export class FileTaskStore implements TaskStore {
       throw new StorageRecordError(`ChangeSet belongs to another Task: ${stored.taskId}.`);
     }
     const aggregate = this.#requireTaskForWrite(taskId);
+    const evidenceRound = Object.values(aggregate.reviewRounds).find(
+      ({ evidenceCommit }) => evidenceCommit === stored.headCommit
+    );
+    if (evidenceRound !== undefined) {
+      throw new StorageRecordError(
+        `ReviewRound evidence commit ${evidenceRound.id}/${stored.headCommit} cannot become a ChangeSet.`
+      );
+    }
     if (!aggregate.task.projectBindings.some(({ projectId }) => projectId === stored.projectId)) {
       throw new StorageRecordError(`ChangeSet Project does not match Task: ${stored.id}.`);
     }
@@ -589,6 +597,14 @@ export class FileTaskStore implements TaskStore {
       }
       if (changeSet.projectId !== stored.projectId) {
         throw new StorageRecordError(`Integration ChangeSet belongs to another Project: ${changeSetId}.`);
+      }
+      const evidenceRound = Object.values(aggregate.reviewRounds).find(
+        ({ evidenceCommit }) => evidenceCommit === changeSet.headCommit
+      );
+      if (evidenceRound !== undefined) {
+        throw new StorageRecordError(
+          `ReviewRound evidence commit ${evidenceRound.id}/${changeSet.headCommit} cannot become an Integration source.`
+        );
       }
     }
     const existing = aggregate.integrationAttempts[stored.id];
@@ -667,6 +683,19 @@ export class FileTaskStore implements TaskStore {
     const boundProjects = new Set(aggregate.task.projectBindings.map(({ projectId }) => projectId));
     if (stored.entries.some(({ projectId }) => !boundProjects.has(projectId))) {
       throw new StorageRecordError(`RoleWorkspace Project does not match Task: ${taskId}/${stored.roleName}`);
+    }
+    if (stored.owner.type === "review-round") {
+      const round = aggregate.reviewRounds[stored.owner.reviewRoundId];
+      if (round === undefined) {
+        throw new StorageRecordError(
+          `RoleWorkspace ReviewRound not found: ${taskId}/${stored.owner.reviewRoundId}.`
+        );
+      }
+      if (round.reviewerRoleName !== stored.roleName) {
+        throw new StorageRecordError(
+          `RoleWorkspace does not match its Reviewer Role: ${taskId}/${stored.roleName}.`
+        );
+      }
     }
     this.#mutate((state) => {
       state.tasks[taskId].roleWorkspaces[stored.roleName] = stored;
@@ -1870,6 +1899,14 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
         `RoleWorkspace Work Item not found: ${taskId}/${workspace.owner.workItemId}.`
       );
     }
+    if (workspace.owner.type === "review-round") {
+      const round = aggregate.reviewRounds[workspace.owner.reviewRoundId];
+      if (round === undefined || round.reviewerRoleName !== workspace.roleName) {
+        throw new StorageRecordError(
+          `RoleWorkspace ReviewRound is invalid: ${taskId}/${workspace.owner.reviewRoundId}.`
+        );
+      }
+    }
   }
   for (const [roleName, sessions] of Object.entries(aggregate.roleSessionSets)) {
     if (sessions.inFlight !== null) {
@@ -1950,6 +1987,14 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
     )) {
       throw new StorageRecordError(`ChangeSet Project does not match Task: ${changeSet.id}.`);
     }
+    const evidenceRound = Object.values(aggregate.reviewRounds).find(
+      ({ evidenceCommit }) => evidenceCommit === changeSet.headCommit
+    );
+    if (evidenceRound !== undefined) {
+      throw new StorageRecordError(
+        `ReviewRound evidence commit ${evidenceRound.id}/${changeSet.headCommit} cannot become a ChangeSet.`
+      );
+    }
   }
   for (const integration of Object.values(aggregate.integrationAttempts)) {
     if (!boundProjects.has(integration.projectId)) {
@@ -1965,6 +2010,14 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
       if (changeSet.projectId !== integration.projectId) {
         throw new StorageRecordError(
           `Integration ChangeSet belongs to another Project: ${integration.id}/${changeSetId}.`
+        );
+      }
+      const evidenceRound = Object.values(aggregate.reviewRounds).find(
+        ({ evidenceCommit }) => evidenceCommit === changeSet.headCommit
+      );
+      if (evidenceRound !== undefined) {
+        throw new StorageRecordError(
+          `ReviewRound evidence commit ${evidenceRound.id}/${changeSet.headCommit} cannot become an Integration source.`
         );
       }
     }
@@ -2141,15 +2194,44 @@ function validReviewRoundTransition(
     || existing.workItemId !== candidate.workItemId
     || existing.candidateId !== candidate.candidateId
     || existing.reviewerRoleName !== candidate.reviewerRoleName
+    || existing.reviewBaseProvenance !== candidate.reviewBaseProvenance
+    || existing.reviewBaseCommit !== candidate.reviewBaseCommit
     || existing.requestedBy !== candidate.requestedBy
     || existing.createdAt !== candidate.createdAt
   ) return false;
   if (existing.status === "pending") {
-    return ["running", "failed"].includes(candidate.status);
+    if (candidate.status === "pending") {
+      return existing.workspace === undefined
+        && candidate.workspace !== undefined
+        && candidate.reviewerRunId === undefined
+        && candidate.summary === undefined
+        && candidate.checks === undefined
+        && candidate.evidenceCommit === undefined
+        && candidate.endedAt === undefined
+        && candidate.workspaceDisposition === undefined;
+    }
+    return ["running", "failed"].includes(candidate.status)
+      && (existing.workspace === undefined
+        || isDeepStrictEqual(existing.workspace, candidate.workspace));
   }
   if (existing.status === "running") {
     return ["completed", "failed"].includes(candidate.status)
-      && existing.reviewerRunId === candidate.reviewerRunId;
+      && existing.reviewerRunId === candidate.reviewerRunId
+      && isDeepStrictEqual(existing.workspace, candidate.workspace);
+  }
+  if (existing.status === candidate.status
+    && (existing.status === "completed" || existing.status === "failed")) {
+    const {
+      workspaceDisposition: _existingDisposition,
+      ...existingResult
+    } = existing;
+    const {
+      workspaceDisposition: _candidateDisposition,
+      ...candidateResult
+    } = candidate;
+    return isDeepStrictEqual(existingResult, candidateResult)
+      && existing.workspaceDisposition?.kind !== "removed"
+      && candidate.workspaceDisposition !== undefined;
   }
   return false;
 }

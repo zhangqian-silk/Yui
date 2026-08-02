@@ -20,6 +20,15 @@ export type WorkItemStatus =
 
 export type WorkItemWorkspaceDisposition = "integrated" | "abandoned";
 
+export type CandidateGitSnapshot = Readonly<{
+  schemaVersion: 1;
+  reviewBaseCommit: string;
+  projects: readonly Readonly<{
+    projectId: string;
+    commit: string;
+  }>[];
+}>;
+
 export type WorkItemCandidate = Readonly<{
   schemaVersion: 2;
   id: string;
@@ -33,6 +42,7 @@ export type WorkItemCandidate = Readonly<{
     | Readonly<{ type: "run"; runId: string }>;
   reviewPolicy?: ReviewConfig;
   workspace?: RoleWorkspace;
+  gitSnapshot?: CandidateGitSnapshot;
   createdAt: string;
 }>;
 
@@ -109,6 +119,7 @@ export function submitWorkItemCandidate(
       | Readonly<{ type: "run"; runId: string }>;
     reviewPolicy?: ReviewConfig;
     workspace?: RoleWorkspace;
+    gitSnapshot?: CandidateGitSnapshot;
   }>,
   now: Date
 ): WorkItem {
@@ -131,6 +142,7 @@ export function submitWorkItemCandidate(
     source: input.source,
     ...(input.reviewPolicy === undefined ? {} : { reviewPolicy: input.reviewPolicy }),
     ...(input.workspace === undefined ? {} : { workspace: input.workspace }),
+    ...(input.gitSnapshot === undefined ? {} : { gitSnapshot: input.gitSnapshot }),
     createdAt: now.toISOString()
   });
   const { outcome: _outcome, endedAt: _endedAt, ...base } = workItem;
@@ -343,9 +355,80 @@ export function validateWorkItemCandidate(
     }, "agentRun");
   }
   if (candidate.reviewPolicy !== undefined) validateReviewConfig(candidate.reviewPolicy);
-  if (candidate.workspace !== undefined) validateRoleWorkspace(candidate.workspace);
+  if (candidate.workspace !== undefined) {
+    validateRoleWorkspace(candidate.workspace);
+    if (candidate.workspace.owner.type === "review-round") {
+      throw new Error("Work Item candidate cannot use a ReviewRound-owned workspace.");
+    }
+  }
+  if (candidate.gitSnapshot !== undefined) {
+    if (candidate.workspace === undefined) {
+      throw new Error("Candidate Git snapshot requires a managed workspace.");
+    }
+    validateCandidateGitSnapshot(candidate.gitSnapshot, candidate.workspace);
+  }
   requireTimestamp(candidate.createdAt, "Work Item candidate createdAt");
   return candidate;
+}
+
+export function createCandidateGitSnapshot(
+  workspace: RoleWorkspace,
+  projects: readonly Readonly<{ projectId: string; commit: string }>[]
+): CandidateGitSnapshot {
+  validateRoleWorkspace(workspace);
+  if (workspace.owner.type === "review-round") {
+    throw new Error("Candidate Git snapshot cannot come from a ReviewRound workspace.");
+  }
+  if (workspace.entries.length === 0) {
+    throw new Error("Candidate Git snapshot requires a Project workspace.");
+  }
+  const byProject = new Map(projects.map(({ projectId, commit: value }) => [
+    requireIdentity(projectId, "Candidate snapshot Project"),
+    requireCommit(value, "Candidate snapshot commit")
+  ]));
+  if (byProject.size !== projects.length) {
+    throw new Error("Candidate snapshot Projects are duplicated.");
+  }
+  const normalized = workspace.entries.map(({ projectId }) => {
+    const value = byProject.get(projectId);
+    if (value === undefined) {
+      throw new Error(`Candidate snapshot Project is missing: ${projectId}.`);
+    }
+    return { projectId, commit: value };
+  });
+  if (normalized.length !== byProject.size) {
+    throw new Error("Candidate snapshot contains a Project outside its workspace.");
+  }
+  const primary = workspace.entries.find(({ access }) => access === "write")
+    ?? workspace.entries[0]!;
+  return {
+    schemaVersion: 1,
+    reviewBaseCommit: byProject.get(primary.projectId)!,
+    projects: normalized
+  };
+}
+
+function validateCandidateGitSnapshot(
+  snapshot: CandidateGitSnapshot,
+  workspace: RoleWorkspace
+): void {
+  if (snapshot.schemaVersion !== 1) {
+    throw new Error("Candidate Git snapshot must use schemaVersion 1.");
+  }
+  requireCommit(snapshot.reviewBaseCommit, "Candidate review base commit");
+  const normalized = createCandidateGitSnapshot(workspace, snapshot.projects);
+  if (normalized.reviewBaseCommit !== snapshot.reviewBaseCommit
+    || JSON.stringify(normalized.projects) !== JSON.stringify(snapshot.projects)) {
+    throw new Error("Candidate Git snapshot does not match its managed workspace.");
+  }
+}
+
+function requireCommit(value: string, label: string): string {
+  const commit = requireText(value, label).toLowerCase();
+  if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u.test(commit)) {
+    throw new Error(`${label} is invalid.`);
+  }
+  return commit;
 }
 
 export function currentWorkItemCandidate(

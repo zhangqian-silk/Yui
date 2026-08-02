@@ -161,6 +161,25 @@ function fixtureStore() {
         updatedAt: "2026-07-23T07:28:00.000Z"
       }] : [];
     },
+    listReviewRounds(taskId) {
+      return taskId === "task-1" ? [{
+        schemaVersion: 2,
+        id: "review-round-1",
+        taskId,
+        workItemId: "work-1",
+        candidateId: "candidate-1",
+        reviewerRoleName: "reviewer",
+        reviewBaseProvenance: "frozen-candidate",
+        reviewBaseCommit: "a".repeat(40),
+        requestedBy: "leader",
+        status: "completed",
+        summary: "No material findings.",
+        checks: [{ name: "npm test", outcome: "passed" }],
+        evidenceCommit: "b".repeat(40),
+        createdAt: "2026-07-23T07:20:00.000Z",
+        endedAt: "2026-07-23T07:27:00.000Z"
+      }] : [];
+    },
     listInputRequests(taskId) {
       return taskId === "task-1" ? [{ id: "input-1", status: "open", question: "Choose a port", createdAt: "2026-07-23T07:00:00.000Z" }] : [];
     },
@@ -306,6 +325,8 @@ test("dashboard API summarizes tasks and exposes one consolidated task detail", 
     assert.equal(detail.openInputs[0].question, "Choose a port");
     assert.equal(detail.runs[0].summary, "Dashboard verified.");
     assert.equal(detail.runs[0].effective.access, "read");
+    assert.equal(detail.reviewRounds[0].reviewBaseCommit, "a".repeat(40));
+    assert.equal(detail.reviewRounds[0].evidenceCommit, "b".repeat(40));
     assert.equal(detail.messages[0].author.roleName, "leader");
     assert.equal(detail.decisions[0].title, "Keep it read-only");
     assert.equal(detail.milestones[0].title, "Dashboard verified");
