@@ -295,6 +295,14 @@ the result message, and queues the Leader. It does not accept the WorkItem. A
 Leader never wakes itself; any pending Operator or Worker wake remains durable
 until the Leader is idle.
 
+If the outcome cannot be determined, label the handoff `uncertain`,
+`incomplete`, `blocked`, or `requiring Leader judgment` and submit the most
+complete truthful identities, actions, repository state, checks and errors,
+lifecycle boundary, unfinished work, open decisions, risks, confidence, and
+bounded next options. Yield records immutable Run/Candidate or Review evidence
+only; it does not imply acceptance, WorkItem completion, ChangeSet capture,
+Integration, or Task completion.
+
 For bounded work, the Leader owns a roleless WorkItem and may execute it
 directly or create a native subagent through the current Agent conversation:
 

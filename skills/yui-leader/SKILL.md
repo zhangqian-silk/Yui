@@ -397,6 +397,20 @@ resume the fixed Leader Session.
 
 Every wake is an active control Run. Before ending:
 
+- If you cannot finally determine success, failure, completeness, or the
+  correct disposition, do not guess, silently stop, or hide uncertainty behind
+  a success summary. Clearly label the checkpoint uncertain, incomplete,
+  blocked, or requiring Leader judgment.
+- Preserve the same complete checkpoint before either yield or an InputRequest.
+  When applicable, record exact Run, WorkItem, and native Session identity;
+  actions actually performed; changed paths and commit/worktree state; checks
+  actually run and their outcomes; provider, runtime, or permission errors;
+  the last confirmed lifecycle boundary; work not performed; unresolved
+  assumptions or decisions; residual risks; confidence; and bounded next
+  options.
+- Review Runs report findings, verification gaps, and limits. Use that evidence
+  to decide disposition as Leader; do not treat the review as acceptance.
+
 1. update the Brief checkpoint;
 2. record any material Decision, completed Milestone, or stable Project
    Knowledge;
@@ -407,6 +421,15 @@ yui task run yield <run-id> --summary-file - <<'YUI_SUMMARY'
 <current result or waiting state>
 YUI_SUMMARY
 ```
+
+A Leader yield preserves immutable Run evidence only. It never implies Leader
+acceptance, WorkItem completion, ChangeSet capture, Integration, or Task
+completion. The exact yield command must be the final tool action. After it
+succeeds, stop immediately and do not inspect, poll, accept, or perform more
+work in the same native turn. If the exact yield is denied, do not retry,
+broaden permissions, use a wrapper, mutate Yui state, or invent delivery
+evidence; truthfully surface the blocker through the supported provider failure
+boundary. Do not add a fallback protocol.
 
 Always yield before waiting for delegated results. Leaving the Run active
 prevents queued results from waking the Leader.

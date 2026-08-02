@@ -167,6 +167,49 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
   );
 });
 
+test("Worker and Leader Skills require truthful uncertain checkpoints", () => {
+  const leader = readFileSync(join(root, "skills", "yui-leader", "SKILL.md"), "utf8");
+  const worker = readFileSync(join(root, "skills", "yui-worker", "SKILL.md"), "utf8");
+
+  assert.match(
+    worker,
+    /uncertain,\s+incomplete,\s+blocked,\s+or requiring Leader judgment/iu
+  );
+  assert.match(
+    worker,
+    /exact Run, WorkItem, and native Session identity[\s\S]*actions actually performed[\s\S]*changed paths and commit\/worktree state[\s\S]*checks actually run and their outcomes[\s\S]*provider, runtime, or permission errors[\s\S]*last confirmed lifecycle boundary[\s\S]*work not performed[\s\S]*unresolved assumptions or decisions[\s\S]*residual risks[\s\S]*confidence[\s\S]*bounded next options/iu
+  );
+  assert.match(
+    worker,
+    /immutable Run\s+evidence and a Candidate, or Review evidence only[\s\S]*never implies Leader\s+acceptance, WorkItem completion, ChangeSet capture,\s+Integration, or Task\s+completion/iu
+  );
+  assert.match(
+    worker,
+    /Review Runs report findings,\s+verification gaps,\s+and limits;\s+the\s+Leader decides disposition/iu
+  );
+  assert.match(
+    worker,
+    /If the\s+exact yield is denied[\s\S]*do not retry[\s\S]*broaden permissions[\s\S]*wrapper[\s\S]*mutate\s+Yui state[\s\S]*invent delivery evidence/iu
+  );
+
+  assert.match(
+    leader,
+    /uncertain,\s+incomplete,\s+blocked,\s+or requiring Leader judgment/iu
+  );
+  assert.match(
+    leader,
+    /same complete checkpoint before either yield or an InputRequest/iu
+  );
+  assert.match(
+    leader,
+    /yield preserves immutable Run evidence only[\s\S]*never implies Leader\s+acceptance, WorkItem completion, ChangeSet capture,\s+Integration, or Task\s+completion/iu
+  );
+  assert.match(
+    leader,
+    /exact yield command must be the final tool action/iu
+  );
+});
+
 test("publish builds once and smokes the same package on Node 20, 22, and 24", () => {
   const workflow = readFileSync(join(root, ".github", "workflows", "publish.yml"), "utf8");
   const smoke = readFileSync(join(root, "scripts", "smoke-runtime-package.mjs"), "utf8");

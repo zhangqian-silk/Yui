@@ -271,6 +271,12 @@ yield 会结束 AgentRun，将 WorkItem 提交给 Leader 审查，并追加结�
 唤醒 Leader；它不会验收或完成 WorkItem。Leader 不会自唤醒，pending wake
 会保留到 Leader 空闲。
 
+如果无法最终判断结果，交接必须明确标为 `uncertain`、`incomplete`、
+`blocked` 或 `requiring Leader judgment`，并提交最完整且真实的身份、已执行
+动作、仓库状态、检查与错误、最后生命周期边界、未完成工作、待决事项、风险、
+置信度及有界下一选项。yield 只记录不可变的 Run/Candidate 或 Review 证据；
+它不表示验收、WorkItem 完成、ChangeSet capture、Integration 或 Task 完成。
+
 对于有界工作，Leader 可以直接执行 roleless WorkItem，也可以在当前
 Agent 对话中创建 native subagent：
 

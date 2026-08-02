@@ -70,6 +70,39 @@ diagnostic evidence commit there. Never push, integrate, mutate Task records,
 touch the Candidate or Worker workspace, another Task/worktree, a stable
 checkout, or real YUI_HOME.
 
+Invoke the exact `yui task run yield ... --summary-file -` command directly
+once; do not wrap it in `until`, `while`, `sh -c`, `cd ... &&`, or another
+compound shell command. If the direct command is denied, report the blocker and
+stop instead of retrying it.
+The exact current-Run yield command must be the final tool action. After it
+succeeds, stop immediately and do not inspect, poll, accept, or perform more
+work in the same native turn.
+
+If you cannot finally determine success, failure, completeness, or the correct
+disposition, do not guess, silently stop, or hide uncertainty behind a success
+summary. Use the exact yield path and clearly label the handoff uncertain,
+incomplete, blocked, or requiring Leader judgment. Report the most complete
+truthful evidence available and, when applicable:
+
+- exact Run, WorkItem, and native Session identity;
+- actions actually performed;
+- changed paths and commit/worktree state;
+- checks actually run and their outcomes;
+- provider, runtime, or permission errors;
+- the last confirmed lifecycle boundary;
+- work not performed;
+- unresolved assumptions or decisions;
+- residual risks;
+- confidence; and
+- bounded next options.
+
+Permission for this exact control-plane handoff does not grant repository
+writes, broad Bash authority, external effects, or cross-Run control. If the
+exact yield is denied, do not retry, broaden permissions, use a wrapper, mutate
+Yui state, or invent delivery evidence. Truthfully surface the blocker through
+the supported provider failure boundary and stop; there is no fallback
+protocol.
+
 Make one bounded evidence pass: inspect the relevant change and callers, run
 proportionate checks, and judge the core outcome. Do not repeat successful
 checks or invent extra edge-case probes without concrete defect evidence. Once
@@ -81,14 +114,19 @@ If the exact direct command is denied, report that blocker and stop; do not
 retry through a wrapper or alternate delivery path.
 
 Include the result, changed paths, review base, optional evidence commit,
-checks, residual risk, and blockers in the stdin summary. Printing a final
-response without executing `yield` does not deliver either provider's managed
-Run. Execution yield ends the AgentRun
-and appends an immutable Candidate to the same WorkItem. Review yield ends only
+checks, residual risk, blockers, and any required uncertainty evidence in the
+stdin summary. A final response does not deliver either provider's managed Run.
+Execution yield ends the AgentRun and appends an immutable Candidate to the
+same WorkItem. Review yield ends only
 its exact ReviewRound and creates no Candidate, ChangeSet, Integration source,
 acceptance, or completion.
-Permission denial, a missing or wrong Run yield, and StopFailure are failures,
-never successful Candidates or completed ReviewRounds.
+Yield submits immutable Run evidence and a Candidate, or Review evidence only.
+It never implies Leader acceptance, WorkItem completion, ChangeSet capture,
+Integration, or Task completion. Review Runs report findings,
+verification gaps, and limits;
+the Leader decides disposition. A missing, denied, wrong-Run,
+stale, or duplicate yield and StopFailure never synthesize a successful
+Candidate or completed ReviewRound.
 
 Leave managed workspaces intact. The Leader may route a ReviewRound evidence
 SHA or findings back to the original Worker, which continues in its unchanged

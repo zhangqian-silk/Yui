@@ -108,6 +108,64 @@ test("Claude Worker completion requires the exact explicit yield transport", () 
   assert.doesNotMatch(worker, /managed Stop hook|final assistant message/iu);
 });
 
+test("Codex and Claude Worker handoffs require truthful uncertain evidence", () => {
+  const evidencePatterns = [
+    /exact Run, WorkItem, and native Session identity/iu,
+    /actions actually performed/iu,
+    /changed paths and commit\/worktree state/iu,
+    /checks actually run and their outcomes/iu,
+    /provider, runtime, or permission errors/iu,
+    /last confirmed lifecycle boundary/iu,
+    /work not performed/iu,
+    /unresolved assumptions or decisions/iu,
+    /residual risks/iu,
+    /confidence/iu,
+    /bounded next options/iu
+  ];
+
+  for (const adapterId of ["codex", "claude"]) {
+    const worker = buildWorkerContext({
+      taskId: "task-1",
+      role: {
+        ...role,
+        name: "reviewer",
+        activeAgentId: adapterId,
+        agentBindings: {
+          [adapterId]: {
+            agentId: adapterId,
+            adapterId,
+            config: { adapterId }
+          }
+        }
+      },
+      input: "return the bounded review"
+    });
+
+    assert.match(
+      worker,
+      /uncertain, incomplete, blocked, or requiring Leader judgment/iu
+    );
+    for (const pattern of evidencePatterns) assert.match(worker, pattern);
+    assert.match(
+      worker,
+      /immutable Run evidence and a Candidate, or Review evidence only/iu
+    );
+    assert.match(
+      worker,
+      /never implies Leader acceptance, WorkItem completion, ChangeSet capture, Integration, or Task completion/iu
+    );
+    assert.match(
+      worker,
+      /Review Runs report findings, verification gaps, and limits; the Leader decides disposition/iu
+    );
+    assert.match(
+      worker,
+      /If the exact yield is denied[\s\S]*do not retry[\s\S]*broaden permissions[\s\S]*wrapper[\s\S]*mutate Yui state[\s\S]*invent delivery evidence/iu
+    );
+    assert.match(worker, /yield command must be your final tool action/iu);
+  }
+});
+
 test("Operator context exposes native developer instructions and a Skill reference", () => {
   const context = compileRoleSessionContext(undefined, {
     ...role,
