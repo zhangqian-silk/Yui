@@ -620,22 +620,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         || active.deliveredAt !== undefined
         || active.effective.agentId !== input.agentId
         || active.effective.adapterId !== input.adapterId
-        || sessions === null
-        || sessions.activeAgentId !== input.agentId
-        || sessions.inFlight?.agentId !== input.agentId
-        || sessions.inFlight.runId !== input.runId
-        || sessions.inFlight.receiptId !== formatAgentRunReceiptId(input.taskId, input.runId)
-        || sessions.inFlight.deliveredAt !== undefined
         || mailbox?.processing?.batchId !== input.mailboxBatchId
         || mailbox.processing.executionRef?.type !== "run"
         || mailbox.processing.executionRef.taskId !== input.taskId
         || mailbox.processing.executionRef.id !== input.runId
-        || !preparedSessionMatches(
+        || !preparedDeliveryFailureSessionFenceMatches(
+          sessions,
           session,
-          input.agentId,
-          input.adapterId,
-          input.nativeSessionId,
-          input.launchId
+          input
         )
         || !preparedReservationMatches(
           runtimeMailbox,
@@ -2244,6 +2236,34 @@ function preparedSessionMatches(
   return launchId === undefined
     ? session.launchId === undefined
     : session.launchId === launchId;
+}
+
+function preparedDeliveryFailureSessionFenceMatches(
+  sessions: TaskRoleSessionSet | null,
+  session: RoleAgentSession | undefined,
+  input: Pick<
+    RoleRunDeliveryFailurePersistence,
+    "taskId" | "agentId" | "adapterId" | "runId" | "nativeSessionId" | "launchId"
+  >
+): boolean {
+  if (sessions === null) return input.nativeSessionId === undefined;
+  if (sessions.activeAgentId !== input.agentId) return false;
+  if (sessions.inFlight === null) {
+    return input.nativeSessionId === undefined
+      && session === undefined
+      && sessions.pendingTurnCompletion === null;
+  }
+  return sessions.inFlight.agentId === input.agentId
+    && sessions.inFlight.runId === input.runId
+    && sessions.inFlight.receiptId === formatAgentRunReceiptId(input.taskId, input.runId)
+    && sessions.inFlight.deliveredAt === undefined
+    && preparedSessionMatches(
+      session,
+      input.agentId,
+      input.adapterId,
+      input.nativeSessionId,
+      input.launchId
+    );
 }
 
 function preparedReservationMatches(

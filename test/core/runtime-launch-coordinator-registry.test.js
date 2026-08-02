@@ -11,6 +11,12 @@ import { RuntimeLaunchCoordinator } from "../../dist/controller/runtimeLaunchCoo
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { ExecutorRegistry } from "../../dist/executor/executorRegistry.js";
 import {
+  bindTaskRoleRun,
+  createRoleSessionSet,
+  markTaskRoleRunDelivered,
+  recordRoleAgentSession
+} from "../../dist/executor/agentExecutor.js";
+import {
   RUNTIME_CLEANUP_REQUIRED_REASON,
   RUNTIME_LAUNCH_RESERVED_REASON,
   hasRuntimeCleanupObligation,
@@ -175,8 +181,8 @@ async function waitFor(predicate, label, timeoutMs = 1_000) {
   assert.fail(`Timed out waiting for ${label}.`);
 }
 
-async function preparedControllerRecoveryFixture(t) {
-  const fx = fixture(t, "claude");
+async function controllerRecoveryFixture(t, persistPrepared) {
+  const fx = fixture(t, persistPrepared ? "claude" : "codex");
   const roleName = "worker";
   const role = fx.roles.get(roleName);
   const item = updateWorkItemStatus(createWorkItem(
@@ -235,7 +241,9 @@ async function preparedControllerRecoveryFixture(t) {
       return runtimeBinding(request, {
         index: controls.starts.length,
         hostCreated,
-        nativeSessionId: "claude-native-recovery"
+        ...(persistPrepared
+          ? { nativeSessionId: "claude-native-recovery" }
+          : {})
       });
     },
     async resume() { throw new Error("resume is not expected"); },
@@ -258,33 +266,70 @@ async function preparedControllerRecoveryFixture(t) {
       return true;
     }
   };
-  const initialDelivery = registry(
-    new RuntimeLaunchCoordinator(fx.schedulerStore, host, {
+  const initialCoordinator = new RuntimeLaunchCoordinator(
+    fx.schedulerStore,
+    host,
+    {
       createGenerationId: () => "original-generation",
       now: () => NOW
-    }),
-    host,
-    async () => "busy",
-    unusedTmux("running")
+    }
   );
-  const [initial] = await processActiveRoleRunDeliveries(
-    fx.schedulerStore,
-    initialDelivery,
-    NOW
-  );
-  assert.equal(initial.reason, "not-ready");
-  const session = fx.store.getRoleSession(fx.task.id, roleName);
-  const launchId = session.launchId;
-  assert.equal(session.nativeSessionId, "claude-native-recovery");
+  let launchId;
+  let session;
+  if (persistPrepared) {
+    const initialDelivery = registry(
+      initialCoordinator,
+      host,
+      async () => "busy",
+      unusedTmux("running")
+    );
+    const [initial] = await processActiveRoleRunDeliveries(
+      fx.schedulerStore,
+      initialDelivery,
+      NOW
+    );
+    assert.equal(initial.reason, "not-ready");
+    session = fx.store.getRoleSession(fx.task.id, roleName);
+    launchId = session.launchId;
+    assert.equal(session.nativeSessionId, "claude-native-recovery");
+  } else {
+    const claim = fx.schedulerStore.claimWorkMailbox({
+      target,
+      batchId: `agent-run:${fx.task.id}/${run.id}`,
+      owner: "controller",
+      now: NOW,
+      executionRef: { type: "run", taskId: fx.task.id, id: run.id }
+    });
+    assert.equal(claim.status, "claimed");
+    const binding = await initialCoordinator.prepare({
+      owner: owner(fx, roleName),
+      agentId: fx.agent.id,
+      adapterId: fx.agent.adapterId,
+      effective: run.effective,
+      workspace: fx.home,
+      mode: "new",
+      runId: run.id
+    }, "deferred");
+    launchId = binding.launchId;
+    session = null;
+    assert.equal(binding.nativeSessionId, undefined);
+    assert.equal(fx.store.getTaskRoleSessionSet(fx.task.id, roleName), null);
+  }
   assertReservation(fx, roleName, launchId, run.id);
   assert.equal(
     fx.store.getWorkMailbox(target).processing.executionRef.id,
     run.id
   );
   assert.equal(
-    fx.store.getTaskRoleSessionSet(fx.task.id, roleName).inFlight.runId,
-    run.id
+    fx.store.getWorkMailbox(target).processing.batchId,
+    `agent-run:${fx.task.id}/${run.id}`
   );
+  if (persistPrepared) {
+    assert.equal(
+      fx.store.getTaskRoleSessionSet(fx.task.id, roleName).inFlight.runId,
+      run.id
+    );
+  }
 
   return {
     ...fx,
@@ -322,6 +367,14 @@ async function preparedControllerRecoveryFixture(t) {
       return { store, adapter, delivery, controller, errors };
     }
   };
+}
+
+function preparedControllerRecoveryFixture(t) {
+  return controllerRecoveryFixture(t, true);
+}
+
+function prePreparedControllerRecoveryFixture(t) {
+  return controllerRecoveryFixture(t, false);
 }
 
 test("fresh Codex Leader and Worker reserve before start and their first matching Hook binds the native session", async (t) => {
@@ -971,6 +1024,235 @@ for (const recoveryLoss of ["stopped", "recreated"]) {
     )), false);
     assert.equal(
       recovery.store.getWorkItem(fx.task.id, fx.item.id).candidates.length,
+      0
+    );
+  });
+}
+
+for (const runtimeState of ["starting", "unavailable"]) {
+  test(`Controller bounds pre-prepared same-Run ${runtimeState} recovery and fails it exactly once`, async (t) => {
+    const fx = await prePreparedControllerRecoveryFixture(t);
+    fx.controls.state = runtimeState;
+    fx.controls.allowStopOwner = false;
+    const recovery = fx.startController(1);
+
+    recovery.controller.signal(`role:${fx.task.id}/${fx.roleName}`);
+    await waitFor(
+      () => recovery.store.getAgentRun(fx.task.id, fx.run.id)?.status === "failed",
+      `the pre-prepared ${runtimeState} Run to exhaust its bounded retry`
+    );
+    await waitFor(
+      () => fx.controls.stoppedOwners.includes(fx.roleName),
+      `the pre-prepared ${runtimeState} cleanup attempt`
+    );
+
+    assert.equal(recovery.store.getActiveAgentRun(fx.task.id, fx.roleName), null);
+    assert.equal(recovery.store.getTaskRoleSessionSet(fx.task.id, fx.roleName), null);
+    assert.equal(
+      hasRuntimeCleanupObligation(reservationMailbox(fx, fx.roleName)),
+      true
+    );
+    const failedItem = recovery.store.getWorkItem(fx.task.id, fx.item.id);
+    assert.equal(failedItem.status, "failed");
+    assert.equal(failedItem.candidates.length, 0);
+    const workerStarts = fx.controls.starts.filter(
+      (request) => request.owner.roleName === fx.roleName
+    );
+    assert.equal(workerStarts.length, 1);
+    assert.deepEqual(
+      new Set(workerStarts.map((request) => request.launchId)),
+      new Set([fx.launchId])
+    );
+    assert.equal(fx.controls.hostCreations, 1);
+
+    fx.controls.allowStopOwner = true;
+    recovery.controller.signal(`role:${fx.task.id}/${fx.roleName}`);
+    await waitFor(
+      () => reservationMailbox(fx, fx.roleName) === null,
+      `the pre-prepared ${runtimeState} cleanup confirmation`
+    );
+    assert.equal(recovery.adapter.classifyRuntimeTurnCompleted({
+      taskId: fx.task.id,
+      roleName: fx.roleName,
+      agentId: fx.agent.id,
+      adapterId: fx.agent.adapterId,
+      launchId: fx.launchId,
+      nativeSessionId: "late-native-prepared-gap",
+      turnId: `late-pre-prepared-${runtimeState}`,
+      runId: fx.run.id
+    }), "obsolete");
+
+    const failureEvents = recovery.store.listEvents(fx.task.id).filter(
+      (event) => event.type === "runtime.role-delivery-failed"
+        && event.payload.runId === fx.run.id
+    ).length;
+    assert.equal(failureEvents, 1);
+    const workerStartCount = workerStarts.length;
+    const restarted = fx.startController(1);
+    await restarted.controller.pump();
+    assert.equal(
+      fx.controls.starts.filter(
+        (request) => request.owner.roleName === fx.roleName
+      ).length,
+      workerStartCount
+    );
+    assert.equal(restarted.store.listEvents(fx.task.id).filter(
+      (event) => event.type === "runtime.role-delivery-failed"
+        && event.payload.runId === fx.run.id
+    ).length, failureEvents);
+    assert.equal(
+      restarted.store.getWorkItem(fx.task.id, fx.item.id).candidates.length,
+      0
+    );
+  });
+}
+
+for (const recoveryLoss of ["stopped", "recreated"]) {
+  test(`Controller immediately terminalizes a pre-prepared same-Run ${recoveryLoss} generation loss`, async (t) => {
+    const fx = await prePreparedControllerRecoveryFixture(t);
+    fx.controls.allowStopOwner = false;
+    if (recoveryLoss === "stopped") {
+      fx.controls.state = "stopped";
+    } else {
+      fx.controls.state = "running";
+      fx.controls.recreateNextStart = true;
+    }
+    const recovery = fx.startController(10);
+
+    await recovery.controller.pump();
+    assert.equal(
+      recovery.store.getAgentRun(fx.task.id, fx.run.id).status,
+      "failed"
+    );
+    assert.equal(recovery.store.getActiveAgentRun(fx.task.id, fx.roleName), null);
+    assert.equal(recovery.store.getTaskRoleSessionSet(fx.task.id, fx.roleName), null);
+    assert.equal(
+      hasRuntimeCleanupObligation(reservationMailbox(fx, fx.roleName)),
+      true
+    );
+    const workerStarts = fx.controls.starts.filter(
+      (request) => request.owner.roleName === fx.roleName
+    );
+    assert.equal(workerStarts.length, recoveryLoss === "stopped" ? 1 : 2);
+    assert.deepEqual(
+      new Set(workerStarts.map((request) => request.launchId)),
+      new Set([fx.launchId])
+    );
+    assert.equal(
+      recovery.store.getWorkItem(fx.task.id, fx.item.id).candidates.length,
+      0
+    );
+
+    await waitFor(
+      () => fx.controls.stoppedOwners.includes(fx.roleName),
+      `the pre-prepared ${recoveryLoss} cleanup attempt`
+    );
+    fx.controls.allowStopOwner = true;
+    recovery.controller.signal(`role:${fx.task.id}/${fx.roleName}`);
+    await waitFor(
+      () => reservationMailbox(fx, fx.roleName) === null,
+      `the pre-prepared ${recoveryLoss} cleanup confirmation`
+    );
+    assert.equal(recovery.adapter.classifyRuntimeTurnCompleted({
+      taskId: fx.task.id,
+      roleName: fx.roleName,
+      agentId: fx.agent.id,
+      adapterId: fx.agent.adapterId,
+      launchId: fx.launchId,
+      nativeSessionId: "late-native-prepared-gap",
+      turnId: `late-pre-prepared-${recoveryLoss}`,
+      runId: fx.run.id
+    }), "obsolete");
+  });
+}
+
+for (const initialState of ["starting", "unavailable"]) {
+  test(`Controller persists and delivers a pre-prepared ${initialState}-to-running Run on its original generation`, async (t) => {
+    const fx = await prePreparedControllerRecoveryFixture(t);
+    fx.controls.inspections.push(initialState, "running");
+    fx.controls.pushOutcome = "sent";
+    const recovery = fx.startController(2);
+
+    recovery.controller.signal(`role:${fx.task.id}/${fx.roleName}`);
+    await waitFor(
+      () => recovery.store.getAgentRun(fx.task.id, fx.run.id)?.deliveredAt !== undefined,
+      `the pre-prepared ${initialState} Run to deliver`
+    );
+
+    const delivered = recovery.store.getAgentRun(fx.task.id, fx.run.id);
+    assert.equal(delivered.status, "active");
+    const sessions = recovery.store.getTaskRoleSessionSet(
+      fx.task.id,
+      fx.roleName
+    );
+    assert.equal(sessions.sessions[fx.agent.id], undefined);
+    assert.equal(sessions.inFlight.runId, fx.run.id);
+    assert.notEqual(sessions.inFlight.deliveredAt, undefined);
+    const workerStarts = fx.controls.starts.filter(
+      (request) => request.owner.roleName === fx.roleName
+    );
+    assert.equal(workerStarts.length, 2);
+    assert.equal(fx.controls.hostCreations, 1);
+    assert.deepEqual(
+      new Set(workerStarts.map((request) => request.launchId)),
+      new Set([fx.launchId])
+    );
+    assertReservation(fx, fx.roleName, fx.launchId, fx.run.id);
+    const item = recovery.store.getWorkItem(fx.task.id, fx.item.id);
+    assert.equal(item.status, "running");
+    assert.equal(item.candidates.length, 0);
+    assert.deepEqual(recovery.errors, []);
+  });
+}
+
+for (const conflict of ["session", "in-flight"]) {
+  test(`pre-prepared exact failure keeps the existing ${conflict} fence strict`, async (t) => {
+    const fx = await prePreparedControllerRecoveryFixture(t);
+    let sessions = createRoleSessionSet(
+      owner(fx, fx.roleName),
+      fx.agent.id,
+      NOW
+    );
+    if (conflict === "session") {
+      sessions = recordRoleAgentSession(sessions, {
+        agentId: fx.agent.id,
+        adapterId: fx.agent.adapterId,
+        nativeSessionId: "unexpected-native-session",
+        launchId: fx.launchId,
+        policy: "fixed",
+        status: "running",
+        effective: fx.run.effective
+      }, NOW);
+    } else {
+      sessions = bindTaskRoleRun(sessions, {
+        agentId: fx.agent.id,
+        runId: fx.run.id,
+        receiptId: `agent-run:${fx.task.id}/${fx.run.id}`
+      }, NOW);
+      sessions = markTaskRoleRunDelivered(sessions, {
+        agentId: fx.agent.id,
+        runId: fx.run.id,
+        receiptId: `agent-run:${fx.task.id}/${fx.run.id}`
+      }, NOW);
+    }
+    fx.store.saveTaskRoleSessionSet(sessions);
+    const roleMailbox = fx.store.getWorkMailbox(fx.target);
+
+    assert.equal(fx.schedulerStore.saveRoleRunDeliveryFailure({
+      taskId: fx.task.id,
+      roleName: fx.roleName,
+      agentId: fx.agent.id,
+      adapterId: fx.agent.adapterId,
+      runId: fx.run.id,
+      mailboxBatchId: roleMailbox.processing.batchId,
+      launchId: fx.launchId,
+      now: NOW
+    }), "state-changed");
+    assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).status, "active");
+    assert.equal(fx.store.getActiveAgentRun(fx.task.id, fx.roleName).id, fx.run.id);
+    assertReservation(fx, fx.roleName, fx.launchId, fx.run.id);
+    assert.equal(
+      fx.store.getWorkItem(fx.task.id, fx.item.id).candidates.length,
       0
     );
   });
