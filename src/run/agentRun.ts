@@ -183,11 +183,11 @@ export function validateAgentRun(run: AgentRun): AgentRun {
 }
 
 export function yieldAgentRun(run: AgentRun, summary: string, now: Date): AgentRun {
-  return finishAgentRun(run, "yielded", requireText(summary, "Agent run summary"), now);
+  return finishAgentRun(run, "yielded", requireResultText(summary, "Agent run summary"), now);
 }
 
 export function failAgentRun(run: AgentRun, summary: string, now: Date): AgentRun {
-  return finishAgentRun(run, "failed", requireText(summary, "Agent run summary"), now);
+  return finishAgentRun(run, "failed", requireResultText(summary, "Agent run summary"), now);
 }
 
 function finishAgentRun(
@@ -223,6 +223,13 @@ function requireText(value: string, label: string): string {
   const normalized = value.trim();
   if (normalized.length === 0) throw new Error(`${label} is required.`);
   return normalized;
+}
+
+/** Result transport preserves the provider's complete text, including outer whitespace. */
+function requireResultText(value: string, label: string): string {
+  if (typeof value !== "string" || value.includes("\0")) throw new Error(`${label} is invalid.`);
+  if (value.trim().length === 0) throw new Error(`${label} is required.`);
+  return value;
 }
 
 function requireTimestamp(value: string, label: string): void {

@@ -1,6 +1,14 @@
 export type TaskPriority = "low" | "medium" | "high" | "urgent";
-export type TaskStatus = "draft" | "active" | "completed" | "archived";
+export type TaskStatus =
+  | "draft"
+  | "active"
+  | "completed"
+  | "cancelled"
+  | "superseded"
+  | "abandoned"
+  | "archived";
 export type TaskCompletedBy = "user" | "operator" | "leader";
+export type TaskRetirementStatus = "cancelled" | "superseded" | "abandoned";
 
 export type TaskProjectBinding = Readonly<{
   projectId: string;
@@ -30,7 +38,7 @@ export type TaskMetadataUpdate = Partial<{
 }>;
 
 export type Task = {
-  schemaVersion: 2;
+  schemaVersion: 3;
   id: string;
   title: string;
   description?: string;
@@ -44,6 +52,11 @@ export type Task = {
   completedAt?: string;
   completedBy?: TaskCompletedBy;
   completionSummary?: string;
+  retiredAt?: string;
+  retiredBy?: TaskCompletedBy;
+  retirementSummary?: string;
+  retiredAs?: TaskRetirementStatus;
+  replacementTaskId?: string;
   archivedAt?: string;
   archivedBy?: "user" | "operator" | "leader";
   archiveReason?: string;
@@ -55,7 +68,7 @@ export type Task = {
 export function createTask(id: string, title: string, now: Date, metadata: TaskMetadata = {}): Task {
   const timestamp = now.toISOString();
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: requireSafeIdentity(id, "Task id"),
     title: requireText(title, "Task title"),
     ...cloneMetadata(metadata),
@@ -68,8 +81,76 @@ export function createTask(id: string, title: string, now: Date, metadata: TaskM
 export function activateTask(task: Task, now: Date): Task {
   if (task.status === "archived") throw new Error(`Cannot activate archived Task: ${task.id}.`);
   if (task.status === "completed") throw new Error(`Cannot activate completed Task ${task.id}; reopen it instead.`);
+  if (["cancelled", "superseded", "abandoned"].includes(task.status)) {
+    throw new Error(`Cannot activate retired Task: ${task.id}/${task.status}.`);
+  }
   if (task.status === "active") return task;
   return { ...task, status: "active", updatedAt: now.toISOString() };
+}
+
+export type TaskRetirementInput = Readonly<{
+  status: TaskRetirementStatus;
+  by: TaskCompletedBy;
+  summary: string;
+  replacementTaskId?: string;
+}>;
+
+/** Explicitly retires a stale aggregate while retaining all historical facts. */
+export function retireTask(
+  task: Task,
+  input: TaskRetirementInput,
+  now: Date
+): Task {
+  validateTask(task);
+  if (!( ["cancelled", "superseded", "abandoned"] as const).includes(input.status)) {
+    throw new Error(`Task retirement status is invalid: ${String(input.status)}.`);
+  }
+  const summary = requireText(input.summary, "Task retirement summary");
+  const by = input.by;
+  if (!( ["user", "operator", "leader"] as const).includes(by)) {
+    throw new Error(`Task retirement actor is invalid: ${String(by)}.`);
+  }
+  if (input.status === "superseded") {
+    if (input.replacementTaskId === undefined) {
+      throw new Error("A superseded Task requires a replacement Task reference.");
+    }
+    const replacementTaskId = requireSafeIdentity(
+      input.replacementTaskId,
+      "Replacement Task id"
+    );
+    if (replacementTaskId === task.id) {
+      throw new Error("A Task cannot replace itself.");
+    }
+  } else if (input.replacementTaskId !== undefined) {
+    throw new Error("Only a superseded Task may reference a replacement.");
+  }
+  if (["cancelled", "superseded", "abandoned"].includes(task.status)) {
+    if (
+      task.status === input.status
+      && task.retiredBy === by
+      && task.retirementSummary === summary
+      && task.replacementTaskId === input.replacementTaskId
+    ) {
+      return task;
+    }
+    throw new Error(`Task already has an explicit retirement: ${task.id}.`);
+  }
+  if (task.status === "archived" || task.status === "completed") {
+    throw new Error(`Task cannot be retired from ${task.status}: ${task.id}.`);
+  }
+  const timestamp = now.toISOString();
+  return validateTask({
+    ...task,
+    status: input.status,
+    retiredAt: timestamp,
+    retiredBy: by,
+    retirementSummary: summary,
+    retiredAs: input.status,
+    ...(input.replacementTaskId === undefined
+      ? {}
+      : { replacementTaskId: input.replacementTaskId }),
+    updatedAt: timestamp
+  });
 }
 
 export function completeTask(
@@ -112,8 +193,12 @@ export function archiveTask(
   archive?: { by: NonNullable<Task["archivedBy"]>; reason?: string; summary?: string }
 ): Task {
   if (task.status === "archived") return task;
+  if (task.status !== "completed"
+    && !["cancelled", "superseded", "abandoned"].includes(task.status)) {
+    throw new Error(`Only a completed or retired Task can be archived: ${task.id}.`);
+  }
   const timestamp = now.toISOString();
-  return {
+  return validateTask({
     ...task,
     status: "archived",
     archivedAt: timestamp,
@@ -121,7 +206,7 @@ export function archiveTask(
     ...(archive?.reason === undefined ? {} : { archiveReason: archive.reason.trim() }),
     ...(archive?.summary === undefined ? {} : { archiveSummary: archive.summary.trim() }),
     updatedAt: timestamp
-  };
+  });
 }
 
 export function updateTaskArchived(
@@ -177,10 +262,10 @@ export function isTaskArchived(task: Task): boolean {
 }
 
 export function validateTask(task: Task): Task {
-  if (task.schemaVersion !== 2) throw new Error("Task must use schemaVersion 2.");
+  if (task.schemaVersion !== 3) throw new Error("Task must use schemaVersion 3.");
   requireSafeIdentity(task.id, "Task id");
   requireText(task.title, "Task title");
-  if (!(["draft", "active", "completed", "archived"] as const).includes(task.status)) {
+  if (!(["draft", "active", "completed", "cancelled", "superseded", "abandoned", "archived"] as const).includes(task.status)) {
     throw new Error(`Task status is invalid: ${String(task.status)}.`);
   }
   requireTimestamp(task.createdAt, "Task createdAt");
@@ -219,8 +304,56 @@ export function validateTask(task: Task): Task {
   if (task.status === "completed" && !hasAllCompletion) {
     throw new Error("A completed Task requires completedAt, completedBy, and completionSummary.");
   }
-  if ((task.status === "draft" || task.status === "active") && hasAnyCompletion) {
+  if (["draft", "active", "cancelled", "superseded", "abandoned"].includes(task.status)
+    && hasAnyCompletion) {
     throw new Error(`Task completion metadata is invalid for ${task.status} status.`);
+  }
+
+  const retirementFields = [
+    task.retiredAt,
+    task.retiredBy,
+    task.retirementSummary,
+    task.retiredAs,
+    task.replacementTaskId
+  ];
+  const hasAnyRetirement = retirementFields.some((value) => value !== undefined);
+  const retired = task.status === "cancelled"
+    || task.status === "superseded"
+    || task.status === "abandoned";
+  const archivedRetirement = task.status === "archived" && hasAnyRetirement;
+  if (retired || archivedRetirement) {
+    if (
+      task.retiredAt === undefined
+      || task.retiredBy === undefined
+      || task.retirementSummary === undefined
+      || task.retiredAs === undefined
+    ) {
+      throw new Error(
+        "A retired Task requires retiredAt, retiredBy, retiredAs, and retirementSummary."
+      );
+    }
+    requireTimestamp(task.retiredAt, "Task retiredAt");
+    if (!( ["user", "operator", "leader"] as const).includes(task.retiredBy)) {
+      throw new Error(`Task retiredBy is invalid: ${String(task.retiredBy)}.`);
+    }
+    requireText(task.retirementSummary, "Task retirement summary");
+    if (!( ["cancelled", "superseded", "abandoned"] as const).includes(task.retiredAs)) {
+      throw new Error(`Task retiredAs is invalid: ${String(task.retiredAs)}.`);
+    }
+    if (retired && task.retiredAs !== task.status) {
+      throw new Error("Task retiredAs must match its retirement status.");
+    }
+    if (task.retiredAs === "superseded") {
+      const replacementTaskId = requireSafeIdentity(
+        task.replacementTaskId ?? "",
+        "Replacement Task id"
+      );
+      if (replacementTaskId === task.id) throw new Error("A Task cannot replace itself.");
+    } else if (task.replacementTaskId !== undefined) {
+      throw new Error("Only a superseded Task may reference a replacement.");
+    }
+  } else if (hasAnyRetirement) {
+    throw new Error(`Task retirement metadata is invalid for ${task.status} status.`);
   }
 
   const hasAnyArchive = [task.archivedAt, task.archivedBy, task.archiveReason, task.archiveSummary]
@@ -235,6 +368,11 @@ export function validateTask(task: Task): Task {
     }
     if (task.archiveReason !== undefined) requireText(task.archiveReason, "Task archive reason");
     if (task.archiveSummary !== undefined) requireText(task.archiveSummary, "Task archive summary");
+    if (hasAllCompletion === hasAnyRetirement) {
+      throw new Error(
+        "An archived Task must preserve exactly one completion or retirement outcome."
+      );
+    }
   } else if (hasAnyArchive) {
     throw new Error(`Task archive metadata is invalid for ${task.status} status.`);
   }

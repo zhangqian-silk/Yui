@@ -351,7 +351,7 @@ yui task work accept <task-id>/<work-item-id> --summary "Acceptance criteria met
 ```
 
 Use `task work reject` to return an awaiting result for repair and redispatch,
-and `task work cancel` for obsolete non-running work. WorkItem and Integration
+and `task work dispose` for explicit terminal disposition. WorkItem and Integration
 worktrees and check logs remain available as evidence until explicit cleanup.
 
 For long-running Tasks, the Leader keeps Yui—not a native transcript—as the

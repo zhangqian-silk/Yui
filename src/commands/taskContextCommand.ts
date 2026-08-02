@@ -11,7 +11,8 @@ const TERMINAL_WORK_ITEM_STATUSES = new Set([
   "completed",
   "failed",
   "cancelled",
-  "superseded"
+  "superseded",
+  "abandoned"
 ]);
 
 export function runTaskContextCommand(args: string[], store: TaskStore) {
@@ -81,6 +82,8 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     ...(task.tags === undefined ? [] : [`Tags: ${task.tags.join(", ")}`]),
     ...(task.dueAt === undefined ? [] : [`Due: ${formatTimestamp(task.dueAt, timeZone)}`]),
     ...(task.completionSummary === undefined ? [] : [`Completion summary: ${task.completionSummary}`]),
+    ...(task.retirementSummary === undefined ? [] : [`Retirement summary: ${task.retirementSummary}`]),
+    ...(task.replacementTaskId === undefined ? [] : [`Replacement Task: ${task.replacementTaskId}`]),
     ...(task.archiveSummary === undefined ? [] : [`Archive summary: ${task.archiveSummary}`]),
     ...(task.projectBindings.length === 0
       ? []

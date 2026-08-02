@@ -160,6 +160,10 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
     /one bounded evidence pass[\s\S]*Do not repeat successful\s+checks[\s\S]*yield immediately/ui
   );
   assert.match(worker, /do not wrap it in `until`[\s\S]*duplicate or late\s+review yield is obsolete/u);
+  assert.match(
+    worker,
+    /For a managed Claude Run[\s\S]*managed Stop hook[\s\S]*never successful Candidates/u
+  );
 });
 
 test("publish builds once and smokes the same package on Node 20, 22, and 24", () => {

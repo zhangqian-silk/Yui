@@ -24,7 +24,7 @@ import { processOperatorInputNotifications } from "../../dist/scheduler/operator
 import { queueLeaderWakeup } from "../../dist/scheduler/wakeupQueue.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
-import { activateTask, archiveTask, createTask } from "../../dist/task/task.js";
+import { activateTask, archiveTask, completeTask, createTask } from "../../dist/task/task.js";
 import { createWorkItem, updateWorkItemStatus } from "../../dist/workItem/workItem.js";
 
 function fixture(t) {
@@ -1601,7 +1601,10 @@ test("dormant-session CAS rejects a Hook-updated session and stops an unchanged 
 
 test("a late Codex notify cannot reactivate a session after Task archive", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
-  store.saveTask(archiveTask(task, new Date(now.getTime() + 1_000)));
+  store.saveTask(archiveTask(
+    completeTask(task, now, { by: "leader", summary: "Fixture complete." }),
+    new Date(now.getTime() + 1_000)
+  ));
 
   assert.throws(() => adapter.recordRuntimeNativeSession({
     taskId: task.id,

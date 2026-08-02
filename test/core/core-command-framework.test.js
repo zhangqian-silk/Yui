@@ -91,6 +91,7 @@ test("the declarative catalog exposes exactly the lean public command surface", 
     "task activate",
     "task complete",
     "task reopen",
+    "task retire",
     "task list",
     "task show",
     "task context",
@@ -118,6 +119,7 @@ test("the declarative catalog exposes exactly the lean public command surface", 
     "task work",
     "task work create",
     "task work list",
+    "task work show",
     "task work update",
     "task work scope",
     "task work dispatch",
@@ -129,7 +131,7 @@ test("the declarative catalog exposes exactly the lean public command surface", 
     "task work review preserve",
     "task work accept",
     "task work reject",
-    "task work cancel",
+    "task work dispose",
     "task run",
     "task run list",
     "task run retry",
@@ -166,7 +168,7 @@ test("the declarative catalog exposes exactly the lean public command surface", 
   const internal = ROOT_COMMAND.children.find((child) => child.name === "internal");
   assert.ok(internal);
   assert.equal(internal.hidden, true);
-  assert.deepEqual(internal.children.map((child) => child.name), ["session-notify"]);
+  assert.deepEqual(internal.children.map((child) => child.name), ["session-notify", "claude-hook"]);
   const completion = ROOT_COMMAND.children.find((child) => child.name === "completion");
   assert.ok(completion);
   assert.equal(completion.children.find((child) => child.name === "candidates")?.hidden, true);
@@ -277,6 +279,9 @@ test("the canonical execution commands are callable while the redundant yield al
   const internal = routeInvocation(["internal", "session-notify", "{}"]);
   assert.equal(internal.kind, "execute");
   assert.deepEqual(internal.node.path, ["yui", "internal", "session-notify"]);
+  const claudeHook = routeInvocation(["internal", "claude-hook"]);
+  assert.equal(claudeHook.kind, "execute");
+  assert.deepEqual(claudeHook.node.path, ["yui", "internal", "claude-hook"]);
 
   const completion = routeInvocation([
     "completion", "candidates", "--shell", "zsh", "--index", "1", "--", "task"

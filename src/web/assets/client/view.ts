@@ -1,5 +1,14 @@
 export const VIEW_SCRIPT = `
-const statuses = ["all", "active", "draft", "completed", "archived"];
+const statuses = [
+  "all",
+  "active",
+  "draft",
+  "completed",
+  "cancelled",
+  "superseded",
+  "abandoned",
+  "archived"
+];
 
 function node(tagName, className, textContent) {
   const element = document.createElement(tagName);
@@ -244,6 +253,9 @@ export function renderOverview(detail, state, t, locale, onSelect) {
     ["active", counts ? counts.active : 0],
     ["draft", counts ? counts.draft : 0],
     ["completed", counts ? counts.completed : 0],
+    ["cancelled", counts ? counts.cancelled : 0],
+    ["superseded", counts ? counts.superseded : 0],
+    ["abandoned", counts ? counts.abandoned : 0],
     ["archived", counts ? counts.archived : 0]
   ];
   if (counts && counts.total > 0) {
@@ -342,6 +354,20 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
       meta.append(node("span", "", t("detail.completedBy") + " · " + authorName(t, task.completedBy)));
     }
     if (task.completedAt) meta.append(node("time", "", formatDateTime(task.completedAt, locale)));
+    if (meta.childNodes.length) conclusion.append(meta);
+    detail.append(conclusion);
+  } else if (task.retirementSummary || ["cancelled", "superseded", "abandoned"].includes(task.status)) {
+    const conclusion = node("section", "conclusion retired");
+    conclusion.append(node("h3", "", t("detail.retired")));
+    if (task.retirementSummary) conclusion.append(node("p", "", task.retirementSummary));
+    if (task.replacementTaskId) {
+      conclusion.append(node("p", "record-copy muted", t("detail.replacement") + " · " + task.replacementTaskId));
+    }
+    const meta = node("div", "run-meta");
+    if (task.retiredBy) {
+      meta.append(node("span", "", t("detail.retiredBy") + " · " + authorName(t, task.retiredBy)));
+    }
+    if (task.retiredAt) meta.append(node("time", "", formatDateTime(task.retiredAt, locale)));
     if (meta.childNodes.length) conclusion.append(meta);
     detail.append(conclusion);
   } else if (task.status === "archived" || task.archiveSummary || task.archiveReason) {

@@ -422,7 +422,7 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
     ], store, lifecycleLeaderNow);
   }
   runTaskCommand([
-    "work", "cancel", `${lifecycleTask.id}/${lifecycleWork.id}`,
+    "work", "dispose", `${lifecycleTask.id}/${lifecycleWork.id}`, "cancelled",
     "--summary", "First lifecycle pass settled."
   ], store, lifecycleLeaderNow);
   runTaskCommand([
@@ -434,7 +434,7 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   ], store, lifecycleLeaderNow).data.workItem;
   assert.equal(secondLifecycleWork.id, "work-item-2");
   runTaskCommand([
-    "work", "cancel", `${lifecycleTask.id}/${secondLifecycleWork.id}`,
+    "work", "dispose", `${lifecycleTask.id}/${secondLifecycleWork.id}`, "cancelled",
     "--summary", "Second lifecycle pass settled."
   ], store, lifecycleLeaderNow);
   runTaskCommand([

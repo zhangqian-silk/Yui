@@ -53,7 +53,8 @@ round, result, and checks in the WorkItem summary.
 
 ## Task Role AgentRun
 
-The managed input names the current Run ID. Before ending, execute its exact:
+The managed input names the current Run ID. Before ending a Codex Run, execute
+its exact:
 
 ```sh
 yui task run yield <current-run-id> --summary "<outcome and evidence>"
@@ -81,6 +82,14 @@ executing `yield` does not deliver the Run. Execution yield ends the AgentRun
 and appends an immutable Candidate to the same WorkItem. Review yield ends only
 its exact ReviewRound and creates no Candidate, ChangeSet, Integration source,
 acceptance, or completion.
+
+For a managed Claude Run, return the complete outcome and evidence in the final
+assistant message. Yui's managed Stop hook durably records that exact result and
+terminalizes the exact Run; an explicit direct `yui task run yield <run>
+--summary "<outcome and evidence>"` remains supported. Do not require a heredoc,
+temporary file, permission bypass, or user/project `.claude` configuration for
+result transport. Permission denial, missing result, and StopFailure are
+failures, never successful Candidates or completed ReviewRounds.
 
 Leave managed workspaces intact. The Leader may route a ReviewRound evidence
 SHA or findings back to the original Worker, which continues in its unchanged

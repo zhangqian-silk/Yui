@@ -39,6 +39,9 @@ import {
   yieldAgentRun,
   type AgentRun
 } from "../run/agentRun.js";
+import { terminalizeExactTaskRun } from "../lifecycle/exactRunTerminalization.js";
+import { queueReviewRound } from "../commands/taskCommands.js";
+import type { TaskClaudeLifecycleEvent } from "./runtimeEventProcessor.js";
 import type {
   DormantRuntimeOwnerCandidate,
   LeaderDispatchFailurePersistence,
@@ -55,7 +58,10 @@ import { createLeaderRecoveryNotification } from "../scheduler/operatorNotificat
 import { pendingWakeupsMatch } from "../scheduler/pendingWakeup.js";
 import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import { updateWorkItemStatus } from "../workItem/workItem.js";
+import {
+  submitWorkItemCandidate,
+  updateWorkItemStatus
+} from "../workItem/workItem.js";
 import {
   formatAgentRunReceiptId,
   formatTaskRecordReference
@@ -546,12 +552,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           existing?.agentId !== input.session.agentId
           || existing.adapterId !== input.session.adapterId
           || existing.nativeSessionId !== input.session.nativeSessionId
+          || (input.launchId !== undefined && existing.launchId !== input.launchId)
           || existing.status !== "running"
         ) {
           saveTaskSession(store, role, {
             ...input.session,
             nativeSessionId: input.session.nativeSessionId
-          }, "running", input.now);
+          }, "running", input.now, input.launchId);
         }
         completePreparedRuntimeReservation(store, reservation);
       }
@@ -577,11 +584,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           existing
         );
         if (existing?.nativeSessionId !== input.session.nativeSessionId
+          || (input.launchId !== undefined && existing.launchId !== input.launchId)
           || existing.status !== "running") {
           saveTaskSession(store, role, {
             ...input.session,
             nativeSessionId: input.session.nativeSessionId
-          }, "running", input.now);
+          }, "running", input.now, input.launchId);
         }
         completePreparedRuntimeReservation(store, reservation);
       }
@@ -694,7 +702,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       store.saveWorkMailbox(completeProcessing(mailbox, mailbox.processing.batchId));
       if (currentRun.purpose === "execution" && currentRun.workItemId !== undefined) {
         const workItem = store.getWorkItem(task.id, currentRun.workItemId);
-        if (workItem !== null && !["completed", "failed", "cancelled", "superseded"].includes(workItem.status)) {
+        if (workItem !== null && !["completed", "failed", "cancelled", "superseded", "abandoned"].includes(workItem.status)) {
           store.saveWorkItem(
             task.id,
             updateWorkItemStatus(workItem, "failed", input.now, input.summary)
@@ -758,7 +766,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }
 
   reserveRuntimeLaunch(
-    input: Readonly<{ owner: RuntimeRoleOwner; launchId: string }>,
+    input: Readonly<{ owner: RuntimeRoleOwner; launchId: string; runId?: string }>,
     assertCurrent: () => void,
     now = new Date()
   ): Readonly<{
@@ -790,7 +798,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         RUNTIME_LAUNCH_RESERVED_REASON,
         now,
         input.owner.scope === "task"
-          ? [{ type: "task", id: input.owner.taskId }]
+          ? [{ type: "task", id: input.owner.taskId } as const]
           : []
       );
       const queued = store.getWorkMailbox(target);
@@ -1012,8 +1020,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return this.store.transaction((store) => {
       const task = store.getTask(input.taskId);
       if (task === null) throw new Error(`Task not found: ${input.taskId}.`);
-      if (task.status === "archived") {
-        throw new Error(`Cannot complete a runtime turn for archived Task: ${input.taskId}.`);
+      if (task.status !== "active") {
+        throw new Error(`Cannot complete a runtime turn for inactive Task: ${input.taskId}.`);
       }
       const role = requireRole(store, input.taskId, input.roleName);
       let sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName)
@@ -1093,6 +1101,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         agentId: input.agentId,
         adapterId: input.adapterId,
         nativeSessionId: input.nativeSessionId,
+        ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
         policy: "fixed",
         status: sessions.inFlight === null ? idleStatus : "running",
         effective
@@ -1243,8 +1252,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return this.store.transaction((store) => {
       const task = store.getTask(input.taskId);
       if (task === null) throw new Error(`Task not found: ${input.taskId}.`);
-      if (task.status === "archived") {
-        throw new Error(`Cannot complete a runtime turn for archived Task: ${input.taskId}.`);
+      if (task.status !== "active") {
+        throw new Error(`Cannot complete a runtime turn for inactive Task: ${input.taskId}.`);
       }
       const role = requireRole(store, input.taskId, input.roleName);
       const current = store.getRoleSessionSet(input.taskId, input.roleName)
@@ -1289,6 +1298,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             agentId: input.agentId,
             adapterId: input.adapterId,
             nativeSessionId: input.nativeSessionId,
+            ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
             policy: "fixed",
             status: "ready",
             effective
@@ -1337,7 +1347,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         ));
         if (active.purpose === "execution" && active.workItemId !== undefined) {
           const item = store.getWorkItem(task.id, active.workItemId);
-          if (item !== null && !["completed", "failed", "cancelled", "superseded"].includes(item.status)) {
+          if (item !== null && !["completed", "failed", "cancelled", "superseded", "abandoned"].includes(item.status)) {
             store.saveWorkItem(
               task.id,
               updateWorkItemStatus(item, "failed", now, summary)
@@ -1458,10 +1468,227 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     });
   }
 
+  classifyClaudeLifecycleEvent(
+    input: TaskClaudeLifecycleEvent
+  ): "apply" | "obsolete" {
+    const task = this.store.getTask(input.taskId);
+    if (task?.status !== "active") return "obsolete";
+    const role = this.store.getRole(input.taskId, input.roleName);
+    if (role === null) return "obsolete";
+    const run = this.store.getAgentRun(input.taskId, input.runId);
+    const active = this.store.getActiveAgentRun(input.taskId, input.roleName);
+    if (
+      run === null
+      || run.status !== "active"
+      || active?.id !== run.id
+      || run.roleName !== input.roleName
+      || run.effective.agentId !== input.agentId
+      || run.effective.adapterId !== "claude"
+      || input.adapterId !== "claude"
+    ) return "obsolete";
+    const sessions = this.store.getTaskRoleSessionSet(input.taskId, input.roleName);
+    const session = sessions?.sessions[input.agentId];
+    if (
+      sessions === null
+      || session?.nativeSessionId !== input.nativeSessionId
+      || session.launchId !== input.launchId
+      || sessions.inFlight?.agentId !== input.agentId
+      || sessions.inFlight.runId !== input.runId
+      || sessions.inFlight.receiptId !== `agent-run:${input.taskId}/${input.runId}`
+    ) return "obsolete";
+    return "apply";
+  }
+
+  observeClaudeLifecycleEvent(
+    input: TaskClaudeLifecycleEvent,
+    now = new Date()
+  ): Readonly<{ disposition: "applied" | "obsolete"; runId: string }> {
+    return this.store.transaction((store) => {
+      const before = store.getAgentRun(input.taskId, input.runId);
+      if (before === null) {
+        recordObsoleteRuntimeEvent(store, input, "run-missing", now);
+        return { disposition: "obsolete", runId: input.runId };
+      }
+      const summary = input.type === "claude-stop"
+        ? input.result!
+        : claudeStopFailureSummary(input);
+      const result = terminalizeExactTaskRun(store, {
+        taskId: input.taskId,
+        roleName: input.roleName,
+        agentId: input.agentId,
+        runId: input.runId,
+        receiptId: `agent-run:${input.taskId}/${input.runId}`,
+        nativeSessionId: input.nativeSessionId,
+        launchId: input.launchId,
+        outcome: {
+          status: input.type === "claude-stop" ? "yielded" : "failed",
+          summary
+        }
+      }, now);
+      if (result.disposition === "obsolete" || result.run === null) {
+        recordObsoleteRuntimeEvent(
+          store,
+          input,
+          result.reason ?? "identity-mismatch-or-terminal",
+          now
+        );
+        return { disposition: "obsolete", runId: input.runId };
+      }
+
+      const terminal = result.run;
+      const message = createTaskMessage(
+        store.nextMessageId(input.taskId),
+        input.taskId,
+        summary,
+        "role-result",
+        { type: "role", roleName: input.roleName },
+        now,
+        {
+          runId: input.runId,
+          ...(before.workItemId === undefined ? {} : { workItemId: before.workItemId })
+        }
+      );
+      store.saveMessage(input.taskId, message);
+      store.saveEvent(input.taskId, createTaskEvent(
+        store.nextEventId(input.taskId),
+        input.taskId,
+        "message.sent",
+        { messageId: message.id, kind: message.kind },
+        now
+      ));
+
+      let leaderReason: string | null = null;
+      if (input.type === "claude-stop") {
+        if (before.purpose === "review") {
+          leaderReason = "review-result";
+        } else if (before.workItemId !== undefined) {
+          const item = store.getWorkItem(input.taskId, before.workItemId);
+          if (item === null) {
+            throw new Error(`Work Item not found for Claude Run: ${before.workItemId}.`);
+          }
+          const reviewConfig = store.getReviewConfig();
+          const candidateRequired = input.roleName !== "leader" || reviewConfig !== null;
+          const updated = candidateRequired
+            ? submitWorkItemCandidate(item, {
+                summary,
+                source: { type: "run", runId: terminal.id },
+                ...(reviewConfig === null ? {} : { reviewPolicy: reviewConfig }),
+                ...(before.workspace === undefined ? {} : { workspace: before.workspace })
+              }, now)
+            : updateWorkItemStatus(item, "completed", now, summary);
+          store.saveWorkItem(input.taskId, updated);
+          if (candidateRequired) {
+            if (reviewConfig?.trigger === "always") {
+              const review = queueReviewRound(
+                store,
+                updated,
+                reviewConfig,
+                "policy",
+                now
+              );
+              if (review.run === null) leaderReason = "review-failed";
+            } else {
+              leaderReason = "candidate-ready";
+            }
+          }
+        } else if (input.roleName !== "leader") {
+          throw new Error(`Claude Run is not a WorkItem Run: ${input.runId}.`);
+        }
+      } else {
+        if (before.purpose === "execution" && before.workItemId !== undefined) {
+          const item = store.getWorkItem(input.taskId, before.workItemId);
+          if (item !== null && ![
+            "completed", "failed", "cancelled", "superseded", "abandoned"
+          ].includes(item.status)) {
+            store.saveWorkItem(
+              input.taskId,
+              updateWorkItemStatus(item, "failed", now, summary)
+            );
+          }
+        }
+        const role = store.getRole(input.taskId, input.roleName);
+        if (role !== null) {
+          store.saveRole(
+            input.taskId,
+            updateRoleStatus(role, input.roleName === "leader" ? "failed" : "idle", now)
+          );
+        }
+        leaderReason = before.purpose === "review" ? "review-failed" : "role-run-failed";
+      }
+
+      store.saveEvent(input.taskId, createTaskEvent(
+        store.nextEventId(input.taskId),
+        input.taskId,
+        input.type === "claude-stop"
+          ? "runtime.claude-stop"
+          : "runtime.claude-stop-failure",
+        {
+          eventId: input.eventId,
+          runId: input.runId,
+          roleName: input.roleName,
+          outcome: terminal.status
+        },
+        now
+      ));
+
+      if (leaderReason !== null) {
+        enqueueWork(
+          store,
+          { kind: "role", taskId: input.taskId, roleName: "leader" },
+          leaderReason,
+          now,
+          [
+            { type: "run", taskId: input.taskId, id: terminal.id },
+            { type: "message", taskId: input.taskId, id: message.id },
+            ...(terminal.workItemId === undefined
+              ? []
+              : [{ type: "work-item" as const, taskId: input.taskId, id: terminal.workItemId }])
+          ]
+        );
+      } else if (input.type === "claude-stop-failure" && input.roleName === "leader") {
+        store.saveOperatorNotification(createLeaderRecoveryNotification(
+          input.taskId,
+          summary,
+          now,
+          store.getOperatorNotification(input.taskId)
+        ));
+        enqueueWork(
+          store,
+          { kind: "operator" },
+          "leader-run-failed",
+          now,
+          [
+            { type: "task", id: input.taskId },
+            { type: "run", taskId: input.taskId, id: terminal.id }
+          ]
+        );
+      }
+      return { disposition: "applied", runId: input.runId };
+    });
+  }
+
+  observeObsoleteRuntimeEvent(input: Readonly<{
+    eventId: string;
+    eventType: string;
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    runId?: string;
+    launchId?: string;
+    nativeSessionId: string;
+    reason: string;
+  }>, now = new Date()): void {
+    this.store.transaction((store) => {
+      if (store.getTask(input.taskId) === null) return;
+      recordObsoleteRuntimeEvent(store, input, input.reason, now);
+    });
+  }
+
   recordGlobalRuntimeNativeSession(input: Readonly<{
     roleName: string;
     agentId: string;
     adapterId: string;
+    launchId?: string;
     nativeSessionId: string;
   }>, now = new Date()): RoleAgentSession {
     return this.store.transaction((store) => (
@@ -1521,6 +1748,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         agentId: input.agentId,
         adapterId: input.adapterId,
         nativeSessionId: input.nativeSessionId,
+        ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
         title: effectiveExisting?.title ?? input.title,
         preview: effectiveExisting?.preview ?? (
           input.summary === undefined ? undefined : sessionPreview(input.summary)
@@ -1580,6 +1808,57 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     }
     return "apply";
   }
+}
+
+function claudeStopFailureSummary(input: TaskClaudeLifecycleEvent): string {
+  return [
+    "Claude StopFailure.",
+    `error: ${input.error ?? "Unknown Claude failure."}`,
+    ...(input.errorDetails === undefined
+      ? []
+      : [`error_details: ${input.errorDetails}`]),
+    ...(input.lastAssistantMessage === undefined
+      ? []
+      : [`last_assistant_message: ${input.lastAssistantMessage}`])
+  ].join("\n");
+}
+
+function recordObsoleteRuntimeEvent(
+  store: TaskStore,
+  input: Readonly<{
+    eventId: string;
+    eventType?: string;
+    type?: string;
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    runId?: string;
+    launchId?: string;
+    nativeSessionId: string;
+  }>,
+  reason: string,
+  now: Date
+): void {
+  if (store.listEvents(input.taskId).some((event) => (
+    event.type === "runtime.event-obsolete"
+    && event.payload.eventId === input.eventId
+  ))) return;
+  store.saveEvent(input.taskId, createTaskEvent(
+    store.nextEventId(input.taskId),
+    input.taskId,
+    "runtime.event-obsolete",
+    {
+      eventId: input.eventId,
+      eventType: input.eventType ?? input.type ?? "unknown",
+      roleName: input.roleName,
+      agentId: input.agentId,
+      nativeSessionId: input.nativeSessionId,
+      ...(input.runId === undefined ? {} : { runId: input.runId }),
+      ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+      reason
+    },
+    now
+  ));
 }
 
 function sessionPreview(value: string): string {
@@ -1770,8 +2049,8 @@ function recordTaskRuntimeNativeSession(
     roleName: string;
     agentId: string;
     adapterId: string;
-    nativeSessionId: string;
     launchId?: string;
+    nativeSessionId: string;
     effective?: EffectiveLaunchSnapshot;
   }>,
   now: Date
@@ -1802,7 +2081,8 @@ function recordTaskRuntimeNativeSession(
     input.launchId,
     "Native session registration conflicts with the fixed Role session."
   );
-  if (existing?.status === "running") return existing;
+  if (existing?.status === "running"
+    && (input.launchId === undefined || existing.launchId === input.launchId)) return existing;
   const resolvedEffective = taskSessionEffective(
     store,
     input.taskId,
@@ -1823,6 +2103,7 @@ function recordTaskRuntimeNativeSession(
     agentId: input.agentId,
     adapterId: input.adapterId,
     nativeSessionId: input.nativeSessionId,
+    ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
     policy: "fixed",
     status: "running",
     effective
@@ -1837,8 +2118,8 @@ function recordGlobalRuntimeNativeSession(
     roleName: string;
     agentId: string;
     adapterId: string;
-    nativeSessionId: string;
     launchId?: string;
+    nativeSessionId: string;
     effective?: EffectiveLaunchSnapshot;
   }>,
   now: Date
@@ -1860,7 +2141,8 @@ function recordGlobalRuntimeNativeSession(
     input.launchId,
     "Native session registration conflicts with the fixed global Role session."
   );
-  if (existing?.status === "running") return existing;
+  if (existing?.status === "running"
+    && (input.launchId === undefined || existing.launchId === input.launchId)) return existing;
   const resolvedEffective = globalSessionEffective(role, effectiveExisting);
   const effective = input.effective === undefined
     ? resolvedEffective
@@ -1875,6 +2157,7 @@ function recordGlobalRuntimeNativeSession(
     agentId: input.agentId,
     adapterId: input.adapterId,
     nativeSessionId: input.nativeSessionId,
+    ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
     policy: "fixed",
     status: "running",
     effective
@@ -1988,7 +2271,8 @@ function saveTaskSession(
   role: NonNullable<ReturnType<TaskStore["getRole"]>>,
   session: SchedulerRoleSession & { nativeSessionId: string },
   status: AgentSessionStatus,
-  now: Date
+  now: Date,
+  launchId?: string
 ): void {
   const current = store.getRoleSessionSet(role.taskId, role.name)
     ?? createRoleSessionSet(
@@ -2000,6 +2284,7 @@ function saveTaskSession(
     agentId: session.agentId,
     adapterId: session.adapterId,
     nativeSessionId: session.nativeSessionId,
+    ...(launchId === undefined ? {} : { launchId }),
     policy: "fixed",
     status,
     effective: session.effective

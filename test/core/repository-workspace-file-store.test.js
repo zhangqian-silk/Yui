@@ -43,6 +43,11 @@ import {
   createReviewRound
 } from "../../dist/review/reviewRound.js";
 import { createAgentRun, recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
+import { createInputRequest } from "../../dist/input/inputRequest.js";
+import {
+  createIntegrationAttempt,
+  updateIntegrationAttempt
+} from "../../dist/integration/integrationAttempt.js";
 import { createProject } from "../../dist/repository/project.js";
 import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
@@ -2308,6 +2313,186 @@ test("dirty worktrees keep a completed Task out of Archived while its record rem
   assert.equal(store.getTask(active.id).cwd, undefined);
   assert.equal(existsSync(main), false);
   assert.equal(store.listEvents(active.id).at(-1).payload.workspaceDisposition, "integrated");
+});
+
+test("Task retirement preflight is read-only and fails closed on dirty managed state", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Retire only when safe", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const item = submitWorkItemCandidate(updateWorkItemStatus(createWorkItem(
+    "work-item-1",
+    task.id,
+    { title: "Preserve this result", writeProjectIds: [project.id] },
+    NOW
+  ), "running", NOW), {
+    summary: "Candidate evidence",
+    source: { type: "direct" }
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  const workspace = await preparer.prepareTaskWorkspace(task.id);
+  const dirtyPath = join(workspace.path, project.name, "retirement-dirty.txt");
+  writeFileSync(dirtyPath, "must survive\n");
+  const before = {
+    task: store.getTask(task.id),
+    item: store.getWorkItem(task.id, item.id),
+    events: store.listEvents(task.id),
+    workspaces: store.listRoleWorkspaces(task.id)
+  };
+
+  await assert.rejects(
+    new WorkItemChangeSetManager(store).assertRetirable(task.id),
+    /retirement workspace is not clean/i
+  );
+
+  assert.deepEqual(store.getTask(task.id), before.task);
+  assert.deepEqual(store.getWorkItem(task.id, item.id), before.item);
+  assert.deepEqual(store.listEvents(task.id), before.events);
+  assert.deepEqual(store.listRoleWorkspaces(task.id), before.workspaces);
+  assert.equal(existsSync(dirtyPath), true);
+});
+
+test("Task retirement settles the aggregate but preserves Candidate, Git, Integration, Session, and workspace history", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Retire stale aggregate", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  const main = await preparer.prepareTaskWorkspace(task.id);
+  const workspace = store.getRoleWorkspace(task.id, "leader");
+  const entry = workspace.entries[0];
+  writeFileSync(join(entry.path, "retirement-proof.txt"), "captured evidence\n");
+  execFileSync("git", ["-C", entry.path, "add", "retirement-proof.txt"]);
+  execFileSync("git", ["-C", entry.path, "commit", "-qm", "retirement proof"]);
+  const head = execFileSync("git", ["-C", entry.path, "rev-parse", "HEAD"], {
+    encoding: "utf8"
+  }).trim();
+
+  const item = submitWorkItemCandidate(updateWorkItemStatus(createWorkItem(
+    "work-item-1",
+    task.id,
+    { title: "Historical candidate", writeProjectIds: [project.id] },
+    NOW
+  ), "running", NOW), {
+    summary: "Keep this candidate verbatim",
+    source: { type: "direct" }
+  }, NOW);
+  const changeSet = createWorkItemChangeSet({
+    id: "change-set-1",
+    taskId: task.id,
+    workItemId: item.id,
+    projectId: project.id,
+    baseCommit: entry.baseCommit,
+    headCommit: head,
+    branch: entry.branch,
+    changedPaths: ["retirement-proof.txt"]
+  }, NOW);
+  const integration = updateIntegrationAttempt(createIntegrationAttempt({
+    id: "integration-1",
+    taskId: task.id,
+    projectId: project.id,
+    targetRef: entry.branch,
+    expectedHead: entry.baseCommit,
+    changeSetIds: [changeSet.id]
+  }, NOW), {
+    status: "committed",
+    candidateCommit: head
+  }, NOW);
+  const historicalRun = yieldAgentRun(createAgentRun(
+    "agent-run-1",
+    task.id,
+    "leader",
+    "new",
+    "Historical input owner.",
+    NOW
+  ), "Historical input owner settled.", NOW);
+  const input = createInputRequest(
+    "input-1",
+    task.id,
+    {
+      taskId: task.id,
+      roleName: "leader",
+      agentId: "codex",
+      runId: historicalRun.id,
+      nativeSessionId: "native-history"
+    },
+    {
+      question: "Still continue?",
+      choices: [{ key: "yes", label: "Continue" }],
+      blockedRefs: [{ type: "work-item", taskId: task.id, id: item.id }]
+    },
+    NOW
+  );
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: "worker"
+  }, "codex", NOW);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "native-history",
+    policy: "fixed",
+    status: "ready"
+  }, NOW);
+  store.transaction((tx) => {
+    tx.saveAgentRun(historicalRun);
+    tx.saveWorkItem(task.id, item);
+    tx.saveChangeSet(task.id, changeSet);
+    tx.saveIntegrationAttempt(task.id, integration);
+    tx.saveInputRequest(task.id, input);
+    tx.saveTaskRoleSessionSet(sessions);
+  });
+  const workspacesBefore = store.listRoleWorkspaces(task.id);
+  const sessionsBefore = store.getTaskRoleSessionSet(task.id, "worker");
+  const proof = await new WorkItemChangeSetManager(store).assertRetirable(task.id);
+
+  const result = runTaskCommand([
+    "retire", task.id, "abandoned", "--summary", "The intent is no longer current."
+  ], store, {
+    now: () => new Date(NOW),
+    taskRetirementProof: proof,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  });
+
+  assert.equal(result.kind, "output");
+  assert.equal(store.getTask(task.id).status, "abandoned");
+  assert.equal(store.getTask(task.id).retirementSummary, "The intent is no longer current.");
+  assert.equal(store.getWorkItem(task.id, item.id).status, "abandoned");
+  assert.equal(store.getWorkItem(task.id, item.id).candidates[0].summary, "Keep this candidate verbatim");
+  assert.deepEqual(store.listChangeSets(task.id), [changeSet]);
+  assert.deepEqual(store.listIntegrationAttempts(task.id), [integration]);
+  assert.equal(store.getInputRequest(task.id, input.id).status, "cancelled");
+  assert.deepEqual(store.getTaskRoleSessionSet(task.id, "worker"), sessionsBefore);
+  assert.deepEqual(
+    store.getWorkMailbox({
+      kind: "role-runtime",
+      taskId: task.id,
+      roleName: "worker"
+    }).pending.reasons,
+    ["runtime-cleanup-required"]
+  );
+  assert.deepEqual(store.listRoleWorkspaces(task.id), workspacesBefore);
+  assert.equal(store.getTask(task.id).cwd, main.path);
+  assert.equal(existsSync(entry.path), true);
+  assert.equal(store.listEvents(task.id).at(-1).type, "task.retired");
 });
 
 test("Task archive requires explicit WorkItem cleanup and preserves its record", async (t) => {

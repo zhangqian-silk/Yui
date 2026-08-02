@@ -318,6 +318,7 @@ export class TmuxSessionHost implements SessionHostPort {
       effective: request.effective,
       launchId: request.launchId,
       mode: request.mode,
+      ...(request.runId === undefined ? {} : { runId: request.runId }),
       ...(request.environment === undefined
         ? {}
         : { environment: request.environment }),

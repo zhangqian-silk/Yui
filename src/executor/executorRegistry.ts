@@ -39,6 +39,7 @@ export interface RoleLaunchPlanner {
     adapterId: string;
     effective?: EffectiveLaunchSnapshot;
     mode: RoleSessionLaunchMode;
+    runId?: string;
     nativeSessionId?: string;
   }>): PlannedRoleSession;
 }

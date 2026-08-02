@@ -18,7 +18,7 @@ export type CoordinatedRuntimeLaunchRequest = RuntimeLaunchPreparationRequest;
 
 export type RuntimeLaunchReservationPort = Readonly<{
   reserveRuntimeLaunch(
-    input: Readonly<{ owner: RuntimeRoleOwner; launchId: string }>,
+    input: Readonly<{ owner: RuntimeRoleOwner; launchId: string; runId?: string }>,
     assertCurrent: () => void,
     now?: Date
   ): Readonly<{ status: "reserved" | "existing"; launchId: string }>;
@@ -158,7 +158,8 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
     )}`;
     let reservation = this.reservations.reserveRuntimeLaunch({
       owner: request.owner,
-      launchId: proposedLaunchId
+      launchId: proposedLaunchId,
+      ...(request.runId === undefined ? {} : { runId: request.runId })
     }, assertLaunchCurrent, this.#now());
     let reusedConfirmedRunningHost = false;
 
@@ -188,7 +189,8 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
         }
         reservation = this.reservations.reserveRuntimeLaunch({
           owner: request.owner,
-          launchId: proposedLaunchId
+          launchId: proposedLaunchId,
+          ...(request.runId === undefined ? {} : { runId: request.runId })
         }, assertLaunchCurrent, this.#now());
         if (reservation.status !== "reserved") {
           throw new Error("Runtime launch reservation could not be renewed.");
@@ -211,6 +213,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
             adapterId: request.adapterId,
             effective: request.effective,
             workspace: request.workspace,
+            ...(request.runId === undefined ? {} : { runId: request.runId }),
             ...(request.environment === undefined
               ? {}
               : { environment: request.environment })
@@ -223,6 +226,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
             adapterId: request.adapterId,
             effective: request.effective,
             workspace: request.workspace,
+            ...(request.runId === undefined ? {} : { runId: request.runId }),
             ...(request.environment === undefined
               ? {}
               : { environment: request.environment }),

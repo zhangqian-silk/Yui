@@ -23,6 +23,7 @@ import type { TaskStore } from "../storage/taskStore.js";
 import { writeTextFileAtomically } from "../storage/durableFile.js";
 import { compileRoleSessionContext } from "../context/roleSessionContext.js";
 import { resolveAgentAdapter } from "./agentAdapter.js";
+import type { ClaudeAgentConfig } from "./agentAdapter.js";
 import { inspectCodexLaunchConfig } from "./codexConfigConflict.js";
 import type { PlannedRoleSession, RoleLaunchPlanner } from "./executorRegistry.js";
 import type {
@@ -115,7 +116,10 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     if (task.status !== "active") throw new Error(`Task is not active: ${input.taskId}.`);
     const role = this.store.getRole(input.taskId, input.roleName);
     if (role === null) throw new Error(`Role not found: ${input.taskId}/${input.roleName}.`);
-    const activeRun = this.store.getActiveAgentRun(task.id, role.name);
+      const activeRun = this.store.getActiveAgentRun(task.id, role.name);
+    if (input.runId !== undefined && activeRun?.id !== input.runId) {
+      throw new Error(`Role Run is no longer current: ${input.runId}.`);
+    }
     const runWorkspace = activeRun?.workspace;
     if (task.projectBindings.length > 0) {
       const workspace = this.store.getRoleWorkspace(task.id, role.name);
@@ -131,7 +135,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         && workspace.owner.type === "work-item"
         && isolatedWorkItem !== null
         && isolatedWorkItem.assignee === role.name
-        && !["completed", "failed", "cancelled", "superseded"].includes(isolatedWorkItem.status)
+        && !["completed", "failed", "cancelled", "superseded", "abandoned"].includes(isolatedWorkItem.status)
         && (activeRun === null
           || activeRun.workItemId === workspace.owner.workItemId)
         && sameWorkspaceProjects(workspace, task.projectBindings.map(({ projectId }) => projectId))
@@ -220,6 +224,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       mode: RoleSessionLaunchMode;
       nativeSessionId?: string;
       launchId?: string;
+      runId?: string;
       environment?: Readonly<Record<string, string>>;
     }>,
     owner: Readonly<{ scope: "task"; taskId: string } | { scope: "global" }>,
@@ -279,9 +284,22 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         + "notify callback and refuses to replace or be replaced by native configuration."
       );
     }
+    const managedRun = owner.scope === "task" && input.runId !== undefined
+      ? this.store.getAgentRun(owner.taskId, input.runId)
+      : null;
+    const effectiveConfig = binding.config.adapterId === "claude"
+      && owner.scope === "task"
+      && input.runId !== undefined
+      ? managedClaudeControlPlaneConfig(
+          binding.config,
+          owner.taskId,
+          managedRun?.workItemId,
+          input.runId
+        )
+      : binding.config;
     const compileInput = {
       agent,
-      config: binding.config,
+      config: effectiveConfig,
       workspace: effectiveWorkspace,
       ...(sessionTitle === undefined ? {} : { sessionTitle }),
       ...sessionContext,
@@ -321,6 +339,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         ? readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective)
         : null;
     } else if (launchMode === "new") {
+      if (owner.scope === "task" && input.runId !== undefined) {
+        args.push(
+          "--plugin-dir",
+          ensureManagedClaudeLifecyclePlugin(this.home, this.#cliPath)
+        );
+      }
       const nativeSessionId = requireText(
         input.launchId === undefined
           ? this.#createNativeSessionId()
@@ -335,6 +359,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       args.push("--session-id", nativeSessionId);
       session = readySession(input.agentId, binding.adapterId, nativeSessionId, effective);
     } else {
+      if (owner.scope === "task" && input.runId !== undefined) {
+        args.push(
+          "--plugin-dir",
+          ensureManagedClaudeLifecyclePlugin(this.home, this.#cliPath)
+        );
+      }
       session = readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective);
     }
 
@@ -363,7 +393,11 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
             }),
         ...(input.launchId === undefined
           ? {}
-          : { YUI_LAUNCH_ID: input.launchId })
+          : { YUI_LAUNCH_ID: input.launchId }),
+        ...(input.runId === undefined ? {} : { YUI_RUN_ID: input.runId }),
+        ...(configured.adapterId !== "claude" || session === null
+          ? {}
+          : { YUI_NATIVE_SESSION_ID: session.nativeSessionId })
       }
     };
     const scopedLaunch = owner.scope === "task"
@@ -479,6 +513,57 @@ function ensureManagedYuiLauncher(home: string, cliPath: string): string {
   );
   chmodSync(launcherPath, 0o700);
   return binPath;
+}
+
+function ensureManagedClaudeLifecyclePlugin(home: string, cliPath: string): string {
+  const root = join(resolve(home), "runtime", "claude-lifecycle-plugin");
+  writeTextFileAtomically(
+    join(root, ".claude-plugin", "plugin.json"),
+    `${JSON.stringify({
+      name: "yui-runtime-lifecycle",
+      description: "Yui-owned exact Run lifecycle transport",
+      version: "1.0.0"
+    }, null, 2)}\n`
+  );
+  const command = {
+    type: "command",
+    command: canonicalPath(process.execPath),
+    args: [canonicalPath(cliPath), "internal", "claude-hook"]
+  };
+  writeTextFileAtomically(
+    join(root, "hooks", "hooks.json"),
+    `${JSON.stringify({
+      hooks: {
+        Stop: [{ hooks: [command] }],
+        StopFailure: [{ hooks: [command] }]
+      }
+    }, null, 2)}\n`
+  );
+  return root;
+}
+
+function managedClaudeControlPlaneConfig(
+  config: ClaudeAgentConfig,
+  taskId: string,
+  workItemId: string | undefined,
+  runId: string
+): ClaudeAgentConfig {
+  const managed = [
+    `Bash(yui --json task context ${taskId})`,
+    `Bash(yui --json task work list ${taskId})`,
+    ...(workItemId === undefined
+      ? []
+      : [`Bash(yui --json task work show ${workItemId})`]),
+    `Bash(yui task run yield ${runId}:*)`
+  ];
+  const existing = config.permission?.allowedTools ?? [];
+  return {
+    ...config,
+    permission: {
+      ...config.permission,
+      allowedTools: [...new Set([...existing, ...managed])]
+    }
+  };
 }
 
 function canonicalPath(path: string): string {

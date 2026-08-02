@@ -275,6 +275,14 @@ const taskChildren: readonly NodeInput[] = [
     fileOptions: ["--summary-file"]
   },
   { name: "reopen", summary: "Reopen a completed Task.", usage: "yui task reopen <id>" },
+  {
+    name: "retire",
+    summary: "Retire a stale Task while preserving its historical evidence.",
+    usage: "yui task retire <task> <cancelled|superseded|abandoned> (--summary <text>|--summary-file <path|->) [--replacement <task>]",
+    options: ["--summary", "--summary-file", "--replacement"],
+    fileOptions: ["--summary-file"],
+    argumentValues: { 1: ["cancelled", "superseded", "abandoned"] }
+  },
   { name: "list", summary: "List Tasks." },
   { name: "show", summary: "Show a Task.", usage: "yui task show <id>" },
   {
@@ -383,8 +391,8 @@ const taskChildren: readonly NodeInput[] = [
       id: "manage",
       title: "Commands",
       entries: [
-        "create", "list", "update", "scope", "dispatch", "isolate", "capture", "cleanup",
-        "review", "accept", "reject", "cancel"
+        "create", "list", "show", "update", "scope", "dispatch", "isolate", "capture", "cleanup",
+        "review", "accept", "reject", "dispose"
       ]
     }],
     children: [
@@ -395,13 +403,14 @@ const taskChildren: readonly NodeInput[] = [
         options: ["--project", "--objective", "--accept", "--after", "--role"]
       },
       { name: "list", summary: "List work items for a Task.", usage: "yui task work list <task>" },
+      { name: "show", summary: "Show one Work Item.", usage: "yui task work show <work>" },
       {
         name: "update",
         summary: "Update a work item's state.",
         usage: "yui task work update <task>/<work> <todo|running|done|failed|cancelled|superseded> [--summary <text>]",
         options: ["--summary"],
         argumentValues: {
-          1: ["todo", "running", "done", "failed", "cancelled", "superseded"]
+          1: ["todo", "running", "done", "failed"]
         }
       },
       {
@@ -464,10 +473,11 @@ const taskChildren: readonly NodeInput[] = [
         options: ["--summary"]
       },
       {
-        name: "cancel",
-        summary: "Cancel a non-running Work Item.",
-        usage: "yui task work cancel <task>/<work> --summary <text>",
-        options: ["--summary"]
+        name: "dispose",
+        summary: "Record the Leader's explicit WorkItem disposition and settle its exact Runs.",
+        usage: "yui task work dispose <work> <cancelled|abandoned|replaced> --summary <text> [--replacement <work>]",
+        options: ["--summary", "--replacement"],
+        argumentValues: { 1: ["cancelled", "abandoned", "replaced"] }
       }
     ]
   },
@@ -843,7 +853,7 @@ export const ROOT_COMMAND = buildNode({
       name: "task",
       summary: "Manage Tasks, WorkItems, Agent Runs, and integration.",
       sections: [
-        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "update", "activate", "complete", "reopen", "list", "show", "context", "archive", "reconcile"] },
+        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "archive", "reconcile"] },
         { id: "collaboration", title: "Collaboration", entries: ["message", "input", "work", "run", "integration", "role", "enter"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
       ],
@@ -862,12 +872,19 @@ export const ROOT_COMMAND = buildNode({
       name: "internal",
       summary: "Internal Yui callbacks.",
       hidden: true,
-      sections: [{ id: "callbacks", title: "Callbacks", entries: ["session-notify"] }],
-      children: [{
-        name: "session-notify",
-        summary: "Record a structured native session notification.",
-        usage: "yui internal session-notify <payload>"
-      }]
+      sections: [{ id: "callbacks", title: "Callbacks", entries: ["session-notify", "claude-hook"] }],
+      children: [
+        {
+          name: "session-notify",
+          summary: "Record a structured native session notification.",
+          usage: "yui internal session-notify <payload>"
+        },
+        {
+          name: "claude-hook",
+          summary: "Record a managed Claude lifecycle event from stdin.",
+          usage: "yui internal claude-hook"
+        }
+      ]
     }
   ]
 });

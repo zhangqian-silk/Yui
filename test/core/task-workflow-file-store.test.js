@@ -28,6 +28,7 @@ import {
   attachReviewRoundWorkspace,
   recordReviewWorkspaceDisposition
 } from "../../dist/review/reviewRound.js";
+import { terminalizeExactTaskRun } from "../../dist/lifecycle/exactRunTerminalization.js";
 import { failAgentRun } from "../../dist/run/agentRun.js";
 import { createAgentRun, recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 import {
@@ -302,7 +303,7 @@ function recordReadyNativeSession(store, taskId, roleName, nativeSessionId) {
   store.saveTaskRoleSessionSet(sessions);
 }
 
-test("Work Item rejection and cancellation close the acceptance loop without new states", (t) => {
+test("Work Item rejection and Leader disposition close the acceptance loop", (t) => {
   const { store, options } = fixture(t);
   const task = createTask(store, options);
   run(["activate", task.id], store, options);
@@ -341,8 +342,10 @@ test("Work Item rejection and cancellation close the acceptance loop without new
   assert.equal(store.getWorkItem(task.id, rejected.id).status, "failed");
 
   assert.match(
-    run(["work", "cancel", rejected.id, "--summary", "No longer needed."], store, options),
-    /Cancelled Work Item/
+    run([
+      "work", "dispose", rejected.id, "cancelled", "--summary", "No longer needed."
+    ], store, leaderOptions),
+    /Disposed Work Item/
   );
   assert.equal(store.getWorkItem(task.id, rejected.id).status, "cancelled");
   assert.equal(
@@ -350,7 +353,7 @@ test("Work Item rejection and cancellation close the acceptance loop without new
     true
   );
   assert.equal(
-    store.listEvents(task.id).some(({ type }) => type === "work.cancelled"),
+    store.listEvents(task.id).some(({ type }) => type === "work.disposed"),
     true
   );
 });
@@ -1166,8 +1169,15 @@ test("a failed ReviewRound remains evidence but does not override Leader judgmen
   run(["run", "yield", execution.id, "--summary", "candidate ready"], store, options);
   const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
   store.transaction((tx) => {
-    tx.saveAgentRun(failAgentRun(reviewRun, "Reviewer runtime unavailable.", NOW));
-    tx.clearActiveAgentRun(task.id, "reviewer");
+    const result = terminalizeExactTaskRun(tx, {
+      taskId: task.id,
+      roleName: reviewRun.roleName,
+      agentId: reviewRun.effective.agentId,
+      runId: reviewRun.id,
+      receiptId: `agent-run:${task.id}/${reviewRun.id}`,
+      outcome: { status: "failed", summary: "Reviewer runtime unavailable." }
+    }, NOW);
+    assert.equal(result.disposition, "applied");
   });
   assert.equal(store.listReviewRounds(task.id)[0].status, "failed");
 
@@ -2138,13 +2148,22 @@ test("Task completion requires every WorkItem to be terminal", (t) => {
   );
   assert.equal(store.getTask(task.id)?.status, "active");
 
-  run(["work", "cancel", item.id, "--summary", "No longer needed."], store, options);
+  run([
+    "work", "dispose", item.id, "cancelled", "--summary", "No longer needed."
+  ], store, {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  });
   run(["complete", task.id, "--summary", "Done"], store, options);
   assert.equal(store.getTask(task.id)?.status, "completed");
   assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "cancelled");
 });
 
-test("a failed WorkItem can be explicitly closed after its isolated workspace was abandoned", (t) => {
+test("a failed WorkItem can be explicitly abandoned after its isolated workspace was abandoned", (t) => {
   const { store, options } = fixture(t);
   const task = createTask(store, options, "Recover failed isolated work");
   run(["activate", task.id], store, options);
@@ -2160,14 +2179,21 @@ test("a failed WorkItem can be explicitly closed after its isolated workspace wa
   );
 
   run(
-    ["work", "update", item.id, "superseded", "--summary", "Replacement completed."],
+    ["work", "dispose", item.id, "abandoned", "--summary", "No deliverable remains."],
     store,
-    options
+    {
+      ...options,
+      environment: {
+        YUI_SESSION_SCOPE: "task",
+        YUI_TASK_ID: task.id,
+        YUI_ROLE: "leader"
+      }
+    }
   );
   run(["complete", task.id, "--summary", "Recovered and delivered."], store, options);
 
   assert.equal(store.getTask(task.id)?.status, "completed");
-  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "superseded");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "abandoned");
   assert.equal(store.getWorkItem(item.taskId, item.id)?.workspaceDisposition, "abandoned");
 });
 

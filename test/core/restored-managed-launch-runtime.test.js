@@ -480,6 +480,75 @@ test("Claude launch identity is deterministic for one durable launch across retr
   assert.deepEqual(first.launch.args.slice(-2), ["--session-id", first.session.nativeSessionId]);
 });
 
+test("managed Claude Task Runs inject exact Stop hooks and permission-aware control-plane access", (t) => {
+  const { home, store, task, role, agent, now } = fixture(t, "claude");
+  const controlledRole = createRole(
+    task.id,
+    role.name,
+    [createRoleAgentBinding(agent, {
+      adapterId: "claude",
+      permission: { mode: "dontAsk", allowedTools: ["Read"] }
+    })],
+    agent.id,
+    role.workspace,
+    now
+  );
+  const item = updateWorkItemStatus(createWorkItem(
+    "work-item-1",
+    task.id,
+    { title: "Exact Claude result", assignee: role.name },
+    now
+  ), "running", now);
+  const run = createAgentRun(
+    "agent-run-1",
+    task.id,
+    role.name,
+    "new",
+    "Return the exact result",
+    now,
+    {
+      workItemId: item.id,
+      agent: { agentId: agent.id, adapterId: "claude" }
+    }
+  );
+  store.transaction((tx) => {
+    tx.saveRole(task.id, controlledRole);
+    tx.saveWorkItem(task.id, item);
+    tx.saveActiveAgentRun(run);
+  });
+  const plan = new FileRoleLaunchPlanner(home, store, { cliPath: "/dist/cli.js" }).plan({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    mode: "new",
+    runId: run.id,
+    launchId: "launch-1"
+  });
+
+  const pluginIndex = plan.launch.args.indexOf("--plugin-dir");
+  assert.ok(pluginIndex >= 0);
+  const pluginRoot = plan.launch.args[pluginIndex + 1];
+  assert.ok(pluginRoot.startsWith(join(home, "runtime")));
+  const hooks = JSON.parse(readFileSync(join(pluginRoot, "hooks", "hooks.json"), "utf8"));
+  assert.deepEqual(Object.keys(hooks.hooks).sort(), ["Stop", "StopFailure"]);
+  for (const eventName of ["Stop", "StopFailure"]) {
+    const command = hooks.hooks[eventName][0].hooks[0];
+    assert.equal(command.command, process.execPath);
+    assert.deepEqual(command.args, ["/dist/cli.js", "internal", "claude-hook"]);
+  }
+  assert.equal(plan.launch.env.YUI_RUN_ID, run.id);
+  assert.equal(plan.launch.env.YUI_LAUNCH_ID, "launch-1");
+  assert.equal(plan.launch.env.YUI_NATIVE_SESSION_ID, plan.session.nativeSessionId);
+  const allowedIndex = plan.launch.args.indexOf("--allowed-tools");
+  assert.ok(allowedIndex >= 0);
+  const allowed = plan.launch.args.slice(allowedIndex + 1, pluginIndex);
+  assert.ok(allowed.includes(`Bash(yui --json task context ${task.id})`));
+  assert.ok(allowed.includes(`Bash(yui --json task work list ${task.id})`));
+  assert.ok(allowed.includes(`Bash(yui --json task work show ${item.id})`));
+  assert.ok(allowed.includes(`Bash(yui task run yield ${run.id}:*)`));
+});
+
 test("Codex notify payload is strictly converted to one durable runtime event", async (t) => {
   const { home, store, task, role, agent, now } = fixture(t);
   store.saveAgentRun(createAgentRun(

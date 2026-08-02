@@ -230,7 +230,16 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
   },
   taskTarget("reopen", 2, ["completed"]),
   {
-    ...taskTarget("archive", 2, ["completed"]),
+    ...taskTarget("retire", 2, ["draft", "active"]),
+    trailingOptions: {
+      "--summary": "value",
+      "--summary-file": "value",
+      "--replacement": "value"
+    },
+    confirmation: { action: "Retire task", targetArgumentIndex: 2 }
+  },
+  {
+    ...taskTarget("archive", 2, ["completed", "cancelled", "superseded", "abandoned"]),
     trailingOptions: { "--integrated": "flag", "--abandon": "flag" },
     confirmation: { action: "Archive task", targetArgumentIndex: 2 }
   },
@@ -417,7 +426,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     commandPath: ["task", "work", "list"],
     selectors: [{ argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true }]
   },
-  ...["update", "dispatch", "isolate", "capture", "cleanup", "accept", "reject", "cancel"]
+  ...["show", "update", "dispatch", "isolate", "capture", "cleanup", "accept", "reject"]
     .map((command): InteractionPolicy => ({
       commandPath: ["task", "work", command],
       selectors: [{
@@ -437,10 +446,30 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
                   "--abandon": "flag" as const
                 }
               }
-            : ["accept", "reject", "cancel"].includes(command)
+            : ["accept", "reject"].includes(command)
               ? { trailingOptions: { "--summary": "value" as const } }
               : {})
     })),
+  {
+    commandPath: ["task", "work", "dispose"],
+    selectors: [
+      {
+        argumentIndex: 3,
+        entity: "work-item",
+        provider: "work-items",
+        actionTarget: true
+      },
+      {
+        option: "--replacement",
+        entity: "work-item",
+        provider: "work-items",
+        dependsOn: 3,
+        actionTarget: false
+      }
+    ],
+    trailingOptions: { "--summary": "value", "--replacement": "value" },
+    confirmation: { action: "Dispose Work Item", targetArgumentIndex: 3 }
+  },
   {
     commandPath: ["task", "run", "list"],
     selectors: [{ argumentIndex: 3, entity: "work-item", provider: "work-items", actionTarget: true }],

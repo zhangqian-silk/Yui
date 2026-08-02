@@ -97,7 +97,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     updatedAt: timestamp
   };
   const task = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: "task-1",
     title: "Restore storage",
     projectBindings: [],
@@ -268,7 +268,7 @@ test("FileTaskStore persists strict task, role, and operator WorkMailboxes", () 
   const store = new FileTaskStore(home);
   const timestamp = "2026-07-22T00:00:00.000Z";
   const task = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: "task-1",
     title: "Mailbox storage",
     projectBindings: [],
@@ -389,7 +389,7 @@ test("FileTaskStore rejects mailbox identity and dangling cross-references", () 
   const store = new FileTaskStore(home);
   const timestamp = "2026-07-22T00:00:00.000Z";
   store.saveTask({
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: "task-1",
     title: "Mailbox validation",
     projectBindings: [],
@@ -454,11 +454,11 @@ test("record versions and aggregate shape are validated without silently repairi
   const store = new FileTaskStore(home);
   assert.throws(
     () => store.saveTask({ schemaVersion: 1, id: "task-1" }),
-    /Task.*schemaVersion 2/
+    /Task.*schemaVersion 3/
   );
   assert.throws(
     () => store.saveTask({
-      schemaVersion: 2,
+      schemaVersion: 3,
       id: "task-invalid",
       title: "Invalid completion",
       projectBindings: [],
@@ -471,7 +471,7 @@ test("record versions and aggregate shape are validated without silently repairi
 
   const timestamp = "2026-07-19T00:00:00.000Z";
   const task = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: "task-1",
     title: "Validate WorkItem cleanup",
     projectBindings: [],

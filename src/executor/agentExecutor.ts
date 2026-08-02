@@ -34,6 +34,8 @@ export type RoleAgentSession = {
   agentId: string;
   adapterId: string;
   nativeSessionId: string;
+  /** Durable exact generation identity for native lifecycle events. */
+  launchId?: string;
   title?: string;
   preview?: string;
   policy: "fixed" | "leader-controlled";
@@ -83,6 +85,7 @@ export type RecordRoleAgentSessionInput = {
   agentId: string;
   adapterId: string;
   nativeSessionId: string;
+  launchId?: string;
   title?: string;
   preview?: string;
   policy: RoleAgentSession["policy"];
@@ -192,6 +195,9 @@ export function recordRoleAgentSession<TSet extends RoleSessionSet>(
     agentId,
     adapterId,
     nativeSessionId,
+    ...(input.launchId === undefined
+      ? continuing?.launchId === undefined ? {} : { launchId: continuing.launchId }
+      : { launchId: requireText(input.launchId, "Launch id") }),
     ...optionalSessionText("title", input.title ?? continuing?.title),
     ...optionalSessionText("preview", input.preview ?? continuing?.preview),
     policy: input.policy,
@@ -500,9 +506,18 @@ export function terminalizeTaskRoleRunSession(
 ): TaskRoleSessionSet {
   validateRoleSessionSet(set);
   const inFlight = set.inFlight;
-  let updated = inFlight === null
-    ? set
-    : clearTaskRoleRun(set, fence, terminalAt);
+  const pending = set.pendingTurnCompletion;
+  let updated = pending !== null
+    && pending.agentId === fence.agentId
+    && pending.runId === fence.runId
+    ? settleTaskRoleCompletion(set, {
+        agentId: fence.agentId,
+        runId: fence.runId,
+        turnId: pending.turnId
+      }, terminalAt)
+    : inFlight === null
+      ? set
+      : clearTaskRoleRun(set, fence, terminalAt);
   const session = updated.sessions[updated.activeAgentId];
   if (session?.status === "running") {
     updated = updateRoleAgentSessionStatus(
@@ -667,6 +682,7 @@ export function validateRoleAgentSession(
     throw new Error(`Role Agent session effective identity is inconsistent: ${agentId}.`);
   }
   requireText(session.nativeSessionId, "Native session id");
+  if (session.launchId !== undefined) requireSafeIdentity(session.launchId, "Launch id");
   if (
     session.title !== undefined
     && optionalSessionText("title", session.title).title !== session.title

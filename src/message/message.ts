@@ -43,7 +43,7 @@ export function createTaskMessage(
     taskId: requireSafeIdentity(taskId, "Message Task id"),
     kind,
     author: normalizeAuthor(author),
-    body: requireText(body, "Message body"),
+    body: requireBody(body),
     ...(context.runId === undefined
       ? {}
       : { runId: requireSafeIdentity(context.runId, "Message Run id") }),
@@ -110,4 +110,12 @@ function requireText(value: string, label: string): string {
   const normalized = value.trim();
   if (normalized.length === 0) throw new Error(`${label} is required.`);
   return normalized;
+}
+
+function requireBody(value: string): string {
+  if (typeof value !== "string" || value.includes("\0")) {
+    throw new Error("Message body is invalid.");
+  }
+  if (value.trim().length === 0) throw new Error("Message body is required.");
+  return value;
 }

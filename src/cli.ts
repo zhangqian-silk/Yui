@@ -73,6 +73,7 @@ import { FileSchedulerStoreAdapter } from "./controller/fileSchedulerStoreAdapte
 import { cleanControllerResource } from "./controller/resourceCleanupLinux.js";
 import { scanControllerResourceInventory } from "./controller/resourceInventoryLinux.js";
 import { runSessionNotifyCommand } from "./controller/sessionNotify.js";
+import { runClaudeLifecycleHookCommand } from "./controller/claudeLifecycleHook.js";
 import { runDoctorCommand } from "./doctor/doctor.js";
 import { agentNotFound, CliError, runtimeError, usageError } from "./errors/cliError.js";
 import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
@@ -218,11 +219,15 @@ export async function main(): Promise<void> {
     return;
   }
   if (args[0] === "internal") {
-    if (args[1] !== "session-notify" || args.length !== 3) {
-      throw usageError("Internal session notify usage is invalid.");
+    if (args[1] === "session-notify" && args.length === 3) {
+      await runSessionNotifyCommand(args[2], process.env);
+      return;
     }
-    await runSessionNotifyCommand(args[2], process.env);
-    return;
+    if (args[1] === "claude-hook" && args.length === 2) {
+      await runClaudeLifecycleHookCommand(readFileSync(0, "utf8"), process.env);
+      return;
+    }
+    throw usageError("Internal lifecycle callback usage is invalid.");
   }
 
   if (args[0] === "controller") {
@@ -672,6 +677,21 @@ export async function main(): Promise<void> {
         }
       }
     }
+    let taskRetirementProof;
+    if (resolved[1] === "retire") {
+      const taskId = resolved[2];
+      if (taskId !== undefined && !taskId.startsWith("--")) {
+        const task = store.getTask(taskId);
+        if (task?.status === "active" || task?.status === "draft") {
+          try {
+            taskRetirementProof = await new WorkItemChangeSetManager(store)
+              .assertRetirable(taskId);
+          } catch (error) {
+            throw usageError(error instanceof Error ? error.message : String(error));
+          }
+        }
+      }
+    }
     let workItemIntegrationProof;
     if (resolved[1] === "work" && resolved[2] === "accept") {
       const workItemId = resolved[3];
@@ -706,7 +726,8 @@ export async function main(): Promise<void> {
         yuiHome: home,
         ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
         ...(candidateGitSnapshot === undefined ? {} : { candidateGitSnapshot }),
-        ...(reviewResult === undefined ? {} : { reviewResult })
+        ...(reviewResult === undefined ? {} : { reviewResult }),
+        ...(taskRetirementProof === undefined ? {} : { taskRetirementProof })
       }
     );
     if (result.kind === "output") {

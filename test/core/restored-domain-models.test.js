@@ -20,7 +20,7 @@ import {
   createAgentRun,
   recordRoleAgentSession
 } from "../helpers/effectiveLaunch.js";
-import { activateTask, archiveTask, createTask } from "../../dist/task/task.js";
+import { activateTask, archiveTask, completeTask, createTask } from "../../dist/task/task.js";
 import {
   createWorkItem,
   recordWorkItemWorkspaceDisposition,
@@ -268,7 +268,7 @@ test("restored persistent domain records are plain JSON with explicit schema ver
   const yielded = yieldAgentRun(run, "Implemented", later);
   const snapshot = JSON.parse(JSON.stringify({ task, workItem, yielded }));
 
-  assert.equal(snapshot.task.schemaVersion, 2);
+  assert.equal(snapshot.task.schemaVersion, 3);
   assert.equal(snapshot.task.status, "draft");
   assert.equal(snapshot.workItem.schemaVersion, 6);
   assert.equal(snapshot.yielded.schemaVersion, 4);
@@ -334,7 +334,7 @@ test("a writable Review Run requires its exact ReviewRound-owned workspace", () 
   );
 });
 
-test("Task follows the retained draft, active, archived lifecycle", () => {
+test("Task follows the retained draft, active, completed, archived lifecycle", () => {
   const draft = createTask("task-1", "Lifecycle", now, {
     projectBindings: [
       { projectId: "repo-1", directory: "backend", baseRef: "main" },
@@ -342,9 +342,13 @@ test("Task follows the retained draft, active, archived lifecycle", () => {
     ]
   });
   const active = activateTask(draft, later);
-  const archived = archiveTask(active, new Date("2026-07-19T12:02:00.000Z"));
+  const completed = completeTask(active, later, { by: "leader", summary: "Done." });
+  const archived = archiveTask(completed, new Date("2026-07-19T12:02:00.000Z"));
 
-  assert.deepEqual([draft.status, active.status, archived.status], ["draft", "active", "archived"]);
+  assert.deepEqual(
+    [draft.status, active.status, completed.status, archived.status],
+    ["draft", "active", "completed", "archived"]
+  );
   assert.equal("archived" in draft, false);
   assert.deepEqual(draft.projectBindings, [
     { projectId: "repo-1", directory: "backend", baseRef: "main" },

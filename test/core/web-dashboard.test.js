@@ -37,7 +37,7 @@ function effectiveLaunch() {
 function fixtureStore() {
   const tasks = [
     {
-      schemaVersion: 2,
+      schemaVersion: 3,
       id: "task-1",
       title: "Ship web dashboard",
       description: "Make task state visible without replacing the CLI.",
@@ -53,7 +53,7 @@ function fixtureStore() {
       updatedAt: "2026-07-23T07:30:00.000Z"
     },
     {
-      schemaVersion: 2,
+      schemaVersion: 3,
       id: "task-2",
       title: "Document release",
       projectBindings: [],
@@ -307,10 +307,30 @@ test("dashboard API summarizes tasks and exposes one consolidated task detail", 
     assert.equal(dashboardResponse.headers.get("x-content-type-options"), "nosniff");
     const dashboard = await dashboardResponse.json();
     assert.equal(dashboard.generatedAt, now.toISOString());
-    assert.deepEqual(dashboard.counts, { total: 2, draft: 0, active: 1, completed: 1, archived: 0, openInputs: 1 });
+    assert.deepEqual(dashboard.counts, {
+      total: 2,
+      draft: 0,
+      active: 1,
+      completed: 1,
+      cancelled: 0,
+      superseded: 0,
+      abandoned: 0,
+      archived: 0,
+      openInputs: 1
+    });
     assert.equal(dashboard.tasks[0].id, "task-1");
     assert.deepEqual(dashboard.tasks[0].projectNames, ["Yui Web"]);
-    assert.deepEqual(dashboard.tasks[0].workItems, { total: 2, pending: 1, running: 1, completed: 0, failed: 0 });
+    assert.deepEqual(dashboard.tasks[0].workItems, {
+      total: 2,
+      pending: 1,
+      running: 1,
+      awaiting_acceptance: 0,
+      completed: 0,
+      failed: 0,
+      cancelled: 0,
+      superseded: 0,
+      abandoned: 0
+    });
 
     const detailResponse = await fetch(`${origin}/api/tasks/task-1`);
     assert.equal(detailResponse.status, 200);

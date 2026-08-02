@@ -35,7 +35,12 @@ import {
   type TaskMessageContext,
   type TaskMessageKind
 } from "../message/message.js";
-import type { WorkItemIntegrationProof } from "../workspace/workItemChangeSetManager.js";
+import type {
+  TaskRetirementProof,
+  WorkItemIntegrationProof
+} from "../workspace/workItemChangeSetManager.js";
+import { cancelInputRequest } from "../input/inputRequest.js";
+import { terminalizeExactTaskRun } from "../lifecycle/exactRunTerminalization.js";
 import {
   activeRoleAgentBinding,
   copyGlobalRoleToTaskRole,
@@ -72,11 +77,17 @@ import {
 } from "../coordination/workMailboxQueue.js";
 import type { MailboxEntityRef, MailboxTarget } from "../coordination/workMailbox.js";
 import {
+  RUNTIME_CLEANUP_REQUIRED_REASON,
+  hasRuntimeCleanupObligation,
+  runtimeLifecycleTarget
+} from "../runtime/lifecycleReservation.js";
+import {
   activateTask,
   addTaskProjectBinding,
   archiveTask,
   completeTask,
   createTask,
+  retireTask,
   reopenTask,
   updateTaskMetadata,
   type Task,
@@ -95,6 +106,7 @@ import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import {
   currentWorkItemCandidate,
   createWorkItem,
+  disposeWorkItem,
   retryFailedWorkItem,
   submitWorkItemCandidate,
   updateWorkItemWriteProjects,
@@ -172,6 +184,7 @@ export type TaskCommandOptions = Readonly<{
     }>[];
     evidenceCommit?: string;
   }>;
+  taskRetirementProof?: TaskRetirementProof;
 }>;
 
 export function runTaskCommand(
@@ -190,6 +203,7 @@ export function runTaskCommand(
     case "complete": return output(completeTaskCommand(rest, store, options));
     case "reopen": return output(reopenTaskCommand(rest, store, options));
     case "archive": return output(archiveTaskCommand(rest, store, options));
+    case "retire": return retireTaskCommand(rest, store, options);
     case "reconcile": return output(reconcileTaskCommand(rest, store, options));
     case "message": return output(taskMessageCommand(rest, store, options));
     case "project": return taskProjectCommand(rest, store, options);
@@ -565,6 +579,10 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     ...(task.completedAt === undefined ? [] : [`Completed: ${presentTime(task.completedAt, timeZone)}`]),
     ...(task.completedBy === undefined ? [] : [`Completed by: ${task.completedBy}`]),
     ...(task.completionSummary === undefined ? [] : [`Completion summary: ${task.completionSummary}`]),
+    ...(task.retiredAt === undefined ? [] : [`Retired: ${presentTime(task.retiredAt, timeZone)}`]),
+    ...(task.retiredBy === undefined ? [] : [`Retired by: ${task.retiredBy}`]),
+    ...(task.retirementSummary === undefined ? [] : [`Retirement summary: ${task.retirementSummary}`]),
+    ...(task.replacementTaskId === undefined ? [] : [`Replacement Task: ${task.replacementTaskId}`]),
     ...(task.projectBindings.length === 0
       ? []
       : [
@@ -651,6 +669,7 @@ function completeTaskCommand(
       item.status !== "completed"
       && item.status !== "cancelled"
       && item.status !== "superseded"
+      && item.status !== "abandoned"
     ));
     if (incompleteWork !== undefined) {
       throw usageError(`Task ${task.id} has unaccepted work: ${incompleteWork.id}/${incompleteWork.status}.`);
@@ -784,8 +803,9 @@ function archiveTaskCommand(
     const task = requireTask(tx, request.taskId);
     const actor = taskActor(options, task.id);
     if (task.status === "archived") return { task, changed: false } as const;
-    if (task.status !== "completed") {
-      throw usageError(`Task ${task.id} must be completed before it can be archived.`);
+    if (task.status !== "completed"
+      && !["cancelled", "superseded", "abandoned"].includes(task.status)) {
+      throw usageError(`Task ${task.id} must be completed or retired before it can be archived.`);
     }
     if (task.cwd !== undefined || tx.listRoleWorkspaces(task.id).length > 0) {
       throw usageError(`Task ${task.id} still has managed worktrees; clean them before archiving.`);
@@ -845,6 +865,221 @@ function archiveTaskCommand(
     : `Task ${result.task.id} is already archived\n`;
 }
 
+function retireTaskCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task retire usage: yui task retire <task> <cancelled|superseded|abandoned> (--summary <text>|--summary-file <path|->) [--replacement <task>].";
+  const parsed = parseTail(
+    args,
+    new Set(["--summary", "--summary-file", "--replacement"]),
+    usage
+  );
+  exactPositionals(parsed.positionals, 2, usage);
+  const taskId = parsed.positionals[0]!;
+  const status = parsed.positionals[1];
+  if (status !== "cancelled" && status !== "superseded" && status !== "abandoned") {
+    throw usageError(`Task retirement status is invalid: ${String(status)}.`, usage);
+  }
+  const summary = readCommandText(
+    parsed.options.get("--summary"),
+    parsed.options.get("--summary-file"),
+    "--summary",
+    usage
+  );
+  const replacementTaskId = parsed.options.get("--replacement");
+  if ((status === "superseded") !== (replacementTaskId !== undefined)) {
+    throw usageError(
+      status === "superseded"
+        ? "A superseded Task requires --replacement."
+        : "Only a superseded Task may use --replacement.",
+      usage
+    );
+  }
+  const now = clock(options);
+  const result = store.transaction((tx) => {
+    const task = requireTask(tx, taskId);
+    if (["cancelled", "superseded", "abandoned"].includes(task.status)) {
+      const same = task.status === status
+        && task.retirementSummary === summary
+        && task.replacementTaskId === replacementTaskId;
+      if (!same) throw usageError(`Task already has a different retirement: ${task.id}.`);
+      return { task, changed: false } as const;
+    }
+    if (taskActor(options, task.id) !== "leader") {
+      throw usageError("Only the Task Leader may retire a Task.");
+    }
+    if (task.status !== "active" && task.status !== "draft") {
+      throw usageError(`Task cannot be retired from ${task.status}: ${task.id}.`);
+    }
+    if (replacementTaskId !== undefined) {
+      const replacement = tx.getTask(replacementTaskId);
+      if (replacement === null || replacement.id === task.id) {
+        throw usageError(
+          `Replacement Task must be a different existing Task: ${replacementTaskId}.`
+        );
+      }
+    }
+    const unresolvedIntegration = tx.listIntegrationAttempts(task.id).find((integration) => (
+      integration.status === "running"
+      || integration.status === "blocked"
+      || integration.status === "validating"
+    ));
+    if (unresolvedIntegration !== undefined) {
+      throw usageError(
+        `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
+      );
+    }
+    assertTaskRetirementProof(tx, task, options.taskRetirementProof);
+
+    for (const run of tx.listAgentRuns(task.id).filter(({ status: runStatus }) => (
+      runStatus === "active"
+    ))) {
+      const role = requireRole(tx, task.id, run.roleName);
+      const terminal = terminalizeExactTaskRun(tx, {
+        taskId: task.id,
+        roleName: run.roleName,
+        agentId: run.effective.agentId,
+        runId: run.id,
+        receiptId: formatAgentRunReceiptId(task.id, run.id),
+        mailboxDisposition: "discard",
+        outcome: {
+          status: "failed",
+          summary: `Task ${status}: ${summary}`
+        }
+      }, now);
+      if (terminal.disposition !== "applied") {
+        throw usageError(
+          `Task Run changed during retirement: ${run.id}/${terminal.reason ?? "obsolete"}.`
+        );
+      }
+    }
+
+    const workDisposition = status === "cancelled" ? "cancelled" : "abandoned";
+    for (const item of tx.listWorkItems(task.id)) {
+      if (item.status === "completed" || item.disposition !== undefined) continue;
+      if (["cancelled", "superseded", "abandoned"].includes(item.status)) continue;
+      tx.saveWorkItem(task.id, disposeWorkItem(item, {
+        kind: workDisposition,
+        by: "leader",
+        summary: `Task ${status}: ${summary}`
+      }, now));
+    }
+    for (const request of tx.listInputRequests(task.id)) {
+      if (request.status === "open") {
+        tx.saveInputRequest(
+          task.id,
+          cancelInputRequest(request, `Task ${status}: ${summary}`, now)
+        );
+      }
+    }
+    for (const sessions of tx.listRoleSessionSets(task.id)) {
+      let updated = sessions;
+      const activeSession = updated.sessions[updated.activeAgentId];
+      if (updated.inFlight !== null || updated.pendingTurnCompletion !== null) {
+        throw usageError(
+          `Task Role still has an unsettled Run fence: ${task.id}/${updated.owner.roleName}.`
+        );
+      }
+      if (activeSession?.status === "running") {
+        updated = updateRoleAgentSessionStatus(
+          updated,
+          updated.activeAgentId,
+          "ready",
+          now
+        );
+      }
+      if (activeSession !== undefined
+        && activeSession.status !== "stopped"
+        && activeSession.status !== "broken") {
+        const runtimeTarget = runtimeLifecycleTarget({
+          scope: "task",
+          taskId: task.id,
+          roleName: updated.owner.roleName
+        });
+        if (!hasRuntimeCleanupObligation(tx.getWorkMailbox(runtimeTarget))) {
+          enqueueWork(
+            tx,
+            runtimeTarget,
+            RUNTIME_CLEANUP_REQUIRED_REASON,
+            now,
+            [taskRef(task.id)]
+          );
+        }
+      }
+      if (updated !== sessions) tx.saveTaskRoleSessionSet(updated);
+    }
+    for (const role of tx.listRoles(task.id)) {
+      if (role.status !== "idle") {
+        tx.saveRole(task.id, updateRoleStatus(role, "idle", now));
+      }
+    }
+    for (const mailbox of tx.listWorkMailboxes()) {
+      if (
+        (mailbox.target.kind === "task"
+          || mailbox.target.kind === "role")
+        && mailbox.target.taskId === task.id
+      ) {
+        tx.removeWorkMailbox(mailbox.target);
+      }
+    }
+    tx.clearPendingWakeup(task.id);
+    tx.clearLeaderFailure(task.id);
+    tx.clearOperatorNotification(task.id);
+    const retired = retireTask(task, {
+      status,
+      by: "leader",
+      summary,
+      ...(replacementTaskId === undefined ? {} : { replacementTaskId })
+    }, now);
+    tx.saveTask(retired);
+    recordTaskEvent(tx, task.id, "task.retired", {
+      status,
+      by: "leader",
+      summary,
+      ...(replacementTaskId === undefined ? {} : { replacementTaskId })
+    }, now);
+    return { task: retired, changed: true } as const;
+  });
+  if (result.changed) options.runtime?.notifyStateChanged(result.task.id);
+  return output(
+    result.changed
+      ? `Retired task ${result.task.id} as ${result.task.status}\n`
+      : `Task ${result.task.id} is already ${result.task.status}\n`,
+    { task: result.task }
+  );
+}
+
+function assertTaskRetirementProof(
+  store: TaskWorkflowStore,
+  task: Task,
+  proof: TaskRetirementProof | undefined
+): void {
+  const workspaces = store.listRoleWorkspaces(task.id);
+  if (proof === undefined) {
+    if (workspaces.length === 0 && task.projectBindings.length === 0) return;
+    throw usageError(`Task retirement preflight proof is required: ${task.id}.`);
+  }
+  if (
+    proof.taskId !== task.id
+    || proof.taskUpdatedAt !== task.updatedAt
+    || proof.workspaces.length !== workspaces.length
+  ) {
+    throw usageError(`Task changed after retirement preflight: ${task.id}.`);
+  }
+  const expected = [...proof.workspaces]
+    .sort((left, right) => left.roleName.localeCompare(right.roleName));
+  const actual = [...workspaces]
+    .sort((left, right) => left.roleName.localeCompare(right.roleName));
+  if (!actual.every((workspace, index) => (
+    expected[index]?.roleName === workspace.roleName
+    && isDeepStrictEqual(expected[index]?.workspace, workspace)
+  ))) {
+    throw usageError(`Task workspaces changed after retirement preflight: ${task.id}.`);
+  }
+}
+
 export function parseTaskArchiveArguments(
   args: readonly string[]
 ): Readonly<{ taskId: string; disposition: "integrated" | "abandoned" }> {
@@ -866,10 +1101,12 @@ export function validateTaskArchiveRequest(
   const request = parseTaskArchiveArguments(args);
   const task = requireTask(store, request.taskId);
   taskActor(options, task.id);
-  if (task.status !== "archived" && task.status !== "completed") {
-    throw usageError(`Task ${task.id} must be completed before it can be archived.`);
+  if (task.status !== "archived"
+    && task.status !== "completed"
+    && !["cancelled", "superseded", "abandoned"].includes(task.status)) {
+    throw usageError(`Task ${task.id} must be completed or retired before it can be archived.`);
   }
-  if (task.status === "completed") {
+  if (task.status !== "archived") {
     assertNoOpenInputRequests(store, task.id, "archiving the Task");
   }
   return request;
@@ -1347,13 +1584,14 @@ function taskWorkCommand(
   const [command, ...rest] = args;
   if (command === "create") return createWork(rest, store, options);
   if (command === "list") return listWork(rest, store);
+  if (command === "show") return showWork(rest, store, options);
   if (command === "update") return updateWork(rest, store, options);
   if (command === "scope") return output(updateWorkScope(rest, store, options));
   if (command === "dispatch") return output(dispatchWork(rest, store, options));
   if (command === "review") return reviewWork(rest, store, options);
   if (command === "accept") return acceptWork(rest, store, options);
   if (command === "reject") return rejectWork(rest, store, options);
-  if (command === "cancel") return cancelWork(rest, store, options);
+  if (command === "dispose") return disposeWork(rest, store, options);
   throw usageError(command === undefined
     ? "Task work command is required."
     : `Unknown command: task work ${command}`);
@@ -1460,13 +1698,13 @@ function updateWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task work update usage: yui task work update <task>/<work> <todo|running|done|failed|cancelled|superseded> [--summary <text>].";
+  const usage = "Task work update usage: yui task work update <task>/<work> <todo|running|done|failed> [--summary <text>].";
   const parsed = parseTail(args, new Set(["--summary"]), usage);
   exactPositionals(parsed.positionals, 2, usage);
   const requested = parsed.positionals[1];
   const status = parseWorkStatus(requested);
   const summary = trimmed(parsed.options.get("--summary"));
-  if (["completed", "failed", "cancelled", "superseded"].includes(status)
+  if (["completed", "failed"].includes(status)
     && summary === undefined) {
     throw usageError(`--summary is required when work becomes ${requested}.`);
   }
@@ -1534,20 +1772,10 @@ function updateWork(
         reviewTrigger: candidateRequired ? reviewConfig.trigger : null
       };
     }
-    if (
-      current.workspaceDisposition !== undefined
-      && isTerminalWorkItemStatus(current.status)
-      && status === "superseded"
-    ) {
-      const updated = updateWorkItemStatus(current, status, now, summary);
-      tx.saveWorkItem(task.id, updated);
-      enqueueWork(tx, taskMailbox(task.id), "work-updated", now, [workItemRef(task.id, updated.id)]);
-      return { item: updated, reviewDispatch: null, reviewTrigger: null };
-    }
     throw usageError(
       `Assigned Work Item execution cannot use task work update: ${current.id}. `
       + "Use dispatch and run yield, then let the Task Leader accept or reject the result; "
-      + "use task work cancel to cancel it."
+      + "use task work dispose for an explicit Leader disposition."
     );
   });
   notifyMailbox(options.runtime, taskMailbox(result.item.taskId), result.item.taskId);
@@ -1883,55 +2111,92 @@ function rejectWork(
   return output(`Rejected Work Item ${rejected.id}\n`, { workItem: rejected });
 }
 
-function cancelWork(
+function disposeWork(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task work cancel usage: yui task work cancel <task>/<work> --summary <text>.";
-  const parsed = parseTail(args, new Set(["--summary"]), usage);
-  exactPositionals(parsed.positionals, 1, usage);
+  const usage = "Task work dispose usage: yui task work dispose <task>/<work> <cancelled|abandoned|replaced> --summary <text> [--replacement <task>/<work>].";
+  const parsed = parseTail(args, new Set(["--summary", "--replacement"]), usage);
+  exactPositionals(parsed.positionals, 2, usage);
+  const workItemId = parsed.positionals[0]!;
+  const kind = parsed.positionals[1];
+  if (kind !== "cancelled" && kind !== "abandoned" && kind !== "replaced") {
+    throw usageError(`Work Item disposition is invalid: ${String(kind)}.`, usage);
+  }
   const summary = requiredOption(parsed.options, "--summary");
+  const replacementWorkItemId = parsed.options.get("--replacement");
+  if ((kind === "replaced") !== (replacementWorkItemId !== undefined)) {
+    throw usageError(
+      kind === "replaced"
+        ? "A replaced Work Item requires --replacement."
+        : "Only a replaced Work Item may use --replacement.",
+      usage
+    );
+  }
   const now = clock(options);
-  const result = store.transaction((tx) => {
-    const item = requireWorkItem(tx, parsed.positionals[0], options);
+  const disposed = store.transaction((tx) => {
+    const item = requireWorkItem(tx, workItemId, options);
     const task = requireTask(tx, item.taskId);
     if (task.status !== "active") {
       throw usageError(`Task is not active: ${task.id}/${task.status}.`);
     }
-    if (!["pending", "failed", "awaiting_acceptance"].includes(item.status)) {
-      throw usageError(
-        item.status === "running"
-          ? `Work Item is running; stop or fail its active AgentRun first: ${item.id}.`
-          : `Work Item cannot be cancelled from ${item.status}: ${item.id}.`
-      );
+    if (taskActor(options, task.id) !== "leader") {
+      throw usageError("Only the Task Leader may dispose a Work Item.");
     }
-    const actor = taskActor(options, task.id);
-    if (item.status === "awaiting_acceptance") {
-      const candidate = requireWorkItemCandidate(item);
-      const activeReview = activeReviewRoundForCandidate(tx, item, candidate);
-      if (activeReview !== undefined) {
-        throw usageError(`ReviewRound is still active: ${activeReview.id}/${activeReview.status}.`);
+    if (replacementWorkItemId !== undefined) {
+      const replacement = requireWorkItem(tx, replacementWorkItemId, options);
+      if (replacement.taskId !== task.id) {
+        throw usageError(
+          `Replacement Work Item must belong to the same Task: ${replacementWorkItemId}.`
+        );
+      }
+      if (replacement.id === item.id) {
+        throw usageError("A Work Item cannot replace itself.");
       }
     }
-    const cancelled = updateWorkItemStatus(item, "cancelled", now, summary);
-    tx.saveWorkItem(item.taskId, cancelled);
-    recordTaskEvent(tx, item.taskId, "work.cancelled", {
-      workItemId: item.id,
-      cancelledBy: actor,
-      summary
-    }, now);
-    if (actor !== "leader") {
-      enqueueWork(tx, leaderMailbox(task.id), "work-cancelled", now, [
-        workItemRef(task.id, item.id)
-      ]);
+    for (const run of tx.listAgentRuns(task.id).filter((candidate) => (
+      candidate.status === "active" && candidate.workItemId === item.id
+    ))) {
+      const role = requireRole(tx, task.id, run.roleName);
+      const terminal = terminalizeExactTaskRun(tx, {
+        taskId: task.id,
+        roleName: run.roleName,
+        agentId: run.effective.agentId,
+        runId: run.id,
+        receiptId: formatAgentRunReceiptId(task.id, run.id),
+        outcome: {
+          status: "failed",
+          summary: `Work Item ${kind}: ${summary}`
+        }
+      }, now);
+      if (terminal.disposition !== "applied") {
+        throw usageError(
+          `Work Item Run changed during disposition: ${run.id}/${terminal.reason ?? "obsolete"}.`
+        );
+      }
     }
-    return { item: cancelled, notifyLeader: actor !== "leader" };
+    const next = disposeWorkItem(item, {
+      kind,
+      by: "leader",
+      summary,
+      ...(replacementWorkItemId === undefined ? {} : { replacementWorkItemId })
+    }, now);
+    if (next !== item) {
+      tx.saveWorkItem(task.id, next);
+      recordTaskEvent(tx, task.id, "work.disposed", {
+        workItemId: next.id,
+        disposition: kind,
+        summary,
+        ...(replacementWorkItemId === undefined
+          ? {}
+          : { replacementWorkItemId })
+      }, now);
+    }
+    return next;
   });
-  if (result.notifyLeader) {
-    notifyMailbox(options.runtime, leaderMailbox(result.item.taskId), result.item.taskId);
-  }
-  return output(`Cancelled Work Item ${result.item.id}\n`, { workItem: result.item });
+  options.runtime?.notifyStateChanged(disposed.taskId);
+  return output(`Disposed Work Item ${disposed.id} as ${kind}\n`, { workItem: disposed });
 }
 
 function listWork(args: string[], store: TaskWorkflowStore): TaskCommandExecution {
@@ -1963,6 +2228,30 @@ function listWork(args: string[], store: TaskWorkflowStore): TaskCommandExecutio
         defaultTableWidth()
       )}\n`;
   return output(rendered, { workItems: items });
+}
+
+function showWork(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  exactPositionals(args, 1, "Task work show usage: yui task work show <work>.");
+  const item = requireWorkItem(store, args[0], options);
+  const replacement = item.disposition?.replacementWorkItemId;
+  const rendered = [
+    `Work Item: ${item.id}`,
+    `Task: ${item.taskId}`,
+    `Status: ${presentWorkStatus(item.status)}`,
+    `Role: ${item.assignee ?? "Leader"}`,
+    `Title: ${item.title}`,
+    `Objective: ${item.objective}`,
+    `Write Projects: ${item.writeProjectIds.join(", ") || "-"}`,
+    `Acceptance: ${item.acceptance.length === 0 ? "-" : item.acceptance.join("; ")}`,
+    `Outcome: ${item.outcome ?? "-"}`,
+    `Disposition: ${item.disposition?.kind ?? "-"}`,
+    `Replacement: ${replacement ?? "-"}`
+  ].join("\n");
+  return output(`${rendered}\n`, { workItem: item });
 }
 
 function reviewWork(
@@ -2118,7 +2407,10 @@ function retryRun(
       roleAgentSessionResumeMode(sessions, effective.agentId, effective),
       previous.workItemId === undefined
         ? retaggedInput
-        : ensureWorkerRunCompletionRequirement(retaggedInput),
+        : ensureWorkerRunCompletionRequirement(
+            retaggedInput,
+            activeRoleAgentBinding(role).adapterId
+          ),
       now,
       {
         ...(previous.workItemId === undefined ? {} : { workItemId: previous.workItemId }),
@@ -2180,7 +2472,24 @@ function yieldRun(
     const role = requireRole(tx, task.id, active.roleName);
     const pointer = tx.getActiveAgentRun(task.id, role.name);
     if (pointer?.id !== active.id) throw usageError(`Run is not active for ${task.id}/${role.name}: ${active.id}.`);
-    const terminal = yieldAgentRun(active, summary, now);
+    const terminalization = terminalizeExactTaskRun(tx, {
+      taskId: task.id,
+      roleName: role.name,
+      agentId: active.effective.agentId,
+      runId: active.id,
+      receiptId: formatAgentRunReceiptId(task.id, active.id),
+      outcome: { status: "yielded", summary },
+      ...(active.purpose === "review" && options.reviewResult !== undefined
+        ? { reviewResult: options.reviewResult }
+        : {})
+    }, now);
+    if (terminalization.disposition !== "applied" || terminalization.run === null) {
+      throw usageError(
+        `Run ${active.id} no longer matches its exact execution fence: `
+        + `${terminalization.reason ?? "obsolete"}.`
+      );
+    }
+    const terminal = terminalization.run;
     const message = appendMessage(
       tx,
       task.id,
@@ -2195,36 +2504,21 @@ function yieldRun(
         ? null
         : tx.getReviewRound(task.id, active.reviewRoundId);
       if (round === null
-        || round.status !== "running"
+        || round.status !== "completed"
         || round.reviewerRunId !== active.id) {
-        throw usageError(`ReviewRun no longer owns an active ReviewRound: ${active.id}.`);
+        throw usageError(`ReviewRun did not complete its exact ReviewRound: ${active.id}.`);
       }
-      const completedRound = finishReviewRound(
-        round,
-        "completed",
-        summary,
-        now,
-        options.reviewResult
-      );
-      tx.saveReviewRound(task.id, completedRound);
       recordTaskEvent(tx, task.id, "review.completed", {
-        reviewRoundId: completedRound.id,
-        workItemId: completedRound.workItemId,
-        candidateId: completedRound.candidateId,
-        reviewBaseProvenance: completedRound.reviewBaseProvenance,
-        reviewBaseCommit: completedRound.reviewBaseCommit ?? "unavailable",
-        evidenceCommit: completedRound.evidenceCommit ?? "none",
-        checks: completedRound.checks?.map(({ name, outcome }) => `${name}:${outcome}`)
+        reviewRoundId: round.id,
+        workItemId: round.workItemId,
+        candidateId: round.candidateId,
+        reviewBaseProvenance: round.reviewBaseProvenance,
+        reviewBaseCommit: round.reviewBaseCommit ?? "unavailable",
+        evidenceCommit: round.evidenceCommit ?? "none",
+        checks: round.checks?.map(({ name, outcome }) => `${name}:${outcome}`)
           .join(",") || "none"
       }, now);
     }
-    tx.saveAgentRun(terminal);
-    requireCompleteWorkExecution(
-      tx,
-      roleMailbox(task.id, role.name),
-      runRef(task.id, terminal.id)
-    );
-    tx.clearActiveAgentRun(task.id, role.name);
     let automaticReview: Readonly<{
       item: WorkItem;
       config: ReviewConfig;
@@ -2256,15 +2550,6 @@ function yieldRun(
       }
     } else if (role.name !== LEADER_ROLE) {
       throw usageError(`Run ${active.id} is not a work run.`);
-    }
-    tx.saveRole(task.id, updateRoleStatus(role, "idle", now));
-    const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
-    if (sessions !== null) {
-      tx.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(sessions, {
-        agentId: active.effective.agentId,
-        runId: active.id,
-        receiptId: formatAgentRunReceiptId(task.id, active.id)
-      }, now));
     }
     const reviewDispatch = automaticReview === null
       ? null
@@ -2320,7 +2605,7 @@ function yieldRun(
   });
 }
 
-function queueReviewRound(
+export function queueReviewRound(
   store: TaskWorkflowStore,
   item: WorkItem,
   config: ReviewConfig,
@@ -2776,7 +3061,7 @@ function chronologicalAgentRuns(runs: readonly AgentRun[]): AgentRun[] {
 }
 
 function isTerminalWorkItemStatus(status: WorkItemStatus): boolean {
-  return ["completed", "failed", "cancelled", "superseded"].includes(status);
+  return ["completed", "failed", "cancelled", "superseded", "abandoned"].includes(status);
 }
 
 function assertTaskOpen(task: Task): void {
@@ -2784,6 +3069,9 @@ function assertTaskOpen(task: Task): void {
     throw usageError(`Task ${task.id} is completed; reopen it before continuing.`);
   }
   if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
+  if (["cancelled", "superseded", "abandoned"].includes(task.status)) {
+    throw usageError(`Task is retired: ${task.id}/${task.status}.`);
+  }
 }
 
 function taskActor(options: TaskCommandOptions, taskId: string) {
@@ -2796,6 +3084,9 @@ function inactiveTaskMessage(task: Task, action: string): string {
   }
   if (task.status === "completed") {
     return `Task ${task.id} is completed; reopen it before ${action}.`;
+  }
+  if (["cancelled", "superseded", "abandoned"].includes(task.status)) {
+    return `Task ${task.id} is retired as ${task.status}; it cannot resume ${action}.`;
   }
   return `Task is archived: ${task.id}.`;
 }
@@ -2810,8 +3101,6 @@ function parseWorkStatus(value: string): WorkItemStatus {
   if (value === "running") return "running";
   if (value === "done") return "completed";
   if (value === "failed") return "failed";
-  if (value === "cancelled") return "cancelled";
-  if (value === "superseded") return "superseded";
   throw usageError(`Invalid work item status: ${value}.`);
 }
 

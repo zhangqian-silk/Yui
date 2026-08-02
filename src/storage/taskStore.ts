@@ -41,7 +41,6 @@ import {
   type ReviewConfig
 } from "../review/reviewConfig.js";
 import {
-  finishReviewRound,
   validateReviewRound,
   type ReviewRound
 } from "../review/reviewRound.js";
@@ -498,7 +497,7 @@ export class FileTaskStore implements TaskStore {
 
   nextTaskId(): string { return this.#nextGlobalId("task", (state) => Object.keys(state.tasks)); }
   saveTask(task: Task): void {
-    const stored = validateTask(identified<Task>(task, 2, "id", task.id, "Task"));
+    const stored = validateTask(identified<Task>(task, 3, "id", task.id, "Task"));
     this.#mutate((state) => {
       for (const binding of stored.projectBindings) {
         if (state.projects[binding.projectId] === undefined) {
@@ -798,15 +797,6 @@ export class FileTaskStore implements TaskStore {
       const task = state.tasks[stored.taskId];
       observeTaskRecordId(task, "agentRun", stored.id);
       task.agentRuns[stored.id] = stored;
-      if (stored.reviewRoundId === undefined || stored.status === "active") return;
-      const round = task.reviewRounds[stored.reviewRoundId];
-      if (round.status !== "pending" && round.status !== "running") return;
-      task.reviewRounds[round.id] = finishReviewRound(
-        round,
-        stored.status === "yielded" ? "completed" : "failed",
-        stored.summary!,
-        new Date(stored.endedAt!)
-      );
     });
   }
   nextReviewRoundId(taskId: string): string {
@@ -1410,7 +1400,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
   }, "integrationAttempts");
   versioned(aggregate, 11, `Task aggregate ${taskId}`);
   validateTaskIdHighWaterMarks(aggregate.idHighWaterMarks, taskId);
-  validateTask(identified(aggregate.task, 2, "id", taskId, "Task"));
+  validateTask(identified(aggregate.task, 3, "id", taskId, "Task"));
   if (aggregate.brief !== null) storedTaskBrief(aggregate.brief);
   parseMap(aggregate.roles, (record, key) => { const role = identified<TaskRole>(record, 3, "name", key, "Task Role"); if (role.taskId !== taskId) throw new StorageRecordError(`Task Role belongs to another Task: ${role.taskId}`); validateTaskRole(role); return role; }, "roles");
   parseMap(aggregate.roleWorkspaces, (record, key) => {
@@ -1870,6 +1860,14 @@ function validateMailboxReferences(state: StorageState, mailbox: WorkMailbox): v
 
 function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredTask): void {
   const taskId = aggregate.task.id;
+  if (aggregate.task.replacementTaskId !== undefined) {
+    const replacement = state.tasks[aggregate.task.replacementTaskId];
+    if (replacement === undefined || replacement.task.id === taskId) {
+      throw new StorageRecordError(
+        `Replacement Task reference is invalid: ${taskId}/${aggregate.task.replacementTaskId}.`
+      );
+    }
+  }
   const boundProjects = new Set(aggregate.task.projectBindings.map(({ projectId }) => projectId));
   assertAcyclicWorkItems(aggregate.workItems);
   for (const item of Object.values(aggregate.workItems)) {
@@ -1882,6 +1880,18 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
       throw new StorageRecordError(
         `Work Item writable Project does not belong to Task: ${taskId}/${item.id}.`
       );
+    }
+    const replacementWorkItemId = item.disposition?.replacementWorkItemId;
+    if (replacementWorkItemId !== undefined) {
+      if (replacementWorkItemId === item.id) {
+        throw new StorageRecordError(`Work Item cannot replace itself: ${taskId}/${item.id}.`);
+      }
+      const replacement = aggregate.workItems[replacementWorkItemId];
+      if (replacement === undefined || replacement.taskId !== taskId) {
+        throw new StorageRecordError(
+          `Replacement Work Item must belong to the same Task: ${taskId}/${replacementWorkItemId}.`
+        );
+      }
     }
     for (const candidate of item.candidates) {
       assertWorkItemCandidateReferences(
@@ -2122,26 +2132,29 @@ function validWorkItemTransition(existing: WorkItem, candidate: WorkItem): boole
     return false;
   }
   const allowed: Readonly<Record<WorkItem["status"], readonly WorkItem["status"][]>> = {
-    pending: ["pending", "running", "cancelled", "superseded"],
+    pending: ["pending", "running", "cancelled", "superseded", "abandoned"],
     running: [
       "running",
       "awaiting_acceptance",
       "completed",
       "failed",
       "cancelled",
-      "superseded"
+      "superseded",
+      "abandoned"
     ],
     awaiting_acceptance: [
       "awaiting_acceptance",
       "completed",
       "failed",
       "cancelled",
-      "superseded"
+      "superseded",
+      "abandoned"
     ],
     completed: ["completed"],
-    failed: ["failed", "running", "cancelled", "superseded"],
+    failed: ["failed", "running", "cancelled", "superseded", "abandoned"],
     cancelled: ["cancelled"],
-    superseded: ["superseded"]
+    superseded: ["superseded"],
+    abandoned: ["abandoned"]
   };
   return allowed[existing.status].includes(candidate.status);
 }

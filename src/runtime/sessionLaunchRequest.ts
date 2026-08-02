@@ -12,6 +12,7 @@ type SessionLaunchRequestBase = Readonly<{
   adapterId: string;
   effective: EffectiveLaunchSnapshot;
   workspace: string;
+  runId?: string;
   environment?: Readonly<Record<string, string>>;
 }>;
 
@@ -45,6 +46,9 @@ export function createSessionLaunchRequest(
     adapterId,
     effective,
     workspace,
+    ...(input.runId === undefined
+      ? {}
+      : { runId: requireSafeIdentity(input.runId, "Run id") }),
     ...(input.environment === undefined
       ? {}
       : { environment: copyEnvironment(input.environment) })

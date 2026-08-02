@@ -550,7 +550,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   ): Promise<GitWorkspaceRemoval> {
     const item = requireWorkItem(this.store, taskId, workItemId);
     const task = requireTask(this.store, item.taskId);
-    if (!["completed", "failed", "cancelled", "superseded"].includes(item.status)) {
+    if (!["completed", "failed", "cancelled", "superseded", "abandoned"].includes(item.status)) {
       throw new Error(`Work item must be terminal before cleanup: ${item.id}.`);
     }
     if (item.workspaceDisposition !== undefined && item.workspaceDisposition !== disposition) {
@@ -830,7 +830,7 @@ function assertWorkItemWorkspaceEligible(
   if (item.assignee === LEADER_ROLE) {
     throw new Error("The Leader must remain in the Task main workspace.");
   }
-  if (["completed", "failed", "cancelled", "superseded"].includes(item.status)) {
+  if (["completed", "failed", "cancelled", "superseded", "abandoned"].includes(item.status)) {
     throw new Error(`Work item is already terminal: ${item.id}.`);
   }
   if (store.getActiveAgentRun(task.id, item.assignee) !== null) {
