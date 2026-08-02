@@ -276,9 +276,9 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
           effective: request.effective
         }, assertLaunchCurrent, this.#now());
       } else {
-        // Deferred scheduler persistence clears a known native identity in the
-        // same transaction that records the Role session. Fresh Codex keeps
-        // the reservation until its matching generation Hook arrives.
+        // Deferred scheduler persistence records a known native identity while
+        // retaining the reservation until exact Run delivery. Fresh Codex has
+        // no identity yet and keeps it until its matching generation Hook.
         this.reservations.confirmRuntimeLaunchReservation({
           owner: request.owner,
           launchId

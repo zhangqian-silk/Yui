@@ -46,6 +46,7 @@ import type {
   LeaderDispatchFailurePersistence,
   LeaderDispatchClaimResult,
   LeaderDispatchPersistence,
+  RoleRunDeliveryFailurePersistence,
   RoleRunDeliveryPersistence,
   SchedulerRole,
   SchedulerRoleSession,
@@ -541,8 +542,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         const existing = store.getRoleSession(input.task.id, input.role.name);
         const reservation = matchingPreparedRuntimeReservation(
           store,
-          input,
-          existing
+          input
         );
         if (
           existing?.agentId !== input.session.agentId
@@ -574,10 +574,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       }
       if (input.session !== null && input.session.nativeSessionId !== undefined) {
         const existing = store.getRoleSession(input.task.id, input.role.name);
-        const reservation = matchingPreparedRuntimeReservation(
+        matchingPreparedRuntimeReservation(
           store,
-          input,
-          existing
+          input
         );
         if (existing?.nativeSessionId !== input.session.nativeSessionId
           || (input.launchId !== undefined && existing.launchId !== input.launchId)
@@ -587,9 +586,180 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             nativeSessionId: input.session.nativeSessionId
           }, "running", input.now, input.launchId);
         }
-        completePreparedRuntimeReservation(store, reservation);
       }
       bindTaskRoleRunInFlight(store, role, input.run, input.now);
+    });
+  }
+
+  saveRoleRunDeliveryFailure(
+    input: RoleRunDeliveryFailurePersistence
+  ): "failed" | "state-changed" {
+    return this.store.transaction((store) => {
+      const task = store.getTask(input.taskId);
+      const role = store.getRole(input.taskId, input.roleName);
+      const active = store.getActiveAgentRun(input.taskId, input.roleName);
+      const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
+      const session = sessions?.sessions[input.agentId];
+      const mailbox = store.getWorkMailbox({
+        kind: "role",
+        taskId: input.taskId,
+        roleName: input.roleName
+      });
+      const runtimeMailbox = store.getWorkMailbox(runtimeLifecycleTarget({
+        scope: "task",
+        taskId: input.taskId,
+        roleName: input.roleName
+      }));
+      if (
+        task === null
+        || task.status !== "active"
+        || role === null
+        || active === null
+        || active.id !== input.runId
+        || active.status !== "active"
+        || active.deliveredAt !== undefined
+        || active.effective.agentId !== input.agentId
+        || active.effective.adapterId !== input.adapterId
+        || sessions === null
+        || sessions.activeAgentId !== input.agentId
+        || sessions.inFlight?.agentId !== input.agentId
+        || sessions.inFlight.runId !== input.runId
+        || sessions.inFlight.receiptId !== formatAgentRunReceiptId(input.taskId, input.runId)
+        || sessions.inFlight.deliveredAt !== undefined
+        || mailbox?.processing?.batchId !== input.mailboxBatchId
+        || mailbox.processing.executionRef?.type !== "run"
+        || mailbox.processing.executionRef.taskId !== input.taskId
+        || mailbox.processing.executionRef.id !== input.runId
+        || !preparedSessionMatches(
+          session,
+          input.agentId,
+          input.adapterId,
+          input.nativeSessionId,
+          input.launchId
+        )
+        || !preparedReservationMatches(
+          runtimeMailbox,
+          input.taskId,
+          input.runId,
+          input.launchId
+        )
+      ) {
+        return "state-changed";
+      }
+
+      const summary = `Role delivery retry limit exhausted before exact Run input delivery: ${input.runId}.`;
+      const result = terminalizeExactTaskRun(store, {
+        taskId: input.taskId,
+        roleName: input.roleName,
+        agentId: input.agentId,
+        runId: input.runId,
+        receiptId: formatAgentRunReceiptId(input.taskId, input.runId),
+        ...(session?.nativeSessionId === undefined
+          ? {}
+          : { nativeSessionId: session.nativeSessionId }),
+        ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+        runtimeCleanup: "required",
+        outcome: { status: "failed", summary }
+      }, input.now);
+      if (result.disposition !== "applied" || result.run === null) {
+        return "state-changed";
+      }
+
+      const terminal = result.run;
+      const message = createTaskMessage(
+        store.nextMessageId(input.taskId),
+        input.taskId,
+        summary,
+        "role-result",
+        { type: "role", roleName: input.roleName },
+        input.now,
+        {
+          runId: terminal.id,
+          ...(terminal.workItemId === undefined
+            ? {}
+            : { workItemId: terminal.workItemId })
+        }
+      );
+      store.saveMessage(input.taskId, message);
+      store.saveEvent(input.taskId, createTaskEvent(
+        store.nextEventId(input.taskId),
+        input.taskId,
+        "message.sent",
+        { messageId: message.id, kind: message.kind },
+        input.now
+      ));
+      store.saveEvent(input.taskId, createTaskEvent(
+        store.nextEventId(input.taskId),
+        input.taskId,
+        "runtime.role-delivery-failed",
+        {
+          runId: terminal.id,
+          roleName: input.roleName,
+          outcome: terminal.status
+        },
+        input.now
+      ));
+
+      if (terminal.purpose === "execution" && terminal.workItemId !== undefined) {
+        const item = store.getWorkItem(input.taskId, terminal.workItemId);
+        if (item !== null && ![
+          "completed", "failed", "cancelled", "superseded", "abandoned"
+        ].includes(item.status)) {
+          store.saveWorkItem(
+            input.taskId,
+            updateWorkItemStatus(item, "failed", input.now, summary)
+          );
+        }
+      }
+
+      if (input.roleName !== "leader") {
+        enqueueWork(
+          store,
+          { kind: "role", taskId: input.taskId, roleName: "leader" },
+          terminal.purpose === "review" ? "review-failed" : "role-run-failed",
+          input.now,
+          [
+            { type: "run", taskId: input.taskId, id: terminal.id },
+            { type: "message", taskId: input.taskId, id: message.id },
+            ...(terminal.workItemId === undefined
+              ? []
+                : [{ type: "work-item" as const, taskId: input.taskId, id: terminal.workItemId }])
+          ]
+        );
+      } else {
+        const failedRole = store.getRole(input.taskId, input.roleName);
+        if (failedRole !== null) {
+          store.saveRole(
+            input.taskId,
+            updateRoleStatus(failedRole, "failed", input.now)
+          );
+        }
+        store.saveLeaderFailure(recordLeaderFailure(
+          input.taskId,
+          session?.nativeSessionId ?? "(unregistered)",
+          summary,
+          input.now,
+          store.getLeaderFailure(input.taskId)
+        ));
+        store.saveOperatorNotification(createLeaderRecoveryNotification(
+          input.taskId,
+          summary,
+          input.now,
+          store.getOperatorNotification(input.taskId)
+        ));
+        enqueueWork(
+          store,
+          { kind: "operator" },
+          "leader-run-failed",
+          input.now,
+          [
+            { type: "task", id: input.taskId },
+            { type: "run", taskId: input.taskId, id: terminal.id },
+            { type: "message", taskId: input.taskId, id: message.id }
+          ]
+        );
+      }
+      return "failed";
     });
   }
 
@@ -801,11 +971,22 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (queued === null || queued.pending === null || queued.processing !== null) {
         throw new Error("Runtime launch reservation could not be queued.");
       }
-      store.saveWorkMailbox(claimPending(queued, {
+      let claimed = claimPending(queued, {
         batchId: input.launchId,
         owner: RUNTIME_LIFECYCLE_OWNER,
         startedAt: now.toISOString()
-      }));
+      });
+      if (input.runId !== undefined) {
+        if (input.owner.scope !== "task") {
+          throw new Error("A Run-bound runtime reservation requires a Task owner.");
+        }
+        claimed = bindExecution(
+          claimed,
+          input.launchId,
+          { type: "run", taskId: input.owner.taskId, id: input.runId }
+        );
+      }
+      store.saveWorkMailbox(claimed);
       return { status: "reserved", launchId: input.launchId };
     });
   }
@@ -1986,15 +2167,55 @@ function runtimeSessionMatchesSettledLaunch(
     );
 }
 
+function preparedSessionMatches(
+  session: RoleAgentSession | undefined,
+  agentId: string,
+  adapterId: string,
+  nativeSessionId: string | undefined,
+  launchId: string | undefined
+): boolean {
+  if (session === undefined) return nativeSessionId === undefined;
+  if (
+    session.agentId !== agentId
+    || session.adapterId !== adapterId
+    || session.status === "stopped"
+    || session.status === "broken"
+    || (nativeSessionId !== undefined
+      && session.nativeSessionId !== nativeSessionId)
+  ) {
+    return false;
+  }
+  return launchId === undefined
+    ? session.launchId === undefined
+    : session.launchId === launchId;
+}
+
+function preparedReservationMatches(
+  mailbox: WorkMailbox | null,
+  taskId: string,
+  runId: string,
+  launchId: string | undefined
+): boolean {
+  if (launchId === undefined) {
+    return !isRuntimeLaunchReservation(mailbox?.processing);
+  }
+  const processing = mailbox?.processing;
+  return isRuntimeLaunchReservation(processing, launchId)
+    && !hasRuntimeCleanupObligation(mailbox)
+    && processing?.executionRef?.type === "run"
+    && processing.executionRef.taskId === taskId
+    && processing.executionRef.id === runId;
+}
+
 function matchingPreparedRuntimeReservation(
   store: TaskStore,
   input: Readonly<{
     task: { id: string };
     role: { name: string };
+    run: { id: string };
     session: SchedulerRoleSession | null;
     launchId?: string;
-  }>,
-  existing: SchedulerRoleSession | null
+  }>
 ): WorkMailbox | null {
   if (
     input.launchId === undefined
@@ -2010,16 +2231,11 @@ function matchingPreparedRuntimeReservation(
   const mailbox = store.getWorkMailbox(runtimeLifecycleTarget(owner));
   if (
     isRuntimeLaunchReservation(mailbox?.processing, input.launchId)
+    && mailbox?.processing?.executionRef?.type === "run"
+    && mailbox.processing.executionRef.id === input.run.id
     && !hasRuntimeCleanupObligation(mailbox)
   ) {
     return mailbox;
-  }
-  if (
-    existing?.agentId === input.session.agentId
-    && existing.adapterId === input.session.adapterId
-    && existing.nativeSessionId === input.session.nativeSessionId
-  ) {
-    return null;
   }
   throw new Error("Prepared Role session does not match its launch generation.");
 }

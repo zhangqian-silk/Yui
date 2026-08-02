@@ -68,13 +68,20 @@ function reservationMailbox(fx, roleName) {
   return fx.store.getWorkMailbox(runtimeLifecycleTarget(owner(fx, roleName)));
 }
 
-function assertReservation(fx, roleName, launchId) {
+function assertReservation(fx, roleName, launchId, runId) {
   const mailbox = reservationMailbox(fx, roleName);
   assert.ok(mailbox);
   assert.equal(isRuntimeLaunchReservation(mailbox.processing, launchId), true);
   assert.deepEqual(mailbox.processing.batch.reasons, [
     RUNTIME_LAUNCH_RESERVED_REASON
   ]);
+  if (runId !== undefined) {
+    assert.deepEqual(mailbox.processing.executionRef, {
+      type: "run",
+      taskId: fx.task.id,
+      id: runId
+    });
+  }
   return mailbox;
 }
 
@@ -120,6 +127,19 @@ function registry(coordinator, host, promptPush = async () => "busy") {
 
 function prepareInput(fx, roleName, runId, adapterId = fx.agent.adapterId) {
   const effective = fx.schedulerStore.getRole(fx.task.id, roleName).effective;
+  if (fx.store.getAgentRun(fx.task.id, runId) === null) {
+    fx.store.saveAgentRun(createAgentRun(
+      runId,
+      fx.task.id,
+      roleName,
+      "new",
+      `prepare ${runId}`,
+      NOW,
+      {
+        effective
+      }
+    ));
+  }
   return {
     taskId: fx.task.id,
     roleName,
@@ -158,8 +178,8 @@ test("fresh Codex Leader and Worker reserve before start and their first matchin
   );
   const delivery = registry(coordinator, host);
 
-  for (const roleName of ["leader", "worker"]) {
-    const input = prepareInput(fx, roleName, `run-${roleName}`);
+  for (const [index, roleName] of ["leader", "worker"].entries()) {
+    const input = prepareInput(fx, roleName, `agent-run-${index + 1}`);
     const prepared = await delivery.prepareRoleSession(input);
     const ready = await delivery.waitUntilReady(prepared);
 
@@ -237,12 +257,22 @@ test("a busy retry for one delivery reuses the prepared binding without starting
   assertReservation(fx, "worker", first.launchId);
 });
 
-test("a known Claude native session and its reservation are persisted together by saveRoleRunPrepared", async (t) => {
+test("a known Claude preparation retains its exact Run reservation until delivery", async (t) => {
   const fx = fixture(t, "claude");
+  let hostPresent = false;
+  let createdHosts = 0;
+  let starts = 0;
   const host = {
     async start(request) {
       assertReservation(fx, request.owner.roleName, request.launchId);
-      return runtimeBinding(request, { nativeSessionId: "claude-native-1" });
+      starts += 1;
+      const hostCreated = !hostPresent;
+      hostPresent = true;
+      if (hostCreated) createdHosts += 1;
+      return runtimeBinding(request, {
+        nativeSessionId: "claude-native-1",
+        hostCreated
+      });
     },
     async resume() { throw new Error("resume is not expected"); },
     async stop() {},
@@ -292,7 +322,38 @@ test("a known Claude native session and its reservation are persisted together b
     fx.store.getRoleSession(fx.task.id, input.roleName).nativeSessionId,
     "claude-native-1"
   );
+  assertReservation(fx, input.roleName, prepared.launchId, input.runId);
+
+  const restartedStore = new FileTaskStore(fx.home);
+  const restartedSchedulerStore = new FileSchedulerStoreAdapter(restartedStore);
+  const restartedDelivery = registry(
+    new RuntimeLaunchCoordinator(restartedSchedulerStore, host, {
+      createGenerationId: () => "must-not-replace-prepared-generation",
+      now: () => NOW
+    }),
+    host
+  );
+  const recovered = await restartedDelivery.prepareRoleSession(input);
+  const recoveredReady = await restartedDelivery.waitUntilReady(recovered);
+
+  assert.equal(recovered.launchId, prepared.launchId);
+  assert.equal(recovered.sessionStarted, false);
+  assert.equal(recoveredReady.session.nativeSessionId, "claude-native-1");
+  assert.equal(createdHosts, 1);
+  assert.equal(starts, 2);
+  assertReservation(fx, input.roleName, prepared.launchId, input.runId);
+
+  restartedSchedulerStore.saveRoleRunDelivery({
+    task: restartedSchedulerStore.getTask(fx.task.id),
+    role: restartedSchedulerStore.getRole(fx.task.id, input.roleName),
+    run,
+    session: recoveredReady.session,
+    launchId: prepared.launchId,
+    now: NOW
+  });
+
   assert.equal(reservationMailbox(fx, input.roleName), null);
+  assert.notEqual(fx.store.getAgentRun(fx.task.id, run.id).deliveredAt, undefined);
 });
 
 for (const inspectionState of ["stopped", "running", "unavailable"]) {
@@ -319,7 +380,7 @@ for (const inspectionState of ["stopped", "running", "unavailable"]) {
 
     await assert.rejects(
       delivery.prepareRoleSession(
-        prepareInput(fx, "worker", `run-${inspectionState}`)
+        prepareInput(fx, "worker", "agent-run-1")
       ),
       new RegExp(`start failed: ${inspectionState}`)
     );
@@ -375,7 +436,7 @@ test("after Controller restart an existing running host reuses its generation wi
     }
   );
   const first = await registry(firstCoordinator, host).prepareRoleSession(
-    prepareInput(fx, "leader", "run-before-restart")
+    prepareInput(fx, "leader", "agent-run-1")
   );
   assertReservation(fx, "leader", first.launchId);
 
@@ -393,7 +454,7 @@ test("after Controller restart an existing running host reuses its generation wi
     restartedCoordinator,
     host
   ).prepareRoleSession(
-    prepareInput(fx, "leader", "run-after-restart")
+    prepareInput(fx, "leader", "agent-run-1")
   );
 
   assert.equal(recovered.launchId, first.launchId);
@@ -444,7 +505,7 @@ test("a host recreated after a running reservation probe is fenced into a fresh 
     }),
     host
   ).prepareRoleSession(
-    prepareInput(fx, "leader", "run-before-race")
+    prepareInput(fx, "leader", "agent-run-1")
   );
   assertReservation(fx, "leader", first.launchId);
 
@@ -465,7 +526,7 @@ test("a host recreated after a running reservation probe is fenced into a fresh 
       effective: fx.schedulerStore.getRole(fx.task.id, "leader").effective,
       workspace: fx.home,
       mode: "new",
-      runId: "run-raced-recovery"
+      runId: "agent-run-1"
     }, "deferred"),
     /recreated while recovering an existing generation/i
   );
@@ -481,7 +542,7 @@ test("a host recreated after a running reservation probe is fenced into a fresh 
     effective: fx.schedulerStore.getRole(fx.task.id, "leader").effective,
     workspace: fx.home,
     mode: "new",
-    runId: "run-raced-recovery"
+    runId: "agent-run-1"
   }, "deferred");
 
   assert.notEqual(recovered.launchId, first.launchId);
@@ -533,7 +594,7 @@ test("a foreground preflight failure cannot enqueue cleanup for an existing heal
     }
   );
   const first = await registry(firstCoordinator, host).prepareRoleSession(
-    prepareInput(fx, "leader", "run-before-foreground")
+    prepareInput(fx, "leader", "agent-run-1")
   );
   rejectRebind = true;
 
@@ -705,7 +766,7 @@ test("a stopped pre-binding host gets a new generation and the old generation Ho
     }
   );
   const first = await registry(firstCoordinator, host).prepareRoleSession(
-    prepareInput(fx, "worker", "run-before-stop")
+    prepareInput(fx, "worker", "agent-run-1")
   );
   hostPresent = false;
 
@@ -723,7 +784,7 @@ test("a stopped pre-binding host gets a new generation and the old generation Ho
     restartedCoordinator,
     host
   ).prepareRoleSession(
-    prepareInput(fx, "worker", "run-after-stop")
+    prepareInput(fx, "worker", "agent-run-2")
   );
 
   assert.notEqual(recovered.launchId, first.launchId);
@@ -739,14 +800,14 @@ test("a stopped pre-binding host gets a new generation and the old generation Ho
     launchId: first.launchId,
     nativeSessionId: "thread-old",
     turnId: "turn-old",
-    runId: "run-before-stop"
+    runId: "agent-run-1"
   };
   const currentHook = {
     ...oldHook,
     launchId: recovered.launchId,
     nativeSessionId: "thread-current",
     turnId: "turn-current",
-    runId: "run-after-stop"
+    runId: "agent-run-2"
   };
   assert.equal(
     restartedReservations.classifyRuntimeTurnCompleted(oldHook),

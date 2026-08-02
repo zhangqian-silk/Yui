@@ -5,16 +5,23 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
+import { runControllerSchedulerPass } from "../../dist/controller/controller.js";
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
 import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { updateRoleAgentSessionStatus } from "../../dist/executor/agentExecutor.js";
 import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import {
+  attachReviewRoundWorkspace,
+  createReviewRound,
+  startReviewRound
+} from "../../dist/review/reviewRound.js";
+import {
   createGlobalRole,
   createRole,
   createRoleAgentBinding,
-  updateRole
+  updateRole,
+  updateRoleStatus
 } from "../../dist/role/role.js";
 import { yieldAgentRun } from "../../dist/run/agentRun.js";
 import { createAgentRun as createTestAgentRun } from "../helpers/effectiveLaunch.js";
@@ -22,10 +29,21 @@ import { processActiveRoleRunDeliveries } from "../../dist/scheduler/activeRoleR
 import { processLeaderWakeups } from "../../dist/scheduler/leaderWakeupProcessor.js";
 import { processOperatorInputNotifications } from "../../dist/scheduler/operatorInputNotificationProcessor.js";
 import { queueLeaderWakeup } from "../../dist/scheduler/wakeupQueue.js";
+import {
+  hasRuntimeCleanupObligation,
+  isRuntimeLaunchReservation,
+  runtimeLifecycleTarget
+} from "../../dist/runtime/lifecycleReservation.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, archiveTask, completeTask, createTask } from "../../dist/task/task.js";
-import { createWorkItem, updateWorkItemStatus } from "../../dist/workItem/workItem.js";
+import { createRoleWorkspace } from "../../dist/worktree/roleWorkspace.js";
+import { createProject } from "../../dist/repository/project.js";
+import {
+  createWorkItem,
+  submitWorkItemCandidate,
+  updateWorkItemStatus
+} from "../../dist/workItem/workItem.js";
 
 function fixture(t) {
   const home = mkdtempSync(join(tmpdir(), "yui-scheduler-store-"));
@@ -33,7 +51,10 @@ function fixture(t) {
   ensureStorageSchema(home);
   const store = new FileTaskStore(home);
   const now = new Date("2026-07-19T00:00:00.000Z");
-  const task = activateTask(createTask("task-1", "Run workflow", now), now);
+  const task = activateTask(createTask("task-1", "Run workflow", now, {
+    projectBindings: [{ projectId: "project-1", directory: "Yui", baseRef: "main" }],
+    cwd: home
+  }), now);
   const role = createRole(
     task.id,
     "leader",
@@ -46,6 +67,13 @@ function fixture(t) {
     now
   );
   store.transaction((tx) => {
+    tx.saveProject(createProject(
+      "project-1",
+      "Yui",
+      home,
+      { stable: "main", development: "main" },
+      now
+    ));
     tx.saveTask(task);
     tx.saveRole(task.id, role);
     queueLeaderWakeup(tx, task.id, "task-created", now);
@@ -74,6 +102,157 @@ function createAgentRun(adapter, ...args) {
   });
 }
 
+function preparedDeliveryFailureFixture(
+  t,
+  { roleName = "worker", purpose = "execution" } = {}
+) {
+  const fx = fixture(t);
+  const { home, store, task, now, adapter } = fx;
+  const role = roleName === "leader"
+    ? fx.role
+    : createRole(
+        task.id,
+        roleName,
+        [createRoleAgentBinding({ id: "codex", adapterId: "codex" })],
+        "codex",
+        home,
+        now
+      );
+  let item = null;
+  let round = null;
+  const runId = "agent-run-1";
+  if (purpose === "execution" && roleName !== "leader") {
+    item = updateWorkItemStatus(createWorkItem(
+      "work-item-1",
+      task.id,
+      { title: `Execute ${roleName}`, writeProjectIds: ["project-1"] },
+      now
+    ), "running", now);
+  } else if (purpose === "review") {
+    item = updateWorkItemStatus(createWorkItem(
+      "work-item-1",
+      task.id,
+      { title: `Review ${roleName}`, writeProjectIds: ["project-1"] },
+      now
+    ), "running", now);
+    item = submitWorkItemCandidate(item, {
+      summary: "candidate under review",
+      source: { type: "direct" }
+    }, now);
+    const reviewBaseCommit = "b".repeat(40);
+    const pendingRound = createReviewRound(
+      "review-round-1",
+      task.id,
+      item.id,
+      item.candidates[0].id,
+      roleName,
+      "leader",
+      reviewBaseCommit,
+      now
+    );
+    const reviewWorkspace = createRoleWorkspace({
+      taskId: task.id,
+      roleName,
+      owner: { type: "review-round", reviewRoundId: pendingRound.id },
+      root: join(home, "reviews", pendingRound.id),
+      entries: [{
+        projectId: "project-1",
+        directory: "Yui",
+        access: "write",
+        path: join(home, "reviews", pendingRound.id, "Yui"),
+        branch: `yui/${task.id}/${pendingRound.id}`,
+        baseRef: reviewBaseCommit,
+        baseCommit: reviewBaseCommit
+      }]
+    }, now);
+    round = startReviewRound(
+      attachReviewRoundWorkspace(pendingRound, reviewWorkspace),
+      runId
+    );
+  }
+  const effective = purpose === "review"
+    ? resolveEffectiveLaunch({
+        role,
+        purpose,
+        workspace: round.workspace,
+        workItemWriteProjectIds: item.writeProjectIds,
+        reviewRoundId: round.id,
+        reviewBaseCommit: round.reviewBaseCommit
+      })
+    : resolveEffectiveLaunch({ role, purpose });
+  const run = createAgentRun(
+    adapter,
+    runId,
+    task.id,
+    roleName,
+    "new",
+    `deliver ${roleName}`,
+    now,
+    {
+      purpose,
+      ...(item === null ? {} : { workItemId: item.id }),
+      ...(round === null ? {} : { reviewRoundId: round.id }),
+      ...(round?.workspace === undefined ? {} : { workspace: round.workspace }),
+      effective
+    }
+  );
+  const target = { kind: "role", taskId: task.id, roleName };
+  store.transaction((tx) => {
+    if (roleName !== "leader") tx.saveRole(task.id, role);
+    tx.saveRole(task.id, updateRoleStatus(role, "running", now));
+    if (item !== null) tx.saveWorkItem(task.id, item);
+    if (round !== null) tx.saveReviewRound(task.id, round);
+    tx.saveActiveAgentRun(run);
+    enqueueWork(tx, target, "run-dispatched", now, [
+      { type: "run", taskId: task.id, id: run.id }
+    ]);
+  });
+  const mailboxBatchId = `agent-run:${task.id}/${run.id}`;
+  const claim = adapter.claimWorkMailbox({
+    target,
+    batchId: mailboxBatchId,
+    owner: "controller",
+    now,
+    executionRef: { type: "run", taskId: task.id, id: run.id }
+  });
+  assert.notEqual(claim.status, "empty");
+  const launchId = `runtime-test:generation:${roleName}`;
+  adapter.reserveRuntimeLaunch({
+    owner: { scope: "task", taskId: task.id, roleName },
+    launchId,
+    runId: run.id
+  }, () => {}, now);
+  const session = schedulerSession(run, `native-${roleName}`, "running");
+  adapter.saveRoleRunPrepared({
+    task: adapter.getTask(task.id),
+    role: adapter.getRole(task.id, roleName),
+    run,
+    session,
+    launchId,
+    now
+  });
+  return {
+    ...fx,
+    role,
+    run,
+    item,
+    round,
+    target,
+    launchId,
+    session,
+    failure: {
+      taskId: task.id,
+      roleName,
+      agentId: run.effective.agentId,
+      adapterId: run.effective.adapterId,
+      runId: run.id,
+      mailboxBatchId,
+      nativeSessionId: session.nativeSessionId,
+      launchId,
+      now
+    }
+  };
+}
 test("FileSchedulerStoreAdapter commits Leader run, Role and fixed session together", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
   const before = JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision;
@@ -1192,6 +1371,178 @@ test("Worker busy retry persists and reuses the hosted native session before del
   assert.equal(retried.status, "delivered", retried.error);
   assert.equal(store.getRoleSession(task.id, worker.name).nativeSessionId, "hosted-native-b");
   assert.notEqual(store.getActiveAgentRun(task.id, worker.name).deliveredAt, undefined);
+});
+
+test("Worker delivery exhaustion atomically fails the exact Run and queues cleanup plus Leader work", (t) => {
+  const fx = preparedDeliveryFailureFixture(t);
+  const runtimeTarget = runtimeLifecycleTarget({
+    scope: "task",
+    taskId: fx.task.id,
+    roleName: fx.role.name
+  });
+  const reserved = fx.store.getWorkMailbox(runtimeTarget);
+  assert.equal(isRuntimeLaunchReservation(reserved.processing, fx.launchId), true);
+  assert.deepEqual(reserved.processing.executionRef, {
+    type: "run",
+    taskId: fx.task.id,
+    id: fx.run.id
+  });
+
+  assert.equal(
+    fx.adapter.saveRoleRunDeliveryFailure(fx.failure),
+    "failed"
+  );
+
+  const terminal = fx.store.getAgentRun(fx.task.id, fx.run.id);
+  assert.equal(terminal.status, "failed");
+  assert.equal(terminal.deliveredAt, undefined);
+  assert.equal(fx.store.getActiveAgentRun(fx.task.id, fx.role.name), null);
+  assert.equal(fx.store.getWorkItem(fx.task.id, fx.item.id).status, "failed");
+  assert.equal(fx.store.getWorkItem(fx.task.id, fx.item.id).candidates.length, 0);
+  assert.equal(fx.store.getRole(fx.task.id, fx.role.name).status, "idle");
+  assert.equal(fx.store.getRoleSession(fx.task.id, fx.role.name).status, "ready");
+  assert.equal(fx.store.getWorkMailbox(fx.target).processing, null);
+  assert.equal(hasRuntimeCleanupObligation(
+    fx.store.getWorkMailbox(runtimeTarget)
+  ), true);
+  assert.ok(fx.store.getPendingWakeup(fx.task.id).reasons.includes("role-run-failed"));
+  assert.ok(fx.store.listEvents(fx.task.id).some(
+    (event) => event.type === "runtime.role-delivery-failed"
+  ));
+  const messageCount = fx.store.listMessages(fx.task.id).length;
+
+  assert.equal(
+    fx.adapter.saveRoleRunDeliveryFailure(fx.failure),
+    "state-changed"
+  );
+  assert.equal(fx.store.listMessages(fx.task.id).length, messageCount);
+});
+
+test("Reviewer delivery exhaustion fails only its ReviewRound and queues the Leader", (t) => {
+  const fx = preparedDeliveryFailureFixture(t, {
+    roleName: "reviewer",
+    purpose: "review"
+  });
+
+  assert.equal(
+    fx.adapter.saveRoleRunDeliveryFailure(fx.failure),
+    "failed"
+  );
+
+  assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).status, "failed");
+  assert.equal(
+    fx.store.getReviewRound(fx.task.id, fx.round.id).status,
+    "failed"
+  );
+  assert.equal(
+    fx.store.getWorkItem(fx.task.id, fx.item.id).status,
+    "awaiting_acceptance"
+  );
+  assert.equal(
+    fx.store.getWorkItem(fx.task.id, fx.item.id).candidates.length,
+    1
+  );
+  assert.ok(fx.store.getPendingWakeup(fx.task.id).reasons.includes("review-failed"));
+});
+
+test("Leader delivery exhaustion records Operator recovery and stops its owned runtime before session exit", async (t) => {
+  const fx = preparedDeliveryFailureFixture(t, { roleName: "leader" });
+  const runtimeTarget = runtimeLifecycleTarget({
+    scope: "task",
+    taskId: fx.task.id,
+    roleName: fx.role.name
+  });
+
+  assert.equal(
+    fx.adapter.saveRoleRunDeliveryFailure(fx.failure),
+    "failed"
+  );
+  assert.equal(fx.store.getRole(fx.task.id, fx.role.name).status, "failed");
+  assert.equal(
+    fx.store.getLeaderFailure(fx.task.id).nativeSessionId,
+    fx.session.nativeSessionId
+  );
+  assert.equal(
+    fx.store.getOperatorNotification(fx.task.id).type,
+    "leader-recovery-failed"
+  );
+  assert.ok(
+    fx.store.getWorkMailbox({ kind: "operator" }).pending.reasons.includes(
+      "leader-run-failed"
+    )
+  );
+  assert.equal(fx.store.getRoleSession(fx.task.id, fx.role.name).status, "ready");
+  assert.equal(hasRuntimeCleanupObligation(
+    fx.store.getWorkMailbox(runtimeTarget)
+  ), true);
+
+  let stopCalls = 0;
+  const forgotten = [];
+  await runControllerSchedulerPass(
+    fx.adapter,
+    {
+      async prepareRoleSession() { throw new Error("unused"); },
+      async waitUntilReady() { throw new Error("unused"); },
+      async sendOnce() { throw new Error("unused"); },
+      async inspectRole() { return "present"; },
+      async stopTask() { return false; },
+      forgetPrepared(input) { forgotten.push(input); }
+    },
+    new Date(fx.now.getTime() + 1_000),
+    undefined,
+    { kind: "dirty", keys: [`role:${fx.task.id}/${fx.role.name}`] },
+    false,
+    [],
+    {
+      async inspectOwner() { return { state: "running" }; },
+      async stopOwner(owner) {
+        stopCalls += 1;
+        assert.deepEqual(owner, {
+          scope: "task",
+          taskId: fx.task.id,
+          roleName: fx.role.name
+        });
+        assert.equal(
+          fx.store.getRoleSession(fx.task.id, fx.role.name).status,
+          "ready"
+        );
+        return true;
+      }
+    }
+  );
+
+  assert.equal(stopCalls, 1);
+  assert.equal(fx.store.getRoleSession(fx.task.id, fx.role.name).status, "stopped");
+  assert.equal(fx.store.getWorkMailbox(runtimeTarget), null);
+  assert.deepEqual(forgotten, [{
+    taskId: fx.task.id,
+    roleName: fx.role.name
+  }]);
+});
+
+test("delivery exhaustion is a no-op when the exact generation fence changed", (t) => {
+  const fx = preparedDeliveryFailureFixture(t);
+  const beforeMessages = fx.store.listMessages(fx.task.id).length;
+
+  assert.equal(fx.adapter.saveRoleRunDeliveryFailure({
+    ...fx.failure,
+    launchId: "runtime-test:generation:stale"
+  }), "state-changed");
+
+  assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).status, "active");
+  assert.equal(fx.store.getActiveAgentRun(fx.task.id, fx.role.name).id, fx.run.id);
+  assert.equal(fx.store.getWorkItem(fx.task.id, fx.item.id).status, "running");
+  assert.equal(fx.store.listMessages(fx.task.id).length, beforeMessages);
+  const reservation = fx.store.getWorkMailbox(runtimeLifecycleTarget({
+    scope: "task",
+    taskId: fx.task.id,
+    roleName: fx.role.name
+  }));
+  assert.equal(isRuntimeLaunchReservation(
+    reservation.processing,
+    fx.launchId
+  ), true);
+  assert.equal(hasRuntimeCleanupObligation(reservation), false);
 });
 
 test("runtime native session registration is structured and exited work fails atomically", (t) => {

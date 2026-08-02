@@ -65,6 +65,7 @@ function emptyStore(events = []) {
     saveLeaderDispatch() {},
     saveRoleRunPrepared() {},
     saveRoleRunDelivery() {},
+    saveRoleRunDeliveryFailure() { return "state-changed"; },
     saveLeaderDispatchFailure() {},
     saveExitedRoleRun() {},
     saveArchivedTaskStopped() {}
@@ -1799,15 +1800,25 @@ test("a non-ready Role delivery uses bounded queued retries instead of blocking 
   controller.stop();
 });
 
-test("exhausting Role delivery retries forgets the transient Run preparation", async () => {
+test("exhausting Role delivery retries terminalizes the exact prepared Run before forgetting it", async () => {
   const task = { id: "task-1", status: "active", projectBindings: [] };
   const roleValue = role(task.id, "worker");
-  const run = deliveredRun(task.id, roleValue.name);
+  let run = deliveredRun(task.id, roleValue.name);
   delete run.deliveredAt;
+  const runId = run.id;
+  const session = {
+    agentId: run.effective.agentId,
+    adapterId: run.effective.adapterId,
+    nativeSessionId: "native-retry-exhausted",
+    status: "running",
+    effective: run.effective
+  };
+  const now = new Date("2025-01-02T03:04:05.000Z");
   const store = emptyStore();
   store.getTask = () => task;
   store.getRole = () => roleValue;
   store.getActiveAgentRun = () => run;
+  store.getRoleSession = () => session;
   store.claimWorkMailbox = () => ({
     status: "processing",
     processing: {
@@ -1825,53 +1836,68 @@ test("exhausting Role delivery retries forgets the transient Run preparation", a
       executionRef: { type: "run", taskId: task.id, id: run.id }
     }
   });
+  const events = [];
+  const failures = [];
+  store.saveRoleRunDeliveryFailure = (input) => {
+    events.push("terminalized");
+    failures.push(input);
+    run = null;
+    return "failed";
+  };
   let sends = 0;
-  let resolveForgotten;
-  const forgotten = new Promise((resolve) => { resolveForgotten = resolve; });
+  const forgotten = [];
   const delivery = {
     ...noTmux,
     async prepareRoleSession(input) {
       return {
         ...input,
         deliveryId: "delivery-retry-exhausted",
+        launchId: "launch-retry-exhausted",
         sessionStarted: false
       };
     },
     async waitUntilReady(prepared) {
-      return { prepared, session: null };
+      return { prepared, session };
     },
     async sendOnce() {
       sends += 1;
       return "busy";
     },
     async inspectRole() { return "present"; },
-    forgetPrepared(input) { resolveForgotten(input); }
+    forgetPrepared(input) {
+      events.push("forgotten");
+      forgotten.push(input);
+    }
   };
   const controller = new FileTaskController(store, delivery, {
     signalWindowMs: 1,
     deliveryRetryMs: 2,
-    deliveryRetryLimit: 2
+    deliveryRetryLimit: 2,
+    now: () => now
   });
 
   controller.signal("role:task-1/worker");
-  let timeout;
-  const forgottenInput = await Promise.race([
-    forgotten,
-    new Promise((_, reject) => {
-      timeout = setTimeout(
-        () => reject(new Error("prepared Run cache was not released")),
-        1_000
-      );
-    })
-  ]);
-  clearTimeout(timeout);
+  await new Promise((resolve) => setTimeout(resolve, 50));
 
   assert.equal(sends, 3);
-  assert.deepEqual(forgottenInput, {
+  assert.deepEqual(failures, [{
     taskId: task.id,
     roleName: roleValue.name,
-    runId: run.id
-  });
+    agentId: run?.effective.agentId ?? session.effective.agentId,
+    adapterId: run?.effective.adapterId ?? session.effective.adapterId,
+    runId,
+    mailboxBatchId: `agent-run:${task.id}/${runId}`,
+    nativeSessionId: session.nativeSessionId,
+    launchId: "launch-retry-exhausted",
+    now
+  }]);
+  assert.deepEqual(forgotten, [{
+    taskId: task.id,
+    roleName: roleValue.name,
+    runId,
+    launchId: "launch-retry-exhausted"
+  }]);
+  assert.deepEqual(events, ["terminalized", "forgotten"]);
   controller.stop();
 });
 

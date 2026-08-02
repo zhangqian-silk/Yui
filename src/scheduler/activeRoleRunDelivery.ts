@@ -1,6 +1,8 @@
 import type {
   PreparedRoleDelivery,
   ReadyRoleDelivery,
+  SchedulerAgentRun,
+  RoleRunDeliveryFailurePersistence,
   SchedulerRole,
   SchedulerRoleSession,
   SchedulerStorePort,
@@ -21,6 +23,7 @@ export type ActiveRoleRunDeliveryResult = Readonly<{
   status: "delivered" | "already-delivered" | "skipped" | "failed";
   reason?: "workspace-not-ready" | "launch-failed" | "mailbox-empty" | "mailbox-busy" | "not-ready" | "runtime-unavailable" | "delivery-uncertain";
   error?: string;
+  terminalFailure?: Omit<RoleRunDeliveryFailurePersistence, "now">;
 }>;
 
 /**
@@ -93,6 +96,7 @@ export async function processActiveRoleRunDeliveries(
         continue;
       }
       let prepared: PreparedRoleDelivery | undefined;
+      let preparedSession: SchedulerRoleSession | null = existingSession;
       let deliveryAttempted = false;
       try {
         const nativeSessionId = run.mode === "resume"
@@ -117,6 +121,7 @@ export async function processActiveRoleRunDeliveries(
           run.mode,
           ready
         );
+        preparedSession = session;
         store.saveRoleRunPrepared({
           task,
           role,
@@ -139,7 +144,13 @@ export async function processActiveRoleRunDeliveries(
             roleName: role.name,
             runId: run.id,
             status: "skipped",
-            reason: outcome === "busy" ? "not-ready" : "runtime-unavailable"
+            reason: outcome === "busy" ? "not-ready" : "runtime-unavailable",
+            terminalFailure: roleRunDeliveryFailure(
+              run,
+              processing.batchId,
+              session,
+              ready.prepared.launchId
+            )
           });
           continue;
         }
@@ -184,19 +195,44 @@ export async function processActiveRoleRunDeliveries(
           });
           continue;
         }
-        store.releaseWorkMailbox(target, processing.batchId);
         results.push({
           taskId: task.id,
           roleName: role.name,
           runId: run.id,
           status: "failed",
           reason: "delivery-uncertain",
-          error: message
+          error: message,
+          terminalFailure: roleRunDeliveryFailure(
+            run,
+            processing.batchId,
+            preparedSession,
+            prepared?.launchId
+          )
         });
       }
     }
   }
   return results;
+}
+
+function roleRunDeliveryFailure(
+  run: SchedulerAgentRun,
+  mailboxBatchId: string,
+  session: SchedulerRoleSession | null,
+  launchId: string | undefined
+): Omit<RoleRunDeliveryFailurePersistence, "now"> {
+  return {
+    taskId: run.taskId,
+    roleName: run.roleName,
+    agentId: run.effective.agentId,
+    adapterId: run.effective.adapterId,
+    runId: run.id,
+    mailboxBatchId,
+    ...(session?.nativeSessionId === undefined
+      ? {}
+      : { nativeSessionId: session.nativeSessionId }),
+    ...(launchId === undefined ? {} : { launchId })
+  };
 }
 
 function requireResumeSession(

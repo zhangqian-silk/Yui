@@ -110,6 +110,19 @@ export type RoleRunDeliveryPersistence = Readonly<{
   now: Date;
 }>;
 
+export type RoleRunDeliveryFailurePersistence = Readonly<{
+  taskId: string;
+  roleName: string;
+  agentId: string;
+  adapterId: AgentAdapterId;
+  runId: string;
+  mailboxBatchId: string;
+  nativeSessionId?: string;
+  /** Exact external-process generation prepared for this undelivered Run. */
+  launchId?: string;
+  now: Date;
+}>;
+
 export type ExitedRoleRunPersistence = Readonly<{
   task: SchedulerTask;
   role: SchedulerRole;
@@ -227,6 +240,10 @@ export interface SchedulerStorePort {
   saveRoleRunPrepared(input: RoleRunDeliveryPersistence): void;
   /** Persist successful delivery of a Work AgentRun and its fixed session. */
   saveRoleRunDelivery(input: RoleRunDeliveryPersistence): void;
+  /** Atomically fail one exact prepared Run after bounded delivery exhaustion. */
+  saveRoleRunDeliveryFailure(
+    input: RoleRunDeliveryFailurePersistence
+  ): "failed" | "state-changed";
   /** Persist LeaderFailure, OperatorNotification and failed/broken runtime state. */
   saveLeaderDispatchFailure(input: LeaderDispatchFailurePersistence): "failed" | "state-changed";
   /** Fail the run and running WorkItem, clear active-run, and stop the Role session. */

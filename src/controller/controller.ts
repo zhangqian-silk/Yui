@@ -10,6 +10,7 @@ import {
 import { stopArchivedTaskRuntimes } from "../scheduler/archivedTaskRuntime.js";
 import type {
   AutoResolvedInput,
+  RoleRunDeliveryFailurePersistence,
   SchedulerReconcileSelection,
   SchedulerStorePort,
   TmuxDeliveryPort
@@ -52,6 +53,11 @@ class RuntimeEventApplyError extends AggregateError {}
 type RuntimeLifecycleHost = Pick<
   SessionHostPort,
   "inspectOwner" | "inspectOwners" | "stopOwner"
+>;
+
+type RoleRunDeliveryFailureIdentity = Omit<
+  RoleRunDeliveryFailurePersistence,
+  "now"
 >;
 
 export type ControllerSchedulerResult = Readonly<{
@@ -727,6 +733,7 @@ export class FileTaskController {
   readonly #deliveryRetryAttempts = new Map<MailboxKey, Readonly<{
     identity: string;
     attempts: number;
+    terminalFailure?: RoleRunDeliveryFailureIdentity;
   }>>();
   readonly #deliveryRetryTimers = new Map<MailboxKey, NodeJS.Timeout>();
   #passRetryTimer: NodeJS.Timeout | undefined;
@@ -1093,14 +1100,22 @@ export class FileTaskController {
   }
 
   #scheduleDeliveryRetries(result: ControllerSchedulerResult): void {
-    const retry = new Map<MailboxKey, string>();
+    const retry = new Map<MailboxKey, Readonly<{
+      identity: string;
+      terminalFailure?: RoleRunDeliveryFailureIdentity;
+    }>>();
     const settled = new Set<MailboxKey>();
     for (const delivery of result.activeRunDeliveries) {
       const key = `role:${encodeURIComponent(delivery.taskId)}/${encodeURIComponent(delivery.roleName)}` as const;
       if (delivery.reason === "not-ready"
         || delivery.reason === "runtime-unavailable"
         || delivery.reason === "delivery-uncertain") {
-        retry.set(key, delivery.runId);
+        retry.set(key, {
+          identity: delivery.runId,
+          ...(delivery.terminalFailure === undefined
+            ? {}
+            : { terminalFailure: delivery.terminalFailure })
+        });
       }
       else if (delivery.status === "delivered" || delivery.status === "already-delivered") settled.add(key);
     }
@@ -1110,7 +1125,7 @@ export class FileTaskController {
         wakeup.reason === "not-ready"
         || wakeup.reason === "delivery-uncertain"
       ) {
-        retry.set(key, wakeup.runId ?? key);
+        retry.set(key, { identity: wakeup.runId ?? key });
       }
       else if (wakeup.status === "dispatched") settled.add(key);
     }
@@ -1122,11 +1137,13 @@ export class FileTaskController {
         )
     );
     if (operatorRetries.length > 0) {
-      retry.set("operator", operatorRetries.map((notification) => (
-        "inputRequestId" in notification
-          ? `input:${notification.inputRequestId}`
-          : `recovery:${notification.recoveryTaskId}`
-      )).join("|"));
+      retry.set("operator", {
+        identity: operatorRetries.map((notification) => (
+          "inputRequestId" in notification
+            ? `input:${notification.inputRequestId}`
+            : `recovery:${notification.recoveryTaskId}`
+        )).join("|")
+      });
     } else if (result.inputNotifications.some(
       (notification) => notification.status === "sent"
         || notification.status === "already-sent"
@@ -1135,8 +1152,12 @@ export class FileTaskController {
       settled.add("operator");
     }
     for (const key of settled) this.#clearDeliveryRetry(key);
-    for (const [key, identity] of retry) {
-      this.#scheduleDeliveryRetry(key, identity);
+    for (const [key, candidate] of retry) {
+      this.#scheduleDeliveryRetry(
+        key,
+        candidate.identity,
+        candidate.terminalFailure
+      );
     }
   }
 
@@ -1179,19 +1200,43 @@ export class FileTaskController {
     }
   }
 
-  #scheduleDeliveryRetry(key: MailboxKey, identity: string): void {
-    const previous = this.#deliveryRetryAttempts.get(key);
+  #scheduleDeliveryRetry(
+    key: MailboxKey,
+    identity: string,
+    terminalFailure?: RoleRunDeliveryFailureIdentity
+  ): void {
+    let previous = this.#deliveryRetryAttempts.get(key);
     if (previous !== undefined && previous.identity !== identity) {
       this.#clearDeliveryRetry(key);
+      previous = undefined;
     }
-    if (this.#deliveryRetryTimers.has(key)) return;
-    const attempts = this.#deliveryRetryAttempts.get(key)?.attempts ?? 0;
-    if (attempts >= this.#deliveryRetryLimit) {
-      if (key === "operator") this.#operatorStartupRetryArmed = false;
-      this.#forgetPreparedAfterRetryExhaustion(key, identity);
+    const stableTerminalFailure = previous?.terminalFailure ?? terminalFailure;
+    if (this.#deliveryRetryTimers.has(key)) {
+      if (previous !== undefined && stableTerminalFailure !== previous.terminalFailure) {
+        this.#deliveryRetryAttempts.set(key, {
+          ...previous,
+          terminalFailure: stableTerminalFailure
+        });
+      }
       return;
     }
-    this.#deliveryRetryAttempts.set(key, { identity, attempts: attempts + 1 });
+    const attempts = previous?.attempts ?? 0;
+    if (attempts >= this.#deliveryRetryLimit) {
+      if (key === "operator") this.#operatorStartupRetryArmed = false;
+      this.#terminalizePreparedAfterRetryExhaustion(
+        key,
+        identity,
+        stableTerminalFailure
+      );
+      return;
+    }
+    this.#deliveryRetryAttempts.set(key, {
+      identity,
+      attempts: attempts + 1,
+      ...(stableTerminalFailure === undefined
+        ? {}
+        : { terminalFailure: stableTerminalFailure })
+    });
     const delayMs = Math.min(
       2_000,
       this.#deliveryRetryMs * (2 ** Math.min(attempts, 3))
@@ -1204,24 +1249,42 @@ export class FileTaskController {
     this.#deliveryRetryTimers.set(key, timer);
   }
 
-  #forgetPreparedAfterRetryExhaustion(
+  #terminalizePreparedAfterRetryExhaustion(
     key: MailboxKey,
-    runId: string
+    runId: string,
+    failure: RoleRunDeliveryFailureIdentity | undefined
   ): void {
     if (
-      this.delivery.forgetPrepared === undefined
-      || !key.startsWith("role:")
+      !key.startsWith("role:")
       || runId.startsWith("runtime-cleanup:")
+      || failure === undefined
     ) {
       return;
     }
     const target = parseMailboxKey(key);
     if (target.kind !== "role") return;
-    this.delivery.forgetPrepared({
-      taskId: target.taskId,
-      roleName: target.roleName,
-      runId
+    if (
+      target.taskId !== failure.taskId
+      || target.roleName !== failure.roleName
+      || runId !== failure.runId
+    ) {
+      throw new Error(`Role delivery retry identity changed: ${key}/${runId}.`);
+    }
+    const result = this.store.saveRoleRunDeliveryFailure({
+      ...failure,
+      now: this.#now()
     });
+    this.#clearDeliveryRetry(key);
+    if (result !== "failed") return;
+    this.delivery.forgetPrepared?.({
+      taskId: failure.taskId,
+      roleName: failure.roleName,
+      runId: failure.runId,
+      ...(failure.launchId === undefined
+        ? {}
+        : { launchId: failure.launchId })
+    });
+    if (!this.#stopped) this.signal(key);
   }
 
   #clearEmptyOperatorRetry(): void {
