@@ -341,7 +341,7 @@ yui task work accept <task-id>/<work-item-id> --summary "验收标准满足。"
 ```
 
 使用 `task work reject` 退回待验收结果以便修复和重新派发，使用
-`task work cancel` 关闭不再需要且未运行的工作。WorkItem、Integration
+`task work dispose` 显式记录终态处置。WorkItem、Integration
 worktree 与检查日志会作为证据保留，直到显式清理。
 
 长期 Task 不依赖 native transcript 恢复。Leader 每次 yield 前更新 Brief

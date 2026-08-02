@@ -507,6 +507,10 @@ test("managed Claude Task Runs inject only StopFailure and exact explicit-yield 
     { title: "Exact Claude result", assignee: role.name },
     now
   ), "running", now);
+  const effective = resolveEffectiveLaunch({
+    role: controlledRole,
+    purpose: "execution"
+  });
   const run = createAgentRun(
     "agent-run-1",
     task.id,
@@ -516,7 +520,7 @@ test("managed Claude Task Runs inject only StopFailure and exact explicit-yield 
     now,
     {
       workItemId: item.id,
-      agent: { agentId: agent.id, adapterId: "claude" }
+      effective
     }
   );
   store.transaction((tx) => {
@@ -531,7 +535,8 @@ test("managed Claude Task Runs inject only StopFailure and exact explicit-yield 
     adapterId: agent.adapterId,
     mode: "new",
     runId: run.id,
-    launchId: "launch-1"
+    launchId: "launch-1",
+    effective: run.effective
   });
 
   const pluginIndex = plan.launch.args.indexOf("--plugin-dir");

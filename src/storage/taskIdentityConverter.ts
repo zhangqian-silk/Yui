@@ -403,6 +403,7 @@ function convertTaskAggregate(conversion: TaskConversion): JsonObject {
   return {
     ...clone(source),
     schemaVersion: 11,
+    task: convertLegacyTask(source.task, conversion.taskId),
     roles,
     idHighWaterMarks: Object.fromEntries(
       (Object.keys(FAMILY_FIELDS) as TaskRecordKind[]).map((kind) => [
@@ -483,6 +484,14 @@ function convertTaskAggregate(conversion: TaskConversion): JsonObject {
       payload: convertTaskEventPayload(record, conversion)
     }))
   };
+}
+
+function convertLegacyTask(value: unknown, taskId: string): JsonObject {
+  const task = clone(object(value, `Source Task ${taskId}`));
+  if (task.schemaVersion !== 2) {
+    throw new Error(`Source Task ${taskId} must use legacy schemaVersion 2.`);
+  }
+  return { ...task, schemaVersion: 3 };
 }
 
 function convertTaskEventPayload(record: JsonObject, conversion: TaskConversion): JsonObject {

@@ -603,6 +603,7 @@ test("offline identity conversion writes a fresh zero-dangling output without to
   for (const taskId of report.taskIds) {
     const task = converted.tasks[taskId];
     assert.equal(task.schemaVersion, 11);
+    assert.equal(task.task.schemaVersion, 3);
     assert.deepEqual(Object.keys(task.workItems), ["work-item-1"]);
     assert.deepEqual(Object.keys(task.agentRuns), ["agent-run-1"]);
     assert.deepEqual(Object.keys(task.messages), ["message-1"]);
@@ -896,7 +897,7 @@ function legacyIdentityState() {
     const inputId = `input-${recordNumber}`;
     tasks[taskId] = {
       schemaVersion: 9,
-      task: createTask(taskId, taskId, new Date(stamp)),
+      task: legacyTask(taskId, taskId, new Date(stamp)),
       brief: null,
       changeSets: {},
       integrationAttempts: {},
@@ -1003,7 +1004,7 @@ function legacyIdentityState() {
     };
   }
   const firstStamp = new Date(NOW.getTime() + 1_000).toISOString();
-  tasks["task-1"].task = createTask("task-1", "task-1", new Date(firstStamp), {
+  tasks["task-1"].task = legacyTask("task-1", "task-1", new Date(firstStamp), {
     projectBindings: [{ projectId: "project-1", directory: "fixture", baseRef: "main" }]
   });
   tasks["task-1"].workItems["work-item-10"] = {
@@ -1145,6 +1146,10 @@ function legacyIdentityState() {
       }
     }
   };
+}
+
+function legacyTask(id, title, now, metadata = {}) {
+  return { ...createTask(id, title, now, metadata), schemaVersion: 2 };
 }
 
 function legacyWorkItemWorkspace(timestamp) {
