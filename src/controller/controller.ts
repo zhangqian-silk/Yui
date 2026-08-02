@@ -156,8 +156,8 @@ export async function runControllerSchedulerPass(
     const activeRunDeliveries = await processActiveRoleRunDeliveries(
       store, delivery, now, roleSelection
     );
-    const uncertainRunRefs = new Set(activeRunDeliveries.flatMap((result) => (
-      result.reason === "delivery-uncertain"
+    const unsettledRunRefs = new Set(activeRunDeliveries.flatMap((result) => (
+      result.reason === "delivery-uncertain" || result.terminalFailure !== undefined
         ? [formatTaskRecordReference(result.taskId, result.runId, "agentRun")]
         : []
     )));
@@ -167,7 +167,7 @@ export async function runControllerSchedulerPass(
       delivery,
       now,
       roleSelection,
-      uncertainRunRefs
+      unsettledRunRefs
     );
     await reconcileDormantRuntimeOwners(
       store,
@@ -1105,9 +1105,14 @@ export class FileTaskController {
       terminalFailure?: RoleRunDeliveryFailureIdentity;
     }>>();
     const settled = new Set<MailboxKey>();
+    const resignal = new Set<MailboxKey>();
     for (const delivery of result.activeRunDeliveries) {
       const key = `role:${encodeURIComponent(delivery.taskId)}/${encodeURIComponent(delivery.roleName)}` as const;
-      if (delivery.reason === "not-ready"
+      if (delivery.terminalized === true) {
+        settled.add(key);
+        resignal.add(key);
+      }
+      else if (delivery.reason === "not-ready"
         || delivery.reason === "runtime-unavailable"
         || delivery.reason === "delivery-uncertain") {
         retry.set(key, {
@@ -1152,6 +1157,7 @@ export class FileTaskController {
       settled.add("operator");
     }
     for (const key of settled) this.#clearDeliveryRetry(key);
+    for (const key of resignal) this.signal(key);
     for (const [key, candidate] of retry) {
       this.#scheduleDeliveryRetry(
         key,

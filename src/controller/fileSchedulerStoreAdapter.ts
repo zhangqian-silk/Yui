@@ -938,6 +938,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   ): Readonly<{
     status: "reserved" | "existing";
     launchId: string;
+    runId?: string;
   }> {
     return this.store.transaction((store) => {
       assertCurrent();
@@ -947,9 +948,18 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         if (hasRuntimeCleanupObligation(existing)) {
           throw new Error("Runtime cleanup is still pending.");
         }
+        const executionRef = existing!.processing!.executionRef;
+        if (executionRef?.type === "run"
+          && (input.owner.scope !== "task"
+            || executionRef.taskId !== input.owner.taskId)) {
+          throw new Error("Runtime launch reservation belongs to another Task Run.");
+        }
         return {
           status: "existing",
-          launchId: existing!.processing!.batchId
+          launchId: existing!.processing!.batchId,
+          ...(executionRef?.type === "run"
+            ? { runId: executionRef.id }
+            : {})
         };
       }
       if (
@@ -987,7 +997,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         );
       }
       store.saveWorkMailbox(claimed);
-      return { status: "reserved", launchId: input.launchId };
+      return {
+        status: "reserved",
+        launchId: input.launchId,
+        ...(input.runId === undefined ? {} : { runId: input.runId })
+      };
     });
   }
 
@@ -1047,12 +1061,28 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
 
   completeRuntimeLaunchReservation(
     owner: RuntimeRoleOwner,
-    launchId: string
+    launchId: string,
+    expectedTerminalRunId?: string
   ): boolean {
     return this.store.transaction((store) => {
       const target = runtimeLifecycleTarget(owner);
       const mailbox = store.getWorkMailbox(target);
       if (!isRuntimeLaunchReservation(mailbox?.processing, launchId)) return false;
+      if (expectedTerminalRunId !== undefined) {
+        const expectedRun = owner.scope === "task"
+          ? store.getAgentRun(owner.taskId, expectedTerminalRunId)
+          : null;
+        if (
+          owner.scope !== "task"
+          || mailbox?.processing?.executionRef?.type !== "run"
+          || mailbox.processing.executionRef.taskId !== owner.taskId
+          || mailbox.processing.executionRef.id !== expectedTerminalRunId
+          || expectedRun === null
+          || expectedRun.status === "active"
+        ) {
+          return false;
+        }
+      }
       saveRuntimeLifecycleMailbox(
         store,
         completeProcessing(mailbox!, launchId)
@@ -1178,7 +1208,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           roleName: input.roleName
         })
       ));
-      return cleanup || isLeaderDisposedWorkItemRun(this.store, input)
+      return cleanup || isObsoleteTerminalRuntimeRun(this.store, input)
         ? "obsolete"
         : "apply";
     }
@@ -1272,7 +1302,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         && existing !== undefined
         && (
           hasRuntimeCleanupObligation(store.getWorkMailbox(runtimeLifecycleTarget(owner)))
-          || isLeaderDisposedWorkItemRun(store, input)
+          || isObsoleteTerminalRuntimeRun(store, input)
         )) {
         return { session: existing, duplicate: false, disposition: "obsolete" };
       }
@@ -2033,6 +2063,32 @@ function isLeaderDisposedWorkItemRun(
     return false;
   }
   return store.getWorkItem(input.taskId, run.workItemId)?.disposition !== undefined;
+}
+
+function isObsoleteTerminalRuntimeRun(
+  store: TaskStore,
+  input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    runId?: string;
+  }>
+): boolean {
+  if (isLeaderDisposedWorkItemRun(store, input)) return true;
+  if (input.runId === undefined) return false;
+  const run = store.getAgentRun(input.taskId, input.runId);
+  if (
+    run === null
+    || run.status !== "failed"
+    || run.roleName !== input.roleName
+    || run.effective.agentId !== input.agentId
+  ) {
+    return false;
+  }
+  return store.listEvents(input.taskId).some((event) => (
+    event.type === "runtime.role-delivery-failed"
+    && event.payload.runId === input.runId
+  ));
 }
 
 function sessionPreview(value: string): string {

@@ -9,6 +9,25 @@ import type {
 
 export type SessionRuntimeState = "starting" | "running" | "stopped" | "unavailable";
 
+export type RuntimeLaunchRecoveryKind = "retryable" | "generation-lost";
+export type RuntimeLaunchRecoveryState = "starting" | "unavailable" | "stopped" | "recreated";
+
+/** Exact run-bound recovery outcome from a persisted launch reservation. */
+export class RuntimeLaunchRecoveryError extends Error {
+  readonly name = "RuntimeLaunchRecoveryError";
+
+  constructor(
+    readonly kind: RuntimeLaunchRecoveryKind,
+    readonly runtimeState: RuntimeLaunchRecoveryState,
+    readonly runId: string,
+    readonly launchId: string
+  ) {
+    super(kind === "retryable"
+      ? `Runtime launch recovery is temporarily ${runtimeState}: ${runId}/${launchId}.`
+      : `Exact Run launch generation was lost (${runtimeState}): ${runId}/${launchId}.`);
+  }
+}
+
 export type SessionInspection = Readonly<{
   state: SessionRuntimeState;
   nativeSessionId?: string;

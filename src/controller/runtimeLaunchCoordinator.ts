@@ -6,6 +6,7 @@ import {
 } from "../runtime/lifecycleReservation.js";
 import {
   createRuntimeBinding,
+  RuntimeLaunchRecoveryError,
   type RuntimeBinding,
   type RuntimeLaunchPersistence as RuntimeLaunchPersistencePort,
   type RuntimeLaunchPreparationPort,
@@ -21,7 +22,11 @@ export type RuntimeLaunchReservationPort = Readonly<{
     input: Readonly<{ owner: RuntimeRoleOwner; launchId: string; runId?: string }>,
     assertCurrent: () => void,
     now?: Date
-  ): Readonly<{ status: "reserved" | "existing"; launchId: string }>;
+  ): Readonly<{
+    status: "reserved" | "existing";
+    launchId: string;
+    runId?: string;
+  }>;
   confirmRuntimeLaunchReservation(
     input: Readonly<{ owner: RuntimeRoleOwner; launchId: string }>,
     assertCurrent: () => void
@@ -36,7 +41,8 @@ export type RuntimeLaunchReservationPort = Readonly<{
   }>, assertCurrent: () => void, now?: Date): void;
   completeRuntimeLaunchReservation(
     owner: RuntimeRoleOwner,
-    launchId: string
+    launchId: string,
+    expectedTerminalRunId?: string
   ): boolean;
   settleStoppedRuntimeLaunch(input: Readonly<{
     owner: RuntimeRoleOwner;
@@ -172,8 +178,21 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
           }.`
         );
       }
+      const sameRunReservation = request.runId !== undefined
+        && reservation.runId === request.runId;
+      const differentRunReservation = request.runId !== undefined
+        && reservation.runId !== undefined
+        && reservation.runId !== request.runId;
       const inspection = await this.host.inspectOwner(request.owner);
       if (inspection.state === "unavailable" || inspection.state === "starting") {
+        if (sameRunReservation) {
+          throw new RuntimeLaunchRecoveryError(
+            "retryable",
+            inspection.state,
+            request.runId!,
+            reservation.launchId
+          );
+        }
         throw new Error(
           `Runtime launch reservation cannot yet be verified: ${
             request.owner.roleName
@@ -181,9 +200,18 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
         );
       }
       if (inspection.state === "stopped") {
+        if (sameRunReservation) {
+          throw new RuntimeLaunchRecoveryError(
+            "generation-lost",
+            "stopped",
+            request.runId!,
+            reservation.launchId
+          );
+        }
         if (!this.reservations.completeRuntimeLaunchReservation(
           request.owner,
-          reservation.launchId
+          reservation.launchId,
+          differentRunReservation ? reservation.runId : undefined
         )) {
           throw new Error("Runtime launch reservation changed during recovery.");
         }
@@ -196,6 +224,13 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
           throw new Error("Runtime launch reservation could not be renewed.");
         }
       } else {
+        if (differentRunReservation) {
+          throw new Error(
+            `Runtime launch reservation belongs to another Run whose host is still running: ${
+              reservation.runId
+            }.`
+          );
+        }
         reusedConfirmedRunningHost = true;
         assertLaunchCurrent();
       }
@@ -252,6 +287,14 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
     }
 
     if (reusedConfirmedRunningHost && binding.hostCreated === true) {
+      if (request.runId !== undefined && reservation.runId === request.runId) {
+        throw new RuntimeLaunchRecoveryError(
+          "generation-lost",
+          "recreated",
+          request.runId,
+          launchId
+        );
+      }
       await this.#compensateStartedHost(
         request.owner,
         binding,

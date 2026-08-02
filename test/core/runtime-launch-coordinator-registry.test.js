@@ -5,12 +5,15 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
+import { FileTaskController } from "../../dist/controller/controller.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
 import { RuntimeLaunchCoordinator } from "../../dist/controller/runtimeLaunchCoordinator.js";
+import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { ExecutorRegistry } from "../../dist/executor/executorRegistry.js";
 import {
   RUNTIME_CLEANUP_REQUIRED_REASON,
   RUNTIME_LAUNCH_RESERVED_REASON,
+  hasRuntimeCleanupObligation,
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
 } from "../../dist/runtime/lifecycleReservation.js";
@@ -20,9 +23,15 @@ import {
   updateRoleStatus
 } from "../../dist/role/role.js";
 import { createAgentRun } from "../helpers/effectiveLaunch.js";
+import { failAgentRun } from "../../dist/run/agentRun.js";
+import { processActiveRoleRunDeliveries } from "../../dist/scheduler/activeRoleRunDelivery.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
+import {
+  createWorkItem,
+  updateWorkItemStatus
+} from "../../dist/workItem/workItem.js";
 
 const NOW = new Date("2026-07-24T00:00:00.000Z");
 
@@ -100,22 +109,27 @@ function runtimeBinding(request, options = {}) {
   };
 }
 
-function unusedTmux() {
+function unusedTmux(roleStatus = "exited") {
   return {
     ensureRoleWindow() { throw new Error("legacy launch must not run"); },
     waitUntilReady() { throw new Error("legacy readiness must not run"); },
     sendRoleInputOnce() { throw new Error("legacy delivery must not run"); },
     sendRoleInputOnceIfReady() { return "unavailable"; },
-    probeRoleStatus() { return "exited"; },
+    probeRoleStatus() { return roleStatus; },
     killRole() {},
     stopTask() { return false; }
   };
 }
 
-function registry(coordinator, host, promptPush = async () => "busy") {
+function registry(
+  coordinator,
+  host,
+  promptPush = async () => "busy",
+  tmux = unusedTmux()
+) {
   return new ExecutorRegistry(
     { plan() { throw new Error("legacy planner must not run"); } },
-    unusedTmux(),
+    tmux,
     undefined,
     {
       sessionHost: host,
@@ -149,6 +163,164 @@ function prepareInput(fx, roleName, runId, adapterId = fx.agent.adapterId) {
     mode: "new",
     runId,
     effective
+  };
+}
+
+async function waitFor(predicate, label, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.fail(`Timed out waiting for ${label}.`);
+}
+
+async function preparedControllerRecoveryFixture(t) {
+  const fx = fixture(t, "claude");
+  const roleName = "worker";
+  const role = fx.roles.get(roleName);
+  const item = updateWorkItemStatus(createWorkItem(
+    "work-item-1",
+    fx.task.id,
+    { title: "Recover one exact delivery" },
+    NOW
+  ), "running", NOW);
+  const run = createAgentRun(
+    "agent-run-1",
+    fx.task.id,
+    roleName,
+    "new",
+    "deliver after Controller restart",
+    NOW,
+    {
+      purpose: "execution",
+      workItemId: item.id,
+      effective: fx.schedulerStore.getRole(fx.task.id, roleName).effective
+    }
+  );
+  const target = { kind: "role", taskId: fx.task.id, roleName };
+  fx.store.transaction((store) => {
+    store.saveWorkItem(fx.task.id, item);
+    store.saveRole(
+      fx.task.id,
+      updateRoleStatus(role, "running", NOW)
+    );
+    store.saveActiveAgentRun(run);
+    enqueueWork(store, target, "run-dispatched", NOW, [
+      { type: "run", taskId: fx.task.id, id: run.id }
+    ]);
+  });
+
+  const controls = {
+    state: "running",
+    inspections: [],
+    recreateNextStart: false,
+    allowStopOwner: true,
+    pushOutcome: "busy",
+    starts: [],
+    hostCreations: 0,
+    stopCalls: 0,
+    stopOwnerCalls: 0,
+    stoppedBindings: [],
+    stoppedOwners: []
+  };
+  const host = {
+    async start(request) {
+      const hostCreated = controls.starts.length === 0
+        || controls.recreateNextStart;
+      controls.recreateNextStart = false;
+      controls.state = "running";
+      controls.starts.push(request);
+      if (hostCreated) controls.hostCreations += 1;
+      return runtimeBinding(request, {
+        index: controls.starts.length,
+        hostCreated,
+        nativeSessionId: "claude-native-recovery"
+      });
+    },
+    async resume() { throw new Error("resume is not expected"); },
+    async stop(binding) {
+      controls.stopCalls += 1;
+      controls.stoppedBindings.push(binding.owner.roleName);
+      controls.state = "stopped";
+    },
+    async inspect() { return { state: controls.state }; },
+    async inspectOwner() {
+      return {
+        state: controls.inspections.shift() ?? controls.state
+      };
+    },
+    async stopOwner(owner) {
+      controls.stopOwnerCalls += 1;
+      controls.stoppedOwners.push(owner.roleName);
+      if (!controls.allowStopOwner) return false;
+      controls.state = "stopped";
+      return true;
+    }
+  };
+  const initialDelivery = registry(
+    new RuntimeLaunchCoordinator(fx.schedulerStore, host, {
+      createGenerationId: () => "original-generation",
+      now: () => NOW
+    }),
+    host,
+    async () => "busy",
+    unusedTmux("running")
+  );
+  const [initial] = await processActiveRoleRunDeliveries(
+    fx.schedulerStore,
+    initialDelivery,
+    NOW
+  );
+  assert.equal(initial.reason, "not-ready");
+  const session = fx.store.getRoleSession(fx.task.id, roleName);
+  const launchId = session.launchId;
+  assert.equal(session.nativeSessionId, "claude-native-recovery");
+  assertReservation(fx, roleName, launchId, run.id);
+  assert.equal(
+    fx.store.getWorkMailbox(target).processing.executionRef.id,
+    run.id
+  );
+  assert.equal(
+    fx.store.getTaskRoleSessionSet(fx.task.id, roleName).inFlight.runId,
+    run.id
+  );
+
+  return {
+    ...fx,
+    roleName,
+    role,
+    item,
+    run,
+    target,
+    launchId,
+    session,
+    controls,
+    host,
+    startController(deliveryRetryLimit = 2) {
+      const store = new FileTaskStore(fx.home);
+      const adapter = new FileSchedulerStoreAdapter(store);
+      const delivery = registry(
+        new RuntimeLaunchCoordinator(adapter, host, {
+          createGenerationId: () => "must-not-replace-original",
+          now: () => NOW
+        }),
+        host,
+        async () => controls.pushOutcome,
+        unusedTmux("running")
+      );
+      const errors = [];
+      const controller = new FileTaskController(adapter, delivery, {
+        signalWindowMs: 1,
+        deliveryRetryMs: 2,
+        deliveryRetryLimit,
+        now: () => NOW,
+        onError: (error) => errors.push(error),
+        lifecycleHost: host
+      });
+      t.after(() => controller.stop());
+      return { store, adapter, delivery, controller, errors };
+    }
   };
 }
 
@@ -465,7 +637,114 @@ test("after Controller restart an existing running host reuses its generation wi
   assertReservation(fx, "leader", first.launchId);
 });
 
-test("a host recreated after a running reservation probe is fenced into a fresh generation", async (t) => {
+for (const inspectionState of ["starting", "unavailable"]) {
+  test(`same-Run ${inspectionState} recovery retains its exact generation as a typed retry`, async (t) => {
+    const fx = fixture(t);
+    let state = "running";
+    let starts = 0;
+    const host = {
+      async start(request) {
+        starts += 1;
+        return runtimeBinding(request, { index: starts, hostCreated: true });
+      },
+      async resume() { throw new Error("resume is not expected"); },
+      async stop() {},
+      async inspect() { return { state }; },
+      async inspectOwner() { return { state }; },
+      async stopOwner() { return true; }
+    };
+    const input = prepareInput(fx, "worker", "agent-run-1");
+    const first = await registry(
+      new RuntimeLaunchCoordinator(fx.schedulerStore, host, {
+        createGenerationId: () => `${inspectionState}-generation`,
+        now: () => NOW
+      }),
+      host
+    ).prepareRoleSession(input);
+    state = inspectionState;
+
+    const restarted = registry(
+      new RuntimeLaunchCoordinator(
+        new FileSchedulerStoreAdapter(new FileTaskStore(fx.home)),
+        host,
+        {
+          createGenerationId: () => "must-not-renew",
+          now: () => NOW
+        }
+      ),
+      host
+    );
+    await assert.rejects(
+      restarted.prepareRoleSession(input),
+      (error) => {
+        assert.equal(error.name, "RuntimeLaunchRecoveryError");
+        assert.equal(error.kind, "retryable");
+        assert.equal(error.runtimeState, inspectionState);
+        assert.equal(error.runId, input.runId);
+        assert.equal(error.launchId, first.launchId);
+        return true;
+      }
+    );
+
+    assert.equal(starts, 1);
+    assertReservation(fx, "worker", first.launchId, input.runId);
+  });
+}
+
+test("a confirmed-stopped generation is lost for the same active Run instead of renewed", async (t) => {
+  const fx = fixture(t);
+  let hostPresent = false;
+  let starts = 0;
+  const host = {
+    async start(request) {
+      starts += 1;
+      hostPresent = true;
+      return runtimeBinding(request, { index: starts, hostCreated: true });
+    },
+    async resume() { throw new Error("resume is not expected"); },
+    async stop() { hostPresent = false; },
+    async inspect() { return { state: hostPresent ? "running" : "stopped" }; },
+    async inspectOwner() { return { state: hostPresent ? "running" : "stopped" }; },
+    async stopOwner() { hostPresent = false; return true; }
+  };
+  const input = prepareInput(fx, "worker", "agent-run-1");
+  const first = await registry(
+    new RuntimeLaunchCoordinator(fx.schedulerStore, host, {
+      createGenerationId: () => "stopped-generation",
+      now: () => NOW
+    }),
+    host
+  ).prepareRoleSession(input);
+  hostPresent = false;
+
+  const restarted = registry(
+    new RuntimeLaunchCoordinator(
+      new FileSchedulerStoreAdapter(new FileTaskStore(fx.home)),
+      host,
+      {
+        createGenerationId: () => "forbidden-renewal",
+        now: () => NOW
+      }
+    ),
+    host
+  );
+  await assert.rejects(
+    restarted.prepareRoleSession(input),
+    (error) => {
+      assert.equal(error.name, "RuntimeLaunchRecoveryError");
+      assert.equal(error.kind, "generation-lost");
+      assert.equal(error.runtimeState, "stopped");
+      assert.equal(error.runId, input.runId);
+      assert.equal(error.launchId, first.launchId);
+      return true;
+    }
+  );
+
+  assert.equal(starts, 1);
+  assertReservation(fx, "worker", first.launchId, input.runId);
+});
+
+test("a host recreated after a same-Run running probe reports generation loss without renewal", async (t) => {
   const fx = fixture(t);
   let hostPresent = false;
   let starts = 0;
@@ -507,14 +786,13 @@ test("a host recreated after a running reservation probe is fenced into a fresh 
   ).prepareRoleSession(
     prepareInput(fx, "leader", "agent-run-1")
   );
-  assertReservation(fx, "leader", first.launchId);
+  assertReservation(fx, "leader", first.launchId, "agent-run-1");
 
-  const generations = ["unused-existing-candidate", "fresh-generation"];
   const restartedCoordinator = new RuntimeLaunchCoordinator(
     new FileSchedulerStoreAdapter(new FileTaskStore(fx.home)),
     host,
     {
-      createGenerationId: () => generations.shift(),
+      createGenerationId: () => "must-not-renew",
       now: () => NOW
     }
   );
@@ -528,28 +806,175 @@ test("a host recreated after a running reservation probe is fenced into a fresh 
       mode: "new",
       runId: "agent-run-1"
     }, "deferred"),
-    /recreated while recovering an existing generation/i
+    (error) => {
+      assert.equal(error.name, "RuntimeLaunchRecoveryError");
+      assert.equal(error.kind, "generation-lost");
+      assert.equal(error.runtimeState, "recreated");
+      assert.equal(error.runId, "agent-run-1");
+      assert.equal(error.launchId, first.launchId);
+      return true;
+    }
   );
 
-  assert.equal(stops, 1);
-  assert.equal(hostPresent, false);
-  assert.equal(reservationMailbox(fx, "leader"), null);
-
-  const recovered = await restartedCoordinator.prepare({
-    owner: owner(fx, "leader"),
-    agentId: fx.agent.id,
-    adapterId: fx.agent.adapterId,
-    effective: fx.schedulerStore.getRole(fx.task.id, "leader").effective,
-    workspace: fx.home,
-    mode: "new",
-    runId: "agent-run-1"
-  }, "deferred");
-
-  assert.notEqual(recovered.launchId, first.launchId);
-  assert.match(recovered.launchId, /fresh-generation$/);
-  assert.equal(recovered.hostCreated, true);
-  assertReservation(fx, "leader", recovered.launchId);
+  assert.equal(stops, 0);
+  assert.equal(hostPresent, true);
+  assertReservation(fx, "leader", first.launchId, "agent-run-1");
 });
+
+for (const initialRecoveryState of ["running", "starting"]) {
+  test(`Controller restart recovers a same-Run ${initialRecoveryState} host and delivers on its original generation`, async (t) => {
+    const fx = await preparedControllerRecoveryFixture(t);
+    if (initialRecoveryState === "starting") {
+      fx.controls.inspections.push("starting", "running");
+    }
+    fx.controls.pushOutcome = "sent";
+    const recovery = fx.startController(2);
+
+    recovery.controller.signal(`role:${fx.task.id}/${fx.roleName}`);
+    await waitFor(
+      () => recovery.store.getAgentRun(fx.task.id, fx.run.id)?.deliveredAt !== undefined,
+      "the original Run to be delivered"
+    );
+
+    const delivered = recovery.store.getAgentRun(fx.task.id, fx.run.id);
+    assert.equal(delivered.status, "active");
+    assert.equal(fx.controls.hostCreations, 1);
+    assert.equal(fx.controls.starts.length, 2);
+    assert.deepEqual(
+      new Set(fx.controls.starts.map((request) => request.launchId)),
+      new Set([fx.launchId])
+    );
+    assert.equal(
+      recovery.store.getRoleSession(fx.task.id, fx.roleName).nativeSessionId,
+      fx.session.nativeSessionId
+    );
+    assert.equal(reservationMailbox(fx, fx.roleName), null);
+    const item = recovery.store.getWorkItem(fx.task.id, fx.item.id);
+    assert.equal(item.status, "running");
+    assert.equal(item.candidates.length, 0);
+    assert.deepEqual(recovery.errors, []);
+  });
+}
+
+for (const runtimeState of ["starting", "unavailable"]) {
+  test(`Controller exhausts same-Run ${runtimeState} recovery through exact failure and confirmed cleanup`, async (t) => {
+    const fx = await preparedControllerRecoveryFixture(t);
+    fx.controls.state = runtimeState;
+    fx.controls.allowStopOwner = false;
+    const recovery = fx.startController(1);
+
+    recovery.controller.signal(`role:${fx.task.id}/${fx.roleName}`);
+    await waitFor(
+      () => recovery.store.getAgentRun(fx.task.id, fx.run.id)?.status === "failed",
+      `the ${runtimeState} Run to fail exactly`
+    );
+
+    assert.equal(
+      recovery.store.getRoleSession(fx.task.id, fx.roleName).status === "stopped",
+      false
+    );
+    assert.equal(
+      hasRuntimeCleanupObligation(reservationMailbox(fx, fx.roleName)),
+      true
+    );
+    assert.equal(recovery.store.getActiveAgentRun(fx.task.id, fx.roleName), null);
+    const failedItem = recovery.store.getWorkItem(fx.task.id, fx.item.id);
+    assert.equal(failedItem.status, "failed");
+    assert.equal(failedItem.candidates.length, 0);
+    assert.equal(
+      fx.controls.starts.filter((request) => request.owner.roleName === fx.roleName).length,
+      1
+    );
+    assert.equal(
+      recovery.store.getRoleSession(fx.task.id, fx.roleName).nativeSessionId,
+      fx.session.nativeSessionId
+    );
+    await waitFor(
+      () => fx.controls.stoppedOwners.includes(fx.roleName),
+      `the ${runtimeState} cleanup attempt`
+    );
+    assert.notEqual(
+      recovery.store.getRoleSession(fx.task.id, fx.roleName).status,
+      "stopped"
+    );
+
+    fx.controls.allowStopOwner = true;
+    recovery.controller.signal(`role:${fx.task.id}/${fx.roleName}`);
+    await waitFor(
+      () => recovery.store.getRoleSession(fx.task.id, fx.roleName).status === "stopped",
+      `the ${runtimeState} owner cleanup confirmation`
+    );
+    assert.equal(reservationMailbox(fx, fx.roleName), null);
+  });
+}
+
+for (const recoveryLoss of ["stopped", "recreated"]) {
+  test(`Controller terminalizes same-Run ${recoveryLoss} generation loss without renewal`, async (t) => {
+    const fx = await preparedControllerRecoveryFixture(t);
+    if (recoveryLoss === "stopped") {
+      fx.controls.state = "stopped";
+    } else {
+      fx.controls.state = "running";
+      fx.controls.recreateNextStart = true;
+    }
+    const recovery = fx.startController(3);
+
+    recovery.controller.signal(`role:${fx.task.id}/${fx.roleName}`);
+    await waitFor(
+      () => recovery.store.getAgentRun(fx.task.id, fx.run.id)?.status === "failed"
+        && recovery.store.getRoleSession(fx.task.id, fx.roleName)?.status === "stopped",
+      `the ${recoveryLoss} generation to terminalize and clean up`
+    );
+
+    assert.equal(recovery.store.getActiveAgentRun(fx.task.id, fx.roleName), null);
+    assert.equal(fx.controls.stoppedBindings.includes(fx.roleName), false);
+    assert.equal(
+      fx.controls.stoppedOwners.filter((roleName) => roleName === fx.roleName).length,
+      1
+    );
+    const workerStarts = fx.controls.starts.filter(
+      (request) => request.owner.roleName === fx.roleName
+    );
+    assert.deepEqual(
+      new Set(workerStarts.map((request) => request.launchId)),
+      new Set([fx.launchId])
+    );
+    assert.equal(
+      workerStarts.length,
+      recoveryLoss === "stopped" ? 1 : 2
+    );
+    assert.equal(
+      recovery.store.getRoleSession(fx.task.id, fx.roleName).nativeSessionId,
+      fx.session.nativeSessionId
+    );
+    assert.equal(reservationMailbox(fx, fx.roleName), null);
+    const failedItem = recovery.store.getWorkItem(fx.task.id, fx.item.id);
+    assert.equal(failedItem.status, "failed");
+    assert.equal(failedItem.candidates.length, 0);
+    assert.equal(recovery.adapter.classifyRuntimeTurnCompleted({
+      taskId: fx.task.id,
+      roleName: fx.roleName,
+      agentId: fx.agent.id,
+      adapterId: fx.agent.adapterId,
+      launchId: fx.launchId,
+      nativeSessionId: fx.session.nativeSessionId,
+      turnId: `late-${recoveryLoss}`,
+      runId: fx.run.id
+    }), "obsolete");
+    const lateDeliveries = await processActiveRoleRunDeliveries(
+      recovery.adapter,
+      recovery.delivery,
+      NOW
+    );
+    assert.equal(lateDeliveries.some((delivery) => (
+      delivery.roleName === fx.roleName && delivery.runId === fx.run.id
+    )), false);
+    assert.equal(
+      recovery.store.getWorkItem(fx.task.id, fx.item.id).candidates.length,
+      0
+    );
+  });
+}
 
 test("a foreground preflight failure cannot enqueue cleanup for an existing healthy generation", async (t) => {
   const fx = fixture(t);
@@ -780,12 +1205,23 @@ test("a stopped pre-binding host gets a new generation and the old generation Ho
       now: () => NOW
     }
   );
+  const laterInput = prepareInput(fx, "worker", "agent-run-2");
+  await assert.rejects(
+    registry(restartedCoordinator, host).prepareRoleSession(laterInput),
+    /reservation changed during recovery/i
+  );
+  assertReservation(fx, "worker", first.launchId, "agent-run-1");
+
+  const priorRun = fx.store.getAgentRun(fx.task.id, "agent-run-1");
+  fx.store.saveAgentRun(failAgentRun(
+    priorRun,
+    "prior Run terminal before replacement",
+    new Date(NOW.getTime() + 1)
+  ));
   const recovered = await registry(
     restartedCoordinator,
     host
-  ).prepareRoleSession(
-    prepareInput(fx, "worker", "agent-run-2")
-  );
+  ).prepareRoleSession(laterInput);
 
   assert.notEqual(recovered.launchId, first.launchId);
   assert.equal(recovered.sessionStarted, true);

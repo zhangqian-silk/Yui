@@ -15,15 +15,17 @@ import {
 } from "./ports.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import { effectiveLaunchSnapshotsCompatible } from "../executor/effectiveLaunch.js";
+import { RuntimeLaunchRecoveryError } from "../runtime/ports.js";
 
 export type ActiveRoleRunDeliveryResult = Readonly<{
   taskId: string;
   roleName: string;
   runId: string;
   status: "delivered" | "already-delivered" | "skipped" | "failed";
-  reason?: "workspace-not-ready" | "launch-failed" | "mailbox-empty" | "mailbox-busy" | "not-ready" | "runtime-unavailable" | "delivery-uncertain";
+  reason?: "workspace-not-ready" | "launch-failed" | "generation-lost" | "mailbox-empty" | "mailbox-busy" | "not-ready" | "runtime-unavailable" | "delivery-uncertain";
   error?: string;
   terminalFailure?: Omit<RoleRunDeliveryFailurePersistence, "now">;
+  terminalized?: boolean;
 }>;
 
 /**
@@ -168,6 +170,51 @@ export async function processActiveRoleRunDeliveries(
         results.push({ taskId: task.id, roleName: role.name, runId: run.id, status });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        if (error instanceof RuntimeLaunchRecoveryError) {
+          if (error.runId !== run.id) throw error;
+          const terminalFailure = roleRunDeliveryFailure(
+            run,
+            processing.batchId,
+            existingSession,
+            error.launchId
+          );
+          if (error.kind === "retryable") {
+            results.push({
+              taskId: task.id,
+              roleName: role.name,
+              runId: run.id,
+              status: "skipped",
+              reason: "runtime-unavailable",
+              error: message,
+              terminalFailure
+            });
+            continue;
+          }
+          const persisted = store.saveRoleRunDeliveryFailure({
+            ...terminalFailure,
+            now
+          });
+          if (persisted === "failed") {
+            delivery.forgetPrepared?.({
+              taskId: task.id,
+              roleName: role.name,
+              runId: run.id,
+              launchId: error.launchId
+            });
+          }
+          results.push({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id,
+            status: "failed",
+            reason: "generation-lost",
+            error: persisted === "state-changed"
+              ? "Run state changed during exact launch generation failure."
+              : message,
+            terminalized: persisted === "failed"
+          });
+          continue;
+        }
         if (!deliveryAttempted) {
           delivery.forgetPrepared?.({
             taskId: task.id,
