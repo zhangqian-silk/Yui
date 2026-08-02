@@ -59,8 +59,9 @@ Bind a Project and create a Draft Task:
 
 ```sh
 yui project add app /absolute/workspace/app \
-  --remote git@example.com:team/app.git --stable main --development develop
-yui project update app --alias app-cli --development develop
+  --remote git@example.com:team/app.git --stable main --development main
+yui project update app --alias app-cli
+yui project refresh app
 yui project list
 
 yui task create "Ship CSV export" --project app
@@ -70,6 +71,13 @@ yui task show <task-id>
 yui task context <task-id>
 yui task activate <task-id>
 ```
+
+`project refresh` is the explicit network operation for a stable Project checkout. It fetches the
+configured stable branch directly from the Project remote URL and advances only through a clean,
+verified fast-forward. Refresh requires matching stable and development branches, treats untracked
+files as dirty, preserves ignored files, and refuses missing remotes or refs and diverged checkouts.
+When the configured branch is `HEAD`, refresh resolves the remote's symbolic default branch for that
+operation and requires the checkout to be on that branch; detached or mismatched checkouts fail.
 
 Use `task context` as the first detailed read of an existing Task. It combines the Task, Brief, active Decisions, recent Milestones, Roles, current and recent WorkItems with their Runs, recent Messages, open and resolved InputRequests, and recent Events. Terminal output keeps histories and long text compact; `yui --json task context <task-id>` returns the complete records in the top-level `data` field.
 
@@ -493,7 +501,7 @@ yui update
 yui agent add|list|show|capabilities|update|remove
 yui role add|list|show|update|remove|bind|enter
 yui role session record|replace
-yui project add|clone|update|discover|list|show|knowledge
+yui project add|clone|refresh|update|discover|list|show|knowledge
 ```
 
 Agent environment bindings store process-environment variable names, never secret values. Adapter-owned lifecycle arguments cannot be overridden through raw arguments.

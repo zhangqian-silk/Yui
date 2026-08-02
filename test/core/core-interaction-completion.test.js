@@ -49,6 +49,7 @@ const PUBLIC_PATHS = [
   "project",
   "project add",
   "project clone",
+  "project refresh",
   "project update",
   "project discover",
   "project list",
@@ -284,6 +285,7 @@ function values(set) {
 
 test("interaction policies cover missing task, work, Integration, and job identifiers", () => {
   const expected = [
+    [["project", "refresh"], 2, "projects"],
     [["task", "show"], 2, "tasks"],
     [["task", "activate"], 2, "tasks"],
     [["task", "update"], 2, "tasks"],
