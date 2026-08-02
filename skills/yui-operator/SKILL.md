@@ -82,11 +82,13 @@ questions, or other outcomes that do not deliver repository changes. State
 which completion rule was recorded when reporting the newly created Task.
 
 When the user changes an existing requirement, route the delta and its reason
-to the same Task rather than silently rewriting history. This includes a
-direction change that shrinks or redirects the mission: keep it on the original
-Task, submit only the delta and its reason, and let the Leader cancel or
-supersede the affected WorkItem and create the replacement. Do not open a new
-Task for a course correction. If the delta changes
+to the same Task rather than silently rewriting history. This includes a shrink
+or a change of implementation or approach that preserves the same bounded
+outcome: keep it on the original Task, submit only the delta and its reason, and
+let the Leader cancel or supersede the affected WorkItem and create the
+replacement. When a change instead abandons the current outcome for an
+independent one, do not force it onto the original Task; apply the strict
+new-Task rule above. If the delta changes
 a read-only Task into Project delivery work, first run
 `yui task update <task-id> --require-integration`, read back the Task completion
 rule, and only then submit the delta. When a completed Task

@@ -451,7 +451,7 @@ P08、P09 是发布阻塞场景：歧义必须在创建前解决，不能靠替�
 修复错误路由。`task project add` 只允许 active Leader 为同一 outcome 追加
 确实需要的 Project，不是 Operator 猜错后的纠偏手段。
 
-### 7.2 Existing Task 归并：T01-T15
+### 7.2 Existing Task 归并：T01-T16
 
 | ID | 场景 | 预期 |
 |---|---|---|
@@ -469,11 +469,13 @@ P08、P09 是发布阻塞场景：歧义必须在创建前解决，不能靠替�
 | T12 | 新要求与旧要求冲突 | `UPDATE` 并保留变更原因 |
 | T13 | “继续”且候选唯一 | 使用唯一候选 |
 | T14 | “继续”但有多个相似 active Task | `ASK` |
-| T15 | 把原方案（如全量物化）收缩为更窄方案（如按需刷新） | `UPDATE` 原 Task，只路由 delta 和原因；替代 WorkItem 由 Leader cancel/supersede，不新建 Task |
+| T15 | 收缩或改变实现/方案但仍是同一有界结果（如全量物化改为按需刷新） | `UPDATE` 原 Task，只路由 delta 和原因；替代 WorkItem 由 Leader cancel/supersede，不新建 Task |
+| T16 | 放弃当前有界目标，转做与之无关的独立结果 | 不塞回原 Task；按严格 NEW 规则 `CREATE-P` 新 Task，原 Task 由用户授权后另行 cancel/complete |
 
-T01-T15 至少覆盖 `SAME`、`NEW`、`RESUME` 和 `STALE`；T07、T14 额外覆盖
-`SWITCH`、`RESTART` 和 `RETRY`。T15 验证方向收缩只路由 delta，不因课程修正
-新建 Task，替代由 Leader 管理。
+T01-T16 至少覆盖 `SAME`、`NEW`、`RESUME` 和 `STALE`；T07、T14 额外覆盖
+`SWITCH`、`RESTART` 和 `RETRY`。T15 验证同一有界结果的收缩/改方案只路由
+delta、替代由 Leader 管理；T16 是其反例——目标被独立结果取代时走严格 NEW，
+不因“也是方向改变”而误留原 Task。
 
 ### 7.3 生命周期：L01-L08
 
