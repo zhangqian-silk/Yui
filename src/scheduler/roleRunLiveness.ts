@@ -8,14 +8,6 @@ import {
 import { queueLeaderWakeup } from "./wakeupQueue.js";
 
 export const EXITED_ROLE_RUN_SUMMARY = "The role's tmux session exited before the run yielded.";
-export const MISSING_TURN_HOOK_SUMMARY =
-  "The role returned to its composer without a matching native Turn Hook.";
-export const DEFAULT_READY_RECOVERY_AGE_MS = 120_000;
-
-export type ReadyRecoveryControl = Readonly<{
-  confirmedRunIds: ReadonlySet<string>;
-  observedRunIds: Set<string>;
-}>;
 
 /**
  * Lightweight liveness only: an active AgentRun whose tmux role is absent is
@@ -25,14 +17,11 @@ export async function reconcileExitedRoleRuns(
   store: SchedulerStorePort,
   delivery: Pick<
     TmuxDeliveryPort,
-    "inspectRole" | "inspectRoles" | "inspectRoleReadiness" | "stopRole" | "forgetPrepared"
+    "inspectRole" | "inspectRoles" | "forgetPrepared"
   >,
   now: Date,
   selection?: SchedulerReconcileSelection,
-  excludedRunIds: ReadonlySet<string> = new Set(),
-  minimumReadyRecoveryAgeMs = DEFAULT_READY_RECOVERY_AGE_MS,
-  readyRecoveryRunIds: ReadonlySet<string> = new Set(),
-  readyRecoveryControl?: ReadyRecoveryControl
+  excludedRunIds: ReadonlySet<string> = new Set()
 ): Promise<string[]> {
   const failed: string[] = [];
   const candidates = selectedSchedulerTasks(store, selection).flatMap((task) => (
@@ -78,60 +67,13 @@ export async function reconcileExitedRoleRuns(
       const status = batch === null
         ? await delivery.inspectRole(inspection)
         : batchStatuses.get(`${task.id}\0${role.name}`)!;
-      if (status === "present") {
-        const isFullReconciliation = selection === undefined || selection.full;
-        const readyRecoveryDue = readyRecoveryRunIds.has(run.id)
-          || (
-            isFullReconciliation
-            && run.deliveredAt !== undefined
-            && now.getTime() - Date.parse(run.deliveredAt) >= minimumReadyRecoveryAgeMs
-          );
-        if (
-          readyRecoveryDue
-          && run.deliveredAt !== undefined
-          && delivery.inspectRoleReadiness !== undefined
-          && delivery.stopRole !== undefined
-          && await delivery.inspectRoleReadiness(inspection) === "ready"
-        ) {
-          readyRecoveryControl?.observedRunIds.add(run.id);
-          if (!readyRecoveryControl?.confirmedRunIds.has(run.id)) continue;
-          // Readiness proves quiescence, not Turn completion. Stop the exact
-          // generation before releasing durable state so a late Hook is stale.
-          if (!await delivery.stopRole(task.id, role.name)) continue;
-          const persisted = store.saveExitedRoleRun({
-            task,
-            role,
-            run,
-            session,
-            reason: "missing-turn-hook",
-            summary: MISSING_TURN_HOOK_SUMMARY,
-            now
-          });
-          if (persisted === "state-changed") continue;
-          delivery.forgetPrepared?.({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id
-          });
-          failed.push(run.id);
-          if (persisted === undefined && task.status === "active") {
-            queueLeaderWakeup(
-              store,
-              task.id,
-              role.name === "leader" ? "leader-run-failed" : "role-run-failed",
-              now
-            );
-          }
-        }
-        continue;
-      }
+      if (status === "present") continue;
 
       const persisted = store.saveExitedRoleRun({
         task,
         role,
         run,
         session,
-        reason: "host-exited",
         summary: EXITED_ROLE_RUN_SUMMARY,
         now
       });

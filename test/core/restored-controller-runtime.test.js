@@ -183,9 +183,7 @@ test("full recovery inventories dormant Task and global sessions once and stops 
     new Date(1),
     undefined,
     { kind: "full" },
-    undefined,
     true,
-    new Set(),
     [],
     lifecycleHost
   );
@@ -212,9 +210,7 @@ test("dirty recovery never performs the dormant native-session inventory", async
     new Date(1),
     undefined,
     { kind: "dirty", keys: ["role:task-1/leader"] },
-    undefined,
     true,
-    new Set(),
     [],
     lifecycleHost
   );
@@ -289,7 +285,6 @@ test("a main full pass never consumes the Operator mailbox", async () => {
     new Date(0),
     undefined,
     { kind: "full" },
-    undefined,
     false
   );
 });
@@ -513,9 +508,7 @@ test("one stale Role cleanup failure does not block another Role delivery", asyn
         "role:task-delivery/worker"
       ]
     },
-    undefined,
     true,
-    new Set(),
     [],
     lifecycleHost
   );
@@ -603,9 +596,7 @@ test("Task and global cleanup obligations supersede launch reservations atomical
       kind: "dirty",
       keys: ["role:task-1/worker", "global-role:operator"]
     },
-    undefined,
     true,
-    new Set(),
     [],
     lifecycleHost
   );
@@ -678,9 +669,7 @@ test("full recovery probes old reservations without stopping a healthy host", as
     new Date(120_001),
     undefined,
     { kind: "full" },
-    undefined,
     false,
-    new Set(),
     [],
     lifecycleHost
   );
@@ -691,173 +680,6 @@ test("full recovery probes old reservations without stopping a healthy host", as
   ]);
   assert.notEqual(mailboxes.get(runningTarget.roleName).processing, null);
   assert.equal(mailboxes.get(stoppedTarget.roleName).processing, null);
-});
-
-test("a foreground global Role awaiting its first Turn is preserved", async () => {
-  const target = { kind: "global-role-runtime", roleName: "operator" };
-  let mailbox = {
-    schemaVersion: 1,
-    target,
-    nextSequence: 2,
-    processing: {
-      batchId: "launch-unregistered-operator",
-      batch: {
-        fromSequence: 1, toSequence: 1, reasons: ["runtime-launch-reserved"],
-        refs: [], requestCount: 1,
-        firstQueuedAt: new Date(0).toISOString(),
-        lastQueuedAt: new Date(0).toISOString()
-      },
-      owner: "runtime-lifecycle",
-      startedAt: new Date(0).toISOString()
-    },
-    pending: null
-  };
-  const store = emptyStore();
-  store.listWorkMailboxes = () => mailbox === null ? [] : [mailbox];
-  store.getWorkMailbox = (candidate) => candidate.kind === "global-role-runtime"
-    ? mailbox
-    : null;
-  store.getOperatorDeliveryTarget = () => ({ roleName: "operator", adapterId: "codex" });
-  store.completeStoppedRuntimeReservation = (_target, batchId) => {
-    if (mailbox?.processing?.batchId !== batchId) return false;
-    mailbox = null;
-    return true;
-  };
-  const stopped = [];
-  const lifecycleHost = {
-    async inspectOwner() { return { state: "running" }; },
-    async stopOwner(owner) { stopped.push(owner); return true; }
-  };
-
-  await runControllerSchedulerPass(
-    store,
-    noTmux,
-    new Date(120_001),
-    undefined,
-    { kind: "full" },
-    undefined,
-    false,
-    new Set(),
-    [],
-    lifecycleHost
-  );
-
-  assert.deepEqual(stopped, []);
-  assert.notEqual(mailbox, null);
-});
-
-test("a stale unregistered Task Role with an active Run uses ready-gated cleanup", async () => {
-  const task = { id: "task-1", status: "active", projectBindings: [] };
-  const roleValue = role(task.id, "worker");
-  const target = { kind: "role-runtime", taskId: task.id, roleName: roleValue.name };
-  let mailbox = {
-    schemaVersion: 1,
-    target,
-    nextSequence: 2,
-    processing: {
-      batchId: "launch-unregistered-worker",
-      batch: {
-        fromSequence: 1, toSequence: 1, reasons: ["runtime-launch-reserved"],
-        refs: [], requestCount: 1,
-        firstQueuedAt: new Date(0).toISOString(),
-        lastQueuedAt: new Date(0).toISOString()
-      },
-      owner: "runtime-lifecycle",
-      startedAt: new Date(0).toISOString()
-    },
-    pending: null
-  };
-  const store = emptyStore();
-  store.listTasks = () => [task];
-  store.getTask = () => task;
-  store.listRoles = () => [roleValue];
-  store.getRole = () => roleValue;
-  store.getActiveAgentRun = () => ({ id: "run-1", status: "active" });
-  store.listWorkMailboxes = () => mailbox === null ? [] : [mailbox];
-  store.getWorkMailbox = (candidate) => candidate.kind === "role-runtime"
-    ? mailbox
-    : null;
-  store.completeStoppedRuntimeReservation = (_target, batchId) => {
-    if (mailbox?.processing?.batchId !== batchId) return false;
-    mailbox = null;
-    return true;
-  };
-  const stopped = [];
-  const lifecycleHost = {
-    async inspectOwner() { return { state: "running" }; },
-    async stopOwner(owner) {
-      stopped.push(owner);
-      return true;
-    }
-  };
-  const delivery = {
-    ...noTmux,
-    async inspectRole() { return "present"; },
-    async inspectRoleReadiness(input) {
-      assert.deepEqual(input, {
-        taskId: task.id,
-        roleName: roleValue.name,
-        agentId: roleValue.activeAgentId,
-        adapterId: roleValue.adapterId
-      });
-      return "ready";
-    }
-  };
-
-  await runControllerSchedulerPass(
-    store, delivery, new Date(120_001), undefined, { kind: "full" },
-    undefined, false, new Set(), [], lifecycleHost
-  );
-
-  assert.deepEqual(stopped, [{ scope: "task", taskId: task.id, roleName: roleValue.name }]);
-  assert.equal(mailbox, null);
-});
-
-test("a foreground Task Role without an active Run is preserved", async () => {
-  const task = { id: "task-1", status: "active", projectBindings: [] };
-  const roleValue = role(task.id, "worker");
-  const target = { kind: "role-runtime", taskId: task.id, roleName: roleValue.name };
-  let mailbox = {
-    schemaVersion: 1,
-    target,
-    nextSequence: 2,
-    processing: {
-      batchId: "launch-unregistered-worker",
-      batch: {
-        fromSequence: 1, toSequence: 1, reasons: ["runtime-launch-reserved"],
-        refs: [], requestCount: 1,
-        firstQueuedAt: new Date(0).toISOString(),
-        lastQueuedAt: new Date(0).toISOString()
-      },
-      owner: "runtime-lifecycle",
-      startedAt: new Date(0).toISOString()
-    },
-    pending: null
-  };
-  const store = emptyStore();
-  store.listTasks = () => [task];
-  store.getTask = () => task;
-  store.listRoles = () => [roleValue];
-  store.getRole = () => roleValue;
-  store.listWorkMailboxes = () => [mailbox];
-  store.getWorkMailbox = () => mailbox;
-  const stopped = [];
-  const lifecycleHost = {
-    async inspectOwner() { return { state: "running" }; },
-    async stopOwner(owner) { stopped.push(owner); return true; }
-  };
-  const delivery = {
-    ...noTmux,
-    async inspectRoleReadiness() { return "ready"; }
-  };
-
-  await runControllerSchedulerPass(
-    store, delivery, new Date(120_001), undefined, { kind: "full" },
-    undefined, false, new Set(), [], lifecycleHost
-  );
-
-  assert.deepEqual(stopped, []);
-  assert.notEqual(mailbox, null);
 });
 
 test("an unavailable stale reservation is re-inspected by its exact dirty retry", async () => {
@@ -1107,9 +929,7 @@ test("stale Role cleanup finishes before a concurrently queued Run may launch", 
       kind: "dirty",
       keys: ["role:task-1/worker"]
     },
-    undefined,
     true,
-    new Set(),
     [],
     lifecycleHost
   );
@@ -2251,145 +2071,6 @@ test("an overdue semantic deadline uses bounded pass backoff instead of a zero-d
   await new Promise((resolve) => setTimeout(resolve, 50));
 
   assert.equal(failures, 3);
-  controller.stop();
-});
-
-test("overdue ready recovery remains targeted and retries until the composer is ready", async () => {
-  const task = { id: "task-1", status: "active", projectBindings: [] };
-  const roleValue = role(task.id, "worker");
-  let run = {
-    ...deliveredRun(task.id, roleValue.name),
-    deliveredAt: new Date(Date.now() - 1_000).toISOString()
-  };
-  let listTaskCalls = 0;
-  let readinessCalls = 0;
-  let failed = 0;
-  const store = emptyStore();
-  store.listTasks = () => { listTaskCalls += 1; return [task]; };
-  store.getTask = () => task;
-  store.listRoles = () => [roleValue];
-  store.getRole = () => roleValue;
-  store.getActiveAgentRun = () => run;
-  store.saveExitedRoleRun = () => {
-    failed += 1;
-    run = null;
-    return "failed";
-  };
-  const delivery = {
-    ...noTmux,
-    async inspectRole() { return "present"; },
-    async inspectRoleReadiness() {
-      readinessCalls += 1;
-      return readinessCalls < 3 ? "busy" : "ready";
-    },
-    async stopRole() {
-      return true;
-    }
-  };
-  const controller = new FileTaskController(store, delivery, {
-    intervalMs: 60_000,
-    signalWindowMs: 1,
-    deliveryRetryMs: 2,
-    readyRecoveryAgeMs: 5
-  });
-
-  await controller.pump();
-  const fullPassTaskScans = listTaskCalls;
-  await new Promise((resolve) => setTimeout(resolve, 50));
-
-  // Two busy probes are followed by one observation and one confirmation.
-  assert.equal(readinessCalls, 4);
-  assert.equal(failed, 1);
-  assert.equal(listTaskCalls, fullPassTaskScans);
-  controller.stop();
-});
-
-test("a Hook drained after the first ready observation fences the confirmation pass", async () => {
-  const task = { id: "task-1", status: "active", projectBindings: [] };
-  const roleValue = role(task.id, "worker");
-  const run = {
-    ...deliveredRun(task.id, roleValue.name),
-    deliveredAt: new Date(Date.now() - 1_000).toISOString()
-  };
-  let hookObserved = false;
-  let drains = 0;
-  let stopped = 0;
-  let failed = 0;
-  const store = emptyStore();
-  store.listTasks = () => [task];
-  store.getTask = () => task;
-  store.listRoles = () => [roleValue];
-  store.getRole = () => roleValue;
-  store.getActiveAgentRun = () => run;
-  store.listPendingRuntimeTurnCompletions = () => hookObserved
-    ? [{ taskId: task.id, roleName: roleValue.name, runId: run.id }]
-    : [];
-  store.saveExitedRoleRun = () => { failed += 1; return "failed"; };
-  const delivery = {
-    ...noTmux,
-    async inspectRole() { return "present"; },
-    async inspectRoleReadiness() { return "ready"; },
-    async stopRole() { stopped += 1; return true; }
-  };
-  const controller = new FileTaskController(store, delivery, {
-    signalWindowMs: 1,
-    deliveryRetryMs: 2,
-    readyRecoveryAgeMs: 5,
-    runtimeEventProcessor: {
-      drain() {
-        drains += 1;
-        if (drains === 2) hookObserved = true;
-        return { acknowledgedEventIds: [], deferred: [], failed: [] };
-      }
-    }
-  });
-
-  await controller.pump();
-  await new Promise((resolve) => setTimeout(resolve, 20));
-
-  assert.equal(hookObserved, true);
-  assert.equal(stopped, 0);
-  assert.equal(failed, 0);
-  controller.stop();
-});
-
-test("a terminal Role clears its pending ready-recovery timer", async () => {
-  const task = { id: "task-1", status: "active", projectBindings: [] };
-  const roleValue = role(task.id, "worker");
-  let run = {
-    ...deliveredRun(task.id, roleValue.name),
-    deliveredAt: new Date().toISOString()
-  };
-  let listTaskCalls = 0;
-  let readinessCalls = 0;
-  const store = emptyStore();
-  store.listTasks = () => { listTaskCalls += 1; return [task]; };
-  store.getTask = () => task;
-  store.listRoles = () => [roleValue];
-  store.getRole = () => roleValue;
-  store.getActiveAgentRun = () => run;
-  const delivery = {
-    ...noTmux,
-    async inspectRole() { return "present"; },
-    async inspectRoleReadiness() {
-      readinessCalls += 1;
-      return "busy";
-    }
-  };
-  const controller = new FileTaskController(store, delivery, {
-    intervalMs: 60_000,
-    signalWindowMs: 1,
-    readyRecoveryAgeMs: 30
-  });
-
-  await controller.pump();
-  const fullPassTaskScans = listTaskCalls;
-  run = null;
-  controller.signal("role:task-1/worker");
-  await new Promise((resolve) => setTimeout(resolve, 70));
-
-  assert.equal(readinessCalls, 0);
-  assert.equal(listTaskCalls, fullPassTaskScans);
   controller.stop();
 });
 

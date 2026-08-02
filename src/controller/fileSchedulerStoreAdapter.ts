@@ -636,8 +636,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       ) {
         return "state-changed";
       }
-      const missingLeaderHook = input.reason === "missing-turn-hook"
-        && role.name === "leader";
       store.saveAgentRun(failAgentRun(currentRun, input.summary, input.now));
       store.clearActiveAgentRun(task.id, role.name);
       clearTaskRoleRunInFlight(store, role, currentRun, input.now);
@@ -651,41 +649,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           );
         }
       }
-      store.saveRole(task.id, updateRoleStatus(
-        role,
-        missingLeaderHook ? "failed" : "exited",
-        input.now
-      ));
+      store.saveRole(task.id, updateRoleStatus(role, "exited", input.now));
       stopTaskSessionIfPresent(store, task.id, role.name, role.activeAgentId, input.now);
-      if (missingLeaderHook) {
-        const detail = "Leader runtime registration failed because the native Turn Hook did not arrive.";
-        store.saveLeaderFailure(recordLeaderFailure(
-          task.id,
-          input.session?.nativeSessionId ?? "(unregistered)",
-          detail,
-          input.now,
-          store.getLeaderFailure(task.id)
-        ));
-        store.saveOperatorNotification(createLeaderRecoveryNotification(
-          task.id,
-          detail,
-          input.now,
-          store.getOperatorNotification(task.id)
-        ));
-        enqueueWork(store, { kind: "operator" }, "leader-recovery-failed", input.now, [
-          { type: "task", id: task.id },
-          { type: "run", id: currentRun.id }
-        ]);
-        return "failed";
-      }
       queueLeaderWakeup(
         store,
         task.id,
         currentRun.purpose === "review"
           ? "review-failed"
-          : role.name === "leader"
-            ? "leader-run-failed"
-            : "role-run-failed",
+          : role.name === "leader" ? "leader-run-failed" : "role-run-failed",
         input.now
       );
       return "failed";

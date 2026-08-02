@@ -1258,49 +1258,6 @@ test("runtime native session registration is structured and exited work fails at
   assert.equal(store.getActiveAgentRun(task.id, role.name).id, replacement.id);
 });
 
-test("a missing Leader Hook immediately escalates without an automatic retry", (t) => {
-  const { store, task, role, now, adapter } = fixture(t);
-  const failGeneration = (runId, reason) => {
-    const wakeup = adapter.enqueueLeaderWakeup(task.id, reason, now);
-    const run = createAgentRun(runId, task.id, role.name, "new", "recover", now);
-    assert.equal(adapter.saveLeaderDispatch({
-      task,
-      role: adapter.getRole(task.id, role.name),
-      run,
-      session: null,
-      wakeup,
-      now
-    }), "claimed");
-    adapter.saveRoleRunDelivery({
-      task,
-      role: adapter.getRole(task.id, role.name),
-      run,
-      session: null,
-      now
-    });
-    assert.equal(adapter.saveExitedRoleRun({
-      task,
-      role: adapter.getRole(task.id, role.name),
-      run,
-      session: null,
-      reason: "missing-turn-hook",
-      summary: "missing native Turn Hook",
-      now
-    }), "failed");
-    return run;
-  };
-
-  const failed = failGeneration("agent-run-missing-hook-1", "role-result");
-  assert.equal(store.getPendingWakeup(task.id), null);
-  assert.equal(store.getLeaderFailure(task.id).attemptCount, 1);
-  assert.match(store.getLeaderFailure(task.id).message, /registration failed/i);
-  assert.equal(store.getOperatorNotification(task.id).type, "leader-recovery-failed");
-  assert.deepEqual(
-    store.getWorkMailbox({ kind: "operator" }).pending.refs,
-    [{ type: "task", id: task.id }, { type: "run", id: failed.id }]
-  );
-});
-
 test("reconfirming an already delivered active run does not rewrite authoritative state", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
   const run = createAgentRun(

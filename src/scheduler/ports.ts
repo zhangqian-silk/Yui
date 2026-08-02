@@ -112,7 +112,6 @@ export type ExitedRoleRunPersistence = Readonly<{
   role: SchedulerRole;
   run: SchedulerAgentRun;
   session: SchedulerRoleSession | null;
-  reason?: "host-exited" | "missing-turn-hook";
   summary: string;
   now: Date;
 }>;
