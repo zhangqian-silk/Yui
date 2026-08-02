@@ -16,6 +16,12 @@ export type ReviewCheck = Readonly<{
   details?: string;
 }>;
 
+export type ReviewYieldReport = Readonly<{
+  summary: string;
+  checks: readonly ReviewCheck[];
+  evidenceCommit?: string;
+}>;
+
 export type ReviewRound = {
   schemaVersion: 2;
   id: string;
@@ -125,6 +131,66 @@ export function finishReviewRound(
       : { evidenceCommit: requireCommit(result.evidenceCommit, "Review evidence commit") }),
     endedAt: now.toISOString()
   });
+}
+
+/**
+ * A Review Run reports its durable result through the existing summary-file
+ * stdin channel. The JSON envelope keeps check provenance explicit without a
+ * second command, sidecar, or inferred text convention.
+ */
+export function parseReviewYieldReport(value: string): ReviewYieldReport {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch (error) {
+    throw new Error("Review yield input must be one JSON result object.", { cause: error });
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("Review yield input must be one JSON result object.");
+  }
+  const record = parsed as Record<string, unknown>;
+  const allowed = new Set(["summary", "checks", "evidenceCommit"]);
+  const unknown = Object.keys(record).find((field) => !allowed.has(field));
+  if (unknown !== undefined) {
+    throw new Error(`Review yield result has unknown field: ${unknown}.`);
+  }
+  if (!Object.hasOwn(record, "summary") || !Object.hasOwn(record, "checks")) {
+    throw new Error("Review yield result requires summary and checks.");
+  }
+  if (!Array.isArray(record.checks) || record.checks.length === 0) {
+    throw new Error(
+      "Review yield result requires at least one passed, failed, or skipped check."
+    );
+  }
+  const checks = record.checks.map((value) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error("Review yield check must be an object.");
+    }
+    const check = value as Record<string, unknown>;
+    const checkUnknown = Object.keys(check).find((field) => (
+      field !== "name" && field !== "outcome" && field !== "details"
+    ));
+    if (checkUnknown !== undefined) {
+      throw new Error(`Review yield check has unknown field: ${checkUnknown}.`);
+    }
+    return {
+      name: check.name as string,
+      outcome: check.outcome as ReviewCheck["outcome"],
+      ...(check.details === undefined ? {} : { details: check.details as string })
+    };
+  });
+  return {
+    summary: requireText(record.summary as string, "Review summary"),
+    checks: validateChecks(checks),
+    ...(record.evidenceCommit === undefined
+      ? {}
+      : {
+          evidenceCommit: requireCommit(
+            record.evidenceCommit as string,
+            "Review evidence commit"
+          )
+        })
+  };
 }
 
 export function recordReviewWorkspaceDisposition(

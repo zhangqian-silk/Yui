@@ -12,8 +12,21 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
-import { createConfiguredAgent } from "../../dist/agent/agent.js";
-import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
+import {
+  configuredAgentToDefinition,
+  createConfiguredAgent
+} from "../../dist/agent/agent.js";
+import { resolveAgentAdapter } from "../../dist/executor/agentAdapter.js";
+import {
+  effectiveLaunchConfig,
+  effectiveLaunchSnapshotsCompatible,
+  resolveEffectiveLaunch
+} from "../../dist/executor/effectiveLaunch.js";
+import {
+  createGlobalRole,
+  createRole,
+  createRoleAgentBinding
+} from "../../dist/role/role.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import {
   FileTaskStore,
@@ -45,6 +58,7 @@ import {
   createWorkMailbox,
   enqueueSignal
 } from "../../dist/coordination/workMailbox.js";
+import { createRoleWorkspace } from "../../dist/worktree/roleWorkspace.js";
 
 const NOW = new Date("2026-08-02T00:00:00.000Z");
 const REVIEW_BASE_COMMIT = "a".repeat(40);
@@ -696,6 +710,132 @@ test("offline identity conversion writes a fresh zero-dangling output without to
   assert.doesNotThrow(() => new FileTaskStore(output).listTasks());
 });
 
+test("offline identity conversion bootstraps only the configured legacy reviewer for writable isolated launches", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "yui-reviewer-bootstrap-convert-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const source = join(root, "source");
+  const output = join(root, "output");
+  mkdirSync(source);
+  const sourceState = legacyConfiguredReviewerState(root);
+  writeLegacyStorage(source, sourceState);
+  const sourceBefore = readFileSync(join(source, STORAGE_STATE_FILE));
+
+  const { convertLegacyTaskIdentityStorage } = await import(
+    "../../dist/storage/taskIdentityConverter.js"
+  );
+  const report = convertLegacyTaskIdentityStorage({ source, output, now: NOW });
+  assert.deepEqual(readFileSync(join(source, STORAGE_STATE_FILE)), sourceBefore);
+  assert.deepEqual(report.reviewBootstrap, {
+    roleName: "reviewer",
+    globalRole: "updated",
+    taskRoles: ["task-1", "task-2"],
+    builtinProfile: "updated"
+  });
+
+  const converted = JSON.parse(readFileSync(join(output, STORAGE_STATE_FILE), "utf8"));
+  const store = new FileTaskStore(output);
+  assert.doesNotThrow(() => store.listTasks());
+  assert.equal(converted.globalRoles.reviewer.defaultAccess, "write");
+  assert.equal(converted.globalRoles.reviewer.launchRevision, 1);
+  for (const binding of Object.values(converted.globalRoles.reviewer.agentBindings)) {
+    assert.equal(binding.config.yolo, true);
+    assert.equal(binding.config.permission, undefined);
+  }
+  for (const taskId of ["task-1", "task-2"]) {
+    assert.equal(converted.tasks[taskId].roles.reviewer.defaultAccess, "write");
+    assert.equal(converted.tasks[taskId].roles.reviewer.launchRevision, 1);
+  }
+  assert.equal(converted.globalRoles["custom-reviewer"].defaultAccess, "read");
+  assert.deepEqual(
+    converted.globalRoles["custom-reviewer"].agentBindings.claude.config.permission,
+    { mode: "plan" }
+  );
+  assert.equal(converted.agentProfiles.reviewer.defaultAccess, "write");
+  assert.equal(converted.agentProfiles.reviewer.revision, 2);
+  assert.match(converted.agentProfiles.reviewer.instructions, /ReviewRound-owned workspace/u);
+  assert.equal(converted.agentProfiles["custom-reviewer"].defaultAccess, "read");
+  assert.equal(converted.agentProfiles["custom-reviewer"].instructions, "Custom policy.");
+
+  for (const session of Object.values(
+    converted.globalRoleSessionSets.reviewer.sessions
+  )) {
+    assert.equal(session.effective.provenance, "legacy-cutover");
+    assert.equal(session.effective.access, "read");
+    assert.equal(session.effective.yolo, false);
+  }
+
+  for (const [taskId, agentId, bypassFlag] of [
+    ["task-1", "codex", "--dangerously-bypass-approvals-and-sandbox"],
+    ["task-2", "claude", "--dangerously-skip-permissions"]
+  ]) {
+    const role = store.getRole(taskId, "reviewer");
+    assert.equal(role.activeAgentId, agentId);
+    const roundId = "review-round-2";
+    const workspaceRoot = join(root, `${taskId}-${agentId}-review`);
+    const projectPath = join(workspaceRoot, "fixture");
+    mkdirSync(projectPath, { recursive: true });
+    const workspace = createRoleWorkspace({
+      taskId,
+      roleName: "reviewer",
+      owner: { type: "review-round", reviewRoundId: roundId },
+      root: workspaceRoot,
+      entries: [{
+        projectId: "project-1",
+        directory: "fixture",
+        access: "write",
+        path: projectPath,
+        branch: `yui/${taskId}/${roundId}`,
+        baseRef: "main",
+        baseCommit: "c".repeat(40)
+      }]
+    }, NOW);
+    const effective = resolveEffectiveLaunch({
+      role,
+      purpose: "review",
+      workspace,
+      reviewRoundId: roundId,
+      reviewBaseCommit: "c".repeat(40)
+    });
+    assert.equal(effective.access, "write");
+    assert.equal(effective.yolo, true);
+    assert.equal(effective.permission, undefined);
+    assert.deepEqual(effective.writeProjectIds, ["project-1"]);
+    const legacySession = converted.globalRoleSessionSets.reviewer.sessions[agentId];
+    assert.equal(effectiveLaunchSnapshotsCompatible(legacySession.effective, effective), false);
+    const agent = store.getConfiguredAgent(agentId);
+    const argv = resolveAgentAdapter(agent.adapterId).compileNew({
+      agent: configuredAgentToDefinition(agent),
+      config: effectiveLaunchConfig(effective),
+      workspace: workspace.root
+    }).argv;
+    assert.equal(argv.includes(bypassFlag), true);
+    assert.equal(argv.includes("--allowed-tools"), false);
+    assert.equal(argv.includes("--disallowed-tools"), false);
+  }
+});
+
+test("offline identity conversion rejects a configured reviewer without an authoritative Global Role", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "yui-reviewer-bootstrap-ambiguous-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const source = join(root, "source");
+  const output = join(root, "output");
+  mkdirSync(source);
+  const sourceState = legacyConfiguredReviewerState(root);
+  delete sourceState.globalRoles.reviewer;
+  writeLegacyStorage(source, sourceState);
+  const sourceBefore = readFileSync(join(source, STORAGE_STATE_FILE));
+
+  const { convertLegacyTaskIdentityStorage } = await import(
+    "../../dist/storage/taskIdentityConverter.js"
+  );
+  assert.throws(
+    () => convertLegacyTaskIdentityStorage({ source, output, now: NOW }),
+    /configured reviewer Global Role is missing: reviewer.*configure or clear config\.review/i
+  );
+  assert.deepEqual(readFileSync(join(source, STORAGE_STATE_FILE)), sourceBefore);
+  assert.equal(existsSync(output), false);
+});
+
 test("offline identity conversion only remaps documented Task Event references", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "yui-identity-event-convert-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -1145,6 +1285,141 @@ function legacyIdentityState() {
         }
       }
     }
+  };
+}
+
+function legacyConfiguredReviewerState(root) {
+  const state = legacyIdentityState();
+  const stamp = NOW.toISOString();
+  const codex = createConfiguredAgent("codex", "codex", "codex", [], [], NOW);
+  const claude = createConfiguredAgent("claude", "claude", "claude", [], [], NOW);
+  const codexBinding = createRoleAgentBinding(codex, {
+    adapterId: "codex",
+    model: "gpt-review",
+    effort: "max",
+    permission: { sandbox: "read-only", approval: "never" }
+  });
+  const claudeBinding = createRoleAgentBinding(claude, {
+    adapterId: "claude",
+    model: "opus",
+    effort: "max",
+    permission: {
+      mode: "dontAsk",
+      allowedTools: [
+        "Read",
+        "Grep",
+        "Glob",
+        "Bash(yui --json task context *)",
+        "Bash(yui --json task work show *)",
+        "Bash(yui --json task work list *)",
+        "Bash(git diff *)",
+        "Bash(git status *)",
+        "Bash(git show *)",
+        "Bash(git log *)",
+        "Bash(yui task run yield *)"
+      ],
+      disallowedTools: ["Edit", "Write"]
+    }
+  });
+  const reviewerProfileDescription =
+    "Review one candidate against the user's core outcome, supported behavior, and direct evidence.";
+  state.config = {
+    schemaVersion: 1,
+    defaultAgent: codex.id,
+    defaultWorkspace: root,
+    review: { roleName: "reviewer", trigger: "leader" }
+  };
+  state.configuredAgents = { [codex.id]: codex, [claude.id]: claude };
+  state.agentProfiles = {
+    reviewer: {
+      schemaVersion: 2,
+      id: "reviewer",
+      revision: 1,
+      defaultAccess: "read",
+      description: reviewerProfileDescription,
+      instructions: "Start from user intent and acceptance criteria. Inspect the complete relevant change and report only reachable, material, actionable problems with direct evidence. Separate defects from verification gaps, and prefer the smallest sufficient correction. Do not turn speculative or extreme edge cases into new state, retries, fallbacks, or protocol. Expose evidence and options to the Leader, who decides. Do not modify files or external state.",
+      createdAt: stamp,
+      updatedAt: stamp
+    },
+    "custom-reviewer": {
+      schemaVersion: 2,
+      id: "custom-reviewer",
+      revision: 4,
+      defaultAccess: "read",
+      description: "Custom review profile.",
+      instructions: "Custom policy.",
+      createdAt: stamp,
+      updatedAt: stamp
+    }
+  };
+  state.globalRoles = {
+    reviewer: legacyRole(createGlobalRole(
+      "reviewer",
+      [codexBinding, claudeBinding],
+      codex.id,
+      root,
+      NOW,
+      {},
+      "read"
+    )),
+    "custom-reviewer": legacyRole(createGlobalRole(
+      "custom-reviewer",
+      [createRoleAgentBinding(claude, {
+        adapterId: "claude",
+        permission: { mode: "plan" }
+      })],
+      claude.id,
+      root,
+      NOW,
+      {},
+      "read"
+    ))
+  };
+  state.globalRoleSessionSets = {
+    reviewer: legacyGlobalReviewerSessions(stamp)
+  };
+  state.tasks["task-1"].roles.reviewer = legacyRole(createRole(
+    "task-1", "reviewer", [codexBinding, claudeBinding], codex.id,
+    root, NOW, {}, "read"
+  ));
+  state.tasks["task-2"].roles.reviewer = legacyRole(createRole(
+    "task-2", "reviewer", [codexBinding, claudeBinding], claude.id,
+    root, NOW, {}, "read"
+  ));
+  return state;
+}
+
+function legacyRole(role) {
+  const {
+    schemaVersion: _schemaVersion,
+    launchRevision: _launchRevision,
+    defaultAccess: _defaultAccess,
+    ...legacy
+  } = role;
+  return { ...legacy, schemaVersion: 2 };
+}
+
+function legacyGlobalReviewerSessions(timestamp) {
+  const session = (agentId, adapterId) => ({
+    schemaVersion: 2,
+    agentId,
+    adapterId,
+    nativeSessionId: `legacy-reviewer-${agentId}`,
+    policy: "fixed",
+    status: "ready",
+    recentCompletedTurnIds: [],
+    createdAt: timestamp,
+    updatedAt: timestamp
+  });
+  return {
+    schemaVersion: 2,
+    owner: { scope: "global", roleName: "reviewer" },
+    activeAgentId: "codex",
+    sessions: {
+      codex: session("codex", "codex"),
+      claude: session("claude", "claude")
+    },
+    updatedAt: timestamp
   };
 }
 

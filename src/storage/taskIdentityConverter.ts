@@ -15,6 +15,7 @@ import {
   type EffectiveLaunchWorkspace
 } from "../executor/effectiveLaunch.js";
 import type { AgentAdapterId } from "../agent/adapterCatalog.js";
+import { builtinAgentProfileInputs } from "../profile/agentProfile.js";
 
 import {
   formatAgentRunReceiptId,
@@ -34,6 +35,11 @@ const LEGACY_AGGREGATE_SCHEMA_VERSION = 10;
 const LEGACY_TASK_AGGREGATE_SCHEMA_VERSION = 9;
 export const IDENTITY_CONVERSION_REPORT_FILE = "identity-conversion.json";
 
+const LEGACY_BUILTIN_REVIEWER_DESCRIPTION =
+  "Review one candidate against the user's core outcome, supported behavior, and direct evidence.";
+const LEGACY_BUILTIN_REVIEWER_INSTRUCTIONS =
+  "Start from user intent and acceptance criteria. Inspect the complete relevant change and report only reachable, material, actionable problems with direct evidence. Separate defects from verification gaps, and prefer the smallest sufficient correction. Do not turn speculative or extreme edge cases into new state, retries, fallbacks, or protocol. Expose evidence and options to the Leader, who decides. Do not modify files or external state.";
+
 type JsonObject = Record<string, unknown>;
 type IdMaps = Record<TaskRecordKind, Map<string, string>>;
 
@@ -42,6 +48,20 @@ type TaskConversion = Readonly<{
   source: JsonObject;
   maps: IdMaps;
   candidateByWorkItem: Map<string, Map<string, string>>;
+}>;
+
+export type ReviewBootstrapConversionReport = Readonly<{
+  roleName: string;
+  globalRole: "updated";
+  taskRoles: readonly string[];
+  builtinProfile: "updated" | "absent" | "preserved-custom";
+}>;
+
+type ReviewBootstrapPlan = Readonly<{
+  roleName: string;
+  taskIds: readonly string[];
+  builtinProfile: ReviewBootstrapConversionReport["builtinProfile"];
+  convertedBuiltinProfile?: JsonObject;
 }>;
 
 type EventReferenceKind = Exclude<TaskRecordKind, "event"> | "candidate";
@@ -127,6 +147,7 @@ export type TaskIdentityConversionReport = Readonly<{
   sourceStateSha256: string;
   taskIds: readonly string[];
   recordCounts: Readonly<Record<string, Readonly<Record<TaskRecordKind, number>>>>;
+  reviewBootstrap: ReviewBootstrapConversionReport | null;
   convertedAt: string;
 }>;
 
@@ -147,7 +168,8 @@ export function convertLegacyTaskIdentityStorage(input: Readonly<{
   validateLegacyManifest(parseJson(manifestBytes, "Source storage manifest"));
   const sourceState = parseLegacyState(parseJson(stateBytes, "Source storage state"));
   const conversions = buildTaskConversions(sourceState);
-  const convertedState = convertState(sourceState, conversions);
+  const reviewBootstrap = buildReviewBootstrapPlan(sourceState, conversions, now);
+  const convertedState = convertState(sourceState, conversions, reviewBootstrap);
 
   assertSourceUnchanged(manifestPath, manifestBytes, statePath, stateBytes);
   if (existsSync(output)) throw new Error(`Conversion output must be fresh: ${output}.`);
@@ -167,6 +189,14 @@ export function convertLegacyTaskIdentityStorage(input: Readonly<{
         conversion.maps[kind].size
       ])) as Record<TaskRecordKind, number>
     ])),
+    reviewBootstrap: reviewBootstrap === null
+      ? null
+      : {
+          roleName: reviewBootstrap.roleName,
+          globalRole: "updated",
+          taskRoles: reviewBootstrap.taskIds,
+          builtinProfile: reviewBootstrap.builtinProfile
+        },
     convertedAt: now.toISOString()
   };
 
@@ -249,6 +279,74 @@ function buildTaskConversions(state: JsonObject): TaskConversion[] {
   });
 }
 
+function buildReviewBootstrapPlan(
+  state: JsonObject,
+  conversions: readonly TaskConversion[],
+  now: Date
+): ReviewBootstrapPlan | null {
+  const config = object(state.config, "Source Yui config");
+  if (config.review === undefined || config.review === null) return null;
+  const review = object(config.review, "Source review config");
+  const roleName = text(review.roleName, "Configured reviewer Role name");
+  const globalRoles = object(state.globalRoles, "Source Global Roles");
+  if (!Object.hasOwn(globalRoles, roleName)) {
+    throw new Error(
+      `Configured reviewer Global Role is missing: ${roleName}. `
+      + "Configure or clear config.review before conversion."
+    );
+  }
+  const globalRole = object(
+    globalRoles[roleName],
+    `Configured reviewer Global Role ${roleName}`
+  );
+  if (globalRole.name !== roleName) {
+    throw new Error(`Configured reviewer Global Role identity is inconsistent: ${roleName}.`);
+  }
+  const taskIds = conversions.flatMap((conversion) => {
+    const roles = object(
+      conversion.source.roles,
+      `Source Task Roles ${conversion.taskId}`
+    );
+    if (!Object.hasOwn(roles, roleName)) return [];
+    const role = object(
+      roles[roleName],
+      `Configured Task reviewer ${conversion.taskId}/${roleName}`
+    );
+    if (role.name !== roleName) {
+      throw new Error(
+        `Configured Task reviewer identity is inconsistent: ${conversion.taskId}/${roleName}.`
+      );
+    }
+    return [conversion.taskId];
+  });
+  const profiles = object(state.agentProfiles, "Source Agent Profiles");
+  const sourceProfile = profiles.reviewer;
+  if (sourceProfile === undefined) {
+    return { roleName, taskIds, builtinProfile: "absent" };
+  }
+  const profile = clone(object(sourceProfile, "Source reviewer Profile"));
+  if (!isLegacyBuiltinReviewerProfile(profile)) {
+    return { roleName, taskIds, builtinProfile: "preserved-custom" };
+  }
+  const desired = builtinAgentProfileInputs().find(({ id }) => id === "reviewer");
+  if (desired === undefined || desired.defaultAccess !== "write") {
+    throw new Error("Current built-in reviewer Profile is unavailable for conversion.");
+  }
+  return {
+    roleName,
+    taskIds,
+    builtinProfile: "updated",
+    convertedBuiltinProfile: {
+      ...profile,
+      revision: (profile.revision as number) + 1,
+      defaultAccess: desired.defaultAccess,
+      description: desired.description,
+      instructions: desired.instructions,
+      updatedAt: now.toISOString()
+    }
+  };
+}
+
 function buildFamilyMap(
   aggregate: JsonObject,
   taskId: string,
@@ -272,10 +370,14 @@ function buildFamilyMap(
   ]));
 }
 
-function convertState(state: JsonObject, conversions: readonly TaskConversion[]): JsonObject {
+function convertState(
+  state: JsonObject,
+  conversions: readonly TaskConversion[],
+  reviewBootstrap: ReviewBootstrapPlan | null
+): JsonObject {
   const tasks: JsonObject = {};
   for (const conversion of conversions) {
-    tasks[conversion.taskId] = convertTaskAggregate(conversion);
+    tasks[conversion.taskId] = convertTaskAggregate(conversion, reviewBootstrap);
   }
   const owners = buildOwnerIndex(conversions);
   const mailboxes: JsonObject = {};
@@ -284,7 +386,12 @@ function convertState(state: JsonObject, conversions: readonly TaskConversion[])
   }
   const globalRoles = Object.fromEntries(Object.entries(
     object(state.globalRoles, "Source Global Roles")
-  ).map(([name, value]) => [name, convertLegacyRole(value, `Global Role ${name}`)]));
+  ).map(([name, value]) => [
+    name,
+    name === reviewBootstrap?.roleName
+      ? convertLegacyReviewRole(value, `Global Role ${name}`)
+      : convertLegacyRole(value, `Global Role ${name}`)
+  ]));
   const globalRoleSessionSets = Object.fromEntries(Object.entries(object(
     state.globalRoleSessionSets,
     "Source Global Role sessions"
@@ -296,6 +403,12 @@ function convertState(state: JsonObject, conversions: readonly TaskConversion[])
   return {
     ...clone(state),
     schemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
+    agentProfiles: reviewBootstrap?.convertedBuiltinProfile === undefined
+      ? clone(object(state.agentProfiles, "Source Agent Profiles"))
+      : {
+          ...clone(object(state.agentProfiles, "Source Agent Profiles")),
+          reviewer: reviewBootstrap.convertedBuiltinProfile
+        },
     globalRoles,
     globalRoleSessionSets,
     tasks,
@@ -316,6 +429,87 @@ function convertLegacyRole(value: unknown, label: string): JsonObject {
     // offline cutover therefore closes desired access to read-only.
     defaultAccess: "read"
   };
+}
+
+function convertLegacyReviewRole(value: unknown, label: string): JsonObject {
+  const converted = convertLegacyRole(value, label);
+  const bindings = object(converted.agentBindings, `${label} Agent bindings`);
+  return {
+    ...converted,
+    defaultAccess: "write",
+    agentBindings: Object.fromEntries(Object.entries(bindings).map(([agentId, binding]) => [
+      agentId,
+      convertLegacyReviewBinding(binding, `${label} Agent binding ${agentId}`)
+    ]))
+  };
+}
+
+function convertLegacyReviewBinding(value: unknown, label: string): JsonObject {
+  const binding = clone(object(value, label));
+  const adapterId = agentAdapterId(binding.adapterId, `${label} adapter id`);
+  const config = clone(object(binding.config, `${label} config`));
+  if (config.adapterId !== adapterId) {
+    throw new Error(`${label} config adapter does not match its binding.`);
+  }
+  if (config.advanced !== undefined) {
+    throw new Error(
+      `${label} has custom advanced arguments; clear them or configure the writable `
+      + "review target explicitly before conversion."
+    );
+  }
+  if (config.additionalDirectories !== undefined) {
+    const directories = array(
+      config.additionalDirectories,
+      `${label} additional directories`
+    );
+    if (directories.length > 0) {
+      throw new Error(
+        `${label} grants directories outside the managed Review workspace; `
+        + "clear them before conversion."
+      );
+    }
+    delete config.additionalDirectories;
+  }
+  if (adapterId === "claude") {
+    if (config.settingsFile !== undefined) {
+      throw new Error(
+        `${label} has a custom Claude settings file; clear it or configure the writable `
+        + "review target explicitly before conversion."
+      );
+    }
+    if (config.settingsSources !== undefined) {
+      const sources = array(config.settingsSources, `${label} Claude settings sources`);
+      if (sources.length > 0) {
+        throw new Error(
+          `${label} has custom Claude settings sources; clear them or configure the writable `
+          + "review target explicitly before conversion."
+        );
+      }
+      delete config.settingsSources;
+    }
+  }
+  delete config.permission;
+  return {
+    ...binding,
+    config: {
+      ...config,
+      yolo: true
+    }
+  };
+}
+
+function isLegacyBuiltinReviewerProfile(profile: JsonObject): boolean {
+  return profile.schemaVersion === 2
+    && profile.id === "reviewer"
+    && profile.revision === 1
+    && profile.defaultAccess === "read"
+    && profile.description === LEGACY_BUILTIN_REVIEWER_DESCRIPTION
+    && profile.instructions === LEGACY_BUILTIN_REVIEWER_INSTRUCTIONS
+    && !Object.hasOwn(profile, "skills")
+    && !Object.hasOwn(profile, "model")
+    && !Object.hasOwn(profile, "effort")
+    && typeof profile.createdAt === "string"
+    && profile.updatedAt === profile.createdAt;
 }
 
 function legacyRoleContext(role: JsonObject): EffectiveLaunchContext {
@@ -388,15 +582,20 @@ function agentAdapterId(value: unknown, label: string): AgentAdapterId {
   return result;
 }
 
-function convertTaskAggregate(conversion: TaskConversion): JsonObject {
+function convertTaskAggregate(
+  conversion: TaskConversion,
+  reviewBootstrap: ReviewBootstrapPlan | null
+): JsonObject {
   const source = conversion.source;
   const roles = Object.fromEntries(Object.entries(object(
     source.roles,
     `Source Task Roles ${conversion.taskId}`
-  )).map(([name, value]) => [name, convertLegacyRole(
-    value,
-    `Task Role ${conversion.taskId}/${name}`
-  )]));
+  )).map(([name, value]) => [
+    name,
+    name === reviewBootstrap?.roleName
+      ? convertLegacyReviewRole(value, `Task Role ${conversion.taskId}/${name}`)
+      : convertLegacyRole(value, `Task Role ${conversion.taskId}/${name}`)
+  ]));
   const workspaces = convertNamedMap(source.roleWorkspaces, (value) => (
     convertWorkspace(value, conversion)
   ));

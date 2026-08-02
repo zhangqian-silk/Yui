@@ -349,12 +349,13 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   assert.notEqual(reviewRun, null);
   runTaskCommand([
     "run", "yield", `${primaryTask.id}/${reviewRun.id}`,
-    "--summary", "Review passed with no material findings."
+    "--summary", JSON.stringify({
+      summary: "Review passed with no material findings.",
+      checks: [{ name: "identity E2E review", outcome: "passed" }]
+    })
   ], store, {
     ...postAnswerReviewer,
-    reviewResult: {
-      checks: [{ name: "identity E2E review", outcome: "passed" }]
-    }
+    reviewWorkspaceResult: {}
   });
   const review = store.listReviewRounds(primaryTask.id)[0];
   assert.equal(review.id, "review-round-1");

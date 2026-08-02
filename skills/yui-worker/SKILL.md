@@ -70,6 +70,26 @@ diagnostic evidence commit there. Never push, integrate, mutate Task records,
 touch the Candidate or Worker workspace, another Task/worktree, a stable
 checkout, or real YUI_HOME.
 
+For a review Run only, the heredoc body must be exactly one JSON result object
+on the same `--summary-file -` channel:
+
+```json
+{
+  "summary": "Human review outcome and findings",
+  "checks": [
+    {"name": "npm test", "outcome": "passed", "details": "exact result"}
+  ],
+  "evidenceCommit": "optional exact diagnostic commit SHA"
+}
+```
+
+Report at least one named check. Use `skipped` with details when a relevant
+check was not run, and omit `evidenceCommit` when no diagnostic commit exists.
+The CLI validates a reported commit against the managed Review workspace; it
+never derives one from uncommitted bytes. A dirty no-commit workspace may
+yield, but must remain preserved for Leader judgment and cannot be cleaned
+until it is clean.
+
 Invoke the exact `yui task run yield ... --summary-file -` command directly
 once; do not wrap it in `until`, `while`, `sh -c`, `cd ... &&`, or another
 compound shell command. If the direct command is denied, report the blocker and

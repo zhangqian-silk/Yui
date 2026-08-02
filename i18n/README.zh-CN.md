@@ -98,7 +98,11 @@ yui storage convert-task-identity \
 转换器会重映射全部 Task-owned 记录与引用，使用当前 runtime 验证新输出，
 生成 `identity-conversion.json`，并核对源文件字节未改变。悬空或歧义旧引用
 会令转换失败；转换器绝不原地修改源 home。切换 `YUI_HOME` 前，应检查报告
-和 fresh home 中的 Task context。完整边界见
+和 fresh home 中的 Task context。转换还会以 `config.review.roleName` 为唯一
+权威，定向升级同名 Global/Task reviewer Role 与精确匹配的旧内建 reviewer
+Profile，使新建的隔离 ReviewRound 可本地写入；自定义或无关 Role/Profile
+保持不变，无法无歧义转换的审查配置会在产生输出前失败。旧 Run/Session 的
+effective snapshot 保持只读且不可续用。完整边界见
 [Task 本地 ID 与离线转换](../docs/task-local-identity.md)。
 
 ## 快速开始
@@ -176,8 +180,10 @@ yui task project add <task-id> shared-sdk --base main
 相对目录布局，只为写入范围创建隔离 worktree，其他 Task Project 作为上下文
 从 Task main 暴露。Yui 会在受管派发和 `yui-worker` Skill 中明确列出可写与
 仅上下文 Project，由 Agent 严格遵守该边界。原生 Agent 权限作用于整个会话：
-实现 Role 使用可写会话，explorer 和 reviewer Role 使用原生只读会话（Codex
-`read-only`，或带最小 allow list 的 Claude `dontAsk`）。
+实现 Role 只有在 WorkItem 明确写入范围与 workspace owner 完全匹配时才使用
+可写会话；explorer 使用原生只读会话。reviewer 仅在独立 ReviewRound-owned
+workspace 的 owner、reviewRoundId 与全部条目精确匹配时获得配置上限内的可写
+能力，其他组合均 fail closed。
 
 写入范围只能扩大，不能缩小。Worker yield 并报告还需要另一个仓库后，
 Leader 使用完整的“旧范围 + 新范围”更新并重新派发：
@@ -257,7 +263,19 @@ ReviewRound 从冻结 Candidate SHA 创建独立的可写 worktree。Codex/Claud
 该 exact ReviewRound owner、reviewRoundId 与 workspace 全部匹配时获得配置上限
 内的正常 full capability；Skill 仍禁止 push、Integration、Task state、其他
 workspace 与真实 YUI_HOME 变更。两种 provider 都必须直接执行当前 Run 的 exact
-stdin yield；最终回复本身不是持久交付。
+stdin yield；最终回复本身不是持久交付。review yield 的 stdin 是唯一报告通道，
+必须是一个 JSON object，包含人类摘要与至少一项检查；只有实际提交诊断 commit
+时才提供 `evidenceCommit`：
+
+```sh
+yui task run yield <task-id>/<review-run-id> --summary-file - <<'YUI_SUMMARY'
+{"summary":"复现并验证完成","checks":[{"name":"npm test","outcome":"passed","details":"全部通过"}],"evidenceCommit":"<exact-sha>"}
+YUI_SUMMARY
+```
+
+Reviewer 可以修改文件并在不提交的情况下 yield；脏字节不会被推断为 evidence。
+该 Round 仍会精确终结且不产生 Candidate/ChangeSet，workspace 会为 Leader 判断而
+保留，cleanup 会在其重新变干净前拒绝删除。
 
 Worker 显式交付当前 Run：
 

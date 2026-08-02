@@ -161,6 +161,8 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
     /one bounded evidence pass[\s\S]*Do not repeat successful\s+checks[\s\S]*yield immediately/ui
   );
   assert.match(worker, /do not wrap it in `until`[\s\S]*duplicate or late\s+review yield is obsolete/u);
+  assert.match(worker, /review Run only[\s\S]*exactly one JSON result object[\s\S]*at least one named check/ui);
+  assert.match(worker, /dirty no-commit workspace may\s+yield[\s\S]*cannot be cleaned\s+until it is clean/ui);
   assert.match(
     worker,
     /managed Codex or\s+Claude Run[\s\S]*--summary-file -[\s\S]*final\s+response[\s\S]*does not deliver/u

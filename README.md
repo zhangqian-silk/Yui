@@ -71,6 +71,12 @@ desired revisions and immutable effective Run/Session launch snapshots. Legacy
 launch facts are provenance-marked and closed to read-only. The converter
 validates the fresh output with the current runtime, writes
 `identity-conversion.json`, and verifies that the source bytes did not change.
+When `config.review` is set, the report also records the deterministic reviewer
+bootstrap: only that configured Global Role and same-name existing Task Roles
+are made write-capable with normal Codex/Claude bypass settings, and only the
+exact old built-in `reviewer` Profile is upgraded. Unrelated or customized
+Roles/Profiles remain unchanged; a missing configured Global Role or unsafe
+external provider setting fails before any output remains.
 It rejects dangling or ambiguous legacy references and never modifies the
 source in place. There is no identity-only intermediate format or runtime dual
 read. Inspect the report and the fresh Task contexts before switching
@@ -269,6 +275,12 @@ only non-WorkItem write purpose: it receives write/bypass only when its Run,
 reviewRoundId, frozen base, and ReviewRound-owned workspace match exactly;
 every mismatch fails closed. Its diagnostic commit is visible history but is
 explicitly rejected by capture, ChangeSet, Integration, and acceptance paths.
+Review yield keeps the same exact `--summary-file -` command, but its stdin is
+one JSON object containing `summary`, a non-empty `checks` array of named
+`passed`/`failed`/`skipped` outcomes with optional details, and an optional
+reported `evidenceCommit` that must equal the managed Review branch HEAD. Dirty
+uncommitted diagnosis may yield without that field; the worktree is retained
+and cleanup refuses it until it is clean.
 
 Every Role desired launch change increments its revision and applies only to a
 future launch. Each AgentRun and native Role Session stores the complete actual

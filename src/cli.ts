@@ -711,7 +711,7 @@ export async function main(): Promise<void> {
       workspacePreparer,
       process.env
     );
-    const reviewResult = await reviewResultForTaskCommand(
+    const reviewWorkspaceResult = await reviewWorkspaceResultForTaskCommand(
       resolved,
       store,
       workspacePreparer,
@@ -726,7 +726,7 @@ export async function main(): Promise<void> {
         yuiHome: home,
         ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
         ...(candidateGitSnapshot === undefined ? {} : { candidateGitSnapshot }),
-        ...(reviewResult === undefined ? {} : { reviewResult }),
+        ...(reviewWorkspaceResult === undefined ? {} : { reviewWorkspaceResult }),
         ...(taskRetirementProof === undefined ? {} : { taskRetirementProof })
       }
     );
@@ -890,7 +890,7 @@ async function candidateSnapshotForTaskCommand(
   return undefined;
 }
 
-async function reviewResultForTaskCommand(
+async function reviewWorkspaceResultForTaskCommand(
   args: readonly string[],
   store: FileTaskStore,
   preparer: FileTaskWorkspacePreparer,
@@ -903,13 +903,7 @@ async function reviewResultForTaskCommand(
   if (run === null || run.purpose !== "review" || run.reviewRoundId === undefined) {
     return undefined;
   }
-  return {
-    checks: [],
-    ...await preparer.snapshotReviewRoundResult(
-      reference.taskId,
-      run.reviewRoundId
-    )
-  };
+  return preparer.snapshotReviewRoundResult(reference.taskId, run.reviewRoundId);
 }
 
 function reviewRoundFromCommandData(data: unknown): Readonly<{

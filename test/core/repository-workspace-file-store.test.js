@@ -1175,12 +1175,15 @@ test("a ReviewRound worktree starts at the frozen Candidate commit and cleans up
   const candidateCount = store.getWorkItem(task.id, item.id).candidates.length;
   runTaskCommand([
     "run", "yield", reviewRun.id,
-    "--summary", "Diagnostic evidence recorded."
+    "--summary", JSON.stringify({
+      summary: "Diagnostic evidence recorded.",
+      checks: [{ name: "fixture test", outcome: "passed" }],
+      evidenceCommit
+    })
   ], store, {
     now: () => new Date(NOW),
     environment: { YUI_TASK_ID: task.id },
-    reviewResult: {
-      checks: [{ name: "fixture test", outcome: "passed" }],
+    reviewWorkspaceResult: {
       evidenceCommit
     }
   });

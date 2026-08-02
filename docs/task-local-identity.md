@@ -74,7 +74,19 @@ the fresh directory. In the same direct cutover it creates versioned Role
 desired configuration and immutable effective AgentRun/RoleSession snapshots.
 Missing legacy permission facts are never guessed: legacy effective snapshots
 are marked `legacy-cutover`, forced read-only, and are not resumable. The output
-also records historical terminal ReviewRounds as `legacy-unavailable` when the
+uses `config.review` as the sole reviewer bootstrap authority. It upgrades only
+the configured Global Role and existing same-name Task Roles to normal isolated
+Review write/bypass capability, removes their obsolete forced-read provider
+settings, and upgrades only an exact old built-in `reviewer` Profile. Custom or
+unrelated Roles and Profiles are preserved. A missing configured Global Role,
+external additional directory, custom advanced argument, or Claude settings
+source is ambiguous for isolation and fails before an output is retained. The
+conversion report records the target Role, affected Task Roles, and built-in
+Profile disposition. Existing Run and Session effective snapshots remain
+`legacy-cutover`, read-only, immutable, and non-resumable.
+
+The output also records historical terminal ReviewRounds as
+`legacy-unavailable` when the
 old format did not persist a frozen Candidate commit. An active legacy review
 cannot be reconstructed safely and makes conversion fail closed. New reviews
 always carry a frozen commit and ReviewRound-owned workspace. The output is

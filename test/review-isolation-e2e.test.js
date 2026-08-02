@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -238,27 +238,41 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
   assert.equal(readFileSync(join(workerEntry.path, "candidate.txt"), "utf8"), candidateBytes);
 
   now = new Date(START.getTime() + 2_000);
-  runTaskCommand([
-    "run", "yield", reviewRun.id,
-    "--summary", "Diagnostic reproduction committed; Candidate remains immutable."
-  ], store, {
-    now: () => now,
-    runtime,
-    environment: { YUI_TASK_ID: task.id },
-    reviewResult: {
-      checks: [
-        { name: "npm run build", outcome: "passed" },
-        { name: "npm test", outcome: "passed" }
-      ],
-      evidenceCommit
-    }
+  const committedYield = yieldReviewThroughCli(home, task.id, reviewRun.id, {
+    summary: "Diagnostic reproduction committed; Candidate remains immutable.",
+    checks: [
+      {
+        name: "npm run build",
+        outcome: "passed",
+        details: "node --check src.js completed"
+      },
+      {
+        name: "npm test",
+        outcome: "passed",
+        details: "base and reproduction tests passed"
+      }
+    ],
+    evidenceCommit
   });
+  assert.equal(committedYield.status, 0, committedYield.stderr || committedYield.error?.message);
   const completedRound = store.getReviewRound(task.id, pendingRound.id);
   assert.equal(completedRound.status, "completed");
+  assert.equal(
+    store.getAgentRun(task.id, reviewRun.id).summary,
+    "Diagnostic reproduction committed; Candidate remains immutable."
+  );
   assert.equal(completedRound.evidenceCommit, evidenceCommit);
   assert.deepEqual(completedRound.checks, [
-    { name: "npm run build", outcome: "passed" },
-    { name: "npm test", outcome: "passed" }
+    {
+      name: "npm run build",
+      outcome: "passed",
+      details: "node --check src.js completed"
+    },
+    {
+      name: "npm test",
+      outcome: "passed",
+      details: "base and reproduction tests passed"
+    }
   ]);
   assert.equal(store.getWorkItem(task.id, item.id).candidates.length, candidateCount);
   assert.deepEqual(store.listChangeSets(task.id), []);
@@ -343,6 +357,108 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
   assert.notEqual(continuedCommit, evidenceCommit);
   assert.equal(store.getWorkItem(task.id, item.id).candidates[0].gitSnapshot.reviewBaseCommit, candidateCommit);
 
+  const continuedTree = git(workerEntry.path, "rev-parse", "HEAD^{tree}");
+  const continuedStatus = git(workerEntry.path, "status", "--porcelain=v1");
+  const continuedBytes = readFileSync(join(workerEntry.path, "worker-follow-up.txt"), "utf8");
+  markDelivered(store, resumedWorker, now);
+  const continuedSnapshot = await preparer.snapshotCandidateWorkspace(workerWorkspace);
+  runTaskCommand([
+    "run", "yield", resumedWorker.id,
+    "--summary", "Original Worker follow-up is ready."
+  ], store, {
+    now: () => now,
+    runtime,
+    environment: { YUI_TASK_ID: task.id },
+    candidateGitSnapshot: continuedSnapshot
+  });
+  const secondCandidateCount = store.getWorkItem(task.id, item.id).candidates.length;
+  assert.equal(secondCandidateCount, candidateCount + 1);
+  const secondRound = store.listReviewRounds(task.id).at(-1);
+  assert.notEqual(secondRound.id, pendingRound.id);
+  assert.equal(secondRound.status, "pending");
+  assert.equal(secondRound.reviewBaseCommit, continuedCommit);
+  const dirtyReviewWorkspace = await preparer.prepareReviewRoundWorkspace(
+    task.id,
+    secondRound.id
+  );
+  const dirtyReviewEntry = dirtyReviewWorkspace.entries[0];
+  const dirtyReviewRun = dispatchPreparedReviewRound(task.id, secondRound.id, store, {
+    now: () => now,
+    runtime,
+    environment: { YUI_TASK_ID: task.id }
+  });
+  assert.equal(dirtyReviewRun.reviewRoundId, secondRound.id);
+  markDelivered(store, dirtyReviewRun, now);
+
+  writeFileSync(
+    join(dirtyReviewEntry.path, "test", "dirty-no-commit.test.js"),
+    [
+      'import assert from "node:assert/strict";',
+      'import test from "node:test";',
+      'import { add } from "../src.js";',
+      'test("dirty review diagnosis", () => assert.equal(add(4, 5), 9));',
+      ""
+    ].join("\n")
+  );
+  execFileSync("npm", ["run", "build"], { cwd: dirtyReviewEntry.path, stdio: "pipe" });
+  execFileSync("npm", ["test"], { cwd: dirtyReviewEntry.path, stdio: "pipe" });
+  assert.notEqual(git(dirtyReviewEntry.path, "status", "--porcelain=v1"), "");
+
+  const dirtyYield = yieldReviewThroughCli(home, task.id, dirtyReviewRun.id, {
+    summary: "Uncommitted diagnosis reproduced the behavior; preserve for Leader judgment.",
+    checks: [
+      {
+        name: "npm run build",
+        outcome: "passed",
+        details: "review source parsed successfully"
+      },
+      {
+        name: "npm test",
+        outcome: "passed",
+        details: "dirty reproduction and base tests passed"
+      }
+    ]
+  });
+  assert.equal(dirtyYield.status, 0, dirtyYield.stderr || dirtyYield.error?.message);
+  const dirtyCompletedRound = store.getReviewRound(task.id, secondRound.id);
+  assert.equal(dirtyCompletedRound.status, "completed");
+  assert.equal(dirtyCompletedRound.evidenceCommit, undefined);
+  assert.equal(dirtyCompletedRound.checks.length, 2);
+  assert.equal(store.getWorkItem(task.id, item.id).candidates.length, secondCandidateCount);
+  assert.equal(git(workerEntry.path, "rev-parse", "HEAD"), continuedCommit);
+  assert.equal(git(workerEntry.path, "rev-parse", "HEAD^{tree}"), continuedTree);
+  assert.equal(git(workerEntry.path, "status", "--porcelain=v1"), continuedStatus);
+  assert.equal(readFileSync(join(workerEntry.path, "worker-follow-up.txt"), "utf8"), continuedBytes);
+
+  const preserve = reviewWorkspaceCommand(home, task.id, "preserve", secondRound.id);
+  assert.equal(preserve.status, 0, preserve.stderr || preserve.error?.message);
+  assert.equal(
+    store.getReviewRound(task.id, secondRound.id).workspaceDisposition.kind,
+    "preserved"
+  );
+  const dirtyCleanup = reviewWorkspaceCommand(home, task.id, "cleanup", secondRound.id);
+  assert.notEqual(dirtyCleanup.status, 0);
+  assert.match(dirtyCleanup.stderr, /dirty and was retained/i);
+  assert.equal(existsSync(dirtyReviewEntry.path), true);
+  assert.equal(
+    store.getReviewRound(task.id, secondRound.id).workspaceDisposition.kind,
+    "preserved"
+  );
+
+  git(dirtyReviewEntry.path, "add", "test/dirty-no-commit.test.js");
+  git(dirtyReviewEntry.path, "commit", "-qm", "preserved post-yield diagnosis");
+  assert.equal(git(dirtyReviewEntry.path, "status", "--porcelain=v1"), "");
+  const cleanCleanup = reviewWorkspaceCommand(home, task.id, "cleanup", secondRound.id);
+  assert.equal(cleanCleanup.status, 0, cleanCleanup.stderr || cleanCleanup.error?.message);
+  assert.equal(existsSync(dirtyReviewEntry.path), false);
+  assert.equal(existsSync(workerEntry.path), true);
+  assert.equal(git(workerEntry.path, "rev-parse", "HEAD"), continuedCommit);
+  assert.equal(store.getReviewRound(task.id, secondRound.id).evidenceCommit, undefined);
+  assert.equal(
+    store.getReviewRound(task.id, secondRound.id).workspaceDisposition.kind,
+    "removed"
+  );
+
   const report = {
     schemaVersion: 1,
     yuiHome: home,
@@ -350,11 +466,13 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
     taskId: task.id,
     workItemId: item.id,
     reviewRoundId: pendingRound.id,
+    dirtyReviewRoundId: secondRound.id,
     candidateCommit,
     reviewBaseCommit: completedRound.reviewBaseCommit,
     evidenceCommit,
     continuedWorkerCommit: continuedCommit,
     candidateCountAfterReview: candidateCount,
+    candidateCountAfterDirtyReview: secondCandidateCount,
     reviewWorkspace: {
       root: reviewWorkspace.root,
       branch: reviewEntry.branch,
@@ -369,7 +487,15 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
       yolo: reviewRun.effective.yolo,
       permission: reviewRun.effective.permission
     },
-    checks: ["npm run build", "npm test"],
+    checks: completedRound.checks,
+    dirtyNoCommit: {
+      evidenceCommit: dirtyCompletedRound.evidenceCommit ?? null,
+      checks: dirtyCompletedRound.checks,
+      preserveStatus: preserve.status,
+      dirtyCleanupStatus: dirtyCleanup.status,
+      cleanCleanupStatus: cleanCleanup.status,
+      disposition: store.getReviewRound(task.id, secondRound.id).workspaceDisposition.kind
+    },
     guards: ["capture", "candidate", "change-set", "integration", "accept"],
     workerWorkspacePreserved: existsSync(workerEntry.path)
   };
@@ -428,6 +554,59 @@ function noOpRuntime() {
     reconcileTask() {},
     prepareTaskRoleEnter() {}
   };
+}
+
+function yieldReviewThroughCli(home, taskId, runId, result) {
+  return yieldRunThroughCli(
+    home,
+    taskId,
+    "reviewer",
+    runId,
+    `${JSON.stringify(result, null, 2)}\n`
+  );
+}
+
+function yieldRunThroughCli(home, taskId, roleName, runId, summary) {
+  return spawnSync(
+    process.execPath,
+    [
+      join(process.cwd(), "dist", "cli.js"),
+      "task", "run", "yield", runId, "--summary-file", "-"
+    ],
+    {
+      encoding: "utf8",
+      input: summary,
+      env: {
+        ...process.env,
+        YUI_HOME: home,
+        YUI_SESSION_SCOPE: "task",
+        YUI_TASK_ID: taskId,
+        YUI_ROLE: roleName
+      },
+      timeout: 10_000
+    }
+  );
+}
+
+function reviewWorkspaceCommand(home, taskId, command, reviewRoundId) {
+  return spawnSync(
+    process.execPath,
+    [
+      join(process.cwd(), "dist", "cli.js"),
+      "task", "work", "review", command, `${taskId}/${reviewRoundId}`
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        YUI_HOME: home,
+        YUI_SESSION_SCOPE: "task",
+        YUI_TASK_ID: taskId,
+        YUI_ROLE: "leader"
+      },
+      timeout: 10_000
+    }
+  );
 }
 
 function markDelivered(store, run, now) {

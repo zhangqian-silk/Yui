@@ -457,15 +457,13 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     assertReviewRoundOwnsWorkspace(round.id, round.workspace);
     const changed: string[] = [];
     for (const entry of round.workspace.entries) {
-      if (!await this.git.isClean(entry.path)) {
-        throw new Error(
-          `Review Project workspace must be clean before yield: ${round.id}/${entry.projectId}.`
-        );
-      }
       if (await this.git.headRef(entry.path) !== entry.branch) {
         throw new Error(`Review Project workspace left its managed branch: ${round.id}/${entry.projectId}.`);
       }
       const head = (await this.git.inspect(entry.path, "HEAD")).baseCommit;
+      // Dirty bytes are intentionally not evidenceCommit provenance. Only a
+      // committed HEAD that differs from the frozen entry base can be
+      // reported; cleanup separately refuses to remove dirty worktrees.
       if (head !== entry.baseCommit) changed.push(head);
     }
     if (changed.length > 1) {

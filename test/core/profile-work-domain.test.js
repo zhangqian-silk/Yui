@@ -37,6 +37,8 @@ test("the built-in reviewer delegates evidence-backed judgment without engineeri
   assert.match(reviewer.instructions, /speculative or extreme edge cases/i);
   assert.match(reviewer.instructions, /ReviewRound-owned workspace/i);
   assert.match(reviewer.instructions, /Never push, integrate, mutate Task state/i);
+  assert.match(reviewer.instructions, /one JSON object.*exact summary-file stdin channel/i);
+  assert.match(reviewer.instructions, /at least one named passed\/failed\/skipped check/i);
   assert.match(reviewer.instructions, /Leader, who decides/i);
   assert.equal(reviewer.defaultAccess, "write");
 });

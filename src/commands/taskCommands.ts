@@ -62,6 +62,7 @@ import {
 import {
   createReviewRound,
   finishReviewRound,
+  parseReviewYieldReport,
   recordReviewWorkspaceDisposition,
   startReviewRound,
   type ReviewRound
@@ -176,12 +177,7 @@ export type TaskCommandOptions = Readonly<{
   yuiHome?: string;
   workItemIntegrationProof?: WorkItemIntegrationProof;
   candidateGitSnapshot?: CandidateGitSnapshot;
-  reviewResult?: Readonly<{
-    checks?: readonly Readonly<{
-      name: string;
-      outcome: "passed" | "failed" | "skipped";
-      details?: string;
-    }>[];
+  reviewWorkspaceResult?: Readonly<{
     evidenceCommit?: string;
   }>;
   taskRetirementProof?: TaskRetirementProof;
@@ -2450,7 +2446,7 @@ function yieldRun(
   const usage = "Task run yield usage: yui task run yield <task>/<run> (--summary <text>|--summary-file <path|->).";
   const parsed = parseTail(args, new Set(["--summary", "--summary-file"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
-  const summary = readCommandText(
+  const inputSummary = readCommandText(
     parsed.options.get("--summary"),
     parsed.options.get("--summary-file"),
     "--summary",
@@ -2470,6 +2466,23 @@ function yieldRun(
     const role = requireRole(tx, task.id, active.roleName);
     const pointer = tx.getActiveAgentRun(task.id, role.name);
     if (pointer?.id !== active.id) throw usageError(`Run is not active for ${task.id}/${role.name}: ${active.id}.`);
+    let reviewReport;
+    if (active.purpose === "review") {
+      if (options.reviewWorkspaceResult === undefined) {
+        throw usageError(`Review Run requires managed workspace preflight: ${active.id}.`);
+      }
+      try {
+        reviewReport = parseReviewYieldReport(inputSummary);
+      } catch (error) {
+        throw usageError(error instanceof Error ? error.message : String(error));
+      }
+      if (reviewReport.evidenceCommit !== options.reviewWorkspaceResult.evidenceCommit) {
+        throw usageError(
+          `Reported Review evidence commit does not match the managed workspace: ${active.id}.`
+        );
+      }
+    }
+    const summary = reviewReport?.summary ?? inputSummary;
     const terminalization = terminalizeExactTaskRun(tx, {
       taskId: task.id,
       roleName: role.name,
@@ -2477,9 +2490,16 @@ function yieldRun(
       runId: active.id,
       receiptId: formatAgentRunReceiptId(task.id, active.id),
       outcome: { status: "yielded", summary },
-      ...(active.purpose === "review" && options.reviewResult !== undefined
-        ? { reviewResult: options.reviewResult }
-        : {})
+      ...(reviewReport === undefined
+        ? {}
+        : {
+            reviewResult: {
+              checks: reviewReport.checks,
+              ...(options.reviewWorkspaceResult?.evidenceCommit === undefined
+                ? {}
+                : { evidenceCommit: options.reviewWorkspaceResult.evidenceCommit })
+            }
+          })
     }, now);
     if (terminalization.disposition !== "applied" || terminalization.run === null) {
       throw usageError(
@@ -2719,7 +2739,8 @@ export function dispatchPreparedReviewRound(
       "Start from the user's core outcome and the WorkItem intent. The candidate summary is a pointer, not proof: inspect the complete relevant change, callers, and proportionate checks.",
       "You may freely edit source/tests, run local build or test commands, and optionally commit diagnostic evidence only inside this ReviewRound-owned workspace.",
       "Do not push, integrate, mutate Task state, touch the Candidate or Worker workspace, another Task/workspace, a stable checkout, or real YUI_HOME.",
-      "Report reviewBaseCommit, optional evidenceCommit, exact checks/results, material findings, and uncertainty. Review yield completes only this Round and creates no Candidate or ChangeSet.",
+      "The exact --summary-file - body for Review yield must be one JSON object: {\"summary\":\"...\",\"checks\":[{\"name\":\"...\",\"outcome\":\"passed|failed|skipped\",\"details\":\"...\"}],\"evidenceCommit\":\"optional exact SHA\"}. Report at least one check; use skipped with details when a check was not run. Omit evidenceCommit when you made no diagnostic commit.",
+      "Report reviewBaseCommit, exact checks/results, material findings, and uncertainty. Review yield completes only this Round and creates no Candidate or ChangeSet.",
       "The Leader alone interprets and routes evidence to the original Worker; never merge review evidence yourself."
     ].join("\n");
     const runId = tx.nextAgentRunId(taskId);

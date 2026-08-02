@@ -106,7 +106,7 @@ function run(args, store, options) {
     const roles = reviewCandidateRoles(args, store, taskId);
     if (roles.length > 0) ensureSyntheticReviewCandidateWorkspace(store, taskId, roles);
   }
-  const commandOptions = taskId === undefined
+  const snapshotOptions = taskId === undefined
     ? options
     : withSyntheticCandidateSnapshot(args, store, taskId, options);
   const activeBefore = taskId === undefined
@@ -114,6 +114,9 @@ function run(args, store, options) {
     : args[0] === "run" && args[1] === "yield"
       ? store.getAgentRun(taskId, args[2]?.split("/").at(-1))
       : null;
+  const commandOptions = activeBefore?.purpose === "review"
+    ? { ...snapshotOptions, reviewWorkspaceResult: {} }
+    : snapshotOptions;
   const result = runTaskCommand(args, store, commandOptions);
   assert.equal(result.kind, "output");
   if (taskId !== undefined) {
@@ -913,6 +916,8 @@ test("always review creates a ReviewRound under the same WorkItem and never revi
   assert.match(reviewRun.input, /candidate summary is a pointer, not proof/i);
   assert.match(reviewRun.input, /Review yield completes only this Round and creates no Candidate or ChangeSet/);
   assert.match(reviewRun.input, /The Leader alone interprets and routes evidence/);
+  assert.match(reviewRun.input, /must be one JSON object/);
+  assert.match(reviewRun.input, /at least one check/);
 
   const leaderOptions = {
     ...options,
@@ -932,14 +937,21 @@ test("always review creates a ReviewRound under the same WorkItem and never revi
   );
 
   markDelivered(store, reviewRun);
-  run(["run", "yield", reviewRun.id, "--summary", "One issue to consider."], store, options);
+  run(["run", "yield", reviewRun.id, "--summary", JSON.stringify({
+    summary: "One issue to consider.",
+    checks: [{ name: "inspection", outcome: "passed", details: "Reviewed candidate evidence." }]
+  })], store, options);
   assert.equal(store.listReviewRounds(task.id).length, 1);
   assert.equal(store.listWorkItems(task.id).length, 1);
   const completedRound = store.getReviewRound(task.id, rounds[0].id);
   assert.equal(completedRound.reviewerRunId, reviewRun.id);
   assert.equal(completedRound.status, "completed");
   assert.equal(completedRound.summary, "One issue to consider.");
-  assert.deepEqual(completedRound.checks, []);
+  assert.deepEqual(completedRound.checks, [{
+    name: "inspection",
+    outcome: "passed",
+    details: "Reviewed candidate evidence."
+  }]);
   assert.equal(completedRound.reviewBaseCommit, REVIEW_BASE_COMMIT);
   assert.equal(completedRound.reviewBaseProvenance, "frozen-candidate");
   assert.equal(completedRound.workspace.owner.type, "review-round");
@@ -987,7 +999,10 @@ test("global review policy is snapshotted by each candidate, not by Task creatio
   store.saveConfig(configWithoutReview);
   const firstReview = store.getActiveAgentRun(task.id, "reviewer");
   markDelivered(store, firstReview);
-  run(["run", "yield", firstReview.id, "--summary", "reviewed first candidate"], store, options);
+  run(["run", "yield", firstReview.id, "--summary", JSON.stringify({
+    summary: "reviewed first candidate",
+    checks: [{ name: "inspection", outcome: "passed" }]
+  })], store, options);
   const leaderOptions = {
     ...options,
     environment: {
@@ -1275,7 +1290,10 @@ test("the latest ReviewRound stays authoritative when timestamps tie", (t) => {
     run(["work", "review", item.id], store, leaderOptions);
     const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
     markDelivered(store, reviewRun);
-    run(["run", "yield", reviewRun.id, "--summary", `review ${round}`], store, options);
+    run(["run", "yield", reviewRun.id, "--summary", JSON.stringify({
+      summary: `review ${round}`,
+      checks: [{ name: "inspection", outcome: "passed" }]
+    })], store, options);
   }
   run(["work", "review", item.id], store, leaderOptions);
 
