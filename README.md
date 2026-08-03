@@ -490,7 +490,15 @@ terminal detaches only that tmux client; the Agent process and conversation
 continue running in tmux. The Web surface does not duplicate transcripts or
 maintain another session state.
 
-The control room supports English and Simplified Chinese, selecting an initial locale from the browser and remembering manual changes. The theme selector switches between the dark Control Room and light Paper Ledger themes. Both choices are stored only in browser `localStorage`; they do not modify `YUI_HOME`.
+The dashboard opens on an overview cockpit: four operational metrics (active
+tasks, open inputs waiting on you, completed tasks, and the total), a
+cross-task attention inbox that surfaces every open InputRequest with its
+question and urgency so you can answer without drilling in, and the list of
+currently active tasks. Selecting a task opens an anchored detail view
+(Summary, Focus, Work items, Runs, Roles, History, Messages) with a sticky
+tab bar that tracks the visible section.
+
+The control room supports English and Simplified Chinese, selecting an initial locale from the browser and remembering manual changes. The theme selector switches between the dark Control Room, the light Paper Ledger, and the dark-blue Atlas themes. Both choices are stored only in browser `localStorage`; they do not modify `YUI_HOME`.
 
 ## Management commands
 
