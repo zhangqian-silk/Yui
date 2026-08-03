@@ -253,7 +253,7 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .detail-meta-item{display:grid;gap:3px;min-width:0}
 .detail-meta-item small{color:var(--muted);font-family:var(--font-mono);font-size:8.5px;text-transform:uppercase;letter-spacing:.1em}
 .detail-meta-item>span{color:var(--text);font-size:12.5px}
-.detail-meta-item>.meta-path{font-family:var(--font-mono);font-size:11px;color:var(--muted);word-break:break-all}
+.detail-meta-item>.meta-path{font-family:var(--font-mono);font-size:11px;color:var(--muted);max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
 .detail-meta-item>.pill{align-self:end}
 /* Pills + dots */
 .pill{display:inline-flex;align-items:center;font-family:var(--font-mono);font-size:9px;text-transform:uppercase;letter-spacing:.07em;padding:3px 10px;border-radius:var(--radius-pill);white-space:nowrap;color:var(--accent);background:var(--accent-soft);border:1px solid var(--accent-line)}
