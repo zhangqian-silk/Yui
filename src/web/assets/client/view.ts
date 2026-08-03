@@ -594,7 +594,7 @@ function workItemCard(item, titles, t, locale, actions, _taskId) {
   card.append(head);
 
   const meta = node("div", "record-meta");
-  if (item.assignee) meta.append(node("span", "", t("detail.assignee") + " · " + item.assignee));
+  if (item.assignee) meta.append(node("span", "", item.assignee));
   meta.append(node("span", "mono", item.id));
   meta.append(node("time", "", formatDateTime(item.updatedAt, locale)));
   card.append(meta);
@@ -640,7 +640,7 @@ function runCard(run, t, locale) {
 
   const foot = node("div", "execute-foot");
   const tags = node("div", "execute-tags");
-  tags.append(node("span", "", t("mode." + run.mode)));
+  tags.append(chip(t("mode." + run.mode)));
   const badge = run.agentId ? agentBadge(run) : null;
   if (badge) tags.append(badge);
   foot.append(tags);

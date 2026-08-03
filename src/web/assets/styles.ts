@@ -351,7 +351,6 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .criteria-list li{position:relative;padding-left:16px;font-family:var(--font-body);font-size:12.5px;line-height:1.55;color:var(--muted)}
 .criteria-list li:before{content:"";position:absolute;left:3px;top:7px;width:5px;height:5px;border-radius:50%;background:var(--accent-line)}
 /* Operator CTA card (sidebar bottom) */
-.operator-open{display:grid;grid-template-columns:auto auto 1fr auto;gap:2px 10px;align-items:center;width:100%;text-align:left;padding:8px 11px;background:linear-gradient(150deg,var(--bg-3),var(--bg-2));border:1px solid var(--border-strong);border-radius:var(--radius);box-shadow:var(--shadow-card);transition:border-color var(--motion-fast),box-shadow var(--motion-fast)}
 .operator-open{display:flex;align-items:center;gap:10px;width:100%;text-align:left;padding:7px 11px;background:linear-gradient(150deg,var(--bg-3),var(--bg-2));border:1px solid var(--border-strong);border-radius:var(--radius);box-shadow:var(--shadow-card);transition:border-color var(--motion-fast),box-shadow var(--motion-fast)}
 .operator-open:hover{border-color:var(--accent-line);box-shadow:0 0 0 4px var(--accent-soft)}
 .operator-title{font-family:var(--font-body);font-weight:700;font-size:13px;color:var(--text);letter-spacing:-.005em;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
