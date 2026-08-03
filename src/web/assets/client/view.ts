@@ -635,7 +635,6 @@ function runCard(run, t, locale) {
   const foot = node("div", "execute-foot");
   const tags = node("div", "execute-tags");
   tags.append(node("span", "", t("mode." + run.mode)));
-  tags.append(node("span", "", t(run.deliveredAt ? "delivery.delivered" : "delivery.pending")));
   const badge = run.agentId ? agentBadge(run) : null;
   if (badge) tags.append(badge);
   foot.append(tags);
@@ -655,7 +654,7 @@ function roleCard(role, task, t, locale, actions) {
 
   const actionsRow = node("div", "record-actions");
   const left = node("div", "record-meta");
-  left.append(node("span", "", t("detail.agent") + " · " + role.activeAgentId));
+  left.append(node("span", "mono", role.activeAgentId));
   const activeBinding = role.agentBindings && role.agentBindings[role.activeAgentId];
   if (activeBinding) {
     const badge = agentBadge({
