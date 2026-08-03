@@ -53,7 +53,6 @@ export const DASHBOARD_HTML = `<!doctype html>
           </label>
         </div>
         <button id="operator-terminal" class="operator-open" type="button">
-          <span class="operator-key" data-i18n="actions.opKey">Press O to open</span>
           <span class="operator-title" data-i18n="actions.operator">Operator session</span>
           <span class="operator-shortcuts" aria-hidden="true"><kbd>O</kbd><kbd>↵</kbd></span>
         </button>

@@ -529,7 +529,7 @@ test("redesigned web shell exposes importance-ordered nav and a registered theme
     }
     // Sidebar treats the Operator as a durable, first-class entry.
     assert.match(shell, /class="operator-open"/);
-    assert.match(shell, /data-i18n="actions\.opKey"/);
+    assert.match(shell, /data-i18n="actions\.operator"/);
     // Search widened to project / tags / IDs.
     assert.match(shell, /data-i18n-placeholder="search\.placeholder"/);
 
