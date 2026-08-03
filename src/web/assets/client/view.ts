@@ -220,28 +220,6 @@ function taskMatchesQuery(task, query, locale) {
   return hay.includes(query);
 }
 
-function progressTrack(counts) {
-  const total = Math.max(1, counts.total || 0);
-  const segments = [
-    ["completed", counts.completed],
-    ["running", counts.running],
-    ["pending", counts.pending],
-    ["failed", counts.failed]
-  ];
-  const track = node("div", "progress");
-  const bar = node("span", "progress-track");
-  segments.forEach(function (entry) {
-    if (entry[1] <= 0) return;
-    const seg = node("span", "progress-seg " + entry[0]);
-    seg.style.flexGrow = String(entry[1]);
-    seg.style.width = Math.round((entry[1] / total) * 100) + "%";
-    bar.append(seg);
-  });
-  track.append(bar, node("span", "progress-count",
-    (counts.completed || 0) + "/" + (counts.total || 0)));
-  return track;
-}
-
 export function renderTasks(container, state, t, locale, onSelect) {
   clear(container);
   const query = state.query.trim().toLocaleLowerCase(locale);
@@ -289,27 +267,18 @@ function taskCard(task, hasAttention, state, t, locale, onSelect) {
 
   const main = node("span", "task-main");
   main.append(node("strong", "task-title", task.title));
-  const meta = node("span", "task-meta");
-  meta.append(node("span", "", translatedStatus(t, "status", task.status)));
-  meta.append(node("span", "", relativeTime(task.updatedAt, locale, t)));
-  (task.tags || []).slice(0, 3).forEach(function (tag) {
-    meta.append(node("span", "tag", "#" + tag));
-  });
-  if (task.projectNames && task.projectNames.length) {
-    meta.append(node("span", "", task.projectNames.join(" · ")));
-  }
-  main.append(meta);
+  main.append(node("span", "task-meta", relativeTime(task.updatedAt, locale, t)));
   button.append(main);
 
-  const badges = node("span", "task-badges");
-  if (hasAttention) badges.append(node("span", "badge-attention", String(task.openInputCount || 1)));
-  if (task.workItems && task.workItems.running > 0) {
-    badges.append(node("span", "badge-running", String(task.workItems.running)));
-  }
-  button.append(badges);
-
-  if (task.workItems && task.workItems.total > 0) {
-    button.append(progressTrack(task.workItems));
+  // One signal only: an open input (needs the user) outranks a running count.
+  if (hasAttention) {
+    const badge = node("span", "task-signal is-input", String(task.openInputCount || 1));
+    badge.title = t("stats.inputs");
+    button.append(badge);
+  } else if (task.workItems && task.workItems.running > 0) {
+    const badge = node("span", "task-signal is-running", String(task.workItems.running));
+    badge.title = t("stats.running");
+    button.append(badge);
   }
 
   button.addEventListener("click", function () { onSelect(task.id); });
@@ -327,13 +296,6 @@ export function renderOverview(detail, state, t, locale, onSelect) {
   clear(detail);
   const wrap = node("div", "overview");
   const counts = state.counts;
-
-  const intro = node("div", "overview-intro");
-  intro.append(
-    node("h2", "", t("page.title")),
-    node("p", "", t("page.lede"))
-  );
-  wrap.append(intro);
 
   const total = counts ? counts.total : 0;
   const rail = node("div", "command-rail");
@@ -365,46 +327,19 @@ export function renderOverview(detail, state, t, locale, onSelect) {
   }
   wrap.append(inbox);
 
-  const panels = node("div", "panel-grid");
-  if (counts && counts.total > 0) {
-    const panel = node("div", "panel");
-    panel.append(node("h4", "", t("overview.distribution")));
-    panel.append(distributionBar(counts, t));
-    panel.append(distributionLegend(counts, t));
-    panels.append(panel);
-  }
+  // Active work is the one list worth surfacing next to the inbox; status
+  // counts already live in the metric rail, so no distribution panel here.
   const activeTasks = (state.tasks || []).filter(function (task) { return task.status === "active"; });
-  const activePanel = node("div", "panel");
-  activePanel.append(node("h4", "", t("overview.activeNow") + " · " + activeTasks.length));
-  const activeBody = node("div", "overview-list");
-  if (!activeTasks.length) {
-    activeBody.append(node("div", "row", t("overview.activeEmpty")));
-  } else {
-    activeTasks.slice(0, 5).forEach(function (task) {
-      activeBody.append(overviewRow(task, String(task.workItems.running), t, locale, onSelect, false, true));
+  if (activeTasks.length) {
+    const activeBlock = node("section", "overview-block");
+    activeBlock.append(sectionHead(t("overview.activeNow"), { count: activeTasks.length }));
+    const activeBody = node("div", "overview-list");
+    activeTasks.forEach(function (task) {
+      activeBody.append(overviewRow(task, t, locale, onSelect));
     });
+    activeBlock.append(activeBody);
+    wrap.append(activeBlock);
   }
-  activePanel.append(activeBody);
-  panels.append(activePanel);
-
-  const doneTasks = (state.tasks || [])
-    .filter(function (task) { return task.status === "completed"; })
-    .slice()
-    .sort(function (a, b) {
-      return Date.parse(b.completedAt || b.updatedAt) - Date.parse(a.completedAt || a.updatedAt);
-    })
-    .slice(0, 3);
-  if (doneTasks.length) {
-    const donePanel = node("div", "panel");
-    donePanel.append(node("h4", "", t("overview.completedRecently") + " · " + doneTasks.length));
-    const doneBody = node("div", "overview-list");
-    doneTasks.forEach(function (task) {
-      doneBody.append(overviewRow(task, "", t, locale, onSelect, false, false));
-    });
-    donePanel.append(doneBody);
-    panels.append(donePanel);
-  }
-  wrap.append(panels);
   detail.append(wrap);
 }
 
@@ -439,52 +374,17 @@ function attentionRow(item, t, locale, onSelect) {
   return row;
 }
 
-function overviewRow(task, badgeText, t, locale, onSelect, muted, showInputs) {
-  const row = node("button", "overview-row" + (task.openInputCount > 0 ? " has-inputs" : ""));
+function overviewRow(task, t, locale, onSelect) {
+  const hasInputs = task.openInputCount > 0;
+  const row = node("button", "overview-row" + (hasInputs ? " has-inputs" : ""));
   row.type = "button";
   row.append(statusDot(task.status));
   const main = node("span", "overview-row-title", task.title);
   main.title = task.title;
   row.append(main);
-  let stat = badgeText;
-  if (showInputs && task.openInputCount > 0) stat = String(task.openInputCount);
-  if (stat) row.append(node("span", "overview-row-stat", stat));
+  row.append(node("span", "overview-row-time", relativeTime(task.updatedAt, locale, t)));
   row.addEventListener("click", function () { onSelect(task.id); });
   return row;
-}
-
-function distributionBar(counts, t) {
-  const bar = node("div", "dist-bar");
-  const segments = [
-    ["active", counts.active],
-    ["draft", counts.draft],
-    ["completed", counts.completed],
-    ["archived", counts.archived]
-  ];
-  segments.forEach(function (entry) {
-    if (entry[1] <= 0) return;
-    const seg = node("span", "dist-seg " + entry[0]);
-    seg.style.flexGrow = String(entry[1]);
-    seg.title = translatedStatus(t, "status", entry[0]) + " · " + entry[1];
-    bar.append(seg);
-  });
-  return bar;
-}
-
-function distributionLegend(counts, t) {
-  const legend = node("div", "dist-legend");
-  const segments = [
-    ["active", counts.active],
-    ["draft", counts.draft],
-    ["completed", counts.completed],
-    ["archived", counts.archived]
-  ];
-  segments.forEach(function (entry) {
-    const item = node("span", "legend-item");
-    item.append(statusDot(entry[0]), node("span", "", translatedStatus(t, "status", entry[0])), node("b", "", String(entry[1])));
-    legend.append(item);
-  });
-  return legend;
 }
 
 export function renderLoading(container, t, key) {
