@@ -185,7 +185,7 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .filter-select:hover{border-color:var(--border-strong)}
 .filter-select:focus-visible{outline:none;border-color:var(--accent-line);box-shadow:0 0 0 3px var(--accent-soft)}
 /* Sidebar task cards */
-.task{display:grid;grid-template-columns:8px minmax(0,1fr) auto;gap:2px 9px;align-items:center;width:100%;text-align:left;padding:6px 9px;border:1px solid transparent;border-radius:var(--radius);background:transparent;color:var(--text);transition:background var(--motion-fast),border-color var(--motion-fast)}
+.task{display:grid;grid-template-columns:8px minmax(0,1fr) auto;gap:2px 9px;align-items:center;width:100%;text-align:left;padding:5px 9px;border:1px solid transparent;border-radius:var(--radius);background:transparent;color:var(--text);transition:background var(--motion-fast),border-color var(--motion-fast)}
 .task:hover{background:var(--bg-2);border-color:var(--border)}
 .task[aria-current=true]{background:var(--bg-3);border-color:var(--accent-line);box-shadow:inset 2px 0 var(--accent)}
 .task .status-dot{grid-row:1;align-self:center;margin-top:0}
@@ -224,7 +224,7 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .section-label{color:var(--muted);font-family:var(--font-mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.12em;margin-left:auto}
 .section-kicker{color:var(--faint);font-family:var(--font-body);font-size:11.5px;margin-left:4px;align-self:baseline}
 .overview-list{display:grid;gap:7px}
-.overview-row{display:grid;grid-template-columns:8px minmax(0,1fr) auto;gap:10px;align-items:center;text-align:left;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-2);color:var(--text);box-shadow:var(--shadow-card);transition:border-color var(--motion-fast),transform var(--motion-fast)}
+.overview-row{display:grid;grid-template-columns:8px minmax(0,1fr) auto;gap:10px;align-items:center;text-align:left;padding:7px 11px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-2);color:var(--text);box-shadow:var(--shadow-card);transition:border-color var(--motion-fast),transform var(--motion-fast)}
 .overview-row:hover{border-color:var(--border-strong);transform:translateY(-1px)}
 .overview-row .status-dot{margin-top:0}
 .overview-row-title{min-width:0;font-family:var(--font-body);font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
