@@ -51,7 +51,7 @@ There is no compatibility lookup, cross-Task guess, or bare-ID fallback.
 
 ## Offline conversion
 
-Runtime opens only the current aggregate-v12 / StoredTask-v11 schema. It does
+Runtime opens only the current aggregate-v13 / StoredTask-v12 schema. It does
 not read the legacy global-ID shape or an identity-only intermediate shape.
 Conversion is an explicit, stopped-system operation from the supported
 aggregate-v10 / StoredTask-v9 source into a separate fresh output:

@@ -613,10 +613,10 @@ test("offline identity conversion writes a fresh zero-dangling output without to
   assert.deepEqual(report.taskIds, ["task-1", "task-2"]);
   assert.deepEqual(readFileSync(join(source, STORAGE_STATE_FILE)), sourceBefore);
   const converted = JSON.parse(readFileSync(join(output, STORAGE_STATE_FILE), "utf8"));
-  assert.equal(converted.schemaVersion, 12);
+  assert.equal(converted.schemaVersion, 13);
   for (const taskId of report.taskIds) {
     const task = converted.tasks[taskId];
-    assert.equal(task.schemaVersion, 11);
+    assert.equal(task.schemaVersion, 12);
     assert.equal(task.task.schemaVersion, 3);
     assert.deepEqual(Object.keys(task.workItems), ["work-item-1"]);
     assert.deepEqual(Object.keys(task.agentRuns), ["agent-run-1"]);
@@ -672,7 +672,10 @@ test("offline identity conversion writes a fresh zero-dangling output without to
   assert.equal(second.agentRuns["agent-run-1"].schemaVersion, 4);
   assert.equal(second.agentRuns["agent-run-1"].effective.access, "read");
   assert.equal(second.agentRuns["agent-run-1"].effective.sourceDesiredRevision, 1);
-  assert.equal(second.roleSessionSets.leader.sessions.codex.schemaVersion, 3);
+    assert.equal(second.roleSessionSets.leader.sessions.codex.schemaVersion, 3);
+    assert.equal(second.roleSessionSets.leader.schemaVersion, 3);
+    assert.equal(second.roleSessionSets.leader.unusableSessionRetirement, null);
+    assert.deepEqual(second.roleSessionSets.leader.retiredSessions, {});
   assert.equal(second.roleSessionSets.leader.sessions.codex.effective.access, "read");
   assert.equal(second.activeRuns.leader.runId, "agent-run-1");
   assert.deepEqual(second.roleSessionSets.leader.inFlight, {
@@ -763,6 +766,7 @@ test("offline identity conversion bootstraps only the configured legacy reviewer
     assert.equal(session.effective.access, "read");
     assert.equal(session.effective.yolo, false);
   }
+  assert.equal(converted.globalRoleSessionSets.reviewer.schemaVersion, 3);
 
   for (const [taskId, agentId, bypassFlag] of [
     ["task-1", "codex", "--dangerously-bypass-approvals-and-sandbox"],

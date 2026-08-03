@@ -48,7 +48,7 @@ export type RoleAgentSession = {
 };
 
 type RoleSessionSetBase<TOwner extends RoleSessionOwner> = {
-  schemaVersion: 2;
+  schemaVersion: 3;
   owner: TOwner;
   activeAgentId: string;
   sessions: Record<string, RoleAgentSession>;
@@ -67,11 +67,41 @@ export type GlobalRoleSessionSet = RoleSessionSetBase<GlobalRoleSessionOwner> & 
   /** Immutable terminal native Sessions keyed by an opaque Yui reference. */
   history?: Record<string, RoleAgentSession>;
 };
+
+export type UnusableSessionRetirement = Readonly<{
+  schemaVersion: 1;
+  id: string;
+  taskId: string;
+  roleName: string;
+  agentId: string;
+  adapterId: string;
+  runId: string;
+  receiptId: string;
+  nativeSessionId: string;
+  launchId: string;
+  reason: string;
+  status: "cleanup-pending";
+  declaredAt: string;
+}>;
+
+export type RetiredTaskRoleSession = Readonly<{
+  schemaVersion: 1;
+  retirementId: string;
+  runId: string;
+  receiptId: string;
+  reason: string;
+  declaredAt: string;
+  retiredAt: string;
+  session: RoleAgentSession;
+}>;
+
 export type TaskRoleSessionSet = RoleSessionSetBase<TaskRoleSessionOwner> & {
   /** Immutable terminal native Sessions superseded by a fresh effective launch. */
   history?: readonly RoleAgentSession[];
   inFlight: TaskRoleInFlight | null;
   pendingTurnCompletion: PendingTurnCompletion | null;
+  unusableSessionRetirement: UnusableSessionRetirement | null;
+  retiredSessions: Record<string, RetiredTaskRoleSession>;
 };
 export type RoleSessionSet = GlobalRoleSessionSet | TaskRoleSessionSet;
 
@@ -115,7 +145,7 @@ export function createRoleSessionSet(
   now: Date
 ): RoleSessionSet {
   const base = {
-    schemaVersion: 2 as const,
+    schemaVersion: 3 as const,
     owner: normalizeOwner(owner),
     activeAgentId: requireSafeIdentity(activeAgentId, "Active Agent id"),
     sessions: {},
@@ -126,7 +156,9 @@ export function createRoleSessionSet(
     : {
         ...base,
         inFlight: null,
-        pendingTurnCompletion: null
+        pendingTurnCompletion: null,
+        unusableSessionRetirement: null,
+        retiredSessions: {}
       } as TaskRoleSessionSet;
 }
 
@@ -163,9 +195,24 @@ export function recordRoleAgentSession<TSet extends RoleSessionSet>(
   now: Date
 ): TSet {
   validateRoleSessionSet(set);
+  if (set.owner.scope === "task"
+    && (set as TaskRoleSessionSet).unusableSessionRetirement !== null) {
+    throw new Error("Task Role session has a pending unusable-session retirement.");
+  }
   const agentId = requireSafeIdentity(input.agentId, "Agent id");
   const adapterId = requireText(input.adapterId, "Agent adapter id");
   const nativeSessionId = requireText(input.nativeSessionId, "Native session id");
+  if (set.owner.scope === "task") {
+    const retired = Object.values((set as TaskRoleSessionSet).retiredSessions).find((entry) => (
+      entry.session.nativeSessionId === nativeSessionId
+      || (input.launchId !== undefined && entry.session.launchId === input.launchId)
+    ));
+    if (retired !== undefined) {
+      throw new Error(
+        `A new Task Role Session cannot reuse retired native or launch identity: ${retired.retirementId}.`
+      );
+    }
+  }
   if (!isAgentSessionStatus(input.status)) {
     throw new Error(`Role Agent session status is invalid: ${input.status}.`);
   }
@@ -292,7 +339,11 @@ export function retireTaskRoleSessionsForWorkspace(
   now: Date
 ): TaskRoleSessionSet {
   validateRoleSessionSet(set);
-  if (set.inFlight !== null || set.pendingTurnCompletion !== null) {
+  if (
+    set.inFlight !== null
+    || set.pendingTurnCompletion !== null
+    || set.unusableSessionRetirement !== null
+  ) {
     throw new Error("Cannot retire a Task Role session with unsettled Run state.");
   }
   const live = Object.values(set.sessions).find(
@@ -362,6 +413,10 @@ export function roleAgentSessionResumeMode(
 ): "new" | "resume" {
   if (set === null) return "new";
   validateRoleSessionSet(set);
+  if (set.owner.scope === "task"
+    && (set as TaskRoleSessionSet).unusableSessionRetirement !== null) {
+    throw new Error("Task Role session has a pending unusable-session retirement.");
+  }
   const session = set.sessions[requireSafeIdentity(agentId, "Agent id")];
   if (session === undefined || session.nativeSessionId.trim().length === 0) return "new";
   if (effectiveLaunchSnapshotsCompatible(session.effective, desired)) return "resume";
@@ -384,6 +439,9 @@ export function bindTaskRoleRun(
   const normalized = normalizeTaskRoleRunFence(fence);
   if (normalized.agentId !== set.activeAgentId) {
     throw new Error("Task Role Run Agent does not match the active Agent.");
+  }
+  if (set.unusableSessionRetirement !== null) {
+    throw new Error("Task Role session has a pending unusable-session retirement.");
   }
   if (set.pendingTurnCompletion !== null) {
     throw new Error("Task Role session set has an unsettled Turn completion.");
@@ -530,6 +588,130 @@ export function terminalizeTaskRoleRunSession(
   return updated;
 }
 
+export function declareTaskRoleSessionUnusable(
+  set: TaskRoleSessionSet,
+  input: Omit<UnusableSessionRetirement, "schemaVersion" | "status" | "declaredAt">,
+  now: Date
+): TaskRoleSessionSet {
+  validateRoleSessionSet(set);
+  const retirement = validateUnusableSessionRetirement({
+    schemaVersion: 1,
+    id: input.id,
+    taskId: input.taskId,
+    roleName: input.roleName,
+    agentId: input.agentId,
+    adapterId: input.adapterId,
+    runId: input.runId,
+    receiptId: input.receiptId,
+    nativeSessionId: input.nativeSessionId,
+    launchId: input.launchId,
+    reason: input.reason,
+    status: "cleanup-pending",
+    declaredAt: requireDate(now, "Unusable Session declaration timestamp")
+  });
+  if (
+    set.owner.taskId !== retirement.taskId
+    || set.owner.roleName !== retirement.roleName
+    || set.activeAgentId !== retirement.agentId
+  ) {
+    throw new Error("Unusable Session declaration does not match the Task Role owner.");
+  }
+  if (set.unusableSessionRetirement !== null) {
+    if (sameUnusableSessionRetirement(set.unusableSessionRetirement, retirement)) return set;
+    throw new Error("Task Role already has a different unusable-session retirement.");
+  }
+  if (set.pendingTurnCompletion !== null) {
+    throw new Error("Task Role has a pending Turn completion.");
+  }
+  const inFlight = set.inFlight;
+  if (
+    inFlight === null
+    || inFlight.agentId !== retirement.agentId
+    || inFlight.runId !== retirement.runId
+    || inFlight.receiptId !== retirement.receiptId
+    || inFlight.deliveredAt === undefined
+  ) {
+    throw new Error("Unusable Session declaration does not match a delivered in-flight Run.");
+  }
+  const session = set.sessions[retirement.agentId];
+  if (
+    session === undefined
+    || session.adapterId !== retirement.adapterId
+    || session.nativeSessionId !== retirement.nativeSessionId
+    || session.launchId !== retirement.launchId
+    || session.policy !== "fixed"
+    || session.status === "stopped"
+    || session.status === "broken"
+  ) {
+    throw new Error("Unusable Session declaration does not match the fixed Role Session.");
+  }
+  return validateRoleSessionSet({
+    ...set,
+    unusableSessionRetirement: retirement,
+    updatedAt: retirement.declaredAt
+  });
+}
+
+export function retireDeclaredUnusableTaskRoleSession(
+  set: TaskRoleSessionSet,
+  retirementId: string,
+  now: Date
+): TaskRoleSessionSet {
+  validateRoleSessionSet(set);
+  const normalizedId = requireSafeIdentity(retirementId, "Session retirement id");
+  const retirement = set.unusableSessionRetirement;
+  if (retirement === null || retirement.id !== normalizedId) {
+    throw new Error("Unusable Session retirement obligation changed.");
+  }
+  if (set.pendingTurnCompletion !== null) {
+    throw new Error("Task Role has a pending Turn completion.");
+  }
+  const inFlight = set.inFlight;
+  const session = set.sessions[retirement.agentId];
+  if (
+    inFlight === null
+    || inFlight.agentId !== retirement.agentId
+    || inFlight.runId !== retirement.runId
+    || inFlight.receiptId !== retirement.receiptId
+    || inFlight.deliveredAt === undefined
+    || session === undefined
+    || session.adapterId !== retirement.adapterId
+    || session.nativeSessionId !== retirement.nativeSessionId
+    || session.launchId !== retirement.launchId
+  ) {
+    throw new Error("Unusable Session retirement fence changed.");
+  }
+  const retiredAt = requireDate(now, "Session retiredAt");
+  const retired: RetiredTaskRoleSession = {
+    schemaVersion: 1,
+    retirementId: retirement.id,
+    runId: retirement.runId,
+    receiptId: retirement.receiptId,
+    reason: retirement.reason,
+    declaredAt: retirement.declaredAt,
+    retiredAt,
+    session: {
+      ...session,
+      status: "broken",
+      updatedAt: retiredAt
+    }
+  };
+  const sessions = { ...set.sessions };
+  delete sessions[retirement.agentId];
+  return validateRoleSessionSet({
+    ...set,
+    sessions,
+    inFlight: null,
+    pendingTurnCompletion: null,
+    unusableSessionRetirement: null,
+    retiredSessions: {
+      ...set.retiredSessions,
+      [retirement.id]: validateRetiredTaskRoleSession(retired, retirement.id)
+    },
+    updatedAt: retiredAt
+  });
+}
+
 export function settleTaskRoleCompletion(
   set: TaskRoleSessionSet,
   expected: Readonly<{ agentId: string; runId: string; turnId: string }>,
@@ -582,16 +764,21 @@ export function settleTaskRoleCompletion(
 }
 
 export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): TSet {
-  if (set.schemaVersion !== 2) throw new Error("Role session set schema version is invalid.");
+  if (set.schemaVersion !== 3) throw new Error("Role session set schema version is invalid.");
   normalizeOwner(set.owner);
   requireSafeIdentity(set.activeAgentId, "Active Agent id");
   for (const [agentId, session] of Object.entries(set.sessions)) {
     validateRoleAgentSession(session, agentId);
   }
   if (set.owner.scope === "global") {
-    if (Object.hasOwn(set, "inFlight") || Object.hasOwn(set, "pendingTurnCompletion")) {
+    if (
+      Object.hasOwn(set, "inFlight")
+      || Object.hasOwn(set, "pendingTurnCompletion")
+      || Object.hasOwn(set, "unusableSessionRetirement")
+      || Object.hasOwn(set, "retiredSessions")
+    ) {
       throw new Error(
-        "Global Role session set must not contain inFlight or pendingTurnCompletion."
+        "Global Role session set must not contain Task Role lifecycle fields."
       );
     }
     const history = (set as GlobalRoleSessionSet).history;
@@ -605,7 +792,12 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
       }
     }
   } else {
-    if (!Object.hasOwn(set, "inFlight") || !Object.hasOwn(set, "pendingTurnCompletion")) {
+    if (
+      !Object.hasOwn(set, "inFlight")
+      || !Object.hasOwn(set, "pendingTurnCompletion")
+      || !Object.hasOwn(set, "unusableSessionRetirement")
+      || !Object.hasOwn(set, "retiredSessions")
+    ) {
       throw new Error("Task Role session set must contain its Turn fence.");
     }
     const taskSet = set as TaskRoleSessionSet;
@@ -660,9 +852,103 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
         throw new Error("Pending Turn native session does not match the Role Agent session.");
       }
     }
+    const retirement = taskSet.unusableSessionRetirement === null
+      ? null
+      : validateUnusableSessionRetirement(taskSet.unusableSessionRetirement);
+    if (retirement !== null) {
+      if (
+        retirement.taskId !== taskSet.owner.taskId
+        || retirement.roleName !== taskSet.owner.roleName
+        || retirement.agentId !== taskSet.activeAgentId
+        || pending !== null
+        || inFlight?.agentId !== retirement.agentId
+        || inFlight.runId !== retirement.runId
+        || inFlight.receiptId !== retirement.receiptId
+        || inFlight.deliveredAt === undefined
+      ) {
+        throw new Error("Unusable Session retirement does not match the Task Role fence.");
+      }
+      const session = taskSet.sessions[retirement.agentId];
+      if (
+        session === undefined
+        || session.adapterId !== retirement.adapterId
+        || session.nativeSessionId !== retirement.nativeSessionId
+        || session.launchId !== retirement.launchId
+        || session.policy !== "fixed"
+      ) {
+        throw new Error("Unusable Session retirement does not match the fixed Session.");
+      }
+    }
+    if (!isRecord(taskSet.retiredSessions)) {
+      throw new Error("Task Role retired Sessions must be a record.");
+    }
+    for (const [retirementId, retired] of Object.entries(taskSet.retiredSessions)) {
+      validateRetiredTaskRoleSession(retired, retirementId);
+    }
   }
   requireText(set.updatedAt, "Role session set update timestamp");
   return set;
+}
+
+function validateUnusableSessionRetirement(
+  value: UnusableSessionRetirement
+): UnusableSessionRetirement {
+  if (value.schemaVersion !== 1) {
+    throw new Error("Unusable Session retirement schema version is invalid.");
+  }
+  requireSafeIdentity(value.id, "Session retirement id");
+  requireSafeIdentity(value.taskId, "Session retirement Task id");
+  requireSafeIdentity(value.roleName, "Session retirement Role name");
+  requireSafeIdentity(value.agentId, "Session retirement Agent id");
+  requireText(value.adapterId, "Session retirement adapter id");
+  requireSafeIdentity(value.runId, "Session retirement Run id");
+  requireText(value.receiptId, "Session retirement receipt id");
+  requireText(value.nativeSessionId, "Session retirement native Session id");
+  requireSafeIdentity(value.launchId, "Session retirement launch id");
+  requireText(value.reason, "Session retirement reason");
+  if (value.status !== "cleanup-pending") {
+    throw new Error("Unusable Session retirement status is invalid.");
+  }
+  requirePersistedTimestamp(value.declaredAt, "Session retirement declaredAt");
+  return value;
+}
+
+function validateRetiredTaskRoleSession(
+  value: RetiredTaskRoleSession,
+  expectedRetirementId: string
+): RetiredTaskRoleSession {
+  if (value.schemaVersion !== 1) {
+    throw new Error("Retired Task Role Session schema version is invalid.");
+  }
+  const retirementId = requireSafeIdentity(value.retirementId, "Session retirement id");
+  if (retirementId !== expectedRetirementId) {
+    throw new Error(`Retired Task Role Session identity is inconsistent: ${expectedRetirementId}.`);
+  }
+  requireSafeIdentity(value.runId, "Retired Session Run id");
+  requireText(value.receiptId, "Retired Session receipt id");
+  requireText(value.reason, "Retired Session reason");
+  requirePersistedTimestamp(value.declaredAt, "Retired Session declaredAt");
+  requirePersistedTimestamp(value.retiredAt, "Retired Session retiredAt");
+  validateRoleAgentSession(value.session);
+  requireSafeIdentity(value.session.launchId ?? "", "Retired Session launch id");
+  if (value.session.status !== "broken" || value.session.policy !== "fixed") {
+    throw new Error("Retired Task Role Session must be a broken fixed Session.");
+  }
+  if (Date.parse(value.retiredAt) < Date.parse(value.declaredAt)) {
+    throw new Error("Retired Task Role Session cannot predate its declaration.");
+  }
+  return value;
+}
+
+function sameUnusableSessionRetirement(
+  left: UnusableSessionRetirement,
+  right: UnusableSessionRetirement
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function validateRoleAgentSession(

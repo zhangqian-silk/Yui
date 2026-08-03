@@ -24,10 +24,16 @@ import { createTaskMessage } from "../../dist/message/message.js";
 import { createMilestone } from "../../dist/milestone/milestone.js";
 import { createAgentProfile } from "../../dist/profile/agentProfile.js";
 import {
+  bindTaskRoleRun,
+  createRoleSessionSet,
+  declareTaskRoleSessionUnusable,
+  markTaskRoleRunDelivered
+} from "../../dist/executor/agentExecutor.js";
+import {
   createGlobalRole,
   createRoleAgentBinding
 } from "../../dist/role/role.js";
-import { createAgentRun } from "../helpers/effectiveLaunch.js";
+import { createAgentRun, recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import {
@@ -187,7 +193,14 @@ test("task context aggregates complete records and renders a compact recent summ
     activeDecisions: [activeDecision],
     milestones,
     roles,
-    roleSessions: { leader: null, worker: null },
+    roleSessionSets: [],
+    roleSessionRecoveries: roles.map((role) => ({
+      taskId: task.id,
+      roleName: role.name,
+      sessionRetirement: null,
+      runtimeCleanupPending: false,
+      freshLaunchAllowed: true
+    })),
     workItems: [workItem],
     agentRuns,
     reviewRounds: [],
@@ -219,6 +232,67 @@ test("task context aggregates complete records and renders a compact recent summ
   assert.match(result.output, /Message 6/);
   assert.match(result.output, /Open input requests \(0\):\n  None\./);
   assert.match(result.output, /Recent events \(5 of 8\)/);
+});
+
+test("task context exposes an exact unusable-session retirement without inferring runtime health", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Recover fixed Session");
+  output(["role", "add", task.id, "worker", "--agent", "codex"], store, options);
+  const role = store.getRole(task.id, "worker");
+  const run = createAgentRun(
+    store.nextAgentRunId(task.id),
+    task.id,
+    role.name,
+    "new",
+    "Do bounded work",
+    NOW,
+    { agent: { agentId: "codex", adapterId: "codex" } }
+  );
+  const delivered = { ...run, deliveredAt: NOW.toISOString() };
+  store.saveAgentRun(delivered);
+  let sessions = createRoleSessionSet(
+    { scope: "task", taskId: task.id, roleName: role.name },
+    "codex",
+    NOW
+  );
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "native-context-unusable",
+    launchId: "launch-context-unusable",
+    policy: "fixed",
+    status: "running"
+  }, NOW);
+  const fence = {
+    agentId: "codex",
+    runId: delivered.id,
+    receiptId: `agent-run:${task.id}/${delivered.id}`
+  };
+  sessions = markTaskRoleRunDelivered(bindTaskRoleRun(sessions, fence, NOW), fence, NOW);
+  sessions = declareTaskRoleSessionUnusable(sessions, {
+    id: `session-retirement-${delivered.id}`,
+    taskId: task.id,
+    roleName: role.name,
+    agentId: "codex",
+    adapterId: "codex",
+    runId: delivered.id,
+    receiptId: fence.receiptId,
+    nativeSessionId: "native-context-unusable",
+    launchId: "launch-context-unusable",
+    reason: "Operator cannot use the fixed Session."
+  }, NOW);
+  store.saveTaskRoleSessionSet(sessions);
+
+  const result = output(["context", task.id], store, options);
+  assert.equal(result.data.roleSessionSets.length, 1);
+  assert.equal(
+    result.data.roleSessionSets[0].unusableSessionRetirement.reason,
+    "Operator cannot use the fixed Session."
+  );
+  assert.match(result.output, /Session usability: operator-declared-unusable \(cleanup-pending\)/);
+  assert.match(result.output, /Native Session: native-context-unusable @ launch-context-unusable/);
+  assert.match(result.output, /Reason: Operator cannot use the fixed Session\./);
+  assert.match(result.output, /Fresh launch: blocked by the pending Session retirement/);
 });
 
 test("task context includes every open input and renders a bounded actionable summary", (t) => {

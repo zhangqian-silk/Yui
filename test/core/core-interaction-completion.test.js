@@ -48,6 +48,7 @@ const PUBLIC_PATHS = [
   "operator list",
   "operator resume",
   "operator submit",
+  "operator retire-unusable-session",
   "project",
   "project add",
   "project clone",
@@ -339,6 +340,29 @@ test("interaction policies cover missing task, work, Integration, and job identi
     action: "Archive task",
     targetArgumentIndex: 2
   });
+});
+
+test("unusable Session retirement exposes exact Operator help and completion selectors", () => {
+  const node = findCommandNode(["operator", "retire-unusable-session"]);
+  assert.ok(node);
+  assert.deepEqual(node.options, [
+    "--run", "--agent", "--adapter", "--receipt",
+    "--native-session", "--launch", "--reason"
+  ]);
+  assert.match(renderCommandHelp(node, "0.2.0"), /retire-unusable-session <task> <role>/u);
+  const policy = findInteractionPolicy(node);
+  assert.ok(policy);
+  assert.deepEqual(policy.selectors.map(({ provider, argumentIndex, option, dependsOn }) => ({
+    provider,
+    ...(argumentIndex === undefined ? {} : { argumentIndex }),
+    ...(option === undefined ? {} : { option }),
+    ...(dependsOn === undefined ? {} : { dependsOn })
+  })), [
+    { provider: "tasks", argumentIndex: 2 },
+    { provider: "task-roles", argumentIndex: 3, dependsOn: 2 },
+    { provider: "runs", option: "--run", dependsOn: 2 },
+    { provider: "configured-agents", option: "--agent" }
+  ]);
 });
 
 test("candidate providers read the current core entities through CoreCliPorts.call", async () => {

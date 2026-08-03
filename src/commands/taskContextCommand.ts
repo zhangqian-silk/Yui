@@ -3,6 +3,7 @@ import type { InputRequest } from "../input/inputRequest.js";
 import { taskMessageAuthorLabel } from "../message/message.js";
 import { formatTimestamp } from "../output/timePresentation.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import { inspectTaskRoleSessionRecovery } from "./taskRoleRuntimeStatus.js";
 
 const RECENT_RECORD_LIMIT = 5;
 const RELATED_RECORD_LIMIT = 5;
@@ -26,6 +27,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     const workItems = reader.listWorkItems(task.id);
     const inputRequests = reader.listInputRequests(task.id);
     const roles = reader.listRoles(task.id);
+    const roleSessionSets = reader.listRoleSessionSets(task.id);
     return {
       task,
       reviewConfig: reader.getReviewConfig(),
@@ -34,10 +36,10 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
         .filter((decision) => decision.status === "active"),
       milestones: reader.listMilestones(task.id),
       roles,
-      roleSessions: Object.fromEntries(roles.map((role) => [
-        role.name,
-        reader.getTaskRoleSessionSet(task.id, role.name)
-      ])),
+      roleSessionSets,
+      roleSessionRecoveries: roles.map((role) => (
+        inspectTaskRoleSessionRecovery(task.id, role.name, reader)
+      )),
       workItems,
       agentRuns: chronological(reader.listAgentRuns(task.id)),
       reviewRounds: chronological(reader.listReviewRounds(task.id)),
@@ -56,7 +58,8 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     activeDecisions,
     milestones,
     roles,
-    roleSessions,
+    roleSessionSets,
+    roleSessionRecoveries,
     workItems,
     agentRuns,
     reviewRounds,
@@ -145,10 +148,11 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
           const activeRun = agentRuns.find((run) => (
             run.roleName === role.name && run.status === "active"
           ));
-          const sessions = roleSessions[role.name];
+          const sessions = roleSessionSets.find((set) => set.owner.roleName === role.name);
           const activeSession = sessions?.sessions[sessions.activeAgentId];
           const effective = activeRun?.effective ?? activeSession?.effective;
           const effectiveSource = activeRun === undefined ? "Session" : "Run";
+          const recovery = roleSessionRecoveries.find((entry) => entry.roleName === role.name);
           const creation = [...events].reverse().find((event) => (
             event.type === "role.added" && event.payload.role === role.name
           ));
@@ -165,7 +169,25 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
                 : "pending next launch"}`,
             ...(creation?.payload.runtimeSource === undefined
               ? []
-              : [`    Runtime source at creation: ${creation.payload.runtimeSource}`])
+              : [`    Runtime source at creation: ${creation.payload.runtimeSource}`]),
+            ...(recovery?.sessionRetirement === null || recovery === undefined
+              ? []
+              : [
+                  `    Session usability: ${recovery.sessionRetirement.state === "cleanup-pending"
+                    ? "operator-declared-unusable (cleanup-pending)"
+                    : `retired (${recovery.sessionRetirement.id})`}`,
+                  `    Native Session: ${recovery.sessionRetirement.nativeSessionId} @ ${recovery.sessionRetirement.launchId}`,
+                  `    Exact Run/receipt: ${recovery.sessionRetirement.runId} / ${recovery.sessionRetirement.receiptId}`,
+                  `    Reason: ${compactText(recovery.sessionRetirement.reason)}`,
+                  `    Runtime cleanup: ${recovery.runtimeCleanupPending ? "pending" : "complete"}`,
+                  `    Fresh launch: ${recovery.freshLaunchAllowed
+                    ? "allowed by the durable Session fence"
+                    : recovery.runtimeCleanupPending
+                      ? "blocked until verified owned runtime cleanup completes"
+                      : recovery.sessionRetirement.state === "cleanup-pending"
+                        ? "blocked by the pending Session retirement"
+                        : "not allowed while a current Session is recorded"}`
+                ])
           ];
         })),
     "",

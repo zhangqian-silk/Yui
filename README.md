@@ -66,7 +66,7 @@ yui storage convert-task-identity \
 ```
 
 The converter remaps all Task-owned records and references and writes the one
-current combined schema directly: aggregate v12 / StoredTask v11 with Role
+current combined schema directly: aggregate v13 / StoredTask v12 with Role
 desired revisions and immutable effective Run/Session launch snapshots. Legacy
 launch facts are provenance-marked and closed to read-only. The converter
 validates the fresh output with the current runtime, writes
@@ -235,6 +235,26 @@ yui operator resume --last
 yui operator new
 yui operator enter
 ```
+
+When a delivered Task Role Run is pinned to a fixed native Session that the
+Operator has explicitly determined cannot execute another Turn, the global
+Operator can retire that exact Session generation:
+
+```sh
+yui operator retire-unusable-session <task-id> <role> \
+  --run <run-id> --agent <agent-id> --adapter <adapter-id> \
+  --receipt <receipt-id> --native-session <native-session-id> \
+  --launch <launch-id> --reason "<operator reason>"
+```
+
+The command fails only the matching delivered Run and records the exact
+Operator reason; it never creates a Candidate, accepts work, or completes the
+Task. Yui then stops only that Role's owned runtime. Until the stop is verified,
+`task role status` and `task context` show cleanup pending and keep fresh launch
+blocked. After exact cleanup completion, the old fixed Session is retained in
+retirement history and the next launch is new. Existing messages, mailbox
+signals, reviews, and delivery history remain durable. Task-scoped Roles and
+ordinary users cannot invoke this recovery command.
 
 Without `--task`, `operator submit` creates a new Draft. Drafts accept planning changes but must be activated before Agent execution.
 Operator resolves every request against the Project catalog and existing Task

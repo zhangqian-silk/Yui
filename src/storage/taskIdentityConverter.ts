@@ -601,7 +601,7 @@ function convertTaskAggregate(
   ));
   return {
     ...clone(source),
-    schemaVersion: 11,
+    schemaVersion: 12,
     task: convertLegacyTask(source.task, conversion.taskId),
     roles,
     idHighWaterMarks: Object.fromEntries(
@@ -916,6 +916,7 @@ function convertTaskRoleSessionSet(
     : object(sessions.pendingTurnCompletion, "Pending Turn completion");
   return {
     ...sessions,
+    schemaVersion: 3,
     sessions: convertSessionMap(
       sessions.sessions,
       role,
@@ -940,7 +941,9 @@ function convertTaskRoleSessionSet(
           ...clone(pending),
           taskId: conversion.taskId,
           runId: mapped(conversion, "agentRun", pending.runId, "Pending completion Run")
-        }
+        },
+    unusableSessionRetirement: null,
+    retiredSessions: {}
   };
 }
 
@@ -955,6 +958,7 @@ function convertRoleSessionSet(
     : effectiveWorkspace(workspaceValue);
   return {
     ...set,
+    schemaVersion: 3,
     sessions: convertSessionMap(set.sessions, role, workspace),
     ...(set.history === undefined
       ? {}

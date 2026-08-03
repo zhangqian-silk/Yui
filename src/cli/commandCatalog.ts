@@ -719,7 +719,7 @@ export const ROOT_COMMAND = buildNode({
       sections: [{
         id: "workflow",
         title: "Commands",
-        entries: ["enter", "new", "list", "resume", "submit"]
+        entries: ["enter", "new", "list", "resume", "submit", "retire-unusable-session"]
       }],
       children: [
         { name: "enter", summary: "Enter the Operator's native session." },
@@ -742,6 +742,15 @@ export const ROOT_COMMAND = buildNode({
           usage: "yui operator submit (<body>|--body-file <path|->) [--task <id>]",
           options: ["--task", "--body-file"],
           fileOptions: ["--body-file"]
+        },
+        {
+          name: "retire-unusable-session",
+          summary: "Retire one exact delivered fixed native Session declared unusable by the Operator.",
+          usage: "yui operator retire-unusable-session <task> <role> --run <run> --agent <agent> --adapter <adapter> --receipt <receipt> --native-session <id> --launch <generation> --reason <text>",
+          options: [
+            "--run", "--agent", "--adapter", "--receipt",
+            "--native-session", "--launch", "--reason"
+          ]
         }
       ]
     },

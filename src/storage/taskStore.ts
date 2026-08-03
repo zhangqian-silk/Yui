@@ -124,7 +124,7 @@ type ActiveRunPointer = Readonly<{ schemaVersion: 1; runId: string }>;
 type TaskIdHighWaterMarks = Record<TaskRecordKind, number>;
 
 type StoredTask = {
-  schemaVersion: 11;
+  schemaVersion: 12;
   task: Task;
   idHighWaterMarks: TaskIdHighWaterMarks;
   brief: TaskBrief | null;
@@ -147,7 +147,7 @@ type StoredTask = {
 };
 
 type StorageState = {
-  schemaVersion: 12;
+  schemaVersion: 13;
   revision: number;
   config: YuiConfig;
   configuredAgents: Record<string, ConfiguredAgent>;
@@ -1173,7 +1173,7 @@ export function ensureYuiHome(rootDir: string): void { mkdirSync(rootDir, { recu
 
 function emptyState(): StorageState {
   return {
-    schemaVersion: 12,
+    schemaVersion: 13,
     revision: 0,
     config: { schemaVersion: 1 },
     configuredAgents: {},
@@ -1187,7 +1187,7 @@ function emptyState(): StorageState {
 }
 function emptyStoredTask(task: Task): StoredTask {
   return {
-    schemaVersion: 11,
+    schemaVersion: 12,
     task,
     idHighWaterMarks: emptyTaskIdHighWaterMarks(),
     brief: null,
@@ -1266,7 +1266,7 @@ function parseState(raw: string): StorageState {
     "tasks",
     "mailboxes"
   ], "Storage state");
-  if (state.schemaVersion !== 12 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
+  if (state.schemaVersion !== 13 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
   const result = clone(state) as unknown as StorageState;
   result.config = versioned(result.config, 1, "Yui config");
   validateYuiConfig(result.config);
@@ -1398,7 +1398,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateIntegrationAttempt(attempt);
     return attempt;
   }, "integrationAttempts");
-  versioned(aggregate, 11, `Task aggregate ${taskId}`);
+  versioned(aggregate, 12, `Task aggregate ${taskId}`);
   validateTaskIdHighWaterMarks(aggregate.idHighWaterMarks, taskId);
   validateTask(identified(aggregate.task, 3, "id", taskId, "Task"));
   if (aggregate.brief !== null) storedTaskBrief(aggregate.brief);
@@ -1548,14 +1548,14 @@ function validateYuiConfig(config: YuiConfig): void {
 }
 
 function globalSessions(value: unknown): GlobalRoleSessionSet {
-  const set = versioned<GlobalRoleSessionSet>(value, 2, "Global Role session set");
+  const set = versioned<GlobalRoleSessionSet>(value, 3, "Global Role session set");
   if (set.owner?.scope !== "global" || typeof set.owner.roleName !== "string") throw new StorageRecordError("Global Role session owner is invalid.");
   validateSessions(set.sessions);
   validateRoleSessionSet(set);
   return set;
 }
 function taskSessions(value: unknown): TaskRoleSessionSet {
-  const set = versioned<TaskRoleSessionSet>(value, 2, "Task Role session set");
+  const set = versioned<TaskRoleSessionSet>(value, 3, "Task Role session set");
   if (set.owner?.scope !== "task" || typeof set.owner.taskId !== "string" || typeof set.owner.roleName !== "string") throw new StorageRecordError("Task Role session owner is invalid.");
   validateSessions(set.sessions);
   validateRoleSessionSet(set);
@@ -1582,9 +1582,13 @@ function assertSessionsMatchRole(
     ...Object.entries(sessions.sessions),
     ...(sessions.owner.scope === "global"
       ? Object.entries((sessions as GlobalRoleSessionSet).history ?? {})
-      : ((sessions as TaskRoleSessionSet).history ?? []).map((session, index) => (
-          [String(index), session] as const
-        )))
+      : [
+          ...((sessions as TaskRoleSessionSet).history ?? []).map((session, index) => (
+            [`history-${index}`, session] as const
+          )),
+          ...Object.entries((sessions as TaskRoleSessionSet).retiredSessions)
+            .map(([id, retired]) => [id, retired.session] as const)
+        ])
   ];
   for (const [, session] of ownedSessions) {
     const agentId = session.agentId;

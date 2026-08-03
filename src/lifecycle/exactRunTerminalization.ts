@@ -29,6 +29,8 @@ export type ExactRunTerminalizationInput = Readonly<{
   mailboxDisposition?: "exact" | "discard";
   /** Leader-forced control boundaries must stop the native process on every provider. */
   runtimeCleanup?: "provider-default" | "required";
+  /** Preserve the delivered Session/generation fence until verified stop completion. */
+  runtimeFence?: "settle" | "preserve-for-unusable-session-retirement";
   outcome: Readonly<{
     status: "yielded" | "failed";
     summary: string;
@@ -121,7 +123,10 @@ export function terminalizeExactTaskRun(
   }
   store.clearActiveAgentRun(input.taskId, input.roleName);
   store.saveRole(input.taskId, updateRoleStatus(role, "idle", now));
-  if (sessions !== null) {
+  if (
+    sessions !== null
+    && input.runtimeFence !== "preserve-for-unusable-session-retirement"
+  ) {
     store.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(sessions, {
       agentId: input.agentId,
       runId: input.runId,
@@ -132,8 +137,11 @@ export function terminalizeExactTaskRun(
   // Run boundary ends the process generation. A caller may additionally make
   // cleanup mandatory for a provider-independent control action such as
   // Leader disposition. The durable Session identity itself is preserved.
-  if (input.runtimeCleanup === "required"
-    || run.effective.adapterId === "claude") {
+  if (
+    input.runtimeFence === "preserve-for-unusable-session-retirement"
+    || input.runtimeCleanup === "required"
+    || run.effective.adapterId === "claude"
+  ) {
     enqueueWork(
       store,
       runtimeLifecycleTarget({
@@ -146,7 +154,9 @@ export function terminalizeExactTaskRun(
       [{ type: "task", id: input.taskId }]
     );
   }
-  settleLaunchReservation(store, sessions, input);
+  if (input.runtimeFence !== "preserve-for-unusable-session-retirement") {
+    settleLaunchReservation(store, sessions, input);
+  }
   return { disposition: "applied", run: terminal };
 }
 
@@ -154,6 +164,23 @@ function matchesSessionFence(
   sessions: TaskRoleSessionSet | null,
   input: ExactRunTerminalizationInput
 ): boolean {
+  if (input.runtimeFence === "preserve-for-unusable-session-retirement") {
+    if (
+      sessions === null
+      || input.nativeSessionId === undefined
+      || input.launchId === undefined
+      || sessions.activeAgentId !== input.agentId
+      || sessions.pendingTurnCompletion !== null
+    ) return false;
+    const session = sessions.sessions[input.agentId];
+    const inFlight = sessions.inFlight;
+    return session?.nativeSessionId === input.nativeSessionId
+      && session.launchId === input.launchId
+      && inFlight?.agentId === input.agentId
+      && inFlight.runId === input.runId
+      && inFlight.receiptId === input.receiptId
+      && inFlight.deliveredAt !== undefined;
+  }
   if (sessions === null) return input.nativeSessionId === undefined;
   if (sessions.activeAgentId !== input.agentId) return false;
   const session = sessions.sessions[input.agentId];

@@ -225,6 +225,23 @@ yui operator new
 yui operator enter
 ```
 
+当一个已交付的 Task Role Run 被固定到原生 Session，而 Operator 已明确判定该
+Session 无法再执行 Turn 时，global Operator 可以精确退役这一代 Session：
+
+```sh
+yui operator retire-unusable-session <task-id> <role> \
+  --run <run-id> --agent <agent-id> --adapter <adapter-id> \
+  --receipt <receipt-id> --native-session <native-session-id> \
+  --launch <launch-id> --reason "<operator reason>"
+```
+
+该命令只会失败化完全匹配的已交付 Run，并持久记录 Operator reason；它不会创建
+Candidate、验收工作或完成 Task。随后 Yui 只停止该 Role 自己拥有的 runtime。
+停机得到验证前，`task role status` 和 `task context` 会显示 cleanup pending，
+并阻止 fresh launch；精确 cleanup 完成后，旧 fixed Session 进入退役历史，下一次
+启动必须使用 new mode。已有 message、mailbox signal、review 和交付历史都会保留。
+Task 范围内的 Role 与普通 user 均无权调用这个恢复命令。
+
 不带 `--task` 时会创建新 Draft。Draft 可以继续规划，但激活前不会执行 Agent 工作。
 Operator 会结合 Project Catalog 和现有 Task context 路由请求。同一有界
 目标的追加需求、修复、审查和咨询继续进入原 Task，即使它涉及多个 Project。
