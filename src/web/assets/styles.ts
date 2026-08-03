@@ -316,7 +316,7 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .record-cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;align-items:start;grid-auto-flow:dense}
 .record-block{display:grid;gap:5px;align-content:start}
 .record-block>small{display:block;color:var(--muted);font-family:var(--font-mono);font-size:8.5px;text-transform:uppercase;letter-spacing:.1em;font-weight:600}
-.record-block p{margin:0;font-family:var(--font-body);font-size:12.5px;line-height:1.6;color:var(--text)}
+.record-block p{margin:0;font-family:var(--font-body);font-size:12px;line-height:1.5;color:var(--text)}
 .record-block p.muted,.record-block .muted{color:var(--muted)}
 .record-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:2px}
 .record-actions .record-meta{margin:0}
