@@ -41,6 +41,7 @@ import type {
 } from "../workspace/workItemChangeSetManager.js";
 import { cancelInputRequest } from "../input/inputRequest.js";
 import { terminalizeExactTaskRun } from "../lifecycle/exactRunTerminalization.js";
+import { resetTaskRoleSessionGeneration } from "../lifecycle/taskRoleSessionReset.js";
 import {
   activeRoleAgentBinding,
   copyGlobalRoleToTaskRole,
@@ -107,7 +108,7 @@ import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import {
   currentWorkItemCandidate,
   createWorkItem,
-  disposeWorkItem,
+  retireWorkItem,
   retryFailedWorkItem,
   submitWorkItemCandidate,
   updateWorkItemWriteProjects,
@@ -663,9 +664,7 @@ function completeTaskCommand(
     assertNoOpenInputRequests(tx, task.id, "completing the Task");
     const incompleteWork = tx.listWorkItems(task.id).find((item) => (
       item.status !== "completed"
-      && item.status !== "cancelled"
-      && item.status !== "superseded"
-      && item.status !== "abandoned"
+      && item.status !== "retired"
     ));
     if (incompleteWork !== undefined) {
       throw usageError(`Task ${task.id} has unaccepted work: ${incompleteWork.id}/${incompleteWork.status}.`);
@@ -800,7 +799,7 @@ function archiveTaskCommand(
     const actor = taskActor(options, task.id);
     if (task.status === "archived") return { task, changed: false } as const;
     if (task.status !== "completed"
-      && !["cancelled", "superseded", "abandoned"].includes(task.status)) {
+      && task.status !== "retired") {
       throw usageError(`Task ${task.id} must be completed or retired before it can be archived.`);
     }
     if (task.cwd !== undefined || tx.listRoleWorkspaces(task.id).length > 0) {
@@ -866,18 +865,14 @@ function retireTaskCommand(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task retire usage: yui task retire <task> <cancelled|superseded|abandoned> (--summary <text>|--summary-file <path|->) [--replacement <task>].";
+  const usage = "Task retire usage: yui task retire <task> (--summary <text>|--summary-file <path|->) [--replacement <task>].";
   const parsed = parseTail(
     args,
     new Set(["--summary", "--summary-file", "--replacement"]),
     usage
   );
-  exactPositionals(parsed.positionals, 2, usage);
+  exactPositionals(parsed.positionals, 1, usage);
   const taskId = parsed.positionals[0]!;
-  const status = parsed.positionals[1];
-  if (status !== "cancelled" && status !== "superseded" && status !== "abandoned") {
-    throw usageError(`Task retirement status is invalid: ${String(status)}.`, usage);
-  }
   const summary = readCommandText(
     parsed.options.get("--summary"),
     parsed.options.get("--summary-file"),
@@ -885,20 +880,11 @@ function retireTaskCommand(
     usage
   );
   const replacementTaskId = parsed.options.get("--replacement");
-  if ((status === "superseded") !== (replacementTaskId !== undefined)) {
-    throw usageError(
-      status === "superseded"
-        ? "A superseded Task requires --replacement."
-        : "Only a superseded Task may use --replacement.",
-      usage
-    );
-  }
   const now = clock(options);
   const result = store.transaction((tx) => {
     const task = requireTask(tx, taskId);
-    if (["cancelled", "superseded", "abandoned"].includes(task.status)) {
-      const same = task.status === status
-        && task.retirementSummary === summary
+    if (task.status === "retired") {
+      const same = task.retirementSummary === summary
         && task.replacementTaskId === replacementTaskId;
       if (!same) throw usageError(`Task already has a different retirement: ${task.id}.`);
       return { task, changed: false } as const;
@@ -932,7 +918,6 @@ function retireTaskCommand(
     for (const run of tx.listAgentRuns(task.id).filter(({ status: runStatus }) => (
       runStatus === "active"
     ))) {
-      const role = requireRole(tx, task.id, run.roleName);
       const terminal = terminalizeExactTaskRun(tx, {
         taskId: task.id,
         roleName: run.roleName,
@@ -942,7 +927,7 @@ function retireTaskCommand(
         mailboxDisposition: "discard",
         outcome: {
           status: "failed",
-          summary: `Task ${status}: ${summary}`
+          summary: `Task retired: ${summary}`
         }
       }, now);
       if (terminal.disposition !== "applied") {
@@ -952,21 +937,19 @@ function retireTaskCommand(
       }
     }
 
-    const workDisposition = status === "cancelled" ? "cancelled" : "abandoned";
     for (const item of tx.listWorkItems(task.id)) {
       if (item.status === "completed" || item.disposition !== undefined) continue;
-      if (["cancelled", "superseded", "abandoned"].includes(item.status)) continue;
-      tx.saveWorkItem(task.id, disposeWorkItem(item, {
-        kind: workDisposition,
+      if (item.status === "retired") continue;
+      tx.saveWorkItem(task.id, retireWorkItem(item, {
         by: "leader",
-        summary: `Task ${status}: ${summary}`
+        summary: `Task retired: ${summary}`
       }, now));
     }
     for (const request of tx.listInputRequests(task.id)) {
       if (request.status === "open") {
         tx.saveInputRequest(
           task.id,
-          cancelInputRequest(request, `Task ${status}: ${summary}`, now)
+          cancelInputRequest(request, `Task retired: ${summary}`, now)
         );
       }
     }
@@ -1024,14 +1007,12 @@ function retireTaskCommand(
     tx.clearLeaderFailure(task.id);
     tx.clearOperatorNotification(task.id);
     const retired = retireTask(task, {
-      status,
       by: "leader",
       summary,
       ...(replacementTaskId === undefined ? {} : { replacementTaskId })
     }, now);
     tx.saveTask(retired);
     recordTaskEvent(tx, task.id, "task.retired", {
-      status,
       by: "leader",
       summary,
       ...(replacementTaskId === undefined ? {} : { replacementTaskId })
@@ -1041,7 +1022,7 @@ function retireTaskCommand(
   if (result.changed) options.runtime?.notifyStateChanged(result.task.id);
   return output(
     result.changed
-      ? `Retired task ${result.task.id} as ${result.task.status}\n`
+      ? `Retired task ${result.task.id}\n`
       : `Task ${result.task.id} is already ${result.task.status}\n`,
     { task: result.task }
   );
@@ -1099,7 +1080,7 @@ export function validateTaskArchiveRequest(
   taskActor(options, task.id);
   if (task.status !== "archived"
     && task.status !== "completed"
-    && !["cancelled", "superseded", "abandoned"].includes(task.status)) {
+    && task.status !== "retired") {
     throw usageError(`Task ${task.id} must be completed or retired before it can be archived.`);
   }
   if (task.status !== "archived") {
@@ -1195,10 +1176,52 @@ function taskRoleCommand(
   if (command === "remove") return output(removeTaskRole(rest, store, options));
   if (command === "bind") return output(bindTaskRole(rest, store, options));
   if (command === "unbind") return output(unbindTaskRole(rest, store, options));
+  if (command === "reset") return resetTaskRole(rest, store, options);
   if (command === "enter") return enterTaskRole(rest, store, options);
   throw usageError(command === undefined
     ? "Task role command is required."
     : `Unknown command: task role ${command}`);
+}
+
+function resetTaskRole(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task role reset usage: yui task role reset <task> <role> --reason <text>.";
+  const parsed = parseTail(args, new Set(["--reason"]), usage);
+  exactPositionals(parsed.positionals, 2, usage);
+  const reason = requiredOption(parsed.options, "--reason");
+  const now = clock(options);
+  let result;
+  try {
+    result = store.transaction((tx) => resetTaskRoleSessionGeneration(
+      tx,
+      parsed.positionals[0],
+      parsed.positionals[1],
+      reason,
+      now
+    ));
+  } catch (error) {
+    throw usageError(error instanceof Error ? error.message : String(error), usage);
+  }
+  const target = runtimeLifecycleTarget({
+    scope: "task",
+    taskId: result.taskId,
+    roleName: result.roleName
+  });
+  options.runtime?.notifyMailboxChanged?.(target);
+  notifyMailbox(
+    options.runtime,
+    result.roleName === LEADER_ROLE
+      ? { kind: "operator" }
+      : leaderMailbox(result.taskId),
+    result.taskId
+  );
+  return output(
+    `Reset Task Role Session ${result.taskId}/${result.roleName}; runtime cleanup is pending.\n`,
+    result
+  );
 }
 
 function addTaskRole(
@@ -1260,7 +1283,7 @@ function addTaskRole(
       agent: `${created.activeAgentId}/${binding.adapterId}`,
       model: binding.config.model ?? "CLI default",
       effort: binding.config.effort ?? "CLI default",
-      permissionStrategy: binding.config.permission?.strategy ?? "default",
+      permissionStrategy: binding.config.permission.strategy,
       ...roleLaunchEventPayload(created, null)
     }, now);
     return { role: created, binding };
@@ -1270,7 +1293,7 @@ function addTaskRole(
     `Added role ${result.role.name} to ${result.role.taskId}`,
     `Runtime source: ${agentId === undefined ? "Global Role worker" : `Explicit Agent ${agentId}`}`,
     `Agent: ${result.role.activeAgentId}/${result.binding.adapterId}`,
-    `Model: ${result.binding.config.model ?? "CLI default"}; effort: ${result.binding.config.effort ?? "CLI default"}; permission: ${result.binding.config.permission?.strategy ?? "default"}`,
+    `Model: ${result.binding.config.model ?? "CLI default"}; effort: ${result.binding.config.effort ?? "CLI default"}; permission: ${result.binding.config.permission.strategy}`,
     "Next: create a WorkItem and start this Role when it has assigned work."
   ].join("\n").concat("\n");
 }
@@ -1587,7 +1610,7 @@ function taskWorkCommand(
   if (command === "review") return reviewWork(rest, store, options);
   if (command === "accept") return acceptWork(rest, store, options);
   if (command === "reject") return rejectWork(rest, store, options);
-  if (command === "dispose") return disposeWork(rest, store, options);
+  if (command === "retire") return retireWork(rest, store, options);
   throw usageError(command === undefined
     ? "Task work command is required."
     : `Unknown command: task work ${command}`);
@@ -1771,7 +1794,7 @@ function updateWork(
     throw usageError(
       `Assigned Work Item execution cannot use task work update: ${current.id}. `
       + "Use dispatch and run yield, then let the Task Leader accept or reject the result; "
-      + "use task work dispose for an explicit Leader disposition."
+      + "use task work retire for an explicit Leader retirement."
     );
   });
   notifyMailbox(options.runtime, taskMailbox(result.item.taskId), result.item.taskId);
@@ -2107,38 +2130,26 @@ function rejectWork(
   return output(`Rejected Work Item ${rejected.id}\n`, { workItem: rejected });
 }
 
-function disposeWork(
+function retireWork(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task work dispose usage: yui task work dispose <task>/<work> <cancelled|abandoned|replaced> --summary <text> [--replacement <task>/<work>].";
+  const usage = "Task work retire usage: yui task work retire <task>/<work> --summary <text> [--replacement <task>/<work>].";
   const parsed = parseTail(args, new Set(["--summary", "--replacement"]), usage);
-  exactPositionals(parsed.positionals, 2, usage);
+  exactPositionals(parsed.positionals, 1, usage);
   const workItemId = parsed.positionals[0]!;
-  const kind = parsed.positionals[1];
-  if (kind !== "cancelled" && kind !== "abandoned" && kind !== "replaced") {
-    throw usageError(`Work Item disposition is invalid: ${String(kind)}.`, usage);
-  }
   const summary = requiredOption(parsed.options, "--summary");
   const replacementWorkItemId = parsed.options.get("--replacement");
-  if ((kind === "replaced") !== (replacementWorkItemId !== undefined)) {
-    throw usageError(
-      kind === "replaced"
-        ? "A replaced Work Item requires --replacement."
-        : "Only a replaced Work Item may use --replacement.",
-      usage
-    );
-  }
   const now = clock(options);
-  const disposed = store.transaction((tx) => {
+  const retired = store.transaction((tx) => {
     const item = requireWorkItem(tx, workItemId, options);
     const task = requireTask(tx, item.taskId);
     if (task.status !== "active") {
       throw usageError(`Task is not active: ${task.id}/${task.status}.`);
     }
     if (taskActor(options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may dispose a Work Item.");
+      throw usageError("Only the Task Leader may retire a Work Item.");
     }
     if (replacementWorkItemId !== undefined) {
       const replacement = requireWorkItem(tx, replacementWorkItemId, options);
@@ -2154,7 +2165,6 @@ function disposeWork(
     for (const run of tx.listAgentRuns(task.id).filter((candidate) => (
       candidate.status === "active" && candidate.workItemId === item.id
     ))) {
-      const role = requireRole(tx, task.id, run.roleName);
       const terminal = terminalizeExactTaskRun(tx, {
         taskId: task.id,
         roleName: run.roleName,
@@ -2164,26 +2174,24 @@ function disposeWork(
         runtimeCleanup: "required",
         outcome: {
           status: "failed",
-          summary: `Work Item ${kind}: ${summary}`
+          summary: `Work Item retired: ${summary}`
         }
       }, now);
       if (terminal.disposition !== "applied") {
         throw usageError(
-          `Work Item Run changed during disposition: ${run.id}/${terminal.reason ?? "obsolete"}.`
+          `Work Item Run changed during retirement: ${run.id}/${terminal.reason ?? "obsolete"}.`
         );
       }
     }
-    const next = disposeWorkItem(item, {
-      kind,
+    const next = retireWorkItem(item, {
       by: "leader",
       summary,
       ...(replacementWorkItemId === undefined ? {} : { replacementWorkItemId })
     }, now);
     if (next !== item) {
       tx.saveWorkItem(task.id, next);
-      recordTaskEvent(tx, task.id, "work.disposed", {
+      recordTaskEvent(tx, task.id, "work.retired", {
         workItemId: next.id,
-        disposition: kind,
         summary,
         ...(replacementWorkItemId === undefined
           ? {}
@@ -2192,8 +2200,8 @@ function disposeWork(
     }
     return next;
   });
-  options.runtime?.notifyStateChanged(disposed.taskId);
-  return output(`Disposed Work Item ${disposed.id} as ${kind}\n`, { workItem: disposed });
+  options.runtime?.notifyStateChanged(retired.taskId);
+  return output(`Retired Work Item ${retired.id}\n`, { workItem: retired });
 }
 
 function listWork(args: string[], store: TaskWorkflowStore): TaskCommandExecution {
@@ -2245,7 +2253,7 @@ function showWork(
     `Write Projects: ${item.writeProjectIds.join(", ") || "-"}`,
     `Acceptance: ${item.acceptance.length === 0 ? "-" : item.acceptance.join("; ")}`,
     `Outcome: ${item.outcome ?? "-"}`,
-    `Disposition: ${item.disposition?.kind ?? "-"}`,
+    `Retirement: ${item.disposition === undefined ? "-" : "retired"}`,
     `Replacement: ${replacement ?? "-"}`
   ].join("\n");
   return output(`${rendered}\n`, { workItem: item });
@@ -2332,7 +2340,7 @@ function listRuns(
       { header: "Purpose", minWidth: 6, maxWidth: 10 },
       { header: "Mode", minWidth: 4, maxWidth: 8 },
       { header: "Effective", minWidth: 10, maxWidth: 30 },
-      { header: "Access", minWidth: 6, maxWidth: 8 },
+      { header: "Profile", minWidth: 7, maxWidth: 8 },
       { header: "Permission", minWidth: 8, maxWidth: 16 },
       { header: "Status", minWidth: 6, maxWidth: 12 },
       { header: "Summary", minWidth: 8, maxWidth: 58 }
@@ -2343,7 +2351,7 @@ function listRuns(
       run.purpose,
       run.mode,
       `${run.effective.agentId}/${run.effective.adapterId} r${run.effective.sourceDesiredRevision}`,
-      run.effective.access,
+      run.effective.profileAccess,
       run.effective.permission.strategy,
       run.status,
       run.summary ?? "-"
@@ -2476,7 +2484,8 @@ function yieldRun(
       } catch (error) {
         throw usageError(error instanceof Error ? error.message : String(error));
       }
-      if (reviewReport.evidenceCommit !== options.reviewWorkspaceResult.evidenceCommit) {
+      if (reviewReport.evidenceCommit !== undefined
+        && reviewReport.evidenceCommit !== options.reviewWorkspaceResult.evidenceCommit) {
         throw usageError(
           `Reported Review evidence commit does not match the managed workspace: ${active.id}.`
         );
@@ -2494,6 +2503,7 @@ function yieldRun(
         ? {}
         : {
             reviewResult: {
+              report: reviewReport.report,
               checks: reviewReport.checks,
               ...(options.reviewWorkspaceResult?.evidenceCommit === undefined
                 ? {}
@@ -2511,7 +2521,7 @@ function yieldRun(
     const message = appendMessage(
       tx,
       task.id,
-      summary,
+      reviewReport?.report ?? summary,
       "role-result",
       { type: "role", roleName: role.name },
       now,
@@ -2738,7 +2748,7 @@ export function dispatchPreparedReviewRound(
       "Start from the user's core outcome and the WorkItem intent. The candidate summary is a pointer, not proof: inspect the complete relevant change, callers, and proportionate checks.",
       "You may freely edit source/tests, run local build or test commands, and optionally commit diagnostic evidence only inside this ReviewRound-owned workspace.",
       "Do not push, integrate, mutate Task state, touch the Candidate or Worker workspace, another Task/workspace, a stable checkout, or real YUI_HOME.",
-      "The exact --summary-file - body for Review yield must be one JSON object: {\"summary\":\"...\",\"checks\":[{\"name\":\"...\",\"outcome\":\"passed|failed|skipped\",\"details\":\"...\"}],\"evidenceCommit\":\"optional exact SHA\"}. Report at least one check; use skipped with details when a check was not run. Omit evidenceCommit when you made no diagnostic commit.",
+      "Use the exact --summary-file - body to report complete findings, evidence, checks actually run, uncertainty, and recommended next actions in clear Markdown or JSON. Yui preserves the full report; no fixed wording or field list is required. If you include evidenceCommit, it must match the managed Review workspace.",
       "Report reviewBaseCommit, exact checks/results, material findings, and uncertainty. Review yield completes only this Round and creates no Candidate or ChangeSet.",
       "The Leader alone interprets and routes evidence to the original Worker; never merge review evidence yourself."
     ].join("\n");
@@ -2946,7 +2956,7 @@ function roleLaunchEventPayload(
     effectiveRevision: effective === undefined
       ? "none"
       : String(effective.sourceDesiredRevision),
-    effectiveAccess: effective?.access ?? "none",
+    profileAccess: effective?.profileAccess ?? "none",
     effectivePermission: effective?.permission.strategy ?? "none",
     desiredDrift: effective === undefined
       ? "not-started"
@@ -2964,7 +2974,7 @@ function runLaunchEventPayload(run: AgentRun): TaskEventPayload {
     mode: run.mode,
     agent: `${run.effective.agentId}/${run.effective.adapterId}`,
     effectiveRevision: String(run.effective.sourceDesiredRevision),
-    effectiveAccess: run.effective.access,
+    profileAccess: run.effective.profileAccess,
     effectivePermission: run.effective.permission.strategy,
     writeProjectIds: run.effective.writeProjectIds.join(",") || "none",
     ...(run.reviewRoundId === undefined
@@ -3078,7 +3088,7 @@ function chronologicalAgentRuns(runs: readonly AgentRun[]): AgentRun[] {
 }
 
 function isTerminalWorkItemStatus(status: WorkItemStatus): boolean {
-  return ["completed", "failed", "cancelled", "superseded", "abandoned"].includes(status);
+  return ["completed", "failed", "retired"].includes(status);
 }
 
 function assertTaskOpen(task: Task): void {
@@ -3086,9 +3096,7 @@ function assertTaskOpen(task: Task): void {
     throw usageError(`Task ${task.id} is completed; reopen it before continuing.`);
   }
   if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
-  if (["cancelled", "superseded", "abandoned"].includes(task.status)) {
-    throw usageError(`Task is retired: ${task.id}/${task.status}.`);
-  }
+  if (task.status === "retired") throw usageError(`Task is retired: ${task.id}.`);
 }
 
 function taskActor(options: TaskCommandOptions, taskId: string) {
@@ -3102,9 +3110,7 @@ function inactiveTaskMessage(task: Task, action: string): string {
   if (task.status === "completed") {
     return `Task ${task.id} is completed; reopen it before ${action}.`;
   }
-  if (["cancelled", "superseded", "abandoned"].includes(task.status)) {
-    return `Task ${task.id} is retired as ${task.status}; it cannot resume ${action}.`;
-  }
+  if (task.status === "retired") return `Task ${task.id} is retired; it cannot resume ${action}.`;
   return `Task is archived: ${task.id}.`;
 }
 

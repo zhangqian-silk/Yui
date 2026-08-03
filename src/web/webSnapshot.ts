@@ -45,9 +45,7 @@ export function buildWebDashboardSnapshot(
       draft: 0,
       active: 0,
       completed: 0,
-      cancelled: 0,
-      superseded: 0,
-      abandoned: 0,
+      retired: 0,
       archived: 0
     };
     const projectNames = new Map(reader.listProjects().map((project) => [project.id, project.name]));
@@ -132,9 +130,7 @@ function countWorkItems(items: readonly WorkItem[]): WorkItemCounts {
     awaiting_acceptance: 0,
     completed: 0,
     failed: 0,
-    cancelled: 0,
-    superseded: 0,
-    abandoned: 0
+    retired: 0
   };
   const mutable = counts as Record<keyof WorkItemCounts, number>;
   for (const item of items) {
@@ -148,10 +144,8 @@ function compareDashboardTasks(left: DashboardTask, right: DashboardTask): numbe
     active: 0,
     draft: 1,
     completed: 2,
-    cancelled: 3,
-    superseded: 4,
-    abandoned: 5,
-    archived: 6
+    retired: 3,
+    archived: 4
   };
   return statusOrder[left.status] - statusOrder[right.status]
     || Date.parse(right.updatedAt) - Date.parse(left.updatedAt)

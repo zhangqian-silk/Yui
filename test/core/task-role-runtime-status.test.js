@@ -7,10 +7,8 @@ import test from "node:test";
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import {
-  bindTaskRoleRun,
   createRoleSessionSet,
-  declareTaskRoleSessionUnusable,
-  markTaskRoleRunDelivered
+  resetTaskRoleSession
 } from "../../dist/executor/agentExecutor.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { createInputRequest } from "../../dist/input/inputRequest.js";
@@ -104,7 +102,7 @@ function dispatchTestRun(store, taskId, roleName, workItemId) {
   return run;
 }
 
-function recordPendingSessionRetirement(store, taskId, roleName, run) {
+function recordResetSession(store, taskId, roleName) {
   const role = store.getRole(taskId, roleName);
   let sessions = createRoleSessionSet(
     { scope: "task", taskId, roleName },
@@ -119,25 +117,7 @@ function recordPendingSessionRetirement(store, taskId, roleName, run) {
     policy: "fixed",
     status: "running"
   }, NOW);
-  const fence = {
-    agentId: role.activeAgentId,
-    runId: run.id,
-    receiptId: `agent-run:${taskId}/${run.id}`
-  };
-  sessions = bindTaskRoleRun(sessions, fence, NOW);
-  sessions = markTaskRoleRunDelivered(sessions, fence, NOW);
-  sessions = declareTaskRoleSessionUnusable(sessions, {
-    id: `session-retirement-${run.id}`,
-    taskId,
-    roleName,
-    agentId: role.activeAgentId,
-    adapterId: role.agentBindings[role.activeAgentId].adapterId,
-    runId: run.id,
-    receiptId: fence.receiptId,
-    nativeSessionId: "native-unusable",
-    launchId: "launch-unusable",
-    reason: "Operator confirmed this fixed Session cannot run another Turn."
-  }, NOW);
+  sessions = resetTaskRoleSession(sessions, NOW);
   store.saveTaskRoleSessionSet(sessions);
   enqueueWork(
     store,
@@ -215,26 +195,20 @@ test("Task Role status explains persisted and live state without capturing outpu
   assert.equal(result.data.role.nativeSession, null);
 });
 
-test("Task Role status separates live runtime from an Operator-declared unusable Session", (t) => {
+test("Task Role status separates live runtime from pending reset cleanup", (t) => {
   const { store, options } = fixture(t);
   execute(["create", "Inspect unusable Session"], store, options);
   const task = store.listTasks()[0];
   execute(["role", "add", task.id, "worker"], store, options);
-  execute(["work", "create", task.id, "Run it"], store, options);
   execute(["activate", task.id], store, options);
-  const run = dispatchTestRun(store, task.id, "worker", store.listWorkItems(task.id)[0].id);
-  store.saveAgentRun({ ...run, deliveredAt: NOW.toISOString() });
-  recordPendingSessionRetirement(store, task.id, "worker", run);
+  recordResetSession(store, task.id, "worker");
 
   const result = execute(["role", "status", task.id, "worker"], store, options);
   assert.equal(result.data.role.tmux.state, "running");
   assert.equal(result.data.role.health, "needs-attention");
-  assert.equal(result.data.role.sessionRetirement.state, "cleanup-pending");
-  assert.equal(result.data.role.sessionRetirement.nativeSessionId, "native-unusable");
   assert.equal(result.data.role.runtimeCleanupPending, true);
   assert.equal(result.data.role.freshLaunchAllowed, false);
-  assert.match(result.output, /Session usability\s+operator-declared-unusable \(cleanup-pending\)/);
-  assert.match(result.output, /Operator confirmed this fixed Session cannot run another Turn\./);
+  assert.equal(result.data.role.nativeSession, null);
   assert.match(result.output, /Runtime cleanup\s+pending/);
   assert.match(result.output, /Fresh launch\s+blocked/);
   assert.match(result.output, /tmux pane\s+running/);
@@ -242,9 +216,7 @@ test("Task Role status separates live runtime from an Operator-declared unusable
   const list = execute(["role", "list", task.id], store, options);
   const listedWorker = list.data.roles.find((status) => status.roleName === "worker");
   assert.equal(listedWorker.health, "needs-attention");
-  assert.equal(listedWorker.sessionRetirement.state, "cleanup-pending");
-  assert.match(list.output, /unusable/);
-  assert.match(list.output, /\(cleanup-pending\)/);
+  assert.equal(listedWorker.runtimeCleanupPending, true);
 });
 
 test("Task Role health distinguishes queued, orphaned delivered, and exited runtime states", (t) => {

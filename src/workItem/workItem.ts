@@ -15,23 +15,17 @@ export type WorkItemStatus =
   | "awaiting_acceptance"
   | "completed"
   | "failed"
-  | "cancelled"
-  | "superseded"
-  | "abandoned";
-
-export type WorkItemDispositionKind = "cancelled" | "abandoned" | "replaced";
+  | "retired";
 
 export type WorkItemDisposition = Readonly<{
   schemaVersion: 1;
-  kind: WorkItemDispositionKind;
   by: "leader";
   summary: string;
-  disposedAt: string;
+  retiredAt: string;
   replacementWorkItemId?: string;
 }>;
 
 export type WorkItemDispositionInput = Readonly<{
-  kind: WorkItemDispositionKind;
   by: "leader";
   summary: string;
   replacementWorkItemId?: string;
@@ -89,9 +83,7 @@ export type WorkItem = {
 const TERMINAL_STATUSES: readonly WorkItemStatus[] = [
   "completed",
   "failed",
-  "cancelled",
-  "superseded",
-  "abandoned"
+  "retired"
 ];
 
 export function createWorkItem(
@@ -186,10 +178,9 @@ export function updateWorkItemStatus(
   validateStatus(status);
   const alreadyTerminal = isTerminalStatus(workItem.status);
   if (workItem.disposition !== undefined && status !== workItem.status) {
-    throw new Error(`Disposed Work Item status cannot change: ${workItem.id}.`);
+    throw new Error(`Retired Work Item status cannot change: ${workItem.id}.`);
   }
-  const closingFailedWork = workItem.status === "failed"
-    && (status === "cancelled" || status === "superseded");
+  const closingFailedWork = workItem.status === "failed" && status === "retired";
   if (alreadyTerminal && status !== workItem.status && !closingFailedWork) {
     throw new Error(`Terminal Work Item status cannot change: ${workItem.id}.`);
   }
@@ -220,8 +211,7 @@ export function updateWorkItemStatus(
     status,
     revision: workItem.revision + 1,
     ...(normalizedOutcome === undefined ? {} : { outcome: normalizedOutcome }),
-    // An isolated result's disposition is still durable evidence after the
-    // failed WorkItem is explicitly cancelled or superseded.
+    // Isolated workspace cleanup remains durable evidence after retirement.
     ...(closingFailedWork && workspaceDisposition !== undefined
       ? { workspaceDisposition }
       : {}),
@@ -235,19 +225,16 @@ export function updateWorkItemStatus(
  * fact. Replays of the same decision are idempotent; a different terminal
  * decision can never overwrite the first one.
  */
-export function disposeWorkItem(
+export function retireWorkItem(
   workItem: WorkItem,
   input: WorkItemDispositionInput,
   now: Date
 ): WorkItem {
   validateWorkItem(workItem);
   const disposition = normalizeDisposition(input, now);
-  const status: WorkItemStatus = disposition.kind === "replaced"
-    ? "superseded"
-    : disposition.kind;
   if (workItem.disposition !== undefined) {
     if (
-      workItem.status === status
+      workItem.status === "retired"
       && sameDisposition(workItem.disposition, disposition)
     ) {
       return workItem;
@@ -255,17 +242,17 @@ export function disposeWorkItem(
     throw new Error(`Work Item already has an explicit disposition: ${workItem.id}.`);
   }
   if (workItem.status === "completed") {
-    throw new Error(`Completed Work Item cannot be disposed: ${workItem.id}.`);
+    throw new Error(`Completed Work Item cannot be retired: ${workItem.id}.`);
   }
   if (isTerminalStatus(workItem.status)
     && workItem.status !== "failed"
-    && workItem.status !== status) {
+    && workItem.status !== "retired") {
     throw new Error(`Terminal Work Item status cannot change: ${workItem.id}.`);
   }
-  const timestamp = disposition.disposedAt;
+  const timestamp = disposition.retiredAt;
   return validateWorkItem({
     ...workItem,
-    status,
+    status: "retired",
     outcome: disposition.summary,
     disposition,
     revision: workItem.revision + 1,
@@ -280,7 +267,7 @@ export function retryFailedWorkItem(workItem: WorkItem, now: Date): WorkItem {
     throw new Error(`Work item is not retryable from ${workItem.status}: ${workItem.id}.`);
   }
   if (workItem.workspaceDisposition !== undefined) {
-    throw new Error(`Work item workspace is already disposed: ${workItem.id}.`);
+    throw new Error(`Work item workspace is already settled: ${workItem.id}.`);
   }
   const { outcome: _outcome, endedAt: _endedAt, ...base } = workItem;
   return validateWorkItem({
@@ -384,14 +371,11 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
   }
   if (workItem.disposition !== undefined) {
     validateDisposition(workItem.disposition);
-    const expectedStatus: WorkItemStatus = workItem.disposition.kind === "replaced"
-      ? "superseded"
-      : workItem.disposition.kind;
-    if (workItem.status !== expectedStatus) {
+    if (workItem.status !== "retired") {
       throw new Error("Work Item disposition does not match its status.");
     }
     if (workItem.outcome !== workItem.disposition.summary
-      || workItem.endedAt !== workItem.disposition.disposedAt) {
+      || workItem.endedAt !== workItem.disposition.retiredAt) {
       throw new Error("Work Item disposition does not match its terminal metadata.");
     }
   }
@@ -565,9 +549,7 @@ function validateStatus(status: WorkItemStatus): void {
     "awaiting_acceptance",
     "completed",
     "failed",
-    "cancelled",
-    "superseded",
-    "abandoned"
+    "retired"
   ].includes(status)) {
     throw new Error(`Work Item status is invalid: ${String(status)}.`);
   }
@@ -577,29 +559,19 @@ function normalizeDisposition(
   input: WorkItemDispositionInput,
   now: Date
 ): WorkItemDisposition {
-  const kind = input.kind;
-  if (!( ["cancelled", "abandoned", "replaced"] as const).includes(kind)) {
-    throw new Error(`Work Item disposition kind is invalid: ${String(kind)}.`);
-  }
   if (input.by !== "leader") {
-    throw new Error("Only the Task Leader may dispose a Work Item.");
+    throw new Error("Only the Task Leader may retire a Work Item.");
   }
   const summary = requireText(input.summary, "Work item disposition summary");
   const replacementWorkItemId = input.replacementWorkItemId;
-  if (kind === "replaced") {
-    if (replacementWorkItemId === undefined) {
-      throw new Error("A replaced Work Item requires a replacement Work Item reference.");
-    }
+  if (replacementWorkItemId !== undefined) {
     requireIdentity(replacementWorkItemId, "Replacement Work Item id");
-  } else if (replacementWorkItemId !== undefined) {
-    throw new Error("Only a replaced Work Item may reference a replacement.");
   }
   const result: WorkItemDisposition = {
     schemaVersion: 1,
-    kind,
     by: "leader",
     summary,
-    disposedAt: now.toISOString(),
+    retiredAt: now.toISOString(),
     ...(replacementWorkItemId === undefined ? {} : { replacementWorkItemId })
   };
   return validateDisposition(result);
@@ -609,18 +581,13 @@ function validateDisposition(disposition: WorkItemDisposition): WorkItemDisposit
   if (disposition.schemaVersion !== 1) {
     throw new Error("Work Item disposition must use schemaVersion 1.");
   }
-  if (!( ["cancelled", "abandoned", "replaced"] as const).includes(disposition.kind)) {
-    throw new Error("Work Item disposition kind is invalid.");
-  }
   if (disposition.by !== "leader") {
     throw new Error("Work Item disposition actor is invalid.");
   }
   requireText(disposition.summary, "Work item disposition summary");
-  requireTimestamp(disposition.disposedAt, "Work Item disposedAt");
-  if (disposition.kind === "replaced") {
-    requireIdentity(disposition.replacementWorkItemId ?? "", "Replacement Work Item id");
-  } else if (disposition.replacementWorkItemId !== undefined) {
-    throw new Error("Only a replaced Work Item may reference a replacement.");
+  requireTimestamp(disposition.retiredAt, "Work Item retiredAt");
+  if (disposition.replacementWorkItemId !== undefined) {
+    requireIdentity(disposition.replacementWorkItemId, "Replacement Work Item id");
   }
   return disposition;
 }
@@ -629,8 +596,7 @@ function sameDisposition(
   left: WorkItemDisposition,
   right: WorkItemDisposition
 ): boolean {
-  return left.kind === right.kind
-    && left.by === right.by
+  return left.by === right.by
     && left.summary === right.summary
     && left.replacementWorkItemId === right.replacementWorkItemId;
 }

@@ -930,6 +930,39 @@ for (const terminalStatus of ["stopped", "broken"]) {
   });
 }
 
+test("Operator notification delivery requires a structured ready Session", (t) => {
+  const { home, store, now, adapter } = fixture(t);
+  const role = createGlobalRole(
+    "operator",
+    [createRoleAgentBinding({ id: "codex", adapterId: "codex" })],
+    "codex",
+    home,
+    now
+  );
+  store.saveGlobalRole(role);
+  assert.equal(adapter.getOperatorDeliveryTarget(), null);
+
+  adapter.recordGlobalRuntimeNativeSession({
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-operator"
+  }, now);
+  assert.equal(adapter.getOperatorDeliveryTarget(), null);
+
+  adapter.observeGlobalRuntimeTurnCompleted({
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-operator",
+    turnId: "turn-operator-ready"
+  }, new Date(now.getTime() + 1));
+  assert.deepEqual(adapter.getOperatorDeliveryTarget(), {
+    roleName: "operator",
+    adapterId: "codex"
+  });
+});
+
 test("a Hook classified for Run A cannot close Run B after an intervening dispatch", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
   const first = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "A", now);

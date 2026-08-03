@@ -231,11 +231,6 @@ function permissionPatch(
   if (selected !== "configured" && !nativeOptions) {
     return structuredClone(current ?? { strategy: "bypass" }) as Record<string, unknown>;
   }
-  if (selected === undefined && current?.strategy !== "configured") {
-    throw usageError(
-      "Provider permission options require --permission-strategy configured."
-    );
-  }
   const permission = current?.strategy === "configured"
     ? structuredClone(current) as unknown as Record<string, unknown>
     : { strategy: "configured" } as Record<string, unknown>;

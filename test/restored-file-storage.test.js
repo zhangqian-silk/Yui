@@ -26,7 +26,7 @@ function readEffective(agentId, adapterId, workspace) {
     sourceDesiredRevision: 1,
     agentId,
     adapterId,
-    access: "read",
+    profileAccess: "read",
     search: false,
     permission: adapterId === "codex"
       ? { strategy: "configured", sandbox: "read-only", approval: "never" }
@@ -49,10 +49,10 @@ function readEffective(agentId, adapterId, workspace) {
     context: {}
   };
 }
-test("storage schema initializes layout v6 with aggregate v13 and rejects non-current versions", () => {
+test("storage schema initializes layout v6 with aggregate v14 and rejects non-current versions", () => {
   const home = temporaryHome();
   assert.equal(CURRENT_STORAGE_LAYOUT_VERSION, 6);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 13);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 14);
   assert.equal(inspectStorageSchema(home).status, "uninitialized");
 
   ensureStorageSchema(home, new Date("2026-07-19T00:00:00.000Z"));
@@ -151,8 +151,6 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     owner: { scope: "task", taskId: task.id, roleName: "leader" },
     inFlight: null,
     pendingTurnCompletion: null,
-    unusableSessionRetirement: null,
-    retiredSessions: {},
     sessions: {
       codex: { ...globalSessions.sessions.codex, nativeSessionId: "task-session" }
     }
@@ -226,8 +224,8 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   });
 
   const onDisk = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
-  assert.equal(onDisk.schemaVersion, 13);
-  assert.equal(onDisk.tasks[task.id].schemaVersion, 12);
+  assert.equal(onDisk.schemaVersion, 14);
+  assert.equal(onDisk.tasks[task.id].schemaVersion, 13);
   assert.equal(onDisk.revision, 1);
   assert.deepEqual(store.getConfiguredAgent("codex"), agent);
   assert.deepEqual(store.getGlobalRole("operator"), globalRole);
@@ -268,7 +266,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify(incompatible));
   assert.throws(
     () => new FileTaskStore(home).listTasks(),
-    /Task aggregate task-1 must use schemaVersion 12/
+    /Task aggregate task-1 must use schemaVersion 13/
   );
 });
 
@@ -520,7 +518,7 @@ test("record versions and aggregate shape are validated without silently repairi
   );
 
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify({
-    schemaVersion: 13,
+    schemaVersion: 14,
     revision: 1,
     config: { schemaVersion: 1 },
     configuredAgents: {},

@@ -154,14 +154,14 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
   assert.match(worker, /result and records the actual Profile revision/u);
   assert.match(
     worker,
-    /Every review Run is bound to one frozen Candidate commit[\s\S]*separate\s+ReviewRound-owned writable worktree[\s\S]*only authority to work locally/u
+    /Every review Run is bound to one frozen Candidate commit[\s\S]*separate\s+ReviewRound-owned writable worktree[\s\S]*exact ReviewRound workspace and brief authorize local work/u
   );
   assert.match(
     worker,
     /one bounded evidence pass[\s\S]*Do not repeat successful\s+checks[\s\S]*yield immediately/ui
   );
   assert.match(worker, /do not wrap it in `until`[\s\S]*duplicate or late\s+review yield is obsolete/u);
-  assert.match(worker, /review Run only[\s\S]*exactly one JSON result object[\s\S]*at least one named check/ui);
+  assert.match(worker, /For a review Run[\s\S]*Clear Markdown is sufficient[\s\S]*Do not invent a check merely to satisfy a schema/ui);
   assert.match(worker, /dirty no-commit workspace may\s+yield[\s\S]*cannot be cleaned\s+until it is clean/ui);
   assert.match(
     worker,

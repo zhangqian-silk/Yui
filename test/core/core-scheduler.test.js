@@ -188,7 +188,7 @@ test("a pre-send Leader failure forgets its transient prepared binding", async (
   const delivery = fakeDelivery();
   delivery.waitUntilReady = async (prepared) => {
     delivery.calls.push({ type: "ready", prepared });
-    throw new Error("composer inspection failed");
+    throw new Error("process inspection failed");
   };
 
   const [result] = await processLeaderWakeups(store, delivery, NOW);
@@ -417,7 +417,7 @@ test("a present Role remains active until its native Turn Hook is observed", asy
   const delivery = {
     ...fakeDelivery({ inspect: "present" }),
     async inspectRoleReadiness() {
-      throw new Error("composer readiness is not a native Turn boundary");
+      throw new Error("process readiness is not a native Turn boundary");
     }
   };
 

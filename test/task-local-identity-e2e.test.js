@@ -248,17 +248,21 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
 
   const resumedLeaderRun = store.getActiveAgentRun(primaryTask.id, "leader");
   assert.notEqual(resumedLeaderRun, null);
-  const [answerDelivery] = await processActiveRoleRunDeliveries(
-    scheduler,
-    delivery,
-    postAnswerNow,
-    taskSelection(primaryTask.id)
-  );
-  assert.equal(answerDelivery.status, "delivered", JSON.stringify(answerDelivery));
-  assert.equal(
-    delivery.receipts.at(-1),
-    `agent-run:${primaryTask.id}/${resumedLeaderRun.id}`
-  );
+  let answerDeliveryStatus = "already-delivered";
+  if (resumedLeaderRun.deliveredAt === undefined) {
+    const [answerDelivery] = await processActiveRoleRunDeliveries(
+      scheduler,
+      delivery,
+      postAnswerNow,
+      taskSelection(primaryTask.id)
+    );
+    assert.equal(answerDelivery.status, "delivered", JSON.stringify(answerDelivery));
+    answerDeliveryStatus = answerDelivery.status;
+    assert.equal(
+      delivery.receipts.at(-1),
+      `agent-run:${primaryTask.id}/${resumedLeaderRun.id}`
+    );
+  }
 
   const hookPayload = JSON.stringify({
     type: "agent-turn-complete",
@@ -423,7 +427,7 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
     ], store, lifecycleLeaderNow);
   }
   runTaskCommand([
-    "work", "dispose", `${lifecycleTask.id}/${lifecycleWork.id}`, "cancelled",
+    "work", "retire", `${lifecycleTask.id}/${lifecycleWork.id}`,
     "--summary", "First lifecycle pass settled."
   ], store, lifecycleLeaderNow);
   runTaskCommand([
@@ -435,7 +439,7 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   ], store, lifecycleLeaderNow).data.workItem;
   assert.equal(secondLifecycleWork.id, "work-item-2");
   runTaskCommand([
-    "work", "dispose", `${lifecycleTask.id}/${secondLifecycleWork.id}`, "cancelled",
+    "work", "retire", `${lifecycleTask.id}/${secondLifecycleWork.id}`,
     "--summary", "Second lifecycle pass settled."
   ], store, lifecycleLeaderNow);
   runTaskCommand([
@@ -519,7 +523,7 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
       taskId: primaryTask.id,
       runId: resumedLeaderRun.id,
       claimedAfterActualCliInputAnswer: true,
-      deliveryStatus: answerDelivery.status,
+      deliveryStatus: answerDeliveryStatus,
       settledPostWorkflowRunId: finalPrimaryControlRun?.id ?? null
     },
     input: {

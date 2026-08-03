@@ -691,7 +691,7 @@ test("after Controller restart an existing running host reuses its generation wi
 });
 
 for (const inspectionState of ["starting", "unavailable"]) {
-  test(`same-Run ${inspectionState} recovery retains its exact generation as a typed retry`, async (t) => {
+  test(`same-Run ${inspectionState} recovery retains its exact generation as retryable`, async (t) => {
     const fx = fixture(t);
     let state = "running";
     let starts = 0;
@@ -730,10 +730,8 @@ for (const inspectionState of ["starting", "unavailable"]) {
     await assert.rejects(
       restarted.prepareRoleSession(input),
       (error) => {
-        assert.equal(error.name, "RuntimeLaunchRecoveryError");
-        assert.equal(error.kind, "retryable");
-        assert.equal(error.runtimeState, inspectionState);
-        assert.equal(error.runId, input.runId);
+        assert.equal(error.name, "RuntimeLaunchError");
+        assert.equal(error.retryable, true);
         assert.equal(error.launchId, first.launchId);
         return true;
       }
@@ -784,10 +782,8 @@ test("a confirmed-stopped generation is lost for the same active Run instead of 
   await assert.rejects(
     restarted.prepareRoleSession(input),
     (error) => {
-      assert.equal(error.name, "RuntimeLaunchRecoveryError");
-      assert.equal(error.kind, "generation-lost");
-      assert.equal(error.runtimeState, "stopped");
-      assert.equal(error.runId, input.runId);
+      assert.equal(error.name, "RuntimeLaunchError");
+      assert.equal(error.retryable, false);
       assert.equal(error.launchId, first.launchId);
       return true;
     }
@@ -860,10 +856,8 @@ test("a host recreated after a same-Run running probe reports generation loss wi
       runId: "agent-run-1"
     }, "deferred"),
     (error) => {
-      assert.equal(error.name, "RuntimeLaunchRecoveryError");
-      assert.equal(error.kind, "generation-lost");
-      assert.equal(error.runtimeState, "recreated");
-      assert.equal(error.runId, "agent-run-1");
+      assert.equal(error.name, "RuntimeLaunchError");
+      assert.equal(error.retryable, false);
       assert.equal(error.launchId, first.launchId);
       return true;
     }

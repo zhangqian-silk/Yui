@@ -12,7 +12,7 @@ import { createRoleAgentBinding } from "../../dist/role/role.js";
 
 const NOW = new Date("2026-08-02T13:30:00.000Z");
 
-test("source access does not alter the provider permission strategy", () => {
+test("Profile access is behavior intent and does not erase an exact WorkItem write scope", () => {
   const role = desiredRole("codex", {
     adapterId: "codex",
     model: "gpt-5.6-sol",
@@ -23,12 +23,13 @@ test("source access does not alter the provider permission strategy", () => {
   const effective = resolveEffectiveLaunch({
     role,
     purpose: "execution",
-    workspace: workspace("read")
+    workspace: workspace("write"),
+    workItemWriteProjectIds: ["project-1"]
   });
 
   assert.equal(effective.schemaVersion, 2);
-  assert.equal(effective.access, "read");
-  assert.deepEqual(effective.writeProjectIds, []);
+  assert.equal(effective.profileAccess, "read");
+  assert.deepEqual(effective.writeProjectIds, ["project-1"]);
   assert.deepEqual(effective.permission, { strategy: "bypass" });
   assert.equal(effective.search, true);
   const argv = compileArgv(role, effective);
@@ -52,7 +53,7 @@ test("explicit Codex native permission options remain independent from write sco
     workItemWriteProjectIds: ["project-1"]
   });
 
-  assert.equal(effective.access, "write");
+  assert.equal(effective.profileAccess, "write");
   assert.deepEqual(effective.writeProjectIds, ["project-1"]);
   assert.deepEqual(effective.permission, {
     strategy: "configured",
@@ -80,7 +81,7 @@ test("explicit Claude native permission options remain independent from read sco
     workspace: workspace("read")
   });
 
-  assert.equal(effective.access, "read");
+  assert.equal(effective.profileAccess, "read");
   assert.deepEqual(effective.permission, {
     strategy: "configured",
     mode: "plan",
@@ -107,7 +108,7 @@ test("Review uses its configured permission in the exact writable ReviewRound wo
     workspace: reviewWorkspace("review-round-1")
   });
 
-  assert.equal(effective.access, "write");
+  assert.equal(effective.profileAccess, "write");
   assert.deepEqual(effective.writeProjectIds, ["project-1"]);
   assert.deepEqual(effective.permission, { strategy: "bypass" });
   assert.equal(effective.reviewRoundId, "review-round-1");
@@ -165,8 +166,7 @@ test("Session compatibility compares the complete effective config except desire
   }), false);
   assert.equal(effectiveLaunchSnapshotsCompatible(first, {
     ...laterRevision,
-    access: "read",
-    writeProjectIds: []
+    profileAccess: "read"
   }), false);
 });
 

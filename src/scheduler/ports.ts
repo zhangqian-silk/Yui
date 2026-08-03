@@ -341,7 +341,7 @@ export interface TmuxDeliveryPort {
     runId?: string;
     launchId?: string;
   }>): void;
-  /** Best-effort nudge to an already-running global Operator composer. */
+  /** Best-effort nudge to an already-running global Operator process. */
   notifyOperatorInputOnce?(input: Readonly<{
     roleName: "operator";
     adapterId: string;

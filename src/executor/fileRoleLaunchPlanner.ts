@@ -134,7 +134,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         && workspace.owner.type === "work-item"
         && isolatedWorkItem !== null
         && isolatedWorkItem.assignee === role.name
-        && !["completed", "failed", "cancelled", "superseded", "abandoned"].includes(isolatedWorkItem.status)
+        && !["completed", "failed", "retired"].includes(isolatedWorkItem.status)
         && (activeRun === null
           || activeRun.workItemId === workspace.owner.workItemId)
         && sameWorkspaceProjects(workspace, task.projectBindings.map(({ projectId }) => projectId))
@@ -545,7 +545,7 @@ function managedClaudeControlPlaneConfig(
   workItemId: string | undefined,
   runId: string
 ): ClaudeAgentConfig {
-  if (config.permission?.strategy !== "configured") return config;
+  if (config.permission.strategy !== "configured") return config;
   const managed = [
     `Bash(yui --json task context ${taskId})`,
     `Bash(yui --json task work list ${taskId})`,

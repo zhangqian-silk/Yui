@@ -55,7 +55,7 @@ export type RuntimeRoleFact = Readonly<{
   ownerKind: "task-role" | "global-role";
   taskId?: string;
   taskTitle?: string;
-  taskStatus?: "draft" | "active" | "completed" | "cancelled" | "superseded" | "abandoned" | "archived";
+  taskStatus?: "draft" | "active" | "completed" | "retired" | "archived";
   roleName: string;
   agentId: string;
   adapterId?: string;
@@ -100,7 +100,7 @@ export type RuntimeOwner =
       kind: "task-role";
       taskId: string;
       taskTitle?: string;
-      taskStatus?: "draft" | "active" | "completed" | "cancelled" | "superseded" | "abandoned" | "archived";
+      taskStatus?: "draft" | "active" | "completed" | "retired" | "archived";
       roleName: string;
       agentId: string;
       adapterId?: string;

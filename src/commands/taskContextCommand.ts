@@ -11,9 +11,7 @@ const SUMMARY_TEXT_LIMIT = 400;
 const TERMINAL_WORK_ITEM_STATUSES = new Set([
   "completed",
   "failed",
-  "cancelled",
-  "superseded",
-  "abandoned"
+  "retired"
 ]);
 
 export function runTaskContextCommand(args: string[], store: TaskStore) {
@@ -158,10 +156,10 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
           ));
           return [
             `  ${role.name} [${role.status}]: ${role.activeAgentId}/${binding.adapterId}`,
-            `    Desired: r${role.launchRevision}; access ceiling: ${role.defaultAccess}; Model: ${binding.config.model ?? "default"}; effort: ${binding.config.effort ?? "default"}; permission: ${binding.config.permission?.strategy ?? "default"}`,
+            `    Desired: r${role.launchRevision}; Profile intent: ${role.defaultAccess}; Model: ${binding.config.model ?? "default"}; effort: ${binding.config.effort ?? "default"}; permission: ${binding.config.permission.strategy}`,
             `    Effective: ${effective === undefined
               ? "not started"
-              : `${effectiveSource} ${effective.agentId}/${effective.adapterId}; r${effective.sourceDesiredRevision}; access: ${effective.access}; permission: ${effective.permission.strategy}`}`,
+              : `${effectiveSource} ${effective.agentId}/${effective.adapterId}; r${effective.sourceDesiredRevision}; Profile intent: ${effective.profileAccess}; permission: ${effective.permission.strategy}`}`,
             `    Desired drift: ${effective === undefined
               ? "-"
               : effective.sourceDesiredRevision === role.launchRevision
@@ -170,24 +168,10 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
             ...(creation?.payload.runtimeSource === undefined
               ? []
               : [`    Runtime source at creation: ${creation.payload.runtimeSource}`]),
-            ...(recovery?.sessionRetirement === null || recovery === undefined
-              ? []
-              : [
-                  `    Session usability: ${recovery.sessionRetirement.state === "cleanup-pending"
-                    ? "operator-declared-unusable (cleanup-pending)"
-                    : `retired (${recovery.sessionRetirement.id})`}`,
-                  `    Native Session: ${recovery.sessionRetirement.nativeSessionId} @ ${recovery.sessionRetirement.launchId}`,
-                  `    Exact Run/receipt: ${recovery.sessionRetirement.runId} / ${recovery.sessionRetirement.receiptId}`,
-                  `    Reason: ${compactText(recovery.sessionRetirement.reason)}`,
-                  `    Runtime cleanup: ${recovery.runtimeCleanupPending ? "pending" : "complete"}`,
-                  `    Fresh launch: ${recovery.freshLaunchAllowed
-                    ? "allowed by the durable Session fence"
-                    : recovery.runtimeCleanupPending
-                      ? "blocked until verified owned runtime cleanup completes"
-                      : recovery.sessionRetirement.state === "cleanup-pending"
-                        ? "blocked by the pending Session retirement"
-                        : "not allowed while a current Session is recorded"}`
-                ])
+            ...(recovery === undefined ? [] : [
+              `    Runtime cleanup: ${recovery.runtimeCleanupPending ? "pending" : "none"}`,
+              `    Fresh launch: ${recovery.freshLaunchAllowed ? "allowed" : "blocked"}`
+            ])
           ];
         })),
     "",
@@ -221,7 +205,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
             ...(latestRun === undefined
               ? ["    AgentRuns: none."]
               : [
-                  `    AgentRuns: ${itemRuns.length}; latest ${latestRun.id} [${latestRun.status}] ${latestRun.effective.agentId}/${latestRun.effective.adapterId} · effective r${latestRun.effective.sourceDesiredRevision}/${latestRun.effective.access}/${latestRun.effective.permission.strategy}`,
+                  `    AgentRuns: ${itemRuns.length}; latest ${latestRun.id} [${latestRun.status}] ${latestRun.effective.agentId}/${latestRun.effective.adapterId} · effective r${latestRun.effective.sourceDesiredRevision}/${latestRun.effective.profileAccess}/${latestRun.effective.permission.strategy}`,
                   `      Input: ${compactText(latestRun.input)}`,
                   ...(latestRun.summary === undefined
                     ? []
@@ -238,7 +222,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       agentRuns,
       (run) => [
         `  ${run.id} [${run.status}/${run.purpose}] ${run.roleName} via ${run.effective.agentId}/${run.effective.adapterId}`,
-        `    Effective: r${run.effective.sourceDesiredRevision}; access: ${run.effective.access}; permission: ${run.effective.permission.strategy}; model: ${run.effective.model ?? "default"}; effort: ${run.effective.effort ?? "default"}`,
+        `    Effective: r${run.effective.sourceDesiredRevision}; Profile intent: ${run.effective.profileAccess}; permission: ${run.effective.permission.strategy}; model: ${run.effective.model ?? "default"}; effort: ${run.effective.effort ?? "default"}`,
         ...(run.summary === undefined ? [] : [`    Result: ${compactText(run.summary)}`])
       ]
     ),

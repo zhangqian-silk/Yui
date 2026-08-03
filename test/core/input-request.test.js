@@ -213,16 +213,31 @@ function fixture(t) {
     root,
     FIRST
   );
+  const operator = createGlobalRole(
+    "operator",
+    [createRoleAgentBinding(agent)],
+    agent.id,
+    root,
+    FIRST
+  );
+  let operatorSessions = createRoleSessionSet(
+    { scope: "global", roleName: operator.name },
+    operator.activeAgentId,
+    FIRST
+  );
+  operatorSessions = recordRoleAgentSession(operatorSessions, {
+    agentId: operator.activeAgentId,
+    adapterId: operator.agentBindings[operator.activeAgentId].adapterId,
+    nativeSessionId: "operator-native-1",
+    policy: "fixed",
+    status: "ready",
+    effective: resolveEffectiveLaunch({ role: operator, purpose: "execution" })
+  }, FIRST);
   store.transaction((tx) => {
     tx.saveConfig({ schemaVersion: 1, defaultAgent: agent.id, defaultWorkspace: root });
     tx.saveConfiguredAgent(agent);
-    tx.saveGlobalRole(createGlobalRole(
-      "operator",
-      [createRoleAgentBinding(agent)],
-      agent.id,
-      root,
-      FIRST
-    ));
+    tx.saveGlobalRole(operator);
+    tx.saveGlobalRoleSessionSet(operatorSessions);
     tx.saveGlobalRole(leader);
   });
   const changed = [];

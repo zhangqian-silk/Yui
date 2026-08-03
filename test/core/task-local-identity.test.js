@@ -24,6 +24,7 @@ import {
 } from "../../dist/task/task.js";
 import {
   createWorkItem,
+  retireWorkItem,
   submitWorkItemCandidate,
   updateWorkItemStatus,
   validateWorkItem
@@ -289,12 +290,10 @@ test("complete, reopen, and archive never reset a Task-local high-water mark", (
     const first = createWorkItem(tx.nextWorkItemId(task.id), task.id, {
       title: "First lifecycle WorkItem"
     }, NOW);
-    tx.saveWorkItem(task.id, updateWorkItemStatus(
-      first,
-      "cancelled",
-      firstAt,
-      "Lifecycle fixture settled."
-    ));
+    tx.saveWorkItem(task.id, retireWorkItem(first, {
+      by: "leader",
+      summary: "Lifecycle fixture settled."
+    }, firstAt));
     tx.saveTask(completeTask(task, firstAt, { by: "leader", summary: "First pass complete." }));
   });
 
@@ -305,12 +304,10 @@ test("complete, reopen, and archive never reset a Task-local high-water mark", (
       title: "Second lifecycle WorkItem"
     }, secondAt);
     assert.equal(second.id, "work-item-2");
-    tx.saveWorkItem(reopened.id, updateWorkItemStatus(
-      second,
-      "cancelled",
-      secondAt,
-      "Reopened lifecycle fixture settled."
-    ));
+    tx.saveWorkItem(reopened.id, retireWorkItem(second, {
+      by: "leader",
+      summary: "Reopened lifecycle fixture settled."
+    }, secondAt));
     tx.saveTask(archiveTask(
       completeTask(reopened, secondAt, { by: "leader", summary: "Second pass complete." }),
       secondAt,

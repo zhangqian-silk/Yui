@@ -4,9 +4,7 @@ const statuses = [
   "active",
   "draft",
   "completed",
-  "cancelled",
-  "superseded",
-  "abandoned",
+  "retired",
   "archived"
 ];
 
@@ -253,9 +251,7 @@ export function renderOverview(detail, state, t, locale, onSelect) {
     ["active", counts ? counts.active : 0],
     ["draft", counts ? counts.draft : 0],
     ["completed", counts ? counts.completed : 0],
-    ["cancelled", counts ? counts.cancelled : 0],
-    ["superseded", counts ? counts.superseded : 0],
-    ["abandoned", counts ? counts.abandoned : 0],
+    ["retired", counts ? counts.retired : 0],
     ["archived", counts ? counts.archived : 0]
   ];
   if (counts && counts.total > 0) {
@@ -356,7 +352,7 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     if (task.completedAt) meta.append(node("time", "", formatDateTime(task.completedAt, locale)));
     if (meta.childNodes.length) conclusion.append(meta);
     detail.append(conclusion);
-  } else if (task.retirementSummary || ["cancelled", "superseded", "abandoned"].includes(task.status)) {
+  } else if (task.retirementSummary || task.status === "retired") {
     const conclusion = node("section", "conclusion retired");
     conclusion.append(node("h3", "", t("detail.retired")));
     if (task.retirementSummary) conclusion.append(node("p", "", task.retirementSummary));
@@ -479,8 +475,8 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     if (run.effective) {
       metadata.append(node("span", "", t("detail.effective") + " · r"
         + run.effective.sourceDesiredRevision));
-      metadata.append(node("span", "", t("detail.access") + " · "
-        + run.effective.access));
+      metadata.append(node("span", "", t("detail.profileIntent") + " · "
+        + run.effective.profileAccess));
       metadata.append(node("span", "", t("detail.permission") + " · "
         + run.effective.permission.strategy));
     }
@@ -594,7 +590,7 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     if (activeBadge) agentMeta.append(activeBadge);
     agentMeta.append(node("span", "", t("detail.desired") + " · r"
       + role.launchRevision));
-    agentMeta.append(node("span", "", t("detail.accessCeiling") + " · "
+    agentMeta.append(node("span", "", t("detail.profileIntent") + " · "
       + role.defaultAccess));
     roleActions.append(agentMeta);
     const open = node("button", "input-answer", t("actions.openRole"));
@@ -616,8 +612,8 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
       if (effectiveBadge) effectiveMeta.append(effectiveBadge);
       effectiveMeta.append(node("span", "", t("detail.effective") + " · r"
         + role.effectiveLaunch.sourceDesiredRevision));
-      effectiveMeta.append(node("span", "", t("detail.access") + " · "
-        + role.effectiveLaunch.access));
+      effectiveMeta.append(node("span", "", t("detail.profileIntent") + " · "
+        + role.effectiveLaunch.profileAccess));
       effectiveMeta.append(node("span", "", t("detail.permission") + " · "
         + role.effectiveLaunch.permission.strategy));
       effectiveMeta.append(node("span", "", role.launchDrift

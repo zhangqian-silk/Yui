@@ -124,7 +124,7 @@ type ActiveRunPointer = Readonly<{ schemaVersion: 1; runId: string }>;
 type TaskIdHighWaterMarks = Record<TaskRecordKind, number>;
 
 type StoredTask = {
-  schemaVersion: 12;
+  schemaVersion: 13;
   task: Task;
   idHighWaterMarks: TaskIdHighWaterMarks;
   brief: TaskBrief | null;
@@ -147,7 +147,7 @@ type StoredTask = {
 };
 
 type StorageState = {
-  schemaVersion: 13;
+  schemaVersion: 14;
   revision: number;
   config: YuiConfig;
   configuredAgents: Record<string, ConfiguredAgent>;
@@ -1173,7 +1173,7 @@ export function ensureYuiHome(rootDir: string): void { mkdirSync(rootDir, { recu
 
 function emptyState(): StorageState {
   return {
-    schemaVersion: 13,
+    schemaVersion: 14,
     revision: 0,
     config: { schemaVersion: 1 },
     configuredAgents: {},
@@ -1187,7 +1187,7 @@ function emptyState(): StorageState {
 }
 function emptyStoredTask(task: Task): StoredTask {
   return {
-    schemaVersion: 12,
+    schemaVersion: 13,
     task,
     idHighWaterMarks: emptyTaskIdHighWaterMarks(),
     brief: null,
@@ -1266,7 +1266,7 @@ function parseState(raw: string): StorageState {
     "tasks",
     "mailboxes"
   ], "Storage state");
-  if (state.schemaVersion !== 13 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
+  if (state.schemaVersion !== 14 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
   const result = clone(state) as unknown as StorageState;
   result.config = versioned(result.config, 1, "Yui config");
   validateYuiConfig(result.config);
@@ -1398,7 +1398,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateIntegrationAttempt(attempt);
     return attempt;
   }, "integrationAttempts");
-  versioned(aggregate, 12, `Task aggregate ${taskId}`);
+  versioned(aggregate, 13, `Task aggregate ${taskId}`);
   validateTaskIdHighWaterMarks(aggregate.idHighWaterMarks, taskId);
   validateTask(identified(aggregate.task, 3, "id", taskId, "Task"));
   if (aggregate.brief !== null) storedTaskBrief(aggregate.brief);
@@ -1585,9 +1585,7 @@ function assertSessionsMatchRole(
       : [
           ...((sessions as TaskRoleSessionSet).history ?? []).map((session, index) => (
             [`history-${index}`, session] as const
-          )),
-          ...Object.entries((sessions as TaskRoleSessionSet).retiredSessions)
-            .map(([id, retired]) => [id, retired.session] as const)
+          ))
         ])
   ];
   for (const [, session] of ownedSessions) {
@@ -2136,29 +2134,23 @@ function validWorkItemTransition(existing: WorkItem, candidate: WorkItem): boole
     return false;
   }
   const allowed: Readonly<Record<WorkItem["status"], readonly WorkItem["status"][]>> = {
-    pending: ["pending", "running", "cancelled", "superseded", "abandoned"],
+    pending: ["pending", "running", "retired"],
     running: [
       "running",
       "awaiting_acceptance",
       "completed",
       "failed",
-      "cancelled",
-      "superseded",
-      "abandoned"
+      "retired"
     ],
     awaiting_acceptance: [
       "awaiting_acceptance",
       "completed",
       "failed",
-      "cancelled",
-      "superseded",
-      "abandoned"
+      "retired"
     ],
     completed: ["completed"],
-    failed: ["failed", "running", "cancelled", "superseded", "abandoned"],
-    cancelled: ["cancelled"],
-    superseded: ["superseded"],
-    abandoned: ["abandoned"]
+    failed: ["failed", "running", "retired"],
+    retired: ["retired"]
   };
   return allowed[existing.status].includes(candidate.status);
 }

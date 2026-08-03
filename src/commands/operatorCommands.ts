@@ -1,7 +1,4 @@
 import { usageError } from "../errors/cliError.js";
-import { declareUnusableSessionRetirement } from "../lifecycle/unusableSessionRetirement.js";
-import { runtimeLifecycleTarget } from "../runtime/lifecycleReservation.js";
-import { inspectTaskRoleSessionRecovery } from "./taskRoleRuntimeStatus.js";
 import {
   createRoleSessionSet,
   type GlobalRoleSessionSet
@@ -53,98 +50,11 @@ export function runOperatorCommand(
     case "new": return newSession(rest, store);
     case "resume": return resumeSession(rest, store);
     case "submit": return submit(rest, store, options);
-    case "retire-unusable-session": return retireUnusableSession(rest, store, options);
     default:
       throw usageError(command === undefined
         ? "Operator command is required."
         : `Unknown command: operator ${command}`);
   }
-}
-
-function retireUnusableSession(
-  args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions
-): TaskCommandExecution {
-  const usage = "Operator retire unusable Session usage: yui operator retire-unusable-session <task> <role> --run <run> --agent <agent> --adapter <adapter> --receipt <receipt> --native-session <id> --launch <generation> --reason <text>.";
-  if (
-    options.environment?.YUI_SESSION_SCOPE !== "global"
-    || options.environment.YUI_ROLE !== "operator"
-  ) {
-    throw usageError("Only the global Operator may retire an unusable Task Role Session.");
-  }
-  const optionNames = new Set([
-    "--run", "--agent", "--adapter", "--receipt",
-    "--native-session", "--launch", "--reason"
-  ]);
-  const positionals: string[] = [];
-  const values = new Map<string, string>();
-  for (let index = 0; index < args.length; index += 1) {
-    const value = args[index]!;
-    if (!value.startsWith("--")) {
-      positionals.push(value);
-      continue;
-    }
-    if (!optionNames.has(value)) throw usageError(`Unsupported option: ${value}.`, usage);
-    if (values.has(value)) throw usageError(`Option may only be specified once: ${value}.`, usage);
-    const candidate = args[index + 1];
-    if (candidate === undefined || candidate.startsWith("--")) {
-      throw usageError(`${value} is required.`, usage);
-    }
-    values.set(value, candidate);
-    index += 1;
-  }
-  if (positionals.length !== 2) throw usageError(usage);
-  const required = (name: string): string => {
-    const value = values.get(name)?.trim();
-    if (value === undefined || value.length === 0) throw usageError(`${name} is required.`, usage);
-    return value;
-  };
-  const now = options.now?.() ?? new Date();
-  let result;
-  try {
-    result = store.transaction((tx) => declareUnusableSessionRetirement(tx, {
-      taskId: positionals[0]!.trim(),
-      roleName: positionals[1]!.trim(),
-      agentId: required("--agent"),
-      adapterId: required("--adapter"),
-      runId: required("--run"),
-      receiptId: required("--receipt"),
-      nativeSessionId: required("--native-session"),
-      launchId: required("--launch"),
-      reason: required("--reason")
-    }, now));
-  } catch (error) {
-    throw usageError(error instanceof Error ? error.message : String(error));
-  }
-  if (result.changed) {
-    options.runtime?.notifyMailboxChanged?.(runtimeLifecycleTarget({
-      scope: "task",
-      taskId: result.run.taskId,
-      roleName: result.run.roleName
-    }));
-  }
-  const state = result.status === "retired"
-    ? "retired"
-    : "cleanup pending; fresh launch is blocked";
-  const freshLaunchAllowed = inspectTaskRoleSessionRecovery(
-    result.run.taskId,
-    result.run.roleName,
-    store
-  ).freshLaunchAllowed;
-  return {
-    kind: "output",
-    output: result.changed
-      ? `Declared native Session unusable for ${result.run.taskId}/${result.run.roleName}; ${state}.\n`
-      : `Unusable native Session retirement is already ${state} for ${result.run.taskId}/${result.run.roleName}.\n`,
-    data: {
-      retirementId: result.retirementId,
-      disposition: result.disposition,
-      status: result.status,
-      freshLaunchAllowed,
-      run: result.run
-    }
-  };
 }
 
 function submit(

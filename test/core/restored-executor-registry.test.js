@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  agentComposerReadinessProbe,
+  agentProcessReadinessProbe,
   ExecutorRegistry
 } from "../../dist/executor/executorRegistry.js";
 import { TmuxSessionHost } from "../../dist/runtime/index.js";
@@ -12,7 +12,7 @@ function effective(agentId, adapterId, workspace = "/tmp/workspace") {
   return testEffectiveLaunch({ agentId, adapterId, workspaceRoot: workspace });
 }
 
-test("readiness resolver distinguishes Codex node composer and Claude prompt markers", () => {
+test("readiness uses tmux process state and never parses Agent output", () => {
   const base = {
     taskId: "task-1",
     roleName: "leader",
@@ -20,197 +20,24 @@ test("readiness resolver distinguishes Codex node composer and Claude prompt mar
     dead: false,
     pid: 123
   };
-  const codex = agentComposerReadinessProbe("codex");
-  const claude = agentComposerReadinessProbe("claude");
+  const codex = agentProcessReadinessProbe("codex");
+  const claude = agentProcessReadinessProbe("claude");
 
+  assert.equal(codex({ ...base, currentCommand: "node" }), true);
   assert.equal(codex({
     ...base,
     currentCommand: "node",
-    content: "OpenAI Codex\nmodel: gpt-5 /model to change\n› Find and fix a bug in @filename\n"
+    content: "Unknown future trust or permission prompt"
   }), true);
-  assert.equal(codex({
-    ...base,
-    currentCommand: "node",
-    content: [
-      "• Working (1m 10s • esc to interrupt)",
-      "",
-      "› Summarize recent commits",
-      "",
-      "gpt-5.6-sol medium · /tmp/workspace"
-    ].join("\n")
-  }), false);
-  assert.equal(codex({
-    ...base,
-    currentCommand: "node",
-    content: [
-      "Would you like to run this command?",
-      "› 1. Yes, proceed",
-      "  2. No",
-      "Press enter to confirm or esc to cancel",
-      "gpt-5.6-sol medium · /tmp/workspace"
-    ].join("\n")
-  }), false);
-  assert.equal(codex({
-    ...base,
-    currentCommand: "node",
-    content: [
-      ...Array.from({ length: 40 }, (_, index) => `completed transcript line ${index}`),
-      "",
-      "› Summarize recent commits",
-      "",
-      "gpt-5.6-sol medium · /tmp/workspace"
-    ].join("\n")
-  }), true);
-  const operatorCodex = agentComposerReadinessProbe("codex", "operator");
-  const idleOperatorContent = [
-    "completed output",
-    "",
-    "› Summarize recent commits",
-    "",
-    "gpt-5.6-sol medium · /tmp/workspace"
-  ].join("\n");
-  assert.equal(operatorCodex({
-    ...base,
-    currentCommand: "node",
-    content: idleOperatorContent,
-    styledContent: [
-      "completed output",
-      "",
-      "\u001b[1m›\u001b[0m \u001b[2mSummarize recent commits\u001b[0m",
-      "",
-      "gpt-5.6-sol medium · /tmp/workspace"
-    ].join("\n")
-  }), true);
-  assert.equal(operatorCodex({
-    ...base,
-    currentCommand: "node",
-    content: idleOperatorContent,
-    styledContent: [
-      "completed output",
-      "",
-      "\u001b[1m›\u001b[0m Summarize recent commits",
-      "",
-      "gpt-5.6-sol medium · /tmp/workspace"
-    ].join("\n")
-  }), false);
-  assert.equal(operatorCodex({
-    ...base,
-    currentCommand: "node",
-    content: idleOperatorContent
-  }), false);
-  assert.equal(operatorCodex({
-    ...base,
-    currentCommand: "node",
-    content: [
-      "completed output",
-      "›",
-      "  unsent multiline draft",
-      "gpt-5.6-sol medium · /tmp/workspace"
-    ].join("\n"),
-    styledContent: [
-      "completed output",
-      "\u001b[1m›\u001b[0m",
-      "  unsent multiline draft",
-      "gpt-5.6-sol medium · /tmp/workspace"
-    ].join("\n")
-  }), false);
-  assert.equal(codex({ ...base, currentCommand: "node", content: "starting\n" }), false);
-  assert.equal(codex({
-    ...base,
-    currentCommand: "node",
-    content: "OpenAI Codex\nUpdate available\nPress enter to continue\n› \n/model to change\n"
-  }), false);
-  assert.equal(claude({ ...base, currentCommand: "claude", content: "hello\n❯ \n" }), true);
+  assert.equal(claude({ ...base, currentCommand: "claude" }), true);
   assert.equal(claude({
     ...base,
     currentCommand: "claude",
-    content: [
-      "Yui · task-1 · Fix the boundary bug · Leader",
-      "──",
-      "❯ Try \"fix lint errors\"",
-      "────────────────────────────────────────────────────────────────",
-      "───",
-      "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
-    ].join("\n")
+    content: "❯ Working… press ctrl-c to interrupt"
   }), true);
-  assert.equal(claude({
-    ...base,
-    currentCommand: "claude",
-    content: [
-      "Yui · task-1 · Review candidate · reviewer",
-      "❯ Try \"fix lint errors\"",
-      "────────────────────────────────────────────────────────────────",
-      "  ⏸ plan mode on (shift+tab to cycle) · ← for agents"
-    ].join("\n")
-  }), true);
-  assert.equal(claude({
-    ...base,
-    currentCommand: "claude",
-    content: [
-      "I yielded without disturbing the working implementer.",
-      "✻ Crunched for 56s",
-      "❯ continue",
-      "────────────────────────────────────────────────────────────────",
-      "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
-    ].join("\n"),
-    styledContent: [
-      "I yielded without disturbing the working implementer.",
-      "✻ Crunched for 56s",
-      "❯ \u001b[2mcontinue\u001b[0m",
-      "────────────────────────────────────────────────────────────────",
-      "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
-    ].join("\n")
-  }), true);
-  assert.equal(claude({
-    ...base,
-    currentCommand: "claude",
-    content: [
-      "❯ old prompt",
-      "Completed an earlier request",
-      "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
-    ].join("\n")
-  }), false);
-  assert.equal(claude({
-    ...base,
-    currentCommand: "claude",
-    content: "❯ old prompt\nWorking… press ctrl-c to interrupt\n"
-  }), false);
-  assert.equal(claude({ ...base, currentCommand: "claude", content: "thinking…\n" }), false);
-  const operatorClaude = agentComposerReadinessProbe("claude", "operator");
-  assert.equal(operatorClaude({
-    ...base,
-    currentCommand: "claude",
-    content: "hello\n❯ \n",
-    styledContent: "hello\n\u001b[1m❯\u001b[0m \n"
-  }), true);
-  assert.equal(operatorClaude({
-    ...base,
-    currentCommand: "claude",
-    content: "hello\n❯ unsent draft\n",
-    styledContent: "hello\n\u001b[1m❯\u001b[0m unsent draft\n"
-  }), false);
-  assert.equal(operatorClaude({
-    ...base,
-    currentCommand: "claude",
-    content: "hello\n❯ continue\n",
-    styledContent: "hello\n\u001b[1m❯\u001b[0m \u001b[2mcontinue\u001b[0m\n"
-  }), true);
-  assert.equal(operatorClaude({
-    ...base,
-    currentCommand: "claude",
-    content: [
-      "I yielded without disturbing the working implementer.",
-      "❯ continue",
-      "────────────────────────────────────────────────────────────────",
-      "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
-    ].join("\n"),
-    styledContent: [
-      "I yielded without disturbing the working implementer.",
-      "\u001b[1m❯\u001b[0m \u001b[2mcontinue\u001b[0m",
-      "────────────────────────────────────────────────────────────────",
-      "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
-    ].join("\n")
-  }), true);
+  assert.equal(codex({ ...base, dead: true, currentCommand: "node" }), false);
+  assert.equal(claude({ ...base, pid: undefined, currentCommand: "claude" }), false);
+  assert.equal(codex({ ...base, currentCommand: "" }), false);
 });
 
 test("ExecutorRegistry prepares new/resume sessions and always carries the adapter probe into sendOnce", async () => {
@@ -473,7 +300,7 @@ test("runtime launch plans Claude once and reports the native session actually h
   assert.equal(ready.session.nativeSessionId, "claude-hosted-1");
 });
 
-test("Operator input notification never launches a pane or waits for a busy composer", async () => {
+test("Operator input notification never launches a pane or waits for a busy process", async () => {
   const calls = [];
   let state = "exited";
   const registry = new ExecutorRegistry({ plan() { throw new Error("unused"); } }, {

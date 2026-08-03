@@ -191,7 +191,7 @@ into the child brief:
 
 - WorkItem objective, acceptance criteria, dependencies, and context reads;
 - Profile revision, description, instructions, and required Skills;
-- access boundary and allowed workspace;
+- Profile read/write behavior intent and exact allowed workspace;
 - requested validation and evidence;
 - optional model and effort hints.
 
@@ -255,10 +255,10 @@ Do not reconstruct Agent/model/effort or provider permission during execution.
 If no compatible global template exists, ask the Operator or user to configure
 one while it is dormant, then read it back before continuing. Every managed
 binding defaults to `permission.strategy=bypass`; a binding may instead choose
-provider `default` or explicit native `configured` options. Source write access
-remains a separate exact WorkItem or ReviewRound scope. Profile and Skill
+provider `default` or any supported subset of native `configured` options.
+Project write authority remains a separate exact WorkItem or ReviewRound scope. Profile and Skill
 constrain behavior, and provider bypass never changes that boundary, including
-for an `explorer` Role whose Yui access remains read-only.
+for an `explorer` Role whose Profile intent remains read-only.
 
 For meaningful concurrent-write risk, isolate the WorkItem before dispatch:
 
@@ -446,5 +446,9 @@ inputs are resolved:
 yui task complete <task-id> --summary "<outcome, validation, and remaining risks>"
 ```
 
-Archiving is a separate user or Operator lifecycle action after managed
-worktrees are clean and explicitly disposed.
+Retire obsolete WorkItems with `yui task work retire <task>/<work> --summary
+"..."`, optionally using `--replacement`. If the current Role generation is
+unusable, reset it with `yui task role reset <task> <role> --reason "..."` and
+let Yui derive all runtime identities from durable state. Archiving is a
+separate user or Operator lifecycle action after managed worktrees are clean
+and explicitly settled.

@@ -220,7 +220,7 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
     workspace: workspaces.get("profile-read"),
     workItemWriteProjectIds: [project.id]
   });
-  assert.equal(profileReadEffective.access, "read");
+  assert.equal(profileReadEffective.profileAccess, "read");
 
   const planner = new FileRoleLaunchPlanner(home, store, {
     environment: {
@@ -259,18 +259,20 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
   };
 
   for (const key of ["codexRead", "claudeRead"]) {
-    assert.equal(effective[key].access, "read");
+    assert.equal(effective[key].profileAccess, "write");
+    assert.deepEqual(effective[key].writeProjectIds, []);
     assert.equal(effective[key].permission.strategy, "bypass");
   }
   assertCodexWrite(plans.codexRead.launch.args);
   assertClaudeWrite(plans.claudeRead.launch.args);
-  assert.equal(effective.profileRead.access, "read");
+  assert.equal(effective.profileRead.profileAccess, "read");
+  assert.deepEqual(effective.profileRead.writeProjectIds, [project.id]);
   assert.equal(effective.profileRead.permission.strategy, "bypass");
   assertClaudeWrite(plans.profileRead.launch.args);
   assertCodexWrite(plans.codexWrite.launch.args);
   assertClaudeWrite(plans.claudeWrite.launch.args);
-  assert.equal(effective.codexReview.access, "write");
-  assert.equal(effective.claudeReview.access, "write");
+  assert.equal(effective.codexReview.profileAccess, "write");
+  assert.equal(effective.claudeReview.profileAccess, "write");
   assertCodexWrite(plans.codexReview.launch.args);
   assertClaudeWrite(plans.claudeReview.launch.args);
   for (const plan of Object.values(plans)) executePlan(plan);

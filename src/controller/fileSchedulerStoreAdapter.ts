@@ -9,7 +9,6 @@ import {
   recordObservedTaskRoleCompletion,
   recordRoleAgentSession,
   rememberRoleAgentCompletedTurn,
-  retireDeclaredUnusableTaskRoleSession,
   settleTaskRoleCompletion,
   terminalizeTaskRoleRunSession,
   updateRoleAgentSessionStatus,
@@ -129,10 +128,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     if (role === null) return null;
     const sessions = this.store.getGlobalRoleSessionSet(SYSTEM_OPERATOR_ROLE);
     const effectiveSession = sessions?.sessions[sessions.activeAgentId];
+    if (effectiveSession?.status !== "ready") return null;
     return {
       roleName: SYSTEM_OPERATOR_ROLE,
-      adapterId: effectiveSession?.effective.adapterId
-        ?? activeRoleAgentBinding(role).adapterId
+      adapterId: effectiveSession.effective.adapterId
     } as const;
   }
 
@@ -281,68 +280,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return this.store.transaction((store) => {
       let mailbox = store.getWorkMailbox(target);
       if (mailbox === null || !hasRuntimeCleanupObligation(mailbox)) return false;
-      if (target.kind === "role-runtime") {
-        const sessions = store.getTaskRoleSessionSet(target.taskId, target.roleName);
-        const retirement = sessions?.unusableSessionRetirement;
-        if (retirement !== undefined && retirement !== null) {
-          const task = store.getTask(target.taskId);
-          const role = store.getRole(target.taskId, target.roleName);
-          const run = store.getAgentRun(target.taskId, retirement.runId);
-          const binding = role === null ? null : activeRoleAgentBinding(role);
-          const pending = mailbox.pending;
-          if (
-            task?.status !== "active"
-            || role === null
-            || binding?.agentId !== retirement.agentId
-            || binding.adapterId !== retirement.adapterId
-            || role.status !== (target.roleName === "leader" ? "failed" : "idle")
-            || run?.status !== "failed"
-            || run.roleName !== target.roleName
-            || run.effective.agentId !== retirement.agentId
-            || run.effective.adapterId !== retirement.adapterId
-            || store.getActiveAgentRun(target.taskId, target.roleName) !== null
-            || mailbox.processing !== null
-            || pending === null
-            || pending.requestCount !== 1
-            || pending.reasons.length !== 1
-            || pending.reasons[0] !== RUNTIME_CLEANUP_REQUIRED_REASON
-          ) {
-            return false;
-          }
-          const batchId = `runtime-cleanup-complete:${pending.fromSequence}-${pending.toSequence}`;
-          mailbox = completeProcessing(claimPending(mailbox, {
-            batchId,
-            owner: RUNTIME_LIFECYCLE_OWNER,
-            startedAt: now.toISOString()
-          }), batchId);
-          store.saveTaskRoleSessionSet(retireDeclaredUnusableTaskRoleSession(
-            sessions!,
-            retirement.id,
-            now
-          ));
-          saveRuntimeLifecycleMailbox(store, mailbox);
-          store.saveEvent(target.taskId, createTaskEvent(
-            store.nextEventId(target.taskId),
-            target.taskId,
-            "runtime.unusable-session-retired",
-            {
-              retirementId: retirement.id,
-              taskId: target.taskId,
-              roleName: target.roleName,
-              agentId: retirement.agentId,
-              adapterId: retirement.adapterId,
-              runId: retirement.runId,
-              receiptId: retirement.receiptId,
-              nativeSessionId: retirement.nativeSessionId,
-              launchId: retirement.launchId,
-              reason: retirement.reason,
-              freshLaunchAllowed: "true"
-            },
-            now
-          ));
-          return true;
-        }
-      }
       if (mailbox.processing !== null) {
         if (
           !isRuntimeLaunchReservation(mailbox.processing)
@@ -758,7 +695,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (terminal.purpose === "execution" && terminal.workItemId !== undefined) {
         const item = store.getWorkItem(input.taskId, terminal.workItemId);
         if (item !== null && ![
-          "completed", "failed", "cancelled", "superseded", "abandoned"
+          "completed", "failed", "retired"
         ].includes(item.status)) {
           store.saveWorkItem(
             input.taskId,
@@ -923,7 +860,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       store.saveWorkMailbox(completeProcessing(mailbox, mailbox.processing.batchId));
       if (currentRun.purpose === "execution" && currentRun.workItemId !== undefined) {
         const workItem = store.getWorkItem(task.id, currentRun.workItemId);
-        if (workItem !== null && !["completed", "failed", "cancelled", "superseded", "abandoned"].includes(workItem.status)) {
+        if (workItem !== null && !["completed", "failed", "retired"].includes(workItem.status)) {
           store.saveWorkItem(
             task.id,
             updateWorkItemStatus(workItem, "failed", input.now, input.summary)
@@ -1215,12 +1152,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     const role = this.store.getRole(input.taskId, input.roleName);
     if (task === null || task.status === "archived" || role === null) return "obsolete";
     const sessions = this.store.getTaskRoleSessionSet(input.taskId, input.roleName);
-    if (sessions !== null && matchingRetiredRuntimeSession(sessions, input) !== null) {
-      return "obsolete";
-    }
-    if (sessions?.unusableSessionRetirement !== null && sessions !== null) {
-      return "obsolete";
-    }
     const existing = sessions?.sessions[input.agentId];
     const owner = {
       scope: "task" as const,
@@ -1310,17 +1241,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           input.agentId,
           now
         );
-      const retiredSession = matchingRetiredRuntimeSession(sessions, input);
-      if (retiredSession !== null) {
-        return { session: retiredSession, duplicate: false, disposition: "obsolete" };
-      }
       const existing = sessions.sessions[input.agentId];
-      if (sessions.unusableSessionRetirement !== null) {
-        if (existing === undefined) {
-          throw new Error("Unusable-session retirement has no matching fixed Session.");
-        }
-        return { session: existing, duplicate: false, disposition: "obsolete" };
-      }
       const owner = {
         scope: "task" as const,
         taskId: input.taskId,
@@ -1528,11 +1449,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return finalized;
   }
 
-  /**
-   * Codex has returned to its composer. A delivered Leader control Run cannot
-   * remain active past this boundary: doing so would permanently fence later
-   * Worker-result wakeups behind a process that is alive but no longer busy.
-   */
+  /** A structured native Turn-completion event terminalizes its exact Run fence. */
   recordRuntimeTurnCompleted(input: Readonly<{
     taskId: string;
     roleName: string;
@@ -1645,7 +1562,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         ));
         if (active.purpose === "execution" && active.workItemId !== undefined) {
           const item = store.getWorkItem(task.id, active.workItemId);
-          if (item !== null && !["completed", "failed", "cancelled", "superseded", "abandoned"].includes(item.status)) {
+          if (item !== null && !["completed", "failed", "retired"].includes(item.status)) {
             store.saveWorkItem(
               task.id,
               updateWorkItemStatus(item, "failed", now, summary)
@@ -1856,7 +1773,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (before.purpose === "execution" && before.workItemId !== undefined) {
         const item = store.getWorkItem(input.taskId, before.workItemId);
         if (item !== null && ![
-          "completed", "failed", "cancelled", "superseded", "abandoned"
+          "completed", "failed", "retired"
         ].includes(item.status)) {
           store.saveWorkItem(
             input.taskId,
@@ -2160,27 +2077,6 @@ function isObsoleteTerminalRuntimeRun(
     event.type === "runtime.role-delivery-failed"
     && event.payload.runId === input.runId
   ));
-}
-
-function matchingRetiredRuntimeSession(
-  sessions: TaskRoleSessionSet,
-  input: Readonly<{
-    agentId: string;
-    adapterId: string;
-    launchId?: string;
-    nativeSessionId: string;
-    runId?: string;
-  }>
-): RoleAgentSession | null {
-  if (input.launchId === undefined || input.runId === undefined) return null;
-  const retired = Object.values(sessions.retiredSessions).find((entry) => (
-    entry.runId === input.runId
-    && entry.session.agentId === input.agentId
-    && entry.session.adapterId === input.adapterId
-    && entry.session.nativeSessionId === input.nativeSessionId
-    && entry.session.launchId === input.launchId
-  ));
-  return retired?.session ?? null;
 }
 
 function sessionPreview(value: string): string {
@@ -2811,7 +2707,7 @@ function runLaunchEventPayload(run: AgentRun): Record<string, string> {
     mode: run.mode,
     agent: `${run.effective.agentId}/${run.effective.adapterId}`,
     effectiveRevision: String(run.effective.sourceDesiredRevision),
-    effectiveAccess: run.effective.access,
+    profileAccess: run.effective.profileAccess,
     effectivePermission: run.effective.permission.strategy,
     writeProjectIds: run.effective.writeProjectIds.join(",") || "none"
   };

@@ -346,17 +346,17 @@ test("Work Item rejection and Leader disposition close the acceptance loop", (t)
 
   assert.match(
     run([
-      "work", "dispose", rejected.id, "cancelled", "--summary", "No longer needed."
+      "work", "retire", rejected.id, "--summary", "No longer needed."
     ], store, leaderOptions),
-    /Disposed Work Item/
+    /Retired Work Item/
   );
-  assert.equal(store.getWorkItem(task.id, rejected.id).status, "cancelled");
+  assert.equal(store.getWorkItem(task.id, rejected.id).status, "retired");
   assert.equal(
     store.listEvents(task.id).some(({ type }) => type === "work.rejected"),
     true
   );
   assert.equal(
-    store.listEvents(task.id).some(({ type }) => type === "work.disposed"),
+    store.listEvents(task.id).some(({ type }) => type === "work.retired"),
     true
   );
 });
@@ -916,8 +916,8 @@ test("always review creates a ReviewRound under the same WorkItem and never revi
   assert.match(reviewRun.input, /candidate summary is a pointer, not proof/i);
   assert.match(reviewRun.input, /Review yield completes only this Round and creates no Candidate or ChangeSet/);
   assert.match(reviewRun.input, /The Leader alone interprets and routes evidence/);
-  assert.match(reviewRun.input, /must be one JSON object/);
-  assert.match(reviewRun.input, /at least one check/);
+  assert.match(reviewRun.input, /clear Markdown or JSON/);
+  assert.match(reviewRun.input, /no fixed wording or field list is required/);
 
   const leaderOptions = {
     ...options,
@@ -2009,7 +2009,8 @@ test("Leader creates a profiled Worker instance, binds Claude config, then launc
     ),
     ["--model", "claude-opus"]
   );
-  assert.equal(plan.session.effective.access, "read");
+  assert.equal(plan.session.effective.profileAccess, "write");
+  assert.deepEqual(plan.session.effective.writeProjectIds, []);
   assert.equal(plan.session.effective.permission.strategy, "bypass");
   assert.equal(plan.launch.args.includes("--dangerously-skip-permissions"), true);
   assert.equal(plan.launch.args.includes("--permission-mode"), false);
@@ -2166,7 +2167,7 @@ test("Task completion requires every WorkItem to be terminal", (t) => {
   assert.equal(store.getTask(task.id)?.status, "active");
 
   run([
-    "work", "dispose", item.id, "cancelled", "--summary", "No longer needed."
+    "work", "retire", item.id, "--summary", "No longer needed."
   ], store, {
     ...options,
     environment: {
@@ -2177,10 +2178,10 @@ test("Task completion requires every WorkItem to be terminal", (t) => {
   });
   run(["complete", task.id, "--summary", "Done"], store, options);
   assert.equal(store.getTask(task.id)?.status, "completed");
-  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "cancelled");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "retired");
 });
 
-test("a failed WorkItem can be explicitly abandoned after its isolated workspace was abandoned", (t) => {
+test("a failed WorkItem can be explicitly retired after its isolated workspace was abandoned", (t) => {
   const { store, options } = fixture(t);
   const task = createTask(store, options, "Recover failed isolated work");
   run(["activate", task.id], store, options);
@@ -2196,7 +2197,7 @@ test("a failed WorkItem can be explicitly abandoned after its isolated workspace
   );
 
   run(
-    ["work", "dispose", item.id, "abandoned", "--summary", "No deliverable remains."],
+    ["work", "retire", item.id, "--summary", "No deliverable remains."],
     store,
     {
       ...options,
@@ -2210,7 +2211,7 @@ test("a failed WorkItem can be explicitly abandoned after its isolated workspace
   run(["complete", task.id, "--summary", "Recovered and delivered."], store, options);
 
   assert.equal(store.getTask(task.id)?.status, "completed");
-  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "abandoned");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "retired");
   assert.equal(store.getWorkItem(item.taskId, item.id)?.workspaceDisposition, "abandoned");
 });
 

@@ -46,7 +46,6 @@ const PUBLIC_PATHS = [
   "operator list",
   "operator resume",
   "operator submit",
-  "operator retire-unusable-session",
   "project",
   "project add",
   "project clone",
@@ -120,6 +119,7 @@ const PUBLIC_PATHS = [
   "task role remove",
   "task role bind",
   "task role unbind",
+  "task role reset",
   "task role enter",
   "task work",
   "task work create",
@@ -136,7 +136,7 @@ const PUBLIC_PATHS = [
   "task work review preserve",
   "task work accept",
   "task work reject",
-  "task work dispose",
+  "task work retire",
   "task run",
   "task run list",
   "task run retry",
@@ -340,14 +340,11 @@ test("interaction policies cover missing task, work, Integration, and job identi
   });
 });
 
-test("unusable Session retirement exposes exact Operator help and completion selectors", () => {
-  const node = findCommandNode(["operator", "retire-unusable-session"]);
+test("Task Role reset exposes exact help and completion selectors", () => {
+  const node = findCommandNode(["task", "role", "reset"]);
   assert.ok(node);
-  assert.deepEqual(node.options, [
-    "--run", "--agent", "--adapter", "--receipt",
-    "--native-session", "--launch", "--reason"
-  ]);
-  assert.match(renderCommandHelp(node, "0.2.0"), /retire-unusable-session <task> <role>/u);
+  assert.deepEqual(node.options, ["--reason"]);
+  assert.match(renderCommandHelp(node, "0.2.0"), /task role reset <task> <role>/u);
   const policy = findInteractionPolicy(node);
   assert.ok(policy);
   assert.deepEqual(policy.selectors.map(({ provider, argumentIndex, option, dependsOn }) => ({
@@ -356,10 +353,8 @@ test("unusable Session retirement exposes exact Operator help and completion sel
     ...(option === undefined ? {} : { option }),
     ...(dependsOn === undefined ? {} : { dependsOn })
   })), [
-    { provider: "tasks", argumentIndex: 2 },
-    { provider: "task-roles", argumentIndex: 3, dependsOn: 2 },
-    { provider: "runs", option: "--run", dependsOn: 2 },
-    { provider: "configured-agents", option: "--agent" }
+    { provider: "tasks", argumentIndex: 3 },
+    { provider: "task-roles", argumentIndex: 4, dependsOn: 3 }
   ]);
 });
 

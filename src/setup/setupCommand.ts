@@ -146,17 +146,17 @@ export async function runSetupCommand(
       `Operator Agent: ${result.operatorAgentId}.`,
       `Leader model: ${result.leaderConfig.model ?? "CLI default"}.`,
       `Leader reasoning effort: ${result.leaderConfig.effort ?? "CLI default"}.`,
-      `Leader permission: ${result.leaderConfig.permission?.strategy ?? "default"}.`,
+      `Leader permission: ${result.leaderConfig.permission.strategy}.`,
       `Operator model: ${result.operatorConfig.model ?? "CLI default"}.`,
       `Operator reasoning effort: ${result.operatorConfig.effort ?? "CLI default"}.`,
-      `Operator permission: ${result.operatorConfig.permission?.strategy ?? "default"}.`,
+      `Operator permission: ${result.operatorConfig.permission.strategy}.`,
       `Worker Agent: ${result.workerAgentId}.`,
       `Worker configuration: ${result.workerReusesLeader
         ? "Reused Leader configuration"
         : "Configured separately"}.`,
       `Worker model: ${result.workerConfig.model ?? "CLI default"}.`,
       `Worker reasoning effort: ${result.workerConfig.effort ?? "CLI default"}.`,
-      `Worker permission: ${result.workerConfig.permission?.strategy ?? "default"}.`,
+      `Worker permission: ${result.workerConfig.permission.strategy}.`,
       `Project workspace: ${result.workspace}.`,
       `Time zone: ${resolveTimeZone(new FileTaskStore(home).getConfig().timeZone)}.`
     ];

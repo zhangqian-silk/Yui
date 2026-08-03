@@ -79,7 +79,6 @@ export function parseClaudeStopFailureHookNotification(
   if (payload.hook_event_name !== "StopFailure") {
     throw new Error("Managed Claude lifecycle ingestion accepts only StopFailure.");
   }
-  assertStopFailureHookKeys(payload);
   if (environment.YUI_SESSION_SCOPE !== "task") {
     throw new Error("Claude lifecycle hook requires a Task session scope.");
   }
@@ -135,96 +134,6 @@ function parseObject(value: string | undefined): Record<string, unknown> {
   } catch {
     throw new Error("Claude lifecycle hook stdin JSON is invalid.");
   }
-}
-
-function assertStopFailureHookKeys(payload: Record<string, unknown>): void {
-  const allowed = new Set([
-    "hook_event_name",
-    "session_id",
-    "prompt_id",
-    "transcript_path",
-    "cwd",
-    "permission_mode",
-    "effort",
-    "agent_id",
-    "agent_type",
-    "error",
-    "error_details",
-    "last_assistant_message"
-  ]);
-  const unexpected = Object.keys(payload).find((key) => !allowed.has(key));
-  if (unexpected !== undefined) {
-    throw new Error(`Claude lifecycle hook stdin JSON has unexpected field: ${unexpected}.`);
-  }
-  for (const required of ["hook_event_name", "session_id", "error"]) {
-    if (!Object.hasOwn(payload, required)) {
-      throw new Error(`Claude lifecycle hook stdin JSON is missing ${required}.`);
-    }
-  }
-  assertCurrentCommonFields(payload);
-  if (!CLAUDE_STOP_FAILURE_ERRORS.has(payload.error as string)) {
-    invalidHookField("error");
-  }
-}
-
-const CLAUDE_PERMISSION_MODES = new Set([
-  "default",
-  "plan",
-  "acceptEdits",
-  "auto",
-  "dontAsk",
-  "bypassPermissions"
-]);
-const CLAUDE_EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
-const CLAUDE_STOP_FAILURE_ERRORS = new Set([
-  "rate_limit",
-  "overloaded",
-  "authentication_failed",
-  "oauth_org_not_allowed",
-  "billing_error",
-  "invalid_request",
-  "model_not_found",
-  "server_error",
-  "max_output_tokens",
-  "unknown"
-]);
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
-
-function assertCurrentCommonFields(payload: Record<string, unknown>): void {
-  for (const key of ["transcript_path", "cwd", "agent_id", "agent_type"] as const) {
-    if (payload[key] !== undefined) requireProviderText(payload[key], key);
-  }
-  if (payload.prompt_id !== undefined) {
-    const promptId = requireProviderText(payload.prompt_id, "prompt_id");
-    if (!UUID_PATTERN.test(promptId)) invalidHookField("prompt_id");
-  }
-  if (payload.permission_mode !== undefined
-    && !CLAUDE_PERMISSION_MODES.has(payload.permission_mode as string)) {
-    invalidHookField("permission_mode");
-  }
-  if (payload.effort !== undefined) {
-    if (!isObject(payload.effort)
-      || !hasExactKeys(payload.effort, ["level"])
-      || !CLAUDE_EFFORT_LEVELS.has(payload.effort.level as string)) {
-      invalidHookField("effort");
-    }
-  }
-}
-
-function requireProviderText(value: unknown, field: string): string {
-  if (typeof value !== "string" || value.includes("\0") || value.trim().length === 0) {
-    invalidHookField(field);
-  }
-  return value;
-}
-
-function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
-  return Object.keys(value).length === expected.length
-    && expected.every((key) => Object.hasOwn(value, key));
-}
-
-function invalidHookField(field: string): never {
-  throw new Error(`Claude lifecycle hook stdin JSON has invalid ${field}.`);
 }
 
 function requireIdentity(value: unknown, label: string): string {

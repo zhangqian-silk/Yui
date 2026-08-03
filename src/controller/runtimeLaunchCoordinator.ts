@@ -6,7 +6,7 @@ import {
 } from "../runtime/lifecycleReservation.js";
 import {
   createRuntimeBinding,
-  RuntimeLaunchRecoveryError,
+  RuntimeLaunchError,
   type RuntimeBinding,
   type RuntimeLaunchPersistence as RuntimeLaunchPersistencePort,
   type RuntimeLaunchPreparationPort,
@@ -186,11 +186,10 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       const inspection = await this.host.inspectOwner(request.owner);
       if (inspection.state === "unavailable" || inspection.state === "starting") {
         if (sameRunReservation) {
-          throw new RuntimeLaunchRecoveryError(
-            "retryable",
-            inspection.state,
-            request.runId!,
-            reservation.launchId
+          throw new RuntimeLaunchError(
+            true,
+            reservation.launchId,
+            `Runtime is temporarily ${inspection.state}: ${request.runId}/${reservation.launchId}.`
           );
         }
         throw new Error(
@@ -201,11 +200,10 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       }
       if (inspection.state === "stopped") {
         if (sameRunReservation) {
-          throw new RuntimeLaunchRecoveryError(
-            "generation-lost",
-            "stopped",
-            request.runId!,
-            reservation.launchId
+          throw new RuntimeLaunchError(
+            false,
+            reservation.launchId,
+            `Exact Run launch generation stopped before delivery: ${request.runId}/${reservation.launchId}.`
           );
         }
         if (!this.reservations.completeRuntimeLaunchReservation(
@@ -288,11 +286,10 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
 
     if (reusedConfirmedRunningHost && binding.hostCreated === true) {
       if (request.runId !== undefined && reservation.runId === request.runId) {
-        throw new RuntimeLaunchRecoveryError(
-          "generation-lost",
-          "recreated",
-          request.runId,
-          launchId
+        throw new RuntimeLaunchError(
+          false,
+          launchId,
+          `Exact Run launch generation was unexpectedly recreated: ${request.runId}/${launchId}.`
         );
       }
       await this.#compensateStartedHost(

@@ -94,7 +94,7 @@ function renderDispatchContext(
     `Task: ${context.taskId}`,
     `Role: ${profile.name}`,
     `Active Agent: ${profile.activeAgentId}`,
-    `Runtime: ${binding.adapterId}; model: ${binding.config.model ?? "CLI default"}; effort: ${binding.config.effort ?? "CLI default"}; permission: ${binding.config.permission?.strategy ?? "default"}`,
+    `Runtime: ${binding.adapterId}; model: ${binding.config.model ?? "CLI default"}; effort: ${binding.config.effort ?? "CLI default"}; permission: ${binding.config.permission.strategy}`,
     profile.description === undefined ? null : `Description: ${profile.description}`,
     ...(profile.responsibilities ?? []).map((item) => `Responsibility: ${item}`),
     ...(profile.constraints ?? []).map((item) => `Constraint: ${item}`),

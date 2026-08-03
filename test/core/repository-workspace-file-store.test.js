@@ -2464,7 +2464,7 @@ test("Task retirement settles the aggregate but preserves Candidate, Git, Integr
   const proof = await new WorkItemChangeSetManager(store).assertRetirable(task.id);
 
   const result = runTaskCommand([
-    "retire", task.id, "abandoned", "--summary", "The intent is no longer current."
+    "retire", task.id, "--summary", "The intent is no longer current."
   ], store, {
     now: () => new Date(NOW),
     taskRetirementProof: proof,
@@ -2476,9 +2476,9 @@ test("Task retirement settles the aggregate but preserves Candidate, Git, Integr
   });
 
   assert.equal(result.kind, "output");
-  assert.equal(store.getTask(task.id).status, "abandoned");
+  assert.equal(store.getTask(task.id).status, "retired");
   assert.equal(store.getTask(task.id).retirementSummary, "The intent is no longer current.");
-  assert.equal(store.getWorkItem(task.id, item.id).status, "abandoned");
+  assert.equal(store.getWorkItem(task.id, item.id).status, "retired");
   assert.equal(store.getWorkItem(task.id, item.id).candidates[0].summary, "Keep this candidate verbatim");
   assert.deepEqual(store.listChangeSets(task.id), [changeSet]);
   assert.deepEqual(store.listIntegrationAttempts(task.id), [integration]);

@@ -41,10 +41,10 @@ export function renderRoleDetails(
     `  Active Agent     ${role.activeAgentId}`,
     ...("status" in role ? [`  Status           ${role.status}`] : []),
     `  Workspace        ${role.workspace}`,
-    `  Desired launch   r${role.launchRevision}; access ceiling=${role.defaultAccess}`,
+    `  Desired launch   r${role.launchRevision}; Profile intent=${role.defaultAccess}`,
     `  Effective launch ${effective === undefined
       ? "not started"
-      : `${effective.agentId}/${effective.adapterId}; r${effective.sourceDesiredRevision}; access=${effective.access}; permission=${effective.permission.strategy}`}`,
+      : `${effective.agentId}/${effective.adapterId}; r${effective.sourceDesiredRevision}; Profile intent=${effective.profileAccess}; permission=${effective.permission.strategy}`}`,
     `  Desired drift    ${effective === undefined
       ? "-"
       : effective.sourceDesiredRevision === role.launchRevision
@@ -100,15 +100,18 @@ function bindingRow(
 function permission(binding: RoleAgentBinding): string {
   if (binding.config.adapterId === "codex") {
     const permission = binding.config.permission;
-    if (permission === undefined || permission.strategy === "default") return "CLI default";
+    if (permission.strategy === "default") return "CLI default";
     if (permission.strategy === "bypass") return "bypass";
-    return `sandbox=${permission.sandbox}, approval=${permission.approval}`;
+    return [
+      permission.sandbox === undefined ? undefined : `sandbox=${permission.sandbox}`,
+      permission.approval === undefined ? undefined : `approval=${permission.approval}`
+    ].filter((value): value is string => value !== undefined).join("; ");
   }
   const permission = binding.config.permission;
-  if (permission === undefined || permission.strategy === "default") return "CLI default";
+  if (permission.strategy === "default") return "CLI default";
   if (permission.strategy === "bypass") return "bypass";
   const rules = [
-    `mode=${permission.mode}`,
+    permission.mode === undefined ? undefined : `mode=${permission.mode}`,
     permission.allowedTools === undefined
       ? undefined
       : `allow=${permission.allowedTools.join(", ")}`,

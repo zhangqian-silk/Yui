@@ -44,7 +44,7 @@ type RoleAgentOwner = RoleProfile & {
   schemaVersion: 3;
   /** Monotonic desired configuration revision. It only affects the next launch. */
   launchRevision: number;
-  /** Maximum access the Role may receive after scope and purpose are applied. */
+  /** Provider-neutral read/write behavior intent copied from the Profile. */
   defaultAccess: WorkerAccess;
   name: string;
   activeAgentId: string;

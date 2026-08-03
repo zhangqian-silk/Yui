@@ -22,6 +22,14 @@ test("new Role bindings default to one explicit bypass permission strategy", () 
     adapterId: "codex",
     permission: { strategy: "bypass" }
   });
+  assert.deepEqual(createRoleAgentBinding(agent, {
+    adapterId: "codex",
+    model: "gpt-custom"
+  }).config, {
+    adapterId: "codex",
+    model: "gpt-custom",
+    permission: { strategy: "bypass" }
+  });
 });
 
 test("current Role storage rejects a binding without an explicit permission strategy", () => {
@@ -36,23 +44,45 @@ test("current Role storage rejects a binding without an explicit permission stra
     "/fixture",
     NOW
   ), /explicit permission strategy/i);
+
+  assert.throws(() => resolveAgentAdapter("codex").canonicalizeConfig({
+    adapterId: "codex"
+  }), /permission strategy is required/i);
+  assert.throws(() => resolveAgentAdapter("claude").canonicalizeConfig({
+    adapterId: "claude"
+  }), /permission strategy is required/i);
 });
 
-test("configured permission requires the provider's complete native enum shape", () => {
-  assert.throws(
-    () => resolveAgentAdapter("codex").canonicalizeConfig({
-      adapterId: "codex",
-      permission: { strategy: "configured", sandbox: "read-only" }
-    }),
-    /approval/i
-  );
-  assert.throws(
-    () => resolveAgentAdapter("claude").canonicalizeConfig({
-      adapterId: "claude",
-      permission: { strategy: "configured" }
-    }),
-    /permission mode/i
-  );
+test("configured permission forwards any non-empty subset of provider-native options", () => {
+  const codex = resolveAgentAdapter("codex").canonicalizeConfig({
+    adapterId: "codex",
+    permission: { strategy: "configured", sandbox: "read-only" }
+  });
+  assert.deepEqual(codex.permission, {
+    strategy: "configured",
+    sandbox: "read-only"
+  });
+
+  const claude = resolveAgentAdapter("claude").canonicalizeConfig({
+    adapterId: "claude",
+    permission: {
+      strategy: "configured",
+      allowedTools: ["Bash(API_KEY=$API_KEY command)"]
+    }
+  });
+  assert.deepEqual(claude.permission, {
+    strategy: "configured",
+    allowedTools: ["Bash(API_KEY=$API_KEY command)"]
+  });
+
+  assert.throws(() => resolveAgentAdapter("claude").canonicalizeConfig({
+    adapterId: "claude",
+    permission: { strategy: "configured" }
+  }), /at least one provider-native option/i);
+  assert.throws(() => resolveAgentAdapter("claude").canonicalizeConfig({
+    adapterId: "claude",
+    permission: { strategy: "configured", allowedTools: [] }
+  }), /tool lists must not be empty/i);
 });
 
 test("read access does not downgrade a configured provider bypass", () => {
@@ -66,7 +96,7 @@ test("read access does not downgrade a configured provider bypass", () => {
     workspace: workspace("read")
   });
 
-  assert.equal(effective.access, "read");
+  assert.equal(effective.profileAccess, "read");
   assert.deepEqual(effective.permission, { strategy: "bypass" });
   assert.ok(compileArgv(role, effective).includes(
     "--dangerously-bypass-approvals-and-sandbox"
@@ -88,7 +118,7 @@ test("configured provider enums remain independent from write access", () => {
     workspace: workspace("write"),
     workItemWriteProjectIds: ["project-1"]
   });
-  assert.equal(codexEffective.access, "write");
+  assert.equal(codexEffective.profileAccess, "write");
   assert.deepEqual(compileArgv(codexRole, codexEffective).slice(2), [
     "--sandbox", "read-only", "--ask-for-approval", "never"
   ]);
@@ -108,7 +138,7 @@ test("configured provider enums remain independent from write access", () => {
     workspace: workspace("write"),
     workItemWriteProjectIds: ["project-1"]
   });
-  assert.equal(claudeEffective.access, "write");
+  assert.equal(claudeEffective.profileAccess, "write");
   assert.deepEqual(compileArgv(claudeRole, claudeEffective), [
     "--permission-mode", "plan",
     "--allowed-tools", "Read", "Grep",

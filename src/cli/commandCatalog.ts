@@ -277,10 +277,9 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "retire",
     summary: "Retire a stale Task while preserving its historical evidence.",
-    usage: "yui task retire <task> <cancelled|superseded|abandoned> (--summary <text>|--summary-file <path|->) [--replacement <task>]",
+    usage: "yui task retire <task> (--summary <text>|--summary-file <path|->) [--replacement <task>]",
     options: ["--summary", "--summary-file", "--replacement"],
-    fileOptions: ["--summary-file"],
-    argumentValues: { 1: ["cancelled", "superseded", "abandoned"] }
+    fileOptions: ["--summary-file"]
   },
   { name: "list", summary: "List Tasks." },
   { name: "show", summary: "Show a Task.", usage: "yui task show <id>" },
@@ -352,7 +351,7 @@ const taskChildren: readonly NodeInput[] = [
     name: "role",
     summary: "Manage Roles within a Task.",
     sections: [{ id: "manage", title: "Commands", entries: [
-      "add", "list", "status", "show", "update", "remove", "bind", "unbind", "enter"
+      "add", "list", "status", "show", "update", "remove", "bind", "unbind", "reset", "enter"
     ] }],
     children: [
       {
@@ -380,6 +379,12 @@ const taskChildren: readonly NodeInput[] = [
       { name: "remove", summary: "Remove a Task Role.", usage: "yui task role remove <task> <role>" },
       { name: "bind", summary: "Bind and activate an Agent for a Task Role.", usage: "yui task role bind <task> <role> <agent-id>" },
       { name: "unbind", summary: "Unbind a dormant Agent from a Task Role.", usage: "yui task role unbind <task> <role> <agent-id>" },
+      {
+        name: "reset",
+        summary: "Fail current work, forget the native Session, and request verified cleanup.",
+        usage: "yui task role reset <task> <role> --reason <text>",
+        options: ["--reason"]
+      },
       { name: "enter", summary: "Enter a Task Role's native session.", usage: "yui task role enter <task> <role>" }
     ]
   },
@@ -391,7 +396,7 @@ const taskChildren: readonly NodeInput[] = [
       title: "Commands",
       entries: [
         "create", "list", "show", "update", "scope", "dispatch", "isolate", "capture", "cleanup",
-        "review", "accept", "reject", "dispose"
+        "review", "accept", "reject", "retire"
       ]
     }],
     children: [
@@ -406,7 +411,7 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "update",
         summary: "Update a work item's state.",
-        usage: "yui task work update <task>/<work> <todo|running|done|failed|cancelled|superseded> [--summary <text>]",
+        usage: "yui task work update <task>/<work> <todo|running|done|failed> [--summary <text>]",
         options: ["--summary"],
         argumentValues: {
           1: ["todo", "running", "done", "failed"]
@@ -472,11 +477,10 @@ const taskChildren: readonly NodeInput[] = [
         options: ["--summary"]
       },
       {
-        name: "dispose",
-        summary: "Record the Leader's explicit WorkItem disposition and settle its exact Runs.",
-        usage: "yui task work dispose <work> <cancelled|abandoned|replaced> --summary <text> [--replacement <work>]",
-        options: ["--summary", "--replacement"],
-        argumentValues: { 1: ["cancelled", "abandoned", "replaced"] }
+        name: "retire",
+        summary: "Retire a WorkItem and settle its exact Runs.",
+        usage: "yui task work retire <work> --summary <text> [--replacement <work>]",
+        options: ["--summary", "--replacement"]
       }
     ]
   },
@@ -706,7 +710,7 @@ export const ROOT_COMMAND = buildNode({
       sections: [{
         id: "workflow",
         title: "Commands",
-        entries: ["enter", "new", "list", "resume", "submit", "retire-unusable-session"]
+        entries: ["enter", "new", "list", "resume", "submit"]
       }],
       children: [
         { name: "enter", summary: "Enter the Operator's native session." },
@@ -729,15 +733,6 @@ export const ROOT_COMMAND = buildNode({
           usage: "yui operator submit (<body>|--body-file <path|->) [--task <id>]",
           options: ["--task", "--body-file"],
           fileOptions: ["--body-file"]
-        },
-        {
-          name: "retire-unusable-session",
-          summary: "Retire one exact delivered fixed native Session declared unusable by the Operator.",
-          usage: "yui operator retire-unusable-session <task> <role> --run <run> --agent <agent> --adapter <adapter> --receipt <receipt> --native-session <id> --launch <generation> --reason <text>",
-          options: [
-            "--run", "--agent", "--adapter", "--receipt",
-            "--native-session", "--launch", "--reason"
-          ]
         }
       ]
     },

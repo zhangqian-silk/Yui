@@ -12,14 +12,20 @@ import {
 import { compileRoleSessionContext } from "../../dist/context/roleSessionContext.js";
 
 const role = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   taskId: "task-1",
   name: "leader",
   activeAgentId: "codex",
   agentBindings: {
-    codex: { agentId: "codex", adapterId: "codex", config: { adapterId: "codex" } }
+    codex: {
+      agentId: "codex",
+      adapterId: "codex",
+      config: { adapterId: "codex", permission: { strategy: "bypass" } }
+    }
   },
   workspace: "/tmp/workspace",
+  launchRevision: 1,
+  defaultAccess: "write",
   status: "idle",
   description: "Lead the implementation",
   constraints: ["Keep changes focused"],
@@ -96,7 +102,7 @@ test("Claude Worker completion requires the exact explicit yield transport", () 
         claude: {
           agentId: "claude",
           adapterId: "claude",
-          config: { adapterId: "claude" }
+          config: { adapterId: "claude", permission: { strategy: "bypass" } }
         }
       }
     },
@@ -134,7 +140,7 @@ test("Codex and Claude Worker handoffs require truthful uncertain evidence", () 
           [adapterId]: {
             agentId: adapterId,
             adapterId,
-            config: { adapterId }
+            config: { adapterId, permission: { strategy: "bypass" } }
           }
         }
       },

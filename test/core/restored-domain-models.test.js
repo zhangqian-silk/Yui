@@ -24,6 +24,7 @@ import { activateTask, archiveTask, completeTask, createTask } from "../../dist/
 import {
   createWorkItem,
   recordWorkItemWorkspaceDisposition,
+  retireWorkItem,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { createTaskMessage } from "../../dist/message/message.js";
@@ -316,7 +317,7 @@ test("a writable Review Run requires its exact ReviewRound-owned workspace", () 
   );
 
   assert.doesNotThrow(() => validateAgentRun(run));
-  assert.equal(run.effective.access, "write");
+  assert.equal(run.effective.profileAccess, "write");
   assert.equal(run.effective.reviewRoundId, "review-round-1");
   assert.equal(run.workspace.owner.reviewRoundId, "review-round-1");
   assert.throws(
@@ -407,7 +408,7 @@ test("updating a terminal WorkItem outcome preserves its workspace disposition",
   assert.equal(corrected.endedAt, completed.endedAt);
 });
 
-test("closing an abandoned failed WorkItem preserves its workspace disposition", () => {
+test("retiring an abandoned failed WorkItem preserves its workspace disposition", () => {
   const failed = updateWorkItemStatus(createWorkItem(
     "work-item-1",
     "task-1",
@@ -415,16 +416,15 @@ test("closing an abandoned failed WorkItem preserves its workspace disposition",
     now
   ), "failed", later, "Native session exited.");
   const abandoned = recordWorkItemWorkspaceDisposition(failed, "abandoned", later);
-  const superseded = updateWorkItemStatus(
-    abandoned,
-    "superseded",
-    later,
-    "Replacement work completed."
-  );
+  const retired = retireWorkItem(abandoned, {
+    by: "leader",
+    summary: "Replacement work completed.",
+    replacementWorkItemId: "work-item-2"
+  }, later);
 
-  assert.equal(superseded.status, "superseded");
-  assert.equal(superseded.workspaceDisposition, "abandoned");
-  assert.equal(superseded.outcome, "Replacement work completed.");
+  assert.equal(retired.status, "retired");
+  assert.equal(retired.workspaceDisposition, "abandoned");
+  assert.equal(retired.outcome, "Replacement work completed.");
 });
 
 test("TaskMessage represents user, operator, and Role result authors structurally", () => {

@@ -1,11 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 
-import type {
-  RetiredTaskRoleSession,
-  RoleAgentSession,
-  TaskRoleSessionSet,
-  UnusableSessionRetirement
-} from "../executor/agentExecutor.js";
+import type { RoleAgentSession } from "../executor/agentExecutor.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { TaskRole } from "../role/role.js";
@@ -40,24 +35,9 @@ export type TaskRoleWorkspaceStatus =
   | Readonly<{ managed: false; path: string }>
   | Readonly<{ managed: true } & RoleWorkspace>;
 
-export type TaskRoleSessionRetirementStatus = Readonly<{
-  state: "cleanup-pending" | "retired";
-  id: string;
-  agentId: string;
-  adapterId: string;
-  runId: string;
-  receiptId: string;
-  nativeSessionId: string;
-  launchId: string;
-  reason: string;
-  declaredAt: string;
-  retiredAt?: string;
-}>;
-
 export type TaskRoleSessionRecoveryStatus = Readonly<{
   taskId: string;
   roleName: string;
-  sessionRetirement: TaskRoleSessionRetirementStatus | null;
   runtimeCleanupPending: boolean;
   freshLaunchAllowed: boolean;
 }>;
@@ -77,7 +57,6 @@ export type TaskRoleRuntimeStatus = Readonly<{
   activeRun: AgentRun | null;
   activeWork: WorkItem | null;
   nativeSession: RoleAgentSession | null;
-  sessionRetirement: TaskRoleSessionRetirementStatus | null;
   runtimeCleanupPending: boolean;
   freshLaunchAllowed: boolean;
   tmux: TaskRoleTmuxStatus;
@@ -118,12 +97,7 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
     : `${status.nativeSession.nativeSessionId} (${status.nativeSession.status}, ${status.nativeSession.adapterId}, effective r${status.nativeSession.effective.sourceDesiredRevision})`;
   const effectiveLaunch = status.effectiveLaunch === null
     ? "not started"
-    : `${status.effectiveLaunch.agentId}/${status.effectiveLaunch.adapterId}; r${status.effectiveLaunch.sourceDesiredRevision}; access=${status.effectiveLaunch.access}; permission=${status.effectiveLaunch.permission.strategy}`;
-  const sessionUsability = status.sessionRetirement === null
-    ? "no Operator declaration"
-    : status.sessionRetirement.state === "cleanup-pending"
-      ? "operator-declared-unusable (cleanup-pending)"
-      : `retired (${status.sessionRetirement.id})`;
+    : `${status.effectiveLaunch.agentId}/${status.effectiveLaunch.adapterId}; r${status.effectiveLaunch.sourceDesiredRevision}; Profile intent=${status.effectiveLaunch.profileAccess}; permission=${status.effectiveLaunch.permission.strategy}`;
   const tmux = status.tmux.state === "missing"
     ? "missing"
     : [
@@ -146,7 +120,7 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
     `  Reason           ${status.healthReason}`,
     `  Open inputs      ${status.openInputRequestCount}`,
     `  Agent            ${status.agentId}`,
-    `  Desired launch   r${status.desiredRevision}; access ceiling=${status.role.defaultAccess}`,
+    `  Desired launch   r${status.desiredRevision}; Profile intent=${status.role.defaultAccess}`,
     `  Effective launch ${effectiveLaunch}`,
     `  Desired drift    ${status.effectiveLaunch === null
       ? "-"
@@ -156,10 +130,6 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
     `  Active work      ${activeWork}`,
     `  Active run       ${activeRun}`,
     `  Native session   ${nativeSession}`,
-    `  Session usability ${sessionUsability}`,
-    ...(status.sessionRetirement === null
-      ? []
-      : [`  Retirement reason ${status.sessionRetirement.reason}`]),
     `  Runtime cleanup  ${status.runtimeCleanupPending ? "pending" : "none"}`,
     `  Fresh launch     ${status.freshLaunchAllowed ? "allowed" : "blocked"}`,
     `  tmux pane        ${tmux}`,
@@ -176,12 +146,7 @@ export function taskRoleActiveWorkLabel(status: TaskRoleRuntimeStatus): string {
 }
 
 export function taskRoleNativeSessionLabel(status: TaskRoleRuntimeStatus): string {
-  if (status.sessionRetirement?.state === "cleanup-pending") {
-    return "unusable (cleanup-pending)";
-  }
-  if (status.sessionRetirement?.state === "retired" && status.nativeSession === null) {
-    return "retired";
-  }
+  if (status.runtimeCleanupPending && status.nativeSession === null) return "reset (cleanup-pending)";
   return status.nativeSession?.status ?? "unbound";
 }
 
@@ -193,18 +158,13 @@ export function inspectTaskRoleSessionRecovery(
   const sessions = store.getTaskRoleSessionSet(taskId, roleName);
   const target = runtimeLifecycleTarget({ scope: "task", taskId, roleName });
   const runtimeMailbox = store.getWorkMailbox(target);
-  const sessionRetirement = sessions === null ? null : currentSessionRetirement(sessions);
   return {
     taskId,
     roleName,
-    sessionRetirement,
     runtimeCleanupPending: hasRuntimeCleanupObligation(runtimeMailbox),
     freshLaunchAllowed: (
       sessions === null
-      || (
-        sessions.unusableSessionRetirement === null
-        && sessions.sessions[sessions.activeAgentId] === undefined
-      )
+      || sessions.sessions[sessions.activeAgentId] === undefined
     ) && !hasRuntimeLifecycleWork(runtimeMailbox)
   };
 }
@@ -260,7 +220,6 @@ function inspectTaskRoleRuntimeStatus(
     role,
     activeRun,
     nativeSession,
-    recovery.sessionRetirement,
     recovery.runtimeCleanupPending,
     tmux,
     openInputRequestCount
@@ -288,17 +247,14 @@ function calculateHealth(
   role: TaskRole,
   activeRun: AgentRun | null,
   nativeSession: RoleAgentSession | null,
-  sessionRetirement: TaskRoleSessionRetirementStatus | null,
   runtimeCleanupPending: boolean,
   tmux: TaskRoleTmuxStatus,
   openInputRequestCount: number
 ): Pick<TaskRoleRuntimeStatus, "health" | "healthReason"> {
-  if (sessionRetirement?.state === "cleanup-pending") {
+  if (runtimeCleanupPending && nativeSession === null) {
     return {
       health: "needs-attention",
-      healthReason: runtimeCleanupPending
-        ? `Operator declared native Session ${sessionRetirement.nativeSessionId} unusable; verified runtime cleanup is pending`
-        : `Operator declared native Session ${sessionRetirement.nativeSessionId} unusable; its cleanup obligation is missing`
+      healthReason: "the native Session was reset; verified runtime cleanup is pending"
     };
   }
   if (role.status === "failed" || role.status === "exited") {
@@ -344,52 +300,4 @@ function calculateHealth(
   return tmux.state === "running"
     ? { health: "ready", healthReason: "the native Agent pane is ready without active work" }
     : { health: "idle", healthReason: "there is no active work or live tmux pane" };
-}
-
-function currentSessionRetirement(
-  sessions: TaskRoleSessionSet
-): TaskRoleSessionRetirementStatus | null {
-  if (sessions.unusableSessionRetirement !== null) {
-    return pendingRetirementStatus(sessions.unusableSessionRetirement);
-  }
-  const retired = Object.values(sessions.retiredSessions).sort((left, right) => (
-    Date.parse(left.retiredAt) - Date.parse(right.retiredAt)
-    || left.retirementId.localeCompare(right.retirementId)
-  )).at(-1);
-  return retired === undefined ? null : retiredSessionStatus(retired);
-}
-
-function pendingRetirementStatus(
-  retirement: UnusableSessionRetirement
-): TaskRoleSessionRetirementStatus {
-  return {
-    state: "cleanup-pending",
-    id: retirement.id,
-    agentId: retirement.agentId,
-    adapterId: retirement.adapterId,
-    runId: retirement.runId,
-    receiptId: retirement.receiptId,
-    nativeSessionId: retirement.nativeSessionId,
-    launchId: retirement.launchId,
-    reason: retirement.reason,
-    declaredAt: retirement.declaredAt
-  };
-}
-
-function retiredSessionStatus(
-  retired: RetiredTaskRoleSession
-): TaskRoleSessionRetirementStatus {
-  return {
-    state: "retired",
-    id: retired.retirementId,
-    agentId: retired.session.agentId,
-    adapterId: retired.session.adapterId,
-    runId: retired.runId,
-    receiptId: retired.receiptId,
-    nativeSessionId: retired.session.nativeSessionId,
-    launchId: retired.session.launchId ?? "unrecorded",
-    reason: retired.reason,
-    declaredAt: retired.declaredAt,
-    retiredAt: retired.retiredAt
-  };
 }

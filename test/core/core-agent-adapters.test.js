@@ -219,7 +219,7 @@ test("Codex refuses to replace native developer_instructions from the effective 
 
   assert.throws(() => adapter.compileNew({
     agent: configured("codex-personal", "codex", "/opt/bin/codex"),
-    config: { adapterId: "codex" },
+    config: { adapterId: "codex", permission: { strategy: "default" } },
     workspace,
     codexDeveloperInstructions: inspectCodexDeveloperInstructions({
       environment: { CODEX_HOME: codexHome },
@@ -803,7 +803,7 @@ test("Claude writes large native session context to a private managed file inste
   const adapter = resolveAgentAdapter("claude");
   const compiled = adapter.compileNew({
     agent: configured("claude-personal", "claude", "claude-wrapper"),
-    config: { adapterId: "claude" },
+    config: { adapterId: "claude", permission: { strategy: "default" } },
     workspace: "/tmp",
     developerInstructions: content,
     managedContextFile: contextFile

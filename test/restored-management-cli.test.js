@@ -252,7 +252,7 @@ test("global Role rejects adapter-specific settings before mutating the binding"
     () => runGlobalRoleCommand([
       "update", "reviewer", "--agent", "claude", "--permission-mode", ""
     ], store),
-    /permission-strategy configured|required/i
+    /must not be empty|required/i
   );
   assert.throws(
     () => runGlobalRoleCommand([

@@ -59,7 +59,7 @@ and `task integration start`, keep their subordinate IDs local to that Task.
 Candidate IDs are local to their WorkItem and carry both Task and WorkItem
 provenance.
 
-Yui supports only the current aggregate-v13 / StoredTask-v12 schema. Older
+Yui supports only the current aggregate-v14 / StoredTask-v13 schema. Older
 homes are intentionally unsupported: initialize a fresh `YUI_HOME` instead of
 asking the runtime to convert, dual-read, or infer historical records. See
 [Task-local identity](docs/task-local-identity.md) for the current reference
@@ -170,13 +170,13 @@ keeps the same relative layout, creates isolated worktrees only for that write
 scope, and exposes the other Task Projects as context from Task main. Yui puts
 the exact writable and context-only Project lists into the managed dispatch and
 the `yui-worker` Skill requires the Agent to honor that boundary. Native Agent
-permissions remain session-wide, while Yui `access` records only source-delivery
-authority. Every managed Role binding defaults to
+permissions remain session-wide, while Profile `access` is a behavior hint,
+not a provider sandbox or write grant. Every managed Role binding defaults to
 `permission.strategy=bypass`, including `explorer`, so provider prompts do not
 block normal work. Profiles and Skills constrain behavior; exact WorkItem or
 ReviewRound scope and the matching managed workspace are the only authority to
 modify Project files. A Role may instead choose `default` or `configured` and
-retain the provider's native permission options without changing Yui access.
+retain any supported subset of the provider's native permission options.
 
 Write scope may only expand. The Leader supplies the complete old-plus-new set
 after a Worker yields and reports that another repository is required; an
@@ -221,25 +221,19 @@ yui operator new
 yui operator enter
 ```
 
-When a delivered Task Role Run is pinned to a fixed native Session that the
-Operator has explicitly determined cannot execute another Turn, the global
-Operator can retire that exact Session generation:
+When a Task Role's current native Session cannot continue, reset it by intent:
 
 ```sh
-yui operator retire-unusable-session <task-id> <role> \
-  --run <run-id> --agent <agent-id> --adapter <adapter-id> \
-  --receipt <receipt-id> --native-session <native-session-id> \
-  --launch <launch-id> --reason "<operator reason>"
+yui task role reset <task-id> <role> --reason "<why this generation cannot continue>"
 ```
 
-The command fails only the matching delivered Run and records the exact
-Operator reason; it never creates a Candidate, accepts work, or completes the
-Task. Yui then stops only that Role's owned runtime. Until the stop is verified,
-`task role status` and `task context` show cleanup pending and keep fresh launch
-blocked. After exact cleanup completion, the old fixed Session is retained in
-retirement history and the next launch is new. Existing messages, mailbox
-signals, reviews, and delivery history remain durable. Task-scoped Roles and
-ordinary users cannot invoke this recovery command.
+Yui derives the current Run, Agent, launch, receipt, and native Session from its
+own records. It fails only that exact active Run (and its execution WorkItem),
+stores the current Session as broken history, and asks the Controller to stop
+only the Role-owned runtime. The command never creates a Candidate, accepts
+work, or completes the Task. While cleanup is pending, `task role status` and
+`task context` block a fresh launch. Existing messages, reviews, and delivery
+history remain durable.
 
 Without `--task`, `operator submit` creates a new Draft. Drafts accept planning changes but must be activated before Agent execution.
 Operator resolves every request against the Project catalog and existing Task
@@ -272,29 +266,30 @@ yui task work dispatch <task-id>/<work-item-id> --input "Implement and run focus
 
 Permission is one adapter-specific enum configuration on each Agent binding:
 `default` follows the provider, `bypass` compiles the provider's supported
-bypass flag, and `configured` retains native options. Codex configured options
-are `sandbox` and `approval`; Claude configured options are `mode`,
-`allowedTools`, and `disallowedTools`. This permission strategy is independent
-from source access: only an exact WorkItem scope and matching managed workspace
-grant Project writes. A ReviewRound is the only non-WorkItem source-write
+bypass flag, and `configured` retains whichever native options are explicitly
+set. Codex options are `sandbox` and `approval`; Claude options are `mode`,
+`allowedTools`, and `disallowedTools`. Provider permission is independent from
+Profile behavior and Project write authority: only an exact WorkItem scope and
+matching managed workspace grant normal Project writes. A ReviewRound is the only non-WorkItem write
 purpose and must match its Run, reviewRoundId, frozen base, and
 ReviewRound-owned workspace; every mismatch fails closed. Its diagnostic commit
 is visible history but is
 explicitly rejected by capture, ChangeSet, Integration, and acceptance paths.
 Review yield keeps the same exact `--summary-file -` command, but its stdin is
-one JSON object containing `summary`, a non-empty `checks` array of named
-`passed`/`failed`/`skipped` outcomes with optional details, and an optional
-reported `evidenceCommit` that must equal the managed Review branch HEAD. Dirty
-uncommitted diagnosis may yield without that field; the worktree is retained
-and cleanup refuses it until it is clean.
+the Reviewer's complete free-form Markdown or JSON report. If a JSON report
+includes known `checks` or `evidenceCommit` fields, Yui records them as
+structured evidence and verifies the reported commit against the managed
+Review branch HEAD; unknown fields remain part of the report. Dirty uncommitted
+diagnosis may yield without a commit; the worktree is retained and cleanup
+refuses it until it is clean.
 
 Every Role desired launch change increments its revision and applies only to a
 future launch. Each AgentRun and native Role Session stores the complete actual
-agent, adapter, model, effort, source access, permission strategy and native
-options, workspace, context, and source desired revision. Updating,
+agent, adapter, model, effort, Profile access intent, exact writable Projects,
+permission strategy and native options, workspace, context, and source desired revision. Updating,
 switching, or clearing Role overrides never
 hot-mutates an existing process. `task context`, Role views, Run history,
-Events, and Web show desired/effective revisions, access, permission, and
+Events, and Web show desired/effective revisions, Profile intent, permission, and
 pending next-launch drift.
 
 Both Codex and Claude deliver a managed Run only through its exact injected
@@ -384,7 +379,8 @@ yui task work accept <task-id>/<work-item-id> --summary "Acceptance criteria met
 ```
 
 Use `task work reject` to return an awaiting result for repair and redispatch,
-and `task work dispose` for explicit terminal disposition. WorkItem and Integration
+and `task work retire <task>/<work> --summary "..."` to retire obsolete work,
+optionally naming a replacement. WorkItem and Integration
 worktrees and check logs remain available as evidence until explicit cleanup.
 
 For long-running Tasks, the Leader keeps Yui—not a native transcript—as the
@@ -415,7 +411,7 @@ yui task input request <task-id> --question "Which format should be the default?
 
 The recommendation is shown to the user. If no answer arrives, the nearest-deadline timer wakes the Controller to atomically apply that exact choice and queue the fixed Leader session to resume. Free-text and user-required requests never auto-resolve.
 
-`task input list` is the authoritative global open-input Inbox; add a Task ID to scope it, or `--all` to include answered and cancelled requests. The Controller also makes one receipt-backed, best-effort delivery to an already-running Operator composer. It never starts or interrupts an Operator for this notification; an absent or busy Operator falls back to the durable Inbox and is reconsidered on a later Controller pass. Answers may be submitted by the user or Operator. An open request prevents unrelated pending wakes and Task completion or archival. The originating Leader may instead run `yui task input cancel <task-id> <input-id> --reason "..."`; cancellation queues that fixed Leader session to resume.
+`task input list` is the authoritative global open-input Inbox; add a Task ID to scope it, or `--all` to include answered and cancelled requests. The Controller also makes one receipt-backed, best-effort delivery to an already-running Operator process. It never starts or interrupts an Operator for this notification; unavailable process state or a changed pane fence falls back to the durable Inbox and is reconsidered on a later Controller pass. It does not inspect or classify Agent terminal text. Answers may be submitted by the user or Operator. An open request prevents unrelated pending wakes and Task completion or archival. The originating Leader may instead run `yui task input cancel <task-id> <input-id> --reason "..."`; cancellation queues that fixed Leader session to resume.
 
 Inspect the result:
 
@@ -484,6 +480,12 @@ Use `yui role unbind <global-role> <agent-id>` or `yui task role unbind <task-id
 
 Claude session IDs are preallocated at launch. Managed Codex launches use Codex's structured `notify` callback; after a completed turn, the callback records the native thread ID without injecting a session-binding prompt into the model conversation.
 
+Automated lifecycle and delivery decisions use structured Hook payloads,
+persisted identities, tmux process state, receipts, and pane fences. Yui never
+parses prompt glyphs, progress text, trust dialogs, or other Agent terminal
+output to infer readiness or success. `captureRole()` remains an explicit
+human-facing transcript read and has no lifecycle authority.
+
 Stable Role context is also launch metadata, never a bootstrap turn. Yui passes Role policy and `systemPrompt` through the Agent's native system/developer-instruction channel. Native Codex CLI has no per-launch extra-Skill-root option, so its developer instructions carry compact absolute Skill references and Codex reads each `SKILL.md` on demand. Because `developer_instructions` is one scalar setting, Yui inspects every supported Linux Codex layer—`/etc/codex/config.toml`, the user config, the selected `$CODEX_HOME/<name>.config.toml`, project configs, and `/etc/codex/managed_config.toml`—and refuses to replace a value found in any of them. Managed Codex sessions also require exclusive ownership of the structured `notify` callback that records native Turn completion; Yui refuses launch when any inspected layer already defines `notify`, so neither callback can silently replace the other. `skills.config` is not misused because it only enables or disables already-discovered Skills. Claude receives the same Skill content from a private `0600` managed context file rather than a large or sensitive argv value; retries and resumes reuse the Role-specific path. Non-Operator global Roles stay neutral and receive no Task Leader or Worker Skill. Operator therefore opens at an empty native composer, so the user's text remains its first user message. Leader wakeups and Worker Run assignments remain real mailbox-delivered work messages. An adapter without a native instruction channel must reject this context rather than silently converting it into a first user prompt.
 
 ## Controller and failure handling
@@ -522,7 +524,7 @@ Its recovery reconciliation runs every 120 seconds by default. Normal durable st
 4. detect exited active Role processes;
 5. dispatch pending Leader wakes when the Leader is idle.
 
-Automated input is sent only through tmux. Each pass performs one non-blocking Agent-specific readiness check; a busy startup is retried through a small bounded mailbox timer, while later busy sessions are normally woken by Codex turn-complete events. A pane-local receipt prevents the same Run from being typed twice after a Controller retry.
+Automated input is sent only through tmux. Each pass performs one non-blocking process-state readiness check; a busy startup is retried through a small bounded mailbox timer, while later busy sessions are normally woken by Codex turn-complete events. A pane-local receipt prevents the same Run from being typed twice after a Controller retry.
 
 If a Role process exits before yielding, the Controller fails that Run and running WorkItem and queues the Leader. Recovery failures are exposed through the small compatibility Jobs view:
 

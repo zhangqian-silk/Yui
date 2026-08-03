@@ -16,7 +16,7 @@ import {
   type RoleAgentConfig
 } from "./agentAdapter.js";
 
-export type EffectiveLaunchAccess = WorkerAccess;
+export type EffectiveLaunchProfileAccess = WorkerAccess;
 
 export type EffectiveLaunchWorkspace = Readonly<{
   root: string;
@@ -29,7 +29,8 @@ type EffectiveLaunchBase = Readonly<{
   schemaVersion: 2;
   sourceDesiredRevision: number;
   agentId: string;
-  access: EffectiveLaunchAccess;
+  /** Profile behavior intent captured for this Session; not a provider sandbox. */
+  profileAccess: EffectiveLaunchProfileAccess;
   model?: string;
   effort?: string;
   search: boolean;
@@ -78,13 +79,6 @@ export function resolveEffectiveLaunch(
   const binding = input.role.agentBindings[input.role.activeAgentId]!;
   const workspace = snapshotWorkspace(input.role.workspace, input.workspace);
   const writeProjectIds = effectiveWriteProjects(input, workspace);
-  const writeAuthorized = "taskId" in input.role
-    && input.role.defaultAccess === "write"
-    && writeProjectIds.length > 0;
-  const access: EffectiveLaunchAccess = input.role.defaultAccess === "read"
-    || !writeAuthorized
-    ? "read"
-    : "write";
   const config = resolveAgentAdapter(binding.adapterId).canonicalizeConfig(
     clone(binding.config) as never
   ) as RoleAgentConfig;
@@ -92,7 +86,7 @@ export function resolveEffectiveLaunch(
     sourceDesiredRevision: input.role.launchRevision,
     agentId: binding.agentId,
     config,
-    access,
+    profileAccess: input.role.defaultAccess,
     writeProjectIds,
     workspace,
     context: snapshotContext(input.role),
@@ -181,8 +175,10 @@ export function validateEffectiveLaunchSnapshot<T extends EffectiveLaunchSnapsho
   }
   positiveInteger(snapshot.sourceDesiredRevision, "Source desired revision");
   identity(snapshot.agentId, "Effective Agent id");
-  if (snapshot.access !== "read" && snapshot.access !== "write") {
-    throw new Error(`Effective launch access is invalid: ${String(snapshot.access)}.`);
+  if (snapshot.profileAccess !== "read" && snapshot.profileAccess !== "write") {
+    throw new Error(
+      `Effective launch Profile access is invalid: ${String(snapshot.profileAccess)}.`
+    );
   }
   if (typeof snapshot.search !== "boolean") {
     throw new Error("Effective launch search flag must be boolean.");
@@ -193,12 +189,6 @@ export function validateEffectiveLaunchSnapshot<T extends EffectiveLaunchSnapsho
   const writeProjectIds = uniqueIdentities(snapshot.writeProjectIds, "Effective writable Project");
   if (!isDeepStrictEqual(writeProjectIds, snapshot.writeProjectIds)) {
     throw new Error("Effective writable Projects must be unique and sorted.");
-  }
-  if (snapshot.access === "read" && snapshot.writeProjectIds.length !== 0) {
-    throw new Error("Read-only effective launch cannot carry writable Projects.");
-  }
-  if (snapshot.access === "write" && snapshot.writeProjectIds.length === 0) {
-    throw new Error("Writable effective launch requires an exact writable Project scope.");
   }
   if (snapshot.permission === undefined) {
     throw new Error("Effective launch requires an explicit permission strategy.");
@@ -234,6 +224,7 @@ export function effectiveRoleForLaunch<T extends EffectiveLaunchRole>(
     activeAgentId: snapshot.agentId,
     agentBindings: { ...role.agentBindings, [snapshot.agentId]: binding },
     launchRevision: snapshot.sourceDesiredRevision,
+    defaultAccess: snapshot.profileAccess,
     workspace: snapshot.workspace.root
   } as T;
   clearMissingContext(result, snapshot.context);
@@ -244,7 +235,7 @@ function snapshotFromConfig(input: Readonly<{
   sourceDesiredRevision: number;
   agentId: string;
   config: RoleAgentConfig;
-  access: EffectiveLaunchAccess;
+  profileAccess: EffectiveLaunchProfileAccess;
   writeProjectIds: readonly string[];
   workspace: EffectiveLaunchWorkspace;
   context: EffectiveLaunchContext;
@@ -268,7 +259,7 @@ function snapshotFromConfig(input: Readonly<{
       "Source desired revision"
     ),
     agentId: identity(input.agentId, "Effective Agent id"),
-    access: input.access,
+    profileAccess: input.profileAccess,
     ...(config.model === undefined ? {} : { model: config.model }),
     ...(config.effort === undefined ? {} : { effort: config.effort }),
     search: config.adapterId === "codex" && config.search === true,
@@ -337,7 +328,6 @@ function effectiveWriteProjects(
       "Review workspace Project"
     );
   }
-  if (input.role.defaultAccess === "read") return [];
   const workspaceWrite = uniqueIdentities(
     workspace.entries
       .filter(({ access }) => access === "write")

@@ -15,7 +15,7 @@ import {
 } from "./ports.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import { effectiveLaunchSnapshotsCompatible } from "../executor/effectiveLaunch.js";
-import { RuntimeLaunchRecoveryError } from "../runtime/ports.js";
+import { RuntimeLaunchError } from "../runtime/ports.js";
 
 export type ActiveRoleRunDeliveryResult = Readonly<{
   taskId: string;
@@ -170,15 +170,14 @@ export async function processActiveRoleRunDeliveries(
         results.push({ taskId: task.id, roleName: role.name, runId: run.id, status });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (error instanceof RuntimeLaunchRecoveryError) {
-          if (error.runId !== run.id) throw error;
+        if (error instanceof RuntimeLaunchError) {
           const terminalFailure = roleRunDeliveryFailure(
             run,
             processing.batchId,
             existingSession,
             error.launchId
           );
-          if (error.kind === "retryable") {
+          if (error.retryable) {
             results.push({
               taskId: task.id,
               roleName: role.name,

@@ -16,9 +16,7 @@ const CAPTURABLE_WORK_ITEM_STATUSES = new Set([
   "awaiting_acceptance",
   "completed",
   "failed",
-  "cancelled",
-  "superseded",
-  "abandoned"
+  "retired"
 ]);
 
 export type ProjectIntegrationProof = Readonly<{

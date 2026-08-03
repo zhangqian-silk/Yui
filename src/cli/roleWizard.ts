@@ -306,7 +306,10 @@ async function configureNewAgentField(
   const binding = {
     agentId: agent.id,
     adapterId: agent.adapterId,
-    config: { adapterId: agent.adapterId }
+    config: {
+      adapterId: agent.adapterId,
+      permission: { strategy: "bypass" }
+    }
   };
   const resolved = await loadAgentCatalog(ports, binding);
   const fields = agentFields(binding, resolved?.catalog);
@@ -743,46 +746,66 @@ async function configuredPermissionArgs(
 ): Promise<string[] | undefined> {
   if (strategy !== "configured") return ["--permission-strategy", strategy];
   if (binding.adapterId === "codex") {
-    const sandbox = await promptAgentFieldValue(agentField(
+    const field = await choose(
+      "Native permission option",
+      [
+        { value: "sandbox", cells: ["Sandbox"] },
+        { value: "approval", cells: ["Approval"] }
+      ],
+      [TEXT_COLUMN],
+      io,
       "sandbox",
-      "Sandbox",
+      "option"
+    );
+    if (field === undefined) return undefined;
+    const option = field === "sandbox" ? "--sandbox" : "--approval";
+    const value = await promptAgentFieldValue(agentField(
+      field,
+      field === "sandbox" ? "Sandbox" : "Approval",
       undefined,
-      "--sandbox",
+      option,
       ["--permission-strategy", "default"],
-      catalogChoices(catalog, "permission.sandbox", [
-        "read-only", "workspace-write", "danger-full-access"
-      ])
+      field === "sandbox"
+        ? catalogChoices(catalog, "permission.sandbox", [
+            "read-only", "workspace-write", "danger-full-access"
+          ])
+        : catalogChoices(catalog, "permission.approval", [
+            "untrusted", "on-request", "never"
+          ])
     ), io);
-    if (sandbox === undefined) return undefined;
-    const approval = await promptAgentFieldValue(agentField(
-      "approval",
-      "Approval",
-      undefined,
-      "--approval",
-      ["--permission-strategy", "default"],
-      catalogChoices(catalog, "permission.approval", [
-        "untrusted", "on-request", "never"
-      ])
-    ), io);
-    return approval === undefined
+    return value === undefined
       ? undefined
-      : [
-          "--permission-strategy", "configured",
-          "--sandbox", sandbox,
-          "--approval", approval
-        ];
+      : ["--permission-strategy", "configured", option, value];
   }
-  const mode = await promptAgentFieldValue(agentField(
-    "permission-mode",
-    "Permission mode",
-    undefined,
-    "--permission-mode",
-    ["--permission-strategy", "default"],
-    catalogChoices(catalog, "permission.mode")
-  ), io);
-  return mode === undefined
+  const field = await choose(
+    "Native permission option",
+    [
+      { value: "mode", cells: ["Permission mode"] },
+      { value: "allowed", cells: ["Allowed tool"] },
+      { value: "disallowed", cells: ["Disallowed tool"] }
+    ],
+    [TEXT_COLUMN],
+    io,
+    "mode",
+    "option"
+  );
+  if (field === undefined) return undefined;
+  const option = field === "mode"
+    ? "--permission-mode"
+    : field === "allowed" ? "--allowed-tool" : "--disallowed-tool";
+  const value = field === "mode"
+    ? await promptAgentFieldValue(agentField(
+        "permission-mode",
+        "Permission mode",
+        undefined,
+        option,
+        ["--permission-strategy", "default"],
+        catalogChoices(catalog, "permission.mode")
+      ), io)
+    : (await io.question(`${field === "allowed" ? "Allowed" : "Disallowed"} tool: `))?.trim();
+  return value === undefined || value.length === 0
     ? undefined
-    : ["--permission-strategy", "configured", "--permission-mode", mode];
+    : ["--permission-strategy", "configured", option, value];
 }
 
 async function promptAgentFieldValue(

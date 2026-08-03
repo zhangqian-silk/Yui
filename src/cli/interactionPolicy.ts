@@ -239,7 +239,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     confirmation: { action: "Retire task", targetArgumentIndex: 2 }
   },
   {
-    ...taskTarget("archive", 2, ["completed", "cancelled", "superseded", "abandoned"]),
+    ...taskTarget("archive", 2, ["completed", "retired"]),
     trailingOptions: { "--integrated": "flag", "--abandon": "flag" },
     confirmation: { action: "Archive task", targetArgumentIndex: 2 }
   },
@@ -253,54 +253,6 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       actionTarget: false
     }],
     trailingOptions: { "--task": "value" }
-  },
-  {
-    commandPath: ["operator", "retire-unusable-session"],
-    selectors: [
-      {
-        argumentIndex: 2,
-        entity: "task",
-        provider: "tasks",
-        actionTarget: true,
-        statuses: ["active"]
-      },
-      {
-        argumentIndex: 3,
-        entity: "task-role",
-        provider: "task-roles",
-        dependsOn: 2,
-        actionTarget: true
-      },
-      {
-        option: "--run",
-        requiredOption: true,
-        entity: "run",
-        provider: "runs",
-        dependsOn: 2,
-        actionTarget: true,
-        statuses: ["active"]
-      },
-      {
-        option: "--agent",
-        requiredOption: true,
-        entity: "agent",
-        provider: "configured-agents",
-        actionTarget: false
-      }
-    ],
-    trailingOptions: {
-      "--run": "value",
-      "--agent": "value",
-      "--adapter": "value",
-      "--receipt": "value",
-      "--native-session": "value",
-      "--launch": "value",
-      "--reason": "value"
-    },
-    confirmation: {
-      action: "Retire unusable native Session",
-      targetArgumentIndex: 2
-    }
   },
   {
     commandPath: ["task", "create"],
@@ -442,6 +394,21 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     ]
   })),
   {
+    commandPath: ["task", "role", "reset"],
+    selectors: [
+      { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true, statuses: ["active"] },
+      {
+        argumentIndex: 4,
+        entity: "task-role",
+        provider: "task-roles",
+        dependsOn: 3,
+        actionTarget: true
+      }
+    ],
+    trailingOptions: { "--reason": "value" },
+    confirmation: { action: "Reset Task Role Session", targetArgumentIndex: 4 }
+  },
+  {
     commandPath: ["task", "role", "enter"],
     selectors: [
       { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
@@ -499,7 +466,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
               : {})
     })),
   {
-    commandPath: ["task", "work", "dispose"],
+    commandPath: ["task", "work", "retire"],
     selectors: [
       {
         argumentIndex: 3,
@@ -516,7 +483,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       }
     ],
     trailingOptions: { "--summary": "value", "--replacement": "value" },
-    confirmation: { action: "Dispose Work Item", targetArgumentIndex: 3 }
+    confirmation: { action: "Retire Work Item", targetArgumentIndex: 3 }
   },
   {
     commandPath: ["task", "run", "list"],

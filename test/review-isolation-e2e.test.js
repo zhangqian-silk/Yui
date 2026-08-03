@@ -181,7 +181,7 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
   assert.equal(reviewEntry.access, "write");
   assert.equal(reviewEntry.baseCommit, candidateCommit);
   assert.equal(git(reviewEntry.path, "rev-parse", "HEAD"), candidateCommit);
-  assert.equal(reviewRun.effective.access, "write");
+  assert.equal(reviewRun.effective.profileAccess, "write");
   assert.deepEqual(reviewRun.effective.permission, { strategy: "bypass" });
   assert.equal(reviewRun.effective.reviewRoundId, pendingRound.id);
   assert.equal(reviewRun.effective.reviewBaseCommit, candidateCommit);
@@ -480,7 +480,7 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
       adapterId: reviewRun.effective.adapterId,
       model: reviewRun.effective.model,
       effort: reviewRun.effective.effort,
-      access: reviewRun.effective.access,
+      profileAccess: reviewRun.effective.profileAccess,
       permission: reviewRun.effective.permission
     },
     checks: completedRound.checks,

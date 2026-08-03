@@ -29,15 +29,15 @@ export type CodexPermissionConfig =
   | Readonly<{ strategy: "bypass" }>
   | Readonly<{
       strategy: "configured";
-      sandbox: "read-only" | "workspace-write" | "danger-full-access";
-      approval: "untrusted" | "on-request" | "never";
+      sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+      approval?: "untrusted" | "on-request" | "never";
     }>;
 export type ClaudePermissionConfig =
   | Readonly<{ strategy: "default" }>
   | Readonly<{ strategy: "bypass" }>
   | Readonly<{
       strategy: "configured";
-      mode: string;
+      mode?: string;
       allowedTools?: readonly string[];
       disallowedTools?: readonly string[];
     }>;
@@ -45,7 +45,7 @@ export type CodexAgentConfig = Readonly<{
   adapterId: "codex";
   model?: string;
   effort?: string;
-  permission?: CodexPermissionConfig;
+  permission: CodexPermissionConfig;
   search?: boolean;
   profile?: string;
   additionalDirectories?: readonly string[];
@@ -55,7 +55,7 @@ export type ClaudeAgentConfig = Readonly<{
   adapterId: "claude";
   model?: string;
   effort?: string;
-  permission?: ClaudePermissionConfig;
+  permission: ClaudePermissionConfig;
   additionalDirectories?: readonly string[];
   settingsFile?: string;
   settingsSources?: readonly string[];
@@ -217,38 +217,42 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
       throw new Error("Codex search must be boolean.");
     }
     validatePaths(config.additionalDirectories, "Codex additional directory");
-    if (config.permission !== undefined) {
-      if (config.permission.strategy === "configured") {
-        exact(config.permission, ["strategy", "sandbox", "approval"], "Codex permission config");
-        if (!SANDBOXES.includes(config.permission.sandbox)) {
-          throw new Error("Codex sandbox is invalid.");
-        }
-        if (!APPROVALS.includes(config.permission.approval)) {
-          throw new Error("Codex approval is invalid.");
-        }
-      } else {
-        exact(config.permission, ["strategy"], "Codex permission config");
-        validateSimplePermissionStrategy(config.permission.strategy, "Codex permission strategy");
+    if (config.permission === undefined) {
+      throw new Error("Codex permission strategy is required.");
+    }
+    if (config.permission.strategy === "configured") {
+      exact(config.permission, ["strategy", "sandbox", "approval"], "Codex permission config");
+      if (config.permission.sandbox !== undefined
+        && !SANDBOXES.includes(config.permission.sandbox)) {
+        throw new Error("Codex sandbox is invalid.");
       }
+      if (config.permission.approval !== undefined
+        && !APPROVALS.includes(config.permission.approval)) {
+        throw new Error("Codex approval is invalid.");
+      }
+      requireConfiguredPermissionOption(config.permission, "Codex");
+    } else {
+      exact(config.permission, ["strategy"], "Codex permission config");
+      validateSimplePermissionStrategy(config.permission.strategy, "Codex permission strategy");
     }
     advanced(this.id, config.advanced);
   }
 
   structuredArgs(config: CodexAgentConfig): string[] {
     return [
-      // Yui launches Codex in a detached tmux window and waits for the
-      // composer before delivering work.  The startup updater is itself an
-      // interactive prompt, so leaving it enabled can consume the first
-      // automated delivery as an update-menu answer.
+      // Yui launches Codex in a detached tmux window. Disable the startup
+      // updater so an unrelated native prompt cannot consume managed input.
       "--config", "check_for_update_on_startup=false",
       ...(config.model === undefined ? [] : ["--model", config.model]),
       ...(config.effort === undefined ? [] : ["--config", `model_reasoning_effort=\"${config.effort}\"`]),
-      ...(config.permission?.strategy === "bypass"
+      ...(config.permission.strategy === "bypass"
         ? ["--dangerously-bypass-approvals-and-sandbox"]
-        : config.permission?.strategy === "configured"
+        : config.permission.strategy === "configured"
           ? [
-              "--sandbox", config.permission.sandbox,
-              "--ask-for-approval", config.permission.approval
+              ...(config.permission.sandbox === undefined
+                ? [] : ["--sandbox", config.permission.sandbox]),
+              ...(config.permission.approval === undefined
+                ? [] : ["--ask-for-approval", config.permission.approval])
             ]
           : []),
       ...(config.search === true ? ["--search"] : []),
@@ -313,21 +317,22 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
     if (config.settingsSources !== undefined && new Set(config.settingsSources).size !== config.settingsSources.length) {
       throw new Error("Claude settings sources contain duplicates.");
     }
-    if (config.permission !== undefined) {
-      if (config.permission.strategy === "configured") {
-        exact(config.permission, ["strategy", "mode", "allowedTools", "disallowedTools"], "Claude permission config");
-        text(config.permission.mode, "Claude permission mode");
-        optionalTexts(config.permission.allowedTools, "Claude allowed tool");
-        optionalTexts(config.permission.disallowedTools, "Claude disallowed tool");
-        for (const tool of [...(config.permission.allowedTools ?? []), ...(config.permission.disallowedTools ?? [])]) {
-          if (/(?:api[-_]?key|token|secret|password|credential|authorization|Bearer\s+\S+|sk-[\w-]{8,})/i.test(tool)) {
-            throw new Error("Claude tool expressions cannot contain secret-bearing literals.");
-          }
-        }
-      } else {
-        exact(config.permission, ["strategy"], "Claude permission config");
-        validateSimplePermissionStrategy(config.permission.strategy, "Claude permission strategy");
+    if (config.permission === undefined) {
+      throw new Error("Claude permission strategy is required.");
+    }
+    if (config.permission.strategy === "configured") {
+      exact(config.permission, ["strategy", "mode", "allowedTools", "disallowedTools"], "Claude permission config");
+      optionalText(config.permission.mode, "Claude permission mode");
+      optionalTexts(config.permission.allowedTools, "Claude allowed tool");
+      optionalTexts(config.permission.disallowedTools, "Claude disallowed tool");
+      if (config.permission.allowedTools?.length === 0
+        || config.permission.disallowedTools?.length === 0) {
+        throw new Error("Claude configured tool lists must not be empty.");
       }
+      requireConfiguredPermissionOption(config.permission, "Claude");
+    } else {
+      exact(config.permission, ["strategy"], "Claude permission config");
+      validateSimplePermissionStrategy(config.permission.strategy, "Claude permission strategy");
     }
     advanced(this.id, config.advanced);
   }
@@ -336,15 +341,16 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
     return [
       ...(config.model === undefined ? [] : ["--model", config.model]),
       ...(config.effort === undefined ? [] : ["--effort", config.effort]),
-      ...(config.permission?.strategy === "bypass"
+      ...(config.permission.strategy === "bypass"
         ? ["--dangerously-skip-permissions"]
-        : config.permission?.strategy === "configured"
+        : config.permission.strategy === "configured"
+          && config.permission.mode !== undefined
           ? ["--permission-mode", config.permission.mode]
           : []),
-      ...(config.permission?.strategy !== "configured"
+      ...(config.permission.strategy !== "configured"
         || config.permission.allowedTools === undefined
         ? [] : ["--allowed-tools", ...config.permission.allowedTools]),
-      ...(config.permission?.strategy !== "configured"
+      ...(config.permission.strategy !== "configured"
         || config.permission.disallowedTools === undefined
         ? [] : ["--disallowed-tools", ...config.permission.disallowedTools]),
       ...(config.additionalDirectories ?? []).flatMap((path) => ["--add-dir", path]),
@@ -612,15 +618,15 @@ function missingCodexCapabilities(help: string): string[] {
 function cloneConfig(config: RoleAgentConfig, paths: readonly string[] | undefined): RoleAgentConfig {
   const advancedConfig = config.advanced?.rawArgs === undefined ? config.advanced : { rawArgs: [...config.advanced.rawArgs] };
   if (config.adapterId === "codex") return { ...config,
-    ...(config.permission === undefined ? {} : { permission: { ...config.permission } }),
+    permission: { ...config.permission },
     ...(paths === undefined ? {} : { additionalDirectories: [...paths] }),
     ...(advancedConfig === undefined ? {} : { advanced: advancedConfig }) };
   return { ...config,
-    ...(config.permission === undefined ? {} : { permission: config.permission.strategy === "configured"
+    permission: config.permission.strategy === "configured"
       ? { ...config.permission,
           ...(config.permission.allowedTools === undefined ? {} : { allowedTools: [...config.permission.allowedTools] }),
           ...(config.permission.disallowedTools === undefined ? {} : { disallowedTools: [...config.permission.disallowedTools] }) }
-      : { ...config.permission } }),
+      : { ...config.permission },
     ...(paths === undefined ? {} : { additionalDirectories: [...paths] }),
     ...(config.settingsSources === undefined ? {} : { settingsSources: [...config.settingsSources] }),
     ...(advancedConfig === undefined ? {} : { advanced: advancedConfig }) };
@@ -635,6 +641,17 @@ export function defaultRoleAgentConfig(adapterId: AgentAdapterId): RoleAgentConf
 function validateSimplePermissionStrategy(value: unknown, label: string): void {
   if (value !== "default" && value !== "bypass") {
     throw new Error(`${label} is invalid.`);
+  }
+}
+
+function requireConfiguredPermissionOption(
+  permission: Readonly<Record<string, unknown>>,
+  provider: string
+): void {
+  if (Object.keys(permission).every((key) => key === "strategy")) {
+    throw new Error(
+      `${provider} configured permission requires at least one provider-native option.`
+    );
   }
 }
 function advanced(id: AgentAdapterId, value: AdvancedAgentConfig | undefined): void {

@@ -181,5 +181,5 @@ function sameProjectScope(
 }
 
 function isTerminalWorkItem(item: WorkItem): boolean {
-  return ["completed", "failed", "cancelled", "superseded", "abandoned"].includes(item.status);
+  return ["completed", "failed", "retired"].includes(item.status);
 }

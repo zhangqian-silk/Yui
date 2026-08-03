@@ -308,7 +308,7 @@ test("TmuxSessionHost inventories Task and global owners from one tmux snapshot"
   assert.equal(inventoryCalls, 1);
 });
 
-test("TmuxPromptPushAdapter maps tmux presence and composer readiness to portable outcomes", async () => {
+test("TmuxPromptPushAdapter maps tmux presence and process readiness to portable outcomes", async () => {
   const pushes = [];
   let status = "running";
   let outcome = "sent";

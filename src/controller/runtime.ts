@@ -17,7 +17,7 @@ import {
   type RuntimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
 import {
-  agentComposerReadinessProbe,
+  agentProcessReadinessProbe,
   ExecutorRegistry
 } from "../executor/executorRegistry.js";
 import {
@@ -99,7 +99,7 @@ export async function startFileTaskControllerRuntime(
   );
   const sessionHost = options.sessionHost ?? new TmuxSessionHost(planner, tmux);
   const promptPush = options.promptPush
-    ?? new TmuxPromptPushAdapter(tmux, agentComposerReadinessProbe);
+    ?? new TmuxPromptPushAdapter(tmux, agentProcessReadinessProbe);
   let runningRuntime: RunningFileTaskController["runtime"] | undefined;
   const signalRuntimeCleanup = (target: RuntimeLifecycleTarget) => {
     runningRuntime?.signal(runtimeLifecycleSignalKey(
@@ -129,7 +129,7 @@ export async function startFileTaskControllerRuntime(
   const delivery = options.delivery ?? new ExecutorRegistry(
     planner,
     tmux,
-    agentComposerReadinessProbe,
+    agentProcessReadinessProbe,
     { sessionHost, promptPush, launchCoordinator }
   );
   const workspacePreparer = options.workspacePreparer

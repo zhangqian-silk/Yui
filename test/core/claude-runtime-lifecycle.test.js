@@ -207,7 +207,7 @@ test("Claude StopFailure captures structured evidence and remains durable when w
   assert.equal(event.agentId, "claude-primary");
 });
 
-test("Claude StopFailure stdin is strict and never infers a managed identity", async (t) => {
+test("Claude StopFailure accepts provider evolution but never infers a managed identity", async (t) => {
   const { home, environment } = fixture(t);
   await assert.rejects(
     runClaudeLifecycleHookCommand(JSON.stringify({
@@ -215,28 +215,14 @@ test("Claude StopFailure stdin is strict and never infers a managed identity", a
     }), environment, async () => ({})),
     /error/i
   );
-  await assert.rejects(
+  await assert.doesNotReject(
     runClaudeLifecycleHookCommand(JSON.stringify({
       ...currentClaudeHookCommon("StopFailure"),
-      error: "server_error",
-      unexpected: true
-    }), environment, async () => ({})),
-    /invalid|unexpected/i
-  );
-  await assert.rejects(
-    runClaudeLifecycleHookCommand(JSON.stringify({
-      ...currentClaudeHookCommon("StopFailure"),
-      effort: { level: "ultra" },
-      error: "server_error"
-    }), environment, async () => ({})),
-    /effort/i
-  );
-  await assert.rejects(
-    runClaudeLifecycleHookCommand(JSON.stringify({
-      ...currentClaudeHookCommon("StopFailure"),
-      error: "made_up_provider_error"
-    }), environment, async () => ({})),
-    /error/i
+      permission_mode: "manual",
+      effort: { level: "ultra", provider_metadata: true },
+      error: "future_provider_error",
+      future_provider_field: { nested: true }
+    }), environment, async () => ({}))
   );
   await assert.rejects(
     runClaudeLifecycleHookCommand(JSON.stringify({
@@ -254,7 +240,8 @@ test("Claude StopFailure stdin is strict and never infers a managed identity", a
     }), environment, async () => ({})),
     /native session/i
   );
-  assert.deepEqual(new FileRuntimeEventInbox(home).list(), []);
+  const [event] = new FileRuntimeEventInbox(home).list();
+  assert.equal(event.error, "future_provider_error");
 });
 
 test("Claude StopFailure fails the exact Run and WorkItem without a Candidate or retry", async (t) => {

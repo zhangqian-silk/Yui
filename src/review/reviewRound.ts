@@ -17,6 +17,7 @@ export type ReviewCheck = Readonly<{
 
 export type ReviewYieldReport = Readonly<{
   summary: string;
+  report: string;
   checks: readonly ReviewCheck[];
   evidenceCommit?: string;
 }>;
@@ -34,6 +35,7 @@ export type ReviewRound = {
   requestedBy: ReviewRequestSource;
   status: ReviewRoundStatus;
   summary?: string;
+  report?: string;
   checks?: readonly ReviewCheck[];
   evidenceCommit?: string;
   workspaceDisposition?: Readonly<{
@@ -110,6 +112,7 @@ export function finishReviewRound(
   summary: string,
   now: Date,
   result: Readonly<{
+    report?: string;
     checks?: readonly ReviewCheck[];
     evidenceCommit?: string;
   }> = {}
@@ -122,6 +125,7 @@ export function finishReviewRound(
     ...round,
     status,
     summary: requireText(summary, "Review summary"),
+    report: requireText(result.report ?? summary, "Review report"),
     checks: validateChecks(result.checks ?? []),
     ...(result.evidenceCommit === undefined
       ? {}
@@ -130,60 +134,32 @@ export function finishReviewRound(
   });
 }
 
-/**
- * A Review Run reports its durable result through the existing summary-file
- * stdin channel. The JSON envelope keeps check provenance explicit without a
- * second command, sidecar, or inferred text convention.
- */
+/** Accepts the Reviewer's complete report and extracts only optional known evidence. */
 export function parseReviewYieldReport(value: string): ReviewYieldReport {
+  const report = requireText(value, "Review report");
   let parsed: unknown;
   try {
-    parsed = JSON.parse(value) as unknown;
-  } catch (error) {
-    throw new Error("Review yield input must be one JSON result object.", { cause: error });
+    parsed = JSON.parse(report) as unknown;
+  } catch {
+    return { summary: report, report, checks: [] };
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("Review yield input must be one JSON result object.");
+    return { summary: report, report, checks: [] };
   }
   const record = parsed as Record<string, unknown>;
-  const allowed = new Set(["summary", "checks", "evidenceCommit"]);
-  const unknown = Object.keys(record).find((field) => !allowed.has(field));
-  if (unknown !== undefined) {
-    throw new Error(`Review yield result has unknown field: ${unknown}.`);
-  }
-  if (!Object.hasOwn(record, "summary") || !Object.hasOwn(record, "checks")) {
-    throw new Error("Review yield result requires summary and checks.");
-  }
-  if (!Array.isArray(record.checks) || record.checks.length === 0) {
-    throw new Error(
-      "Review yield result requires at least one passed, failed, or skipped check."
-    );
-  }
-  const checks = record.checks.map((value) => {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) {
-      throw new Error("Review yield check must be an object.");
-    }
-    const check = value as Record<string, unknown>;
-    const checkUnknown = Object.keys(check).find((field) => (
-      field !== "name" && field !== "outcome" && field !== "details"
-    ));
-    if (checkUnknown !== undefined) {
-      throw new Error(`Review yield check has unknown field: ${checkUnknown}.`);
-    }
-    return {
-      name: check.name as string,
-      outcome: check.outcome as ReviewCheck["outcome"],
-      ...(check.details === undefined ? {} : { details: check.details as string })
-    };
-  });
+  const summary = typeof record.summary === "string" && record.summary.trim().length > 0
+    ? requireText(record.summary, "Review summary")
+    : report;
+  const checks = extractChecks(record.checks);
   return {
-    summary: requireText(record.summary as string, "Review summary"),
-    checks: validateChecks(checks),
-    ...(record.evidenceCommit === undefined
+    summary,
+    report,
+    checks,
+    ...(typeof record.evidenceCommit !== "string"
       ? {}
       : {
           evidenceCommit: requireCommit(
-            record.evidenceCommit as string,
+            record.evidenceCommit,
             "Review evidence commit"
           )
         })
@@ -239,6 +215,7 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
   const terminal = round.status === "completed" || round.status === "failed";
   if (terminal) {
     requireText(round.summary ?? "", "Review summary");
+    requireText(round.report ?? "", "Review report");
     validateChecks(round.checks ?? []);
     if (round.evidenceCommit !== undefined) {
       requireCommit(round.evidenceCommit, "Review evidence commit");
@@ -248,6 +225,7 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
     }
     requireTimestamp(round.endedAt ?? "", "ReviewRound endedAt");
   } else if (round.summary !== undefined
+    || round.report !== undefined
     || round.checks !== undefined
     || round.evidenceCommit !== undefined
     || round.endedAt !== undefined) {
@@ -268,6 +246,24 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
     requireTimestamp(round.workspaceDisposition.recordedAt, "Review workspace disposition time");
   }
   return round;
+}
+
+function extractChecks(value: unknown): readonly ReviewCheck[] {
+  if (!Array.isArray(value)) return [];
+  const extracted = value.flatMap((entry): ReviewCheck[] => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return [];
+    const check = entry as Record<string, unknown>;
+    if (typeof check.name !== "string"
+      || (check.outcome !== "passed"
+        && check.outcome !== "failed"
+        && check.outcome !== "skipped")) return [];
+    return [{
+      name: check.name,
+      outcome: check.outcome,
+      ...(typeof check.details === "string" ? { details: check.details } : {})
+    }];
+  });
+  return validateChecks(extracted);
 }
 
 function validateReviewWorkspace(round: ReviewRound, workspace: RoleWorkspace): void {

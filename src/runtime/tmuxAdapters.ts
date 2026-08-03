@@ -101,8 +101,6 @@ export type RuntimeTmuxPaneState = Readonly<{
   dead: boolean;
   pid?: number;
   currentCommand: string;
-  content: string;
-  styledContent?: string;
   cursorX?: number;
   cursorY?: number;
   historySize?: number;
@@ -367,7 +365,7 @@ export class TmuxSessionHost implements SessionHostPort {
   }
 }
 
-/** Non-blocking active-composer push adapter; it never performs readiness polling. */
+/** Non-blocking receipt-backed tmux push; it never interprets provider output. */
 export class TmuxPromptPushAdapter implements ActivePromptPushPort {
   constructor(
     private readonly tmux: RuntimeTmuxPromptPort,

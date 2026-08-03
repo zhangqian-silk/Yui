@@ -326,10 +326,10 @@ test("Web search only offers enabled or CLI default, never a false override", as
   assert.doesNotMatch(terminal.writes.at(-1), /false/);
 });
 
-test("Permission strategy configures provider-native enums atomically", async () => {
+test("Configured permission selects one provider-native option", async () => {
   const terminal = io([
     "2", "codex", "permission-strategy", "configured",
-    "danger-full-access", "never"
+    "sandbox", "danger-full-access"
   ]);
   const result = await resolveRoleWizardArguments(
     ["role", "update", "reviewer"],
@@ -342,8 +342,7 @@ test("Permission strategy configures provider-native enums atomically", async ()
     args: [
       "role", "update", "reviewer", "--agent", "codex",
       "--permission-strategy", "configured",
-      "--sandbox", "danger-full-access",
-      "--approval", "never"
+      "--sandbox", "danger-full-access"
     ]
   });
 });

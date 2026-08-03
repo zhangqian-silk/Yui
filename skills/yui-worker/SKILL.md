@@ -10,7 +10,7 @@ dispatch defines the objective, Profile constraints, access, context reads,
 workspace, validation, and return protocol.
 
 - Preserve supplied Task, WorkItem, Role, and Run identities.
-- Follow the supplied Worker Profile instructions, Skills, access boundary,
+- Follow the supplied Worker Profile instructions, Skills, read/write behavior intent,
   model/effort request, and expected evidence. Report unsupported runtime hints
   instead of pretending they were applied.
 - Read more context only through supplied `yui task context` and Project
@@ -21,14 +21,14 @@ workspace, validation, and return protocol.
 - Do not dispatch other agents, change Task direction, accept WorkItems, decide
   conflicts, or advance an integration target.
 - A provider `bypass` launch removes permission prompts but does not broaden
-  the supplied Profile, access, WorkItem, workspace, Project scope, or
+  the supplied Profile, WorkItem, workspace, Project scope, or
   behavioral authority. Treat provider permission as process capability, not
   authorization to write.
-- Read-only work must not modify files. A multi-Project workspace may expose
+- An `explorer` or other read-intent Profile must not modify files. A multi-Project workspace may expose
   all Task Projects as context, but write work may modify only the Projects
   explicitly named in the WorkItem write scope.
-- If the brief requests a mutation while the supplied Profile or access
-  boundary is read-only, stop and report a routing mismatch to the Leader. Do
+- If the brief requests a mutation while the supplied Profile is read-intent,
+  stop and report a routing mismatch to the Leader. Do
   not attempt the write or relax the permission yourself.
 - Validate in proportion to risk. Report passed, failed, and skipped checks
   honestly.
@@ -64,15 +64,18 @@ YUI_SUMMARY
 ```
 
 Every review Run is bound to one frozen Candidate commit and a separate
-ReviewRound-owned writable worktree. Full native Codex or Claude capability is
-only authority to work locally inside that exact review worktree. You may edit
+ReviewRound-owned writable worktree. Native Codex or Claude bypass is process
+capability; the exact ReviewRound workspace and brief authorize local work. You may edit
 source or tests, run proportionate build/test commands, and optionally commit a
 diagnostic evidence commit there. Never push, integrate, mutate Task records,
 touch the Candidate or Worker workspace, another Task/worktree, a stable
 checkout, or real YUI_HOME.
 
-For a review Run only, the heredoc body must be exactly one JSON result object
-on the same `--summary-file -` channel:
+For a review Run, put the complete findings, evidence, checks actually run,
+uncertainty, and recommended next actions in the same `--summary-file -`
+heredoc. Clear Markdown is sufficient. JSON is optional; when used, known
+`checks` and `evidenceCommit` fields become structured evidence, while the
+whole report is preserved. For example:
 
 ```json
 {
@@ -84,9 +87,9 @@ on the same `--summary-file -` channel:
 }
 ```
 
-Report at least one named check. Use `skipped` with details when a relevant
-check was not run, and omit `evidenceCommit` when no diagnostic commit exists.
-The CLI validates a reported commit against the managed Review workspace; it
+Do not invent a check merely to satisfy a schema. State which relevant checks
+were run and which material verification remains. Omit `evidenceCommit` when
+no diagnostic commit exists. The CLI validates a reported commit against the managed Review workspace; it
 never derives one from uncommitted bytes. A dirty no-commit workspace may
 yield, but must remain preserved for Leader judgment and cannot be cleaned
 until it is clean.

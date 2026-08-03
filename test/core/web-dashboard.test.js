@@ -23,7 +23,7 @@ function effectiveLaunch() {
     adapterId: "codex",
     model: "gpt-5.6-sol",
     effort: "max",
-    access: "read",
+    profileAccess: "read",
     search: false,
     permission: { strategy: "configured", sandbox: "read-only", approval: "never" },
     writeProjectIds: [],
@@ -309,9 +309,7 @@ test("dashboard API summarizes tasks and exposes one consolidated task detail", 
       draft: 0,
       active: 1,
       completed: 1,
-      cancelled: 0,
-      superseded: 0,
-      abandoned: 0,
+      retired: 0,
       archived: 0,
       openInputs: 1
     });
@@ -324,9 +322,7 @@ test("dashboard API summarizes tasks and exposes one consolidated task detail", 
       awaiting_acceptance: 0,
       completed: 0,
       failed: 0,
-      cancelled: 0,
-      superseded: 0,
-      abandoned: 0
+      retired: 0
     });
 
     const detailResponse = await fetch(`${origin}/api/tasks/task-1`);
@@ -341,7 +337,7 @@ test("dashboard API summarizes tasks and exposes one consolidated task detail", 
     assert.equal(detail.roles[0].launchDrift, true);
     assert.equal(detail.openInputs[0].question, "Choose a port");
     assert.equal(detail.runs[0].summary, "Dashboard verified.");
-    assert.equal(detail.runs[0].effective.access, "read");
+    assert.equal(detail.runs[0].effective.profileAccess, "read");
     assert.equal(detail.reviewRounds[0].reviewBaseCommit, "a".repeat(40));
     assert.equal(detail.reviewRounds[0].evidenceCommit, "b".repeat(40));
     assert.equal(detail.messages[0].author.roleName, "leader");
