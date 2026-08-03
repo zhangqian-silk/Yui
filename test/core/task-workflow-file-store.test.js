@@ -953,7 +953,6 @@ test("always review creates a ReviewRound under the same WorkItem and never revi
     details: "Reviewed candidate evidence."
   }]);
   assert.equal(completedRound.reviewBaseCommit, REVIEW_BASE_COMMIT);
-  assert.equal(completedRound.reviewBaseProvenance, "frozen-candidate");
   assert.equal(completedRound.workspace.owner.type, "review-round");
   assert.equal(completedRound.workspace.owner.reviewRoundId, completedRound.id);
   assert.equal(completedRound.workspaceDisposition.kind, "removed");
@@ -1801,11 +1800,12 @@ test("Task Role add, update, show, and remove preserve lean field-level configur
   run([
     "role", "add", task.id, "reviewer", "--agent", "codex",
     "--description", "Review changes", "--model", "gpt-5.6-sol",
-    "--effort", "high", "--sandbox", "read-only"
+    "--effort", "high", "--permission-strategy", "configured",
+    "--sandbox", "read-only", "--approval", "never"
   ], store, options);
   run([
     "role", "update", task.id, "reviewer", "--agent", "codex",
-    "--clear-model", "--approval", "never", "--description", "Review safely"
+    "--clear-model", "--description", "Review safely"
   ], store, options);
 
   const role = store.getRole(task.id, "reviewer");
@@ -1813,12 +1813,17 @@ test("Task Role add, update, show, and remove preserve lean field-level configur
   assert.deepEqual(role.agentBindings.codex.config, {
     adapterId: "codex",
     effort: "high",
-    permission: { sandbox: "read-only", approval: "never" }
+    permission: {
+      strategy: "configured",
+      sandbox: "read-only",
+      approval: "never"
+    }
   });
 
   run([
     "role", "update", task.id, "reviewer", "--agent", "claude",
-    "--model", "claude-opus", "--permission-mode", "dontAsk",
+    "--model", "claude-opus", "--permission-strategy", "configured",
+    "--permission-mode", "dontAsk",
     "--allowed-tool", "Bash(yui task run yield *)",
     "--allowed-tool", "Read", "--allowed-tool", "Grep", "--allowed-tool", "Glob",
     "--disallowed-tool", "Edit"
@@ -1829,6 +1834,7 @@ test("Task Role add, update, show, and remove preserve lean field-level configur
     adapterId: "claude",
     model: "claude-opus",
     permission: {
+      strategy: "configured",
       mode: "dontAsk",
       allowedTools: ["Bash(yui task run yield *)", "Read", "Grep", "Glob"],
       disallowedTools: ["Edit"]
@@ -1849,7 +1855,7 @@ test("Task Role add, update, show, and remove preserve lean field-level configur
   assert.deepEqual(store.getRole(task.id, "reviewer").agentBindings.claude.config, {
     adapterId: "claude",
     model: "claude-opus",
-    permission: { mode: "dontAsk" }
+    permission: { strategy: "configured", mode: "dontAsk" }
   });
 
   const shown = run(["role", "show", task.id, "reviewer"], store, options);
@@ -1878,7 +1884,7 @@ test("Task Role creation copies the global worker Role's complete Agent binding 
         adapterId: "claude",
         model: "sonnet",
         effort: "max",
-        yolo: true
+        permission: { strategy: "bypass" }
       }
     )],
     "claude",
@@ -1895,15 +1901,15 @@ test("Task Role creation copies the global worker Role's complete Agent binding 
       adapterId: "claude",
       model: "sonnet",
       effort: "max",
-      yolo: true
+      permission: { strategy: "bypass" }
     }
   );
   assert.match(receipt, /Runtime source: Global Role worker/);
   assert.match(receipt, /Agent: claude\/claude/);
-  assert.match(receipt, /Model: sonnet; effort: max; YOLO: enabled/);
+  assert.match(receipt, /Model: sonnet; effort: max; permission: bypass/);
   const context = run(["context", task.id], store, options);
   assert.match(context, /Runtime source at creation: Global Role worker/);
-  assert.match(context, /Model: sonnet; effort: max; YOLO: enabled/);
+  assert.match(context, /Model: sonnet; effort: max; permission: bypass/);
 });
 
 test("integration-required Task cannot complete without delivery evidence", (t) => {
@@ -1957,8 +1963,7 @@ test("Leader creates a profiled Worker instance, binds Claude config, then launc
     "role", "update", task.id, "worker",
     "--agent", "claude",
     "--model", "claude-opus",
-    "--permission-mode", "acceptEdits",
-    "--yolo", "true"
+    "--permission-strategy", "bypass"
   ], store, options);
   run(["role", "bind", task.id, "worker", "claude"], store, options);
 
@@ -1973,8 +1978,7 @@ test("Leader creates a profiled Worker instance, binds Claude config, then launc
   assert.deepEqual(worker.agentBindings.claude.config, {
     adapterId: "claude",
     model: "claude-opus",
-    permission: { mode: "acceptEdits" },
-    yolo: true
+    permission: { strategy: "bypass" }
   });
   assert.equal(worker.agentBindings.codex.config.model, undefined);
 
@@ -2006,7 +2010,7 @@ test("Leader creates a profiled Worker instance, binds Claude config, then launc
     ["--model", "claude-opus"]
   );
   assert.equal(plan.session.effective.access, "read");
-  assert.equal(plan.session.effective.executionMode, "unrestricted");
+  assert.equal(plan.session.effective.permission.strategy, "bypass");
   assert.equal(plan.launch.args.includes("--dangerously-skip-permissions"), true);
   assert.equal(plan.launch.args.includes("--permission-mode"), false);
   assert.equal(plan.launch.args.includes("--disallowed-tools"), false);

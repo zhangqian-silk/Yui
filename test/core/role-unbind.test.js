@@ -25,7 +25,11 @@ const NOW = new Date("2026-07-24T05:00:00.000Z");
 const LATER = new Date("2026-07-24T05:01:00.000Z");
 
 function binding(agentId, adapterId = agentId) {
-  return { agentId, adapterId, config: { adapterId } };
+  return {
+    agentId,
+    adapterId,
+    config: { adapterId, permission: { strategy: "bypass" } }
+  };
 }
 
 function roleSessions(owner, status) {

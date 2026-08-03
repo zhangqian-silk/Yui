@@ -488,6 +488,7 @@ test("managed Claude Task Runs inject only StopFailure and exact explicit-yield 
     [createRoleAgentBinding(agent, {
       adapterId: "claude",
       permission: {
+        strategy: "configured",
         mode: "dontAsk",
         allowedTools: [
           "Read",

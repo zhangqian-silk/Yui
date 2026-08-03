@@ -2211,7 +2211,6 @@ function validReviewRoundTransition(
     || existing.workItemId !== candidate.workItemId
     || existing.candidateId !== candidate.candidateId
     || existing.reviewerRoleName !== candidate.reviewerRoleName
-    || existing.reviewBaseProvenance !== candidate.reviewBaseProvenance
     || existing.reviewBaseCommit !== candidate.reviewBaseCommit
     || existing.requestedBy !== candidate.requestedBy
     || existing.createdAt !== candidate.createdAt

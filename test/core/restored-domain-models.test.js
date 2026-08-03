@@ -33,7 +33,11 @@ const now = new Date("2026-07-19T12:00:00.000Z");
 const later = new Date("2026-07-19T12:01:00.000Z");
 
 function binding(agentId, adapterId = agentId, config = {}) {
-  return { agentId, adapterId, config: { adapterId, ...config } };
+  return {
+    agentId,
+    adapterId,
+    config: { adapterId, permission: { strategy: "bypass" }, ...config }
+  };
 }
 
 test("GlobalRole copies into an isolated TaskRole with independent Agent bindings", () => {
@@ -273,7 +277,7 @@ test("restored persistent domain records are plain JSON with explicit schema ver
   assert.equal(snapshot.workItem.schemaVersion, 6);
   assert.equal(snapshot.yielded.schemaVersion, 4);
   assert.equal(snapshot.yielded.effective.schemaVersion, 2);
-  assert.equal(snapshot.yielded.effective.executionMode, "unrestricted");
+  assert.equal(snapshot.yielded.effective.permission.strategy, "bypass");
   assert.equal(snapshot.yielded.purpose, "execution");
   assert.equal(snapshot.yielded.status, "yielded");
   assert.equal(snapshot.yielded.endedAt, later.toISOString());

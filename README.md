@@ -25,6 +25,10 @@ yui doctor
 
 Model and effort are per-Agent Role settings, so Operator, Leader, and the global Worker can use different values even when they share an Agent CLI. Interactive Role flows validate those settings against the selected Agent runtime. Worker Profile model and effort fields are provider-neutral child-execution hints and therefore remain explicit, scriptable values rather than Agent capability selections.
 
+Setup gives every managed Agent binding the explicit `bypass` permission
+strategy. Later Role updates may select `default`, `bypass`, or `configured`;
+the last choice exposes that adapter's native permission enums and tool rules.
+
 Runtime catalogs are refreshed per command and cached under Yui home. If a live probe times out or fails, Yui shows the last cache for the same Agent launch context and clearly marks it as potentially stale; without a matching cache, it offers CLI defaults and custom values. `yui agent capabilities <id>` exposes the same one-pass catalog, including models, model-specific efforts, and other runtime choices such as permissions, search availability, profiles, settings sources, and service tiers.
 
 `completion` is also interactive, with or without an explicit shell:
@@ -55,37 +59,11 @@ and `task integration start`, keep their subordinate IDs local to that Task.
 Candidate IDs are local to their WorkItem and carry both Task and WorkItem
 provenance.
 
-One offline converter is available for the immediately preceding aggregate-v10
-identity layout (StoredTask v9). Stop the source Controller, keep the source
-home immutable, and select a new path that does not exist:
-
-```sh
-yui storage convert-task-identity \
-  --source /absolute/path/to/old-yui-home \
-  --output /absolute/path/to/fresh-yui-home
-```
-
-The converter remaps all Task-owned records and references and writes the one
-current combined schema directly: aggregate v13 / StoredTask v12 with Role
-desired revisions and immutable effective Run/Session launch snapshots. Legacy
-launch facts are provenance-marked and closed to read-only. Exact built-in
-`operator`, `leader`, `worker`, and `implementer` Roles receive the current
-write-capable default for their next fresh launch; custom Roles remain
-read-only because their old Profile identity was not persisted. The converter
-validates the fresh output with the current runtime, writes
-`identity-conversion.json`, and verifies that the source bytes did not change.
-When `config.review` is set, the report also records the deterministic reviewer
-bootstrap: only that configured Global Role and same-name existing Task Roles
-are made write-capable with normal Codex/Claude bypass settings, and only the
-exact old built-in `reviewer` Profile is upgraded. Unrelated or customized
-Roles/Profiles remain unchanged; a missing configured Global Role or unsafe
-external provider setting fails before any output remains.
-It rejects dangling or ambiguous legacy references and never modifies the
-source in place. There is no identity-only intermediate format or runtime dual
-read. Inspect the report and the fresh Task contexts before switching
-`YUI_HOME`. See
-[Task-local identity and offline conversion](docs/task-local-identity.md) for
-the complete boundary.
+Yui supports only the current aggregate-v13 / StoredTask-v12 schema. Older
+homes are intentionally unsupported: initialize a fresh `YUI_HOME` instead of
+asking the runtime to convert, dual-read, or infer historical records. See
+[Task-local identity](docs/task-local-identity.md) for the current reference
+contract.
 
 Setup also seeds four reusable Worker Profiles:
 
@@ -192,13 +170,13 @@ keeps the same relative layout, creates isolated worktrees only for that write
 scope, and exposes the other Task Projects as context from Task main. Yui puts
 the exact writable and context-only Project lists into the managed dispatch and
 the `yui-worker` Skill requires the Agent to honor that boundary. Native Agent
-permissions remain session-wide, so Yui records source access and provider
-execution mode as separate facts. An explicit read-only Profile such as
-`explorer` is native `read-only`; a write-capable Leader, WorkItem, or
-ReviewRound is `unrestricted` so it can use its required local tools without
-permission deadlocks. Exact WorkItem and workspace scope still declares which
-Projects they may modify. Profile and Skill instructions constrain behavior but
-never enlarge that structural authority.
+permissions remain session-wide, while Yui `access` records only source-delivery
+authority. Every managed Role binding defaults to
+`permission.strategy=bypass`, including `explorer`, so provider prompts do not
+block normal work. Profiles and Skills constrain behavior; exact WorkItem or
+ReviewRound scope and the matching managed workspace are the only authority to
+modify Project files. A Role may instead choose `default` or `configured` and
+retain the provider's native permission options without changing Yui access.
 
 Write scope may only expand. The Leader supplies the complete old-plus-new set
 after a Worker yields and reports that another repository is required; an
@@ -292,18 +270,16 @@ yui task work isolate <task-id>/<work-item-id>
 yui task work dispatch <task-id>/<work-item-id> --input "Implement and run focused tests"
 ```
 
-Yui derives the effective execution mode from the portable Profile instead of
-provider permission preferences. A write-capable Profile compiles to
-`unrestricted`, using
-`--dangerously-bypass-approvals-and-sandbox` for Codex or
-`--dangerously-skip-permissions` for Claude; an explicit read-only Profile
-compiles to native `read-only`. This runtime mode is independent from declared
-source access: only an exact WorkItem scope and matching managed workspace grant
-Project writes. A ReviewRound is the only non-WorkItem source-write purpose and
-must match its Run, reviewRoundId, frozen base, and ReviewRound-owned workspace;
-every mismatch fails closed. Provider-specific permission fields remain desired
-launch metadata, but cannot silently downgrade a write-capable run or elevate a
-read-only Profile. Its diagnostic commit is visible history but is
+Permission is one adapter-specific enum configuration on each Agent binding:
+`default` follows the provider, `bypass` compiles the provider's supported
+bypass flag, and `configured` retains native options. Codex configured options
+are `sandbox` and `approval`; Claude configured options are `mode`,
+`allowedTools`, and `disallowedTools`. This permission strategy is independent
+from source access: only an exact WorkItem scope and matching managed workspace
+grant Project writes. A ReviewRound is the only non-WorkItem source-write
+purpose and must match its Run, reviewRoundId, frozen base, and
+ReviewRound-owned workspace; every mismatch fails closed. Its diagnostic commit
+is visible history but is
 explicitly rejected by capture, ChangeSet, Integration, and acceptance paths.
 Review yield keeps the same exact `--summary-file -` command, but its stdin is
 one JSON object containing `summary`, a non-empty `checks` array of named
@@ -314,11 +290,11 @@ and cleanup refuses it until it is clean.
 
 Every Role desired launch change increments its revision and applies only to a
 future launch. Each AgentRun and native Role Session stores the complete actual
-agent, adapter, model, effort, source access, provider-neutral execution mode,
-permission, workspace, context, and source desired revision. Updating,
+agent, adapter, model, effort, source access, permission strategy and native
+options, workspace, context, and source desired revision. Updating,
 switching, or clearing Role overrides never
 hot-mutates an existing process. `task context`, Role views, Run history,
-Events, and Web show desired/effective revisions, access, provenance, and
+Events, and Web show desired/effective revisions, access, permission, and
 pending next-launch drift.
 
 Both Codex and Claude deliver a managed Run only through its exact injected

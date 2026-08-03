@@ -1,6 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
 
-import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import type { WorkerAccess } from "../profile/agentProfile.js";
 import type {
   GlobalRole,
@@ -18,9 +17,6 @@ import {
 } from "./agentAdapter.js";
 
 export type EffectiveLaunchAccess = WorkerAccess;
-export type EffectiveExecutionMode = "read-only" | "unrestricted";
-export type EffectiveLaunchProvenance = "resolved" | "legacy-cutover";
-export type EffectiveReviewBaseProvenance = "frozen-candidate" | "legacy-unavailable";
 
 export type EffectiveLaunchWorkspace = Readonly<{
   root: string;
@@ -31,14 +27,11 @@ export type EffectiveLaunchContext = Readonly<RoleProfile>;
 
 type EffectiveLaunchBase = Readonly<{
   schemaVersion: 2;
-  provenance: EffectiveLaunchProvenance;
   sourceDesiredRevision: number;
   agentId: string;
   access: EffectiveLaunchAccess;
-  executionMode: EffectiveExecutionMode;
   model?: string;
   effort?: string;
-  yolo: boolean;
   search: boolean;
   additionalDirectories?: readonly string[];
   advanced?: AdvancedAgentConfig;
@@ -46,19 +39,18 @@ type EffectiveLaunchBase = Readonly<{
   workspace: EffectiveLaunchWorkspace;
   context: EffectiveLaunchContext;
   reviewRoundId?: string;
-  reviewBaseProvenance?: EffectiveReviewBaseProvenance;
   reviewBaseCommit?: string;
 }>;
 
 export type CodexEffectiveLaunchSnapshot = EffectiveLaunchBase & Readonly<{
   adapterId: "codex";
-  permission?: CodexAgentConfig["permission"];
+  permission: NonNullable<CodexAgentConfig["permission"]>;
   profile?: string;
 }>;
 
 export type ClaudeEffectiveLaunchSnapshot = EffectiveLaunchBase & Readonly<{
   adapterId: "claude";
-  permission?: ClaudeAgentConfig["permission"];
+  permission: NonNullable<ClaudeAgentConfig["permission"]>;
   settingsFile?: string;
   settingsSources?: readonly string[];
 }>;
@@ -77,28 +69,7 @@ export type ResolveEffectiveLaunchInput = Readonly<{
   workItemWriteProjectIds?: readonly string[];
   reviewRoundId?: string;
   reviewBaseCommit?: string;
-  nativeReadOnlySupported?: boolean;
 }>;
-
-const CLAUDE_READ_ONLY_ALLOWED_TOOLS = Object.freeze([
-  "Read",
-  "Grep",
-  "Glob",
-  "Bash(yui --json task context *)",
-  "Bash(yui --json task work show *)",
-  "Bash(yui --json task work list *)",
-  "Bash(git diff *)",
-  "Bash(git status *)",
-  "Bash(git show *)",
-  "Bash(git log *)",
-  "Bash(yui task run yield *)"
-]);
-
-const CLAUDE_READ_ONLY_DISALLOWED_TOOLS = Object.freeze([
-  "Edit",
-  "Write",
-  "NotebookEdit"
-]);
 
 export function resolveEffectiveLaunch(
   input: ResolveEffectiveLaunchInput
@@ -114,74 +85,23 @@ export function resolveEffectiveLaunch(
     || !writeAuthorized
     ? "read"
     : "write";
-  const executionMode: EffectiveExecutionMode = input.role.defaultAccess === "write"
-    ? "unrestricted"
-    : "read-only";
-  if (executionMode === "read-only" && input.nativeReadOnlySupported === false) {
-    throw new Error(
-      `Agent adapter ${binding.adapterId} cannot express native read-only access; launch refused.`
-    );
-  }
+  const config = resolveAgentAdapter(binding.adapterId).canonicalizeConfig(
+    clone(binding.config) as never
+  ) as RoleAgentConfig;
   return snapshotFromConfig({
     sourceDesiredRevision: input.role.launchRevision,
-    provenance: "resolved",
     agentId: binding.agentId,
-    config: executionMode === "read-only"
-      ? readOnlyConfig(binding.config)
-      : unrestrictedConfig(binding.config),
+    config,
     access,
-    executionMode,
     writeProjectIds,
     workspace,
     context: snapshotContext(input.role),
     ...(input.purpose === "review"
       ? {
           reviewRoundId: identity(input.reviewRoundId ?? "", "ReviewRound id"),
-          reviewBaseProvenance: "frozen-candidate" as const,
           reviewBaseCommit: commit(input.reviewBaseCommit ?? "", "Review base commit")
         }
       : {})
-  });
-}
-
-/**
- * The offline cutover records only legacy facts that were actually persisted,
- * and closes every missing permission field to read-only. Legacy snapshots are
- * audit history and are deliberately never resumable.
- */
-export function legacyEffectiveLaunchSnapshot(input: Readonly<{
-  sourceDesiredRevision: number;
-  agentId: string;
-  adapterId: AgentAdapterId;
-  model?: string;
-  effort?: string;
-  workspace: EffectiveLaunchWorkspace;
-  context?: EffectiveLaunchContext;
-  reviewRoundId?: string;
-}>): EffectiveLaunchSnapshot {
-  return snapshotFromConfig({
-    sourceDesiredRevision: positiveInteger(
-      input.sourceDesiredRevision,
-      "Legacy source desired revision"
-    ),
-    provenance: "legacy-cutover",
-    agentId: identity(input.agentId, "Legacy Agent id"),
-    config: readOnlyConfig({
-      adapterId: input.adapterId,
-      ...(input.model === undefined ? {} : { model: input.model }),
-      ...(input.effort === undefined ? {} : { effort: input.effort })
-    } as RoleAgentConfig),
-    access: "read",
-    executionMode: "read-only",
-    writeProjectIds: [],
-    workspace: cloneWorkspace(input.workspace),
-    context: cloneContext(input.context ?? {}),
-    ...(input.reviewRoundId === undefined
-      ? {}
-      : {
-          reviewRoundId: identity(input.reviewRoundId, "Legacy ReviewRound id"),
-          reviewBaseProvenance: "legacy-unavailable" as const
-        })
   });
 }
 
@@ -199,10 +119,7 @@ function codexConfigFromSnapshot(
     adapterId: "codex",
     ...(snapshot.model === undefined ? {} : { model: snapshot.model }),
     ...(snapshot.effort === undefined ? {} : { effort: snapshot.effort }),
-    ...(snapshot.yolo ? { yolo: true as const } : {}),
-    ...(snapshot.permission === undefined
-      ? {}
-      : { permission: clone(snapshot.permission) }),
+    permission: clone(snapshot.permission),
     ...(snapshot.additionalDirectories === undefined
       ? {}
       : { additionalDirectories: [...snapshot.additionalDirectories] }),
@@ -221,10 +138,7 @@ function claudeConfigFromSnapshot(
     adapterId: "claude",
     ...(snapshot.model === undefined ? {} : { model: snapshot.model }),
     ...(snapshot.effort === undefined ? {} : { effort: snapshot.effort }),
-    ...(snapshot.yolo ? { yolo: true as const } : {}),
-    ...(snapshot.permission === undefined
-      ? {}
-      : { permission: clone(snapshot.permission) }),
+    permission: clone(snapshot.permission),
     ...(snapshot.additionalDirectories === undefined
       ? {}
       : { additionalDirectories: [...snapshot.additionalDirectories] }),
@@ -246,18 +160,16 @@ export function effectiveLaunchSnapshotsCompatible(
 ): boolean {
   validateEffectiveLaunchSnapshot(existing);
   validateEffectiveLaunchSnapshot(desired);
-  if (existing.provenance !== "resolved" || desired.provenance !== "resolved") return false;
-  const withoutProvenanceRevision = (snapshot: EffectiveLaunchSnapshot) => {
+  const withoutDesiredRevision = (snapshot: EffectiveLaunchSnapshot) => {
     const {
       sourceDesiredRevision: _sourceDesiredRevision,
-      provenance: _provenance,
       ...actual
     } = snapshot;
     return actual;
   };
   return isDeepStrictEqual(
-    withoutProvenanceRevision(existing),
-    withoutProvenanceRevision(desired)
+    withoutDesiredRevision(existing),
+    withoutDesiredRevision(desired)
   );
 }
 
@@ -267,27 +179,13 @@ export function validateEffectiveLaunchSnapshot<T extends EffectiveLaunchSnapsho
   if (snapshot.schemaVersion !== 2) {
     throw new Error("Effective launch snapshot must use schemaVersion 2.");
   }
-  if (snapshot.provenance !== "resolved" && snapshot.provenance !== "legacy-cutover") {
-    throw new Error("Effective launch provenance is invalid.");
-  }
   positiveInteger(snapshot.sourceDesiredRevision, "Source desired revision");
   identity(snapshot.agentId, "Effective Agent id");
   if (snapshot.access !== "read" && snapshot.access !== "write") {
     throw new Error(`Effective launch access is invalid: ${String(snapshot.access)}.`);
   }
-  if (snapshot.executionMode !== "read-only" && snapshot.executionMode !== "unrestricted") {
-    throw new Error(
-      `Effective execution mode is invalid: ${String(snapshot.executionMode)}.`
-    );
-  }
-  if (snapshot.executionMode === "read-only" && snapshot.access !== "read") {
-    throw new Error("Native read-only execution cannot carry source write access.");
-  }
-  if (snapshot.access === "write" && snapshot.executionMode !== "unrestricted") {
-    throw new Error("Source write access requires unrestricted execution.");
-  }
-  if (typeof snapshot.yolo !== "boolean" || typeof snapshot.search !== "boolean") {
-    throw new Error("Effective launch yolo/search flags must be boolean.");
+  if (typeof snapshot.search !== "boolean") {
+    throw new Error("Effective launch search flag must be boolean.");
   }
   if (snapshot.adapterId === "claude" && snapshot.search) {
     throw new Error("Claude effective launch cannot enable Codex search.");
@@ -302,66 +200,21 @@ export function validateEffectiveLaunchSnapshot<T extends EffectiveLaunchSnapsho
   if (snapshot.access === "write" && snapshot.writeProjectIds.length === 0) {
     throw new Error("Writable effective launch requires an exact writable Project scope.");
   }
-  if ((snapshot.reviewRoundId === undefined) !== (snapshot.reviewBaseProvenance === undefined)) {
-    throw new Error("Effective Review provenance is incomplete.");
+  if (snapshot.permission === undefined) {
+    throw new Error("Effective launch requires an explicit permission strategy.");
   }
-  if (snapshot.reviewRoundId !== undefined) {
+  if ((snapshot.reviewRoundId === undefined) !== (snapshot.reviewBaseCommit === undefined)) {
+    throw new Error("Effective Review base is incomplete.");
+  }
+  if (snapshot.reviewRoundId !== undefined && snapshot.reviewBaseCommit !== undefined) {
     identity(snapshot.reviewRoundId, "Effective ReviewRound id");
-    if (snapshot.reviewBaseProvenance === "frozen-candidate") {
-      commit(snapshot.reviewBaseCommit ?? "", "Effective review base commit");
-      if (snapshot.provenance !== "resolved") {
-        throw new Error("Legacy effective launch cannot claim a frozen Review base.");
-      }
-    } else if (snapshot.reviewBaseProvenance === "legacy-unavailable") {
-      if (snapshot.reviewBaseCommit !== undefined || snapshot.provenance !== "legacy-cutover") {
-        throw new Error("Effective legacy Review provenance is invalid.");
-      }
-    } else {
-      throw new Error("Effective Review base provenance is invalid.");
-    }
-  } else if (snapshot.reviewBaseCommit !== undefined) {
-    throw new Error("Effective Review provenance is incomplete.");
+    commit(snapshot.reviewBaseCommit, "Effective review base commit");
   }
   validateWorkspace(snapshot.workspace);
   cloneContext(snapshot.context);
   const config = effectiveLaunchConfigUnchecked(snapshot);
   resolveAgentAdapter(snapshot.adapterId).canonicalizeConfig(config as never);
-  if (snapshot.executionMode === "read-only") {
-    assertNativeReadOnlyConfig(config);
-  } else if (snapshot.yolo !== true || snapshot.permission !== undefined) {
-    throw new Error("Unrestricted effective launch must use provider bypass without permission overrides.");
-  }
   return snapshot;
-}
-
-export function assertReadOnlyAgentArgv(
-  snapshot: EffectiveLaunchSnapshot,
-  argv: readonly string[]
-): void {
-  validateEffectiveLaunchSnapshot(snapshot);
-  if (snapshot.executionMode !== "read-only") {
-    throw new Error("Read-only argv validation requires native read-only execution.");
-  }
-  if (snapshot.adapterId === "codex") {
-    if (argv.includes("--dangerously-bypass-approvals-and-sandbox")) {
-      throw new Error("Codex read-only launch contains the YOLO bypass flag.");
-    }
-    if (argumentValue(argv, "--sandbox") !== "read-only"
-      || argumentValue(argv, "--ask-for-approval") !== "never") {
-      throw new Error("Codex read-only launch did not compile the native read-only boundary.");
-    }
-    return;
-  }
-  if (argv.includes("--dangerously-skip-permissions")) {
-    throw new Error("Claude read-only launch contains the permission bypass flag.");
-  }
-  if (argumentValue(argv, "--permission-mode") !== "dontAsk"
-    || !argv.includes("--allowed-tools")
-    || !argv.includes("Read")
-    || !argv.includes("--disallowed-tools")
-    || !argv.includes("Write")) {
-    throw new Error("Claude read-only launch did not compile the native read-only boundary.");
-  }
 }
 
 export function effectiveRoleForLaunch<T extends EffectiveLaunchRole>(
@@ -389,44 +242,35 @@ export function effectiveRoleForLaunch<T extends EffectiveLaunchRole>(
 
 function snapshotFromConfig(input: Readonly<{
   sourceDesiredRevision: number;
-  provenance: EffectiveLaunchProvenance;
   agentId: string;
   config: RoleAgentConfig;
   access: EffectiveLaunchAccess;
-  executionMode: EffectiveExecutionMode;
   writeProjectIds: readonly string[];
   workspace: EffectiveLaunchWorkspace;
   context: EffectiveLaunchContext;
   reviewRoundId?: string;
-  reviewBaseProvenance?: EffectiveReviewBaseProvenance;
   reviewBaseCommit?: string;
 }>): EffectiveLaunchSnapshot {
   const config = clone(input.config);
+  if (config.permission === undefined) {
+    throw new Error("Effective launch requires an explicit permission strategy.");
+  }
   const review = input.reviewRoundId === undefined
     ? {}
-    : input.reviewBaseProvenance === "legacy-unavailable"
-      ? {
-          reviewRoundId: identity(input.reviewRoundId, "ReviewRound id"),
-          reviewBaseProvenance: "legacy-unavailable" as const
-        }
-      : {
-          reviewRoundId: identity(input.reviewRoundId, "ReviewRound id"),
-          reviewBaseProvenance: "frozen-candidate" as const,
-          reviewBaseCommit: commit(input.reviewBaseCommit ?? "", "Review base commit")
-        };
+    : {
+        reviewRoundId: identity(input.reviewRoundId, "ReviewRound id"),
+        reviewBaseCommit: commit(input.reviewBaseCommit ?? "", "Review base commit")
+      };
   const common = {
     schemaVersion: 2 as const,
-    provenance: input.provenance,
     sourceDesiredRevision: positiveInteger(
       input.sourceDesiredRevision,
       "Source desired revision"
     ),
     agentId: identity(input.agentId, "Effective Agent id"),
     access: input.access,
-    executionMode: input.executionMode,
     ...(config.model === undefined ? {} : { model: config.model }),
     ...(config.effort === undefined ? {} : { effort: config.effort }),
-    yolo: config.yolo === true,
     search: config.adapterId === "codex" && config.search === true,
     ...(config.additionalDirectories === undefined
       ? {}
@@ -441,13 +285,13 @@ function snapshotFromConfig(input: Readonly<{
     ? {
         ...common,
         adapterId: "codex",
-        ...(config.permission === undefined ? {} : { permission: clone(config.permission) }),
+        permission: clone(config.permission),
         ...(config.profile === undefined ? {} : { profile: config.profile })
       }
     : {
         ...common,
         adapterId: "claude",
-        ...(config.permission === undefined ? {} : { permission: clone(config.permission) }),
+        permission: clone(config.permission),
         ...(config.settingsFile === undefined ? {} : { settingsFile: config.settingsFile }),
         ...(config.settingsSources === undefined
           ? {}
@@ -462,63 +306,6 @@ function effectiveLaunchConfigUnchecked(
   return snapshot.adapterId === "codex"
     ? codexConfigFromSnapshot(snapshot)
     : claudeConfigFromSnapshot(snapshot);
-}
-
-function readOnlyConfig(config: RoleAgentConfig): RoleAgentConfig {
-  const common = {
-    adapterId: config.adapterId,
-    ...(config.model === undefined ? {} : { model: config.model }),
-    ...(config.effort === undefined ? {} : { effort: config.effort })
-  };
-  return config.adapterId === "codex"
-    ? {
-        ...common,
-        adapterId: "codex",
-        permission: { sandbox: "read-only", approval: "never" }
-      }
-    : {
-        ...common,
-        adapterId: "claude",
-        permission: {
-          mode: "dontAsk",
-          allowedTools: [...CLAUDE_READ_ONLY_ALLOWED_TOOLS],
-          disallowedTools: [...CLAUDE_READ_ONLY_DISALLOWED_TOOLS]
-        },
-        settingsSources: []
-      };
-}
-
-function unrestrictedConfig(config: RoleAgentConfig): RoleAgentConfig {
-  const canonical = resolveAgentAdapter(config.adapterId).canonicalizeConfig(
-    clone(config) as never
-  ) as RoleAgentConfig;
-  const result = {
-    ...canonical,
-    yolo: true as const
-  } as RoleAgentConfig & { permission?: unknown };
-  delete result.permission;
-  return result;
-}
-
-function assertNativeReadOnlyConfig(config: RoleAgentConfig): void {
-  if (config.yolo === true || config.additionalDirectories !== undefined
-    || config.advanced !== undefined) {
-    throw new Error("Read-only effective launch contains an access-expanding setting.");
-  }
-  if (config.adapterId === "codex") {
-    if (config.search === true
-      || config.permission?.sandbox !== "read-only"
-      || config.permission.approval !== "never") {
-      throw new Error("Codex effective launch is not native read-only.");
-    }
-    return;
-  }
-  if (config.settingsFile !== undefined
-    || config.permission?.mode !== "dontAsk"
-    || !isDeepStrictEqual(config.permission.allowedTools, CLAUDE_READ_ONLY_ALLOWED_TOOLS)
-    || !isDeepStrictEqual(config.permission.disallowedTools, CLAUDE_READ_ONLY_DISALLOWED_TOOLS)) {
-    throw new Error("Claude effective launch is not native read-only.");
-  }
 }
 
 function effectiveWriteProjects(
@@ -694,11 +481,6 @@ function text(value: string, label: string): string {
     throw new Error(`${label} is required.`);
   }
   return value.trim();
-}
-
-function argumentValue(argv: readonly string[], flag: string): string | undefined {
-  const index = argv.lastIndexOf(flag);
-  return index < 0 ? undefined : argv[index + 1];
 }
 
 function clone<T>(value: T): T {

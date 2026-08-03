@@ -251,12 +251,14 @@ still defines portable behavior; Worker defines runtime Agent configuration.
 Before dispatch, inspect `task role show`; if Agent, model, effort, Profile, or
 workspace scope is missing or inconsistent, do not dispatch or guess it.
 
-Do not reconstruct Agent/model/effort or effective execution mode during
-execution. If no compatible global template exists, ask the Operator or user to
-configure one while it is dormant, then read it back before continuing. Yui
-compiles write-capable Profiles to provider bypass and explicit read-only
-Profiles to native read-only. Source write access remains a separate exact
-WorkItem or ReviewRound scope; bypass never changes that behavioral boundary.
+Do not reconstruct Agent/model/effort or provider permission during execution.
+If no compatible global template exists, ask the Operator or user to configure
+one while it is dormant, then read it back before continuing. Every managed
+binding defaults to `permission.strategy=bypass`; a binding may instead choose
+provider `default` or explicit native `configured` options. Source write access
+remains a separate exact WorkItem or ReviewRound scope. Profile and Skill
+constrain behavior, and provider bypass never changes that boundary, including
+for an `explorer` Role whose Yui access remains read-only.
 
 For meaningful concurrent-write risk, isolate the WorkItem before dispatch:
 

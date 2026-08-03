@@ -27,8 +27,6 @@ const PUBLIC_PATHS = [
   "update",
   "setup",
   "doctor",
-  "storage",
-  "storage convert-task-identity",
   "web",
   "controller",
   "controller status",

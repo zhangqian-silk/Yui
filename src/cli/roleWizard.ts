@@ -337,6 +337,14 @@ async function configureNewAgentField(
           args: selection.effort === undefined ? args : [...args, "--effort", selection.effort]
         };
   }
+  if (selected.value === "permission-strategy") {
+    const strategy = await promptAgentFieldValue(selected, io);
+    if (strategy === undefined || strategy.length === 0) return { kind: "cancelled", args };
+    const permissionArgs = await configuredPermissionArgs(binding, resolved?.catalog, strategy, io);
+    return permissionArgs === undefined
+      ? { kind: "cancelled", args }
+      : { kind: "resolved", args: [...args, ...permissionArgs] };
+  }
   const value = await promptAgentFieldValue(selected, io);
   return value === undefined
     ? { kind: "cancelled", args }
@@ -581,6 +589,16 @@ async function updateAgentBindingSettings(
       ]
     };
   }
+  if (selectedField.value === "permission-strategy") {
+    const strategy = await promptAgentFieldValue(selectedField, io);
+    if (strategy === undefined || strategy.length === 0) return { kind: "cancelled", args };
+    const permissionArgs = await configuredPermissionArgs(binding, resolved?.catalog, strategy, io);
+    if (permissionArgs === undefined) return { kind: "cancelled", args };
+    return {
+      kind: "resolved",
+      args: [...args, "--agent", binding.agentId, ...permissionArgs]
+    };
+  }
 
   const action = await choose(
     `Update ${selectedField.label}`,
@@ -598,7 +616,7 @@ async function updateAgentBindingSettings(
   if (action === "clear") {
     return {
       kind: "resolved",
-      args: [...args, "--agent", binding.agentId, selectedField.clear]
+      args: [...args, "--agent", binding.agentId, ...selectedField.clear]
     };
   }
   const value = await promptAgentFieldValue(selectedField, io);
@@ -614,7 +632,7 @@ type AgentField = Readonly<{
   label: string;
   current: string;
   set: string;
-  clear: string;
+  clear: readonly string[];
   choices?: readonly string[];
 }>;
 
@@ -625,30 +643,38 @@ function agentFields(
   const config = binding.config;
   const permission = entity(config.permission) ?? {};
   return [
-    agentField("model", "Model", config.model, "--model", "--clear-model"),
-    agentField("effort", "Effort", config.effort, "--effort", "--clear-effort"),
-    agentField("yolo", "YOLO", config.yolo, "--yolo", "--clear-yolo",
-      catalogChoices(catalog, "yolo", ["true"])),
-    ...(binding.adapterId === "codex" ? [
-      agentField("sandbox", "Sandbox", permission.sandbox, "--sandbox", "--clear-sandbox",
+    agentField("model", "Model", config.model, "--model", ["--clear-model"]),
+    agentField("effort", "Effort", config.effort, "--effort", ["--clear-effort"]),
+    agentField(
+      "permission-strategy",
+      "Permission strategy",
+      permission.strategy,
+      "--permission-strategy",
+      ["--permission-strategy", "default"],
+      catalogChoices(catalog, "permission.strategy", ["default", "bypass", "configured"])
+    ),
+    ...(binding.adapterId === "codex" && permission.strategy === "configured" ? [
+      agentField("sandbox", "Sandbox", permission.sandbox, "--sandbox", ["--permission-strategy", "default"],
         catalogChoices(catalog, "permission.sandbox", [
           "read-only", "workspace-write", "danger-full-access"
         ])),
-      agentField("approval", "Approval", permission.approval, "--approval", "--clear-approval",
+      agentField("approval", "Approval", permission.approval, "--approval", ["--permission-strategy", "default"],
         catalogChoices(catalog, "permission.approval", [
           "untrusted", "on-request", "never"
-        ])),
-      agentField("search", "Web search", config.search, "--search", "--clear-search", [
+        ]))
+    ] : []),
+    ...(binding.adapterId === "codex" ? [
+      agentField("search", "Web search", config.search, "--search", ["--clear-search"], [
         ...catalogChoices(catalog, "search", ["true"])
       ])
     ] : []),
-    ...(binding.adapterId === "claude" ? [
+    ...(binding.adapterId === "claude" && permission.strategy === "configured" ? [
       agentField(
         "permission-mode",
         "Permission mode",
         permission.mode,
         "--permission-mode",
-        "--clear-permission-mode",
+        ["--permission-strategy", "default"],
         catalogChoices(catalog, "permission.mode")
       )
     ] : [])
@@ -703,10 +729,60 @@ function agentField(
   label: string,
   current: unknown,
   set: string,
-  clear: string,
+  clear: readonly string[],
   choices?: readonly string[]
 ): AgentField {
   return { value, label, current: display(current), set, clear, ...(choices === undefined ? {} : { choices }) };
+}
+
+async function configuredPermissionArgs(
+  binding: RoleBinding,
+  catalog: AgentConfigurationCatalog | undefined,
+  strategy: string,
+  io: SelectionIo
+): Promise<string[] | undefined> {
+  if (strategy !== "configured") return ["--permission-strategy", strategy];
+  if (binding.adapterId === "codex") {
+    const sandbox = await promptAgentFieldValue(agentField(
+      "sandbox",
+      "Sandbox",
+      undefined,
+      "--sandbox",
+      ["--permission-strategy", "default"],
+      catalogChoices(catalog, "permission.sandbox", [
+        "read-only", "workspace-write", "danger-full-access"
+      ])
+    ), io);
+    if (sandbox === undefined) return undefined;
+    const approval = await promptAgentFieldValue(agentField(
+      "approval",
+      "Approval",
+      undefined,
+      "--approval",
+      ["--permission-strategy", "default"],
+      catalogChoices(catalog, "permission.approval", [
+        "untrusted", "on-request", "never"
+      ])
+    ), io);
+    return approval === undefined
+      ? undefined
+      : [
+          "--permission-strategy", "configured",
+          "--sandbox", sandbox,
+          "--approval", approval
+        ];
+  }
+  const mode = await promptAgentFieldValue(agentField(
+    "permission-mode",
+    "Permission mode",
+    undefined,
+    "--permission-mode",
+    ["--permission-strategy", "default"],
+    catalogChoices(catalog, "permission.mode")
+  ), io);
+  return mode === undefined
+    ? undefined
+    : ["--permission-strategy", "configured", "--permission-mode", mode];
 }
 
 async function promptAgentFieldValue(

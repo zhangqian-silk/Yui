@@ -110,13 +110,12 @@ test("rawArgs cannot take ownership of structured, lifecycle, or secret-bearing 
   assert.doesNotThrow(() => validateAgentRawArguments("claude", ["--verbose"]));
 });
 
-test("YOLO config compiles to each Agent CLI's owned dangerous flag", () => {
+test("bypass permission strategy compiles to each Agent CLI's owned dangerous flag", () => {
   const codex = resolveAgentAdapter("codex").compileNew({
-    agent: configured("codex-yolo", "codex", "codex"),
+    agent: configured("codex-bypass", "codex", "codex"),
     config: {
       adapterId: "codex",
-      yolo: true,
-      permission: { sandbox: "workspace-write", approval: "on-request" }
+      permission: { strategy: "bypass" }
     },
     workspace: "/tmp",
     codexDeveloperInstructions: { status: "absent" }
@@ -126,11 +125,10 @@ test("YOLO config compiles to each Agent CLI's owned dangerous flag", () => {
   assert.equal(codex.argv.includes("--ask-for-approval"), false);
 
   const claude = resolveAgentAdapter("claude").compileNew({
-    agent: configured("claude-yolo", "claude", "claude"),
+    agent: configured("claude-bypass", "claude", "claude"),
     config: {
       adapterId: "claude",
-      yolo: true,
-      permission: { mode: "acceptEdits" }
+      permission: { strategy: "bypass" }
     },
     workspace: "/tmp"
   });
@@ -151,7 +149,11 @@ test("Codex structured config compiles deterministically for new and resume laun
     adapterId: "codex",
     model: "gpt-test",
     effort: "high",
-    permission: { sandbox: "workspace-write", approval: "on-request" },
+    permission: {
+      strategy: "configured",
+      sandbox: "workspace-write",
+      approval: "on-request"
+    },
     search: true,
     profile: "work",
     additionalDirectories: [second, first, second],
@@ -741,6 +743,7 @@ test("Claude structured config compiles permissions and preallocated session lif
     model: "sonnet",
     effort: "high",
     permission: {
+      strategy: "configured",
       mode: "dontAsk",
       allowedTools: ["Read", "Grep", "Glob", "Bash(yui task run yield *)"],
       disallowedTools: ["Edit", "Write"]

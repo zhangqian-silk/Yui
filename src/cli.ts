@@ -81,7 +81,6 @@ import { TaskWorkspaceCoordinator } from "./repository/taskWorkspaceCoordinator.
 import { FileTaskWorkspacePreparer } from "./repository/taskWorkspacePreparer.js";
 import { inspectStorageSchema, requireStorageSchema } from "./storage/storageSchema.js";
 import { FileTaskStore, resolveYuiHome } from "./storage/taskStore.js";
-import { convertLegacyTaskIdentityStorage } from "./storage/taskIdentityConverter.js";
 import { resolveTaskRecordReference } from "./task/taskRecordReference.js";
 import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
 import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
@@ -154,34 +153,6 @@ export async function main(): Promise<void> {
     if (jsonOutput) throw usageError("Update does not support --json.");
     if (args.length !== 1) throw usageError("Update usage: yui update");
     process.exitCode = runUpdateCommand();
-    return;
-  }
-
-  if (args[0] === "storage") {
-    const usage = "Storage conversion usage: yui storage convert-task-identity --source <old-yui-home> --output <fresh-yui-home>";
-    if (args[1] !== "convert-task-identity") throw usageError(usage);
-    const options = new Map<string, string>();
-    for (let index = 2; index < args.length; index += 2) {
-      const option = args[index];
-      const value = args[index + 1];
-      if ((option !== "--source" && option !== "--output")
-        || value === undefined || value.startsWith("--") || options.has(option)) {
-        throw usageError(usage);
-      }
-      options.set(option, value);
-    }
-    if (args.length !== 6 || options.size !== 2) throw usageError(usage);
-    const report = convertLegacyTaskIdentityStorage({
-      source: options.get("--source")!,
-      output: options.get("--output")!
-    });
-    emit(
-      `Converted ${report.taskIds.length} Tasks into fresh storage ${report.output}\n`
-      + `Source remained unchanged: ${report.source}\n`
-      + `Report: ${report.output}/identity-conversion.json`,
-      false,
-      report
-    );
     return;
   }
 

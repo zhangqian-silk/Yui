@@ -124,20 +124,16 @@ export function validateAgentRun(run: AgentRun): AgentRun {
     if (run.workItemId === undefined || run.reviewRoundId === undefined) {
       throw new Error("A review Agent run requires WorkItem and ReviewRound references.");
     }
-    const resolvedReview = run.effective.provenance === "resolved";
-    if (resolvedReview && (run.workspace === undefined
+    if (run.workspace === undefined
       || run.workspace.owner.type !== "review-round"
-      || run.workspace.owner.reviewRoundId !== run.reviewRoundId)) {
+      || run.workspace.owner.reviewRoundId !== run.reviewRoundId) {
       throw new Error(
         `A review Agent run requires its exact ReviewRound workspace owner: ${run.reviewRoundId}.`
       );
     }
-    if (resolvedReview && (run.workspace!.entries.length === 0
-      || run.workspace!.entries.some(({ access }) => access !== "write"))) {
+    if (run.workspace.entries.length === 0
+      || run.workspace.entries.some(({ access }) => access !== "write")) {
       throw new Error("A review Agent run requires only isolated writable workspace entries.");
-    }
-    if (!resolvedReview && run.status === "active") {
-      throw new Error("An active review Agent run cannot use legacy launch provenance.");
     }
   } else {
     if (run.reviewRoundId !== undefined) {
@@ -157,7 +153,7 @@ export function validateAgentRun(run: AgentRun): AgentRun {
     if (run.effective.reviewRoundId !== run.reviewRoundId) {
       throw new Error("Review Agent run effective provenance does not match its ReviewRound.");
     }
-    if (run.effective.reviewBaseProvenance === "frozen-candidate" && !run.workspace!.entries.some(
+    if (!run.workspace!.entries.some(
       ({ baseCommit }) => baseCommit === run.effective.reviewBaseCommit
     )) {
       throw new Error("Review Agent run effective base does not match its workspace.");

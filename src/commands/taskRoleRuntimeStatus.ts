@@ -118,7 +118,7 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
     : `${status.nativeSession.nativeSessionId} (${status.nativeSession.status}, ${status.nativeSession.adapterId}, effective r${status.nativeSession.effective.sourceDesiredRevision})`;
   const effectiveLaunch = status.effectiveLaunch === null
     ? "not started"
-    : `${status.effectiveLaunch.agentId}/${status.effectiveLaunch.adapterId}; r${status.effectiveLaunch.sourceDesiredRevision}; access=${status.effectiveLaunch.access}; mode=${status.effectiveLaunch.executionMode}; provenance=${status.effectiveLaunch.provenance}`;
+    : `${status.effectiveLaunch.agentId}/${status.effectiveLaunch.adapterId}; r${status.effectiveLaunch.sourceDesiredRevision}; access=${status.effectiveLaunch.access}; permission=${status.effectiveLaunch.permission.strategy}`;
   const sessionUsability = status.sessionRetirement === null
     ? "no Operator declaration"
     : status.sessionRetirement.state === "cleanup-pending"

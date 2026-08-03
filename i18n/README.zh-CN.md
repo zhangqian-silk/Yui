@@ -58,6 +58,10 @@ Leader 和 Operator，再说明全局 Worker 配置会复制到新建的 Task Ro
 Worker 即使使用同一个 Agent CLI，也可以采用不同配置。Profile 中的
 model/effort 只是 native child 的可移植 hint。
 
+Setup 会为每个受管 Agent binding 显式设置 `bypass` permission strategy。
+后续 Role 更新可选择 `default`、`bypass` 或 `configured`；`configured` 会
+保留对应 adapter 的原生权限枚举与工具规则。
+
 运行时能力目录会在每次命令中刷新，并缓存在 Yui home。实时探测超时或失败时，Yui 会展示同一 Agent 启动上下文最近一次成功的缓存并明确提示数据可能过期；没有匹配缓存时，则提供 CLI 默认值和自定义入口。`yui agent capabilities <id>` 可一次性读取同一份目录，包括模型、逐模型思考强度，以及权限、搜索可用性、profile、settings source、service tier 等其他运行时选项。
 
 `completion` 无论是否指定 shell，都会进入确认流程：
@@ -86,26 +90,9 @@ Task 的命令（例如 `task work create`、`task integration start`）仍使�
 Task 内的本地子记录 ID。Candidate 只在所属 WorkItem 内递增，并同时保存
 Task 与 WorkItem provenance。
 
-对于紧邻本版本的 aggregate-v10 identity 布局，只提供一个离线转换器。先
-停止源 Controller，保持源 home 不可变，并选择一个尚不存在的新路径：
-
-```sh
-yui storage convert-task-identity \
-  --source /absolute/path/to/old-yui-home \
-  --output /absolute/path/to/fresh-yui-home
-```
-
-转换器会重映射全部 Task-owned 记录与引用，使用当前 runtime 验证新输出，
-生成 `identity-conversion.json`，并核对源文件字节未改变。悬空或歧义旧引用
-会令转换失败；转换器绝不原地修改源 home。切换 `YUI_HOME` 前，应检查报告
-和 fresh home 中的 Task context。转换还会以 `config.review.roleName` 为唯一
-权威，定向升级同名 Global/Task reviewer Role 与精确匹配的旧内建 reviewer
-Profile，使新建的隔离 ReviewRound 可本地写入；自定义或无关 Role/Profile
-保持不变，无法无歧义转换的审查配置会在产生输出前失败。旧 Run/Session 的
-effective snapshot 保持只读且不可续用；精确内建 `operator`、`leader`、
-`worker`、`implementer` Role 则为下一次 fresh launch 获得当前可写默认值，
-其他自定义 Role 因旧格式未保存 Profile 身份而保持只读。完整边界见
-[Task 本地 ID 与离线转换](../docs/task-local-identity.md)。
+Yui 只支持当前 aggregate-v13 / StoredTask-v12 schema。旧 home 不提供转换、
+双读或历史记录推断；需要使用新版本时初始化全新的 `YUI_HOME`。当前引用契约见
+[Task 本地 ID](../docs/task-local-identity.md)。
 
 ## 快速开始
 
@@ -182,11 +169,11 @@ yui task project add <task-id> shared-sdk --base main
 相对目录布局，只为写入范围创建隔离 worktree，其他 Task Project 作为上下文
 从 Task main 暴露。Yui 会在受管派发和 `yui-worker` Skill 中明确列出可写与
 仅上下文 Project，由 Agent 严格遵守该边界。原生 Agent 权限作用于整个会话，
-因此 Yui 将源码 access 与 provider execution mode 分开记录：显式只读的
-`explorer` 使用原生 `read-only`；可写 Leader、WorkItem 或 ReviewRound 使用
-`unrestricted`，避免必要本地工具被权限提示卡死。只有精确 WorkItem 范围与
-匹配的 managed workspace 才声明可修改 Project；Profile 与 Skill 约束行为，
-不能扩大这项结构化权限。
+而 Yui `access` 只记录源码交付权限。所有受管 Role binding（包括
+`explorer`）默认使用 `permission.strategy=bypass`，避免 provider 权限提示阻塞
+正常工作；Profile 与 Skill 负责约束行为，只有精确 WorkItem/ReviewRound 范围
+和匹配的 managed workspace 才能授权修改 Project。Role 也可以显式选择
+`default` 或 `configured` 并保留 provider 原生权限选项，这不会改变 Yui access。
 
 写入范围只能扩大，不能缩小。Worker yield 并报告还需要另一个仓库后，
 Leader 使用完整的“旧范围 + 新范围”更新并重新派发：
@@ -270,15 +257,14 @@ yui task work isolate <task-id>/<work-item-id>
 yui task work dispatch <task-id>/<work-item-id> --input "完成实现并运行聚焦测试"
 ```
 
-Yui 根据 provider-neutral Profile 推导实际 execution mode。可写 Profile 对
-Codex 编译 `--dangerously-bypass-approvals-and-sandbox`，对 Claude 编译
-`--dangerously-skip-permissions`；显式只读 Profile 则编译原生 `read-only`。
-binding 中的 provider permission/YOLO 字段仍是 desired launch metadata，不能
-降级可写 Profile，也不能提升只读 Profile。任意非 Leader Task Role 在创建时
-不传 `--agent`，都会复制全局 Worker Role 的完整 Agent bindings，Leader 无需
-重新拼接 model、effort 和权限。创建回执与 `task context` 会同时记录源码
-access 和实际 execution mode。显式 `--agent` 属于 Task 专用覆盖，必须在派发
-前补全并回读配置。
+每个 Agent binding 只有一套 adapter-specific 权限枚举配置：`default` 遵循
+provider 默认行为；`bypass` 编译 provider 支持的 bypass flag；`configured`
+保留原生选项。Codex 的 configured 选项是 `sandbox` 和 `approval`；Claude 的
+configured 选项是 `mode`、`allowedTools` 与 `disallowedTools`。任意非 Leader
+Task Role 在创建时不传 `--agent`，都会复制全局 Worker Role 的完整 Agent
+bindings，Leader 无需重新拼接 model、effort 和权限。创建回执与
+`task context` 分别记录源码 access 与实际 permission strategy。显式
+`--agent` 属于 Task 专用覆盖，必须在派发前补全并回读配置。
 
 ReviewRound 从冻结 Candidate SHA 创建独立的可写 worktree。Codex/Claude 只在
 该 exact ReviewRound owner、reviewRoundId 与 workspace 全部匹配时获得配置上限

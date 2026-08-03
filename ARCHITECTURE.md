@@ -34,9 +34,10 @@ independent execution additionally records an AgentRun.
   next-launch-only. The Role may bind multiple Agents; every binding retains
   independent runtime configuration.
 - `AgentRun` records one managed dispatch and an immutable effective snapshot:
-  actual Agent, adapter, model, effort, access, permission boundary, workspace,
-  Role context, and source desired revision. A native Role Session stores the
-  same snapshot; running processes are never hot-mutated by later Role edits.
+  actual Agent, adapter, model, effort, source access, provider permission
+  strategy and native options, workspace, Role context, and source desired
+  revision. A native Role Session stores the same snapshot; running processes
+  are never hot-mutated by later Role edits.
 - A `WorkItemCandidate` is the explicit result currently awaiting Leader
   acceptance. It snapshots the WorkItem revision, summary, and either a
   yielded execution Run or a Leader-managed direct source.
@@ -109,12 +110,12 @@ A WorkItem can read the full Task workspace but has an explicit Project write
 scope. Isolation creates a second root with independent worktrees for writable
 Projects and Task-main context for the rest. The managed dispatch and
 `yui-worker` Skill name both sets explicitly; the Agent must modify only the
-writable set. Effective native permission is derived once at dispatch from the
-Profile access ceiling, exact scope, matching workspace ownership/access, and
-Run purpose. A normal write process requires a WorkItem write scope. A review
-write process instead requires an exact ReviewRound owner and frozen Candidate
-base. Gitless and non-WorkItem Runs, empty scopes, and read Profiles are native
-read-only; unsupported read-only adapters fail closed.
+writable set. Provider permission is binding configuration: every managed Role
+defaults to `bypass`, while `default` and `configured` preserve provider-native
+behavior. It is independent from Yui access. A normal source write requires a
+WorkItem write scope and matching managed workspace; a review write instead
+requires an exact ReviewRound owner and frozen Candidate base. Profiles and
+Skills constrain behavior even when provider prompts are bypassed.
 Scope is monotonic. A Worker cannot expand it directly: it reports the need,
 and the Leader either adds Projects to the existing scope, creates another
 WorkItem, or adds the Project to the Task.

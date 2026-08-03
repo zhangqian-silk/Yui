@@ -2812,7 +2812,7 @@ function runLaunchEventPayload(run: AgentRun): Record<string, string> {
     agent: `${run.effective.agentId}/${run.effective.adapterId}`,
     effectiveRevision: String(run.effective.sourceDesiredRevision),
     effectiveAccess: run.effective.access,
-    provenance: run.effective.provenance,
+    effectivePermission: run.effective.permission.strategy,
     writeProjectIds: run.effective.writeProjectIds.join(",") || "none"
   };
 }

@@ -28,12 +28,16 @@ function role(input = {}) {
       codex: {
         agentId: "codex",
         adapterId: "codex",
-        config: { adapterId: "codex", model: "gpt-5.6-sol" }
+        config: {
+          adapterId: "codex",
+          model: "gpt-5.6-sol",
+          permission: { strategy: "bypass" }
+        }
       },
       claude: {
         agentId: "claude",
         adapterId: "claude",
-        config: { adapterId: "claude" }
+        config: { adapterId: "claude", permission: { strategy: "bypass" } }
       }
     },
     workspace: "/tmp/reviewer",
@@ -106,6 +110,15 @@ function capabilityCatalog(agentId) {
             ]
           }],
       fields: [
+        {
+          key: "permission.strategy",
+          choices: [
+            { value: "default", label: "default" },
+            { value: "bypass", label: "bypass" },
+            { value: "configured", label: "configured" }
+          ],
+          allowCustom: false
+        },
         {
           key: "permission.sandbox",
           choices: [
@@ -311,6 +324,46 @@ test("Web search only offers enabled or CLI default, never a false override", as
   });
   assert.match(terminal.writes.at(-1), /true/);
   assert.doesNotMatch(terminal.writes.at(-1), /false/);
+});
+
+test("Permission strategy configures provider-native enums atomically", async () => {
+  const terminal = io([
+    "2", "codex", "permission-strategy", "configured",
+    "danger-full-access", "never"
+  ]);
+  const result = await resolveRoleWizardArguments(
+    ["role", "update", "reviewer"],
+    ports(),
+    terminal
+  );
+
+  assert.deepEqual(result, {
+    kind: "resolved",
+    args: [
+      "role", "update", "reviewer", "--agent", "codex",
+      "--permission-strategy", "configured",
+      "--sandbox", "danger-full-access",
+      "--approval", "never"
+    ]
+  });
+});
+
+test("Permission bypass is one enum choice without provider-native fields", async () => {
+  const terminal = io(["permission-strategy", "bypass"]);
+  const result = await resolveGlobalRoleAgentConfigurationArguments(
+    "reviewer",
+    "claude",
+    ports(),
+    terminal
+  );
+
+  assert.deepEqual(result, {
+    kind: "resolved",
+    args: [
+      "role", "update", "reviewer", "--agent", "claude",
+      "--permission-strategy", "bypass"
+    ]
+  });
 });
 
 test("Wizard is bypassed outside TTY and when update options are explicit", async () => {

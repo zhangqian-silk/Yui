@@ -23,15 +23,29 @@ import {
 } from "./agentConfigurationProbe.js";
 
 export type AdvancedAgentConfig = Readonly<{ rawArgs?: readonly string[] }>;
+export type PermissionStrategy = "default" | "bypass" | "configured";
+export type CodexPermissionConfig =
+  | Readonly<{ strategy: "default" }>
+  | Readonly<{ strategy: "bypass" }>
+  | Readonly<{
+      strategy: "configured";
+      sandbox: "read-only" | "workspace-write" | "danger-full-access";
+      approval: "untrusted" | "on-request" | "never";
+    }>;
+export type ClaudePermissionConfig =
+  | Readonly<{ strategy: "default" }>
+  | Readonly<{ strategy: "bypass" }>
+  | Readonly<{
+      strategy: "configured";
+      mode: string;
+      allowedTools?: readonly string[];
+      disallowedTools?: readonly string[];
+    }>;
 export type CodexAgentConfig = Readonly<{
   adapterId: "codex";
   model?: string;
   effort?: string;
-  yolo?: boolean;
-  permission?: Readonly<{
-    sandbox?: "read-only" | "workspace-write" | "danger-full-access";
-    approval?: "untrusted" | "on-request" | "never";
-  }>;
+  permission?: CodexPermissionConfig;
   search?: boolean;
   profile?: string;
   additionalDirectories?: readonly string[];
@@ -41,12 +55,7 @@ export type ClaudeAgentConfig = Readonly<{
   adapterId: "claude";
   model?: string;
   effort?: string;
-  yolo?: boolean;
-  permission?: Readonly<{
-    mode?: string;
-    allowedTools?: readonly string[];
-    disallowedTools?: readonly string[];
-  }>;
+  permission?: ClaudePermissionConfig;
   additionalDirectories?: readonly string[];
   settingsFile?: string;
   settingsSources?: readonly string[];
@@ -198,24 +207,28 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
   }
 
   validateStructured(config: CodexAgentConfig): void {
-    exact(config, ["adapterId", "model", "effort", "yolo", "permission", "search", "profile",
+    exact(config, ["adapterId", "model", "effort", "permission", "search", "profile",
       "additionalDirectories", "advanced"], "Codex Agent config");
     if (config.adapterId !== "codex") throw new Error("Codex Agent config adapter is invalid.");
     optionalText(config.model, "Codex model");
     optionalText(config.effort, "Codex effort");
-    optionalBoolean(config.yolo, "Codex YOLO");
     optionalText(config.profile, "Codex profile");
     if (config.search !== undefined && typeof config.search !== "boolean") {
       throw new Error("Codex search must be boolean.");
     }
     validatePaths(config.additionalDirectories, "Codex additional directory");
     if (config.permission !== undefined) {
-      exact(config.permission, ["sandbox", "approval"], "Codex permission config");
-      if (config.permission.sandbox !== undefined && !SANDBOXES.includes(config.permission.sandbox)) {
-        throw new Error("Codex sandbox is invalid.");
-      }
-      if (config.permission.approval !== undefined && !APPROVALS.includes(config.permission.approval)) {
-        throw new Error("Codex approval is invalid.");
+      if (config.permission.strategy === "configured") {
+        exact(config.permission, ["strategy", "sandbox", "approval"], "Codex permission config");
+        if (!SANDBOXES.includes(config.permission.sandbox)) {
+          throw new Error("Codex sandbox is invalid.");
+        }
+        if (!APPROVALS.includes(config.permission.approval)) {
+          throw new Error("Codex approval is invalid.");
+        }
+      } else {
+        exact(config.permission, ["strategy"], "Codex permission config");
+        validateSimplePermissionStrategy(config.permission.strategy, "Codex permission strategy");
       }
     }
     advanced(this.id, config.advanced);
@@ -230,13 +243,14 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
       "--config", "check_for_update_on_startup=false",
       ...(config.model === undefined ? [] : ["--model", config.model]),
       ...(config.effort === undefined ? [] : ["--config", `model_reasoning_effort=\"${config.effort}\"`]),
-      ...(config.yolo === true
+      ...(config.permission?.strategy === "bypass"
         ? ["--dangerously-bypass-approvals-and-sandbox"]
-        : [
-            ...(config.permission?.sandbox === undefined ? [] : ["--sandbox", config.permission.sandbox]),
-            ...(config.permission?.approval === undefined
-              ? [] : ["--ask-for-approval", config.permission.approval])
-          ]),
+        : config.permission?.strategy === "configured"
+          ? [
+              "--sandbox", config.permission.sandbox,
+              "--ask-for-approval", config.permission.approval
+            ]
+          : []),
       ...(config.search === true ? ["--search"] : []),
       ...(config.profile === undefined ? [] : ["--profile", config.profile]),
       ...(config.additionalDirectories ?? []).flatMap((path) => ["--add-dir", path])
@@ -288,12 +302,11 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
   }
 
   validateStructured(config: ClaudeAgentConfig): void {
-    exact(config, ["adapterId", "model", "effort", "yolo", "permission", "additionalDirectories",
+    exact(config, ["adapterId", "model", "effort", "permission", "additionalDirectories",
       "settingsFile", "settingsSources", "advanced"], "Claude Agent config");
     if (config.adapterId !== "claude") throw new Error("Claude Agent config adapter is invalid.");
     optionalText(config.model, "Claude model");
     optionalText(config.effort, "Claude effort");
-    optionalBoolean(config.yolo, "Claude YOLO");
     validatePaths(config.additionalDirectories, "Claude additional directory");
     if (config.settingsFile !== undefined) absolutePath(config.settingsFile, "Claude settings file");
     optionalTexts(config.settingsSources, "Claude settings source");
@@ -301,14 +314,19 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
       throw new Error("Claude settings sources contain duplicates.");
     }
     if (config.permission !== undefined) {
-      exact(config.permission, ["mode", "allowedTools", "disallowedTools"], "Claude permission config");
-      optionalText(config.permission.mode, "Claude permission mode");
-      optionalTexts(config.permission.allowedTools, "Claude allowed tool");
-      optionalTexts(config.permission.disallowedTools, "Claude disallowed tool");
-      for (const tool of [...(config.permission.allowedTools ?? []), ...(config.permission.disallowedTools ?? [])]) {
-        if (/(?:api[-_]?key|token|secret|password|credential|authorization|Bearer\s+\S+|sk-[\w-]{8,})/i.test(tool)) {
-          throw new Error("Claude tool expressions cannot contain secret-bearing literals.");
+      if (config.permission.strategy === "configured") {
+        exact(config.permission, ["strategy", "mode", "allowedTools", "disallowedTools"], "Claude permission config");
+        text(config.permission.mode, "Claude permission mode");
+        optionalTexts(config.permission.allowedTools, "Claude allowed tool");
+        optionalTexts(config.permission.disallowedTools, "Claude disallowed tool");
+        for (const tool of [...(config.permission.allowedTools ?? []), ...(config.permission.disallowedTools ?? [])]) {
+          if (/(?:api[-_]?key|token|secret|password|credential|authorization|Bearer\s+\S+|sk-[\w-]{8,})/i.test(tool)) {
+            throw new Error("Claude tool expressions cannot contain secret-bearing literals.");
+          }
         }
+      } else {
+        exact(config.permission, ["strategy"], "Claude permission config");
+        validateSimplePermissionStrategy(config.permission.strategy, "Claude permission strategy");
       }
     }
     advanced(this.id, config.advanced);
@@ -318,11 +336,17 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
     return [
       ...(config.model === undefined ? [] : ["--model", config.model]),
       ...(config.effort === undefined ? [] : ["--effort", config.effort]),
-      ...(config.yolo === true
+      ...(config.permission?.strategy === "bypass"
         ? ["--dangerously-skip-permissions"]
-        : config.permission?.mode === undefined ? [] : ["--permission-mode", config.permission.mode]),
-      ...(config.permission?.allowedTools === undefined ? [] : ["--allowed-tools", ...config.permission.allowedTools]),
-      ...(config.permission?.disallowedTools === undefined ? [] : ["--disallowed-tools", ...config.permission.disallowedTools]),
+        : config.permission?.strategy === "configured"
+          ? ["--permission-mode", config.permission.mode]
+          : []),
+      ...(config.permission?.strategy !== "configured"
+        || config.permission.allowedTools === undefined
+        ? [] : ["--allowed-tools", ...config.permission.allowedTools]),
+      ...(config.permission?.strategy !== "configured"
+        || config.permission.disallowedTools === undefined
+        ? [] : ["--disallowed-tools", ...config.permission.disallowedTools]),
       ...(config.additionalDirectories ?? []).flatMap((path) => ["--add-dir", path]),
       ...(config.settingsFile === undefined ? [] : ["--settings", config.settingsFile]),
       ...(config.settingsSources === undefined ? [] : ["--setting-sources", config.settingsSources.join(",")])
@@ -469,7 +493,7 @@ export function inspectAgentCapabilities(
 function baseline(id: AgentAdapterId): CapabilityField[] {
   if (id === "codex") return [
     field("model", "enum", "degraded", true), field("effort", "enum", "unavailable", true),
-    field("yolo", "boolean", "available", false, ["true"]),
+    field("permission.strategy", "enum", "available", false, ["default", "bypass", "configured"]),
     field("permission.sandbox", "enum", "available", false, SANDBOXES),
     field("permission.approval", "enum", "available", false, APPROVALS),
     field("profile", "string", "available", true), field("search", "boolean", "available", false, ["true"]),
@@ -478,7 +502,7 @@ function baseline(id: AgentAdapterId): CapabilityField[] {
   return [
     field("model", "enum", "degraded", true, ["fable", "opus", "sonnet"]),
     field("effort", "enum", "unavailable", true),
-    field("yolo", "boolean", "available", false, ["true"]),
+    field("permission.strategy", "enum", "available", false, ["default", "bypass", "configured"]),
     field("permission.mode", "enum", "unavailable", true),
     field("permission.allowedTools", "string-list", "available", true),
     field("permission.disallowedTools", "string-list", "available", true),
@@ -490,14 +514,31 @@ function baseline(id: AgentAdapterId): CapabilityField[] {
 function fromHelp(id: AgentAdapterId, help: string): CapabilityField[] {
   const fields = baseline(id);
   const replacements = id === "codex"
-    ? [choiceField("permission.sandbox", help, "--sandbox", SANDBOXES),
+    ? [permissionStrategyField(help, "--dangerously-bypass-approvals-and-sandbox"),
+        choiceField("permission.sandbox", help, "--sandbox", SANDBOXES),
         choiceField("permission.approval", help, "--ask-for-approval", APPROVALS)]
     : [choiceField("model", help, "--model", ["fable", "opus", "sonnet"], true),
         choiceField("effort", help, "--effort", [], true),
+        permissionStrategyField(help, "--dangerously-skip-permissions"),
         choiceField("permission.mode", help, "--permission-mode", [], true),
         choiceField("settingsSources", help, "--setting-sources", ["user", "project", "local"])];
   const byKey = new Map(replacements.map((value) => [value.key, value]));
   return fields.map((value) => byKey.get(value.key) ?? value);
+}
+
+function permissionStrategyField(help: string, bypassFlag: string): CapabilityField {
+  const choices = [
+    "default",
+    ...(help.includes(bypassFlag) ? ["bypass"] : []),
+    "configured"
+  ];
+  return field(
+    "permission.strategy",
+    "enum",
+    choices.includes("bypass") ? "available" : "degraded",
+    false,
+    choices
+  );
 }
 
 function choiceField(key: string, help: string, flag: string, fallback: readonly string[], custom = false): CapabilityField {
@@ -575,12 +616,26 @@ function cloneConfig(config: RoleAgentConfig, paths: readonly string[] | undefin
     ...(paths === undefined ? {} : { additionalDirectories: [...paths] }),
     ...(advancedConfig === undefined ? {} : { advanced: advancedConfig }) };
   return { ...config,
-    ...(config.permission === undefined ? {} : { permission: { ...config.permission,
-      ...(config.permission.allowedTools === undefined ? {} : { allowedTools: [...config.permission.allowedTools] }),
-      ...(config.permission.disallowedTools === undefined ? {} : { disallowedTools: [...config.permission.disallowedTools] }) } }),
+    ...(config.permission === undefined ? {} : { permission: config.permission.strategy === "configured"
+      ? { ...config.permission,
+          ...(config.permission.allowedTools === undefined ? {} : { allowedTools: [...config.permission.allowedTools] }),
+          ...(config.permission.disallowedTools === undefined ? {} : { disallowedTools: [...config.permission.disallowedTools] }) }
+      : { ...config.permission } }),
     ...(paths === undefined ? {} : { additionalDirectories: [...paths] }),
     ...(config.settingsSources === undefined ? {} : { settingsSources: [...config.settingsSources] }),
     ...(advancedConfig === undefined ? {} : { advanced: advancedConfig }) };
+}
+
+export function defaultRoleAgentConfig(adapterId: AgentAdapterId): RoleAgentConfig {
+  return adapterId === "codex"
+    ? { adapterId: "codex", permission: { strategy: "bypass" } }
+    : { adapterId: "claude", permission: { strategy: "bypass" } };
+}
+
+function validateSimplePermissionStrategy(value: unknown, label: string): void {
+  if (value !== "default" && value !== "bypass") {
+    throw new Error(`${label} is invalid.`);
+  }
 }
 function advanced(id: AgentAdapterId, value: AdvancedAgentConfig | undefined): void {
   if (value === undefined) return;
@@ -608,11 +663,6 @@ function absolutePath(value: string, label: string): void {
 }
 function optionalText(value: unknown, label: string): void {
   if (value !== undefined) text(value, label);
-}
-function optionalBoolean(value: unknown, label: string): void {
-  if (value !== undefined && typeof value !== "boolean") {
-    throw new Error(`${label} must be boolean.`);
-  }
 }
 function optionalTexts(values: readonly string[] | undefined, label: string): void {
   if (values === undefined) return;

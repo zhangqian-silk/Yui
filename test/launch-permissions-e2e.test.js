@@ -23,7 +23,6 @@ import {
   updateRoleAgentSessionStatus
 } from "../dist/executor/agentExecutor.js";
 import {
-  assertReadOnlyAgentArgv,
   effectiveLaunchSnapshotsCompatible,
   resolveEffectiveLaunch
 } from "../dist/executor/effectiveLaunch.js";
@@ -86,16 +85,14 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
     adapterId: "codex",
     model: "gpt-e2e",
     effort: "max",
-    yolo: true,
     search: true,
-    permission: { sandbox: "danger-full-access", approval: "never" }
+    permission: { strategy: "bypass" }
   });
   const claudeWriteBinding = createRoleAgentBinding(claude, {
     adapterId: "claude",
     model: "claude-e2e",
     effort: "max",
-    yolo: true,
-    permission: { mode: "bypassPermissions" }
+    permission: { strategy: "bypass" }
   });
   const project = createProject(
     "project-1",
@@ -263,12 +260,13 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
 
   for (const key of ["codexRead", "claudeRead"]) {
     assert.equal(effective[key].access, "read");
-    assert.equal(effective[key].executionMode, "unrestricted");
+    assert.equal(effective[key].permission.strategy, "bypass");
   }
   assertCodexWrite(plans.codexRead.launch.args);
   assertClaudeWrite(plans.claudeRead.launch.args);
-  assert.equal(effective.profileRead.executionMode, "read-only");
-  assertReadOnlyAgentArgv(effective.profileRead, plans.profileRead.launch.args);
+  assert.equal(effective.profileRead.access, "read");
+  assert.equal(effective.profileRead.permission.strategy, "bypass");
+  assertClaudeWrite(plans.profileRead.launch.args);
   assertCodexWrite(plans.codexWrite.launch.args);
   assertClaudeWrite(plans.claudeWrite.launch.args);
   assert.equal(effective.codexReview.access, "write");
@@ -316,14 +314,17 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
     "--agent", codex.id,
     "--model", "gpt-next",
     "--effort", "high",
-    "--clear-yolo"
+    "--permission-strategy", "configured",
+    "--sandbox", "read-only",
+    "--approval", "never"
   ], store, options);
   runTaskCommand([
     "role", "update", taskId, "codex-write",
     "--agent", claude.id,
     "--model", "claude-next",
     "--effort", "max",
-    "--yolo", "true"
+    "--permission-strategy", "configured",
+    "--permission-mode", "plan"
   ], store, options);
   runTaskCommand([
     "role", "bind", taskId, "codex-write", claude.id
@@ -331,14 +332,15 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
   runTaskCommand([
     "role", "update", taskId, "codex-write",
     "--agent", claude.id,
-    "--clear-model", "--clear-effort", "--clear-yolo",
-    "--clear-permission-mode"
+    "--clear-model", "--clear-effort",
+    "--permission-strategy", "default"
   ], store, options);
 
   const desiredAfter = store.getRole(taskId, "codex-write");
   assert.equal(desiredAfter.activeAgentId, claude.id);
   assert.deepEqual(desiredAfter.agentBindings[claude.id].config, {
-    adapterId: "claude"
+    adapterId: "claude",
+    permission: { strategy: "default" }
   });
   assert.ok(desiredAfter.launchRevision > historicalRun.effective.sourceDesiredRevision);
   assert.deepEqual(store.getActiveAgentRun(taskId, "codex-write"), historicalRun);
@@ -415,17 +417,9 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
     reviewRoundId: "review-round-1",
     reviewBaseCommit: commit
   }), /workspace owner does not match/i);
-  assert.throws(() => resolveEffectiveLaunch({
-    role: store.getRole(taskId, "profile-read"),
-    purpose: "execution",
-    workspace: workspaces.get("profile-read"),
-    workItemWriteProjectIds: [project.id],
-    nativeReadOnlySupported: false
-  }), /cannot express native read-only access/i);
-
   const context = runTaskCommand(["context", taskId], store).output;
   assert.match(context, /Desired drift:\s+pending next launch/i);
-  assert.match(context, /provenance:\s+resolved/i);
+  assert.match(context, /permission:\s+bypass/i);
   const events = store.listEvents(taskId);
   assert.equal(events.some((event) => (
     event.type === "role.updated"
@@ -448,14 +442,13 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
     immutableRun: historicalRun,
     immutableSession: historicalSession,
     checks: {
-      writeCapableControlRunsBypass: true,
-      explicitProfileReadOnly: true,
+      readAccessKeepsProviderBypass: true,
+      profileConstrainsSourceDeliveryOnly: true,
       codexWriteBypass: true,
       claudeWriteBypass: true,
       isolatedReviewsFullCapability: true,
       desiredChangeNextLaunchOnly: true,
-      scopeMismatchFailedClosed: true,
-      nativeReadOnlyUnsupportedFailedClosed: true
+      scopeMismatchFailedClosed: true
     }
   };
   const reportPath = join(root, "launch-permissions-e2e-report.json");

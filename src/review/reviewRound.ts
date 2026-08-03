@@ -8,7 +8,6 @@ import { validateRoleWorkspace, type RoleWorkspace } from "../worktree/roleWorks
 export type ReviewRoundStatus = "pending" | "running" | "completed" | "failed";
 export type ReviewRequestSource = "policy" | "leader";
 export type ReviewWorkspaceDisposition = "preserved" | "removed";
-export type ReviewBaseProvenance = "frozen-candidate" | "legacy-unavailable";
 
 export type ReviewCheck = Readonly<{
   name: string;
@@ -30,8 +29,7 @@ export type ReviewRound = {
   candidateId: string;
   reviewerRoleName: string;
   reviewerRunId?: string;
-  reviewBaseProvenance: ReviewBaseProvenance;
-  reviewBaseCommit?: string;
+  reviewBaseCommit: string;
   workspace?: RoleWorkspace;
   requestedBy: ReviewRequestSource;
   status: ReviewRoundStatus;
@@ -63,7 +61,6 @@ export function createReviewRound(
     workItemId: requireIdentity(workItemId, "Work Item id"),
     candidateId: requireIdentity(candidateId, "Candidate id"),
     reviewerRoleName: requireIdentity(reviewerRoleName, "Reviewer Role"),
-    reviewBaseProvenance: "frozen-candidate",
     reviewBaseCommit: requireCommit(reviewBaseCommit, "Review base commit"),
     requestedBy: validateReviewRequestSource(requestedBy),
     status: "pending",
@@ -226,18 +223,7 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
     throw new Error(`Candidate local id is invalid: ${round.candidateId}.`);
   }
   requireIdentity(round.reviewerRoleName, "Reviewer Role");
-  if (round.reviewBaseProvenance === "frozen-candidate") {
-    requireCommit(round.reviewBaseCommit ?? "", "Review base commit");
-  } else if (round.reviewBaseProvenance === "legacy-unavailable") {
-    if (round.reviewBaseCommit !== undefined) {
-      throw new Error("A legacy-unavailable ReviewRound cannot claim a review base commit.");
-    }
-    if (round.status === "pending" || round.status === "running") {
-      throw new Error("An active ReviewRound requires a frozen Candidate commit.");
-    }
-  } else {
-    throw new Error("Review base provenance is invalid.");
-  }
+  requireCommit(round.reviewBaseCommit, "Review base commit");
   validateReviewRequestSource(round.requestedBy);
   if (!["pending", "running", "completed", "failed"].includes(round.status)) {
     throw new Error(`ReviewRound status is invalid: ${String(round.status)}.`);
@@ -297,8 +283,7 @@ function validateReviewWorkspace(round: ReviewRound, workspace: RoleWorkspace): 
     || workspace.entries.some(({ access }) => access !== "write")) {
     throw new Error(`ReviewRound workspace must contain only writable isolated entries: ${round.id}.`);
   }
-  if (round.reviewBaseProvenance !== "frozen-candidate"
-    || !workspace.entries.some(({ baseCommit }) => baseCommit === round.reviewBaseCommit)) {
+  if (!workspace.entries.some(({ baseCommit }) => baseCommit === round.reviewBaseCommit)) {
     throw new Error(`ReviewRound workspace does not contain its review base: ${round.id}.`);
   }
 }

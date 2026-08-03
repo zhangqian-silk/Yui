@@ -141,7 +141,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       "--agent": "value", "--workspace": "value", "--description": "value",
       "--responsibility": "value", "--constraint": "value", "--expected-output": "value",
       "--system-prompt": "value", "--skill": "value", "--model": "value",
-      "--effort": "value", "--yolo": "value", "--sandbox": "value", "--approval": "value",
+      "--effort": "value", "--permission-strategy": "value", "--sandbox": "value", "--approval": "value",
       "--permission-mode": "value", "--allowed-tool": "value", "--disallowed-tool": "value",
       "--search": "value"
     }
@@ -397,7 +397,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       "--profile": "value", "--agent": "value", "--description": "value", "--responsibility": "value",
       "--constraint": "value", "--expected-output": "value", "--system-prompt": "value",
       "--skill": "value", "--model": "value", "--effort": "value",
-      "--yolo": "value", "--sandbox": "value", "--approval": "value", "--permission-mode": "value",
+      "--permission-strategy": "value", "--sandbox": "value", "--approval": "value", "--permission-mode": "value",
       "--allowed-tool": "value", "--disallowed-tool": "value", "--search": "value"
     }
   },

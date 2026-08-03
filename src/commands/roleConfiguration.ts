@@ -1,5 +1,10 @@
 import { usageError } from "../errors/cliError.js";
-import { resolveAgentAdapter, type RoleAgentConfig } from "../executor/agentAdapter.js";
+import {
+  defaultRoleAgentConfig,
+  resolveAgentAdapter,
+  type PermissionStrategy,
+  type RoleAgentConfig
+} from "../executor/agentAdapter.js";
 import type { RoleAgentBinding, RoleProfile } from "../role/role.js";
 
 export type RoleOptionKind = "flag" | "value" | "repeatable";
@@ -32,7 +37,7 @@ const PROFILE_CLEAR_OPTIONS: readonly [string, RoleOptionKind][] = [
 const AGENT_VALUE_OPTIONS: readonly [string, RoleOptionKind][] = [
   ["--model", "value"],
   ["--effort", "value"],
-  ["--yolo", "value"],
+  ["--permission-strategy", "value"],
   ["--sandbox", "value"],
   ["--approval", "value"],
   ["--permission-mode", "value"],
@@ -47,10 +52,6 @@ const AGENT_REPEATABLE_OPTIONS: readonly [string, RoleOptionKind][] = [
 const AGENT_CLEAR_OPTIONS: readonly [string, RoleOptionKind][] = [
   ["--clear-model", "flag"],
   ["--clear-effort", "flag"],
-  ["--clear-yolo", "flag"],
-  ["--clear-sandbox", "flag"],
-  ["--clear-approval", "flag"],
-  ["--clear-permission-mode", "flag"],
   ["--clear-allowed-tools", "flag"],
   ["--clear-disallowed-tools", "flag"],
   ["--clear-search", "flag"],
@@ -180,30 +181,13 @@ export function patchRoleAgentBinding(
   assertAgentOptionConflicts(parsed);
   assertAdapterOptions(binding.adapterId, parsed);
   if (parsed.has("--clear-agent-config")) {
-    return { ...binding, config: { adapterId: binding.adapterId } as RoleAgentConfig };
+    return { ...binding, config: defaultRoleAgentConfig(binding.adapterId) };
   }
 
   const config = structuredClone(binding.config) as unknown as Record<string, unknown>;
   patchText(config, parsed, "--model", "--clear-model", "model");
   patchText(config, parsed, "--effort", "--clear-effort", "effort");
-  patchTrue(config, parsed, "--yolo", "--clear-yolo", "yolo");
-
-  const permission = {
-    ...((config.permission as Readonly<Record<string, unknown>> | undefined) ?? {})
-  } as Record<string, unknown>;
-  patchText(permission, parsed, "--sandbox", "--clear-sandbox", "sandbox");
-  patchText(permission, parsed, "--approval", "--clear-approval", "approval");
-  patchText(permission, parsed, "--permission-mode", "--clear-permission-mode", "mode");
-  patchTexts(permission, parsed, "--allowed-tool", "--clear-allowed-tools", "allowedTools");
-  patchTexts(
-    permission,
-    parsed,
-    "--disallowed-tool",
-    "--clear-disallowed-tools",
-    "disallowedTools"
-  );
-  if (Object.keys(permission).length === 0) delete config.permission;
-  else config.permission = permission;
+  config.permission = permissionPatch(binding, parsed);
 
   if (parsed.has("--search")) {
     if (parsed.one("--search") !== "true") {
@@ -221,6 +205,68 @@ export function patchRoleAgentBinding(
   } catch (error) {
     throw usageError(error instanceof Error ? error.message : String(error));
   }
+}
+
+function permissionPatch(
+  binding: RoleAgentBinding,
+  parsed: ParsedRoleOptions
+): Record<string, unknown> {
+  const selected = parsed.has("--permission-strategy")
+    ? permissionStrategy(parsed.one("--permission-strategy"))
+    : undefined;
+  const nativeOptions = [
+    "--sandbox", "--approval", "--permission-mode",
+    "--allowed-tool", "--clear-allowed-tools",
+    "--disallowed-tool", "--clear-disallowed-tools"
+  ].some((option) => parsed.has(option));
+  if (selected === "default" || selected === "bypass") {
+    if (nativeOptions) {
+      throw usageError(
+        `--permission-strategy ${selected} cannot be combined with provider permission options.`
+      );
+    }
+    return { strategy: selected };
+  }
+  const current = binding.config.permission;
+  if (selected !== "configured" && !nativeOptions) {
+    return structuredClone(current ?? { strategy: "bypass" }) as Record<string, unknown>;
+  }
+  if (selected === undefined && current?.strategy !== "configured") {
+    throw usageError(
+      "Provider permission options require --permission-strategy configured."
+    );
+  }
+  const permission = current?.strategy === "configured"
+    ? structuredClone(current) as unknown as Record<string, unknown>
+    : { strategy: "configured" } as Record<string, unknown>;
+  permission.strategy = "configured";
+  if (binding.adapterId === "codex") {
+    if (parsed.has("--sandbox")) permission.sandbox = requiredText(parsed.one("--sandbox"));
+    if (parsed.has("--approval")) permission.approval = requiredText(parsed.one("--approval"));
+  } else {
+    if (parsed.has("--permission-mode")) {
+      permission.mode = requiredText(parsed.one("--permission-mode"));
+    }
+    patchTexts(permission, parsed, "--allowed-tool", "--clear-allowed-tools", "allowedTools");
+    patchTexts(
+      permission,
+      parsed,
+      "--disallowed-tool",
+      "--clear-disallowed-tools",
+      "disallowedTools"
+    );
+  }
+  return permission;
+}
+
+function permissionStrategy(value: string | undefined): PermissionStrategy {
+  const strategy = requiredText(value);
+  if (strategy !== "default" && strategy !== "bypass" && strategy !== "configured") {
+    throw usageError(
+      "--permission-strategy must be default, bypass, or configured."
+    );
+  }
+  return strategy;
 }
 
 function patchText(
@@ -249,10 +295,6 @@ function assertAgentOptionConflicts(parsed: ParsedRoleOptions): void {
   assertPairs(parsed, [
     ["--model", "--clear-model"],
     ["--effort", "--clear-effort"],
-    ["--yolo", "--clear-yolo"],
-    ["--sandbox", "--clear-sandbox"],
-    ["--approval", "--clear-approval"],
-    ["--permission-mode", "--clear-permission-mode"],
     ["--allowed-tool", "--clear-allowed-tools"],
     ["--disallowed-tool", "--clear-disallowed-tools"],
     ["--search", "--clear-search"]
@@ -263,27 +305,10 @@ function assertAgentOptionConflicts(parsed: ParsedRoleOptions): void {
   }
 }
 
-function patchTrue(
-  target: Record<string, unknown>,
-  parsed: ParsedRoleOptions,
-  valueOption: string,
-  clearOption: string,
-  key: string
-): void {
-  if (parsed.has(valueOption)) {
-    if (parsed.one(valueOption) !== "true") {
-      throw usageError(`${valueOption} supports true only; use ${clearOption} to follow the CLI default.`);
-    }
-    target[key] = true;
-  }
-  if (parsed.has(clearOption)) delete target[key];
-}
-
 function assertAdapterOptions(adapterId: string, parsed: ParsedRoleOptions): void {
-  const codex = ["--sandbox", "--clear-sandbox", "--approval", "--clear-approval",
-    "--search", "--clear-search"];
+  const codex = ["--sandbox", "--approval", "--search", "--clear-search"];
   const claude = [
-    "--permission-mode", "--clear-permission-mode",
+    "--permission-mode",
     "--allowed-tool", "--clear-allowed-tools",
     "--disallowed-tool", "--clear-disallowed-tools"
   ];

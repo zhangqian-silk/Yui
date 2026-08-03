@@ -71,9 +71,8 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
     adapterId: "codex",
     model: "gpt-review-e2e",
     effort: "max",
-    yolo: true,
     search: true,
-    permission: { sandbox: "danger-full-access", approval: "never" }
+    permission: { strategy: "bypass" }
   });
   const project = createProject(
     "project-1",
@@ -163,7 +162,6 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
   const [pendingRound] = store.listReviewRounds(task.id);
   assert.equal(pendingRound.status, "pending");
   assert.equal(pendingRound.reviewBaseCommit, candidateCommit);
-  assert.equal(pendingRound.reviewBaseProvenance, "frozen-candidate");
 
   now = new Date(START.getTime() + 1_000);
   const reviewWorkspace = await preparer.prepareReviewRoundWorkspace(task.id, pendingRound.id);
@@ -184,8 +182,7 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
   assert.equal(reviewEntry.baseCommit, candidateCommit);
   assert.equal(git(reviewEntry.path, "rev-parse", "HEAD"), candidateCommit);
   assert.equal(reviewRun.effective.access, "write");
-  assert.equal(reviewRun.effective.yolo, true);
-  assert.equal(reviewRun.effective.permission, undefined);
+  assert.deepEqual(reviewRun.effective.permission, { strategy: "bypass" });
   assert.equal(reviewRun.effective.reviewRoundId, pendingRound.id);
   assert.equal(reviewRun.effective.reviewBaseCommit, candidateCommit);
   assert.equal(reviewRun.effective.workspace.root, reviewWorkspace.root);
@@ -484,7 +481,6 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
       model: reviewRun.effective.model,
       effort: reviewRun.effective.effort,
       access: reviewRun.effective.access,
-      yolo: reviewRun.effective.yolo,
       permission: reviewRun.effective.permission
     },
     checks: completedRound.checks,

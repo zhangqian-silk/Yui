@@ -23,17 +23,15 @@ function temporaryHome() {
 function readEffective(agentId, adapterId, workspace) {
   return {
     schemaVersion: 2,
-    provenance: "resolved",
     sourceDesiredRevision: 1,
     agentId,
     adapterId,
     access: "read",
-    executionMode: "read-only",
-    yolo: false,
     search: false,
     permission: adapterId === "codex"
-      ? { sandbox: "read-only", approval: "never" }
+      ? { strategy: "configured", sandbox: "read-only", approval: "never" }
       : {
+          strategy: "configured",
           mode: "dontAsk",
           allowedTools: [
             "Read", "Grep", "Glob",
@@ -111,7 +109,13 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     defaultAccess: "write",
     name: "operator",
     activeAgentId: "codex",
-    agentBindings: { codex: { agentId: "codex", adapterId: "codex", config: { adapterId: "codex" } } },
+    agentBindings: {
+      codex: {
+        agentId: "codex",
+        adapterId: "codex",
+        config: { adapterId: "codex", permission: { strategy: "bypass" } }
+      }
+    },
     workspace: home,
     createdAt: timestamp,
     updatedAt: timestamp
@@ -244,7 +248,11 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     activeAgentId: "claude",
     agentBindings: {
       ...globalRole.agentBindings,
-      claude: { agentId: "claude", adapterId: "claude", config: { adapterId: "claude" } }
+      claude: {
+        agentId: "claude",
+        adapterId: "claude",
+        config: { adapterId: "claude", permission: { strategy: "bypass" } }
+      }
     }
   };
   const switchedGlobalSessions = { ...globalSessions, activeAgentId: "claude" };
@@ -287,7 +295,11 @@ test("FileTaskStore persists strict task, role, and operator WorkMailboxes", () 
     status: "idle",
     activeAgentId: "codex",
     agentBindings: {
-      codex: { agentId: "codex", adapterId: "codex", config: { adapterId: "codex" } }
+      codex: {
+        agentId: "codex",
+        adapterId: "codex",
+        config: { adapterId: "codex", permission: { strategy: "bypass" } }
+      }
     },
     workspace: home,
     createdAt: timestamp,

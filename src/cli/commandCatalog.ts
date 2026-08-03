@@ -138,7 +138,7 @@ const roleProfileOptions = [
   "--expected-output", "--system-prompt", "--skill"
 ] as const;
 const roleAgentOptions = [
-  "--model", "--effort", "--yolo", "--sandbox", "--approval", "--permission-mode",
+  "--model", "--effort", "--permission-strategy", "--sandbox", "--approval", "--permission-mode",
   "--allowed-tool", "--disallowed-tool", "--search"
 ] as const;
 const roleProfileClearOptions = [
@@ -146,8 +146,7 @@ const roleProfileClearOptions = [
   "--clear-expected-output", "--clear-system-prompt", "--clear-skills"
 ] as const;
 const roleAgentClearOptions = [
-  "--clear-model", "--clear-effort", "--clear-yolo", "--clear-sandbox", "--clear-approval",
-  "--clear-permission-mode", "--clear-allowed-tools", "--clear-disallowed-tools",
+  "--clear-model", "--clear-effort", "--clear-allowed-tools", "--clear-disallowed-tools",
   "--clear-search", "--clear-agent-config"
 ] as const;
 const agentProfileOptions = [
@@ -160,7 +159,7 @@ const agentProfileClearOptions = [
 const roleAgentOptionValues = {
   "--sandbox": ["read-only", "workspace-write", "danger-full-access"],
   "--approval": ["untrusted", "on-request", "never"],
-  "--yolo": ["true"],
+  "--permission-strategy": ["default", "bypass", "configured"],
   "--search": ["true"]
 } as const;
 
@@ -605,7 +604,7 @@ export const ROOT_COMMAND = buildNode({
   usage: "yui [--json] <command>",
   sections: [
     { id: "general", title: "General", entries: [
-      "help", "version", "update", "setup", "doctor", "storage", "completion"
+      "help", "version", "update", "setup", "doctor", "completion"
     ] },
     { id: "workflow", title: "Workflow", entries: ["operator", "project", "task"] },
     { id: "configuration", title: "Configuration", entries: ["config", "agent", "profile", "role"] },
@@ -618,18 +617,6 @@ export const ROOT_COMMAND = buildNode({
     { name: "update", summary: "Install the latest published Yui package globally." },
     { name: "setup", summary: "Initialize or update Yui configuration." },
     { name: "doctor", summary: "Check Yui dependencies and file state." },
-    {
-      name: "storage",
-      summary: "Perform explicit offline storage operations.",
-      sections: [{ id: "manage", title: "Commands", entries: ["convert-task-identity"] }],
-      children: [{
-        name: "convert-task-identity",
-        summary: "Convert aggregate v10 global record ids into a fresh Task-local output.",
-        usage: "yui storage convert-task-identity --source <old-yui-home> --output <fresh-yui-home>",
-        options: ["--source", "--output"],
-        fileOptions: ["--source", "--output"]
-      }]
-    },
     {
       name: "web",
       summary: "Serve the local Task and Agent control room.",

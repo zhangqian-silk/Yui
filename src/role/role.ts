@@ -7,6 +7,10 @@ import type {
   RoleAgentConfig
 } from "../executor/agentAdapter.js";
 import {
+  defaultRoleAgentConfig,
+  resolveAgentAdapter
+} from "../executor/agentAdapter.js";
+import {
   validateRoleSessionSet,
   type GlobalRoleSessionSet,
   type RoleSessionSet,
@@ -77,7 +81,12 @@ export function createRoleAgentBinding(
 ): RoleAgentBinding {
   const agentId = requireSafeIdentity(agent.id, "Role Agent id");
   const adapterId = requireSupportedAdapterId(agent.adapterId);
-  const effectiveConfig = config ?? { adapterId };
+  const defaults = defaultRoleAgentConfig(adapterId);
+  const effectiveConfig = config === undefined
+    ? defaults
+    : config.permission === undefined
+      ? { ...config, permission: defaults.permission } as RoleAgentConfig
+      : config;
   if (effectiveConfig.adapterId !== adapterId) {
     throw new Error(`Role Agent config adapter does not match Agent: ${agentId}.`);
   }
@@ -435,6 +444,10 @@ function validateRoleAgentBinding(binding: RoleAgentBinding): RoleAgentBinding {
   if (binding.config.adapterId !== adapterId) {
     throw new Error(`Role Agent binding adapter is inconsistent: ${agentId}.`);
   }
+  if (binding.config.permission === undefined) {
+    throw new Error(`Role Agent binding requires an explicit permission strategy: ${agentId}.`);
+  }
+  resolveAgentAdapter(adapterId).canonicalizeConfig(binding.config as never);
   return binding;
 }
 

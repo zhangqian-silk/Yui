@@ -481,8 +481,8 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
         + run.effective.sourceDesiredRevision));
       metadata.append(node("span", "", t("detail.access") + " · "
         + run.effective.access));
-      metadata.append(node("span", "", t("detail.provenance") + " · "
-        + run.effective.provenance));
+      metadata.append(node("span", "", t("detail.permission") + " · "
+        + run.effective.permission.strategy));
     }
     metadata.append(node("time", "", formatDateTime(run.updatedAt, locale)));
     card.append(metadata);
@@ -511,8 +511,7 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     const metadata = node("div", "run-meta");
     metadata.append(node("span", "", round.reviewerRoleName));
     metadata.append(node("span", "", round.workItemId + " · " + round.candidateId));
-    metadata.append(node("span", "", t("detail.reviewBase") + " · "
-      + round.reviewBaseProvenance + " · " + (round.reviewBaseCommit || "unavailable")));
+    metadata.append(node("span", "", t("detail.reviewBase") + " · " + round.reviewBaseCommit));
     if (round.workspace) {
       metadata.append(node("span", "", t("detail.workspace") + " · " + round.workspace.root));
     }
@@ -619,8 +618,8 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
         + role.effectiveLaunch.sourceDesiredRevision));
       effectiveMeta.append(node("span", "", t("detail.access") + " · "
         + role.effectiveLaunch.access));
-      effectiveMeta.append(node("span", "", t("detail.provenance") + " · "
-        + role.effectiveLaunch.provenance));
+      effectiveMeta.append(node("span", "", t("detail.permission") + " · "
+        + role.effectiveLaunch.permission.strategy));
       effectiveMeta.append(node("span", "", role.launchDrift
         ? t("launch.drift")
         : t("launch.current")));

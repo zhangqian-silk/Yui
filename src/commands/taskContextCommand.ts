@@ -158,10 +158,10 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
           ));
           return [
             `  ${role.name} [${role.status}]: ${role.activeAgentId}/${binding.adapterId}`,
-            `    Desired: r${role.launchRevision}; access ceiling: ${role.defaultAccess}; Model: ${binding.config.model ?? "default"}; effort: ${binding.config.effort ?? "default"}; YOLO: ${binding.config.yolo === true ? "enabled" : "disabled"}`,
+            `    Desired: r${role.launchRevision}; access ceiling: ${role.defaultAccess}; Model: ${binding.config.model ?? "default"}; effort: ${binding.config.effort ?? "default"}; permission: ${binding.config.permission?.strategy ?? "default"}`,
             `    Effective: ${effective === undefined
               ? "not started"
-              : `${effectiveSource} ${effective.agentId}/${effective.adapterId}; r${effective.sourceDesiredRevision}; access: ${effective.access}; mode: ${effective.executionMode}; provenance: ${effective.provenance}`}`,
+              : `${effectiveSource} ${effective.agentId}/${effective.adapterId}; r${effective.sourceDesiredRevision}; access: ${effective.access}; permission: ${effective.permission.strategy}`}`,
             `    Desired drift: ${effective === undefined
               ? "-"
               : effective.sourceDesiredRevision === role.launchRevision
@@ -221,7 +221,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
             ...(latestRun === undefined
               ? ["    AgentRuns: none."]
               : [
-                  `    AgentRuns: ${itemRuns.length}; latest ${latestRun.id} [${latestRun.status}] ${latestRun.effective.agentId}/${latestRun.effective.adapterId} · effective r${latestRun.effective.sourceDesiredRevision}/${latestRun.effective.access}/${latestRun.effective.executionMode}`,
+                  `    AgentRuns: ${itemRuns.length}; latest ${latestRun.id} [${latestRun.status}] ${latestRun.effective.agentId}/${latestRun.effective.adapterId} · effective r${latestRun.effective.sourceDesiredRevision}/${latestRun.effective.access}/${latestRun.effective.permission.strategy}`,
                   `      Input: ${compactText(latestRun.input)}`,
                   ...(latestRun.summary === undefined
                     ? []
@@ -238,7 +238,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       agentRuns,
       (run) => [
         `  ${run.id} [${run.status}/${run.purpose}] ${run.roleName} via ${run.effective.agentId}/${run.effective.adapterId}`,
-        `    Effective: r${run.effective.sourceDesiredRevision}; access: ${run.effective.access}; mode: ${run.effective.executionMode}; model: ${run.effective.model ?? "default"}; effort: ${run.effective.effort ?? "default"}`,
+        `    Effective: r${run.effective.sourceDesiredRevision}; access: ${run.effective.access}; permission: ${run.effective.permission.strategy}; model: ${run.effective.model ?? "default"}; effort: ${run.effective.effort ?? "default"}`,
         ...(run.summary === undefined ? [] : [`    Result: ${compactText(run.summary)}`])
       ]
     ),
@@ -310,7 +310,7 @@ function renderWorkItemReviews(
   if (latest === undefined) return ["    ReviewRounds: none."];
   return [
     `    ReviewRounds: ${rounds.length}; latest ${latest.id} [${latest.status}] for ${latest.candidateId} via ${latest.reviewerRoleName} (${latest.requestedBy})`,
-    `      Review base: ${latest.reviewBaseProvenance}; ${latest.reviewBaseCommit ?? "unavailable"}`,
+    `      Review base: ${latest.reviewBaseCommit}`,
     `      Review workspace: ${latest.workspace === undefined
       ? "not prepared"
       : `${latest.workspace.root} (${latest.workspace.entries.length} writable Projects)`}`,

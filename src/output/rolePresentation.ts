@@ -44,7 +44,7 @@ export function renderRoleDetails(
     `  Desired launch   r${role.launchRevision}; access ceiling=${role.defaultAccess}`,
     `  Effective launch ${effective === undefined
       ? "not started"
-      : `${effective.agentId}/${effective.adapterId}; r${effective.sourceDesiredRevision}; access=${effective.access}; mode=${effective.executionMode}; provenance=${effective.provenance}`}`,
+      : `${effective.agentId}/${effective.adapterId}; r${effective.sourceDesiredRevision}; access=${effective.access}; permission=${effective.permission.strategy}`}`,
     `  Desired drift    ${effective === undefined
       ? "-"
       : effective.sourceDesiredRevision === role.launchRevision
@@ -98,27 +98,25 @@ function bindingRow(
 }
 
 function permission(binding: RoleAgentBinding): string {
-  if (binding.config.yolo === true) return "YOLO";
   if (binding.config.adapterId === "codex") {
-    const sandbox = binding.config.permission?.sandbox;
-    const approval = binding.config.permission?.approval;
-    if (sandbox === undefined && approval === undefined) return "CLI default";
-    return [
-      sandbox === undefined ? undefined : `sandbox=${sandbox}`,
-      approval === undefined ? undefined : `approval=${approval}`
-    ].filter((value): value is string => value !== undefined).join(", ");
+    const permission = binding.config.permission;
+    if (permission === undefined || permission.strategy === "default") return "CLI default";
+    if (permission.strategy === "bypass") return "bypass";
+    return `sandbox=${permission.sandbox}, approval=${permission.approval}`;
   }
   const permission = binding.config.permission;
+  if (permission === undefined || permission.strategy === "default") return "CLI default";
+  if (permission.strategy === "bypass") return "bypass";
   const rules = [
-    permission?.mode === undefined ? undefined : `mode=${permission.mode}`,
-    permission?.allowedTools === undefined
+    `mode=${permission.mode}`,
+    permission.allowedTools === undefined
       ? undefined
       : `allow=${permission.allowedTools.join(", ")}`,
-    permission?.disallowedTools === undefined
+    permission.disallowedTools === undefined
       ? undefined
       : `deny=${permission.disallowedTools.join(", ")}`
   ].filter((value): value is string => value !== undefined);
-  return rules.length === 0 ? "CLI default" : rules.join("; ");
+  return rules.join("; ");
 }
 
 function present(value: string | undefined): string {

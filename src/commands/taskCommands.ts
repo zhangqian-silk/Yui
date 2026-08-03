@@ -1260,7 +1260,7 @@ function addTaskRole(
       agent: `${created.activeAgentId}/${binding.adapterId}`,
       model: binding.config.model ?? "CLI default",
       effort: binding.config.effort ?? "CLI default",
-      yolo: binding.config.yolo === true ? "enabled" : "disabled",
+      permissionStrategy: binding.config.permission?.strategy ?? "default",
       ...roleLaunchEventPayload(created, null)
     }, now);
     return { role: created, binding };
@@ -1270,7 +1270,7 @@ function addTaskRole(
     `Added role ${result.role.name} to ${result.role.taskId}`,
     `Runtime source: ${agentId === undefined ? "Global Role worker" : `Explicit Agent ${agentId}`}`,
     `Agent: ${result.role.activeAgentId}/${result.binding.adapterId}`,
-    `Model: ${result.binding.config.model ?? "CLI default"}; effort: ${result.binding.config.effort ?? "CLI default"}; YOLO: ${result.binding.config.yolo === true ? "enabled" : "disabled"}`,
+    `Model: ${result.binding.config.model ?? "CLI default"}; effort: ${result.binding.config.effort ?? "CLI default"}; permission: ${result.binding.config.permission?.strategy ?? "default"}`,
     "Next: create a WorkItem and start this Role when it has assigned work."
   ].join("\n").concat("\n");
 }
@@ -2333,7 +2333,7 @@ function listRuns(
       { header: "Mode", minWidth: 4, maxWidth: 8 },
       { header: "Effective", minWidth: 10, maxWidth: 30 },
       { header: "Access", minWidth: 6, maxWidth: 8 },
-      { header: "Source", minWidth: 8, maxWidth: 16 },
+      { header: "Permission", minWidth: 8, maxWidth: 16 },
       { header: "Status", minWidth: 6, maxWidth: 12 },
       { header: "Summary", minWidth: 8, maxWidth: 58 }
     ],
@@ -2344,7 +2344,7 @@ function listRuns(
       run.mode,
       `${run.effective.agentId}/${run.effective.adapterId} r${run.effective.sourceDesiredRevision}`,
       run.effective.access,
-      run.effective.provenance,
+      run.effective.permission.strategy,
       run.status,
       run.summary ?? "-"
     ]),
@@ -2530,8 +2530,7 @@ function yieldRun(
         reviewRoundId: round.id,
         workItemId: round.workItemId,
         candidateId: round.candidateId,
-        reviewBaseProvenance: round.reviewBaseProvenance,
-        reviewBaseCommit: round.reviewBaseCommit ?? "unavailable",
+        reviewBaseCommit: round.reviewBaseCommit,
         evidenceCommit: round.evidenceCommit ?? "none",
         checks: round.checks?.map(({ name, outcome }) => `${name}:${outcome}`)
           .join(",") || "none"
@@ -2948,7 +2947,7 @@ function roleLaunchEventPayload(
       ? "none"
       : String(effective.sourceDesiredRevision),
     effectiveAccess: effective?.access ?? "none",
-    provenance: effective?.provenance ?? "none",
+    effectivePermission: effective?.permission.strategy ?? "none",
     desiredDrift: effective === undefined
       ? "not-started"
       : effective.sourceDesiredRevision === role.launchRevision
@@ -2966,14 +2965,13 @@ function runLaunchEventPayload(run: AgentRun): TaskEventPayload {
     agent: `${run.effective.agentId}/${run.effective.adapterId}`,
     effectiveRevision: String(run.effective.sourceDesiredRevision),
     effectiveAccess: run.effective.access,
-    provenance: run.effective.provenance,
+    effectivePermission: run.effective.permission.strategy,
     writeProjectIds: run.effective.writeProjectIds.join(",") || "none",
     ...(run.reviewRoundId === undefined
       ? {}
       : {
           reviewRoundId: run.reviewRoundId,
-          reviewBaseProvenance: run.effective.reviewBaseProvenance ?? "none",
-          reviewBaseCommit: run.effective.reviewBaseCommit ?? "unavailable"
+          reviewBaseCommit: run.effective.reviewBaseCommit ?? "none"
         })
   };
 }

@@ -18,6 +18,7 @@ export function testEffectiveLaunch(input = {}) {
   const adapterId = input.adapterId ?? (agentId === "claude" ? "claude" : "codex");
   const config = {
     adapterId,
+    permission: input.permission ?? { strategy: "bypass" },
     ...(input.model === undefined ? {} : { model: input.model }),
     ...(input.effort === undefined ? {} : { effort: input.effort })
   };

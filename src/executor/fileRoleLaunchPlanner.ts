@@ -34,7 +34,6 @@ import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import type { RoleWorkspace } from "../worktree/roleWorkspace.js";
 import { activeLiveRoleAgentSession } from "./agentExecutor.js";
 import {
-  assertReadOnlyAgentArgv,
   effectiveLaunchSnapshotsCompatible,
   effectiveRoleForLaunch,
   resolveEffectiveLaunch,
@@ -331,7 +330,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       : adapter.compileNew(compileInput);
 
     let args = [...compiled.argv];
-    if (effective.executionMode === "read-only") assertReadOnlyAgentArgv(effective, args);
     let session: SchedulerRoleSession | null;
     if (binding.adapterId === "codex") {
       args = addCodexSessionNotify(args, launchMode, this.#cliPath);
@@ -547,6 +545,7 @@ function managedClaudeControlPlaneConfig(
   workItemId: string | undefined,
   runId: string
 ): ClaudeAgentConfig {
+  if (config.permission?.strategy !== "configured") return config;
   const managed = [
     `Bash(yui --json task context ${taskId})`,
     `Bash(yui --json task work list ${taskId})`,
@@ -555,7 +554,7 @@ function managedClaudeControlPlaneConfig(
       : [`Bash(yui --json task work show ${workItemId})`]),
     `Bash(yui task run yield ${runId} --summary-file -:*)`
   ];
-  const existing = (config.permission?.allowedTools ?? [])
+  const existing = (config.permission.allowedTools ?? [])
     .filter((rule) => !isManagedYuiBashRule(rule));
   return {
     ...config,

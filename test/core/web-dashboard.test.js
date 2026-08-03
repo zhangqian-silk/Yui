@@ -18,17 +18,14 @@ const now = new Date("2026-07-23T08:00:00.000Z");
 function effectiveLaunch() {
   return {
     schemaVersion: 2,
-    provenance: "resolved",
     sourceDesiredRevision: 2,
     agentId: "codex",
     adapterId: "codex",
     model: "gpt-5.6-sol",
     effort: "max",
     access: "read",
-    executionMode: "read-only",
-    yolo: false,
     search: false,
-    permission: { sandbox: "read-only", approval: "never" },
+    permission: { strategy: "configured", sandbox: "read-only", approval: "never" },
     writeProjectIds: [],
     workspace: { root: "/tasks/task-1", entries: [] },
     context: {}
@@ -170,7 +167,6 @@ function fixtureStore() {
         workItemId: "work-1",
         candidateId: "candidate-1",
         reviewerRoleName: "reviewer",
-        reviewBaseProvenance: "frozen-candidate",
         reviewBaseCommit: "a".repeat(40),
         requestedBy: "leader",
         status: "completed",
