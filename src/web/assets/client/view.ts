@@ -293,8 +293,10 @@ function taskCard(task, hasAttention, state, t, locale, onSelect) {
 
 function metricTile(label, value, options) {
   const tile = node("article", "metric" + (options && options.hot ? " is-hot" : ""));
-  tile.append(node("span", "metric-label", label), node("strong", "metric-value", String(value)));
-  if (options && options.sub) tile.append(node("span", "metric-sub", options.sub));
+  const labelWrap = node("div", "metric-label-wrap");
+  labelWrap.append(node("span", "metric-label", label));
+  if (options && options.sub) labelWrap.append(node("span", "metric-sub", options.sub));
+  tile.append(labelWrap, node("strong", "metric-value", String(value)));
   return tile;
 }
 
