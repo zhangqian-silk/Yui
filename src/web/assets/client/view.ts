@@ -596,10 +596,13 @@ function workItemCard(item, titles, t, locale, actions, _taskId) {
   meta.append(node("time", "", formatDateTime(item.updatedAt, locale)));
   card.append(meta);
 
-  const cols = node("div", "record-cols");
+  // Objective spans the full card width so a short objective never leaves a
+  // tall empty column beside a long acceptance list.
   if (item.objective && item.objective !== item.title) {
-    cols.append(copyBlock(t("detail.objective"), item.objective));
+    card.append(copyBlock(t("detail.objective"), item.objective));
   }
+
+  const cols = node("div", "record-cols");
   if (item.acceptance && item.acceptance.length) cols.append(criteriaList(t("detail.acceptance"), item.acceptance));
   if (item.dependsOn && item.dependsOn.length) {
     cols.append(chipRow(t("detail.dependsOn"), item.dependsOn.map(function (id) { return titles[id] || id; })));
