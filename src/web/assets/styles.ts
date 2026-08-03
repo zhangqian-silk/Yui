@@ -332,7 +332,7 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .execute-id .role{font-family:var(--font-body);font-weight:700;font-size:12.5px;color:var(--text)}
 .execute-io{display:grid;gap:5px}
 .execute-io>small{color:var(--muted);font-family:var(--font-mono);font-size:8.5px;text-transform:uppercase;letter-spacing:.1em;font-weight:600}
-.execute-io p{margin:0;font-family:var(--font-body);font-size:12.5px;line-height:1.55;color:var(--text)}
+.execute-io p{margin:0;font-family:var(--font-body);font-size:12.5px;line-height:1.55;color:var(--text);max-height:9.3em;overflow-y:auto;padding-right:4px}
 .execute-io.outcome{border-left:2px solid var(--success);background:var(--success-soft);padding:9px 0 9px 12px;border-radius:0 var(--radius) var(--radius) 0}
 .execute-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding-top:4px}
 .execute-tags{display:flex;align-items:center;gap:6px;flex-wrap:wrap;color:var(--muted);font-family:var(--font-mono);font-size:10px;letter-spacing:.05em}
