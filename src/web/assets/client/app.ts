@@ -22,6 +22,7 @@ const elements = {
   tasks: document.querySelector("#task-list"),
   detail: document.querySelector("#detail"),
   mainCol: document.querySelector(".main-col"),
+  topbar: document.querySelector(".topbar"),
   detailBack: document.querySelector("#detail-back"),
   detailTabs: document.querySelector("#detail-tabs"),
   pageTitle: document.querySelector("#page-title"),
@@ -112,6 +113,17 @@ function renderDynamicContent() {
   if (preserveScroll) elements.mainCol.scrollTop = savedScrollTop;
   syncTabHighlight();
   updateMetrics();
+  updateStickyOffsets();
+}
+
+function updateStickyOffsets() {
+  const root = document.documentElement;
+  if (elements.topbar) {
+    root.style.setProperty("--topbar-h", elements.topbar.offsetHeight + "px");
+  }
+  if (elements.detailTabs && !elements.detailTabs.hidden) {
+    root.style.setProperty("--tabs-h", elements.detailTabs.offsetHeight + "px");
+  }
 }
 
 function updateActiveTabFromScroll() {

@@ -198,9 +198,15 @@ export function renderFilters(container, state, t, onFilter) {
   const counts = state.counts || {};
   const row = node("div", "filter-row");
   statuses.forEach(function (status) {
-    const btn = node("button", "filter-chip", translatedStatus(t, "status", status));
+    const btn = node("button", "filter-chip");
     btn.type = "button";
     btn.dataset.status = status;
+    if (status !== "all") {
+      const dot = node("span", "filter-dot");
+      dot.classList.add(status);
+      btn.append(dot);
+    }
+    btn.append(document.createTextNode(translatedStatus(t, "status", status)));
     if (state.filter === status) btn.classList.add("is-active");
     const count = status === "all" ? counts.total : counts[status];
     if (count !== undefined && count !== null) {
