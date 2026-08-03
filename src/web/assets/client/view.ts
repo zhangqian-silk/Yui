@@ -1,8 +1,5 @@
 export const VIEW_SCRIPT = `
-// The status filter is a compact segmented control. It surfaces only the
-// high-frequency views; low-frequency draft/archived tasks still appear under
-// their own groups in the "all" view, so no filter chip is needed for them.
-const statuses = ["all", "active", "completed"];
+const statuses = ["all", "active", "draft", "completed", "archived"];
 
 function node(tagName, className, textContent) {
   const element = document.createElement(tagName);
@@ -195,14 +192,20 @@ function answerSummary(input, t, locale) {
 
 export function renderFilters(container, state, t, onFilter) {
   clear(container);
+  // Single-line status picker: a native select keeps all statuses distinct and
+  // never wraps, in any language, while the sidebar list still groups tasks by
+  // status. Reuses the sidebar's .select-control styling.
+  const select = node("select", "filter-select");
+  select.setAttribute("aria-label", t("filters.label"));
   statuses.forEach(function (status) {
-    const button = node("button", "filter", translatedStatus(t, "status", status));
-    button.type = "button";
-    button.dataset.status = status;
-    button.setAttribute("aria-pressed", String(state.filter === status));
-    button.addEventListener("click", function () { onFilter(status); });
-    container.append(button);
+    const option = node("option", "", translatedStatus(t, "status", status));
+    option.value = status;
+    if (state.filter === status) option.selected = true;
+    select.append(option);
   });
+  select.value = state.filter;
+  select.addEventListener("change", function () { onFilter(select.value); });
+  container.append(select);
 }
 
 function taskGroupOf(task, attentionIds) {
