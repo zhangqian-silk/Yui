@@ -12,6 +12,7 @@ import {
 } from "../integration/integrationAttempt.js";
 import { GitIntegrationService } from "../integration/gitIntegrationService.js";
 import { taskActor } from "./taskActor.js";
+import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
 
 export type TaskIntegrationCommandOptions = Readonly<{
   now?: () => Date;
@@ -27,14 +28,18 @@ export async function runTaskIntegrationCommand(
   const now = options.now ?? (() => new Date());
   const [command, ...rest] = args;
   if (command === "start") return start(rest, store, home, now);
-  if (command === "continue") return continueIntegration(rest, store, home, now);
+  if (command === "continue") {
+    return continueIntegration(rest, store, home, now, options.environment);
+  }
   if (command === "resolve") {
     return resolveDecision(rest, store, now, options.environment);
   }
-  if (command === "abort") return abortIntegration(rest, store, now());
-  if (command === "cleanup") return cleanupIntegration(rest, store, home);
+  if (command === "abort") return abortIntegration(rest, store, now(), options.environment);
+  if (command === "cleanup") {
+    return cleanupIntegration(rest, store, home, options.environment);
+  }
   if (command === "list") return list(rest, store);
-  if (command === "show") return show(rest, store);
+  if (command === "show") return show(rest, store, options.environment);
   throw usageError(command === undefined
     ? "Task Integration command is required."
     : `Unknown command: task integration ${command}`);
@@ -43,14 +48,15 @@ export async function runTaskIntegrationCommand(
 async function cleanupIntegration(
   args: readonly string[],
   store: TaskStore,
-  home: string
+  home: string,
+  environment: NodeJS.ProcessEnv | undefined
 ): Promise<Readonly<{ output: string; data: unknown }>> {
   if (args.length !== 1) {
     throw usageError(
-      "Task Integration cleanup usage: yui task integration cleanup <integration>."
+      "Task Integration cleanup usage: yui task integration cleanup <task>/<integration>."
     );
   }
-  const integration = requireIntegration(store, args[0]);
+  const integration = requireIntegration(store, args[0], environment);
   if (integration.status !== "committed" && integration.status !== "failed") {
     throw usageError(
       `Integration is not terminal: ${integration.id}/${integration.status}.`
@@ -98,6 +104,14 @@ async function start(
     if (changeSet === null) throw usageError(`ChangeSet not found: ${id}.`);
     return changeSet;
   });
+  const reviewEvidence = new Set(store.listReviewRounds(task.id)
+    .flatMap(({ evidenceCommit }) => evidenceCommit === undefined ? [] : [evidenceCommit]));
+  const reviewSource = changeSets.find(({ headCommit }) => reviewEvidence.has(headCommit));
+  if (reviewSource !== undefined) {
+    throw usageError(
+      `ReviewRound evidence commit cannot become an Integration source: ${reviewSource.id}.`
+    );
+  }
   const projectIds = [...new Set(changeSets.map(({ projectId }) => projectId))];
   if (projectIds.length !== 1) {
     throw usageError("An Integration may only contain ChangeSets from one Project.");
@@ -122,16 +136,19 @@ async function start(
     throw usageError(`Task main worktree is not ready; reconcile the Task first: ${task.id}.`);
   }
   const expectedHead = (await new NodeGitWorkspace().inspect(project.path, targetRef)).baseCommit;
-  const integration = createIntegrationAttempt({
-    id: store.nextIntegrationAttemptId(task.id),
-    taskId: task.id,
-    projectId: project.id,
-    targetRef,
-    expectedHead,
-    changeSetIds,
-    checkCommands: parsed.many.get("--check") ?? []
-  }, now());
-  store.saveIntegrationAttempt(task.id, integration);
+  const integration = store.transaction((tx) => {
+    const created = createIntegrationAttempt({
+      id: tx.nextIntegrationAttemptId(task.id),
+      taskId: task.id,
+      projectId: project.id,
+      targetRef,
+      expectedHead,
+      changeSetIds,
+      checkCommands: parsed.many.get("--check") ?? []
+    }, now());
+    tx.saveIntegrationAttempt(task.id, created);
+    return created;
+  });
   return runIntegration(store, home, integration, now);
 }
 
@@ -139,12 +156,13 @@ async function continueIntegration(
   args: readonly string[],
   store: TaskStore,
   home: string,
-  now: () => Date
+  now: () => Date,
+  environment: NodeJS.ProcessEnv | undefined
 ): Promise<Readonly<{ output: string; data: unknown }>> {
-  const usage = "Task Integration continue usage: yui task integration continue <integration>.";
+  const usage = "Task Integration continue usage: yui task integration continue <task>/<integration>.";
   const parsed = parseRepeatable(args, new Set(), new Set(), usage);
   if (parsed.positionals.length !== 1) throw usageError(usage);
-  const integration = requireIntegration(store, parsed.positionals[0]);
+  const integration = requireIntegration(store, parsed.positionals[0], environment);
   requireActiveIntegrationTask(store, integration);
   if (
     integration.status !== "validating"
@@ -165,7 +183,7 @@ async function runIntegration(
   now: () => Date
 ): Promise<Readonly<{ output: string; data: unknown }>> {
   const result = await new GitIntegrationService(home, store, undefined, now)
-    .integrate(integration.id);
+    .integrate(integration.taskId, integration.id);
   const output = result.status === "committed"
     ? `Integrated ${result.attempt.changeSetIds.join(", ")} into ${result.attempt.targetRef} with CAS (${result.attempt.id})\n`
     : result.status === "blocked"
@@ -180,10 +198,10 @@ function resolveDecision(
   now: () => Date,
   environment: NodeJS.ProcessEnv | undefined
 ): Readonly<{ output: string; data: unknown }> {
-  const usage = "Task Integration resolve usage: yui task integration resolve <integration> --option <manual-resolution|reject> --rationale <text>.";
+  const usage = "Task Integration resolve usage: yui task integration resolve <task>/<integration> --option <manual-resolution|reject> --rationale <text>.";
   const parsed = parseRepeatable(args, new Set(), new Set(["--option", "--rationale"]), usage);
   if (parsed.positionals.length !== 1) throw usageError(usage);
-  const integration = requireIntegration(store, parsed.positionals[0]);
+  const integration = requireIntegration(store, parsed.positionals[0], environment);
   const task = requireActiveIntegrationTask(store, integration);
   if (taskActor(environment, task.id) !== "leader") {
     throw usageError("Only the Task Leader can resolve an Integration conflict.");
@@ -207,12 +225,13 @@ function resolveDecision(
 function abortIntegration(
   args: readonly string[],
   store: TaskStore,
-  now: Date
+  now: Date,
+  environment: NodeJS.ProcessEnv | undefined
 ): Readonly<{ output: string; data: unknown }> {
-  const usage = "Task Integration abort usage: yui task integration abort <integration> --reason <text>.";
+  const usage = "Task Integration abort usage: yui task integration abort <task>/<integration> --reason <text>.";
   const parsed = parseRepeatable(args, new Set(), new Set(["--reason"]), usage);
   if (parsed.positionals.length !== 1) throw usageError(usage);
-  const integration = requireIntegration(store, parsed.positionals[0]);
+  const integration = requireIntegration(store, parsed.positionals[0], environment);
   requireActiveIntegrationTask(store, integration);
   if (integration.status !== "running" && integration.status !== "blocked") {
     throw usageError(
@@ -280,10 +299,11 @@ function list(
 
 function show(
   args: readonly string[],
-  store: TaskStore
+  store: TaskStore,
+  environment: NodeJS.ProcessEnv | undefined
 ): Readonly<{ output: string; data: unknown }> {
-  if (args.length !== 1) throw usageError("Task Integration show usage: yui task integration show <integration>.");
-  const integration = requireIntegration(store, args[0]);
+  if (args.length !== 1) throw usageError("Task Integration show usage: yui task integration show <task>/<integration>.");
+  const integration = requireIntegration(store, args[0], environment);
   return {
     output: `${[
       `Integration Attempt: ${integration.id}`,
@@ -311,13 +331,28 @@ function show(
   };
 }
 
-function requireIntegration(store: TaskStore, id: string): IntegrationAttempt {
-  const matches = store.listTasks().flatMap((task) => {
-    const attempt = store.getIntegrationAttempt(task.id, id);
-    return attempt === null ? [] : [attempt];
-  });
-  if (matches.length !== 1) throw usageError(`Integration Attempt not found: ${id}.`);
-  return matches[0];
+function requireIntegration(
+  store: TaskStore,
+  value: string,
+  environment: NodeJS.ProcessEnv | undefined
+): IntegrationAttempt {
+  let reference;
+  try {
+    reference = resolveTaskRecordReference(value, {
+      kind: "integrationAttempt",
+      contextTaskId: environment?.YUI_TASK_ID,
+      label: "Integration Attempt"
+    });
+  } catch (error) {
+    throw usageError(error instanceof Error ? error.message : String(error));
+  }
+  const attempt = store.getIntegrationAttempt(reference.taskId, reference.localId);
+  if (attempt === null) {
+    throw usageError(
+      `Integration Attempt not found: ${reference.taskId}/${reference.localId}.`
+    );
+  }
+  return attempt;
 }
 
 function parseRepeatable(

@@ -15,6 +15,7 @@ function inputRequest(policy) {
     "input-7",
     "task-3",
     {
+      taskId: "task-3",
       roleName: "leader",
       agentId: "codex",
       runId: "agent-run-8",
@@ -26,7 +27,7 @@ function inputRequest(policy) {
         { key: "safe", label: "Safe rollout" },
         { key: "fast", label: "Fast rollout" }
       ],
-      blockedRefs: [{ type: "run", id: "agent-run-8" }],
+      blockedRefs: [{ type: "run", taskId: "task-3", id: "agent-run-8" }],
       policy
     },
     CREATED_AT
@@ -49,8 +50,8 @@ test("required InputRequest becomes an attention presentation that only the user
     {
       category: "attention",
       taskId: "task-3",
-      receiptId: "input-request:input-7",
-      source: { kind: "input-request", id: "input-7" }
+      receiptId: "input-request:task-3/input-7",
+      source: { kind: "input-request", taskId: "task-3", localId: "input-7" }
     }
   );
   assert.match(presentation.text, /Which rollout should we use\?/);
@@ -58,7 +59,7 @@ test("required InputRequest becomes an attention presentation that only the user
   assert.match(presentation.text, /fast: Fast rollout/);
   assert.match(presentation.text, /requires the user's response/i);
   assert.match(presentation.text, /do not answer or choose on the user's behalf/i);
-  assert.match(presentation.text, /yui task input answer input-7 --choice <key>/);
+  assert.match(presentation.text, /yui task input answer task-3\/input-7 --choice <key>/);
   assert.doesNotMatch(presentation.text, /automatic fallback after/i);
 });
 
@@ -74,7 +75,7 @@ test("recommended InputRequest identifies its recommendation and automatic fallb
   );
 
   assert.equal(presentation.category, "attention");
-  assert.equal(presentation.receiptId, "input-request:input-7");
+  assert.equal(presentation.receiptId, "input-request:task-3/input-7");
   assert.match(presentation.text, /Agent recommendation: safe: Safe rollout/);
   assert.match(
     presentation.text,
@@ -94,6 +95,7 @@ test("free-text InputRequest renders the native answer command without inventing
     "input-8",
     "task-3",
     {
+      taskId: "task-3",
       roleName: "leader",
       agentId: "codex",
       runId: "agent-run-8"
@@ -108,7 +110,7 @@ test("free-text InputRequest renders the native answer command without inventing
 
   const presentation = createInputRequestOperatorPresentation(request, {});
   assert.match(presentation.text, /Answer type: free text/);
-  assert.match(presentation.text, /yui task input answer input-8 --text "<answer>"/);
+  assert.match(presentation.text, /yui task input answer task-3\/input-8 --text "<answer>"/);
   assert.doesNotMatch(presentation.text, /Choices:/);
 });
 

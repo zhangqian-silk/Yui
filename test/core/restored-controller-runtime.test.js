@@ -29,6 +29,7 @@ import {
 } from "../../dist/controller/clientRuntime.js";
 import { startFileTaskControllerRuntime } from "../../dist/controller/runtime.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import { testEffectiveLaunch } from "../helpers/effectiveLaunch.js";
 
 function emptyStore(events = []) {
   return {
@@ -46,7 +47,7 @@ function emptyStore(events = []) {
     resolveDueRuntimeTurnCompletions() { return []; },
     getRoleSession() { return null; },
     hasInFlightTurn() { return false; },
-    nextAgentRunId() { return "run-1"; },
+    peekNextAgentRunId() { return "agent-run-1"; },
     getWorkMailbox() { return null; },
     listWorkMailboxes() { return []; },
     claimWorkMailbox() { return { status: "empty" }; },
@@ -64,6 +65,7 @@ function emptyStore(events = []) {
     saveLeaderDispatch() {},
     saveRoleRunPrepared() {},
     saveRoleRunDelivery() {},
+    saveRoleRunDeliveryFailure() { return "state-changed"; },
     saveLeaderDispatchFailure() {},
     saveExitedRoleRun() {},
     saveArchivedTaskStopped() {}
@@ -84,7 +86,7 @@ test("controller scheduler folds completion and liveness phases before wakeups",
   assert.deepEqual(result, {
     stoppedArchivedTaskIds: [],
     activeRunDeliveries: [],
-    failedRunIds: [],
+    failedRunRefs: [],
     wakeups: [],
     inputNotifications: [],
     autoResolvedInputs: []
@@ -97,10 +99,10 @@ test("a due native Turn completion forgets the finalized Run preparation", async
   store.listPendingRuntimeTurnCompletions = () => [{
     taskId: "task-1",
     roleName: "worker",
-    runId: "run-1",
+    runId: "agent-run-1",
     dueAt: new Date(0).toISOString()
   }];
-  store.resolveDueRuntimeTurnCompletions = () => ["run-1"];
+  store.resolveDueRuntimeTurnCompletions = () => ["task-1/agent-run-1"];
   const forgotten = [];
   const delivery = {
     ...noTmux,
@@ -118,7 +120,32 @@ test("a due native Turn completion forgets the finalized Run preparation", async
   assert.deepEqual(forgotten, [{
     taskId: "task-1",
     roleName: "worker",
-    runId: "run-1"
+    runId: "agent-run-1"
+  }]);
+});
+
+test("a finalized local Run ref forgets only its owning Task preparation", async () => {
+  const store = emptyStore();
+  store.listPendingRuntimeTurnCompletions = () => ["task-1", "task-2"].map(
+    (taskId) => ({
+      taskId,
+      roleName: "worker",
+      runId: "agent-run-1",
+      dueAt: new Date(0).toISOString()
+    })
+  );
+  store.resolveDueRuntimeTurnCompletions = () => ["task-1/agent-run-1"];
+  const forgotten = [];
+
+  await runControllerSchedulerPass(store, {
+    ...noTmux,
+    forgetPrepared(input) { forgotten.push(input); }
+  }, new Date(1), undefined, { kind: "full" });
+
+  assert.deepEqual(forgotten, [{
+    taskId: "task-1",
+    roleName: "worker",
+    runId: "agent-run-1"
   }]);
 });
 
@@ -413,7 +440,7 @@ test("one stale Role cleanup failure does not block another Role delivery", asyn
   };
   const deliveryBatch = {
     fromSequence: 1, toSequence: 1, reasons: ["run-dispatched"],
-    refs: [{ type: "run", id: "run-task-delivery-worker" }], requestCount: 1,
+    refs: [{ type: "run", taskId: "task-delivery", id: "agent-run-91" }], requestCount: 1,
     firstQueuedAt: new Date(0).toISOString(),
     lastQueuedAt: new Date(0).toISOString()
   };
@@ -836,7 +863,7 @@ test("stale Role cleanup finishes before a concurrently queued Run may launch", 
   };
   const runBatch = {
     fromSequence: 2, toSequence: 2, reasons: ["run-dispatched"],
-    refs: [{ type: "run", id: "run-new" }], requestCount: 1,
+    refs: [{ type: "run", taskId: task.id, id: "agent-run-92" }], requestCount: 1,
     firstQueuedAt: new Date(1).toISOString(),
     lastQueuedAt: new Date(1).toISOString()
   };
@@ -936,7 +963,7 @@ test("stale Role cleanup finishes before a concurrently queued Run may launch", 
   await stopStarted;
   run = {
     ...deliveredRun(task.id, roleValue.name),
-    id: "run-new",
+    id: "agent-run-92",
     deliveredAt: undefined
   };
   runMailbox = { ...runMailbox, pending: runBatch, nextSequence: 3 };
@@ -997,16 +1024,20 @@ test("controller delivers a queued Work AgentRun through tmux before liveness", 
     name: "worker",
     activeAgentId: "codex",
     adapterId: "codex",
+    effective: testEffectiveLaunch({ agentId: "codex" }),
+    workspace: "/fixture/workspace",
     status: "running"
   };
   const run = {
-    schemaVersion: 1,
-    id: "run-1",
+    schemaVersion: 4,
+    id: "agent-run-1",
     taskId: task.id,
     roleName: role.name,
     mode: "new",
     input: "implement it",
-    workItemId: "work-1",
+    purpose: "execution",
+    effective: testEffectiveLaunch({ agentId: "codex" }),
+    workItemId: "work-item-1",
     status: "active",
     createdAt: new Date(0).toISOString(),
     updatedAt: new Date(0).toISOString()
@@ -1019,14 +1050,15 @@ test("controller delivers a queued Work AgentRun through tmux before liveness", 
   store.claimWorkMailbox = () => ({
     status: "claimed",
     processing: {
-      batchId: "agent-run:run-1",
+      batchId: `agent-run:${task.id}/${run.id}`,
       batch: {
-        fromSequence: 1, toSequence: 1, reasons: ["work-dispatched"], refs: [{ type: "run", id: run.id }],
+        fromSequence: 1, toSequence: 1, reasons: ["work-dispatched"],
+        refs: [{ type: "run", taskId: task.id, id: run.id }],
         requestCount: 1, firstQueuedAt: new Date(0).toISOString(), lastQueuedAt: new Date(0).toISOString()
       },
       owner: "controller",
       startedAt: new Date(0).toISOString(),
-      executionRef: { type: "run", id: run.id }
+      executionRef: { type: "run", taskId: task.id, id: run.id }
     }
   });
   store.saveRoleRunDelivery = ({ run: saved }) => events.push(`persist:${saved.id}`);
@@ -1056,8 +1088,8 @@ test("controller delivers a queued Work AgentRun through tmux before liveness", 
   assert.deepEqual(events, [
     "prepare",
     "ready",
-    "send:agent-run:run-1:implement it",
-    "persist:run-1",
+    "send:agent-run:task-1/agent-run-1:implement it",
+    "persist:agent-run-1",
     "inspect"
   ]);
 });
@@ -1157,8 +1189,16 @@ test("dirty Role reconciliation inspects only that Role while retaining the Task
     (role) => role.taskId === taskId && role.name === roleName
   ) ?? null;
   store.getActiveAgentRun = (_taskId, roleName) => ({
-    schemaVersion: 1, id: `run-${roleName}`, taskId: task.id, roleName,
-    mode: "new", input: roleName, status: "active", deliveredAt: new Date(0).toISOString(),
+    schemaVersion: 4,
+    id: roleName === "worker" ? "agent-run-1" : "agent-run-2",
+    taskId: task.id,
+    roleName,
+    mode: "new",
+    input: roleName,
+    purpose: "execution",
+    status: "active",
+    effective: testEffectiveLaunch({ agentId: `codex-${roleName}` }),
+    deliveredAt: new Date(0).toISOString(),
     createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString()
   });
   store.resolveExpiredInputRecommendations = () => [];
@@ -1262,13 +1302,15 @@ test("controller pump coalesces overlap into one non-overlapping follow-up pass"
     taskId: "task-1", name: "worker", activeAgentId: "codex", adapterId: "codex", status: "running"
   }];
   store.getActiveAgentRun = () => ({
-    schemaVersion: 1,
-    id: "run-1",
+    schemaVersion: 4,
+    id: "agent-run-1",
     taskId: "task-1",
     roleName: "worker",
     mode: "new",
     input: "work",
+    purpose: "execution",
     status: "active",
+    effective: testEffectiveLaunch({ agentId: "codex" }),
     createdAt: new Date(0).toISOString(),
     updatedAt: new Date(0).toISOString()
   });
@@ -1724,13 +1766,14 @@ test("a non-ready Role delivery uses bounded queued retries instead of blocking 
   store.claimWorkMailbox = () => ({
     status: "processing",
     processing: {
-      batchId: `agent-run:${run.id}`,
+      batchId: `agent-run:${task.id}/${run.id}`,
       batch: {
-        fromSequence: 1, toSequence: 1, reasons: ["run-dispatched"], refs: [{ type: "run", id: run.id }],
+        fromSequence: 1, toSequence: 1, reasons: ["run-dispatched"],
+        refs: [{ type: "run", taskId: task.id, id: run.id }],
         requestCount: 1, firstQueuedAt: new Date(0).toISOString(), lastQueuedAt: new Date(0).toISOString()
       },
       owner: "controller", startedAt: new Date(0).toISOString(),
-      executionRef: { type: "run", id: run.id }
+      executionRef: { type: "run", taskId: task.id, id: run.id }
     }
   });
   store.saveRoleRunDelivery = ({ now }) => { run = { ...run, deliveredAt: now.toISOString() }; };
@@ -1757,79 +1800,104 @@ test("a non-ready Role delivery uses bounded queued retries instead of blocking 
   controller.stop();
 });
 
-test("exhausting Role delivery retries forgets the transient Run preparation", async () => {
+test("exhausting Role delivery retries terminalizes the exact prepared Run before forgetting it", async () => {
   const task = { id: "task-1", status: "active", projectBindings: [] };
   const roleValue = role(task.id, "worker");
-  const run = deliveredRun(task.id, roleValue.name);
+  let run = deliveredRun(task.id, roleValue.name);
   delete run.deliveredAt;
+  const runId = run.id;
+  const session = {
+    agentId: run.effective.agentId,
+    adapterId: run.effective.adapterId,
+    nativeSessionId: "native-retry-exhausted",
+    status: "running",
+    effective: run.effective
+  };
+  const now = new Date("2025-01-02T03:04:05.000Z");
   const store = emptyStore();
   store.getTask = () => task;
   store.getRole = () => roleValue;
   store.getActiveAgentRun = () => run;
+  store.getRoleSession = () => session;
   store.claimWorkMailbox = () => ({
     status: "processing",
     processing: {
-      batchId: `agent-run:${run.id}`,
+      batchId: `agent-run:${task.id}/${run.id}`,
       batch: {
         fromSequence: 1, toSequence: 1,
         reasons: ["run-dispatched"],
-        refs: [{ type: "run", id: run.id }],
+        refs: [{ type: "run", taskId: task.id, id: run.id }],
         requestCount: 1,
         firstQueuedAt: new Date(0).toISOString(),
         lastQueuedAt: new Date(0).toISOString()
       },
       owner: "controller",
       startedAt: new Date(0).toISOString(),
-      executionRef: { type: "run", id: run.id }
+      executionRef: { type: "run", taskId: task.id, id: run.id }
     }
   });
+  const events = [];
+  const failures = [];
+  store.saveRoleRunDeliveryFailure = (input) => {
+    events.push("terminalized");
+    failures.push(input);
+    run = null;
+    return "failed";
+  };
   let sends = 0;
-  let resolveForgotten;
-  const forgotten = new Promise((resolve) => { resolveForgotten = resolve; });
+  const forgotten = [];
   const delivery = {
     ...noTmux,
     async prepareRoleSession(input) {
       return {
         ...input,
         deliveryId: "delivery-retry-exhausted",
+        launchId: "launch-retry-exhausted",
         sessionStarted: false
       };
     },
     async waitUntilReady(prepared) {
-      return { prepared, session: null };
+      return { prepared, session };
     },
     async sendOnce() {
       sends += 1;
       return "busy";
     },
     async inspectRole() { return "present"; },
-    forgetPrepared(input) { resolveForgotten(input); }
+    forgetPrepared(input) {
+      events.push("forgotten");
+      forgotten.push(input);
+    }
   };
   const controller = new FileTaskController(store, delivery, {
     signalWindowMs: 1,
     deliveryRetryMs: 2,
-    deliveryRetryLimit: 2
+    deliveryRetryLimit: 2,
+    now: () => now
   });
 
   controller.signal("role:task-1/worker");
-  let timeout;
-  const forgottenInput = await Promise.race([
-    forgotten,
-    new Promise((_, reject) => {
-      timeout = setTimeout(
-        () => reject(new Error("prepared Run cache was not released")),
-        1_000
-      );
-    })
-  ]);
-  clearTimeout(timeout);
+  await new Promise((resolve) => setTimeout(resolve, 50));
 
   assert.equal(sends, 3);
-  assert.deepEqual(forgottenInput, {
+  assert.deepEqual(failures, [{
     taskId: task.id,
     roleName: roleValue.name,
-    runId: run.id
-  });
+    agentId: run?.effective.agentId ?? session.effective.agentId,
+    adapterId: run?.effective.adapterId ?? session.effective.adapterId,
+    runId,
+    mailboxBatchId: `agent-run:${task.id}/${runId}`,
+    nativeSessionId: session.nativeSessionId,
+    launchId: "launch-retry-exhausted",
+    now
+  }]);
+  assert.deepEqual(forgotten, [{
+    taskId: task.id,
+    roleName: roleValue.name,
+    runId,
+    launchId: "launch-retry-exhausted"
+  }]);
+  assert.deepEqual(events, ["terminalized", "forgotten"]);
   controller.stop();
 });
 
@@ -1850,18 +1918,20 @@ test("a fresh Controller retries an undelivered Run in an existing busy pane", a
     agentId: roleValue.activeAgentId,
     adapterId: roleValue.adapterId,
     nativeSessionId: "thread-existing",
-    status: "running"
+    status: "running",
+    effective: run.effective
   });
   store.claimWorkMailbox = () => ({
     status: "processing",
     processing: {
-      batchId: `agent-run:${run.id}`,
+      batchId: `agent-run:${task.id}/${run.id}`,
       batch: {
-        fromSequence: 1, toSequence: 1, reasons: ["run-dispatched"], refs: [{ type: "run", id: run.id }],
+        fromSequence: 1, toSequence: 1, reasons: ["run-dispatched"],
+        refs: [{ type: "run", taskId: task.id, id: run.id }],
         requestCount: 1, firstQueuedAt: new Date(0).toISOString(), lastQueuedAt: new Date(0).toISOString()
       },
       owner: "controller", startedAt: new Date(0).toISOString(),
-      executionRef: { type: "run", id: run.id }
+      executionRef: { type: "run", taskId: task.id, id: run.id }
     }
   });
   const delivery = {
@@ -1902,20 +1972,21 @@ test("a resumed Role retries startup readiness when prepare created its missing 
     agentId: roleValue.activeAgentId,
     adapterId: roleValue.adapterId,
     nativeSessionId: "thread-existing",
-    status: "running"
+    status: "running",
+    effective: run.effective
   });
   store.claimWorkMailbox = () => ({
     status: "processing",
     processing: {
-      batchId: `agent-run:${run.id}`,
+      batchId: `agent-run:${task.id}/${run.id}`,
       batch: {
         fromSequence: 1, toSequence: 1, reasons: ["run-dispatched"],
-        refs: [{ type: "run", id: run.id }], requestCount: 1,
+        refs: [{ type: "run", taskId: task.id, id: run.id }], requestCount: 1,
         firstQueuedAt: new Date(0).toISOString(),
         lastQueuedAt: new Date(0).toISOString()
       },
       owner: "controller", startedAt: new Date(0).toISOString(),
-      executionRef: { type: "run", id: run.id }
+      executionRef: { type: "run", taskId: task.id, id: run.id }
     }
   });
   const delivery = {
@@ -2018,13 +2089,13 @@ test("a failed pass cannot postpone a pending Turn completion deadline to the fu
     ? [{
         taskId: "task-1",
         roleName: "leader",
-        runId: "run-1",
+        runId: "agent-run-1",
         dueAt: new Date(deadline).toISOString()
       }]
     : [];
   store.resolveDueRuntimeTurnCompletions = (now) => {
     if (pending && now.getTime() >= deadline) pending = false;
-    return pending ? [] : ["run-1"];
+    return pending ? [] : ["task-1/agent-run-1"];
   };
   store.listPendingWakeups = () => {
     if (failWakeupScan) {
@@ -2053,7 +2124,7 @@ test("an overdue semantic deadline uses bounded pass backoff instead of a zero-d
   store.listPendingRuntimeTurnCompletions = () => [{
     taskId: "task-1",
     roleName: "leader",
-    runId: "run-1",
+    runId: "agent-run-1",
     dueAt: new Date(Date.now() - 1_000).toISOString()
   }];
   store.listPendingWakeups = () => {
@@ -2075,16 +2146,25 @@ test("an overdue semantic deadline uses bounded pass backoff instead of a zero-d
 });
 
 function role(taskId, name) {
+  const agentId = `codex-${name}`;
   return {
-    taskId, name, activeAgentId: `codex-${name}`, adapterId: "codex", status: "running"
+    taskId,
+    name,
+    activeAgentId: agentId,
+    adapterId: "codex",
+    effective: testEffectiveLaunch({ agentId }),
+    workspace: "/fixture/workspace",
+    status: "running"
   };
 }
 
 function deliveredRun(taskId, roleName) {
   const at = new Date(0).toISOString();
+  const agentId = `codex-${roleName}`;
   return {
-    schemaVersion: 1, id: `run-${taskId}-${roleName}`, taskId, roleName,
-    mode: "new", input: "work", status: "active", deliveredAt: at,
+    schemaVersion: 4, id: "agent-run-1", taskId, roleName,
+    mode: "new", input: "work", purpose: "execution", status: "active", deliveredAt: at,
+    effective: testEffectiveLaunch({ agentId }),
     createdAt: at, updatedAt: at
   };
 }
@@ -2092,10 +2172,15 @@ function deliveredRun(taskId, roleName) {
 function operatorRuntimeFixture() {
   const target = { kind: "operator" };
   const request = {
-    schemaVersion: 1,
-    id: "input-operator",
+    schemaVersion: 2,
+    id: "input-1",
     taskId: "task-1",
-    requester: { roleName: "leader", agentId: "codex", runId: "run-leader" },
+    requester: {
+      taskId: "task-1",
+      roleName: "leader",
+      agentId: "codex",
+      runId: "agent-run-93"
+    },
     question: "Choose a recovery path?",
     choices: [],
     blockedRefs: [],
@@ -2108,7 +2193,7 @@ function operatorRuntimeFixture() {
     fromSequence: 1,
     toSequence: 1,
     reasons: ["input-requested"],
-    refs: [{ type: "input", id: request.id }],
+    refs: [{ type: "input", taskId: request.taskId, id: request.id }],
     requestCount: 1,
     firstQueuedAt: new Date(0).toISOString(),
     lastQueuedAt: new Date(0).toISOString()
@@ -2121,7 +2206,9 @@ function operatorRuntimeFixture() {
     pending: null
   };
   const store = emptyStore();
-  store.getInputRequest = (inputRequestId) => inputRequestId === request.id ? request : null;
+  store.getInputRequest = (_taskId, inputRequestId) => (
+    inputRequestId === request.id ? request : null
+  );
   store.getOperatorDeliveryTarget = () => ({ roleName: "operator", adapterId: "codex" });
   store.getWorkMailbox = (mailboxTarget) => (
     mailboxTarget.kind === "operator" ? mailbox : null
@@ -2213,7 +2300,7 @@ test("background FileTask controller exposes status, scan and stop on one privat
   assert.deepEqual(await callController(home, "scheduler.scan", {}), {
     stoppedArchivedTaskIds: [],
     activeRunDeliveries: [],
-    failedRunIds: [],
+    failedRunRefs: [],
     wakeups: [],
     inputNotifications: [],
     autoResolvedInputs: []

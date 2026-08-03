@@ -25,6 +25,10 @@ yui doctor
 
 Model and effort are per-Agent Role settings, so Operator, Leader, and the global Worker can use different values even when they share an Agent CLI. Interactive Role flows validate those settings against the selected Agent runtime. Worker Profile model and effort fields are provider-neutral child-execution hints and therefore remain explicit, scriptable values rather than Agent capability selections.
 
+Setup gives every managed Agent binding the explicit `bypass` permission
+strategy. Later Role updates may select `default`, `bypass`, or `configured`;
+the last choice exposes that adapter's native permission enums and tool rules.
+
 Runtime catalogs are refreshed per command and cached under Yui home. If a live probe times out or fails, Yui shows the last cache for the same Agent launch context and clearly marks it as potentially stale; without a matching cache, it offers CLI defaults and custom values. `yui agent capabilities <id>` exposes the same one-pass catalog, including models, model-specific efforts, and other runtime choices such as permissions, search availability, profiles, settings sources, and service tiers.
 
 `completion` is also interactive, with or without an explicit shell:
@@ -43,7 +47,23 @@ export YUI_HOME=/absolute/path/to/yui-home
 yui setup
 ```
 
-The home contains `schema.json`, the authoritative `state.json`, Project Catalog and knowledge, and Controller discovery files. Stable Project checkouts and managed worktrees live under the configured workspace, outside Yui home. The current storage version is exact and fresh-only; this release does not migrate older formats.
+The home contains `schema.json`, the authoritative `state.json`, Project Catalog and knowledge, and Controller discovery files. Stable Project checkouts and managed worktrees live under the configured workspace, outside Yui home. Runtime storage is exact and fresh-only: it never dual-reads an older schema or guesses an old identifier.
+
+Every Task-owned record family allocates a monotonically increasing local ID
+inside its Task. Different Tasks may therefore both contain `work-item-1`,
+`agent-run-1`, or `input-1`. A managed Task session may use that short local ID
+because `YUI_TASK_ID` supplies the scope. Outside a Task session, use the
+qualified form `<task-id>/<local-id>`; Yui never searches every Task for a bare
+ID. Commands that already take a Task explicitly, such as `task work create`
+and `task integration start`, keep their subordinate IDs local to that Task.
+Candidate IDs are local to their WorkItem and carry both Task and WorkItem
+provenance.
+
+Yui supports only the current aggregate-v14 / StoredTask-v13 schema. Older
+homes are intentionally unsupported: initialize a fresh `YUI_HOME` instead of
+asking the runtime to convert, dual-read, or infer historical records. See
+[Task-local identity](docs/task-local-identity.md) for the current reference
+contract.
 
 Setup also seeds four reusable Worker Profiles:
 
@@ -106,12 +126,15 @@ every existing or new Task; that candidate snapshots the rule, so later
 `always` starts a ReviewRound for every candidate, including a yielded Role Run
 or a Leader-managed direct result; `leader` leaves the candidate awaiting
 acceptance so the Leader can accept it directly or run
-`yui task work review <work-item-id>`. A configured review rule therefore keeps
+`yui task work review <task-id>/<work-item-id>`. A configured review rule therefore keeps
 Leader-managed candidates awaiting a decision instead of marking them done.
-A ReviewRound references that immutable candidate, and its review AgentRun never creates
-another WorkItem or recursively triggers review. The natural-language review
-result wakes the Leader, who decides whether to accept, reject and redispatch
-the original Role in its existing Session, review again, or request user input.
+A ReviewRound freezes the Candidate's exact Git commit and creates a fresh,
+ReviewRound-owned writable worktree on a unique branch. Its AgentRun may edit,
+test, and optionally commit diagnostic evidence there, but never changes the
+Candidate or Worker workspace and never creates another WorkItem, Candidate,
+ChangeSet, or recursive review. The result wakes the Leader, who decides whether
+to route evidence to the original Worker, accept, reject and redispatch that
+Worker in its existing Session, review again, or request user input.
 A failed review remains visible evidence and wakes the Leader, but does not
 take that decision away from the Leader.
 Candidate history, every ReviewRound, and the Leader decision remain grouped
@@ -147,9 +170,13 @@ keeps the same relative layout, creates isolated worktrees only for that write
 scope, and exposes the other Task Projects as context from Task main. Yui puts
 the exact writable and context-only Project lists into the managed dispatch and
 the `yui-worker` Skill requires the Agent to honor that boundary. Native Agent
-permissions remain session-wide: use a write-capable session for implementation
-and a native read-only session (Codex `read-only` or Claude `dontAsk` with a
-small allow list) for explorer and reviewer Roles.
+permissions remain session-wide, while Profile `access` is a behavior hint,
+not a provider sandbox or write grant. Every managed Role binding defaults to
+`permission.strategy=bypass`, including `explorer`, so provider prompts do not
+block normal work. Profiles and Skills constrain behavior; exact WorkItem or
+ReviewRound scope and the matching managed workspace are the only authority to
+modify Project files. A Role may instead choose `default` or `configured` and
+retain any supported subset of the provider's native permission options.
 
 Write scope may only expand. The Leader supplies the complete old-plus-new set
 after a Worker yields and reports that another repository is required; an
@@ -158,17 +185,17 @@ existing writable Project cannot be removed:
 ```sh
 yui task work create <task-id> "Update contract" \
   --project backend --project frontend --role implementer
-yui task work scope <work-item-id> \
+yui task work scope <task-id>/<work-item-id> \
   --project backend --project frontend --project shared-sdk
-yui task work isolate <work-item-id>
-yui task work reject <work-item-id> \
+yui task work isolate <task-id>/<work-item-id>
+yui task work reject <task-id>/<work-item-id> \
   --summary "Write scope expanded; continue in the refreshed workspace."
-yui task work dispatch <work-item-id>
-yui task work capture <work-item-id>
+yui task work dispatch <task-id>/<work-item-id>
+yui task work capture <task-id>/<work-item-id>
 yui task integration start <task-id> --project backend \
   --change-set <backend-change-set-id> --check "<validation command>"
-yui task integration cleanup <integration-id>
-yui task work cleanup <work-item-id> --integrated
+yui task integration cleanup <task-id>/<integration-id>
+yui task work cleanup <task-id>/<work-item-id> --integrated
 ```
 
 `capture` records one immutable ChangeSet per modified Project. Repeat capture
@@ -193,6 +220,20 @@ yui operator resume --last
 yui operator new
 yui operator enter
 ```
+
+When a Task Role's current native Session cannot continue, reset it by intent:
+
+```sh
+yui task role reset <task-id> <role> --reason "<why this generation cannot continue>"
+```
+
+Yui derives the current Run, Agent, launch, receipt, and native Session from its
+own records. It fails only that exact active Run (and its execution WorkItem),
+stores the current Session as broken history, and asks the Controller to stop
+only the Role-owned runtime. The command never creates a Candidate, accepts
+work, or completes the Task. While cleanup is pending, `task role status` and
+`task context` block a fresh launch. Existing messages, reviews, and delivery
+history remain durable.
 
 Without `--task`, `operator submit` creates a new Draft. Drafts accept planning changes but must be activated before Agent execution.
 Operator resolves every request against the Project catalog and existing Task
@@ -219,48 +260,62 @@ yui task role show <task-id> implementer
 
 yui task work create <task-id> "Implement the exporter" \
   --project app --role implementer
-yui task work isolate <work-item-id>
-yui task work dispatch <work-item-id> --input "Implement and run focused tests"
+yui task work isolate <task-id>/<work-item-id>
+yui task work dispatch <task-id>/<work-item-id> --input "Implement and run focused tests"
 ```
 
-`--yolo true` is a first-class Role setting. Yui compiles it to
-`--dangerously-bypass-approvals-and-sandbox` for Codex and
-`--dangerously-skip-permissions` for Claude; `--clear-yolo` returns to the
-stored permission settings or CLI default. Any non-Leader Task Role created
-without `--agent` copies the global Worker Role's complete Agent bindings, so
-model, effort, and permissions do not need to be reconstructed by the Leader.
-The creation receipt and `task context` record that runtime source and the
-effective Agent/model/effort/YOLO values. An explicit `--agent` is a deliberate
-Task-specific override and must be configured completely before dispatch.
+Permission is one adapter-specific enum configuration on each Agent binding:
+`default` follows the provider, `bypass` compiles the provider's supported
+bypass flag, and `configured` retains whichever native options are explicitly
+set. Codex options are `sandbox` and `approval`; Claude options are `mode`,
+`allowedTools`, and `disallowedTools`. Provider permission is independent from
+Profile behavior and Project write authority: only an exact WorkItem scope and
+matching managed workspace grant normal Project writes. A ReviewRound is the only non-WorkItem write
+purpose and must match its Run, reviewRoundId, frozen base, and
+ReviewRound-owned workspace; every mismatch fails closed. Its diagnostic commit
+is visible history but is
+explicitly rejected by capture, ChangeSet, Integration, and acceptance paths.
+Review yield keeps the same exact `--summary-file -` command, but its stdin is
+the Reviewer's complete free-form Markdown or JSON report. If a JSON report
+includes known `checks` or `evidenceCommit` fields, Yui records them as
+structured evidence and verifies the reported commit against the managed
+Review branch HEAD; unknown fields remain part of the report. Dirty uncommitted
+diagnosis may yield without a commit; the worktree is retained and cleanup
+refuses it until it is clean.
 
-A Claude reviewer can use native `dontAsk` mode so unapproved tools fail closed
-without an interactive prompt while the exact Yui handoff remains available.
-Pre-approve the read tools and that handoff when configuring the Role:
+Every Role desired launch change increments its revision and applies only to a
+future launch. Each AgentRun and native Role Session stores the complete actual
+agent, adapter, model, effort, Profile access intent, exact writable Projects,
+permission strategy and native options, workspace, context, and source desired revision. Updating,
+switching, or clearing Role overrides never
+hot-mutates an existing process. `task context`, Role views, Run history,
+Events, and Web show desired/effective revisions, Profile intent, permission, and
+pending next-launch drift.
 
-```sh
-yui role update reviewer --agent claude --model <model> --effort <effort> \
-  --permission-mode dontAsk \
-  --allowed-tool Read --allowed-tool Grep --allowed-tool Glob \
-  --allowed-tool 'Bash(yui task run yield *)'
-```
-
-This does not enable file-editing tools or relax the review Profile; everything
-that is neither read-only nor explicitly allowed is denied. The reviewer must
-invoke the yield command directly, not through a shell loop or wrapper that
-would stop matching the rule. Repeat `--allowed-tool` or `--disallowed-tool` to
-replace the corresponding Claude tool-rule list; `--clear-allowed-tools` and
-`--clear-disallowed-tools` remove those stored rules.
+Both Codex and Claude deliver a managed Run only through its exact injected
+stdin-yield command. A final assistant message alone is not a durable handoff;
+permission denial, a missing or wrong Run yield, and StopFailure fail closed.
 
 The Worker delivers its current Run explicitly:
 
 ```sh
-yui task run yield <run-id> --summary "Implemented the exporter; focused tests pass"
+yui task run yield <task-id>/<run-id> --summary-file - <<'YUI_SUMMARY'
+Implemented the exporter; focused tests pass
+YUI_SUMMARY
 ```
 
 Yield completes the AgentRun, submits the WorkItem for Leader review, appends
 the result message, and queues the Leader. It does not accept the WorkItem. A
 Leader never wakes itself; any pending Operator or Worker wake remains durable
 until the Leader is idle.
+
+If the outcome cannot be determined, label the handoff `uncertain`,
+`incomplete`, `blocked`, or `requiring Leader judgment` and submit the most
+complete truthful identities, actions, repository state, checks and errors,
+lifecycle boundary, unfinished work, open decisions, risks, confidence, and
+bounded next options. Yield records immutable Run/Candidate or Review evidence
+only; it does not imply acceptance, WorkItem completion, ChangeSet capture,
+Integration, or Task completion.
 
 For bounded work, the Leader owns a roleless WorkItem and may execute it
 directly or create a native subagent through the current Agent conversation:
@@ -269,7 +324,7 @@ directly or create a native subagent through the current Agent conversation:
 yui task work create <task-id> "Review the implementation" \
   --objective "Return source-backed findings" \
   --accept "Every finding identifies an affected path"
-yui task work update <work-item-id> running
+yui task work update <task-id>/<work-item-id> running
 yui profile show reviewer
 ```
 
@@ -283,7 +338,7 @@ the Leader Agent, credentials, and conversation context. The Leader reviews the
 returned result and records the actual execution facts:
 
 ```sh
-yui task work update <work-item-id> done \
+yui task work update <task-id>/<work-item-id> done \
   --summary "executor=subagent; profile=reviewer@3; model=inherited; round=1; result=reviewed; checks=npm test passed"
 ```
 
@@ -310,21 +365,22 @@ Integration state stores compact check outcomes and failure diagnoses. Full stdo
 Code or semantic conflicts remain blocked until that Task's Leader records a decision:
 
 ```sh
-yui task integration resolve <integration-id> \
+yui task integration resolve <task-id>/<integration-id> \
   --option manual-resolution \
   --rationale "Preserve the public contract while combining both implementations"
-yui task integration continue <integration-id>
+yui task integration continue <task-id>/<integration-id>
 ```
 
 Worker yield is not WorkItem completion. The Leader accepts only after reviewing
 the result, validations, and the latest ChangeSet integration:
 
 ```sh
-yui task work accept <work-item-id> --summary "Acceptance criteria met."
+yui task work accept <task-id>/<work-item-id> --summary "Acceptance criteria met."
 ```
 
 Use `task work reject` to return an awaiting result for repair and redispatch,
-and `task work cancel` for obsolete non-running work. WorkItem and Integration
+and `task work retire <task>/<work> --summary "..."` to retire obsolete work,
+optionally naming a replacement. WorkItem and Integration
 worktrees and check logs remain available as evidence until explicit cleanup.
 
 For long-running Tasks, the Leader keeps Yui—not a native transcript—as the
@@ -341,8 +397,8 @@ When an active Leader Run cannot continue without a user decision, it can create
 yui task input request <task-id> --question "Which format should be the default?" \
   --choice csv="CSV" --choice json="JSON" --blocks work-item:<work-item-id>
 yui task input list
-yui task input show <input-id>
-yui task input answer <input-id> --choice csv
+yui task input show <task-id>/<input-id>
+yui task input answer <task-id>/<input-id> --choice csv
 ```
 
 Requests are user-required by default and remain open until answered or cancelled. When the Agent has a safe recommendation, it may attach a choice fallback and explicit timeout:
@@ -355,7 +411,7 @@ yui task input request <task-id> --question "Which format should be the default?
 
 The recommendation is shown to the user. If no answer arrives, the nearest-deadline timer wakes the Controller to atomically apply that exact choice and queue the fixed Leader session to resume. Free-text and user-required requests never auto-resolve.
 
-`task input list` is the authoritative global open-input Inbox; add a Task ID to scope it, or `--all` to include answered and cancelled requests. The Controller also makes one receipt-backed, best-effort delivery to an already-running Operator composer. It never starts or interrupts an Operator for this notification; an absent or busy Operator falls back to the durable Inbox and is reconsidered on a later Controller pass. Answers may be submitted by the user or Operator. An open request prevents unrelated pending wakes and Task completion or archival. The originating Leader may instead run `yui task input cancel <task-id> <input-id> --reason "..."`; cancellation queues that fixed Leader session to resume.
+`task input list` is the authoritative global open-input Inbox; add a Task ID to scope it, or `--all` to include answered and cancelled requests. The Controller also makes one receipt-backed, best-effort delivery to an already-running Operator process. It never starts or interrupts an Operator for this notification; unavailable process state or a changed pane fence falls back to the durable Inbox and is reconsidered on a later Controller pass. It does not inspect or classify Agent terminal text. Answers may be submitted by the user or Operator. An open request prevents unrelated pending wakes and Task completion or archival. The originating Leader may instead run `yui task input cancel <task-id> <input-id> --reason "..."`; cancellation queues that fixed Leader session to resume.
 
 Inspect the result:
 
@@ -411,9 +467,24 @@ running, Yui asks before stopping it and switching the conversation. On a
 cross-Agent switch, the saved model and effort are reused unless the user
 explicitly chooses to update them.
 
+The Role's active binding is desired state for the next compatible launch. A
+running AgentRun and its native Session continue under their immutable
+effective snapshot even if the Role is edited or switched. Resume is allowed
+only when the complete effective snapshot and workspace remain compatible;
+otherwise Yui starts a new Session after the old process has stopped and keeps
+the terminal Session's immutable effective snapshot in history. Until that
+process terminates, exact control-plane wakes continue through its actual
+snapshot instead of applying desired drift as a hot change.
+
 Use `yui role unbind <global-role> <agent-id>` or `yui task role unbind <task-id> <role> <agent-id>` to retire a dormant binding. The active binding and any non-stopped native session are rejected; a stopped session record is removed atomically with the binding.
 
 Claude session IDs are preallocated at launch. Managed Codex launches use Codex's structured `notify` callback; after a completed turn, the callback records the native thread ID without injecting a session-binding prompt into the model conversation.
+
+Automated lifecycle and delivery decisions use structured Hook payloads,
+persisted identities, tmux process state, receipts, and pane fences. Yui never
+parses prompt glyphs, progress text, trust dialogs, or other Agent terminal
+output to infer readiness or success. `captureRole()` remains an explicit
+human-facing transcript read and has no lifecycle authority.
 
 Stable Role context is also launch metadata, never a bootstrap turn. Yui passes Role policy and `systemPrompt` through the Agent's native system/developer-instruction channel. Native Codex CLI has no per-launch extra-Skill-root option, so its developer instructions carry compact absolute Skill references and Codex reads each `SKILL.md` on demand. Because `developer_instructions` is one scalar setting, Yui inspects every supported Linux Codex layer—`/etc/codex/config.toml`, the user config, the selected `$CODEX_HOME/<name>.config.toml`, project configs, and `/etc/codex/managed_config.toml`—and refuses to replace a value found in any of them. Managed Codex sessions also require exclusive ownership of the structured `notify` callback that records native Turn completion; Yui refuses launch when any inspected layer already defines `notify`, so neither callback can silently replace the other. `skills.config` is not misused because it only enables or disables already-discovered Skills. Claude receives the same Skill content from a private `0600` managed context file rather than a large or sensitive argv value; retries and resumes reuse the Role-specific path. Non-Operator global Roles stay neutral and receive no Task Leader or Worker Skill. Operator therefore opens at an empty native composer, so the user's text remains its first user message. Leader wakeups and Worker Run assignments remain real mailbox-delivered work messages. An adapter without a native instruction channel must reject this context rather than silently converting it into a first user prompt.
 
@@ -453,7 +524,7 @@ Its recovery reconciliation runs every 120 seconds by default. Normal durable st
 4. detect exited active Role processes;
 5. dispatch pending Leader wakes when the Leader is idle.
 
-Automated input is sent only through tmux. Each pass performs one non-blocking Agent-specific readiness check; a busy startup is retried through a small bounded mailbox timer, while later busy sessions are normally woken by Codex turn-complete events. A pane-local receipt prevents the same Run from being typed twice after a Controller retry.
+Automated input is sent only through tmux. Each pass performs one non-blocking process-state readiness check; a busy startup is retried through a small bounded mailbox timer, while later busy sessions are normally woken by Codex turn-complete events. A pane-local receipt prevents the same Run from being typed twice after a Controller retry.
 
 If a Role process exits before yielding, the Controller fails that Run and running WorkItem and queues the Leader. Recovery failures are exposed through the small compatibility Jobs view:
 

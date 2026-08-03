@@ -85,8 +85,8 @@ When the user changes an existing requirement, route the delta and its reason
 to the same Task rather than silently rewriting history. This includes a shrink
 or a change of implementation or approach that preserves the same bounded
 outcome: keep it on the original Task, submit only the delta and its reason, and
-let the Leader cancel or supersede the affected WorkItem and create the
-replacement. When a change instead abandons the current outcome for an
+let the Leader retire the affected WorkItem, optionally name its replacement,
+and create the replacement. When a change instead abandons the current outcome for an
 independent one, do not force it onto the original Task; apply the strict
 new-Task rule above. If the delta changes
 a read-only Task into Project delivery work, first run
@@ -159,14 +159,19 @@ and each binding's model and permission settings unless the user requests a
 change. Record the provider constraint in the Task message so the Leader knows
 the requirement, but do not treat that message as the runtime binding.
 
-Treat Agent/model/effort and permission settings as launch configuration, not
-Task prose. When the user explicitly authorizes a binding change, update only a
-dormant Role, persist the complete binding, and read it back before that Role
-enters or dispatches a Session. YOLO may be enabled only by explicit user
-authorization; it removes provider prompts but does not expand Operator,
-Leader, or Worker responsibilities. If a live Session prevents the change,
-report the affected Session and stop rather than partially updating the
-configuration or telling the Leader to reconstruct it.
+Treat Agent/model/effort and provider settings as launch configuration, not
+Task prose. When the user requests a binding change, update only a dormant Role,
+persist the complete binding, and read it back before that Role enters or
+dispatches a Session. Every managed binding defaults to the adapter-specific
+`bypass` permission strategy; `default` follows the provider and `configured`
+retains whichever native permission enums and tool rules are explicitly set.
+Keep permission independent from Profile `access`: access is behavior intent,
+while exact
+WorkItem or ReviewRound scope plus the managed workspace authorizes Project
+writes. Provider bypass never expands Operator, Leader, Worker, WorkItem, or
+workspace responsibilities. If a live Session prevents the change, report the
+affected Session and stop rather than partially updating the configuration or
+telling the Leader to reconstruct it.
 
 Provider transcripts remain native to the Agent. Yui stores durable Task
 context, WorkItems, AgentRuns, compact results, and Git integration evidence.
@@ -207,6 +212,10 @@ ChangeSet is integrated.
   conflicts on the Leader's behalf.
 - Reconcile a disappeared native Session with `task reconcile`; inspect the Run
   before retrying a confirmed failure.
+- If the current Task Role native generation cannot continue, use
+  `yui task role reset <task> <role> --reason "..."`. Let Yui derive the exact
+  Run, Agent, receipt, launch, and Session identities; never reconstruct them
+  from terminal text or ask the user to paste them.
 - Retry only an explicitly failed recovery Job.
 
 Archive with `yui task archive <task-id> --integrated` or `--abandon` only after

@@ -31,7 +31,11 @@ test("Task completion is a reversible fence before terminal archive", () => {
   assert.equal("completedBy" in reopened, false);
   assert.equal("completionSummary" in reopened, false);
 
-  const archived = archiveTask(reopened, new Date("2026-07-20T00:04:00.000Z"));
+  const recompleted = completeTask(reopened, new Date("2026-07-20T00:04:00.000Z"), {
+    by: "leader",
+    summary: "Completed again."
+  });
+  const archived = archiveTask(recompleted, new Date("2026-07-20T00:05:00.000Z"));
   assert.throws(() => reopenTask(archived, CREATED), /archived/i);
 });
 

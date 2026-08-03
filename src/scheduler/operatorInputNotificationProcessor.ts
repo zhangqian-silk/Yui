@@ -48,8 +48,9 @@ export async function processOperatorInputNotifications(
   if (claim.status === "empty") return [];
   const processing = claim.processing;
   const requests: PendingOperatorAttention[] = processing.batch.refs
-    .filter((ref) => ref.type === "input")
-    .map((ref) => store.getInputRequest(ref.id))
+    .flatMap((ref) => ref.type === "input"
+      ? [store.getInputRequest(ref.taskId, ref.id)]
+      : [])
     .filter((request): request is InputRequest => request !== null && request.status === "open")
     .map((request) => ({ kind: "input", request }));
   const recoveries: PendingOperatorAttention[] = processing.batch.refs
@@ -162,7 +163,7 @@ function deduplicateAttention(
   const seen = new Set<string>();
   return attentions.filter((attention) => {
     const key = attention.kind === "input"
-      ? `input:${attention.request.id}`
+      ? `input:${attention.request.taskId}/${attention.request.id}`
       : `recovery:${attention.notification.taskId}:${attention.notification.createdAt}`;
     if (seen.has(key)) return false;
     seen.add(key);

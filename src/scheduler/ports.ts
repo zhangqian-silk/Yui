@@ -16,6 +16,7 @@ import type { PendingTurnCompletion } from "../executor/turnCompletion.js";
 import type { RuntimeRoleOwner } from "../runtime/lifecycleReservation.js";
 import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import type { Task } from "../task/task.js";
+import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 
 export type SchedulerTask = Readonly<Pick<
   Task,
@@ -29,6 +30,7 @@ export type SchedulerRole = Readonly<{
   adapterId: AgentAdapterId;
   model?: string;
   effort?: string;
+  effective: EffectiveLaunchSnapshot;
   workspace: string;
   status: "idle" | "running" | "detached" | "exited" | "failed";
 }>;
@@ -40,6 +42,7 @@ export type SchedulerRoleSession = Readonly<{
   adapterId: string;
   nativeSessionId?: string;
   status: "reserved" | "ready" | "running" | "stopped" | "broken";
+  effective: EffectiveLaunchSnapshot;
 }>;
 
 /**
@@ -107,6 +110,19 @@ export type RoleRunDeliveryPersistence = Readonly<{
   now: Date;
 }>;
 
+export type RoleRunDeliveryFailurePersistence = Readonly<{
+  taskId: string;
+  roleName: string;
+  agentId: string;
+  adapterId: AgentAdapterId;
+  runId: string;
+  mailboxBatchId: string;
+  nativeSessionId?: string;
+  /** Exact external-process generation prepared for this undelivered Run. */
+  launchId?: string;
+  now: Date;
+}>;
+
 export type ExitedRoleRunPersistence = Readonly<{
   task: SchedulerTask;
   role: SchedulerRole;
@@ -140,7 +156,7 @@ export interface SchedulerStorePort {
   hasOpenInputRequest(taskId: string): boolean;
   listOpenInputRequests(): readonly InputRequest[];
   listPendingRuntimeTurnCompletions(): readonly PendingTurnCompletion[];
-  getInputRequest(inputRequestId: string): InputRequest | null;
+  getInputRequest(taskId: string, inputRequestId: string): InputRequest | null;
   getOperatorDeliveryTarget(): SchedulerOperatorDeliveryTarget | null;
   resolveExpiredInputRecommendations(
     now: Date,
@@ -150,9 +166,13 @@ export interface SchedulerStorePort {
     now: Date,
     taskIds?: ReadonlySet<string>
   ): readonly string[];
-  getRoleSession(taskId: string, roleName: string): SchedulerRoleSession | null;
+  getRoleSession(
+    taskId: string,
+    roleName: string,
+    agentId?: string
+  ): SchedulerRoleSession | null;
   hasInFlightTurn(taskId: string, roleName: string): boolean;
-  nextAgentRunId(taskId: string): string;
+  peekNextAgentRunId(taskId: string): string;
 
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
   listWorkMailboxes(): readonly WorkMailbox[];
@@ -220,6 +240,10 @@ export interface SchedulerStorePort {
   saveRoleRunPrepared(input: RoleRunDeliveryPersistence): void;
   /** Persist successful delivery of a Work AgentRun and its fixed session. */
   saveRoleRunDelivery(input: RoleRunDeliveryPersistence): void;
+  /** Atomically fail one exact prepared Run after bounded delivery exhaustion. */
+  saveRoleRunDeliveryFailure(
+    input: RoleRunDeliveryFailurePersistence
+  ): "failed" | "state-changed";
   /** Persist LeaderFailure, OperatorNotification and failed/broken runtime state. */
   saveLeaderDispatchFailure(input: LeaderDispatchFailurePersistence): "failed" | "state-changed";
   /** Fail the run and running WorkItem, clear active-run, and stop the Role session. */
@@ -295,6 +319,7 @@ export interface TmuxDeliveryPort {
     roleName: string;
     agentId: string;
     adapterId: string;
+    effective: EffectiveLaunchSnapshot;
     workspace: string;
     mode: RoleSessionLaunchMode;
     runId?: string;
@@ -316,7 +341,7 @@ export interface TmuxDeliveryPort {
     runId?: string;
     launchId?: string;
   }>): void;
-  /** Best-effort nudge to an already-running global Operator composer. */
+  /** Best-effort nudge to an already-running global Operator process. */
   notifyOperatorInputOnce?(input: Readonly<{
     roleName: "operator";
     adapterId: string;

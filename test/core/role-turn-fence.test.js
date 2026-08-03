@@ -7,10 +7,10 @@ import {
   createRoleSessionSet,
   markTaskRoleRunDelivered,
   recordObservedTaskRoleCompletion,
-  recordRoleAgentSession,
   settleTaskRoleCompletion,
   validateRoleSessionSet
 } from "../../dist/executor/agentExecutor.js";
+import { recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 import { createPendingTurnCompletion } from "../../dist/runtime/turnCompletion.js";
 
 const PREPARED_AT = new Date("2026-07-23T02:00:00.000Z");
@@ -60,7 +60,7 @@ function deliver(set = bind()) {
 
 test("a fresh Task Role can bind and deliver one exact Run before its native session is known", () => {
   const fresh = taskSet();
-  assert.equal(fresh.schemaVersion, 2);
+  assert.equal(fresh.schemaVersion, 3);
   assert.equal(fresh.sessions.codex, undefined);
   assert.equal(fresh.inFlight, null);
   assert.equal(fresh.pendingTurnCompletion, null);
@@ -87,13 +87,13 @@ test("Global Role session sets do not carry or accept Task Run fences", () => {
     PREPARED_AT
   );
 
-  assert.equal(global.schemaVersion, 2);
+  assert.equal(global.schemaVersion, 3);
   assert.equal(Object.hasOwn(global, "inFlight"), false);
   assert.equal(Object.hasOwn(global, "pendingTurnCompletion"), false);
   assert.throws(() => bind(global), /Task Role session set/u);
   assert.throws(
     () => validateRoleSessionSet({ ...global, inFlight: null }),
-    /Global Role session set must not contain.*inFlight/u
+    /Global Role session set must not contain Task Role lifecycle fields/u
   );
 });
 

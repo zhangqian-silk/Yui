@@ -1,5 +1,12 @@
 export const VIEW_SCRIPT = `
-const statuses = ["all", "active", "draft", "completed", "archived"];
+const statuses = [
+  "all",
+  "active",
+  "draft",
+  "completed",
+  "retired",
+  "archived"
+];
 
 function node(tagName, className, textContent) {
   const element = document.createElement(tagName);
@@ -244,6 +251,7 @@ export function renderOverview(detail, state, t, locale, onSelect) {
     ["active", counts ? counts.active : 0],
     ["draft", counts ? counts.draft : 0],
     ["completed", counts ? counts.completed : 0],
+    ["retired", counts ? counts.retired : 0],
     ["archived", counts ? counts.archived : 0]
   ];
   if (counts && counts.total > 0) {
@@ -342,6 +350,20 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
       meta.append(node("span", "", t("detail.completedBy") + " · " + authorName(t, task.completedBy)));
     }
     if (task.completedAt) meta.append(node("time", "", formatDateTime(task.completedAt, locale)));
+    if (meta.childNodes.length) conclusion.append(meta);
+    detail.append(conclusion);
+  } else if (task.retirementSummary || task.status === "retired") {
+    const conclusion = node("section", "conclusion retired");
+    conclusion.append(node("h3", "", t("detail.retired")));
+    if (task.retirementSummary) conclusion.append(node("p", "", task.retirementSummary));
+    if (task.replacementTaskId) {
+      conclusion.append(node("p", "record-copy muted", t("detail.replacement") + " · " + task.replacementTaskId));
+    }
+    const meta = node("div", "run-meta");
+    if (task.retiredBy) {
+      meta.append(node("span", "", t("detail.retiredBy") + " · " + authorName(t, task.retiredBy)));
+    }
+    if (task.retiredAt) meta.append(node("time", "", formatDateTime(task.retiredAt, locale)));
     if (meta.childNodes.length) conclusion.append(meta);
     detail.append(conclusion);
   } else if (task.status === "archived" || task.archiveSummary || task.archiveReason) {
@@ -448,8 +470,16 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     const metadata = node("div", "run-meta");
     metadata.append(node("span", "", t("mode." + run.mode)));
     metadata.append(node("span", "", t(run.deliveredAt ? "delivery.delivered" : "delivery.pending")));
-    const badge = run.agentId ? agentBadge(run) : null;
+    const badge = run.effective ? agentBadge(run.effective) : null;
     if (badge) metadata.append(badge);
+    if (run.effective) {
+      metadata.append(node("span", "", t("detail.effective") + " · r"
+        + run.effective.sourceDesiredRevision));
+      metadata.append(node("span", "", t("detail.profileIntent") + " · "
+        + run.effective.profileAccess));
+      metadata.append(node("span", "", t("detail.permission") + " · "
+        + run.effective.permission.strategy));
+    }
     metadata.append(node("time", "", formatDateTime(run.updatedAt, locale)));
     card.append(metadata);
 
@@ -465,6 +495,37 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
   });
   executionSection.append(runs);
   detail.append(executionSection);
+
+  const reviewSection = section(t("detail.reviews") + " · " + data.reviewRounds.length);
+  const reviews = node("div", "row-list");
+  if (!data.reviewRounds.length) reviews.append(emptyRow(t));
+  data.reviewRounds.slice().sort(byNewest).forEach(function (round) {
+    const card = node("article", "record-card");
+    const row = node("div", "row record-head");
+    row.append(node("strong", "", round.id), statusPill(t, "review", round.status));
+    card.append(row);
+    const metadata = node("div", "run-meta");
+    metadata.append(node("span", "", round.reviewerRoleName));
+    metadata.append(node("span", "", round.workItemId + " · " + round.candidateId));
+    metadata.append(node("span", "", t("detail.reviewBase") + " · " + round.reviewBaseCommit));
+    if (round.workspace) {
+      metadata.append(node("span", "", t("detail.workspace") + " · " + round.workspace.root));
+    }
+    if (round.evidenceCommit) {
+      metadata.append(node("span", "", t("detail.evidence") + " · " + round.evidenceCommit));
+    }
+    card.append(metadata);
+    if (round.checks && round.checks.length) {
+      card.append(node("p", "record-copy", t("detail.checks") + " · "
+        + round.checks.map(function (check) {
+          return check.name + "=" + check.outcome;
+        }).join(", ")));
+    }
+    if (round.summary) card.append(node("p", "record-copy", round.summary));
+    reviews.append(card);
+  });
+  reviewSection.append(reviews);
+  detail.append(reviewSection);
 
   const workSection = section(t("detail.workItems") + " · " + data.workItems.length);
   const work = node("div", "row-list");
@@ -525,8 +586,12 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
         })
       : null;
     const agentMeta = node("div", "run-meta");
-    agentMeta.append(node("span", "", t("detail.agent") + " · " + role.activeAgentId));
+    agentMeta.append(node("span", "", t("detail.desiredAgent") + " · " + role.activeAgentId));
     if (activeBadge) agentMeta.append(activeBadge);
+    agentMeta.append(node("span", "", t("detail.desired") + " · r"
+      + role.launchRevision));
+    agentMeta.append(node("span", "", t("detail.profileIntent") + " · "
+      + role.defaultAccess));
     roleActions.append(agentMeta);
     const open = node("button", "input-answer", t("actions.openRole"));
     open.type = "button";
@@ -539,6 +604,23 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     });
     roleActions.append(open);
     card.append(roleActions);
+    if (role.effectiveLaunch) {
+      const effectiveMeta = node("div", "run-meta");
+      effectiveMeta.append(node("span", "", t("detail.effectiveAgent") + " · "
+        + role.effectiveLaunch.agentId));
+      const effectiveBadge = agentBadge(role.effectiveLaunch);
+      if (effectiveBadge) effectiveMeta.append(effectiveBadge);
+      effectiveMeta.append(node("span", "", t("detail.effective") + " · r"
+        + role.effectiveLaunch.sourceDesiredRevision));
+      effectiveMeta.append(node("span", "", t("detail.profileIntent") + " · "
+        + role.effectiveLaunch.profileAccess));
+      effectiveMeta.append(node("span", "", t("detail.permission") + " · "
+        + role.effectiveLaunch.permission.strategy));
+      effectiveMeta.append(node("span", "", role.launchDrift
+        ? t("launch.drift")
+        : t("launch.current")));
+      card.append(effectiveMeta);
+    }
     if (role.description) card.append(node("p", "record-copy", role.description));
     const bindingIds = role.agentBindings ? Object.keys(role.agentBindings) : [];
     if (bindingIds.length > 1) {

@@ -3,6 +3,7 @@ import type { InputRequest } from "../input/inputRequest.js";
 import { taskMessageAuthorLabel } from "../message/message.js";
 import { formatTimestamp } from "../output/timePresentation.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import { inspectTaskRoleSessionRecovery } from "./taskRoleRuntimeStatus.js";
 
 const RECENT_RECORD_LIMIT = 5;
 const RELATED_RECORD_LIMIT = 5;
@@ -10,8 +11,7 @@ const SUMMARY_TEXT_LIMIT = 400;
 const TERMINAL_WORK_ITEM_STATUSES = new Set([
   "completed",
   "failed",
-  "cancelled",
-  "superseded"
+  "retired"
 ]);
 
 export function runTaskContextCommand(args: string[], store: TaskStore) {
@@ -24,6 +24,8 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     if (task === null) throw taskNotFound(taskId);
     const workItems = reader.listWorkItems(task.id);
     const inputRequests = reader.listInputRequests(task.id);
+    const roles = reader.listRoles(task.id);
+    const roleSessionSets = reader.listRoleSessionSets(task.id);
     return {
       task,
       reviewConfig: reader.getReviewConfig(),
@@ -31,7 +33,11 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       activeDecisions: reader.listDecisions(task.id)
         .filter((decision) => decision.status === "active"),
       milestones: reader.listMilestones(task.id),
-      roles: reader.listRoles(task.id),
+      roles,
+      roleSessionSets,
+      roleSessionRecoveries: roles.map((role) => (
+        inspectTaskRoleSessionRecovery(task.id, role.name, reader)
+      )),
       workItems,
       agentRuns: chronological(reader.listAgentRuns(task.id)),
       reviewRounds: chronological(reader.listReviewRounds(task.id)),
@@ -50,6 +56,8 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     activeDecisions,
     milestones,
     roles,
+    roleSessionSets,
+    roleSessionRecoveries,
     workItems,
     agentRuns,
     reviewRounds,
@@ -75,6 +83,8 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     ...(task.tags === undefined ? [] : [`Tags: ${task.tags.join(", ")}`]),
     ...(task.dueAt === undefined ? [] : [`Due: ${formatTimestamp(task.dueAt, timeZone)}`]),
     ...(task.completionSummary === undefined ? [] : [`Completion summary: ${task.completionSummary}`]),
+    ...(task.retirementSummary === undefined ? [] : [`Retirement summary: ${task.retirementSummary}`]),
+    ...(task.replacementTaskId === undefined ? [] : [`Replacement Task: ${task.replacementTaskId}`]),
     ...(task.archiveSummary === undefined ? [] : [`Archive summary: ${task.archiveSummary}`]),
     ...(task.projectBindings.length === 0
       ? []
@@ -133,15 +143,35 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       ? ["  None."]
       : roles.flatMap((role) => {
           const binding = role.agentBindings[role.activeAgentId];
+          const activeRun = agentRuns.find((run) => (
+            run.roleName === role.name && run.status === "active"
+          ));
+          const sessions = roleSessionSets.find((set) => set.owner.roleName === role.name);
+          const activeSession = sessions?.sessions[sessions.activeAgentId];
+          const effective = activeRun?.effective ?? activeSession?.effective;
+          const effectiveSource = activeRun === undefined ? "Session" : "Run";
+          const recovery = roleSessionRecoveries.find((entry) => entry.roleName === role.name);
           const creation = [...events].reverse().find((event) => (
             event.type === "role.added" && event.payload.role === role.name
           ));
           return [
             `  ${role.name} [${role.status}]: ${role.activeAgentId}/${binding.adapterId}`,
-            `    Model: ${binding.config.model ?? "default"}; effort: ${binding.config.effort ?? "default"}; YOLO: ${binding.config.yolo === true ? "enabled" : "disabled"}`,
+            `    Desired: r${role.launchRevision}; Profile intent: ${role.defaultAccess}; Model: ${binding.config.model ?? "default"}; effort: ${binding.config.effort ?? "default"}; permission: ${binding.config.permission.strategy}`,
+            `    Effective: ${effective === undefined
+              ? "not started"
+              : `${effectiveSource} ${effective.agentId}/${effective.adapterId}; r${effective.sourceDesiredRevision}; Profile intent: ${effective.profileAccess}; permission: ${effective.permission.strategy}`}`,
+            `    Desired drift: ${effective === undefined
+              ? "-"
+              : effective.sourceDesiredRevision === role.launchRevision
+                ? "none"
+                : "pending next launch"}`,
             ...(creation?.payload.runtimeSource === undefined
               ? []
-              : [`    Runtime source at creation: ${creation.payload.runtimeSource}`])
+              : [`    Runtime source at creation: ${creation.payload.runtimeSource}`]),
+            ...(recovery === undefined ? [] : [
+              `    Runtime cleanup: ${recovery.runtimeCleanupPending ? "pending" : "none"}`,
+              `    Fresh launch: ${recovery.freshLaunchAllowed ? "allowed" : "blocked"}`
+            ])
           ];
         })),
     "",
@@ -167,12 +197,15 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
               : item.candidates.flatMap((candidate) => [
                   `    Candidate ${candidate.sequence}: ${candidate.id}${item.status === "awaiting_acceptance" && candidate === item.candidates.at(-1) ? " [current]" : ""} (${candidate.source.type === "run" ? candidate.source.runId : "direct"})`,
                   `      Review policy: ${candidate.reviewPolicy === undefined ? "none" : `${candidate.reviewPolicy.roleName} (${candidate.reviewPolicy.trigger})`}`,
+                  `      Frozen Git: ${candidate.gitSnapshot === undefined
+                    ? "unavailable"
+                    : `${candidate.gitSnapshot.reviewBaseCommit} (${candidate.gitSnapshot.projects.length} Projects)`}`,
                   `      Summary: ${compactText(candidate.summary)}`
                 ])),
             ...(latestRun === undefined
               ? ["    AgentRuns: none."]
               : [
-                  `    AgentRuns: ${itemRuns.length}; latest ${latestRun.id} [${latestRun.status}] ${latestRun.agentId ?? "unknown"}/${latestRun.adapterId ?? "unknown"}`,
+                  `    AgentRuns: ${itemRuns.length}; latest ${latestRun.id} [${latestRun.status}] ${latestRun.effective.agentId}/${latestRun.effective.adapterId} · effective r${latestRun.effective.sourceDesiredRevision}/${latestRun.effective.profileAccess}/${latestRun.effective.permission.strategy}`,
                   `      Input: ${compactText(latestRun.input)}`,
                   ...(latestRun.summary === undefined
                     ? []
@@ -188,8 +221,8 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       "AgentRuns",
       agentRuns,
       (run) => [
-        `  ${run.id} [${run.status}/${run.purpose}] ${run.roleName} via ${run.agentId ?? "unknown"}/${run.adapterId ?? "unknown"}`,
-        `    Model: ${run.model ?? "default"}; effort: ${run.effort ?? "default"}`,
+        `  ${run.id} [${run.status}/${run.purpose}] ${run.roleName} via ${run.effective.agentId}/${run.effective.adapterId}`,
+        `    Effective: r${run.effective.sourceDesiredRevision}; Profile intent: ${run.effective.profileAccess}; permission: ${run.effective.permission.strategy}; model: ${run.effective.model ?? "default"}; effort: ${run.effective.effort ?? "default"}`,
         ...(run.summary === undefined ? [] : [`    Result: ${compactText(run.summary)}`])
       ]
     ),
@@ -261,6 +294,15 @@ function renderWorkItemReviews(
   if (latest === undefined) return ["    ReviewRounds: none."];
   return [
     `    ReviewRounds: ${rounds.length}; latest ${latest.id} [${latest.status}] for ${latest.candidateId} via ${latest.reviewerRoleName} (${latest.requestedBy})`,
+    `      Review base: ${latest.reviewBaseCommit}`,
+    `      Review workspace: ${latest.workspace === undefined
+      ? "not prepared"
+      : `${latest.workspace.root} (${latest.workspace.entries.length} writable Projects)`}`,
+    `      Workspace disposition: ${latest.workspaceDisposition?.kind ?? "pending"}`,
+    `      Diagnostic evidence: ${latest.evidenceCommit ?? "none"}`,
+    `      Checks: ${latest.checks === undefined || latest.checks.length === 0
+      ? "none"
+      : latest.checks.map(({ name, outcome }) => `${name}=${outcome}`).join(", ")}`,
     ...(latest.summary === undefined
       ? []
       : [`      Review summary: ${compactText(latest.summary)}`])

@@ -4,6 +4,7 @@ import {
   requireText,
   requireTimestamp
 } from "../domain/validation.js";
+import { validateTaskRecordReference } from "../task/taskRecordReference.js";
 
 type ChangeSetIdentity = Readonly<{
   id: string;
@@ -41,9 +42,11 @@ export function createWorkItemChangeSet(
 
 export function validateChangeSet<T extends ChangeSet>(changeSet: T): T {
   if (changeSet.schemaVersion !== 2) throw new Error("ChangeSet must use schemaVersion 2.");
-  requireIdentity(changeSet.workItemId, "Work Item id");
-  requireIdentity(changeSet.id, "ChangeSet id");
-  requireIdentity(changeSet.taskId, "Task id");
+  validateTaskRecordReference({ taskId: changeSet.taskId, localId: changeSet.id }, "changeSet");
+  validateTaskRecordReference({
+    taskId: changeSet.taskId,
+    localId: changeSet.workItemId
+  }, "workItem");
   requireIdentity(changeSet.projectId, "Project id");
   requireCommit(changeSet.baseCommit, "ChangeSet base commit");
   requireCommit(changeSet.headCommit, "ChangeSet head commit");

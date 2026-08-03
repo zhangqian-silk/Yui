@@ -32,12 +32,13 @@ import {
   createRoleAgentBinding,
   updateRole
 } from "../../dist/role/role.js";
-import { createAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun } from "../helpers/effectiveLaunch.js";
+import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import { repairOrphanedActiveTasks } from "../../dist/scheduler/activeTaskProgress.js";
 import { mergePendingWakeup } from "../../dist/scheduler/pendingWakeup.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
-import { activateTask, archiveTask, createTask } from "../../dist/task/task.js";
+import { activateTask, archiveTask, completeTask, createTask } from "../../dist/task/task.js";
 
 const FIRST = new Date("2026-07-24T00:00:00.000Z");
 const SECOND = new Date("2026-07-24T00:00:01.000Z");
@@ -128,19 +129,28 @@ test("an active Role Run may launch from its snapshotted workspace", async (t) =
     updatedAt: FIRST.toISOString()
   };
   const run = createAgentRun(
-    "agent-run-workspace",
+    "agent-run-101",
     task.id,
     reviewer.name,
     "new",
     "Review the candidate.",
     FIRST,
-    { workspace }
+    {
+      workspace,
+      effective: resolveEffectiveLaunch({
+        role: reviewer,
+        purpose: "execution",
+        workspace
+      })
+    }
   );
   const target = { kind: "role", taskId: task.id, roleName: reviewer.name };
   store.transaction((tx) => {
     tx.saveRole(task.id, reviewer);
     tx.saveActiveAgentRun(run);
-    enqueueWork(tx, target, "review-requested", FIRST, [{ type: "run", id: run.id }]);
+    enqueueWork(tx, target, "review-requested", FIRST, [
+      { type: "run", taskId: task.id, id: run.id }
+    ]);
   });
   const starts = [];
   const sessionHost = {
@@ -229,7 +239,13 @@ test("a Role host created after Task archival is stopped without a false cleanup
     roleName: role.name
   });
   await startEntered;
-  store.saveTask(archiveTask(store.getTask(task.id), SECOND));
+  store.saveTask(archiveTask(
+    completeTask(store.getTask(task.id), FIRST, {
+      by: "leader",
+      summary: "Fixture complete."
+    }),
+    SECOND
+  ));
 
   releaseStart();
 

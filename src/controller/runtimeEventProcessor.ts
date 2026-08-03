@@ -1,8 +1,13 @@
 import type { SchedulerTask } from "../scheduler/ports.js";
-import type { FileRuntimeEventInbox } from "./runtimeEventInbox.js";
-import type { RuntimeTurnCompletedEvent } from "./runtimeEventInbox.js";
+import type {
+  FileRuntimeEventInbox,
+  RuntimeClaudeStopFailureEvent,
+  RuntimeLifecycleEvent,
+  RuntimeTurnCompletedEvent
+} from "./runtimeEventInbox.js";
 
-type TaskRuntimeTurnCompleted = Readonly<{
+export type TaskRuntimeTurnCompleted = Readonly<{
+  eventId?: string;
   taskId: string;
   roleName: string;
   agentId: string;
@@ -14,7 +19,8 @@ type TaskRuntimeTurnCompleted = Readonly<{
   summary: string;
 }>;
 
-type GlobalRuntimeTurnCompleted = Readonly<{
+export type GlobalRuntimeTurnCompleted = Readonly<{
+  eventId?: string;
   roleName: string;
   agentId: string;
   adapterId: string;
@@ -23,6 +29,21 @@ type GlobalRuntimeTurnCompleted = Readonly<{
   turnId: string;
   title?: string;
   summary: string;
+}>;
+
+export type TaskClaudeStopFailureEvent = Readonly<{
+  eventId: string;
+  type: "claude-stop-failure";
+  taskId: string;
+  roleName: string;
+  agentId: string;
+  adapterId: "claude";
+  launchId: string;
+  nativeSessionId: string;
+  runId: string;
+  error: string;
+  errorDetails?: string;
+  lastAssistantMessage?: string;
 }>;
 
 export type RuntimeTurnEventObserver = Readonly<{
@@ -41,6 +62,27 @@ export type RuntimeTurnEventObserver = Readonly<{
   classifyGlobalRuntimeTurnCompleted?(
     input: GlobalRuntimeTurnCompleted
   ): "apply" | "obsolete";
+  classifyClaudeStopFailureEvent?(
+    input: TaskClaudeStopFailureEvent
+  ): "apply" | "obsolete";
+  observeClaudeStopFailureEvent?(
+    input: TaskClaudeStopFailureEvent,
+    now?: Date
+  ): unknown;
+  observeObsoleteRuntimeEvent?(
+    input: Readonly<{
+      eventId: string;
+      eventType: RuntimeLifecycleEvent["type"];
+      taskId: string;
+      roleName: string;
+      agentId: string;
+      runId?: string;
+      launchId?: string;
+      nativeSessionId: string;
+      reason: string;
+    }>,
+    now?: Date
+  ): unknown;
 }>;
 
 export type RuntimeEventDrainFailure = Readonly<{
@@ -50,7 +92,7 @@ export type RuntimeEventDrainFailure = Readonly<{
 
 export type RuntimeEventDrainResult = Readonly<{
   acknowledgedEventIds: readonly string[];
-  deferred: readonly RuntimeTurnCompletedEvent[];
+  deferred: readonly RuntimeLifecycleEvent[];
   failed: readonly RuntimeEventDrainFailure[];
 }>;
 
@@ -58,11 +100,7 @@ export interface RuntimeEventProcessorPort {
   drain(now: Date): RuntimeEventDrainResult;
 }
 
-/**
- * Folds immutable Hook facts into the authoritative state one event at a time.
- * An event is acknowledged only after its state transaction succeeds. A late
- * event for an already archived/deleted Task is obsolete and can be discarded.
- */
+/** Folds immutable Hook facts one at a time before acknowledging them. */
 export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
   constructor(
     private readonly inbox: Pick<FileRuntimeEventInbox, "list" | "acknowledge">,
@@ -71,62 +109,24 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
 
   drain(now: Date): RuntimeEventDrainResult {
     const acknowledgedEventIds: string[] = [];
-    const deferred: RuntimeTurnCompletedEvent[] = [];
+    const deferred: RuntimeLifecycleEvent[] = [];
     const failed: RuntimeEventDrainFailure[] = [];
-    let events: readonly RuntimeTurnCompletedEvent[];
+    let events: readonly RuntimeLifecycleEvent[];
     try {
       events = this.inbox.list();
     } catch (error) {
-      return {
-        acknowledgedEventIds,
-        deferred,
-        failed: [{ error }]
-      };
+      return { acknowledgedEventIds, deferred, failed: [{ error }] };
     }
     for (const event of events) {
       try {
-        if (event.scope === "task") {
-          const task = this.observer.getTask(event.taskId!);
-          if (task === null || task.status === "archived") {
-            this.acknowledge(event.id, acknowledgedEventIds);
-            continue;
-          }
-          const input = {
-            taskId: event.taskId!,
-            roleName: event.roleName,
-            agentId: event.agentId,
-            adapterId: event.adapterId,
-            ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
-            nativeSessionId: event.nativeSessionId,
-            turnId: event.turnId,
-            ...(event.runId === undefined ? {} : { runId: event.runId }),
-            summary: event.summary
-          };
-          const disposition = this.observer.classifyRuntimeTurnCompleted?.(input)
-            ?? "apply";
-          if (disposition === "deferred") {
+        if (event.type === "native-turn-completed") {
+          const outcome = this.applyCodex(event, now);
+          if (outcome === "deferred") {
             deferred.push(event);
             continue;
           }
-          if (disposition === "obsolete") {
-            this.acknowledge(event.id, acknowledgedEventIds);
-            continue;
-          }
-          this.observer.observeRuntimeTurnCompleted(input, now);
         } else {
-          const input = {
-            roleName: event.roleName,
-            agentId: event.agentId,
-            adapterId: event.adapterId,
-            ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
-            nativeSessionId: event.nativeSessionId,
-            turnId: event.turnId,
-            ...(event.title === undefined ? {} : { title: event.title }),
-            summary: event.summary
-          };
-          if (this.observer.classifyGlobalRuntimeTurnCompleted?.(input) !== "obsolete") {
-            this.observer.observeGlobalRuntimeTurnCompleted(input, now);
-          }
+          this.applyClaudeStopFailure(event, now);
         }
         this.acknowledge(event.id, acknowledgedEventIds);
       } catch (error) {
@@ -136,8 +136,128 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
     return { acknowledgedEventIds, deferred, failed };
   }
 
+  private applyCodex(
+    event: RuntimeTurnCompletedEvent,
+    now: Date
+  ): "applied" | "deferred" | "obsolete" {
+    if (event.scope === "task") {
+      const task = this.observer.getTask(event.taskId!);
+      const input: TaskRuntimeTurnCompleted = {
+        eventId: event.id,
+        taskId: event.taskId!,
+        roleName: event.roleName,
+        agentId: event.agentId,
+        adapterId: event.adapterId,
+        ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
+        nativeSessionId: event.nativeSessionId,
+        turnId: event.turnId,
+        ...(event.runId === undefined ? {} : { runId: event.runId }),
+        summary: event.summary
+      };
+      if (task === null) return "obsolete";
+      if (task.status !== "active") {
+        this.recordObsolete(
+          event,
+          task.status === "archived" ? "task-archived" : "task-retired",
+          now
+        );
+        return "obsolete";
+      }
+      const disposition = this.observer.classifyRuntimeTurnCompleted?.(input) ?? "apply";
+      if (disposition === "deferred") return disposition;
+      if (disposition === "obsolete") {
+        this.recordObsolete(event, "identity-mismatch-or-terminal", now);
+        return disposition;
+      }
+      const observed = this.observer.observeRuntimeTurnCompleted(input, now);
+      if (isObsoleteRuntimeTurnObservation(observed)) {
+        this.recordObsolete(event, "runtime-cleanup-or-stopped-session", now);
+        return "obsolete";
+      }
+      return "applied";
+    }
+    const input: GlobalRuntimeTurnCompleted = {
+      eventId: event.id,
+      roleName: event.roleName,
+      agentId: event.agentId,
+      adapterId: event.adapterId,
+      ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
+      nativeSessionId: event.nativeSessionId,
+      turnId: event.turnId,
+      ...(event.title === undefined ? {} : { title: event.title }),
+      summary: event.summary
+    };
+    if (this.observer.classifyGlobalRuntimeTurnCompleted?.(input) !== "obsolete") {
+      this.observer.observeGlobalRuntimeTurnCompleted(input, now);
+      return "applied";
+    }
+    return "obsolete";
+  }
+
+  private applyClaudeStopFailure(
+    event: RuntimeClaudeStopFailureEvent,
+    now: Date
+  ): void {
+    const task = this.observer.getTask(event.taskId);
+    if (task === null) return;
+    const input: TaskClaudeStopFailureEvent = {
+      eventId: event.id,
+      type: event.type,
+      taskId: event.taskId,
+      roleName: event.roleName,
+      agentId: event.agentId,
+      adapterId: event.adapterId,
+      launchId: event.launchId,
+      nativeSessionId: event.nativeSessionId,
+      runId: event.runId,
+      error: event.error,
+      ...(event.errorDetails === undefined ? {} : { errorDetails: event.errorDetails }),
+      ...(event.lastAssistantMessage === undefined
+        ? {}
+        : { lastAssistantMessage: event.lastAssistantMessage })
+    };
+    if (task.status !== "active"
+      || this.observer.classifyClaudeStopFailureEvent?.(input) === "obsolete") {
+      this.recordObsolete(
+        event,
+        task.status === "archived"
+          ? "task-archived"
+          : task.status !== "active"
+            ? "task-retired"
+            : "identity-mismatch-or-terminal",
+        now
+      );
+      return;
+    }
+    if (this.observer.observeClaudeStopFailureEvent === undefined) {
+      throw new Error("Claude StopFailure observer is unavailable.");
+    }
+    this.observer.observeClaudeStopFailureEvent(input, now);
+  }
+
+  private recordObsolete(event: RuntimeLifecycleEvent, reason: string, now: Date): void {
+    if (event.scope !== "task" || event.taskId === undefined) return;
+    this.observer.observeObsoleteRuntimeEvent?.({
+      eventId: event.id,
+      eventType: event.type,
+      taskId: event.taskId,
+      roleName: event.roleName,
+      agentId: event.agentId,
+      ...(event.runId === undefined ? {} : { runId: event.runId }),
+      ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
+      nativeSessionId: event.nativeSessionId,
+      reason
+    }, now);
+  }
+
   private acknowledge(id: string, acknowledged: string[]): void {
     this.inbox.acknowledge(id);
     acknowledged.push(id);
   }
+}
+
+function isObsoleteRuntimeTurnObservation(value: unknown): boolean {
+  return typeof value === "object"
+    && value !== null
+    && (value as { disposition?: unknown }).disposition === "obsolete";
 }

@@ -18,6 +18,7 @@ import type {
   SessionInspection
 } from "./ports.js";
 import { requireSafeIdentity } from "./validation.js";
+import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 
 export type RuntimeTmuxRole = Readonly<{
   name: string;
@@ -44,6 +45,7 @@ export interface RuntimeRoleLaunchPlannerPort {
     roleName: string;
     agentId: string;
     adapterId: string;
+    effective: EffectiveLaunchSnapshot;
     mode: "new" | "resume";
     nativeSessionId?: string;
     launchId?: string;
@@ -53,6 +55,7 @@ export interface RuntimeRoleLaunchPlannerPort {
     roleName: string;
     agentId: string;
     adapterId: string;
+    effective: EffectiveLaunchSnapshot;
     mode: "new" | "resume";
     nativeSessionId?: string;
     launchId?: string;
@@ -98,8 +101,6 @@ export type RuntimeTmuxPaneState = Readonly<{
   dead: boolean;
   pid?: number;
   currentCommand: string;
-  content: string;
-  styledContent?: string;
   cursorX?: number;
   cursorY?: number;
   historySize?: number;
@@ -312,8 +313,10 @@ export class TmuxSessionHost implements SessionHostPort {
       roleName: request.owner.roleName,
       agentId: request.agentId,
       adapterId: request.adapterId,
+      effective: request.effective,
       launchId: request.launchId,
       mode: request.mode,
+      ...(request.runId === undefined ? {} : { runId: request.runId }),
       ...(request.environment === undefined
         ? {}
         : { environment: request.environment }),
@@ -362,7 +365,7 @@ export class TmuxSessionHost implements SessionHostPort {
   }
 }
 
-/** Non-blocking active-composer push adapter; it never performs readiness polling. */
+/** Non-blocking receipt-backed tmux push; it never interprets provider output. */
 export class TmuxPromptPushAdapter implements ActivePromptPushPort {
   constructor(
     private readonly tmux: RuntimeTmuxPromptPort,

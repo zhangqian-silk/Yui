@@ -1,6 +1,14 @@
+import { isDeepStrictEqual } from "node:util";
+
 import type { RoleAgentSession } from "../executor/agentExecutor.js";
+import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { TaskRole } from "../role/role.js";
+import {
+  hasRuntimeCleanupObligation,
+  hasRuntimeLifecycleWork,
+  runtimeLifecycleTarget
+} from "../runtime/lifecycleReservation.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import type { WorkItem } from "../workItem/workItem.js";
@@ -27,10 +35,21 @@ export type TaskRoleWorkspaceStatus =
   | Readonly<{ managed: false; path: string }>
   | Readonly<{ managed: true } & RoleWorkspace>;
 
+export type TaskRoleSessionRecoveryStatus = Readonly<{
+  taskId: string;
+  roleName: string;
+  runtimeCleanupPending: boolean;
+  freshLaunchAllowed: boolean;
+}>;
+
 export type TaskRoleRuntimeStatus = Readonly<{
   taskId: string;
   roleName: string;
   agentId: string;
+  desiredRevision: number;
+  effectiveLaunch: EffectiveLaunchSnapshot | null;
+  launchDrift: boolean;
+  runSessionDrift: boolean;
   health: TaskRoleHealth;
   healthReason: string;
   openInputRequestCount: number;
@@ -38,6 +57,8 @@ export type TaskRoleRuntimeStatus = Readonly<{
   activeRun: AgentRun | null;
   activeWork: WorkItem | null;
   nativeSession: RoleAgentSession | null;
+  runtimeCleanupPending: boolean;
+  freshLaunchAllowed: boolean;
   tmux: TaskRoleTmuxStatus;
   workspace: TaskRoleWorkspaceStatus;
 }>;
@@ -73,7 +94,10 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
     : `${status.activeWork.id} (${status.activeWork.status}) ${status.activeWork.title}`;
   const nativeSession = status.nativeSession === null
     ? "not recorded"
-    : `${status.nativeSession.nativeSessionId} (${status.nativeSession.status}, ${status.nativeSession.adapterId})`;
+    : `${status.nativeSession.nativeSessionId} (${status.nativeSession.status}, ${status.nativeSession.adapterId}, effective r${status.nativeSession.effective.sourceDesiredRevision})`;
+  const effectiveLaunch = status.effectiveLaunch === null
+    ? "not started"
+    : `${status.effectiveLaunch.agentId}/${status.effectiveLaunch.adapterId}; r${status.effectiveLaunch.sourceDesiredRevision}; Profile intent=${status.effectiveLaunch.profileAccess}; permission=${status.effectiveLaunch.permission.strategy}`;
   const tmux = status.tmux.state === "missing"
     ? "missing"
     : [
@@ -96,10 +120,18 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
     `  Reason           ${status.healthReason}`,
     `  Open inputs      ${status.openInputRequestCount}`,
     `  Agent            ${status.agentId}`,
+    `  Desired launch   r${status.desiredRevision}; Profile intent=${status.role.defaultAccess}`,
+    `  Effective launch ${effectiveLaunch}`,
+    `  Desired drift    ${status.effectiveLaunch === null
+      ? "-"
+      : status.launchDrift ? "pending next launch" : "none"}`,
+    `  Run/session      ${status.runSessionDrift ? "snapshot mismatch" : "snapshot consistent"}`,
     `  Role state       ${status.role.status}`,
     `  Active work      ${activeWork}`,
     `  Active run       ${activeRun}`,
     `  Native session   ${nativeSession}`,
+    `  Runtime cleanup  ${status.runtimeCleanupPending ? "pending" : "none"}`,
+    `  Fresh launch     ${status.freshLaunchAllowed ? "allowed" : "blocked"}`,
     `  tmux pane        ${tmux}`,
     `  Workspace        ${
       status.workspace.managed ? status.workspace.root : status.workspace.path
@@ -114,7 +146,27 @@ export function taskRoleActiveWorkLabel(status: TaskRoleRuntimeStatus): string {
 }
 
 export function taskRoleNativeSessionLabel(status: TaskRoleRuntimeStatus): string {
+  if (status.runtimeCleanupPending && status.nativeSession === null) return "reset (cleanup-pending)";
   return status.nativeSession?.status ?? "unbound";
+}
+
+export function inspectTaskRoleSessionRecovery(
+  taskId: string,
+  roleName: string,
+  store: TaskStore
+): TaskRoleSessionRecoveryStatus {
+  const sessions = store.getTaskRoleSessionSet(taskId, roleName);
+  const target = runtimeLifecycleTarget({ scope: "task", taskId, roleName });
+  const runtimeMailbox = store.getWorkMailbox(target);
+  return {
+    taskId,
+    roleName,
+    runtimeCleanupPending: hasRuntimeCleanupObligation(runtimeMailbox),
+    freshLaunchAllowed: (
+      sessions === null
+      || sessions.sessions[sessions.activeAgentId] === undefined
+    ) && !hasRuntimeLifecycleWork(runtimeMailbox)
+  };
 }
 
 export function taskRoleOpenInputLabel(status: TaskRoleRuntimeStatus): string {
@@ -142,7 +194,15 @@ function inspectTaskRoleRuntimeStatus(
     ? null
     : store.getWorkItem(taskId, activeRun.workItemId);
   const sessions = store.getTaskRoleSessionSet(taskId, role.name);
-  const nativeSession = sessions?.sessions[role.activeAgentId] ?? null;
+  const effectiveAgentId = activeRun?.effective.agentId ?? sessions?.activeAgentId;
+  const nativeSession = effectiveAgentId === undefined
+    ? null
+    : sessions?.sessions[effectiveAgentId] ?? null;
+  const effectiveLaunch = activeRun?.effective ?? nativeSession?.effective ?? null;
+  const runSessionDrift = activeRun !== null
+    && nativeSession !== null
+    && !isDeepStrictEqual(activeRun.effective, nativeSession.effective);
+  const recovery = inspectTaskRoleSessionRecovery(taskId, role.name, store);
   const tmux: TaskRoleTmuxStatus = pane === undefined
     ? { state: "missing" }
     : {
@@ -160,13 +220,18 @@ function inspectTaskRoleRuntimeStatus(
     role,
     activeRun,
     nativeSession,
+    recovery.runtimeCleanupPending,
     tmux,
     openInputRequestCount
   );
   return {
-    taskId,
-    roleName: role.name,
-    agentId: role.activeAgentId,
+    ...recovery,
+    agentId: effectiveLaunch?.agentId ?? role.activeAgentId,
+    desiredRevision: role.launchRevision,
+    effectiveLaunch,
+    launchDrift: effectiveLaunch !== null
+      && effectiveLaunch.sourceDesiredRevision !== role.launchRevision,
+    runSessionDrift,
     ...health,
     openInputRequestCount,
     role,
@@ -182,9 +247,16 @@ function calculateHealth(
   role: TaskRole,
   activeRun: AgentRun | null,
   nativeSession: RoleAgentSession | null,
+  runtimeCleanupPending: boolean,
   tmux: TaskRoleTmuxStatus,
   openInputRequestCount: number
 ): Pick<TaskRoleRuntimeStatus, "health" | "healthReason"> {
+  if (runtimeCleanupPending && nativeSession === null) {
+    return {
+      health: "needs-attention",
+      healthReason: "the native Session was reset; verified runtime cleanup is pending"
+    };
+  }
   if (role.status === "failed" || role.status === "exited") {
     return { health: "failed", healthReason: `persisted Role state is ${role.status}` };
   }

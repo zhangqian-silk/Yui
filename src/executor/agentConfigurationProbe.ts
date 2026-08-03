@@ -73,7 +73,7 @@ export async function discoverCodexConfiguration(
     const capabilityRecord = object(providerCapabilities);
     const webSearch = capabilityRecord?.webSearch === true
       && (allowedWebSearchModes === undefined || allowedWebSearchModes.includes("live"));
-    const yolo = configurationFlagAvailable(
+    const bypass = configurationFlagAvailable(
       help,
       "--dangerously-bypass-approvals-and-sandbox"
     );
@@ -94,8 +94,11 @@ export async function discoverCodexConfiguration(
       fields: [
         field("model", [], true),
         field("effort", [], true),
-        field("yolo", yolo ? [choice("true")] : [], false, yolo,
-          yolo ? undefined : "Codex YOLO mode is unavailable."),
+        field("permission.strategy", [
+          choice("default"),
+          ...(bypass ? [choice("bypass")] : []),
+          choice("configured")
+        ], false, true, bypass ? undefined : "Codex bypass strategy is unavailable."),
         field("permission.sandbox", sandboxChoices.map(choice), false),
         field("permission.approval", approvalChoices.map(choice), false),
         field("search", webSearch ? [choice("true")] : [], false, webSearch,
@@ -154,7 +157,7 @@ export async function discoverClaudeConfiguration(
   const initialized = object(initialization);
   const models = array(initialized?.models, "Claude model catalog").map(claudeModel);
   const permissionModes = configurationHelpChoices(help, "--permission-mode", []);
-  const yolo = configurationFlagAvailable(help, "--dangerously-skip-permissions");
+  const bypass = configurationFlagAvailable(help, "--dangerously-skip-permissions");
   const settingsSources = configurationHelpChoices(
     help,
     "--setting-sources",
@@ -169,8 +172,11 @@ export async function discoverClaudeConfiguration(
     fields: [
       field("model", [], true),
       field("effort", [], true),
-      field("yolo", yolo ? [choice("true")] : [], false, yolo,
-        yolo ? undefined : "Claude YOLO mode is unavailable."),
+      field("permission.strategy", [
+        choice("default"),
+        ...(bypass ? [choice("bypass")] : []),
+        choice("configured")
+      ], false, true, bypass ? undefined : "Claude bypass strategy is unavailable."),
       field("permission.mode", permissionModes.map(choice), true),
       field("permission.allowedTools", [], true),
       field("permission.disallowedTools", [], true),

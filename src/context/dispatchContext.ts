@@ -52,13 +52,33 @@ const WORKER_RUN_COMPLETION_REQUIREMENT = [
     + "`yui task run yield <current-run-id> --summary-file - <<'YUI_SUMMARY'` "
     + "followed by the outcome, evidence, and a closing `YUI_SUMMARY` line, "
     + "replacing the placeholder with that ID.",
+  "If you cannot finally determine success, failure, completeness, or the correct "
+    + "disposition, do not guess, silently stop, or hide uncertainty behind a success "
+    + "summary. Use this exact yield path and label the handoff uncertain, incomplete, "
+    + "blocked, or requiring Leader judgment.",
+  "Report the most complete truthful evidence available and, when applicable: exact Run, "
+    + "WorkItem, and native Session identity; actions actually performed; changed paths "
+    + "and commit/worktree state; checks actually run and their outcomes; provider, runtime, "
+    + "or permission errors; the last confirmed lifecycle boundary; work not performed; "
+    + "unresolved assumptions or decisions; residual risks; confidence; and bounded next options.",
+  "Yield submits immutable Run evidence and a Candidate, or Review evidence only. It never "
+    + "implies Leader acceptance, WorkItem completion, ChangeSet capture, Integration, or "
+    + "Task completion. Review Runs report findings, verification gaps, and limits; the "
+    + "Leader decides disposition.",
+  "This exact control-plane permission does not grant repository writes, broad Bash, "
+    + "external effects, or cross-Run control.",
+  "If the exact yield is denied, do not retry, broaden permissions, use a wrapper, mutate "
+    + "Yui state, or invent delivery evidence. Truthfully surface the blocker through the "
+    + "supported provider failure boundary; there is no fallback protocol.",
   "Yielding closes the Run and hands the WorkItem to the Leader for acceptance; "
     + "a final response alone does neither.",
   "The yield command must be your final tool action. After it succeeds, stop immediately: "
     + "do not inspect, poll, accept, or perform any further work in the same native turn."
 ].join("\n");
 
-export function ensureWorkerRunCompletionRequirement(input: string): string {
+export function ensureWorkerRunCompletionRequirement(
+  input: string
+): string {
   return input.endsWith(`\n\n${WORKER_RUN_COMPLETION_REQUIREMENT}`)
     ? input
     : `${input}\n\n${WORKER_RUN_COMPLETION_REQUIREMENT}`;
@@ -74,7 +94,7 @@ function renderDispatchContext(
     `Task: ${context.taskId}`,
     `Role: ${profile.name}`,
     `Active Agent: ${profile.activeAgentId}`,
-    `Runtime: ${binding.adapterId}; model: ${binding.config.model ?? "CLI default"}; effort: ${binding.config.effort ?? "CLI default"}; YOLO: ${binding.config.yolo === true ? "enabled" : "disabled"}`,
+    `Runtime: ${binding.adapterId}; model: ${binding.config.model ?? "CLI default"}; effort: ${binding.config.effort ?? "CLI default"}; permission: ${binding.config.permission.strategy}`,
     profile.description === undefined ? null : `Description: ${profile.description}`,
     ...(profile.responsibilities ?? []).map((item) => `Responsibility: ${item}`),
     ...(profile.constraints ?? []).map((item) => `Constraint: ${item}`),

@@ -56,10 +56,10 @@ yui profile list
 
 | 执行位置 | 必须确认 |
 |---|---|
-| Operator | Agent、model、effort、权限/YOLO，以及复用当前会话还是创建新会话 |
-| Task Leader | Agent、model、effort、权限/YOLO |
+| Operator | Agent、model、effort、permission strategy，以及复用当前会话还是创建新会话 |
+| Task Leader | Agent、model、effort、permission strategy |
 | native subagent | 继承 Leader，还是在 native API 支持时覆盖 model/effort |
-| Task Role | 每个 Role 的 Agent、model、effort、权限/YOLO 和必要的 adapter 配置 |
+| Task Role | 每个 Role 的 Agent、model、effort、permission strategy 和必要的原生配置 |
 | 兼容性冒烟 | 需要覆盖哪些额外 Agent/adapter |
 | 运行预算 | 最大测试时长、可接受调用成本、是否允许并行 Agent |
 
@@ -87,10 +87,10 @@ yui profile list
 - runtime 不暴露 child 实际 model 时，结果记录 `inherited` 或 `unknown`，
   不得猜测。
 - 用户指定的 Agent/model 不可用时，停止并重新询问；不得静默回退。
-- 用户选择 YOLO 时，将它保存为 Role 的 `yolo=true`。Codex 和 Claude 必须
-  分别出现 `--dangerously-bypass-approvals-and-sandbox` 和
-  `--dangerously-skip-permissions`；不再通过手动确认 workspace trust
-  或临场修改 CLI 参数实现。
+- 所有受管 binding 默认选择 `permission.strategy=bypass`。Codex 和 Claude
+  必须分别出现 `--dangerously-bypass-approvals-and-sandbox` 和
+  `--dangerously-skip-permissions`，包括 `access=read` 的 explorer。测试不得
+  识别 provider trust 文案、自动发送按键或临场修改 CLI 参数。
 - 如果当前 active Session 阻止重新配置，应先说明需要停止或切换哪些 Session
   及影响，再获得用户授权。
 - 将最终确认值写入本次测试报告，并用实际 AgentRun/session 事实核对。
@@ -109,7 +109,7 @@ Task Role 的 Agent/model/effort、权限及必要 adapter 配置持久化，并
 配置预置不等于提前启动 Worker Session：
 
 - 全局 Operator、Leader 和 Worker 在测试前完成配置；setup 中明确选择
-  Worker 复用 Leader，或单独选择 Agent/model/effort/YOLO；
+  Worker 复用 Leader，或单独选择 Agent/model/effort/permission strategy；
 - Task 创建时复制已确认的 Leader binding；
 - Leader 运行中仍负责选择 Direct、native subagent 或 Task Role，选择
   provider-neutral Profile，并创建 WorkItem；
@@ -154,9 +154,9 @@ Controller/YUI_HOME，立即停止该路径，不用全局 `make link` 修补。
 ### 2.5 构造完整运行配置
 
 完整 E2E 的主路径应在无 active Session 的阶段一次性构造全局 Operator、
-Leader 和 Worker binding。如果用户已经明确授权“放开权限”，三者统一保存
-`yolo=true`。这表示测试期间不出现 workspace trust、工具审批或权限确认页面；
-它不改变 Profile 和 WorkItem 的职责边界。
+Leader 和 Worker binding。所有受管 binding 明确使用 `bypass`；`explorer`
+仍使用同样的 provider 权限，但 Yui `access=read`。运行时 bypass 不改变
+Profile、WorkItem 或 workspace 的职责边界。
 
 下面是配置形态示例。`<model>` 和 `<effort>` 必须替换为本次 capability
 探测后用户确认的精确值，不能照抄历史测试：
@@ -164,17 +164,17 @@ Leader 和 Worker binding。如果用户已经明确授权“放开权限”，�
 ```sh
 yui role update operator \
   --agent <operator-agent> --model <operator-model> \
-  --effort <operator-effort> --yolo true
+  --effort <operator-effort> --permission-strategy bypass
 yui role bind operator <operator-agent>
 
 yui role update leader \
   --agent <worker-agent> --model <worker-model> \
-  --effort <worker-effort> --yolo true
+  --effort <worker-effort> --permission-strategy bypass
 yui role bind leader <worker-agent>
 
 yui role update worker \
   --agent <worker-agent> --model <worker-model> \
-  --effort <worker-effort> --yolo true
+  --effort <worker-effort> --permission-strategy bypass
 yui role bind worker <worker-agent>
 ```
 
@@ -197,19 +197,18 @@ yui --json role show worker
 
 门禁要求：
 
-- active Agent、model、effort、`yolo=true` 必须与确认清单一致；
-- Codex YOLO 的实际启动参数必须是
+- active Agent、model、effort 和 permission strategy 必须与确认清单一致；
+- Codex `bypass` 的实际启动参数必须是
   `--dangerously-bypass-approvals-and-sandbox`；
-- Claude YOLO 的实际启动参数必须是
+- Claude `bypass` 的实际启动参数必须是
   `--dangerously-skip-permissions`；
-- YOLO 开启时，即使 binding 仍保留普通 permission 字段，实际启动不得再
-  传递冲突的 `--sandbox`、`--ask-for-approval` 或 `--permission-mode`；
+- `bypass` 开启时不得再传递冲突的 `--sandbox`、`--ask-for-approval` 或
+  `--permission-mode`；
 - 全局 Worker 缺失或不一致时停止，不得先启动 Session 再补配置。
 
-权限边界负向测试不要混入这个无提示主路径。需要验证 read-only sandbox、
-Claude `dontAsk` allow/deny 规则或审批页面时，使用另一个隔离 `YUI_HOME`，
-清除对应 Role 的 YOLO 后单独执行，并在报告中标记为
-permission-boundary run。
+原生权限配置测试不要混入这个无提示主路径。需要验证 Codex read-only sandbox
+或 Claude `dontAsk` allow/deny 规则时，使用另一个隔离 `YUI_HOME`，选择
+`permission.strategy=configured`，并分别核对 provider 权限与 Yui access。
 
 ## 3. 当前产品边界
 
@@ -234,19 +233,20 @@ Project 时，只能由 active Leader 使用 `task project add` 追加。Yui 不
 Task main 是一个包含全部 Project peer directory 的逻辑根。WorkItem 可以读取
 全部 Task Project，但只允许修改其重复 `--project` 声明的写入范围；受管派发
 和 `yui-worker` Skill 必须清楚列出可写与仅上下文 Project。原生 Agent 权限是
-会话级而不是逐 Project 的；实现会话可写，reviewer 会话使用带最小 allow list
-的 Claude `dontAsk` 或 Codex `read-only`。写入范围只能扩大。
-Claude reviewer 的会话配置只预批准 `Read`、`Grep`、`Glob` 和
-`Bash(yui task run yield *)`：其余非只读工具直接拒绝，同时审查仍可完成 Yui
-控制面交接。yield 必须直接执行一次，不能包进 shell 循环或复合命令；不得启用
-编辑工具、切到 YOLO，或依赖需要在线分类器的权限模式。
+会话级而不是逐 Project 的；所有受管 binding 默认使用 provider bypass，但
+实现会话仍只写 WorkItem scope，reviewer 会话仍只写 exact
+ReviewRound-owned workspace。
+Review 权限来自 frozen Candidate SHA、purpose、reviewRoundId 与 workspace owner
+的联合校验，并且必须回读真实启动参数。Codex/Claude 都必须直接执行一次 exact
+`--summary-file -` yield，不能包进 shell 循环或复合命令；Skill 禁止 push、
+Integration、Task state、其他 workspace 与真实 YUI_HOME 变更。
 `capture` 对每个实际修改的 Project 生成独立 ChangeSet，integration 保持
 单 Project 事务，所有修改 Project 的最新候选都已集成后才能 accept。
 
-Leader 根据工作语义选择 Profile：只读调查和评审使用 read-only Profile，
-修改代码或外部状态使用 `implementer`。reviewer Role 不承担实现 WorkItem，
-也不复用写权限会话；完整 E2E 必须回读 reviewer 的原生只读权限，并验证它仍然
-遵守只读 Profile、Skill 和 WorkItem 边界。
+Leader 根据工作语义选择 Profile：只读调查使用 `explorer`，正常实现使用
+`implementer`，评审仅使用单一 `reviewer` Profile 与独立 ReviewRound
+worktree。reviewer 不承担实现 WorkItem，也不复用 Worker Session；完整 E2E
+必须回读 Codex/Claude full-capability argv，并验证修改只发生在 Review workspace。
 
 Task Role Worker yield 只提交结果，不能完成 WorkItem。代码结果必须经过：
 
@@ -592,10 +592,10 @@ Q01-Q08 需要在其他会话改变 Task 状态后，通过 `RESUME`/`STALE` 再
 - Leader 创建或复用兼容 Task Role；
 - Task Role 从全局 Worker 复制完整 runtime binding，Profile 只复制行为约束；
 - 创建回执、`task context`、Role 和 AgentRun 对 runtime 来源及
-  Agent/model/effort/YOLO 的描述一致；
+  Agent/model/effort/permission strategy 的描述一致；
 - AgentRun 快照与实际 dispatch 配置一致；
-- 无提示主路径的 Role 均使用用户确认的 YOLO，且不出现 trust/approval 页面；
-- read-only Profile 即使在 YOLO 下也不修改文件或外部状态；
+- `bypass` Role 不出现工具审批页面；
+- `access=read` 的 Profile 即使 provider 为 bypass 也不修改文件或外部状态；
 - isolate、yield、review、capture、integration、accept、cleanup 顺序成立。
 
 额外覆盖：
@@ -730,8 +730,8 @@ Issue:
 - 每个 WorkItem 有 bounded objective 和可观察 acceptance；
 - 执行路径符合任务约束；
 - 实际 Agent/model 与用户确认及 AgentRun 记录一致；
-- 无提示主路径的权限确认或 workspace trust 阻塞：0；
-- YOLO 主路径中 read-only Profile 产生的文件或外部状态修改：0；
+- `bypass` 主路径中的权限确认阻塞：0；
+- `access=read` Profile 产生的文件或外部状态修改：0；
 - 未经 pre-dispatch 配置核对而启动的 Task Role Run：0；
 - 用户未选择 `CLI default` 时，空 model/effort 的 Task Role Run：0；
 - Leader 临场复述或从 transcript 猜测运行配置的次数：0；
@@ -766,7 +766,7 @@ lifecycle、clarification、execution path、持久事实和 forbidden mutation�
 1. 选择并记录 `E2E_RUN_ROOT`；
 2. 初始化隔离 `YUI_HOME`、外部 workspace 和 fixture，但不启动 Agent Session；
 3. 在隔离 `YUI_HOME` 中完成 setup 并探测 Agent 能力；
-4. 向用户确认本次 Agent/model/effort、权限/YOLO、兼容范围和预算；
+4. 向用户确认本次 Agent/model/effort、permission strategy、兼容范围和预算；
 5. 持久化并回读 Operator、Leader 和全局 Worker Role；
 6. 运行 build、lint 和确定性自动化测试；
 7. 启动第一个 Session，核对 `command -v yui`、`YUI_HOME` 和实际启动参数；

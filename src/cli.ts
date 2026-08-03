@@ -51,6 +51,9 @@ import {
 import { runProjectCommand } from "./commands/projectCommands.js";
 import { runProfileCommand } from "./commands/profileCommands.js";
 import {
+  dispatchPreparedReviewRound,
+  failPendingReviewRound,
+  preserveReviewRoundWorkspace,
   runTaskCommand,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
@@ -70,6 +73,7 @@ import { FileSchedulerStoreAdapter } from "./controller/fileSchedulerStoreAdapte
 import { cleanControllerResource } from "./controller/resourceCleanupLinux.js";
 import { scanControllerResourceInventory } from "./controller/resourceInventoryLinux.js";
 import { runSessionNotifyCommand } from "./controller/sessionNotify.js";
+import { runClaudeLifecycleHookCommand } from "./controller/claudeLifecycleHook.js";
 import { runDoctorCommand } from "./doctor/doctor.js";
 import { agentNotFound, CliError, runtimeError, usageError } from "./errors/cliError.js";
 import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
@@ -77,6 +81,7 @@ import { TaskWorkspaceCoordinator } from "./repository/taskWorkspaceCoordinator.
 import { FileTaskWorkspacePreparer } from "./repository/taskWorkspacePreparer.js";
 import { inspectStorageSchema, requireStorageSchema } from "./storage/storageSchema.js";
 import { FileTaskStore, resolveYuiHome } from "./storage/taskStore.js";
+import { resolveTaskRecordReference } from "./task/taskRecordReference.js";
 import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
 import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
@@ -185,11 +190,15 @@ export async function main(): Promise<void> {
     return;
   }
   if (args[0] === "internal") {
-    if (args[1] !== "session-notify" || args.length !== 3) {
-      throw usageError("Internal session notify usage is invalid.");
+    if (args[1] === "session-notify" && args.length === 3) {
+      await runSessionNotifyCommand(args[2], process.env);
+      return;
     }
-    await runSessionNotifyCommand(args[2], process.env);
-    return;
+    if (args[1] === "claude-hook" && args.length === 2) {
+      await runClaudeLifecycleHookCommand(readFileSync(0, "utf8"), process.env);
+      return;
+    }
+    throw usageError("Internal lifecycle callback usage is invalid.");
   }
 
   if (args[0] === "controller") {
@@ -498,30 +507,39 @@ export async function main(): Promise<void> {
     if (resolved[1] === "work" && resolved[2] === "isolate") {
       const workItemId = resolved[3];
       if (workItemId === undefined || resolved.length !== 4) {
-        throw usageError("Task work isolate usage: yui task work isolate <work>.");
+        throw usageError("Task work isolate usage: yui task work isolate <task>/<work>.");
       }
-      const workspace = await workspaceCoordinator.isolateWorkItem(workItemId);
+      const reference = cliWorkItemReference(workItemId, process.env);
+      const workspace = await workspaceCoordinator.isolateWorkItem(
+        reference.taskId,
+        reference.localId
+      );
       emit(
-        `Created WorkItem workspace for ${workItemId}\nWorkspace: ${workspace.root}\n`,
+        `Created WorkItem workspace for ${reference.taskId}/${reference.localId}\nWorkspace: ${workspace.root}\n`,
         false,
-        { workItemId, workspace }
+        { workItemRef: reference, workspace }
       );
       return;
     }
     if (resolved[1] === "work" && resolved[2] === "capture") {
       const workItemId = resolved[3];
       if (workItemId === undefined || resolved.length !== 4) {
-        throw usageError("Task work capture usage: yui task work capture <work>.");
+        throw usageError("Task work capture usage: yui task work capture <task>/<work>.");
       }
-      const changeSets = await new WorkItemChangeSetManager(store).capture(workItemId);
+      const reference = cliWorkItemReference(workItemId, process.env);
+      const changeSets = await new WorkItemChangeSetManager(store).capture(
+        reference.taskId,
+        reference.localId
+      );
+      const qualified = `${reference.taskId}/${reference.localId}`;
       emit(
         changeSets.length === 0
-          ? `WorkItem workspace has no changes to capture: ${workItemId}\n`
+          ? `WorkItem workspace has no changes to capture: ${qualified}\n`
           : `Captured ChangeSets ${changeSets.map(({ id }) => id).join(", ")} from ${
-              workItemId
+              qualified
             }\n`,
         false,
-        { workItemId, changeSets }
+        { workItemRef: reference, changeSets }
       );
       return;
     }
@@ -531,28 +549,85 @@ export async function main(): Promise<void> {
       if (workItemId === undefined
         || !["--integrated", "--abandon"].includes(disposition ?? "")
         || resolved.length !== 5) {
-        throw usageError("Task work cleanup usage: yui task work cleanup <work> (--integrated|--abandon).");
+        throw usageError("Task work cleanup usage: yui task work cleanup <task>/<work> (--integrated|--abandon).");
       }
       const cleanedAs = disposition === "--integrated" ? "integrated" : "abandoned";
+      const reference = cliWorkItemReference(workItemId, process.env);
+      const qualified = `${reference.taskId}/${reference.localId}`;
       if (cleanedAs === "integrated") {
         try {
-          await new WorkItemChangeSetManager(store).assertIntegrated(workItemId);
+          await new WorkItemChangeSetManager(store).assertIntegrated(
+            reference.taskId,
+            reference.localId
+          );
         } catch (error) {
           throw usageError(error instanceof Error ? error.message : String(error));
         }
       }
-      const removal = await workspaceCoordinator.cleanupWorkItem(workItemId, cleanedAs);
+      const removal = await workspaceCoordinator.cleanupWorkItem(
+        reference.taskId,
+        reference.localId,
+        cleanedAs
+      );
       if (removal === "dirty") {
-        throw usageError(`WorkItem worktree is dirty and was retained: ${workItemId}.`);
+        throw usageError(`WorkItem worktree is dirty and was retained: ${qualified}.`);
       }
       emit(
-        `Cleaned WorkItem worktree ${workItemId} (${cleanedAs})\n`,
+        `Cleaned WorkItem worktree ${qualified} (${cleanedAs})\n`,
         false,
         {
-          workItem: store.findWorkItem(workItemId),
+          workItem: store.getWorkItem(reference.taskId, reference.localId),
           worktree: { removal, disposition: cleanedAs }
         }
       );
+      return;
+    }
+    if (resolved[1] === "work" && resolved[2] === "review"
+      && resolved[3] === "cleanup") {
+      const reviewRef = resolved[4];
+      if (reviewRef === undefined || resolved.length !== 5) {
+        throw usageError(
+          "Task work review cleanup usage: yui task work review cleanup <task>/<review-round>."
+        );
+      }
+      const reference = cliTaskRecordReference(reviewRef, "reviewRound", process.env);
+      const removal = await workspaceCoordinator.cleanupReviewRound(
+        reference.taskId,
+        reference.localId
+      );
+      if (removal === "dirty") {
+        throw usageError(
+          `ReviewRound worktree is dirty and was retained: ${reference.taskId}/${reference.localId}.`
+        );
+      }
+      emit(
+        `Cleaned ReviewRound worktree ${reference.taskId}/${reference.localId}\n`,
+        false,
+        {
+          reviewRound: store.getReviewRound(reference.taskId, reference.localId),
+          worktree: { removal }
+        }
+      );
+      return;
+    }
+    if (resolved[1] === "work" && resolved[2] === "review"
+      && resolved[3] === "preserve") {
+      const reviewRef = resolved[4];
+      if (reviewRef === undefined || resolved.length !== 5) {
+        throw usageError(
+          "Task work review preserve usage: yui task work review preserve <task>/<review-round>."
+        );
+      }
+      const reference = cliTaskRecordReference(reviewRef, "reviewRound", process.env);
+      const round = preserveReviewRoundWorkspace(
+        reference.taskId,
+        reference.localId,
+        store,
+        { runtime, environment: process.env, yuiHome: home }
+      );
+      emit(`Preserved ReviewRound worktree ${reference.taskId}/${reference.localId}\n`, false, {
+        reviewRound: round
+      });
       return;
     }
     if (resolved[1] === "archive") {
@@ -573,18 +648,46 @@ export async function main(): Promise<void> {
         }
       }
     }
+    let taskRetirementProof;
+    if (resolved[1] === "retire") {
+      const taskId = resolved[2];
+      if (taskId !== undefined && !taskId.startsWith("--")) {
+        const task = store.getTask(taskId);
+        if (task?.status === "active" || task?.status === "draft") {
+          try {
+            taskRetirementProof = await new WorkItemChangeSetManager(store)
+              .assertRetirable(taskId);
+          } catch (error) {
+            throw usageError(error instanceof Error ? error.message : String(error));
+          }
+        }
+      }
+    }
     let workItemIntegrationProof;
     if (resolved[1] === "work" && resolved[2] === "accept") {
       const workItemId = resolved[3];
       if (workItemId !== undefined && !workItemId.startsWith("--")) {
         try {
+          const reference = cliWorkItemReference(workItemId, process.env);
           workItemIntegrationProof = await new WorkItemChangeSetManager(store)
-            .assertIntegrated(workItemId) ?? undefined;
+            .assertIntegrated(reference.taskId, reference.localId) ?? undefined;
         } catch (error) {
           throw usageError(error instanceof Error ? error.message : String(error));
         }
       }
     }
+    const candidateGitSnapshot = await candidateSnapshotForTaskCommand(
+      resolved,
+      store,
+      workspacePreparer,
+      process.env
+    );
+    const reviewWorkspaceResult = await reviewWorkspaceResultForTaskCommand(
+      resolved,
+      store,
+      workspacePreparer,
+      process.env
+    );
     const result = runTaskCommand(
       resolved.slice(1),
       store,
@@ -592,10 +695,47 @@ export async function main(): Promise<void> {
         runtime,
         environment: process.env,
         yuiHome: home,
-        ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof })
+        ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
+        ...(candidateGitSnapshot === undefined ? {} : { candidateGitSnapshot }),
+        ...(reviewWorkspaceResult === undefined ? {} : { reviewWorkspaceResult }),
+        ...(taskRetirementProof === undefined ? {} : { taskRetirementProof })
       }
     );
     if (result.kind === "output") {
+      const requestedRound = reviewRoundFromCommandData(result.data);
+      let reviewOutput = "";
+      let reviewData: unknown;
+      if (requestedRound?.status === "pending") {
+        try {
+          const workspace = await workspacePreparer.prepareReviewRoundWorkspace(
+            requestedRound.taskId,
+            requestedRound.id
+          );
+          const run = dispatchPreparedReviewRound(
+            requestedRound.taskId,
+            requestedRound.id,
+            store,
+            { runtime, environment: process.env, yuiHome: home }
+          );
+          reviewOutput = `Review queued as ${requestedRound.id} (${run.id})\n`;
+          reviewData = {
+            reviewRound: store.getReviewRound(requestedRound.taskId, requestedRound.id),
+            reviewRun: run,
+            workspace
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const failed = failPendingReviewRound(
+            requestedRound.taskId,
+            requestedRound.id,
+            message,
+            store,
+            { runtime, environment: process.env, yuiHome: home }
+          );
+          reviewOutput = `Review could not start: ${message}\n`;
+          reviewData = { reviewRound: failed };
+        }
+      }
       if (resolved[1] === "create") {
         const created = result.data as {
           task?: { id?: string; projectBindings?: readonly unknown[] }
@@ -630,7 +770,9 @@ export async function main(): Promise<void> {
           }
         }
       }
-      emit(result.output, false, result.data);
+      emit(`${result.output}${reviewOutput}`, false, reviewData === undefined
+        ? result.data
+        : { command: result.data, ...reviewData as object });
       return;
     }
     await runtime.prepareTaskRoleEnter({
@@ -652,6 +794,105 @@ export async function main(): Promise<void> {
   );
 }
 
+function cliWorkItemReference(
+  value: string,
+  environment: NodeJS.ProcessEnv
+) {
+  try {
+    return resolveTaskRecordReference(value, {
+      kind: "workItem",
+      label: "Work Item reference",
+      ...(environment.YUI_TASK_ID === undefined
+        ? {}
+        : { contextTaskId: environment.YUI_TASK_ID })
+    });
+  } catch (error) {
+    throw usageError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function cliTaskRecordReference(
+  value: string,
+  kind: "agentRun" | "reviewRound",
+  environment: NodeJS.ProcessEnv
+) {
+  try {
+    return resolveTaskRecordReference(value, {
+      kind,
+      label: kind === "agentRun" ? "Agent Run reference" : "ReviewRound reference",
+      ...(environment.YUI_TASK_ID === undefined
+        ? {}
+        : { contextTaskId: environment.YUI_TASK_ID })
+    });
+  } catch (error) {
+    throw usageError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function candidateSnapshotForTaskCommand(
+  args: readonly string[],
+  store: FileTaskStore,
+  preparer: FileTaskWorkspacePreparer,
+  environment: NodeJS.ProcessEnv
+) {
+  if (args[0] !== "task" || store.getReviewConfig() === null) return undefined;
+  if (args[1] === "run" && args[2] === "yield" && args[3] !== undefined) {
+    const reference = cliTaskRecordReference(args[3], "agentRun", environment);
+    const run = store.getAgentRun(reference.taskId, reference.localId);
+    if (run === null || run.purpose !== "execution" || run.workItemId === undefined) {
+      return undefined;
+    }
+    if (run.workspace === undefined) {
+      throw usageError(`Reviewable Run has no managed Candidate workspace: ${run.id}.`);
+    }
+    return preparer.snapshotCandidateWorkspace(run.workspace);
+  }
+  if (args[1] === "work" && args[2] === "update"
+    && args[3] !== undefined && args[4] === "done") {
+    const reference = cliWorkItemReference(args[3], environment);
+    const workspace = store.getRoleWorkspace(reference.taskId, "leader");
+    if (workspace === null) {
+      throw usageError(
+        `Reviewable direct WorkItem has no managed Candidate workspace: ${reference.localId}.`
+      );
+    }
+    return preparer.snapshotCandidateWorkspace(workspace);
+  }
+  return undefined;
+}
+
+async function reviewWorkspaceResultForTaskCommand(
+  args: readonly string[],
+  store: FileTaskStore,
+  preparer: FileTaskWorkspacePreparer,
+  environment: NodeJS.ProcessEnv
+) {
+  if (args[0] !== "task" || args[1] !== "run" || args[2] !== "yield"
+    || args[3] === undefined) return undefined;
+  const reference = cliTaskRecordReference(args[3], "agentRun", environment);
+  const run = store.getAgentRun(reference.taskId, reference.localId);
+  if (run === null || run.purpose !== "review" || run.reviewRoundId === undefined) {
+    return undefined;
+  }
+  return preparer.snapshotReviewRoundResult(reference.taskId, run.reviewRoundId);
+}
+
+function reviewRoundFromCommandData(data: unknown): Readonly<{
+  id: string;
+  taskId: string;
+  status: string;
+}> | undefined {
+  if (typeof data !== "object" || data === null || !("reviewRound" in data)) return undefined;
+  const round = (data as { reviewRound?: unknown }).reviewRound;
+  if (typeof round !== "object" || round === null) return undefined;
+  const value = round as { id?: unknown; taskId?: unknown; status?: unknown };
+  return typeof value.id === "string"
+    && typeof value.taskId === "string"
+    && typeof value.status === "string"
+    ? { id: value.id, taskId: value.taskId, status: value.status }
+    : undefined;
+}
+
 async function executeOperatorSessionControl(
   control: OperatorSessionControl,
   home: string,
@@ -667,7 +908,7 @@ async function executeOperatorSessionControl(
   const role = store.getGlobalRole("operator");
   if (role === null) throw usageError("Operator is not configured. Run yui setup first.");
   const sessionSet = store.getGlobalRoleSessionSet(role.name);
-  const active = sessionSet?.sessions[role.activeAgentId];
+  const active = sessionSet?.sessions[sessionSet.activeAgentId];
   const paneRunning = tmux.detectRoleStatus("operator", "operator") === "running";
   if (paneRunning && active === undefined) {
     throw usageError(
@@ -678,7 +919,7 @@ async function executeOperatorSessionControl(
   if (
     control.action === "resume"
     && paneRunning
-    && control.targetAgentId === role.activeAgentId
+    && control.targetAgentId === active?.agentId
     && active !== undefined
     && operatorSessionRef(active) === control.ref
   ) {

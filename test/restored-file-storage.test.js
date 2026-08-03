@@ -20,10 +20,39 @@ function temporaryHome() {
   return mkdtempSync(join(tmpdir(), "yui-file-store-"));
 }
 
-test("storage schema initializes layout v6 with aggregate v10 and rejects non-current versions", () => {
+function readEffective(agentId, adapterId, workspace) {
+  return {
+    schemaVersion: 2,
+    sourceDesiredRevision: 1,
+    agentId,
+    adapterId,
+    profileAccess: "read",
+    search: false,
+    permission: adapterId === "codex"
+      ? { strategy: "configured", sandbox: "read-only", approval: "never" }
+      : {
+          strategy: "configured",
+          mode: "dontAsk",
+          allowedTools: [
+            "Read", "Grep", "Glob",
+            "Bash(yui --json task context *)",
+            "Bash(yui --json task work show *)",
+            "Bash(yui --json task work list *)",
+            "Bash(git diff *)", "Bash(git status *)", "Bash(git show *)",
+            "Bash(git log *)", "Bash(yui task run yield *)"
+          ],
+          disallowedTools: ["Edit", "Write", "NotebookEdit"]
+        },
+    ...(adapterId === "claude" ? { settingsSources: [] } : {}),
+    writeProjectIds: [],
+    workspace: { root: workspace, entries: [] },
+    context: {}
+  };
+}
+test("storage schema initializes layout v6 with aggregate v14 and rejects non-current versions", () => {
   const home = temporaryHome();
   assert.equal(CURRENT_STORAGE_LAYOUT_VERSION, 6);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 10);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 14);
   assert.equal(inspectStorageSchema(home).status, "uninitialized");
 
   ensureStorageSchema(home, new Date("2026-07-19T00:00:00.000Z"));
@@ -66,7 +95,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     updatedAt: timestamp
   };
   const task = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: "task-1",
     title: "Restore storage",
     projectBindings: [],
@@ -75,10 +104,18 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     updatedAt: timestamp
   };
   const globalRole = {
-    schemaVersion: 2,
+    schemaVersion: 3,
+    launchRevision: 1,
+    defaultAccess: "write",
     name: "operator",
     activeAgentId: "codex",
-    agentBindings: { codex: { agentId: "codex", adapterId: "codex", config: { adapterId: "codex" } } },
+    agentBindings: {
+      codex: {
+        agentId: "codex",
+        adapterId: "codex",
+        config: { adapterId: "codex", permission: { strategy: "bypass" } }
+      }
+    },
     workspace: home,
     createdAt: timestamp,
     updatedAt: timestamp
@@ -90,16 +127,17 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     status: "idle"
   };
   const globalSessions = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     owner: { scope: "global", roleName: "operator" },
     activeAgentId: "codex",
     sessions: {
       codex: {
-        schemaVersion: 2,
+        schemaVersion: 3,
         agentId: "codex",
         adapterId: "codex",
         nativeSessionId: "global-session",
         policy: "fixed",
+        effective: readEffective("codex", "codex", home),
         status: "ready",
         recentCompletedTurnIds: [],
         createdAt: timestamp,
@@ -118,8 +156,8 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     }
   };
   const item = {
-    schemaVersion: 5,
-    id: "work-1",
+    schemaVersion: 6,
+    id: "work-item-1",
     taskId: task.id,
     title: "Implement",
     objective: "Implement",
@@ -133,13 +171,14 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     updatedAt: timestamp
   };
   const run = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     id: "agent-run-1",
     taskId: task.id,
     roleName: "leader",
     mode: "new",
     input: "implement",
     purpose: "execution",
+    effective: readEffective("codex", "codex", home),
     workItemId: item.id,
     status: "active",
     createdAt: timestamp,
@@ -185,8 +224,8 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   });
 
   const onDisk = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
-  assert.equal(onDisk.schemaVersion, 10);
-  assert.equal(onDisk.tasks[task.id].schemaVersion, 9);
+  assert.equal(onDisk.schemaVersion, 14);
+  assert.equal(onDisk.tasks[task.id].schemaVersion, 13);
   assert.equal(onDisk.revision, 1);
   assert.deepEqual(store.getConfiguredAgent("codex"), agent);
   assert.deepEqual(store.getGlobalRole("operator"), globalRole);
@@ -207,7 +246,11 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     activeAgentId: "claude",
     agentBindings: {
       ...globalRole.agentBindings,
-      claude: { agentId: "claude", adapterId: "claude", config: { adapterId: "claude" } }
+      claude: {
+        agentId: "claude",
+        adapterId: "claude",
+        config: { adapterId: "claude", permission: { strategy: "bypass" } }
+      }
     }
   };
   const switchedGlobalSessions = { ...globalSessions, activeAgentId: "claude" };
@@ -223,7 +266,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify(incompatible));
   assert.throws(
     () => new FileTaskStore(home).listTasks(),
-    /Task aggregate task-1 must use schemaVersion 9/
+    /Task aggregate task-1 must use schemaVersion 13/
   );
 });
 
@@ -233,7 +276,7 @@ test("FileTaskStore persists strict task, role, and operator WorkMailboxes", () 
   const store = new FileTaskStore(home);
   const timestamp = "2026-07-22T00:00:00.000Z";
   const task = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: "task-1",
     title: "Mailbox storage",
     projectBindings: [],
@@ -242,13 +285,19 @@ test("FileTaskStore persists strict task, role, and operator WorkMailboxes", () 
     updatedAt: timestamp
   };
   const role = {
-    schemaVersion: 2,
+    schemaVersion: 3,
+    launchRevision: 1,
+    defaultAccess: "write",
     name: "leader",
     taskId: task.id,
     status: "idle",
     activeAgentId: "codex",
     agentBindings: {
-      codex: { agentId: "codex", adapterId: "codex", config: { adapterId: "codex" } }
+      codex: {
+        agentId: "codex",
+        adapterId: "codex",
+        config: { adapterId: "codex", permission: { strategy: "bypass" } }
+      }
     },
     workspace: home,
     createdAt: timestamp,
@@ -352,7 +401,7 @@ test("FileTaskStore rejects mailbox identity and dangling cross-references", () 
   const store = new FileTaskStore(home);
   const timestamp = "2026-07-22T00:00:00.000Z";
   store.saveTask({
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: "task-1",
     title: "Mailbox validation",
     projectBindings: [],
@@ -371,7 +420,7 @@ test("FileTaskStore rejects mailbox identity and dangling cross-references", () 
       fromSequence: 1,
       toSequence: 1,
       reasons: ["changed"],
-      refs: [{ type: "run", id: "missing-run" }],
+      refs: [{ type: "run", taskId: "task-1", id: "agent-run-99" }],
       requestCount: 1,
       firstQueuedAt: timestamp,
       lastQueuedAt: timestamp
@@ -382,7 +431,7 @@ test("FileTaskStore rejects mailbox identity and dangling cross-references", () 
 
   state.mailboxes = { "task/task-1": state.mailboxes["task/wrong-key"] };
   writeFileSync(statePath, JSON.stringify(state));
-  assert.throws(() => new FileTaskStore(home).listTasks(), /mailbox reference.*missing-run/i);
+  assert.throws(() => new FileTaskStore(home).listTasks(), /mailbox reference.*agent-run-99/i);
 });
 
 test("FileTaskStore keeps legacy config valid and validates recovery and timezone settings", () => {
@@ -417,11 +466,11 @@ test("record versions and aggregate shape are validated without silently repairi
   const store = new FileTaskStore(home);
   assert.throws(
     () => store.saveTask({ schemaVersion: 1, id: "task-1" }),
-    /Task.*schemaVersion 2/
+    /Task.*schemaVersion 3/
   );
   assert.throws(
     () => store.saveTask({
-      schemaVersion: 2,
+      schemaVersion: 3,
       id: "task-invalid",
       title: "Invalid completion",
       projectBindings: [],
@@ -434,7 +483,7 @@ test("record versions and aggregate shape are validated without silently repairi
 
   const timestamp = "2026-07-19T00:00:00.000Z";
   const task = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: "task-1",
     title: "Validate WorkItem cleanup",
     projectBindings: [],
@@ -443,8 +492,8 @@ test("record versions and aggregate shape are validated without silently repairi
     updatedAt: timestamp
   };
   const item = {
-    schemaVersion: 5,
-    id: "work-1",
+    schemaVersion: 6,
+    id: "work-item-1",
     taskId: task.id,
     title: "Implement",
     objective: "Implement",
@@ -469,7 +518,7 @@ test("record versions and aggregate shape are validated without silently repairi
   );
 
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify({
-    schemaVersion: 10,
+    schemaVersion: 14,
     revision: 1,
     config: { schemaVersion: 1 },
     configuredAgents: {},

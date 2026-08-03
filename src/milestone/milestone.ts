@@ -1,3 +1,5 @@
+import { validateTaskRecordReference } from "../task/taskRecordReference.js";
+
 export type Milestone = {
   schemaVersion: 1;
   id: string;
@@ -17,7 +19,7 @@ export function createMilestone(
 ): Milestone {
   return {
     schemaVersion: 1,
-    id: requireSafeIdentity(id, "Milestone id"),
+    id: validateTaskRecordReference({ taskId, localId: id }, "milestone").localId,
     taskId: requireSafeIdentity(taskId, "Task id"),
     title: requireText(title, "Milestone title"),
     summary: requireText(summary, "Milestone summary"),

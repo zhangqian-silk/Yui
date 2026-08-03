@@ -2,6 +2,7 @@ import {
   completeProcessing,
   createWorkMailbox,
   enqueueSignal,
+  mailboxEntityRefKey,
   type MailboxEntityRef,
   type MailboxTarget,
   type WorkMailbox
@@ -42,8 +43,8 @@ export function completeWorkExecution(
     mailbox === null
     || processing === undefined
     || processing === null
-    || processing.executionRef?.type !== executionRef.type
-    || processing.executionRef.id !== executionRef.id
+    || processing.executionRef === undefined
+    || mailboxEntityRefKey(processing.executionRef) !== mailboxEntityRefKey(executionRef)
   ) {
     return false;
   }
@@ -82,6 +83,36 @@ export function requireCompleteWorkExecution(
     `Work mailbox execution mismatch for ${targetLabel(target)}: `
     + `${executionRef.type}/${executionRef.id}.`
   );
+}
+
+/**
+ * Settles the exact Run delivery boundary, including the short window before
+ * the scheduler has claimed its single pending dispatch. A merged pending
+ * batch is never discarded because its signal-to-ref mapping is no longer
+ * recoverable.
+ */
+export function settleExactWorkExecution(
+  store: WorkMailboxQueueStore,
+  target: MailboxTarget,
+  executionRef: MailboxEntityRef
+): "processing" | "pending" | "absent" {
+  if (completeWorkExecution(store, target, executionRef)) return "processing";
+  const mailbox = store.getWorkMailbox(target);
+  if (mailbox === null) return "absent";
+  const pending = mailbox.pending;
+  if (pending === null) return "absent";
+  const matches = pending.refs.some(
+    (ref) => ref.type === executionRef.type && ref.id === executionRef.id
+  );
+  if (!matches) return "absent";
+  if (pending.requestCount !== 1) {
+    throw new Error(
+      `Cannot settle a merged pending mailbox batch for ${targetLabel(target)}: `
+      + `${executionRef.type}/${executionRef.id}.`
+    );
+  }
+  store.saveWorkMailbox({ ...mailbox, pending: null });
+  return "pending";
 }
 
 function timestamp(value: Date | string): string {

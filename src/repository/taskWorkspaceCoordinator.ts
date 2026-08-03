@@ -24,9 +24,9 @@ export class TaskWorkspaceCoordinator {
     readonly runtime: TaskRoleRuntimeStopper
   ) {}
 
-  async isolateWorkItem(workItemId: string) {
-    const item = this.store.findWorkItem(workItemId);
-    if (item === null) throw new Error(`Work item not found: ${workItemId}.`);
+  async isolateWorkItem(taskId: string, workItemId: string) {
+    const item = this.store.getWorkItem(taskId, workItemId);
+    if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
     const assignee = this.#workItemIsolationAssignee(item);
     const task = this.store.getTask(item.taskId)!;
     const taskProjectIds = task.projectBindings.map(({ projectId }) => projectId);
@@ -52,15 +52,16 @@ export class TaskWorkspaceCoordinator {
       }
     }
     await this.#stopLiveRoles(item.taskId, [assignee]);
-    return this.preparer.prepareWorkItemWorkspace(workItemId);
+    return this.preparer.prepareWorkItemWorkspace(item.taskId, item.id);
   }
 
   async cleanupWorkItem(
+    taskId: string,
     workItemId: string,
     disposition: WorkItemWorkspaceDisposition
   ): Promise<GitWorkspaceRemoval> {
-    const item = this.store.findWorkItem(workItemId);
-    if (item === null) throw new Error(`Work item not found: ${workItemId}.`);
+    const item = this.store.getWorkItem(taskId, workItemId);
+    if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
     if (!isTerminalWorkItem(item)) {
       throw new Error(`Work item must be terminal before cleanup: ${item.id}.`);
     }
@@ -73,10 +74,25 @@ export class TaskWorkspaceCoordinator {
         `Work item workspace is already recorded as ${item.workspaceDisposition}.`
       );
     }
-    const state = await this.preparer.inspectWorkItemWorkspace(item.id);
+    const state = await this.preparer.inspectWorkItemWorkspace(item.taskId, item.id);
     if (state === "dirty") return "dirty";
     await this.#stopLiveRoles(item.taskId, [item.assignee]);
-    return this.preparer.cleanupWorkItemWorkspace(item.id, disposition);
+    return this.preparer.cleanupWorkItemWorkspace(item.taskId, item.id, disposition);
+  }
+
+  async cleanupReviewRound(
+    taskId: string,
+    reviewRoundId: string
+  ): Promise<GitWorkspaceRemoval> {
+    const round = this.store.getReviewRound(taskId, reviewRoundId);
+    if (round === null) throw new Error(`ReviewRound not found: ${taskId}/${reviewRoundId}.`);
+    if (round.status !== "completed" && round.status !== "failed") {
+      throw new Error(`ReviewRound must be terminal before cleanup: ${round.id}.`);
+    }
+    const state = await this.preparer.inspectReviewRoundWorkspace(taskId, reviewRoundId);
+    if (state === "dirty") return "dirty";
+    await this.#stopLiveRoles(taskId, [round.reviewerRoleName]);
+    return this.preparer.cleanupReviewRoundWorkspace(taskId, reviewRoundId);
   }
 
   async cleanupTaskForArchive(taskId: string): Promise<TaskWorkspaceCleanup> {
@@ -165,5 +181,5 @@ function sameProjectScope(
 }
 
 function isTerminalWorkItem(item: WorkItem): boolean {
-  return ["completed", "failed", "cancelled", "superseded"].includes(item.status);
+  return ["completed", "failed", "retired"].includes(item.status);
 }
