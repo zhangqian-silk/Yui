@@ -292,7 +292,8 @@ function taskCard(task, hasAttention, state, t, locale, onSelect) {
 }
 
 function metricTile(label, value, options) {
-  const tile = node("article", "metric" + (options && options.hot ? " is-hot" : ""));
+  const variant = options && options.hot ? " is-hot" : options && options.warning ? " is-warning" : "";
+  const tile = node("article", "metric" + variant);
   const labelWrap = node("div", "metric-label-wrap");
   labelWrap.append(node("span", "metric-label", label));
   if (options && options.sub) labelWrap.append(node("span", "metric-sub", options.sub));
@@ -309,7 +310,7 @@ export function renderOverview(detail, state, t, locale, onSelect) {
   const rail = node("div", "command-rail");
   rail.append(
     metricTile(t("metrics.active"), counts ? counts.active : "—", { hot: true }),
-    metricTile(t("metrics.inputs"), counts ? counts.openInputs : "—", {}),
+    metricTile(t("metrics.inputs"), counts ? counts.openInputs : "—", { warning: true }),
     metricTile(t("metrics.completed"), counts ? counts.completed : "—", {}),
     metricTile(t("metrics.total"), total, {})
   );
