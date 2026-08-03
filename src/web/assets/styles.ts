@@ -239,7 +239,7 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .inbox-dot{width:8px;height:8px;flex:none;border-radius:50%;background:var(--warning);box-shadow:0 0 8px var(--warning)}
 .inbox-head{display:flex;align-items:center;gap:9px;min-width:0}
 .inbox-task{font-family:var(--font-mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.inbox-question{grid-column:1;grid-row:2;font-family:var(--font-body);font-size:14px;font-weight:600;line-height:1.4;color:var(--text);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.inbox-question{grid-column:1;grid-row:2;font-family:var(--font-body);font-size:13px;font-weight:600;line-height:1.4;color:var(--text);min-width:0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .inbox-foot{grid-column:2;grid-row:1 / span 2;display:flex;flex-direction:column;align-items:flex-end;justify-content:center;gap:4px;flex:none}
 .inbox-foot time{color:var(--muted);font-size:10.5px;font-family:var(--font-mono);letter-spacing:.03em}
 .inbox-go{color:var(--warning);font-size:11.5px;font-weight:600;font-family:var(--font-body)}
