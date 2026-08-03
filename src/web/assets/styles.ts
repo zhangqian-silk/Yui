@@ -294,7 +294,7 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .record-pills{display:flex;gap:6px;flex-wrap:wrap;flex:none}
 .record-meta{display:flex;gap:10px 16px;flex-wrap:wrap;color:var(--muted);font-family:var(--font-body);font-size:11px}
 .record-meta .mono{font-family:var(--font-mono);color:var(--faint);font-size:10px}
-.record-meta time{color:var(--faint)}
+.record-meta time{color:var(--muted)}
 .record-cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:13px}
 .record-block{display:grid;gap:7px;align-content:start}
 .record-block>small{display:block;color:var(--muted);font-family:var(--font-mono);font-size:8.5px;text-transform:uppercase;letter-spacing:.1em;font-weight:600}
