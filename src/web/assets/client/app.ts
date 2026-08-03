@@ -21,6 +21,7 @@ const elements = {
   filters: document.querySelector("#status-filters"),
   tasks: document.querySelector("#task-list"),
   detail: document.querySelector("#detail"),
+  mainCol: document.querySelector(".main-col"),
   detailBack: document.querySelector("#detail-back"),
   detailTabs: document.querySelector("#detail-tabs"),
   pageTitle: document.querySelector("#page-title"),
@@ -82,7 +83,7 @@ function setDetailActive(active) {
 
 function showOverview() {
   renderOverview(elements.detail, state, i18n.t, i18n.getLocale(), selectTask);
-  elements.detail.scrollTop = 0;
+  elements.mainCol.scrollTop = 0;
 }
 
 function renderCurrentDetail() {
@@ -105,10 +106,10 @@ function renderDynamicContent() {
     renderDynamicContent();
   });
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
-  const preserveScroll = state.detail !== null && elements.detail.scrollTop > 0;
-  const savedScrollTop = elements.detail.scrollTop;
+  const preserveScroll = state.detail !== null && elements.mainCol.scrollTop > 0;
+  const savedScrollTop = elements.mainCol.scrollTop;
   renderCurrentDetail();
-  if (preserveScroll) elements.detail.scrollTop = savedScrollTop;
+  if (preserveScroll) elements.mainCol.scrollTop = savedScrollTop;
   syncTabHighlight();
   updateMetrics();
 }
@@ -117,7 +118,7 @@ function updateActiveTabFromScroll() {
   if (!state.detail || !elements.detailTabs) return;
   const tabs = Array.from(elements.detailTabs.querySelectorAll(".tab"));
   if (!tabs.length) return;
-  const root = elements.detail;
+  const root = elements.mainCol;
   const rootTop = root.getBoundingClientRect().top;
   let activeId = tabs[0].dataset.target;
   let bestTop = -Infinity;
@@ -179,14 +180,14 @@ async function requestJson(path, options) {
 async function loadTaskDetail(taskId, showLoading) {
   if (showLoading) {
     renderLoading(elements.detail, i18n.t, "loading.detail");
-    elements.detail.scrollTop = 0;
+    elements.mainCol.scrollTop = 0;
   }
-  const savedScrollTop = showLoading ? 0 : elements.detail.scrollTop;
+  const savedScrollTop = showLoading ? 0 : elements.mainCol.scrollTop;
   const detail = await requestJson("/api/tasks/" + encodeURIComponent(taskId));
   if (state.selected !== taskId) return;
   state.detail = detail;
   renderCurrentDetail();
-  elements.detail.scrollTop = savedScrollTop;
+  elements.mainCol.scrollTop = savedScrollTop;
   setDetailActive(true);
   syncTabHighlight();
 }
@@ -454,7 +455,7 @@ showOverview();
 // Scroll-spy: keep the detail tab bar in sync with the visible section.
 // Bound once on the scroll container; it reads tabs/sections from the live DOM
 // so it survives detail re-renders.
-elements.detail.addEventListener("scroll", updateActiveTabFromScroll, { passive: true });
+elements.mainCol.addEventListener("scroll", updateActiveTabFromScroll, { passive: true });
 
 refreshDashboard();
 window.setInterval(function () { refreshDashboard({ quiet: true }); }, 5000);

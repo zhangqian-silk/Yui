@@ -192,20 +192,25 @@ function answerSummary(input, t, locale) {
 
 export function renderFilters(container, state, t, onFilter) {
   clear(container);
-  // Single-line status picker: a native select keeps all statuses distinct and
-  // never wraps, in any language, while the sidebar list still groups tasks by
-  // status. Reuses the sidebar's .select-control styling.
-  const select = node("select", "filter-select");
-  select.setAttribute("aria-label", t("filters.label"));
+  // Single-row status chip row: every status is visible at once with its count,
+  // so the user can switch filters without opening a dropdown. The row never
+  // wraps; on narrow widths it scrolls horizontally.
+  const counts = state.counts || {};
+  const row = node("div", "filter-row");
   statuses.forEach(function (status) {
-    const option = node("option", "", translatedStatus(t, "status", status));
-    option.value = status;
-    if (state.filter === status) option.selected = true;
-    select.append(option);
+    const btn = node("button", "filter-chip", translatedStatus(t, "status", status));
+    btn.type = "button";
+    btn.dataset.status = status;
+    if (state.filter === status) btn.classList.add("is-active");
+    const count = status === "all" ? counts.total : counts[status];
+    if (count !== undefined && count !== null) {
+      const badge = node("span", "filter-count", String(count));
+      btn.append(badge);
+    }
+    btn.addEventListener("click", function () { onFilter(status); });
+    row.append(btn);
   });
-  select.value = state.filter;
-  select.addEventListener("change", function () { onFilter(select.value); });
-  container.append(select);
+  container.append(row);
 }
 
 function taskGroupOf(task, attentionIds) {
@@ -294,9 +299,7 @@ function taskCard(task, hasAttention, state, t, locale, onSelect) {
 function metricTile(label, value, options) {
   const variant = options && options.hot ? " is-hot" : options && options.warning ? " is-warning" : "";
   const tile = node("article", "metric" + variant);
-  const labelWrap = node("div", "metric-label-wrap");
-  labelWrap.append(node("span", "metric-label", label));
-  tile.append(labelWrap, node("strong", "metric-value", String(value)));
+  tile.append(node("span", "metric-label", label), node("strong", "metric-value", String(value)));
   return tile;
 }
 
