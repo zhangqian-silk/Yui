@@ -1,5 +1,8 @@
 export const VIEW_SCRIPT = `
-const statuses = ["all", "active", "draft", "completed", "archived"];
+// The status filter is a compact segmented control. It surfaces only the
+// high-frequency views; low-frequency draft/archived tasks still appear under
+// their own groups in the "all" view, so no filter chip is needed for them.
+const statuses = ["all", "active", "completed"];
 
 function node(tagName, className, textContent) {
   const element = document.createElement(tagName);

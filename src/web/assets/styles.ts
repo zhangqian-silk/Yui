@@ -111,7 +111,7 @@ body.terminal-active .app-shell{grid-template-columns:var(--sidebar-w) minmax(0,
 .sidebar-brand{display:flex;gap:10px;align-items:center;flex:none;margin-bottom:14px}
 .brand-text{display:grid;gap:3px;min-width:0;flex:1}
 .sidebar .search{flex:none;margin-bottom:10px}
-.filters{display:flex;gap:6px;flex-wrap:wrap;flex:none;margin-bottom:10px}
+.filters{display:flex;gap:2px;flex:none;margin-bottom:10px;padding:3px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius-pill)}
 .board-caption{flex:none;margin-bottom:8px}
 .task-list{flex:1;min-height:0;overflow-y:auto;display:grid;gap:3px;align-content:start;margin:0 -4px;padding:2px 4px}
 .task-group{display:grid;gap:7px}
@@ -181,9 +181,9 @@ input:focus-visible,select:focus-visible,button:focus-visible,.task:focus-visibl
 .search input:focus{border-color:var(--accent-line);box-shadow:0 0 0 3px var(--accent-soft);outline:none}
 .search kbd{position:absolute;right:11px;top:50%;transform:translateY(-50%);pointer-events:none}
 kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2px;border-radius:5px;padding:1px 6px;font-size:11px;color:var(--muted);font-family:var(--font-mono)}
-.filter{border:1px solid var(--border);background:var(--bg-2);color:var(--muted);font-family:var(--font-mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.09em;padding:5px 10px;border-radius:var(--radius-pill);transition:border-color var(--motion-fast),color var(--motion-fast),background var(--motion-fast)}
-.filter:hover{border-color:var(--border-strong);color:var(--text)}
-.filter[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:var(--on-accent);font-weight:700}
+.filter{flex:1;min-width:0;border:0;background:transparent;color:var(--muted);font-family:var(--font-body);font-size:11.5px;letter-spacing:.01em;padding:6px 8px;border-radius:var(--radius-pill);text-align:center;white-space:nowrap;transition:color var(--motion-fast),background var(--motion-fast)}
+.filter:hover{color:var(--text)}
+.filter[aria-pressed=true]{background:var(--accent);color:var(--on-accent);font-weight:600}
 /* Sidebar task cards */
 .task{display:grid;grid-template-columns:8px minmax(0,1fr) auto;gap:2px 9px;align-items:center;width:100%;text-align:left;padding:7px 10px;border:1px solid transparent;border-radius:var(--radius);background:transparent;color:var(--text);transition:background var(--motion-fast),border-color var(--motion-fast)}
 .task:hover{background:var(--bg-2);border-color:var(--border)}
