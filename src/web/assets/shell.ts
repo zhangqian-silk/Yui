@@ -33,7 +33,6 @@ export const DASHBOARD_HTML = `<!doctype html>
         <kbd>/</kbd>
       </label>
       <div id="status-filters" class="filters" role="group" aria-label="Filter by status" data-i18n-aria-label="filters.label"></div>
-      <div class="board-caption"><span class="eyebrow" data-i18n="board.eyebrow">TASK INDEX</span></div>
       <div id="task-list" class="task-list" aria-label="Tasks" data-i18n-aria-label="board.title" aria-live="polite"><div class="loading" data-i18n="loading.dashboard">Reading local state…</div></div>
       <div class="sidebar-foot">
         <div class="sidebar-controls">
@@ -56,7 +55,6 @@ export const DASHBOARD_HTML = `<!doctype html>
         <button id="operator-terminal" class="operator-open" type="button">
           <span class="operator-key" data-i18n="actions.opKey">Press O to open</span>
           <span class="operator-title" data-i18n="actions.operator">Operator session</span>
-          <span class="operator-hint" data-i18n="actions.operatorHint">Local Codex or Claude CLI</span>
           <span class="operator-shortcuts" aria-hidden="true"><kbd>O</kbd><kbd>↵</kbd></span>
         </button>
       </div>

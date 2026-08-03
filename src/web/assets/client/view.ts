@@ -308,8 +308,7 @@ export function renderOverview(detail, state, t, locale, onSelect) {
   rail.append(
     metricTile(t("metrics.active"), counts ? counts.active : "—", { hot: true }),
     metricTile(t("metrics.inputs"), counts ? counts.openInputs : "—", {}),
-    metricTile(t("metrics.completed"), counts ? counts.completed : "—",
-      { sub: total > 0 ? t("metrics.ofTotal").replace("{total}", String(total)) : "" }),
+    metricTile(t("metrics.completed"), counts ? counts.completed : "—", {}),
     metricTile(t("metrics.total"), total, {})
   );
   wrap.append(rail);
