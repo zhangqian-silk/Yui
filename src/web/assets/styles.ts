@@ -313,7 +313,7 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .record-meta{display:flex;gap:10px 16px;flex-wrap:wrap;color:var(--muted);font-family:var(--font-body);font-size:11px}
 .record-meta .mono{font-family:var(--font-mono);color:var(--faint);font-size:10px}
 .record-meta time{color:var(--muted)}
-.record-cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:13px;align-items:start;grid-auto-flow:dense}
+.record-cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;align-items:start;grid-auto-flow:dense}
 .record-block{display:grid;gap:5px;align-content:start}
 .record-block>small{display:block;color:var(--muted);font-family:var(--font-mono);font-size:8.5px;text-transform:uppercase;letter-spacing:.1em;font-weight:600}
 .record-block p{margin:0;font-family:var(--font-body);font-size:12.5px;line-height:1.6;color:var(--text)}
@@ -357,8 +357,8 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .chip.is-adapter{color:var(--text);font-weight:700}
 .chip.is-active{color:var(--accent);background:var(--accent-soft);border-color:var(--accent-line)}
 .chip-row{display:flex;gap:6px;flex-wrap:wrap}
-.criteria-list{margin:0;padding:0;list-style:none;display:grid;gap:7px}
-.criteria-list li{position:relative;padding-left:16px;font-family:var(--font-body);font-size:12.5px;line-height:1.55;color:var(--muted)}
+.criteria-list{margin:0;padding:0;list-style:none;display:grid;gap:5px}
+.criteria-list li{position:relative;padding-left:16px;font-family:var(--font-body);font-size:12px;line-height:1.45;color:var(--muted)}
 .criteria-list li:before{content:"";position:absolute;left:3px;top:7px;width:5px;height:5px;border-radius:50%;background:var(--accent-line)}
 /* Operator CTA card (sidebar bottom) */
 .operator-open{display:flex;align-items:center;gap:10px;width:100%;text-align:left;padding:7px 11px;background:linear-gradient(150deg,var(--bg-3),var(--bg-2));border:1px solid var(--border-strong);border-radius:var(--radius);box-shadow:var(--shadow-card);transition:border-color var(--motion-fast),box-shadow var(--motion-fast)}
