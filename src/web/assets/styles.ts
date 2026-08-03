@@ -209,7 +209,6 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .command-rail{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:18px}
 .metric{background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow-card);padding:10px 12px;display:flex;align-items:center;justify-content:space-between;gap:12px;position:relative;overflow:hidden;transition:border-color var(--motion-fast),transform var(--motion-fast)}
 .metric:hover{border-color:var(--border-strong);transform:translateY(-2px)}
-.metric-label-wrap{display:flex;flex-direction:column;gap:2px;min-width:0}
 .metric-label{color:var(--muted);font-family:var(--font-mono);font-size:10px;text-transform:uppercase;letter-spacing:.12em;line-height:1.2}
 .metric-value{font-family:var(--font-display);font-weight:700;font-size:24px;line-height:1;letter-spacing:-.02em;font-variant-numeric:tabular-nums;color:var(--text);flex:none}
 .metric.is-hot{border-color:var(--accent-line)}
