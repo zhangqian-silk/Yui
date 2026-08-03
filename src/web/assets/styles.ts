@@ -255,10 +255,10 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .detail-title{margin:0;font-family:var(--font-display);font-weight:600;font-size:clamp(15px,1.3vw,18px);letter-spacing:-.01em;line-height:1.3;color:var(--text)}
 .detail-description{font-family:var(--font-body);color:var(--muted);line-height:1.6;margin:0;max-width:76ch;font-size:14px}
 .detail-meta{display:flex;align-items:center;gap:8px 18px;flex-wrap:wrap;padding-top:3px}
-.detail-meta-item{display:grid;gap:3px;min-width:0}
-.detail-meta-item small{color:var(--muted);font-family:var(--font-mono);font-size:8.5px;text-transform:uppercase;letter-spacing:.1em}
-.detail-meta-item>span{color:var(--text);font-size:12.5px}
-.detail-meta-item>.meta-path{font-family:var(--font-mono);font-size:11px;color:var(--muted);max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
+.detail-meta-item{display:inline-flex;align-items:baseline;gap:5px;min-width:0}
+.detail-meta-item small{color:var(--muted);font-family:var(--font-mono);font-size:8.5px;text-transform:uppercase;letter-spacing:.1em;flex:none}
+.detail-meta-item>span{color:var(--text);font-size:12.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.detail-meta-item>.meta-path{font-family:var(--font-mono);font-size:11px;color:var(--muted);max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .detail-meta-item>.pill{align-self:end}
 /* Pills + dots */
 .pill{display:inline-flex;align-items:center;font-family:var(--font-mono);font-size:9px;text-transform:uppercase;letter-spacing:.07em;padding:3px 10px;border-radius:var(--radius-pill);white-space:nowrap;color:var(--accent);background:var(--accent-soft);border:1px solid var(--accent-line)}
