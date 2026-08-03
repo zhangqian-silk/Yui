@@ -105,17 +105,42 @@ function renderDynamicContent() {
     renderDynamicContent();
   });
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
+  const preserveScroll = state.detail !== null && elements.detail.scrollTop > 0;
+  const savedScrollTop = elements.detail.scrollTop;
   renderCurrentDetail();
+  if (preserveScroll) elements.detail.scrollTop = savedScrollTop;
   syncTabHighlight();
   updateMetrics();
 }
 
-function syncTabHighlight() {
+function updateActiveTabFromScroll() {
   if (!state.detail || !elements.detailTabs) return;
   const tabs = Array.from(elements.detailTabs.querySelectorAll(".tab"));
-  tabs.forEach(function (tab) { tab.classList.remove("is-active"); });
-  const first = tabs[0];
-  if (first) first.classList.add("is-active");
+  if (!tabs.length) return;
+  const root = elements.detail;
+  const rootTop = root.getBoundingClientRect().top;
+  let activeId = tabs[0].dataset.target;
+  let bestTop = -Infinity;
+  tabs.forEach(function (tab) {
+    const id = tab.dataset.target;
+    if (!id) return;
+    const el = root.querySelector("#" + id);
+    if (!el) return;
+    const top = el.getBoundingClientRect().top - rootTop;
+    if (top <= 8 && top > bestTop) {
+      bestTop = top;
+      activeId = id;
+    }
+  });
+  tabs.forEach(function (tab) {
+    tab.classList.toggle("is-active", tab.dataset.target === activeId);
+  });
+}
+
+function syncTabHighlight() {
+  // Compute the active tab from the current scroll position. The module-level
+  // scroll listener keeps it in sync afterwards.
+  updateActiveTabFromScroll();
 }
 
 function showToast(message) {
@@ -156,10 +181,12 @@ async function loadTaskDetail(taskId, showLoading) {
     renderLoading(elements.detail, i18n.t, "loading.detail");
     elements.detail.scrollTop = 0;
   }
+  const savedScrollTop = showLoading ? 0 : elements.detail.scrollTop;
   const detail = await requestJson("/api/tasks/" + encodeURIComponent(taskId));
   if (state.selected !== taskId) return;
   state.detail = detail;
   renderCurrentDetail();
+  elements.detail.scrollTop = savedScrollTop;
   setDetailActive(true);
   syncTabHighlight();
 }
@@ -423,6 +450,12 @@ i18n.subscribe(function () {
   if (!state.selected && elements.pageTitle) elements.pageTitle.textContent = i18n.t("page.title");
 });
 showOverview();
+
+// Scroll-spy: keep the detail tab bar in sync with the visible section.
+// Bound once on the scroll container; it reads tabs/sections from the live DOM
+// so it survives detail re-renders.
+elements.detail.addEventListener("scroll", updateActiveTabFromScroll, { passive: true });
+
 refreshDashboard();
 window.setInterval(function () { refreshDashboard({ quiet: true }); }, 5000);
 `;

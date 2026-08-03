@@ -123,7 +123,7 @@ body.terminal-active .app-shell{grid-template-columns:var(--sidebar-w) minmax(0,
 .topbar{flex:none;display:flex;align-items:center;justify-content:space-between;gap:18px;padding:14px var(--page-space)}
 .topbar-leading{display:flex;align-items:center;gap:14px;min-width:0}
 .breadcrumb{display:flex;align-items:baseline;gap:8px;min-width:0}
-.crumb-current{margin:0;min-width:0;font-family:var(--font-display);font-weight:600;font-size:clamp(20px,2.4vw,28px);letter-spacing:-.02em;line-height:1.1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.crumb-current{margin:0;min-width:0;font-family:var(--font-display);font-weight:600;font-size:clamp(16px,1.7vw,21px);letter-spacing:-.015em;line-height:1.2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .topbar-actions{display:flex;align-items:center;gap:14px;flex:none}
 .clock{display:grid;justify-items:end;gap:4px;text-align:right}
 /* Sticky section navigation, only meaningful while a task is open */
@@ -132,7 +132,7 @@ body.detail-active .detail-tabs{display:flex}
 .tab{flex:none;padding:11px 13px;color:var(--muted);font-family:var(--font-mono);font-size:10px;text-transform:uppercase;letter-spacing:.09em;background:transparent;border:0;border-bottom:2px solid transparent;cursor:pointer;white-space:nowrap;transition:color var(--motion-fast),border-color var(--motion-fast)}
 .tab:hover{color:var(--text)}
 .tab.is-active{color:var(--accent);border-bottom-color:var(--accent)}
-.detail{flex:1;min-height:0;overflow-y:auto;padding:16px var(--page-space) 72px;min-width:0;scroll-behavior:smooth}
+.detail{flex:1;min-height:0;overflow-y:auto;padding:16px var(--page-space) 72px;min-width:0}
 .detail:focus-visible{outline:none}
 .anchor{scroll-margin-top:2px}
 /* Terminal panel */
@@ -247,7 +247,7 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .detail-scaffold{display:grid;gap:0}
 .detail-head{display:grid;gap:9px;padding:10px 0 16px;border-bottom:1px solid var(--border)}
 .detail-kicker{display:inline-flex;width:fit-content;color:var(--accent);font-family:var(--font-mono);font-size:10px;letter-spacing:.12em;background:var(--accent-soft);border:1px solid var(--accent-line);padding:3px 11px;border-radius:var(--radius-pill)}
-.detail-title{margin:0;font-family:var(--font-display);font-weight:600;font-size:clamp(22px,2.9vw,34px);letter-spacing:-.014em;line-height:1.1;color:var(--text)}
+.detail-title{margin:0;font-family:var(--font-display);font-weight:600;font-size:clamp(20px,2.2vw,26px);letter-spacing:-.012em;line-height:1.15;color:var(--text)}
 .detail-description{font-family:var(--font-body);color:var(--muted);line-height:1.6;margin:0;max-width:76ch;font-size:14px}
 .detail-meta{display:flex;align-items:center;gap:8px 18px;flex-wrap:wrap;padding-top:3px}
 .detail-meta-item{display:grid;gap:3px;min-width:0}
