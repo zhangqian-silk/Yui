@@ -7,20 +7,20 @@ import {
   assertReadOnlyAgentArgv,
   effectiveLaunchConfig,
   effectiveLaunchSnapshotsCompatible,
+  legacyEffectiveLaunchSnapshot,
   resolveEffectiveLaunch
 } from "../../dist/executor/effectiveLaunch.js";
 import { createRoleAgentBinding } from "../../dist/role/role.js";
 
 const NOW = new Date("2026-08-02T13:30:00.000Z");
 
-test("Task execution without an explicit WorkItem write scope is native read-only", () => {
+test("a write-capable Task Role keeps unrestricted runtime without source write scope", () => {
   const role = desiredRole("codex", {
     adapterId: "codex",
     model: "gpt-5.6-sol",
     effort: "max",
-    yolo: true,
     search: true,
-    permission: { sandbox: "danger-full-access", approval: "never" }
+    permission: { sandbox: "workspace-write", approval: "on-request" }
   });
   const effective = resolveEffectiveLaunch({
     role,
@@ -29,31 +29,28 @@ test("Task execution without an explicit WorkItem write scope is native read-onl
     workItemWriteProjectIds: []
   });
 
+  assert.equal(effective.schemaVersion, 2);
   assert.equal(effective.access, "read");
-  assert.equal(effective.yolo, false);
-  assert.equal(effective.search, false);
+  assert.equal(effective.executionMode, "unrestricted");
+  assert.equal(effective.yolo, true);
+  assert.equal(effective.search, true);
   assert.deepEqual(effective.writeProjectIds, []);
-  assert.deepEqual(effective.permission, {
-    sandbox: "read-only",
-    approval: "never"
-  });
+  assert.equal(effective.permission, undefined);
   const argv = compileArgv(role, effective);
-  assertReadOnlyAgentArgv(effective, argv);
   assert.deepEqual(argv.slice(2, 6), [
     "--model", "gpt-5.6-sol", "--config", "model_reasoning_effort=\"max\""
   ]);
-  assert.ok(argv.includes("read-only"));
-  assert.ok(argv.includes("never"));
-  assert.equal(argv.includes("--dangerously-bypass-approvals-and-sandbox"), false);
-  assert.equal(argv.includes("--search"), false);
+  assert.equal(argv.includes("--dangerously-bypass-approvals-and-sandbox"), true);
+  assert.equal(argv.includes("--search"), true);
 });
 
-test("a writable workspace alone never grants a non-WorkItem Task Run write access", () => {
-  const role = desiredRole("codex", {
+test("an explicit read-only Profile stays native read-only despite provider bypass settings", () => {
+  const role = { ...desiredRole("codex", {
     adapterId: "codex",
     yolo: true,
+    search: true,
     permission: { sandbox: "danger-full-access", approval: "never" }
-  });
+  }), defaultAccess: "read" };
   const effective = resolveEffectiveLaunch({
     role,
     purpose: "execution",
@@ -61,17 +58,21 @@ test("a writable workspace alone never grants a non-WorkItem Task Run write acce
   });
 
   assert.equal(effective.access, "read");
+  assert.equal(effective.executionMode, "read-only");
   assert.deepEqual(effective.writeProjectIds, []);
   assert.equal(effective.yolo, false);
-  assertReadOnlyAgentArgv(effective, compileArgv(role, effective));
+  assert.equal(effective.search, false);
+  const argv = compileArgv(role, effective);
+  assertReadOnlyAgentArgv(effective, argv);
+  assert.equal(argv.includes("--dangerously-bypass-approvals-and-sandbox"), false);
 });
 
-test("write Profile plus exact WorkItem and workspace scope preserves configured Codex YOLO", () => {
+test("write scope compiles provider-neutral unrestricted execution for Codex", () => {
   const role = desiredRole("codex", {
     adapterId: "codex",
     model: "gpt-5.6-sol",
-    yolo: true,
-    search: true
+    search: true,
+    permission: { sandbox: "workspace-write", approval: "on-request" }
   });
   const effective = resolveEffectiveLaunch({
     role,
@@ -81,7 +82,9 @@ test("write Profile plus exact WorkItem and workspace scope preserves configured
   });
 
   assert.equal(effective.access, "write");
+  assert.equal(effective.executionMode, "unrestricted");
   assert.equal(effective.yolo, true);
+  assert.equal(effective.permission, undefined);
   assert.equal(effective.search, true);
   assert.deepEqual(effective.writeProjectIds, ["project-1"]);
   const argv = compileArgv(role, effective);
@@ -89,13 +92,12 @@ test("write Profile plus exact WorkItem and workspace scope preserves configured
   assert.ok(argv.includes("--search"));
 });
 
-test("Review purpose retains Claude bypass only in its exact ReviewRound workspace", () => {
+test("writable Review compiles provider-neutral unrestricted execution for Claude", () => {
   const role = desiredRole("claude", {
     adapterId: "claude",
     model: "opus",
     effort: "max",
-    yolo: true,
-    permission: { mode: "bypassPermissions" }
+    permission: { mode: "plan", allowedTools: ["Read"] }
   });
   const effective = resolveEffectiveLaunch({
     role,
@@ -106,6 +108,7 @@ test("Review purpose retains Claude bypass only in its exact ReviewRound workspa
   });
 
   assert.equal(effective.access, "write");
+  assert.equal(effective.executionMode, "unrestricted");
   assert.equal(effective.yolo, true);
   assert.equal(effective.permission, undefined);
   assert.equal(effective.reviewRoundId, "review-round-1");
@@ -130,6 +133,7 @@ test("Review purpose retains Codex YOLO in its exact ReviewRound workspace", () 
   });
 
   assert.equal(effective.access, "write");
+  assert.equal(effective.executionMode, "unrestricted");
   assert.equal(effective.yolo, true);
   assert.equal(effective.search, true);
   assert.deepEqual(effective.writeProjectIds, ["project-1"]);
@@ -164,6 +168,22 @@ test("Review purpose fails closed on workspace owner or ReviewRound mismatch", (
   );
 });
 
+test("legacy terminal Review launch records unavailable frozen-base provenance", () => {
+  const effective = legacyEffectiveLaunchSnapshot({
+    sourceDesiredRevision: 1,
+    agentId: "claude",
+    adapterId: "claude",
+    workspace: { root: "/fixture/legacy-review", entries: [] },
+    reviewRoundId: "review-round-1"
+  });
+
+  assert.equal(effective.provenance, "legacy-cutover");
+  assert.equal(effective.executionMode, "read-only");
+  assert.equal(effective.reviewRoundId, "review-round-1");
+  assert.equal(effective.reviewBaseProvenance, "legacy-unavailable");
+  assert.equal(effective.reviewBaseCommit, undefined);
+});
+
 test("Session compatibility compares complete effective config and workspace, not provenance revision alone", () => {
   const role = desiredRole("codex", {
     adapterId: "codex",
@@ -184,6 +204,8 @@ test("Session compatibility compares complete effective config and workspace, no
   assert.equal(effectiveLaunchSnapshotsCompatible(first, {
     ...laterRevision,
     access: "read",
+    executionMode: "read-only",
+    yolo: false,
     writeProjectIds: [],
     permission: { sandbox: "read-only", approval: "never" }
   }), false);

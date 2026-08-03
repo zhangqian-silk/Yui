@@ -68,7 +68,10 @@ yui storage convert-task-identity \
 The converter remaps all Task-owned records and references and writes the one
 current combined schema directly: aggregate v13 / StoredTask v12 with Role
 desired revisions and immutable effective Run/Session launch snapshots. Legacy
-launch facts are provenance-marked and closed to read-only. The converter
+launch facts are provenance-marked and closed to read-only. Exact built-in
+`operator`, `leader`, `worker`, and `implementer` Roles receive the current
+write-capable default for their next fresh launch; custom Roles remain
+read-only because their old Profile identity was not persisted. The converter
 validates the fresh output with the current runtime, writes
 `identity-conversion.json`, and verifies that the source bytes did not change.
 When `config.review` is set, the report also records the deterministic reviewer
@@ -189,9 +192,13 @@ keeps the same relative layout, creates isolated worktrees only for that write
 scope, and exposes the other Task Projects as context from Task main. Yui puts
 the exact writable and context-only Project lists into the managed dispatch and
 the `yui-worker` Skill requires the Agent to honor that boundary. Native Agent
-permissions remain session-wide: use native read-only for an explorer, and
-allow the configured reviewer full local capability only in its exact
-ReviewRound-owned worktree.
+permissions remain session-wide, so Yui records source access and provider
+execution mode as separate facts. An explicit read-only Profile such as
+`explorer` is native `read-only`; a write-capable Leader, WorkItem, or
+ReviewRound is `unrestricted` so it can use its required local tools without
+permission deadlocks. Exact WorkItem and workspace scope still declares which
+Projects they may modify. Profile and Skill instructions constrain behavior but
+never enlarge that structural authority.
 
 Write scope may only expand. The Leader supplies the complete old-plus-new set
 after a Worker yields and reports that another repository is required; an
@@ -285,15 +292,18 @@ yui task work isolate <task-id>/<work-item-id>
 yui task work dispatch <task-id>/<work-item-id> --input "Implement and run focused tests"
 ```
 
-`--yolo true` is a desired Role ceiling, not an unconditional process flag. It
-can compile to `--dangerously-bypass-approvals-and-sandbox` for Codex or
-`--dangerously-skip-permissions` for Claude only when a write Profile, an exact
-WorkItem write scope, and a matching writable managed workspace all agree.
-`--clear-yolo` affects the next launch. A Gitless Task, a non-WorkItem Run, an
-empty write scope, or a read Profile is native read-only. A ReviewRound is the
-only non-WorkItem write purpose: it receives write/bypass only when its Run,
-reviewRoundId, frozen base, and ReviewRound-owned workspace match exactly;
-every mismatch fails closed. Its diagnostic commit is visible history but is
+Yui derives the effective execution mode from the portable Profile instead of
+provider permission preferences. A write-capable Profile compiles to
+`unrestricted`, using
+`--dangerously-bypass-approvals-and-sandbox` for Codex or
+`--dangerously-skip-permissions` for Claude; an explicit read-only Profile
+compiles to native `read-only`. This runtime mode is independent from declared
+source access: only an exact WorkItem scope and matching managed workspace grant
+Project writes. A ReviewRound is the only non-WorkItem source-write purpose and
+must match its Run, reviewRoundId, frozen base, and ReviewRound-owned workspace;
+every mismatch fails closed. Provider-specific permission fields remain desired
+launch metadata, but cannot silently downgrade a write-capable run or elevate a
+read-only Profile. Its diagnostic commit is visible history but is
 explicitly rejected by capture, ChangeSet, Integration, and acceptance paths.
 Review yield keeps the same exact `--summary-file -` command, but its stdin is
 one JSON object containing `summary`, a non-empty `checks` array of named
@@ -304,8 +314,9 @@ and cleanup refuses it until it is clean.
 
 Every Role desired launch change increments its revision and applies only to a
 future launch. Each AgentRun and native Role Session stores the complete actual
-agent, adapter, model, effort, access, permission, workspace, context, and
-source desired revision. Updating, switching, or clearing Role overrides never
+agent, adapter, model, effort, source access, provider-neutral execution mode,
+permission, workspace, context, and source desired revision. Updating,
+switching, or clearing Role overrides never
 hot-mutates an existing process. `task context`, Role views, Run history,
 Events, and Web show desired/effective revisions, access, provenance, and
 pending next-launch drift.

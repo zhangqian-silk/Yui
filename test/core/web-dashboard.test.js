@@ -17,7 +17,7 @@ const now = new Date("2026-07-23T08:00:00.000Z");
 
 function effectiveLaunch() {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     provenance: "resolved",
     sourceDesiredRevision: 2,
     agentId: "codex",
@@ -25,6 +25,7 @@ function effectiveLaunch() {
     model: "gpt-5.6-sol",
     effort: "max",
     access: "read",
+    executionMode: "read-only",
     yolo: false,
     search: false,
     permission: { sandbox: "read-only", approval: "never" },

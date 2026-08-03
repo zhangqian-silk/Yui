@@ -159,14 +159,16 @@ and each binding's model and permission settings unless the user requests a
 change. Record the provider constraint in the Task message so the Leader knows
 the requirement, but do not treat that message as the runtime binding.
 
-Treat Agent/model/effort and permission settings as launch configuration, not
-Task prose. When the user explicitly authorizes a binding change, update only a
-dormant Role, persist the complete binding, and read it back before that Role
-enters or dispatches a Session. YOLO may be enabled only by explicit user
-authorization; it removes provider prompts but does not expand Operator,
-Leader, or Worker responsibilities. If a live Session prevents the change,
-report the affected Session and stop rather than partially updating the
-configuration or telling the Leader to reconstruct it.
+Treat Agent/model/effort and provider settings as launch configuration, not
+Task prose. When the user requests a binding change, update only a dormant Role,
+persist the complete binding, and read it back before that Role enters or
+dispatches a Session. Effective permission mode comes from the portable
+Profile: write-capable Profiles compile to provider bypass, while an explicit
+read-only Profile compiles to native read-only. Do not ask the user to rebuild
+provider flags for each Run. Bypass removes provider prompts but does not expand
+Operator, Leader, Worker, WorkItem, or workspace responsibilities. If a live
+Session prevents the change, report the affected Session and stop rather than
+partially updating the configuration or telling the Leader to reconstruct it.
 
 Provider transcripts remain native to the Agent. Yui stores durable Task
 context, WorkItems, AgentRuns, compact results, and Git integration evidence.

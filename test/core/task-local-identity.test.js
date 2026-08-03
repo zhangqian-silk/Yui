@@ -668,15 +668,21 @@ test("offline identity conversion writes a fresh zero-dangling output without to
   const second = converted.tasks["task-2"];
   assert.equal(second.roles.leader.schemaVersion, 3);
   assert.equal(second.roles.leader.launchRevision, 1);
-  assert.equal(second.roles.leader.defaultAccess, "read");
+  assert.equal(second.roles.leader.defaultAccess, "write");
+  assert.equal(second.roles.explorer.defaultAccess, "read");
   assert.equal(second.agentRuns["agent-run-1"].schemaVersion, 4);
   assert.equal(second.agentRuns["agent-run-1"].effective.access, "read");
+  assert.equal(second.agentRuns["agent-run-1"].effective.executionMode, "read-only");
   assert.equal(second.agentRuns["agent-run-1"].effective.sourceDesiredRevision, 1);
     assert.equal(second.roleSessionSets.leader.sessions.codex.schemaVersion, 3);
     assert.equal(second.roleSessionSets.leader.schemaVersion, 3);
     assert.equal(second.roleSessionSets.leader.unusableSessionRetirement, null);
     assert.deepEqual(second.roleSessionSets.leader.retiredSessions, {});
   assert.equal(second.roleSessionSets.leader.sessions.codex.effective.access, "read");
+  assert.equal(
+    second.roleSessionSets.leader.sessions.codex.effective.executionMode,
+    "read-only"
+  );
   assert.equal(second.activeRuns.leader.runId, "agent-run-1");
   assert.deepEqual(second.roleSessionSets.leader.inFlight, {
     agentId: "codex",
@@ -764,6 +770,7 @@ test("offline identity conversion bootstraps only the configured legacy reviewer
   )) {
     assert.equal(session.effective.provenance, "legacy-cutover");
     assert.equal(session.effective.access, "read");
+    assert.equal(session.effective.executionMode, "read-only");
     assert.equal(session.effective.yolo, false);
   }
   assert.equal(converted.globalRoleSessionSets.reviewer.schemaVersion, 3);
@@ -816,6 +823,66 @@ test("offline identity conversion bootstraps only the configured legacy reviewer
     assert.equal(argv.includes("--allowed-tools"), false);
     assert.equal(argv.includes("--disallowed-tools"), false);
   }
+});
+
+test("offline identity conversion preserves terminal legacy Review Run provenance", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "yui-terminal-review-convert-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const source = join(root, "source");
+  const output = join(root, "output");
+  mkdirSync(source);
+  const state = legacyIdentityState();
+  const task = state.tasks["task-1"];
+  const stamp = new Date(NOW.getTime() + 1_500).toISOString();
+  const agent = state.configuredAgents.codex;
+  task.roles.reviewer = legacyRole(createRole(
+    "task-1",
+    "reviewer",
+    [createRoleAgentBinding(agent)],
+    agent.id,
+    "/fixture/review",
+    new Date(stamp),
+    {},
+    "read"
+  ));
+  task.agentRuns["agent-run-11"] = {
+    schemaVersion: 3,
+    id: "agent-run-11",
+    taskId: "task-1",
+    roleName: "reviewer",
+    mode: "new",
+    input: "Review the legacy Candidate.",
+    purpose: "review",
+    workItemId: "work-item-10",
+    reviewRoundId: "review-round-10",
+    workspace: legacyWorkItemWorkspace(stamp),
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    status: "yielded",
+    summary: "Legacy review completed.",
+    createdAt: stamp,
+    updatedAt: stamp,
+    deliveredAt: stamp,
+    endedAt: stamp
+  };
+  task.reviewRounds["review-round-10"].reviewerRunId = "agent-run-11";
+  writeLegacyStorage(source, state);
+
+  const { convertLegacyTaskIdentityStorage } = await import(
+    "../../dist/storage/taskIdentityConverter.js"
+  );
+  convertLegacyTaskIdentityStorage({ source, output, now: NOW });
+
+  const converted = JSON.parse(readFileSync(join(output, STORAGE_STATE_FILE), "utf8"));
+  const run = converted.tasks["task-1"].agentRuns["agent-run-2"];
+  assert.equal(run.reviewRoundId, "review-round-1");
+  assert.equal(run.effective.reviewBaseProvenance, "legacy-unavailable");
+  assert.equal(run.effective.reviewBaseCommit, undefined);
+  assert.equal(
+    converted.tasks["task-1"].reviewRounds["review-round-1"].reviewerRunId,
+    "agent-run-2"
+  );
+  assert.doesNotThrow(() => new FileTaskStore(output).getAgentRun("task-1", "agent-run-2"));
 });
 
 test("offline identity conversion rejects a configured reviewer without an authoritative Global Role", async (t) => {
@@ -1230,6 +1297,16 @@ function legacyIdentityState() {
     schemaVersion: 2,
     status: "running"
   };
+  tasks["task-2"].roles.explorer = legacyRole(createRole(
+    "task-2",
+    "explorer",
+    [binding],
+    agent.id,
+    "/fixture/task-2",
+    new Date(secondStamp),
+    {},
+    "read"
+  ));
   tasks["task-2"].activeRuns.leader = {
     schemaVersion: 1,
     runId: "agent-run-20"

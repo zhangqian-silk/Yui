@@ -161,7 +161,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
             `    Desired: r${role.launchRevision}; access ceiling: ${role.defaultAccess}; Model: ${binding.config.model ?? "default"}; effort: ${binding.config.effort ?? "default"}; YOLO: ${binding.config.yolo === true ? "enabled" : "disabled"}`,
             `    Effective: ${effective === undefined
               ? "not started"
-              : `${effectiveSource} ${effective.agentId}/${effective.adapterId}; r${effective.sourceDesiredRevision}; access: ${effective.access}; provenance: ${effective.provenance}`}`,
+              : `${effectiveSource} ${effective.agentId}/${effective.adapterId}; r${effective.sourceDesiredRevision}; access: ${effective.access}; mode: ${effective.executionMode}; provenance: ${effective.provenance}`}`,
             `    Desired drift: ${effective === undefined
               ? "-"
               : effective.sourceDesiredRevision === role.launchRevision
@@ -221,7 +221,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
             ...(latestRun === undefined
               ? ["    AgentRuns: none."]
               : [
-                  `    AgentRuns: ${itemRuns.length}; latest ${latestRun.id} [${latestRun.status}] ${latestRun.effective.agentId}/${latestRun.effective.adapterId} · effective r${latestRun.effective.sourceDesiredRevision}/${latestRun.effective.access}`,
+                  `    AgentRuns: ${itemRuns.length}; latest ${latestRun.id} [${latestRun.status}] ${latestRun.effective.agentId}/${latestRun.effective.adapterId} · effective r${latestRun.effective.sourceDesiredRevision}/${latestRun.effective.access}/${latestRun.effective.executionMode}`,
                   `      Input: ${compactText(latestRun.input)}`,
                   ...(latestRun.summary === undefined
                     ? []
@@ -238,7 +238,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       agentRuns,
       (run) => [
         `  ${run.id} [${run.status}/${run.purpose}] ${run.roleName} via ${run.effective.agentId}/${run.effective.adapterId}`,
-        `    Effective: r${run.effective.sourceDesiredRevision}; access: ${run.effective.access}; model: ${run.effective.model ?? "default"}; effort: ${run.effective.effort ?? "default"}`,
+        `    Effective: r${run.effective.sourceDesiredRevision}; access: ${run.effective.access}; mode: ${run.effective.executionMode}; model: ${run.effective.model ?? "default"}; effort: ${run.effective.effort ?? "default"}`,
         ...(run.summary === undefined ? [] : [`    Result: ${compactText(run.summary)}`])
       ]
     ),

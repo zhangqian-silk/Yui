@@ -18,6 +18,7 @@ import {
 } from "./agentAdapter.js";
 
 export type EffectiveLaunchAccess = WorkerAccess;
+export type EffectiveExecutionMode = "read-only" | "unrestricted";
 export type EffectiveLaunchProvenance = "resolved" | "legacy-cutover";
 export type EffectiveReviewBaseProvenance = "frozen-candidate" | "legacy-unavailable";
 
@@ -29,11 +30,12 @@ export type EffectiveLaunchWorkspace = Readonly<{
 export type EffectiveLaunchContext = Readonly<RoleProfile>;
 
 type EffectiveLaunchBase = Readonly<{
-  schemaVersion: 1;
+  schemaVersion: 2;
   provenance: EffectiveLaunchProvenance;
   sourceDesiredRevision: number;
   agentId: string;
   access: EffectiveLaunchAccess;
+  executionMode: EffectiveExecutionMode;
   model?: string;
   effort?: string;
   yolo: boolean;
@@ -112,7 +114,10 @@ export function resolveEffectiveLaunch(
     || !writeAuthorized
     ? "read"
     : "write";
-  if (access === "read" && input.nativeReadOnlySupported === false) {
+  const executionMode: EffectiveExecutionMode = input.role.defaultAccess === "write"
+    ? "unrestricted"
+    : "read-only";
+  if (executionMode === "read-only" && input.nativeReadOnlySupported === false) {
     throw new Error(
       `Agent adapter ${binding.adapterId} cannot express native read-only access; launch refused.`
     );
@@ -121,10 +126,11 @@ export function resolveEffectiveLaunch(
     sourceDesiredRevision: input.role.launchRevision,
     provenance: "resolved",
     agentId: binding.agentId,
-    config: access === "read"
+    config: executionMode === "read-only"
       ? readOnlyConfig(binding.config)
-      : writeConfig(binding.config),
+      : unrestrictedConfig(binding.config),
     access,
+    executionMode,
     writeProjectIds,
     workspace,
     context: snapshotContext(input.role),
@@ -166,6 +172,7 @@ export function legacyEffectiveLaunchSnapshot(input: Readonly<{
       ...(input.effort === undefined ? {} : { effort: input.effort })
     } as RoleAgentConfig),
     access: "read",
+    executionMode: "read-only",
     writeProjectIds: [],
     workspace: cloneWorkspace(input.workspace),
     context: cloneContext(input.context ?? {}),
@@ -257,8 +264,8 @@ export function effectiveLaunchSnapshotsCompatible(
 export function validateEffectiveLaunchSnapshot<T extends EffectiveLaunchSnapshot>(
   snapshot: T
 ): T {
-  if (snapshot.schemaVersion !== 1) {
-    throw new Error("Effective launch snapshot must use schemaVersion 1.");
+  if (snapshot.schemaVersion !== 2) {
+    throw new Error("Effective launch snapshot must use schemaVersion 2.");
   }
   if (snapshot.provenance !== "resolved" && snapshot.provenance !== "legacy-cutover") {
     throw new Error("Effective launch provenance is invalid.");
@@ -267,6 +274,17 @@ export function validateEffectiveLaunchSnapshot<T extends EffectiveLaunchSnapsho
   identity(snapshot.agentId, "Effective Agent id");
   if (snapshot.access !== "read" && snapshot.access !== "write") {
     throw new Error(`Effective launch access is invalid: ${String(snapshot.access)}.`);
+  }
+  if (snapshot.executionMode !== "read-only" && snapshot.executionMode !== "unrestricted") {
+    throw new Error(
+      `Effective execution mode is invalid: ${String(snapshot.executionMode)}.`
+    );
+  }
+  if (snapshot.executionMode === "read-only" && snapshot.access !== "read") {
+    throw new Error("Native read-only execution cannot carry source write access.");
+  }
+  if (snapshot.access === "write" && snapshot.executionMode !== "unrestricted") {
+    throw new Error("Source write access requires unrestricted execution.");
   }
   if (typeof snapshot.yolo !== "boolean" || typeof snapshot.search !== "boolean") {
     throw new Error("Effective launch yolo/search flags must be boolean.");
@@ -280,6 +298,9 @@ export function validateEffectiveLaunchSnapshot<T extends EffectiveLaunchSnapsho
   }
   if (snapshot.access === "read" && snapshot.writeProjectIds.length !== 0) {
     throw new Error("Read-only effective launch cannot carry writable Projects.");
+  }
+  if (snapshot.access === "write" && snapshot.writeProjectIds.length === 0) {
+    throw new Error("Writable effective launch requires an exact writable Project scope.");
   }
   if ((snapshot.reviewRoundId === undefined) !== (snapshot.reviewBaseProvenance === undefined)) {
     throw new Error("Effective Review provenance is incomplete.");
@@ -305,8 +326,10 @@ export function validateEffectiveLaunchSnapshot<T extends EffectiveLaunchSnapsho
   cloneContext(snapshot.context);
   const config = effectiveLaunchConfigUnchecked(snapshot);
   resolveAgentAdapter(snapshot.adapterId).canonicalizeConfig(config as never);
-  if (snapshot.access === "read") {
+  if (snapshot.executionMode === "read-only") {
     assertNativeReadOnlyConfig(config);
+  } else if (snapshot.yolo !== true || snapshot.permission !== undefined) {
+    throw new Error("Unrestricted effective launch must use provider bypass without permission overrides.");
   }
   return snapshot;
 }
@@ -316,8 +339,8 @@ export function assertReadOnlyAgentArgv(
   argv: readonly string[]
 ): void {
   validateEffectiveLaunchSnapshot(snapshot);
-  if (snapshot.access !== "read") {
-    throw new Error("Read-only argv validation requires a read-only effective snapshot.");
+  if (snapshot.executionMode !== "read-only") {
+    throw new Error("Read-only argv validation requires native read-only execution.");
   }
   if (snapshot.adapterId === "codex") {
     if (argv.includes("--dangerously-bypass-approvals-and-sandbox")) {
@@ -370,6 +393,7 @@ function snapshotFromConfig(input: Readonly<{
   agentId: string;
   config: RoleAgentConfig;
   access: EffectiveLaunchAccess;
+  executionMode: EffectiveExecutionMode;
   writeProjectIds: readonly string[];
   workspace: EffectiveLaunchWorkspace;
   context: EffectiveLaunchContext;
@@ -378,8 +402,20 @@ function snapshotFromConfig(input: Readonly<{
   reviewBaseCommit?: string;
 }>): EffectiveLaunchSnapshot {
   const config = clone(input.config);
+  const review = input.reviewRoundId === undefined
+    ? {}
+    : input.reviewBaseProvenance === "legacy-unavailable"
+      ? {
+          reviewRoundId: identity(input.reviewRoundId, "ReviewRound id"),
+          reviewBaseProvenance: "legacy-unavailable" as const
+        }
+      : {
+          reviewRoundId: identity(input.reviewRoundId, "ReviewRound id"),
+          reviewBaseProvenance: "frozen-candidate" as const,
+          reviewBaseCommit: commit(input.reviewBaseCommit ?? "", "Review base commit")
+        };
   const common = {
-    schemaVersion: 1 as const,
+    schemaVersion: 2 as const,
     provenance: input.provenance,
     sourceDesiredRevision: positiveInteger(
       input.sourceDesiredRevision,
@@ -387,6 +423,7 @@ function snapshotFromConfig(input: Readonly<{
     ),
     agentId: identity(input.agentId, "Effective Agent id"),
     access: input.access,
+    executionMode: input.executionMode,
     ...(config.model === undefined ? {} : { model: config.model }),
     ...(config.effort === undefined ? {} : { effort: config.effort }),
     yolo: config.yolo === true,
@@ -398,13 +435,7 @@ function snapshotFromConfig(input: Readonly<{
     writeProjectIds: [...input.writeProjectIds],
     workspace: cloneWorkspace(input.workspace),
     context: cloneContext(input.context),
-    ...(input.reviewRoundId === undefined
-      ? {}
-      : {
-          reviewRoundId: identity(input.reviewRoundId, "ReviewRound id"),
-          reviewBaseProvenance: input.reviewBaseProvenance ?? "frozen-candidate",
-          reviewBaseCommit: commit(input.reviewBaseCommit ?? "", "Review base commit")
-        })
+    ...review
   };
   const snapshot: EffectiveLaunchSnapshot = config.adapterId === "codex"
     ? {
@@ -457,12 +488,14 @@ function readOnlyConfig(config: RoleAgentConfig): RoleAgentConfig {
       };
 }
 
-function writeConfig(config: RoleAgentConfig): RoleAgentConfig {
+function unrestrictedConfig(config: RoleAgentConfig): RoleAgentConfig {
   const canonical = resolveAgentAdapter(config.adapterId).canonicalizeConfig(
     clone(config) as never
   ) as RoleAgentConfig;
-  if (canonical.yolo !== true || canonical.permission === undefined) return canonical;
-  const result = { ...canonical } as RoleAgentConfig & { permission?: unknown };
+  const result = {
+    ...canonical,
+    yolo: true as const
+  } as RoleAgentConfig & { permission?: unknown };
   delete result.permission;
   return result;
 }

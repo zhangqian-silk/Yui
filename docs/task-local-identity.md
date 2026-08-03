@@ -71,9 +71,14 @@ Before running it:
 The converter reads a stable source snapshot, deterministically remaps every
 Task-owned family and nested reference, and writes current-schema state into
 the fresh directory. In the same direct cutover it creates versioned Role
-desired configuration and immutable effective AgentRun/RoleSession snapshots.
-Missing legacy permission facts are never guessed: legacy effective snapshots
-are marked `legacy-cutover`, forced read-only, and are not resumable. The output
+desired configuration and immutable effective AgentRun/RoleSession snapshots,
+including the provider-neutral `read-only` or `unrestricted` execution mode.
+Missing legacy permission facts are never guessed: historical effective
+snapshots are marked `legacy-cutover`, forced read-only, and are not resumable.
+For the next fresh launch, exact built-in `operator`, `leader`, `worker`, and
+`implementer` Roles receive the current write-capable default; custom Roles
+remain read-only because the old schema did not persist their Profile identity.
+The output
 uses `config.review` as the sole reviewer bootstrap authority. It upgrades only
 the configured Global Role and existing same-name Task Roles to normal isolated
 Review write/bypass capability, removes their obsolete forced-read provider

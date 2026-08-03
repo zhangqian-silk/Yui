@@ -87,10 +87,10 @@ yui profile list
 - runtime 不暴露 child 实际 model 时，结果记录 `inherited` 或 `unknown`，
   不得猜测。
 - 用户指定的 Agent/model 不可用时，停止并重新询问；不得静默回退。
-- 用户选择 YOLO 时，将它保存为 Role 的 `yolo=true`。Codex 和 Claude 必须
-  分别出现 `--dangerously-bypass-approvals-and-sandbox` 和
-  `--dangerously-skip-permissions`；不再通过手动确认 workspace trust
-  或临场修改 CLI 参数实现。
+- effective execution mode 由 Profile 推导。可写 Profile 的 Codex 和 Claude
+  必须分别出现 `--dangerously-bypass-approvals-and-sandbox` 和
+  `--dangerously-skip-permissions`；显式只读 Profile 必须保持原生只读。测试
+  不得识别 provider trust 文案、自动发送按键或临场修改 CLI 参数。
 - 如果当前 active Session 阻止重新配置，应先说明需要停止或切换哪些 Session
   及影响，再获得用户授权。
 - 将最终确认值写入本次测试报告，并用实际 AgentRun/session 事实核对。
@@ -154,9 +154,9 @@ Controller/YUI_HOME，立即停止该路径，不用全局 `make link` 修补。
 ### 2.5 构造完整运行配置
 
 完整 E2E 的主路径应在无 active Session 的阶段一次性构造全局 Operator、
-Leader 和 Worker binding。如果用户已经明确授权“放开权限”，三者统一保存
-`yolo=true`。这表示测试期间不出现 workspace trust、工具审批或权限确认页面；
-它不改变 Profile 和 WorkItem 的职责边界。
+Leader 和 Worker binding。三者使用可写 Profile，因此 effective mode 统一为
+`unrestricted`；`explorer` 作为独立的原生只读负向路径。运行时 bypass 不改变
+Profile、WorkItem 或 workspace 的职责边界。
 
 下面是配置形态示例。`<model>` 和 `<effort>` 必须替换为本次 capability
 探测后用户确认的精确值，不能照抄历史测试：
@@ -164,17 +164,17 @@ Leader 和 Worker binding。如果用户已经明确授权“放开权限”，�
 ```sh
 yui role update operator \
   --agent <operator-agent> --model <operator-model> \
-  --effort <operator-effort> --yolo true
+  --effort <operator-effort>
 yui role bind operator <operator-agent>
 
 yui role update leader \
   --agent <worker-agent> --model <worker-model> \
-  --effort <worker-effort> --yolo true
+  --effort <worker-effort>
 yui role bind leader <worker-agent>
 
 yui role update worker \
   --agent <worker-agent> --model <worker-model> \
-  --effort <worker-effort> --yolo true
+  --effort <worker-effort>
 yui role bind worker <worker-agent>
 ```
 
@@ -197,19 +197,18 @@ yui --json role show worker
 
 门禁要求：
 
-- active Agent、model、effort、`yolo=true` 必须与确认清单一致；
-- Codex YOLO 的实际启动参数必须是
+- active Agent、model、effort 和 effective execution mode 必须与确认清单一致；
+- Codex `unrestricted` 的实际启动参数必须是
   `--dangerously-bypass-approvals-and-sandbox`；
-- Claude YOLO 的实际启动参数必须是
+- Claude `unrestricted` 的实际启动参数必须是
   `--dangerously-skip-permissions`；
-- YOLO 开启时，即使 binding 仍保留普通 permission 字段，实际启动不得再
+- `unrestricted` 开启时，即使 binding 仍保留普通 permission 字段，实际启动不得再
   传递冲突的 `--sandbox`、`--ask-for-approval` 或 `--permission-mode`；
 - 全局 Worker 缺失或不一致时停止，不得先启动 Session 再补配置。
 
-权限边界负向测试不要混入这个无提示主路径。需要验证 read-only sandbox、
-Claude `dontAsk` allow/deny 规则或审批页面时，使用另一个隔离 `YUI_HOME`，
-清除对应 Role 的 YOLO 后单独执行，并在报告中标记为
-permission-boundary run。
+权限边界负向测试不要混入这个无提示主路径。需要验证 Codex read-only sandbox
+或 Claude `dontAsk` allow/deny 规则时，使用另一个隔离 `YUI_HOME` 和显式
+`explorer` Profile 单独执行，并在报告中标记为 permission-boundary run。
 
 ## 3. 当前产品边界
 
@@ -234,8 +233,8 @@ Project 时，只能由 active Leader 使用 `task project add` 追加。Yui 不
 Task main 是一个包含全部 Project peer directory 的逻辑根。WorkItem 可以读取
 全部 Task Project，但只允许修改其重复 `--project` 声明的写入范围；受管派发
 和 `yui-worker` Skill 必须清楚列出可写与仅上下文 Project。原生 Agent 权限是
-会话级而不是逐 Project 的；实现会话只写 WorkItem scope，reviewer 会话仅在
-exact ReviewRound-owned workspace 中使用正常 Codex/Claude full capability。
+会话级而不是逐 Project 的；可写 Profile 使用 provider bypass，但实现会话仍
+只写 WorkItem scope，reviewer 会话仍只写 exact ReviewRound-owned workspace。
 Review 权限来自 frozen Candidate SHA、purpose、reviewRoundId 与 workspace owner
 的联合校验，并且必须回读真实启动参数。Codex/Claude 都必须直接执行一次 exact
 `--summary-file -` yield，不能包进 shell 循环或复合命令；Skill 禁止 push、
@@ -594,8 +593,8 @@ Q01-Q08 需要在其他会话改变 Task 状态后，通过 `RESUME`/`STALE` 再
 - 创建回执、`task context`、Role 和 AgentRun 对 runtime 来源及
   Agent/model/effort/YOLO 的描述一致；
 - AgentRun 快照与实际 dispatch 配置一致；
-- 无提示主路径的 Role 均使用用户确认的 YOLO，且不出现 trust/approval 页面；
-- read-only Profile 即使在 YOLO 下也不修改文件或外部状态；
+- 可写 Role 的 effective mode 均为 `unrestricted`，且不出现工具审批页面；
+- 显式 read-only Profile 使用原生只读并且不修改文件或外部状态；
 - isolate、yield、review、capture、integration、accept、cleanup 顺序成立。
 
 额外覆盖：
@@ -730,8 +729,8 @@ Issue:
 - 每个 WorkItem 有 bounded objective 和可观察 acceptance；
 - 执行路径符合任务约束；
 - 实际 Agent/model 与用户确认及 AgentRun 记录一致；
-- 无提示主路径的权限确认或 workspace trust 阻塞：0；
-- YOLO 主路径中 read-only Profile 产生的文件或外部状态修改：0；
+- `unrestricted` 主路径中的权限确认阻塞：0；
+- 显式 read-only Profile 产生的文件或外部状态修改：0；
 - 未经 pre-dispatch 配置核对而启动的 Task Role Run：0；
 - 用户未选择 `CLI default` 时，空 model/effort 的 Task Role Run：0；
 - Leader 临场复述或从 transcript 猜测运行配置的次数：0；

@@ -130,11 +130,11 @@ inspect the available Profiles:
 yui profile list
 ```
 
-Choose the Profile by the work's meaning. Use `explorer` for read-only
-inspection, `reviewer` only for ReviewRound isolation, and `implementer` for a
-Worker expected to modify its declared Project scope. Do not use the reviewer
-Profile as a general implementation Role. If one WorkItem may write at any
-stage, use a write-capable implementation Profile; split out a read-only
+Choose the Profile by the work's meaning. `worker`, `implementer`, and
+`reviewer` are write-capable by default; use `explorer` for explicit read-only
+inspection and `reviewer` only for ReviewRound isolation. Do not use the
+reviewer Profile as a general implementation Role. If one WorkItem may write at
+any stage, use a write-capable implementation Profile; split out a read-only
 investigation only when it is independently useful.
 
 ## Decompose
@@ -248,13 +248,15 @@ native Session configuration.
 Add a non-Leader Task Role without `--agent` so Yui copies the configured global
 Worker Role's complete bindings, regardless of the Task Role name. The Profile
 still defines portable behavior; Worker defines runtime Agent configuration.
-Before dispatch, inspect `task role show`; if Agent, model, effort, or permission
-settings are missing or inconsistent, do not dispatch or guess them.
+Before dispatch, inspect `task role show`; if Agent, model, effort, Profile, or
+workspace scope is missing or inconsistent, do not dispatch or guess it.
 
-Do not reconstruct Agent/model/effort or YOLO settings during execution. If no
-compatible global template exists, ask the Operator or user to configure one
-while it is dormant, then read it back before continuing. Provider permission
-bypass does not change the selected Profile's read/write boundary.
+Do not reconstruct Agent/model/effort or effective execution mode during
+execution. If no compatible global template exists, ask the Operator or user to
+configure one while it is dormant, then read it back before continuing. Yui
+compiles write-capable Profiles to provider bypass and explicit read-only
+Profiles to native read-only. Source write access remains a separate exact
+WorkItem or ReviewRound scope; bypass never changes that behavioral boundary.
 
 For meaningful concurrent-write risk, isolate the WorkItem before dispatch:
 

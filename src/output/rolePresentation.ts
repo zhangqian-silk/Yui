@@ -44,7 +44,7 @@ export function renderRoleDetails(
     `  Desired launch   r${role.launchRevision}; access ceiling=${role.defaultAccess}`,
     `  Effective launch ${effective === undefined
       ? "not started"
-      : `${effective.agentId}/${effective.adapterId}; r${effective.sourceDesiredRevision}; access=${effective.access}; provenance=${effective.provenance}`}`,
+      : `${effective.agentId}/${effective.adapterId}; r${effective.sourceDesiredRevision}; access=${effective.access}; mode=${effective.executionMode}; provenance=${effective.provenance}`}`,
     `  Desired drift    ${effective === undefined
       ? "-"
       : effective.sourceDesiredRevision === role.launchRevision

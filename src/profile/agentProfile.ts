@@ -95,8 +95,8 @@ export function builtinAgentProfileInputs(): readonly AgentProfileInput[] {
   return [
     {
       id: "worker",
-      description: "Complete one bounded delegated WorkItem.",
-      defaultAccess: "read"
+      description: "Implement and validate one bounded delegated WorkItem.",
+      defaultAccess: "write"
     },
     {
       id: "explorer",

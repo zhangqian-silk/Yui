@@ -240,7 +240,8 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
     codexWrite: taskPlan(planner, store, taskId, "codex-write", "launch-codex-write"),
     claudeWrite: taskPlan(planner, store, taskId, "claude-write", "launch-claude-write"),
     codexReview: taskPlan(planner, store, taskId, "codex-review", "launch-codex-review"),
-    claudeReview: taskPlan(planner, store, taskId, "claude-review", "launch-claude-review")
+    claudeReview: taskPlan(planner, store, taskId, "claude-review", "launch-claude-review"),
+    profileRead: taskPlan(planner, store, taskId, "profile-read", "launch-profile-read")
   };
   const effective = {
     codexRead: resolveEffectiveLaunch({
@@ -256,13 +257,18 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
     codexWrite: execution[0].effective,
     claudeWrite: execution[1].effective,
     codexReview: reviews[0].effective,
-    claudeReview: reviews[1].effective
+    claudeReview: reviews[1].effective,
+    profileRead: profileReadEffective
   };
 
   for (const key of ["codexRead", "claudeRead"]) {
     assert.equal(effective[key].access, "read");
-    assertReadOnlyAgentArgv(effective[key], plans[key].launch.args);
+    assert.equal(effective[key].executionMode, "unrestricted");
   }
+  assertCodexWrite(plans.codexRead.launch.args);
+  assertClaudeWrite(plans.claudeRead.launch.args);
+  assert.equal(effective.profileRead.executionMode, "read-only");
+  assertReadOnlyAgentArgv(effective.profileRead, plans.profileRead.launch.args);
   assertCodexWrite(plans.codexWrite.launch.args);
   assertClaudeWrite(plans.claudeWrite.launch.args);
   assert.equal(effective.codexReview.access, "write");
@@ -430,7 +436,7 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
     schemaVersion: 1,
     taskId,
     sourceRepository: { path: sourceRepository, commit },
-    storage: { aggregate: 12, storedTask: 11 },
+    storage: { aggregate: 13, storedTask: 12 },
     initialCaptures,
     driftCapture: readCapture(home, "codex-write", "codex"),
     effective,
@@ -442,8 +448,8 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
     immutableRun: historicalRun,
     immutableSession: historicalSession,
     checks: {
-      codexReadOnly: true,
-      claudeReadOnly: true,
+      writeCapableControlRunsBypass: true,
+      explicitProfileReadOnly: true,
       codexWriteBypass: true,
       claudeWriteBypass: true,
       isolatedReviewsFullCapability: true,
@@ -590,7 +596,8 @@ function readCaptures(home) {
     ["codexWrite", readCapture(home, "codex-write", "codex")],
     ["claudeWrite", readCapture(home, "claude-write", "claude")],
     ["codexReview", readCapture(home, "codex-review", "codex")],
-    ["claudeReview", readCapture(home, "claude-review", "claude")]
+    ["claudeReview", readCapture(home, "claude-review", "claude")],
+    ["profileRead", readCapture(home, "profile-read", "claude")]
   ]);
 }
 

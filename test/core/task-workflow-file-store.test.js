@@ -2006,15 +2006,10 @@ test("Leader creates a profiled Worker instance, binds Claude config, then launc
     ["--model", "claude-opus"]
   );
   assert.equal(plan.session.effective.access, "read");
-  assert.equal(plan.launch.args.includes("--dangerously-skip-permissions"), false);
-  assert.deepEqual(
-    plan.launch.args.slice(
-      plan.launch.args.indexOf("--permission-mode"),
-      plan.launch.args.indexOf("--permission-mode") + 2
-    ),
-    ["--permission-mode", "dontAsk"]
-  );
-  assert.ok(plan.launch.args.includes("--disallowed-tools"));
+  assert.equal(plan.session.effective.executionMode, "unrestricted");
+  assert.equal(plan.launch.args.includes("--dangerously-skip-permissions"), true);
+  assert.equal(plan.launch.args.includes("--permission-mode"), false);
+  assert.equal(plan.launch.args.includes("--disallowed-tools"), false);
   assert.equal(plan.session.nativeSessionId, "claude-worker-session");
 });
 

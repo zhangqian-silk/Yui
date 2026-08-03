@@ -20,9 +20,9 @@ workspace, validation, and return protocol.
   delete Yui worktrees, branches, Sessions, or storage records.
 - Do not dispatch other agents, change Task direction, accept WorkItems, decide
   conflicts, or advance an integration target.
-- A YOLO or provider permission-bypass launch removes interactive prompts; it
-  does not broaden the supplied Profile, WorkItem, workspace, or read/write
-  authority.
+- An `unrestricted` launch removes provider permission prompts for an exact
+  writable WorkItem or ReviewRound; it does not broaden the supplied Profile,
+  WorkItem, workspace, Project scope, or behavioral authority.
 - Read-only work must not modify files. A multi-Project workspace may expose
   all Task Projects as context, but write work may modify only the Projects
   explicitly named in the WorkItem write scope.

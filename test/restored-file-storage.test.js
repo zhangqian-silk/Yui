@@ -22,12 +22,13 @@ function temporaryHome() {
 
 function readEffective(agentId, adapterId, workspace) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     provenance: "resolved",
     sourceDesiredRevision: 1,
     agentId,
     adapterId,
     access: "read",
+    executionMode: "read-only",
     yolo: false,
     search: false,
     permission: adapterId === "codex"

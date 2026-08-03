@@ -331,7 +331,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       : adapter.compileNew(compileInput);
 
     let args = [...compiled.argv];
-    if (effective.access === "read") assertReadOnlyAgentArgv(effective, args);
+    if (effective.executionMode === "read-only") assertReadOnlyAgentArgv(effective, args);
     let session: SchedulerRoleSession | null;
     if (binding.adapterId === "codex") {
       args = addCodexSessionNotify(args, launchMode, this.#cliPath);

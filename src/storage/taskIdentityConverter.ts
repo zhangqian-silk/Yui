@@ -39,6 +39,12 @@ const LEGACY_BUILTIN_REVIEWER_DESCRIPTION =
   "Review one candidate against the user's core outcome, supported behavior, and direct evidence.";
 const LEGACY_BUILTIN_REVIEWER_INSTRUCTIONS =
   "Start from user intent and acceptance criteria. Inspect the complete relevant change and report only reachable, material, actionable problems with direct evidence. Separate defects from verification gaps, and prefer the smallest sufficient correction. Do not turn speculative or extreme edge cases into new state, retries, fallbacks, or protocol. Expose evidence and options to the Leader, who decides. Do not modify files or external state.";
+const WRITE_CAPABLE_BUILTIN_ROLE_NAMES = new Set([
+  "operator",
+  "leader",
+  "worker",
+  "implementer"
+]);
 
 type JsonObject = Record<string, unknown>;
 type IdMaps = Record<TaskRecordKind, Map<string, string>>;
@@ -421,13 +427,18 @@ function convertLegacyRole(value: unknown, label: string): JsonObject {
   if (role.schemaVersion !== 2) {
     throw new Error(`${label} must use legacy schemaVersion 2.`);
   }
+  const name = text(role.name, `${label} name`);
   return {
     ...role,
     schemaVersion: 3,
     launchRevision: 1,
-    // Legacy prompt/config did not prove an authorized write scope. The one
-    // offline cutover therefore closes desired access to read-only.
-    defaultAccess: "read"
+    // The current built-in execution roles are intentionally write-capable so
+    // their next fresh launch can use provider-neutral unrestricted mode. A
+    // custom legacy Role remains fail-closed because its copied Profile
+    // identity was not persisted and therefore cannot be inferred safely.
+    defaultAccess: WRITE_CAPABLE_BUILTIN_ROLE_NAMES.has(name)
+      ? "write"
+      : "read"
   };
 }
 

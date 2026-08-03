@@ -173,6 +173,7 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
     [...BUILTIN_PROFILE_IDS].sort()
   );
   assert.equal("agentId" in store.getAgentProfile("worker"), false);
+  assert.equal(store.getAgentProfile("worker").defaultAccess, "write");
   assert.equal(store.getAgentProfile("explorer").defaultAccess, "read");
   assert.equal(store.getAgentProfile("implementer").defaultAccess, "write");
   assert.equal(store.getAgentProfile("reviewer").defaultAccess, "write");

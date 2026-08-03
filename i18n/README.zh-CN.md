@@ -102,7 +102,9 @@ yui storage convert-task-identity \
 权威，定向升级同名 Global/Task reviewer Role 与精确匹配的旧内建 reviewer
 Profile，使新建的隔离 ReviewRound 可本地写入；自定义或无关 Role/Profile
 保持不变，无法无歧义转换的审查配置会在产生输出前失败。旧 Run/Session 的
-effective snapshot 保持只读且不可续用。完整边界见
+effective snapshot 保持只读且不可续用；精确内建 `operator`、`leader`、
+`worker`、`implementer` Role 则为下一次 fresh launch 获得当前可写默认值，
+其他自定义 Role 因旧格式未保存 Profile 身份而保持只读。完整边界见
 [Task 本地 ID 与离线转换](../docs/task-local-identity.md)。
 
 ## 快速开始
@@ -179,11 +181,12 @@ yui task project add <task-id> shared-sdk --base main
 实现型 WorkItem 必须声明允许修改的 Project。它保留与 Task main 一致的
 相对目录布局，只为写入范围创建隔离 worktree，其他 Task Project 作为上下文
 从 Task main 暴露。Yui 会在受管派发和 `yui-worker` Skill 中明确列出可写与
-仅上下文 Project，由 Agent 严格遵守该边界。原生 Agent 权限作用于整个会话：
-实现 Role 只有在 WorkItem 明确写入范围与 workspace owner 完全匹配时才使用
-可写会话；explorer 使用原生只读会话。reviewer 仅在独立 ReviewRound-owned
-workspace 的 owner、reviewRoundId 与全部条目精确匹配时获得配置上限内的可写
-能力，其他组合均 fail closed。
+仅上下文 Project，由 Agent 严格遵守该边界。原生 Agent 权限作用于整个会话，
+因此 Yui 将源码 access 与 provider execution mode 分开记录：显式只读的
+`explorer` 使用原生 `read-only`；可写 Leader、WorkItem 或 ReviewRound 使用
+`unrestricted`，避免必要本地工具被权限提示卡死。只有精确 WorkItem 范围与
+匹配的 managed workspace 才声明可修改 Project；Profile 与 Skill 约束行为，
+不能扩大这项结构化权限。
 
 写入范围只能扩大，不能缩小。Worker yield 并报告还需要另一个仓库后，
 Leader 使用完整的“旧范围 + 新范围”更新并重新派发：
@@ -267,14 +270,15 @@ yui task work isolate <task-id>/<work-item-id>
 yui task work dispatch <task-id>/<work-item-id> --input "完成实现并运行聚焦测试"
 ```
 
-`--yolo true` 是 Role 的一等配置。Yui 会分别为 Codex 编译
-`--dangerously-bypass-approvals-and-sandbox`，为 Claude 编译
-`--dangerously-skip-permissions`；`--clear-yolo` 会恢复已保存的权限设置或
-CLI 默认值。任意非 Leader Task Role 在创建时不传 `--agent`，都会复制全局
-Worker Role 的完整 Agent bindings，Leader 无需重新拼接 model、effort 和
-权限。创建回执和 `task context` 会记录配置来源及生效的
-Agent/model/effort/YOLO。显式 `--agent` 属于 Task 专用覆盖，必须在派发前
-补全并回读配置。
+Yui 根据 provider-neutral Profile 推导实际 execution mode。可写 Profile 对
+Codex 编译 `--dangerously-bypass-approvals-and-sandbox`，对 Claude 编译
+`--dangerously-skip-permissions`；显式只读 Profile 则编译原生 `read-only`。
+binding 中的 provider permission/YOLO 字段仍是 desired launch metadata，不能
+降级可写 Profile，也不能提升只读 Profile。任意非 Leader Task Role 在创建时
+不传 `--agent`，都会复制全局 Worker Role 的完整 Agent bindings，Leader 无需
+重新拼接 model、effort 和权限。创建回执与 `task context` 会同时记录源码
+access 和实际 execution mode。显式 `--agent` 属于 Task 专用覆盖，必须在派发
+前补全并回读配置。
 
 ReviewRound 从冻结 Candidate SHA 创建独立的可写 worktree。Codex/Claude 只在
 该 exact ReviewRound owner、reviewRoundId 与 workspace 全部匹配时获得配置上限

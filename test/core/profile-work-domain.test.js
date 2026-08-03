@@ -43,6 +43,17 @@ test("the built-in reviewer delegates evidence-backed judgment without engineeri
   assert.equal(reviewer.defaultAccess, "write");
 });
 
+test("normal development Profiles default to write scope while explorer stays explicit read-only", () => {
+  const profiles = Object.fromEntries(builtinAgentProfileInputs().map((profile) => [
+    profile.id,
+    profile
+  ]));
+  assert.equal(profiles.worker.defaultAccess, "write");
+  assert.equal(profiles.implementer.defaultAccess, "write");
+  assert.equal(profiles.reviewer.defaultAccess, "write");
+  assert.equal(profiles.explorer.defaultAccess, "read");
+});
+
 test("AgentProfile is versioned independently from Actor and has no workspace or session", () => {
   const profile = createAgentProfile({
     id: "implementer",
