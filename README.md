@@ -620,6 +620,41 @@ The first `make link` saves the original `yui` entry in the same user-level bin 
 make unlink
 ```
 
+To run this checkout in isolation without changing the global `yui`, build only
+its local launcher instead of linking:
+
+```sh
+make install-local
+./output/dev/bin/yui doctor
+```
+
+`make install-local` writes a self-contained launcher at `output/dev/bin/yui`
+and never touches the user-level `yui` command. The launcher resolves its own
+checkout and defaults `YUI_HOME` to this checkout's `output/dev/home`, so every
+instance identity that Yui derives from `YUI_HOME`—Controller socket, tmux
+server, and state—stays separate from any other checkout or the global install.
+It is idempotent, so re-run it after pulling new code (then run
+`./output/dev/bin/yui controller restart` if a Controller is already running).
+Call the launcher by its absolute path for a stable per-checkout entry point;
+exporting `output/dev/bin` onto `PATH` is a per-shell convenience only.
+
+`make install-local` builds `dist/` and writes exactly one file—the launcher
+itself. It does not modify `PATH` and does not create the data home, so run
+`./output/dev/bin/yui setup` once before commands that need state. Because a
+bare `yui` is resolved through `PATH` and not by the current directory, working
+inside this checkout does not make a bare `yui` use the local launcher; it still
+runs whatever `PATH` finds. Select this instance with the absolute launcher
+path, or, for one interactive shell only, prepend it to `PATH`:
+
+```sh
+export PATH="$PWD/output/dev/bin:$PATH"   # this shell only; not for automation
+```
+
+This is the recommended entry point for agents and scripts: run
+`make install-local` once, then call `<checkout>/output/dev/bin/yui ...` by
+absolute path from any working directory. Avoid relying on `export` persisting,
+since each command runs in a fresh process.
+
 ## License
 
 [MIT](./LICENSE)

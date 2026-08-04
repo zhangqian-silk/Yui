@@ -1250,6 +1250,12 @@ async function runCli() {
     console.log(`Isolated YUI_HOME default: ${result.yuiHome}`);
     return;
   }
+  if (action === "install-local") {
+    const result = installDevLauncher();
+    console.log(`Local yui launcher ready (global yui unchanged): ${result.launcherPath}`);
+    console.log(`Isolated YUI_HOME default: ${result.yuiHome}`);
+    return;
+  }
   if (action === "unlink") {
     const result = unlinkDevLauncher();
     console.log(result.restored ? `Restored the previous global yui command: ${result.globalLauncherPath}` : "This checkout did not own the global yui command.");
@@ -1264,7 +1270,7 @@ async function runCli() {
     );
     return;
   }
-  throw new Error("Usage: node scripts/manage-dev-launcher.mjs link|unlink|reset-home");
+  throw new Error("Usage: node scripts/manage-dev-launcher.mjs install-local|link|unlink|reset-home");
 }
 
 if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
