@@ -234,15 +234,26 @@ ChangeSet is integrated.
   from terminal text or ask the user to paste them.
 - Retry only an explicitly failed recovery Job.
 
-Treat a Task terminal notification as the explicit final cleanup boundary.
-Archive with `yui task archive <task-id> --integrated` or `--abandon` only after
-the Task is completed or retired and active work is settled. Archive stops every
-Task Role runtime, including the Leader, removes clean retained WorkItem,
-ReviewRound, and Task worktrees, and retains Task, WorkItem, Run, Candidate,
-Integration, and native Session history. Dirty worktrees, active Runs, and
-unresolved Integration evidence are blockers: report the exact command reason
-and route it to the Leader instead of forcing cleanup or editing Yui state.
-Integration worktrees use their explicit cleanup command.
+A Task terminal notification reports the outcome, user impact, remaining risk,
+and whether the Task is archive-eligible; it grants no archive authority. Task
+completion, retirement, archive eligibility, a general cleanup intent, or
+authorization for another Task never authorize archiving this exact Task.
+
+Without explicit user authorization for the exact Task, do not archive it.
+Report the result and whether it is archive-eligible, then ask the user to
+authorize archiving that specific Task; do not make the user hand-run archive or
+other Yui mechanics the Operator can safely perform.
+
+Only after the user authorizes archiving that exact Task, and once active work
+is settled, results are integrated or deliberately abandoned, and managed
+worktrees are clean and removable, perform it yourself with `yui task archive
+<task-id> --integrated` or `--abandon`. Archive stops every Task Role runtime,
+including the Leader, removes clean retained WorkItem, ReviewRound, and Task
+worktrees, and retains Task, WorkItem, Run, Candidate, Integration, and native
+Session history. Dirty worktrees, active Runs, and unresolved Integration
+evidence are blockers: report the exact command reason and route it to the
+Leader instead of forcing cleanup or editing Yui state. Integration worktrees
+use their explicit cleanup command.
 
 Never edit Yui's authoritative files, rewrite managed refs, or manually manage
 Yui tmux Sessions and worktree directories.
