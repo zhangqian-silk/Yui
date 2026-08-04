@@ -325,6 +325,19 @@ test("dashboard API summarizes tasks and exposes one consolidated task detail", 
       retired: 0
     });
 
+    // The redesigned cockpit reads a prioritized inbox rather than dragging
+    // every open input out of each individual task detail.
+    assert.deepEqual(dashboard.attention, [{
+      taskId: "task-1",
+      taskTitle: "Ship web dashboard",
+      request: {
+        id: "input-1",
+        status: "open",
+        question: "Choose a port",
+        createdAt: "2026-07-23T07:00:00.000Z"
+      }
+    }]);
+
     const detailResponse = await fetch(`${origin}/api/tasks/task-1`);
     assert.equal(detailResponse.status, 200);
     const detail = await detailResponse.json();
@@ -552,6 +565,7 @@ test("web shell composes modular i18n, theme, layout, and client assets", async 
 
     const assets = [
       ["/assets/css/tokens.css", "text/css"],
+      ["/assets/css/fonts.css", "text/css"],
       ["/assets/css/layout.css", "text/css"],
       ["/assets/css/components.css", "text/css"],
       ["/assets/css/responsive.css", "text/css"],
@@ -593,5 +607,66 @@ test("web shell composes modular i18n, theme, layout, and client assets", async 
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+});
+
+test("redesigned web shell exposes importance-ordered nav and a registered theme set", async () => {
+  await withServer(async (origin) => {
+    const shell = await fetch(origin).then((response) => response.text());
+    // Breadcrumb + persistent section tabs replaced the old stacked sections.
+    assert.match(shell, /class="breadcrumb"/);
+    assert.match(shell, /id="detail-tabs"/);
+    for (const target of [
+      "detail-top",
+      "detail-focus",
+      "detail-work",
+      "detail-exec",
+      "detail-roles",
+      "detail-history",
+      "detail-messages"
+    ]) {
+      assert.match(shell, new RegExp(`data-target="${target}"`));
+    }
+    // Sidebar treats the Operator as a durable, first-class entry.
+    assert.match(shell, /class="operator-open"/);
+    assert.match(shell, /data-i18n="actions\.operator"/);
+    // Search widened to project / tags / IDs.
+    assert.match(shell, /data-i18n-placeholder="search\.placeholder"/);
+
+    const tokens = await fetch(`${origin}/assets/css/tokens.css`).then((response) => response.text());
+    for (const theme of ["control-room", "paper", "atlas"]) {
+      assert.match(tokens, new RegExp(`data-theme="${theme}"`));
+    }
+    const themeScript = await fetch(`${origin}/assets/js/theme.js`).then((response) => response.text());
+    for (const theme of ["control-room", "paper", "atlas"]) {
+      assert.match(themeScript, new RegExp(`"${theme}"`));
+    }
+
+    // Self-hosted fonts must ship as valid binary woff2 with long-lived caching,
+    // not as utf-8 text that would corrupt the font tables.
+    const fontCss = await fetch(`${origin}/assets/css/fonts.css`).then((response) => response.text());
+    assert.match(fontCss, /@font-face/);
+    assert.match(fontCss, /Inter/);
+    assert.match(fontCss, /JetBrains Mono/);
+    const font = await fetch(`${origin}/assets/fonts/inter-600.woff2`);
+    assert.equal(font.status, 200);
+    assert.match(font.headers.get("content-type"), /^font\/woff2/);
+    assert.match(font.headers.get("cache-control"), /immutable/);
+    const magic = Buffer.from(await font.arrayBuffer()).subarray(0, 4).toString("latin1");
+    assert.equal(magic, "wOF2");
+
+    const i18n = await fetch(`${origin}/assets/js/i18n.js`).then((response) => response.text());
+    const collect = (locale) => {
+      const start = i18n.indexOf(`"${locale}":`);
+      assert.notEqual(start, -1, `${locale} dictionary missing`);
+      const openBrace = i18n.indexOf("{", start);
+      const end = i18n.indexOf("\n  }", openBrace);
+      const body = i18n.slice(openBrace, end);
+      return new Set([...body.matchAll(/"([a-zA-Z0-9.\-]+)":\s*"/g)].map((entry) => entry[1]));
+    };
+    const en = collect("en");
+    const zh = collect("zh-CN");
+    assert.deepEqual([...zh].filter((key) => !en.has(key)), []);
+    assert.deepEqual([...en].filter((key) => !zh.has(key)), []);
   });
 });
