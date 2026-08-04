@@ -53,7 +53,22 @@ export type TaskWorkspaceCleanup = Readonly<{
   status: "removed" | "retained-dirty" | "failed";
   path?: string;
   error?: string;
+  reason?: string;
+  resource?: string;
+  retryable?: boolean;
 }>;
+
+export class WorkspaceCleanupBlockedError extends Error {
+  constructor(
+    readonly reason: string,
+    readonly resource: string,
+    readonly retryable: boolean,
+    message: string
+  ) {
+    super(message);
+    this.name = "WorkspaceCleanupBlockedError";
+  }
+}
 
 export interface TaskWorkspacePreparer {
   prepareTaskWorkspace(taskId: string): Promise<TaskWorkspacePreparation>;
@@ -517,20 +532,21 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         throw new Error(`ReviewRound changed before cleanup was recorded: ${round.id}.`);
       }
       const currentWorkspace = tx.getRoleWorkspace(task.id, workspace.roleName);
-      if (currentWorkspace !== null && !sameRoleWorkspace(currentWorkspace, workspace)) {
-        throw new Error(`Reviewer workspace changed before cleanup was recorded: ${round.id}.`);
-      }
-      if (currentWorkspace !== null) tx.removeRoleWorkspace(task.id, workspace.roleName);
-      const reviewer = tx.getRole(task.id, workspace.roleName);
-      const main = tx.getRoleWorkspace(task.id, LEADER_ROLE);
-      if (reviewer !== null && reviewer.workspace !== (main?.root ?? this.#fallbackWorkspace())) {
-        const timestamp = this.now();
-        retireWorkspaceBoundSession(tx, task.id, reviewer.name, timestamp);
-        tx.saveRole(task.id, updateRole(
-          reviewer,
-          { workspace: main?.root ?? this.#fallbackWorkspace() },
-          timestamp
-        ));
+      const stillOwnsRole = currentWorkspace === null
+        || sameRoleWorkspace(currentWorkspace, workspace);
+      if (stillOwnsRole) {
+        if (currentWorkspace !== null) tx.removeRoleWorkspace(task.id, workspace.roleName);
+        const reviewer = tx.getRole(task.id, workspace.roleName);
+        const main = tx.getRoleWorkspace(task.id, LEADER_ROLE);
+        if (reviewer !== null && reviewer.workspace !== (main?.root ?? this.#fallbackWorkspace())) {
+          const timestamp = this.now();
+          retireWorkspaceBoundSession(tx, task.id, reviewer.name, timestamp);
+          tx.saveRole(task.id, updateRole(
+            reviewer,
+            { workspace: main?.root ?? this.#fallbackWorkspace() },
+            timestamp
+          ));
+        }
       }
       tx.saveReviewRound(task.id, recordReviewWorkspaceDisposition(
         currentRound,
@@ -604,15 +620,6 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
 
   async inspectTaskMainWorkspace(taskId: string): Promise<GitWorkspaceState> {
     const task = requireTask(this.store, taskId);
-    const isolated = this.store.listRoleWorkspaces(task.id)
-      .filter(({ owner }) => owner.type === "work-item");
-    if (isolated.length > 0) {
-      throw new Error(
-        `Task has WorkItem workspaces that require explicit cleanup: ${
-          isolated.map(({ owner }) => owner.type === "work-item" ? owner.workItemId : "").join(", ")
-        }.`
-      );
-    }
     const main = this.store.getRoleWorkspace(task.id, LEADER_ROLE);
     if (main === null) return "missing";
     if (main.owner.type !== "task") {
@@ -623,6 +630,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
 
   async cleanupTaskForArchive(taskId: string): Promise<TaskWorkspaceCleanup> {
     const task = requireTask(this.store, taskId);
+    assertTaskArchiveState(task, task);
     const isolated = this.store.listRoleWorkspaces(task.id)
       .filter(({ owner }) => owner.type === "work-item");
     if (isolated.length > 0) {
@@ -637,6 +645,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     }
     const main = this.store.getRoleWorkspace(task.id, LEADER_ROLE);
     if (main !== null) {
+      assertTaskArchiveState(requireTask(this.store, task.id), task);
       if (await this.#inspectEntries(task.id, MAIN_WORKTREE, main.entries) === "dirty") {
         return {
           taskId,
@@ -645,6 +654,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         };
       }
       for (const entry of main.entries) {
+        assertTaskArchiveState(requireTask(this.store, task.id), task);
         const project = requireProject(this.store, entry.projectId);
         const result = await this.git.removeWorktree({
           repositoryPath: project.path,
@@ -656,10 +666,12 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           throw new Error(`Task workspace changed after cleanup preflight: ${task.id}.`);
         }
       }
+      assertTaskArchiveState(requireTask(this.store, task.id), task);
       await removeWorkspaceView(main.root);
+      assertTaskArchiveState(requireTask(this.store, task.id), task);
       this.#recordWorkspaceRemoval(task, main, this.#fallbackWorkspace());
     }
-    this.#clearTaskWorkspace(requireTask(this.store, task.id), this.#fallbackWorkspace());
+    this.#clearTaskWorkspace(task, this.#fallbackWorkspace());
     return { taskId, status: "removed" };
   }
 
@@ -742,6 +754,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     }>
   ): void {
     this.store.transaction((tx) => {
+      if (workspace.owner.type === "task") {
+        assertTaskArchiveState(requireTask(tx, task.id), task);
+      }
       const current = tx.getRoleWorkspace(task.id, workspace.roleName);
       if (current === null || !sameRoleWorkspace(current, workspace)) {
         if (workItem === undefined) {
@@ -770,6 +785,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   #clearTaskWorkspace(task: Task, fallback: string): void {
     this.store.transaction((tx) => {
       const latest = requireTask(tx, task.id);
+      assertTaskArchiveState(latest, task);
       for (const role of tx.listRoles(task.id)) {
         if (role.workspace !== fallback) {
           const timestamp = this.now();
@@ -789,6 +805,18 @@ function requireTask(store: TaskStore, taskId: string): Task {
   const task = store.getTask(taskId);
   if (task === null) throw new Error(`Task not found: ${taskId}.`);
   return task;
+}
+
+function assertTaskArchiveState(current: Task, expected: Task): void {
+  if ((current.status !== "completed" && current.status !== "retired")
+    || !isDeepStrictEqual(current, expected)) {
+    throw new WorkspaceCleanupBlockedError(
+      "task-changed",
+      `task:${expected.id}`,
+      true,
+      `Task changed during archive cleanup: ${expected.id}.`
+    );
+  }
 }
 
 function requireProject(store: TaskStore, projectId: string): Project {

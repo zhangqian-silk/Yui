@@ -447,7 +447,7 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   ], store, lifecycleLeaderNow);
   runCliJson(home, [
     "task", "archive", lifecycleTask.id, "--abandon"
-  ], leaderCliEnvironment(home, lifecycleTask.id));
+  ], operatorCliEnvironment(home));
   runCliJson(home, ["controller", "stop"]);
   const finalSettlementNow = new Date();
   let finalPrimaryControlRun = store.getActiveAgentRun(primaryTask.id, "leader");
@@ -672,6 +672,14 @@ function leaderCliEnvironment(home, taskId) {
     YUI_SESSION_SCOPE: "task",
     YUI_TASK_ID: taskId,
     YUI_ROLE: "leader"
+  };
+}
+
+function operatorCliEnvironment(home) {
+  return {
+    ...isolatedCliEnvironment(home),
+    YUI_SESSION_SCOPE: "global",
+    YUI_ROLE: "operator"
   };
 }
 

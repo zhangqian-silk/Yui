@@ -3,7 +3,10 @@ import type { Decision } from "../decision/decision.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import type { Milestone } from "../milestone/milestone.js";
 import type { LeaderFailure } from "./leaderFailure.js";
-import type { OperatorNotification } from "./operatorNotification.js";
+import type {
+  LeaderRecoveryOperatorNotification,
+  OperatorNotification
+} from "./operatorNotification.js";
 import type { PendingWakeup } from "./pendingWakeup.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type {
@@ -138,7 +141,7 @@ export type LeaderDispatchFailurePersistence = Readonly<{
   session: SchedulerRoleSession | null;
   claimed: Readonly<{ run: SchedulerAgentRun; wakeup: PendingWakeup }>;
   failure: LeaderFailure;
-  notification: OperatorNotification;
+  notification: LeaderRecoveryOperatorNotification;
   now: Date;
 }>;
 
@@ -248,8 +251,6 @@ export interface SchedulerStorePort {
   saveLeaderDispatchFailure(input: LeaderDispatchFailurePersistence): "failed" | "state-changed";
   /** Fail the run and running WorkItem, clear active-run, and stop the Role session. */
   saveExitedRoleRun(input: ExitedRoleRunPersistence): "failed" | "state-changed";
-  /** Mark every recorded Task Role session stopped after tmux termination. */
-  saveArchivedTaskStopped(taskId: string, now: Date): void;
 }
 
 /** Resolves Tasks without a global scan for a dirty reconciliation pass. */
@@ -377,6 +378,4 @@ export interface TmuxDeliveryPort {
     }>[]>;
   /** Retryable stale lifecycle cleanup for one exact Task Role pane. */
   stopRole?(taskId: string, roleName: string): Promise<boolean>;
-  /** Archive boundary: tmux owns process termination for every Role in the Task. */
-  stopTask(taskId: string): Promise<boolean>;
 }

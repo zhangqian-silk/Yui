@@ -16,7 +16,6 @@ import { readCommandText } from "./textInput.js";
 import {
   createRoleSessionSet,
   roleAgentSessionResumeMode,
-  terminalizeTaskRoleRunSession,
   updateRoleAgentSessionStatus,
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
@@ -56,7 +55,6 @@ import {
 } from "../role/role.js";
 import {
   createAgentRun,
-  failAgentRun,
   yieldAgentRun,
   type AgentRun
 } from "../run/agentRun.js";
@@ -78,11 +76,7 @@ import {
   requireCompleteWorkExecution
 } from "../coordination/workMailboxQueue.js";
 import type { MailboxEntityRef, MailboxTarget } from "../coordination/workMailbox.js";
-import {
-  RUNTIME_CLEANUP_REQUIRED_REASON,
-  hasRuntimeCleanupObligation,
-  runtimeLifecycleTarget
-} from "../runtime/lifecycleReservation.js";
+import { runtimeLifecycleTarget } from "../runtime/lifecycleReservation.js";
 import {
   activateTask,
   addTaskProjectBinding,
@@ -146,6 +140,7 @@ import {
   runTaskInputCommand
 } from "./taskInputCommands.js";
 import { taskActor as resolveTaskActor } from "./taskActor.js";
+import { createTaskTerminalNotification } from "../scheduler/operatorNotification.js";
 
 const LEADER_ROLE = "leader";
 
@@ -724,22 +719,17 @@ function completeTaskCommand(
       if (leaderEntry.run.deliveredAt === undefined) {
         throw usageError(`Task ${task.id} Leader delivery is still pending.`);
       }
-      tx.saveAgentRun(yieldAgentRun(leaderEntry.run, summary, now));
-      requireCompleteWorkExecution(
-        tx,
-        roleMailbox(task.id, LEADER_ROLE),
-        runRef(task.id, leaderEntry.run.id)
-      );
-      tx.clearActiveAgentRun(task.id, LEADER_ROLE);
-      tx.saveRole(task.id, updateRoleStatus(leaderEntry.role, "idle", now));
-      const sessions = tx.getTaskRoleSessionSet(task.id, LEADER_ROLE);
-      if (sessions !== null) {
-        tx.saveTaskRoleSessionSet(
-          terminalizeTaskRoleRunSession(sessions, {
-            agentId: leaderEntry.run.effective.agentId,
-            runId: leaderEntry.run.id,
-            receiptId: formatAgentRunReceiptId(task.id, leaderEntry.run.id)
-          }, now)
+      const terminal = terminalizeExactTaskRun(tx, {
+        taskId: task.id,
+        roleName: LEADER_ROLE,
+        agentId: leaderEntry.run.effective.agentId,
+        runId: leaderEntry.run.id,
+        receiptId: formatAgentRunReceiptId(task.id, leaderEntry.run.id),
+        outcome: { status: "yielded", summary }
+      }, now);
+      if (terminal.disposition !== "applied") {
+        throw usageError(
+          `Task Leader Run changed during completion: ${leaderEntry.run.id}/${terminal.reason}.`
         );
       }
     }
@@ -749,11 +739,22 @@ function completeTaskCommand(
     tx.clearPendingWakeup(task.id);
     tx.clearLeaderFailure(task.id);
     tx.clearOperatorNotification(task.id);
+    tx.saveOperatorNotification(createTaskTerminalNotification(
+      task.id,
+      "completed",
+      actor,
+      summary,
+      now
+    ));
+    enqueueWork(tx, { kind: "operator" }, "task-terminal", now, [taskRef(task.id)]);
     recordTaskEvent(tx, task.id, "task.completed", { by: actor, summary }, now);
     enqueueWork(tx, taskMailbox(task.id), "task-completed", now, [taskRef(task.id)]);
     return { task: completed, changed: true } as const;
   });
-  if (result.changed) notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
+  if (result.changed) {
+    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
+    notifyMailbox(options.runtime, { kind: "operator" }, result.task.id);
+  }
   return result.changed
     ? `Completed task ${result.task.id}\n`
     : `Task ${result.task.id} is already completed\n`;
@@ -773,6 +774,7 @@ function reopenTaskCommand(
     if (task.status !== "completed") throw usageError(`Task is not completed: ${task.id}.`);
     const active = reopenTask(task, now);
     tx.saveTask(active);
+    tx.clearOperatorNotification(task.id);
     enqueueWork(tx, leaderMailbox(task.id), "task-reopened", now, [taskRef(task.id)]);
     enqueueWork(tx, taskMailbox(task.id), "task-reopened", now, [taskRef(task.id)]);
     recordTaskEvent(tx, task.id, "task.reopened", { status: active.status }, now);
@@ -816,36 +818,21 @@ function archiveTaskCommand(
         `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
       );
     }
+    const activeRole = tx.listRoles(task.id)
+      .find((role) => tx.getActiveAgentRun(task.id, role.name) !== null);
+    if (activeRole !== undefined) {
+      throw usageError(
+        `Task ${task.id} still has an active Run for Role ${activeRole.name}; `
+        + "stop its runtime before archiving."
+      );
+    }
     const archived = archiveTask(task, now, { by: actor });
     tx.saveTask(archived);
     tx.clearPendingWakeup(task.id);
     tx.clearLeaderFailure(task.id);
     tx.clearOperatorNotification(task.id);
     for (const role of tx.listRoles(task.id)) {
-      const activeRun = tx.getActiveAgentRun(task.id, role.name);
-      // Archival is the explicit aggregate teardown boundary. Unlike a normal
-      // Run terminal transition, it may cancel work before Controller claimed
-      // the pending delivery, so the Role mailbox is discarded as a whole.
       tx.removeWorkMailbox(roleMailbox(task.id, role.name));
-      if (activeRun === null) continue;
-      const failed = failAgentRun(activeRun, "Task archived.", now);
-      tx.saveAgentRun(failed);
-      tx.clearActiveAgentRun(task.id, role.name);
-      tx.saveRole(task.id, updateRoleStatus(role, "idle", now));
-      const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
-      if (sessions !== null) {
-        tx.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(sessions, {
-          agentId: activeRun.effective.agentId,
-          runId: activeRun.id,
-          receiptId: formatAgentRunReceiptId(task.id, activeRun.id)
-        }, now));
-      }
-      if (failed.workItemId !== undefined) {
-        const item = tx.getWorkItem(task.id, failed.workItemId);
-        if (item !== null && item.status === "running") {
-          tx.saveWorkItem(task.id, updateWorkItemStatus(item, "failed", now, "Task archived."));
-        }
-      }
     }
     recordTaskEvent(tx, task.id, "task.archived", {
       by: actor,
@@ -883,14 +870,12 @@ function retireTaskCommand(
   const now = clock(options);
   const result = store.transaction((tx) => {
     const task = requireTask(tx, taskId);
+    const actor = taskActor(options, task.id);
     if (task.status === "retired") {
       const same = task.retirementSummary === summary
         && task.replacementTaskId === replacementTaskId;
       if (!same) throw usageError(`Task already has a different retirement: ${task.id}.`);
       return { task, changed: false } as const;
-    }
-    if (taskActor(options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may retire a Task.");
     }
     if (task.status !== "active" && task.status !== "draft") {
       throw usageError(`Task cannot be retired from ${task.status}: ${task.id}.`);
@@ -938,12 +923,13 @@ function retireTaskCommand(
     }
 
     for (const item of tx.listWorkItems(task.id)) {
-      if (item.status === "completed" || item.disposition !== undefined) continue;
-      if (item.status === "retired") continue;
-      tx.saveWorkItem(task.id, retireWorkItem(item, {
-        by: "leader",
-        summary: `Task retired: ${summary}`
-      }, now));
+      if (item.status === "completed" || item.status === "retired") continue;
+      tx.saveWorkItem(task.id, updateWorkItemStatus(
+        item,
+        "retired",
+        now,
+        `Task retired: ${summary}`
+      ));
     }
     for (const request of tx.listInputRequests(task.id)) {
       if (request.status === "open") {
@@ -952,42 +938,6 @@ function retireTaskCommand(
           cancelInputRequest(request, `Task retired: ${summary}`, now)
         );
       }
-    }
-    for (const sessions of tx.listRoleSessionSets(task.id)) {
-      let updated = sessions;
-      const activeSession = updated.sessions[updated.activeAgentId];
-      if (updated.inFlight !== null || updated.pendingTurnCompletion !== null) {
-        throw usageError(
-          `Task Role still has an unsettled Run fence: ${task.id}/${updated.owner.roleName}.`
-        );
-      }
-      if (activeSession?.status === "running") {
-        updated = updateRoleAgentSessionStatus(
-          updated,
-          updated.activeAgentId,
-          "ready",
-          now
-        );
-      }
-      if (activeSession !== undefined
-        && activeSession.status !== "stopped"
-        && activeSession.status !== "broken") {
-        const runtimeTarget = runtimeLifecycleTarget({
-          scope: "task",
-          taskId: task.id,
-          roleName: updated.owner.roleName
-        });
-        if (!hasRuntimeCleanupObligation(tx.getWorkMailbox(runtimeTarget))) {
-          enqueueWork(
-            tx,
-            runtimeTarget,
-            RUNTIME_CLEANUP_REQUIRED_REASON,
-            now,
-            [taskRef(task.id)]
-          );
-        }
-      }
-      if (updated !== sessions) tx.saveTaskRoleSessionSet(updated);
     }
     for (const role of tx.listRoles(task.id)) {
       if (role.status !== "idle") {
@@ -1007,19 +957,30 @@ function retireTaskCommand(
     tx.clearLeaderFailure(task.id);
     tx.clearOperatorNotification(task.id);
     const retired = retireTask(task, {
-      by: "leader",
+      by: actor,
       summary,
       ...(replacementTaskId === undefined ? {} : { replacementTaskId })
     }, now);
     tx.saveTask(retired);
+    tx.saveOperatorNotification(createTaskTerminalNotification(
+      task.id,
+      "retired",
+      actor,
+      summary,
+      now
+    ));
+    enqueueWork(tx, { kind: "operator" }, "task-terminal", now, [taskRef(task.id)]);
     recordTaskEvent(tx, task.id, "task.retired", {
-      by: "leader",
+      by: actor,
       summary,
       ...(replacementTaskId === undefined ? {} : { replacementTaskId })
     }, now);
     return { task: retired, changed: true } as const;
   });
-  if (result.changed) options.runtime?.notifyStateChanged(result.task.id);
+  if (result.changed) {
+    options.runtime?.notifyStateChanged(result.task.id);
+    notifyMailbox(options.runtime, { kind: "operator" }, result.task.id);
+  }
   return output(
     result.changed
       ? `Retired task ${result.task.id}\n`
@@ -1077,7 +1038,10 @@ export function validateTaskArchiveRequest(
 ): Readonly<{ taskId: string; disposition: "integrated" | "abandoned" }> {
   const request = parseTaskArchiveArguments(args);
   const task = requireTask(store, request.taskId);
-  taskActor(options, task.id);
+  const actor = taskActor(options, task.id);
+  if (actor === "leader") {
+    throw usageError("Only the global Operator may archive a Task from a managed Session.");
+  }
   if (task.status !== "archived"
     && task.status !== "completed"
     && task.status !== "retired") {
@@ -1085,6 +1049,16 @@ export function validateTaskArchiveRequest(
   }
   if (task.status !== "archived") {
     assertNoOpenInputRequests(store, task.id, "archiving the Task");
+    const unresolvedIntegration = store.listIntegrationAttempts(task.id).find((integration) => (
+      integration.status === "running"
+      || integration.status === "blocked"
+      || integration.status === "validating"
+    ));
+    if (unresolvedIntegration !== undefined) {
+      throw usageError(
+        `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
+      );
+    }
   }
   return request;
 }
@@ -2171,7 +2145,6 @@ function retireWork(
         agentId: run.effective.agentId,
         runId: run.id,
         receiptId: formatAgentRunReceiptId(task.id, run.id),
-        runtimeCleanup: "required",
         outcome: {
           status: "failed",
           summary: `Work Item retired: ${summary}`

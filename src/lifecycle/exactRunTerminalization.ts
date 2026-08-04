@@ -1,8 +1,5 @@
 import { completeProcessing } from "../coordination/workMailbox.js";
-import {
-  enqueueWork,
-  settleExactWorkExecution
-} from "../coordination/workMailboxQueue.js";
+import { settleExactWorkExecution } from "../coordination/workMailboxQueue.js";
 import {
   terminalizeTaskRoleRunSession,
   type TaskRoleSessionSet
@@ -12,7 +9,6 @@ import { finishReviewRound, type ReviewCheck } from "../review/reviewRound.js";
 import { failAgentRun, yieldAgentRun, type AgentRun } from "../run/agentRun.js";
 import {
   isRuntimeLaunchReservation,
-  RUNTIME_CLEANUP_REQUIRED_REASON,
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
 import type { TaskStore } from "../storage/taskStore.js";
@@ -27,8 +23,6 @@ export type ExactRunTerminalizationInput = Readonly<{
   launchId?: string;
   /** Aggregate retirement owns every queued Role signal, not only this Run. */
   mailboxDisposition?: "exact" | "discard";
-  /** Leader-forced control boundaries must stop the native process on every provider. */
-  runtimeCleanup?: "provider-default" | "required";
   outcome: Readonly<{
     status: "yielded" | "failed";
     summary: string;
@@ -128,26 +122,6 @@ export function terminalizeExactTaskRun(
       runId: input.runId,
       receiptId: input.receiptId
     }, now));
-  }
-  // Claude's native Hook payload has no provider turn id, so its default exact
-  // Run boundary ends the process generation. A caller may additionally make
-  // cleanup mandatory for a provider-independent control action such as
-  // Leader disposition. The durable Session identity itself is preserved.
-  if (
-    input.runtimeCleanup === "required"
-    || run.effective.adapterId === "claude"
-  ) {
-    enqueueWork(
-      store,
-      runtimeLifecycleTarget({
-        scope: "task",
-        taskId: input.taskId,
-        roleName: input.roleName
-      }),
-      RUNTIME_CLEANUP_REQUIRED_REASON,
-      now,
-      [{ type: "task", id: input.taskId }]
-    );
   }
   settleLaunchReservation(store, sessions, input);
   return { disposition: "applied", run: terminal };

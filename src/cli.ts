@@ -57,6 +57,7 @@ import {
   runTaskCommand,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
+import { taskActor } from "./commands/taskActor.js";
 import { runTaskIntegrationCommand } from "./commands/taskIntegrationCommands.js";
 import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
 import {
@@ -77,7 +78,10 @@ import { runClaudeLifecycleHookCommand } from "./controller/claudeLifecycleHook.
 import { runDoctorCommand } from "./doctor/doctor.js";
 import { agentNotFound, CliError, runtimeError, usageError } from "./errors/cliError.js";
 import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
-import { TaskWorkspaceCoordinator } from "./repository/taskWorkspaceCoordinator.js";
+import {
+  TaskWorkspaceCoordinator,
+  WorkspaceCleanupBlockedError
+} from "./repository/taskWorkspaceCoordinator.js";
 import { FileTaskWorkspacePreparer } from "./repository/taskWorkspacePreparer.js";
 import { inspectStorageSchema, requireStorageSchema } from "./storage/storageSchema.js";
 import { FileTaskStore, resolveYuiHome } from "./storage/taskStore.js";
@@ -96,8 +100,9 @@ import {
   listOperatorSessions,
   operatorSessionRef
 } from "./operator/operatorSessionHistory.js";
+import { YUI_VERSION, yuiVersionIdentity } from "./version.js";
 
-const VERSION = readPackageVersion();
+const VERSION = YUI_VERSION;
 const rawArgs = process.argv.slice(2);
 const jsonOutput = rawArgs.includes("--json");
 const args = normalizeAliases(
@@ -107,7 +112,7 @@ const args = normalizeAliases(
 void main().catch((error: unknown) => {
   if (error instanceof CliError) {
     const rendered = jsonOutput
-      ? JSON.stringify({ ok: false, code: error.code, message: error.message, details: {} })
+      ? JSON.stringify({ ok: false, code: error.code, message: error.message, details: error.details })
       : `${error.code}: ${error.message}${error.helpText === undefined ? "" : `\n\n${error.helpText.trimEnd()}`}`;
     process.stderr.write(`${rendered}\n`);
     process.exitCode = error.exitCode;
@@ -126,7 +131,7 @@ export async function main(): Promise<void> {
     return;
   }
   if (args[0] === "version" && args.length === 1) {
-    emit(VERSION, true);
+    emit(VERSION, true, yuiVersionIdentity());
     return;
   }
 
@@ -547,13 +552,43 @@ export async function main(): Promise<void> {
       const workItemId = resolved[3];
       const disposition = resolved[4];
       if (workItemId === undefined
-        || !["--integrated", "--abandon"].includes(disposition ?? "")
+        || !["--runtime-only", "--integrated", "--abandon"].includes(disposition ?? "")
         || resolved.length !== 5) {
-        throw usageError("Task work cleanup usage: yui task work cleanup <task>/<work> (--integrated|--abandon).");
+        throw usageError(
+          "Task work cleanup usage: yui task work cleanup <task>/<work> "
+          + "(--runtime-only|--integrated|--abandon)."
+        );
       }
-      const cleanedAs = disposition === "--integrated" ? "integrated" : "abandoned";
       const reference = cliWorkItemReference(workItemId, process.env);
       const qualified = `${reference.taskId}/${reference.localId}`;
+      const actor = taskActor(process.env, reference.taskId);
+      if (actor === "operator") {
+        throw usageError(
+          "Only the Task Leader may clean a WorkItem from a managed Session."
+        );
+      }
+      if (disposition === "--runtime-only") {
+        let runtimeCleanup;
+        try {
+          runtimeCleanup = await workspaceCoordinator.cleanupWorkItemRuntime(
+            reference.taskId,
+            reference.localId
+          );
+        } catch (error) {
+          throw cleanupCliError(error, `work-item:${qualified}`);
+        }
+        emit(
+          `Released WorkItem runtime ${qualified}; retained its Session and worktree\n`,
+          false,
+          {
+            workItem: store.getWorkItem(reference.taskId, reference.localId),
+            runtime: { cleanup: runtimeCleanup },
+            worktree: { retained: true }
+          }
+        );
+        return;
+      }
+      const cleanedAs = disposition === "--integrated" ? "integrated" : "abandoned";
       if (cleanedAs === "integrated") {
         try {
           await new WorkItemChangeSetManager(store).assertIntegrated(
@@ -564,13 +599,22 @@ export async function main(): Promise<void> {
           throw usageError(error instanceof Error ? error.message : String(error));
         }
       }
-      const removal = await workspaceCoordinator.cleanupWorkItem(
-        reference.taskId,
-        reference.localId,
-        cleanedAs
-      );
+      let removal;
+      try {
+        removal = await workspaceCoordinator.cleanupWorkItem(
+          reference.taskId,
+          reference.localId,
+          cleanedAs
+        );
+      } catch (error) {
+        throw cleanupCliError(error, `work-item:${qualified}`);
+      }
       if (removal === "dirty") {
-        throw usageError(`WorkItem worktree is dirty and was retained: ${qualified}.`);
+        throw usageError(
+          `WorkItem worktree is dirty and was retained: ${qualified}.`,
+          undefined,
+          cleanupBlockedDetails("dirty-worktree", `work-item:${qualified}`, true)
+        );
       }
       emit(
         `Cleaned WorkItem worktree ${qualified} (${cleanedAs})\n`,
@@ -631,7 +675,7 @@ export async function main(): Promise<void> {
       return;
     }
     if (resolved[1] === "archive") {
-      const { taskId } = validateTaskArchiveRequest(
+      const { taskId, disposition } = validateTaskArchiveRequest(
         resolved.slice(2),
         store,
         { runtime, environment: process.env, yuiHome: home }
@@ -639,12 +683,39 @@ export async function main(): Promise<void> {
       const task = store.getTask(taskId);
       if (task === null) throw new Error(`Task disappeared after archive validation: ${taskId}.`);
       if (task.status !== "archived") {
-        const cleanup = await workspaceCoordinator.cleanupTaskForArchive(task.id);
+        const workItemIds = store.listRoleWorkspaces(task.id)
+          .flatMap(({ owner }) => owner.type === "work-item" ? [owner.workItemId] : []);
+        for (const workItemId of workItemIds) {
+          const item = store.getWorkItem(task.id, workItemId);
+          if (item?.status !== "completed" || disposition !== "integrated") continue;
+          try {
+            await new WorkItemChangeSetManager(store).assertIntegrated(task.id, item.id);
+          } catch (error) {
+            throw usageError(error instanceof Error ? error.message : String(error));
+          }
+        }
+        const cleanup = await workspaceCoordinator.cleanupTaskForArchive(task.id, disposition);
         if (cleanup.status === "retained-dirty") {
-          throw usageError(`Task ${task.id} has dirty managed worktrees and remains completed.`);
+          throw usageError(
+            cleanup.error ?? `Task ${task.id} has dirty managed worktrees and remains terminal.`,
+            undefined,
+            cleanupBlockedDetails(
+              cleanup.reason ?? "dirty-worktree",
+              cleanup.resource ?? `task:${task.id}`,
+              cleanup.retryable ?? true
+            )
+          );
         }
         if (cleanup.status === "failed") {
-          throw usageError(`Task ${task.id} worktree cleanup failed: ${cleanup.error ?? "unknown error"}.`);
+          throw usageError(
+            `Task ${task.id} worktree cleanup failed: ${cleanup.error ?? "unknown error"}.`,
+            undefined,
+            cleanupBlockedDetails(
+              cleanup.reason ?? "cleanup-failed",
+              cleanup.resource ?? `task:${task.id}`,
+              cleanup.retryable ?? true
+            )
+          );
         }
       }
     }
@@ -792,6 +863,35 @@ export async function main(): Promise<void> {
     `Command is not connected to the restored FileTaskStore framework yet: ${resolved[0]}.`,
     renderCommandHelp(invocation.node, VERSION)
   );
+}
+
+function cleanupCliError(error: unknown, fallbackResource: string): CliError {
+  if (error instanceof WorkspaceCleanupBlockedError) {
+    return usageError(
+      error.message,
+      undefined,
+      cleanupBlockedDetails(error.reason, error.resource, error.retryable)
+    );
+  }
+  return new CliError(
+    "RUNTIME_ERROR",
+    error instanceof Error ? error.message : String(error),
+    undefined,
+    cleanupBlockedDetails("cleanup-failed", fallbackResource, true)
+  );
+}
+
+function cleanupBlockedDetails(
+  reason: string,
+  resource: string,
+  retryable: boolean
+): Readonly<Record<string, unknown>> {
+  return {
+    status: "blocked",
+    blockedBy: [{ resource, reason, retryable }],
+    remainingResources: [resource],
+    retryable
+  };
 }
 
 function cliWorkItemReference(
@@ -1344,18 +1444,6 @@ function agentEnvironmentRefreshScope(
     sourceNames: [...new Set([...currentSources, ...previousOnlySources])],
     nativeNames: [...new Set([...currentNative, ...previousOnlyNative])]
   };
-}
-
-function readPackageVersion(): string {
-  try {
-    const value = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
-      version?: unknown;
-    };
-    if (typeof value.version === "string" && value.version.length > 0) return value.version;
-  } catch {
-    // Keep help/version available if package metadata is damaged.
-  }
-  return "0.0.0";
 }
 
 export function cliIdentity(env: NodeJS.ProcessEnv): CliIdentity {

@@ -534,11 +534,19 @@ test("Controller atomically applies an expired Agent recommendation and resumes 
       return "sent";
     }
   };
+  const lifecycleHost = {
+    async stopOwner() { return true; }
+  };
 
   const beforeTimeout = await runControllerSchedulerPass(
     new FileSchedulerStoreAdapter(store),
     delivery,
-    new Date(FIRST.getTime() + 30_000)
+    new Date(FIRST.getTime() + 30_000),
+    undefined,
+    { kind: "full" },
+    true,
+    [],
+    lifecycleHost
   );
   assert.deepEqual(beforeTimeout.autoResolvedInputs, []);
   assert.equal(store.getInputRequest(task.id, request.id).status, "open");
@@ -548,7 +556,12 @@ test("Controller atomically applies an expired Agent recommendation and resumes 
   const result = await runControllerSchedulerPass(
     new FileSchedulerStoreAdapter(store),
     delivery,
-    SECOND
+    SECOND,
+    undefined,
+    { kind: "full" },
+    true,
+    [],
+    lifecycleHost
   );
 
   assert.deepEqual(result.autoResolvedInputs, [{

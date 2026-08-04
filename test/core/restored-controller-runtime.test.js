@@ -22,6 +22,7 @@ import {
   readControllerDiscovery
 } from "../../dist/core/controllerClient.js";
 import { FILE_TASK_CONTROLLER_PROTOCOL_VERSION } from "../../dist/core/protocol.js";
+import { YUI_VERSION, yuiVersionIdentity } from "../../dist/version.js";
 import {
   FileTaskWorkflowRuntime,
   restartFileTaskController,
@@ -67,8 +68,7 @@ function emptyStore(events = []) {
     saveRoleRunDelivery() {},
     saveRoleRunDeliveryFailure() { return "state-changed"; },
     saveLeaderDispatchFailure() {},
-    saveExitedRoleRun() {},
-    saveArchivedTaskStopped() {}
+    saveExitedRoleRun() {}
   };
 }
 
@@ -84,7 +84,6 @@ test("controller scheduler folds completion and liveness phases before wakeups",
   const events = [];
   const result = await runControllerSchedulerPass(emptyStore(events), noTmux, new Date(0));
   assert.deepEqual(result, {
-    stoppedArchivedTaskIds: [],
     activeRunDeliveries: [],
     failedRunRefs: [],
     wakeups: [],
@@ -1094,13 +1093,12 @@ test("controller delivers a queued Work AgentRun through tmux before liveness", 
   ]);
 });
 
-test("controller archives are enforced by killing the tmux Task and stopping sessions", async () => {
+test("archived Tasks do not trigger implicit Controller runtime cleanup", async () => {
   const task = { id: "task-archived", status: "archived", projectBindings: [] };
   const calls = [];
   const store = emptyStore();
   store.listTasks = () => [task];
   store.getTask = (taskId) => taskId === task.id ? task : null;
-  store.saveArchivedTaskStopped = (taskId) => calls.push(`stored:${taskId}`);
   const delivery = {
     ...noTmux,
     async stopTask(taskId) { calls.push(`tmux:${taskId}`); return true; }
@@ -1114,8 +1112,8 @@ test("controller archives are enforced by killing the tmux Task and stopping ses
     { kind: "dirty", keys: [`task:${task.id}`] }
   );
 
-  assert.deepEqual(result.stoppedArchivedTaskIds, [task.id]);
-  assert.deepEqual(calls, [`tmux:${task.id}`, `stored:${task.id}`]);
+  assert.equal("stoppedArchivedTaskIds" in result, false);
+  assert.deepEqual(calls, []);
 });
 
 test("dirty mailbox keys compile into exact task, role and operator selections", () => {
@@ -1139,7 +1137,7 @@ test("dirty mailbox keys compile into exact task, role and operator selections",
   );
 });
 
-test("dirty Task reconciliation prepares active work and only stops archived runtimes", async () => {
+test("dirty Task reconciliation prepares active work without implicit runtime teardown", async () => {
   const events = [];
   const active = { id: "task-active", status: "active", projectBindings: [{ projectId: "project-1" }] };
   const archived = { id: "task-archived", status: "archived", projectBindings: [{ projectId: "project-1" }] };
@@ -1159,7 +1157,7 @@ test("dirty Task reconciliation prepares active work and only stops archived run
   };
   const delivery = {
     ...noTmux,
-    async stopTask(taskId) { events.push(`stop:${taskId}`); return true; }
+    async stopTask() { throw new Error("Controller must not tear down an archived Task"); }
   };
 
   await runControllerSchedulerPass(store, delivery, new Date(0), workspace, {
@@ -1167,7 +1165,7 @@ test("dirty Task reconciliation prepares active work and only stops archived run
     keys: ["task:task-active", "task:task-archived"]
   });
 
-  assert.ok(events.indexOf("workspace:task-active") < events.indexOf("stop:task-archived"));
+  assert.equal(events.includes("workspace:task-active"), true);
   assert.equal(events.includes("workspace:task-archived"), false);
   assert.deepEqual(events.filter((event) => event.startsWith("deadlines:")), [
     "deadlines:task-active,task-archived"
@@ -2293,12 +2291,14 @@ test("background FileTask controller exposes status, scan and stop on one privat
   assert.equal(status.running, true);
   assert.equal(status.pid, process.pid);
   assert.equal(status.protocolVersion, FILE_TASK_CONTROLLER_PROTOCOL_VERSION);
+  assert.equal(status.version, YUI_VERSION);
+  assert.equal(status.storageLayoutVersion, yuiVersionIdentity().storageLayoutVersion);
+  assert.equal(status.aggregateSchemaVersion, yuiVersionIdentity().aggregateSchemaVersion);
   assert.deepEqual(
     await callController(home, "scheduler.signal", { key: "task:task-1" }),
     { accepted: true }
   );
   assert.deepEqual(await callController(home, "scheduler.scan", {}), {
-    stoppedArchivedTaskIds: [],
     activeRunDeliveries: [],
     failedRunRefs: [],
     wakeups: [],

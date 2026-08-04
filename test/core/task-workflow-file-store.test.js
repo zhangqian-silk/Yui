@@ -46,6 +46,7 @@ import {
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
+import { completeTask } from "../../dist/task/task.js";
 import { createRoleWorkspace } from "../../dist/worktree/roleWorkspace.js";
 import {
   createCandidateGitSnapshot,
@@ -2103,6 +2104,29 @@ test("archive refuses active work and leaves its runtime ownership intact", (t) 
   assert.equal(store.getActiveAgentRun(task.id, "leader")?.id, active.id);
 });
 
+test("archive fails closed instead of terminalizing a residual active Run", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Residual runtime");
+  run(["activate", task.id], store, options);
+  run(["work", "create", task.id, "residual work"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  dispatchTestRun(store, task.id, "leader", item.id);
+  const active = store.getActiveAgentRun(task.id, "leader");
+  store.saveTask(completeTask(store.getTask(task.id), NOW, {
+    by: "user",
+    summary: "Synthetic terminal state for the archive boundary."
+  }));
+
+  assert.throws(
+    () => run(["archive", task.id, "--abandon"], store, options),
+    /active Run.*Leader|Role leader.*stop its runtime/i
+  );
+  assert.equal(store.getTask(task.id).status, "completed");
+  assert.equal(store.getAgentRun(active.taskId, active.id).status, "active");
+  assert.equal(store.getActiveAgentRun(task.id, "leader").id, active.id);
+  assert.equal(store.getWorkItem(task.id, item.id).status, "running");
+});
+
 test("completion fences active behavior until an explicit reopen", (t) => {
   const { store, options } = fixture(t);
   const task = createTask(store, options, "Complete and reopen");
@@ -2129,6 +2153,19 @@ test("completion fences active behavior until an explicit reopen", (t) => {
       YUI_ROLE: "leader"
     }
   });
+  let leaderSessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: "leader"
+  }, "codex", NOW);
+  leaderSessions = recordRoleAgentSession(leaderSessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "leader-native-session",
+    policy: "fixed",
+    status: "ready"
+  }, NOW);
+  store.saveTaskRoleSessionSet(leaderSessions);
 
   run(["complete", task.id, "--summary", "Everything requested is done."], store, options);
   const completed = store.getTask(task.id);
@@ -2136,7 +2173,25 @@ test("completion fences active behavior until an explicit reopen", (t) => {
   assert.equal(completed.completionSummary, "Everything requested is done.");
   assert.equal(store.getPendingWakeup(task.id), null);
   assert.equal(store.getLeaderFailure(task.id), null);
-  assert.equal(store.getOperatorNotification(task.id), null);
+  assert.deepEqual(store.getOperatorNotification(task.id), {
+    schemaVersion: 1,
+    taskId: task.id,
+    type: "task-terminal",
+    status: "completed",
+    by: "user",
+    summary: "Everything requested is done.",
+    createdAt: NOW.toISOString(),
+    updatedAt: NOW.toISOString()
+  });
+  assert.deepEqual(
+    store.getWorkMailbox({ kind: "operator" }).pending.reasons,
+    ["task-terminal"]
+  );
+  assert.equal(store.getWorkMailbox({
+    kind: "role-runtime",
+    taskId: task.id,
+    roleName: "leader"
+  }), null);
   assert.throws(
     () => runTaskCommand(["message", "send", task.id, "continue"], store, options),
     /completed.*reopen/i
@@ -2253,6 +2308,28 @@ test("a Leader control Run can complete its Task atomically", (t) => {
   assert.equal(store.getAgentRun(controlRun.taskId, controlRun.id)?.summary, "Final review passed.");
   assert.equal(store.getActiveAgentRun(task.id, "leader"), null);
   assert.equal(store.getRole(task.id, "leader")?.status, "idle");
+  assert.deepEqual(store.getOperatorNotification(task.id), {
+    schemaVersion: 1,
+    taskId: task.id,
+    type: "task-terminal",
+    status: "completed",
+    by: "leader",
+    summary: "Final review passed.",
+    createdAt: NOW.toISOString(),
+    updatedAt: NOW.toISOString()
+  });
+  assert.deepEqual(
+    store.getWorkMailbox({ kind: "operator" }).pending.reasons,
+    ["task-terminal"]
+  );
+  assert.equal(store.getWorkMailbox({
+    kind: "role-runtime",
+    taskId: task.id,
+    roleName: "leader"
+  }), null);
+
+  run(["reopen", task.id], store, options);
+  assert.equal(store.getOperatorNotification(task.id), null);
 });
 
 test("a Leader session cannot complete another Task as that Task's Leader", (t) => {
@@ -2289,7 +2366,7 @@ test("a Leader session cannot complete another Task as that Task's Leader", (t) 
         }
       }
     ),
-    /active Leader run/i
+    /managed Task Session.*matching Leader/i
   );
   assert.equal(store.getTask(target.id)?.status, "active");
   assert.equal(store.getActiveAgentRun(target.id, "leader")?.id, targetRun.id);

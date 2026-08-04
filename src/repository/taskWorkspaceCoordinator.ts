@@ -1,16 +1,31 @@
+import { isDeepStrictEqual } from "node:util";
+
+import type { ReviewRound } from "../review/reviewRound.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import type { Task } from "../task/task.js";
 import type {
   WorkItem,
   WorkItemWorkspaceDisposition
 } from "../workItem/workItem.js";
+import type { RoleWorkspace } from "../worktree/roleWorkspace.js";
 import type { GitWorkspaceRemoval } from "./gitWorkspace.js";
 import {
   FileTaskWorkspacePreparer,
+  WorkspaceCleanupBlockedError,
   type TaskWorkspaceCleanup
 } from "./taskWorkspacePreparer.js";
 
+export { WorkspaceCleanupBlockedError } from "./taskWorkspacePreparer.js";
+
 export type TaskRoleRuntimeStopper = Readonly<{
   stopTaskRoleSessions(taskId: string, roleNames: readonly string[]): Promise<void>;
+}>;
+
+type TaskArchiveSnapshot = Readonly<{
+  task: Task;
+  roleWorkspaces: readonly RoleWorkspace[];
+  workItems: readonly WorkItem[];
+  reviewRounds: readonly ReviewRound[];
 }>;
 
 /**
@@ -66,7 +81,12 @@ export class TaskWorkspaceCoordinator {
       throw new Error(`Work item must be terminal before cleanup: ${item.id}.`);
     }
     if (item.assignee === undefined) {
-      throw new Error(`Work item has no Task Role workspace: ${item.id}.`);
+      throw new WorkspaceCleanupBlockedError(
+        "work-item-no-role",
+        `work-item:${item.taskId}/${item.id}`,
+        false,
+        `Work item has no Task Role workspace: ${item.id}.`
+      );
     }
     if (item.workspaceDisposition !== undefined
       && item.workspaceDisposition !== disposition) {
@@ -74,10 +94,23 @@ export class TaskWorkspaceCoordinator {
         `Work item workspace is already recorded as ${item.workspaceDisposition}.`
       );
     }
+    if (item.workspaceDisposition === disposition) return "missing";
     const state = await this.preparer.inspectWorkItemWorkspace(item.taskId, item.id);
     if (state === "dirty") return "dirty";
-    await this.#stopLiveRoles(item.taskId, [item.assignee]);
+    this.#assertWorkItemRuntimeOwner(item);
+    await this.runtime.stopTaskRoleSessions(item.taskId, [item.assignee]);
     return this.preparer.cleanupWorkItemWorkspace(item.taskId, item.id, disposition);
+  }
+
+  async cleanupWorkItemRuntime(
+    taskId: string,
+    workItemId: string
+  ): Promise<"released"> {
+    const item = this.store.getWorkItem(taskId, workItemId);
+    if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
+    this.#assertWorkItemRuntimeOwner(item);
+    await this.runtime.stopTaskRoleSessions(item.taskId, [item.assignee!]);
+    return "released";
   }
 
   async cleanupReviewRound(
@@ -95,21 +128,113 @@ export class TaskWorkspaceCoordinator {
     return this.preparer.cleanupReviewRoundWorkspace(taskId, reviewRoundId);
   }
 
-  async cleanupTaskForArchive(taskId: string): Promise<TaskWorkspaceCleanup> {
+  async cleanupTaskForArchive(
+    taskId: string,
+    disposition: WorkItemWorkspaceDisposition
+  ): Promise<TaskWorkspaceCleanup> {
     try {
+      const task = this.store.getTask(taskId);
+      if (task === null) throw new Error(`Task not found: ${taskId}.`);
+      if (task.status !== "completed" && task.status !== "retired") {
+        throw new Error(`Task must be completed or retired before archive cleanup: ${task.id}.`);
+      }
+      const roleWorkspaces = [...this.store.listRoleWorkspaces(task.id)]
+        .sort((left, right) => left.roleName.localeCompare(right.roleName));
+      const workspaces = roleWorkspaces
+        .filter(({ owner }) => owner.type === "work-item");
+      const workItems = workspaces.map((workspace) => {
+        const workItemId = workspace.owner.type === "work-item"
+          ? workspace.owner.workItemId
+          : "";
+        const item = this.store.getWorkItem(task.id, workItemId);
+        if (item === null) throw new Error(`Work item not found: ${task.id}/${workItemId}.`);
+        if (item.status !== "completed" && item.status !== "retired") {
+          throw new Error(`Work item must be completed or retired before archive cleanup: ${item.id}.`);
+        }
+        return item;
+      });
+      const allWorkItems = [...this.store.listWorkItems(task.id)]
+        .sort((left, right) => left.id.localeCompare(right.id));
+      const allReviewRounds = [...this.store.listReviewRounds(task.id)]
+        .sort((left, right) => left.id.localeCompare(right.id));
+      const reviewRounds = allReviewRounds.filter((round) => (
+        round.workspace !== undefined && round.workspaceDisposition?.kind !== "removed"
+      ));
+      const snapshot: TaskArchiveSnapshot = {
+        task,
+        roleWorkspaces,
+        workItems: allWorkItems,
+        reviewRounds: allReviewRounds
+      };
+      for (const round of reviewRounds) {
+        if (round.status !== "completed" && round.status !== "failed") {
+          throw new Error(`ReviewRound must be terminal before archive cleanup: ${round.id}.`);
+        }
+        if (await this.preparer.inspectReviewRoundWorkspace(task.id, round.id) === "dirty") {
+          return {
+            taskId,
+            status: "retained-dirty",
+            ...(task.cwd === undefined ? {} : { path: task.cwd }),
+            error: `ReviewRound worktree is dirty: ${round.id}.`,
+            reason: "dirty-worktree",
+            resource: `review-round:${task.id}/${round.id}`,
+            retryable: true
+          };
+        }
+      }
+      for (const item of workItems) {
+        if (await this.preparer.inspectWorkItemWorkspace(task.id, item.id) === "dirty") {
+          return {
+            taskId,
+            status: "retained-dirty",
+            ...(task.cwd === undefined ? {} : { path: task.cwd }),
+            error: `WorkItem worktree is dirty: ${item.id}.`,
+            reason: "dirty-worktree",
+            resource: `work-item:${task.id}/${item.id}`,
+            retryable: true
+          };
+        }
+      }
       const state = await this.preparer.inspectTaskMainWorkspace(taskId);
       if (state === "dirty") {
-        const task = this.store.getTask(taskId);
         return {
           taskId,
           status: "retained-dirty",
-          ...(task?.cwd === undefined ? {} : { path: task.cwd })
+          ...(task.cwd === undefined ? {} : { path: task.cwd }),
+          error: `Task main worktree is dirty: ${task.id}.`,
+          reason: "dirty-worktree",
+          resource: `task-worktree:${task.id}`,
+          retryable: true
         };
       }
-      await this.#stopLiveRoles(
-        taskId,
-        this.store.listRoles(taskId).map(({ name }) => name)
-      );
+      const activeRole = this.store.listRoles(taskId)
+        .find((role) => this.store.getActiveAgentRun(taskId, role.name) !== null);
+      if (activeRole !== undefined) {
+        throw new WorkspaceCleanupBlockedError(
+          "active-run",
+          `role:${task.id}/${activeRole.name}`,
+          true,
+          `Task Role still has an active Run: ${task.id}/${activeRole.name}.`
+        );
+      }
+      const roleNames = this.store.listRoles(taskId).map(({ name }) => name);
+      if (roleNames.length > 0) {
+        await this.runtime.stopTaskRoleSessions(taskId, roleNames);
+      }
+      this.#assertTaskArchiveSnapshot(snapshot);
+      for (const round of reviewRounds) {
+        this.#assertTaskArchiveLifecycle(task);
+        await this.preparer.cleanupReviewRoundWorkspace(task.id, round.id);
+      }
+      for (const item of workItems) {
+        this.#assertTaskArchiveLifecycle(task);
+        await this.preparer.cleanupWorkItemWorkspace(
+          task.id,
+          item.id,
+          item.status === "completed" ? disposition : "abandoned"
+        );
+      }
+      this.#assertTaskArchiveLifecycle(task);
       return this.preparer.cleanupTaskForArchive(taskId);
     } catch (error) {
       const task = this.store.getTask(taskId);
@@ -117,8 +242,94 @@ export class TaskWorkspaceCoordinator {
         taskId,
         status: "failed",
         ...(task?.cwd === undefined ? {} : { path: task.cwd }),
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? error.message : String(error),
+        ...(error instanceof WorkspaceCleanupBlockedError
+          ? {
+              reason: error.reason,
+              resource: error.resource,
+              retryable: error.retryable
+            }
+          : {
+              reason: "cleanup-failed",
+              resource: `task:${taskId}`,
+              retryable: true
+            })
       };
+    }
+  }
+
+  #assertTaskArchiveSnapshot(snapshot: TaskArchiveSnapshot): void {
+    this.#assertTaskArchiveLifecycle(snapshot.task);
+    const roleWorkspaces = [...this.store.listRoleWorkspaces(snapshot.task.id)]
+      .sort((left, right) => left.roleName.localeCompare(right.roleName));
+    const workItems = [...this.store.listWorkItems(snapshot.task.id)]
+      .sort((left, right) => left.id.localeCompare(right.id));
+    const reviewRounds = [...this.store.listReviewRounds(snapshot.task.id)]
+      .sort((left, right) => left.id.localeCompare(right.id));
+    if (!isDeepStrictEqual(roleWorkspaces, snapshot.roleWorkspaces)
+      || !isDeepStrictEqual(workItems, snapshot.workItems)
+      || !isDeepStrictEqual(reviewRounds, snapshot.reviewRounds)) {
+      throw new WorkspaceCleanupBlockedError(
+        "task-changed",
+        `task:${snapshot.task.id}`,
+        true,
+        `Task resources changed while archive cleanup stopped runtimes: ${snapshot.task.id}.`
+      );
+    }
+  }
+
+  #assertTaskArchiveLifecycle(expected: Task): void {
+    const current = this.store.getTask(expected.id);
+    if (current === null || !isDeepStrictEqual(current, expected)) {
+      throw new WorkspaceCleanupBlockedError(
+        "task-changed",
+        `task:${expected.id}`,
+        true,
+        `Task changed during archive cleanup: ${expected.id}.`
+      );
+    }
+  }
+
+  #assertWorkItemRuntimeOwner(item: WorkItem): void {
+    if (item.assignee === undefined) {
+      throw new WorkspaceCleanupBlockedError(
+        "work-item-no-role",
+        `work-item:${item.taskId}/${item.id}`,
+        false,
+        `Work item has no Task Role runtime: ${item.id}.`
+      );
+    }
+    const activeRun = this.store.getActiveAgentRun(item.taskId, item.assignee);
+    if (activeRun !== null) {
+      if (activeRun.workItemId !== item.id) {
+        throw new WorkspaceCleanupBlockedError(
+          "role-reassigned",
+          `role:${item.taskId}/${item.assignee}`,
+          true,
+          `Task Role already serves Work Item ${activeRun.workItemId ?? "none"}: `
+          + `${item.taskId}/${item.assignee}.`
+        );
+      }
+      throw new WorkspaceCleanupBlockedError(
+        "active-run",
+        `work-item:${item.taskId}/${item.id}`,
+        true,
+        `Work item still has an active Run: ${item.taskId}/${item.id}.`
+      );
+    }
+    const workspace = this.store.getRoleWorkspace(item.taskId, item.assignee);
+    if (workspace?.owner.type !== "work-item"
+      || workspace.owner.workItemId !== item.id) {
+      const owner = workspace?.owner.type === "work-item"
+        ? workspace.owner.workItemId
+        : workspace?.owner.type ?? "none";
+      throw new WorkspaceCleanupBlockedError(
+        "role-reassigned",
+        `role:${item.taskId}/${item.assignee}`,
+        true,
+        `Task Role no longer serves Work Item ${item.id} (current owner: ${owner}): `
+        + `${item.taskId}/${item.assignee}.`
+      );
     }
   }
 

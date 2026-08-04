@@ -198,14 +198,18 @@ test("Task Role reset fails exact work and forgets only the current native gener
   }), "obsolete");
 });
 
-test("the shared exact-Run terminal boundary converges queued execution", (t) => {
-  const { store } = fixture(t);
-  const run = prepareRun(store, { delivered: false });
+test("the shared exact-Run terminal boundary does not infer runtime cleanup", (t) => {
+  const { store } = fixture(t, { adapterId: "codex" });
+  const run = prepareRun(store, {
+    delivered: false,
+    adapterId: "codex",
+    agentId: "codex-primary"
+  });
 
   const applied = store.transaction((tx) => terminalizeExactTaskRun(tx, {
     taskId: run.taskId,
     roleName: run.roleName,
-    agentId: "claude-primary",
+    agentId: "codex-primary",
     runId: run.id,
     receiptId: `agent-run:${run.taskId}/${run.id}`,
     nativeSessionId: "native-1",
@@ -216,12 +220,9 @@ test("the shared exact-Run terminal boundary converges queued execution", (t) =>
   assert.equal(store.getAgentRun(run.taskId, run.id).status, "failed");
   assert.equal(store.getActiveAgentRun(run.taskId, run.roleName), null);
   assert.equal(store.getTaskRoleSessionSet(run.taskId, run.roleName).inFlight, null);
-  assert.deepEqual(
-    store.getWorkMailbox({
-      kind: "role-runtime", taskId: run.taskId, roleName: run.roleName
-    }).pending.reasons,
-    ["runtime-cleanup-required"]
-  );
+  assert.equal(store.getWorkMailbox({
+    kind: "role-runtime", taskId: run.taskId, roleName: run.roleName
+  }), null);
 });
 
 test("Leader WorkItem retirement closes its active Run with one terminal state", (t) => {
@@ -286,6 +287,7 @@ test("Task retirement closes exact work and makes late provider facts obsolete",
   assert.equal(store.getTask(task.id).status, "retired");
   assert.equal(store.getAgentRun(task.id, run.id).status, "failed");
   assert.equal(store.getWorkItem(task.id, item.id).status, "retired");
+  assert.equal(store.getWorkItem(task.id, item.id).disposition, undefined);
   assert.equal(new FileSchedulerStoreAdapter(store).classifyClaudeStopFailureEvent({
     eventId: "late-after-retirement",
     type: "claude-stop-failure",
@@ -299,4 +301,54 @@ test("Task retirement closes exact work and makes late provider facts obsolete",
     error: "server_error",
     errorDetails: "Late provider failure"
   }), "obsolete");
+});
+
+test("a user may retire a whole Task without inventing a Leader WorkItem decision", (t) => {
+  const { store, task, item } = fixture(t, { adapterId: "codex" });
+
+  runTaskCommand([
+    "retire", task.id, "--summary", "The user withdrew the aggregate outcome."
+  ], store, {
+    now: () => THIRD,
+    environment: {}
+  });
+
+  assert.equal(store.getTask(task.id).status, "retired");
+  assert.equal(store.getTask(task.id).retiredBy, "user");
+  assert.equal(store.getWorkItem(task.id, item.id).status, "retired");
+  assert.equal(store.getWorkItem(task.id, item.id).disposition, undefined);
+  assert.deepEqual(store.getOperatorNotification(task.id), {
+    schemaVersion: 1,
+    taskId: task.id,
+    type: "task-terminal",
+    status: "retired",
+    by: "user",
+    summary: "The user withdrew the aggregate outcome.",
+    createdAt: THIRD.toISOString(),
+    updatedAt: THIRD.toISOString()
+  });
+  assert.deepEqual(
+    store.getWorkMailbox({ kind: "operator" }).pending.reasons,
+    ["task-terminal"]
+  );
+});
+
+test("a managed Worker cannot fall through to user Task lifecycle authority", (t) => {
+  const { store, task } = fixture(t, { adapterId: "codex" });
+
+  assert.throws(
+    () => runTaskCommand([
+      "retire", task.id, "--summary", "Worker must not retire the aggregate."
+    ], store, {
+      now: () => THIRD,
+      environment: {
+        YUI_SESSION_SCOPE: "task",
+        YUI_TASK_ID: task.id,
+        YUI_ROLE: "worker",
+        YUI_AGENT_ID: "codex-primary"
+      }
+    }),
+    /managed Task Session.*Leader/i
+  );
+  assert.equal(store.getTask(task.id).status, "active");
 });

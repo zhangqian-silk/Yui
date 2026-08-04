@@ -441,9 +441,9 @@ const taskChildren: readonly NodeInput[] = [
       },
       {
         name: "cleanup",
-        summary: "Remove a clean terminal WorkItem worktree after integration or abandonment.",
-        usage: "yui task work cleanup <task>/<work> (--integrated|--abandon)",
-        options: ["--integrated", "--abandon"]
+        summary: "Release an idle WorkItem runtime or remove its final clean worktree.",
+        usage: "yui task work cleanup <task>/<work> (--runtime-only|--integrated|--abandon)",
+        options: ["--runtime-only", "--integrated", "--abandon"]
       },
       {
         name: "review",

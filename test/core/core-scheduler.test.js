@@ -563,6 +563,38 @@ test("Operator busy and delivery errors release the claimed mailbox batch", asyn
   }
 });
 
+test("Operator delivery sends one informational Task terminal notification", async () => {
+  const notification = {
+    schemaVersion: 1,
+    taskId: "task-1",
+    type: "task-terminal",
+    status: "completed",
+    by: "leader",
+    summary: "Integrated and verified.",
+    createdAt: NOW.toISOString(),
+    updatedAt: NOW.toISOString()
+  };
+  const store = operatorStore([], [notification]);
+  const deliveries = [];
+
+  const result = await processOperatorInputNotifications(store, {
+    async notifyOperatorInputOnce(input) {
+      deliveries.push(input);
+      return "sent";
+    }
+  });
+
+  assert.deepEqual(result, [{
+    terminalTaskId: "task-1",
+    taskId: "task-1",
+    status: "sent"
+  }]);
+  assert.equal(deliveries[0].receiptId, `task-terminal:task-1:completed:${NOW.toISOString()}`);
+  assert.match(deliveries[0].text, /Integrated and verified/);
+  assert.equal(store.mailbox.pending, null);
+  assert.equal(store.mailbox.processing, null);
+});
+
 function operatorRequest(id, taskId = "task-1") {
   return {
     schemaVersion: 2,
@@ -584,7 +616,7 @@ function operatorRequest(id, taskId = "task-1") {
   };
 }
 
-function operatorStore(requests) {
+function operatorStore(requests, notifications = []) {
   let mailbox = createWorkMailbox({ kind: "operator" });
   for (const request of requests) {
     mailbox = enqueueSignal(mailbox, {
@@ -593,15 +625,27 @@ function operatorStore(requests) {
       occurredAt: NOW.toISOString()
     });
   }
+  for (const notification of notifications) {
+    mailbox = enqueueSignal(mailbox, {
+      reason: "task-terminal",
+      refs: [{ type: "task", id: notification.taskId }],
+      occurredAt: NOW.toISOString()
+    });
+  }
   const byId = new Map(requests.map((request) => [
     `${request.taskId}/${request.id}`,
     request
+  ]));
+  const notificationsByTask = new Map(notifications.map((notification) => [
+    notification.taskId,
+    notification
   ]));
   const store = {
     get mailbox() { return mailbox; },
     getPresentationContext: () => ({ timeZone: "Asia/Shanghai" }),
     getWorkMailbox: () => mailbox,
     getInputRequest: (taskId, id) => byId.get(`${taskId}/${id}`) ?? null,
+    getOperatorNotification: (taskId) => notificationsByTask.get(taskId) ?? null,
     getOperatorDeliveryTarget: () => ({ roleName: "operator", adapterId: "codex" }),
     claimWorkMailbox(input) {
       if (mailbox.processing !== null) {

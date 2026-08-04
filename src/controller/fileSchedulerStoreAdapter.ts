@@ -10,7 +10,6 @@ import {
   recordRoleAgentSession,
   rememberRoleAgentCompletedTurn,
   settleTaskRoleCompletion,
-  terminalizeTaskRoleRunSession,
   updateRoleAgentSessionStatus,
   type AgentSessionStatus,
   type GlobalRoleSessionSet,
@@ -36,7 +35,6 @@ import { SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
 import {
   failAgentRun,
   markAgentRunDelivered,
-  yieldAgentRun,
   type AgentRun
 } from "../run/agentRun.js";
 import { terminalizeExactTaskRun } from "../lifecycle/exactRunTerminalization.js";
@@ -71,7 +69,7 @@ import {
   type MailboxTarget,
   type WorkMailbox
 } from "../coordination/workMailbox.js";
-import { completeWorkExecution, enqueueWork } from "../coordination/workMailboxQueue.js";
+import { enqueueWork } from "../coordination/workMailboxQueue.js";
 import type { SchedulerMailboxClaimInput, SchedulerMailboxClaimResult } from "../scheduler/ports.js";
 import {
   RUNTIME_CLEANUP_REQUIRED_REASON,
@@ -650,12 +648,23 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           ? {}
           : { nativeSessionId: session.nativeSessionId }),
         ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
-        runtimeCleanup: "required",
         outcome: { status: "failed", summary }
       }, input.now);
       if (result.disposition !== "applied" || result.run === null) {
         return "state-changed";
       }
+
+      enqueueWork(
+        store,
+        runtimeLifecycleTarget({
+          scope: "task",
+          taskId: input.taskId,
+          roleName: input.roleName
+        }),
+        RUNTIME_CLEANUP_REQUIRED_REASON,
+        input.now,
+        [{ type: "task", id: input.taskId }]
+      );
 
       const terminal = result.run;
       const message = createTaskMessage(
@@ -884,28 +893,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         input.now
       );
       return "failed";
-    });
-  }
-
-  saveArchivedTaskStopped(taskId: string, now: Date): void {
-    this.store.transaction((store) => {
-      const task = store.getTask(taskId);
-      if (task === null || task.status !== "archived") return;
-      for (const role of store.listRoles(taskId)) {
-        if (role.status !== "idle") {
-          store.saveRole(taskId, updateRoleStatus(role, "idle", now));
-        }
-      }
-      for (const current of store.listRoleSessionSets(taskId)) {
-        if (Object.values(current.sessions).every((session) => session.status === "stopped")) {
-          continue;
-        }
-        let updated: TaskRoleSessionSet = current;
-        for (const agentId of Object.keys(current.sessions)) {
-          updated = updateRoleAgentSessionStatus(updated, agentId, "stopped", now);
-        }
-        store.saveRoleSessionSet(updated);
-      }
     });
   }
 
@@ -1540,26 +1527,22 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
 
       if (role.name !== "leader" || active.workItemId !== undefined) {
         const summary = `Role turn completed without yui task run yield. Last assistant message: ${input.summary}`;
-        const terminal = failAgentRun(active, summary, now);
-        const target = { kind: "role", taskId: task.id, roleName: role.name } as const;
-        store.saveAgentRun(terminal);
-        if (!completeWorkExecution(store, target, {
-          type: "run",
+        const result = terminalizeExactTaskRun(store, {
           taskId: task.id,
-          id: terminal.id
-        })) {
-          throw new Error(`Role Run mailbox execution is inconsistent: ${terminal.id}.`);
+          roleName: role.name,
+          agentId: active.effective.agentId,
+          runId: active.id,
+          receiptId: formatAgentRunReceiptId(task.id, active.id),
+          nativeSessionId: input.nativeSessionId,
+          ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+          outcome: { status: "failed", summary }
+        }, now);
+        if (result.disposition !== "applied" || result.run === null) {
+          throw new Error(
+            `Role Run changed during native Turn completion: ${active.id}/${result.reason}.`
+          );
         }
-        store.clearActiveAgentRun(task.id, role.name);
-        store.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(
-          store.getTaskRoleSessionSet(task.id, role.name)!,
-          {
-            agentId: active.effective.agentId,
-            runId: active.id,
-            receiptId: formatAgentRunReceiptId(task.id, active.id)
-          },
-          now
-        ));
+        const terminal = result.run;
         if (active.purpose === "execution" && active.workItemId !== undefined) {
           const item = store.getWorkItem(task.id, active.workItemId);
           if (item !== null && !["completed", "failed", "retired"].includes(item.status)) {
@@ -1569,7 +1552,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             );
           }
         }
-        store.saveRole(task.id, updateRoleStatus(role, "idle", now));
         enqueueWork(
           store,
           { kind: "role", taskId: task.id, roleName: "leader" },
@@ -1589,7 +1571,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         return { session, finalizedRunId: terminal.id };
       }
 
-      const terminal = yieldAgentRun(active, input.summary, now);
       const leaderTarget = { kind: "role", taskId: task.id, roleName: role.name } as const;
       const leaderMailbox = store.getWorkMailbox(leaderTarget);
       const recoveryTurn = leaderMailbox?.processing?.executionRef?.type === "run"
@@ -1603,6 +1584,22 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         ))
         && !store.listWorkItems(task.id).some((item) => item.status === "running")
         && !store.listInputRequests(task.id).some((request) => request.status === "open");
+      const result = terminalizeExactTaskRun(store, {
+        taskId: task.id,
+        roleName: role.name,
+        agentId: active.effective.agentId,
+        runId: active.id,
+        receiptId: formatAgentRunReceiptId(task.id, active.id),
+        nativeSessionId: input.nativeSessionId,
+        ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+        outcome: { status: "yielded", summary: input.summary }
+      }, now);
+      if (result.disposition !== "applied" || result.run === null) {
+        throw new Error(
+          `Leader Run changed during native Turn completion: ${active.id}/${result.reason}.`
+        );
+      }
+      const terminal = result.run;
       const message = createTaskMessage(
         store.nextMessageId(task.id),
         task.id,
@@ -1612,7 +1609,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         now,
         { runId: terminal.id }
       );
-      store.saveAgentRun(terminal);
       store.saveMessage(task.id, message);
       store.saveEvent(task.id, createTaskEvent(
         store.nextEventId(task.id),
@@ -1621,24 +1617,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         { messageId: message.id, kind: message.kind },
         now
       ));
-      if (!completeWorkExecution(
-        store,
-        leaderTarget,
-        { type: "run", taskId: task.id, id: terminal.id }
-      )) {
-        throw new Error(`Leader Run mailbox execution is inconsistent: ${terminal.id}.`);
-      }
-      store.clearActiveAgentRun(task.id, role.name);
-      store.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(
-        store.getTaskRoleSessionSet(task.id, role.name)!,
-        {
-          agentId: active.effective.agentId,
-          runId: active.id,
-          receiptId: formatAgentRunReceiptId(task.id, active.id)
-        },
-        now
-      ));
-      store.saveRole(task.id, updateRoleStatus(role, "idle", now));
       if (quiescent) {
         if (recoveryTurn) {
           const message = "Leader ended a recovery Turn without completing, blocking, or continuing the Task.";
@@ -1747,6 +1725,18 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         );
         return { disposition: "obsolete", runId: input.runId };
       }
+
+      enqueueWork(
+        store,
+        runtimeLifecycleTarget({
+          scope: "task",
+          taskId: input.taskId,
+          roleName: input.roleName
+        }),
+        RUNTIME_CLEANUP_REQUIRED_REASON,
+        now,
+        [{ type: "task", id: input.taskId }]
+      );
 
       const terminal = result.run;
       const message = createTaskMessage(

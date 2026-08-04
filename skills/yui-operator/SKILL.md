@@ -218,12 +218,15 @@ ChangeSet is integrated.
   from terminal text or ask the user to paste them.
 - Retry only an explicitly failed recovery Job.
 
+Treat a Task terminal notification as the explicit final cleanup boundary.
 Archive with `yui task archive <task-id> --integrated` or `--abandon` only after
-the Task is completed, active work is settled, and every managed WorkItem
-worktree has an explicit disposition. Dirty worktrees are blockers and must
-remain available. Archive stops Task Sessions and removes clean Task-managed
-worktrees while retaining Task and WorkItem records. Integration worktrees use
-their explicit cleanup command.
+the Task is completed or retired and active work is settled. Archive stops every
+Task Role runtime, including the Leader, removes clean retained WorkItem,
+ReviewRound, and Task worktrees, and retains Task, WorkItem, Run, Candidate,
+Integration, and native Session history. Dirty worktrees, active Runs, and
+unresolved Integration evidence are blockers: report the exact command reason
+and route it to the Leader instead of forcing cleanup or editing Yui state.
+Integration worktrees use their explicit cleanup command.
 
 Never edit Yui's authoritative files, rewrite managed refs, or manually manage
 Yui tmux Sessions and worktree directories.

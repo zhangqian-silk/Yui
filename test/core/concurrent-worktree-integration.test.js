@@ -321,7 +321,9 @@ test("same-file WorkItems run in separate worktrees and a conflicting integratio
   );
   assert.equal((await preparer.cleanupTaskForArchive(task.id)).status, "removed");
   assert.match(
-    runTaskCommand(["archive", task.id, "--integrated"], store, leaderOptions).output,
+    runTaskCommand([
+      "archive", task.id, "--integrated"
+    ], store, { now: () => now, environment: {} }).output,
     /Archived task/
   );
   await assert.rejects(

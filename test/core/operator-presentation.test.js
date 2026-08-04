@@ -4,7 +4,8 @@ import { test } from "node:test";
 import { createInputRequest } from "../../dist/input/inputRequest.js";
 import {
   createInputRequestOperatorPresentation,
-  createLeaderRecoveryOperatorPresentation
+  createLeaderRecoveryOperatorPresentation,
+  createTaskTerminalOperatorPresentation
 } from "../../dist/interaction/operatorPresentation.js";
 
 const CREATED_AT = new Date("2026-07-23T01:00:00.000Z");
@@ -141,4 +142,33 @@ test("Leader recovery failure is an attention-only Operator presentation", () =>
   assert.match(presentation.text, /yui jobs list/);
   assert.match(presentation.text, /yui jobs retry leader-recovery:task-3/);
   assert.doesNotMatch(presentation.text, /yui job show/);
+});
+
+test("Task terminal delivery is informational and includes the durable outcome", () => {
+  const presentation = createTaskTerminalOperatorPresentation({
+    schemaVersion: 1,
+    taskId: "task-3",
+    type: "task-terminal",
+    status: "completed",
+    by: "leader",
+    summary: "All requested changes are integrated and verified.",
+    createdAt: CREATED_AT.toISOString(),
+    updatedAt: CREATED_AT.toISOString()
+  });
+
+  assert.deepEqual(
+    {
+      category: presentation.category,
+      receiptId: presentation.receiptId,
+      source: presentation.source
+    },
+    {
+      category: "information",
+      receiptId: `task-terminal:task-3:completed:${CREATED_AT.toISOString()}`,
+      source: { kind: "task-terminal", id: "task-3" }
+    }
+  );
+  assert.match(presentation.text, /Task task-3 was completed by its Leader/);
+  assert.match(presentation.text, /All requested changes are integrated and verified/);
+  assert.doesNotMatch(presentation.text, /user attention/i);
 });

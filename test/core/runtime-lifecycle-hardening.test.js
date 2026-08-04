@@ -25,6 +25,7 @@ import {
 } from "../../dist/controller/runtime.js";
 import { ControllerClientError } from "../../dist/core/controllerClient.js";
 import { FILE_TASK_CONTROLLER_PROTOCOL_VERSION } from "../../dist/core/protocol.js";
+import { YUI_VERSION } from "../../dist/version.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import {
   createGlobalRole,
@@ -55,9 +56,21 @@ test("storage writes reject a running Controller with an incompatible protocol",
       call: async () => ({
         running: true,
         pid: 43,
-        protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION
+        protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+        version: YUI_VERSION
       })
     })
+  );
+  await assert.rejects(
+    assertFileTaskControllerStorageCompatible("/tmp/yui-stale-controller", {
+      call: async () => ({
+        running: true,
+        pid: 44,
+        protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+        version: "0.2.9"
+      })
+    }),
+    /Controller version is incompatible.*controller restart/i
   );
   await assert.doesNotReject(
     assertFileTaskControllerStorageCompatible("/tmp/yui-no-controller", {
