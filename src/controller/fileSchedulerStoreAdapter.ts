@@ -1,4 +1,7 @@
+import { isDeepStrictEqual } from "node:util";
+
 import {
+  activeLiveRoleAgentSession,
   bindTaskRoleRun,
   clearTaskRoleRun,
   createRoleSessionSet,
@@ -7,7 +10,6 @@ import {
   recordRoleAgentSession,
   rememberRoleAgentCompletedTurn,
   settleTaskRoleCompletion,
-  terminalizeTaskRoleRunSession,
   updateRoleAgentSessionStatus,
   type AgentSessionStatus,
   type GlobalRoleSessionSet,
@@ -23,13 +25,26 @@ import { createTaskEvent } from "../event/taskEvent.js";
 import { createTaskMessage } from "../message/message.js";
 import { answerInputRequest } from "../input/inputRequest.js";
 import { activeRoleAgentBinding, updateRoleStatus } from "../role/role.js";
+import {
+  effectiveLaunchSnapshotsCompatible,
+  resolveEffectiveLaunch,
+  validateEffectiveLaunchSnapshot,
+  type EffectiveLaunchSnapshot
+} from "../executor/effectiveLaunch.js";
 import { SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
-import { failAgentRun, markAgentRunDelivered, yieldAgentRun } from "../run/agentRun.js";
+import {
+  failAgentRun,
+  markAgentRunDelivered,
+  type AgentRun
+} from "../run/agentRun.js";
+import { terminalizeExactTaskRun } from "../lifecycle/exactRunTerminalization.js";
+import type { TaskClaudeStopFailureEvent } from "./runtimeEventProcessor.js";
 import type {
   DormantRuntimeOwnerCandidate,
   LeaderDispatchFailurePersistence,
   LeaderDispatchClaimResult,
   LeaderDispatchPersistence,
+  RoleRunDeliveryFailurePersistence,
   RoleRunDeliveryPersistence,
   SchedulerRole,
   SchedulerRoleSession,
@@ -43,6 +58,10 @@ import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { updateWorkItemStatus } from "../workItem/workItem.js";
 import {
+  formatAgentRunReceiptId,
+  formatTaskRecordReference
+} from "../task/taskRecordReference.js";
+import {
   bindExecution,
   claimPending,
   completeProcessing,
@@ -50,7 +69,7 @@ import {
   type MailboxTarget,
   type WorkMailbox
 } from "../coordination/workMailbox.js";
-import { completeWorkExecution, enqueueWork } from "../coordination/workMailboxQueue.js";
+import { enqueueWork } from "../coordination/workMailboxQueue.js";
 import type { SchedulerMailboxClaimInput, SchedulerMailboxClaimResult } from "../scheduler/ports.js";
 import {
   RUNTIME_CLEANUP_REQUIRED_REASON,
@@ -78,12 +97,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   listMilestones(taskId: string) { return this.store.listMilestones(taskId); }
 
   listRoles(taskId: string): SchedulerRole[] {
-    return this.store.listRoles(taskId).map(mapRole);
+    return this.store.listRoles(taskId).map((role) => mapRole(this.store, role));
   }
 
   getRole(taskId: string, roleName: string): SchedulerRole | null {
     const role = this.store.getRole(taskId, roleName);
-    return role === null ? null : mapRole(role);
+    return role === null ? null : mapRole(this.store, role);
   }
 
   getActiveAgentRun(taskId: string, roleName: string) {
@@ -98,16 +117,19 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return this.store.listAllInputRequests().filter((request) => request.status === "open");
   }
 
-  getInputRequest(inputRequestId: string) {
-    return this.store.findInputRequest(inputRequestId);
+  getInputRequest(taskId: string, inputRequestId: string) {
+    return this.store.getInputRequest(taskId, inputRequestId);
   }
 
   getOperatorDeliveryTarget() {
     const role = this.store.getGlobalRole(SYSTEM_OPERATOR_ROLE);
     if (role === null) return null;
+    const sessions = this.store.getGlobalRoleSessionSet(SYSTEM_OPERATOR_ROLE);
+    const effectiveSession = sessions?.sessions[sessions.activeAgentId];
+    if (effectiveSession?.status !== "ready") return null;
     return {
       roleName: SYSTEM_OPERATOR_ROLE,
-      adapterId: activeRoleAgentBinding(role).adapterId
+      adapterId: effectiveSession.effective.adapterId
     } as const;
   }
 
@@ -133,6 +155,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         store.saveInputRequest(task.id, answered);
         store.saveEvent(task.id, createTaskEvent(
           store.nextEventId(task.id),
+          task.id,
           "input.auto-answered",
           { requestId: request.id, choiceKey },
           now
@@ -144,9 +167,16 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     });
   }
 
-  getRoleSession(taskId: string, roleName: string): SchedulerRoleSession | null {
-    const session = this.store.getRoleSession(taskId, roleName);
-    return session === null ? null : mapSession(session);
+  getRoleSession(
+    taskId: string,
+    roleName: string,
+    agentId?: string
+  ): SchedulerRoleSession | null {
+    const sessions = this.store.getTaskRoleSessionSet(taskId, roleName);
+    const session = agentId === undefined
+      ? sessions?.sessions[sessions.activeAgentId]
+      : sessions?.sessions[agentId];
+    return session === undefined ? null : mapSession(session);
   }
 
   hasInFlightTurn(taskId: string, roleName: string): boolean {
@@ -154,7 +184,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return sessions !== null && sessions.inFlight !== null;
   }
 
-  nextAgentRunId(taskId: string): string { return this.store.nextAgentRunId(taskId); }
+  peekNextAgentRunId(taskId: string): string {
+    return this.store.peekNextAgentRunId(taskId);
+  }
   getWorkMailbox(target: MailboxTarget) { return this.store.getWorkMailbox(target); }
   listWorkMailboxes() { return this.store.listWorkMailboxes(); }
 
@@ -420,11 +452,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         || role.workspace !== input.role.workspace) {
         return "state-changed";
       }
-      if (input.run.agentId !== undefined
-        && (input.run.agentId !== input.role.activeAgentId
-        || input.run.adapterId !== input.role.adapterId
-        || input.run.model !== input.role.model
-        || input.run.effort !== input.role.effort)) {
+      if (!isDeepStrictEqual(input.run.effective, input.role.effective)) {
         return "state-changed";
       }
       if (store.getAgentRun(input.task.id, input.run.id) !== null) return "state-changed";
@@ -437,7 +465,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       const mailbox = store.getWorkMailbox(target);
       if (mailbox === null || mailbox.pending === null) return "state-changed";
       if (mailbox.processing !== null) return "busy";
-      const batchId = `agent-run:${input.run.id}`;
+      if (store.peekNextAgentRunId(input.task.id) !== input.run.id) {
+        return "state-changed";
+      }
+      const allocatedRunId = store.nextAgentRunId(input.task.id);
+      if (allocatedRunId !== input.run.id) {
+        throw new Error(`Leader Run allocation changed unexpectedly: ${input.task.id}.`);
+      }
+      const batchId = formatAgentRunReceiptId(input.task.id, input.run.id);
       const claimed = bindExecution(
         claimPending(mailbox, {
           batchId,
@@ -445,12 +480,19 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           startedAt: input.now.toISOString()
         }),
         batchId,
-        { type: "run", id: input.run.id }
+        { type: "run", taskId: input.task.id, id: input.run.id }
       );
       store.saveActiveAgentRun(input.run);
       store.saveWorkMailbox(claimed);
       store.saveRole(input.task.id, updateRoleStatus(role, "running", input.now));
       bindTaskRoleRunInFlight(store, role, input.run, input.now);
+      store.saveEvent(input.task.id, createTaskEvent(
+        store.nextEventId(input.task.id),
+        input.task.id,
+        "run.dispatched",
+        runLaunchEventPayload(input.run),
+        input.now
+      ));
       if (input.session !== null && input.session.nativeSessionId !== undefined) {
         saveTaskSession(store, role, {
           ...input.session,
@@ -477,6 +519,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (active.deliveredAt === undefined) {
         store.saveAgentRun(markAgentRunDelivered(active, input.now));
         markTaskRoleRunDeliveredInFlight(store, role, input.run, input.now);
+        store.saveEvent(input.task.id, createTaskEvent(
+          store.nextEventId(input.task.id),
+          input.task.id,
+          "run.delivered",
+          runLaunchEventPayload(active),
+          input.now
+        ));
       } else {
         const sessions = store.getTaskRoleSessionSet(input.task.id, input.role.name);
         if (sessions?.inFlight?.runId === input.run.id
@@ -491,19 +540,19 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         const existing = store.getRoleSession(input.task.id, input.role.name);
         const reservation = matchingPreparedRuntimeReservation(
           store,
-          input,
-          existing
+          input
         );
         if (
           existing?.agentId !== input.session.agentId
           || existing.adapterId !== input.session.adapterId
           || existing.nativeSessionId !== input.session.nativeSessionId
+          || (input.launchId !== undefined && existing.launchId !== input.launchId)
           || existing.status !== "running"
         ) {
           saveTaskSession(store, role, {
             ...input.session,
             nativeSessionId: input.session.nativeSessionId
-          }, "running", input.now);
+          }, "running", input.now, input.launchId);
         }
         completePreparedRuntimeReservation(store, reservation);
       }
@@ -523,21 +572,195 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       }
       if (input.session !== null && input.session.nativeSessionId !== undefined) {
         const existing = store.getRoleSession(input.task.id, input.role.name);
-        const reservation = matchingPreparedRuntimeReservation(
+        matchingPreparedRuntimeReservation(
           store,
-          input,
-          existing
+          input
         );
         if (existing?.nativeSessionId !== input.session.nativeSessionId
+          || (input.launchId !== undefined && existing.launchId !== input.launchId)
           || existing.status !== "running") {
           saveTaskSession(store, role, {
             ...input.session,
             nativeSessionId: input.session.nativeSessionId
-          }, "running", input.now);
+          }, "running", input.now, input.launchId);
         }
-        completePreparedRuntimeReservation(store, reservation);
       }
       bindTaskRoleRunInFlight(store, role, input.run, input.now);
+    });
+  }
+
+  saveRoleRunDeliveryFailure(
+    input: RoleRunDeliveryFailurePersistence
+  ): "failed" | "state-changed" {
+    return this.store.transaction((store) => {
+      const task = store.getTask(input.taskId);
+      const role = store.getRole(input.taskId, input.roleName);
+      const active = store.getActiveAgentRun(input.taskId, input.roleName);
+      const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
+      const session = sessions?.sessions[input.agentId];
+      const mailbox = store.getWorkMailbox({
+        kind: "role",
+        taskId: input.taskId,
+        roleName: input.roleName
+      });
+      const runtimeMailbox = store.getWorkMailbox(runtimeLifecycleTarget({
+        scope: "task",
+        taskId: input.taskId,
+        roleName: input.roleName
+      }));
+      if (
+        task === null
+        || task.status !== "active"
+        || role === null
+        || active === null
+        || active.id !== input.runId
+        || active.status !== "active"
+        || active.deliveredAt !== undefined
+        || active.effective.agentId !== input.agentId
+        || active.effective.adapterId !== input.adapterId
+        || mailbox?.processing?.batchId !== input.mailboxBatchId
+        || mailbox.processing.executionRef?.type !== "run"
+        || mailbox.processing.executionRef.taskId !== input.taskId
+        || mailbox.processing.executionRef.id !== input.runId
+        || !preparedDeliveryFailureSessionFenceMatches(
+          sessions,
+          session,
+          input
+        )
+        || !preparedReservationMatches(
+          runtimeMailbox,
+          input.taskId,
+          input.runId,
+          input.launchId
+        )
+      ) {
+        return "state-changed";
+      }
+
+      const summary = `Role delivery retry limit exhausted before exact Run input delivery: ${input.runId}.`;
+      const result = terminalizeExactTaskRun(store, {
+        taskId: input.taskId,
+        roleName: input.roleName,
+        agentId: input.agentId,
+        runId: input.runId,
+        receiptId: formatAgentRunReceiptId(input.taskId, input.runId),
+        ...(session?.nativeSessionId === undefined
+          ? {}
+          : { nativeSessionId: session.nativeSessionId }),
+        ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+        outcome: { status: "failed", summary }
+      }, input.now);
+      if (result.disposition !== "applied" || result.run === null) {
+        return "state-changed";
+      }
+
+      enqueueWork(
+        store,
+        runtimeLifecycleTarget({
+          scope: "task",
+          taskId: input.taskId,
+          roleName: input.roleName
+        }),
+        RUNTIME_CLEANUP_REQUIRED_REASON,
+        input.now,
+        [{ type: "task", id: input.taskId }]
+      );
+
+      const terminal = result.run;
+      const message = createTaskMessage(
+        store.nextMessageId(input.taskId),
+        input.taskId,
+        summary,
+        "role-result",
+        { type: "role", roleName: input.roleName },
+        input.now,
+        {
+          runId: terminal.id,
+          ...(terminal.workItemId === undefined
+            ? {}
+            : { workItemId: terminal.workItemId })
+        }
+      );
+      store.saveMessage(input.taskId, message);
+      store.saveEvent(input.taskId, createTaskEvent(
+        store.nextEventId(input.taskId),
+        input.taskId,
+        "message.sent",
+        { messageId: message.id, kind: message.kind },
+        input.now
+      ));
+      store.saveEvent(input.taskId, createTaskEvent(
+        store.nextEventId(input.taskId),
+        input.taskId,
+        "runtime.role-delivery-failed",
+        {
+          runId: terminal.id,
+          roleName: input.roleName,
+          outcome: terminal.status
+        },
+        input.now
+      ));
+
+      if (terminal.purpose === "execution" && terminal.workItemId !== undefined) {
+        const item = store.getWorkItem(input.taskId, terminal.workItemId);
+        if (item !== null && ![
+          "completed", "failed", "retired"
+        ].includes(item.status)) {
+          store.saveWorkItem(
+            input.taskId,
+            updateWorkItemStatus(item, "failed", input.now, summary)
+          );
+        }
+      }
+
+      if (input.roleName !== "leader") {
+        enqueueWork(
+          store,
+          { kind: "role", taskId: input.taskId, roleName: "leader" },
+          terminal.purpose === "review" ? "review-failed" : "role-run-failed",
+          input.now,
+          [
+            { type: "run", taskId: input.taskId, id: terminal.id },
+            { type: "message", taskId: input.taskId, id: message.id },
+            ...(terminal.workItemId === undefined
+              ? []
+                : [{ type: "work-item" as const, taskId: input.taskId, id: terminal.workItemId }])
+          ]
+        );
+      } else {
+        const failedRole = store.getRole(input.taskId, input.roleName);
+        if (failedRole !== null) {
+          store.saveRole(
+            input.taskId,
+            updateRoleStatus(failedRole, "failed", input.now)
+          );
+        }
+        store.saveLeaderFailure(recordLeaderFailure(
+          input.taskId,
+          session?.nativeSessionId ?? "(unregistered)",
+          summary,
+          input.now,
+          store.getLeaderFailure(input.taskId)
+        ));
+        store.saveOperatorNotification(createLeaderRecoveryNotification(
+          input.taskId,
+          summary,
+          input.now,
+          store.getOperatorNotification(input.taskId)
+        ));
+        enqueueWork(
+          store,
+          { kind: "operator" },
+          "leader-run-failed",
+          input.now,
+          [
+            { type: "task", id: input.taskId },
+            { type: "run", taskId: input.taskId, id: terminal.id },
+            { type: "message", taskId: input.taskId, id: message.id }
+          ]
+        );
+      }
+      return "failed";
     });
   }
 
@@ -558,12 +781,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         task === null
         || task.status !== "active"
         || role === null
-        || role.activeAgentId !== input.role.activeAgentId
-        || activeRoleAgentBinding(role).adapterId !== input.role.adapterId
         || active === null
         || active.id !== input.claimed.run.id
         || active.status !== "active"
         || mailbox?.processing?.executionRef?.type !== "run"
+        || mailbox.processing.executionRef.taskId !== input.task.id
         || mailbox.processing.executionRef.id !== input.claimed.run.id
         || !schedulerRoleSessionsMatch(
           store.getRoleSession(input.task.id, input.role.name),
@@ -577,7 +799,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       clearTaskRoleRunInFlight(store, role, active, input.now);
       store.saveWorkMailbox(releaseProcessing(mailbox, mailbox.processing.batchId));
       store.saveRole(input.task.id, updateRoleStatus(role, "failed", input.now));
-      breakTaskSessionIfPresent(store, input.task.id, role.name, role.activeAgentId, input.now);
+      breakTaskSessionIfPresent(
+        store,
+        input.task.id,
+        role.name,
+        active.effective.agentId,
+        input.now
+      );
       const failure = recordLeaderFailure(
         input.task.id,
         input.failure.nativeSessionId,
@@ -608,8 +836,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         task === null
         || task.status !== "active"
         || role === null
-        || role.activeAgentId !== input.role.activeAgentId
-        || activeRoleAgentBinding(role).adapterId !== input.role.adapterId
         || currentRun === null
         || currentRun.id !== input.run.id
         || currentRun.status !== "active"
@@ -621,9 +847,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         sessions?.inFlight !== null
         && sessions !== null
         && (
-          sessions.inFlight.agentId !== role.activeAgentId
+          sessions.inFlight.agentId !== currentRun.effective.agentId
           || sessions.inFlight.runId !== currentRun.id
-          || sessions.inFlight.receiptId !== `agent-run:${currentRun.id}`
+          || sessions.inFlight.receiptId !== formatAgentRunReceiptId(task.id, currentRun.id)
         )
       ) {
         return "state-changed";
@@ -632,6 +858,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       const mailbox = store.getWorkMailbox(target);
       if (
         mailbox?.processing?.executionRef?.type !== "run"
+        || mailbox.processing.executionRef.taskId !== task.id
         || mailbox.processing.executionRef.id !== currentRun.id
       ) {
         return "state-changed";
@@ -642,7 +869,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       store.saveWorkMailbox(completeProcessing(mailbox, mailbox.processing.batchId));
       if (currentRun.purpose === "execution" && currentRun.workItemId !== undefined) {
         const workItem = store.getWorkItem(task.id, currentRun.workItemId);
-        if (workItem !== null && !["completed", "failed", "cancelled", "superseded"].includes(workItem.status)) {
+        if (workItem !== null && !["completed", "failed", "retired"].includes(workItem.status)) {
           store.saveWorkItem(
             task.id,
             updateWorkItemStatus(workItem, "failed", input.now, input.summary)
@@ -650,7 +877,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         }
       }
       store.saveRole(task.id, updateRoleStatus(role, "exited", input.now));
-      stopTaskSessionIfPresent(store, task.id, role.name, role.activeAgentId, input.now);
+      stopTaskSessionIfPresent(
+        store,
+        task.id,
+        role.name,
+        currentRun.effective.agentId,
+        input.now
+      );
       queueLeaderWakeup(
         store,
         task.id,
@@ -660,28 +893,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         input.now
       );
       return "failed";
-    });
-  }
-
-  saveArchivedTaskStopped(taskId: string, now: Date): void {
-    this.store.transaction((store) => {
-      const task = store.getTask(taskId);
-      if (task === null || task.status !== "archived") return;
-      for (const role of store.listRoles(taskId)) {
-        if (role.status !== "idle") {
-          store.saveRole(taskId, updateRoleStatus(role, "idle", now));
-        }
-      }
-      for (const current of store.listRoleSessionSets(taskId)) {
-        if (Object.values(current.sessions).every((session) => session.status === "stopped")) {
-          continue;
-        }
-        let updated: TaskRoleSessionSet = current;
-        for (const agentId of Object.keys(current.sessions)) {
-          updated = updateRoleAgentSessionStatus(updated, agentId, "stopped", now);
-        }
-        store.saveRoleSessionSet(updated);
-      }
     });
   }
 
@@ -700,12 +911,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }
 
   reserveRuntimeLaunch(
-    input: Readonly<{ owner: RuntimeRoleOwner; launchId: string }>,
+    input: Readonly<{ owner: RuntimeRoleOwner; launchId: string; runId?: string }>,
     assertCurrent: () => void,
     now = new Date()
   ): Readonly<{
     status: "reserved" | "existing";
     launchId: string;
+    runId?: string;
   }> {
     return this.store.transaction((store) => {
       assertCurrent();
@@ -715,9 +927,18 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         if (hasRuntimeCleanupObligation(existing)) {
           throw new Error("Runtime cleanup is still pending.");
         }
+        const executionRef = existing!.processing!.executionRef;
+        if (executionRef?.type === "run"
+          && (input.owner.scope !== "task"
+            || executionRef.taskId !== input.owner.taskId)) {
+          throw new Error("Runtime launch reservation belongs to another Task Run.");
+        }
         return {
           status: "existing",
-          launchId: existing!.processing!.batchId
+          launchId: existing!.processing!.batchId,
+          ...(executionRef?.type === "run"
+            ? { runId: executionRef.id }
+            : {})
         };
       }
       if (
@@ -732,19 +953,34 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         RUNTIME_LAUNCH_RESERVED_REASON,
         now,
         input.owner.scope === "task"
-          ? [{ type: "task", id: input.owner.taskId }]
+          ? [{ type: "task", id: input.owner.taskId } as const]
           : []
       );
       const queued = store.getWorkMailbox(target);
       if (queued === null || queued.pending === null || queued.processing !== null) {
         throw new Error("Runtime launch reservation could not be queued.");
       }
-      store.saveWorkMailbox(claimPending(queued, {
+      let claimed = claimPending(queued, {
         batchId: input.launchId,
         owner: RUNTIME_LIFECYCLE_OWNER,
         startedAt: now.toISOString()
-      }));
-      return { status: "reserved", launchId: input.launchId };
+      });
+      if (input.runId !== undefined) {
+        if (input.owner.scope !== "task") {
+          throw new Error("A Run-bound runtime reservation requires a Task owner.");
+        }
+        claimed = bindExecution(
+          claimed,
+          input.launchId,
+          { type: "run", taskId: input.owner.taskId, id: input.runId }
+        );
+      }
+      store.saveWorkMailbox(claimed);
+      return {
+        status: "reserved",
+        launchId: input.launchId,
+        ...(input.runId === undefined ? {} : { runId: input.runId })
+      };
     });
   }
 
@@ -764,6 +1000,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     agentId: string;
     adapterId: string;
     nativeSessionId: string;
+    effective: EffectiveLaunchSnapshot;
   }>, assertCurrent: () => void, now = new Date()): RoleAgentSession {
     return this.store.transaction((store) => {
       assertCurrent();
@@ -781,13 +1018,17 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             roleName: input.owner.roleName,
             agentId: input.agentId,
             adapterId: input.adapterId,
-            nativeSessionId: input.nativeSessionId
+            nativeSessionId: input.nativeSessionId,
+            launchId: input.launchId,
+            effective: input.effective
           }, now)
         : recordGlobalRuntimeNativeSession(store, {
             roleName: input.owner.roleName,
             agentId: input.agentId,
             adapterId: input.adapterId,
-            nativeSessionId: input.nativeSessionId
+            nativeSessionId: input.nativeSessionId,
+            launchId: input.launchId,
+            effective: input.effective
           }, now);
       saveRuntimeLifecycleMailbox(
         store,
@@ -799,12 +1040,28 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
 
   completeRuntimeLaunchReservation(
     owner: RuntimeRoleOwner,
-    launchId: string
+    launchId: string,
+    expectedTerminalRunId?: string
   ): boolean {
     return this.store.transaction((store) => {
       const target = runtimeLifecycleTarget(owner);
       const mailbox = store.getWorkMailbox(target);
       if (!isRuntimeLaunchReservation(mailbox?.processing, launchId)) return false;
+      if (expectedTerminalRunId !== undefined) {
+        const expectedRun = owner.scope === "task"
+          ? store.getAgentRun(owner.taskId, expectedTerminalRunId)
+          : null;
+        if (
+          owner.scope !== "task"
+          || mailbox?.processing?.executionRef?.type !== "run"
+          || mailbox.processing.executionRef.taskId !== owner.taskId
+          || mailbox.processing.executionRef.id !== expectedTerminalRunId
+          || expectedRun === null
+          || expectedRun.status === "active"
+        ) {
+          return false;
+        }
+      }
       saveRuntimeLifecycleMailbox(
         store,
         completeProcessing(mailbox!, launchId)
@@ -881,33 +1138,59 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     const task = this.store.getTask(input.taskId);
     const role = this.store.getRole(input.taskId, input.roleName);
     if (task === null || task.status === "archived" || role === null) return "obsolete";
-    const binding = activeRoleAgentBinding(role);
-    if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-      return "obsolete";
-    }
     const sessions = this.store.getTaskRoleSessionSet(input.taskId, input.roleName);
     const existing = sessions?.sessions[input.agentId];
+    const owner = {
+      scope: "task" as const,
+      taskId: input.taskId,
+      roleName: input.roleName
+    };
     if (
       existing === undefined
-      && !runtimeHookMatchesReservation(this.store, {
-        scope: "task",
-        taskId: input.taskId,
-        roleName: input.roleName
-      }, input.launchId)
+      && !runtimeHookMatchesReservation(this.store, owner, input.launchId)
     ) return "obsolete";
-    if (
-      existing !== undefined
-      && existing.nativeSessionId !== input.nativeSessionId
-    ) return "obsolete";
+    try {
+      const effectiveExisting = nativeTransitionExisting(
+        this.store,
+        owner,
+        existing,
+        input.nativeSessionId,
+        input.launchId,
+        "Runtime turn completion conflicts with the fixed Role session."
+      );
+      const effective = taskSessionEffective(
+        this.store,
+        input.taskId,
+        input.roleName,
+        input.agentId,
+        effectiveExisting
+      );
+      if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
+        return "obsolete";
+      }
+    } catch {
+      return "obsolete";
+    }
     if (sessions?.pendingTurnCompletion !== null && sessions !== null) {
       return sessions.pendingTurnCompletion.turnId === input.turnId
         ? "apply"
         : "deferred";
     }
-    // A first native Turn may be explicitly terminalized by the CLI before
-    // its Hook arrives. The Hook still owns the native-session fact even
-    // though there is no Run left to close.
-    if (sessions?.inFlight === null || sessions === null) return "apply";
+    // A normal explicit CLI yield may precede its native Hook; that Hook still
+    // owns the turn fact. A forced cleanup boundary or stopped process instead
+    // makes the old generation obsolete.
+    if (sessions?.inFlight === null || sessions === null) {
+      const cleanup = hasRuntimeCleanupObligation(this.store.getWorkMailbox(
+        runtimeLifecycleTarget({
+          scope: "task",
+          taskId: input.taskId,
+          roleName: input.roleName
+        })
+      ));
+      return cleanup || isObsoleteTerminalRuntimeRun(this.store, input)
+        ? "obsolete"
+        : "apply";
+    }
     if (input.runId === undefined || sessions.inFlight.runId !== input.runId) {
       return "obsolete";
     }
@@ -930,22 +1213,19 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     session: RoleAgentSession;
     duplicate: boolean;
     pendingRunId?: string;
+    disposition?: "obsolete";
   }> {
     return this.store.transaction((store) => {
       const task = store.getTask(input.taskId);
       if (task === null) throw new Error(`Task not found: ${input.taskId}.`);
-      if (task.status === "archived") {
-        throw new Error(`Cannot complete a runtime turn for archived Task: ${input.taskId}.`);
+      if (task.status !== "active") {
+        throw new Error(`Cannot complete a runtime turn for inactive Task: ${input.taskId}.`);
       }
       const role = requireRole(store, input.taskId, input.roleName);
-      const binding = activeRoleAgentBinding(role);
-      if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-        throw new Error("Runtime turn completion does not match the active Role Agent binding.");
-      }
       let sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName)
         ?? createRoleSessionSet(
           { scope: "task", taskId: input.taskId, roleName: input.roleName },
-          role.activeAgentId,
+          input.agentId,
           now
         );
       const existing = sessions.sessions[input.agentId];
@@ -960,15 +1240,31 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       ) {
         throw new Error("Runtime turn completion does not match the launch reservation.");
       }
-      if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
-        throw new Error("Runtime turn completion conflicts with the fixed Role session.");
+      const effectiveExisting = nativeTransitionExisting(
+        store,
+        owner,
+        existing,
+        input.nativeSessionId,
+        input.launchId,
+        "Runtime turn completion conflicts with the fixed Role session."
+      );
+      const effective = taskSessionEffective(
+        store,
+        task.id,
+        role.name,
+        input.agentId,
+        effectiveExisting
+      );
+      if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
+        throw new Error("Runtime turn completion does not match the effective launch identity.");
       }
-      if (existing !== undefined && hasRecentTurnId(existing.recentCompletedTurnIds, input.turnId)) {
-        return { session: existing, duplicate: true };
+      if (effectiveExisting !== undefined
+        && hasRecentTurnId(effectiveExisting.recentCompletedTurnIds, input.turnId)) {
+        return { session: effectiveExisting, duplicate: true };
       }
       const pending = sessions.pendingTurnCompletion;
       if (
-        existing !== undefined
+        effectiveExisting !== undefined
         && pending !== null
         && pending.agentId === input.agentId
         && pending.nativeSessionId === input.nativeSessionId
@@ -976,10 +1272,18 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         && pending.runId === input.runId
       ) {
         return {
-          session: existing,
+          session: effectiveExisting,
           duplicate: true,
           pendingRunId: pending.runId
         };
+      }
+      if (sessions.inFlight === null
+        && existing !== undefined
+        && (
+          hasRuntimeCleanupObligation(store.getWorkMailbox(runtimeLifecycleTarget(owner)))
+          || isObsoleteTerminalRuntimeRun(store, input)
+        )) {
+        return { session: existing, duplicate: false, disposition: "obsolete" };
       }
       // Classification is only an optimization. Revalidate the Run inside the
       // authoritative transaction before a Hook may claim a native identity.
@@ -990,20 +1294,23 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           || sessions.inFlight.runId !== input.runId
         )
       ) {
-        if (existing === undefined) {
+        if (effectiveExisting === undefined) {
           throw new Error("Runtime turn completion no longer matches the in-flight Run.");
         }
-        return { session: existing, duplicate: false };
+        return { session: effectiveExisting, duplicate: false };
       }
-      const idleStatus = existing?.status === "stopped" || existing?.status === "broken"
-        ? existing.status
+      const idleStatus = effectiveExisting?.status === "stopped"
+        || effectiveExisting?.status === "broken"
+        ? effectiveExisting.status
         : "ready";
       sessions = recordRoleAgentSession(sessions, {
         agentId: input.agentId,
         adapterId: input.adapterId,
         nativeSessionId: input.nativeSessionId,
+        ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
         policy: "fixed",
-        status: sessions.inFlight === null ? idleStatus : "running"
+        status: sessions.inFlight === null ? idleStatus : "running",
+        effective
       }, now);
       if (sessions.inFlight === null) {
         sessions = rememberRoleAgentCompletedTurn(
@@ -1107,7 +1414,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             expectedRunId: completion.runId,
             summary: completion.summary
           }, now);
-          if (result.finalizedRunId !== undefined) finalized.push(result.finalizedRunId);
+          if (result.finalizedRunId !== undefined) {
+            finalized.push(formatTaskRecordReference(
+              completion.taskId,
+              result.finalizedRunId,
+              "agentRun"
+            ));
+          }
         }
         let settled = store.getTaskRoleSessionSet(completion.taskId, completion.roleName);
         if (settled?.pendingTurnCompletion?.turnId !== completion.turnId) return;
@@ -1123,11 +1436,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return finalized;
   }
 
-  /**
-   * Codex has returned to its composer. A delivered Leader control Run cannot
-   * remain active past this boundary: doing so would permanently fence later
-   * Worker-result wakeups behind a process that is alive but no longer busy.
-   */
+  /** A structured native Turn-completion event terminalizes its exact Run fence. */
   recordRuntimeTurnCompleted(input: Readonly<{
     taskId: string;
     roleName: string;
@@ -1145,18 +1454,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return this.store.transaction((store) => {
       const task = store.getTask(input.taskId);
       if (task === null) throw new Error(`Task not found: ${input.taskId}.`);
-      if (task.status === "archived") {
-        throw new Error(`Cannot complete a runtime turn for archived Task: ${input.taskId}.`);
+      if (task.status !== "active") {
+        throw new Error(`Cannot complete a runtime turn for inactive Task: ${input.taskId}.`);
       }
       const role = requireRole(store, input.taskId, input.roleName);
-      const binding = activeRoleAgentBinding(role);
-      if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-        throw new Error("Runtime turn completion does not match the active Role Agent binding.");
-      }
       const current = store.getRoleSessionSet(input.taskId, input.roleName)
         ?? createRoleSessionSet(
           { scope: "task", taskId: input.taskId, roleName: input.roleName },
-          role.activeAgentId,
+          input.agentId,
           now
         );
       const existing = current.sessions[input.agentId];
@@ -1171,17 +1476,34 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       ) {
         throw new Error("Runtime turn completion does not match the launch reservation.");
       }
-      if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
-        throw new Error("Runtime turn completion conflicts with the fixed Role session.");
+      const effectiveExisting = nativeTransitionExisting(
+        store,
+        owner,
+        existing,
+        input.nativeSessionId,
+        input.launchId,
+        "Runtime turn completion conflicts with the fixed Role session."
+      );
+      const effective = taskSessionEffective(
+        store,
+        task.id,
+        role.name,
+        input.agentId,
+        effectiveExisting
+      );
+      if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
+        throw new Error("Runtime turn completion does not match the effective launch identity.");
       }
-      const sessions = existing?.status === "ready"
+      const sessions = effectiveExisting?.status === "ready"
         ? current
         : recordRoleAgentSession(current, {
             agentId: input.agentId,
             adapterId: input.adapterId,
             nativeSessionId: input.nativeSessionId,
+            ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
             policy: "fixed",
-            status: "ready"
+            status: "ready",
+            effective
           }, now);
       if (
         input.expectedRunId !== undefined
@@ -1205,51 +1527,54 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
 
       if (role.name !== "leader" || active.workItemId !== undefined) {
         const summary = `Role turn completed without yui task run yield. Last assistant message: ${input.summary}`;
-        const terminal = failAgentRun(active, summary, now);
-        const target = { kind: "role", taskId: task.id, roleName: role.name } as const;
-        store.saveAgentRun(terminal);
-        if (!completeWorkExecution(store, target, { type: "run", id: terminal.id })) {
-          throw new Error(`Role Run mailbox execution is inconsistent: ${terminal.id}.`);
+        const result = terminalizeExactTaskRun(store, {
+          taskId: task.id,
+          roleName: role.name,
+          agentId: active.effective.agentId,
+          runId: active.id,
+          receiptId: formatAgentRunReceiptId(task.id, active.id),
+          nativeSessionId: input.nativeSessionId,
+          ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+          outcome: { status: "failed", summary }
+        }, now);
+        if (result.disposition !== "applied" || result.run === null) {
+          throw new Error(
+            `Role Run changed during native Turn completion: ${active.id}/${result.reason}.`
+          );
         }
-        store.clearActiveAgentRun(task.id, role.name);
-        store.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(
-          store.getTaskRoleSessionSet(task.id, role.name)!,
-          {
-            agentId: role.activeAgentId,
-            runId: active.id,
-            receiptId: `agent-run:${active.id}`
-          },
-          now
-        ));
+        const terminal = result.run;
         if (active.purpose === "execution" && active.workItemId !== undefined) {
           const item = store.getWorkItem(task.id, active.workItemId);
-          if (item !== null && !["completed", "failed", "cancelled", "superseded"].includes(item.status)) {
+          if (item !== null && !["completed", "failed", "retired"].includes(item.status)) {
             store.saveWorkItem(
               task.id,
               updateWorkItemStatus(item, "failed", now, summary)
             );
           }
         }
-        store.saveRole(task.id, updateRoleStatus(role, "idle", now));
         enqueueWork(
           store,
           { kind: "role", taskId: task.id, roleName: "leader" },
           "role-run-failed",
           now,
           [
-            { type: "run", id: terminal.id },
+            { type: "run", taskId: task.id, id: terminal.id },
             ...(terminal.workItemId === undefined
               ? []
-              : [{ type: "work-item" as const, id: terminal.workItemId }])
+              : [{
+                  type: "work-item" as const,
+                  taskId: task.id,
+                  id: terminal.workItemId
+                }])
           ]
         );
         return { session, finalizedRunId: terminal.id };
       }
 
-      const terminal = yieldAgentRun(active, input.summary, now);
       const leaderTarget = { kind: "role", taskId: task.id, roleName: role.name } as const;
       const leaderMailbox = store.getWorkMailbox(leaderTarget);
       const recoveryTurn = leaderMailbox?.processing?.executionRef?.type === "run"
+        && leaderMailbox.processing.executionRef.taskId === task.id
         && leaderMailbox.processing.executionRef.id === active.id
         && leaderMailbox.processing.batch.reasons.includes("leader-turn-unclosed");
       const quiescent = leaderMailbox?.pending === null
@@ -1259,40 +1584,39 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         ))
         && !store.listWorkItems(task.id).some((item) => item.status === "running")
         && !store.listInputRequests(task.id).some((request) => request.status === "open");
+      const result = terminalizeExactTaskRun(store, {
+        taskId: task.id,
+        roleName: role.name,
+        agentId: active.effective.agentId,
+        runId: active.id,
+        receiptId: formatAgentRunReceiptId(task.id, active.id),
+        nativeSessionId: input.nativeSessionId,
+        ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+        outcome: { status: "yielded", summary: input.summary }
+      }, now);
+      if (result.disposition !== "applied" || result.run === null) {
+        throw new Error(
+          `Leader Run changed during native Turn completion: ${active.id}/${result.reason}.`
+        );
+      }
+      const terminal = result.run;
       const message = createTaskMessage(
         store.nextMessageId(task.id),
+        task.id,
         input.summary,
         "role-result",
         { type: "role", roleName: role.name },
         now,
         { runId: terminal.id }
       );
-      store.saveAgentRun(terminal);
       store.saveMessage(task.id, message);
       store.saveEvent(task.id, createTaskEvent(
         store.nextEventId(task.id),
+        task.id,
         "message.sent",
         { messageId: message.id, kind: message.kind },
         now
       ));
-      if (!completeWorkExecution(
-        store,
-        leaderTarget,
-        { type: "run", id: terminal.id }
-      )) {
-        throw new Error(`Leader Run mailbox execution is inconsistent: ${terminal.id}.`);
-      }
-      store.clearActiveAgentRun(task.id, role.name);
-      store.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(
-        store.getTaskRoleSessionSet(task.id, role.name)!,
-        {
-          agentId: role.activeAgentId,
-          runId: active.id,
-          receiptId: `agent-run:${active.id}`
-        },
-        now
-      ));
-      store.saveRole(task.id, updateRoleStatus(role, "idle", now));
       if (quiescent) {
         if (recoveryTurn) {
           const message = "Leader ended a recovery Turn without completing, blocking, or continuing the Task.";
@@ -1317,7 +1641,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             now,
             [
               { type: "task", id: task.id },
-              { type: "run", id: terminal.id }
+              { type: "run", taskId: task.id, id: terminal.id }
             ]
           );
         } else {
@@ -1328,7 +1652,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             now,
             [
               { type: "task", id: task.id },
-              { type: "run", id: terminal.id }
+              { type: "run", taskId: task.id, id: terminal.id }
             ]
           );
         }
@@ -1337,10 +1661,195 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     });
   }
 
+  classifyClaudeStopFailureEvent(
+    input: TaskClaudeStopFailureEvent
+  ): "apply" | "obsolete" {
+    const task = this.store.getTask(input.taskId);
+    if (task?.status !== "active") return "obsolete";
+    const role = this.store.getRole(input.taskId, input.roleName);
+    if (role === null) return "obsolete";
+    const run = this.store.getAgentRun(input.taskId, input.runId);
+    const active = this.store.getActiveAgentRun(input.taskId, input.roleName);
+    if (
+      run === null
+      || run.status !== "active"
+      || active?.id !== run.id
+      || run.roleName !== input.roleName
+      || run.effective.agentId !== input.agentId
+      || run.effective.adapterId !== "claude"
+      || input.adapterId !== "claude"
+    ) return "obsolete";
+    const sessions = this.store.getTaskRoleSessionSet(input.taskId, input.roleName);
+    const session = sessions?.sessions[input.agentId];
+    if (
+      sessions === null
+      || session?.nativeSessionId !== input.nativeSessionId
+      || session.launchId !== input.launchId
+      || sessions.inFlight?.agentId !== input.agentId
+      || sessions.inFlight.runId !== input.runId
+      || sessions.inFlight.receiptId !== `agent-run:${input.taskId}/${input.runId}`
+    ) return "obsolete";
+    return "apply";
+  }
+
+  observeClaudeStopFailureEvent(
+    input: TaskClaudeStopFailureEvent,
+    now = new Date()
+  ): Readonly<{ disposition: "applied" | "obsolete"; runId: string }> {
+    return this.store.transaction((store) => {
+      const before = store.getAgentRun(input.taskId, input.runId);
+      if (before === null) {
+        recordObsoleteRuntimeEvent(store, input, "run-missing", now);
+        return { disposition: "obsolete", runId: input.runId };
+      }
+      const summary = claudeStopFailureSummary(input);
+      const result = terminalizeExactTaskRun(store, {
+        taskId: input.taskId,
+        roleName: input.roleName,
+        agentId: input.agentId,
+        runId: input.runId,
+        receiptId: `agent-run:${input.taskId}/${input.runId}`,
+        nativeSessionId: input.nativeSessionId,
+        launchId: input.launchId,
+        outcome: {
+          status: "failed",
+          summary
+        }
+      }, now);
+      if (result.disposition === "obsolete" || result.run === null) {
+        recordObsoleteRuntimeEvent(
+          store,
+          input,
+          result.reason ?? "identity-mismatch-or-terminal",
+          now
+        );
+        return { disposition: "obsolete", runId: input.runId };
+      }
+
+      enqueueWork(
+        store,
+        runtimeLifecycleTarget({
+          scope: "task",
+          taskId: input.taskId,
+          roleName: input.roleName
+        }),
+        RUNTIME_CLEANUP_REQUIRED_REASON,
+        now,
+        [{ type: "task", id: input.taskId }]
+      );
+
+      const terminal = result.run;
+      const message = createTaskMessage(
+        store.nextMessageId(input.taskId),
+        input.taskId,
+        summary,
+        "role-result",
+        { type: "role", roleName: input.roleName },
+        now,
+        {
+          runId: input.runId,
+          ...(before.workItemId === undefined ? {} : { workItemId: before.workItemId })
+        }
+      );
+      store.saveMessage(input.taskId, message);
+      store.saveEvent(input.taskId, createTaskEvent(
+        store.nextEventId(input.taskId),
+        input.taskId,
+        "message.sent",
+        { messageId: message.id, kind: message.kind },
+        now
+      ));
+
+      if (before.purpose === "execution" && before.workItemId !== undefined) {
+        const item = store.getWorkItem(input.taskId, before.workItemId);
+        if (item !== null && ![
+          "completed", "failed", "retired"
+        ].includes(item.status)) {
+          store.saveWorkItem(
+            input.taskId,
+            updateWorkItemStatus(item, "failed", now, summary)
+          );
+        }
+      }
+      const role = store.getRole(input.taskId, input.roleName);
+      if (role !== null) {
+        store.saveRole(
+          input.taskId,
+          updateRoleStatus(role, input.roleName === "leader" ? "failed" : "idle", now)
+        );
+      }
+
+      store.saveEvent(input.taskId, createTaskEvent(
+        store.nextEventId(input.taskId),
+        input.taskId,
+        "runtime.claude-stop-failure",
+        {
+          eventId: input.eventId,
+          runId: input.runId,
+          roleName: input.roleName,
+          outcome: terminal.status
+        },
+        now
+      ));
+
+      if (input.roleName !== "leader") {
+        enqueueWork(
+          store,
+          { kind: "role", taskId: input.taskId, roleName: "leader" },
+          before.purpose === "review" ? "review-failed" : "role-run-failed",
+          now,
+          [
+            { type: "run", taskId: input.taskId, id: terminal.id },
+            { type: "message", taskId: input.taskId, id: message.id },
+            ...(terminal.workItemId === undefined
+              ? []
+              : [{ type: "work-item" as const, taskId: input.taskId, id: terminal.workItemId }])
+          ]
+        );
+      } else {
+        store.saveOperatorNotification(createLeaderRecoveryNotification(
+          input.taskId,
+          summary,
+          now,
+          store.getOperatorNotification(input.taskId)
+        ));
+        enqueueWork(
+          store,
+          { kind: "operator" },
+          "leader-run-failed",
+          now,
+          [
+            { type: "task", id: input.taskId },
+            { type: "run", taskId: input.taskId, id: terminal.id }
+          ]
+        );
+      }
+      return { disposition: "applied", runId: input.runId };
+    });
+  }
+
+  observeObsoleteRuntimeEvent(input: Readonly<{
+    eventId: string;
+    eventType: string;
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    runId?: string;
+    launchId?: string;
+    nativeSessionId: string;
+    reason: string;
+  }>, now = new Date()): void {
+    this.store.transaction((store) => {
+      if (store.getTask(input.taskId) === null) return;
+      recordObsoleteRuntimeEvent(store, input, input.reason, now);
+    });
+  }
+
   recordGlobalRuntimeNativeSession(input: Readonly<{
     roleName: string;
     agentId: string;
     adapterId: string;
+    launchId?: string;
     nativeSessionId: string;
   }>, now = new Date()): RoleAgentSession {
     return this.store.transaction((store) => (
@@ -1361,14 +1870,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return this.store.transaction((store) => {
       const role = store.getGlobalRole(input.roleName);
       if (role === null) throw new Error(`Global Role not found: ${input.roleName}.`);
-      const binding = activeRoleAgentBinding(role);
-      if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-        throw new Error("Runtime turn completion does not match the active global Role Agent binding.");
-      }
       let current: GlobalRoleSessionSet = store.getGlobalRoleSessionSet(input.roleName)
         ?? createRoleSessionSet(
           { scope: "global", roleName: input.roleName },
-          role.activeAgentId,
+          input.agentId,
           now
         );
       const existing = current.sessions[input.agentId];
@@ -1384,22 +1889,34 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           "Runtime turn completion does not match the global launch reservation."
         );
       }
-      if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
-        throw new Error("Runtime turn completion conflicts with the fixed global Role session.");
+      const effectiveExisting = nativeTransitionExisting(
+        store,
+        owner,
+        existing,
+        input.nativeSessionId,
+        input.launchId,
+        "Runtime turn completion conflicts with the fixed global Role session."
+      );
+      const effective = globalSessionEffective(role, effectiveExisting);
+      if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
+        throw new Error("Runtime turn completion does not match the effective global launch identity.");
       }
-      const completedStatus = existing?.status === "stopped" || existing?.status === "broken"
-        ? existing.status
+      const completedStatus = effectiveExisting?.status === "stopped"
+        || effectiveExisting?.status === "broken"
+        ? effectiveExisting.status
         : "ready";
       current = recordRoleAgentSession(current, {
         agentId: input.agentId,
         adapterId: input.adapterId,
         nativeSessionId: input.nativeSessionId,
-        title: existing?.title ?? input.title,
-        preview: existing?.preview ?? (
+        ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+        title: effectiveExisting?.title ?? input.title,
+        preview: effectiveExisting?.preview ?? (
           input.summary === undefined ? undefined : sessionPreview(input.summary)
         ),
         policy: "fixed",
-        status: completedStatus
+        status: completedStatus,
+        effective
       }, now);
       current = rememberRoleAgentCompletedTurn(
         current,
@@ -1423,24 +1940,133 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }>): "apply" | "obsolete" {
     const role = this.store.getGlobalRole(input.roleName);
     if (role === null) return "obsolete";
-    const binding = activeRoleAgentBinding(role);
-    if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-      return "obsolete";
-    }
     const existing = this.store.getGlobalRoleSessionSet(input.roleName)
       ?.sessions[input.agentId];
+    const owner = {
+      scope: "global" as const,
+      roleName: input.roleName
+    };
     if (
       existing === undefined
-      && !runtimeHookMatchesReservation(this.store, {
-        scope: "global",
-        roleName: input.roleName
-      }, input.launchId)
+      && !runtimeHookMatchesReservation(this.store, owner, input.launchId)
     ) return "obsolete";
-    return existing !== undefined
-      && existing.nativeSessionId !== input.nativeSessionId
-      ? "obsolete"
-      : "apply";
+    let effectiveExisting: RoleAgentSession | undefined;
+    try {
+      effectiveExisting = nativeTransitionExisting(
+        this.store,
+        owner,
+        existing,
+        input.nativeSessionId,
+        input.launchId,
+        "Runtime turn completion conflicts with the fixed global Role session."
+      );
+    } catch {
+      return "obsolete";
+    }
+    const effective = globalSessionEffective(role, effectiveExisting);
+    if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
+      return "obsolete";
+    }
+    return "apply";
   }
+}
+
+function claudeStopFailureSummary(input: TaskClaudeStopFailureEvent): string {
+  return [
+    "Claude StopFailure.",
+    `error: ${input.error}`,
+    ...(input.errorDetails === undefined
+      ? []
+      : [`error_details: ${input.errorDetails}`]),
+    ...(input.lastAssistantMessage === undefined
+      ? []
+      : [`last_assistant_message: ${input.lastAssistantMessage}`])
+  ].join("\n");
+}
+
+function recordObsoleteRuntimeEvent(
+  store: TaskStore,
+  input: Readonly<{
+    eventId: string;
+    eventType?: string;
+    type?: string;
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    runId?: string;
+    launchId?: string;
+    nativeSessionId: string;
+  }>,
+  reason: string,
+  now: Date
+): void {
+  if (store.listEvents(input.taskId).some((event) => (
+    event.type === "runtime.event-obsolete"
+    && event.payload.eventId === input.eventId
+  ))) return;
+  store.saveEvent(input.taskId, createTaskEvent(
+    store.nextEventId(input.taskId),
+    input.taskId,
+    "runtime.event-obsolete",
+    {
+      eventId: input.eventId,
+      eventType: input.eventType ?? input.type ?? "unknown",
+      roleName: input.roleName,
+      agentId: input.agentId,
+      nativeSessionId: input.nativeSessionId,
+      ...(input.runId === undefined ? {} : { runId: input.runId }),
+      ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+      reason
+    },
+    now
+  ));
+}
+
+function isLeaderDisposedWorkItemRun(
+  store: TaskStore,
+  input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    runId?: string;
+  }>
+): boolean {
+  if (input.runId === undefined) return false;
+  const run = store.getAgentRun(input.taskId, input.runId);
+  if (run === null
+    || run.status !== "failed"
+    || run.roleName !== input.roleName
+    || run.effective.agentId !== input.agentId
+    || run.workItemId === undefined) {
+    return false;
+  }
+  return store.getWorkItem(input.taskId, run.workItemId)?.disposition !== undefined;
+}
+
+function isObsoleteTerminalRuntimeRun(
+  store: TaskStore,
+  input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    runId?: string;
+  }>
+): boolean {
+  if (isLeaderDisposedWorkItemRun(store, input)) return true;
+  if (input.runId === undefined) return false;
+  const run = store.getAgentRun(input.taskId, input.runId);
+  if (
+    run === null
+    || run.status !== "failed"
+    || run.roleName !== input.roleName
+    || run.effective.agentId !== input.agentId
+  ) {
+    return false;
+  }
+  return store.listEvents(input.taskId).some((event) => (
+    event.type === "runtime.role-delivery-failed"
+    && event.payload.runId === input.runId
+  ));
 }
 
 function sessionPreview(value: string): string {
@@ -1575,15 +2201,83 @@ function runtimeSessionMatchesSettledLaunch(
     );
 }
 
+function preparedSessionMatches(
+  session: RoleAgentSession | undefined,
+  agentId: string,
+  adapterId: string,
+  nativeSessionId: string | undefined,
+  launchId: string | undefined
+): boolean {
+  if (session === undefined) return nativeSessionId === undefined;
+  if (
+    session.agentId !== agentId
+    || session.adapterId !== adapterId
+    || session.status === "stopped"
+    || session.status === "broken"
+    || (nativeSessionId !== undefined
+      && session.nativeSessionId !== nativeSessionId)
+  ) {
+    return false;
+  }
+  return launchId === undefined
+    ? session.launchId === undefined
+    : session.launchId === launchId;
+}
+
+function preparedDeliveryFailureSessionFenceMatches(
+  sessions: TaskRoleSessionSet | null,
+  session: RoleAgentSession | undefined,
+  input: Pick<
+    RoleRunDeliveryFailurePersistence,
+    "taskId" | "agentId" | "adapterId" | "runId" | "nativeSessionId" | "launchId"
+  >
+): boolean {
+  if (sessions === null) return input.nativeSessionId === undefined;
+  if (sessions.activeAgentId !== input.agentId) return false;
+  if (sessions.inFlight === null) {
+    return input.nativeSessionId === undefined
+      && session === undefined
+      && sessions.pendingTurnCompletion === null;
+  }
+  return sessions.inFlight.agentId === input.agentId
+    && sessions.inFlight.runId === input.runId
+    && sessions.inFlight.receiptId === formatAgentRunReceiptId(input.taskId, input.runId)
+    && sessions.inFlight.deliveredAt === undefined
+    && preparedSessionMatches(
+      session,
+      input.agentId,
+      input.adapterId,
+      input.nativeSessionId,
+      input.launchId
+    );
+}
+
+function preparedReservationMatches(
+  mailbox: WorkMailbox | null,
+  taskId: string,
+  runId: string,
+  launchId: string | undefined
+): boolean {
+  if (launchId === undefined) {
+    return !isRuntimeLaunchReservation(mailbox?.processing);
+  }
+  const processing = mailbox?.processing;
+  return isRuntimeLaunchReservation(processing, launchId)
+    && !hasRuntimeCleanupObligation(mailbox)
+    && processing?.executionRef?.type === "run"
+    && processing.executionRef.taskId === taskId
+    && processing.executionRef.id === runId;
+}
+
 function matchingPreparedRuntimeReservation(
   store: TaskStore,
   input: Readonly<{
     task: { id: string };
     role: { name: string };
+    run: { id: string };
     session: SchedulerRoleSession | null;
     launchId?: string;
-  }>,
-  existing: SchedulerRoleSession | null
+  }>
 ): WorkMailbox | null {
   if (
     input.launchId === undefined
@@ -1599,16 +2293,11 @@ function matchingPreparedRuntimeReservation(
   const mailbox = store.getWorkMailbox(runtimeLifecycleTarget(owner));
   if (
     isRuntimeLaunchReservation(mailbox?.processing, input.launchId)
+    && mailbox?.processing?.executionRef?.type === "run"
+    && mailbox.processing.executionRef.id === input.run.id
     && !hasRuntimeCleanupObligation(mailbox)
   ) {
     return mailbox;
-  }
-  if (
-    existing?.agentId === input.session.agentId
-    && existing.adapterId === input.session.adapterId
-    && existing.nativeSessionId === input.session.nativeSessionId
-  ) {
-    return null;
   }
   throw new Error("Prepared Role session does not match its launch generation.");
 }
@@ -1631,7 +2320,9 @@ function recordTaskRuntimeNativeSession(
     roleName: string;
     agentId: string;
     adapterId: string;
+    launchId?: string;
     nativeSessionId: string;
+    effective?: EffectiveLaunchSnapshot;
   }>,
   now: Date
 ): RoleAgentSession {
@@ -1646,27 +2337,47 @@ function recordTaskRuntimeNativeSession(
     );
   }
   const role = requireRole(store, input.taskId, input.roleName);
-  const binding = activeRoleAgentBinding(role);
-  if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-    throw new Error("Native session registration does not match the active Role Agent binding.");
-  }
   const current = store.getRoleSessionSet(input.taskId, input.roleName)
     ?? createRoleSessionSet(
       { scope: "task", taskId: input.taskId, roleName: input.roleName },
-      role.activeAgentId,
+      input.agentId,
       now
     );
   const existing = current.sessions[input.agentId];
-  if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
-    throw new Error("Native session registration conflicts with the fixed Role session.");
+  const effectiveExisting = nativeTransitionExisting(
+    store,
+    { scope: "task", taskId: input.taskId, roleName: input.roleName },
+    existing,
+    input.nativeSessionId,
+    input.launchId,
+    "Native session registration conflicts with the fixed Role session."
+  );
+  if (existing?.status === "running"
+    && (input.launchId === undefined || existing.launchId === input.launchId)) return existing;
+  const resolvedEffective = taskSessionEffective(
+    store,
+    input.taskId,
+    input.roleName,
+    input.agentId,
+    effectiveExisting
+  );
+  const effective = input.effective === undefined
+    ? resolvedEffective
+    : validateEffectiveLaunchSnapshot(input.effective);
+  if (!effectiveLaunchSnapshotsCompatible(resolvedEffective, effective)) {
+    throw new Error("Reserved native Session effective launch changed before persistence.");
   }
-  if (existing?.status === "running") return existing;
+  if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
+    throw new Error("Native session registration does not match the effective launch identity.");
+  }
   const updated = recordRoleAgentSession(current, {
     agentId: input.agentId,
     adapterId: input.adapterId,
     nativeSessionId: input.nativeSessionId,
+    ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
     policy: "fixed",
-    status: "running"
+    status: "running",
+    effective
   }, now);
   store.saveRoleSessionSet(updated);
   return updated.sessions[input.agentId]!;
@@ -1678,42 +2389,87 @@ function recordGlobalRuntimeNativeSession(
     roleName: string;
     agentId: string;
     adapterId: string;
+    launchId?: string;
     nativeSessionId: string;
+    effective?: EffectiveLaunchSnapshot;
   }>,
   now: Date
 ): RoleAgentSession {
   const role = store.getGlobalRole(input.roleName);
   if (role === null) throw new Error(`Global Role not found: ${input.roleName}.`);
-  const binding = activeRoleAgentBinding(role);
-  if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-    throw new Error(
-      "Native session registration does not match the active global Role Agent binding."
-    );
-  }
   const current: GlobalRoleSessionSet = store.getGlobalRoleSessionSet(input.roleName)
     ?? createRoleSessionSet(
       { scope: "global", roleName: input.roleName },
-      role.activeAgentId,
+      input.agentId,
       now
     );
   const existing = current.sessions[input.agentId];
-  if (existing !== undefined && existing.nativeSessionId !== input.nativeSessionId) {
-    throw new Error("Native session registration conflicts with the fixed global Role session.");
+  const effectiveExisting = nativeTransitionExisting(
+    store,
+    { scope: "global", roleName: input.roleName },
+    existing,
+    input.nativeSessionId,
+    input.launchId,
+    "Native session registration conflicts with the fixed global Role session."
+  );
+  if (existing?.status === "running"
+    && (input.launchId === undefined || existing.launchId === input.launchId)) return existing;
+  const resolvedEffective = globalSessionEffective(role, effectiveExisting);
+  const effective = input.effective === undefined
+    ? resolvedEffective
+    : validateEffectiveLaunchSnapshot(input.effective);
+  if (!effectiveLaunchSnapshotsCompatible(resolvedEffective, effective)) {
+    throw new Error("Reserved global native Session effective launch changed before persistence.");
   }
-  if (existing?.status === "running") return existing;
+  if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
+    throw new Error("Native session registration does not match the effective global launch identity.");
+  }
   const updated = recordRoleAgentSession(current, {
     agentId: input.agentId,
     adapterId: input.adapterId,
     nativeSessionId: input.nativeSessionId,
+    ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
     policy: "fixed",
-    status: "running"
+    status: "running",
+    effective
   }, now);
   store.saveGlobalRoleSessionSet(updated);
   return updated.sessions[input.agentId]!;
 }
 
-function mapRole(role: ReturnType<TaskStore["getRole"]> extends infer _T ? NonNullable<ReturnType<TaskStore["getRole"]>> : never): SchedulerRole {
+function nativeTransitionExisting(
+  store: TaskStore,
+  owner: RuntimeRoleOwner,
+  existing: RoleAgentSession | undefined,
+  nativeSessionId: string,
+  launchId: string | undefined,
+  conflictMessage: string
+): RoleAgentSession | undefined {
+  if (existing === undefined || existing.nativeSessionId === nativeSessionId) {
+    return existing;
+  }
+  if (
+    (existing.status === "stopped" || existing.status === "broken")
+    && runtimeHookMatchesReservation(store, owner, launchId)
+  ) {
+    return undefined;
+  }
+  throw new Error(conflictMessage);
+}
+
+function mapRole(
+  store: TaskStore,
+  role: NonNullable<ReturnType<TaskStore["getRole"]>>
+): SchedulerRole {
   const binding = activeRoleAgentBinding(role);
+  const workspace = store.getRoleWorkspace(role.taskId, role.name) ?? undefined;
+  const effective = activeLiveRoleAgentSession(
+    store.getTaskRoleSessionSet(role.taskId, role.name)
+  )?.effective ?? resolveEffectiveLaunch({
+      role,
+      purpose: "execution",
+      ...(workspace === undefined ? {} : { workspace })
+    });
   return {
     taskId: role.taskId,
     name: role.name,
@@ -1721,9 +2477,54 @@ function mapRole(role: ReturnType<TaskStore["getRole"]> extends infer _T ? NonNu
     adapterId: binding.adapterId,
     ...(binding.config.model === undefined ? {} : { model: binding.config.model }),
     ...(binding.config.effort === undefined ? {} : { effort: binding.config.effort }),
+    effective,
     workspace: role.workspace,
     status: role.status
   };
+}
+
+function taskSessionEffective(
+  store: TaskStore,
+  taskId: string,
+  roleName: string,
+  agentId: string,
+  existing: RoleAgentSession | undefined
+) {
+  const active = store.getActiveAgentRun(taskId, roleName);
+  if (active !== null) {
+    if (active.effective.agentId !== agentId) {
+      throw new Error(
+        `Native Session registration does not match the effective Run Agent: ${taskId}/${roleName}.`
+      );
+    }
+    return active.effective;
+  }
+  if (existing !== undefined) return existing.effective;
+  const role = store.getRole(taskId, roleName);
+  if (role === null) throw new Error(`Role not found: ${taskId}/${roleName}.`);
+  const workspace = store.getRoleWorkspace(taskId, roleName)
+    ?? store.getRoleWorkspace(taskId, "leader")
+    ?? undefined;
+  const item = workspace?.owner.type === "work-item"
+    ? store.getWorkItem(taskId, workspace.owner.workItemId)
+    : null;
+  const effective = resolveEffectiveLaunch({
+    role,
+    purpose: "execution",
+    ...(workspace === undefined ? {} : { workspace }),
+    ...(item === null ? {} : { workItemWriteProjectIds: item.writeProjectIds })
+  });
+  if (effective.agentId !== agentId) {
+    throw new Error(`Native Session registration does not match Role desired Agent: ${agentId}.`);
+  }
+  return effective;
+}
+
+function globalSessionEffective(
+  role: Parameters<typeof resolveEffectiveLaunch>[0]["role"],
+  existing: RoleAgentSession | undefined,
+) {
+  return existing?.effective ?? resolveEffectiveLaunch({ role, purpose: "execution" });
 }
 
 function mapSession(session: RoleAgentSession): SchedulerRoleSession {
@@ -1731,7 +2532,8 @@ function mapSession(session: RoleAgentSession): SchedulerRoleSession {
     agentId: session.agentId,
     adapterId: session.adapterId,
     nativeSessionId: session.nativeSessionId,
-    status: session.status
+    status: session.status,
+    effective: session.effective
   };
 }
 
@@ -1740,20 +2542,23 @@ function saveTaskSession(
   role: NonNullable<ReturnType<TaskStore["getRole"]>>,
   session: SchedulerRoleSession & { nativeSessionId: string },
   status: AgentSessionStatus,
-  now: Date
+  now: Date,
+  launchId?: string
 ): void {
   const current = store.getRoleSessionSet(role.taskId, role.name)
     ?? createRoleSessionSet(
       { scope: "task", taskId: role.taskId, roleName: role.name },
-      role.activeAgentId,
+      session.agentId,
       now
     );
   const updated = recordRoleAgentSession(current, {
     agentId: session.agentId,
     adapterId: session.adapterId,
     nativeSessionId: session.nativeSessionId,
+    ...(launchId === undefined ? {} : { launchId }),
     policy: "fixed",
-    status
+    status,
+    effective: session.effective
   }, now);
   store.saveRoleSessionSet(updated);
 }
@@ -1761,19 +2566,40 @@ function saveTaskSession(
 function bindTaskRoleRunInFlight(
   store: TaskStore,
   role: NonNullable<ReturnType<TaskStore["getRole"]>>,
-  run: { id: string },
+  run: { id: string; effective: { agentId: string } },
   now: Date
 ): void {
-  const current = store.getRoleSessionSet(role.taskId, role.name)
+  const agentId = run.effective.agentId;
+  let current = store.getRoleSessionSet(role.taskId, role.name)
     ?? createRoleSessionSet(
       { scope: "task", taskId: role.taskId, roleName: role.name },
-      role.activeAgentId,
+      agentId,
       now
     );
+  if (current.activeAgentId !== agentId) {
+    if (current.inFlight !== null || current.pendingTurnCompletion !== null) {
+      throw new Error("Task Role Session identity cannot change with an unsettled Run fence.");
+    }
+    const liveConflict = Object.values(current.sessions).find((session) => (
+      session.agentId !== agentId
+      && session.status !== "stopped"
+      && session.status !== "broken"
+    ));
+    if (liveConflict !== undefined) {
+      throw new Error(
+        `Task Role Session identity cannot change while ${liveConflict.agentId} is live.`
+      );
+    }
+    current = {
+      ...current,
+      activeAgentId: agentId,
+      updatedAt: now.toISOString()
+    };
+  }
   const updated = bindTaskRoleRun(current, {
-    agentId: role.activeAgentId,
+    agentId,
     runId: run.id,
-    receiptId: `agent-run:${run.id}`
+    receiptId: formatAgentRunReceiptId(role.taskId, run.id)
   }, now);
   store.saveRoleSessionSet(updated);
 }
@@ -1781,7 +2607,7 @@ function bindTaskRoleRunInFlight(
 function markTaskRoleRunDeliveredInFlight(
   store: TaskStore,
   role: NonNullable<ReturnType<TaskStore["getRole"]>>,
-  run: { id: string },
+  run: { id: string; effective: { agentId: string } },
   now: Date
 ): void {
   const current = store.getRoleSessionSet(role.taskId, role.name);
@@ -1789,9 +2615,9 @@ function markTaskRoleRunDeliveredInFlight(
     throw new Error(`Task Role session set is missing for delivered Run: ${run.id}.`);
   }
   const updated = markTaskRoleRunDelivered(current, {
-    agentId: role.activeAgentId,
+    agentId: run.effective.agentId,
     runId: run.id,
-    receiptId: `agent-run:${run.id}`
+    receiptId: formatAgentRunReceiptId(role.taskId, run.id)
   }, now);
   store.saveRoleSessionSet(updated);
 }
@@ -1799,16 +2625,16 @@ function markTaskRoleRunDeliveredInFlight(
 function clearTaskRoleRunInFlight(
   store: TaskStore,
   role: NonNullable<ReturnType<TaskStore["getRole"]>>,
-  run: { id: string },
+  run: { id: string; effective: { agentId: string } },
   now: Date
 ): void {
   const current = store.getRoleSessionSet(role.taskId, role.name);
   if (current === null) return;
   if (current.inFlight?.runId !== run.id) return;
   const updated = clearTaskRoleRun(current, {
-    agentId: role.activeAgentId,
+    agentId: run.effective.agentId,
     runId: run.id,
-    receiptId: `agent-run:${run.id}`
+    receiptId: formatAgentRunReceiptId(role.taskId, run.id)
   }, now);
   store.saveRoleSessionSet(updated);
 }
@@ -1853,11 +2679,26 @@ function schedulerRoleSessionsMatch(
   if (current === null || expected === null) return current === expected;
   return current.agentId === expected.agentId
     && current.adapterId === expected.adapterId
-    && current.nativeSessionId === expected.nativeSessionId;
+    && current.nativeSessionId === expected.nativeSessionId
+    && isDeepStrictEqual(current.effective, expected.effective);
 }
 
 function requireRole(store: TaskStore, taskId: string, roleName: string) {
   const role = store.getRole(taskId, roleName);
   if (role === null) throw new Error(`Role not found: ${taskId}/${roleName}.`);
   return role;
+}
+
+function runLaunchEventPayload(run: AgentRun): Record<string, string> {
+  return {
+    runId: run.id,
+    role: run.roleName,
+    purpose: run.purpose,
+    mode: run.mode,
+    agent: `${run.effective.agentId}/${run.effective.adapterId}`,
+    effectiveRevision: String(run.effective.sourceDesiredRevision),
+    profileAccess: run.effective.profileAccess,
+    effectivePermission: run.effective.permission.strategy,
+    writeProjectIds: run.effective.writeProjectIds.join(",") || "none"
+  };
 }

@@ -95,6 +95,7 @@ const PUBLIC_PATHS = [
   "task activate",
   "task complete",
   "task reopen",
+  "task retire",
   "task list",
   "task show",
   "task context",
@@ -118,10 +119,12 @@ const PUBLIC_PATHS = [
   "task role remove",
   "task role bind",
   "task role unbind",
+  "task role reset",
   "task role enter",
   "task work",
   "task work create",
   "task work list",
+  "task work show",
   "task work update",
   "task work scope",
   "task work dispatch",
@@ -129,9 +132,11 @@ const PUBLIC_PATHS = [
   "task work capture",
   "task work cleanup",
   "task work review",
+  "task work review cleanup",
+  "task work review preserve",
   "task work accept",
   "task work reject",
-  "task work cancel",
+  "task work retire",
   "task run",
   "task run list",
   "task run retry",
@@ -241,9 +246,23 @@ function createPorts() {
           ? [{ id: "work-alpha", title: "Alpha work", taskId: params.taskId }]
           : [{ id: "work-beta", title: "Beta work", taskId: params.taskId }];
       }
+      if (method === "task.run.list") {
+        return [{
+          id: "agent-run-1",
+          taskId: params.taskId,
+          workItemId: "work-item-1",
+          roleName: "worker",
+          status: "active"
+        }];
+      }
       if (method === "task.integration.list") {
         return params.taskId === "task-alpha"
-          ? [{ id: "integration-alpha", status: "blocked", targetRef: "main" }]
+          ? [{
+              id: "integration-alpha",
+              taskId: "task-alpha",
+              status: "blocked",
+              targetRef: "main"
+            }]
           : [];
       }
       if (method === "task.change-set.list") {
@@ -321,6 +340,24 @@ test("interaction policies cover missing task, work, Integration, and job identi
   });
 });
 
+test("Task Role reset exposes exact help and completion selectors", () => {
+  const node = findCommandNode(["task", "role", "reset"]);
+  assert.ok(node);
+  assert.deepEqual(node.options, ["--reason"]);
+  assert.match(renderCommandHelp(node, "0.2.0"), /task role reset <task> <role>/u);
+  const policy = findInteractionPolicy(node);
+  assert.ok(policy);
+  assert.deepEqual(policy.selectors.map(({ provider, argumentIndex, option, dependsOn }) => ({
+    provider,
+    ...(argumentIndex === undefined ? {} : { argumentIndex }),
+    ...(option === undefined ? {} : { option }),
+    ...(dependsOn === undefined ? {} : { dependsOn })
+  })), [
+    { provider: "tasks", argumentIndex: 3 },
+    { provider: "task-roles", argumentIndex: 4, dependsOn: 3 }
+  ]);
+});
+
 test("candidate providers read the current core entities through CoreCliPorts.call", async () => {
   const ports = createPorts();
 
@@ -336,7 +373,7 @@ test("candidate providers read the current core entities through CoreCliPorts.ca
     selector("work-items", "work-item", { argumentIndex: 3 }),
     ports,
     ["task", "work", "accept"]
-  )), ["work-alpha", "work-beta"]);
+  )), ["task-alpha/work-alpha", "task-beta/work-beta"]);
   assert.deepEqual(values(await getSelectionCandidates(
     selector("task-roles", "task-role", { argumentIndex: 4, dependsOn: 3 }),
     ports,
@@ -346,7 +383,18 @@ test("candidate providers read the current core entities through CoreCliPorts.ca
     selector("integration-attempts", "integration-attempt", { argumentIndex: 3 }),
     ports,
     ["task", "integration", "show"]
-  )), ["integration-alpha"]);
+  )), ["task-alpha/integration-alpha"]);
+  const runSelector = selector("runs", "run", { argumentIndex: 4, dependsOn: 3 });
+  assert.deepEqual(values(await getSelectionCandidates(
+    runSelector,
+    ports,
+    ["task", "run", "retry", "task-alpha/work-item-1"]
+  )), ["task-alpha/agent-run-1"]);
+  assert.deepEqual(values(await getSelectionCandidates(
+    runSelector,
+    ports,
+    ["task", "run", "retry", "work-item-1"]
+  )), []);
   assert.deepEqual(values(await getSelectionCandidates(
     selector("jobs", "job"), ports, ["jobs", "retry"]
   )), ["job-alpha", "job-beta"]);
@@ -432,7 +480,7 @@ test("InputRequest interaction and completion select global or Task-scoped open 
     answer.selectors[0],
     ports,
     ["task", "input", "answer"]
-  )), ["input-open"]);
+  )), ["task-alpha/input-open"]);
 
   const cancel = findInteractionPolicy(findCommandNode(["task", "input", "cancel"]));
   assert.ok(cancel);
@@ -444,9 +492,9 @@ test("InputRequest interaction and completion select global or Task-scoped open 
 
   assert.deepEqual(await resolveCompletionCandidates({
     words: ["task", "input", "answer"],
-    current: "input-o",
+    current: "task-alpha/input-o",
     ports
-  }), ["input-open"]);
+  }), ["task-alpha/input-open"]);
   assert.deepEqual(await resolveCompletionCandidates({
     words: ["task", "input", "cancel", "task-alpha"],
     current: "input-",

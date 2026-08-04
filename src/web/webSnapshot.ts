@@ -9,8 +9,10 @@ export type WebDashboardStore = Pick<TaskStore,
   | "getTask"
   | "getTaskBrief"
   | "listRoles"
+  | "getTaskRoleSessionSet"
   | "listWorkItems"
   | "listAgentRuns"
+  | "listReviewRounds"
   | "listInputRequests"
   | "listMessages"
   | "listDecisions"
@@ -18,12 +20,8 @@ export type WebDashboardStore = Pick<TaskStore,
   | "listProjects"
 >;
 
-type WorkItemCounts = Readonly<{
+type WorkItemCounts = Readonly<Record<WorkItemStatus, number> & {
   total: number;
-  pending: number;
-  running: number;
-  completed: number;
-  failed: number;
 }>;
 
 type DashboardTask = Task & Readonly<{
@@ -55,6 +53,7 @@ export function buildWebDashboardSnapshot(
       draft: 0,
       active: 0,
       completed: 0,
+      retired: 0,
       archived: 0
     };
     const projectNames = new Map(reader.listProjects().map((project) => [project.id, project.name]));
@@ -102,12 +101,32 @@ export function buildWebTaskDetail(store: WebDashboardStore, taskId: string): ob
       const name = projectNamesById.get(projectId);
       return name === undefined ? [] : [name];
     });
+    const runs = reader.listAgentRuns(taskId);
+    const activeRuns = new Map(runs
+      .filter((run) => run.status === "active")
+      .map((run) => [run.roleName, run]));
+    const roles = reader.listRoles(taskId).map((role) => {
+      const activeRun = activeRuns.get(role.name);
+      const sessions = reader.getTaskRoleSessionSet(taskId, role.name);
+      const activeSession = sessions?.sessions[sessions.activeAgentId];
+      const effectiveLaunch = activeRun?.effective ?? activeSession?.effective ?? null;
+      return {
+        ...role,
+        effectiveLaunch,
+        effectiveLaunchSource: activeRun === undefined
+          ? activeSession === undefined ? null : "session"
+          : "run",
+        launchDrift: effectiveLaunch !== null
+          && effectiveLaunch.sourceDesiredRevision !== role.launchRevision
+      };
+    });
     return {
       task: projectNames.length === 0 ? task : { ...task, projectNames },
       brief: reader.getTaskBrief(taskId),
-      roles: reader.listRoles(taskId),
+      roles,
       workItems: reader.listWorkItems(taskId),
-      runs: reader.listAgentRuns(taskId),
+      runs,
+      reviewRounds: reader.listReviewRounds(taskId),
       openInputs: inputs.filter((request) => request.status === "open"),
       messages: reader.listMessages(taskId),
       decisions: reader.listDecisions(taskId),
@@ -117,24 +136,30 @@ export function buildWebTaskDetail(store: WebDashboardStore, taskId: string): ob
 }
 
 function countWorkItems(items: readonly WorkItem[]): WorkItemCounts {
-  const counts: WorkItemCounts = { total: items.length, pending: 0, running: 0, completed: 0, failed: 0 };
+  const counts: WorkItemCounts = {
+    total: items.length,
+    pending: 0,
+    running: 0,
+    awaiting_acceptance: 0,
+    completed: 0,
+    failed: 0,
+    retired: 0
+  };
   const mutable = counts as Record<keyof WorkItemCounts, number>;
   for (const item of items) {
-    const key = visibleWorkItemStatus(item.status);
-    if (key !== null) mutable[key] += 1;
+    mutable[item.status] += 1;
   }
   return counts;
 }
 
-function visibleWorkItemStatus(status: WorkItemStatus): keyof Omit<WorkItemCounts, "total"> | null {
-  if (status === "pending" || status === "running" || status === "completed" || status === "failed") {
-    return status;
-  }
-  return null;
-}
-
 function compareDashboardTasks(left: DashboardTask, right: DashboardTask): number {
-  const statusOrder: Record<TaskStatus, number> = { active: 0, draft: 1, completed: 2, archived: 3 };
+  const statusOrder: Record<TaskStatus, number> = {
+    active: 0,
+    draft: 1,
+    completed: 2,
+    retired: 3,
+    archived: 4
+  };
   return statusOrder[left.status] - statusOrder[right.status]
     || Date.parse(right.updatedAt) - Date.parse(left.updatedAt)
     || left.id.localeCompare(right.id);

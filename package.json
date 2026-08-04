@@ -1,6 +1,6 @@
 {
   "name": "@zq-silk/yui",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Local control plane for long-running native agent CLI sessions backed by tmux.",
   "license": "MIT",
   "private": true,
@@ -14,6 +14,7 @@
   "files": [
     "dist",
     "skills",
+    "docs",
     "README.md",
     "ARCHITECTURE.md",
     "i18n/README.zh-CN.md",

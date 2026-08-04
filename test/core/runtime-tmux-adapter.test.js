@@ -8,6 +8,15 @@ import {
   createRuntimeBinding,
   createSessionLaunchRequest
 } from "../../dist/runtime/index.js";
+import { testEffectiveLaunch } from "../helpers/effectiveLaunch.js";
+
+function effective(workspace = "/repo") {
+  return testEffectiveLaunch({
+    agentId: "codex-personal",
+    adapterId: "codex",
+    workspaceRoot: workspace
+  });
+}
 
 function fakePlan(nativeSessionId = undefined) {
   return {
@@ -58,6 +67,7 @@ test("TmuxSessionHost starts task owners through the task planner and returns an
     owner: { scope: "task", taskId: "task-1", roleName: "leader" },
     agentId: "codex-personal",
     adapterId: "codex",
+    effective: effective(),
     workspace: "/repo"
   });
 
@@ -69,6 +79,7 @@ test("TmuxSessionHost starts task owners through the task planner and returns an
       roleName: "leader",
       agentId: "codex-personal",
       adapterId: "codex",
+      effective: effective(),
       launchId: "launch-1",
       mode: "new"
     }],
@@ -115,6 +126,7 @@ test("TmuxSessionHost serializes first Role windows that share one Task host", a
     owner: { scope: "task", taskId: "task-1", roleName },
     agentId: "codex-personal",
     adapterId: "codex",
+    effective: effective(),
     workspace: "/repo"
   });
 
@@ -166,6 +178,7 @@ test("TmuxSessionHost resumes global owners and stops only the referenced role",
     owner: { scope: "global", roleName: "operator" },
     agentId: "codex-personal",
     adapterId: "codex",
+    effective: effective(),
     workspace: "/repo",
     nativeSessionId: "native-1"
   }));
@@ -175,6 +188,7 @@ test("TmuxSessionHost resumes global owners and stops only the referenced role",
       roleName: "operator",
       agentId: "codex-personal",
       adapterId: "codex",
+      effective: effective(),
       launchId: "launch-2",
       mode: "resume",
       nativeSessionId: "native-1"
@@ -249,6 +263,7 @@ test("TmuxSessionHost rejects a planned workspace mismatch before creating a pro
       owner: { scope: "task", taskId: "task-1", roleName: "leader" },
       agentId: "codex-personal",
       adapterId: "codex",
+      effective: effective("/expected"),
       workspace: "/expected"
     })),
     /workspace does not match the runtime request/u
@@ -293,7 +308,7 @@ test("TmuxSessionHost inventories Task and global owners from one tmux snapshot"
   assert.equal(inventoryCalls, 1);
 });
 
-test("TmuxPromptPushAdapter maps tmux presence and composer readiness to portable outcomes", async () => {
+test("TmuxPromptPushAdapter maps tmux presence and process readiness to portable outcomes", async () => {
   const pushes = [];
   let status = "running";
   let outcome = "sent";
@@ -317,11 +332,12 @@ test("TmuxPromptPushAdapter maps tmux presence and composer readiness to portabl
     owner: { scope: "task", taskId: "task-1", roleName: "leader" },
     agentId: "codex-personal",
     adapterId: "codex",
+    effective: effective(),
     workspace: "/repo"
   }));
   const envelope = createPromptEnvelope({
-    id: "prompt-1",
-    source: { kind: "agent-run", id: "run-1" },
+    id: "agent-run:task-1/agent-run-1",
+    source: { kind: "agent-run", taskId: "task-1", localId: "agent-run-1" },
     text: "Continue the task",
     createdAt: new Date("2026-07-22T08:00:00.000Z")
   });
@@ -330,7 +346,7 @@ test("TmuxPromptPushAdapter maps tmux presence and composer readiness to portabl
   assert.deepEqual(pushes[0], {
     taskId: "task-1",
     roleName: "leader",
-    receiptId: "prompt-1",
+    receiptId: "agent-run:task-1/agent-run-1",
     text: "Continue the task",
     readinessProbe: pushes[0].readinessProbe
   });
@@ -373,11 +389,12 @@ test("TmuxPromptPushAdapter prefers the async tmux path", async () => {
     owner: { scope: "task", taskId: "task-1", roleName: "leader" },
     agentId: "codex-personal",
     adapterId: "codex",
+    effective: effective(),
     workspace: "/repo"
   }));
   const envelope = createPromptEnvelope({
-    id: "prompt-async",
-    source: { kind: "agent-run", id: "run-async" },
+    id: "agent-run:task-1/agent-run-2",
+    source: { kind: "agent-run", taskId: "task-1", localId: "agent-run-2" },
     text: String.raw`literal ; $HOME "quotes"`,
     createdAt: new Date("2026-07-22T08:00:00.000Z")
   });
@@ -385,7 +402,7 @@ test("TmuxPromptPushAdapter prefers the async tmux path", async () => {
   const adapter = new TmuxPromptPushAdapter(tmux, () => () => true);
   assert.equal(await adapter.tryPush({ binding, envelope }), "delivered");
   assert.deepEqual(calls, [
-    ["send-async", "task-1", "leader", "prompt-async", envelope.text]
+    ["send-async", "task-1", "leader", "agent-run:task-1/agent-run-2", envelope.text]
   ]);
   outcome = "unavailable";
   assert.equal(await adapter.tryPush({ binding, envelope }), "unavailable");

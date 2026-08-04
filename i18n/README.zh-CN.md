@@ -58,6 +58,10 @@ Leader 和 Operator，再说明全局 Worker 配置会复制到新建的 Task Ro
 Worker 即使使用同一个 Agent CLI，也可以采用不同配置。Profile 中的
 model/effort 只是 native child 的可移植 hint。
 
+Setup 会为每个受管 Agent binding 显式设置 `bypass` permission strategy。
+后续 Role 更新可选择 `default`、`bypass` 或 `configured`；`configured` 会
+保留对应 adapter 的原生权限枚举与工具规则。
+
 运行时能力目录会在每次命令中刷新，并缓存在 Yui home。实时探测超时或失败时，Yui 会展示同一 Agent 启动上下文最近一次成功的缓存并明确提示数据可能过期；没有匹配缓存时，则提供 CLI 默认值和自定义入口。`yui agent capabilities <id>` 可一次性读取同一份目录，包括模型、逐模型思考强度，以及权限、搜索可用性、profile、settings source、service tier 等其他运行时选项。
 
 `completion` 无论是否指定 shell，都会进入确认流程：
@@ -76,7 +80,19 @@ export YUI_HOME=/absolute/path/to/yui-home
 yui setup
 ```
 
-home 中包含 `schema.json`、权威 `state.json`、Project Catalog、项目知识和 Controller 发现文件。稳定 Project checkout 与受管理 worktree 位于 home 外部的 workspace。当前存储版本严格匹配且 fresh-only；旧格式会被直接拒绝，不做迁移。
+home 中包含 `schema.json`、权威 `state.json`、Project Catalog、项目知识和 Controller 发现文件。稳定 Project checkout 与受管理 worktree 位于 home 外部的 workspace。运行时存储严格匹配且 fresh-only：不会双读旧 schema，也不会猜测旧 ID。
+
+所有 Task-owned 记录族都在各自 Task 内分配单调递增的本地 ID。因此，不同
+Task 可以同时拥有 `work-item-1`、`agent-run-1` 或 `input-1`。受管 Task
+session 可由 `YUI_TASK_ID` 提供作用域并使用本地短 ID；Task session 外必须
+使用 `<task-id>/<local-id>`。Yui 不会拿裸 ID 扫描所有 Task。已经显式接收
+Task 的命令（例如 `task work create`、`task integration start`）仍使用该
+Task 内的本地子记录 ID。Candidate 只在所属 WorkItem 内递增，并同时保存
+Task 与 WorkItem provenance。
+
+Yui 只支持当前 aggregate-v14 / StoredTask-v13 schema。旧 home 不提供转换、
+双读或历史记录推断；需要使用新版本时初始化全新的 `YUI_HOME`。当前引用契约见
+[Task 本地 ID](../docs/task-local-identity.md)。
 
 ## 快速开始
 
@@ -116,7 +132,7 @@ yui config review clear
 后续 `set`/`clear` 不会改变已经在途的判断。
 `always` 会为每个候选启动 ReviewRound，包括 Role yield 的结果和 Leader 直接管理的
 结果；`leader` 则让候选保持等待验收，由 Leader 直接 accept 或执行
-`yui task work review <work-item-id>`。因此只要配置了审查规则，Leader
+`yui task work review <task-id>/<work-item-id>`。因此只要配置了审查规则，Leader
 管理的候选也不会直接标记为完成。ReviewRound 引用不可变候选，审查
 AgentRun 不创建新 WorkItem，也不会递归触发审查。审查以自然语言结果
 唤醒 Leader；Leader 决定验收、reject 后在原 Role 与原 Session 中修复、
@@ -152,9 +168,12 @@ yui task project add <task-id> shared-sdk --base main
 实现型 WorkItem 必须声明允许修改的 Project。它保留与 Task main 一致的
 相对目录布局，只为写入范围创建隔离 worktree，其他 Task Project 作为上下文
 从 Task main 暴露。Yui 会在受管派发和 `yui-worker` Skill 中明确列出可写与
-仅上下文 Project，由 Agent 严格遵守该边界。原生 Agent 权限作用于整个会话：
-实现 Role 使用可写会话，explorer 和 reviewer Role 使用原生只读会话（Codex
-`read-only`，或带最小 allow list 的 Claude `dontAsk`）。
+仅上下文 Project，由 Agent 严格遵守该边界。原生 Agent 权限作用于整个会话，
+而 Profile `access` 只是行为意图，不是 provider sandbox 或写入授权。所有受管 Role binding（包括
+`explorer`）默认使用 `permission.strategy=bypass`，避免 provider 权限提示阻塞
+正常工作；Profile 与 Skill 负责约束行为，只有精确 WorkItem/ReviewRound 范围
+和匹配的 managed workspace 才能授权修改 Project。Role 也可以显式选择
+`default`，或用 `configured` 保留显式设置的任意 provider 原生权限选项子集。
 
 写入范围只能扩大，不能缩小。Worker yield 并报告还需要另一个仓库后，
 Leader 使用完整的“旧范围 + 新范围”更新并重新派发：
@@ -162,17 +181,17 @@ Leader 使用完整的“旧范围 + 新范围”更新并重新派发：
 ```sh
 yui task work create <task-id> "升级协议与客户端" \
   --project backend --project frontend --role implementer
-yui task work scope <work-item-id> \
+yui task work scope <task-id>/<work-item-id> \
   --project backend --project frontend --project shared-sdk
-yui task work isolate <work-item-id>
-yui task work reject <work-item-id> \
+yui task work isolate <task-id>/<work-item-id>
+yui task work reject <task-id>/<work-item-id> \
   --summary "已扩大写入范围，请在刷新后的 workspace 继续。"
-yui task work dispatch <work-item-id>
-yui task work capture <work-item-id>
+yui task work dispatch <task-id>/<work-item-id>
+yui task work capture <task-id>/<work-item-id>
 yui task integration start <task-id> --project backend \
   --change-set <backend-change-set-id> --check "<validation command>"
-yui task integration cleanup <integration-id>
-yui task work cleanup <work-item-id> --integrated
+yui task integration cleanup <task-id>/<integration-id>
+yui task work cleanup <task-id>/<work-item-id> --integrated
 ```
 
 `capture` 为每个实际修改的 Project 记录一个不可变 ChangeSet；同一 HEAD
@@ -196,6 +215,18 @@ yui operator new
 yui operator enter
 ```
 
+当 Task Role 当前的原生 Session 无法继续时，只需按意图重置：
+
+```sh
+yui task role reset <task-id> <role> --reason "<该 generation 无法继续的原因>"
+```
+
+Yui 从自己的记录中推导当前 Run、Agent、launch、receipt 和 native Session。
+它只失败化该精确 active Run（以及对应 execution WorkItem），把当前 Session
+保存为 broken history，并要求 Controller 只停止该 Role 拥有的 runtime。该命令
+不会创建 Candidate、验收工作或完成 Task。cleanup pending 期间，`task role status`
+和 `task context` 会阻止 fresh launch；已有 message、review 和交付历史都会保留。
+
 不带 `--task` 时会创建新 Draft。Draft 可以继续规划，但激活前不会执行 Agent 工作。
 Operator 会结合 Project Catalog 和现有 Task context 路由请求。同一有界
 目标的追加需求、修复、审查和咨询继续进入原 Task，即使它涉及多个 Project。
@@ -217,44 +248,57 @@ yui task role show <task-id> implementer
 
 yui task work create <task-id> "实现导出器" \
   --project app --role implementer
-yui task work isolate <work-item-id>
-yui task work dispatch <work-item-id> --input "完成实现并运行聚焦测试"
+yui task work isolate <task-id>/<work-item-id>
+yui task work dispatch <task-id>/<work-item-id> --input "完成实现并运行聚焦测试"
 ```
 
-`--yolo true` 是 Role 的一等配置。Yui 会分别为 Codex 编译
-`--dangerously-bypass-approvals-and-sandbox`，为 Claude 编译
-`--dangerously-skip-permissions`；`--clear-yolo` 会恢复已保存的权限设置或
-CLI 默认值。任意非 Leader Task Role 在创建时不传 `--agent`，都会复制全局
-Worker Role 的完整 Agent bindings，Leader 无需重新拼接 model、effort 和
-权限。创建回执和 `task context` 会记录配置来源及生效的
-Agent/model/effort/YOLO。显式 `--agent` 属于 Task 专用覆盖，必须在派发前
-补全并回读配置。
+每个 Agent binding 只有一套 adapter-specific 权限枚举配置：`default` 遵循
+provider 默认行为；`bypass` 编译 provider 支持的 bypass flag；`configured`
+保留其中显式设置的原生选项。Codex 选项是 `sandbox` 和 `approval`；Claude 选项是
+`mode`、`allowedTools` 与 `disallowedTools`。provider 权限与 Profile 行为意图、
+Project 写入授权彼此独立：普通写入只由精确 WorkItem 范围和匹配的 managed
+workspace 授权。任意非 Leader
+Task Role 在创建时不传 `--agent`，都会复制全局 Worker Role 的完整 Agent
+bindings，Leader 无需重新拼接 model、effort 和权限。创建回执与
+`task context` 分别记录 Profile intent、精确可写 Project 与实际 permission strategy。显式
+`--agent` 属于 Task 专用覆盖，必须在派发前补全并回读配置。
 
-Claude reviewer 可以使用原生 `dontAsk` 模式：未预批准的工具会直接拒绝且不会
-弹出交互确认，同时精确放行只读工具和向 Yui 交回结果所需的控制面命令：
+ReviewRound 从冻结 Candidate SHA 创建独立的可写 worktree。只有 exact
+ReviewRound owner、reviewRoundId、冻结 base 与 workspace 全部匹配时，才获得
+该 workspace 的写入授权；Skill 仍禁止 push、Integration、Task state、其他
+workspace 与真实 YUI_HOME 变更。两种 provider 都必须直接执行当前 Run 的 exact
+stdin yield；最终回复本身不是持久交付。review yield 的 stdin 保存 Reviewer
+完整的自由格式 Markdown 或 JSON 报告。如果 JSON 含已知的 `checks` 或
+`evidenceCommit` 字段，Yui 会把它们记录为结构化证据，并核验 commit 是否等于
+managed Review branch HEAD；未知字段仍保留在完整报告中：
 
 ```sh
-yui role update reviewer --agent claude --model <model> --effort <effort> \
-  --permission-mode dontAsk \
-  --allowed-tool Read --allowed-tool Grep --allowed-tool Glob \
-  --allowed-tool 'Bash(yui task run yield *)'
+yui task run yield <task-id>/<review-run-id> --summary-file - <<'YUI_SUMMARY'
+{"summary":"复现并验证完成","checks":[{"name":"npm test","outcome":"passed","details":"全部通过"}],"evidenceCommit":"<exact-sha>"}
+YUI_SUMMARY
 ```
 
-这不会启用文件编辑工具，也不会放宽只读 reviewer Profile；既非只读、又未
-显式允许的动作都会被拒绝。reviewer 必须直接执行 yield 命令，不能包进 shell
-循环或其他导致规则不再匹配的复合命令。重复传入 `--allowed-tool` 或
-`--disallowed-tool` 会替换对应的 Claude 工具规则列表；`--clear-allowed-tools`
-和 `--clear-disallowed-tools` 可移除已保存的规则。
+Reviewer 可以修改文件并在不提交的情况下 yield；脏字节不会被推断为 evidence。
+该 Round 仍会精确终结且不产生 Candidate/ChangeSet，workspace 会为 Leader 判断而
+保留，cleanup 会在其重新变干净前拒绝删除。
 
 Worker 显式交付当前 Run：
 
 ```sh
-yui task run yield <run-id> --summary "导出器已完成，聚焦测试通过"
+yui task run yield <task-id>/<run-id> --summary-file - <<'YUI_SUMMARY'
+导出器已完成，聚焦测试通过
+YUI_SUMMARY
 ```
 
 yield 会结束 AgentRun，将 WorkItem 提交给 Leader 审查，并追加结果消息和
 唤醒 Leader；它不会验收或完成 WorkItem。Leader 不会自唤醒，pending wake
 会保留到 Leader 空闲。
+
+如果无法最终判断结果，交接必须明确标为 `uncertain`、`incomplete`、
+`blocked` 或 `requiring Leader judgment`，并提交最完整且真实的身份、已执行
+动作、仓库状态、检查与错误、最后生命周期边界、未完成工作、待决事项、风险、
+置信度及有界下一选项。yield 只记录不可变的 Run/Candidate 或 Review 证据；
+它不表示验收、WorkItem 完成、ChangeSet capture、Integration 或 Task 完成。
 
 对于有界工作，Leader 可以直接执行 roleless WorkItem，也可以在当前
 Agent 对话中创建 native subagent：
@@ -263,7 +307,7 @@ Agent 对话中创建 native subagent：
 yui task work create <task-id> "审查实现" \
   --objective "返回有源码依据的问题" \
   --accept "每个问题都标明受影响路径"
-yui task work update <work-item-id> running
+yui task work update <task-id>/<work-item-id> running
 yui profile show reviewer
 ```
 
@@ -278,7 +322,7 @@ Agent bindings。Leader 审查返回结果后，在 WorkItem summary 中登记�
 执行信息：
 
 ```sh
-yui task work update <work-item-id> done \
+yui task work update <task-id>/<work-item-id> done \
   --summary "executor=subagent; profile=reviewer@3; model=inherited; round=1; result=reviewed; checks=npm test passed"
 ```
 
@@ -292,9 +336,9 @@ Leader reject 并在同一 workspace 重新派发。相同 HEAD 重复 capture �
 原 ChangeSet；修复后的新 HEAD 形成新候选：
 
 ```sh
-yui task work reject <work-item-id> --summary "需要修复的具体问题"
-yui task work dispatch <work-item-id> --input "结合上一轮结果修复"
-yui task work capture <work-item-id>
+yui task work reject <task-id>/<work-item-id> --summary "需要修复的具体问题"
+yui task work dispatch <task-id>/<work-item-id> --input "结合上一轮结果修复"
+yui task work capture <task-id>/<work-item-id>
 yui task integration start <task-id> \
   --change-set <latest-change-set-id> --check "npm test"
 ```
@@ -306,21 +350,22 @@ Integration 只保存紧凑检查结果和失败诊断。完整 stdout/stderr �
 代码或语义冲突会保持 blocked，直到该 Task 的 Leader 记录决策：
 
 ```sh
-yui task integration resolve <integration-id> \
+yui task integration resolve <task-id>/<integration-id> \
   --option manual-resolution \
   --rationale "保留公开契约并组合两边实现"
-yui task integration continue <integration-id>
+yui task integration continue <task-id>/<integration-id>
 ```
 
 Worker yield 不等于 WorkItem 完成。Leader 审查结果、验证和最新
 ChangeSet 集成后再显式验收：
 
 ```sh
-yui task work accept <work-item-id> --summary "验收标准满足。"
+yui task work accept <task-id>/<work-item-id> --summary "验收标准满足。"
 ```
 
 使用 `task work reject` 退回待验收结果以便修复和重新派发，使用
-`task work cancel` 关闭不再需要且未运行的工作。WorkItem、Integration
+`task work retire <task>/<work> --summary "..."` 退役过时工作，并可选指定
+replacement。WorkItem、Integration
 worktree 与检查日志会作为证据保留，直到显式清理。
 
 长期 Task 不依赖 native transcript 恢复。Leader 每次 yield 前更新 Brief
@@ -334,8 +379,8 @@ Knowledge。
 yui task input request <task-id> --question "默认使用哪种格式？" \
   --choice csv="CSV" --choice json="JSON" --blocks work-item:<work-item-id>
 yui task input list
-yui task input show <input-id>
-yui task input answer <input-id> --choice csv
+yui task input show <task-id>/<input-id>
+yui task input answer <task-id>/<input-id> --choice csv
 ```
 
 请求默认必须由用户回答，并保持开放直到回答或取消。当 Agent 存在安全的推荐方案时，可以为选项设置明确的超时回退：
@@ -348,7 +393,7 @@ yui task input request <task-id> --question "默认使用哪种格式？" \
 
 推荐项会明确展示给用户；如果截止时间前没有回答，独立的最近 deadline timer 会唤醒 Controller，原子采用这个确定选项，并排队恢复固定的 Leader session。自由文本和必须由用户回答的请求永远不会自动解决。
 
-`task input list` 是权威的全局开放输入 Inbox；可附加 Task ID 限定范围，或使用 `--all` 查看已回答和已取消的请求。Controller 还会尝试向已经运行且处于输入状态的 Operator composer 投递一次带回执的提示；它不会为了通知而启动或打断 Operator。Operator 不在线或正忙时，请求仍保留在 Inbox，并在后续 Controller 定向处理中重新尝试。用户和 Operator 都可回答。存在开放请求时，无关的 pending wake 不会绕过等待，Task 也不能 complete 或 archive。原 Leader 也可执行 `yui task input cancel <task-id> <input-id> --reason "..."`，取消会排队恢复该固定 Leader session。
+`task input list` 是权威的全局开放输入 Inbox；可附加 Task ID 限定范围，或使用 `--all` 查看已回答和已取消的请求。Controller 还会尝试向已有且结构化状态为 ready 的 Operator process 投递一次带回执的提示；它不会为了通知而启动或打断 Operator。process 不可用或 pane fence 已变化时，请求仍保留在 Inbox，并在后续 Controller 定向处理中重新尝试。该路径不会读取或分类 Agent 终端文本。用户和 Operator 都可回答。存在开放请求时，无关的 pending wake 不会绕过等待，Task 也不能 complete 或 archive。原 Leader 也可执行 `yui task input cancel <task-id> <input-id> --reason "..."`，取消会排队恢复该固定 Leader session。
 
 ```sh
 yui task context <task-id>
@@ -393,6 +438,11 @@ binding 是预先保存、可随时切换的配置，而不是并行身份。Ope
 
 Claude 的 session ID 在启动前分配。受管理的 Codex 启动使用 Codex 结构化 `notify` 回调，在 turn 完成后记录 thread ID，不再向模型对话注入 session-bind prompt。
 
+自动生命周期与投递判断只使用结构化 Hook payload、持久身份、tmux process
+state、receipt 与 pane fence。Yui 不会解析 prompt glyph、进度文本、trust dialog
+或其他 Agent 终端输出来推断 ready 或 success。`captureRole()` 只用于显式的人类
+transcript 查看，不具备生命周期权威。
+
 稳定的 Role 上下文也属于启动元数据，而不是 bootstrap turn。Yui 通过 Agent 原生的 system/developer instruction 通道传入 Role 策略和 `systemPrompt`。原生 Codex CLI 没有按会话追加 Skill root 的参数，因此 developer instructions 只携带精简的 Skill 绝对路径，由 Codex 按需读取 `SKILL.md`。由于 `developer_instructions` 是单一标量配置，Yui 会检查当前支持的全部 Linux Codex 配置层：`/etc/codex/config.toml`、用户配置、选中的 `$CODEX_HOME/<name>.config.toml`、项目配置以及 `/etc/codex/managed_config.toml`；任意一层已经设置该值时都会明确拒绝覆盖。受管理的 Codex 会话还必须独占用于记录原生 Turn 完成状态的结构化 `notify` 回调；任意受检配置层已经定义 `notify` 时，Yui 都会拒绝启动，避免两个回调互相静默覆盖。`skills.config` 只负责启停已发现 Skill，Yui 不会误用它。Claude 从 Yui 管理的私有 `0600` context 文件读取同一份 Skill 内容，不再把大段或敏感文本放进 argv；重试和 resume 会复用该 Role 的稳定路径。非 Operator 的 global Role 保持中性，不会注入 Task Leader 或 Worker Skill。因此 Operator 会停在空白的原生 composer，用户输入仍是第一条 user message；Leader wake 和 Worker Run assignment 仍是邮箱投递的真实工作消息。不具备原生指令通道的 adapter 必须拒绝这类上下文，不能静默降级为首轮 user prompt。
 
 ## Controller 与失败处理
@@ -415,7 +465,7 @@ yui controller restart
 4. 检测活动 Role 进程退出；
 5. Leader 空闲时投递 pending wake。
 
-自动输入只通过 tmux 投递。每次处理只做一次非阻塞的 Agent 专属 readiness 检查；启动阶段忙碌时通过小型有界 mailbox timer 重试，后续忙碌会话通常由 Codex turn-complete 事件再次唤醒。pane 内 receipt 可避免 Controller 重试时重复输入同一 Run。
+自动输入只通过 tmux 投递。每次处理只做一次非阻塞的 process-state readiness 检查；启动阶段忙碌时通过小型有界 mailbox timer 重试，后续忙碌会话通常由 Codex turn-complete 事件再次唤醒。pane 内 receipt 可避免 Controller 重试时重复输入同一 Run。
 
 Role 在 yield 前退出时，Controller 会失败对应 Run 和 running WorkItem，并唤醒 Leader。恢复状态通过精简的 Jobs 兼容视图呈现：
 

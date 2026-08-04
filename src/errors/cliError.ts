@@ -18,15 +18,24 @@ const EXIT_CODES: Record<CliErrorCode, number> = {
 export class CliError extends Error {
   readonly exitCode: number;
 
-  constructor(readonly code: CliErrorCode, message: string, readonly helpText?: string) {
+  constructor(
+    readonly code: CliErrorCode,
+    message: string,
+    readonly helpText?: string,
+    readonly details: Readonly<Record<string, unknown>> = {}
+  ) {
     super(message);
     this.name = "CliError";
     this.exitCode = EXIT_CODES[code];
   }
 }
 
-export function usageError(message: string, helpText?: string): CliError {
-  return new CliError("USAGE_ERROR", message, helpText);
+export function usageError(
+  message: string,
+  helpText?: string,
+  details: Readonly<Record<string, unknown>> = {}
+): CliError {
+  return new CliError("USAGE_ERROR", message, helpText, details);
 }
 
 export function taskNotFound(id: string): CliError {

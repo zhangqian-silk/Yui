@@ -17,6 +17,7 @@ import {
   type JsonValue
 } from "./protocol.js";
 import { controllerSocketPath } from "./controllerEndpoint.js";
+import { YUI_VERSION, yuiVersionIdentity } from "../version.js";
 
 export type ControllerDispatcher = (
   method: string,
@@ -217,7 +218,10 @@ async function routeRequest(
       result: {
         pid: process.pid,
         running: true,
-        protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION
+        protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+        version: YUI_VERSION,
+        storageLayoutVersion: yuiVersionIdentity().storageLayoutVersion,
+        aggregateSchemaVersion: yuiVersionIdentity().aggregateSchemaVersion
       }
     });
     return;

@@ -440,14 +440,23 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
   if (task.completionSummary) {
     const conclusion = node("div", "conclusion");
     conclusion.append(node("h3", "", t("detail.conclusion")), node("p", "", task.completionSummary));
-    conclusion.append(conclusionMeta(task, t, locale, false));
+    conclusion.append(conclusionMeta(task, t, locale, "completed"));
+    summaryBody.append(conclusion);
+  } else if (task.status === "retired" || task.retirementSummary) {
+    const conclusion = node("div", "conclusion archived");
+    conclusion.append(node("h3", "", t("detail.retired")));
+    if (task.retirementSummary) conclusion.append(node("p", "", task.retirementSummary));
+    if (task.replacementTaskId) {
+      conclusion.append(node("p", "muted", t("detail.replacement") + " · " + task.replacementTaskId));
+    }
+    conclusion.append(conclusionMeta(task, t, locale, "retired"));
     summaryBody.append(conclusion);
   } else if (task.status === "archived" || task.archiveSummary || task.archiveReason) {
     const conclusion = node("div", "conclusion archived");
     conclusion.append(node("h3", "", t("detail.archived")));
     if (task.archiveSummary) conclusion.append(node("p", "", task.archiveSummary));
     if (task.archiveReason) conclusion.append(node("p", "muted", task.archiveReason));
-    conclusion.append(conclusionMeta(task, t, locale, true));
+    conclusion.append(conclusionMeta(task, t, locale, "archived"));
     summaryBody.append(conclusion);
   }
   scaffold.append(anchorSection("detail-top", sectionHead(t("tabs.summary")),
@@ -504,6 +513,43 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     sectionHead(t("detail.execution"), { count: data.runs.length }),
     execBody));
 
+  // 5b. Reviews (anchor #detail-reviews) — review rounds for yielded candidates
+  const reviewBody = node("div", "row-list");
+  if (!data.reviewRounds || !data.reviewRounds.length) {
+    reviewBody.append(emptyRow(t));
+  } else {
+    data.reviewRounds.slice().sort(byNewest).forEach(function (round) {
+      const card = node("article", "record-card");
+      const head = node("div", "record-head");
+      const titleRow = node("div", "record-title-row");
+      titleRow.append(node("strong", "record-title", round.id));
+      head.append(titleRow);
+      head.append(pill(t, "review", round.status));
+      card.append(head);
+      const meta = node("div", "record-meta");
+      meta.append(node("span", "", round.reviewerRoleName));
+      meta.append(node("span", "mono", round.workItemId + " · " + round.candidateId));
+      meta.append(node("span", "", t("detail.reviewBase") + " · " + round.reviewBaseCommit));
+      if (round.workspace && round.workspace.root) {
+        meta.append(pathMetaItem(t("detail.workspace"), round.workspace.root));
+      }
+      if (round.evidenceCommit) {
+        meta.append(node("span", "", t("detail.evidence") + " · " + round.evidenceCommit));
+      }
+      card.append(meta);
+      if (round.checks && round.checks.length) {
+        card.append(copyBlock(t("detail.checks"), round.checks.map(function (check) {
+          return check.name + "=" + check.outcome;
+        }).join(", ")));
+      }
+      if (round.summary) card.append(copyBlock("", round.summary));
+      reviewBody.append(card);
+    });
+  }
+  scaffold.append(anchorSection("detail-reviews",
+    sectionHead(t("detail.reviews"), { count: (data.reviewRounds || []).length }),
+    reviewBody));
+
   // 6. Roles (anchor #detail-roles)
   const rolesBody = node("div", "row-list");
   if (!data.roles.length) rolesBody.append(emptyRow(t));
@@ -550,12 +596,18 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
   detail.append(scaffold);
 }
 
-function conclusionMeta(task, t, locale, archived) {
+function conclusionMeta(task, t, locale, kind) {
   const meta = node("div", "conclusion-meta");
-  const actor = archived ? task.archivedBy : task.completedBy;
-  const at = archived ? task.archivedAt : task.completedAt;
-  if (actor) meta.append(node("span", "",
-    (archived ? t("detail.archivedBy") : t("detail.completedBy")) + " · " + authorName(t, actor)));
+  const actor = kind === "archived" ? task.archivedBy
+    : kind === "retired" ? task.retiredBy
+    : task.completedBy;
+  const at = kind === "archived" ? task.archivedAt
+    : kind === "retired" ? task.retiredAt
+    : task.completedAt;
+  const label = kind === "archived" ? t("detail.archivedBy")
+    : kind === "retired" ? t("detail.retiredBy")
+    : t("detail.completedBy");
+  if (actor) meta.append(node("span", "", label + " · " + authorName(t, actor)));
   if (at) meta.append(node("time", "", formatDateTime(at, locale)));
   return meta;
 }
@@ -647,11 +699,20 @@ function runCard(run, t, locale) {
   const foot = node("div", "execute-foot");
   const tags = node("div", "execute-tags");
   tags.append(chip(t("mode." + run.mode)));
-  const badge = run.agentId ? agentBadge(run) : null;
+  tags.append(chip(t(run.deliveredAt ? "delivery.delivered" : "delivery.pending")));
+  const badge = run.effective ? agentBadge(run.effective) : (run.agentId ? agentBadge(run) : null);
   if (badge) tags.append(badge);
   foot.append(tags);
   foot.append(pill(t, "run", run.status));
   card.append(foot);
+
+  if (run.effective) {
+    const eff = node("div", "record-meta");
+    eff.append(node("span", "", t("detail.effective") + " · r" + run.effective.sourceDesiredRevision));
+    eff.append(node("span", "", t("detail.profileIntent") + " · " + run.effective.profileAccess));
+    eff.append(node("span", "", t("detail.permission") + " · " + run.effective.permission.strategy));
+    card.append(eff);
+  }
 
   card.append(node("time", "", formatDateTime(run.updatedAt, locale)));
   return card;
@@ -666,7 +727,7 @@ function roleCard(role, task, t, locale, actions) {
 
   const actionsRow = node("div", "record-actions");
   const left = node("div", "record-meta");
-  left.append(node("span", "mono", role.activeAgentId));
+  left.append(node("span", "", t("detail.desiredAgent") + " · " + role.activeAgentId));
   const activeBinding = role.agentBindings && role.agentBindings[role.activeAgentId];
   if (activeBinding) {
     const badge = agentBadge({
@@ -675,6 +736,12 @@ function roleCard(role, task, t, locale, actions) {
       effort: activeBinding.config && activeBinding.config.effort
     });
     if (badge) left.append(badge);
+  }
+  if (role.launchRevision !== undefined) {
+    left.append(node("span", "", t("detail.desired") + " · r" + role.launchRevision));
+  }
+  if (role.defaultAccess !== undefined) {
+    left.append(node("span", "", t("detail.profileIntent") + " · " + role.defaultAccess));
   }
   actionsRow.append(left);
 
@@ -686,6 +753,24 @@ function roleCard(role, task, t, locale, actions) {
   });
   actionsRow.append(open);
   card.append(actionsRow);
+
+  if (role.effectiveLaunch) {
+    const eff = node("div", "record-meta");
+    eff.append(node("span", "", t("detail.effectiveAgent") + " · " + role.effectiveLaunch.agentId));
+    const effBadge = agentBadge(role.effectiveLaunch);
+    if (effBadge) eff.append(effBadge);
+    if (role.effectiveLaunch.sourceDesiredRevision !== undefined) {
+      eff.append(node("span", "", t("detail.effective") + " · r" + role.effectiveLaunch.sourceDesiredRevision));
+    }
+    if (role.effectiveLaunch.profileAccess !== undefined) {
+      eff.append(node("span", "", t("detail.profileIntent") + " · " + role.effectiveLaunch.profileAccess));
+    }
+    if (role.effectiveLaunch.permission && role.effectiveLaunch.permission.strategy !== undefined) {
+      eff.append(node("span", "", t("detail.permission") + " · " + role.effectiveLaunch.permission.strategy));
+    }
+    eff.append(node("span", "", role.launchDrift ? t("launch.drift") : t("launch.current")));
+    card.append(eff);
+  }
 
   if (role.description) card.append(copyBlock("", role.description, { muted: true }));
 

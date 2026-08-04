@@ -21,13 +21,18 @@ const RUNTIME_SKILLS = [
 const RUNTIME_DOCUMENTS = [
   "README.md",
   "ARCHITECTURE.md",
+  "docs/task-local-identity.md",
   "i18n/README.zh-CN.md",
   "LICENSE"
 ];
 const RUNTIME_PACKAGE_FILES = [
   "dist",
   "skills",
-  ...RUNTIME_DOCUMENTS
+  "docs",
+  "README.md",
+  "ARCHITECTURE.md",
+  "i18n/README.zh-CN.md",
+  "LICENSE"
 ];
 
 const outputIndex = process.argv.indexOf("--output");

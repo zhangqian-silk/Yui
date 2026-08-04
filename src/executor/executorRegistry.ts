@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { stripVTControlCharacters } from "node:util";
 import type {
   PreparedRoleDelivery,
   ReadyRoleDelivery,
@@ -23,6 +22,7 @@ import {
   type RuntimeLaunchPreparationPort,
   type SessionHostPort
 } from "../runtime/index.js";
+import type { EffectiveLaunchSnapshot } from "./effectiveLaunch.js";
 
 export type PlannedRoleSession = Readonly<{
   role: TmuxRole;
@@ -36,7 +36,9 @@ export interface RoleLaunchPlanner {
     roleName: string;
     agentId: string;
     adapterId: string;
+    effective?: EffectiveLaunchSnapshot;
     mode: RoleSessionLaunchMode;
+    runId?: string;
     nativeSessionId?: string;
   }>): PlannedRoleSession;
 }
@@ -80,8 +82,6 @@ export type ExecutorTmuxPort = Readonly<{
   inspectRolePaneInventoryAsync?(): Promise<TmuxRolePaneState[]>;
   inspectPane?(taskId: string, roleName: string): TmuxPaneState;
   inspectPaneAsync?(taskId: string, roleName: string): Promise<TmuxPaneState>;
-  stopTask(taskId: string): boolean;
-  stopTaskAsync?(taskId: string): Promise<boolean>;
 }>;
 
 export type AgentReadinessResolver = (
@@ -112,7 +112,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
   constructor(
     private readonly planner: RoleLaunchPlanner,
     private readonly tmux: ExecutorTmuxPort,
-    private readonly readiness: AgentReadinessResolver = agentComposerReadinessProbe,
+    private readonly readiness: AgentReadinessResolver = agentProcessReadinessProbe,
     private readonly runtimePorts?: ExecutorRuntimePorts
   ) {}
 
@@ -121,6 +121,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     roleName: string;
     agentId: string;
     adapterId: string;
+    effective: EffectiveLaunchSnapshot;
     workspace: string;
     mode: RoleSessionLaunchMode;
     runId?: string;
@@ -157,6 +158,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
         owner: { scope: "task", taskId: input.taskId, roleName: input.roleName },
         agentId: input.agentId,
         adapterId: input.adapterId,
+        effective: input.effective,
         workspace: input.workspace,
         ...(input.runId === undefined ? {} : { runId: input.runId })
       } as const;
@@ -195,7 +197,8 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
             agentId: binding.agentId,
             adapterId: binding.adapterId,
             nativeSessionId: binding.nativeSessionId,
-            status: "ready"
+            status: "ready",
+            effective: input.effective
           };
     }
     const delivery: PreparedRoleDelivery = {
@@ -231,11 +234,19 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
   }>): Promise<"sent" | "already-sent" | "busy" | "unavailable"> {
     const prepared = this.requirePrepared(input.delivery.prepared);
     if (prepared.binding !== undefined && this.runtimePorts !== undefined) {
+      const runId = input.delivery.prepared.runId;
+      if (runId === undefined) {
+        throw new Error("Runtime prompt delivery requires a Task-local Run id.");
+      }
       const outcome = await this.runtimePorts.promptPush.tryPush({
         binding: prepared.binding,
         envelope: createPromptEnvelope({
           id: input.receiptId,
-          source: { kind: "agent-run", id: input.receiptId },
+          source: {
+            kind: "agent-run",
+            taskId: input.delivery.prepared.taskId,
+            localId: runId
+          },
           text: input.text,
           createdAt: new Date()
         })
@@ -331,7 +342,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       if (pane === undefined) return "busy";
       return this.readiness(input.adapterId)(pane) ? "ready" : "busy";
     } catch {
-      // A pane can disappear between the inventory and content snapshot; the
+      // A pane can disappear between inventory and the targeted process snapshot; the
       // ordinary liveness pass will classify it on the next reconciliation.
       return "busy";
     }
@@ -375,18 +386,6 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     }));
   }
 
-  async stopTask(taskId: string): Promise<boolean> {
-    const stopped = this.tmux.stopTaskAsync === undefined
-      ? this.tmux.stopTask(taskId)
-      : await this.tmux.stopTaskAsync(taskId);
-    for (const [deliveryId, prepared] of this.#prepared) {
-      if (prepared.delivery.taskId === taskId) {
-        this.#prepared.delete(deliveryId);
-      }
-    }
-    return stopped;
-  }
-
   async stopRole(taskId: string, roleName: string): Promise<boolean> {
     const status = this.tmux.probeRoleStatusAsync === undefined
       ? this.tmux.probeRoleStatus(taskId, roleName)
@@ -413,170 +412,29 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
   }
 }
 
-export function agentComposerReadinessProbe(
+export function agentProcessReadinessProbe(
   adapterId: string,
-  surface: "role" | "operator" = "role"
+  _surface: "role" | "operator" = "role"
 ): TmuxReadinessProbe {
-  switch (adapterId) {
-    case "codex":
-      return (pane) => {
-        const content = pane.content.replace(/\r/g, "");
-        const nonEmptyLines = content
-          .split("\n")
-          .map((line) => line.trim())
-          .filter((line) => line.length > 0);
-        const reverseComposerIndex = [...nonEmptyLines]
-          .reverse()
-          .findIndex((line) => line.startsWith("›"));
-        const composerIndex = reverseComposerIndex < 0
-          ? -1
-          : nonEmptyLines.length - reverseComposerIndex - 1;
-        const legacyComposer = content.includes("OpenAI Codex")
-          && content.includes("/model to change")
-          && composerIndex === nonEmptyLines.length - 1;
-        const currentComposer = nonEmptyLines[nonEmptyLines.length - 1]?.includes(" · ") === true
-          && composerIndex >= Math.max(0, nonEmptyLines.length - 12)
-          && composerIndex < nonEmptyLines.length - 1;
-        // Codex keeps the composer and footer visible while a Turn is active,
-        // including when a user has queued another prompt. Readiness must
-        // prove that no Turn is running, not merely that input can be typed.
-        const activeTurn = /(?:^|\n)\s*(?:[•●·]\s*)?(?:Working|Running)\b[^\n]*(?:esc to interrupt|•\s*esc)\b/i
-          .test(content);
-        return livePane(pane)
-          && !activeTurn
-          && !/Press enter to (?:continue|confirm)|esc to cancel|select.*update|update selector|Would you like to (?:run|allow|proceed)|Do you want to allow/i
-            .test(content)
-          && (legacyComposer || currentComposer)
-          && (
-            surface !== "operator"
-            || provablyEmptyStyledComposer(pane, "›", true)
-          );
-      };
-    case "claude":
-      return (pane) => {
-        const content = pane.content.replace(/\r/g, "");
-        const tail = content.split("\n")
-          .map((line) => line.trim())
-          .filter(Boolean)
-          .slice(-12);
-        const reverseComposerIndex = [...tail]
-          .reverse()
-          .findIndex((line) => line.startsWith("❯"));
-        const composerIndex = reverseComposerIndex < 0
-          ? -1
-          : tail.length - reverseComposerIndex - 1;
-        const composer = composerIndex >= 0
-          && tail.slice(composerIndex + 1).every(claudeComposerChromeLine);
-        const activeTurn = tail.some((line) => (
-          /(?:esc to interrupt|ctrl\+c to interrupt|press ctrl-c)/i.test(line)
-          || /^(?:[•●·*✢✶✽✻]\s*)?(?:working|thinking)\b/i.test(line)
-        ));
-        return livePane(pane)
-          && composer
-          && !activeTurn
-          && (
-            surface !== "operator"
-            || provablyEmptyStyledComposer(pane, "❯", true)
-          );
-      };
-    default:
-      throw new Error(`No tmux readiness probe is registered for Agent adapter: ${adapterId}.`);
+  if (adapterId !== "codex" && adapterId !== "claude") {
+    throw new Error(`No tmux readiness probe is registered for Agent adapter: ${adapterId}.`);
   }
-}
-
-function claudeComposerChromeLine(line: string): boolean {
-  return /^[─━═\-\s]+$/u.test(line)
-    || line.startsWith("⏵⏵")
-    || /^⏸\s+plan mode on\b/iu.test(line);
+  // Run state and receipt fences decide whether delivery is allowed. Provider
+  // terminal contents are display-only evidence and never lifecycle input.
+  return livePane;
 }
 
 function livePane(pane: TmuxPaneState): boolean {
   return !pane.dead && pane.pid !== undefined && pane.currentCommand.trim().length > 0;
 }
 
-function provablyEmptyStyledComposer(
-  pane: TmuxPaneState,
-  marker: "›" | "❯",
-  allowDimPlaceholder: boolean
-): boolean {
-  if (pane.styledContent === undefined) return false;
-  const lines = pane.styledContent.replace(/\r/g, "").split("\n");
-  let composerIndex = -1;
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    if (stripVTControlCharacters(lines[index]!).trimStart().startsWith(marker)) {
-      composerIndex = index;
-      break;
-    }
-  }
-  if (composerIndex < 0) return false;
-  let regionEnd = lines.length;
-  if (marker === "›") {
-    let footerIndex = -1;
-    for (let index = lines.length - 1; index >= 0; index -= 1) {
-      if (stripVTControlCharacters(lines[index]!).trim().length > 0) {
-        footerIndex = index;
-        break;
-      }
-    }
-    if (
-      footerIndex <= composerIndex
-      || !stripVTControlCharacters(lines[footerIndex]!).includes(" · ")
-    ) {
-      return false;
-    }
-    regionEnd = footerIndex;
-  } else {
-    const footerIndex = lines.findIndex((line, index) => (
-      index > composerIndex
-      && claudeComposerChromeLine(stripVTControlCharacters(line).trim())
-    ));
-    if (footerIndex > composerIndex) regionEnd = footerIndex;
-  }
-  const composerRegion = lines.slice(composerIndex, regionEnd).join("\n");
-  let afterMarker = false;
-  let dim = false;
-  const tokens = composerRegion.matchAll(/\u001b\[([0-9;:]*)m|([^\u001b]+)/gu);
-  for (const token of tokens) {
-    if (token[1] !== undefined) {
-      dim = nextDimState(dim, token[1]);
-      continue;
-    }
-    for (const character of token[2] ?? "") {
-      if (!afterMarker) {
-        if (character === marker) afterMarker = true;
-        continue;
-      }
-      if (/\s/u.test(character)) continue;
-      if (!allowDimPlaceholder || !dim) return false;
-    }
-  }
-  return afterMarker;
-}
-
-function nextDimState(current: boolean, sgr: string): boolean {
-  const values = sgr.length === 0 ? [0] : sgr.split(";").map((value) => Number(value));
-  let dim = current;
-  for (let index = 0; index < values.length; index += 1) {
-    const value = values[index];
-    if (value === 0) dim = false;
-    else if (value === 2) dim = true;
-    else if (value === 22) dim = false;
-    else if (
-      (value === 38 || value === 48 || value === 58)
-      && (values[index + 1] === 2 || values[index + 1] === 5)
-    ) {
-      index += values[index + 1] === 2 ? 4 : 2;
-    }
-  }
-  return dim;
-}
-
 function preparedDeliveryId(input: Readonly<{
   taskId: string;
   roleName: string;
-  agentId: string;
-  adapterId: string;
-  mode: RoleSessionLaunchMode;
+    agentId: string;
+    adapterId: string;
+    effective: EffectiveLaunchSnapshot;
+    mode: RoleSessionLaunchMode;
   runId?: string;
   nativeSessionId?: string;
 }>): string {
@@ -585,6 +443,7 @@ function preparedDeliveryId(input: Readonly<{
     input.roleName,
     input.agentId,
     input.adapterId,
+    input.effective,
     input.mode,
     input.runId ?? null,
     input.nativeSessionId ?? null

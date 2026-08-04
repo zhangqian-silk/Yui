@@ -17,9 +17,9 @@ import {
   enqueueSignal
 } from "../../dist/coordination/workMailbox.js";
 import {
-  createRoleSessionSet,
-  recordRoleAgentSession
+  createRoleSessionSet
 } from "../../dist/executor/agentExecutor.js";
+import { recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 import {
   RUNTIME_CLEANUP_REQUIRED_REASON,
   RUNTIME_LAUNCH_RESERVED_REASON,

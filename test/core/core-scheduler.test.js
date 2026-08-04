@@ -14,6 +14,7 @@ import {
   enqueueSignal,
   releaseProcessing
 } from "../../dist/coordination/workMailbox.js";
+import { testEffectiveLaunch } from "../helpers/effectiveLaunch.js";
 
 const NOW = new Date("2026-07-19T12:00:00.000Z");
 
@@ -53,7 +54,7 @@ test("periodic recovery does not wake a Task already owned by an active Worker",
   store.pending.clear();
   store.getWorkMailbox = () => null;
   store.roles.push(role("worker"));
-  store.activeRuns.set(key("task-1", "worker"), activeRun("run-worker", "worker"));
+  store.activeRuns.set(key("task-1", "worker"), activeRun("agent-run-2", "worker"));
 
   assert.deepEqual(repairOrphanedActiveTasks(store, NOW), []);
   assert.equal(store.pending.has("task-1"), false);
@@ -76,7 +77,7 @@ test("a Task mailbox trigger does not count as an owner of an active Task", () =
 
 test("a busy Leader retains its pending wakeup and receives no terminal delivery", async () => {
   const store = fakeStore();
-  store.activeRuns.set(key("task-1", "leader"), activeRun("run-busy", "leader"));
+  store.activeRuns.set(key("task-1", "leader"), activeRun("agent-run-3", "leader"));
   const delivery = fakeDelivery();
 
   const result = await processLeaderWakeups(store, delivery, NOW);
@@ -128,7 +129,7 @@ test("an idle Leader starts a real wakeup run, waits for readiness, sends once, 
 
   const result = await processLeaderWakeups(store, delivery, NOW);
 
-  assert.deepEqual(result, [{ taskId: "task-1", runId: "run-1", status: "dispatched" }]);
+  assert.deepEqual(result, [{ taskId: "task-1", runId: "agent-run-1", status: "dispatched" }]);
   assert.deepEqual(delivery.calls.map((call) => call.type), ["prepare", "ready", "sendOnce"]);
   assert.equal(delivery.calls[0].input.mode, "new");
   assert.equal(delivery.calls[2].input.receiptId.startsWith("agent-run:"), true);
@@ -138,14 +139,14 @@ test("an idle Leader starts a real wakeup run, waits for readiness, sends once, 
   assert.equal(store.savedDispatches[0].run.roleName, "leader");
   assert.equal(
     store.savedDispatches[0].run.input.startsWith(
-      "Yui · task-1 · Test task · Leader · Run run-1\n\n"
+      "Yui · task-1 · Test task · Leader · Run agent-run-1\n\n"
     ),
     true
   );
   assert.match(store.savedDispatches[0].run.input, /role-result/);
   assert.match(store.savedDispatches[0].run.input, /yui task context task-1/);
-  assert.match(store.savedDispatches[0].run.input, /Current Leader Run: run-1/);
-  assert.match(store.savedDispatches[0].run.input, /yui task run yield run-1/);
+  assert.match(store.savedDispatches[0].run.input, /Current Leader Run: agent-run-1/);
+  assert.match(store.savedDispatches[0].run.input, /yui task run yield agent-run-1/);
   assert.match(store.savedDispatches[0].run.input, /yui task complete task-1 --summary/);
   assert.doesNotMatch(store.savedDispatches[0].run.input, /yui task message list/);
   assert.equal(store.pending.has("task-1"), false);
@@ -174,7 +175,7 @@ test("a Leader send or post-send persistence uncertainty preserves the claimed R
     assert.equal(result.status, "failed");
     assert.equal(result.reason, "delivery-uncertain");
     assert.equal(store.savedFailures.length, 0);
-    assert.equal(store.activeRuns.get(key("task-1", "leader")).id, "run-1");
+    assert.equal(store.activeRuns.get(key("task-1", "leader")).id, "agent-run-1");
     assert.equal(
       delivery.calls.some((call) => call.type === "forget"),
       false
@@ -187,7 +188,7 @@ test("a pre-send Leader failure forgets its transient prepared binding", async (
   const delivery = fakeDelivery();
   delivery.waitUntilReady = async (prepared) => {
     delivery.calls.push({ type: "ready", prepared });
-    throw new Error("composer inspection failed");
+    throw new Error("process inspection failed");
   };
 
   const [result] = await processLeaderWakeups(store, delivery, NOW);
@@ -198,7 +199,7 @@ test("a pre-send Leader failure forgets its transient prepared binding", async (
     {
       taskId: "task-1",
       roleName: "leader",
-      runId: "run-1"
+      runId: "agent-run-1"
     }
   );
 });
@@ -311,19 +312,19 @@ test("a missing Worker tmux fails its run and queues a Leader wakeup", async () 
   const store = fakeStore();
   store.roles.push(role("worker"));
   store.activeRuns.set(key("task-1", "worker"), {
-    ...activeRun("run-worker", "worker"),
-    workItemId: "work-1"
+    ...activeRun("agent-run-2", "worker"),
+    workItemId: "work-item-1"
   });
   store.sessions.set(key("task-1", "worker"), roleSession({ agentId: "codex-worker" }));
   const delivery = fakeDelivery({ inspect: "absent" });
 
   const failed = await reconcileExitedRoleRuns(store, delivery, NOW);
 
-  assert.deepEqual(failed, ["run-worker"]);
+  assert.deepEqual(failed, ["task-1/agent-run-2"]);
   assert.equal(store.savedExitedRuns.length, 1);
   assert.deepEqual(
     delivery.calls.find((call) => call.type === "forget")?.input,
-    { taskId: "task-1", roleName: "worker", runId: "run-worker" }
+    { taskId: "task-1", roleName: "worker", runId: "agent-run-2" }
   );
   assert.deepEqual(store.pending.get("task-1").reasons, ["role-result", "role-run-failed"]);
 });
@@ -331,7 +332,7 @@ test("a missing Worker tmux fails its run and queues a Leader wakeup", async () 
 test("a liveness probe error makes no state change", async () => {
   const store = fakeStore();
   store.roles.push(role("worker"));
-  store.activeRuns.set(key("task-1", "worker"), activeRun("run-worker", "worker"));
+  store.activeRuns.set(key("task-1", "worker"), activeRun("agent-run-2", "worker"));
   const delivery = fakeDelivery();
   delivery.inspectRole = async () => {
     throw new Error("tmux unavailable");
@@ -345,7 +346,7 @@ test("a liveness probe error makes no state change", async () => {
 test("an observed Turn completion fences destructive liveness reconciliation", async () => {
   const store = fakeStore();
   store.roles.push(role("worker"));
-  const run = activeRun("run-worker", "worker");
+  const run = activeRun("agent-run-2", "worker");
   store.activeRuns.set(key("task-1", "worker"), run);
   store.listPendingRuntimeTurnCompletions = () => [{
     taskId: "task-1",
@@ -361,29 +362,62 @@ test("an observed Turn completion fences destructive liveness reconciliation", a
 test("a delivery-uncertain Run is not failed by liveness in the same pass", async () => {
   const store = fakeStore();
   store.roles.push(role("worker"));
-  const run = activeRun("run-worker", "worker");
+  const run = activeRun("agent-run-2", "worker");
   store.activeRuns.set(key("task-1", "worker"), run);
   const delivery = fakeDelivery({ inspect: "absent" });
 
   assert.deepEqual(
-    await reconcileExitedRoleRuns(store, delivery, NOW, undefined, new Set([run.id])),
+    await reconcileExitedRoleRuns(
+      store,
+      delivery,
+      NOW,
+      undefined,
+      new Set([`task-1/${run.id}`])
+    ),
     []
   );
   assert.equal(store.savedExitedRuns.length, 0);
+});
+
+test("a delivery-uncertain local Run id does not fence another Task", async () => {
+  const store = fakeStore();
+  store.roles.push(role("worker"));
+  store.activeRuns.set(
+    key("task-1", "worker"),
+    activeRun("agent-run-2", "worker")
+  );
+  store.tasks.push({ ...store.tasks[0], id: "task-2", title: "Second Task" });
+  store.roles.push({ ...role("worker"), taskId: "task-2" });
+  store.activeRuns.set(key("task-2", "worker"), {
+    ...activeRun("agent-run-2", "worker"),
+    taskId: "task-2"
+  });
+  const delivery = fakeDelivery({ inspect: "absent" });
+
+  assert.deepEqual(
+    await reconcileExitedRoleRuns(
+      store,
+      delivery,
+      NOW,
+      undefined,
+      new Set(["task-1/agent-run-2"])
+    ),
+    ["task-2/agent-run-2"]
+  );
 });
 
 test("a present Role remains active until its native Turn Hook is observed", async () => {
   const store = fakeStore();
   store.roles.push(role("worker"));
   const run = {
-    ...activeRun("run-worker", "worker"),
+    ...activeRun("agent-run-2", "worker"),
     deliveredAt: new Date(NOW.getTime() - 120_000).toISOString()
   };
   store.activeRuns.set(key("task-1", "worker"), run);
   const delivery = {
     ...fakeDelivery({ inspect: "present" }),
     async inspectRoleReadiness() {
-      throw new Error("composer readiness is not a native Turn boundary");
+      throw new Error("process readiness is not a native Turn boundary");
     }
   };
 
@@ -395,7 +429,7 @@ test("a present Role remains active until its native Turn Hook is observed", asy
 test("an incomplete batch liveness snapshot is non-destructive", async () => {
   const store = fakeStore();
   store.roles.push(role("worker"));
-  store.activeRuns.set(key("task-1", "worker"), activeRun("run-worker", "worker"));
+  store.activeRuns.set(key("task-1", "worker"), activeRun("agent-run-2", "worker"));
   const delivery = fakeDelivery();
   delivery.inspectRoles = async () => [];
 
@@ -409,8 +443,8 @@ test("an incomplete batch liveness snapshot is non-destructive", async () => {
 test("liveness reconciliation uses one batch inventory for all active Roles", async () => {
   const store = fakeStore();
   store.roles.push(role("worker"));
-  store.activeRuns.set(key("task-1", "leader"), activeRun("run-leader", "leader"));
-  store.activeRuns.set(key("task-1", "worker"), activeRun("run-worker", "worker"));
+  store.activeRuns.set(key("task-1", "leader"), activeRun("agent-run-4", "leader"));
+  store.activeRuns.set(key("task-1", "worker"), activeRun("agent-run-2", "worker"));
   let inventoryCalls = 0;
   const delivery = {
     async inspectRole() {
@@ -433,7 +467,7 @@ test("liveness reconciliation uses one batch inventory for all active Roles", as
 
 test("a missing Leader tmux queues recovery, while Leader yield never self-wakes", async () => {
   const store = fakeStore();
-  const leaderRun = activeRun("run-leader", "leader");
+  const leaderRun = activeRun("agent-run-4", "leader");
   store.activeRuns.set(key("task-1", "leader"), leaderRun);
   const delivery = fakeDelivery({ inspect: "absent" });
 
@@ -447,7 +481,7 @@ test("a missing Leader tmux queues recovery, while Leader yield never self-wakes
 
 test("Leader yield makes an existing pending wakeup dispatchable without adding a self-wake", async () => {
   const store = fakeStore();
-  const leaderRun = activeRun("run-leader", "leader");
+  const leaderRun = activeRun("agent-run-4", "leader");
   store.activeRuns.set(key("task-1", "leader"), leaderRun);
   const delivery = fakeDelivery();
 
@@ -479,12 +513,39 @@ test("Operator delivery releases a partial batch and receipts make the retry saf
   const second = await processOperatorInputNotifications(store, delivery);
   assert.deepEqual(second.map((result) => result.status), ["already-sent", "sent"]);
   assert.deepEqual(receipts, [
-    "input-request:input-1",
-    "input-request:input-1",
-    "input-request:input-2"
+    "input-request:task-1/input-1",
+    "input-request:task-1/input-1",
+    "input-request:task-1/input-2"
   ]);
   assert.equal(store.mailbox.processing, null);
   assert.equal(store.mailbox.pending, null);
+});
+
+test("Operator delivery keeps equal local input ids from separate Tasks", async () => {
+  const requests = [
+    operatorRequest("input-1", "task-1"),
+    operatorRequest("input-1", "task-2")
+  ];
+  const store = operatorStore(requests);
+  const receipts = [];
+  const results = await processOperatorInputNotifications(store, {
+    async notifyOperatorInputOnce(input) {
+      receipts.push(input.receiptId);
+      return "already-sent";
+    }
+  });
+
+  assert.deepEqual(results.map(({ taskId, inputRequestId }) => ({
+    taskId,
+    inputRequestId
+  })), [
+    { taskId: "task-1", inputRequestId: "input-1" },
+    { taskId: "task-2", inputRequestId: "input-1" }
+  ]);
+  assert.deepEqual(receipts, [
+    "input-request:task-1/input-1",
+    "input-request:task-2/input-1"
+  ]);
 });
 
 test("Operator busy and delivery errors release the claimed mailbox batch", async () => {
@@ -502,12 +563,49 @@ test("Operator busy and delivery errors release the claimed mailbox batch", asyn
   }
 });
 
-function operatorRequest(id) {
-  return {
+test("Operator delivery sends one informational Task terminal notification", async () => {
+  const notification = {
     schemaVersion: 1,
-    id,
     taskId: "task-1",
-    requester: { roleName: "leader", agentId: "codex", runId: "run-1" },
+    type: "task-terminal",
+    status: "completed",
+    by: "leader",
+    summary: "Integrated and verified.",
+    createdAt: NOW.toISOString(),
+    updatedAt: NOW.toISOString()
+  };
+  const store = operatorStore([], [notification]);
+  const deliveries = [];
+
+  const result = await processOperatorInputNotifications(store, {
+    async notifyOperatorInputOnce(input) {
+      deliveries.push(input);
+      return "sent";
+    }
+  });
+
+  assert.deepEqual(result, [{
+    terminalTaskId: "task-1",
+    taskId: "task-1",
+    status: "sent"
+  }]);
+  assert.equal(deliveries[0].receiptId, `task-terminal:task-1:completed:${NOW.toISOString()}`);
+  assert.match(deliveries[0].text, /Integrated and verified/);
+  assert.equal(store.mailbox.pending, null);
+  assert.equal(store.mailbox.processing, null);
+});
+
+function operatorRequest(id, taskId = "task-1") {
+  return {
+    schemaVersion: 2,
+    id,
+    taskId,
+    requester: {
+      taskId,
+      roleName: "leader",
+      agentId: "codex",
+      runId: "agent-run-1"
+    },
     question: `Question ${id}?`,
     choices: [],
     blockedRefs: [],
@@ -518,21 +616,36 @@ function operatorRequest(id) {
   };
 }
 
-function operatorStore(requests) {
+function operatorStore(requests, notifications = []) {
   let mailbox = createWorkMailbox({ kind: "operator" });
   for (const request of requests) {
     mailbox = enqueueSignal(mailbox, {
       reason: "input-requested",
-      refs: [{ type: "input", id: request.id }],
+      refs: [{ type: "input", taskId: request.taskId, id: request.id }],
       occurredAt: NOW.toISOString()
     });
   }
-  const byId = new Map(requests.map((request) => [request.id, request]));
+  for (const notification of notifications) {
+    mailbox = enqueueSignal(mailbox, {
+      reason: "task-terminal",
+      refs: [{ type: "task", id: notification.taskId }],
+      occurredAt: NOW.toISOString()
+    });
+  }
+  const byId = new Map(requests.map((request) => [
+    `${request.taskId}/${request.id}`,
+    request
+  ]));
+  const notificationsByTask = new Map(notifications.map((notification) => [
+    notification.taskId,
+    notification
+  ]));
   const store = {
     get mailbox() { return mailbox; },
     getPresentationContext: () => ({ timeZone: "Asia/Shanghai" }),
     getWorkMailbox: () => mailbox,
-    getInputRequest: (id) => byId.get(id) ?? null,
+    getInputRequest: (taskId, id) => byId.get(`${taskId}/${id}`) ?? null,
+    getOperatorNotification: (taskId) => notificationsByTask.get(taskId) ?? null,
     getOperatorDeliveryTarget: () => ({ roleName: "operator", adapterId: "codex" }),
     claimWorkMailbox(input) {
       if (mailbox.processing !== null) {
@@ -596,7 +709,7 @@ function fakeStore(options = {}) {
     getRoleSession: (taskId, roleName) => store.sessions.get(key(taskId, roleName)) ?? null,
     getWorkMailbox: () => null,
     releaseWorkMailbox: () => false,
-    nextAgentRunId: () => `run-${store.savedDispatches.length + 1}`,
+    peekNextAgentRunId: () => `agent-run-${store.savedDispatches.length + 1}`,
     getPendingWakeup: (taskId) => store.pending.get(taskId) ?? null,
     listPendingWakeups: () => [...store.pending.values()],
     savePendingWakeup: (wakeup) => store.pending.set(wakeup.taskId, wakeup),
@@ -685,33 +798,49 @@ function fakeDelivery(options = {}) {
 }
 
 function role(name) {
+  const agentId = name === "leader" ? "codex-leader" : "codex-worker";
   return {
     taskId: "task-1",
     name,
-    activeAgentId: name === "leader" ? "codex-leader" : "codex-worker",
+    activeAgentId: agentId,
     adapterId: "codex",
+    effective: testEffectiveLaunch({ agentId, workspaceRoot: "/repo" }),
+    workspace: "/repo",
     status: "running"
   };
 }
 
 function roleSession(patch = {}) {
-  return {
+  const session = {
     agentId: "codex-leader",
     adapterId: "codex",
     nativeSessionId: "native-leader-1",
     status: "running",
     ...patch
   };
+  return {
+    ...session,
+    effective: patch.effective ?? testEffectiveLaunch({
+      agentId: session.agentId,
+      adapterId: session.adapterId,
+      workspaceRoot: "/repo"
+    })
+  };
 }
 
 function activeRun(id, roleName) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 4,
     id,
     taskId: "task-1",
     roleName,
     mode: "new",
     input: "continue",
+    purpose: "execution",
+    effective: testEffectiveLaunch({
+      agentId: roleName === "leader" ? "codex-leader" : "codex-worker",
+      workspaceRoot: "/repo"
+    }),
     status: "active",
     createdAt: NOW.toISOString(),
     updatedAt: NOW.toISOString()

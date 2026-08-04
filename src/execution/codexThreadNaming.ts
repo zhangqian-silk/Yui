@@ -1,6 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 
+import { YUI_VERSION } from "../version.js";
+
 type JsonObject = Record<string, unknown>;
 
 export type CodexThreadNameRequest = Readonly<{
@@ -81,7 +83,7 @@ class CodexNamingClient {
     try {
       await withTimeout(
         client.request("initialize", {
-          clientInfo: { name: "yui", title: "Yui", version: "0.2.0" },
+          clientInfo: { name: "yui", title: "Yui", version: YUI_VERSION },
           capabilities: {
             experimentalApi: true,
             requestAttestation: false

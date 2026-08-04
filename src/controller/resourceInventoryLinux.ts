@@ -393,11 +393,13 @@ function loadHomeState(
     const roles: RuntimeRoleFact[] = store.listGlobalRoles().map((role) => {
       const session = activeRoleAgentSession(store.getGlobalRoleSessionSet(role.name));
       const binding = role.agentBindings[role.activeAgentId];
+      const agentId = session?.effective.agentId ?? role.activeAgentId;
+      const adapterId = session?.effective.adapterId ?? binding?.adapterId;
       return {
         ownerKind: "global-role",
         roleName: role.name,
-        agentId: role.activeAgentId,
-        ...(binding === undefined ? {} : { adapterId: binding.adapterId }),
+        agentId,
+        ...(adapterId === undefined ? {} : { adapterId }),
         ...(session === null ? {} : { nativeSessionId: session.nativeSessionId })
       };
     });
@@ -405,14 +407,16 @@ function loadHomeState(
       for (const role of store.listRoles(task.id)) {
         const session = activeRoleAgentSession(store.getRoleSessionSet(task.id, role.name));
         const binding = role.agentBindings[role.activeAgentId];
+        const agentId = session?.effective.agentId ?? role.activeAgentId;
+        const adapterId = session?.effective.adapterId ?? binding?.adapterId;
         roles.push({
           ownerKind: "task-role",
           taskId: task.id,
           taskTitle: task.title,
           taskStatus: task.status,
           roleName: role.name,
-          agentId: role.activeAgentId,
-          ...(binding === undefined ? {} : { adapterId: binding.adapterId }),
+          agentId,
+          ...(adapterId === undefined ? {} : { adapterId }),
           ...(session === null ? {} : { nativeSessionId: session.nativeSessionId })
         });
       }

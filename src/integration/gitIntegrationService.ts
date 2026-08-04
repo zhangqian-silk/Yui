@@ -43,8 +43,8 @@ export class GitIntegrationService {
     this.worktreeRoot = resolveWorktreeRoot(home, store.getConfig().defaultWorkspace);
   }
 
-  async integrate(integrationId: string): Promise<IntegrationResult> {
-    const initial = requireIntegration(this.store, integrationId);
+  async integrate(taskId: string, integrationId: string): Promise<IntegrationResult> {
+    const initial = requireIntegration(this.store, taskId, integrationId);
     const task = this.store.getTask(initial.taskId);
     if (task === null || !task.projectBindings.some(
       ({ projectId }) => projectId === initial.projectId
@@ -505,13 +505,16 @@ async function gitLine(args: readonly string[]): Promise<string> {
   return value;
 }
 
-function requireIntegration(store: TaskStore, id: string): IntegrationAttempt {
-  const matches = store.listTasks().flatMap((task) => {
-    const attempt = store.getIntegrationAttempt(task.id, id);
-    return attempt === null ? [] : [attempt];
-  });
-  if (matches.length !== 1) throw new Error(`Integration Attempt not found or ambiguous: ${id}.`);
-  return matches[0];
+function requireIntegration(
+  store: TaskStore,
+  taskId: string,
+  id: string
+): IntegrationAttempt {
+  const attempt = store.getIntegrationAttempt(taskId, id);
+  if (attempt === null) {
+    throw new Error(`Integration Attempt not found: ${taskId}/${id}.`);
+  }
+  return attempt;
 }
 
 function fullTargetRef(value: string): string {

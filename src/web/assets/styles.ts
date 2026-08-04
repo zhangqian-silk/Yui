@@ -281,18 +281,22 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .pill[data-status=completed],.pill[data-status=integrated],.pill[data-status=role-result]{color:var(--success);background:var(--success-soft);border-color:transparent}
 .pill[data-status=pending],.pill[data-status=draft],.pill[data-status=recommended],
 .pill[data-status=detached]{color:var(--warning);background:var(--warning-soft);border-color:transparent}
-.pill[data-status=archived],.pill[data-status=superseded],.pill[data-status=abandoned],
+.pill[data-status=archived],.pill[data-status=retired],.pill[data-status=superseded],.pill[data-status=abandoned],
 .pill[data-status=exited],.pill[data-status=system]{color:var(--muted);background:var(--bg-3);border-color:transparent}
 .status-dot{width:8px;height:8px;flex:none;border-radius:50%;background:var(--faint);margin-top:4px}
 .status-dot.active{background:var(--active);box-shadow:0 0 8px var(--active)}
 .status-dot.completed{background:var(--success);box-shadow:0 0 8px var(--success)}
 .status-dot.draft{background:var(--warning);box-shadow:0 0 8px var(--warning)}
+.status-dot.retired{background:var(--faint)}
 .status-dot.archived{background:var(--faint)}
 /* Bands */
 .conclusion{padding:13px 16px;border:1px solid var(--success);background:var(--success-soft);border-radius:var(--radius-lg);margin:16px 0;display:grid;gap:7px}
 .conclusion h3{margin:0;color:var(--success);letter-spacing:.14em;font-family:var(--font-mono);font-size:10px;text-transform:uppercase;display:flex;align-items:center;gap:10px}
 .conclusion h3:before{content:"✓ ";display:grid;place-items:center;width:18px;height:18px;border-radius:50%;background:var(--success);color:var(--on-accent);font-size:11px}
 .conclusion p{font-size:14px;margin:0;color:var(--text);font-family:var(--font-body);line-height:1.6}
+.conclusion.retired{border-color:var(--warning);background:var(--warning-soft)}
+.conclusion.retired h3{color:var(--warning)}
+.conclusion.retired h3:before{content:"× ";background:var(--warning);color:var(--on-accent)}
 .conclusion.archived{border-color:var(--border-strong);background:var(--bg-2)}
 .conclusion.archived h3{color:var(--muted)}
 .conclusion.archived h3:before{content:"→ ";background:var(--border-strong);color:var(--text)}

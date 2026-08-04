@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, realpathSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 import {
   configuredAgentToDefinition,
@@ -22,6 +23,7 @@ import type { TaskStore } from "../storage/taskStore.js";
 import { writeTextFileAtomically } from "../storage/durableFile.js";
 import { compileRoleSessionContext } from "../context/roleSessionContext.js";
 import { resolveAgentAdapter } from "./agentAdapter.js";
+import type { ClaudeAgentConfig } from "./agentAdapter.js";
 import { inspectCodexLaunchConfig } from "./codexConfigConflict.js";
 import type { PlannedRoleSession, RoleLaunchPlanner } from "./executorRegistry.js";
 import type {
@@ -30,6 +32,13 @@ import type {
 } from "../runtime/ports.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import type { RoleWorkspace } from "../worktree/roleWorkspace.js";
+import { activeLiveRoleAgentSession } from "./agentExecutor.js";
+import {
+  effectiveLaunchSnapshotsCompatible,
+  effectiveRoleForLaunch,
+  resolveEffectiveLaunch,
+  type EffectiveLaunchSnapshot
+} from "./effectiveLaunch.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
@@ -41,6 +50,7 @@ export type GlobalRoleLaunchPlanInput = Readonly<{
   roleName: string;
   agentId: string;
   adapterId: string;
+  effective?: EffectiveLaunchSnapshot;
   mode: RoleSessionLaunchMode;
   nativeSessionId?: string;
   launchId?: string;
@@ -105,7 +115,10 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     if (task.status !== "active") throw new Error(`Task is not active: ${input.taskId}.`);
     const role = this.store.getRole(input.taskId, input.roleName);
     if (role === null) throw new Error(`Role not found: ${input.taskId}/${input.roleName}.`);
-    const activeRun = this.store.getActiveAgentRun(task.id, role.name);
+      const activeRun = this.store.getActiveAgentRun(task.id, role.name);
+    if (input.runId !== undefined && activeRun?.id !== input.runId) {
+      throw new Error(`Role Run is no longer current: ${input.runId}.`);
+    }
     const runWorkspace = activeRun?.workspace;
     if (task.projectBindings.length > 0) {
       const workspace = this.store.getRoleWorkspace(task.id, role.name);
@@ -121,7 +134,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         && workspace.owner.type === "work-item"
         && isolatedWorkItem !== null
         && isolatedWorkItem.assignee === role.name
-        && !["completed", "failed", "cancelled", "superseded"].includes(isolatedWorkItem.status)
+        && !["completed", "failed", "retired"].includes(isolatedWorkItem.status)
         && (activeRun === null
           || activeRun.workItemId === workspace.owner.workItemId)
         && sameWorkspaceProjects(workspace, task.projectBindings.map(({ projectId }) => projectId))
@@ -134,30 +147,70 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           task.projectBindings.map(({ projectId }) => projectId)
         )
         && (runWorkspace.owner.type === "task"
-          || runWorkspace.owner.workItemId === activeRun?.workItemId);
+          || (runWorkspace.owner.type === "work-item"
+            && runWorkspace.owner.workItemId === activeRun?.workItemId)
+          || (runWorkspace.owner.type === "review-round"
+            && runWorkspace.owner.reviewRoundId === activeRun?.reviewRoundId));
       if (task.cwd === undefined || main === null || (!runScoped && !sharedMain && !isolated)) {
         throw new Error(`Role workspace is not ready: ${input.taskId}/${input.roleName}.`);
       }
+    }
+    const sessionSet = this.store.getTaskRoleSessionSet(task.id, role.name);
+    const resolvedEffective = activeRun?.effective
+      ?? activeLiveRoleAgentSession(sessionSet)?.effective
+      ?? resolveTaskRoleEffectiveLaunch(this.store, role);
+    if (input.effective !== undefined
+      && !isDeepStrictEqual(resolvedEffective, input.effective)) {
+      throw new Error(`Role launch effective Run snapshot changed: ${input.taskId}/${input.roleName}.`);
+    }
+    if (activeRun !== null && input.effective === undefined) {
+      throw new Error(`Role launch is missing the effective Run snapshot: ${input.taskId}/${input.roleName}.`);
+    }
+    const effective = input.effective ?? resolvedEffective;
+    const existing = sessionSet?.sessions[effective.agentId];
+    const compatibleExisting = existing !== undefined
+      && effectiveLaunchSnapshotsCompatible(existing.effective, effective);
+    if (input.mode === "resume" && !compatibleExisting) {
+      throw new Error(
+        `Task Role resume effective snapshot drifted: ${task.id}/${role.name}.`
+      );
     }
     return this.#compile(
       role,
       input,
       { scope: "task", taskId: task.id },
       taskRoleSessionTitle(task, role.name),
-      this.store.getRoleSession(task.id, role.name)?.nativeSessionId,
-      runWorkspace
+      compatibleExisting ? existing.nativeSessionId : undefined,
+      runWorkspace,
+      effective
     );
   }
 
   planGlobalRole(input: GlobalRoleLaunchPlanInput): PlannedRoleSession {
     const role = this.store.getGlobalRole(input.roleName);
     if (role === null) throw new Error(`Global Role not found: ${input.roleName}.`);
+    const sessionSet = this.store.getGlobalRoleSessionSet(role.name);
+    const resolvedEffective = activeLiveRoleAgentSession(sessionSet)?.effective
+      ?? resolveEffectiveLaunch({ role, purpose: "execution" });
+    if (input.effective !== undefined
+      && !isDeepStrictEqual(resolvedEffective, input.effective)) {
+      throw new Error(`Global Role launch effective snapshot changed: ${role.name}.`);
+    }
+    const effective = input.effective ?? resolvedEffective;
+    const existing = sessionSet?.sessions[effective.agentId];
+    const compatibleExisting = existing !== undefined
+      && effectiveLaunchSnapshotsCompatible(existing.effective, effective);
+    if (input.mode === "resume" && !compatibleExisting) {
+      throw new Error(`Global Role resume effective snapshot drifted: ${role.name}.`);
+    }
     return this.#compile(
       role,
       input,
       { scope: "global" },
       undefined,
-      this.store.getGlobalRoleSessionSet(role.name)?.sessions[role.activeAgentId]?.nativeSessionId
+      compatibleExisting ? existing.nativeSessionId : undefined,
+      undefined,
+      effective
     );
   }
 
@@ -170,14 +223,17 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       mode: RoleSessionLaunchMode;
       nativeSessionId?: string;
       launchId?: string;
+      runId?: string;
       environment?: Readonly<Record<string, string>>;
     }>,
     owner: Readonly<{ scope: "task"; taskId: string } | { scope: "global" }>,
     sessionTitle: string | undefined,
-    knownNativeSessionId?: string,
-    workspaceOverride?: RoleWorkspace
+    knownNativeSessionId: string | undefined,
+    workspaceOverride: RoleWorkspace | undefined,
+    effective: EffectiveLaunchSnapshot
   ): PlannedRoleSession {
-    const binding = activeRoleAgentBinding(role);
+    const launchRole = effectiveRoleForLaunch(role, effective);
+    const binding = activeRoleAgentBinding(launchRole);
     if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
       throw new Error(`Role launch identity changed: ${role.name}.`);
     }
@@ -207,8 +263,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         .join(delimiter)
     };
     const adapter = resolveAgentAdapter(binding.adapterId);
-    const effectiveWorkspace = workspaceOverride?.root ?? role.workspace;
-    const sessionContext = compileRoleSessionContext(this.home, role, owner);
+    const effectiveWorkspace = effective.workspace.root;
+    const sessionContext = compileRoleSessionContext(this.home, launchRole, owner);
     const codexConfig = binding.config.adapterId === "codex"
       ? inspectCodexLaunchConfig({
           environment: {
@@ -227,9 +283,22 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         + "notify callback and refuses to replace or be replaced by native configuration."
       );
     }
+    const managedRun = owner.scope === "task" && input.runId !== undefined
+      ? this.store.getAgentRun(owner.taskId, input.runId)
+      : null;
+    const effectiveConfig = binding.config.adapterId === "claude"
+      && owner.scope === "task"
+      && input.runId !== undefined
+      ? managedClaudeControlPlaneConfig(
+          binding.config,
+          owner.taskId,
+          managedRun?.workItemId,
+          input.runId
+        )
+      : binding.config;
     const compileInput = {
       agent,
-      config: binding.config,
+      config: effectiveConfig,
       workspace: effectiveWorkspace,
       ...(sessionTitle === undefined ? {} : { sessionTitle }),
       ...sessionContext,
@@ -265,9 +334,15 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     if (binding.adapterId === "codex") {
       args = addCodexSessionNotify(args, launchMode, this.#cliPath);
       session = launchMode === "resume"
-        ? readySession(input.agentId, binding.adapterId, resumeNativeSessionId!)
+        ? readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective)
         : null;
     } else if (launchMode === "new") {
+      if (owner.scope === "task" && input.runId !== undefined) {
+        args.push(
+          "--plugin-dir",
+          ensureManagedClaudeLifecyclePlugin(this.home, this.#cliPath)
+        );
+      }
       const nativeSessionId = requireText(
         input.launchId === undefined
           ? this.#createNativeSessionId()
@@ -280,9 +355,15 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         "Native session id"
       );
       args.push("--session-id", nativeSessionId);
-      session = readySession(input.agentId, binding.adapterId, nativeSessionId);
+      session = readySession(input.agentId, binding.adapterId, nativeSessionId, effective);
     } else {
-      session = readySession(input.agentId, binding.adapterId, resumeNativeSessionId!);
+      if (owner.scope === "task" && input.runId !== undefined) {
+        args.push(
+          "--plugin-dir",
+          ensureManagedClaudeLifecyclePlugin(this.home, this.#cliPath)
+        );
+      }
+      session = readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective);
     }
 
     const launch = {
@@ -310,7 +391,11 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
             }),
         ...(input.launchId === undefined
           ? {}
-          : { YUI_LAUNCH_ID: input.launchId })
+          : { YUI_LAUNCH_ID: input.launchId }),
+        ...(input.runId === undefined ? {} : { YUI_RUN_ID: input.runId }),
+        ...(configured.adapterId !== "claude" || session === null
+          ? {}
+          : { YUI_NATIVE_SESSION_ID: session.nativeSessionId })
       }
     };
     const scopedLaunch = owner.scope === "task"
@@ -370,6 +455,24 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   }
 }
 
+function resolveTaskRoleEffectiveLaunch(
+  store: TaskStore,
+  role: TaskRole
+): EffectiveLaunchSnapshot {
+  const workspace = store.getRoleWorkspace(role.taskId, role.name)
+    ?? store.getRoleWorkspace(role.taskId, "leader")
+    ?? undefined;
+  const item = workspace?.owner.type === "work-item"
+    ? store.getWorkItem(role.taskId, workspace.owner.workItemId)
+    : null;
+  return resolveEffectiveLaunch({
+    role,
+    purpose: "execution",
+    ...(workspace === undefined ? {} : { workspace }),
+    ...(item === null ? {} : { workItemWriteProjectIds: item.writeProjectIds })
+  });
+}
+
 function workspaceScopeEnvironment(
   environment: Readonly<Record<string, string>>,
   workspace: RoleWorkspace
@@ -408,6 +511,62 @@ function ensureManagedYuiLauncher(home: string, cliPath: string): string {
   );
   chmodSync(launcherPath, 0o700);
   return binPath;
+}
+
+function ensureManagedClaudeLifecyclePlugin(home: string, cliPath: string): string {
+  const root = join(resolve(home), "runtime", "claude-lifecycle-plugin");
+  writeTextFileAtomically(
+    join(root, ".claude-plugin", "plugin.json"),
+    `${JSON.stringify({
+      name: "yui-runtime-lifecycle",
+      description: "Yui-owned exact Run lifecycle transport",
+      version: "1.0.0"
+    }, null, 2)}\n`
+  );
+  const command = {
+    type: "command",
+    command: canonicalPath(process.execPath),
+    args: [canonicalPath(cliPath), "internal", "claude-hook"]
+  };
+  writeTextFileAtomically(
+    join(root, "hooks", "hooks.json"),
+    `${JSON.stringify({
+      hooks: {
+        StopFailure: [{ hooks: [command] }]
+      }
+    }, null, 2)}\n`
+  );
+  return root;
+}
+
+function managedClaudeControlPlaneConfig(
+  config: ClaudeAgentConfig,
+  taskId: string,
+  workItemId: string | undefined,
+  runId: string
+): ClaudeAgentConfig {
+  if (config.permission.strategy !== "configured") return config;
+  const managed = [
+    `Bash(yui --json task context ${taskId})`,
+    `Bash(yui --json task work list ${taskId})`,
+    ...(workItemId === undefined
+      ? []
+      : [`Bash(yui --json task work show ${workItemId})`]),
+    `Bash(yui task run yield ${runId} --summary-file -:*)`
+  ];
+  const existing = (config.permission.allowedTools ?? [])
+    .filter((rule) => !isManagedYuiBashRule(rule));
+  return {
+    ...config,
+    permission: {
+      ...config.permission,
+      allowedTools: [...new Set([...existing, ...managed])]
+    }
+  };
+}
+
+function isManagedYuiBashRule(rule: string): boolean {
+  return /^Bash\(yui(?:\s|:\*|\*|\))/u.test(rule.trim());
 }
 
 function canonicalPath(path: string): string {
@@ -473,13 +632,15 @@ function addCodexSessionNotify(
 function readySession(
   agentId: string,
   adapterId: string,
-  nativeSessionId: string
+  nativeSessionId: string,
+  effective: EffectiveLaunchSnapshot
 ): SchedulerRoleSession {
   return {
     agentId,
     adapterId,
     nativeSessionId: requireText(nativeSessionId, "Native session id"),
-    status: "ready"
+    status: "ready",
+    effective
   };
 }
 

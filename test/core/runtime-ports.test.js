@@ -6,8 +6,14 @@ import {
   createRuntimeBinding,
   createSessionLaunchRequest
 } from "../../dist/runtime/index.js";
+import { testEffectiveLaunch } from "../helpers/effectiveLaunch.js";
 
 const NOW = new Date("2026-07-22T08:00:00.000Z");
+const EFFECTIVE = testEffectiveLaunch({
+  agentId: "codex-personal",
+  adapterId: "codex",
+  workspaceRoot: "/repo"
+});
 
 test("runtime values retain only portable identities and an opaque host reference", () => {
   const owner = { scope: "task", taskId: " task-1 ", roleName: " leader " };
@@ -40,6 +46,7 @@ test("session launch requests distinguish fresh and resumable native sessions wi
     owner: { scope: "global", roleName: "operator" },
     agentId: "codex-personal",
     adapterId: "codex",
+    effective: EFFECTIVE,
     workspace: " /repo "
   });
   const resumed = createSessionLaunchRequest({
@@ -48,6 +55,7 @@ test("session launch requests distinguish fresh and resumable native sessions wi
     owner: { scope: "task", taskId: "task-1", roleName: "leader" },
     agentId: "codex-personal",
     adapterId: "codex",
+    effective: EFFECTIVE,
     workspace: "/repo",
     nativeSessionId: " thread-1 "
   });
@@ -60,21 +68,40 @@ test("session launch requests distinguish fresh and resumable native sessions wi
 });
 
 test("prompt envelopes preserve delivery identity while copying their source", () => {
-  const source = { kind: "input-request", id: " input-1 " };
+  const source = { kind: "input-request", taskId: " task-1 ", localId: "input-1" };
   const envelope = createPromptEnvelope({
-    id: " prompt-1 ",
+    id: "input-request:task-1/input-1",
     source,
     text: " Choose a database. ",
     createdAt: NOW
   });
 
   assert.deepEqual(envelope, {
-    id: "prompt-1",
-    source: { kind: "input-request", id: "input-1" },
+    id: "input-request:task-1/input-1",
+    source: { kind: "input-request", taskId: "task-1", localId: "input-1" },
     text: "Choose a database.",
     createdAt: NOW.toISOString()
   });
   assert.notEqual(envelope.source, source);
+
+  assert.throws(
+    () => createPromptEnvelope({
+      id: "prompt-1",
+      source,
+      text: "Choose a database.",
+      createdAt: NOW
+    }),
+    /does not match its source/u
+  );
+  assert.throws(
+    () => createPromptEnvelope({
+      id: "input-request:task-2/input-1",
+      source,
+      text: "Choose a database.",
+      createdAt: NOW
+    }),
+    /does not match its source/u
+  );
 });
 
 test("runtime constructors reject ambiguous or unsafe identities", () => {
@@ -85,6 +112,7 @@ test("runtime constructors reject ambiguous or unsafe identities", () => {
       owner: { scope: "task", taskId: "task-1", roleName: "leader" },
       agentId: "codex",
       adapterId: "codex",
+      effective: testEffectiveLaunch({ workspaceRoot: "/repo" }),
       workspace: "/repo",
       nativeSessionId: " "
     }),
@@ -104,7 +132,7 @@ test("runtime constructors reject ambiguous or unsafe identities", () => {
   assert.throws(
     () => createPromptEnvelope({
       id: "prompt-1",
-      source: { kind: "unknown", id: "source-1" },
+      source: { kind: "unknown", taskId: "task-1", localId: "source-1" },
       text: "Prompt",
       createdAt: NOW
     }),

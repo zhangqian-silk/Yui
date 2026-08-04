@@ -1,4 +1,7 @@
-import type { RoleSessionSet } from "../executor/agentExecutor.js";
+import {
+  activeRoleAgentSession,
+  type RoleSessionSet
+} from "../executor/agentExecutor.js";
 import type { GlobalRole, Role, RoleAgentBinding } from "../role/role.js";
 import { defaultTableWidth, renderTable } from "./table.js";
 
@@ -24,6 +27,7 @@ export function renderRoleDetails(
 ): string {
   const bindings = Object.values(role.agentBindings)
     .sort((left, right) => left.agentId.localeCompare(right.agentId));
+  const effective = activeRoleAgentSession(input.sessions ?? null)?.effective;
   const profile = [
     `  Description      ${present(role.description)}`,
     `  Responsibilities ${presentList(role.responsibilities)}`,
@@ -36,7 +40,16 @@ export function renderRoleDetails(
     `  Kind             ${input.kind}`,
     `  Active Agent     ${role.activeAgentId}`,
     ...("status" in role ? [`  Status           ${role.status}`] : []),
-    `  Workspace        ${role.workspace}`
+    `  Workspace        ${role.workspace}`,
+    `  Desired launch   r${role.launchRevision}; Profile intent=${role.defaultAccess}`,
+    `  Effective launch ${effective === undefined
+      ? "not started"
+      : `${effective.agentId}/${effective.adapterId}; r${effective.sourceDesiredRevision}; Profile intent=${effective.profileAccess}; permission=${effective.permission.strategy}`}`,
+    `  Desired drift    ${effective === undefined
+      ? "-"
+      : effective.sourceDesiredRevision === role.launchRevision
+        ? "none"
+        : "pending next launch"}`
   ];
   return [
     title,
@@ -85,27 +98,28 @@ function bindingRow(
 }
 
 function permission(binding: RoleAgentBinding): string {
-  if (binding.config.yolo === true) return "YOLO";
   if (binding.config.adapterId === "codex") {
-    const sandbox = binding.config.permission?.sandbox;
-    const approval = binding.config.permission?.approval;
-    if (sandbox === undefined && approval === undefined) return "CLI default";
+    const permission = binding.config.permission;
+    if (permission.strategy === "default") return "CLI default";
+    if (permission.strategy === "bypass") return "bypass";
     return [
-      sandbox === undefined ? undefined : `sandbox=${sandbox}`,
-      approval === undefined ? undefined : `approval=${approval}`
-    ].filter((value): value is string => value !== undefined).join(", ");
+      permission.sandbox === undefined ? undefined : `sandbox=${permission.sandbox}`,
+      permission.approval === undefined ? undefined : `approval=${permission.approval}`
+    ].filter((value): value is string => value !== undefined).join("; ");
   }
   const permission = binding.config.permission;
+  if (permission.strategy === "default") return "CLI default";
+  if (permission.strategy === "bypass") return "bypass";
   const rules = [
-    permission?.mode === undefined ? undefined : `mode=${permission.mode}`,
-    permission?.allowedTools === undefined
+    permission.mode === undefined ? undefined : `mode=${permission.mode}`,
+    permission.allowedTools === undefined
       ? undefined
       : `allow=${permission.allowedTools.join(", ")}`,
-    permission?.disallowedTools === undefined
+    permission.disallowedTools === undefined
       ? undefined
       : `deny=${permission.disallowedTools.join(", ")}`
   ].filter((value): value is string => value !== undefined);
-  return rules.length === 0 ? "CLI default" : rules.join("; ");
+  return rules.join("; ");
 }
 
 function present(value: string | undefined): string {

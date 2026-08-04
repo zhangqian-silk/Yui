@@ -1,12 +1,26 @@
 import type { PromptEnvelope } from "./promptEnvelope.js";
 import type { RuntimeBinding } from "./runtimeBinding.js";
 import type { RuntimeOwner } from "./runtimeOwner.js";
+import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 import type {
   NewSessionLaunchRequest,
   ResumeSessionLaunchRequest
 } from "./sessionLaunchRequest.js";
 
 export type SessionRuntimeState = "starting" | "running" | "stopped" | "unavailable";
+
+/** A persisted launch is either temporarily unavailable or permanently lost. */
+export class RuntimeLaunchError extends Error {
+  readonly name = "RuntimeLaunchError";
+
+  constructor(
+    readonly retryable: boolean,
+    readonly launchId: string,
+    message: string
+  ) {
+    super(message);
+  }
+}
 
 export type SessionInspection = Readonly<{
   state: SessionRuntimeState;
@@ -17,6 +31,7 @@ export type RuntimeLaunchPreparationRequest = Readonly<{
   owner: RuntimeOwner;
   agentId: string;
   adapterId: string;
+  effective: EffectiveLaunchSnapshot;
   workspace: string;
   environment?: Readonly<Record<string, string>>;
   mode: "new" | "resume";

@@ -1,7 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { resolve } from "node:path";
 import type { Readable } from "node:stream";
-import { stripVTControlCharacters } from "node:util";
 import { runtimeError } from "../errors/cliError.js";
 import { usableInteractiveTerminal } from "../output/terminal.js";
 import { handoffTerminal, type TerminalInput } from "./terminalHandoff.js";
@@ -36,8 +35,6 @@ export type TmuxPaneState = Readonly<{
   dead: boolean;
   pid?: number;
   currentCommand: string;
-  content: string;
-  styledContent?: string;
   cursorX?: number;
   cursorY?: number;
   historySize?: number;
@@ -427,18 +424,13 @@ export class TmuxManager {
     const pidText = output.slice(separator + 1, secondSeparator);
     const currentCommand = output.slice(secondSeparator + 1);
     const pid = Number(pidText);
-    const styledContent = this.run([
-      "capture-pane", "-ep", "-t", target, "-S", "-40"
-    ]);
     return {
       taskId,
       roleName,
       target,
       dead: dead === "1",
       ...(Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),
-      currentCommand,
-      content: stripVTControlCharacters(styledContent),
-      styledContent
+      currentCommand
     };
   }
 
@@ -446,11 +438,7 @@ export class TmuxManager {
     return (await this.inspectDeliveryPaneAsync(taskId, roleName)).pane;
   }
 
-  /**
-   * Reads receipt, pane identity, cursor fence and styled terminal contents
-   * through one tmux client. The styled snapshot lets adapter probes distinguish
-   * an empty placeholder from user-authored composer text.
-   */
+  /** Reads receipt and pane identity through one tmux client without terminal output. */
   private async inspectDeliveryPaneAsync(
     taskId: string,
     roleName: string,
@@ -472,15 +460,9 @@ export class TmuxManager {
         "#{history_size}",
         "#{pane_current_command}",
         receiptFormat
-      ].join("|"),
-      ";",
-      "capture-pane", "-ep", "-t", target, "-S", "-40"
+      ].join("|")
     ]);
-    const newline = output.indexOf("\n");
-    if (newline < 0) {
-      throw runtimeError(`Tmux returned an invalid pane state for ${roleName}.`);
-    }
-    const state = output.slice(0, newline).split("|");
+    const state = output.trimEnd().split("|");
     if (state.length !== 8 || state[0] !== PANE_STATE_MARKER) {
       throw runtimeError(`Tmux returned an invalid pane state for ${roleName}.`);
     }
@@ -509,7 +491,6 @@ export class TmuxManager {
     if (cursorX === undefined || cursorY === undefined || historySize === undefined) {
       throw runtimeError(`Tmux returned an invalid pane state for ${roleName}.`);
     }
-    const styledContent = output.slice(newline + 1);
     return {
       pane: {
         taskId,
@@ -518,8 +499,6 @@ export class TmuxManager {
         dead: deadText === "1",
         ...(pid === undefined ? {} : { pid }),
         currentCommand,
-        content: stripVTControlCharacters(styledContent),
-        styledContent,
         cursorX,
         cursorY,
         historySize
@@ -574,8 +553,8 @@ export class TmuxManager {
 
   /**
    * Reads the Role pane inventory for this YUI_HOME in one tmux server call.
-   * Terminal contents are deliberately excluded; recovery code can take a
-   * targeted readiness snapshot later for the small set of suspicious panes.
+   * Terminal contents are deliberately excluded; recovery can inspect process
+   * identity later for the small set of suspicious panes.
    */
   inspectRolePaneInventory(): TmuxRolePaneState[] {
     const formatSeparator = "\u001f";
@@ -684,8 +663,8 @@ export class TmuxManager {
     safeValue(receiptId, "tmux delivery receipt id");
     safeValue(input, "tmux input");
     // A delivered run is normally still busy on the next Controller scan. The
-    // pane receipt is authoritative for that retry, so do not wait for the
-    // composer merely to discover that the input was already sent.
+    // pane receipt is authoritative for that retry, so return before another
+    // process-readiness check when the input was already sent.
     if (this.hasDeliveryReceipt(taskId, roleName, receiptId)) {
       return "already-sent";
     }

@@ -3,12 +3,7 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { ControllerDispatcher } from "../core/controllerServer.js";
 import type { JsonValue } from "../core/protocol.js";
-import {
-  activeRoleAgentBinding,
-  type GlobalRole,
-  type Role,
-  type RoleAgentBinding
-} from "../role/role.js";
+import { type GlobalRole, type Role } from "../role/role.js";
 import type { ConfiguredAgent } from "../agent/agent.js";
 import {
   AGENT_OPERATIONAL_ENVIRONMENT_NAMES,
@@ -22,9 +17,18 @@ import {
   type RuntimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
 import {
-  agentComposerReadinessProbe,
+  agentProcessReadinessProbe,
   ExecutorRegistry
 } from "../executor/executorRegistry.js";
+import {
+  activeLiveRoleAgentSession,
+  roleAgentSessionResumeMode
+} from "../executor/agentExecutor.js";
+import {
+  effectiveLaunchSnapshotsCompatible,
+  resolveEffectiveLaunch,
+  type EffectiveLaunchSnapshot
+} from "../executor/effectiveLaunch.js";
 import { FileRoleLaunchPlanner } from "../executor/fileRoleLaunchPlanner.js";
 import { FileTaskStore, type TaskStore } from "../storage/taskStore.js";
 import {
@@ -95,7 +99,7 @@ export async function startFileTaskControllerRuntime(
   );
   const sessionHost = options.sessionHost ?? new TmuxSessionHost(planner, tmux);
   const promptPush = options.promptPush
-    ?? new TmuxPromptPushAdapter(tmux, agentComposerReadinessProbe);
+    ?? new TmuxPromptPushAdapter(tmux, agentProcessReadinessProbe);
   let runningRuntime: RunningFileTaskController["runtime"] | undefined;
   const signalRuntimeCleanup = (target: RuntimeLifecycleTarget) => {
     runningRuntime?.signal(runtimeLifecycleSignalKey(
@@ -125,7 +129,7 @@ export async function startFileTaskControllerRuntime(
   const delivery = options.delivery ?? new ExecutorRegistry(
     planner,
     tmux,
-    agentComposerReadinessProbe,
+    agentProcessReadinessProbe,
     { sessionHost, promptPush, launchCoordinator }
   );
   const workspacePreparer = options.workspacePreparer
@@ -270,43 +274,56 @@ export function createRuntimeLifecycleDispatcher(
           : `Global Role not found: ${request.roleName}.`
       );
     }
-    const binding = activeRoleAgentBinding(role);
-    const agent = store.getConfiguredAgent(role.activeAgentId);
+    const activeRun = request.scope === "task"
+      ? store.getActiveAgentRun(request.taskId, request.roleName)
+      : null;
+    const sessions = request.scope === "task"
+      ? store.getTaskRoleSessionSet(request.taskId, request.roleName)
+      : store.getGlobalRoleSessionSet(request.roleName);
+    const effective = activeRun?.effective
+      ?? activeLiveRoleAgentSession(sessions)?.effective
+      ?? resolveRuntimeDesiredEffective(store, request, role);
+    const binding = role.agentBindings[effective.agentId];
+    const agent = store.getConfiguredAgent(effective.agentId);
+    if (binding === undefined || binding.adapterId !== effective.adapterId) {
+      throw applicationError(
+        "INVALID_PARAMS",
+        `Role binding does not match effective launch: ${effective.agentId}.`
+      );
+    }
     if (agent === null || agent.adapterId !== binding.adapterId) {
       throw applicationError(
         "INVALID_PARAMS",
-        `Configured Agent does not match Role: ${role.activeAgentId}.`
+        `Configured Agent does not match Role: ${effective.agentId}.`
       );
     }
     validateLifecycleEnvironment(request.environment, agent);
-    const fence = createLifecycleFence(role, binding, agent);
-    const session = request.scope === "task"
-      ? store.getRoleSession(request.taskId, request.roleName)
-      : store.getGlobalRoleSessionSet(request.roleName)?.sessions[role.activeAgentId];
+    const mode = roleAgentSessionResumeMode(sessions, effective.agentId, effective);
+    const session = sessions?.sessions[effective.agentId];
     const owner = request.scope === "task"
       ? { scope: "task" as const, taskId: request.taskId, roleName: request.roleName }
       : { scope: "global" as const, roleName: request.roleName };
     const common = {
       owner,
-      agentId: role.activeAgentId,
+      agentId: effective.agentId,
       adapterId: binding.adapterId,
-      workspace: role.workspace,
+      effective,
+      workspace: effective.workspace.root,
+      ...(activeRun === null ? {} : { runId: activeRun.id }),
       ...(request.environment === undefined
         ? {}
         : { environment: request.environment })
     };
-    const assertCurrent = () => {
-      const violation = lifecycleFenceViolation(store, request, fence);
-      if (violation !== null) throw new Error(violation);
-    };
+    const launchRequest = mode === "new"
+      ? { ...common, mode: "new" as const }
+      : {
+          ...common,
+          mode: "resume" as const,
+          nativeSessionId: session!.nativeSessionId
+        };
+    const assertCurrent = () => assertRuntimeLaunchRequestCurrent(store, launchRequest);
     const runtimeBinding = await launchCoordinator.prepare(
-      session?.nativeSessionId === undefined
-        ? { ...common, mode: "new" }
-        : {
-            ...common,
-            mode: "resume",
-            nativeSessionId: session.nativeSessionId
-          },
+      launchRequest,
       "immediate",
       assertCurrent
     );
@@ -326,60 +343,30 @@ export function createRuntimeLifecycleDispatcher(
   };
 }
 
-type LifecycleFence = Readonly<{
-  role: Readonly<Record<string, unknown>>;
-  agent: ConfiguredAgent;
-}>;
-
-function createLifecycleFence(
-  role: Role | GlobalRole,
-  binding: RoleAgentBinding,
-  agent: ConfiguredAgent
-): LifecycleFence {
-  const {
-    status: _status,
-    createdAt: _createdAt,
-    updatedAt: _updatedAt,
-    agentBindings: _agentBindings,
-    ...launchRole
-  } = role as Role & Partial<Pick<Role, "status">>;
-  return {
-    role: {
-      ...launchRole,
-      activeBinding: binding
-    },
-    agent
-  };
-}
-
-function lifecycleFenceViolation(
+function resolveRuntimeDesiredEffective(
   store: TaskStore,
   request: EnsureRoleSessionRequest,
-  expected: LifecycleFence
-): string | null {
-  if (request.scope === "task") {
-    const task = store.getTask(request.taskId);
-    if (task === null) return `Task no longer exists: ${request.taskId}.`;
-    if (task.status !== "active") return `Task is no longer active: ${request.taskId}.`;
+  role: Role | GlobalRole
+): EffectiveLaunchSnapshot {
+  if (request.scope === "global") {
+    return resolveEffectiveLaunch({
+      role: role as GlobalRole,
+      purpose: "execution"
+    });
   }
-  const role = request.scope === "task"
-    ? store.getRole(request.taskId, request.roleName)
-    : store.getGlobalRole(request.roleName);
-  if (role === null) return `Role no longer exists: ${request.roleName}.`;
-  let binding: RoleAgentBinding;
-  try {
-    binding = activeRoleAgentBinding(role);
-  } catch {
-    return `Role launch state changed: ${request.roleName}.`;
-  }
-  const agent = store.getConfiguredAgent(role.activeAgentId);
-  if (
-    agent === null
-    || !isDeepStrictEqual(createLifecycleFence(role, binding, agent), expected)
-  ) {
-    return `Role or Agent launch state changed: ${request.roleName}.`;
-  }
-  return null;
+  const taskRole = role as Role;
+  const workspace = store.getRoleWorkspace(request.taskId, request.roleName)
+    ?? store.getRoleWorkspace(request.taskId, "leader")
+    ?? undefined;
+  const item = workspace?.owner.type === "work-item"
+    ? store.getWorkItem(request.taskId, workspace.owner.workItemId)
+    : null;
+  return resolveEffectiveLaunch({
+    role: taskRole,
+    purpose: "execution",
+    ...(workspace === undefined ? {} : { workspace }),
+    ...(item === null ? {} : { workItemWriteProjectIds: item.writeProjectIds })
+  });
 }
 
 function assertRuntimeLaunchRequestCurrent(
@@ -409,17 +396,25 @@ function assertRuntimeLaunchRequestCurrent(
   if (role === null) {
     throw new Error(`Role no longer exists: ${request.owner.roleName}.`);
   }
-  const binding = activeRoleAgentBinding(role);
-  const expectedWorkspace = request.owner.scope === "task"
-    && request.runId !== undefined
-    ? activeRun?.workspace?.root ?? role.workspace
-    : role.workspace;
+  const sessions = request.owner.scope === "task"
+    ? store.getTaskRoleSessionSet(request.owner.taskId, request.owner.roleName)
+    : store.getGlobalRoleSessionSet(request.owner.roleName);
+  const expectedEffective = request.owner.scope === "task" && request.runId !== undefined
+    ? activeRun?.effective
+    : activeLiveRoleAgentSession(sessions)?.effective
+      ?? currentDesiredEffective(store, request, role);
   if (
-    role.activeAgentId !== request.agentId
-    || binding.adapterId !== request.adapterId
-    || expectedWorkspace !== request.workspace
+    expectedEffective === undefined
+    || !isDeepStrictEqual(expectedEffective, request.effective)
+    || request.effective.agentId !== request.agentId
+    || request.effective.adapterId !== request.adapterId
+    || request.effective.workspace.root !== request.workspace
   ) {
     throw new Error(`Role launch state changed: ${request.owner.roleName}.`);
+  }
+  const binding = role.agentBindings[request.agentId];
+  if (binding === undefined || binding.adapterId !== request.adapterId) {
+    throw new Error(`Role effective binding changed: ${request.owner.roleName}.`);
   }
   const agent = store.getConfiguredAgent(request.agentId);
   if (agent === null || agent.adapterId !== request.adapterId) {
@@ -427,33 +422,55 @@ function assertRuntimeLaunchRequestCurrent(
   }
   if (request.mode === "resume") {
     const session = request.owner.scope === "task"
-      ? store.getRoleSession(request.owner.taskId, request.owner.roleName)
+      ? store.getTaskRoleSessionSet(request.owner.taskId, request.owner.roleName)
+        ?.sessions[request.agentId]
       : store.getGlobalRoleSessionSet(request.owner.roleName)
         ?.sessions[request.agentId];
-    if (session?.nativeSessionId !== request.nativeSessionId) {
+    if (session === null || session === undefined
+      || session.nativeSessionId !== request.nativeSessionId) {
       throw new Error(`Native session changed: ${request.owner.roleName}.`);
     }
+    if (!effectiveLaunchSnapshotsCompatible(session.effective, request.effective)) {
+      throw new Error(`Native session effective launch changed: ${request.owner.roleName}.`);
+    }
   }
+}
+
+function currentDesiredEffective(
+  store: TaskStore,
+  request: CoordinatedRuntimeLaunchRequest,
+  role: Role | GlobalRole
+): EffectiveLaunchSnapshot {
+  if (request.owner.scope === "global") {
+    return resolveEffectiveLaunch({ role: role as GlobalRole, purpose: "execution" });
+  }
+  const workspace = store.getRoleWorkspace(
+    request.owner.taskId,
+    request.owner.roleName
+  ) ?? store.getRoleWorkspace(request.owner.taskId, "leader") ?? undefined;
+  const item = workspace?.owner.type === "work-item"
+    ? store.getWorkItem(request.owner.taskId, workspace.owner.workItemId)
+    : null;
+  return resolveEffectiveLaunch({
+    role: role as Role,
+    purpose: "execution",
+    ...(workspace === undefined ? {} : { workspace }),
+    ...(item === null ? {} : { workItemWriteProjectIds: item.writeProjectIds })
+  });
 }
 
 function runtimeLaunchFingerprint(
   store: TaskStore,
   request: CoordinatedRuntimeLaunchRequest
 ): string {
-  const role = request.owner.scope === "task"
-    ? store.getRole(request.owner.taskId, request.owner.roleName)
-    : store.getGlobalRole(request.owner.roleName);
-  if (role === null) {
-    throw new Error(`Role no longer exists: ${request.owner.roleName}.`);
-  }
-  const binding = activeRoleAgentBinding(role);
-  const agent = store.getConfiguredAgent(role.activeAgentId);
+  const agent = store.getConfiguredAgent(request.effective.agentId);
   if (agent === null) {
-    throw new Error(`Agent no longer exists: ${role.activeAgentId}.`);
+    throw new Error(`Agent no longer exists: ${request.effective.agentId}.`);
   }
   return createHash("sha256").update(JSON.stringify([
     request.owner,
-    createLifecycleFence(role, binding, agent)
+    request.effective,
+    agent
   ])).digest("hex");
 }
 

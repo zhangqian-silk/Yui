@@ -43,6 +43,7 @@ test("the source package keeps one TypeScript build and declares its Web runtime
   assert.deepEqual(sourcePackage.files, [
     "dist",
     "skills",
+    "docs",
     "README.md",
     "ARCHITECTURE.md",
     "i18n/README.zh-CN.md",
@@ -74,8 +75,9 @@ test("runtime assembly contains only the built CLI, docs, and three skills", (t)
 
   assert.deepEqual(
     readdirSync(output).sort(),
-    ["ARCHITECTURE.md", "LICENSE", "README.md", "dist", "i18n", "package.json", "skills"]
+    ["ARCHITECTURE.md", "LICENSE", "README.md", "dist", "docs", "i18n", "package.json", "skills"]
   );
+  assert.deepEqual(readdirSync(join(output, "docs")), ["task-local-identity.md"]);
   assert.deepEqual(readdirSync(join(output, "i18n")), ["README.zh-CN.md"]);
   assert.deepEqual(
     readdirSync(join(output, "skills")).sort(),
@@ -127,7 +129,9 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
   assert.match(leader, /A Profile is required for this path/u);
   assert.match(leader, /Ignore all Task Role Agent bindings/u);
   assert.match(leader, /executor=subagent; profile=reviewer@3/u);
-  assert.match(leader, /Bash\(yui task run yield \*\).*control-plane handoff/us);
+  assert.match(leader, /fresh ReviewRound-owned worktree.*frozen Candidate/usi);
+  assert.match(leader, /never capture, integrate, accept,\s+or auto-merge the review workspace/usi);
+  assert.match(leader, /current Run's[\s\S]*--summary-file -[\s\S]*durable\s+handoff/u);
   assert.match(
     leader,
     /`--check` commands run from the selected Project's integration candidate root[\s\S]*not\s+`cd <project> && npm test`/u
@@ -150,13 +154,62 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
   assert.match(worker, /result and records the actual Profile revision/u);
   assert.match(
     worker,
-    /review Run uses a native read-only permission mode[\s\S]*Do not request approval[\s\S]*yield\s+the Run/u
+    /Every review Run is bound to one frozen Candidate commit[\s\S]*separate\s+ReviewRound-owned writable worktree[\s\S]*exact ReviewRound workspace and brief authorize local work/u
   );
   assert.match(
     worker,
-    /one bounded evidence pass[\s\S]*Do not repeat successful checks[\s\S]*yield\s+immediately/u
+    /one bounded evidence pass[\s\S]*Do not repeat successful\s+checks[\s\S]*yield immediately/ui
   );
-  assert.match(worker, /do not wrap it in `until`[\s\S]*If the direct command is denied[\s\S]*stop instead of retrying/u);
+  assert.match(worker, /do not wrap it in `until`[\s\S]*duplicate or late\s+review yield is obsolete/u);
+  assert.match(worker, /For a review Run[\s\S]*Clear Markdown is sufficient[\s\S]*Do not invent a check merely to satisfy a schema/ui);
+  assert.match(worker, /dirty no-commit workspace may\s+yield[\s\S]*cannot be cleaned\s+until it is clean/ui);
+  assert.match(
+    worker,
+    /managed Codex or\s+Claude Run[\s\S]*--summary-file -[\s\S]*final\s+response[\s\S]*does not deliver/u
+  );
+});
+
+test("Worker and Leader Skills require truthful uncertain checkpoints", () => {
+  const leader = readFileSync(join(root, "skills", "yui-leader", "SKILL.md"), "utf8");
+  const worker = readFileSync(join(root, "skills", "yui-worker", "SKILL.md"), "utf8");
+
+  assert.match(
+    worker,
+    /uncertain,\s+incomplete,\s+blocked,\s+or requiring Leader judgment/iu
+  );
+  assert.match(
+    worker,
+    /exact Run, WorkItem, and native Session identity[\s\S]*actions actually performed[\s\S]*changed paths and commit\/worktree state[\s\S]*checks actually run and their outcomes[\s\S]*provider, runtime, or permission errors[\s\S]*last confirmed lifecycle boundary[\s\S]*work not performed[\s\S]*unresolved assumptions or decisions[\s\S]*residual risks[\s\S]*confidence[\s\S]*bounded next options/iu
+  );
+  assert.match(
+    worker,
+    /immutable Run\s+evidence and a Candidate, or Review evidence only[\s\S]*never implies Leader\s+acceptance, WorkItem completion, ChangeSet capture,\s+Integration, or Task\s+completion/iu
+  );
+  assert.match(
+    worker,
+    /Review Runs report findings,\s+verification gaps,\s+and limits;\s+the\s+Leader decides disposition/iu
+  );
+  assert.match(
+    worker,
+    /If the\s+exact yield is denied[\s\S]*do not retry[\s\S]*broaden permissions[\s\S]*wrapper[\s\S]*mutate\s+Yui state[\s\S]*invent delivery evidence/iu
+  );
+
+  assert.match(
+    leader,
+    /uncertain,\s+incomplete,\s+blocked,\s+or requiring Leader judgment/iu
+  );
+  assert.match(
+    leader,
+    /same complete checkpoint before either yield or an InputRequest/iu
+  );
+  assert.match(
+    leader,
+    /yield preserves immutable Run evidence only[\s\S]*never implies Leader\s+acceptance, WorkItem completion, ChangeSet capture,\s+Integration, or Task\s+completion/iu
+  );
+  assert.match(
+    leader,
+    /exact yield command must be the final tool action/iu
+  );
 });
 
 test("publish builds once and smokes the same package on Node 20, 22, and 24", () => {

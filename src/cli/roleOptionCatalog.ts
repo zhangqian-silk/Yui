@@ -25,7 +25,8 @@ const CLAUDE_ONLY = Object.freeze(["claude"] as const);
 export const ROLE_AGENT_OPTION_SPECS: readonly RoleAgentOptionSpec[] = Object.freeze([
   roleAgentOption("--model", "model", "model", false, BOTH_ADAPTERS),
   roleAgentOption("--effort", "effort", "effort", false, BOTH_ADAPTERS),
-  roleAgentOption("--yolo", "yolo", "true", false, BOTH_ADAPTERS, { staticValues: ["true"] }),
+  roleAgentOption("--permission-strategy", "permission.strategy", "strategy", false, BOTH_ADAPTERS,
+    { staticValues: ["default", "bypass", "configured"] }),
   roleAgentOption("--sandbox", "permission.sandbox", "mode", false, CODEX_ONLY),
   roleAgentOption("--approval", "permission.approval", "policy", false, CODEX_ONLY),
   roleAgentOption("--permission-mode", "permission.mode", "mode", false, CLAUDE_ONLY),

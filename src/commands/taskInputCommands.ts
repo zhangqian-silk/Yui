@@ -1,10 +1,6 @@
 import { dataError, roleNotFound, taskNotFound, usageError } from "../errors/cliError.js";
 import { createTaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
-import {
-  terminalizeTaskRoleRunSession,
-  updateRoleAgentSessionStatus,
-  type TaskRoleSessionSet
-} from "../executor/agentExecutor.js";
+import type { TaskRoleSessionSet } from "../executor/agentExecutor.js";
 import {
   answerInputRequest,
   cancelInputRequest,
@@ -18,12 +14,17 @@ import {
 } from "../input/inputRequest.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { formatTimestamp } from "../output/timePresentation.js";
-import { updateRoleStatus, type Role } from "../role/role.js";
-import { yieldAgentRun, type AgentRun } from "../run/agentRun.js";
-import { enqueueWork, requireCompleteWorkExecution } from "../coordination/workMailboxQueue.js";
+import type { Role } from "../role/role.js";
+import type { AgentRun } from "../run/agentRun.js";
+import { enqueueWork } from "../coordination/workMailboxQueue.js";
 import type { MailboxTarget } from "../coordination/workMailbox.js";
+import { terminalizeExactTaskRun } from "../lifecycle/exactRunTerminalization.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
+import {
+  formatAgentRunReceiptId,
+  resolveTaskRecordReference
+} from "../task/taskRecordReference.js";
 
 const LEADER_ROLE = "leader";
 
@@ -51,7 +52,7 @@ export function runTaskInputCommand(
   switch (command) {
     case "request": return createRequest(rest, store, options);
     case "list": return listRequests(rest, store);
-    case "show": return showRequest(rest, store);
+    case "show": return showRequest(rest, store, options);
     case "answer": return answerRequest(rest, store, options);
     case "cancel": return cancelRequest(rest, store, options);
     default:
@@ -91,7 +92,7 @@ function createRequest(
   exactPositionals(parsed.positionals, 1, usage);
   const question = requiredOption(parsed.options, "--question");
   const choices = (parsed.multiOptions.get("--choice") ?? []).map(parseInputChoice);
-  const blockedRefs = (parsed.multiOptions.get("--blocks") ?? []).map(parseInputBlockedRef);
+  const blockedValues = parsed.multiOptions.get("--blocks") ?? [];
   const recommendedChoiceKey = optionalNonEmptyOption(parsed.options, "--recommend");
   const timeoutSeconds = optionalNonEmptyOption(parsed.options, "--timeout-seconds");
   if ((recommendedChoiceKey === undefined) !== (timeoutSeconds === undefined)) {
@@ -108,6 +109,7 @@ function createRequest(
   const request = store.transaction((tx) => {
     const task = requireTask(tx, parsed.positionals[0]);
     if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "requesting input"));
+    const blockedRefs = blockedValues.map((value) => parseInputBlockedRef(value, task.id));
     validateBlockedInputOwnership(tx, task.id, blockedRefs);
     const origin = requireLeaderInputOrigin(tx, task.id, options.environment);
     const created = createInputRequest(
@@ -119,27 +121,27 @@ function createRequest(
     );
     tx.saveInputRequest(task.id, created);
     enqueueWork(tx, { kind: "operator" }, "input-requested", now, [
-      { type: "input", id: created.id },
-      { type: "run", id: origin.run.id }
+      { type: "input", taskId: task.id, id: created.id },
+      { type: "run", taskId: task.id, id: origin.run.id }
     ]);
-    tx.saveAgentRun(yieldAgentRun(
-      origin.run,
-      `Waiting for input ${created.id}: ${created.question}`,
-      now
-    ));
-    requireCompleteWorkExecution(
-      tx,
-      { kind: "role", taskId: task.id, roleName: LEADER_ROLE },
-      { type: "run", id: origin.run.id }
-    );
-    tx.clearActiveAgentRun(task.id, LEADER_ROLE);
-    tx.saveRole(task.id, updateRoleStatus(origin.role, "idle", now));
-    if (origin.sessions !== null) {
-      tx.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(origin.sessions, {
-        agentId: origin.role.activeAgentId,
-        runId: origin.run.id,
-        receiptId: `agent-run:${origin.run.id}`
-      }, now));
+    const terminal = terminalizeExactTaskRun(tx, {
+      taskId: task.id,
+      roleName: LEADER_ROLE,
+      agentId: origin.run.effective.agentId,
+      runId: origin.run.id,
+      receiptId: formatAgentRunReceiptId(task.id, origin.run.id),
+      ...(origin.requester.nativeSessionId === undefined
+        ? {}
+        : { nativeSessionId: origin.requester.nativeSessionId }),
+      outcome: {
+        status: "yielded",
+        summary: `Waiting for input ${created.id}: ${created.question}`
+      }
+    }, now);
+    if (terminal.disposition !== "applied") {
+      throw usageError(
+        `Task Leader Run changed while requesting input: ${origin.run.id}/${terminal.reason}.`
+      );
     }
     recordTaskEvent(tx, task.id, "input.requested", {
       requestId: created.id,
@@ -178,7 +180,7 @@ function listRequests(args: string[], store: TaskStore): TaskInputCommandExecuti
           { header: "Created", minWidth: 10, maxWidth: 28 }
         ],
         requests.map((request) => [
-          request.id,
+          taskId === undefined ? `${request.taskId}/${request.id}` : request.id,
           request.taskId,
           request.status,
           request.policy.kind,
@@ -191,15 +193,24 @@ function listRequests(args: string[], store: TaskStore): TaskInputCommandExecuti
   return output(rendered, { requests });
 }
 
-function showRequest(args: string[], store: TaskStore): TaskInputCommandExecution {
-  const usage = "Task input show usage: yui task input show <input> [--task <task>].";
+function showRequest(
+  args: string[],
+  store: TaskStore,
+  options: TaskInputCommandOptions
+): TaskInputCommandExecution {
+  const usage = "Task input show usage: yui task input show (<task>/<input> | <input> --task <task>).";
   const parsed = parseTail(args, new Set(["--task"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
-  const taskId = optionalNonEmptyOption(parsed.options, "--task");
-  const request = taskId === undefined
-    ? store.findInputRequest(parsed.positionals[0])
-    : store.getInputRequest(requireTask(store, taskId).id, parsed.positionals[0]);
-  if (request === null) throw dataError(`Input request not found: ${parsed.positionals[0]}.`);
+  const reference = inputRequestReference(
+    store,
+    parsed.positionals[0],
+    optionalNonEmptyOption(parsed.options, "--task"),
+    options.environment
+  );
+  const request = store.getInputRequest(reference.taskId, reference.localId);
+  if (request === null) {
+    throw dataError(`Input request not found: ${reference.taskId}/${reference.localId}.`);
+  }
   return output(renderInputRequest(request, store.getConfig().timeZone), { request });
 }
 
@@ -208,7 +219,7 @@ function answerRequest(
   store: TaskStore,
   options: TaskInputCommandOptions
 ): TaskInputCommandExecution {
-  const usage = "Task input answer usage: yui task input answer <input> [--task <task>] (--choice <key> | --text <text>).";
+  const usage = "Task input answer usage: yui task input answer (<task>/<input> | <input> --task <task>) (--choice <key> | --text <text>).";
   const parsed = parseTail(args, new Set(["--task", "--choice", "--text"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
   const choice = optionalNonEmptyOption(parsed.options, "--choice");
@@ -216,11 +227,16 @@ function answerRequest(
   if ((choice === undefined) === (text === undefined)) {
     throw usageError("Exactly one of --choice or --text is required.", usage);
   }
-  const taskHint = optionalNonEmptyOption(parsed.options, "--task");
-  const located = taskHint === undefined
-    ? store.findInputRequest(parsed.positionals[0])
-    : store.getInputRequest(requireTask(store, taskHint).id, parsed.positionals[0]);
-  if (located === null) throw dataError(`Input request not found: ${parsed.positionals[0]}.`);
+  const reference = inputRequestReference(
+    store,
+    parsed.positionals[0],
+    optionalNonEmptyOption(parsed.options, "--task"),
+    options.environment
+  );
+  const located = store.getInputRequest(reference.taskId, reference.localId);
+  if (located === null) {
+    throw dataError(`Input request not found: ${reference.taskId}/${reference.localId}.`);
+  }
   const answer: InputAnswer = choice === undefined ? { text: text! } : { choiceKey: choice };
   const now = clock(options);
   const request = store.transaction((tx) => {
@@ -239,7 +255,7 @@ function answerRequest(
       { kind: "role", taskId: task.id, roleName: LEADER_ROLE },
       `input-answered:${answered.id}`,
       now,
-      [{ type: "input", id: answered.id }]
+      [{ type: "input", taskId: task.id, id: answered.id }]
     );
     return answered;
   });
@@ -271,7 +287,7 @@ function cancelRequest(
       { kind: "role", taskId: task.id, roleName: LEADER_ROLE },
       `input-cancelled:${cancelled.id}`,
       now,
-      [{ type: "input", id: cancelled.id }]
+      [{ type: "input", taskId: task.id, id: cancelled.id }]
     );
     return cancelled;
   });
@@ -296,8 +312,8 @@ function requireLeaderInputOrigin(
     env.YUI_SESSION_SCOPE !== "task"
     || env.YUI_TASK_ID !== taskId
     || env.YUI_ROLE !== LEADER_ROLE
-    || env.YUI_AGENT_ID !== role.activeAgentId
     || run === null
+    || env.YUI_AGENT_ID !== run.effective.agentId
     || run.status !== "active"
     || run.deliveredAt === undefined
     || run.workItemId !== undefined
@@ -307,13 +323,14 @@ function requireLeaderInputOrigin(
   const sessions = store.getTaskRoleSessionSet(taskId, LEADER_ROLE);
   const nativeSessionId = trimmed(env.YUI_NATIVE_SESSION_ID);
   if (nativeSessionId !== undefined
-    && sessions?.sessions[role.activeAgentId]?.nativeSessionId !== nativeSessionId) {
+    && sessions?.sessions[run.effective.agentId]?.nativeSessionId !== nativeSessionId) {
     throw usageError("Task input request native session does not match the active Leader session.");
   }
   return {
     requester: {
+      taskId,
       roleName: "leader",
-      agentId: role.activeAgentId,
+      agentId: run.effective.agentId,
       runId: run.id,
       ...(nativeSessionId === undefined ? {} : { nativeSessionId })
     },
@@ -355,14 +372,14 @@ function parseInputChoice(value: string): InputChoice {
   return { key: value.slice(0, separator).trim(), label: value.slice(separator + 1).trim() };
 }
 
-function parseInputBlockedRef(value: string): InputBlockedRef {
+function parseInputBlockedRef(value: string, taskId: string): InputBlockedRef {
   const separator = value.indexOf(":");
   const type = value.slice(0, separator);
   const id = value.slice(separator + 1).trim();
   if ((type !== "work-item" && type !== "run") || separator <= 0 || id.length === 0) {
     throw usageError("--blocks must use work-item:<id> or run:<id>.");
   }
-  return { type, id };
+  return { type, taskId, id };
 }
 
 function validateBlockedInputOwnership(
@@ -372,13 +389,41 @@ function validateBlockedInputOwnership(
 ): void {
   for (const reference of references) {
     const record = reference.type === "work-item"
-      ? store.findWorkItem(reference.id)
-      : store.findAgentRun(reference.id);
+      ? store.getWorkItem(taskId, reference.id)
+      : store.getAgentRun(taskId, reference.id);
     if (record === null) throw dataError(`Blocked ${reference.type} not found: ${reference.id}.`);
-    if (record.taskId !== taskId) {
-      throw usageError(`Blocked ${reference.type} belongs to another Task: ${reference.id}.`);
-    }
   }
+}
+
+function inputRequestReference(
+  store: TaskStore,
+  value: string,
+  taskHint: string | undefined,
+  environment: NodeJS.ProcessEnv | undefined
+) {
+  const explicitTaskId = taskHint === undefined
+    ? undefined
+    : requireTask(store, taskHint).id;
+  let reference;
+  try {
+    reference = resolveTaskRecordReference(value, {
+      kind: "inputRequest",
+      label: "Input request reference",
+      ...(explicitTaskId !== undefined
+        ? { contextTaskId: explicitTaskId }
+        : environment?.YUI_TASK_ID === undefined
+          ? {}
+          : { contextTaskId: environment.YUI_TASK_ID })
+    });
+  } catch (error) {
+    throw usageError(error instanceof Error ? error.message : String(error));
+  }
+  if (explicitTaskId !== undefined && reference.taskId !== explicitTaskId) {
+    throw usageError(
+      `Input request belongs to another Task: ${reference.taskId}/${reference.localId}.`
+    );
+  }
+  return reference;
 }
 
 function renderInputRequest(request: InputRequest, timeZone: string | undefined): string {
@@ -437,6 +482,7 @@ function inactiveTaskMessage(task: Task, action: string): string {
   if (task.status === "completed") {
     return `Task ${task.id} is completed; reopen it before ${action}.`;
   }
+  if (task.status === "retired") return `Task ${task.id} is retired; it cannot resume ${action}.`;
   return `Task is archived: ${task.id}.`;
 }
 
@@ -469,7 +515,9 @@ function recordTaskEvent(
   payload: TaskEventPayload,
   now: Date
 ): void {
-  store.saveEvent(taskId, createTaskEvent(store.nextEventId(taskId), type, payload, now));
+  store.saveEvent(taskId, createTaskEvent(
+    store.nextEventId(taskId), taskId, type, payload, now
+  ));
 }
 
 function requiredText(value: string | undefined, label: string): string {
