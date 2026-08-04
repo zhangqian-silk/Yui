@@ -540,6 +540,23 @@ yui doctor
 make unlink
 ```
 
+若只想隔离运行当前 checkout、而不改动全局 `yui`，构建它的本地 launcher，而不是执行 `link`：
+
+```sh
+make install-local
+./output/dev/bin/yui doctor
+```
+
+`make install-local` 会在 `output/dev/bin/yui` 写入一个自包含 launcher，并且完全不碰用户级 `yui` 命令。该 launcher 会自行解析所在 checkout，并把 `YUI_HOME` 默认指向本 checkout 的 `output/dev/home`；因此 Yui 从 `YUI_HOME` 派生的所有实例标识（Controller socket、tmux server、state）都会与其他 checkout 或全局安装保持隔离。该命令是幂等的，拉取新代码后可重复执行（若已有 Controller 在运行，再执行 `./output/dev/bin/yui controller restart`）。请以绝对路径调用该 launcher，作为每个 checkout 稳定的入口；把 `output/dev/bin` 加入 `PATH` 只是单个 shell 会话的便捷做法。
+
+`make install-local` 会先 build 出 `dist/`，然后只写入一个文件——launcher 本身。它不会修改 `PATH`，也不会创建数据 home，因此在需要状态的命令之前先执行一次 `./output/dev/bin/yui setup`。注意：裸敲 `yui` 是按 `PATH` 解析的，**与当前所在目录无关**；即使人在本 checkout 目录里，裸 `yui` 也不会用到本地 launcher，仍然会执行 `PATH` 找到的那个（通常是全局 `yui`）。要选中本实例，请使用 launcher 的绝对路径；或仅针对某一个交互式 shell，把它前置到 `PATH`：
+
+```sh
+export PATH="$PWD/output/dev/bin:$PATH"   # 仅当前 shell 生效；不适用于自动化
+```
+
+这也是推荐给 agent 和脚本的入口：执行一次 `make install-local`，之后在任意工作目录下以绝对路径调用 `<checkout>/output/dev/bin/yui ...`。不要依赖 `export` 跨命令留存，因为每条命令都在全新进程中运行。
+
 ## 许可证
 
 [MIT](../LICENSE)
