@@ -10,6 +10,7 @@ import { createInterface } from "node:readline";
 import { parse } from "smol-toml";
 
 import { configuredAgentLaunchEnvironment } from "../agent/launchEnvironment.js";
+import { YUI_VERSION } from "../version.js";
 import type {
   AgentConfigurationCatalog,
   AgentConfigurationChoice,
@@ -56,7 +57,7 @@ export async function discoverCodexConfiguration(
         input.signal
       ),
       client.request("initialize", {
-        clientInfo: { name: "yui", title: "Yui", version: "0.2.0" },
+        clientInfo: { name: "yui", title: "Yui", version: YUI_VERSION },
         capabilities: { experimentalApi: true, requestAttestation: false }
       }).then(() => { client.notify("initialized", {}); })
     ]);

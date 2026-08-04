@@ -363,17 +363,28 @@ For manual resolution, edit only the candidate worktree and finish the reported
 Git conflict before continuing. Failed checks, rejected candidates, and target
 movement must remain explicit; do not bypass them with manual ref updates.
 
-After acceptance and integration, clean terminal resources deliberately:
+Choose cleanup from the WorkItem's expected next use, not merely from a Run
+ending. If another iteration is imminent, retain the native process and
+worktree. For a longer pause with no active Run or pending delivery, release
+only the runtime; Yui preserves the native Session id and WorkItem worktree so
+the next dispatch can resume them:
+
+```sh
+yui task work cleanup <task>/<work> --runtime-only
+```
+
+After final acceptance and integration, clean terminal resources deliberately:
 
 ```sh
 yui task integration cleanup <integration-id>
-yui task work cleanup <work-id> --integrated
+yui task work cleanup <task>/<work> --integrated
 ```
 
 Use `--abandon` only for deliberate discard. Dirty worktrees remain available
-for capture or resolution. If the original execution Session cannot be
-resumed, surface the recovery decision to the user; do not silently discard
-its context by creating a replacement.
+for capture or resolution. Cleanup must never stop a Role already serving a
+newer WorkItem. If the original execution Session cannot be resumed, surface
+the recovery decision to the user; do not silently discard its context by
+creating a replacement.
 
 If a native Role Session disappears, run `yui task reconcile <task-id>`,
 inspect the Run and partial work, then retry only a confirmed failed Run:
@@ -440,7 +451,12 @@ prevents queued results from waking the Leader.
 
 Complete only after required WorkItems are accepted, Role work is terminal,
 latest isolated results are integrated or deliberately abandoned, and user
-inputs are resolved:
+inputs are resolved. Task completion is a semantic boundary: it records the
+result and notifies the global Operator; it does not infer runtime cleanup or
+stop this Leader. Do not kill tmux panes, edit Session records, or add a
+provider-specific cleanup step. After completion succeeds, end the current
+Turn immediately so the Operator can perform the explicit archive boundary;
+do not stop or mutate the native Session yourself.
 
 ```sh
 yui task complete <task-id> --summary "<outcome, validation, and remaining risks>"
@@ -450,5 +466,5 @@ Retire obsolete WorkItems with `yui task work retire <task>/<work> --summary
 "..."`, optionally using `--replacement`. If the current Role generation is
 unusable, reset it with `yui task role reset <task> <role> --reason "..."` and
 let Yui derive all runtime identities from durable state. Archiving is a
-separate user or Operator lifecycle action after managed worktrees are clean
-and explicitly settled.
+separate global Operator lifecycle action. It performs the final Task-owned
+runtime and clean-worktree teardown, including this Leader.

@@ -1,10 +1,6 @@
 import { dataError, roleNotFound, taskNotFound, usageError } from "../errors/cliError.js";
 import { createTaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
-import {
-  terminalizeTaskRoleRunSession,
-  updateRoleAgentSessionStatus,
-  type TaskRoleSessionSet
-} from "../executor/agentExecutor.js";
+import type { TaskRoleSessionSet } from "../executor/agentExecutor.js";
 import {
   answerInputRequest,
   cancelInputRequest,
@@ -18,10 +14,11 @@ import {
 } from "../input/inputRequest.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { formatTimestamp } from "../output/timePresentation.js";
-import { updateRoleStatus, type Role } from "../role/role.js";
-import { yieldAgentRun, type AgentRun } from "../run/agentRun.js";
-import { enqueueWork, requireCompleteWorkExecution } from "../coordination/workMailboxQueue.js";
+import type { Role } from "../role/role.js";
+import type { AgentRun } from "../run/agentRun.js";
+import { enqueueWork } from "../coordination/workMailboxQueue.js";
 import type { MailboxTarget } from "../coordination/workMailbox.js";
+import { terminalizeExactTaskRun } from "../lifecycle/exactRunTerminalization.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
 import {
@@ -127,24 +124,24 @@ function createRequest(
       { type: "input", taskId: task.id, id: created.id },
       { type: "run", taskId: task.id, id: origin.run.id }
     ]);
-    tx.saveAgentRun(yieldAgentRun(
-      origin.run,
-      `Waiting for input ${created.id}: ${created.question}`,
-      now
-    ));
-    requireCompleteWorkExecution(
-      tx,
-      { kind: "role", taskId: task.id, roleName: LEADER_ROLE },
-      { type: "run", taskId: task.id, id: origin.run.id }
-    );
-    tx.clearActiveAgentRun(task.id, LEADER_ROLE);
-    tx.saveRole(task.id, updateRoleStatus(origin.role, "idle", now));
-    if (origin.sessions !== null) {
-      tx.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(origin.sessions, {
-        agentId: origin.run.effective.agentId,
-        runId: origin.run.id,
-        receiptId: formatAgentRunReceiptId(task.id, origin.run.id)
-      }, now));
+    const terminal = terminalizeExactTaskRun(tx, {
+      taskId: task.id,
+      roleName: LEADER_ROLE,
+      agentId: origin.run.effective.agentId,
+      runId: origin.run.id,
+      receiptId: formatAgentRunReceiptId(task.id, origin.run.id),
+      ...(origin.requester.nativeSessionId === undefined
+        ? {}
+        : { nativeSessionId: origin.requester.nativeSessionId }),
+      outcome: {
+        status: "yielded",
+        summary: `Waiting for input ${created.id}: ${created.question}`
+      }
+    }, now);
+    if (terminal.disposition !== "applied") {
+      throw usageError(
+        `Task Leader Run changed while requesting input: ${origin.run.id}/${terminal.reason}.`
+      );
     }
     recordTaskEvent(tx, task.id, "input.requested", {
       requestId: created.id,

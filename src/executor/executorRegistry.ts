@@ -82,8 +82,6 @@ export type ExecutorTmuxPort = Readonly<{
   inspectRolePaneInventoryAsync?(): Promise<TmuxRolePaneState[]>;
   inspectPane?(taskId: string, roleName: string): TmuxPaneState;
   inspectPaneAsync?(taskId: string, roleName: string): Promise<TmuxPaneState>;
-  stopTask(taskId: string): boolean;
-  stopTaskAsync?(taskId: string): Promise<boolean>;
 }>;
 
 export type AgentReadinessResolver = (
@@ -386,18 +384,6 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
         ? "present"
         : "absent"
     }));
-  }
-
-  async stopTask(taskId: string): Promise<boolean> {
-    const stopped = this.tmux.stopTaskAsync === undefined
-      ? this.tmux.stopTask(taskId)
-      : await this.tmux.stopTaskAsync(taskId);
-    for (const [deliveryId, prepared] of this.#prepared) {
-      if (prepared.delivery.taskId === taskId) {
-        this.#prepared.delete(deliveryId);
-      }
-    }
-    return stopped;
   }
 
   async stopRole(taskId: string, roleName: string): Promise<boolean> {

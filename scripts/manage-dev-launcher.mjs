@@ -673,14 +673,29 @@ function probeController(discovery) {
           || response.ok !== true
           || typeof result !== "object" || result === null
           || resultKeys.length < 2
-          || resultKeys.length > 3
-          || resultKeys.some((key) => !["pid", "running", "protocolVersion"].includes(key))
+          || resultKeys.length > 6
+          || resultKeys.some((key) => ![
+            "pid",
+            "running",
+            "protocolVersion",
+            "version",
+            "storageLayoutVersion",
+            "aggregateSchemaVersion"
+          ].includes(key))
           || result.running !== true
           || !Number.isSafeInteger(result.pid) || result.pid <= 0
           || (
             Object.hasOwn(result, "protocolVersion")
             && (!Number.isSafeInteger(result.protocolVersion) || result.protocolVersion <= 0)
           )
+          || (
+            Object.hasOwn(result, "version")
+            && (typeof result.version !== "string" || result.version.length === 0)
+          )
+          || ["storageLayoutVersion", "aggregateSchemaVersion"].some((key) => (
+            Object.hasOwn(result, key)
+            && (!Number.isSafeInteger(result[key]) || result[key] <= 0)
+          ))
         ) {
           finish({ status: "invalid" });
           return;

@@ -58,7 +58,6 @@ export function resetTaskRoleSessionGeneration(
         nativeSessionId: current.nativeSessionId,
         ...(current.launchId === undefined ? {} : { launchId: current.launchId })
       }),
-      runtimeCleanup: "required",
       outcome: { status: "failed", summary }
     }, now);
     if (terminal.disposition !== "applied" || terminal.run === null) {
@@ -70,13 +69,13 @@ export function resetTaskRoleSessionGeneration(
         store.saveWorkItem(task.id, updateWorkItemStatus(item, "failed", now, summary));
       }
     }
-  } else {
-    enqueueWork(store, runtimeLifecycleTarget({
-      scope: "task",
-      taskId: task.id,
-      roleName: role.name
-    }), RUNTIME_CLEANUP_REQUIRED_REASON, now, [{ type: "task", id: task.id }]);
   }
+
+  enqueueWork(store, runtimeLifecycleTarget({
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  }), RUNTIME_CLEANUP_REQUIRED_REASON, now, [{ type: "task", id: task.id }]);
 
   sessions = store.getTaskRoleSessionSet(task.id, role.name);
   if (sessions !== null) store.saveTaskRoleSessionSet(resetTaskRoleSession(sessions, now));

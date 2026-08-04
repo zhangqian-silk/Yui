@@ -1,5 +1,8 @@
 import type { InputRequest } from "../input/inputRequest.js";
-import type { OperatorNotification } from "../scheduler/operatorNotification.js";
+import type {
+  LeaderRecoveryOperatorNotification,
+  TaskTerminalOperatorNotification
+} from "../scheduler/operatorNotification.js";
 import { formatTimestamp } from "../output/timePresentation.js";
 import {
   formatInputRequestReceiptId,
@@ -12,12 +15,21 @@ type OperatorPresentationBase = Readonly<{
   text: string;
 }>;
 
-export type OperatorAttentionPresentation = OperatorPresentationBase & Readonly<{
-  category: "attention";
+export type OperatorPresentation = OperatorPresentationBase & Readonly<{
+  category: "attention" | "information";
   source: Readonly<
     | { kind: "input-request"; taskId: string; localId: string }
     | { kind: "leader-recovery"; id: string }
+    | { kind: "task-terminal"; id: string }
   >;
+}>;
+
+export type OperatorAttentionPresentation = OperatorPresentation & Readonly<{
+  category: "attention";
+}>;
+
+export type OperatorInformationPresentation = OperatorPresentation & Readonly<{
+  category: "information";
 }>;
 
 export type OperatorPresentationContext = Readonly<{
@@ -73,7 +85,7 @@ export function createInputRequestOperatorPresentation(
 }
 
 export function createLeaderRecoveryOperatorPresentation(
-  notification: OperatorNotification
+  notification: LeaderRecoveryOperatorNotification
 ): OperatorAttentionPresentation {
   return {
     category: "attention",
@@ -87,6 +99,28 @@ export function createLeaderRecoveryOperatorPresentation(
       `Inspect: yui task show ${notification.taskId}`,
       "Recovery status: yui jobs list",
       `Retry after inspection: yui jobs retry leader-recovery:${notification.taskId}`
+    ].join("\n")
+  };
+}
+
+export function createTaskTerminalOperatorPresentation(
+  notification: TaskTerminalOperatorNotification
+): OperatorInformationPresentation {
+  const action = notification.status === "completed" ? "completed" : "retired";
+  const actor = notification.by === "leader"
+    ? "its Leader"
+    : notification.by === "operator"
+      ? "the Operator"
+      : "the user";
+  return {
+    category: "information",
+    taskId: notification.taskId,
+    receiptId: `task-terminal:${notification.taskId}:${notification.status}:${notification.createdAt}`,
+    source: { kind: "task-terminal", id: notification.taskId },
+    text: [
+      `Task ${notification.taskId} was ${action} by ${actor}.`,
+      `Summary: ${notification.summary}`,
+      `Inspect: yui task show ${notification.taskId}`
     ].join("\n")
   };
 }

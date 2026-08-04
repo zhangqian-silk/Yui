@@ -7,7 +7,6 @@ import {
   processActiveRoleRunDeliveries,
   type ActiveRoleRunDeliveryResult
 } from "../scheduler/activeRoleRunDelivery.js";
-import { stopArchivedTaskRuntimes } from "../scheduler/archivedTaskRuntime.js";
 import type {
   AutoResolvedInput,
   RoleRunDeliveryFailurePersistence,
@@ -61,7 +60,6 @@ type RoleRunDeliveryFailureIdentity = Omit<
 >;
 
 export type ControllerSchedulerResult = Readonly<{
-  stoppedArchivedTaskIds: readonly string[];
   activeRunDeliveries: readonly ActiveRoleRunDeliveryResult[];
   failedRunRefs: readonly string[];
   wakeups: readonly LeaderWakeupProcessingResult[];
@@ -147,12 +145,6 @@ export async function runControllerSchedulerPass(
     const failedTaskMailboxes = await prepareActiveWorkspaces(
       store, workspacePreparer, selection
     );
-    const taskWorkSelection = selection.full
-      ? taskMailboxReconcileSelection(store)
-      : selection;
-    const stoppedArchivedTaskIds = await stopArchivedTaskRuntimes(
-      store, delivery, now, taskWorkSelection
-    );
     const activeRunDeliveries = await processActiveRoleRunDeliveries(
       store, delivery, now, roleSelection
     );
@@ -193,7 +185,6 @@ export async function runControllerSchedulerPass(
       }
     }
     return {
-      stoppedArchivedTaskIds,
       activeRunDeliveries,
       failedRunRefs,
       wakeups,
@@ -558,24 +549,6 @@ function roleIdentity(taskId: string, roleName: string): string {
   return `${taskId}\0${roleName}`;
 }
 
-function taskMailboxReconcileSelection(
-  store: SchedulerStorePort
-): ReconcileSelection {
-  const taskIds = new Set(store.listWorkMailboxes().flatMap((mailbox) => (
-    mailbox.target.kind === "task"
-    && (mailbox.pending !== null || mailbox.processing !== null)
-      ? [mailbox.target.taskId]
-      : []
-  )));
-  return {
-    full: false,
-    taskIds,
-    allRoleTaskIds: taskIds,
-    rolesByTask: new Map(),
-    operator: false
-  };
-}
-
 function claimSelectedTaskMailboxes(
   store: SchedulerStorePort,
   selection: ReconcileSelection,
@@ -934,7 +907,6 @@ export class FileTaskController {
 
   async #runCoalesced(): Promise<ControllerSchedulerResult> {
     let result: ControllerSchedulerResult = {
-      stoppedArchivedTaskIds: [],
       activeRunDeliveries: [],
       failedRunRefs: [],
       wakeups: [],
@@ -1146,7 +1118,9 @@ export class FileTaskController {
         identity: operatorRetries.map((notification) => (
           "inputRequestId" in notification
             ? `input:${notification.inputRequestId}`
-            : `recovery:${notification.recoveryTaskId}`
+            : "recoveryTaskId" in notification
+              ? `recovery:${notification.recoveryTaskId}`
+              : `terminal:${notification.terminalTaskId}`
         )).join("|")
       });
     } else if (result.inputNotifications.some(
