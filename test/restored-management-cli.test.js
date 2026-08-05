@@ -96,17 +96,54 @@ test("public catalog exposes Agent, Agent Profile, and persistent Role managemen
   }
 });
 
-test("update uses the exact shell-free published npm command", () => {
-  let invocation;
-  const status = runUpdateCommand((command, args, options) => {
-    invocation = { command, args, options };
-    return { pid: 1, output: [], stdout: null, stderr: null, status: 7, signal: null };
-  });
-  assert.equal(status, 7);
-  assert.equal(invocation.command, "npm");
-  assert.deepEqual(invocation.args, ["install", "--global", "@zq-silk/yui@latest"]);
-  assert.equal(invocation.options.shell, false);
-  assert.equal(invocation.options.stdio, "inherit");
+test("update stages side by side and gates on a read-only preflight", () => {
+  // The old npm-global-first flow is gone: update must stage a new package,
+  // preflight it read-only, and only then migrate storage and promote the binary.
+  const order = [];
+  const lines = [];
+  const status = runUpdateCommand(
+    process.env,
+    undefined,
+    (text) => lines.push(text),
+    {
+      stage: () => { order.push("stage"); return { binaryPath: "/staged/yui", version: "9.9.9" }; },
+      preflight: () => { order.push("preflight"); return { status: "already-current" }; },
+      activateStorage: () => { order.push("activate-storage"); return { status: "already-current" }; },
+      activateBinary: () => { order.push("activate-binary"); },
+      verify: () => { order.push("verify"); },
+      cleanup: () => { order.push("cleanup"); }
+    }
+  );
+  assert.equal(status, 0);
+  // Staging and preflight precede any binary promotion; cleanup always runs.
+  assert.deepEqual(order, ["stage", "preflight", "activate-binary", "verify", "cleanup"]);
+  assert.match(lines.join(""), /Updated Yui to 9\.9\.9/);
+});
+
+test("update aborts without replacing the binary when preflight is blocked", () => {
+  const order = [];
+  const lines = [];
+  const status = runUpdateCommand(
+    process.env,
+    undefined,
+    (text) => lines.push(text),
+    {
+      stage: () => { order.push("stage"); return { binaryPath: "/staged/yui", version: "9.9.9" }; },
+      preflight: () => ({
+        status: "blocked", stage: "future-version",
+        message: "newer than supported", action: "install a newer release"
+      }),
+      activateStorage: () => { order.push("activate-storage"); return { status: "already-current" }; },
+      activateBinary: () => { order.push("activate-binary"); },
+      verify: () => { order.push("verify"); },
+      cleanup: () => { order.push("cleanup"); }
+    }
+  );
+  assert.equal(status, 5);
+  // Never migrated storage, never replaced the binary; the current install stays.
+  assert.deepEqual(order, ["stage", "cleanup"]);
+  assert.match(lines.join(""), /aborted during preflight/);
+  assert.match(lines.join(""), /remain usable/);
 });
 
 test("Agent add preserves adapter args and environment names without secret values", () => {

@@ -18,6 +18,10 @@ import {
   inspectStorageSchema,
   type StorageSchemaState
 } from "../storage/storageSchema.js";
+import { createEmptyRegistry } from "../storage/migration/index.js";
+import { classifyHome } from "../storage/upgrade/homeClassification.js";
+import { latestStorageVersionState } from "../storage/upgrade/recordVersions.js";
+import type { HomeSnapshot } from "../storage/upgrade/homeMigrationTarget.js";
 import {
   CommandExecutionError,
   type CommandExecutor
@@ -63,6 +67,7 @@ export function getDoctorChecks(
   return [
     homeCheck,
     schemaCheck,
+    checkCompatibility(home, homeCheck, schema),
     storage.check,
     checkExecutable("git", env.YUI_GIT_BIN ?? "git", ["--version"], executor),
     checkExecutable("tmux", env.YUI_TMUX_BIN ?? "tmux", ["-V"], executor),
@@ -131,6 +136,67 @@ function checkSchema(state: SchemaInspection): DoctorCheck {
       return { name: "storage schema", status: "invalid", detail: state.detail };
     case "read-error":
       return { name: "storage schema", status: "invalid", detail: state.detail };
+  }
+}
+
+/**
+ * The four-state storage compatibility check: USABLE / MIGRATABLE /
+ * NEEDS_NEW_VERSION / CORRUPTED. This complements the raw "storage schema" check
+ * with the migration framework's verdict, so a user sees whether a Home can be
+ * used as-is, upgraded with `yui upgrade`, needs a newer release, or is damaged.
+ * The registry ships EMPTY, so any strictly-older Home reads as NEEDS_NEW_VERSION
+ * with a precise missing-step reason, and CORRUPTED is only ever a real
+ * structural/reference failure — never inferred from a version number.
+ */
+function checkCompatibility(
+  home: string,
+  homeCheck: DoctorCheck,
+  schema: SchemaInspection
+): DoctorCheck {
+  const name = "storage compatibility";
+  if (homeCheck.status !== "ok") {
+    return { name, status: homeCheck.status, detail: homeCheck.detail };
+  }
+  if (schema.status === "uninitialized") {
+    return { name, status: "missing", detail: "run yui setup" };
+  }
+  if (schema.status === "read-error") {
+    return { name, status: "invalid", detail: schema.detail };
+  }
+  let classification;
+  try {
+    classification = classifyHome({
+      home,
+      registry: createEmptyRegistry<HomeSnapshot>(),
+      latest: latestStorageVersionState()
+    });
+  } catch (error) {
+    return { name, status: "invalid", detail: errorMessage(error) };
+  }
+  const verdict = classification.classification.verdict;
+  const versions =
+    `layout=${classification.layoutVersion ?? "?"}/${classification.latestLayoutVersion}`
+    + ` aggregate=${classification.aggregateVersion ?? "?"}/${classification.latestAggregateVersion}`;
+  const incompatible = classification.incompatibleComponent === undefined
+    ? ""
+    : ` incompatibleComponent=${classification.incompatibleComponent}`;
+  switch (verdict) {
+    case "USABLE":
+      return { name, status: "ok", detail: `USABLE ${versions}` };
+    case "MIGRATABLE":
+      return { name, status: "ok", detail: `MIGRATABLE ${versions}; run yui upgrade` };
+    case "NEEDS_NEW_VERSION":
+      return {
+        name,
+        status: "unsupported",
+        detail: `NEEDS_NEW_VERSION ${versions}${incompatible}; ${classification.classification.blocker.reason}`
+      };
+    case "CORRUPTED":
+      return {
+        name,
+        status: "invalid",
+        detail: `CORRUPTED: ${classification.classification.detail}`
+      };
   }
 }
 

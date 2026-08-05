@@ -87,6 +87,7 @@ import {
   type RoleWorkspace
 } from "../worktree/roleWorkspace.js";
 import { writeTextFileAtomically } from "./durableFile.js";
+import { assertHomeWritable } from "./upgradeFence.js";
 import { requireStorageSchema } from "./storageSchema.js";
 
 export const STORAGE_STATE_FILE = "state.json";
@@ -1146,6 +1147,12 @@ export class FileTaskStore implements TaskStore {
     return parseState(readFileSync(path, "utf8"));
   }
   #commit(state: StorageState, expectedRevision: number): void {
+    // The upgrade admission fence is honored at the single write moment, so both
+    // baseline CLI writers and the Controller (which mutate through this same
+    // store) refuse to persist while an upgrade owns the Home. Reads and
+    // read-only transactions never reach here, and the fencing process itself is
+    // exempt so it can re-pin the revision under the lock.
+    assertHomeWritable(this.rootDir);
     const current = this.#readState();
     if (current.revision !== expectedRevision) {
       throw new StorageConflictError(`Storage changed concurrently (expected revision ${expectedRevision}, found ${current.revision}).`);
@@ -2260,6 +2267,21 @@ function acquireStorageLock(rootDir: string): () => void {
       if (Date.now() >= deadline) throw new StorageConflictError(`Timed out waiting for storage lock: ${lock}`);
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCK_RETRY_MS);
     }
+  }
+}
+
+/**
+ * Run `execute` while holding the same storage write lock the store uses, without
+ * the version-gated {@link FileTaskStore} constructor. The upgrade orchestrator
+ * uses this to re-pin the committed revision under the lock against a source Home
+ * whose schema is not the current version (so a store cannot be constructed yet).
+ */
+export function withStorageWriteLock<T>(rootDir: string, execute: () => T): T {
+  const release = acquireStorageLock(rootDir);
+  try {
+    return execute();
+  } finally {
+    release();
   }
 }
 function reclaimDeadLock(lock: string): void {

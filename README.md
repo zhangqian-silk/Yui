@@ -59,11 +59,40 @@ and `task integration start`, keep their subordinate IDs local to that Task.
 Candidate IDs are local to their WorkItem and carry both Task and WorkItem
 provenance.
 
-Yui supports only the current aggregate-v14 / StoredTask-v13 schema. Older
-homes are intentionally unsupported: initialize a fresh `YUI_HOME` instead of
-asking the runtime to convert, dual-read, or infer historical records. See
-[Task-local identity](docs/task-local-identity.md) for the current reference
-contract.
+Yui models three independent, monotonic storage version axes: the on-disk
+`layout` (`schema.json`, `state.json`, locks), the authoritative `aggregate`
+document, and the `record` axis — a `recordKind -> version` map where every
+record family (WorkItem, AgentRun, ReviewRound, …) versions on its own. A
+centralized, future-facing migration framework (registry → planner → engine)
+covers all three; the registry ships **empty** in this release, so no historical
+migration step exists yet and any strictly-older home is fail-closed.
+
+`yui doctor` and `yui upgrade` present one of four compatibility states:
+
+- **USABLE** — every axis is at the current version; nothing to do.
+- **MIGRATABLE** — strictly older, and a complete deterministic step path exists
+  (none today, since the registry is empty).
+- **NEEDS_NEW_VERSION** — a version this release cannot migrate: either newer
+  than supported (`future-version`) or older with no registered step
+  (`missing-step`). Under the empty registry, every strictly-older home lands
+  here with a precise reason and the incompatible component (layout vs
+  aggregate).
+- **CORRUPTED** — real structural or reference-graph damage only, never inferred
+  from a version number.
+
+`yui upgrade` is the diagnostic/manual entry point. `yui upgrade --dry-run`
+runs a read-only preflight and plan, validates through the real loader gate on a
+staged copy, prints the report, and discards it without switching. `yui upgrade`
+(execute) places an admission fence (new writers, CLI and Controller alike,
+refuse to start), drains the Controller with the public `controller.stop`,
+re-pins the committed revision under the write lock, migrates into a fresh
+staged home, validates it, then atomically switches into place with a
+timestamped backup and a post-switch health check. Any failed or blocked step
+leaves the authoritative home byte-for-byte unchanged and reports the exact
+blocker stage and recovery action. It never converts a real home in this
+release (the registry is empty), and Yui never dual-reads an older schema or
+guesses an old identifier. See [Task-local identity](docs/task-local-identity.md)
+for the current reference contract.
 
 Setup also seeds four reusable Worker Profiles:
 
@@ -577,11 +606,30 @@ The restored management surface includes:
 
 ```sh
 yui update
+yui upgrade [--dry-run]
 yui agent add|list|show|capabilities|update|remove
 yui role add|list|show|update|remove|bind|enter
 yui role session record|replace
 yui project add|clone|refresh|update|discover|list|show|knowledge
 ```
+
+`yui update` stages the newly published package **side by side** — it never
+replaces the current global install first — then uses the staged binary to run a
+read-only preflight against the home. Only when that is safe does it migrate
+storage (atomically, with a timestamped backup) and promote the binary, running
+a new-binary health check last. On any failure it reports the exact phase and a
+recovery action.
+
+Rollback boundary (precise): this release does **not** introduce a versioned
+binary pointer or stable launcher, so it does **not** claim binary+home
+dual-resource atomicity. It guarantees: (1) staging is isolated — a
+stage/preflight failure leaves the old binary and home byte-for-byte unchanged;
+(2) the storage switch is atomic with a timestamped backup and is recoverable by
+restoring that backup until the new version resumes writes; (3) no auto-downgrade
+once the new version has written. The one non-atomic window — storage already
+switched, binary promotion then fails — is reported with the exact
+`mv <backup> <home>` recovery, and because the axes are version-gated the old
+binary fail-closes on the new home rather than misreading it.
 
 Agent environment bindings store process-environment variable names, never secret values. Adapter-owned lifecycle arguments cannot be overridden through raw arguments.
 
@@ -591,7 +639,10 @@ Yui targets one trusted local user on one machine. Its Web/API surface is
 loopback-only and intentionally omits remote or multi-user Web access,
 distributed coordination, backup/import/export commands, trash/restore,
 derived indexes, recovery journals, runtime leases, inactivity TTLs,
-cooldowns, and recurring schedules.
+cooldowns, and recurring schedules. (The one internal exception is the
+timestamped home backup `yui upgrade`/`yui update` takes immediately before an
+atomic storage switch, purely to make that single switch recoverable — it is not
+a general backup/restore facility.)
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for persistence and scheduling details.
 The reusable, user-driven acceptance plan is documented in

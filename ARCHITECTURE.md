@@ -190,6 +190,56 @@ cleanup revalidates ownership and fails safely when concurrent state changes;
 manual retry is the recovery boundary rather than another durable state
 machine.
 
+Storage compatibility is modeled on three independent, monotonic version axes:
+`layout` (on-disk `schema.json`, `state.json`, locks), `aggregate` (the
+authoritative document), and `record` — a `recordKind -> version` map so each
+record family versions on its own. A centralized migration framework
+(registry → planner → engine) is generic and domain-free: the engine is
+parameterized over an injected `MigrationTarget` and never hardcodes a Yui
+record list. Compatibility is decided **only** by explicit registered step
+paths, never by version magnitude or semver. The registry ships **empty** in
+this release — there are no historical steps — so every strictly-older home is
+fail-closed. `doctor`/`upgrade` classify a home as USABLE, MIGRATABLE,
+NEEDS_NEW_VERSION (with a `future-version` or `missing-step` reason plus the
+incompatible layout/aggregate component), or CORRUPTED — the last only for real
+structural/reference damage, never inferred from a version number.
+
+`yui upgrade` is the transactional storage-migration entry point. Execute mode
+places an **admission fence** honored at the single storage write choke point,
+so both baseline CLI writers and the Controller (which mutate through the same
+store) refuse to begin a new write while an upgrade owns the home; the fencing
+process itself is exempt. The fence is enforced by every writer built from this
+release forward (its check lives in the shared store-commit path); it cannot
+retroactively bind an already-installed older binary, so cross-release
+concurrency is instead handled by the quiesce step and the recommendation to
+stop all Yui activity for the home before upgrading. It then drains the
+Controller with the public `controller.stop`/shutdownAndDrain (never a broad
+kill, never a TTL or idle heuristic), fails closed if any foreign writer, live
+Controller, unfinished runtime lifecycle mailbox, or held `.state.lock` remains,
+re-pins the committed revision under the write lock after the drain (avoiding a
+check-then-migrate race), migrates the immutable source into a fresh staged
+home, validates it through the real `FileTaskStore` loader gate (record parse +
+reference graph), then atomically switches into place with a timestamped backup
+and a post-switch health check. Any blocked or failed step leaves the
+authoritative home byte-for-byte unchanged and reports the exact stage and
+recovery action; `--dry-run` runs through the validation gate and discards the
+staged output without switching. This release never migrates a real home (the
+registry is empty); the machinery is future-facing.
+
+`yui update` stages the published package side by side (never replacing the live
+install first), runs the staged binary's read-only preflight against the home,
+and only then migrates storage and promotes the binary, with a new-binary health
+check last. **Rollback boundary (narrowed):** this release introduces no
+versioned binary pointer or stable launcher and therefore makes no binary+home
+dual-resource atomicity claim. It guarantees isolated staging (a
+stage/preflight failure leaves binary and home unchanged), a recoverable atomic
+storage switch (timestamped backup, restorable until the new version resumes
+writes), and no auto-downgrade after writes resume. The single non-atomic window
+— storage switched, binary promotion then failing — is surfaced with the exact
+backup-restore recovery, and the version-gated axes make the old binary
+fail-close on the new home rather than misread it. task-5 delivers this code and
+its isolated tests only; it never runs an upgrade against a real home.
+
 The Web control room is loopback-only and never receives Controller socket
 credentials. It presents durable records and native terminal access without
 becoming a second source of truth.

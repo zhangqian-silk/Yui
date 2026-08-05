@@ -23,6 +23,7 @@ import {
 import { resolveOperatorWizardArguments } from "./cli/operatorWizard.js";
 import type { SelectionPorts } from "./cli/selectionPorts.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
+import { runUpgradeCommand } from "./cli/upgradeCommand.js";
 import { formatTimestamp } from "./output/timePresentation.js";
 import { renderAgentConfigurationCatalog } from "./output/agentConfigurationPresentation.js";
 import type { ConfiguredAgent } from "./agent/agent.js";
@@ -192,6 +193,15 @@ export async function main(): Promise<void> {
   }
   if (args[0] === "doctor") {
     emit(runDoctorCommand(args.slice(1), process.env, new NodeCommandExecutor()));
+    return;
+  }
+  if (args[0] === "upgrade") {
+    // Mirror doctor/controller: needs a Home but self-manages the schema check,
+    // because upgrade must run against a non-current Home. Dispatched before the
+    // unconditional requireStorageSchema gate below.
+    const result = await runUpgradeCommand(args.slice(1), home);
+    process.exitCode = result.exitCode;
+    emit(result.output, false, result.data);
     return;
   }
   if (args[0] === "internal") {
