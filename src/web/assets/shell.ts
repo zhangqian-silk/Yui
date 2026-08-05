@@ -52,10 +52,6 @@ export const DASHBOARD_HTML = `<!doctype html>
             </select>
           </label>
         </div>
-        <button id="operator-terminal" class="operator-open" type="button">
-          <span class="operator-title" data-i18n="actions.operator">Operator session</span>
-          <span class="operator-shortcuts" aria-hidden="true"><kbd>O</kbd><kbd>↵</kbd></span>
-        </button>
       </div>
     </aside>
     <div class="main-col">
@@ -73,6 +69,10 @@ export const DASHBOARD_HTML = `<!doctype html>
             <span data-i18n="sync.label">Last sync</span>
             <time id="last-sync">—</time>
           </div>
+          <button id="operator-terminal" class="operator-open" type="button">
+            <span class="operator-title" data-i18n="actions.operator">Operator session</span>
+            <span class="operator-shortcuts" aria-hidden="true"><kbd>O</kbd></span>
+          </button>
           <button id="refresh" class="refresh" type="button" title="Refresh tasks"><span data-i18n="actions.refresh">Refresh</span> <kbd>R</kbd></button>
         </div>
       </header>
