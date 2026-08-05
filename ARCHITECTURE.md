@@ -225,7 +225,13 @@ not match its locator, or a record with a missing/invalid `schemaVersion`.
 places an **admission fence** honored at the single storage write choke point,
 so both baseline CLI writers and the Controller (which mutate through the same
 store) refuse to begin a new write while an upgrade owns the home; the fencing
-process itself is exempt. The fence is enforced by every writer built from this
+process itself is exempt. **Fence acquisition is a single atomic
+`O_CREAT|O_EXCL` create** — the kernel guarantees exactly one of any number of
+concurrent upgraders wins that create, so there is no check-then-write window in
+which two upgraders both believe they acquired; a loser either re-enters (it
+already owns the fence), reclaims a *provably-dead* owner's stale fence and
+retries once, or fails closed for a live/undeterminable owner. There is no lease
+or multi-round negotiation. The fence is enforced by every writer built from this
 release forward (its check lives in the shared store-commit path); it cannot
 retroactively bind an already-installed older binary, so cross-release
 concurrency is instead handled by the quiesce step and the recommendation to
@@ -242,6 +248,44 @@ authoritative home byte-for-byte unchanged and reports the exact stage and
 recovery action; `--dry-run` runs through the validation gate and discards the
 staged output without switching. This release never migrates a real home (the
 registry is empty); the machinery is future-facing.
+
+**Uninitialized home is an actionable blocker, not a no-op.** An
+uninitialized home (never `yui setup`) has no storage to migrate. The classifier
+reports it as USABLE (nothing is *wrong* with it, so `doctor` may present it
+as-is), but the *upgrade* path would otherwise collapse that verdict into a
+silent no-op against a home that was never set up. Upgrade therefore returns a
+structured `uninitialized` blocker ("run `yui setup`") — never an unclassified
+runtime error and never a false success.
+
+**Complete home content preservation contract.** A migration only *transforms*
+`schema.json` + `state.json`, but the atomic switch replaces the **whole** home
+directory (`home -> backup`, `staging -> home`). Staging that held only those two
+files would silently drop everything else the real home persists — `runtime/`
+discovery, `runtime/inbox/*` (AUTHORITATIVE, not-yet-applied events), `cache/`,
+`artifacts/`. The chosen contract (implemented in `writeFreshOutput`) is that
+**staging carries a complete copy of the home**: every other entry (any depth:
+dirs, files, symlinks) is copied verbatim, and only `schema.json`/`state.json`
+are overwritten with their migrated bytes. So the switch preserves all
+authoritative and rebuildable content — and the timestamped backup retains the
+original of everything too. The transient `.state.lock` is the one exception: a
+lock is per-instance coordination state, never authoritative content, so it is
+not promoted into the migrated home.
+
+**Partial (two-step) switch is reported honestly, never as "unchanged".** The
+atomic switch is two renames — `home -> backup`, then `staging -> home` — with one
+non-atomic window between them, tracked by a durable sibling progress marker
+(`<home>.upgrade-switch.json`) whose phase distinguishes *not-started* /
+*interrupted* / *complete*. If the second rename fails, the code first attempts
+an automatic rollback (`backup -> home`); when that succeeds the original is
+restored and the failure is reported with the home genuinely unchanged. **Only if
+the rollback also fails** is the switch left partially applied: the marker records
+`interrupted`, the engine surfaces a distinct `switch-ambiguous` outcome, and the
+upgrade blocks at a dedicated `switch-ambiguous` stage that states the home is
+**not** intact and prints the exact `mv "<backup>" "<home>"` recovery — it never
+falsely claims "storage was not switched; the home is unchanged". No completion
+receipt is written in this case (the switch did not commit); the `interrupted`
+marker is the durable signal, and `yui update`'s probe reads it to drive a
+restore-the-backup recovery rather than a "verify the migrated home".
 
 **Quiesce fails closed on any undeterminable signal.** The `.state.lock` is
 acquired mkdir-first with its `owner` file written a moment later, so a lock
@@ -266,6 +310,28 @@ runs the *actually-activated* global binary (resolved via `npm prefix -g`), not
 the staging path, and confirms its reported version matches the staged artifact;
 a mismatch (e.g. staged A but `@latest` moved to B) fails closed.
 
+**Exit status and JSON outcome must agree.** When the orchestrator interprets a
+spawned staged-binary result, a *success-class* outcome (`upgraded`,
+`already-current`, or a `dry-run`/`already-current` preflight) is trusted **only
+when the process also exited 0**. A contradiction — stdout says `upgraded` but the
+process exited non-zero — means the child's own contract was violated mid-flight,
+so it is treated as **ambiguous** (activation) or **blocked** (preflight), never a
+false success. Blocker-class outcomes are exempt: `yui upgrade` deliberately exits
+non-zero (5) for a clean `blocked`, so a non-zero exit there is expected and
+consistent. A parseable result with **no** recognized outcome is likewise never
+read as success.
+
+**Post-verify parses the doctor machine-readable result.** The post-update health
+check does not merely check the doctor process's exit code — a zero exit is
+necessary but not sufficient. It runs `yui --json doctor`, which emits a
+structured `{ checks, storage: { healthy, blocking } }` verdict, and **fails
+closed on any unsupported / corrupted / uninitialized / version-mismatch storage
+check even when the process exited 0** (and also when the result cannot be parsed
+at all, since an unverifiable health check must not pass silently). The `--json`
+doctor path additionally exits non-zero when storage is unhealthy, so even a naive
+exit-code consumer fails closed; text-mode `doctor` keeps its existing
+presentation.
+
 **Activation ambiguity.** Storage activation runs in a spawned staged-binary
 child. If that child is killed (SIGTERM/OOM) or crashes *after* the atomic switch
 commits but *before* it prints its result JSON, the parent cannot tell "nothing
@@ -278,6 +344,15 @@ ambiguous result the orchestrator probes the receipt + timestamped backup +
 current schema and prints precise manual-recovery steps (verify with `yui doctor`;
 restore the named backup with `mv` if needed), and the CLI exits non-zero with a
 dedicated code so the ambiguity is never mistaken for success.
+
+**A receipt is only trusted when it corresponds to the current home.** A leftover
+receipt from a prior attempt is not unconditional proof that *this* attempt's
+switch committed. Before using a receipt for a recovery decision, the probe
+validates correspondence: the receipt carries the `homePath` it is about and the
+`backupPath` it created, and it is rejected (the caller re-probes the real on-disk
+state instead) when it names a **different home** or when its **backup no longer
+exists** (already restored or cleaned). A non-corresponding receipt reads as
+"not switched" so recovery advice is never derived from a stale marker.
 
 **Rollback boundary (narrowed):** this release introduces no
 versioned binary pointer or stable launcher and therefore makes no binary+home

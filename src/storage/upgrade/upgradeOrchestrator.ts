@@ -63,6 +63,7 @@ import {
 
 /** The precise stage at which an upgrade was blocked or failed. */
 export type UpgradeBlockerStage =
+  | "uninitialized"
   | "missing-step"
   | "future-version"
   | "corruption"
@@ -70,6 +71,7 @@ export type UpgradeBlockerStage =
   | "drain-incomplete"
   | "validate"
   | "switch"
+  | "switch-ambiguous"
   | "post-verify";
 
 /** A fail-closed blocker before its owning classification is attached. */
@@ -115,6 +117,11 @@ export type RunStorageUpgradeOptions<Snapshot> = Readonly<{
   controllerOptions?: FileControllerClientOptions;
   /** Test seam: stop+drain the Controller. Defaults to the real client. */
   stopController?: (home: string) => Promise<void>;
+  /**
+   * Test seam forwarded to the migration target's atomic switch to simulate a
+   * failing promotion/rollback rename (P1-4). Production never sets it.
+   */
+  renameImpl?: (from: string, to: string) => void;
 }>;
 
 /**
@@ -131,6 +138,24 @@ export async function runStorageUpgrade(
 
   // 1) Preflight — read-only classification.
   const classification = classifyHome({ home, registry, latest });
+
+  // An uninitialized Home has no storage to migrate. The classifier reports it as
+  // USABLE (nothing is wrong; doctor may present it as-is), but for the UPGRADE
+  // path that verdict would collapse into a silent no-op against a Home that was
+  // never `yui setup`. Return a structured, actionable blocker instead — never a
+  // false success and never an unclassified runtime error (P2-7).
+  if (classification.uninitialized === true) {
+    return withClassification(
+      {
+        outcome: "blocked",
+        stage: "uninitialized",
+        message: "Yui storage is not initialized for this Home; there is nothing to upgrade.",
+        action: "Run `yui setup` to initialize storage, then re-run the upgrade if needed."
+      },
+      classification
+    );
+  }
+
   const verdict = classification.classification.verdict;
   if (verdict === "CORRUPTED") {
     return withClassification(
@@ -156,7 +181,13 @@ export async function runStorageUpgrade(
     );
   }
 
-  const target = createHomeMigrationTarget({ home, latest, now, callerPid });
+  const target = createHomeMigrationTarget({
+    home,
+    latest,
+    now,
+    callerPid,
+    ...(options.renameImpl === undefined ? {} : { renameImpl: options.renameImpl })
+  });
 
   // 2) A USABLE (already-current) Home has nothing to migrate; the engine
   // confirms with a no-op and we never fence, drain, or switch.
@@ -253,6 +284,17 @@ async function execute(
       target.discardFreshOutput();
       return { ...blockedFromFailedReport(report, classification), report };
     }
+    if (report.outcome === "switch-ambiguous") {
+      // The switch was left partially applied: the original was moved to the
+      // backup but BOTH the promotion and its rollback failed. The switch did NOT
+      // commit (the Home path may be missing), so we do NOT write a completion
+      // receipt — that would falsely assert a committed switch. The honest durable
+      // signal is the `interrupted` switch-progress marker the target already
+      // wrote (<home>.upgrade-switch.json), which `yui update`'s probe reads to
+      // drive a restore-the-backup recovery. Report the exact backup-based manual
+      // recovery and never claim the Home is unchanged (P1-4).
+      return { ...blockedFromSwitchAmbiguous(report, classification), report };
+    }
     if (report.outcome !== "migrated") {
       // Blocked/active-runtime detected inside the engine: never switched.
       target.discardFreshOutput();
@@ -266,7 +308,10 @@ async function execute(
     // gap (P1-2). The receipt is cleared only on a clean, verified return.
     writeUpgradeReceipt(home, {
       switched: true,
+      homePath: home,
       completedAt: now().toISOString(),
+      targetLayoutVersion: latest.layout,
+      targetAggregateVersion: latest.aggregate,
       ...(report.switch.backupPath === undefined
         ? {}
         : { backupPath: report.switch.backupPath })
@@ -429,6 +474,30 @@ function blockedFromFailedReport(
   );
 }
 
+/**
+ * Build a blocker for a partially-applied, ambiguous switch: the original was
+ * moved to the backup but neither the promotion nor its rollback completed. This
+ * is reported at the `switch` stage with the exact backup-restore command and an
+ * explicit statement that the Home is NOT unchanged (P1-4).
+ */
+function blockedFromSwitchAmbiguous(
+  report: Extract<MigrationReport, { outcome: "switch-ambiguous" }>,
+  classification: HomeClassification
+): Extract<UpgradeResult, { outcome: "blocked" }> {
+  return withClassification(
+    {
+      outcome: "blocked",
+      stage: "switch-ambiguous",
+      message: `Storage switch is AMBIGUOUS and partially applied: ${report.error}`,
+      action:
+        `Do NOT assume the Home is unchanged. The original Home is at ${report.backupPath}; `
+        + `restore it to recover: mv "${report.backupPath}" "${report.homePath}". A completion `
+        + `receipt was written recording this ambiguity; verify with "yui doctor" after restoring.`
+    },
+    classification
+  );
+}
+
 function blockedFromEngineReport(
   report: MigrationReport,
   classification: HomeClassification
@@ -461,4 +530,8 @@ async function defaultStopController(
 /** Read the current fence for a Home (re-exported for command wiring). */
 export { readUpgradeFence, clearUpgradeFence };
 /** Read/locate the completion receipt (re-exported for update orchestration). */
-export { readUpgradeReceipt, upgradeReceiptPath } from "./upgradeReceipt.js";
+export {
+  readUpgradeReceipt,
+  correlateUpgradeReceipt,
+  upgradeReceiptPath
+} from "./upgradeReceipt.js";

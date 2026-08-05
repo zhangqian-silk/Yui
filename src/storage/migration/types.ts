@@ -133,11 +133,53 @@ export type LiveRuntimeStatus = Readonly<{
   detail?: string;
 }>;
 
-/** Result of the atomic switch, including the timestamped backup location. */
+/**
+ * Result of the atomic switch, including the timestamped backup location.
+ *
+ * A switch is implemented as two atomic renames with one non-atomic window
+ * between them (move original aside, then promote the staged output). `status`
+ * makes that window observable to callers instead of collapsing it into a bare
+ * success:
+ *  - `switched`  — the staged output was fully promoted into the Home path.
+ *  - `ambiguous` — the original was moved to the backup but promotion did not
+ *    complete AND the rollback also failed; the Home is partially switched and
+ *    must be recovered from the backup. NEVER report this as "unchanged".
+ * When a target implements the switch as a single atomic operation it always
+ * returns `switched`; the field defaults to `switched` for back-compatibility.
+ */
 export type SwitchOutcome = Readonly<{
+  status?: "switched" | "ambiguous";
   backupPath?: string;
   detail?: string;
 }>;
+
+/**
+ * Thrown by a target's `atomicSwitchWithBackup` when the switch is left in a
+ * partially-applied, ambiguous state (the original was moved aside but the
+ * promotion and its rollback both failed). It carries the exact recovery path so
+ * the orchestrator can report a truthful, actionable manual recovery rather than
+ * a false "the Home is unchanged".
+ */
+export class AmbiguousSwitchError extends Error {
+  /** The logical Home path that is now partially switched. */
+  readonly homePath: string;
+  /** Where the original Home currently lives (the recovery source). */
+  readonly backupPath: string;
+  /** The staged output that was not promoted. */
+  readonly stagingPath: string;
+  constructor(options: Readonly<{
+    homePath: string;
+    backupPath: string;
+    stagingPath: string;
+    detail: string;
+  }>) {
+    super(options.detail);
+    this.name = "AmbiguousSwitchError";
+    this.homePath = options.homePath;
+    this.backupPath = options.backupPath;
+    this.stagingPath = options.stagingPath;
+  }
+}
 
 /**
  * The abstract migration target the transactional engine is parameterized over.
@@ -247,6 +289,26 @@ export type MigrationReport = Readonly<
       target: StorageVersionState;
       stage: MigrationStage;
       stepsApplied: readonly StepSummary[];
+      error: string;
+    }
+  /**
+   * The atomic switch was left partially applied: the original was moved to the
+   * backup but the promotion and its rollback both failed. This is NOT a clean
+   * "source unchanged" failure — the caller must recover from the backup. Carries
+   * the exact paths for a manual `mv` recovery (P1-4).
+   */
+  | {
+      outcome: "switch-ambiguous";
+      mode: MigrationMode;
+      source: StorageVersionState;
+      target: StorageVersionState;
+      steps: readonly StepSummary[];
+      /** The logical Home path that is now partially switched. */
+      homePath: string;
+      /** Where the original Home currently lives (the recovery source). */
+      backupPath: string;
+      /** The staged output that was not promoted. */
+      stagingPath: string;
       error: string;
     }
 >;

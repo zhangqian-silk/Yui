@@ -79,6 +79,12 @@ export type StorageActivation = Readonly<
 export type StorageStateProbe = Readonly<{
   /** A completion receipt was found (the switch provably committed). */
   switched: boolean;
+  /**
+   * A partially-applied, interrupted switch was found (P1-4): the original was
+   * moved to the backup but neither promotion nor rollback completed, so the Home
+   * path may be missing. This is the strongest "restore the backup" signal.
+   */
+  interrupted?: boolean;
   /** The timestamped backup of the pre-switch Home, when known. */
   backupPath?: string;
   /** Whether the on-disk Home is now at the current, loadable schema. */
@@ -326,6 +332,28 @@ function resolveAmbiguousActivation(
       version: staged.version,
       schemaCurrent: false,
       switched: false
+    };
+  }
+
+  if (probe.interrupted === true) {
+    // A partially-applied, interrupted switch: the original was moved to the
+    // backup and neither promotion nor rollback completed, so the Home path may
+    // be missing. This is the strongest "restore the backup now" signal — never a
+    // "verify the migrated Home" or a "recoverable no-op".
+    return {
+      outcome: "ambiguous",
+      phase: "activate-storage",
+      message:
+        `Storage switch was INTERRUPTED mid-rename (${detail}); the Home may be missing and was `
+        + `NOT left intact. The new binary was NOT promoted.`,
+      action:
+        `Restore the timestamped backup to recover the original Home: `
+        + `mv "${probe.backupPath ?? "<home>.backup-*"}" "${home}". Do NOT resume writes until it is `
+        + `restored, then re-run "yui update".`,
+      version: staged.version,
+      schemaCurrent: probe.schemaCurrent,
+      switched: false,
+      ...(probe.backupPath === undefined ? {} : { storageBackupPath: probe.backupPath })
     };
   }
 

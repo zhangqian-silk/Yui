@@ -20,10 +20,17 @@
  * is stale and is reclaimed, mirroring the storage lock's dead-owner reclaim.
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeSync
+} from "node:fs";
 import { dirname, join } from "node:path";
-
-import { writeTextFileAtomically } from "./durableFile.js";
 
 /** Fence marker location, beside the Controller discovery file under `runtime/`. */
 export const UPGRADE_FENCE_FILE = "runtime/upgrade.fence";
@@ -110,26 +117,92 @@ export function assertHomeWritable(
 /**
  * Place an upgrade fence owned by the current process and return a release
  * handle. The handle is idempotent and only removes a fence this process owns.
+ *
+ * Acquisition is a SINGLE atomic `O_CREAT | O_EXCL` create (P2-5): the kernel
+ * guarantees exactly one of any number of concurrent entrants wins that create,
+ * so there is no check-then-write window in which two upgraders both believe
+ * they acquired. A loser reads the existing fence and either:
+ *  - re-enters (it already owns the fence — idempotent), or
+ *  - reclaims a PROVABLY-DEAD owner's stale fence and retries the atomic create
+ *    once (a dead owner cannot be a live competitor), or
+ *  - fails closed with {@link UpgradeFenceError} for a live foreign owner or an
+ *    undeterminable/malformed fence.
+ * There is no lease, heartbeat, or multi-round negotiation — just the one atomic
+ * create plus a bounded dead-owner reclaim.
  */
 export function placeUpgradeFence(
   home: string,
   options: Readonly<{ reason: string; createdAt: string; ownerPid?: number }>
 ): () => void {
   const ownerPid = options.ownerPid ?? process.pid;
-  const existing = readUpgradeFence(home);
-  if (existing !== null && existing.ownerPid !== ownerPid) {
-    if (existing.ownerPid > 0 && processIsAlive(existing.ownerPid)) {
-      throw new UpgradeFenceError(existing.reason);
-    }
-  }
   const fence: UpgradeFence = {
     schemaVersion: 1,
     ownerPid,
     reason: options.reason,
     createdAt: options.createdAt
   };
-  mkdirSync(dirname(fencePath(home)), { recursive: true, mode: 0o700 });
-  writeTextFileAtomically(fencePath(home), `${JSON.stringify(fence, null, 2)}\n`);
+  const content = `${JSON.stringify(fence, null, 2)}\n`;
+  const path = fencePath(home);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+
+  // At most two attempts: the second only ever runs to retry after reclaiming a
+  // dead owner's stale fence. A fresh race is settled by the first atomic create;
+  // a live foreign owner fails immediately without a retry.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (tryCreateFenceExclusive(path, content)) {
+      fsyncDirectory(dirname(path));
+      return makeFenceRelease(home, ownerPid);
+    }
+    // The atomic create lost: a fence already exists. Decide purely from its
+    // owner — never by overwriting, which would reintroduce the race.
+    const existing = readUpgradeFence(home);
+    if (existing === null) continue; // vanished between create and read; retry.
+    if (existing.ownerPid === ownerPid) {
+      // This process already owns the fence: idempotent re-entry.
+      return makeFenceRelease(home, ownerPid);
+    }
+    if (existing.ownerPid > 0 && !processIsAlive(existing.ownerPid)) {
+      // Provably-dead owner: reclaim the stale fence and retry the atomic create.
+      clearUpgradeFence(home);
+      continue;
+    }
+    // A live foreign owner, or an undeterminable/malformed fence (ownerPid <= 0):
+    // another upgrade holds this Home. Fail closed with no coordination protocol.
+    throw new UpgradeFenceError(existing.reason);
+  }
+  // Still contended after the bounded reclaim retry: fail closed rather than spin.
+  throw new UpgradeFenceError(readUpgradeFence(home)?.reason ?? "upgrade fence contended");
+}
+
+/**
+ * Atomically create the fence file and write its content, failing (returning
+ * `false`) iff the file already exists. The `O_EXCL` create is the single point
+ * that decides a concurrent race; the owner bytes are written into the same
+ * descriptor and fsynced before it is closed.
+ */
+function tryCreateFenceExclusive(path: string, content: string): boolean {
+  let descriptor: number;
+  try {
+    descriptor = openSync(
+      path,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
+      0o600
+    );
+  } catch (error) {
+    if (isEexist(error)) return false;
+    throw error;
+  }
+  try {
+    writeSync(descriptor, content);
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+  return true;
+}
+
+/** Build the idempotent release handle that only clears a fence this owner holds. */
+function makeFenceRelease(home: string, ownerPid: number): () => void {
   return () => {
     const current = readUpgradeFence(home);
     if (current !== null && current.ownerPid === ownerPid) clearUpgradeFence(home);
@@ -152,4 +225,31 @@ function processIsAlive(pid: number): boolean {
 
 function isEnoent(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+function isEexist(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "EEXIST";
+}
+
+/**
+ * fsync the directory holding the fence so a crash right after acquisition still
+ * observes the fence on the next boot (the marker's whole purpose is durability
+ * across an interrupted upgrade). Best-effort: a platform that cannot open a
+ * directory for fsync must not fail the acquisition.
+ */
+function fsyncDirectory(directory: string): void {
+  let descriptor: number;
+  try {
+    descriptor = openSync(directory, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0));
+  } catch {
+    return;
+  }
+  try {
+    fsyncSync(descriptor);
+  } catch {
+    // Some filesystems reject fsync on a directory fd; the O_EXCL create already
+    // committed the inode, so this is not fatal to correctness.
+  } finally {
+    closeSync(descriptor);
+  }
 }

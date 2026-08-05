@@ -31,11 +31,13 @@
 import {
   closeSync,
   constants,
+  cpSync,
   existsSync,
   fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync
 } from "node:fs";
@@ -46,13 +48,18 @@ import { inspectStorageSchema, STORAGE_SCHEMA_FILE } from "../storageSchema.js";
 import { FileTaskStore, STORAGE_STATE_FILE } from "../taskStore.js";
 import { readUpgradeFence, type UpgradeFence } from "../upgradeFence.js";
 import { scanSourceRecordVersions } from "./recordVersionScan.js";
-import type {
-  DerivedStateSummary,
-  LiveRuntimeStatus,
-  MigrationTarget,
-  StorageVersionState,
-  SwitchOutcome,
-  ValidationSummary
+import {
+  clearSwitchProgress,
+  writeSwitchProgress
+} from "./switchProgress.js";
+import {
+  AmbiguousSwitchError,
+  type DerivedStateSummary,
+  type LiveRuntimeStatus,
+  type MigrationTarget,
+  type StorageVersionState,
+  type SwitchOutcome,
+  type ValidationSummary
 } from "../migration/index.js";
 
 /** The read-only, structural snapshot of a source Home. */
@@ -161,6 +168,14 @@ export type HomeMigrationTargetOptions = Readonly<{
   stagingPath?: string;
   /** This process's pid, for foreign-writer detection. */
   callerPid?: number;
+  /**
+   * Test seam for the atomic switch's renames. Defaults to `node:fs`
+   * `renameSync`. Tests inject this to simulate a failure of the second rename
+   * (staging -> home) after the first (home -> backup) committed, exercising the
+   * partial-switch rollback / ambiguous-switch paths (P1-4). Production never
+   * overrides it.
+   */
+  renameImpl?: (from: string, to: string) => void;
 }>;
 
 export type HomeMigrationTarget = MigrationTarget<HomeSnapshot> & Readonly<{
@@ -177,6 +192,10 @@ export function createHomeMigrationTarget(
   const now = options.now ?? (() => new Date());
   const callerPid = options.callerPid ?? process.pid;
   const stagingPath = options.stagingPath ?? `${home}.upgrade-staging`;
+  // The promotion rename (staging -> home) is the only injectable one, so a test
+  // can fail it after the backup rename committed. The backup and rollback
+  // renames always use the real fs so rollback genuinely restores the original.
+  const promoteRename = options.renameImpl ?? renameSync;
 
   return {
     stagingPath,
@@ -217,6 +236,37 @@ export function createHomeMigrationTarget(
         );
       }
       mkdirSync(stagingPath, { recursive: true, mode: 0o700 });
+
+      // COMPLETE HOME CONTENT PRESERVATION CONTRACT (P1-1)
+      // -------------------------------------------------
+      // The migration only TRANSFORMS schema.json + state.json, but the atomic
+      // switch replaces the WHOLE Home directory (home -> backup, staging ->
+      // home). If staging held only those two files, everything else the real
+      // Home persists — runtime/inbox/* (AUTHORITATIVE, not-yet-applied events),
+      // runtime/ discovery, cache/ and artifacts/ (rebuildable) — would be
+      // silently lost on the first real migration.
+      //
+      // Chosen contract: staging carries a COMPLETE copy of the Home; only
+      // schema.json + state.json are overwritten with their migrated bytes.
+      // Every other entry (of any depth: dirs, files, symlinks) is copied
+      // verbatim, so the switch preserves all authoritative and rebuildable
+      // content. The two migrated files are written LAST so they always win over
+      // any copied original. The transient `.state.lock` is NOT promoted (a lock
+      // is per-instance coordination state, never authoritative Home content);
+      // the upgrade fence under runtime/ is copied but cleared post-switch by
+      // this process's fence release. See ARCHITECTURE.md "Complete Home content
+      // preservation".
+      copyHomeContentsExcept(
+        home,
+        stagingPath,
+        new Set([
+          STORAGE_SCHEMA_FILE,
+          STORAGE_STATE_FILE,
+          STATE_LOCK_DIRECTORY,
+          basename(stagingPath)
+        ])
+      );
+
       writeTextFileAtomically(
         join(stagingPath, STORAGE_SCHEMA_FILE),
         `${JSON.stringify(snapshot.schemaManifest, null, 2)}\n`
@@ -269,13 +319,84 @@ export function createHomeMigrationTarget(
         throw new Error(`Refusing to overwrite an existing backup: ${backupPath}.`);
       }
       // Two atomic renames on the same filesystem. The only non-atomic window is
-      // between them; if interrupted there, the source lives intact at the
-      // backup path and recovery is a single `mv <backup> <home>`.
-      renameSync(home, backupPath);
+      // between them. A durable sibling marker records the phase so a reader can
+      // distinguish not-started / interrupted / complete even if this process is
+      // killed mid-switch (P1-4).
+      writeSwitchProgress(home, {
+        phase: "backing-up",
+        homePath: home,
+        backupPath,
+        stagingPath,
+        updatedAt: now().toISOString()
+      });
+
+      // Step 1: move the original aside. If this fails, nothing has moved and the
+      // Home is genuinely unchanged — clear the marker and surface the error.
+      try {
+        renameSync(home, backupPath);
+      } catch (error) {
+        clearSwitchProgress(home);
+        throw error;
+      }
       fsyncDirectory(dirname(home));
-      renameSync(stagingPath, home);
+
+      // The original is now at the backup: we are in the non-atomic window.
+      writeSwitchProgress(home, {
+        phase: "promoting",
+        homePath: home,
+        backupPath,
+        stagingPath,
+        updatedAt: now().toISOString()
+      });
+
+      // Step 2: promote the staged output into the Home path.
+      try {
+        promoteRename(stagingPath, home);
+      } catch (promoteError) {
+        // Promotion failed after the original was moved aside. The invariant
+        // "the Home is unchanged" is now FALSE. Try to restore the original from
+        // the backup so we can honestly report "rolled back, unchanged". The
+        // rollback goes through the same rename seam: whatever fault blocked the
+        // promotion (a read-only parent, a vanished path) would block the reverse
+        // move too, so a test injecting a failing rename exercises both.
+        try {
+          promoteRename(backupPath, home);
+          fsyncDirectory(dirname(home));
+          clearSwitchProgress(home);
+        } catch (rollbackError) {
+          // Rollback ALSO failed: the switch is genuinely interrupted. Record the
+          // interrupted phase durably and raise a precise, recoverable error —
+          // never let the caller believe the Home is intact.
+          writeSwitchProgress(home, {
+            phase: "interrupted",
+            homePath: home,
+            backupPath,
+            stagingPath,
+            updatedAt: now().toISOString()
+          });
+          throw new AmbiguousSwitchError({
+            homePath: home,
+            backupPath,
+            stagingPath,
+            detail:
+              `Storage switch is in an AMBIGUOUS, partially-applied state: the original Home was `
+              + `moved to ${backupPath} but promoting the migrated output failed `
+              + `(${messageOf(promoteError)}), and the automatic rollback also failed `
+              + `(${messageOf(rollbackError)}). The Home path ${home} may be missing. Recover `
+              + `manually by restoring the backup: mv "${backupPath}" "${home}".`
+          });
+        }
+        // Rollback succeeded: the original is back in place, Home unchanged. Bubble
+        // the original promotion error so the engine reports a failed switch with
+        // the source intact (the engine's failure path never claims a switch).
+        throw promoteError;
+      }
       fsyncDirectory(dirname(home));
+
+      // Both renames committed: the switch is complete. Clear the progress marker.
+      clearSwitchProgress(home);
       return {
+        status: "switched",
         backupPath,
         detail: `Original Home backed up at ${backupPath}.`
       };
@@ -452,4 +573,41 @@ function processIsAlive(pid: number): boolean {
 
 function isEnoent(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Copy every top-level entry of `sourceHome` into `destDir`, except the names in
+ * `exclude`, preserving nested directories, files, symlinks, timestamps, and
+ * modes. This implements the complete Home content preservation contract (P1-1):
+ * the migrated schema.json/state.json are written by the caller afterward, and
+ * everything else (runtime/inbox authoritative events, runtime/ discovery,
+ * cache/, artifacts/) is carried verbatim so the atomic switch never drops it.
+ *
+ * Symlinks are copied as links (not dereferenced), so an in-Home symlink keeps
+ * its target rather than duplicating content or escaping the Home. Copy failures
+ * propagate: the engine aborts before the switch, leaving the source untouched.
+ */
+function copyHomeContentsExcept(
+  sourceHome: string,
+  destDir: string,
+  exclude: ReadonlySet<string>
+): void {
+  for (const entry of readdirSync(sourceHome, { withFileTypes: true })) {
+    if (exclude.has(entry.name)) continue;
+    cpSync(join(sourceHome, entry.name), join(destDir, entry.name), {
+      recursive: true,
+      // Copy symlinks as links rather than dereferencing them.
+      dereference: false,
+      // Preserve timestamps/mode so authoritative/rebuildable content is intact.
+      preserveTimestamps: true,
+      // The staging dir is fresh, so nothing should already exist; force keeps
+      // the copy robust if a partial retry left a remnant.
+      force: true,
+      errorOnExist: false
+    });
+  }
 }

@@ -128,6 +128,30 @@ test("doctor presents the four storage states", () => {
   assert.match(runCli(cor.home, ["doctor"]).stdout, /storage compatibility.*CORRUPTED/s);
 });
 
+test("P1-3 --json doctor emits a machine-readable storage-health verdict and exit code", () => {
+  // A healthy current Home: storage.healthy=true and exit 0.
+  const cur = currentHome();
+  const healthy = runCli(cur.home, ["--json", "doctor"]);
+  assert.equal(healthy.status, 0);
+  const healthyData = JSON.parse(healthy.stdout);
+  assert.equal(healthyData.ok, true);
+  assert.equal(healthyData.data.storage.healthy, true);
+  assert.deepEqual(healthyData.data.storage.blocking, []);
+  assert.ok(Array.isArray(healthyData.data.checks), "checks array is present");
+
+  // A version-mismatched Home: storage.healthy=false, a blocking check, exit 5.
+  const fut = currentHome();
+  rewriteManifest(fut.home, { aggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION + 1 });
+  const unhealthy = runCli(fut.home, ["--json", "doctor"]);
+  assert.equal(unhealthy.status, 5, "unhealthy storage exits non-zero under --json");
+  const unhealthyData = JSON.parse(unhealthy.stdout);
+  assert.equal(unhealthyData.data.storage.healthy, false);
+  assert.ok(
+    unhealthyData.data.storage.blocking.length > 0,
+    "at least one blocking storage check is reported"
+  );
+});
+
 test("upgrade --dry-run never writes output and never switches", async () => {
   const { base, home } = currentHome();
   const { latest, registry } = migratableSetup();

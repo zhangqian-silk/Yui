@@ -542,7 +542,13 @@ function fakeSpawn(config) {
       return okData({ version });
     }
     if (isDoctor) {
-      return config.doctor ?? spawnResult({ stdout: Buffer.from(JSON.stringify({ ok: true, data: {} })) });
+      // The real `--json doctor` returns { checks, storage: { healthy, blocking } };
+      // the post-verify parses storage.healthy (P1-3). Default to healthy unless a
+      // test overrides config.doctor to inject an unhealthy or unparseable result.
+      return config.doctor ?? okData({
+        checks: [{ name: "storage state", status: "ok", detail: "readable" }],
+        storage: { healthy: true, blocking: [] }
+      });
     }
     if (isUpgrade) {
       return config.activate ?? okData({ outcome: "already-current" });

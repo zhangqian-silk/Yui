@@ -60,5 +60,7 @@ export function describeReport(report: MigrationReport): string {
       return `Migrated through ${report.steps.length} step(s); source backed up at ${report.switch.backupPath ?? "(unspecified)"}.`;
     case "failed":
       return `Migration failed at ${report.stage}: ${report.error} Source is unchanged; delete any partial output and retry.`;
+    case "switch-ambiguous":
+      return `Migration switch is AMBIGUOUS: ${report.error} Recover from the backup at ${report.backupPath}.`;
   }
 }

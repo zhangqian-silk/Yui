@@ -34,7 +34,8 @@ import { join } from "node:path";
 
 import { runtimeError } from "../errors/cliError.js";
 import { inspectStorageSchema } from "../storage/storageSchema.js";
-import { readUpgradeReceipt } from "../storage/upgrade/upgradeOrchestrator.js";
+import { correlateUpgradeReceipt } from "../storage/upgrade/upgradeOrchestrator.js";
+import { readSwitchProgress } from "../storage/upgrade/switchProgress.js";
 import type {
   StagedPackage,
   StorageActivation,
@@ -122,6 +123,11 @@ export function createUpdatePorts(
         { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
       );
       assertSpawnOk(doctor, "run the post-update health check");
+      // POST-VERIFY PARSES THE MACHINE-READABLE RESULT (P1-3). A zero exit is
+      // necessary but NOT sufficient: parse doctor's structured storage-health
+      // verdict and fail closed on any unsupported / corrupted / uninitialized /
+      // version-mismatch storage check, even when the process exited 0.
+      assertDoctorStorageHealthy(doctor);
 
       // 2) Confirm the activated binary's identity matches the staged artifact;
       // a mismatch (e.g. staged A but @latest moved to B) fails closed.
@@ -138,13 +144,36 @@ export function createUpdatePorts(
     },
 
     probeStorage(home: string): StorageStateProbe {
-      // Resolve an ambiguous activation from durable on-disk evidence (P1-2).
-      const receipt = readUpgradeReceipt(home);
+      // Resolve an ambiguous activation from durable on-disk evidence (P1-2),
+      // but only trust a receipt that CORRESPONDS to the current Home/backup
+      // (P2-6): a leftover receipt from a prior attempt, a different Home, or one
+      // whose backup was already restored/cleaned is NOT evidence that THIS
+      // attempt's switch committed. When it does not correspond, fall back to the
+      // on-disk schema and report `switched: false` so the caller re-probes the
+      // real state instead of giving a recovery instruction from a stale receipt.
       const schema = inspectStorageSchema(home);
+      // A partially-applied, interrupted switch (P1-4) is the strongest signal:
+      // the original was moved to the backup and neither promotion nor rollback
+      // completed, so the Home path may be missing. Surface it explicitly with the
+      // backup so the caller reports a restore, not a "verify the migrated Home".
+      const interrupted = readSwitchProgress(home);
+      if (interrupted !== null && interrupted.phase === "interrupted") {
+        return {
+          switched: false,
+          interrupted: true,
+          schemaCurrent: schema.status === "current",
+          backupPath: interrupted.backupPath
+        };
+      }
+      const correlation = correlateUpgradeReceipt(home);
+      if (!correlation.corresponds) {
+        return { switched: false, schemaCurrent: schema.status === "current" };
+      }
+      const receipt = correlation.receipt;
       return {
-        switched: receipt !== null,
+        switched: true,
         schemaCurrent: schema.status === "current",
-        ...(receipt?.backupPath === undefined ? {} : { backupPath: receipt.backupPath })
+        ...(receipt.backupPath === undefined ? {} : { backupPath: receipt.backupPath })
       };
     },
 
@@ -160,6 +189,19 @@ function interpretPreflight(result: SpawnSyncReturns<Buffer>): UpdatePreflight {
   const parsed = parseJsonResult(result);
   const data = parsed?.data as Record<string, unknown> | undefined;
   const outcome = typeof data?.outcome === "string" ? data.outcome : undefined;
+  // EXIT/OUTCOME CONSISTENCY (P1-2): preflight is read-only, but a success-class
+  // outcome paired with a non-zero exit is still a violated contract. Treat it as
+  // blocked (do NOT proceed to a switch on an inconsistent green preflight).
+  if ((outcome === "already-current" || outcome === "dry-run") && result.status !== 0) {
+    return {
+      status: "blocked",
+      stage: "preflight",
+      message:
+        `The staged binary reported outcome=${outcome} but exited with status `
+        + `${result.status ?? "null"}; a safe preflight must exit 0. Refusing to proceed.`,
+      action: "Investigate the staged binary; do not force an update on an inconsistent preflight."
+    };
+  }
   if (outcome === "already-current") return { status: "already-current" };
   if (outcome === "dry-run") {
     return { status: "migratable", summary: describe(data) };
@@ -199,6 +241,21 @@ function interpretActivation(result: SpawnSyncReturns<Buffer>): StorageActivatio
   }
   const data = parsed.data as Record<string, unknown> | undefined;
   const outcome = typeof data?.outcome === "string" ? data.outcome : undefined;
+  // EXIT STATUS / OUTCOME CONSISTENCY (P1-2)
+  // A success-class outcome is only trustworthy when the child ALSO exited 0. A
+  // contradiction (e.g. stdout says `upgraded` but the process exited non-zero)
+  // means the child's own contract was violated mid-flight — the switch may or
+  // may not have committed — so it is AMBIGUOUS, never a false success. Blocker-
+  // class outcomes are exempt: `yui upgrade` deliberately exits non-zero (5) for
+  // a clean `blocked`, so a non-zero exit there is expected and consistent.
+  if ((outcome === "already-current" || outcome === "upgraded") && result.status !== 0) {
+    return {
+      status: "ambiguous",
+      detail:
+        `the activation process reported outcome=${outcome} but exited with status `
+        + `${result.status ?? "null"} (a success outcome must exit 0); the switch state is unknown`
+    };
+  }
   if (outcome === "already-current") return { status: "already-current" };
   if (outcome === "upgraded") {
     return {
@@ -207,9 +264,23 @@ function interpretActivation(result: SpawnSyncReturns<Buffer>): StorageActivatio
     };
   }
   if (outcome === "blocked") {
+    const stage = typeof data?.stage === "string" ? data.stage : "activate-storage";
+    // A `switch-ambiguous` blocker is NOT a clean, recoverable refusal (P1-4):
+    // the upgrade's atomic switch was left partially applied (original moved to
+    // backup, promotion + rollback both failed). Route it to AMBIGUOUS so the
+    // orchestrator probes the interrupted marker and reports a restore, never a
+    // false "the current install and Home remain usable".
+    if (stage === "switch-ambiguous") {
+      return {
+        status: "ambiguous",
+        detail: typeof data?.message === "string"
+          ? data.message
+          : "the storage switch was left partially applied"
+      };
+    }
     return {
       status: "blocked",
-      stage: typeof data?.stage === "string" ? data.stage : "activate-storage",
+      stage,
       message: typeof data?.message === "string" ? data.message : "Storage activation was refused.",
       action: typeof data?.action === "string"
         ? data.action
@@ -306,6 +377,43 @@ function describe(data: Record<string, unknown> | undefined): string {
   const report = data?.report as Record<string, unknown> | undefined;
   const steps = Array.isArray(report?.steps) ? report?.steps.length : 0;
   return `${steps} migration step(s) validated`;
+}
+
+/**
+ * Fail closed unless the doctor result proves the migrated Home's storage is
+ * healthy (P1-3). Parses the machine-readable `{ ok, data: { storage } }`
+ * envelope and throws when storage is unhealthy — or when the result cannot be
+ * parsed at all, since an unverifiable health check must not pass silently.
+ */
+function assertDoctorStorageHealthy(result: SpawnSyncReturns<Buffer>): void {
+  const parsed = parseJsonResult(result);
+  const data = parsed?.data as Record<string, unknown> | undefined;
+  const storage = data?.storage as
+    | { healthy?: unknown; blocking?: unknown }
+    | undefined;
+  if (storage === undefined || typeof storage.healthy !== "boolean") {
+    throw runtimeError(
+      "Post-update health check failed: the activated binary's `doctor` did not return a "
+        + "parseable storage-health result, so the migrated Home cannot be confirmed healthy. "
+        + "Investigate with `yui doctor` before resuming; if storage was migrated, restore the "
+        + "timestamped backup to recover."
+    );
+  }
+  if (storage.healthy !== true) {
+    const blocking = Array.isArray(storage.blocking) ? storage.blocking : [];
+    const detail = blocking
+      .map((check) => {
+        const record = check as Record<string, unknown>;
+        return `${String(record.name)}=${String(record.status)} (${String(record.detail)})`;
+      })
+      .join("; ");
+    throw runtimeError(
+      "Post-update health check failed: the migrated Home is not healthy per the activated "
+        + `binary's doctor: ${detail || "(no detail)"}. The storage did not come up cleanly on `
+        + "the new version. Restore the timestamped backup to recover the original Home before "
+        + "resuming writes."
+    );
+  }
 }
 
 function assertSpawnOk(result: SpawnSyncReturns<Buffer>, action: string): void {

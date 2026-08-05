@@ -35,6 +35,59 @@ export type DoctorCheck = Readonly<{
   detail: string;
 }>;
 
+/**
+ * The storage-relevant doctor checks, in the order they are produced. Post-update
+ * verification (P1-3) keys off exactly these: a green `yui doctor` for the update
+ * flow means every one of these is `ok`. Tool/agent checks are diagnostic only
+ * and never block an update.
+ */
+export const STORAGE_DOCTOR_CHECK_NAMES = Object.freeze([
+  "storage schema",
+  "storage compatibility",
+  "storage state"
+] as const);
+
+/** A machine-readable summary of storage health, embedded in `--json doctor`. */
+export type StorageHealthSummary = Readonly<{
+  /** True iff every storage check is `ok`. */
+  healthy: boolean;
+  /** The storage checks that are not `ok` (empty when healthy). */
+  blocking: readonly DoctorCheck[];
+}>;
+
+/** The full machine-readable doctor result surfaced by `yui --json doctor`. */
+export type DoctorReport = Readonly<{
+  checks: readonly DoctorCheck[];
+  storage: StorageHealthSummary;
+}>;
+
+/**
+ * Classify the storage checks into a machine-readable health verdict. This is the
+ * canonical, parseable signal the update post-verify consumes (P1-3): storage is
+ * healthy only when schema, compatibility, and state are all `ok`. Any
+ * `unsupported` (version mismatch / needs-new-version), `invalid` (corrupted /
+ * unreadable), or `missing` (uninitialized) storage check is blocking — even
+ * though `yui doctor` itself exits 0.
+ */
+export function summarizeStorageHealth(
+  checks: readonly DoctorCheck[]
+): StorageHealthSummary {
+  const names = new Set<string>(STORAGE_DOCTOR_CHECK_NAMES);
+  const blocking = checks.filter(
+    (check) => names.has(check.name) && check.status !== "ok"
+  );
+  return { healthy: blocking.length === 0, blocking };
+}
+
+/** Build the full machine-readable doctor report (checks + storage health). */
+export function buildDoctorReport(
+  env: NodeJS.ProcessEnv,
+  executor: CommandExecutor
+): DoctorReport {
+  const checks = getDoctorChecks(env, executor);
+  return { checks, storage: summarizeStorageHealth(checks) };
+}
+
 type StorageInspection = Readonly<{
   check: DoctorCheck;
   agents: readonly ConfiguredAgent[];

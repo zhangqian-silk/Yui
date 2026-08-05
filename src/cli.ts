@@ -76,7 +76,7 @@ import { cleanControllerResource } from "./controller/resourceCleanupLinux.js";
 import { scanControllerResourceInventory } from "./controller/resourceInventoryLinux.js";
 import { runSessionNotifyCommand } from "./controller/sessionNotify.js";
 import { runClaudeLifecycleHookCommand } from "./controller/claudeLifecycleHook.js";
-import { runDoctorCommand } from "./doctor/doctor.js";
+import { buildDoctorReport, renderDoctor, runDoctorCommand } from "./doctor/doctor.js";
 import { agentNotFound, CliError, runtimeError, usageError } from "./errors/cliError.js";
 import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
 import {
@@ -192,7 +192,24 @@ export async function main(): Promise<void> {
     return;
   }
   if (args[0] === "doctor") {
-    emit(runDoctorCommand(args.slice(1), process.env, new NodeCommandExecutor()));
+    const doctorArgs = args.slice(1);
+    if (doctorArgs.length !== 0) {
+      // Preserve the usage error for stray operands (parity with text mode).
+      runDoctorCommand(doctorArgs, process.env, new NodeCommandExecutor());
+      return;
+    }
+    const report = buildDoctorReport(process.env, new NodeCommandExecutor());
+    if (jsonOutput) {
+      // Machine-readable result: the full checks array + a storage-health verdict
+      // the update post-verify parses (P1-3). Exit non-zero when storage is not
+      // healthy so even a naive exit-code check fails closed. This exit-code
+      // signal is scoped to the --json path; text-mode doctor keeps its existing
+      // presentation and exit 0 (the WorkItem allows doctor's presentation to stay).
+      if (!report.storage.healthy) process.exitCode = 5;
+      emit("", false, report);
+      return;
+    }
+    emit(renderDoctor(report.checks));
     return;
   }
   if (args[0] === "upgrade") {

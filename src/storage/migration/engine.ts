@@ -25,16 +25,17 @@
 import { planMigration } from "./planner.js";
 import type { MigrationRegistry } from "./registry.js";
 import { collectEffects, toStepSummary } from "./report.js";
-import type {
-  DerivedStateSummary,
-  MigrationMode,
-  MigrationReport,
-  MigrationStage,
-  MigrationTarget,
-  PlannedStep,
-  StepSummary,
-  StorageVersionState,
-  ValidationSummary
+import {
+  AmbiguousSwitchError,
+  type DerivedStateSummary,
+  type MigrationMode,
+  type MigrationReport,
+  type MigrationStage,
+  type MigrationTarget,
+  type PlannedStep,
+  type StepSummary,
+  type StorageVersionState,
+  type ValidationSummary
 } from "./types.js";
 
 export type RunMigrationOptions<Snapshot> = Readonly<{
@@ -136,6 +137,23 @@ export function runMigration<Snapshot>(
       switch: switched
     };
   } catch (error) {
+    // A partially-applied, ambiguous switch is NOT a clean "source unchanged"
+    // failure: the original was moved aside and could not be restored. Surface it
+    // as its own outcome so the orchestrator reports a truthful manual recovery
+    // instead of a false "unchanged" (P1-4).
+    if (error instanceof AmbiguousSwitchError) {
+      return {
+        outcome: "switch-ambiguous",
+        mode,
+        source,
+        target: latest,
+        steps: stepSummaries,
+        homePath: error.homePath,
+        backupPath: error.backupPath,
+        stagingPath: error.stagingPath,
+        error: error.message
+      };
+    }
     return {
       outcome: "failed",
       mode,

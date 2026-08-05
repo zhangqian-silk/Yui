@@ -94,17 +94,32 @@ staged copy, prints the report, and discards it without switching. `yui upgrade`
 refuse to start), drains the Controller with the public `controller.stop`,
 re-pins the committed revision under the write lock, migrates into a fresh
 staged home, validates it, then atomically switches into place with a
-timestamped backup and a post-switch health check. Quiesce **fails closed on any
+timestamped backup and a post-switch health check. **Fence acquisition is a
+single atomic file create**, so two concurrent upgraders never both acquire —
+exactly one wins and the other fails closed (a provably-dead owner's stale fence
+is reclaimed). An **uninitialized home** (never `yui setup`) returns a structured
+"run `yui setup`" blocker rather than a silent no-op. Quiesce **fails closed on any
 undeterminable signal**: a `.state.lock` that exists but whose owner is
 missing/empty/non-integer/unreadable (a writer may be mid-acquisition), or a
 malformed `runtime/controller.json`, is treated as an active runtime and blocks
 the upgrade; only a provably-absent lock or a clearly-dead owner is safe to
-proceed past. Any failed or blocked step
-leaves the authoritative home byte-for-byte unchanged and reports the exact
-blocker stage and recovery action. It never converts a real home in this
-release (the registry is empty), and Yui never dual-reads an older schema or
-guesses an old identifier. See [Task-local identity](docs/task-local-identity.md)
-for the current reference contract.
+proceed past.
+
+The migration only transforms `schema.json` + `state.json`, but because the
+atomic switch replaces the whole home directory, **staging carries a complete
+copy of the home** — `runtime/`, `runtime/inbox/*` (authoritative), `cache/`, and
+`artifacts/` are all preserved through the switch and retained in the backup, with
+no silent loss (the transient `.state.lock` is the sole exception). The switch is
+two renames with one non-atomic window; a second-rename failure first attempts an
+automatic rollback, and only if that rollback **also** fails is the home reported
+as partially switched (a distinct `switch-ambiguous` blocker with the exact
+`mv "<backup>" "<home>"` recovery) — it never falsely claims the home is unchanged.
+Any other failed or blocked step leaves the authoritative home byte-for-byte
+unchanged and reports the exact blocker stage and recovery action. It never
+converts a real home in this release (the registry is empty), and Yui never
+dual-reads an older schema or guesses an old identifier. See
+[Task-local identity](docs/task-local-identity.md) for the current reference
+contract.
 
 Schema work across Tasks is not serialized: any Task may advance a version axis
 (`layout`, `aggregate`, or a `record` family) on its own isolated branch without
@@ -644,8 +659,13 @@ storage (atomically, with a timestamped backup) and promote the binary, running
 a new-binary health check last. It promotes the **same artifact it staged**
 (binary activation pins the exact staged version, never a second bare `@latest`),
 and the health check runs the **actually-activated** global binary and verifies
-its version matches the staged one — a mismatch fails closed. On any failure it
-reports the exact phase and a recovery action.
+its version matches the staged one — a mismatch fails closed. A success-class
+child result is trusted **only when the process also exited 0**: an `upgraded`
+outcome paired with a non-zero exit (or an exit 0 with no recognized outcome) is
+treated as ambiguous/blocked, never a false success. The post-update health check
+**parses the machine-readable `yui --json doctor` result** and fails closed on any
+unsupported/corrupted/uninitialized/version-mismatch storage check even when
+`doctor` exits 0. On any failure it reports the exact phase and a recovery action.
 
 If the storage-activation step cannot be resolved — the spawned staged binary was
 killed or crashed after switching but before reporting — `yui update` reports a
@@ -653,7 +673,10 @@ distinct **ambiguous** result (a dedicated non-zero exit), never a false
 "unchanged/recoverable". A durable completion receipt written the instant the
 switch commits (a `<home>.upgrade-receipt.json` sibling, cleared on clean
 success) lets it resolve the true state from receipt + backup + current schema
-and print precise manual-verification steps.
+and print precise manual-verification steps. The receipt records the home and
+backup it belongs to, so a **leftover receipt that names a different home or whose
+backup no longer exists** is not trusted as proof of this attempt's switch — the
+tool re-probes the real on-disk state instead.
 
 Rollback boundary (precise): this release does **not** introduce a versioned
 binary pointer or stable launcher, so it does **not** claim binary+home
