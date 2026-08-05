@@ -9,6 +9,7 @@ import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { createAgentProfile } from "../../dist/profile/agentProfile.js";
 import { runOperatorCommand } from "../../dist/commands/operatorCommands.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
+import { createTaskEvent } from "../../dist/event/taskEvent.js";
 import {
   bindExecution,
   claimPending,
@@ -21,6 +22,7 @@ import {
   updateRoleStatus
 } from "../../dist/role/role.js";
 import { createAgentRun, failAgentRun } from "../../dist/run/agentRun.js";
+import { createLeaderStallNotification } from "../../dist/scheduler/operatorNotification.js";
 import {
   markYuiRunInput,
   retagYuiRunInput,
@@ -138,6 +140,56 @@ function recordReadyNativeSession(store, taskId, roleName, nativeSessionId) {
   }, NOW);
   store.saveTaskRoleSessionSet(sessions);
 }
+
+test("CLI yield clears matching Leader stall attention and rejects duplicate terminalization", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Recover Leader attention");
+  run(["activate", task.id], store, options);
+  run(["work", "create", task.id, "Leader recovery"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  const active = dispatchTestRun(store, task.id, "leader", item.id);
+  markDelivered(store, active);
+  store.transaction((tx) => {
+    tx.saveEvent(task.id, createTaskEvent(
+      tx.nextEventId(task.id),
+      "run.stalled",
+      {
+        runId: active.id,
+        roleName: "leader",
+        kind: "execution-stalled",
+        classification: "truly-stalled",
+        progressAt: active.createdAt,
+        idleMs: "1800000",
+        evidenceKey: "cli-yield-test",
+        status: "needs-attention"
+      },
+      NOW
+    ));
+    tx.saveOperatorNotification(createLeaderStallNotification(
+      task.id,
+      active.id,
+      active.createdAt,
+      "cli-yield-test",
+      NOW,
+      null
+    ));
+  });
+
+  run(["run", "yield", active.id, "--summary", "Leader recovered"], store, options);
+  assert.equal(store.getOperatorNotification(task.id), null);
+  assert.equal(store.getActiveAgentRun(task.id, "leader"), null);
+  assert.equal(
+    store.listEvents(task.id).filter(({ type, payload }) => (
+      type === "run.recovered" && payload.runId === active.id
+    )).length,
+    1
+  );
+  assert.throws(
+    () => run(["run", "yield", active.id, "--summary", "duplicate"], store, options),
+    /already terminal/u
+  );
+  assert.equal(store.getOperatorNotification(task.id), null);
+});
 
 test("Work Item rejection and cancellation close the acceptance loop without new states", (t) => {
   const { store, options } = fixture(t);

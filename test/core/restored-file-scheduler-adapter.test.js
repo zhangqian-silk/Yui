@@ -8,6 +8,7 @@ import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerSt
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
 import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
+import { createTaskEvent } from "../../dist/event/taskEvent.js";
 import { updateRoleAgentSessionStatus } from "../../dist/executor/agentExecutor.js";
 import {
   createGlobalRole,
@@ -20,6 +21,7 @@ import { processActiveRoleRunDeliveries } from "../../dist/scheduler/activeRoleR
 import { processLeaderWakeups } from "../../dist/scheduler/leaderWakeupProcessor.js";
 import { processOperatorInputNotifications } from "../../dist/scheduler/operatorInputNotificationProcessor.js";
 import { reconcileStalledRoleRuns } from "../../dist/scheduler/roleRunStall.js";
+import { createLeaderStallNotification } from "../../dist/scheduler/operatorNotification.js";
 import { queueLeaderWakeup } from "../../dist/scheduler/wakeupQueue.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
@@ -50,6 +52,35 @@ function fixture(t) {
     queueLeaderWakeup(tx, task.id, "task-created", now);
   });
   return { home, store, task, role, now, adapter: new FileSchedulerStoreAdapter(store) };
+}
+
+function seedLeaderStall(store, task, run, now) {
+  store.transaction((tx) => {
+    const progressAt = run.createdAt;
+    tx.saveEvent(task.id, createTaskEvent(
+      tx.nextEventId(task.id),
+      "run.stalled",
+      {
+        runId: run.id,
+        roleName: run.roleName,
+        kind: "execution-stalled",
+        classification: "truly-stalled",
+        progressAt,
+        idleMs: "1800000",
+        evidenceKey: "provider-neutral-test",
+        status: "needs-attention"
+      },
+      now
+    ));
+    tx.saveOperatorNotification(createLeaderStallNotification(
+      task.id,
+      run.id,
+      progressAt,
+      "provider-neutral-test",
+      now,
+      null
+    ));
+  });
 }
 
 test("FileSchedulerStoreAdapter commits Leader run, Role and fixed session together", (t) => {
@@ -110,6 +141,147 @@ test("Leader delivery stall is routed through the existing Operator notification
   assert.equal(store.getOperatorNotification(task.id).type, "leader-stalled");
   const operatorMailbox = store.getWorkMailbox({ kind: "operator" });
   assert.equal(operatorMailbox.pending.reasons.includes("leader-run-stalled"), true);
+});
+
+test("adapter delivery progress ignores a newer Work Item timestamp before acceptance", async (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  const createdAt = new Date(now.getTime() - 60 * 60_000);
+  const item = updateWorkItemStatus(createWorkItem(
+    "work-item-delivery-clock",
+    task.id,
+    { title: "Delivery boundary" },
+    createdAt
+  ), "running", new Date(now.getTime() - 60_000));
+  const run = createAgentRun(
+    "agent-run-delivery-clock",
+    task.id,
+    role.name,
+    "new",
+    "continue",
+    createdAt,
+    { workItemId: item.id }
+  );
+  store.transaction((tx) => {
+    tx.saveWorkItem(task.id, item);
+    tx.saveAgentRun(run);
+    tx.saveActiveAgentRun(run);
+  });
+
+  const progress = adapter.getRunDurableProgress(task.id, role.name, run.id);
+  assert.equal(progress.progressAt, createdAt.toISOString());
+  assert.equal(progress.evidence, "work-review-integration");
+  const result = await reconcileStalledRoleRuns(
+    adapter,
+    { async inspectRole() { return "present"; } },
+    now,
+    undefined,
+    30 * 60_000
+  );
+  assert.equal(result[0].kind, "delivery-stalled");
+});
+
+test("native and Controller recovery clear only the matching Leader stall attention", (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  const run = createAgentRun("agent-run-native-recovery", task.id, role.name, "new", "continue", now);
+  assert.equal(adapter.saveLeaderDispatch({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: null,
+    wakeup: store.getPendingWakeup(task.id),
+    now
+  }), "claimed");
+  adapter.saveRoleRunDelivery({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: {
+      agentId: "codex",
+      adapterId: "codex",
+      nativeSessionId: "thread-native-recovery",
+      status: "ready"
+    },
+    now
+  });
+  seedLeaderStall(store, task, run, now);
+
+  const observed = adapter.observeRuntimeTurnCompleted({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "thread-native-recovery",
+    turnId: "turn-native-recovery",
+    runId: run.id,
+    summary: "native progress"
+  }, now);
+  assert.equal(observed.pendingRunId, run.id);
+  assert.equal(store.getOperatorNotification(task.id), null);
+
+  const duplicate = adapter.observeRuntimeTurnCompleted({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "thread-native-recovery",
+    turnId: "turn-native-recovery",
+    runId: run.id,
+    summary: "native progress"
+  }, now);
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(store.getOperatorNotification(task.id), null);
+
+  const controllerFixture = fixture(t);
+  const controllerStore = controllerFixture.store;
+  const controllerTask = controllerFixture.task;
+  const controllerRole = controllerFixture.role;
+  const controllerAdapter = controllerFixture.adapter;
+  const controllerNow = controllerFixture.now;
+  const controllerRun = {
+    ...createAgentRun(
+      "agent-run-controller-recovery",
+      controllerTask.id,
+      controllerRole.name,
+      "new",
+      "continue",
+      controllerNow
+    ),
+    deliveredAt: controllerNow.toISOString()
+  };
+  assert.equal(controllerAdapter.saveLeaderDispatch({
+    task: controllerTask,
+    role: controllerAdapter.getRole(controllerTask.id, controllerRole.name),
+    run: controllerRun,
+    session: {
+      agentId: "codex",
+      adapterId: "codex",
+      nativeSessionId: "thread-native-recovery",
+      status: "ready"
+    },
+    wakeup: controllerStore.getPendingWakeup(controllerTask.id),
+    now: controllerNow
+  }), "claimed");
+  controllerAdapter.saveRoleRunDelivery({
+    task: controllerTask,
+    role: controllerAdapter.getRole(controllerTask.id, controllerRole.name),
+    run: controllerRun,
+    session: {
+      agentId: "codex",
+      adapterId: "codex",
+      nativeSessionId: "thread-native-recovery",
+      status: "ready"
+    },
+    now: controllerNow
+  });
+  seedLeaderStall(controllerStore, controllerTask, controllerRun, controllerNow);
+  controllerAdapter.recoverReadyRoleRun({
+    taskId: controllerTask.id,
+    roleName: controllerRole.name,
+    runId: controllerRun.id,
+    now: controllerNow
+  });
+  assert.equal(controllerStore.getOperatorNotification(controllerTask.id), null);
+  assert.equal(controllerStore.getActiveAgentRun(controllerTask.id, controllerRole.name), null);
 });
 
 test("Leader dispatch rejects a stale launch configuration snapshot", (t) => {

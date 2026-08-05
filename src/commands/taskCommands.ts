@@ -13,6 +13,7 @@ import {
 } from "../errors/cliError.js";
 import { createTaskEvent, type TaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
 import {
+  clearMatchingLeaderStallAttention,
   isRoleRunStalled,
   RUN_PROGRESS_EVENT,
   RUN_RECOVERED_EVENT
@@ -2124,6 +2125,7 @@ function yieldRun(
         kind: "yield"
       }, now);
     }
+    clearMatchingLeaderStallAttention(tx, task.id, active.id);
     tx.saveAgentRun(terminal);
     requireCompleteWorkExecution(
       tx,
@@ -2267,11 +2269,8 @@ function checkpointRun(
         progressAt: now.toISOString(),
         kind: "checkpoint"
       }, now);
-      const notification = tx.getOperatorNotification(task.id);
-      if (notification?.type === "leader-stalled" && notification.runId === run.id) {
-        tx.clearOperatorNotification(task.id);
-      }
     }
+    clearMatchingLeaderStallAttention(tx, task.id, run.id);
     return progress;
   });
   return `Checkpoint recorded for ${parsed.positionals[0]} (${event.id}).\n`;

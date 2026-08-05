@@ -131,6 +131,27 @@ test("a live unaccepted Run is delivery-stalled without retrying or mutating its
   assert.deepEqual(store.messages, []);
 });
 
+test("an unaccepted Run keeps its delivery clock at creation despite newer related records", async () => {
+  const store = stallStore({ delivered: false });
+  store.getRunDurableProgress = () => ({
+    progressAt: "2026-08-05T00:55:00.000Z",
+    evidence: "work-review-integration"
+  });
+
+  const result = await reconcileStalledRoleRuns(
+    store,
+    { async inspectRole() { return "present"; } },
+    NOW,
+    undefined,
+    30 * 60_000
+  );
+
+  assert.equal(result[0].kind, "delivery-stalled");
+  const stalled = store.events.find((event) => event.type === "run.stalled");
+  assert.equal(stalled.payload.progressAt, PROGRESS);
+  assert.equal(result[0].idleMs, 60 * 60_000);
+});
+
 test("the same Run + progress point stays one episode while a missing pane is left to fenced liveness", async () => {
   const store = stallStore();
   const live = { async inspectRole() { return "present"; } };

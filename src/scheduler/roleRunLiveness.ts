@@ -56,11 +56,19 @@ export async function reconcileExitedRoleRuns(
     !excludedRunIds.has(run.id)
     && !completing.has(`${task.id}\0${role.name}\0${run.id}`)
   ));
-  if (eligible.length === 0) return failed;
-  const batchStatuses = liveStatuses === undefined || liveStatuses.size === 0
-    ? await inspectEligibleRoleStatuses(delivery, eligible)
-    : liveStatuses;
-  if (liveStatuses !== undefined && liveStatuses.size === 0) {
+  // Build one complete provider inventory for every active Run, including
+  // delivery-uncertain and completion-pending Runs. Those Runs are excluded
+  // only from destructive liveness transitions below; omitting them here
+  // would leave the shared stall pass with an incomplete snapshot and make a
+  // live-but-unaccepted Run invisible to delivery-stall attention.
+  const hasCompleteSharedSnapshot = liveStatuses !== undefined
+    && candidates.every(({ task, role }) => (
+      liveStatuses.has(roleIdentity(task.id, role.name))
+    ));
+  const batchStatuses = hasCompleteSharedSnapshot
+    ? liveStatuses
+    : await inspectRoleStatuses(delivery, candidates);
+  if (liveStatuses !== undefined) {
     for (const [key, status] of batchStatuses) liveStatuses.set(key, status);
   }
   for (const { task, role, run, session, inspection } of eligible) {
@@ -154,7 +162,7 @@ function activeRunCandidates(
   ));
 }
 
-async function inspectEligibleRoleStatuses(
+async function inspectRoleStatuses(
   delivery: Pick<TmuxDeliveryPort, "inspectRole" | "inspectRoles">,
   candidates: readonly RoleRunCandidate[]
 ): Promise<RoleLiveStatusSnapshot> {

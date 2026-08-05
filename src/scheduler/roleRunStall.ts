@@ -6,6 +6,7 @@ import {
   type SchedulerStorePort,
   type TmuxDeliveryPort
 } from "./ports.js";
+import type { OperatorNotification } from "./operatorNotification.js";
 import type { RoleLiveStatusSnapshot } from "./roleRunLiveness.js";
 
 /**
@@ -20,6 +21,31 @@ export const DEFAULT_EXECUTION_STALL_CANDIDATE_AGE_MS = 10 * 60_000;
 export const RUN_PROGRESS_EVENT = "run.progress";
 export const RUN_STALLED_EVENT = "run.stalled";
 export const RUN_RECOVERED_EVENT = "run.recovered";
+
+/** The smallest storage boundary needed to clear a resolved Leader stall. */
+export type LeaderStallAttentionStore = Readonly<{
+  getOperatorNotification(taskId: string): OperatorNotification | null;
+  clearOperatorNotification(taskId: string): void;
+}>;
+
+/**
+ * Clear only the Operator projection raised for this exact Leader Run. A
+ * later Run (or a recovery notification of another kind) must remain intact;
+ * callers use this helper from every supported recovery/terminalization path
+ * so attention cleanup cannot drift between CLI and runtime code.
+ */
+export function clearMatchingLeaderStallAttention(
+  store: LeaderStallAttentionStore,
+  taskId: string,
+  runId: string
+): boolean {
+  const notification = store.getOperatorNotification(taskId);
+  if (notification?.type !== "leader-stalled" || notification.runId !== runId) {
+    return false;
+  }
+  store.clearOperatorNotification(taskId);
+  return true;
+}
 
 export type RoleRunStallKind = "delivery-stalled" | "execution-stalled";
 export type RoleRunStallClassification =
@@ -386,14 +412,15 @@ export async function reconcileStalledRoleRuns(
           latestCheckpointAt,
           latestActivityAt: latestRunActivityAt(events, candidate.run.id)
         });
-    // Before exact acceptance there is no execution progress clock. The Run
-    // creation boundary is only the delivery-watch start; once accepted,
-    // deliveredAt is the semantic baseline and bookkeeping timestamps stay
-    // out of the fold.
-    const progressAt = richerProgress?.progressAt
-      ?? (candidate.run.deliveredAt === undefined
-        ? latestCheckpointAt ?? latestRunActivityAt(events, candidate.run.id) ?? candidate.run.createdAt
-        : fallbackProgressAt!);
+    // Before exact acceptance there is no execution progress clock. Keep the
+    // delivery watch anchored to the Run creation/transport boundary even if
+    // checkpoints, output, or related WorkItem/Review/Integration records are
+    // newer; those facts are useful evidence but cannot prove provider
+    // acceptance or reset delivery timeout. Once accepted, deliveredAt is the
+    // semantic baseline and the durable fold may advance it.
+    const progressAt = candidate.run.deliveredAt === undefined
+      ? candidate.run.createdAt
+      : richerProgress?.progressAt ?? fallbackProgressAt!;
     const evaluation = evaluateRoleRunStall({
       progressAt,
       now,

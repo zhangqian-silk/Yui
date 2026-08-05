@@ -53,6 +53,7 @@ import {
   latestRunProgressAt,
   latestStallEvidenceKey,
   isRoleRunStalled,
+  clearMatchingLeaderStallAttention,
   RUN_PROGRESS_EVENT,
   RUN_RECOVERED_EVENT,
   RUN_STALLED_EVENT
@@ -199,7 +200,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       ));
     const latestActivityAt = latestRunActivityAt(events, run.id);
     const progressAt = run.deliveredAt === undefined
-      ? latestCheckpointAt ?? latestActivityAt ?? run.createdAt
+      ? run.createdAt
       : latestDurableProgressAt({
           deliveredAt: run.deliveredAt,
           latestCheckpointAt,
@@ -219,9 +220,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       (latest, value) => latest === undefined || Date.parse(value) > Date.parse(latest) ? value : latest,
       undefined
     );
-    const finalProgressAt = latestRelatedAt === undefined
-      ? progressAt
-      : Date.parse(latestRelatedAt) > Date.parse(progressAt) ? latestRelatedAt : progressAt;
+    const finalProgressAt = run.deliveredAt === undefined
+      ? run.createdAt
+      : latestRelatedAt === undefined
+        ? progressAt
+        : Date.parse(latestRelatedAt) > Date.parse(progressAt) ? latestRelatedAt : progressAt;
     return {
       progressAt: finalProgressAt,
       ...(latestRelatedAt === undefined ? {} : { evidence: "work-review-integration" })
@@ -334,10 +337,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           },
           input.now
         ));
-        const notification = store.getOperatorNotification(task.id);
-        if (notification?.type === "leader-stalled" && notification.runId === run.id) {
-          store.clearOperatorNotification(task.id);
-        }
+        clearMatchingLeaderStallAttention(store, task.id, run.id);
       }
       return existing && !recovered ? "already-recorded" : "recorded";
     });
@@ -1264,6 +1264,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           now
         ));
       }
+      clearMatchingLeaderStallAttention(store, task.id, fence.runId);
       sessions = recordObservedTaskRoleCompletion(sessions, completion);
       const active = store.getActiveAgentRun(task.id, role.name);
       if (active === null || active.id !== fence.runId || active.status !== "active") {
@@ -1411,6 +1412,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         { runId: terminal.id, roleName: currentRole.name, summary },
         input.now
       ));
+      clearMatchingLeaderStallAttention(store, task.id, terminal.id);
       if (!completeWorkExecution(store, target, { type: "run", id: terminal.id })) {
         throw new Error(`Leader Run mailbox execution is inconsistent: ${terminal.id}.`);
       }
@@ -1677,6 +1679,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           now
         ));
       }
+      clearMatchingLeaderStallAttention(store, task.id, terminal.id);
       if (!completeWorkExecution(
         store,
         leaderTarget,
