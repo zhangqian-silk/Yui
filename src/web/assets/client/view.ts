@@ -749,7 +749,16 @@ function roleCard(role, task, t, locale, actions) {
   const card = node("article", "record-card");
   const head = node("div", "record-head");
   head.append(node("strong", "record-title", role.name));
-  head.append(pill(t, "role", role.status));
+  const headRight = node("div", "record-pills");
+  headRight.append(pill(t, "role", role.status));
+  const open = node("button", "record-open", "");
+  open.type = "button";
+  open.append(node("span", "", t("actions.openRun")), node("span", "arrow", "→"));
+  open.addEventListener("click", function () {
+    if (actions.openTerminal) actions.openTerminal({ scope: "task", taskId: task.id, roleName: role.name });
+  });
+  headRight.append(open);
+  head.append(headRight);
   card.append(head);
 
   const meta = node("div", "record-meta");
@@ -771,16 +780,6 @@ function roleCard(role, task, t, locale, actions) {
   }
   if (role.updatedAt) meta.append(node("time", "", formatDateTime(role.updatedAt, locale)));
   card.append(meta);
-
-  const actionsRow = node("div", "record-actions");
-  const open = node("button", "record-open", "");
-  open.type = "button";
-  open.append(node("span", "", t("actions.openRun")), node("span", "arrow", "→"));
-  open.addEventListener("click", function () {
-    if (actions.openTerminal) actions.openTerminal({ scope: "task", taskId: task.id, roleName: role.name });
-  });
-  actionsRow.append(open);
-  card.append(actionsRow);
 
   if (role.effectiveLaunch) {
     const eff = node("div", "record-meta");

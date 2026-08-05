@@ -328,8 +328,6 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .record-block p.muted,.record-block .muted{color:var(--muted)}
 .outcome-callout{border-left:2px solid var(--success);background:var(--success-soft);padding:9px 12px;border-radius:0 var(--radius) var(--radius) 0}
 .outcome-callout>small{color:var(--success)}
-.record-actions{display:flex;align-items:center;justify-content:flex-end;gap:12px;margin-top:2px}
-.record-actions .record-meta{margin:0}
 .record-open{flex:none;display:inline-flex;align-items:center;gap:6px;padding:7px 13px;color:var(--text);background:var(--bg-3);border:1px solid var(--border);border-radius:var(--radius);font-family:var(--font-body);font-size:12px;font-weight:600;transition:border-color var(--motion-fast),color var(--motion-fast),background var(--motion-fast)}
 .record-open:hover{border-color:var(--accent-line);color:var(--accent);background:var(--accent-soft)}
 .record-open .arrow{font-weight:400;color:var(--faint);transition:transform var(--motion-fast)}
