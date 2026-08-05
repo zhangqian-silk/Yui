@@ -711,6 +711,7 @@ function runCard(run, t, locale) {
   idRow.append(node("span", "role", run.roleName));
   idRow.append(node("span", "", run.id));
   if (run.workItemId) idRow.append(node("span", "", t("detail.workItem") + " · " + run.workItemId));
+  idRow.append(node("time", "", formatDateTime(run.updatedAt, locale)));
   card.append(idRow);
 
   const io = node("div", "execute-io");
@@ -740,7 +741,6 @@ function runCard(run, t, locale) {
     card.append(eff);
   }
 
-  card.append(node("time", "", formatDateTime(run.updatedAt, locale)));
   return card;
 }
 
