@@ -610,7 +610,10 @@ test("Controller atomically applies an expired Agent recommendation and resumes 
     choiceKey: "safe",
     text: "Safe rollout"
   });
-  assert.equal(store.listEvents(task.id).at(-1).type, "input.auto-answered");
+  assert.equal(
+    store.listEvents(task.id).some((event) => event.type === "input.auto-answered"),
+    true
+  );
 });
 
 test("targeted recommendation reconciliation does not mutate another Task", (t) => {

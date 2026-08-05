@@ -671,6 +671,32 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (active.deliveredAt === undefined) {
         store.saveAgentRun(markAgentRunDelivered(active, input.now));
         markTaskRoleRunDeliveredInFlight(store, role, input.run, input.now);
+        const wasStalled = isRoleRunStalled(store.listEvents(task.id), active.id);
+        store.saveEvent(task.id, createTaskEvent(
+          store.nextEventId(task.id),
+          RUN_PROGRESS_EVENT,
+          {
+            runId: active.id,
+            roleName: role.name,
+            kind: "delivery",
+            progressAt: input.now.toISOString()
+          },
+          input.now
+        ));
+        if (wasStalled) {
+          store.saveEvent(task.id, createTaskEvent(
+            store.nextEventId(task.id),
+            RUN_RECOVERED_EVENT,
+            {
+              runId: active.id,
+              roleName: role.name,
+              progressAt: input.now.toISOString(),
+              kind: "delivery"
+            },
+            input.now
+          ));
+        }
+        clearMatchingLeaderStallAttention(store, task.id, active.id);
       } else {
         const sessions = store.getTaskRoleSessionSet(input.task.id, input.role.name);
         if (sessions?.inFlight?.runId === input.run.id
@@ -1378,6 +1404,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           }
         }
         store.saveRole(task.id, updateRoleStatus(currentRole, "idle", input.now));
+        clearMatchingLeaderStallAttention(store, task.id, terminal.id);
         enqueueWork(store, {
           kind: "role",
           taskId: task.id,
@@ -1621,6 +1648,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           }
         }
         store.saveRole(task.id, updateRoleStatus(role, "idle", now));
+        clearMatchingLeaderStallAttention(store, task.id, terminal.id);
         enqueueWork(
           store,
           { kind: "role", taskId: task.id, roleName: "leader" },
