@@ -358,6 +358,7 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .execute-io>small{color:var(--text);font-family:var(--font-body);font-size:13px;font-weight:600;letter-spacing:-.005em}
 .execute-io p{margin:0;font-family:var(--font-body);font-size:12px;line-height:1.6;color:var(--text);max-height:6.2em;overflow-y:auto;padding-right:4px}
 .execute-io.outcome{border-left:2px solid var(--success);background:var(--success-soft);padding:9px 0 9px 12px;border-radius:0 var(--radius) var(--radius) 0}
+.execute-io.outcome>small{color:var(--success)}
 .execute-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding-top:4px}
 .execute-tags{display:flex;align-items:center;gap:6px;flex-wrap:wrap;color:var(--muted);font-family:var(--font-mono);font-size:10px;letter-spacing:.05em}
 .agent-badge{display:inline-flex;gap:5px;flex-wrap:wrap;align-items:center}
