@@ -543,8 +543,9 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
       head.append(pill(t, "review", round.status));
       card.append(head);
       const meta = node("div", "record-meta");
-      meta.append(node("span", "", round.reviewerRoleName));
+      meta.append(node("span", "meta-name", round.reviewerRoleName));
       meta.append(node("span", "mono", round.workItemId + " · " + round.candidateId));
+      if (round.createdAt) meta.append(node("time", "", formatDateTime(round.createdAt, locale)));
       meta.append(node("span", "", t("detail.reviewBase") + " · " + round.reviewBaseCommit));
       if (round.workspace && round.workspace.root) {
         meta.append(pathMetaItem(t("detail.workspace"), round.workspace.root));
@@ -752,12 +753,7 @@ function roleCard(role, task, t, locale, actions) {
   card.append(head);
 
   const meta = node("div", "record-meta");
-  if (role.updatedAt) meta.append(node("time", "", formatDateTime(role.updatedAt, locale)));
-  card.append(meta);
-
-  const actionsRow = node("div", "record-actions");
-  const left = node("div", "record-meta");
-  left.append(node("span", "", t("detail.desiredAgent") + " · " + role.activeAgentId));
+  meta.append(node("span", "meta-name", role.activeAgentId));
   const activeBinding = role.agentBindings && role.agentBindings[role.activeAgentId];
   if (activeBinding) {
     const badge = agentBadge({
@@ -765,16 +761,18 @@ function roleCard(role, task, t, locale, actions) {
       model: activeBinding.config && activeBinding.config.model,
       effort: activeBinding.config && activeBinding.config.effort
     });
-    if (badge) left.append(badge);
+    if (badge) meta.append(badge);
   }
   if (role.launchRevision !== undefined) {
-    left.append(node("span", "", t("detail.desired") + " · r" + role.launchRevision));
+    meta.append(node("span", "", t("detail.desired") + " · r" + role.launchRevision));
   }
   if (role.defaultAccess !== undefined) {
-    left.append(node("span", "", t("detail.profileIntent") + " · " + role.defaultAccess));
+    meta.append(node("span", "", t("detail.profileIntent") + " · " + role.defaultAccess));
   }
-  actionsRow.append(left);
+  if (role.updatedAt) meta.append(node("time", "", formatDateTime(role.updatedAt, locale)));
+  card.append(meta);
 
+  const actionsRow = node("div", "record-actions");
   const open = node("button", "record-open", "");
   open.type = "button";
   open.append(node("span", "", t("actions.openRun")), node("span", "arrow", "→"));
@@ -859,7 +857,7 @@ function historyEventRow(event, t, locale) {
   const meta = node("div", "record-meta");
   meta.append(node("span", "mono", decision.id));
   if (decision.createdAt) meta.append(node("time", "", formatDateTime(decision.createdAt, locale)));
-  if (decision.status) meta.append(node("span", "", decision.status));
+  if (decision.status) meta.append(pill(t, "decision", decision.status));
   card.append(meta);
   if (decision.rationale) card.append(copyBlock("", decision.rationale, { muted: true }));
   if (decision.supersededReason) card.append(copyBlock("", decision.supersededReason, { muted: true }));
