@@ -336,7 +336,7 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 /* Input attention cards */
 .input-card{border:1px solid var(--warning);background:var(--warning-soft);padding:11px 13px;border-radius:var(--radius);color:var(--text);display:grid;gap:8px}
 .input-card-top{display:grid;gap:5px}
-.input-card-top small{display:block;color:var(--warning);font-family:var(--font-mono);font-size:9px;text-transform:uppercase;letter-spacing:.11em;font-weight:600}
+.input-card-top small{display:block;color:var(--warning);font-family:var(--font-body);font-size:12.5px;font-weight:600;letter-spacing:-.005em}
 .input-question{font-family:var(--font-body);font-size:14px;font-weight:600;color:var(--text);line-height:1.35}
 .input-context{display:flex;gap:10px;flex-wrap:wrap;color:var(--muted);font-family:var(--font-body);font-size:11px}
 .input-blocked{display:block;padding:8px 12px;border:1px dashed var(--warning);border-radius:var(--radius);color:var(--muted);font-family:var(--font-mono);font-size:10.5px;letter-spacing:.04em}
