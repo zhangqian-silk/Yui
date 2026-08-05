@@ -14,6 +14,7 @@ import {
 } from "../../dist/coordination/workMailbox.js";
 import { runTaskInputCommand } from "../../dist/commands/taskInputCommands.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
+import { createTaskEvent } from "../../dist/event/taskEvent.js";
 import { runControllerSchedulerPass } from "../../dist/controller/controller.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
 import {
@@ -33,6 +34,7 @@ import {
 } from "../../dist/role/role.js";
 import { createAgentRun } from "../../dist/run/agentRun.js";
 import { processLeaderWakeups } from "../../dist/scheduler/leaderWakeupProcessor.js";
+import { createLeaderStallNotification } from "../../dist/scheduler/operatorNotification.js";
 import { mergePendingWakeup } from "../../dist/scheduler/pendingWakeup.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
@@ -306,6 +308,31 @@ test("Leader request releases its active fence and answer durably queues a resum
     assignee: "leader"
   }, FIRST);
   store.saveWorkItem(task.id, work);
+  store.transaction((tx) => {
+    tx.saveEvent(task.id, createTaskEvent(
+      tx.nextEventId(task.id),
+      "run.stalled",
+      {
+        runId: active.id,
+        roleName: "leader",
+        kind: "execution-stalled",
+        classification: "truly-stalled",
+        progressAt: active.createdAt,
+        idleMs: "1800000",
+        evidenceKey: "input-request-test",
+        status: "needs-attention"
+      },
+      FIRST
+    ));
+    tx.saveOperatorNotification(createLeaderStallNotification(
+      task.id,
+      active.id,
+      active.createdAt,
+      "input-request-test",
+      FIRST,
+      null
+    ));
+  });
 
   run([
     "input", "request", task.id,
@@ -325,9 +352,17 @@ test("Leader request releases its active fence and answer durably queues a resum
   assert.equal(store.getActiveAgentRun(task.id, "leader"), null);
   assert.equal(store.getAgentRun(task.id, active.id).status, "yielded");
   assert.match(store.getAgentRun(task.id, active.id).summary, new RegExp(request.id));
+  const recovered = store.listEvents(task.id).find((event) => (
+    event.type === "run.recovered" && event.payload.runId === active.id
+  ));
+  assert.equal(recovered.payload.kind, "input-request");
+  assert.equal(store.getOperatorNotification(task.id), null);
   assert.equal(store.getRole(task.id, "leader").status, "idle");
   assert.equal(store.getRoleSession(task.id, "leader").status, "ready");
   assert.equal(store.getTaskRoleSessionSet(task.id, "leader").inFlight, null);
+  assert.equal(store.listEvents(task.id).filter(({ type, payload }) => (
+    type === "run.recovered" && payload.runId === active.id
+  )).length, 1);
   assert.equal(store.listEvents(task.id).at(-1).type, "input.requested");
   const operatorMailbox = store.getWorkMailbox({ kind: "operator" });
   assert.deepEqual(operatorMailbox.pending.reasons, ["input-requested"]);
@@ -355,6 +390,32 @@ test("Leader request releases its active fence and answer durably queues a resum
     { encoding: "utf8", env: { ...process.env, YUI_HOME: root } }
   ));
   assert.deepEqual(json, { ok: true, data: { requests: [answer.data.request] } });
+});
+
+test("input request recovery preserves a newer Leader attention and is idempotent", (t) => {
+  const { store, task, active, options } = fixture(t);
+  const newerRunId = "agent-run-newer";
+  store.transaction((tx) => {
+    tx.saveOperatorNotification(createLeaderStallNotification(
+      task.id,
+      newerRunId,
+      active.createdAt,
+      "newer-run",
+      FIRST,
+      null
+    ));
+  });
+
+  run(["input", "request", task.id, "--question", "Proceed?"], store, options);
+  assert.equal(store.getOperatorNotification(task.id).runId, newerRunId);
+  assert.equal(store.listEvents(task.id).filter(({ type }) => type === "run.recovered").length, 0);
+
+  assert.throws(
+    () => runTaskCommand(["input", "request", task.id, "--question", "Duplicate?"], store, options),
+    /requires the active Leader Run environment/u
+  );
+  assert.equal(store.getOperatorNotification(task.id).runId, newerRunId);
+  assert.equal(store.listEvents(task.id).filter(({ type }) => type === "run.recovered").length, 0);
 });
 
 test("first Leader run can request input before a native session id is registered", (t) => {

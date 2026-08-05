@@ -1445,6 +1445,7 @@ test("runtime native session registration is structured and exited work fails at
   });
   const deliveredAt = new Date(now.getTime() + 1_000).toISOString();
   store.saveActiveAgentRun({ ...run, deliveredAt });
+  seedLeaderStall(store, task, { ...run, deliveredAt }, now);
 
   assert.equal(adapter.saveExitedRoleRun({
     task,
@@ -1461,11 +1462,22 @@ test("runtime native session registration is structured and exited work fails at
   assert.equal(store.getWorkItem(task.id, item.id).status, "failed");
   assert.equal(store.getRole(task.id, role.name).status, "exited");
   assert.equal(store.getRoleSession(task.id, role.name).status, "stopped");
+  assert.equal(store.getOperatorNotification(task.id), null);
   assert.equal(
     store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: role.name }).processing,
     null
   );
   assert.ok(store.getPendingWakeup(task.id).reasons.includes("leader-run-failed"));
+
+  assert.equal(adapter.saveExitedRoleRun({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: adapter.getRoleSession(task.id, role.name),
+    summary: "duplicate pane absence",
+    now
+  }), "state-changed");
+  assert.equal(store.getOperatorNotification(task.id), null);
 
   const replacement = createAgentRun(
     "agent-run-replacement",
@@ -1490,6 +1502,14 @@ test("runtime native session registration is structured and exited work fails at
     now,
     executionRef: { type: "run", id: replacement.id }
   });
+  store.saveOperatorNotification(createLeaderStallNotification(
+    task.id,
+    replacement.id,
+    replacement.createdAt,
+    "newer-run",
+    now,
+    null
+  ));
 
   assert.equal(adapter.saveExitedRoleRun({
     task,
@@ -1500,6 +1520,7 @@ test("runtime native session registration is structured and exited work fails at
     now
   }), "state-changed");
   assert.equal(store.getActiveAgentRun(task.id, role.name).id, replacement.id);
+  assert.equal(store.getOperatorNotification(task.id).runId, replacement.id);
 });
 
 test("reconfirming an already delivered active run does not rewrite authoritative state", (t) => {

@@ -22,6 +22,11 @@ import { updateRoleStatus, type Role } from "../role/role.js";
 import { yieldAgentRun, type AgentRun } from "../run/agentRun.js";
 import { enqueueWork, requireCompleteWorkExecution } from "../coordination/workMailboxQueue.js";
 import type { MailboxTarget } from "../coordination/workMailbox.js";
+import {
+  clearMatchingLeaderStallAttention,
+  isRoleRunStalled,
+  RUN_RECOVERED_EVENT
+} from "../scheduler/roleRunStall.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
 
@@ -117,6 +122,7 @@ function createRequest(
       { question, choices, blockedRefs, policy },
       now
     );
+    const wasStalled = isRoleRunStalled(tx.listEvents(task.id), origin.run.id);
     tx.saveInputRequest(task.id, created);
     enqueueWork(tx, { kind: "operator" }, "input-requested", now, [
       { type: "input", id: created.id },
@@ -127,6 +133,15 @@ function createRequest(
       `Waiting for input ${created.id}: ${created.question}`,
       now
     ));
+    if (wasStalled) {
+      recordTaskEvent(tx, task.id, RUN_RECOVERED_EVENT, {
+        runId: origin.run.id,
+        roleName: LEADER_ROLE,
+        progressAt: now.toISOString(),
+        kind: "input-request"
+      }, now);
+    }
+    clearMatchingLeaderStallAttention(tx, task.id, origin.run.id);
     requireCompleteWorkExecution(
       tx,
       { kind: "role", taskId: task.id, roleName: LEADER_ROLE },

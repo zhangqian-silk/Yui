@@ -831,6 +831,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         return "state-changed";
       }
       store.saveAgentRun(failAgentRun(currentRun, input.summary, input.now));
+      clearMatchingLeaderStallAttention(store, task.id, currentRun.id);
       store.clearActiveAgentRun(task.id, role.name);
       clearTaskRoleRunInFlight(store, role, currentRun, input.now);
       store.saveWorkMailbox(completeProcessing(mailbox, mailbox.processing.batchId));
