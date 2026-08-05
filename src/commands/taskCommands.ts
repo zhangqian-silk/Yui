@@ -160,6 +160,13 @@ export type TaskCommandOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
   yuiHome?: string;
   workItemIntegrationProof?: WorkItemIntegrationProof;
+  /**
+   * The foreground CLI uses this while it materializes a physical
+   * ReviewRound workspace.  A Review Run is still durably queued, but its
+   * Role mailbox must not wake the Controller until the Run is rebound to the
+   * prepared owner-keyed workspace.
+   */
+  deferReviewNotifications?: boolean;
 }>;
 
 export function runTaskCommand(
@@ -1517,7 +1524,8 @@ function updateWork(
             updated,
             reviewConfig,
             "policy",
-            now
+            now,
+            options.deferReviewNotifications === true
           )
         : null;
       return {
@@ -1545,7 +1553,8 @@ function updateWork(
   notifyMailbox(options.runtime, taskMailbox(result.item.taskId), result.item.taskId);
   if (result.reviewDispatch?.run !== null
     && result.reviewDispatch?.run !== undefined) {
-    notifyMailbox(
+    notifyReviewMailbox(
+      options,
       options.runtime,
       roleMailbox(result.reviewDispatch.run.taskId, result.reviewDispatch.run.roleName),
       result.reviewDispatch.run.taskId
@@ -1598,7 +1607,7 @@ function dispatchWork(
         + `cleanup ${workspace.owner.workItemId} before dispatching ${item.id}.`
       );
     }
-    if (item.writeProjectIds.length > 0) {
+    if (task.projectBindings.length > 0) {
       const writable = workspace?.owner.type === "work-item"
         && workspace.owner.workItemId === item.id
         ? workspace.entries
@@ -1658,11 +1667,7 @@ function dispatchWork(
       now,
       {
         workItemId: item.id,
-        ...(workspace === null
-          ? (tx.getTaskWorkspace(task.id) === null
-            ? {}
-            : { workspace: tx.getTaskWorkspace(task.id)! })
-          : { workspace }),
+        ...(workspace === null ? {} : { workspace }),
         agent: agentRunSnapshot(role)
       }
     );
@@ -1728,6 +1733,7 @@ function acceptWork(
     if (
       isolatedWorkspace?.owner.type === "work-item"
       && isolatedWorkspace.owner.workItemId === item.id
+      && isolatedWorkspace.entries.some(({ access }) => access === "write")
     ) {
       assertWorkItemIntegrationProof(
         tx,
@@ -1970,10 +1976,18 @@ function reviewWork(
     if (activeRound !== undefined) {
       throw usageError(`ReviewRound is already active: ${activeRound.id}/${activeRound.status}.`);
     }
-    return queueReviewRound(tx, item, config, "leader", now);
+    return queueReviewRound(
+      tx,
+      item,
+      config,
+      "leader",
+      now,
+      options.deferReviewNotifications === true
+    );
   });
   if (result.run !== null) {
-    notifyMailbox(
+    notifyReviewMailbox(
+      options,
       options.runtime,
       roleMailbox(result.run.taskId, result.run.roleName),
       result.run.taskId
@@ -2187,7 +2201,8 @@ function yieldRun(
           automaticReview.item,
           automaticReview.config,
           "policy",
-          now
+          now,
+          options.deferReviewNotifications === true
         );
     const leaderHandoff = active.purpose === "review"
       ? "review-result"
@@ -2216,7 +2231,8 @@ function yieldRun(
   }
   if (yielded.reviewDispatch?.run !== null
     && yielded.reviewDispatch?.run !== undefined) {
-    notifyMailbox(
+    notifyReviewMailbox(
+      options,
       options.runtime,
       roleMailbox(
         yielded.reviewDispatch.run.taskId,
@@ -2233,7 +2249,8 @@ function queueReviewRound(
   item: WorkItem,
   config: ReviewConfig,
   requestedBy: "policy" | "leader",
-  now: Date
+  now: Date,
+  deferNotification = false
 ): Readonly<{ round: ReviewRound; run: AgentRun | null }> {
   const candidate = requireWorkItemCandidate(item);
   const candidateRun = candidate.source.type === "run"
@@ -2348,10 +2365,12 @@ function queueReviewRound(
   store.saveReviewRound(item.taskId, running);
   store.saveActiveAgentRun(run);
   store.saveRole(item.taskId, updateRoleStatus(reviewer, "running", now));
-  enqueueWork(store, roleMailbox(item.taskId, reviewer.name), "review-requested", now, [
-    runRef(run.id),
-    workItemRef(item.id)
-  ]);
+  if (!deferNotification) {
+    enqueueWork(store, roleMailbox(item.taskId, reviewer.name), "review-requested", now, [
+      runRef(run.id),
+      workItemRef(item.id)
+    ]);
+  }
   return { round: running, run };
 }
 
@@ -3216,4 +3235,14 @@ function notifyMailbox(
   } else {
     runtime?.notifyStateChanged(compatibilityTaskId);
   }
+}
+
+function notifyReviewMailbox(
+  options: TaskCommandOptions,
+  runtime: TaskWorkflowRuntimePort | undefined,
+  target: MailboxTarget,
+  compatibilityTaskId: string
+): void {
+  if (options.deferReviewNotifications === true) return;
+  notifyMailbox(runtime, target, compatibilityTaskId);
 }

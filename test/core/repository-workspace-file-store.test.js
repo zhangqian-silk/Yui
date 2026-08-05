@@ -34,6 +34,12 @@ import { createAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
 import { createProject } from "../../dist/repository/project.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
 import { TaskWorkspaceCoordinator } from "../../dist/repository/taskWorkspaceCoordinator.js";
+import {
+  bindExecution,
+  claimPending,
+  createWorkMailbox,
+  enqueueSignal
+} from "../../dist/coordination/workMailbox.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, completeTask, createTask } from "../../dist/task/task.js";
@@ -114,6 +120,31 @@ function addTaskRoles(store, task, repositoryPath, names = ["leader", "worker"])
     }
   });
   return agent;
+}
+
+function markDelivered(store, run) {
+  store.transaction((tx) => {
+    const target = { kind: "role", taskId: run.taskId, roleName: run.roleName };
+    let mailbox = tx.getWorkMailbox(target) ?? createWorkMailbox(target);
+    if (mailbox.processing === null) {
+      if (mailbox.pending === null) {
+        mailbox = enqueueSignal(mailbox, {
+          reason: "fixture-run-dispatched",
+          refs: [{ type: "run", id: run.id }],
+          occurredAt: NOW.toISOString()
+        });
+      }
+      const batchId = `agent-run:${run.id}`;
+      mailbox = claimPending(mailbox, {
+        batchId,
+        owner: "fixture",
+        startedAt: NOW.toISOString()
+      });
+      mailbox = bindExecution(mailbox, batchId, { type: "run", id: run.id });
+      tx.saveWorkMailbox(mailbox);
+    }
+    tx.saveAgentRun({ ...run, deliveredAt: NOW.toISOString() });
+  });
 }
 
 function liveSessionSet(status = "ready") {
@@ -996,6 +1027,249 @@ test("a reviewer launches from a fresh ReviewRound workspace frozen from the Can
   });
   assert.equal(plan.role.workspace, reviewRun.workspace.root);
   assert.equal(plan.launch.env.YUI_WORKSPACE, reviewRun.workspace.root);
+});
+
+test("public review delivery binds the physical ReviewRound workspace before notification", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Review before delivery", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  const agent = addTaskRoles(store, task, repositoryPath);
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(agent)],
+      agent.id,
+      workspace,
+      NOW
+    ));
+    tx.saveConfig({
+      ...tx.getConfig(),
+      review: { roleName: "reviewer", trigger: "leader" }
+    });
+  });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const item = createWorkItem("work-1", task.id, {
+    title: "Review the physical handoff",
+    assignee: "worker",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const develop = await preparer.prepareWorkItemWorkspace(item.id);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  const candidateRun = yieldAgentRun(createAgentRun(
+    "run-1",
+    task.id,
+    "worker",
+    "new",
+    "Produce a candidate.",
+    NOW,
+    { workItemId: item.id, workspace: develop }
+  ), "Candidate ready.", NOW);
+  store.saveAgentRun(candidateRun);
+  store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
+    summary: candidateRun.summary,
+    source: { type: "run", runId: candidateRun.id },
+    reviewPolicy: { roleName: "reviewer", trigger: "leader" },
+    workspace: develop
+  }, NOW));
+
+  const result = spawnSync(
+    process.execPath,
+    [join(process.cwd(), "dist", "cli.js"), "task", "work", "review", item.id],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        YUI_HOME: home,
+        YUI_SESSION_SCOPE: "task",
+        YUI_TASK_ID: task.id,
+        YUI_ROLE: "leader"
+      }
+    }
+  );
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+
+  const round = store.listReviewRounds(task.id)[0];
+  const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
+  assert.equal(round.status, "running");
+  assert.equal(reviewRun.deliveredAt, undefined);
+  assert.equal(
+    reviewRun.workspace.root,
+    join(workspace, "tasks", task.id, "review-rounds", round.id)
+  );
+  assert.equal(store.getReviewRoundWorkspace(task.id, round.id).root, reviewRun.workspace.root);
+  assert.equal(existsSync(reviewRun.workspace.root), true);
+  assert.match(reviewRun.input, new RegExp(reviewRun.workspace.root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  const reviewMailbox = store.getWorkMailbox({
+    kind: "role",
+    taskId: task.id,
+    roleName: "reviewer"
+  });
+  const queuedRefs = reviewMailbox.pending?.refs
+    ?? reviewMailbox.processing?.batch.refs
+    ?? [];
+  assert.equal(queuedRefs.some((ref) => ref.type === "run" && ref.id === reviewRun.id), true);
+});
+
+test("public terminal ReviewRound cleanup removes its clean workspace", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Review cleanup", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  const agent = addTaskRoles(store, task, repositoryPath);
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(agent)],
+      agent.id,
+      workspace,
+      NOW
+    ));
+    tx.saveConfig({ ...tx.getConfig(), review: { roleName: "reviewer", trigger: "leader" } });
+  });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const item = createWorkItem("work-1", task.id, {
+    title: "Review then clean",
+    assignee: "worker",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const develop = await preparer.prepareWorkItemWorkspace(item.id);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  const candidateRun = yieldAgentRun(createAgentRun(
+    "run-1", task.id, "worker", "new", "Candidate", NOW,
+    { workItemId: item.id, workspace: develop }
+  ), "Candidate ready.", NOW);
+  store.saveAgentRun(candidateRun);
+  store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
+    summary: candidateRun.summary,
+    source: { type: "run", runId: candidateRun.id },
+    reviewPolicy: { roleName: "reviewer", trigger: "leader" },
+    workspace: develop
+  }, NOW));
+  const cli = join(process.cwd(), "dist", "cli.js");
+  const leaderEnvironment = {
+    ...process.env,
+    YUI_HOME: home,
+    YUI_SESSION_SCOPE: "task",
+    YUI_TASK_ID: task.id,
+    YUI_ROLE: "leader"
+  };
+  const queued = spawnSync(process.execPath, [cli, "task", "work", "review", item.id], {
+    encoding: "utf8",
+    env: leaderEnvironment
+  });
+  assert.equal(queued.status, 0, queued.stderr || queued.stdout);
+  const round = store.listReviewRounds(task.id)[0];
+  const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
+  markDelivered(store, reviewRun);
+  const finished = spawnSync(
+    process.execPath,
+    [cli, "task", "run", "yield", reviewRun.id, "--summary", "Review complete"],
+    {
+      encoding: "utf8",
+      env: { ...leaderEnvironment, YUI_ROLE: "reviewer" }
+    }
+  );
+  assert.equal(finished.status, 0, finished.stderr || finished.stdout);
+  assert.equal(store.getReviewRound(task.id, round.id).status, "completed");
+  const reviewRoot = join(workspace, "tasks", task.id, "review-rounds", round.id);
+  assert.equal(existsSync(reviewRoot), true);
+
+  const dirtyMarker = join(reviewRoot, project.name, "review-dirty.txt");
+  writeFileSync(dirtyMarker, "retain this evidence\n");
+  const retained = spawnSync(
+    process.execPath,
+    [cli, "task", "work", "review", "cleanup", round.id],
+    { encoding: "utf8", env: leaderEnvironment }
+  );
+  assert.notEqual(retained.status, 0);
+  assert.match(retained.stderr, /dirty/i);
+  assert.notEqual(store.getReviewRoundWorkspace(task.id, round.id), null);
+  assert.equal(existsSync(reviewRoot), true);
+  unlinkSync(dirtyMarker);
+
+  const cleaned = spawnSync(
+    process.execPath,
+    [cli, "task", "work", "review", "cleanup", round.id],
+    { encoding: "utf8", env: leaderEnvironment }
+  );
+  assert.equal(cleaned.status, 0, cleaned.stderr || cleaned.stdout);
+  assert.equal(store.getReviewRoundWorkspace(task.id, round.id), null);
+  assert.equal(existsSync(reviewRoot), false);
+});
+
+test("public dispatch prepares a WorkItem-owned read-only Develop workspace before yield", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Read-only WorkItem", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const item = createWorkItem("work-1", task.id, {
+    title: "Inspect without writes",
+    assignee: "worker",
+    writeProjectIds: []
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const cli = join(process.cwd(), "dist", "cli.js");
+  const environment = {
+    ...process.env,
+    YUI_HOME: home,
+    YUI_SESSION_SCOPE: "task",
+    YUI_TASK_ID: task.id,
+    YUI_ROLE: "worker"
+  };
+  const dispatched = spawnSync(
+    process.execPath,
+    [cli, "task", "work", "dispatch", item.id],
+    { encoding: "utf8", env: environment }
+  );
+  assert.equal(dispatched.status, 0, dispatched.stderr || dispatched.stdout);
+
+  const workspaceRecord = store.getWorkItemWorkspace(task.id, item.id);
+  assert.deepEqual(workspaceRecord.owner, {
+    type: "work-item",
+    taskId: task.id,
+    workItemId: item.id
+  });
+  assert.equal(workspaceRecord.entries.every(({ access }) => access === "read"), true);
+  assert.equal(workspaceRecord.root, join(workspace, "tasks", task.id, "work-items", item.id));
+  assert.equal(existsSync(workspaceRecord.root), true);
+  const active = store.getActiveAgentRun(task.id, "worker");
+  assert.deepEqual(active.workspace.owner, workspaceRecord.owner);
+  markDelivered(store, active);
+
+  const yielded = spawnSync(
+    process.execPath,
+    [cli, "task", "run", "yield", active.id, "--summary", "Read-only result ready"],
+    { encoding: "utf8", env: environment }
+  );
+  assert.equal(yielded.status, 0, yielded.stderr || yielded.stdout);
+  const candidateItem = store.getWorkItem(task.id, item.id);
+  assert.equal(candidateItem.status, "awaiting_acceptance");
+  const candidate = candidateItem.candidates.at(-1);
+  assert.deepEqual(candidate.source, { type: "run", runId: active.id });
+  assert.deepEqual(candidate.workspace.owner, workspaceRecord.owner);
 });
 
 test("a multi-Project Task and WorkItem expose one root with per-Project access", async (t) => {
@@ -2084,6 +2358,99 @@ test("Task archive requires explicit WorkItem cleanup and preserves its record",
   runTaskCommand(["archive", active.id, "--integrated"], store, { now: () => new Date(NOW) });
   assert.equal(store.getTask(active.id).status, "archived");
   assert.equal(store.getWorkItem(active.id, item.id).workspaceDisposition, "integrated");
+});
+
+test("public Task archive cleans terminal ReviewRound workspaces before archiving", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Archive review evidence", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  const agent = addTaskRoles(store, task, repositoryPath);
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(agent)],
+      agent.id,
+      workspace,
+      NOW
+    ));
+    tx.saveConfig({ ...tx.getConfig(), review: { roleName: "reviewer", trigger: "leader" } });
+  });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  const main = (await preparer.prepareTaskWorkspace(task.id)).path;
+  const item = createWorkItem("work-1", task.id, {
+    title: "Reviewable result",
+    assignee: "worker",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const develop = await preparer.prepareWorkItemWorkspace(item.id);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  const candidateRun = yieldAgentRun(createAgentRun(
+    "run-1", task.id, "worker", "new", "Candidate", NOW,
+    { workItemId: item.id, workspace: develop }
+  ), "Candidate ready.", NOW);
+  store.saveAgentRun(candidateRun);
+  store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
+    summary: candidateRun.summary,
+    source: { type: "run", runId: candidateRun.id },
+    reviewPolicy: { roleName: "reviewer", trigger: "leader" },
+    workspace: develop
+  }, NOW));
+  const cli = join(process.cwd(), "dist", "cli.js");
+  const leaderEnvironment = {
+    ...process.env,
+    YUI_HOME: home,
+    YUI_SESSION_SCOPE: "task",
+    YUI_TASK_ID: task.id,
+    YUI_ROLE: "leader"
+  };
+  const queued = spawnSync(process.execPath, [cli, "task", "work", "review", item.id], {
+    encoding: "utf8",
+    env: leaderEnvironment
+  });
+  assert.equal(queued.status, 0, queued.stderr || queued.stdout);
+  const round = store.listReviewRounds(task.id)[0];
+  const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
+  markDelivered(store, reviewRun);
+  const finished = spawnSync(
+    process.execPath,
+    [cli, "task", "run", "yield", reviewRun.id, "--summary", "Review complete"],
+    {
+      encoding: "utf8",
+      env: { ...leaderEnvironment, YUI_ROLE: "reviewer" }
+    }
+  );
+  assert.equal(finished.status, 0, finished.stderr || finished.stdout);
+  const completedItem = updateWorkItemStatus(
+    store.getWorkItem(task.id, item.id),
+    "completed",
+    NOW,
+    "Accepted after review."
+  );
+  store.saveWorkItem(task.id, completedItem);
+  assert.equal(await preparer.cleanupWorkItemWorkspace(item.id, "integrated"), "removed");
+  store.saveTask(completeTask(store.getTask(task.id), NOW, {
+    summary: "Task complete.",
+    by: "leader"
+  }));
+
+  const archived = spawnSync(
+    process.execPath,
+    [cli, "task", "archive", task.id, "--integrated"],
+    { encoding: "utf8", env: leaderEnvironment }
+  );
+  assert.equal(archived.status, 0, archived.stderr || archived.stdout);
+  assert.equal(store.getTask(task.id).status, "archived");
+  assert.equal(store.getReviewRoundWorkspace(task.id, round.id), null);
+  assert.equal(existsSync(join(workspace, "tasks", task.id, "review-rounds", round.id)), false);
+  assert.equal(existsSync(main), false);
 });
 
 test("Project Task creation persists before reporting a missing Git base", async (t) => {

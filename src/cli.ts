@@ -2,6 +2,7 @@
 
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
+import { isDeepStrictEqual } from "node:util";
 
 import { renderCommandHelp } from "./cli/helpRenderer.js";
 import { routeInvocation } from "./cli/invocationRouter.js";
@@ -70,13 +71,14 @@ import { FileSchedulerStoreAdapter } from "./controller/fileSchedulerStoreAdapte
 import { cleanControllerResource } from "./controller/resourceCleanupLinux.js";
 import { scanControllerResourceInventory } from "./controller/resourceInventoryLinux.js";
 import { runSessionNotifyCommand } from "./controller/sessionNotify.js";
+import { enqueueWork } from "./coordination/workMailboxQueue.js";
 import { runDoctorCommand } from "./doctor/doctor.js";
 import { agentNotFound, CliError, runtimeError, usageError } from "./errors/cliError.js";
 import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
 import { TaskWorkspaceCoordinator } from "./repository/taskWorkspaceCoordinator.js";
 import { FileTaskWorkspacePreparer } from "./repository/taskWorkspacePreparer.js";
 import { inspectStorageSchema, requireStorageSchema } from "./storage/storageSchema.js";
-import { FileTaskStore, resolveYuiHome } from "./storage/taskStore.js";
+import { FileTaskStore, resolveYuiHome, type TaskStore } from "./storage/taskStore.js";
 import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
 import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
@@ -508,6 +510,25 @@ export async function main(): Promise<void> {
       );
       return;
     }
+    if (resolved[1] === "work" && resolved[2] === "review"
+      && resolved[3] === "cleanup") {
+      const reviewRoundId = resolved[4];
+      if (reviewRoundId === undefined || resolved.length !== 5) {
+        throw usageError(
+          "Task work review cleanup usage: yui task work review cleanup <round>."
+        );
+      }
+      const removal = await workspacePreparer.cleanupReviewRoundWorkspace(reviewRoundId);
+      if (removal === "dirty") {
+        throw usageError(`ReviewRound workspace is dirty and was retained: ${reviewRoundId}.`);
+      }
+      emit(
+        `Cleaned ReviewRound workspace ${reviewRoundId} (${removal})\n`,
+        false,
+        { reviewRoundId, workspace: { removal } }
+      );
+      return;
+    }
     if (resolved[1] === "work" && resolved[2] === "capture") {
       const workItemId = resolved[3];
       if (workItemId === undefined || resolved.length !== 4) {
@@ -564,6 +585,7 @@ export async function main(): Promise<void> {
       const task = store.getTask(taskId);
       if (task === null) throw new Error(`Task disappeared after archive validation: ${taskId}.`);
       if (task.status !== "archived") {
+        await cleanupReviewRoundsForArchive(task.id, store, workspacePreparer);
         const cleanup = await workspaceCoordinator.cleanupTaskForArchive(task.id);
         if (cleanup.status === "retained-dirty") {
           throw usageError(`Task ${task.id} has dirty managed worktrees and remains completed.`);
@@ -571,6 +593,22 @@ export async function main(): Promise<void> {
         if (cleanup.status === "failed") {
           throw usageError(`Task ${task.id} worktree cleanup failed: ${cleanup.error ?? "unknown error"}.`);
         }
+      }
+    }
+    if (resolved[1] === "work" && resolved[2] === "dispatch") {
+      const workItemId = resolved[3];
+      const item = workItemId === undefined ? null : store.findWorkItem(workItemId);
+      const task = item === null ? null : store.getTask(item.taskId);
+      // A read-only Project WorkItem still needs its own Develop owner.  The
+      // physical preparer creates the symlink view and stores the exact
+      // WorkItem owner before dispatch creates the Run.  Writable scopes keep
+      // the explicit isolate-before-dispatch fence.
+      if (item !== null
+        && task !== null
+        && task.projectBindings.length > 0
+        && item.writeProjectIds.length === 0
+        && store.getWorkItemWorkspace(task.id, item.id) === null) {
+        await workspaceCoordinator.isolateWorkItem(item.id);
       }
     }
     let workItemIntegrationProof;
@@ -585,6 +623,12 @@ export async function main(): Promise<void> {
         }
       }
     }
+    const reviewRunIdsBefore = new Set(
+      store.listTasks()
+        .flatMap((task) => store.listAgentRuns(task.id))
+        .filter((run) => run.purpose === "review" && run.status === "active")
+        .map((run) => run.id)
+    );
     const result = runTaskCommand(
       resolved.slice(1),
       store,
@@ -592,25 +636,24 @@ export async function main(): Promise<void> {
         runtime,
         environment: process.env,
         yuiHome: home,
+        deferReviewNotifications: true,
         ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof })
       }
     );
-    // ReviewRound ownership is durable before dispatch.  Materialize its
-    // isolated Git workspace at the same lifecycle boundary so a reviewer
-    // never receives the Develop path as an implicit writable workspace.
-    for (const task of store.listTasks()) {
-      for (const round of store.listReviewRounds(task.id)) {
-        if ((round.status !== "pending" && round.status !== "running")
-          || store.getReviewRoundWorkspace(task.id, round.id) === null) continue;
-        try {
-          await workspacePreparer.prepareReviewRoundWorkspace(round.id);
-        } catch (error) {
-          throw new Error(
-            `Review workspace preparation failed for ${round.id}: ${
-              error instanceof Error ? error.message : String(error)
-            }`
-          );
-        }
+    const preparedReviewRuns = await prepareAndBindReviewRuns(
+      store,
+      workspacePreparer,
+      reviewRunIdsBefore
+    );
+    for (const run of preparedReviewRuns) {
+      if (runtime.notifyMailboxChanged !== undefined) {
+        runtime.notifyMailboxChanged({
+          kind: "role",
+          taskId: run.taskId,
+          roleName: run.roleName
+        });
+      } else {
+        runtime.notifyStateChanged(run.taskId);
       }
     }
     if (result.kind === "output") {
@@ -668,6 +711,142 @@ export async function main(): Promise<void> {
     `Command is not connected to the restored FileTaskStore framework yet: ${resolved[0]}.`,
     renderCommandHelp(invocation.node, VERSION)
   );
+}
+
+/**
+ * Bind each newly queued Review Run to the physical ReviewRound workspace
+ * before the Controller is notified. The command layer intentionally keeps
+ * its synchronous API, so the foreground CLI closes that small pre-delivery
+ * gap atomically on the still-undelivered Run.
+ */
+async function prepareAndBindReviewRuns(
+  store: FileTaskStore,
+  preparer: FileTaskWorkspacePreparer,
+  alreadyActive: ReadonlySet<string>
+): Promise<readonly Readonly<{ id: string; taskId: string; roleName: string }>[]> {
+  const prepared: Array<Readonly<{ id: string; taskId: string; roleName: string }>> = [];
+  const notificationTime = new Date().toISOString();
+  for (const task of store.listTasks()) {
+    for (const run of store.listAgentRuns(task.id)) {
+      if (
+        run.purpose !== "review"
+        || run.status !== "active"
+        || run.reviewRoundId === undefined
+      ) continue;
+      if (store.getReviewRoundWorkspace(run.taskId, run.reviewRoundId) === null) {
+        // Projectless candidates legitimately have no managed filesystem
+        // workspace. Their Review Run can be delivered with no workspace
+        // attachment; only owner records that need physical worktrees enter
+        // the preparation path below.
+        const queued = store.transaction((tx) => {
+          const current = tx.getAgentRun(run.taskId, run.id);
+          if (current === null || current.status !== "active" || current.deliveredAt !== undefined) {
+            return null;
+          }
+          const hadWork = reviewRunMailboxReady(tx, current);
+          enqueueReviewRun(tx, current, notificationTime);
+          return !alreadyActive.has(current.id) || !hadWork
+            ? { id: current.id, taskId: current.taskId, roleName: current.roleName }
+            : null;
+        });
+        if (queued !== null) prepared.push(queued);
+        continue;
+      }
+      let workspace;
+      try {
+        workspace = await preparer.prepareReviewRoundWorkspace(run.reviewRoundId);
+      } catch (error) {
+        throw new Error(
+          `Review workspace preparation failed for ${run.reviewRoundId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+      const bound = store.transaction((tx) => {
+        const current = tx.getAgentRun(run.taskId, run.id);
+        if (current === null || current.status !== "active") return null;
+        if (current.deliveredAt !== undefined) {
+          if (!isDeepStrictEqual(current.workspace, workspace)) {
+            throw new Error(
+              `Review Run ${current.id} was delivered before its physical workspace was bound.`
+            );
+          }
+          return null;
+        }
+        const previousRoot = current.workspace?.root;
+        const input = previousRoot === undefined
+          ? current.input.replace(
+              /^Candidate workspace: .*$/m,
+              `Candidate workspace: ${workspace.root}`
+            )
+          : current.input.replace(
+              `Candidate workspace: ${previousRoot}`,
+              `Candidate workspace: ${workspace.root}`
+            );
+        const changed = !isDeepStrictEqual(current.workspace, workspace)
+          || input !== current.input;
+        const rebound = { ...current, workspace, input };
+        if (changed) tx.saveAgentRun(rebound);
+        const hadWork = reviewRunMailboxReady(tx, current);
+        enqueueReviewRun(tx, current, notificationTime);
+        return changed || !alreadyActive.has(current.id) || !hadWork ? rebound : null;
+      });
+      if (bound !== null) {
+        prepared.push({ id: bound.id, taskId: bound.taskId, roleName: bound.roleName });
+      }
+    }
+  }
+  return prepared;
+}
+
+function enqueueReviewRun(
+  store: TaskStore,
+  run: Readonly<{ id: string; taskId: string; roleName: string; workItemId?: string }>,
+  occurredAt: string
+): void {
+  enqueueWork(
+    store,
+    { kind: "role", taskId: run.taskId, roleName: run.roleName },
+    "review-requested",
+    occurredAt,
+    [
+      { type: "run", id: run.id },
+      ...(run.workItemId === undefined ? [] : [{ type: "work-item" as const, id: run.workItemId }])
+    ]
+  );
+}
+
+function reviewRunMailboxReady(
+  store: TaskStore,
+  run: Readonly<{ id: string; taskId: string; roleName: string }>
+): boolean {
+  const mailbox = store.getWorkMailbox({
+    kind: "role",
+    taskId: run.taskId,
+    roleName: run.roleName
+  });
+  if (mailbox === null) return false;
+  if (mailbox.processing?.executionRef?.type === "run"
+    && mailbox.processing.executionRef.id === run.id) return true;
+  return mailbox.pending?.refs.some((ref) => ref.type === "run" && ref.id === run.id) ?? false;
+}
+
+async function cleanupReviewRoundsForArchive(
+  taskId: string,
+  store: FileTaskStore,
+  preparer: FileTaskWorkspacePreparer
+): Promise<void> {
+  for (const round of store.listReviewRounds(taskId)) {
+    const workspace = store.getReviewRoundWorkspace(taskId, round.id);
+    if (workspace === null) continue;
+    if (round.status !== "completed" && round.status !== "failed") {
+      throw usageError(`ReviewRound is not terminal: ${round.id}/${round.status}.`);
+    }
+    const removal = await preparer.cleanupReviewRoundWorkspace(round.id);
+    if (removal === "dirty") {
+      throw usageError(`ReviewRound workspace is dirty and was retained: ${round.id}.`);
+    }
+  }
 }
 
 async function executeOperatorSessionControl(
