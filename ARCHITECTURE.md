@@ -240,6 +240,23 @@ backup-restore recovery, and the version-gated axes make the old binary
 fail-close on the new home rather than misread it. task-5 delivers this code and
 its isolated tests only; it never runs an upgrade against a real home.
 
+**Cross-Task schema scheduling.** Storage schema work is not globally serialized.
+Any module or Task may advance a storage version axis (`layout`, `aggregate`, or
+a `record` family) on its own isolated branch without waiting for another Task's
+schema change to land — branches do not block each other. The cost of that
+parallelism is assigned, by design, to whichever branch integrates later: the
+later-integrating branch is responsible for rebasing onto the latest project
+head, resolving all schema and code conflicts, re-advancing whatever schema
+versions and record-version-map entries the rebase requires, rebuilding and
+re-validating the real wiring, and fully re-running the isolated migration/upgrade
+E2E and its documentation. This rework-and-reconcile duty belongs to the later
+integrator; it is a deliberate scheduling trade-off (authorized by the user) that
+avoids cross-Task blocking rather than an accident to be repaired ad hoc.
+Concretely, this release's record-version map is a snapshot of the record
+families on the current baseline, not a frozen set: if another Task later lands a
+record-schema change, the integrating branch re-derives the map against the
+newest head and re-tests to convergence under the same strategy.
+
 The Web control room is loopback-only and never receives Controller socket
 credentials. It presents durable records and native terminal access without
 becoming a second source of truth.

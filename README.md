@@ -94,6 +94,18 @@ release (the registry is empty), and Yui never dual-reads an older schema or
 guesses an old identifier. See [Task-local identity](docs/task-local-identity.md)
 for the current reference contract.
 
+Schema work across Tasks is not serialized: any Task may advance a version axis
+(`layout`, `aggregate`, or a `record` family) on its own isolated branch without
+waiting for another Task's schema change to land. The later-integrating branch
+owns the reconciliation — rebasing onto the latest project head, resolving schema
+and code conflicts, re-advancing the schema versions and record-version-map
+entries the rebase requires, rebuilding and re-validating the wiring, and
+re-running the isolated E2E and docs. This is a deliberate scheduling trade-off
+that avoids cross-Task blocking, not an accident to repair ad hoc. The
+record-version map above is a current-baseline snapshot, so if another Task later
+lands a record-schema change, the integrating branch re-derives it against the
+newest head and re-tests to convergence.
+
 Setup also seeds four reusable Worker Profiles:
 
 ```text
