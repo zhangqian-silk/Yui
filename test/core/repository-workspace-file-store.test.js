@@ -1154,6 +1154,37 @@ test("public review delivery binds the physical ReviewRound workspace before not
   assert.equal(captureAfterDiagnostic.status, 0, captureAfterDiagnostic.stderr);
   assert.match(captureAfterDiagnostic.stdout, /no changes to capture/i);
   assert.equal(store.listChangeSets(task.id).length, 0);
+
+  // A reviewer may add diagnostic descendants, but an unrelated branch
+  // rewrite must fail closed rather than silently rebinding the ReviewRound.
+  const unrelatedBranch = "yui-review-unrelated";
+  execFileSync("git", ["-C", reviewRun.workspace.entries[0].path, "checkout", "--orphan", unrelatedBranch]);
+  writeFileSync(
+    join(reviewRun.workspace.entries[0].path, "unrelated-review-rewrite.txt"),
+    "unrelated review rewrite\n"
+  );
+  execFileSync("git", ["-C", reviewRun.workspace.entries[0].path, "add", "--all"]);
+  execFileSync("git", [
+    "-C", reviewRun.workspace.entries[0].path,
+    "commit", "-qm", "unrelated review rewrite"
+  ]);
+  const identity = worktreeIdentity(task.id, round.id);
+  execFileSync("git", [
+    "-C", reviewRun.workspace.entries[0].path,
+    "branch", "-f", identity.branch, "HEAD"
+  ]);
+  execFileSync("git", ["-C", reviewRun.workspace.entries[0].path, "checkout", "-q", identity.branch]);
+  execFileSync("git", ["-C", reviewRun.workspace.entries[0].path, "branch", "-D", unrelatedBranch]);
+  const unrelatedContext = spawnSync(
+    process.execPath,
+    [cli, "task", "show", task.id],
+    { encoding: "utf8", env: leaderEnvironment }
+  );
+  assert.notEqual(unrelatedContext.status, 0);
+  assert.match(
+    `${unrelatedContext.stderr}\n${unrelatedContext.stdout}`,
+    /does not descend from its frozen base/i
+  );
 });
 
 test("ReviewRound preparation rejects a stale deterministic branch instead of relabelling it", async (t) => {
@@ -1376,6 +1407,127 @@ test("multi-Project ReviewRound preparation discards earlier worktrees when a la
     { stdio: "ignore" }
   ));
   assert.equal(store.getReviewRoundWorkspace(task.id, round.id).root, placeholder.root);
+});
+
+test("multi-Project ReviewRound recovery preserves diagnostic descendants while recreating missing entries", async (t) => {
+  const { root, home, workspace, repositoryPath, store } = fixture(t);
+  const firstProject = await addProject(store, repositoryPath);
+  const secondRepositoryPath = join(root, "frontend");
+  execFileSync("git", ["init", "-q", secondRepositoryPath]);
+  execFileSync("git", ["-C", secondRepositoryPath, "config", "user.name", "Yui Test"]);
+  execFileSync("git", ["-C", secondRepositoryPath, "config", "user.email", "yui@example.invalid"]);
+  writeFileSync(join(secondRepositoryPath, "tracked.txt"), "frontend\n");
+  execFileSync("git", ["-C", secondRepositoryPath, "add", "tracked.txt"]);
+  execFileSync("git", ["-C", secondRepositoryPath, "commit", "-qm", "initial"]);
+  await runProjectCommand([
+    "add", "Frontend", secondRepositoryPath,
+    "--remote", "git@example.invalid:frontend.git",
+    "--stable", "HEAD",
+    "--development", "HEAD"
+  ], store, { now: () => new Date(NOW) });
+  const secondProject = store.listProjects().find(({ name }) => name === "Frontend");
+  assert.notEqual(secondProject, undefined);
+  const task = activateTask(createTask("task-1", "Recover ReviewRound entries", NOW, {
+    projectBindings: [
+      {
+        projectId: firstProject.id,
+        directory: firstProject.name,
+        baseRef: firstProject.developmentBranch
+      },
+      {
+        projectId: secondProject.id,
+        directory: secondProject.name,
+        baseRef: secondProject.developmentBranch
+      }
+    ]
+  }), NOW);
+  const agent = addTaskRoles(store, task, repositoryPath);
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(agent)],
+      agent.id,
+      workspace,
+      NOW
+    ));
+    tx.saveConfig({ ...tx.getConfig(), review: { roleName: "reviewer", trigger: "leader" } });
+  });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const item = createWorkItem("work-1", task.id, {
+    title: "Recover both Project review worktrees",
+    assignee: "worker",
+    writeProjectIds: [firstProject.id, secondProject.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const develop = await preparer.prepareWorkItemWorkspace(item.id);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  const candidateRun = yieldAgentRun(createAgentRun(
+    "run-1",
+    task.id,
+    "worker",
+    "new",
+    "Prepare a recoverable two-Project candidate.",
+    NOW,
+    { workItemId: item.id, workspace: develop }
+  ), "Candidate ready.", NOW);
+  store.saveAgentRun(candidateRun);
+  store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
+    summary: candidateRun.summary,
+    source: { type: "run", runId: candidateRun.id },
+    reviewPolicy: { roleName: "reviewer", trigger: "leader" },
+    workspace: develop
+  }, NOW));
+  runTaskCommand(["work", "review", item.id], store, {
+    now: () => new Date(NOW),
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  });
+  const round = store.listReviewRounds(task.id)[0];
+  const adopted = await preparer.prepareReviewRoundWorkspace(round.id);
+  const frozenByProject = new Map(
+    adopted.entries.map((entry) => [entry.projectId, entry.baseCommit])
+  );
+  const retained = adopted.entries.find(({ projectId }) => projectId === firstProject.id);
+  const missing = adopted.entries.find(({ projectId }) => projectId === secondProject.id);
+  assert.notEqual(retained, undefined);
+  assert.notEqual(missing, undefined);
+
+  writeFileSync(join(retained.path, "review-diagnostic.txt"), "diagnostic descendant\n");
+  execFileSync("git", ["-C", retained.path, "add", "review-diagnostic.txt"]);
+  execFileSync("git", ["-C", retained.path, "commit", "-qm", "review diagnostic descendant"]);
+  const diagnosticHead = execFileSync(
+    "git", ["-C", retained.path, "rev-parse", "HEAD"], { encoding: "utf8" }
+  ).trim();
+  const removed = await new NodeGitWorkspace().removeWorktree({
+    repositoryPath: secondProject.path,
+    container: join(workspace, "worktree", secondProject.name),
+    taskId: task.id,
+    roleName: round.id
+  });
+  assert.equal(removed, "removed");
+  assert.equal(existsSync(missing.path), false);
+
+  const repaired = await preparer.prepareReviewRoundWorkspace(round.id);
+  assert.equal(existsSync(missing.path), true);
+  assert.equal(
+    execFileSync("git", ["-C", retained.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+    diagnosticHead
+  );
+  assert.deepEqual(
+    new Map(repaired.entries.map((entry) => [entry.projectId, entry.baseCommit])),
+    frozenByProject
+  );
+  for (const entry of repaired.entries) {
+    assert.equal(
+      realpathSync(join(repaired.root, entry.directory)),
+      entry.path
+    );
+  }
 });
 
 test("public terminal ReviewRound cleanup removes its clean workspace", async (t) => {

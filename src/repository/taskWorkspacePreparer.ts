@@ -1,4 +1,5 @@
 import {
+  lstat,
   mkdir,
   readlink,
   readdir,
@@ -323,14 +324,15 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     );
     const existing = this.store.getReviewRoundWorkspace(task.id, round.id);
     const reviewRoot = this.#reviewRoundWorkspaceRoot(task.id, round.id);
+    const retained = new Map<string, Readonly<{ project: Project; entry: WorkspaceProjectEntry }>>();
+    const missing = new Set<string>();
+    const adopted = existing?.root === reviewRoot;
     if (existing !== null) {
       if (existing.entries.length !== expectedEntries.size) {
         throw new Error(
           `ReviewRound workspace Project scope changed: ${round.id}.`
         );
       }
-      let physicalMissing = false;
-      const adopted = existing.root === reviewRoot;
       for (const entry of existing.entries) {
         const source = expectedEntries.get(entry.projectId);
         if (source === undefined) {
@@ -359,9 +361,16 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         let physical;
         try {
           physical = await this.git.inspect(entry.path, "HEAD");
-        } catch {
-          physicalMissing = true;
-          break;
+        } catch (error) {
+          try {
+            await lstat(entry.path);
+          } catch (probeError) {
+            if (isMissingPath(probeError)) {
+              missing.add(entry.projectId);
+              continue;
+            }
+          }
+          throw error;
         }
         if (physical.root !== entry.path) {
           throw new Error(
@@ -381,16 +390,29 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             + `expected ${identity.branch}, physical ${branch}.`
           );
         }
+        if (!await this.git.isAncestor(project.path, entry.baseCommit, physical.baseCommit)) {
+          throw new Error(
+            `ReviewRound workspace HEAD does not descend from its frozen base for `
+            + `${round.id}/${entry.projectId}: expected ancestor ${entry.baseCommit}, `
+            + `physical HEAD ${physical.baseCommit}.`
+          );
+        }
+        retained.set(entry.projectId, { project, entry });
       }
-      if (adopted && !physicalMissing) {
+      if (adopted && missing.size === 0) {
         return existing;
       }
       // The durable owner record can outlive a controller crash before the
-      // physical review worktrees were adopted; rebuild from the snapshot.
+      // physical review worktrees were adopted.  Recreate only missing
+      // physical entries; existing reviewer diagnostics remain attached to
+      // their frozen Candidate provenance.
     }
     const prepared: Array<Readonly<{ project: Project; entry: WorkspaceProjectEntry }>> = [];
     try {
-      for (const source of develop.entries) {
+      const sources = adopted
+        ? develop.entries.filter((source) => missing.has(source.projectId))
+        : develop.entries;
+      for (const source of sources) {
         const project = requireProject(this.store, source.projectId);
         const physical = await this.git.ensureWorktree({
           repositoryPath: project.path,
@@ -415,16 +437,40 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           );
         }
       }
-      await ensureWorkspaceView(reviewRoot, prepared.map(({ entry }) => entry));
+      const preparedByProject = new Map(
+        prepared.map(({ project, entry }) => [project.id, entry] as const)
+      );
+      const entries = adopted
+        ? develop.entries.map((source) => {
+          const retainedEntry = retained.get(source.projectId)?.entry;
+          if (retainedEntry !== undefined) return retainedEntry;
+          const preparedEntry = preparedByProject.get(source.projectId);
+          if (preparedEntry === undefined) {
+            throw new Error(
+              `ReviewRound workspace Project could not be reconstructed: `
+              + `${round.id}/${source.projectId}.`
+            );
+          }
+          return preparedEntry;
+        })
+        : prepared.map(({ entry }) => entry);
+      await ensureWorkspaceView(reviewRoot, entries);
       const workspace = createManagedWorkspace({
         owner: { type: "review-round", taskId: task.id, reviewRoundId: round.id },
         root: reviewRoot,
-        entries: prepared.map(({ entry }) => entry)
+        entries
       }, this.now());
-      this.store.saveManagedWorkspace(workspace);
-      return workspace;
+      const stored = preserveWorkspaceCreatedAt(workspace, existing);
+      this.store.saveManagedWorkspace(stored);
+      return stored;
     } catch (error) {
-      await this.#discardUnadoptedEntries(task, prepared, round.id, true);
+      await this.#discardUnadoptedEntries(
+        task,
+        prepared,
+        round.id,
+        true,
+        new Set([...retained.values()].map(({ entry }) => entry.path))
+      );
       throw error;
     }
   }
@@ -631,10 +677,10 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     task: Task,
     prepared: readonly Readonly<{ project: Project; entry: WorkspaceProjectEntry }>[],
     roleName: string,
-    deleteBranch = false
+    deleteBranch = false,
+    adoptedPaths = new Set(this.store.listManagedWorkspaces(task.id)
+      .flatMap((workspace) => workspace.entries.map(({ path }) => path)))
   ): Promise<void> {
-    const adoptedPaths = new Set(this.store.listManagedWorkspaces(task.id)
-      .flatMap((workspace) => workspace.entries.map(({ path }) => path)));
     for (const { project, entry } of prepared.filter(
       ({ entry }) => entry.access === "write" && !adoptedPaths.has(entry.path)
     )) {
@@ -802,6 +848,11 @@ function retireWorkspaceBoundSession(
 
 function sameManagedWorkspace(left: ManagedWorkspace, right: ManagedWorkspace): boolean {
   return isDeepStrictEqual(left, right);
+}
+
+function isMissingPath(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error
+    && (error as { code?: unknown }).code === "ENOENT";
 }
 
 function recordWorkspaceDisposition(
