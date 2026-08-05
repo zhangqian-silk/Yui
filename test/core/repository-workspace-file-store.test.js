@@ -1082,19 +1082,20 @@ test("public review delivery binds the physical ReviewRound workspace before not
     reviewPolicy: { roleName: "reviewer", trigger: "leader" },
     workspace: develop
   }, NOW));
+  const leaderEnvironment = {
+    ...process.env,
+    YUI_HOME: home,
+    YUI_SESSION_SCOPE: "task",
+    YUI_TASK_ID: task.id,
+    YUI_ROLE: "leader"
+  };
 
   const result = spawnSync(
     process.execPath,
     [join(process.cwd(), "dist", "cli.js"), "task", "work", "review", item.id],
     {
       encoding: "utf8",
-      env: {
-        ...process.env,
-        YUI_HOME: home,
-        YUI_SESSION_SCOPE: "task",
-        YUI_TASK_ID: task.id,
-        YUI_ROLE: "leader"
-      }
+      env: leaderEnvironment
     }
   );
   assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -1110,6 +1111,7 @@ test("public review delivery binds the physical ReviewRound workspace before not
   assert.equal(store.getReviewRoundWorkspace(task.id, round.id).root, reviewRun.workspace.root);
   assert.equal(existsSync(reviewRun.workspace.root), true);
   assert.match(reviewRun.input, new RegExp(reviewRun.workspace.root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  const cli = join(process.cwd(), "dist", "cli.js");
   const reviewMailbox = store.getWorkMailbox({
     kind: "role",
     taskId: task.id,
@@ -1119,6 +1121,39 @@ test("public review delivery binds the physical ReviewRound workspace before not
     ?? reviewMailbox.processing?.batch.refs
     ?? [];
   assert.equal(queuedRefs.some((ref) => ref.type === "run" && ref.id === reviewRun.id), true);
+
+  const frozenReviewBase = store.getReviewRoundWorkspace(task.id, round.id)
+    .entries[0].baseCommit;
+  const diagnosticPath = join(reviewRun.workspace.entries[0].path, "review-diagnostic.txt");
+  writeFileSync(diagnosticPath, "diagnostic evidence\n");
+  execFileSync("git", ["-C", reviewRun.workspace.entries[0].path, "add", "review-diagnostic.txt"]);
+  execFileSync("git", [
+    "-C", reviewRun.workspace.entries[0].path,
+    "commit", "-qm", "review diagnostic evidence"
+  ]);
+
+  const contextAfterDiagnostic = spawnSync(
+    process.execPath,
+    [cli, "task", "show", task.id],
+    { encoding: "utf8", env: leaderEnvironment }
+  );
+  assert.equal(
+    contextAfterDiagnostic.status,
+    0,
+    contextAfterDiagnostic.stderr || contextAfterDiagnostic.stdout
+  );
+  assert.equal(
+    store.getReviewRoundWorkspace(task.id, round.id).entries[0].baseCommit,
+    frozenReviewBase
+  );
+  const captureAfterDiagnostic = spawnSync(
+    process.execPath,
+    [cli, "task", "work", "capture", item.id],
+    { encoding: "utf8", env: leaderEnvironment }
+  );
+  assert.equal(captureAfterDiagnostic.status, 0, captureAfterDiagnostic.stderr);
+  assert.match(captureAfterDiagnostic.stdout, /no changes to capture/i);
+  assert.equal(store.listChangeSets(task.id).length, 0);
 });
 
 test("ReviewRound preparation rejects a stale deterministic branch instead of relabelling it", async (t) => {
@@ -1900,6 +1935,15 @@ test("a roleless Project WorkItem follows isolate, Candidate, Integration, accep
     execFileSync("git", ["-C", isolatedPath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
     candidate.workspace.entries[0].baseCommit
   );
+
+  const bypassed = spawnSync(
+    process.execPath,
+    [cli, "task", "work", "update", item.id, "done", "--summary", "Bypass attempt"],
+    { encoding: "utf8", env: leaderEnvironment }
+  );
+  assert.notEqual(bypassed.status, 0);
+  assert.match(bypassed.stderr, /awaiting acceptance|task work accept/i);
+  assert.equal(store.getWorkItem(task.id, item.id).status, "awaiting_acceptance");
 
   const captured = spawnSync(
     process.execPath,

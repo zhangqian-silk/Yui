@@ -1473,6 +1473,12 @@ function updateWork(
       if (status === "running") {
         assertWorkItemDependenciesCompleted(tx, current);
       }
+      if (status === "completed" && current.status === "awaiting_acceptance") {
+        throw usageError(
+          `Work Item ${current.id} is awaiting acceptance; use task work accept `
+          + "after the required ReviewRound and Integration evidence."
+        );
+      }
       const reviewConfig = status === "completed" && !isTerminalWorkItemStatus(current.status)
         ? tx.getReviewConfig()
         : null;
