@@ -339,7 +339,7 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .input-card-top{display:grid;gap:5px}
 .input-card-top small{display:block;color:var(--warning);font-family:var(--font-body);font-size:13px;font-weight:600;letter-spacing:-.005em}
 .input-question{font-family:var(--font-body);font-size:14px;font-weight:600;color:var(--text);line-height:1.35}
-.input-context{display:flex;gap:10px;flex-wrap:wrap;color:var(--muted);font-family:var(--font-body);font-size:11px}
+.input-context{display:flex;align-items:center;gap:10px;flex-wrap:wrap;color:var(--muted);font-family:var(--font-mono);font-size:10.5px;letter-spacing:.02em}
 .input-blocked{display:block;padding:8px 12px;border:1px dashed var(--warning);border-radius:var(--radius);color:var(--muted);font-family:var(--font-mono);font-size:10.5px;letter-spacing:.04em}
 .input-actions{display:flex;gap:8px;flex-wrap:wrap}
 .input-answer{padding:7px 13px;color:var(--text);background:var(--bg-2);border:1px solid var(--border-strong);border-radius:var(--radius);font-family:var(--font-body);font-size:12px;font-weight:600;transition:border-color var(--motion-fast),color var(--motion-fast),background var(--motion-fast)}
