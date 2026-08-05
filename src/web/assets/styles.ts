@@ -301,7 +301,7 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .conclusion.archived{border-color:var(--border-strong);background:var(--bg-2)}
 .conclusion.archived h3{color:var(--muted)}
 .conclusion.archived h3:before{content:"→ ";background:var(--border-strong);color:var(--text)}
-.conclusion-meta{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:11px;font-family:var(--font-body)}
+.conclusion-meta{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:10.5px;font-family:var(--font-mono);letter-spacing:.02em}
 /* Sections */
 .detail-section{display:grid;gap:8px;padding:11px 0;border-bottom:1px solid var(--border)}
 .detail-section:last-child{border-bottom:0}
