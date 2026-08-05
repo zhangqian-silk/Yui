@@ -1,6 +1,6 @@
 import { NodeGitWorkspace } from "../repository/gitWorkspace.js";
 import { resolveProject } from "../repository/project.js";
-import { workspaceProjectEntry } from "../worktree/roleWorkspace.js";
+import { workspaceProjectEntry } from "../worktree/managedWorkspace.js";
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import type { TaskStore } from "../storage/taskStore.js";
@@ -113,7 +113,7 @@ async function start(
   if (!task.projectBindings.some(({ projectId }) => projectId === project.id)) {
     throw usageError(`Project does not belong to Task: ${project.id}.`);
   }
-  const mainWorkspace = store.getRoleWorkspace(task.id, "leader");
+  const mainWorkspace = store.getTaskWorkspace(task.id);
   const mainEntry = mainWorkspace === null
     ? undefined
     : workspaceProjectEntry(mainWorkspace, project.id);

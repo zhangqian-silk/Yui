@@ -1,5 +1,8 @@
 import { isAgentAdapterId, type AgentAdapterId } from "../agent/adapterCatalog.js";
-import { validateRoleWorkspace, type RoleWorkspace } from "../worktree/roleWorkspace.js";
+import {
+  validateManagedWorkspace,
+  type ManagedWorkspace
+} from "../worktree/managedWorkspace.js";
 
 export type DispatchMode = "new" | "resume";
 export type AgentRunStatus = "active" | "yielded" | "failed";
@@ -15,7 +18,7 @@ export type AgentRun = {
   purpose: AgentRunPurpose;
   workItemId?: string;
   reviewRoundId?: string;
-  workspace?: RoleWorkspace;
+  workspace?: ManagedWorkspace;
   agentId?: string;
   adapterId?: AgentAdapterId;
   model?: string;
@@ -40,7 +43,7 @@ export function createAgentRun(
     workItemId?: string;
     purpose?: AgentRunPurpose;
     reviewRoundId?: string;
-    workspace?: RoleWorkspace;
+    workspace?: ManagedWorkspace;
     agent?: Readonly<{
       agentId: string;
       adapterId: AgentAdapterId;
@@ -69,7 +72,7 @@ export function createAgentRun(
       : { reviewRoundId: requireSafeIdentity(context.reviewRoundId, "ReviewRound id") }),
     ...(context.workspace === undefined
       ? {}
-      : { workspace: validateRoleWorkspace(context.workspace) }),
+      : { workspace: validateManagedWorkspace(context.workspace) }),
     ...(context.agent === undefined
       ? {}
       : {
@@ -116,21 +119,33 @@ export function validateAgentRun(run: AgentRun): AgentRun {
   if (run.workItemId !== undefined) requireSafeIdentity(run.workItemId, "Work item id");
   if (run.reviewRoundId !== undefined) requireSafeIdentity(run.reviewRoundId, "ReviewRound id");
   if (run.workspace !== undefined) {
-    validateRoleWorkspace(run.workspace);
-    if (run.workspace.taskId !== run.taskId) {
+    validateManagedWorkspace(run.workspace);
+    if (run.workspace.owner.taskId !== run.taskId) {
       throw new Error("Agent run workspace belongs to another Task.");
     }
     if (run.workspace.owner.type === "work-item"
       && run.workspace.owner.workItemId !== run.workItemId) {
       throw new Error("Agent run workspace belongs to another Work Item.");
     }
+    if (run.workspace.owner.type === "work-item" && run.workItemId === undefined) {
+      throw new Error("A WorkItem workspace requires a WorkItem Agent run reference.");
+    }
+    if (run.workspace.owner.type === "review-round" && run.purpose !== "review") {
+      throw new Error("A ReviewRound workspace requires a review Agent run.");
+    }
+    if (run.workspace.owner.type === "integration-attempt") {
+      throw new Error("An IntegrationAttempt workspace cannot be used by an Agent run.");
+    }
   }
   if (run.purpose === "review") {
     if (run.workItemId === undefined || run.reviewRoundId === undefined) {
       throw new Error("A review Agent run requires WorkItem and ReviewRound references.");
     }
-    if (run.workspace?.entries.some(({ access }) => access !== "read")) {
-      throw new Error("A review Agent run workspace must be read-only.");
+    if (run.workspace !== undefined && (
+      run.workspace.owner.type !== "review-round"
+      || run.workspace.owner.reviewRoundId !== run.reviewRoundId
+    )) {
+      throw new Error("A review Agent run must use its ReviewRound-owned workspace.");
     }
   } else if (run.reviewRoundId !== undefined) {
     throw new Error("An execution Agent run cannot reference a ReviewRound.");

@@ -7,9 +7,9 @@ import {
 import { NodeGitWorkspace } from "../repository/gitWorkspace.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type {
-  RoleWorkspace,
+  ManagedWorkspace,
   WorkspaceProjectEntry
-} from "../worktree/roleWorkspace.js";
+} from "../worktree/managedWorkspace.js";
 import { captureManagedGitChanges } from "./gitChangeSetCapture.js";
 
 const CAPTURABLE_WORK_ITEM_STATUSES = new Set([
@@ -29,8 +29,8 @@ export type ProjectIntegrationProof = Readonly<{
 
 export type WorkItemIntegrationProof = Readonly<{
   workItemId: string;
-  assignee: string;
-  workspace: RoleWorkspace;
+  assignee?: string;
+  workspace: ManagedWorkspace;
   projects: readonly ProjectIntegrationProof[];
 }>;
 
@@ -53,8 +53,7 @@ export class WorkItemChangeSetManager {
   async assertIntegrated(workItemId: string): Promise<WorkItemIntegrationProof | null> {
     const item = this.store.findWorkItem(workItemId);
     if (item === null) throw new Error(`Work item not found: ${workItemId}.`);
-    if (item.assignee === undefined) return null;
-    const workspace = this.store.getRoleWorkspace(item.taskId, item.assignee);
+    const workspace = this.store.getWorkItemWorkspace(item.taskId, item.id);
     if (
       workspace === null
       || workspace.owner.type !== "work-item"
@@ -121,7 +120,7 @@ export class WorkItemChangeSetManager {
     }
     return {
       workItemId: item.id,
-      assignee: item.assignee,
+      ...(item.assignee === undefined ? {} : { assignee: item.assignee }),
       workspace,
       projects
     };
@@ -196,9 +195,9 @@ export class WorkItemChangeSetManager {
 type CapturableContext = Readonly<{
   taskId: string;
   workItemId: string;
-  assignee: string;
+  assignee?: string;
   expectedRevision: number;
-  workspace: RoleWorkspace;
+  workspace: ManagedWorkspace;
 }>;
 
 function requireCapturableContext(
@@ -217,15 +216,12 @@ function requireCapturableContext(
       `Work item workspace is already recorded as ${item.workspaceDisposition}: ${item.id}.`
     );
   }
-  if (item.assignee === undefined) {
-    throw new Error(`Work item has no Task Role workspace: ${item.id}.`);
-  }
   const task = store.getTask(item.taskId);
   if (task === null) throw new Error(`Task not found: ${item.taskId}.`);
   if (task.status !== "active") {
     throw new Error(`Task is not active: ${task.id}/${task.status}.`);
   }
-  const workspace = store.getRoleWorkspace(task.id, item.assignee);
+  const workspace = store.getWorkItemWorkspace(task.id, item.id);
   if (
     workspace === null
     || workspace.owner.type !== "work-item"
@@ -241,7 +237,7 @@ function requireCapturableContext(
   return {
     taskId: task.id,
     workItemId: item.id,
-    assignee: item.assignee,
+    ...(item.assignee === undefined ? {} : { assignee: item.assignee }),
     expectedRevision: item.revision,
     workspace
   };
@@ -250,7 +246,7 @@ function requireCapturableContext(
 function assertCaptureStillCurrent(store: TaskStore, expected: CapturableContext): void {
   const task = store.getTask(expected.taskId);
   const item = store.getWorkItem(expected.taskId, expected.workItemId);
-  const workspace = store.getRoleWorkspace(expected.taskId, expected.assignee);
+  const workspace = store.getWorkItemWorkspace(expected.taskId, expected.workItemId);
   if (
     task?.status !== "active"
     || item === null
@@ -268,7 +264,7 @@ function assertCaptureStillCurrent(store: TaskStore, expected: CapturableContext
   }
 }
 
-function writableEntries(workspace: RoleWorkspace): readonly WorkspaceProjectEntry[] {
+function writableEntries(workspace: ManagedWorkspace): readonly WorkspaceProjectEntry[] {
   return workspace.entries.filter(({ access }) => access === "write");
 }
 

@@ -111,6 +111,11 @@ under the original WorkItem. A rejected result creates a new Candidate on the
 next dispatch while reusing the original execution Role, Session, and
 workspace.
 
+Project-backed Workers commit and leave the Develop workspace clean before
+yielding a Candidate. Yui freezes each writable Project's HEAD in the Candidate
+snapshot; ReviewRound worktrees are recreated from those exact commits even if
+Develop later advances during repair.
+
 Task identity follows one bounded outcome, not the number of repositories
 involved. A repository-backed Task may bind multiple Projects, each with its
 own base ref. Yui exposes them under one Task workspace root:
@@ -140,8 +145,18 @@ scope, and exposes the other Task Projects as context from Task main. Yui puts
 the exact writable and context-only Project lists into the managed dispatch and
 the `yui-worker` Skill requires the Agent to honor that boundary. Native Agent
 permissions remain session-wide: use a write-capable session for implementation
-and a native read-only session (Codex `read-only` or Claude `dontAsk` with a
-small allow list) for explorer and reviewer Roles.
+and ReviewRound workspaces when diagnostic edits are authorized. A reviewer may
+still be launched with native read-only permissions when the review policy only
+allows inspection; the ReviewRound workspace itself remains isolated and never
+feeds Develop ChangeSet capture.
+
+Workspace ownership is independent from the executor Role. Yui persists one
+owner-keyed `ManagedWorkspace` for Task main, each WorkItem Develop checkout,
+each Candidate ReviewRound, and each IntegrationAttempt. Role dispatch attaches
+a snapshot only. The unified delivery chain is
+`isolate -> Candidate -> ReviewRound -> ChangeSet capture -> Integration ->
+accept -> cleanup`; ReviewRound worktrees start from the Candidate's frozen
+commit and never become a ChangeSet source.
 
 Write scope may only expand. The Leader supplies the complete old-plus-new set
 after a Worker yields and reports that another repository is required; an

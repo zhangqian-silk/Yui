@@ -335,6 +335,12 @@ modified Project independently and only its latest reviewed candidate. Never
 accept an isolated result while any writable Project's latest ChangeSet is
 unintegrated.
 
+Workspace ownership is not Role ownership. The WorkItem owns its Develop
+workspace even when a Task Role executes there; each ReviewRound owns a fresh
+workspace from the Candidate's frozen commit, and each IntegrationAttempt owns
+its candidate worktree. Dispatch attaches snapshots only. Review workspace
+cleanup is explicit, and review edits can never feed WorkItem ChangeSet capture.
+
 Yui validates a candidate and advances the target with compare-and-swap. A
 failed candidate does not advance the target. Inspect and resolve semantic
 conflicts as this Task's Leader:

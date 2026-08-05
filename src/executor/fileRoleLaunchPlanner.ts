@@ -29,7 +29,7 @@ import type {
   AgentEnvironmentRefreshPort
 } from "../runtime/ports.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
-import type { RoleWorkspace } from "../worktree/roleWorkspace.js";
+import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
@@ -108,33 +108,49 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const activeRun = this.store.getActiveAgentRun(task.id, role.name);
     const runWorkspace = activeRun?.workspace;
     if (task.projectBindings.length > 0) {
-      const workspace = this.store.getRoleWorkspace(task.id, role.name);
-      const main = this.store.getRoleWorkspace(task.id, "leader");
+      const main = this.store.getTaskWorkspace(task.id);
+      const assignedWorkItem = this.store.listWorkItems(task.id).find((item) =>
+        item.assignee === role.name
+        && !["completed", "failed", "cancelled", "superseded"].includes(item.status)
+      );
+      // A Run snapshot is authoritative for the live launch.  In particular,
+      // a reviewer Run must launch from its ReviewRound-owned workspace rather
+      // than falling back to the WorkItem Develop workspace.  Without an
+      // active snapshot, resolve the normal Role/WorkItem assignment.
+      const workspace = runWorkspace !== undefined
+        ? runWorkspace
+        : assignedWorkItem === undefined
+          ? main
+          : this.store.getWorkItemWorkspace(task.id, assignedWorkItem.id);
       const sharedMain = (workspace === null || workspace.owner.type === "task")
         && main?.owner.type === "task"
         && sameWorkspaceProjects(main, task.projectBindings.map(({ projectId }) => projectId))
-        && role.workspace === main.root;
+        && (role.name === "leader" || role.workspace === main.root);
       const isolatedWorkItem = workspace?.owner.type === "work-item"
         ? this.store.getWorkItem(task.id, workspace.owner.workItemId)
         : null;
       const isolated = workspace !== null
         && workspace.owner.type === "work-item"
         && isolatedWorkItem !== null
-        && isolatedWorkItem.assignee === role.name
+        && (isolatedWorkItem.assignee === undefined || isolatedWorkItem.assignee === role.name)
         && !["completed", "failed", "cancelled", "superseded"].includes(isolatedWorkItem.status)
         && (activeRun === null
           || activeRun.workItemId === workspace.owner.workItemId)
         && sameWorkspaceProjects(workspace, task.projectBindings.map(({ projectId }) => projectId))
         && sameWritableProjects(workspace, isolatedWorkItem.writeProjectIds)
-        && workspace.root === role.workspace;
+        ;
       const runScoped = runWorkspace !== undefined
-        && runWorkspace.taskId === task.id
+        && runWorkspace.owner.taskId === task.id
         && sameWorkspaceProjects(
           runWorkspace,
           task.projectBindings.map(({ projectId }) => projectId)
         )
         && (runWorkspace.owner.type === "task"
-          || runWorkspace.owner.workItemId === activeRun?.workItemId);
+          || (runWorkspace.owner.type === "work-item"
+            && runWorkspace.owner.workItemId === activeRun?.workItemId)
+          || (runWorkspace.owner.type === "review-round"
+            && activeRun?.purpose === "review"
+            && runWorkspace.owner.reviewRoundId === activeRun.reviewRoundId));
       if (task.cwd === undefined || main === null || (!runScoped && !sharedMain && !isolated)) {
         throw new Error(`Role workspace is not ready: ${input.taskId}/${input.roleName}.`);
       }
@@ -175,7 +191,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     owner: Readonly<{ scope: "task"; taskId: string } | { scope: "global" }>,
     sessionTitle: string | undefined,
     knownNativeSessionId?: string,
-    workspaceOverride?: RoleWorkspace
+    workspaceOverride?: ManagedWorkspace
   ): PlannedRoleSession {
     const binding = activeRoleAgentBinding(role);
     if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
@@ -335,9 +351,20 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       args: readonly string[];
       env: Readonly<Record<string, string>>;
     }>,
-    workspaceOverride?: RoleWorkspace
+    workspaceOverride?: ManagedWorkspace
   ): typeof launch {
-    const workspace = workspaceOverride ?? this.store.getRoleWorkspace(taskId, role.name);
+    const workspace = workspaceOverride
+      ?? (role.name === "leader"
+        ? this.store.getTaskWorkspace(taskId)
+        : this.store.listWorkItems(taskId)
+          .find((item) => item.assignee === role.name && item.status === "running") === undefined
+          ? this.store.getTaskWorkspace(taskId)
+          : this.store.getWorkItemWorkspace(
+            taskId,
+            this.store.listWorkItems(taskId).find(
+              (item) => item.assignee === role.name && item.status === "running"
+            )!.id
+          ));
     if (workspace === null || workspace === undefined) return launch;
     return {
       ...launch,
@@ -372,7 +399,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
 
 function workspaceScopeEnvironment(
   environment: Readonly<Record<string, string>>,
-  workspace: RoleWorkspace
+  workspace: ManagedWorkspace
 ): Readonly<Record<string, string>> {
   return {
     ...environment,
@@ -491,7 +518,7 @@ function requireText(value: string | undefined, label: string): string {
 }
 
 function sameWorkspaceProjects(
-  workspace: RoleWorkspace,
+  workspace: ManagedWorkspace,
   projectIds: readonly string[]
 ): boolean {
   const actual = workspace.entries.map(({ projectId }) => projectId).sort();
@@ -501,7 +528,7 @@ function sameWorkspaceProjects(
 }
 
 function sameWritableProjects(
-  workspace: RoleWorkspace,
+  workspace: ManagedWorkspace,
   projectIds: readonly string[]
 ): boolean {
   const actual = workspace.entries

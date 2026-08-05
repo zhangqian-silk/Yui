@@ -6,7 +6,10 @@ import {
   requireTimestamp
 } from "../domain/validation.js";
 import { validateReviewConfig, type ReviewConfig } from "../review/reviewConfig.js";
-import { validateRoleWorkspace, type RoleWorkspace } from "../worktree/roleWorkspace.js";
+import {
+  validateManagedWorkspace,
+  type ManagedWorkspace
+} from "../worktree/managedWorkspace.js";
 
 export type WorkItemStatus =
   | "pending"
@@ -29,7 +32,8 @@ export type WorkItemCandidate = Readonly<{
     | Readonly<{ type: "direct" }>
     | Readonly<{ type: "run"; runId: string }>;
   reviewPolicy?: ReviewConfig;
-  workspace?: RoleWorkspace;
+  /** Snapshot of the WorkItem-owned Develop workspace at candidate time. */
+  workspace?: ManagedWorkspace;
   createdAt: string;
 }>;
 
@@ -105,7 +109,7 @@ export function submitWorkItemCandidate(
       | Readonly<{ type: "direct" }>
       | Readonly<{ type: "run"; runId: string }>;
     reviewPolicy?: ReviewConfig;
-    workspace?: RoleWorkspace;
+    workspace?: ManagedWorkspace;
   }>,
   now: Date
 ): WorkItem {
@@ -325,7 +329,7 @@ export function validateWorkItemCandidate(
     requireIdentity(candidate.source.runId, "Work Item candidate Run id");
   }
   if (candidate.reviewPolicy !== undefined) validateReviewConfig(candidate.reviewPolicy);
-  if (candidate.workspace !== undefined) validateRoleWorkspace(candidate.workspace);
+  if (candidate.workspace !== undefined) validateManagedWorkspace(candidate.workspace);
   requireTimestamp(candidate.createdAt, "Work Item candidate createdAt");
   return candidate;
 }

@@ -84,9 +84,13 @@ leaves every candidate for the Leader to accept directly or review explicitly.
 Review Runs complete their ReviewRound, leave the WorkItem awaiting acceptance,
 and never trigger another review. Successful and failed review attempts both
 wake the Leader and remain evidence for judgment, not a machine verdict.
-Roles describe Agent capability. An AgentRun snapshots its effective workspace;
-review Runs use the Candidate workspace with every Project forced read-only,
-so a Reviewer's previous Role workspace cannot redirect the review.
+Roles describe Agent capability, but they do not own repository workspaces. A
+`ManagedWorkspace` is keyed by its durable owner (`Task`, `WorkItem`,
+`ReviewRound`, or `IntegrationAttempt`); an AgentRun carries only a snapshot of
+the workspace it is allowed to use. Review workspaces are fresh, writable
+copies rooted at the Candidate's frozen commit, so a Reviewer's edits cannot
+redirect to Develop or become a ChangeSet source. The same Candidate may have
+multiple independent ReviewRounds, each with explicit cleanup.
 
 Dependencies are enforced at dispatch. A Role cannot have overlapping active
 Runs, and terminal Task state fences new messages, dispatches, retries, and
@@ -108,7 +112,8 @@ Projects and Task-main context for the rest. The managed dispatch and
 `yui-worker` Skill name both sets explicitly; the Agent must modify only the
 writable set. Native Agent permissions apply to the whole Role Session rather
 than individual Project directories, so implementation Roles use write-capable
-sessions while explorer and reviewer Roles use native read-only sessions. Scope
+sessions and a ReviewRound may grant an isolated write-capable session for
+diagnostic edits (or deliberately retain native read-only permissions). Scope
 is monotonic. A Worker cannot expand it directly: it reports the need, and the
 Leader either adds Projects to the existing scope, creates another WorkItem, or
 adds the Project to the Task.
@@ -122,7 +127,8 @@ An isolated result is handled in this order:
 5. configured checks run;
 6. compare-and-swap advances the target only if its HEAD is unchanged;
 7. the Leader accepts the WorkItem;
-8. clean integration and WorkItem resources are explicitly removed.
+8. clean Integration, ReviewRound, and WorkItem resources are explicitly
+   removed.
 
 Capture at the same HEAD reuses the existing ChangeSet. A repaired HEAD creates
 a new candidate; only the latest reviewed candidate may satisfy acceptance.

@@ -69,6 +69,12 @@ committed Integration before completion. Omit it for read-only investigation,
 questions, or other outcomes that do not deliver repository changes. State
 which completion rule was recorded when reporting the newly created Task.
 
+Managed workspaces are owner-keyed, not Role-keyed: Task main, WorkItem
+Develop, ReviewRound, and IntegrationAttempt each retain their own durable
+record. A Role may execute from a snapshot but never owns or rebinds one.
+Report the full isolate-to-accept lifecycle and explicit cleanup boundaries
+when summarizing delivery.
+
 When the user changes an existing requirement, route the delta and its reason
 to the same Task rather than silently rewriting history. If the delta changes
 a read-only Task into Project delivery work, first run

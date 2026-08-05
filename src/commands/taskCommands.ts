@@ -1,5 +1,7 @@
 import type { ConfiguredAgent } from "../agent/agent.js";
+import { execFileSync } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
+import { join } from "node:path";
 import {
   compileDispatchInput,
   ensureWorkerRunCompletionRequirement
@@ -95,7 +97,11 @@ import {
   type WorkItemStatus
 } from "../workItem/workItem.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
-import { validateRoleWorkspace, type RoleWorkspace } from "../worktree/roleWorkspace.js";
+import {
+  createManagedWorkspace,
+  validateManagedWorkspace,
+  type ManagedWorkspace
+} from "../worktree/managedWorkspace.js";
 import {
   hasAgentConfigOptions,
   parseRoleOptions,
@@ -658,7 +664,7 @@ function completeTaskCommand(
         `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
       );
     }
-    const isolatedWorkspace = tx.listRoleWorkspaces(task.id)
+    const isolatedWorkspace = tx.listManagedWorkspaces(task.id)
       .find(({ owner }) => owner.type === "work-item");
     if (isolatedWorkspace?.owner.type === "work-item") {
       throw usageError(
@@ -769,7 +775,7 @@ function archiveTaskCommand(
     if (task.status !== "completed") {
       throw usageError(`Task ${task.id} must be completed before it can be archived.`);
     }
-    if (task.cwd !== undefined || tx.listRoleWorkspaces(task.id).length > 0) {
+    if (task.cwd !== undefined || tx.listManagedWorkspaces(task.id).length > 0) {
       throw usageError(`Task ${task.id} still has managed worktrees; clean them before archiving.`);
     }
     assertNoOpenInputRequests(tx, task.id, "archiving the Task");
@@ -1463,15 +1469,28 @@ function updateWork(
       const reviewConfig = status === "completed" && !isTerminalWorkItemStatus(current.status)
         ? tx.getReviewConfig()
         : null;
-      const candidateRequired = reviewConfig !== null;
+      const projectDelivery = task.projectBindings.length > 0
+        && current.writeProjectIds.length > 0;
+      const candidateRequired = projectDelivery || reviewConfig !== null;
+      const developWorkspace = tx.getWorkItemWorkspace(task.id, current.id);
+      if (status === "completed" && projectDelivery && developWorkspace === null) {
+        throw usageError(
+          `Project-backed Work Item ${current.id} must be isolated before Candidate submission.`
+        );
+      }
       const updated = candidateRequired
         ? submitWorkItemCandidate(current, {
             summary: summary!,
             source: { type: "direct" },
-            reviewPolicy: reviewConfig,
-            ...(tx.getRoleWorkspace(task.id, LEADER_ROLE) === null
+            ...(reviewConfig === null ? {} : { reviewPolicy: reviewConfig }),
+            ...(developWorkspace === null
               ? {}
-              : { workspace: tx.getRoleWorkspace(task.id, LEADER_ROLE)! })
+              : {
+                  workspace: freezeCandidateWorkspace(
+                    developWorkspace,
+                    now
+                  )
+                })
           }, now)
         : current.status === "failed" && status === "running"
         ? retryFailedWorkItem(current, now)
@@ -1504,7 +1523,7 @@ function updateWork(
       return {
         item: updated,
         reviewDispatch,
-        reviewTrigger: candidateRequired ? reviewConfig.trigger : null
+        reviewTrigger: reviewConfig?.trigger ?? null
       };
     }
     if (
@@ -1571,7 +1590,7 @@ function dispatchWork(
     }
     assertWorkItemDependenciesCompleted(tx, item);
     const role = requireRole(tx, task.id, item.assignee);
-    const workspace = tx.getRoleWorkspace(task.id, role.name);
+    const workspace = tx.getWorkItemWorkspace(task.id, item.id);
     if (workspace?.owner.type === "work-item"
       && workspace.owner.workItemId !== item.id) {
       throw usageError(
@@ -1640,9 +1659,9 @@ function dispatchWork(
       {
         workItemId: item.id,
         ...(workspace === null
-          ? (tx.getRoleWorkspace(task.id, LEADER_ROLE) === null
+          ? (tx.getTaskWorkspace(task.id) === null
             ? {}
-            : { workspace: tx.getRoleWorkspace(task.id, LEADER_ROLE)! })
+            : { workspace: tx.getTaskWorkspace(task.id)! })
           : { workspace }),
         agent: agentRunSnapshot(role)
       }
@@ -1698,9 +1717,14 @@ function acceptWork(
       && latestReview === undefined) {
       throw usageError(`Work Item candidate has no required ReviewRound: ${item.id}.`);
     }
-    const isolatedWorkspace = item.assignee === undefined
-      ? null
-      : tx.getRoleWorkspace(item.taskId, item.assignee);
+    const isolatedWorkspace = tx.getWorkItemWorkspace(item.taskId, item.id);
+    if (task.projectBindings.length > 0
+      && item.writeProjectIds.length > 0
+      && isolatedWorkspace === null) {
+      throw usageError(
+        `Project-backed Work Item ${item.id} has no WorkItem Develop workspace for acceptance.`
+      );
+    }
     if (
       isolatedWorkspace?.owner.type === "work-item"
       && isolatedWorkspace.owner.workItemId === item.id
@@ -1708,7 +1732,7 @@ function acceptWork(
       assertWorkItemIntegrationProof(
         tx,
         item.id,
-        item.assignee!,
+        item.assignee,
         isolatedWorkspace,
         options.workItemIntegrationProof
       );
@@ -1732,8 +1756,8 @@ function acceptWork(
 function assertWorkItemIntegrationProof(
   store: TaskWorkflowStore,
   workItemId: string,
-  assignee: string,
-  workspace: NonNullable<ReturnType<TaskWorkflowStore["getRoleWorkspace"]>>,
+  assignee: string | undefined,
+  workspace: NonNullable<ReturnType<TaskWorkflowStore["getWorkItemWorkspace"]>>,
   proof: WorkItemIntegrationProof | undefined
 ): void {
   if (
@@ -1755,7 +1779,7 @@ function assertWorkItemIntegrationProof(
     if (projectProof === undefined || projectProof.baseCommit !== entry.baseCommit) {
       throw usageError(`WorkItem integration verification is stale: ${workItemId}.`);
     }
-    const latestChangeSet = store.listChangeSets(workspace.taskId)
+    const latestChangeSet = store.listChangeSets(workspace.owner.taskId)
       .filter((changeSet) => (
         changeSet.workItemId === workItemId
         && changeSet.projectId === entry.projectId
@@ -1782,7 +1806,7 @@ function assertWorkItemIntegrationProof(
         `WorkItem integration verification is stale: ${workItemId}.`
       );
     }
-    if (!store.listIntegrationAttempts(workspace.taskId).some((integration) => (
+    if (!store.listIntegrationAttempts(workspace.owner.taskId).some((integration) => (
       integration.status === "committed"
       && integration.projectId === entry.projectId
       && integration.changeSetIds.includes(projectProof.changeSetId!)
@@ -2054,7 +2078,7 @@ function retryRun(
       if (item === null) {
         throw dataError(`Work item not found for run ${previous.id}: ${previous.workItemId}.`);
       }
-      const workspace = tx.getRoleWorkspace(task.id, role.name);
+      const workspace = tx.getWorkItemWorkspace(task.id, item.id);
       if (workspace?.owner.type === "work-item"
         && workspace.owner.workItemId !== item.id) {
         throw usageError(
@@ -2134,7 +2158,9 @@ function yieldRun(
             summary,
             source: { type: "run", runId: terminal.id },
             ...(reviewConfig === null ? {} : { reviewPolicy: reviewConfig }),
-            ...(active.workspace === undefined ? {} : { workspace: active.workspace })
+            ...(active.workspace === undefined
+              ? {}
+              : { workspace: freezeCandidateWorkspace(active.workspace, now) })
           }, now)
         : updateWorkItemStatus(item, "completed", now, summary);
       tx.saveWorkItem(task.id, yieldedItem);
@@ -2255,14 +2281,30 @@ function queueReviewRound(
   const candidateRole = candidateRoleName === undefined
     ? null
     : store.getRole(item.taskId, candidateRoleName);
-  const candidateWorkspaceRecord = candidate.workspace
+  const projectDelivery = task.projectBindings.length > 0 && item.writeProjectIds.length > 0;
+  const developWorkspaceRecord = candidate.workspace
     ?? candidateRun?.workspace
-    ?? (candidateRole === null
-      ? store.getRoleWorkspace(item.taskId, LEADER_ROLE) ?? undefined
-      : store.getRoleWorkspace(item.taskId, candidateRole.name)
-        ?? store.getRoleWorkspace(item.taskId, LEADER_ROLE)
-        ?? undefined);
-  const candidateWorkspace = candidateWorkspaceRecord?.root
+    ?? store.getWorkItemWorkspace(item.taskId, item.id)
+    ?? (!projectDelivery && candidateRole === null
+      ? store.getTaskWorkspace(item.taskId) ?? undefined
+      : undefined);
+  if (projectDelivery && (
+    developWorkspaceRecord === undefined
+    || developWorkspaceRecord.owner.type !== "work-item"
+    || developWorkspaceRecord.owner.workItemId !== item.id
+  )) {
+    throw usageError(
+      `Project-backed Work Item ${item.id} has no frozen WorkItem Develop workspace for review.`
+    );
+  }
+  const reviewWorkspaceRecord = developWorkspaceRecord === undefined
+    ? undefined
+    : createReviewWorkspaceSnapshot(developWorkspaceRecord, pending.id, now);
+  if (reviewWorkspaceRecord !== undefined) {
+    store.saveManagedWorkspace(reviewWorkspaceRecord);
+  }
+  const candidateWorkspace = reviewWorkspaceRecord?.root
+    ?? developWorkspaceRecord?.root
     ?? candidateRole?.workspace
     ?? task.cwd;
   const candidateLabel = candidate.source.type === "run"
@@ -2295,9 +2337,9 @@ function queueReviewRound(
       workItemId: item.id,
       purpose: "review",
       reviewRoundId: pending.id,
-      ...(candidateWorkspaceRecord === undefined
+      ...(reviewWorkspaceRecord === undefined
         ? {}
-        : { workspace: readOnlyReviewWorkspace(candidateWorkspaceRecord, reviewer.name, now) }),
+        : { workspace: reviewWorkspaceRecord }),
       agent: agentRunSnapshot(reviewer)
     }
   );
@@ -2321,15 +2363,74 @@ function requireWorkItemCandidate(item: WorkItem): WorkItemCandidate {
   return candidate;
 }
 
-function readOnlyReviewWorkspace(
-  workspace: RoleWorkspace,
-  reviewerRoleName: string,
+function createReviewWorkspaceSnapshot(
+  workspace: ManagedWorkspace,
+  reviewRoundId: string,
   now: Date
-): RoleWorkspace {
-  return validateRoleWorkspace({
+): ManagedWorkspace {
+  return createManagedWorkspace({
+    owner: {
+      type: "review-round",
+      taskId: workspace.owner.taskId,
+      reviewRoundId
+    },
+    root: join(workspace.root, ".review-rounds", reviewRoundId),
+    entries: workspace.entries.map((entry) => ({
+      ...entry,
+      path: join(workspace.root, ".review-rounds", reviewRoundId, entry.directory),
+      access: "write" as const
+    }))
+  }, now);
+}
+
+/**
+ * Freeze the Git snapshot carried by a Candidate without changing the
+ * WorkItem-owned Develop record.  Workers are required to yield a committed,
+ * clean Develop checkout; otherwise a ReviewRound could not be recreated
+ * after a restart from a durable commit identity.
+ */
+function freezeCandidateWorkspace(
+  workspace: ManagedWorkspace,
+  now: Date
+): ManagedWorkspace {
+  const entries = workspace.entries.map((entry) => {
+    try {
+      const status = execFileSync(
+        "git",
+        ["-C", entry.path, "status", "--porcelain=v1", "--untracked-files=all"],
+        { encoding: "utf8" }
+      ).trim();
+      if (status.length > 0) {
+        throw new Error("the Develop workspace has uncommitted changes");
+      }
+      const branch = execFileSync(
+        "git",
+        ["-C", entry.path, "symbolic-ref", "--quiet", "--short", "HEAD"],
+        { encoding: "utf8" }
+      ).trim();
+      if (branch !== entry.branch) {
+        throw new Error(`the Develop workspace is on branch ${branch}`);
+      }
+      const baseCommit = execFileSync(
+        "git",
+        ["-C", entry.path, "rev-parse", "--verify", "HEAD^{commit}"],
+        { encoding: "utf8" }
+      ).trim().toLowerCase();
+      if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(baseCommit)) {
+        throw new Error("Git returned an invalid frozen commit");
+      }
+      return { ...entry, baseCommit };
+    } catch (error) {
+      throw usageError(
+        `Cannot freeze Candidate workspace ${workspace.owner.taskId}: ${
+          entry.projectId
+       }; ${error instanceof Error ? error.message : String(error)}.`
+      );
+    }
+  });
+  return validateManagedWorkspace({
     ...workspace,
-    roleName: reviewerRoleName,
-    entries: workspace.entries.map((entry) => ({ ...entry, access: "read" as const })),
+    entries,
     updatedAt: now.toISOString()
   });
 }

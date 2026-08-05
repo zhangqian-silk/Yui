@@ -595,6 +595,24 @@ export async function main(): Promise<void> {
         ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof })
       }
     );
+    // ReviewRound ownership is durable before dispatch.  Materialize its
+    // isolated Git workspace at the same lifecycle boundary so a reviewer
+    // never receives the Develop path as an implicit writable workspace.
+    for (const task of store.listTasks()) {
+      for (const round of store.listReviewRounds(task.id)) {
+        if ((round.status !== "pending" && round.status !== "running")
+          || store.getReviewRoundWorkspace(task.id, round.id) === null) continue;
+        try {
+          await workspacePreparer.prepareReviewRoundWorkspace(round.id);
+        } catch (error) {
+          throw new Error(
+            `Review workspace preparation failed for ${round.id}: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+        }
+      }
+    }
     if (result.kind === "output") {
       if (resolved[1] === "create") {
         const created = result.data as {

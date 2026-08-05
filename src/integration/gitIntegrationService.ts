@@ -13,6 +13,7 @@ import {
   updateIntegrationAttempt,
   type IntegrationAttempt
 } from "./integrationAttempt.js";
+import { createManagedWorkspace } from "../worktree/managedWorkspace.js";
 
 const executeFile = promisify(execFile);
 
@@ -72,6 +73,24 @@ export class GitIntegrationService {
         branch: prepared.branch,
         baseCommit: prepared.baseCommit
       };
+      const existingWorkspace = this.store.getIntegrationWorkspace(task.id, initial.id);
+      this.store.saveManagedWorkspace(existingWorkspace ?? createManagedWorkspace({
+        owner: {
+          type: "integration-attempt",
+          taskId: task.id,
+          integrationAttemptId: initial.id
+        },
+        root: prepared.path,
+        entries: [{
+          projectId: project.id,
+          directory: project.name,
+          access: "write",
+          path: prepared.path,
+          branch: prepared.branch,
+          baseRef: initial.expectedHead,
+          baseCommit: prepared.baseCommit
+        }]
+      }, this.now()));
     } catch (error) {
       return this.#fail(initial, error, "integration-preparation");
     }
@@ -170,6 +189,11 @@ export class GitIntegrationService {
       await rm(integrationCheckDirectory(this.home, task.id, integration.id), {
         recursive: true,
         force: true
+      });
+      this.store.removeManagedWorkspace({
+        type: "integration-attempt",
+        taskId: integration.taskId,
+        integrationAttemptId: integration.id
       });
     }
     return result;
