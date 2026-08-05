@@ -13,6 +13,7 @@ export type OperatorAttentionPresentation = OperatorPresentationBase & Readonly<
   source: Readonly<
     | { kind: "input-request"; id: string }
     | { kind: "leader-recovery"; id: string }
+    | { kind: "leader-stall"; id: string }
   >;
 }>;
 
@@ -63,7 +64,7 @@ export function createInputRequestOperatorPresentation(
 }
 
 export function createLeaderRecoveryOperatorPresentation(
-  notification: OperatorNotification
+  notification: Extract<OperatorNotification, { type: "leader-recovery-failed" }>
 ): OperatorAttentionPresentation {
   return {
     category: "attention",
@@ -77,6 +78,31 @@ export function createLeaderRecoveryOperatorPresentation(
       `Inspect: yui task show ${notification.taskId}`,
       "Recovery status: yui jobs list",
       `Retry after inspection: yui jobs retry leader-recovery:${notification.taskId}`
+    ].join("\n")
+  };
+}
+
+export function createLeaderStallOperatorPresentation(
+  notification: Extract<OperatorNotification, { type: "leader-stalled" }>
+): OperatorAttentionPresentation {
+  return {
+    category: "attention",
+    taskId: notification.taskId,
+    receiptId: `leader-stall:${notification.taskId}:${notification.runId}:${notification.progressAt}`,
+    source: {
+      kind: "leader-stall",
+      id: `${notification.runId}:${notification.progressAt}`
+    },
+    text: [
+      "A Task Leader is truly stalled and needs user attention.",
+      `Task: ${notification.taskId}`,
+      `Leader Run: ${notification.runId}`,
+      `lastProgressAt: ${notification.progressAt}`,
+      "Classification: truly-stalled",
+      `Evidence: ${notification.evidenceKey}`,
+      "Controller preserved the exact Run/Session fence and performed no automatic Enter, reset, retry, kill, or Session replacement.",
+      `Inspect: yui task context ${notification.taskId}`,
+      "Choose the supported continuation, reset, retry, Agent change, or user-input action only after inspection."
     ].join("\n")
   };
 }

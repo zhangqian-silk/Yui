@@ -31,15 +31,32 @@ import type {
   LeaderDispatchClaimResult,
   LeaderDispatchPersistence,
   RoleRunDeliveryPersistence,
+  RoleRunProgressPersistence,
+  RoleRunStallPersistence,
+  SchedulerRunProgress,
   SchedulerRole,
   SchedulerRoleSession,
   SchedulerStorePort,
   ExitedRoleRunPersistence
 } from "../scheduler/ports.js";
 import { recordLeaderFailure } from "../scheduler/leaderFailure.js";
-import { createLeaderRecoveryNotification } from "../scheduler/operatorNotification.js";
+import {
+  createLeaderRecoveryNotification,
+  createLeaderStallNotification
+} from "../scheduler/operatorNotification.js";
 import { pendingWakeupsMatch } from "../scheduler/pendingWakeup.js";
 import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
+import {
+  latestDurableProgressAt,
+  latestRunActivityAt,
+  latestRunEventTime,
+  latestRunProgressAt,
+  latestStallEvidenceKey,
+  isRoleRunStalled,
+  RUN_PROGRESS_EVENT,
+  RUN_RECOVERED_EVENT,
+  RUN_STALLED_EVENT
+} from "../scheduler/roleRunStall.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { updateWorkItemStatus } from "../workItem/workItem.js";
 import {
@@ -147,6 +164,183 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   getRoleSession(taskId: string, roleName: string): SchedulerRoleSession | null {
     const session = this.store.getRoleSession(taskId, roleName);
     return session === null ? null : mapSession(session);
+  }
+
+  listEvents(taskId: string) {
+    return this.store.listEvents(taskId);
+  }
+
+  getRunDurableProgress(
+    taskId: string,
+    roleName: string,
+    runId: string
+  ): SchedulerRunProgress | null {
+    const run = this.store.getActiveAgentRun(taskId, roleName);
+    if (run === null || run.id !== runId) return null;
+    const events = this.store.listEvents(taskId);
+    const latestCheckpointAt = latestRunProgressAt(events, run.id);
+    const workItem = run.workItemId === undefined
+      ? null
+      : this.store.getWorkItem(taskId, run.workItemId);
+    const reviewRounds = run.workItemId === undefined
+      ? []
+      : this.store.listReviewRounds(taskId).filter(({ workItemId }) => workItemId === run.workItemId);
+    const changeSets = run.workItemId === undefined
+      ? []
+      : this.store.listChangeSets(taskId).filter(({ workItemId }) => workItemId === run.workItemId);
+    const integrationChangeSetIds = new Set(changeSets.map(({ id }) => id));
+    const integrations = this.store.listIntegrationAttempts(taskId).filter((attempt) => (
+      attempt.changeSetIds.some((id) => integrationChangeSetIds.has(id))
+    ));
+    const inputProgress = this.store.listInputRequests(taskId)
+      .filter((request) => (
+        request.requester.runId === run.id
+        || request.blockedRefs.some((ref) => ref.type === "run" && ref.id === run.id)
+      ));
+    const latestActivityAt = latestRunActivityAt(events, run.id);
+    const progressAt = run.deliveredAt === undefined
+      ? latestCheckpointAt ?? latestActivityAt ?? run.createdAt
+      : latestDurableProgressAt({
+          deliveredAt: run.deliveredAt,
+          latestCheckpointAt,
+          latestActivityAt
+        });
+    const relatedUpdatedAt = [
+      workItem?.updatedAt,
+      ...reviewRounds.map(({ endedAt, createdAt }) => endedAt ?? createdAt),
+      ...changeSets.map(({ createdAt }) => createdAt),
+      ...integrations.map(({ updatedAt }) => updatedAt),
+      ...inputProgress.map(({ updatedAt }) => updatedAt),
+      ...(workItem?.candidates ?? []).map(({ createdAt }) => createdAt)
+    ].filter((value): value is string => (
+      typeof value === "string" && Number.isFinite(Date.parse(value))
+    ));
+    const latestRelatedAt = relatedUpdatedAt.reduce<string | undefined>(
+      (latest, value) => latest === undefined || Date.parse(value) > Date.parse(latest) ? value : latest,
+      undefined
+    );
+    const finalProgressAt = latestRelatedAt === undefined
+      ? progressAt
+      : Date.parse(latestRelatedAt) > Date.parse(progressAt) ? latestRelatedAt : progressAt;
+    return {
+      progressAt: finalProgressAt,
+      ...(latestRelatedAt === undefined ? {} : { evidence: "work-review-integration" })
+    };
+  }
+
+  recordRoleRunStall(
+    input: RoleRunStallPersistence
+  ): "raised" | "already-raised" | "state-changed" {
+    return this.store.transaction((store) => {
+      const task = store.getTask(input.taskId);
+      const role = store.getRole(input.taskId, input.roleName);
+      const run = store.getActiveAgentRun(input.taskId, input.roleName);
+      if (
+        task === null
+        || task.status !== "active"
+        || role === null
+        || run === null
+        || run.id !== input.runId
+        || run.status !== "active"
+      ) return "state-changed";
+
+      const existing = latestStallEvidenceKey(store.listEvents(task.id), run.id);
+      if (existing?.progressAt === input.progressAt) return "already-raised";
+
+      const event = createTaskEvent(
+        store.nextEventId(task.id),
+        RUN_STALLED_EVENT,
+        {
+          runId: run.id,
+          roleName: role.name,
+          kind: input.kind,
+          classification: input.classification,
+          progressAt: input.progressAt,
+          idleMs: String(Math.max(0, Math.floor(input.idleMs))),
+          evidenceKey: input.evidenceKey,
+          status: "needs-attention"
+        },
+        input.now
+      );
+      store.saveEvent(task.id, event);
+      if (role.name === "leader") {
+        store.saveOperatorNotification(createLeaderStallNotification(
+          task.id,
+          run.id,
+          input.progressAt,
+          input.evidenceKey,
+          input.now,
+          store.getOperatorNotification(task.id)
+        ));
+        enqueueWork(store, { kind: "operator" }, "leader-run-stalled", input.now, [
+          { type: "task", id: task.id }
+        ]);
+      } else {
+        queueLeaderWakeup(store, task.id, "role-run-stalled", input.now);
+      }
+      return "raised";
+    });
+  }
+
+  recordRoleRunProgress(
+    input: RoleRunProgressPersistence
+  ): "recorded" | "already-recorded" | "state-changed" {
+    return this.store.transaction((store) => {
+      const task = store.getTask(input.taskId);
+      const run = store.getActiveAgentRun(input.taskId, input.roleName);
+      if (
+        task === null
+        || task.status !== "active"
+        || run === null
+        || run.id !== input.runId
+        || run.status !== "active"
+      ) return "state-changed";
+      const events = store.listEvents(task.id);
+      const existing = events.some((event) => (
+        event.type === RUN_PROGRESS_EVENT
+        && event.payload.runId === run.id
+        && (
+          event.payload.progressAt === input.progressAt
+          || Date.parse(event.createdAt) >= Date.parse(input.progressAt)
+        )
+      ));
+      const stalledAt = latestRunEventTime(events, RUN_STALLED_EVENT, run.id);
+      const recoveredAt = latestRunEventTime(events, RUN_RECOVERED_EVENT, run.id);
+      const recovered = stalledAt !== undefined
+        && (recoveredAt === undefined || Date.parse(recoveredAt) <= Date.parse(stalledAt));
+      if (!existing) {
+        store.saveEvent(task.id, createTaskEvent(
+          store.nextEventId(task.id),
+          RUN_PROGRESS_EVENT,
+          {
+            runId: run.id,
+            roleName: input.roleName,
+            kind: "durable-fold",
+            progressAt: input.progressAt,
+            evidence: input.evidence ?? ""
+          },
+          input.now
+        ));
+      }
+      if (recovered) {
+        store.saveEvent(task.id, createTaskEvent(
+          store.nextEventId(task.id),
+          RUN_RECOVERED_EVENT,
+          {
+            runId: run.id,
+            roleName: input.roleName,
+            progressAt: input.progressAt,
+            kind: "durable-progress"
+          },
+          input.now
+        ));
+        const notification = store.getOperatorNotification(task.id);
+        if (notification?.type === "leader-stalled" && notification.runId === run.id) {
+          store.clearOperatorNotification(task.id);
+        }
+      }
+      return existing && !recovered ? "already-recorded" : "recorded";
+    });
   }
 
   hasInFlightTurn(taskId: string, roleName: string): boolean {
@@ -1044,6 +1238,32 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         observedAt: now,
         dueAt: new Date(now.getTime() + 2_000)
       });
+      const wasStalled = isRoleRunStalled(store.listEvents(task.id), fence.runId);
+      store.saveEvent(task.id, createTaskEvent(
+        store.nextEventId(task.id),
+        RUN_PROGRESS_EVENT,
+        {
+          runId: fence.runId,
+          roleName: role.name,
+          kind: "native-turn",
+          turnId: input.turnId,
+          note: boundedRuntimeNote(input.summary)
+        },
+        now
+      ));
+      if (wasStalled) {
+        store.saveEvent(task.id, createTaskEvent(
+          store.nextEventId(task.id),
+          RUN_RECOVERED_EVENT,
+          {
+            runId: fence.runId,
+            roleName: role.name,
+            progressAt: now.toISOString(),
+            kind: "native-turn"
+          },
+          now
+        ));
+      }
       sessions = recordObservedTaskRoleCompletion(sessions, completion);
       const active = store.getActiveAgentRun(task.id, role.name);
       if (active === null || active.id !== fence.runId || active.status !== "active") {
@@ -1102,7 +1322,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         nativeSessionId: agent.nativeSessionId,
         turnId: `recovery-${run.id}`,
         expectedRunId: run.id,
-        summary
+        summary,
+        origin: "recovery"
       }, input.now);
       return;
     }
@@ -1180,20 +1401,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         ))
         && !store.listWorkItems(task.id).some((item) => item.status === "running")
         && !store.listInputRequests(task.id).some((request) => request.status === "open");
-      const message = createTaskMessage(
-        store.nextMessageId(task.id),
-        summary,
-        "role-result",
-        { type: "role", roleName: currentRole.name },
-        input.now,
-        { runId: terminal.id }
-      );
+      // This branch only ever closes a Run with the Controller's synthesized
+      // recovery summary, never an agent's own message. Record it as a run fact
+      // so the recovery is auditable without adding Task Message noise.
       store.saveAgentRun(terminal);
-      store.saveMessage(task.id, message);
       store.saveEvent(task.id, createTaskEvent(
         store.nextEventId(task.id),
-        "message.sent",
-        { messageId: message.id, kind: message.kind },
+        RUN_RECOVERED_EVENT,
+        { runId: terminal.id, roleName: currentRole.name, summary },
         input.now
       ));
       if (!completeWorkExecution(store, target, { type: "run", id: terminal.id })) {
@@ -1303,6 +1518,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     turnId: string;
     expectedRunId?: string;
     summary: string;
+    /**
+     * "native" is a real agent Turn Hook whose summary is the agent's own last
+     * message and belongs in the collaboration narrative. "recovery" is a
+     * Controller-synthesized closure whose summary is a control-plane
+     * observation; it is a run fact (event), never a Task Message.
+     */
+    origin?: "native" | "recovery";
   }>, now = new Date()): Readonly<{
     session: RoleAgentSession;
     finalizedRunId?: string;
@@ -1424,22 +1646,37 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         ))
         && !store.listWorkItems(task.id).some((item) => item.status === "running")
         && !store.listInputRequests(task.id).some((request) => request.status === "open");
-      const message = createTaskMessage(
-        store.nextMessageId(task.id),
-        input.summary,
-        "role-result",
-        { type: "role", roleName: role.name },
-        now,
-        { runId: terminal.id }
-      );
+      // A native Turn summary is the agent's own last message and belongs in the
+      // collaboration narrative. A Controller-synthesized recovery closure is a
+      // run fact, recorded as an event so it never masquerades as a Leader
+      // summary in the Task Message stream.
+      const message = input.origin === "recovery"
+        ? null
+        : createTaskMessage(
+            store.nextMessageId(task.id),
+            input.summary,
+            "role-result",
+            { type: "role", roleName: role.name },
+            now,
+            { runId: terminal.id }
+          );
       store.saveAgentRun(terminal);
-      store.saveMessage(task.id, message);
-      store.saveEvent(task.id, createTaskEvent(
-        store.nextEventId(task.id),
-        "message.sent",
-        { messageId: message.id, kind: message.kind },
-        now
-      ));
+      if (message === null) {
+        store.saveEvent(task.id, createTaskEvent(
+          store.nextEventId(task.id),
+          RUN_RECOVERED_EVENT,
+          { runId: terminal.id, roleName: role.name, summary: input.summary },
+          now
+        ));
+      } else {
+        store.saveMessage(task.id, message);
+        store.saveEvent(task.id, createTaskEvent(
+          store.nextEventId(task.id),
+          "message.sent",
+          { messageId: message.id, kind: message.kind, runId: terminal.id },
+          now
+        ));
+      }
       if (!completeWorkExecution(
         store,
         leaderTarget,
@@ -1614,6 +1851,11 @@ function sessionPreview(value: string): string {
   return /[\uD800-\uDBFF]$/.test(truncated)
     ? truncated.slice(0, -1)
     : truncated;
+}
+
+function boundedRuntimeNote(value: string): string {
+  const normalized = value.trim().replaceAll(/\s+/gu, " ");
+  return normalized.length <= 280 ? normalized : `${normalized.slice(0, 279)}…`;
 }
 
 function requireRuntimeLaunchReservation(
@@ -1896,7 +2138,8 @@ function mapSession(session: RoleAgentSession): SchedulerRoleSession {
     agentId: session.agentId,
     adapterId: session.adapterId,
     nativeSessionId: session.nativeSessionId,
-    status: session.status
+    status: session.status,
+    updatedAt: session.updatedAt
   };
 }
 

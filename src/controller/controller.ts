@@ -18,6 +18,10 @@ import {
   DEFAULT_READY_RECOVERY_AGE_MS,
   reconcileExitedRoleRuns
 } from "../scheduler/roleRunLiveness.js";
+import {
+  DEFAULT_STALL_WINDOW_MS,
+  reconcileStalledRoleRuns
+} from "../scheduler/roleRunStall.js";
 import { repairOrphanedActiveTasks } from "../scheduler/activeTaskProgress.js";
 import {
   processOperatorInputNotifications,
@@ -71,6 +75,7 @@ export type ControllerRuntimeOptions = Readonly<{
   deliveryRetryMs?: number;
   deliveryRetryLimit?: number;
   readyRecoveryAgeMs?: number;
+  stallWindowMs?: number;
   now?: () => Date;
   onError?: (error: unknown) => void;
   workspacePreparer?: Pick<TaskWorkspacePreparer, "prepareTaskWorkspace">;
@@ -116,7 +121,8 @@ export async function runControllerSchedulerPass(
   includeOperator = true,
   readyRecoveryRunIds: ReadonlySet<string> = new Set(),
   runtimeCleanupOutcomes: RuntimeCleanupOutcome[] = [],
-  lifecycleHost?: RuntimeLifecycleHost
+  lifecycleHost?: RuntimeLifecycleHost,
+  stallWindowMs = DEFAULT_STALL_WINDOW_MS
 ): Promise<ControllerSchedulerResult> {
   const compiledSelection = compileReconcileSelection(scope);
   const selection = includeOperator
@@ -159,6 +165,9 @@ export async function runControllerSchedulerPass(
       result.reason === "delivery-uncertain" ? [result.runId] : []
     )));
     resolveDueRuntimeTurnCompletions(store, delivery, selection, now);
+    // Liveness owns the one full-pass provider inventory; the stall phase
+    // receives the same mutable snapshot and never probes tmux twice.
+    const liveStatuses = new Map<string, "present" | "absent">();
     const failedRunIds = await reconcileExitedRoleRuns(
       store,
       delivery,
@@ -166,7 +175,16 @@ export async function runControllerSchedulerPass(
       roleSelection,
       uncertainRunIds,
       readyRecoveryAgeMs,
-      readyRecoveryRunIds
+      readyRecoveryRunIds,
+      liveStatuses
+    );
+    await reconcileStalledRoleRuns(
+      store,
+      delivery,
+      now,
+      roleSelection,
+      stallWindowMs,
+      liveStatuses
     );
     await reconcileDormantRuntimeOwners(
       store,
@@ -731,6 +749,7 @@ export class FileTaskController {
   readonly #deliveryRetryMs: number;
   readonly #deliveryRetryLimit: number;
   readonly #readyRecoveryAgeMs: number;
+  readonly #stallWindowMs: number;
   readonly #runtimeEventProcessor: RuntimeEventProcessorPort | undefined;
   readonly #lifecycleHost:
     | RuntimeLifecycleHost
@@ -784,6 +803,11 @@ export class FileTaskController {
       options.readyRecoveryAgeMs,
       DEFAULT_READY_RECOVERY_AGE_MS,
       "Controller ready recovery age"
+    );
+    this.#stallWindowMs = positiveInteger(
+      options.stallWindowMs,
+      DEFAULT_STALL_WINDOW_MS,
+      "Controller Run stall window"
     );
     this.#runtimeEventProcessor = options.runtimeEventProcessor;
     this.#lifecycleHost = options.lifecycleHost;
@@ -980,7 +1004,8 @@ export class FileTaskController {
             false,
             dueReadyRecoveryRunIds,
             runtimeCleanupOutcomes,
-            this.#lifecycleHost
+            this.#lifecycleHost,
+            this.#stallWindowMs
           );
           const secondRuntimeDrain = this.#drainRuntimeEvents();
           this.#clearPassRetry();

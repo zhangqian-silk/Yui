@@ -43,6 +43,29 @@ Do not invent another execution entity or a `yui ... subagent` command.
 - Keep these as two views of the same work. Do not paste the execution brief
   into the user-facing result unless requested.
 
+## Write high-value collaboration summaries
+
+Task Messages are the Task's collaboration narrative, not a scheduler log.
+Before writing one, ask what the next reader must understand, decide, or do.
+Record a new conclusion, material architecture or behavior change, meaningful
+acceptance/rejection, user impact, risk, or recovery decision; point to the
+relevant Task, WorkItem, Run, Review, Input, Decision, or Milestone for detail.
+Do not repeat a Worker, Reviewer, or Tester conclusion merely because the
+Leader saw it. Add a new summary only when the Leader adds acceptance,
+interpretation, impact, a changed plan, or a decision. Keep dispatch, attach,
+heartbeat, sampling, waiting, and unchanged recovery in structured runtime
+records. There is no fixed heading order, section count, field list, or
+character budget: choose the smallest useful abstraction for the recipient.
+
+- A Worker/Implementer handoff should explain the problem or constraint,
+  mechanism and boundary, observable impact, tradeoff, and verification.
+- A Reviewer/Tester handoff should emphasize the user-visible finding or
+  disposition, minimal reproduction or evidence reference, severity, and
+  verification gap or next action.
+- A Leader-to-user summary should explain stage outcome, important risk or
+  unresolved choice, and the next bounded action rather than orchestration
+  chronology.
+
 ## Recover and persist Task context
 
 A launch or wake message is a pointer, not the full context. Start with:

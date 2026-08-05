@@ -5,6 +5,10 @@ import type { TaskStore } from "../storage/taskStore.js";
 import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import type { WorkItem } from "../workItem/workItem.js";
 import type { RoleWorkspace } from "../worktree/roleWorkspace.js";
+import {
+  isRoleRunStalled,
+  latestStallProgressAt
+} from "../scheduler/roleRunStall.js";
 
 export type TaskRoleHealth =
   | "idle"
@@ -40,6 +44,11 @@ export type TaskRoleRuntimeStatus = Readonly<{
   nativeSession: RoleAgentSession | null;
   tmux: TaskRoleTmuxStatus;
   workspace: TaskRoleWorkspaceStatus;
+  stall: Readonly<{
+    active: boolean;
+    progressAt?: string;
+    kind?: "delivery-stalled" | "execution-stalled";
+  }>;
 }>;
 
 export function inspectTaskRoleRuntimeStatuses(
@@ -99,6 +108,9 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
     `  Role state       ${status.role.status}`,
     `  Active work      ${activeWork}`,
     `  Active run       ${activeRun}`,
+    `  Run attention    ${status.stall.active
+      ? `needs-attention (${status.stall.kind ?? "execution-stalled"}; no durable progress since ${status.stall.progressAt ?? "unknown"})`
+      : "none"}`,
     `  Native session   ${nativeSession}`,
     `  tmux pane        ${tmux}`,
     `  Workspace        ${
@@ -156,13 +168,31 @@ function inspectTaskRoleRuntimeStatus(
   const workspace: TaskRoleWorkspaceStatus = managedWorkspace === null
     ? { managed: false, path: role.workspace }
     : { ...managedWorkspace, managed: true };
+  const events = store.listEvents(taskId);
+  const stalled = activeRun !== null && isRoleRunStalled(events, activeRun.id);
+  const stallProgressAt = activeRun === null
+    ? undefined
+    : latestStallProgressAt(events, activeRun.id);
+  const stallKind = activeRun === null
+    ? undefined
+    : latestStallKind(events, activeRun.id);
   const health = calculateHealth(
     role,
     activeRun,
     nativeSession,
     tmux,
-    openInputRequestCount
+    openInputRequestCount,
+    stalled
   );
+  const stall = activeRun === null
+    ? { active: false }
+    : {
+        active: stalled,
+        ...(stallProgressAt === undefined
+          ? {}
+          : { progressAt: stallProgressAt }),
+        ...(stallKind === undefined ? {} : { kind: stallKind })
+      };
   return {
     taskId,
     roleName: role.name,
@@ -174,8 +204,21 @@ function inspectTaskRoleRuntimeStatus(
     activeWork,
     nativeSession,
     tmux,
-    workspace
+    workspace,
+    stall
   };
+}
+
+function latestStallKind(
+  events: ReturnType<TaskStore["listEvents"]>,
+  runId: string
+): "delivery-stalled" | "execution-stalled" | undefined {
+  const event = [...events]
+    .filter((candidate) => candidate.type === "run.stalled" && candidate.payload.runId === runId)
+    .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
+  return event?.payload.kind === "delivery-stalled" || event?.payload.kind === "execution-stalled"
+    ? event.payload.kind
+    : undefined;
 }
 
 function calculateHealth(
@@ -183,7 +226,8 @@ function calculateHealth(
   activeRun: AgentRun | null,
   nativeSession: RoleAgentSession | null,
   tmux: TaskRoleTmuxStatus,
-  openInputRequestCount: number
+  openInputRequestCount: number,
+  stalled: boolean
 ): Pick<TaskRoleRuntimeStatus, "health" | "healthReason"> {
   if (role.status === "failed" || role.status === "exited") {
     return { health: "failed", healthReason: `persisted Role state is ${role.status}` };
@@ -203,6 +247,12 @@ function calculateHealth(
     }
     if (activeRun.deliveredAt !== undefined && tmux.state !== "running") {
       return { health: "needs-attention", healthReason: "the delivered active Run has no live tmux pane" };
+    }
+    if (stalled) {
+      return {
+        health: "needs-attention",
+        healthReason: "the live active Run has no durable progress in the configured stall window"
+      };
     }
   }
   if (activeRun === null && role.status === "running") {

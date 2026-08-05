@@ -16,6 +16,7 @@ import type { PendingTurnCompletion } from "../executor/turnCompletion.js";
 import type { RuntimeRoleOwner } from "../runtime/lifecycleReservation.js";
 import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import type { Task } from "../task/task.js";
+import type { TaskEvent } from "../event/taskEvent.js";
 
 export type SchedulerTask = Readonly<Pick<
   Task,
@@ -40,6 +41,34 @@ export type SchedulerRoleSession = Readonly<{
   adapterId: string;
   nativeSessionId?: string;
   status: "reserved" | "ready" | "running" | "stopped" | "broken";
+  /** Last durable session transition, when the adapter can expose it. */
+  updatedAt?: string;
+}>;
+
+export type RoleRunStallPersistence = Readonly<{
+  taskId: string;
+  roleName: string;
+  runId: string;
+  kind: "delivery-stalled" | "execution-stalled";
+  classification: "truly-stalled";
+  progressAt: string;
+  idleMs: number;
+  evidenceKey: string;
+  now: Date;
+}>;
+
+export type SchedulerRunProgress = Readonly<{
+  progressAt: string;
+  evidence?: string;
+}>;
+
+export type RoleRunProgressPersistence = Readonly<{
+  taskId: string;
+  roleName: string;
+  runId: string;
+  progressAt: string;
+  evidence?: string;
+  now: Date;
 }>;
 
 /**
@@ -151,6 +180,14 @@ export interface SchedulerStorePort {
     taskIds?: ReadonlySet<string>
   ): readonly string[];
   getRoleSession(taskId: string, roleName: string): SchedulerRoleSession | null;
+  /** Immutable runtime facts used by the low-frequency stall projection. */
+  listEvents?(taskId: string): readonly TaskEvent[];
+  /** Optional richer fold of WorkItem/Review/Integration progress for a Run. */
+  getRunDurableProgress?(taskId: string, roleName: string, runId: string): SchedulerRunProgress | null;
+  /** Materializes a newly observed related-record fold as one run.progress fact. */
+  recordRoleRunProgress?(input: RoleRunProgressPersistence): "recorded" | "already-recorded" | "state-changed";
+  /** Atomically records one new stall episode and routes its responsibility. */
+  recordRoleRunStall?(input: RoleRunStallPersistence): "raised" | "already-raised" | "state-changed";
   hasInFlightTurn(taskId: string, roleName: string): boolean;
   nextAgentRunId(taskId: string): string;
 

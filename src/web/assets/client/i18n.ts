@@ -20,7 +20,7 @@ const messages = {
     "overview.lede": "Tracking {total} tasks — {active} active, {inputs} awaiting input, {completed} completed.",
     "overview.distribution": "Status distribution",
     "overview.attention": "Needs attention",
-    "overview.attentionEmpty": "No open inputs. Nothing is waiting on you.",
+    "overview.attentionEmpty": "No open inputs or stalled Runs.",
     "overview.activeNow": "Active now",
     "overview.activeEmpty": "No tasks are currently active.",
     "sync.label": "LAST SYNC",
@@ -45,6 +45,8 @@ const messages = {
     "detail.completedBy": "Completed by",
     "detail.focus": "Current focus",
     "detail.execution": "Execution",
+    "detail.runtimeHealth": "Runtime health",
+    "detail.lastProgress": "Last semantic progress",
     "detail.roles": "Roles",
     "detail.workItems": "Work items",
     "detail.openInput": "Open input",
@@ -131,6 +133,7 @@ const messages = {
     "work.superseded": "Superseded",
     "stats.running": "running",
     "stats.inputs": "inputs",
+    "stats.stalledRuns": "stalled Runs",
     "time.justNow": "just now"
   },
   "zh-CN": {
@@ -153,7 +156,7 @@ const messages = {
     "overview.lede": "正在跟踪 {total} 个任务 —— {active} 个进行中,{inputs} 个待处理输入,{completed} 个已完成。",
     "overview.distribution": "状态分布",
     "overview.attention": "需要关注",
-    "overview.attentionEmpty": "没有待处理输入,当前无需你介入。",
+    "overview.attentionEmpty": "没有待处理输入或停滞运行,当前无需你介入。",
     "overview.activeNow": "进行中",
     "overview.activeEmpty": "当前没有进行中的任务。",
     "sync.label": "最近同步",
@@ -178,6 +181,8 @@ const messages = {
     "detail.completedBy": "完成人",
     "detail.focus": "当前重点",
     "detail.execution": "执行记录",
+    "detail.runtimeHealth": "运行健康",
+    "detail.lastProgress": "最近语义进展",
     "detail.roles": "角色",
     "detail.workItems": "工作项",
     "detail.openInput": "待处理输入",
@@ -264,6 +269,7 @@ const messages = {
     "work.superseded": "已替代",
     "stats.running": "运行中",
     "stats.inputs": "项输入",
+    "stats.stalledRuns": "停滞运行",
     "time.justNow": "刚刚"
   }
 };

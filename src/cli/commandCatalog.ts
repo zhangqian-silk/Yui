@@ -460,7 +460,7 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "run",
     summary: "Inspect and control Task Role Agent Runs.",
-    sections: [{ id: "manage", title: "Commands", entries: ["list", "retry", "yield"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["list", "retry", "yield", "checkpoint"] }],
     children: [
       { name: "list", summary: "List Runs for a work item.", usage: "yui task run list <work>" },
       { name: "retry", summary: "Retry a failed Run.", usage: "yui task run retry <run>" },
@@ -470,6 +470,14 @@ const taskChildren: readonly NodeInput[] = [
         usage: "yui task run yield <run> (--summary <text>|--summary-file <path|->)",
         options: ["--summary", "--summary-file"],
         fileOptions: ["--summary-file"]
+      },
+      {
+        name: "checkpoint",
+        summary: "Record durable progress for a long-running Agent Run.",
+        usage: "yui task run checkpoint <run> (--note <text>|--note-file <path|->)",
+        options: ["--note", "--note-file"],
+        fileOptions: ["--note-file"],
+        hidden: true
       }
     ]
   },

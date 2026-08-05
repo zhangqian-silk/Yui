@@ -37,6 +37,7 @@ function resolveExecutionPath(args: readonly string[]): Invocation {
     const internalExecutable = child !== undefined && (
       (node === ROOT_COMMAND && child.name === "internal")
       || (node.path.join(" ") === "yui completion" && child.name === "candidates")
+      || (node.path.join(" ") === "yui task run" && child.name === "checkpoint")
     );
     if (child === undefined || (child.hidden && !internalExecutable)) {
       if (node.kind === "hybrid" && node.acceptsArguments) break;

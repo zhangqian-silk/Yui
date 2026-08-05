@@ -92,6 +92,65 @@ test("controller scheduler folds completion and liveness phases before wakeups",
   assert.deepEqual(events, ["list-tasks", "list-tasks", "list-tasks", "list-wakeups"]);
 });
 
+test("full controller liveness and stall phases reuse one Role inventory", async () => {
+  const task = { id: "task-1", title: "shared inventory", status: "active", projectBindings: [] };
+  const role = {
+    taskId: task.id,
+    name: "worker",
+    activeAgentId: "codex",
+    adapterId: "codex",
+    workspace: "/tmp/work",
+    status: "running"
+  };
+  const run = {
+    schemaVersion: 3,
+    id: "run-1",
+    taskId: task.id,
+    roleName: role.name,
+    mode: "new",
+    input: "work",
+    purpose: "execution",
+    status: "active",
+    deliveredAt: new Date(0).toISOString(),
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString()
+  };
+  const store = emptyStore();
+  const events = [];
+  let inventoryCalls = 0;
+  let singleInspections = 0;
+  store.listTasks = () => [task];
+  store.getTask = (id) => id === task.id ? task : null;
+  store.listRoles = () => [role];
+  store.getRole = (_taskId, name) => name === role.name ? role : null;
+  store.getActiveAgentRun = () => run;
+  store.listEvents = () => events;
+  store.recordRoleRunStall = () => "raised";
+  store.hasOpenInputRequest = () => false;
+  store.getWorkMailbox = () => null;
+  store.listPendingWakeups = () => [];
+  store.listWorkMailboxes = () => [];
+  const delivery = {
+    ...noTmux,
+    async inspectRole() {
+      singleInspections += 1;
+      return "present";
+    },
+    async inspectRoles(inputs) {
+      inventoryCalls += 1;
+      return inputs.map((input) => ({
+        taskId: input.taskId,
+        roleName: input.roleName,
+        status: "present"
+      }));
+    }
+  };
+
+  await runControllerSchedulerPass(store, delivery, new Date(31 * 60_000));
+  assert.equal(inventoryCalls, 1);
+  assert.equal(singleInspections, 0);
+});
+
 test("a due native Turn completion forgets the finalized Run preparation", async () => {
   const store = emptyStore();
   store.listPendingRuntimeTurnCompletions = () => [{

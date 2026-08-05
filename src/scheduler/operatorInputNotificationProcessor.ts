@@ -2,6 +2,7 @@ import type { InputRequest } from "../input/inputRequest.js";
 import {
   createInputRequestOperatorPresentation,
   createLeaderRecoveryOperatorPresentation,
+  createLeaderStallOperatorPresentation,
   type OperatorAttentionPresentation
 } from "../interaction/operatorPresentation.js";
 import type { OperatorNotification } from "./operatorNotification.js";
@@ -153,7 +154,9 @@ function createAttentionPresentation(
 ): OperatorAttentionPresentation {
   return attention.kind === "input"
     ? createInputRequestOperatorPresentation(attention.request, store.getPresentationContext())
-    : createLeaderRecoveryOperatorPresentation(attention.notification);
+    : attention.notification.type === "leader-stalled"
+      ? createLeaderStallOperatorPresentation(attention.notification)
+      : createLeaderRecoveryOperatorPresentation(attention.notification);
 }
 
 function deduplicateAttention(
@@ -163,7 +166,9 @@ function deduplicateAttention(
   return attentions.filter((attention) => {
     const key = attention.kind === "input"
       ? `input:${attention.request.id}`
-      : `recovery:${attention.notification.taskId}:${attention.notification.createdAt}`;
+      : attention.notification.type === "leader-stalled"
+        ? `stall:${attention.notification.taskId}:${attention.notification.runId}:${attention.notification.progressAt}`
+        : `recovery:${attention.notification.taskId}:${attention.notification.createdAt}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;

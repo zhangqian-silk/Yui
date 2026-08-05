@@ -1,6 +1,8 @@
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task, TaskStatus } from "../task/task.js";
 import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
+import { isRoleRunStalled } from "../scheduler/roleRunStall.js";
+import type { TaskEvent } from "../event/taskEvent.js";
 
 export type WebDashboardStore = Pick<TaskStore,
   | "transaction"
@@ -15,7 +17,9 @@ export type WebDashboardStore = Pick<TaskStore,
   | "listDecisions"
   | "listMilestones"
   | "listProjects"
->;
+> & Readonly<{
+  listEvents?: (taskId: string) => readonly TaskEvent[];
+}>;
 
 type WorkItemCounts = Readonly<{
   total: number;
@@ -29,6 +33,7 @@ type DashboardTask = Task & Readonly<{
   workItems: WorkItemCounts;
   roleCount: number;
   openInputCount: number;
+  needsAttentionCount: number;
   projectNames?: readonly string[];
 }>;
 
@@ -56,6 +61,10 @@ export function buildWebDashboardSnapshot(
       const taskOpenInputs = reader.listInputRequests(task.id)
         .filter((request) => request.status === "open").length;
       openInputs += taskOpenInputs;
+      const events = reader.listEvents?.(task.id) ?? [];
+      const needsAttentionCount = reader.listAgentRuns(task.id)
+        .filter((run) => run.status === "active" && isRoleRunStalled(events, run.id))
+        .length;
       const names = task.projectBindings.flatMap(({ projectId }) => {
         const name = projectNames.get(projectId);
         return name === undefined ? [] : [name];
@@ -65,7 +74,8 @@ export function buildWebDashboardSnapshot(
         ...(names.length === 0 ? {} : { projectNames: names }),
         workItems: countWorkItems(reader.listWorkItems(task.id)),
         roleCount: reader.listRoles(task.id).length,
-        openInputCount: taskOpenInputs
+        openInputCount: taskOpenInputs,
+        needsAttentionCount
       };
     }).sort(compareDashboardTasks);
 
@@ -89,18 +99,45 @@ export function buildWebTaskDetail(store: WebDashboardStore, taskId: string): ob
       const name = projectNamesById.get(projectId);
       return name === undefined ? [] : [name];
     });
+    const runs = reader.listAgentRuns(taskId);
+    const events = reader.listEvents?.(taskId) ?? [];
+    const needsAttentionRuns = runs
+      .filter((run) => run.status === "active" && isRoleRunStalled(events, run.id))
+      .map((run) => ({
+        runId: run.id,
+        roleName: run.roleName,
+        progressAt: latestStallProgress(events, run.id),
+        kind: latestStallField(events, run.id, "kind") ?? "execution-stalled",
+        classification: latestStallField(events, run.id, "classification") ?? "truly-stalled"
+      }));
     return {
       task: projectNames.length === 0 ? task : { ...task, projectNames },
       brief: reader.getTaskBrief(taskId),
       roles: reader.listRoles(taskId),
       workItems: reader.listWorkItems(taskId),
-      runs: reader.listAgentRuns(taskId),
+      runs,
+      runtimeHealth: { needsAttentionRuns },
       openInputs: inputs.filter((request) => request.status === "open"),
       messages: reader.listMessages(taskId),
       decisions: reader.listDecisions(taskId),
       milestones: reader.listMilestones(taskId)
     };
   });
+}
+
+function latestStallProgress(events: readonly TaskEvent[], runId: string): string | undefined {
+  return latestStallField(events, runId, "progressAt");
+}
+
+function latestStallField(
+  events: readonly TaskEvent[],
+  runId: string,
+  field: string
+): string | undefined {
+  const stalled = events
+    .filter((event) => event.type === "run.stalled" && event.payload.runId === runId)
+    .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
+  return stalled?.payload[field];
 }
 
 function countWorkItems(items: readonly WorkItem[]): WorkItemCounts {

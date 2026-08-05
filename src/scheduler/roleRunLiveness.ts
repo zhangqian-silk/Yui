@@ -10,6 +10,23 @@ import { queueLeaderWakeup } from "./wakeupQueue.js";
 export const EXITED_ROLE_RUN_SUMMARY = "The role's tmux session exited before the run yielded.";
 export const DEFAULT_READY_RECOVERY_AGE_MS = 120_000;
 
+export type RoleLiveStatus = "present" | "absent";
+export type RoleLiveStatusSnapshot = ReadonlyMap<string, RoleLiveStatus>;
+
+type RoleRunCandidate = Readonly<{
+  task: ReturnType<typeof selectedSchedulerTasks>[number];
+  role: ReturnType<typeof selectedSchedulerRoles>[number];
+  run: NonNullable<ReturnType<SchedulerStorePort["getActiveAgentRun"]>>;
+  session: ReturnType<SchedulerStorePort["getRoleSession"]>;
+  inspection: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    adapterId: string;
+    nativeSessionId?: string;
+  }>;
+}>;
+
 /**
  * Lightweight liveness only: an active AgentRun whose tmux role is absent is
  * failed, then the Leader is durably queued. No TTL, cooldown, or schedules.
@@ -24,31 +41,11 @@ export async function reconcileExitedRoleRuns(
   selection?: SchedulerReconcileSelection,
   excludedRunIds: ReadonlySet<string> = new Set(),
   minimumReadyRecoveryAgeMs = DEFAULT_READY_RECOVERY_AGE_MS,
-  readyRecoveryRunIds: ReadonlySet<string> = new Set()
+  readyRecoveryRunIds: ReadonlySet<string> = new Set(),
+  liveStatuses?: Map<string, RoleLiveStatus>
 ): Promise<string[]> {
   const failed: string[] = [];
-  const candidates = selectedSchedulerTasks(store, selection).flatMap((task) => (
-    selectedSchedulerRoles(store, task.id, selection).flatMap((role) => {
-      const run = store.getActiveAgentRun(task.id, role.name);
-      if (run === null) return [];
-      const session = store.getRoleSession(task.id, role.name);
-      return [{
-        task,
-        role,
-        run,
-        session,
-        inspection: {
-          taskId: task.id,
-          roleName: role.name,
-          agentId: role.activeAgentId,
-          adapterId: role.adapterId,
-          ...(session?.nativeSessionId === undefined
-            ? {}
-            : { nativeSessionId: session.nativeSessionId })
-        }
-      }];
-    })
-  ));
+  const candidates = activeRunCandidates(store, selection);
   if (candidates.length === 0) return failed;
   const completing = new Set(
     store.listPendingRuntimeTurnCompletions().map((completion) => (
@@ -60,16 +57,15 @@ export async function reconcileExitedRoleRuns(
     && !completing.has(`${task.id}\0${role.name}\0${run.id}`)
   ));
   if (eligible.length === 0) return failed;
-  const batch = delivery.inspectRoles === undefined
-    ? null
-    : await delivery.inspectRoles(eligible.map((candidate) => candidate.inspection));
-  const batchStatuses = batch === null
-    ? new Map<string, "present" | "absent">()
-    : exactBatchStatuses(batch, eligible);
+  const batchStatuses = liveStatuses === undefined || liveStatuses.size === 0
+    ? await inspectEligibleRoleStatuses(delivery, eligible)
+    : liveStatuses;
+  if (liveStatuses !== undefined && liveStatuses.size === 0) {
+    for (const [key, status] of batchStatuses) liveStatuses.set(key, status);
+  }
   for (const { task, role, run, session, inspection } of eligible) {
-      const status = batch === null
-        ? await delivery.inspectRole(inspection)
-        : batchStatuses.get(`${task.id}\0${role.name}`)!;
+      const status = batchStatuses.get(`${task.id}\0${role.name}`);
+      if (status === undefined) throw new Error("Role liveness snapshot is incomplete.");
       if (status === "present") {
         const isFullReconciliation = selection === undefined || selection.full;
         const readyRecoveryDue = readyRecoveryRunIds.has(run.id)
@@ -130,6 +126,52 @@ export async function reconcileExitedRoleRuns(
   return failed;
 }
 
+function activeRunCandidates(
+  store: SchedulerStorePort,
+  selection?: SchedulerReconcileSelection
+): RoleRunCandidate[] {
+  return selectedSchedulerTasks(store, selection).flatMap((task) => (
+    selectedSchedulerRoles(store, task.id, selection).flatMap((role) => {
+      const run = store.getActiveAgentRun(task.id, role.name);
+      if (run === null) return [];
+      const session = store.getRoleSession(task.id, role.name);
+      return [{
+        task,
+        role,
+        run,
+        session,
+        inspection: {
+          taskId: task.id,
+          roleName: role.name,
+          agentId: role.activeAgentId,
+          adapterId: role.adapterId,
+          ...(session?.nativeSessionId === undefined
+            ? {}
+            : { nativeSessionId: session.nativeSessionId })
+        }
+      }];
+    })
+  ));
+}
+
+async function inspectEligibleRoleStatuses(
+  delivery: Pick<TmuxDeliveryPort, "inspectRole" | "inspectRoles">,
+  candidates: readonly RoleRunCandidate[]
+): Promise<RoleLiveStatusSnapshot> {
+  if (delivery.inspectRoles !== undefined) {
+    const batch = await delivery.inspectRoles(candidates.map(({ inspection }) => inspection));
+    return exactBatchStatuses(batch, candidates);
+  }
+  const entries = [];
+  for (const candidate of candidates) {
+    entries.push({
+      key: roleIdentity(candidate.task.id, candidate.role.name),
+      status: await delivery.inspectRole(candidate.inspection)
+    });
+  }
+  return new Map(entries.map(({ key, status }) => [key, status]));
+}
+
 function exactBatchStatuses(
   batch: readonly Readonly<{
     taskId: string;
@@ -154,4 +196,8 @@ function exactBatchStatuses(
     throw new Error("Tmux Role batch liveness snapshot is incomplete.");
   }
   return statuses;
+}
+
+function roleIdentity(taskId: string, roleName: string): string {
+  return `${taskId}\0${roleName}`;
 }

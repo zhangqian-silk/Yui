@@ -271,6 +271,7 @@ function leaderWakeupInput(
     `Current Leader Run: ${runId}.`,
     `Yui wakeup reasons: ${reasons.join(", ")}.`,
     `Read the authoritative context with yui task context ${taskId}.`,
+    "For role-run-stalled or runtime-health attention, diagnose from the exact Run/Event/Session and related WorkItem/Review/Integration records. Preserve the current fence and write a Task Message only for a new root cause, impact, recovery action, acceptance decision, or user-relevant conclusion; an unchanged healthy wait is zero Message.",
     `If the Task is Project-backed, read its catalog entry with yui project show <project> and inspect relevant Yui-maintained knowledge with yui project knowledge list <project> and yui project knowledge show <project> <knowledge>.`,
     "Use narrower Task message, WorkItem, decision, milestone, and input commands only when a specific record needs closer inspection.",
     `When the requested outcome is finished and there are no active Worker Runs or unresolved inputs, complete the Task with yui task complete ${taskId} --summary-file - and a quoted heredoc containing the final outcome and evidence.`,

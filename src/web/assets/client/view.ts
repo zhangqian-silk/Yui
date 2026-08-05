@@ -270,13 +270,20 @@ export function renderOverview(detail, state, t, locale, onSelect) {
     wrap.append(distBlock);
   }
 
-  const attentionTasks = state.tasks.filter(function (task) { return task.openInputCount > 0; });
+  const attentionTasks = state.tasks.filter(function (task) {
+    return task.openInputCount > 0 || (task.needsAttentionCount || 0) > 0;
+  });
   const attentionBlock = node("section", "overview-block");
   attentionBlock.append(node("h3", "", t("overview.attention") + " · " + attentionTasks.length));
   if (attentionTasks.length) {
     const list = node("div", "overview-list");
     attentionTasks.forEach(function (task) {
-      list.append(overviewRow(task, task.openInputCount + " " + t("stats.inputs"), "has-inputs", onSelect));
+      const labels = [];
+      if (task.openInputCount > 0) labels.push(task.openInputCount + " " + t("stats.inputs"));
+      if ((task.needsAttentionCount || 0) > 0) {
+        labels.push(task.needsAttentionCount + " " + t("stats.stalledRuns"));
+      }
+      list.append(overviewRow(task, labels.join(" · "), "has-inputs", onSelect));
     });
     attentionBlock.append(list);
   } else {
@@ -412,6 +419,23 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
       inputSection.append(card);
     });
     detail.append(inputSection);
+  }
+
+  const stalledRuns = data.runtimeHealth && data.runtimeHealth.needsAttentionRuns
+    ? data.runtimeHealth.needsAttentionRuns
+    : [];
+  if (stalledRuns.length) {
+    const runtimeHealthSection = section(t("detail.runtimeHealth") + " · " + stalledRuns.length);
+    stalledRuns.forEach(function (run) {
+      const card = node("article", "record-card");
+      card.append(
+        node("strong", "", run.roleName + " · " + run.runId),
+        node("p", "record-copy", (run.kind || "execution-stalled") + " · " + (run.classification || "truly-stalled")),
+        node("small", "", t("detail.lastProgress") + " · " + formatDateTime(run.progressAt, locale))
+      );
+      runtimeHealthSection.append(card);
+    });
+    detail.append(runtimeHealthSection);
   }
 
   const briefSection = section(t("detail.focus"));

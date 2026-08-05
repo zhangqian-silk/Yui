@@ -19,6 +19,7 @@ import { createAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
 import { processActiveRoleRunDeliveries } from "../../dist/scheduler/activeRoleRunDelivery.js";
 import { processLeaderWakeups } from "../../dist/scheduler/leaderWakeupProcessor.js";
 import { processOperatorInputNotifications } from "../../dist/scheduler/operatorInputNotificationProcessor.js";
+import { reconcileStalledRoleRuns } from "../../dist/scheduler/roleRunStall.js";
 import { queueLeaderWakeup } from "../../dist/scheduler/wakeupQueue.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
@@ -80,6 +81,35 @@ test("FileSchedulerStoreAdapter commits Leader run, Role and fixed session toget
   assert.equal(store.getRole(task.id, role.name).status, "running");
   assert.equal(store.getRoleSession(task.id, role.name).nativeSessionId, "thread-1");
   assert.equal(JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision, before + 1);
+});
+
+test("Leader delivery stall is routed through the existing Operator notification lane", async (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  const run = createAgentRun("agent-run-leader-stall", task.id, role.name, "new", "continue", now);
+  assert.equal(adapter.saveLeaderDispatch({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: null,
+    wakeup: store.getPendingWakeup(task.id),
+    now
+  }), "claimed");
+  const result = await reconcileStalledRoleRuns(
+    adapter,
+    { async inspectRole() { return "present"; } },
+    new Date(now.getTime() + 31 * 60_000),
+    undefined,
+    30 * 60_000
+  );
+  assert.equal(result[0].kind, "delivery-stalled");
+  assert.equal(result[0].classification, "truly-stalled");
+  const stalled = store.listEvents(task.id).find((event) => event.type === "run.stalled");
+  assert.equal(stalled.payload.runId, run.id);
+  assert.equal(stalled.payload.kind, "delivery-stalled");
+  assert.equal(store.getPendingWakeup(task.id), null);
+  assert.equal(store.getOperatorNotification(task.id).type, "leader-stalled");
+  const operatorMailbox = store.getWorkMailbox({ kind: "operator" });
+  assert.equal(operatorMailbox.pending.reasons.includes("leader-run-stalled"), true);
 });
 
 test("Leader dispatch rejects a stale launch configuration snapshot", (t) => {

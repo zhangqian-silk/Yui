@@ -1,8 +1,10 @@
 import { taskNotFound, usageError } from "../errors/cliError.js";
+import type { TaskEvent } from "../event/taskEvent.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import { taskMessageAuthorLabel } from "../message/message.js";
 import { formatTimestamp } from "../output/timePresentation.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import { isRoleRunStalled, latestStallProgressAt } from "../scheduler/roleRunStall.js";
 
 const RECENT_RECORD_LIMIT = 5;
 const RELATED_RECORD_LIMIT = 5;
@@ -194,6 +196,21 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       ]
     ),
     "",
+    "Runtime health:",
+    ...(() => {
+      const stalled = agentRuns.filter((run) => (
+        run.status === "active" && isRoleRunStalled(events, run.id)
+      ));
+      return stalled.length === 0
+        ? ["  No needs-attention Runs."]
+        : stalled.flatMap((run) => [
+            `  ${run.id} [needs-attention] ${run.roleName}`,
+            `    Durable progress: ${formatTimestamp(latestStallProgressAt(events, run.id) ?? run.updatedAt, timeZone)}`,
+            `    Cause: ${latestStallKind(events, run.id)} with no new semantic Run evidence in the stall window`,
+            "    Next: inspect Task context/Role status; no automatic retry or Session replacement was performed."
+          ]);
+    })(),
+    "",
     `ChangeSets (${changeSets.length}):`,
     ...(changeSets.length === 0
       ? ["  None."]
@@ -252,6 +269,13 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     output: `${lines.join("\n")}\n`,
     data
   };
+}
+
+function latestStallKind(events: readonly TaskEvent[], runId: string): string {
+  const event = [...events]
+    .filter((candidate) => candidate.type === "run.stalled" && candidate.payload.runId === runId)
+    .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
+  return event?.payload.kind ?? "execution-stalled";
 }
 
 function renderWorkItemReviews(
