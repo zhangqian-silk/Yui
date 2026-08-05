@@ -59,7 +59,31 @@ export type StorageActivation = Readonly<
   | { status: "already-current" }
   | { status: "migrated"; backupPath?: string }
   | { status: "blocked"; stage: string; message: string; action: string }
+  /**
+   * The activation child did not return a parseable success/failure receipt
+   * (e.g. killed by SIGTERM/OOM after the atomic switch, or crashed before
+   * printing its JSON). The storage state is UNKNOWN: the switch may or may not
+   * have committed. Never treat this as recoverable-and-unchanged (P1-2); the
+   * orchestrator resolves the true state from the on-disk receipt + backup +
+   * schema and reports an explicit manual recovery.
+   */
+  | { status: "ambiguous"; detail: string }
 >;
+
+/**
+ * A read-only probe of the target Home's storage state, used to resolve an
+ * ambiguous activation. `switched` is a durable receipt the activation writes
+ * the instant its atomic switch commits; `backupPath` locates the pre-switch
+ * Home; `schemaCurrent` says whether the Home now loads at the current version.
+ */
+export type StorageStateProbe = Readonly<{
+  /** A completion receipt was found (the switch provably committed). */
+  switched: boolean;
+  /** The timestamped backup of the pre-switch Home, when known. */
+  backupPath?: string;
+  /** Whether the on-disk Home is now at the current, loadable schema. */
+  schemaCurrent: boolean;
+}>;
 
 /**
  * Injected side effects. The real implementations spawn npm and the staged
@@ -73,10 +97,19 @@ export type UpdatePorts = Readonly<{
   preflight: (staged: StagedPackage, home: string) => UpdatePreflight;
   /** Promote the staged storage into place (atomic switch + backup). */
   activateStorage: (staged: StagedPackage, home: string) => StorageActivation;
-  /** Promote the staged package to the live global install. */
+  /** Promote the SAME staged artifact to the live global install (P1-3). */
   activateBinary: (staged: StagedPackage) => void;
-  /** New-binary health check over the migrated Home; throws on failure. */
+  /**
+   * New-binary health check over the migrated Home; throws on failure. Runs the
+   * ACTUALLY-ACTIVATED global binary (not the staging path) and confirms its
+   * version/identity matches the staged artifact (P1-3).
+   */
   verify: (staged: StagedPackage, home: string) => void;
+  /**
+   * Read-only probe of the Home's storage state, to resolve an ambiguous
+   * activation from the durable receipt + backup + current schema (P1-2).
+   */
+  probeStorage: (home: string) => StorageStateProbe;
   /** Best-effort staging cleanup. */
   cleanup: (staged: StagedPackage) => void;
 }>;
@@ -94,6 +127,24 @@ export type UpdateResult = Readonly<
       recoverable: boolean;
       version?: string;
       storageBackupPath?: string;
+    }
+  /**
+   * The storage activation's outcome could not be determined: the switch may or
+   * may not have committed. This is NEITHER a clean recovery NOR a completed
+   * update — it demands manual verification. Carries the best available evidence
+   * (receipt/backup/schema) and the precise steps to resolve it (P1-2).
+   */
+  | {
+      outcome: "ambiguous";
+      phase: UpdatePhase;
+      message: string;
+      action: string;
+      version?: string;
+      storageBackupPath?: string;
+      /** Whether the on-disk Home is now at the current, loadable schema. */
+      schemaCurrent: boolean;
+      /** Whether a durable completion receipt was found. */
+      switched: boolean;
     }
 >;
 
@@ -163,6 +214,12 @@ export function runUpdate(
         version: staged.version
       };
     }
+    if (activation.status === "ambiguous") {
+      // The activation child left no parseable receipt: the switch may or may not
+      // have committed. Resolve the true state from the durable on-disk evidence
+      // and report an explicit manual recovery — never a false "recoverable".
+      return resolveAmbiguousActivation(ports, staged, home, activation.detail);
+    }
     const backupPath = activation.status === "migrated" ? activation.backupPath : undefined;
 
     // 4/5) Promote the binary, then post-verify with the new binary's loader.
@@ -227,6 +284,88 @@ function activateAndVerify(
   return storageBackupPath === undefined
     ? { outcome: "updated", version: staged.version }
     : { outcome: "updated", version: staged.version, storageBackupPath };
+}
+
+/**
+ * Resolve an ambiguous storage activation (P1-2): the activation child left no
+ * parseable receipt, so the switch may or may not have committed. Probe the
+ * durable on-disk evidence and report an explicit manual recovery — this is
+ * NEVER reported as recoverable-and-unchanged.
+ *
+ * The verdict is driven by the completion receipt first (the switch writes it the
+ * instant it commits), then corroborated by the on-disk schema:
+ *  - receipt present  -> the switch committed; point at the backup and require
+ *    the operator to verify the migrated Home before resuming (the binary was
+ *    never promoted, so the old binary fail-closes on the new schema).
+ *  - no receipt, schema already current -> most likely the switch never ran
+ *    (or fully reverted); still require an explicit re-run rather than asserting
+ *    "unchanged", because stdout was lost.
+ *  - no receipt, schema not current -> genuinely indeterminate; give the
+ *    operator the exact files to inspect.
+ */
+function resolveAmbiguousActivation(
+  ports: UpdatePorts,
+  staged: StagedPackage,
+  home: string,
+  detail: string
+): UpdateResult {
+  let probe: StorageStateProbe;
+  try {
+    probe = ports.probeStorage(home);
+  } catch (error) {
+    // Even the probe failed: report maximum uncertainty with the raw evidence.
+    return {
+      outcome: "ambiguous",
+      phase: "activate-storage",
+      message: `Storage activation result is unknown (${detail}); probing the Home also failed: ${messageOf(error)}.`,
+      action:
+        `Do NOT assume the update succeeded or was a no-op. Manually inspect ${home} and any `
+        + `"${home}.backup-*" sibling and "${home}.upgrade-receipt.json"; if a receipt exists the `
+        + `switch committed — verify the migrated Home with "yui doctor" before resuming, otherwise `
+        + `restore the newest backup with mv before re-running "yui update".`,
+      version: staged.version,
+      schemaCurrent: false,
+      switched: false
+    };
+  }
+
+  if (probe.switched) {
+    // The switch provably committed; the binary was not promoted.
+    return {
+      outcome: "ambiguous",
+      phase: "activate-storage",
+      message:
+        `Storage was switched (a completion receipt is present) but the activation process `
+        + `did not confirm success (${detail}). The new binary was NOT promoted.`,
+      action:
+        `Verify the migrated Home before resuming writes: run "yui doctor"`
+        + `${probe.backupPath === undefined ? "" : ` (its timestamped backup is ${probe.backupPath})`}. `
+        + `If it is healthy, finish by re-running "yui update" to promote the binary; if not, restore `
+        + `the backup with mv "${probe.backupPath ?? "<home>.backup-*"}" "${home}". Do NOT resume `
+        + `writes with the old binary against the migrated Home.`,
+      version: staged.version,
+      schemaCurrent: probe.schemaCurrent,
+      switched: true,
+      ...(probe.backupPath === undefined ? {} : { storageBackupPath: probe.backupPath })
+    };
+  }
+
+  // No receipt: the switch most likely never committed, but stdout was lost so we
+  // cannot assert "unchanged". Require an explicit, verified re-run.
+  return {
+    outcome: "ambiguous",
+    phase: "activate-storage",
+    message:
+      `Storage activation did not confirm a result (${detail}) and no completion receipt was found`
+      + `${probe.schemaCurrent ? "; the Home currently loads at the current schema" : ""}.`,
+    action:
+      `The switch most likely did not commit, but this was not confirmed. Verify with "yui doctor" `
+      + `and check for any "${home}.backup-*" sibling before retrying; then re-run "yui update". Do `
+      + `NOT assume the update completed.`,
+    version: staged.version,
+    schemaCurrent: probe.schemaCurrent,
+    switched: false
+  };
 }
 
 function messageOf(error: unknown): string {

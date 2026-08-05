@@ -8,12 +8,20 @@
  * incompatible component (layout vs aggregate).
  *
  * Corruption is only ever reported from a *real* structural failure: a
- * `state.json` that fails the strict `parseState` gate (bad record shape, a
- * broken reference graph), or a `schema.json` manifest that is not valid. It is
- * never inferred from version magnitude. An older or newer version is a version
- * verdict (`MIGRATABLE` when a complete step path exists, else
- * `NEEDS_NEW_VERSION`), never `CORRUPTED`. With the registry shipping EMPTY, any
- * strictly-older Home is `NEEDS_NEW_VERSION` via a precise `missing-step` reason.
+ * `state.json` that is not parseable / not shaped like the record locators
+ * describe / carries a record with an invalid `schemaVersion`, a broken reference
+ * graph (detected by the strict loader once every axis is already current), or a
+ * `schema.json` manifest that is not valid. It is never inferred from version
+ * magnitude. An older or newer version — on ANY axis, including a single older
+ * record family — is a version verdict (`MIGRATABLE` when a complete step path
+ * exists, else `NEEDS_NEW_VERSION`), never `CORRUPTED`. With the registry shipping
+ * EMPTY, any strictly-older Home is `NEEDS_NEW_VERSION` via a precise
+ * `missing-step` reason.
+ *
+ * The three axes are independent: the record axis is read structurally from the
+ * raw `state.json` (see `inspectSourceVersionState` / `recordVersionScan.ts`), so
+ * a record-only-older Home is classified on its version axis rather than being
+ * misreported as corrupted by the strict loader.
  */
 
 import {
@@ -28,7 +36,10 @@ import {
   type StorageSchemaState
 } from "../storageSchema.js";
 import { FileTaskStore, StorageRecordError } from "../taskStore.js";
-import type { HomeSnapshot } from "./homeMigrationTarget.js";
+import {
+  inspectSourceVersionState,
+  type HomeSnapshot
+} from "./homeMigrationTarget.js";
 
 /** The rich, presentation-ready classification of a Home. */
 export type HomeClassification = Readonly<{
@@ -82,16 +93,30 @@ export function classifyHome<Snapshot>(
     };
   }
 
-  const source: StorageVersionState = {
-    layout: schema.currentLayoutVersion,
-    aggregate: schema.currentAggregateSchemaVersion,
-    // See homeMigrationTarget: the scalar axes block first in planner order, so
-    // the source record map is only consulted once layout+aggregate are current,
-    // at which point parseState has proven every record is at its current version.
-    record: latest.record
-  };
+  // Read all three axes read-only. The record axis is extracted structurally from
+  // the raw state.json (never through the strict loader), so an older/newer
+  // record family is a version fact — not a false corruption. Structural JSON
+  // damage surfaces here as a corruption signal.
+  const inspected = inspectSourceVersionState(home, latest);
+  if ("corruption" in inspected) {
+    return {
+      ...base,
+      classification: { verdict: "CORRUPTED", detail: inspected.corruption.detail },
+      layoutVersion: schema.currentLayoutVersion,
+      aggregateVersion: schema.currentAggregateSchemaVersion,
+      ...(incompatibleComponentOf(schema) === undefined
+        ? {}
+        : { incompatibleComponent: incompatibleComponentOf(schema) })
+    };
+  }
+  const source: StorageVersionState = inspected.source;
 
-  const corruption = schema.status === "current"
+  // The reference graph can only be validated by the strict loader, which only
+  // understands the current versions. So run it exactly when every axis is
+  // already current (the plan would be a no-op); a throw there is genuine
+  // structural/reference corruption, never a version mismatch. An older/newer
+  // axis skips the loader and is decided purely by the planner below.
+  const corruption = isFullyCurrent(source, latest)
     ? detectCurrentHomeCorruption(home)
     : undefined;
 
@@ -108,9 +133,11 @@ export function classifyHome<Snapshot>(
 }
 
 /**
- * Load a *current-version* Home through the strict `FileTaskStore` gate to
- * detect real structural/reference corruption. A version error cannot occur
- * here (the manifest already reported `current`), so any throw is corruption.
+ * Load a Home whose every axis is already current through the strict
+ * `FileTaskStore` gate to detect real structural/reference corruption. This is
+ * only ever called when the source equals `latest` across all three axes, so a
+ * version error cannot occur here and any throw is genuine corruption (bad
+ * record shape, a broken reference graph).
  */
 function detectCurrentHomeCorruption(home: string): CorruptionSignal | undefined {
   try {
@@ -129,6 +156,29 @@ function detectCurrentHomeCorruption(home: string): CorruptionSignal | undefined
     // silently swallowed as "usable".
     throw error;
   }
+}
+
+/** True when the source is already at `latest` on every axis (a no-op plan). */
+function isFullyCurrent(
+  source: StorageVersionState,
+  latest: StorageVersionState
+): boolean {
+  if (source.layout !== latest.layout || source.aggregate !== latest.aggregate) {
+    return false;
+  }
+  // Every family shared by source and target must already match; a family
+  // present on only one side is a difference the planner reasons about, not a
+  // "current" match, so it is not fully current.
+  const kinds = new Set([
+    ...Object.keys(source.record),
+    ...Object.keys(latest.record)
+  ]);
+  for (const kind of kinds) {
+    const from = source.record[kind]?.version;
+    const to = latest.record[kind]?.version;
+    if (from !== to) return false;
+  }
+  return true;
 }
 
 function incompatibleComponentOf(

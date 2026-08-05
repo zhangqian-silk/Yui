@@ -204,6 +204,23 @@ NEEDS_NEW_VERSION (with a `future-version` or `missing-step` reason plus the
 incompatible layout/aggregate component), or CORRUPTED — the last only for real
 structural/reference damage, never inferred from a version number.
 
+The three axes are genuinely independent, including the record axis. The
+scalar `layout`/`aggregate` versions come from `schema.json`; the per-family
+`record` versions are extracted **structurally** from the raw `state.json`
+(read-only JSON traversal following each family's `recordKind -> {version,path}`
+locator), *never* through the strict `FileTaskStore` loader. This matters
+because the loader validates every record against the current release and throws
+on the first older family — which would misreport a home whose only difference is
+an older record family as CORRUPTED and block it from ever migrating. Reading the
+record axis structurally keeps a record-only-older home on its version axis: it
+plans as MIGRATABLE (with a step path) or NEEDS_NEW_VERSION (fail-closed under the
+empty registry), exactly like an older scalar axis. The strict loader is used
+only to detect a broken reference graph, and only once **every** axis is already
+current (a no-op plan) — the one case where a load failure is genuine corruption
+rather than a version mismatch. CORRUPTED is otherwise reserved for real
+structural JSON damage: an unparseable `state.json`, a container whose shape does
+not match its locator, or a record with a missing/invalid `schemaVersion`.
+
 `yui upgrade` is the transactional storage-migration entry point. Execute mode
 places an **admission fence** honored at the single storage write choke point,
 so both baseline CLI writers and the Controller (which mutate through the same
@@ -226,10 +243,43 @@ recovery action; `--dry-run` runs through the validation gate and discards the
 staged output without switching. This release never migrates a real home (the
 registry is empty); the machinery is future-facing.
 
+**Quiesce fails closed on any undeterminable signal.** The `.state.lock` is
+acquired mkdir-first with its `owner` file written a moment later, so a lock
+directory that exists but whose owner is missing, empty, non-integer, or
+unreadable is *not* proof of "no writer" — it may be a writer mid-acquisition.
+Quiesce therefore treats such a lock as **unknown-active** and refuses to proceed
+(reporting an `active-runtime` blocker); only a lock whose owner is clearly
+readable *and* names a dead PID is reclaimable. A `runtime/controller.json` that
+exists but is malformed/unparseable is treated the same way — a live Controller
+cannot be ruled out, so it fails closed rather than being read as "no
+controller". A lock or discovery file that is provably absent is the only "no
+runtime" case.
+
 `yui update` stages the published package side by side (never replacing the live
 install first), runs the staged binary's read-only preflight against the home,
 and only then migrates storage and promotes the binary, with a new-binary health
-check last. **Rollback boundary (narrowed):** this release introduces no
+check last. **Same-artifact promotion:** the version resolved at stage time is
+pinned, and binary activation installs that exact `@zq-silk/yui@<version>` — never
+a second bare `@latest` that could resolve to a different build than the one that
+passed preflight. **Verify the activated binary:** the post-update health check
+runs the *actually-activated* global binary (resolved via `npm prefix -g`), not
+the staging path, and confirms its reported version matches the staged artifact;
+a mismatch (e.g. staged A but `@latest` moved to B) fails closed.
+
+**Activation ambiguity.** Storage activation runs in a spawned staged-binary
+child. If that child is killed (SIGTERM/OOM) or crashes *after* the atomic switch
+commits but *before* it prints its result JSON, the parent cannot tell "nothing
+happened" from "storage already switched". This is reported as a distinct
+**ambiguous** outcome — never a false "recoverable/unchanged". The switch writes
+a durable completion **receipt** at a sibling path (`<home>.upgrade-receipt.json`)
+the instant it commits, and clears it only on a clean, fully-verified return; so
+its presence proves the switch committed even when stdout was lost. On an
+ambiguous result the orchestrator probes the receipt + timestamped backup +
+current schema and prints precise manual-recovery steps (verify with `yui doctor`;
+restore the named backup with `mv` if needed), and the CLI exits non-zero with a
+dedicated code so the ambiguity is never mistaken for success.
+
+**Rollback boundary (narrowed):** this release introduces no
 versioned binary pointer or stable launcher and therefore makes no binary+home
 dual-resource atomicity claim. It guarantees isolated staging (a
 stage/preflight failure leaves binary and home unchanged), a recoverable atomic

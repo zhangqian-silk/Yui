@@ -45,6 +45,7 @@ import { writeTextFileAtomically } from "../durableFile.js";
 import { inspectStorageSchema, STORAGE_SCHEMA_FILE } from "../storageSchema.js";
 import { FileTaskStore, STORAGE_STATE_FILE } from "../taskStore.js";
 import { readUpgradeFence, type UpgradeFence } from "../upgradeFence.js";
+import { scanSourceRecordVersions } from "./recordVersionScan.js";
 import type {
   DerivedStateSummary,
   LiveRuntimeStatus,
@@ -65,12 +66,47 @@ export type HomeSnapshot = Readonly<{
 const STATE_LOCK_DIRECTORY = ".state.lock";
 const CONTROLLER_DISCOVERY_FILE = "runtime/controller.json";
 
+/**
+ * A `.state.lock` holder. The lock is acquired mkdir-first and the owner file is
+ * written a moment later (see `taskStore.acquireStorageLock`), so a lock whose
+ * owner is missing/unreadable/non-integer/empty is NOT provably absent — it may
+ * be a writer mid-acquisition or a live process whose owner file we cannot read.
+ * The quiesce gate must treat that as active and fail closed, never fail open.
+ */
+export type WriteLockHolder = Readonly<
+  /** The owner file names a live foreign process. */
+  | { state: "live"; ownerPid: number }
+  /**
+   * The lock directory exists but its owner cannot be determined (missing,
+   * empty, non-integer, or unreadable). Fail-closed: treated as active.
+   */
+  | { state: "unknown" }
+>;
+
+/** Discovery of the per-home Controller from its `runtime/controller.json`. */
+export type ControllerDiscovery = Readonly<
+  /** The discovery file names a live process. */
+  | { state: "live"; pid: number }
+  /**
+   * The discovery file exists but is malformed/unparseable, so we cannot rule
+   * out a live Controller. Fail-closed: treated as active.
+   */
+  | { state: "unknown" }
+>;
+
 /** Layout-agnostic runtime signals used by the quiesce gate and the engine. */
 export type HomeRuntimeSignals = Readonly<{
-  /** A `.state.lock` held by a live foreign process (another writer). */
-  foreignWriteLock: Readonly<{ ownerPid: number }> | null;
-  /** A live per-home Controller (its discovery file names a live process). */
-  liveController: Readonly<{ pid: number }> | null;
+  /**
+   * A `.state.lock` holder, or `null` only when the lock directory is provably
+   * absent. A present-but-undeterminable lock is `{ state: "unknown" }`, not
+   * `null`, so an ambiguous lock fails closed.
+   */
+  foreignWriteLock: WriteLockHolder | null;
+  /**
+   * The per-home Controller discovery, or `null` only when there is provably no
+   * discovery file. A present-but-malformed file is `{ state: "unknown" }`.
+   */
+  liveController: ControllerDiscovery | null;
   /** The current upgrade fence, if any. */
   fence: UpgradeFence | null;
 }>;
@@ -91,9 +127,27 @@ export function inspectHomeRuntime(
   };
 }
 
-/** True when any live runtime is actively holding the Home right now. */
+/**
+ * True when any live-or-undeterminable runtime is holding the Home. A holder we
+ * cannot positively clear (`unknown`) counts as active — fail closed.
+ */
 export function homeRuntimeIsActive(signals: HomeRuntimeSignals): boolean {
   return signals.foreignWriteLock !== null || signals.liveController !== null;
+}
+
+/** A human-readable description of why the runtime is considered active. */
+export function describeActiveRuntime(signals: HomeRuntimeSignals): string {
+  if (signals.liveController !== null) {
+    return signals.liveController.state === "live"
+      ? `Controller pid ${signals.liveController.pid} is running.`
+      : `A ${CONTROLLER_DISCOVERY_FILE} exists but is malformed; a live Controller cannot be ruled out.`;
+  }
+  if (signals.foreignWriteLock !== null) {
+    return signals.foreignWriteLock.state === "live"
+      ? `Another writer holds ${STATE_LOCK_DIRECTORY} (pid ${signals.foreignWriteLock.ownerPid}).`
+      : `${STATE_LOCK_DIRECTORY} exists but its owner is undeterminable; another writer cannot be ruled out.`;
+  }
+  return "A live runtime is holding the Home.";
 }
 
 export type HomeMigrationTargetOptions = Readonly<{
@@ -128,35 +182,21 @@ export function createHomeMigrationTarget(
     stagingPath,
 
     inspectVersions(): StorageVersionState {
-      const schema = inspectStorageSchema(home);
-      switch (schema.status) {
-        case "current":
-        case "unsupported":
-          return {
-            layout: schema.currentLayoutVersion,
-            aggregate: schema.currentAggregateSchemaVersion,
-            // Record families are validated per-version by parseState, so a
-            // readable current Home is provably at the current record map; an
-            // older/newer scalar axis blocks first in planner order, so the
-            // source record map is only consulted when it is already current.
-            record: latest.record
-          };
-        case "uninitialized":
-          throw new Error(
-            "Cannot inspect versions: Yui storage is not initialized. Run `yui setup`."
-          );
-        case "invalid":
-          throw new Error(`Storage schema manifest is invalid: ${schema.detail}`);
+      const inspected = inspectSourceVersionState(home, latest);
+      if ("corruption" in inspected) {
+        // A structurally-damaged source cannot yield trustworthy versions. The
+        // engine has no CORRUPTED outcome, so surface it as a hard error rather
+        // than pretend the record axis is current (the classifier turns the same
+        // structural damage into a CORRUPTED verdict for doctor/upgrade).
+        throw new Error(inspected.corruption.detail);
       }
+      return inspected.source;
     },
 
     detectLiveRuntime(): LiveRuntimeStatus {
       const signals = inspectHomeRuntime(home, callerPid);
       if (!homeRuntimeIsActive(signals)) return { active: false };
-      const detail = signals.liveController !== null
-        ? `Controller pid ${signals.liveController.pid} is running.`
-        : `Another writer holds ${STATE_LOCK_DIRECTORY} (pid ${signals.foreignWriteLock?.ownerPid}).`;
-      return { active: true, detail };
+      return { active: true, detail: describeActiveRuntime(signals) };
     },
 
     readSource(): HomeSnapshot {
@@ -247,41 +287,141 @@ export function createHomeMigrationTarget(
   };
 }
 
+/**
+ * The read-only source version state, or the structural corruption that blocks
+ * reading it. Callers (the target's `inspectVersions`, the classifier) share this
+ * so the three axes are read the same way in both places.
+ */
+export type SourceVersionInspection = Readonly<
+  | { source: StorageVersionState }
+  | { corruption: Readonly<{ corrupted: true; detail: string }> }
+>;
+
+/**
+ * Read a source Home's full three-axis {@link StorageVersionState} read-only.
+ *
+ * The scalar `layout`/`aggregate` versions come from `schema.json`; the `record`
+ * axis is extracted structurally from the raw `state.json` (never through the
+ * strict `parseState`, which would conflate an older record family with
+ * corruption — see P1-1 / `recordVersionScan.ts`). This is the single seam that
+ * makes the record axis genuinely independent of the scalar axes: a record-only-
+ * older Home yields an older `record` map here, so the planner produces a
+ * record-axis verdict instead of the loader falsely reporting `CORRUPTED`.
+ *
+ * Returns `corruption` when the manifest is invalid, storage is uninitialized, or
+ * `state.json` is structurally damaged; callers map that to a hard error (engine)
+ * or a `CORRUPTED` verdict (classifier).
+ */
+export function inspectSourceVersionState(
+  home: string,
+  latest: StorageVersionState
+): SourceVersionInspection {
+  const schema = inspectStorageSchema(home);
+  if (schema.status === "uninitialized") {
+    return {
+      corruption: {
+        corrupted: true,
+        detail: "Yui storage is not initialized. Run `yui setup`."
+      }
+    };
+  }
+  if (schema.status === "invalid") {
+    return {
+      corruption: {
+        corrupted: true,
+        detail: `Storage schema manifest is invalid: ${schema.detail}`
+      }
+    };
+  }
+
+  // schema.status is "current" or "unsupported": scalar axes are known. Read the
+  // record axis structurally so an older/newer record family is a version fact,
+  // not a parse failure.
+  const scan = scanSourceRecordVersions(home, latest.record);
+  if ("corruption" in scan) {
+    return { corruption: scan.corruption };
+  }
+  return {
+    source: {
+      layout: schema.currentLayoutVersion,
+      aggregate: schema.currentAggregateSchemaVersion,
+      record: scan.record
+    }
+  };
+}
+
+/**
+ * Inspect the `.state.lock` holder, fail-closed.
+ *
+ * Returns `null` ONLY when the lock directory is provably absent (no writer).
+ * When the directory exists, the owner file is read: a clearly-live foreign pid
+ * is `live`; a dead owner is reclaimable (`null`); but a missing, empty,
+ * non-integer, or unreadable owner is `{ state: "unknown" }` — the lock is
+ * acquired mkdir-first with the owner written a moment later, so an
+ * undeterminable owner may be a writer mid-acquisition or a live process, and we
+ * must not treat it as absent.
+ */
 function inspectForeignWriteLock(
   home: string,
   callerPid: number
-): Readonly<{ ownerPid: number }> | null {
-  const ownerPath = join(home, STATE_LOCK_DIRECTORY, "owner");
-  let ownerPid: number;
-  try {
-    ownerPid = Number.parseInt(readFileSync(ownerPath, "utf8"), 10);
-  } catch (error) {
-    // No lock directory (or no owner file yet) means no foreign writer.
-    if (isEnoent(error)) return null;
-    throw error;
-  }
-  if (!Number.isInteger(ownerPid) || ownerPid === callerPid) return null;
-  return processIsAlive(ownerPid) ? { ownerPid } : null;
-}
+): WriteLockHolder | null {
+  const lockDir = join(home, STATE_LOCK_DIRECTORY);
+  if (!existsSync(lockDir)) return null; // provably no lock: no writer.
 
-function inspectLiveController(home: string): Readonly<{ pid: number }> | null {
   let raw: string;
   try {
-    raw = readFileSync(join(home, CONTROLLER_DISCOVERY_FILE), "utf8");
+    raw = readFileSync(join(lockDir, "owner"), "utf8");
   } catch (error) {
-    if (isEnoent(error)) return null;
-    throw error;
+    // Lock dir exists but the owner file is missing/unreadable: a writer may be
+    // mid-acquisition (mkdir done, owner not yet written). Fail closed.
+    if (isEnoent(error)) return { state: "unknown" };
+    return { state: "unknown" };
   }
+
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return { state: "unknown" }; // empty/partial write.
+  const ownerPid = Number.parseInt(trimmed, 10);
+  if (!Number.isInteger(ownerPid) || String(ownerPid) !== trimmed) {
+    // Non-integer or malformed owner: undeterminable. Fail closed.
+    return { state: "unknown" };
+  }
+  // Our own fence-exempt process re-pins under this lock; not a foreign writer.
+  if (ownerPid === callerPid) return null;
+  // Only a provably-dead owner is reclaimable (no writer); a live one is active.
+  return processIsAlive(ownerPid) ? { state: "live", ownerPid } : null;
+}
+
+/**
+ * Inspect the per-home Controller discovery, fail-closed.
+ *
+ * Returns `null` ONLY when there is provably no discovery file. A file naming a
+ * live pid is `live`; a file naming a dead pid is `null` (no live Controller);
+ * but a present-but-malformed/unparseable file is `{ state: "unknown" }` — we
+ * cannot rule out a live Controller from unreadable discovery, so it fails
+ * closed rather than being treated as "no controller".
+ */
+function inspectLiveController(home: string): ControllerDiscovery | null {
+  const discoveryPath = join(home, CONTROLLER_DISCOVERY_FILE);
+  let raw: string;
   try {
-    const value = JSON.parse(raw) as Record<string, unknown>;
-    const pid = value.pid;
-    if (Number.isInteger(pid) && processIsAlive(pid as number)) {
-      return { pid: pid as number };
-    }
-  } catch {
-    // A malformed discovery file is treated as no live controller.
+    raw = readFileSync(discoveryPath, "utf8");
+  } catch (error) {
+    if (isEnoent(error)) return null; // provably no discovery file.
+    return { state: "unknown" }; // present but unreadable: fail closed.
   }
-  return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return { state: "unknown" }; // malformed JSON: cannot rule out a controller.
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { state: "unknown" };
+  }
+  const pid = (value as Record<string, unknown>).pid;
+  if (!Number.isInteger(pid)) return { state: "unknown" }; // no usable pid.
+  // A named pid that is dead means no live Controller; alive means active.
+  return processIsAlive(pid as number) ? { state: "live", pid: pid as number } : null;
 }
 
 function parseJsonObject(raw: string, label: string): Record<string, unknown> {

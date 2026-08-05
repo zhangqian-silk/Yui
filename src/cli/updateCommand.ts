@@ -28,7 +28,11 @@ export function runUpdateCommand(
   const resolvedPorts = ports ?? createUpdatePorts(environment, spawn);
   const result = runUpdate(resolvedPorts, { home });
   write(`${renderUpdateResult(result)}\n`);
-  return result.outcome === "aborted" ? 5 : 0;
+  // Both an abort and an ambiguous result are non-success exits; ambiguous is
+  // distinct (manual verification required), so it gets its own exit code.
+  if (result.outcome === "aborted") return 5;
+  if (result.outcome === "ambiguous") return 6;
+  return 0;
 }
 
 /** Render an {@link UpdateResult} as concise, CLI-style text. */
@@ -47,6 +51,12 @@ export function renderUpdateResult(result: UpdateResult): string {
         result.recoverable
           ? "The current install and Home remain usable."
           : "Manual recovery is required (see below).",
+        `Action: ${result.action}`
+      ].join("\n");
+    case "ambiguous":
+      return [
+        `Update result is UNKNOWN after ${result.phase}: ${result.message}`,
+        "Manual verification is required — do NOT assume the update succeeded or was a no-op.",
         `Action: ${result.action}`
       ].join("\n");
   }

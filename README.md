@@ -65,20 +65,27 @@ document, and the `record` axis — a `recordKind -> version` map where every
 record family (WorkItem, AgentRun, ReviewRound, …) versions on its own. A
 centralized, future-facing migration framework (registry → planner → engine)
 covers all three; the registry ships **empty** in this release, so no historical
-migration step exists yet and any strictly-older home is fail-closed.
+migration step exists yet and any strictly-older home is fail-closed. The record
+axis is genuinely independent: a home's per-family record versions are read
+**structurally** from the raw `state.json` (never through the strict loader), so
+a home whose *only* difference is an older record family is a version verdict
+(MIGRATABLE / NEEDS_NEW_VERSION) — not a false CORRUPTED.
 
 `yui doctor` and `yui upgrade` present one of four compatibility states:
 
 - **USABLE** — every axis is at the current version; nothing to do.
-- **MIGRATABLE** — strictly older, and a complete deterministic step path exists
-  (none today, since the registry is empty).
+- **MIGRATABLE** — strictly older on any axis (scalar or a single record family),
+  and a complete deterministic step path exists (none today, since the registry
+  is empty).
 - **NEEDS_NEW_VERSION** — a version this release cannot migrate: either newer
   than supported (`future-version`) or older with no registered step
-  (`missing-step`). Under the empty registry, every strictly-older home lands
-  here with a precise reason and the incompatible component (layout vs
-  aggregate).
-- **CORRUPTED** — real structural or reference-graph damage only, never inferred
-  from a version number.
+  (`missing-step`), on any axis including a record family. Under the empty
+  registry, every strictly-older home lands here with a precise reason and the
+  incompatible component (layout vs aggregate).
+- **CORRUPTED** — real structural or reference-graph damage only (unparseable
+  `state.json`, a container that doesn't match its record locator, a record with
+  a missing/invalid `schemaVersion`, or a broken reference graph found once every
+  axis is already current), never inferred from a version number.
 
 `yui upgrade` is the diagnostic/manual entry point. `yui upgrade --dry-run`
 runs a read-only preflight and plan, validates through the real loader gate on a
@@ -87,7 +94,12 @@ staged copy, prints the report, and discards it without switching. `yui upgrade`
 refuse to start), drains the Controller with the public `controller.stop`,
 re-pins the committed revision under the write lock, migrates into a fresh
 staged home, validates it, then atomically switches into place with a
-timestamped backup and a post-switch health check. Any failed or blocked step
+timestamped backup and a post-switch health check. Quiesce **fails closed on any
+undeterminable signal**: a `.state.lock` that exists but whose owner is
+missing/empty/non-integer/unreadable (a writer may be mid-acquisition), or a
+malformed `runtime/controller.json`, is treated as an active runtime and blocks
+the upgrade; only a provably-absent lock or a clearly-dead owner is safe to
+proceed past. Any failed or blocked step
 leaves the authoritative home byte-for-byte unchanged and reports the exact
 blocker stage and recovery action. It never converts a real home in this
 release (the registry is empty), and Yui never dual-reads an older schema or
@@ -629,8 +641,19 @@ yui project add|clone|refresh|update|discover|list|show|knowledge
 replaces the current global install first — then uses the staged binary to run a
 read-only preflight against the home. Only when that is safe does it migrate
 storage (atomically, with a timestamped backup) and promote the binary, running
-a new-binary health check last. On any failure it reports the exact phase and a
-recovery action.
+a new-binary health check last. It promotes the **same artifact it staged**
+(binary activation pins the exact staged version, never a second bare `@latest`),
+and the health check runs the **actually-activated** global binary and verifies
+its version matches the staged one — a mismatch fails closed. On any failure it
+reports the exact phase and a recovery action.
+
+If the storage-activation step cannot be resolved — the spawned staged binary was
+killed or crashed after switching but before reporting — `yui update` reports a
+distinct **ambiguous** result (a dedicated non-zero exit), never a false
+"unchanged/recoverable". A durable completion receipt written the instant the
+switch commits (a `<home>.upgrade-receipt.json` sibling, cleared on clean
+success) lets it resolve the true state from receipt + backup + current schema
+and print precise manual-verification steps.
 
 Rollback boundary (precise): this release does **not** introduce a versioned
 binary pointer or stable launcher, so it does **not** claim binary+home

@@ -46,11 +46,16 @@ import {
   readUpgradeFence
 } from "../upgradeFence.js";
 import {
+  clearUpgradeReceipt,
+  writeUpgradeReceipt
+} from "./upgradeReceipt.js";
+import {
   classifyHome,
   type HomeClassification
 } from "./homeClassification.js";
 import {
   createHomeMigrationTarget,
+  describeActiveRuntime,
   homeRuntimeIsActive,
   inspectHomeRuntime,
   type HomeSnapshot
@@ -254,12 +259,30 @@ async function execute(
       return { ...blockedFromEngineReport(report, classification), report };
     }
 
+    // The atomic switch has COMMITTED. Drop a durable, out-of-band receipt before
+    // doing anything else, so that if this process is killed before it can report
+    // success (SIGTERM/OOM after switch), a later reader can still prove the
+    // switch happened and locate the backup — closing the activation-ambiguity
+    // gap (P1-2). The receipt is cleared only on a clean, verified return.
+    writeUpgradeReceipt(home, {
+      switched: true,
+      completedAt: now().toISOString(),
+      ...(report.switch.backupPath === undefined
+        ? {}
+        : { backupPath: report.switch.backupPath })
+    });
+
     // 7) Post-switch health check with a fresh loader over the promoted Home.
     const postVerify = postSwitchHealthCheck(home);
     if (postVerify !== null) {
+      // Switch committed but the migrated Home did not load: keep the receipt so
+      // the ambiguity is recorded, and report the backup-based manual recovery.
       return { ...withClassification(postVerify, classification), report };
     }
 
+    // Fully verified: the migrated Home loads. Clear the receipt — there is no
+    // ambiguity to record.
+    clearUpgradeReceipt(home);
     return {
       outcome: "upgraded",
       classification,
@@ -285,14 +308,13 @@ async function execute(
 function verifyQuiesced(home: string, callerPid: number): UpgradeBlocker | null {
   const signals = inspectHomeRuntime(home, callerPid);
   if (homeRuntimeIsActive(signals)) {
-    const detail = signals.liveController !== null
-      ? `the Controller (pid ${signals.liveController.pid}) is still running`
-      : `another writer holds the storage lock (pid ${signals.foreignWriteLock?.ownerPid})`;
     return {
       outcome: "blocked",
       stage: "active-runtime",
-      message: `Cannot upgrade while ${detail}.`,
-      action: "Stop all Yui activity for this Home, then retry the upgrade."
+      message: `Cannot upgrade: ${describeActiveRuntime(signals)}`,
+      action:
+        "Stop all Yui activity for this Home (and clear any stale .state.lock / "
+        + "runtime/controller.json only after confirming no process owns it), then retry."
     };
   }
 
@@ -438,3 +460,5 @@ async function defaultStopController(
 
 /** Read the current fence for a Home (re-exported for command wiring). */
 export { readUpgradeFence, clearUpgradeFence };
+/** Read/locate the completion receipt (re-exported for update orchestration). */
+export { readUpgradeReceipt, upgradeReceiptPath } from "./upgradeReceipt.js";
