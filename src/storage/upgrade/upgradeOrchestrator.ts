@@ -25,7 +25,7 @@
  * authoritative input byte-for-byte unchanged.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -371,14 +371,28 @@ function verifyQuiesced(home: string, callerPid: number): UpgradeBlocker | null 
     };
   }
 
-  // Unfinished runtime lifecycle obligations (inbox/mailbox not drained) block.
+  // Unfinished runtime lifecycle obligations block. This is TWO independent
+  // durable lanes (per task-1 / message-8 §3, either non-empty fails closed):
+  //  1. the aggregate `state.json` mailboxes (runtime lifecycle lanes), and
+  //  2. the DURABLE runtime inbox `runtime/inbox/*` — authoritative, not-yet-
+  //     applied native-hook events. A healthy Controller drains the inbox, but
+  //     the no-Controller / stale-event path (fully supported) reaches here with
+  //     inbox entries still on disk, and those must not be silently discarded by
+  //     an atomic switch. We prove the inbox empty READ-ONLY (never acknowledging
+  //     or quarantining as part of the check — that would mutate the source).
   const pendingRuntime = countPendingRuntimeMailboxes(home);
-  if (pendingRuntime > 0) {
+  const pendingInbox = countPendingDurableInbox(home);
+  if (pendingRuntime > 0 || pendingInbox > 0) {
+    const parts: string[] = [];
+    if (pendingRuntime > 0) parts.push(`${pendingRuntime} pending mailbox(es)`);
+    if (pendingInbox > 0) parts.push(`${pendingInbox} pending durable inbox entr(ies)`);
     return {
       outcome: "blocked",
       stage: "drain-incomplete",
-      message: `Runtime lifecycle work is not drained (${pendingRuntime} pending mailbox(es)).`,
-      action: "Let the Controller finish draining, then retry the upgrade."
+      message: `Runtime lifecycle work is not drained (${parts.join("; ")}).`,
+      action:
+        "Let the Controller finish draining the runtime inbox and mailboxes (or start it so it "
+        + "can), then retry the upgrade. The authoritative Home is unchanged."
     };
   }
   return null;
@@ -417,6 +431,54 @@ function countPendingRuntimeMailboxes(home: string): number {
     const isRuntimeLane = kind === "role-runtime" || kind === "global-role-runtime";
     const hasWork = mailbox.pending !== null || mailbox.processing !== null;
     if (isRuntimeLane && hasWork) count += 1;
+  }
+  return count;
+}
+
+/**
+ * Count pending entries in the DURABLE runtime inbox, READ-ONLY (R3-F4). This
+ * proves the inbox is drained before an atomic switch replaces the whole Home,
+ * so authoritative not-yet-applied native-hook events are never silently lost.
+ *
+ * It deliberately does NOT go through `FileRuntimeEventInbox.list()`, which
+ * quarantines malformed entries as a side effect — the quiesce check must not
+ * mutate the source. Instead it counts, purely by directory listing:
+ *  - any committed event file (`*.json`) in `runtime/inbox`,
+ *  - any in-progress temporary write (`.<id>.tmp-*`) in `runtime/inbox`, and
+ *  - any quarantined-but-unresolved entry under `runtime/inbox-invalid`.
+ * Any of these being non-zero means lifecycle work is not fully drained. A
+ * missing inbox directory (or an unreadable one) counts as zero pending here for
+ * the inbox itself, but an unreadable directory is surfaced as a conservative
+ * single pending entry so an undeterminable inbox fails closed rather than open.
+ */
+function countPendingDurableInbox(home: string): number {
+  const inboxDir = join(home, "runtime", "inbox");
+  const invalidDir = join(home, "runtime", "inbox-invalid");
+  let count = 0;
+  count += countInboxDirectoryEntries(inboxDir, /* countTemporary */ true);
+  count += countInboxDirectoryEntries(invalidDir, /* countTemporary */ true);
+  return count;
+}
+
+/**
+ * Count durable entries in one inbox directory. A `.json` file or (when
+ * `countTemporary`) a `.tmp-` in-progress write is pending. Returns 0 when the
+ * directory is provably absent; returns 1 (fail-closed) when it exists but cannot
+ * be listed, so an undeterminable inbox never reads as "empty".
+ */
+function countInboxDirectoryEntries(directory: string, countTemporary: boolean): number {
+  let entries: string[];
+  try {
+    entries = readdirSync(directory);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return 0;
+    return 1; // present but unreadable: fail closed.
+  }
+  let count = 0;
+  for (const name of entries) {
+    if (name.endsWith(".json")) count += 1;
+    else if (countTemporary && name.includes(".tmp-")) count += 1;
+    else if (!name.startsWith(".")) count += 1; // any other real entry (e.g. quarantined copies).
   }
   return count;
 }

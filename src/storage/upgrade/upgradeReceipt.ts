@@ -22,7 +22,7 @@
  * binary), which share the same fixed `YUI_HOME` path.
  */
 
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 import { writeTextFileAtomically } from "../durableFile.js";
@@ -100,42 +100,97 @@ export type ReceiptCorrelation = Readonly<
 >;
 
 /**
- * Validate that a receipt corresponds to the current Home/backup before trusting
- * it for a recovery decision (P2-6). The correspondence rules, each closing a
- * concrete staleness gap:
+ * Validate that a receipt genuinely corresponds to the current Home AND its
+ * backup before trusting it for a recovery decision (P2-6 / R3-F6). Existence
+ * alone is not correspondence: a receipt is trusted only when it carries the
+ * current protocol's correlating fields and its backup is a REAL directory at the
+ * exact timestamped-sibling path this Home's switch would have produced. Each
+ * rule closes a concrete staleness/impersonation gap:
  *
  *  - **no receipt** — nothing to correlate.
- *  - **home mismatch** — the receipt names a different `homePath`: it is about a
- *    different target Home (e.g. a copied receipt) and says nothing about this one.
- *  - **backup missing** — the receipt names a `backupPath` that no longer exists:
- *    the switch it recorded was already rolled back (operator restored the
- *    backup) or the backup was cleaned, so it is NOT current evidence of a
- *    committed switch. Re-probe the real on-disk state instead.
+ *  - **missing/foreign homePath** — a legacy receipt without `homePath`, or one
+ *    naming a different Home, says nothing trustworthy about THIS Home; the
+ *    current protocol always stamps `homePath`, so its absence is a legacy/degraded
+ *    marker that must be re-probed, not reused.
+ *  - **missing backupPath** — a receipt with no backup path is a degraded/legacy
+ *    marker; without the exact backup to correlate against we cannot confirm it,
+ *    so we re-probe rather than assert a committed switch.
+ *  - **backup not the expected sibling** — a `backupPath` that is not
+ *    `<home>.backup-*` in the Home's own parent directory is unrelated evidence
+ *    (a copied/foreign receipt); reject it.
+ *  - **backup absent or not a directory** — the switch it recorded was already
+ *    rolled back/cleaned, or the path is not a real backup dir; re-probe.
  *
- * A receipt WITHOUT a `backupPath` (older/degraded form) can only be weakly
- * corroborated; it corresponds only when its `homePath` matches (or is absent),
- * and the caller must still consult the on-disk schema.
+ * On any rejection the caller falls back to an explicit "uncertain → re-probe the
+ * real on-disk state" rather than deriving a recovery instruction from stale or
+ * unrelated evidence.
  */
 export function correlateUpgradeReceipt(home: string): ReceiptCorrelation {
   const receipt = readUpgradeReceipt(home);
   if (receipt === null) {
     return { corresponds: false, reason: "no receipt present", receipt: null };
   }
-  if (receipt.homePath !== undefined && receipt.homePath !== home) {
+  // The current protocol always records the Home it is about; a receipt without
+  // `homePath`, or naming a different Home, is legacy/foreign — never trusted.
+  if (receipt.homePath === undefined) {
+    return {
+      corresponds: false,
+      reason: "receipt has no homePath (legacy/degraded marker); re-probing current state",
+      receipt
+    };
+  }
+  if (receipt.homePath !== home) {
     return {
       corresponds: false,
       reason: `receipt names a different Home (${receipt.homePath} != ${home})`,
       receipt
     };
   }
-  if (receipt.backupPath !== undefined && !existsSync(receipt.backupPath)) {
+  // A trustworthy receipt must carry the exact backup its switch created.
+  if (receipt.backupPath === undefined) {
     return {
       corresponds: false,
-      reason: `receipt backup ${receipt.backupPath} no longer exists (already restored or cleaned)`,
+      reason: "receipt has no backupPath; cannot correlate a committed switch — re-probing",
+      receipt
+    };
+  }
+  if (!isExpectedBackupSibling(home, receipt.backupPath)) {
+    return {
+      corresponds: false,
+      reason: `receipt backup ${receipt.backupPath} is not this Home's expected timestamped sibling; unrelated evidence`,
+      receipt
+    };
+  }
+  if (!isRealDirectory(receipt.backupPath)) {
+    return {
+      corresponds: false,
+      reason: `receipt backup ${receipt.backupPath} is absent or not a directory (already restored or cleaned)`,
       receipt
     };
   }
   return { corresponds: true, receipt };
+}
+
+/**
+ * True when `backupPath` is the exact `<home>.backup-<stamp>` sibling in the
+ * Home's own parent directory that this Home's atomic switch would produce (see
+ * `homeMigrationTarget.atomicSwitchWithBackup`). Rejects any path in a different
+ * directory or without the `<basename>.backup-` prefix — i.e. unrelated evidence.
+ */
+function isExpectedBackupSibling(home: string, backupPath: string): boolean {
+  if (dirname(backupPath) !== dirname(home)) return false;
+  const prefix = `${basename(home)}.backup-`;
+  const name = basename(backupPath);
+  return name.startsWith(prefix) && name.length > prefix.length;
+}
+
+/** True when `path` exists and is a real directory (not a file/symlink target miss). */
+function isRealDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /** Best-effort removal of the receipt (on clean success or before a fresh run). */

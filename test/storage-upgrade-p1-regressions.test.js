@@ -542,11 +542,16 @@ function fakeSpawn(config) {
       return okData({ version });
     }
     if (isDoctor) {
-      // The real `--json doctor` returns { checks, storage: { healthy, blocking } };
-      // the post-verify parses storage.healthy (P1-3). Default to healthy unless a
-      // test overrides config.doctor to inject an unhealthy or unparseable result.
+      // The real `--json doctor` returns { checks, storage: { healthy, blocking } }
+      // with EVERY storage check present; the post-verify requires all of them
+      // present-and-ok (P1-3/R3-F2). Default to a full healthy set unless a test
+      // overrides config.doctor to inject an unhealthy or unparseable result.
       return config.doctor ?? okData({
-        checks: [{ name: "storage state", status: "ok", detail: "readable" }],
+        checks: [
+          { name: "storage schema", status: "ok", detail: "current" },
+          { name: "storage compatibility", status: "ok", detail: "USABLE" },
+          { name: "storage state", status: "ok", detail: "readable" }
+        ],
         storage: { healthy: true, blocking: [] }
       });
     }

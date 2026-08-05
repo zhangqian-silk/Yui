@@ -227,9 +227,22 @@ export function createUpdatePorts(
 }
 
 function interpretPreflight(result: SpawnSyncReturns<Buffer>): UpdatePreflight {
-  const parsed = parseJsonResult(result);
-  const data = parsed?.data as Record<string, unknown> | undefined;
-  const outcome = typeof data?.outcome === "string" ? data.outcome : undefined;
+  // Require a valid `{ ok:true, data }` success envelope before trusting any
+  // outcome (R3-F3). An error envelope, unparseable output, kill, or transport
+  // error is not a safe preflight — block rather than proceed to a switch.
+  const data = parseSuccessEnvelopeData(result);
+  if (data === null) {
+    return {
+      status: "blocked",
+      stage: "preflight",
+      message:
+        "The staged binary's preflight did not return a valid success envelope "
+        + `(exit ${result.status ?? "null"}${result.signal === null ? "" : `, signal ${result.signal}`}); `
+        + "refusing to proceed on an unverifiable preflight.",
+      action: "Investigate the staged binary; do not force an update on an unverifiable preflight."
+    };
+  }
+  const outcome = typeof data.outcome === "string" ? data.outcome : undefined;
   // EXIT/OUTCOME CONSISTENCY (P1-2): preflight is read-only, but a success-class
   // outcome paired with a non-zero exit is still a violated contract. Treat it as
   // blocked (do NOT proceed to a switch on an inconsistent green preflight).
@@ -249,9 +262,9 @@ function interpretPreflight(result: SpawnSyncReturns<Buffer>): UpdatePreflight {
   }
   return {
     status: "blocked",
-    stage: typeof data?.stage === "string" ? data.stage : "preflight",
-    message: typeof data?.message === "string" ? data.message : "Preflight was not safe.",
-    action: typeof data?.action === "string"
+    stage: typeof data.stage === "string" ? data.stage : "preflight",
+    message: typeof data.message === "string" ? data.message : "Preflight was not safe.",
+    action: typeof data.action === "string"
       ? data.action
       : "Resolve the reported condition and retry."
   };
@@ -265,23 +278,23 @@ function interpretActivation(result: SpawnSyncReturns<Buffer>): StorageActivatio
       detail: `the activation process could not be run: ${result.error.message}`
     };
   }
-  // Killed by a signal, or a non-zero exit with no parseable JSON: the child may
-  // have died after the atomic switch but before printing its result. This is
+  // Require a valid `{ ok:true, data }` success envelope (R3-F3). Killed by a
+  // signal, no parseable JSON, or an `ok:false`/malformed envelope: the child may
+  // have died after the atomic switch but before printing a valid result. This is
   // AMBIGUOUS, never a false "recoverable/unchanged" (P1-2).
-  const parsed = parseJsonResult(result);
-  if (parsed === null) {
+  const data = parseSuccessEnvelopeData(result);
+  if (data === null) {
     const how = result.signal !== null
       ? `terminated by ${result.signal}`
       : result.status === null
         ? "terminated without an exit code"
-        : `exited with status ${result.status} and no parseable result`;
+        : `exited with status ${result.status} and no valid success envelope`;
     return {
       status: "ambiguous",
       detail: `the activation process ${how}`
     };
   }
-  const data = parsed.data as Record<string, unknown> | undefined;
-  const outcome = typeof data?.outcome === "string" ? data.outcome : undefined;
+  const outcome = typeof data.outcome === "string" ? data.outcome : undefined;
   // EXIT STATUS / OUTCOME CONSISTENCY (P1-2)
   // A success-class outcome is only trustworthy when the child ALSO exited 0. A
   // contradiction (e.g. stdout says `upgraded` but the process exited non-zero)
@@ -337,29 +350,44 @@ function interpretActivation(result: SpawnSyncReturns<Buffer>): StorageActivatio
 }
 
 /**
- * Parse the `{ ok, data }` JSON envelope from a spawn result's stdout. Returns
- * `null` when the process errored, was killed, exited non-zero, or produced no
- * parseable JSON — every case the caller must treat as unresolved.
+ * Extract the validated `data` object from a spawn result's `{ ok: true, data }`
+ * JSON envelope, or `null` when the result is not a trustworthy success envelope.
+ *
+ * Returns `null` when the process errored, was killed, produced no parseable
+ * JSON, the envelope's `ok` is not exactly `true`, or `data` is not an object
+ * (R3-F3). It does NOT reject a non-zero exit on its own — the deliberate
+ * non-zero exit for a `blocked`/unhealthy outcome still carries a valid success
+ * envelope, and callers apply their own exit/outcome consistency rules. Every
+ * caller must treat `null` as unresolved (fail-closed / ambiguous / blocked).
  */
-function parseJsonResult(
+function parseSuccessEnvelopeData(
   result: SpawnSyncReturns<Buffer>
 ): Record<string, unknown> | null {
   if (result.error !== undefined) return null;
   if (result.signal !== null || result.status === null) return null;
+  let envelope: Record<string, unknown>;
   try {
     const text = result.stdout.toString("utf8").trim();
     if (text.length === 0) return null;
-    const value = JSON.parse(text) as Record<string, unknown>;
-    return value;
+    envelope = JSON.parse(text) as Record<string, unknown>;
   } catch {
     return null;
   }
+  // Require a success envelope: ok === true and a real data object. A `{ ok:false }`
+  // error envelope, or one with a non-object `data`, is never a success (R3-F3).
+  if (envelope.ok !== true) return null;
+  if (typeof envelope.data !== "object" || envelope.data === null || Array.isArray(envelope.data)) {
+    return null;
+  }
+  return envelope.data as Record<string, unknown>;
 }
 
 /**
- * Resolve the exact version of the staged install from its package metadata, or
- * `null` when no concrete version can be determined. Callers MUST fail closed on
- * `null` rather than fall back to `@latest` (R2-F1).
+ * Resolve the exact, CONCRETE version of the staged install, or `null` when no
+ * concrete version can be determined. A dist-tag sentinel like `latest` (or any
+ * non-semver-shaped value) is NOT a concrete version and yields `null` (R3-F1):
+ * callers MUST fail closed rather than pin `@latest`, which would let activation
+ * promote a different build than the one preflighted.
  */
 function resolveStagedVersion(
   stagingPath: string,
@@ -371,21 +399,39 @@ function resolveStagedVersion(
   const manifest = join(stagingPath, "lib", "node_modules", PACKAGE_NAME, "package.json");
   const fromManifest = readVersionFromPackageJson(manifest);
   if (fromManifest !== null) return fromManifest;
-  // Fall back to asking the staged binary itself; `null` if it too cannot answer.
+  // Fall back to asking the staged binary itself; `null` if it too cannot answer
+  // with a successful, concrete version.
   return resolveBinaryVersion(binaryPath, environment, spawn);
 }
 
-/** Read `version` from a package.json, or `null` when unavailable. */
+/**
+ * True for a concrete, pinnable package version — a semver-shaped `X.Y.Z` with an
+ * optional pre-release/build suffix. Rejects dist-tag sentinels (`latest`, `next`,
+ * …), empty/whitespace, and anything not anchored to a numeric `major.minor.patch`
+ * so a sentinel can never be spliced into an activation spec (R3-F1).
+ */
+function isConcreteVersion(value: string): boolean {
+  return /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(value.trim());
+}
+
+/** Read a CONCRETE `version` from a package.json, or `null` when absent/non-concrete. */
 function readVersionFromPackageJson(path: string): string | null {
   try {
     const value = JSON.parse(readFileSync(path, "utf8")) as { version?: unknown };
-    return typeof value.version === "string" && value.version.length > 0 ? value.version : null;
+    if (typeof value.version !== "string") return null;
+    const version = value.version.trim();
+    return isConcreteVersion(version) ? version : null;
   } catch {
     return null;
   }
 }
 
-/** Ask a `yui` binary for its version via `--json version`; `null` on failure. */
+/**
+ * Ask a `yui` binary for its version via `--json version`; returns the CONCRETE
+ * version only from a valid `{ ok:true, data }` success envelope at exit 0
+ * (R3-F1/R3-F3), else `null`. A non-zero exit, `ok:false`, missing/non-concrete
+ * `version`, or unparseable output all yield `null` so the caller fails closed.
+ */
 function resolveBinaryVersion(
   binaryPath: string,
   environment: NodeJS.ProcessEnv,
@@ -396,9 +442,12 @@ function resolveBinaryVersion(
     ["--json", "version"],
     { cwd: process.cwd(), env: environment, shell: false }
   );
-  const parsed = parseJsonResult(result);
-  const data = parsed?.data as Record<string, unknown> | undefined;
-  return typeof data?.version === "string" && data.version.length > 0 ? data.version : null;
+  // A version probe is only trustworthy from a successful, zero-exit envelope.
+  if (result.status !== 0) return null;
+  const data = parseSuccessEnvelopeData(result);
+  if (data === null || typeof data.version !== "string") return null;
+  const version = data.version.trim();
+  return isConcreteVersion(version) ? version : null;
 }
 
 /** Resolve the live global `yui` binary path from `npm prefix -g`. */
@@ -472,12 +521,39 @@ function assertDoctorStorageHealthy(result: SpawnSyncReturns<Buffer>): void {
     );
   }
 
-  // 2) Collect the blocking (non-ok) storage checks from the authoritative checks
-  // array. Every storage-named check must be present AND ok.
-  const storageNames = new Set<string>(STORAGE_DOCTOR_CHECK_NAMES);
-  const storageChecks = checks.filter(
-    (c) => typeof c.name === "string" && storageNames.has(c.name)
-  );
+  // 2) Require EVERY expected storage check to be present exactly once AND ok
+  // (R3-F2). A `healthy: true` flag with an empty `blocking` array must NOT be
+  // trusted when an expected check is missing, duplicated, or malformed — the
+  // authoritative signal is the checks array itself, not the summary flag.
+  const expectedNames = STORAGE_DOCTOR_CHECK_NAMES;
+  const byName = new Map<string, Record<string, unknown>[]>();
+  for (const c of checks) {
+    if (typeof c.name === "string") {
+      const list = byName.get(c.name) ?? [];
+      list.push(c);
+      byName.set(c.name, list);
+    }
+  }
+  const missingOrMalformed: string[] = [];
+  for (const name of expectedNames) {
+    const entries = byName.get(name) ?? [];
+    if (entries.length !== 1) {
+      missingOrMalformed.push(`${name}=${entries.length === 0 ? "missing" : `duplicated x${entries.length}`}`);
+      continue;
+    }
+    if (typeof entries[0].status !== "string") {
+      missingOrMalformed.push(`${name}=malformed`);
+    }
+  }
+  if (missingOrMalformed.length > 0) {
+    throw doctorUnverifiable(
+      `the doctor result is missing or has malformed storage checks (${missingOrMalformed.join("; ")}); `
+        + "refusing to trust the health flag without every expected check present"
+    );
+  }
+
+  // The blocking (non-ok) storage checks, from the now-complete authoritative set.
+  const storageChecks = expectedNames.map((name) => (byName.get(name) as Record<string, unknown>[])[0]);
   const blockingChecks = storageChecks.filter((c) => c.status !== "ok");
   const declaredBlocking = Array.isArray(storage.blocking)
     ? (storage.blocking as Record<string, unknown>[])

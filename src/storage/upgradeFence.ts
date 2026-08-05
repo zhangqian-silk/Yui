@@ -294,14 +294,22 @@ function reclaimOrphanedLock(reclaimLock: string, ownerFile: string): boolean {
 }
 
 function writeFenceLockOwner(ownerFile: string): void {
+  let descriptor: number;
   try {
-    writeSync(
-      openSync(ownerFile, constants.O_CREAT | constants.O_WRONLY | constants.O_TRUNC, 0o600),
-      `${process.pid}\n`
-    );
+    descriptor = openSync(ownerFile, constants.O_CREAT | constants.O_WRONLY | constants.O_TRUNC, 0o600);
   } catch {
     // Best effort: without the owner pid the lock is still age-reclaimable, so a
     // failure to record it degrades to the age bound rather than orphaning.
+    return;
+  }
+  // Keep the descriptor so it can be closed in `finally` — never leak an fd per
+  // reclaim (R3-F5).
+  try {
+    writeSync(descriptor, `${process.pid}\n`);
+  } catch {
+    // Recording the pid is best-effort; the age bound still bounds reclaim.
+  } finally {
+    closeSync(descriptor);
   }
 }
 

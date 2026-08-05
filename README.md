@@ -91,9 +91,12 @@ a home whose *only* difference is an older record family is a version verdict
 runs a read-only preflight and plan, validates through the real loader gate on a
 staged copy, prints the report, and discards it without switching. `yui upgrade`
 (execute) places an admission fence (new writers, CLI and Controller alike,
-refuse to start), drains the Controller with the public `controller.stop`,
-re-pins the committed revision under the write lock, migrates into a fresh
-staged home, validates it, then atomically switches into place with a
+refuse to start), drains the Controller with the public `controller.stop`, proves
+both the runtime-lifecycle mailboxes AND the durable runtime inbox
+(`runtime/inbox/*`) are empty read-only (either non-empty blocks at
+`drain-incomplete`, so authoritative not-yet-applied events are never dropped by a
+switch), re-pins the committed revision under the write lock, migrates into a
+fresh staged home, validates it, then atomically switches into place with a
 timestamped backup and a post-switch health check. **Fence acquisition is a
 single atomic file create**, so two concurrent upgraders never both acquire —
 exactly one wins and the other fails closed. A provably-dead owner's stale fence
@@ -670,20 +673,22 @@ read-only preflight against the home. Only when that is safe does it migrate
 storage (atomically, with a timestamped backup) and promote the binary, running
 a new-binary health check last. It promotes the **same artifact it staged**
 (binary activation pins the exact staged version, never a second bare `@latest`);
-if the exact staged version cannot be resolved the stage **fails** rather than
-falling back to `@latest`. The health check runs the **actually-activated** global
-binary and **requires** its version to be concrete and equal to the staged one — a
-missing, unparseable, or mismatched version fails closed (never skipped). A
-success-class child result is trusted **only when the process also exited 0**: an
-`upgraded` outcome paired with a non-zero exit (or an exit 0 with no recognized
-outcome) is treated as ambiguous/blocked, never a false success. The post-update
-health check **parses and validates the machine-readable `yui --json doctor`
-envelope before interpreting the exit status** — because `--json doctor` exits
-non-zero on unhealthy storage — and fails closed on any
-unsupported/corrupted/uninitialized/version-mismatch check, an unparseable
-envelope, or a self-contradictory one; only a valid success envelope with all
-storage checks `ok` and exit 0 is healthy. On any failure it reports the exact
-phase and a recovery action.
+the staged version must be a **concrete semver** — a `latest`/dist-tag sentinel,
+a malformed value, or a probe without a valid `{ ok:true }` envelope at exit 0 is
+rejected and the stage **fails** rather than falling back to `@latest`. The health
+check runs the **actually-activated** global binary and **requires** its version
+to be concrete and equal to the staged one — a missing, unparseable, or mismatched
+version fails closed (never skipped). Every spawned-child result must be a valid
+`{ ok:true, data }` **success envelope** before its outcome is trusted (else
+preflight blocks / activation is ambiguous), and a success-class outcome is
+trusted **only when the process also exited 0**. The post-update health check
+**parses and validates the machine-readable `yui --json doctor` envelope before
+interpreting the exit status** — because `--json doctor` exits non-zero on
+unhealthy storage — requires **every** expected storage check present-and-`ok`
+(a missing/duplicated/malformed check fails closed), and rejects an unparseable or
+self-contradictory envelope; only a valid success envelope with all storage checks
+`ok` and exit 0 is healthy. On any failure it reports the exact phase and a
+recovery action.
 
 If the storage-activation step cannot be resolved — the spawned staged binary was
 killed or crashed after switching but before reporting — `yui update` reports a
@@ -691,9 +696,11 @@ distinct **ambiguous** result (a dedicated non-zero exit), never a false
 "unchanged/recoverable". A durable completion receipt written the instant the
 switch commits (a `<home>.upgrade-receipt.json` sibling, cleared on clean
 success) lets it resolve the true state from receipt + backup + current schema
-and print precise manual-verification steps. The receipt records the home and
-backup it belongs to, so a **leftover receipt that names a different home or whose
-backup no longer exists** is not trusted as proof of this attempt's switch — the
+and print precise manual-verification steps. The receipt is trusted only when it
+genuinely corresponds: it must carry this home's `homePath` and a `backupPath`
+that is the expected `<home>.backup-*` real directory, so a **legacy receipt
+without those fields, or one whose backup is unrelated / missing / not a
+directory** is not trusted as proof of this attempt's switch — the
 tool re-probes the real on-disk state instead.
 
 Rollback boundary (precise): this release does **not** introduce a versioned

@@ -251,14 +251,24 @@ concurrency is instead handled by the quiesce step and the recommendation to
 stop all Yui activity for the home before upgrading. It then drains the
 Controller with the public `controller.stop`/shutdownAndDrain (never a broad
 kill, never a TTL or idle heuristic), fails closed if any foreign writer, live
-Controller, unfinished runtime lifecycle mailbox, or held `.state.lock` remains,
-re-pins the committed revision under the write lock after the drain (avoiding a
-check-then-migrate race), migrates the immutable source into a fresh staged
-home, validates it through the real `FileTaskStore` loader gate (record parse +
-reference graph), then atomically switches into place with a timestamped backup
-and a post-switch health check. Any blocked or failed step leaves the
-authoritative home byte-for-byte unchanged and reports the exact stage and
-recovery action; `--dry-run` runs through the validation gate and discards the
+Controller, or held `.state.lock` remains, and proves BOTH durable runtime lanes
+empty — the aggregate `state.json` runtime-lifecycle mailboxes AND the durable
+runtime inbox `runtime/inbox/*` (authoritative not-yet-applied native-hook
+events; per task-1 / message-8 §3, either non-empty is a `drain-incomplete`
+blocker). The inbox is proven empty **read-only** (a plain directory scan for
+committed `*.json` events, in-progress `.tmp-*` writes, and quarantined
+`runtime/inbox-invalid` entries) — never via the inbox's own `list()`, which
+would quarantine as a side effect, so the check never mutates the source; an
+unreadable inbox directory fails closed. This matters because the no-Controller
+/ stale-event path reaches quiesce with inbox entries still on disk, and an
+atomic switch must never silently drop them. It then re-pins the committed
+revision under the write lock after the drain (avoiding a check-then-migrate
+race), migrates the immutable source into a fresh staged home, validates it
+through the real `FileTaskStore` loader gate (record parse + reference graph),
+then atomically switches into place with a timestamped backup and a post-switch
+health check. Any blocked or failed step leaves the authoritative home
+byte-for-byte unchanged and reports the exact stage and recovery action;
+`--dry-run` runs through the validation gate and discards the
 staged output without switching. This release never migrates a real home (the
 registry is empty); the machinery is future-facing.
 
@@ -344,25 +354,31 @@ and only then migrates storage and promotes the binary, with a new-binary health
 check last. **Same-artifact promotion:** the version resolved at stage time is
 pinned, and binary activation installs that exact `@zq-silk/yui@<version>` — never
 a second bare `@latest` that could resolve to a different build than the one that
-passed preflight. **A stage that cannot resolve a concrete version FAILS** rather
-than falling back to a `@latest` sentinel (R2-F1): if neither the staged
-package.json nor the staged binary's `--json version` yields an exact version,
-the stage aborts (the live install is untouched, so it is fully recoverable),
-because a `latest` sentinel would reopen exactly the "promoted binary ≠
-preflighted binary" gap. **Verify the activated binary:** the post-update health
-check runs the *actually-activated* global binary (resolved via `npm prefix -g`),
-not the staging path, and **requires** its reported version to be concrete and
-equal to the staged version — a missing, unparseable, or mismatched version fails
-closed (never skipped), so a build whose identity cannot be positively confirmed
-is never trusted.
+passed preflight. **Only a CONCRETE version is accepted** (R3-F1): the resolver
+requires a semver-shaped `X.Y.Z` (optional pre-release/build suffix) — a dist-tag
+sentinel like `latest`, an empty/malformed value, or a version probe that does
+not come back in a valid `{ ok:true, data }` envelope at exit 0 all yield "no
+version", and the stage then FAILS closed (the live install is untouched, fully
+recoverable) rather than splicing a `latest` sentinel into an activation spec.
+**Verify the activated binary:** the post-update health check runs the
+*actually-activated* global binary (resolved via `npm prefix -g`), not the
+staging path, and **requires** its reported version to be concrete and equal to
+the staged version — a missing, unparseable, or mismatched version fails closed
+(never skipped), so a build whose identity cannot be positively confirmed is
+never trusted.
 
-**Exit status and JSON outcome must agree.** When the orchestrator interprets a
-spawned staged-binary result, a *success-class* outcome (`upgraded`,
-`already-current`, or a `dry-run`/`already-current` preflight) is trusted **only
-when the process also exited 0**. A contradiction — stdout says `upgraded` but the
-process exited non-zero — means the child's own contract was violated mid-flight,
-so it is treated as **ambiguous** (activation) or **blocked** (preflight), never a
-false success. Blocker-class outcomes are exempt: `yui upgrade` deliberately exits
+**A success envelope is required before any outcome is trusted.** Every
+interpretation of a spawned staged-binary result first requires a valid
+`{ ok: true, data: <object> }` success envelope (R3-F3); an `ok:false` error
+envelope, a non-object `data`, unparseable output, a kill, or a transport error
+is unresolved — preflight treats it as **blocked**, activation as **ambiguous**,
+and a version probe as "no version". Only then does the outcome/exit consistency
+rule apply: a *success-class* outcome (`upgraded`, `already-current`, or a
+`dry-run`/`already-current` preflight) is trusted **only when the process also
+exited 0**. A contradiction — stdout says `upgraded` but the process exited
+non-zero — means the child's own contract was violated mid-flight, so it is
+treated as **ambiguous** (activation) or **blocked** (preflight), never a false
+success. Blocker-class outcomes are exempt: `yui upgrade` deliberately exits
 non-zero (5) for a clean `blocked`, so a non-zero exit there is expected and
 consistent. A parseable result with **no** recognized outcome is likewise never
 read as success.
@@ -373,8 +389,10 @@ FIRST, then the exit status (R2-F2) — because `--json doctor` deliberately exi
 non-zero on unhealthy storage, so keying off the exit first would reduce a precise
 "storage unsupported/corrupted" verdict to a generic "exited with status N".
 Storage is healthy only when ALL hold: a valid `{ ok: true, data: { checks,
-storage } }` success envelope, `storage.healthy === true` with no blocking
-checks, every expected storage check present-and-`ok`, AND exit 0. A parseable-
+storage } }` success envelope, **every expected storage check present exactly once
+and `ok`** (a missing, duplicated, or malformed check fails closed — the `healthy`
+flag is never trusted over the authoritative checks array, R3-F2),
+`storage.healthy === true` with no blocking checks, AND exit 0. A parseable-
 but-unhealthy result (typically exit 5) throws a precise, recovery-oriented
 blocker; an unparseable, non-success, or self-contradictory envelope (e.g.
 `healthy: true` alongside a non-`ok` storage check, or `ok: false`) fails closed —
@@ -395,14 +413,18 @@ current schema and prints precise manual-recovery steps (verify with `yui doctor
 restore the named backup with `mv` if needed), and the CLI exits non-zero with a
 dedicated code so the ambiguity is never mistaken for success.
 
-**A receipt is only trusted when it corresponds to the current home.** A leftover
-receipt from a prior attempt is not unconditional proof that *this* attempt's
-switch committed. Before using a receipt for a recovery decision, the probe
-validates correspondence: the receipt carries the `homePath` it is about and the
-`backupPath` it created, and it is rejected (the caller re-probes the real on-disk
-state instead) when it names a **different home** or when its **backup no longer
-exists** (already restored or cleaned). A non-corresponding receipt reads as
-"not switched" so recovery advice is never derived from a stale marker.
+**A receipt is only trusted when it genuinely corresponds to the current home
+AND its backup.** A leftover receipt from a prior attempt is not unconditional
+proof that *this* attempt's switch committed, and existence alone is not
+correspondence (R3-F6). Before using a receipt for a recovery decision, the probe
+requires the current protocol's correlating fields and a real backup: it is
+rejected (the caller re-probes the real on-disk state instead) when it lacks a
+`homePath` (a legacy/degraded marker), names a **different home**, lacks a
+`backupPath`, names a backup that is **not this home's expected
+`<home>.backup-*` timestamped sibling** (unrelated/foreign evidence), or whose
+backup is **absent or not a real directory** (already restored or cleaned). A
+non-corresponding receipt reads as "not switched" so recovery advice is never
+derived from stale, legacy, or unrelated evidence.
 
 **Rollback boundary (narrowed):** this release introduces no
 versioned binary pointer or stable launcher and therefore makes no binary+home

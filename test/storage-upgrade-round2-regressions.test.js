@@ -94,10 +94,15 @@ function migratableSetup() {
 // preserve runtime/inbox (authoritative), cache/, artifacts/ — no silent loss.
 // ===========================================================================
 
-/** Seed extra persistent content across authoritative + rebuildable dirs. */
+/**
+ * Seed extra persistent content across runtime discovery + rebuildable dirs.
+ * NOTE: this intentionally does NOT seed `runtime/inbox/*` — a non-empty durable
+ * inbox now (correctly) blocks the upgrade at drain-incomplete (R3-F4), which is
+ * covered by its own test. Preservation here is proven for the content that a
+ * clean (drained) upgrade actually switches: runtime discovery, cache/, artifacts/.
+ */
 function seedExtraHomeContent(home) {
-  mkdirSync(join(home, "runtime", "inbox"), { recursive: true });
-  writeFileSync(join(home, "runtime", "inbox", "event-1.json"), '{"authoritative":true}\n');
+  mkdirSync(join(home, "runtime"), { recursive: true });
   writeFileSync(join(home, "runtime", "controller.json"), '{"pid":999999999}\n');
   mkdirSync(join(home, "cache"), { recursive: true });
   writeFileSync(join(home, "cache", "warmup.bin"), "cache-bytes");
@@ -105,7 +110,7 @@ function seedExtraHomeContent(home) {
   writeFileSync(join(home, "artifacts", "integration-checks", "check-1.log"), "check output");
 }
 
-test("P1-1 positive: a migrated switch preserves runtime/inbox, cache/, artifacts/", async () => {
+test("P1-1 positive: a migrated switch preserves runtime/, cache/, artifacts/", async () => {
   const { home } = currentHome();
   seedExtraHomeContent(home);
   const { latest, registry } = migratableSetup();
@@ -115,11 +120,11 @@ test("P1-1 positive: a migrated switch preserves runtime/inbox, cache/, artifact
     now: () => new Date("2026-08-06T12:00:00.000Z")
   });
   assert.equal(result.outcome, "upgraded");
-  // Every authoritative + rebuildable entry must survive the atomic switch.
+  // Every runtime + rebuildable entry must survive the atomic switch.
   assert.equal(
-    readFileSync(join(home, "runtime", "inbox", "event-1.json"), "utf8"),
-    '{"authoritative":true}\n',
-    "authoritative runtime/inbox event must be preserved"
+    readFileSync(join(home, "runtime", "controller.json"), "utf8"),
+    '{"pid":999999999}\n',
+    "runtime discovery content must be preserved"
   );
   assert.equal(readFileSync(join(home, "cache", "warmup.bin"), "utf8"), "cache-bytes");
   assert.equal(
@@ -142,8 +147,8 @@ test("P1-1 positive: the timestamped backup also retains the original extra cont
   assert.equal(result.outcome, "upgraded");
   assert.ok(result.backupPath, "a backup path is reported");
   assert.equal(
-    readFileSync(join(result.backupPath, "runtime", "inbox", "event-1.json"), "utf8"),
-    '{"authoritative":true}\n'
+    readFileSync(join(result.backupPath, "runtime", "controller.json"), "utf8"),
+    '{"pid":999999999}\n'
   );
 });
 
@@ -169,6 +174,11 @@ test("P1-1 negative: the transient .state.lock is NOT promoted into the migrated
 test("P1-1 target unit: writeFreshOutput stages a COMPLETE copy, not just schema+state", () => {
   const { home } = currentHome();
   seedExtraHomeContent(home);
+  // Seed a nested runtime/inbox entry directly (this unit test drives the target,
+  // bypassing the quiesce drain gate) to prove the complete copy includes even
+  // deep authoritative content.
+  mkdirSync(join(home, "runtime", "inbox"), { recursive: true });
+  writeFileSync(join(home, "runtime", "inbox", "event-1.json"), '{"authoritative":true}\n');
   const stagingPath = `${home}.upgrade-staging`;
   const target = createHomeMigrationTarget({ home, latest: latestStorageVersionState(), stagingPath });
   target.writeFreshOutput(target.readSource());
