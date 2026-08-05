@@ -41,7 +41,7 @@ import {
   renameSync,
   rmSync
 } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 
 import { writeTextFileAtomically } from "../durableFile.js";
 import { inspectStorageSchema, STORAGE_SCHEMA_FILE } from "../storageSchema.js";
@@ -170,13 +170,38 @@ export type HomeMigrationTargetOptions = Readonly<{
   callerPid?: number;
   /**
    * Test seam for the atomic switch's renames. Defaults to `node:fs`
-   * `renameSync`. Tests inject this to simulate a failure of the second rename
-   * (staging -> home) after the first (home -> backup) committed, exercising the
-   * partial-switch rollback / ambiguous-switch paths (P1-4). Production never
-   * overrides it.
+   * `renameSync`. Applies to BOTH the promote (staging -> home) and the rollback
+   * (backup -> home) renames, so a test can drive the partial-switch and
+   * ambiguous-switch paths (P1-4). Production never overrides it.
    */
   renameImpl?: (from: string, to: string) => void;
+  /**
+   * Test seam for injecting a fault at a specific point in the atomic switch, to
+   * exercise the phase-aware failure handling (F2): the fsync/marker operations
+   * that surround the two renames, not just the renames themselves. Called at the
+   * start of each labeled switch step; throwing simulates that step failing.
+   * Production never overrides it.
+   */
+  switchFaultHook?: (step: SwitchStep) => void;
 }>;
+
+/**
+ * Labeled steps of the atomic switch, for the {@link HomeMigrationTargetOptions}
+ * `switchFaultHook` test seam. These name every operation AFTER the point of no
+ * return (the `home -> backup` rename) so a test can fault each one and verify it
+ * is handled phase-aware rather than collapsing into a false "source unchanged".
+ */
+export type SwitchStep =
+  /** The fsync of the Home's parent dir, right after `home -> backup`. */
+  | "post-backup-fsync"
+  /** Writing the `promoting` progress marker (original already at backup). */
+  | "promoting-marker"
+  /** The fsync of the Home's parent dir, right after `staging -> home`. */
+  | "post-promote-fsync"
+  /** Clearing the progress marker after a fully-committed promotion. */
+  | "post-promote-clear"
+  /** The rollback `backup -> home` rename after a pre-promotion failure. */
+  | "rollback-rename";
 
 export type HomeMigrationTarget = MigrationTarget<HomeSnapshot> & Readonly<{
   /** The staged fresh-output directory this target writes/promotes/discards. */
@@ -192,10 +217,25 @@ export function createHomeMigrationTarget(
   const now = options.now ?? (() => new Date());
   const callerPid = options.callerPid ?? process.pid;
   const stagingPath = options.stagingPath ?? `${home}.upgrade-staging`;
-  // The promotion rename (staging -> home) is the only injectable one, so a test
-  // can fail it after the backup rename committed. The backup and rollback
-  // renames always use the real fs so rollback genuinely restores the original.
+  // The staging directory must live OUTSIDE the source Home so the complete-copy
+  // contract (F1) never has to copy the staging tree into itself, and so a
+  // legitimately-named Home entry is never misclassified as "the staging dir".
+  // A staging path nested inside the Home is refused outright rather than papered
+  // over with a fragile exclusion.
+  if (isPathInside(home, stagingPath)) {
+    throw new Error(
+      `Staging path must not be inside the Home being migrated: ${stagingPath} is under ${home}. `
+        + "Use a sibling staging directory."
+    );
+  }
+  // The promote (staging -> home) and rollback (backup -> home) renames share the
+  // injectable seam: a fault that blocks the forward rename (e.g. a read-only
+  // parent) would block the reverse too, so an always-failing `renameImpl` drives
+  // the genuine interrupted/ambiguous path. Default is the real fs.
   const promoteRename = options.renameImpl ?? renameSync;
+  // Fault seam for the fsync/marker steps around the renames (F2). A no-op unless
+  // a test injects it; production leaves it undefined.
+  const faultHook = options.switchFaultHook ?? (() => {});
 
   return {
     stagingPath,
@@ -256,15 +296,16 @@ export function createHomeMigrationTarget(
       // the upgrade fence under runtime/ is copied but cleared post-switch by
       // this process's fence release. See ARCHITECTURE.md "Complete Home content
       // preservation".
+      //
+      // Only schema.json / state.json / .state.lock are excluded — NOT the staging
+      // basename (F1). The staging directory is guaranteed to be OUTSIDE the Home
+      // (enforced at target construction), so a Home entry that happens to share
+      // the staging basename (e.g. a real `home.upgrade-staging` file) is genuine
+      // content and is copied like anything else, never silently dropped.
       copyHomeContentsExcept(
         home,
         stagingPath,
-        new Set([
-          STORAGE_SCHEMA_FILE,
-          STORAGE_STATE_FILE,
-          STATE_LOCK_DIRECTORY,
-          basename(stagingPath)
-        ])
+        new Set([STORAGE_SCHEMA_FILE, STORAGE_STATE_FILE, STATE_LOCK_DIRECTORY])
       );
 
       writeTextFileAtomically(
@@ -318,88 +359,120 @@ export function createHomeMigrationTarget(
       if (existsSync(backupPath)) {
         throw new Error(`Refusing to overwrite an existing backup: ${backupPath}.`);
       }
-      // Two atomic renames on the same filesystem. The only non-atomic window is
-      // between them. A durable sibling marker records the phase so a reader can
-      // distinguish not-started / interrupted / complete even if this process is
-      // killed mid-switch (P1-4).
-      writeSwitchProgress(home, {
-        phase: "backing-up",
-        homePath: home,
-        backupPath,
-        stagingPath,
-        updatedAt: now().toISOString()
-      });
 
-      // Step 1: move the original aside. If this fails, nothing has moved and the
-      // Home is genuinely unchanged — clear the marker and surface the error.
+      // The switch is two atomic renames with one non-atomic window between them.
+      // A durable sibling marker records the phase (backing-up / promoting /
+      // interrupted) so a reader — or `yui update`'s crash recovery — can tell how
+      // far the switch got even if this process dies mid-way (P1-4 / F2 / F3).
+      //
+      // The invariant that drives error handling: BEFORE step 1's rename commits,
+      // the Home is byte-for-byte intact and any failure is a clean pre-switch
+      // failure (plain throw -> engine `failed` -> "source unchanged", which is
+      // TRUE). AFTER step 1 commits, the original no longer lives at `home`, so
+      // EVERY subsequent operation — the post-rename fsync, the `promoting` marker
+      // write, the promote rename, and the post-promote fsync/marker-clear — is
+      // handled phase-aware: on any error we attempt rollback, and if rollback
+      // fails we persist `interrupted` and raise AmbiguousSwitchError. A
+      // post-switch exception is NEVER allowed to escape as a plain error that the
+      // engine would render as "source unchanged" (F2).
+
+      // Phase 0 (Home intact): write the backing-up marker, then move aside.
+      // Any failure here leaves the Home untouched — clear the marker, plain throw.
       try {
+        writeSwitchProgress(home, {
+          phase: "backing-up",
+          homePath: home,
+          backupPath,
+          stagingPath,
+          updatedAt: now().toISOString()
+        });
         renameSync(home, backupPath);
       } catch (error) {
-        clearSwitchProgress(home);
+        // Nothing committed (or the marker write failed before the rename): the
+        // Home is intact. Best-effort clear the marker and surface a clean error.
+        try { clearSwitchProgress(home); } catch { /* best effort */ }
         throw error;
       }
-      fsyncDirectory(dirname(home));
 
-      // The original is now at the backup: we are in the non-atomic window.
-      writeSwitchProgress(home, {
-        phase: "promoting",
-        homePath: home,
-        backupPath,
-        stagingPath,
-        updatedAt: now().toISOString()
-      });
-
-      // Step 2: promote the staged output into the Home path.
+      // ---- From here the original lives at `backupPath`, NOT at `home`. ----
+      // Every step is guarded: on failure, roll back to restore the original; if
+      // the rollback fails, the switch is genuinely interrupted (ambiguous).
       try {
+        faultHook("post-backup-fsync");
+        fsyncDirectory(dirname(home));
+        faultHook("promoting-marker");
+        writeSwitchProgress(home, {
+          phase: "promoting",
+          homePath: home,
+          backupPath,
+          stagingPath,
+          updatedAt: now().toISOString()
+        });
+        // Step 2: promote the staged output into the Home path.
         promoteRename(stagingPath, home);
-      } catch (promoteError) {
-        // Promotion failed after the original was moved aside. The invariant
-        // "the Home is unchanged" is now FALSE. Try to restore the original from
-        // the backup so we can honestly report "rolled back, unchanged". The
-        // rollback goes through the same rename seam: whatever fault blocked the
-        // promotion (a read-only parent, a vanished path) would block the reverse
-        // move too, so a test injecting a failing rename exercises both.
+        // Post-promotion durability. If these throw, the new Home is ALREADY in
+        // place and correct; fsync/marker-clear are best-effort durability, not
+        // correctness, so a failure here must NOT fail the switch or trigger a
+        // rollback (that would destroy a good migrated Home). Swallow them.
+        try { faultHook("post-promote-fsync"); fsyncDirectory(dirname(home)); }
+        catch { /* durability best effort */ }
+        try { faultHook("post-promote-clear"); clearSwitchProgress(home); }
+        catch { /* marker cleared lazily later */ }
+        return {
+          status: "switched",
+          backupPath,
+          detail: `Original Home backed up at ${backupPath}.`
+        };
+      } catch (switchError) {
+        // A failure BEFORE promotion committed (post-rename fsync, `promoting`
+        // marker write, or the promote rename itself). The original is at the
+        // backup and `home` is missing. Attempt rollback to restore it — the
+        // `return` above is the only path once promotion has committed, so here
+        // promotion has NOT committed and rollback is always the right recovery.
+        return rollbackOrInterrupt(switchError);
+      }
+
+      /**
+       * Restore the original from the backup after a pre-promotion failure. On
+       * success the Home is intact again and we re-throw the original error as a
+       * clean pre-switch failure (engine `failed`, truthfully "source unchanged").
+       * If the rollback itself fails, persist `interrupted` and raise
+       * AmbiguousSwitchError with the exact manual recovery.
+       */
+      function rollbackOrInterrupt(switchError: unknown): never {
         try {
+          faultHook("rollback-rename");
           promoteRename(backupPath, home);
-          fsyncDirectory(dirname(home));
-          clearSwitchProgress(home);
+          try { fsyncDirectory(dirname(home)); } catch { /* durability best effort */ }
+          try { clearSwitchProgress(home); } catch { /* best effort */ }
         } catch (rollbackError) {
-          // Rollback ALSO failed: the switch is genuinely interrupted. Record the
-          // interrupted phase durably and raise a precise, recoverable error —
-          // never let the caller believe the Home is intact.
-          writeSwitchProgress(home, {
-            phase: "interrupted",
-            homePath: home,
-            backupPath,
-            stagingPath,
-            updatedAt: now().toISOString()
-          });
+          try {
+            writeSwitchProgress(home, {
+              phase: "interrupted",
+              homePath: home,
+              backupPath,
+              stagingPath,
+              updatedAt: now().toISOString()
+            });
+          } catch { /* marker best effort; fs evidence + backup still recover it */ }
           throw new AmbiguousSwitchError({
             homePath: home,
             backupPath,
             stagingPath,
             detail:
               `Storage switch is in an AMBIGUOUS, partially-applied state: the original Home was `
-              + `moved to ${backupPath} but promoting the migrated output failed `
-              + `(${messageOf(promoteError)}), and the automatic rollback also failed `
-              + `(${messageOf(rollbackError)}). The Home path ${home} may be missing. Recover `
-              + `manually by restoring the backup: mv "${backupPath}" "${home}".`
+              + `moved to ${backupPath} but the switch failed (${messageOf(switchError)}), and the `
+              + `automatic rollback also failed (${messageOf(rollbackError)}). The Home path ${home} `
+              + `may be missing. Recover manually by restoring the backup: mv "${backupPath}" "${home}".`
           });
         }
         // Rollback succeeded: the original is back in place, Home unchanged. Bubble
-        // the original promotion error so the engine reports a failed switch with
-        // the source intact (the engine's failure path never claims a switch).
-        throw promoteError;
+        // the original error so the engine reports a failed switch with the source
+        // intact (the engine's failure path never claims a switch committed).
+        throw switchError instanceof Error
+          ? switchError
+          : new Error(String(switchError));
       }
-      fsyncDirectory(dirname(home));
-
-      // Both renames committed: the switch is complete. Clear the progress marker.
-      clearSwitchProgress(home);
-      return {
-        status: "switched",
-        backupPath,
-        detail: `Original Home backed up at ${backupPath}.`
-      };
     },
 
     discardFreshOutput(): void {
@@ -577,6 +650,25 @@ function isEnoent(error: unknown): boolean {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * True when `candidate` is the same path as `base` or nested anywhere inside it.
+ * Uses resolved absolute paths and a relative-path check so it is robust to
+ * `.`/`..`/trailing-slash forms and never treats a sibling that merely shares a
+ * name prefix (e.g. `home.upgrade-staging` vs `home`) as "inside" (F1).
+ */
+function isPathInside(base: string, candidate: string): boolean {
+  const rel = relative(resolve(base), resolve(candidate));
+  if (rel === "") return true; // identical path.
+  // Inside iff the relative path does not escape upward and is not absolute.
+  return !rel.startsWith("..") && !isAbsolutePath(rel);
+}
+
+function isAbsolutePath(p: string): boolean {
+  // resolve() yields platform-absolute paths; a relative() result that is
+  // absolute means the two paths share no common base (different roots).
+  return resolve(p) === p;
 }
 
 /**

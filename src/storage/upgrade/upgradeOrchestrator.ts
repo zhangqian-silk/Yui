@@ -58,7 +58,8 @@ import {
   describeActiveRuntime,
   homeRuntimeIsActive,
   inspectHomeRuntime,
-  type HomeSnapshot
+  type HomeSnapshot,
+  type SwitchStep
 } from "./homeMigrationTarget.js";
 
 /** The precise stage at which an upgrade was blocked or failed. */
@@ -122,6 +123,12 @@ export type RunStorageUpgradeOptions<Snapshot> = Readonly<{
    * failing promotion/rollback rename (P1-4). Production never sets it.
    */
   renameImpl?: (from: string, to: string) => void;
+  /**
+   * Test seam forwarded to the migration target's atomic switch to fault a
+   * specific fsync/marker step around the two renames (F2). Production never
+   * sets it.
+   */
+  switchFaultHook?: (step: SwitchStep) => void;
 }>;
 
 /**
@@ -186,7 +193,8 @@ export async function runStorageUpgrade(
     latest,
     now,
     callerPid,
-    ...(options.renameImpl === undefined ? {} : { renameImpl: options.renameImpl })
+    ...(options.renameImpl === undefined ? {} : { renameImpl: options.renameImpl }),
+    ...(options.switchFaultHook === undefined ? {} : { switchFaultHook: options.switchFaultHook })
   });
 
   // 2) A USABLE (already-current) Home has nothing to migrate; the engine

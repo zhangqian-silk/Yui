@@ -152,19 +152,37 @@ export function createUpdatePorts(
       // on-disk schema and report `switched: false` so the caller re-probes the
       // real state instead of giving a recovery instruction from a stale receipt.
       const schema = inspectStorageSchema(home);
-      // A partially-applied, interrupted switch (P1-4) is the strongest signal:
-      // the original was moved to the backup and neither promotion nor rollback
-      // completed, so the Home path may be missing. Surface it explicitly with the
-      // backup so the caller reports a restore, not a "verify the migrated Home".
-      const interrupted = readSwitchProgress(home);
-      if (interrupted !== null && interrupted.phase === "interrupted") {
-        return {
-          switched: false,
-          interrupted: true,
-          schemaCurrent: schema.status === "current",
-          backupPath: interrupted.backupPath
-        };
+
+      // A crash mid-switch leaves a durable progress marker. Any phase — including
+      // `backing-up` and `promoting`, not just `interrupted` — combined with
+      // filesystem evidence that the original was moved aside (the backup exists)
+      // and the Home is not in place means the authoritative data lives ONLY at
+      // the backup. That is a known, precise restore, never a "most likely did not
+      // commit" glob/retry that would send the operator to re-setup a missing Home
+      // (F3). We only decline to treat a marker as interrupted when the Home is
+      // demonstrably intact (nothing to recover) or there is no backup to restore.
+      const progress = readSwitchProgress(home);
+      if (progress !== null) {
+        const backupPresent = progress.backupPath !== undefined
+          && existsSync(progress.backupPath);
+        // The Home is "in place" only when storage is actually initialized there;
+        // a missing/uninitialized Home after a mid-switch crash means the data is
+        // at the backup.
+        const homeInitialized = schema.status !== "uninitialized";
+        if (progress.phase === "interrupted"
+          || (backupPresent && !homeInitialized)) {
+          // Original at the backup, Home missing/uninitialized: recover by restore.
+          return {
+            switched: false,
+            interrupted: true,
+            schemaCurrent: schema.status === "current",
+            ...(progress.backupPath === undefined ? {} : { backupPath: progress.backupPath })
+          };
+        }
+        // A pre-start/complete-ish marker with an intact Home (or no usable backup)
+        // is not an interrupted switch — fall through to the receipt/schema logic.
       }
+
       const correlation = correlateUpgradeReceipt(home);
       if (!correlation.corresponds) {
         return { switched: false, schemaCurrent: schema.status === "current" };

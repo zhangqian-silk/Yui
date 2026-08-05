@@ -230,10 +230,15 @@ process itself is exempt. **Fence acquisition is a single atomic
 concurrent upgraders wins that create, so there is no check-then-write window in
 which two upgraders both believe they acquired; a loser either re-enters (it
 already owns the fence), reclaims a *provably-dead* owner's stale fence and
-retries once, or fails closed for a live/undeterminable owner. There is no lease
-or multi-round negotiation. The fence is enforced by every writer built from this
-release forward (its check lives in the shared store-commit path); it cannot
-retroactively bind an already-installed older binary, so cross-release
+retries, or fails closed for a live/undeterminable owner. **Stale-fence reclaim
+is itself atomic (compare-and-delete under a `mkdir` critical section):** the
+reclaim re-reads the fence bytes under the lock and deletes *only* the exact
+dead-owner bytes it observed, so a racer that slipped a fresh live fence into the
+same path between the observe and the delete is never clobbered — closing the
+reclaim TOCTOU that could otherwise let two entrants both acquire. There is no
+lease or multi-round negotiation. The fence is enforced by every writer built
+from this release forward (its check lives in the shared store-commit path); it
+cannot retroactively bind an already-installed older binary, so cross-release
 concurrency is instead handled by the quiesce step and the recommendation to
 stop all Yui activity for the home before upgrading. It then drains the
 Controller with the public `controller.stop`/shutdownAndDrain (never a broad
@@ -269,23 +274,44 @@ are overwritten with their migrated bytes. So the switch preserves all
 authoritative and rebuildable content — and the timestamped backup retains the
 original of everything too. The transient `.state.lock` is the one exception: a
 lock is per-instance coordination state, never authoritative content, so it is
-not promoted into the migrated home.
+not promoted into the migrated home. The staging directory is required to live
+*outside* the home (an in-home staging layout is refused at construction), so the
+copy never excludes a home entry merely because it shares the staging directory's
+name — a real home entry named `home.upgrade-staging` is preserved like any other.
 
 **Partial (two-step) switch is reported honestly, never as "unchanged".** The
 atomic switch is two renames — `home -> backup`, then `staging -> home` — with one
 non-atomic window between them, tracked by a durable sibling progress marker
 (`<home>.upgrade-switch.json`) whose phase distinguishes *not-started* /
-*interrupted* / *complete*. If the second rename fails, the code first attempts
-an automatic rollback (`backup -> home`); when that succeeds the original is
-restored and the failure is reported with the home genuinely unchanged. **Only if
-the rollback also fails** is the switch left partially applied: the marker records
-`interrupted`, the engine surfaces a distinct `switch-ambiguous` outcome, and the
-upgrade blocks at a dedicated `switch-ambiguous` stage that states the home is
-**not** intact and prints the exact `mv "<backup>" "<home>"` recovery — it never
-falsely claims "storage was not switched; the home is unchanged". No completion
-receipt is written in this case (the switch did not commit); the `interrupted`
-marker is the durable signal, and `yui update`'s probe reads it to drive a
-restore-the-backup recovery rather than a "verify the migrated home".
+*backing-up* / *promoting* / *interrupted* / *complete*. The invariant that drives
+error handling: **before** the first rename commits the home is intact and any
+failure is a clean pre-switch error ("source unchanged", which is true);
+**after** it commits, *every* subsequent operation — the post-rename fsync, the
+`promoting` marker write, the promote rename, and the post-promote fsync/marker
+clear — is phase-aware, so an fsync or marker failure can never escape as a plain
+error that the engine would render as "source unchanged". On any pre-promotion
+failure the code attempts an automatic rollback (`backup -> home`); when that
+succeeds the original is restored and the failure is reported with the home
+genuinely unchanged. **Only if the rollback also fails** is the switch left
+partially applied: the marker records `interrupted`, the engine surfaces a
+distinct `switch-ambiguous` outcome, and the upgrade blocks at a dedicated
+`switch-ambiguous` stage that states the home is **not** intact and prints the
+exact `mv "<backup>" "<home>"` recovery. A failure of the *post-promotion*
+fsync/marker-clear, by contrast, does **not** fail the switch — the new home is
+already in place and correct, and those steps are best-effort durability, so a
+good migrated home is never rolled back. No completion receipt is written for an
+interrupted switch (it did not commit); the `interrupted` marker is the durable
+signal.
+
+**Crash-window recovery keys off the marker plus filesystem evidence.** A process
+that dies mid-switch leaves a valid `backing-up` or `promoting` marker (not just
+`interrupted`), with the original at the backup and the home path missing. `yui
+update`'s probe treats *any* such marker combined with filesystem evidence (the
+backup exists and the home is missing/uninitialized) as an interrupted switch and
+prints the exact backup-restore path — never a generic "most likely did not
+commit, retry/setup" that would send the operator to re-initialize a missing
+home. A pre-start marker whose home is still intact (or that has no usable backup)
+is *not* treated as interrupted: there is nothing to recover.
 
 **Quiesce fails closed on any undeterminable signal.** The `.state.lock` is
 acquired mkdir-first with its `owner` file written a moment later, so a lock

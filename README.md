@@ -96,8 +96,11 @@ re-pins the committed revision under the write lock, migrates into a fresh
 staged home, validates it, then atomically switches into place with a
 timestamped backup and a post-switch health check. **Fence acquisition is a
 single atomic file create**, so two concurrent upgraders never both acquire —
-exactly one wins and the other fails closed (a provably-dead owner's stale fence
-is reclaimed). An **uninitialized home** (never `yui setup`) returns a structured
+exactly one wins and the other fails closed. A provably-dead owner's stale fence
+is reclaimed, but the reclaim is an **atomic compare-and-delete** (it removes only
+the exact stale bytes, under a lock), so a fresh live fence a racer created in the
+meantime is never clobbered — two entrants can never both end up "acquired". An
+**uninitialized home** (never `yui setup`) returns a structured
 "run `yui setup`" blocker rather than a silent no-op. Quiesce **fails closed on any
 undeterminable signal**: a `.state.lock` that exists but whose owner is
 missing/empty/non-integer/unreadable (a writer may be mid-acquisition), or a
@@ -109,14 +112,20 @@ The migration only transforms `schema.json` + `state.json`, but because the
 atomic switch replaces the whole home directory, **staging carries a complete
 copy of the home** — `runtime/`, `runtime/inbox/*` (authoritative), `cache/`, and
 `artifacts/` are all preserved through the switch and retained in the backup, with
-no silent loss (the transient `.state.lock` is the sole exception). The switch is
-two renames with one non-atomic window; a second-rename failure first attempts an
-automatic rollback, and only if that rollback **also** fails is the home reported
-as partially switched (a distinct `switch-ambiguous` blocker with the exact
-`mv "<backup>" "<home>"` recovery) — it never falsely claims the home is unchanged.
-Any other failed or blocked step leaves the authoritative home byte-for-byte
-unchanged and reports the exact blocker stage and recovery action. It never
-converts a real home in this release (the registry is empty), and Yui never
+no silent loss (the transient `.state.lock` is the sole exception; a real home
+entry that happens to share the staging directory's name is preserved too, and an
+in-home staging layout is refused outright). The switch is two renames with one
+non-atomic window, and **every** step after the first rename — the fsyncs and the
+progress-marker writes, not just the rename — is phase-aware: a failure first
+attempts an automatic rollback, and only if that rollback **also** fails is the
+home reported as partially switched (a distinct `switch-ambiguous` blocker with
+the exact `mv "<backup>" "<home>"` recovery) — it never falsely claims the home is
+unchanged. A crash mid-switch leaves a durable marker; `yui update` recovery reads
+that marker plus filesystem evidence (backup present, home missing) to name the
+exact backup restore rather than a generic retry. Any other failed or blocked step
+leaves the authoritative home byte-for-byte unchanged and reports the exact
+blocker stage and recovery action. It never converts a real home in this release
+(the registry is empty), and Yui never
 dual-reads an older schema or guesses an old identifier. See
 [Task-local identity](docs/task-local-identity.md) for the current reference
 contract.
