@@ -91,7 +91,7 @@ function chipRow(label, values, activeValue) {
 function criteriaList(label, items) {
   const list = (items || []).filter(Boolean);
   if (!list.length) return null;
-  const block = node("div", "record-block");
+  const block = node("div", "record-block is-wide");
   block.append(node("small", "", label));
   const listElement = node("ul", "criteria-list");
   list.forEach(function (item) { listElement.append(node("li", "", item)); });
@@ -657,7 +657,7 @@ function inputCard(input, _options, t, locale, actions) {
 }
 
 function workItemCard(item, titles, t, locale, actions, _taskId) {
-  const card = node("article", "record-card");
+  const card = node("article", "record-card work-item-card");
   const head = node("div", "record-head");
   const titleRow = node("div", "record-title-row");
   titleRow.append(statusDot(item.status), node("strong", "record-title", item.title));
@@ -673,22 +673,32 @@ function workItemCard(item, titles, t, locale, actions, _taskId) {
   meta.append(node("time", "", formatDateTime(item.updatedAt, locale)));
   card.append(meta);
 
-  // Objective spans the full card width so a short objective never leaves a
-  // tall empty column beside a long acceptance list.
   if (item.objective && item.objective !== item.title) {
     card.append(copyBlock(t("detail.objective"), item.objective));
   }
 
-  const cols = node("div", "record-cols");
-  if (item.acceptance && item.acceptance.length) cols.append(criteriaList(t("detail.acceptance"), item.acceptance));
+  if (item.acceptance && item.acceptance.length) {
+    card.append(criteriaList(t("detail.acceptance"), item.acceptance));
+  }
+
+  // Short chip rows (dependencies, writable projects) sit side by side; long
+  // text blocks above and below stay full-width so the card reads top-to-bottom
+  // like an issue rather than a mismatched column grid.
+  const chipCols = node("div", "work-item-chips");
   if (item.dependsOn && item.dependsOn.length) {
-    cols.append(chipRow(t("detail.dependsOn"), item.dependsOn.map(function (id) { return titles[id] || id; })));
+    chipCols.append(chipRow(t("detail.dependsOn"), item.dependsOn.map(function (id) { return titles[id] || id; })));
   }
   if (item.writeProjectIds && item.writeProjectIds.length) {
-    cols.append(chipRow(t("detail.writeProjects"), item.writeProjectIds));
+    chipCols.append(chipRow(t("detail.writeProjects"), item.writeProjectIds));
   }
-  if (item.outcome) cols.append(copyBlock(t("detail.outcome"), item.outcome, { muted: true }));
-  if (cols.childNodes.length) card.append(cols);
+  if (chipCols.childNodes.length) card.append(chipCols);
+
+  if (item.outcome) {
+    const outcome = node("div", "record-block outcome-callout");
+    outcome.append(node("small", "", t("detail.outcome")));
+    outcome.append(node("p", "muted", item.outcome));
+    card.append(outcome);
+  }
   return card;
 }
 
@@ -740,6 +750,11 @@ function roleCard(role, task, t, locale, actions) {
   head.append(node("strong", "record-title", role.name));
   head.append(pill(t, "role", role.status));
   card.append(head);
+
+  const meta = node("div", "record-meta");
+  meta.append(node("span", "mono", role.name));
+  if (role.updatedAt) meta.append(node("time", "", formatDateTime(role.updatedAt, locale)));
+  card.append(meta);
 
   const actionsRow = node("div", "record-actions");
   const left = node("div", "record-meta");
@@ -823,9 +838,9 @@ function historyEventRow(event, t, locale) {
     const card = node("article", "record-card");
     const head = node("div", "record-head");
     const titleRow = node("div", "record-title-row");
-    titleRow.append(statusDot("completed"), node("strong", "record-title", milestone.title));
+    titleRow.append(node("strong", "record-title", milestone.title));
     head.append(titleRow);
-    head.append(pill(t, "milestone", "recorded"));
+    head.append(pill(t, "history", "milestone"));
     card.append(head);
     const meta = node("div", "record-meta");
     meta.append(node("span", "mono", milestone.id));
@@ -837,9 +852,16 @@ function historyEventRow(event, t, locale) {
   const decision = event.item;
   const card = node("article", "record-card");
   const head = node("div", "record-head");
-  head.append(node("strong", "record-title", decision.title));
-  head.append(pill(t, "decision", decision.status));
+  const titleRow = node("div", "record-title-row");
+  titleRow.append(node("strong", "record-title", decision.title));
+  head.append(titleRow);
+  head.append(pill(t, "history", "decision"));
   card.append(head);
+  const meta = node("div", "record-meta");
+  meta.append(node("span", "mono", decision.id));
+  if (decision.createdAt) meta.append(node("time", "", formatDateTime(decision.createdAt, locale)));
+  if (decision.status) meta.append(node("span", "", decision.status));
+  card.append(meta);
   if (decision.rationale) card.append(copyBlock("", decision.rationale, { muted: true }));
   if (decision.supersededReason) card.append(copyBlock("", decision.supersededReason, { muted: true }));
   return card;
@@ -849,12 +871,13 @@ function messageCard(message, t, locale) {
   const card = node("article", "record-card");
   const head = node("div", "record-head");
   const titleRow = node("div", "record-title-row");
-  titleRow.append(statusDot("active"), node("strong", "record-title", messageAuthor(message, t)));
+  titleRow.append(node("strong", "record-title", messageAuthor(message, t)));
   head.append(titleRow);
   if (message.kind) head.append(pill(t, "messageKind", message.kind));
   card.append(head);
 
   const meta = node("div", "record-meta");
+  meta.append(node("span", "mono", message.id));
   meta.append(node("time", "", formatDateTime(message.createdAt, locale)));
   if (message.runId) meta.append(node("span", "mono", message.runId + (message.workItemId ? " · " + message.workItemId : "")));
   card.append(meta);
