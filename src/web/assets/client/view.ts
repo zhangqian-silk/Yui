@@ -668,7 +668,7 @@ function workItemCard(item, titles, t, locale, actions, _taskId) {
   card.append(head);
 
   const meta = node("div", "record-meta");
-  if (item.assignee) meta.append(node("span", "", item.assignee));
+  if (item.assignee) meta.append(node("span", "meta-name", item.assignee));
   meta.append(node("span", "mono", item.id));
   meta.append(node("time", "", formatDateTime(item.updatedAt, locale)));
   card.append(meta);
@@ -752,7 +752,6 @@ function roleCard(role, task, t, locale, actions) {
   card.append(head);
 
   const meta = node("div", "record-meta");
-  meta.append(node("span", "mono", role.name));
   if (role.updatedAt) meta.append(node("time", "", formatDateTime(role.updatedAt, locale)));
   card.append(meta);
 
