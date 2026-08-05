@@ -1478,7 +1478,9 @@ function updateWork(
         : null;
       const projectDelivery = task.projectBindings.length > 0
         && current.writeProjectIds.length > 0;
-      const candidateRequired = projectDelivery || reviewConfig !== null;
+      const candidateRequired = status === "completed"
+        && current.status === "running"
+        && (projectDelivery || reviewConfig !== null);
       const developWorkspace = tx.getWorkItemWorkspace(task.id, current.id);
       if (status === "completed" && projectDelivery && developWorkspace === null) {
         throw usageError(

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
@@ -32,6 +33,7 @@ import {
 } from "../../dist/role/role.js";
 import { createAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
 import { createProject } from "../../dist/repository/project.js";
+import { NodeGitWorkspace, worktreeIdentity } from "../../dist/repository/gitWorkspace.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
 import { TaskWorkspaceCoordinator } from "../../dist/repository/taskWorkspaceCoordinator.js";
 import {
@@ -1119,6 +1121,228 @@ test("public review delivery binds the physical ReviewRound workspace before not
   assert.equal(queuedRefs.some((ref) => ref.type === "run" && ref.id === reviewRun.id), true);
 });
 
+test("ReviewRound preparation rejects a stale deterministic branch instead of relabelling it", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Reject stale review worktree", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  const agent = addTaskRoles(store, task, repositoryPath);
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(agent)],
+      agent.id,
+      workspace,
+      NOW
+    ));
+    tx.saveConfig({ ...tx.getConfig(), review: { roleName: "reviewer", trigger: "leader" } });
+  });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const item = createWorkItem("work-1", task.id, {
+    title: "Review a frozen candidate",
+    assignee: "worker",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const develop = await preparer.prepareWorkItemWorkspace(item.id);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  const candidateRun = yieldAgentRun(createAgentRun(
+    "run-1",
+    task.id,
+    "worker",
+    "new",
+    "Prepare a frozen candidate.",
+    NOW,
+    { workItemId: item.id, workspace: develop }
+  ), "Candidate ready.", NOW);
+  store.saveAgentRun(candidateRun);
+  store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
+    summary: candidateRun.summary,
+    source: { type: "run", runId: candidateRun.id },
+    reviewPolicy: { roleName: "reviewer", trigger: "leader" },
+    workspace: develop
+  }, NOW));
+
+  runTaskCommand(["work", "review", item.id], store, {
+    now: () => new Date(NOW),
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  });
+  const round = store.listReviewRounds(task.id)[0];
+  assert.equal(round.status, "running");
+  const placeholder = store.getReviewRoundWorkspace(task.id, round.id);
+  assert.notEqual(placeholder, null);
+  assert.match(placeholder.root, /\.review-rounds/);
+
+  writeFileSync(join(repositoryPath, "stale-review.txt"), "stale branch\n");
+  execFileSync("git", ["-C", repositoryPath, "add", "stale-review.txt"]);
+  execFileSync("git", ["-C", repositoryPath, "commit", "-qm", "stale review branch"]);
+  const identity = worktreeIdentity(task.id, round.id);
+  const stalePath = join(workspace, "worktree", project.name, identity.directory);
+  mkdirSync(join(stalePath, ".."), { recursive: true });
+  execFileSync("git", [
+    "-C", repositoryPath,
+    "worktree", "add", "-b", identity.branch,
+    stalePath,
+    "HEAD"
+  ], { stdio: "ignore" });
+
+  await assert.rejects(
+    preparer.prepareReviewRoundWorkspace(round.id),
+    /ReviewRound workspace baseCommit mismatch/i
+  );
+  assert.equal(store.getReviewRoundWorkspace(task.id, round.id).root, placeholder.root);
+  assert.equal(existsSync(stalePath), false);
+  assert.throws(() => execFileSync(
+    "git",
+    ["-C", repositoryPath, "show-ref", "--verify", `refs/heads/${identity.branch}`],
+    { stdio: "ignore" }
+  ));
+});
+
+test("multi-Project ReviewRound preparation discards earlier worktrees when a later Project fails", async (t) => {
+  const { root, home, workspace, repositoryPath, store } = fixture(t);
+  const firstProject = await addProject(store, repositoryPath);
+  const secondRepositoryPath = join(root, "frontend");
+  execFileSync("git", ["init", "-q", secondRepositoryPath]);
+  execFileSync("git", ["-C", secondRepositoryPath, "config", "user.name", "Yui Test"]);
+  execFileSync("git", ["-C", secondRepositoryPath, "config", "user.email", "yui@example.invalid"]);
+  writeFileSync(join(secondRepositoryPath, "tracked.txt"), "frontend\n");
+  execFileSync("git", ["-C", secondRepositoryPath, "add", "tracked.txt"]);
+  execFileSync("git", ["-C", secondRepositoryPath, "commit", "-qm", "initial"]);
+  await runProjectCommand([
+    "add", "Frontend", secondRepositoryPath,
+    "--remote", "git@example.invalid:frontend.git",
+    "--stable", "HEAD",
+    "--development", "HEAD"
+  ], store, { now: () => new Date(NOW) });
+  const secondProject = store.listProjects().find(({ name }) => name === "Frontend");
+  assert.notEqual(secondProject, undefined);
+  const task = activateTask(createTask("task-1", "Review two Projects", NOW, {
+    projectBindings: [
+      {
+        projectId: firstProject.id,
+        directory: firstProject.name,
+        baseRef: firstProject.developmentBranch
+      },
+      {
+        projectId: secondProject.id,
+        directory: secondProject.name,
+        baseRef: secondProject.developmentBranch
+      }
+    ]
+  }), NOW);
+  const agent = addTaskRoles(store, task, repositoryPath);
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(agent)],
+      agent.id,
+      workspace,
+      NOW
+    ));
+    tx.saveConfig({ ...tx.getConfig(), review: { roleName: "reviewer", trigger: "leader" } });
+  });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const item = createWorkItem("work-1", task.id, {
+    title: "Review both Project results",
+    assignee: "worker",
+    writeProjectIds: [firstProject.id, secondProject.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const develop = await preparer.prepareWorkItemWorkspace(item.id);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  const candidateRun = yieldAgentRun(createAgentRun(
+    "run-1",
+    task.id,
+    "worker",
+    "new",
+    "Prepare a two-Project candidate.",
+    NOW,
+    { workItemId: item.id, workspace: develop }
+  ), "Candidate ready.", NOW);
+  store.saveAgentRun(candidateRun);
+  store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
+    summary: candidateRun.summary,
+    source: { type: "run", runId: candidateRun.id },
+    reviewPolicy: { roleName: "reviewer", trigger: "leader" },
+    workspace: develop
+  }, NOW));
+  runTaskCommand(["work", "review", item.id], store, {
+    now: () => new Date(NOW),
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  });
+  const round = store.listReviewRounds(task.id)[0];
+  const placeholder = store.getReviewRoundWorkspace(task.id, round.id);
+  assert.notEqual(placeholder, null);
+
+  const realGit = new NodeGitWorkspace();
+  let ensureCalls = 0;
+  const failingGit = {
+    inspect: (...args) => realGit.inspect(...args),
+    ensureWorktree: async (input) => {
+      ensureCalls += 1;
+      if (ensureCalls === 2) throw new Error("synthetic later Project failure");
+      return realGit.ensureWorktree(input);
+    },
+    removeWorktree: (input) => realGit.removeWorktree(input)
+  };
+  const failingPreparer = new FileTaskWorkspacePreparer(
+    home,
+    store,
+    failingGit,
+    () => new Date(NOW)
+  );
+  await assert.rejects(
+    failingPreparer.prepareReviewRoundWorkspace(round.id),
+    /synthetic later Project failure/
+  );
+  assert.equal(ensureCalls, 2);
+  const firstPhysical = join(
+    workspace,
+    "worktree",
+    firstProject.name,
+    task.id,
+    round.id
+  );
+  const secondPhysical = join(
+    workspace,
+    "worktree",
+    secondProject.name,
+    task.id,
+    round.id
+  );
+  assert.equal(existsSync(firstPhysical), false);
+  assert.equal(existsSync(secondPhysical), false);
+  assert.throws(() => execFileSync(
+    "git",
+    ["-C", repositoryPath, "show-ref", "--verify", `refs/heads/yui/task-1/${round.id}`],
+    { stdio: "ignore" }
+  ));
+  assert.throws(() => execFileSync(
+    "git",
+    ["-C", secondRepositoryPath, "show-ref", "--verify", `refs/heads/yui/task-1/${round.id}`],
+    { stdio: "ignore" }
+  ));
+  assert.equal(store.getReviewRoundWorkspace(task.id, round.id).root, placeholder.root);
+});
+
 test("public terminal ReviewRound cleanup removes its clean workspace", async (t) => {
   const { home, workspace, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
@@ -1606,6 +1830,119 @@ test("Leader can directly create and clean a WorkItem-owned isolated worktree", 
     ["-C", repositoryPath, "show-ref", "--verify", "refs/heads/yui/task-1/work-1"],
     { stdio: "ignore" }
   ));
+});
+
+test("a roleless Project WorkItem follows isolate, Candidate, Integration, acceptance, and cleanup", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Roleless WorkItem lifecycle", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath, ["leader"]);
+  const item = createWorkItem("work-1", task.id, {
+    title: "Leader-managed isolated change",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+
+  const cli = join(process.cwd(), "dist", "cli.js");
+  const leaderEnvironment = {
+    ...process.env,
+    YUI_HOME: home,
+    YUI_SESSION_SCOPE: "task",
+    YUI_TASK_ID: task.id,
+    YUI_ROLE: "leader"
+  };
+  const isolated = spawnSync(
+    process.execPath,
+    [cli, "task", "work", "isolate", item.id],
+    { encoding: "utf8", env: leaderEnvironment }
+  );
+  assert.equal(isolated.status, 0, isolated.stderr || isolated.stdout);
+  const develop = store.getWorkItemWorkspace(task.id, item.id);
+  assert.notEqual(develop, null);
+  assert.deepEqual(develop.owner, {
+    type: "work-item",
+    taskId: task.id,
+    workItemId: item.id
+  });
+  assert.equal(store.getWorkItem(task.id, item.id).assignee, undefined);
+
+  const started = spawnSync(
+    process.execPath,
+    [cli, "task", "work", "update", item.id, "running"],
+    { encoding: "utf8", env: leaderEnvironment }
+  );
+  assert.equal(started.status, 0, started.stderr || started.stdout);
+  assert.equal(store.getWorkItem(task.id, item.id).status, "running");
+  assert.equal(store.getWorkItem(task.id, item.id).candidates.length, 0);
+
+  const isolatedPath = develop.entries[0].path;
+  writeFileSync(join(isolatedPath, "roleless.txt"), "roleless result\n");
+  execFileSync("git", ["-C", isolatedPath, "add", "roleless.txt"]);
+  execFileSync("git", ["-C", isolatedPath, "commit", "-qm", "roleless result"]);
+  const completed = spawnSync(
+    process.execPath,
+    [cli, "task", "work", "update", item.id, "done", "--summary", "Ready for integration"],
+    { encoding: "utf8", env: leaderEnvironment }
+  );
+  assert.equal(completed.status, 0, completed.stderr || completed.stdout);
+  const candidateItem = store.getWorkItem(task.id, item.id);
+  assert.equal(candidateItem.status, "awaiting_acceptance");
+  const candidate = candidateItem.candidates.at(-1);
+  assert.deepEqual(candidate.source, { type: "direct" });
+  assert.deepEqual(candidate.workspace.owner, develop.owner);
+  assert.equal(
+    execFileSync("git", ["-C", isolatedPath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+    candidate.workspace.entries[0].baseCommit
+  );
+
+  const captured = spawnSync(
+    process.execPath,
+    [cli, "task", "work", "capture", item.id],
+    { encoding: "utf8", env: leaderEnvironment }
+  );
+  assert.equal(captured.status, 0, captured.stderr || captured.stdout);
+  const [changeSet] = store.listChangeSets(task.id);
+  assert.notEqual(changeSet, undefined);
+  assert.equal(changeSet.workItemId, item.id);
+
+  const integration = spawnSync(
+    process.execPath,
+    [cli, "task", "integration", "start", task.id, "--change-set", changeSet.id],
+    { encoding: "utf8", env: leaderEnvironment }
+  );
+  assert.equal(integration.status, 0, integration.stderr || integration.stdout);
+  assert.match(integration.stdout, /Integrated/i);
+
+  const accepted = spawnSync(
+    process.execPath,
+    [cli, "task", "work", "accept", item.id, "--summary", "Integrated and accepted"],
+    { encoding: "utf8", env: leaderEnvironment }
+  );
+  assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
+  assert.equal(store.getWorkItem(task.id, item.id).status, "completed");
+
+  const cleaned = spawnSync(
+    process.execPath,
+    [cli, "task", "work", "cleanup", item.id, "--integrated"],
+    { encoding: "utf8", env: leaderEnvironment }
+  );
+  assert.equal(cleaned.status, 0, cleaned.stderr || cleaned.stdout);
+  assert.equal(store.getWorkItemWorkspace(task.id, item.id), null);
+  assert.equal(store.getWorkItem(task.id, item.id).workspaceDisposition, "integrated");
+  assert.equal(store.getWorkItem(task.id, item.id).assignee, undefined);
+  assert.equal(existsSync(isolatedPath), false);
+  assert.throws(() => execFileSync(
+    "git",
+    ["-C", repositoryPath, "show-ref", "--verify", "refs/heads/yui/task-1/work-1"],
+    { stdio: "ignore" }
+  ));
+  assert.equal(existsSync(join(workspace, "tasks", task.id, "work-items", item.id)), false);
 });
 
 test("Leader acceptance consumes an exact workspace integration proof", async (t) => {

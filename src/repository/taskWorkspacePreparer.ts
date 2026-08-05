@@ -307,16 +307,6 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (item === null) throw new Error(`Work item not found: ${round.workItemId}.`);
     const candidate = item.candidates.find(({ id }) => id === round.candidateId);
     if (candidate === undefined) throw new Error(`Candidate not found: ${round.candidateId}.`);
-    const existing = this.store.getReviewRoundWorkspace(task.id, round.id);
-    if (existing !== null) {
-      try {
-        for (const entry of existing.entries) await this.git.inspect(entry.path, "HEAD");
-        return existing;
-      } catch {
-        // The durable owner record can outlive a controller crash before the
-        // physical review worktrees were adopted; rebuild from the snapshot.
-      }
-    }
     // A Candidate is an immutable snapshot of Develop.  Always prefer that
     // snapshot over the current WorkItem workspace: the Worker may have
     // continued (or a retry may have replaced) Develop after yielding, but a
@@ -327,37 +317,90 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (develop === null || develop === undefined) {
       throw new Error(`Candidate has no Develop workspace: ${round.candidateId}.`);
     }
+    const expectedEntries = new Map(
+      develop.entries.map((entry) => [entry.projectId, entry] as const)
+    );
+    const existing = this.store.getReviewRoundWorkspace(task.id, round.id);
+    if (existing !== null) {
+      if (existing.entries.length !== expectedEntries.size) {
+        throw new Error(
+          `ReviewRound workspace Project scope changed: ${round.id}.`
+        );
+      }
+      let physicalMissing = false;
+      for (const entry of existing.entries) {
+        const source = expectedEntries.get(entry.projectId);
+        if (source === undefined) {
+          throw new Error(
+            `ReviewRound workspace Project scope changed: ${round.id}/${entry.projectId}.`
+          );
+        }
+        if (!sameCommit(entry.baseCommit, source.baseCommit)) {
+          throw new Error(
+            `ReviewRound workspace baseCommit record mismatch for ${round.id}/${entry.projectId}: `
+            + `expected ${source.baseCommit}, recorded ${entry.baseCommit}.`
+          );
+        }
+        let physical;
+        try {
+          physical = await this.git.inspect(entry.path, "HEAD");
+        } catch {
+          physicalMissing = true;
+          break;
+        }
+        if (!sameCommit(physical.baseCommit, source.baseCommit)) {
+          throw new Error(
+            `ReviewRound workspace baseCommit mismatch for ${round.id}/${entry.projectId}: `
+            + `expected ${source.baseCommit}, physical HEAD ${physical.baseCommit}.`
+          );
+        }
+      }
+      if (!physicalMissing) {
+        return existing;
+      }
+      // The durable owner record can outlive a controller crash before the
+      // physical review worktrees were adopted; rebuild from the snapshot.
+    }
     const prepared: Array<Readonly<{ project: Project; entry: WorkspaceProjectEntry }>> = [];
-    for (const source of develop.entries) {
-      const project = requireProject(this.store, source.projectId);
-      const physical = await this.git.ensureWorktree({
-        repositoryPath: project.path,
-        container: this.#projectContainer(project.name),
-        taskId: task.id,
-        roleName: round.id,
-        baseRef: source.baseCommit
-      });
-      prepared.push({
-        project,
-        entry: {
+    try {
+      for (const source of develop.entries) {
+        const project = requireProject(this.store, source.projectId);
+        const physical = await this.git.ensureWorktree({
+          repositoryPath: project.path,
+          container: this.#projectContainer(project.name),
+          taskId: task.id,
+          roleName: round.id,
+          baseRef: source.baseCommit
+        });
+        const entry = {
           ...source,
-          access: "write",
+          access: "write" as const,
           path: physical.path,
           branch: physical.branch,
           baseRef: source.baseCommit,
           baseCommit: source.baseCommit
+        };
+        prepared.push({ project, entry });
+        if (!sameCommit(physical.baseCommit, source.baseCommit)) {
+          throw new Error(
+            `ReviewRound workspace baseCommit mismatch for ${round.id}/${source.projectId}: `
+            + `expected ${source.baseCommit}, physical HEAD ${physical.baseCommit}.`
+          );
         }
-      });
+      }
+      const root = this.#reviewRoundWorkspaceRoot(task.id, round.id);
+      await ensureWorkspaceView(root, prepared.map(({ entry }) => entry));
+      const workspace = createManagedWorkspace({
+        owner: { type: "review-round", taskId: task.id, reviewRoundId: round.id },
+        root,
+        entries: prepared.map(({ entry }) => entry)
+      }, this.now());
+      this.store.saveManagedWorkspace(workspace);
+      return workspace;
+    } catch (error) {
+      await this.#discardUnadoptedEntries(task, prepared, round.id, true);
+      throw error;
     }
-    const root = this.#reviewRoundWorkspaceRoot(task.id, round.id);
-    await ensureWorkspaceView(root, prepared.map(({ entry }) => entry));
-    const workspace = createManagedWorkspace({
-      owner: { type: "review-round", taskId: task.id, reviewRoundId: round.id },
-      root,
-      entries: prepared.map(({ entry }) => entry)
-    }, this.now());
-    this.store.saveManagedWorkspace(workspace);
-    return workspace;
   }
 
   async cleanupReviewRoundWorkspace(reviewRoundId: string): Promise<ReviewWorkspaceCleanup> {
@@ -561,7 +604,8 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   async #discardUnadoptedEntries(
     task: Task,
     prepared: readonly Readonly<{ project: Project; entry: WorkspaceProjectEntry }>[],
-    roleName: string
+    roleName: string,
+    deleteBranch = false
   ): Promise<void> {
     const adoptedPaths = new Set(this.store.listManagedWorkspaces(task.id)
       .flatMap((workspace) => workspace.entries.map(({ path }) => path)));
@@ -572,7 +616,8 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         repositoryPath: project.path,
         container: this.#projectContainer(project.name),
         taskId: task.id,
-        roleName
+        roleName,
+        ...(deleteBranch ? { deleteBranch: true } : {})
       });
       if (removal === "dirty") {
         throw new Error(
@@ -802,6 +847,10 @@ function safePathSegment(value: string): string {
     throw new Error("Identity is invalid for managed workspace layout.");
   }
   return normalized;
+}
+
+function sameCommit(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase();
 }
 
 export function resolveWorktreeRoot(home: string, workspace: string | undefined): string {
