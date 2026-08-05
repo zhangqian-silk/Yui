@@ -146,7 +146,7 @@ body.terminal-active .app-shell{grid-template-columns:var(--sidebar-w) minmax(0,
 .topbar-actions{display:flex;align-items:center;gap:14px;flex:none}
 .clock{display:grid;justify-items:end;gap:2px;text-align:right;line-height:1.2}
 /* Sticky section navigation, only meaningful while a task is open */
-.detail-tabs{position:sticky;top:var(--topbar-h,44px);z-index:20;flex:none;display:none;gap:0;padding:0 max(calc(var(--page-space) - 4px),calc((100% - 1100px) / 2));background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid var(--border);overflow-x:auto;scrollbar-width:none}
+.detail-tabs{position:sticky;top:var(--topbar-h,44px);z-index:20;flex:none;display:none;gap:0;padding:0 max(var(--page-space),calc((100% - 1100px) / 2));background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid var(--border);overflow-x:auto;scrollbar-width:none}
 body.detail-active .detail-tabs{display:flex}
 .tab{flex:none;padding:11px 13px;color:var(--muted);font-family:var(--font-mono);font-size:10px;text-transform:uppercase;letter-spacing:.09em;background:transparent;border:0;border-bottom:2px solid transparent;cursor:pointer;white-space:nowrap;transition:color var(--motion-fast),border-color var(--motion-fast)}
 .tab:hover{color:var(--text)}
