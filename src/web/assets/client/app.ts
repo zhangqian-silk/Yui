@@ -152,7 +152,9 @@ function renderDynamicContent() {
     syncUrlFromState({ replace: false });
     renderDynamicContent();
   });
+  const savedTaskScroll = elements.tasks.scrollTop;
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
+  elements.tasks.scrollTop = savedTaskScroll;
   const preserveScroll = state.detail !== null && elements.mainCol.scrollTop > 0;
   const savedScrollTop = elements.mainCol.scrollTop;
   renderCurrentDetail();
@@ -214,7 +216,9 @@ function clearSelection() {
   setDetailActive(false);
   syncUrlFromState({ replace: !urlTaskId() });
   showOverview();
+  const savedTaskScroll = elements.tasks.scrollTop;
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
+  elements.tasks.scrollTop = savedTaskScroll;
 }
 
 async function requestJson(path, options) {
@@ -259,7 +263,9 @@ async function selectTask(taskId) {
   // duplicate history entry.
   syncUrlFromState({ replace: state.selected === urlTaskId() });
   setDetailActive(true);
+  const savedTaskScroll = elements.tasks.scrollTop;
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
+  elements.tasks.scrollTop = savedTaskScroll;
   try {
     await loadTaskDetail(taskId, true);
   } catch {
@@ -476,7 +482,9 @@ if (elements.detailTabs) {
 elements.search.addEventListener("input", function () {
   state.query = elements.search.value;
   syncUrlFromState({ replace: true });
+  const savedTaskScroll = elements.tasks.scrollTop;
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
+  elements.tasks.scrollTop = savedTaskScroll;
 });
 elements.refresh.addEventListener("click", function () { refreshDashboard(); });
 elements.operatorTerminal.addEventListener("click", function () {
