@@ -38,6 +38,7 @@ import { mergePendingWakeup } from "../../dist/scheduler/pendingWakeup.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, archiveTask, createTask } from "../../dist/task/task.js";
+import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 
 const FIRST = new Date("2026-07-24T00:00:00.000Z");
 const SECOND = new Date("2026-07-24T00:00:01.000Z");
@@ -117,16 +118,11 @@ test("an active Role Run may launch from its snapshotted workspace", async (t) =
     home,
     FIRST
   );
-  const workspace = {
-    schemaVersion: 3,
-    taskId: task.id,
-    roleName: reviewer.name,
-    owner: { type: "task" },
+  const workspace = createManagedWorkspace({
+    owner: { type: "task", taskId: task.id },
     root: join(home, "candidate"),
-    entries: [],
-    createdAt: FIRST.toISOString(),
-    updatedAt: FIRST.toISOString()
-  };
+    entries: []
+  }, FIRST);
   const run = createAgentRun(
     "agent-run-workspace",
     task.id,

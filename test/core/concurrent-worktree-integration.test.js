@@ -292,6 +292,10 @@ test("same-file WorkItems run in separate worktrees and a conflicting integratio
   assert.equal(readFileSync(join(repositoryPath, "shared.txt"), "utf8"), "resolved\n");
   assert.equal(readFileSync(join(repositoryPath, "later.txt"), "utf8"), "later\n");
   assert.equal(git(["-C", repositoryPath, "status", "--porcelain"]), "");
+  assert.match(
+    (await runTaskIntegrationCommand(["cleanup", resolved.id], store, home)).output,
+    /Cleaned Integration worktree/
+  );
 
   store.saveWorkItem(task.id, updateWorkItemStatus(
     store.getWorkItem(task.id, second.id),
@@ -454,13 +458,16 @@ async function createWriteResult(
   }
   const running = updateWorkItemStatus(workItem, "running", now);
   store.saveWorkItem(workItem.taskId, running);
-  saveAwaitingCandidate(store, running);
+  saveAwaitingCandidate(store, running, workspace);
   const [changeSet] = await manager.capture(workItem.id);
   assert.notEqual(changeSet, undefined);
   return { workspace, entry, changeSet };
 }
 
-function saveAwaitingCandidate(store, running) {
+function saveAwaitingCandidate(store, running, workspace = store.getWorkItemWorkspace(
+  running.taskId,
+  running.id
+)) {
   const run = yieldAgentRun(createAgentRun(
     store.nextAgentRunId(running.taskId),
     running.taskId,
@@ -468,12 +475,13 @@ function saveAwaitingCandidate(store, running) {
     "new",
     "Prepare candidate.",
     now,
-    { workItemId: running.id }
+    { workItemId: running.id, workspace }
   ), "Candidate ready.", now);
   store.saveAgentRun(run);
   store.saveWorkItem(running.taskId, submitWorkItemCandidate(running, {
     summary: run.summary,
-    source: { type: "run", runId: run.id }
+    source: { type: "run", runId: run.id },
+    workspace
   }, now));
 }
 

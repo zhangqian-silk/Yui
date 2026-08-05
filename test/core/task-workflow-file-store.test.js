@@ -37,7 +37,7 @@ import {
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
-import { createRoleWorkspace } from "../../dist/worktree/roleWorkspace.js";
+import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 import {
   recordWorkItemWorkspaceDisposition,
   submitWorkItemCandidate,
@@ -85,7 +85,37 @@ function fixture(t) {
 }
 
 function run(args, store, options) {
+  let dispatchedItem = null;
+  if (args[0] === "work" && args[1] === "dispatch" && args[2] !== undefined) {
+    const item = store.findWorkItem(args[2]);
+    const task = item === null ? null : store.getTask(item.taskId);
+    if (
+      item !== null
+      && task !== null
+      && task.projectBindings.length === 0
+      && store.getWorkItemWorkspace(item.taskId, item.id) === null
+    ) {
+      dispatchedItem = item;
+    }
+  }
   const result = runTaskCommand(args, store, options);
+  if (dispatchedItem !== null) {
+    const active = store.getActiveAgentRun(dispatchedItem.taskId, dispatchedItem.assignee ?? "leader");
+    if (active !== null && active.workspace === undefined) {
+      store.saveAgentRun({
+        ...active,
+        workspace: createManagedWorkspace({
+          owner: {
+            type: "work-item",
+            taskId: dispatchedItem.taskId,
+            workItemId: dispatchedItem.id
+          },
+          root: join(store.rootDirectory(), "test-workspaces", dispatchedItem.taskId, dispatchedItem.id),
+          entries: []
+        }, NOW)
+      });
+    }
+  }
   assert.equal(result.kind, "output");
   return result.output;
 }
@@ -198,6 +228,11 @@ function dispatchTestRun(store, taskId, roleName, workItemId, input = "test run"
     throw new Error(`${taskId}/${roleName} already has an active run.`);
   }
   const runId = store.nextAgentRunId(taskId);
+  const workspace = store.getWorkItemWorkspace(taskId, workItemId) ?? createManagedWorkspace({
+    owner: { type: "work-item", taskId, workItemId },
+    root: join(store.rootDirectory(), "test-workspaces", taskId, workItemId),
+    entries: []
+  }, NOW);
   const run = createAgentRun(
     runId,
     taskId,
@@ -209,14 +244,14 @@ function dispatchTestRun(store, taskId, roleName, workItemId, input = "test run"
       taskRoleSessionTitle(store.getTask(taskId), roleName)
     ),
     NOW,
-    { workItemId }
+    { workItemId, workspace }
   );
   store.transaction((tx) => {
     tx.saveAgentRun(run);
     tx.saveActiveAgentRun(run);
     tx.saveRole(taskId, updateRoleStatus(role, "running", NOW));
-    const item = tx.getWorkItem(taskId, workItemId);
-    tx.saveWorkItem(taskId, updateWorkItemStatus(item, "running", NOW));
+    const currentItem = tx.getWorkItem(taskId, workItemId);
+    tx.saveWorkItem(taskId, updateWorkItemStatus(currentItem, "running", NOW));
     const target = { kind: "role", taskId, roleName };
     const mailbox = enqueueSignal(tx.getWorkMailbox(target) ?? createWorkMailbox(target), {
       reason: "run-dispatched",
@@ -820,10 +855,8 @@ test("always review covers a Leader-managed WorkItem without inventing an execut
 
   run(["work", "update", item.id, "running"], store, leaderOptions);
   const running = store.getWorkItem(task.id, item.id);
-  const foreignWorkspace = createRoleWorkspace({
-    taskId: "foreign-task",
-    roleName: "leader",
-    owner: { type: "task" },
+  const foreignWorkspace = createManagedWorkspace({
+    owner: { type: "task", taskId: "foreign-task" },
     root,
     entries: []
   }, new Date(NOW));

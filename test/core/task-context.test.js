@@ -190,6 +190,7 @@ test("task context aggregates complete records and renders a compact recent summ
     reviewRounds: [],
     changeSets: [],
     integrations: [],
+    managedWorkspaces: [],
     messages,
     openInputRequests: [],
     resolvedInputRequests: [],

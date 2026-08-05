@@ -44,7 +44,7 @@ import {
   updateWorkItemWriteProjects,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
-import { createRoleWorkspace } from "../../dist/worktree/roleWorkspace.js";
+import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 import { WorkItemChangeSetManager } from "../../dist/workspace/workItemChangeSetManager.js";
 
 const NOW = new Date("2026-07-19T12:00:00.000Z");
@@ -141,8 +141,9 @@ test("workspace coordination stops a live Role only after a clean preflight", as
       projectBindings: [{ projectId: "project-1" }]
     }),
     getActiveAgentRun: () => null,
+    listAgentRuns: () => [],
     getRole: () => ({ name: "worker" }),
-    getRoleWorkspace: () => null,
+    getWorkItemWorkspace: () => null,
     getTaskRoleSessionSet: () => liveSessionSet()
   };
   const runtime = {
@@ -235,7 +236,7 @@ test("WorkItem isolation refreshes read context after the Task gains a Project",
     projectBindings: [{ projectId: "project-1" }, { projectId: "project-2" }]
   };
   const stale = {
-    owner: { type: "work-item", workItemId: item.id },
+    owner: { type: "work-item", taskId: item.taskId, workItemId: item.id },
     entries: [{ projectId: "project-1", access: "write" }]
   };
   const refreshed = {
@@ -250,8 +251,9 @@ test("WorkItem isolation refreshes read context after the Task gains a Project",
     findWorkItem: () => item,
     getTask: () => task,
     getRole: () => ({ name: "worker" }),
-    getRoleWorkspace: () => stale,
+    getWorkItemWorkspace: () => stale,
     getActiveAgentRun: () => null,
+    listAgentRuns: () => [],
     getTaskRoleSessionSet: () => null
   }, {
     async prepareTaskWorkspace() {},
@@ -312,7 +314,8 @@ test("invalid WorkItem isolation leaves a live Role session untouched", async ()
     }),
     getActiveAgentRun: () => null,
     getRole: () => ({ name: "worker" }),
-    getRoleWorkspace: () => null,
+    getWorkItemWorkspace: () => null,
+    listAgentRuns: () => [],
     getTaskRoleSessionSet: () => liveSessionSet()
   }, {
     async prepareTaskWorkspace() {
@@ -793,13 +796,11 @@ test("a Project-backed Task owns one main worktree shared by Roles", async (t) =
   });
   assert.equal(store.getTask(task.id).cwd, main);
   assert.deepEqual(store.listRoles(task.id).map(({ workspace: path }) => path), [main, main, main]);
-  assert.deepEqual(store.listRoleWorkspaces(task.id).map((entry) => ({
+  assert.deepEqual(store.listManagedWorkspaces(task.id).map((entry) => ({
     owner: entry.owner,
-    roleName: entry.roleName,
     root: entry.root
   })), [{
-    owner: { type: "task" },
-    roleName: "leader",
+    owner: { type: "task", taskId: task.id },
     root: main
   }]);
   assert.equal(existsSync(join(mainProject, ".git")), true);
@@ -855,6 +856,7 @@ test("a lazily copied reviewer starts from the prepared Project Task workspace",
     assignee: "worker"
   }, NOW);
   store.saveWorkItem(task.id, item);
+  const developWorkspace = await preparer.prepareWorkItemWorkspace(item.id);
   const running = updateWorkItemStatus(item, "running", NOW);
   store.saveWorkItem(task.id, running);
   const candidateRun = yieldAgentRun(createAgentRun(
@@ -864,23 +866,24 @@ test("a lazily copied reviewer starts from the prepared Project Task workspace",
     "new",
     "Produce a candidate.",
     NOW,
-    { workItemId: item.id }
+    { workItemId: item.id, workspace: developWorkspace }
   ), "Candidate ready.", NOW);
   store.saveAgentRun(candidateRun);
-  const mainWorkspace = store.getRoleWorkspace(task.id, "leader");
+  const mainWorkspace = store.getTaskWorkspace(task.id);
   assert.throws(
     () => store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
-      summary: candidateRun.summary,
-      source: { type: "run", runId: candidateRun.id },
-      reviewPolicy: { roleName: "reviewer", trigger: "leader" },
-      workspace: mainWorkspace
+    summary: candidateRun.summary,
+    source: { type: "run", runId: candidateRun.id },
+    reviewPolicy: { roleName: "reviewer", trigger: "leader" },
+    workspace: mainWorkspace
     }, NOW)),
-    /workspace does not match its source Run/
+    /workspace does not match its source Run|must use the WorkItem-owned Develop workspace/
   );
   store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
     summary: candidateRun.summary,
     source: { type: "run", runId: candidateRun.id },
-    reviewPolicy: { roleName: "reviewer", trigger: "leader" }
+    reviewPolicy: { roleName: "reviewer", trigger: "leader" },
+    workspace: developWorkspace
   }, NOW));
 
   runTaskCommand(["work", "review", item.id], store, {
@@ -904,7 +907,7 @@ test("a lazily copied reviewer starts from the prepared Project Task workspace",
   }));
 });
 
-test("a reviewer launches from the candidate Run workspace instead of its previous Role workspace", async (t) => {
+test("a reviewer launches from a fresh ReviewRound workspace frozen from the Candidate", async (t) => {
   const { home, workspace, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "Review an isolated candidate", NOW, {
@@ -978,9 +981,10 @@ test("a reviewer launches from the candidate Run workspace instead of its previo
   });
 
   const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
-  assert.equal(reviewRun.workspace.root, isolated.root);
-  assert.equal(reviewRun.workspace.owner.workItemId, item.id);
-  assert.equal(reviewRun.workspace.entries.every(({ access }) => access === "read"), true);
+  assert.notEqual(reviewRun.workspace.root, isolated.root);
+  assert.equal(reviewRun.workspace.owner.type, "review-round");
+  assert.equal(reviewRun.workspace.owner.taskId, task.id);
+  assert.equal(reviewRun.workspace.entries.every(({ access }) => access === "write"), true);
   const plan = new FileRoleLaunchPlanner(home, store, {
     cliPath: "/dist/cli.js"
   }).plan({
@@ -990,8 +994,8 @@ test("a reviewer launches from the candidate Run workspace instead of its previo
     adapterId: agent.adapterId,
     mode: "new"
   });
-  assert.equal(plan.role.workspace, isolated.root);
-  assert.equal(plan.launch.env.YUI_WORKSPACE, isolated.root);
+  assert.equal(plan.role.workspace, reviewRun.workspace.root);
+  assert.equal(plan.launch.env.YUI_WORKSPACE, reviewRun.workspace.root);
 });
 
 test("a multi-Project Task and WorkItem expose one root with per-Project access", async (t) => {
@@ -1025,7 +1029,7 @@ test("a multi-Project Task and WorkItem expose one root with per-Project access"
     ]
   }), NOW);
   addTaskRoles(store, task, repositoryPath);
-  const item = createWorkItem("work-1", task.id, {
+  let item = createWorkItem("work-1", task.id, {
     title: "Update backend using frontend context",
     assignee: "worker",
     writeProjectIds: [backend.id]
@@ -1033,7 +1037,6 @@ test("a multi-Project Task and WorkItem expose one root with per-Project access"
   store.saveWorkItem(task.id, item);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
 
-  await preparer.prepareTaskWorkspace(task.id);
   runTaskCommand([
     "project", "add", task.id, frontend.id, "--directory", "frontend"
   ], store, {
@@ -1044,9 +1047,11 @@ test("a multi-Project Task and WorkItem expose one root with per-Project access"
       YUI_ROLE: "leader"
     }
   });
+  item = updateWorkItemWriteProjects(item, [backend.id, frontend.id], NOW);
+  store.saveWorkItem(task.id, item);
   const mainResult = await preparer.prepareTaskWorkspace(task.id);
   assert.equal(mainResult.path, join(workspace, "tasks", task.id, "main"));
-  const main = store.getRoleWorkspace(task.id, "leader");
+  const main = store.getTaskWorkspace(task.id);
   assert.equal(main.root, mainResult.path);
   assert.deepEqual(main.entries.map(({ directory, access }) => ({ directory, access })), [
     { directory: "backend", access: "write" },
@@ -1057,16 +1062,18 @@ test("a multi-Project Task and WorkItem expose one root with per-Project access"
   assert.equal(work.root, join(workspace, "tasks", task.id, "work-items", item.id));
   assert.deepEqual(work.entries.map(({ directory, access }) => ({ directory, access })), [
     { directory: "backend", access: "write" },
-    { directory: "frontend", access: "read" }
+    { directory: "frontend", access: "write" }
   ]);
   assert.notEqual(
     realpathSync(join(work.root, "backend")),
     realpathSync(join(main.root, "backend"))
   );
-  assert.equal(
+  assert.notEqual(
     realpathSync(join(work.root, "frontend")),
     realpathSync(join(main.root, "frontend"))
   );
+  item = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, item);
   const isolatedPlan = new FileRoleLaunchPlanner(home, store, {
     cliPath: "/dist/cli.js"
   }).plan({
@@ -1077,8 +1084,8 @@ test("a multi-Project Task and WorkItem expose one root with per-Project access"
     mode: "new"
   });
   assert.equal(isolatedPlan.launch.command, "codex");
-  assert.deepEqual(JSON.parse(isolatedPlan.launch.env.YUI_WRITABLE_PROJECT_IDS), [backend.id]);
-  assert.deepEqual(JSON.parse(isolatedPlan.launch.env.YUI_CONTEXT_PROJECT_IDS), [frontend.id]);
+  assert.deepEqual(JSON.parse(isolatedPlan.launch.env.YUI_WRITABLE_PROJECT_IDS), [backend.id, frontend.id]);
+  assert.deepEqual(JSON.parse(isolatedPlan.launch.env.YUI_CONTEXT_PROJECT_IDS), []);
   const directAgentPlan = new FileRoleLaunchPlanner(home, store, {
     cliPath: "/dist/cli.js",
     environment: { PATH: join(root, "missing-bin") }
@@ -1090,7 +1097,7 @@ test("a multi-Project Task and WorkItem expose one root with per-Project access"
     mode: "new"
   });
   assert.equal(directAgentPlan.launch.command, "codex");
-  assert.deepEqual(JSON.parse(directAgentPlan.launch.env.YUI_CONTEXT_PROJECT_IDS), [frontend.id]);
+  assert.deepEqual(JSON.parse(directAgentPlan.launch.env.YUI_CONTEXT_PROJECT_IDS), []);
 
   writeFileSync(join(work.root, "backend", "contract.txt"), "v2\n");
   execFileSync("git", ["-C", join(work.root, "backend"), "add", "contract.txt"]);
@@ -1137,14 +1144,15 @@ test("a multi-Project Task and WorkItem expose one root with per-Project access"
     "new",
     "Prepare multi-Project candidate.",
     new Date(NOW.getTime() + 3),
-    { workItemId: item.id }
+    { workItemId: item.id, workspace: expanded }
   ), "Candidate ready.", new Date(NOW.getTime() + 3));
   store.saveAgentRun(candidateRun);
   store.saveWorkItem(
     task.id,
     submitWorkItemCandidate(running, {
       summary: candidateRun.summary,
-      source: { type: "run", runId: candidateRun.id }
+      source: { type: "run", runId: candidateRun.id },
+      workspace: expanded
     }, new Date(NOW.getTime() + 3))
   );
   const manager = new WorkItemChangeSetManager(
@@ -1210,14 +1218,14 @@ test("a new Task reuses its managed branch after interrupted preparation", async
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
 
   const prepared = await preparer.prepareTaskWorkspace(task.id);
-  const preparedEntry = store.getRoleWorkspace(task.id, "leader").entries[0];
+  const preparedEntry = store.getTaskWorkspace(task.id).entries[0];
   assert.equal(
     execFileSync("git", ["-C", preparedEntry.path, "rev-parse", "HEAD"], {
       encoding: "utf8"
     }).trim(),
     collisionCommit
   );
-  assert.equal(store.getRoleWorkspace(task.id, "leader").root, prepared.path);
+  assert.equal(store.getTaskWorkspace(task.id).root, prepared.path);
   assert.equal(store.getTask(task.id).cwd, prepared.path);
 });
 
@@ -1230,7 +1238,7 @@ test("a persisted Task workspace can restore its retained branch after the direc
   addTaskRoles(store, task, repositoryPath, ["leader"]);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
   const first = await preparer.prepareTaskWorkspace(task.id);
-  const firstEntry = store.getRoleWorkspace(task.id, "leader").entries[0];
+  const firstEntry = store.getTaskWorkspace(task.id).entries[0];
   writeFileSync(join(firstEntry.path, "progress.txt"), "retained progress\n");
   execFileSync("git", ["-C", firstEntry.path, "add", "progress.txt"]);
   execFileSync("git", ["-C", firstEntry.path, "commit", "-qm", "retained progress"]);
@@ -1241,7 +1249,7 @@ test("a persisted Task workspace can restore its retained branch after the direc
 
   const restored = await preparer.prepareTaskWorkspace(task.id);
   assert.equal(restored.path, first.path);
-  const restoredEntry = store.getRoleWorkspace(task.id, "leader").entries[0];
+  const restoredEntry = store.getTaskWorkspace(task.id).entries[0];
   assert.equal(
     execFileSync("git", ["-C", restoredEntry.path, "rev-parse", "HEAD"], {
       encoding: "utf8"
@@ -1267,7 +1275,11 @@ test("Leader can directly create and clean a WorkItem-owned isolated worktree", 
   const main = (await preparer.prepareTaskWorkspace(task.id)).path;
   const isolated = await preparer.prepareWorkItemWorkspace(item.id);
   const isolatedEntry = isolated.entries[0];
-  assert.deepEqual(isolated.owner, { type: "work-item", workItemId: item.id });
+  assert.deepEqual(isolated.owner, {
+    type: "work-item",
+    taskId: task.id,
+    workItemId: item.id
+  });
   assert.equal(
     isolatedEntry.path,
     join(workspace, "worktree", "Yui", task.id, item.id)
@@ -1297,21 +1309,22 @@ test("Leader can directly create and clean a WorkItem-owned isolated worktree", 
   store.saveWorkItem(task.id, next);
   assert.throws(
     () => runTaskCommand(["work", "dispatch", next.id], store, { now: () => new Date(NOW) }),
-    /work-1.*cleanup|cleanup.*work-1/i
+    /work-1.*cleanup|cleanup.*work-1|work-2.*must be isolated/i
   );
 
   const dirtyFile = join(isolatedEntry.path, "dirty.txt");
   writeFileSync(dirtyFile, "preserve\n");
   assert.equal(await preparer.cleanupWorkItemWorkspace(item.id, "integrated"), "dirty");
   assert.equal(existsSync(isolated.root), true);
-  assert.deepEqual(store.getRoleWorkspace(task.id, "worker").owner, {
+  assert.deepEqual(store.getWorkItemWorkspace(task.id, item.id).owner, {
     type: "work-item",
+    taskId: task.id,
     workItemId: item.id
   });
   unlinkSync(dirtyFile);
   assert.equal(await preparer.cleanupWorkItemWorkspace(item.id, "integrated"), "removed");
   assert.equal(existsSync(isolated.root), false);
-  assert.equal(store.getRoleWorkspace(task.id, "worker"), null);
+  assert.equal(store.getWorkItemWorkspace(task.id, item.id), null);
   assert.equal(store.getRole(task.id, "worker").workspace, main);
   assert.equal(store.getWorkItem(task.id, item.id).workspaceDisposition, "integrated");
   assert.throws(() => execFileSync(
@@ -1346,12 +1359,13 @@ test("Leader acceptance consumes an exact workspace integration proof", async (t
     "new",
     "Review without changes",
     NOW,
-    { workItemId: item.id }
+    { workItemId: item.id, workspace: isolated }
   ), "No changes required.", NOW);
   store.saveAgentRun(yielded);
   store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
     summary: yielded.summary,
-    source: { type: "run", runId: yielded.id }
+    source: { type: "run", runId: yielded.id },
+    workspace: isolated
   }, NOW));
   const leader = {
     now: () => new Date(NOW),
@@ -1464,7 +1478,7 @@ test("Leader can capture, integrate, and clean an isolated Role result before fo
   store.saveWorkItem(task.id, item);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
   await preparer.prepareTaskWorkspace(task.id);
-  const main = store.getRoleWorkspace(task.id, "leader").entries[0].path;
+  const main = store.getTaskWorkspace(task.id).entries[0].path;
   const isolated = await preparer.prepareWorkItemWorkspace(item.id);
   writeFileSync(join(isolated.entries[0].path, "delivered.txt"), "first increment\n");
   const running = updateWorkItemStatus(item, "running", NOW);
@@ -1574,7 +1588,7 @@ test("Leader can capture, integrate, and clean an isolated Role result before fo
   );
   assert.equal(cleanup.status, 0, cleanup.stderr || cleanup.error?.message);
   assert.equal(existsSync(isolated.entries[0].path), false);
-  assert.equal(store.getRoleWorkspace(task.id, "worker"), null);
+  assert.equal(store.getWorkItemWorkspace(task.id, item.id), null);
 
   const followUp = createWorkItem("work-2", task.id, {
     title: "Implement the follow-up increment",
@@ -1633,7 +1647,7 @@ test("integrated cleanup retains a clean self-committed Role result until it is 
   assert.equal(cleanup.status, 2);
   assert.match(cleanup.stderr, /uncaptured commits/i);
   assert.equal(existsSync(isolated.entries[0].path), true);
-  assert.equal(store.getRoleWorkspace(task.id, "worker")?.owner.workItemId, item.id);
+  assert.equal(store.getWorkItemWorkspace(task.id, item.id)?.owner.workItemId, item.id);
   assert.equal(store.listChangeSets(task.id).length, 0);
 });
 
@@ -1699,14 +1713,15 @@ test("an awaiting WorkItem can capture successive immutable ChangeSets", async (
     "new",
     "Prepare successive results.",
     NOW,
-    { workItemId: item.id }
+    { workItemId: item.id, workspace: isolated }
   ), "Candidate ready.", NOW);
   store.saveAgentRun(candidateRun);
   store.saveWorkItem(
     task.id,
     submitWorkItemCandidate(running, {
       summary: candidateRun.summary,
-      source: { type: "run", runId: candidateRun.id }
+      source: { type: "run", runId: candidateRun.id },
+      workspace: isolated
     }, NOW)
   );
   const manager = new WorkItemChangeSetManager(store, () => new Date(NOW));
@@ -1756,7 +1771,7 @@ test("WorkItem cleanup validates its disposition before removing the worktree", 
     /already recorded as integrated/i
   );
   assert.equal(existsSync(isolated.entries[0].path), true);
-  assert.notEqual(store.getRoleWorkspace(task.id, "worker"), null);
+  assert.notEqual(store.getWorkItemWorkspace(task.id, item.id), null);
 });
 
 test("WorkItem cleanup reports a post-removal race and converges on retry", async (t) => {
@@ -1818,7 +1833,7 @@ test("WorkItem cleanup reports a post-removal race and converges on retry", asyn
     preparer.cleanupWorkItemWorkspace(item.id, "integrated"),
     /worktree was removed.*durable cleanup was not recorded.*retry/i
   );
-  assert.notEqual(store.getRoleWorkspace(task.id, "worker"), null);
+  assert.notEqual(store.getWorkItemWorkspace(task.id, item.id), null);
   assert.equal(store.getWorkItem(task.id, item.id).workspaceDisposition, undefined);
 
   const coordinator = new TaskWorkspaceCoordinator(store, preparer, {
@@ -1830,7 +1845,7 @@ test("WorkItem cleanup reports a post-removal race and converges on retry", asyn
     }
   });
   assert.equal(await coordinator.cleanupWorkItem(item.id, "integrated"), "missing");
-  assert.equal(store.getRoleWorkspace(task.id, "worker"), null);
+  assert.equal(store.getWorkItemWorkspace(task.id, item.id), null);
   assert.equal(store.getWorkItem(task.id, item.id).workspaceDisposition, "integrated");
 });
 
@@ -1889,7 +1904,7 @@ test("WorkItem cleanup cannot commit across a newly prepared in-flight Role run"
     preparer.cleanupWorkItemWorkspace(item.id, "integrated"),
     /worktree was removed.*durable cleanup was not recorded.*retry/i
   );
-  assert.notEqual(store.getRoleWorkspace(task.id, "worker"), null);
+  assert.notEqual(store.getWorkItemWorkspace(task.id, item.id), null);
   assert.equal(store.getWorkItem(task.id, item.id).workspaceDisposition, undefined);
   assert.equal(
     store.getTaskRoleSessionSet(task.id, "worker").inFlight.runId,
@@ -1927,10 +1942,8 @@ test("late WorkItem cleanup preserves a replacement workspace owned by newer wor
     NOW,
     "Ready for cleanup."
   ));
-  const replacement = createRoleWorkspace({
-    taskId: task.id,
-    roleName: "worker",
-    owner: { type: "work-item", workItemId: second.id },
+  const replacement = createManagedWorkspace({
+    owner: { type: "work-item", taskId: task.id, workItemId: second.id },
     root: join(root, "replacement"),
     entries: [{
       ...oldWorkspace.entries[0],
@@ -1945,7 +1958,7 @@ test("late WorkItem cleanup preserves a replacement workspace owned by newer wor
     },
     async removeWorktree() {
       store.transaction((tx) => {
-        tx.saveRoleWorkspace(task.id, replacement);
+        tx.saveManagedWorkspace(replacement);
         tx.saveRole(task.id, updateRole(
           tx.getRole(task.id, "worker"),
           { workspace: replacement.root },
@@ -1966,8 +1979,8 @@ test("late WorkItem cleanup preserves a replacement workspace owned by newer wor
     await preparer.cleanupWorkItemWorkspace(first.id, "integrated"),
     "removed"
   );
-  assert.deepEqual(store.getRoleWorkspace(task.id, "worker"), replacement);
-  assert.equal(store.getRole(task.id, "worker").workspace, replacement.root);
+  assert.deepEqual(store.getWorkItemWorkspace(task.id, second.id), replacement);
+  assert.equal(store.getRole(task.id, "worker").workspace, store.getTaskWorkspace(task.id).root);
   assert.equal(store.getWorkItem(task.id, first.id).workspaceDisposition, "integrated");
 });
 
@@ -2006,7 +2019,7 @@ test("dirty worktrees keep a completed Task out of Archived while its record rem
   addTaskRoles(store, active, repositoryPath);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
   const main = (await preparer.prepareTaskWorkspace(active.id)).path;
-  const mainEntry = store.getRoleWorkspace(active.id, "leader").entries[0];
+  const mainEntry = store.getTaskWorkspace(active.id).entries[0];
   store.saveTask(completeTask(store.getTask(active.id), NOW, {
     summary: "Done",
     by: "user"
