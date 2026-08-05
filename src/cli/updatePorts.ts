@@ -33,6 +33,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { runtimeError } from "../errors/cliError.js";
+import { STORAGE_DOCTOR_CHECK_NAMES } from "../doctor/doctor.js";
 import { inspectStorageSchema } from "../storage/storageSchema.js";
 import { correlateUpgradeReceipt } from "../storage/upgrade/upgradeOrchestrator.js";
 import { readSwitchProgress } from "../storage/upgrade/switchProgress.js";
@@ -69,9 +70,21 @@ export function createUpdatePorts(
       assertSpawnOk(result, "stage the new package");
       const binaryPath = join(stagingPath, "bin", "yui");
       // Resolve the EXACT version that was staged (from the staged install's own
-      // package.json), so activation promotes this same artifact rather than a
-      // second, independently-resolved `@latest` (P1-3).
+      // package.json, else the staged binary itself). If neither yields a concrete
+      // version, FAIL the stage (R2-F1): we must never fall back to a bare
+      // `@latest`, which would let activation promote — and verify wave through —
+      // a different build than the one that passed preflight.
       const version = resolveStagedVersion(stagingPath, binaryPath, environment, spawn);
+      if (version === null) {
+        // Clean up the staging dir; the live install is untouched, so this is a
+        // fully recoverable pre-activation failure.
+        rmSync(stagingPath, { recursive: true, force: true });
+        throw runtimeError(
+          "Failed to resolve the exact staged package version (neither the staged package.json "
+            + "nor `yui --json version` returned a concrete version). Refusing to proceed with a "
+            + "`@latest` fallback that could promote a different build than the one preflighted."
+        );
+      }
       return { binaryPath, version, stagingPath };
     },
 
@@ -94,12 +107,10 @@ export function createUpdatePorts(
     },
 
     activateBinary(staged: StagedPackage): void {
-      // Promote the SAME resolved artifact, pinned by exact version — not a fresh
-      // bare `@latest` that could resolve to a different build than the one that
-      // passed preflight/stage (P1-3).
-      const spec = staged.version === "latest" || staged.version.length === 0
-        ? PACKAGE_SPEC
-        : `${PACKAGE_NAME}@${staged.version}`;
+      // Promote the SAME resolved artifact, pinned by exact version — never a bare
+      // `@latest` (R2-F1: `stage` guarantees `staged.version` is a concrete
+      // version, so there is no `latest` sentinel to fall back to).
+      const spec = `${PACKAGE_NAME}@${staged.version}`;
       const result = spawn(
         "npm",
         ["install", "--global", spec],
@@ -117,29 +128,39 @@ export function createUpdatePorts(
         );
       }
       // 1) Health check the migrated Home through the activated binary's loader.
+      // POST-VERIFY PARSES THE MACHINE-READABLE RESULT FIRST, THEN THE EXIT STATUS
+      // (R2-F2). `yui --json doctor` deliberately sets a non-zero exit when storage
+      // is unhealthy, so interpreting the exit status before the envelope would
+      // reduce a precise "storage unsupported/corrupted" verdict to a generic
+      // "exited with status 5". We therefore parse+validate the structured storage
+      // health first: only a valid success envelope with every expected storage
+      // check present-and-ok, no blocking checks, AND exit 0 is healthy.
       const doctor = spawn(
         activeBinary,
         ["--json", "doctor"],
         { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
       );
-      assertSpawnOk(doctor, "run the post-update health check");
-      // POST-VERIFY PARSES THE MACHINE-READABLE RESULT (P1-3). A zero exit is
-      // necessary but NOT sufficient: parse doctor's structured storage-health
-      // verdict and fail closed on any unsupported / corrupted / uninitialized /
-      // version-mismatch storage check, even when the process exited 0.
       assertDoctorStorageHealthy(doctor);
 
-      // 2) Confirm the activated binary's identity matches the staged artifact;
-      // a mismatch (e.g. staged A but @latest moved to B) fails closed.
-      if (staged.version !== "latest" && staged.version.length > 0) {
-        const activeVersion = resolveBinaryVersion(activeBinary, environment, spawn);
-        if (activeVersion !== null && activeVersion !== staged.version) {
-          throw runtimeError(
-            `Post-update health check failed: the activated binary is version ${activeVersion}, `
-              + `but the staged/verified artifact was ${staged.version}. Refusing to trust a `
-              + "different build than the one that passed preflight."
-          );
-        }
+      // 2) Confirm the activated binary's identity matches the staged artifact.
+      // `staged.version` is always a concrete version (R2-F1), so we REQUIRE the
+      // activated binary to report a concrete version that equals it; a missing,
+      // unparseable, or non-zero `version` result fails closed rather than being
+      // skipped — we must never trust a build we cannot positively identify.
+      const activeVersion = resolveBinaryVersion(activeBinary, environment, spawn);
+      if (activeVersion === null) {
+        throw runtimeError(
+          "Post-update health check failed: could not determine the activated binary's version "
+            + `(expected ${staged.version}). Refusing to trust a build whose identity cannot be `
+            + "confirmed against the staged/preflighted artifact."
+        );
+      }
+      if (activeVersion !== staged.version) {
+        throw runtimeError(
+          `Post-update health check failed: the activated binary is version ${activeVersion}, `
+            + `but the staged/verified artifact was ${staged.version}. Refusing to trust a `
+            + "different build than the one that passed preflight."
+        );
       }
     },
 
@@ -153,14 +174,15 @@ export function createUpdatePorts(
       // real state instead of giving a recovery instruction from a stale receipt.
       const schema = inspectStorageSchema(home);
 
-      // A crash mid-switch leaves a durable progress marker. Any phase — including
-      // `backing-up` and `promoting`, not just `interrupted` — combined with
-      // filesystem evidence that the original was moved aside (the backup exists)
-      // and the Home is not in place means the authoritative data lives ONLY at
-      // the backup. That is a known, precise restore, never a "most likely did not
-      // commit" glob/retry that would send the operator to re-setup a missing Home
-      // (F3). We only decline to treat a marker as interrupted when the Home is
-      // demonstrably intact (nothing to recover) or there is no backup to restore.
+      // A crash mid-switch leaves a durable progress marker. A marker of ANY phase
+      // — `backing-up`, `promoting`, or `interrupted` — is only actionable as an
+      // interrupted switch when the FILESYSTEM still corroborates it: the backup
+      // exists AND the Home is not in place (missing/uninitialized), so the
+      // authoritative data lives only at the backup and the recovery is a precise
+      // restore. This gate now applies to `interrupted` too (R2-F3): a leftover
+      // `interrupted` marker after a manual recovery — Home already restored, or
+      // the backup already gone — must NOT be trusted to emit a restore path; we
+      // ignore the stale marker and re-probe the real state below.
       const progress = readSwitchProgress(home);
       if (progress !== null) {
         const backupPresent = progress.backupPath !== undefined
@@ -169,18 +191,19 @@ export function createUpdatePorts(
         // a missing/uninitialized Home after a mid-switch crash means the data is
         // at the backup.
         const homeInitialized = schema.status !== "uninitialized";
-        if (progress.phase === "interrupted"
-          || (backupPresent && !homeInitialized)) {
+        if (backupPresent && !homeInitialized) {
           // Original at the backup, Home missing/uninitialized: recover by restore.
+          // The Home is uninitialized here, so it is definitively not current.
           return {
             switched: false,
             interrupted: true,
-            schemaCurrent: schema.status === "current",
+            schemaCurrent: false,
             ...(progress.backupPath === undefined ? {} : { backupPath: progress.backupPath })
           };
         }
-        // A pre-start/complete-ish marker with an intact Home (or no usable backup)
-        // is not an interrupted switch — fall through to the receipt/schema logic.
+        // Otherwise the marker is stale relative to the current filesystem (Home
+        // intact, or no backup to restore). Do not emit a restore path from it —
+        // fall through and reconcile against the receipt/schema below.
       }
 
       const correlation = correlateUpgradeReceipt(home);
@@ -333,20 +356,23 @@ function parseJsonResult(
   }
 }
 
-/** Resolve the exact version of the staged install from its package metadata. */
+/**
+ * Resolve the exact version of the staged install from its package metadata, or
+ * `null` when no concrete version can be determined. Callers MUST fail closed on
+ * `null` rather than fall back to `@latest` (R2-F1).
+ */
 function resolveStagedVersion(
   stagingPath: string,
   binaryPath: string,
   environment: NodeJS.ProcessEnv,
   spawn: UpdateSpawner
-): string {
+): string | null {
   // Prefer the staged package.json (deterministic, no extra process).
   const manifest = join(stagingPath, "lib", "node_modules", PACKAGE_NAME, "package.json");
   const fromManifest = readVersionFromPackageJson(manifest);
   if (fromManifest !== null) return fromManifest;
-  // Fall back to asking the staged binary itself.
-  const fromBinary = resolveBinaryVersion(binaryPath, environment, spawn);
-  return fromBinary ?? "latest";
+  // Fall back to asking the staged binary itself; `null` if it too cannot answer.
+  return resolveBinaryVersion(binaryPath, environment, spawn);
 }
 
 /** Read `version` from a package.json, or `null` when unavailable. */
@@ -398,32 +424,79 @@ function describe(data: Record<string, unknown> | undefined): string {
 }
 
 /**
- * Fail closed unless the doctor result proves the migrated Home's storage is
- * healthy (P1-3). Parses the machine-readable `{ ok, data: { storage } }`
- * envelope and throws when storage is unhealthy — or when the result cannot be
- * parsed at all, since an unverifiable health check must not pass silently.
+ * Fail closed unless the doctor result PROVES the migrated Home's storage is
+ * healthy (P1-3 / R2-F2). The envelope and storage checks are validated BEFORE
+ * the exit status is interpreted, because `yui --json doctor` deliberately exits
+ * non-zero on unhealthy storage — so keying off the exit first would reduce a
+ * precise structured verdict to a generic "exited with status N".
+ *
+ * Healthy requires ALL of:
+ *  - a valid `{ ok: true, data: { storage, checks } }` success envelope,
+ *  - `storage.healthy === true` with an empty `storage.blocking`,
+ *  - every expected storage check present AND `ok`, and
+ *  - exit status 0.
+ * A parseable-but-unhealthy result (typically exit 5) throws a precise, recovery-
+ * oriented blocker. An unparseable, non-success, or self-contradictory envelope
+ * (e.g. `healthy: true` yet a non-`ok`/blocking check, or `ok: false`) fails
+ * closed — an unverifiable health check must never pass silently.
  */
 function assertDoctorStorageHealthy(result: SpawnSyncReturns<Buffer>): void {
-  const parsed = parseJsonResult(result);
-  const data = parsed?.data as Record<string, unknown> | undefined;
-  const storage = data?.storage as
-    | { healthy?: unknown; blocking?: unknown }
-    | undefined;
-  if (storage === undefined || typeof storage.healthy !== "boolean") {
-    throw runtimeError(
-      "Post-update health check failed: the activated binary's `doctor` did not return a "
-        + "parseable storage-health result, so the migrated Home cannot be confirmed healthy. "
-        + "Investigate with `yui doctor` before resuming; if storage was migrated, restore the "
-        + "timestamped backup to recover."
+  // 1) Envelope must be a parseable success envelope. A spawn transport error,
+  // kill, missing exit code, empty/garbage stdout, or `ok !== true` is
+  // unverifiable -> fail closed.
+  if (result.error !== undefined || result.signal !== null || result.status === null) {
+    throw doctorUnverifiable(
+      result.signal !== null
+        ? `the doctor process was terminated by ${result.signal}`
+        : result.error !== undefined
+          ? `the doctor process could not be run: ${result.error.message}`
+          : "the doctor process terminated without an exit code"
     );
   }
-  if (storage.healthy !== true) {
-    const blocking = Array.isArray(storage.blocking) ? storage.blocking : [];
-    const detail = blocking
-      .map((check) => {
-        const record = check as Record<string, unknown>;
-        return `${String(record.name)}=${String(record.status)} (${String(record.detail)})`;
-      })
+  let envelope: Record<string, unknown> | null;
+  try {
+    const text = result.stdout.toString("utf8").trim();
+    envelope = text.length === 0 ? null : (JSON.parse(text) as Record<string, unknown>);
+  } catch {
+    envelope = null;
+  }
+  if (envelope === null || envelope.ok !== true || typeof envelope.data !== "object" || envelope.data === null) {
+    throw doctorUnverifiable("the activated binary's `doctor` did not return a parseable success envelope");
+  }
+  const data = envelope.data as Record<string, unknown>;
+  const storage = data.storage as { healthy?: unknown; blocking?: unknown } | undefined;
+  const checks = Array.isArray(data.checks) ? (data.checks as Record<string, unknown>[]) : null;
+  if (storage === undefined || typeof storage.healthy !== "boolean" || checks === null) {
+    throw doctorUnverifiable(
+      "the activated binary's `doctor` did not return a parseable storage-health result"
+    );
+  }
+
+  // 2) Collect the blocking (non-ok) storage checks from the authoritative checks
+  // array. Every storage-named check must be present AND ok.
+  const storageNames = new Set<string>(STORAGE_DOCTOR_CHECK_NAMES);
+  const storageChecks = checks.filter(
+    (c) => typeof c.name === "string" && storageNames.has(c.name)
+  );
+  const blockingChecks = storageChecks.filter((c) => c.status !== "ok");
+  const declaredBlocking = Array.isArray(storage.blocking)
+    ? (storage.blocking as Record<string, unknown>[])
+    : [];
+
+  // 3) Contradiction guard: `healthy: true` must agree with the checks. If it
+  // claims healthy yet a storage check is non-ok (or it declares blocking checks),
+  // the result is self-contradictory -> fail closed rather than trust the flag.
+  if (storage.healthy === true && (blockingChecks.length > 0 || declaredBlocking.length > 0)) {
+    throw doctorUnverifiable(
+      "the doctor result is self-contradictory (reports healthy storage yet lists a non-ok "
+        + "storage check); refusing to trust it"
+    );
+  }
+
+  // 4) Unhealthy (typically a deliberate non-zero exit): a precise blocker.
+  if (storage.healthy !== true || blockingChecks.length > 0 || declaredBlocking.length > 0) {
+    const detail = [...blockingChecks, ...declaredBlocking]
+      .map((c) => `${String(c.name)}=${String(c.status)} (${String(c.detail)})`)
       .join("; ");
     throw runtimeError(
       "Post-update health check failed: the migrated Home is not healthy per the activated "
@@ -432,6 +505,24 @@ function assertDoctorStorageHealthy(result: SpawnSyncReturns<Buffer>): void {
         + "resuming writes."
     );
   }
+
+  // 5) Healthy checks AND a healthy flag — but a non-zero exit still contradicts a
+  // clean bill of health, so require exit 0 as the final gate (R2-F2).
+  if (result.status !== 0) {
+    throw doctorUnverifiable(
+      `the doctor result reports healthy storage but the process exited with status ${result.status}; `
+        + "a clean health check must exit 0"
+    );
+  }
+}
+
+/** A fail-closed post-update health-check error for an unverifiable doctor result. */
+function doctorUnverifiable(reason: string): Error {
+  return runtimeError(
+    `Post-update health check failed: ${reason}, so the migrated Home cannot be confirmed `
+      + "healthy. Investigate with `yui doctor` before resuming; if storage was migrated, restore "
+      + "the timestamped backup to recover."
+  );
 }
 
 function assertSpawnOk(result: SpawnSyncReturns<Buffer>, action: string): void {

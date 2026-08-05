@@ -235,10 +235,18 @@ is itself atomic (compare-and-delete under a `mkdir` critical section):** the
 reclaim re-reads the fence bytes under the lock and deletes *only* the exact
 dead-owner bytes it observed, so a racer that slipped a fresh live fence into the
 same path between the observe and the delete is never clobbered — closing the
-reclaim TOCTOU that could otherwise let two entrants both acquire. There is no
-lease or multi-round negotiation. The fence is enforced by every writer built
-from this release forward (its check lives in the shared store-commit path); it
-cannot retroactively bind an already-installed older binary, so cross-release
+reclaim TOCTOU that could otherwise let two entrants both acquire. **That
+critical-section lock is itself crash-recoverable** (mirroring the storage lock's
+dead-owner reclaim): it records its owner pid, and a lock left behind by a
+crashed holder is reclaimed by a later entrant once its owner is provably dead
+(or it is older than a small age bound), so a mid-reclaim crash can never
+permanently orphan the lock and strand admission (R2-F4). When a reclaim cannot
+be proven complete, `assertHomeWritable` re-verifies and refuses rather than
+falsely reporting the home writable, and a dead-owner fence is never left
+indefinitely stranding writers. There is no lease or multi-round negotiation. The
+fence is enforced by every writer built from this release forward (its check
+lives in the shared store-commit path); it cannot retroactively bind an
+already-installed older binary, so cross-release
 concurrency is instead handled by the quiesce step and the recommendation to
 stop all Yui activity for the home before upgrading. It then drains the
 Controller with the public `controller.stop`/shutdownAndDrain (never a broad
@@ -304,14 +312,19 @@ interrupted switch (it did not commit); the `interrupted` marker is the durable
 signal.
 
 **Crash-window recovery keys off the marker plus filesystem evidence.** A process
-that dies mid-switch leaves a valid `backing-up` or `promoting` marker (not just
+that dies mid-switch leaves a durable marker (`backing-up`, `promoting`, or
 `interrupted`), with the original at the backup and the home path missing. `yui
-update`'s probe treats *any* such marker combined with filesystem evidence (the
-backup exists and the home is missing/uninitialized) as an interrupted switch and
-prints the exact backup-restore path — never a generic "most likely did not
-commit, retry/setup" that would send the operator to re-initialize a missing
-home. A pre-start marker whose home is still intact (or that has no usable backup)
-is *not* treated as interrupted: there is nothing to recover.
+update`'s probe treats a marker of **any** phase as an interrupted switch **only
+when the filesystem still corroborates it** — the backup exists AND the home is
+missing/uninitialized — and then prints the exact backup-restore path, never a
+generic "most likely did not commit, retry/setup" that would send the operator to
+re-initialize a missing home. Crucially this evidence gate applies to the
+`interrupted` phase too (R2-F3): a stale `interrupted` marker left over after a
+manual recovery — the home already restored, or the backup already removed — is
+**not** trusted to emit a restore path; the probe ignores the stale marker and
+reconciles against the real on-disk state instead. A pre-start marker whose home
+is still intact (or that has no usable backup) is likewise not treated as
+interrupted: there is nothing to recover.
 
 **Quiesce fails closed on any undeterminable signal.** The `.state.lock` is
 acquired mkdir-first with its `owner` file written a moment later, so a lock
@@ -331,10 +344,17 @@ and only then migrates storage and promotes the binary, with a new-binary health
 check last. **Same-artifact promotion:** the version resolved at stage time is
 pinned, and binary activation installs that exact `@zq-silk/yui@<version>` — never
 a second bare `@latest` that could resolve to a different build than the one that
-passed preflight. **Verify the activated binary:** the post-update health check
-runs the *actually-activated* global binary (resolved via `npm prefix -g`), not
-the staging path, and confirms its reported version matches the staged artifact;
-a mismatch (e.g. staged A but `@latest` moved to B) fails closed.
+passed preflight. **A stage that cannot resolve a concrete version FAILS** rather
+than falling back to a `@latest` sentinel (R2-F1): if neither the staged
+package.json nor the staged binary's `--json version` yields an exact version,
+the stage aborts (the live install is untouched, so it is fully recoverable),
+because a `latest` sentinel would reopen exactly the "promoted binary ≠
+preflighted binary" gap. **Verify the activated binary:** the post-update health
+check runs the *actually-activated* global binary (resolved via `npm prefix -g`),
+not the staging path, and **requires** its reported version to be concrete and
+equal to the staged version — a missing, unparseable, or mismatched version fails
+closed (never skipped), so a build whose identity cannot be positively confirmed
+is never trusted.
 
 **Exit status and JSON outcome must agree.** When the orchestrator interprets a
 spawned staged-binary result, a *success-class* outcome (`upgraded`,
@@ -347,16 +367,20 @@ non-zero (5) for a clean `blocked`, so a non-zero exit there is expected and
 consistent. A parseable result with **no** recognized outcome is likewise never
 read as success.
 
-**Post-verify parses the doctor machine-readable result.** The post-update health
-check does not merely check the doctor process's exit code — a zero exit is
-necessary but not sufficient. It runs `yui --json doctor`, which emits a
-structured `{ checks, storage: { healthy, blocking } }` verdict, and **fails
-closed on any unsupported / corrupted / uninitialized / version-mismatch storage
-check even when the process exited 0** (and also when the result cannot be parsed
-at all, since an unverifiable health check must not pass silently). The `--json`
-doctor path additionally exits non-zero when storage is unhealthy, so even a naive
-exit-code consumer fails closed; text-mode `doctor` keeps its existing
-presentation.
+**Post-verify parses the doctor machine-readable result before the exit status.**
+The post-update health check validates the structured `yui --json doctor` verdict
+FIRST, then the exit status (R2-F2) — because `--json doctor` deliberately exits
+non-zero on unhealthy storage, so keying off the exit first would reduce a precise
+"storage unsupported/corrupted" verdict to a generic "exited with status N".
+Storage is healthy only when ALL hold: a valid `{ ok: true, data: { checks,
+storage } }` success envelope, `storage.healthy === true` with no blocking
+checks, every expected storage check present-and-`ok`, AND exit 0. A parseable-
+but-unhealthy result (typically exit 5) throws a precise, recovery-oriented
+blocker; an unparseable, non-success, or self-contradictory envelope (e.g.
+`healthy: true` alongside a non-`ok` storage check, or `ok: false`) fails closed —
+an unverifiable health check must never pass silently. The `--json` doctor path
+additionally exits non-zero when storage is unhealthy, so even a naive exit-code
+consumer fails closed; text-mode `doctor` keeps its existing presentation.
 
 **Activation ambiguity.** Storage activation runs in a spawned staged-binary
 child. If that child is killed (SIGTERM/OOM) or crashes *after* the atomic switch

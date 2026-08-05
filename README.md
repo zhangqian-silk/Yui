@@ -99,14 +99,17 @@ single atomic file create**, so two concurrent upgraders never both acquire —
 exactly one wins and the other fails closed. A provably-dead owner's stale fence
 is reclaimed, but the reclaim is an **atomic compare-and-delete** (it removes only
 the exact stale bytes, under a lock), so a fresh live fence a racer created in the
-meantime is never clobbered — two entrants can never both end up "acquired". An
-**uninitialized home** (never `yui setup`) returns a structured
-"run `yui setup`" blocker rather than a silent no-op. Quiesce **fails closed on any
-undeterminable signal**: a `.state.lock` that exists but whose owner is
-missing/empty/non-integer/unreadable (a writer may be mid-acquisition), or a
-malformed `runtime/controller.json`, is treated as an active runtime and blocks
-the upgrade; only a provably-absent lock or a clearly-dead owner is safe to
-proceed past.
+meantime is never clobbered — two entrants can never both end up "acquired". That
+reclaim lock is itself **crash-recoverable** (owner-pid + age reclaim), so a
+holder that crashes mid-reclaim cannot orphan it and permanently block admission;
+when a reclaim cannot be proven complete the writer fails closed rather than
+falsely reporting the home writable. An **uninitialized home** (never `yui setup`)
+returns a structured "run `yui setup`" blocker rather than a silent no-op. Quiesce
+**fails closed on any undeterminable signal**: a `.state.lock` that exists but
+whose owner is missing/empty/non-integer/unreadable (a writer may be
+mid-acquisition), or a malformed `runtime/controller.json`, is treated as an
+active runtime and blocks the upgrade; only a provably-absent lock or a
+clearly-dead owner is safe to proceed past.
 
 The migration only transforms `schema.json` + `state.json`, but because the
 atomic switch replaces the whole home directory, **staging carries a complete
@@ -666,15 +669,21 @@ replaces the current global install first — then uses the staged binary to run
 read-only preflight against the home. Only when that is safe does it migrate
 storage (atomically, with a timestamped backup) and promote the binary, running
 a new-binary health check last. It promotes the **same artifact it staged**
-(binary activation pins the exact staged version, never a second bare `@latest`),
-and the health check runs the **actually-activated** global binary and verifies
-its version matches the staged one — a mismatch fails closed. A success-class
-child result is trusted **only when the process also exited 0**: an `upgraded`
-outcome paired with a non-zero exit (or an exit 0 with no recognized outcome) is
-treated as ambiguous/blocked, never a false success. The post-update health check
-**parses the machine-readable `yui --json doctor` result** and fails closed on any
-unsupported/corrupted/uninitialized/version-mismatch storage check even when
-`doctor` exits 0. On any failure it reports the exact phase and a recovery action.
+(binary activation pins the exact staged version, never a second bare `@latest`);
+if the exact staged version cannot be resolved the stage **fails** rather than
+falling back to `@latest`. The health check runs the **actually-activated** global
+binary and **requires** its version to be concrete and equal to the staged one — a
+missing, unparseable, or mismatched version fails closed (never skipped). A
+success-class child result is trusted **only when the process also exited 0**: an
+`upgraded` outcome paired with a non-zero exit (or an exit 0 with no recognized
+outcome) is treated as ambiguous/blocked, never a false success. The post-update
+health check **parses and validates the machine-readable `yui --json doctor`
+envelope before interpreting the exit status** — because `--json doctor` exits
+non-zero on unhealthy storage — and fails closed on any
+unsupported/corrupted/uninitialized/version-mismatch check, an unparseable
+envelope, or a self-contradictory one; only a valid success envelope with all
+storage checks `ok` and exit 0 is healthy. On any failure it reports the exact
+phase and a recovery action.
 
 If the storage-activation step cannot be resolved — the spawned staged binary was
 killed or crashed after switching but before reporting — `yui update` reports a

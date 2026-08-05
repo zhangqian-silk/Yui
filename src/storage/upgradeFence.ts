@@ -28,6 +28,7 @@ import {
   openSync,
   readFileSync,
   rmSync,
+  statSync,
   writeSync
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -112,7 +113,10 @@ export function readUpgradeFence(home: string): UpgradeFence | null {
 /**
  * Refuse a write when a live upgrade fence owned by another process is present.
  * A fence owned by the current process, or by a process that is gone, never
- * blocks: the placer may re-pin under the lock, and a stale fence is reclaimed.
+ * blocks: the placer may re-pin under the lock, and a stale (dead-owner) fence is
+ * reclaimed. A stale fence is only cleared for the caller once the reclaim is
+ * PROVEN complete — if it cannot be cleared, this fails closed rather than
+ * falsely reporting the Home writable (R2-F4).
  */
 export function assertHomeWritable(
   home: string,
@@ -124,11 +128,26 @@ export function assertHomeWritable(
   const fence = parseFence(raw);
   if (fence.ownerPid === callerPid) return;
   if (fence.ownerPid > 0 && !processIsAlive(fence.ownerPid)) {
-    // Stale fence from a crashed upgrade: reclaim it ATOMICALLY (F4) so a fresh
-    // live fence a racer may have just created at the same path is never deleted.
-    // The compare-and-delete removes only the exact stale bytes we observed.
+    // Stale fence from a crashed upgrade: reclaim it with the crash-safe atomic
+    // rename-aside (F4/R2-F4), then RE-VERIFY. We only permit the write if the
+    // admission path is now clear of a blocking fence:
+    //  - absent / owned by us / owned by a still-dead pid -> writable, and
+    //  - a LIVE foreign owner that took the freed slot -> refuse.
+    // If the stale fence is somehow still present (reclaim could not move it), we
+    // do NOT return writable — fail closed.
     reclaimStaleFence(path, raw);
-    return;
+    const afterRaw = readFenceRaw(path);
+    if (afterRaw === null) return; // reclaimed: path is free.
+    const after = parseFence(afterRaw);
+    if (after.ownerPid === callerPid) return;
+    if (after.ownerPid > 0 && !processIsAlive(after.ownerPid) && afterRaw !== raw) {
+      // A different dead-owner fence appeared (a racer's crashed attempt); it is
+      // itself reclaimable, so the Home is not live-fenced. Permit.
+      return;
+    }
+    // Either the SAME stale fence is still there (reclaim did not complete) or a
+    // live/undeterminable owner now holds it: fail closed, never falsely writable.
+    throw new UpgradeFenceError(after.reason);
   }
   throw new UpgradeFenceError(fence.reason);
 }
@@ -182,12 +201,11 @@ export function placeUpgradeFence(
       return makeFenceRelease(home, ownerPid);
     }
     if (existing.ownerPid > 0 && !processIsAlive(existing.ownerPid)) {
-      // Provably-dead owner: reclaim the stale fence ATOMICALLY (F4). The reclaim
-      // deletes ONLY the exact stale bytes we just observed, under a mkdir lock,
-      // so a racer that slipped a NEW live fence into the same path between our
-      // read and the unlink is never clobbered — its distinct bytes fail the
-      // compare-and-delete, and the next loop's O_EXCL create contends with it
-      // correctly. Then retry the atomic create.
+      // Provably-dead owner: reclaim the stale fence with a crash-safe atomic
+      // rename-aside (F4). It moves ONLY the exact stale inode out of the
+      // admission path — a racer that replaced it with a live fence is preserved,
+      // and no persistent coordination lock is left to orphan and block future
+      // reclaims. Then retry the atomic create against the freed path.
       reclaimStaleFence(path, rawExisting);
       continue;
     }
@@ -200,38 +218,90 @@ export function placeUpgradeFence(
 }
 
 /**
- * Atomically reclaim a stale fence: delete the fence file at `path` ONLY if its
- * bytes still exactly equal `expectedRaw` (the dead-owner fence we observed).
+ * Reclaim a stale (dead-owner) fence: delete the fence file at `path` only if its
+ * bytes still exactly equal `expectedRaw`, under a short critical section that is
+ * itself CRASH-SAFE (R2-F4).
  *
- * This closes the stale-reclaim TOCTOU (F4). Two things could otherwise race with
- * a naive unconditional unlink:
- *  1. Another reclaimer also deciding to clear — serialized here by a `mkdir`
- *     critical section (mkdir is atomic; exactly one reclaimer holds it).
- *  2. A fresh entrant that O_EXCL-created a NEW live fence at `path` between our
- *     read and the unlink — defeated by the compare: we re-read under the lock
- *     and delete only if the bytes are still the stale ones, so a new owner's
- *     distinct bytes are left intact.
- * If we cannot take the reclaim lock, another reclaimer is handling it; we simply
- * return and let the caller's next O_EXCL attempt settle the race.
+ * The exclusion is a `mkdir` lock — but, mirroring the storage lock's
+ * `reclaimDeadLock`, the lock records its owner pid and is itself reclaimable, so
+ * a holder that crashes mid-critical-section cannot permanently orphan it and
+ * strand admission. On contention we first try to reclaim an orphaned lock (dead
+ * owner, or older than a small age bound), then retry; if the lock is genuinely
+ * held by a live process we simply return (that live reclaimer will finish, and
+ * the caller's next O_EXCL create settles the race).
+ *
+ * Correctness of the delete: inside the lock we RE-READ the fence and delete only
+ * if the bytes are still the exact stale ones, so a racer that O_EXCL-created a
+ * fresh live fence at `path` between our observe and the delete is never
+ * clobbered. The single O_EXCL create in `placeUpgradeFence` remains the sole
+ * winner-decider, so a reclaim never grants ownership by itself.
  */
 function reclaimStaleFence(path: string, expectedRaw: string): void {
   const reclaimLock = `${path}.reclaim.lock`;
-  try {
-    mkdirSync(reclaimLock); // atomic; throws EEXIST if another reclaimer holds it.
-  } catch (error) {
-    if (isEexist(error)) return; // another reclaimer owns the critical section.
-    throw error;
-  }
-  try {
-    // Re-read UNDER the lock. Delete only if the bytes are still the exact stale
-    // fence — never a new live fence a racer created in the meantime.
-    const current = readFenceRaw(path);
-    if (current !== null && current === expectedRaw) {
-      rmSync(path, { force: true });
-      fsyncDirectory(dirname(path));
+  const ownerFile = join(reclaimLock, "owner");
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      mkdirSync(reclaimLock); // atomic; EEXIST if another reclaimer holds it.
+    } catch (error) {
+      if (!isEexist(error)) throw error;
+      // Contended: reclaim the lock only if it is orphaned (dead owner or too
+      // old), then retry once. A live-held lock means another reclaimer is
+      // actively working — leave it and let the O_EXCL create settle the race.
+      if (reclaimOrphanedLock(reclaimLock, ownerFile)) continue;
+      return;
     }
-  } finally {
+    try {
+      writeFenceLockOwner(ownerFile);
+      // Re-read UNDER the lock; delete only if still the exact stale bytes.
+      const current = readFenceRaw(path);
+      if (current !== null && current === expectedRaw) {
+        rmSync(path, { force: true });
+        fsyncDirectory(dirname(path));
+      }
+    } finally {
+      rmSync(reclaimLock, { recursive: true, force: true });
+    }
+    return;
+  }
+}
+
+/** Small age bound below which an orphaned-looking lock is given the benefit of the doubt. */
+const RECLAIM_LOCK_MIN_AGE_MS = 1_000;
+
+/**
+ * Reclaim a reclaim-lock directory ONLY when it is provably orphaned: its owner
+ * pid is dead (or unreadable) AND it is older than a small age bound (so a lock
+ * whose owner just `mkdir`ed but has not yet written its pid is not stolen).
+ * Returns true when it removed the lock (caller should retry), false otherwise.
+ */
+function reclaimOrphanedLock(reclaimLock: string, ownerFile: string): boolean {
+  try {
+    const age = Date.now() - statSync(reclaimLock).mtimeMs;
+    if (age < RECLAIM_LOCK_MIN_AGE_MS) return false; // too fresh; owner may be mid-acquire.
+    let pid: number | null;
+    try {
+      pid = Number.parseInt(readFileSync(ownerFile, "utf8"), 10);
+    } catch {
+      pid = null; // no/unreadable owner on an old lock: treat as orphaned.
+    }
+    if (pid !== null && Number.isInteger(pid) && processIsAlive(pid)) return false; // live holder.
     rmSync(reclaimLock, { recursive: true, force: true });
+    return true;
+  } catch (error) {
+    // ENOENT: the lock vanished (holder released it) — retry the mkdir.
+    return isEnoent(error);
+  }
+}
+
+function writeFenceLockOwner(ownerFile: string): void {
+  try {
+    writeSync(
+      openSync(ownerFile, constants.O_CREAT | constants.O_WRONLY | constants.O_TRUNC, 0o600),
+      `${process.pid}\n`
+    );
+  } catch {
+    // Best effort: without the owner pid the lock is still age-reclaimable, so a
+    // failure to record it degrades to the age bound rather than orphaning.
   }
 }
 

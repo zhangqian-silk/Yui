@@ -553,6 +553,18 @@ function fakeGlobalInstall() {
   return { globalPrefix, globalBinary: join(globalPrefix, "bin", "yui") };
 }
 
+/** A healthy `--json doctor` payload: all storage checks ok + healthy verdict. */
+function healthyDoctorData() {
+  return {
+    checks: [
+      { name: "storage schema", status: "ok", detail: "current" },
+      { name: "storage compatibility", status: "ok", detail: "USABLE" },
+      { name: "storage state", status: "ok", detail: "readable" }
+    ],
+    storage: { healthy: true, blocking: [] }
+  };
+}
+
 /** A fake spawn whose activated global doctor returns a chosen result. */
 function verifySpawn(globalPrefix, doctorResult, stageVersion = "9.9.9") {
   const globalBinary = join(globalPrefix, "bin", "yui");
@@ -561,7 +573,7 @@ function verifySpawn(globalPrefix, doctorResult, stageVersion = "9.9.9") {
     if (command === "npm" && args[0] === "install") return spawnResult({});
     if (args.includes("version")) return okData({ version: stageVersion });
     if (args.includes("doctor") && command === globalBinary) return doctorResult;
-    if (args.includes("doctor")) return okData({ storage: { healthy: true, blocking: [] } });
+    if (args.includes("doctor")) return okData(healthyDoctorData());
     return spawnResult({});
   };
 }
@@ -569,7 +581,7 @@ function verifySpawn(globalPrefix, doctorResult, stageVersion = "9.9.9") {
 test("P1-3 positive: verify passes when doctor reports healthy storage (exit 0)", () => {
   const { globalPrefix } = fakeGlobalInstall();
   const ports = createUpdatePorts(process.env, verifySpawn(
-    globalPrefix, okData({ storage: { healthy: true, blocking: [] } }, 0)
+    globalPrefix, okData(healthyDoctorData(), 0)
   ));
   const staged = ports.stage();
   assert.doesNotThrow(() => ports.verify(staged, "/home"));
@@ -580,6 +592,7 @@ test("P1-3 negative: verify FAILS CLOSED when doctor reports unhealthy storage d
   const ports = createUpdatePorts(process.env, verifySpawn(
     globalPrefix,
     okData({
+      checks: [{ name: "storage compatibility", status: "unsupported", detail: "NEEDS_NEW_VERSION" }],
       storage: {
         healthy: false,
         blocking: [{ name: "storage compatibility", status: "unsupported", detail: "NEEDS_NEW_VERSION" }]
@@ -600,4 +613,3 @@ test("P1-3 negative: verify FAILS CLOSED when doctor returns an unparseable stor
   assert.throws(() => ports.verify(staged, "/home"),
     /did not return a parseable storage-health result|cannot be confirmed healthy/i);
 });
-
