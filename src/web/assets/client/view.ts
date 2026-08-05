@@ -191,32 +191,48 @@ function answerSummary(input, t, locale) {
 }
 
 export function renderFilters(container, state, t, onFilter) {
-  clear(container);
+  const counts = state.counts || {};
   // Single-row status chip row: every status is visible at once with its count,
   // so the user can switch filters without opening a dropdown. The row never
   // wraps; on narrow widths it scrolls horizontally.
-  const counts = state.counts || {};
-  const row = node("div", "filter-row");
-  statuses.forEach(function (status) {
-    const btn = node("button", "filter-chip");
-    btn.type = "button";
-    btn.dataset.status = status;
-    if (status !== "all") {
-      const dot = node("span", "filter-dot");
-      dot.classList.add(status);
-      btn.append(dot);
-    }
-    btn.append(document.createTextNode(translatedStatus(t, "status", status)));
-    if (state.filter === status) btn.classList.add("is-active");
-    const count = status === "all" ? counts.total : counts[status];
-    if (count !== undefined && count !== null) {
-      const badge = node("span", "filter-count", String(count));
+  //
+  // The row and its chips are created once and reused across renders so that
+  // switching filters does not reset the row's horizontal scroll position.
+  let row = container.querySelector(":scope > .filter-row");
+  if (!row) {
+    row = node("div", "filter-row");
+    statuses.forEach(function (status) {
+      const btn = node("button", "filter-chip");
+      btn.type = "button";
+      btn.dataset.status = status;
+      if (status !== "all") {
+        const dot = node("span", "filter-dot");
+        dot.classList.add(status);
+        btn.append(dot);
+      }
+      btn.append(document.createTextNode(translatedStatus(t, "status", status)));
+      const badge = node("span", "filter-count");
       btn.append(badge);
+      btn.addEventListener("click", function () { onFilter(status); });
+      row.append(btn);
+    });
+    container.append(row);
+  }
+  statuses.forEach(function (status) {
+    const btn = row.querySelector('.filter-chip[data-status="' + status + '"]');
+    if (!btn) return;
+    btn.classList.toggle("is-active", state.filter === status);
+    const count = status === "all" ? counts.total : counts[status];
+    const badge = btn.querySelector(".filter-count");
+    if (badge) {
+      if (count !== undefined && count !== null) {
+        badge.textContent = String(count);
+        badge.hidden = false;
+      } else {
+        badge.hidden = true;
+      }
     }
-    btn.addEventListener("click", function () { onFilter(status); });
-    row.append(btn);
   });
-  container.append(row);
 }
 
 function taskGroupOf(task, attentionIds) {

@@ -1,25 +1,43 @@
 /*
  * DESIGN TOKEN CONTRACT
  * ---------------------
- * Every theme is a self-contained [data-theme="..."] block that MUST define the
- * full variable set below. Layout / component / responsive styles reference these
- * variables only — never hardcode a color outside a theme block.
+ * Layout is fully decoupled from themes. Geometry, type, metrics, and motion
+ * live once in the theme-independent :root block below and are shared by every
+ * theme. A [data-theme="..."] block defines ONLY color / surface / effect
+ * tokens, so switching (or adding) a theme can never change layout, sizing, or
+ * position. Layout / component / responsive styles reference these variables
+ * only — never hardcode a color outside a theme block.
  *
- * To add a theme: copy a block, rename the selector, retune the values, then
- * register the name in client/theme.ts (THEMES) and add an <option> in shell.ts.
+ * To add a theme: copy a color block, rename the selector, retune the color
+ * values, then register the name in client/theme.ts (THEMES) and add an
+ * <option> in shell.ts. Do NOT put layout tokens in a theme block; if a future
+ * theme genuinely needs to affect layout, revisit this contract deliberately.
  *
+ * Theme-independent (:root, shared by all themes)
+ *   Geometry   --radius --radius-lg --radius-pill
+ *   Type       --font-mono --font-display --font-body
+ *   Metrics    --page-space --sidebar-w --terminal-w
+ *   Motion     --motion-fast --motion-slow --ease
+ *
+ * Per-theme ([data-theme="..."], color only)
  *   Surfaces   --bg --bg-1 --bg-2 --bg-3            (page → elevated layers)
  *   Lines      --border --border-strong
  *   Text       --text --muted --faint
  *   Accent     --accent --accent-2 --on-accent --accent-soft --accent-line
  *   Semantic   --active/--success/--warning/--danger (+ matching --*-soft)
  *   Effects    --glow --shadow-card --shadow-pop --ambient
- *   Geometry   --radius --radius-lg --radius-pill
- *   Type       --font-mono --font-display --font-body
- *   Metrics    --page-space --sidebar-w
- *   Motion     --motion-fast --motion-slow --ease
  */
 export const TOKEN_STYLES = `
+/* Theme-independent layout tokens — shared by every theme (see contract above).
+   Never move these into a [data-theme] block. */
+:root{
+  --radius:10px;--radius-lg:16px;--radius-pill:999px;
+  --font-mono:"JetBrains Mono","SFMono-Regular",Consolas,monospace;
+  --font-display:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --font-body:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --page-space:clamp(18px,2.6vw,40px);--sidebar-w:clamp(232px,18vw,288px);--terminal-w:clamp(420px,34vw,640px);
+  --motion-fast:150ms;--motion-slow:320ms;--ease:cubic-bezier(.16,.84,.44,1);
+}
 :root,[data-theme="control-room"]{
   color-scheme:dark;
   --bg:#080b11;--bg-1:#0c111a;--bg-2:#111826;--bg-3:#182132;
@@ -39,12 +57,6 @@ export const TOKEN_STYLES = `
     radial-gradient(900px 520px at 104% -6%,rgba(167,139,250,.12),transparent 55%),
     linear-gradient(rgba(255,255,255,.022) 1px,transparent 1px) 0 0/100% 44px,
     linear-gradient(90deg,rgba(255,255,255,.022) 1px,transparent 1px) 0 0/44px 100%;
-  --radius:10px;--radius-lg:16px;--radius-pill:999px;
-  --font-mono:"JetBrains Mono","SFMono-Regular",Consolas,monospace;
-  --font-display:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
-  --font-body:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
-  --page-space:clamp(18px,2.6vw,40px);--sidebar-w:clamp(232px,18vw,288px);--terminal-w:clamp(420px,34vw,640px);
-  --motion-fast:150ms;--motion-slow:320ms;--ease:cubic-bezier(.16,.84,.44,1);
 }
 [data-theme="atlas"]{
   color-scheme:dark;
@@ -65,12 +77,6 @@ export const TOKEN_STYLES = `
     radial-gradient(900px 520px at 106% -6%,rgba(124,171,242,.1),transparent 55%),
     linear-gradient(rgba(230,242,251,.018) 1px,transparent 1px) 0 0/100% 44px,
     linear-gradient(90deg,rgba(230,242,251,.018) 1px,transparent 1px) 0 0/44px 100%;
-  --radius:10px;--radius-lg:16px;--radius-pill:999px;
-  --font-mono:"JetBrains Mono","SFMono-Regular",Consolas,monospace;
-  --font-display:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
-  --font-body:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
-  --page-space:clamp(18px,2.6vw,40px);--sidebar-w:clamp(236px,18vw,292px);--terminal-w:clamp(420px,34vw,640px);
-  --motion-fast:150ms;--motion-slow:320ms;--ease:cubic-bezier(.16,.84,.44,1);
 }
 [data-theme="paper"]{
   color-scheme:light;
@@ -91,12 +97,6 @@ export const TOKEN_STYLES = `
     radial-gradient(900px 520px at 104% -6%,rgba(124,58,237,.08),transparent 55%),
     linear-gradient(rgba(24,45,78,.03) 1px,transparent 1px) 0 0/100% 44px,
     linear-gradient(90deg,rgba(24,45,78,.03) 1px,transparent 1px) 0 0/44px 100%;
-  --radius:10px;--radius-lg:16px;--radius-pill:999px;
-  --font-mono:"JetBrains Mono","SFMono-Regular",Consolas,monospace;
-  --font-display:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
-  --font-body:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
-  --page-space:clamp(18px,2.6vw,40px);--sidebar-w:clamp(232px,18vw,288px);--terminal-w:clamp(420px,34vw,640px);
-  --motion-fast:130ms;--motion-slow:280ms;--ease:cubic-bezier(.16,.84,.44,1);
 }
 `;
 
@@ -144,7 +144,7 @@ body.terminal-active .app-shell{grid-template-columns:var(--sidebar-w) minmax(0,
 .breadcrumb{display:flex;align-items:baseline;gap:8px;min-width:0}
 .crumb-current{margin:0;min-width:0;font-family:var(--font-display);font-weight:600;font-size:clamp(14px,1.3vw,17px);letter-spacing:-.01em;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .topbar-actions{display:flex;align-items:center;gap:14px;flex:none}
-.clock{display:grid;justify-items:end;gap:4px;text-align:right}
+.clock{display:grid;justify-items:end;gap:2px;text-align:right;line-height:1.2}
 /* Sticky section navigation, only meaningful while a task is open */
 .detail-tabs{position:sticky;top:var(--topbar-h,44px);z-index:20;flex:none;display:none;gap:0;padding:0 calc(var(--page-space) - 4px);background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid var(--border);overflow-x:auto;scrollbar-width:none}
 body.detail-active .detail-tabs{display:flex}
@@ -364,10 +364,12 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .criteria-list{margin:0;padding:0;list-style:none;display:grid;gap:5px}
 .criteria-list li{position:relative;padding-left:16px;font-family:var(--font-body);font-size:12px;line-height:1.45;color:var(--muted)}
 .criteria-list li:before{content:"";position:absolute;left:3px;top:7px;width:5px;height:5px;border-radius:50%;background:var(--accent-line)}
-/* Operator CTA card (sidebar bottom) */
-.operator-open{display:flex;align-items:center;gap:10px;width:100%;text-align:left;padding:7px 11px;background:linear-gradient(150deg,var(--bg-3),var(--bg-2));border:1px solid var(--border-strong);border-radius:var(--radius);box-shadow:var(--shadow-card);transition:border-color var(--motion-fast),box-shadow var(--motion-fast)}
-.operator-open:hover{border-color:var(--accent-line);box-shadow:0 0 0 4px var(--accent-soft)}
-.operator-title{font-family:var(--font-body);font-weight:700;font-size:13px;color:var(--text);letter-spacing:-.005em;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Operator session control (top bar, right side).
+   Kept visually consistent with the refresh button so the topbar actions read
+   as one family: same background, border, radius, padding, and hover treatment. */
+.operator-open{display:inline-flex;align-items:center;gap:8px;flex:none;padding:9px 14px;color:var(--text);background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-family:var(--font-body);font-size:12px;font-weight:600;cursor:pointer;transition:border-color var(--motion-fast),color var(--motion-fast),background var(--motion-fast)}
+.operator-open:hover,.operator-open:focus-visible{border-color:var(--accent-line);color:var(--accent);background:var(--accent-soft)}
+.operator-title{flex:none;white-space:nowrap}
 .operator-shortcuts{display:flex;gap:4px;flex:none}
 /* Terminal panel */
 .terminal-panel{color:#e8eef6;background:#080b11;border-left:1px solid #263244;box-shadow:var(--shadow-pop)}
