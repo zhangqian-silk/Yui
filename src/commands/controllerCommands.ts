@@ -6,6 +6,7 @@ import type {
   RuntimeOwner,
   RuntimeResource
 } from "../controller/resourceInventory.js";
+import { DEFAULT_RECONCILIATION_INTERVAL_SECONDS } from "../config/yuiConfig.js";
 
 export type ControllerStatusOptions = Readonly<{
   scope: ControllerInventoryScope;
@@ -82,28 +83,45 @@ export function renderControllerResourceStatus(
     } live process(es), ${formatBytes(snapshot.summary.rssBytes)} RSS.`
   ];
 
-  if (snapshot.scope === "all" || snapshot.domains.length > 1) {
+  if (
+    snapshot.scope === "all"
+    || snapshot.domains.length > 1
+    || snapshot.domains.some(({ domainKind }) => domainKind !== undefined)
+  ) {
     const visibleDomains = selectVisibleDomains(snapshot, verbose);
     lines.push("", renderTable(
       "Control domains",
       [
         { header: "YUI_HOME", minWidth: 16, maxWidth: 54 },
+        { header: "Domain", minWidth: 10, maxWidth: 18 },
+        { header: "Lifetime", minWidth: 10, maxWidth: 18 },
         { header: "Storage", minWidth: 8, maxWidth: 13 },
         { header: "Resources", minWidth: 9, maxWidth: 9 },
         { header: "Processes", minWidth: 9, maxWidth: 9 },
         { header: "RSS", minWidth: 8, maxWidth: 11 },
-        { header: "Issues", minWidth: 6, maxWidth: 6 }
+        { header: "Issues", minWidth: 6, maxWidth: 6 },
+        { header: "Reason", minWidth: 12, maxWidth: 30 }
       ],
       visibleDomains.map((domain) => [
         domain.yuiHome,
+        domain.domainKind ?? "legacy",
+        domain.liveness === undefined
+          ? "—"
+          : `${domain.liveness}/${domain.disposition ?? "review"}`,
         domain.storageStatus,
         String(domain.resourceCount),
         String(domain.liveProcessCount),
         formatBytes(domain.rssBytes),
-        String(domain.issueCount)
+        String(domain.issueCount),
+        domain.reasonCode ?? "—"
       ]),
       width
     ));
+    lines.push(
+      "",
+      `Automatic ephemeral reap: every ${DEFAULT_RECONCILIATION_INTERVAL_SECONDS}s; `
+        + "only expired marked test domains with matching identities are eligible."
+    );
     if (visibleDomains.length < snapshot.domains.length) {
       lines.push(
         "",
@@ -398,6 +416,11 @@ function renderCleanupPlan(
   protectedCount: number,
   reportOnlyCount: number
 ): string {
+  const domains = [...safe, ...review].reduce((counts, resource) => {
+    const home = resource.yuiHome ?? "unattributed";
+    counts.set(home, (counts.get(home) ?? 0) + 1);
+    return counts;
+  }, new Map<string, number>());
   return [
     "Controller cleanup plan",
     "",
@@ -405,19 +428,30 @@ function renderCleanupPlan(
     `  Review        ${review.length} resource(s), ${formatBytes(totalRss(review))} RSS`,
     `  Protected     ${protectedCount} resource(s)`,
     `  Report only   ${reportOnlyCount} resource(s)`,
+    ...(domains.size === 0 ? [] : [
+      "",
+      "  Domains",
+      ...[...domains.entries()].map(([home, count]) => `    ${home}: ${count} candidate(s)`)
+    ]),
     ""
   ].join("\n");
 }
 
 function cleanupResourceLabel(resource: RuntimeResource): string {
   const pids = resource.processes.map(({ pid }) => pid).join(",") || "—";
+  const domain = resource.domain;
   return [
     `${resource.kind}: ${resource.reasonCode}`,
     `  Home  ${resource.yuiHome ?? "unattributed"}`,
     `  PID   ${pids}`,
     `  RSS   ${formatBytes(resource.rssBytes)}`,
     `  Age   ${formatDuration(resource.ageMs)}`,
-    `  Owner ${ownerLabel(resource.owner)}`
+    `  Owner ${ownerLabel(resource.owner)}`,
+    ...(domain === undefined ? [] : [
+      `  Domain ${domain.kind}/${domain.liveness}/${domain.disposition}`,
+      `  Host  ${domain.hostPid === undefined ? "—" : `${domain.hostPid}:${domain.hostProcessStartIdentity ?? "?"}`}`,
+      `  Cost  ${formatBytes(resource.rssBytes)} RSS; tmux=${domain.tmuxTargets.length}`
+    ])
   ].join("\n");
 }
 

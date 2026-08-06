@@ -22,6 +22,7 @@ import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.
 import type { MailboxTarget } from "../coordination/workMailbox.js";
 import { hasRuntimeLifecycleWork } from "../runtime/lifecycleReservation.js";
 import { YUI_VERSION } from "../version.js";
+import { EPHEMERAL_DOMAIN_ENVIRONMENT_NAMES } from "./domainIdentity.js";
 
 const STARTUP_TIMEOUT_MS = 5_000;
 // A lifecycle RPC may legitimately occupy the Controller for 30 seconds.
@@ -33,7 +34,8 @@ const ENVIRONMENT_REFRESH_TIMEOUT_MS = 500;
 const CONFIGURATION_REFRESH_TIMEOUT_MS = 500;
 const CONTROLLER_OPERATIONAL_ENVIRONMENT = [
   ...AGENT_OPERATIONAL_ENVIRONMENT_NAMES,
-  "YUI_TMUX_BIN"
+  "YUI_TMUX_BIN",
+  ...EPHEMERAL_DOMAIN_ENVIRONMENT_NAMES
 ] as const;
 
 export type FileControllerClientOptions = Readonly<{

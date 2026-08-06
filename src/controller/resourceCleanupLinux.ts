@@ -6,6 +6,11 @@ import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
 import { TmuxManager } from "../tmux/tmuxManager.js";
 import type { RuntimeResource } from "./resourceInventory.js";
 import { controllerSocketPath } from "../core/controllerEndpoint.js";
+import {
+  CONTROLLER_DOMAIN_PATH,
+  domainIdentityPath,
+  readEphemeralDomainIdentity
+} from "./domainIdentity.js";
 
 const DEFAULT_TERM_GRACE_MS = 1_000;
 const DEFAULT_KILL_GRACE_MS = 1_000;
@@ -37,6 +42,7 @@ export async function cleanControllerResource(
   if (resource.disposition !== "safe" && resource.disposition !== "review") {
     throw new Error(`Resource is not eligible for cleanup: ${resource.id}.`);
   }
+  assertEphemeralDomainFence(resource);
   const environment = options.environment ?? process.env;
   const ports = options.ports ?? linuxCleanupPorts(environment);
   if (resource.artifact !== undefined) {
@@ -56,6 +62,15 @@ export async function cleanControllerResource(
     if (panes.length > 0) {
       throw new Error(
         `Tmux server still owns Role panes: ${panes.join(", ")}.`
+      );
+    }
+    // Close the small inspect-to-signal race without inventing a wait or
+    // broad process-name rule. A target appearing on the second exact query
+    // keeps the server protected for the next bounded pass.
+    const recheckedPanes = await ports.inspectTmuxServerPanes(resource);
+    if (recheckedPanes.length > 0) {
+      throw new Error(
+        `Tmux server still owns Role panes: ${recheckedPanes.join(", ")}.`
       );
     }
   }
@@ -89,12 +104,37 @@ export async function cleanControllerResource(
   }
 }
 
+function assertEphemeralDomainFence(resource: RuntimeResource): void {
+  const domain = resource.domain;
+  if (domain?.kind !== "ephemeral-test") return;
+  const home = resource.yuiHome;
+  if (home === undefined || domain.token === undefined) {
+    throw new Error(`Ephemeral domain identity is unavailable: ${resource.id}.`);
+  }
+  const identity = readEphemeralDomainIdentity(home);
+  if (identity.status !== "valid" || identity.identity?.token !== domain.token) {
+    throw new Error(`Resource changed since scan: ${resource.id}.`);
+  }
+}
+
 function cleanArtifact(resource: RuntimeResource, ports: ControllerCleanupPorts): void {
   const artifact = resource.artifact;
   if (artifact === undefined) throw new Error(`Artifact is unavailable: ${resource.id}.`);
   assertOwnedArtifactPath(resource);
-  if (ports.artifactFingerprint(artifact.path) !== resource.fingerprint) {
+  const currentFingerprint = ports.artifactFingerprint(artifact.path);
+  if (currentFingerprint === undefined || currentFingerprint !== artifact.fingerprint) {
     throw new Error(`Resource changed since scan: ${resource.id}.`);
+  }
+  if (artifact.artifactKind === "domain-identity") {
+    const home = resource.yuiHome;
+    const expectedToken = resource.domain?.token;
+    if (home === undefined || expectedToken === undefined) {
+      throw new Error(`Ephemeral domain identity is unavailable: ${resource.id}.`);
+    }
+    const identity = readEphemeralDomainIdentity(home);
+    if (identity.status !== "valid" || identity.identity?.token !== expectedToken) {
+      throw new Error(`Resource changed since scan: ${resource.id}.`);
+    }
   }
   if (
     artifact.artifactKind.endsWith("-socket")
@@ -184,6 +224,18 @@ function linuxCleanupPorts(environment: NodeJS.ProcessEnv): ControllerCleanupPor
         candidate.target === target
       ));
       if (pane === undefined) return;
+      if (
+        resource.paneDead !== undefined
+        && pane.dead !== resource.paneDead
+      ) {
+        throw new Error(`Resource changed since scan: ${resource.id}.`);
+      }
+      if (
+        resource.paneCommand !== undefined
+        && pane.currentCommand !== resource.paneCommand
+      ) {
+        throw new Error(`Resource changed since scan: ${resource.id}.`);
+      }
       const expectedPid = resource.processes[0]?.pid;
       if (expectedPid !== undefined && pane.pid !== expectedPid) {
         throw new Error(`Resource changed since scan: ${resource.id}.`);
@@ -255,6 +307,14 @@ function assertOwnedArtifactPath(resource: RuntimeResource): void {
     home !== undefined
     && artifact.artifactKind === "controller-socket"
     && path === controllerSocketPath(home)
+  ) {
+    return;
+  }
+  if (
+    home !== undefined
+    && artifact.artifactKind === "domain-identity"
+    && path === domainIdentityPath(home)
+    && basename(path) === basename(join(resolve(home), CONTROLLER_DOMAIN_PATH))
   ) {
     return;
   }
