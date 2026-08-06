@@ -204,6 +204,29 @@ async function routeRequest(
     return;
   }
 
+  if (request.method === "controller.identity") {
+    if (!isEmptyParams(request.params)) {
+      sendResponse(
+        socket,
+        controllerFailure(request.id, "INVALID_PARAMS", "Controller params are invalid.")
+      );
+      return;
+    }
+    // This is an authenticated, private lifecycle response. Unlike the public
+    // resource inventory, it retains the exact executable/argv that the socket
+    // owner was launched with so an update can restore that same Controller.
+    sendResponse(socket, {
+      id: request.id,
+      ok: true,
+      result: {
+        executablePath: process.execPath,
+        args: process.argv.slice(1),
+        version: YUI_VERSION
+      }
+    });
+    return;
+  }
+
   if (request.method === "controller.status") {
     if (!isEmptyParams(request.params)) {
       sendResponse(

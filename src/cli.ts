@@ -72,6 +72,7 @@ import {
   restartFileTaskController,
   stopFileTaskController
 } from "./controller/clientRuntime.js";
+import { callController, ControllerClientError } from "./core/controllerClient.js";
 import { FileSchedulerStoreAdapter } from "./controller/fileSchedulerStoreAdapter.js";
 import { cleanControllerResource } from "./controller/resourceCleanupLinux.js";
 import { scanControllerResourceInventory } from "./controller/resourceInventoryLinux.js";
@@ -236,6 +237,33 @@ export async function main(): Promise<void> {
 
   if (args[0] === "controller") {
     const method = args[1];
+    if (method === "identity" && args.length === 2) {
+      // Internal lifecycle seam used by update/upgrade. The Controller socket
+      // authenticates this exact launch identity; public `controller status`
+      // intentionally redacts argv in its resource inventory.
+      try {
+        const identity = await callController(home, "controller.identity", {});
+        emit("", false, identity);
+      } catch (error) {
+        // Preserve the Controller protocol code for the synchronous update
+        // lifecycle owner. A generic RUNTIME_ERROR would erase the only
+        // definitive CONTROLLER_NOT_RUNNING proof and force an unnecessary
+        // unknown-active block.
+        if (!(error instanceof ControllerClientError)) throw error;
+        if (jsonOutput) {
+          process.stderr.write(`${JSON.stringify({
+            ok: false,
+            code: error.code,
+            message: error.message,
+            details: {}
+          })}\n`);
+        } else {
+          process.stderr.write(`RUNTIME_ERROR: ${error.message}\n`);
+        }
+        process.exitCode = 5;
+      }
+      return;
+    }
     if (method === "status") {
       const options = parseControllerStatusOptions(args.slice(2));
       const snapshot = await scanControllerResourceInventory({

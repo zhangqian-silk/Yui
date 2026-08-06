@@ -58,6 +58,12 @@ function migratableSetup(home) {
   return { home, latest, registry };
 }
 
+const CONTROLLER_IDENTITY = {
+  executablePath: "/old/node",
+  args: ["/old/controllerMain.js"],
+  version: "8.8.8"
+};
+
 function stageRoot() {
   return mkdtempSync(join(tmpdir(), "yui-convergence-stage-root-"));
 }
@@ -160,13 +166,17 @@ test("blocked upgrade restores a Controller that was running before quiesce", as
     mode: "execute",
     controllerStatus: async () => {
       events.push("status");
-      return { running: true, pid: 123 };
+      return { running: true, pid: 123, identity: CONTROLLER_IDENTITY };
     },
     stopController: async () => {
       events.push("stop");
       return { stopped: true, pid: 123 };
     },
-    startController: async () => { events.push("start"); }
+    startController: async () => { events.push("start"); },
+    restoreController: async (_home, identity) => {
+      events.push("start");
+      assert.deepEqual(identity, CONTROLLER_IDENTITY);
+    }
   });
   assert.equal(result.outcome, "blocked");
   assert.equal(result.stage, "active-runtime");
@@ -184,7 +194,7 @@ test("stop timeout is a structured active-runtime blocker without retry or resto
     mode: "execute",
     controllerStatus: async () => {
       events.push("status");
-      return { running: true, pid: 123 };
+      return { running: true, pid: 123, identity: CONTROLLER_IDENTITY };
     },
     stopController: async () => {
       events.push("stop");
@@ -209,7 +219,7 @@ test("successful switch starts the replacement Controller after verification", a
     mode: "execute",
     controllerStatus: async () => {
       events.push("status");
-      return { running: true, pid: 123 };
+      return { running: true, pid: 123, identity: CONTROLLER_IDENTITY };
     },
     stopController: async () => {
       events.push("stop");
@@ -235,7 +245,7 @@ test("ambiguous switch remains fail-closed and does not restore the old Controll
     mode: "execute",
     controllerStatus: async () => {
       events.push("status");
-      return { running: true, pid: 123 };
+      return { running: true, pid: 123, identity: CONTROLLER_IDENTITY };
     },
     stopController: async () => {
       events.push("stop");
@@ -266,7 +276,7 @@ test("post-switch receipt failure is structured and never restores the old Contr
     mode: "execute",
     controllerStatus: async () => {
       events.push("status");
-      return { running: true, pid: 123 };
+      return { running: true, pid: 123, identity: CONTROLLER_IDENTITY };
     },
     stopController: async () => {
       events.push("stop");
@@ -296,7 +306,7 @@ test("post-switch receipt-clear failure retains commit guard and recovery eviden
     mode: "execute",
     controllerStatus: async () => {
       events.push("status");
-      return { running: true, pid: 123 };
+      return { running: true, pid: 123, identity: CONTROLLER_IDENTITY };
     },
     stopController: async () => {
       events.push("stop");
@@ -313,5 +323,36 @@ test("post-switch receipt-clear failure retains commit guard and recovery eviden
   assert.match(result.message, /receipt clear injected/);
   assert.match(result.recoveryEvidence.receiptPath, /upgrade-receipt/);
   assert.match(result.recoveryEvidence.progressPath, /upgrade-switch/);
+  assert.deepEqual(events, ["status", "stop", "start"]);
+});
+
+test("post-switch replacement start failure uses committed ambiguity evidence", async () => {
+  const { home } = currentHome("yui-convergence-start-failure-");
+  const { latest, registry } = migratableSetup(home);
+  const events = [];
+  const result = await runStorageUpgrade({
+    home,
+    latest,
+    registry,
+    mode: "execute",
+    controllerStatus: async () => {
+      events.push("status");
+      return { running: true, pid: 123, identity: CONTROLLER_IDENTITY };
+    },
+    stopController: async () => {
+      events.push("stop");
+      return { stopped: true, pid: 123 };
+    },
+    startController: async () => {
+      events.push("start");
+      throw new Error("replacement readiness failed");
+    }
+  });
+  assert.equal(result.outcome, "blocked");
+  assert.equal(result.stage, "post-verify");
+  assert.equal(result.switchCommitted, true);
+  assert.match(result.message, /replacement readiness failed/);
+  assert.match(result.action, /upgrade-receipt|upgrade-switch|backup/i);
+  assert.match(result.action, /old Controller/i);
   assert.deepEqual(events, ["status", "stop", "start"]);
 });

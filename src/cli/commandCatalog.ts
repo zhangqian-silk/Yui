@@ -669,7 +669,7 @@ export const ROOT_COMMAND = buildNode({
       sections: [{
         id: "lifecycle",
         title: "Commands",
-        entries: ["status", "cleanup", "stop", "restart"]
+        entries: ["status", "cleanup", "identity", "stop", "restart"]
       }],
       children: [
         {
@@ -683,6 +683,11 @@ export const ROOT_COMMAND = buildNode({
           summary: "Interactively clean confirmed unused runtime resources.",
           usage: "yui controller cleanup [--all]",
           options: ["--all"]
+        },
+        {
+          name: "identity",
+          summary: "Read the authenticated Controller launch identity.",
+          hidden: true
         },
         { name: "stop", summary: "Stop the Controller." },
         { name: "restart", summary: "Restart internal services without stopping tmux sessions." }

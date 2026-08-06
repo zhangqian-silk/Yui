@@ -44,7 +44,15 @@ export type FileControllerClientOptions = Readonly<{
   shutdownTimeoutMs?: number;
   pollIntervalMs?: number;
   requestTimeoutMs?: number;
+  /** Override the expected version for an exact-identity restore handshake. */
+  expectedVersion?: string;
   onError?: (error: unknown) => void;
+}>;
+
+export type ControllerLaunchIdentity = Readonly<{
+  executablePath: string;
+  args: readonly string[];
+  version: string;
 }>;
 
 /**
@@ -80,7 +88,7 @@ export async function ensureFileTaskController(
   const call = options.call ?? callController;
   try {
     const status = await call(home, "controller.status", {});
-    assertCompatibleControllerStatus(status);
+    assertCompatibleControllerStatus(status, options.expectedVersion);
     return status;
   } catch (error) {
     if (!isUnavailable(error)) throw error;
@@ -93,7 +101,7 @@ export async function ensureFileTaskController(
   for (;;) {
     try {
       const status = await call(home, "controller.status", {});
-      assertCompatibleControllerStatus(status);
+      assertCompatibleControllerStatus(status, options.expectedVersion);
       return status;
     } catch (error) {
       if (!isUnavailable(error)) throw error;
@@ -105,7 +113,22 @@ export async function ensureFileTaskController(
   }
 }
 
-function assertCompatibleControllerStatus(status: JsonValue): void {
+/** Start and await readiness for a captured Controller identity. */
+export async function ensureFileTaskControllerIdentity(
+  home: string,
+  identity: ControllerLaunchIdentity,
+  options: FileControllerClientOptions = {}
+): Promise<JsonValue> {
+  return ensureFileTaskController(home, {
+    ...options,
+    expectedVersion: identity.version
+  });
+}
+
+function assertCompatibleControllerStatus(
+  status: JsonValue,
+  expectedVersion?: string
+): void {
   const statusRecord = isJsonRecord(status) && status.running === true ? status : null;
   const actual = statusRecord?.protocolVersion;
   if (statusRecord === null || actual !== FILE_TASK_CONTROLLER_PROTOCOL_VERSION) {
@@ -117,9 +140,15 @@ function assertCompatibleControllerStatus(status: JsonValue): void {
     );
   }
   const actualVersion = statusRecord.version;
-  if (typeof actualVersion === "string" && actualVersion !== YUI_VERSION) {
+  const expected = expectedVersion ?? YUI_VERSION;
+  const versionMismatch = expectedVersion === undefined
+    ? typeof actualVersion === "string" && actualVersion !== expected
+    : actualVersion !== expected;
+  if (versionMismatch) {
     throw new Error(
-      `Controller version is incompatible (expected ${YUI_VERSION}, found ${actualVersion}). `
+      `Controller version is incompatible (expected ${expected}, found ${
+        typeof actualVersion === "string" ? actualVersion : "unknown"
+      }). `
         + "Run `yui controller restart` before writing new task records."
     );
   }

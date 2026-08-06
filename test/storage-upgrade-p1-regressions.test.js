@@ -37,6 +37,11 @@ import {
 } from "../dist/storage/upgrade/upgradeReceipt.js";
 import { runUpdate } from "../dist/cli/updateOrchestrator.js";
 import { createUpdatePorts } from "../dist/cli/updatePorts.js";
+import {
+  ensureFileTaskControllerIdentity
+} from "../dist/controller/clientRuntime.js";
+import { ControllerClientError } from "../dist/core/controllerClient.js";
+import { FILE_TASK_CONTROLLER_PROTOCOL_VERSION } from "../dist/core/protocol.js";
 import { createTask } from "../dist/task/task.js";
 
 // ---------------------------------------------------------------------------
@@ -301,6 +306,130 @@ test("binary-only stop failure is structured with no retry, activation, or resto
   assert.equal(result.phase, "preflight");
   assert.match(result.message, /shutdown timeout/);
   assert.deepEqual(events, ["stage", "preflight", "status", "stop", "cleanup"]);
+});
+
+test("binary-only real ports capture authenticated exact identity, never inferred current identity", () => {
+  const home = "/tmp/yui-authenticated-identity";
+  const identity = {
+    executablePath: "/old/node-v20",
+    args: ["/old/controller-main.js", "--legacy"],
+    version: "8.8.8"
+  };
+  const spawn = (command, args) => {
+    if (args.includes("controller") && args.includes("status")) {
+      return okData({
+        resources: [{
+          kind: "controller",
+          state: "current",
+          yuiHome: home,
+          processes: [{ pid: 41 }]
+        }],
+        warnings: []
+      });
+    }
+    if (args.includes("controller") && args.includes("identity")) return okData(identity);
+    return spawnResult();
+  };
+  const ports = createUpdatePorts(process.env, spawn);
+  assert.deepEqual(ports.controllerStatus(home), { running: true, pid: 41, identity });
+});
+
+test("binary-only real ports accept only an explicit no-Controller proof as stopped", () => {
+  const home = "/tmp/yui-no-controller-proof";
+  const spawn = (_command, args) => {
+    if (args.includes("controller") && args.includes("status")) {
+      return okData({ resources: [], warnings: [] });
+    }
+    if (args.includes("controller") && args.includes("identity")) {
+      return spawnResult({
+        status: 5,
+        stderr: Buffer.from(JSON.stringify({
+          ok: false,
+          code: "CONTROLLER_NOT_RUNNING",
+          message: "Controller is not running."
+        }))
+      });
+    }
+    throw new Error("unexpected Controller lifecycle command");
+  };
+  const ports = createUpdatePorts(process.env, spawn);
+  assert.deepEqual(ports.controllerStatus(home), { running: false });
+});
+
+test("binary-only real ports block orphaned discovery as unknown-active", () => {
+  const home = "/tmp/yui-orphaned-controller";
+  const spawn = (_command, args) => {
+    if (args.includes("controller") && args.includes("status")) {
+      return okData({
+        resources: [{
+          kind: "controller",
+          state: "orphaned",
+          yuiHome: home,
+          processes: [{ pid: 41 }]
+        }],
+        warnings: []
+      });
+    }
+    throw new Error("identity must not be queried for an orphaned inventory");
+  };
+  const ports = createUpdatePorts(process.env, spawn);
+  assert.throws(() => ports.controllerStatus(home), /unknown-active/i);
+});
+
+test("binary-only real ports require an authenticated identity when a current process is listed", () => {
+  const home = "/tmp/yui-identity-uncertain";
+  const spawn = (_command, args) => {
+    if (args.includes("controller") && args.includes("status")) {
+      return okData({
+        resources: [{
+          kind: "controller",
+          state: "current",
+          yuiHome: home,
+          processes: [{ pid: 41 }]
+        }],
+        warnings: []
+      });
+    }
+    return spawnResult({
+      status: 5,
+      stderr: Buffer.from(JSON.stringify({ ok: false, code: "METHOD_NOT_FOUND" }))
+    });
+  };
+  const ports = createUpdatePorts(process.env, spawn);
+  assert.throws(() => ports.controllerStatus(home), /absence could not be authenticated|METHOD_NOT_FOUND|identity/i);
+});
+
+test("exact-identity restore readiness waits for authenticated running status", async () => {
+  const identity = {
+    executablePath: "/old/node-v20",
+    args: ["/old/controller-main.js"],
+    version: "8.8.8"
+  };
+  let statusCalls = 0;
+  let spawnCalls = 0;
+  const result = await ensureFileTaskControllerIdentity(
+    "/tmp/yui-readiness-handshake",
+    identity,
+    {
+      call: async () => {
+        statusCalls += 1;
+        if (statusCalls < 3) {
+          throw new ControllerClientError("CONTROLLER_UNAVAILABLE", "not ready yet");
+        }
+        return {
+          running: true,
+          protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+          version: identity.version
+        };
+      },
+      spawnController: () => { spawnCalls += 1; },
+      startupTimeoutMs: 100,
+      pollIntervalMs: 1
+    }
+  );
+  assert.equal(result.running, true);
+  assert.equal(spawnCalls, 1);
+  assert.equal(statusCalls, 3);
 });
 
 test("P1-1 managed workspace record-only mismatch is NEEDS_NEW_VERSION/missing-step", () => {

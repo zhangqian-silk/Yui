@@ -2358,6 +2358,11 @@ test("background FileTask controller exposes status, scan and stop on one privat
   assert.equal(status.version, YUI_VERSION);
   assert.equal(status.storageLayoutVersion, yuiVersionIdentity().storageLayoutVersion);
   assert.equal(status.aggregateSchemaVersion, yuiVersionIdentity().aggregateSchemaVersion);
+  assert.deepEqual(await callController(home, "controller.identity", {}), {
+    executablePath: process.execPath,
+    args: process.argv.slice(1),
+    version: YUI_VERSION
+  });
   assert.deepEqual(
     await callController(home, "scheduler.signal", { key: "task:task-1" }),
     { accepted: true }

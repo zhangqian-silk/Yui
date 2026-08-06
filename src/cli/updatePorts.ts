@@ -30,7 +30,7 @@
 import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { runtimeError } from "../errors/cliError.js";
@@ -48,7 +48,6 @@ import type {
   UpdatePorts,
   UpdatePreflight
 } from "./updateOrchestrator.js";
-import { YUI_VERSION } from "../version.js";
 
 const PACKAGE_NAME = "@zq-silk/yui";
 const PACKAGE_SPEC = `${PACKAGE_NAME}@latest`;
@@ -256,55 +255,108 @@ export function createUpdatePorts(
 }
 
 const UPDATE_CLI_PATH = fileURLToPath(new URL("../cli.js", import.meta.url));
+const UPDATE_CLIENT_RUNTIME_PATH = fileURLToPath(new URL("../controller/clientRuntime.js", import.meta.url));
 
-/** Capture running state plus the exact process command/version before stopping. */
+/**
+ * Capture running state plus an authenticated exact process identity before
+ * stopping. Public `controller status` is an inventory and intentionally
+ * redacts argv, so current/orphan/stale/uncertain inventory states are never
+ * guessed into "stopped".
+ */
 function readControllerLifecycle(
   home: string,
   environment: NodeJS.ProcessEnv,
   spawn: UpdateSpawner
 ): UpdateControllerLifecycleStatus {
   const data = runControllerCommand(home, environment, spawn, "status");
-  const resources = Array.isArray(data.resources) ? data.resources : [];
+  if (!Array.isArray(data.resources)) {
+    throw new Error("Controller inventory is malformed; treating ownership as unknown-active.");
+  }
+  const resources = data.resources;
+  if (
+    data.warnings !== undefined
+    && (!Array.isArray(data.warnings) || data.warnings.some((warning) => typeof warning !== "string"))
+  ) {
+    throw new Error("Controller inventory warnings are malformed; treating ownership as unknown-active.");
+  }
+  if (Array.isArray(data.warnings) && data.warnings.length > 0) {
+    throw new Error(
+      `Controller inventory is uncertain: ${data.warnings.join("; ")}`
+    );
+  }
+  const resolvedHome = resolve(home);
+  const homeResources = resources.filter((resource) => (
+    isRecord(resource) && resource.yuiHome === resolvedHome
+  ));
+  const controllerResources = homeResources.filter((resource) => (
+    resource.kind === "controller"
+  ));
+  const controllerArtifacts = homeResources.filter((resource) => (
+    resource.kind === "artifact"
+      && isRecord(resource.artifact)
+      && (resource.artifact.artifactKind === "controller-discovery"
+        || resource.artifact.artifactKind === "controller-socket")
+  ));
+  const currentResources = controllerResources.filter((resource) => (
+    resource.state === "current"
+  ));
+  if (
+    controllerArtifacts.length > 0
+    || controllerResources.some((resource) => resource.state !== "current")
+    || currentResources.length > 1
+  ) {
+    throw new Error(
+      "Controller inventory found an orphaned, stale, invalid, or ambiguous resource; "
+        + "treating ownership as unknown-active."
+    );
+  }
   const current = resources.find((resource) => (
     isRecord(resource)
       && resource.kind === "controller"
       && resource.state === "current"
-      && resource.yuiHome === home
+      && resource.yuiHome === resolvedHome
   ));
   const processes = isRecord(current) && Array.isArray(current.processes)
     ? current.processes
     : [];
   const processInfo = processes.find((value) => isRecord(value));
-  if (!isRecord(processInfo)) return { running: false };
-  const executablePath = processInfo.command;
-  const args = processInfo.args;
-  // The inventory intentionally redacts command/argument vectors. For the
-  // current install, the running Controller is launched from this same
-  // executable/entrypoint, so use that explicit identity rather than treating
-  // a live Controller as un-restorable or silently switching to the staged one.
-  const identity = typeof executablePath === "string"
-    && executablePath.length > 0
-    && Array.isArray(args)
-    && args.every((arg) => typeof arg === "string")
-    ? {
-        executablePath,
-        args: args as string[],
-        version: YUI_VERSION
-      }
-    : currentControllerIdentity();
+  if (!isRecord(processInfo)) {
+    if (current !== undefined) {
+      throw new Error(
+        "Controller inventory is current but has no process proof; treating ownership as unknown-active."
+      );
+    }
+    return proveControllerAbsent(home, environment, spawn);
+  }
+  const identity = parseControllerIdentity(
+    runControllerCommand(home, environment, spawn, "identity")
+  );
   return {
     running: true,
-    ...(typeof processInfo.pid === "number" ? { pid: processInfo.pid } : {}),
+    ...(isPositivePid(processInfo.pid) ? { pid: processInfo.pid } : {}),
     identity
   };
 }
 
-function currentControllerIdentity(): ControllerIdentity {
-  return {
-    executablePath: process.execPath,
-    args: [fileURLToPath(new URL("../controller/controllerMain.js", import.meta.url))],
-    version: YUI_VERSION
-  };
+function proveControllerAbsent(
+  home: string,
+  environment: NodeJS.ProcessEnv,
+  spawn: UpdateSpawner
+): UpdateControllerLifecycleStatus {
+  try {
+    runControllerCommand(home, environment, spawn, "identity");
+  } catch (error) {
+    if (controllerErrorCode(error) === "CONTROLLER_NOT_RUNNING") {
+      return { running: false };
+    }
+    throw new Error(
+      `Controller absence could not be authenticated: ${messageOf(error)}`,
+      { cause: error }
+    );
+  }
+  throw new Error(
+    "Controller identity is reachable but inventory is currentless; treating ownership as unknown-active."
+  );
 }
 
 function stopControllerForUpdate(
@@ -335,35 +387,51 @@ function restoreControllerIdentity(
 ): void {
   const launchEnvironment = { ...environment, YUI_HOME: home };
   // Spawn a detached child through a short-lived Node helper so the synchronous
-  // update process does not wait on the Controller event loop. No retry or sleep
-  // is hidden here; the status command below is the single post-launch proof.
+  // update process can still use the authenticated, bounded readiness handshake
+  // shared by Controller startup. No retry, sleep, or new identity inference is
+  // hidden here.
   const helper = [
     "const { spawn } = require('node:child_process');",
     "const values = process.argv.slice(1);",
     "const env = JSON.parse(values.pop());",
-    "const executable = values.shift();",
-    "const child = spawn(executable, values, { detached: true, stdio: 'ignore', env });",
-    "child.unref();"
+    "const version = values.pop();",
+    "const args = JSON.parse(values.pop());",
+    "const executable = values.pop();",
+    "const home = values.pop();",
+    "const runtimeModule = values.pop();",
+    "(async () => {",
+    "  const { ensureFileTaskControllerIdentity } = await import(runtimeModule);",
+    "  await ensureFileTaskControllerIdentity(home, { executablePath: executable, args, version }, {",
+    "    environment: env,",
+    "    spawnController: (_home, launchEnv) => {",
+    "      const child = spawn(executable, args, { detached: true, stdio: 'ignore', env: launchEnv });",
+    "      child.unref();",
+    "    }",
+    "  });",
+    "})().catch((error) => { process.stderr.write(String(error?.stack || error)); process.exitCode = 1; });"
   ].join(" ");
   const result = spawn(
     process.execPath,
-    ["-e", helper, identity.executablePath, ...identity.args, JSON.stringify(launchEnvironment)],
-    { cwd: process.cwd(), env: launchEnvironment, shell: false, stdio: "ignore" }
+    [
+      "-e",
+      helper,
+      UPDATE_CLIENT_RUNTIME_PATH,
+      home,
+      identity.executablePath,
+      JSON.stringify(identity.args),
+      identity.version,
+      JSON.stringify(launchEnvironment)
+    ],
+    { cwd: process.cwd(), env: launchEnvironment, shell: false, stdio: "pipe" }
   );
   assertSpawnOk(result, "restore the previously running Controller identity");
-  const status = readControllerLifecycle(home, environment, spawn);
-  if (!status.running || status.identity?.version !== identity.version) {
-    throw new Error(
-      `Restored Controller identity was not confirmed (expected version ${identity.version}).`
-    );
-  }
 }
 
 function runControllerCommand(
   home: string,
   environment: NodeJS.ProcessEnv,
   spawn: UpdateSpawner,
-  method: "status"
+  method: "status" | "identity"
 ): Record<string, unknown> {
   const result = spawn(
     process.execPath,
@@ -371,13 +439,60 @@ function runControllerCommand(
     { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
   );
   if (result.error !== undefined || result.status !== 0) {
-    throw new Error(`Controller ${method} failed (exit ${result.status ?? "null"}).`);
+    const error = new Error(`Controller ${method} failed (exit ${result.status ?? "null"}).`);
+    const code = controllerErrorCodeFromResult(result);
+    if (code !== undefined) Object.assign(error, { code });
+    throw error;
   }
   const parsed = JSON.parse(result.stdout.toString("utf8")) as unknown;
   if (!isRecord(parsed) || parsed.ok !== true || !isRecord(parsed.data)) {
     throw new Error(`Controller ${method} returned an invalid structured result.`);
   }
   return parsed.data;
+}
+
+function parseControllerIdentity(value: Record<string, unknown>): ControllerIdentity {
+  if (
+    typeof value.executablePath !== "string"
+    || value.executablePath.length === 0
+    || !Array.isArray(value.args)
+    || value.args.some((arg) => typeof arg !== "string")
+    || typeof value.version !== "string"
+    || value.version.length === 0
+  ) {
+    throw new Error(
+      "Authenticated Controller identity is malformed; treating ownership as unknown-active."
+    );
+  }
+  return {
+    executablePath: value.executablePath,
+    args: value.args as string[],
+    version: value.version
+  };
+}
+
+function controllerErrorCodeFromResult(result: SpawnSyncReturns<Buffer>): string | undefined {
+  for (const buffer of [result.stdout, result.stderr]) {
+    try {
+      const parsed = JSON.parse(buffer.toString("utf8")) as unknown;
+      if (isRecord(parsed) && typeof parsed.code === "string") return parsed.code;
+    } catch {
+      // The generic command failure below remains the structured blocker.
+    }
+  }
+  return undefined;
+}
+
+function controllerErrorCode(error: unknown): string | undefined {
+  return isRecord(error) && typeof error.code === "string" ? error.code : undefined;
+}
+
+function isPositivePid(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function runControllerCommandOutput(

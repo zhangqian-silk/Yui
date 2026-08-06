@@ -31,7 +31,6 @@
 import { spawn } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 
 import {
   describeReport,
@@ -43,11 +42,11 @@ import {
 import {
   stopFileTaskController,
   ensureFileTaskController,
+  ensureFileTaskControllerIdentity,
   type FileControllerClientOptions
 } from "../../controller/clientRuntime.js";
 import { callController } from "../../core/controllerClient.js";
 import { FileTaskStore, STORAGE_STATE_FILE, withStorageWriteLock } from "../taskStore.js";
-import { YUI_VERSION } from "../../version.js";
 import {
   clearUpgradeFence,
   placeUpgradeFence,
@@ -370,9 +369,18 @@ async function execute(
         classification
       );
     }
+    if (result === undefined && status!.running && !isControllerLaunchIdentity(status!.identity)) {
+      result = withClassification(
+        controllerLifecycleBlocker(
+          "Controller launch identity could not be authenticated",
+          new Error("executable/argv/version identity is unavailable")
+        ),
+        classification
+      );
+    }
     if (result === undefined) {
       controllerWasRunning = status!.running;
-      controllerIdentity = status!.identity;
+      controllerIdentity = status!.running ? status!.identity : undefined;
       controllerStopConfirmed = !controllerWasRunning;
     }
 
@@ -470,16 +478,9 @@ async function execute(
         // started. The old Controller is not safe to resume on the new Home.
         return {
           ...withClassification(
-            {
-              outcome: "blocked",
-              stage: "post-verify",
-              message:
-                `Storage activation and verification succeeded, but the new Controller `
-                + `could not start: ${messageOf(error)}.`,
-              action:
-                "Do not resume writes with the old Controller. Start the new Controller "
-                + "after resolving the startup failure, then verify with `yui doctor`."
-            },
+            postSwitchAmbiguity(home, result.backupPath, new Error(
+              `The replacement Controller could not start after the committed switch: ${messageOf(error)}`
+            )),
             classification
           ),
           report: result.report
@@ -606,7 +607,13 @@ function executeFenced(
       options.postSwitchFaultHook?.("post-verify");
       const postVerify = postSwitchHealthCheck(home);
       if (postVerify !== null) {
-        return { ...withClassification(postVerify, classification), report };
+        return {
+          ...withClassification(
+            postSwitchAmbiguity(home, report.switch.backupPath, new Error(postVerify.message)),
+            classification
+          ),
+          report
+        };
       }
       return {
         outcome: "upgraded",
@@ -934,12 +941,8 @@ async function defaultControllerStatus(
     raw = await call(home, "controller.status", {});
   } catch (error) {
     // ENOENT/CONTROLLER_NOT_RUNNING is the only definitive stopped fact. A
-    // transport timeout or invalid discovery is unknown and must block. The
-    // one compatibility exception is the real client's stale/invalid discovery
-    // file: a read-only runtime inspection can still prove a dead PID, while a
-    // live or undeterminable PID remains fail-closed. Explicit test/client call
-    // seams do not get this fallback, so an injected transport error cannot be
-    // silently reclassified as stopped.
+    // transport timeout or invalid discovery is unknown-active and must block;
+    // never infer a stopped Controller from a stale or malformed artifact.
     if (controllerErrorCode(error) === "CONTROLLER_NOT_RUNNING") {
       return { running: false };
     }
@@ -954,11 +957,12 @@ async function defaultControllerStatus(
   if (!isRecord(raw) || typeof raw.running !== "boolean") {
     throw new Error("Controller status response is invalid.");
   }
+  const identity = raw.running
+    ? await authenticatedControllerIdentity(home, call, raw)
+    : undefined;
   return {
     running: raw.running,
-    ...(raw.running
-      ? { identity: controllerIdentityFromStatus(raw) }
-      : {}),
+    ...(identity === undefined ? {} : { identity }),
     ...(isPositivePid(raw.pid) ? { pid: raw.pid } : {})
   };
 }
@@ -968,14 +972,11 @@ function controllerStatusFromRuntime(
   cause: unknown
 ): ControllerLifecycleStatus {
   const runtime = inspectHomeRuntime(home);
+  // A malformed/stale artifact is accepted as stopped only when the
+  // layout-agnostic runtime probe proves its named process is dead. Unknown or
+  // live discovery remains unknown-active; it never receives an inferred
+  // executable/argv/version identity.
   if (runtime.liveController === null) return { running: false };
-  if (runtime.liveController.state === "live") {
-    return {
-      running: true,
-      pid: runtime.liveController.pid,
-      identity: controllerIdentityFromStatus({})
-    };
-  }
   throw new Error(
     `Controller runtime discovery could not be resolved: ${messageOf(cause)}`,
     { cause }
@@ -1015,36 +1016,18 @@ async function restoreController(
   cause: unknown,
   identity: ControllerLaunchIdentity | undefined
 ): Promise<void> {
-  const restore = options.restoreController
-    ?? (options.startController === undefined
-      ? ((h: string, i: ControllerLaunchIdentity) => defaultRestoreController(
-          h,
-          i,
-          options.controllerOptions
-        ))
-      : ((h: string, _i: ControllerLaunchIdentity) => options.startController!(h)));
   if (identity === undefined) {
-    // Preserve the historical injected-test seam only when the caller supplied
-    // an explicit start function. Production/default paths never reach this
-    // branch: their authenticated status captures an identity, and their
-    // restore path refuses to invoke the staged/new ensure helper.
-    if (options.restoreController === undefined && options.startController !== undefined) {
-      try {
-        await options.startController(home);
-        return;
-      } catch (error) {
-        throw new Error(
-          `Storage upgrade failed and the previously running Controller could not be restored: `
-            + `${messageOf(error)}`,
-          { cause }
-        );
-      }
-    }
     throw new Error(
       "The previously running Controller identity was not captured; refusing to restore with a new executable.",
       { cause }
     );
   }
+  const restore = options.restoreController
+    ?? ((h: string, i: ControllerLaunchIdentity) => defaultRestoreController(
+      h,
+      i,
+      options.controllerOptions
+    ));
   try {
     await restore(home, identity);
   } catch (error) {
@@ -1056,42 +1039,44 @@ async function restoreController(
   }
 }
 
-function controllerIdentityFromStatus(raw: Record<string, unknown>): ControllerLaunchIdentity {
-  return {
-    executablePath: process.execPath,
-    args: [fileURLToPath(new URL("../../controller/controllerMain.js", import.meta.url))],
-    version: typeof raw.version === "string" && raw.version.length > 0
-      ? raw.version
-      : YUI_VERSION
-  };
+async function authenticatedControllerIdentity(
+  home: string,
+  call: typeof callController,
+  status: Record<string, unknown>
+): Promise<ControllerLaunchIdentity> {
+  const inline = status.identity;
+  if (isControllerLaunchIdentity(inline)) return inline;
+  const raw = await call(home, "controller.identity", {});
+  if (!isControllerLaunchIdentity(raw)) {
+    throw new Error(
+      "Authenticated Controller identity is unavailable; refusing to stop an un-restorable process."
+    );
+  }
+  if (typeof status.version === "string" && raw.version !== status.version) {
+    throw new Error(
+      `Controller identity version ${raw.version} does not match status version ${status.version}.`
+    );
+  }
+  return raw;
 }
 
-/** Start the exact captured process command and require one matching status proof. */
+/** Start the exact captured process command and await an authenticated readiness proof. */
 async function defaultRestoreController(
   home: string,
   identity: ControllerLaunchIdentity,
   controllerOptions: FileControllerClientOptions | undefined
 ): Promise<void> {
-  const environment = {
-    ...(controllerOptions?.environment ?? process.env),
-    YUI_HOME: home
-  };
-  const child = spawn(identity.executablePath, [...identity.args], {
-    env: environment,
-    detached: true,
-    stdio: "ignore"
+  await ensureFileTaskControllerIdentity(home, identity, {
+    ...(controllerOptions ?? {}),
+    spawnController: (_restoredHome, environment) => {
+      const child = spawn(identity.executablePath, [...identity.args], {
+        env: environment,
+        detached: true,
+        stdio: "ignore"
+      });
+      child.unref();
+    }
   });
-  child.unref();
-  const call = controllerOptions?.call ?? callController;
-  const status = await call(home, "controller.status", {});
-  if (!isRecord(status) || status.running !== true) {
-    throw new Error("Restored Controller did not report running:true.");
-  }
-  if (typeof status.version === "string" && status.version !== identity.version) {
-    throw new Error(
-      `Restored Controller version ${status.version} does not match ${identity.version}.`
-    );
-  }
 }
 
 function controllerErrorCode(error: unknown): string | undefined {
@@ -1100,6 +1085,16 @@ function controllerErrorCode(error: unknown): string | undefined {
 
 function isPositivePid(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function isControllerLaunchIdentity(value: unknown): value is ControllerLaunchIdentity {
+  return isRecord(value)
+    && typeof value.executablePath === "string"
+    && value.executablePath.length > 0
+    && Array.isArray(value.args)
+    && value.args.every((arg) => typeof arg === "string")
+    && typeof value.version === "string"
+    && value.version.length > 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
