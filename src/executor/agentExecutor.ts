@@ -729,7 +729,15 @@ export function validateRoleAgentSession(
   if (session.effective.agentId !== agentId || session.effective.adapterId !== session.adapterId) {
     throw new Error(`Role Agent session effective identity is inconsistent: ${agentId}.`);
   }
-  requireText(session.nativeSessionId, "Native session id");
+  // A restored opaque host may have no provider-native identity; its launch
+  // fence is still durable and exact recovery remains possible.
+  if (session.nativeSessionId === undefined) {
+    if (session.launchId === undefined) {
+      throw new Error("Role Agent session requires a native Session or launch id.");
+    }
+  } else {
+    requireText(session.nativeSessionId, "Native session id");
+  }
   if (session.launchId !== undefined) requireSafeIdentity(session.launchId, "Launch id");
   if (
     session.title !== undefined

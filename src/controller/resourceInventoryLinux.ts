@@ -29,6 +29,7 @@ import {
   type ControllerResourceInventory,
   type RuntimeArtifactFact,
   type RuntimeHomeFact,
+  type RuntimePaneFact,
   type RuntimeProcessFact,
   type RuntimeProcessKind,
   type RuntimeRoleFact
@@ -39,6 +40,8 @@ export type ControllerInventoryScanOptions = Readonly<{
   scope: ControllerInventoryScope;
   environment?: NodeJS.ProcessEnv;
   now?: () => Date;
+  /** Reuse the caller's one full pane inventory when already available. */
+  panes?: readonly RuntimePaneFact[];
 }>;
 
 type LinuxProcessStat = Readonly<{
@@ -79,9 +82,11 @@ export async function scanControllerResourceInventory(
     const tmuxSocketPath = join(tmpdir(), `tmux-${uid}`, yuiTmuxServerName(home));
     const tmuxArtifact = rawTmuxArtifacts.find(({ path }) => path === tmuxSocketPath);
     if (tmuxArtifact !== undefined) associatedArtifacts.add(tmuxArtifact.path);
-    const panes = tmuxArtifact?.active === true
-      ? inspectHomePanes(home, environment.YUI_TMUX_BIN ?? "tmux", warnings)
-      : [];
+    const panes = options.panes !== undefined
+      ? options.panes
+      : tmuxArtifact?.active === true
+        ? inspectHomePanes(home, environment.YUI_TMUX_BIN ?? "tmux", warnings)
+        : [];
     const discovery = await inspectDiscovery(home, matchingProcesses, activeSockets);
     if (
       discovery.status === "valid"

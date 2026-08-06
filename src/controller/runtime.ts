@@ -57,6 +57,7 @@ import {
   RuntimeLaunchCoordinator,
   type CoordinatedRuntimeLaunchRequest
 } from "./runtimeLaunchCoordinator.js";
+import { scanControllerResourceInventory } from "./resourceInventoryLinux.js";
 
 export type FileTaskControllerFactoryOptions = ControllerRuntimeOptions & Readonly<{
   store?: TaskStore;
@@ -130,7 +131,39 @@ export async function startFileTaskControllerRuntime(
     planner,
     tmux,
     agentProcessReadinessProbe,
-    { sessionHost, promptPush, launchCoordinator }
+    {
+      sessionHost,
+      promptPush,
+      launchCoordinator,
+      roleResourceInventory: async (panes) => {
+        const inventory = await scanControllerResourceInventory({
+          currentHome: home,
+          scope: "current",
+          panes,
+          ...(options.environment === undefined
+            ? {}
+            : { environment: options.environment })
+        });
+        return inventory.resources.flatMap((resource) => {
+          if (
+            resource.kind !== "agent-session"
+            || resource.owner.kind !== "task-role"
+          ) return [];
+          const active = resource.state === "running" || resource.state === "current";
+          return [{
+            taskId: resource.owner.taskId,
+            roleName: resource.owner.roleName,
+            resource: {
+              observedAt: inventory.observedAt,
+              active,
+              changed: active && resource.cpuTimeMs > 0,
+              cpuTimeMs: resource.cpuTimeMs,
+              rssBytes: resource.rssBytes
+            }
+          }];
+        });
+      }
+    }
   );
   const workspacePreparer = options.workspacePreparer
     ?? new FileTaskWorkspacePreparer(home, store);

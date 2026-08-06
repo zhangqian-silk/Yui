@@ -375,26 +375,48 @@ function matchesRecoverySessionFence(
   input: ExactAgentRunRecoveryInput
 ): boolean {
   const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
-  if (sessions === null) {
-    return input.nativeSessionId === undefined && input.launchId === undefined;
-  }
+  // Recovery must never proceed without a durable Session fence.  A missing
+  // nativeSessionId is supported for an opaque host, but its exact launchId
+  // is then the only identity that can fence the action.
+  if (sessions === null) return false;
   if (sessions.activeAgentId !== input.agentId) return false;
   const session = sessions.sessions[input.agentId];
-  if (input.nativeSessionId === undefined) {
-    if (session !== undefined) return false;
-  } else if (session?.nativeSessionId !== input.nativeSessionId) {
+  if (session === undefined) return false;
+  if (session.agentId !== input.agentId || session.adapterId !== input.adapterId) return false;
+  if (session.status === "stopped" || session.status === "broken") return false;
+
+  const sessionNativeSessionId = session.nativeSessionId;
+  if (sessionNativeSessionId === undefined) {
+    if (input.nativeSessionId !== undefined) return false;
+  } else if (input.nativeSessionId !== sessionNativeSessionId) {
     return false;
   }
-  if (input.launchId === undefined) {
-    return session?.launchId === undefined;
+
+  let launchMatches = false;
+  if (input.launchId !== undefined && session.launchId === input.launchId) {
+    launchMatches = true;
   }
-  if (session?.launchId === input.launchId) return true;
   const mailbox = store.getWorkMailbox(runtimeLifecycleTarget({
     scope: "task",
     taskId: input.taskId,
     roleName: input.roleName
   }));
-  return isRuntimeLaunchReservation(mailbox?.processing, input.launchId);
+  if (
+    !launchMatches
+    && input.launchId !== undefined
+    && isRuntimeLaunchReservation(mailbox?.processing, input.launchId)
+  ) {
+    launchMatches = true;
+  }
+
+  // An opaque Session has no native identity to compare, so an exact launch
+  // identity is mandatory.  Native Sessions may retain the older no-launch
+  // shape; their exact native identity remains a valid fence.
+  if (sessionNativeSessionId === undefined) return launchMatches;
+  if (input.nativeSessionId === undefined) return launchMatches;
+  return session.launchId === undefined
+    ? input.launchId === undefined || launchMatches
+    : launchMatches;
 }
 
 function hasRecoveryReason(value: string): boolean {

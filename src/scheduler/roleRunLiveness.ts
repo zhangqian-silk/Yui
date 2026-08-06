@@ -2,6 +2,7 @@ import {
   selectedSchedulerRoles,
   selectedSchedulerTasks,
   type SchedulerReconcileSelection,
+  type SchedulerRoleResourceEvidence,
   type SchedulerStorePort,
   type TmuxDeliveryPort
 } from "./ports.js";
@@ -25,7 +26,8 @@ export async function reconcileExitedRoleRuns(
   now: Date,
   selection?: SchedulerReconcileSelection,
   excludedRunRefs: ReadonlySet<string> = new Set(),
-  liveStatuses?: Map<string, RoleLiveStatus>
+  liveStatuses?: Map<string, RoleLiveStatus>,
+  resourceEvidence?: Map<string, SchedulerRoleResourceEvidence>
 ): Promise<string[]> {
   const failed: string[] = [];
   const candidates = selectedSchedulerTasks(store, selection).flatMap((task) => (
@@ -63,15 +65,29 @@ export async function reconcileExitedRoleRuns(
   // Build one complete provider inventory for every active Run, including
   // delivery-uncertain and completion-pending Runs. The stall phase reuses
   // this snapshot so one scheduler pass never probes the same pane twice.
-  const batchStatuses = liveStatuses !== undefined
+  const batchSnapshot = liveStatuses !== undefined
     && candidates.every(({ task, role }) => liveStatuses.has(`${task.id}\0${role.name}`))
-    ? liveStatuses
+    ? {
+        statuses: liveStatuses,
+        resources: resourceEvidence ?? new Map<string, SchedulerRoleResourceEvidence>()
+      }
     : await inspectRoleStatuses(delivery, candidates);
   if (liveStatuses !== undefined) {
-    for (const [key, status] of batchStatuses) liveStatuses.set(key, status);
+    for (const [key, status] of batchSnapshot.statuses) liveStatuses.set(key, status);
+  }
+  if (resourceEvidence !== undefined) {
+    for (const [key, resource] of batchSnapshot.resources) {
+      resourceEvidence.set(key, resource);
+      const candidate = candidates.find(({ task, role }) => (
+        `${task.id}\0${role.name}` === key
+      ));
+      if (candidate !== undefined) {
+        resourceEvidence.set(`${key}\0${candidate.run.id}`, resource);
+      }
+    }
   }
   for (const { task, role, run, session, inspection } of eligible) {
-      const status = batchStatuses.get(`${task.id}\0${role.name}`);
+      const status = batchSnapshot.statuses.get(`${task.id}\0${role.name}`);
       if (status === undefined) throw new Error("Role liveness snapshot is incomplete.");
       if (status === "present") continue;
 
@@ -117,12 +133,17 @@ type RoleRunCandidate = Readonly<{
   }>;
 }>;
 
+type RoleInventorySnapshot = Readonly<{
+  statuses: RoleLiveStatusSnapshot;
+  resources: ReadonlyMap<string, SchedulerRoleResourceEvidence>;
+}>;
+
 async function inspectRoleStatuses(
   delivery: Pick<TmuxDeliveryPort, "inspectRole" | "inspectRoles">,
   candidates: readonly RoleRunCandidate[]
-): Promise<RoleLiveStatusSnapshot> {
+): Promise<RoleInventorySnapshot> {
   if (delivery.inspectRoles !== undefined) {
-    return exactBatchStatuses(
+    return exactBatchInventory(
       await delivery.inspectRoles(candidates.map(({ inspection }) => inspection)),
       candidates
     );
@@ -134,31 +155,34 @@ async function inspectRoleStatuses(
       await delivery.inspectRole(candidate.inspection)
     ]);
   }
-  return new Map(entries);
+  return { statuses: new Map(entries), resources: new Map() };
 }
 
-function exactBatchStatuses(
+function exactBatchInventory(
   batch: readonly Readonly<{
     taskId: string;
     roleName: string;
     status: "present" | "absent";
+    resource?: SchedulerRoleResourceEvidence;
   }>[],
   candidates: readonly Readonly<{
     task: Readonly<{ id: string }>;
     role: Readonly<{ name: string }>;
   }>[]
-): Map<string, "present" | "absent"> {
+): RoleInventorySnapshot {
   const expected = new Set(candidates.map(({ task, role }) => `${task.id}\0${role.name}`));
   const statuses = new Map<string, "present" | "absent">();
+  const resources = new Map<string, SchedulerRoleResourceEvidence>();
   for (const entry of batch) {
     const key = `${entry.taskId}\0${entry.roleName}`;
     if (!expected.has(key) || statuses.has(key)) {
       throw new Error("Tmux Role batch liveness snapshot is invalid.");
     }
     statuses.set(key, entry.status);
+    if (entry.resource !== undefined) resources.set(key, entry.resource);
   }
   if (statuses.size !== expected.size) {
     throw new Error("Tmux Role batch liveness snapshot is incomplete.");
   }
-  return statuses;
+  return { statuses, resources };
 }

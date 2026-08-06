@@ -3,6 +3,7 @@ import {
   selectedSchedulerRoles,
   selectedSchedulerTasks,
   type SchedulerReconcileSelection,
+  type SchedulerRoleResourceEvidence,
   type SchedulerStorePort,
   type TmuxDeliveryPort
 } from "./ports.js";
@@ -61,17 +62,7 @@ export type RoleRunStallClassification =
 export type RoleRunProviderAcceptance = "accepted" | "rejected" | "ambiguous";
 
 /** Optional advisory process sample carried by one scheduler inventory pass. */
-export type RoleRunResourceEvidence = Readonly<{
-  observedAt: string;
-  /** Set by the inventory producer when one of the counters changed. */
-  changed?: boolean;
-  /** Explicit activity is still advisory and never advances durable progress. */
-  active?: boolean;
-  cpuTimeMs?: number;
-  rssBytes?: number;
-  ioReadBytes?: number;
-  ioWriteBytes?: number;
-}>;
+export type RoleRunResourceEvidence = SchedulerRoleResourceEvidence;
 
 export type RoleRunResourceEvidenceSnapshot = ReadonlyMap<
   string,
@@ -522,7 +513,8 @@ export async function reconcileStalledRoleRuns(
   selection?: SchedulerReconcileSelection,
   windowMs = DEFAULT_STALL_WINDOW_MS,
   liveStatuses?: RoleLiveStatusSnapshot,
-  resourceEvidence?: RoleRunResourceEvidenceSnapshot
+  resourceEvidence?: RoleRunResourceEvidenceSnapshot,
+  resourceSuppressionKeys?: Set<string>
 ): Promise<RoleRunStallResult[]> {
   // Dirty mailbox passes are intentionally not a second scheduler. Full
   // reconcile owns the all-active-Run scan; dirty passes may still route the
@@ -676,11 +668,13 @@ export async function reconcileStalledRoleRuns(
       windowMs,
       lastAttentionProgressAt: latestStallProgressAt(events, candidate.run.id)
     });
-    const resource = resourceForRun(
+    const resource = consumeResourceEvidence(
       resourceEvidence,
       candidate.task.id,
       candidate.role.name,
-      candidate.run.id
+      candidate.run.id,
+      progressAt,
+      resourceSuppressionKeys
     );
     const runAgentId = candidate.run.effective.agentId;
     const runAdapterId = candidate.run.effective.adapterId;
@@ -957,6 +951,26 @@ function resourceForRun(
   return snapshot.get(`${taskId}\0${roleName}\0${runId}`)
     ?? snapshot.get(`${taskId}\0${roleName}`)
     ?? snapshot.get(runId);
+}
+
+/** Consume at most one advisory sample for one Run/progress point. */
+function consumeResourceEvidence(
+  snapshot: RoleRunResourceEvidenceSnapshot | undefined,
+  taskId: string,
+  roleName: string,
+  runId: string,
+  progressAt: string,
+  suppressionKeys: Set<string> | undefined
+): RoleRunResourceEvidence | undefined {
+  const resource = resourceForRun(snapshot, taskId, roleName, runId);
+  if (resource === undefined || suppressionKeys === undefined) return resource;
+  if (resource.active !== true && resource.changed !== true) return resource;
+  const key = `${taskId}\0${roleName}\0${runId}\0${progressAt}`;
+  if (!suppressionKeys.has(key)) {
+    suppressionKeys.add(key);
+    return resource;
+  }
+  return { ...resource, active: false, changed: false };
 }
 
 function resourceEvidenceIsFresh(

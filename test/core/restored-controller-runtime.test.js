@@ -130,8 +130,19 @@ test("full controller liveness and stall phases reuse one Role inventory", async
   store.listRoles = () => [role];
   store.getRole = (_taskId, name) => name === role.name ? role : null;
   store.getActiveAgentRun = () => run;
+  store.getRoleSession = () => ({
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "native-1",
+    status: "running",
+    effective: run.effective
+  });
   store.listEvents = () => events;
-  store.recordRoleRunStall = () => "raised";
+  let stallRecords = 0;
+  store.recordRoleRunStall = () => {
+    stallRecords += 1;
+    return "raised";
+  };
   store.hasOpenInputRequest = () => false;
   store.getWorkMailbox = () => null;
   store.listPendingWakeups = () => [];
@@ -147,14 +158,49 @@ test("full controller liveness and stall phases reuse one Role inventory", async
       return inputs.map((input) => ({
         taskId: input.taskId,
         roleName: input.roleName,
-        status: "present"
+        status: "present",
+        resource: {
+          observedAt: new Date(31 * 60_000).toISOString(),
+          active: true,
+          changed: true,
+          cpuTimeMs: 20,
+          rssBytes: 4096
+        }
       }));
     }
   };
 
-  await runControllerSchedulerPass(store, delivery, new Date(31 * 60_000));
+  const resourceSuppressionKeys = new Set();
+  await runControllerSchedulerPass(
+    store,
+    delivery,
+    new Date(31 * 60_000),
+    undefined,
+    { kind: "full" },
+    true,
+    [],
+    undefined,
+    30 * 60_000,
+    resourceSuppressionKeys
+  );
   assert.equal(inventoryCalls, 1);
   assert.equal(singleInspections, 0);
+  assert.equal(stallRecords, 0);
+
+  // The same advisory sample cannot keep the same stale Run healthy forever.
+  await runControllerSchedulerPass(
+    store,
+    delivery,
+    new Date(31 * 60_000),
+    undefined,
+    { kind: "full" },
+    true,
+    [],
+    undefined,
+    30 * 60_000,
+    resourceSuppressionKeys
+  );
+  assert.equal(stallRecords, 1);
 });
 
 test("a due native Turn completion forgets the finalized Run preparation", async () => {

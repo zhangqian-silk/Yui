@@ -70,6 +70,25 @@ export type SchedulerRunProgress = Readonly<{
   evidence?: string;
 }>;
 
+/** One bounded advisory process sample carried by the full Role inventory. */
+export type SchedulerRoleResourceEvidence = Readonly<{
+  observedAt: string;
+  /** Set by the inventory producer when one of the counters changed. */
+  changed?: boolean;
+  /** Explicit activity is advisory and never advances durable progress. */
+  active?: boolean;
+  cpuTimeMs?: number;
+  rssBytes?: number;
+  ioReadBytes?: number;
+  ioWriteBytes?: number;
+}>;
+
+export type SchedulerRoleResourceEntry = Readonly<{
+  taskId: string;
+  roleName: string;
+  resource: SchedulerRoleResourceEvidence;
+}>;
+
 export type RoleRunProgressPersistence = Readonly<{
   taskId: string;
   roleName: string;
@@ -414,6 +433,7 @@ export interface TmuxDeliveryPort {
       taskId: string;
       roleName: string;
       status: "present" | "absent";
+      resource?: SchedulerRoleResourceEvidence;
     }>[]>;
   /** Retryable stale lifecycle cleanup for one exact Task Role pane. */
   stopRole?(taskId: string, roleName: string): Promise<boolean>;
