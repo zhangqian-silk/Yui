@@ -285,7 +285,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
             ...launchEnvironment
           },
           workspace: effectiveWorkspace,
-          profile: binding.config.profile
+          profile: binding.config.profile,
+          trustWorkspace: true
         })
       : undefined;
     if (codexConfig?.notify.status === "configured") {
@@ -345,6 +346,23 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     let session: SchedulerRoleSession | null;
     if (binding.adapterId === "codex") {
       args = addCodexSessionNotify(args, launchMode, this.#cliPath);
+      // A fresh Codex TUI has no provider event before its first prompt. Carry
+      // the exact Run input as the provider's positional launch prompt so it is
+      // submitted only after Codex completes startup; never race terminal bytes
+      // and Enter against TUI initialization.
+      if (owner.scope === "task" && input.runId !== undefined) {
+        if (managedRun === null || managedRun.status !== "active") {
+          throw new Error(`Managed Codex Run is no longer active: ${input.runId}.`);
+        }
+        args = addCodexLifecycleHooks(
+          args,
+          launchMode,
+          this.#cliPath
+        );
+        // End option parsing before the opaque prompt so a wakeup beginning
+        // with '-' can never be reinterpreted as a Codex CLI flag.
+        args.push("--", managedRun.input);
+      }
       session = launchMode === "resume"
         ? readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective)
         : null;
@@ -405,7 +423,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           ? {}
           : { YUI_LAUNCH_ID: input.launchId }),
         ...(input.runId === undefined ? {} : { YUI_RUN_ID: input.runId }),
-        ...(configured.adapterId !== "claude" || session === null
+        ...(session === null
           ? {}
           : { YUI_NATIVE_SESSION_ID: session.nativeSessionId })
       }
@@ -420,7 +438,10 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         ...(owner.scope === "task" ? { status: (role as TaskRole).status } : {})
       },
       launch: scopedLaunch,
-      session
+      session,
+      ...(binding.adapterId === "codex" && input.runId !== undefined
+        ? { initialPromptRunId: input.runId }
+        : {})
     };
   }
 
@@ -558,6 +579,12 @@ function ensureManagedClaudeLifecyclePlugin(home: string, cliPath: string): stri
     join(root, "hooks", "hooks.json"),
     `${JSON.stringify({
       hooks: {
+        // SessionStart proves the session exists (and, for source=startup,
+        // pre-input readiness); UserPromptSubmit is the exact provider-accepted
+        // fence; StopFailure is the terminal failure fact. All route to the same
+        // Yui-owned entrypoint, which parses by hook_event_name.
+        SessionStart: [{ hooks: [command] }],
+        UserPromptSubmit: [{ hooks: [command] }],
         StopFailure: [{ hooks: [command] }]
       }
     }, null, 2)}\n`
@@ -648,6 +675,41 @@ function addCodexSessionNotify(
   cliPath: string
 ): string[] {
   const managed = ["--config", codexSessionNotifyConfig(cliPath)];
+  if (mode === "new") return [...args, ...managed];
+  if (args.length < 2 || args.at(-2) !== "resume") {
+    throw new Error("Codex resume launch shape is invalid.");
+  }
+  return [...args.slice(0, -2), ...managed, ...args.slice(-2)];
+}
+
+/**
+ * Codex 0.145 discovers lifecycle hooks from its effective config. Keep Yui's
+ * two handlers invocation-local: this avoids mutating CODEX_HOME or the Task
+ * workspace, while the exact launch environment supplies the durable Run fence.
+ */
+function codexLifecycleHooksConfig(cliPath: string): string {
+  const command = [
+    shellQuote(canonicalPath(process.execPath)),
+    shellQuote(canonicalPath(cliPath)),
+    "internal",
+    "codex-hook"
+  ].join(" ");
+  const handler = `{hooks=[{type="command",command=${JSON.stringify(command)}}]}`;
+  return `hooks={SessionStart=[${handler}],UserPromptSubmit=[${handler}]}`;
+}
+
+function addCodexLifecycleHooks(
+  args: readonly string[],
+  mode: "new" | "resume",
+  cliPath: string
+): string[] {
+  // Session flags are Yui-owned and exact to this launch. Hook trust bypass is
+  // still explicit because these handlers execute a local command.
+  const managed = [
+    "--enable", "hooks",
+    "--config", codexLifecycleHooksConfig(cliPath),
+    "--dangerously-bypass-hook-trust"
+  ];
   if (mode === "new") return [...args, ...managed];
   if (args.length < 2 || args.at(-2) !== "resume") {
     throw new Error("Codex resume launch shape is invalid.");

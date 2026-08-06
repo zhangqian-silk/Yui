@@ -249,6 +249,7 @@ function checkAgent(agent: ConfiguredAgent, executor: CommandExecutor): DoctorCh
       status,
       detail: [
         `start resume interrupt nativeSession=${snapshot.lifecycle.nativeSessionDiscovery}`,
+        `preInputReady=${snapshot.lifecycle.preInputReadiness.status}`,
         `fields=${available}/${degraded}/${unavailable}`,
         ...snapshot.warnings.map((warning) => `warning=${warning}`)
       ].join(" ")

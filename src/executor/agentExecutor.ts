@@ -48,7 +48,6 @@ export type RoleAgentSession = {
 };
 
 type RoleSessionSetBase<TOwner extends RoleSessionOwner> = {
-  schemaVersion: 3;
   owner: TOwner;
   activeAgentId: string;
   sessions: Record<string, RoleAgentSession>;
@@ -60,15 +59,20 @@ export type TaskRoleInFlight = Readonly<{
   runId: string;
   receiptId: string;
   preparedAt: string;
+  /** Transport receipt observed; this does not prove provider acceptance. */
+  pushedAt?: string;
+  /** Exact provider acceptance boundary. */
   deliveredAt?: string;
 }>;
 
 export type GlobalRoleSessionSet = RoleSessionSetBase<GlobalRoleSessionOwner> & {
+  schemaVersion: 3;
   /** Immutable terminal native Sessions keyed by an opaque Yui reference. */
   history?: Record<string, RoleAgentSession>;
 };
 
 export type TaskRoleSessionSet = RoleSessionSetBase<TaskRoleSessionOwner> & {
+  schemaVersion: 4;
   /** Immutable terminal native Sessions superseded by a fresh effective launch. */
   history?: readonly RoleAgentSession[];
   inFlight: TaskRoleInFlight | null;
@@ -116,16 +120,16 @@ export function createRoleSessionSet(
   now: Date
 ): RoleSessionSet {
   const base = {
-    schemaVersion: 3 as const,
     owner: normalizeOwner(owner),
     activeAgentId: requireSafeIdentity(activeAgentId, "Active Agent id"),
     sessions: {},
     updatedAt: now.toISOString()
   };
   return owner.scope === "global"
-    ? base as GlobalRoleSessionSet
+    ? { ...base, schemaVersion: 3 } as GlobalRoleSessionSet
     : {
         ...base,
+        schemaVersion: 4,
         inFlight: null,
         pendingTurnCompletion: null
       } as TaskRoleSessionSet;
@@ -414,6 +418,27 @@ export function bindTaskRoleRun(
   return validateRoleSessionSet(updated);
 }
 
+export function markTaskRoleRunPushed(
+  set: TaskRoleSessionSet,
+  fence: TaskRoleRunFence,
+  pushedAt: Date
+): TaskRoleSessionSet {
+  validateRoleSessionSet(set);
+  assertTaskRoleSessionSet(set);
+  const inFlight = requireMatchingInFlight(set, fence);
+  if (inFlight.pushedAt !== undefined) return set;
+  const timestamp = requireDate(pushedAt, "Task Role Run pushedAt");
+  if (Date.parse(timestamp) < Date.parse(inFlight.preparedAt)) {
+    throw new Error("Task Role Run pushedAt must not be earlier than preparedAt.");
+  }
+  const updated: TaskRoleSessionSet = {
+    ...set,
+    inFlight: { ...inFlight, pushedAt: timestamp },
+    updatedAt: timestamp
+  };
+  return validateRoleSessionSet(updated);
+}
+
 export function markTaskRoleRunDelivered(
   set: TaskRoleSessionSet,
   fence: TaskRoleRunFence,
@@ -429,7 +454,11 @@ export function markTaskRoleRunDelivered(
   }
   const updated: TaskRoleSessionSet = {
     ...set,
-    inFlight: { ...inFlight, deliveredAt: timestamp },
+    inFlight: {
+      ...inFlight,
+      ...(inFlight.pushedAt === undefined ? { pushedAt: timestamp } : {}),
+      deliveredAt: timestamp
+    },
     updatedAt: timestamp
   };
   return validateRoleSessionSet(updated);
@@ -459,8 +488,8 @@ export function recordObservedTaskRoleCompletion(
   if (inFlight.agentId !== observed.agentId || inFlight.runId !== observed.runId) {
     throw new Error("Observed Turn Run does not match the in-flight Run.");
   }
-  if (inFlight.deliveredAt === undefined) {
-    throw new Error("Observed Turn Run must be delivered before completion is recorded.");
+  if (inFlight.pushedAt === undefined) {
+    throw new Error("Observed Turn Run must be pushed before completion is recorded.");
   }
   const updated: TaskRoleSessionSet = {
     ...set,
@@ -624,13 +653,15 @@ export function settleTaskRoleCompletion(
 }
 
 export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): TSet {
-  if (set.schemaVersion !== 3) throw new Error("Role session set schema version is invalid.");
   normalizeOwner(set.owner);
   requireSafeIdentity(set.activeAgentId, "Active Agent id");
   for (const [agentId, session] of Object.entries(set.sessions)) {
     validateRoleAgentSession(session, agentId);
   }
   if (set.owner.scope === "global") {
+    if (set.schemaVersion !== 3) {
+      throw new Error("Global Role session set schema version is invalid.");
+    }
     if (
       Object.hasOwn(set, "inFlight")
       || Object.hasOwn(set, "pendingTurnCompletion")
@@ -650,6 +681,9 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
       }
     }
   } else {
+    if (set.schemaVersion !== 4) {
+      throw new Error("Task Role session set schema version is invalid.");
+    }
     if (
       !Object.hasOwn(set, "inFlight")
       || !Object.hasOwn(set, "pendingTurnCompletion")
@@ -696,9 +730,9 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
       if (
         inFlight?.agentId !== pending.agentId
         || inFlight.runId !== pending.runId
-        || inFlight.deliveredAt === undefined
+        || inFlight.pushedAt === undefined
       ) {
-        throw new Error("Pending Turn completion must match a delivered in-flight Run.");
+        throw new Error("Pending Turn completion must match a pushed in-flight Run.");
       }
       const session = taskSet.sessions[pending.agentId];
       if (session === undefined) {
@@ -808,7 +842,7 @@ function requireMatchingInFlight(
 function validateTaskRoleInFlight(value: TaskRoleInFlight): TaskRoleInFlight {
   const fields = Object.keys(value);
   const unknown = fields.find(
-    (field) => !["agentId", "runId", "receiptId", "preparedAt", "deliveredAt"].includes(field)
+    (field) => !["agentId", "runId", "receiptId", "preparedAt", "pushedAt", "deliveredAt"].includes(field)
   );
   if (unknown !== undefined) {
     throw new Error(`Task Role in-flight Run has unknown field: ${unknown}.`);
@@ -819,6 +853,12 @@ function validateTaskRoleInFlight(value: TaskRoleInFlight): TaskRoleInFlight {
     }
   }
   const preparedAt = requirePersistedTimestamp(value.preparedAt, "Task Role Run preparedAt");
+  if (value.pushedAt !== undefined) {
+    const pushedAt = requirePersistedTimestamp(value.pushedAt, "Task Role Run pushedAt");
+    if (Date.parse(pushedAt) < Date.parse(preparedAt)) {
+      throw new Error("Task Role Run pushedAt must not be earlier than preparedAt.");
+    }
+  }
   if (value.deliveredAt !== undefined) {
     const deliveredAt = requirePersistedTimestamp(
       value.deliveredAt,
@@ -826,6 +866,9 @@ function validateTaskRoleInFlight(value: TaskRoleInFlight): TaskRoleInFlight {
     );
     if (Date.parse(deliveredAt) < Date.parse(preparedAt)) {
       throw new Error("Task Role Run deliveredAt must not be earlier than preparedAt.");
+    }
+    if (value.pushedAt === undefined) {
+      throw new Error("Task Role Run deliveredAt requires a prior pushedAt.");
     }
   }
   requireSafeIdentity(value.agentId, "Agent id");

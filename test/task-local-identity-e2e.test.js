@@ -249,7 +249,7 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   const resumedLeaderRun = store.getActiveAgentRun(primaryTask.id, "leader");
   assert.notEqual(resumedLeaderRun, null);
   let answerDeliveryStatus = "already-delivered";
-  if (resumedLeaderRun.deliveredAt === undefined) {
+  if (resumedLeaderRun.pushedAt === undefined) {
     const [answerDelivery] = await processActiveRoleRunDeliveries(
       scheduler,
       delivery,
@@ -410,7 +410,7 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
     );
     assert.equal(wake.status, "dispatched", JSON.stringify(wake));
     lifecycleControlRun = store.getActiveAgentRun(lifecycleTask.id, "leader");
-  } else if (lifecycleControlRun?.deliveredAt === undefined) {
+  } else if (lifecycleControlRun?.pushedAt === undefined) {
     const [deliveryResult] = await processActiveRoleRunDeliveries(
       scheduler,
       delivery,
@@ -451,7 +451,7 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   runCliJson(home, ["controller", "stop"]);
   const finalSettlementNow = new Date();
   let finalPrimaryControlRun = store.getActiveAgentRun(primaryTask.id, "leader");
-  if (finalPrimaryControlRun !== null && finalPrimaryControlRun.deliveredAt === undefined) {
+  if (finalPrimaryControlRun !== null && finalPrimaryControlRun.pushedAt === undefined) {
     const [deliveryResult] = await processActiveRoleRunDeliveries(
       scheduler,
       delivery,

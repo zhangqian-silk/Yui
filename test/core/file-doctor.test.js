@@ -87,6 +87,7 @@ test("FileTaskStore doctor reports schema, state, tools, and configured Agent ca
   assert.match(output, /tmux\s+ok\s+tmux: tmux 3\.4/);
   assert.match(output, /agent:codex:command\s+ok\s+command=codex-custom adapter=codex version=0\.144\.4/);
   assert.match(output, /agent:codex:capability\s+ok\s+start resume interrupt nativeSession=runtime/);
+  assert.match(output, /preInputReady=unsupported/);
   assert.deepEqual(calls, [
     ["git", ["--version"]],
     ["tmux", ["-V"]],

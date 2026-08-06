@@ -20,6 +20,8 @@ export type CodexConfigInspectionInput = Readonly<{
   environment?: NodeJS.ProcessEnv;
   workspace: string;
   profile?: string;
+  /** Include the exact invocation workspace as trusted, matching Yui's CLI override. */
+  trustWorkspace?: boolean;
   /** Test seam for the host-wide base config; production uses the Codex path. */
   systemConfigPath?: string;
   /** Test seam for managed defaults; production uses the Codex platform path. */
@@ -92,7 +94,12 @@ function inspectCodexConfigKeys(
       }
     })
   );
-  const projectPaths = projectConfigPaths(input.workspace, discovery);
+  const projectPaths = projectConfigPaths(
+    input.workspace,
+    input.trustWorkspace === true
+      ? withExactWorkspaceTrust(discovery, input.workspace)
+      : discovery
+  );
   const candidates = [
     ...discoveryPaths.map((path) => ({ path, keys })),
     ...projectPaths.map((path) => ({
@@ -126,6 +133,16 @@ function inspectCodexConfigKeys(
     }
   }
   return { developerInstructions, notify };
+}
+
+function withExactWorkspaceTrust(
+  discovery: ProjectDiscovery,
+  workspace: string
+): ProjectDiscovery {
+  return {
+    ...discovery,
+    trust: new Map([...discovery.trust, [resolve(workspace), "trusted" as const]])
+  };
 }
 
 function effectiveProjectDiscovery(layers: readonly ProjectDiscovery[]): ProjectDiscovery {

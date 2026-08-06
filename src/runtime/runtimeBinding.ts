@@ -11,6 +11,8 @@ export type RuntimeBinding = Readonly<{
   hostRef: string;
   /** True only when this lifecycle request created the external Role host. */
   hostCreated?: boolean;
+  /** Exact Task Run whose first prompt was submitted by process launch. */
+  initialPromptRunId?: string;
   nativeSessionId?: string;
 }>;
 
@@ -25,6 +27,9 @@ export function createRuntimeBinding(input: RuntimeBinding): RuntimeBinding {
     ...(input.hostCreated === undefined
       ? {}
       : { hostCreated: requireBoolean(input.hostCreated, "Runtime host-created flag") }),
+    ...(input.initialPromptRunId === undefined
+      ? {}
+      : { initialPromptRunId: requireSafeIdentity(input.initialPromptRunId, "Initial prompt Run id") }),
     ...(input.nativeSessionId === undefined
       ? {}
       : { nativeSessionId: requireText(input.nativeSessionId, "Native session id") })

@@ -167,7 +167,10 @@ test("the declarative catalog exposes exactly the lean public command surface", 
   const internal = ROOT_COMMAND.children.find((child) => child.name === "internal");
   assert.ok(internal);
   assert.equal(internal.hidden, true);
-  assert.deepEqual(internal.children.map((child) => child.name), ["session-notify", "claude-hook"]);
+  assert.deepEqual(
+    internal.children.map((child) => child.name),
+    ["session-notify", "claude-hook", "codex-hook"]
+  );
   const completion = ROOT_COMMAND.children.find((child) => child.name === "completion");
   assert.ok(completion);
   assert.equal(completion.children.find((child) => child.name === "candidates")?.hidden, true);
@@ -281,6 +284,9 @@ test("the canonical execution commands are callable while the redundant yield al
   const claudeHook = routeInvocation(["internal", "claude-hook"]);
   assert.equal(claudeHook.kind, "execute");
   assert.deepEqual(claudeHook.node.path, ["yui", "internal", "claude-hook"]);
+  const codexHook = routeInvocation(["internal", "codex-hook"]);
+  assert.equal(codexHook.kind, "execute");
+  assert.deepEqual(codexHook.node.path, ["yui", "internal", "codex-hook"]);
 
   const completion = routeInvocation([
     "completion", "candidates", "--shell", "zsh", "--index", "1", "--", "task"

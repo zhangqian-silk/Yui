@@ -3,8 +3,36 @@ import type {
   FileRuntimeEventInbox,
   RuntimeClaudeStopFailureEvent,
   RuntimeLifecycleEvent,
+  RuntimePromptAcceptedEvent,
+  RuntimeSessionLifecycleEvent,
   RuntimeTurnCompletedEvent
 } from "./runtimeEventInbox.js";
+
+export type TaskProviderSessionLifecycle = Readonly<{
+  eventId: string;
+  taskId: string;
+  roleName: string;
+  agentId: string;
+  adapterId: "codex" | "claude";
+  launchId: string;
+  nativeSessionId: string;
+  runId?: string;
+  sessionSource?: string;
+}>;
+
+export type TaskProviderPromptAccepted = Readonly<{
+  eventId: string;
+  taskId: string;
+  roleName: string;
+  agentId: string;
+  adapterId: "codex" | "claude";
+  launchId: string;
+  nativeSessionId: string;
+  runId: string;
+  receiptId: string;
+}>;
+
+export type ProviderLifecycleObservation = "applied" | "obsolete" | "deferred";
 
 export type TaskRuntimeTurnCompleted = Readonly<{
   eventId?: string;
@@ -83,6 +111,16 @@ export type RuntimeTurnEventObserver = Readonly<{
     }>,
     now?: Date
   ): unknown;
+  /** Folds a provider session-lifecycle fact through the canonical contract. */
+  observeProviderSessionLifecycle?(
+    input: TaskProviderSessionLifecycle,
+    now?: Date
+  ): ProviderLifecycleObservation;
+  /** Folds a provider prompt-acceptance fact; only this may advance delivered. */
+  observeProviderPromptAccepted?(
+    input: TaskProviderPromptAccepted,
+    now?: Date
+  ): ProviderLifecycleObservation;
 }>;
 
 export type RuntimeEventDrainFailure = Readonly<{
@@ -125,8 +163,20 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
             deferred.push(event);
             continue;
           }
-        } else {
+        } else if (event.type === "claude-stop-failure") {
           this.applyClaudeStopFailure(event, now);
+        } else if (event.type === "native-session-lifecycle") {
+          const outcome = this.applySessionLifecycle(event, now);
+          if (outcome === "deferred") {
+            deferred.push(event);
+            continue;
+          }
+        } else {
+          const outcome = this.applyPromptAccepted(event, now);
+          if (outcome === "deferred") {
+            deferred.push(event);
+            continue;
+          }
         }
         this.acknowledge(event.id, acknowledgedEventIds);
       } catch (error) {
@@ -134,6 +184,48 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       }
     }
     return { acknowledgedEventIds, deferred, failed };
+  }
+
+  private applySessionLifecycle(
+    event: RuntimeSessionLifecycleEvent,
+    now: Date
+  ): "applied" | "deferred" | "obsolete" {
+    const task = this.observer.getTask(event.taskId);
+    if (task === null || task.status !== "active") return "obsolete";
+    if (this.observer.observeProviderSessionLifecycle === undefined) return "obsolete";
+    const outcome = this.observer.observeProviderSessionLifecycle({
+      eventId: event.id,
+      taskId: event.taskId,
+      roleName: event.roleName,
+      agentId: event.agentId,
+      adapterId: event.adapterId,
+      launchId: event.launchId,
+      nativeSessionId: event.nativeSessionId,
+      ...(event.runId === undefined ? {} : { runId: event.runId }),
+      ...(event.sessionSource === undefined ? {} : { sessionSource: event.sessionSource })
+    }, now);
+    return outcome === "deferred" ? "deferred" : "applied";
+  }
+
+  private applyPromptAccepted(
+    event: RuntimePromptAcceptedEvent,
+    now: Date
+  ): "applied" | "deferred" | "obsolete" {
+    const task = this.observer.getTask(event.taskId);
+    if (task === null || task.status !== "active") return "obsolete";
+    if (this.observer.observeProviderPromptAccepted === undefined) return "obsolete";
+    const outcome = this.observer.observeProviderPromptAccepted({
+      eventId: event.id,
+      taskId: event.taskId,
+      roleName: event.roleName,
+      agentId: event.agentId,
+      adapterId: event.adapterId,
+      launchId: event.launchId,
+      nativeSessionId: event.nativeSessionId,
+      runId: event.runId,
+      receiptId: event.receiptId
+    }, now);
+    return outcome === "deferred" ? "deferred" : "applied";
   }
 
   private applyCodex(

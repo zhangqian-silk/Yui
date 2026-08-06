@@ -871,7 +871,7 @@ export const ROOT_COMMAND = buildNode({
       name: "internal",
       summary: "Internal Yui callbacks.",
       hidden: true,
-      sections: [{ id: "callbacks", title: "Callbacks", entries: ["session-notify", "claude-hook"] }],
+      sections: [{ id: "callbacks", title: "Callbacks", entries: ["session-notify", "claude-hook", "codex-hook"] }],
       children: [
         {
           name: "session-notify",
@@ -882,6 +882,11 @@ export const ROOT_COMMAND = buildNode({
           name: "claude-hook",
           summary: "Record a managed Claude StopFailure event from stdin.",
           usage: "yui internal claude-hook"
+        },
+        {
+          name: "codex-hook",
+          summary: "Record managed Codex provider lifecycle evidence from stdin.",
+          usage: "yui internal codex-hook"
         }
       ]
     }
