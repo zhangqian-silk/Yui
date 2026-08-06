@@ -35,8 +35,23 @@ test("the built-in reviewer delegates evidence-backed judgment without engineeri
   assert.match(reviewer.instructions, /reachable, material, actionable problems/i);
   assert.match(reviewer.instructions, /smallest sufficient correction/i);
   assert.match(reviewer.instructions, /speculative or extreme edge cases/i);
+  assert.match(reviewer.instructions, /ReviewRound-owned workspace/i);
+  assert.match(reviewer.instructions, /Never push, integrate, mutate Task state/i);
+  assert.match(reviewer.instructions, /full free-form report/i);
+  assert.match(reviewer.instructions, /checks actually run/i);
   assert.match(reviewer.instructions, /Leader, who decides/i);
-  assert.equal(reviewer.defaultAccess, "read");
+  assert.equal(reviewer.defaultAccess, "write");
+});
+
+test("normal development Profiles default to write scope while explorer stays explicit read-only", () => {
+  const profiles = Object.fromEntries(builtinAgentProfileInputs().map((profile) => [
+    profile.id,
+    profile
+  ]));
+  assert.equal(profiles.worker.defaultAccess, "write");
+  assert.equal(profiles.implementer.defaultAccess, "write");
+  assert.equal(profiles.reviewer.defaultAccess, "write");
+  assert.equal(profiles.explorer.defaultAccess, "read");
 });
 
 test("AgentProfile is versioned independently from Actor and has no workspace or session", () => {
@@ -128,7 +143,7 @@ test("a later conflict replaces the consumed Leader decision without adding anot
     projectId: "project-1",
     targetRef: "main",
     expectedHead: "a".repeat(40),
-    changeSetIds: ["change-1"]
+    changeSetIds: ["change-set-1"]
   }, now);
   const firstConflict = requireLeaderDecision(integration, {
     affectedPaths: ["first.ts"],

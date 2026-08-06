@@ -129,15 +129,18 @@ Choose before creating the WorkItem:
   credentials, user-owned independent Session, durable lifecycle, or repeated
   dispatches to a Task-bound Worker instance.
 
-Keep review execution separate from implementation. A reviewer Role uses a
-read-only Profile and native read-only Agent permission, and must not receive a
-writable WorkItem or reuse an implementation Role Session. A Claude reviewer
-uses native `dontAsk` mode with only `Read`, `Grep`, `Glob`, and
-`Bash(yui task run yield *)` pre-approved. Unapproved tools are denied while
-the exact Yui control-plane handoff remains available without a classifier or
-approval prompt. Do not enable editing tools, YOLO, or a writable permission
-mode for review. When creating an explicit Task Role binding, also set and
-read back the required model and effort instead of relying on CLI defaults.
+Keep review execution separate from implementation. A reviewer uses the single
+built-in write-capable `reviewer` Profile, but Yui grants that capability only
+inside a fresh ReviewRound-owned worktree created from the frozen Candidate
+commit. Never reuse the Candidate/Worker workspace or its implementation Role
+Session. Codex and Claude may use their normal configured full capability in
+that isolated worktree; the behavioral boundary forbids push, Integration,
+Task mutation, other workspaces, stable checkouts, and real YUI_HOME. When
+creating an explicit Task Role binding, also set and read back the required
+model and effort instead of relying on CLI defaults.
+Every managed reviewer must deliver through the current Run's exact
+`--summary-file -` yield command; a final response alone is not a durable
+handoff.
 
 A direct or native-subagent WorkItem is roleless. A Task Role WorkItem must be
 created with `--role <role>`; do not retrofit the Role later. Reuse a compatible
@@ -150,12 +153,12 @@ inspect the available Profiles:
 yui profile list
 ```
 
-Choose the Profile by the work's meaning. Use `explorer`, `reviewer`, or another
-read-only Profile for inspection and review. Use `implementer` for work expected
-to modify files or external state. Do not send an implementation brief to a
-read-only Worker and rely on that Worker to repair the routing mistake. If one
-WorkItem may write at any stage, use a write-capable Profile; split out a
-read-only investigation only when it is independently useful.
+Choose the Profile by the work's meaning. `worker`, `implementer`, and
+`reviewer` are write-capable by default; use `explorer` for explicit read-only
+inspection and `reviewer` only for ReviewRound isolation. Do not use the
+reviewer Profile as a general implementation Role. If one WorkItem may write at
+any stage, use a write-capable implementation Profile; split out a read-only
+investigation only when it is independently useful.
 
 ## Decompose
 
@@ -211,7 +214,7 @@ into the child brief:
 
 - WorkItem objective, acceptance criteria, dependencies, and context reads;
 - Profile revision, description, instructions, and required Skills;
-- access boundary and allowed workspace;
+- Profile read/write behavior intent and exact allowed workspace;
 - requested validation and evidence;
 - optional model and effort hints.
 
@@ -268,13 +271,17 @@ native Session configuration.
 Add a non-Leader Task Role without `--agent` so Yui copies the configured global
 Worker Role's complete bindings, regardless of the Task Role name. The Profile
 still defines portable behavior; Worker defines runtime Agent configuration.
-Before dispatch, inspect `task role show`; if Agent, model, effort, or permission
-settings are missing or inconsistent, do not dispatch or guess them.
+Before dispatch, inspect `task role show`; if Agent, model, effort, Profile, or
+workspace scope is missing or inconsistent, do not dispatch or guess it.
 
-Do not reconstruct Agent/model/effort or YOLO settings during execution. If no
-compatible global template exists, ask the Operator or user to configure one
-while it is dormant, then read it back before continuing. Provider permission
-bypass does not change the selected Profile's read/write boundary.
+Do not reconstruct Agent/model/effort or provider permission during execution.
+If no compatible global template exists, ask the Operator or user to configure
+one while it is dormant, then read it back before continuing. Every managed
+binding defaults to `permission.strategy=bypass`; a binding may instead choose
+provider `default` or any supported subset of native `configured` options.
+Project write authority remains a separate exact WorkItem or ReviewRound scope. Profile and Skill
+constrain behavior, and provider bypass never changes that boundary, including
+for an `explorer` Role whose Profile intent remains read-only.
 
 For meaningful concurrent-write risk, isolate the WorkItem before dispatch:
 
@@ -324,6 +331,11 @@ ReviewRounds, checks, and workspace through `task context`.
   new `task work review`, accept with an explicit rationale, or ask the user.
 - If the same ambiguity or external choice repeats, persist context and create
   an InputRequest instead of looping.
+- A Reviewer may leave an optional diagnostic commit. Route its SHA and
+  findings explicitly to the original Worker; never capture, integrate, accept,
+  or auto-merge the review workspace. After routing, use
+  `yui task work review cleanup <task>/<review-round>` or preserve it explicitly
+  for further diagnosis. Cleanup removes only the ReviewRound workspace.
 
 - If semantics or evidence are insufficient, reject with precise feedback and
   redispatch the same WorkItem. Keep the isolated workspace so the Worker can
@@ -374,17 +386,28 @@ For manual resolution, edit only the candidate worktree and finish the reported
 Git conflict before continuing. Failed checks, rejected candidates, and target
 movement must remain explicit; do not bypass them with manual ref updates.
 
-After acceptance and integration, clean terminal resources deliberately:
+Choose cleanup from the WorkItem's expected next use, not merely from a Run
+ending. If another iteration is imminent, retain the native process and
+worktree. For a longer pause with no active Run or pending delivery, release
+only the runtime; Yui preserves the native Session id and WorkItem worktree so
+the next dispatch can resume them:
+
+```sh
+yui task work cleanup <task>/<work> --runtime-only
+```
+
+After final acceptance and integration, clean terminal resources deliberately:
 
 ```sh
 yui task integration cleanup <integration-id>
-yui task work cleanup <work-id> --integrated
+yui task work cleanup <task>/<work> --integrated
 ```
 
 Use `--abandon` only for deliberate discard. Dirty worktrees remain available
-for capture or resolution. If the original execution Session cannot be
-resumed, surface the recovery decision to the user; do not silently discard
-its context by creating a replacement.
+for capture or resolution. Cleanup must never stop a Role already serving a
+newer WorkItem. If the original execution Session cannot be resumed, surface
+the recovery decision to the user; do not silently discard its context by
+creating a replacement.
 
 If a native Role Session disappears, run `yui task reconcile <task-id>`,
 inspect the Run and partial work, then retry only a confirmed failed Run:
@@ -412,25 +435,59 @@ resume the fixed Leader Session.
 
 Every wake is an active control Run. Before ending:
 
+- If you cannot finally determine success, failure, completeness, or the
+  correct disposition, do not guess, silently stop, or hide uncertainty behind
+  a success summary. Clearly label the checkpoint uncertain, incomplete,
+  blocked, or requiring Leader judgment.
+- Preserve the same complete checkpoint before either yield or an InputRequest.
+  When applicable, record exact Run, WorkItem, and native Session identity;
+  actions actually performed; changed paths and commit/worktree state; checks
+  actually run and their outcomes; provider, runtime, or permission errors;
+  the last confirmed lifecycle boundary; work not performed; unresolved
+  assumptions or decisions; residual risks; confidence; and bounded next
+  options.
+- Review Runs report findings, verification gaps, and limits. Use that evidence
+  to decide disposition as Leader; do not treat the review as acceptance.
+
 1. update the Brief checkpoint;
 2. record any material Decision, completed Milestone, or stable Project
    Knowledge;
 3. do exactly one of: complete the Task, create an InputRequest, or yield.
 
 ```sh
-yui task run yield <run-id> --summary "<current result or waiting state>"
+yui task run yield <run-id> --summary-file - <<'YUI_SUMMARY'
+<current result or waiting state>
+YUI_SUMMARY
 ```
+
+A Leader yield preserves immutable Run evidence only. It never implies Leader
+acceptance, WorkItem completion, ChangeSet capture, Integration, or Task
+completion. The exact yield command must be the final tool action. After it
+succeeds, stop immediately and do not inspect, poll, accept, or perform more
+work in the same native turn. If the exact yield is denied, do not retry,
+broaden permissions, use a wrapper, mutate Yui state, or invent delivery
+evidence; truthfully surface the blocker through the supported provider failure
+boundary. Do not add a fallback protocol.
 
 Always yield before waiting for delegated results. Leaving the Run active
 prevents queued results from waking the Leader.
 
 Complete only after required WorkItems are accepted, Role work is terminal,
 latest isolated results are integrated or deliberately abandoned, and user
-inputs are resolved:
+inputs are resolved. Task completion is a semantic boundary: it records the
+result and notifies the global Operator; it does not infer runtime cleanup or
+stop this Leader. Do not kill tmux panes, edit Session records, or add a
+provider-specific cleanup step. After completion succeeds, end the current
+Turn immediately so the Operator can perform the explicit archive boundary;
+do not stop or mutate the native Session yourself.
 
 ```sh
 yui task complete <task-id> --summary "<outcome, validation, and remaining risks>"
 ```
 
-Archiving is a separate user or Operator lifecycle action after managed
-worktrees are clean and explicitly disposed.
+Retire obsolete WorkItems with `yui task work retire <task>/<work> --summary
+"..."`, optionally using `--replacement`. If the current Role generation is
+unusable, reset it with `yui task role reset <task> <role> --reason "..."` and
+let Yui derive all runtime identities from durable state. Archiving is a
+separate global Operator lifecycle action. It performs the final Task-owned
+runtime and clean-worktree teardown, including this Leader.

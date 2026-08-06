@@ -8,15 +8,16 @@ import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import {
   createRoleSessionSet,
-  recordRoleAgentSession
+  resetTaskRoleSession
 } from "../../dist/executor/agentExecutor.js";
+import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { createInputRequest } from "../../dist/input/inputRequest.js";
 import {
   createGlobalRole,
   createRoleAgentBinding,
   updateRoleStatus
 } from "../../dist/role/role.js";
-import { createAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun, recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { updateWorkItemStatus } from "../../dist/workItem/workItem.js";
@@ -101,6 +102,31 @@ function dispatchTestRun(store, taskId, roleName, workItemId) {
   return run;
 }
 
+function recordResetSession(store, taskId, roleName) {
+  const role = store.getRole(taskId, roleName);
+  let sessions = createRoleSessionSet(
+    { scope: "task", taskId, roleName },
+    role.activeAgentId,
+    NOW
+  );
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: role.activeAgentId,
+    adapterId: role.agentBindings[role.activeAgentId].adapterId,
+    nativeSessionId: "native-unusable",
+    launchId: "launch-unusable",
+    policy: "fixed",
+    status: "running"
+  }, NOW);
+  sessions = resetTaskRoleSession(sessions, NOW);
+  store.saveTaskRoleSessionSet(sessions);
+  enqueueWork(
+    store,
+    { kind: "role-runtime", taskId, roleName },
+    "runtime-cleanup-required",
+    NOW
+  );
+}
+
 test("Task Role list uses one tmux snapshot and returns structured runtime summaries", (t) => {
   const { root, store, options, paneReads } = fixture(t);
   execute(["create", "Runtime status"], store, options);
@@ -169,6 +195,30 @@ test("Task Role status explains persisted and live state without capturing outpu
   assert.equal(result.data.role.nativeSession, null);
 });
 
+test("Task Role status separates live runtime from pending reset cleanup", (t) => {
+  const { store, options } = fixture(t);
+  execute(["create", "Inspect unusable Session"], store, options);
+  const task = store.listTasks()[0];
+  execute(["role", "add", task.id, "worker"], store, options);
+  execute(["activate", task.id], store, options);
+  recordResetSession(store, task.id, "worker");
+
+  const result = execute(["role", "status", task.id, "worker"], store, options);
+  assert.equal(result.data.role.tmux.state, "running");
+  assert.equal(result.data.role.health, "needs-attention");
+  assert.equal(result.data.role.runtimeCleanupPending, true);
+  assert.equal(result.data.role.freshLaunchAllowed, false);
+  assert.equal(result.data.role.nativeSession, null);
+  assert.match(result.output, /Runtime cleanup\s+pending/);
+  assert.match(result.output, /Fresh launch\s+blocked/);
+  assert.match(result.output, /tmux pane\s+running/);
+
+  const list = execute(["role", "list", task.id], store, options);
+  const listedWorker = list.data.roles.find((status) => status.roleName === "worker");
+  assert.equal(listedWorker.health, "needs-attention");
+  assert.equal(listedWorker.runtimeCleanupPending, true);
+});
+
 test("Task Role health distinguishes queued, orphaned delivered, and exited runtime states", (t) => {
   const { store, options } = fixture(t);
   execute(["create", "Health states"], store, options);
@@ -216,10 +266,19 @@ test("an open InputRequest blocks a healthy Leader and exposes only its count", 
   execute(["create", "Await user"], store, options);
   const task = store.listTasks()[0];
   execute(["role", "add", task.id, "worker"], store, options);
+  const origin = createAgentRun(
+    store.nextAgentRunId(task.id),
+    task.id,
+    "leader",
+    "new",
+    "Ask for input",
+    NOW
+  );
+  store.saveAgentRun(origin);
   const request = createInputRequest(
     store.nextInputRequestId(task.id),
     task.id,
-    { roleName: "leader", agentId: "codex", runId: "run-origin" },
+    { taskId: task.id, roleName: "leader", agentId: "codex", runId: origin.id },
     { question: "Choose the rollout?", choices: [], blockedRefs: [] },
     NOW
   );

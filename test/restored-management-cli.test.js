@@ -184,11 +184,12 @@ test("global Role enter defers launch compilation to the Controller and preserve
   assert.equal(store.sessions.get("reviewer").sessions.claude.nativeSessionId, "session-2");
 });
 
-test("global Role Agent settings support adapter-aware field patches and CLI-default clears", () => {
+test("global Role Agent settings support adapter-aware permission strategies", () => {
   const store = roleStore();
   runGlobalRoleCommand([
     "add", "reviewer", "--agent", "codex",
     "--model", "gpt-5.6-sol", "--effort", "high",
+    "--permission-strategy", "configured",
     "--sandbox", "workspace-write", "--approval", "on-request", "--search", "true"
   ], store);
 
@@ -196,7 +197,11 @@ test("global Role Agent settings support adapter-aware field patches and CLI-def
     adapterId: "codex",
     model: "gpt-5.6-sol",
     effort: "high",
-    permission: { sandbox: "workspace-write", approval: "on-request" },
+    permission: {
+      strategy: "configured",
+      sandbox: "workspace-write",
+      approval: "on-request"
+    },
     search: true
   });
   const launch = runGlobalRoleCommand(["enter", "reviewer"], store, { env: {} });
@@ -205,12 +210,13 @@ test("global Role Agent settings support adapter-aware field patches and CLI-def
 
   runGlobalRoleCommand([
     "update", "reviewer", "--agent", "codex",
-    "--model", "gpt-5.6-codex", "--clear-effort", "--clear-approval"
+    "--model", "gpt-5.6-codex", "--clear-effort",
+    "--permission-strategy", "default"
   ], store);
   assert.deepEqual(store.roles.get("reviewer").agentBindings.codex.config, {
     adapterId: "codex",
     model: "gpt-5.6-codex",
-    permission: { sandbox: "workspace-write" },
+    permission: { strategy: "default" },
     search: true
   });
 
@@ -220,12 +226,12 @@ test("global Role Agent settings support adapter-aware field patches and CLI-def
   assert.equal(store.roles.get("reviewer").activeAgentId, "codex");
   assert.deepEqual(store.roles.get("reviewer").agentBindings.claude.config, {
     adapterId: "claude",
-    model: "claude-opus"
+    model: "claude-opus",
+    permission: { strategy: "bypass" }
   });
 
   const output = runGlobalRoleCommand(["show", "reviewer"], store);
   assert.match(output, /gpt-5\.6-codex/);
-  assert.match(output, /workspace-write/);
   assert.match(output, /CLI default/);
   assert.doesNotMatch(output, /\{"adapterId"/);
 });

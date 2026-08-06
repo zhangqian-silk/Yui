@@ -25,6 +25,7 @@ import {
 } from "../../dist/controller/runtime.js";
 import { ControllerClientError } from "../../dist/core/controllerClient.js";
 import { FILE_TASK_CONTROLLER_PROTOCOL_VERSION } from "../../dist/core/protocol.js";
+import { YUI_VERSION } from "../../dist/version.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import {
   createGlobalRole,
@@ -32,12 +33,13 @@ import {
   createRoleAgentBinding,
   updateRole
 } from "../../dist/role/role.js";
-import { createAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun } from "../helpers/effectiveLaunch.js";
+import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import { repairOrphanedActiveTasks } from "../../dist/scheduler/activeTaskProgress.js";
 import { mergePendingWakeup } from "../../dist/scheduler/pendingWakeup.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
-import { activateTask, archiveTask, createTask } from "../../dist/task/task.js";
+import { activateTask, archiveTask, completeTask, createTask } from "../../dist/task/task.js";
 
 const FIRST = new Date("2026-07-24T00:00:00.000Z");
 const SECOND = new Date("2026-07-24T00:00:01.000Z");
@@ -54,9 +56,21 @@ test("storage writes reject a running Controller with an incompatible protocol",
       call: async () => ({
         running: true,
         pid: 43,
-        protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION
+        protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+        version: YUI_VERSION
       })
     })
+  );
+  await assert.rejects(
+    assertFileTaskControllerStorageCompatible("/tmp/yui-stale-controller", {
+      call: async () => ({
+        running: true,
+        pid: 44,
+        protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+        version: "0.2.9"
+      })
+    }),
+    /Controller version is incompatible.*controller restart/i
   );
   await assert.doesNotReject(
     assertFileTaskControllerStorageCompatible("/tmp/yui-no-controller", {
@@ -128,19 +142,28 @@ test("an active Role Run may launch from its snapshotted workspace", async (t) =
     updatedAt: FIRST.toISOString()
   };
   const run = createAgentRun(
-    "agent-run-workspace",
+    "agent-run-101",
     task.id,
     reviewer.name,
     "new",
     "Review the candidate.",
     FIRST,
-    { workspace }
+    {
+      workspace,
+      effective: resolveEffectiveLaunch({
+        role: reviewer,
+        purpose: "execution",
+        workspace
+      })
+    }
   );
   const target = { kind: "role", taskId: task.id, roleName: reviewer.name };
   store.transaction((tx) => {
     tx.saveRole(task.id, reviewer);
     tx.saveActiveAgentRun(run);
-    enqueueWork(tx, target, "review-requested", FIRST, [{ type: "run", id: run.id }]);
+    enqueueWork(tx, target, "review-requested", FIRST, [
+      { type: "run", taskId: task.id, id: run.id }
+    ]);
   });
   const starts = [];
   const sessionHost = {
@@ -229,7 +252,13 @@ test("a Role host created after Task archival is stopped without a false cleanup
     roleName: role.name
   });
   await startEntered;
-  store.saveTask(archiveTask(store.getTask(task.id), SECOND));
+  store.saveTask(archiveTask(
+    completeTask(store.getTask(task.id), FIRST, {
+      by: "leader",
+      summary: "Fixture complete."
+    }),
+    SECOND
+  ));
 
   releaseStart();
 
@@ -1077,82 +1106,6 @@ test("Controller restart default shutdown budget exceeds lifecycle request timeo
   });
 
   assert.deepEqual(result, { restarted: true, previousPid: 10, pid: 20 });
-});
-
-test("production runtime forwards readyRecoveryAgeMs into the Controller", async (t) => {
-  const { home, store, task, role } = fixture(t);
-  const schedulerStore = new FileSchedulerStoreAdapter(store);
-  const wakeup = schedulerStore.enqueueLeaderWakeup(
-    task.id,
-    "ready-recovery-age-test",
-    FIRST
-  );
-  const run = createAgentRun(
-    "agent-run-ready-age",
-    task.id,
-    role.name,
-    "new",
-    "finish the turn",
-    FIRST
-  );
-  const schedulerRole = schedulerStore.getRole(task.id, role.name);
-  assert.equal(schedulerStore.saveLeaderDispatch({
-    task,
-    role: schedulerRole,
-    run,
-    session: null,
-    wakeup,
-    now: FIRST
-  }), "claimed");
-  schedulerStore.saveRoleRunDelivery({
-    task,
-    role: schedulerRole,
-    run,
-    session: null,
-    now: FIRST
-  });
-  const recovered = [];
-  const recoverReadyRoleRun = schedulerStore.recoverReadyRoleRun.bind(schedulerStore);
-  schedulerStore.recoverReadyRoleRun = (input) => {
-    recovered.push(input);
-    return recoverReadyRoleRun(input);
-  };
-  const delivery = {
-    async stopTask() { return false; },
-    async inspectRole() { return "present"; },
-    async inspectRoleReadiness() { return "ready"; }
-  };
-  const sessionHost = {
-    async start() { throw new Error("unused"); },
-    async resume() { throw new Error("unused"); },
-    async stop() {},
-    async inspect() { return { state: "unavailable" }; }
-  };
-  const running = await startFileTaskControllerRuntime(home, {
-    store,
-    schedulerStore,
-    planner: {},
-    tmux: {},
-    delivery,
-    sessionHost,
-    promptPush: { async tryPush() { return "unavailable"; } },
-    workspacePreparer: {
-      async prepareTaskWorkspace() { return { taskId: task.id, status: "ready" }; },
-    },
-    runtimeEventProcessor: {
-      drain() {
-        return { appliedEventIds: [], acknowledgedEventIds: [], failed: [] };
-      }
-    },
-    intervalMs: 60_000,
-    readyRecoveryAgeMs: 10,
-    now: () => new Date(FIRST.getTime() + 1_000)
-  });
-  t.after(() => running.close());
-
-  await running.runtime.pump();
-
-  assert.deepEqual(recovered.map(({ runId }) => runId), [run.id]);
 });
 
 test("orphan recovery uses the store's atomic Leader enqueue operation", () => {

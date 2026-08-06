@@ -72,6 +72,20 @@ test("Codex notify writes an immutable event without waiting for FileTaskStore l
   assert.equal(statSync(eventPath).mode & 0o777, 0o600);
 });
 
+test("Codex notify persists a tool-only Turn with no final assistant message", async (t) => {
+  const { home, environment, payload } = fixture(t);
+
+  await runSessionNotifyCommand(payload(null), environment, async () => ({}));
+
+  const [event] = new FileRuntimeEventInbox(home).list();
+  assert.equal(event.nativeSessionId, "thread-native-1");
+  assert.equal(event.turnId, "turn-1");
+  assert.equal(
+    event.summary,
+    "Native Turn completed without a final assistant message."
+  );
+});
+
 test("a global Role Hook signals only its lifecycle lane", async (t) => {
   const { home, environment, payload } = fixture(t);
   const calls = [];

@@ -5,6 +5,7 @@ import {
   requireText,
   requireTimestamp
 } from "../domain/validation.js";
+import { validateTaskRecordReference } from "../task/taskRecordReference.js";
 import {
   normalizeCheckResult,
   type CheckResult
@@ -154,12 +155,17 @@ export function validateIntegrationAttempt(attempt: IntegrationAttempt): Integra
   if (attempt.schemaVersion !== 2) {
     throw new Error("IntegrationAttempt must use schemaVersion 2.");
   }
-  requireIdentity(attempt.id, "Integration Attempt id");
-  requireIdentity(attempt.taskId, "Task id");
+  validateTaskRecordReference({
+    taskId: attempt.taskId,
+    localId: attempt.id
+  }, "integrationAttempt");
   requireIdentity(attempt.projectId, "Project id");
   requireText(attempt.targetRef, "Integration target ref");
   requireCommit(attempt.expectedHead, "Integration expected head");
   normalizedUniqueIdentities(attempt.changeSetIds, "ChangeSet id");
+  for (const changeSetId of attempt.changeSetIds) {
+    validateTaskRecordReference({ taskId: attempt.taskId, localId: changeSetId }, "changeSet");
+  }
   normalizedUniqueText(attempt.checkCommands, "Integration check command");
   if (attempt.changeSetIds.length === 0) {
     throw new Error("IntegrationAttempt requires at least one ChangeSet.");

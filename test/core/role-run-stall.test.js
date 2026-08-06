@@ -66,7 +66,8 @@ test("an accepted Run past the candidate filter with recent progress is not stal
   const deliveredAt = new Date(NOW.getTime() - 20 * 60_000).toISOString();
   const store = stallStore({ createdAt: deliveredAt, deliveredAt });
   store.events.push(createTaskEvent(
-    "event-progress",
+    "event-1",
+    "task-1",
     "run.progress",
     { runId: "run-1", note: "tool output persisted" },
     new Date(NOW.getTime() - 60_000)
@@ -106,6 +107,7 @@ test("a live accepted Run raises one idempotent needs-attention event without a 
   // automatic retry or terminal Run mutation.
   store.events.push(createTaskEvent(
     "event-2",
+    "task-1",
     "run.progress",
     { runId: "run-1", note: "tool output persisted" },
     new Date("2026-08-05T01:05:00.000Z")
@@ -263,6 +265,7 @@ function stallStore(options = {}) {
       if (existing !== undefined) return "already-raised";
       this.events.push(createTaskEvent(
         `event-${this.events.length + 1}`,
+        this.tasks[0].id,
         "run.stalled",
         {
           runId: input.runId,

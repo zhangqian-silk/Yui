@@ -1,6 +1,8 @@
 import { createAgentRun } from "../run/agentRun.js";
 import { markYuiRunInput } from "../run/runIdentity.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
+import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
+import { effectiveLaunchSnapshotsCompatible } from "../executor/effectiveLaunch.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
 import { createLeaderRecoveryNotification } from "./operatorNotification.js";
 import type {
@@ -53,7 +55,7 @@ export async function processLeaderWakeups(
     }
 
     // This check deliberately precedes every tmux operation. A pending wake is
-    // durable state, not text that may be injected into a busy Agent composer.
+    // durable state, not text that may be injected into a busy Agent process.
     if (store.getActiveAgentRun(task.id, role.name) !== null) {
       results.push({ taskId: task.id, status: "skipped", reason: "busy" });
       continue;
@@ -64,15 +66,27 @@ export async function processLeaderWakeups(
       continue;
     }
 
-    const existingSession = store.getRoleSession(task.id, role.name);
+    const existingSession = store.getRoleSession(
+      task.id,
+      role.name,
+      role.effective.agentId
+    );
     let effectiveSession: SchedulerRoleSession | null = existingSession;
     let claimed = false;
     let deliveryAttempted = false;
     let run: ReturnType<typeof createAgentRun> | null = null;
     let prepared: PreparedRoleDelivery | undefined;
     try {
-      const mode = hasNativeSession(existingSession) ? "resume" : "new";
-      const runId = store.nextAgentRunId(task.id);
+      const compatibleSession = existingSession !== null
+        && effectiveLaunchSnapshotsCompatible(existingSession.effective, role.effective);
+      if (hasNativeSession(existingSession) && !compatibleSession
+        && existingSession.status !== "stopped" && existingSession.status !== "broken") {
+        throw new Error(
+          `Leader Session is incompatible with desired effective launch: ${task.id}/${role.name}.`
+        );
+      }
+      const mode = hasNativeSession(existingSession) && compatibleSession ? "resume" : "new";
+      const runId = store.peekNextAgentRunId(task.id);
       const input = markYuiRunInput(leaderWakeupInput(
         task.id,
         runId,
@@ -86,12 +100,7 @@ export async function processLeaderWakeups(
         input,
         now,
         {
-          agent: {
-            agentId: role.activeAgentId,
-            adapterId: role.adapterId,
-            ...(role.model === undefined ? {} : { model: role.model }),
-            ...(role.effort === undefined ? {} : { effort: role.effort })
-          }
+          effective: role.effective
         }
       );
       const claim = store.saveLeaderDispatch({
@@ -110,9 +119,10 @@ export async function processLeaderWakeups(
       prepared = await delivery.prepareRoleSession({
         taskId: task.id,
         roleName: role.name,
-        agentId: role.activeAgentId,
-        adapterId: role.adapterId,
-        workspace: role.workspace,
+        agentId: role.effective.agentId,
+        adapterId: role.effective.adapterId,
+        effective: role.effective,
+        workspace: role.effective.workspace.root,
         mode,
         runId: run.id,
         ...(mode === "resume" ? { nativeSessionId: existingSession!.nativeSessionId } : {})
@@ -131,7 +141,12 @@ export async function processLeaderWakeups(
         results.push({ taskId: task.id, status: "skipped", reason: "unavailable" });
         continue;
       }
-      effectiveSession = validateReadySession(role.activeAgentId, existingSession, mode, ready.session);
+      effectiveSession = validateReadySession(
+        run.effective,
+        existingSession,
+        mode,
+        ready.session
+      );
       store.saveRoleRunPrepared({
         task,
         role,
@@ -145,7 +160,7 @@ export async function processLeaderWakeups(
       deliveryAttempted = true;
       const outcome = await delivery.sendOnce({
         delivery: ready,
-        receiptId: `agent-run:${run.id}`,
+        receiptId: formatAgentRunReceiptId(task.id, run.id),
         text: input
       });
       if (outcome === "busy" || outcome === "unavailable") {
@@ -234,15 +249,18 @@ export async function processLeaderWakeups(
 }
 
 function validateReadySession(
-  activeAgentId: string,
+  effective: import("../executor/effectiveLaunch.js").EffectiveLaunchSnapshot,
   existing: SchedulerRoleSession | null,
   mode: "new" | "resume",
   session: SchedulerRoleSession | null
 ): SchedulerRoleSession | null {
   if (mode === "new" && session === null) return null;
   if (session === null) throw new Error("Leader resume returned no fixed native session.");
-  if (session.agentId !== activeAgentId) {
+  if (session.agentId !== effective.agentId || session.adapterId !== effective.adapterId) {
     throw new Error(`Ready session belongs to another Agent: ${session.agentId}.`);
+  }
+  if (!effectiveLaunchSnapshotsCompatible(session.effective, effective)) {
+    throw new Error("Ready Leader session effective snapshot changed.");
   }
   if (!hasNativeSession(session)) {
     throw new Error("Ready Leader session has no native session id.");
@@ -275,7 +293,7 @@ function leaderWakeupInput(
     `If the Task is Project-backed, read its catalog entry with yui project show <project> and inspect relevant Yui-maintained knowledge with yui project knowledge list <project> and yui project knowledge show <project> <knowledge>.`,
     "Use narrower Task message, WorkItem, decision, milestone, and input commands only when a specific record needs closer inspection.",
     `When the requested outcome is finished and there are no active Worker Runs or unresolved inputs, complete the Task with yui task complete ${taskId} --summary-file - and a quoted heredoc containing the final outcome and evidence.`,
-    `Before ending this turn, if the Task was not completed and no InputRequest terminalized this Run, release the active fence with yui task run yield ${runId} --summary-file - and a quoted heredoc containing the current result or waiting state. In particular, yield before waiting for Worker results; do not return to an idle composer while this Run remains active. The yield command must be the final tool action: after it succeeds, stop immediately and do not inspect, poll, accept, or perform further work in the same native turn.`
+    `Before ending this turn, if the Task was not completed and no InputRequest terminalized this Run, release the active fence with yui task run yield ${runId} --summary-file - and a quoted heredoc containing the current result or waiting state. In particular, yield before waiting for Worker results; do not end the native turn while this Run remains active. The yield command must be the final tool action: after it succeeds, stop immediately and do not inspect, poll, accept, or perform further work in the same native turn.`
   ];
   return lines.join("\n");
 }

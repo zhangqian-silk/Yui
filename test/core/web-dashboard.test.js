@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { get } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,10 +15,27 @@ import {
 
 const now = new Date("2026-07-23T08:00:00.000Z");
 
+function effectiveLaunch() {
+  return {
+    schemaVersion: 2,
+    sourceDesiredRevision: 2,
+    agentId: "codex",
+    adapterId: "codex",
+    model: "gpt-5.6-sol",
+    effort: "max",
+    profileAccess: "read",
+    search: false,
+    permission: { strategy: "configured", sandbox: "read-only", approval: "never" },
+    writeProjectIds: [],
+    workspace: { root: "/tasks/task-1", entries: [] },
+    context: {}
+  };
+}
+
 function fixtureStore() {
   const tasks = [
     {
-      schemaVersion: 2,
+      schemaVersion: 3,
       id: "task-1",
       title: "Ship web dashboard",
       description: "Make task state visible without replacing the CLI.",
@@ -34,7 +51,7 @@ function fixtureStore() {
       updatedAt: "2026-07-23T07:30:00.000Z"
     },
     {
-      schemaVersion: 2,
+      schemaVersion: 3,
       id: "task-2",
       title: "Document release",
       projectBindings: [],
@@ -78,7 +95,49 @@ function fixtureStore() {
       } : null;
     },
     listRoles(taskId) {
-      return taskId === "task-1" ? [{ name: "leader", status: "running", activeAgentId: "codex" }] : [];
+      return taskId === "task-1" ? [{
+        schemaVersion: 3,
+        taskId,
+        name: "leader",
+        status: "running",
+        launchRevision: 3,
+        defaultAccess: "write",
+        activeAgentId: "codex",
+        agentBindings: {
+          codex: {
+            agentId: "codex",
+            adapterId: "codex",
+            config: { adapterId: "codex", model: "gpt-5.6-sol", effort: "max" }
+          }
+        },
+        workspace: "/tasks/task-1",
+        createdAt: "2026-07-22T08:00:00.000Z",
+        updatedAt: "2026-07-23T07:30:00.000Z"
+      }] : [];
+    },
+    getTaskRoleSessionSet(taskId, roleName) {
+      return taskId === "task-1" && roleName === "leader" ? {
+        schemaVersion: 2,
+        owner: { scope: "task", taskId, roleName },
+        activeAgentId: "codex",
+        sessions: {
+          codex: {
+            schemaVersion: 3,
+            agentId: "codex",
+            adapterId: "codex",
+            nativeSessionId: "thread-1",
+            policy: "fixed",
+            effective: effectiveLaunch(),
+            status: "ready",
+            recentCompletedTurnIds: [],
+            createdAt: "2026-07-23T07:00:00.000Z",
+            updatedAt: "2026-07-23T07:30:00.000Z"
+          }
+        },
+        inFlight: null,
+        pendingTurnCompletion: null,
+        updatedAt: "2026-07-23T07:30:00.000Z"
+      } : null;
     },
     listWorkItems(taskId) {
       return taskId === "task-1" ? [
@@ -92,10 +151,30 @@ function fixtureStore() {
         taskId,
         roleName: "leader",
         mode: "resume",
+        purpose: "execution",
+        effective: effectiveLaunch(),
         input: "Finish the dashboard.",
         status: "yielded",
         summary: "Dashboard verified.",
         updatedAt: "2026-07-23T07:28:00.000Z"
+      }] : [];
+    },
+    listReviewRounds(taskId) {
+      return taskId === "task-1" ? [{
+        schemaVersion: 2,
+        id: "review-round-1",
+        taskId,
+        workItemId: "work-1",
+        candidateId: "candidate-1",
+        reviewerRoleName: "reviewer",
+        reviewBaseCommit: "a".repeat(40),
+        requestedBy: "leader",
+        status: "completed",
+        summary: "No material findings.",
+        checks: [{ name: "npm test", outcome: "passed" }],
+        evidenceCommit: "b".repeat(40),
+        createdAt: "2026-07-23T07:20:00.000Z",
+        endedAt: "2026-07-23T07:27:00.000Z"
       }] : [];
     },
     listInputRequests(taskId) {
@@ -225,10 +304,39 @@ test("dashboard API summarizes tasks and exposes one consolidated task detail", 
     assert.equal(dashboardResponse.headers.get("x-content-type-options"), "nosniff");
     const dashboard = await dashboardResponse.json();
     assert.equal(dashboard.generatedAt, now.toISOString());
-    assert.deepEqual(dashboard.counts, { total: 2, draft: 0, active: 1, completed: 1, archived: 0, openInputs: 1 });
+    assert.deepEqual(dashboard.counts, {
+      total: 2,
+      draft: 0,
+      active: 1,
+      completed: 1,
+      retired: 0,
+      archived: 0,
+      openInputs: 1
+    });
     assert.equal(dashboard.tasks[0].id, "task-1");
     assert.deepEqual(dashboard.tasks[0].projectNames, ["Yui Web"]);
-    assert.deepEqual(dashboard.tasks[0].workItems, { total: 2, pending: 1, running: 1, completed: 0, failed: 0 });
+    assert.deepEqual(dashboard.tasks[0].workItems, {
+      total: 2,
+      pending: 1,
+      running: 1,
+      awaiting_acceptance: 0,
+      completed: 0,
+      failed: 0,
+      retired: 0
+    });
+
+    // The redesigned cockpit reads a prioritized inbox rather than dragging
+    // every open input out of each individual task detail.
+    assert.deepEqual(dashboard.attention, [{
+      taskId: "task-1",
+      taskTitle: "Ship web dashboard",
+      request: {
+        id: "input-1",
+        status: "open",
+        question: "Choose a port",
+        createdAt: "2026-07-23T07:00:00.000Z"
+      }
+    }]);
 
     const detailResponse = await fetch(`${origin}/api/tasks/task-1`);
     assert.equal(detailResponse.status, 200);
@@ -238,8 +346,13 @@ test("dashboard API summarizes tasks and exposes one consolidated task detail", 
     assert.equal(detail.brief.objective, "Deliver the web dashboard.");
     assert.match(detail.brief.technicalApproach, /Task read model/);
     assert.equal(detail.roles[0].status, "running");
+    assert.equal(detail.roles[0].effectiveLaunch.sourceDesiredRevision, 2);
+    assert.equal(detail.roles[0].launchDrift, true);
     assert.equal(detail.openInputs[0].question, "Choose a port");
     assert.equal(detail.runs[0].summary, "Dashboard verified.");
+    assert.equal(detail.runs[0].effective.profileAccess, "read");
+    assert.equal(detail.reviewRounds[0].reviewBaseCommit, "a".repeat(40));
+    assert.equal(detail.reviewRounds[0].evidenceCommit, "b".repeat(40));
     assert.equal(detail.messages[0].author.roleName, "leader");
     assert.equal(detail.decisions[0].title, "Keep it read-only");
     assert.equal(detail.milestones[0].title, "Dashboard verified");
@@ -452,6 +565,7 @@ test("web shell composes modular i18n, theme, layout, and client assets", async 
 
     const assets = [
       ["/assets/css/tokens.css", "text/css"],
+      ["/assets/css/fonts.css", "text/css"],
       ["/assets/css/layout.css", "text/css"],
       ["/assets/css/components.css", "text/css"],
       ["/assets/css/responsive.css", "text/css"],
@@ -490,8 +604,78 @@ test("web shell composes modular i18n, theme, layout, and client assets", async 
         });
         assert.equal(checked.status, 0, checked.stderr);
       }
+
+      // The client must reflect the current view in the URL so the browser
+      // back/forward buttons stay inside the app instead of leaving the site.
+      const appSource = readFileSync(join(directory, "app.mjs"), "utf8");
+      assert.match(appSource, /history\.pushState/);
+      assert.match(appSource, /addEventListener\("popstate"/);
+      assert.match(appSource, /"task"/);
+      assert.match(appSource, /"filter"/);
+      assert.match(appSource, /"q"/);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+});
+
+test("redesigned web shell exposes importance-ordered nav and a registered theme set", async () => {
+  await withServer(async (origin) => {
+    const shell = await fetch(origin).then((response) => response.text());
+    // Breadcrumb + persistent section tabs replaced the old stacked sections.
+    assert.match(shell, /class="breadcrumb"/);
+    assert.match(shell, /id="detail-tabs"/);
+    for (const target of [
+      "detail-top",
+      "detail-focus",
+      "detail-work",
+      "detail-exec",
+      "detail-roles",
+      "detail-history",
+      "detail-messages"
+    ]) {
+      assert.match(shell, new RegExp(`data-target="${target}"`));
+    }
+    // Sidebar treats the Operator as a durable, first-class entry.
+    assert.match(shell, /class="operator-open"/);
+    assert.match(shell, /data-i18n="actions\.operator"/);
+    // Search widened to project / tags / IDs.
+    assert.match(shell, /data-i18n-placeholder="search\.placeholder"/);
+
+    const tokens = await fetch(`${origin}/assets/css/tokens.css`).then((response) => response.text());
+    for (const theme of ["control-room", "paper", "atlas"]) {
+      assert.match(tokens, new RegExp(`data-theme="${theme}"`));
+    }
+    const themeScript = await fetch(`${origin}/assets/js/theme.js`).then((response) => response.text());
+    for (const theme of ["control-room", "paper", "atlas"]) {
+      assert.match(themeScript, new RegExp(`"${theme}"`));
+    }
+
+    // Self-hosted fonts must ship as valid binary woff2 with long-lived caching,
+    // not as utf-8 text that would corrupt the font tables.
+    const fontCss = await fetch(`${origin}/assets/css/fonts.css`).then((response) => response.text());
+    assert.match(fontCss, /@font-face/);
+    assert.match(fontCss, /Inter/);
+    assert.match(fontCss, /JetBrains Mono/);
+    const font = await fetch(`${origin}/assets/fonts/inter-600.woff2`);
+    assert.equal(font.status, 200);
+    assert.match(font.headers.get("content-type"), /^font\/woff2/);
+    assert.match(font.headers.get("cache-control"), /immutable/);
+    const magic = Buffer.from(await font.arrayBuffer()).subarray(0, 4).toString("latin1");
+    assert.equal(magic, "wOF2");
+
+    const i18n = await fetch(`${origin}/assets/js/i18n.js`).then((response) => response.text());
+    const collect = (locale) => {
+      const start = i18n.indexOf(`"${locale}":`);
+      assert.notEqual(start, -1, `${locale} dictionary missing`);
+      const openBrace = i18n.indexOf("{", start);
+      const end = i18n.indexOf("\n  }", openBrace);
+      const body = i18n.slice(openBrace, end);
+      return new Set([...body.matchAll(/"([a-zA-Z0-9.\-]+)":\s*"/g)].map((entry) => entry[1]));
+    };
+    const en = collect("en");
+    const zh = collect("zh-CN");
+    assert.deepEqual([...zh].filter((key) => !en.has(key)), []);
+    assert.deepEqual([...en].filter((key) => !zh.has(key)), []);
   });
 });

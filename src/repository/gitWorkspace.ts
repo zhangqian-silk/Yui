@@ -21,11 +21,21 @@ export type PreparedGitWorktree = Readonly<{
 
 export type GitWorkspaceRemoval = "removed" | "missing" | "dirty";
 export type GitWorkspaceState = "missing" | "clean" | "dirty";
+export type GitWorkspaceRefresh = Readonly<{
+  fromCommit: string;
+  toCommit: string;
+  changed: boolean;
+}>;
 
 export interface GitWorkspacePort {
   inspect(repositoryPath: string, baseRef?: string): Promise<GitRepositoryInspection>;
   headRef(repositoryPath: string): Promise<string>;
   isClean(repositoryPath: string): Promise<boolean>;
+  refresh(input: Readonly<{
+    repositoryPath: string;
+    remoteUrl: string;
+    stableRef: string;
+  }>): Promise<GitWorkspaceRefresh>;
   clone(input: Readonly<{
     remoteUrl: string;
     destination: string;
@@ -72,6 +82,62 @@ export interface GitWorkspacePort {
 
 /** The small Git boundary used by project registration and Task workspaces. */
 export class NodeGitWorkspace implements GitWorkspacePort {
+  async refresh(input: Readonly<{
+    repositoryPath: string;
+    remoteUrl: string;
+    stableRef: string;
+  }>): Promise<GitWorkspaceRefresh> {
+    const remote = safeRemote(input.remoteUrl);
+    const configuredStableRef = await safeFetchBranch(input.stableRef);
+    const initial = await this.inspect(input.repositoryPath, "HEAD");
+    await this.#assertRefreshCheckout(
+      initial.root,
+      configuredStableRef,
+      initial.baseCommit
+    );
+    const stableBranch = configuredStableRef === "HEAD"
+      ? await resolveRemoteHeadBranch(remote)
+      : configuredStableRef;
+    if (stableBranch !== configuredStableRef) {
+      await this.#assertRefreshCheckout(initial.root, stableBranch, initial.baseCommit);
+    }
+
+    const stableRemoteRef = `refs/heads/${stableBranch}`;
+    await git(["-C", initial.root, "fetch", "--no-tags", remote, stableRemoteRef]);
+    const fetchedCommit = (await gitLine([
+      "-C", initial.root,
+      "rev-parse", "--verify", "--end-of-options", "FETCH_HEAD^{commit}"
+    ])).toLowerCase();
+
+    await this.#assertRefreshCheckout(initial.root, stableBranch, initial.baseCommit);
+    if (fetchedCommit === initial.baseCommit) {
+      return {
+        fromCommit: initial.baseCommit,
+        toCommit: fetchedCommit,
+        changed: false
+      };
+    }
+    if (!await gitSucceeds([
+      "-C", initial.root,
+      "merge-base", "--is-ancestor", initial.baseCommit, fetchedCommit
+    ])) {
+      throw new Error(
+        `Project checkout cannot be fast-forwarded from ${initial.baseCommit} to ${fetchedCommit}.`
+      );
+    }
+
+    await git([
+      "-C", initial.root,
+      "merge", "--ff-only", "--no-edit", fetchedCommit
+    ]);
+    await this.#assertRefreshCheckout(initial.root, stableBranch, fetchedCommit);
+    return {
+      fromCommit: initial.baseCommit,
+      toCommit: fetchedCommit,
+      changed: true
+    };
+  }
+
   async clone(input: Readonly<{
     remoteUrl: string;
     destination: string;
@@ -156,6 +222,29 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       "-C", root, "status", "--porcelain=v1", "--untracked-files=all"
     ]);
     return status.length === 0;
+  }
+
+  async #assertRefreshCheckout(
+    repositoryPath: string,
+    stableRef: string,
+    expectedCommit: string
+  ): Promise<void> {
+    if (stableRef !== "HEAD") {
+      const currentBranch = await this.headRef(repositoryPath);
+      if (currentBranch !== stableRef) {
+        const found = currentBranch === "HEAD" ? "detached HEAD" : currentBranch;
+        throw new Error(
+          `Project checkout must be on its stable branch: expected ${stableRef}, found ${found}.`
+        );
+      }
+    }
+    const head = await this.inspect(repositoryPath, "HEAD");
+    if (head.baseCommit !== expectedCommit) {
+      throw new Error("Project checkout changed while it was being refreshed.");
+    }
+    if (!await this.isClean(head.root)) {
+      throw new Error("Project checkout must be clean before it can be refreshed.");
+    }
   }
 
   async ensureWorktree(input: Readonly<{
@@ -496,6 +585,50 @@ function safeRef(value: string): string {
   const ref = requireText(value, "Git base ref");
   if (ref.startsWith("-") || /[\r\n]/.test(ref)) throw new Error("Git base ref is invalid.");
   return ref;
+}
+
+async function safeFetchBranch(value: string): Promise<string> {
+  const configuredRef = safeRef(value);
+  if (configuredRef === "HEAD") return configuredRef;
+  const branchPrefix = "refs/heads/";
+  const branch = configuredRef.startsWith(branchPrefix)
+    ? configuredRef.slice(branchPrefix.length)
+    : configuredRef;
+  if (!await gitSucceeds(["check-ref-format", "--branch", branch])) {
+    throw new Error("Git stable branch is invalid.");
+  }
+  return branch;
+}
+
+async function resolveRemoteHeadBranch(remote: string): Promise<string> {
+  let output: string;
+  try {
+    output = await git(["ls-remote", "--symref", remote, "HEAD"]);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Git command failed.";
+    throw new Error(`Project remote HEAD could not be resolved: ${detail}`, { cause: error });
+  }
+
+  const symbolicLines = output.split("\n").filter((line) => line.startsWith("ref: "));
+  const prefix = "ref: refs/heads/";
+  const suffix = "\tHEAD";
+  const symbolic = symbolicLines.length === 1 ? symbolicLines[0]! : "";
+  if (!symbolic.startsWith(prefix) || !symbolic.endsWith(suffix)) {
+    throw invalidRemoteHead();
+  }
+  const branch = symbolic.slice(prefix.length, -suffix.length);
+  if (branch === "HEAD") throw invalidRemoteHead();
+  try {
+    return await safeFetchBranch(branch);
+  } catch {
+    throw invalidRemoteHead();
+  }
+}
+
+function invalidRemoteHead(): Error {
+  return new Error(
+    "Project remote HEAD must identify a valid symbolic branch under refs/heads/."
+  );
 }
 
 function safeRemote(value: string): string {

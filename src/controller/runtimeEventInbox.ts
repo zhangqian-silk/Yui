@@ -19,7 +19,8 @@ import {
 import { join } from "node:path";
 
 export const MAX_RUNTIME_TURN_SUMMARY_BYTES = 32 * 1024;
-export const MAX_RUNTIME_EVENT_FILE_BYTES = 256 * 1024;
+export const MAX_CLAUDE_HOOK_TEXT_BYTES = 4 * 1024 * 1024;
+export const MAX_RUNTIME_EVENT_FILE_BYTES = 16 * 1024 * 1024;
 
 const RUNTIME_EVENT_DIRECTORY = join("runtime", "inbox");
 const INVALID_RUNTIME_EVENT_DIRECTORY = join("runtime", "inbox-invalid");
@@ -44,30 +45,43 @@ export type RuntimeTurnCompletedEvent = Readonly<{
   id: string;
   type: "native-turn-completed";
   receivedAt: string;
-  scope: "task" | "global";
-  taskId?: string;
+}> & RuntimeTurnCompletedInput;
+
+type ClaudeEventEnvelope = Readonly<{
+  scope: "task";
+  taskId: string;
   roleName: string;
   agentId: string;
-  adapterId: "codex";
-  launchId?: string;
+  adapterId: "claude";
+  launchId: string;
   nativeSessionId: string;
-  turnId: string;
-  runId?: string;
-  title?: string;
-  summary: string;
+  runId: string;
 }>;
 
-export type RuntimeEventEnqueueResult = Readonly<{
-  event: RuntimeTurnCompletedEvent;
-  created: boolean;
+export type RuntimeClaudeStopFailureInput = ClaudeEventEnvelope & Readonly<{
+  error: string;
+  errorDetails?: string;
+  lastAssistantMessage?: string;
 }>;
+
+export type RuntimeClaudeStopFailureEvent = Readonly<{
+  schemaVersion: 1;
+  id: string;
+  type: "claude-stop-failure";
+  receivedAt: string;
+}> & RuntimeClaudeStopFailureInput;
+
+export type RuntimeLifecycleEvent =
+  | RuntimeTurnCompletedEvent
+  | RuntimeClaudeStopFailureEvent;
+
+export type RuntimeEventEnqueueResult<TEvent extends RuntimeLifecycleEvent = RuntimeLifecycleEvent> =
+  Readonly<{ event: TEvent; created: boolean }>;
 
 /**
- * Durable ingress for facts emitted by native Agent hooks.
- *
- * This inbox is intentionally independent from FileTaskStore and its lock.
- * Event files are immutable; consumers acknowledge them only after applying
- * the event to the authoritative aggregate.
+ * Durable ingress for facts emitted by native Agent hooks. It deliberately
+ * owns no FileTaskStore lock: immutable files are acknowledged only after the
+ * Controller commits their authoritative aggregate effect.
  */
 export class FileRuntimeEventInbox {
   private readonly directory: string;
@@ -79,15 +93,104 @@ export class FileRuntimeEventInbox {
     this.directory = join(home, RUNTIME_EVENT_DIRECTORY);
   }
 
-  enqueueTurnCompleted(input: RuntimeTurnCompletedInput): RuntimeEventEnqueueResult {
-    const normalized = normalizeInput(input);
-    const event = Object.freeze({
+  enqueueTurnCompleted(
+    input: RuntimeTurnCompletedInput
+  ): RuntimeEventEnqueueResult<RuntimeTurnCompletedEvent> {
+    const normalized = normalizeCodexInput(input);
+    return this.publish(Object.freeze({
       schemaVersion: 1,
-      id: runtimeTurnEventId(normalized),
+      id: runtimeEventId("native-turn-completed", normalized),
       type: "native-turn-completed",
       receivedAt: this.now().toISOString(),
       ...normalized
-    } satisfies RuntimeTurnCompletedEvent);
+    }));
+  }
+
+  enqueueClaudeStopFailure(
+    input: RuntimeClaudeStopFailureInput
+  ): RuntimeEventEnqueueResult<RuntimeClaudeStopFailureEvent> {
+    const normalized = normalizeClaudeStopFailureInput(input);
+    return this.publish(Object.freeze({
+      schemaVersion: 1,
+      id: runtimeEventId("claude-stop-failure", normalized),
+      type: "claude-stop-failure",
+      receivedAt: this.now().toISOString(),
+      ...normalized
+    }));
+  }
+
+  list(): RuntimeLifecycleEvent[] {
+    if (!existsSync(this.directory)) return [];
+    const events: RuntimeLifecycleEvent[] = [];
+    for (const name of readdirSync(this.directory).filter((entry) => entry.endsWith(".json"))) {
+      try {
+        const id = name.slice(0, -".json".length);
+        assertEventId(id);
+        const event = this.read(id);
+        if (event !== null) events.push(event);
+      } catch (error) {
+        if (!(error instanceof RuntimeEventInboxError)
+          || error.code !== "RUNTIME_EVENT_INVALID") {
+          throw error;
+        }
+        try {
+          this.quarantine(name);
+        } catch {
+          // One unreadable entry must not block independent durable events.
+        }
+      }
+    }
+    return events.sort((left, right) => (
+      left.receivedAt.localeCompare(right.receivedAt)
+      || left.id.localeCompare(right.id)
+    ));
+  }
+
+  read(id: string): RuntimeLifecycleEvent | null {
+    assertEventId(id);
+    const path = this.eventPath(id);
+    let metadata;
+    try {
+      metadata = lstatSync(path);
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) return null;
+      throw error;
+    }
+    if (
+      !metadata.isFile()
+      || (metadata.mode & 0o777) !== 0o600
+      || metadata.size > MAX_RUNTIME_EVENT_FILE_BYTES
+    ) {
+      throw invalidEvent(`Runtime event file is invalid: ${id}`);
+    }
+    let value: unknown;
+    try {
+      value = JSON.parse(readFileSync(path, "utf8"));
+    } catch {
+      throw invalidEvent(`Runtime event JSON is invalid: ${id}`);
+    }
+    const event = parseRuntimeEvent(value);
+    if (event.id !== id || runtimeEventId(event.type, event) !== id) {
+      throw invalidEvent(`Runtime event identity is invalid: ${id}`);
+    }
+    return event;
+  }
+
+  acknowledge(id: string): boolean {
+    assertEventId(id);
+    try {
+      unlinkSync(this.eventPath(id));
+      fsyncDirectory(this.directory);
+      return true;
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) return false;
+      throw error;
+    }
+  }
+
+  private publish<TEvent extends RuntimeLifecycleEvent>(
+    event: TEvent
+  ): RuntimeEventEnqueueResult<TEvent> {
     const content = `${JSON.stringify(event)}\n`;
     if (Buffer.byteLength(content, "utf8") > MAX_RUNTIME_EVENT_FILE_BYTES) {
       throw new RuntimeEventInboxError(
@@ -114,8 +217,6 @@ export class FileRuntimeEventInbox {
       closeSync(descriptor);
       descriptor = null;
       try {
-        // A hard link publishes the fully-written inode atomically and, unlike
-        // rename, can never replace an event already published by a retry.
         linkSync(temporary, target);
         unlinkSync(temporary);
         fsyncDirectory(this.directory);
@@ -123,8 +224,6 @@ export class FileRuntimeEventInbox {
       } catch (error) {
         if (!isNodeError(error, "EEXIST")) throw error;
         const existing = this.read(event.id);
-        // A consumer may acknowledge the existing file between link(EEXIST)
-        // and this read. That is safe: acknowledgement means it was applied.
         if (existing === null) return { event, created: false };
         if (!hasSameIdentity(existing, event)) {
           throw new RuntimeEventInboxError(
@@ -132,92 +231,11 @@ export class FileRuntimeEventInbox {
             `Runtime event id conflicts with an existing file: ${event.id}`
           );
         }
-        return { event: existing, created: false };
+        return { event: existing as TEvent, created: false };
       }
     } finally {
       if (descriptor !== null) closeSync(descriptor);
       rmSync(temporary, { force: true });
-    }
-  }
-
-  list(): RuntimeTurnCompletedEvent[] {
-    if (!existsSync(this.directory)) return [];
-    const events: RuntimeTurnCompletedEvent[] = [];
-    for (const name of readdirSync(this.directory).filter((entry) => entry.endsWith(".json"))) {
-      try {
-        const id = name.slice(0, -".json".length);
-        assertEventId(id);
-        const event = this.read(id);
-        if (event !== null) events.push(event);
-      } catch (error) {
-        if (
-          !(error instanceof RuntimeEventInboxError)
-          || error.code !== "RUNTIME_EVENT_INVALID"
-        ) {
-          throw error;
-        }
-        try {
-          this.quarantine(name);
-        } catch {
-          // Quarantine is best-effort. Leave the invalid entry in place without
-          // allowing it to block independent, readable Hook events.
-        }
-      }
-    }
-    return events.sort((left, right) => (
-        left.receivedAt.localeCompare(right.receivedAt)
-        || left.id.localeCompare(right.id)
-    ));
-  }
-
-  read(id: string): RuntimeTurnCompletedEvent | null {
-    assertEventId(id);
-    const path = this.eventPath(id);
-    let metadata;
-    try {
-      metadata = lstatSync(path);
-    } catch (error) {
-      if (isNodeError(error, "ENOENT")) return null;
-      throw error;
-    }
-    if (
-      !metadata.isFile()
-      || (metadata.mode & 0o777) !== 0o600
-      || metadata.size > MAX_RUNTIME_EVENT_FILE_BYTES
-    ) {
-      throw new RuntimeEventInboxError(
-        "RUNTIME_EVENT_INVALID",
-        `Runtime event file is invalid: ${id}`
-      );
-    }
-    let value: unknown;
-    try {
-      value = JSON.parse(readFileSync(path, "utf8"));
-    } catch {
-      throw new RuntimeEventInboxError(
-        "RUNTIME_EVENT_INVALID",
-        `Runtime event JSON is invalid: ${id}`
-      );
-    }
-    const event = parseRuntimeEvent(value);
-    if (event.id !== id || runtimeTurnEventId(event) !== id) {
-      throw new RuntimeEventInboxError(
-        "RUNTIME_EVENT_INVALID",
-        `Runtime event identity is invalid: ${id}`
-      );
-    }
-    return event;
-  }
-
-  acknowledge(id: string): boolean {
-    assertEventId(id);
-    try {
-      unlinkSync(this.eventPath(id));
-      fsyncDirectory(this.directory);
-      return true;
-    } catch (error) {
-      if (isNodeError(error, "ENOENT")) return false;
-      throw error;
     }
   }
 
@@ -254,10 +272,13 @@ export class RuntimeEventInboxError extends Error {
   }
 }
 
-function runtimeTurnEventId(input: RuntimeTurnCompletedInput): string {
-  const identity = JSON.stringify([
+function runtimeEventId(
+  type: RuntimeLifecycleEvent["type"],
+  input: RuntimeTurnCompletedInput | RuntimeClaudeStopFailureInput
+): string {
+  const common = [
     1,
-    "native-turn-completed",
+    type,
     input.scope,
     input.taskId ?? null,
     input.roleName,
@@ -265,44 +286,84 @@ function runtimeTurnEventId(input: RuntimeTurnCompletedInput): string {
     input.adapterId,
     input.launchId ?? null,
     input.nativeSessionId,
-    input.turnId,
+    "turnId" in input ? input.turnId : null,
     input.runId ?? null
-  ]);
-  return `turn-${createHash("sha256").update(identity).digest("hex")}`;
+  ];
+  return `turn-${createHash("sha256").update(JSON.stringify(common)).digest("hex")}`;
 }
 
-function normalizeInput(input: RuntimeTurnCompletedInput): RuntimeTurnCompletedInput {
+function normalizeCodexInput(input: RuntimeTurnCompletedInput): RuntimeTurnCompletedInput {
   const scope = input.scope;
-  if (scope !== "task" && scope !== "global") {
-    throw new RuntimeEventInboxError("RUNTIME_EVENT_INVALID", "Runtime event scope is invalid.");
-  }
-  if (typeof input.summary !== "string" || input.summary.includes("\0")) {
-    throw new RuntimeEventInboxError("RUNTIME_EVENT_INVALID", "Runtime event summary is invalid.");
-  }
+  if (scope !== "task" && scope !== "global") throw invalidEvent();
+  if (typeof input.summary !== "string" || input.summary.includes("\0")) throw invalidEvent();
   const common = {
     scope,
-    roleName: requireText(input.roleName, "Role name"),
-    agentId: requireText(input.agentId, "Agent id"),
+    roleName: requireIdentityText(input.roleName, "Role name"),
+    agentId: requireIdentityText(input.agentId, "Agent id"),
     adapterId: input.adapterId,
     ...(input.launchId === undefined
       ? {}
-      : { launchId: requireText(input.launchId, "Launch id") }),
-    nativeSessionId: requireText(input.nativeSessionId, "Native session id"),
-    turnId: requireText(input.turnId, "Turn id"),
-    ...(input.runId === undefined ? {} : { runId: requireText(input.runId, "Run id") }),
-    ...(input.title === undefined ? {} : { title: requireText(input.title, "Session title") }),
+      : { launchId: requireIdentityText(input.launchId, "Launch id") }),
+    nativeSessionId: requireIdentityText(input.nativeSessionId, "Native session id"),
+    turnId: requireIdentityText(input.turnId, "Turn id"),
+    ...(input.runId === undefined
+      ? {}
+      : { runId: requireIdentityText(input.runId, "Run id") }),
+    ...(input.title === undefined
+      ? {}
+      : { title: requireIdentityText(input.title, "Session title") }),
     summary: truncateUtf8(input.summary.trim(), MAX_RUNTIME_TURN_SUMMARY_BYTES)
   } as const;
-  if (common.adapterId !== "codex" || common.summary.length === 0) {
-    throw new RuntimeEventInboxError("RUNTIME_EVENT_INVALID", "Runtime event is invalid.");
-  }
+  if (common.adapterId !== "codex" || common.summary.length === 0) throw invalidEvent();
   return scope === "task"
-    ? { ...common, taskId: requireText(input.taskId, "Task id") }
+    ? { ...common, taskId: requireIdentityText(input.taskId, "Task id") }
     : common;
 }
 
-function parseRuntimeEvent(value: unknown): RuntimeTurnCompletedEvent {
+function normalizeClaudeEnvelope(input: ClaudeEventEnvelope): ClaudeEventEnvelope {
+  if (input.scope !== "task" || input.adapterId !== "claude") throw invalidEvent();
+  return {
+    scope: "task",
+    taskId: requireIdentityText(input.taskId, "Task id"),
+    roleName: requireIdentityText(input.roleName, "Role name"),
+    agentId: requireIdentityText(input.agentId, "Agent id"),
+    adapterId: "claude",
+    launchId: requireIdentityText(input.launchId, "Launch id"),
+    nativeSessionId: requireIdentityText(input.nativeSessionId, "Native session id"),
+    runId: requireIdentityText(input.runId, "Run id")
+  };
+}
+
+function normalizeClaudeStopFailureInput(
+  input: RuntimeClaudeStopFailureInput
+): RuntimeClaudeStopFailureInput {
+  return {
+    ...normalizeClaudeEnvelope(input),
+    error: requireLongText(input.error, "Claude failure error"),
+    ...(input.errorDetails === undefined
+      ? {}
+      : { errorDetails: requireLongText(input.errorDetails, "Claude failure details") }),
+    ...(input.lastAssistantMessage === undefined
+      ? {}
+      : {
+          lastAssistantMessage: requireLongText(
+            input.lastAssistantMessage,
+            "Claude failure last assistant message"
+          )
+        })
+  };
+}
+
+function parseRuntimeEvent(value: unknown): RuntimeLifecycleEvent {
   if (!isObject(value)) throw invalidEvent();
+  switch (value.type) {
+    case "native-turn-completed": return parseCodexEvent(value);
+    case "claude-stop-failure": return parseClaudeStopFailureEvent(value);
+    default: throw invalidEvent();
+  }
+}
+
+function parseCodexEvent(value: Record<string, any>): RuntimeTurnCompletedEvent {
   const scope = value.scope;
   const expected = scope === "task"
     ? [
@@ -319,17 +380,11 @@ function parseRuntimeEvent(value: unknown): RuntimeTurnCompletedEvent {
         ...(value.runId === undefined ? [] : ["runId"]),
         ...(value.title === undefined ? [] : ["title"])
       ];
-  if (
-    (scope !== "task" && scope !== "global")
+  if ((scope !== "task" && scope !== "global")
     || value.schemaVersion !== 1
-    || value.type !== "native-turn-completed"
-    || !hasExactKeys(value, expected)
-  ) {
-    throw invalidEvent();
-  }
-  const receivedAt = requireText(value.receivedAt, "Received at");
-  if (Number.isNaN(Date.parse(receivedAt))) throw invalidEvent();
-  const normalized = normalizeInput({
+    || !hasExactKeys(value, expected)) throw invalidEvent();
+  const receivedAt = requireTimestamp(value.receivedAt);
+  const normalized = normalizeCodexInput({
     scope,
     ...(scope === "task" ? { taskId: value.taskId } : {}),
     roleName: value.roleName,
@@ -341,23 +396,62 @@ function parseRuntimeEvent(value: unknown): RuntimeTurnCompletedEvent {
     ...(value.runId === undefined ? {} : { runId: value.runId }),
     ...(value.title === undefined ? {} : { title: value.title }),
     summary: value.summary
-  } as RuntimeTurnCompletedInput);
+  });
   return Object.freeze({
     schemaVersion: 1,
-    id: requireText(value.id, "Event id"),
+    id: requireIdentityText(value.id, "Event id"),
     type: "native-turn-completed",
     receivedAt,
     ...normalized
   });
 }
 
-function requireText(value: unknown, label: string): string {
+function parseClaudeStopFailureEvent(
+  value: Record<string, any>
+): RuntimeClaudeStopFailureEvent {
+  const expected = [
+    "schemaVersion", "id", "type", "receivedAt", "scope", "taskId", "roleName",
+    "agentId", "adapterId", "launchId", "nativeSessionId", "runId", "error",
+    ...(value.errorDetails === undefined ? [] : ["errorDetails"]),
+    ...(value.lastAssistantMessage === undefined ? [] : ["lastAssistantMessage"])
+  ];
+  if (value.schemaVersion !== 1 || !hasExactKeys(value, expected)) throw invalidEvent();
+  const normalized = normalizeClaudeStopFailureInput(value as RuntimeClaudeStopFailureInput);
+  return Object.freeze({
+    schemaVersion: 1,
+    id: requireIdentityText(value.id, "Event id"),
+    type: "claude-stop-failure",
+    receivedAt: requireTimestamp(value.receivedAt),
+    ...normalized
+  });
+}
+
+function requireIdentityText(value: unknown, label: string): string {
   if (typeof value !== "string" || value.includes("\0")) throw invalidEvent();
   const text = value.trim();
   if (text.length === 0 || text.length > 1_024) {
-    throw new RuntimeEventInboxError("RUNTIME_EVENT_INVALID", `${label} is invalid.`);
+    throw invalidEvent(`${label} is invalid.`);
   }
   return text;
+}
+
+function requireLongText(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.includes("\0") || value.trim().length === 0) {
+    throw invalidEvent(`${label} is required.`);
+  }
+  if (Buffer.byteLength(value, "utf8") > MAX_CLAUDE_HOOK_TEXT_BYTES) {
+    throw new RuntimeEventInboxError(
+      "RUNTIME_EVENT_TOO_LARGE",
+      `${label} exceeds the durable inbox limit.`
+    );
+  }
+  return value;
+}
+
+function requireTimestamp(value: unknown): string {
+  const timestamp = requireIdentityText(value, "Received at");
+  if (!Number.isFinite(Date.parse(timestamp))) throw invalidEvent();
+  return timestamp;
 }
 
 function truncateUtf8(value: string, maximumBytes: number): string {
@@ -385,16 +479,12 @@ function fsyncDirectory(directory: string): void {
 }
 
 function assertEventId(id: string): void {
-  if (!EVENT_ID_PATTERN.test(id)) {
-    throw new RuntimeEventInboxError("RUNTIME_EVENT_INVALID", "Runtime event id is invalid.");
-  }
+  if (!EVENT_ID_PATTERN.test(id)) throw invalidEvent("Runtime event id is invalid.");
 }
 
-function hasSameIdentity(
-  left: RuntimeTurnCompletedEvent,
-  right: RuntimeTurnCompletedEvent
-): boolean {
+function hasSameIdentity(left: RuntimeLifecycleEvent, right: RuntimeLifecycleEvent): boolean {
   return left.id === right.id
+    && left.type === right.type
     && left.scope === right.scope
     && left.taskId === right.taskId
     && left.roleName === right.roleName
@@ -402,8 +492,8 @@ function hasSameIdentity(
     && left.adapterId === right.adapterId
     && left.launchId === right.launchId
     && left.nativeSessionId === right.nativeSessionId
-    && left.turnId === right.turnId
-    && left.runId === right.runId;
+    && left.runId === right.runId
+    && (!("turnId" in left) || !("turnId" in right) || left.turnId === right.turnId);
 }
 
 function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
@@ -421,6 +511,6 @@ function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoExcepti
   return error instanceof Error && "code" in error && error.code === code;
 }
 
-function invalidEvent(): RuntimeEventInboxError {
-  return new RuntimeEventInboxError("RUNTIME_EVENT_INVALID", "Runtime event is invalid.");
+function invalidEvent(message = "Runtime event is invalid."): RuntimeEventInboxError {
+  return new RuntimeEventInboxError("RUNTIME_EVENT_INVALID", message);
 }

@@ -21,13 +21,13 @@ const elements = {
   filters: document.querySelector("#status-filters"),
   tasks: document.querySelector("#task-list"),
   detail: document.querySelector("#detail"),
+  mainCol: document.querySelector(".main-col"),
+  topbar: document.querySelector(".topbar"),
   detailBack: document.querySelector("#detail-back"),
+  detailTabs: document.querySelector("#detail-tabs"),
+  pageTitle: document.querySelector("#page-title"),
   toast: document.querySelector("#toast"),
   lastSync: document.querySelector("#last-sync"),
-  active: document.querySelector("#metric-active"),
-  inputs: document.querySelector("#metric-inputs"),
-  completed: document.querySelector("#metric-completed"),
-  total: document.querySelector("#metric-total"),
   terminalPanel: document.querySelector("#terminal-panel"),
   terminalHost: document.querySelector("#terminal-host"),
   terminalTitle: document.querySelector("#terminal-title"),
@@ -39,17 +39,63 @@ const token = document.querySelector('meta[name="yui-web-token"]').content;
 const state = {
   tasks: [],
   counts: null,
+  attention: [],
   generatedAt: null,
   filter: "all",
   query: "",
   selected: null,
   detail: null
 };
+const VALID_FILTERS = ["all", "active", "draft", "completed", "archived"];
 let terminalSession = null;
 let terminalStateKey = "terminal.closed";
 
 const i18n = createI18n(elements.locale);
 createThemeController(elements.theme);
+
+// --- URL / history ---------------------------------------------------------
+// Reflect the current view (selected task, status filter, search query) in the
+// query string so the browser back/forward buttons work and the page can be
+// deep-linked / refreshed without losing context.
+function readQuery() {
+  return new URLSearchParams(window.location.search);
+}
+
+function buildSearch(params) {
+  const entries = Array.from(params.entries()).filter(function (entry) {
+    return entry[1] !== "" && entry[1] !== null && entry[1] !== undefined;
+  });
+  if (!entries.length) return "";
+  return "?" + entries.map(function (entry) {
+    return encodeURIComponent(entry[0]) + "=" + encodeURIComponent(entry[1]);
+  }).join("&");
+}
+
+function applyUrl(params, options) {
+  const replace = options && options.replace;
+  const search = buildSearch(params);
+  const url = window.location.pathname + search + window.location.hash;
+  if (replace) {
+    history.replaceState({ task: params.get("task") || null }, "", url);
+  } else {
+    history.pushState({ task: params.get("task") || null }, "", url);
+  }
+}
+
+function urlTaskId() {
+  return readQuery().get("task") || null;
+}
+
+function syncUrlFromState(options) {
+  const params = readQuery();
+  if (state.selected) params.set("task", state.selected);
+  else params.delete("task");
+  if (state.filter && state.filter !== "all") params.set("filter", state.filter);
+  else params.delete("filter");
+  if (state.query) params.set("q", state.query);
+  else params.delete("q");
+  applyUrl(params, options);
+}
 
 function detailActions() {
   return {
@@ -59,11 +105,6 @@ function detailActions() {
 }
 
 function updateMetrics() {
-  const counts = state.counts;
-  elements.active.textContent = counts ? String(counts.active) : "—";
-  elements.inputs.textContent = counts ? String(counts.openInputs) : "—";
-  elements.completed.textContent = counts ? String(counts.completed) : "—";
-  elements.total.textContent = counts ? String(counts.total) : "—";
   elements.lastSync.textContent = state.generatedAt
     ? new Intl.DateTimeFormat(i18n.getLocale(), { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(state.generatedAt))
     : "—";
@@ -72,10 +113,23 @@ function updateMetrics() {
 function setDetailActive(active) {
   document.body.classList.toggle("detail-active", active);
   elements.detailBack.hidden = !active;
+  if (elements.detailTabs) elements.detailTabs.hidden = !active;
+  if (elements.pageTitle) {
+    if (active) {
+      elements.pageTitle.textContent = state.detail
+        ? state.detail.task.title
+        : (state.tasks.find(function (task) { return task.id === state.selected; }) || { title: "…" }).title;
+      elements.pageTitle.dataset.i18n = "";
+    } else {
+      elements.pageTitle.textContent = i18n.t("page.title");
+      elements.pageTitle.dataset.i18n = "page.title";
+    }
+  }
 }
 
 function showOverview() {
   renderOverview(elements.detail, state, i18n.t, i18n.getLocale(), selectTask);
+  elements.mainCol.scrollTop = 0;
 }
 
 function renderCurrentDetail() {
@@ -95,11 +149,59 @@ function renderCurrentDetail() {
 function renderDynamicContent() {
   renderFilters(elements.filters, state, i18n.t, function (filter) {
     state.filter = filter;
+    syncUrlFromState({ replace: false });
     renderDynamicContent();
   });
+  const savedTaskScroll = elements.tasks.scrollTop;
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
+  elements.tasks.scrollTop = savedTaskScroll;
+  const preserveScroll = state.detail !== null && elements.mainCol.scrollTop > 0;
+  const savedScrollTop = elements.mainCol.scrollTop;
   renderCurrentDetail();
+  if (preserveScroll) elements.mainCol.scrollTop = savedScrollTop;
+  syncTabHighlight();
   updateMetrics();
+  updateStickyOffsets();
+}
+
+function updateStickyOffsets() {
+  const root = document.documentElement;
+  if (elements.topbar) {
+    root.style.setProperty("--topbar-h", elements.topbar.offsetHeight + "px");
+  }
+  if (elements.detailTabs && !elements.detailTabs.hidden) {
+    root.style.setProperty("--tabs-h", elements.detailTabs.offsetHeight + "px");
+  }
+}
+
+function updateActiveTabFromScroll() {
+  if (!state.detail || !elements.detailTabs) return;
+  const tabs = Array.from(elements.detailTabs.querySelectorAll(".tab"));
+  if (!tabs.length) return;
+  const root = elements.mainCol;
+  const rootTop = root.getBoundingClientRect().top;
+  let activeId = tabs[0].dataset.target;
+  let bestTop = -Infinity;
+  tabs.forEach(function (tab) {
+    const id = tab.dataset.target;
+    if (!id) return;
+    const el = root.querySelector("#" + id);
+    if (!el) return;
+    const top = el.getBoundingClientRect().top - rootTop;
+    if (top <= 8 && top > bestTop) {
+      bestTop = top;
+      activeId = id;
+    }
+  });
+  tabs.forEach(function (tab) {
+    tab.classList.toggle("is-active", tab.dataset.target === activeId);
+  });
+}
+
+function syncTabHighlight() {
+  // Compute the active tab from the current scroll position. The module-level
+  // scroll listener keeps it in sync afterwards.
+  updateActiveTabFromScroll();
 }
 
 function showToast(message) {
@@ -112,8 +214,11 @@ function clearSelection() {
   state.selected = null;
   state.detail = null;
   setDetailActive(false);
+  syncUrlFromState({ replace: !urlTaskId() });
   showOverview();
+  const savedTaskScroll = elements.tasks.scrollTop;
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
+  elements.tasks.scrollTop = savedTaskScroll;
 }
 
 async function requestJson(path, options) {
@@ -138,19 +243,29 @@ async function requestJson(path, options) {
 async function loadTaskDetail(taskId, showLoading) {
   if (showLoading) {
     renderLoading(elements.detail, i18n.t, "loading.detail");
-    elements.detail.scrollTop = 0;
+    elements.mainCol.scrollTop = 0;
   }
+  const savedScrollTop = showLoading ? 0 : elements.mainCol.scrollTop;
   const detail = await requestJson("/api/tasks/" + encodeURIComponent(taskId));
   if (state.selected !== taskId) return;
   state.detail = detail;
   renderCurrentDetail();
+  elements.mainCol.scrollTop = savedScrollTop;
+  setDetailActive(true);
+  syncTabHighlight();
 }
 
 async function selectTask(taskId) {
   state.selected = taskId;
   state.detail = null;
+  // When the selection is driven by the URL (initial load or popstate), the
+  // URL already reflects the task id, so replace instead of pushing a
+  // duplicate history entry.
+  syncUrlFromState({ replace: state.selected === urlTaskId() });
   setDetailActive(true);
+  const savedTaskScroll = elements.tasks.scrollTop;
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
+  elements.tasks.scrollTop = savedTaskScroll;
   try {
     await loadTaskDetail(taskId, true);
   } catch {
@@ -194,18 +309,18 @@ async function refreshDashboard(options) {
     const dashboard = await requestJson("/api/dashboard");
     state.tasks = dashboard.tasks;
     state.counts = dashboard.counts;
+    state.attention = dashboard.attention || [];
     state.generatedAt = dashboard.generatedAt;
     if (state.selected && !state.tasks.some(function (task) { return task.id === state.selected; })) {
       clearSelection();
+    } else {
+      renderDynamicContent();
     }
-    renderDynamicContent();
     if (previousInputs !== null && dashboard.counts.openInputs > previousInputs) {
       showToast(i18n.t("input.new"));
     }
-    if (quiet && state.selected) {
-      try {
-        await loadTaskDetail(state.selected, false);
-      } catch {}
+    if (state.selected && !quiet) {
+      try { await loadTaskDetail(state.selected, false); } catch {}
     }
   } catch {
     if (!quiet) {
@@ -349,9 +464,27 @@ function openTerminal(target) {
   terminalSession = { terminal, socket, input, resizeObserver };
 }
 
+if (elements.detailTabs) {
+  elements.detailTabs.addEventListener("click", function (event) {
+    const tab = event.target && event.target.closest ? event.target.closest(".tab") : null;
+    if (!tab) return;
+    const targetId = tab.dataset.target;
+    if (!targetId || !elements.detail) return;
+    const section = elements.detail.querySelector("#" + targetId);
+    if (!section) return;
+    section.scrollIntoView({ behavior: "smooth", block: "start" });
+    elements.detailTabs.querySelectorAll(".tab").forEach(function (other) {
+      other.classList.toggle("is-active", other === tab);
+    });
+  });
+}
+
 elements.search.addEventListener("input", function () {
   state.query = elements.search.value;
+  syncUrlFromState({ replace: true });
+  const savedTaskScroll = elements.tasks.scrollTop;
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
+  elements.tasks.scrollTop = savedTaskScroll;
 });
 elements.refresh.addEventListener("click", function () { refreshDashboard(); });
 elements.operatorTerminal.addEventListener("click", function () {
@@ -370,17 +503,61 @@ document.addEventListener("keydown", function (event) {
     clearSelection();
     return;
   }
-  if (event.key.toLowerCase() === "r"
-    && !event.metaKey && !event.ctrlKey && !event.altKey
-    && !typing && !terminalPanelOpen()) {
+  if (typing) return;
+  if (event.key === "/") {
+    event.preventDefault();
+    elements.search.focus();
+    return;
+  }
+  if (event.key.toLowerCase() === "o" && !event.metaKey && !event.ctrlKey && !event.altKey) {
+    openTerminal({ scope: "global", roleName: "operator" });
+    return;
+  }
+  if (event.key.toLowerCase() === "r" && !event.metaKey && !event.ctrlKey && !event.altKey && !terminalPanelOpen()) {
     refreshDashboard();
   }
 });
+
+// Restore view state from the URL on load and on browser back/forward.
+function applyStateFromUrl() {
+  const params = readQuery();
+  const filter = params.get("filter");
+  if (filter && VALID_FILTERS.indexOf(filter) !== -1) {
+    state.filter = filter;
+  } else {
+    state.filter = "all";
+  }
+  const query = params.get("q");
+  state.query = query || "";
+  if (elements.search) elements.search.value = state.query;
+  const taskId = params.get("task");
+  if (taskId) {
+    selectTask(taskId);
+  } else {
+    state.selected = null;
+    state.detail = null;
+    setDetailActive(false);
+    showOverview();
+  }
+}
+
+window.addEventListener("popstate", function () {
+  applyStateFromUrl();
+});
+
 i18n.subscribe(function () {
   renderDynamicContent();
   if (terminalSession) setTerminalState(terminalStateKey);
+  if (!state.selected && elements.pageTitle) elements.pageTitle.textContent = i18n.t("page.title");
 });
 showOverview();
+
+// Scroll-spy: keep the detail tab bar in sync with the visible section.
+// Bound once on the scroll container; it reads tabs/sections from the live DOM
+// so it survives detail re-renders.
+elements.mainCol.addEventListener("scroll", updateActiveTabFromScroll, { passive: true });
+
+applyStateFromUrl();
 refreshDashboard();
 window.setInterval(function () { refreshDashboard({ quiet: true }); }, 5000);
 `;

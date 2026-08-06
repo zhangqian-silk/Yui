@@ -3,7 +3,8 @@ import {
   createInputRequestOperatorPresentation,
   createLeaderRecoveryOperatorPresentation,
   createLeaderStallOperatorPresentation,
-  type OperatorAttentionPresentation
+  createTaskTerminalOperatorPresentation,
+  type OperatorPresentation
 } from "../interaction/operatorPresentation.js";
 import type { OperatorNotification } from "./operatorNotification.js";
 import type {
@@ -21,11 +22,13 @@ type OperatorNotificationOutcome = Readonly<{
 
 export type OperatorInputNotificationResult =
   | (OperatorNotificationOutcome & Readonly<{ inputRequestId: string }>)
-  | (OperatorNotificationOutcome & Readonly<{ recoveryTaskId: string }>);
+  | (OperatorNotificationOutcome & Readonly<{ recoveryTaskId: string }>)
+  | (OperatorNotificationOutcome & Readonly<{ stallTaskId: string }>)
+  | (OperatorNotificationOutcome & Readonly<{ terminalTaskId: string }>);
 
 type PendingOperatorAttention =
   | Readonly<{ kind: "input"; request: InputRequest }>
-  | Readonly<{ kind: "recovery"; notification: OperatorNotification }>;
+  | Readonly<{ kind: "notification"; notification: OperatorNotification }>;
 
 export async function processOperatorInputNotifications(
   store: SchedulerStorePort,
@@ -49,16 +52,17 @@ export async function processOperatorInputNotifications(
   if (claim.status === "empty") return [];
   const processing = claim.processing;
   const requests: PendingOperatorAttention[] = processing.batch.refs
-    .filter((ref) => ref.type === "input")
-    .map((ref) => store.getInputRequest(ref.id))
+    .flatMap((ref) => ref.type === "input"
+      ? [store.getInputRequest(ref.taskId, ref.id)]
+      : [])
     .filter((request): request is InputRequest => request !== null && request.status === "open")
     .map((request) => ({ kind: "input", request }));
-  const recoveries: PendingOperatorAttention[] = processing.batch.refs
+  const notifications: PendingOperatorAttention[] = processing.batch.refs
     .filter((ref) => ref.type === "task")
     .map((ref) => store.getOperatorNotification(ref.id))
     .filter((notification): notification is OperatorNotification => notification !== null)
-    .map((notification) => ({ kind: "recovery", notification }));
-  const attentions = deduplicateAttention([...requests, ...recoveries]);
+    .map((notification) => ({ kind: "notification", notification }));
+  const attentions = deduplicateAttention([...requests, ...notifications]);
   if (attentions.length === 0) {
     store.completeWorkMailbox(targetMailbox, processing.batchId);
     return [];
@@ -139,11 +143,26 @@ function skipped(
 
 function attentionIdentity(attention: PendingOperatorAttention):
   | Readonly<{ inputRequestId: string; taskId: string }>
-  | Readonly<{ recoveryTaskId: string; taskId: string }> {
-  return attention.kind === "input"
-    ? { inputRequestId: attention.request.id, taskId: attention.request.taskId }
-    : {
+  | Readonly<{ recoveryTaskId: string; taskId: string }>
+  | Readonly<{ stallTaskId: string; taskId: string }>
+  | Readonly<{ terminalTaskId: string; taskId: string }> {
+  if (attention.kind === "input") {
+    return { inputRequestId: attention.request.id, taskId: attention.request.taskId };
+  }
+  if (attention.notification.type === "leader-recovery-failed") {
+    return {
         recoveryTaskId: attention.notification.taskId,
+        taskId: attention.notification.taskId
+      };
+  }
+  if (attention.notification.type === "leader-stalled") {
+    return {
+      stallTaskId: attention.notification.taskId,
+      taskId: attention.notification.taskId
+    };
+  }
+  return {
+        terminalTaskId: attention.notification.taskId,
         taskId: attention.notification.taskId
       };
 }
@@ -151,12 +170,16 @@ function attentionIdentity(attention: PendingOperatorAttention):
 function createAttentionPresentation(
   attention: PendingOperatorAttention,
   store: SchedulerStorePort
-): OperatorAttentionPresentation {
-  return attention.kind === "input"
-    ? createInputRequestOperatorPresentation(attention.request, store.getPresentationContext())
-    : attention.notification.type === "leader-stalled"
-      ? createLeaderStallOperatorPresentation(attention.notification)
-      : createLeaderRecoveryOperatorPresentation(attention.notification);
+): OperatorPresentation {
+  if (attention.kind === "input") {
+    return createInputRequestOperatorPresentation(attention.request, store.getPresentationContext());
+  }
+  if (attention.notification.type === "leader-recovery-failed") {
+    return createLeaderRecoveryOperatorPresentation(attention.notification);
+  }
+  return attention.notification.type === "leader-stalled"
+    ? createLeaderStallOperatorPresentation(attention.notification)
+    : createTaskTerminalOperatorPresentation(attention.notification);
 }
 
 function deduplicateAttention(
@@ -165,7 +188,7 @@ function deduplicateAttention(
   const seen = new Set<string>();
   return attentions.filter((attention) => {
     const key = attention.kind === "input"
-      ? `input:${attention.request.id}`
+      ? `input:${attention.request.taskId}:${attention.request.id}`
       : attention.notification.type === "leader-stalled"
         ? `stall:${attention.notification.taskId}:${attention.notification.runId}:${attention.notification.progressAt}`
         : `recovery:${attention.notification.taskId}:${attention.notification.createdAt}`;

@@ -89,15 +89,18 @@ export async function getSelectionCandidates(
       );
     case "input-requests": {
       const taskId = dependencyValue(selector, args);
+      const requests = (await list(ports, "task.input.list", {
+        ...(taskId === undefined ? {} : { taskId }),
+        all: true
+      })).filter((request) => selector.statuses === undefined
+        || selector.statuses.includes(stringField(request, "status") ?? ""));
       return entities(
         "input request",
         taskId === undefined ? "Select input request" : `Select input request: ${taskId}`,
-        (await list(ports, "task.input.list", {
-          ...(taskId === undefined ? {} : { taskId }),
-          all: true
-        })).filter((request) => selector.statuses === undefined
-          || selector.statuses.includes(stringField(request, "status") ?? "")),
-        ["id", "taskId", "status", "question"]
+        taskId === undefined ? qualifyTaskRecords(requests) : requests,
+        taskId === undefined
+          ? ["qualifiedId", "status", "question"]
+          : ["id", "status", "question"]
       );
     }
     case "task-roles": {
@@ -141,8 +144,8 @@ export async function getSelectionCandidates(
       return entities(
         "work item",
         "Select work item",
-        await listAllWorkItems(ports),
-        ["id", "title", "status"]
+        qualifyTaskRecords(await listAllWorkItems(ports)),
+        ["qualifiedId", "title", "status"]
       );
     case "runs": {
       const workItemId = dependencyValue(selector, args);
@@ -150,20 +153,22 @@ export async function getSelectionCandidates(
       return entities(
         "run",
         workItemId === undefined ? "Select Run" : `Select Run: ${workItemId}`,
-        runs.filter((run) => workItemId === undefined
-          || stringField(run, "workItemId") === workItemId),
-        ["id", "roleName", "status", "summary"]
+        qualifyTaskRecords(runs.filter((run) => workItemId === undefined
+          || matchesTaskRecordReference(run, "workItemId", workItemId))),
+        ["qualifiedId", "roleName", "status", "summary"]
       );
     }
     case "integration-attempts":
       return entities(
         "Integration Attempt",
         "Select Integration Attempt",
-        (await listAllByTask(ports, "task.integration.list", "integrations")).filter((attempt) =>
-          selector.statuses === undefined
-          || selector.statuses.includes(stringField(attempt, "status") ?? "")
+        qualifyTaskRecords(
+          (await listAllByTask(ports, "task.integration.list", "integrations")).filter(
+            (attempt) => selector.statuses === undefined
+              || selector.statuses.includes(stringField(attempt, "status") ?? "")
+          )
         ),
-        ["id", "status", "targetRef"]
+        ["qualifiedId", "status", "targetRef"]
       );
     case "change-sets": {
       const taskId = dependencyValue(selector, args);
@@ -176,6 +181,27 @@ export async function getSelectionCandidates(
       );
     }
   }
+}
+
+function qualifyTaskRecords(input: readonly Entity[]): Entity[] {
+  return input.flatMap((entity) => {
+    const taskId = stringField(entity, "taskId");
+    const id = stringField(entity, "id");
+    return taskId === undefined || id === undefined
+      ? []
+      : [{ ...entity, qualifiedId: `${taskId}/${id}` }];
+  });
+}
+
+function matchesTaskRecordReference(
+  entity: Entity,
+  field: string,
+  reference: string
+): boolean {
+  const separator = reference.indexOf("/");
+  if (separator < 0) return false;
+  return stringField(entity, "taskId") === reference.slice(0, separator)
+    && stringField(entity, field) === reference.slice(separator + 1);
 }
 
 async function listAllWorkItems(ports: SelectionPorts): Promise<Entity[]> {

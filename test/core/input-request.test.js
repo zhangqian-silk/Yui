@@ -18,9 +18,9 @@ import { createTaskEvent } from "../../dist/event/taskEvent.js";
 import { runControllerSchedulerPass } from "../../dist/controller/controller.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
 import {
-  createRoleSessionSet,
-  recordRoleAgentSession
+  createRoleSessionSet
 } from "../../dist/executor/agentExecutor.js";
+import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import {
   answerInputRequest,
   cancelInputRequest,
@@ -32,7 +32,7 @@ import {
   createRoleAgentBinding,
   updateRoleStatus
 } from "../../dist/role/role.js";
-import { createAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun, recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 import { processLeaderWakeups } from "../../dist/scheduler/leaderWakeupProcessor.js";
 import { createLeaderStallNotification } from "../../dist/scheduler/operatorNotification.js";
 import { mergePendingWakeup } from "../../dist/scheduler/pendingWakeup.js";
@@ -69,6 +69,7 @@ test("input list reads presentation timezone once per command", () => {
 
 function requester(overrides = {}) {
   return {
+    taskId: "task-1",
     roleName: "leader",
     agentId: "codex",
     runId: "agent-run-1",
@@ -89,8 +90,8 @@ test("InputRequest domain supports text or choice answers and terminal transitio
         { key: "fast", label: "Fast path" }
       ],
       blockedRefs: [
-        { type: "work-item", id: "work-item-1" },
-        { type: "run", id: "agent-run-2" }
+        { type: "work-item", taskId: "task-1", id: "work-item-1" },
+        { type: "run", taskId: "task-1", id: "agent-run-2" }
       ]
     },
     FIRST
@@ -214,16 +215,31 @@ function fixture(t) {
     root,
     FIRST
   );
+  const operator = createGlobalRole(
+    "operator",
+    [createRoleAgentBinding(agent)],
+    agent.id,
+    root,
+    FIRST
+  );
+  let operatorSessions = createRoleSessionSet(
+    { scope: "global", roleName: operator.name },
+    operator.activeAgentId,
+    FIRST
+  );
+  operatorSessions = recordRoleAgentSession(operatorSessions, {
+    agentId: operator.activeAgentId,
+    adapterId: operator.agentBindings[operator.activeAgentId].adapterId,
+    nativeSessionId: "operator-native-1",
+    policy: "fixed",
+    status: "ready",
+    effective: resolveEffectiveLaunch({ role: operator, purpose: "execution" })
+  }, FIRST);
   store.transaction((tx) => {
     tx.saveConfig({ schemaVersion: 1, defaultAgent: agent.id, defaultWorkspace: root });
     tx.saveConfiguredAgent(agent);
-    tx.saveGlobalRole(createGlobalRole(
-      "operator",
-      [createRoleAgentBinding(agent)],
-      agent.id,
-      root,
-      FIRST
-    ));
+    tx.saveGlobalRole(operator);
+    tx.saveGlobalRoleSessionSet(operatorSessions);
     tx.saveGlobalRole(leader);
   });
   const changed = [];
@@ -238,6 +254,7 @@ function fixture(t) {
   runTaskCommand(["activate", task.id], store, options);
   store.clearPendingWakeup(task.id);
   const role = store.getRole(task.id, "leader");
+  const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
   const active = {
     ...createAgentRun(
       store.nextAgentRunId(task.id),
@@ -245,7 +262,8 @@ function fixture(t) {
       role.name,
       "resume",
       "Steward the task",
-      FIRST
+      FIRST,
+      { effective }
     ),
     deliveredAt: FIRST.toISOString()
   };
@@ -259,7 +277,8 @@ function fixture(t) {
     adapterId: role.agentBindings[role.activeAgentId].adapterId,
     nativeSessionId: "native-1",
     policy: "fixed",
-    status: "running"
+    status: "running",
+    effective
   }, FIRST);
   store.transaction((tx) => {
     tx.saveActiveAgentRun(active);
@@ -270,18 +289,18 @@ function fixture(t) {
       tx.getWorkMailbox(target) ?? createWorkMailbox(target),
       {
         reason: "fixture-run-dispatched",
-        refs: [{ type: "run", id: active.id }],
+        refs: [{ type: "run", taskId: task.id, id: active.id }],
         occurredAt: FIRST.toISOString()
       }
     );
     tx.saveWorkMailbox(bindExecution(
       claimPending(queued, {
-        batchId: `agent-run:${active.id}`,
+        batchId: `agent-run:${task.id}/${active.id}`,
         owner: "controller",
         startedAt: FIRST.toISOString()
       }),
-      `agent-run:${active.id}`,
-      { type: "run", id: active.id }
+      `agent-run:${task.id}/${active.id}`,
+      { type: "run", taskId: task.id, id: active.id }
     ));
   });
   const environment = {
@@ -303,7 +322,7 @@ function run(args, store, options) {
 
 test("Leader request releases its active fence and answer durably queues a resume wake", (t) => {
   const { root, store, task, active, options } = fixture(t);
-  const work = createWorkItem("work-item-foreign-check", task.id, {
+  const work = createWorkItem("work-item-1", task.id, {
     title: "Check rollout",
     assignee: "leader"
   }, FIRST);
@@ -311,6 +330,7 @@ test("Leader request releases its active fence and answer durably queues a resum
   store.transaction((tx) => {
     tx.saveEvent(task.id, createTaskEvent(
       tx.nextEventId(task.id),
+      task.id,
       "run.stalled",
       {
         runId: active.id,
@@ -346,8 +366,8 @@ test("Leader request releases its active fence and answer durably queues a resum
   const request = store.listInputRequests(task.id)[0];
   assert.equal(request.requester.runId, active.id);
   assert.deepEqual(request.blockedRefs, [
-    { type: "work-item", id: work.id },
-    { type: "run", id: active.id }
+    { type: "work-item", taskId: task.id, id: work.id },
+    { type: "run", taskId: task.id, id: active.id }
   ]);
   assert.equal(store.getActiveAgentRun(task.id, "leader"), null);
   assert.equal(store.getAgentRun(task.id, active.id).status, "yielded");
@@ -373,7 +393,7 @@ test("Leader request releases its active fence and answer durably queues a resum
   const reloaded = new FileTaskStore(root);
   assert.deepEqual(reloaded.getInputRequest(task.id, request.id), request);
   const answer = run([
-    "input", "answer", request.id,
+    "input", "answer", `${task.id}/${request.id}`,
     "--choice", "safe"
   ], reloaded, { ...options, now: () => new Date(SECOND), environment: {} });
   assert.equal(answer.data.request.status, "answered");
@@ -381,7 +401,7 @@ test("Leader request releases its active fence and answer durably queues a resum
   assert.ok(reloaded.getPendingWakeup(task.id).reasons.includes(`input-answered:${request.id}`));
   assert.equal(reloaded.listEvents(task.id).at(-1).type, "input.answered");
   assert.throws(() => runTaskCommand([
-    "input", "answer", request.id, "--choice", "fast"
+    "input", "answer", `${task.id}/${request.id}`, "--choice", "fast"
   ], reloaded, { ...options, environment: {} }), /already answered/i);
 
   const json = JSON.parse(execFileSync(
@@ -461,7 +481,8 @@ test("a pending wake cannot bypass open input and becomes dispatchable after ans
           agentId: session.agentId,
           adapterId: session.adapterId,
           nativeSessionId: session.nativeSessionId,
-          status: "running"
+          status: "running",
+          effective: session.effective
         }
       };
     },
@@ -477,7 +498,7 @@ test("a pending wake cannot bypass open input and becomes dispatchable after ans
   assert.equal(store.getPendingWakeup(task.id).requestCount, 1);
 
   const request = store.listInputRequests(task.id)[0];
-  run(["input", "answer", request.id, "--text", "Continue"], store, {
+  run(["input", "answer", `${task.id}/${request.id}`, "--text", "Continue"], store, {
     ...options,
     now: () => new Date(SECOND),
     environment: { YUI_SESSION_SCOPE: "global", YUI_ROLE: "operator" }
@@ -524,7 +545,7 @@ test("Controller nudges an available Operator once while the Inbox remains autho
     status: "sent"
   }]);
   assert.equal(notifications.length, 1);
-  assert.equal(notifications[0].receiptId, `input-request:${request.id}`);
+  assert.equal(notifications[0].receiptId, `input-request:${task.id}/${request.id}`);
   assert.equal(notifications[0].roleName, "operator");
   assert.match(notifications[0].text, new RegExp(`Input: ${request.id}`));
   assert.match(notifications[0].text, /Which rollout\?/);
@@ -575,11 +596,19 @@ test("Controller atomically applies an expired Agent recommendation and resumes 
       return "sent";
     }
   };
+  const lifecycleHost = {
+    async stopOwner() { return true; }
+  };
 
   const beforeTimeout = await runControllerSchedulerPass(
     new FileSchedulerStoreAdapter(store),
     delivery,
-    new Date(FIRST.getTime() + 30_000)
+    new Date(FIRST.getTime() + 30_000),
+    undefined,
+    { kind: "full" },
+    true,
+    [],
+    lifecycleHost
   );
   assert.deepEqual(beforeTimeout.autoResolvedInputs, []);
   assert.equal(store.getInputRequest(task.id, request.id).status, "open");
@@ -589,7 +618,12 @@ test("Controller atomically applies an expired Agent recommendation and resumes 
   const result = await runControllerSchedulerPass(
     new FileSchedulerStoreAdapter(store),
     delivery,
-    SECOND
+    SECOND,
+    undefined,
+    { kind: "full" },
+    true,
+    [],
+    lifecycleHost
   );
 
   assert.deepEqual(result.autoResolvedInputs, [{
@@ -610,9 +644,9 @@ test("Controller atomically applies an expired Agent recommendation and resumes 
     choiceKey: "safe",
     text: "Safe rollout"
   });
-  assert.equal(
-    store.listEvents(task.id).some((event) => event.type === "input.auto-answered"),
-    true
+  assert.deepEqual(
+    store.listEvents(task.id).slice(-4).map((event) => event.type),
+    ["input.auto-answered", "run.dispatched", "run.delivered", "run.progress"]
   );
 });
 
@@ -630,10 +664,23 @@ test("targeted recommendation reconciliation does not mutate another Task", (t) 
   runTaskCommand(["create", "Other recommendation"], store, options);
   const otherTask = store.listTasks().find((entry) => entry.id !== task.id);
   runTaskCommand(["activate", otherTask.id], store, options);
+  const otherRun = createAgentRun(
+    store.nextAgentRunId(otherTask.id),
+    otherTask.id,
+    "leader",
+    "new",
+    "Other input origin",
+    FIRST
+  );
+  store.saveAgentRun(otherRun);
   const otherRequest = createInputRequest(
     store.nextInputRequestId(otherTask.id),
     otherTask.id,
-    requester({ runId: "agent-run-other", nativeSessionId: "native-other" }),
+    requester({
+      taskId: otherTask.id,
+      runId: otherRun.id,
+      nativeSessionId: "native-other"
+    }),
     {
       question: "Other rollout?",
       choices: [{ key: "safe", label: "Safe rollout" }],
@@ -661,7 +708,7 @@ test("request provenance, blocked ownership, lifecycle, and origin-only cancel a
   const other = runTaskCommand(["create", "Other"], store, options);
   assert.equal(other.kind, "output");
   const otherTask = store.listTasks().find((entry) => entry.id !== task.id);
-  const foreignWork = createWorkItem("foreign-work", otherTask.id, {
+  const foreignWork = createWorkItem("work-item-1", otherTask.id, {
     title: "Foreign",
     assignee: "leader"
   }, FIRST);
@@ -671,7 +718,7 @@ test("request provenance, blocked ownership, lifecycle, and origin-only cancel a
     "input", "request", task.id,
     "--question", "Forged",
     "--blocks", `work-item:${foreignWork.id}`
-  ], store, options), /belongs to another Task/i);
+  ], store, options), /Blocked work-item not found: work-item-1/i);
   assert.throws(() => runTaskCommand([
     "input", "request", task.id, "--question", "Forged"
   ], store, {
