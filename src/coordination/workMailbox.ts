@@ -1,3 +1,8 @@
+import {
+  validateTaskRecordReference,
+  type TaskRecordKind
+} from "../task/taskRecordReference.js";
+
 export type MailboxTarget =
   | Readonly<{ kind: "task"; taskId: string }>
   | Readonly<{ kind: "role"; taskId: string; roleName: string }>
@@ -15,10 +20,13 @@ export type MailboxEntityType =
   | "session"
   | "message";
 
-export type MailboxEntityRef = Readonly<{
-  type: MailboxEntityType;
-  id: string;
-}>;
+export type MailboxEntityRef =
+  | Readonly<{ type: "task" | "session"; id: string }>
+  | Readonly<{
+      type: "run" | "work-item" | "input" | "message";
+      taskId: string;
+      id: string;
+    }>;
 
 export type WorkSignal = Readonly<{
   reason: string;
@@ -146,10 +154,30 @@ export function mailboxTargetKey(target: MailboxTarget): string {
 }
 
 function copyRef(ref: MailboxEntityRef): MailboxEntityRef {
+  if (!("taskId" in ref)) {
+    if (ref.type !== "task" && ref.type !== "session") {
+      throw new Error(`entity reference taskId is required for ${ref.type}`);
+    }
+    return {
+      type: ref.type,
+      id: requireText(ref.id, "entity reference id")
+    };
+  }
+  const validated = validateTaskRecordReference({
+    taskId: ref.taskId,
+    localId: ref.id
+  }, mailboxTaskRecordKind(ref.type));
   return {
     type: ref.type,
-    id: requireText(ref.id, "entity reference id")
+    taskId: validated.taskId,
+    id: validated.localId
   };
+}
+
+export function mailboxEntityRefKey(ref: MailboxEntityRef): string {
+  return !("taskId" in ref)
+    ? `${ref.type}\u0000${ref.id}`
+    : `${ref.type}\u0000${ref.taskId}\u0000${ref.id}`;
 }
 
 function appendUnique<T>(
@@ -177,7 +205,7 @@ function mergeBatches(earlier: PendingBatch, later: PendingBatch): PendingBatch 
     refs: appendUnique(
       earlier.refs,
       later.refs,
-      (ref) => `${ref.type}\u0000${ref.id}`
+      mailboxEntityRefKey
     ),
     requestCount: earlier.requestCount + later.requestCount,
     firstQueuedAt: earlier.firstQueuedAt,
@@ -267,10 +295,18 @@ function parseTarget(value: unknown): MailboxTarget {
 
 function parseRef(value: unknown, label: string): MailboxEntityRef {
   const ref = record(value, label);
-  exact(ref, ["type", "id"], label);
   const types: readonly MailboxEntityType[] = ["task", "run", "work-item", "input", "session", "message"];
   if (!types.includes(ref.type as MailboxEntityType)) throw new Error(`${label} type is invalid`);
-  return { type: ref.type as MailboxEntityType, id: requireString(ref.id, `${label} id`) };
+  if (ref.type === "task" || ref.type === "session") {
+    exact(ref, ["type", "id"], label);
+    return { type: ref.type, id: requireString(ref.id, `${label} id`) };
+  }
+  exact(ref, ["type", "taskId", "id"], label);
+  return copyRef({
+    type: ref.type as "run" | "work-item" | "input" | "message",
+    taskId: requireString(ref.taskId, `${label} taskId`),
+    id: requireString(ref.id, `${label} id`)
+  });
 }
 
 function parseBatch(value: unknown, label: string): PendingBatch {
@@ -287,7 +323,7 @@ function parseBatch(value: unknown, label: string): PendingBatch {
   if (reasons.length === 0) throw new Error(`${label} reasons must not be empty`);
   if (!Array.isArray(batch.refs)) throw new Error(`${label} refs must be an array`);
   const refs = batch.refs.map((ref, index) => parseRef(ref, `${label} refs[${index}]`));
-  const refKeys = refs.map((ref) => `${ref.type}\u0000${ref.id}`);
+  const refKeys = refs.map(mailboxEntityRefKey);
   if (new Set(refKeys).size !== refKeys.length) throw new Error(`${label} refs must not contain duplicates`);
   const result: PendingBatch = {
     fromSequence,
@@ -332,7 +368,7 @@ export function enqueueSignal(
     fromSequence: sequence,
     toSequence: sequence,
     reasons: [reason],
-    refs: appendUnique([], refs, (ref) => `${ref.type}\u0000${ref.id}`),
+    refs: appendUnique([], refs, mailboxEntityRefKey),
     requestCount: 1,
     firstQueuedAt: occurredAt,
     lastQueuedAt: occurredAt
@@ -345,6 +381,17 @@ export function enqueueSignal(
       ? incoming
       : mergeBatches(mailbox.pending, incoming)
   };
+}
+
+function mailboxTaskRecordKind(
+  type: "run" | "work-item" | "input" | "message"
+): TaskRecordKind {
+  switch (type) {
+    case "run": return "agentRun";
+    case "work-item": return "workItem";
+    case "input": return "inputRequest";
+    case "message": return "message";
+  }
 }
 
 export function claimPending(

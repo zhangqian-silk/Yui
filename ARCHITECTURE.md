@@ -28,13 +28,16 @@ independent execution additionally records an AgentRun.
 - `Agent` selects a supported adapter such as Codex or Claude and defines its
   launch context.
 - `WorkerProfile` is a versioned, provider-neutral behavior template containing
-  instructions, Skills, access expectations, and optional model/effort hints.
+  instructions, Skills, a read/write behavior intent, and optional model/effort hints.
 - `TaskRole` is a mutable Worker instance inside one Task. Applying a Profile
-  copies its portable behavior. The Role may bind multiple Agents; every
-  binding retains independent runtime configuration.
-- `AgentRun` records one managed dispatch, its selected Agent and runtime
-  configuration, delivery state, compact result, and whether its purpose is
-  execution or review.
+  copies its portable behavior. Its versioned desired launch configuration is
+  next-launch-only. The Role may bind multiple Agents; every binding retains
+  independent runtime configuration.
+- `AgentRun` records one managed dispatch and an immutable effective snapshot:
+  actual Agent, adapter, model, effort, Profile behavior intent, exact writable
+  Projects, provider permission strategy and native options, workspace, Role
+  context, and source desired revision. A native Role Session stores the same snapshot; running processes
+  are never hot-mutated by later Role edits.
 - A `WorkItemCandidate` is the explicit result currently awaiting Leader
   acceptance. It snapshots the WorkItem revision, summary, and either a
   yielded execution Run or a Leader-managed direct source.
@@ -46,7 +49,7 @@ not choose adapters, own Sessions, or carry credentials.
 
 For a native subagent, the Leader must choose and read an explicit
 WorkerProfile, using `worker` when no specialist fits. The Leader includes the
-Profile instructions, Skills, access boundary, validation expectations, and
+Profile instructions, Skills, behavior intent, workspace boundary, validation expectations, and
 supported model/effort hints in the child brief. Task Role Agent bindings are
 ignored because the child inherits the Leader Agent. The reviewed WorkItem
 summary records the actual Profile revision, inherited or confirmed model and
@@ -81,16 +84,20 @@ Every result awaiting acceptance is stored as an explicit WorkItem candidate.
 `always` dispatches a review AgentRun for every candidate, whether it comes
 from a yielded execution Run or a Leader-managed direct result; `leader`
 leaves every candidate for the Leader to accept directly or review explicitly.
-Review Runs complete their ReviewRound, leave the WorkItem awaiting acceptance,
-and never trigger another review. Successful and failed review attempts both
-wake the Leader and remain evidence for judgment, not a machine verdict.
+Review Runs complete only their exact ReviewRound, leave the WorkItem awaiting
+acceptance, and never trigger another review or append a Candidate. Successful
+and failed review attempts both wake the Leader and remain evidence for
+judgment, not a machine verdict. The ReviewRound stores its frozen Candidate
+base, isolated workspace provenance, complete free-form report, optional
+structured checks, and optional diagnostic commit. The Leader may route that evidence to the original Worker, but Yui
+never merges it automatically.
+
 Roles describe Agent capability, but they do not own repository workspaces. A
 `ManagedWorkspace` is keyed by its durable owner (`Task`, `WorkItem`,
-`ReviewRound`, or `IntegrationAttempt`); an AgentRun carries only a snapshot of
-the workspace it is allowed to use. Review workspaces are fresh, writable
-copies rooted at the Candidate's frozen commit, so a Reviewer's edits cannot
-redirect to Develop or become a ChangeSet source. The same Candidate may have
-multiple independent ReviewRounds, each with explicit cleanup.
+`ReviewRound`, or `IntegrationAttempt`); an AgentRun carries only a launch
+snapshot. Review workspaces are fresh writable copies at the Candidate's
+frozen commit, so diagnostics cannot redirect Develop or become a ChangeSet
+source. Each ReviewRound has an independent lifecycle and explicit cleanup.
 
 Dependencies are enforced at dispatch. A Role cannot have overlapping active
 Runs, and terminal Task state fences new messages, dispatches, retries, and
@@ -110,13 +117,18 @@ A WorkItem can read the full Task workspace but has an explicit Project write
 scope. Isolation creates a second root with independent worktrees for writable
 Projects and Task-main context for the rest. The managed dispatch and
 `yui-worker` Skill name both sets explicitly; the Agent must modify only the
-writable set. Native Agent permissions apply to the whole Role Session rather
-than individual Project directories, so implementation Roles use write-capable
-sessions and a ReviewRound may grant an isolated write-capable session for
-diagnostic edits (or deliberately retain native read-only permissions). Scope
-is monotonic. A Worker cannot expand it directly: it reports the need, and the
-Leader either adds Projects to the existing scope, creates another WorkItem, or
-adds the Project to the Task.
+writable set. Provider permission is binding configuration: every managed Role
+defaults to `bypass`, while `default` and `configured` preserve provider-native
+behavior. Provider permission and Profile access intent do not grant Project
+writes. A normal source write requires an exact WorkItem write scope and
+matching managed workspace; a review write instead
+requires an exact ReviewRound owner and frozen Candidate base. Profiles and
+Skills constrain behavior even when provider prompts are bypassed. Provider
+permissions remain Session-wide rather than Project-specific, so the durable
+workspace owner and exact Project scope remain the authorization boundary.
+Scope is monotonic. A Worker cannot expand it directly: it reports the need,
+and the Leader either adds Projects to the existing scope, creates another
+WorkItem, or adds the Project to the Task.
 
 An isolated result is handled in this order:
 
@@ -168,6 +180,18 @@ tmux owns native Agent terminals. The Controller owns mailbox delivery,
 wakeups, Role liveness, reconciliation, and read-only Web observation. Operator
 and Leader Sessions are fixed Task/global Roles; Task Worker Sessions are
 selected through Role Agent bindings.
+
+Role desired revisions and Run/Session effective snapshots keep configuration
+history explicit. Resume compares the complete effective snapshot and
+workspace compatibility rather than revision alone. Desired drift is expected
+while an old process is running and becomes effective only on a later launch;
+control-plane wakes continue through the live Session's actual snapshot, and
+fresh replacement archives the stopped snapshot instead of rewriting it.
+Mailbox generations, reservations, liveness, native Turn Hooks, and exact yield
+remain the control-plane authority; configuration snapshots do not replace any
+of those completion fences. Lifecycle code uses structured Hook data, persisted identities, tmux
+process state, receipts, and pane fences. It never parses Agent terminal glyphs,
+progress text, trust dialogs, or final prose to infer readiness or success.
 
 All durable writes use process locking and atomic replacement. Storage validates
 record identity, legal transitions, dependency cycles, cross-record ownership,

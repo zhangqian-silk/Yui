@@ -4,7 +4,9 @@ import { test } from "node:test";
 import { createInputRequest } from "../../dist/input/inputRequest.js";
 import {
   createInputRequestOperatorPresentation,
-  createLeaderRecoveryOperatorPresentation
+  createLeaderRecoveryOperatorPresentation,
+  createLeaderStallOperatorPresentation,
+  createTaskTerminalOperatorPresentation
 } from "../../dist/interaction/operatorPresentation.js";
 
 const CREATED_AT = new Date("2026-07-23T01:00:00.000Z");
@@ -15,6 +17,7 @@ function inputRequest(policy) {
     "input-7",
     "task-3",
     {
+      taskId: "task-3",
       roleName: "leader",
       agentId: "codex",
       runId: "agent-run-8",
@@ -26,7 +29,7 @@ function inputRequest(policy) {
         { key: "safe", label: "Safe rollout" },
         { key: "fast", label: "Fast rollout" }
       ],
-      blockedRefs: [{ type: "run", id: "agent-run-8" }],
+      blockedRefs: [{ type: "run", taskId: "task-3", id: "agent-run-8" }],
       policy
     },
     CREATED_AT
@@ -49,8 +52,8 @@ test("required InputRequest becomes an attention presentation that only the user
     {
       category: "attention",
       taskId: "task-3",
-      receiptId: "input-request:input-7",
-      source: { kind: "input-request", id: "input-7" }
+      receiptId: "input-request:task-3/input-7",
+      source: { kind: "input-request", taskId: "task-3", localId: "input-7" }
     }
   );
   assert.match(presentation.text, /Which rollout should we use\?/);
@@ -58,7 +61,7 @@ test("required InputRequest becomes an attention presentation that only the user
   assert.match(presentation.text, /fast: Fast rollout/);
   assert.match(presentation.text, /requires the user's response/i);
   assert.match(presentation.text, /do not answer or choose on the user's behalf/i);
-  assert.match(presentation.text, /yui task input answer input-7 --choice <key>/);
+  assert.match(presentation.text, /yui task input answer task-3\/input-7 --choice <key>/);
   assert.doesNotMatch(presentation.text, /automatic fallback after/i);
 });
 
@@ -74,7 +77,7 @@ test("recommended InputRequest identifies its recommendation and automatic fallb
   );
 
   assert.equal(presentation.category, "attention");
-  assert.equal(presentation.receiptId, "input-request:input-7");
+  assert.equal(presentation.receiptId, "input-request:task-3/input-7");
   assert.match(presentation.text, /Agent recommendation: safe: Safe rollout/);
   assert.match(
     presentation.text,
@@ -94,6 +97,7 @@ test("free-text InputRequest renders the native answer command without inventing
     "input-8",
     "task-3",
     {
+      taskId: "task-3",
       roleName: "leader",
       agentId: "codex",
       runId: "agent-run-8"
@@ -108,7 +112,7 @@ test("free-text InputRequest renders the native answer command without inventing
 
   const presentation = createInputRequestOperatorPresentation(request, {});
   assert.match(presentation.text, /Answer type: free text/);
-  assert.match(presentation.text, /yui task input answer input-8 --text "<answer>"/);
+  assert.match(presentation.text, /yui task input answer task-3\/input-8 --text "<answer>"/);
   assert.doesNotMatch(presentation.text, /Choices:/);
 });
 
@@ -139,4 +143,59 @@ test("Leader recovery failure is an attention-only Operator presentation", () =>
   assert.match(presentation.text, /yui jobs list/);
   assert.match(presentation.text, /yui jobs retry leader-recovery:task-3/);
   assert.doesNotMatch(presentation.text, /yui job show/);
+});
+test("Leader stall keeps the exact Run and semantic progress evidence in Operator attention", () => {
+  const presentation = createLeaderStallOperatorPresentation({
+    schemaVersion: 1,
+    taskId: "task-3",
+    type: "leader-stalled",
+    message: "Leader Run agent-run-9 is truly stalled.",
+    runId: "agent-run-9",
+    progressAt: CREATED_AT.toISOString(),
+    classification: "truly-stalled",
+    evidenceKey: "execution-stalled:mailbox-pending",
+    createdAt: CREATED_AT.toISOString(),
+    updatedAt: CREATED_AT.toISOString()
+  });
+  assert.equal(presentation.category, "attention");
+  assert.equal(
+    presentation.receiptId,
+    `leader-stall:task-3:agent-run-9:${CREATED_AT.toISOString()}`
+  );
+  assert.deepEqual(presentation.source, {
+    kind: "leader-stall",
+    id: `agent-run-9:${CREATED_AT.toISOString()}`
+  });
+  assert.match(presentation.text, /truly stalled/i);
+  assert.match(presentation.text, /agent-run-9/);
+  assert.match(presentation.text, /no automatic Enter, reset, retry, kill/i);
+});
+
+test("Task terminal delivery is informational and includes the durable outcome", () => {
+  const presentation = createTaskTerminalOperatorPresentation({
+    schemaVersion: 1,
+    taskId: "task-3",
+    type: "task-terminal",
+    status: "completed",
+    by: "leader",
+    summary: "All requested changes are integrated and verified.",
+    createdAt: CREATED_AT.toISOString(),
+    updatedAt: CREATED_AT.toISOString()
+  });
+
+  assert.deepEqual(
+    {
+      category: presentation.category,
+      receiptId: presentation.receiptId,
+      source: presentation.source
+    },
+    {
+      category: "information",
+      receiptId: `task-terminal:task-3:completed:${CREATED_AT.toISOString()}`,
+      source: { kind: "task-terminal", id: "task-3" }
+    }
+  );
+  assert.match(presentation.text, /Task task-3 was completed by its Leader/);
+  assert.match(presentation.text, /All requested changes are integrated and verified/);
+  assert.doesNotMatch(presentation.text, /user attention/i);
 });

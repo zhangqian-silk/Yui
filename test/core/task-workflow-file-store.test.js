@@ -8,7 +8,11 @@ import test from "node:test";
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { createAgentProfile } from "../../dist/profile/agentProfile.js";
 import { runOperatorCommand } from "../../dist/commands/operatorCommands.js";
-import { runTaskCommand } from "../../dist/commands/taskCommands.js";
+import {
+  dispatchPreparedReviewRound,
+  runTaskCommand
+} from "../../dist/commands/taskCommands.js";
+import { createTaskEvent } from "../../dist/event/taskEvent.js";
 import {
   bindExecution,
   claimPending,
@@ -18,9 +22,17 @@ import {
 import {
   createGlobalRole,
   createRoleAgentBinding,
+  updateRole,
   updateRoleStatus
 } from "../../dist/role/role.js";
-import { createAgentRun, failAgentRun } from "../../dist/run/agentRun.js";
+import { createLeaderStallNotification } from "../../dist/scheduler/operatorNotification.js";
+import {
+  attachReviewRoundWorkspace,
+  recordReviewWorkspaceDisposition
+} from "../../dist/review/reviewRound.js";
+import { terminalizeExactTaskRun } from "../../dist/lifecycle/exactRunTerminalization.js";
+import { failAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun, recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 import {
   markYuiRunInput,
   retagYuiRunInput,
@@ -31,20 +43,23 @@ import { createProject } from "../../dist/repository/project.js";
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
-  markTaskRoleRunDelivered,
-  recordRoleAgentSession
+  markTaskRoleRunDelivered
 } from "../../dist/executor/agentExecutor.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
+import { completeTask } from "../../dist/task/task.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 import {
+  createCandidateGitSnapshot,
   recordWorkItemWorkspaceDisposition,
   submitWorkItemCandidate,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 
 const NOW = new Date("2026-07-19T12:00:00.000Z");
+const REVIEW_PROJECT_ID = "review-project";
+const REVIEW_BASE_COMMIT = "a".repeat(40);
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), "yui-workflow-"));
@@ -80,44 +95,186 @@ function fixture(t) {
     reconcileTask(taskId) { calls.reconcile.push(taskId); },
     prepareTaskRoleEnter(input) { calls.enter.push(input); }
   };
-  const options = { runtime, now: () => new Date(NOW) };
+  const options = {
+    runtime,
+    now: () => new Date(NOW),
+    environment: { YUI_TASK_ID: "task-1" }
+  };
   return { root, store, calls, options };
 }
 
 function run(args, store, options) {
-  let dispatchedItem = null;
-  if (args[0] === "work" && args[1] === "dispatch" && args[2] !== undefined) {
-    const item = store.findWorkItem(args[2]);
-    const task = item === null ? null : store.getTask(item.taskId);
-    if (
-      item !== null
-      && task !== null
-      && task.projectBindings.length === 0
-      && store.getWorkItemWorkspace(item.taskId, item.id) === null
-    ) {
-      dispatchedItem = item;
+  const taskId = options.environment?.YUI_TASK_ID;
+  if (taskId !== undefined && store.getReviewConfig() !== null) {
+    const workItemIds = reviewCandidateWorkItems(args, store, taskId);
+    if (workItemIds.length > 0) {
+      ensureSyntheticReviewCandidateWorkspace(store, taskId, workItemIds);
     }
   }
-  const result = runTaskCommand(args, store, options);
-  if (dispatchedItem !== null) {
-    const active = store.getActiveAgentRun(dispatchedItem.taskId, dispatchedItem.assignee ?? "leader");
-    if (active !== null && active.workspace === undefined) {
-      store.saveAgentRun({
-        ...active,
-        workspace: createManagedWorkspace({
-          owner: {
-            type: "work-item",
-            taskId: dispatchedItem.taskId,
-            workItemId: dispatchedItem.id
-          },
-          root: join(store.rootDirectory(), "test-workspaces", dispatchedItem.taskId, dispatchedItem.id),
-          entries: []
-        }, NOW)
-      });
-    }
-  }
+  const snapshotOptions = taskId === undefined
+    ? options
+    : withSyntheticCandidateSnapshot(args, store, taskId, options);
+  const activeBefore = taskId === undefined
+    ? null
+    : args[0] === "run" && args[1] === "yield"
+      ? store.getAgentRun(taskId, args[2]?.split("/").at(-1))
+      : null;
+  const commandOptions = activeBefore?.purpose === "review"
+    ? { ...snapshotOptions, reviewWorkspaceResult: {} }
+    : snapshotOptions;
+  const result = runTaskCommand(args, store, commandOptions);
   assert.equal(result.kind, "output");
+  if (taskId !== undefined) {
+    dispatchSyntheticPendingReviews(store, taskId, options);
+    if (activeBefore?.purpose === "review") {
+      cleanupSyntheticReviewWorkspace(store, taskId, activeBefore.reviewRoundId);
+    }
+  }
   return result.output;
+}
+
+function reviewCandidateWorkItems(args, store, taskId) {
+  if (args[0] === "work" && args[1] === "dispatch") {
+    const item = store.getWorkItem(taskId, args[2]?.split("/").at(-1));
+    return item === null ? [] : [item.id];
+  }
+  if (args[0] === "work" && args[1] === "update" && args[3] === "done") {
+    const item = store.getWorkItem(taskId, args[2]?.split("/").at(-1));
+    return item === null ? [] : [item.id];
+  }
+  return [];
+}
+
+function ensureSyntheticReviewCandidateWorkspace(store, taskId, workItemIds) {
+  let task = store.getTask(taskId);
+  if (task === null) return;
+  const root = store.getConfig().defaultWorkspace;
+  if (store.getProject(REVIEW_PROJECT_ID) === null) {
+    store.saveProject(createProject(
+      REVIEW_PROJECT_ID,
+      "review-fixture",
+      root,
+      { stable: "main", development: "main" },
+      NOW
+    ));
+  }
+  if (!task.projectBindings.some(({ projectId }) => projectId === REVIEW_PROJECT_ID)) {
+    store.saveTask({
+      ...task,
+      projectBindings: [{
+        projectId: REVIEW_PROJECT_ID,
+        directory: "review-fixture",
+        baseRef: "main"
+      }]
+    });
+    task = store.getTask(taskId);
+  }
+  if (store.getTaskWorkspace(taskId) === null) {
+    const workspaceRoot = join(root, "synthetic-review", taskId, "main");
+    const workspace = createManagedWorkspace({
+      owner: { type: "task", taskId },
+      root: workspaceRoot,
+      entries: [{
+        projectId: REVIEW_PROJECT_ID,
+        directory: "review-fixture",
+        access: "write",
+        path: join(workspaceRoot, "review-fixture"),
+        branch: `yui/${taskId}/main`,
+        baseRef: "main",
+        baseCommit: REVIEW_BASE_COMMIT
+      }]
+    }, NOW);
+    store.transaction((tx) => {
+      tx.saveManagedWorkspace(workspace);
+      const leader = tx.getRole(taskId, "leader");
+      if (leader !== null) {
+        tx.saveRole(taskId, updateRole(leader, { workspace: workspace.root }, NOW));
+      }
+    });
+  }
+  for (const workItemId of new Set(workItemIds)) {
+    if (store.getWorkItemWorkspace(taskId, workItemId) !== null) continue;
+    const item = store.getWorkItem(taskId, workItemId);
+    if (item === null) continue;
+    const workspaceRoot = join(root, "synthetic-review", taskId, workItemId);
+    const workspace = createManagedWorkspace({
+      owner: { type: "work-item", taskId, workItemId },
+      root: workspaceRoot,
+      entries: [{
+        projectId: REVIEW_PROJECT_ID,
+        directory: "review-fixture",
+        access: item.writeProjectIds.includes(REVIEW_PROJECT_ID) ? "write" : "read",
+        path: join(workspaceRoot, "review-fixture"),
+        branch: `yui/${taskId}/${workItemId}`,
+        baseRef: "main",
+        baseCommit: REVIEW_BASE_COMMIT
+      }]
+    }, NOW);
+    store.saveManagedWorkspace(workspace);
+  }
+}
+
+function withSyntheticCandidateSnapshot(args, store, taskId, options) {
+  let workspace;
+  if (args[0] === "run" && args[1] === "yield") {
+    const run = store.getAgentRun(taskId, args[2]?.split("/").at(-1));
+    if (run?.purpose === "execution") workspace = run.workspace;
+  } else if (args[0] === "work" && args[1] === "update" && args[3] === "done") {
+    workspace = store.getWorkItemWorkspace(taskId, args[2]?.split("/").at(-1));
+  }
+  if (workspace === undefined || workspace === null || workspace.entries.length === 0) {
+    return options;
+  }
+  return {
+    ...options,
+    candidateGitSnapshot: createCandidateGitSnapshot(workspace, [{
+      projectId: REVIEW_PROJECT_ID,
+      commit: REVIEW_BASE_COMMIT
+    }])
+  };
+}
+
+function dispatchSyntheticPendingReviews(store, taskId, options) {
+  for (const round of store.listReviewRounds(taskId).filter((entry) => (
+    entry.status === "pending" && entry.workspace === undefined
+  ))) {
+    const root = store.getConfig().defaultWorkspace;
+    const workspaceRoot = join(root, "synthetic-review", taskId, round.id);
+    const workspace = createManagedWorkspace({
+      owner: { type: "review-round", taskId, reviewRoundId: round.id },
+      root: workspaceRoot,
+      entries: [{
+        projectId: REVIEW_PROJECT_ID,
+        directory: "review-fixture",
+        access: "write",
+        path: join(workspaceRoot, "review-fixture"),
+        branch: `yui/${taskId}/${round.id}`,
+        baseRef: round.reviewBaseCommit,
+        baseCommit: round.reviewBaseCommit
+      }]
+    }, NOW);
+    store.transaction((tx) => {
+      const reviewer = tx.getRole(taskId, round.reviewerRoleName);
+      assert.notEqual(reviewer, null);
+      tx.saveManagedWorkspace(workspace);
+      tx.saveReviewRound(taskId, attachReviewRoundWorkspace(round, workspace));
+      tx.saveRole(taskId, updateRole(reviewer, { workspace: workspace.root }, NOW));
+    });
+    dispatchPreparedReviewRound(taskId, round.id, store, options);
+  }
+}
+
+function cleanupSyntheticReviewWorkspace(store, taskId, reviewRoundId) {
+  if (reviewRoundId === undefined) return;
+  const round = store.getReviewRound(taskId, reviewRoundId);
+  if (round === null || (round.status !== "completed" && round.status !== "failed")) return;
+  const workspace = store.getReviewRoundWorkspace(taskId, round.id);
+  if (workspace?.owner.type !== "review-round"
+    || workspace.owner.reviewRoundId !== round.id) return;
+  store.transaction((tx) => {
+    tx.removeManagedWorkspace(workspace.owner);
+    tx.saveReviewRound(taskId, recordReviewWorkspaceDisposition(round, "removed", NOW));
+  });
 }
 
 function createTask(store, options, title = "Plan first") {
@@ -133,11 +290,11 @@ function markDelivered(store, run) {
       if (mailbox.pending === null) {
         mailbox = enqueueSignal(mailbox, {
           reason: "fixture-run-dispatched",
-          refs: [{ type: "run", id: run.id }],
+          refs: [{ type: "run", taskId: run.taskId, id: run.id }],
           occurredAt: NOW.toISOString()
         });
       }
-      const batchId = `agent-run:${run.id}`;
+      const batchId = `agent-run:${run.taskId}/${run.id}`;
       mailbox = bindExecution(
         claimPending(mailbox, {
           batchId,
@@ -145,7 +302,7 @@ function markDelivered(store, run) {
           startedAt: NOW.toISOString()
         }),
         batchId,
-        { type: "run", id: run.id }
+        { type: "run", taskId: run.taskId, id: run.id }
       );
       tx.saveWorkMailbox(mailbox);
     }
@@ -154,20 +311,76 @@ function markDelivered(store, run) {
 }
 
 function recordReadyNativeSession(store, taskId, roleName, nativeSessionId) {
+  const effective = store.listAgentRuns(taskId)
+    .filter((run) => run.roleName === roleName)
+    .at(-1)?.effective;
+  assert.ok(effective, `missing historical effective launch for ${taskId}/${roleName}`);
   let sessions = createRoleSessionSet({
     scope: "task",
     taskId,
     roleName
-  }, "codex", NOW);
+  }, effective.agentId, NOW);
   sessions = recordRoleAgentSession(sessions, {
-    agentId: "codex",
-    adapterId: "codex",
+    agentId: effective.agentId,
+    adapterId: effective.adapterId,
     nativeSessionId,
     policy: "fixed",
-    status: "ready"
+    status: "ready",
+    effective
   }, NOW);
   store.saveTaskRoleSessionSet(sessions);
 }
+
+test("CLI yield clears matching Leader stall attention and rejects duplicate terminalization", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Recover Leader attention");
+  run(["activate", task.id], store, options);
+  run(["work", "create", task.id, "Leader recovery"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  const active = dispatchTestRun(store, task.id, "leader", item.id);
+  markDelivered(store, active);
+  store.transaction((tx) => {
+    tx.saveEvent(task.id, createTaskEvent(
+      tx.nextEventId(task.id),
+      task.id,
+      "run.stalled",
+      {
+        runId: active.id,
+        roleName: "leader",
+        kind: "execution-stalled",
+        classification: "truly-stalled",
+        progressAt: active.createdAt,
+        idleMs: "1800000",
+        evidenceKey: "cli-yield-test",
+        status: "needs-attention"
+      },
+      NOW
+    ));
+    tx.saveOperatorNotification(createLeaderStallNotification(
+      task.id,
+      active.id,
+      active.createdAt,
+      "cli-yield-test",
+      NOW,
+      null
+    ));
+  });
+
+  run(["run", "yield", active.id, "--summary", "Leader recovered"], store, options);
+  assert.equal(store.getOperatorNotification(task.id), null);
+  assert.equal(store.getActiveAgentRun(task.id, "leader"), null);
+  assert.equal(
+    store.listEvents(task.id).filter(({ type, payload }) => (
+      type === "run.recovered" && payload.runId === active.id
+    )).length,
+    1
+  );
+  assert.throws(
+    () => run(["run", "yield", active.id, "--summary", "duplicate"], store, options),
+    /already terminal/u
+  );
+  assert.equal(store.getOperatorNotification(task.id), null);
+});
 
 test("Work Item rejection and cancellation close the acceptance loop without new states", (t) => {
   const { store, options } = fixture(t);
@@ -208,21 +421,26 @@ test("Work Item rejection and cancellation close the acceptance loop without new
   assert.equal(store.getWorkItem(task.id, rejected.id).status, "failed");
 
   assert.match(
-    run(["work", "cancel", rejected.id, "--summary", "No longer needed."], store, options),
-    /Cancelled Work Item/
+    run([
+      "work", "retire", rejected.id, "--summary", "No longer needed."
+    ], store, leaderOptions),
+    /Retired Work Item/
   );
-  assert.equal(store.getWorkItem(task.id, rejected.id).status, "cancelled");
+  assert.equal(store.getWorkItem(task.id, rejected.id).status, "retired");
   assert.equal(
     store.listEvents(task.id).some(({ type }) => type === "work.rejected"),
     true
   );
   assert.equal(
-    store.listEvents(task.id).some(({ type }) => type === "work.cancelled"),
+    store.listEvents(task.id).some(({ type }) => type === "work.retired"),
     true
   );
 });
 
 function dispatchTestRun(store, taskId, roleName, workItemId, input = "test run") {
+  if (store.getReviewConfig() !== null) {
+    ensureSyntheticReviewCandidateWorkspace(store, taskId, [workItemId]);
+  }
   const role = store.getRole(taskId, roleName);
   if (store.getActiveAgentRun(taskId, roleName) !== null) {
     throw new Error(`${taskId}/${roleName} already has an active run.`);
@@ -244,7 +462,7 @@ function dispatchTestRun(store, taskId, roleName, workItemId, input = "test run"
       taskRoleSessionTitle(store.getTask(taskId), roleName)
     ),
     NOW,
-    { workItemId, workspace }
+    { workItemId, ...(workspace === undefined ? {} : { workspace }) }
   );
   store.transaction((tx) => {
     tx.saveAgentRun(run);
@@ -255,7 +473,10 @@ function dispatchTestRun(store, taskId, roleName, workItemId, input = "test run"
     const target = { kind: "role", taskId, roleName };
     const mailbox = enqueueSignal(tx.getWorkMailbox(target) ?? createWorkMailbox(target), {
       reason: "run-dispatched",
-      refs: [{ type: "run", id: run.id }, { type: "work-item", id: workItemId }],
+      refs: [
+        { type: "run", taskId, id: run.id },
+        { type: "work-item", taskId, id: workItemId }
+      ],
       occurredAt: NOW.toISOString()
     });
     tx.saveWorkMailbox(mailbox);
@@ -636,19 +857,19 @@ test("assigned Work dispatch honors dependencies and Worker yield awaits Leader 
     new RegExp(`Work Item dependency is not completed: ${first.id}`)
   );
   run(["work", "dispatch", first.id, "--input", "implement"], store, options);
-  assert.equal(store.findWorkItem(second.id)?.status, "pending");
+  assert.equal(store.getWorkItem(second.taskId, second.id)?.status, "pending");
   const active = store.getActiveAgentRun(task.id, "worker");
   assert.equal(active?.workItemId, first.id);
-  assert.equal(active?.agentId, "codex");
-  assert.equal(active?.adapterId, "codex");
+  assert.equal(active?.effective.agentId, "codex");
+  assert.equal(active?.effective.adapterId, "codex");
   const workerMailbox = store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: "worker" });
   assert.deepEqual(workerMailbox.pending.reasons, ["run-dispatched"]);
   assert.ok(workerMailbox.pending.refs.some((ref) => ref.type === "run" && ref.id === active.id));
 
   markDelivered(store, active);
   run(["run", "yield", active.id, "--summary", "implemented"], store, options);
-  assert.equal(store.findAgentRun(active.id)?.status, "yielded");
-  assert.equal(store.findWorkItem(first.id)?.status, "awaiting_acceptance");
+  assert.equal(store.getAgentRun(active.taskId, active.id)?.status, "yielded");
+  assert.equal(store.getWorkItem(first.taskId, first.id)?.status, "awaiting_acceptance");
   assert.equal(store.getActiveAgentRun(task.id, "worker"), null);
   const resultMessage = store.listMessages(task.id).at(-1);
   assert.deepEqual(resultMessage.author, { type: "role", roleName: "worker" });
@@ -667,7 +888,7 @@ test("assigned Work dispatch honors dependencies and Worker yield awaits Leader 
     ),
     /assigned Work Item.*accept or reject/iu
   );
-  assert.equal(store.findWorkItem(first.id)?.status, "awaiting_acceptance");
+  assert.equal(store.getWorkItem(first.taskId, first.id)?.status, "awaiting_acceptance");
 
   const leaderOptions = {
     ...options,
@@ -678,9 +899,52 @@ test("assigned Work dispatch honors dependencies and Worker yield awaits Leader 
     }
   };
   run(["work", "accept", first.id, "--summary", "reviewed"], store, leaderOptions);
-  assert.equal(store.findWorkItem(first.id)?.status, "completed");
+  assert.equal(store.getWorkItem(first.taskId, first.id)?.status, "completed");
   run(["work", "dispatch", second.id], store, options);
-  assert.equal(store.findWorkItem(second.id)?.status, "running");
+  assert.equal(store.getWorkItem(second.taskId, second.id)?.status, "running");
+});
+
+test("desired Agent drift preserves the in-flight Run's exact yield authority", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Immutable yield identity");
+  run(["activate", task.id], store, options);
+  run(["role", "add", task.id, "worker"], store, options);
+  run(["work", "create", task.id, "implementation", "--role", "worker"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+
+  run(["work", "dispatch", item.id], store, options);
+  const active = store.getActiveAgentRun(task.id, "worker");
+  assert.equal(active?.effective.agentId, "codex");
+  markDelivered(store, active);
+  recordReadyNativeSession(store, task.id, "worker", "codex-session");
+  store.transaction((tx) => {
+    const fence = {
+      agentId: active.effective.agentId,
+      runId: active.id,
+      receiptId: `agent-run:${task.id}/${active.id}`
+    };
+    const sessions = tx.getTaskRoleSessionSet(task.id, "worker");
+    tx.saveTaskRoleSessionSet(markTaskRoleRunDelivered(
+      bindTaskRoleRun(sessions, fence, NOW),
+      fence,
+      NOW
+    ));
+  });
+
+  const runSnapshot = structuredClone(active.effective);
+  run(["role", "bind", task.id, "worker", "claude"], store, options);
+  assert.equal(store.getRole(task.id, "worker")?.activeAgentId, "claude");
+  assert.deepEqual(store.getActiveAgentRun(task.id, "worker")?.effective, runSnapshot);
+  assert.equal(store.getTaskRoleSessionSet(task.id, "worker")?.activeAgentId, "codex");
+  assert.equal(store.getTaskRoleSessionSet(task.id, "worker")?.inFlight?.agentId, "codex");
+
+  run(["run", "yield", active.id, "--summary", "old snapshot completed"], store, options);
+  assert.equal(store.getAgentRun(task.id, active.id)?.status, "yielded");
+  assert.equal(store.getActiveAgentRun(task.id, "worker"), null);
+  assert.equal(store.getTaskRoleSessionSet(task.id, "worker")?.inFlight, null);
+  assert.equal(store.getTaskRoleSessionSet(task.id, "worker")?.activeAgentId, "codex");
+  assert.equal(store.getRole(task.id, "worker")?.activeAgentId, "claude");
+  assert.deepEqual(store.getAgentRun(task.id, active.id)?.effective, runSnapshot);
 });
 
 test("always review creates a ReviewRound under the same WorkItem and never reviews the review", (t) => {
@@ -726,11 +990,14 @@ test("always review creates a ReviewRound under the same WorkItem and never revi
   const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
   assert.equal(reviewRun.purpose, "review");
   assert.equal(reviewRun.reviewRoundId, rounds[0].id);
-  assert.match(reviewRun.input, /Do not modify files or create another WorkItem/);
+  assert.match(reviewRun.input, /freely edit source\/tests/);
+  assert.match(reviewRun.input, /only inside this ReviewRound-owned workspace/);
+  assert.match(reviewRun.input, /Do not push, integrate, mutate Task state/);
   assert.match(reviewRun.input, /candidate summary is a pointer, not proof/i);
-  assert.match(reviewRun.input, /reachable, material, actionable problems/i);
-  assert.match(reviewRun.input, /speculative extreme cases/i);
-  assert.match(reviewRun.input, /the Leader decides/i);
+  assert.match(reviewRun.input, /Review yield completes only this Round and creates no Candidate or ChangeSet/);
+  assert.match(reviewRun.input, /The Leader alone interprets and routes evidence/);
+  assert.match(reviewRun.input, /clear Markdown or JSON/);
+  assert.match(reviewRun.input, /no fixed wording or field list is required/);
 
   const leaderOptions = {
     ...options,
@@ -750,19 +1017,29 @@ test("always review creates a ReviewRound under the same WorkItem and never revi
   );
 
   markDelivered(store, reviewRun);
-  run(["run", "yield", reviewRun.id, "--summary", "One issue to consider."], store, options);
+  run(["run", "yield", reviewRun.id, "--summary", JSON.stringify({
+    summary: "One issue to consider.",
+    checks: [{ name: "inspection", outcome: "passed", details: "Reviewed candidate evidence." }]
+  })], store, options);
   assert.equal(store.listReviewRounds(task.id).length, 1);
   assert.equal(store.listWorkItems(task.id).length, 1);
-  assert.deepEqual(store.getReviewRound(task.id, rounds[0].id), {
-    ...rounds[0],
-    reviewerRunId: reviewRun.id,
-    status: "completed",
-    summary: "One issue to consider.",
-    endedAt: NOW.toISOString()
-  });
-  assert.equal(store.findWorkItem(item.id)?.status, "awaiting_acceptance");
+  const completedRound = store.getReviewRound(task.id, rounds[0].id);
+  assert.equal(completedRound.reviewerRunId, reviewRun.id);
+  assert.equal(completedRound.status, "completed");
+  assert.equal(completedRound.summary, "One issue to consider.");
+  assert.deepEqual(completedRound.checks, [{
+    name: "inspection",
+    outcome: "passed",
+    details: "Reviewed candidate evidence."
+  }]);
+  assert.equal(completedRound.reviewBaseCommit, REVIEW_BASE_COMMIT);
+  assert.equal(completedRound.workspace.owner.type, "review-round");
+  assert.equal(completedRound.workspace.owner.reviewRoundId, completedRound.id);
+  assert.equal(completedRound.workspaceDisposition.kind, "removed");
+  assert.equal(completedRound.endedAt, NOW.toISOString());
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "awaiting_acceptance");
   run(["work", "accept", item.id, "--summary", "Leader considered the review."], store, leaderOptions);
-  assert.equal(store.findWorkItem(item.id)?.status, "completed");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "completed");
 });
 
 test("global review policy is snapshotted by each candidate, not by Task creation", (t) => {
@@ -801,7 +1078,10 @@ test("global review policy is snapshotted by each candidate, not by Task creatio
   store.saveConfig(configWithoutReview);
   const firstReview = store.getActiveAgentRun(task.id, "reviewer");
   markDelivered(store, firstReview);
-  run(["run", "yield", firstReview.id, "--summary", "reviewed first candidate"], store, options);
+  run(["run", "yield", firstReview.id, "--summary", JSON.stringify({
+    summary: "reviewed first candidate",
+    checks: [{ name: "inspection", outcome: "passed" }]
+  })], store, options);
   const leaderOptions = {
     ...options,
     environment: {
@@ -867,14 +1147,14 @@ test("always review covers a Leader-managed WorkItem without inventing an execut
       reviewPolicy: { roleName: "reviewer", trigger: "leader" },
       workspace: foreignWorkspace
     }, NOW)),
-    /workspace belongs to another Task/
+    /WorkItem-owned workspace/
   );
   run([
     "work", "update", item.id, "done",
     "--summary", "Native subagent result is ready."
   ], store, leaderOptions);
 
-  const awaiting = store.findWorkItem(item.id);
+  const awaiting = store.getWorkItem(item.taskId, item.id);
   assert.equal(awaiting.status, "awaiting_acceptance");
   assert.deepEqual(store.listAgentRuns(task.id).filter(({ purpose }) => purpose === "execution"), []);
   const [round] = store.listReviewRounds(task.id);
@@ -913,7 +1193,7 @@ test("always review covers a yielded Leader execution candidate", (t) => {
 
   run(["run", "yield", execution.id, "--summary", "Leader candidate ready."], store, options);
 
-  assert.equal(store.findWorkItem(item.id).status, "awaiting_acceptance");
+  assert.equal(store.getWorkItem(item.taskId, item.id).status, "awaiting_acceptance");
   const candidate = store.getWorkItem(task.id, item.id).candidates.at(-1);
   assert.equal(store.listReviewRounds(task.id)[0].candidateId, candidate.id);
   assert.equal(candidate.summary, "Leader candidate ready.");
@@ -921,7 +1201,7 @@ test("always review covers a yielded Leader execution candidate", (t) => {
   assert.equal(store.getActiveAgentRun(task.id, "reviewer").purpose, "review");
 });
 
-test("review can reuse the candidate Role without leaving its active status idle", (t) => {
+test("review fails closed when the reviewer Role produced the candidate", (t) => {
   const { root, store, options } = fixture(t);
   store.transaction((tx) => {
     tx.saveGlobalRole(createGlobalRole(
@@ -947,9 +1227,12 @@ test("review can reuse the candidate Role without leaving its active status idle
 
   run(["run", "yield", execution.id, "--summary", "candidate ready"], store, options);
 
-  const reviewRun = store.getActiveAgentRun(task.id, "worker");
-  assert.equal(reviewRun.purpose, "review");
-  assert.equal(store.getRole(task.id, "worker").status, "running");
+  const [round] = store.listReviewRounds(task.id);
+  assert.equal(store.getActiveAgentRun(task.id, "worker"), null);
+  assert.equal(round.status, "failed");
+  assert.match(round.summary, /separate from the Candidate producer/);
+  assert.equal(round.workspace, undefined);
+  assert.equal(store.getRole(task.id, "worker").status, "idle");
 });
 
 test("a failed ReviewRound remains evidence but does not override Leader judgment", (t) => {
@@ -978,8 +1261,15 @@ test("a failed ReviewRound remains evidence but does not override Leader judgmen
   run(["run", "yield", execution.id, "--summary", "candidate ready"], store, options);
   const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
   store.transaction((tx) => {
-    tx.saveAgentRun(failAgentRun(reviewRun, "Reviewer runtime unavailable.", NOW));
-    tx.clearActiveAgentRun(task.id, "reviewer");
+    const result = terminalizeExactTaskRun(tx, {
+      taskId: task.id,
+      roleName: reviewRun.roleName,
+      agentId: reviewRun.effective.agentId,
+      runId: reviewRun.id,
+      receiptId: `agent-run:${task.id}/${reviewRun.id}`,
+      outcome: { status: "failed", summary: "Reviewer runtime unavailable." }
+    }, NOW);
+    assert.equal(result.disposition, "applied");
   });
   assert.equal(store.listReviewRounds(task.id)[0].status, "failed");
 
@@ -995,7 +1285,7 @@ test("a failed ReviewRound remains evidence but does not override Leader judgmen
     "work", "accept", item.id,
     "--summary", "User authorized acceptance after the review failure."
   ], store, leaderOptions);
-  assert.equal(store.findWorkItem(item.id).status, "completed");
+  assert.equal(store.getWorkItem(item.taskId, item.id).status, "completed");
 });
 
 test("leader-triggered review starts only when the Leader requests it", (t) => {
@@ -1034,7 +1324,7 @@ test("leader-triggered review starts only when the Leader requests it", (t) => {
   };
   assert.match(
     run(["work", "review", item.id], store, leaderOptions),
-    /Review queued/
+    /Review requested/
   );
   assert.equal(store.listReviewRounds(task.id).length, 1);
   assert.equal(store.getActiveAgentRun(task.id, "reviewer")?.purpose, "review");
@@ -1077,7 +1367,10 @@ test("the latest ReviewRound stays authoritative when timestamps tie", (t) => {
     run(["work", "review", item.id], store, leaderOptions);
     const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
     markDelivered(store, reviewRun);
-    run(["run", "yield", reviewRun.id, "--summary", `review ${round}`], store, options);
+    run(["run", "yield", reviewRun.id, "--summary", JSON.stringify({
+      summary: `review ${round}`,
+      checks: [{ name: "inspection", outcome: "passed" }]
+    })], store, options);
   }
   run(["work", "review", item.id], store, leaderOptions);
 
@@ -1130,7 +1423,7 @@ test("leader-triggered review can inspect a Leader-managed direct candidate", (t
   assert.deepEqual(store.listReviewRounds(task.id), []);
   assert.match(
     run(["work", "review", item.id], store, leaderOptions),
-    /Review queued/
+    /Review requested/
   );
   assert.equal(store.listReviewRounds(task.id)[0].candidateId, candidate.id);
 });
@@ -1207,7 +1500,7 @@ test("Leader rejection preserves a Worker WorkItem for another dispatch round", 
   assert.notEqual(second.id, first.id);
   assert.equal(second.mode, "resume");
   assert.equal(second.workItemId, item.id);
-  assert.equal(store.findWorkItem(item.id)?.status, "running");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "running");
 });
 
 test("retry replaces the old causal Run marker instead of reusing it", (t) => {
@@ -1215,13 +1508,13 @@ test("retry replaces the old causal Run marker instead of reusing it", (t) => {
   const task = createTask(store, options, "Retry marker");
   run(["activate", task.id], store, options);
   const failed = failAgentRun(createAgentRun(
-    "agent-run-old",
+    "agent-run-99",
     task.id,
     "leader",
     "new",
     markYuiRunInput(
       "recover",
-      "agent-run-old",
+      "agent-run-99",
       `Yui · ${task.id} · Retry marker · Leader`
     ),
     NOW
@@ -1271,7 +1564,7 @@ test("a failed Worker Run can retry its failed WorkItem", (t) => {
 
   run(["run", "retry", active.id], store, options);
 
-  assert.equal(store.findWorkItem(item.id)?.status, "running");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "running");
   const retried = store.getActiveAgentRun(task.id, "worker");
   assert.equal(retried?.workItemId, item.id);
   assert.match(retried.input, /yui task run yield <current-run-id>/);
@@ -1367,7 +1660,7 @@ test("Leader yield does not self-wake and preserves a wake queued while busy", (
   const pending = store.getPendingWakeup(task.id);
   run(["run", "yield", runRecord.id, "--summary", "coordinated"], store, options);
   assert.deepEqual(store.getPendingWakeup(task.id), pending);
-  assert.equal(store.findWorkItem(item.id)?.status, "completed");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "completed");
 });
 
 test("Leader can track conversation-internal work without a Task Role", (t) => {
@@ -1401,17 +1694,17 @@ test("Leader can track conversation-internal work without a Task Role", (t) => {
     "work", "update", item.id, "running",
     "--summary", "executor=subagent; profile=reviewer@3; model=inherited"
   ], store, leaderOptions);
-  assert.equal(store.findWorkItem(item.id)?.status, "running");
-  assert.equal(store.findWorkItem(item.id)?.outcome, undefined);
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "running");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.outcome, undefined);
   assert.equal(store.getActiveAgentRun(task.id, "leader"), null);
 
   run([
     "work", "update", item.id, "done",
     "--summary", "Leader reviewed the native subagent result and verified the evidence."
   ], store, leaderOptions);
-  assert.equal(store.findWorkItem(item.id)?.status, "completed");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "completed");
   assert.equal(
-    store.findWorkItem(item.id)?.outcome,
+    store.getWorkItem(item.taskId, item.id)?.outcome,
     "Leader reviewed the native subagent result and verified the evidence."
   );
   const progress = store.listEvents(task.id)
@@ -1464,8 +1757,8 @@ test("Leader-owned work honors dependencies and can retry directly", (t) => {
     "--summary", "First native subagent result did not pass review."
   ], store, leaderOptions);
   run(["work", "update", implementation.id, "running"], store, leaderOptions);
-  assert.equal(store.findWorkItem(implementation.id)?.status, "running");
-  assert.equal(store.findWorkItem(implementation.id)?.outcome, undefined);
+  assert.equal(store.getWorkItem(implementation.taskId, implementation.id)?.status, "running");
+  assert.equal(store.getWorkItem(implementation.taskId, implementation.id)?.outcome, undefined);
 });
 
 test("Leader control Run without a WorkItem can yield and release the pending wake boundary", (t) => {
@@ -1491,7 +1784,7 @@ test("Leader control Run without a WorkItem can yield and release the pending wa
     const fence = {
       agentId: leader.activeAgentId,
       runId: controlRun.id,
-      receiptId: `agent-run:${controlRun.id}`
+      receiptId: `agent-run:${task.id}/${controlRun.id}`
     };
     const sessions = tx.getTaskRoleSessionSet(task.id, "leader")
       ?? createRoleSessionSet(
@@ -1507,7 +1800,7 @@ test("Leader control Run without a WorkItem can yield and release the pending wa
   });
 
   run(["run", "yield", controlRun.id, "--summary", "reviewed"], store, options);
-  assert.equal(store.findAgentRun(controlRun.id)?.status, "yielded");
+  assert.equal(store.getAgentRun(controlRun.taskId, controlRun.id)?.status, "yielded");
   assert.equal(store.getActiveAgentRun(task.id, "leader"), null);
   assert.equal(store.getRole(task.id, "leader")?.status, "idle");
   assert.equal(store.getPendingWakeup(task.id), null);
@@ -1546,7 +1839,7 @@ test("a rejected Worker control yield rolls back all staged FileTaskStore writes
     ),
     /not a work run/i
   );
-  assert.equal(store.findAgentRun(invalidRun.id)?.status, "active");
+  assert.equal(store.getAgentRun(invalidRun.taskId, invalidRun.id)?.status, "active");
   assert.equal(store.getActiveAgentRun(task.id, "worker")?.id, invalidRun.id);
   assert.equal(store.getRole(task.id, "worker")?.status, "running");
   assert.deepEqual(store.listMessages(task.id), beforeMessages);
@@ -1585,11 +1878,12 @@ test("Task Role add, update, show, and remove preserve lean field-level configur
   run([
     "role", "add", task.id, "reviewer", "--agent", "codex",
     "--description", "Review changes", "--model", "gpt-5.6-sol",
-    "--effort", "high", "--sandbox", "read-only"
+    "--effort", "high", "--permission-strategy", "configured",
+    "--sandbox", "read-only", "--approval", "never"
   ], store, options);
   run([
     "role", "update", task.id, "reviewer", "--agent", "codex",
-    "--clear-model", "--approval", "never", "--description", "Review safely"
+    "--clear-model", "--description", "Review safely"
   ], store, options);
 
   const role = store.getRole(task.id, "reviewer");
@@ -1597,12 +1891,17 @@ test("Task Role add, update, show, and remove preserve lean field-level configur
   assert.deepEqual(role.agentBindings.codex.config, {
     adapterId: "codex",
     effort: "high",
-    permission: { sandbox: "read-only", approval: "never" }
+    permission: {
+      strategy: "configured",
+      sandbox: "read-only",
+      approval: "never"
+    }
   });
 
   run([
     "role", "update", task.id, "reviewer", "--agent", "claude",
-    "--model", "claude-opus", "--permission-mode", "dontAsk",
+    "--model", "claude-opus", "--permission-strategy", "configured",
+    "--permission-mode", "dontAsk",
     "--allowed-tool", "Bash(yui task run yield *)",
     "--allowed-tool", "Read", "--allowed-tool", "Grep", "--allowed-tool", "Glob",
     "--disallowed-tool", "Edit"
@@ -1613,6 +1912,7 @@ test("Task Role add, update, show, and remove preserve lean field-level configur
     adapterId: "claude",
     model: "claude-opus",
     permission: {
+      strategy: "configured",
       mode: "dontAsk",
       allowedTools: ["Bash(yui task run yield *)", "Read", "Grep", "Glob"],
       disallowedTools: ["Edit"]
@@ -1633,7 +1933,7 @@ test("Task Role add, update, show, and remove preserve lean field-level configur
   assert.deepEqual(store.getRole(task.id, "reviewer").agentBindings.claude.config, {
     adapterId: "claude",
     model: "claude-opus",
-    permission: { mode: "dontAsk" }
+    permission: { strategy: "configured", mode: "dontAsk" }
   });
 
   const shown = run(["role", "show", task.id, "reviewer"], store, options);
@@ -1662,7 +1962,7 @@ test("Task Role creation copies the global worker Role's complete Agent binding 
         adapterId: "claude",
         model: "sonnet",
         effort: "max",
-        yolo: true
+        permission: { strategy: "bypass" }
       }
     )],
     "claude",
@@ -1679,15 +1979,15 @@ test("Task Role creation copies the global worker Role's complete Agent binding 
       adapterId: "claude",
       model: "sonnet",
       effort: "max",
-      yolo: true
+      permission: { strategy: "bypass" }
     }
   );
   assert.match(receipt, /Runtime source: Global Role worker/);
   assert.match(receipt, /Agent: claude\/claude/);
-  assert.match(receipt, /Model: sonnet; effort: max; YOLO: enabled/);
+  assert.match(receipt, /Model: sonnet; effort: max; permission: bypass/);
   const context = run(["context", task.id], store, options);
   assert.match(context, /Runtime source at creation: Global Role worker/);
-  assert.match(context, /Model: sonnet; effort: max; YOLO: enabled/);
+  assert.match(context, /Model: sonnet; effort: max; permission: bypass/);
 });
 
 test("integration-required Task cannot complete without delivery evidence", (t) => {
@@ -1741,8 +2041,7 @@ test("Leader creates a profiled Worker instance, binds Claude config, then launc
     "role", "update", task.id, "worker",
     "--agent", "claude",
     "--model", "claude-opus",
-    "--permission-mode", "acceptEdits",
-    "--yolo", "true"
+    "--permission-strategy", "bypass"
   ], store, options);
   run(["role", "bind", task.id, "worker", "claude"], store, options);
 
@@ -1757,8 +2056,7 @@ test("Leader creates a profiled Worker instance, binds Claude config, then launc
   assert.deepEqual(worker.agentBindings.claude.config, {
     adapterId: "claude",
     model: "claude-opus",
-    permission: { mode: "acceptEdits" },
-    yolo: true
+    permission: { strategy: "bypass" }
   });
   assert.equal(worker.agentBindings.codex.config.model, undefined);
 
@@ -1778,7 +2076,8 @@ test("Leader creates a profiled Worker instance, binds Claude config, then launc
     roleName: "worker",
     agentId: "claude",
     adapterId: "claude",
-    mode: "new"
+    mode: "new",
+    effective: store.getActiveAgentRun(task.id, "worker").effective
   });
   assert.equal(plan.launch.command, "claude");
   assert.deepEqual(
@@ -1788,8 +2087,12 @@ test("Leader creates a profiled Worker instance, binds Claude config, then launc
     ),
     ["--model", "claude-opus"]
   );
-  assert.ok(plan.launch.args.includes("--dangerously-skip-permissions"));
+  assert.equal(plan.session.effective.profileAccess, "write");
+  assert.deepEqual(plan.session.effective.writeProjectIds, []);
+  assert.equal(plan.session.effective.permission.strategy, "bypass");
+  assert.equal(plan.launch.args.includes("--dangerously-skip-permissions"), true);
   assert.equal(plan.launch.args.includes("--permission-mode"), false);
+  assert.equal(plan.launch.args.includes("--disallowed-tools"), false);
   assert.equal(plan.session.nativeSessionId, "claude-worker-session");
 });
 
@@ -1873,9 +2176,32 @@ test("archive refuses active work and leaves its runtime ownership intact", (t) 
     /must be completed/i
   );
   assert.equal(store.getTask(task.id)?.status, "active");
-  assert.equal(store.findAgentRun(active.id)?.status, "active");
-  assert.equal(store.findWorkItem(item.id)?.status, "running");
+  assert.equal(store.getAgentRun(active.taskId, active.id)?.status, "active");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "running");
   assert.equal(store.getActiveAgentRun(task.id, "leader")?.id, active.id);
+});
+
+test("archive fails closed instead of terminalizing a residual active Run", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Residual runtime");
+  run(["activate", task.id], store, options);
+  run(["work", "create", task.id, "residual work"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  dispatchTestRun(store, task.id, "leader", item.id);
+  const active = store.getActiveAgentRun(task.id, "leader");
+  store.saveTask(completeTask(store.getTask(task.id), NOW, {
+    by: "user",
+    summary: "Synthetic terminal state for the archive boundary."
+  }));
+
+  assert.throws(
+    () => run(["archive", task.id, "--abandon"], store, options),
+    /active Run.*Leader|Role leader.*stop its runtime/i
+  );
+  assert.equal(store.getTask(task.id).status, "completed");
+  assert.equal(store.getAgentRun(active.taskId, active.id).status, "active");
+  assert.equal(store.getActiveAgentRun(task.id, "leader").id, active.id);
+  assert.equal(store.getWorkItem(task.id, item.id).status, "running");
 });
 
 test("completion fences active behavior until an explicit reopen", (t) => {
@@ -1904,6 +2230,19 @@ test("completion fences active behavior until an explicit reopen", (t) => {
       YUI_ROLE: "leader"
     }
   });
+  let leaderSessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: "leader"
+  }, "codex", NOW);
+  leaderSessions = recordRoleAgentSession(leaderSessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "leader-native-session",
+    policy: "fixed",
+    status: "ready"
+  }, NOW);
+  store.saveTaskRoleSessionSet(leaderSessions);
 
   run(["complete", task.id, "--summary", "Everything requested is done."], store, options);
   const completed = store.getTask(task.id);
@@ -1911,7 +2250,25 @@ test("completion fences active behavior until an explicit reopen", (t) => {
   assert.equal(completed.completionSummary, "Everything requested is done.");
   assert.equal(store.getPendingWakeup(task.id), null);
   assert.equal(store.getLeaderFailure(task.id), null);
-  assert.equal(store.getOperatorNotification(task.id), null);
+  assert.deepEqual(store.getOperatorNotification(task.id), {
+    schemaVersion: 1,
+    taskId: task.id,
+    type: "task-terminal",
+    status: "completed",
+    by: "user",
+    summary: "Everything requested is done.",
+    createdAt: NOW.toISOString(),
+    updatedAt: NOW.toISOString()
+  });
+  assert.deepEqual(
+    store.getWorkMailbox({ kind: "operator" }).pending.reasons,
+    ["task-terminal"]
+  );
+  assert.equal(store.getWorkMailbox({
+    kind: "role-runtime",
+    taskId: task.id,
+    roleName: "leader"
+  }), null);
   assert.throws(
     () => runTaskCommand(["message", "send", task.id, "continue"], store, options),
     /completed.*reopen/i
@@ -1941,13 +2298,22 @@ test("Task completion requires every WorkItem to be terminal", (t) => {
   );
   assert.equal(store.getTask(task.id)?.status, "active");
 
-  run(["work", "cancel", item.id, "--summary", "No longer needed."], store, options);
+  run([
+    "work", "retire", item.id, "--summary", "No longer needed."
+  ], store, {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  });
   run(["complete", task.id, "--summary", "Done"], store, options);
   assert.equal(store.getTask(task.id)?.status, "completed");
-  assert.equal(store.findWorkItem(item.id)?.status, "cancelled");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "retired");
 });
 
-test("a failed WorkItem can be explicitly closed after its isolated workspace was abandoned", (t) => {
+test("a failed WorkItem can be explicitly retired after its isolated workspace was abandoned", (t) => {
   const { store, options } = fixture(t);
   const task = createTask(store, options, "Recover failed isolated work");
   run(["activate", task.id], store, options);
@@ -1963,15 +2329,22 @@ test("a failed WorkItem can be explicitly closed after its isolated workspace wa
   );
 
   run(
-    ["work", "update", item.id, "superseded", "--summary", "Replacement completed."],
+    ["work", "retire", item.id, "--summary", "No deliverable remains."],
     store,
-    options
+    {
+      ...options,
+      environment: {
+        YUI_SESSION_SCOPE: "task",
+        YUI_TASK_ID: task.id,
+        YUI_ROLE: "leader"
+      }
+    }
   );
   run(["complete", task.id, "--summary", "Recovered and delivered."], store, options);
 
   assert.equal(store.getTask(task.id)?.status, "completed");
-  assert.equal(store.findWorkItem(item.id)?.status, "superseded");
-  assert.equal(store.findWorkItem(item.id)?.workspaceDisposition, "abandoned");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "retired");
+  assert.equal(store.getWorkItem(item.taskId, item.id)?.workspaceDisposition, "abandoned");
 });
 
 test("a Leader control Run can complete its Task atomically", (t) => {
@@ -2008,10 +2381,32 @@ test("a Leader control Run can complete its Task atomically", (t) => {
   );
 
   assert.equal(store.getTask(task.id)?.status, "completed");
-  assert.equal(store.findAgentRun(controlRun.id)?.status, "yielded");
-  assert.equal(store.findAgentRun(controlRun.id)?.summary, "Final review passed.");
+  assert.equal(store.getAgentRun(controlRun.taskId, controlRun.id)?.status, "yielded");
+  assert.equal(store.getAgentRun(controlRun.taskId, controlRun.id)?.summary, "Final review passed.");
   assert.equal(store.getActiveAgentRun(task.id, "leader"), null);
   assert.equal(store.getRole(task.id, "leader")?.status, "idle");
+  assert.deepEqual(store.getOperatorNotification(task.id), {
+    schemaVersion: 1,
+    taskId: task.id,
+    type: "task-terminal",
+    status: "completed",
+    by: "leader",
+    summary: "Final review passed.",
+    createdAt: NOW.toISOString(),
+    updatedAt: NOW.toISOString()
+  });
+  assert.deepEqual(
+    store.getWorkMailbox({ kind: "operator" }).pending.reasons,
+    ["task-terminal"]
+  );
+  assert.equal(store.getWorkMailbox({
+    kind: "role-runtime",
+    taskId: task.id,
+    roleName: "leader"
+  }), null);
+
+  run(["reopen", task.id], store, options);
+  assert.equal(store.getOperatorNotification(task.id), null);
 });
 
 test("a Leader session cannot complete another Task as that Task's Leader", (t) => {
@@ -2048,7 +2443,7 @@ test("a Leader session cannot complete another Task as that Task's Leader", (t) 
         }
       }
     ),
-    /active Leader run/i
+    /managed Task Session.*matching Leader/i
   );
   assert.equal(store.getTask(target.id)?.status, "active");
   assert.equal(store.getActiveAgentRun(target.id, "leader")?.id, targetRun.id);

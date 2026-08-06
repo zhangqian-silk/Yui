@@ -52,9 +52,13 @@ import {
 import { runProjectCommand } from "./commands/projectCommands.js";
 import { runProfileCommand } from "./commands/profileCommands.js";
 import {
+  dispatchPreparedReviewRound,
+  failPendingReviewRound,
+  preserveReviewRoundWorkspace,
   runTaskCommand,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
+import { taskActor } from "./commands/taskActor.js";
 import { runTaskIntegrationCommand } from "./commands/taskIntegrationCommands.js";
 import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
 import {
@@ -71,14 +75,18 @@ import { FileSchedulerStoreAdapter } from "./controller/fileSchedulerStoreAdapte
 import { cleanControllerResource } from "./controller/resourceCleanupLinux.js";
 import { scanControllerResourceInventory } from "./controller/resourceInventoryLinux.js";
 import { runSessionNotifyCommand } from "./controller/sessionNotify.js";
-import { enqueueWork } from "./coordination/workMailboxQueue.js";
+import { runClaudeLifecycleHookCommand } from "./controller/claudeLifecycleHook.js";
 import { runDoctorCommand } from "./doctor/doctor.js";
 import { agentNotFound, CliError, runtimeError, usageError } from "./errors/cliError.js";
 import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
-import { TaskWorkspaceCoordinator } from "./repository/taskWorkspaceCoordinator.js";
+import {
+  TaskWorkspaceCoordinator,
+  WorkspaceCleanupBlockedError
+} from "./repository/taskWorkspaceCoordinator.js";
 import { FileTaskWorkspacePreparer } from "./repository/taskWorkspacePreparer.js";
 import { inspectStorageSchema, requireStorageSchema } from "./storage/storageSchema.js";
-import { FileTaskStore, resolveYuiHome, type TaskStore } from "./storage/taskStore.js";
+import { FileTaskStore, resolveYuiHome } from "./storage/taskStore.js";
+import { resolveTaskRecordReference } from "./task/taskRecordReference.js";
 import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
 import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
@@ -93,8 +101,9 @@ import {
   listOperatorSessions,
   operatorSessionRef
 } from "./operator/operatorSessionHistory.js";
+import { YUI_VERSION, yuiVersionIdentity } from "./version.js";
 
-const VERSION = readPackageVersion();
+const VERSION = YUI_VERSION;
 const rawArgs = process.argv.slice(2);
 const jsonOutput = rawArgs.includes("--json");
 const args = normalizeAliases(
@@ -104,7 +113,7 @@ const args = normalizeAliases(
 void main().catch((error: unknown) => {
   if (error instanceof CliError) {
     const rendered = jsonOutput
-      ? JSON.stringify({ ok: false, code: error.code, message: error.message, details: {} })
+      ? JSON.stringify({ ok: false, code: error.code, message: error.message, details: error.details })
       : `${error.code}: ${error.message}${error.helpText === undefined ? "" : `\n\n${error.helpText.trimEnd()}`}`;
     process.stderr.write(`${rendered}\n`);
     process.exitCode = error.exitCode;
@@ -123,7 +132,7 @@ export async function main(): Promise<void> {
     return;
   }
   if (args[0] === "version" && args.length === 1) {
-    emit(VERSION, true);
+    emit(VERSION, true, yuiVersionIdentity());
     return;
   }
 
@@ -187,11 +196,15 @@ export async function main(): Promise<void> {
     return;
   }
   if (args[0] === "internal") {
-    if (args[1] !== "session-notify" || args.length !== 3) {
-      throw usageError("Internal session notify usage is invalid.");
+    if (args[1] === "session-notify" && args.length === 3) {
+      await runSessionNotifyCommand(args[2], process.env);
+      return;
     }
-    await runSessionNotifyCommand(args[2], process.env);
-    return;
+    if (args[1] === "claude-hook" && args.length === 2) {
+      await runClaudeLifecycleHookCommand(readFileSync(0, "utf8"), process.env);
+      return;
+    }
+    throw usageError("Internal lifecycle callback usage is invalid.");
   }
 
   if (args[0] === "controller") {
@@ -500,13 +513,17 @@ export async function main(): Promise<void> {
     if (resolved[1] === "work" && resolved[2] === "isolate") {
       const workItemId = resolved[3];
       if (workItemId === undefined || resolved.length !== 4) {
-        throw usageError("Task work isolate usage: yui task work isolate <work>.");
+        throw usageError("Task work isolate usage: yui task work isolate <task>/<work>.");
       }
-      const workspace = await workspaceCoordinator.isolateWorkItem(workItemId);
+      const reference = cliWorkItemReference(workItemId, process.env);
+      const workspace = await workspaceCoordinator.isolateWorkItem(
+        reference.taskId,
+        reference.localId
+      );
       emit(
-        `Created WorkItem workspace for ${workItemId}\nWorkspace: ${workspace.root}\n`,
+        `Created WorkItem workspace for ${reference.taskId}/${reference.localId}\nWorkspace: ${workspace.root}\n`,
         false,
-        { workItemId, workspace }
+        { workItemRef: reference, workspace }
       );
       return;
     }
@@ -515,34 +532,45 @@ export async function main(): Promise<void> {
       const reviewRoundId = resolved[4];
       if (reviewRoundId === undefined || resolved.length !== 5) {
         throw usageError(
-          "Task work review cleanup usage: yui task work review cleanup <round>."
+          "Task work review cleanup usage: yui task work review cleanup <task>/<review-round>."
         );
       }
-      const removal = await workspacePreparer.cleanupReviewRoundWorkspace(reviewRoundId);
+      const reference = cliTaskRecordReference(reviewRoundId, "reviewRound", process.env);
+      const removal = await workspaceCoordinator.cleanupReviewRound(
+        reference.taskId,
+        reference.localId
+      );
       if (removal === "dirty") {
-        throw usageError(`ReviewRound workspace is dirty and was retained: ${reviewRoundId}.`);
+        throw usageError(
+          `ReviewRound workspace is dirty and was retained: ${reference.taskId}/${reference.localId}.`
+        );
       }
       emit(
-        `Cleaned ReviewRound workspace ${reviewRoundId} (${removal})\n`,
+        `Cleaned ReviewRound workspace ${reference.taskId}/${reference.localId} (${removal})\n`,
         false,
-        { reviewRoundId, workspace: { removal } }
+        { reviewRoundRef: reference, workspace: { removal } }
       );
       return;
     }
     if (resolved[1] === "work" && resolved[2] === "capture") {
       const workItemId = resolved[3];
       if (workItemId === undefined || resolved.length !== 4) {
-        throw usageError("Task work capture usage: yui task work capture <work>.");
+        throw usageError("Task work capture usage: yui task work capture <task>/<work>.");
       }
-      const changeSets = await new WorkItemChangeSetManager(store).capture(workItemId);
+      const reference = cliWorkItemReference(workItemId, process.env);
+      const changeSets = await new WorkItemChangeSetManager(store).capture(
+        reference.taskId,
+        reference.localId
+      );
+      const qualified = `${reference.taskId}/${reference.localId}`;
       emit(
         changeSets.length === 0
-          ? `WorkItem workspace has no changes to capture: ${workItemId}\n`
+          ? `WorkItem workspace has no changes to capture: ${qualified}\n`
           : `Captured ChangeSets ${changeSets.map(({ id }) => id).join(", ")} from ${
-              workItemId
+              qualified
             }\n`,
         false,
-        { workItemId, changeSets }
+        { workItemRef: reference, changeSets }
       );
       return;
     }
@@ -550,34 +578,130 @@ export async function main(): Promise<void> {
       const workItemId = resolved[3];
       const disposition = resolved[4];
       if (workItemId === undefined
-        || !["--integrated", "--abandon"].includes(disposition ?? "")
+        || !["--runtime-only", "--integrated", "--abandon"].includes(disposition ?? "")
         || resolved.length !== 5) {
-        throw usageError("Task work cleanup usage: yui task work cleanup <work> (--integrated|--abandon).");
+        throw usageError(
+          "Task work cleanup usage: yui task work cleanup <task>/<work> "
+          + "(--runtime-only|--integrated|--abandon)."
+        );
+      }
+      const reference = cliWorkItemReference(workItemId, process.env);
+      const qualified = `${reference.taskId}/${reference.localId}`;
+      const actor = taskActor(process.env, reference.taskId);
+      if (actor === "operator") {
+        throw usageError(
+          "Only the Task Leader may clean a WorkItem from a managed Session."
+        );
+      }
+      if (disposition === "--runtime-only") {
+        let runtimeCleanup;
+        try {
+          runtimeCleanup = await workspaceCoordinator.cleanupWorkItemRuntime(
+            reference.taskId,
+            reference.localId
+          );
+        } catch (error) {
+          throw cleanupCliError(error, `work-item:${qualified}`);
+        }
+        emit(
+          `Released WorkItem runtime ${qualified}; retained its Session and worktree\n`,
+          false,
+          {
+            workItem: store.getWorkItem(reference.taskId, reference.localId),
+            runtime: { cleanup: runtimeCleanup },
+            worktree: { retained: true }
+          }
+        );
+        return;
       }
       const cleanedAs = disposition === "--integrated" ? "integrated" : "abandoned";
       if (cleanedAs === "integrated") {
         try {
-          await new WorkItemChangeSetManager(store).assertIntegrated(workItemId);
+          await new WorkItemChangeSetManager(store).assertIntegrated(
+            reference.taskId,
+            reference.localId
+          );
         } catch (error) {
           throw usageError(error instanceof Error ? error.message : String(error));
         }
       }
-      const removal = await workspaceCoordinator.cleanupWorkItem(workItemId, cleanedAs);
+      let removal;
+      try {
+        removal = await workspaceCoordinator.cleanupWorkItem(
+          reference.taskId,
+          reference.localId,
+          cleanedAs
+        );
+      } catch (error) {
+        throw cleanupCliError(error, `work-item:${qualified}`);
+      }
       if (removal === "dirty") {
-        throw usageError(`WorkItem worktree is dirty and was retained: ${workItemId}.`);
+        throw usageError(
+          `WorkItem worktree is dirty and was retained: ${qualified}.`,
+          undefined,
+          cleanupBlockedDetails("dirty-worktree", `work-item:${qualified}`, true)
+        );
       }
       emit(
-        `Cleaned WorkItem worktree ${workItemId} (${cleanedAs})\n`,
+        `Cleaned WorkItem worktree ${qualified} (${cleanedAs})\n`,
         false,
         {
-          workItem: store.findWorkItem(workItemId),
+          workItem: store.getWorkItem(reference.taskId, reference.localId),
           worktree: { removal, disposition: cleanedAs }
         }
       );
       return;
     }
+    if (resolved[1] === "work" && resolved[2] === "review"
+      && resolved[3] === "cleanup") {
+      const reviewRef = resolved[4];
+      if (reviewRef === undefined || resolved.length !== 5) {
+        throw usageError(
+          "Task work review cleanup usage: yui task work review cleanup <task>/<review-round>."
+        );
+      }
+      const reference = cliTaskRecordReference(reviewRef, "reviewRound", process.env);
+      const removal = await workspaceCoordinator.cleanupReviewRound(
+        reference.taskId,
+        reference.localId
+      );
+      if (removal === "dirty") {
+        throw usageError(
+          `ReviewRound worktree is dirty and was retained: ${reference.taskId}/${reference.localId}.`
+        );
+      }
+      emit(
+        `Cleaned ReviewRound worktree ${reference.taskId}/${reference.localId}\n`,
+        false,
+        {
+          reviewRound: store.getReviewRound(reference.taskId, reference.localId),
+          worktree: { removal }
+        }
+      );
+      return;
+    }
+    if (resolved[1] === "work" && resolved[2] === "review"
+      && resolved[3] === "preserve") {
+      const reviewRef = resolved[4];
+      if (reviewRef === undefined || resolved.length !== 5) {
+        throw usageError(
+          "Task work review preserve usage: yui task work review preserve <task>/<review-round>."
+        );
+      }
+      const reference = cliTaskRecordReference(reviewRef, "reviewRound", process.env);
+      const round = preserveReviewRoundWorkspace(
+        reference.taskId,
+        reference.localId,
+        store,
+        { runtime, environment: process.env, yuiHome: home }
+      );
+      emit(`Preserved ReviewRound worktree ${reference.taskId}/${reference.localId}\n`, false, {
+        reviewRound: round
+      });
+      return;
+    }
     if (resolved[1] === "archive") {
-      const { taskId } = validateTaskArchiveRequest(
+      const { taskId, disposition } = validateTaskArchiveRequest(
         resolved.slice(2),
         store,
         { runtime, environment: process.env, yuiHome: home }
@@ -585,19 +709,65 @@ export async function main(): Promise<void> {
       const task = store.getTask(taskId);
       if (task === null) throw new Error(`Task disappeared after archive validation: ${taskId}.`);
       if (task.status !== "archived") {
-        await cleanupReviewRoundsForArchive(task.id, store, workspacePreparer);
-        const cleanup = await workspaceCoordinator.cleanupTaskForArchive(task.id);
+        const workItemIds = store.listManagedWorkspaces(task.id)
+          .flatMap(({ owner }) => owner.type === "work-item" ? [owner.workItemId] : []);
+        for (const workItemId of workItemIds) {
+          const item = store.getWorkItem(task.id, workItemId);
+          if (item?.status !== "completed" || disposition !== "integrated") continue;
+          try {
+            await new WorkItemChangeSetManager(store).assertIntegrated(task.id, item.id);
+          } catch (error) {
+            throw usageError(error instanceof Error ? error.message : String(error));
+          }
+        }
+        const cleanup = await workspaceCoordinator.cleanupTaskForArchive(task.id, disposition);
         if (cleanup.status === "retained-dirty") {
-          throw usageError(`Task ${task.id} has dirty managed worktrees and remains completed.`);
+          throw usageError(
+            cleanup.error ?? `Task ${task.id} has dirty managed worktrees and remains terminal.`,
+            undefined,
+            cleanupBlockedDetails(
+              cleanup.reason ?? "dirty-worktree",
+              cleanup.resource ?? `task:${task.id}`,
+              cleanup.retryable ?? true
+            )
+          );
         }
         if (cleanup.status === "failed") {
-          throw usageError(`Task ${task.id} worktree cleanup failed: ${cleanup.error ?? "unknown error"}.`);
+          throw usageError(
+            `Task ${task.id} worktree cleanup failed: ${cleanup.error ?? "unknown error"}.`,
+            undefined,
+            cleanupBlockedDetails(
+              cleanup.reason ?? "cleanup-failed",
+              cleanup.resource ?? `task:${task.id}`,
+              cleanup.retryable ?? true
+            )
+          );
+        }
+      }
+    }
+    let taskRetirementProof;
+    if (resolved[1] === "retire") {
+      const taskId = resolved[2];
+      if (taskId !== undefined && !taskId.startsWith("--")) {
+        const task = store.getTask(taskId);
+        if (task?.status === "active" || task?.status === "draft") {
+          try {
+            taskRetirementProof = await new WorkItemChangeSetManager(store)
+              .assertRetirable(taskId);
+          } catch (error) {
+            throw usageError(error instanceof Error ? error.message : String(error));
+          }
         }
       }
     }
     if (resolved[1] === "work" && resolved[2] === "dispatch") {
       const workItemId = resolved[3];
-      const item = workItemId === undefined ? null : store.findWorkItem(workItemId);
+      const reference = workItemId === undefined
+        ? null
+        : cliWorkItemReference(workItemId, process.env);
+      const item = reference === null
+        ? null
+        : store.getWorkItem(reference.taskId, reference.localId);
       const task = item === null ? null : store.getTask(item.taskId);
       // A read-only Project WorkItem still needs its own Develop owner.  The
       // physical preparer creates the symlink view and stores the exact
@@ -608,7 +778,7 @@ export async function main(): Promise<void> {
         && task.projectBindings.length > 0
         && item.writeProjectIds.length === 0
         && store.getWorkItemWorkspace(task.id, item.id) === null) {
-        await workspaceCoordinator.isolateWorkItem(item.id);
+        await workspaceCoordinator.isolateWorkItem(item.taskId, item.id);
       }
     }
     let workItemIntegrationProof;
@@ -616,18 +786,25 @@ export async function main(): Promise<void> {
       const workItemId = resolved[3];
       if (workItemId !== undefined && !workItemId.startsWith("--")) {
         try {
+          const reference = cliWorkItemReference(workItemId, process.env);
           workItemIntegrationProof = await new WorkItemChangeSetManager(store)
-            .assertIntegrated(workItemId) ?? undefined;
+            .assertIntegrated(reference.taskId, reference.localId) ?? undefined;
         } catch (error) {
           throw usageError(error instanceof Error ? error.message : String(error));
         }
       }
     }
-    const reviewRunIdsBefore = new Set(
-      store.listTasks()
-        .flatMap((task) => store.listAgentRuns(task.id))
-        .filter((run) => run.purpose === "review" && run.status === "active")
-        .map((run) => run.id)
+    const candidateGitSnapshot = await candidateSnapshotForTaskCommand(
+      resolved,
+      store,
+      workspacePreparer,
+      process.env
+    );
+    const reviewWorkspaceResult = await reviewWorkspaceResultForTaskCommand(
+      resolved,
+      store,
+      workspacePreparer,
+      process.env
     );
     const result = runTaskCommand(
       resolved.slice(1),
@@ -636,27 +813,47 @@ export async function main(): Promise<void> {
         runtime,
         environment: process.env,
         yuiHome: home,
-        deferReviewNotifications: true,
-        ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof })
+        ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
+        ...(candidateGitSnapshot === undefined ? {} : { candidateGitSnapshot }),
+        ...(reviewWorkspaceResult === undefined ? {} : { reviewWorkspaceResult }),
+        ...(taskRetirementProof === undefined ? {} : { taskRetirementProof })
       }
     );
-    const preparedReviewRuns = await prepareAndBindReviewRuns(
-      store,
-      workspacePreparer,
-      reviewRunIdsBefore
-    );
-    for (const run of preparedReviewRuns) {
-      if (runtime.notifyMailboxChanged !== undefined) {
-        runtime.notifyMailboxChanged({
-          kind: "role",
-          taskId: run.taskId,
-          roleName: run.roleName
-        });
-      } else {
-        runtime.notifyStateChanged(run.taskId);
-      }
-    }
     if (result.kind === "output") {
+      const requestedRound = reviewRoundFromCommandData(result.data);
+      let reviewOutput = "";
+      let reviewData: unknown;
+      if (requestedRound?.status === "pending") {
+        try {
+          const workspace = await workspacePreparer.prepareReviewRoundWorkspace(
+            requestedRound.taskId,
+            requestedRound.id
+          );
+          const run = dispatchPreparedReviewRound(
+            requestedRound.taskId,
+            requestedRound.id,
+            store,
+            { runtime, environment: process.env, yuiHome: home }
+          );
+          reviewOutput = `Review queued as ${requestedRound.id} (${run.id})\n`;
+          reviewData = {
+            reviewRound: store.getReviewRound(requestedRound.taskId, requestedRound.id),
+            reviewRun: run,
+            workspace
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const failed = failPendingReviewRound(
+            requestedRound.taskId,
+            requestedRound.id,
+            message,
+            store,
+            { runtime, environment: process.env, yuiHome: home }
+          );
+          reviewOutput = `Review could not start: ${message}\n`;
+          reviewData = { reviewRound: failed };
+        }
+      }
       if (resolved[1] === "create") {
         const created = result.data as {
           task?: { id?: string; projectBindings?: readonly unknown[] }
@@ -691,7 +888,9 @@ export async function main(): Promise<void> {
           }
         }
       }
-      emit(result.output, false, result.data);
+      emit(`${result.output}${reviewOutput}`, false, reviewData === undefined
+        ? result.data
+        : { command: result.data, ...reviewData as object });
       return;
     }
     await runtime.prepareTaskRoleEnter({
@@ -713,140 +912,132 @@ export async function main(): Promise<void> {
   );
 }
 
-/**
- * Bind each newly queued Review Run to the physical ReviewRound workspace
- * before the Controller is notified. The command layer intentionally keeps
- * its synchronous API, so the foreground CLI closes that small pre-delivery
- * gap atomically on the still-undelivered Run.
- */
-async function prepareAndBindReviewRuns(
-  store: FileTaskStore,
-  preparer: FileTaskWorkspacePreparer,
-  alreadyActive: ReadonlySet<string>
-): Promise<readonly Readonly<{ id: string; taskId: string; roleName: string }>[]> {
-  const prepared: Array<Readonly<{ id: string; taskId: string; roleName: string }>> = [];
-  const notificationTime = new Date().toISOString();
-  for (const task of store.listTasks()) {
-    for (const run of store.listAgentRuns(task.id)) {
-      if (
-        run.purpose !== "review"
-        || run.status !== "active"
-        || run.reviewRoundId === undefined
-      ) continue;
-      if (store.getReviewRoundWorkspace(run.taskId, run.reviewRoundId) === null) {
-        // Projectless candidates legitimately have no managed filesystem
-        // workspace. Their Review Run can be delivered with no workspace
-        // attachment; only owner records that need physical worktrees enter
-        // the preparation path below.
-        const queued = store.transaction((tx) => {
-          const current = tx.getAgentRun(run.taskId, run.id);
-          if (current === null || current.status !== "active" || current.deliveredAt !== undefined) {
-            return null;
-          }
-          const hadWork = reviewRunMailboxReady(tx, current);
-          enqueueReviewRun(tx, current, notificationTime);
-          return !alreadyActive.has(current.id) || !hadWork
-            ? { id: current.id, taskId: current.taskId, roleName: current.roleName }
-            : null;
-        });
-        if (queued !== null) prepared.push(queued);
-        continue;
-      }
-      let workspace;
-      try {
-        workspace = await preparer.prepareReviewRoundWorkspace(run.reviewRoundId);
-      } catch (error) {
-        throw new Error(
-          `Review workspace preparation failed for ${run.reviewRoundId}: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        );
-      }
-      const bound = store.transaction((tx) => {
-        const current = tx.getAgentRun(run.taskId, run.id);
-        if (current === null || current.status !== "active") return null;
-        if (current.deliveredAt !== undefined) {
-          if (!isDeepStrictEqual(current.workspace, workspace)) {
-            throw new Error(
-              `Review Run ${current.id} was delivered before its physical workspace was bound.`
-            );
-          }
-          return null;
-        }
-        const previousRoot = current.workspace?.root;
-        const input = previousRoot === undefined
-          ? current.input.replace(
-              /^Candidate workspace: .*$/m,
-              `Candidate workspace: ${workspace.root}`
-            )
-          : current.input.replace(
-              `Candidate workspace: ${previousRoot}`,
-              `Candidate workspace: ${workspace.root}`
-            );
-        const changed = !isDeepStrictEqual(current.workspace, workspace)
-          || input !== current.input;
-        const rebound = { ...current, workspace, input };
-        if (changed) tx.saveAgentRun(rebound);
-        const hadWork = reviewRunMailboxReady(tx, current);
-        enqueueReviewRun(tx, current, notificationTime);
-        return changed || !alreadyActive.has(current.id) || !hadWork ? rebound : null;
-      });
-      if (bound !== null) {
-        prepared.push({ id: bound.id, taskId: bound.taskId, roleName: bound.roleName });
-      }
-    }
+function cleanupCliError(error: unknown, fallbackResource: string): CliError {
+  if (error instanceof WorkspaceCleanupBlockedError) {
+    return usageError(
+      error.message,
+      undefined,
+      cleanupBlockedDetails(error.reason, error.resource, error.retryable)
+    );
   }
-  return prepared;
-}
-
-function enqueueReviewRun(
-  store: TaskStore,
-  run: Readonly<{ id: string; taskId: string; roleName: string; workItemId?: string }>,
-  occurredAt: string
-): void {
-  enqueueWork(
-    store,
-    { kind: "role", taskId: run.taskId, roleName: run.roleName },
-    "review-requested",
-    occurredAt,
-    [
-      { type: "run", id: run.id },
-      ...(run.workItemId === undefined ? [] : [{ type: "work-item" as const, id: run.workItemId }])
-    ]
+  return new CliError(
+    "RUNTIME_ERROR",
+    error instanceof Error ? error.message : String(error),
+    undefined,
+    cleanupBlockedDetails("cleanup-failed", fallbackResource, true)
   );
 }
 
-function reviewRunMailboxReady(
-  store: TaskStore,
-  run: Readonly<{ id: string; taskId: string; roleName: string }>
-): boolean {
-  const mailbox = store.getWorkMailbox({
-    kind: "role",
-    taskId: run.taskId,
-    roleName: run.roleName
-  });
-  if (mailbox === null) return false;
-  if (mailbox.processing?.executionRef?.type === "run"
-    && mailbox.processing.executionRef.id === run.id) return true;
-  return mailbox.pending?.refs.some((ref) => ref.type === "run" && ref.id === run.id) ?? false;
+function cleanupBlockedDetails(
+  reason: string,
+  resource: string,
+  retryable: boolean
+): Readonly<Record<string, unknown>> {
+  return {
+    status: "blocked",
+    blockedBy: [{ resource, reason, retryable }],
+    remainingResources: [resource],
+    retryable
+  };
 }
 
-async function cleanupReviewRoundsForArchive(
-  taskId: string,
-  store: FileTaskStore,
-  preparer: FileTaskWorkspacePreparer
-): Promise<void> {
-  for (const round of store.listReviewRounds(taskId)) {
-    const workspace = store.getReviewRoundWorkspace(taskId, round.id);
-    if (workspace === null) continue;
-    if (round.status !== "completed" && round.status !== "failed") {
-      throw usageError(`ReviewRound is not terminal: ${round.id}/${round.status}.`);
-    }
-    const removal = await preparer.cleanupReviewRoundWorkspace(round.id);
-    if (removal === "dirty") {
-      throw usageError(`ReviewRound workspace is dirty and was retained: ${round.id}.`);
-    }
+function cliWorkItemReference(
+  value: string,
+  environment: NodeJS.ProcessEnv
+) {
+  try {
+    return resolveTaskRecordReference(value, {
+      kind: "workItem",
+      label: "Work Item reference",
+      ...(environment.YUI_TASK_ID === undefined
+        ? {}
+        : { contextTaskId: environment.YUI_TASK_ID })
+    });
+  } catch (error) {
+    throw usageError(error instanceof Error ? error.message : String(error));
   }
+}
+
+function cliTaskRecordReference(
+  value: string,
+  kind: "agentRun" | "reviewRound",
+  environment: NodeJS.ProcessEnv
+) {
+  try {
+    return resolveTaskRecordReference(value, {
+      kind,
+      label: kind === "agentRun" ? "Agent Run reference" : "ReviewRound reference",
+      ...(environment.YUI_TASK_ID === undefined
+        ? {}
+        : { contextTaskId: environment.YUI_TASK_ID })
+    });
+  } catch (error) {
+    throw usageError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function candidateSnapshotForTaskCommand(
+  args: readonly string[],
+  store: FileTaskStore,
+  preparer: FileTaskWorkspacePreparer,
+  environment: NodeJS.ProcessEnv
+) {
+  if (args[0] !== "task" || store.getReviewConfig() === null) return undefined;
+  if (args[1] === "run" && args[2] === "yield" && args[3] !== undefined) {
+    const reference = cliTaskRecordReference(args[3], "agentRun", environment);
+    const run = store.getAgentRun(reference.taskId, reference.localId);
+    if (run === null || run.purpose !== "execution" || run.workItemId === undefined) {
+      return undefined;
+    }
+    if (run.workspace === undefined) {
+      throw usageError(`Reviewable Run has no managed Candidate workspace: ${run.id}.`);
+    }
+    return preparer.snapshotCandidateWorkspace(run.workspace);
+  }
+  if (args[1] === "work" && args[2] === "update"
+    && args[3] !== undefined && args[4] === "done") {
+    const reference = cliWorkItemReference(args[3], environment);
+    const workspace = store.getWorkItemWorkspace(reference.taskId, reference.localId);
+    if (workspace === null) {
+      throw usageError(
+        `Reviewable direct WorkItem has no managed Candidate workspace: ${reference.localId}.`
+      );
+    }
+    return preparer.snapshotCandidateWorkspace(workspace);
+  }
+  return undefined;
+}
+
+async function reviewWorkspaceResultForTaskCommand(
+  args: readonly string[],
+  store: FileTaskStore,
+  preparer: FileTaskWorkspacePreparer,
+  environment: NodeJS.ProcessEnv
+) {
+  if (args[0] !== "task" || args[1] !== "run" || args[2] !== "yield"
+    || args[3] === undefined) return undefined;
+  const reference = cliTaskRecordReference(args[3], "agentRun", environment);
+  const run = store.getAgentRun(reference.taskId, reference.localId);
+  if (run === null || run.purpose !== "review" || run.reviewRoundId === undefined) {
+    return undefined;
+  }
+  return preparer.snapshotReviewRoundResult(reference.taskId, run.reviewRoundId);
+}
+
+function reviewRoundFromCommandData(data: unknown): Readonly<{
+  id: string;
+  taskId: string;
+  status: string;
+}> | undefined {
+  if (typeof data !== "object" || data === null || !("reviewRound" in data)) return undefined;
+  const round = (data as { reviewRound?: unknown }).reviewRound;
+  if (typeof round !== "object" || round === null) return undefined;
+  const value = round as { id?: unknown; taskId?: unknown; status?: unknown };
+  return typeof value.id === "string"
+    && typeof value.taskId === "string"
+    && typeof value.status === "string"
+    ? { id: value.id, taskId: value.taskId, status: value.status }
+    : undefined;
 }
 
 async function executeOperatorSessionControl(
@@ -864,7 +1055,7 @@ async function executeOperatorSessionControl(
   const role = store.getGlobalRole("operator");
   if (role === null) throw usageError("Operator is not configured. Run yui setup first.");
   const sessionSet = store.getGlobalRoleSessionSet(role.name);
-  const active = sessionSet?.sessions[role.activeAgentId];
+  const active = sessionSet?.sessions[sessionSet.activeAgentId];
   const paneRunning = tmux.detectRoleStatus("operator", "operator") === "running";
   if (paneRunning && active === undefined) {
     throw usageError(
@@ -875,7 +1066,7 @@ async function executeOperatorSessionControl(
   if (
     control.action === "resume"
     && paneRunning
-    && control.targetAgentId === role.activeAgentId
+    && control.targetAgentId === active?.agentId
     && active !== undefined
     && operatorSessionRef(active) === control.ref
   ) {
@@ -1300,18 +1491,6 @@ function agentEnvironmentRefreshScope(
     sourceNames: [...new Set([...currentSources, ...previousOnlySources])],
     nativeNames: [...new Set([...currentNative, ...previousOnlyNative])]
   };
-}
-
-function readPackageVersion(): string {
-  try {
-    const value = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
-      version?: unknown;
-    };
-    if (typeof value.version === "string" && value.version.length > 0) return value.version;
-  } catch {
-    // Keep help/version available if package metadata is damaged.
-  }
-  return "0.0.0";
 }
 
 export function cliIdentity(env: NodeJS.ProcessEnv): CliIdentity {

@@ -4,6 +4,7 @@ import {
   recordRoleAgentSession,
   type GlobalRoleSessionSet
 } from "../executor/agentExecutor.js";
+import { resolveEffectiveLaunch } from "../executor/effectiveLaunch.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { activeRoleSummary, renderRoleDetails } from "../output/rolePresentation.js";
 import {
@@ -193,20 +194,13 @@ function updateRole(
   const workspace = trimmed(parsed.one("--workspace"));
   const next = store.transaction((tx) => {
     const role = requireRole(name, tx);
-    const sessions = tx.getGlobalRoleSessionSet(name);
     const changesLaunchContext = hasRoleLaunchContextOptions(parsed);
     const changesAgentConfig = hasAgentConfigOptions(parsed);
     if (changesLaunchContext || changesAgentConfig) {
       assertRoleRuntimeMutationAllowed(tx, {
         scope: "global",
         roleName: role.name
-      }, "launch configuration update");
-    }
-    if (
-      changesLaunchContext
-      && Object.values(sessions?.sessions ?? {}).some(({ status }) => status !== "stopped")
-    ) {
-      throw usageError("Role launch context cannot be changed while its native process is running.");
+      }, "desired launch configuration update");
     }
     let bindings = role.agentBindings;
     if (changesAgentConfig) {
@@ -214,13 +208,6 @@ function updateRole(
       const agent = requireAgent(agentId, tx);
       assertOperatorAdapterAvailable(role, agent);
       const binding = role.agentBindings[agentId] ?? createRoleAgentBinding(definition(agent));
-      const targetSession = sessions?.sessions[agentId];
-      if (
-        targetSession !== undefined
-        && targetSession.status !== "stopped"
-      ) {
-        throw usageError("Agent settings cannot be changed while its native process is running.");
-      }
       bindings = { ...role.agentBindings, [agentId]: patchRoleAgentBinding(binding, parsed) };
     }
     const updated = updateGlobalRole(role, {
@@ -251,7 +238,7 @@ function bindRole(args: string[], store: GlobalRoleStore): string {
     assertRoleRuntimeMutationAllowed(tx, {
       scope: "global",
       roleName: role.name
-    }, "Agent binding");
+    }, "desired Agent binding update");
     const agent = requireAgent(agentId, tx);
     assertOperatorAdapterAvailable(role, agent);
     const binding = role.agentBindings[agentId] ?? createRoleAgentBinding(definition(agent));
@@ -266,7 +253,7 @@ function bindRole(args: string[], store: GlobalRoleStore): string {
       };
     }
     const existingSet = tx.getGlobalRoleSessionSet(name);
-    const activeSession = existingSet?.sessions[role.activeAgentId];
+    const activeSession = existingSet?.sessions[existingSet.activeAgentId];
     try {
       const switched = switchActiveRoleAgent(
         withBinding,
@@ -399,7 +386,8 @@ function roleSession(
       adapterId: binding.adapterId,
       nativeSessionId,
       policy: "fixed" as const,
-      status: environment.YUI_ROLE === name ? "running" as const : "ready" as const
+      status: environment.YUI_ROLE === name ? "running" as const : "ready" as const,
+      effective: resolveEffectiveLaunch({ role, purpose: "execution" })
     };
     if (command === "record") {
       if (existing !== null && existing.nativeSessionId !== nativeSessionId) {

@@ -1,16 +1,34 @@
+import { isDeepStrictEqual } from "node:util";
+
+import type { ReviewRound } from "../review/reviewRound.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import type { Task } from "../task/task.js";
 import type {
   WorkItem,
   WorkItemWorkspaceDisposition
 } from "../workItem/workItem.js";
+import {
+  managedWorkspaceKey,
+  type ManagedWorkspace
+} from "../worktree/managedWorkspace.js";
 import type { GitWorkspaceRemoval } from "./gitWorkspace.js";
 import {
   FileTaskWorkspacePreparer,
+  WorkspaceCleanupBlockedError,
   type TaskWorkspaceCleanup
 } from "./taskWorkspacePreparer.js";
 
+export { WorkspaceCleanupBlockedError } from "./taskWorkspacePreparer.js";
+
 export type TaskRoleRuntimeStopper = Readonly<{
   stopTaskRoleSessions(taskId: string, roleNames: readonly string[]): Promise<void>;
+}>;
+
+type TaskArchiveSnapshot = Readonly<{
+  task: Task;
+  managedWorkspaces: readonly ManagedWorkspace[];
+  workItems: readonly WorkItem[];
+  reviewRounds: readonly ReviewRound[];
 }>;
 
 /**
@@ -24,9 +42,9 @@ export class TaskWorkspaceCoordinator {
     readonly runtime: TaskRoleRuntimeStopper
   ) {}
 
-  async isolateWorkItem(workItemId: string) {
-    const item = this.store.findWorkItem(workItemId);
-    if (item === null) throw new Error(`Work item not found: ${workItemId}.`);
+  async isolateWorkItem(taskId: string, workItemId: string) {
+    const item = this.store.getWorkItem(taskId, workItemId);
+    if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
     const assignee = this.#workItemIsolationAssignee(item);
     const activeDevelopRun = this.store.listAgentRuns(item.taskId)
       .find((run) => run.status === "active" && run.workItemId === item.id);
@@ -57,15 +75,16 @@ export class TaskWorkspaceCoordinator {
       }
     }
     if (assignee !== undefined) await this.#stopLiveRoles(item.taskId, [assignee]);
-    return this.preparer.prepareWorkItemWorkspace(workItemId);
+    return this.preparer.prepareWorkItemWorkspace(item.taskId, item.id);
   }
 
   async cleanupWorkItem(
+    taskId: string,
     workItemId: string,
     disposition: WorkItemWorkspaceDisposition
   ): Promise<GitWorkspaceRemoval> {
-    const item = this.store.findWorkItem(workItemId);
-    if (item === null) throw new Error(`Work item not found: ${workItemId}.`);
+    const item = this.store.getWorkItem(taskId, workItemId);
+    if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
     if (!isTerminalWorkItem(item)) {
       throw new Error(`Work item must be terminal before cleanup: ${item.id}.`);
     }
@@ -75,27 +94,150 @@ export class TaskWorkspaceCoordinator {
         `Work item workspace is already recorded as ${item.workspaceDisposition}.`
       );
     }
-    const state = await this.preparer.inspectWorkItemWorkspace(item.id);
+    if (item.workspaceDisposition === disposition) return "missing";
+    const state = await this.preparer.inspectWorkItemWorkspace(item.taskId, item.id);
     if (state === "dirty") return "dirty";
+    this.#assertWorkItemRuntimeQuiescent(item);
     if (item.assignee !== undefined) await this.#stopLiveRoles(item.taskId, [item.assignee]);
-    return this.preparer.cleanupWorkItemWorkspace(item.id, disposition);
+    return this.preparer.cleanupWorkItemWorkspace(item.taskId, item.id, disposition);
   }
 
-  async cleanupTaskForArchive(taskId: string): Promise<TaskWorkspaceCleanup> {
+  async cleanupWorkItemRuntime(
+    taskId: string,
+    workItemId: string
+  ): Promise<"released"> {
+    const item = this.store.getWorkItem(taskId, workItemId);
+    if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
+    this.#assertWorkItemRuntimeQuiescent(item);
+    if (item.assignee !== undefined) {
+      await this.#stopLiveRoles(item.taskId, [item.assignee]);
+    }
+    return "released";
+  }
+
+  async cleanupReviewRound(
+    taskId: string,
+    reviewRoundId: string
+  ): Promise<GitWorkspaceRemoval> {
+    const round = this.store.getReviewRound(taskId, reviewRoundId);
+    if (round === null) throw new Error(`ReviewRound not found: ${taskId}/${reviewRoundId}.`);
+    if (round.status !== "completed" && round.status !== "failed") {
+      throw new Error(`ReviewRound must be terminal before cleanup: ${round.id}.`);
+    }
+    const state = await this.preparer.inspectReviewRoundWorkspace(taskId, reviewRoundId);
+    if (state === "dirty") return "dirty";
+    await this.#stopLiveRoles(taskId, [round.reviewerRoleName]);
+    return this.preparer.cleanupReviewRoundWorkspace(taskId, reviewRoundId);
+  }
+
+  async cleanupTaskForArchive(
+    taskId: string,
+    disposition: WorkItemWorkspaceDisposition
+  ): Promise<TaskWorkspaceCleanup> {
     try {
+      const task = this.store.getTask(taskId);
+      if (task === null) throw new Error(`Task not found: ${taskId}.`);
+      if (task.status !== "completed" && task.status !== "retired") {
+        throw new Error(`Task must be completed or retired before archive cleanup: ${task.id}.`);
+      }
+      const managedWorkspaces = [...this.store.listManagedWorkspaces(task.id)]
+        .sort((left, right) => managedWorkspaceKey(left.owner)
+          .localeCompare(managedWorkspaceKey(right.owner)));
+      const workspaces = managedWorkspaces
+        .filter(({ owner }) => owner.type === "work-item");
+      const workItems = workspaces.map((workspace) => {
+        const workItemId = workspace.owner.type === "work-item"
+          ? workspace.owner.workItemId
+          : "";
+        const item = this.store.getWorkItem(task.id, workItemId);
+        if (item === null) throw new Error(`Work item not found: ${task.id}/${workItemId}.`);
+        if (item.status !== "completed" && item.status !== "retired") {
+          throw new Error(`Work item must be completed or retired before archive cleanup: ${item.id}.`);
+        }
+        return item;
+      });
+      const allWorkItems = [...this.store.listWorkItems(task.id)]
+        .sort((left, right) => left.id.localeCompare(right.id));
+      const allReviewRounds = [...this.store.listReviewRounds(task.id)]
+        .sort((left, right) => left.id.localeCompare(right.id));
+      const reviewRounds = allReviewRounds.filter((round) => (
+        round.workspace !== undefined && round.workspaceDisposition?.kind !== "removed"
+      ));
+      const snapshot: TaskArchiveSnapshot = {
+        task,
+        managedWorkspaces,
+        workItems: allWorkItems,
+        reviewRounds: allReviewRounds
+      };
+      for (const round of reviewRounds) {
+        if (round.status !== "completed" && round.status !== "failed") {
+          throw new Error(`ReviewRound must be terminal before archive cleanup: ${round.id}.`);
+        }
+        if (await this.preparer.inspectReviewRoundWorkspace(task.id, round.id) === "dirty") {
+          return {
+            taskId,
+            status: "retained-dirty",
+            ...(task.cwd === undefined ? {} : { path: task.cwd }),
+            error: `ReviewRound worktree is dirty: ${round.id}.`,
+            reason: "dirty-worktree",
+            resource: `review-round:${task.id}/${round.id}`,
+            retryable: true
+          };
+        }
+      }
+      for (const item of workItems) {
+        if (await this.preparer.inspectWorkItemWorkspace(task.id, item.id) === "dirty") {
+          return {
+            taskId,
+            status: "retained-dirty",
+            ...(task.cwd === undefined ? {} : { path: task.cwd }),
+            error: `WorkItem worktree is dirty: ${item.id}.`,
+            reason: "dirty-worktree",
+            resource: `work-item:${task.id}/${item.id}`,
+            retryable: true
+          };
+        }
+      }
       const state = await this.preparer.inspectTaskMainWorkspace(taskId);
       if (state === "dirty") {
-        const task = this.store.getTask(taskId);
         return {
           taskId,
           status: "retained-dirty",
-          ...(task?.cwd === undefined ? {} : { path: task.cwd })
+          ...(task.cwd === undefined ? {} : { path: task.cwd }),
+          error: `Task main worktree is dirty: ${task.id}.`,
+          reason: "dirty-worktree",
+          resource: `task-worktree:${task.id}`,
+          retryable: true
         };
       }
-      await this.#stopLiveRoles(
-        taskId,
-        this.store.listRoles(taskId).map(({ name }) => name)
-      );
+      const activeRole = this.store.listRoles(taskId)
+        .find((role) => this.store.getActiveAgentRun(taskId, role.name) !== null);
+      if (activeRole !== undefined) {
+        throw new WorkspaceCleanupBlockedError(
+          "active-run",
+          `role:${task.id}/${activeRole.name}`,
+          true,
+          `Task Role still has an active Run: ${task.id}/${activeRole.name}.`
+        );
+      }
+      const roleNames = this.store.listRoles(taskId).map(({ name }) => name);
+      if (roleNames.length > 0) {
+        await this.runtime.stopTaskRoleSessions(taskId, roleNames);
+      }
+      this.#assertTaskArchiveSnapshot(snapshot);
+      for (const round of reviewRounds) {
+        this.#assertTaskArchiveLifecycle(task);
+        await this.preparer.cleanupReviewRoundWorkspace(task.id, round.id);
+      }
+      for (const item of workItems) {
+        this.#assertTaskArchiveLifecycle(task);
+        await this.preparer.cleanupWorkItemWorkspace(
+          task.id,
+          item.id,
+          item.status === "completed" ? disposition : "abandoned"
+        );
+      }
+      this.#assertTaskArchiveLifecycle(task);
       return this.preparer.cleanupTaskForArchive(taskId);
     } catch (error) {
       const task = this.store.getTask(taskId);
@@ -103,8 +245,65 @@ export class TaskWorkspaceCoordinator {
         taskId,
         status: "failed",
         ...(task?.cwd === undefined ? {} : { path: task.cwd }),
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? error.message : String(error),
+        ...(error instanceof WorkspaceCleanupBlockedError
+          ? {
+              reason: error.reason,
+              resource: error.resource,
+              retryable: error.retryable
+            }
+          : {
+              reason: "cleanup-failed",
+              resource: `task:${taskId}`,
+              retryable: true
+            })
       };
+    }
+  }
+
+  #assertTaskArchiveSnapshot(snapshot: TaskArchiveSnapshot): void {
+    this.#assertTaskArchiveLifecycle(snapshot.task);
+    const managedWorkspaces = [...this.store.listManagedWorkspaces(snapshot.task.id)]
+      .sort((left, right) => managedWorkspaceKey(left.owner)
+        .localeCompare(managedWorkspaceKey(right.owner)));
+    const workItems = [...this.store.listWorkItems(snapshot.task.id)]
+      .sort((left, right) => left.id.localeCompare(right.id));
+    const reviewRounds = [...this.store.listReviewRounds(snapshot.task.id)]
+      .sort((left, right) => left.id.localeCompare(right.id));
+    if (!isDeepStrictEqual(managedWorkspaces, snapshot.managedWorkspaces)
+      || !isDeepStrictEqual(workItems, snapshot.workItems)
+      || !isDeepStrictEqual(reviewRounds, snapshot.reviewRounds)) {
+      throw new WorkspaceCleanupBlockedError(
+        "task-changed",
+        `task:${snapshot.task.id}`,
+        true,
+        `Task resources changed while archive cleanup stopped runtimes: ${snapshot.task.id}.`
+      );
+    }
+  }
+
+  #assertTaskArchiveLifecycle(expected: Task): void {
+    const current = this.store.getTask(expected.id);
+    if (current === null || !isDeepStrictEqual(current, expected)) {
+      throw new WorkspaceCleanupBlockedError(
+        "task-changed",
+        `task:${expected.id}`,
+        true,
+        `Task changed during archive cleanup: ${expected.id}.`
+      );
+    }
+  }
+
+  #assertWorkItemRuntimeQuiescent(item: WorkItem): void {
+    const activeRun = this.store.listAgentRuns(item.taskId)
+      .find((run) => run.status === "active" && run.workItemId === item.id);
+    if (activeRun !== undefined) {
+      throw new WorkspaceCleanupBlockedError(
+        "active-run",
+        `work-item:${item.taskId}/${item.id}`,
+        true,
+        `Work item still has an active Run: ${item.taskId}/${item.id}.`
+      );
     }
   }
 
@@ -164,5 +363,5 @@ function sameProjectScope(
 }
 
 function isTerminalWorkItem(item: WorkItem): boolean {
-  return ["completed", "failed", "cancelled", "superseded"].includes(item.status);
+  return ["completed", "failed", "retired"].includes(item.status);
 }

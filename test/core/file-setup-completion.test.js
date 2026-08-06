@@ -173,19 +173,22 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
     [...BUILTIN_PROFILE_IDS].sort()
   );
   assert.equal("agentId" in store.getAgentProfile("worker"), false);
+  assert.equal(store.getAgentProfile("worker").defaultAccess, "write");
   assert.equal(store.getAgentProfile("explorer").defaultAccess, "read");
   assert.equal(store.getAgentProfile("implementer").defaultAccess, "write");
-  assert.equal(store.getAgentProfile("reviewer").defaultAccess, "read");
+  assert.equal(store.getAgentProfile("reviewer").defaultAccess, "write");
   assert.equal(existsSync(join(home, "worktrees")), false);
   assert.deepEqual(store.getGlobalRole("operator").agentBindings.codex.config, {
     adapterId: "codex",
     model: "gpt-5.6-sol",
-    effort: "xhigh"
+    effort: "xhigh",
+    permission: { strategy: "bypass" }
   });
   assert.deepEqual(store.getGlobalRole("leader").agentBindings.codex.config, {
     adapterId: "codex",
     model: "gpt-5.6-sol",
-    effort: "xhigh"
+    effort: "xhigh",
+    permission: { strategy: "bypass" }
   });
   assert.match(rendered, /Choose Agents by number or name/);
   assert.match(rendered, /Choose default Agent \[codex\]/);
@@ -198,10 +201,13 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
   assert.match(rendered, /Select reasoning effort/);
   assert.match(result, /Leader model: gpt-5\.6-sol/);
   assert.match(result, /Leader reasoning effort: xhigh/);
+  assert.match(result, /Leader permission: bypass/);
   assert.match(result, /Operator model: gpt-5\.6-sol/);
   assert.match(result, /Operator reasoning effort: xhigh/);
+  assert.match(result, /Operator permission: bypass/);
   assert.match(result, /Worker configuration: Reused Leader configuration/);
   assert.match(result, /Worker model: gpt-5\.6-sol/);
+  assert.match(result, /Worker permission: bypass/);
   assert.match(result, /Project workspace:/);
   assert.match(result, /Completion install skipped/);
 
@@ -218,6 +224,7 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
 
   const operatorWithPermissions = store.getGlobalRole("operator");
   operatorWithPermissions.agentBindings.codex.config.permission = {
+    strategy: "configured",
     sandbox: "workspace-write",
     approval: "never"
   };
@@ -250,7 +257,7 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
   );
   assert.deepEqual(
     repeated.getGlobalRole("operator").agentBindings.codex.config.permission,
-    { sandbox: "workspace-write", approval: "never" }
+    { strategy: "configured", sandbox: "workspace-write", approval: "never" }
   );
   assert.equal(
     repeated.getGlobalRole("operator").agentBindings.codex.config.search,
@@ -287,7 +294,11 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
     new FileTaskStore(home).getGlobalRole("operator").agentBindings.codex.config,
     {
       adapterId: "codex",
-      permission: { sandbox: "workspace-write", approval: "never" },
+      permission: {
+        strategy: "configured",
+        sandbox: "workspace-write",
+        approval: "never"
+      },
       search: true
     }
   );
@@ -320,9 +331,10 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
     "codex"
   );
 
-  const { createRoleSessionSet, recordRoleAgentSession } = await import(
+  const { createRoleSessionSet } = await import(
     "../../dist/executor/agentExecutor.js"
   );
+  const { recordRoleAgentSession } = await import("../helpers/effectiveLaunch.js");
   const now = new Date("2026-07-25T00:00:00.000Z");
   store.saveGlobalRoleSessionSet(recordRoleAgentSession(
     createRoleSessionSet(
@@ -342,13 +354,20 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
   const runningInput = new PassThrough();
   const runningOutput = new PassThrough();
   runningInput.end("all\n\n\n\n\ngpt-new\n\n\n");
-  await assert.rejects(runSetupCommand(
+  const runningEffective = structuredClone(
+    store.getGlobalRoleSessionSet("operator").sessions.codex.effective
+  );
+  await assert.doesNotReject(runSetupCommand(
     [], env, executor,
     { input: runningInput, output: runningOutput, forceInteractive: true }
-  ), /cannot be reconfigured.*Session is running.*rerun yui setup/i);
+  ));
   assert.equal(
     new FileTaskStore(home).getGlobalRole("operator").agentBindings.codex.config.model,
-    undefined
+    "gpt-new"
+  );
+  assert.deepEqual(
+    new FileTaskStore(home).getGlobalRoleSessionSet("operator").sessions.codex.effective,
+    runningEffective
   );
 });
 
@@ -400,7 +419,8 @@ test("setup can configure Worker separately from Leader", async (t) => {
   assert.deepEqual(worker.agentBindings.claude.config, {
     adapterId: "claude",
     model: "sonnet",
-    effort: "max"
+    effort: "max",
+    permission: { strategy: "bypass" }
   });
   assert.match(result, /Worker configuration: Configured separately/);
   assert.match(result, /Worker Agent: claude/);
@@ -439,7 +459,7 @@ test("setup supports Claude defaults for Leader, Operator, and Worker Profiles",
   assert.equal(store.getGlobalRole("operator").activeAgentId, "claude");
   assert.deepEqual(
     store.getGlobalRole("leader").agentBindings.claude.config,
-    { adapterId: "claude" }
+    { adapterId: "claude", permission: { strategy: "bypass" } }
   );
   assert.equal("agentId" in store.getAgentProfile("worker"), false);
   assert.equal("agentId" in store.getAgentProfile("implementer"), false);

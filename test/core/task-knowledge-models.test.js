@@ -109,7 +109,7 @@ test("Decision has a one-way active to superseded lifecycle", () => {
 test("Decision and Milestone reject unsafe aggregate identities", () => {
   assert.throws(
     () => createDecision("../decision", "task-1", "title", "reason", now),
-    /Decision id is invalid/i
+    /decision local id is invalid/i
   );
   assert.throws(
     () => createMilestone("milestone-1", "../task", "title", "summary", now),
@@ -139,9 +139,11 @@ test("Milestone is a leader-authored append-only fact", () => {
 
 test("TaskEvent appends without replacing an existing event", () => {
   const sourcePayload = { title: "Created", status: "draft" };
-  const first = createTaskEvent("event-1", " task.created ", sourcePayload, now);
+  const first = createTaskEvent("event-1", "task-1", " task.created ", sourcePayload, now);
   sourcePayload.status = "active";
-  const second = createTaskEvent("event-2", "task.activated", { status: "active" }, later);
+  const second = createTaskEvent(
+    "event-2", "task-1", "task.activated", { status: "active" }, later
+  );
 
   const history = appendTaskEvent([first], second);
   assert.deepEqual(history.map((event) => event.id), ["event-1", "event-2"]);

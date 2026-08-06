@@ -1,6 +1,15 @@
 import type { InputRequest } from "../input/inputRequest.js";
-import type { OperatorNotification } from "../scheduler/operatorNotification.js";
+import type {
+  LeaderRecoveryOperatorNotification,
+  LeaderStallNotification,
+  OperatorNotification,
+  TaskTerminalOperatorNotification
+} from "../scheduler/operatorNotification.js";
 import { formatTimestamp } from "../output/timePresentation.js";
+import {
+  formatInputRequestReceiptId,
+  formatTaskRecordReference
+} from "../task/taskRecordReference.js";
 
 type OperatorPresentationBase = Readonly<{
   taskId: string;
@@ -8,12 +17,22 @@ type OperatorPresentationBase = Readonly<{
   text: string;
 }>;
 
-export type OperatorAttentionPresentation = OperatorPresentationBase & Readonly<{
-  category: "attention";
+export type OperatorPresentation = OperatorPresentationBase & Readonly<{
+  category: "attention" | "information";
   source: Readonly<
-    | { kind: "input-request"; id: string }
+    | { kind: "input-request"; taskId: string; localId: string }
     | { kind: "leader-recovery"; id: string }
+    | { kind: "leader-stall"; id: string }
+    | { kind: "task-terminal"; id: string }
   >;
+}>;
+
+export type OperatorAttentionPresentation = OperatorPresentation & Readonly<{
+  category: "attention";
+}>;
+
+export type OperatorInformationPresentation = OperatorPresentation & Readonly<{
+  category: "information";
 }>;
 
 export type OperatorPresentationContext = Readonly<{
@@ -37,8 +56,8 @@ export function createInputRequestOperatorPresentation(
   return {
     category: "attention",
     taskId: request.taskId,
-    receiptId: `input-request:${request.id}`,
-    source: { kind: "input-request", id: request.id },
+    receiptId: formatInputRequestReceiptId(request.taskId, request.id),
+    source: { kind: "input-request", taskId: request.taskId, localId: request.id },
     text: [
       "A Task Leader is waiting for user input. Present this question in the native Operator session.",
       "Do not answer it yourself; do not answer or choose on the user's behalf.",
@@ -54,16 +73,22 @@ export function createInputRequestOperatorPresentation(
             `Agent recommendation: ${recommendation!.key}: ${recommendation!.label}`,
             `Automatic fallback after: ${formatTimestamp(policy.timeoutAt, context.timeZone)}`
           ]),
-      `Inspect: yui task input show ${request.id}`,
+      `Inspect: yui task input show ${formatTaskRecordReference(
+        request.taskId, request.id, "inputRequest"
+      )}`,
       request.choices.length === 0
-        ? `After the user replies: yui task input answer ${request.id} --text "<answer>"`
-        : `After the user chooses: yui task input answer ${request.id} --choice <key>`
+        ? `After the user replies: yui task input answer ${formatTaskRecordReference(
+            request.taskId, request.id, "inputRequest"
+          )} --text "<answer>"`
+        : `After the user chooses: yui task input answer ${formatTaskRecordReference(
+            request.taskId, request.id, "inputRequest"
+          )} --choice <key>`
     ].join("\n")
   };
 }
 
 export function createLeaderRecoveryOperatorPresentation(
-  notification: OperatorNotification
+  notification: LeaderRecoveryOperatorNotification
 ): OperatorAttentionPresentation {
   return {
     category: "attention",
@@ -77,6 +102,53 @@ export function createLeaderRecoveryOperatorPresentation(
       `Inspect: yui task show ${notification.taskId}`,
       "Recovery status: yui jobs list",
       `Retry after inspection: yui jobs retry leader-recovery:${notification.taskId}`
+    ].join("\n")
+  };
+}
+
+export function createLeaderStallOperatorPresentation(
+  notification: LeaderStallNotification
+): OperatorAttentionPresentation {
+  return {
+    category: "attention",
+    taskId: notification.taskId,
+    receiptId: `leader-stall:${notification.taskId}:${notification.runId}:${notification.progressAt}`,
+    source: {
+      kind: "leader-stall",
+      id: `${notification.runId}:${notification.progressAt}`
+    },
+    text: [
+      "A Task Leader is truly stalled and needs user attention.",
+      `Task: ${notification.taskId}`,
+      `Leader Run: ${notification.runId}`,
+      `lastProgressAt: ${notification.progressAt}`,
+      "Classification: truly-stalled",
+      `Evidence: ${notification.evidenceKey}`,
+      "Controller preserved the exact Run/Session fence and performed no automatic Enter, reset, retry, kill, or Session replacement.",
+      `Inspect: yui task context ${notification.taskId}`,
+      "Choose the supported continuation, reset, retry, Agent change, or user-input action only after inspection."
+    ].join("\n")
+  };
+}
+
+export function createTaskTerminalOperatorPresentation(
+  notification: TaskTerminalOperatorNotification
+): OperatorInformationPresentation {
+  const action = notification.status === "completed" ? "completed" : "retired";
+  const actor = notification.by === "leader"
+    ? "its Leader"
+    : notification.by === "operator"
+      ? "the Operator"
+      : "the user";
+  return {
+    category: "information",
+    taskId: notification.taskId,
+    receiptId: `task-terminal:${notification.taskId}:${notification.status}:${notification.createdAt}`,
+    source: { kind: "task-terminal", id: notification.taskId },
+    text: [
+      `Task ${notification.taskId} was ${action} by ${actor}.`,
+      `Summary: ${notification.summary}`,
+      `Inspect: yui task show ${notification.taskId}`
     ].join("\n")
   };
 }

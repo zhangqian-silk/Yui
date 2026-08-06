@@ -9,27 +9,36 @@ import {
 } from "../../dist/role/role.js";
 import {
   createRoleSessionSet,
-  recordRoleAgentSession,
   retireTaskRoleSessionsForWorkspace,
   updateRoleAgentSessionStatus
 } from "../../dist/executor/agentExecutor.js";
 import {
-  createAgentRun,
+  validateAgentRun,
   yieldAgentRun
 } from "../../dist/run/agentRun.js";
-import { activateTask, archiveTask, createTask } from "../../dist/task/task.js";
+import {
+  createAgentRun,
+  recordRoleAgentSession
+} from "../helpers/effectiveLaunch.js";
+import { activateTask, archiveTask, completeTask, createTask } from "../../dist/task/task.js";
 import {
   createWorkItem,
   recordWorkItemWorkspaceDisposition,
+  retireWorkItem,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { createTaskMessage } from "../../dist/message/message.js";
+import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 
 const now = new Date("2026-07-19T12:00:00.000Z");
 const later = new Date("2026-07-19T12:01:00.000Z");
 
 function binding(agentId, adapterId = agentId, config = {}) {
-  return { agentId, adapterId, config: { adapterId, ...config } };
+  return {
+    agentId,
+    adapterId,
+    config: { adapterId, permission: { strategy: "bypass" }, ...config }
+  };
 }
 
 test("GlobalRole copies into an isolated TaskRole with independent Agent bindings", () => {
@@ -46,8 +55,11 @@ test("GlobalRole copies into an isolated TaskRole with independent Agent binding
   );
   const taskRole = copyGlobalRoleToTaskRole(globalRole, "task-1", later);
 
-  assert.equal(globalRole.schemaVersion, 2);
-  assert.equal(taskRole.schemaVersion, 2);
+  assert.equal(globalRole.schemaVersion, 3);
+  assert.equal(taskRole.schemaVersion, 3);
+  assert.equal(globalRole.launchRevision, 1);
+  assert.equal(taskRole.launchRevision, 1);
+  assert.equal(taskRole.defaultAccess, "write");
   assert.equal(taskRole.taskId, "task-1");
   assert.equal(taskRole.status, "idle");
   assert.notEqual(taskRole.agentBindings, globalRole.agentBindings);
@@ -99,7 +111,7 @@ test("Agent switching preserves dormant sessions and resumes the target native s
   assert.equal(switched.sessions.sessions.claude.nativeSessionId, "claude-session");
 });
 
-test("Agent switching rejects active runs and mismatched GlobalRole/TaskRole session owners", () => {
+test("Agent switching during a Run updates only desired identity and still rejects mismatched owners", () => {
   const role = createRole(
     "task-1",
     "leader",
@@ -113,16 +125,16 @@ test("Agent switching rejects active runs and mismatched GlobalRole/TaskRole ses
     "codex",
     now
   );
-  assert.throws(
-    () => switchActiveRoleAgent(
-      role,
-      taskSessions,
-      "claude",
-      { activeRun: true, nativeProcessRunning: false },
-      later
-    ),
-    /active AgentRun/i
+  const desired = switchActiveRoleAgent(
+    role,
+    taskSessions,
+    "claude",
+    { activeRun: true, nativeProcessRunning: false },
+    later
   );
+  assert.equal(desired.role.activeAgentId, "claude");
+  assert.equal(desired.role.launchRevision, role.launchRevision + 1);
+  assert.equal(desired.sessions.activeAgentId, "codex");
 
   const globalSessions = createRoleSessionSet(
     { scope: "global", roleName: "leader" },
@@ -168,22 +180,89 @@ test("workspace migration retires only after every bound native session is stopp
   );
 
   const stopped = updateRoleAgentSessionStatus(sessions, "claude", "stopped", later);
+  const retired = retireTaskRoleSessionsForWorkspace(stopped, later);
+  assert.deepEqual(retired.sessions, {});
   assert.deepEqual(
-    retireTaskRoleSessionsForWorkspace(stopped, later).sessions,
-    {}
+    retired.history.map(({ agentId, nativeSessionId }) => ({ agentId, nativeSessionId })),
+    [
+      { agentId: "codex", nativeSessionId: "codex-stopped" },
+      { agentId: "claude", nativeSessionId: "claude-dormant-ready" }
+    ]
   );
+});
+
+test("a fresh Task native Session archives the immutable stopped snapshot", () => {
+  let sessions = createRoleSessionSet(
+    { scope: "task", taskId: "task-1", roleName: "worker" },
+    "codex",
+    now
+  );
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "codex-old",
+    policy: "fixed",
+    status: "stopped"
+  }, now);
+  const previous = structuredClone(sessions.sessions.codex);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "codex-new",
+    policy: "fixed",
+    status: "ready",
+    effective: {
+      ...previous.effective,
+      sourceDesiredRevision: previous.effective.sourceDesiredRevision + 1,
+      model: "gpt-next"
+    }
+  }, later);
+
+  assert.equal(sessions.sessions.codex.nativeSessionId, "codex-new");
+  assert.deepEqual(sessions.history, [previous]);
+});
+
+test("a fresh global native Session archives the immutable stopped snapshot", () => {
+  let sessions = createRoleSessionSet(
+    { scope: "global", roleName: "worker" },
+    "codex",
+    now
+  );
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "codex-global-old",
+    policy: "fixed",
+    status: "stopped"
+  }, now);
+  const previous = structuredClone(sessions.sessions.codex);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "codex-global-new",
+    policy: "fixed",
+    status: "ready",
+    effective: {
+      ...previous.effective,
+      sourceDesiredRevision: previous.effective.sourceDesiredRevision + 1,
+      model: "gpt-next"
+    }
+  }, later);
+
+  assert.equal(sessions.sessions.codex.nativeSessionId, "codex-global-new");
+  assert.deepEqual(Object.values(sessions.history), [previous]);
 });
 
 test("restored persistent domain records are plain JSON with explicit schema versions", () => {
   const task = createTask("task-1", "Restore models", now);
   const workItem = createWorkItem(
-    "work-1",
+    "work-item-1",
     task.id,
     { title: "Implement", assignee: "worker" },
     now
   );
   const run = createAgentRun(
-    "run-1",
+    "agent-run-1",
     task.id,
     "worker",
     "new",
@@ -194,16 +273,72 @@ test("restored persistent domain records are plain JSON with explicit schema ver
   const yielded = yieldAgentRun(run, "Implemented", later);
   const snapshot = JSON.parse(JSON.stringify({ task, workItem, yielded }));
 
-  assert.equal(snapshot.task.schemaVersion, 2);
+  assert.equal(snapshot.task.schemaVersion, 3);
   assert.equal(snapshot.task.status, "draft");
-  assert.equal(snapshot.workItem.schemaVersion, 5);
-  assert.equal(snapshot.yielded.schemaVersion, 3);
+  assert.equal(snapshot.workItem.schemaVersion, 6);
+  assert.equal(snapshot.yielded.schemaVersion, 4);
+  assert.equal(snapshot.yielded.effective.schemaVersion, 2);
+  assert.equal(snapshot.yielded.effective.permission.strategy, "bypass");
   assert.equal(snapshot.yielded.purpose, "execution");
   assert.equal(snapshot.yielded.status, "yielded");
   assert.equal(snapshot.yielded.endedAt, later.toISOString());
 });
 
-test("Task follows the retained draft, active, archived lifecycle", () => {
+test("a writable Review Run requires its exact ReviewRound-owned workspace", () => {
+  const reviewWorkspace = createManagedWorkspace({
+    owner: { type: "review-round", taskId: "task-1", reviewRoundId: "review-round-1" },
+    root: "/fixture/reviews/review-round-1",
+    entries: [{
+      projectId: "project-1",
+      directory: "Yui",
+      access: "write",
+      path: "/fixture/reviews/review-round-1/Yui",
+      branch: "yui/task-1/review-round-1",
+      baseRef: "b".repeat(40),
+      baseCommit: "b".repeat(40)
+    }]
+  }, now);
+  const run = createAgentRun(
+    "agent-run-1",
+    "task-1",
+    "reviewer",
+    "new",
+    "Review the Candidate.",
+    now,
+    {
+      purpose: "review",
+      workItemId: "work-item-1",
+      reviewRoundId: "review-round-1",
+      reviewBaseCommit: "b".repeat(40),
+      workspace: reviewWorkspace
+    }
+  );
+
+  assert.doesNotThrow(() => validateAgentRun(run));
+  assert.equal(run.effective.profileAccess, "write");
+  assert.equal(run.effective.reviewRoundId, "review-round-1");
+  assert.equal(run.workspace.owner.reviewRoundId, "review-round-1");
+  assert.throws(
+    () => validateAgentRun(createAgentRun(
+      "agent-run-2",
+      "task-1",
+      "reviewer",
+      "new",
+      "Review from a mismatched Round.",
+      now,
+      {
+        purpose: "review",
+        workItemId: "work-item-1",
+        reviewRoundId: "review-round-2",
+        reviewBaseCommit: "b".repeat(40),
+        workspace: reviewWorkspace
+      }
+    )),
+    /ReviewRound workspace owner.*review-round-2/i
+  );
+});
+
+test("Task follows the retained draft, active, completed, archived lifecycle", () => {
   const draft = createTask("task-1", "Lifecycle", now, {
     projectBindings: [
       { projectId: "repo-1", directory: "backend", baseRef: "main" },
@@ -211,9 +346,13 @@ test("Task follows the retained draft, active, archived lifecycle", () => {
     ]
   });
   const active = activateTask(draft, later);
-  const archived = archiveTask(active, new Date("2026-07-19T12:02:00.000Z"));
+  const completed = completeTask(active, later, { by: "leader", summary: "Done." });
+  const archived = archiveTask(completed, new Date("2026-07-19T12:02:00.000Z"));
 
-  assert.deepEqual([draft.status, active.status, archived.status], ["draft", "active", "archived"]);
+  assert.deepEqual(
+    [draft.status, active.status, completed.status, archived.status],
+    ["draft", "active", "completed", "archived"]
+  );
   assert.equal("archived" in draft, false);
   assert.deepEqual(draft.projectBindings, [
     { projectId: "repo-1", directory: "backend", baseRef: "main" },
@@ -224,7 +363,7 @@ test("Task follows the retained draft, active, archived lifecycle", () => {
 
 test("WorkItems keep the Leader-approved writable Project subset", () => {
   const item = createWorkItem(
-    "work-1",
+    "work-item-1",
     "task-1",
     {
       title: "Update the contract",
@@ -239,7 +378,7 @@ test("WorkItems keep the Leader-approved writable Project subset", () => {
 
 test("terminal WorkItems cannot be reopened", () => {
   const pending = createWorkItem(
-    "work-1",
+    "work-item-1",
     "task-1",
     { title: "Implement", assignee: "worker" },
     now
@@ -254,7 +393,7 @@ test("terminal WorkItems cannot be reopened", () => {
 
 test("updating a terminal WorkItem outcome preserves its workspace disposition", () => {
   const completed = updateWorkItemStatus(createWorkItem(
-    "work-1",
+    "work-item-1",
     "task-1",
     { title: "Implement", assignee: "worker" },
     now
@@ -267,29 +406,29 @@ test("updating a terminal WorkItem outcome preserves its workspace disposition",
   assert.equal(corrected.endedAt, completed.endedAt);
 });
 
-test("closing an abandoned failed WorkItem preserves its workspace disposition", () => {
+test("retiring an abandoned failed WorkItem preserves its workspace disposition", () => {
   const failed = updateWorkItemStatus(createWorkItem(
-    "work-1",
+    "work-item-1",
     "task-1",
     { title: "Implement", assignee: "worker" },
     now
   ), "failed", later, "Native session exited.");
   const abandoned = recordWorkItemWorkspaceDisposition(failed, "abandoned", later);
-  const superseded = updateWorkItemStatus(
-    abandoned,
-    "superseded",
-    later,
-    "Replacement work completed."
-  );
+  const retired = retireWorkItem(abandoned, {
+    by: "leader",
+    summary: "Replacement work completed.",
+    replacementWorkItemId: "work-item-2"
+  }, later);
 
-  assert.equal(superseded.status, "superseded");
-  assert.equal(superseded.workspaceDisposition, "abandoned");
-  assert.equal(superseded.outcome, "Replacement work completed.");
+  assert.equal(retired.status, "retired");
+  assert.equal(retired.workspaceDisposition, "abandoned");
+  assert.equal(retired.outcome, "Replacement work completed.");
 });
 
 test("TaskMessage represents user, operator, and Role result authors structurally", () => {
   const user = createTaskMessage(
     "message-1",
+    "task-1",
     "Please continue",
     "user",
     { type: "user" },
@@ -297,20 +436,23 @@ test("TaskMessage represents user, operator, and Role result authors structurall
   );
   const result = createTaskMessage(
     "message-2",
+    "task-1",
     "Implemented",
     "role-result",
     { type: "role", roleName: "worker" },
     later,
-    { runId: "agent-run-1", workItemId: "work-1" }
+    { runId: "agent-run-1", workItemId: "work-item-1" }
   );
 
   assert.deepEqual(user.author, { type: "user" });
   assert.equal(user.kind, "user");
   assert.deepEqual(result.author, { type: "role", roleName: "worker" });
   assert.equal(result.runId, "agent-run-1");
-  assert.equal(result.workItemId, "work-1");
+  assert.equal(result.workItemId, "work-item-1");
   assert.throws(
-    () => createTaskMessage("message-3", "Invalid", "role-result", { type: "user" }, now),
+    () => createTaskMessage(
+      "message-3", "task-1", "Invalid", "role-result", { type: "user" }, now
+    ),
     /Role result.*Role author/i
   );
 });

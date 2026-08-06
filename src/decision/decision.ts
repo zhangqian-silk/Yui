@@ -1,3 +1,5 @@
+import { validateTaskRecordReference } from "../task/taskRecordReference.js";
+
 export type DecisionStatus = "active" | "superseded";
 
 export type Decision = {
@@ -23,7 +25,7 @@ export function createDecision(
   const timestamp = now.toISOString();
   return {
     schemaVersion: 1,
-    id: requireSafeIdentity(id, "Decision id"),
+    id: validateTaskRecordReference({ taskId, localId: id }, "decision").localId,
     taskId: requireSafeIdentity(taskId, "Task id"),
     title: requireText(title, "Decision title"),
     rationale: requireText(rationale, "Decision rationale"),

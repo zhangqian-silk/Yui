@@ -87,14 +87,17 @@ function collectJobs(store: TaskStore): PresentedJob[] {
     }
     const failure = store.getLeaderFailure(task.id);
     const notification = store.getOperatorNotification(task.id);
-    if (failure !== null || notification !== null) {
+    const recoveryNotification = notification?.type === "leader-recovery-failed"
+      ? notification
+      : null;
+    if (failure !== null || recoveryNotification !== null) {
       jobs.push({
         id: `${RECOVERY_PREFIX}${task.id}`,
         taskId: task.id,
         kind: "leader-recovery",
         status: "failed",
-        detail: failure?.message ?? notification?.message ?? "Leader recovery failed.",
-        updatedAt: failure?.lastFailedAt ?? notification?.updatedAt ?? task.updatedAt
+        detail: failure?.message ?? recoveryNotification?.message ?? "Leader recovery failed.",
+        updatedAt: failure?.lastFailedAt ?? recoveryNotification?.updatedAt ?? task.updatedAt
       });
     }
   }
@@ -123,7 +126,10 @@ function retryJob(
     if (task.status !== "active") {
       throw usageError(`Leader recovery can only be retried for an active Task: ${task.id}.`);
     }
-    if (tx.getLeaderFailure(task.id) === null && tx.getOperatorNotification(task.id) === null) {
+    if (
+      tx.getLeaderFailure(task.id) === null
+      && tx.getOperatorNotification(task.id)?.type !== "leader-recovery-failed"
+    ) {
       throw usageError(`Job not found: ${id}.`);
     }
     tx.clearLeaderFailure(task.id);

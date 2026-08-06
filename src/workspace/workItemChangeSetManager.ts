@@ -10,14 +10,14 @@ import type {
   ManagedWorkspace,
   WorkspaceProjectEntry
 } from "../worktree/managedWorkspace.js";
+import { managedWorkspaceKey } from "../worktree/managedWorkspace.js";
 import { captureManagedGitChanges } from "./gitChangeSetCapture.js";
 
 const CAPTURABLE_WORK_ITEM_STATUSES = new Set([
   "awaiting_acceptance",
   "completed",
   "failed",
-  "cancelled",
-  "superseded"
+  "retired"
 ]);
 
 export type ProjectIntegrationProof = Readonly<{
@@ -34,14 +34,29 @@ export type WorkItemIntegrationProof = Readonly<{
   projects: readonly ProjectIntegrationProof[];
 }>;
 
+export type TaskRetirementWorkspaceProof = Readonly<{
+  ownerKey: string;
+  workspace: ManagedWorkspace;
+  projects: readonly ProjectIntegrationProof[];
+}>;
+
+export type TaskRetirementProof = Readonly<{
+  taskId: string;
+  taskUpdatedAt: string;
+  workspaces: readonly TaskRetirementWorkspaceProof[];
+}>;
+
 export class WorkItemChangeSetManager {
   constructor(
     readonly store: TaskStore,
     readonly now: () => Date = () => new Date()
   ) {}
 
-  async capture(workItemId: string): Promise<readonly WorkItemChangeSet[]> {
-    const context = requireCapturableContext(this.store, workItemId);
+  async capture(
+    taskId: string,
+    workItemId: string
+  ): Promise<readonly WorkItemChangeSet[]> {
+    const context = requireCapturableContext(this.store, taskId, workItemId);
     const captured: WorkItemChangeSet[] = [];
     for (const entry of writableEntries(context.workspace)) {
       const changeSet = await this.#captureProject(context, entry);
@@ -50,9 +65,12 @@ export class WorkItemChangeSetManager {
     return captured;
   }
 
-  async assertIntegrated(workItemId: string): Promise<WorkItemIntegrationProof | null> {
-    const item = this.store.findWorkItem(workItemId);
-    if (item === null) throw new Error(`Work item not found: ${workItemId}.`);
+  async assertIntegrated(
+    taskId: string,
+    workItemId: string
+  ): Promise<WorkItemIntegrationProof | null> {
+    const item = this.store.getWorkItem(taskId, workItemId);
+    if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
     const workspace = this.store.getWorkItemWorkspace(item.taskId, item.id);
     if (
       workspace === null
@@ -123,6 +141,91 @@ export class WorkItemChangeSetManager {
       ...(item.assignee === undefined ? {} : { assignee: item.assignee }),
       workspace,
       projects
+    };
+  }
+
+  /**
+   * Fail-closed proof that retiring the aggregate will not hide unrecorded Git
+   * state. It never removes or modifies a worktree.
+   */
+  async assertRetirable(taskId: string): Promise<TaskRetirementProof> {
+    const task = this.store.getTask(taskId);
+    if (task === null) throw new Error(`Task not found: ${taskId}.`);
+    if (task.status !== "active" && task.status !== "draft") {
+      throw new Error(`Task cannot be retired from ${task.status}: ${task.id}.`);
+    }
+    const unresolved = this.store.listIntegrationAttempts(task.id).find((attempt) => (
+      attempt.status === "running"
+      || attempt.status === "blocked"
+      || attempt.status === "validating"
+    ));
+    if (unresolved !== undefined) {
+      throw new Error(
+        `Task has an unresolved Integration Attempt: ${task.id}/${unresolved.id}.`
+      );
+    }
+    const git = new NodeGitWorkspace();
+    const workspaces: TaskRetirementWorkspaceProof[] = [];
+    for (const workspace of this.store.listManagedWorkspaces(task.id)) {
+      const projects: ProjectIntegrationProof[] = [];
+      for (const entry of workspace.entries) {
+        if (!await git.isClean(entry.path)) {
+          throw new Error(
+            `Task retirement workspace is not clean: ${task.id}/${entry.projectId}.`
+          );
+        }
+        const headCommit = (await git.inspect(entry.path, "HEAD")).baseCommit;
+        if (headCommit !== entry.baseCommit) {
+          if (workspace.owner.type === "work-item") {
+            const latest = latestWorkItemChangeSet(
+              this.store,
+              task.id,
+              workspace.owner.workItemId,
+              entry.projectId
+            );
+            if (
+              latest === undefined
+              || latest.baseCommit !== entry.baseCommit
+              || latest.headCommit !== headCommit
+              || latest.branch !== entry.branch
+            ) {
+              throw new Error(
+                `Task retirement would hide uncaptured WorkItem commits: `
+                + `${workspace.owner.workItemId}/${entry.projectId}.`
+              );
+            }
+            projects.push({
+              projectId: entry.projectId,
+              baseCommit: entry.baseCommit,
+              headCommit,
+              changeSetId: latest.id
+            });
+            continue;
+          }
+          const committed = this.store.listIntegrationAttempts(task.id).find((attempt) => (
+            attempt.status === "committed"
+            && attempt.projectId === entry.projectId
+            && attempt.candidateCommit === headCommit
+          ));
+          if (committed === undefined) {
+            throw new Error(
+              `Task retirement would hide uncaptured Task workspace commits: `
+              + `${task.id}/${entry.projectId}.`
+            );
+          }
+        }
+        projects.push({
+          projectId: entry.projectId,
+          baseCommit: entry.baseCommit,
+          headCommit
+        });
+      }
+      workspaces.push({ ownerKey: managedWorkspaceKey(workspace.owner), workspace, projects });
+    }
+    return {
+      taskId: task.id,
+      taskUpdatedAt: task.updatedAt,
+      workspaces
     };
   }
 
@@ -202,10 +305,11 @@ type CapturableContext = Readonly<{
 
 function requireCapturableContext(
   store: TaskStore,
+  taskId: string,
   workItemId: string
 ): CapturableContext {
-  const item = store.findWorkItem(workItemId);
-  if (item === null) throw new Error(`Work item not found: ${workItemId}.`);
+  const item = store.getWorkItem(taskId, workItemId);
+  if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
   if (!CAPTURABLE_WORK_ITEM_STATUSES.has(item.status)) {
     throw new Error(
       `Work item must be awaiting acceptance or terminal before capture: ${item.id}.`
@@ -222,6 +326,11 @@ function requireCapturableContext(
     throw new Error(`Task is not active: ${task.id}/${task.status}.`);
   }
   const workspace = store.getWorkItemWorkspace(task.id, item.id);
+  if (workspace?.owner.type === "review-round") {
+    throw new Error(
+      `ReviewRound-owned workspace cannot be captured as WorkItem Develop: ${item.id}.`
+    );
+  }
   if (
     workspace === null
     || workspace.owner.type !== "work-item"

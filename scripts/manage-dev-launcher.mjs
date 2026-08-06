@@ -673,14 +673,29 @@ function probeController(discovery) {
           || response.ok !== true
           || typeof result !== "object" || result === null
           || resultKeys.length < 2
-          || resultKeys.length > 3
-          || resultKeys.some((key) => !["pid", "running", "protocolVersion"].includes(key))
+          || resultKeys.length > 6
+          || resultKeys.some((key) => ![
+            "pid",
+            "running",
+            "protocolVersion",
+            "version",
+            "storageLayoutVersion",
+            "aggregateSchemaVersion"
+          ].includes(key))
           || result.running !== true
           || !Number.isSafeInteger(result.pid) || result.pid <= 0
           || (
             Object.hasOwn(result, "protocolVersion")
             && (!Number.isSafeInteger(result.protocolVersion) || result.protocolVersion <= 0)
           )
+          || (
+            Object.hasOwn(result, "version")
+            && (typeof result.version !== "string" || result.version.length === 0)
+          )
+          || ["storageLayoutVersion", "aggregateSchemaVersion"].some((key) => (
+            Object.hasOwn(result, key)
+            && (!Number.isSafeInteger(result[key]) || result[key] <= 0)
+          ))
         ) {
           finish({ status: "invalid" });
           return;
@@ -1235,6 +1250,12 @@ async function runCli() {
     console.log(`Isolated YUI_HOME default: ${result.yuiHome}`);
     return;
   }
+  if (action === "install-local") {
+    const result = installDevLauncher();
+    console.log(`Local yui launcher ready (global yui unchanged): ${result.launcherPath}`);
+    console.log(`Isolated YUI_HOME default: ${result.yuiHome}`);
+    return;
+  }
   if (action === "unlink") {
     const result = unlinkDevLauncher();
     console.log(result.restored ? `Restored the previous global yui command: ${result.globalLauncherPath}` : "This checkout did not own the global yui command.");
@@ -1249,7 +1270,7 @@ async function runCli() {
     );
     return;
   }
-  throw new Error("Usage: node scripts/manage-dev-launcher.mjs link|unlink|reset-home");
+  throw new Error("Usage: node scripts/manage-dev-launcher.mjs install-local|link|unlink|reset-home");
 }
 
 if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

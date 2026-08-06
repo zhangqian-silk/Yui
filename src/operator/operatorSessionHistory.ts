@@ -1,7 +1,6 @@
-import { createHash } from "node:crypto";
-
 import {
   normalizeRoleAgentSessionText,
+  roleAgentSessionRef,
   validateRoleSessionSet,
   type GlobalRoleSessionSet,
   type RoleAgentSession
@@ -26,12 +25,7 @@ type OperatorSessionIdentity = Readonly<{
 }>;
 
 export function operatorSessionRef(session: OperatorSessionIdentity): string {
-  const digest = createHash("sha256").update(JSON.stringify([
-    requireText(session.agentId, "Agent id"),
-    requireText(session.adapterId, "Agent adapter id"),
-    requireText(session.nativeSessionId, "Native session id")
-  ])).digest("hex");
-  return `op-${digest.slice(0, 16)}`;
+  return roleAgentSessionRef(session);
 }
 
 export function listOperatorSessions(

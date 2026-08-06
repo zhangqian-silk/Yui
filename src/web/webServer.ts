@@ -9,7 +9,7 @@ import type { Duplex } from "node:stream";
 import WebSocket, { WebSocketServer } from "ws";
 
 import { usageError } from "../errors/cliError.js";
-import { DASHBOARD_HTML, findWebAsset } from "./assets/assetManifest.js";
+import { DASHBOARD_HTML, findWebAsset, type WebAsset } from "./assets/assetManifest.js";
 import {
   buildWebDashboardSnapshot,
   buildWebTaskDetail,
@@ -182,7 +182,7 @@ async function handleHttpRequest(
           method === "HEAD"
         );
       } else if (asset !== null) {
-        sendText(response, 200, asset.contentType, asset.body, method === "HEAD");
+        sendAsset(response, asset, method === "HEAD");
       } else if (pathname === "/api/dashboard") {
         sendJson(response, 200, buildWebDashboardSnapshot(store, now()), method === "HEAD");
       } else if (pathname.startsWith("/api/tasks/")) {
@@ -492,6 +492,19 @@ function sendText(
   response.setHeader("content-type", contentType);
   response.setHeader("content-length", Buffer.byteLength(body));
   response.end(head ? undefined : body);
+}
+
+function sendAsset(response: ServerResponse, asset: WebAsset, head: boolean): void {
+  const payload = asset.encoding === "base64"
+    ? Buffer.from(asset.body, "base64")
+    : Buffer.from(asset.body, "utf-8");
+  if (asset.contentType.startsWith("font/") || asset.contentType.startsWith("image/")) {
+    response.setHeader("cache-control", "public, max-age=31536000, immutable");
+  }
+  response.statusCode = 200;
+  response.setHeader("content-type", asset.contentType);
+  response.setHeader("content-length", payload.length);
+  response.end(head ? undefined : payload);
 }
 
 function sendWebSocket(webSocket: WebSocket, value: unknown): void {

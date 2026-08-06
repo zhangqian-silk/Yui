@@ -9,7 +9,6 @@ import { runGlobalRoleCommand } from "../../dist/commands/globalRoleCommands.js"
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import {
   createRoleSessionSet,
-  recordRoleAgentSession,
   updateRoleAgentSessionStatus
 } from "../../dist/executor/agentExecutor.js";
 import {
@@ -22,7 +21,7 @@ import {
   RUNTIME_LAUNCH_RESERVED_REASON,
   runtimeLifecycleTarget
 } from "../../dist/runtime/lifecycleReservation.js";
-import { createAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun, recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 import {
   createGlobalRole,
   createRoleAgentBinding
@@ -161,13 +160,13 @@ test("Global Role update checks runtime state and saves the Role in one transact
     observed.events
       .filter(({ method }) => method === "getGlobalRoleSessionSet")
       .map(({ insideTransaction }) => insideTransaction),
-    [true, false]
+    [false]
   );
   assert.ok(observed.events.some(({ method, insideTransaction }) =>
     method === "getWorkMailbox" && insideTransaction));
 });
 
-test("Global Role launch context cannot change while its active native session is running", (t) => {
+test("Global Role desired launch context changes without mutating a running Session", (t) => {
   const { root, store } = fixture(t);
   const options = { yuiHome: root };
   runGlobalRoleCommand(["add", "reviewer", "--agent", "codex"], store, options);
@@ -176,20 +175,27 @@ test("Global Role launch context cannot change while its active native session i
     roleName: "reviewer"
   }));
   const before = store.getGlobalRole("reviewer");
+  const effectiveBefore = structuredClone(
+    store.getGlobalRoleSessionSet("reviewer").sessions.codex.effective
+  );
 
-  for (const command of [
-    ["update", "reviewer", "--constraint", "Never write outside the workspace"],
-    ["update", "reviewer", "--workspace", join(root, "replacement")]
-  ]) {
-    assert.throws(
-      () => runGlobalRoleCommand(command, store, options),
-      /launch context|native process|running/i
-    );
-    assert.deepEqual(store.getGlobalRole("reviewer"), before);
-  }
+  runGlobalRoleCommand([
+    "update", "reviewer", "--constraint", "Never write outside the workspace"
+  ], store, options);
+  runGlobalRoleCommand([
+    "update", "reviewer", "--workspace", join(root, "replacement")
+  ], store, options);
+
+  const desired = store.getGlobalRole("reviewer");
+  const session = store.getGlobalRoleSessionSet("reviewer").sessions.codex;
+  assert.equal(desired.launchRevision, before.launchRevision + 2);
+  assert.deepEqual(desired.constraints, ["Never write outside the workspace"]);
+  assert.equal(desired.workspace, join(root, "replacement"));
+  assert.deepEqual(session.effective, effectiveBefore);
+  assert.equal(session.status, "ready");
 });
 
-test("Task Role launch context cannot change during an active Run or native session", (t) => {
+test("Task Role desired launch context changes without mutating an active Run or Session", (t) => {
   const { store, options } = fixture(t);
   const task = createTask(store, options);
   const before = store.getRole(task.id, "leader");
@@ -202,13 +208,13 @@ test("Task Role launch context cannot change during an active Run or native sess
     NOW
   ));
 
-  assert.throws(
-    () => runTaskCommand([
-      "role", "update", task.id, "leader", "--system-prompt", "New policy"
-    ], store, options),
-    /launch context|active Run|running/i
-  );
-  assert.deepEqual(store.getRole(task.id, "leader"), before);
+  const runBefore = structuredClone(store.getActiveAgentRun(task.id, "leader"));
+  runTaskCommand([
+    "role", "update", task.id, "leader", "--system-prompt", "New policy"
+  ], store, options);
+  assert.equal(store.getRole(task.id, "leader").launchRevision, before.launchRevision + 1);
+  assert.equal(store.getRole(task.id, "leader").systemPrompt, "New policy");
+  assert.deepEqual(store.getActiveAgentRun(task.id, "leader"), runBefore);
 
   store.clearActiveAgentRun(task.id, "leader");
   store.saveTaskRoleSessionSet(runningSession({
@@ -216,16 +222,65 @@ test("Task Role launch context cannot change during an active Run or native sess
     taskId: task.id,
     roleName: "leader"
   }));
-  assert.throws(
-    () => runTaskCommand([
-      "role", "update", task.id, "leader", "--responsibility", "New responsibility"
-    ], store, options),
-    /launch context|native process|running/i
+  const sessionBefore = structuredClone(store.getTaskRoleSessionSet(task.id, "leader"));
+  runTaskCommand([
+    "role", "update", task.id, "leader", "--responsibility", "New responsibility"
+  ], store, options);
+  assert.equal(store.getRole(task.id, "leader").launchRevision, before.launchRevision + 2);
+  assert.deepEqual(
+    store.getTaskRoleSessionSet(task.id, "leader"),
+    sessionBefore
   );
-  assert.deepEqual(store.getRole(task.id, "leader"), before);
 });
 
-test("Role updates reject every non-stopped dormant session and allow stopped sessions", (t) => {
+test("successive desired Agent switches preserve the live Session identity", (t) => {
+  const { root, store, options } = fixture(t);
+  store.saveConfiguredAgent(createConfiguredAgent(
+    "claude-alt",
+    "claude",
+    "claude-alt",
+    [],
+    [],
+    NOW
+  ));
+
+  runGlobalRoleCommand(["add", "reviewer", "--agent", "codex"], store, { yuiHome: root });
+  store.saveGlobalRoleSessionSet(runningSession({
+    scope: "global",
+    roleName: "reviewer"
+  }));
+  const globalEffective = structuredClone(
+    store.getGlobalRoleSessionSet("reviewer").sessions.codex.effective
+  );
+  runGlobalRoleCommand(["bind", "reviewer", "claude"], store, { yuiHome: root });
+  runGlobalRoleCommand(["bind", "reviewer", "claude-alt"], store, { yuiHome: root });
+  assert.equal(store.getGlobalRole("reviewer").activeAgentId, "claude-alt");
+  assert.equal(store.getGlobalRoleSessionSet("reviewer").activeAgentId, "codex");
+  assert.deepEqual(
+    store.getGlobalRoleSessionSet("reviewer").sessions.codex.effective,
+    globalEffective
+  );
+
+  const task = createTask(store, options);
+  store.saveTaskRoleSessionSet(runningSession({
+    scope: "task",
+    taskId: task.id,
+    roleName: "leader"
+  }));
+  const taskEffective = structuredClone(
+    store.getTaskRoleSessionSet(task.id, "leader").sessions.codex.effective
+  );
+  runTask(["role", "bind", task.id, "leader", "claude"], store, options);
+  runTask(["role", "bind", task.id, "leader", "claude-alt"], store, options);
+  assert.equal(store.getRole(task.id, "leader").activeAgentId, "claude-alt");
+  assert.equal(store.getTaskRoleSessionSet(task.id, "leader").activeAgentId, "codex");
+  assert.deepEqual(
+    store.getTaskRoleSessionSet(task.id, "leader").sessions.codex.effective,
+    taskEffective
+  );
+});
+
+test("Role updates are next-launch-only for ready and stopped dormant sessions", (t) => {
   const { root, store, options } = fixture(t);
   runGlobalRoleCommand(["add", "reviewer", "--agent", "codex"], store, options);
   runGlobalRoleCommand(["bind", "reviewer", "claude"], store, options);
@@ -235,18 +290,14 @@ test("Role updates reject every non-stopped dormant session and allow stopped se
     roleName: "reviewer"
   }, "ready"));
 
-  assert.throws(
-    () => runGlobalRoleCommand([
-      "update", "reviewer", "--description", "New shared context"
-    ], store, options),
-    /native process|running/i
-  );
-  assert.throws(
-    () => runGlobalRoleCommand([
-      "update", "reviewer", "--agent", "claude", "--model", "claude-next"
-    ], store, options),
-    /native process|running/i
-  );
+  const readyGlobal = structuredClone(store.getGlobalRoleSessionSet("reviewer"));
+  runGlobalRoleCommand([
+    "update", "reviewer", "--description", "New shared context"
+  ], store, options);
+  runGlobalRoleCommand([
+    "update", "reviewer", "--agent", "claude", "--model", "claude-next"
+  ], store, options);
+  assert.deepEqual(store.getGlobalRoleSessionSet("reviewer"), readyGlobal);
 
   store.saveGlobalRoleSessionSet(dormantSession({
     scope: "global",
@@ -264,12 +315,11 @@ test("Role updates reject every non-stopped dormant session and allow stopped se
     taskId: task.id,
     roleName: "leader"
   }, "ready"));
-  assert.throws(
-    () => runTaskCommand([
-      "role", "update", task.id, "leader", "--agent", "claude", "--model", "claude-next"
-    ], store, options),
-    /native process|running/i
-  );
+  const readyTask = structuredClone(store.getTaskRoleSessionSet(task.id, "leader"));
+  runTaskCommand([
+    "role", "update", task.id, "leader", "--agent", "claude", "--model", "claude-next"
+  ], store, options);
+  assert.deepEqual(store.getTaskRoleSessionSet(task.id, "leader"), readyTask);
   store.saveTaskRoleSessionSet(dormantSession({
     scope: "task",
     taskId: task.id,

@@ -28,3 +28,13 @@
 
 - Do not add legacy storage or workspace compatibility unless the user explicitly requests it.
 - Prefer the smallest workflow that satisfies the current product commitment. Avoid speculative states, background protocols, and duplicate sources of truth.
+
+## Run this checkout in isolation
+
+- To exercise Yui from this checkout, run `make install-local` once, then always invoke the launcher by absolute path: `<checkout>/output/dev/bin/yui ...`. This is the reliable per-checkout entry point for automation.
+- `make install-local` builds `dist/` and writes exactly one file, the launcher at `output/dev/bin/yui`. It does not modify `PATH`, does not touch the global `yui`, and does not create the data home. It is idempotent; re-run it after pulling code.
+- The launcher resolves its own checkout and defaults `YUI_HOME` to this checkout's `output/dev/home`, so the Controller socket, tmux server, and state that Yui derives from `YUI_HOME` stay separate from other checkouts and the global install. Calling it by absolute path works from any working directory.
+- A bare `yui` always resolves through `PATH`, independent of the current directory. Being inside this checkout does NOT make bare `yui` use the local launcher; it still runs whatever `PATH` finds (typically the global `yui`). Only an absolute launcher path selects this instance. A per-shell `export PATH=<checkout>/output/dev/bin:$PATH` also works, but only inside that one interactive shell.
+- Each command runs in a fresh process, so `export PATH=...` / `export YUI_HOME=...` do not persist to the next command; never depend on them in automation. Use the absolute launcher path every time instead.
+- Do not use `make link` to test a change: it persistently replaces the user-level global `yui` for every shell. Prefer `make install-local` plus the absolute path for per-checkout work.
+- `make install-local` only creates the launcher. Initialize the isolated home once with `<checkout>/output/dev/bin/yui setup` before commands that need state, and run `<checkout>/output/dev/bin/yui controller restart` if a Controller is already running an older build.

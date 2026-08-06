@@ -1,8 +1,11 @@
+import { validateTaskRecordReference } from "../task/taskRecordReference.js";
+
 export type TaskEventPayload = Record<string, string>;
 
 export type TaskEvent = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   id: string;
+  taskId: string;
   type: string;
   payload: TaskEventPayload;
   createdAt: string;
@@ -10,17 +13,21 @@ export type TaskEvent = {
 
 export function createTaskEvent(
   id: string,
+  taskId: string,
   type: string,
   payload: TaskEventPayload,
   now: Date
 ): TaskEvent {
-  return {
-    schemaVersion: 1,
+  const event: TaskEvent = {
+    schemaVersion: 2,
     id: requireText(id, "Task event id"),
+    taskId: requireText(taskId, "Task event Task id"),
     type: requireText(type, "Task event type"),
     payload: normalizePayload(payload),
     createdAt: now.toISOString()
   };
+  validateTaskRecordReference({ taskId: event.taskId, localId: event.id }, "event");
+  return event;
 }
 
 /**

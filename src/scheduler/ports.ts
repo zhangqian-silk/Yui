@@ -3,7 +3,10 @@ import type { Decision } from "../decision/decision.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import type { Milestone } from "../milestone/milestone.js";
 import type { LeaderFailure } from "./leaderFailure.js";
-import type { OperatorNotification } from "./operatorNotification.js";
+import type {
+  LeaderRecoveryOperatorNotification,
+  OperatorNotification
+} from "./operatorNotification.js";
 import type { PendingWakeup } from "./pendingWakeup.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type {
@@ -16,6 +19,8 @@ import type { PendingTurnCompletion } from "../executor/turnCompletion.js";
 import type { RuntimeRoleOwner } from "../runtime/lifecycleReservation.js";
 import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import type { Task } from "../task/task.js";
+import type { TaskEvent } from "../event/taskEvent.js";
+import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 
 export type SchedulerTask = Readonly<Pick<
   Task,
@@ -29,6 +34,7 @@ export type SchedulerRole = Readonly<{
   adapterId: AgentAdapterId;
   model?: string;
   effort?: string;
+  effective: EffectiveLaunchSnapshot;
   workspace: string;
   status: "idle" | "running" | "detached" | "exited" | "failed";
 }>;
@@ -40,6 +46,35 @@ export type SchedulerRoleSession = Readonly<{
   adapterId: string;
   nativeSessionId?: string;
   status: "reserved" | "ready" | "running" | "stopped" | "broken";
+  effective: EffectiveLaunchSnapshot;
+  /** Last durable session transition, when the adapter can expose it. */
+  updatedAt?: string;
+}>;
+
+export type RoleRunStallPersistence = Readonly<{
+  taskId: string;
+  roleName: string;
+  runId: string;
+  kind: "delivery-stalled" | "execution-stalled";
+  classification: "truly-stalled";
+  progressAt: string;
+  idleMs: number;
+  evidenceKey: string;
+  now: Date;
+}>;
+
+export type SchedulerRunProgress = Readonly<{
+  progressAt: string;
+  evidence?: string;
+}>;
+
+export type RoleRunProgressPersistence = Readonly<{
+  taskId: string;
+  roleName: string;
+  runId: string;
+  progressAt: string;
+  evidence?: string;
+  now: Date;
 }>;
 
 /**
@@ -107,6 +142,19 @@ export type RoleRunDeliveryPersistence = Readonly<{
   now: Date;
 }>;
 
+export type RoleRunDeliveryFailurePersistence = Readonly<{
+  taskId: string;
+  roleName: string;
+  agentId: string;
+  adapterId: AgentAdapterId;
+  runId: string;
+  mailboxBatchId: string;
+  nativeSessionId?: string;
+  /** Exact external-process generation prepared for this undelivered Run. */
+  launchId?: string;
+  now: Date;
+}>;
+
 export type ExitedRoleRunPersistence = Readonly<{
   task: SchedulerTask;
   role: SchedulerRole;
@@ -122,7 +170,7 @@ export type LeaderDispatchFailurePersistence = Readonly<{
   session: SchedulerRoleSession | null;
   claimed: Readonly<{ run: SchedulerAgentRun; wakeup: PendingWakeup }>;
   failure: LeaderFailure;
-  notification: OperatorNotification;
+  notification: LeaderRecoveryOperatorNotification;
   now: Date;
 }>;
 
@@ -140,7 +188,7 @@ export interface SchedulerStorePort {
   hasOpenInputRequest(taskId: string): boolean;
   listOpenInputRequests(): readonly InputRequest[];
   listPendingRuntimeTurnCompletions(): readonly PendingTurnCompletion[];
-  getInputRequest(inputRequestId: string): InputRequest | null;
+  getInputRequest(taskId: string, inputRequestId: string): InputRequest | null;
   getOperatorDeliveryTarget(): SchedulerOperatorDeliveryTarget | null;
   resolveExpiredInputRecommendations(
     now: Date,
@@ -150,9 +198,21 @@ export interface SchedulerStorePort {
     now: Date,
     taskIds?: ReadonlySet<string>
   ): readonly string[];
-  getRoleSession(taskId: string, roleName: string): SchedulerRoleSession | null;
+  getRoleSession(
+    taskId: string,
+    roleName: string,
+    agentId?: string
+  ): SchedulerRoleSession | null;
+  /** Immutable runtime facts used by the low-frequency stall projection. */
+  listEvents?(taskId: string): readonly TaskEvent[];
+  /** Optional richer fold of WorkItem/Review/Integration progress for a Run. */
+  getRunDurableProgress?(taskId: string, roleName: string, runId: string): SchedulerRunProgress | null;
+  /** Materializes a newly observed related-record fold as one run.progress fact. */
+  recordRoleRunProgress?(input: RoleRunProgressPersistence): "recorded" | "already-recorded" | "state-changed";
+  /** Atomically records one new stall episode and routes its responsibility. */
+  recordRoleRunStall?(input: RoleRunStallPersistence): "raised" | "already-raised" | "state-changed";
   hasInFlightTurn(taskId: string, roleName: string): boolean;
-  nextAgentRunId(taskId: string): string;
+  peekNextAgentRunId(taskId: string): string;
 
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
   listWorkMailboxes(): readonly WorkMailbox[];
@@ -220,19 +280,14 @@ export interface SchedulerStorePort {
   saveRoleRunPrepared(input: RoleRunDeliveryPersistence): void;
   /** Persist successful delivery of a Work AgentRun and its fixed session. */
   saveRoleRunDelivery(input: RoleRunDeliveryPersistence): void;
+  /** Atomically fail one exact prepared Run after bounded delivery exhaustion. */
+  saveRoleRunDeliveryFailure(
+    input: RoleRunDeliveryFailurePersistence
+  ): "failed" | "state-changed";
   /** Persist LeaderFailure, OperatorNotification and failed/broken runtime state. */
   saveLeaderDispatchFailure(input: LeaderDispatchFailurePersistence): "failed" | "state-changed";
   /** Fail the run and running WorkItem, clear active-run, and stop the Role session. */
   saveExitedRoleRun(input: ExitedRoleRunPersistence): "failed" | "state-changed";
-  /** Synthesizes the same durable Turn boundary when a full safety scan sees the composer ready. */
-  recoverReadyRoleRun?(input: Readonly<{
-    taskId: string;
-    roleName: string;
-    runId: string;
-    now: Date;
-  }>): void;
-  /** Mark every recorded Task Role session stopped after tmux termination. */
-  saveArchivedTaskStopped(taskId: string, now: Date): void;
 }
 
 /** Resolves Tasks without a global scan for a dirty reconciliation pass. */
@@ -302,6 +357,7 @@ export interface TmuxDeliveryPort {
     roleName: string;
     agentId: string;
     adapterId: string;
+    effective: EffectiveLaunchSnapshot;
     workspace: string;
     mode: RoleSessionLaunchMode;
     runId?: string;
@@ -323,7 +379,7 @@ export interface TmuxDeliveryPort {
     runId?: string;
     launchId?: string;
   }>): void;
-  /** Best-effort nudge to an already-running global Operator composer. */
+  /** Best-effort nudge to an already-running global Operator process. */
   notifyOperatorInputOnce?(input: Readonly<{
     roleName: "operator";
     adapterId: string;
@@ -359,6 +415,4 @@ export interface TmuxDeliveryPort {
     }>[]>;
   /** Retryable stale lifecycle cleanup for one exact Task Role pane. */
   stopRole?(taskId: string, roleName: string): Promise<boolean>;
-  /** Archive boundary: tmux owns process termination for every Role in the Task. */
-  stopTask(taskId: string): Promise<boolean>;
 }

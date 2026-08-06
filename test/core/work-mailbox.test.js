@@ -84,14 +84,14 @@ test("enqueueSignal immutably coalesces pending reasons and entity references", 
   const empty = createWorkMailbox(roleTarget);
   const first = enqueueSignal(empty, {
     reason: "worker-yield",
-    refs: [{ type: "run", id: "run-1" }],
+    refs: [{ type: "run", taskId: "task-1", id: "agent-run-1" }],
     occurredAt: FIRST
   });
   const second = enqueueSignal(first, {
     reason: "worker-yield",
     refs: [
-      { type: "run", id: "run-1" },
-      { type: "work-item", id: "work-2" }
+      { type: "run", taskId: "task-1", id: "agent-run-1" },
+      { type: "work-item", taskId: "task-1", id: "work-item-2" }
     ],
     occurredAt: SECOND
   });
@@ -104,8 +104,8 @@ test("enqueueSignal immutably coalesces pending reasons and entity references", 
     toSequence: 2,
     reasons: ["worker-yield"],
     refs: [
-      { type: "run", id: "run-1" },
-      { type: "work-item", id: "work-2" }
+      { type: "run", taskId: "task-1", id: "agent-run-1" },
+      { type: "work-item", taskId: "task-1", id: "work-item-2" }
     ],
     requestCount: 2,
     firstQueuedAt: FIRST,
@@ -137,7 +137,7 @@ test("claim freezes pending and signals arriving during processing form the next
 
   const signalled = enqueueSignal(claimed, {
     reason: "activated",
-    refs: [{ type: "run", id: "run-2" }],
+    refs: [{ type: "run", taskId: "task-1", id: "agent-run-2" }],
     occurredAt: THIRD
   });
   assert.deepEqual(signalled.processing, claimed.processing);
@@ -145,7 +145,7 @@ test("claim freezes pending and signals arriving during processing form the next
     fromSequence: 2,
     toSequence: 2,
     reasons: ["activated"],
-    refs: [{ type: "run", id: "run-2" }],
+    refs: [{ type: "run", taskId: "task-1", id: "agent-run-2" }],
     requestCount: 1,
     firstQueuedAt: THIRD,
     lastQueuedAt: THIRD
@@ -185,7 +185,7 @@ test("claim requires pending work and rejects concurrent processing", () => {
 test("bindExecution and completeProcessing use the batch id as a compare-and-set fence", () => {
   const queued = enqueueSignal(createWorkMailbox(roleTarget), {
     reason: "run-pending",
-    refs: [{ type: "run", id: "run-1" }],
+    refs: [{ type: "run", taskId: "task-1", id: "agent-run-1" }],
     occurredAt: FIRST
   });
   const claimed = claimPending(queued, {
@@ -195,17 +195,23 @@ test("bindExecution and completeProcessing use the batch id as a compare-and-set
   });
 
   assert.throws(
-    () => bindExecution(claimed, "stale-batch", { type: "run", id: "run-1" }),
+    () => bindExecution(claimed, "stale-batch", {
+      type: "run", taskId: "task-1", id: "agent-run-1"
+    }),
     /batch id/i
   );
-  const bound = bindExecution(claimed, "batch-1", { type: "run", id: "run-1" });
+  const bound = bindExecution(claimed, "batch-1", {
+    type: "run", taskId: "task-1", id: "agent-run-1"
+  });
   assert.equal(claimed.processing.executionRef, undefined);
-  assert.deepEqual(bound.processing.executionRef, { type: "run", id: "run-1" });
+  assert.deepEqual(bound.processing.executionRef, {
+    type: "run", taskId: "task-1", id: "agent-run-1"
+  });
   assert.throws(() => completeProcessing(bound, "stale-batch"), /batch id/i);
 
   const withNext = enqueueSignal(bound, {
     reason: "user-message",
-    refs: [{ type: "message", id: "message-1" }],
+    refs: [{ type: "message", taskId: "task-1", id: "message-1" }],
     occurredAt: THIRD
   });
   const completed = completeProcessing(withNext, "batch-1");
@@ -216,7 +222,7 @@ test("bindExecution and completeProcessing use the batch id as a compare-and-set
 test("releaseProcessing merges the frozen batch before signals in the next pending batch", () => {
   const first = enqueueSignal(createWorkMailbox(roleTarget), {
     reason: "worker-yield",
-    refs: [{ type: "run", id: "run-1" }],
+    refs: [{ type: "run", taskId: "task-1", id: "agent-run-1" }],
     occurredAt: FIRST
   });
   const claimed = claimPending(first, {
@@ -227,8 +233,8 @@ test("releaseProcessing merges the frozen batch before signals in the next pendi
   const withNext = enqueueSignal(claimed, {
     reason: "user-message",
     refs: [
-      { type: "run", id: "run-1" },
-      { type: "message", id: "message-1" }
+      { type: "run", taskId: "task-1", id: "agent-run-1" },
+      { type: "message", taskId: "task-1", id: "message-1" }
     ],
     occurredAt: THIRD
   });
@@ -241,8 +247,8 @@ test("releaseProcessing merges the frozen batch before signals in the next pendi
     toSequence: 2,
     reasons: ["worker-yield", "user-message"],
     refs: [
-      { type: "run", id: "run-1" },
-      { type: "message", id: "message-1" }
+      { type: "run", taskId: "task-1", id: "agent-run-1" },
+      { type: "message", taskId: "task-1", id: "message-1" }
     ],
     requestCount: 2,
     firstQueuedAt: FIRST,

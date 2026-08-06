@@ -5,10 +5,12 @@ import {
   type SchedulerStorePort,
   type TmuxDeliveryPort
 } from "./ports.js";
+import { formatTaskRecordReference } from "../task/taskRecordReference.js";
 import { queueLeaderWakeup } from "./wakeupQueue.js";
 
 export const EXITED_ROLE_RUN_SUMMARY = "The role's tmux session exited before the run yielded.";
-export const DEFAULT_READY_RECOVERY_AGE_MS = 120_000;
+export type RoleLiveStatus = "present" | "absent";
+export type RoleLiveStatusSnapshot = ReadonlyMap<string, RoleLiveStatus>;
 
 /**
  * Lightweight liveness only: an active AgentRun whose tmux role is absent is
@@ -18,20 +20,19 @@ export async function reconcileExitedRoleRuns(
   store: SchedulerStorePort,
   delivery: Pick<
     TmuxDeliveryPort,
-    "inspectRole" | "inspectRoles" | "inspectRoleReadiness" | "forgetPrepared"
+    "inspectRole" | "inspectRoles" | "forgetPrepared"
   >,
   now: Date,
   selection?: SchedulerReconcileSelection,
-  excludedRunIds: ReadonlySet<string> = new Set(),
-  minimumReadyRecoveryAgeMs = DEFAULT_READY_RECOVERY_AGE_MS,
-  readyRecoveryRunIds: ReadonlySet<string> = new Set()
+  excludedRunRefs: ReadonlySet<string> = new Set(),
+  liveStatuses?: Map<string, RoleLiveStatus>
 ): Promise<string[]> {
   const failed: string[] = [];
   const candidates = selectedSchedulerTasks(store, selection).flatMap((task) => (
     selectedSchedulerRoles(store, task.id, selection).flatMap((role) => {
       const run = store.getActiveAgentRun(task.id, role.name);
       if (run === null) return [];
-      const session = store.getRoleSession(task.id, role.name);
+      const session = store.getRoleSession(task.id, role.name, run.effective.agentId);
       return [{
         task,
         role,
@@ -40,8 +41,8 @@ export async function reconcileExitedRoleRuns(
         inspection: {
           taskId: task.id,
           roleName: role.name,
-          agentId: role.activeAgentId,
-          adapterId: role.adapterId,
+          agentId: run.effective.agentId,
+          adapterId: run.effective.adapterId,
           ...(session?.nativeSessionId === undefined
             ? {}
             : { nativeSessionId: session.nativeSessionId })
@@ -56,49 +57,23 @@ export async function reconcileExitedRoleRuns(
     ))
   );
   const eligible = candidates.filter(({ task, role, run }) => (
-    !excludedRunIds.has(run.id)
+    !excludedRunRefs.has(formatTaskRecordReference(task.id, run.id, "agentRun"))
     && !completing.has(`${task.id}\0${role.name}\0${run.id}`)
   ));
-  if (eligible.length === 0) return failed;
-  const batch = delivery.inspectRoles === undefined
-    ? null
-    : await delivery.inspectRoles(eligible.map((candidate) => candidate.inspection));
-  const batchStatuses = batch === null
-    ? new Map<string, "present" | "absent">()
-    : exactBatchStatuses(batch, eligible);
+  // Build one complete provider inventory for every active Run, including
+  // delivery-uncertain and completion-pending Runs. The stall phase reuses
+  // this snapshot so one scheduler pass never probes the same pane twice.
+  const batchStatuses = liveStatuses !== undefined
+    && candidates.every(({ task, role }) => liveStatuses.has(`${task.id}\0${role.name}`))
+    ? liveStatuses
+    : await inspectRoleStatuses(delivery, candidates);
+  if (liveStatuses !== undefined) {
+    for (const [key, status] of batchStatuses) liveStatuses.set(key, status);
+  }
   for (const { task, role, run, session, inspection } of eligible) {
-      const status = batch === null
-        ? await delivery.inspectRole(inspection)
-        : batchStatuses.get(`${task.id}\0${role.name}`)!;
-      if (status === "present") {
-        const isFullReconciliation = selection === undefined || selection.full;
-        const readyRecoveryDue = readyRecoveryRunIds.has(run.id)
-          || (
-            isFullReconciliation
-            && run.deliveredAt !== undefined
-            && now.getTime() - Date.parse(run.deliveredAt) >= minimumReadyRecoveryAgeMs
-          );
-        if (
-          readyRecoveryDue
-          && run.deliveredAt !== undefined
-          && delivery.inspectRoleReadiness !== undefined
-          && store.recoverReadyRoleRun !== undefined
-          && await delivery.inspectRoleReadiness(inspection) === "ready"
-        ) {
-          store.recoverReadyRoleRun({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id,
-            now
-          });
-          delivery.forgetPrepared?.({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id
-          });
-        }
-        continue;
-      }
+      const status = batchStatuses.get(`${task.id}\0${role.name}`);
+      if (status === undefined) throw new Error("Role liveness snapshot is incomplete.");
+      if (status === "present") continue;
 
       const persisted = store.saveExitedRoleRun({
         task,
@@ -114,7 +89,7 @@ export async function reconcileExitedRoleRuns(
         roleName: role.name,
         runId: run.id
       });
-      failed.push(run.id);
+      failed.push(formatTaskRecordReference(task.id, run.id, "agentRun"));
       // Compatibility for narrow in-memory/custom ports that predate the
       // adapter's atomic failure+wake transition. Production returns
       // "failed" and already enqueued this wake in the same transaction.
@@ -128,6 +103,38 @@ export async function reconcileExitedRoleRuns(
       }
   }
   return failed;
+}
+
+type RoleRunCandidate = Readonly<{
+  task: ReturnType<typeof selectedSchedulerTasks>[number];
+  role: ReturnType<typeof selectedSchedulerRoles>[number];
+  inspection: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    adapterId: string;
+    nativeSessionId?: string;
+  }>;
+}>;
+
+async function inspectRoleStatuses(
+  delivery: Pick<TmuxDeliveryPort, "inspectRole" | "inspectRoles">,
+  candidates: readonly RoleRunCandidate[]
+): Promise<RoleLiveStatusSnapshot> {
+  if (delivery.inspectRoles !== undefined) {
+    return exactBatchStatuses(
+      await delivery.inspectRoles(candidates.map(({ inspection }) => inspection)),
+      candidates
+    );
+  }
+  const entries: [string, RoleLiveStatus][] = [];
+  for (const candidate of candidates) {
+    entries.push([
+      `${candidate.task.id}\0${candidate.role.name}`,
+      await delivery.inspectRole(candidate.inspection)
+    ]);
+  }
+  return new Map(entries);
 }
 
 function exactBatchStatuses(

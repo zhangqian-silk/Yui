@@ -18,7 +18,10 @@ import type { SelectionIo } from "../cli/interactiveSelection.js";
 import type { CompletionStore } from "../completion/completionInstaller.js";
 import { runCompletionWizard } from "../completion/completionWizard.js";
 import { usageError } from "../errors/cliError.js";
-import { resolveAgentAdapter } from "../executor/agentAdapter.js";
+import {
+  defaultRoleAgentConfig,
+  resolveAgentAdapter
+} from "../executor/agentAdapter.js";
 import {
   AgentConfigurationCatalogService
 } from "../executor/agentConfigurationCatalog.js";
@@ -143,15 +146,17 @@ export async function runSetupCommand(
       `Operator Agent: ${result.operatorAgentId}.`,
       `Leader model: ${result.leaderConfig.model ?? "CLI default"}.`,
       `Leader reasoning effort: ${result.leaderConfig.effort ?? "CLI default"}.`,
+      `Leader permission: ${result.leaderConfig.permission.strategy}.`,
       `Operator model: ${result.operatorConfig.model ?? "CLI default"}.`,
       `Operator reasoning effort: ${result.operatorConfig.effort ?? "CLI default"}.`,
+      `Operator permission: ${result.operatorConfig.permission.strategy}.`,
       `Worker Agent: ${result.workerAgentId}.`,
       `Worker configuration: ${result.workerReusesLeader
         ? "Reused Leader configuration"
         : "Configured separately"}.`,
       `Worker model: ${result.workerConfig.model ?? "CLI default"}.`,
       `Worker reasoning effort: ${result.workerConfig.effort ?? "CLI default"}.`,
-      `Worker YOLO: ${result.workerConfig.yolo === true ? "enabled" : "disabled"}.`,
+      `Worker permission: ${result.workerConfig.permission.strategy}.`,
       `Project workspace: ${result.workspace}.`,
       `Time zone: ${resolveTimeZone(new FileTaskStore(home).getConfig().timeZone)}.`
     ];
@@ -416,7 +421,12 @@ function savePreparedSystemRole(
   now: Date
 ): void {
   const sessions = store.getGlobalRoleSessionSet(role.name);
-  if (sessions === null || sessions.activeAgentId === role.activeAgentId) {
+  const activeSession = sessions?.sessions[sessions.activeAgentId];
+  if (
+    sessions === null
+    || sessions.activeAgentId === role.activeAgentId
+    || (activeSession !== undefined && activeSession.status !== "stopped")
+  ) {
     store.saveGlobalRole(role);
     return;
   }
@@ -465,7 +475,7 @@ async function promptRoleAgentConfig(
     throw usageError(`${label} Agent configuration was cancelled.`);
   }
   const candidate = structuredClone(
-    existing ?? { adapterId: agent.adapterId }
+    existing ?? defaultRoleAgentConfig(agent.adapterId)
   ) as unknown as Record<string, unknown>;
   if (selection.model === undefined) delete candidate.model;
   else candidate.model = selection.model;
@@ -577,17 +587,7 @@ function prepareSystemRole(
     assertRoleRuntimeMutationAllowed(store, {
       scope: "global",
       roleName: name
-    }, "launch configuration update");
-    const liveSession = Object.values(
-      store.getGlobalRoleSessionSet(name)?.sessions ?? {}
-    ).find(({ status }) => status !== "stopped");
-    if (liveSession !== undefined) {
-      throw usageError(
-        `Global Role ${name} cannot be reconfigured while its native Session is ${
-          liveSession.status
-        }. Exit or stop that Session, then rerun yui setup.`
-      );
-    }
+    }, "desired launch configuration update");
     return updateGlobalRole(existing, {
       activeAgentId: agent.id,
       workspace,

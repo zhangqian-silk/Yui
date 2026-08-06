@@ -27,7 +27,7 @@ export type ProjectCommandStore = Readonly<{
 export type ProjectCommandOptions = Readonly<{
   git?: Pick<
     GitWorkspacePort,
-    "inspect" | "headRef" | "isClean" | "clone" | "ensureLocalBranch"
+    "inspect" | "headRef" | "isClean" | "refresh" | "clone" | "ensureLocalBranch"
   >;
   now?: () => Date;
 }>;
@@ -48,6 +48,15 @@ export async function runProjectCommand(
   }
   if (command === "list") {
     return { output: listProjects(rest, store), data: { projects: store.listProjects() } };
+  }
+  if (command === "refresh") {
+    const refreshed = await refreshProject(rest, store, options);
+    return {
+      output: refreshed.changed
+        ? `Refreshed project ${refreshed.project.id}: ${refreshed.fromCommit} -> ${refreshed.toCommit}\n`
+        : `Project ${refreshed.project.id} is already current at ${refreshed.toCommit}\n`,
+      data: refreshed
+    };
   }
   if (command === "update") {
     const project = await updateProject(rest, store, options);
@@ -80,6 +89,36 @@ export async function runProjectCommand(
   throw usageError(command === undefined
     ? "Project command is required."
     : `Unknown command: project ${command}`);
+}
+
+async function refreshProject(
+  args: readonly string[],
+  store: ProjectCommandStore,
+  options: ProjectCommandOptions
+): Promise<Readonly<{
+  project: Project;
+  fromCommit: string;
+  toCommit: string;
+  changed: boolean;
+}>> {
+  if (args.length !== 1) {
+    throw usageError("Project refresh usage: yui project refresh <project>.");
+  }
+  const project = requireProject(store, args[0]!);
+  if (project.remoteUrl === undefined) {
+    throw usageError(`Project refresh requires a remote URL: ${project.id}.`);
+  }
+  if (project.stableBranch !== project.developmentBranch) {
+    throw usageError(
+      `Project refresh requires matching stable and development branches: ${project.id}.`
+    );
+  }
+  const refreshed = await (options.git ?? new NodeGitWorkspace()).refresh({
+    repositoryPath: project.path,
+    remoteUrl: project.remoteUrl,
+    stableRef: project.stableBranch
+  });
+  return { project, ...refreshed };
 }
 
 type DiscoveredProject = Readonly<{

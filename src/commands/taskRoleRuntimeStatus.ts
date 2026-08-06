@@ -1,10 +1,22 @@
+import { isDeepStrictEqual } from "node:util";
+
 import type { RoleAgentSession } from "../executor/agentExecutor.js";
+import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { TaskRole } from "../role/role.js";
+import {
+  hasRuntimeCleanupObligation,
+  hasRuntimeLifecycleWork,
+  runtimeLifecycleTarget
+} from "../runtime/lifecycleReservation.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import type { WorkItem } from "../workItem/workItem.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
+import {
+  isRoleRunStalled,
+  latestStallProgressAt
+} from "../scheduler/roleRunStall.js";
 
 export type TaskRoleHealth =
   | "idle"
@@ -27,10 +39,21 @@ export type TaskRoleWorkspaceStatus =
   | Readonly<{ managed: false; path: string }>
   | Readonly<{ managed: true } & ManagedWorkspace>;
 
+export type TaskRoleSessionRecoveryStatus = Readonly<{
+  taskId: string;
+  roleName: string;
+  runtimeCleanupPending: boolean;
+  freshLaunchAllowed: boolean;
+}>;
+
 export type TaskRoleRuntimeStatus = Readonly<{
   taskId: string;
   roleName: string;
   agentId: string;
+  desiredRevision: number;
+  effectiveLaunch: EffectiveLaunchSnapshot | null;
+  launchDrift: boolean;
+  runSessionDrift: boolean;
   health: TaskRoleHealth;
   healthReason: string;
   openInputRequestCount: number;
@@ -38,8 +61,15 @@ export type TaskRoleRuntimeStatus = Readonly<{
   activeRun: AgentRun | null;
   activeWork: WorkItem | null;
   nativeSession: RoleAgentSession | null;
+  runtimeCleanupPending: boolean;
+  freshLaunchAllowed: boolean;
   tmux: TaskRoleTmuxStatus;
   workspace: TaskRoleWorkspaceStatus;
+  stall: Readonly<{
+    active: boolean;
+    progressAt?: string;
+    kind?: "delivery-stalled" | "execution-stalled";
+  }>;
 }>;
 
 export function inspectTaskRoleRuntimeStatuses(
@@ -73,7 +103,10 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
     : `${status.activeWork.id} (${status.activeWork.status}) ${status.activeWork.title}`;
   const nativeSession = status.nativeSession === null
     ? "not recorded"
-    : `${status.nativeSession.nativeSessionId} (${status.nativeSession.status}, ${status.nativeSession.adapterId})`;
+    : `${status.nativeSession.nativeSessionId} (${status.nativeSession.status}, ${status.nativeSession.adapterId}, effective r${status.nativeSession.effective.sourceDesiredRevision})`;
+  const effectiveLaunch = status.effectiveLaunch === null
+    ? "not started"
+    : `${status.effectiveLaunch.agentId}/${status.effectiveLaunch.adapterId}; r${status.effectiveLaunch.sourceDesiredRevision}; Profile intent=${status.effectiveLaunch.profileAccess}; permission=${status.effectiveLaunch.permission.strategy}`;
   const tmux = status.tmux.state === "missing"
     ? "missing"
     : [
@@ -96,10 +129,21 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
     `  Reason           ${status.healthReason}`,
     `  Open inputs      ${status.openInputRequestCount}`,
     `  Agent            ${status.agentId}`,
+    `  Desired launch   r${status.desiredRevision}; Profile intent=${status.role.defaultAccess}`,
+    `  Effective launch ${effectiveLaunch}`,
+    `  Desired drift    ${status.effectiveLaunch === null
+      ? "-"
+      : status.launchDrift ? "pending next launch" : "none"}`,
+    `  Run/session      ${status.runSessionDrift ? "snapshot mismatch" : "snapshot consistent"}`,
     `  Role state       ${status.role.status}`,
     `  Active work      ${activeWork}`,
     `  Active run       ${activeRun}`,
+    `  Run attention    ${status.stall.active
+      ? `needs-attention (${status.stall.kind ?? "execution-stalled"}; no durable progress since ${status.stall.progressAt ?? "unknown"})`
+      : "none"}`,
     `  Native session   ${nativeSession}`,
+    `  Runtime cleanup  ${status.runtimeCleanupPending ? "pending" : "none"}`,
+    `  Fresh launch     ${status.freshLaunchAllowed ? "allowed" : "blocked"}`,
     `  tmux pane        ${tmux}`,
     `  Workspace        ${
       status.workspace.managed ? status.workspace.root : status.workspace.path
@@ -114,7 +158,27 @@ export function taskRoleActiveWorkLabel(status: TaskRoleRuntimeStatus): string {
 }
 
 export function taskRoleNativeSessionLabel(status: TaskRoleRuntimeStatus): string {
+  if (status.runtimeCleanupPending && status.nativeSession === null) return "reset (cleanup-pending)";
   return status.nativeSession?.status ?? "unbound";
+}
+
+export function inspectTaskRoleSessionRecovery(
+  taskId: string,
+  roleName: string,
+  store: TaskStore
+): TaskRoleSessionRecoveryStatus {
+  const sessions = store.getTaskRoleSessionSet(taskId, roleName);
+  const target = runtimeLifecycleTarget({ scope: "task", taskId, roleName });
+  const runtimeMailbox = store.getWorkMailbox(target);
+  return {
+    taskId,
+    roleName,
+    runtimeCleanupPending: hasRuntimeCleanupObligation(runtimeMailbox),
+    freshLaunchAllowed: (
+      sessions === null
+      || sessions.sessions[sessions.activeAgentId] === undefined
+    ) && !hasRuntimeLifecycleWork(runtimeMailbox)
+  };
 }
 
 export function taskRoleOpenInputLabel(status: TaskRoleRuntimeStatus): string {
@@ -142,7 +206,15 @@ function inspectTaskRoleRuntimeStatus(
     ? null
     : store.getWorkItem(taskId, activeRun.workItemId);
   const sessions = store.getTaskRoleSessionSet(taskId, role.name);
-  const nativeSession = sessions?.sessions[role.activeAgentId] ?? null;
+  const effectiveAgentId = activeRun?.effective.agentId ?? sessions?.activeAgentId;
+  const nativeSession = effectiveAgentId === undefined
+    ? null
+    : sessions?.sessions[effectiveAgentId] ?? null;
+  const effectiveLaunch = activeRun?.effective ?? nativeSession?.effective ?? null;
+  const runSessionDrift = activeRun !== null
+    && nativeSession !== null
+    && !isDeepStrictEqual(activeRun.effective, nativeSession.effective);
+  const recovery = inspectTaskRoleSessionRecovery(taskId, role.name, store);
   const tmux: TaskRoleTmuxStatus = pane === undefined
     ? { state: "missing" }
     : {
@@ -162,17 +234,40 @@ function inspectTaskRoleRuntimeStatus(
   const workspace: TaskRoleWorkspaceStatus = managedWorkspace === null
     ? { managed: false, path: role.workspace }
     : { ...managedWorkspace, managed: true };
+  const events = store.listEvents(taskId);
+  const stalled = activeRun !== null && isRoleRunStalled(events, activeRun.id);
+  const stallProgressAt = activeRun === null
+    ? undefined
+    : latestStallProgressAt(events, activeRun.id);
+  const stallKind = activeRun === null
+    ? undefined
+    : latestStallKind(events, activeRun.id);
   const health = calculateHealth(
     role,
     activeRun,
     nativeSession,
+    recovery.runtimeCleanupPending,
     tmux,
-    openInputRequestCount
+    openInputRequestCount,
+    stalled
   );
+  const stall = activeRun === null
+    ? { active: false }
+    : {
+        active: stalled,
+        ...(stallProgressAt === undefined
+          ? {}
+          : { progressAt: stallProgressAt }),
+        ...(stallKind === undefined ? {} : { kind: stallKind })
+      };
   return {
-    taskId,
-    roleName: role.name,
-    agentId: role.activeAgentId,
+    ...recovery,
+    agentId: effectiveLaunch?.agentId ?? role.activeAgentId,
+    desiredRevision: role.launchRevision,
+    effectiveLaunch,
+    launchDrift: effectiveLaunch !== null
+      && effectiveLaunch.sourceDesiredRevision !== role.launchRevision,
+    runSessionDrift,
     ...health,
     openInputRequestCount,
     role,
@@ -180,17 +275,38 @@ function inspectTaskRoleRuntimeStatus(
     activeWork,
     nativeSession,
     tmux,
-    workspace
+    workspace,
+    stall
   };
+}
+
+function latestStallKind(
+  events: ReturnType<TaskStore["listEvents"]>,
+  runId: string
+): "delivery-stalled" | "execution-stalled" | undefined {
+  const event = [...events]
+    .filter((candidate) => candidate.type === "run.stalled" && candidate.payload.runId === runId)
+    .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
+  return event?.payload.kind === "delivery-stalled" || event?.payload.kind === "execution-stalled"
+    ? event.payload.kind
+    : undefined;
 }
 
 function calculateHealth(
   role: TaskRole,
   activeRun: AgentRun | null,
   nativeSession: RoleAgentSession | null,
+  runtimeCleanupPending: boolean,
   tmux: TaskRoleTmuxStatus,
-  openInputRequestCount: number
+  openInputRequestCount: number,
+  stalled: boolean
 ): Pick<TaskRoleRuntimeStatus, "health" | "healthReason"> {
+  if (runtimeCleanupPending && nativeSession === null) {
+    return {
+      health: "needs-attention",
+      healthReason: "the native Session was reset; verified runtime cleanup is pending"
+    };
+  }
   if (role.status === "failed" || role.status === "exited") {
     return { health: "failed", healthReason: `persisted Role state is ${role.status}` };
   }
@@ -209,6 +325,12 @@ function calculateHealth(
     }
     if (activeRun.deliveredAt !== undefined && tmux.state !== "running") {
       return { health: "needs-attention", healthReason: "the delivered active Run has no live tmux pane" };
+    }
+    if (stalled) {
+      return {
+        health: "needs-attention",
+        healthReason: "the live active Run has no durable progress in the configured stall window"
+      };
     }
   }
   if (activeRun === null && role.status === "running") {
