@@ -449,6 +449,10 @@ function requireMatchingRuntimeBinding(
     || binding.agentId !== request.agentId
     || binding.adapterId !== request.adapterId
     || (
+      binding.initialPromptRunId !== undefined
+      && binding.initialPromptRunId !== request.runId
+    )
+    || (
       request.mode === "resume"
       && binding.nativeSessionId !== request.nativeSessionId
     )

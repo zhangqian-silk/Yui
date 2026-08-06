@@ -36,6 +36,7 @@ export type RuntimePlannedSession = Readonly<{
   role: RuntimeTmuxRole;
   launch: RuntimeTmuxLaunchPlan;
   session: Readonly<{ nativeSessionId?: string }> | null;
+  initialPromptRunId?: string;
 }>;
 
 /** Narrow structural boundary implemented by FileRoleLaunchPlanner. */
@@ -47,6 +48,7 @@ export interface RuntimeRoleLaunchPlannerPort {
     adapterId: string;
     effective: EffectiveLaunchSnapshot;
     mode: "new" | "resume";
+    runId?: string;
     nativeSessionId?: string;
     launchId?: string;
     environment?: Readonly<Record<string, string>>;
@@ -360,6 +362,9 @@ export class TmuxSessionHost implements SessionHostPort {
         roleName: request.owner.roleName
       }),
       hostCreated,
+      ...(hostCreated && planned.initialPromptRunId !== undefined
+        ? { initialPromptRunId: planned.initialPromptRunId }
+        : {}),
       ...(nativeSessionId === undefined ? {} : { nativeSessionId })
     });
   }

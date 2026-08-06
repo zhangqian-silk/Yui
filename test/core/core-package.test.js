@@ -169,6 +169,41 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
   );
 });
 
+test("Operator archives only after explicit user authorization for the exact Task", () => {
+  const operator = readFileSync(join(root, "skills", "yui-operator", "SKILL.md"), "utf8");
+
+  // A terminal notification / completion reports outcome and eligibility but is not archive authority.
+  assert.match(
+    operator,
+    /A\s+Task\s+terminal\s+notification\s+reports[\s\S]*?archive-eligible[\s\S]*?grants\s+no\s+archive\s+authority/u
+  );
+  // Completion, eligibility, a general cleanup intent, or another Task's authorization never authorize this exact archive.
+  assert.match(
+    operator,
+    /Task\s+completion,\s+retirement,\s+archive\s+eligibility,\s+a\s+general\s+cleanup\s+intent,\s+or\s+authorization\s+for\s+another\s+Task\s+never\s+authorize\s+archiving\s+this\s+exact\s+Task/u
+  );
+  // Without exact-Task authorization: do not archive; report and request it; do not hand the user mechanical steps.
+  assert.match(
+    operator,
+    /Without\s+explicit\s+user\s+authorization\s+for\s+the\s+exact\s+Task,\s+do\s+not\s+archive\s+it[\s\S]*?ask\s+the\s+user\s+to\s+authorize\s+archiving\s+that\s+specific\s+Task[\s\S]*?do\s+not\s+make\s+the\s+user\s+hand-run/u
+  );
+  // With authorization: the Operator itself performs the command, only after the safe preconditions hold.
+  assert.match(
+    operator,
+    /Only\s+after\s+the\s+user\s+authorizes\s+archiving\s+that\s+exact\s+Task[\s\S]*?active\s+work\s+is\s+settled,\s+results\s+are\s+integrated\s+or\s+deliberately\s+abandoned,\s+and\s+managed\s+worktrees\s+are\s+clean\s+and\s+removable,\s+perform\s+it\s+yourself\s+with\s+`yui\s+task\s+archive/u
+  );
+  // Unmet preconditions stay blockers routed to the Leader, not forced cleanup.
+  assert.match(
+    operator,
+    /Dirty\s+worktrees,\s+active\s+Runs,\s+and\s+unresolved\s+Integration\s+evidence\s+are\s+blockers/u
+  );
+  // The implicit "terminal notification is the cleanup boundary" trigger must be gone.
+  assert.doesNotMatch(
+    operator,
+    /Treat a Task terminal notification as the explicit final cleanup boundary/u
+  );
+});
+
 test("Worker and Leader Skills require truthful uncertain checkpoints", () => {
   const leader = readFileSync(join(root, "skills", "yui-leader", "SKILL.md"), "utf8");
   const worker = readFileSync(join(root, "skills", "yui-worker", "SKILL.md"), "utf8");

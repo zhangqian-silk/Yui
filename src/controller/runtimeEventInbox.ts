@@ -71,9 +71,61 @@ export type RuntimeClaudeStopFailureEvent = Readonly<{
   receivedAt: string;
 }> & RuntimeClaudeStopFailureInput;
 
+/**
+ * A provider session-lifecycle fact (Claude or Codex SessionStart).
+ * `sessionSource` carries the exact provider-native discriminator (Claude's
+ * SessionStart `source`) so the adapter mapping can decide whether it proves
+ * pre-input readiness. Provider-neutral: the ingress captures the fact and exact
+ * fences; the canonical mapping owns its meaning.
+ */
+export type RuntimeSessionLifecycleInput = Readonly<{
+  scope: "task";
+  taskId: string;
+  roleName: string;
+  agentId: string;
+  adapterId: "codex" | "claude";
+  launchId: string;
+  nativeSessionId: string;
+  runId?: string;
+  sessionSource?: string;
+}>;
+
+export type RuntimeSessionLifecycleEvent = Readonly<{
+  schemaVersion: 1;
+  id: string;
+  type: "native-session-lifecycle";
+  receivedAt: string;
+}> & RuntimeSessionLifecycleInput;
+
+/**
+ * A provider prompt-acceptance fact (Claude or Codex UserPromptSubmit). This is
+ * the only native signal that may advance a Run to
+ * accepted/delivered, and only under an exact identity-matched fold.
+ */
+export type RuntimePromptAcceptedInput = Readonly<{
+  scope: "task";
+  taskId: string;
+  roleName: string;
+  agentId: string;
+  adapterId: "codex" | "claude";
+  launchId: string;
+  nativeSessionId: string;
+  runId: string;
+  receiptId: string;
+}>;
+
+export type RuntimePromptAcceptedEvent = Readonly<{
+  schemaVersion: 1;
+  id: string;
+  type: "native-prompt-accepted";
+  receivedAt: string;
+}> & RuntimePromptAcceptedInput;
+
 export type RuntimeLifecycleEvent =
   | RuntimeTurnCompletedEvent
-  | RuntimeClaudeStopFailureEvent;
+  | RuntimeClaudeStopFailureEvent
+  | RuntimeSessionLifecycleEvent
+  | RuntimePromptAcceptedEvent;
 
 export type RuntimeEventEnqueueResult<TEvent extends RuntimeLifecycleEvent = RuntimeLifecycleEvent> =
   Readonly<{ event: TEvent; created: boolean }>;
@@ -114,6 +166,32 @@ export class FileRuntimeEventInbox {
       schemaVersion: 1,
       id: runtimeEventId("claude-stop-failure", normalized),
       type: "claude-stop-failure",
+      receivedAt: this.now().toISOString(),
+      ...normalized
+    }));
+  }
+
+  enqueueSessionLifecycle(
+    input: RuntimeSessionLifecycleInput
+  ): RuntimeEventEnqueueResult<RuntimeSessionLifecycleEvent> {
+    const normalized = normalizeSessionLifecycleInput(input);
+    return this.publish(Object.freeze({
+      schemaVersion: 1,
+      id: runtimeEventId("native-session-lifecycle", normalized),
+      type: "native-session-lifecycle",
+      receivedAt: this.now().toISOString(),
+      ...normalized
+    }));
+  }
+
+  enqueuePromptAccepted(
+    input: RuntimePromptAcceptedInput
+  ): RuntimeEventEnqueueResult<RuntimePromptAcceptedEvent> {
+    const normalized = normalizePromptAcceptedInput(input);
+    return this.publish(Object.freeze({
+      schemaVersion: 1,
+      id: runtimeEventId("native-prompt-accepted", normalized),
+      type: "native-prompt-accepted",
       receivedAt: this.now().toISOString(),
       ...normalized
     }));
@@ -274,7 +352,10 @@ export class RuntimeEventInboxError extends Error {
 
 function runtimeEventId(
   type: RuntimeLifecycleEvent["type"],
-  input: RuntimeTurnCompletedInput | RuntimeClaudeStopFailureInput
+  input: RuntimeTurnCompletedInput
+    | RuntimeClaudeStopFailureInput
+    | RuntimeSessionLifecycleInput
+    | RuntimePromptAcceptedInput
 ): string {
   const common = [
     1,
@@ -287,7 +368,9 @@ function runtimeEventId(
     input.launchId ?? null,
     input.nativeSessionId,
     "turnId" in input ? input.turnId : null,
-    input.runId ?? null
+    input.runId ?? null,
+    "sessionSource" in input ? input.sessionSource ?? null : null,
+    "receiptId" in input ? input.receiptId ?? null : null
   ];
   return `turn-${createHash("sha256").update(JSON.stringify(common)).digest("hex")}`;
 }
@@ -354,13 +437,93 @@ function normalizeClaudeStopFailureInput(
   };
 }
 
+function normalizeSessionLifecycleInput(
+  input: RuntimeSessionLifecycleInput
+): RuntimeSessionLifecycleInput {
+  if (input.scope !== "task") throw invalidEvent();
+  if (input.adapterId !== "codex" && input.adapterId !== "claude") throw invalidEvent();
+  return {
+    scope: "task",
+    taskId: requireIdentityText(input.taskId, "Task id"),
+    roleName: requireIdentityText(input.roleName, "Role name"),
+    agentId: requireIdentityText(input.agentId, "Agent id"),
+    adapterId: input.adapterId,
+    launchId: requireIdentityText(input.launchId, "Launch id"),
+    nativeSessionId: requireIdentityText(input.nativeSessionId, "Native session id"),
+    ...(input.runId === undefined
+      ? {}
+      : { runId: requireIdentityText(input.runId, "Run id") }),
+    ...(input.sessionSource === undefined
+      ? {}
+      : { sessionSource: requireIdentityText(input.sessionSource, "Session source") })
+  };
+}
+
+function normalizePromptAcceptedInput(
+  input: RuntimePromptAcceptedInput
+): RuntimePromptAcceptedInput {
+  if (input.scope !== "task") throw invalidEvent();
+  if (input.adapterId !== "codex" && input.adapterId !== "claude") throw invalidEvent();
+  return {
+    scope: "task",
+    taskId: requireIdentityText(input.taskId, "Task id"),
+    roleName: requireIdentityText(input.roleName, "Role name"),
+    agentId: requireIdentityText(input.agentId, "Agent id"),
+    adapterId: input.adapterId,
+    launchId: requireIdentityText(input.launchId, "Launch id"),
+    nativeSessionId: requireIdentityText(input.nativeSessionId, "Native session id"),
+    runId: requireIdentityText(input.runId, "Run id"),
+    receiptId: requireIdentityText(input.receiptId, "Receipt id")
+  };
+}
+
 function parseRuntimeEvent(value: unknown): RuntimeLifecycleEvent {
   if (!isObject(value)) throw invalidEvent();
   switch (value.type) {
     case "native-turn-completed": return parseCodexEvent(value);
     case "claude-stop-failure": return parseClaudeStopFailureEvent(value);
+    case "native-session-lifecycle": return parseSessionLifecycleEvent(value);
+    case "native-prompt-accepted": return parsePromptAcceptedEvent(value);
     default: throw invalidEvent();
   }
+}
+
+function parseSessionLifecycleEvent(
+  value: Record<string, any>
+): RuntimeSessionLifecycleEvent {
+  const expected = [
+    "schemaVersion", "id", "type", "receivedAt", "scope", "taskId", "roleName",
+    "agentId", "adapterId", "launchId", "nativeSessionId",
+    ...(value.runId === undefined ? [] : ["runId"]),
+    ...(value.sessionSource === undefined ? [] : ["sessionSource"])
+  ];
+  if (value.schemaVersion !== 1 || !hasExactKeys(value, expected)) throw invalidEvent();
+  const normalized = normalizeSessionLifecycleInput(value as RuntimeSessionLifecycleInput);
+  return Object.freeze({
+    schemaVersion: 1,
+    id: requireIdentityText(value.id, "Event id"),
+    type: "native-session-lifecycle",
+    receivedAt: requireTimestamp(value.receivedAt),
+    ...normalized
+  });
+}
+
+function parsePromptAcceptedEvent(
+  value: Record<string, any>
+): RuntimePromptAcceptedEvent {
+  const expected = [
+    "schemaVersion", "id", "type", "receivedAt", "scope", "taskId", "roleName",
+    "agentId", "adapterId", "launchId", "nativeSessionId", "runId", "receiptId"
+  ];
+  if (value.schemaVersion !== 1 || !hasExactKeys(value, expected)) throw invalidEvent();
+  const normalized = normalizePromptAcceptedInput(value as RuntimePromptAcceptedInput);
+  return Object.freeze({
+    schemaVersion: 1,
+    id: requireIdentityText(value.id, "Event id"),
+    type: "native-prompt-accepted",
+    receivedAt: requireTimestamp(value.receivedAt),
+    ...normalized
+  });
 }
 
 function parseCodexEvent(value: Record<string, any>): RuntimeTurnCompletedEvent {

@@ -5,7 +5,7 @@ import { writeTextFileAtomically } from "./durableFile.js";
 /** Version of the on-disk layout (`schema.json`, root `state.json`, and locks). */
 export const CURRENT_STORAGE_LAYOUT_VERSION = 6;
 /** Version of the authoritative aggregate stored in `state.json`. */
-export const CURRENT_AGGREGATE_SCHEMA_VERSION = 15;
+export const CURRENT_AGGREGATE_SCHEMA_VERSION = 16;
 export const STORAGE_SCHEMA_FILE = "schema.json";
 
 export type StorageSchemaManifest = Readonly<{

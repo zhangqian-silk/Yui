@@ -731,6 +731,7 @@ export class FileTaskController {
   #pendingFull = false;
   readonly #pendingKeys = new Set<MailboxKey>();
   #operatorStartupRetryArmed = false;
+  #lastOperatorSignalIdentity: string | undefined;
   #stopped = false;
 
   constructor(
@@ -833,6 +834,11 @@ export class FileTaskController {
     if (this.#timer !== undefined) return;
     if (this.#stopped) throw new Error("Controller runtime is stopped.");
     this.#requestBackgroundPump();
+    // Arm the Operator lane once for work that was already pending when the
+    // Controller started. Subsequent main-lane passes signal it only when a
+    // new Operator batch is durably queued; an unchanged pending batch must
+    // not keep an unavailable Operator lane in a zero-delay drain loop.
+    this.#signalOperatorMailbox();
     this.#timer = setInterval(() => {
       this.#requestBackgroundPump();
     }, this.#intervalMs);
@@ -1006,8 +1012,14 @@ export class FileTaskController {
   #signalOperatorMailbox(): void {
     if (this.#stopped) return;
     const mailbox = this.store.getWorkMailbox({ kind: "operator" });
-    if (mailbox !== null && (mailbox.pending !== null || mailbox.processing !== null)) {
+    const identity = operatorMailboxBatchIdentity(mailbox);
+    if (identity === null) {
+      this.#lastOperatorSignalIdentity = undefined;
+      return;
+    }
+    if (identity !== this.#lastOperatorSignalIdentity) {
       this.#operatorSignalScheduler.signal("operator");
+      this.#lastOperatorSignalIdentity = identity;
     }
   }
 
@@ -1415,6 +1427,19 @@ function positiveInteger(value: number | undefined, fallback: number, label: str
     throw new TypeError(`${label} must be a positive integer`);
   }
   return resolved;
+}
+
+function operatorMailboxBatchIdentity(
+  mailbox: ReturnType<SchedulerStorePort["getWorkMailbox"]>
+): string | null {
+  const batch = mailbox?.pending ?? mailbox?.processing?.batch;
+  if (batch === null || batch === undefined) return null;
+  return [
+    batch.fromSequence,
+    batch.toSequence,
+    batch.firstQueuedAt,
+    batch.lastQueuedAt
+  ].join(":");
 }
 
 function schedulerResultJson(result: ControllerSchedulerResult): JsonValue {

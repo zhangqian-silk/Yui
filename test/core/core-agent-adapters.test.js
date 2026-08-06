@@ -67,12 +67,25 @@ test("Agent adapters expose the stable Codex and Claude catalog", () => {
   assert.deepEqual(codex.capabilities, {
     recover: true,
     interrupt: true,
-    nativeSessionDiscovery: "runtime"
+    nativeSessionDiscovery: "runtime",
+    preInputReadiness: {
+      status: "unsupported",
+      reason: "not-available",
+      note: codex.capabilities.preInputReadiness.note
+    }
   });
+  // Codex 0.145 SessionStart fires within run_turn(input): no pre-input event.
+  assert.equal(codex.capabilities.preInputReadiness.status, "unsupported");
 
   const claude = resolveAgentAdapter("claude");
   assert.equal(claude.supportedVersion, "2.1.207");
   assert.equal(claude.capabilities.nativeSessionDiscovery, "preallocated");
+  // Claude fires SessionStart(startup) before the first prompt: pre-input ready.
+  assert.equal(claude.capabilities.preInputReadiness.status, "supported");
+  assert.equal(
+    claude.capabilities.preInputReadiness.nativeEvent,
+    "SessionStart(source=startup)"
+  );
   assert.throws(() => resolveAgentAdapter("unknown"), /unsupported/i);
 });
 
@@ -180,6 +193,7 @@ test("Codex structured config compiles deterministically for new and resume laun
     "--profile", "work",
     "--add-dir", canonicalFirst,
     "--add-dir", canonicalSecond,
+    "--config", `projects={${JSON.stringify(root)}={trust_level="trusted"}}`,
     "--config", `developer_instructions=${JSON.stringify([
       "review carefully",
       "Yui Role Skills are available at the paths below. Before performing work governed by one, read and follow its SKILL.md on demand; do not treat this list as a user message.",
@@ -587,6 +601,30 @@ test("managed Codex policy cannot enable project discovery", async (t) => {
     systemConfigPath: join(root, "missing-system.toml"),
     managedConfigPath
   }).status, "absent");
+
+  t.after(async () => {
+    await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }));
+  });
+});
+
+test("Yui invocation trust inspects the exact workspace project layer before launch", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "yui-codex-invocation-trust-"));
+  const codexHome = join(root, "codex-home");
+  const workspace = join(root, "project");
+  const projectConfig = join(workspace, ".codex", "config.toml");
+  await mkdir(codexHome);
+  await mkdir(join(workspace, ".git"), { recursive: true });
+  await mkdir(join(workspace, ".codex"));
+  await writeFile(join(codexHome, "config.toml"), "");
+  await writeFile(projectConfig, 'developer_instructions = "project policy"\n');
+
+  assert.deepEqual(inspectCodexDeveloperInstructions({
+    environment: { CODEX_HOME: codexHome },
+    workspace,
+    trustWorkspace: true,
+    systemConfigPath: join(root, "missing-system.toml"),
+    managedConfigPath: join(root, "missing-managed.toml")
+  }), { status: "configured", source: projectConfig });
 
   t.after(async () => {
     await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }));

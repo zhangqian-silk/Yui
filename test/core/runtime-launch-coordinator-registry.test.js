@@ -578,7 +578,7 @@ test("a known Claude preparation retains its exact Run reservation until deliver
   });
 
   assert.equal(reservationMailbox(fx, input.roleName), null);
-  assert.notEqual(fx.store.getAgentRun(fx.task.id, run.id).deliveredAt, undefined);
+  assert.notEqual(fx.store.getAgentRun(fx.task.id, run.id).pushedAt, undefined);
 });
 
 for (const inspectionState of ["stopped", "running", "unavailable"]) {
@@ -879,7 +879,7 @@ for (const initialRecoveryState of ["running", "starting"]) {
 
     recovery.controller.signal(`role:${fx.task.id}/${fx.roleName}`);
     await waitFor(
-      () => recovery.store.getAgentRun(fx.task.id, fx.run.id)?.deliveredAt !== undefined,
+      () => recovery.store.getAgentRun(fx.task.id, fx.run.id)?.pushedAt !== undefined,
       "the original Run to be delivered"
     );
 
@@ -1169,7 +1169,7 @@ for (const initialState of ["starting", "unavailable"]) {
 
     recovery.controller.signal(`role:${fx.task.id}/${fx.roleName}`);
     await waitFor(
-      () => recovery.store.getAgentRun(fx.task.id, fx.run.id)?.deliveredAt !== undefined,
+      () => recovery.store.getAgentRun(fx.task.id, fx.run.id)?.pushedAt !== undefined,
       `the pre-prepared ${initialState} Run to deliver`
     );
 
@@ -1181,7 +1181,8 @@ for (const initialState of ["starting", "unavailable"]) {
     );
     assert.equal(sessions.sessions[fx.agent.id], undefined);
     assert.equal(sessions.inFlight.runId, fx.run.id);
-    assert.notEqual(sessions.inFlight.deliveredAt, undefined);
+    assert.notEqual(sessions.inFlight.pushedAt, undefined);
+    assert.equal(sessions.inFlight.deliveredAt, undefined);
     const workerStarts = fx.controls.starts.filter(
       (request) => request.owner.roleName === fx.roleName
     );

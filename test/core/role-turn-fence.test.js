@@ -60,7 +60,7 @@ function deliver(set = bind()) {
 
 test("a fresh Task Role can bind and deliver one exact Run before its native session is known", () => {
   const fresh = taskSet();
-  assert.equal(fresh.schemaVersion, 3);
+  assert.equal(fresh.schemaVersion, 4);
   assert.equal(fresh.sessions.codex, undefined);
   assert.equal(fresh.inFlight, null);
   assert.equal(fresh.pendingTurnCompletion, null);
@@ -128,7 +128,7 @@ test("observed completion is fenced by Task, Role, Agent, native session, and Ru
   }, DELIVERED_AT);
   assert.throws(
     () => recordObservedTaskRoleCompletion(undelivered, pending()),
-    /must be delivered/u
+    /must be pushed/u
   );
 });
 

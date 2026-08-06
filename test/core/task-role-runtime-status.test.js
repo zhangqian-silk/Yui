@@ -137,7 +137,7 @@ test("Task Role list uses one tmux snapshot and returns structured runtime summa
   const work = store.listWorkItems(task.id)[0];
   dispatchTestRun(store, task.id, "worker", work.id);
   const activeRun = store.getActiveAgentRun(task.id, "worker");
-  store.saveAgentRun({ ...activeRun, deliveredAt: NOW.toISOString() });
+  store.saveAgentRun({ ...activeRun, pushedAt: NOW.toISOString(), deliveredAt: NOW.toISOString() });
 
   let sessions = createRoleSessionSet(
     { scope: "task", taskId: task.id, roleName: "worker" },
@@ -237,7 +237,7 @@ test("Task Role health distinguishes queued, orphaned delivered, and exited runt
     "starting"
   );
   const activeRun = store.getActiveAgentRun(task.id, "worker");
-  store.saveAgentRun({ ...activeRun, deliveredAt: NOW.toISOString() });
+  store.saveAgentRun({ ...activeRun, pushedAt: NOW.toISOString(), deliveredAt: NOW.toISOString() });
   assert.equal(
     execute(["role", "status", task.id, "worker"], store, withoutPane).data.role.health,
     "needs-attention"

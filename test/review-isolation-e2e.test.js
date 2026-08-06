@@ -630,7 +630,7 @@ function markDelivered(store, run, now) {
       );
       tx.saveWorkMailbox(mailbox);
     }
-    tx.saveAgentRun({ ...run, deliveredAt: now.toISOString() });
+    tx.saveAgentRun({ ...run, pushedAt: now.toISOString(), deliveredAt: now.toISOString() });
   });
 }
 
