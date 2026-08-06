@@ -547,10 +547,18 @@ test("separate FileTaskStore instances observe and preserve interleaved writes",
   });
 
   first.saveConfiguredAgent(configuredAgent("codex", "codex"));
+  assert.deepEqual(
+    first.listConfiguredAgents().map(({ id }) => id),
+    ["codex"]
+  );
+  assert.deepEqual(
+    first.transaction((store) => store.listConfiguredAgents().map(({ id }) => id)),
+    ["codex"]
+  );
   second.saveConfiguredAgent(configuredAgent("claude", "claude"));
 
   assert.deepEqual(
-    first.listConfiguredAgents().map(({ id }) => id),
+    first.transaction((store) => store.listConfiguredAgents().map(({ id }) => id)),
     ["claude", "codex"]
   );
   assert.equal(JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8")).revision, 2);
