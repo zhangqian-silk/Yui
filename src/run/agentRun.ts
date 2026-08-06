@@ -13,7 +13,7 @@ export type AgentRunStatus = "active" | "yielded" | "failed";
 export type AgentRunPurpose = "execution" | "review";
 
 export type AgentRun = {
-  schemaVersion: 4;
+  schemaVersion: 5;
   id: string;
   taskId: string;
   roleName: string;
@@ -35,7 +35,7 @@ export type AgentRun = {
   pushedAt?: string;
   /**
    * Set only after an exact, identity-matched durable provider-accepted fold
-   * (UserPromptSubmit / user_prompt_submit). This is the durable "delivered"
+   * (UserPromptSubmit). This is the durable "delivered"
    * gate every consumer reads; transport alone never sets it.
    */
   deliveredAt?: string;
@@ -65,7 +65,7 @@ export function createAgentRun(
   }
   const timestamp = now.toISOString();
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     id: requireSafeIdentity(id, "Agent run id"),
     taskId: requireSafeIdentity(taskId, "Task id"),
     roleName: requireSafeIdentity(roleName, "Role name"),
@@ -118,7 +118,7 @@ export function markAgentRunDelivered(run: AgentRun, now: Date): AgentRun {
 }
 
 export function validateAgentRun(run: AgentRun): AgentRun {
-  if (run.schemaVersion !== 4) throw new Error("Agent run must use schemaVersion 4.");
+  if (run.schemaVersion !== 5) throw new Error("Agent run must use schemaVersion 5.");
   validateTaskRecordReference({ taskId: run.taskId, localId: run.id }, "agentRun");
   requireSafeIdentity(run.roleName, "Role name");
   if (run.mode !== "new" && run.mode !== "resume") {

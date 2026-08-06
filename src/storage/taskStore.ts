@@ -149,7 +149,7 @@ type StoredTask = {
 };
 
 type StorageState = {
-  schemaVersion: 15;
+  schemaVersion: 16;
   revision: number;
   config: YuiConfig;
   configuredAgents: Record<string, ConfiguredAgent>;
@@ -825,7 +825,7 @@ export class FileTaskStore implements TaskStore {
   getAgentRun(taskId: string, id: string): AgentRun | null { return optional(this.#state().tasks[taskId]?.agentRuns[id]); }
   listAgentRuns(taskId: string): AgentRun[] { return values(this.#requireTask(taskId).agentRuns, "id"); }
   saveAgentRun(run: AgentRun): void {
-    const stored = identified<AgentRun>(run, 4, "id", run.id, "Agent run");
+    const stored = identified<AgentRun>(run, 5, "id", run.id, "Agent run");
     validateAgentRun(stored);
     const aggregate = this.#requireTaskForWrite(stored.taskId);
     if (stored.purpose === "review"
@@ -1250,7 +1250,7 @@ export function ensureYuiHome(rootDir: string): void { mkdirSync(rootDir, { recu
 
 function emptyState(): StorageState {
   return {
-    schemaVersion: 15,
+    schemaVersion: 16,
     revision: 0,
     config: { schemaVersion: 1 },
     configuredAgents: {},
@@ -1343,7 +1343,7 @@ function parseState(raw: string): StorageState {
     "tasks",
     "mailboxes"
   ], "Storage state");
-  if (state.schemaVersion !== 15 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
+  if (state.schemaVersion !== 16 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
   const result = clone(state) as unknown as StorageState;
   result.config = versioned(result.config, 1, "Yui config");
   validateYuiConfig(result.config);
@@ -1510,7 +1510,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateWorkItem(item);
     return item;
   }, "workItems");
-  parseMap(aggregate.agentRuns, (record, key) => { const run = identified<AgentRun>(record, 4, "id", key, "Agent run"); if (run.taskId !== taskId) throw new StorageRecordError(`Agent run belongs to another Task: ${run.taskId}`); validateAgentRun(run); return run; }, "agentRuns");
+  parseMap(aggregate.agentRuns, (record, key) => { const run = identified<AgentRun>(record, 5, "id", key, "Agent run"); if (run.taskId !== taskId) throw new StorageRecordError(`Agent run belongs to another Task: ${run.taskId}`); validateAgentRun(run); return run; }, "agentRuns");
   parseMap(aggregate.reviewRounds, (record, key) => {
     const round = identified<ReviewRound>(record, 2, "id", key, "ReviewRound");
     if (round.taskId !== taskId) {
@@ -1645,7 +1645,7 @@ function globalSessions(value: unknown): GlobalRoleSessionSet {
   return set;
 }
 function taskSessions(value: unknown): TaskRoleSessionSet {
-  const set = versioned<TaskRoleSessionSet>(value, 3, "Task Role session set");
+  const set = versioned<TaskRoleSessionSet>(value, 4, "Task Role session set");
   if (set.owner?.scope !== "task" || typeof set.owner.taskId !== "string" || typeof set.owner.roleName !== "string") throw new StorageRecordError("Task Role session owner is invalid.");
   validateSessions(set.sessions);
   validateRoleSessionSet(set);

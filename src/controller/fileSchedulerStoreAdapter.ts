@@ -6,6 +6,7 @@ import {
   clearTaskRoleRun,
   createRoleSessionSet,
   markTaskRoleRunDelivered,
+  markTaskRoleRunPushed,
   recordObservedTaskRoleCompletion,
   recordRoleAgentSession,
   rememberRoleAgentCompletedTurn,
@@ -756,7 +757,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       // transport receipt — that removes the transport-to-delivered false path.
       if (active.pushedAt === undefined) {
         store.saveAgentRun(markAgentRunPushed(active, input.now));
-        markTaskRoleRunDeliveredInFlight(store, role, input.run, input.now);
+        markTaskRoleRunPushedInFlight(store, role, input.run, input.now);
         store.saveEvent(task.id, createTaskEvent(
           store.nextEventId(task.id),
           task.id,
@@ -767,8 +768,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       } else {
         const sessions = store.getTaskRoleSessionSet(input.task.id, input.role.name);
         if (sessions?.inFlight?.runId === input.run.id
-          && sessions.inFlight.deliveredAt === undefined) {
-          markTaskRoleRunDeliveredInFlight(store, role, input.run, input.now);
+          && sessions.inFlight.pushedAt === undefined) {
+          markTaskRoleRunPushedInFlight(store, role, input.run, input.now);
         }
       }
       if (role.status !== "running") {
@@ -1569,7 +1570,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         runId: sessions.inFlight.runId,
         receiptId: sessions.inFlight.receiptId
       };
-      if (sessions.inFlight.deliveredAt === undefined) {
+      if (sessions.inFlight.pushedAt === undefined) {
         const active = store.getActiveAgentRun(task.id, role.name);
         if (active === null || active.id !== fence.runId || active.status !== "active") {
           return { session: sessions.sessions[input.agentId]!, duplicate: false };
@@ -1577,12 +1578,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         // A native turn completion proves the prompt reached the Agent, so it
         // records the transport-reached (pushed) fact and the inFlight marker.
         // It must NOT promote run-level acceptance (deliveredAt): only an exact
-        // provider-accepted fold (user_prompt_submit) may do that, so a
+        // provider-accepted fold (UserPromptSubmit) may do that, so a
         // completion for an unaccepted Run never forges acceptance.
         if (active.pushedAt === undefined) {
           store.saveAgentRun(markAgentRunPushed(active, now));
         }
-        sessions = markTaskRoleRunDelivered(sessions, fence, now);
+        sessions = markTaskRoleRunPushed(sessions, fence, now);
       }
       const completion = createPendingTurnCompletion({
         taskId: task.id,
@@ -2124,7 +2125,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }
 
   /**
-   * Folds a provider session-lifecycle fact (SessionStart / session_start)
+   * Folds a provider SessionStart lifecycle fact
    * through the canonical contract. Session-started/ready never advance Run
    * acceptance; this only records generation facts and binds a discovered native
    * id under the exact launch fence. Idempotent replays are no-ops.
@@ -2148,9 +2149,40 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         case "idempotent":
           return "applied";
         case "apply":
+          if (decision.outcome.outcome === "bind-native-session") {
+            const role = store.getRole(input.taskId, input.roleName);
+            const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
+            const run = input.runId === undefined
+              ? null
+              : store.getAgentRun(input.taskId, input.runId);
+            if (role === null || sessions === null || run === null) {
+              recordCanonicalObsolete(
+                store,
+                input,
+                "native-session-lifecycle",
+                "bind-state-missing",
+                now
+              );
+              return "obsolete";
+            }
+            const bound = recordRoleAgentSession(sessions, {
+              agentId: input.agentId,
+              adapterId: input.adapterId,
+              nativeSessionId: decision.outcome.nativeSessionId,
+              launchId: input.launchId,
+              policy: "fixed",
+              status: "running",
+              effective: run.effective
+            }, now);
+            store.saveTaskRoleSessionSet(bound);
+            completeRuntimeHookReservation(
+              store,
+              { scope: "task", taskId: input.taskId, roleName: input.roleName },
+              input.launchId
+            );
+          }
           // Session-started/ready/bind facts are recorded provider-neutrally as
-          // an auditable event; the durable Run truth model that projects them
-          // into status/attention is work-item-4's contract, not this one. The
+          // an auditable event. The
           // payload carries the generation fence + preInputReady so the fresh
           // push gate can read the exact provider-ready fact for this generation.
           store.saveEvent(input.taskId, createTaskEvent(
@@ -2177,8 +2209,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }
 
   /**
-   * Folds a provider prompt-acceptance fact (UserPromptSubmit /
-   * user_prompt_submit). This is the ONLY path that may advance a Run to
+   * Folds a provider UserPromptSubmit acceptance fact. This is the ONLY path
+   * that may advance a Run to
    * accepted/delivered, and only under an exact identity-matched durable fold
    * after the single transport push.
    */
@@ -2274,20 +2306,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     const sessionSet = store.getTaskRoleSessionSet(fence.taskId, fence.roleName);
     const session = sessionSet?.sessions[fence.agentId] ?? null;
     const boundNativeSessionId = session?.nativeSessionId;
-    // A `reserved` session is allocated but has no provider-started fact yet; a
-    // running/ready session reflects a provider event. sessionStarted and ready
-    // are projected from that durable status so a duplicate SessionStart folds
-    // idempotently while a first one still marks/binds.
-    const providerConfirmed = session !== null
-      && session.nativeSessionId !== undefined
-      && (session.status === "ready" || session.status === "running");
-    const sessionStarted = providerConfirmed;
-    const ready = providerConfirmed;
     if (runId === undefined) {
       return {
         fence,
-        sessionStarted,
-        ready,
+        sessionStarted: false,
+        ready: false,
         pushed: false,
         accepted: false,
         terminal: false,
@@ -2295,11 +2318,38 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       };
     }
     const run = store.getAgentRun(fence.taskId, runId);
-    if (run === null) return null;
+    const inFlight = sessionSet?.inFlight;
+    if (run === null
+      || inFlight === null
+      || inFlight === undefined
+      || inFlight.runId !== run.id
+      || inFlight.agentId !== run.effective.agentId) return null;
+    const owner = { scope: "task" as const, taskId: fence.taskId, roleName: fence.roleName };
+    const launchId = session?.launchId
+      ?? (runtimeHookMatchesReservation(store, owner, fence.launchId) ? fence.launchId : undefined);
+    if (launchId === undefined) return null;
+    const expectedFence: CanonicalIdentityFence = {
+      taskId: fence.taskId,
+      roleName: fence.roleName,
+      agentId: run.effective.agentId,
+      adapterId: run.effective.adapterId,
+      runId: run.id,
+      launchId,
+      receiptId: inFlight.receiptId,
+      ...(boundNativeSessionId === undefined ? {} : { nativeSessionId: boundNativeSessionId })
+    };
+    const lifecycleEvents = store.listEvents(fence.taskId).filter((event) => (
+      event.type === "runtime.provider-session-lifecycle"
+      && event.payload.roleName === fence.roleName
+      && event.payload.agentId === run.effective.agentId
+      && event.payload.adapterId === run.effective.adapterId
+      && event.payload.launchId === launchId
+      && event.payload.nativeSessionId === (boundNativeSessionId ?? fence.nativeSessionId)
+    ));
     return {
-      fence,
-      sessionStarted,
-      ready,
+      fence: expectedFence,
+      sessionStarted: lifecycleEvents.length > 0,
+      ready: lifecycleEvents.some((event) => event.payload.preInputReady === "true"),
       pushed: run.pushedAt !== undefined,
       accepted: run.deliveredAt !== undefined,
       terminal: run.status !== "active",
@@ -2768,7 +2818,7 @@ function preparedDeliveryFailureSessionFenceMatches(
   return sessions.inFlight.agentId === input.agentId
     && sessions.inFlight.runId === input.runId
     && sessions.inFlight.receiptId === formatAgentRunReceiptId(input.taskId, input.runId)
-    && sessions.inFlight.deliveredAt === undefined
+    && sessions.inFlight.pushedAt === undefined
     && preparedSessionMatches(
       session,
       input.agentId,
@@ -3136,6 +3186,24 @@ function bindTaskRoleRunInFlight(
   }
   const updated = bindTaskRoleRun(current, {
     agentId,
+    runId: run.id,
+    receiptId: formatAgentRunReceiptId(role.taskId, run.id)
+  }, now);
+  store.saveRoleSessionSet(updated);
+}
+
+function markTaskRoleRunPushedInFlight(
+  store: TaskStore,
+  role: NonNullable<ReturnType<TaskStore["getRole"]>>,
+  run: { id: string; effective: { agentId: string } },
+  now: Date
+): void {
+  const current = store.getRoleSessionSet(role.taskId, role.name);
+  if (current === null) {
+    throw new Error(`Task Role session set is missing for pushed Run: ${run.id}.`);
+  }
+  const updated = markTaskRoleRunPushed(current, {
+    agentId: run.effective.agentId,
     runId: run.id,
     receiptId: formatAgentRunReceiptId(role.taskId, run.id)
   }, now);

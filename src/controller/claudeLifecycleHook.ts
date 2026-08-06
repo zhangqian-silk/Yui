@@ -5,6 +5,7 @@ import {
   FileRuntimeEventInbox,
   MAX_RUNTIME_EVENT_FILE_BYTES
 } from "./runtimeEventInbox.js";
+import { resolveProviderHookRunFence } from "./providerHookRunFence.js";
 
 type ControllerCall = (
   home: string,
@@ -21,9 +22,10 @@ type ClaudeHookEnvelope = Readonly<{
   launchId: string;
   runId: string;
   nativeSessionId: string;
+  receiptId: string;
 }>;
 
-export type ClaudeStopFailureHookNotification = ClaudeHookEnvelope & Readonly<{
+export type ClaudeStopFailureHookNotification = Omit<ClaudeHookEnvelope, "receiptId"> & Readonly<{
   type: "StopFailure";
   error: string;
   errorDetails?: string;
@@ -134,6 +136,11 @@ export function parseClaudeHookEnvelope(
   environment: NodeJS.ProcessEnv
 ): ClaudeHookNotificationEnvelope {
   const payload = parseObject(stdinJson);
+  if (payload.hook_event_name !== "SessionStart"
+    && payload.hook_event_name !== "UserPromptSubmit"
+    && payload.hook_event_name !== "StopFailure") {
+    throw new Error("Managed Claude lifecycle ingestion received an unsupported hook event.");
+  }
   const base = parseClaudeEnvelope(payload, environment);
   switch (payload.hook_event_name) {
     case "SessionStart":
@@ -146,7 +153,7 @@ export function parseClaudeHookEnvelope(
       return {
         ...base,
         kind: "prompt-submit",
-        receiptId: `agent-run:${base.taskId}/${base.runId}`
+        receiptId: base.receiptId
       };
     case "StopFailure":
       return {
@@ -174,28 +181,10 @@ function parseClaudeEnvelope(
   payload: Record<string, unknown>,
   environment: NodeJS.ProcessEnv
 ): ClaudeHookEnvelope {
-  if (environment.YUI_SESSION_SCOPE !== "task") {
-    throw new Error("Claude lifecycle hook requires a Task session scope.");
-  }
-  if (environment.YUI_ADAPTER_ID !== "claude") {
-    throw new Error("Claude lifecycle hook requires the Claude adapter.");
-  }
   const nativeSessionId = requireIdentity(payload.session_id, "Claude session id");
-  const expectedNativeSessionId = requireIdentity(
-    environment.YUI_NATIVE_SESSION_ID,
-    "YUI native session id"
-  );
-  if (nativeSessionId !== expectedNativeSessionId) {
-    throw new Error("Claude lifecycle hook native session does not match its launch envelope.");
-  }
   return {
-    taskId: requireIdentity(environment.YUI_TASK_ID, "Task id"),
-    roleName: requireIdentity(environment.YUI_ROLE, "Role name"),
-    agentId: requireIdentity(environment.YUI_AGENT_ID, "Agent id"),
-    adapterId: "claude",
-    launchId: requireIdentity(environment.YUI_LAUNCH_ID, "Launch id"),
-    runId: requireIdentity(environment.YUI_RUN_ID, "Run id"),
-    nativeSessionId
+    ...resolveProviderHookRunFence(environment, "claude", nativeSessionId),
+    adapterId: "claude"
   };
 }
 

@@ -103,7 +103,7 @@ test("Claude capability declares pre-input readiness supported by SessionStart(s
 
 // --- Codex mapping (0.145) ---------------------------------------------------
 
-test("Codex session_start maps to provider-session-started only — NEVER pre-input-ready", () => {
+test("Codex SessionStart maps to provider-session-started only — NEVER pre-input-ready", () => {
   const event = mapNativeLifecycleSignal({ kind: "native-session-start", fence: codexFence });
   assert.equal(event.phase, "provider-session-started");
   assert.equal(event.evidence, "provider-native-durable");

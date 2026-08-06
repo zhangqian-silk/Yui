@@ -87,7 +87,7 @@ export type CanonicalLifecycleEvent = Readonly<{
   /**
    * The exact provider-native discriminator that justifies a `provider-ready`
    * event — e.g. Claude's SessionStart `source`. Preserved end to end so a
-   * future real parser (and every test) can prove readiness came from the one
+   * provider hook parser (and every test) can prove readiness came from the one
    * variant proven to precede the first prompt, not any SessionStart.
    */
   readinessVariant?: string;

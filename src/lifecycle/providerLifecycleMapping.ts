@@ -147,8 +147,8 @@ const CLAUDE_LIFECYCLE_MAPPING: ProviderLifecycleMapping = {
 };
 
 /**
- * Codex 0.145, mapped from its observed run_turn(input) -> session_start ->
- * user_prompt_submit ordering. session_start fires *inside* run_turn — after the
+ * Codex 0.145, mapped from its observed run_turn(input) -> SessionStart ->
+ * UserPromptSubmit ordering. SessionStart fires *inside* run_turn — after the
  * first input — so it can only prove that the session/thread now exists, never
  * pre-input readiness. UserPromptSubmit is the acceptance fence; the notify
  * agent-turn-complete is the terminal fact. Codex emits no StopFailure hook.
@@ -159,7 +159,7 @@ const CODEX_LIFECYCLE_MAPPING: ProviderLifecycleMapping = {
     status: "unsupported",
     reason: "not-available",
     note:
-      "Codex 0.145 session_start fires within run_turn(input), i.e. after the "
+      "Codex 0.145 SessionStart fires within run_turn(input), i.e. after the "
       + "first input; no native event precedes the first prompt, so pre-input "
       + "readiness is not available and fails closed."
   },
@@ -172,7 +172,7 @@ const CODEX_LIFECYCLE_MAPPING: ProviderLifecycleMapping = {
   map(signal: NativeLifecycleSignal): CanonicalLifecycleEvent {
     switch (signal.kind) {
       case "native-session-start":
-        // session_start proves the thread exists but arrives after the first
+        // SessionStart proves the thread exists but arrives after the first
         // input, so it maps to session-started only — never ready, never pre-input.
         return createCanonicalLifecycleEvent({
           phase: "provider-session-started",

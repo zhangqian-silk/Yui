@@ -72,7 +72,7 @@ export type RuntimeClaudeStopFailureEvent = Readonly<{
 }> & RuntimeClaudeStopFailureInput;
 
 /**
- * A provider session-lifecycle fact (Claude SessionStart / Codex session_start).
+ * A provider session-lifecycle fact (Claude or Codex SessionStart).
  * `sessionSource` carries the exact provider-native discriminator (Claude's
  * SessionStart `source`) so the adapter mapping can decide whether it proves
  * pre-input readiness. Provider-neutral: the ingress captures the fact and exact
@@ -98,8 +98,8 @@ export type RuntimeSessionLifecycleEvent = Readonly<{
 }> & RuntimeSessionLifecycleInput;
 
 /**
- * A provider prompt-acceptance fact (Claude UserPromptSubmit / Codex
- * user_prompt_submit). This is the only native signal that may advance a Run to
+ * A provider prompt-acceptance fact (Claude or Codex UserPromptSubmit). This is
+ * the only native signal that may advance a Run to
  * accepted/delivered, and only under an exact identity-matched fold.
  */
 export type RuntimePromptAcceptedInput = Readonly<{

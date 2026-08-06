@@ -61,7 +61,8 @@ test("explicit Codex native permission options remain independent from write sco
     approval: "never"
   });
   assert.deepEqual(compileArgv(role, effective).slice(2), [
-    "--sandbox", "read-only", "--ask-for-approval", "never"
+    "--sandbox", "read-only", "--ask-for-approval", "never",
+    "--config", 'projects={"/fixture/work-item-1"={trust_level="trusted"}}'
   ]);
 });
 

@@ -5,6 +5,7 @@ import {
   FileRuntimeEventInbox,
   MAX_RUNTIME_EVENT_FILE_BYTES
 } from "./runtimeEventInbox.js";
+import { resolveProviderHookRunFence } from "./providerHookRunFence.js";
 
 type ControllerCall = (
   home: string,
@@ -20,6 +21,7 @@ type CodexHookEnvelope = Readonly<{
   launchId: string;
   runId: string;
   nativeSessionId: string;
+  receiptId: string;
 }>;
 
 type CodexSessionStartEnvelope = CodexHookEnvelope & Readonly<{ kind: "session-start" }>;
@@ -31,10 +33,10 @@ type CodexHookNotificationEnvelope = CodexSessionStartEnvelope | CodexPromptSubm
 
 /**
  * Hidden CLI entrypoint used by the managed Codex lifecycle hooks. Codex 0.145
- * fires session_start and user_prompt_submit inside run_turn(input); this parses
+ * fires SessionStart and UserPromptSubmit inside run_turn(input); this parses
  * by hook_event_name and writes one immutable runtime-inbox event per fact.
- * session_start maps (via the adapter) to provider-session-started only — never
- * pre-input readiness; user_prompt_submit is the exact provider-accepted fence.
+ * SessionStart maps (via the adapter) to provider-session-started only — never
+ * pre-input readiness; UserPromptSubmit is the exact provider-accepted fence.
  * The durable write is authoritative; the socket call is only a wake-up hint.
  */
 export async function runCodexLifecycleHookCommand(
@@ -55,7 +57,7 @@ export async function runCodexLifecycleHookCommand(
       launchId: envelope.launchId,
       nativeSessionId: envelope.nativeSessionId,
       runId: envelope.runId
-      // No sessionSource: Codex session_start carries no pre-input discriminator.
+      // Codex SessionStart arrives within the first turn, not before input.
     });
   } else {
     inbox.enqueuePromptAccepted({
@@ -95,15 +97,19 @@ export function parseCodexHookEnvelope(
   environment: NodeJS.ProcessEnv
 ): CodexHookNotificationEnvelope {
   const payload = parseObject(stdinJson);
+  if (payload.hook_event_name !== "SessionStart"
+    && payload.hook_event_name !== "UserPromptSubmit") {
+    throw new Error("Managed Codex lifecycle ingestion received an unsupported hook event.");
+  }
   const base = parseCodexEnvelope(payload, environment);
   switch (payload.hook_event_name) {
-    case "session_start":
+    case "SessionStart":
       return { ...base, kind: "session-start" };
-    case "user_prompt_submit":
+    case "UserPromptSubmit":
       return {
         ...base,
         kind: "prompt-submit",
-        receiptId: `agent-run:${base.taskId}/${base.runId}`
+        receiptId: base.receiptId
       };
     default:
       throw new Error("Managed Codex lifecycle ingestion received an unsupported hook event.");
@@ -114,28 +120,8 @@ function parseCodexEnvelope(
   payload: Record<string, unknown>,
   environment: NodeJS.ProcessEnv
 ): CodexHookEnvelope {
-  if (environment.YUI_SESSION_SCOPE !== "task") {
-    throw new Error("Codex lifecycle hook requires a Task session scope.");
-  }
-  if (environment.YUI_ADAPTER_ID !== "codex") {
-    throw new Error("Codex lifecycle hook requires the Codex adapter.");
-  }
   const nativeSessionId = requireIdentity(payload.session_id, "Codex session id");
-  const expectedNativeSessionId = requireIdentity(
-    environment.YUI_NATIVE_SESSION_ID,
-    "YUI native session id"
-  );
-  if (nativeSessionId !== expectedNativeSessionId) {
-    throw new Error("Codex lifecycle hook native session does not match its launch envelope.");
-  }
-  return {
-    taskId: requireIdentity(environment.YUI_TASK_ID, "Task id"),
-    roleName: requireIdentity(environment.YUI_ROLE, "Role name"),
-    agentId: requireIdentity(environment.YUI_AGENT_ID, "Agent id"),
-    launchId: requireIdentity(environment.YUI_LAUNCH_ID, "Launch id"),
-    runId: requireIdentity(environment.YUI_RUN_ID, "Run id"),
-    nativeSessionId
-  };
+  return resolveProviderHookRunFence(environment, "codex", nativeSessionId);
 }
 
 function parseObject(value: string | undefined): Record<string, unknown> {

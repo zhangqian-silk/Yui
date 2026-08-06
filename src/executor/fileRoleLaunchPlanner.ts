@@ -285,7 +285,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
             ...launchEnvironment
           },
           workspace: effectiveWorkspace,
-          profile: binding.config.profile
+          profile: binding.config.profile,
+          trustWorkspace: true
         })
       : undefined;
     if (codexConfig?.notify.status === "configured") {
@@ -345,15 +346,22 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     let session: SchedulerRoleSession | null;
     if (binding.adapterId === "codex") {
       args = addCodexSessionNotify(args, launchMode, this.#cliPath);
-      // Task-scoped managed Codex Runs also route session_start / user_prompt_submit
-      // through the Yui-owned hooks dir so the canonical fold can observe the
-      // session and the exact provider-accepted fence.
+      // A fresh Codex TUI has no provider event before its first prompt. Carry
+      // the exact Run input as the provider's positional launch prompt so it is
+      // submitted only after Codex completes startup; never race terminal bytes
+      // and Enter against TUI initialization.
       if (owner.scope === "task" && input.runId !== undefined) {
+        if (managedRun === null || managedRun.status !== "active") {
+          throw new Error(`Managed Codex Run is no longer active: ${input.runId}.`);
+        }
         args = addCodexLifecycleHooks(
           args,
           launchMode,
-          ensureManagedCodexLifecycleHooks(this.home, this.#cliPath)
+          this.#cliPath
         );
+        // End option parsing before the opaque prompt so a wakeup beginning
+        // with '-' can never be reinterpreted as a Codex CLI flag.
+        args.push("--", managedRun.input);
       }
       session = launchMode === "resume"
         ? readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective)
@@ -415,7 +423,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           ? {}
           : { YUI_LAUNCH_ID: input.launchId }),
         ...(input.runId === undefined ? {} : { YUI_RUN_ID: input.runId }),
-        ...(configured.adapterId !== "claude" || session === null
+        ...(session === null
           ? {}
           : { YUI_NATIVE_SESSION_ID: session.nativeSessionId })
       }
@@ -430,7 +438,10 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         ...(owner.scope === "task" ? { status: (role as TaskRole).status } : {})
       },
       launch: scopedLaunch,
-      session
+      session,
+      ...(binding.adapterId === "codex" && input.runId !== undefined
+        ? { initialPromptRunId: input.runId }
+        : {})
     };
   }
 
@@ -672,38 +683,31 @@ function addCodexSessionNotify(
 }
 
 /**
- * Writes the Yui-owned Codex hooks dir. Codex 0.145 reads `[hooks] managed_dir`
- * (a struct, not a path string) pointing at a dir containing hooks.json with
- * snake_case event keys. session_start and user_prompt_submit both route to the
- * Yui-owned entrypoint, which enqueues the exact fenced runtime-inbox events.
+ * Codex 0.145 discovers lifecycle hooks from its effective config. Keep Yui's
+ * two handlers invocation-local: this avoids mutating CODEX_HOME or the Task
+ * workspace, while the exact launch environment supplies the durable Run fence.
  */
-function ensureManagedCodexLifecycleHooks(home: string, cliPath: string): string {
-  const dir = join(resolve(home), "runtime", "codex-lifecycle-hooks");
-  const command = {
-    type: "command",
-    command: [canonicalPath(process.execPath), canonicalPath(cliPath), "internal", "codex-hook"]
-  };
-  writeTextFileAtomically(
-    join(dir, "hooks.json"),
-    `${JSON.stringify({
-      description: "Yui-owned Codex lifecycle transport",
-      hooks: {
-        session_start: [{ hooks: [command] }],
-        user_prompt_submit: [{ hooks: [command] }]
-      }
-    }, null, 2)}\n`
-  );
-  return dir;
+function codexLifecycleHooksConfig(cliPath: string): string {
+  const command = [
+    shellQuote(canonicalPath(process.execPath)),
+    shellQuote(canonicalPath(cliPath)),
+    "internal",
+    "codex-hook"
+  ].join(" ");
+  const handler = `{hooks=[{type="command",command=${JSON.stringify(command)}}]}`;
+  return `hooks={SessionStart=[${handler}],UserPromptSubmit=[${handler}]}`;
 }
 
 function addCodexLifecycleHooks(
   args: readonly string[],
   mode: "new" | "resume",
-  managedDir: string
+  cliPath: string
 ): string[] {
-  // Yui owns this hooks source, so bypass hook trust for the managed dir.
+  // Session flags are Yui-owned and exact to this launch. Hook trust bypass is
+  // still explicit because these handlers execute a local command.
   const managed = [
-    "--config", `hooks.managed_dir=${JSON.stringify(managedDir)}`,
+    "--enable", "hooks",
+    "--config", codexLifecycleHooksConfig(cliPath),
     "--dangerously-bypass-hook-trust"
   ];
   if (mode === "new") return [...args, ...managed];

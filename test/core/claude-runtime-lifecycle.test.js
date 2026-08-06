@@ -33,8 +33,7 @@ import { activateTask, createTask } from "../../dist/task/task.js";
 import { createWorkItem, updateWorkItemStatus } from "../../dist/workItem/workItem.js";
 
 function fixture(t) {
-  const home = mkdtempSync(join(tmpdir(), "yui-claude-hook-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const { home } = workflowFixture(t);
   return {
     home,
     environment: {
@@ -45,7 +44,7 @@ function fixture(t) {
       YUI_AGENT_ID: "claude-primary",
       YUI_ADAPTER_ID: "claude",
       YUI_LAUNCH_ID: "launch-1",
-      YUI_RUN_ID: "agent-run-1",
+      YUI_RUN_ID: "agent-run-stale-process-value",
       YUI_NATIVE_SESSION_ID: "native-1"
     }
   };
@@ -228,8 +227,8 @@ test("Claude StopFailure accepts provider evolution but never infers a managed i
     runClaudeLifecycleHookCommand(JSON.stringify({
       ...currentClaudeHookCommon("StopFailure"),
       error: "server_error"
-    }), { ...environment, YUI_RUN_ID: undefined }, async () => ({})),
-    /Run id/i
+    }), { ...environment, YUI_LAUNCH_ID: undefined }, async () => ({})),
+    /Launch id/i
   );
   await assert.rejects(
     runClaudeLifecycleHookCommand(JSON.stringify({

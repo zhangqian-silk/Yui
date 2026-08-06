@@ -278,6 +278,14 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
   }
 
   override launchContextArgs(input: CompileInput<CodexAgentConfig>): string[] {
+    // Yui has already scoped and authorized this exact workspace. Declare that
+    // invocation-local trust explicitly so Codex does not place its interactive
+    // directory trust prompt in front of the managed first input. This does not
+    // mutate the user's Codex config or trust any parent/sibling directory.
+    const workspaceTrust = [
+      "--config",
+      `projects={${JSON.stringify(resolve(input.workspace))}={trust_level="trusted"}}`
+    ];
     const instructions = [
       input.developerInstructions,
       ...(input.skills === undefined || input.skills.length === 0
@@ -287,11 +295,12 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
             ...input.skills.map((skill) => `- ${skill.id}: ${skill.path}/SKILL.md`)
         ])
     ].filter((value): value is string => value !== undefined && value.trim().length > 0);
-    if (instructions.length === 0) return [];
+    if (instructions.length === 0) return workspaceTrust;
     const nativeInstructions = input.codexDeveloperInstructions
       ?? inspectCodexDeveloperInstructions({
         workspace: input.workspace,
-        profile: input.config.profile
+        profile: input.config.profile,
+        trustWorkspace: true
       });
     if (nativeInstructions.status === "configured") {
       throw new Error(
@@ -300,6 +309,7 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
       );
     }
     return [
+      ...workspaceTrust,
       "--config",
       `developer_instructions=${tomlString(instructions.join("\n"))}`
     ];

@@ -1181,7 +1181,8 @@ for (const initialState of ["starting", "unavailable"]) {
     );
     assert.equal(sessions.sessions[fx.agent.id], undefined);
     assert.equal(sessions.inFlight.runId, fx.run.id);
-    assert.notEqual(sessions.inFlight.deliveredAt, undefined);
+    assert.notEqual(sessions.inFlight.pushedAt, undefined);
+    assert.equal(sessions.inFlight.deliveredAt, undefined);
     const workerStarts = fx.controls.starts.filter(
       (request) => request.owner.roleName === fx.roleName
     );

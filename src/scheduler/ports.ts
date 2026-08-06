@@ -351,6 +351,8 @@ export type PreparedRoleDelivery = Readonly<{
   mode: RoleSessionLaunchMode;
   /** The prepare request created a new external Role window/process. */
   sessionStarted: boolean;
+  /** Provider launch argv carried this Run's first prompt atomically. */
+  inputSubmittedAtLaunch?: boolean;
 }>;
 
 export type ReadyRoleDelivery = Readonly<{

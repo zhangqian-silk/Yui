@@ -15,7 +15,7 @@ import { runCodexLifecycleHookCommand } from "../../dist/controller/codexLifecyc
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
-  markTaskRoleRunDelivered,
+  markTaskRoleRunPushed,
   recordRoleAgentSession
 } from "../../dist/executor/agentExecutor.js";
 import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
@@ -39,7 +39,7 @@ import { createWorkItem, updateWorkItemStatus } from "../../dist/workItem/workIt
 // seam evidence — no live provider process — never a first-prompt acceptance.
 // ---------------------------------------------------------------------------
 
-function fixture(t, adapterId, sessionStatus = "running") {
+function fixture(t, adapterId, sessionStatus = "running", options = {}) {
   const home = mkdtempSync(join(tmpdir(), "yui-provider-accept-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home);
@@ -80,22 +80,32 @@ function fixture(t, adapterId, sessionStatus = "running") {
     let sessions = createRoleSessionSet(
       { scope: "task", taskId: task.id, roleName: worker.name }, agent.id, first
     );
-    sessions = recordRoleAgentSession(sessions, {
-      agentId: agent.id, adapterId, nativeSessionId, launchId: "launch-1",
-      policy: "fixed", status: sessionStatus, effective: run.effective
-    }, first);
+    if (options.runtimeDiscovered !== true) {
+      sessions = recordRoleAgentSession(sessions, {
+        agentId: agent.id, adapterId, nativeSessionId, launchId: "launch-1",
+        policy: "fixed", status: sessionStatus, effective: run.effective
+      }, first);
+    }
     sessions = bindTaskRoleRun(sessions, {
       agentId: agent.id, runId: run.id, receiptId: `agent-run:${task.id}/${run.id}`
     }, first);
-    sessions = markTaskRoleRunDelivered(sessions, {
+    sessions = markTaskRoleRunPushed(sessions, {
       agentId: agent.id, runId: run.id, receiptId: `agent-run:${task.id}/${run.id}`
     }, second);
     tx.saveTaskRoleSessionSet(sessions);
   });
+  if (options.runtimeDiscovered === true) {
+    adapter.reserveRuntimeLaunch({
+      owner: { scope: "task", taskId: task.id, roleName: worker.name },
+      launchId: "launch-1",
+      runId: run.id
+    }, () => {}, first);
+  }
   const environment = {
     YUI_HOME: home, YUI_SESSION_SCOPE: "task", YUI_TASK_ID: task.id,
     YUI_ROLE: worker.name, YUI_AGENT_ID: agent.id, YUI_ADAPTER_ID: adapterId,
-    YUI_LAUNCH_ID: "launch-1", YUI_RUN_ID: run.id, YUI_NATIVE_SESSION_ID: nativeSessionId
+    YUI_LAUNCH_ID: "launch-1", YUI_RUN_ID: run.id,
+    ...(options.runtimeDiscovered === true ? {} : { YUI_NATIVE_SESSION_ID: nativeSessionId })
   };
   const drain = () => new FileRuntimeEventProcessor(
     new FileRuntimeEventInbox(home), adapter
@@ -126,12 +136,12 @@ test("Claude UserPromptSubmit hook folds to provider-accepted and only then writ
   assert.ok(fx.store.listEvents(fx.task.id).some((e) => e.type === "run.delivered"));
 });
 
-test("Codex user_prompt_submit hook folds to provider-accepted and writes delivered", async (t) => {
+test("Codex UserPromptSubmit hook folds to provider-accepted and writes delivered", async (t) => {
   const fx = fixture(t, "codex");
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
 
   await runCodexLifecycleHookCommand(
-    JSON.stringify({ hook_event_name: "user_prompt_submit", session_id: fx.nativeSessionId, prompt: "Do the work" }),
+    JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: fx.nativeSessionId, prompt: "Do the work" }),
     fx.environment,
     async () => ({})
   );
@@ -139,6 +149,24 @@ test("Codex user_prompt_submit hook folds to provider-accepted and writes delive
   assert.equal(events.length, 1);
   assert.equal(events[0].type, "native-prompt-accepted");
 
+  fx.drain();
+  assert.notEqual(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
+});
+
+test("hook resolves the current in-flight Run instead of a stale process YUI_RUN_ID", async (t) => {
+  const fx = fixture(t, "codex");
+  await runCodexLifecycleHookCommand(
+    JSON.stringify({
+      hook_event_name: "UserPromptSubmit",
+      session_id: fx.nativeSessionId,
+      prompt: "Do the work"
+    }),
+    { ...fx.environment, YUI_RUN_ID: "agent-run-stale" },
+    async () => ({})
+  );
+  const [event] = new FileRuntimeEventInbox(fx.home).list();
+  assert.equal(event.runId, fx.run.id);
+  assert.equal(event.receiptId, `agent-run:${fx.task.id}/${fx.run.id}`);
   fx.drain();
   assert.notEqual(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
 });
@@ -163,18 +191,36 @@ test("Claude SessionStart hook folds to a session-lifecycle event, never deliver
   ));
 });
 
-test("Codex session_start hook records session-lifecycle without pre-input readiness", async (t) => {
+test("Codex SessionStart hook records session-lifecycle without pre-input readiness", async (t) => {
   const fx = fixture(t, "codex", "reserved");
   await runCodexLifecycleHookCommand(
-    JSON.stringify({ hook_event_name: "session_start", session_id: fx.nativeSessionId }),
+    JSON.stringify({ hook_event_name: "SessionStart", session_id: fx.nativeSessionId }),
     fx.environment,
     async () => ({})
   );
   fx.drain();
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
-  // Codex session_start is provider-session-started only — preInputReady stays false.
+  // Codex SessionStart is provider-session-started only — preInputReady stays false.
   assert.ok(fx.store.listEvents(fx.task.id).some(
     (e) => e.type === "runtime.provider-session-lifecycle" && e.payload.preInputReady === "false"
+  ));
+});
+
+test("runtime-discovered Codex SessionStart binds the provider session without a native id in launch env", async (t) => {
+  const fx = fixture(t, "codex", "reserved", { runtimeDiscovered: true });
+  assert.equal(fx.store.getRoleSession(fx.task.id, fx.worker.name), null);
+  await runCodexLifecycleHookCommand(
+    JSON.stringify({ hook_event_name: "SessionStart", session_id: fx.nativeSessionId }),
+    fx.environment,
+    async () => ({})
+  );
+  fx.drain();
+  const session = fx.store.getRoleSession(fx.task.id, fx.worker.name);
+  assert.equal(session.nativeSessionId, fx.nativeSessionId);
+  assert.equal(session.launchId, "launch-1");
+  assert.ok(fx.store.listEvents(fx.task.id).some(
+    (event) => event.type === "runtime.provider-session-lifecycle"
+      && event.payload.outcome === "bind-native-session"
   ));
 });
 
