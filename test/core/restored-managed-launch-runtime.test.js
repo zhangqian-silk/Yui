@@ -480,7 +480,7 @@ test("Claude launch identity is deterministic for one durable launch across retr
   assert.deepEqual(first.launch.args.slice(-2), ["--session-id", first.session.nativeSessionId]);
 });
 
-test("managed Claude Task Runs inject only StopFailure and exact explicit-yield access", (t) => {
+test("managed Claude Task Runs inject the lifecycle hooks and exact explicit-yield access", (t) => {
   const { home, store, task, role, agent, now } = fixture(t, "claude");
   const controlledRole = createRole(
     task.id,
@@ -545,10 +545,15 @@ test("managed Claude Task Runs inject only StopFailure and exact explicit-yield 
   const pluginRoot = plan.launch.args[pluginIndex + 1];
   assert.ok(pluginRoot.startsWith(join(home, "runtime")));
   const hooks = JSON.parse(readFileSync(join(pluginRoot, "hooks", "hooks.json"), "utf8"));
-  assert.deepEqual(Object.keys(hooks.hooks), ["StopFailure"]);
-  const command = hooks.hooks.StopFailure[0].hooks[0];
-  assert.equal(command.command, process.execPath);
-  assert.deepEqual(command.args, ["/dist/cli.js", "internal", "claude-hook"]);
+  assert.deepEqual(
+    Object.keys(hooks.hooks).sort(),
+    ["SessionStart", "StopFailure", "UserPromptSubmit"]
+  );
+  for (const eventKey of ["SessionStart", "UserPromptSubmit", "StopFailure"]) {
+    const command = hooks.hooks[eventKey][0].hooks[0];
+    assert.equal(command.command, process.execPath, eventKey);
+    assert.deepEqual(command.args, ["/dist/cli.js", "internal", "claude-hook"], eventKey);
+  }
   assert.equal(plan.launch.env.YUI_RUN_ID, run.id);
   assert.equal(plan.launch.env.YUI_LAUNCH_ID, "launch-1");
   assert.equal(plan.launch.env.YUI_NATIVE_SESSION_ID, plan.session.nativeSessionId);

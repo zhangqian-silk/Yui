@@ -74,7 +74,7 @@ test("a durable Leader claim fences completion while tmux is still preparing", a
   assert.match(String(completionError), /delivery is still pending/i);
   assert.equal(sent, true);
   assert.equal(store.getTask(task.id)?.status, "active");
-  assert.notEqual(store.getActiveAgentRun(task.id, "leader")?.deliveredAt, undefined);
+  assert.notEqual(store.getActiveAgentRun(task.id, "leader")?.pushedAt, undefined);
   assert.deepEqual(result, [{
     taskId: task.id,
     runId: "agent-run-1",
@@ -117,7 +117,7 @@ test("a claimed but undelivered Leader run fences completion before tmux input",
 
   assert.match(String(completionError), /delivery is still pending/i);
   assert.equal(store.getTask(task.id)?.status, "active");
-  assert.notEqual(store.getActiveAgentRun(task.id, "leader")?.deliveredAt, undefined);
+  assert.notEqual(store.getActiveAgentRun(task.id, "leader")?.pushedAt, undefined);
   assert.deepEqual(result, [{
     taskId: task.id,
     runId: "agent-run-1",

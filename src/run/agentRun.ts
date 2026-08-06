@@ -26,7 +26,18 @@ export type AgentRun = {
   /** Immutable actual launch configuration and provenance. */
   effective: EffectiveLaunchSnapshot;
   status: AgentRunStatus;
-  /** Set only after tmux has confirmed the receipt-backed input delivery. */
+  /**
+   * Set when tmux confirmed the receipt-backed transport push (bytes reached the
+   * pane). Transport only — it proves the prompt was pushed, never that the
+   * provider accepted it. A push without a later provider-accepted fold stays
+   * pushed-but-unaccepted.
+   */
+  pushedAt?: string;
+  /**
+   * Set only after an exact, identity-matched durable provider-accepted fold
+   * (UserPromptSubmit / user_prompt_submit). This is the durable "delivered"
+   * gate every consumer reads; transport alone never sets it.
+   */
   deliveredAt?: string;
   summary?: string;
   createdAt: string;
@@ -81,13 +92,29 @@ export function isActiveAgentRun(run: AgentRun): boolean {
   return run.status === "active";
 }
 
+export function markAgentRunPushed(run: AgentRun, now: Date): AgentRun {
+  if (run.status !== "active") {
+    throw new Error(`Cannot push a terminal Agent run: ${run.id}.`);
+  }
+  if (run.pushedAt !== undefined) return run;
+  const timestamp = now.toISOString();
+  return { ...run, pushedAt: timestamp, updatedAt: timestamp };
+}
+
 export function markAgentRunDelivered(run: AgentRun, now: Date): AgentRun {
   if (run.status !== "active") {
     throw new Error(`Cannot deliver a terminal Agent run: ${run.id}.`);
   }
   if (run.deliveredAt !== undefined) return run;
   const timestamp = now.toISOString();
-  return { ...run, deliveredAt: timestamp, updatedAt: timestamp };
+  // Acceptance implies the prompt was pushed first; record both so a consumer
+  // never sees delivered-without-pushed.
+  return {
+    ...run,
+    ...(run.pushedAt === undefined ? { pushedAt: timestamp } : {}),
+    deliveredAt: timestamp,
+    updatedAt: timestamp
+  };
 }
 
 export function validateAgentRun(run: AgentRun): AgentRun {
@@ -178,7 +205,14 @@ export function validateAgentRun(run: AgentRun): AgentRun {
   }
   requireTimestamp(run.createdAt, "Agent run createdAt");
   requireTimestamp(run.updatedAt, "Agent run updatedAt");
-  if (run.deliveredAt !== undefined) requireTimestamp(run.deliveredAt, "Agent run deliveredAt");
+  if (run.pushedAt !== undefined) requireTimestamp(run.pushedAt, "Agent run pushedAt");
+  if (run.deliveredAt !== undefined) {
+    requireTimestamp(run.deliveredAt, "Agent run deliveredAt");
+    // Acceptance can never precede its transport push.
+    if (run.pushedAt === undefined) {
+      throw new Error("Agent run deliveredAt requires a prior pushedAt.");
+    }
+  }
   if (run.status === "active") {
     if (run.summary !== undefined || run.endedAt !== undefined) {
       throw new Error("An active Agent run cannot have terminal metadata.");

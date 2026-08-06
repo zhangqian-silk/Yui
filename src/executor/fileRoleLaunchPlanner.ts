@@ -345,6 +345,16 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     let session: SchedulerRoleSession | null;
     if (binding.adapterId === "codex") {
       args = addCodexSessionNotify(args, launchMode, this.#cliPath);
+      // Task-scoped managed Codex Runs also route session_start / user_prompt_submit
+      // through the Yui-owned hooks dir so the canonical fold can observe the
+      // session and the exact provider-accepted fence.
+      if (owner.scope === "task" && input.runId !== undefined) {
+        args = addCodexLifecycleHooks(
+          args,
+          launchMode,
+          ensureManagedCodexLifecycleHooks(this.home, this.#cliPath)
+        );
+      }
       session = launchMode === "resume"
         ? readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective)
         : null;
@@ -558,6 +568,12 @@ function ensureManagedClaudeLifecyclePlugin(home: string, cliPath: string): stri
     join(root, "hooks", "hooks.json"),
     `${JSON.stringify({
       hooks: {
+        // SessionStart proves the session exists (and, for source=startup,
+        // pre-input readiness); UserPromptSubmit is the exact provider-accepted
+        // fence; StopFailure is the terminal failure fact. All route to the same
+        // Yui-owned entrypoint, which parses by hook_event_name.
+        SessionStart: [{ hooks: [command] }],
+        UserPromptSubmit: [{ hooks: [command] }],
         StopFailure: [{ hooks: [command] }]
       }
     }, null, 2)}\n`
@@ -648,6 +664,48 @@ function addCodexSessionNotify(
   cliPath: string
 ): string[] {
   const managed = ["--config", codexSessionNotifyConfig(cliPath)];
+  if (mode === "new") return [...args, ...managed];
+  if (args.length < 2 || args.at(-2) !== "resume") {
+    throw new Error("Codex resume launch shape is invalid.");
+  }
+  return [...args.slice(0, -2), ...managed, ...args.slice(-2)];
+}
+
+/**
+ * Writes the Yui-owned Codex hooks dir. Codex 0.145 reads `[hooks] managed_dir`
+ * (a struct, not a path string) pointing at a dir containing hooks.json with
+ * snake_case event keys. session_start and user_prompt_submit both route to the
+ * Yui-owned entrypoint, which enqueues the exact fenced runtime-inbox events.
+ */
+function ensureManagedCodexLifecycleHooks(home: string, cliPath: string): string {
+  const dir = join(resolve(home), "runtime", "codex-lifecycle-hooks");
+  const command = {
+    type: "command",
+    command: [canonicalPath(process.execPath), canonicalPath(cliPath), "internal", "codex-hook"]
+  };
+  writeTextFileAtomically(
+    join(dir, "hooks.json"),
+    `${JSON.stringify({
+      description: "Yui-owned Codex lifecycle transport",
+      hooks: {
+        session_start: [{ hooks: [command] }],
+        user_prompt_submit: [{ hooks: [command] }]
+      }
+    }, null, 2)}\n`
+  );
+  return dir;
+}
+
+function addCodexLifecycleHooks(
+  args: readonly string[],
+  mode: "new" | "resume",
+  managedDir: string
+): string[] {
+  // Yui owns this hooks source, so bypass hook trust for the managed dir.
+  const managed = [
+    "--config", `hooks.managed_dir=${JSON.stringify(managedDir)}`,
+    "--dangerously-bypass-hook-trust"
+  ];
   if (mode === "new") return [...args, ...managed];
   if (args.length < 2 || args.at(-2) !== "resume") {
     throw new Error("Codex resume launch shape is invalid.");

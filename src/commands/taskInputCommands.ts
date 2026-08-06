@@ -330,7 +330,7 @@ function requireLeaderInputOrigin(
     || run === null
     || env.YUI_AGENT_ID !== run.effective.agentId
     || run.status !== "active"
-    || run.deliveredAt === undefined
+    || run.pushedAt === undefined
     || run.workItemId !== undefined
   ) {
     throw usageError("Task input request requires the active Leader Run environment.");

@@ -21,6 +21,10 @@ import {
   discoverClaudeConfiguration,
   discoverCodexConfiguration
 } from "./agentConfigurationProbe.js";
+import {
+  preInputReadinessCapability
+} from "../lifecycle/providerLifecycleMapping.js";
+import type { PreInputReadinessCapability } from "../lifecycle/canonicalLifecycleEvent.js";
 
 export type AdvancedAgentConfig = Readonly<{ rawArgs?: readonly string[] }>;
 export type PermissionStrategy = "default" | "bypass" | "configured";
@@ -89,6 +93,12 @@ export type CapabilitySnapshot = Readonly<{
     resume: true;
     nativeSessionDiscovery: "runtime" | "preallocated";
     interrupt: true;
+    /**
+     * Whether this provider emits a native event proven to occur before the
+     * first prompt that Yui may map to pre-input readiness. Explicit and fail
+     * closed when unsupported — never a provider-name default.
+     */
+    preInputReadiness: PreInputReadinessCapability;
   }>;
   fields: readonly CapabilityField[];
   warnings: readonly string[];
@@ -128,6 +138,7 @@ export interface AgentAdapter<TConfig extends RoleAgentConfig = RoleAgentConfig>
     recover: true;
     interrupt: true;
     nativeSessionDiscovery: "runtime" | "preallocated";
+    preInputReadiness: PreInputReadinessCapability;
   }>;
   validateConfig(input: CompileInput<TConfig>): void;
   compileNew(input: CompileInput<TConfig>): CompiledAgentLaunch;
@@ -200,7 +211,12 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
   readonly id = "codex" as const;
   readonly label = "Codex";
   readonly supportedVersion = "0.144.1";
-  readonly capabilities = { recover: true, interrupt: true, nativeSessionDiscovery: "runtime" } as const;
+  readonly capabilities = {
+    recover: true,
+    interrupt: true,
+    nativeSessionDiscovery: "runtime",
+    preInputReadiness: preInputReadinessCapability("codex")
+  } as const;
 
   discoverConfiguration(input: AgentConfigurationDiscoveryInput): Promise<AgentConfigurationCatalog> {
     return discoverCodexConfiguration(input);
@@ -299,7 +315,12 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
   readonly id = "claude" as const;
   readonly label = "Claude";
   readonly supportedVersion = "2.1.207";
-  readonly capabilities = { recover: true, interrupt: true, nativeSessionDiscovery: "preallocated" } as const;
+  readonly capabilities = {
+    recover: true,
+    interrupt: true,
+    nativeSessionDiscovery: "preallocated",
+    preInputReadiness: preInputReadinessCapability("claude")
+  } as const;
 
   discoverConfiguration(input: AgentConfigurationDiscoveryInput): Promise<AgentConfigurationCatalog> {
     return discoverClaudeConfiguration(input);
@@ -573,7 +594,7 @@ function snapshot(agent: AgentDefinition, adapter: AgentAdapter, installation: A
   fields: CapabilityField[], at: string, warnings: string[] = []): CapabilitySnapshot {
   return { schemaVersion: 1, agentId: agent.id, adapterId: agent.adapterId, installation,
     lifecycle: { start: true, resume: true, nativeSessionDiscovery: adapter.capabilities.nativeSessionDiscovery,
-      interrupt: true }, fields, warnings, refreshedAt: at };
+      interrupt: true, preInputReadiness: adapter.capabilities.preInputReadiness }, fields, warnings, refreshedAt: at };
 }
 function runProbe(command: string, args: readonly string[]): AgentProbeResult {
   const result = spawnSync(command, [...args], { encoding: "utf8", shell: false, timeout: PROBE_TIMEOUT_MS,

@@ -35,10 +35,26 @@ import { SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
 import {
   failAgentRun,
   markAgentRunDelivered,
+  markAgentRunPushed,
   type AgentRun
 } from "../run/agentRun.js";
 import { terminalizeExactTaskRun } from "../lifecycle/exactRunTerminalization.js";
-import type { TaskClaudeStopFailureEvent } from "./runtimeEventProcessor.js";
+import {
+  createCanonicalLifecycleEvent,
+  foldCanonicalLifecycleEvent,
+  type CanonicalIdentityFence,
+  type CanonicalRunExpectation
+} from "../lifecycle/canonicalLifecycleEvent.js";
+import {
+  mapNativeLifecycleSignal,
+  type NativeLifecycleSignal
+} from "../lifecycle/providerLifecycleMapping.js";
+import type {
+  ProviderLifecycleObservation,
+  TaskClaudeStopFailureEvent,
+  TaskProviderPromptAccepted,
+  TaskProviderSessionLifecycle
+} from "./runtimeEventProcessor.js";
 import type {
   DormantRuntimeOwnerCandidate,
   LeaderDispatchFailurePersistence,
@@ -381,6 +397,28 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return sessions !== null && sessions.inFlight !== null;
   }
 
+  isRoleGenerationProviderReady(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    launchId?: string;
+    nativeSessionId?: string;
+  }>): boolean {
+    // A provider-ready fact for this exact generation is proven by a folded
+    // runtime.provider-session-lifecycle event with preInputReady true and a
+    // matching agent/launch/nativeSession fence. This reads durable folded truth
+    // only — no liveness, screen, or pane/PID inference.
+    return this.store.listEvents(input.taskId).some((event) => (
+      event.type === "runtime.provider-session-lifecycle"
+      && event.payload.roleName === input.roleName
+      && event.payload.agentId === input.agentId
+      && event.payload.preInputReady === "true"
+      && (input.launchId === undefined || event.payload.launchId === input.launchId)
+      && (input.nativeSessionId === undefined
+        || event.payload.nativeSessionId === input.nativeSessionId)
+    ));
+  }
+
   peekNextAgentRunId(taskId: string): string {
     return this.store.peekNextAgentRunId(taskId);
   }
@@ -713,44 +751,19 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (active === null || active.id !== input.run.id) {
         throw new Error(`Active Agent run changed before delivery was persisted: ${input.run.id}.`);
       }
-      if (active.deliveredAt === undefined) {
-        store.saveAgentRun(markAgentRunDelivered(active, input.now));
+      // Transport success records prompt-pushed ONLY. Acceptance (deliveredAt)
+      // is written exclusively by an exact provider-accepted fold, never by the
+      // transport receipt — that removes the transport-to-delivered false path.
+      if (active.pushedAt === undefined) {
+        store.saveAgentRun(markAgentRunPushed(active, input.now));
         markTaskRoleRunDeliveredInFlight(store, role, input.run, input.now);
-        const wasStalled = isRoleRunStalled(store.listEvents(task.id), active.id);
         store.saveEvent(task.id, createTaskEvent(
           store.nextEventId(task.id),
           task.id,
-          "run.delivered",
+          "run.pushed",
           runLaunchEventPayload(active),
           input.now
         ));
-        store.saveEvent(task.id, createTaskEvent(
-          store.nextEventId(task.id),
-          task.id,
-          RUN_PROGRESS_EVENT,
-          {
-            runId: active.id,
-            roleName: role.name,
-            kind: "delivery",
-            progressAt: input.now.toISOString()
-          },
-          input.now
-        ));
-        if (wasStalled) {
-          store.saveEvent(task.id, createTaskEvent(
-            store.nextEventId(task.id),
-            task.id,
-            RUN_RECOVERED_EVENT,
-            {
-              runId: active.id,
-              roleName: role.name,
-              progressAt: input.now.toISOString(),
-              kind: "delivery"
-            },
-            input.now
-          ));
-        }
-        clearMatchingLeaderStallAttention(store, task.id, active.id);
       } else {
         const sessions = store.getTaskRoleSessionSet(input.task.id, input.role.name);
         if (sessions?.inFlight?.runId === input.run.id
@@ -840,7 +853,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         || active === null
         || active.id !== input.runId
         || active.status !== "active"
-        || active.deliveredAt !== undefined
+        || active.pushedAt !== undefined
         || active.effective.agentId !== input.agentId
         || active.effective.adapterId !== input.adapterId
         || mailbox?.processing?.batchId !== input.mailboxBatchId
@@ -1561,8 +1574,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         if (active === null || active.id !== fence.runId || active.status !== "active") {
           return { session: sessions.sessions[input.agentId]!, duplicate: false };
         }
-        if (active.deliveredAt === undefined) {
-          store.saveAgentRun(markAgentRunDelivered(active, now));
+        // A native turn completion proves the prompt reached the Agent, so it
+        // records the transport-reached (pushed) fact and the inFlight marker.
+        // It must NOT promote run-level acceptance (deliveredAt): only an exact
+        // provider-accepted fold (user_prompt_submit) may do that, so a
+        // completion for an unaccepted Run never forges acceptance.
+        if (active.pushedAt === undefined) {
+          store.saveAgentRun(markAgentRunPushed(active, now));
         }
         sessions = markTaskRoleRunDelivered(sessions, fence, now);
       }
@@ -1781,7 +1799,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (
         task.status !== "active"
         || active === null
-        || active.deliveredAt === undefined
+        || active.pushedAt === undefined
         || (input.expectedRunId !== undefined && active.id !== input.expectedRunId)
       ) {
         return { session };
@@ -2105,6 +2123,190 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     });
   }
 
+  /**
+   * Folds a provider session-lifecycle fact (SessionStart / session_start)
+   * through the canonical contract. Session-started/ready never advance Run
+   * acceptance; this only records generation facts and binds a discovered native
+   * id under the exact launch fence. Idempotent replays are no-ops.
+   */
+  observeProviderSessionLifecycle(
+    input: TaskProviderSessionLifecycle,
+    now = new Date()
+  ): ProviderLifecycleObservation {
+    return this.store.transaction((store) => {
+      const decision = this.foldProviderSignal(store, {
+        kind: "native-session-start",
+        ...(input.sessionSource === undefined ? {} : { sessionSource: input.sessionSource }),
+        fence: providerFence(input)
+      }, input.runId);
+      switch (decision.kind) {
+        case "obsolete":
+          recordCanonicalObsolete(store, input, "native-session-lifecycle", decision.reason, now);
+          return "obsolete";
+        case "deferred":
+          return "deferred";
+        case "idempotent":
+          return "applied";
+        case "apply":
+          // Session-started/ready/bind facts are recorded provider-neutrally as
+          // an auditable event; the durable Run truth model that projects them
+          // into status/attention is work-item-4's contract, not this one. The
+          // payload carries the generation fence + preInputReady so the fresh
+          // push gate can read the exact provider-ready fact for this generation.
+          store.saveEvent(input.taskId, createTaskEvent(
+            store.nextEventId(input.taskId),
+            input.taskId,
+            "runtime.provider-session-lifecycle",
+            {
+              eventId: input.eventId,
+              roleName: input.roleName,
+              agentId: input.agentId,
+              adapterId: input.adapterId,
+              launchId: input.launchId,
+              nativeSessionId: input.nativeSessionId,
+              outcome: decision.outcome.outcome,
+              preInputReady: (decision.outcome.outcome === "mark-ready"
+                && decision.outcome.preInputReady) ? "true" : "false",
+              ...(input.runId === undefined ? {} : { runId: input.runId })
+            },
+            now
+          ));
+          return "applied";
+      }
+    });
+  }
+
+  /**
+   * Folds a provider prompt-acceptance fact (UserPromptSubmit /
+   * user_prompt_submit). This is the ONLY path that may advance a Run to
+   * accepted/delivered, and only under an exact identity-matched durable fold
+   * after the single transport push.
+   */
+  observeProviderPromptAccepted(
+    input: TaskProviderPromptAccepted,
+    now = new Date()
+  ): ProviderLifecycleObservation {
+    return this.store.transaction((store) => {
+      const decision = this.foldProviderSignal(store, {
+        kind: "native-prompt-submit",
+        fence: providerFence(input)
+      }, input.runId);
+      if (decision.kind === "obsolete") {
+        recordCanonicalObsolete(store, input, "native-prompt-accepted", decision.reason, now);
+        return "obsolete";
+      }
+      if (decision.kind === "deferred") return "deferred";
+      if (decision.kind === "idempotent") return "applied";
+      // decision.kind === "apply" && outcome advance-accepted
+      const active = store.getActiveAgentRun(input.taskId, input.roleName);
+      if (active === null || active.id !== input.runId || active.status !== "active") {
+        recordCanonicalObsolete(store, input, "native-prompt-accepted", "run-not-active", now);
+        return "obsolete";
+      }
+      const role = store.getRole(input.taskId, input.roleName);
+      if (role === null) {
+        recordCanonicalObsolete(store, input, "native-prompt-accepted", "role-missing", now);
+        return "obsolete";
+      }
+      if (active.deliveredAt === undefined) {
+        store.saveAgentRun(markAgentRunDelivered(active, now));
+        markTaskRoleRunDeliveredInFlight(store, role, active, now);
+        store.saveEvent(input.taskId, createTaskEvent(
+          store.nextEventId(input.taskId),
+          input.taskId,
+          "run.delivered",
+          runLaunchEventPayload(store.getAgentRun(input.taskId, input.runId)!),
+          now
+        ));
+      }
+      return "applied";
+    });
+  }
+
+  /**
+   * Shared projection + canonical fold for provider-native lifecycle signals.
+   * Reads current durable Run/session state into a CanonicalRunExpectation,
+   * maps the neutral signal through the per-adapter registry, and folds. The
+   * fold owns every ordering/identity/evidence decision; this method only reads
+   * durable truth and never branches on the provider name.
+   */
+  private foldProviderSignal(
+    store: TaskStore,
+    signal: NativeLifecycleSignal,
+    runId: string | undefined
+  ): Readonly<
+    | { kind: "apply"; outcome: ReturnType<typeof foldCanonicalLifecycleEvent> }
+    | { kind: "idempotent"; reason: string }
+    | { kind: "deferred"; reason: string }
+    | { kind: "obsolete"; reason: string }
+  > {
+    let event;
+    try {
+      event = mapNativeLifecycleSignal(signal);
+    } catch (error) {
+      return { kind: "obsolete", reason: error instanceof Error ? error.message : "map-failed" };
+    }
+    const expectation = this.projectRunExpectation(store, signal.fence, runId);
+    if (expectation === null) return { kind: "obsolete", reason: "run-or-role-missing" };
+    const outcome = foldCanonicalLifecycleEvent(event, expectation);
+    switch (outcome.outcome) {
+      case "obsolete":
+        return { kind: "obsolete", reason: outcome.reason };
+      case "fail-closed":
+        return { kind: "obsolete", reason: `fail-closed:${outcome.reason}` };
+      case "deferred":
+        return { kind: "deferred", reason: outcome.reason };
+      case "idempotent":
+        return { kind: "idempotent", reason: outcome.reason };
+      default:
+        return { kind: "apply", outcome };
+    }
+  }
+
+  /** Reads durable Run + session state into the pure fold's expectation shape. */
+  private projectRunExpectation(
+    store: TaskStore,
+    fence: CanonicalIdentityFence,
+    runId: string | undefined
+  ): CanonicalRunExpectation | null {
+    const role = store.getRole(fence.taskId, fence.roleName);
+    if (role === null) return null;
+    const sessionSet = store.getTaskRoleSessionSet(fence.taskId, fence.roleName);
+    const session = sessionSet?.sessions[fence.agentId] ?? null;
+    const boundNativeSessionId = session?.nativeSessionId;
+    // A `reserved` session is allocated but has no provider-started fact yet; a
+    // running/ready session reflects a provider event. sessionStarted and ready
+    // are projected from that durable status so a duplicate SessionStart folds
+    // idempotently while a first one still marks/binds.
+    const providerConfirmed = session !== null
+      && session.nativeSessionId !== undefined
+      && (session.status === "ready" || session.status === "running");
+    const sessionStarted = providerConfirmed;
+    const ready = providerConfirmed;
+    if (runId === undefined) {
+      return {
+        fence,
+        sessionStarted,
+        ready,
+        pushed: false,
+        accepted: false,
+        terminal: false,
+        ...(boundNativeSessionId === undefined ? {} : { boundNativeSessionId })
+      };
+    }
+    const run = store.getAgentRun(fence.taskId, runId);
+    if (run === null) return null;
+    return {
+      fence,
+      sessionStarted,
+      ready,
+      pushed: run.pushedAt !== undefined,
+      accepted: run.deliveredAt !== undefined,
+      terminal: run.status !== "active",
+      ...(boundNativeSessionId === undefined ? {} : { boundNativeSessionId })
+    };
+  }
+
   observeObsoleteRuntimeEvent(input: Readonly<{
     eventId: string;
     eventType: string;
@@ -2259,6 +2461,48 @@ function claudeStopFailureSummary(input: TaskClaudeStopFailureEvent): string {
       ? []
       : [`last_assistant_message: ${input.lastAssistantMessage}`])
   ].join("\n");
+}
+
+function providerFence(
+  input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    adapterId: "codex" | "claude";
+    launchId: string;
+    nativeSessionId: string;
+    runId?: string;
+    receiptId?: string;
+  }>
+): CanonicalIdentityFence {
+  return {
+    taskId: input.taskId,
+    roleName: input.roleName,
+    agentId: input.agentId,
+    adapterId: input.adapterId,
+    launchId: input.launchId,
+    nativeSessionId: input.nativeSessionId,
+    ...(input.runId === undefined ? {} : { runId: input.runId }),
+    ...(input.receiptId === undefined ? {} : { receiptId: input.receiptId })
+  };
+}
+
+function recordCanonicalObsolete(
+  store: TaskStore,
+  input: Readonly<{
+    eventId: string;
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    launchId: string;
+    nativeSessionId: string;
+    runId?: string;
+  }>,
+  eventType: string,
+  reason: string,
+  now: Date
+): void {
+  recordObsoleteRuntimeEvent(store, { ...input, eventType }, reason, now);
 }
 
 function recordObsoleteRuntimeEvent(

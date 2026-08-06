@@ -265,6 +265,7 @@ function fixture(t) {
       FIRST,
       { effective }
     ),
+    pushedAt: FIRST.toISOString(),
     deliveredAt: FIRST.toISOString()
   };
   let sessions = createRoleSessionSet(
@@ -645,8 +646,8 @@ test("Controller atomically applies an expired Agent recommendation and resumes 
     text: "Safe rollout"
   });
   assert.deepEqual(
-    store.listEvents(task.id).slice(-4).map((event) => event.type),
-    ["input.auto-answered", "run.dispatched", "run.delivered", "run.progress"]
+    store.listEvents(task.id).slice(-3).map((event) => event.type),
+    ["input.auto-answered", "run.dispatched", "run.pushed"]
   );
 });
 

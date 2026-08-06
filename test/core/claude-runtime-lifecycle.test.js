@@ -176,7 +176,7 @@ test("ordinary Claude Stop is rejected and cannot become a managed lifecycle eve
   }), environment, async (...args) => {
     signals.push(args);
     return {};
-  }), /StopFailure/i);
+  }), /unsupported hook event/i);
 
   assert.deepEqual(new FileRuntimeEventInbox(home).list(), []);
   assert.deepEqual(signals, []);
@@ -373,7 +373,10 @@ test("exact stdin yield preserves multiline UTF-8, rejects wrong or repeated Run
   const resumeHooks = JSON.parse(
     readFileSync(join(resumePluginRoot, "hooks", "hooks.json"), "utf8")
   );
-  assert.deepEqual(Object.keys(resumeHooks.hooks), ["StopFailure"]);
+  assert.deepEqual(
+    Object.keys(resumeHooks.hooks).sort(),
+    ["SessionStart", "StopFailure", "UserPromptSubmit"]
+  );
 
   const late = {
     eventId: "late-stop-failure-old-run",

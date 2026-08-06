@@ -67,12 +67,25 @@ test("Agent adapters expose the stable Codex and Claude catalog", () => {
   assert.deepEqual(codex.capabilities, {
     recover: true,
     interrupt: true,
-    nativeSessionDiscovery: "runtime"
+    nativeSessionDiscovery: "runtime",
+    preInputReadiness: {
+      status: "unsupported",
+      reason: "not-available",
+      note: codex.capabilities.preInputReadiness.note
+    }
   });
+  // Codex 0.145 session_start fires within run_turn(input): no pre-input event.
+  assert.equal(codex.capabilities.preInputReadiness.status, "unsupported");
 
   const claude = resolveAgentAdapter("claude");
   assert.equal(claude.supportedVersion, "2.1.207");
   assert.equal(claude.capabilities.nativeSessionDiscovery, "preallocated");
+  // Claude fires SessionStart(startup) before the first prompt: pre-input ready.
+  assert.equal(claude.capabilities.preInputReadiness.status, "supported");
+  assert.equal(
+    claude.capabilities.preInputReadiness.nativeEvent,
+    "SessionStart(source=startup)"
+  );
   assert.throws(() => resolveAgentAdapter("unknown"), /unsupported/i);
 });
 

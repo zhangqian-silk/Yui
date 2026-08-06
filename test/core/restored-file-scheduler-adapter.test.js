@@ -358,7 +358,7 @@ test("Leader delivery stall is routed through the existing Operator notification
   assert.equal(operatorMailbox.pending.reasons.includes("leader-run-stalled"), true);
 });
 
-test("accepted Leader delivery records progress/recovery and clears only its stall attention", (t) => {
+test("transport delivery records pushed without provider acceptance", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
   const run = createAgentRun(
     adapter,
@@ -389,21 +389,14 @@ test("accepted Leader delivery records progress/recovery and clears only its sta
     now: deliveredAt
   });
 
-  assert.equal(store.getAgentRun(task.id, run.id).deliveredAt, deliveredAt.toISOString());
+  assert.notEqual(store.getAgentRun(task.id, run.id).pushedAt, undefined);
+  assert.equal(store.getAgentRun(task.id, run.id).deliveredAt, undefined);
   const events = store.listEvents(task.id);
-  const progress = events.filter((event) => (
-    event.type === RUN_PROGRESS_EVENT && event.payload.runId === run.id
-  ));
-  const recovered = events.filter((event) => (
-    event.type === RUN_RECOVERED_EVENT && event.payload.runId === run.id
-  ));
-  assert.equal(progress.length, 1);
-  assert.equal(progress[0].payload.kind, "delivery");
-  assert.equal(progress[0].payload.progressAt, deliveredAt.toISOString());
-  assert.equal(recovered.length, 1);
-  assert.equal(recovered[0].payload.kind, "delivery");
-  assert.equal(isRoleRunStalled(events, run.id), false);
-  assert.equal(store.getOperatorNotification(task.id), null);
+  assert.equal(events.filter((event) => (
+    event.type === "run.pushed" && event.payload.runId === run.id
+  )).length, 1);
+  assert.equal(isRoleRunStalled(events, run.id), true);
+  assert.equal(store.getOperatorNotification(task.id).runId, run.id);
 
   const stateBeforeDuplicate = readFileSync(join(home, "state.json"), "utf8");
   adapter.saveRoleRunDelivery({
@@ -413,18 +406,9 @@ test("accepted Leader delivery records progress/recovery and clears only its sta
     session: null,
     now: new Date(deliveredAt.getTime() + 1_000)
   });
-  assert.equal(
-    store.listEvents(task.id).filter((event) => (
-      event.type === RUN_PROGRESS_EVENT && event.payload.runId === run.id
-    )).length,
-    1
-  );
-  assert.equal(
-    store.listEvents(task.id).filter((event) => (
-      event.type === RUN_RECOVERED_EVENT && event.payload.runId === run.id
-    )).length,
-    1
-  );
+  assert.equal(store.listEvents(task.id).filter((event) => (
+    event.type === "run.pushed" && event.payload.runId === run.id
+  )).length, 1);
   assert.equal(readFileSync(join(home, "state.json"), "utf8"), stateBeforeDuplicate);
 
   store.saveOperatorNotification(createLeaderStallNotification(
@@ -545,6 +529,7 @@ test("native and Controller recovery clear only the matching Leader stall attent
       "continue",
       controllerNow
     ),
+    pushedAt: controllerNow.toISOString(),
     deliveredAt: controllerNow.toISOString()
   };
   assert.equal(controllerAdapter.saveLeaderDispatch({
@@ -661,7 +646,10 @@ test("a busy Leader claim is retried through active Run delivery without another
   const [retried] = await processActiveRoleRunDeliveries(adapter, delivery, now);
   assert.equal(retried.status, "delivered");
   assert.equal(sends, 2);
-  assert.notEqual(store.getActiveAgentRun(task.id, role.name).deliveredAt, undefined);
+  // Transport success records prompt-pushed; acceptance (deliveredAt) awaits an
+  // exact provider-accepted fold, so it stays undefined after the push alone.
+  assert.notEqual(store.getActiveAgentRun(task.id, role.name).pushedAt, undefined);
+  assert.equal(store.getActiveAgentRun(task.id, role.name).deliveredAt, undefined);
 });
 
 test("desired drift does not block a wake delivered to the still-live Leader Session", async (t) => {
@@ -993,7 +981,11 @@ test("a matching Hook proves delivery across the receipt persistence crash windo
   assert.equal(beforeReceipt.acknowledgedEventIds.length, 1);
   assert.equal(beforeReceipt.deferred.length, 0);
   assert.equal(inbox.list().length, 0);
-  assert.notEqual(store.getActiveAgentRun(task.id, role.name).deliveredAt, undefined);
+  // A native turn completion proves the prompt was pushed, not that the provider
+  // accepted it: it records pushedAt, never deliveredAt (only a provider-accepted
+  // fold may do that).
+  assert.notEqual(store.getActiveAgentRun(task.id, role.name).pushedAt, undefined);
+  assert.equal(store.getActiveAgentRun(task.id, role.name).deliveredAt, undefined);
   assert.equal(
     store.getTaskRoleSessionSet(task.id, role.name).pendingTurnCompletion.runId,
     run.id
@@ -1777,7 +1769,8 @@ test("Worker busy retry persists and reuses the hosted native session before del
   const [retried] = await processActiveRoleRunDeliveries(adapter, delivery, now);
   assert.equal(retried.status, "delivered", retried.error);
   assert.equal(store.getRoleSession(task.id, worker.name).nativeSessionId, "hosted-native-b");
-  assert.notEqual(store.getActiveAgentRun(task.id, worker.name).deliveredAt, undefined);
+  assert.notEqual(store.getActiveAgentRun(task.id, worker.name).pushedAt, undefined);
+  assert.equal(store.getActiveAgentRun(task.id, worker.name).deliveredAt, undefined);
 });
 
 test("Worker delivery exhaustion atomically fails the exact Run and queues cleanup plus Leader work", (t) => {
@@ -1993,8 +1986,7 @@ test("runtime native session registration is structured and exited work fails at
     executionRef: { type: "run", taskId: task.id, id: run.id }
   });
   const deliveredAt = new Date(now.getTime() + 1_000).toISOString();
-  store.saveActiveAgentRun({ ...run, deliveredAt });
-  seedLeaderStall(store, task, { ...run, deliveredAt }, now);
+  store.saveActiveAgentRun({ ...run, pushedAt: deliveredAt, deliveredAt });
 
   assert.equal(adapter.saveExitedRoleRun({
     task,
@@ -2084,6 +2076,7 @@ test("reconfirming an already delivered active run does not rewrite authoritativ
     "work",
     now
   );
+  run.pushedAt = now.toISOString();
   run.deliveredAt = now.toISOString();
   store.transaction((tx) => {
     tx.saveRole(task.id, { ...role, status: "running" });
