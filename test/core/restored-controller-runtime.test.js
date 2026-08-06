@@ -1787,6 +1787,31 @@ test("an existing busy Operator gets bounded delivery retries without startup ar
   controller.stop();
 });
 
+test("an unchanged Operator mailbox is not re-signalled by repeated full passes", async () => {
+  const fixture = operatorRuntimeFixture();
+  fixture.store.getOperatorDeliveryTarget = () => null;
+  fixture.enqueue();
+  const claim = fixture.store.claimWorkMailbox;
+  let operatorClaims = 0;
+  fixture.store.claimWorkMailbox = (input) => {
+    if (input.target.kind === "operator") operatorClaims += 1;
+    return claim(input);
+  };
+  const controller = new FileTaskController(fixture.store, noTmux, {
+    signalWindowMs: 1
+  });
+
+  await controller.pump();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await controller.pump();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  // The first full pass arms the Operator lane. The unchanged pending batch
+  // must not create another zero-delay Operator pass on the second full scan.
+  assert.equal(operatorClaims, 1);
+  controller.stop();
+});
+
 test("a dirty Hook fold signals Operator work created after scheduler phases", async () => {
   const fixture = operatorRuntimeFixture();
   let drains = 0;
