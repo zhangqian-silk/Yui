@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { processLeaderWakeups } from "../../dist/scheduler/leaderWakeupProcessor.js";
 import { reconcileExitedRoleRuns } from "../../dist/scheduler/roleRunLiveness.js";
+import { reconcileStalledRoleRuns } from "../../dist/scheduler/roleRunStall.js";
 import { processOperatorInputNotifications } from "../../dist/scheduler/operatorInputNotificationProcessor.js";
 import { repairOrphanedActiveTasks } from "../../dist/scheduler/activeTaskProgress.js";
 import { mergePendingWakeup } from "../../dist/scheduler/pendingWakeup.js";
@@ -379,6 +380,45 @@ test("a delivery-uncertain Run is not failed by liveness in the same pass", asyn
   assert.equal(store.savedExitedRuns.length, 0);
 });
 
+test("full liveness inventory includes delivery-uncertain Runs for the shared stall pass", async () => {
+  const store = fakeStore();
+  store.roles.push(role("worker"));
+  const run = {
+    ...activeRun("agent-run-100", "worker"),
+    createdAt: new Date(NOW.getTime() - 31 * 60_000).toISOString()
+  };
+  store.activeRuns.set(key("task-1", "worker"), run);
+  const delivery = fakeDelivery({ inspect: "present" });
+  const liveStatuses = new Map();
+
+  assert.deepEqual(
+    await reconcileExitedRoleRuns(
+      store,
+      delivery,
+      NOW,
+      undefined,
+      new Set([`task-1/${run.id}`]),
+      liveStatuses
+    ),
+    []
+  );
+  assert.equal(store.savedExitedRuns.length, 0);
+  assert.equal(liveStatuses.get("task-1\0worker"), "present");
+
+  const stalled = await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    NOW,
+    undefined,
+    30 * 60_000,
+    liveStatuses
+  );
+  assert.deepEqual(stalled.map(({ runId, kind }) => ({ runId, kind })), [
+    { runId: run.id, kind: "delivery-stalled" }
+  ]);
+  assert.equal(store.savedExitedRuns.length, 0);
+});
+
 test("a delivery-uncertain local Run id does not fence another Task", async () => {
   const store = fakeStore();
   store.roles.push(role("worker"));
@@ -694,6 +734,7 @@ function fakeStore(options = {}) {
     savedDispatches: [],
     savedFailures: [],
     savedExitedRuns: [],
+    events: [],
     operations: [],
     getPresentationContext: () => ({ timeZone: "Asia/Shanghai" }),
     listTasks: () => store.tasks,
@@ -719,6 +760,7 @@ function fakeStore(options = {}) {
     },
     getLeaderFailure: () => null,
     getOperatorNotification: () => null,
+    listEvents: () => store.events,
     getTaskBrief: () => options.brief ?? null,
     listDecisions: () => options.decisions ?? [],
     listMilestones: () => options.milestones ?? [],
@@ -750,6 +792,18 @@ function fakeStore(options = {}) {
     saveExitedRoleRun: (input) => {
       store.savedExitedRuns.push(input);
       store.activeRuns.delete(key(input.task.id, input.role.name));
+    },
+    recordRoleRunStall: (input) => {
+      store.events.push({
+        type: "run.stalled",
+        createdAt: input.now.toISOString(),
+        payload: {
+          runId: input.runId,
+          progressAt: input.progressAt,
+          evidenceKey: input.evidenceKey
+        }
+      });
+      return "raised";
     }
   };
   return store;

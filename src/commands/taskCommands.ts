@@ -11,7 +11,13 @@ import {
   taskNotFound,
   usageError
 } from "../errors/cliError.js";
-import { createTaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
+import { createTaskEvent, type TaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
+import {
+  clearMatchingLeaderStallAttention,
+  isRoleRunStalled,
+  RUN_PROGRESS_EVENT,
+  RUN_RECOVERED_EVENT
+} from "../scheduler/roleRunStall.js";
 import { readCommandText } from "./textInput.js";
 import {
   createRoleSessionSet,
@@ -2291,6 +2297,7 @@ function taskRunCommand(
   if (command === "list") return output(listRuns(rest, store, options));
   if (command === "retry") return output(retryRun(rest, store, options));
   if (command === "yield") return yieldRun(rest, store, options);
+  if (command === "checkpoint") return output(checkpointRun(rest, store, options));
   throw usageError(command === undefined
     ? "Task run command is required."
     : `Unknown command: task run ${command}`);
@@ -2447,6 +2454,7 @@ function yieldRun(
     const role = requireRole(tx, task.id, active.roleName);
     const pointer = tx.getActiveAgentRun(task.id, role.name);
     if (pointer?.id !== active.id) throw usageError(`Run is not active for ${task.id}/${role.name}: ${active.id}.`);
+    const wasStalled = isRoleRunStalled(tx.listEvents(task.id), active.id);
     let reviewReport;
     if (active.purpose === "review") {
       if (options.reviewWorkspaceResult === undefined) {
@@ -2500,6 +2508,15 @@ function yieldRun(
       now,
       { runId: terminal.id, workItemId: active.workItemId }
     );
+    if (wasStalled) {
+      recordTaskEvent(tx, task.id, RUN_RECOVERED_EVENT, {
+        runId: terminal.id,
+        roleName: role.name,
+        progressAt: now.toISOString(),
+        kind: "yield"
+      }, now);
+    }
+    clearMatchingLeaderStallAttention(tx, task.id, active.id);
     if (active.purpose === "review") {
       const round = active.reviewRoundId === undefined
         ? null
@@ -2603,6 +2620,63 @@ function yieldRun(
       ? {}
       : { reviewRound: yielded.reviewDispatch.round })
   });
+}
+
+/**
+ * Records a structured progress checkpoint for an active Run. This is a durable
+ * run fact, not a Task Message: it advances the Run's durable-progress clock so
+ * a healthy but long-running Run keeps proving it is alive without adding
+ * collaboration-narrative noise. It never yields, mutates the Run, or wakes the
+ * Leader.
+ */
+function checkpointRun(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  const usage = "Task run checkpoint usage: yui task run checkpoint <run> (--note <text>|--note-file <path|->).";
+  const parsed = parseTail(args, new Set(["--note", "--note-file"]), usage);
+  exactPositionals(parsed.positionals, 1, usage);
+  const note = readCommandText(
+    parsed.options.get("--note"),
+    parsed.options.get("--note-file"),
+    "--note",
+    usage
+  );
+  const now = clock(options);
+  const event = store.transaction((tx) => {
+    const run = requireRun(tx, parsed.positionals[0], options);
+    if (run.status !== "active") {
+      throw usageError(`Run ${run.id} is already terminal: ${run.status}.`);
+    }
+    if (run.deliveredAt === undefined) {
+      throw usageError(`Run ${run.id} delivery is still pending.`);
+    }
+    const task = requireTask(tx, run.taskId);
+    if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "checkpointing a run"));
+    const pointer = tx.getActiveAgentRun(task.id, run.roleName);
+    if (pointer?.id !== run.id) {
+      throw usageError(`Run is not active for ${task.id}/${run.roleName}: ${run.id}.`);
+    }
+    const events = tx.listEvents(task.id);
+    const recovered = isRoleRunStalled(events, run.id);
+    const progress = recordTaskEventRecord(tx, task.id, RUN_PROGRESS_EVENT, {
+      runId: run.id,
+      note: truncateEventNote(note),
+      ...(run.workItemId === undefined ? {} : { workItemId: run.workItemId })
+    }, now);
+    if (recovered) {
+      recordTaskEventRecord(tx, task.id, RUN_RECOVERED_EVENT, {
+        runId: run.id,
+        roleName: run.roleName,
+        progressAt: now.toISOString(),
+        kind: "checkpoint"
+      }, now);
+    }
+    clearMatchingLeaderStallAttention(tx, task.id, run.id);
+    return progress;
+  });
+  return `Checkpoint recorded for ${parsed.positionals[0]} (${event.id}).\n`;
 }
 
 export function queueReviewRound(
@@ -2902,7 +2976,11 @@ function appendMessage(
     store.nextMessageId(taskId), taskId, body, kind, author, now, context
   );
   store.saveMessage(taskId, message);
-  recordTaskEvent(store, taskId, "message.sent", { messageId: message.id, kind: message.kind }, now);
+  recordTaskEvent(store, taskId, "message.sent", {
+    messageId: message.id,
+    kind: message.kind,
+    ...(message.runId === undefined ? {} : { runId: message.runId })
+  }, now);
   return message;
 }
 
@@ -2913,9 +2991,25 @@ function recordTaskEvent(
   payload: TaskEventPayload,
   now: Date
 ): void {
-  store.saveEvent(taskId, createTaskEvent(
-    store.nextEventId(taskId), taskId, type, payload, now
-  ));
+  recordTaskEventRecord(store, taskId, type, payload, now);
+}
+
+function recordTaskEventRecord(
+  store: TaskWorkflowStore,
+  taskId: string,
+  type: string,
+  payload: TaskEventPayload,
+  now: Date
+): TaskEvent {
+  const event = createTaskEvent(store.nextEventId(taskId), taskId, type, payload, now);
+  store.saveEvent(taskId, event);
+  return event;
+}
+
+/** Keeps a free-text run-fact note bounded so an event payload stays compact. */
+function truncateEventNote(note: string): string {
+  const normalized = note.trim();
+  return normalized.length <= 280 ? normalized : `${normalized.slice(0, 279)}…`;
 }
 
 function roleLaunchEventPayload(

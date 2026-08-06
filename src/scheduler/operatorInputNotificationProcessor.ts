@@ -2,6 +2,7 @@ import type { InputRequest } from "../input/inputRequest.js";
 import {
   createInputRequestOperatorPresentation,
   createLeaderRecoveryOperatorPresentation,
+  createLeaderStallOperatorPresentation,
   createTaskTerminalOperatorPresentation,
   type OperatorPresentation
 } from "../interaction/operatorPresentation.js";
@@ -22,6 +23,7 @@ type OperatorNotificationOutcome = Readonly<{
 export type OperatorInputNotificationResult =
   | (OperatorNotificationOutcome & Readonly<{ inputRequestId: string }>)
   | (OperatorNotificationOutcome & Readonly<{ recoveryTaskId: string }>)
+  | (OperatorNotificationOutcome & Readonly<{ stallTaskId: string }>)
   | (OperatorNotificationOutcome & Readonly<{ terminalTaskId: string }>);
 
 type PendingOperatorAttention =
@@ -142,16 +144,24 @@ function skipped(
 function attentionIdentity(attention: PendingOperatorAttention):
   | Readonly<{ inputRequestId: string; taskId: string }>
   | Readonly<{ recoveryTaskId: string; taskId: string }>
+  | Readonly<{ stallTaskId: string; taskId: string }>
   | Readonly<{ terminalTaskId: string; taskId: string }> {
   if (attention.kind === "input") {
     return { inputRequestId: attention.request.id, taskId: attention.request.taskId };
   }
-  return attention.notification.type === "leader-recovery-failed"
-    ? {
+  if (attention.notification.type === "leader-recovery-failed") {
+    return {
         recoveryTaskId: attention.notification.taskId,
         taskId: attention.notification.taskId
-      }
-    : {
+      };
+  }
+  if (attention.notification.type === "leader-stalled") {
+    return {
+      stallTaskId: attention.notification.taskId,
+      taskId: attention.notification.taskId
+    };
+  }
+  return {
         terminalTaskId: attention.notification.taskId,
         taskId: attention.notification.taskId
       };
@@ -164,8 +174,11 @@ function createAttentionPresentation(
   if (attention.kind === "input") {
     return createInputRequestOperatorPresentation(attention.request, store.getPresentationContext());
   }
-  return attention.notification.type === "leader-recovery-failed"
-    ? createLeaderRecoveryOperatorPresentation(attention.notification)
+  if (attention.notification.type === "leader-recovery-failed") {
+    return createLeaderRecoveryOperatorPresentation(attention.notification);
+  }
+  return attention.notification.type === "leader-stalled"
+    ? createLeaderStallOperatorPresentation(attention.notification)
     : createTaskTerminalOperatorPresentation(attention.notification);
 }
 
@@ -175,8 +188,10 @@ function deduplicateAttention(
   const seen = new Set<string>();
   return attentions.filter((attention) => {
     const key = attention.kind === "input"
-      ? `input:${attention.request.taskId}/${attention.request.id}`
-      : `${attention.notification.type}:${attention.notification.taskId}:${attention.notification.createdAt}`;
+      ? `input:${attention.request.taskId}:${attention.request.id}`
+      : attention.notification.type === "leader-stalled"
+        ? `stall:${attention.notification.taskId}:${attention.notification.runId}:${attention.notification.progressAt}`
+        : `recovery:${attention.notification.taskId}:${attention.notification.createdAt}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;

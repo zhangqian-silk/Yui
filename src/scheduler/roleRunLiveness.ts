@@ -9,6 +9,8 @@ import { formatTaskRecordReference } from "../task/taskRecordReference.js";
 import { queueLeaderWakeup } from "./wakeupQueue.js";
 
 export const EXITED_ROLE_RUN_SUMMARY = "The role's tmux session exited before the run yielded.";
+export type RoleLiveStatus = "present" | "absent";
+export type RoleLiveStatusSnapshot = ReadonlyMap<string, RoleLiveStatus>;
 
 /**
  * Lightweight liveness only: an active AgentRun whose tmux role is absent is
@@ -22,7 +24,8 @@ export async function reconcileExitedRoleRuns(
   >,
   now: Date,
   selection?: SchedulerReconcileSelection,
-  excludedRunRefs: ReadonlySet<string> = new Set()
+  excludedRunRefs: ReadonlySet<string> = new Set(),
+  liveStatuses?: Map<string, RoleLiveStatus>
 ): Promise<string[]> {
   const failed: string[] = [];
   const candidates = selectedSchedulerTasks(store, selection).flatMap((task) => (
@@ -57,17 +60,19 @@ export async function reconcileExitedRoleRuns(
     !excludedRunRefs.has(formatTaskRecordReference(task.id, run.id, "agentRun"))
     && !completing.has(`${task.id}\0${role.name}\0${run.id}`)
   ));
-  if (eligible.length === 0) return failed;
-  const batch = delivery.inspectRoles === undefined
-    ? null
-    : await delivery.inspectRoles(eligible.map((candidate) => candidate.inspection));
-  const batchStatuses = batch === null
-    ? new Map<string, "present" | "absent">()
-    : exactBatchStatuses(batch, eligible);
+  // Build one complete provider inventory for every active Run, including
+  // delivery-uncertain and completion-pending Runs. The stall phase reuses
+  // this snapshot so one scheduler pass never probes the same pane twice.
+  const batchStatuses = liveStatuses !== undefined
+    && candidates.every(({ task, role }) => liveStatuses.has(`${task.id}\0${role.name}`))
+    ? liveStatuses
+    : await inspectRoleStatuses(delivery, candidates);
+  if (liveStatuses !== undefined) {
+    for (const [key, status] of batchStatuses) liveStatuses.set(key, status);
+  }
   for (const { task, role, run, session, inspection } of eligible) {
-      const status = batch === null
-        ? await delivery.inspectRole(inspection)
-        : batchStatuses.get(`${task.id}\0${role.name}`)!;
+      const status = batchStatuses.get(`${task.id}\0${role.name}`);
+      if (status === undefined) throw new Error("Role liveness snapshot is incomplete.");
       if (status === "present") continue;
 
       const persisted = store.saveExitedRoleRun({
@@ -98,6 +103,38 @@ export async function reconcileExitedRoleRuns(
       }
   }
   return failed;
+}
+
+type RoleRunCandidate = Readonly<{
+  task: ReturnType<typeof selectedSchedulerTasks>[number];
+  role: ReturnType<typeof selectedSchedulerRoles>[number];
+  inspection: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    adapterId: string;
+    nativeSessionId?: string;
+  }>;
+}>;
+
+async function inspectRoleStatuses(
+  delivery: Pick<TmuxDeliveryPort, "inspectRole" | "inspectRoles">,
+  candidates: readonly RoleRunCandidate[]
+): Promise<RoleLiveStatusSnapshot> {
+  if (delivery.inspectRoles !== undefined) {
+    return exactBatchStatuses(
+      await delivery.inspectRoles(candidates.map(({ inspection }) => inspection)),
+      candidates
+    );
+  }
+  const entries: [string, RoleLiveStatus][] = [];
+  for (const candidate of candidates) {
+    entries.push([
+      `${candidate.task.id}\0${candidate.role.name}`,
+      await delivery.inspectRole(candidate.inspection)
+    ]);
+  }
+  return new Map(entries);
 }
 
 function exactBatchStatuses(

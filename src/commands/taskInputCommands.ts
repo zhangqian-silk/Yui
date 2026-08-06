@@ -14,10 +14,15 @@ import {
 } from "../input/inputRequest.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { formatTimestamp } from "../output/timePresentation.js";
-import type { Role } from "../role/role.js";
+import { type Role } from "../role/role.js";
 import type { AgentRun } from "../run/agentRun.js";
 import { enqueueWork } from "../coordination/workMailboxQueue.js";
 import type { MailboxTarget } from "../coordination/workMailbox.js";
+import {
+  clearMatchingLeaderStallAttention,
+  isRoleRunStalled,
+  RUN_RECOVERED_EVENT
+} from "../scheduler/roleRunStall.js";
 import { terminalizeExactTaskRun } from "../lifecycle/exactRunTerminalization.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
@@ -119,6 +124,7 @@ function createRequest(
       { question, choices, blockedRefs, policy },
       now
     );
+    const wasStalled = isRoleRunStalled(tx.listEvents(task.id), origin.run.id);
     tx.saveInputRequest(task.id, created);
     enqueueWork(tx, { kind: "operator" }, "input-requested", now, [
       { type: "input", taskId: task.id, id: created.id },
@@ -143,6 +149,15 @@ function createRequest(
         `Task Leader Run changed while requesting input: ${origin.run.id}/${terminal.reason}.`
       );
     }
+    if (wasStalled) {
+      recordTaskEvent(tx, task.id, RUN_RECOVERED_EVENT, {
+        runId: origin.run.id,
+        roleName: LEADER_ROLE,
+        progressAt: now.toISOString(),
+        kind: "input-request"
+      }, now);
+    }
+    clearMatchingLeaderStallAttention(tx, task.id, origin.run.id);
     recordTaskEvent(tx, task.id, "input.requested", {
       requestId: created.id,
       requesterRunId: created.requester.runId,

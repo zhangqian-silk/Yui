@@ -359,6 +359,25 @@ export function renderOverview(detail, state, t, locale, onSelect) {
   }
   wrap.append(inbox);
 
+  const stalledTasks = (state.tasks || []).filter(function (task) {
+    return (task.needsAttentionCount || 0) > 0;
+  });
+  if (stalledTasks.length) {
+    const stalledBlock = node("section", "overview-block");
+    stalledBlock.append(node("h3", "", t("overview.attention") + " · " + stalledTasks.length));
+    const list = node("div", "overview-list");
+    stalledTasks.forEach(function (task) {
+      list.append(overviewRow(
+        task,
+        task.needsAttentionCount + " " + t("stats.stalledRuns"),
+        "has-inputs",
+        onSelect
+      ));
+    });
+    stalledBlock.append(list);
+    wrap.append(stalledBlock);
+  }
+
   // Active work is the one list worth surfacing next to the inbox; status
   // counts already live in the metric rail, so no distribution panel here.
   const activeTasks = (state.tasks || []).filter(function (task) { return task.status === "active"; });
@@ -487,6 +506,27 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     scaffold.append(anchorSection("detail-attention",
       sectionHead(t("detail.attention"), { count: data.openInputs.length }),
       attentionBody));
+  }
+
+  const stalledRuns = data.runtimeHealth && data.runtimeHealth.needsAttentionRuns
+    ? data.runtimeHealth.needsAttentionRuns
+    : [];
+  if (stalledRuns.length) {
+    const runtimeHealthBody = node("div", "section-body");
+    stalledRuns.forEach(function (run) {
+      const card = node("article", "record-card");
+      card.append(
+        node("strong", "", run.roleName + " · " + run.runId),
+        node("p", "record-copy", (run.kind || "execution-stalled") + " · " + (run.classification || "truly-stalled")),
+        node("small", "", t("detail.lastProgress") + " · " + formatDateTime(run.progressAt, locale))
+      );
+      runtimeHealthBody.append(card);
+    });
+    scaffold.append(anchorSection(
+      "detail-health",
+      sectionHead(t("detail.runtimeHealth"), { count: stalledRuns.length }),
+      runtimeHealthBody
+    ));
   }
 
   // 3. Focus (anchor #detail-focus) — brief + technical approach

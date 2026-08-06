@@ -9,6 +9,7 @@ import { runControllerSchedulerPass } from "../../dist/controller/controller.js"
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
 import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
+import { createTaskEvent } from "../../dist/event/taskEvent.js";
 import { updateRoleAgentSessionStatus } from "../../dist/executor/agentExecutor.js";
 import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import {
@@ -28,6 +29,13 @@ import { createAgentRun as createTestAgentRun } from "../helpers/effectiveLaunch
 import { processActiveRoleRunDeliveries } from "../../dist/scheduler/activeRoleRunDelivery.js";
 import { processLeaderWakeups } from "../../dist/scheduler/leaderWakeupProcessor.js";
 import { processOperatorInputNotifications } from "../../dist/scheduler/operatorInputNotificationProcessor.js";
+import {
+  isRoleRunStalled,
+  reconcileStalledRoleRuns,
+  RUN_PROGRESS_EVENT,
+  RUN_RECOVERED_EVENT
+} from "../../dist/scheduler/roleRunStall.js";
+import { createLeaderStallNotification } from "../../dist/scheduler/operatorNotification.js";
 import { queueLeaderWakeup } from "../../dist/scheduler/wakeupQueue.js";
 import {
   hasRuntimeCleanupObligation,
@@ -81,6 +89,36 @@ function fixture(t) {
   return { home, store, task, role, now, adapter: new FileSchedulerStoreAdapter(store) };
 }
 
+function seedLeaderStall(store, task, run, now) {
+  store.transaction((tx) => {
+    const progressAt = run.createdAt;
+    tx.saveEvent(task.id, createTaskEvent(
+      tx.nextEventId(task.id),
+      task.id,
+      "run.stalled",
+      {
+        runId: run.id,
+        roleName: run.roleName,
+        kind: "execution-stalled",
+        classification: "truly-stalled",
+        progressAt,
+        idleMs: "1800000",
+        evidenceKey: "provider-neutral-test",
+        status: "needs-attention"
+      },
+      now
+    ));
+    tx.saveOperatorNotification(createLeaderStallNotification(
+      task.id,
+      run.id,
+      progressAt,
+      "provider-neutral-test",
+      now,
+      null
+    ));
+  });
+}
+
 function schedulerSession(run, nativeSessionId, status = "ready") {
   return {
     agentId: run.effective.agentId,
@@ -91,7 +129,14 @@ function schedulerSession(run, nativeSessionId, status = "ready") {
   };
 }
 
-function createAgentRun(adapter, ...args) {
+function createAgentRun(adapterOrRunId, ...args) {
+  // Task-7's focused stall tests predate the effective-launch adapter helper;
+  // keep their compact call form while using the current adapter-aware form
+  // for the master lifecycle tests.
+  if (typeof adapterOrRunId === "string") {
+    return createTestAgentRun(adapterOrRunId, ...args);
+  }
+  const adapter = adapterOrRunId;
   const context = args[6] ?? {};
   if (context.effective !== undefined || context.agent !== undefined) {
     return createTestAgentRun(...args);
@@ -253,6 +298,7 @@ function preparedDeliveryFailureFixture(
     }
   };
 }
+
 test("FileSchedulerStoreAdapter commits Leader run, Role and fixed session together", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
   const before = JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision;
@@ -280,6 +326,252 @@ test("FileSchedulerStoreAdapter commits Leader run, Role and fixed session toget
   assert.equal(store.getRole(task.id, role.name).status, "running");
   assert.equal(store.getRoleSession(task.id, role.name).nativeSessionId, "thread-1");
   assert.equal(JSON.parse(readFileSync(join(home, "state.json"), "utf8")).revision, before + 1);
+});
+
+test("Leader delivery stall is routed through the existing Operator notification lane", async (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  const run = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
+  assert.equal(adapter.saveLeaderDispatch({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: null,
+    wakeup: store.getPendingWakeup(task.id),
+    now
+  }), "claimed");
+  const result = await reconcileStalledRoleRuns(
+    adapter,
+    { async inspectRole() { return "present"; } },
+    new Date(now.getTime() + 31 * 60_000),
+    undefined,
+    30 * 60_000
+  );
+  assert.equal(result[0].kind, "delivery-stalled");
+  assert.equal(result[0].classification, "truly-stalled");
+  const stalled = store.listEvents(task.id).find((event) => event.type === "run.stalled");
+  assert.equal(stalled.payload.runId, run.id);
+  assert.equal(stalled.payload.kind, "delivery-stalled");
+  assert.equal(store.getPendingWakeup(task.id), null);
+  assert.equal(store.getOperatorNotification(task.id).type, "leader-stalled");
+  const operatorMailbox = store.getWorkMailbox({ kind: "operator" });
+  assert.equal(operatorMailbox.pending.reasons.includes("leader-run-stalled"), true);
+});
+
+test("accepted Leader delivery records progress/recovery and clears only its stall attention", (t) => {
+  const { home, store, task, role, now, adapter } = fixture(t);
+  const run = createAgentRun(
+    adapter,
+    adapter.peekNextAgentRunId(task.id),
+    task.id,
+    role.name,
+    "new",
+    "continue",
+    now
+  );
+  assert.equal(adapter.saveLeaderDispatch({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: null,
+    wakeup: store.getPendingWakeup(task.id),
+    now
+  }), "claimed");
+  seedLeaderStall(store, task, run, now);
+  assert.equal(isRoleRunStalled(store.listEvents(task.id), run.id), true);
+
+  const deliveredAt = new Date(now.getTime() + 1_000);
+  adapter.saveRoleRunDelivery({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: null,
+    now: deliveredAt
+  });
+
+  assert.equal(store.getAgentRun(task.id, run.id).deliveredAt, deliveredAt.toISOString());
+  const events = store.listEvents(task.id);
+  const progress = events.filter((event) => (
+    event.type === RUN_PROGRESS_EVENT && event.payload.runId === run.id
+  ));
+  const recovered = events.filter((event) => (
+    event.type === RUN_RECOVERED_EVENT && event.payload.runId === run.id
+  ));
+  assert.equal(progress.length, 1);
+  assert.equal(progress[0].payload.kind, "delivery");
+  assert.equal(progress[0].payload.progressAt, deliveredAt.toISOString());
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].payload.kind, "delivery");
+  assert.equal(isRoleRunStalled(events, run.id), false);
+  assert.equal(store.getOperatorNotification(task.id), null);
+
+  const stateBeforeDuplicate = readFileSync(join(home, "state.json"), "utf8");
+  adapter.saveRoleRunDelivery({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: null,
+    now: new Date(deliveredAt.getTime() + 1_000)
+  });
+  assert.equal(
+    store.listEvents(task.id).filter((event) => (
+      event.type === RUN_PROGRESS_EVENT && event.payload.runId === run.id
+    )).length,
+    1
+  );
+  assert.equal(
+    store.listEvents(task.id).filter((event) => (
+      event.type === RUN_RECOVERED_EVENT && event.payload.runId === run.id
+    )).length,
+    1
+  );
+  assert.equal(readFileSync(join(home, "state.json"), "utf8"), stateBeforeDuplicate);
+
+  store.saveOperatorNotification(createLeaderStallNotification(
+    task.id,
+    "agent-run-2",
+    deliveredAt.toISOString(),
+    "newer-run",
+    deliveredAt,
+    null
+  ));
+  adapter.saveRoleRunDelivery({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: null,
+    now: new Date(deliveredAt.getTime() + 2_000)
+  });
+  assert.equal(store.getOperatorNotification(task.id).runId, "agent-run-2");
+});
+
+test("adapter delivery progress ignores a newer Work Item timestamp before acceptance", async (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  const createdAt = new Date(now.getTime() - 60 * 60_000);
+  const item = updateWorkItemStatus(createWorkItem(
+    "work-item-101",
+    task.id,
+    { title: "Delivery boundary" },
+    createdAt
+  ), "running", new Date(now.getTime() - 60_000));
+  const run = createAgentRun(
+    adapter,
+    "agent-run-105",
+    task.id,
+    role.name,
+    "new",
+    "continue",
+    createdAt,
+    { workItemId: item.id }
+  );
+  store.transaction((tx) => {
+    tx.saveWorkItem(task.id, item);
+    tx.saveAgentRun(run);
+    tx.saveActiveAgentRun(run);
+  });
+
+  const progress = adapter.getRunDurableProgress(task.id, role.name, run.id);
+  assert.equal(progress.progressAt, createdAt.toISOString());
+  assert.equal(progress.evidence, "work-review-integration");
+  const result = await reconcileStalledRoleRuns(
+    adapter,
+    { async inspectRole() { return "present"; } },
+    now,
+    undefined,
+    30 * 60_000
+  );
+  assert.equal(result[0].kind, "delivery-stalled");
+});
+
+test("native and Controller recovery clear only the matching Leader stall attention", (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  const run = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
+  assert.equal(adapter.saveLeaderDispatch({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: null,
+    wakeup: store.getPendingWakeup(task.id),
+    now
+  }), "claimed");
+  adapter.saveRoleRunDelivery({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: schedulerSession(run, "thread-native-recovery"),
+    now
+  });
+  seedLeaderStall(store, task, run, now);
+
+  const observed = adapter.observeRuntimeTurnCompleted({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "thread-native-recovery",
+    turnId: "turn-native-recovery",
+    runId: run.id,
+    summary: "native progress"
+  }, now);
+  assert.equal(observed.pendingRunId, run.id);
+  assert.equal(store.getOperatorNotification(task.id), null);
+
+  const duplicate = adapter.observeRuntimeTurnCompleted({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "thread-native-recovery",
+    turnId: "turn-native-recovery",
+    runId: run.id,
+    summary: "native progress"
+  }, now);
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(store.getOperatorNotification(task.id), null);
+
+  const controllerFixture = fixture(t);
+  const controllerStore = controllerFixture.store;
+  const controllerTask = controllerFixture.task;
+  const controllerRole = controllerFixture.role;
+  const controllerAdapter = controllerFixture.adapter;
+  const controllerNow = controllerFixture.now;
+  const controllerRun = {
+    ...createAgentRun(
+      controllerAdapter,
+      controllerAdapter.peekNextAgentRunId(controllerTask.id),
+      controllerTask.id,
+      controllerRole.name,
+      "new",
+      "continue",
+      controllerNow
+    ),
+    deliveredAt: controllerNow.toISOString()
+  };
+  assert.equal(controllerAdapter.saveLeaderDispatch({
+    task: controllerTask,
+    role: controllerAdapter.getRole(controllerTask.id, controllerRole.name),
+    run: controllerRun,
+    session: schedulerSession(controllerRun, "thread-native-recovery"),
+    wakeup: controllerStore.getPendingWakeup(controllerTask.id),
+    now: controllerNow
+  }), "claimed");
+  controllerAdapter.saveRoleRunDelivery({
+    task: controllerTask,
+    role: controllerAdapter.getRole(controllerTask.id, controllerRole.name),
+    run: controllerRun,
+    session: schedulerSession(controllerRun, "thread-native-recovery"),
+    now: controllerNow
+  });
+  seedLeaderStall(controllerStore, controllerTask, controllerRun, controllerNow);
+  assert.equal(controllerAdapter.saveExitedRoleRun({
+    task: controllerTask,
+    role: controllerAdapter.getRole(controllerTask.id, controllerRole.name),
+    run: controllerRun,
+    session: controllerAdapter.getRoleSession(controllerTask.id, controllerRole.name),
+    summary: "controller liveness recovery",
+    now: controllerNow
+  }), "failed");
+  assert.equal(controllerStore.getOperatorNotification(controllerTask.id), null);
+  assert.equal(controllerStore.getActiveAgentRun(controllerTask.id, controllerRole.name), null);
 });
 
 test("Leader dispatch rejects a stale launch configuration snapshot", (t) => {
@@ -1107,6 +1399,87 @@ test("a second Hook waits behind the first grace closure instead of poisoning re
   assert.equal(store.getActiveAgentRun(task.id, role.name), null);
 });
 
+test("native completion failure for a Leader WorkItem clears only matching stall attention", (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  const item = updateWorkItemStatus(createWorkItem(
+    "work-item-102",
+    task.id,
+    { title: "Native failure" },
+    now
+  ), "running", now);
+  const run = createAgentRun(
+    adapter,
+    adapter.peekNextAgentRunId(task.id),
+    task.id,
+    role.name,
+    "new",
+    "continue",
+    now,
+    { workItemId: item.id }
+  );
+  store.transaction((tx) => {
+    tx.saveWorkItem(task.id, item);
+  });
+  assert.equal(adapter.saveLeaderDispatch({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: null,
+    wakeup: store.getPendingWakeup(task.id),
+    now
+  }), "claimed");
+  adapter.saveRoleRunDelivery({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: schedulerSession(run, "thread-native-work-item"),
+    now
+  });
+  seedLeaderStall(store, task, run, now);
+
+  const completedAt = new Date(now.getTime() + 1_000);
+  const completion = adapter.recordRuntimeTurnCompleted({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "thread-native-work-item",
+    turnId: "turn-native-work-item",
+    expectedRunId: run.id,
+    summary: "WorkItem completion did not yield the Run.",
+    origin: "native"
+  }, completedAt);
+
+  assert.equal(completion.finalizedRunId, run.id);
+  assert.equal(store.getAgentRun(task.id, run.id).status, "failed");
+  assert.equal(store.getWorkItem(task.id, item.id).status, "failed");
+  assert.equal(store.getActiveAgentRun(task.id, role.name), null);
+  assert.equal(store.getTaskRoleSessionSet(task.id, role.name).inFlight, null);
+  assert.equal(store.getOperatorNotification(task.id), null);
+
+  store.saveOperatorNotification(createLeaderStallNotification(
+    task.id,
+    "agent-run-2",
+    completedAt.toISOString(),
+    "newer-run",
+    completedAt,
+    null
+  ));
+  const duplicate = adapter.recordRuntimeTurnCompleted({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "thread-native-work-item",
+    turnId: "turn-native-work-item",
+    expectedRunId: run.id,
+    summary: "duplicate completion",
+    origin: "native"
+  }, new Date(completedAt.getTime() + 1_000));
+  assert.equal(duplicate.finalizedRunId, undefined);
+  assert.equal(store.getOperatorNotification(task.id).runId, "agent-run-2");
+});
+
 test("a quiescent result-driven Leader Turn is recovered instead of inferring Task completion", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
   store.transaction((tx) => {
@@ -1620,6 +1993,7 @@ test("runtime native session registration is structured and exited work fails at
   });
   const deliveredAt = new Date(now.getTime() + 1_000).toISOString();
   store.saveActiveAgentRun({ ...run, deliveredAt });
+  seedLeaderStall(store, task, { ...run, deliveredAt }, now);
 
   assert.equal(adapter.saveExitedRoleRun({
     task,
@@ -1636,11 +2010,22 @@ test("runtime native session registration is structured and exited work fails at
   assert.equal(store.getWorkItem(task.id, item.id).status, "failed");
   assert.equal(store.getRole(task.id, role.name).status, "exited");
   assert.equal(store.getRoleSession(task.id, role.name).status, "stopped");
+  assert.equal(store.getOperatorNotification(task.id), null);
   assert.equal(
     store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: role.name }).processing,
     null
   );
   assert.ok(store.getPendingWakeup(task.id).reasons.includes("leader-run-failed"));
+
+  assert.equal(adapter.saveExitedRoleRun({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: adapter.getRoleSession(task.id, role.name),
+    summary: "duplicate pane absence",
+    now
+  }), "state-changed");
+  assert.equal(store.getOperatorNotification(task.id), null);
 
   const replacement = createAgentRun(adapter,
     "agent-run-102",
@@ -1667,6 +2052,14 @@ test("runtime native session registration is structured and exited work fails at
     now,
     executionRef: { type: "run", taskId: task.id, id: replacement.id }
   });
+  store.saveOperatorNotification(createLeaderStallNotification(
+    task.id,
+    replacement.id,
+    replacement.createdAt,
+    "newer-run",
+    now,
+    null
+  ));
 
   assert.equal(adapter.saveExitedRoleRun({
     task,
@@ -1677,6 +2070,7 @@ test("runtime native session registration is structured and exited work fails at
     now
   }), "state-changed");
   assert.equal(store.getActiveAgentRun(task.id, role.name).id, replacement.id);
+  assert.equal(store.getOperatorNotification(task.id).runId, replacement.id);
 });
 
 test("reconfirming an already delivered active run does not rewrite authoritative state", (t) => {

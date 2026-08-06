@@ -40,6 +40,26 @@ workspace, validation, and return protocol.
   Leader approves, continue only after a new dispatch names the expanded
   writable Project set.
 
+## Hand off the useful conclusion
+
+Your Task Message or Run yield is a collaboration summary, not a transcript.
+Choose information by the next reader's likely judgment or action. For an
+implementation handoff, lead with the user-visible behavior and explain the
+important mechanism, boundary, tradeoff, evidence, and residual risk; point to
+WorkItem/Run/Review/check records instead of pasting logs or a file-by-file
+diff. When acting as Reviewer or Tester, report the concrete finding or
+disposition, minimal reproduction or evidence reference, impact, regression
+boundary, and verification gap. Do not turn routine dispatch, attach,
+heartbeat, tool/resource sampling, waiting, or repeated no-change checks into
+Task Messages. Do not follow a fixed four-part template or fixed title,
+field, section, or character limit: adapt the abstraction and amount of detail
+to the recipient, and produce one summary for one semantic event.
+
+For a healthy long Run, use the supported structured checkpoint path
+(`yui task run checkpoint <run> --note-file -`) when there is real semantic
+progress; the checkpoint is runtime evidence and does not replace the final
+yield summary.
+
 ## Native subagent
 
 A native subagent inherits the Leader Agent and ignores Task Role Agent

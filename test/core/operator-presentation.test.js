@@ -5,6 +5,7 @@ import { createInputRequest } from "../../dist/input/inputRequest.js";
 import {
   createInputRequestOperatorPresentation,
   createLeaderRecoveryOperatorPresentation,
+  createLeaderStallOperatorPresentation,
   createTaskTerminalOperatorPresentation
 } from "../../dist/interaction/operatorPresentation.js";
 
@@ -142,6 +143,32 @@ test("Leader recovery failure is an attention-only Operator presentation", () =>
   assert.match(presentation.text, /yui jobs list/);
   assert.match(presentation.text, /yui jobs retry leader-recovery:task-3/);
   assert.doesNotMatch(presentation.text, /yui job show/);
+});
+test("Leader stall keeps the exact Run and semantic progress evidence in Operator attention", () => {
+  const presentation = createLeaderStallOperatorPresentation({
+    schemaVersion: 1,
+    taskId: "task-3",
+    type: "leader-stalled",
+    message: "Leader Run agent-run-9 is truly stalled.",
+    runId: "agent-run-9",
+    progressAt: CREATED_AT.toISOString(),
+    classification: "truly-stalled",
+    evidenceKey: "execution-stalled:mailbox-pending",
+    createdAt: CREATED_AT.toISOString(),
+    updatedAt: CREATED_AT.toISOString()
+  });
+  assert.equal(presentation.category, "attention");
+  assert.equal(
+    presentation.receiptId,
+    `leader-stall:task-3:agent-run-9:${CREATED_AT.toISOString()}`
+  );
+  assert.deepEqual(presentation.source, {
+    kind: "leader-stall",
+    id: `agent-run-9:${CREATED_AT.toISOString()}`
+  });
+  assert.match(presentation.text, /truly stalled/i);
+  assert.match(presentation.text, /agent-run-9/);
+  assert.match(presentation.text, /no automatic Enter, reset, retry, kill/i);
 });
 
 test("Task terminal delivery is informational and includes the durable outcome", () => {

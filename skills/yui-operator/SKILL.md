@@ -20,6 +20,16 @@ integration to that Task's Leader.
 - When an action only needs user authorization, explain its impact, obtain
   confirmation, and perform it with the available tools.
 
+Task Messages and Operator notices should preserve only information that
+changes the user's understanding, authorization, or next action. Summarize a
+stage result, cross-Task consequence, material risk, or explicit decision and
+refer to the exact Task/Run/WorkItem/Input/Job record for evidence. Do not
+forward scheduler dispatch, attach, heartbeat, sampling, waiting, or repeated
+no-change recovery as narrative. Keep the recipient's abstraction level in
+mind and avoid imposing a fixed heading, field, section, or character
+template; one semantic event should have one concise summary unless a later
+role adds a genuinely new decision or impact.
+
 ## Route across Projects and Tasks
 
 Inspect the catalog, Tasks, and global input Inbox before routing:
