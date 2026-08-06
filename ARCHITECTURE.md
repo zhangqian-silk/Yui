@@ -222,10 +222,15 @@ structural JSON damage: an unparseable `state.json`, a container whose shape doe
 not match its locator, or a record with a missing/invalid `schemaVersion`.
 
 `yui upgrade` is the transactional storage-migration entry point. Execute mode
-places an **admission fence** honored at the single storage write choke point,
-so both baseline CLI writers and the Controller (which mutate through the same
-store) refuse to begin a new write while an upgrade owns the home; the fencing
-process itself is exempt. **Fence acquisition is a single atomic
+places an **admission fence** honored at every authoritative write choke point,
+so baseline CLI writers, the Controller (which mutate through the same store),
+AND the durable runtime-inbox publish path all refuse to begin a new write while
+an upgrade owns the home; the fencing process itself is exempt. The inbox
+`publish` calling the same `assertHomeWritable` fence gate closes the
+quiesce→switch TOCTOU (decision-13): once an upgrade has proven the inbox empty,
+a late native-hook enqueue is refused with a structured `UpgradeFenceError` (the
+hook backs off and re-delivers after the upgrade) rather than being silently
+dropped by the imminent whole-home switch. **Fence acquisition is a single atomic
 `O_CREAT|O_EXCL` create** — the kernel guarantees exactly one of any number of
 concurrent upgraders wins that create, so there is no check-then-write window in
 which two upgraders both believe they acquired; a loser either re-enters (it
@@ -261,9 +266,13 @@ committed `*.json` events, in-progress `.tmp-*` writes, and quarantined
 would quarantine as a side effect, so the check never mutates the source; an
 unreadable inbox directory fails closed. This matters because the no-Controller
 / stale-event path reaches quiesce with inbox entries still on disk, and an
-atomic switch must never silently drop them. It then re-pins the committed
-revision under the write lock after the drain (avoiding a check-then-migrate
-race), migrates the immutable source into a fresh staged home, validates it
+atomic switch must never silently drop them. The window between this read-only
+proof and the switch is itself closed by the inbox `publish` fence gate above (a
+late enqueue during the fence is refused, not silently written), so the emptiness
+established here cannot be quietly violated before the switch. It then re-pins the
+committed revision under the write lock after the drain (avoiding a
+check-then-migrate race), migrates the immutable source into a fresh staged home,
+validates it
 through the real `FileTaskStore` loader gate (record parse + reference graph),
 then atomically switches into place with a timestamped backup and a post-switch
 health check. Any blocked or failed step leaves the authoritative home
@@ -369,11 +378,17 @@ never trusted.
 
 **A success envelope is required before any outcome is trusted.** Every
 interpretation of a spawned staged-binary result first requires a valid
-`{ ok: true, data: <object> }` success envelope (R3-F3); an `ok:false` error
-envelope, a non-object `data`, unparseable output, a kill, or a transport error
-is unresolved — preflight treats it as **blocked**, activation as **ambiguous**,
-and a version probe as "no version". Only then does the outcome/exit consistency
-rule apply: a *success-class* outcome (`upgraded`, `already-current`, or a
+`{ ok: true, data: <object> }` success envelope (R3-F3). The parser guards the
+top-level shape *before* reading any field: a body that parses to `null`, an
+array, or a primitive (`JSON.parse("null")`/`"[]"`/`"5"` all succeed) is rejected
+as no-envelope rather than crashing on a `.ok` access (R4-F1); likewise an
+`ok:false` error envelope, a non-object `data`, unparseable output, a kill, or a
+transport error is unresolved — preflight treats it as **blocked**, activation as
+**ambiguous**, and a version probe as "no version". The `runUpdate` orchestrator
+also wraps the preflight/activation port calls so an unexpected throw becomes a
+blocked preflight / ambiguous activation, never an uncaught error that could hide
+a committed switch. Only then does the outcome/exit consistency rule apply: a
+*success-class* outcome (`upgraded`, `already-current`, or a
 `dry-run`/`already-current` preflight) is trusted **only when the process also
 exited 0**. A contradiction — stdout says `upgraded` but the process exited
 non-zero — means the child's own contract was violated mid-flight, so it is
@@ -391,8 +406,11 @@ non-zero on unhealthy storage, so keying off the exit first would reduce a preci
 Storage is healthy only when ALL hold: a valid `{ ok: true, data: { checks,
 storage } }` success envelope, **every expected storage check present exactly once
 and `ok`** (a missing, duplicated, or malformed check fails closed — the `healthy`
-flag is never trusted over the authoritative checks array, R3-F2),
-`storage.healthy === true` with no blocking checks, AND exit 0. A parseable-
+flag is never trusted over the authoritative checks array, R3-F2), a
+`storage.blocking` that is **a well-formed array of check-shaped objects** (a
+missing field, a non-array value, or a malformed element fails closed rather than
+being silently coerced to an empty array, R4-F2), `storage.healthy === true` with
+no blocking checks, AND exit 0. A parseable-
 but-unhealthy result (typically exit 5) throws a precise, recovery-oriented
 blocker; an unparseable, non-success, or self-contradictory envelope (e.g.
 `healthy: true` alongside a non-`ok` storage check, or `ok: false`) fails closed —

@@ -97,7 +97,12 @@ both the runtime-lifecycle mailboxes AND the durable runtime inbox
 `drain-incomplete`, so authoritative not-yet-applied events are never dropped by a
 switch), re-pins the committed revision under the write lock, migrates into a
 fresh staged home, validates it, then atomically switches into place with a
-timestamped backup and a post-switch health check. **Fence acquisition is a
+timestamped backup and a post-switch health check. The admission fence is honored
+not only by the CLI/Controller store-commit path but also by the **durable runtime
+inbox `publish`**: while an upgrade holds the fence, a late native-hook enqueue is
+refused with an explicit `UpgradeFenceError` (the hook backs off and re-delivers
+after the upgrade) instead of being silently lost by the imminent whole-home
+switch — closing the quiesce→switch race. **Fence acquisition is a
 single atomic file create**, so two concurrent upgraders never both acquire —
 exactly one wins and the other fails closed. A provably-dead owner's stale fence
 is reclaimed, but the reclaim is an **atomic compare-and-delete** (it removes only

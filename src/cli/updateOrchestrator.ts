@@ -189,7 +189,22 @@ export function runUpdate(
 
   try {
     // 2) Preflight — the staged binary inspects the Home read-only; no switch.
-    const preflight = ports.preflight(staged, home);
+    // A preflight port that throws unexpectedly (e.g. an I/O fault) is not a safe
+    // green light: treat it as a blocked preflight (recoverable, no switch) rather
+    // than letting the exception escape (R4-F1).
+    let preflight: UpdatePreflight;
+    try {
+      preflight = ports.preflight(staged, home);
+    } catch (error) {
+      return {
+        outcome: "aborted",
+        phase: "preflight",
+        message: `Preflight failed unexpectedly: ${messageOf(error)}`,
+        action: "The current install and Home are unchanged. Investigate the staged binary and retry.",
+        recoverable: true,
+        version: staged.version
+      };
+    }
     if (preflight.status === "blocked") {
       return {
         outcome: "aborted",
@@ -206,8 +221,22 @@ export function runUpdate(
       return activateAndVerify(ports, staged, home, undefined);
     }
 
-    // 3) Activate storage — recoverable: atomic switch + timestamped backup.
-    const activation = ports.activateStorage(staged, home);
+    // 3) Activate storage — recoverable: atomic switch + timestamped backup. An
+    // activation port that throws unexpectedly may have committed the switch
+    // before failing, so its state is UNKNOWN — resolve it as ambiguous from the
+    // durable on-disk evidence, never let the exception escape as a false clean
+    // failure (R4-F1 / P1-2).
+    let activation: StorageActivation;
+    try {
+      activation = ports.activateStorage(staged, home);
+    } catch (error) {
+      return resolveAmbiguousActivation(
+        ports,
+        staged,
+        home,
+        `the activation step threw unexpectedly: ${messageOf(error)}`
+      );
+    }
     if (activation.status === "blocked") {
       return {
         outcome: "aborted",

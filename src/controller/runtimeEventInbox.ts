@@ -18,6 +18,8 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
+import { assertHomeWritable } from "../storage/upgradeFence.js";
+
 export const MAX_RUNTIME_TURN_SUMMARY_BYTES = 32 * 1024;
 export const MAX_CLAUDE_HOOK_TEXT_BYTES = 4 * 1024 * 1024;
 export const MAX_RUNTIME_EVENT_FILE_BYTES = 16 * 1024 * 1024;
@@ -191,6 +193,17 @@ export class FileRuntimeEventInbox {
   private publish<TEvent extends RuntimeLifecycleEvent>(
     event: TEvent
   ): RuntimeEventEnqueueResult<TEvent> {
+    // Honor the upgrade admission fence at the durable-inbox write choke point
+    // (R4-F3 / decision-13). An in-progress `yui upgrade`/`yui update` quiesces by
+    // proving the inbox empty and then atomically switching the whole Home; a late
+    // native-hook enqueue after that proof but before the switch would be silently
+    // lost. Refusing the write while a live foreign fence holds the Home closes
+    // that TOCTOU: the caller (the hook) gets an explicit `UpgradeFenceError` and
+    // backs off, so the authoritative event is never silently dropped — it is
+    // blocked and can be re-delivered after the upgrade finishes. This mirrors the
+    // same fence check the FileTaskStore commit path enforces, and is a no-op when
+    // no upgrade is running (the normal hook path is unaffected).
+    assertHomeWritable(this.home);
     const content = `${JSON.stringify(event)}\n`;
     if (Buffer.byteLength(content, "utf8") > MAX_RUNTIME_EVENT_FILE_BYTES) {
       throw new RuntimeEventInboxError(

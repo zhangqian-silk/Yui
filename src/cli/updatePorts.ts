@@ -365,14 +365,23 @@ function parseSuccessEnvelopeData(
 ): Record<string, unknown> | null {
   if (result.error !== undefined) return null;
   if (result.signal !== null || result.status === null) return null;
-  let envelope: Record<string, unknown>;
+  let parsed: unknown;
   try {
     const text = result.stdout.toString("utf8").trim();
     if (text.length === 0) return null;
-    envelope = JSON.parse(text) as Record<string, unknown>;
+    parsed = JSON.parse(text) as unknown;
   } catch {
     return null;
   }
+  // The top-level value must be a real object — never `null`, an array, or a
+  // primitive. `JSON.parse("null")`/`"[]"`/`"5"` all parse successfully but are
+  // not valid envelopes, and reading `.ok` off `null` would throw (R4-F1); guard
+  // the shape first so a malformed child result becomes a clean `null` (which the
+  // caller maps to blocked/ambiguous) rather than an uncaught TypeError.
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return null;
+  }
+  const envelope = parsed as Record<string, unknown>;
   // Require a success envelope: ok === true and a real data object. A `{ ok:false }`
   // error envelope, or one with a non-object `data`, is never a success (R3-F3).
   if (envelope.ok !== true) return null;
@@ -490,9 +499,11 @@ function describe(data: Record<string, unknown> | undefined): string {
  * closed — an unverifiable health check must never pass silently.
  */
 function assertDoctorStorageHealthy(result: SpawnSyncReturns<Buffer>): void {
-  // 1) Envelope must be a parseable success envelope. A spawn transport error,
-  // kill, missing exit code, empty/garbage stdout, or `ok !== true` is
-  // unverifiable -> fail closed.
+  // 1) Envelope must be a parseable `{ ok:true, data:<object> }` success envelope.
+  // A spawn transport error, kill, missing exit code, empty/garbage stdout, a
+  // top-level `null`/array/primitive, or `ok !== true` is unverifiable -> fail
+  // closed. Shared with the update ports' parser so `null`/primitive envelopes
+  // can never crash the check (R4-F1).
   if (result.error !== undefined || result.signal !== null || result.status === null) {
     throw doctorUnverifiable(
       result.signal !== null
@@ -502,17 +513,10 @@ function assertDoctorStorageHealthy(result: SpawnSyncReturns<Buffer>): void {
           : "the doctor process terminated without an exit code"
     );
   }
-  let envelope: Record<string, unknown> | null;
-  try {
-    const text = result.stdout.toString("utf8").trim();
-    envelope = text.length === 0 ? null : (JSON.parse(text) as Record<string, unknown>);
-  } catch {
-    envelope = null;
-  }
-  if (envelope === null || envelope.ok !== true || typeof envelope.data !== "object" || envelope.data === null) {
+  const data = parseSuccessEnvelopeData(result);
+  if (data === null) {
     throw doctorUnverifiable("the activated binary's `doctor` did not return a parseable success envelope");
   }
-  const data = envelope.data as Record<string, unknown>;
   const storage = data.storage as { healthy?: unknown; blocking?: unknown } | undefined;
   const checks = Array.isArray(data.checks) ? (data.checks as Record<string, unknown>[]) : null;
   if (storage === undefined || typeof storage.healthy !== "boolean" || checks === null) {
@@ -555,14 +559,35 @@ function assertDoctorStorageHealthy(result: SpawnSyncReturns<Buffer>): void {
   // The blocking (non-ok) storage checks, from the now-complete authoritative set.
   const storageChecks = expectedNames.map((name) => (byName.get(name) as Record<string, unknown>[])[0]);
   const blockingChecks = storageChecks.filter((c) => c.status !== "ok");
-  const declaredBlocking = Array.isArray(storage.blocking)
-    ? (storage.blocking as Record<string, unknown>[])
-    : [];
+
+  // `storage.blocking` MUST be a well-formed array of check-shaped objects (R4-F2).
+  // A missing field, a non-array value (e.g. a string), or a malformed element is
+  // an incomplete/unknown doctor result — fail closed rather than silently coerce
+  // it to an empty array (which would let an unverifiable result read as healthy).
+  if (!Array.isArray(storage.blocking)) {
+    throw doctorUnverifiable(
+      "the doctor result's storage.blocking is missing or not an array; the storage-health "
+        + "result is incomplete and cannot be trusted"
+    );
+  }
+  const declaredBlocking = storage.blocking as unknown[];
+  const malformedDeclared = declaredBlocking.filter((entry) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return true;
+    const record = entry as Record<string, unknown>;
+    return typeof record.name !== "string" || typeof record.status !== "string";
+  });
+  if (malformedDeclared.length > 0) {
+    throw doctorUnverifiable(
+      `the doctor result's storage.blocking has ${malformedDeclared.length} malformed entr(ies) `
+        + "(each must be an object with string name/status); refusing to trust an unverifiable result"
+    );
+  }
+  const declaredBlockingChecks = declaredBlocking as Record<string, unknown>[];
 
   // 3) Contradiction guard: `healthy: true` must agree with the checks. If it
   // claims healthy yet a storage check is non-ok (or it declares blocking checks),
   // the result is self-contradictory -> fail closed rather than trust the flag.
-  if (storage.healthy === true && (blockingChecks.length > 0 || declaredBlocking.length > 0)) {
+  if (storage.healthy === true && (blockingChecks.length > 0 || declaredBlockingChecks.length > 0)) {
     throw doctorUnverifiable(
       "the doctor result is self-contradictory (reports healthy storage yet lists a non-ok "
         + "storage check); refusing to trust it"
@@ -570,8 +595,8 @@ function assertDoctorStorageHealthy(result: SpawnSyncReturns<Buffer>): void {
   }
 
   // 4) Unhealthy (typically a deliberate non-zero exit): a precise blocker.
-  if (storage.healthy !== true || blockingChecks.length > 0 || declaredBlocking.length > 0) {
-    const detail = [...blockingChecks, ...declaredBlocking]
+  if (storage.healthy !== true || blockingChecks.length > 0 || declaredBlockingChecks.length > 0) {
+    const detail = [...blockingChecks, ...declaredBlockingChecks]
       .map((c) => `${String(c.name)}=${String(c.status)} (${String(c.detail)})`)
       .join("; ");
     throw runtimeError(
