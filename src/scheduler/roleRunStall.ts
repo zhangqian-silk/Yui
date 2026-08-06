@@ -147,10 +147,16 @@ export function projectRoleRunHealth(input: Readonly<{
     && (input.resource?.active === true || input.resource?.changed === true);
   const waitingUser = input.waitingUser === true;
   const waitingOnWorkers = input.waitingOnWorkers === true && !input.staleLeaderMailbox;
+  // A TmuxSessionHost binding may intentionally be opaque and therefore have
+  // no persisted nativeSessionId.  With a present host, durable no-progress
+  // evidence is still actionable in that case.  Only an explicit stopped or
+  // broken Session blocks the projection; identity mismatches are fenced by
+  // reconcileStalledRoleRuns below before this projection is routed.
   const executionStall = candidate
     && evaluation.stalled
     && hostLiveness === "present"
-    && nativeSession === "matching"
+    && nativeSession !== "stopped"
+    && nativeSession !== "broken"
     && providerAcceptance !== "ambiguous"
     && !resourceActivity;
   const stalled = executionStall

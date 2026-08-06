@@ -122,6 +122,61 @@ test("resource activity cannot make an unknown host or native Session healthy", 
   assert.equal(projection.nativeSession, "missing");
 });
 
+test("an opaque SessionHost binding still routes a stalled accepted Run", async () => {
+  const store = stallStore({ session: null });
+  let inspected;
+  const result = await reconcileStalledRoleRuns(
+    store,
+    {
+      async inspectRole(input) {
+        inspected = input;
+        return "present";
+      }
+    },
+    NOW,
+    undefined,
+    30 * 60_000
+  );
+
+  assert.equal(result[0]?.kind, "execution-stalled");
+  assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 1);
+  assert.equal("nativeSessionId" in inspected, false);
+});
+
+test("stopped, broken, and identity-mismatched Sessions remain fail-closed", async () => {
+  for (const session of [
+    {
+      agentId: "agent-1",
+      adapterId: "codex",
+      nativeSessionId: "native-1",
+      status: "stopped"
+    },
+    {
+      agentId: "agent-1",
+      adapterId: "codex",
+      nativeSessionId: "native-1",
+      status: "broken"
+    },
+    {
+      agentId: "other-agent",
+      adapterId: "codex",
+      nativeSessionId: "native-1",
+      status: "running"
+    }
+  ]) {
+    const store = stallStore({ session });
+    const result = await reconcileStalledRoleRuns(
+      store,
+      { async inspectRole() { return "present"; } },
+      NOW,
+      undefined,
+      30 * 60_000
+    );
+    assert.deepEqual(result, [], `unexpected stall for ${session.status}`);
+    assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 0);
+  }
+});
+
 test("an accepted live Run younger than ten minutes is not a stall candidate", async () => {
   const deliveredAt = new Date(NOW.getTime() - 5 * 60_000).toISOString();
   const store = stallStore({ createdAt: deliveredAt, deliveredAt });
@@ -315,13 +370,15 @@ function stallStore(options = {}) {
     updatedAt: createdAt,
     workItemId: "work-1"
   };
-  const session = {
-    agentId: role.activeAgentId,
-    adapterId: role.adapterId,
-    nativeSessionId: "native-1",
-    status: "running",
-    updatedAt: PROGRESS
-  };
+  const session = options.session === null
+    ? null
+    : options.session ?? {
+        agentId: role.activeAgentId,
+        adapterId: role.adapterId,
+        nativeSessionId: "native-1",
+        status: "running",
+        updatedAt: PROGRESS
+      };
   const downstreamRole = {
     ...role,
     name: "worker",
@@ -356,9 +413,10 @@ function stallStore(options = {}) {
       return this.runs.find((candidate) => candidate.roleName === name) ?? null;
     },
     getRoleSession(_taskId, name) {
-      return name === "worker" && options.downstream
-        ? { ...this.session, agentId: "agent-worker" }
-        : this.session;
+      if (name === "worker" && options.downstream && this.session !== null) {
+        return { ...this.session, agentId: "agent-worker" };
+      }
+      return this.session;
     },
     hasOpenInputRequest() { return options.openInput === true; },
     getWorkMailbox() { return { pending: null }; },
