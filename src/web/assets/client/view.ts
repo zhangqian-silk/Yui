@@ -91,7 +91,7 @@ function chipRow(label, values, activeValue) {
 function criteriaList(label, items) {
   const list = (items || []).filter(Boolean);
   if (!list.length) return null;
-  const block = node("div", "record-block");
+  const block = node("div", "record-block is-wide");
   block.append(node("small", "", label));
   const listElement = node("ul", "criteria-list");
   list.forEach(function (item) { listElement.append(node("li", "", item)); });
@@ -191,32 +191,48 @@ function answerSummary(input, t, locale) {
 }
 
 export function renderFilters(container, state, t, onFilter) {
-  clear(container);
+  const counts = state.counts || {};
   // Single-row status chip row: every status is visible at once with its count,
   // so the user can switch filters without opening a dropdown. The row never
   // wraps; on narrow widths it scrolls horizontally.
-  const counts = state.counts || {};
-  const row = node("div", "filter-row");
-  statuses.forEach(function (status) {
-    const btn = node("button", "filter-chip");
-    btn.type = "button";
-    btn.dataset.status = status;
-    if (status !== "all") {
-      const dot = node("span", "filter-dot");
-      dot.classList.add(status);
-      btn.append(dot);
-    }
-    btn.append(document.createTextNode(translatedStatus(t, "status", status)));
-    if (state.filter === status) btn.classList.add("is-active");
-    const count = status === "all" ? counts.total : counts[status];
-    if (count !== undefined && count !== null) {
-      const badge = node("span", "filter-count", String(count));
+  //
+  // The row and its chips are created once and reused across renders so that
+  // switching filters does not reset the row's horizontal scroll position.
+  let row = container.querySelector(":scope > .filter-row");
+  if (!row) {
+    row = node("div", "filter-row");
+    statuses.forEach(function (status) {
+      const btn = node("button", "filter-chip");
+      btn.type = "button";
+      btn.dataset.status = status;
+      if (status !== "all") {
+        const dot = node("span", "filter-dot");
+        dot.classList.add(status);
+        btn.append(dot);
+      }
+      btn.append(document.createTextNode(translatedStatus(t, "status", status)));
+      const badge = node("span", "filter-count");
       btn.append(badge);
+      btn.addEventListener("click", function () { onFilter(status); });
+      row.append(btn);
+    });
+    container.append(row);
+  }
+  statuses.forEach(function (status) {
+    const btn = row.querySelector('.filter-chip[data-status="' + status + '"]');
+    if (!btn) return;
+    btn.classList.toggle("is-active", state.filter === status);
+    const count = status === "all" ? counts.total : counts[status];
+    const badge = btn.querySelector(".filter-count");
+    if (badge) {
+      if (count !== undefined && count !== null) {
+        badge.textContent = String(count);
+        badge.hidden = false;
+      } else {
+        badge.hidden = true;
+      }
     }
-    btn.addEventListener("click", function () { onFilter(status); });
-    row.append(btn);
   });
-  container.append(row);
 }
 
 function taskGroupOf(task, attentionIds) {
@@ -342,6 +358,25 @@ export function renderOverview(detail, state, t, locale, onSelect) {
     inbox.append(list);
   }
   wrap.append(inbox);
+
+  const stalledTasks = (state.tasks || []).filter(function (task) {
+    return (task.needsAttentionCount || 0) > 0;
+  });
+  if (stalledTasks.length) {
+    const stalledBlock = node("section", "overview-block");
+    stalledBlock.append(node("h3", "", t("overview.attention") + " · " + stalledTasks.length));
+    const list = node("div", "overview-list");
+    stalledTasks.forEach(function (task) {
+      list.append(overviewRow(
+        task,
+        task.needsAttentionCount + " " + t("stats.stalledRuns"),
+        "has-inputs",
+        onSelect
+      ));
+    });
+    stalledBlock.append(list);
+    wrap.append(stalledBlock);
+  }
 
   // Active work is the one list worth surfacing next to the inbox; status
   // counts already live in the metric rail, so no distribution panel here.
@@ -473,6 +508,27 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
       attentionBody));
   }
 
+  const stalledRuns = data.runtimeHealth && data.runtimeHealth.needsAttentionRuns
+    ? data.runtimeHealth.needsAttentionRuns
+    : [];
+  if (stalledRuns.length) {
+    const runtimeHealthBody = node("div", "section-body");
+    stalledRuns.forEach(function (run) {
+      const card = node("article", "record-card");
+      card.append(
+        node("strong", "", run.roleName + " · " + run.runId),
+        node("p", "record-copy", (run.kind || "execution-stalled") + " · " + (run.classification || "truly-stalled")),
+        node("small", "", t("detail.lastProgress") + " · " + formatDateTime(run.progressAt, locale))
+      );
+      runtimeHealthBody.append(card);
+    });
+    scaffold.append(anchorSection(
+      "detail-health",
+      sectionHead(t("detail.runtimeHealth"), { count: stalledRuns.length }),
+      runtimeHealthBody
+    ));
+  }
+
   // 3. Focus (anchor #detail-focus) — brief + technical approach
   const focusBody = node("div", "section-body");
   if (data.brief) {
@@ -527,8 +583,9 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
       head.append(pill(t, "review", round.status));
       card.append(head);
       const meta = node("div", "record-meta");
-      meta.append(node("span", "", round.reviewerRoleName));
+      meta.append(node("span", "meta-name", round.reviewerRoleName));
       meta.append(node("span", "mono", round.workItemId + " · " + round.candidateId));
+      if (round.createdAt) meta.append(node("time", "", formatDateTime(round.createdAt, locale)));
       meta.append(node("span", "", t("detail.reviewBase") + " · " + round.reviewBaseCommit));
       if (round.workspace && round.workspace.root) {
         meta.append(pathMetaItem(t("detail.workspace"), round.workspace.root));
@@ -641,7 +698,7 @@ function inputCard(input, _options, t, locale, actions) {
 }
 
 function workItemCard(item, titles, t, locale, actions, _taskId) {
-  const card = node("article", "record-card");
+  const card = node("article", "record-card work-item-card");
   const head = node("div", "record-head");
   const titleRow = node("div", "record-title-row");
   titleRow.append(statusDot(item.status), node("strong", "record-title", item.title));
@@ -652,27 +709,37 @@ function workItemCard(item, titles, t, locale, actions, _taskId) {
   card.append(head);
 
   const meta = node("div", "record-meta");
-  if (item.assignee) meta.append(node("span", "", item.assignee));
+  if (item.assignee) meta.append(node("span", "meta-name", item.assignee));
   meta.append(node("span", "mono", item.id));
   meta.append(node("time", "", formatDateTime(item.updatedAt, locale)));
   card.append(meta);
 
-  // Objective spans the full card width so a short objective never leaves a
-  // tall empty column beside a long acceptance list.
   if (item.objective && item.objective !== item.title) {
     card.append(copyBlock(t("detail.objective"), item.objective));
   }
 
-  const cols = node("div", "record-cols");
-  if (item.acceptance && item.acceptance.length) cols.append(criteriaList(t("detail.acceptance"), item.acceptance));
+  if (item.acceptance && item.acceptance.length) {
+    card.append(criteriaList(t("detail.acceptance"), item.acceptance));
+  }
+
+  // Short chip rows (dependencies, writable projects) sit side by side; long
+  // text blocks above and below stay full-width so the card reads top-to-bottom
+  // like an issue rather than a mismatched column grid.
+  const chipCols = node("div", "work-item-chips");
   if (item.dependsOn && item.dependsOn.length) {
-    cols.append(chipRow(t("detail.dependsOn"), item.dependsOn.map(function (id) { return titles[id] || id; })));
+    chipCols.append(chipRow(t("detail.dependsOn"), item.dependsOn.map(function (id) { return titles[id] || id; })));
   }
   if (item.writeProjectIds && item.writeProjectIds.length) {
-    cols.append(chipRow(t("detail.writeProjects"), item.writeProjectIds));
+    chipCols.append(chipRow(t("detail.writeProjects"), item.writeProjectIds));
   }
-  if (item.outcome) cols.append(copyBlock(t("detail.outcome"), item.outcome, { muted: true }));
-  if (cols.childNodes.length) card.append(cols);
+  if (chipCols.childNodes.length) card.append(chipCols);
+
+  if (item.outcome) {
+    const outcome = node("div", "record-block outcome-callout");
+    outcome.append(node("small", "", t("detail.outcome")));
+    outcome.append(node("p", "muted", item.outcome));
+    card.append(outcome);
+  }
   return card;
 }
 
@@ -685,6 +752,7 @@ function runCard(run, t, locale) {
   idRow.append(node("span", "role", run.roleName));
   idRow.append(node("span", "", run.id));
   if (run.workItemId) idRow.append(node("span", "", t("detail.workItem") + " · " + run.workItemId));
+  idRow.append(node("time", "", formatDateTime(run.updatedAt, locale)));
   card.append(idRow);
 
   const io = node("div", "execute-io");
@@ -714,7 +782,6 @@ function runCard(run, t, locale) {
     card.append(eff);
   }
 
-  card.append(node("time", "", formatDateTime(run.updatedAt, locale)));
   return card;
 }
 
@@ -722,12 +789,20 @@ function roleCard(role, task, t, locale, actions) {
   const card = node("article", "record-card");
   const head = node("div", "record-head");
   head.append(node("strong", "record-title", role.name));
-  head.append(pill(t, "role", role.status));
+  const headRight = node("div", "record-pills");
+  headRight.append(pill(t, "role", role.status));
+  const open = node("button", "record-open", "");
+  open.type = "button";
+  open.append(node("span", "", t("actions.openRun")), node("span", "arrow", "→"));
+  open.addEventListener("click", function () {
+    if (actions.openTerminal) actions.openTerminal({ scope: "task", taskId: task.id, roleName: role.name });
+  });
+  headRight.append(open);
+  head.append(headRight);
   card.append(head);
 
-  const actionsRow = node("div", "record-actions");
-  const left = node("div", "record-meta");
-  left.append(node("span", "", t("detail.desiredAgent") + " · " + role.activeAgentId));
+  const meta = node("div", "record-meta");
+  meta.append(node("span", "meta-name", role.activeAgentId));
   const activeBinding = role.agentBindings && role.agentBindings[role.activeAgentId];
   if (activeBinding) {
     const badge = agentBadge({
@@ -735,24 +810,16 @@ function roleCard(role, task, t, locale, actions) {
       model: activeBinding.config && activeBinding.config.model,
       effort: activeBinding.config && activeBinding.config.effort
     });
-    if (badge) left.append(badge);
+    if (badge) meta.append(badge);
   }
   if (role.launchRevision !== undefined) {
-    left.append(node("span", "", t("detail.desired") + " · r" + role.launchRevision));
+    meta.append(node("span", "", t("detail.desired") + " · r" + role.launchRevision));
   }
   if (role.defaultAccess !== undefined) {
-    left.append(node("span", "", t("detail.profileIntent") + " · " + role.defaultAccess));
+    meta.append(node("span", "", t("detail.profileIntent") + " · " + role.defaultAccess));
   }
-  actionsRow.append(left);
-
-  const open = node("button", "record-open", "");
-  open.type = "button";
-  open.append(node("span", "", t("actions.openRun")), node("span", "arrow", "→"));
-  open.addEventListener("click", function () {
-    if (actions.openTerminal) actions.openTerminal({ scope: "task", taskId: task.id, roleName: role.name });
-  });
-  actionsRow.append(open);
-  card.append(actionsRow);
+  if (role.updatedAt) meta.append(node("time", "", formatDateTime(role.updatedAt, locale)));
+  card.append(meta);
 
   if (role.effectiveLaunch) {
     const eff = node("div", "record-meta");
@@ -807,9 +874,9 @@ function historyEventRow(event, t, locale) {
     const card = node("article", "record-card");
     const head = node("div", "record-head");
     const titleRow = node("div", "record-title-row");
-    titleRow.append(statusDot("completed"), node("strong", "record-title", milestone.title));
+    titleRow.append(node("strong", "record-title", milestone.title));
     head.append(titleRow);
-    head.append(pill(t, "milestone", "recorded"));
+    head.append(pill(t, "history", "milestone"));
     card.append(head);
     const meta = node("div", "record-meta");
     meta.append(node("span", "mono", milestone.id));
@@ -821,9 +888,16 @@ function historyEventRow(event, t, locale) {
   const decision = event.item;
   const card = node("article", "record-card");
   const head = node("div", "record-head");
-  head.append(node("strong", "record-title", decision.title));
-  head.append(pill(t, "decision", decision.status));
+  const titleRow = node("div", "record-title-row");
+  titleRow.append(node("strong", "record-title", decision.title));
+  head.append(titleRow);
+  head.append(pill(t, "history", "decision"));
   card.append(head);
+  const meta = node("div", "record-meta");
+  meta.append(node("span", "mono", decision.id));
+  if (decision.createdAt) meta.append(node("time", "", formatDateTime(decision.createdAt, locale)));
+  if (decision.status) meta.append(pill(t, "decision", decision.status));
+  card.append(meta);
   if (decision.rationale) card.append(copyBlock("", decision.rationale, { muted: true }));
   if (decision.supersededReason) card.append(copyBlock("", decision.supersededReason, { muted: true }));
   return card;
@@ -833,12 +907,13 @@ function messageCard(message, t, locale) {
   const card = node("article", "record-card");
   const head = node("div", "record-head");
   const titleRow = node("div", "record-title-row");
-  titleRow.append(statusDot("active"), node("strong", "record-title", messageAuthor(message, t)));
+  titleRow.append(node("strong", "record-title", messageAuthor(message, t)));
   head.append(titleRow);
   if (message.kind) head.append(pill(t, "messageKind", message.kind));
   card.append(head);
 
   const meta = node("div", "record-meta");
+  meta.append(node("span", "mono", message.id));
   meta.append(node("time", "", formatDateTime(message.createdAt, locale)));
   if (message.runId) meta.append(node("span", "mono", message.runId + (message.workItemId ? " · " + message.workItemId : "")));
   card.append(meta);

@@ -7,7 +7,10 @@ import type {
   RoleProfile,
   TaskRole
 } from "../role/role.js";
-import type { RoleWorkspace, WorkspaceProjectEntry } from "../worktree/roleWorkspace.js";
+import type {
+  ManagedWorkspace,
+  WorkspaceProjectEntry
+} from "../worktree/managedWorkspace.js";
 import {
   resolveAgentAdapter,
   type AdvancedAgentConfig,
@@ -65,7 +68,7 @@ export type EffectiveLaunchRole = TaskRole | GlobalRole;
 export type ResolveEffectiveLaunchInput = Readonly<{
   role: EffectiveLaunchRole;
   purpose: "execution" | "review";
-  workspace?: RoleWorkspace;
+  workspace?: ManagedWorkspace;
   /** Undefined means a non-WorkItem run; [] is an explicit read-only WorkItem scope. */
   workItemWriteProjectIds?: readonly string[];
   reviewRoundId?: string;
@@ -351,7 +354,7 @@ function effectiveWriteProjects(
 
 function snapshotWorkspace(
   roleWorkspace: string,
-  workspace: RoleWorkspace | undefined
+  workspace: ManagedWorkspace | undefined
 ): EffectiveLaunchWorkspace {
   if (workspace === undefined) return { root: text(roleWorkspace, "Role workspace"), entries: [] };
   return {

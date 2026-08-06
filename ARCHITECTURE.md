@@ -92,6 +92,13 @@ base, isolated workspace provenance, complete free-form report, optional
 structured checks, and optional diagnostic commit. The Leader may route that evidence to the original Worker, but Yui
 never merges it automatically.
 
+Roles describe Agent capability, but they do not own repository workspaces. A
+`ManagedWorkspace` is keyed by its durable owner (`Task`, `WorkItem`,
+`ReviewRound`, or `IntegrationAttempt`); an AgentRun carries only a launch
+snapshot. Review workspaces are fresh writable copies at the Candidate's
+frozen commit, so diagnostics cannot redirect Develop or become a ChangeSet
+source. Each ReviewRound has an independent lifecycle and explicit cleanup.
+
 Dependencies are enforced at dispatch. A Role cannot have overlapping active
 Runs, and terminal Task state fences new messages, dispatches, retries, and
 late results until explicitly reopened.
@@ -116,7 +123,9 @@ behavior. Provider permission and Profile access intent do not grant Project
 writes. A normal source write requires an exact WorkItem write scope and
 matching managed workspace; a review write instead
 requires an exact ReviewRound owner and frozen Candidate base. Profiles and
-Skills constrain behavior even when provider prompts are bypassed.
+Skills constrain behavior even when provider prompts are bypassed. Provider
+permissions remain Session-wide rather than Project-specific, so the durable
+workspace owner and exact Project scope remain the authorization boundary.
 Scope is monotonic. A Worker cannot expand it directly: it reports the need,
 and the Leader either adds Projects to the existing scope, creates another
 WorkItem, or adds the Project to the Task.
@@ -130,7 +139,8 @@ An isolated result is handled in this order:
 5. configured checks run;
 6. compare-and-swap advances the target only if its HEAD is unchanged;
 7. the Leader accepts the WorkItem;
-8. clean integration and WorkItem resources are explicitly removed.
+8. clean Integration, ReviewRound, and WorkItem resources are explicitly
+   removed.
 
 Capture at the same HEAD reuses the existing ChangeSet. A repaired HEAD creates
 a new candidate; only the latest reviewed candidate may satisfy acceptance.

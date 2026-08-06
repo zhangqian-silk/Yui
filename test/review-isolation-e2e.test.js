@@ -176,6 +176,7 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
   assert.notEqual(reviewEntry.path, workerEntry.path);
   assert.deepEqual(reviewWorkspace.owner, {
     type: "review-round",
+    taskId: task.id,
     reviewRoundId: pendingRound.id
   });
   assert.equal(reviewEntry.access, "write");
@@ -200,7 +201,7 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
   };
   await assert.rejects(
     new WorkItemChangeSetManager(
-      taskStoreWithWorkItem(store, captureProbe),
+      taskStoreWithWorkItem(store, captureProbe, reviewWorkspace),
       () => now
     ).capture(task.id, captureProbe.id),
     /ReviewRound-owned workspace cannot be captured/
@@ -666,7 +667,7 @@ function taskStoreWithChangeSet(store, changeSet) {
   });
 }
 
-function taskStoreWithWorkItem(store, workItem) {
+function taskStoreWithWorkItem(store, workItem, workspace) {
   return new Proxy(store, {
     get(target, property) {
       if (property === "getWorkItem") {
@@ -674,6 +675,13 @@ function taskStoreWithWorkItem(store, workItem) {
           taskId === workItem.taskId && workItemId === workItem.id
             ? structuredClone(workItem)
             : target.getWorkItem(taskId, workItemId)
+        );
+      }
+      if (property === "getWorkItemWorkspace") {
+        return (taskId, workItemId) => (
+          taskId === workItem.taskId && workItemId === workItem.id
+            ? structuredClone(workspace)
+            : target.getWorkItemWorkspace(taskId, workItemId)
         );
       }
       const value = Reflect.get(target, property, target);

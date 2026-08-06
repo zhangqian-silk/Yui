@@ -355,12 +355,15 @@ function resolveRuntimeDesiredEffective(
     });
   }
   const taskRole = role as Role;
-  const workspace = store.getRoleWorkspace(request.taskId, request.roleName)
-    ?? store.getRoleWorkspace(request.taskId, "leader")
+  const item = store.listWorkItems(request.taskId).find((candidate) => (
+    candidate.assignee === request.roleName
+      && !["completed", "failed", "retired"].includes(candidate.status)
+  )) ?? null;
+  const workspace = (item === null
+    ? store.getTaskWorkspace(request.taskId)
+    : store.getWorkItemWorkspace(request.taskId, item.id))
+    ?? store.getTaskWorkspace(request.taskId)
     ?? undefined;
-  const item = workspace?.owner.type === "work-item"
-    ? store.getWorkItem(request.taskId, workspace.owner.workItemId)
-    : null;
   return resolveEffectiveLaunch({
     role: taskRole,
     purpose: "execution",
@@ -444,13 +447,15 @@ function currentDesiredEffective(
   if (request.owner.scope === "global") {
     return resolveEffectiveLaunch({ role: role as GlobalRole, purpose: "execution" });
   }
-  const workspace = store.getRoleWorkspace(
-    request.owner.taskId,
-    request.owner.roleName
-  ) ?? store.getRoleWorkspace(request.owner.taskId, "leader") ?? undefined;
-  const item = workspace?.owner.type === "work-item"
-    ? store.getWorkItem(request.owner.taskId, workspace.owner.workItemId)
-    : null;
+  const item = store.listWorkItems(request.owner.taskId).find((candidate) => (
+    candidate.assignee === request.owner.roleName
+      && !["completed", "failed", "retired"].includes(candidate.status)
+  )) ?? null;
+  const workspace = (item === null
+    ? store.getTaskWorkspace(request.owner.taskId)
+    : store.getWorkItemWorkspace(request.owner.taskId, item.id))
+    ?? store.getTaskWorkspace(request.owner.taskId)
+    ?? undefined;
   return resolveEffectiveLaunch({
     role: role as Role,
     purpose: "execution",

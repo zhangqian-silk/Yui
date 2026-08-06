@@ -15,6 +15,10 @@ import type {
   TmuxDeliveryPort
 } from "../scheduler/ports.js";
 import { reconcileExitedRoleRuns } from "../scheduler/roleRunLiveness.js";
+import {
+  DEFAULT_STALL_WINDOW_MS,
+  reconcileStalledRoleRuns
+} from "../scheduler/roleRunStall.js";
 import { repairOrphanedActiveTasks } from "../scheduler/activeTaskProgress.js";
 import {
   processOperatorInputNotifications,
@@ -72,6 +76,7 @@ export type ControllerRuntimeOptions = Readonly<{
   signalWindowMs?: number;
   deliveryRetryMs?: number;
   deliveryRetryLimit?: number;
+  stallWindowMs?: number;
   now?: () => Date;
   onError?: (error: unknown) => void;
   workspacePreparer?: Pick<TaskWorkspacePreparer, "prepareTaskWorkspace">;
@@ -115,7 +120,8 @@ export async function runControllerSchedulerPass(
   scope: ReconcileScope = { kind: "full" },
   includeOperator = true,
   runtimeCleanupOutcomes: RuntimeCleanupOutcome[] = [],
-  lifecycleHost?: RuntimeLifecycleHost
+  lifecycleHost?: RuntimeLifecycleHost,
+  stallWindowMs = DEFAULT_STALL_WINDOW_MS
 ): Promise<ControllerSchedulerResult> {
   const compiledSelection = compileReconcileSelection(scope);
   const selection = includeOperator
@@ -154,13 +160,16 @@ export async function runControllerSchedulerPass(
         : []
     )));
     resolveDueRuntimeTurnCompletions(store, delivery, selection, now);
+    const liveStatuses = new Map<string, "present" | "absent">();
     const failedRunRefs = await reconcileExitedRoleRuns(
       store,
       delivery,
       now,
       roleSelection,
-      unsettledRunRefs
+      unsettledRunRefs,
+      liveStatuses
     );
+    await reconcileStalledRoleRuns(store, delivery, now, roleSelection, stallWindowMs, liveStatuses);
     await reconcileDormantRuntimeOwners(
       store,
       delivery,
@@ -699,6 +708,7 @@ export class FileTaskController {
     | undefined;
   readonly #deliveryRetryMs: number;
   readonly #deliveryRetryLimit: number;
+  readonly #stallWindowMs: number;
   readonly #runtimeEventProcessor: RuntimeEventProcessorPort | undefined;
   readonly #lifecycleHost:
     | RuntimeLifecycleHost
@@ -745,6 +755,11 @@ export class FileTaskController {
       options.deliveryRetryLimit,
       DEFAULT_DELIVERY_RETRY_LIMIT,
       "Controller delivery retry limit"
+    );
+    this.#stallWindowMs = positiveInteger(
+      options.stallWindowMs,
+      DEFAULT_STALL_WINDOW_MS,
+      "Controller Run stall window"
     );
     this.#runtimeEventProcessor = options.runtimeEventProcessor;
     this.#lifecycleHost = options.lifecycleHost;
@@ -932,7 +947,8 @@ export class FileTaskController {
             scope,
             false,
             runtimeCleanupOutcomes,
-            this.#lifecycleHost
+            this.#lifecycleHost,
+            this.#stallWindowMs
           );
           const secondRuntimeDrain = this.#drainRuntimeEvents();
           this.#clearPassRetry();
@@ -1120,6 +1136,8 @@ export class FileTaskController {
             ? `input:${notification.inputRequestId}`
             : "recoveryTaskId" in notification
               ? `recovery:${notification.recoveryTaskId}`
+              : "stallTaskId" in notification
+                ? `stall:${notification.stallTaskId}`
               : `terminal:${notification.terminalTaskId}`
         )).join("|")
       });

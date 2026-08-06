@@ -1,5 +1,7 @@
 import type { ConfiguredAgent } from "../agent/agent.js";
+import { execFileSync } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
+import { join } from "node:path";
 import {
   compileDispatchInput,
   ensureWorkerRunCompletionRequirement
@@ -11,7 +13,13 @@ import {
   taskNotFound,
   usageError
 } from "../errors/cliError.js";
-import { createTaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
+import { createTaskEvent, type TaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
+import {
+  clearMatchingLeaderStallAttention,
+  isRoleRunStalled,
+  RUN_PROGRESS_EVENT,
+  RUN_RECOVERED_EVENT
+} from "../scheduler/roleRunStall.js";
 import { readCommandText } from "./textInput.js";
 import {
   createRoleSessionSet,
@@ -113,6 +121,7 @@ import {
   type WorkItemStatus
 } from "../workItem/workItem.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
+import { managedWorkspaceKey } from "../worktree/managedWorkspace.js";
 import {
   hasAgentConfigOptions,
   parseRoleOptions,
@@ -685,7 +694,7 @@ function completeTaskCommand(
         `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
       );
     }
-    const isolatedWorkspace = tx.listRoleWorkspaces(task.id)
+    const isolatedWorkspace = tx.listManagedWorkspaces(task.id)
       .find(({ owner }) => owner.type === "work-item");
     if (isolatedWorkspace?.owner.type === "work-item") {
       throw usageError(
@@ -804,7 +813,7 @@ function archiveTaskCommand(
       && task.status !== "retired") {
       throw usageError(`Task ${task.id} must be completed or retired before it can be archived.`);
     }
-    if (task.cwd !== undefined || tx.listRoleWorkspaces(task.id).length > 0) {
+    if (task.cwd !== undefined || tx.listManagedWorkspaces(task.id).length > 0) {
       throw usageError(`Task ${task.id} still has managed worktrees; clean them before archiving.`);
     }
     assertNoOpenInputRequests(tx, task.id, "archiving the Task");
@@ -994,7 +1003,7 @@ function assertTaskRetirementProof(
   task: Task,
   proof: TaskRetirementProof | undefined
 ): void {
-  const workspaces = store.listRoleWorkspaces(task.id);
+  const workspaces = store.listManagedWorkspaces(task.id);
   if (proof === undefined) {
     if (workspaces.length === 0 && task.projectBindings.length === 0) return;
     throw usageError(`Task retirement preflight proof is required: ${task.id}.`);
@@ -1007,11 +1016,12 @@ function assertTaskRetirementProof(
     throw usageError(`Task changed after retirement preflight: ${task.id}.`);
   }
   const expected = [...proof.workspaces]
-    .sort((left, right) => left.roleName.localeCompare(right.roleName));
+    .sort((left, right) => left.ownerKey.localeCompare(right.ownerKey));
   const actual = [...workspaces]
-    .sort((left, right) => left.roleName.localeCompare(right.roleName));
+    .sort((left, right) => managedWorkspaceKey(left.owner)
+      .localeCompare(managedWorkspaceKey(right.owner)));
   if (!actual.every((workspace, index) => (
-    expected[index]?.roleName === workspace.roleName
+    expected[index]?.ownerKey === managedWorkspaceKey(workspace.owner)
     && isDeepStrictEqual(expected[index]?.workspace, workspace)
   ))) {
     throw usageError(`Task workspaces changed after retirement preflight: ${task.id}.`);
@@ -1715,18 +1725,34 @@ function updateWork(
       if (status === "running") {
         assertWorkItemDependenciesCompleted(tx, current);
       }
+      if (status === "completed" && current.status === "awaiting_acceptance") {
+        throw usageError(
+          `Work Item ${current.id} is awaiting acceptance; use task work accept `
+          + "after the required ReviewRound and Integration evidence."
+        );
+      }
       const reviewConfig = status === "completed" && !isTerminalWorkItemStatus(current.status)
         ? tx.getReviewConfig()
         : null;
-      const candidateRequired = reviewConfig !== null;
+      const projectDelivery = task.projectBindings.length > 0
+        && current.writeProjectIds.length > 0;
+      const candidateRequired = status === "completed"
+        && current.status === "running"
+        && (projectDelivery || reviewConfig !== null);
+      const developWorkspace = tx.getWorkItemWorkspace(task.id, current.id);
+      if (status === "completed" && projectDelivery && developWorkspace === null) {
+        throw usageError(
+          `Project-backed Work Item ${current.id} must be isolated before Candidate submission.`
+        );
+      }
       const updated = candidateRequired
         ? submitWorkItemCandidate(current, {
             summary: summary!,
             source: { type: "direct" },
-            reviewPolicy: reviewConfig,
-            ...(tx.getRoleWorkspace(task.id, LEADER_ROLE) === null
+            ...(reviewConfig === null ? {} : { reviewPolicy: reviewConfig }),
+            ...(developWorkspace === null
               ? {}
-              : { workspace: tx.getRoleWorkspace(task.id, LEADER_ROLE)! }),
+              : { workspace: developWorkspace }),
             ...(options.candidateGitSnapshot === undefined
               ? {}
               : { gitSnapshot: options.candidateGitSnapshot })
@@ -1762,7 +1788,7 @@ function updateWork(
       return {
         item: updated,
         reviewDispatch,
-        reviewTrigger: candidateRequired ? reviewConfig.trigger : null
+        reviewTrigger: reviewConfig?.trigger ?? null
       };
     }
     throw usageError(
@@ -1774,7 +1800,8 @@ function updateWork(
   notifyMailbox(options.runtime, taskMailbox(result.item.taskId), result.item.taskId);
   if (result.reviewDispatch?.run !== null
     && result.reviewDispatch?.run !== undefined) {
-    notifyMailbox(
+    notifyReviewMailbox(
+      options,
       options.runtime,
       roleMailbox(result.reviewDispatch.run.taskId, result.reviewDispatch.run.roleName),
       result.reviewDispatch.run.taskId
@@ -1826,7 +1853,7 @@ function dispatchWork(
     }
     assertWorkItemDependenciesCompleted(tx, item);
     const role = requireRole(tx, task.id, item.assignee);
-    const workspace = tx.getRoleWorkspace(task.id, role.name);
+    const workspace = tx.getWorkItemWorkspace(task.id, item.id);
     if (workspace?.owner.type === "work-item"
       && workspace.owner.workItemId !== item.id) {
       throw usageError(
@@ -1834,7 +1861,7 @@ function dispatchWork(
         + `cleanup ${workspace.owner.workItemId} before dispatching ${item.id}.`
       );
     }
-    if (item.writeProjectIds.length > 0) {
+    if (task.projectBindings.length > 0) {
       const writable = workspace?.owner.type === "work-item"
         && workspace.owner.workItemId === item.id
         ? workspace.entries
@@ -1874,7 +1901,7 @@ function dispatchWork(
       runId,
       taskRoleSessionTitle(task, role.name)
     );
-    const runWorkspace = workspace ?? tx.getRoleWorkspace(task.id, LEADER_ROLE) ?? undefined;
+    const runWorkspace = workspace ?? tx.getTaskWorkspace(task.id) ?? undefined;
     const effective = resolveEffectiveLaunch({
       role,
       purpose: "execution",
@@ -1970,17 +1997,23 @@ function acceptWork(
       && latestReview === undefined) {
       throw usageError(`Work Item candidate has no required ReviewRound: ${item.id}.`);
     }
-    const isolatedWorkspace = item.assignee === undefined
-      ? null
-      : tx.getRoleWorkspace(item.taskId, item.assignee);
+    const isolatedWorkspace = tx.getWorkItemWorkspace(item.taskId, item.id);
+    if (task.projectBindings.length > 0
+      && item.writeProjectIds.length > 0
+      && isolatedWorkspace === null) {
+      throw usageError(
+        `Project-backed Work Item ${item.id} has no WorkItem Develop workspace for acceptance.`
+      );
+    }
     if (
       isolatedWorkspace?.owner.type === "work-item"
       && isolatedWorkspace.owner.workItemId === item.id
+      && isolatedWorkspace.entries.some(({ access }) => access === "write")
     ) {
       assertWorkItemIntegrationProof(
         tx,
         item.id,
-        item.assignee!,
+        item.assignee,
         isolatedWorkspace,
         options.workItemIntegrationProof
       );
@@ -2004,8 +2037,8 @@ function acceptWork(
 function assertWorkItemIntegrationProof(
   store: TaskWorkflowStore,
   workItemId: string,
-  assignee: string,
-  workspace: NonNullable<ReturnType<TaskWorkflowStore["getRoleWorkspace"]>>,
+  assignee: string | undefined,
+  workspace: NonNullable<ReturnType<TaskWorkflowStore["getWorkItemWorkspace"]>>,
   proof: WorkItemIntegrationProof | undefined
 ): void {
   if (
@@ -2027,7 +2060,7 @@ function assertWorkItemIntegrationProof(
     if (projectProof === undefined || projectProof.baseCommit !== entry.baseCommit) {
       throw usageError(`WorkItem integration verification is stale: ${workItemId}.`);
     }
-    const latestChangeSet = store.listChangeSets(workspace.taskId)
+    const latestChangeSet = store.listChangeSets(workspace.owner.taskId)
       .filter((changeSet) => (
         changeSet.workItemId === workItemId
         && changeSet.projectId === entry.projectId
@@ -2054,7 +2087,7 @@ function assertWorkItemIntegrationProof(
         `WorkItem integration verification is stale: ${workItemId}.`
       );
     }
-    if (!store.listIntegrationAttempts(workspace.taskId).some((integration) => (
+    if (!store.listIntegrationAttempts(workspace.owner.taskId).some((integration) => (
       integration.status === "committed"
       && integration.projectId === entry.projectId
       && integration.changeSetIds.includes(projectProof.changeSetId!)
@@ -2265,10 +2298,17 @@ function reviewWork(
     if (activeRound !== undefined) {
       throw usageError(`ReviewRound is already active: ${activeRound.id}/${activeRound.status}.`);
     }
-    return queueReviewRound(tx, item, config, "leader", now);
+    return queueReviewRound(
+      tx,
+      item,
+      config,
+      "leader",
+      now
+    );
   });
   if (result.run !== null) {
-    notifyMailbox(
+    notifyReviewMailbox(
+      options,
       options.runtime,
       roleMailbox(result.run.taskId, result.run.roleName),
       result.run.taskId
@@ -2291,6 +2331,7 @@ function taskRunCommand(
   if (command === "list") return output(listRuns(rest, store, options));
   if (command === "retry") return output(retryRun(rest, store, options));
   if (command === "yield") return yieldRun(rest, store, options);
+  if (command === "checkpoint") return output(checkpointRun(rest, store, options));
   throw usageError(command === undefined
     ? "Task run command is required."
     : `Unknown command: task run ${command}`);
@@ -2364,7 +2405,9 @@ function retryRun(
       throw dataError(`Work item not found for run ${previous.id}: ${previous.workItemId}.`);
     }
     const runWorkspace = previous.workspace
-      ?? tx.getRoleWorkspace(task.id, role.name)
+      ?? (retryItem === null
+        ? tx.getTaskWorkspace(task.id)
+        : tx.getWorkItemWorkspace(task.id, retryItem.id))
       ?? undefined;
     const effective = resolveEffectiveLaunch({
       role,
@@ -2398,7 +2441,7 @@ function retryRun(
     tx.saveRole(task.id, updateRoleStatus(role, "running", now));
     if (previous.workItemId !== undefined) {
       const item = retryItem!;
-      const workspace = tx.getRoleWorkspace(task.id, role.name);
+      const workspace = tx.getWorkItemWorkspace(task.id, item.id);
       if (workspace?.owner.type === "work-item"
         && workspace.owner.workItemId !== item.id) {
         throw usageError(
@@ -2447,6 +2490,7 @@ function yieldRun(
     const role = requireRole(tx, task.id, active.roleName);
     const pointer = tx.getActiveAgentRun(task.id, role.name);
     if (pointer?.id !== active.id) throw usageError(`Run is not active for ${task.id}/${role.name}: ${active.id}.`);
+    const wasStalled = isRoleRunStalled(tx.listEvents(task.id), active.id);
     let reviewReport;
     if (active.purpose === "review") {
       if (options.reviewWorkspaceResult === undefined) {
@@ -2500,6 +2544,15 @@ function yieldRun(
       now,
       { runId: terminal.id, workItemId: active.workItemId }
     );
+    if (wasStalled) {
+      recordTaskEvent(tx, task.id, RUN_RECOVERED_EVENT, {
+        runId: terminal.id,
+        roleName: role.name,
+        progressAt: now.toISOString(),
+        kind: "yield"
+      }, now);
+    }
+    clearMatchingLeaderStallAttention(tx, task.id, active.id);
     if (active.purpose === "review") {
       const round = active.reviewRoundId === undefined
         ? null
@@ -2587,7 +2640,8 @@ function yieldRun(
   }
   if (yielded.reviewDispatch?.run !== null
     && yielded.reviewDispatch?.run !== undefined) {
-    notifyMailbox(
+    notifyReviewMailbox(
+      options,
       options.runtime,
       roleMailbox(
         yielded.reviewDispatch.run.taskId,
@@ -2603,6 +2657,63 @@ function yieldRun(
       ? {}
       : { reviewRound: yielded.reviewDispatch.round })
   });
+}
+
+/**
+ * Records a structured progress checkpoint for an active Run. This is a durable
+ * run fact, not a Task Message: it advances the Run's durable-progress clock so
+ * a healthy but long-running Run keeps proving it is alive without adding
+ * collaboration-narrative noise. It never yields, mutates the Run, or wakes the
+ * Leader.
+ */
+function checkpointRun(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  const usage = "Task run checkpoint usage: yui task run checkpoint <run> (--note <text>|--note-file <path|->).";
+  const parsed = parseTail(args, new Set(["--note", "--note-file"]), usage);
+  exactPositionals(parsed.positionals, 1, usage);
+  const note = readCommandText(
+    parsed.options.get("--note"),
+    parsed.options.get("--note-file"),
+    "--note",
+    usage
+  );
+  const now = clock(options);
+  const event = store.transaction((tx) => {
+    const run = requireRun(tx, parsed.positionals[0], options);
+    if (run.status !== "active") {
+      throw usageError(`Run ${run.id} is already terminal: ${run.status}.`);
+    }
+    if (run.deliveredAt === undefined) {
+      throw usageError(`Run ${run.id} delivery is still pending.`);
+    }
+    const task = requireTask(tx, run.taskId);
+    if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "checkpointing a run"));
+    const pointer = tx.getActiveAgentRun(task.id, run.roleName);
+    if (pointer?.id !== run.id) {
+      throw usageError(`Run is not active for ${task.id}/${run.roleName}: ${run.id}.`);
+    }
+    const events = tx.listEvents(task.id);
+    const recovered = isRoleRunStalled(events, run.id);
+    const progress = recordTaskEventRecord(tx, task.id, RUN_PROGRESS_EVENT, {
+      runId: run.id,
+      note: truncateEventNote(note),
+      ...(run.workItemId === undefined ? {} : { workItemId: run.workItemId })
+    }, now);
+    if (recovered) {
+      recordTaskEventRecord(tx, task.id, RUN_RECOVERED_EVENT, {
+        runId: run.id,
+        roleName: run.roleName,
+        progressAt: now.toISOString(),
+        kind: "checkpoint"
+      }, now);
+    }
+    clearMatchingLeaderStallAttention(tx, task.id, run.id);
+    return progress;
+  });
+  return `Checkpoint recorded for ${parsed.positionals[0]} (${event.id}).\n`;
 }
 
 export function queueReviewRound(
@@ -2700,7 +2811,7 @@ export function dispatchPreparedReviewRound(
     if (tx.getActiveAgentRun(taskId, reviewer.name) !== null) {
       throw usageError(`Reviewer Role already has an active run: ${reviewer.name}.`);
     }
-    const storedWorkspace = tx.getRoleWorkspace(taskId, reviewer.name);
+    const storedWorkspace = tx.getReviewRoundWorkspace(taskId, round.id);
     if (storedWorkspace === null
       || !isDeepStrictEqual(storedWorkspace, round.workspace)
       || storedWorkspace.owner.type !== "review-round"
@@ -2902,7 +3013,11 @@ function appendMessage(
     store.nextMessageId(taskId), taskId, body, kind, author, now, context
   );
   store.saveMessage(taskId, message);
-  recordTaskEvent(store, taskId, "message.sent", { messageId: message.id, kind: message.kind }, now);
+  recordTaskEvent(store, taskId, "message.sent", {
+    messageId: message.id,
+    kind: message.kind,
+    ...(message.runId === undefined ? {} : { runId: message.runId })
+  }, now);
   return message;
 }
 
@@ -2913,9 +3028,25 @@ function recordTaskEvent(
   payload: TaskEventPayload,
   now: Date
 ): void {
-  store.saveEvent(taskId, createTaskEvent(
-    store.nextEventId(taskId), taskId, type, payload, now
-  ));
+  recordTaskEventRecord(store, taskId, type, payload, now);
+}
+
+function recordTaskEventRecord(
+  store: TaskWorkflowStore,
+  taskId: string,
+  type: string,
+  payload: TaskEventPayload,
+  now: Date
+): TaskEvent {
+  const event = createTaskEvent(store.nextEventId(taskId), taskId, type, payload, now);
+  store.saveEvent(taskId, event);
+  return event;
+}
+
+/** Keeps a free-text run-fact note bounded so an event payload stays compact. */
+function truncateEventNote(note: string): string {
+  const normalized = note.trim();
+  return normalized.length <= 280 ? normalized : `${normalized.slice(0, 279)}…`;
 }
 
 function roleLaunchEventPayload(
@@ -3679,4 +3810,13 @@ function notifyMailbox(
   } else {
     runtime?.notifyStateChanged(compatibilityTaskId);
   }
+}
+
+function notifyReviewMailbox(
+  _options: TaskCommandOptions,
+  runtime: TaskWorkflowRuntimePort | undefined,
+  target: MailboxTarget,
+  compatibilityTaskId: string
+): void {
+  notifyMailbox(runtime, target, compatibilityTaskId);
 }

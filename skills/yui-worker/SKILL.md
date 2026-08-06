@@ -32,6 +32,17 @@ workspace, validation, and return protocol.
   not attempt the write or relax the permission yourself.
 - Validate in proportion to risk. Report passed, failed, and skipped checks
   honestly.
+- A Role executes in a workspace snapshot; it does not own that workspace.
+  Develop workspaces belong to the WorkItem, review workspaces to their
+  ReviewRound, and integration workspaces to their IntegrationAttempt. Never
+  use a Role-keyed lookup as proof of WorkItem ownership.
+- Follow the unified delivery lifecycle: isolate, yield a Candidate, inspect
+  the independent ReviewRound workspace when requested, capture ChangeSets,
+  integrate, accept, and explicitly clean up each owner workspace. Review
+  edits are not ChangeSet sources.
+- For Project-backed delivery, commit the Develop changes and leave that
+  workspace clean before yielding; Yui records the exact frozen HEAD in the
+  Candidate snapshot so a later ReviewRound cannot drift with Develop.
 - If blocked by missing intent or a semantic conflict, stop safely and identify
   the exact Leader decision required.
 - If another Project must be modified, stop and report the Project, reason, and
@@ -39,6 +50,26 @@ workspace, validation, and return protocol.
   Task-main context directory or expand the WorkItem scope yourself. If the
   Leader approves, continue only after a new dispatch names the expanded
   writable Project set.
+
+## Hand off the useful conclusion
+
+Your Task Message or Run yield is a collaboration summary, not a transcript.
+Choose information by the next reader's likely judgment or action. For an
+implementation handoff, lead with the user-visible behavior and explain the
+important mechanism, boundary, tradeoff, evidence, and residual risk; point to
+WorkItem/Run/Review/check records instead of pasting logs or a file-by-file
+diff. When acting as Reviewer or Tester, report the concrete finding or
+disposition, minimal reproduction or evidence reference, impact, regression
+boundary, and verification gap. Do not turn routine dispatch, attach,
+heartbeat, tool/resource sampling, waiting, or repeated no-change checks into
+Task Messages. Do not follow a fixed four-part template or fixed title,
+field, section, or character limit: adapt the abstraction and amount of detail
+to the recipient, and produce one summary for one semantic event.
+
+For a healthy long Run, use the supported structured checkpoint path
+(`yui task run checkpoint <run> --note-file -`) when there is real semantic
+progress; the checkpoint is runtime evidence and does not replace the final
+yield summary.
 
 ## Native subagent
 

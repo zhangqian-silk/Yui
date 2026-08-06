@@ -6,7 +6,10 @@ import {
   requireTimestamp
 } from "../domain/validation.js";
 import { validateReviewConfig, type ReviewConfig } from "../review/reviewConfig.js";
-import { validateRoleWorkspace, type RoleWorkspace } from "../worktree/roleWorkspace.js";
+import {
+  validateManagedWorkspace,
+  type ManagedWorkspace
+} from "../worktree/managedWorkspace.js";
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
 
 export type WorkItemStatus =
@@ -54,7 +57,8 @@ export type WorkItemCandidate = Readonly<{
     | Readonly<{ type: "direct" }>
     | Readonly<{ type: "run"; runId: string }>;
   reviewPolicy?: ReviewConfig;
-  workspace?: RoleWorkspace;
+  /** Snapshot of the WorkItem-owned Develop workspace at candidate time. */
+  workspace?: ManagedWorkspace;
   gitSnapshot?: CandidateGitSnapshot;
   createdAt: string;
 }>;
@@ -131,7 +135,7 @@ export function submitWorkItemCandidate(
       | Readonly<{ type: "direct" }>
       | Readonly<{ type: "run"; runId: string }>;
     reviewPolicy?: ReviewConfig;
-    workspace?: RoleWorkspace;
+    workspace?: ManagedWorkspace;
     gitSnapshot?: CandidateGitSnapshot;
   }>,
   now: Date
@@ -421,9 +425,11 @@ export function validateWorkItemCandidate(
   }
   if (candidate.reviewPolicy !== undefined) validateReviewConfig(candidate.reviewPolicy);
   if (candidate.workspace !== undefined) {
-    validateRoleWorkspace(candidate.workspace);
-    if (candidate.workspace.owner.type === "review-round") {
-      throw new Error("Work Item candidate cannot use a ReviewRound-owned workspace.");
+    validateManagedWorkspace(candidate.workspace);
+    if (candidate.workspace.owner.type !== "work-item"
+      || candidate.workspace.owner.taskId !== candidate.taskId
+      || candidate.workspace.owner.workItemId !== candidate.workItemId) {
+      throw new Error("Work Item candidate must use its WorkItem-owned workspace.");
     }
   }
   if (candidate.gitSnapshot !== undefined) {
@@ -437,12 +443,12 @@ export function validateWorkItemCandidate(
 }
 
 export function createCandidateGitSnapshot(
-  workspace: RoleWorkspace,
+  workspace: ManagedWorkspace,
   projects: readonly Readonly<{ projectId: string; commit: string }>[]
 ): CandidateGitSnapshot {
-  validateRoleWorkspace(workspace);
-  if (workspace.owner.type === "review-round") {
-    throw new Error("Candidate Git snapshot cannot come from a ReviewRound workspace.");
+  validateManagedWorkspace(workspace);
+  if (workspace.owner.type !== "work-item") {
+    throw new Error("Candidate Git snapshot must come from a WorkItem workspace.");
   }
   if (workspace.entries.length === 0) {
     throw new Error("Candidate Git snapshot requires a Project workspace.");
@@ -475,7 +481,7 @@ export function createCandidateGitSnapshot(
 
 function validateCandidateGitSnapshot(
   snapshot: CandidateGitSnapshot,
-  workspace: RoleWorkspace
+  workspace: ManagedWorkspace
 ): void {
   if (snapshot.schemaVersion !== 1) {
     throw new Error("Candidate Git snapshot must use schemaVersion 1.");

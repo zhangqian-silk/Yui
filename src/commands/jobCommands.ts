@@ -126,7 +126,10 @@ function retryJob(
     if (task.status !== "active") {
       throw usageError(`Leader recovery can only be retried for an active Task: ${task.id}.`);
     }
-    if (tx.getLeaderFailure(task.id) === null && tx.getOperatorNotification(task.id) === null) {
+    if (
+      tx.getLeaderFailure(task.id) === null
+      && tx.getOperatorNotification(task.id)?.type !== "leader-recovery-failed"
+    ) {
       throw usageError(`Job not found: ${id}.`);
     }
     tx.clearLeaderFailure(task.id);

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { get } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -604,6 +604,15 @@ test("web shell composes modular i18n, theme, layout, and client assets", async 
         });
         assert.equal(checked.status, 0, checked.stderr);
       }
+
+      // The client must reflect the current view in the URL so the browser
+      // back/forward buttons stay inside the app instead of leaving the site.
+      const appSource = readFileSync(join(directory, "app.mjs"), "utf8");
+      assert.match(appSource, /history\.pushState/);
+      assert.match(appSource, /addEventListener\("popstate"/);
+      assert.match(appSource, /"task"/);
+      assert.match(appSource, /"filter"/);
+      assert.match(appSource, /"q"/);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

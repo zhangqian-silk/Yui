@@ -46,11 +46,56 @@ const state = {
   selected: null,
   detail: null
 };
+const VALID_FILTERS = ["all", "active", "draft", "completed", "archived"];
 let terminalSession = null;
 let terminalStateKey = "terminal.closed";
 
 const i18n = createI18n(elements.locale);
 createThemeController(elements.theme);
+
+// --- URL / history ---------------------------------------------------------
+// Reflect the current view (selected task, status filter, search query) in the
+// query string so the browser back/forward buttons work and the page can be
+// deep-linked / refreshed without losing context.
+function readQuery() {
+  return new URLSearchParams(window.location.search);
+}
+
+function buildSearch(params) {
+  const entries = Array.from(params.entries()).filter(function (entry) {
+    return entry[1] !== "" && entry[1] !== null && entry[1] !== undefined;
+  });
+  if (!entries.length) return "";
+  return "?" + entries.map(function (entry) {
+    return encodeURIComponent(entry[0]) + "=" + encodeURIComponent(entry[1]);
+  }).join("&");
+}
+
+function applyUrl(params, options) {
+  const replace = options && options.replace;
+  const search = buildSearch(params);
+  const url = window.location.pathname + search + window.location.hash;
+  if (replace) {
+    history.replaceState({ task: params.get("task") || null }, "", url);
+  } else {
+    history.pushState({ task: params.get("task") || null }, "", url);
+  }
+}
+
+function urlTaskId() {
+  return readQuery().get("task") || null;
+}
+
+function syncUrlFromState(options) {
+  const params = readQuery();
+  if (state.selected) params.set("task", state.selected);
+  else params.delete("task");
+  if (state.filter && state.filter !== "all") params.set("filter", state.filter);
+  else params.delete("filter");
+  if (state.query) params.set("q", state.query);
+  else params.delete("q");
+  applyUrl(params, options);
+}
 
 function detailActions() {
   return {
@@ -104,9 +149,12 @@ function renderCurrentDetail() {
 function renderDynamicContent() {
   renderFilters(elements.filters, state, i18n.t, function (filter) {
     state.filter = filter;
+    syncUrlFromState({ replace: false });
     renderDynamicContent();
   });
+  const savedTaskScroll = elements.tasks.scrollTop;
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
+  elements.tasks.scrollTop = savedTaskScroll;
   const preserveScroll = state.detail !== null && elements.mainCol.scrollTop > 0;
   const savedScrollTop = elements.mainCol.scrollTop;
   renderCurrentDetail();
@@ -166,8 +214,11 @@ function clearSelection() {
   state.selected = null;
   state.detail = null;
   setDetailActive(false);
+  syncUrlFromState({ replace: !urlTaskId() });
   showOverview();
+  const savedTaskScroll = elements.tasks.scrollTop;
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
+  elements.tasks.scrollTop = savedTaskScroll;
 }
 
 async function requestJson(path, options) {
@@ -207,8 +258,14 @@ async function loadTaskDetail(taskId, showLoading) {
 async function selectTask(taskId) {
   state.selected = taskId;
   state.detail = null;
+  // When the selection is driven by the URL (initial load or popstate), the
+  // URL already reflects the task id, so replace instead of pushing a
+  // duplicate history entry.
+  syncUrlFromState({ replace: state.selected === urlTaskId() });
   setDetailActive(true);
+  const savedTaskScroll = elements.tasks.scrollTop;
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
+  elements.tasks.scrollTop = savedTaskScroll;
   try {
     await loadTaskDetail(taskId, true);
   } catch {
@@ -424,7 +481,10 @@ if (elements.detailTabs) {
 
 elements.search.addEventListener("input", function () {
   state.query = elements.search.value;
+  syncUrlFromState({ replace: true });
+  const savedTaskScroll = elements.tasks.scrollTop;
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
+  elements.tasks.scrollTop = savedTaskScroll;
 });
 elements.refresh.addEventListener("click", function () { refreshDashboard(); });
 elements.operatorTerminal.addEventListener("click", function () {
@@ -457,6 +517,34 @@ document.addEventListener("keydown", function (event) {
     refreshDashboard();
   }
 });
+
+// Restore view state from the URL on load and on browser back/forward.
+function applyStateFromUrl() {
+  const params = readQuery();
+  const filter = params.get("filter");
+  if (filter && VALID_FILTERS.indexOf(filter) !== -1) {
+    state.filter = filter;
+  } else {
+    state.filter = "all";
+  }
+  const query = params.get("q");
+  state.query = query || "";
+  if (elements.search) elements.search.value = state.query;
+  const taskId = params.get("task");
+  if (taskId) {
+    selectTask(taskId);
+  } else {
+    state.selected = null;
+    state.detail = null;
+    setDetailActive(false);
+    showOverview();
+  }
+}
+
+window.addEventListener("popstate", function () {
+  applyStateFromUrl();
+});
+
 i18n.subscribe(function () {
   renderDynamicContent();
   if (terminalSession) setTerminalState(terminalStateKey);
@@ -469,6 +557,7 @@ showOverview();
 // so it survives detail re-renders.
 elements.mainCol.addEventListener("scroll", updateActiveTabFromScroll, { passive: true });
 
+applyStateFromUrl();
 refreshDashboard();
 window.setInterval(function () { refreshDashboard({ quiet: true }); }, 5000);
 `;

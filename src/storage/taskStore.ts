@@ -83,9 +83,11 @@ import {
   type WorkItemCandidate
 } from "../workItem/workItem.js";
 import {
-  validateRoleWorkspace,
-  type RoleWorkspace
-} from "../worktree/roleWorkspace.js";
+  managedWorkspaceKey,
+  validateManagedWorkspace,
+  type ManagedWorkspace,
+  type ManagedWorkspaceOwner
+} from "../worktree/managedWorkspace.js";
 import { writeTextFileAtomically } from "./durableFile.js";
 import { assertHomeWritable } from "./upgradeFence.js";
 import { requireStorageSchema } from "./storageSchema.js";
@@ -125,14 +127,14 @@ type ActiveRunPointer = Readonly<{ schemaVersion: 1; runId: string }>;
 type TaskIdHighWaterMarks = Record<TaskRecordKind, number>;
 
 type StoredTask = {
-  schemaVersion: 13;
+  schemaVersion: 14;
   task: Task;
   idHighWaterMarks: TaskIdHighWaterMarks;
   brief: TaskBrief | null;
   changeSets: Record<string, ChangeSet>;
   integrationAttempts: Record<string, IntegrationAttempt>;
   roles: Record<string, TaskRole>;
-  roleWorkspaces: Record<string, RoleWorkspace>;
+  managedWorkspaces: Record<string, ManagedWorkspace>;
   roleSessionSets: Record<string, TaskRoleSessionSet>;
   workItems: Record<string, WorkItem>;
   agentRuns: Record<string, AgentRun>;
@@ -148,7 +150,7 @@ type StoredTask = {
 };
 
 type StorageState = {
-  schemaVersion: 14;
+  schemaVersion: 15;
   revision: number;
   config: YuiConfig;
   configuredAgents: Record<string, ConfiguredAgent>;
@@ -212,10 +214,16 @@ export type TaskStore = {
   getRole(taskId: string, name: string): TaskRole | null;
   saveTaskRoleWithSessionSet(role: TaskRole, sessions: TaskRoleSessionSet): void;
   removeTaskRole(taskId: string, name: string): boolean;
-  saveRoleWorkspace(taskId: string, workspace: RoleWorkspace): void;
-  listRoleWorkspaces(taskId: string): RoleWorkspace[];
-  getRoleWorkspace(taskId: string, roleName: string): RoleWorkspace | null;
-  removeRoleWorkspace(taskId: string, roleName: string): boolean;
+  saveManagedWorkspace(workspace: ManagedWorkspace): void;
+  listManagedWorkspaces(taskId: string): ManagedWorkspace[];
+  /** Singular spelling is retained for the public owner-selector API. */
+  listManagedWorkspace(taskId: string): ManagedWorkspace[];
+  getManagedWorkspace(owner: ManagedWorkspaceOwner): ManagedWorkspace | null;
+  getTaskWorkspace(taskId: string): ManagedWorkspace | null;
+  getWorkItemWorkspace(taskId: string, workItemId: string): ManagedWorkspace | null;
+  getReviewRoundWorkspace(taskId: string, reviewRoundId: string): ManagedWorkspace | null;
+  getIntegrationWorkspace(taskId: string, integrationAttemptId: string): ManagedWorkspace | null;
+  removeManagedWorkspace(owner: ManagedWorkspaceOwner): boolean;
   getRoleSessionSet(taskId: string, roleName: string): TaskRoleSessionSet | null;
   getTaskRoleSessionSet(taskId: string, roleName: string): TaskRoleSessionSet | null;
   listRoleSessionSets(taskId: string): TaskRoleSessionSet[];
@@ -276,6 +284,7 @@ export type TaskStore = {
 
 export class FileTaskStore implements TaskStore {
   #transaction: { state: StorageState; baseRevision: number; dirty: boolean } | null = null;
+  #readCache: { fingerprint: string; state: StorageState } | null = null;
 
   constructor(private readonly rootDir: string) {
     requireStorageSchema(rootDir);
@@ -286,12 +295,15 @@ export class FileTaskStore implements TaskStore {
   transaction<T>(execute: (store: TaskStore) => T): T {
     if (this.#transaction !== null) return synchronousResult(execute(this));
     return this.#withWriteLock(() => {
-      const state = this.#readState();
+      const state = this.#readCachedState();
       this.#transaction = { state, baseRevision: state.revision, dirty: false };
       try {
         const result = synchronousResult(execute(this));
         if (this.#transaction.dirty) this.#commit(state, this.#transaction.baseRevision);
         return result;
+      } catch (error) {
+        this.#readCache = null;
+        throw error;
       } finally {
         this.#transaction = null;
       }
@@ -658,9 +670,6 @@ export class FileTaskStore implements TaskStore {
   removeTaskRole(taskId: string, name: string): boolean {
     return this.transaction(() => {
       const aggregate = this.#requireTask(taskId);
-      if (aggregate.roleWorkspaces[name] !== undefined) {
-        throw new StorageRecordError(`Task Role workspace must be cleaned before removing the Role: ${taskId}/${name}`);
-      }
       const removed = this.#remove(() => aggregate.roles, name);
       this.#mutate((state) => {
         delete aggregate.roleSessionSets[name];
@@ -670,47 +679,82 @@ export class FileTaskStore implements TaskStore {
       return removed;
     });
   }
-  saveRoleWorkspace(taskId: string, workspace: RoleWorkspace): void {
-    const aggregate = this.#requireTaskForWrite(taskId);
+  saveManagedWorkspace(workspace: ManagedWorkspace): void {
     const stored = clone(workspace);
-    validateRoleWorkspace(stored);
-    if (stored.taskId !== taskId) {
-      throw new StorageRecordError(`RoleWorkspace belongs to another Task: ${stored.taskId}`);
+    validateManagedWorkspace(stored);
+    const taskId = stored.owner.taskId;
+    const aggregate = this.#requireTaskForWrite(taskId);
+    if (stored.owner.type === "work-item"
+      && aggregate.workItems[stored.owner.workItemId] === undefined) {
+      throw new StorageRecordError(
+        `Managed workspace WorkItem not found: ${taskId}/${stored.owner.workItemId}.`
+      );
     }
-    if (aggregate.roles[stored.roleName] === undefined) {
-      throw new StorageRecordError(`Task Role not found: ${taskId}/${stored.roleName}`);
+    if (stored.owner.type === "review-round"
+      && aggregate.reviewRounds[stored.owner.reviewRoundId] === undefined) {
+      throw new StorageRecordError(
+        `Managed workspace ReviewRound not found: ${taskId}/${stored.owner.reviewRoundId}.`
+      );
     }
-    const boundProjects = new Set(aggregate.task.projectBindings.map(({ projectId }) => projectId));
+    if (stored.owner.type === "integration-attempt"
+      && aggregate.integrationAttempts[stored.owner.integrationAttemptId] === undefined) {
+      throw new StorageRecordError(
+        `Managed workspace Integration Attempt not found: ${taskId}/${stored.owner.integrationAttemptId}.`
+      );
+    }
+    assertManagedWorkspaceReferences(aggregate, stored, "Managed workspace");
+    const boundProjects = new Set(
+      aggregate.task.projectBindings.map(({ projectId }) => projectId)
+    );
     if (stored.entries.some(({ projectId }) => !boundProjects.has(projectId))) {
-      throw new StorageRecordError(`RoleWorkspace Project does not match Task: ${taskId}/${stored.roleName}`);
-    }
-    if (stored.owner.type === "review-round") {
-      const round = aggregate.reviewRounds[stored.owner.reviewRoundId];
-      if (round === undefined) {
-        throw new StorageRecordError(
-          `RoleWorkspace ReviewRound not found: ${taskId}/${stored.owner.reviewRoundId}.`
-        );
-      }
-      if (round.reviewerRoleName !== stored.roleName) {
-        throw new StorageRecordError(
-          `RoleWorkspace does not match its Reviewer Role: ${taskId}/${stored.roleName}.`
-        );
-      }
+      throw new StorageRecordError(
+        `Managed workspace Project does not match Task: ${taskId}.`
+      );
     }
     this.#mutate((state) => {
-      state.tasks[taskId].roleWorkspaces[stored.roleName] = stored;
+      state.tasks[taskId].managedWorkspaces[managedWorkspaceKey(stored.owner)] = stored;
     });
   }
-  listRoleWorkspaces(taskId: string): RoleWorkspace[] {
-    return values(this.#requireTask(taskId).roleWorkspaces, "roleName");
+  listManagedWorkspaces(taskId: string): ManagedWorkspace[] {
+    return values(this.#requireTask(taskId).managedWorkspaces, (workspace) =>
+      managedWorkspaceKey(workspace.owner)
+    );
   }
-  getRoleWorkspace(taskId: string, roleName: string): RoleWorkspace | null {
-    return optional(this.#state().tasks[taskId]?.roleWorkspaces[roleName]);
+  listManagedWorkspace(taskId: string): ManagedWorkspace[] {
+    return this.listManagedWorkspaces(taskId);
   }
-  removeRoleWorkspace(taskId: string, roleName: string): boolean {
-    this.#requireTaskForWrite(taskId);
-    return this.#remove((state) => state.tasks[taskId].roleWorkspaces, roleName);
+  getTaskWorkspace(taskId: string): ManagedWorkspace | null {
+    return this.getManagedWorkspace({ type: "task", taskId });
   }
+  getWorkItemWorkspace(taskId: string, workItemId: string): ManagedWorkspace | null {
+    return this.getManagedWorkspace({ type: "work-item", taskId, workItemId });
+  }
+  getReviewRoundWorkspace(taskId: string, reviewRoundId: string): ManagedWorkspace | null {
+    return this.getManagedWorkspace({ type: "review-round", taskId, reviewRoundId });
+  }
+  getIntegrationWorkspace(
+    taskId: string,
+    integrationAttemptId: string
+  ): ManagedWorkspace | null {
+    return this.getManagedWorkspace({
+      type: "integration-attempt",
+      taskId,
+      integrationAttemptId
+    });
+  }
+  getManagedWorkspace(owner: ManagedWorkspaceOwner): ManagedWorkspace | null {
+    return optional(
+      this.#state().tasks[owner.taskId]?.managedWorkspaces[managedWorkspaceKey(owner)]
+    );
+  }
+  removeManagedWorkspace(owner: ManagedWorkspaceOwner): boolean {
+    this.#requireTaskForWrite(owner.taskId);
+    return this.#remove(
+      (state) => state.tasks[owner.taskId].managedWorkspaces,
+      managedWorkspaceKey(owner)
+    );
+  }
+
   getRoleSessionSet(taskId: string, roleName: string): TaskRoleSessionSet | null {
     return optional(this.#state().tasks[taskId]?.roleSessionSets[roleName]);
   }
@@ -785,6 +829,13 @@ export class FileTaskStore implements TaskStore {
     const stored = identified<AgentRun>(run, 4, "id", run.id, "Agent run");
     validateAgentRun(stored);
     const aggregate = this.#requireTaskForWrite(stored.taskId);
+    if (stored.purpose === "review"
+      && aggregate.task.projectBindings.length > 0
+      && stored.workspace === undefined) {
+      throw new StorageRecordError(
+        `A Project-backed review Agent run requires its ReviewRound workspace: ${stored.id}.`
+      );
+    }
     if (stored.reviewRoundId !== undefined) {
       const round = aggregate.reviewRounds[stored.reviewRoundId];
       if (round === undefined) {
@@ -1090,7 +1141,7 @@ export class FileTaskStore implements TaskStore {
   }
   #requireTaskForWrite(taskId: string): StoredTask { return this.#requireTask(taskId); }
 
-  #state(): StorageState { return this.#transaction?.state ?? this.#readState(); }
+  #state(): StorageState { return this.#transaction?.state ?? this.#readCachedState(); }
   #mutate(execute: (state: StorageState) => void): void { this.#mutateResult((state) => { execute(state); }); }
   #mutateResult<T>(execute: (state: StorageState) => T): T {
     if (this.#transaction !== null) {
@@ -1099,10 +1150,15 @@ export class FileTaskStore implements TaskStore {
       return result;
     }
     return this.#withWriteLock(() => {
-      const state = this.#readState();
-      const result = execute(state);
-      this.#commit(state, state.revision);
-      return result;
+      const state = this.#readCachedState();
+      try {
+        const result = execute(state);
+        this.#commit(state, state.revision);
+        return result;
+      } catch (error) {
+        this.#readCache = null;
+        throw error;
+      }
     });
   }
   #remove<T>(select: (state: StorageState) => Record<string, T>, id: string): boolean {
@@ -1146,6 +1202,21 @@ export class FileTaskStore implements TaskStore {
     if (!existsSync(path)) return emptyState();
     return parseState(readFileSync(path, "utf8"));
   }
+  #readCachedState(): StorageState {
+    requireStorageSchema(this.rootDir);
+    const path = join(this.rootDir, STORAGE_STATE_FILE);
+    if (!existsSync(path)) {
+      if (this.#readCache?.fingerprint === "missing") return this.#readCache.state;
+      const state = emptyState();
+      this.#readCache = { fingerprint: "missing", state };
+      return state;
+    }
+    const fingerprint = stateFileFingerprint(path);
+    if (this.#readCache?.fingerprint === fingerprint) return this.#readCache.state;
+    const state = parseState(readFileSync(path, "utf8"));
+    this.#readCache = { fingerprint, state };
+    return state;
+  }
   #commit(state: StorageState, expectedRevision: number): void {
     // The upgrade admission fence is honored at the single write moment, so both
     // baseline CLI writers and the Controller (which mutate through this same
@@ -1161,11 +1232,17 @@ export class FileTaskStore implements TaskStore {
     const content = `${JSON.stringify(state, null, 2)}\n`;
     parseState(content);
     writeTextFileAtomically(join(this.rootDir, STORAGE_STATE_FILE), content);
+    this.#readCache = null;
   }
   #withWriteLock<T>(execute: () => T): T {
     const release = acquireStorageLock(this.rootDir);
     try { return execute(); } finally { release(); }
   }
+}
+
+function stateFileFingerprint(path: string): string {
+  const stat = statSync(path, { bigint: true });
+  return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(":");
 }
 
 export class StorageRecordError extends Error { constructor(message: string) { super(message); this.name = "StorageRecordError"; } }
@@ -1180,7 +1257,7 @@ export function ensureYuiHome(rootDir: string): void { mkdirSync(rootDir, { recu
 
 function emptyState(): StorageState {
   return {
-    schemaVersion: 14,
+    schemaVersion: 15,
     revision: 0,
     config: { schemaVersion: 1 },
     configuredAgents: {},
@@ -1194,14 +1271,14 @@ function emptyState(): StorageState {
 }
 function emptyStoredTask(task: Task): StoredTask {
   return {
-    schemaVersion: 13,
+    schemaVersion: 14,
     task,
     idHighWaterMarks: emptyTaskIdHighWaterMarks(),
     brief: null,
     changeSets: {},
     integrationAttempts: {},
     roles: {},
-    roleWorkspaces: {},
+    managedWorkspaces: {},
     roleSessionSets: {},
     workItems: {},
     agentRuns: {},
@@ -1273,7 +1350,7 @@ function parseState(raw: string): StorageState {
     "tasks",
     "mailboxes"
   ], "Storage state");
-  if (state.schemaVersion !== 14 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
+  if (state.schemaVersion !== 15 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
   const result = clone(state) as unknown as StorageState;
   result.config = versioned(result.config, 1, "Yui config");
   validateYuiConfig(result.config);
@@ -1333,23 +1410,31 @@ function parseState(raw: string): StorageState {
     for (const [name, role] of Object.entries(aggregate.roles)) {
       const sessions = aggregate.roleSessionSets[name];
       if (sessions !== undefined) assertSessionsMatchRole(sessions, role);
-      const workspace = aggregate.roleWorkspaces[name];
-      if (workspace !== undefined && workspace.root !== role.workspace) {
-        throw new StorageRecordError(`Task Role workspace path is inconsistent: ${aggregate.task.id}/${name}`);
-      }
     }
     for (const name of Object.keys(aggregate.roleSessionSets)) {
       if (aggregate.roles[name] === undefined) {
         throw new StorageRecordError(`Task Role session set has no Role: ${aggregate.task.id}/${name}`);
       }
     }
-    for (const [name, workspace] of Object.entries(aggregate.roleWorkspaces)) {
-      if (aggregate.roles[name] === undefined) {
-        throw new StorageRecordError(`RoleWorkspace has no Task Role: ${aggregate.task.id}/${name}`);
+    for (const [key, workspace] of Object.entries(aggregate.managedWorkspaces)) {
+      if (workspace.owner.taskId !== aggregate.task.id) {
+        throw new StorageRecordError(`Managed workspace belongs to another Task: ${key}`);
       }
       const boundProjects = new Set(aggregate.task.projectBindings.map(({ projectId }) => projectId));
       if (workspace.entries.some(({ projectId }) => !boundProjects.has(projectId))) {
-        throw new StorageRecordError(`RoleWorkspace Project does not match Task: ${aggregate.task.id}/${name}`);
+        throw new StorageRecordError(`Managed workspace Project does not match Task: ${aggregate.task.id}/${key}`);
+      }
+      if (workspace.owner.type === "work-item"
+        && aggregate.workItems[workspace.owner.workItemId] === undefined) {
+        throw new StorageRecordError(`Managed workspace WorkItem not found: ${aggregate.task.id}/${workspace.owner.workItemId}`);
+      }
+      if (workspace.owner.type === "review-round"
+        && aggregate.reviewRounds[workspace.owner.reviewRoundId] === undefined) {
+        throw new StorageRecordError(`Managed workspace ReviewRound not found: ${aggregate.task.id}/${workspace.owner.reviewRoundId}`);
+      }
+      if (workspace.owner.type === "integration-attempt"
+        && aggregate.integrationAttempts[workspace.owner.integrationAttemptId] === undefined) {
+        throw new StorageRecordError(`Managed workspace Integration Attempt not found: ${aggregate.task.id}/${workspace.owner.integrationAttemptId}`);
       }
     }
     validateCanonicalTaskReferences(result, aggregate);
@@ -1367,7 +1452,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     "changeSets",
     "integrationAttempts",
     "roles",
-    "roleWorkspaces",
+    "managedWorkspaces",
     "roleSessionSets",
     "workItems",
     "agentRuns",
@@ -1405,19 +1490,24 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateIntegrationAttempt(attempt);
     return attempt;
   }, "integrationAttempts");
-  versioned(aggregate, 13, `Task aggregate ${taskId}`);
+  versioned(aggregate, 14, `Task aggregate ${taskId}`);
   validateTaskIdHighWaterMarks(aggregate.idHighWaterMarks, taskId);
   validateTask(identified(aggregate.task, 3, "id", taskId, "Task"));
   if (aggregate.brief !== null) storedTaskBrief(aggregate.brief);
   parseMap(aggregate.roles, (record, key) => { const role = identified<TaskRole>(record, 3, "name", key, "Task Role"); if (role.taskId !== taskId) throw new StorageRecordError(`Task Role belongs to another Task: ${role.taskId}`); validateTaskRole(role); return role; }, "roles");
-  parseMap(aggregate.roleWorkspaces, (record, key) => {
-    const workspace = identified<RoleWorkspace>(record, 3, "roleName", key, "Managed workspace");
-    if (workspace.taskId !== taskId) {
-      throw new StorageRecordError(`RoleWorkspace belongs to another Task: ${workspace.taskId}`);
+  parseMap(aggregate.managedWorkspaces, (record, key) => {
+    const workspace = record as ManagedWorkspace;
+    validateManagedWorkspace(workspace);
+    if (workspace.owner.taskId !== taskId) {
+      throw new StorageRecordError(
+        `Managed workspace belongs to another Task: ${workspace.owner.taskId}`
+      );
     }
-    validateRoleWorkspace(workspace);
+    if (managedWorkspaceKey(workspace.owner) !== key) {
+      throw new StorageRecordError(`Managed workspace identity is inconsistent: ${taskId}/${key}`);
+    }
     return workspace;
-  }, "roleWorkspaces");
+  }, "managedWorkspaces");
   parseMap(aggregate.roleSessionSets, (record, key) => { const set = taskSessions(record); if (set.owner.taskId !== taskId || set.owner.roleName !== key) throw new StorageRecordError(`Task Role session set identity is inconsistent: ${taskId}/${key}`); return set; }, "roleSessionSets");
   parseMap(aggregate.workItems, (record, key) => {
     const item = identified<WorkItem>(record, 6, "id", key, "Work item");
@@ -1911,18 +2001,18 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
       );
     }
   }
-  for (const workspace of Object.values(aggregate.roleWorkspaces)) {
+  for (const workspace of Object.values(aggregate.managedWorkspaces)) {
     if (workspace.owner.type === "work-item"
       && aggregate.workItems[workspace.owner.workItemId] === undefined) {
       throw new StorageRecordError(
-        `RoleWorkspace Work Item not found: ${taskId}/${workspace.owner.workItemId}.`
+        `Managed workspace Work Item not found: ${taskId}/${workspace.owner.workItemId}.`
       );
     }
     if (workspace.owner.type === "review-round") {
       const round = aggregate.reviewRounds[workspace.owner.reviewRoundId];
-      if (round === undefined || round.reviewerRoleName !== workspace.roleName) {
+      if (round === undefined) {
         throw new StorageRecordError(
-          `RoleWorkspace ReviewRound is invalid: ${taskId}/${workspace.owner.reviewRoundId}.`
+          `Managed workspace ReviewRound is invalid: ${taskId}/${workspace.owner.reviewRoundId}.`
         );
       }
     }
@@ -2039,6 +2129,114 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
           `ReviewRound evidence commit ${evidenceRound.id}/${changeSet.headCommit} cannot become an Integration source.`
         );
       }
+    }
+  }
+  for (const workspace of Object.values(aggregate.managedWorkspaces)) {
+    assertManagedWorkspaceReferences(aggregate, workspace, "Managed workspace");
+  }
+}
+
+/**
+ * Enforce the owner-specific scope at the storage boundary.  The map key and
+ * foreign-record checks prevent dangling identities; these checks prevent a
+ * valid owner from being paired with another lifecycle's Project scope.
+ */
+function assertManagedWorkspaceReferences(
+  aggregate: StoredTask,
+  workspace: ManagedWorkspace,
+  label: string,
+  workItemOverride?: WorkItem
+): void {
+  const taskId = aggregate.task.id;
+  const boundProjects = aggregate.task.projectBindings.map(({ projectId }) => projectId).sort();
+  const actualProjects = workspace.entries.map(({ projectId }) => projectId).sort();
+  const requireVisibleTaskScope = (): void => {
+    // Project bindings are persisted before the physical workspace is
+    // reconciled.  During that bounded hand-off a workspace may be missing a
+    // newly-bound Project, but it must never expose a Project outside the
+    // current Task.  Launch preparation closes the temporary subset before
+    // the workspace can be used.
+    if (actualProjects.some((projectId) => !boundProjects.includes(projectId))) {
+      throw new StorageRecordError(`${label} Project scope does not match Task: ${taskId}.`);
+    }
+  };
+  switch (workspace.owner.type) {
+    case "task":
+      requireVisibleTaskScope();
+      if (workspace.entries.some(({ access }) => access !== "write")) {
+        throw new StorageRecordError(`${label} Task workspace must be writable: ${taskId}.`);
+      }
+      return;
+    case "work-item": {
+      const item = workItemOverride?.id === workspace.owner.workItemId
+        ? workItemOverride
+        : aggregate.workItems[workspace.owner.workItemId];
+      if (item === undefined) {
+        throw new StorageRecordError(
+          `${label} WorkItem not found: ${taskId}/${workspace.owner.workItemId}.`
+        );
+      }
+      requireVisibleTaskScope();
+      const writable = workspace.entries
+        .filter(({ access }) => access === "write")
+        .map(({ projectId }) => projectId)
+        .sort();
+      const expectedWritable = [...item.writeProjectIds].sort();
+      // Write scope expansion is persisted before the physical WorkItem
+      // workspace is reconciled.  The stored workspace may therefore expose
+      // a temporary subset, but it may never grant write access outside the
+      // current WorkItem authorization.
+      if (writable.some((projectId) => !expectedWritable.includes(projectId))) {
+        throw new StorageRecordError(
+          `${label} WorkItem write scope does not match: ${taskId}/${item.id}.`
+        );
+      }
+      return;
+    }
+    case "review-round": {
+      const round = aggregate.reviewRounds[workspace.owner.reviewRoundId];
+      if (round === undefined) {
+        throw new StorageRecordError(
+          `${label} ReviewRound not found: ${taskId}/${workspace.owner.reviewRoundId}.`
+        );
+      }
+      requireVisibleTaskScope();
+      if (workspace.entries.some(({ access }) => access !== "write")) {
+        throw new StorageRecordError(
+          `${label} ReviewRound workspace must be writable: ${taskId}/${round.id}.`
+        );
+      }
+      const item = aggregate.workItems[round.workItemId];
+      const candidate = item?.candidates.find(({ id }) => id === round.candidateId);
+      if (candidate?.gitSnapshot !== undefined) {
+        for (const frozen of candidate.gitSnapshot.projects) {
+          const reviewEntry = workspace.entries.find(({ projectId }) => (
+            projectId === frozen.projectId
+          ));
+          if (reviewEntry === undefined || reviewEntry.baseCommit !== frozen.commit) {
+            throw new StorageRecordError(
+              `${label} ReviewRound does not use the Candidate frozen commit: ${taskId}/${round.id}.`
+            );
+          }
+        }
+      }
+      return;
+    }
+    case "integration-attempt": {
+      const attempt = aggregate.integrationAttempts[workspace.owner.integrationAttemptId];
+      if (attempt === undefined) {
+        throw new StorageRecordError(
+          `${label} Integration Attempt not found: ${taskId}/${workspace.owner.integrationAttemptId}.`
+        );
+      }
+      if (workspace.entries.length !== 1
+        || workspace.entries[0].projectId !== attempt.projectId
+        || workspace.entries[0].access !== "write") {
+        throw new StorageRecordError(
+          `${label} Integration Attempt scope is invalid: ${taskId}/${attempt.id}.`
+        );
+      }
+      return;
     }
   }
 }
@@ -2172,17 +2370,27 @@ function assertWorkItemCandidateReferences(
     throw new StorageRecordError(`${label} revision is invalid.`);
   }
   if (candidate.workspace !== undefined) {
-    if (candidate.workspace.taskId !== item.taskId) {
+    if (candidate.workspace.owner.taskId !== item.taskId) {
       throw new StorageRecordError(`${label} workspace belongs to another Task.`);
     }
     if (candidate.workspace.owner.type === "work-item"
       && candidate.workspace.owner.workItemId !== item.id) {
       throw new StorageRecordError(`${label} workspace belongs to another Work Item.`);
     }
+    if (candidate.workspace.owner.type !== "work-item") {
+      throw new StorageRecordError(`${label} must use the WorkItem-owned Develop workspace.`);
+    }
+    assertManagedWorkspaceReferences(aggregate, candidate.workspace, label, item);
   }
   if (candidate.source.type === "direct") {
     if (item.assignee !== undefined) {
       throw new StorageRecordError(`${label} cannot be direct for an assigned Work Item.`);
+    }
+    if (candidate.workspace !== undefined
+      && (candidate.workspace.owner.type !== "work-item"
+        || candidate.workspace.owner.taskId !== item.taskId
+        || candidate.workspace.owner.workItemId !== item.id)) {
+      throw new StorageRecordError(`${label} must use the WorkItem-owned Develop workspace.`);
     }
     return;
   }
@@ -2194,8 +2402,49 @@ function assertWorkItemCandidateReferences(
     || run.summary !== candidate.summary) {
     throw new StorageRecordError(`${label} Run is invalid: ${candidate.source.runId}.`);
   }
-  if (!isDeepStrictEqual(candidate.workspace, run.workspace)) {
+  if ((candidate.workspace === undefined) !== (run.workspace === undefined)) {
     throw new StorageRecordError(`${label} workspace does not match its source Run.`);
+  }
+  if (candidate.workspace !== undefined && run.workspace !== undefined) {
+    assertCandidateWorkspaceMatchesRun(candidate.workspace, run.workspace, label);
+  }
+  if (candidate.workspace !== undefined && (
+    candidate.workspace.owner.type !== "work-item"
+    || candidate.workspace.owner.taskId !== item.taskId
+    || candidate.workspace.owner.workItemId !== item.id
+  )) {
+    throw new StorageRecordError(`${label} must use the WorkItem-owned Develop workspace.`);
+  }
+}
+
+/** Candidate freezes Git commits at yield time, so timestamp/baseCommit fields
+ * may differ from the Run's dispatch snapshot while workspace identity and
+ * execution scope must remain exact. */
+function assertCandidateWorkspaceMatchesRun(
+  candidate: ManagedWorkspace,
+  run: ManagedWorkspace,
+  label: string
+): void {
+  if (
+    candidate.owner.type !== run.owner.type
+    || candidate.owner.taskId !== run.owner.taskId
+    || candidate.root !== run.root
+    || candidate.entries.length !== run.entries.length
+  ) {
+    throw new StorageRecordError(`${label} workspace does not match its source Run.`);
+  }
+  for (const source of run.entries) {
+    const frozen = candidate.entries.find(({ projectId }) => projectId === source.projectId);
+    if (
+      frozen === undefined
+      || frozen.directory !== source.directory
+      || frozen.access !== source.access
+      || frozen.path !== source.path
+      || frozen.branch !== source.branch
+      || frozen.baseRef !== source.baseRef
+    ) {
+      throw new StorageRecordError(`${label} workspace scope does not match its source Run.`);
+    }
   }
 }
 

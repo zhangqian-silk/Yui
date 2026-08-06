@@ -25,7 +25,7 @@ export function testEffectiveLaunch(input = {}) {
   const taskScoped = typeof workspace === "object" && workspace !== null;
   const role = {
     schemaVersion: 3,
-    ...(taskScoped ? { taskId: workspace.taskId ?? "task-1", status: "idle" } : {}),
+    ...(taskScoped ? { taskId: workspace.owner?.taskId ?? "task-1", status: "idle" } : {}),
     name: input.roleName ?? "fixture-role",
     activeAgentId: agentId,
     agentBindings: {

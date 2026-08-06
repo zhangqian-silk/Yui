@@ -4,7 +4,10 @@ import {
   requireTimestamp
 } from "../domain/validation.js";
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
-import { validateRoleWorkspace, type RoleWorkspace } from "../worktree/roleWorkspace.js";
+import {
+  validateManagedWorkspace,
+  type ManagedWorkspace
+} from "../worktree/managedWorkspace.js";
 export type ReviewRoundStatus = "pending" | "running" | "completed" | "failed";
 export type ReviewRequestSource = "policy" | "leader";
 export type ReviewWorkspaceDisposition = "preserved" | "removed";
@@ -31,7 +34,7 @@ export type ReviewRound = {
   reviewerRoleName: string;
   reviewerRunId?: string;
   reviewBaseCommit: string;
-  workspace?: RoleWorkspace;
+  workspace?: ManagedWorkspace;
   requestedBy: ReviewRequestSource;
   status: ReviewRoundStatus;
   summary?: string;
@@ -72,7 +75,7 @@ export function createReviewRound(
 
 export function attachReviewRoundWorkspace(
   round: ReviewRound,
-  workspace: RoleWorkspace
+  workspace: ManagedWorkspace
 ): ReviewRound {
   validateReviewRound(round);
   validateReviewWorkspace(round, workspace);
@@ -266,9 +269,9 @@ function extractChecks(value: unknown): readonly ReviewCheck[] {
   return validateChecks(extracted);
 }
 
-function validateReviewWorkspace(round: ReviewRound, workspace: RoleWorkspace): void {
-  validateRoleWorkspace(workspace);
-  if (workspace.taskId !== round.taskId || workspace.roleName !== round.reviewerRoleName) {
+function validateReviewWorkspace(round: ReviewRound, workspace: ManagedWorkspace): void {
+  validateManagedWorkspace(workspace);
+  if (workspace.owner.taskId !== round.taskId) {
     throw new Error(`ReviewRound workspace provenance is invalid: ${round.id}.`);
   }
   if (workspace.owner.type !== "review-round"

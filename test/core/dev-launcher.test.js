@@ -862,6 +862,41 @@ test("reset-home CLI awaits the reset before reporting its backup", () => {
   );
 });
 
+test("install-local CLI creates only the isolated launcher and never touches global", () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-install-local-cli-"));
+  const projectRoot = join(root, "checkout");
+  const globalBinDir = join(root, "global-bin");
+  mkdirSync(projectRoot, { recursive: true });
+  mkdirSync(globalBinDir, { recursive: true });
+  const sentinel = join(globalBinDir, "yui");
+  writeFileSync(sentinel, "#!/bin/sh\necho original\n");
+
+  const output = execFileSync(
+    process.execPath,
+    [fileURLToPath(new URL("../../scripts/manage-dev-launcher.mjs", import.meta.url)), "install-local"],
+    { cwd: projectRoot, encoding: "utf8" }
+  );
+
+  const launcherPath = join(projectRoot, "output", "dev", "bin", "yui");
+  assert.match(output, /global yui unchanged/);
+  assert.match(output, new RegExp(launcherPath.replaceAll(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+  assert.equal(existsSync(launcherPath), true);
+  assert.equal(lstatSync(launcherPath).isSymbolicLink(), false);
+  assert.match(readFileSync(launcherPath, "utf8"), /YUI_CLI_NAME=yui/);
+  // A pre-existing unrelated global yui in a separate bin is left untouched.
+  assert.equal(readFileSync(sentinel, "utf8"), "#!/bin/sh\necho original\n");
+});
+
+test("install-local CLI is idempotent and safe to re-run", () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-dev-install-local-idempotent-"));
+  const scriptPath = fileURLToPath(new URL("../../scripts/manage-dev-launcher.mjs", import.meta.url));
+  execFileSync(process.execPath, [scriptPath, "install-local"], { cwd: root, encoding: "utf8" });
+  const launcherPath = join(root, "output", "dev", "bin", "yui");
+  const first = readFileSync(launcherPath, "utf8");
+  execFileSync(process.execPath, [scriptPath, "install-local"], { cwd: root, encoding: "utf8" });
+  assert.equal(readFileSync(launcherPath, "utf8"), first);
+});
+
 test("development home reset rejects malformed Controller discovery without moving data", async () => {
   const root = mkdtempSync(join(tmpdir(), "yui-dev-reset-invalid-discovery-"));
   const outputDir = join(root, "output", "dev");

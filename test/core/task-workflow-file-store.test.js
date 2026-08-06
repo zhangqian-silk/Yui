@@ -12,6 +12,7 @@ import {
   dispatchPreparedReviewRound,
   runTaskCommand
 } from "../../dist/commands/taskCommands.js";
+import { createTaskEvent } from "../../dist/event/taskEvent.js";
 import {
   bindExecution,
   claimPending,
@@ -24,6 +25,7 @@ import {
   updateRole,
   updateRoleStatus
 } from "../../dist/role/role.js";
+import { createLeaderStallNotification } from "../../dist/scheduler/operatorNotification.js";
 import {
   attachReviewRoundWorkspace,
   recordReviewWorkspaceDisposition
@@ -47,7 +49,7 @@ import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { completeTask } from "../../dist/task/task.js";
-import { createRoleWorkspace } from "../../dist/worktree/roleWorkspace.js";
+import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 import {
   createCandidateGitSnapshot,
   recordWorkItemWorkspaceDisposition,
@@ -104,8 +106,10 @@ function fixture(t) {
 function run(args, store, options) {
   const taskId = options.environment?.YUI_TASK_ID;
   if (taskId !== undefined && store.getReviewConfig() !== null) {
-    const roles = reviewCandidateRoles(args, store, taskId);
-    if (roles.length > 0) ensureSyntheticReviewCandidateWorkspace(store, taskId, roles);
+    const workItemIds = reviewCandidateWorkItems(args, store, taskId);
+    if (workItemIds.length > 0) {
+      ensureSyntheticReviewCandidateWorkspace(store, taskId, workItemIds);
+    }
   }
   const snapshotOptions = taskId === undefined
     ? options
@@ -129,19 +133,20 @@ function run(args, store, options) {
   return result.output;
 }
 
-function reviewCandidateRoles(args, store, taskId) {
+function reviewCandidateWorkItems(args, store, taskId) {
   if (args[0] === "work" && args[1] === "dispatch") {
     const item = store.getWorkItem(taskId, args[2]?.split("/").at(-1));
-    return item?.assignee === undefined ? [] : [item.assignee];
+    return item === null ? [] : [item.id];
   }
   if (args[0] === "work" && args[1] === "update" && args[3] === "done") {
-    return ["leader"];
+    const item = store.getWorkItem(taskId, args[2]?.split("/").at(-1));
+    return item === null ? [] : [item.id];
   }
   return [];
 }
 
-function ensureSyntheticReviewCandidateWorkspace(store, taskId, roleNames) {
-  const task = store.getTask(taskId);
+function ensureSyntheticReviewCandidateWorkspace(store, taskId, workItemIds) {
+  let task = store.getTask(taskId);
   if (task === null) return;
   const root = store.getConfig().defaultWorkspace;
   if (store.getProject(REVIEW_PROJECT_ID) === null) {
@@ -162,31 +167,50 @@ function ensureSyntheticReviewCandidateWorkspace(store, taskId, roleNames) {
         baseRef: "main"
       }]
     });
+    task = store.getTask(taskId);
   }
-  for (const roleName of new Set(["leader", ...roleNames])) {
-    if (store.getRoleWorkspace(taskId, roleName) !== null) continue;
-    const role = store.getRole(taskId, roleName);
-    if (role === null) continue;
-    const workspaceRoot = join(root, "synthetic-review", taskId, roleName);
-    const workspace = createRoleWorkspace({
-      taskId,
-      roleName,
-      owner: { type: "task" },
+  if (store.getTaskWorkspace(taskId) === null) {
+    const workspaceRoot = join(root, "synthetic-review", taskId, "main");
+    const workspace = createManagedWorkspace({
+      owner: { type: "task", taskId },
       root: workspaceRoot,
       entries: [{
         projectId: REVIEW_PROJECT_ID,
         directory: "review-fixture",
-        access: "read",
+        access: "write",
         path: join(workspaceRoot, "review-fixture"),
-        branch: `yui/${taskId}/${roleName}`,
+        branch: `yui/${taskId}/main`,
         baseRef: "main",
         baseCommit: REVIEW_BASE_COMMIT
       }]
     }, NOW);
     store.transaction((tx) => {
-      tx.saveRoleWorkspace(taskId, workspace);
-      tx.saveRole(taskId, updateRole(role, { workspace: workspace.root }, NOW));
+      tx.saveManagedWorkspace(workspace);
+      const leader = tx.getRole(taskId, "leader");
+      if (leader !== null) {
+        tx.saveRole(taskId, updateRole(leader, { workspace: workspace.root }, NOW));
+      }
     });
+  }
+  for (const workItemId of new Set(workItemIds)) {
+    if (store.getWorkItemWorkspace(taskId, workItemId) !== null) continue;
+    const item = store.getWorkItem(taskId, workItemId);
+    if (item === null) continue;
+    const workspaceRoot = join(root, "synthetic-review", taskId, workItemId);
+    const workspace = createManagedWorkspace({
+      owner: { type: "work-item", taskId, workItemId },
+      root: workspaceRoot,
+      entries: [{
+        projectId: REVIEW_PROJECT_ID,
+        directory: "review-fixture",
+        access: item.writeProjectIds.includes(REVIEW_PROJECT_ID) ? "write" : "read",
+        path: join(workspaceRoot, "review-fixture"),
+        branch: `yui/${taskId}/${workItemId}`,
+        baseRef: "main",
+        baseCommit: REVIEW_BASE_COMMIT
+      }]
+    }, NOW);
+    store.saveManagedWorkspace(workspace);
   }
 }
 
@@ -196,9 +220,11 @@ function withSyntheticCandidateSnapshot(args, store, taskId, options) {
     const run = store.getAgentRun(taskId, args[2]?.split("/").at(-1));
     if (run?.purpose === "execution") workspace = run.workspace;
   } else if (args[0] === "work" && args[1] === "update" && args[3] === "done") {
-    workspace = store.getRoleWorkspace(taskId, "leader");
+    workspace = store.getWorkItemWorkspace(taskId, args[2]?.split("/").at(-1));
   }
-  if (workspace === undefined || workspace === null) return options;
+  if (workspace === undefined || workspace === null || workspace.entries.length === 0) {
+    return options;
+  }
   return {
     ...options,
     candidateGitSnapshot: createCandidateGitSnapshot(workspace, [{
@@ -214,10 +240,8 @@ function dispatchSyntheticPendingReviews(store, taskId, options) {
   ))) {
     const root = store.getConfig().defaultWorkspace;
     const workspaceRoot = join(root, "synthetic-review", taskId, round.id);
-    const workspace = createRoleWorkspace({
-      taskId,
-      roleName: round.reviewerRoleName,
-      owner: { type: "review-round", reviewRoundId: round.id },
+    const workspace = createManagedWorkspace({
+      owner: { type: "review-round", taskId, reviewRoundId: round.id },
       root: workspaceRoot,
       entries: [{
         projectId: REVIEW_PROJECT_ID,
@@ -232,8 +256,8 @@ function dispatchSyntheticPendingReviews(store, taskId, options) {
     store.transaction((tx) => {
       const reviewer = tx.getRole(taskId, round.reviewerRoleName);
       assert.notEqual(reviewer, null);
+      tx.saveManagedWorkspace(workspace);
       tx.saveReviewRound(taskId, attachReviewRoundWorkspace(round, workspace));
-      tx.saveRoleWorkspace(taskId, workspace);
       tx.saveRole(taskId, updateRole(reviewer, { workspace: workspace.root }, NOW));
     });
     dispatchPreparedReviewRound(taskId, round.id, store, options);
@@ -244,11 +268,11 @@ function cleanupSyntheticReviewWorkspace(store, taskId, reviewRoundId) {
   if (reviewRoundId === undefined) return;
   const round = store.getReviewRound(taskId, reviewRoundId);
   if (round === null || (round.status !== "completed" && round.status !== "failed")) return;
-  const workspace = store.getRoleWorkspace(taskId, round.reviewerRoleName);
+  const workspace = store.getReviewRoundWorkspace(taskId, round.id);
   if (workspace?.owner.type !== "review-round"
     || workspace.owner.reviewRoundId !== round.id) return;
   store.transaction((tx) => {
-    tx.removeRoleWorkspace(taskId, round.reviewerRoleName);
+    tx.removeManagedWorkspace(workspace.owner);
     tx.saveReviewRound(taskId, recordReviewWorkspaceDisposition(round, "removed", NOW));
   });
 }
@@ -307,7 +331,58 @@ function recordReadyNativeSession(store, taskId, roleName, nativeSessionId) {
   store.saveTaskRoleSessionSet(sessions);
 }
 
-test("Work Item rejection and Leader disposition close the acceptance loop", (t) => {
+test("CLI yield clears matching Leader stall attention and rejects duplicate terminalization", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Recover Leader attention");
+  run(["activate", task.id], store, options);
+  run(["work", "create", task.id, "Leader recovery"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  const active = dispatchTestRun(store, task.id, "leader", item.id);
+  markDelivered(store, active);
+  store.transaction((tx) => {
+    tx.saveEvent(task.id, createTaskEvent(
+      tx.nextEventId(task.id),
+      task.id,
+      "run.stalled",
+      {
+        runId: active.id,
+        roleName: "leader",
+        kind: "execution-stalled",
+        classification: "truly-stalled",
+        progressAt: active.createdAt,
+        idleMs: "1800000",
+        evidenceKey: "cli-yield-test",
+        status: "needs-attention"
+      },
+      NOW
+    ));
+    tx.saveOperatorNotification(createLeaderStallNotification(
+      task.id,
+      active.id,
+      active.createdAt,
+      "cli-yield-test",
+      NOW,
+      null
+    ));
+  });
+
+  run(["run", "yield", active.id, "--summary", "Leader recovered"], store, options);
+  assert.equal(store.getOperatorNotification(task.id), null);
+  assert.equal(store.getActiveAgentRun(task.id, "leader"), null);
+  assert.equal(
+    store.listEvents(task.id).filter(({ type, payload }) => (
+      type === "run.recovered" && payload.runId === active.id
+    )).length,
+    1
+  );
+  assert.throws(
+    () => run(["run", "yield", active.id, "--summary", "duplicate"], store, options),
+    /already terminal/u
+  );
+  assert.equal(store.getOperatorNotification(task.id), null);
+});
+
+test("Work Item rejection and cancellation close the acceptance loop without new states", (t) => {
   const { store, options } = fixture(t);
   const task = createTask(store, options);
   run(["activate", task.id], store, options);
@@ -364,14 +439,18 @@ test("Work Item rejection and Leader disposition close the acceptance loop", (t)
 
 function dispatchTestRun(store, taskId, roleName, workItemId, input = "test run") {
   if (store.getReviewConfig() !== null) {
-    ensureSyntheticReviewCandidateWorkspace(store, taskId, [roleName]);
+    ensureSyntheticReviewCandidateWorkspace(store, taskId, [workItemId]);
   }
   const role = store.getRole(taskId, roleName);
-  const workspace = store.getRoleWorkspace(taskId, roleName) ?? undefined;
   if (store.getActiveAgentRun(taskId, roleName) !== null) {
     throw new Error(`${taskId}/${roleName} already has an active run.`);
   }
   const runId = store.nextAgentRunId(taskId);
+  const workspace = store.getWorkItemWorkspace(taskId, workItemId) ?? createManagedWorkspace({
+    owner: { type: "work-item", taskId, workItemId },
+    root: join(store.rootDirectory(), "test-workspaces", taskId, workItemId),
+    entries: []
+  }, NOW);
   const run = createAgentRun(
     runId,
     taskId,
@@ -389,8 +468,8 @@ function dispatchTestRun(store, taskId, roleName, workItemId, input = "test run"
     tx.saveAgentRun(run);
     tx.saveActiveAgentRun(run);
     tx.saveRole(taskId, updateRoleStatus(role, "running", NOW));
-    const item = tx.getWorkItem(taskId, workItemId);
-    tx.saveWorkItem(taskId, updateWorkItemStatus(item, "running", NOW));
+    const currentItem = tx.getWorkItem(taskId, workItemId);
+    tx.saveWorkItem(taskId, updateWorkItemStatus(currentItem, "running", NOW));
     const target = { kind: "role", taskId, roleName };
     const mailbox = enqueueSignal(tx.getWorkMailbox(target) ?? createWorkMailbox(target), {
       reason: "run-dispatched",
@@ -1056,10 +1135,8 @@ test("always review covers a Leader-managed WorkItem without inventing an execut
 
   run(["work", "update", item.id, "running"], store, leaderOptions);
   const running = store.getWorkItem(task.id, item.id);
-  const foreignWorkspace = createRoleWorkspace({
-    taskId: "foreign-task",
-    roleName: "leader",
-    owner: { type: "task" },
+  const foreignWorkspace = createManagedWorkspace({
+    owner: { type: "task", taskId: "foreign-task" },
     root,
     entries: []
   }, new Date(NOW));
@@ -1070,7 +1147,7 @@ test("always review covers a Leader-managed WorkItem without inventing an execut
       reviewPolicy: { roleName: "reviewer", trigger: "leader" },
       workspace: foreignWorkspace
     }, NOW)),
-    /workspace belongs to another Task/
+    /WorkItem-owned workspace/
   );
   run([
     "work", "update", item.id, "done",
