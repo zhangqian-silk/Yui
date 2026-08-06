@@ -7,7 +7,10 @@ import type {
   WorkItem,
   WorkItemWorkspaceDisposition
 } from "../workItem/workItem.js";
-import type { RoleWorkspace } from "../worktree/roleWorkspace.js";
+import {
+  managedWorkspaceKey,
+  type ManagedWorkspace
+} from "../worktree/managedWorkspace.js";
 import type { GitWorkspaceRemoval } from "./gitWorkspace.js";
 import {
   FileTaskWorkspacePreparer,
@@ -23,7 +26,7 @@ export type TaskRoleRuntimeStopper = Readonly<{
 
 type TaskArchiveSnapshot = Readonly<{
   task: Task;
-  roleWorkspaces: readonly RoleWorkspace[];
+  managedWorkspaces: readonly ManagedWorkspace[];
   workItems: readonly WorkItem[];
   reviewRounds: readonly ReviewRound[];
 }>;
@@ -43,30 +46,35 @@ export class TaskWorkspaceCoordinator {
     const item = this.store.getWorkItem(taskId, workItemId);
     if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
     const assignee = this.#workItemIsolationAssignee(item);
+    const activeDevelopRun = this.store.listAgentRuns(item.taskId)
+      .find((run) => run.status === "active" && run.workItemId === item.id);
+    if (activeDevelopRun !== undefined) {
+      throw new Error(`Work Item already has an active Develop Run: ${activeDevelopRun.id}.`);
+    }
     const task = this.store.getTask(item.taskId)!;
     const taskProjectIds = task.projectBindings.map(({ projectId }) => projectId);
-    const existing = this.store.getRoleWorkspace(item.taskId, assignee);
+    const existing = this.store.getWorkItemWorkspace(item.taskId, item.id);
     if (existing !== null
       && existing.owner.type === "work-item"
       && existing.owner.workItemId === item.id
       && sameProjectScope(existing, taskProjectIds, item.writeProjectIds)) return existing;
     if (existing !== null) {
       if (existing.owner.type !== "work-item" || existing.owner.workItemId !== item.id) {
-        throw new Error(`Role already has another WorkItem workspace: ${item.taskId}/${assignee}.`);
+        throw new Error(`WorkItem already has another managed workspace: ${item.taskId}/${item.id}.`);
       }
     }
     await this.preparer.prepareTaskWorkspace(item.taskId);
-    const prepared = this.store.getRoleWorkspace(item.taskId, assignee);
+    const prepared = this.store.getWorkItemWorkspace(item.taskId, item.id);
     if (prepared !== null
       && prepared.owner.type === "work-item"
       && prepared.owner.workItemId === item.id
       && sameProjectScope(prepared, taskProjectIds, item.writeProjectIds)) return prepared;
     if (prepared !== null) {
       if (prepared.owner.type !== "work-item" || prepared.owner.workItemId !== item.id) {
-        throw new Error(`Role already has another WorkItem workspace: ${item.taskId}/${assignee}.`);
+        throw new Error(`WorkItem already has another managed workspace: ${item.taskId}/${item.id}.`);
       }
     }
-    await this.#stopLiveRoles(item.taskId, [assignee]);
+    if (assignee !== undefined) await this.#stopLiveRoles(item.taskId, [assignee]);
     return this.preparer.prepareWorkItemWorkspace(item.taskId, item.id);
   }
 
@@ -80,14 +88,6 @@ export class TaskWorkspaceCoordinator {
     if (!isTerminalWorkItem(item)) {
       throw new Error(`Work item must be terminal before cleanup: ${item.id}.`);
     }
-    if (item.assignee === undefined) {
-      throw new WorkspaceCleanupBlockedError(
-        "work-item-no-role",
-        `work-item:${item.taskId}/${item.id}`,
-        false,
-        `Work item has no Task Role workspace: ${item.id}.`
-      );
-    }
     if (item.workspaceDisposition !== undefined
       && item.workspaceDisposition !== disposition) {
       throw new Error(
@@ -97,8 +97,8 @@ export class TaskWorkspaceCoordinator {
     if (item.workspaceDisposition === disposition) return "missing";
     const state = await this.preparer.inspectWorkItemWorkspace(item.taskId, item.id);
     if (state === "dirty") return "dirty";
-    this.#assertWorkItemRuntimeOwner(item);
-    await this.runtime.stopTaskRoleSessions(item.taskId, [item.assignee]);
+    this.#assertWorkItemRuntimeQuiescent(item);
+    if (item.assignee !== undefined) await this.#stopLiveRoles(item.taskId, [item.assignee]);
     return this.preparer.cleanupWorkItemWorkspace(item.taskId, item.id, disposition);
   }
 
@@ -108,8 +108,10 @@ export class TaskWorkspaceCoordinator {
   ): Promise<"released"> {
     const item = this.store.getWorkItem(taskId, workItemId);
     if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
-    this.#assertWorkItemRuntimeOwner(item);
-    await this.runtime.stopTaskRoleSessions(item.taskId, [item.assignee!]);
+    this.#assertWorkItemRuntimeQuiescent(item);
+    if (item.assignee !== undefined) {
+      await this.#stopLiveRoles(item.taskId, [item.assignee]);
+    }
     return "released";
   }
 
@@ -138,9 +140,10 @@ export class TaskWorkspaceCoordinator {
       if (task.status !== "completed" && task.status !== "retired") {
         throw new Error(`Task must be completed or retired before archive cleanup: ${task.id}.`);
       }
-      const roleWorkspaces = [...this.store.listRoleWorkspaces(task.id)]
-        .sort((left, right) => left.roleName.localeCompare(right.roleName));
-      const workspaces = roleWorkspaces
+      const managedWorkspaces = [...this.store.listManagedWorkspaces(task.id)]
+        .sort((left, right) => managedWorkspaceKey(left.owner)
+          .localeCompare(managedWorkspaceKey(right.owner)));
+      const workspaces = managedWorkspaces
         .filter(({ owner }) => owner.type === "work-item");
       const workItems = workspaces.map((workspace) => {
         const workItemId = workspace.owner.type === "work-item"
@@ -162,7 +165,7 @@ export class TaskWorkspaceCoordinator {
       ));
       const snapshot: TaskArchiveSnapshot = {
         task,
-        roleWorkspaces,
+        managedWorkspaces,
         workItems: allWorkItems,
         reviewRounds: allReviewRounds
       };
@@ -260,13 +263,14 @@ export class TaskWorkspaceCoordinator {
 
   #assertTaskArchiveSnapshot(snapshot: TaskArchiveSnapshot): void {
     this.#assertTaskArchiveLifecycle(snapshot.task);
-    const roleWorkspaces = [...this.store.listRoleWorkspaces(snapshot.task.id)]
-      .sort((left, right) => left.roleName.localeCompare(right.roleName));
+    const managedWorkspaces = [...this.store.listManagedWorkspaces(snapshot.task.id)]
+      .sort((left, right) => managedWorkspaceKey(left.owner)
+        .localeCompare(managedWorkspaceKey(right.owner)));
     const workItems = [...this.store.listWorkItems(snapshot.task.id)]
       .sort((left, right) => left.id.localeCompare(right.id));
     const reviewRounds = [...this.store.listReviewRounds(snapshot.task.id)]
       .sort((left, right) => left.id.localeCompare(right.id));
-    if (!isDeepStrictEqual(roleWorkspaces, snapshot.roleWorkspaces)
+    if (!isDeepStrictEqual(managedWorkspaces, snapshot.managedWorkspaces)
       || !isDeepStrictEqual(workItems, snapshot.workItems)
       || !isDeepStrictEqual(reviewRounds, snapshot.reviewRounds)) {
       throw new WorkspaceCleanupBlockedError(
@@ -290,45 +294,15 @@ export class TaskWorkspaceCoordinator {
     }
   }
 
-  #assertWorkItemRuntimeOwner(item: WorkItem): void {
-    if (item.assignee === undefined) {
-      throw new WorkspaceCleanupBlockedError(
-        "work-item-no-role",
-        `work-item:${item.taskId}/${item.id}`,
-        false,
-        `Work item has no Task Role runtime: ${item.id}.`
-      );
-    }
-    const activeRun = this.store.getActiveAgentRun(item.taskId, item.assignee);
-    if (activeRun !== null) {
-      if (activeRun.workItemId !== item.id) {
-        throw new WorkspaceCleanupBlockedError(
-          "role-reassigned",
-          `role:${item.taskId}/${item.assignee}`,
-          true,
-          `Task Role already serves Work Item ${activeRun.workItemId ?? "none"}: `
-          + `${item.taskId}/${item.assignee}.`
-        );
-      }
+  #assertWorkItemRuntimeQuiescent(item: WorkItem): void {
+    const activeRun = this.store.listAgentRuns(item.taskId)
+      .find((run) => run.status === "active" && run.workItemId === item.id);
+    if (activeRun !== undefined) {
       throw new WorkspaceCleanupBlockedError(
         "active-run",
         `work-item:${item.taskId}/${item.id}`,
         true,
         `Work item still has an active Run: ${item.taskId}/${item.id}.`
-      );
-    }
-    const workspace = this.store.getRoleWorkspace(item.taskId, item.assignee);
-    if (workspace?.owner.type !== "work-item"
-      || workspace.owner.workItemId !== item.id) {
-      const owner = workspace?.owner.type === "work-item"
-        ? workspace.owner.workItemId
-        : workspace?.owner.type ?? "none";
-      throw new WorkspaceCleanupBlockedError(
-        "role-reassigned",
-        `role:${item.taskId}/${item.assignee}`,
-        true,
-        `Task Role no longer serves Work Item ${item.id} (current owner: ${owner}): `
-        + `${item.taskId}/${item.assignee}.`
       );
     }
   }
@@ -347,15 +321,12 @@ export class TaskWorkspaceCoordinator {
     if (live.length > 0) await this.runtime.stopTaskRoleSessions(taskId, live);
   }
 
-  #workItemIsolationAssignee(item: WorkItem): string {
+  #workItemIsolationAssignee(item: WorkItem): string | undefined {
     const task = this.store.getTask(item.taskId);
     if (task === null) throw new Error(`Task not found: ${item.taskId}.`);
     if (task.status !== "active") throw new Error(`Task is not active: ${task.id}.`);
     if (task.projectBindings.length === 0) {
       throw new Error(`WorkItem isolation requires a Project-backed Task: ${task.id}.`);
-    }
-    if (item.assignee === undefined) {
-      throw new Error(`WorkItem isolation requires a Task Role assignee: ${item.id}.`);
     }
     if (item.assignee === "leader") {
       throw new Error("The Leader must remain in the Task main worktree.");
@@ -363,10 +334,10 @@ export class TaskWorkspaceCoordinator {
     if (isTerminalWorkItem(item)) {
       throw new Error(`Work item is already terminal: ${item.id}.`);
     }
-    if (this.store.getActiveAgentRun(task.id, item.assignee) !== null) {
+    if (item.assignee !== undefined && this.store.getActiveAgentRun(task.id, item.assignee) !== null) {
       throw new Error(`Role has an active Run: ${task.id}/${item.assignee}.`);
     }
-    if (this.store.getRole(task.id, item.assignee) === null) {
+    if (item.assignee !== undefined && this.store.getRole(task.id, item.assignee) === null) {
       throw new Error(`Role not found: ${task.id}/${item.assignee}.`);
     }
     return item.assignee;

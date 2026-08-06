@@ -468,7 +468,7 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
     ], store, { ...primaryLeader, now: () => finalSettlementNow });
   }
   assert.equal(store.getActiveAgentRun(primaryTask.id, "leader"), null);
-  const taskCleanup = store.getRoleWorkspace(lifecycleTask.id, "leader") === null
+  const taskCleanup = store.getTaskWorkspace(lifecycleTask.id) === null
     ? { status: "removed" }
     : { status: "failed" };
   assert.equal(taskCleanup.status, "removed");

@@ -49,10 +49,10 @@ function readEffective(agentId, adapterId, workspace) {
     context: {}
   };
 }
-test("storage schema initializes layout v6 with aggregate v14 and rejects non-current versions", () => {
+test("storage schema initializes layout v6 with aggregate v15 and rejects non-current versions", () => {
   const home = temporaryHome();
   assert.equal(CURRENT_STORAGE_LAYOUT_VERSION, 6);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 14);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 15);
   assert.equal(inspectStorageSchema(home).status, "uninitialized");
 
   ensureStorageSchema(home, new Date("2026-07-19T00:00:00.000Z"));
@@ -78,7 +78,6 @@ test("storage schema initializes layout v6 with aggregate v14 and rejects non-cu
     );
   }
 });
-
 test("FileTaskStore commits the authoritative workflow graph in one aggregate write", () => {
   const home = temporaryHome();
   ensureStorageSchema(home);
@@ -224,8 +223,8 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   });
 
   const onDisk = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
-  assert.equal(onDisk.schemaVersion, 14);
-  assert.equal(onDisk.tasks[task.id].schemaVersion, 13);
+  assert.equal(onDisk.schemaVersion, 15);
+  assert.equal(onDisk.tasks[task.id].schemaVersion, 14);
   assert.equal(onDisk.revision, 1);
   assert.deepEqual(store.getConfiguredAgent("codex"), agent);
   assert.deepEqual(store.getGlobalRole("operator"), globalRole);
@@ -266,7 +265,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify(incompatible));
   assert.throws(
     () => new FileTaskStore(home).listTasks(),
-    /Task aggregate task-1 must use schemaVersion 13/
+    /Task aggregate task-1 must use schemaVersion 14/
   );
 });
 
@@ -518,7 +517,7 @@ test("record versions and aggregate shape are validated without silently repairi
   );
 
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify({
-    schemaVersion: 14,
+    schemaVersion: 15,
     revision: 1,
     config: { schemaVersion: 1 },
     configuredAgents: {},

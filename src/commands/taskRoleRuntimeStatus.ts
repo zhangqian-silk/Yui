@@ -12,7 +12,7 @@ import {
 import type { TaskStore } from "../storage/taskStore.js";
 import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import type { WorkItem } from "../workItem/workItem.js";
-import type { RoleWorkspace } from "../worktree/roleWorkspace.js";
+import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import {
   isRoleRunStalled,
   latestStallProgressAt
@@ -37,7 +37,7 @@ export type TaskRoleTmuxStatus = Readonly<{
 
 export type TaskRoleWorkspaceStatus =
   | Readonly<{ managed: false; path: string }>
-  | Readonly<{ managed: true } & RoleWorkspace>;
+  | Readonly<{ managed: true } & ManagedWorkspace>;
 
 export type TaskRoleSessionRecoveryStatus = Readonly<{
   taskId: string;
@@ -224,7 +224,13 @@ function inspectTaskRoleRuntimeStatus(
         ...(pane.pid === undefined ? {} : { pid: pane.pid }),
         currentCommand: pane.currentCommand
       };
-  const managedWorkspace = store.getRoleWorkspace(taskId, role.name);
+  // The active Run snapshot is authoritative for the live Role session.  It
+  // may point at a ReviewRound-owned workspace, which is intentionally
+  // distinct from the WorkItem Develop workspace.
+  const managedWorkspace = activeRun?.workspace
+    ?? (activeRun?.workItemId === undefined
+      ? store.getTaskWorkspace(taskId)
+      : store.getWorkItemWorkspace(taskId, activeRun.workItemId));
   const workspace: TaskRoleWorkspaceStatus = managedWorkspace === null
     ? { managed: false, path: role.workspace }
     : { ...managedWorkspace, managed: true };

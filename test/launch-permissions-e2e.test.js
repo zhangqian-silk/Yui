@@ -48,7 +48,7 @@ import {
   submitWorkItemCandidate,
   updateWorkItemStatus
 } from "../dist/workItem/workItem.js";
-import { createRoleWorkspace } from "../dist/worktree/roleWorkspace.js";
+import { createManagedWorkspace } from "../dist/worktree/managedWorkspace.js";
 
 const START = new Date("2026-08-02T14:00:00.000Z");
 
@@ -182,7 +182,7 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
     tx.saveProject(project);
     tx.saveTask(task);
     for (const role of roles.values()) tx.saveRole(taskId, role);
-    tx.saveRoleWorkspace(taskId, mainWorkspace);
+    tx.saveManagedWorkspace(mainWorkspace);
   });
 
   const execution = [
@@ -212,7 +212,7 @@ test("isolated launch cutover freezes desired/effective identity and enforces na
   );
   store.transaction((tx) => {
     tx.saveWorkItem(taskId, profileReadItem);
-    tx.saveRoleWorkspace(taskId, workspaces.get("profile-read"));
+    tx.saveManagedWorkspace(workspaces.get("profile-read"));
   });
   const profileReadEffective = resolveEffectiveLaunch({
     role: store.getRole(taskId, "profile-read"),
@@ -477,7 +477,7 @@ function executionFixture(store, role, workspace, workItemId, runId) {
   );
   store.transaction((tx) => {
     tx.saveWorkItem(role.taskId, item);
-    tx.saveRoleWorkspace(role.taskId, workspace);
+    tx.saveManagedWorkspace(workspace);
     tx.saveAgentRun(run);
     tx.saveActiveAgentRun(run);
     tx.saveRole(role.taskId, updateRoleStatus(role, "running", START));
@@ -530,7 +530,7 @@ function reviewFixture(store, role, workspace, workItemId, roundId, runId) {
   store.transaction((tx) => {
     tx.saveWorkItem(role.taskId, item);
     tx.saveReviewRound(role.taskId, round);
-    tx.saveRoleWorkspace(role.taskId, workspace);
+    tx.saveManagedWorkspace(workspace);
     tx.saveAgentRun(run);
     tx.saveActiveAgentRun(run);
     tx.saveRole(role.taskId, updateRoleStatus(role, "running", START));
@@ -642,10 +642,8 @@ function fixtureWorkspace(input) {
   mkdirSync(workspaceRoot, { recursive: true });
   const projectPath = join(workspaceRoot, "fixture");
   execFileSync("git", ["clone", "-q", input.sourceRepository, projectPath]);
-  return createRoleWorkspace({
-    taskId: input.taskId,
-    roleName: input.roleName,
-    owner: input.owner,
+  return createManagedWorkspace({
+    owner: { ...input.owner, taskId: input.taskId },
     root: workspaceRoot,
     entries: [{
       projectId: "project-1",

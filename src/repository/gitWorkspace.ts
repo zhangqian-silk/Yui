@@ -29,6 +29,11 @@ export type GitWorkspaceRefresh = Readonly<{
 
 export interface GitWorkspacePort {
   inspect(repositoryPath: string, baseRef?: string): Promise<GitRepositoryInspection>;
+  isAncestor(
+    repositoryPath: string,
+    ancestor: string,
+    descendant: string
+  ): Promise<boolean>;
   headRef(repositoryPath: string): Promise<string>;
   isClean(repositoryPath: string): Promise<boolean>;
   refresh(input: Readonly<{
@@ -209,6 +214,20 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       baseRef: ref,
       baseCommit: baseCommit.toLowerCase()
     };
+  }
+
+  async isAncestor(
+    repositoryPath: string,
+    ancestor: string,
+    descendant: string
+  ): Promise<boolean> {
+    const root = (await this.inspect(repositoryPath)).root;
+    return gitSucceeds([
+      "-C", root,
+      "merge-base", "--is-ancestor",
+      safeRef(ancestor),
+      safeRef(descendant)
+    ]);
   }
 
   async headRef(repositoryPath: string): Promise<string> {

@@ -142,6 +142,11 @@ under the original WorkItem. A rejected result creates a new Candidate on the
 next dispatch while reusing the original execution Role, Session, and
 workspace.
 
+Project-backed Workers commit and leave the Develop workspace clean before
+yielding a Candidate. Yui freezes each writable Project's HEAD in the Candidate
+snapshot; ReviewRound worktrees are recreated from those exact commits even if
+Develop later advances during repair.
+
 Task identity follows one bounded outcome, not the number of repositories
 involved. A repository-backed Task may bind multiple Projects, each with its
 own base ref. Yui exposes them under one Task workspace root:
@@ -177,6 +182,13 @@ block normal work. Profiles and Skills constrain behavior; exact WorkItem or
 ReviewRound scope and the matching managed workspace are the only authority to
 modify Project files. A Role may instead choose `default` or `configured` and
 retain any supported subset of the provider's native permission options.
+
+Workspace ownership is independent from the executor Role. Yui persists one
+owner-keyed `ManagedWorkspace` for Task main, each WorkItem Develop checkout,
+each ReviewRound, and each IntegrationAttempt; dispatch attaches a snapshot.
+The delivery chain is `isolate -> Candidate -> ReviewRound -> ChangeSet capture
+-> Integration -> accept -> cleanup`. Review worktrees start at the frozen
+Candidate commit and never become a Develop ChangeSet source.
 
 Write scope may only expand. The Leader supplies the complete old-plus-new set
 after a Worker yields and reports that another repository is required; an

@@ -2,6 +2,7 @@
 
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
+import { isDeepStrictEqual } from "node:util";
 
 import { renderCommandHelp } from "./cli/helpRenderer.js";
 import { routeInvocation } from "./cli/invocationRouter.js";
@@ -526,6 +527,31 @@ export async function main(): Promise<void> {
       );
       return;
     }
+    if (resolved[1] === "work" && resolved[2] === "review"
+      && resolved[3] === "cleanup") {
+      const reviewRoundId = resolved[4];
+      if (reviewRoundId === undefined || resolved.length !== 5) {
+        throw usageError(
+          "Task work review cleanup usage: yui task work review cleanup <task>/<review-round>."
+        );
+      }
+      const reference = cliTaskRecordReference(reviewRoundId, "reviewRound", process.env);
+      const removal = await workspaceCoordinator.cleanupReviewRound(
+        reference.taskId,
+        reference.localId
+      );
+      if (removal === "dirty") {
+        throw usageError(
+          `ReviewRound workspace is dirty and was retained: ${reference.taskId}/${reference.localId}.`
+        );
+      }
+      emit(
+        `Cleaned ReviewRound workspace ${reference.taskId}/${reference.localId} (${removal})\n`,
+        false,
+        { reviewRoundRef: reference, workspace: { removal } }
+      );
+      return;
+    }
     if (resolved[1] === "work" && resolved[2] === "capture") {
       const workItemId = resolved[3];
       if (workItemId === undefined || resolved.length !== 4) {
@@ -683,7 +709,7 @@ export async function main(): Promise<void> {
       const task = store.getTask(taskId);
       if (task === null) throw new Error(`Task disappeared after archive validation: ${taskId}.`);
       if (task.status !== "archived") {
-        const workItemIds = store.listRoleWorkspaces(task.id)
+        const workItemIds = store.listManagedWorkspaces(task.id)
           .flatMap(({ owner }) => owner.type === "work-item" ? [owner.workItemId] : []);
         for (const workItemId of workItemIds) {
           const item = store.getWorkItem(task.id, workItemId);
@@ -732,6 +758,27 @@ export async function main(): Promise<void> {
             throw usageError(error instanceof Error ? error.message : String(error));
           }
         }
+      }
+    }
+    if (resolved[1] === "work" && resolved[2] === "dispatch") {
+      const workItemId = resolved[3];
+      const reference = workItemId === undefined
+        ? null
+        : cliWorkItemReference(workItemId, process.env);
+      const item = reference === null
+        ? null
+        : store.getWorkItem(reference.taskId, reference.localId);
+      const task = item === null ? null : store.getTask(item.taskId);
+      // A read-only Project WorkItem still needs its own Develop owner.  The
+      // physical preparer creates the symlink view and stores the exact
+      // WorkItem owner before dispatch creates the Run.  Writable scopes keep
+      // the explicit isolate-before-dispatch fence.
+      if (item !== null
+        && task !== null
+        && task.projectBindings.length > 0
+        && item.writeProjectIds.length === 0
+        && store.getWorkItemWorkspace(task.id, item.id) === null) {
+        await workspaceCoordinator.isolateWorkItem(item.taskId, item.id);
       }
     }
     let workItemIntegrationProof;
@@ -950,7 +997,7 @@ async function candidateSnapshotForTaskCommand(
   if (args[1] === "work" && args[2] === "update"
     && args[3] !== undefined && args[4] === "done") {
     const reference = cliWorkItemReference(args[3], environment);
-    const workspace = store.getRoleWorkspace(reference.taskId, "leader");
+    const workspace = store.getWorkItemWorkspace(reference.taskId, reference.localId);
     if (workspace === null) {
       throw usageError(
         `Reviewable direct WorkItem has no managed Candidate workspace: ${reference.localId}.`

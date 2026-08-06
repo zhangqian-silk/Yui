@@ -2744,7 +2744,15 @@ function mapRole(
   role: NonNullable<ReturnType<TaskStore["getRole"]>>
 ): SchedulerRole {
   const binding = activeRoleAgentBinding(role);
-  const workspace = store.getRoleWorkspace(role.taskId, role.name) ?? undefined;
+  const item = store.listWorkItems(role.taskId).find((candidate) => (
+    candidate.assignee === role.name
+      && !["completed", "failed", "retired"].includes(candidate.status)
+  )) ?? null;
+  const workspace = (item === null
+    ? store.getTaskWorkspace(role.taskId)
+    : store.getWorkItemWorkspace(role.taskId, item.id))
+    ?? store.getTaskWorkspace(role.taskId)
+    ?? undefined;
   const effective = activeLiveRoleAgentSession(
     store.getTaskRoleSessionSet(role.taskId, role.name)
   )?.effective ?? resolveEffectiveLaunch({
@@ -2784,12 +2792,15 @@ function taskSessionEffective(
   if (existing !== undefined) return existing.effective;
   const role = store.getRole(taskId, roleName);
   if (role === null) throw new Error(`Role not found: ${taskId}/${roleName}.`);
-  const workspace = store.getRoleWorkspace(taskId, roleName)
-    ?? store.getRoleWorkspace(taskId, "leader")
+  const item = store.listWorkItems(taskId).find((candidate) => (
+    candidate.assignee === roleName
+      && !["completed", "failed", "retired"].includes(candidate.status)
+  )) ?? null;
+  const workspace = (item === null
+    ? store.getTaskWorkspace(taskId)
+    : store.getWorkItemWorkspace(taskId, item.id))
+    ?? store.getTaskWorkspace(taskId)
     ?? undefined;
-  const item = workspace?.owner.type === "work-item"
-    ? store.getWorkItem(taskId, workspace.owner.workItemId)
-    : null;
   const effective = resolveEffectiveLaunch({
     role,
     purpose: "execution",

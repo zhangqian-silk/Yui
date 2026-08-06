@@ -32,6 +32,17 @@ workspace, validation, and return protocol.
   not attempt the write or relax the permission yourself.
 - Validate in proportion to risk. Report passed, failed, and skipped checks
   honestly.
+- A Role executes in a workspace snapshot; it does not own that workspace.
+  Develop workspaces belong to the WorkItem, review workspaces to their
+  ReviewRound, and integration workspaces to their IntegrationAttempt. Never
+  use a Role-keyed lookup as proof of WorkItem ownership.
+- Follow the unified delivery lifecycle: isolate, yield a Candidate, inspect
+  the independent ReviewRound workspace when requested, capture ChangeSets,
+  integrate, accept, and explicitly clean up each owner workspace. Review
+  edits are not ChangeSet sources.
+- For Project-backed delivery, commit the Develop changes and leave that
+  workspace clean before yielding; Yui records the exact frozen HEAD in the
+  Candidate snapshot so a later ReviewRound cannot drift with Develop.
 - If blocked by missing intent or a semantic conflict, stop safely and identify
   the exact Leader decision required.
 - If another Project must be modified, stop and report the Project, reason, and

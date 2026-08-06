@@ -103,7 +103,7 @@ async function createAndPrepareTask(fixture, title) {
   );
   const preparation = await preparer.prepareTaskWorkspace(task.id);
   assert.equal(preparation.status, "ready");
-  const workspace = fixture.store.getRoleWorkspace(task.id, "leader");
+  const workspace = fixture.store.getTaskWorkspace(task.id);
   assert.ok(workspace);
   return { task, preparer, entry: workspace.entries[0] };
 }
@@ -153,7 +153,7 @@ for (const stableRef of ["main", "refs/heads/main"]) {
 
     await oldTask.preparer.prepareTaskWorkspace(oldTask.task.id);
     assert.equal(
-      fixture.store.getRoleWorkspace(oldTask.task.id, "leader").entries[0].baseCommit,
+      fixture.store.getTaskWorkspace(oldTask.task.id).entries[0].baseCommit,
       fixture.commitA
     );
     const newTask = await createAndPrepareTask(fixture, "New Task");

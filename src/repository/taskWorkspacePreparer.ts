@@ -1,4 +1,5 @@
 import {
+  lstat,
   mkdir,
   readlink,
   readdir,
@@ -25,13 +26,15 @@ import {
   type WorkItemWorkspaceDisposition
 } from "../workItem/workItem.js";
 import {
-  createRoleWorkspace,
+  createManagedWorkspace,
+  managedWorkspaceKey,
   managedWorktreeName,
-  type RoleWorkspace,
+  type ManagedWorkspace,
   type WorkspaceProjectEntry
-} from "../worktree/roleWorkspace.js";
+} from "../worktree/managedWorkspace.js";
 import {
   NodeGitWorkspace,
+  worktreeIdentity,
   type GitWorkspacePort,
   type GitWorkspaceRemoval,
   type GitWorkspaceState
@@ -99,9 +102,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         ...(task.cwd === undefined ? {} : { path: task.cwd })
       };
     }
-    const leader = this.store.getRole(task.id, LEADER_ROLE);
-    if (leader === null) throw new Error(`Task leader Role not found: ${task.id}.`);
-    const existing = this.store.getRoleWorkspace(task.id, LEADER_ROLE);
+    const existing = this.store.getTaskWorkspace(task.id);
     if (existing !== null && existing.owner.type !== "task") {
       throw new Error(`Task main workspace ownership is invalid: ${task.id}.`);
     }
@@ -133,10 +134,8 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         });
       }
       await ensureWorkspaceView(root, prepared.map(({ entry }) => entry));
-      const workspace = createRoleWorkspace({
-        taskId: task.id,
-        roleName: LEADER_ROLE,
-        owner: { type: "task" },
+      const workspace = createManagedWorkspace({
+        owner: { type: "task", taskId: task.id },
         root,
         entries: prepared.map(({ entry }) => entry)
       }, this.now());
@@ -148,18 +147,28 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         if (!isDeepStrictEqual(latest.projectBindings, task.projectBindings)) {
           throw new Error(`Task Projects changed while preparing its workspace: ${task.id}.`);
         }
-        const current = tx.getRoleWorkspace(task.id, LEADER_ROLE);
+        const current = tx.getTaskWorkspace(task.id);
         if (current !== null && current.owner.type !== "task") {
           throw new Error(`Task main workspace ownership is invalid: ${task.id}.`);
         }
-        tx.saveRoleWorkspace(task.id, preserveWorkspaceCreatedAt(workspace, current));
+        tx.saveManagedWorkspace(preserveWorkspaceCreatedAt(workspace, current));
         const timestamp = this.now();
         for (const role of tx.listRoles(task.id)) {
-          const assigned = tx.getRoleWorkspace(task.id, role.name);
-          if (assigned !== null && assigned.owner.type !== "task") continue;
-          if (role.workspace !== root) {
+          // The Role field is only a cwd/snapshot hint.  Preserve the hint for
+          // an active WorkItem assignment; the durable owner is the WorkItem,
+          // not this Role record.  Other Roles use Task main.
+          const assignedItem = tx.listWorkItems(task.id).find((candidate) => (
+            candidate.assignee === role.name
+              && !["completed", "failed", "retired"]
+                .includes(candidate.status)
+          ));
+          const assignedWorkspace = assignedItem === undefined
+            ? null
+            : tx.getWorkItemWorkspace(task.id, assignedItem.id);
+          const target = assignedWorkspace?.root ?? root;
+          if (role.workspace !== target) {
             retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
-            tx.saveRole(task.id, updateRole(role, { workspace: root }, timestamp));
+            tx.saveRole(task.id, updateRole(role, { workspace: target }, timestamp));
           }
         }
         if (latest.cwd !== root) {
@@ -173,9 +182,12 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     }
   }
 
-  async snapshotCandidateWorkspace(workspace: RoleWorkspace): Promise<CandidateGitSnapshot> {
+  async snapshotCandidateWorkspace(workspace: ManagedWorkspace): Promise<CandidateGitSnapshot> {
     if (workspace.owner.type === "review-round") {
-      throw new Error("A ReviewRound workspace cannot become a WorkItem Candidate source.");
+      throw new Error("ReviewRound workspace cannot become a WorkItem Candidate source.");
+    }
+    if (workspace.owner.type !== "work-item") {
+      throw new Error("Only a WorkItem workspace can become a Candidate source.");
     }
     const projects = [];
     for (const entry of workspace.entries) {
@@ -201,25 +213,25 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   async prepareWorkItemWorkspace(
     taskId: string,
     workItemId: string
-  ): Promise<RoleWorkspace> {
+  ): Promise<ManagedWorkspace> {
     const item = requireWorkItem(this.store, taskId, workItemId);
     const task = requireTask(this.store, item.taskId);
     assertWorkItemWorkspaceEligible(this.store, task, item);
     await this.prepareTaskWorkspace(task.id);
-    const main = this.store.getRoleWorkspace(task.id, LEADER_ROLE);
+    const main = this.store.getTaskWorkspace(task.id);
     if (main === null || main.owner.type !== "task") {
       throw new Error(`Task main workspace is not ready: ${task.id}.`);
     }
-    const role = this.store.getRole(task.id, item.assignee!);
-    if (role === null) throw new Error(`Role not found: ${task.id}/${item.assignee}.`);
-    const existing = this.store.getRoleWorkspace(task.id, role.name);
+    const existing = this.store.getWorkItemWorkspace(task.id, item.id);
     if (existing !== null && (
       existing.owner.type !== "work-item"
       || existing.owner.workItemId !== item.id
     )) {
-      throw new Error(`Role already has another WorkItem workspace: ${task.id}/${role.name}.`);
+      throw new Error(`WorkItem workspace owner is invalid: ${task.id}/${item.id}.`);
     }
-    assertWorkspaceSessionsRetirable(this.store, task.id, role.name, this.now());
+    if (item.assignee !== undefined) {
+      assertWorkspaceSessionsRetirable(this.store, task.id, item.assignee, this.now());
+    }
 
     const writeProjects = new Set(item.writeProjectIds);
     const root = this.#workItemWorkspaceRoot(task.id, item.id);
@@ -272,10 +284,8 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         });
       }
       await ensureWorkspaceView(root, prepared.map(({ entry }) => entry));
-      const workspace = createRoleWorkspace({
-        taskId: task.id,
-        roleName: role.name,
-        owner: { type: "work-item", workItemId: item.id },
+      const workspace = createManagedWorkspace({
+        owner: { type: "work-item", taskId: task.id, workItemId: item.id },
         root,
         entries: prepared.map(({ entry }) => entry)
       }, this.now());
@@ -286,27 +296,35 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           throw new Error(`Work item changed while preparing its workspace: ${item.id}.`);
         }
         if (latestItem.revision !== item.revision
-          || latestItem.assignee !== role.name
           || !isDeepStrictEqual(latestItem.writeProjectIds, item.writeProjectIds)) {
           throw new Error(`Work item changed while preparing its workspace: ${item.id}.`);
         }
-        if (tx.getActiveAgentRun(task.id, role.name) !== null) {
-          throw new Error(`Role has an active Run: ${task.id}/${role.name}.`);
+        const activeDevelopRun = tx.listAgentRuns(task.id)
+          .find((run) => run.status === "active" && run.workItemId === item.id);
+        if (activeDevelopRun !== undefined) {
+          throw new Error(`Work Item already has an active Develop Run: ${activeDevelopRun.id}.`);
         }
-        const latestRole = tx.getRole(task.id, role.name);
-        if (latestRole === null) throw new Error(`Role not found: ${task.id}/${role.name}.`);
-        const current = tx.getRoleWorkspace(task.id, role.name);
+        if (latestItem.assignee !== undefined
+          && tx.getActiveAgentRun(task.id, latestItem.assignee) !== null) {
+          throw new Error(`Role has an active Run: ${task.id}/${latestItem.assignee}.`);
+        }
+        const current = tx.getWorkItemWorkspace(task.id, item.id);
         if (current !== null && (
           current.owner.type !== "work-item"
           || current.owner.workItemId !== item.id
         )) {
-          throw new Error(`Role workspace changed: ${task.id}/${role.name}.`);
+          throw new Error(`WorkItem workspace changed: ${task.id}/${item.id}.`);
         }
         const timestamp = this.now();
-        retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
         const stored = preserveWorkspaceCreatedAt(workspace, current);
-        tx.saveRoleWorkspace(task.id, stored);
-        tx.saveRole(task.id, updateRole(latestRole, { workspace: root }, timestamp));
+        tx.saveManagedWorkspace(stored);
+        if (latestItem.assignee !== undefined) {
+          const latestRole = tx.getRole(task.id, latestItem.assignee);
+          if (latestRole !== null && latestRole.workspace !== root) {
+            retireWorkspaceBoundSession(tx, task.id, latestItem.assignee, timestamp);
+            tx.saveRole(task.id, updateRole(latestRole, { workspace: root }, timestamp));
+          }
+        }
         return stored;
       });
     } catch (error) {
@@ -320,8 +338,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     workItemId: string
   ): Promise<GitWorkspaceState> {
     const item = requireWorkItem(this.store, taskId, workItemId);
-    if (item.assignee === undefined) return "missing";
-    const workspace = this.store.getRoleWorkspace(item.taskId, item.assignee);
+    const workspace = this.store.getWorkItemWorkspace(item.taskId, item.id);
     if (workspace === null) return "missing";
     assertWorkItemOwnsWorkspace(item, workspace);
     return this.#inspectEntries(
@@ -331,10 +348,13 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     );
   }
 
+  /** Prepare a fresh, reviewer-writable workspace from the candidate's
+   * frozen Develop snapshot.  This record is owned by the ReviewRound; it is
+   * never used as a ChangeSet capture source. */
   async prepareReviewRoundWorkspace(
     taskId: string,
     reviewRoundId: string
-  ): Promise<RoleWorkspace> {
+  ): Promise<ManagedWorkspace> {
     const task = requireTask(this.store, taskId);
     const round = this.store.getReviewRound(task.id, reviewRoundId);
     if (round === null) throw new Error(`ReviewRound not found: ${task.id}/${reviewRoundId}.`);
@@ -346,7 +366,12 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (candidate === undefined) {
       throw new Error(`ReviewRound Candidate not found: ${round.candidateId}.`);
     }
-    if (candidate.workspace === undefined || candidate.gitSnapshot === undefined) {
+    // A Candidate is an immutable snapshot of Develop.  Always prefer that
+    // snapshot over the current WorkItem workspace: the Worker may have
+    // continued (or a retry may have replaced) Develop after yielding, but a
+    // ReviewRound must start from the exact Candidate commit and scope.
+    const develop = candidate.workspace;
+    if (develop === undefined || candidate.gitSnapshot === undefined) {
       throw new Error(`Candidate has no frozen managed Git snapshot: ${candidate.id}.`);
     }
     if (candidate.gitSnapshot.reviewBaseCommit !== round.reviewBaseCommit) {
@@ -356,91 +381,208 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (reviewer === null) {
       throw new Error(`Reviewer Role not found: ${task.id}/${round.reviewerRoleName}.`);
     }
-    const existing = this.store.getRoleWorkspace(task.id, reviewer.name);
-    if (existing !== null) {
-      if (existing.owner.type === "review-round"
-        && existing.owner.reviewRoundId === round.id) {
-        return existing;
-      }
-      throw new Error(`Reviewer Role already has another managed workspace: ${task.id}/${reviewer.name}.`);
-    }
-    assertWorkspaceSessionsRetirable(this.store, task.id, reviewer.name, this.now());
-
     const snapshotCommits = new Map(
       candidate.gitSnapshot.projects.map(({ projectId, commit }) => [projectId, commit])
     );
-    const root = this.#reviewRoundWorkspaceRoot(task.id, round.id);
+    const frozenEntries = develop.entries.map((entry) => {
+      const commit = snapshotCommits.get(entry.projectId);
+      if (commit === undefined) {
+        throw new Error(`Candidate snapshot Project is missing: ${entry.projectId}.`);
+      }
+      return { ...entry, baseRef: commit, baseCommit: commit };
+    });
+    const expectedEntries = new Map(
+      frozenEntries.map((entry) => [entry.projectId, entry] as const)
+    );
+    const existing = this.store.getReviewRoundWorkspace(task.id, round.id);
+    const reviewRoot = this.#reviewRoundWorkspaceRoot(task.id, round.id);
+    const retained = new Map<string, Readonly<{ project: Project; entry: WorkspaceProjectEntry }>>();
+    const missing = new Set<string>();
+    const adopted = existing?.root === reviewRoot;
+    if (existing !== null) {
+      if (existing.entries.length !== expectedEntries.size) {
+        throw new Error(
+          `ReviewRound workspace Project scope changed: ${round.id}.`
+        );
+      }
+      for (const entry of existing.entries) {
+        const source = expectedEntries.get(entry.projectId);
+        if (source === undefined) {
+          throw new Error(
+            `ReviewRound workspace Project scope changed: ${round.id}/${entry.projectId}.`
+          );
+        }
+        if (!sameCommit(entry.baseCommit, source.baseCommit)) {
+          throw new Error(
+            `ReviewRound workspace baseCommit record mismatch for ${round.id}/${entry.projectId}: `
+            + `expected ${source.baseCommit}, recorded ${entry.baseCommit}.`
+          );
+        }
+        if (!adopted) continue;
+        const project = requireProject(this.store, entry.projectId);
+        const identity = worktreeIdentity(task.id, round.id);
+        const expectedPath = join(
+          this.#projectContainer(project.name),
+          identity.directory
+        );
+        if (entry.path !== expectedPath || entry.branch !== identity.branch) {
+          throw new Error(
+            `ReviewRound workspace managed identity mismatch for ${round.id}/${entry.projectId}.`
+          );
+        }
+        let physical;
+        try {
+          physical = await this.git.inspect(entry.path, "HEAD");
+        } catch (error) {
+          try {
+            await lstat(entry.path);
+          } catch (probeError) {
+            if (isMissingPath(probeError)) {
+              missing.add(entry.projectId);
+              continue;
+            }
+          }
+          throw error;
+        }
+        if (physical.root !== entry.path) {
+          throw new Error(
+            `ReviewRound workspace managed path mismatch for ${round.id}/${entry.projectId}.`
+          );
+        }
+        const projectRoot = await this.git.inspect(project.path, "HEAD");
+        if (physical.gitDirectory !== projectRoot.gitDirectory) {
+          throw new Error(
+            `ReviewRound workspace managed Project mismatch for ${round.id}/${entry.projectId}.`
+          );
+        }
+        const branch = await this.git.headRef(entry.path);
+        if (branch !== identity.branch) {
+          throw new Error(
+            `ReviewRound workspace managed branch mismatch for ${round.id}/${entry.projectId}: `
+            + `expected ${identity.branch}, physical ${branch}.`
+          );
+        }
+        if (!await this.git.isAncestor(project.path, entry.baseCommit, physical.baseCommit)) {
+          throw new Error(
+            `ReviewRound workspace HEAD does not descend from its frozen base for `
+            + `${round.id}/${entry.projectId}: expected ancestor ${entry.baseCommit}, `
+            + `physical HEAD ${physical.baseCommit}.`
+          );
+        }
+        retained.set(entry.projectId, { project, entry });
+      }
+      if (adopted && missing.size === 0) {
+        if (round.workspace !== undefined && !isDeepStrictEqual(round.workspace, existing)) {
+          throw new Error(`ReviewRound workspace record diverged: ${round.id}.`);
+        }
+        if (round.workspace === undefined) {
+          this.store.saveReviewRound(task.id, attachReviewRoundWorkspace(round, existing));
+        }
+        return existing;
+      }
+      // The durable owner record can outlive a controller crash before the
+      // physical review worktrees were adopted.  Recreate only missing
+      // physical entries; existing reviewer diagnostics remain attached to
+      // their frozen Candidate provenance.
+    }
     const prepared: Array<Readonly<{ project: Project; entry: WorkspaceProjectEntry }>> = [];
     try {
-      for (const binding of task.projectBindings) {
-        const project = requireProject(this.store, binding.projectId);
-        const candidateEntry = requireWorkspaceEntry(candidate.workspace, project.id);
-        const baseCommit = snapshotCommits.get(project.id);
-        if (baseCommit === undefined) {
-          throw new Error(`Candidate snapshot Project is missing: ${project.id}.`);
-        }
+      const sources = adopted
+        ? frozenEntries.filter((source) => missing.has(source.projectId))
+        : frozenEntries;
+      for (const source of sources) {
+        const project = requireProject(this.store, source.projectId);
         const physical = await this.git.ensureWorktree({
           repositoryPath: project.path,
           container: this.#projectContainer(project.name),
           taskId: task.id,
           roleName: round.id,
-          baseRef: baseCommit
+          baseRef: source.baseCommit
         });
-        if (physical.baseCommit !== baseCommit) {
-          throw new Error(`Review worktree does not start at the Candidate commit: ${round.id}/${project.id}.`);
-        }
-        prepared.push({
-          project,
-          entry: {
-            projectId: project.id,
-            directory: binding.directory,
-            access: "write",
-            path: physical.path,
-            branch: physical.branch,
-            baseRef: baseCommit,
-            baseCommit
-          }
-        });
-        if (candidateEntry.projectId !== project.id) {
-          throw new Error(`Candidate workspace Project changed: ${candidate.id}/${project.id}.`);
+        const entry = {
+          ...source,
+          access: "write" as const,
+          path: physical.path,
+          branch: physical.branch,
+          baseRef: source.baseCommit,
+          baseCommit: source.baseCommit
+        };
+        prepared.push({ project, entry });
+        if (!sameCommit(physical.baseCommit, source.baseCommit)) {
+          throw new Error(
+            `ReviewRound workspace baseCommit mismatch for ${round.id}/${source.projectId}: `
+            + `expected ${source.baseCommit}, physical HEAD ${physical.baseCommit}.`
+          );
         }
       }
-      await ensureWorkspaceView(root, prepared.map(({ entry }) => entry));
-      const workspace = createRoleWorkspace({
-        taskId: task.id,
-        roleName: reviewer.name,
-        owner: { type: "review-round", reviewRoundId: round.id },
-        root,
-        entries: prepared.map(({ entry }) => entry)
+      const preparedByProject = new Map(
+        prepared.map(({ project, entry }) => [project.id, entry] as const)
+      );
+      const entries = adopted
+        ? frozenEntries.map((source) => {
+          const retainedEntry = retained.get(source.projectId)?.entry;
+          if (retainedEntry !== undefined) return retainedEntry;
+          const preparedEntry = preparedByProject.get(source.projectId);
+          if (preparedEntry === undefined) {
+            throw new Error(
+              `ReviewRound workspace Project could not be reconstructed: `
+              + `${round.id}/${source.projectId}.`
+            );
+          }
+          return preparedEntry;
+        })
+        : prepared.map(({ entry }) => entry);
+      await ensureWorkspaceView(reviewRoot, entries);
+      const workspace = createManagedWorkspace({
+        owner: { type: "review-round", taskId: task.id, reviewRoundId: round.id },
+        root: reviewRoot,
+        entries
       }, this.now());
+      const stored = preserveWorkspaceCreatedAt(workspace, existing);
       return this.store.transaction((tx) => {
         const currentRound = tx.getReviewRound(task.id, round.id);
         const currentItem = tx.getWorkItem(task.id, item.id);
         if (currentRound === null || currentRound.status !== "pending"
           || currentItem === null
-          || !isDeepStrictEqual(currentItem.candidates.find(({ id }) => id === candidate.id), candidate)) {
+          || !isDeepStrictEqual(
+            currentItem.candidates.find(({ id }) => id === candidate.id),
+            candidate
+          )) {
           throw new Error(`ReviewRound changed while preparing its workspace: ${round.id}.`);
         }
         if (tx.getActiveAgentRun(task.id, reviewer.name) !== null) {
           throw new Error(`Reviewer Role has an active Run: ${task.id}/${reviewer.name}.`);
         }
-        const currentWorkspace = tx.getRoleWorkspace(task.id, reviewer.name);
-        if (currentWorkspace !== null) {
-          throw new Error(`Reviewer Role workspace changed: ${task.id}/${reviewer.name}.`);
+        const currentWorkspace = tx.getReviewRoundWorkspace(task.id, round.id);
+        if (currentWorkspace !== null
+          && !sameManagedWorkspace(currentWorkspace, existing ?? stored)) {
+          throw new Error(`ReviewRound workspace changed: ${task.id}/${round.id}.`);
         }
         const latestReviewer = tx.getRole(task.id, reviewer.name);
         if (latestReviewer === null) {
           throw new Error(`Reviewer Role not found: ${task.id}/${reviewer.name}.`);
         }
         const timestamp = this.now();
-        retireWorkspaceBoundSession(tx, task.id, reviewer.name, timestamp);
-        tx.saveRoleWorkspace(task.id, workspace);
-        tx.saveReviewRound(task.id, attachReviewRoundWorkspace(currentRound, workspace));
-        tx.saveRole(task.id, updateRole(latestReviewer, { workspace: root }, timestamp));
-        return workspace;
+        tx.saveManagedWorkspace(stored);
+        tx.saveReviewRound(task.id, attachReviewRoundWorkspace(currentRound, stored));
+        if (latestReviewer.workspace !== stored.root) {
+          retireWorkspaceBoundSession(tx, task.id, latestReviewer.name, timestamp);
+          tx.saveRole(task.id, updateRole(
+            latestReviewer,
+            { workspace: stored.root },
+            timestamp
+          ));
+        }
+        return stored;
       });
     } catch (error) {
-      await this.#discardUnadoptedEntries(task, prepared, round.id);
+      await this.#discardUnadoptedEntries(
+        task,
+        prepared,
+        round.id,
+        true,
+        new Set([...retained.values()].map(({ entry }) => entry.path))
+      );
       throw error;
     }
   }
@@ -451,13 +593,13 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   ): Promise<GitWorkspaceState> {
     const round = this.store.getReviewRound(taskId, reviewRoundId);
     if (round === null) throw new Error(`ReviewRound not found: ${taskId}/${reviewRoundId}.`);
-    if (round.workspace === undefined) return "missing";
-    assertReviewRoundOwnsWorkspace(round.id, round.workspace);
-    return this.#inspectEntries(
-      taskId,
-      round.id,
-      round.workspace.entries
-    );
+    const workspace = this.store.getReviewRoundWorkspace(taskId, reviewRoundId);
+    if (workspace === null) return "missing";
+    assertReviewRoundOwnsWorkspace(round.id, workspace);
+    if (round.workspace !== undefined && !isDeepStrictEqual(round.workspace, workspace)) {
+      throw new Error(`ReviewRound workspace record diverged: ${round.id}.`);
+    }
+    return this.#inspectEntries(taskId, round.id, workspace.entries);
   }
 
   async snapshotReviewRoundResult(
@@ -466,19 +608,30 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   ): Promise<Readonly<{ evidenceCommit?: string }>> {
     const round = this.store.getReviewRound(taskId, reviewRoundId);
     if (round === null) throw new Error(`ReviewRound not found: ${taskId}/${reviewRoundId}.`);
-    if (round.status !== "running" || round.workspace === undefined) {
+    const workspace = this.store.getReviewRoundWorkspace(taskId, reviewRoundId);
+    if (round.status !== "running" || workspace === null) {
       throw new Error(`ReviewRound is not running in a managed workspace: ${reviewRoundId}.`);
     }
-    assertReviewRoundOwnsWorkspace(round.id, round.workspace);
+    assertReviewRoundOwnsWorkspace(round.id, workspace);
+    if (round.workspace === undefined || !isDeepStrictEqual(round.workspace, workspace)) {
+      throw new Error(`ReviewRound workspace record diverged: ${round.id}.`);
+    }
     const changed: string[] = [];
-    for (const entry of round.workspace.entries) {
+    for (const entry of workspace.entries) {
       if (await this.git.headRef(entry.path) !== entry.branch) {
-        throw new Error(`Review Project workspace left its managed branch: ${round.id}/${entry.projectId}.`);
+        throw new Error(
+          `Review Project workspace left its managed branch: ${round.id}/${entry.projectId}.`
+        );
       }
       const head = (await this.git.inspect(entry.path, "HEAD")).baseCommit;
-      // Dirty bytes are intentionally not evidenceCommit provenance. Only a
-      // committed HEAD that differs from the frozen entry base can be
-      // reported; cleanup separately refuses to remove dirty worktrees.
+      const project = requireProject(this.store, entry.projectId);
+      if (!await this.git.isAncestor(project.path, entry.baseCommit, head)) {
+        throw new Error(
+          `ReviewRound workspace HEAD does not descend from its frozen base for `
+          + `${round.id}/${entry.projectId}: expected ancestor ${entry.baseCommit}, `
+          + `physical HEAD ${head}.`
+        );
+      }
       if (head !== entry.baseCommit) changed.push(head);
     }
     if (changed.length > 1) {
@@ -500,15 +653,25 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       throw new Error(`ReviewRound must be terminal before cleanup: ${round.id}.`);
     }
     if (round.workspaceDisposition?.kind === "removed") return "missing";
-    const workspace = round.workspace;
-    if (workspace === undefined) {
+    const workspace = this.store.getReviewRoundWorkspace(task.id, round.id);
+    if (workspace === null || round.workspace === undefined) {
       throw new Error(`ReviewRound has no managed workspace: ${round.id}.`);
     }
     assertReviewRoundOwnsWorkspace(round.id, workspace);
-    assertWorkspaceSessionsRetirable(this.store, task.id, workspace.roleName, this.now());
-    if (await this.#inspectEntries(task.id, round.id, workspace.entries) === "dirty") {
-      return "dirty";
+    if (!isDeepStrictEqual(round.workspace, workspace)) {
+      throw new Error(`ReviewRound workspace record diverged: ${round.id}.`);
     }
+    assertWorkspaceSessionsRetirable(
+      this.store,
+      task.id,
+      round.reviewerRoleName,
+      this.now()
+    );
+    if (await this.#inspectEntries(
+      task.id,
+      managedWorktreeName(workspace.owner),
+      workspace.entries
+    ) === "dirty") return "dirty";
     let removed = false;
     for (const entry of workspace.entries) {
       const project = requireProject(this.store, entry.projectId);
@@ -516,7 +679,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         repositoryPath: project.path,
         container: this.#projectContainer(project.name),
         taskId: task.id,
-        roleName: round.id,
+        roleName: managedWorktreeName(workspace.owner),
         deleteBranch: true
       });
       if (result === "dirty") {
@@ -527,32 +690,28 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     await removeWorkspaceView(workspace.root);
     this.store.transaction((tx) => {
       const currentRound = tx.getReviewRound(task.id, round.id);
+      const currentWorkspace = tx.getReviewRoundWorkspace(task.id, round.id);
       if (currentRound === null || currentRound.status !== round.status
-        || !isDeepStrictEqual(currentRound.workspace, workspace)) {
+        || currentRound.workspace === undefined
+        || !isDeepStrictEqual(currentRound.workspace, workspace)
+        || currentWorkspace === null
+        || !sameManagedWorkspace(currentWorkspace, workspace)) {
         throw new Error(`ReviewRound changed before cleanup was recorded: ${round.id}.`);
       }
-      const currentWorkspace = tx.getRoleWorkspace(task.id, workspace.roleName);
-      const stillOwnsRole = currentWorkspace === null
-        || sameRoleWorkspace(currentWorkspace, workspace);
-      if (stillOwnsRole) {
-        if (currentWorkspace !== null) tx.removeRoleWorkspace(task.id, workspace.roleName);
-        const reviewer = tx.getRole(task.id, workspace.roleName);
-        const main = tx.getRoleWorkspace(task.id, LEADER_ROLE);
-        if (reviewer !== null && reviewer.workspace !== (main?.root ?? this.#fallbackWorkspace())) {
-          const timestamp = this.now();
-          retireWorkspaceBoundSession(tx, task.id, reviewer.name, timestamp);
-          tx.saveRole(task.id, updateRole(
-            reviewer,
-            { workspace: main?.root ?? this.#fallbackWorkspace() },
-            timestamp
-          ));
-        }
-      }
+      tx.removeManagedWorkspace(workspace.owner);
       tx.saveReviewRound(task.id, recordReviewWorkspaceDisposition(
         currentRound,
         "removed",
         this.now()
       ));
+      const reviewer = tx.getRole(task.id, round.reviewerRoleName);
+      if (reviewer !== null && reviewer.workspace === workspace.root) {
+        const main = tx.getTaskWorkspace(task.id);
+        const target = main?.root ?? this.#fallbackWorkspace();
+        const timestamp = this.now();
+        retireWorkspaceBoundSession(tx, task.id, reviewer.name, timestamp);
+        tx.saveRole(task.id, updateRole(reviewer, { workspace: target }, timestamp));
+      }
     });
     return removed ? "removed" : "missing";
   }
@@ -570,16 +729,15 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (item.workspaceDisposition !== undefined && item.workspaceDisposition !== disposition) {
       throw new Error(`Work item workspace is already recorded as ${item.workspaceDisposition}.`);
     }
-    if (item.assignee === undefined) {
-      throw new Error(`WorkItem has no Task Role workspace: ${item.id}.`);
-    }
-    const workspace = this.store.getRoleWorkspace(task.id, item.assignee);
+    const workspace = this.store.getWorkItemWorkspace(task.id, item.id);
     if (workspace === null) {
       if (item.workspaceDisposition === disposition) return "missing";
       throw new Error(`WorkItem has no managed isolated worktree workspace: ${item.id}.`);
     }
     assertWorkItemOwnsWorkspace(item, workspace);
-    assertWorkspaceSessionsRetirable(this.store, task.id, workspace.roleName, this.now());
+    if (item.assignee !== undefined) {
+      assertWorkspaceSessionsRetirable(this.store, task.id, item.assignee, this.now());
+    }
     const writable = workspace.entries.filter(({ access }) => access === "write");
     if (await this.#inspectEntries(
       task.id,
@@ -620,7 +778,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
 
   async inspectTaskMainWorkspace(taskId: string): Promise<GitWorkspaceState> {
     const task = requireTask(this.store, taskId);
-    const main = this.store.getRoleWorkspace(task.id, LEADER_ROLE);
+    const main = this.store.getTaskWorkspace(task.id);
     if (main === null) return "missing";
     if (main.owner.type !== "task") {
       throw new Error(`Task main workspace ownership is invalid: ${task.id}.`);
@@ -631,19 +789,19 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   async cleanupTaskForArchive(taskId: string): Promise<TaskWorkspaceCleanup> {
     const task = requireTask(this.store, taskId);
     assertTaskArchiveState(task, task);
-    const isolated = this.store.listRoleWorkspaces(task.id)
-      .filter(({ owner }) => owner.type === "work-item");
+    const isolated = this.store.listManagedWorkspaces(task.id)
+      .filter(({ owner }) => owner.type !== "task");
     if (isolated.length > 0) {
       return {
         taskId,
         status: "failed",
         ...(task.cwd === undefined ? {} : { path: task.cwd }),
-        error: `WorkItem workspaces require explicit cleanup: ${
-          isolated.map(({ owner }) => owner.type === "work-item" ? owner.workItemId : "").join(", ")
+        error: `Managed workspaces require explicit cleanup: ${
+          isolated.map(({ owner }) => managedWorkspaceKey(owner)).join(", ")
         }.`
       };
     }
-    const main = this.store.getRoleWorkspace(task.id, LEADER_ROLE);
+    const main = this.store.getTaskWorkspace(task.id);
     if (main !== null) {
       assertTaskArchiveState(requireTask(this.store, task.id), task);
       if (await this.#inspectEntries(task.id, MAIN_WORKTREE, main.entries) === "dirty") {
@@ -723,10 +881,11 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   async #discardUnadoptedEntries(
     task: Task,
     prepared: readonly Readonly<{ project: Project; entry: WorkspaceProjectEntry }>[],
-    roleName: string
+    roleName: string,
+    deleteBranch = false,
+    adoptedPaths = new Set(this.store.listManagedWorkspaces(task.id)
+      .flatMap((workspace) => workspace.entries.map(({ path }) => path)))
   ): Promise<void> {
-    const adoptedPaths = new Set(this.store.listRoleWorkspaces(task.id)
-      .flatMap((workspace) => workspace.entries.map(({ path }) => path)));
     for (const { project, entry } of prepared.filter(
       ({ entry }) => entry.access === "write" && !adoptedPaths.has(entry.path)
     )) {
@@ -734,7 +893,8 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         repositoryPath: project.path,
         container: this.#projectContainer(project.name),
         taskId: task.id,
-        roleName
+        roleName,
+        ...(deleteBranch ? { deleteBranch: true } : {})
       });
       if (removal === "dirty") {
         throw new Error(
@@ -746,7 +906,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
 
   #recordWorkspaceRemoval(
     task: Task,
-    workspace: RoleWorkspace,
+    workspace: ManagedWorkspace,
     fallback: string,
     workItem?: Readonly<{
       workItemId: string;
@@ -757,19 +917,24 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       if (workspace.owner.type === "task") {
         assertTaskArchiveState(requireTask(tx, task.id), task);
       }
-      const current = tx.getRoleWorkspace(task.id, workspace.roleName);
-      if (current === null || !sameRoleWorkspace(current, workspace)) {
+      const current = tx.listManagedWorkspaces(task.id)
+        .find((entry) => managedWorkspaceKey(entry.owner) === managedWorkspaceKey(workspace.owner))
+        ?? null;
+      if (current === null || !sameManagedWorkspace(current, workspace)) {
         if (workItem === undefined) {
           throw new Error(`Managed workspace changed before cleanup was recorded: ${
             task.id
-          }/${workspace.roleName}.`);
+          }/${managedWorkspaceKey(workspace.owner)}.`);
         }
         recordWorkspaceDisposition(tx, task.id, workItem, this.now());
         return;
       }
-      const role = tx.getRole(task.id, workspace.roleName);
-      tx.removeRoleWorkspace(task.id, workspace.roleName);
-      const main = tx.getRoleWorkspace(task.id, LEADER_ROLE);
+      const roleName = workspace.owner.type === "work-item"
+        ? tx.getWorkItem(task.id, workspace.owner.workItemId)?.assignee
+        : workspace.owner.type === "task" ? LEADER_ROLE : undefined;
+      const role = roleName === undefined ? null : tx.getRole(task.id, roleName);
+      tx.removeManagedWorkspace(workspace.owner);
+      const main = tx.getTaskWorkspace(task.id);
       const target = workspace.owner.type === "task" ? fallback : main?.root ?? fallback;
       if (role !== null && role.workspace !== target) {
         const timestamp = this.now();
@@ -836,7 +1001,7 @@ function requireWorkItem(
 }
 
 function requireWorkspaceEntry(
-  workspace: RoleWorkspace,
+  workspace: ManagedWorkspace,
   projectId: string
 ): WorkspaceProjectEntry {
   const entry = workspace.entries.find((candidate) => candidate.projectId === projectId);
@@ -850,29 +1015,28 @@ function assertWorkItemWorkspaceEligible(
   item: WorkItem
 ): void {
   if (task.status !== "active") throw new Error(`Task is not active: ${task.id}.`);
-  if (item.assignee === undefined) {
-    throw new Error(`WorkItem workspace requires a Task Role assignee: ${item.id}.`);
-  }
-  if (item.assignee === LEADER_ROLE) {
-    throw new Error("The Leader must remain in the Task main workspace.");
-  }
   if (["completed", "failed", "retired"].includes(item.status)) {
     throw new Error(`Work item is already terminal: ${item.id}.`);
   }
-  if (store.getActiveAgentRun(task.id, item.assignee) !== null) {
+  const activeDevelopRun = store.listAgentRuns(task.id)
+    .find((run) => run.status === "active" && run.workItemId === item.id);
+  if (activeDevelopRun !== undefined) {
+    throw new Error(`Work Item already has an active Develop Run: ${activeDevelopRun.id}.`);
+  }
+  if (item.assignee !== undefined && store.getActiveAgentRun(task.id, item.assignee) !== null) {
     throw new Error(`Role has an active Run: ${task.id}/${item.assignee}.`);
   }
 }
 
-function assertWorkItemOwnsWorkspace(item: WorkItem, workspace: RoleWorkspace): void {
+function assertWorkItemOwnsWorkspace(item: WorkItem, workspace: ManagedWorkspace): void {
   if (workspace.owner.type !== "work-item" || workspace.owner.workItemId !== item.id) {
-    throw new Error(`WorkItem does not own the Role workspace: ${item.id}.`);
+    throw new Error(`WorkItem does not own the managed workspace: ${item.id}.`);
   }
 }
 
 function assertReviewRoundOwnsWorkspace(
   reviewRoundId: string,
-  workspace: RoleWorkspace
+  workspace: ManagedWorkspace
 ): void {
   if (workspace.owner.type !== "review-round"
     || workspace.owner.reviewRoundId !== reviewRoundId) {
@@ -881,9 +1045,9 @@ function assertReviewRoundOwnsWorkspace(
 }
 
 function preserveWorkspaceCreatedAt(
-  workspace: RoleWorkspace,
-  previous: RoleWorkspace | null
-): RoleWorkspace {
+  workspace: ManagedWorkspace,
+  previous: ManagedWorkspace | null
+): ManagedWorkspace {
   return previous === null
     ? workspace
     : { ...workspace, createdAt: previous.createdAt };
@@ -917,8 +1081,13 @@ function retireWorkspaceBoundSession(
   }
 }
 
-function sameRoleWorkspace(left: RoleWorkspace, right: RoleWorkspace): boolean {
+function sameManagedWorkspace(left: ManagedWorkspace, right: ManagedWorkspace): boolean {
   return isDeepStrictEqual(left, right);
+}
+
+function isMissingPath(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error
+    && (error as { code?: unknown }).code === "ENOENT";
 }
 
 function recordWorkspaceDisposition(
@@ -990,6 +1159,10 @@ function safePathSegment(value: string): string {
     throw new Error("Identity is invalid for managed workspace layout.");
   }
   return normalized;
+}
+
+function sameCommit(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase();
 }
 
 export function resolveWorktreeRoot(home: string, workspace: string | undefined): string {

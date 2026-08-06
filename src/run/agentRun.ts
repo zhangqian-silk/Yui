@@ -2,8 +2,11 @@ import {
   validateEffectiveLaunchSnapshot,
   type EffectiveLaunchSnapshot
 } from "../executor/effectiveLaunch.js";
-import { validateRoleWorkspace, type RoleWorkspace } from "../worktree/roleWorkspace.js";
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
+import {
+  validateManagedWorkspace,
+  type ManagedWorkspace
+} from "../worktree/managedWorkspace.js";
 
 export type DispatchMode = "new" | "resume";
 export type AgentRunStatus = "active" | "yielded" | "failed";
@@ -19,7 +22,7 @@ export type AgentRun = {
   purpose: AgentRunPurpose;
   workItemId?: string;
   reviewRoundId?: string;
-  workspace?: RoleWorkspace;
+  workspace?: ManagedWorkspace;
   /** Immutable actual launch configuration and provenance. */
   effective: EffectiveLaunchSnapshot;
   status: AgentRunStatus;
@@ -42,7 +45,7 @@ export function createAgentRun(
     workItemId?: string;
     purpose?: AgentRunPurpose;
     reviewRoundId?: string;
-    workspace?: RoleWorkspace;
+    workspace?: ManagedWorkspace;
     effective: EffectiveLaunchSnapshot;
   }
 ): AgentRun {
@@ -66,7 +69,7 @@ export function createAgentRun(
       : { reviewRoundId: requireSafeIdentity(context.reviewRoundId, "ReviewRound id") }),
     ...(context.workspace === undefined
       ? {}
-      : { workspace: validateRoleWorkspace(context.workspace) }),
+      : { workspace: validateManagedWorkspace(context.workspace) }),
     effective: validateEffectiveLaunchSnapshot(context.effective),
     status: "active",
     createdAt: timestamp,
@@ -105,13 +108,22 @@ export function validateAgentRun(run: AgentRun): AgentRun {
     validateTaskRecordReference({ taskId: run.taskId, localId: run.reviewRoundId }, "reviewRound");
   }
   if (run.workspace !== undefined) {
-    validateRoleWorkspace(run.workspace);
-    if (run.workspace.taskId !== run.taskId) {
+    validateManagedWorkspace(run.workspace);
+    if (run.workspace.owner.taskId !== run.taskId) {
       throw new Error("Agent run workspace belongs to another Task.");
     }
     if (run.workspace.owner.type === "work-item"
       && run.workspace.owner.workItemId !== run.workItemId) {
       throw new Error("Agent run workspace belongs to another Work Item.");
+    }
+    if (run.workspace.owner.type === "work-item" && run.workItemId === undefined) {
+      throw new Error("A WorkItem workspace requires a WorkItem Agent run reference.");
+    }
+    if (run.workspace.owner.type === "review-round" && run.purpose !== "review") {
+      throw new Error("A ReviewRound workspace requires a review Agent run.");
+    }
+    if (run.workspace.owner.type === "integration-attempt") {
+      throw new Error("An IntegrationAttempt workspace cannot be used by an Agent run.");
     }
     if (run.workspace.owner.type === "review-round"
       && run.workspace.owner.reviewRoundId !== run.reviewRoundId) {

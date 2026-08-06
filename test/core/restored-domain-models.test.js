@@ -28,7 +28,7 @@ import {
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { createTaskMessage } from "../../dist/message/message.js";
-import { createRoleWorkspace } from "../../dist/worktree/roleWorkspace.js";
+import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 
 const now = new Date("2026-07-19T12:00:00.000Z");
 const later = new Date("2026-07-19T12:01:00.000Z");
@@ -285,10 +285,8 @@ test("restored persistent domain records are plain JSON with explicit schema ver
 });
 
 test("a writable Review Run requires its exact ReviewRound-owned workspace", () => {
-  const reviewWorkspace = createRoleWorkspace({
-    taskId: "task-1",
-    roleName: "reviewer",
-    owner: { type: "review-round", reviewRoundId: "review-round-1" },
+  const reviewWorkspace = createManagedWorkspace({
+    owner: { type: "review-round", taskId: "task-1", reviewRoundId: "review-round-1" },
     root: "/fixture/reviews/review-round-1",
     entries: [{
       projectId: "project-1",

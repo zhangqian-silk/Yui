@@ -45,7 +45,7 @@ import {
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, archiveTask, completeTask, createTask } from "../../dist/task/task.js";
-import { createRoleWorkspace } from "../../dist/worktree/roleWorkspace.js";
+import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 import { createProject } from "../../dist/repository/project.js";
 import {
   createWorkItem,
@@ -195,10 +195,8 @@ function preparedDeliveryFailureFixture(
       reviewBaseCommit,
       now
     );
-    const reviewWorkspace = createRoleWorkspace({
-      taskId: task.id,
-      roleName,
-      owner: { type: "review-round", reviewRoundId: pendingRound.id },
+    const reviewWorkspace = createManagedWorkspace({
+      owner: { type: "review-round", taskId: task.id, reviewRoundId: pendingRound.id },
       root: join(home, "reviews", pendingRound.id),
       entries: [{
         projectId: "project-1",
@@ -246,7 +244,10 @@ function preparedDeliveryFailureFixture(
     if (roleName !== "leader") tx.saveRole(task.id, role);
     tx.saveRole(task.id, updateRoleStatus(role, "running", now));
     if (item !== null) tx.saveWorkItem(task.id, item);
-    if (round !== null) tx.saveReviewRound(task.id, round);
+    if (round !== null) {
+      tx.saveReviewRound(task.id, round);
+      tx.saveManagedWorkspace(round.workspace);
+    }
     tx.saveActiveAgentRun(run);
     enqueueWork(tx, target, "run-dispatched", now, [
       { type: "run", taskId: task.id, id: run.id }
