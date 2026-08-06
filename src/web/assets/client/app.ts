@@ -44,7 +44,8 @@ const state = {
   filter: "all",
   query: "",
   selected: null,
-  detail: null
+  detail: null,
+  detailKey: null
 };
 const VALID_FILTERS = ["all", "active", "draft", "completed", "archived"];
 let terminalSession = null;
@@ -86,10 +87,34 @@ function urlTaskId() {
   return readQuery().get("task") || null;
 }
 
+// The visible detail section is part of the URL (?task=X&section=runs) so a
+// refresh or a shared link lands on the same section. Writes always replace —
+// section moves are not history entries.
+function setSectionParam(targetId) {
+  if (!state.detail) return;
+  const params = readQuery();
+  const section = String(targetId).replace(/^detail-/, "");
+  if (params.get("section") === section) return;
+  params.set("section", section);
+  applyUrl(params, { replace: true });
+}
+
+let sectionParamTimer = null;
+function queueSectionParamSync(targetId) {
+  if (sectionParamTimer !== null) window.clearTimeout(sectionParamTimer);
+  sectionParamTimer = window.setTimeout(function () {
+    sectionParamTimer = null;
+    setSectionParam(targetId);
+  }, 250);
+}
+
 function syncUrlFromState(options) {
   const params = readQuery();
   if (state.selected) params.set("task", state.selected);
-  else params.delete("task");
+  else {
+    params.delete("task");
+    params.delete("section");
+  }
   if (state.filter && state.filter !== "all") params.set("filter", state.filter);
   else params.delete("filter");
   if (state.query) params.set("q", state.query);
@@ -132,8 +157,24 @@ function showOverview() {
   elements.mainCol.scrollTop = 0;
 }
 
-function renderCurrentDetail() {
+// Fingerprint of the rendered detail payload. Quiet polling re-renders the
+// whole detail on every tick; skipping identical payloads keeps local UI state
+// (expanded blocks, list pages) alive and avoids DOM churn.
+let renderedDetailKey = null;
+
+function detailKeyOf(detail) {
+  const text = JSON.stringify(detail);
+  let hash = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = (hash * 31 + text.charCodeAt(i)) | 0;
+  }
+  return text.length + ":" + hash;
+}
+
+function renderCurrentDetail(force) {
   if (state.detail) {
+    const key = i18n.getLocale() + "|" + state.detailKey;
+    if (!force && key === renderedDetailKey) return;
     renderTaskDetail(
       elements.detail,
       state.detail,
@@ -141,7 +182,9 @@ function renderCurrentDetail() {
       i18n.getLocale(),
       detailActions()
     );
+    renderedDetailKey = key;
   } else if (!state.selected) {
+    renderedDetailKey = null;
     showOverview();
   }
 }
@@ -180,6 +223,11 @@ function updateActiveTabFromScroll() {
   if (!tabs.length) return;
   const root = elements.mainCol;
   const rootTop = root.getBoundingClientRect().top;
+  // Sections sit below the sticky topbar + tab bar (see .anchor scroll-margin),
+  // so "current" means the last section whose top crossed that stacked offset.
+  const stickyH = (elements.topbar ? elements.topbar.offsetHeight : 0)
+    + (elements.detailTabs.hidden ? 0 : elements.detailTabs.offsetHeight);
+  const threshold = stickyH + 8;
   let activeId = tabs[0].dataset.target;
   let bestTop = -Infinity;
   tabs.forEach(function (tab) {
@@ -188,7 +236,7 @@ function updateActiveTabFromScroll() {
     const el = root.querySelector("#" + id);
     if (!el) return;
     const top = el.getBoundingClientRect().top - rootTop;
-    if (top <= 8 && top > bestTop) {
+    if (top <= threshold && top > bestTop) {
       bestTop = top;
       activeId = id;
     }
@@ -196,6 +244,7 @@ function updateActiveTabFromScroll() {
   tabs.forEach(function (tab) {
     tab.classList.toggle("is-active", tab.dataset.target === activeId);
   });
+  if (state.detail) queueSectionParamSync(activeId);
 }
 
 function syncTabHighlight() {
@@ -249,15 +298,33 @@ async function loadTaskDetail(taskId, showLoading) {
   const detail = await requestJson("/api/tasks/" + encodeURIComponent(taskId));
   if (state.selected !== taskId) return;
   state.detail = detail;
-  renderCurrentDetail();
-  elements.mainCol.scrollTop = savedScrollTop;
+  state.detailKey = detailKeyOf(detail);
+  renderCurrentDetail(true);
+  // Reveal the tab bar before measuring/scroll so anchors land correctly.
   setDetailActive(true);
+  updateStickyOffsets();
+  // A section in the URL wins over the preserved scroll offset.
+  const section = readQuery().get("section");
+  const anchor = section ? elements.detail.querySelector("#detail-" + section) : null;
+  if (anchor) {
+    anchor.scrollIntoView({ block: "start" });
+  } else {
+    elements.mainCol.scrollTop = savedScrollTop;
+  }
   syncTabHighlight();
 }
 
 async function selectTask(taskId) {
+  // Switching tasks drops the previous section; staying on the same task
+  // (URL-driven loads, popstate) keeps it.
+  if (urlTaskId() !== taskId) {
+    const params = readQuery();
+    params.delete("section");
+    applyUrl(params, { replace: true });
+  }
   state.selected = taskId;
   state.detail = null;
+  renderedDetailKey = null;
   // When the selection is driven by the URL (initial load or popstate), the
   // URL already reflects the task id, so replace instead of pushing a
   // duplicate history entry.
@@ -473,6 +540,7 @@ if (elements.detailTabs) {
     const section = elements.detail.querySelector("#" + targetId);
     if (!section) return;
     section.scrollIntoView({ behavior: "smooth", block: "start" });
+    setSectionParam(targetId);
     elements.detailTabs.querySelectorAll(".tab").forEach(function (other) {
       other.classList.toggle("is-active", other === tab);
     });
