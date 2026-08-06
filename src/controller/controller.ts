@@ -43,6 +43,7 @@ import {
 import type { SessionHostPort } from "../runtime/ports.js";
 import { formatTaskRecordReference } from "../task/taskRecordReference.js";
 import type { RuntimeEventProcessorPort } from "./runtimeEventProcessor.js";
+import type { EphemeralDomainIdentity } from "./domainIdentity.js";
 
 const DEFAULT_RECONCILIATION_INTERVAL_MS = reconciliationIntervalMilliseconds();
 const DEFAULT_SIGNAL_WINDOW_MS = 100;
@@ -83,6 +84,14 @@ export type ControllerRuntimeOptions = Readonly<{
   runtimeEventProcessor?: RuntimeEventProcessorPort;
   lifecycleHost?: RuntimeLifecycleHost;
   configuration?: ControllerConfigurationPort;
+  domainIdentity?: EphemeralDomainIdentity;
+  resourceReaper?: () => Promise<Readonly<{
+    cleaned: number;
+    failed: readonly Readonly<{ id: string; message: string }>[];
+    expiredDomains?: readonly Readonly<{ yuiHome: string; token?: string }>[];
+  }>>;
+  onExpiredEphemeralDomain?:
+    (domain: Readonly<{ yuiHome: string; token?: string }>) => void;
 }>;
 
 export interface ControllerConfigurationPort {
@@ -726,6 +735,12 @@ export class FileTaskController {
   readonly #signalScheduler: MailboxScheduler<MailboxKey>;
   readonly #operatorSignalScheduler: MailboxScheduler<MailboxKey>;
   readonly #configuration: ControllerConfigurationPort | undefined;
+  readonly #resourceReaper:
+    | ControllerRuntimeOptions["resourceReaper"]
+    | undefined;
+  readonly #onExpiredEphemeralDomain:
+    | ControllerRuntimeOptions["onExpiredEphemeralDomain"]
+    | undefined;
   #current: Promise<ControllerSchedulerResult> | undefined;
   #operatorCurrent: Promise<void> | undefined;
   #pendingFull = false;
@@ -765,6 +780,8 @@ export class FileTaskController {
     this.#runtimeEventProcessor = options.runtimeEventProcessor;
     this.#lifecycleHost = options.lifecycleHost;
     this.#configuration = options.configuration;
+    this.#resourceReaper = options.resourceReaper;
+    this.#onExpiredEphemeralDomain = options.onExpiredEphemeralDomain;
     this.#signalScheduler = new MailboxScheduler(
       async (keys) => { await this.#requestPass({ kind: "dirty", keys }); },
       {
@@ -944,6 +961,25 @@ export class FileTaskController {
         this.#pendingKeys.clear();
         try {
           if (scope.kind === "full") this.reloadReconciliationInterval();
+          if (scope.kind === "full" && this.#resourceReaper !== undefined) {
+            const reap = await this.#resourceReaper();
+            for (const failure of reap.failed) {
+              this.#onError(new Error(
+                `Ephemeral runtime reap failed for ${failure.id}: ${failure.message}`
+              ));
+            }
+            // The reaper owns the exact resource fences. Once a whole expired
+            // domain converges, let the detached Controller close itself on a
+            // later turn; never close while this reconciliation pass is still
+            // the in-flight server request.
+            if (reap.failed.length === 0 && (reap.expiredDomains?.length ?? 0) > 0) {
+              for (const domain of reap.expiredDomains ?? []) {
+                queueMicrotask(() => {
+                  this.#onExpiredEphemeralDomain?.(domain);
+                });
+              }
+            }
+          }
           const firstRuntimeDrain = this.#drainRuntimeEvents();
           result = await runControllerSchedulerPass(
             this.store,
@@ -1377,6 +1413,8 @@ export async function startFileTaskController(
     runtime.stop();
     await Promise.allSettled([...lifecycleRequests]);
     await runtime.shutdownAndDrain();
+  }, {
+    domainIdentity: options.domainIdentity
   });
   runtime.start();
   const closed = server.closed;

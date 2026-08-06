@@ -57,6 +57,8 @@ import {
   RuntimeLaunchCoordinator,
   type CoordinatedRuntimeLaunchRequest
 } from "./runtimeLaunchCoordinator.js";
+import { ephemeralDomainFromEnvironment } from "./domainIdentity.js";
+import { createEphemeralResourceReaper } from "./ephemeralResourceReaper.js";
 
 export type FileTaskControllerFactoryOptions = ControllerRuntimeOptions & Readonly<{
   store?: TaskStore;
@@ -101,6 +103,7 @@ export async function startFileTaskControllerRuntime(
   const promptPush = options.promptPush
     ?? new TmuxPromptPushAdapter(tmux, agentProcessReadinessProbe);
   let runningRuntime: RunningFileTaskController["runtime"] | undefined;
+  let runningController: RunningFileTaskController | undefined;
   const signalRuntimeCleanup = (target: RuntimeLifecycleTarget) => {
     runningRuntime?.signal(runtimeLifecycleSignalKey(
       target.kind === "role-runtime"
@@ -134,6 +137,19 @@ export async function startFileTaskControllerRuntime(
   );
   const workspacePreparer = options.workspacePreparer
     ?? new FileTaskWorkspacePreparer(home, store);
+  const domainIdentity = options.domainIdentity
+    ?? ephemeralDomainFromEnvironment(options.environment ?? process.env);
+  const resourceReaper = options.resourceReaper
+    ?? (domainIdentity === undefined
+      ? undefined
+      : createEphemeralResourceReaper({
+          currentHome: home,
+          // The detached Controller owns one YUI_HOME. Keep automatic
+          // recovery bounded to that domain; cross-home cleanup remains an
+          // explicit `controller cleanup --all` inventory operation.
+          scope: "current",
+          environment: options.environment
+        }));
   const lifecycleDispatcher = createRuntimeLifecycleDispatcher(
     store,
     schedulerStore,
@@ -157,9 +173,15 @@ export async function startFileTaskControllerRuntime(
       now: options.now,
       onError: options.onError,
       lifecycleHost: sessionHost,
+      ...(resourceReaper === undefined ? {} : { resourceReaper }),
+      onExpiredEphemeralDomain: (domain) => {
+        if (domain.yuiHome !== home) return;
+        void runningController?.close().catch(options.onError ?? (() => undefined));
+      },
       workspacePreparer,
       runtimeEventProcessor: options.runtimeEventProcessor
         ?? new FileRuntimeEventProcessor(new FileRuntimeEventInbox(home), schedulerStore),
+      domainIdentity,
       ...(options.configuration !== undefined
         ? { configuration: options.configuration }
         : options.intervalMs === undefined
@@ -173,6 +195,7 @@ export async function startFileTaskControllerRuntime(
         : {})
     }
   );
+  runningController = running;
   runningRuntime = running.runtime;
   return {
     ...running,

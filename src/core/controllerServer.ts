@@ -18,6 +18,11 @@ import {
 } from "./protocol.js";
 import { controllerSocketPath } from "./controllerEndpoint.js";
 import { YUI_VERSION, yuiVersionIdentity } from "../version.js";
+import {
+  removeEphemeralDomainIdentity,
+  writeEphemeralDomainIdentity,
+  type EphemeralDomainIdentity
+} from "../controller/domainIdentity.js";
 
 export type ControllerDispatcher = (
   method: string,
@@ -30,14 +35,24 @@ export type RunningControllerServer = Readonly<{
   close(): Promise<void>;
 }>;
 
+export type ControllerServerOptions = Readonly<{
+  domainIdentity?: EphemeralDomainIdentity;
+}>;
+
 export async function startControllerServer(
   home: string,
   dispatcher?: ControllerDispatcher,
-  beforeDiscoveryRemoval?: () => void | Promise<void>
+  beforeDiscoveryRemoval?: () => void | Promise<void>,
+  options: ControllerServerOptions = {}
 ): Promise<RunningControllerServer> {
   const releaseLifecycleLock = await acquireHomeLifecycleLock(home);
   try {
-    return await startControllerServerLocked(home, dispatcher, beforeDiscoveryRemoval);
+    return await startControllerServerLocked(
+      home,
+      dispatcher,
+      beforeDiscoveryRemoval,
+      options
+    );
   } finally {
     await releaseLifecycleLock();
   }
@@ -46,7 +61,8 @@ export async function startControllerServer(
 async function startControllerServerLocked(
   home: string,
   dispatcher?: ControllerDispatcher,
-  beforeDiscoveryRemoval?: () => void | Promise<void>
+  beforeDiscoveryRemoval?: () => void | Promise<void>,
+  options: ControllerServerOptions = {}
 ): Promise<RunningControllerServer> {
   const discoveryPath = join(home, CONTROLLER_DISCOVERY_PATH);
   const socketPath = controllerSocketPath(home);
@@ -86,6 +102,9 @@ async function startControllerServerLocked(
       socketPath,
       token
     });
+    if (options.domainIdentity !== undefined) {
+      writeEphemeralDomainIdentity(home, options.domainIdentity);
+    }
     await writeDiscoveryAtomically(discoveryPath, discovery);
 
     let resolveClosed: () => void = () => undefined;
@@ -99,6 +118,9 @@ async function startControllerServerLocked(
         await beforeDiscoveryRemoval?.();
         await closeNetServer(netServer);
         await removeOwnedDiscovery(discoveryPath, token);
+        if (options.domainIdentity !== undefined) {
+          removeEphemeralDomainIdentity(home, options.domainIdentity.token);
+        }
         resolveClosed();
       })();
       return closePromise;
