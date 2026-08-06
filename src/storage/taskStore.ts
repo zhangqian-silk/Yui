@@ -283,6 +283,7 @@ export type TaskStore = {
 
 export class FileTaskStore implements TaskStore {
   #transaction: { state: StorageState; baseRevision: number; dirty: boolean } | null = null;
+  #readCache: { fingerprint: string; state: StorageState } | null = null;
 
   constructor(private readonly rootDir: string) {
     requireStorageSchema(rootDir);
@@ -293,12 +294,15 @@ export class FileTaskStore implements TaskStore {
   transaction<T>(execute: (store: TaskStore) => T): T {
     if (this.#transaction !== null) return synchronousResult(execute(this));
     return this.#withWriteLock(() => {
-      const state = this.#readState();
+      const state = this.#readCachedState();
       this.#transaction = { state, baseRevision: state.revision, dirty: false };
       try {
         const result = synchronousResult(execute(this));
         if (this.#transaction.dirty) this.#commit(state, this.#transaction.baseRevision);
         return result;
+      } catch (error) {
+        this.#readCache = null;
+        throw error;
       } finally {
         this.#transaction = null;
       }
@@ -1136,7 +1140,7 @@ export class FileTaskStore implements TaskStore {
   }
   #requireTaskForWrite(taskId: string): StoredTask { return this.#requireTask(taskId); }
 
-  #state(): StorageState { return this.#transaction?.state ?? this.#readState(); }
+  #state(): StorageState { return this.#transaction?.state ?? this.#readCachedState(); }
   #mutate(execute: (state: StorageState) => void): void { this.#mutateResult((state) => { execute(state); }); }
   #mutateResult<T>(execute: (state: StorageState) => T): T {
     if (this.#transaction !== null) {
@@ -1145,10 +1149,15 @@ export class FileTaskStore implements TaskStore {
       return result;
     }
     return this.#withWriteLock(() => {
-      const state = this.#readState();
-      const result = execute(state);
-      this.#commit(state, state.revision);
-      return result;
+      const state = this.#readCachedState();
+      try {
+        const result = execute(state);
+        this.#commit(state, state.revision);
+        return result;
+      } catch (error) {
+        this.#readCache = null;
+        throw error;
+      }
     });
   }
   #remove<T>(select: (state: StorageState) => Record<string, T>, id: string): boolean {
@@ -1192,6 +1201,21 @@ export class FileTaskStore implements TaskStore {
     if (!existsSync(path)) return emptyState();
     return parseState(readFileSync(path, "utf8"));
   }
+  #readCachedState(): StorageState {
+    requireStorageSchema(this.rootDir);
+    const path = join(this.rootDir, STORAGE_STATE_FILE);
+    if (!existsSync(path)) {
+      if (this.#readCache?.fingerprint === "missing") return this.#readCache.state;
+      const state = emptyState();
+      this.#readCache = { fingerprint: "missing", state };
+      return state;
+    }
+    const fingerprint = stateFileFingerprint(path);
+    if (this.#readCache?.fingerprint === fingerprint) return this.#readCache.state;
+    const state = parseState(readFileSync(path, "utf8"));
+    this.#readCache = { fingerprint, state };
+    return state;
+  }
   #commit(state: StorageState, expectedRevision: number): void {
     const current = this.#readState();
     if (current.revision !== expectedRevision) {
@@ -1201,11 +1225,17 @@ export class FileTaskStore implements TaskStore {
     const content = `${JSON.stringify(state, null, 2)}\n`;
     parseState(content);
     writeTextFileAtomically(join(this.rootDir, STORAGE_STATE_FILE), content);
+    this.#readCache = null;
   }
   #withWriteLock<T>(execute: () => T): T {
     const release = acquireStorageLock(this.rootDir);
     try { return execute(); } finally { release(); }
   }
+}
+
+function stateFileFingerprint(path: string): string {
+  const stat = statSync(path, { bigint: true });
+  return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(":");
 }
 
 export class StorageRecordError extends Error { constructor(message: string) { super(message); this.name = "StorageRecordError"; } }
