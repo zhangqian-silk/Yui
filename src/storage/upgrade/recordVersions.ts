@@ -37,7 +37,7 @@ const CURRENT_RECORD_VERSIONS: Readonly<Record<string, RecordAxisEntry>> = Objec
   task: { version: 3, path: "state.json#/tasks/*/task" },
   taskBrief: { version: 2, path: "state.json#/tasks/*/brief" },
   taskRole: { version: 3, path: "state.json#/tasks/*/roles" },
-  roleWorkspace: { version: 3, path: "state.json#/tasks/*/roleWorkspaces" },
+  managedWorkspace: { version: 1, path: "state.json#/tasks/*/managedWorkspaces" },
   taskRoleSessionSet: { version: 3, path: "state.json#/tasks/*/roleSessionSets" },
   workItem: { version: 6, path: "state.json#/tasks/*/workItems" },
   agentRun: { version: 4, path: "state.json#/tasks/*/agentRuns" },

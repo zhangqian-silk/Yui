@@ -194,6 +194,55 @@ test("P1-1 scan: an absent/empty family is treated as already-latest", () => {
   assert.equal(scan.record.configuredAgent.version, currentRecordVersions().configuredAgent.version);
 });
 
+test("P1-1 map completeness: current persisted workspace family is ManagedWorkspace", () => {
+  const versions = currentRecordVersions();
+  assert.deepEqual(
+    Object.keys(versions).sort(),
+    [
+      "agentProfile", "agentRun", "changeSet", "configuredAgent", "decision",
+      "event", "globalRole", "globalRoleSessionSet", "inputRequest",
+      "integrationAttempt", "managedWorkspace", "message", "milestone",
+      "project", "reviewRound", "task", "taskBrief", "taskRole",
+      "taskRoleSessionSet", "workItem", "workMailbox"
+    ].sort()
+  );
+  assert.deepEqual(versions.managedWorkspace, {
+    version: 1,
+    path: "state.json#/tasks/*/managedWorkspaces"
+  });
+  assert.equal("roleWorkspace" in versions, false);
+});
+
+test("P1-1 managed workspace record-only mismatch is NEEDS_NEW_VERSION/missing-step", () => {
+  const { home } = currentHome();
+  editState(home, (state) => {
+    // The scanner intentionally needs only the record's schemaVersion here;
+    // the strict aggregate loader must not run while this record axis is old.
+    state.tasks = {
+      "task-1": {
+        managedWorkspaces: {
+          "task": { schemaVersion: 1 }
+        }
+      }
+    };
+  });
+  const latest = LATEST();
+  latest.record = {
+    ...latest.record,
+    managedWorkspace: {
+      version: 2,
+      path: "state.json#/tasks/*/managedWorkspaces"
+    }
+  };
+  const result = classifyHome({ home, registry: EMPTY(), latest });
+  assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");
+  assert.equal(result.classification.blocker.reason, "missing-step");
+  assert.equal(result.classification.blocker.axis, "record");
+  assert.equal(result.classification.blocker.recordKind, "managedWorkspace");
+  assert.equal(result.classification.blocker.from, 1);
+  assert.equal(result.classification.blocker.to, 2);
+});
+
 test("P1-1 upgrade: a record-only-older Home blocks with missing-step and never switches", async () => {
   const { home } = currentHome();
   setConfiguredAgent(home, 1);

@@ -57,35 +57,42 @@ export type UpdateSpawner = (
 /** Build the real ports. `spawn` is injectable so tests avoid real installs. */
 export function createUpdatePorts(
   environment: NodeJS.ProcessEnv,
-  spawn: UpdateSpawner = spawnSync
+  spawn: UpdateSpawner = spawnSync,
+  stagingRoot: string = tmpdir()
 ): UpdatePorts {
   return {
     stage(): StagedPackage {
-      const stagingPath = mkdtempSync(join(tmpdir(), "yui-update-stage-"));
-      const result = spawn(
-        "npm",
-        ["install", "--global", "--prefix", stagingPath, PACKAGE_SPEC],
-        { cwd: process.cwd(), env: environment, shell: false, stdio: "inherit" }
-      );
-      assertSpawnOk(result, "stage the new package");
-      const binaryPath = join(stagingPath, "bin", "yui");
-      // Resolve the EXACT version that was staged (from the staged install's own
-      // package.json, else the staged binary itself). If neither yields a concrete
-      // version, FAIL the stage (R2-F1): we must never fall back to a bare
-      // `@latest`, which would let activation promote — and verify wave through —
-      // a different build than the one that passed preflight.
-      const version = resolveStagedVersion(stagingPath, binaryPath, environment, spawn);
-      if (version === null) {
-        // Clean up the staging dir; the live install is untouched, so this is a
-        // fully recoverable pre-activation failure.
-        rmSync(stagingPath, { recursive: true, force: true });
-        throw runtimeError(
-          "Failed to resolve the exact staged package version (neither the staged package.json "
-            + "nor `yui --json version` returned a concrete version). Refusing to proceed with a "
-            + "`@latest` fallback that could promote a different build than the one preflighted."
+      const stagingPath = mkdtempSync(join(stagingRoot, "yui-update-stage-"));
+      let ownsStaging = true;
+      try {
+        const result = spawn(
+          "npm",
+          ["install", "--global", "--prefix", stagingPath, PACKAGE_SPEC],
+          { cwd: process.cwd(), env: environment, shell: false, stdio: "inherit" }
         );
+        assertSpawnOk(result, "stage the new package");
+        const binaryPath = join(stagingPath, "bin", "yui");
+        // Resolve the EXACT version that was staged (from the staged install's own
+        // package.json, else the staged binary itself). If neither yields a concrete
+        // version, FAIL the stage (R2-F1): we must never fall back to a bare
+        // `@latest`, which would let activation promote — and verify wave through —
+        // a different build than the one that passed preflight.
+        const version = resolveStagedVersion(stagingPath, binaryPath, environment, spawn);
+        if (version === null) {
+          throw runtimeError(
+            "Failed to resolve the exact staged package version (neither the staged package.json "
+              + "nor `yui --json version` returned a concrete version). Refusing to proceed with a "
+              + "`@latest` fallback that could promote a different build than the one preflighted."
+          );
+        }
+        // Successful staging transfers cleanup ownership to runUpdate's finally
+        // block. Every assertion, spawn, npm/network, or version-resolution
+        // failure before that handoff removes the throwaway prefix here.
+        ownsStaging = false;
+        return { binaryPath, version, stagingPath };
+      } finally {
+        if (ownsStaging) rmSync(stagingPath, { recursive: true, force: true });
       }
-      return { binaryPath, version, stagingPath };
     },
 
     preflight(staged: StagedPackage, home: string): UpdatePreflight {

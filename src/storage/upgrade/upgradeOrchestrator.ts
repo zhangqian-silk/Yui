@@ -9,10 +9,13 @@
  *     -> plan (delegated to the engine; missing/future step = fail-closed)
  *     -> [execute] admission fence  (new writers refused)
  *     -> [execute] coordination lock (outside Home; shared with inbox publish)
- *          -> quiesce (verify no foreign writer / unfinished lifecycle)
+ *          -> quiesce (record/stop prior Controller; verify no foreign writer /
+ *             unfinished lifecycle)
  *          -> re-pin revision (under `.state.lock`)
  *          -> snapshot -> validate gate -> atomic switch + backup
  *     -> [execute] post-switch health check (fresh FileTaskStore loader)
+ *     -> restore old Controller on pre-switch block, or start the replacement
+ *        only after a committed switch and successful verification
  *
  * `--dry-run` runs preflight + plan + the staged validation gate, then discards
  * the staged output and never switches. Every failure reports a precise blocker
@@ -37,8 +40,10 @@ import {
 } from "../migration/index.js";
 import {
   stopFileTaskController,
+  ensureFileTaskController,
   type FileControllerClientOptions
 } from "../../controller/clientRuntime.js";
+import { callController } from "../../core/controllerClient.js";
 import { FileTaskStore, STORAGE_STATE_FILE, withStorageWriteLock } from "../taskStore.js";
 import {
   clearUpgradeFence,
@@ -119,8 +124,19 @@ export type RunStorageUpgradeOptions<Snapshot> = Readonly<{
   callerPid?: number;
   /** Overrides for the Controller stop/drain client (tests inject fakes). */
   controllerOptions?: FileControllerClientOptions;
+  /**
+   * Test seam: inspect whether the Controller was running before quiesce.
+   * Defaults to the authenticated `controller.status` RPC; an absent
+   * Controller is the only state treated as definitely stopped.
+   */
+  controllerStatus?: (home: string) => Promise<ControllerLifecycleStatus>;
   /** Test seam: stop+drain the Controller. Defaults to the real client. */
-  stopController?: (home: string) => Promise<void>;
+  stopController?: (home: string) => Promise<void | ControllerStopResult>;
+  /**
+   * Test seam: start a Controller after a verified switch, or restore the old
+   * Controller after a blocked pre-switch attempt. Defaults to the real client.
+   */
+  startController?: (home: string) => Promise<unknown>;
   /**
    * Test seam forwarded to the migration target's atomic switch to simulate a
    * failing promotion/rollback rename (P1-4). Production never sets it.
@@ -132,6 +148,19 @@ export type RunStorageUpgradeOptions<Snapshot> = Readonly<{
    * sets it.
    */
   switchFaultHook?: (step: SwitchStep) => void;
+}>;
+
+/** The lifecycle fact captured before an upgrade stops a Controller. */
+export type ControllerLifecycleStatus = Readonly<{
+  running: boolean;
+  pid?: number;
+}>;
+
+/** A stop result is successful only when the caller can prove `stopped:true`. */
+export type ControllerStopResult = Readonly<{
+  stopped: boolean;
+  alreadyStopped?: boolean;
+  pid?: number;
 }>;
 
 /**
@@ -259,7 +288,7 @@ async function execute(
   callerPid: number,
   now: () => Date
 ): Promise<UpgradeResult> {
-  const { home, registry, latest } = options;
+  const { home } = options;
 
   // 3) Admission fence — from here, new baseline CLI and Controller writers are
   // refused at the storage commit choke point. The fencing process is exempt.
@@ -269,109 +298,244 @@ async function execute(
     ownerPid: callerPid
   });
 
+  let controllerWasRunning = false;
+  let controllerStopConfirmed = false;
+  let result: UpgradeResult | undefined;
+  let unexpected: unknown;
   try {
-    // 4) Quiesce — drain the Controller with the public stop, then require that
-    // no foreign writer, no live Controller, and no unfinished runtime lifecycle
-    // remain. Any unclear signal fails closed with the source unchanged.
-    const stopController = options.stopController
-      ?? ((h: string) => defaultStopController(h, options.controllerOptions));
-    await stopController(home);
-
+    // Record the lifecycle fact before stopping anything. An unavailable or
+    // malformed status is unknown, not "stopped"; fail closed without attempting
+    // a blind stop/retry.
+    const controllerStatus = options.controllerStatus
+      ?? ((h: string) => defaultControllerStatus(h, options.controllerOptions));
+    let status: ControllerLifecycleStatus | undefined;
     try {
-      // The read-only drain proof, revision pin, complete-home copy, and
-      // both switch renames share one sibling coordination lock with inbox
-      // publish. A hook that was admitted before the fence either completes
-      // before this boundary (and is copied) or waits and receives a fence
-      // failure after it. The quiesce proof itself runs only after this lock is
-      // acquired, so no separate scan can race the final copy.
-      return withUpgradeCoordinationLock(home, () => {
-        const quiesce = verifyQuiesced(home, callerPid);
-        if (quiesce !== null) {
-          return withClassification(quiesce, classification);
-        }
-
-        // 5) Re-pin the final revision under the write lock, after drain, so the
-        // snapshot reflects the last committed state (no check-then-migrate
-        // race). The fence exempts this process, so the lock is obtainable.
-        repinRevision(home);
-
-        // 6) Snapshot -> validate gate -> atomic switch + timestamped backup.
-        target.discardFreshOutput();
-        const report = runMigration({ registry, target, latest, mode: "execute" });
-        if (report.outcome === "failed") {
-          target.discardFreshOutput();
-          return { ...blockedFromFailedReport(report, classification), report };
-        }
-        if (report.outcome === "switch-ambiguous") {
-          // The switch was left partially applied: the original was moved to the
-          // backup but BOTH the promotion and its rollback failed. The switch did
-          // NOT commit (the Home path may be missing), so we do NOT write a
-          // completion receipt — that would falsely assert a committed switch.
-          // The honest durable signal is the `interrupted` switch-progress marker
-          // the target already wrote (<home>.upgrade-switch.json), which `yui
-          // update`'s probe reads to drive a restore-the-backup recovery.
-          return { ...blockedFromSwitchAmbiguous(report, classification), report };
-        }
-        if (report.outcome !== "migrated") {
-          // Blocked/active-runtime detected inside the engine: never switched.
-          target.discardFreshOutput();
-          return { ...blockedFromEngineReport(report, classification), report };
-        }
-
-        // The atomic switch has COMMITTED. Drop a durable, out-of-band receipt
-        // before doing anything else, so that if this process is killed before it
-        // can report success (SIGTERM/OOM after switch), a later reader can still
-        // prove the switch happened and locate the backup — closing the
-        // activation-ambiguity gap (P1-2). The receipt is cleared only on a
-        // clean, verified return.
-        writeUpgradeReceipt(home, {
-          switched: true,
-          homePath: home,
-          completedAt: now().toISOString(),
-          targetLayoutVersion: latest.layout,
-          targetAggregateVersion: latest.aggregate,
-          ...(report.switch.backupPath === undefined
-            ? {}
-            : { backupPath: report.switch.backupPath })
-        });
-
-        // 7) Post-switch health check with a fresh loader over the promoted Home.
-        const postVerify = postSwitchHealthCheck(home);
-        if (postVerify !== null) {
-          // Switch committed but the migrated Home did not load: keep the receipt
-          // so the ambiguity is recorded, and report the backup-based manual
-          // recovery.
-          return { ...withClassification(postVerify, classification), report };
-        }
-
-        // Fully verified: the migrated Home loads. Clear the receipt — there is
-        // no ambiguity to record.
-        clearUpgradeReceipt(home);
-        return {
-          outcome: "upgraded",
-          classification,
-          report,
-          ...(report.switch.backupPath === undefined
-            ? {}
-            : { backupPath: report.switch.backupPath })
-        };
-      });
+      status = await controllerStatus(home);
     } catch (error) {
-      if (!(error instanceof UpgradeFenceError)) throw error;
-      return withClassification(
-        {
-          outcome: "blocked",
-          stage: "coordination",
-          message: `Upgrade coordination could not be acquired: ${error.message}`,
-          action:
-            "Wait for the other writer or switch recovery to finish, then retry; "
-            + "the authoritative Home was not switched by this attempt."
-        },
+      result = withClassification(
+        controllerLifecycleBlocker(
+          "Controller status could not be verified",
+          error
+        ),
         classification
       );
     }
+    if (result === undefined && !isControllerLifecycleStatus(status)) {
+      result = withClassification(
+        controllerLifecycleBlocker(
+          "Controller status was malformed",
+          new Error("expected a boolean running field")
+        ),
+        classification
+      );
+    }
+    if (result === undefined) {
+      controllerWasRunning = status!.running;
+      controllerStopConfirmed = !controllerWasRunning;
+    }
+
+    // 4) Quiesce — drain the Controller with the public stop, then require that
+    // no foreign writer, no live Controller, and no unfinished runtime lifecycle
+    // remain. Any unclear signal fails closed with the source unchanged. A stop
+    // request is issued at most once; timeout/rejection is a structured blocker,
+    // never a retry loop.
+    const stopController = options.stopController
+      ?? ((h: string) => defaultStopController(h, options.controllerOptions));
+    if (result === undefined && controllerWasRunning) {
+      try {
+        const stopped = await stopController(home);
+        if (!confirmedControllerStopped(stopped)) {
+          result = withClassification(
+            controllerLifecycleBlocker(
+              "Controller stop did not confirm a drained process",
+              new Error("stop returned without stopped:true")
+            ),
+            classification
+          );
+        } else {
+          controllerStopConfirmed = true;
+        }
+      } catch (error) {
+        result = withClassification(
+          controllerLifecycleBlocker("Controller stop/drain failed", error),
+          classification
+        );
+      }
+    }
+
+    if (result === undefined) {
+      try {
+        result = executeFenced(options, classification, target, callerPid, now);
+      } catch (error) {
+        unexpected = error;
+      }
+    }
   } finally {
     releaseFence();
+  }
+
+  // Restoring the old Controller must happen after the upgrade fence is
+  // released, otherwise its startup scheduler would be blocked by our own
+  // fence. A thrown unexpected fault remains a throw, but the old lifecycle is
+  // still restored exactly once before it escapes.
+  if (unexpected !== undefined) {
+    if (controllerWasRunning && controllerStopConfirmed) {
+      await restoreController(home, options, unexpected);
+    }
+    throw unexpected;
+  }
+  if (result === undefined) {
+    throw new Error("Storage upgrade did not produce a result.");
+  }
+
+  const startController = options.startController
+    ?? ((h: string) => defaultStartController(h, options.controllerOptions));
+  if (result.outcome === "upgraded") {
+    if (controllerWasRunning) {
+      try {
+        // New Controller startup is deliberately after switch + post-verify.
+        await startController(home);
+      } catch (error) {
+        // Keep the completion receipt and backup as durable evidence when the
+        // storage switch is verified but the replacement Controller cannot be
+        // started. The old Controller is not safe to resume on the new Home.
+        return {
+          ...withClassification(
+            {
+              outcome: "blocked",
+              stage: "post-verify",
+              message:
+                `Storage activation and verification succeeded, but the new Controller `
+                + `could not start: ${messageOf(error)}.`,
+              action:
+                "Do not resume writes with the old Controller. Start the new Controller "
+                + "after resolving the startup failure, then verify with `yui doctor`."
+            },
+            classification
+          ),
+          report: result.report
+        };
+      }
+    }
+    // No further uncertainty remains once the replacement Controller (when one
+    // existed) is ready; clear the receipt only at this final boundary.
+    clearUpgradeReceipt(home);
+    return result;
+  }
+
+  if (
+    controllerWasRunning
+    && controllerStopConfirmed
+    && result.outcome === "blocked"
+    // Once the switch committed (post-verify) or became ambiguous, the old
+    // Controller is not safe to resume against this Home.
+    && result.stage !== "post-verify"
+    && result.stage !== "switch-ambiguous"
+  ) {
+    try {
+      // A blocked/failed pre-switch attempt leaves the old Home authoritative;
+      // restore the Controller that was running before quiesce, once and only
+      // once. Ambiguous switch is excluded: its Home authority is unknown.
+      await startController(home);
+    } catch (error) {
+      return {
+        ...withClassification(
+          {
+            outcome: "blocked",
+            stage: "active-runtime",
+            message:
+              `${result.message} The previously running Controller could not be restored: `
+              + `${messageOf(error)}.`,
+            action:
+              "Keep the old Home quiesced and resolve the Controller startup failure; "
+              + "do not resume writes until the Controller and Home are verified."
+          },
+          classification
+        ),
+        ...(result.report === undefined ? {} : { report: result.report })
+      };
+    }
+  }
+  return result;
+}
+
+/** Execute the fenced, coordinated migration after Controller quiesce. */
+function executeFenced(
+  options: RunStorageUpgradeOptions<HomeSnapshot>,
+  classification: HomeClassification,
+  target: ReturnType<typeof createHomeMigrationTarget>,
+  callerPid: number,
+  now: () => Date
+): UpgradeResult {
+  const { home, registry, latest } = options;
+  try {
+    // The read-only drain proof, revision pin, complete-home copy, and both
+    // switch renames share one sibling coordination lock with inbox publish.
+    return withUpgradeCoordinationLock(home, () => {
+      const quiesce = verifyQuiesced(home, callerPid);
+      if (quiesce !== null) return withClassification(quiesce, classification);
+
+      // Re-pin the final revision under the write lock, after drain, so the
+      // snapshot reflects the last committed state (no check-then-migrate race).
+      repinRevision(home);
+
+      // Snapshot -> validate gate -> atomic switch + timestamped backup.
+      target.discardFreshOutput();
+      const report = runMigration({ registry, target, latest, mode: "execute" });
+      if (report.outcome === "failed") {
+        target.discardFreshOutput();
+        return { ...blockedFromFailedReport(report, classification), report };
+      }
+      if (report.outcome === "switch-ambiguous") {
+        // The switch was left partially applied. Do not write a completion
+        // receipt; the interrupted switch-progress marker is the durable signal.
+        return { ...blockedFromSwitchAmbiguous(report, classification), report };
+      }
+      if (report.outcome !== "migrated") {
+        target.discardFreshOutput();
+        return { ...blockedFromEngineReport(report, classification), report };
+      }
+
+      // The atomic switch has COMMITTED. Keep a durable receipt until the
+      // post-switch loader and (when applicable) replacement Controller both
+      // succeed; this closes the activation ambiguity window.
+      writeUpgradeReceipt(home, {
+        switched: true,
+        homePath: home,
+        completedAt: now().toISOString(),
+        targetLayoutVersion: latest.layout,
+        targetAggregateVersion: latest.aggregate,
+        ...(report.switch.backupPath === undefined
+          ? {}
+          : { backupPath: report.switch.backupPath })
+      });
+
+      const postVerify = postSwitchHealthCheck(home);
+      if (postVerify !== null) {
+        return { ...withClassification(postVerify, classification), report };
+      }
+      return {
+        outcome: "upgraded",
+        classification,
+        report,
+        ...(report.switch.backupPath === undefined
+          ? {}
+          : { backupPath: report.switch.backupPath })
+      };
+    });
+  } catch (error) {
+    if (!(error instanceof UpgradeFenceError)) throw error;
+    return withClassification(
+      {
+        outcome: "blocked",
+        stage: "coordination",
+        message: `Upgrade coordination could not be acquired: ${error.message}`,
+        action:
+          "Wait for the other writer or switch recovery to finish, then retry; "
+          + "the authoritative Home was not switched by this attempt."
+      },
+      classification
+    );
   }
 }
 
@@ -587,8 +751,8 @@ function blockedFromSwitchAmbiguous(
       message: `Storage switch is AMBIGUOUS and partially applied: ${report.error}`,
       action:
         `Do NOT assume the Home is unchanged. The original Home is at ${report.backupPath}; `
-        + `restore it to recover: mv "${report.backupPath}" "${report.homePath}". A completion `
-        + `receipt was written recording this ambiguity; verify with "yui doctor" after restoring.`
+        + `restore it to recover: mv "${report.backupPath}" "${report.homePath}". The interrupted `
+        + `switch marker records this ambiguity; verify with "yui doctor" after restoring.`
     },
     classification
   );
@@ -619,8 +783,127 @@ function withClassification(
 async function defaultStopController(
   home: string,
   controllerOptions: FileControllerClientOptions | undefined
+): Promise<ControllerStopResult> {
+  return stopFileTaskController(home, controllerOptions ?? {});
+}
+
+async function defaultStartController(
+  home: string,
+  controllerOptions: FileControllerClientOptions | undefined
+): Promise<unknown> {
+  return ensureFileTaskController(home, controllerOptions ?? {});
+}
+
+async function defaultControllerStatus(
+  home: string,
+  controllerOptions: FileControllerClientOptions | undefined
+): Promise<ControllerLifecycleStatus> {
+  const call = controllerOptions?.call ?? callController;
+  let raw: unknown;
+  try {
+    raw = await call(home, "controller.status", {});
+  } catch (error) {
+    // ENOENT/CONTROLLER_NOT_RUNNING is the only definitive stopped fact. A
+    // transport timeout or invalid discovery is unknown and must block. The
+    // one compatibility exception is the real client's stale/invalid discovery
+    // file: a read-only runtime inspection can still prove a dead PID, while a
+    // live or undeterminable PID remains fail-closed. Explicit test/client call
+    // seams do not get this fallback, so an injected transport error cannot be
+    // silently reclassified as stopped.
+    if (controllerErrorCode(error) === "CONTROLLER_NOT_RUNNING") {
+      return { running: false };
+    }
+    if (
+      controllerOptions?.call === undefined
+      && controllerErrorCode(error) === "CONTROLLER_DISCOVERY_INVALID"
+    ) {
+      return controllerStatusFromRuntime(home, error);
+    }
+    throw error;
+  }
+  if (!isRecord(raw) || typeof raw.running !== "boolean") {
+    throw new Error("Controller status response is invalid.");
+  }
+  return {
+    running: raw.running,
+    ...(isPositivePid(raw.pid) ? { pid: raw.pid } : {})
+  };
+}
+
+function controllerStatusFromRuntime(
+  home: string,
+  cause: unknown
+): ControllerLifecycleStatus {
+  const runtime = inspectHomeRuntime(home);
+  if (runtime.liveController === null) return { running: false };
+  if (runtime.liveController.state === "live") {
+    return { running: true, pid: runtime.liveController.pid };
+  }
+  throw new Error(
+    `Controller runtime discovery could not be resolved: ${messageOf(cause)}`,
+    { cause }
+  );
+}
+
+function confirmedControllerStopped(
+  value: void | ControllerStopResult
+): boolean {
+  // Existing test seams historically returned void after a successful drain;
+  // retain that narrow compatibility while requiring explicit confirmation for
+  // any structured result.
+  return value === undefined || (isRecord(value) && value.stopped === true);
+}
+
+function isControllerLifecycleStatus(value: unknown): value is ControllerLifecycleStatus {
+  return isRecord(value) && typeof value.running === "boolean";
+}
+
+function controllerLifecycleBlocker(
+  prefix: string,
+  error: unknown
+): UpgradeBlocker {
+  return {
+    outcome: "blocked",
+    stage: "active-runtime",
+    message: `${prefix}: ${messageOf(error)}.`,
+    action:
+      "The Controller may still be active or draining. Do not retry stop blindly; "
+      + "inspect the Controller and runtime, then retry once the Home is quiesced."
+  };
+}
+
+async function restoreController(
+  home: string,
+  options: RunStorageUpgradeOptions<HomeSnapshot>,
+  cause: unknown
 ): Promise<void> {
-  await stopFileTaskController(home, controllerOptions ?? {});
+  const startController = options.startController
+    ?? ((h: string) => defaultStartController(h, options.controllerOptions));
+  try {
+    await startController(home);
+  } catch (error) {
+    throw new Error(
+      `Storage upgrade failed and the previously running Controller could not be restored: `
+        + `${messageOf(error)}`,
+      { cause }
+    );
+  }
+}
+
+function controllerErrorCode(error: unknown): string | undefined {
+  return isRecord(error) && typeof error.code === "string" ? error.code : undefined;
+}
+
+function isPositivePid(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** Read the current fence for a Home (re-exported for command wiring). */
