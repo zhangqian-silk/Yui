@@ -331,6 +331,32 @@ function recordReadyNativeSession(store, taskId, roleName, nativeSessionId) {
   store.saveTaskRoleSessionSet(sessions);
 }
 
+function recordOpaqueRoleSession(store, taskId, roleName, run, status = "ready") {
+  const timestamp = NOW.toISOString();
+  const sessions = createRoleSessionSet({
+    scope: "task",
+    taskId,
+    roleName
+  }, run.effective.agentId, NOW);
+  store.saveTaskRoleSessionSet({
+    ...sessions,
+    sessions: {
+      [run.effective.agentId]: {
+        schemaVersion: 3,
+        agentId: run.effective.agentId,
+        adapterId: run.effective.adapterId,
+        launchId: `opaque-launch-${taskId}-${roleName}`,
+        policy: "fixed",
+        effective: run.effective,
+        status,
+        recentCompletedTurnIds: [],
+        createdAt: timestamp,
+        updatedAt: timestamp
+      }
+    }
+  });
+}
+
 test("CLI yield clears matching Leader stall attention and rejects duplicate terminalization", (t) => {
   const { store, options } = fixture(t);
   const task = createTask(store, options, "Recover Leader attention");
@@ -1569,6 +1595,59 @@ test("a failed Worker Run can retry its failed WorkItem", (t) => {
   assert.equal(retried?.workItemId, item.id);
   assert.match(retried.input, /yui task run yield <current-run-id>/);
   assert.match(retried.input, /final response alone does neither/i);
+});
+
+test("opaque live Sessions fail closed for public Work dispatch and Run retry", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Opaque dispatch fences");
+  run(["activate", task.id], store, options);
+  run(["role", "add", task.id, "worker"], store, options);
+  run(["work", "create", task.id, "dispatch", "--role", "worker"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  run(["work", "dispatch", item.id], store, options);
+  const first = store.getActiveAgentRun(task.id, "worker");
+  markDelivered(store, first);
+  run(["run", "yield", first.id, "--summary", "first candidate"], store, options);
+  const leaderOptions = {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+  run(["work", "reject", item.id, "--summary", "repair"], store, leaderOptions);
+  recordOpaqueRoleSession(store, task.id, "worker", first);
+
+  assert.throws(
+    () => runTaskCommand(["work", "dispatch", item.id], store, options),
+    /no native Session identity/i
+  );
+  assert.equal(store.getActiveAgentRun(task.id, "worker"), null);
+
+  const failed = failAgentRun(createAgentRun(
+    "agent-run-77",
+    task.id,
+    "worker",
+    "new",
+    markYuiRunInput(
+      "retry the failed opaque WorkItem",
+      "agent-run-77",
+      taskRoleSessionTitle(task, "worker")
+    ),
+    NOW,
+    {
+      workItemId: item.id,
+      ...(first.workspace === undefined ? {} : { workspace: first.workspace }),
+      effective: first.effective
+    }
+  ), "transient failure", NOW);
+  store.saveAgentRun(failed);
+  assert.throws(
+    () => runTaskCommand(["run", "retry", failed.id], store, options),
+    /no native Session identity/i
+  );
+  assert.equal(store.getActiveAgentRun(task.id, "worker"), null);
 });
 
 test("Run marker handling preserves user-authored marker lines outside the managed header", () => {

@@ -22,6 +22,8 @@ export const DEFAULT_EXECUTION_STALL_CANDIDATE_AGE_MS = 10 * 60_000;
 export const RUN_PROGRESS_EVENT = "run.progress";
 export const RUN_STALLED_EVENT = "run.stalled";
 export const RUN_RECOVERED_EVENT = "run.recovered";
+/** Durable one-shot advisory resource evidence; never a progress fact. */
+export const RUN_RESOURCE_SUPPRESSED_EVENT = "run.resource-suppressed";
 /** Structured, non-Message recovery evidence written by an explicit Leader. */
 export const RUN_RECOVERY_REQUESTED_EVENT = "run.recovery-requested";
 export const RUN_RECOVERY_APPLIED_EVENT = "run.recovery-applied";
@@ -668,14 +670,6 @@ export async function reconcileStalledRoleRuns(
       windowMs,
       lastAttentionProgressAt: latestStallProgressAt(events, candidate.run.id)
     });
-    const resource = consumeResourceEvidence(
-      resourceEvidence,
-      candidate.task.id,
-      candidate.role.name,
-      candidate.run.id,
-      progressAt,
-      resourceSuppressionKeys
-    );
     const runAgentId = candidate.run.effective.agentId;
     const runAdapterId = candidate.run.effective.adapterId;
     const sessionMatchesRun = candidate.session === null
@@ -685,6 +679,30 @@ export async function reconcileStalledRoleRuns(
       );
     const sessionUsable = candidate.session === null
       || (candidate.session.status !== "stopped" && candidate.session.status !== "broken");
+    const resourceSnapshot = resourceForRun(
+      resourceEvidence,
+      candidate.task.id,
+      candidate.role.name,
+      candidate.run.id
+    );
+    const resourceCanSuppress = live === "present"
+      && sessionMatchesRun
+      && sessionUsable
+      && typeof candidate.session?.nativeSessionId === "string"
+      && candidate.session.nativeSessionId.trim().length > 0
+      && resourceEvidenceIsFresh(resourceSnapshot, now, windowMs);
+    const resource = resourceCanSuppress
+      ? await consumeResourceEvidence(
+          store,
+          resourceEvidence,
+          candidate.task.id,
+          candidate.role.name,
+          candidate.run.id,
+          progressAt,
+          resourceSuppressionKeys,
+          now
+        )
+      : resourceSnapshot;
     const health = projectRoleRunHealth({
       progressAt,
       createdAt: candidate.run.createdAt,
@@ -954,20 +972,39 @@ function resourceForRun(
 }
 
 /** Consume at most one advisory sample for one Run/progress point. */
-function consumeResourceEvidence(
+async function consumeResourceEvidence(
+  store: SchedulerStorePort,
   snapshot: RoleRunResourceEvidenceSnapshot | undefined,
   taskId: string,
   roleName: string,
   runId: string,
   progressAt: string,
-  suppressionKeys: Set<string> | undefined
-): RoleRunResourceEvidence | undefined {
+  suppressionKeys: Set<string> | undefined,
+  now: Date
+): Promise<RoleRunResourceEvidence | undefined> {
   const resource = resourceForRun(snapshot, taskId, roleName, runId);
-  if (resource === undefined || suppressionKeys === undefined) return resource;
+  if (resource === undefined) return undefined;
   if (resource.active !== true && resource.changed !== true) return resource;
   const key = `${taskId}\0${roleName}\0${runId}\0${progressAt}`;
-  if (!suppressionKeys.has(key)) {
-    suppressionKeys.add(key);
+  if (store.recordRoleRunResourceSuppression !== undefined) {
+    const persisted = store.recordRoleRunResourceSuppression({
+      taskId,
+      roleName,
+      runId,
+      progressAt,
+      observedAt: resource.observedAt,
+      now
+    });
+    if (persisted === "recorded") return resource;
+    if (persisted === "already-recorded") {
+      return { ...resource, active: false, changed: false };
+    }
+    // A concurrent Run/session change is not permission to manufacture a
+    // stall or to rebind the resource sample; leave the advisory fact intact.
+    return resource;
+  }
+  if (suppressionKeys === undefined || !suppressionKeys.has(key)) {
+    suppressionKeys?.add(key);
     return resource;
   }
   return { ...resource, active: false, changed: false };

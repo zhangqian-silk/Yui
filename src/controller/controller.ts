@@ -722,7 +722,7 @@ export class FileTaskController {
   readonly #deliveryRetryMs: number;
   readonly #deliveryRetryLimit: number;
   readonly #stallWindowMs: number;
-  /** One-shot advisory resource suppressions keyed by Run/progress point. */
+  /** Narrow-port fallback; FileSchedulerStoreAdapter durably records these keys. */
   readonly #resourceSuppressionKeys = new Set<string>();
   readonly #runtimeEventProcessor: RuntimeEventProcessorPort | undefined;
   readonly #lifecycleHost:

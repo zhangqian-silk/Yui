@@ -376,7 +376,23 @@ export function roleAgentSessionResumeMode(
   if (set === null) return "new";
   validateRoleSessionSet(set);
   const session = set.sessions[requireSafeIdentity(agentId, "Agent id")];
-  if (session === undefined || session.nativeSessionId.trim().length === 0) return "new";
+  if (session === undefined) return "new";
+  // A restored opaque host can be inspected/recovered only through its exact
+  // launch fence. It cannot be resumed or silently rebound to a new launch
+  // without a provider-native identity; an explicit verified stop still
+  // permits the normal fresh-generation path.
+  if (
+    typeof session.nativeSessionId !== "string"
+    || session.nativeSessionId.trim().length === 0
+  ) {
+    if (session.status !== "stopped" && session.status !== "broken") {
+      throw new Error(
+        `Role Agent session has no native Session identity: ${agentId}. `
+        + "Restore the exact native Session or explicitly stop it before starting a fresh Session."
+      );
+    }
+    return "new";
+  }
   if (effectiveLaunchSnapshotsCompatible(session.effective, desired)) return "resume";
   if (session.status !== "stopped" && session.status !== "broken") {
     throw new Error(

@@ -47,6 +47,7 @@ import type {
   RoleRunDeliveryFailurePersistence,
   RoleRunDeliveryPersistence,
   RoleRunProgressPersistence,
+  RoleRunResourceSuppressionPersistence,
   RoleRunStallPersistence,
   SchedulerRunProgress,
   SchedulerRole,
@@ -69,6 +70,7 @@ import {
   clearMatchingLeaderStallAttention,
   RUN_PROGRESS_EVENT,
   RUN_RECOVERED_EVENT,
+  RUN_RESOURCE_SUPPRESSED_EVENT,
   RUN_STALLED_EVENT
 } from "../scheduler/roleRunStall.js";
 import type { TaskStore } from "../storage/taskStore.js";
@@ -332,6 +334,43 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         clearMatchingLeaderStallAttention(store, task.id, run.id);
       }
       return existing && !recovered ? "already-recorded" : "recorded";
+    });
+  }
+
+  recordRoleRunResourceSuppression(
+    input: RoleRunResourceSuppressionPersistence
+  ): "recorded" | "already-recorded" | "state-changed" {
+    return this.store.transaction((store) => {
+      const task = store.getTask(input.taskId);
+      const run = store.getActiveAgentRun(input.taskId, input.roleName);
+      if (
+        task === null
+        || task.status !== "active"
+        || run === null
+        || run.id !== input.runId
+        || run.status !== "active"
+      ) return "state-changed";
+      const existing = store.listEvents(task.id).some((event) => (
+        event.type === RUN_RESOURCE_SUPPRESSED_EVENT
+        && event.payload.runId === run.id
+        && event.payload.roleName === input.roleName
+        && event.payload.progressAt === input.progressAt
+      ));
+      if (existing) return "already-recorded";
+      store.saveEvent(task.id, createTaskEvent(
+        store.nextEventId(task.id),
+        task.id,
+        RUN_RESOURCE_SUPPRESSED_EVENT,
+        {
+          runId: run.id,
+          roleName: input.roleName,
+          progressAt: input.progressAt,
+          observedAt: input.observedAt,
+          kind: "advisory-resource"
+        },
+        input.now
+      ));
+      return "recorded";
     });
   }
 

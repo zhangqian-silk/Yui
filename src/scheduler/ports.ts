@@ -98,6 +98,16 @@ export type RoleRunProgressPersistence = Readonly<{
   now: Date;
 }>;
 
+/** One durable advisory-resource suppression for one exact Run progress point. */
+export type RoleRunResourceSuppressionPersistence = Readonly<{
+  taskId: string;
+  roleName: string;
+  runId: string;
+  progressAt: string;
+  observedAt: string;
+  now: Date;
+}>;
+
 /**
  * Exact persisted session fact used to fence a low-frequency native-host
  * absence observation from a concurrent launch or Hook update.
@@ -230,6 +240,8 @@ export interface SchedulerStorePort {
   getRunDurableProgress?(taskId: string, roleName: string, runId: string): SchedulerRunProgress | null;
   /** Materializes a newly observed related-record fold as one run.progress fact. */
   recordRoleRunProgress?(input: RoleRunProgressPersistence): "recorded" | "already-recorded" | "state-changed";
+  /** Atomically consumes one advisory resource sample for an exact Run/progress point. */
+  recordRoleRunResourceSuppression?(input: RoleRunResourceSuppressionPersistence): "recorded" | "already-recorded" | "state-changed";
   /** Atomically records one new stall episode and routes its responsibility. */
   recordRoleRunStall?(input: RoleRunStallPersistence): "raised" | "already-raised" | "state-changed";
   hasInFlightTurn(taskId: string, roleName: string): boolean;

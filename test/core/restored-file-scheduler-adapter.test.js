@@ -10,7 +10,11 @@ import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.j
 import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
-import { updateRoleAgentSessionStatus } from "../../dist/executor/agentExecutor.js";
+import {
+  createRoleSessionSet,
+  recordRoleAgentSession,
+  updateRoleAgentSessionStatus
+} from "../../dist/executor/agentExecutor.js";
 import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import {
   attachReviewRoundWorkspace,
@@ -356,6 +360,107 @@ test("Leader delivery stall is routed through the existing Operator notification
   assert.equal(store.getOperatorNotification(task.id).type, "leader-stalled");
   const operatorMailbox = store.getWorkMailbox({ kind: "operator" });
   assert.equal(operatorMailbox.pending.reasons.includes("leader-run-stalled"), true);
+});
+
+test("advisory resource suppression survives a Controller restart for one Run/progress point", async (t) => {
+  const { home, store, task, role, now, adapter } = fixture(t);
+  const createdAt = new Date(now.getTime() - 60 * 60_000);
+  const run = createAgentRun(
+    adapter,
+    "agent-run-77",
+    task.id,
+    role.name,
+    "new",
+    "resource restart",
+    createdAt
+  );
+  const delivered = { ...run, deliveredAt: createdAt.toISOString() };
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  }, run.effective.agentId, createdAt);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: run.effective.agentId,
+    adapterId: run.effective.adapterId,
+    nativeSessionId: "native-resource-restart",
+    launchId: "launch-resource-restart",
+    policy: "fixed",
+    status: "running",
+    effective: run.effective
+  }, createdAt);
+  store.transaction((tx) => {
+    tx.saveAgentRun(delivered);
+    tx.saveActiveAgentRun(delivered);
+    tx.saveRole(task.id, updateRoleStatus(
+      tx.getRole(task.id, role.name),
+      "running",
+      createdAt
+    ));
+    tx.saveTaskRoleSessionSet(sessions);
+  });
+  const delivery = {
+    async inspectRole() { return "present"; },
+    async inspectRoles(inputs) {
+      return inputs.map((input) => ({
+        taskId: input.taskId,
+        roleName: input.roleName,
+        status: "present",
+        resource: {
+          observedAt: new Date(now.getTime() - 1_000).toISOString(),
+          active: true,
+          changed: true,
+          cpuTimeMs: 20,
+          rssBytes: 4096
+        }
+      }));
+    }
+  };
+  const first = await runControllerSchedulerPass(
+    adapter,
+    delivery,
+    now,
+    undefined,
+    { kind: "full" },
+    true,
+    [],
+    undefined,
+    30 * 60_000,
+    new Set()
+  );
+  assert.deepEqual(first.failedRunRefs, []);
+  assert.equal(
+    store.listEvents(task.id).filter((event) => event.type === "run.resource-suppressed").length,
+    1
+  );
+  assert.equal(
+    store.listEvents(task.id).filter((event) => event.type === "run.stalled").length,
+    0
+  );
+
+  const restartedStore = new FileTaskStore(home);
+  const restartedAdapter = new FileSchedulerStoreAdapter(restartedStore);
+  const second = await runControllerSchedulerPass(
+    restartedAdapter,
+    delivery,
+    now,
+    undefined,
+    { kind: "full" },
+    true,
+    [],
+    undefined,
+    30 * 60_000,
+    new Set()
+  );
+  assert.deepEqual(second.failedRunRefs, []);
+  assert.equal(
+    restartedStore.listEvents(task.id).filter((event) => event.type === "run.resource-suppressed").length,
+    1
+  );
+  assert.equal(
+    restartedStore.listEvents(task.id).filter((event) => event.type === "run.stalled").length,
+    1
+  );
 });
 
 test("accepted Leader delivery records progress/recovery and clears only its stall attention", (t) => {

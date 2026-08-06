@@ -142,6 +142,47 @@ test("Controller lifecycle dispatcher is the sole session creator for enter", as
   );
 });
 
+test("Controller ensure refuses to rebind a live opaque Session", async (t) => {
+  const { store, task, role, agent, now } = fixture(t);
+  const schedulerStore = new FileSchedulerStoreAdapter(store);
+  schedulerStore.recordRuntimeNativeSession({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    nativeSessionId: "thread-opaque-host"
+  }, now);
+  const sessions = store.getTaskRoleSessionSet(task.id, role.name);
+  const opaque = { ...sessions.sessions[agent.id] };
+  delete opaque.nativeSessionId;
+  opaque.launchId = "opaque-launch-1";
+  store.saveTaskRoleSessionSet({
+    ...sessions,
+    sessions: { ...sessions.sessions, [agent.id]: opaque }
+  });
+  let starts = 0;
+  let resumes = 0;
+  const dispatch = createRuntimeLifecycleDispatcher(store, schedulerStore, {
+    async start() { starts += 1; throw new Error("must not start"); },
+    async resume() { resumes += 1; throw new Error("must not resume"); }
+  });
+
+  await assert.rejects(
+    dispatch("runtime.ensure-role-session", {
+      scope: "task",
+      taskId: task.id,
+      roleName: role.name
+    }),
+    /no native Session identity/i
+  );
+  assert.equal(starts, 0);
+  assert.equal(resumes, 0);
+  assert.equal(
+    store.getTaskRoleSessionSet(task.id, role.name).sessions[agent.id].launchId,
+    "opaque-launch-1"
+  );
+});
+
 test("Controller keeps a live Session effective snapshot across desired drift", async (t) => {
   const { store, task, role, agent, now } = fixture(t);
   const schedulerStore = new FileSchedulerStoreAdapter(store);
