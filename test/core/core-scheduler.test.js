@@ -264,6 +264,25 @@ test("an idle Leader resumes its fixed native session", async () => {
   assert.equal(store.savedDispatches[0].session.nativeSessionId, "native-leader-1");
 });
 
+test("a live opaque Leader retains its wake until exact cleanup instead of rebinding", async () => {
+  const session = roleSession({ launchId: "launch-opaque-leader", status: "running" });
+  delete session.nativeSessionId;
+  const store = fakeStore({ session });
+  const delivery = fakeDelivery({ inspect: "present" });
+
+  const result = await processLeaderWakeups(store, delivery, NOW);
+
+  assert.deepEqual(result, [{
+    taskId: "task-1",
+    status: "skipped",
+    reason: "recovery-blocked"
+  }]);
+  assert.equal(store.pending.has("task-1"), true);
+  assert.equal(store.savedDispatches.length, 0);
+  assert.deepEqual(delivery.calls.map((call) => call.type), ["inspect"]);
+  assert.equal("nativeSessionId" in delivery.calls[0].input, false);
+});
+
 test("Leader resume refuses a replacement native session", async () => {
   const existing = roleSession({ nativeSessionId: "native-leader-1", status: "ready" });
   const replacement = roleSession({ nativeSessionId: "native-leader-2", status: "running" });

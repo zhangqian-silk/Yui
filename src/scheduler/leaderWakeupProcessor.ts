@@ -3,6 +3,10 @@ import { markYuiRunInput } from "../run/runIdentity.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import { effectiveLaunchSnapshotsCompatible } from "../executor/effectiveLaunch.js";
+import {
+  hasRuntimeLifecycleWork,
+  runtimeLifecycleTarget
+} from "../runtime/lifecycleReservation.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
 import { createLeaderRecoveryNotification } from "./operatorNotification.js";
 import type {
@@ -77,6 +81,43 @@ export async function processLeaderWakeups(
     let run: ReturnType<typeof createAgentRun> | null = null;
     let prepared: PreparedRoleDelivery | undefined;
     try {
+      if (existingSession !== null && !hasNativeSession(existingSession)) {
+        const sessionIsTerminal = existingSession.status === "stopped"
+          || existingSession.status === "broken";
+        if (!sessionIsTerminal) {
+          // An opaque live Session has no provider identity that can be safely
+          // rebound. A host absence observation is not a verified stop; keep
+          // the wake durable until an explicit exact cleanup/reset settles it.
+          if (existingSession.launchId !== undefined) {
+            await delivery.inspectRole({
+              taskId: task.id,
+              roleName: role.name,
+              agentId: existingSession.agentId,
+              adapterId: existingSession.adapterId
+            });
+          }
+          results.push({
+            taskId: task.id,
+            status: "skipped",
+            reason: "recovery-blocked"
+          });
+          continue;
+        }
+        if (hasRuntimeLifecycleWork(store.getWorkMailbox(runtimeLifecycleTarget({
+          scope: "task",
+          taskId: task.id,
+          roleName: role.name
+        })))) {
+          // A stopped/broken Session is eligible for a fresh mode only after
+          // its exact runtime cleanup/reservation lane has settled.
+          results.push({
+            taskId: task.id,
+            status: "skipped",
+            reason: "recovery-blocked"
+          });
+          continue;
+        }
+      }
       const compatibleSession = existingSession !== null
         && effectiveLaunchSnapshotsCompatible(existingSession.effective, role.effective);
       if (hasNativeSession(existingSession) && !compatibleSession

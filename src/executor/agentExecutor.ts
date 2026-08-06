@@ -683,14 +683,14 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
         if (session.status !== "stopped" && session.status !== "broken") {
           throw new Error("Task Role session history must be terminal.");
         }
-        const key = `${session.agentId}\0${session.nativeSessionId}`;
+        const key = taskRoleSessionIdentity(session);
         if (identities.has(key)) {
-          throw new Error("Task Role session history contains a duplicate native Session.");
+          throw new Error("Task Role session history contains a duplicate Session identity.");
         }
         identities.add(key);
       }
       for (const session of Object.values(taskSet.sessions)) {
-        if (identities.has(`${session.agentId}\0${session.nativeSessionId}`)) {
+        if (identities.has(taskRoleSessionIdentity(session))) {
           throw new Error("Active and historical Task Role Sessions must be distinct.");
         }
       }
@@ -777,6 +777,16 @@ export function validateRoleAgentSession(
   requireText(session.createdAt, "Role Agent session creation timestamp");
   requireText(session.updatedAt, "Role Agent session update timestamp");
   return session;
+}
+
+function taskRoleSessionIdentity(session: RoleAgentSession): string {
+  if (session.nativeSessionId !== undefined) {
+    return `${session.agentId}\0native\0${session.nativeSessionId}`;
+  }
+  if (session.launchId === undefined) {
+    throw new Error("Opaque Task Role session requires a launch identity.");
+  }
+  return `${session.agentId}\0launch\0${session.launchId}`;
 }
 
 function optionalSessionText(
