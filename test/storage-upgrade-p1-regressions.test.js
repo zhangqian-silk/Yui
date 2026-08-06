@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
@@ -40,7 +41,7 @@ import { createUpdatePorts } from "../dist/cli/updatePorts.js";
 import {
   ensureFileTaskControllerIdentity
 } from "../dist/controller/clientRuntime.js";
-import { ControllerClientError } from "../dist/core/controllerClient.js";
+import { callController, ControllerClientError } from "../dist/core/controllerClient.js";
 import { FILE_TASK_CONTROLLER_PROTOCOL_VERSION } from "../dist/core/protocol.js";
 import { createTask } from "../dist/task/task.js";
 
@@ -294,6 +295,32 @@ test("binary-only activation failure restores the exact old Controller identity"
   ]);
 });
 
+test("binary-only restore rejects a same-version wrong executable or argv", async (t) => {
+  const { home } = currentHome();
+  await startIsolatedController(home, t);
+  const captured = await callController(home, "controller.identity", {});
+  const wrong = {
+    executablePath: captured.executablePath,
+    args: [...captured.args, "--wrong-captured-argv"],
+    version: captured.version
+  };
+  const ports = createUpdatePorts(process.env, spawnSync);
+  assert.throws(
+    () => ports.restoreController(home, wrong),
+    /Failed to restore the previously running Controller identity: exited with status 1/i
+  );
+  assert.deepEqual(await callController(home, "controller.identity", {}), captured);
+});
+
+test("binary-only restore accepts the exact captured executable, argv, and version", async (t) => {
+  const { home } = currentHome();
+  await startIsolatedController(home, t);
+  const captured = await callController(home, "controller.identity", {});
+  const ports = createUpdatePorts(process.env, spawnSync);
+  assert.doesNotThrow(() => ports.restoreController(home, captured));
+  assert.deepEqual(await callController(home, "controller.identity", {}), captured);
+});
+
 test("binary-only stop failure is structured with no retry, activation, or restore", () => {
   const events = [];
   const result = runUpdate(binaryOnlyPorts(events, {
@@ -411,7 +438,8 @@ test("exact-identity restore readiness waits for authenticated running status", 
     "/tmp/yui-readiness-handshake",
     identity,
     {
-      call: async () => {
+      call: async (_home, method) => {
+        if (method === "controller.identity") return identity;
         statusCalls += 1;
         if (statusCalls < 3) {
           throw new ControllerClientError("CONTROLLER_UNAVAILABLE", "not ready yet");
@@ -430,6 +458,155 @@ test("exact-identity restore readiness waits for authenticated running status", 
   assert.equal(result.running, true);
   assert.equal(spawnCalls, 1);
   assert.equal(statusCalls, 3);
+});
+
+test("exact-identity readiness rejects a same-version Controller with wrong executable or argv", async () => {
+  const identity = {
+    executablePath: "/old/node-v20",
+    args: ["/old/controller-main.js", "--captured"],
+    version: "8.8.8"
+  };
+  const wrong = {
+    executablePath: "/other/node-v20",
+    args: ["/other/controller-main.js", "--captured"],
+    version: identity.version
+  };
+  let spawnCalls = 0;
+  let identityCalls = 0;
+  await assert.rejects(
+    ensureFileTaskControllerIdentity(
+      "/tmp/yui-readiness-wrong-identity",
+      identity,
+      {
+        call: async (_home, method) => {
+          if (method === "controller.status") {
+            return {
+              running: true,
+              protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+              version: identity.version
+            };
+          }
+          identityCalls += 1;
+          return wrong;
+        },
+        spawnController: () => { spawnCalls += 1; },
+        startupTimeoutMs: 100,
+        pollIntervalMs: 1
+      }
+    ),
+    /identity.*(?:mismatch|match|executable|argv)/i
+  );
+  assert.equal(identityCalls, 1);
+  assert.equal(spawnCalls, 0, "identity mismatch must not spawn a second Controller");
+});
+
+test("exact-identity readiness accepts the captured executable, argv, and version", async () => {
+  const identity = {
+    executablePath: "/old/node-v20",
+    args: ["/old/controller-main.js", "--captured"],
+    version: "8.8.8"
+  };
+  let identityCalls = 0;
+  const result = await ensureFileTaskControllerIdentity(
+    "/tmp/yui-readiness-exact-identity",
+    identity,
+    {
+      call: async (_home, method) => {
+        if (method === "controller.status") {
+          return {
+            running: true,
+            protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+            version: identity.version
+          };
+        }
+        identityCalls += 1;
+        return identity;
+      },
+      spawnController: () => { throw new Error("must not spawn for an already-running exact identity"); }
+    }
+  );
+  assert.equal(result.running, true);
+  assert.equal(identityCalls, 1);
+});
+
+test("storage upgrade default restore rejects same-version wrong Controller identity", async () => {
+  const { home } = currentHome();
+  mkdirSync(join(home, ".state.lock"));
+  const { latest, registry } = migratableSetup();
+  const identity = {
+    executablePath: "/old/node-v20",
+    args: ["/old/controller-main.js"],
+    version: "8.8.8"
+  };
+  const wrong = {
+    executablePath: "/other/node-v20",
+    args: ["/other/controller-main.js"],
+    version: identity.version
+  };
+  let identityCalls = 0;
+  let spawnCalls = 0;
+  const result = await runStorageUpgrade({
+    home,
+    registry,
+    latest,
+    mode: "execute",
+    controllerOptions: {
+      call: async (_home, method) => {
+        if (method === "controller.status") {
+          return {
+            running: true,
+            protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+            version: identity.version
+          };
+        }
+        identityCalls += 1;
+        return identityCalls === 1 ? identity : wrong;
+      },
+      spawnController: () => { spawnCalls += 1; }
+    },
+    stopController: async () => ({ stopped: true })
+  });
+  assert.equal(result.outcome, "blocked");
+  assert.equal(result.stage, "active-runtime");
+  assert.match(result.message, /could not be restored|identity/i);
+  assert.equal(identityCalls, 2, "capture and restore must each authenticate identity");
+  assert.equal(spawnCalls, 0, "wrong identity must not start a second Controller");
+});
+
+test("storage upgrade default restore accepts the captured Controller identity", async () => {
+  const { home } = currentHome();
+  mkdirSync(join(home, ".state.lock"));
+  const { latest, registry } = migratableSetup();
+  const identity = {
+    executablePath: "/old/node-v20",
+    args: ["/old/controller-main.js"],
+    version: "8.8.8"
+  };
+  let identityCalls = 0;
+  const result = await runStorageUpgrade({
+    home,
+    registry,
+    latest,
+    mode: "execute",
+    controllerOptions: {
+      call: async (_home, method) => {
+        if (method === "controller.status") {
+          return {
+            running: true,
+            protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+            version: identity.version
+          };
+        }
+        identityCalls += 1;
+        return identity;
+      },
+      spawnController: () => { throw new Error("must not spawn for an already-running exact identity"); }
+    },
+    stopController: async () => ({ stopped: true })
+  });
+  assert.equal(result.outcome, "blocked");
+  assert.equal(result.stage, "active-runtime");
+  assert.equal(identityCalls, 2, "capture and restore must authenticate the exact identity");
 });
 
 test("P1-1 managed workspace record-only mismatch is NEEDS_NEW_VERSION/missing-step", () => {
@@ -731,6 +908,36 @@ test("P1-4 upgrade fails closed with active-runtime on an undeterminable lock", 
 // ---------------------------------------------------------------------------
 // Local helpers (kept at the bottom for readability).
 // ---------------------------------------------------------------------------
+
+async function startIsolatedController(home, t) {
+  const controllerPath = join(process.cwd(), "dist/controller/controllerMain.js");
+  const child = spawn(process.execPath, [controllerPath], {
+    cwd: process.cwd(),
+    env: { ...process.env, YUI_HOME: home },
+    stdio: "ignore"
+  });
+  t.after(async () => {
+    if (child.exitCode !== null) return;
+    await new Promise((resolve) => {
+      child.once("exit", resolve);
+      child.kill("SIGTERM");
+    });
+  });
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    try {
+      const status = await callController(home, "controller.status", {});
+      if (status.running === true) return child;
+    } catch (error) {
+      if (!(error instanceof ControllerClientError)
+        || !["CONTROLLER_NOT_RUNNING", "CONTROLLER_UNAVAILABLE"].includes(error.code)) {
+        throw error;
+      }
+    }
+    if (Date.now() >= deadline) throw new Error("isolated Controller did not become ready");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 /** The synthetic migratable setup (mirrors storage-upgrade-e2e). */
 function migratableSetup() {

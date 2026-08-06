@@ -119,10 +119,72 @@ export async function ensureFileTaskControllerIdentity(
   identity: ControllerLaunchIdentity,
   options: FileControllerClientOptions = {}
 ): Promise<JsonValue> {
-  return ensureFileTaskController(home, {
+  assertExpectedControllerLaunchIdentity(identity);
+  const status = await ensureFileTaskController(home, {
     ...options,
     expectedVersion: identity.version
   });
+  // A same-version status is not an identity proof: another Controller binary
+  // may own the Home after a restart or a stale discovery race. Authenticate
+  // the socket owner and compare the complete launch vector before reporting
+  // readiness. This post-readiness check deliberately has no retry or spawn
+  // fallback; a mismatch/unavailable/malformed identity is fail-closed.
+  const call = options.call ?? callController;
+  const actual = await call(home, "controller.identity", {}, {
+    timeoutMs: options.requestTimeoutMs
+  });
+  assertControllerLaunchIdentity(actual, identity);
+  return status;
+}
+
+function assertExpectedControllerLaunchIdentity(
+  identity: ControllerLaunchIdentity
+): void {
+  if (
+    typeof identity.executablePath !== "string"
+    || identity.executablePath.length === 0
+    || !Array.isArray(identity.args)
+    || identity.args.some((arg) => typeof arg !== "string")
+    || typeof identity.version !== "string"
+    || identity.version.length === 0
+  ) {
+    throw new Error(
+      "Expected Controller launch identity is malformed; refusing to start or accept a Controller."
+    );
+  }
+}
+
+function assertControllerLaunchIdentity(
+  actual: JsonValue,
+  expected: ControllerLaunchIdentity
+): void {
+  if (!isJsonRecord(actual)) {
+    throw new Error(
+      "Authenticated Controller launch identity is malformed; refusing to accept readiness."
+    );
+  }
+  const actualArgs = actual.args;
+  if (
+    typeof actual.executablePath !== "string"
+    || !Array.isArray(actualArgs)
+    || actualArgs.some((arg) => typeof arg !== "string")
+    || typeof actual.version !== "string"
+  ) {
+    throw new Error(
+      "Authenticated Controller launch identity is malformed; refusing to accept readiness."
+    );
+  }
+  const argsMatch = actualArgs.length === expected.args.length
+    && actualArgs.every((arg, index) => arg === expected.args[index]);
+  if (
+    actual.executablePath !== expected.executablePath
+    || !argsMatch
+    || actual.version !== expected.version
+  ) {
+    throw new Error(
+      "Authenticated Controller launch identity does not match the captured executable, argv, and version; refusing readiness."
+    );
+  }
 }
 
 function assertCompatibleControllerStatus(
