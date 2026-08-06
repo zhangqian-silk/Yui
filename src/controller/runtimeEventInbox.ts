@@ -18,7 +18,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
-import { assertHomeWritable } from "../storage/upgradeFence.js";
+import { withUpgradeCoordinationLock } from "../storage/upgradeCoordination.js";
 
 export const MAX_RUNTIME_TURN_SUMMARY_BYTES = 32 * 1024;
 export const MAX_CLAUDE_HOOK_TEXT_BYTES = 4 * 1024 * 1024;
@@ -80,6 +80,12 @@ export type RuntimeLifecycleEvent =
 export type RuntimeEventEnqueueResult<TEvent extends RuntimeLifecycleEvent = RuntimeLifecycleEvent> =
   Readonly<{ event: TEvent; created: boolean }>;
 
+/** Test-only synchronization seam; production callers leave it unset. */
+export type RuntimeEventInboxHooks = Readonly<{
+  /** Called after admission is checked while the coordination lock is held. */
+  afterAdmission?: () => void;
+}>;
+
 /**
  * Durable ingress for facts emitted by native Agent hooks. It deliberately
  * owns no FileTaskStore lock: immutable files are acknowledged only after the
@@ -90,7 +96,8 @@ export class FileRuntimeEventInbox {
 
   constructor(
     readonly home: string,
-    private readonly now: () => Date = () => new Date()
+    private readonly now: () => Date = () => new Date(),
+    private readonly hooks: RuntimeEventInboxHooks = {}
   ) {
     this.directory = join(home, RUNTIME_EVENT_DIRECTORY);
   }
@@ -193,63 +200,60 @@ export class FileRuntimeEventInbox {
   private publish<TEvent extends RuntimeLifecycleEvent>(
     event: TEvent
   ): RuntimeEventEnqueueResult<TEvent> {
-    // Honor the upgrade admission fence at the durable-inbox write choke point
-    // (R4-F3 / decision-13). An in-progress `yui upgrade`/`yui update` quiesces by
-    // proving the inbox empty and then atomically switching the whole Home; a late
-    // native-hook enqueue after that proof but before the switch would be silently
-    // lost. Refusing the write while a live foreign fence holds the Home closes
-    // that TOCTOU: the caller (the hook) gets an explicit `UpgradeFenceError` and
-    // backs off, so the authoritative event is never silently dropped — it is
-    // blocked and can be re-delivered after the upgrade finishes. This mirrors the
-    // same fence check the FileTaskStore commit path enforces, and is a no-op when
-    // no upgrade is running (the normal hook path is unaffected).
-    assertHomeWritable(this.home);
-    const content = `${JSON.stringify(event)}\n`;
-    if (Buffer.byteLength(content, "utf8") > MAX_RUNTIME_EVENT_FILE_BYTES) {
-      throw new RuntimeEventInboxError(
-        "RUNTIME_EVENT_TOO_LARGE",
-        "Runtime event exceeds the durable inbox limit."
-      );
-    }
-    ensureInboxDirectory(this.directory);
-    const target = this.eventPath(event.id);
-    const temporary = join(
-      this.directory,
-      `.${event.id}.tmp-${process.pid}-${randomUUID()}`
-    );
-    let descriptor: number | null = null;
-    try {
-      descriptor = openSync(
-        temporary,
-        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
-        0o600
-      );
-      writeFileSync(descriptor, content, "utf8");
-      fchmodSync(descriptor, 0o600);
-      fsyncSync(descriptor);
-      closeSync(descriptor);
-      descriptor = null;
-      try {
-        linkSync(temporary, target);
-        unlinkSync(temporary);
-        fsyncDirectory(this.directory);
-        return { event, created: true };
-      } catch (error) {
-        if (!isNodeError(error, "EEXIST")) throw error;
-        const existing = this.read(event.id);
-        if (existing === null) return { event, created: false };
-        if (!hasSameIdentity(existing, event)) {
-          throw new RuntimeEventInboxError(
-            "RUNTIME_EVENT_CONFLICT",
-            `Runtime event id conflicts with an existing file: ${event.id}`
-          );
-        }
-        return { event: existing as TEvent, created: false };
+    // The fence check and the complete durable write share one sibling
+    // coordination lock with upgrade's final inbox scan/copy/two-step switch.
+    // A hook that passed admission before the fence was placed either finishes
+    // under this lock (so its event is copied) or waits and receives an
+    // UpgradeFenceError after the cutover holder releases the lock.
+    return withUpgradeCoordinationLock(this.home, () => {
+      this.hooks.afterAdmission?.();
+      const content = `${JSON.stringify(event)}\n`;
+      if (Buffer.byteLength(content, "utf8") > MAX_RUNTIME_EVENT_FILE_BYTES) {
+        throw new RuntimeEventInboxError(
+          "RUNTIME_EVENT_TOO_LARGE",
+          "Runtime event exceeds the durable inbox limit."
+        );
       }
-    } finally {
-      if (descriptor !== null) closeSync(descriptor);
-      rmSync(temporary, { force: true });
-    }
+      ensureInboxDirectory(this.directory);
+      const target = this.eventPath(event.id);
+      const temporary = join(
+        this.directory,
+        `.${event.id}.tmp-${process.pid}-${randomUUID()}`
+      );
+      let descriptor: number | null = null;
+      try {
+        descriptor = openSync(
+          temporary,
+          constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
+          0o600
+        );
+        writeFileSync(descriptor, content, "utf8");
+        fchmodSync(descriptor, 0o600);
+        fsyncSync(descriptor);
+        closeSync(descriptor);
+        descriptor = null;
+        try {
+          linkSync(temporary, target);
+          unlinkSync(temporary);
+          fsyncDirectory(this.directory);
+          return { event, created: true };
+        } catch (error) {
+          if (!isNodeError(error, "EEXIST")) throw error;
+          const existing = this.read(event.id);
+          if (existing === null) return { event, created: false };
+          if (!hasSameIdentity(existing, event)) {
+            throw new RuntimeEventInboxError(
+              "RUNTIME_EVENT_CONFLICT",
+              `Runtime event id conflicts with an existing file: ${event.id}`
+            );
+          }
+          return { event: existing as TEvent, created: false };
+        }
+      } finally {
+        if (descriptor !== null) closeSync(descriptor);
+        rmSync(temporary, { force: true });
+      }
+    });
   }
 
   private eventPath(id: string): string {

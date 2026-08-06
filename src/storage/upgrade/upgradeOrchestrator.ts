@@ -8,10 +8,10 @@
  *   preflight (classify, read-only)
  *     -> plan (delegated to the engine; missing/future step = fail-closed)
  *     -> [execute] admission fence  (new writers refused)
- *     -> [execute] quiesce          (controller.stop drains; then verify no
- *                                     foreign writer / no unfinished lifecycle)
- *     -> [execute] re-pin revision  (under the write lock, after drain)
- *     -> snapshot -> validate gate -> [execute] atomic switch + backup
+ *     -> [execute] coordination lock (outside Home; shared with inbox publish)
+ *          -> quiesce (verify no foreign writer / unfinished lifecycle)
+ *          -> re-pin revision (under `.state.lock`)
+ *          -> snapshot -> validate gate -> atomic switch + backup
  *     -> [execute] post-switch health check (fresh FileTaskStore loader)
  *
  * `--dry-run` runs preflight + plan + the staged validation gate, then discards
@@ -43,8 +43,10 @@ import { FileTaskStore, STORAGE_STATE_FILE, withStorageWriteLock } from "../task
 import {
   clearUpgradeFence,
   placeUpgradeFence,
-  readUpgradeFence
+  readUpgradeFence,
+  UpgradeFenceError
 } from "../upgradeFence.js";
+import { withUpgradeCoordinationLock } from "../upgradeCoordination.js";
 import {
   clearUpgradeReceipt,
   writeUpgradeReceipt
@@ -70,6 +72,7 @@ export type UpgradeBlockerStage =
   | "corruption"
   | "active-runtime"
   | "drain-incomplete"
+  | "coordination"
   | "validate"
   | "switch"
   | "switch-ambiguous"
@@ -248,7 +251,7 @@ function dryRun(
   return { outcome: "dry-run", classification, report };
 }
 
-/** Execute: fence -> quiesce -> re-pin -> switch -> post-verify. */
+/** Execute: fence -> coordination/quiesce -> re-pin -> switch -> post-verify. */
 async function execute(
   options: RunStorageUpgradeOptions<HomeSnapshot>,
   classification: HomeClassification,
@@ -274,76 +277,99 @@ async function execute(
       ?? ((h: string) => defaultStopController(h, options.controllerOptions));
     await stopController(home);
 
-    const quiesce = verifyQuiesced(home, callerPid);
-    if (quiesce !== null) {
-      target.discardFreshOutput();
-      return withClassification(quiesce, classification);
-    }
+    try {
+      // The read-only drain proof, revision pin, complete-home copy, and
+      // both switch renames share one sibling coordination lock with inbox
+      // publish. A hook that was admitted before the fence either completes
+      // before this boundary (and is copied) or waits and receives a fence
+      // failure after it. The quiesce proof itself runs only after this lock is
+      // acquired, so no separate scan can race the final copy.
+      return withUpgradeCoordinationLock(home, () => {
+        const quiesce = verifyQuiesced(home, callerPid);
+        if (quiesce !== null) {
+          return withClassification(quiesce, classification);
+        }
 
-    // 5) Re-pin the final revision under the write lock, after drain, so the
-    // snapshot reflects the last committed state (no check-then-migrate race).
-    // The fence exempts this process, so the lock is obtainable.
-    repinRevision(home);
+        // 5) Re-pin the final revision under the write lock, after drain, so the
+        // snapshot reflects the last committed state (no check-then-migrate
+        // race). The fence exempts this process, so the lock is obtainable.
+        repinRevision(home);
 
-    // 6) Snapshot -> validate gate -> atomic switch + timestamped backup.
-    target.discardFreshOutput();
-    const report = runMigration({ registry, target, latest, mode: "execute" });
-    if (report.outcome === "failed") {
-      target.discardFreshOutput();
-      return { ...blockedFromFailedReport(report, classification), report };
-    }
-    if (report.outcome === "switch-ambiguous") {
-      // The switch was left partially applied: the original was moved to the
-      // backup but BOTH the promotion and its rollback failed. The switch did NOT
-      // commit (the Home path may be missing), so we do NOT write a completion
-      // receipt — that would falsely assert a committed switch. The honest durable
-      // signal is the `interrupted` switch-progress marker the target already
-      // wrote (<home>.upgrade-switch.json), which `yui update`'s probe reads to
-      // drive a restore-the-backup recovery. Report the exact backup-based manual
-      // recovery and never claim the Home is unchanged (P1-4).
-      return { ...blockedFromSwitchAmbiguous(report, classification), report };
-    }
-    if (report.outcome !== "migrated") {
-      // Blocked/active-runtime detected inside the engine: never switched.
-      target.discardFreshOutput();
-      return { ...blockedFromEngineReport(report, classification), report };
-    }
+        // 6) Snapshot -> validate gate -> atomic switch + timestamped backup.
+        target.discardFreshOutput();
+        const report = runMigration({ registry, target, latest, mode: "execute" });
+        if (report.outcome === "failed") {
+          target.discardFreshOutput();
+          return { ...blockedFromFailedReport(report, classification), report };
+        }
+        if (report.outcome === "switch-ambiguous") {
+          // The switch was left partially applied: the original was moved to the
+          // backup but BOTH the promotion and its rollback failed. The switch did
+          // NOT commit (the Home path may be missing), so we do NOT write a
+          // completion receipt — that would falsely assert a committed switch.
+          // The honest durable signal is the `interrupted` switch-progress marker
+          // the target already wrote (<home>.upgrade-switch.json), which `yui
+          // update`'s probe reads to drive a restore-the-backup recovery.
+          return { ...blockedFromSwitchAmbiguous(report, classification), report };
+        }
+        if (report.outcome !== "migrated") {
+          // Blocked/active-runtime detected inside the engine: never switched.
+          target.discardFreshOutput();
+          return { ...blockedFromEngineReport(report, classification), report };
+        }
 
-    // The atomic switch has COMMITTED. Drop a durable, out-of-band receipt before
-    // doing anything else, so that if this process is killed before it can report
-    // success (SIGTERM/OOM after switch), a later reader can still prove the
-    // switch happened and locate the backup — closing the activation-ambiguity
-    // gap (P1-2). The receipt is cleared only on a clean, verified return.
-    writeUpgradeReceipt(home, {
-      switched: true,
-      homePath: home,
-      completedAt: now().toISOString(),
-      targetLayoutVersion: latest.layout,
-      targetAggregateVersion: latest.aggregate,
-      ...(report.switch.backupPath === undefined
-        ? {}
-        : { backupPath: report.switch.backupPath })
-    });
+        // The atomic switch has COMMITTED. Drop a durable, out-of-band receipt
+        // before doing anything else, so that if this process is killed before it
+        // can report success (SIGTERM/OOM after switch), a later reader can still
+        // prove the switch happened and locate the backup — closing the
+        // activation-ambiguity gap (P1-2). The receipt is cleared only on a
+        // clean, verified return.
+        writeUpgradeReceipt(home, {
+          switched: true,
+          homePath: home,
+          completedAt: now().toISOString(),
+          targetLayoutVersion: latest.layout,
+          targetAggregateVersion: latest.aggregate,
+          ...(report.switch.backupPath === undefined
+            ? {}
+            : { backupPath: report.switch.backupPath })
+        });
 
-    // 7) Post-switch health check with a fresh loader over the promoted Home.
-    const postVerify = postSwitchHealthCheck(home);
-    if (postVerify !== null) {
-      // Switch committed but the migrated Home did not load: keep the receipt so
-      // the ambiguity is recorded, and report the backup-based manual recovery.
-      return { ...withClassification(postVerify, classification), report };
+        // 7) Post-switch health check with a fresh loader over the promoted Home.
+        const postVerify = postSwitchHealthCheck(home);
+        if (postVerify !== null) {
+          // Switch committed but the migrated Home did not load: keep the receipt
+          // so the ambiguity is recorded, and report the backup-based manual
+          // recovery.
+          return { ...withClassification(postVerify, classification), report };
+        }
+
+        // Fully verified: the migrated Home loads. Clear the receipt — there is
+        // no ambiguity to record.
+        clearUpgradeReceipt(home);
+        return {
+          outcome: "upgraded",
+          classification,
+          report,
+          ...(report.switch.backupPath === undefined
+            ? {}
+            : { backupPath: report.switch.backupPath })
+        };
+      });
+    } catch (error) {
+      if (!(error instanceof UpgradeFenceError)) throw error;
+      return withClassification(
+        {
+          outcome: "blocked",
+          stage: "coordination",
+          message: `Upgrade coordination could not be acquired: ${error.message}`,
+          action:
+            "Wait for the other writer or switch recovery to finish, then retry; "
+            + "the authoritative Home was not switched by this attempt."
+        },
+        classification
+      );
     }
-
-    // Fully verified: the migrated Home loads. Clear the receipt — there is no
-    // ambiguity to record.
-    clearUpgradeReceipt(home);
-    return {
-      outcome: "upgraded",
-      classification,
-      report,
-      ...(report.switch.backupPath === undefined
-        ? {}
-        : { backupPath: report.switch.backupPath })
-    };
   } finally {
     releaseFence();
   }

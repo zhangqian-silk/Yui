@@ -91,18 +91,23 @@ a home whose *only* difference is an older record family is a version verdict
 runs a read-only preflight and plan, validates through the real loader gate on a
 staged copy, prints the report, and discards it without switching. `yui upgrade`
 (execute) places an admission fence (new writers, CLI and Controller alike,
-refuse to start), drains the Controller with the public `controller.stop`, proves
-both the runtime-lifecycle mailboxes AND the durable runtime inbox
-(`runtime/inbox/*`) are empty read-only (either non-empty blocks at
-`drain-incomplete`, so authoritative not-yet-applied events are never dropped by a
-switch), re-pins the committed revision under the write lock, migrates into a
-fresh staged home, validates it, then atomically switches into place with a
-timestamped backup and a post-switch health check. The admission fence is honored
-not only by the CLI/Controller store-commit path but also by the **durable runtime
-inbox `publish`**: while an upgrade holds the fence, a late native-hook enqueue is
-refused with an explicit `UpgradeFenceError` (the hook backs off and re-delivers
-after the upgrade) instead of being silently lost by the imminent whole-home
-switch — closing the quiesce→switch race. **Fence acquisition is a
+refuse to start), drains the Controller with the public `controller.stop`, then
+enters one shared sibling coordination boundary. Inside it, both the
+runtime-lifecycle mailboxes AND the durable runtime inbox (`runtime/inbox/*`) are
+checked (either non-empty blocks at `drain-incomplete`, so authoritative
+not-yet-applied events are never dropped by a switch), followed by the revision
+pin, complete-home copy, validation, and two-step switch.
+The boundary is `<home>.upgrade-coordination.lock`, outside the Home so renames
+cannot move a live lock. Inbox `publish` takes that same lock, checks the fence
+and any unresolved switch-progress marker while holding it, writes the temp/link/
+fsync event, and releases it. Upgrade takes the lock after the Controller drain,
+proves both runtime lanes, re-pins the revision under `.state.lock`, copies the
+complete Home, and keeps the coordination lock through `home -> backup` and
+`staging -> home`. Thus a hook admitted before the fence either finishes before
+the final snapshot (and its event is copied) or waits and receives an explicit
+`UpgradeFenceError` after cutover; it can safely re-deliver and is never silently
+stranded only in the backup. With no fence, the normal hook path keeps the same
+durable behavior, only serialized at this boundary. **Fence acquisition is a
 single atomic file create**, so two concurrent upgraders never both acquire —
 exactly one wins and the other fails closed. A provably-dead owner's stale fence
 is reclaimed, but the reclaim is an **atomic compare-and-delete** (it removes only
@@ -111,7 +116,18 @@ meantime is never clobbered — two entrants can never both end up "acquired". T
 reclaim lock is itself **crash-recoverable** (owner-pid + age reclaim), so a
 holder that crashes mid-reclaim cannot orphan it and permanently block admission;
 when a reclaim cannot be proven complete the writer fails closed rather than
-falsely reporting the home writable. An **uninitialized home** (never `yui setup`)
+falsely reporting the home writable. The coordination lock uses the same bounded
+crash-recovery rule: it records an owner PID, waits only for a bounded interval,
+and atomically renames aside a lock whose owner is provably dead (or whose
+owner-less directory is older than the conservative acquisition window). A live
+or undeterminable holder fails closed, so a crash cannot deadlock the Home and a
+live writer is never evicted by a TTL. A switch-progress marker blocks hook
+admission when the Home is missing or uninitialized (including a malformed
+marker, because its recovery phase is unknowable); a stale marker beside an
+intact Home is ignored just as the update probe ignores it after corroborating
+the filesystem. The lock order is one-way — coordination
+lock, then `.state.lock`; inbox writers never acquire `.state.lock` — so no
+coordination cycle is introduced. An **uninitialized home** (never `yui setup`)
 returns a structured "run `yui setup`" blocker rather than a silent no-op. Quiesce
 **fails closed on any undeterminable signal**: a `.state.lock` that exists but
 whose owner is missing/empty/non-integer/unreadable (a writer may be

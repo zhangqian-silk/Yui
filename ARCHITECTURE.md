@@ -223,14 +223,21 @@ not match its locator, or a record with a missing/invalid `schemaVersion`.
 
 `yui upgrade` is the transactional storage-migration entry point. Execute mode
 places an **admission fence** honored at every authoritative write choke point,
-so baseline CLI writers, the Controller (which mutate through the same store),
-AND the durable runtime-inbox publish path all refuse to begin a new write while
-an upgrade owns the home; the fencing process itself is exempt. The inbox
-`publish` calling the same `assertHomeWritable` fence gate closes the
-quiesce→switch TOCTOU (decision-13): once an upgrade has proven the inbox empty,
-a late native-hook enqueue is refused with a structured `UpgradeFenceError` (the
-hook backs off and re-delivers after the upgrade) rather than being silently
-dropped by the imminent whole-home switch. **Fence acquisition is a single atomic
+so baseline CLI writers and the Controller (which mutate through the same store)
+refuse to begin a new write while an upgrade owns the Home; the fencing process
+itself is exempt. Durable runtime-inbox `publish` participates in a separate,
+shared sibling coordination boundary: `<home>.upgrade-coordination.lock` lives
+outside the Home and serializes the complete inbox write with the final
+snapshot/copy/two-step switch. A publish acquires that lock, then checks the
+fence and any unresolved `<home>.upgrade-switch.json` marker before its
+temp/link/fsync sequence. Upgrade acquires the same lock after Controller drain,
+proves both runtime lanes, re-pins under `.state.lock`, stages the complete
+Home, and holds the coordination lock through `home -> backup` and
+`staging -> home`. A hook that passed admission before the fence therefore either
+finishes under the lock and is copied into promoted Home, or waits and receives a
+structured `UpgradeFenceError` that permits re-delivery; it cannot be silently
+dropped into backup-only storage. With no fence, normal hook behavior is unchanged
+apart from this shared serialization point. **Fence acquisition is a single atomic
 `O_CREAT|O_EXCL` create** — the kernel guarantees exactly one of any number of
 concurrent upgraders wins that create, so there is no check-then-write window in
 which two upgraders both believe they acquired; a loser either re-enters (it
@@ -248,8 +255,17 @@ crashed holder is reclaimed by a later entrant once its owner is provably dead
 permanently orphan the lock and strand admission (R2-F4). When a reclaim cannot
 be proven complete, `assertHomeWritable` re-verifies and refuses rather than
 falsely reporting the home writable, and a dead-owner fence is never left
-indefinitely stranding writers. There is no lease or multi-round negotiation. The
-fence is enforced by every writer built from this release forward (its check
+indefinitely stranding writers. There is no lease or multi-round negotiation.
+The coordination lock uses the same bounded crash-recovery rule as other Home
+locks: it records an owner PID, waits only a bounded interval, and atomically
+renames aside a lock whose owner is provably dead (or whose owner-less directory
+is older than the conservative acquisition window). A live or undeterminable
+holder fails closed; a switch-progress marker blocks hook admission when the
+Home is missing or uninitialized (including a malformed marker), while a stale
+marker beside an intact Home is ignored after filesystem corroboration. Lock
+ordering is one-way — coordination lock, then `.state.lock`; inbox writers
+never acquire `.state.lock` — so the cutover cannot deadlock on a reverse order.
+The fence is enforced by every writer built from this release forward (its check
 lives in the shared store-commit path); it cannot retroactively bind an
 already-installed older binary, so cross-release
 concurrency is instead handled by the quiesce step and the recommendation to
@@ -266,11 +282,11 @@ committed `*.json` events, in-progress `.tmp-*` writes, and quarantined
 would quarantine as a side effect, so the check never mutates the source; an
 unreadable inbox directory fails closed. This matters because the no-Controller
 / stale-event path reaches quiesce with inbox entries still on disk, and an
-atomic switch must never silently drop them. The window between this read-only
-proof and the switch is itself closed by the inbox `publish` fence gate above (a
-late enqueue during the fence is refused, not silently written), so the emptiness
-established here cannot be quietly violated before the switch. It then re-pins the
-committed revision under the write lock after the drain (avoiding a
+atomic switch must never silently drop them. The read-only quiesce proof is
+performed only after acquiring the shared coordination lock; an admitted hook
+that was still completing cannot cross that lock, and a hook that waits sees the
+fence and fails explicitly. The cutover then re-pins the committed revision
+under the write lock after the drain (avoiding a
 check-then-migrate race), migrates the immutable source into a fresh staged home,
 validates it
 through the real `FileTaskStore` loader gate (record parse + reference graph),
