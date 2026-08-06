@@ -126,8 +126,11 @@ type ActiveRunPointer = Readonly<{ schemaVersion: 1; runId: string }>;
 
 type TaskIdHighWaterMarks = Record<TaskRecordKind, number>;
 
+/** The schema version of each persisted `state.json#/tasks/*` aggregate. */
+export const CURRENT_STORED_TASK_SCHEMA_VERSION = 14;
+
 type StoredTask = {
-  schemaVersion: 14;
+  schemaVersion: typeof CURRENT_STORED_TASK_SCHEMA_VERSION;
   task: Task;
   idHighWaterMarks: TaskIdHighWaterMarks;
   brief: TaskBrief | null;
@@ -1271,7 +1274,7 @@ function emptyState(): StorageState {
 }
 function emptyStoredTask(task: Task): StoredTask {
   return {
-    schemaVersion: 14,
+    schemaVersion: CURRENT_STORED_TASK_SCHEMA_VERSION,
     task,
     idHighWaterMarks: emptyTaskIdHighWaterMarks(),
     brief: null,
@@ -1490,7 +1493,11 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateIntegrationAttempt(attempt);
     return attempt;
   }, "integrationAttempts");
-  versioned(aggregate, 14, `Task aggregate ${taskId}`);
+  versioned(
+    aggregate,
+    CURRENT_STORED_TASK_SCHEMA_VERSION,
+    `Task aggregate ${taskId}`
+  );
   validateTaskIdHighWaterMarks(aggregate.idHighWaterMarks, taskId);
   validateTask(identified(aggregate.task, 3, "id", taskId, "Task"));
   if (aggregate.brief !== null) storedTaskBrief(aggregate.brief);

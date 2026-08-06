@@ -31,6 +31,7 @@ import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:ch
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { runtimeError } from "../errors/cliError.js";
 import { STORAGE_DOCTOR_CHECK_NAMES } from "../doctor/doctor.js";
@@ -39,11 +40,15 @@ import { correlateUpgradeReceipt } from "../storage/upgrade/upgradeOrchestrator.
 import { readSwitchProgress } from "../storage/upgrade/switchProgress.js";
 import type {
   StagedPackage,
+  ControllerIdentity,
   StorageActivation,
   StorageStateProbe,
+  UpdateControllerLifecycleStatus,
+  UpdateControllerStopResult,
   UpdatePorts,
   UpdatePreflight
 } from "./updateOrchestrator.js";
+import { YUI_VERSION } from "../version.js";
 
 const PACKAGE_NAME = "@zq-silk/yui";
 const PACKAGE_SPEC = `${PACKAGE_NAME}@latest`;
@@ -229,8 +234,171 @@ export function createUpdatePorts(
       if (staged.stagingPath !== undefined) {
         rmSync(staged.stagingPath, { recursive: true, force: true });
       }
+    },
+
+    // `runUpdate` is intentionally synchronous because the npm/staged-binary
+    // ports use spawnSync. Keep Controller ownership in this same owner by
+    // using the CLI's structured lifecycle commands; tests can replace these
+    // seams with deterministic fakes without touching a real Controller.
+    controllerStatus(home: string): UpdateControllerLifecycleStatus {
+      return readControllerLifecycle(home, environment, spawn);
+    },
+    stopController(home: string): UpdateControllerStopResult {
+      return stopControllerForUpdate(home, environment, spawn);
+    },
+    startController(home: string): void {
+      restartControllerForUpdate(home, environment, spawn);
+    },
+    restoreController(home: string, identity: ControllerIdentity): void {
+      restoreControllerIdentity(home, identity, environment, spawn);
     }
   };
+}
+
+const UPDATE_CLI_PATH = fileURLToPath(new URL("../cli.js", import.meta.url));
+
+/** Capture running state plus the exact process command/version before stopping. */
+function readControllerLifecycle(
+  home: string,
+  environment: NodeJS.ProcessEnv,
+  spawn: UpdateSpawner
+): UpdateControllerLifecycleStatus {
+  const data = runControllerCommand(home, environment, spawn, "status");
+  const resources = Array.isArray(data.resources) ? data.resources : [];
+  const current = resources.find((resource) => (
+    isRecord(resource)
+      && resource.kind === "controller"
+      && resource.state === "current"
+      && resource.yuiHome === home
+  ));
+  const processes = isRecord(current) && Array.isArray(current.processes)
+    ? current.processes
+    : [];
+  const processInfo = processes.find((value) => isRecord(value));
+  if (!isRecord(processInfo)) return { running: false };
+  const executablePath = processInfo.command;
+  const args = processInfo.args;
+  // The inventory intentionally redacts command/argument vectors. For the
+  // current install, the running Controller is launched from this same
+  // executable/entrypoint, so use that explicit identity rather than treating
+  // a live Controller as un-restorable or silently switching to the staged one.
+  const identity = typeof executablePath === "string"
+    && executablePath.length > 0
+    && Array.isArray(args)
+    && args.every((arg) => typeof arg === "string")
+    ? {
+        executablePath,
+        args: args as string[],
+        version: YUI_VERSION
+      }
+    : currentControllerIdentity();
+  return {
+    running: true,
+    ...(typeof processInfo.pid === "number" ? { pid: processInfo.pid } : {}),
+    identity
+  };
+}
+
+function currentControllerIdentity(): ControllerIdentity {
+  return {
+    executablePath: process.execPath,
+    args: [fileURLToPath(new URL("../controller/controllerMain.js", import.meta.url))],
+    version: YUI_VERSION
+  };
+}
+
+function stopControllerForUpdate(
+  home: string,
+  environment: NodeJS.ProcessEnv,
+  spawn: UpdateSpawner
+): UpdateControllerStopResult {
+  const output = runControllerCommandOutput(home, environment, spawn, "stop");
+  if (/already stopped/i.test(output)) return { stopped: false, alreadyStopped: true };
+  if (/stopped/i.test(output)) return { stopped: true };
+  throw new Error("Controller stop returned no structured stopped/already-stopped outcome.");
+}
+
+function restartControllerForUpdate(
+  home: string,
+  environment: NodeJS.ProcessEnv,
+  spawn: UpdateSpawner
+): void {
+  runControllerCommandOutput(home, environment, spawn, "restart");
+}
+
+/** Restore the captured process identity, never the staged/new `yui` launcher. */
+function restoreControllerIdentity(
+  home: string,
+  identity: ControllerIdentity,
+  environment: NodeJS.ProcessEnv,
+  spawn: UpdateSpawner
+): void {
+  const launchEnvironment = { ...environment, YUI_HOME: home };
+  // Spawn a detached child through a short-lived Node helper so the synchronous
+  // update process does not wait on the Controller event loop. No retry or sleep
+  // is hidden here; the status command below is the single post-launch proof.
+  const helper = [
+    "const { spawn } = require('node:child_process');",
+    "const values = process.argv.slice(1);",
+    "const env = JSON.parse(values.pop());",
+    "const executable = values.shift();",
+    "const child = spawn(executable, values, { detached: true, stdio: 'ignore', env });",
+    "child.unref();"
+  ].join(" ");
+  const result = spawn(
+    process.execPath,
+    ["-e", helper, identity.executablePath, ...identity.args, JSON.stringify(launchEnvironment)],
+    { cwd: process.cwd(), env: launchEnvironment, shell: false, stdio: "ignore" }
+  );
+  assertSpawnOk(result, "restore the previously running Controller identity");
+  const status = readControllerLifecycle(home, environment, spawn);
+  if (!status.running || status.identity?.version !== identity.version) {
+    throw new Error(
+      `Restored Controller identity was not confirmed (expected version ${identity.version}).`
+    );
+  }
+}
+
+function runControllerCommand(
+  home: string,
+  environment: NodeJS.ProcessEnv,
+  spawn: UpdateSpawner,
+  method: "status"
+): Record<string, unknown> {
+  const result = spawn(
+    process.execPath,
+    [UPDATE_CLI_PATH, "--json", "controller", method],
+    { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
+  );
+  if (result.error !== undefined || result.status !== 0) {
+    throw new Error(`Controller ${method} failed (exit ${result.status ?? "null"}).`);
+  }
+  const parsed = JSON.parse(result.stdout.toString("utf8")) as unknown;
+  if (!isRecord(parsed) || parsed.ok !== true || !isRecord(parsed.data)) {
+    throw new Error(`Controller ${method} returned an invalid structured result.`);
+  }
+  return parsed.data;
+}
+
+function runControllerCommandOutput(
+  home: string,
+  environment: NodeJS.ProcessEnv,
+  spawn: UpdateSpawner,
+  method: "stop" | "restart"
+): string {
+  const result = spawn(
+    process.execPath,
+    [UPDATE_CLI_PATH, "--json", "controller", method],
+    { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
+  );
+  if (result.error !== undefined || result.status !== 0) {
+    throw new Error(`Controller ${method} failed (exit ${result.status ?? "null"}).`);
+  }
+  const parsed = JSON.parse(result.stdout.toString("utf8")) as unknown;
+  if (!isRecord(parsed) || parsed.ok !== true || typeof parsed.output !== "string") {
+    throw new Error(`Controller ${method} returned an invalid structured result.`);
+  }
+  return parsed.output;
 }
 
 function interpretPreflight(result: SpawnSyncReturns<Buffer>): UpdatePreflight {
@@ -337,6 +505,18 @@ function interpretActivation(result: SpawnSyncReturns<Buffer>): StorageActivatio
         detail: typeof data?.message === "string"
           ? data.message
           : "the storage switch was left partially applied"
+      };
+    }
+    // A post-verify blocker is emitted only after the atomic Home switch has
+    // committed. Treat it as AMBIGUOUS in the parent update flow so a stopped
+    // old Controller is never restored against the migrated Home; the receipt,
+    // backup, and switch-progress marker are the recovery evidence.
+    if (stage === "post-verify") {
+      return {
+        status: "ambiguous",
+        detail: typeof data?.message === "string"
+          ? data.message
+          : "storage switched but post-switch verification did not complete"
       };
     }
     return {
@@ -631,6 +811,10 @@ function doctorUnverifiable(reason: string): Error {
       + "healthy. Investigate with `yui doctor` before resuming; if storage was migrated, restore "
       + "the timestamped backup to recover."
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function assertSpawnOk(result: SpawnSyncReturns<Buffer>, action: string): void {

@@ -37,6 +37,9 @@
  * hidden behind a false atomicity claim.
  */
 
+import { switchProgressPath } from "../storage/upgrade/switchProgress.js";
+import { upgradeReceiptPath } from "../storage/upgrade/upgradeReceipt.js";
+
 /** A side-by-side staged package, isolated from the live global install. */
 export type StagedPackage = Readonly<{
   /** Absolute path to the staged `yui` binary. */
@@ -69,6 +72,31 @@ export type StorageActivation = Readonly<
    */
   | { status: "ambiguous"; detail: string }
 >;
+
+/** The exact Controller launch identity captured before an update stops it. */
+export type ControllerIdentity = Readonly<{
+  /** Executable that owns the Controller process (for example `node`). */
+  executablePath: string;
+  /** Exact launch arguments for that executable, including the Controller entrypoint. */
+  args: readonly string[];
+  /** Version reported by the running Controller before the update. */
+  version: string;
+}>;
+
+/** Lifecycle fact captured before a binary-only update quiesces the Home. */
+export type UpdateControllerLifecycleStatus = Readonly<{
+  running: boolean;
+  pid?: number;
+  /** Required when `running` is true so restoration cannot silently use the new binary. */
+  identity?: ControllerIdentity;
+}>;
+
+/** Structured stop result; a running Controller is stopped at most once. */
+export type UpdateControllerStopResult = Readonly<{
+  stopped: boolean;
+  alreadyStopped?: boolean;
+  pid?: number;
+}>;
 
 /**
  * A read-only probe of the target Home's storage state, used to resolve an
@@ -118,6 +146,17 @@ export type UpdatePorts = Readonly<{
   probeStorage: (home: string) => StorageStateProbe;
   /** Best-effort staging cleanup. */
   cleanup: (staged: StagedPackage) => void;
+  /**
+   * Optional Controller lifecycle owner for binary-only/already-current updates.
+   * When any lifecycle seam is supplied, all four seams are required so a
+   * failed pre-switch update never falls back to a staged/new Controller.
+   */
+  controllerStatus?: (home: string) => UpdateControllerLifecycleStatus;
+  stopController?: (home: string) => UpdateControllerStopResult;
+  /** Start the replacement only after binary activation and post-health verification. */
+  startController?: (home: string) => void;
+  /** Restore the exact identity captured before the update (never the staged binary). */
+  restoreController?: (home: string, identity: ControllerIdentity) => void;
 }>;
 
 /** The structured outcome of an update attempt. */
@@ -161,6 +200,12 @@ export type UpdatePhase =
   | "activate-storage"
   | "activate-binary"
   | "post-verify";
+
+type UpdateControllerLifecycle = Readonly<{
+  wasRunning: boolean;
+  stopped: boolean;
+  identity?: ControllerIdentity;
+}>;
 
 /**
  * Run the update orchestration. Never performs an irreversible step before the
@@ -218,7 +263,9 @@ export function runUpdate(
 
     if (preflight.status === "already-current") {
       // Nothing to migrate; promote the binary and verify. Storage is untouched.
-      return activateAndVerify(ports, staged, home, undefined);
+      const lifecycle = captureControllerLifecycle(ports, staged.version, home);
+      if ("outcome" in lifecycle) return lifecycle;
+      return activateAndVerify(ports, staged, home, undefined, lifecycle.lifecycle);
     }
 
     // 3) Activate storage — recoverable: atomic switch + timestamped backup. An
@@ -274,22 +321,20 @@ function activateAndVerify(
   ports: UpdatePorts,
   staged: StagedPackage,
   home: string,
-  storageBackupPath: string | undefined
+  storageBackupPath: string | undefined,
+  lifecycle?: UpdateControllerLifecycle
 ): UpdateResult {
   try {
     ports.activateBinary(staged);
   } catch (error) {
-    return {
+    const failure: UpdateResult = {
       outcome: "aborted",
       phase: "activate-binary",
       message: `Failed to activate the new binary: ${messageOf(error)}`,
       action: storageBackupPath === undefined
         ? "Storage was not migrated; the current install may be partially replaced. "
           + "Re-run `yui update` to complete, or reinstall the package."
-        : `Storage was migrated (backup at ${storageBackupPath}). The old binary `
-          + "fail-closes on the new Home rather than misreading it. To fully revert, "
-          + `restore the backup: mv "${storageBackupPath}" "${home}". Otherwise re-run `
-          + "`yui update` to finish promoting the new binary.",
+        : postSwitchRecoveryAction(home, storageBackupPath),
       // Recoverable ONLY while storage was not yet switched. Once storage is
       // migrated, this is a narrowed, backup-based manual recovery, not an
       // automatic downgrade.
@@ -297,28 +342,209 @@ function activateAndVerify(
       version: staged.version,
       ...(storageBackupPath === undefined ? {} : { storageBackupPath })
     };
+    return restoreBeforeSwitchOrReport(ports, home, lifecycle, storageBackupPath, failure);
   }
 
   try {
     ports.verify(staged, home);
   } catch (error) {
-    return {
+    const failure: UpdateResult = {
       outcome: "aborted",
       phase: "post-verify",
       message: `Post-update health check failed: ${messageOf(error)}`,
       action: storageBackupPath === undefined
         ? "The new binary did not pass its health check. Investigate before using Yui."
-        : `The migrated Home did not pass the new binary's health check. Restore the `
-          + `backup to recover: mv "${storageBackupPath}" "${home}".`,
+        : postSwitchRecoveryAction(home, storageBackupPath),
       recoverable: false,
       version: staged.version,
       ...(storageBackupPath === undefined ? {} : { storageBackupPath })
     };
+    return restoreBeforeSwitchOrReport(ports, home, lifecycle, storageBackupPath, failure);
+  }
+
+  if (lifecycle?.wasRunning === true) {
+    try {
+      ports.startController!(home);
+    } catch (error) {
+      const failure: UpdateResult = {
+        outcome: "aborted",
+        phase: "post-verify",
+        message:
+          `The replacement Controller could not start after activation and health verification: `
+          + `${messageOf(error)}.`,
+        action: storageBackupPath === undefined
+          ? "The Home was not migrated. Keep writes quiesced and restore the previously running Controller identity before retrying."
+          : postSwitchRecoveryAction(home, storageBackupPath),
+        recoverable: false,
+        version: staged.version,
+        ...(storageBackupPath === undefined ? {} : { storageBackupPath })
+      };
+      return restoreBeforeSwitchOrReport(ports, home, lifecycle, storageBackupPath, failure);
+    }
   }
 
   return storageBackupPath === undefined
     ? { outcome: "updated", version: staged.version }
     : { outcome: "updated", version: staged.version, storageBackupPath };
+}
+
+/**
+ * Capture the old Controller before a binary-only update mutates the install.
+ * A partial lifecycle port set is rejected rather than silently selecting a
+ * staged/new `ensureFileTaskController` for restoration.
+ */
+function captureControllerLifecycle(
+  ports: UpdatePorts,
+  version: string,
+  home: string
+): { lifecycle: UpdateControllerLifecycle } | Extract<UpdateResult, { outcome: "aborted" }> {
+  const supplied = [
+    ports.controllerStatus,
+    ports.stopController,
+    ports.startController,
+    ports.restoreController
+  ].some((port) => port !== undefined);
+  if (!supplied) return { lifecycle: { wasRunning: false, stopped: false } };
+  if (
+    ports.controllerStatus === undefined
+    || ports.stopController === undefined
+    || ports.startController === undefined
+    || ports.restoreController === undefined
+  ) {
+    return {
+      outcome: "aborted",
+      phase: "preflight",
+      message: "Controller lifecycle ownership is incomplete for this update.",
+      action:
+        "Provide status, stop, replacement-start, and exact-identity restore seams; refusing to activate a binary without a complete lifecycle owner.",
+      recoverable: true,
+      version
+    };
+  }
+
+  let status: UpdateControllerLifecycleStatus;
+  try {
+    status = ports.controllerStatus(home);
+  } catch (error) {
+    return {
+      outcome: "aborted",
+      phase: "preflight",
+      message: `Controller status could not be verified: ${messageOf(error)}`,
+      action:
+        "Do not activate the binary while Controller ownership is unknown; inspect the Controller and retry once status is verified.",
+      recoverable: true,
+      version
+    };
+  }
+  if (!isControllerLifecycleStatus(status)) {
+    return {
+      outcome: "aborted",
+      phase: "preflight",
+      message: "Controller status was malformed; expected a boolean running field.",
+      action: "Inspect the Controller status provider and retry; no binary activation was attempted.",
+      recoverable: true,
+      version
+    };
+  }
+  if (!status.running) return { lifecycle: { wasRunning: false, stopped: false } };
+  if (!isControllerIdentity(status.identity)) {
+    return {
+      outcome: "aborted",
+      phase: "preflight",
+      message:
+        "The Controller is running but its executable/version identity could not be captured.",
+      action:
+        "Refusing to stop a Controller that cannot be restored exactly; provide its executable path, arguments, and version, then retry.",
+      recoverable: true,
+      version
+    };
+  }
+
+  let stopped: UpdateControllerStopResult;
+  try {
+    stopped = ports.stopController(home);
+  } catch (error) {
+    return {
+      outcome: "aborted",
+      phase: "preflight",
+      message: `Controller stop/drain failed: ${messageOf(error)}`,
+      action:
+        "The Controller may still be active or draining. Do not retry stop blindly; inspect it and retry once the Home is quiesced.",
+      recoverable: true,
+      version
+    };
+  }
+  if (!isControllerStopResult(stopped) || stopped.stopped !== true) {
+    return {
+      outcome: "aborted",
+      phase: "preflight",
+      message: "Controller stop did not return the required stopped:true confirmation.",
+      action:
+        "Keep the Home quiesced and inspect the Controller; no binary activation was attempted and no stop retry was issued.",
+      recoverable: true,
+      version
+    };
+  }
+  return {
+    lifecycle: {
+      wasRunning: true,
+      stopped: true,
+      identity: status.identity
+    }
+  };
+}
+
+function restoreBeforeSwitchOrReport(
+  ports: UpdatePorts,
+  home: string,
+  lifecycle: UpdateControllerLifecycle | undefined,
+  storageBackupPath: string | undefined,
+  failure: Extract<UpdateResult, { outcome: "aborted" }>
+): UpdateResult {
+  // Once storage switched, the old Controller is never safe to restore. Keep
+  // the failure structured and point at all durable recovery evidence instead.
+  if (storageBackupPath !== undefined || lifecycle?.wasRunning !== true) return failure;
+  try {
+    ports.restoreController!(home, lifecycle.identity!);
+    return failure;
+  } catch (error) {
+    return {
+      outcome: "aborted",
+      phase: "post-verify",
+      message:
+        `${failure.message} The previously running Controller identity could not be restored: `
+        + `${messageOf(error)}.`,
+      action:
+        "Keep the Home quiesced and resolve the exact old Controller restore failure before retrying; do not start the staged/new Controller blindly.",
+      recoverable: false,
+      version: "version" in failure ? failure.version : undefined
+    };
+  }
+}
+
+function postSwitchRecoveryAction(home: string, backupPath: string): string {
+  return `The storage switch is committed (backup at ${backupPath}); do not restore the old Controller. `
+    + `Inspect the backup, receipt marker "${upgradeReceiptPath(home)}", and switch-progress marker `
+    + `"${switchProgressPath(home)}". Verify the migrated Home, then either finish the update or `
+    + `restore the backup explicitly with mv "${backupPath}" "${home}".`;
+}
+
+function isControllerLifecycleStatus(value: unknown): value is UpdateControllerLifecycleStatus {
+  return isRecord(value) && typeof value.running === "boolean";
+}
+
+function isControllerStopResult(value: unknown): value is UpdateControllerStopResult {
+  return isRecord(value) && typeof value.stopped === "boolean";
+}
+
+function isControllerIdentity(value: unknown): value is ControllerIdentity {
+  return isRecord(value)
+    && typeof value.executablePath === "string"
+    && value.executablePath.length > 0
+    && Array.isArray(value.args)
+    && value.args.every((arg) => typeof arg === "string")
+    && typeof value.version === "string"
+    && value.version.length > 0;
 }
 
 /**
@@ -355,7 +581,8 @@ function resolveAmbiguousActivation(
       message: `Storage activation result is unknown (${detail}); probing the Home also failed: ${messageOf(error)}.`,
       action:
         `Do NOT assume the update succeeded or was a no-op. Manually inspect ${home} and any `
-        + `"${home}.backup-*" sibling and "${home}.upgrade-receipt.json"; if a receipt exists the `
+        + `"${home}.backup-*" sibling, "${upgradeReceiptPath(home)}", and `
+        + `"${switchProgressPath(home)}"; if a receipt exists the `
         + `switch committed — verify the migrated Home with "yui doctor" before resuming, otherwise `
         + `restore the newest backup with mv before re-running "yui update".`,
       version: staged.version,
@@ -378,7 +605,7 @@ function resolveAmbiguousActivation(
       action:
         `Restore the timestamped backup to recover the original Home: `
         + `mv "${probe.backupPath ?? "<home>.backup-*"}" "${home}". Do NOT resume writes until it is `
-        + `restored, then re-run "yui update".`,
+        + `restored; inspect "${switchProgressPath(home)}" for the interrupted phase, then re-run "yui update".`,
       version: staged.version,
       schemaCurrent: probe.schemaCurrent,
       switched: false,
@@ -397,6 +624,7 @@ function resolveAmbiguousActivation(
       action:
         `Verify the migrated Home before resuming writes: run "yui doctor"`
         + `${probe.backupPath === undefined ? "" : ` (its timestamped backup is ${probe.backupPath})`}. `
+        + `Inspect "${upgradeReceiptPath(home)}" and "${switchProgressPath(home)}" before deciding. `
         + `If it is healthy, finish by re-running "yui update" to promote the binary; if not, restore `
         + `the backup with mv "${probe.backupPath ?? "<home>.backup-*"}" "${home}". Do NOT resume `
         + `writes with the old binary against the migrated Home.`,
@@ -417,7 +645,8 @@ function resolveAmbiguousActivation(
       + `${probe.schemaCurrent ? "; the Home currently loads at the current schema" : ""}.`,
     action:
       `The switch most likely did not commit, but this was not confirmed. Verify with "yui doctor" `
-      + `and check for any "${home}.backup-*" sibling before retrying; then re-run "yui update". Do `
+      + `and check for any "${home}.backup-*" sibling, "${upgradeReceiptPath(home)}", and `
+      + `"${switchProgressPath(home)}" before retrying; then re-run "yui update". Do `
       + `NOT assume the update completed.`,
     version: staged.version,
     schemaCurrent: probe.schemaCurrent,
@@ -427,4 +656,8 @@ function resolveAmbiguousActivation(
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -79,12 +79,14 @@ export function renderUpgradeResult(
       return `${header}\nUpgraded storage. Original Home backed up at `
         + `${result.backupPath ?? "(unspecified)"}.`;
     case "blocked": {
-      // Most blockers guarantee the source is untouched. The `switch-ambiguous`
-      // stage is the partial switch whose rollback also failed (P1-4), where that
-      // claim would be false; a plain `switch` failure rolled back cleanly.
-      const unchangedNote = result.stage === "switch-ambiguous"
-        ? "The switch did not complete and could not be rolled back; the authoritative Home is NOT intact (see Action)."
-        : "Storage was not switched; the authoritative Home is unchanged.";
+      // Most blockers guarantee the source is untouched. A partial switch or a
+      // post-switch ambiguity explicitly carries the committed boundary and
+      // named recovery evidence; never print a false unchanged claim there.
+      const unchangedNote = result.switchCommitted === true
+        ? "The storage switch committed, but post-switch completion is ambiguous; the old Controller was not restored (see Action and recovery evidence)."
+        : result.stage === "switch-ambiguous"
+          ? "The switch did not complete and could not be rolled back; the authoritative Home is NOT intact (see Action)."
+          : "Storage was not switched; the authoritative Home is unchanged.";
       return [
         header,
         `${mode === "dry-run" ? "Dry run" : "Upgrade"} blocked at ${result.stage}: ${result.message}`,

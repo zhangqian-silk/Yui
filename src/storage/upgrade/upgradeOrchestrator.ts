@@ -28,8 +28,10 @@
  * authoritative input byte-for-byte unchanged.
  */
 
+import { spawn } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   describeReport,
@@ -45,6 +47,7 @@ import {
 } from "../../controller/clientRuntime.js";
 import { callController } from "../../core/controllerClient.js";
 import { FileTaskStore, STORAGE_STATE_FILE, withStorageWriteLock } from "../taskStore.js";
+import { YUI_VERSION } from "../../version.js";
 import {
   clearUpgradeFence,
   placeUpgradeFence,
@@ -54,8 +57,10 @@ import {
 import { withUpgradeCoordinationLock } from "../upgradeCoordination.js";
 import {
   clearUpgradeReceipt,
-  writeUpgradeReceipt
+  writeUpgradeReceipt,
+  upgradeReceiptPath
 } from "./upgradeReceipt.js";
+import { switchProgressPath } from "./switchProgress.js";
 import {
   classifyHome,
   type HomeClassification
@@ -89,6 +94,16 @@ type UpgradeBlocker = Readonly<{
   stage: UpgradeBlockerStage;
   message: string;
   action: string;
+  /** True once the atomic Home switch committed; never restore the old Controller. */
+  switchCommitted?: true;
+  /** The exact backup retained for explicit recovery after a committed switch. */
+  backupPath?: string;
+  /** Named durable evidence for an ambiguous post-switch boundary. */
+  recoveryEvidence?: Readonly<{
+    backupPath?: string;
+    receiptPath: string;
+    progressPath: string;
+  }>;
 }>;
 
 /** The structured result of an upgrade attempt. */
@@ -137,6 +152,11 @@ export type RunStorageUpgradeOptions<Snapshot> = Readonly<{
    * Controller after a blocked pre-switch attempt. Defaults to the real client.
    */
   startController?: (home: string) => Promise<unknown>;
+  /** Restore the exact Controller identity captured before quiesce. */
+  restoreController?: (
+    home: string,
+    identity: ControllerLaunchIdentity
+  ) => Promise<unknown>;
   /**
    * Test seam forwarded to the migration target's atomic switch to simulate a
    * failing promotion/rollback rename (P1-4). Production never sets it.
@@ -148,12 +168,31 @@ export type RunStorageUpgradeOptions<Snapshot> = Readonly<{
    * sets it.
    */
   switchFaultHook?: (step: SwitchStep) => void;
+  /** Test-only injection for failures after the atomic switch commits. */
+  postSwitchFaultHook?: (step: PostSwitchFaultStep) => void;
 }>;
+
+/** Deterministic post-switch failure seams used by regression tests. */
+export type PostSwitchFaultStep = "receipt-write" | "post-verify" | "receipt-clear";
+
+type SwitchCommitState = {
+  committed: boolean;
+  backupPath?: string;
+};
 
 /** The lifecycle fact captured before an upgrade stops a Controller. */
 export type ControllerLifecycleStatus = Readonly<{
   running: boolean;
   pid?: number;
+  /** Exact executable/version captured before the Controller is stopped. */
+  identity?: ControllerLaunchIdentity;
+}>;
+
+/** The executable, arguments, and version of a Controller before quiesce. */
+export type ControllerLaunchIdentity = Readonly<{
+  executablePath: string;
+  args: readonly string[];
+  version: string;
 }>;
 
 /** A stop result is successful only when the caller can prove `stopped:true`. */
@@ -300,8 +339,10 @@ async function execute(
 
   let controllerWasRunning = false;
   let controllerStopConfirmed = false;
+  let controllerIdentity: ControllerLaunchIdentity | undefined;
   let result: UpgradeResult | undefined;
   let unexpected: unknown;
+  const switchState: SwitchCommitState = { committed: false };
   try {
     // Record the lifecycle fact before stopping anything. An unavailable or
     // malformed status is unknown, not "stopped"; fail closed without attempting
@@ -331,6 +372,7 @@ async function execute(
     }
     if (result === undefined) {
       controllerWasRunning = status!.running;
+      controllerIdentity = status!.identity;
       controllerStopConfirmed = !controllerWasRunning;
     }
 
@@ -365,13 +407,34 @@ async function execute(
 
     if (result === undefined) {
       try {
-        result = executeFenced(options, classification, target, callerPid, now);
+        result = executeFenced(options, classification, target, callerPid, now, switchState);
       } catch (error) {
-        unexpected = error;
+        // Any exception after the atomic rename is a post-switch ambiguity. It
+        // must not cross the generic restore path: the old Controller is unsafe
+        // against a Home whose authority has already moved.
+        if (switchState.committed) {
+          result = withClassification(
+            postSwitchAmbiguity(home, switchState.backupPath, error),
+            classification
+          );
+        } else {
+          unexpected = error;
+        }
       }
     }
   } finally {
-    releaseFence();
+    try {
+      releaseFence();
+    } catch (error) {
+      if (switchState.committed && result === undefined) {
+        result = withClassification(
+          postSwitchAmbiguity(home, switchState.backupPath, error),
+          classification
+        );
+      } else if (unexpected === undefined) {
+        unexpected = error;
+      }
+    }
   }
 
   // Restoring the old Controller must happen after the upgrade fence is
@@ -379,8 +442,14 @@ async function execute(
   // fence. A thrown unexpected fault remains a throw, but the old lifecycle is
   // still restored exactly once before it escapes.
   if (unexpected !== undefined) {
+    if (switchState.committed) {
+      return withClassification(
+        postSwitchAmbiguity(home, switchState.backupPath, unexpected),
+        classification
+      );
+    }
     if (controllerWasRunning && controllerStopConfirmed) {
-      await restoreController(home, options, unexpected);
+      await restoreController(home, options, unexpected, controllerIdentity);
     }
     throw unexpected;
   }
@@ -419,7 +488,18 @@ async function execute(
     }
     // No further uncertainty remains once the replacement Controller (when one
     // existed) is ready; clear the receipt only at this final boundary.
-    clearUpgradeReceipt(home);
+    try {
+      options.postSwitchFaultHook?.("receipt-clear");
+      clearUpgradeReceipt(home);
+    } catch (error) {
+      return {
+        ...withClassification(
+          postSwitchAmbiguity(home, result.backupPath, error),
+          classification
+        ),
+        report: result.report
+      };
+    }
     return result;
   }
 
@@ -436,7 +516,12 @@ async function execute(
       // A blocked/failed pre-switch attempt leaves the old Home authoritative;
       // restore the Controller that was running before quiesce, once and only
       // once. Ambiguous switch is excluded: its Home authority is unknown.
-      await startController(home);
+      await restoreController(
+        home,
+        options,
+        new Error(result.message),
+        controllerIdentity
+      );
     } catch (error) {
       return {
         ...withClassification(
@@ -465,7 +550,8 @@ function executeFenced(
   classification: HomeClassification,
   target: ReturnType<typeof createHomeMigrationTarget>,
   callerPid: number,
-  now: () => Date
+  now: () => Date,
+  switchState: SwitchCommitState
 ): UpgradeResult {
   const { home, registry, latest } = options;
   try {
@@ -496,9 +582,16 @@ function executeFenced(
         return { ...blockedFromEngineReport(report, classification), report };
       }
 
+      // From this line onward the old Home has moved to its backup and the new
+      // Home is authoritative. Set the guard before any receipt/health work so
+      // even an injected post-switch failure cannot restore the old Controller.
+      switchState.committed = true;
+      switchState.backupPath = report.switch.backupPath;
+
       // The atomic switch has COMMITTED. Keep a durable receipt until the
       // post-switch loader and (when applicable) replacement Controller both
       // succeed; this closes the activation ambiguity window.
+      options.postSwitchFaultHook?.("receipt-write");
       writeUpgradeReceipt(home, {
         switched: true,
         homePath: home,
@@ -510,6 +603,7 @@ function executeFenced(
           : { backupPath: report.switch.backupPath })
       });
 
+      options.postSwitchFaultHook?.("post-verify");
       const postVerify = postSwitchHealthCheck(home);
       if (postVerify !== null) {
         return { ...withClassification(postVerify, classification), report };
@@ -752,10 +846,46 @@ function blockedFromSwitchAmbiguous(
       action:
         `Do NOT assume the Home is unchanged. The original Home is at ${report.backupPath}; `
         + `restore it to recover: mv "${report.backupPath}" "${report.homePath}". The interrupted `
-        + `switch marker records this ambiguity; verify with "yui doctor" after restoring.`
+        + `switch marker "${switchProgressPath(report.homePath)}" records this ambiguity; verify `
+        + `with "yui doctor" after restoring.`
     },
     classification
   );
+}
+
+/**
+ * A structured blocker for failures after the atomic Home switch. The receipt
+ * and progress marker are named explicitly so an operator can reconcile the
+ * committed Home; the generic old-Controller restore path must never run here.
+ */
+function postSwitchAmbiguity(
+  home: string,
+  backupPath: string | undefined,
+  error: unknown
+): UpgradeBlocker {
+  const receiptPath = upgradeReceiptPath(home);
+  const progressPath = switchProgressPath(home);
+  const backup = backupPath === undefined ? "the timestamped Home backup" : `backup ${backupPath}`;
+  return {
+    outcome: "blocked",
+    stage: "post-verify",
+    switchCommitted: true,
+    ...(backupPath === undefined ? {} : { backupPath }),
+    recoveryEvidence: {
+      ...(backupPath === undefined ? {} : { backupPath }),
+      receiptPath,
+      progressPath
+    },
+    message:
+      `The storage switch committed, but post-switch completion could not be confirmed: `
+      + `${messageOf(error)}. The old Controller was not restored.`,
+    action:
+      `Do not start the old Controller against the migrated Home. Inspect ${backup}, receipt `
+      + `"${receiptPath}", and switch-progress marker "${progressPath}"; verify the Home, then `
+      + (backupPath === undefined
+        ? "complete or explicitly recover the switch before resuming writes."
+        : `restore the backup explicitly with mv "${backupPath}" "${home}" if verification fails.`)
+  };
 }
 
 function blockedFromEngineReport(
@@ -826,6 +956,9 @@ async function defaultControllerStatus(
   }
   return {
     running: raw.running,
+    ...(raw.running
+      ? { identity: controllerIdentityFromStatus(raw) }
+      : {}),
     ...(isPositivePid(raw.pid) ? { pid: raw.pid } : {})
   };
 }
@@ -837,7 +970,11 @@ function controllerStatusFromRuntime(
   const runtime = inspectHomeRuntime(home);
   if (runtime.liveController === null) return { running: false };
   if (runtime.liveController.state === "live") {
-    return { running: true, pid: runtime.liveController.pid };
+    return {
+      running: true,
+      pid: runtime.liveController.pid,
+      identity: controllerIdentityFromStatus({})
+    };
   }
   throw new Error(
     `Controller runtime discovery could not be resolved: ${messageOf(cause)}`,
@@ -875,17 +1012,84 @@ function controllerLifecycleBlocker(
 async function restoreController(
   home: string,
   options: RunStorageUpgradeOptions<HomeSnapshot>,
-  cause: unknown
+  cause: unknown,
+  identity: ControllerLaunchIdentity | undefined
 ): Promise<void> {
-  const startController = options.startController
-    ?? ((h: string) => defaultStartController(h, options.controllerOptions));
+  const restore = options.restoreController
+    ?? (options.startController === undefined
+      ? ((h: string, i: ControllerLaunchIdentity) => defaultRestoreController(
+          h,
+          i,
+          options.controllerOptions
+        ))
+      : ((h: string, _i: ControllerLaunchIdentity) => options.startController!(h)));
+  if (identity === undefined) {
+    // Preserve the historical injected-test seam only when the caller supplied
+    // an explicit start function. Production/default paths never reach this
+    // branch: their authenticated status captures an identity, and their
+    // restore path refuses to invoke the staged/new ensure helper.
+    if (options.restoreController === undefined && options.startController !== undefined) {
+      try {
+        await options.startController(home);
+        return;
+      } catch (error) {
+        throw new Error(
+          `Storage upgrade failed and the previously running Controller could not be restored: `
+            + `${messageOf(error)}`,
+          { cause }
+        );
+      }
+    }
+    throw new Error(
+      "The previously running Controller identity was not captured; refusing to restore with a new executable.",
+      { cause }
+    );
+  }
   try {
-    await startController(home);
+    await restore(home, identity);
   } catch (error) {
     throw new Error(
       `Storage upgrade failed and the previously running Controller could not be restored: `
         + `${messageOf(error)}`,
       { cause }
+    );
+  }
+}
+
+function controllerIdentityFromStatus(raw: Record<string, unknown>): ControllerLaunchIdentity {
+  return {
+    executablePath: process.execPath,
+    args: [fileURLToPath(new URL("../../controller/controllerMain.js", import.meta.url))],
+    version: typeof raw.version === "string" && raw.version.length > 0
+      ? raw.version
+      : YUI_VERSION
+  };
+}
+
+/** Start the exact captured process command and require one matching status proof. */
+async function defaultRestoreController(
+  home: string,
+  identity: ControllerLaunchIdentity,
+  controllerOptions: FileControllerClientOptions | undefined
+): Promise<void> {
+  const environment = {
+    ...(controllerOptions?.environment ?? process.env),
+    YUI_HOME: home
+  };
+  const child = spawn(identity.executablePath, [...identity.args], {
+    env: environment,
+    detached: true,
+    stdio: "ignore"
+  });
+  child.unref();
+  const call = controllerOptions?.call ?? callController;
+  const status = await call(home, "controller.status", {});
+  if (!isRecord(status) || status.running !== true) {
+    throw new Error("Restored Controller did not report running:true.");
+  }
+  if (typeof status.version === "string" && status.version !== identity.version) {
+    throw new Error(
+      `Restored Controller version ${status.version} does not match ${identity.version}.`
     );
   }
 }

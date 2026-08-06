@@ -128,7 +128,7 @@ function scanFamily(
   }
 
   // Each endpoint is either a single record (it carries `schemaVersion`, e.g.
-  // tasks/*/task, tasks/*/brief) or a map of records (its values carry
+  // tasks/* (the StoredTask aggregate), tasks/*/task, tasks/*/brief) or a map of records (its values carry
   // `schemaVersion`, e.g. configuredAgents, tasks/*/workItems).
   let min = Number.POSITIVE_INFINITY;
   let max = Number.NEGATIVE_INFINITY;

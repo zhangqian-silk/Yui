@@ -254,3 +254,64 @@ test("ambiguous switch remains fail-closed and does not restore the old Controll
   assert.equal(result.stage, "switch-ambiguous");
   assert.deepEqual(events, ["status", "stop"]);
 });
+
+test("post-switch receipt failure is structured and never restores the old Controller", async () => {
+  const { home } = currentHome("yui-convergence-post-switch-");
+  const { latest, registry } = migratableSetup(home);
+  const events = [];
+  const result = await runStorageUpgrade({
+    home,
+    latest,
+    registry,
+    mode: "execute",
+    controllerStatus: async () => {
+      events.push("status");
+      return { running: true, pid: 123 };
+    },
+    stopController: async () => {
+      events.push("stop");
+      return { stopped: true, pid: 123 };
+    },
+    startController: async () => { events.push("restore-or-start"); },
+    postSwitchFaultHook: (step) => {
+      if (step === "receipt-write") throw new Error("receipt write injected");
+    }
+  });
+  assert.equal(result.outcome, "blocked");
+  assert.equal(result.stage, "post-verify");
+  assert.equal(result.switchCommitted, true);
+  assert.match(result.message, /receipt write injected/);
+  assert.match(result.action, /upgrade-receipt|upgrade-switch|backup/i);
+  assert.deepEqual(events, ["status", "stop"]);
+});
+
+test("post-switch receipt-clear failure retains commit guard and recovery evidence", async () => {
+  const { home } = currentHome("yui-convergence-receipt-clear-");
+  const { latest, registry } = migratableSetup(home);
+  const events = [];
+  const result = await runStorageUpgrade({
+    home,
+    latest,
+    registry,
+    mode: "execute",
+    controllerStatus: async () => {
+      events.push("status");
+      return { running: true, pid: 123 };
+    },
+    stopController: async () => {
+      events.push("stop");
+      return { stopped: true, pid: 123 };
+    },
+    startController: async () => { events.push("start"); },
+    postSwitchFaultHook: (step) => {
+      if (step === "receipt-clear") throw new Error("receipt clear injected");
+    }
+  });
+  assert.equal(result.outcome, "blocked");
+  assert.equal(result.stage, "post-verify");
+  assert.equal(result.switchCommitted, true);
+  assert.match(result.message, /receipt clear injected/);
+  assert.match(result.recoveryEvidence.receiptPath, /upgrade-receipt/);
+  assert.match(result.recoveryEvidence.progressPath, /upgrade-switch/);
+  assert.deepEqual(events, ["status", "stop", "start"]);
+});

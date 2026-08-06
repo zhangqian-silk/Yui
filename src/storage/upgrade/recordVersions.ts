@@ -19,6 +19,7 @@ import {
   CURRENT_AGGREGATE_SCHEMA_VERSION,
   CURRENT_STORAGE_LAYOUT_VERSION
 } from "../storageSchema.js";
+import { CURRENT_STORED_TASK_SCHEMA_VERSION } from "../taskStore.js";
 import type { RecordAxisEntry, StorageVersionState } from "../migration/index.js";
 
 /**
@@ -34,6 +35,14 @@ const CURRENT_RECORD_VERSIONS: Readonly<Record<string, RecordAxisEntry>> = Objec
   agentProfile: { version: 2, path: "state.json#/agentProfiles" },
   globalRole: { version: 3, path: "state.json#/globalRoles" },
   globalRoleSessionSet: { version: 3, path: "state.json#/globalRoleSessionSets" },
+  // The task aggregate is itself a versioned record family. Keep this family
+  // alongside (and distinct from) the nested `task` record family: an older
+  // aggregate wrapper must be classified on the record axis before the strict
+  // loader is asked to parse its nested members.
+  storedTask: {
+    version: CURRENT_STORED_TASK_SCHEMA_VERSION,
+    path: "state.json#/tasks/*"
+  },
   task: { version: 3, path: "state.json#/tasks/*/task" },
   taskBrief: { version: 2, path: "state.json#/tasks/*/brief" },
   taskRole: { version: 3, path: "state.json#/tasks/*/roles" },

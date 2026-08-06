@@ -37,6 +37,7 @@ import {
 } from "../dist/storage/upgrade/upgradeReceipt.js";
 import { runUpdate } from "../dist/cli/updateOrchestrator.js";
 import { createUpdatePorts } from "../dist/cli/updatePorts.js";
+import { createTask } from "../dist/task/task.js";
 
 // ---------------------------------------------------------------------------
 // Shared isolation helpers — every fixture Home MUST live under the OS temp dir.
@@ -202,7 +203,7 @@ test("P1-1 map completeness: current persisted workspace family is ManagedWorksp
       "agentProfile", "agentRun", "changeSet", "configuredAgent", "decision",
       "event", "globalRole", "globalRoleSessionSet", "inputRequest",
       "integrationAttempt", "managedWorkspace", "message", "milestone",
-      "project", "reviewRound", "task", "taskBrief", "taskRole",
+      "project", "reviewRound", "storedTask", "task", "taskBrief", "taskRole",
       "taskRoleSessionSet", "workItem", "workMailbox"
     ].sort()
   );
@@ -213,6 +214,95 @@ test("P1-1 map completeness: current persisted workspace family is ManagedWorksp
   assert.equal("roleWorkspace" in versions, false);
 });
 
+test("P1-1 aggregate family: StoredTask 14->13 is a record missing-step, not corruption", () => {
+  const { home } = currentHome();
+  const store = new FileTaskStore(home);
+  store.saveTask(createTask("task-1", "Aggregate scan", new Date("2026-08-07T00:00:00.000Z")));
+  editState(home, (state) => {
+    state.tasks["task-1"].schemaVersion = 13;
+  });
+
+  const scan = scanSourceRecordVersions(home, currentRecordVersions());
+  assert.ok("record" in scan);
+  assert.equal(scan.record.storedTask.version, 13);
+  assert.equal(scan.record.task.version, 3, "nested task family remains independently scanned");
+
+  const result = classifyHome({ home, registry: EMPTY(), latest: LATEST() });
+  assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");
+  assert.equal(result.classification.blocker.reason, "missing-step");
+  assert.equal(result.classification.blocker.axis, "record");
+  assert.equal(result.classification.blocker.recordKind, "storedTask");
+  assert.equal(result.classification.blocker.from, 13);
+  assert.equal(result.classification.blocker.to, 14);
+});
+
+// ===========================================================================
+// P1-2/P1-3 — binary-only update owns the same deterministic Controller
+// lifecycle as Home upgrade, and restores the exact pre-update identity.
+// ===========================================================================
+
+function binaryOnlyPorts(events, overrides = {}) {
+  const identity = {
+    executablePath: "/old/node",
+    args: ["/old/controllerMain.js"],
+    version: "8.8.8"
+  };
+  return {
+    stage: () => { events.push("stage"); return { binaryPath: "/staged/yui", version: "9.9.9" }; },
+    preflight: () => { events.push("preflight"); return { status: "already-current" }; },
+    activateStorage: () => { events.push("activate-storage"); return { status: "already-current" }; },
+    activateBinary: () => { events.push("activate-binary"); },
+    verify: () => { events.push("verify"); },
+    cleanup: () => { events.push("cleanup"); },
+    controllerStatus: () => { events.push("status"); return { running: true, identity }; },
+    stopController: () => { events.push("stop"); return { stopped: true, pid: 41 }; },
+    startController: () => { events.push("start"); },
+    restoreController: (_home, captured) => {
+      events.push("restore");
+      assert.deepEqual(captured, identity);
+    },
+    ...overrides
+  };
+}
+
+test("binary-only update stops once and starts replacement after verify", () => {
+  const events = [];
+  const result = runUpdate(binaryOnlyPorts(events), { home: "/unused" });
+  assert.equal(result.outcome, "updated");
+  assert.deepEqual(events, [
+    "stage", "preflight", "status", "stop", "activate-binary", "verify", "start", "cleanup"
+  ]);
+});
+
+test("binary-only activation failure restores the exact old Controller identity", () => {
+  const events = [];
+  const result = runUpdate(binaryOnlyPorts(events, {
+    activateBinary: () => {
+      events.push("activate-binary");
+      throw new Error("binary switch blocked");
+    }
+  }), { home: "/unused" });
+  assert.equal(result.outcome, "aborted");
+  assert.equal(result.phase, "activate-binary");
+  assert.deepEqual(events, [
+    "stage", "preflight", "status", "stop", "activate-binary", "restore", "cleanup"
+  ]);
+});
+
+test("binary-only stop failure is structured with no retry, activation, or restore", () => {
+  const events = [];
+  const result = runUpdate(binaryOnlyPorts(events, {
+    stopController: () => {
+      events.push("stop");
+      throw new Error("shutdown timeout");
+    }
+  }), { home: "/unused" });
+  assert.equal(result.outcome, "aborted");
+  assert.equal(result.phase, "preflight");
+  assert.match(result.message, /shutdown timeout/);
+  assert.deepEqual(events, ["stage", "preflight", "status", "stop", "cleanup"]);
+});
+
 test("P1-1 managed workspace record-only mismatch is NEEDS_NEW_VERSION/missing-step", () => {
   const { home } = currentHome();
   editState(home, (state) => {
@@ -220,6 +310,7 @@ test("P1-1 managed workspace record-only mismatch is NEEDS_NEW_VERSION/missing-s
     // the strict aggregate loader must not run while this record axis is old.
     state.tasks = {
       "task-1": {
+        schemaVersion: 14,
         managedWorkspaces: {
           "task": { schemaVersion: 1 }
         }
