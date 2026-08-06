@@ -198,6 +198,60 @@ test("Task Role reset fails exact work and forgets only the current native gener
   }), "obsolete");
 });
 
+test("public Task Role reset retires an exact opaque launch and permits the next generation", (t) => {
+  const { store, task, agent } = fixture(t, { adapterId: "codex" });
+  const run = prepareRun(store, {
+    adapterId: "codex",
+    agentId: agent.id,
+    nativeSessionId: "native-opaque-old",
+    launchId: "launch-opaque-old"
+  });
+
+  store.transaction((tx) => {
+    const sessions = tx.getTaskRoleSessionSet(task.id, run.roleName);
+    assert.notEqual(sessions, null);
+    delete sessions.sessions[sessions.activeAgentId].nativeSessionId;
+    tx.saveTaskRoleSessionSet(sessions);
+  });
+
+  const result = runTaskCommand([
+    "role", "reset", task.id, run.roleName,
+    "--reason", "Retire the exact opaque generation."
+  ], store, leaderOptions);
+
+  assert.equal(result.kind, "output");
+  assert.equal(store.getAgentRun(task.id, run.id).status, "failed");
+  assert.equal(store.getActiveAgentRun(task.id, run.roleName), null);
+  const sessions = store.getTaskRoleSessionSet(task.id, run.roleName);
+  assert.deepEqual(sessions.sessions, {});
+  assert.equal(sessions.history.length, 1);
+  assert.equal("nativeSessionId" in sessions.history[0], false);
+  const resetEvent = store.listEvents(task.id).find(
+    (event) => event.type === "runtime.role-session-reset"
+  );
+  assert.notEqual(resetEvent, undefined);
+  assert.equal("nativeSessionId" in resetEvent.payload, false);
+  assert.equal(resetEvent.payload.runId, run.id);
+  assert.equal(resetEvent.payload.roleName, run.roleName);
+
+  store.transaction((tx) => {
+    let next = tx.getTaskRoleSessionSet(task.id, run.roleName);
+    next = recordRoleAgentSession(next, {
+      agentId: agent.id,
+      adapterId: agent.adapterId,
+      nativeSessionId: "native-opaque-next",
+      launchId: "launch-opaque-next",
+      policy: "fixed",
+      status: "ready"
+    }, THIRD);
+    tx.saveTaskRoleSessionSet(next);
+  });
+  assert.equal(
+    store.getTaskRoleSessionSet(task.id, run.roleName).sessions[agent.id].nativeSessionId,
+    "native-opaque-next"
+  );
+});
+
 test("the shared exact-Run terminal boundary does not infer runtime cleanup", (t) => {
   const { store } = fixture(t, { adapterId: "codex" });
   const run = prepareRun(store, {
