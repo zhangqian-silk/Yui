@@ -5,6 +5,8 @@ import {
   evaluateRoleRunStall,
   isRoleRunStalled,
   latestDurableProgressAt,
+  latestRunProgressAt,
+  projectRoleRunHealth,
   reconcileStalledRoleRuns
 } from "../../dist/scheduler/roleRunStall.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
@@ -46,6 +48,80 @@ test("stall evaluation treats checkpoints as progress but ignores bookkeeping ti
   );
 });
 
+test("late stale progress events cannot move the durable progress fence backwards", () => {
+  const events = [
+    createTaskEvent(
+      "event-1",
+      "task-1",
+      "run.progress",
+      { runId: "run-1", progressAt: "2026-08-05T00:30:00.000Z" },
+      new Date("2026-08-05T00:30:00.000Z")
+    ),
+    createTaskEvent(
+      "event-2",
+      "task-1",
+      "run.progress",
+      { runId: "run-1", progressAt: "2026-08-05T00:10:00.000Z" },
+      new Date("2026-08-05T00:40:00.000Z")
+    )
+  ];
+  assert.equal(
+    latestRunProgressAt(events, "run-1"),
+    "2026-08-05T00:30:00.000Z"
+  );
+});
+
+test("one health projection keeps live resource activity advisory and does not advance the clock", () => {
+  const projection = projectRoleRunHealth({
+    progressAt: PROGRESS,
+    createdAt: PROGRESS,
+    deliveredAt: PROGRESS,
+    now: NOW,
+    hostLiveness: "present",
+    nativeSession: {
+      status: "running",
+      nativeSessionId: "native-1"
+    },
+    providerAcceptance: "accepted",
+    resource: {
+      observedAt: "2026-08-05T00:59:30.000Z",
+      active: true,
+      changed: true,
+      cpuTimeMs: 10,
+      rssBytes: 1024
+    },
+    roleName: "worker"
+  });
+
+  assert.equal(projection.candidate, true);
+  assert.equal(projection.resourceActivity, true);
+  assert.equal(projection.stalled, false);
+  assert.equal(projection.progressAt, PROGRESS);
+  assert.equal(projection.idleMs, 60 * 60_000);
+});
+
+test("resource activity cannot make an unknown host or native Session healthy", () => {
+  const projection = projectRoleRunHealth({
+    progressAt: PROGRESS,
+    createdAt: PROGRESS,
+    deliveredAt: PROGRESS,
+    now: NOW,
+    hostLiveness: "unknown",
+    nativeSession: null,
+    providerAcceptance: "accepted",
+    resource: {
+      observedAt: "2026-08-05T00:59:30.000Z",
+      active: true,
+      changed: true
+    },
+    roleName: "worker"
+  });
+
+  assert.equal(projection.resourceActivity, false);
+  assert.equal(projection.stalled, false);
+  assert.equal(projection.nativeSession, "missing");
+});
+
 test("an accepted live Run younger than ten minutes is not a stall candidate", async () => {
   const deliveredAt = new Date(NOW.getTime() - 5 * 60_000).toISOString();
   const store = stallStore({ createdAt: deliveredAt, deliveredAt });
@@ -82,6 +158,30 @@ test("an accepted Run past the candidate filter with recent progress is not stal
   );
   assert.deepEqual(result, []);
   assert.equal(inspections, 1);
+  assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 0);
+});
+
+test("one scheduler resource sample suppresses an execution false positive without clearing attention", async () => {
+  const store = stallStore();
+  const resourceEvidence = new Map([
+    ["task-1\0worker\0run-1", {
+      observedAt: "2026-08-05T00:59:30.000Z",
+      active: true,
+      changed: true,
+      cpuTimeMs: 20,
+      rssBytes: 4096
+    }]
+  ]);
+  const result = await reconcileStalledRoleRuns(
+    store,
+    { async inspectRole() { return "present"; } },
+    NOW,
+    undefined,
+    30 * 60_000,
+    undefined,
+    resourceEvidence
+  );
+  assert.deepEqual(result, []);
   assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 0);
 });
 
@@ -206,6 +306,10 @@ function stallStore(options = {}) {
     input: "work",
     purpose: "execution",
     status: "active",
+    effective: {
+      agentId: role.activeAgentId,
+      adapterId: role.adapterId
+    },
     ...(deliveredAt === undefined ? {} : { deliveredAt }),
     createdAt,
     updatedAt: createdAt,
@@ -230,7 +334,11 @@ function stallStore(options = {}) {
     roleName: "worker",
     deliveredAt: "2026-08-05T00:40:00.000Z",
     createdAt: "2026-08-05T00:40:00.000Z",
-    updatedAt: "2026-08-05T00:40:00.000Z"
+    updatedAt: "2026-08-05T00:40:00.000Z",
+    effective: {
+      agentId: downstreamRole.activeAgentId,
+      adapterId: downstreamRole.adapterId
+    }
   };
   const store = {
     tasks: [task],

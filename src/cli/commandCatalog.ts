@@ -487,10 +487,16 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "run",
     summary: "Inspect and control Task Role Agent Runs.",
-    sections: [{ id: "manage", title: "Commands", entries: ["list", "retry", "yield", "checkpoint"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["list", "retry", "recover", "yield", "checkpoint"] }],
     children: [
       { name: "list", summary: "List Runs for a work item.", usage: "yui task run list <task>/<work>" },
       { name: "retry", summary: "Retry a failed Run.", usage: "yui task run retry <task>/<run>" },
+      {
+        name: "recover",
+        summary: "Record one exact Leader-controlled Run recovery decision.",
+        usage: "yui task run recover <task>/<run> --action <diagnose|retry|replace-session|terminate> --expected-progress-at <timestamp> --provider-acceptance <accepted|rejected|ambiguous> --reason <text>",
+        options: ["--action", "--expected-progress-at", "--provider-acceptance", "--reason", "--role", "--agent-id", "--adapter-id", "--native-session-id", "--launch-id"]
+      },
       {
         name: "yield",
         summary: "Complete an active Run and wake the Leader.",

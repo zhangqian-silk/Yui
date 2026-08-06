@@ -62,10 +62,8 @@ import {
 import { pendingWakeupsMatch } from "../scheduler/pendingWakeup.js";
 import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
 import {
-  latestDurableProgressAt,
-  latestRunActivityAt,
+  latestRunDurableProgressAt,
   latestRunEventTime,
-  latestRunProgressAt,
   latestStallEvidenceKey,
   isRoleRunStalled,
   clearMatchingLeaderStallAttention,
@@ -206,59 +204,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string,
     runId: string
   ): SchedulerRunProgress | null {
-    const run = this.store.getActiveAgentRun(taskId, roleName);
-    if (run === null || run.id !== runId) return null;
-    const events = this.store.listEvents(taskId);
-    const latestCheckpointAt = latestRunProgressAt(events, run.id);
-    const workItem = run.workItemId === undefined
-      ? null
-      : this.store.getWorkItem(taskId, run.workItemId);
-    const reviewRounds = run.workItemId === undefined
-      ? []
-      : this.store.listReviewRounds(taskId).filter(({ workItemId }) => workItemId === run.workItemId);
-    const changeSets = run.workItemId === undefined
-      ? []
-      : this.store.listChangeSets(taskId).filter(({ workItemId }) => workItemId === run.workItemId);
-    const integrationChangeSetIds = new Set(changeSets.map(({ id }) => id));
-    const integrations = this.store.listIntegrationAttempts(taskId).filter((attempt) => (
-      attempt.changeSetIds.some((id) => integrationChangeSetIds.has(id))
-    ));
-    const inputProgress = this.store.listInputRequests(taskId)
-      .filter((request) => (
-        request.requester.runId === run.id
-        || request.blockedRefs.some((ref) => ref.type === "run" && ref.id === run.id)
-      ));
-    const latestActivityAt = latestRunActivityAt(events, run.id);
-    const progressAt = run.deliveredAt === undefined
-      ? run.createdAt
-      : latestDurableProgressAt({
-          deliveredAt: run.deliveredAt,
-          latestCheckpointAt,
-          latestActivityAt
-        });
-    const relatedUpdatedAt = [
-      workItem?.updatedAt,
-      ...reviewRounds.map(({ endedAt, createdAt }) => endedAt ?? createdAt),
-      ...changeSets.map(({ createdAt }) => createdAt),
-      ...integrations.map(({ updatedAt }) => updatedAt),
-      ...inputProgress.map(({ updatedAt }) => updatedAt),
-      ...(workItem?.candidates ?? []).map(({ createdAt }) => createdAt)
-    ].filter((value): value is string => (
-      typeof value === "string" && Number.isFinite(Date.parse(value))
-    ));
-    const latestRelatedAt = relatedUpdatedAt.reduce<string | undefined>(
-      (latest, value) => latest === undefined || Date.parse(value) > Date.parse(latest) ? value : latest,
-      undefined
-    );
-    const finalProgressAt = run.deliveredAt === undefined
-      ? run.createdAt
-      : latestRelatedAt === undefined
-        ? progressAt
-        : Date.parse(latestRelatedAt) > Date.parse(progressAt) ? latestRelatedAt : progressAt;
-    return {
-      progressAt: finalProgressAt,
-      ...(latestRelatedAt === undefined ? {} : { evidence: "work-review-integration" })
-    };
+    return latestRunDurableProgressAt(this.store, taskId, roleName, runId);
   }
 
   recordRoleRunStall(
@@ -330,12 +276,25 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         || run.status !== "active"
       ) return "state-changed";
       const events = store.listEvents(task.id);
+      const previousStall = latestStallEvidenceKey(events, run.id);
+      // A progress fact can close only the matching, older stall episode. A
+      // stale/native observation must never clear a newer attention point.
+      if (
+        previousStall !== undefined
+        && Date.parse(input.progressAt) <= Date.parse(previousStall.progressAt)
+      ) {
+        return "already-recorded";
+      }
       const existing = events.some((event) => (
         event.type === RUN_PROGRESS_EVENT
         && event.payload.runId === run.id
         && (
           event.payload.progressAt === input.progressAt
-          || Date.parse(event.createdAt) >= Date.parse(input.progressAt)
+          || (
+            typeof event.payload.progressAt === "string"
+            && Number.isFinite(Date.parse(event.payload.progressAt))
+            && Date.parse(event.payload.progressAt) >= Date.parse(input.progressAt)
+          )
         )
       ));
       const stalledAt = latestRunEventTime(events, RUN_STALLED_EVENT, run.id);
@@ -2825,6 +2784,7 @@ function mapSession(session: RoleAgentSession): SchedulerRoleSession {
     agentId: session.agentId,
     adapterId: session.adapterId,
     nativeSessionId: session.nativeSessionId,
+    ...(session.launchId === undefined ? {} : { launchId: session.launchId }),
     status: session.status,
     effective: session.effective,
     updatedAt: session.updatedAt
