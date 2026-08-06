@@ -5,13 +5,16 @@ export const DASHBOARD_HTML = `<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
   <meta name="yui-web-token" content="__YUI_WEB_TOKEN__">
+  <link rel="icon" href="data:,">
   <title>Yui Control Room</title>
   <link rel="preload" href="/assets/fonts/inter-500.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="preload" href="/assets/fonts/inter-600.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/assets/css/fonts.css">
   <link rel="stylesheet" href="/assets/css/tokens.css">
   <link rel="stylesheet" href="/assets/css/layout.css">
-  <link rel="stylesheet" href="/assets/css/components.css">
+  <link rel="stylesheet" href="/assets/css/widgets.css">
+  <link rel="stylesheet" href="/assets/css/cards.css">
+  <link rel="stylesheet" href="/assets/css/markdown.css">
   <link rel="stylesheet" href="/assets/css/responsive.css">
   <link rel="stylesheet" href="/assets/vendor/xterm.css">
 </head>
@@ -81,6 +84,7 @@ export const DASHBOARD_HTML = `<!doctype html>
         <button class="tab" type="button" data-target="detail-focus" data-i18n="tabs.focus">Focus</button>
         <button class="tab" type="button" data-target="detail-work" data-i18n="tabs.work">Work items</button>
         <button class="tab" type="button" data-target="detail-exec" data-i18n="tabs.exec">Runs</button>
+        <button class="tab" type="button" data-target="detail-reviews" data-i18n="tabs.reviews">Reviews</button>
         <button class="tab" type="button" data-target="detail-roles" data-i18n="tabs.roles">Roles</button>
         <button class="tab" type="button" data-target="detail-history" data-i18n="tabs.history">History</button>
         <button class="tab" type="button" data-target="detail-messages" data-i18n="tabs.messages">Messages</button>

@@ -567,10 +567,16 @@ test("web shell composes modular i18n, theme, layout, and client assets", async 
       ["/assets/css/tokens.css", "text/css"],
       ["/assets/css/fonts.css", "text/css"],
       ["/assets/css/layout.css", "text/css"],
-      ["/assets/css/components.css", "text/css"],
+      ["/assets/css/widgets.css", "text/css"],
+      ["/assets/css/cards.css", "text/css"],
+      ["/assets/css/markdown.css", "text/css"],
       ["/assets/css/responsive.css", "text/css"],
+      ["/assets/js/dom.js", "text/javascript"],
+      ["/assets/js/format.js", "text/javascript"],
       ["/assets/js/i18n.js", "text/javascript"],
+      ["/assets/js/markdown.js", "text/javascript"],
       ["/assets/js/theme.js", "text/javascript"],
+      ["/assets/js/components.js", "text/javascript"],
       ["/assets/js/view.js", "text/javascript"],
       ["/assets/app.js", "text/javascript"],
       ["/assets/vendor/xterm.mjs", "text/javascript"],
@@ -593,6 +599,10 @@ test("web shell composes modular i18n, theme, layout, and client assets", async 
 
     const scripts = [
       ["/assets/app.js", "app.mjs"],
+      ["/assets/js/dom.js", "dom.mjs"],
+      ["/assets/js/format.js", "format.mjs"],
+      ["/assets/js/markdown.js", "markdown.mjs"],
+      ["/assets/js/components.js", "components.mjs"],
       ["/assets/js/view.js", "view.mjs"]
     ];
     const directory = mkdtempSync(join(tmpdir(), "yui-web-syntax-"));
@@ -630,6 +640,7 @@ test("redesigned web shell exposes importance-ordered nav and a registered theme
       "detail-focus",
       "detail-work",
       "detail-exec",
+      "detail-reviews",
       "detail-roles",
       "detail-history",
       "detail-messages"
