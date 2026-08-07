@@ -37,27 +37,32 @@ export function runUpdateCommand(
 
 /** Render an {@link UpdateResult} as concise, CLI-style text. */
 export function renderUpdateResult(result: UpdateResult): string {
-  switch (result.outcome) {
-    case "already-current":
-      return "Yui is already up to date; nothing to install.";
-    case "updated":
-      return result.storageBackupPath === undefined
-        ? `Updated Yui to ${result.version}.`
-        : `Updated Yui to ${result.version}. Storage was migrated; original Home backed up at `
-          + `${result.storageBackupPath}.`;
-    case "aborted":
-      return [
-        `Update aborted during ${result.phase}: ${result.message}`,
-        result.recoverable
-          ? "The current install and Home remain usable."
-          : "Manual recovery is required (see below).",
-        `Action: ${result.action}`
-      ].join("\n");
-    case "ambiguous":
-      return [
-        `Update result is UNKNOWN after ${result.phase}: ${result.message}`,
-        "Manual verification is required — do NOT assume the update succeeded or was a no-op.",
-        `Action: ${result.action}`
-      ].join("\n");
-  }
+  const rendered = (() => {
+    switch (result.outcome) {
+      case "already-current":
+        return "Yui is already up to date; nothing to install.";
+      case "updated":
+        return result.storageBackupPath === undefined
+          ? `Updated Yui to ${result.version}.`
+          : `Updated Yui to ${result.version}. Storage was migrated; original Home backed up at `
+            + `${result.storageBackupPath}.`;
+      case "aborted":
+        return [
+          `Update aborted during ${result.phase}: ${result.message}`,
+          result.recoverable
+            ? "The current install and Home remain usable."
+            : "Manual recovery is required (see below).",
+          `Action: ${result.action}`
+        ].join("\n");
+      case "ambiguous":
+        return [
+          `Update result is UNKNOWN after ${result.phase}: ${result.message}`,
+          "Manual verification is required — do NOT assume the update succeeded or was a no-op.",
+          `Action: ${result.action}`
+        ].join("\n");
+    }
+  })();
+  return result.cleanupWarning === undefined
+    ? rendered
+    : `${rendered}\nWarning: ${result.cleanupWarning}`;
 }

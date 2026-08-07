@@ -38,7 +38,10 @@ export type UpgradeCommandResult = Readonly<{
 export async function runUpgradeCommand(
   args: readonly string[],
   home: string,
-  options: Readonly<{ now?: () => Date }> = {}
+  options: Readonly<{
+    now?: () => Date;
+    controllerLifecycle?: "owned" | "externally-quiesced";
+  }> = {}
 ): Promise<UpgradeCommandResult> {
   const mode = parseUpgradeArgs(args);
   const result = await runStorageUpgrade({
@@ -46,6 +49,9 @@ export async function runUpgradeCommand(
     registry: createEmptyRegistry<HomeSnapshot>(),
     latest: latestStorageVersionState(),
     mode,
+    ...(options.controllerLifecycle === undefined
+      ? {}
+      : { controllerLifecycle: options.controllerLifecycle }),
     ...(options.now === undefined ? {} : { now: options.now })
   });
   return {

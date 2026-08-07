@@ -126,6 +126,15 @@ test("R4-F1 end-to-end: runUpdate on a null-activation child resolves ambiguous 
   const spawn = (command, args) => {
     if (command === "npm" && args[0] === "prefix") return rawOut("");
     if (command === "npm" && args[0] === "install") return spawnResult({});
+    if (args.includes("controller") && args.includes("status")) {
+      return okData({ resources: [], warnings: [] });
+    }
+    if (args.includes("controller") && args.includes("identity")) {
+      return spawnResult({
+        status: 5,
+        stderr: Buffer.from(JSON.stringify({ ok: false, code: "CONTROLLER_NOT_RUNNING" }))
+      });
+    }
     if (args.includes("version")) return okData({ version: "9.9.9" });
     if (args.includes("upgrade") && args.includes("--dry-run")) return okData({ outcome: "dry-run", report: { steps: [{}] } });
     if (args.includes("upgrade")) return rawOut("null", 0); // activation prints null

@@ -134,6 +134,13 @@ export type RunStorageUpgradeOptions<Snapshot> = Readonly<{
   registry: MigrationRegistry<Snapshot>;
   latest: StorageVersionState;
   mode: "dry-run" | "execute";
+  /**
+   * The normal upgrade owns Controller capture/stop/start. The update parent
+   * may instead externally quiesce the Home and ask this staged child to run
+   * storage migration only; in that mode no Controller lifecycle probe or start
+   * is performed from the temporary installation.
+   */
+  controllerLifecycle?: "owned" | "externally-quiesced";
   now?: () => Date;
   callerPid?: number;
   /** Overrides for the Controller stop/drain client (tests inject fakes). */
@@ -330,12 +337,32 @@ async function execute(
 
   // 3) Admission fence — from here, new baseline CLI and Controller writers are
   // refused at the storage commit choke point. The fencing process is exempt.
-  const releaseFence = placeUpgradeFence(home, {
-    reason: "storage upgrade in progress",
-    createdAt: now().toISOString(),
-    ownerPid: callerPid
-  });
+  // A live foreign fence is expected coordination contention, not a generic
+  // runtime failure. Return a structured blocker without removing or retrying
+  // the other upgrader's fence.
+  let releaseFence: (() => void) | undefined;
+  try {
+    releaseFence = placeUpgradeFence(home, {
+      reason: "storage upgrade in progress",
+      createdAt: now().toISOString(),
+      ownerPid: callerPid
+    });
+  } catch (error) {
+    if (!(error instanceof UpgradeFenceError)) throw error;
+    return withClassification(
+      {
+        outcome: "blocked",
+        stage: "coordination",
+        message: `Upgrade coordination could not be acquired: ${error.message}`,
+        action:
+          "Another upgrade is already coordinating this Home. Wait for it to finish, then retry; "
+          + "do not remove its live fence or retry blindly."
+      },
+      classification
+    );
+  }
 
+  const externallyQuiesced = options.controllerLifecycle === "externally-quiesced";
   let controllerWasRunning = false;
   let controllerStopConfirmed = false;
   let controllerIdentity: ControllerLaunchIdentity | undefined;
@@ -343,74 +370,80 @@ async function execute(
   let unexpected: unknown;
   const switchState: SwitchCommitState = { committed: false };
   try {
-    // Record the lifecycle fact before stopping anything. An unavailable or
-    // malformed status is unknown, not "stopped"; fail closed without attempting
-    // a blind stop/retry.
-    const controllerStatus = options.controllerStatus
-      ?? ((h: string) => defaultControllerStatus(h, options.controllerOptions));
-    let status: ControllerLifecycleStatus | undefined;
-    try {
-      status = await controllerStatus(home);
-    } catch (error) {
-      result = withClassification(
-        controllerLifecycleBlocker(
-          "Controller status could not be verified",
-          error
-        ),
-        classification
-      );
-    }
-    if (result === undefined && !isControllerLifecycleStatus(status)) {
-      result = withClassification(
-        controllerLifecycleBlocker(
-          "Controller status was malformed",
-          new Error("expected a boolean running field")
-        ),
-        classification
-      );
-    }
-    if (result === undefined && status!.running && !isControllerLaunchIdentity(status!.identity)) {
-      result = withClassification(
-        controllerLifecycleBlocker(
-          "Controller launch identity could not be authenticated",
-          new Error("executable/argv/version identity is unavailable")
-        ),
-        classification
-      );
-    }
-    if (result === undefined) {
-      controllerWasRunning = status!.running;
-      controllerIdentity = status!.running ? status!.identity : undefined;
-      controllerStopConfirmed = !controllerWasRunning;
-    }
-
-    // 4) Quiesce — drain the Controller with the public stop, then require that
-    // no foreign writer, no live Controller, and no unfinished runtime lifecycle
-    // remain. Any unclear signal fails closed with the source unchanged. A stop
-    // request is issued at most once; timeout/rejection is a structured blocker,
-    // never a retry loop.
-    const stopController = options.stopController
-      ?? ((h: string) => defaultStopController(h, options.controllerOptions));
-    if (result === undefined && controllerWasRunning) {
+    if (!externallyQuiesced) {
+      // Record the lifecycle fact before stopping anything. An unavailable or
+      // malformed status is unknown, not "stopped"; fail closed without attempting
+      // a blind stop/retry.
+      const controllerStatus = options.controllerStatus
+        ?? ((h: string) => defaultControllerStatus(h, options.controllerOptions));
+      let status: ControllerLifecycleStatus | undefined;
       try {
-        const stopped = await stopController(home);
-        if (!confirmedControllerStopped(stopped)) {
-          result = withClassification(
-            controllerLifecycleBlocker(
-              "Controller stop did not confirm a drained process",
-              new Error("stop returned without stopped:true")
-            ),
-            classification
-          );
-        } else {
-          controllerStopConfirmed = true;
-        }
+        status = await controllerStatus(home);
       } catch (error) {
         result = withClassification(
-          controllerLifecycleBlocker("Controller stop/drain failed", error),
+          controllerLifecycleBlocker(
+            "Controller status could not be verified",
+            error
+          ),
           classification
         );
       }
+      if (result === undefined && !isControllerLifecycleStatus(status)) {
+        result = withClassification(
+          controllerLifecycleBlocker(
+            "Controller status was malformed",
+            new Error("expected a boolean running field")
+          ),
+          classification
+        );
+      }
+      if (result === undefined && status!.running && !isControllerLaunchIdentity(status!.identity)) {
+        result = withClassification(
+          controllerLifecycleBlocker(
+            "Controller launch identity could not be authenticated",
+            new Error("executable/argv/version identity is unavailable")
+          ),
+          classification
+        );
+      }
+      if (result === undefined) {
+        controllerWasRunning = status!.running;
+        controllerIdentity = status!.running ? status!.identity : undefined;
+        controllerStopConfirmed = !controllerWasRunning;
+      }
+
+      // 4) Quiesce — drain the Controller with the public stop, then require that
+      // no foreign writer, no live Controller, and no unfinished runtime lifecycle
+      // remain. Any unclear signal fails closed with the source unchanged. A stop
+      // request is issued at most once; timeout/rejection is a structured blocker,
+      // never a retry loop.
+      const stopController = options.stopController
+        ?? ((h: string) => defaultStopController(h, options.controllerOptions));
+      if (result === undefined && controllerWasRunning) {
+        try {
+          const stopped = await stopController(home);
+          if (!confirmedControllerStopped(stopped)) {
+            result = withClassification(
+              controllerLifecycleBlocker(
+                "Controller stop did not confirm a drained process",
+                new Error("stop returned without stopped:true")
+              ),
+              classification
+            );
+          } else {
+            controllerStopConfirmed = true;
+          }
+        } catch (error) {
+          result = withClassification(
+            controllerLifecycleBlocker("Controller stop/drain failed", error),
+            classification
+          );
+        }
+      }
+    } else {
+      // The parent update already captured and drained the old Controller. This
+      // staged child must not inspect or start one from its temporary install.
+      controllerStopConfirmed = true;
     }
 
     if (result === undefined) {
@@ -432,7 +465,7 @@ async function execute(
     }
   } finally {
     try {
-      releaseFence();
+      releaseFence!();
     } catch (error) {
       if (switchState.committed && result === undefined) {
         result = withClassification(
@@ -465,10 +498,10 @@ async function execute(
     throw new Error("Storage upgrade did not produce a result.");
   }
 
-  const startController = options.startController
-    ?? ((h: string) => defaultStartController(h, options.controllerOptions));
   if (result.outcome === "upgraded") {
-    if (controllerWasRunning) {
+    const startController = options.startController
+      ?? ((h: string) => defaultStartController(h, options.controllerOptions));
+    if (!externallyQuiesced && controllerWasRunning) {
       try {
         // New Controller startup is deliberately after switch + post-verify.
         await startController(home);
@@ -505,6 +538,8 @@ async function execute(
   }
 
   if (
+    !externallyQuiesced
+    &&
     controllerWasRunning
     && controllerStopConfirmed
     && result.outcome === "blocked"

@@ -37,6 +37,8 @@
  * hidden behind a false atomicity claim.
  */
 
+import { isAbsolute } from "node:path";
+
 import { switchProgressPath } from "../storage/upgrade/switchProgress.js";
 import { upgradeReceiptPath } from "../storage/upgrade/upgradeReceipt.js";
 
@@ -147,7 +149,7 @@ export type UpdatePorts = Readonly<{
   /** Best-effort staging cleanup. */
   cleanup: (staged: StagedPackage) => void;
   /**
-   * Optional Controller lifecycle owner for binary-only/already-current updates.
+   * Optional Controller lifecycle owner for the parent update orchestration.
    * When any lifecycle seam is supplied, all four seams are required so a
    * failed pre-switch update never falls back to a staged/new Controller.
    */
@@ -161,42 +163,48 @@ export type UpdatePorts = Readonly<{
 
 /** The structured outcome of an update attempt. */
 export type UpdateResult = Readonly<
-  | { outcome: "already-current"; version: string }
-  | { outcome: "updated"; version: string; storageBackupPath?: string }
-  | {
-      outcome: "aborted";
-      phase: UpdatePhase;
-      message: string;
-      action: string;
-      /** True while the old binary and Home are provably still intact. */
-      recoverable: boolean;
-      version?: string;
-      storageBackupPath?: string;
-    }
-  /**
-   * The storage activation's outcome could not be determined: the switch may or
-   * may not have committed. This is NEITHER a clean recovery NOR a completed
-   * update — it demands manual verification. Carries the best available evidence
-   * (receipt/backup/schema) and the precise steps to resolve it (P1-2).
-   */
-  | {
-      outcome: "ambiguous";
-      phase: UpdatePhase;
-      message: string;
-      action: string;
-      version?: string;
-      storageBackupPath?: string;
-      /** Whether the on-disk Home is now at the current, loadable schema. */
-      schemaCurrent: boolean;
-      /** Whether a durable completion receipt was found. */
-      switched: boolean;
-    }
+  (
+    | { outcome: "already-current"; version: string }
+    | { outcome: "updated"; version: string; storageBackupPath?: string }
+    | {
+        outcome: "aborted";
+        phase: UpdatePhase;
+        message: string;
+        action: string;
+        /** True while the old binary and Home are provably still intact. */
+        recoverable: boolean;
+        version?: string;
+        storageBackupPath?: string;
+      }
+    /**
+     * The storage activation's outcome could not be determined: the switch may or
+     * may not have committed. This is NEITHER a clean recovery NOR a completed
+     * update — it demands manual verification. Carries the best available evidence
+     * (receipt/backup/schema) and the precise steps to resolve it (P1-2).
+     */
+    | {
+        outcome: "ambiguous";
+        phase: UpdatePhase;
+        message: string;
+        action: string;
+        version?: string;
+        storageBackupPath?: string;
+        /** Whether the on-disk Home is now at the current, loadable schema. */
+        schemaCurrent: boolean;
+        /** Whether a durable completion receipt was found. */
+        switched: boolean;
+      }
+  ) & {
+    /** Best-effort staging cleanup failed after the update result was known. */
+    cleanupWarning?: string;
+  }
 >;
 
 /** The precise phase an update aborted in. */
 export type UpdatePhase =
   | "stage"
   | "preflight"
+  | "coordination"
   | "activate-storage"
   | "activate-binary"
   | "post-verify";
@@ -232,83 +240,129 @@ export function runUpdate(
     };
   }
 
+  let result: UpdateResult;
+  let cleanupWarning: string | undefined;
   try {
-    // 2) Preflight — the staged binary inspects the Home read-only; no switch.
-    // A preflight port that throws unexpectedly (e.g. an I/O fault) is not a safe
-    // green light: treat it as a blocked preflight (recoverable, no switch) rather
-    // than letting the exception escape (R4-F1).
-    let preflight: UpdatePreflight;
-    try {
-      preflight = ports.preflight(staged, home);
-    } catch (error) {
-      return {
-        outcome: "aborted",
-        phase: "preflight",
-        message: `Preflight failed unexpectedly: ${messageOf(error)}`,
-        action: "The current install and Home are unchanged. Investigate the staged binary and retry.",
-        recoverable: true,
-        version: staged.version
-      };
-    }
-    if (preflight.status === "blocked") {
-      return {
-        outcome: "aborted",
-        phase: "preflight",
-        message: preflight.message,
-        action: preflight.action,
-        recoverable: true,
-        version: staged.version
-      };
-    }
-
-    if (preflight.status === "already-current") {
-      // Nothing to migrate; promote the binary and verify. Storage is untouched.
-      const lifecycle = captureControllerLifecycle(ports, staged.version, home);
-      if ("outcome" in lifecycle) return lifecycle;
-      return activateAndVerify(ports, staged, home, undefined, lifecycle.lifecycle);
-    }
-
-    // 3) Activate storage — recoverable: atomic switch + timestamped backup. An
-    // activation port that throws unexpectedly may have committed the switch
-    // before failing, so its state is UNKNOWN — resolve it as ambiguous from the
-    // durable on-disk evidence, never let the exception escape as a false clean
-    // failure (R4-F1 / P1-2).
-    let activation: StorageActivation;
-    try {
-      activation = ports.activateStorage(staged, home);
-    } catch (error) {
-      return resolveAmbiguousActivation(
-        ports,
-        staged,
-        home,
-        `the activation step threw unexpectedly: ${messageOf(error)}`
-      );
-    }
-    if (activation.status === "blocked") {
-      return {
-        outcome: "aborted",
-        phase: "activate-storage",
-        message: activation.message,
-        action: activation.action,
-        // The engine guarantees the source Home is unchanged on a blocked/failed
-        // migration, and the binary has not been promoted, so this is recoverable.
-        recoverable: true,
-        version: staged.version
-      };
-    }
-    if (activation.status === "ambiguous") {
-      // The activation child left no parseable receipt: the switch may or may not
-      // have committed. Resolve the true state from the durable on-disk evidence
-      // and report an explicit manual recovery — never a false "recoverable".
-      return resolveAmbiguousActivation(ports, staged, home, activation.detail);
-    }
-    const backupPath = activation.status === "migrated" ? activation.backupPath : undefined;
-
-    // 4/5) Promote the binary, then post-verify with the new binary's loader.
-    return activateAndVerify(ports, staged, home, backupPath);
+    result = runStagedUpdate(ports, staged, home);
   } finally {
-    ports.cleanup(staged);
+    try {
+      ports.cleanup(staged);
+    } catch (error) {
+      // Cleanup is deliberately best-effort. Once the orchestrator has
+      // determined an update/abort/ambiguous result, a staging I/O failure must
+      // not replace that authoritative outcome or turn it into a generic error.
+      cleanupWarning = `Staging cleanup could not be completed: ${messageOf(error)}`;
+    }
   }
+  return cleanupWarning === undefined ? result : { ...result, cleanupWarning };
+}
+
+/** Run the staged flow; cleanup is owned by the caller so warnings are retained. */
+function runStagedUpdate(
+  ports: UpdatePorts,
+  staged: StagedPackage,
+  home: string
+): UpdateResult {
+  // 2) Preflight — the staged binary inspects the Home read-only; no switch.
+  // A preflight port that throws unexpectedly (e.g. an I/O fault) is not a safe
+  // green light: treat it as a blocked preflight (recoverable, no switch) rather
+  // than letting the exception escape (R4-F1).
+  let preflight: UpdatePreflight;
+  try {
+    preflight = ports.preflight(staged, home);
+  } catch (error) {
+    return {
+      outcome: "aborted",
+      phase: "preflight",
+      message: `Preflight failed unexpectedly: ${messageOf(error)}`,
+      action: "The current install and Home are unchanged. Investigate the staged binary and retry.",
+      recoverable: true,
+      version: staged.version
+    };
+  }
+  if (preflight.status === "blocked") {
+    return {
+      outcome: "aborted",
+      phase: "preflight",
+      message: preflight.message,
+      action: preflight.action,
+      recoverable: true,
+      version: staged.version
+    };
+  }
+
+  // Capture and stop the old Controller exactly once after preflight but
+  // before either storage activation or binary promotion. This parent update
+  // process remains the sole lifecycle owner for both binary-only and
+  // migratable updates.
+  const lifecycle = captureControllerLifecycle(ports, staged.version, home);
+  if ("outcome" in lifecycle) return lifecycle;
+
+  if (preflight.status === "already-current") {
+    // Nothing to migrate; promote the binary and verify. Storage is untouched.
+    return activateAndVerify(ports, staged, home, undefined, lifecycle.lifecycle);
+  }
+
+  // 3) Activate storage — recoverable: atomic switch + timestamped backup. An
+  // activation port that throws unexpectedly may have committed the switch
+  // before failing, so its state is UNKNOWN — resolve it as ambiguous from the
+  // durable on-disk evidence, never let the exception escape as a false clean
+  // failure (R4-F1 / P1-2).
+  let activation: StorageActivation;
+  try {
+    activation = ports.activateStorage(staged, home);
+  } catch (error) {
+    return resolveAmbiguousActivation(
+      ports,
+      staged,
+      home,
+      `the activation step threw unexpectedly: ${messageOf(error)}`
+    );
+  }
+  if (activation.status === "blocked") {
+    const failure: UpdateResult = {
+      outcome: "aborted",
+      phase: "activate-storage",
+      message: activation.message,
+      action: activation.action,
+      // The engine guarantees the source Home is unchanged on a blocked/failed
+      // migration, and the binary has not been promoted, so this is recoverable.
+      recoverable: true,
+      version: staged.version
+    };
+    // The child was externally quiesced by this parent. A clean pre-switch
+    // refusal therefore restores the exact captured identity; an ambiguous
+    // activation is handled separately and never restores blindly.
+    return restoreBeforeSwitchOrReport(
+      ports,
+      home,
+      lifecycle.lifecycle,
+      undefined,
+      failure
+    );
+  }
+  if (activation.status === "ambiguous") {
+    // The activation child left no parseable receipt: the switch may or may not
+    // have committed. Resolve the true state from the durable on-disk evidence
+    // and report an explicit manual recovery — never a false "recoverable".
+    return resolveAmbiguousActivation(ports, staged, home, activation.detail);
+  }
+  if (activation.status === "migrated" && !isValidBackupPath(activation.backupPath)) {
+    // A migrated/upgraded success without a concrete backup path violates
+    // the recoverable storage-activation contract. Resolve it through the
+    // existing durable receipt/schema probe instead of inferring that the
+    // Home was untouched.
+    return resolveAmbiguousActivation(
+      ports,
+      staged,
+      home,
+      "the activation reported migrated without a non-empty absolute backupPath"
+    );
+  }
+  const backupPath = activation.status === "migrated" ? activation.backupPath : undefined;
+
+  // 4/5) Promote the binary, then post-verify with the new binary's loader.
+  return activateAndVerify(ports, staged, home, backupPath, lifecycle.lifecycle);
 }
 
 /**
@@ -656,6 +710,14 @@ function resolveAmbiguousActivation(
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isValidBackupPath(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.trim() === value
+    && !value.includes("\0")
+    && isAbsolute(value);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -30,7 +30,7 @@
 import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { runtimeError } from "../errors/cliError.js";
@@ -112,7 +112,19 @@ export function createUpdatePorts(
       const result = spawn(
         staged.binaryPath,
         ["--json", "upgrade"],
-        { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
+        {
+          cwd: process.cwd(),
+          // The parent update process captures/stops/drains the old Controller
+          // before invoking the staged child. Mark this internal call so the
+          // child performs storage migration only and never starts a Controller
+          // from the temporary staging installation.
+          env: {
+            ...environment,
+            YUI_HOME: home,
+            YUI_UPDATE_EXTERNALLY_QUIESCED: "1"
+          },
+          shell: false
+        }
       );
       return interpretActivation(result);
     },
@@ -602,9 +614,23 @@ function interpretActivation(result: SpawnSyncReturns<Buffer>): StorageActivatio
   }
   if (outcome === "already-current") return { status: "already-current" };
   if (outcome === "upgraded") {
+    const backupPath = data.backupPath;
+    if (
+      typeof backupPath !== "string"
+      || backupPath.length === 0
+      || backupPath.trim() !== backupPath
+      || backupPath.includes("\0")
+      || !isAbsolute(backupPath)
+    ) {
+      return {
+        status: "ambiguous",
+        detail:
+          "the activation process reported outcome=upgraded without a non-empty absolute backupPath"
+      };
+    }
     return {
       status: "migrated",
-      ...(typeof data?.backupPath === "string" ? { backupPath: data.backupPath } : {})
+      backupPath
     };
   }
   if (outcome === "blocked") {

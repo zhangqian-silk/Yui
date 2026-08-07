@@ -219,7 +219,13 @@ export async function main(): Promise<void> {
     // Mirror doctor/controller: needs a Home but self-manages the schema check,
     // because upgrade must run against a non-current Home. Dispatched before the
     // unconditional requireStorageSchema gate below.
-    const result = await runUpgradeCommand(args.slice(1), home);
+    const result = await runUpgradeCommand(
+      args.slice(1),
+      home,
+      process.env.YUI_UPDATE_EXTERNALLY_QUIESCED === "1"
+        ? { controllerLifecycle: "externally-quiesced" }
+        : {}
+    );
     process.exitCode = result.exitCode;
     emit(result.output, false, result.data);
     return;
