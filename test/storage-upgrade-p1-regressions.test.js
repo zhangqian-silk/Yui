@@ -16,7 +16,11 @@ import {
   CURRENT_STORAGE_LAYOUT_VERSION,
   CURRENT_AGGREGATE_SCHEMA_VERSION
 } from "../dist/storage/storageSchema.js";
-import { FileTaskStore } from "../dist/storage/taskStore.js";
+import {
+  FileTaskStore,
+  CURRENT_AGENT_RUN_SCHEMA_VERSION,
+  CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION
+} from "../dist/storage/taskStore.js";
 import { MigrationRegistry, createEmptyRegistry, planMigration } from "../dist/storage/migration/index.js";
 import {
   latestStorageVersionState,
@@ -38,6 +42,14 @@ import {
 } from "../dist/storage/upgrade/upgradeReceipt.js";
 import { runUpdate } from "../dist/cli/updateOrchestrator.js";
 import { createUpdatePorts } from "../dist/cli/updatePorts.js";
+import { createConfiguredAgent } from "../dist/agent/agent.js";
+import { resolveEffectiveLaunch } from "../dist/executor/effectiveLaunch.js";
+import {
+  createRoleSessionSet,
+  recordRoleAgentSession
+} from "../dist/executor/agentExecutor.js";
+import { createAgentRun } from "../dist/run/agentRun.js";
+import { createRole, createRoleAgentBinding } from "../dist/role/role.js";
 import {
   ensureFileTaskControllerIdentity
 } from "../dist/controller/clientRuntime.js";
@@ -59,6 +71,56 @@ function currentHome() {
   const store = new FileTaskStore(home);
   store.saveConfig({ ...store.getConfig(), timeZone: "UTC" });
   return { base, home };
+}
+
+/**
+ * Build a valid, non-empty current Home through the domain/store APIs. Keeping
+ * both records real is important: a current-version map must not only classify
+ * empty families as current.
+ */
+function currentHomeWithTaskRoleRecords() {
+  const fixture = currentHome();
+  const now = new Date("2026-08-07T00:00:00.000Z");
+  const store = new FileTaskStore(fixture.home);
+  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
+  store.saveConfiguredAgent(agent);
+  const task = createTask("task-1", "Record-version fixture", now);
+  store.saveTask(task);
+  const role = createRole(
+    task.id,
+    "worker",
+    [createRoleAgentBinding(agent)],
+    agent.id,
+    fixture.home,
+    now
+  );
+  store.saveRole(task.id, role);
+  const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
+  let sessions = createRoleSessionSet(
+    { scope: "task", taskId: task.id, roleName: role.name },
+    agent.id,
+    now
+  );
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    nativeSessionId: "native-record-version-fixture",
+    policy: "fixed",
+    status: "ready",
+    effective
+  }, now);
+  store.saveTaskRoleSessionSet(sessions);
+  const run = createAgentRun(
+    store.nextAgentRunId(task.id),
+    task.id,
+    role.name,
+    "new",
+    "Record-version fixture run",
+    now,
+    { effective }
+  );
+  store.saveAgentRun(run);
+  return { ...fixture, taskId: task.id, roleName: role.name, runId: run.id };
 }
 
 /** Read + mutate + write the raw state.json (bypassing the strict store). */
@@ -218,6 +280,76 @@ test("P1-1 map completeness: current persisted workspace family is ManagedWorksp
     path: "state.json#/tasks/*/managedWorkspaces"
   });
   assert.equal("roleWorkspace" in versions, false);
+});
+
+test("P1-1 map guard: non-empty current RoleSessionSet and AgentRun Home is USABLE", async () => {
+  const { home, taskId, roleName, runId } = currentHomeWithTaskRoleRecords();
+  const store = new FileTaskStore(home);
+  const sessions = store.getTaskRoleSessionSet(taskId, roleName);
+  const run = store.getAgentRun(taskId, runId);
+  assert.equal(sessions?.schemaVersion, CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION);
+  assert.equal(run?.schemaVersion, CURRENT_AGENT_RUN_SCHEMA_VERSION);
+
+  const versions = currentRecordVersions();
+  assert.equal(
+    versions.taskRoleSessionSet.version,
+    CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION,
+    "the upgrade map must match taskStore's persisted RoleSessionSet gate"
+  );
+  assert.equal(
+    versions.agentRun.version,
+    CURRENT_AGENT_RUN_SCHEMA_VERSION,
+    "the upgrade map must match taskStore's persisted AgentRun gate"
+  );
+
+  const scan = scanSourceRecordVersions(home, versions);
+  assert.ok("record" in scan);
+  assert.equal(scan.record.taskRoleSessionSet.version, CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION);
+  assert.equal(scan.record.agentRun.version, CURRENT_AGENT_RUN_SCHEMA_VERSION);
+
+  const classification = classifyHome({ home, registry: EMPTY(), latest: LATEST() });
+  assert.equal(classification.classification.verdict, "USABLE");
+  const result = await runStorageUpgrade({
+    home,
+    registry: EMPTY(),
+    latest: LATEST(),
+    mode: "execute",
+    stopController: async () => {}
+  });
+  assert.equal(result.outcome, "already-current");
+});
+
+test("P1-1 map guard preserves older/future/corrupt record outcomes", () => {
+  const older = currentHomeWithTaskRoleRecords();
+  editState(older.home, (state) => {
+    state.tasks[older.taskId].roleSessionSets[older.roleName].schemaVersion =
+      CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION - 1;
+  });
+  const oldResult = classifyHome({ home: older.home, registry: EMPTY(), latest: LATEST() });
+  assert.equal(oldResult.classification.verdict, "NEEDS_NEW_VERSION");
+  assert.equal(oldResult.classification.blocker.reason, "missing-step");
+  assert.equal(oldResult.classification.blocker.recordKind, "taskRoleSessionSet");
+  assert.equal(oldResult.classification.blocker.from, CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION - 1);
+  assert.equal(oldResult.classification.blocker.to, CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION);
+
+  const future = currentHomeWithTaskRoleRecords();
+  editState(future.home, (state) => {
+    state.tasks[future.taskId].agentRuns[future.runId].schemaVersion =
+      CURRENT_AGENT_RUN_SCHEMA_VERSION + 1;
+  });
+  const futureResult = classifyHome({ home: future.home, registry: EMPTY(), latest: LATEST() });
+  assert.equal(futureResult.classification.verdict, "NEEDS_NEW_VERSION");
+  assert.equal(futureResult.classification.blocker.reason, "future-version");
+  assert.equal(futureResult.classification.blocker.recordKind, "agentRun");
+  assert.equal(futureResult.classification.blocker.found, CURRENT_AGENT_RUN_SCHEMA_VERSION + 1);
+  assert.equal(futureResult.classification.blocker.supported, CURRENT_AGENT_RUN_SCHEMA_VERSION);
+
+  const corrupt = currentHomeWithTaskRoleRecords();
+  editState(corrupt.home, (state) => {
+    delete state.tasks[corrupt.taskId].roleSessionSets[corrupt.roleName].schemaVersion;
+  });
+  const corruptResult = classifyHome({ home: corrupt.home, registry: EMPTY(), latest: LATEST() });
+  assert.equal(corruptResult.classification.verdict, "CORRUPTED");
 });
 
 test("P1-1 aggregate family: StoredTask 14->13 is a record missing-step, not corruption", () => {

@@ -129,6 +129,14 @@ type TaskIdHighWaterMarks = Record<TaskRecordKind, number>;
 /** The schema version of each persisted `state.json#/tasks/*` aggregate. */
 export const CURRENT_STORED_TASK_SCHEMA_VERSION = 14;
 
+/**
+ * Persisted nested-record versions consumed by this store's strict parser.
+ * Keep these named at the storage boundary so the upgrade record-axis map can
+ * assert it is classifying the same bytes the store reads and writes.
+ */
+export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 4 as const;
+export const CURRENT_AGENT_RUN_SCHEMA_VERSION = 5 as const;
+
 type StoredTask = {
   schemaVersion: typeof CURRENT_STORED_TASK_SCHEMA_VERSION;
   task: Task;
@@ -829,7 +837,13 @@ export class FileTaskStore implements TaskStore {
   getAgentRun(taskId: string, id: string): AgentRun | null { return optional(this.#state().tasks[taskId]?.agentRuns[id]); }
   listAgentRuns(taskId: string): AgentRun[] { return values(this.#requireTask(taskId).agentRuns, "id"); }
   saveAgentRun(run: AgentRun): void {
-    const stored = identified<AgentRun>(run, 5, "id", run.id, "Agent run");
+    const stored = identified<AgentRun>(
+      run,
+      CURRENT_AGENT_RUN_SCHEMA_VERSION,
+      "id",
+      run.id,
+      "Agent run"
+    );
     validateAgentRun(stored);
     const aggregate = this.#requireTaskForWrite(stored.taskId);
     if (stored.purpose === "review"
@@ -1524,7 +1538,20 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateWorkItem(item);
     return item;
   }, "workItems");
-  parseMap(aggregate.agentRuns, (record, key) => { const run = identified<AgentRun>(record, 5, "id", key, "Agent run"); if (run.taskId !== taskId) throw new StorageRecordError(`Agent run belongs to another Task: ${run.taskId}`); validateAgentRun(run); return run; }, "agentRuns");
+  parseMap(aggregate.agentRuns, (record, key) => {
+    const run = identified<AgentRun>(
+      record,
+      CURRENT_AGENT_RUN_SCHEMA_VERSION,
+      "id",
+      key,
+      "Agent run"
+    );
+    if (run.taskId !== taskId) {
+      throw new StorageRecordError(`Agent run belongs to another Task: ${run.taskId}`);
+    }
+    validateAgentRun(run);
+    return run;
+  }, "agentRuns");
   parseMap(aggregate.reviewRounds, (record, key) => {
     const round = identified<ReviewRound>(record, 2, "id", key, "ReviewRound");
     if (round.taskId !== taskId) {
@@ -1659,7 +1686,11 @@ function globalSessions(value: unknown): GlobalRoleSessionSet {
   return set;
 }
 function taskSessions(value: unknown): TaskRoleSessionSet {
-  const set = versioned<TaskRoleSessionSet>(value, 4, "Task Role session set");
+  const set = versioned<TaskRoleSessionSet>(
+    value,
+    CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION,
+    "Task Role session set"
+  );
   if (set.owner?.scope !== "task" || typeof set.owner.taskId !== "string" || typeof set.owner.roleName !== "string") throw new StorageRecordError("Task Role session owner is invalid.");
   validateSessions(set.sessions);
   validateRoleSessionSet(set);

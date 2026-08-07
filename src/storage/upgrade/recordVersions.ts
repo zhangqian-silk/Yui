@@ -19,7 +19,11 @@ import {
   CURRENT_AGGREGATE_SCHEMA_VERSION,
   CURRENT_STORAGE_LAYOUT_VERSION
 } from "../storageSchema.js";
-import { CURRENT_STORED_TASK_SCHEMA_VERSION } from "../taskStore.js";
+import {
+  CURRENT_AGENT_RUN_SCHEMA_VERSION,
+  CURRENT_STORED_TASK_SCHEMA_VERSION,
+  CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION
+} from "../taskStore.js";
 import type { RecordAxisEntry, StorageVersionState } from "../migration/index.js";
 
 /**
@@ -47,9 +51,9 @@ const CURRENT_RECORD_VERSIONS: Readonly<Record<string, RecordAxisEntry>> = Objec
   taskBrief: { version: 2, path: "state.json#/tasks/*/brief" },
   taskRole: { version: 3, path: "state.json#/tasks/*/roles" },
   managedWorkspace: { version: 1, path: "state.json#/tasks/*/managedWorkspaces" },
-  taskRoleSessionSet: { version: 3, path: "state.json#/tasks/*/roleSessionSets" },
+  taskRoleSessionSet: { version: 4, path: "state.json#/tasks/*/roleSessionSets" },
   workItem: { version: 6, path: "state.json#/tasks/*/workItems" },
-  agentRun: { version: 4, path: "state.json#/tasks/*/agentRuns" },
+  agentRun: { version: 5, path: "state.json#/tasks/*/agentRuns" },
   reviewRound: { version: 2, path: "state.json#/tasks/*/reviewRounds" },
   changeSet: { version: 2, path: "state.json#/tasks/*/changeSets" },
   integrationAttempt: { version: 2, path: "state.json#/tasks/*/integrationAttempts" },
@@ -63,7 +67,28 @@ const CURRENT_RECORD_VERSIONS: Readonly<Record<string, RecordAxisEntry>> = Objec
 
 /** The record-axis map for the current baseline (a defensive shallow copy). */
 export function currentRecordVersions(): Readonly<Record<string, RecordAxisEntry>> {
+  assertTaskStoreRecordVersions();
   return { ...CURRENT_RECORD_VERSIONS };
+}
+
+/**
+ * Fail closed if this centralized map drifts from the strict taskStore gates.
+ * The map intentionally keeps literal values so a future schema bump must
+ * update both the source-of-truth parser and this upgrade baseline together.
+ */
+function assertTaskStoreRecordVersions(): void {
+  const expected: Readonly<Record<string, number>> = {
+    taskRoleSessionSet: CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION,
+    agentRun: CURRENT_AGENT_RUN_SCHEMA_VERSION
+  };
+  for (const [kind, version] of Object.entries(expected)) {
+    const mapped = CURRENT_RECORD_VERSIONS[kind]?.version;
+    if (mapped !== version) {
+      throw new Error(
+        `Record version map drift for ${kind}: taskStore=${version}, map=${String(mapped)}.`
+      );
+    }
+  }
 }
 
 /**
