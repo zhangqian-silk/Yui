@@ -1,194 +1,33 @@
 export const VIEW_SCRIPT = `
+// Page composition: sidebar lists, overview, and the task detail scaffold.
+// All reusable widgets and cards come from components.js.
+import { clear, node } from "/assets/js/dom.js";
+import { byNewest, formatDateTime } from "/assets/js/format.js";
+import {
+  anchorSection,
+  attentionRow,
+  conclusionMeta,
+  emptyRow,
+  historyEventRow,
+  inputCard,
+  messageCard,
+  metaItem,
+  metricTile,
+  overviewRow,
+  pagedList,
+  pathMetaItem,
+  pill,
+  reviewCard,
+  richText,
+  roleCard,
+  runCard,
+  sectionHead,
+  taskCard,
+  translatedStatus,
+  workItemCard
+} from "/assets/js/components.js";
+
 const statuses = ["all", "active", "draft", "completed", "archived"];
-
-function node(tagName, className, textContent) {
-  const element = document.createElement(tagName);
-  if (className) element.className = className;
-  if (textContent !== undefined && textContent !== null) element.textContent = String(textContent);
-  return element;
-}
-
-function clear(element) {
-  element.replaceChildren();
-}
-
-function translatedStatus(t, prefix, status) {
-  return t(prefix + "." + status);
-}
-
-// Mirrors src/agent/adapterCatalog.ts to avoid a runtime import loop.
-const adapterLabels = { codex: "Codex", claude: "Claude" };
-function adapterLabel(adapterId) {
-  return adapterLabels[adapterId] || adapterId;
-}
-
-function relativeTime(iso, locale, t) {
-  const seconds = Math.round((Date.parse(iso) - Date.now()) / 1000);
-  if (!Number.isFinite(seconds) || Math.abs(seconds) < 45) return t("time.justNow");
-  const units = [
-    ["year", 31536000],
-    ["month", 2592000],
-    ["day", 86400],
-    ["hour", 3600],
-    ["minute", 60]
-  ];
-  const selected = units.find(function (entry) { return Math.abs(seconds) >= entry[1]; }) || ["second", 1];
-  return new Intl.RelativeTimeFormat(locale, { numeric: "auto" }).format(
-    Math.round(seconds / selected[1]),
-    selected[0]
-  );
-}
-
-function formatDateTime(iso, locale) {
-  if (!iso || !Number.isFinite(Date.parse(iso))) return "—";
-  return new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(iso));
-}
-
-function byNewest(left, right) {
-  return Date.parse(right.updatedAt || right.createdAt) - Date.parse(left.updatedAt || left.createdAt);
-}
-
-function metaItem(label, value) {
-  const item = node("span", "detail-meta-item");
-  item.append(node("small", "", label), node("span", "", value));
-  return item;
-}
-
-function pathMetaItem(label, value) {
-  const item = node("span", "detail-meta-item");
-  const path = node("span", "meta-path", value);
-  path.title = value;
-  item.append(node("small", "", label), path);
-  return item;
-}
-
-function chip(text, extraClass) {
-  return node("span", "chip" + (extraClass ? " " + extraClass : ""), text);
-}
-
-function agentBadge(agent) {
-  if (!agent) return null;
-  const badge = node("span", "agent-badge");
-  if (agent.adapterId) badge.append(chip(adapterLabel(agent.adapterId), "is-adapter"));
-  if (agent.model) badge.append(chip(agent.model));
-  if (agent.effort) badge.append(chip(agent.effort));
-  return badge.childNodes.length ? badge : null;
-}
-
-function chipRow(label, values, activeValue) {
-  const list = (values || []).filter(function (value) { return value !== undefined && value !== null && value !== ""; });
-  if (!list.length) return null;
-  const block = node("div", "record-block");
-  block.append(node("small", "", label));
-  const row = node("div", "chip-row");
-  list.forEach(function (value) {
-    row.append(chip(String(value), activeValue !== undefined && value === activeValue ? "is-active" : ""));
-  });
-  block.append(row);
-  return block;
-}
-
-function criteriaList(label, items) {
-  const list = (items || []).filter(Boolean);
-  if (!list.length) return null;
-  const block = node("div", "record-block is-wide");
-  block.append(node("small", "", label));
-  const listElement = node("ul", "criteria-list");
-  list.forEach(function (item) { listElement.append(node("li", "", item)); });
-  block.append(listElement);
-  return block;
-}
-
-function copyBlock(label, text, options) {
-  if (!text) return null;
-  const block = node("div", "record-block");
-  block.append(node("small", "", label));
-  const paragraph = node("p", options && options.muted ? "muted" : "", text);
-  block.append(paragraph);
-  return block;
-}
-
-function pill(t, namespace, status) {
-  const pill = node("span", "pill", translatedStatus(t, namespace, status));
-  pill.dataset.status = status;
-  return pill;
-}
-
-function statusDot(status) {
-  const dot = node("span", "status-dot " + status);
-  dot.setAttribute("aria-hidden", "true");
-  return dot;
-}
-
-function messageAuthor(message, t) {
-  return message.author.type === "role"
-    ? message.author.roleName
-    : t("author." + message.author.type);
-}
-
-function authorName(t, who) {
-  const key = "author." + who;
-  const label = t(key);
-  return label === key ? who : label;
-}
-
-function emptyRow(t, key) {
-  return node("div", "row", t(key || "empty.none"));
-}
-
-function sectionHead(label, options) {
-  const head = node("div", "section-head");
-  head.append(node("h3", "", label));
-  if (options && options.count !== undefined) head.append(node("span", "section-count", String(options.count)));
-  if (options && options.kicker) head.append(node("span", "section-kicker", options.kicker));
-  if (options && options.right) head.append(node("span", "section-label", options.right));
-  return head;
-}
-
-function anchorSection(id, head, body) {
-  const section = node("section", "detail-section anchor");
-  section.id = id;
-  section.append(head, body);
-  return section;
-}
-
-function answerActions(input, actions, t) {
-  const answers = node("div", "input-actions");
-  if (input.choices && input.choices.length) {
-    input.choices.forEach(function (choice) {
-      const button = node("button", "input-answer", choice.label);
-      button.type = "button";
-      button.addEventListener("click", function () {
-        if (actions.answerInput) actions.answerInput(input, { choiceKey: choice.key });
-      });
-      answers.append(button);
-    });
-  } else {
-    const form = node("form", "input-form");
-    const field = node("input", "");
-    field.type = "text";
-    field.required = true;
-    field.placeholder = t("input.freeText");
-    const submit = node("button", "input-answer", t("actions.answer"));
-    submit.type = "submit";
-    form.append(field, submit);
-    form.addEventListener("submit", function (event) {
-      event.preventDefault();
-      const text = field.value.trim();
-      if (text && actions.answerInput) actions.answerInput(input, { text: text });
-    });
-    answers.append(form);
-  }
-  return answers;
-}
-
-function answerSummary(input, t, locale) {
-  const parts = [input.question];
-  if (input.policy && input.policy.kind === "recommended" && input.policy.timeoutAt) {
-    parts.push(t("input.timeoutAt") + " " + relativeTime(input.policy.timeoutAt, locale, t));
-  }
-  return parts.join(" · ");
-}
 
 export function renderFilters(container, state, t, onFilter) {
   const counts = state.counts || {};
@@ -290,39 +129,15 @@ export function renderTasks(container, state, t, locale, onSelect) {
   });
 }
 
-function taskCard(task, hasAttention, state, t, locale, onSelect) {
-  const button = node("button", "task");
-  button.type = "button";
-  button.dataset.id = task.id;
-  button.setAttribute("aria-current", String(state.selected === task.id));
-
-  button.append(statusDot(task.status));
-
-  const main = node("span", "task-main");
-  main.append(node("strong", "task-title", task.title));
-  main.append(node("span", "task-meta", relativeTime(task.updatedAt, locale, t)));
-  button.append(main);
-
-  // One signal only: an open input (needs the user) outranks a running count.
-  if (hasAttention) {
-    const badge = node("span", "task-signal is-input", String(task.openInputCount || 1));
-    badge.title = t("stats.inputs");
-    button.append(badge);
-  } else if (task.workItems && task.workItems.running > 0) {
-    const badge = node("span", "task-signal is-running", String(task.workItems.running));
-    badge.title = t("stats.running");
-    button.append(badge);
-  }
-
-  button.addEventListener("click", function () { onSelect(task.id); });
-  return button;
-}
-
-function metricTile(label, value, options) {
-  const variant = options && options.hot ? " is-hot" : options && options.warning ? " is-warning" : "";
-  const tile = node("article", "metric" + variant);
-  tile.append(node("span", "metric-label", label), node("strong", "metric-value", String(value)));
-  return tile;
+function overviewBlock(head, tasks, t, locale, onSelect) {
+  const block = node("section", "overview-block");
+  block.append(sectionHead(head, { count: tasks.length }));
+  const list = node("div", "overview-list");
+  tasks.forEach(function (task) {
+    list.append(overviewRow(task, t, locale, onSelect));
+  });
+  block.append(list);
+  return block;
 }
 
 export function renderOverview(detail, state, t, locale, onSelect) {
@@ -378,64 +193,19 @@ export function renderOverview(detail, state, t, locale, onSelect) {
     wrap.append(stalledBlock);
   }
 
-  // Active work is the one list worth surfacing next to the inbox; status
-  // counts already live in the metric rail, so no distribution panel here.
+  // Active work and the freshest updates sit side by side on wide screens, so
+  // the overview fills the reading surface instead of ending at the inbox.
+  const duo = node("div", "overview-duo");
   const activeTasks = (state.tasks || []).filter(function (task) { return task.status === "active"; });
   if (activeTasks.length) {
-    const activeBlock = node("section", "overview-block");
-    activeBlock.append(sectionHead(t("overview.activeNow"), { count: activeTasks.length }));
-    const activeBody = node("div", "overview-list");
-    activeTasks.forEach(function (task) {
-      activeBody.append(overviewRow(task, t, locale, onSelect));
-    });
-    activeBlock.append(activeBody);
-    wrap.append(activeBlock);
+    duo.append(overviewBlock(t("overview.activeNow"), activeTasks, t, locale, onSelect));
   }
+  const recentTasks = (state.tasks || []).slice().sort(byNewest).slice(0, 8);
+  if (recentTasks.length) {
+    duo.append(overviewBlock(t("overview.recent"), recentTasks, t, locale, onSelect));
+  }
+  if (duo.childNodes.length) wrap.append(duo);
   detail.append(wrap);
-}
-
-function attentionRow(item, t, locale, onSelect) {
-  const row = node("button", "inbox-row");
-  row.type = "button";
-  const request = item.request || {};
-  const kind = request.policy && request.policy.kind === "required" ? "required"
-    : request.policy && request.policy.kind === "recommended" ? "recommended"
-    : null;
-
-  const lead = node("span", "inbox-lead");
-  lead.append(node("span", "inbox-dot"));
-  const head = node("span", "inbox-head");
-  head.append(node("span", "inbox-task", item.taskTitle));
-  if (kind) head.append(pill(t, "input", kind));
-  lead.append(head);
-  row.append(lead);
-
-  if (request.question) {
-    const question = node("span", "inbox-question", request.question);
-    question.title = request.question;
-    row.append(question);
-  }
-
-  const foot = node("span", "inbox-foot");
-  if (request.createdAt) foot.append(node("time", "", relativeTime(request.createdAt, locale, t)));
-  foot.append(node("span", "inbox-go", t("actions.answer") + " →"));
-  row.append(foot);
-
-  row.addEventListener("click", function () { onSelect(item.taskId); });
-  return row;
-}
-
-function overviewRow(task, t, locale, onSelect) {
-  const hasInputs = task.openInputCount > 0;
-  const row = node("button", "overview-row" + (hasInputs ? " has-inputs" : ""));
-  row.type = "button";
-  row.append(statusDot(task.status));
-  const main = node("span", "overview-row-title", task.title);
-  main.title = task.title;
-  row.append(main);
-  row.append(node("span", "overview-row-time", relativeTime(task.updatedAt, locale, t)));
-  row.addEventListener("click", function () { onSelect(task.id); });
-  return row;
 }
 
 export function renderLoading(container, t, key) {
@@ -446,6 +216,38 @@ export function renderLoading(container, t, key) {
 export function renderError(container, message) {
   clear(container);
   container.append(node("div", "error", message));
+}
+
+const RUN_PAGE_SIZE = 12;
+const LIST_PAGE_SIZE = 10;
+const RUN_FILTERS = ["all", "active", "yielded", "failed"];
+
+function runFilterRow(sortedRuns, t, onChange) {
+  const row = node("div", "filter-row run-filter");
+  const buttons = [];
+  RUN_FILTERS.forEach(function (status) {
+    const count = status === "all"
+      ? sortedRuns.length
+      : sortedRuns.filter(function (run) { return run.status === status; }).length;
+    if (status !== "all" && count === 0) return;
+    const btn = node("button", "filter-chip");
+    btn.type = "button";
+    btn.dataset.status = status;
+    if (status !== "all") btn.append(node("span", "filter-dot " + status));
+    btn.append(document.createTextNode(status === "all" ? t("status.all") : t("run." + status)));
+    btn.append(node("span", "filter-count", String(count)));
+    btn.addEventListener("click", function () { onChange(status); });
+    buttons.push({ status: status, element: btn });
+    row.append(btn);
+  });
+  return {
+    row: row,
+    sync: function (active) {
+      buttons.forEach(function (entry) {
+        entry.element.classList.toggle("is-active", entry.status === active);
+      });
+    }
+  };
 }
 
 export function renderTaskDetail(detail, data, t, locale, actions) {
@@ -474,13 +276,14 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
 
   if (task.completionSummary) {
     const conclusion = node("div", "conclusion");
-    conclusion.append(node("h3", "", t("detail.conclusion")), node("p", "", task.completionSummary));
+    conclusion.append(node("h3", "", t("detail.conclusion")));
+    conclusion.append(richText(null, task.completionSummary, t));
     conclusion.append(conclusionMeta(task, t, locale, "completed"));
     summaryBody.append(conclusion);
   } else if (task.status === "retired" || task.retirementSummary) {
     const conclusion = node("div", "conclusion archived");
     conclusion.append(node("h3", "", t("detail.retired")));
-    if (task.retirementSummary) conclusion.append(node("p", "", task.retirementSummary));
+    if (task.retirementSummary) conclusion.append(richText(null, task.retirementSummary, t));
     if (task.replacementTaskId) {
       conclusion.append(node("p", "muted", t("detail.replacement") + " · " + task.replacementTaskId));
     }
@@ -489,7 +292,7 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
   } else if (task.status === "archived" || task.archiveSummary || task.archiveReason) {
     const conclusion = node("div", "conclusion archived");
     conclusion.append(node("h3", "", t("detail.archived")));
-    if (task.archiveSummary) conclusion.append(node("p", "", task.archiveSummary));
+    if (task.archiveSummary) conclusion.append(richText(null, task.archiveSummary, t));
     if (task.archiveReason) conclusion.append(node("p", "muted", task.archiveReason));
     conclusion.append(conclusionMeta(task, t, locale, "archived"));
     summaryBody.append(conclusion);
@@ -533,11 +336,11 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
   const focusBody = node("div", "section-body");
   if (data.brief) {
     const focusCard = node("article", "record-card");
-    focusCard.append(copyBlock(t("detail.focus"), data.brief.currentFocus || data.brief.objective));
+    focusCard.append(richText(t("detail.focus"), data.brief.currentFocus || data.brief.objective, t));
     if (data.brief.technicalApproach) {
-      focusCard.append(copyBlock(t("detail.technicalApproach"), data.brief.technicalApproach, { muted: true }));
+      focusCard.append(richText(t("detail.technicalApproach"), data.brief.technicalApproach, t, { muted: true }));
     }
-    if (data.brief.leaderSummary) focusCard.append(copyBlock(t("detail.leaderSummary"), data.brief.leaderSummary, { muted: true }));
+    if (data.brief.leaderSummary) focusCard.append(richText(t("detail.leaderSummary"), data.brief.leaderSummary, t, { muted: true }));
     focusBody.append(focusCard);
   } else {
     focusBody.append(emptyRow(t, "empty.brief"));
@@ -559,52 +362,49 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     sectionHead(t("detail.workItems"), { count: data.workItems.length }),
     workBody));
 
-  // 5. Runs (anchor #detail-exec) — execution grid
+  // 5. Runs (anchor #detail-exec) — execution grid with status filter + paging
+  const execWrap = node("div", "section-body");
   const execBody = node("div", "run-grid");
-  if (!data.runs.length) execBody.append(emptyRow(t, "empty.runs"));
-  data.runs.slice().sort(byNewest).forEach(function (run) {
-    execBody.append(runCard(run, t, locale));
-  });
+  const sortedRuns = data.runs.slice().sort(byNewest);
+  if (!sortedRuns.length) {
+    execBody.append(emptyRow(t, "empty.runs"));
+    execWrap.append(execBody);
+  } else {
+    let activeRunFilter = "all";
+    const filter = runFilterRow(sortedRuns, t, function (status) {
+      activeRunFilter = status;
+      filter.sync(status);
+      renderRunGrid();
+    });
+    function renderRunGrid() {
+      clear(execBody);
+      const visible = activeRunFilter === "all"
+        ? sortedRuns
+        : sortedRuns.filter(function (run) { return run.status === activeRunFilter; });
+      pagedList(execBody, visible, RUN_PAGE_SIZE, function (run) {
+        return runCard(run, t, locale);
+      }, t);
+    }
+    filter.sync(activeRunFilter);
+    execWrap.append(filter.row, execBody);
+    renderRunGrid();
+  }
   scaffold.append(anchorSection("detail-exec",
     sectionHead(t("detail.execution"), { count: data.runs.length }),
-    execBody));
+    execWrap));
 
   // 5b. Reviews (anchor #detail-reviews) — review rounds for yielded candidates
   const reviewBody = node("div", "row-list");
-  if (!data.reviewRounds || !data.reviewRounds.length) {
+  const sortedRounds = (data.reviewRounds || []).slice().sort(byNewest);
+  if (!sortedRounds.length) {
     reviewBody.append(emptyRow(t));
   } else {
-    data.reviewRounds.slice().sort(byNewest).forEach(function (round) {
-      const card = node("article", "record-card");
-      const head = node("div", "record-head");
-      const titleRow = node("div", "record-title-row");
-      titleRow.append(node("strong", "record-title", round.id));
-      head.append(titleRow);
-      head.append(pill(t, "review", round.status));
-      card.append(head);
-      const meta = node("div", "record-meta");
-      meta.append(node("span", "meta-name", round.reviewerRoleName));
-      meta.append(node("span", "mono", round.workItemId + " · " + round.candidateId));
-      if (round.createdAt) meta.append(node("time", "", formatDateTime(round.createdAt, locale)));
-      meta.append(node("span", "", t("detail.reviewBase") + " · " + round.reviewBaseCommit));
-      if (round.workspace && round.workspace.root) {
-        meta.append(pathMetaItem(t("detail.workspace"), round.workspace.root));
-      }
-      if (round.evidenceCommit) {
-        meta.append(node("span", "", t("detail.evidence") + " · " + round.evidenceCommit));
-      }
-      card.append(meta);
-      if (round.checks && round.checks.length) {
-        card.append(copyBlock(t("detail.checks"), round.checks.map(function (check) {
-          return check.name + "=" + check.outcome;
-        }).join(", ")));
-      }
-      if (round.summary) card.append(copyBlock("", round.summary));
-      reviewBody.append(card);
-    });
+    pagedList(reviewBody, sortedRounds, LIST_PAGE_SIZE, function (round) {
+      return reviewCard(round, t, locale);
+    }, t);
   }
   scaffold.append(anchorSection("detail-reviews",
-    sectionHead(t("detail.reviews"), { count: (data.reviewRounds || []).length }),
+    sectionHead(t("detail.reviews"), { count: sortedRounds.length }),
     reviewBody));
 
   // 6. Roles (anchor #detail-roles)
@@ -632,9 +432,9 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
   if (!historyEvents.length) {
     historyBody.append(emptyRow(t, "detail.historyEmpty"));
   } else {
-    historyEvents.forEach(function (event) {
-      historyBody.append(historyEventRow(event, t, locale));
-    });
+    pagedList(historyBody, historyEvents, LIST_PAGE_SIZE, function (event) {
+      return historyEventRow(event, t, locale);
+    }, t);
   }
   scaffold.append(anchorSection("detail-history",
     sectionHead(t("tabs.history"), { count: historyEvents.length }),
@@ -642,283 +442,17 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
 
   // 8. Messages (anchor #detail-messages)
   const messagesBody = node("div", "row-list");
-  if (!data.messages.length) messagesBody.append(emptyRow(t));
-  data.messages.slice().sort(byNewest).forEach(function (message) {
-    messagesBody.append(messageCard(message, t, locale));
-  });
+  if (!data.messages.length) {
+    messagesBody.append(emptyRow(t));
+  } else {
+    pagedList(messagesBody, data.messages.slice().sort(byNewest), LIST_PAGE_SIZE, function (message) {
+      return messageCard(message, t, locale);
+    }, t);
+  }
   scaffold.append(anchorSection("detail-messages",
     sectionHead(t("detail.messages"), { count: data.messages.length }),
     messagesBody));
 
   detail.append(scaffold);
-}
-
-function conclusionMeta(task, t, locale, kind) {
-  const meta = node("div", "conclusion-meta");
-  const actor = kind === "archived" ? task.archivedBy
-    : kind === "retired" ? task.retiredBy
-    : task.completedBy;
-  const at = kind === "archived" ? task.archivedAt
-    : kind === "retired" ? task.retiredAt
-    : task.completedAt;
-  const label = kind === "archived" ? t("detail.archivedBy")
-    : kind === "retired" ? t("detail.retiredBy")
-    : t("detail.completedBy");
-  if (actor) meta.append(node("span", "", label + " · " + authorName(t, actor)));
-  if (at) meta.append(node("time", "", formatDateTime(at, locale)));
-  return meta;
-}
-
-function inputCard(input, _options, t, locale, actions) {
-  const card = node("article", "input-card");
-  const top = node("div", "input-card-top");
-  top.append(node("small", "", t("detail.openInput")));
-  const question = node("p", "input-question", input.question);
-  top.append(question);
-  const context = node("div", "input-context");
-  if (input.policy) {
-    if (input.policy.kind === "recommended") {
-      context.append(pill(t, "input", "recommended"));
-      if (input.policy.timeoutAt) {
-        context.append(node("span", "", t("input.timeoutAt") + " · " + relativeTime(input.policy.timeoutAt, locale, t)));
-      }
-    } else {
-      context.append(pill(t, "input", "required"));
-    }
-  }
-  context.append(node("time", "", formatDateTime(input.createdAt, locale)));
-  top.append(context);
-  if (input.blockedRefs && input.blockedRefs.length) {
-    const blocked = input.blockedRefs.map(function (ref) { return ref.type + "·" + ref.id; }).join("  ");
-    top.append(node("span", "input-blocked", blocked));
-  }
-  card.append(top);
-  card.append(answerActions(input, actions, t));
-  return card;
-}
-
-function workItemCard(item, titles, t, locale, actions, _taskId) {
-  const card = node("article", "record-card work-item-card");
-  const head = node("div", "record-head");
-  const titleRow = node("div", "record-title-row");
-  titleRow.append(statusDot(item.status), node("strong", "record-title", item.title));
-  const pills = node("div", "record-pills");
-  pills.append(pill(t, "work", item.status));
-  if (item.workspaceDisposition) pills.append(pill(t, "disposition", item.workspaceDisposition));
-  head.append(titleRow, pills);
-  card.append(head);
-
-  const meta = node("div", "record-meta");
-  if (item.assignee) meta.append(node("span", "meta-name", item.assignee));
-  meta.append(node("span", "mono", item.id));
-  meta.append(node("time", "", formatDateTime(item.updatedAt, locale)));
-  card.append(meta);
-
-  if (item.objective && item.objective !== item.title) {
-    card.append(copyBlock(t("detail.objective"), item.objective));
-  }
-
-  if (item.acceptance && item.acceptance.length) {
-    card.append(criteriaList(t("detail.acceptance"), item.acceptance));
-  }
-
-  // Short chip rows (dependencies, writable projects) sit side by side; long
-  // text blocks above and below stay full-width so the card reads top-to-bottom
-  // like an issue rather than a mismatched column grid.
-  const chipCols = node("div", "work-item-chips");
-  if (item.dependsOn && item.dependsOn.length) {
-    chipCols.append(chipRow(t("detail.dependsOn"), item.dependsOn.map(function (id) { return titles[id] || id; })));
-  }
-  if (item.writeProjectIds && item.writeProjectIds.length) {
-    chipCols.append(chipRow(t("detail.writeProjects"), item.writeProjectIds));
-  }
-  if (chipCols.childNodes.length) card.append(chipCols);
-
-  if (item.outcome) {
-    const outcome = node("div", "record-block outcome-callout");
-    outcome.append(node("small", "", t("detail.outcome")));
-    outcome.append(node("p", "muted", item.outcome));
-    card.append(outcome);
-  }
-  return card;
-}
-
-function runCard(run, t, locale) {
-  const card = node("article", "execute-card");
-  card.dataset.status = run.status;
-
-  const idRow = node("div", "execute-id");
-  idRow.append(statusDot(run.status));
-  idRow.append(node("span", "role", run.roleName));
-  idRow.append(node("span", "", run.id));
-  if (run.workItemId) idRow.append(node("span", "", t("detail.workItem") + " · " + run.workItemId));
-  idRow.append(node("time", "", formatDateTime(run.updatedAt, locale)));
-  card.append(idRow);
-
-  const io = node("div", "execute-io");
-  io.append(node("small", "", t("detail.instruction")), node("p", "", run.input));
-  card.append(io);
-  if (run.summary) {
-    const outcome = node("div", "execute-io outcome");
-    outcome.append(node("small", "", t("detail.outcome")), node("p", "", run.summary));
-    card.append(outcome);
-  }
-
-  const foot = node("div", "execute-foot");
-  const tags = node("div", "execute-tags");
-  tags.append(chip(t("mode." + run.mode)));
-  tags.append(chip(t(run.deliveredAt ? "delivery.delivered" : "delivery.pending")));
-  const badge = run.effective ? agentBadge(run.effective) : (run.agentId ? agentBadge(run) : null);
-  if (badge) tags.append(badge);
-  foot.append(tags);
-  foot.append(pill(t, "run", run.status));
-  card.append(foot);
-
-  if (run.effective) {
-    const eff = node("div", "record-meta");
-    eff.append(node("span", "", t("detail.effective") + " · r" + run.effective.sourceDesiredRevision));
-    eff.append(node("span", "", t("detail.profileIntent") + " · " + run.effective.profileAccess));
-    eff.append(node("span", "", t("detail.permission") + " · " + run.effective.permission.strategy));
-    card.append(eff);
-  }
-
-  return card;
-}
-
-function roleCard(role, task, t, locale, actions) {
-  const card = node("article", "record-card");
-  const head = node("div", "record-head");
-  head.append(node("strong", "record-title", role.name));
-  const headRight = node("div", "record-pills");
-  headRight.append(pill(t, "role", role.status));
-  const open = node("button", "record-open", "");
-  open.type = "button";
-  open.append(node("span", "", t("actions.openRun")), node("span", "arrow", "→"));
-  open.addEventListener("click", function () {
-    if (actions.openTerminal) actions.openTerminal({ scope: "task", taskId: task.id, roleName: role.name });
-  });
-  headRight.append(open);
-  head.append(headRight);
-  card.append(head);
-
-  const meta = node("div", "record-meta");
-  meta.append(node("span", "meta-name", role.activeAgentId));
-  const activeBinding = role.agentBindings && role.agentBindings[role.activeAgentId];
-  if (activeBinding) {
-    const badge = agentBadge({
-      adapterId: activeBinding.adapterId,
-      model: activeBinding.config && activeBinding.config.model,
-      effort: activeBinding.config && activeBinding.config.effort
-    });
-    if (badge) meta.append(badge);
-  }
-  if (role.launchRevision !== undefined) {
-    meta.append(node("span", "", t("detail.desired") + " · r" + role.launchRevision));
-  }
-  if (role.defaultAccess !== undefined) {
-    meta.append(node("span", "", t("detail.profileIntent") + " · " + role.defaultAccess));
-  }
-  if (role.updatedAt) meta.append(node("time", "", formatDateTime(role.updatedAt, locale)));
-  card.append(meta);
-
-  if (role.effectiveLaunch) {
-    const eff = node("div", "record-meta");
-    eff.append(node("span", "", t("detail.effectiveAgent") + " · " + role.effectiveLaunch.agentId));
-    const effBadge = agentBadge(role.effectiveLaunch);
-    if (effBadge) eff.append(effBadge);
-    if (role.effectiveLaunch.sourceDesiredRevision !== undefined) {
-      eff.append(node("span", "", t("detail.effective") + " · r" + role.effectiveLaunch.sourceDesiredRevision));
-    }
-    if (role.effectiveLaunch.profileAccess !== undefined) {
-      eff.append(node("span", "", t("detail.profileIntent") + " · " + role.effectiveLaunch.profileAccess));
-    }
-    if (role.effectiveLaunch.permission && role.effectiveLaunch.permission.strategy !== undefined) {
-      eff.append(node("span", "", t("detail.permission") + " · " + role.effectiveLaunch.permission.strategy));
-    }
-    eff.append(node("span", "", role.launchDrift ? t("launch.drift") : t("launch.current")));
-    card.append(eff);
-  }
-
-  if (role.description) card.append(copyBlock("", role.description, { muted: true }));
-
-  const cols = node("div", "record-cols");
-  const bindingIds = role.agentBindings ? Object.keys(role.agentBindings) : [];
-  if (bindingIds.length > 1) {
-    const bindings = bindingIds.map(function (id) {
-      const binding = role.agentBindings[id];
-      const model = binding.config && binding.config.model;
-      return adapterLabel(binding.adapterId) + (model ? " · " + model : "");
-    });
-    const activeBindingLabel = activeBinding
-      ? adapterLabel(activeBinding.adapterId) + (activeBinding.config && activeBinding.config.model ? " · " + activeBinding.config.model : "")
-      : undefined;
-    cols.append(chipRow(t("detail.agents"), bindings, activeBindingLabel));
-  }
-  if (role.skills && role.skills.length) cols.append(chipRow(t("detail.skills"), role.skills));
-  if (role.responsibilities && role.responsibilities.length) cols.append(criteriaList(t("detail.responsibilities"), role.responsibilities));
-  if (role.constraints && role.constraints.length) cols.append(criteriaList(t("detail.constraints"), role.constraints));
-  if (role.expectedOutput) cols.append(copyBlock(t("detail.expectedOutput"), role.expectedOutput, { muted: true }));
-  if (cols.childNodes.length) card.append(cols);
-
-  if (role.workspace) {
-    const meta = node("div", "record-meta");
-    meta.append(pathMetaItem(t("detail.workspace"), role.workspace));
-    card.append(meta);
-  }
-  return card;
-}
-
-function historyEventRow(event, t, locale) {
-  if (event.kind === "milestone") {
-    const milestone = event.item;
-    const card = node("article", "record-card");
-    const head = node("div", "record-head");
-    const titleRow = node("div", "record-title-row");
-    titleRow.append(node("strong", "record-title", milestone.title));
-    head.append(titleRow);
-    head.append(pill(t, "history", "milestone"));
-    card.append(head);
-    const meta = node("div", "record-meta");
-    meta.append(node("span", "mono", milestone.id));
-    meta.append(node("time", "", formatDateTime(milestone.createdAt, locale)));
-    card.append(meta);
-    if (milestone.summary) card.append(copyBlock("", milestone.summary, { muted: true }));
-    return card;
-  }
-  const decision = event.item;
-  const card = node("article", "record-card");
-  const head = node("div", "record-head");
-  const titleRow = node("div", "record-title-row");
-  titleRow.append(node("strong", "record-title", decision.title));
-  head.append(titleRow);
-  head.append(pill(t, "history", "decision"));
-  card.append(head);
-  const meta = node("div", "record-meta");
-  meta.append(node("span", "mono", decision.id));
-  if (decision.createdAt) meta.append(node("time", "", formatDateTime(decision.createdAt, locale)));
-  if (decision.status) meta.append(pill(t, "decision", decision.status));
-  card.append(meta);
-  if (decision.rationale) card.append(copyBlock("", decision.rationale, { muted: true }));
-  if (decision.supersededReason) card.append(copyBlock("", decision.supersededReason, { muted: true }));
-  return card;
-}
-
-function messageCard(message, t, locale) {
-  const card = node("article", "record-card");
-  const head = node("div", "record-head");
-  const titleRow = node("div", "record-title-row");
-  titleRow.append(node("strong", "record-title", messageAuthor(message, t)));
-  head.append(titleRow);
-  if (message.kind) head.append(pill(t, "messageKind", message.kind));
-  card.append(head);
-
-  const meta = node("div", "record-meta");
-  meta.append(node("span", "mono", message.id));
-  meta.append(node("time", "", formatDateTime(message.createdAt, locale)));
-  if (message.runId) meta.append(node("span", "mono", message.runId + (message.workItemId ? " · " + message.workItemId : "")));
-  card.append(meta);
-
-  card.append(copyBlock("", message.body));
-  return card;
 }
 `;

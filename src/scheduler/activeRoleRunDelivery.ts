@@ -16,6 +16,10 @@ import {
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import { effectiveLaunchSnapshotsCompatible } from "../executor/effectiveLaunch.js";
 import { RuntimeLaunchError } from "../runtime/ports.js";
+import {
+  isPreInputReadinessSupported
+} from "../lifecycle/canonicalLifecycleEvent.js";
+import { preInputReadinessCapability } from "../lifecycle/providerLifecycleMapping.js";
 
 export type ActiveRoleRunDeliveryResult = Readonly<{
   taskId: string;
@@ -45,8 +49,11 @@ export async function processActiveRoleRunDeliveries(
     for (const role of selectedSchedulerRoles(store, task.id, selection)) {
       const run = store.getActiveAgentRun(task.id, role.name);
       // A crash after a Leader wake is durably claimed but before tmux input
-      // is recoverable through the same receipt-backed delivery path.
-      if (run === null || run.deliveredAt !== undefined) continue;
+      // is recoverable through the same receipt-backed delivery path. The
+      // re-push guard keys on pushedAt (transport), not deliveredAt (provider
+      // acceptance): a pushed-but-unaccepted Run must never be pushed twice —
+      // no duplicate Enter while acceptance is still pending.
+      if (run === null || run.pushedAt !== undefined) continue;
       if (task.projectBindings.length > 0 && task.cwd === undefined) {
         results.push({
           taskId: task.id,
@@ -134,6 +141,37 @@ export async function processActiveRoleRunDeliveries(
             : { launchId: ready.prepared.launchId }),
           now
         });
+        // Pre-input readiness gate. For an adapter whose capability proves a
+        // native event fires before the first prompt (e.g. Claude SessionStart),
+        // a freshly-started host must not be pushed until that provider-ready
+        // fact has been folded. Unsupported adapters (e.g. Codex) have no
+        // pre-input event, so their push proceeds and acceptance is confirmed
+        // only by the later exact provider-accepted fold. The gate reads the
+        // adapter capability and the durable ready projection — never a sleep,
+        // screen scrape, or pane/PID inference — and fails closed for a
+        // supported adapter whose readiness cannot be confirmed.
+        if (
+          ready.prepared.sessionStarted
+          && isPreInputReadinessSupported(preInputReadinessCapability(run.effective.adapterId))
+          && !providerReadyForPush(store, {
+            taskId: task.id,
+            roleName: role.name,
+            agentId: run.effective.agentId,
+            ...(ready.prepared.launchId === undefined ? {} : { launchId: ready.prepared.launchId }),
+            ...(session?.nativeSessionId === undefined
+              ? {}
+              : { nativeSessionId: session.nativeSessionId })
+          })
+        ) {
+          results.push({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id,
+            status: "skipped",
+            reason: "not-ready"
+          });
+          continue;
+        }
         deliveryAttempted = true;
         const outcome = await delivery.sendOnce({
           delivery: ready,
@@ -326,4 +364,23 @@ function validateReadySession(
 
 function hasText(value: string | undefined): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+/**
+ * Fail-closed readiness check for a supported-readiness adapter's first push.
+ * When the store cannot answer (no implementation), the push is held rather than
+ * proceeding blind — a supported adapter must have a proven provider-ready fold.
+ */
+function providerReadyForPush(
+  store: SchedulerStorePort,
+  input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    launchId?: string;
+    nativeSessionId?: string;
+  }>
+): boolean {
+  if (store.isRoleGenerationProviderReady === undefined) return false;
+  return store.isRoleGenerationProviderReady(input);
 }

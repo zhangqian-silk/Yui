@@ -271,6 +271,101 @@ test("managed Agent PATH resolves yui to the current Controller CLI", (t) => {
   );
 });
 
+test("managed Codex Task Run installs lifecycle hooks while native identity remains provider-discovered", (t) => {
+  const { home, store, task, role, agent, now } = fixture(t);
+  const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
+  store.saveActiveAgentRun(createAgentRun(
+    "agent-run-1",
+    task.id,
+    role.name,
+    "new",
+    "test hooks",
+    now,
+    { effective }
+  ));
+  const plan = new FileRoleLaunchPlanner(home, store, { cliPath: "/dist/cli.js" }).plan({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    mode: "new",
+    runId: "agent-run-1",
+    launchId: "launch-1",
+    effective
+  });
+
+  assert.equal(plan.session, null);
+  assert.equal(plan.launch.env.YUI_RUN_ID, "agent-run-1");
+  assert.equal(plan.launch.env.YUI_LAUNCH_ID, "launch-1");
+  assert.equal(plan.launch.env.YUI_NATIVE_SESSION_ID, undefined);
+  const hooksIndex = plan.launch.args.indexOf("--enable");
+  assert.deepEqual(
+    plan.launch.args.slice(hooksIndex, hooksIndex + 4),
+    [
+      "--enable",
+      "hooks",
+      "--config",
+      "hooks={SessionStart=[{hooks=[{type=\"command\",command=\"'"
+        + `${process.execPath}' '/dist/cli.js' internal codex-hook\"}]}],`
+        + "UserPromptSubmit=[{hooks=[{type=\"command\",command=\"'"
+        + `${process.execPath}' '/dist/cli.js' internal codex-hook\"}]}]}`
+    ]
+  );
+  assert.ok(plan.launch.args.includes("--dangerously-bypass-hook-trust"));
+  assert.equal(plan.launch.args.at(-2), "--");
+  assert.equal(plan.launch.args.at(-1), "test hooks");
+  assert.equal(plan.initialPromptRunId, "agent-run-1");
+  assert.ok(plan.launch.args.includes(
+    `projects={${JSON.stringify(home)}={trust_level="trusted"}}`
+  ));
+});
+
+test("managed Codex resume submits the exact first Run prompt after the native session id", (t) => {
+  const { home, store, task, role, agent, now } = fixture(t);
+  const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  }, agent.id, now);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    nativeSessionId: "codex-existing",
+    policy: "fixed",
+    status: "ready",
+    effective
+  }, now);
+  store.saveTaskRoleSessionSet(sessions);
+  store.saveActiveAgentRun(createAgentRun(
+    "agent-run-1",
+    task.id,
+    role.name,
+    "resume",
+    "-prompt that begins like an option",
+    now,
+    { effective }
+  ));
+
+  const plan = new FileRoleLaunchPlanner(home, store, { cliPath: "/dist/cli.js" }).plan({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    mode: "resume",
+    runId: "agent-run-1",
+    launchId: "launch-1",
+    nativeSessionId: "codex-existing",
+    effective
+  });
+
+  assert.deepEqual(
+    plan.launch.args.slice(-4),
+    ["resume", "codex-existing", "--", "-prompt that begins like an option"]
+  );
+  assert.equal(plan.initialPromptRunId, "agent-run-1");
+});
+
 test("managed Codex launch refuses to replace an existing native notify callback", (t) => {
   const { home, store, task, role, agent } = fixture(t);
   const codexHome = join(home, "native-codex");
@@ -480,7 +575,7 @@ test("Claude launch identity is deterministic for one durable launch across retr
   assert.deepEqual(first.launch.args.slice(-2), ["--session-id", first.session.nativeSessionId]);
 });
 
-test("managed Claude Task Runs inject only StopFailure and exact explicit-yield access", (t) => {
+test("managed Claude Task Runs inject the lifecycle hooks and exact explicit-yield access", (t) => {
   const { home, store, task, role, agent, now } = fixture(t, "claude");
   const controlledRole = createRole(
     task.id,
@@ -545,10 +640,15 @@ test("managed Claude Task Runs inject only StopFailure and exact explicit-yield 
   const pluginRoot = plan.launch.args[pluginIndex + 1];
   assert.ok(pluginRoot.startsWith(join(home, "runtime")));
   const hooks = JSON.parse(readFileSync(join(pluginRoot, "hooks", "hooks.json"), "utf8"));
-  assert.deepEqual(Object.keys(hooks.hooks), ["StopFailure"]);
-  const command = hooks.hooks.StopFailure[0].hooks[0];
-  assert.equal(command.command, process.execPath);
-  assert.deepEqual(command.args, ["/dist/cli.js", "internal", "claude-hook"]);
+  assert.deepEqual(
+    Object.keys(hooks.hooks).sort(),
+    ["SessionStart", "StopFailure", "UserPromptSubmit"]
+  );
+  for (const eventKey of ["SessionStart", "UserPromptSubmit", "StopFailure"]) {
+    const command = hooks.hooks[eventKey][0].hooks[0];
+    assert.equal(command.command, process.execPath, eventKey);
+    assert.deepEqual(command.args, ["/dist/cli.js", "internal", "claude-hook"], eventKey);
+  }
   assert.equal(plan.launch.env.YUI_RUN_ID, run.id);
   assert.equal(plan.launch.env.YUI_LAUNCH_ID, "launch-1");
   assert.equal(plan.launch.env.YUI_NATIVE_SESSION_ID, plan.session.nativeSessionId);

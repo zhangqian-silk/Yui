@@ -120,7 +120,8 @@ test("configured provider enums remain independent from write access", () => {
   });
   assert.equal(codexEffective.profileAccess, "write");
   assert.deepEqual(compileArgv(codexRole, codexEffective).slice(2), [
-    "--sandbox", "read-only", "--ask-for-approval", "never"
+    "--sandbox", "read-only", "--ask-for-approval", "never",
+    "--config", 'projects={"/fixture/work-item-1"={trust_level="trusted"}}'
   ]);
 
   const claudeRole = desiredRole("claude", {

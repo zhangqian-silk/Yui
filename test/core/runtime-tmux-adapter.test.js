@@ -33,7 +33,7 @@ test("TmuxSessionHost starts task owners through the task planner and returns an
   const planner = {
     plan(input) {
       calls.push(["plan", input]);
-      return fakePlan();
+      return { ...fakePlan(), initialPromptRunId: input.runId };
     },
     planGlobalRole() {
       throw new Error("unexpected global plan");
@@ -68,7 +68,8 @@ test("TmuxSessionHost starts task owners through the task planner and returns an
     agentId: "codex-personal",
     adapterId: "codex",
     effective: effective(),
-    workspace: "/repo"
+    workspace: "/repo",
+    runId: "agent-run-1"
   });
 
   const binding = await host.start(request);
@@ -81,13 +82,15 @@ test("TmuxSessionHost starts task owners through the task planner and returns an
       adapterId: "codex",
       effective: effective(),
       launchId: "launch-1",
-      mode: "new"
+      mode: "new",
+      runId: "agent-run-1"
     }],
     ["ensure-async", "task-1", fakePlan().role, fakePlan().launch]
   ]);
   assert.equal(binding.id, "binding-1");
   assert.equal(binding.launchId, "launch-1");
   assert.equal(binding.hostRef.startsWith("yui-tmux:v1:"), true);
+  assert.equal(binding.initialPromptRunId, "agent-run-1");
   assert.equal("nativeSessionId" in binding, false);
   assert.deepEqual(await host.inspect(binding), { state: "running" });
   assert.deepEqual(calls.at(-1), ["probe-async", "task-1", "leader"]);

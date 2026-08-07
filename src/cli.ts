@@ -78,6 +78,7 @@ import { cleanControllerResource } from "./controller/resourceCleanupLinux.js";
 import { scanControllerResourceInventory } from "./controller/resourceInventoryLinux.js";
 import { runSessionNotifyCommand } from "./controller/sessionNotify.js";
 import { runClaudeLifecycleHookCommand } from "./controller/claudeLifecycleHook.js";
+import { runCodexLifecycleHookCommand } from "./controller/codexLifecycleHook.js";
 import { buildDoctorReport, renderDoctor, runDoctorCommand } from "./doctor/doctor.js";
 import { agentNotFound, CliError, runtimeError, usageError } from "./errors/cliError.js";
 import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
@@ -230,6 +231,10 @@ export async function main(): Promise<void> {
     }
     if (args[1] === "claude-hook" && args.length === 2) {
       await runClaudeLifecycleHookCommand(readFileSync(0, "utf8"), process.env);
+      return;
+    }
+    if (args[1] === "codex-hook" && args.length === 2) {
+      await runCodexLifecycleHookCommand(readFileSync(0, "utf8"), process.env);
       return;
     }
     throw usageError("Internal lifecycle callback usage is invalid.");

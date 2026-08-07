@@ -204,7 +204,7 @@ test("an active Role Run may launch from its snapshotted workspace", async (t) =
   assert.ok(reviewerStart);
   assert.equal(reviewerStart.workspace, workspace.root);
   assert.notEqual(reviewerStart.workspace, role.workspace);
-  assert.notEqual(store.getActiveAgentRun(task.id, reviewer.name).deliveredAt, undefined);
+  assert.notEqual(store.getActiveAgentRun(task.id, reviewer.name).pushedAt, undefined);
 });
 
 test("a Role host created after Task archival is stopped without a false cleanup signal", async (t) => {

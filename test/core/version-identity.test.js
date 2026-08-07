@@ -13,7 +13,7 @@ test("Yui exposes one release identity for CLI, Controller and storage diagnosti
     version: "0.3.0",
     controllerProtocolVersion: 3,
     storageLayoutVersion: 6,
-    aggregateSchemaVersion: 15
+    aggregateSchemaVersion: 16
   });
 
   const output = execFileSync(
