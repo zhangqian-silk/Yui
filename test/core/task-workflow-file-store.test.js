@@ -744,10 +744,25 @@ test("Task list and show emit one-pass structured JSON for Agents", (t) => {
     }
   ));
 
-  assert.deepEqual(runCli("task", "list"), {
-    ok: true,
-    data: { tasks: [task] }
+  const listed = runCli("task", "list");
+  assert.equal(listed.ok, true);
+  assert.equal(listed.data.tasks.length, 1);
+  assert.deepEqual(
+    Object.fromEntries(Object.keys(task).map((key) => [key, listed.data.tasks[0][key]])),
+    task
+  );
+  assert.equal(listed.data.tasks[0].summaryStatus, "missing");
+  assert.deepEqual(listed.data.tasks[0].work.counts, {
+    total: 0,
+    pending: 0,
+    running: 0,
+    awaiting_acceptance: 0,
+    completed: 0,
+    failed: 0,
+    retired: 0
   });
+  assert.deepEqual(listed.data.tasks[0].input, { open: [], openCount: 0 });
+  assert.deepEqual(listed.data.tasks[0].blockers, []);
   assert.deepEqual(runCli("task", "show", task.id), {
     ok: true,
     data: {
