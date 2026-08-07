@@ -376,6 +376,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     nativeSessionId?: string;
     runId?: string;
     launchId?: string;
+    progressAt?: string;
   }>[], resourceInputs?: readonly SchedulerRoleResourceInput[]): Promise<readonly Readonly<{
     taskId: string;
     roleName: string;
@@ -405,7 +406,8 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       ...(input.nativeSessionId === undefined
         ? {}
         : { nativeSessionId: input.nativeSessionId }),
-      ...(input.launchId === undefined ? {} : { launchId: input.launchId })
+      ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+      ...(input.progressAt === undefined ? {} : { progressAt: input.progressAt })
     }));
     if (
       this.runtimePorts?.roleResourceInventory !== undefined

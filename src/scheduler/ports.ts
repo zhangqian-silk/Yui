@@ -71,8 +71,22 @@ export type SchedulerRunProgress = Readonly<{
 }>;
 
 /** One bounded advisory process sample carried by the full Role inventory. */
+export type SchedulerRoleResourceIdentity = Readonly<{
+  taskId: string;
+  roleName: string;
+  runId: string;
+  agentId: string;
+  adapterId: string;
+  nativeSessionId?: string;
+  launchId?: string;
+}>;
+
 export type SchedulerRoleResourceEvidence = Readonly<{
   observedAt: string;
+  /** Exact producer generation; missing identity is never consumable progress evidence. */
+  identity?: SchedulerRoleResourceIdentity;
+  /** Durable progress fence observed/requested for this sample. */
+  progressAt?: string;
   /** Set by the inventory producer when one of the counters changed. */
   changed?: boolean;
   /** Explicit activity is advisory and never advances durable progress. */
@@ -98,6 +112,7 @@ export type SchedulerRoleResourceInput = Readonly<{
   adapterId: string;
   nativeSessionId?: string;
   launchId?: string;
+  progressAt?: string;
 }>;
 
 export type RoleRunProgressPersistence = Readonly<{
@@ -114,6 +129,10 @@ export type RoleRunResourceSuppressionPersistence = Readonly<{
   taskId: string;
   roleName: string;
   runId: string;
+  agentId: string;
+  adapterId: string;
+  nativeSessionId?: string;
+  launchId?: string;
   progressAt: string;
   observedAt: string;
   now: Date;
@@ -468,6 +487,7 @@ export interface TmuxDeliveryPort {
     nativeSessionId?: string;
     runId?: string;
     launchId?: string;
+    progressAt?: string;
   }>[], resourceInputs?: readonly SchedulerRoleResourceInput[]):
     Promise<readonly Readonly<{
       taskId: string;

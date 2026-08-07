@@ -159,6 +159,23 @@ export async function startFileTaskControllerRuntime(
             && candidate.roleName === owner.roleName
           ));
           if (input === undefined) return [];
+          const identity = owner.runId === undefined
+            || owner.adapterId === undefined
+            || (owner.nativeSessionId === undefined && owner.launchId === undefined)
+            || (owner.nativeSessionId !== undefined && owner.nativeSessionId.trim().length === 0)
+            || (owner.launchId !== undefined && owner.launchId.trim().length === 0)
+            ? undefined
+            : {
+                taskId: owner.taskId,
+                roleName: owner.roleName,
+                runId: owner.runId,
+                agentId: owner.agentId,
+                adapterId: owner.adapterId,
+                ...(owner.nativeSessionId === undefined
+                  ? {}
+                  : { nativeSessionId: owner.nativeSessionId }),
+                ...(owner.launchId === undefined ? {} : { launchId: owner.launchId })
+              };
           const changed = !active || input.runId === undefined
             ? false
             : resourceActivity({
@@ -179,6 +196,8 @@ export async function startFileTaskControllerRuntime(
               observedAt: inventory.observedAt,
               active,
               changed: active && changed,
+              ...(identity === undefined ? {} : { identity }),
+              ...(input.progressAt === undefined ? {} : { progressAt: input.progressAt }),
               cpuTimeMs: resource.cpuTimeMs,
               ...(resource.ioReadBytes === undefined
                 ? {}

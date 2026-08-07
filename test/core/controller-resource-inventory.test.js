@@ -93,8 +93,13 @@ test("adjacent resource activity requires exact identity and increasing CPU/IO c
   );
   assert.equal(
     tracker(resourceIdentity(), roleResource({ cpuTimeMs: 4, ioReadBytes: 1 })),
+    false,
+    "the first valid sample after a reset is not adjacent"
+  );
+  assert.equal(
+    tracker(resourceIdentity(), roleResource({ cpuTimeMs: 5, ioReadBytes: 1 })),
     true,
-    "activity resumes only after the reset baseline"
+    "activity resumes only after a post-reset baseline"
   );
   assert.equal(
     tracker(resourceIdentity({ nativeSessionId: "other-native" }), roleResource()),
@@ -105,6 +110,67 @@ test("adjacent resource activity requires exact identity and increasing CPU/IO c
     createRuntimeResourceActivityTracker()(resourceIdentity(), roleResource({ cpuTimeMs: 99 })),
     false,
     "Controller restart starts a fresh baseline"
+  );
+});
+
+test("rejected identity, inventory, counter, and process gaps clear the adjacent baseline", () => {
+  const identity = resourceIdentity();
+  const tracker = createRuntimeResourceActivityTracker();
+  assert.equal(tracker(identity, roleResource({ cpuTimeMs: 10 })), false);
+  assert.equal(
+    tracker({ ...identity, nativeSessionId: "old-native" }, roleResource({ cpuTimeMs: 11 })),
+    false,
+    "identity mismatch is a gap"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ cpuTimeMs: 20 })),
+    false,
+    "the first sample after identity returns is a baseline"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ cpuTimeMs: 21 })),
+    true,
+    "only the next adjacent sample is activity"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ processes: [], cpuTimeMs: 22 })),
+    false,
+    "an empty process inventory clears the baseline"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ cpuTimeMs: 30 })),
+    false,
+    "a sample after an empty inventory is a baseline"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ cpuTimeMs: Number.NaN })),
+    false,
+    "an invalid counter clears the baseline"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ cpuTimeMs: 40 })),
+    false,
+    "a sample after an invalid counter is a baseline"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ cpuTimeMs: 41 })),
+    true,
+    "valid adjacent samples resume only after the gap"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ fingerprint: "agent-session:new-process", cpuTimeMs: 42 })),
+    false,
+    "a process identity change is a generation gap"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ fingerprint: "agent-session:new-process", cpuTimeMs: 43 })),
+    false,
+    "the first sample after process replacement is a baseline"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ fingerprint: "agent-session:new-process", cpuTimeMs: 44 })),
+    true,
+    "replacement process activity needs an adjacent sample"
   );
 });
 

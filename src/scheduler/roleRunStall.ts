@@ -85,7 +85,8 @@ export type RoleRunHealthProjection = Readonly<{
 
 /**
  * One pure projection used by every Role. Resource activity can suppress a
- * false positive only together with a live host and matching native Session;
+ * false positive only together with a live host and matching native Session
+ * or launch generation;
  * it never changes the durable progress clock or authorizes recovery.
  */
 export function projectRoleRunHealth(input: Readonly<{
@@ -95,7 +96,11 @@ export function projectRoleRunHealth(input: Readonly<{
   now: Date;
   windowMs?: number;
   hostLiveness: "present" | "absent" | "unknown";
-  nativeSession?: Readonly<{ status: string; nativeSessionId?: string }> | null;
+  nativeSession?: Readonly<{
+    status: string;
+    nativeSessionId?: string;
+    launchId?: string;
+  }> | null;
   providerAcceptance?: RoleRunProviderAcceptance;
   resource?: RoleRunResourceEvidence;
   roleName?: string;
@@ -131,7 +136,8 @@ export function projectRoleRunHealth(input: Readonly<{
         ? "broken"
         : session.status !== "ready" && session.status !== "running"
           ? "unknown"
-          : session.nativeSessionId === undefined
+          : !hasResourceIdentityText(session.nativeSessionId)
+            && !hasResourceIdentityText(session.launchId)
             ? "unknown"
             : "matching";
   const resourceActivity = hostLiveness === "present"
@@ -575,6 +581,7 @@ export async function reconcileStalledRoleRuns(
           taskId: task.id,
           roleName: role.name,
           runId: run.id,
+          progressAt: run.deliveredAt ?? run.createdAt,
           agentId: session?.agentId ?? run.effective.agentId,
           adapterId: session?.adapterId ?? run.effective.adapterId,
           ...(session?.launchId === undefined ? {} : { launchId: session.launchId }),
@@ -588,6 +595,7 @@ export async function reconcileStalledRoleRuns(
                 taskId: task.id,
                 roleName: role.name,
                 runId: run.id,
+                progressAt: run.deliveredAt ?? run.createdAt,
                 agentId: session?.agentId ?? run.effective.agentId,
                 adapterId: session?.adapterId ?? run.effective.adapterId,
                 ...(session?.launchId === undefined ? {} : { launchId: session.launchId }),
@@ -697,6 +705,21 @@ export async function reconcileStalledRoleRuns(
       );
     const sessionUsable = candidate.session === null
       || (candidate.session.status !== "stopped" && candidate.session.status !== "broken");
+    const expectedResourceIdentity = candidate.session === null
+      ? undefined
+      : {
+          taskId: candidate.task.id,
+          roleName: candidate.role.name,
+          runId: candidate.run.id,
+          agentId: runAgentId,
+          adapterId: runAdapterId,
+          ...(candidate.session.nativeSessionId === undefined
+            ? {}
+            : { nativeSessionId: candidate.session.nativeSessionId }),
+          ...(candidate.session.launchId === undefined
+            ? {}
+            : { launchId: candidate.session.launchId })
+        };
     const resourceSnapshot = resourceForRun(
       resourceEvidence,
       candidate.task.id,
@@ -706,8 +729,12 @@ export async function reconcileStalledRoleRuns(
     const resourceCanSuppress = live === "present"
       && sessionMatchesRun
       && sessionUsable
-      && typeof candidate.session?.nativeSessionId === "string"
-      && candidate.session.nativeSessionId.trim().length > 0
+      && expectedResourceIdentity !== undefined
+      && resourceEvidenceMatchesCurrentRun(
+        resourceSnapshot,
+        expectedResourceIdentity,
+        progressAt
+      )
       && resourceEvidenceIsFresh(resourceSnapshot, now, windowMs);
     const resource = resourceCanSuppress
       ? await consumeResourceEvidence(
@@ -717,10 +744,11 @@ export async function reconcileStalledRoleRuns(
           candidate.role.name,
           candidate.run.id,
           progressAt,
+          expectedResourceIdentity!,
           resourceSuppressionKeys,
           now
         )
-      : resourceSnapshot;
+      : undefined;
     const health = projectRoleRunHealth({
       progressAt,
       createdAt: candidate.run.createdAt,
@@ -984,9 +1012,41 @@ function resourceForRun(
   runId: string
 ): RoleRunResourceEvidence | undefined {
   if (snapshot === undefined) return undefined;
-  return snapshot.get(`${taskId}\0${roleName}\0${runId}`)
-    ?? snapshot.get(`${taskId}\0${roleName}`)
-    ?? snapshot.get(runId);
+  return snapshot.get(`${taskId}\0${roleName}\0${runId}`);
+}
+
+function resourceEvidenceMatchesCurrentRun(
+  resource: RoleRunResourceEvidence | undefined,
+  expected: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    agentId: string;
+    adapterId: string;
+    nativeSessionId?: string;
+    launchId?: string;
+  }> | undefined,
+  progressAt: string
+): boolean {
+  if (resource === undefined || expected === undefined) return false;
+  const identity = resource.identity;
+  if (
+    identity === undefined
+    || resource.progressAt !== progressAt
+    || identity.taskId !== expected.taskId
+    || identity.roleName !== expected.roleName
+    || identity.runId !== expected.runId
+    || identity.agentId !== expected.agentId
+    || identity.adapterId !== expected.adapterId
+    || identity.nativeSessionId !== expected.nativeSessionId
+    || identity.launchId !== expected.launchId
+  ) return false;
+  return hasResourceIdentityText(identity.nativeSessionId)
+    || hasResourceIdentityText(identity.launchId);
+}
+
+function hasResourceIdentityText(value: string | undefined): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 /** Consume at most one advisory sample for one Run/progress point. */
@@ -997,11 +1057,23 @@ async function consumeResourceEvidence(
   roleName: string,
   runId: string,
   progressAt: string,
+  expectedIdentity: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    agentId: string;
+    adapterId: string;
+    nativeSessionId?: string;
+    launchId?: string;
+  }>,
   suppressionKeys: Set<string> | undefined,
   now: Date
 ): Promise<RoleRunResourceEvidence | undefined> {
   const resource = resourceForRun(snapshot, taskId, roleName, runId);
   if (resource === undefined) return undefined;
+  if (!resourceEvidenceMatchesCurrentRun(resource, expectedIdentity, progressAt)) {
+    return resource;
+  }
   if (resource.active !== true || resource.changed !== true) return resource;
   const key = `${taskId}\0${roleName}\0${runId}\0${progressAt}`;
   if (store.recordRoleRunResourceSuppression !== undefined) {
@@ -1009,6 +1081,14 @@ async function consumeResourceEvidence(
       taskId,
       roleName,
       runId,
+      agentId: expectedIdentity.agentId,
+      adapterId: expectedIdentity.adapterId,
+      ...(expectedIdentity.nativeSessionId === undefined
+        ? {}
+        : { nativeSessionId: expectedIdentity.nativeSessionId }),
+      ...(expectedIdentity.launchId === undefined
+        ? {}
+        : { launchId: expectedIdentity.launchId }),
       progressAt,
       observedAt: resource.observedAt,
       now
@@ -1017,9 +1097,9 @@ async function consumeResourceEvidence(
     if (persisted === "already-recorded") {
       return { ...resource, active: false, changed: false };
     }
-    // A concurrent Run/session change is not permission to manufacture a
-    // stall or to rebind the resource sample; leave the advisory fact intact.
-    return resource;
+    // A concurrent Run/session change invalidates this sample. Do not let the
+    // stale changed bit suppress the current Run's attention episode.
+    return { ...resource, active: false, changed: false };
   }
   if (suppressionKeys === undefined || !suppressionKeys.has(key)) {
     suppressionKeys?.add(key);

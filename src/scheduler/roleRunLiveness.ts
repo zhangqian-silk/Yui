@@ -48,6 +48,7 @@ export async function reconcileExitedRoleRuns(
           agentId: run.effective.agentId,
           adapterId: run.effective.adapterId,
           runId: run.id,
+          progressAt: run.deliveredAt ?? run.createdAt,
           ...(session?.launchId === undefined ? {} : { launchId: session.launchId }),
           ...(session?.nativeSessionId === undefined
             ? {}
@@ -86,6 +87,7 @@ export async function reconcileExitedRoleRuns(
                 runId: run.id,
                 agentId: run.effective.agentId,
                 adapterId: run.effective.adapterId,
+                progressAt: run.deliveredAt ?? run.createdAt,
                 ...(session?.nativeSessionId === undefined
                   ? {}
                   : { nativeSessionId: session.nativeSessionId }),
@@ -99,11 +101,12 @@ export async function reconcileExitedRoleRuns(
   }
   if (resourceEvidence !== undefined) {
     for (const [key, resource] of batchSnapshot.resources) {
-      resourceEvidence.set(key, resource);
       const candidate = candidates.find(({ task, role }) => (
         `${task.id}\0${role.name}` === key
       ));
       if (candidate !== undefined) {
+        // Keep only the exact Run key. A task/role or bare-Run fallback can
+        // bridge an asynchronous sample from a prior generation.
         resourceEvidence.set(`${key}\0${candidate.run.id}`, resource);
       }
     }
@@ -152,6 +155,7 @@ type RoleRunCandidate = Readonly<{
     agentId: string;
     adapterId: string;
     runId: string;
+    progressAt: string;
     nativeSessionId?: string;
     launchId?: string;
   }>;

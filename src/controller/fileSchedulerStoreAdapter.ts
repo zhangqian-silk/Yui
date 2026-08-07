@@ -367,6 +367,16 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         || run.id !== input.runId
         || run.status !== "active"
       ) return "state-changed";
+      const session = store.getRoleSession(input.taskId, input.roleName);
+      if (
+        session === null
+        || session.agentId !== input.agentId
+        || session.adapterId !== input.adapterId
+        || session.status === "stopped"
+        || session.status === "broken"
+        || session.nativeSessionId !== input.nativeSessionId
+        || session.launchId !== input.launchId
+      ) return "state-changed";
       const existing = store.listEvents(task.id).some((event) => (
         event.type === RUN_RESOURCE_SUPPRESSED_EVENT
         && event.payload.runId === run.id

@@ -173,13 +173,31 @@ export function createRuntimeResourceActivityTracker(): RuntimeResourceActivityT
     ioWriteBytes?: number;
   }>>();
   return (identity, resource) => {
-    if (!matchesResourceIdentity(identity, resource.owner)) return false;
-    if (resource.processes.length === 0) return false;
+    const roleKey = resourceSampleRoleKey(identity, resource);
+    const ownerRoleKey = resource.owner.kind === "task-role"
+      ? `${resource.owner.taskId}\0${resource.owner.roleName}`
+      : undefined;
+    const reject = () => {
+      // A rejected observation is a generation/process gap, not an adjacent
+      // sample. Never let a later valid observation bridge across it.
+      const keys = new Set([roleKey, ownerRoleKey].filter((key): key is string => key !== undefined));
+      if (keys.size === 0) previous.clear();
+      else for (const key of keys) previous.delete(key);
+      return false;
+    };
+    if (!matchesResourceIdentity(identity, resource.owner)) return reject();
+    if (!Array.isArray(resource.processes) || resource.processes.length === 0) {
+      return reject();
+    }
     const cpuTimeMs = nonNegativeCounter(resource.cpuTimeMs);
-    if (cpuTimeMs === undefined) return false;
+    if (cpuTimeMs === undefined) return reject();
     const ioReadBytes = optionalCounter(resource.ioReadBytes);
     const ioWriteBytes = optionalCounter(resource.ioWriteBytes);
-    const roleKey = `${identity.taskId}\0${identity.roleName}`;
+    if (
+      (resource.ioReadBytes !== undefined && ioReadBytes === undefined)
+      || (resource.ioWriteBytes !== undefined && ioWriteBytes === undefined)
+      || roleKey === undefined
+    ) return reject();
     const identityKey = JSON.stringify([
       identity.runId,
       identity.agentId,
@@ -195,19 +213,29 @@ export function createRuntimeResourceActivityTracker(): RuntimeResourceActivityT
       ...(ioWriteBytes === undefined ? {} : { ioWriteBytes })
     };
     const prior = previous.get(roleKey);
-    previous.set(roleKey, current);
+    if (prior === undefined) {
+      previous.set(roleKey, current);
+      return false;
+    }
     if (
-      prior === undefined
-      || prior.identity !== current.identity
+      (prior.ioReadBytes !== undefined && ioReadBytes === undefined)
+      || (prior.ioWriteBytes !== undefined && ioWriteBytes === undefined)
+    ) return reject();
+    if (
+      prior.identity !== current.identity
       || prior.fingerprint !== current.fingerprint
-    ) return false;
-    // Counter resets are a new baseline, not evidence of progress. Replacing
-    // the stored sample above lets a subsequent increase become observable.
+    ) {
+      // An identity/process generation change is not adjacent to the prior
+      // sample. Require a fresh baseline on a subsequent valid observation.
+      previous.delete(roleKey);
+      return false;
+    }
     if (
       cpuTimeMs < prior.cpuTimeMs
       || counterReset(ioReadBytes, prior.ioReadBytes)
       || counterReset(ioWriteBytes, prior.ioWriteBytes)
-    ) return false;
+    ) return reject();
+    previous.set(roleKey, current);
     return cpuTimeMs > prior.cpuTimeMs
       || counterIncrease(ioReadBytes, prior.ioReadBytes)
       || counterIncrease(ioWriteBytes, prior.ioWriteBytes);
@@ -577,6 +605,21 @@ function matchesResourceIdentity(
   owner: RuntimeOwner
 ): boolean {
   if (
+    identity === undefined
+    || typeof identity.taskId !== "string"
+    || identity.taskId.length === 0
+    || typeof identity.roleName !== "string"
+    || identity.roleName.length === 0
+    || typeof identity.runId !== "string"
+    || identity.runId.length === 0
+    || typeof identity.agentId !== "string"
+    || identity.agentId.length === 0
+    || typeof identity.adapterId !== "string"
+    || identity.adapterId.length === 0
+    || (identity.nativeSessionId !== undefined && !hasIdentityText(identity.nativeSessionId))
+    || (identity.launchId !== undefined && !hasIdentityText(identity.launchId))
+  ) return false;
+  if (
     owner.kind !== "task-role"
     || owner.taskId !== identity.taskId
     || owner.roleName !== identity.roleName
@@ -584,13 +627,36 @@ function matchesResourceIdentity(
     || owner.agentId !== identity.agentId
     || owner.adapterId !== identity.adapterId
   ) return false;
-  if (identity.nativeSessionId === undefined && identity.launchId === undefined) return false;
+  if (!hasIdentityText(identity.nativeSessionId) && !hasIdentityText(identity.launchId)) return false;
   if (
     identity.nativeSessionId !== undefined
     && owner.nativeSessionId !== identity.nativeSessionId
   ) return false;
   if (identity.launchId !== undefined && owner.launchId !== identity.launchId) return false;
   return true;
+}
+
+function hasIdentityText(value: string | undefined): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function resourceSampleRoleKey(
+  identity: RuntimeResourceSampleIdentity | undefined,
+  resource: RuntimeResource | undefined
+): string | undefined {
+  const taskId = typeof identity?.taskId === "string" && identity.taskId.length > 0
+    ? identity.taskId
+    : resource?.owner.kind === "task-role"
+      ? resource.owner.taskId
+      : undefined;
+  const roleName = typeof identity?.roleName === "string" && identity.roleName.length > 0
+    ? identity.roleName
+    : resource?.owner.kind === "task-role"
+      ? resource.owner.roleName
+      : undefined;
+  return taskId === undefined || roleName === undefined
+    ? undefined
+    : `${taskId}\0${roleName}`;
 }
 
 function nonNegativeCounter(value: number | undefined): number | undefined {

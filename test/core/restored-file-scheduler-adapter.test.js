@@ -412,6 +412,16 @@ test("advisory resource suppression survives a Controller restart for one Run/pr
         status: "present",
         resource: {
           observedAt: new Date(now.getTime() - 1_000).toISOString(),
+          progressAt: input.progressAt,
+          identity: {
+            taskId: input.taskId,
+            roleName: input.roleName,
+            runId: input.runId,
+            agentId: input.agentId,
+            adapterId: input.adapterId,
+            nativeSessionId: input.nativeSessionId,
+            launchId: input.launchId
+          },
           active: true,
           changed: true,
           cpuTimeMs: 20,

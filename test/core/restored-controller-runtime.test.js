@@ -161,6 +161,15 @@ test("full controller liveness and stall phases reuse one Role inventory", async
         status: "present",
         resource: {
           observedAt: new Date(31 * 60_000).toISOString(),
+          progressAt: input.progressAt,
+          identity: {
+            taskId: input.taskId,
+            roleName: input.roleName,
+            runId: input.runId,
+            agentId: input.agentId,
+            adapterId: input.adapterId,
+            nativeSessionId: input.nativeSessionId
+          },
           active: true,
           changed: true,
           cpuTimeMs: 20,

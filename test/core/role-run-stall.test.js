@@ -247,6 +247,15 @@ test("one scheduler resource sample suppresses an execution false positive witho
   const resourceEvidence = new Map([
     ["task-1\0worker\0run-1", {
       observedAt: "2026-08-05T00:59:30.000Z",
+      progressAt: PROGRESS,
+      identity: {
+        taskId: "task-1",
+        roleName: "worker",
+        runId: "run-1",
+        agentId: "agent-1",
+        adapterId: "codex",
+        nativeSessionId: "native-1"
+      },
       active: true,
       changed: true,
       cpuTimeMs: 20,
@@ -264,6 +273,139 @@ test("one scheduler resource sample suppresses an execution false positive witho
   );
   assert.deepEqual(result, []);
   assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 0);
+});
+
+test("launch identity can fence advisory resource activity when native Session id is opaque", async () => {
+  const store = stallStore({
+    session: {
+      agentId: "agent-1",
+      adapterId: "codex",
+      launchId: "launch-1",
+      status: "running"
+    }
+  });
+  const result = await reconcileStalledRoleRuns(
+    store,
+    { async inspectRole() { return "present"; } },
+    NOW,
+    undefined,
+    30 * 60_000,
+    undefined,
+    new Map([[
+      "task-1\0worker\0run-1",
+      {
+        observedAt: "2026-08-05T00:59:30.000Z",
+        progressAt: PROGRESS,
+        identity: {
+          taskId: "task-1",
+          roleName: "worker",
+          runId: "run-1",
+          agentId: "agent-1",
+          adapterId: "codex",
+          launchId: "launch-1"
+        },
+        active: true,
+        changed: true
+      }
+    ]])
+  );
+  assert.deepEqual(result, []);
+  assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 0);
+});
+
+test("a concurrent suppression CAS change cannot leave a stale changed sample healthy", async () => {
+  const store = stallStore();
+  store.recordRoleRunResourceSuppression = () => "state-changed";
+  const result = await reconcileStalledRoleRuns(
+    store,
+    { async inspectRole() { return "present"; } },
+    NOW,
+    undefined,
+    30 * 60_000,
+    undefined,
+    new Map([[
+      "task-1\0worker\0run-1",
+      {
+        observedAt: "2026-08-05T00:59:30.000Z",
+        progressAt: PROGRESS,
+        identity: {
+          taskId: "task-1",
+          roleName: "worker",
+          runId: "run-1",
+          agentId: "agent-1",
+          adapterId: "codex",
+          nativeSessionId: "native-1"
+        },
+        active: true,
+        changed: true
+      }
+    ]])
+  );
+  assert.equal(result[0]?.runId, "run-1");
+  assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 1);
+});
+
+test("stale Run, Session-generation, and progress-fence samples cannot suppress the current stall", async () => {
+  for (const { identity, sampleProgressAt } of [
+    { identity: {
+      taskId: "task-1",
+      roleName: "worker",
+      runId: "old-run",
+      agentId: "agent-1",
+      adapterId: "codex",
+      nativeSessionId: "native-1"
+    }, sampleProgressAt: PROGRESS },
+    { identity: {
+      taskId: "task-1",
+      roleName: "worker",
+      runId: "run-1",
+      agentId: "agent-1",
+      adapterId: "codex",
+      nativeSessionId: "old-native"
+    }, sampleProgressAt: PROGRESS },
+    { identity: {
+      taskId: "task-1",
+      roleName: "worker",
+      runId: "run-1",
+      agentId: "agent-1",
+      adapterId: "codex",
+      nativeSessionId: "native-1"
+    }, sampleProgressAt: "2026-08-04T23:59:00.000Z" }
+  ]) {
+    const store = stallStore();
+    const result = await reconcileStalledRoleRuns(
+      store,
+      { async inspectRole() { return "present"; } },
+      NOW,
+      undefined,
+      30 * 60_000,
+      undefined,
+      new Map([
+        // This broad key models the old task/role fallback and must be ignored.
+        ["task-1\0worker", {
+          observedAt: "2026-08-05T00:59:30.000Z",
+          progressAt: sampleProgressAt,
+          identity,
+          active: true,
+          changed: true
+        }],
+        // Even an exact current-Run key is unsafe when its Session generation is stale.
+        ["task-1\0worker\0run-1", {
+          observedAt: "2026-08-05T00:59:30.000Z",
+          progressAt: sampleProgressAt,
+          identity,
+          active: true,
+          changed: true
+        }]
+      ])
+    );
+    assert.equal(result[0]?.runId, "run-1");
+    assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 1);
+    assert.equal(
+      store.events.filter((event) => event.type === "run.resource-suppressed").length,
+      0
+    );
+  }
 });
 
 test("a live accepted Run raises one idempotent needs-attention event without a Task Message", async () => {
