@@ -1,18 +1,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import test from "node:test";
 
-import { NodeCommandExecutor } from "../../dist/tmux/commandExecutor.js";
-import { TmuxManager } from "../../dist/tmux/tmuxManager.js";
 import {
   TmuxWebTerminalService
 } from "../../dist/web/tmuxWebTerminal.js";
 import {
   yuiTmuxServerName
 } from "../../dist/tmux/tmuxManager.js";
+import { createIsolatedRuntime } from "../helpers/isolatedRuntime.js";
 
 function fakePty() {
   const data = new Set();
@@ -350,12 +346,64 @@ test("web terminal replays PTY output and exit produced before browser listeners
   connection.close();
 });
 
-test("real web PTY detaches without stopping its tmux Agent", async () => {
-  const yuiHome = mkdtempSync(join(tmpdir(), "yui-web-terminal-"));
-  const manager = new TmuxManager("tmux", new NodeCommandExecutor(), { yuiHome });
-  try {
-    manager.ensureRoleWindow("operator", {
-      name: "operator",
+test("real web PTY detaches without stopping its tmux Agent", async (t) => {
+  const runtime = createIsolatedRuntime(t);
+  const yuiHome = runtime.home;
+  const manager = runtime.tmux();
+  manager.ensureRoleWindow("operator", {
+    name: "operator",
+    workspace: yuiHome
+  }, {
+    command: "/bin/sh",
+    args: [],
+    env: {
+      HOME: yuiHome,
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      TERM: "xterm-256color"
+    }
+  });
+  const service = new TmuxWebTerminalService({
+    yuiHome,
+    tmuxBin: "tmux",
+    tmux: manager,
+    async prepareTaskRole() {},
+    async prepareGlobalRole() {}
+  });
+  const connection = await service.open({
+    scope: "global",
+    roleName: "operator",
+    columns: 80,
+    rows: 24
+  });
+  let output = "";
+  const marker = "__YUI_WEB_PTY_OK__";
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`Timed out waiting for real PTY output: ${output}`)),
+      3_000
+    );
+    const stop = connection.onData((data) => {
+      output += data;
+      if (!output.includes(marker)) return;
+      clearTimeout(timer);
+      stop();
+      resolve();
+    });
+    connection.write(`printf '${marker}\\n'\\r`);
+  });
+
+  connection.close();
+  assert.equal(manager.probeRoleStatus("operator", "operator"), "running");
+});
+
+test("real web terminals keep independent Role windows and native tmux scrolling", async (t) => {
+  const runtime = createIsolatedRuntime(t);
+  const yuiHome = runtime.home;
+  const manager = runtime.tmux();
+  const connections = [];
+  for (const roleName of ["leader", "worker"]) {
+    manager.ensureRoleWindow("task-1", {
+      name: roleName,
       workspace: yuiHome
     }, {
       command: "/bin/sh",
@@ -366,114 +414,53 @@ test("real web PTY detaches without stopping its tmux Agent", async () => {
         TERM: "xterm-256color"
       }
     });
-    const service = new TmuxWebTerminalService({
-      yuiHome,
-      tmuxBin: "tmux",
-      tmux: manager,
-      async prepareTaskRole() {},
-      async prepareGlobalRole() {}
-    });
-    const connection = await service.open({
-      scope: "global",
-      roleName: "operator",
+  }
+  const service = new TmuxWebTerminalService({
+    yuiHome,
+    tmuxBin: "tmux",
+    tmux: manager,
+    async prepareTaskRole() {},
+    async prepareGlobalRole() {}
+  });
+  for (const roleName of ["leader", "worker"]) {
+    connections.push(await service.open({
+      scope: "task",
+      taskId: "task-1",
+      roleName,
       columns: 80,
       rows: 24
-    });
-    let output = "";
-    const marker = "__YUI_WEB_PTY_OK__";
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error(`Timed out waiting for real PTY output: ${output}`)),
-        3_000
-      );
-      const stop = connection.onData((data) => {
-        output += data;
-        if (!output.includes(marker)) return;
-        clearTimeout(timer);
-        stop();
-        resolve();
-      });
-      connection.write(`printf '${marker}\\n'\\r`);
-    });
-
-    connection.close();
-    assert.equal(manager.probeRoleStatus("operator", "operator"), "running");
-  } finally {
-    manager.stopTask("operator");
-    rmSync(yuiHome, { recursive: true, force: true });
+    }));
   }
-});
 
-test("real web terminals keep independent Role windows and native tmux scrolling", async () => {
-  const yuiHome = mkdtempSync(join(tmpdir(), "yui-web-terminal-clients-"));
-  const manager = new TmuxManager("tmux", new NodeCommandExecutor(), { yuiHome });
-  const connections = [];
-  try {
-    for (const roleName of ["leader", "worker"]) {
-      manager.ensureRoleWindow("task-1", {
-        name: roleName,
-        workspace: yuiHome
-      }, {
-        command: "/bin/sh",
-        args: [],
-        env: {
-          HOME: yuiHome,
-          PATH: process.env.PATH ?? "/usr/bin:/bin",
-          TERM: "xterm-256color"
-        }
-      });
-    }
-    const service = new TmuxWebTerminalService({
-      yuiHome,
-      tmuxBin: "tmux",
-      tmux: manager,
-      async prepareTaskRole() {},
-      async prepareGlobalRole() {}
-    });
-    for (const roleName of ["leader", "worker"]) {
-      connections.push(await service.open({
-        scope: "task",
-        taskId: "task-1",
-        roleName,
-        columns: 80,
-        rows: 24
-      }));
-    }
-
-    const clients = await waitFor(
-      () => runTmux(yuiHome, [
-        "list-clients", "-F", "#{session_name}|#{window_name}"
-      ]).split("\n").filter(Boolean),
-      (rows) => rows.length === 2
-    );
-    assert.deepEqual(
-      clients.map((row) => row.split("|")[1]).sort(),
-      ["leader", "worker"]
-    );
-    for (const row of clients) {
-      const clientSession = row.split("|")[0];
-      assert.match(clientSession, /^yui-client-[a-f0-9]{24}$/);
-      assert.equal(runTmux(yuiHome, [
-        "show-options", "-v", "-t", clientSession, "mouse"
-      ]), "on");
-      assert.equal(runTmux(yuiHome, [
-        "show-options", "-v", "-t", clientSession, "status"
-      ]), "off");
-    }
-
-    for (const connection of connections) connection.close();
-    const remainingClientSessions = await waitFor(
-      () => runTmux(yuiHome, ["list-sessions", "-F", "#{session_name}"])
-        .split("\n")
-        .filter((name) => name.startsWith("yui-client-")),
-      (names) => names.length === 0
-    );
-    assert.deepEqual(remainingClientSessions, []);
-    assert.equal(manager.probeRoleStatus("task-1", "leader"), "running");
-    assert.equal(manager.probeRoleStatus("task-1", "worker"), "running");
-  } finally {
-    for (const connection of connections) connection.close();
-    manager.stopTask("task-1");
-    rmSync(yuiHome, { recursive: true, force: true });
+  const clients = await waitFor(
+    () => runTmux(yuiHome, [
+      "list-clients", "-F", "#{session_name}|#{window_name}"
+    ]).split("\n").filter(Boolean),
+    (rows) => rows.length === 2
+  );
+  assert.deepEqual(
+    clients.map((row) => row.split("|")[1]).sort(),
+    ["leader", "worker"]
+  );
+  for (const row of clients) {
+    const clientSession = row.split("|")[0];
+    assert.match(clientSession, /^yui-client-[a-f0-9]{24}$/);
+    assert.equal(runTmux(yuiHome, [
+      "show-options", "-v", "-t", clientSession, "mouse"
+    ]), "on");
+    assert.equal(runTmux(yuiHome, [
+      "show-options", "-v", "-t", clientSession, "status"
+    ]), "off");
   }
+
+  for (const connection of connections) connection.close();
+  const remainingClientSessions = await waitFor(
+    () => runTmux(yuiHome, ["list-sessions", "-F", "#{session_name}"])
+      .split("\n")
+      .filter((name) => name.startsWith("yui-client-")),
+    (names) => names.length === 0
+  );
+  assert.deepEqual(remainingClientSessions, []);
+  assert.equal(manager.probeRoleStatus("task-1", "leader"), "running");
+  assert.equal(manager.probeRoleStatus("task-1", "worker"), "running");
 });

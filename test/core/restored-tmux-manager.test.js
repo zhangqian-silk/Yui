@@ -26,6 +26,7 @@ import {
   yuiTmuxSessionName,
   yuiTmuxServerName
 } from "../../dist/tmux/tmuxManager.js";
+import { createIsolatedRuntime } from "../helpers/isolatedRuntime.js";
 
 function tmuxCommand(args) {
   assert.equal(args[0], "-L");
@@ -380,17 +381,12 @@ test("a real legacy pane stays limited while a re-entered Role receives the conf
     t.skip("tmux is unavailable");
     return;
   }
-  const yuiHome = join(tmpdir(), `yui-real-tmux-history-${process.pid}`);
+  const runtime = createIsolatedRuntime(t);
+  const yuiHome = runtime.home;
   const server = yuiTmuxServerName(yuiHome);
   const taskId = "history-task";
   const session = yuiTmuxSessionName(yuiHome, taskId);
-  const manager = new TmuxManager("tmux", new NodeCommandExecutor(), {
-    yuiHome,
-    historyLimit: 100_000
-  });
-  t.after(() => {
-    manager.stopTask(taskId);
-  });
+  const manager = runtime.tmux({ historyLimit: 100_000 });
   assert.equal(spawnSync(
     "tmux",
     [
@@ -398,8 +394,9 @@ test("a real legacy pane stays limited while a re-entered Role receives the conf
       "-f", "/dev/null",
       "new-session", "-d", "-s", session, "-n", "leader", "/bin/sh"
     ],
-    { stdio: "ignore" }
+    { stdio: "ignore", env: runtime.environment }
   ).status, 0);
+  runtime.recordTmuxTarget(`${session}:leader`);
 
   assert.equal(manager.ensureRoleWindow(taskId, {
     name: "leader",
@@ -484,12 +481,10 @@ test("stopping a real Task removes its detached interactive client sessions", (t
     t.skip("tmux is unavailable");
     return;
   }
-  const yuiHome = join(tmpdir(), `yui-real-tmux-stop-${process.pid}`);
-  const manager = new TmuxManager("tmux", new NodeCommandExecutor(), { yuiHome });
+  const runtime = createIsolatedRuntime(t);
+  const yuiHome = runtime.home;
+  const manager = runtime.tmux();
   const taskId = "grouped-task";
-  t.after(() => {
-    manager.stopTask(taskId);
-  });
   manager.ensureRoleWindow(taskId, {
     name: "leader",
     workspace: process.cwd()
@@ -508,7 +503,7 @@ test("stopping a real Task removes its detached interactive client sessions", (t
       "-L", yuiTmuxServerName(yuiHome),
       "list-sessions", "-F", "#{session_name}"
     ],
-    { encoding: "utf8" }
+    { encoding: "utf8", env: runtime.environment }
   );
   assert.equal(sessions.stdout.trim(), "");
 });
@@ -726,11 +721,8 @@ test("real tmux delivery applies one receipt and one command", async (t) => {
     t.skip("tmux is unavailable");
     return;
   }
-  const manager = new TmuxManager(
-    "tmux",
-    new NodeCommandExecutor(),
-    { yuiHome: join(tmpdir(), `yui-real-tmux-${process.pid}`) }
-  );
+  const runtime = createIsolatedRuntime(t);
+  const manager = runtime.tmux();
   const taskId = "receipt-task";
   const roleName = "worker";
   await manager.ensureRoleWindowAsync(taskId, {
@@ -741,10 +733,6 @@ test("real tmux delivery applies one receipt and one command", async (t) => {
     args: ["--noprofile", "--norc"],
     env: {}
   });
-  t.after(async () => {
-    await manager.stopTaskAsync(taskId).catch(() => {});
-  });
-
   const receiptId = "real-receipt";
   const input = "printf '__YUI_REAL_RECEIPT__\\n'";
   const ready = ({ dead, pid, currentCommand }) => (
@@ -800,14 +788,10 @@ test("real tmux Role process cannot inherit an undeclared Controller secret", as
       });
     }
   };
-  const manager = new TmuxManager("tmux", executor, {
-    yuiHome: join(tmpdir(), `yui-real-clean-env-${process.pid}`)
-  });
+  const runtime = createIsolatedRuntime(t);
+  const manager = runtime.tmux({ executor });
   const taskId = "clean-environment";
   const roleName = "worker";
-  t.after(async () => {
-    await manager.stopTaskAsync(taskId).catch(() => {});
-  });
   await manager.ensureRoleWindowAsync(taskId, {
     name: roleName,
     workspace: process.cwd()
@@ -841,11 +825,8 @@ test("real tmux lifecycle inspection ignores terminal contents", async (t) => {
     t.skip("tmux is unavailable");
     return;
   }
-  const manager = new TmuxManager(
-    "tmux",
-    new NodeCommandExecutor(),
-    { yuiHome: join(tmpdir(), `yui-real-operator-${process.pid}`) }
-  );
+  const runtime = createIsolatedRuntime(t);
+  const manager = runtime.tmux();
   const taskId = "operator";
   const launch = async (roleName, output) => {
     await manager.ensureRoleWindowAsync(taskId, {
@@ -864,10 +845,6 @@ test("real tmux lifecycle inspection ignores terminal contents", async (t) => {
   };
   await launch("first", "arbitrary provider output");
   await launch("second", "different provider output");
-  t.after(async () => {
-    await manager.stopTaskAsync(taskId).catch(() => {});
-  });
-
   const inspectWhenRunning = async (roleName) => {
     for (let attempt = 0; attempt < 20; attempt += 1) {
       const pane = await manager.inspectPaneAsync(taskId, roleName);
@@ -907,8 +884,9 @@ test("real tmux pane changes between inspect and send are rejected without a rec
     t.skip("tmux is unavailable");
     return;
   }
-  const yuiHome = join(tmpdir(), `yui-real-fence-${process.pid}`);
-  const manager = new TmuxManager("tmux", new NodeCommandExecutor(), { yuiHome });
+  const runtime = createIsolatedRuntime(t);
+  const yuiHome = runtime.home;
+  const manager = runtime.tmux();
   const taskId = "fence-task";
   const roleName = "worker";
   await manager.ensureRoleWindowAsync(taskId, {
@@ -919,10 +897,6 @@ test("real tmux pane changes between inspect and send are rejected without a rec
     args: ["--noprofile", "--norc"],
     env: {}
   });
-  t.after(async () => {
-    await manager.stopTaskAsync(taskId).catch(() => {});
-  });
-
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const pane = await manager.inspectPaneAsync(taskId, roleName);
     if (pane.currentCommand === "bash") break;
@@ -944,7 +918,7 @@ test("real tmux pane changes between inspect and send are rejected without a rec
         "-t",
         target,
         "x"
-      ], { encoding: "utf8" });
+      ], { encoding: "utf8", env: runtime.environment });
       assert.equal(changed.status, 0, changed.stderr);
       return true;
     }

@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
-import { chmodSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../dist/agent/agent.js";
@@ -13,6 +23,7 @@ import {
   readEphemeralDomainIdentity
 } from "../dist/controller/domainIdentity.js";
 import { restartFileTaskController } from "../dist/controller/clientRuntime.js";
+import { cleanControllerResource } from "../dist/controller/resourceCleanupLinux.js";
 import { scanControllerResourceInventory } from "../dist/controller/resourceInventoryLinux.js";
 import { createGlobalRole, createRoleAgentBinding } from "../dist/role/role.js";
 import { FileTaskStore } from "../dist/storage/taskStore.js";
@@ -121,4 +132,92 @@ test("Controller-created panes retain a fence across restart and expire safely",
   }
   assert.deepEqual(residual.resources, []);
   assert.equal(readEphemeralDomainIdentity(runtime.home).status, "absent");
+});
+
+test("an abnormal test-host exit leaves a marked domain for Controller auto-reap", async (t) => {
+  if (spawnSync("tmux", ["-V"], { stdio: "ignore" }).status !== 0) {
+    t.skip("tmux is unavailable");
+    return;
+  }
+  const rootSeed = mkdtempSync(join(tmpdir(), "yui-abnormal-runtime-seed-"));
+  rmSync(rootSeed, { recursive: true, force: true });
+  const helperUrl = pathToFileURL(join(process.cwd(), "test/helpers/isolatedRuntime.js")).href;
+  const childScript = `
+    import { createIsolatedRuntime } from ${JSON.stringify(helperUrl)};
+    const runtime = createIsolatedRuntime(undefined, { root: process.env.YUI_ABNORMAL_ROOT });
+    await runtime.startController();
+    const tmux = runtime.tmux();
+    tmux.ensureRoleWindow("abnormal-task", { name: "worker", workspace: runtime.home }, {
+      command: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 60000)"],
+      env: runtime.environment
+    });
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", childScript], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      YUI_ABNORMAL_ROOT: rootSeed
+    },
+    stdio: "ignore"
+  });
+  const [exitCode, exitSignal] = await once(child, "exit");
+  assert.equal(exitCode, 0, exitSignal ?? "abnormal runtime host failed");
+
+  const home = join(rootSeed, "yui-home");
+  const environment = { ...process.env, YUI_HOME: home };
+  t.after(() => rmSync(rootSeed, { recursive: true, force: true }));
+  let residual;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await delay(50);
+    try {
+      await callController(home, "scheduler.scan", {}, { timeoutMs: 5_000 });
+    } catch (error) {
+      if (!(error instanceof ControllerClientError)
+        || !["CONTROLLER_NOT_RUNNING", "CONTROLLER_UNAVAILABLE"].includes(error.code)) {
+        throw error;
+      }
+    }
+    residual = await scanControllerResourceInventory({
+      currentHome: home,
+      scope: "current",
+      environment
+    });
+    if (residual.resources.length === 0
+      && readEphemeralDomainIdentity(home).status === "absent") break;
+  }
+  assert.deepEqual(residual?.resources ?? [], []);
+  assert.equal(readEphemeralDomainIdentity(home).status, "absent");
+  assert.equal(existsSync(join(home, "runtime", "domain.json")), false);
+});
+
+test("teardown retains domain identity and root after a cleanup failure for retry", async (t) => {
+  let failOnce = true;
+  const runtime = createIsolatedRuntime(t, {
+    cleanupResource: async (resource, options) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error(`forced teardown cleanup failure: ${resource.id}`);
+      }
+      return cleanControllerResource(resource, options);
+    }
+  });
+  const tmux = runtime.tmux();
+  tmux.ensureRoleWindow("teardown-failure", {
+    name: "worker",
+    workspace: runtime.home
+  }, {
+    command: process.execPath,
+    args: ["-e", "setTimeout(() => {}, 60000)"],
+    env: runtime.environment
+  });
+
+  await assert.rejects(runtime.teardown(), /forced teardown cleanup failure/u);
+  assert.equal(existsSync(runtime.root), true);
+  const retained = readEphemeralDomainIdentity(runtime.home);
+  assert.equal(retained.status, "valid");
+  assert.equal(retained.identity.token, runtime.identity.token);
+
+  await runtime.teardown();
+  assert.equal(existsSync(runtime.root), false);
 });

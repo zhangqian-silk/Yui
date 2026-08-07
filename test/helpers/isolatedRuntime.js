@@ -11,12 +11,11 @@ import { join } from "node:path";
 import {
   createEphemeralDomainIdentity,
   defaultEphemeralTmuxServer,
-  domainIdentityPath,
   ephemeralDomainEnvironment,
   recordEphemeralTmuxTarget,
   readEphemeralDomainIdentity,
   readLinuxProcessStartIdentity,
-  removeEphemeralDomainIdentity,
+  removeEphemeralDomainIdentityIfUnchanged,
   writeEphemeralDomainIdentity
 } from "../../dist/controller/domainIdentity.js";
 import {
@@ -62,6 +61,7 @@ export function createIsolatedRuntime(testContext, options = {}) {
   let currentIdentity = identity;
   let controllerStarted = false;
   let closed = false;
+  let tearingDown = false;
 
   const runtime = {
     root,
@@ -74,24 +74,52 @@ export function createIsolatedRuntime(testContext, options = {}) {
       await ensureFileTaskController(home, { environment });
       controllerStarted = true;
     },
-    tmux() {
+    recordTmuxTarget(target) {
+      if (!recordEphemeralTmuxTarget(home, currentIdentity.token, target)) {
+        throw new Error(`Isolated runtime target fence was not recorded: ${target}`);
+      }
+      const current = readEphemeralDomainIdentity(home);
+      if (current.status !== "valid") {
+        throw new Error("Isolated runtime domain identity became unavailable.");
+      }
+      currentIdentity = current.identity;
+      environment.YUI_EPHEMERAL_TMUX_TARGETS = JSON.stringify(
+        currentIdentity.tmuxTargets
+      );
+    },
+    tmux(options = {}) {
+      const { executor, ...managerOptions } = options;
       const recordTarget = (target) => {
-        if (!recordEphemeralTmuxTarget(home, currentIdentity.token, target)) {
-          throw new Error(`Isolated runtime target fence was not recorded: ${target}`);
-        }
-        const current = readEphemeralDomainIdentity(home);
-        if (current.status !== "valid") {
-          throw new Error("Isolated runtime domain identity became unavailable.");
-        }
-        currentIdentity = current.identity;
-        environment.YUI_EPHEMERAL_TMUX_TARGETS = JSON.stringify(
-          currentIdentity.tmuxTargets
-        );
+        runtime.recordTmuxTarget(target);
+      };
+      const baseExecutor = executor ?? new NodeCommandExecutor();
+      const scopedExecutor = {
+        run(command, args, runOptions = {}) {
+          return baseExecutor.run(command, args, {
+            ...runOptions,
+            environment: {
+              ...runtime.environment,
+              ...(runOptions.environment ?? {})
+            }
+          });
+        },
+        ...(baseExecutor.runAsync === undefined ? {} : {
+          runAsync(command, args, runOptions = {}) {
+            return baseExecutor.runAsync(command, args, {
+              ...runOptions,
+              environment: {
+                ...runtime.environment,
+                ...(runOptions.environment ?? {})
+              }
+            });
+          }
+        })
       };
       const manager = new TmuxManager(
         environment.YUI_TMUX_BIN ?? "tmux",
-        new NodeCommandExecutor(),
+        scopedExecutor,
         {
+          ...managerOptions,
           yuiHome: home,
           onRoleTargetRecorded: recordTarget
         }
@@ -99,17 +127,59 @@ export function createIsolatedRuntime(testContext, options = {}) {
       return manager;
     },
     async teardown() {
-      if (closed) return;
-      closed = true;
+      if (closed || tearingDown) return;
+      tearingDown = true;
       let failure;
       const remember = (error) => {
         if (failure === undefined) failure = error;
       };
+      const cleanupResource = options.cleanupResource ?? cleanControllerResource;
+      const ownedResource = (resource) => (
+        resource.yuiHome === home
+        && resource.domain?.kind === "ephemeral-test"
+        && resource.domain.token === currentIdentity.token
+      );
       const cleanup = async (resource) => {
         try {
-          await cleanControllerResource(resource, { environment });
+          // This fixture is the exact owner of its marked Home. Inventory
+          // protects an active host by default, but teardown is that owner's
+          // explicit bounded cleanup request; retain the domain fence while
+          // allowing the existing process/pane/artifact primitives to run.
+          await cleanupResource(
+            ownedResource(resource) ? { ...resource, disposition: "safe" } : resource,
+            { environment }
+          );
         } catch (error) {
           remember(error);
+        }
+      };
+      const preserveIdentity = () => {
+        const current = readEphemeralDomainIdentity(home);
+        if (current.status === "absent") {
+          writeEphemeralDomainIdentity(home, currentIdentity);
+          return;
+        }
+        if (current.status !== "valid" || current.identity.token !== currentIdentity.token) {
+          throw new Error("isolated runtime domain identity changed during teardown");
+        }
+        currentIdentity = current.identity;
+      };
+      const identityArtifact = (resource) => (
+        resource.artifact?.artifactKind === "domain-identity"
+      );
+      const scan = async () => scanControllerResourceInventory({
+        currentHome: home,
+        scope: "current",
+        environment
+      });
+      const cleanupPass = async (predicate) => {
+        const snapshot = await scan();
+        for (const resource of snapshot.resources.filter((candidate) => (
+          !identityArtifact(candidate)
+          && ownedResource(candidate)
+          && predicate(candidate)
+        ))) {
+          await cleanup(resource);
         }
       };
 
@@ -124,15 +194,11 @@ export function createIsolatedRuntime(testContext, options = {}) {
         }
       }
 
-      // The Controller intentionally retains target fences across a normal
-      // stop so a restart cannot lose surviving panes. The fixture owns this
-      // disposable domain; once the Controller is stopped it may remove the
-      // exact token and clean the remaining resources itself.
       try {
-        const current = readEphemeralDomainIdentity(home);
-        if (current.status === "valid") {
-          removeEphemeralDomainIdentity(home, current.identity.token);
-        }
+        // A Controller with no recorded panes removes its empty identity on a
+        // normal close. Restore the exact same token/generation before any
+        // inventory or cleanup so every later operation remains fenced.
+        preserveIdentity();
       } catch (error) {
         remember(error);
       }
@@ -141,34 +207,17 @@ export function createIsolatedRuntime(testContext, options = {}) {
       // Pane cleanup alone is not enough when a child has escaped the shell's
       // process group during an exceptional test exit.
       try {
-        let snapshot = await scanControllerResourceInventory({
-          currentHome: home,
-          scope: "current",
-          environment
-        });
-        for (const resource of snapshot.resources.filter((candidate) => (
-          candidate.kind === "agent-session"
+        await cleanupPass((candidate) => (
+          candidate.kind === "controller"
+          || candidate.kind === "agent-session"
           || candidate.kind === "process"
           || candidate.kind === "app-server"
           || candidate.kind === "web"
-        ))) {
-          if (resource.disposition === "safe" || resource.disposition === "review") {
-            await cleanup(resource);
-          }
-        }
-        snapshot = await scanControllerResourceInventory({
-          currentHome: home,
-          scope: "current",
-          environment
-        });
-        for (const resource of snapshot.resources.filter((candidate) => (
+        ));
+        await cleanupPass((candidate) => (
           candidate.kind === "tmux-server"
           || candidate.artifact !== undefined
-        ))) {
-          if (resource.disposition === "safe" || resource.disposition === "review") {
-            await cleanup(resource);
-          }
-        }
+        ));
       } catch (error) {
         remember(error);
       }
@@ -192,28 +241,40 @@ export function createIsolatedRuntime(testContext, options = {}) {
       }
 
       try {
-        let snapshot = await scanControllerResourceInventory({
-          currentHome: home,
-          scope: "current",
-          environment
-        });
-        for (const resource of snapshot.resources) {
-          if (resource.disposition === "safe" || resource.disposition === "review") {
-            await cleanup(resource);
-          }
-        }
-        snapshot = await scanControllerResourceInventory({
-          currentHome: home,
-          scope: "current",
-          environment
-        });
-        if (snapshot.resources.length > 0) {
+        await cleanupPass(() => true);
+        const snapshot = await scan();
+        const residual = snapshot.resources.filter((resource) => !identityArtifact(resource));
+        if (residual.length > 0) {
           remember(new Error(
-            `isolated runtime leaked resources: ${snapshot.resources.map((resource) => resource.id).join(", ")}`
+            `isolated runtime leaked resources: ${residual.map((resource) => resource.id).join(", ")}`
           ));
         }
-        if (existsSync(domainIdentityPath(home))) {
-          remember(new Error("isolated runtime domain identity remains after teardown"));
+        if (failure === undefined) {
+          const current = readEphemeralDomainIdentity(home);
+          if (current.status !== "valid" || current.identity.token !== currentIdentity.token) {
+            throw new Error("isolated runtime domain identity changed before final cleanup");
+          }
+          currentIdentity = current.identity;
+          const removal = removeEphemeralDomainIdentityIfUnchanged(
+            home,
+            currentIdentity.token,
+            current.fingerprint
+          );
+          if (removal !== "removed") {
+            if (removal === "absent") preserveIdentity();
+            throw new Error("isolated runtime domain identity changed before final cleanup");
+          }
+          const final = await scan();
+          if (final.resources.length > 0) {
+            // Re-establish the exact authority for diagnosis/retry if a late
+            // resource appeared in the final window.
+            if (readEphemeralDomainIdentity(home).status === "absent") {
+              writeEphemeralDomainIdentity(home, currentIdentity);
+            }
+            throw new Error(
+              `isolated runtime leaked resources after final cleanup: ${final.resources.map((resource) => resource.id).join(", ")}`
+            );
+          }
         }
       } catch (error) {
         remember(error);
@@ -221,8 +282,11 @@ export function createIsolatedRuntime(testContext, options = {}) {
 
       if (failure === undefined) {
         rmSync(root, { recursive: true, force: true });
+        closed = true;
+        tearingDown = false;
       } else {
         // Keep the root and exact identity available for failure diagnostics.
+        tearingDown = false;
         throw failure;
       }
     }
