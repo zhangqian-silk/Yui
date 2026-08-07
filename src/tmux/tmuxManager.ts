@@ -166,14 +166,18 @@ export class TmuxManager {
     launch?: TmuxLaunchPlan
   ): boolean {
     if (this.windowNames(taskId).includes(role.name)) {
-      this.configureServerHistory();
       this.recordRoleTarget(taskId, role.name);
+      this.configureServerHistory();
       return false;
     }
     if (launch === undefined) {
       throw runtimeError(`Agent launch plan is required to create Role window: ${role.name}.`);
     }
 
+    // Persist the exact target before any tmux mutation. If the recorder
+    // cannot prove the current ephemeral identity/token, do not create a
+    // pane that a later reaper could not fence.
+    this.recordRoleTarget(taskId, role.name);
     if (!this.hasSession(taskId)) {
       this.run([
         "start-server",
@@ -200,7 +204,6 @@ export class TmuxManager {
         ...launchCommand(launch)
       ]);
     }
-    this.recordRoleTarget(taskId, role.name);
     return true;
   }
 
@@ -211,13 +214,16 @@ export class TmuxManager {
   ): Promise<boolean> {
     const snapshot = await this.sessionWindowNamesAsync(taskId);
     if (snapshot.names.includes(role.name)) {
-      await this.configureServerHistoryAsync();
       this.recordRoleTarget(taskId, role.name);
+      await this.configureServerHistoryAsync();
       return false;
     }
     if (launch === undefined) {
       throw runtimeError(`Agent launch plan is required to create Role window: ${role.name}.`);
     }
+    // Keep the async launch ordering identical to the sync path: a recorder
+    // failure is a precondition failure, never a post-launch cleanup hint.
+    this.recordRoleTarget(taskId, role.name);
     if (!snapshot.exists) {
       await this.runAsync([
         "start-server",
@@ -244,7 +250,6 @@ export class TmuxManager {
         ...launchCommand(launch)
       ]);
     }
-    this.recordRoleTarget(taskId, role.name);
     return true;
   }
 
@@ -937,10 +942,15 @@ export class TmuxManager {
   }
 
   renameRole(taskId: string, oldRoleName: string, newRoleName: string): void {
-    this.run([
-      "rename-window", "-t", this.target(taskId, oldRoleName), safeValue(newRoleName, "Role name")
-    ]);
+    const target = this.target(taskId, oldRoleName);
+    const nextRoleName = safeValue(newRoleName, "Role name");
+    // Retain the new exact fence even if tmux later rejects the rename. The
+    // stale fence is conservative and lets a later bounded retry revalidate
+    // the pane instead of guessing or dropping ownership evidence.
     this.recordRoleTarget(taskId, newRoleName);
+    this.run([
+      "rename-window", "-t", target, nextRoleName
+    ]);
   }
 
   private hasSession(taskId: string): boolean {
