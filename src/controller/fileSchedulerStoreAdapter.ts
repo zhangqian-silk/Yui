@@ -3047,13 +3047,21 @@ function mapRole(
     : store.getWorkItemWorkspace(role.taskId, item.id))
     ?? store.getTaskWorkspace(role.taskId)
     ?? undefined;
-  const effective = activeLiveRoleAgentSession(
-    store.getTaskRoleSessionSet(role.taskId, role.name)
-  )?.effective ?? resolveEffectiveLaunch({
-      role,
-      purpose: "execution",
-      ...(workspace === undefined ? {} : { workspace })
-    });
+  const reopened = role.name === "leader"
+    && store.getPendingWakeup(role.taskId)?.reasons.includes("task-reopened") === true;
+  const effective = reopened
+    ? resolveEffectiveLaunch({
+        role,
+        purpose: "execution",
+        ...(workspace === undefined ? {} : { workspace })
+      })
+    : activeLiveRoleAgentSession(
+        store.getTaskRoleSessionSet(role.taskId, role.name)
+      )?.effective ?? resolveEffectiveLaunch({
+          role,
+          purpose: "execution",
+          ...(workspace === undefined ? {} : { workspace })
+        });
   return {
     taskId: role.taskId,
     name: role.name,
@@ -3119,6 +3127,7 @@ function mapSession(session: RoleAgentSession): SchedulerRoleSession {
     agentId: session.agentId,
     adapterId: session.adapterId,
     nativeSessionId: session.nativeSessionId,
+    ...(session.launchId === undefined ? {} : { launchId: session.launchId }),
     status: session.status,
     effective: session.effective,
     updatedAt: session.updatedAt
@@ -3286,6 +3295,7 @@ function schedulerRoleSessionsMatch(
   return current.agentId === expected.agentId
     && current.adapterId === expected.adapterId
     && current.nativeSessionId === expected.nativeSessionId
+    && current.launchId === expected.launchId
     && isDeepStrictEqual(current.effective, expected.effective);
 }
 

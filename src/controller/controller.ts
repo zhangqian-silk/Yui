@@ -7,10 +7,15 @@ import {
   processActiveRoleRunDeliveries,
   type ActiveRoleRunDeliveryResult
 } from "../scheduler/activeRoleRunDelivery.js";
+import {
+  selectedSchedulerRoles,
+  selectedSchedulerTasks
+} from "../scheduler/ports.js";
 import type {
   AutoResolvedInput,
   RoleRunDeliveryFailurePersistence,
   SchedulerReconcileSelection,
+  SchedulerRoleSession,
   SchedulerStorePort,
   TmuxDeliveryPort
 } from "../scheduler/ports.js";
@@ -37,6 +42,7 @@ import type { MailboxTarget, ProcessingBatch } from "../coordination/workMailbox
 import {
   hasRuntimeCleanupObligation,
   isRuntimeLaunchReservation,
+  runtimeLifecycleTarget,
   type RuntimeLifecycleTarget,
   type RuntimeRoleOwner
 } from "../runtime/lifecycleReservation.js";
@@ -136,6 +142,7 @@ export async function runControllerSchedulerPass(
   const selection = includeOperator
     ? compiledSelection
     : { ...compiledSelection, operator: false };
+  queueSelectedCompletedTaskRuntimeCleanups(store, selection, now);
   const failedCleanupRoles = await processSelectedRoleRuntimeCleanups(
     store,
     delivery,
@@ -228,6 +235,42 @@ type RuntimeCleanupOutcome = Readonly<{
   status: "completed" | "failed";
   error?: unknown;
 }>;
+
+function queueSelectedCompletedTaskRuntimeCleanups(
+  store: SchedulerStorePort,
+  selection: ReconcileSelection,
+  now: Date
+): void {
+  if (store.enqueueRuntimeCleanup === undefined) return;
+  for (const task of selectedSchedulerTasks(store, selection)) {
+    if (task.status !== "completed") continue;
+    for (const role of selectedSchedulerRoles(store, task.id, selection)) {
+      if (store.getActiveAgentRun(task.id, role.name) !== null) continue;
+      const session = store.getRoleSession(task.id, role.name);
+      if (!schedulerSessionRequiresRuntimeCleanup(session)) continue;
+      const target = runtimeLifecycleTarget({
+        scope: "task",
+        taskId: task.id,
+        roleName: role.name
+      });
+      if (hasRuntimeCleanupObligation(store.getWorkMailbox(target))) continue;
+      store.enqueueRuntimeCleanup({
+        scope: "task",
+        taskId: task.id,
+        roleName: role.name
+      }, now);
+    }
+  }
+}
+
+function schedulerSessionRequiresRuntimeCleanup(
+  session: SchedulerRoleSession | null
+): boolean {
+  if (session === null || session.status === "stopped" || session.status === "broken") {
+    return false;
+  }
+  return session.status === "running" || session.launchId !== undefined;
+}
 
 async function processSelectedRoleRuntimeCleanups(
   store: SchedulerStorePort,

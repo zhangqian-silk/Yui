@@ -84,7 +84,11 @@ import {
   requireCompleteWorkExecution
 } from "../coordination/workMailboxQueue.js";
 import type { MailboxEntityRef, MailboxTarget } from "../coordination/workMailbox.js";
-import { runtimeLifecycleTarget } from "../runtime/lifecycleReservation.js";
+import {
+  RUNTIME_CLEANUP_REQUIRED_REASON,
+  runtimeLifecycleTarget,
+  type RuntimeLifecycleTarget
+} from "../runtime/lifecycleReservation.js";
 import {
   activateTask,
   addTaskProjectBinding,
@@ -658,7 +662,9 @@ function completeTaskCommand(
   const result = store.transaction((tx) => {
     const task = requireTask(tx, parsed.positionals[0]);
     const actor = taskActor(options, task.id);
-    if (task.status === "completed") return { task, changed: false } as const;
+    if (task.status === "completed") {
+      return { task, changed: false, runtimeCleanupTargets: [] as RuntimeLifecycleTarget[] } as const;
+    }
     if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
     assertNoOpenInputRequests(tx, task.id, "completing the Task");
@@ -753,11 +759,30 @@ function completeTaskCommand(
     ));
     enqueueWork(tx, { kind: "operator" }, "task-terminal", now, [taskRef(task.id)]);
     recordTaskEvent(tx, task.id, "task.completed", { by: actor, summary }, now);
-    enqueueWork(tx, taskMailbox(task.id), "task-completed", now, [taskRef(task.id)]);
-    return { task: completed, changed: true } as const;
+    // A terminal Task must never leave a Task-lane signal that can wake it.
+    // The durable records remain intact; only the derived mailbox work is
+    // discarded at this lifecycle boundary.
+    tx.removeWorkMailbox(taskMailbox(task.id));
+    // Role mailboxes are also derived wake state. A Worker result or recovery
+    // signal queued while the final Run was being settled must not survive a
+    // completed Task and become actionable after a later explicit reopen.
+    for (const role of roles) {
+      tx.removeWorkMailbox(roleMailbox(task.id, role.name));
+    }
+    const runtimeCleanupTargets = queueCompletedTaskRuntimeCleanups(
+      tx,
+      task.id,
+      roles,
+      now
+    );
+    return { task: completed, changed: true, runtimeCleanupTargets } as const;
   });
   if (result.changed) {
-    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
+    for (const target of result.runtimeCleanupTargets) {
+      // Cleanup owns an independent lifecycle lane. Never fall back to the
+      // Task signal for older runtime ports: a completed Task must not wake.
+      options.runtime?.notifyMailboxChanged?.(target);
+    }
     notifyMailbox(options.runtime, { kind: "operator" }, result.task.id);
   }
   return result.changed
@@ -3770,6 +3795,48 @@ function messageOf(error: unknown): string {
 
 function taskMailbox(taskId: string): MailboxTarget {
   return { kind: "task", taskId };
+}
+
+function queueCompletedTaskRuntimeCleanups(
+  store: TaskWorkflowStore,
+  taskId: string,
+  roles: readonly Role[],
+  now: Date
+): RuntimeLifecycleTarget[] {
+  const targets: RuntimeLifecycleTarget[] = [];
+  for (const role of roles) {
+    if (store.getActiveAgentRun(taskId, role.name) !== null) continue;
+    const sessions = store.getTaskRoleSessionSet(taskId, role.name);
+    const active = sessions?.sessions[sessions.activeAgentId];
+    if (!ownedRuntimeSessionRequiresCleanup(active)) continue;
+    const target = runtimeLifecycleTarget({
+      scope: "task",
+      taskId,
+      roleName: role.name
+    });
+    enqueueWork(
+      store,
+      target,
+      RUNTIME_CLEANUP_REQUIRED_REASON,
+      now,
+      [taskRef(taskId)]
+    );
+    targets.push(target);
+  }
+  return targets;
+}
+
+function ownedRuntimeSessionRequiresCleanup(
+  session: TaskRoleSessionSet["sessions"][string] | undefined
+): boolean {
+  if (session === undefined || session.status === "stopped" || session.status === "broken") {
+    return false;
+  }
+  // Older synthetic session fixtures can represent a ready native session
+  // without a lifecycle generation. Do not manufacture a cleanup obligation
+  // for those records; coordinated launches always carry launchId, while a
+  // running session remains actionable even when an older record lacks it.
+  return session.status === "running" || session.launchId !== undefined;
 }
 
 function roleMailbox(taskId: string, roleName: string): MailboxTarget {
