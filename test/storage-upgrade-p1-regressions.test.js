@@ -363,7 +363,24 @@ test("P2 map guard: current non-empty StorageState and StoredTask families are U
   assert.equal(result.outcome, "already-current");
 });
 
-test("P2 map guard rejects an unchecked-family descriptor drift", () => {
+test("P2 map guard rejects a missing direct-family descriptor before classification", () => {
+  const drifted = currentRecordVersions();
+  delete drifted.configuredAgent;
+  assert.throws(
+    () => classifyHome({
+      home: currentHome().home,
+      registry: EMPTY(),
+      latest: latestStorageVersionState(drifted)
+    }),
+    /Record version map completeness drift: missing=configuredAgent/
+  );
+  assert.throws(
+    () => assertRecordVersionDescriptors(drifted),
+    /Record version map completeness drift: missing=configuredAgent/
+  );
+});
+
+test("P2 map guard rejects a changed default locator before classification", () => {
   const drifted = {
     ...currentRecordVersions(),
     configuredAgent: {
@@ -371,6 +388,14 @@ test("P2 map guard rejects an unchecked-family descriptor drift", () => {
       path: "state.json#/projects"
     }
   };
+  assert.throws(
+    () => classifyHome({
+      home: currentHome().home,
+      registry: EMPTY(),
+      latest: latestStorageVersionState(drifted)
+    }),
+    /Record version map drift for configuredAgent/
+  );
   assert.throws(
     () => assertRecordVersionDescriptors(drifted),
     /Record version map drift for configuredAgent/

@@ -54,6 +54,41 @@ function descriptor(version: number, path: string): RecordAxisEntry {
 }
 
 /**
+ * Independent persisted-boundary contract for the direct family keys and
+ * locators. The upgrade descriptor table is checked against this contract so
+ * omitting a newly persisted family or changing a locator cannot make the
+ * scanner silently skip that family.
+ */
+const EXPECTED_DIRECT_RECORD_LOCATORS: Readonly<Record<string, string>> = Object.freeze({
+  config: "state.json#/config",
+  configuredAgent: "state.json#/configuredAgents",
+  project: "state.json#/projects",
+  agentProfile: "state.json#/agentProfiles",
+  globalRole: "state.json#/globalRoles",
+  globalRoleSessionSet: "state.json#/globalRoleSessionSets",
+  storedTask: "state.json#/tasks/*",
+  task: "state.json#/tasks/*/task",
+  taskBrief: "state.json#/tasks/*/brief",
+  taskRole: "state.json#/tasks/*/roles",
+  managedWorkspace: "state.json#/tasks/*/managedWorkspaces",
+  taskRoleSessionSet: "state.json#/tasks/*/roleSessionSets",
+  workItem: "state.json#/tasks/*/workItems",
+  agentRun: "state.json#/tasks/*/agentRuns",
+  reviewRound: "state.json#/tasks/*/reviewRounds",
+  changeSet: "state.json#/tasks/*/changeSets",
+  integrationAttempt: "state.json#/tasks/*/integrationAttempts",
+  activeRunPointer: "state.json#/tasks/*/activeRuns",
+  message: "state.json#/tasks/*/messages",
+  inputRequest: "state.json#/tasks/*/inputRequests",
+  decision: "state.json#/tasks/*/decisions",
+  milestone: "state.json#/tasks/*/milestones",
+  event: "state.json#/tasks/*/events",
+  leaderFailure: "state.json#/tasks/*/leaderFailure",
+  operatorNotification: "state.json#/tasks/*/operatorNotification",
+  workMailbox: "state.json#/mailboxes"
+});
+
+/**
  * The one authoritative descriptor table for every direct StorageState and
  * StoredTask record family. `path` is a logical, human-readable location of
  * where the family's records live inside the authoritative store; the generic
@@ -119,9 +154,11 @@ const CURRENT_RECORD_DESCRIPTORS: Readonly<Record<string, RecordAxisEntry>> = Ob
 const CURRENT_RECORD_VERSIONS = CURRENT_RECORD_DESCRIPTORS;
 
 /** The record-axis map for the current baseline (a defensive shallow copy). */
-export function currentRecordVersions(): Readonly<Record<string, RecordAxisEntry>> {
-  assertRecordVersionDescriptors();
-  return { ...CURRENT_RECORD_VERSIONS };
+export function currentRecordVersions(
+  candidate: Readonly<Record<string, RecordAxisEntry>> = CURRENT_RECORD_VERSIONS
+): Readonly<Record<string, RecordAxisEntry>> {
+  assertRecordVersionDescriptors(candidate);
+  return { ...candidate };
 }
 
 /**
@@ -133,10 +170,10 @@ export function currentRecordVersions(): Readonly<Record<string, RecordAxisEntry
 export function assertRecordVersionDescriptors(
   candidate: Readonly<Record<string, RecordAxisEntry>> = CURRENT_RECORD_VERSIONS
 ): void {
-  const expectedKinds = Object.keys(CURRENT_RECORD_DESCRIPTORS);
+  const expectedKinds = Object.keys(EXPECTED_DIRECT_RECORD_LOCATORS);
   const mappedKinds = Object.keys(candidate);
   const missing = expectedKinds.filter((kind) => !Object.hasOwn(candidate, kind));
-  const unexpected = mappedKinds.filter((kind) => !Object.hasOwn(CURRENT_RECORD_DESCRIPTORS, kind));
+  const unexpected = mappedKinds.filter((kind) => !Object.hasOwn(EXPECTED_DIRECT_RECORD_LOCATORS, kind));
   if (missing.length > 0 || unexpected.length > 0) {
     throw new Error(
       `Record version map completeness drift: missing=${missing.join(",") || "none"}; `
@@ -145,13 +182,16 @@ export function assertRecordVersionDescriptors(
   }
 
   for (const kind of expectedKinds) {
-    const expected = CURRENT_RECORD_DESCRIPTORS[kind]!;
+    const expected = CURRENT_RECORD_DESCRIPTORS[kind];
+    const expectedPath = EXPECTED_DIRECT_RECORD_LOCATORS[kind]!;
     const mapped = candidate[kind];
-    if (mapped === undefined || mapped === null
+    if (expected === undefined
+      || mapped === undefined
+      || mapped === null
       || mapped.version !== expected.version
-      || mapped.path !== expected.path) {
+      || mapped.path !== expectedPath) {
       throw new Error(
-        `Record version map drift for ${kind}: expected=${expected.version}@${expected.path}; `
+        `Record version map drift for ${kind}: expected=${String(expected?.version)}@${expectedPath}; `
         + `actual=${String(mapped?.version)}@${String(mapped?.path)}.`
       );
     }
@@ -163,10 +203,12 @@ export function assertRecordVersionDescriptors(
  * the scalar layout/aggregate versions plus the current record map. The engine
  * and classifier compare a source against this to decide the four-state verdict.
  */
-export function latestStorageVersionState(): StorageVersionState {
+export function latestStorageVersionState(
+  recordDescriptors: Readonly<Record<string, RecordAxisEntry>> = CURRENT_RECORD_VERSIONS
+): StorageVersionState {
   return {
     layout: CURRENT_STORAGE_LAYOUT_VERSION,
     aggregate: CURRENT_AGGREGATE_SCHEMA_VERSION,
-    record: currentRecordVersions()
+    record: currentRecordVersions(recordDescriptors)
   };
 }
