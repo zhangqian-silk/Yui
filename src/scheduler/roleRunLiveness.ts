@@ -9,7 +9,10 @@ import {
 } from "./ports.js";
 import { formatTaskRecordReference } from "../task/taskRecordReference.js";
 import { queueLeaderWakeup } from "./wakeupQueue.js";
-import { DEFAULT_EXECUTION_STALL_CANDIDATE_AGE_MS } from "./roleRunStall.js";
+import {
+  currentRoleRunProgressAt,
+  DEFAULT_EXECUTION_STALL_CANDIDATE_AGE_MS
+} from "./roleRunStall.js";
 
 export const EXITED_ROLE_RUN_SUMMARY = "The role's tmux session exited before the run yielded.";
 export type RoleLiveStatus = "present" | "absent";
@@ -87,7 +90,12 @@ export async function reconcileExitedRoleRuns(
                 runId: run.id,
                 agentId: run.effective.agentId,
                 adapterId: run.effective.adapterId,
-                progressAt: run.deliveredAt ?? run.createdAt,
+                progressAt: currentRoleRunProgressAt(
+                  store,
+                  task.id,
+                  role.name,
+                  run
+                ).progressAt,
                 ...(session?.nativeSessionId === undefined
                   ? {}
                   : { nativeSessionId: session.nativeSessionId }),

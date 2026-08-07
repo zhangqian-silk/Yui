@@ -277,6 +277,45 @@ export function latestRunProgressAt(
 }
 
 /**
+ * Resolve the exact semantic progress fence shared by resource production and
+ * stall consumption for one active Run. The richer adapter fold remains
+ * authoritative when available; the retained Run progress/activity events are
+ * the provider-neutral fallback. Resource evidence carries this value as an
+ * exact fence, but never advances it.
+ */
+export function currentRoleRunProgressAt(
+  store: Readonly<{
+    listEvents?: (taskId: string) => readonly TaskEvent[];
+    getRunDurableProgress?: SchedulerStorePort["getRunDurableProgress"];
+  }>,
+  taskId: string,
+  roleName: string,
+  run: Readonly<{ id: string; createdAt: string; deliveredAt?: string }>,
+  events: readonly TaskEvent[] = store.listEvents?.(taskId) ?? []
+): Readonly<{ progressAt: string; evidence?: string }> {
+  let richerProgress: Readonly<{ progressAt: string; evidence?: string }> | null | undefined;
+  try {
+    richerProgress = store.getRunDurableProgress?.(taskId, roleName, run.id);
+  } catch {
+    // A related-record fold is advisory. The retained Run/Event fence remains
+    // usable when that optional read is unavailable.
+    richerProgress = undefined;
+  }
+  if (run.deliveredAt === undefined) return { progressAt: run.createdAt };
+  const fallbackProgressAt = latestDurableProgressAt({
+    deliveredAt: run.deliveredAt,
+    latestCheckpointAt: latestRunProgressAt(events, run.id),
+    latestActivityAt: latestRunActivityAt(events, run.id)
+  });
+  return {
+    progressAt: richerProgress?.progressAt ?? fallbackProgressAt,
+    ...(richerProgress?.evidence === undefined
+      ? {}
+      : { evidence: richerProgress.evidence })
+  };
+}
+
+/**
  * Computes the current semantic progress fence for an exact Run. The optional
  * related-record readers mirror the adapter's Work/Review/Integration fold;
  * narrow scheduler ports can omit them and still retain Run/Event evidence.
@@ -595,7 +634,12 @@ export async function reconcileStalledRoleRuns(
                 taskId: task.id,
                 roleName: role.name,
                 runId: run.id,
-                progressAt: run.deliveredAt ?? run.createdAt,
+                progressAt: currentRoleRunProgressAt(
+                  store,
+                  task.id,
+                  role.name,
+                  run
+                ).progressAt,
                 agentId: session?.agentId ?? run.effective.agentId,
                 adapterId: session?.adapterId ?? run.effective.adapterId,
                 ...(session?.launchId === undefined ? {} : { launchId: session.launchId }),
@@ -661,35 +705,20 @@ export async function reconcileStalledRoleRuns(
     }
 
     const events = store.listEvents(candidate.task.id);
-    let richerProgress: Readonly<{ progressAt: string; evidence?: string }> | null | undefined;
-    try {
-      richerProgress = store.getRunDurableProgress?.(
-        candidate.task.id,
-        candidate.role.name,
-        candidate.run.id
-      );
-    } catch {
-      // A related-record fold is advisory. The exact Run identity and
-      // provider/session fence remain untouched if a read is unavailable.
-      richerProgress = undefined;
-    }
-    const latestCheckpointAt = latestRunProgressAt(events, candidate.run.id);
-    const fallbackProgressAt = candidate.run.deliveredAt === undefined
-      ? undefined
-      : latestDurableProgressAt({
-          deliveredAt: candidate.run.deliveredAt,
-          latestCheckpointAt,
-          latestActivityAt: latestRunActivityAt(events, candidate.run.id)
-        });
     // Before exact acceptance there is no execution progress clock. Keep the
     // delivery watch anchored to the Run creation/transport boundary even if
     // checkpoints, output, or related WorkItem/Review/Integration records are
     // newer; those facts are useful evidence but cannot prove provider
     // acceptance or reset delivery timeout. Once accepted, deliveredAt is the
     // semantic baseline and the durable fold may advance it.
-    const progressAt = candidate.run.deliveredAt === undefined
-      ? candidate.run.createdAt
-      : richerProgress?.progressAt ?? fallbackProgressAt!;
+    const progress = currentRoleRunProgressAt(
+      store,
+      candidate.task.id,
+      candidate.role.name,
+      candidate.run,
+      events
+    );
+    const progressAt = progress.progressAt;
     const evaluation = evaluateRoleRunStall({
       progressAt,
       now,
@@ -784,7 +813,7 @@ export async function reconcileStalledRoleRuns(
       stalled,
       resourceActivity,
       evidence: [
-        ...(richerProgress?.evidence === undefined ? [] : [richerProgress.evidence]),
+        ...(progress.evidence === undefined ? [] : [progress.evidence]),
         ...(resourceActivity ? ["resource-activity"] : [])
       ].join(",") || undefined,
       stallCandidate: true

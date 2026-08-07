@@ -138,6 +138,12 @@ test("full controller liveness and stall phases reuse one Role inventory", async
     effective: run.effective
   });
   store.listEvents = () => events;
+  const newerProgressAt = new Date(60_000).toISOString();
+  events.push({
+    type: "run.progress",
+    createdAt: newerProgressAt,
+    payload: { runId: run.id, progressAt: newerProgressAt }
+  });
   let stallRecords = 0;
   store.recordRoleRunStall = () => {
     stallRecords += 1;
@@ -153,22 +159,25 @@ test("full controller liveness and stall phases reuse one Role inventory", async
       singleInspections += 1;
       return "present";
     },
-    async inspectRoles(inputs) {
+    async inspectRoles(inputs, requested) {
       inventoryCalls += 1;
+      assert.equal(requested.length, 1);
+      const resourceInput = requested[0];
+      assert.equal(resourceInput.progressAt, newerProgressAt);
       return inputs.map((input) => ({
         taskId: input.taskId,
         roleName: input.roleName,
         status: "present",
         resource: {
           observedAt: new Date(31 * 60_000).toISOString(),
-          progressAt: input.progressAt,
+          progressAt: resourceInput.progressAt,
           identity: {
-            taskId: input.taskId,
-            roleName: input.roleName,
-            runId: input.runId,
-            agentId: input.agentId,
-            adapterId: input.adapterId,
-            nativeSessionId: input.nativeSessionId
+            taskId: resourceInput.taskId,
+            roleName: resourceInput.roleName,
+            runId: resourceInput.runId,
+            agentId: resourceInput.agentId,
+            adapterId: resourceInput.adapterId,
+            nativeSessionId: resourceInput.nativeSessionId
           },
           active: true,
           changed: true,
