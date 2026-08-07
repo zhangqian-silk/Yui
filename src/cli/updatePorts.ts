@@ -376,10 +376,80 @@ function stopControllerForUpdate(
   environment: NodeJS.ProcessEnv,
   spawn: UpdateSpawner
 ): UpdateControllerStopResult {
-  const output = runControllerCommandOutput(home, environment, spawn, "stop");
-  if (/already stopped/i.test(output)) return { stopped: false, alreadyStopped: true };
-  if (/stopped/i.test(output)) return { stopped: true };
-  throw new Error("Controller stop returned no structured stopped/already-stopped outcome.");
+  // Parent update owns this lifecycle boundary. Invoke the runtime client
+  // directly in a short-lived child so a migratable old-schema Home is not
+  // forced through the public `controller stop` command's current-schema gate.
+  // The public command remains gated; this helper is reachable only from the
+  // update-owned port and returns the runtime's structured confirmation.
+  const result = runSchemaIndependentControllerStop(home, environment, spawn);
+  if (typeof result.stopped !== "boolean") {
+    throw new Error("Controller stop returned no structured stopped confirmation.");
+  }
+  if (result.alreadyStopped !== undefined && result.alreadyStopped !== true) {
+    throw new Error("Controller stop returned an invalid alreadyStopped confirmation.");
+  }
+  if (result.pid !== undefined && !isPositivePid(result.pid)) {
+    throw new Error("Controller stop returned an invalid PID confirmation.");
+  }
+  return result;
+}
+
+/**
+ * Stop only the Controller owned by parent update, without dispatching the
+ * public CLI command. `stopFileTaskController` authenticates the discovery,
+ * issues exactly one stop RPC, and drains the owned discovery before returning.
+ */
+function runSchemaIndependentControllerStop(
+  home: string,
+  environment: NodeJS.ProcessEnv,
+  spawn: UpdateSpawner
+): UpdateControllerStopResult {
+  const helper = [
+    "const [runtimeModule, home] = process.argv.slice(1);",
+    "(async () => {",
+    "  const { stopFileTaskController } = await import(runtimeModule);",
+    "  const data = await stopFileTaskController(home, { environment: process.env });",
+    "  process.stdout.write(JSON.stringify({ ok: true, data }));",
+    "})().catch((error) => {",
+    "  const code = typeof error?.code === 'string' ? error.code : 'RUNTIME_ERROR';",
+    "  const message = error instanceof Error ? error.message : String(error);",
+    "  process.stderr.write(JSON.stringify({ ok: false, code, message }));",
+    "  process.exitCode = 5;",
+    "});"
+  ].join(" ");
+  const result = spawn(
+    process.execPath,
+    ["-e", helper, UPDATE_CLIENT_RUNTIME_PATH, home],
+    { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
+  );
+  if (result.error !== undefined || result.status !== 0) {
+    const detail = result.stderr.toString("utf8").trim();
+    throw new Error(
+      `Controller stop failed (exit ${result.status ?? "null"})${detail.length === 0 ? "." : `: ${detail}`}`
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.stdout.toString("utf8"));
+  } catch (error) {
+    throw new Error("Controller stop returned an invalid structured result.", { cause: error });
+  }
+  if (!isRecord(parsed) || parsed.ok !== true || !isRecord(parsed.data)) {
+    throw new Error("Controller stop returned an invalid structured result.");
+  }
+  const data = parsed.data;
+  if (
+    typeof data.stopped !== "boolean"
+    || (data.alreadyStopped !== undefined && data.alreadyStopped !== true)
+    || (data.pid !== undefined && !isPositivePid(data.pid))
+  ) {
+    throw new Error("Controller stop returned an invalid structured confirmation.");
+  }
+  return {
+    stopped: data.stopped,
+    ...(data.alreadyStopped === true ? { alreadyStopped: true } : {}),
+    ...(data.pid === undefined ? {} : { pid: data.pid })
+  };
 }
 
 function restartControllerForUpdate(
