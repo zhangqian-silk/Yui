@@ -59,6 +59,8 @@ export type TmuxReadinessProbe = (pane: TmuxPaneState) => boolean;
 
 export type TmuxManagerOptions = Readonly<{
   yuiHome?: string;
+  /** Records exact Yui Role pane targets for an explicitly fenced domain. */
+  onRoleTargetRecorded?: (target: string) => void;
   terminalInput?: TerminalInput;
   terminalType?: string;
   closeInteractiveInput?: () => void;
@@ -100,6 +102,7 @@ export class TmuxReadinessProbeRequiredError extends Error {
 export class TmuxManager {
   readonly #yuiHome: string;
   readonly #serverName: string;
+  readonly #onRoleTargetRecorded: ((target: string) => void) | undefined;
   readonly #terminalInput: TerminalInput;
   readonly #terminalType: string;
   readonly #closeInteractiveInput: () => void;
@@ -122,6 +125,7 @@ export class TmuxManager {
       : yuiHomeOrOptions;
     this.#yuiHome = options.yuiHome ?? process.env.YUI_HOME ?? process.cwd();
     this.#serverName = yuiTmuxServerName(this.#yuiHome);
+    this.#onRoleTargetRecorded = options.onRoleTargetRecorded;
     this.#terminalInput = options.terminalInput ?? process.stdin as Readable & TerminalInput;
     this.#terminalType = usableInteractiveTerminal(options.terminalType ?? process.env.TERM);
     this.#closeInteractiveInput = options.closeInteractiveInput ?? (() => {});
@@ -163,6 +167,7 @@ export class TmuxManager {
   ): boolean {
     if (this.windowNames(taskId).includes(role.name)) {
       this.configureServerHistory();
+      this.recordRoleTarget(taskId, role.name);
       return false;
     }
     if (launch === undefined) {
@@ -195,6 +200,7 @@ export class TmuxManager {
         ...launchCommand(launch)
       ]);
     }
+    this.recordRoleTarget(taskId, role.name);
     return true;
   }
 
@@ -206,6 +212,7 @@ export class TmuxManager {
     const snapshot = await this.sessionWindowNamesAsync(taskId);
     if (snapshot.names.includes(role.name)) {
       await this.configureServerHistoryAsync();
+      this.recordRoleTarget(taskId, role.name);
       return false;
     }
     if (launch === undefined) {
@@ -237,6 +244,7 @@ export class TmuxManager {
         ...launchCommand(launch)
       ]);
     }
+    this.recordRoleTarget(taskId, role.name);
     return true;
   }
 
@@ -887,6 +895,7 @@ export class TmuxManager {
     const taskSession = this.sessionName(taskId);
     const sessions = this.taskSessionGroupNames(taskId);
     if (sessions.length === 0 && !this.hasSession(taskId)) return false;
+    this.recordTaskTargets(taskId);
     for (const session of [...sessions.filter((name) => name !== taskSession), taskSession]) {
       try {
         this.run(["kill-session", "-t", session]);
@@ -901,6 +910,7 @@ export class TmuxManager {
     const taskSession = this.sessionName(taskId);
     const sessions = await this.taskSessionGroupNamesAsync(taskId);
     if (sessions.length === 0 && !(await this.hasSessionAsync(taskId))) return false;
+    await this.recordTaskTargetsAsync(taskId);
     for (const session of [...sessions.filter((name) => name !== taskSession), taskSession]) {
       try {
         await this.runAsync(["kill-session", "-t", session]);
@@ -912,14 +922,17 @@ export class TmuxManager {
   }
 
   stopRole(taskId: string, roleName: string): void {
+    this.recordRoleTarget(taskId, roleName);
     this.run(["send-keys", "-t", this.target(taskId, roleName), "C-c"]);
   }
 
   killRole(taskId: string, roleName: string): void {
+    this.recordRoleTarget(taskId, roleName);
     this.run(["kill-window", "-t", this.target(taskId, roleName)]);
   }
 
   async killRoleAsync(taskId: string, roleName: string): Promise<void> {
+    this.recordRoleTarget(taskId, roleName);
     await this.runAsync(["kill-window", "-t", this.target(taskId, roleName)]);
   }
 
@@ -927,6 +940,7 @@ export class TmuxManager {
     this.run([
       "rename-window", "-t", this.target(taskId, oldRoleName), safeValue(newRoleName, "Role name")
     ]);
+    this.recordRoleTarget(taskId, newRoleName);
   }
 
   private hasSession(taskId: string): boolean {
@@ -1024,6 +1038,24 @@ export class TmuxManager {
 
   private target(taskId: string, roleName: string): string {
     return yuiTmuxTarget(this.#yuiHome, taskId, roleName);
+  }
+
+  private recordRoleTarget(taskId: string, roleName: string): void {
+    this.#onRoleTargetRecorded?.(this.target(taskId, roleName));
+  }
+
+  private recordTaskTargets(taskId: string): void {
+    if (this.#onRoleTargetRecorded === undefined) return;
+    for (const pane of this.inspectTaskRolePanes(taskId)) {
+      this.#onRoleTargetRecorded(pane.target);
+    }
+  }
+
+  private async recordTaskTargetsAsync(taskId: string): Promise<void> {
+    if (this.#onRoleTargetRecorded === undefined) return;
+    for (const pane of await this.inspectRolePaneInventoryAsync()) {
+      if (pane.taskId === taskId) this.#onRoleTargetRecorded(pane.target);
+    }
   }
 
   private configureServerHistory(): void {

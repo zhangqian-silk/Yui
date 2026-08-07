@@ -122,7 +122,10 @@ function cleanArtifact(resource: RuntimeResource, ports: ControllerCleanupPorts)
   if (artifact === undefined) throw new Error(`Artifact is unavailable: ${resource.id}.`);
   assertOwnedArtifactPath(resource);
   const currentFingerprint = ports.artifactFingerprint(artifact.path);
-  if (currentFingerprint === undefined || currentFingerprint !== artifact.fingerprint) {
+  // A concurrent exact cleanup may have already removed this artifact. The
+  // desired state is still satisfied; only a changed live inode is ambiguous.
+  if (currentFingerprint === undefined) return;
+  if (currentFingerprint !== artifact.fingerprint) {
     throw new Error(`Resource changed since scan: ${resource.id}.`);
   }
   if (artifact.artifactKind === "domain-identity") {

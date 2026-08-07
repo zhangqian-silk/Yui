@@ -13,8 +13,10 @@ import {
   defaultEphemeralTmuxServer,
   domainIdentityPath,
   ephemeralDomainEnvironment,
+  recordEphemeralTmuxTarget,
   readEphemeralDomainIdentity,
   readLinuxProcessStartIdentity,
+  removeEphemeralDomainIdentity,
   writeEphemeralDomainIdentity
 } from "../../dist/controller/domainIdentity.js";
 import {
@@ -73,41 +75,27 @@ export function createIsolatedRuntime(testContext, options = {}) {
       controllerStarted = true;
     },
     tmux() {
+      const recordTarget = (target) => {
+        if (!recordEphemeralTmuxTarget(home, currentIdentity.token, target)) {
+          throw new Error(`Isolated runtime target fence was not recorded: ${target}`);
+        }
+        const current = readEphemeralDomainIdentity(home);
+        if (current.status !== "valid") {
+          throw new Error("Isolated runtime domain identity became unavailable.");
+        }
+        currentIdentity = current.identity;
+        environment.YUI_EPHEMERAL_TMUX_TARGETS = JSON.stringify(
+          currentIdentity.tmuxTargets
+        );
+      };
       const manager = new TmuxManager(
         environment.YUI_TMUX_BIN ?? "tmux",
         new NodeCommandExecutor(),
-        { yuiHome: home }
-      );
-      const refreshIdentityTargets = () => {
-        const current = readEphemeralDomainIdentity(home);
-        if (current.status !== "valid" || current.identity?.token !== currentIdentity.token) {
-          return;
+        {
+          yuiHome: home,
+          onRoleTargetRecorded: recordTarget
         }
-        const targets = manager.inspectRolePaneInventory().map((pane) => pane.target).sort();
-        currentIdentity = Object.freeze({
-          ...current.identity,
-          tmuxTargets: targets
-        });
-        writeEphemeralDomainIdentity(home, currentIdentity);
-        environment.YUI_EPHEMERAL_TMUX_TARGETS = JSON.stringify(targets);
-      };
-      const ensureRoleWindow = manager.ensureRoleWindow.bind(manager);
-      manager.ensureRoleWindow = (...args) => {
-        const created = ensureRoleWindow(...args);
-        refreshIdentityTargets();
-        return created;
-      };
-      const killRole = manager.killRole.bind(manager);
-      manager.killRole = (...args) => {
-        killRole(...args);
-        refreshIdentityTargets();
-      };
-      const stopTask = manager.stopTask.bind(manager);
-      manager.stopTask = (...args) => {
-        const stopped = stopTask(...args);
-        refreshIdentityTargets();
-        return stopped;
-      };
+      );
       return manager;
     },
     async teardown() {
@@ -134,6 +122,19 @@ export function createIsolatedRuntime(testContext, options = {}) {
         } catch (error) {
           remember(error);
         }
+      }
+
+      // The Controller intentionally retains target fences across a normal
+      // stop so a restart cannot lose surviving panes. The fixture owns this
+      // disposable domain; once the Controller is stopped it may remove the
+      // exact token and clean the remaining resources itself.
+      try {
+        const current = readEphemeralDomainIdentity(home);
+        if (current.status === "valid") {
+          removeEphemeralDomainIdentity(home, current.identity.token);
+        }
+      } catch (error) {
+        remember(error);
       }
 
       // Reap the full Agent process trees before removing their tmux panes.
