@@ -246,3 +246,106 @@ test("reaper revalidates exact fingerprint and retries a failed clean", async ()
   assert.equal(second.failed.length, 0);
   assert.equal(cleanCalls, 2);
 });
+
+for (const scenario of [
+  { name: "a reused target", target: "yui-test:operator", disposition: "safe" },
+  { name: "a new pane", target: "yui-test:worker", disposition: "review" }
+]) {
+  test(`reaper defers identity cleanup when ${scenario.name} appears after revalidation`, async () => {
+    const home = "/tmp/yui-ephemeral-race-home";
+    const target = "yui-test:operator";
+    const domain = {
+      yuiHome: home,
+      storageStatus: "current",
+      resourceCount: 1,
+      liveProcessCount: 0,
+      rssBytes: 0,
+      issueCount: 1,
+      kind: "ephemeral-test",
+      domainKind: "ephemeral-test",
+      liveness: "expired",
+      disposition: "safe",
+      reasonCode: "ephemeral-host-dead",
+      fingerprint: "domain-fence",
+      token: "a".repeat(64),
+      tmuxTargets: [target],
+      ageMs: 10_000,
+      graceMs: 1_000
+    };
+    const identity = {
+      id: `artifact:${home}/runtime/domain.json`,
+      fingerprint: "identity-fingerprint",
+      kind: "artifact",
+      state: "stale",
+      disposition: "safe",
+      reasonCode: "stale-domain-identity",
+      yuiHome: home,
+      owner: { kind: "controller-domain", yuiHome: home },
+      processes: [],
+      rssBytes: 0,
+      cpuTimeMs: 0,
+      ageMs: 0,
+      domain,
+      artifact: {
+        artifactKind: "domain-identity",
+        path: `${home}/runtime/domain.json`,
+        active: false,
+        fingerprint: "identity-fingerprint"
+      }
+    };
+    const sibling = {
+      id: `agent-session:${home}:${scenario.target}`,
+      fingerprint: `pane-${scenario.target}`,
+      kind: "agent-session",
+      state: scenario.disposition === "safe" ? "running" : "orphaned",
+      disposition: scenario.disposition,
+      reasonCode: scenario.disposition === "safe" ? "owned-role-pane" : "orphan-pane",
+      yuiHome: home,
+      owner: { kind: "none" },
+      processes: [],
+      rssBytes: 0,
+      cpuTimeMs: 0,
+      ageMs: 0,
+      target: scenario.target,
+      paneDead: false,
+      paneCommand: "sleep",
+      domain
+    };
+    const snapshot = (resources) => ({
+      schemaVersion: 1,
+      observedAt: new Date().toISOString(),
+      currentHome: home,
+      scope: "current",
+      summary: {
+        domainCount: 1,
+        resourceCount: resources.length,
+        liveProcessCount: 0,
+        rssBytes: 0,
+        byDisposition: { safe: resources.filter(({ disposition }) => disposition === "safe").length,
+          review: resources.filter(({ disposition }) => disposition === "review").length,
+          protected: 0, "report-only": 0 }
+      },
+      domains: [domain],
+      resources,
+      warnings: []
+    });
+    const snapshots = [snapshot([identity]), snapshot([identity, sibling])];
+    let scanCount = 0;
+    let cleanCalls = 0;
+    let expiredDomainCallbacks = 0;
+    const result = await reapExpiredEphemeralResources({
+      scan: async () => snapshots[Math.min(scanCount++, snapshots.length - 1)],
+      clean: async () => { cleanCalls += 1; },
+      onExpiredDomain: () => { expiredDomainCallbacks += 1; }
+    });
+
+    assert.equal(cleanCalls, 0);
+    assert.equal(result.cleaned, 0);
+    assert.deepEqual(result.expiredDomains, []);
+    assert.equal(expiredDomainCallbacks, 0);
+    assert.deepEqual(result.failed, [{
+      id: identity.id,
+      message: "domain-sibling-appeared"
+    }]);
+  });
+}

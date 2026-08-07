@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import {
+  mkdtempSync,
+  readFileSync,
+  rmSync
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 
+import {
+  createEphemeralDomainIdentity,
+  defaultEphemeralTmuxServer,
+  domainIdentityPath,
+  recordEphemeralTmuxTarget,
+  writeEphemeralDomainIdentity
+} from "../../dist/controller/domainIdentity.js";
 import { NodeCommandExecutor } from "../../dist/tmux/commandExecutor.js";
 import {
   TmuxDeliveryPump,
@@ -78,6 +90,161 @@ test("all tmux lifecycle operations use the dedicated YUI_HOME server", () => {
   assert.ok(operations.includes("rename-window"));
   assert.ok(operations.includes("kill-session"));
   assert.equal(new Set(calls.map(({ args }) => args[1])).size, 1);
+});
+
+test("target recorder failure blocks sync and async pane mutation", async () => {
+  const syncCalls = [];
+  const syncManager = new TmuxManager("tmux-test", {
+    run(command, args) {
+      syncCalls.push({ command, args });
+      if (tmuxCommand(args) === "has-session") throw new Error("absent");
+      return "";
+    }
+  }, {
+    yuiHome: "/tmp/yui-recorder-failure-sync",
+    onRoleTargetRecorded() {
+      throw new Error("ephemeral identity disappeared");
+    }
+  });
+
+  assert.throws(
+    () => syncManager.ensureRoleWindow("task-1", {
+      name: "worker",
+      workspace: "/tmp/work"
+    }, { command: "codex", args: [], env: {} }),
+    /ephemeral identity disappeared/u
+  );
+  assert.equal(
+    syncCalls.some(({ args }) => ["new-session", "new-window"].includes(tmuxCommand(args))),
+    false
+  );
+
+  const asyncCalls = [];
+  const asyncManager = new TmuxManager("tmux-test", {
+    run() {
+      throw new Error("sync executor path must not be used");
+    },
+    async runAsync(command, args) {
+      asyncCalls.push({ command, args });
+      if (tmuxCommand(args) === "list-windows") return "";
+      return "";
+    }
+  }, {
+    yuiHome: "/tmp/yui-recorder-failure-async",
+    onRoleTargetRecorded() {
+      throw new Error("ephemeral identity disappeared");
+    }
+  });
+
+  await assert.rejects(
+    asyncManager.ensureRoleWindowAsync("task-1", {
+      name: "worker",
+      workspace: "/tmp/work"
+    }, { command: "codex", args: [], env: {} }),
+    /ephemeral identity disappeared/u
+  );
+  assert.equal(
+    asyncCalls.some(({ args }) => ["new-session", "new-window"].includes(tmuxCommand(args))),
+    false
+  );
+});
+
+test("identity disappearance blocks new-window and rename-window before mutation", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "yui-tmux-recorder-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, "home");
+  const identity = createEphemeralDomainIdentity({
+    tmuxServer: defaultEphemeralTmuxServer(home),
+    hostPid: 99999999,
+    hostProcessStartIdentity: "123",
+    tmuxTargets: []
+  });
+  writeEphemeralDomainIdentity(home, identity);
+  rmSync(domainIdentityPath(home));
+
+  const calls = [];
+  const manager = new TmuxManager("tmux-test", {
+    run(command, args) {
+      calls.push({ command, args });
+      if (tmuxCommand(args) === "has-session") throw new Error("absent");
+      return "";
+    }
+  }, {
+    yuiHome: home,
+    onRoleTargetRecorded(target) {
+      if (!recordEphemeralTmuxTarget(home, identity.token, target)) {
+        throw new Error("ephemeral identity disappeared");
+      }
+    }
+  });
+
+  assert.throws(
+    () => manager.ensureRoleWindow("task-1", {
+      name: "worker",
+      workspace: "/tmp/work"
+    }, { command: "codex", args: [], env: {} }),
+    /ephemeral identity disappeared/u
+  );
+  assert.throws(
+    () => manager.renameRole("task-1", "worker", "reviewer"),
+    /ephemeral identity disappeared/u
+  );
+  assert.deepEqual(
+    calls.map(({ args }) => tmuxCommand(args)),
+    ["has-session"]
+  );
+});
+
+test("a tmux mutation failure retains the pre-recorded stale fence", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "yui-tmux-stale-fence-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, "home");
+  const identity = createEphemeralDomainIdentity({
+    tmuxServer: defaultEphemeralTmuxServer(home),
+    hostPid: 99999999,
+    hostProcessStartIdentity: "123",
+    tmuxTargets: []
+  });
+  writeEphemeralDomainIdentity(home, identity);
+  const calls = [];
+  const manager = new TmuxManager("tmux-test", {
+    run(command, args) {
+      calls.push({ command, args });
+      const operation = tmuxCommand(args);
+      if (operation === "has-session") throw new Error("absent");
+      if (args.includes("new-session")) throw new Error("tmux create failed");
+      if (args.includes("rename-window")) throw new Error("tmux rename failed");
+      return "";
+    }
+  }, {
+    yuiHome: home,
+    onRoleTargetRecorded(target) {
+      if (!recordEphemeralTmuxTarget(home, identity.token, target)) {
+        throw new Error("ephemeral identity disappeared");
+      }
+    }
+  });
+
+  assert.throws(
+    () => manager.ensureRoleWindow("task-1", {
+      name: "worker",
+      workspace: "/tmp/work"
+    }, { command: "codex", args: [], env: {} }),
+    /tmux create failed/u
+  );
+  const current = JSON.parse(readFileSync(domainIdentityPath(home), "utf8"));
+  assert.deepEqual(current.tmuxTargets, [`${yuiTmuxSessionName(home, "task-1")}:worker`]);
+  assert.equal(calls.at(-1).args.includes("new-session"), true);
+
+  assert.throws(
+    () => manager.renameRole("task-1", "worker", "reviewer"),
+    /tmux rename failed/u
+  );
+  const afterRenameFailure = JSON.parse(readFileSync(domainIdentityPath(home), "utf8"));
+  assert.deepEqual(afterRenameFailure.tmuxTargets, [
+    `${yuiTmuxSessionName(home, "task-1")}:reviewer`,
+    `${yuiTmuxSessionName(home, "task-1")}:worker`
+  ]);
 });
 
 test("Role launches clear inherited process environment and use only the complete launch plan", () => {

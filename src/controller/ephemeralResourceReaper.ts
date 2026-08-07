@@ -65,6 +65,13 @@ export async function reapExpiredEphemeralResources(
       failed.push({ id: candidate.id, message: "changed-since-scan" });
       continue;
     }
+    if (!isDomainIdentityReadyForCleanup(current, revalidated.resources)) {
+      // The first scan may have seen only runtime/domain.json, while a pane
+      // or another exact sibling appeared before this clean. Keep the sole
+      // token fence and let the next bounded pass converge the sibling first.
+      failed.push({ id: current.id, message: "domain-sibling-appeared" });
+      continue;
+    }
     try {
       await clean(current);
       cleaned += 1;
