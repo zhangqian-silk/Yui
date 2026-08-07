@@ -1,6 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
+  openSync,
   lstatSync,
   mkdirSync,
   readFileSync,
@@ -13,6 +15,7 @@ import { dirname, join, resolve } from "node:path";
 
 /** Durable identity written by an isolated integration-test runtime. */
 export const CONTROLLER_DOMAIN_PATH = "runtime/domain.json";
+const EPHEMERAL_DOMAIN_LOCK_PATH = "runtime/domain.identity.lock";
 export const EPHEMERAL_DOMAIN_GRACE_MS = 1_000;
 
 export const EPHEMERAL_DOMAIN_ENVIRONMENT_NAMES = [
@@ -42,6 +45,14 @@ export type DomainIdentityRead = Readonly<{
   status: "absent" | "valid" | "invalid";
   identity?: EphemeralDomainIdentity;
   fingerprint?: string;
+}>;
+
+export type EphemeralDomainIdentityRemoval = "removed" | "deferred" | "absent";
+
+export type EphemeralDomainIdentityRemovalOptions = Readonly<{
+  /** Test-only scheduling seam for a deterministic final-window race. */
+  beforeAcquire?: () => void;
+  requireNoTargets?: boolean;
 }>;
 
 export type EphemeralDomainIdentityOptions = Readonly<{
@@ -129,6 +140,15 @@ export function writeEphemeralDomainIdentity(
   identity: EphemeralDomainIdentity
 ): void {
   validateEphemeralDomainIdentity(identity);
+  withEphemeralDomainIdentityLock(home, () => {
+    writeEphemeralDomainIdentityUnlocked(home, identity);
+  });
+}
+
+function writeEphemeralDomainIdentityUnlocked(
+  home: string,
+  identity: EphemeralDomainIdentity
+): void {
   const existing = readEphemeralDomainIdentity(home);
   if (existing.status === "invalid") {
     throw new Error("Cannot replace an invalid ephemeral domain identity.");
@@ -191,12 +211,21 @@ export function recordEphemeralTmuxTarget(
   ) return false;
   const current = readEphemeralDomainIdentity(home);
   if (current.status !== "valid" || current.identity?.token !== token) return false;
-  if (current.identity.tmuxTargets.includes(target)) return true;
-  writeEphemeralDomainIdentity(home, {
-    ...current.identity,
-    tmuxTargets: [...current.identity.tmuxTargets, target].sort()
-  });
-  return true;
+  try {
+    return withEphemeralDomainIdentityLock(home, () => {
+      const latest = readEphemeralDomainIdentity(home);
+      if (latest.status !== "valid" || latest.identity?.token !== token) return false;
+      if (latest.identity.tmuxTargets.includes(target)) return true;
+      writeEphemeralDomainIdentityUnlocked(home, {
+        ...latest.identity,
+        tmuxTargets: [...latest.identity.tmuxTargets, target].sort()
+      });
+      return true;
+    });
+  } catch (error) {
+    if (error instanceof EphemeralDomainIdentityLockBusyError) return false;
+    throw error;
+  }
 }
 
 export function readEphemeralDomainIdentity(home: string): DomainIdentityRead {
@@ -228,11 +257,64 @@ export function readEphemeralDomainIdentity(home: string): DomainIdentityRead {
 export function removeEphemeralDomainIdentity(
   home: string,
   token: string
-): void {
-  const path = domainIdentityPath(home);
+): boolean {
   const current = readEphemeralDomainIdentity(home);
-  if (current.status !== "valid" || current.identity?.token !== token) return;
-  rmSync(path, { force: true });
+  if (current.status !== "valid" || current.identity?.token !== token) return false;
+  return removeEphemeralDomainIdentityIfUnchanged(
+    home,
+    token,
+    current.fingerprint
+  ) === "removed";
+}
+
+/**
+ * Removes one exact identity generation while holding the same lock used by
+ * target-fence writers. A changed fingerprint, token, target fence, or busy
+ * lock is a bounded defer; callers can safely retry the next scan.
+ */
+export function removeEphemeralDomainIdentityIfUnchanged(
+  home: string,
+  token: string,
+  expectedFingerprint: string | undefined,
+  options: EphemeralDomainIdentityRemovalOptions = {}
+): EphemeralDomainIdentityRemoval {
+  if (
+    typeof token !== "string"
+    || !/^[a-f0-9]{64}$/u.test(token)
+    || typeof expectedFingerprint !== "string"
+    || expectedFingerprint.length === 0
+  ) return "deferred";
+  const initial = readEphemeralDomainIdentity(home);
+  if (initial.status === "absent") return "absent";
+  if (
+    initial.status !== "valid"
+    || initial.identity?.token !== token
+    || initial.fingerprint !== expectedFingerprint
+    || (options.requireNoTargets === true && initial.identity.tmuxTargets.length > 0)
+  ) return "deferred";
+  options.beforeAcquire?.();
+  try {
+    return withEphemeralDomainIdentityLock(home, () => {
+      const current = readEphemeralDomainIdentity(home);
+      if (current.status === "absent") return "absent";
+      if (
+        current.status !== "valid"
+        || current.identity?.token !== token
+        || current.fingerprint !== expectedFingerprint
+        || (options.requireNoTargets === true && current.identity.tmuxTargets.length > 0)
+      ) return "deferred";
+      try {
+        rmSync(domainIdentityPath(home), { force: false });
+      } catch (error) {
+        if (isNodeCode(error, "ENOENT")) return "absent";
+        throw error;
+      }
+      return "removed";
+    });
+  } catch (error) {
+    if (error instanceof EphemeralDomainIdentityLockBusyError) return "deferred";
+    throw error;
+  }
 }
 
 export function domainIdentityPath(home: string): string {
@@ -319,6 +401,130 @@ function statFingerprint(metadata: Stats): string {
 
 function isNodeCode(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;
+}
+
+class EphemeralDomainIdentityLockBusyError extends Error {
+  constructor(lockPath: string) {
+    super(`Ephemeral domain identity fence is busy: ${lockPath}.`);
+    this.name = "EphemeralDomainIdentityLockBusyError";
+  }
+}
+
+type EphemeralDomainIdentityLockOwner = Readonly<{
+  pid: number;
+  processStartIdentity: string;
+  token: string;
+}>;
+
+function withEphemeralDomainIdentityLock<T>(home: string, action: () => T): T {
+  const lockPath = domainIdentityLockPath(home);
+  const directory = dirname(lockPath);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  chmodSync(directory, 0o700);
+  const processStartIdentity = readLinuxProcessStartIdentity(process.pid);
+  if (processStartIdentity === undefined) {
+    throw new Error(`Cannot read Linux process start identity for lock owner PID ${process.pid}.`);
+  }
+  const owner: EphemeralDomainIdentityLockOwner = {
+    pid: process.pid,
+    processStartIdentity,
+    token: randomBytes(16).toString("hex")
+  };
+  let fileDescriptor: number | undefined;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      fileDescriptor = openSync(lockPath, "wx", 0o600);
+      writeFileSync(fileDescriptor, `${JSON.stringify(owner)}\n`);
+      chmodSync(lockPath, 0o600);
+      break;
+    } catch (error) {
+      if (fileDescriptor !== undefined) {
+        closeSync(fileDescriptor);
+        fileDescriptor = undefined;
+        rmSync(lockPath, { force: true });
+      }
+      if (!isNodeCode(error, "EEXIST")) throw error;
+      if (!reclaimStaleEphemeralDomainLock(lockPath)) {
+        throw new EphemeralDomainIdentityLockBusyError(lockPath);
+      }
+    }
+  }
+  if (fileDescriptor === undefined) {
+    throw new EphemeralDomainIdentityLockBusyError(lockPath);
+  }
+  try {
+    return action();
+  } finally {
+    closeSync(fileDescriptor);
+    releaseEphemeralDomainIdentityLock(lockPath, owner);
+  }
+}
+
+function domainIdentityLockPath(home: string): string {
+  return join(resolve(home), EPHEMERAL_DOMAIN_LOCK_PATH);
+}
+
+function reclaimStaleEphemeralDomainLock(lockPath: string): boolean {
+  let owner: EphemeralDomainIdentityLockOwner;
+  try {
+    const metadata = lstatSync(lockPath);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0) {
+      return false;
+    }
+    owner = JSON.parse(readFileSync(lockPath, "utf8")) as EphemeralDomainIdentityLockOwner;
+    if (
+      typeof owner !== "object"
+      || owner === null
+      || !Number.isSafeInteger(owner.pid)
+      || owner.pid <= 0
+      || typeof owner.processStartIdentity !== "string"
+      || !/^[0-9]{1,32}$/u.test(owner.processStartIdentity)
+      || typeof owner.token !== "string"
+      || !/^[a-f0-9]{32}$/u.test(owner.token)
+    ) return false;
+  } catch {
+    return false;
+  }
+  const currentStartIdentity = readLinuxProcessStartIdentity(owner.pid);
+  if (
+    currentStartIdentity !== undefined
+    && currentStartIdentity === owner.processStartIdentity
+  ) return false;
+  if (currentStartIdentity === undefined && isProcessAlive(owner.pid)) return false;
+  try {
+    rmSync(lockPath, { force: false });
+    return true;
+  } catch (error) {
+    if (isNodeCode(error, "ENOENT")) return true;
+    return false;
+  }
+}
+
+function releaseEphemeralDomainIdentityLock(
+  lockPath: string,
+  owner: EphemeralDomainIdentityLockOwner
+): void {
+  try {
+    const current = JSON.parse(readFileSync(lockPath, "utf8")) as Partial<EphemeralDomainIdentityLockOwner>;
+    if (
+      current.pid === owner.pid
+      && current.processStartIdentity === owner.processStartIdentity
+      && current.token === owner.token
+    ) {
+      rmSync(lockPath, { force: true });
+    }
+  } catch {
+    // A missing or externally invalidated lock is already fail-closed.
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !isNodeCode(error, "ESRCH");
+  }
 }
 
 // Keep this import-free helper usable by test fixtures without requiring tmux.
