@@ -21,10 +21,44 @@ import {
 } from "../storageSchema.js";
 import {
   CURRENT_AGENT_RUN_SCHEMA_VERSION,
+  CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
+  CURRENT_CONFIG_SCHEMA_VERSION,
   CURRENT_STORED_TASK_SCHEMA_VERSION,
   CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION
 } from "../taskStore.js";
+import { CURRENT_LEADER_FAILURE_SCHEMA_VERSION } from "../../scheduler/leaderFailure.js";
+import { CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION } from "../../scheduler/operatorNotification.js";
 import type { RecordAxisEntry, StorageVersionState } from "../migration/index.js";
+
+/** Every persisted record family directly owned by StorageState/StoredTask. */
+const EXPECTED_RECORD_KINDS = [
+  "config",
+  "configuredAgent",
+  "project",
+  "agentProfile",
+  "globalRole",
+  "globalRoleSessionSet",
+  "storedTask",
+  "task",
+  "taskBrief",
+  "taskRole",
+  "managedWorkspace",
+  "taskRoleSessionSet",
+  "workItem",
+  "agentRun",
+  "reviewRound",
+  "changeSet",
+  "integrationAttempt",
+  "activeRunPointer",
+  "message",
+  "inputRequest",
+  "decision",
+  "milestone",
+  "event",
+  "leaderFailure",
+  "operatorNotification",
+  "workMailbox"
+] as const;
 
 /**
  * The record families present on the current baseline, each at its real
@@ -34,6 +68,7 @@ import type { RecordAxisEntry, StorageVersionState } from "../migration/index.js
  * `schemaVersion` changes — it tracks the live schema, it does not freeze it.
  */
 const CURRENT_RECORD_VERSIONS: Readonly<Record<string, RecordAxisEntry>> = Object.freeze({
+  config: { version: CURRENT_CONFIG_SCHEMA_VERSION, path: "state.json#/config" },
   configuredAgent: { version: 2, path: "state.json#/configuredAgents" },
   project: { version: 2, path: "state.json#/projects" },
   agentProfile: { version: 2, path: "state.json#/agentProfiles" },
@@ -57,11 +92,23 @@ const CURRENT_RECORD_VERSIONS: Readonly<Record<string, RecordAxisEntry>> = Objec
   reviewRound: { version: 2, path: "state.json#/tasks/*/reviewRounds" },
   changeSet: { version: 2, path: "state.json#/tasks/*/changeSets" },
   integrationAttempt: { version: 2, path: "state.json#/tasks/*/integrationAttempts" },
+  activeRunPointer: {
+    version: CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
+    path: "state.json#/tasks/*/activeRuns"
+  },
   message: { version: 2, path: "state.json#/tasks/*/messages" },
   inputRequest: { version: 2, path: "state.json#/tasks/*/inputRequests" },
   decision: { version: 1, path: "state.json#/tasks/*/decisions" },
   milestone: { version: 1, path: "state.json#/tasks/*/milestones" },
   event: { version: 2, path: "state.json#/tasks/*/events" },
+  leaderFailure: {
+    version: CURRENT_LEADER_FAILURE_SCHEMA_VERSION,
+    path: "state.json#/tasks/*/leaderFailure"
+  },
+  operatorNotification: {
+    version: CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION,
+    path: "state.json#/tasks/*/operatorNotification"
+  },
   workMailbox: { version: 1, path: "state.json#/mailboxes" }
 });
 
@@ -72,12 +119,31 @@ export function currentRecordVersions(): Readonly<Record<string, RecordAxisEntry
 }
 
 /**
- * Fail closed if this centralized map drifts from the strict taskStore gates.
- * The map intentionally keeps literal values so a future schema bump must
- * update both the source-of-truth parser and this upgrade baseline together.
+ * Fail closed if this centralized map drifts from the persisted boundary.
+ * Completeness is checked separately from version alignment so adding a new
+ * StorageState/StoredTask family cannot silently make a legal Home look
+ * current. Version checks use the named parser/domain constants wherever the
+ * strict loader or domain constructors own the value.
  */
 function assertTaskStoreRecordVersions(): void {
+  const mappedKinds = Object.keys(CURRENT_RECORD_VERSIONS);
+  const missing = EXPECTED_RECORD_KINDS.filter((kind) => !Object.hasOwn(CURRENT_RECORD_VERSIONS, kind));
+  const unexpected = mappedKinds.filter(
+    (kind) => !(EXPECTED_RECORD_KINDS as readonly string[]).includes(kind)
+  );
+  if (missing.length > 0 || unexpected.length > 0) {
+    throw new Error(
+      `Record version map completeness drift: missing=${missing.join(",") || "none"}; `
+      + `unexpected=${unexpected.join(",") || "none"}.`
+    );
+  }
+
   const expected: Readonly<Record<string, number>> = {
+    config: CURRENT_CONFIG_SCHEMA_VERSION,
+    activeRunPointer: CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
+    leaderFailure: CURRENT_LEADER_FAILURE_SCHEMA_VERSION,
+    operatorNotification: CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION,
+    storedTask: CURRENT_STORED_TASK_SCHEMA_VERSION,
     taskRoleSessionSet: CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION,
     agentRun: CURRENT_AGENT_RUN_SCHEMA_VERSION
   };
@@ -86,6 +152,20 @@ function assertTaskStoreRecordVersions(): void {
     if (mapped !== version) {
       throw new Error(
         `Record version map drift for ${kind}: taskStore=${version}, map=${String(mapped)}.`
+      );
+    }
+  }
+
+  const expectedPaths: Readonly<Record<string, string>> = {
+    config: "state.json#/config",
+    activeRunPointer: "state.json#/tasks/*/activeRuns",
+    leaderFailure: "state.json#/tasks/*/leaderFailure",
+    operatorNotification: "state.json#/tasks/*/operatorNotification"
+  };
+  for (const [kind, path] of Object.entries(expectedPaths)) {
+    if (CURRENT_RECORD_VERSIONS[kind]?.path !== path) {
+      throw new Error(
+        `Record version map drift for ${kind}: path=${String(CURRENT_RECORD_VERSIONS[kind]?.path)}.`
       );
     }
   }

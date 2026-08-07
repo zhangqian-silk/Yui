@@ -67,8 +67,14 @@ import {
   type GlobalRole,
   type TaskRole
 } from "../role/role.js";
-import type { LeaderFailure } from "../scheduler/leaderFailure.js";
-import type { OperatorNotification } from "../scheduler/operatorNotification.js";
+import {
+  CURRENT_LEADER_FAILURE_SCHEMA_VERSION,
+  type LeaderFailure
+} from "../scheduler/leaderFailure.js";
+import {
+  CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION,
+  type OperatorNotification
+} from "../scheduler/operatorNotification.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import { validateTask, type Task } from "../task/task.js";
 import {
@@ -90,9 +96,16 @@ import {
 } from "../worktree/managedWorkspace.js";
 import { writeTextFileAtomically } from "./durableFile.js";
 import { assertHomeWritable } from "./upgradeFence.js";
-import { requireStorageSchema } from "./storageSchema.js";
+import {
+  CURRENT_AGGREGATE_SCHEMA_VERSION,
+  requireStorageSchema
+} from "./storageSchema.js";
 
 export const STORAGE_STATE_FILE = "state.json";
+/** The root StorageState schema is the persisted aggregate document version. */
+export const CURRENT_STORAGE_STATE_SCHEMA_VERSION = CURRENT_AGGREGATE_SCHEMA_VERSION;
+export const CURRENT_CONFIG_SCHEMA_VERSION = 1 as const;
+export const CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION = 1 as const;
 const STORAGE_LOCK_DIRECTORY = ".state.lock";
 const LOCK_TIMEOUT_MS = 5_000;
 const LOCK_RETRY_MS = 10;
@@ -104,7 +117,7 @@ export type CompletionInstallation = Readonly<{
   activationPath: string;
 }>;
 export type YuiConfig = Readonly<{
-  schemaVersion: 1;
+  schemaVersion: typeof CURRENT_CONFIG_SCHEMA_VERSION;
   defaultAgent?: string;
   defaultWorkspace?: string;
   timeZone?: string;
@@ -122,7 +135,10 @@ export type ConfiguredAgentUpdateResult = Readonly<{
   agent: ConfiguredAgent;
 }>;
 
-type ActiveRunPointer = Readonly<{ schemaVersion: 1; runId: string }>;
+type ActiveRunPointer = Readonly<{
+  schemaVersion: typeof CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION;
+  runId: string;
+}>;
 
 type TaskIdHighWaterMarks = Record<TaskRecordKind, number>;
 
@@ -161,7 +177,7 @@ type StoredTask = {
 };
 
 type StorageState = {
-  schemaVersion: 16;
+  schemaVersion: typeof CURRENT_STORAGE_STATE_SCHEMA_VERSION;
   revision: number;
   config: YuiConfig;
   configuredAgents: Record<string, ConfiguredAgent>;
@@ -933,7 +949,10 @@ export class FileTaskStore implements TaskStore {
       }
       store.saveAgentRun(run);
       this.#mutate((state) => {
-        state.tasks[run.taskId].activeRuns[run.roleName] = { schemaVersion: 1, runId: run.id };
+        state.tasks[run.taskId].activeRuns[run.roleName] = {
+          schemaVersion: CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
+          runId: run.id
+        };
       });
     });
   }
@@ -1131,7 +1150,10 @@ export class FileTaskStore implements TaskStore {
   #saveSingleton<K extends "leaderFailure" | "operatorNotification">(
     taskId: string, key: K, value: StoredTask[K], label: string
   ): void {
-    const stored = identified<StoredTask[K]>(value, 1, "taskId", taskId, label);
+    const schemaVersion = key === "leaderFailure"
+      ? CURRENT_LEADER_FAILURE_SCHEMA_VERSION
+      : CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION;
+    const stored = identified<StoredTask[K]>(value, schemaVersion, "taskId", taskId, label);
     this.#requireTaskForWrite(taskId);
     this.#mutate((state) => { state.tasks[taskId][key] = stored; });
   }
@@ -1274,9 +1296,9 @@ export function ensureYuiHome(rootDir: string): void { mkdirSync(rootDir, { recu
 
 function emptyState(): StorageState {
   return {
-    schemaVersion: 16,
+    schemaVersion: CURRENT_STORAGE_STATE_SCHEMA_VERSION,
     revision: 0,
-    config: { schemaVersion: 1 },
+    config: { schemaVersion: CURRENT_CONFIG_SCHEMA_VERSION },
     configuredAgents: {},
     projects: {},
     agentProfiles: {},
@@ -1367,9 +1389,13 @@ function parseState(raw: string): StorageState {
     "tasks",
     "mailboxes"
   ], "Storage state");
-  if (state.schemaVersion !== 16 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
+  if (state.schemaVersion !== CURRENT_STORAGE_STATE_SCHEMA_VERSION || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
   const result = clone(state) as unknown as StorageState;
-  result.config = versioned(result.config, 1, "Yui config");
+  result.config = versioned(
+    result.config,
+    CURRENT_CONFIG_SCHEMA_VERSION,
+    "Yui config"
+  );
   validateYuiConfig(result.config);
   parseMap(result.configuredAgents, (value, key) => {
     const agent = identified<ConfiguredAgent>(value, 2, "id", key, "Configured Agent");
@@ -1561,7 +1587,11 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     return round;
   }, "reviewRounds");
   parseMap(aggregate.activeRuns, (record, key) => {
-    const pointer = versioned<ActiveRunPointer>(record, 1, `Active run ${key}`);
+    const pointer = versioned<ActiveRunPointer>(
+      record,
+      CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
+      `Active run ${key}`
+    );
     const run = typeof pointer.runId === "string" ? aggregate.agentRuns[pointer.runId] : undefined;
     if (run === undefined || run.status !== "active" || run.roleName !== key) {
       throw new StorageRecordError(`Active run pointer is invalid: ${taskId}/${key}`);
@@ -1612,7 +1642,12 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
   }, "events");
   for (const [key, label] of [["leaderFailure", "Leader failure"], ["operatorNotification", "Operator notification"]] as const) {
     const record = aggregate[key];
-    if (record !== null) identified(record, 1, "taskId", taskId, label);
+    if (record !== null) {
+      const schemaVersion = key === "leaderFailure"
+        ? CURRENT_LEADER_FAILURE_SCHEMA_VERSION
+        : CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION;
+      identified(record, schemaVersion, "taskId", taskId, label);
+    }
   }
   validateTaskIdHighWaterCoverage(aggregate, taskId);
   return aggregate;

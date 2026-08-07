@@ -18,7 +18,9 @@ import {
 } from "../dist/storage/storageSchema.js";
 import {
   FileTaskStore,
+  CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
   CURRENT_AGENT_RUN_SCHEMA_VERSION,
+  CURRENT_CONFIG_SCHEMA_VERSION,
   CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION
 } from "../dist/storage/taskStore.js";
 import { MigrationRegistry, createEmptyRegistry, planMigration } from "../dist/storage/migration/index.js";
@@ -50,6 +52,11 @@ import {
 } from "../dist/executor/agentExecutor.js";
 import { createAgentRun } from "../dist/run/agentRun.js";
 import { createRole, createRoleAgentBinding } from "../dist/role/role.js";
+import { CURRENT_LEADER_FAILURE_SCHEMA_VERSION, recordLeaderFailure } from "../dist/scheduler/leaderFailure.js";
+import {
+  CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION,
+  createLeaderRecoveryNotification
+} from "../dist/scheduler/operatorNotification.js";
 import {
   ensureFileTaskControllerIdentity
 } from "../dist/controller/clientRuntime.js";
@@ -119,8 +126,29 @@ function currentHomeWithTaskRoleRecords() {
     now,
     { effective }
   );
-  store.saveAgentRun(run);
+  store.saveActiveAgentRun(run);
   return { ...fixture, taskId: task.id, roleName: role.name, runId: run.id };
+}
+
+/** Add valid non-null singleton records to exercise every StoredTask boundary. */
+function currentHomeWithBoundaryRecords() {
+  const fixture = currentHomeWithTaskRoleRecords();
+  const now = new Date("2026-08-07T00:01:00.000Z");
+  const store = new FileTaskStore(fixture.home);
+  store.saveLeaderFailure(recordLeaderFailure(
+    fixture.taskId,
+    "native-record-version-fixture",
+    "record-version fixture failure",
+    now,
+    null
+  ));
+  store.saveOperatorNotification(createLeaderRecoveryNotification(
+    fixture.taskId,
+    "record-version fixture notification",
+    now,
+    null
+  ));
+  return fixture;
 }
 
 /** Read + mutate + write the raw state.json (bypassing the strict store). */
@@ -268,11 +296,12 @@ test("P1-1 map completeness: current persisted workspace family is ManagedWorksp
   assert.deepEqual(
     Object.keys(versions).sort(),
     [
-      "agentProfile", "agentRun", "changeSet", "configuredAgent", "decision",
-      "event", "globalRole", "globalRoleSessionSet", "inputRequest",
-      "integrationAttempt", "managedWorkspace", "message", "milestone",
-      "project", "reviewRound", "storedTask", "task", "taskBrief", "taskRole",
-      "taskRoleSessionSet", "workItem", "workMailbox"
+      "activeRunPointer", "agentProfile", "agentRun", "changeSet", "config",
+      "configuredAgent", "decision", "event", "globalRole", "globalRoleSessionSet",
+      "inputRequest", "integrationAttempt", "leaderFailure", "managedWorkspace",
+      "message", "milestone", "operatorNotification", "project", "reviewRound",
+      "storedTask", "task", "taskBrief", "taskRole", "taskRoleSessionSet", "workItem",
+      "workMailbox"
     ].sort()
   );
   assert.deepEqual(versions.managedWorkspace, {
@@ -280,6 +309,120 @@ test("P1-1 map completeness: current persisted workspace family is ManagedWorksp
     path: "state.json#/tasks/*/managedWorkspaces"
   });
   assert.equal("roleWorkspace" in versions, false);
+});
+
+test("P2 map guard: current non-empty StorageState and StoredTask families are USABLE", async () => {
+  const { home, taskId, roleName, runId } = currentHomeWithBoundaryRecords();
+  const store = new FileTaskStore(home);
+  assert.equal(store.getConfig().schemaVersion, CURRENT_CONFIG_SCHEMA_VERSION);
+  assert.equal(store.getActiveAgentRun(taskId, roleName)?.id, runId);
+  assert.equal(store.getLeaderFailure(taskId)?.schemaVersion, CURRENT_LEADER_FAILURE_SCHEMA_VERSION);
+  assert.equal(
+    store.getOperatorNotification(taskId)?.schemaVersion,
+    CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION
+  );
+
+  const versions = currentRecordVersions();
+  assert.deepEqual(versions.config, {
+    version: CURRENT_CONFIG_SCHEMA_VERSION,
+    path: "state.json#/config"
+  });
+  assert.deepEqual(versions.activeRunPointer, {
+    version: CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
+    path: "state.json#/tasks/*/activeRuns"
+  });
+  assert.deepEqual(versions.leaderFailure, {
+    version: CURRENT_LEADER_FAILURE_SCHEMA_VERSION,
+    path: "state.json#/tasks/*/leaderFailure"
+  });
+  assert.deepEqual(versions.operatorNotification, {
+    version: CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION,
+    path: "state.json#/tasks/*/operatorNotification"
+  });
+
+  const scan = scanSourceRecordVersions(home, versions);
+  assert.ok("record" in scan);
+  assert.equal(scan.record.config.version, CURRENT_CONFIG_SCHEMA_VERSION);
+  assert.equal(scan.record.activeRunPointer.version, CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION);
+  assert.equal(scan.record.leaderFailure.version, CURRENT_LEADER_FAILURE_SCHEMA_VERSION);
+  assert.equal(
+    scan.record.operatorNotification.version,
+    CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION
+  );
+
+  const classification = classifyHome({ home, registry: EMPTY(), latest: LATEST() });
+  assert.equal(classification.classification.verdict, "USABLE");
+  const result = await runStorageUpgrade({
+    home,
+    registry: EMPTY(),
+    latest: LATEST(),
+    mode: "execute",
+    stopController: async () => {}
+  });
+  assert.equal(result.outcome, "already-current");
+});
+
+test("P2 map guard: future config and active-run pointer versions are future-version blockers", () => {
+  const futureConfig = currentHomeWithBoundaryRecords();
+  editState(futureConfig.home, (state) => {
+    state.config.schemaVersion = CURRENT_CONFIG_SCHEMA_VERSION + 1;
+  });
+  const configResult = classifyHome({
+    home: futureConfig.home,
+    registry: EMPTY(),
+    latest: LATEST()
+  });
+  assert.equal(configResult.classification.verdict, "NEEDS_NEW_VERSION");
+  assert.equal(configResult.classification.blocker.reason, "future-version");
+  assert.equal(configResult.classification.blocker.recordKind, "config");
+  assert.equal(configResult.classification.blocker.found, CURRENT_CONFIG_SCHEMA_VERSION + 1);
+  assert.equal(configResult.classification.blocker.supported, CURRENT_CONFIG_SCHEMA_VERSION);
+
+  const futurePointer = currentHomeWithBoundaryRecords();
+  editState(futurePointer.home, (state) => {
+    state.tasks[futurePointer.taskId].activeRuns[futurePointer.roleName].schemaVersion =
+      CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION + 1;
+  });
+  const pointerResult = classifyHome({
+    home: futurePointer.home,
+    registry: EMPTY(),
+    latest: LATEST()
+  });
+  assert.equal(pointerResult.classification.verdict, "NEEDS_NEW_VERSION");
+  assert.equal(pointerResult.classification.blocker.reason, "future-version");
+  assert.equal(pointerResult.classification.blocker.recordKind, "activeRunPointer");
+  assert.equal(
+    pointerResult.classification.blocker.found,
+    CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION + 1
+  );
+  assert.equal(
+    pointerResult.classification.blocker.supported,
+    CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION
+  );
+});
+
+test("P2 map guard preserves corruption for missing boundary schemaVersion", () => {
+  const missingConfig = currentHomeWithBoundaryRecords();
+  editState(missingConfig.home, (state) => {
+    delete state.config.schemaVersion;
+  });
+  const configResult = classifyHome({
+    home: missingConfig.home,
+    registry: EMPTY(),
+    latest: LATEST()
+  });
+  assert.equal(configResult.classification.verdict, "CORRUPTED");
+
+  const missingPointer = currentHomeWithBoundaryRecords();
+  editState(missingPointer.home, (state) => {
+    delete state.tasks[missingPointer.taskId].activeRuns[missingPointer.roleName].schemaVersion;
+  });
+  const pointerResult = classifyHome({
+    home: missingPointer.home,
+    registry: EMPTY(),
+    latest: LATEST()
+  });
+  assert.equal(pointerResult.classification.verdict, "CORRUPTED");
 });
 
 test("P1-1 map guard: non-empty current RoleSessionSet and AgentRun Home is USABLE", async () => {
