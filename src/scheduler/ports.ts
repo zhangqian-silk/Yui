@@ -57,6 +57,16 @@ export type RoleRunStallPersistence = Readonly<{
   taskId: string;
   roleName: string;
   runId: string;
+  agentId: string;
+  adapterId: string;
+  /** Exact Session fact observed by the scan; null is itself a fenced fact. */
+  session: Readonly<{
+    agentId: string;
+    adapterId: string;
+    nativeSessionId?: string;
+    launchId?: string;
+    status: SchedulerRoleSession["status"];
+  }> | null;
   kind: "delivery-stalled" | "execution-stalled";
   classification: "truly-stalled";
   progressAt: string;

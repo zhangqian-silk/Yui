@@ -3,6 +3,7 @@ import {
   selectedSchedulerRoles,
   selectedSchedulerTasks,
   type SchedulerReconcileSelection,
+  type SchedulerRoleSession,
   type SchedulerRoleResourceEvidence,
   type SchedulerStorePort,
   type TmuxDeliveryPort
@@ -867,6 +868,9 @@ export async function reconcileStalledRoleRuns(
       taskId: candidate.task.id,
       roleName: candidate.role.name,
       runId: candidate.run.id,
+      agentId: candidate.run.effective.agentId,
+      adapterId: candidate.run.effective.adapterId,
+      session: candidate.session,
       kind,
       classification,
       progressAt,
@@ -947,7 +951,7 @@ type ObservedRun = Readonly<{
       adapterId: string;
       nativeSessionId?: string;
       launchId?: string;
-      status: string;
+      status: SchedulerRoleSession["status"];
     } | null>;
   }>;
   live: "present" | "absent";

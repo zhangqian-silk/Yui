@@ -240,7 +240,20 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         || run === null
         || run.id !== input.runId
         || run.status !== "active"
+        || run.effective.agentId !== input.agentId
+        || run.effective.adapterId !== input.adapterId
       ) return "state-changed";
+
+      const progress = latestRunDurableProgressAt(
+        store,
+        input.taskId,
+        input.roleName,
+        input.runId
+      );
+      if (progress?.progressAt !== input.progressAt) return "state-changed";
+
+      const session = store.getRoleSession(input.taskId, input.roleName);
+      if (!matchesStallSessionFence(session, input.session)) return "state-changed";
 
       const existing = latestStallEvidenceKey(store.listEvents(task.id), run.id);
       if (existing?.progressAt === input.progressAt) return "already-raised";
@@ -3296,6 +3309,18 @@ function schedulerRoleSessionsMatch(
     && current.adapterId === expected.adapterId
     && current.nativeSessionId === expected.nativeSessionId
     && isDeepStrictEqual(current.effective, expected.effective);
+}
+
+function matchesStallSessionFence(
+  current: SchedulerRoleSession | null,
+  expected: RoleRunStallPersistence["session"]
+): boolean {
+  if (current === null || expected === null) return current === expected;
+  return current.agentId === expected.agentId
+    && current.adapterId === expected.adapterId
+    && current.nativeSessionId === expected.nativeSessionId
+    && current.launchId === expected.launchId
+    && current.status === expected.status;
 }
 
 function requireRole(store: TaskStore, taskId: string, roleName: string) {

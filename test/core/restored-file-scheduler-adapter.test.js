@@ -362,6 +362,81 @@ test("Leader delivery stall is routed through the existing Operator notification
   assert.equal(operatorMailbox.pending.reasons.includes("leader-run-stalled"), true);
 });
 
+test("stale Leader stall persistence cannot outrun newer durable progress", (t) => {
+  const { store, task, run, session, launchId, adapter, now } =
+    preparedDeliveryFailureFixture(t, { roleName: "leader" });
+  const deliveredAt = now.toISOString();
+  store.saveActiveAgentRun({ ...run, pushedAt: deliveredAt, deliveredAt });
+  const observedSession = { ...session, launchId };
+  const progressAt = new Date(now.getTime() + 1_000).toISOString();
+  store.saveEvent(task.id, createTaskEvent(
+    store.nextEventId(task.id),
+    task.id,
+    RUN_PROGRESS_EVENT,
+    { runId: run.id, roleName: run.roleName, progressAt },
+    new Date(progressAt)
+  ));
+
+  assert.equal(adapter.recordRoleRunStall({
+    taskId: task.id,
+    roleName: run.roleName,
+    runId: run.id,
+    agentId: run.effective.agentId,
+    adapterId: run.effective.adapterId,
+    session: observedSession,
+    kind: "execution-stalled",
+    classification: "truly-stalled",
+    progressAt: deliveredAt,
+    idleMs: 30 * 60_000,
+    evidenceKey: "stale-progress",
+    now: new Date(now.getTime() + 31 * 60_000)
+  }), "state-changed");
+  assert.equal(
+    store.listEvents(task.id).some((event) => event.type === "run.stalled"),
+    false
+  );
+  assert.equal(store.getOperatorNotification(task.id), null);
+});
+
+test("stale stall persistence cannot cross a Session terminal transition", (t) => {
+  const { store, task, run, session, launchId, adapter, now } =
+    preparedDeliveryFailureFixture(t, { roleName: "worker" });
+  const deliveredAt = now.toISOString();
+  store.saveActiveAgentRun({ ...run, pushedAt: deliveredAt, deliveredAt });
+  const observedSession = { ...session, launchId };
+  const changedAt = new Date(now.getTime() + 1_000);
+  const changedSessions = updateRoleAgentSessionStatus(
+    store.getTaskRoleSessionSet(task.id, run.roleName),
+    run.effective.agentId,
+    "stopped",
+    changedAt
+  );
+  store.saveTaskRoleSessionSet(changedSessions);
+
+  assert.equal(adapter.recordRoleRunStall({
+    taskId: task.id,
+    roleName: run.roleName,
+    runId: run.id,
+    agentId: run.effective.agentId,
+    adapterId: run.effective.adapterId,
+    session: observedSession,
+    kind: "execution-stalled",
+    classification: "truly-stalled",
+    progressAt: deliveredAt,
+    idleMs: 30 * 60_000,
+    evidenceKey: "stale-session-transition",
+    now: new Date(now.getTime() + 31 * 60_000)
+  }), "state-changed");
+  assert.equal(
+    store.listEvents(task.id).some((event) => event.type === "run.stalled"),
+    false
+  );
+  assert.equal(
+    store.getPendingWakeup(task.id)?.reasons.includes("role-run-stalled") ?? false,
+    false
+  );
+});
+
 test("advisory resource suppression survives a Controller restart for one Run/progress point", async (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
   const createdAt = new Date(now.getTime() - 60 * 60_000);
