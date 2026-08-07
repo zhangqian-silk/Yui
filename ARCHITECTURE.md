@@ -108,8 +108,12 @@ late results until explicitly reopened.
 Stable Project checkouts are read-only references. Task identity follows one
 bounded outcome rather than Project count. A Task binds zero or more Projects,
 records an independent base ref for each binding, and owns one workspace root
-containing a managed main worktree for each binding. The Leader runs from this
-root and sees every Project as a peer directory. The active Leader may append a
+containing a managed main worktree for each binding. The
+`<workspace>/tasks/<task>/main` root is a logical multi-Project container, not a
+Git repository. Each Project child (for example
+`<workspace>/tasks/<task>/main/yui`) is the supported Git cwd and points to
+`<workspace>/worktree/<project>/<task>/main`; Git commands run in that child.
+The Leader runs from this root and sees every Project as a peer directory. The active Leader may append a
 Project when the same outcome expands; replacing an existing binding is not a
 scope-repair mechanism.
 

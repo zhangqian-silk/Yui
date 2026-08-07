@@ -5,6 +5,8 @@ import {
   evaluateRoleRunStall,
   isRoleRunStalled,
   latestDurableProgressAt,
+  latestRunProgressAt,
+  projectRoleRunHealth,
   reconcileStalledRoleRuns
 } from "../../dist/scheduler/roleRunStall.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
@@ -46,6 +48,161 @@ test("stall evaluation treats checkpoints as progress but ignores bookkeeping ti
   );
 });
 
+test("late stale progress events cannot move the durable progress fence backwards", () => {
+  const events = [
+    createTaskEvent(
+      "event-1",
+      "task-1",
+      "run.progress",
+      { runId: "run-1", progressAt: "2026-08-05T00:30:00.000Z" },
+      new Date("2026-08-05T00:30:00.000Z")
+    ),
+    createTaskEvent(
+      "event-2",
+      "task-1",
+      "run.progress",
+      { runId: "run-1", progressAt: "2026-08-05T00:10:00.000Z" },
+      new Date("2026-08-05T00:40:00.000Z")
+    )
+  ];
+  assert.equal(
+    latestRunProgressAt(events, "run-1"),
+    "2026-08-05T00:30:00.000Z"
+  );
+});
+
+test("one health projection keeps live resource activity advisory and does not advance the clock", () => {
+  const projection = projectRoleRunHealth({
+    progressAt: PROGRESS,
+    createdAt: PROGRESS,
+    deliveredAt: PROGRESS,
+    now: NOW,
+    hostLiveness: "present",
+    nativeSession: {
+      status: "running",
+      nativeSessionId: "native-1"
+    },
+    providerAcceptance: "accepted",
+    resource: {
+      observedAt: "2026-08-05T00:59:30.000Z",
+      active: true,
+      changed: true,
+      cpuTimeMs: 10,
+      rssBytes: 1024
+    },
+    roleName: "worker"
+  });
+
+  assert.equal(projection.candidate, true);
+  assert.equal(projection.resourceActivity, true);
+  assert.equal(projection.stalled, false);
+  assert.equal(projection.progressAt, PROGRESS);
+  assert.equal(projection.idleMs, 60 * 60_000);
+});
+
+test("resource activity cannot make an unknown host or native Session healthy", () => {
+  const projection = projectRoleRunHealth({
+    progressAt: PROGRESS,
+    createdAt: PROGRESS,
+    deliveredAt: PROGRESS,
+    now: NOW,
+    hostLiveness: "unknown",
+    nativeSession: null,
+    providerAcceptance: "accepted",
+    resource: {
+      observedAt: "2026-08-05T00:59:30.000Z",
+      active: true,
+      changed: true
+    },
+    roleName: "worker"
+  });
+
+  assert.equal(projection.resourceActivity, false);
+  assert.equal(projection.stalled, false);
+  assert.equal(projection.nativeSession, "missing");
+});
+
+test("RSS-only residency does not suppress a stale accepted Run", () => {
+  const projection = projectRoleRunHealth({
+    progressAt: PROGRESS,
+    createdAt: PROGRESS,
+    deliveredAt: PROGRESS,
+    now: NOW,
+    hostLiveness: "present",
+    nativeSession: {
+      status: "running",
+      nativeSessionId: "native-1"
+    },
+    providerAcceptance: "accepted",
+    resource: {
+      observedAt: "2026-08-05T00:59:30.000Z",
+      active: true,
+      changed: false,
+      cpuTimeMs: 99,
+      rssBytes: 1024 * 1024
+    },
+    roleName: "worker"
+  });
+
+  assert.equal(projection.resourceActivity, false);
+  assert.equal(projection.stalled, true);
+});
+
+test("an opaque SessionHost binding still routes a stalled accepted Run", async () => {
+  const store = stallStore({ session: null });
+  let inspected;
+  const result = await reconcileStalledRoleRuns(
+    store,
+    {
+      async inspectRole(input) {
+        inspected = input;
+        return "present";
+      }
+    },
+    NOW,
+    undefined,
+    30 * 60_000
+  );
+
+  assert.equal(result[0]?.kind, "execution-stalled");
+  assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 1);
+  assert.equal("nativeSessionId" in inspected, false);
+});
+
+test("stopped, broken, and identity-mismatched Sessions remain fail-closed", async () => {
+  for (const session of [
+    {
+      agentId: "agent-1",
+      adapterId: "codex",
+      nativeSessionId: "native-1",
+      status: "stopped"
+    },
+    {
+      agentId: "agent-1",
+      adapterId: "codex",
+      nativeSessionId: "native-1",
+      status: "broken"
+    },
+    {
+      agentId: "other-agent",
+      adapterId: "codex",
+      nativeSessionId: "native-1",
+      status: "running"
+    }
+  ]) {
+    const store = stallStore({ session });
+    const result = await reconcileStalledRoleRuns(
+      store,
+      { async inspectRole() { return "present"; } },
+      NOW,
+      undefined,
+      30 * 60_000
+    );
+    assert.deepEqual(result, [], `unexpected stall for ${session.status}`);
+    assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 0);
+  }
+});
+
 test("an accepted live Run younger than ten minutes is not a stall candidate", async () => {
   const deliveredAt = new Date(NOW.getTime() - 5 * 60_000).toISOString();
   const store = stallStore({ createdAt: deliveredAt, deliveredAt });
@@ -83,6 +240,172 @@ test("an accepted Run past the candidate filter with recent progress is not stal
   assert.deepEqual(result, []);
   assert.equal(inspections, 1);
   assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 0);
+});
+
+test("one scheduler resource sample suppresses an execution false positive without clearing attention", async () => {
+  const store = stallStore();
+  const resourceEvidence = new Map([
+    ["task-1\0worker\0run-1", {
+      observedAt: "2026-08-05T00:59:30.000Z",
+      progressAt: PROGRESS,
+      identity: {
+        taskId: "task-1",
+        roleName: "worker",
+        runId: "run-1",
+        agentId: "agent-1",
+        adapterId: "codex",
+        nativeSessionId: "native-1"
+      },
+      active: true,
+      changed: true,
+      cpuTimeMs: 20,
+      rssBytes: 4096
+    }]
+  ]);
+  const result = await reconcileStalledRoleRuns(
+    store,
+    { async inspectRole() { return "present"; } },
+    NOW,
+    undefined,
+    30 * 60_000,
+    undefined,
+    resourceEvidence
+  );
+  assert.deepEqual(result, []);
+  assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 0);
+});
+
+test("launch identity can fence advisory resource activity when native Session id is opaque", async () => {
+  const store = stallStore({
+    session: {
+      agentId: "agent-1",
+      adapterId: "codex",
+      launchId: "launch-1",
+      status: "running"
+    }
+  });
+  const result = await reconcileStalledRoleRuns(
+    store,
+    { async inspectRole() { return "present"; } },
+    NOW,
+    undefined,
+    30 * 60_000,
+    undefined,
+    new Map([[
+      "task-1\0worker\0run-1",
+      {
+        observedAt: "2026-08-05T00:59:30.000Z",
+        progressAt: PROGRESS,
+        identity: {
+          taskId: "task-1",
+          roleName: "worker",
+          runId: "run-1",
+          agentId: "agent-1",
+          adapterId: "codex",
+          launchId: "launch-1"
+        },
+        active: true,
+        changed: true
+      }
+    ]])
+  );
+  assert.deepEqual(result, []);
+  assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 0);
+});
+
+test("a concurrent suppression CAS change cannot leave a stale changed sample healthy", async () => {
+  const store = stallStore();
+  store.recordRoleRunResourceSuppression = () => "state-changed";
+  const result = await reconcileStalledRoleRuns(
+    store,
+    { async inspectRole() { return "present"; } },
+    NOW,
+    undefined,
+    30 * 60_000,
+    undefined,
+    new Map([[
+      "task-1\0worker\0run-1",
+      {
+        observedAt: "2026-08-05T00:59:30.000Z",
+        progressAt: PROGRESS,
+        identity: {
+          taskId: "task-1",
+          roleName: "worker",
+          runId: "run-1",
+          agentId: "agent-1",
+          adapterId: "codex",
+          nativeSessionId: "native-1"
+        },
+        active: true,
+        changed: true
+      }
+    ]])
+  );
+  assert.equal(result[0]?.runId, "run-1");
+  assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 1);
+});
+
+test("stale Run, Session-generation, and progress-fence samples cannot suppress the current stall", async () => {
+  for (const { identity, sampleProgressAt } of [
+    { identity: {
+      taskId: "task-1",
+      roleName: "worker",
+      runId: "old-run",
+      agentId: "agent-1",
+      adapterId: "codex",
+      nativeSessionId: "native-1"
+    }, sampleProgressAt: PROGRESS },
+    { identity: {
+      taskId: "task-1",
+      roleName: "worker",
+      runId: "run-1",
+      agentId: "agent-1",
+      adapterId: "codex",
+      nativeSessionId: "old-native"
+    }, sampleProgressAt: PROGRESS },
+    { identity: {
+      taskId: "task-1",
+      roleName: "worker",
+      runId: "run-1",
+      agentId: "agent-1",
+      adapterId: "codex",
+      nativeSessionId: "native-1"
+    }, sampleProgressAt: "2026-08-04T23:59:00.000Z" }
+  ]) {
+    const store = stallStore();
+    const result = await reconcileStalledRoleRuns(
+      store,
+      { async inspectRole() { return "present"; } },
+      NOW,
+      undefined,
+      30 * 60_000,
+      undefined,
+      new Map([
+        // This broad key models the old task/role fallback and must be ignored.
+        ["task-1\0worker", {
+          observedAt: "2026-08-05T00:59:30.000Z",
+          progressAt: sampleProgressAt,
+          identity,
+          active: true,
+          changed: true
+        }],
+        // Even an exact current-Run key is unsafe when its Session generation is stale.
+        ["task-1\0worker\0run-1", {
+          observedAt: "2026-08-05T00:59:30.000Z",
+          progressAt: sampleProgressAt,
+          identity,
+          active: true,
+          changed: true
+        }]
+      ])
+    );
+    assert.equal(result[0]?.runId, "run-1");
+    assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 1);
+    assert.equal(
+      store.events.filter((event) => event.type === "run.resource-suppressed").length,
+      0
+    );
+  }
 });
 
 test("a live accepted Run raises one idempotent needs-attention event without a Task Message", async () => {
@@ -206,18 +529,24 @@ function stallStore(options = {}) {
     input: "work",
     purpose: "execution",
     status: "active",
+    effective: {
+      agentId: role.activeAgentId,
+      adapterId: role.adapterId
+    },
     ...(deliveredAt === undefined ? {} : { deliveredAt }),
     createdAt,
     updatedAt: createdAt,
     workItemId: "work-1"
   };
-  const session = {
-    agentId: role.activeAgentId,
-    adapterId: role.adapterId,
-    nativeSessionId: "native-1",
-    status: "running",
-    updatedAt: PROGRESS
-  };
+  const session = options.session === null
+    ? null
+    : options.session ?? {
+        agentId: role.activeAgentId,
+        adapterId: role.adapterId,
+        nativeSessionId: "native-1",
+        status: "running",
+        updatedAt: PROGRESS
+      };
   const downstreamRole = {
     ...role,
     name: "worker",
@@ -230,7 +559,11 @@ function stallStore(options = {}) {
     roleName: "worker",
     deliveredAt: "2026-08-05T00:40:00.000Z",
     createdAt: "2026-08-05T00:40:00.000Z",
-    updatedAt: "2026-08-05T00:40:00.000Z"
+    updatedAt: "2026-08-05T00:40:00.000Z",
+    effective: {
+      agentId: downstreamRole.activeAgentId,
+      adapterId: downstreamRole.adapterId
+    }
   };
   const store = {
     tasks: [task],
@@ -248,9 +581,10 @@ function stallStore(options = {}) {
       return this.runs.find((candidate) => candidate.roleName === name) ?? null;
     },
     getRoleSession(_taskId, name) {
-      return name === "worker" && options.downstream
-        ? { ...this.session, agentId: "agent-worker" }
-        : this.session;
+      if (name === "worker" && options.downstream && this.session !== null) {
+        return { ...this.session, agentId: "agent-worker" };
+      }
+      return this.session;
     },
     hasOpenInputRequest() { return options.openInput === true; },
     getWorkMailbox() { return { pending: null }; },

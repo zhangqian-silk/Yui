@@ -380,7 +380,23 @@ export function roleAgentSessionResumeMode(
   if (set === null) return "new";
   validateRoleSessionSet(set);
   const session = set.sessions[requireSafeIdentity(agentId, "Agent id")];
-  if (session === undefined || session.nativeSessionId.trim().length === 0) return "new";
+  if (session === undefined) return "new";
+  // A restored opaque host can be inspected/recovered only through its exact
+  // launch fence. It cannot be resumed or silently rebound to a new launch
+  // without a provider-native identity; an explicit verified stop still
+  // permits the normal fresh-generation path.
+  if (
+    typeof session.nativeSessionId !== "string"
+    || session.nativeSessionId.trim().length === 0
+  ) {
+    if (session.status !== "stopped" && session.status !== "broken") {
+      throw new Error(
+        `Role Agent session has no native Session identity: ${agentId}. `
+        + "Restore the exact native Session or explicitly stop it before starting a fresh Session."
+      );
+    }
+    return "new";
+  }
   if (effectiveLaunchSnapshotsCompatible(session.effective, desired)) return "resume";
   if (session.status !== "stopped" && session.status !== "broken") {
     throw new Error(
@@ -701,14 +717,14 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
         if (session.status !== "stopped" && session.status !== "broken") {
           throw new Error("Task Role session history must be terminal.");
         }
-        const key = `${session.agentId}\0${session.nativeSessionId}`;
+        const key = taskRoleSessionIdentity(session);
         if (identities.has(key)) {
-          throw new Error("Task Role session history contains a duplicate native Session.");
+          throw new Error("Task Role session history contains a duplicate Session identity.");
         }
         identities.add(key);
       }
       for (const session of Object.values(taskSet.sessions)) {
-        if (identities.has(`${session.agentId}\0${session.nativeSessionId}`)) {
+        if (identities.has(taskRoleSessionIdentity(session))) {
           throw new Error("Active and historical Task Role Sessions must be distinct.");
         }
       }
@@ -763,7 +779,15 @@ export function validateRoleAgentSession(
   if (session.effective.agentId !== agentId || session.effective.adapterId !== session.adapterId) {
     throw new Error(`Role Agent session effective identity is inconsistent: ${agentId}.`);
   }
-  requireText(session.nativeSessionId, "Native session id");
+  // A restored opaque host may have no provider-native identity; its launch
+  // fence is still durable and exact recovery remains possible.
+  if (session.nativeSessionId === undefined) {
+    if (session.launchId === undefined) {
+      throw new Error("Role Agent session requires a native Session or launch id.");
+    }
+  } else {
+    requireText(session.nativeSessionId, "Native session id");
+  }
   if (session.launchId !== undefined) requireSafeIdentity(session.launchId, "Launch id");
   if (
     session.title !== undefined
@@ -787,6 +811,16 @@ export function validateRoleAgentSession(
   requireText(session.createdAt, "Role Agent session creation timestamp");
   requireText(session.updatedAt, "Role Agent session update timestamp");
   return session;
+}
+
+function taskRoleSessionIdentity(session: RoleAgentSession): string {
+  if (session.nativeSessionId !== undefined) {
+    return `${session.agentId}\0native\0${session.nativeSessionId}`;
+  }
+  if (session.launchId === undefined) {
+    throw new Error("Opaque Task Role session requires a launch identity.");
+  }
+  return `${session.agentId}\0launch\0${session.launchId}`;
 }
 
 function optionalSessionText(

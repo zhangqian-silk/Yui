@@ -45,6 +45,8 @@ export type SchedulerRoleSession = Readonly<{
   agentId: string;
   adapterId: string;
   nativeSessionId?: string;
+  /** Exact external-process generation, when the runtime recorded one. */
+  launchId?: string;
   status: "reserved" | "ready" | "running" | "stopped" | "broken";
   effective: EffectiveLaunchSnapshot;
   /** Last durable session transition, when the adapter can expose it. */
@@ -55,6 +57,16 @@ export type RoleRunStallPersistence = Readonly<{
   taskId: string;
   roleName: string;
   runId: string;
+  agentId: string;
+  adapterId: string;
+  /** Exact Session fact observed by the scan; null is itself a fenced fact. */
+  session: Readonly<{
+    agentId: string;
+    adapterId: string;
+    nativeSessionId?: string;
+    launchId?: string;
+    status: SchedulerRoleSession["status"];
+  }> | null;
   kind: "delivery-stalled" | "execution-stalled";
   classification: "truly-stalled";
   progressAt: string;
@@ -68,12 +80,71 @@ export type SchedulerRunProgress = Readonly<{
   evidence?: string;
 }>;
 
+/** One bounded advisory process sample carried by the full Role inventory. */
+export type SchedulerRoleResourceIdentity = Readonly<{
+  taskId: string;
+  roleName: string;
+  runId: string;
+  agentId: string;
+  adapterId: string;
+  nativeSessionId?: string;
+  launchId?: string;
+}>;
+
+export type SchedulerRoleResourceEvidence = Readonly<{
+  observedAt: string;
+  /** Exact producer generation; missing identity is never consumable progress evidence. */
+  identity?: SchedulerRoleResourceIdentity;
+  /** Durable progress fence observed/requested for this sample. */
+  progressAt?: string;
+  /** Set by the inventory producer when one of the counters changed. */
+  changed?: boolean;
+  /** Explicit activity is advisory and never advances durable progress. */
+  active?: boolean;
+  cpuTimeMs?: number;
+  rssBytes?: number;
+  ioReadBytes?: number;
+  ioWriteBytes?: number;
+}>;
+
+export type SchedulerRoleResourceEntry = Readonly<{
+  taskId: string;
+  roleName: string;
+  resource: SchedulerRoleResourceEvidence;
+}>;
+
+/** Exact Role generation identity requested for one advisory resource sample. */
+export type SchedulerRoleResourceInput = Readonly<{
+  taskId: string;
+  roleName: string;
+  runId?: string;
+  agentId: string;
+  adapterId: string;
+  nativeSessionId?: string;
+  launchId?: string;
+  progressAt?: string;
+}>;
+
 export type RoleRunProgressPersistence = Readonly<{
   taskId: string;
   roleName: string;
   runId: string;
   progressAt: string;
   evidence?: string;
+  now: Date;
+}>;
+
+/** One durable advisory-resource suppression for one exact Run progress point. */
+export type RoleRunResourceSuppressionPersistence = Readonly<{
+  taskId: string;
+  roleName: string;
+  runId: string;
+  agentId: string;
+  adapterId: string;
+  nativeSessionId?: string;
+  launchId?: string;
+  progressAt: string;
+  observedAt: string;
   now: Date;
 }>;
 
@@ -209,6 +280,8 @@ export interface SchedulerStorePort {
   getRunDurableProgress?(taskId: string, roleName: string, runId: string): SchedulerRunProgress | null;
   /** Materializes a newly observed related-record fold as one run.progress fact. */
   recordRoleRunProgress?(input: RoleRunProgressPersistence): "recorded" | "already-recorded" | "state-changed";
+  /** Atomically consumes one advisory resource sample for an exact Run/progress point. */
+  recordRoleRunResourceSuppression?(input: RoleRunResourceSuppressionPersistence): "recorded" | "already-recorded" | "state-changed";
   /** Atomically records one new stall episode and routes its responsibility. */
   recordRoleRunStall?(input: RoleRunStallPersistence): "raised" | "already-raised" | "state-changed";
   /**
@@ -422,11 +495,15 @@ export interface TmuxDeliveryPort {
     agentId: string;
     adapterId: string;
     nativeSessionId?: string;
-  }>[]):
+    runId?: string;
+    launchId?: string;
+    progressAt?: string;
+  }>[], resourceInputs?: readonly SchedulerRoleResourceInput[]):
     Promise<readonly Readonly<{
       taskId: string;
       roleName: string;
       status: "present" | "absent";
+      resource?: SchedulerRoleResourceEvidence;
     }>[]>;
   /** Retryable stale lifecycle cleanup for one exact Task Role pane. */
   stopRole?(taskId: string, roleName: string): Promise<boolean>;

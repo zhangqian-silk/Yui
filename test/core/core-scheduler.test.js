@@ -264,6 +264,25 @@ test("an idle Leader resumes its fixed native session", async () => {
   assert.equal(store.savedDispatches[0].session.nativeSessionId, "native-leader-1");
 });
 
+test("a live opaque Leader retains its wake until exact cleanup instead of rebinding", async () => {
+  const session = roleSession({ launchId: "launch-opaque-leader", status: "running" });
+  delete session.nativeSessionId;
+  const store = fakeStore({ session });
+  const delivery = fakeDelivery({ inspect: "present" });
+
+  const result = await processLeaderWakeups(store, delivery, NOW);
+
+  assert.deepEqual(result, [{
+    taskId: "task-1",
+    status: "skipped",
+    reason: "recovery-blocked"
+  }]);
+  assert.equal(store.pending.has("task-1"), true);
+  assert.equal(store.savedDispatches.length, 0);
+  assert.deepEqual(delivery.calls.map((call) => call.type), ["inspect"]);
+  assert.equal("nativeSessionId" in delivery.calls[0].input, false);
+});
+
 test("Leader resume refuses a replacement native session", async () => {
   const existing = roleSession({ nativeSessionId: "native-leader-1", status: "ready" });
   const replacement = roleSession({ nativeSessionId: "native-leader-2", status: "running" });
@@ -416,6 +435,41 @@ test("full liveness inventory includes delivery-uncertain Runs for the shared st
   assert.deepEqual(stalled.map(({ runId, kind }) => ({ runId, kind })), [
     { runId: run.id, kind: "delivery-stalled" }
   ]);
+  assert.equal(store.savedExitedRuns.length, 0);
+});
+
+test("cheap liveness shares one pane inventory while resource inputs stay behind the ten-minute gate", async () => {
+  const store = fakeStore();
+  const youngRole = role("worker");
+  const oldRole = { ...role("worker-2"), name: "worker-2", activeAgentId: "codex-worker-2" };
+  store.roles.push(youngRole, oldRole);
+  store.activeRuns.set(key("task-1", youngRole.name), {
+    ...activeRun("agent-run-101", youngRole.name),
+    deliveredAt: new Date(NOW.getTime() - 5 * 60_000).toISOString()
+  });
+  store.activeRuns.set(key("task-1", oldRole.name), {
+    ...activeRun("agent-run-102", oldRole.name),
+    deliveredAt: new Date(NOW.getTime() - 11 * 60_000).toISOString()
+  });
+  let paneInventories = 0;
+  let resourceInputs;
+  const delivery = {
+    async inspectRole() { throw new Error("single-Run probing is not allowed"); },
+    async inspectRoles(inputs, requested) {
+      paneInventories += 1;
+      assert.equal(inputs.length, 2);
+      resourceInputs = requested;
+      return inputs.map((input) => ({
+        taskId: input.taskId,
+        roleName: input.roleName,
+        status: "present"
+      }));
+    }
+  };
+
+  assert.deepEqual(await reconcileExitedRoleRuns(store, delivery, NOW), []);
+  assert.equal(paneInventories, 1);
+  assert.deepEqual(resourceInputs.map(({ runId }) => runId), ["agent-run-102"]);
   assert.equal(store.savedExitedRuns.length, 0);
 });
 

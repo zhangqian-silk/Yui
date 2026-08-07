@@ -107,7 +107,9 @@ export function resetTaskRoleSessionGeneration(
       roleName: role.name,
       reason: summary,
       ...(activeRun === null ? {} : { runId: activeRun.id }),
-      ...(current === undefined ? {} : { nativeSessionId: current.nativeSessionId })
+      ...(current?.nativeSessionId === undefined
+        ? {}
+        : { nativeSessionId: current.nativeSessionId })
     },
     now
   ));
