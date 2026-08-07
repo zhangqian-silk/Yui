@@ -386,13 +386,12 @@ function activateAndVerify(
       phase: "activate-binary",
       message: `Failed to activate the new binary: ${messageOf(error)}`,
       action: storageBackupPath === undefined
-        ? "Storage was not migrated; the current install may be partially replaced. "
-          + "Re-run `yui update` to complete, or reinstall the package."
+        ? binaryActivationUncertainAction()
         : postSwitchRecoveryAction(home, storageBackupPath),
-      // Recoverable ONLY while storage was not yet switched. Once storage is
-      // migrated, this is a narrowed, backup-based manual recovery, not an
-      // automatic downgrade.
-      recoverable: storageBackupPath === undefined,
+      // Once binary activation begins, its outcome is not knowable from a
+      // failed npm process. Home-not-switched is useful evidence, but it does
+      // not prove the current installation remains usable.
+      recoverable: false,
       version: staged.version,
       ...(storageBackupPath === undefined ? {} : { storageBackupPath })
     };
@@ -407,7 +406,7 @@ function activateAndVerify(
       phase: "post-verify",
       message: `Post-update health check failed: ${messageOf(error)}`,
       action: storageBackupPath === undefined
-        ? "The new binary did not pass its health check. Investigate before using Yui."
+        ? binaryHealthUncertainAction()
         : postSwitchRecoveryAction(home, storageBackupPath),
       recoverable: false,
       version: staged.version,
@@ -581,6 +580,18 @@ function postSwitchRecoveryAction(home: string, backupPath: string): string {
     + `Inspect the backup, receipt marker "${upgradeReceiptPath(home)}", and switch-progress marker `
     + `"${switchProgressPath(home)}". Verify the migrated Home, then either finish the update or `
     + `restore the backup explicitly with mv "${backupPath}" "${home}".`;
+}
+
+function binaryActivationUncertainAction(): string {
+  return "The Home was not migrated, but binary activation began and its outcome is unknown; "
+    + "do not assume the current install is usable. Reinstall Yui, verify `yui version` and "
+    + "`yui doctor`, then retry `yui update` before resuming writes.";
+}
+
+function binaryHealthUncertainAction(): string {
+  return "The Home was not migrated, but the activated binary failed health verification; do not "
+    + "assume the current install is usable. Reinstall Yui, verify `yui version` and `yui doctor`, "
+    + "then retry `yui update` before resuming writes.";
 }
 
 function isControllerLifecycleStatus(value: unknown): value is UpdateControllerLifecycleStatus {

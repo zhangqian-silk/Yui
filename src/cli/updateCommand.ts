@@ -51,7 +51,9 @@ export function renderUpdateResult(result: UpdateResult): string {
           `Update aborted during ${result.phase}: ${result.message}`,
           result.recoverable
             ? "The current install and Home remain usable."
-            : "Manual recovery is required (see below).",
+            : result.phase === "activate-binary" && result.storageBackupPath === undefined
+              ? "The Home was not migrated, but binary health is unknown; do not assume the current install is usable."
+              : "Manual recovery is required (see below).",
           `Action: ${result.action}`
         ].join("\n");
       case "ambiguous":

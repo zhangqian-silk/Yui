@@ -28,9 +28,9 @@
  */
 
 import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { runtimeError } from "../errors/cliError.js";
@@ -64,6 +64,10 @@ export function createUpdatePorts(
   spawn: UpdateSpawner = spawnSync,
   stagingRoot: string = tmpdir()
 ): UpdatePorts {
+  // Keep the exact verified artifact in memory for this update attempt. This is
+  // deliberately not persisted as a retry or recovery protocol.
+  let verifiedActivatedBinary: string | undefined;
+  let verifiedActivatedVersion: string | undefined;
   return {
     stage(): StagedPackage {
       const stagingPath = mkdtempSync(join(stagingRoot, "yui-update-stage-"));
@@ -130,6 +134,8 @@ export function createUpdatePorts(
     },
 
     activateBinary(staged: StagedPackage): void {
+      verifiedActivatedBinary = undefined;
+      verifiedActivatedVersion = undefined;
       // Promote the SAME resolved artifact, pinned by exact version — never a bare
       // `@latest` (R2-F1: `stage` guarantees `staged.version` is a concrete
       // version, so there is no `latest` sentinel to fall back to).
@@ -185,6 +191,10 @@ export function createUpdatePorts(
             + "different build than the one that passed preflight."
         );
       }
+      // Retain the exact path used by both doctor and version verification. The
+      // replacement start must not resolve UPDATE_CLI_PATH or npm again.
+      verifiedActivatedBinary = activeBinary;
+      verifiedActivatedVersion = activeVersion;
     },
 
     probeStorage(home: string): StorageStateProbe {
@@ -258,7 +268,19 @@ export function createUpdatePorts(
       return stopControllerForUpdate(home, environment, spawn);
     },
     startController(home: string): void {
-      restartControllerForUpdate(home, environment, spawn);
+      if (verifiedActivatedBinary === undefined || verifiedActivatedVersion === undefined) {
+        throw runtimeError(
+          "Replacement Controller cannot start before the activated global binary has "
+            + "passed doctor/version verification."
+        );
+      }
+      restartControllerForUpdate(
+        home,
+        environment,
+        spawn,
+        verifiedActivatedBinary,
+        verifiedActivatedVersion
+      );
     },
     restoreController(home: string, identity: ControllerIdentity): void {
       restoreControllerIdentity(home, identity, environment, spawn);
@@ -455,9 +477,15 @@ function runSchemaIndependentControllerStop(
 function restartControllerForUpdate(
   home: string,
   environment: NodeJS.ProcessEnv,
-  spawn: UpdateSpawner
+  spawn: UpdateSpawner,
+  activatedBinary: string,
+  activatedVersion: string
 ): void {
-  runControllerCommandOutput(home, environment, spawn, "restart");
+  runControllerCommandOutput(home, environment, spawn, "restart", activatedBinary);
+  const identity = parseControllerIdentity(
+    runControllerCommand(home, environment, spawn, "identity", activatedBinary)
+  );
+  assertActivatedControllerIdentity(identity, activatedBinary, activatedVersion);
 }
 
 /** Restore the captured process identity, never the staged/new `yui` launcher. */
@@ -475,7 +503,6 @@ function restoreControllerIdentity(
   const helper = [
     "const { spawn } = require('node:child_process');",
     "const values = process.argv.slice(1);",
-    "const env = JSON.parse(values.pop());",
     "const version = values.pop();",
     "const args = JSON.parse(values.pop());",
     "const executable = values.pop();",
@@ -484,7 +511,7 @@ function restoreControllerIdentity(
     "(async () => {",
     "  const { ensureFileTaskControllerIdentity } = await import(runtimeModule);",
     "  await ensureFileTaskControllerIdentity(home, { executablePath: executable, args, version }, {",
-    "    environment: env,",
+    "    environment: process.env,",
     "    spawnController: (_home, launchEnv) => {",
     "      const child = spawn(executable, args, { detached: true, stdio: 'ignore', env: launchEnv });",
     "      child.unref();",
@@ -501,8 +528,7 @@ function restoreControllerIdentity(
       home,
       identity.executablePath,
       JSON.stringify(identity.args),
-      identity.version,
-      JSON.stringify(launchEnvironment)
+      identity.version
     ],
     { cwd: process.cwd(), env: launchEnvironment, shell: false, stdio: "pipe" }
   );
@@ -513,11 +539,16 @@ function runControllerCommand(
   home: string,
   environment: NodeJS.ProcessEnv,
   spawn: UpdateSpawner,
-  method: "status" | "identity"
+  method: "status" | "identity",
+  cliBinary?: string
 ): Record<string, unknown> {
+  const command = cliBinary ?? process.execPath;
+  const args = cliBinary === undefined
+    ? [UPDATE_CLI_PATH, "--json", "controller", method]
+    : ["--json", "controller", method];
   const result = spawn(
-    process.execPath,
-    [UPDATE_CLI_PATH, "--json", "controller", method],
+    command,
+    args,
     { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
   );
   if (result.error !== undefined || result.status !== 0) {
@@ -581,11 +612,16 @@ function runControllerCommandOutput(
   home: string,
   environment: NodeJS.ProcessEnv,
   spawn: UpdateSpawner,
-  method: "stop" | "restart"
+  method: "stop" | "restart",
+  cliBinary?: string
 ): string {
+  const command = cliBinary ?? process.execPath;
+  const args = cliBinary === undefined
+    ? [UPDATE_CLI_PATH, "--json", "controller", method]
+    : ["--json", "controller", method];
   const result = spawn(
-    process.execPath,
-    [UPDATE_CLI_PATH, "--json", "controller", method],
+    command,
+    args,
     { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
   );
   if (result.error !== undefined || result.status !== 0) {
@@ -596,6 +632,61 @@ function runControllerCommandOutput(
     throw new Error(`Controller ${method} returned an invalid structured result.`);
   }
   return parsed.output;
+}
+
+/**
+ * Authenticate a replacement Controller against the activated artifact. The
+ * package version identifies the artifact, while the exact controller entrypoint
+ * identifies which global installation supplied the running process.
+ */
+function assertActivatedControllerIdentity(
+  identity: ControllerIdentity,
+  activatedBinary: string,
+  activatedVersion: string
+): void {
+  if (identity.version !== activatedVersion) {
+    throw new Error(
+      `Replacement Controller version ${identity.version} does not match the activated `
+        + `binary version ${activatedVersion}; refusing readiness.`
+    );
+  }
+  const expectedEntrypoint = activatedControllerEntrypoint(activatedBinary);
+  if (identity.executablePath !== process.execPath
+    || identity.args.length !== 1
+    || identity.args[0] !== expectedEntrypoint) {
+    throw new Error(
+      "Replacement Controller launch identity does not match the activated global binary "
+        + "runtime/entrypoint; refusing readiness."
+    );
+  }
+}
+
+/** Resolve the Controller entrypoint beside the activated package's CLI. */
+function activatedControllerEntrypoint(activatedBinary: string): string {
+  let resolvedBinary: string;
+  try {
+    resolvedBinary = realpathSync(activatedBinary);
+  } catch {
+    // `verify` already checked existsSync. Keep the fallback deterministic for
+    // test seams and fail closed later if the identity does not match it.
+    resolvedBinary = resolve(activatedBinary);
+  }
+  const direct = join(dirname(resolvedBinary), "controller", "controllerMain.js");
+  if (existsSync(direct)) return direct;
+
+  // npm may expose a non-symlink launcher under <prefix>/bin. Resolve the
+  // package's canonical global layout when it is present.
+  const prefix = resolve(dirname(resolvedBinary), "..");
+  const packageEntrypoint = join(
+    prefix,
+    "lib",
+    "node_modules",
+    PACKAGE_NAME,
+    "dist",
+    "controller",
+    "controllerMain.js"
+  );
+  return existsSync(packageEntrypoint) ? packageEntrypoint : direct;
 }
 
 function interpretPreflight(result: SpawnSyncReturns<Buffer>): UpdatePreflight {

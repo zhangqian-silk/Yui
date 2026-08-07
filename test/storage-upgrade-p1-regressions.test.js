@@ -636,6 +636,27 @@ test("binary-only restore accepts the exact captured executable, argv, and versi
   assert.deepEqual(await callController(home, "controller.identity", {}), captured);
 });
 
+test("Controller restore inherits environment without serializing credentials into child argv", () => {
+  const secret = "restore-secret-do-not-leak";
+  const environment = { ...process.env, YUI_HOME: "/tmp/yui-restore-secret", OPENAI_API_KEY: secret };
+  let captured;
+  const ports = createUpdatePorts(environment, (command, args, options) => {
+    captured = { command, args: [...args], options };
+    return spawnResult();
+  });
+  ports.restoreController("/tmp/yui-restore-secret", {
+    executablePath: "/old/node",
+    args: ["/old/controllerMain.js"],
+    version: "8.8.8"
+  });
+
+  assert.ok(captured);
+  assert.equal(JSON.stringify(captured.args).includes(secret), false);
+  assert.equal(JSON.stringify(captured.args).includes("OPENAI_API_KEY"), false);
+  assert.equal(captured.options.env.OPENAI_API_KEY, secret);
+  assert.equal(captured.options.env.YUI_HOME, "/tmp/yui-restore-secret");
+});
+
 test("binary-only stop failure is structured with no retry, activation, or restore", () => {
   const events = [];
   const result = runUpdate(binaryOnlyPorts(events, {

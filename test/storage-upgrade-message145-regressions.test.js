@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import {
   mkdirSync,
   mkdtempSync,
-  rmSync
+  rmSync,
+  writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -164,6 +165,26 @@ test("migratable post-cutover failure never restores the old Controller", () => 
   assert.equal(events.includes("restore"), false);
 });
 
+test("binary activation failure before Home switch is not reported as a usable current install", () => {
+  const result = runUpdate({
+    stage: () => ({ binaryPath: "/tmp/yui-stage/bin/yui", version: "9.9.9" }),
+    preflight: () => ({ status: "already-current" }),
+    activateStorage: () => ({ status: "already-current" }),
+    activateBinary: () => { throw new Error("npm activation outcome unknown"); },
+    verify: () => {},
+    cleanup: () => {}
+  }, { home: "/tmp/yui-home" });
+
+  assert.equal(result.outcome, "aborted");
+  assert.equal(result.phase, "activate-binary");
+  assert.equal(result.recoverable, false);
+  const rendered = renderUpdateResult(result);
+  assert.match(rendered, /Home was not migrated/);
+  assert.match(rendered, /binary health is unknown/);
+  assert.match(rendered, /reinstall Yui/i);
+  assert.doesNotMatch(rendered, /current install and Home remain usable/);
+});
+
 test("staged storage activation marks the child externally quiesced", () => {
   let captured;
   const ports = createUpdatePorts(process.env, (_command, _args, options) => {
@@ -173,6 +194,64 @@ test("staged storage activation marks the child externally quiesced", () => {
   ports.activateStorage({ binaryPath: "/tmp/staged/yui", version: "9.9.9" }, "/tmp/yui-home");
   assert.equal(captured.env.YUI_UPDATE_EXTERNALLY_QUIESCED, "1");
   assert.equal(captured.env.YUI_HOME, "/tmp/yui-home");
+});
+
+test("replacement Controller starts through the verified activated global binary and re-authenticates identity", () => {
+  const base = mkdtempSync(join(tmpdir(), "yui-message145-global-"));
+  const binDir = join(base, "bin");
+  const globalBinary = join(binDir, "yui");
+  const controllerEntrypoint = join(binDir, "controller", "controllerMain.js");
+  mkdirSync(join(binDir, "controller"), { recursive: true });
+  writeFileSync(globalBinary, "#!/bin/sh\n", { mode: 0o755 });
+  const calls = [];
+  const spawn = (command, args, options) => {
+    calls.push({ command, args: [...args], options });
+    if (command === "npm" && args[0] === "prefix") {
+      return spawnResult({ stdout: Buffer.from(base) });
+    }
+    if (command === globalBinary && args.includes("doctor")) {
+      return okData({
+        checks: [
+          { name: "storage schema", status: "ok", detail: "current" },
+          { name: "storage compatibility", status: "ok", detail: "USABLE" },
+          { name: "storage state", status: "ok", detail: "readable" }
+        ],
+        storage: { healthy: true, blocking: [] }
+      });
+    }
+    if (command === globalBinary && args.includes("version")) {
+      return okData({ version: "9.9.9" });
+    }
+    if (command === globalBinary && args.includes("restart")) {
+      return spawnResult({
+        stdout: Buffer.from(JSON.stringify({ ok: true, output: "Controller restarted." }))
+      });
+    }
+    if (command === globalBinary && args.includes("identity")) {
+      return okData({
+        executablePath: process.execPath,
+        args: [controllerEntrypoint],
+        version: "9.9.9"
+      });
+    }
+    return spawnResult();
+  };
+
+  try {
+    const ports = createUpdatePorts(process.env, spawn);
+    const staged = { binaryPath: "/tmp/staged/yui", version: "9.9.9" };
+    ports.verify(staged, "/tmp/yui-home");
+    ports.startController("/tmp/yui-home");
+
+    const restart = calls.find((call) => call.args.includes("restart"));
+    const identity = calls.find((call) => call.args.includes("identity"));
+    assert.equal(restart.command, globalBinary);
+    assert.equal(identity.command, globalBinary);
+    assert.equal(calls.some((call) => call.command === process.execPath
+      && call.args.includes("controller") && call.args.includes("restart")), false);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });
 
 test("externally-quiesced storage upgrade never probes or starts a Controller", async () => {
