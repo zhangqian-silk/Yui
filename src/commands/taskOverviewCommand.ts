@@ -1,0 +1,523 @@
+import type { TaskBrief } from "../brief/taskBrief.js";
+import type { TaskEvent } from "../event/taskEvent.js";
+import { usageError } from "../errors/cliError.js";
+import type { InputRequest } from "../input/inputRequest.js";
+import type { LeaderFailure } from "../scheduler/leaderFailure.js";
+import type { OperatorNotification } from "../scheduler/operatorNotification.js";
+import {
+  isRoleRunStalled,
+  latestStallProgressAt
+} from "../scheduler/roleRunStall.js";
+import type { AgentRun } from "../run/agentRun.js";
+import type { Role } from "../role/role.js";
+import { formatTimestamp } from "../output/timePresentation.js";
+import type { Task } from "../task/task.js";
+import type { TaskStore } from "../storage/taskStore.js";
+import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
+import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
+import { defaultTableWidth, renderTable } from "../output/table.js";
+
+export type TaskListOptions = Readonly<{
+  all: boolean;
+  verbose: boolean;
+}>;
+
+export type TaskOverviewWorkCounts = Readonly<Record<WorkItemStatus, number> & {
+  total: number;
+}>;
+
+export type TaskOverviewLeader = Readonly<{
+  role: "leader";
+  roleStatus: Role["status"] | "missing";
+  summary: string | null;
+  currentFocus: string | null;
+  updatedAt: string | null;
+  updatedBy: string | null;
+  summaryStatus: "available" | "missing";
+}>;
+
+export type TaskOverviewRuntimeRun = Readonly<{
+  id: string;
+  roleName: string;
+  status: AgentRun["status"];
+  delivery: "pending" | "delivered";
+  deliveredAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}>;
+
+export type TaskOverviewRuntime = Readonly<{
+  activeRuns: readonly TaskOverviewRuntimeRun[];
+  activeRunCount: number;
+  pendingDeliveryCount: number;
+}>;
+
+export type TaskOverviewAttention = Readonly<{
+  kind: "leader-recovery" | "leader-stalled";
+  id: string;
+  status: "failed" | "needs-attention";
+  owner: "operator";
+  summary: string;
+  updatedAt: string;
+  runId?: string;
+  roleName?: string;
+}>;
+
+export type TaskOverviewBlocker = Readonly<{
+  kind: "work" | "input" | "attention";
+  type: "work" | "input" | "attention";
+  id: string;
+  status: string;
+  owner: string;
+  action: string;
+  summary: string;
+  blockedRefs?: readonly Readonly<{ type: "work-item" | "run"; taskId: string; id: string }>[];
+}>;
+
+export type TaskOverviewNext = Readonly<{
+  action: string;
+  owner: string;
+  kind: TaskOverviewBlocker["kind"] | "wakeup" | "summary";
+  id?: string;
+  summary: string;
+}>;
+
+export type TaskOverview = Task & Readonly<{
+  brief: TaskBrief | null;
+  leader: TaskOverviewLeader;
+  leaderSummary: string | null;
+  currentFocus: string | null;
+  summaryUpdatedAt: string | null;
+  summaryUpdatedBy: string | null;
+  summaryStatus: "available" | "missing";
+  work: Readonly<{
+    counts: TaskOverviewWorkCounts;
+    items: readonly WorkItem[];
+  }>;
+  input: Readonly<{
+    open: readonly InputRequest[];
+    openCount: number;
+  }>;
+  attention: readonly TaskOverviewAttention[];
+  attentionCount: number;
+  blockers: readonly TaskOverviewBlocker[];
+  next: TaskOverviewNext | null;
+  nextAction: string | null;
+  nextOwner: string | null;
+  runtime: TaskOverviewRuntime;
+}>;
+
+export type TaskOverviewResult = Readonly<{
+  tasks: readonly TaskOverview[];
+}>;
+
+export function parseTaskListOptions(args: readonly string[]): TaskListOptions {
+  const allowed = new Set(["--all", "--verbose"]);
+  if (
+    args.some((argument) => !allowed.has(argument))
+    || new Set(args).size !== args.length
+  ) {
+    throw usageError(
+      "Task list usage: yui task list [--all] [--verbose]."
+    );
+  }
+  return {
+    all: args.includes("--all"),
+    verbose: args.includes("--verbose")
+  };
+}
+
+export function buildTaskOverview(
+  store: TaskStore,
+  options: TaskListOptions
+): TaskOverviewResult {
+  const tasks = store.listTasks()
+    .filter((task) => options.all || task.status !== "archived")
+    .map((task) => buildTaskOverviewEntry(task, store));
+  return { tasks };
+}
+
+export function renderTaskOverview(
+  result: TaskOverviewResult,
+  options: TaskListOptions,
+  timeZone: unknown,
+  width = defaultTableWidth()
+): string {
+  if (result.tasks.length === 0) return "No tasks found.\n";
+  const title = options.all ? "Tasks (all)" : "Tasks (unarchived)";
+  const output = renderTable(
+    title,
+    [
+      { header: "Task", minWidth: 8, maxWidth: 20 },
+      { header: "Title", minWidth: 10, maxWidth: 46 },
+      { header: "Lifecycle", minWidth: 9, maxWidth: 14 },
+      { header: "Leader", minWidth: 12, maxWidth: 48 },
+      { header: "Summary updated", minWidth: 16, maxWidth: 28 },
+      { header: "Work", minWidth: 8, maxWidth: 38 },
+      { header: "Blockers", minWidth: 9, maxWidth: 42 },
+      { header: "Next action / owner", minWidth: 16, maxWidth: 42 }
+    ],
+    result.tasks.map((task) => [
+      task.id,
+      task.title,
+      task.status,
+      leaderCell(task),
+      task.summaryUpdatedAt === null
+        ? "missing"
+        : formatTimestamp(task.summaryUpdatedAt, timeZone),
+      workCell(task.work.counts),
+      blockersCell(task.blockers),
+      nextCell(task.next)
+    ]),
+    width
+  );
+  if (!options.verbose) return `${output}\n`;
+  return `${output}\n\n${renderVerboseDetails(result.tasks, timeZone)}\n`;
+}
+
+function buildTaskOverviewEntry(task: Task, store: TaskStore): TaskOverview {
+  const brief = store.getTaskBrief(task.id);
+  const leaderRole = store.getRole(task.id, "leader");
+  const workItems = store.listWorkItems(task.id);
+  const inputRequests = store.listInputRequests(task.id);
+  const openInputRequests = inputRequests.filter((request) => request.status === "open");
+  const agentRuns = store.listAgentRuns(task.id);
+  const events = store.listEvents(task.id);
+  const attention = collectAttention(
+    task,
+    agentRuns,
+    events,
+    store.getLeaderFailure(task.id),
+    store.getOperatorNotification(task.id)
+  );
+  const blockers = collectBlockers(workItems, openInputRequests, attention);
+  const next = deriveNextAction(
+    task,
+    brief,
+    workItems,
+    openInputRequests,
+    blockers,
+    store.getPendingWakeup(task.id)
+  );
+  const leader: TaskOverviewLeader = {
+    role: "leader",
+    roleStatus: leaderRole?.status ?? "missing",
+    summary: brief?.leaderSummary ?? null,
+    currentFocus: brief?.currentFocus ?? null,
+    updatedAt: brief?.updatedAt ?? null,
+    updatedBy: brief?.updatedBy ?? null,
+    summaryStatus: brief === null ? "missing" : "available"
+  };
+  const counts = countWorkItems(workItems);
+  const runtimeRuns = agentRuns
+    .filter((run) => run.status === "active")
+    .map((run): TaskOverviewRuntimeRun => ({
+      id: run.id,
+      roleName: run.roleName,
+      status: run.status,
+      delivery: run.deliveredAt === undefined ? "pending" : "delivered",
+      deliveredAt: run.deliveredAt ?? null,
+      createdAt: run.createdAt,
+      updatedAt: run.updatedAt
+    }));
+  const runtime: TaskOverviewRuntime = {
+    activeRuns: runtimeRuns,
+    activeRunCount: runtimeRuns.length,
+    pendingDeliveryCount: runtimeRuns.filter((run) => run.delivery === "pending").length
+  };
+  return {
+    ...task,
+    brief,
+    leader,
+    leaderSummary: leader.summary,
+    currentFocus: leader.currentFocus,
+    summaryUpdatedAt: leader.updatedAt,
+    summaryUpdatedBy: leader.updatedBy,
+    summaryStatus: leader.summaryStatus,
+    work: { counts, items: workItems },
+    input: { open: openInputRequests, openCount: openInputRequests.length },
+    attention,
+    attentionCount: attention.length,
+    blockers,
+    next,
+    nextAction: next?.action ?? null,
+    nextOwner: next?.owner ?? null,
+    runtime
+  };
+}
+
+function collectAttention(
+  task: Task,
+  runs: readonly AgentRun[],
+  events: readonly TaskEvent[],
+  failure: LeaderFailure | null,
+  notification: OperatorNotification | null
+): TaskOverviewAttention[] {
+  const items: TaskOverviewAttention[] = [];
+  if (failure !== null || notification?.type === "leader-recovery-failed") {
+    items.push({
+      kind: "leader-recovery",
+      id: `leader-recovery:${task.id}`,
+      status: "failed",
+      owner: "operator",
+      summary: failure?.message
+        ?? (notification?.type === "leader-recovery-failed"
+          ? notification.message
+          : "Leader recovery failed."),
+      updatedAt: failure?.lastFailedAt
+        ?? (notification?.type === "leader-recovery-failed"
+          ? notification.updatedAt
+          : task.updatedAt)
+    });
+  }
+  const notificationStall = notification?.type === "leader-stalled"
+    ? notification
+    : null;
+  if (notificationStall !== null) {
+    items.push({
+      kind: "leader-stalled",
+      id: `leader-stall:${notificationStall.runId}:${notificationStall.progressAt}`,
+      status: "needs-attention",
+      owner: "operator",
+      summary: notificationStall.message,
+      updatedAt: notificationStall.updatedAt,
+      runId: notificationStall.runId,
+      roleName: "leader"
+    });
+  }
+  for (const run of runs) {
+    if (
+      run.roleName !== "leader"
+      || run.status !== "active"
+      || !isRoleRunStalled(events, run.id)
+    ) continue;
+    if (notificationStall?.runId === run.id) continue;
+    const progressAt = latestStallProgressAt(events, run.id) ?? run.updatedAt;
+    items.push({
+      kind: "leader-stalled",
+      id: `leader-stall:${run.id}:${progressAt}`,
+      status: "needs-attention",
+      owner: "operator",
+      summary: `Run ${run.id} for ${run.roleName} has no durable progress after ${progressAt}.`,
+      updatedAt: progressAt,
+      runId: run.id,
+      roleName: run.roleName
+    });
+  }
+  return items.sort((left, right) => (
+    Date.parse(left.updatedAt) - Date.parse(right.updatedAt)
+    || left.id.localeCompare(right.id)
+  ));
+}
+
+function collectBlockers(
+  workItems: readonly WorkItem[],
+  openInputRequests: readonly InputRequest[],
+  attention: readonly TaskOverviewAttention[]
+): TaskOverviewBlocker[] {
+  const blockers: TaskOverviewBlocker[] = [];
+  const workById = new Map(workItems.map((item) => [item.id, item]));
+  for (const item of workItems) {
+    if (item.status === "failed") {
+      blockers.push({
+        kind: "work",
+        type: "work",
+        id: item.id,
+        status: item.status,
+        owner: item.assignee ?? "leader",
+        action: "review-failed-work",
+        summary: item.outcome ?? `Work Item ${item.id} failed.`
+      });
+      continue;
+    }
+    if (item.status === "awaiting_acceptance") {
+      blockers.push({
+        kind: "work",
+        type: "work",
+        id: item.id,
+        status: item.status,
+        owner: "leader",
+        action: "accept-work-item",
+        summary: `Work Item ${item.id} is awaiting Leader acceptance.`
+      });
+      continue;
+    }
+    if (item.status !== "pending") continue;
+    const dependencies = item.dependsOn.filter((dependency) => (
+      workById.get(dependency)?.status !== "completed"
+    ));
+    if (dependencies.length === 0) continue;
+    blockers.push({
+      kind: "work",
+      type: "work",
+      id: item.id,
+      status: item.status,
+      owner: item.assignee ?? "leader",
+      action: "unblock-work-item",
+      summary: `Work Item ${item.id} is waiting on ${dependencies.join(", ")}.`
+    });
+  }
+  for (const request of openInputRequests) {
+    blockers.push({
+      kind: "input",
+      type: "input",
+      id: request.id,
+      status: request.status,
+      owner: "user",
+      action: "answer-input",
+      summary: request.question,
+      blockedRefs: request.blockedRefs
+    });
+  }
+  for (const item of attention) {
+    blockers.push({
+      kind: "attention",
+      type: "attention",
+      id: item.id,
+      status: item.status,
+      owner: item.owner,
+      action: item.kind === "leader-recovery"
+        ? "inspect-leader-recovery"
+        : "inspect-leader-stall",
+      summary: item.summary
+    });
+  }
+  return blockers;
+}
+
+function deriveNextAction(
+  task: Task,
+  brief: TaskBrief | null,
+  workItems: readonly WorkItem[],
+  openInputRequests: readonly InputRequest[],
+  blockers: readonly TaskOverviewBlocker[],
+  pendingWakeup: PendingWakeup | null
+): TaskOverviewNext | null {
+  const input = openInputRequests[0];
+  if (input !== undefined) {
+    return {
+      action: "answer-input",
+      owner: "user",
+      kind: "input",
+      id: input.id,
+      summary: input.question
+    };
+  }
+  const attention = blockers.find((blocker) => blocker.kind === "attention");
+  if (attention !== undefined) {
+    return {
+      action: attention.action,
+      owner: attention.owner,
+      kind: "attention",
+      id: attention.id,
+      summary: attention.summary
+    };
+  }
+  const workBlocker = blockers.find((blocker) => blocker.kind === "work");
+  if (workBlocker !== undefined) {
+    return {
+      action: workBlocker.action,
+      owner: workBlocker.owner,
+      kind: "work",
+      id: workBlocker.id,
+      summary: workBlocker.summary
+    };
+  }
+  if (pendingWakeup !== null) {
+    return {
+      action: "process-leader-wakeup",
+      owner: "leader",
+      kind: "wakeup",
+      summary: pendingWakeup.reasons.join(", ")
+    };
+  }
+  const pending = workItems.find((item) => item.status === "pending");
+  if (pending !== undefined) {
+    return {
+      action: "start-work-item",
+      owner: pending.assignee ?? "leader",
+      kind: "work",
+      id: pending.id,
+      summary: pending.title
+    };
+  }
+  if (task.status === "active" && brief === null) {
+    return {
+      action: "update-leader-summary",
+      owner: "leader",
+      kind: "summary",
+      summary: "No persisted Task Brief is available."
+    };
+  }
+  return null;
+}
+
+function countWorkItems(items: readonly WorkItem[]): TaskOverviewWorkCounts {
+  const counts: Record<WorkItemStatus, number> & { total: number } = {
+    total: items.length,
+    pending: 0,
+    running: 0,
+    awaiting_acceptance: 0,
+    completed: 0,
+    failed: 0,
+    retired: 0
+  };
+  for (const item of items) counts[item.status] += 1;
+  return counts;
+}
+
+function leaderCell(task: TaskOverview): string {
+  const status = task.leader.roleStatus;
+  if (task.leader.summaryStatus === "missing") return `${status} · missing summary`;
+  const values = [task.leader.summary, task.leader.currentFocus]
+    .filter((value): value is string => value !== null && value.length > 0);
+  return values.length === 0
+    ? `${status} · summary unavailable`
+    : compactText(`${status} · ${values.join(" · ")}`);
+}
+
+function workCell(counts: TaskOverviewWorkCounts): string {
+  if (counts.total === 0) return "none";
+  const details = (Object.keys(counts) as (keyof TaskOverviewWorkCounts)[])
+    .filter((status): status is WorkItemStatus => status !== "total" && counts[status] > 0)
+    .map((status) => `${status}:${counts[status]}`);
+  return `${counts.total} total${details.length === 0 ? "" : ` (${details.join(", ")})`}`;
+}
+
+function blockersCell(blockers: readonly TaskOverviewBlocker[]): string {
+  if (blockers.length === 0) return "none";
+  return blockers.map((blocker) => `${blocker.kind}:${blocker.id}`).join(", ");
+}
+
+function nextCell(next: TaskOverviewNext | null): string {
+  return next === null ? "—" : `${next.action} / ${next.owner}`;
+}
+
+function compactText(value: string): string {
+  const oneLine = value.replace(/\s+/g, " ").trim();
+  return oneLine.length <= 240 ? oneLine : `${oneLine.slice(0, 237)}...`;
+}
+
+function renderVerboseDetails(
+  tasks: readonly TaskOverview[],
+  timeZone: unknown
+): string {
+  return [
+    "Task details",
+    ...tasks.flatMap((task) => [
+      `${task.id}: ${task.title}`,
+      `  Description: ${task.description ?? "—"}`,
+      `  Current focus: ${task.currentFocus ?? "missing"}`,
+      `  Leader summary: ${task.leaderSummary ?? "missing"}`,
+      `  Summary updated by: ${task.summaryUpdatedBy ?? "unknown"}`,
+      `  Summary updated at: ${task.summaryUpdatedAt === null
+        ? "missing"
+        : formatTimestamp(task.summaryUpdatedAt, timeZone)}`,
+      `  Projects: ${task.projectBindings.length === 0
+        ? "none"
+        : task.projectBindings.map(({ directory, projectId, baseRef }) => (
+            `${directory} (${projectId} @ ${baseRef})`
+          )).join(", ")}`
+    ])
+  ].join("\n");
+}
