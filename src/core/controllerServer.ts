@@ -20,6 +20,7 @@ import { controllerSocketPath } from "./controllerEndpoint.js";
 import { YUI_VERSION, yuiVersionIdentity } from "../version.js";
 import {
   removeEphemeralDomainIdentity,
+  readEphemeralDomainIdentity,
   writeEphemeralDomainIdentity,
   type EphemeralDomainIdentity
 } from "../controller/domainIdentity.js";
@@ -119,7 +120,18 @@ async function startControllerServerLocked(
         await closeNetServer(netServer);
         await removeOwnedDiscovery(discoveryPath, token);
         if (options.domainIdentity !== undefined) {
-          removeEphemeralDomainIdentity(home, options.domainIdentity.token);
+          // Keep the exact target fence while detached Role panes survive a
+          // Controller stop/restart. The owning test teardown or an expired
+          // domain reaper removes the identity only after those resources
+          // converge, never by dropping the fence during a normal stop.
+          const current = readEphemeralDomainIdentity(home);
+          if (
+            current.status === "valid"
+            && current.identity?.token === options.domainIdentity.token
+            && current.identity.tmuxTargets.length === 0
+          ) {
+            removeEphemeralDomainIdentity(home, options.domainIdentity.token);
+          }
         }
         resolveClosed();
       })();

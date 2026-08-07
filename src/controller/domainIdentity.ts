@@ -129,6 +129,30 @@ export function writeEphemeralDomainIdentity(
   identity: EphemeralDomainIdentity
 ): void {
   validateEphemeralDomainIdentity(identity);
+  const existing = readEphemeralDomainIdentity(home);
+  if (existing.status === "invalid") {
+    throw new Error("Cannot replace an invalid ephemeral domain identity.");
+  }
+  if (existing.status === "valid") {
+    if (existing.identity?.token !== identity.token) {
+      throw new Error("Ephemeral domain identity token changed.");
+    }
+    if (
+      existing.identity.hostPid !== identity.hostPid
+      || existing.identity.hostProcessStartIdentity !== identity.hostProcessStartIdentity
+      || existing.identity.tmuxServer !== identity.tmuxServer
+      || existing.identity.createdAt !== identity.createdAt
+    ) {
+      throw new Error("Ephemeral domain identity ownership changed.");
+    }
+    identity = {
+      ...identity,
+      tmuxTargets: [...new Set([
+        ...existing.identity.tmuxTargets,
+        ...identity.tmuxTargets
+      ])].sort()
+    };
+  }
   const path = domainIdentityPath(home);
   const directory = dirname(path);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -145,6 +169,34 @@ export function writeEphemeralDomainIdentity(
     rmSync(temporary, { force: true });
     throw error;
   }
+}
+
+/**
+ * Adds one exact Role pane target to the current domain fence. A missing,
+ * invalid, or different-token identity is never repaired by omission: the
+ * caller must fail the launch/cleanup operation closed.
+ */
+export function recordEphemeralTmuxTarget(
+  home: string,
+  token: string,
+  target: string
+): boolean {
+  if (
+    typeof token !== "string"
+    || !/^[a-f0-9]{64}$/u.test(token)
+    || typeof target !== "string"
+    || target.length === 0
+    || target.length > 256
+    || target.includes("\0")
+  ) return false;
+  const current = readEphemeralDomainIdentity(home);
+  if (current.status !== "valid" || current.identity?.token !== token) return false;
+  if (current.identity.tmuxTargets.includes(target)) return true;
+  writeEphemeralDomainIdentity(home, {
+    ...current.identity,
+    tmuxTargets: [...current.identity.tmuxTargets, target].sort()
+  });
+  return true;
 }
 
 export function readEphemeralDomainIdentity(home: string): DomainIdentityRead {

@@ -7,12 +7,22 @@ import test from "node:test";
 import {
   createEphemeralDomainIdentity,
   defaultEphemeralTmuxServer,
+  readEphemeralDomainIdentity,
   readLinuxProcessStartIdentity,
+  recordEphemeralTmuxTarget,
   writeEphemeralDomainIdentity
 } from "../../dist/controller/domainIdentity.js";
+import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { reapExpiredEphemeralResources } from "../../dist/controller/ephemeralResourceReaper.js";
 import { scanControllerResourceInventory } from "../../dist/controller/resourceInventoryLinux.js";
+import {
+  createRoleSessionSet,
+  updateRoleAgentSessionStatus
+} from "../../dist/executor/agentExecutor.js";
+import { createGlobalRole, createRoleAgentBinding } from "../../dist/role/role.js";
+import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import { recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 
 function temporaryHome() {
   const root = mkdtempSync(join(tmpdir(), "yui-ephemeral-domain-test-"));
@@ -48,6 +58,21 @@ test("expired marked domain carries host identity, token and tmux target fence",
   assert.equal(snapshot.domains[0].tmuxTargets[0], "yui-test:worker");
   assert.match(snapshot.domains[0].reasonCode, /ephemeral-host-dead/);
   assert.equal(snapshot.resources[0].domain?.token, snapshot.domains[0].token);
+});
+
+test("same-token Controller restart writes retain recorded tmux targets", (t) => {
+  const { root, home } = temporaryHome();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const first = identity(home, { tmuxTargets: [] });
+  writeEphemeralDomainIdentity(home, first);
+  assert.equal(
+    recordEphemeralTmuxTarget(home, first.token, "yui-test:operator"),
+    true
+  );
+  writeEphemeralDomainIdentity(home, first);
+  const current = readEphemeralDomainIdentity(home);
+  assert.equal(current.status, "valid");
+  assert.deepEqual(current.identity.tmuxTargets, ["yui-test:operator"]);
 });
 
 test("active host identity protects an otherwise expired domain", async (t) => {
@@ -95,6 +120,65 @@ test("PID reuse is expired only after the recorded start identity mismatches", a
   });
   assert.equal(snapshot.domains[0].disposition, "safe");
   assert.match(snapshot.domains[0].reasonCode, /identity-mismatch/);
+});
+
+test("only a live Global Session protects an expired domain", async (t) => {
+  for (const status of ["ready", "stopped", "broken"]) {
+    const { root, home } = temporaryHome();
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const now = new Date("2026-08-01T00:00:00.000Z");
+    const agent = createConfiguredAgent(
+      `codex-global-${status}`,
+      "codex",
+      "codex",
+      [],
+      [],
+      now
+    );
+    const role = createGlobalRole(
+      "operator",
+      [createRoleAgentBinding(agent)],
+      agent.id,
+      home,
+      now
+    );
+    const store = new FileTaskStore(home);
+    let sessions = createRoleSessionSet(
+      { scope: "global", roleName: role.name },
+      agent.id,
+      now
+    );
+    sessions = recordRoleAgentSession(sessions, {
+      agentId: agent.id,
+      adapterId: agent.adapterId,
+      nativeSessionId: `native-${status}`,
+      policy: "fixed",
+      status: "ready"
+    }, now);
+    sessions = updateRoleAgentSessionStatus(sessions, agent.id, status, now);
+    store.transaction((tx) => {
+      tx.saveConfiguredAgent(agent);
+      tx.saveGlobalRole(role);
+      tx.saveGlobalRoleSessionSet(sessions);
+    });
+    writeEphemeralDomainIdentity(home, identity(home, {
+      createdAt: new Date("2026-07-31T23:59:00.000Z")
+    }));
+
+    const snapshot = await scanControllerResourceInventory({
+      currentHome: home,
+      scope: "current",
+      now: () => new Date("2026-08-01T00:00:10.000Z")
+    });
+    assert.equal(
+      snapshot.domains[0].disposition,
+      status === "ready" ? "protected" : "safe"
+    );
+    assert.equal(
+      snapshot.domains[0].reasonCode,
+      status === "ready" ? "ephemeral-active-task-role" : "ephemeral-host-dead"
+    );
+  }
 });
 
 test("reaper revalidates exact fingerprint and retries a failed clean", async () => {

@@ -57,7 +57,10 @@ import {
   RuntimeLaunchCoordinator,
   type CoordinatedRuntimeLaunchRequest
 } from "./runtimeLaunchCoordinator.js";
-import { ephemeralDomainFromEnvironment } from "./domainIdentity.js";
+import {
+  ephemeralDomainFromEnvironment,
+  recordEphemeralTmuxTarget
+} from "./domainIdentity.js";
 import { createEphemeralResourceReaper } from "./ephemeralResourceReaper.js";
 
 export type FileTaskControllerFactoryOptions = ControllerRuntimeOptions & Readonly<{
@@ -91,13 +94,28 @@ export async function startFileTaskControllerRuntime(
 ): Promise<RunningFileTaskControllerRuntime> {
   const store = options.store ?? new FileTaskStore(home);
   const schedulerStore = options.schedulerStore ?? new FileSchedulerStoreAdapter(store);
+  const domainIdentity = options.domainIdentity
+    ?? ephemeralDomainFromEnvironment(options.environment ?? process.env);
   const planner = options.planner ?? new FileRoleLaunchPlanner(home, store, {
     environment: options.environment
   });
   const tmux = options.tmux ?? new TmuxManager(
     options.environment?.YUI_TMUX_BIN ?? process.env.YUI_TMUX_BIN ?? "tmux",
     new NodeCommandExecutor(),
-    { yuiHome: home }
+    {
+      yuiHome: home,
+      ...(domainIdentity === undefined
+        ? {}
+        : {
+            onRoleTargetRecorded: (target: string) => {
+              if (!recordEphemeralTmuxTarget(home, domainIdentity.token, target)) {
+                throw new Error(
+                  `Ephemeral tmux target fence could not be recorded: ${target}.`
+                );
+              }
+            }
+          })
+    }
   );
   const sessionHost = options.sessionHost ?? new TmuxSessionHost(planner, tmux);
   const promptPush = options.promptPush
@@ -137,8 +155,6 @@ export async function startFileTaskControllerRuntime(
   );
   const workspacePreparer = options.workspacePreparer
     ?? new FileTaskWorkspacePreparer(home, store);
-  const domainIdentity = options.domainIdentity
-    ?? ephemeralDomainFromEnvironment(options.environment ?? process.env);
   const resourceReaper = options.resourceReaper
     ?? (domainIdentity === undefined
       ? undefined

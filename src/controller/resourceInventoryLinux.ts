@@ -9,7 +9,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
-import { activeRoleAgentSession } from "../executor/agentExecutor.js";
+import { activeLiveRoleAgentSession } from "../executor/agentExecutor.js";
 import { inspectStorageSchema } from "../storage/storageSchema.js";
 import { FileTaskStore } from "../storage/taskStore.js";
 import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
@@ -112,7 +112,11 @@ export async function scanControllerResourceInventory(
     if (discovery.status === "invalid" && discovery.artifact !== undefined) {
       associatedArtifacts.add(discovery.artifact.path);
     }
-    if (tmuxArtifact !== undefined && !tmuxArtifact.active) artifacts.push(tmuxArtifact);
+    // Keep active sockets visible as report-only resources too. An expired
+    // domain must not self-close while its tmux namespace is still active;
+    // the next bounded pass can reclassify the exact socket after the pane and
+    // server converge.
+    if (tmuxArtifact !== undefined) artifacts.push(tmuxArtifact);
 
     const domainPath = join(home, CONTROLLER_DOMAIN_PATH);
     const domainIdentity = readEphemeralDomainIdentity(home);
@@ -125,10 +129,20 @@ export async function scanControllerResourceInventory(
     }
 
     const validDiscoveryProcess = discovery.status === "valid"
-      && matchingProcesses.some((candidate) => (
-        candidate.pid === discovery.pid
-        && candidate.startIdentity === discovery.processStartIdentity
-      ));
+      && (
+        matchingProcesses.some((candidate) => (
+          candidate.pid === discovery.pid
+          && candidate.startIdentity === discovery.processStartIdentity
+        ))
+        // The scanner omits its own process from signalable resources. A
+        // Controller nevertheless must recognize its exact discovery fence;
+        // otherwise its own expired-domain pass would delete controller.json
+        // and strand the still-running server without a callable endpoint.
+        || (
+          discovery.pid === process.pid
+          && readLinuxProcessStartIdentity(process.pid) === discovery.processStartIdentity
+        )
+      );
     const discoveryPath = join(home, CONTROLLER_DISCOVERY_PATH);
     const expectedControllerSocketPath = controllerSocketPath(home);
     if (
@@ -485,8 +499,9 @@ function inspectRuntimeDomain(
 
   const activeRole = roles.some((role) => (
     (role.ownerKind === "task-role" && role.taskStatus === "active")
-    // Global Roles have no Task status. A native session identity is the
-    // durable liveness fact for that scope.
+    // Global Roles have no Task status. Only a live native Session is a
+    // durable liveness fact for that scope; stopped/broken history must not
+    // protect an expired disposable domain merely because it has an ID.
     || (role.ownerKind === "global-role" && role.nativeSessionId !== undefined)
   ));
   if (!storageSafe) {
@@ -615,7 +630,7 @@ function loadHomeState(
   try {
     const store = new FileTaskStore(home);
     const roles: RuntimeRoleFact[] = store.listGlobalRoles().map((role) => {
-      const session = activeRoleAgentSession(store.getGlobalRoleSessionSet(role.name));
+      const session = activeLiveRoleAgentSession(store.getGlobalRoleSessionSet(role.name));
       const binding = role.agentBindings[role.activeAgentId];
       const agentId = session?.effective.agentId ?? role.activeAgentId;
       const adapterId = session?.effective.adapterId ?? binding?.adapterId;
@@ -629,7 +644,7 @@ function loadHomeState(
     });
     for (const task of store.listTasks()) {
       for (const role of store.listRoles(task.id)) {
-        const session = activeRoleAgentSession(store.getRoleSessionSet(task.id, role.name));
+        const session = activeLiveRoleAgentSession(store.getRoleSessionSet(task.id, role.name));
         const binding = role.agentBindings[role.activeAgentId];
         const agentId = session?.effective.agentId ?? role.activeAgentId;
         const adapterId = session?.effective.adapterId ?? binding?.adapterId;

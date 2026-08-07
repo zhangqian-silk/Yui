@@ -35,9 +35,11 @@ export async function reapExpiredEphemeralResources(
   const initial = await scan();
   const candidates = initial.resources
     .filter(isExpiredEphemeralResource)
+    .filter((resource) => isDomainIdentityReadyForCleanup(resource, initial.resources))
     .sort(compareCleanupOrder);
   if (candidates.length === 0) {
-    const expiredDomains = safeExpiredDomains(initial);
+    const expiredDomains = safeExpiredDomains(initial)
+      .filter((domain) => domainHasNoResources(initial, domain.yuiHome));
     for (const domain of expiredDomains) options.onExpiredDomain?.(domain);
     return {
       scanned: initial.domains.length,
@@ -49,7 +51,7 @@ export async function reapExpiredEphemeralResources(
   }
 
   const revalidated = await scan();
-  const expiredDomains = safeExpiredDomains(revalidated);
+  const eligibleExpiredDomains = safeExpiredDomains(revalidated);
   const byId = new Map(revalidated.resources.map((resource) => [resource.id, resource]));
   const failed: Array<{ id: string; message: string }> = [];
   let cleaned = 0;
@@ -72,6 +74,16 @@ export async function reapExpiredEphemeralResources(
         message: error instanceof Error ? error.message : String(error)
       });
     }
+  }
+  let expiredDomains: readonly Readonly<{ yuiHome: string; token?: string }>[] = [];
+  if (failed.length === 0 && eligibleExpiredDomains.length > 0) {
+    // A domain callback is authority to stop the detached Controller. Verify
+    // the post-cleanup snapshot first so a retained identity, a concurrent
+    // resource, or a newly appeared target cannot trigger self-close.
+    const converged = await scan();
+    expiredDomains = eligibleExpiredDomains.filter((domain) => (
+      domainHasNoResources(converged, domain.yuiHome)
+    ));
   }
   const result = {
     scanned: revalidated.domains.length,
@@ -105,6 +117,21 @@ function isExpiredEphemeralResource(resource: RuntimeResource): boolean {
     && resource.disposition === "safe";
 }
 
+function isDomainIdentityReadyForCleanup(
+  resource: RuntimeResource,
+  resources: readonly RuntimeResource[]
+): boolean {
+  if (resource.artifact?.artifactKind !== "domain-identity") return true;
+  // Keep the durable domain fence until every other resource in that exact
+  // home has converged. Otherwise a surviving tmux server would become an
+  // unmarked/review resource on the next scan and could never trigger the
+  // Controller self-close. Deferring the identity to a later pass also keeps
+  // one failed sibling cleanup from dropping the only remaining authority.
+  return resources.every((candidate) => (
+    candidate.id === resource.id || candidate.yuiHome !== resource.yuiHome
+  ));
+}
+
 function safeExpiredDomains(
   snapshot: ControllerResourceInventory
 ): readonly Readonly<{ yuiHome: string; token?: string }>[] {
@@ -121,6 +148,13 @@ function safeExpiredDomains(
       yuiHome: domain.yuiHome,
       ...(domain.token === undefined ? {} : { token: domain.token })
     }));
+}
+
+function domainHasNoResources(
+  snapshot: ControllerResourceInventory,
+  yuiHome: string
+): boolean {
+  return snapshot.resources.every((resource) => resource.yuiHome !== yuiHome);
 }
 
 function compareCleanupOrder(left: RuntimeResource, right: RuntimeResource): number {
