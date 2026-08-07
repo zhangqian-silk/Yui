@@ -770,10 +770,25 @@ test("Task list and show emit one-pass structured JSON for Agents", (t) => {
     }
   ));
 
-  assert.deepEqual(runCli("task", "list"), {
-    ok: true,
-    data: { tasks: [task] }
+  const listed = runCli("task", "list");
+  assert.equal(listed.ok, true);
+  assert.equal(listed.data.tasks.length, 1);
+  assert.deepEqual(
+    Object.fromEntries(Object.keys(task).map((key) => [key, listed.data.tasks[0][key]])),
+    task
+  );
+  assert.equal(listed.data.tasks[0].summaryStatus, "missing");
+  assert.deepEqual(listed.data.tasks[0].work.counts, {
+    total: 0,
+    pending: 0,
+    running: 0,
+    awaiting_acceptance: 0,
+    completed: 0,
+    failed: 0,
+    retired: 0
   });
+  assert.deepEqual(listed.data.tasks[0].input, { open: [], openCount: 0 });
+  assert.deepEqual(listed.data.tasks[0].blockers, []);
   assert.deepEqual(runCli("task", "show", task.id), {
     ok: true,
     data: {
@@ -1542,7 +1557,7 @@ test("retry replaces the old causal Run marker instead of reusing it", (t) => {
     markYuiRunInput(
       "recover",
       "agent-run-99",
-      `Yui · ${task.id} · Retry marker · Leader`
+      `Yui · ${task.id} · Leader · Retry marker`
     ),
     NOW
   ), "failed before delivery", NOW);
@@ -1551,9 +1566,9 @@ test("retry replaces the old causal Run marker instead of reusing it", (t) => {
   run(["run", "retry", failed.id], store, options);
 
   const retried = store.getActiveAgentRun(task.id, "leader");
-  const markers = retried.input.match(/^Yui · .+ · Retry marker · Leader · Run .+$/gm);
+  const markers = retried.input.match(/^Yui · .+ · Leader · Retry marker · Run .+$/gm);
   assert.deepEqual(markers, [
-    `Yui · ${task.id} · Retry marker · Leader · Run ${retried.id}`
+    `Yui · ${task.id} · Leader · Retry marker · Run ${retried.id}`
   ]);
   assert.equal(retried.input.includes("Run agent-run-old"), false);
   assert.equal(yuiRunIdFromInputMessages([retried.input]), retried.id);
@@ -1571,7 +1586,7 @@ test("a failed Worker Run can retry its failed WorkItem", (t) => {
   active.input = markYuiRunInput(
     "legacy Worker dispatch without an explicit yield requirement",
     active.id,
-    `Yui · ${task.id} · Retry Worker work · Worker`
+    `Yui · ${task.id} · Worker · Retry Worker work`
   );
   store.transaction((tx) => {
     tx.saveAgentRun(failAgentRun(active, "transient failure", NOW));
@@ -1661,19 +1676,19 @@ test("Run marker handling preserves user-authored marker lines outside the manag
   const marked = markYuiRunInput(
     userInput,
     "agent-run-current",
-    "Yui · task-7 · Test Task · Worker"
+    "Yui · task-7 · Worker · Test Task"
   );
   const retried = retagYuiRunInput(
     marked,
     "agent-run-retried",
-    "Yui · task-7 · Test Task · Worker"
+    "Yui · task-7 · Worker · Test Task"
   );
 
   assert.equal(marked.includes("Yui-Run: example-from-user"), true);
   assert.equal(retried.includes("Yui-Run: example-from-user"), true);
   assert.equal(
     retried.startsWith(
-      "Yui · task-7 · Test Task · Worker · Run agent-run-retried\n\n"
+      "Yui · task-7 · Worker · Test Task · Run agent-run-retried\n\n"
     ),
     true
   );
@@ -1691,12 +1706,12 @@ test("first Run marking preserves a user lookalike at the start of the body", ()
   const marked = markYuiRunInput(
     userInput,
     "agent-run-current",
-    "Yui · task-7 · Test Task · Worker"
+    "Yui · task-7 · Worker · Test Task"
   );
 
   assert.equal(
     marked,
-    `Yui · task-7 · Test Task · Worker · Run agent-run-current\n\n${userInput}`
+    `Yui · task-7 · Worker · Test Task · Run agent-run-current\n\n${userInput}`
   );
   assert.equal(yuiRunIdFromInputMessages([marked]), "agent-run-current");
 });
@@ -1709,7 +1724,7 @@ test("Run parsing rejects previous marker formats", () => {
     () => retagYuiRunInput(
       legacy,
       "agent-run-current",
-      "Yui · task-7 · Existing Task · Leader"
+      "Yui · task-7 · Leader · Existing Task"
     ),
     /managed Run input header is required/iu
   );
@@ -1720,7 +1735,7 @@ test("Run retagging rejects input without a managed envelope", () => {
     () => retagYuiRunInput(
       "plain user input",
       "agent-run-retried",
-      "Yui · task-7 · Test Task · Worker"
+      "Yui · task-7 · Worker · Test Task"
     ),
     /managed Run input header is required/iu
   );

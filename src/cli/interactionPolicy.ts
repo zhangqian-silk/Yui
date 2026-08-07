@@ -239,6 +239,11 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     confirmation: { action: "Retire task", targetArgumentIndex: 2 }
   },
   {
+    commandPath: ["task", "list"],
+    selectors: [],
+    trailingOptions: { "--all": "flag", "--verbose": "flag" }
+  },
+  {
     ...taskTarget("archive", 2, ["completed", "retired"]),
     trailingOptions: { "--integrated": "flag", "--abandon": "flag" },
     confirmation: { action: "Archive task", targetArgumentIndex: 2 }

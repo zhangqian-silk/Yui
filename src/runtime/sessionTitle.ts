@@ -10,7 +10,7 @@ export function taskRoleSessionTitle(
   task: TaskSessionIdentity,
   roleName: string
 ): string {
-  return sessionTitle(["Yui", task.id, task.title, roleLabel(roleName)]);
+  return sessionTitle(["Yui", task.id, roleLabel(roleName), task.title]);
 }
 
 function sessionTitle(segments: readonly string[]): string {
@@ -18,12 +18,12 @@ function sessionTitle(segments: readonly string[]): string {
   const full = normalized.join(TITLE_SEPARATOR);
   if (full.length <= MAX_SESSION_TITLE_LENGTH) return full;
 
-  const tail = truncate(normalized.at(-1)!, 48);
   const head = normalized.slice(0, -1).join(TITLE_SEPARATOR);
-  const headLength =
-    MAX_SESSION_TITLE_LENGTH - TITLE_SEPARATOR.length - tail.length - 1;
-  if (headLength < 1) return truncate(full, MAX_SESSION_TITLE_LENGTH);
-  return `${truncate(head, headLength)}…${TITLE_SEPARATOR}${tail}`;
+  const tail = normalized.at(-1)!;
+  const tailLength =
+    MAX_SESSION_TITLE_LENGTH - head.length - TITLE_SEPARATOR.length - 1;
+  if (tailLength < 1) return truncate(full, MAX_SESSION_TITLE_LENGTH);
+  return `${head}${TITLE_SEPARATOR}${truncate(tail, tailLength)}…`;
 }
 
 function normalizeSegment(value: string): string {

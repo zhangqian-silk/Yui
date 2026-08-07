@@ -154,6 +154,11 @@ import {
 } from "./taskInputCommands.js";
 import { taskActor as resolveTaskActor } from "./taskActor.js";
 import { createTaskTerminalNotification } from "../scheduler/operatorNotification.js";
+import {
+  buildTaskOverview,
+  parseTaskListOptions,
+  renderTaskOverview
+} from "./taskOverviewCommand.js";
 
 const LEADER_ROLE = "leader";
 
@@ -524,27 +529,18 @@ function createTaskAggregate(
 }
 
 function listTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandExecution {
-  assertNoArguments(args, "Task list usage: yui task list.");
-  const tasks = store.listTasks();
-  const rendered = tasks.length === 0
-    ? "No tasks found.\n"
-    : `${renderTable(
-        "Tasks",
-        [
-          { header: "Task", minWidth: 6, maxWidth: 20 },
-          { header: "Status", minWidth: 6, maxWidth: 10 },
-          { header: "Title", minWidth: 8, maxWidth: 64 },
-          { header: "Projects", minWidth: 8, maxWidth: 24 }
-        ],
-        tasks.map((task) => [
-          task.id,
-          task.status,
-          task.title,
-          task.projectBindings.map(({ directory }) => directory).join(", ") || "-"
-        ]),
-        defaultTableWidth()
-      )}\n`;
-  return output(rendered, { tasks });
+  const options = parseTaskListOptions(args);
+  const snapshot = store.transaction((reader) => ({
+    result: buildTaskOverview(reader, options),
+    timeZone: reader.getConfig().timeZone
+  }));
+  const rendered = renderTaskOverview(
+    snapshot.result,
+    options,
+    snapshot.timeZone,
+    defaultTableWidth()
+  );
+  return output(rendered, snapshot.result);
 }
 
 function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandExecution {

@@ -281,7 +281,12 @@ const taskChildren: readonly NodeInput[] = [
     options: ["--summary", "--summary-file", "--replacement"],
     fileOptions: ["--summary-file"]
   },
-  { name: "list", summary: "List Tasks." },
+  {
+    name: "list",
+    summary: "List unarchived Task overviews.",
+    usage: "yui task list [--all] [--verbose]",
+    options: ["--all", "--verbose"]
+  },
   { name: "show", summary: "Show a Task.", usage: "yui task show <id>" },
   {
     name: "context",

@@ -140,7 +140,7 @@ test("an idle Leader starts a real wakeup run, waits for readiness, sends once, 
   assert.equal(store.savedDispatches[0].run.roleName, "leader");
   assert.equal(
     store.savedDispatches[0].run.input.startsWith(
-      "Yui · task-1 · Test task · Leader · Run agent-run-1\n\n"
+      "Yui · task-1 · Leader · Test task · Run agent-run-1\n\n"
     ),
     true
   );
