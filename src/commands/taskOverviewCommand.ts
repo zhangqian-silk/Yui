@@ -286,7 +286,11 @@ function collectAttention(
     });
   }
   for (const run of runs) {
-    if (run.status !== "active" || !isRoleRunStalled(events, run.id)) continue;
+    if (
+      run.roleName !== "leader"
+      || run.status !== "active"
+      || !isRoleRunStalled(events, run.id)
+    ) continue;
     if (notificationStall?.runId === run.id) continue;
     const progressAt = latestStallProgressAt(events, run.id) ?? run.updatedAt;
     items.push({
@@ -463,10 +467,13 @@ function countWorkItems(items: readonly WorkItem[]): TaskOverviewWorkCounts {
 }
 
 function leaderCell(task: TaskOverview): string {
-  if (task.leader.summaryStatus === "missing") return "missing summary";
+  const status = task.leader.roleStatus;
+  if (task.leader.summaryStatus === "missing") return `${status} · missing summary`;
   const values = [task.leader.summary, task.leader.currentFocus]
     .filter((value): value is string => value !== null && value.length > 0);
-  return values.length === 0 ? "summary unavailable" : compactText(values.join(" · "));
+  return values.length === 0
+    ? `${status} · summary unavailable`
+    : compactText(`${status} · ${values.join(" · ")}`);
 }
 
 function workCell(counts: TaskOverviewWorkCounts): string {

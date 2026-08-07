@@ -9,8 +9,14 @@ import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { createTaskBrief } from "../../dist/brief/taskBrief.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
 import { createInputRequest } from "../../dist/input/inputRequest.js";
-import { createGlobalRole, createRoleAgentBinding } from "../../dist/role/role.js";
+import {
+  createGlobalRole,
+  createRole,
+  createRoleAgentBinding,
+  updateRoleStatus
+} from "../../dist/role/role.js";
 import { createLeaderStallNotification } from "../../dist/scheduler/operatorNotification.js";
+import { mergePendingWakeup } from "../../dist/scheduler/pendingWakeup.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
@@ -64,6 +70,11 @@ test("task list defaults to unarchived overview records with durable Leader fact
   const { store, options } = fixture(t);
   const active = createTask(store, options, "Visible Task");
   saveBrief(store, active.id);
+  store.saveRole(active.id, updateRoleStatus(
+    store.getRole(active.id, "leader"),
+    "failed",
+    new Date(NOW.getTime() + 60_000)
+  ));
   const archived = createTask(store, options, "Archived Task");
   runTaskCommand(["activate", archived.id], store, options);
   runTaskCommand(["complete", archived.id, "--summary", "Finished"], store, options);
@@ -84,6 +95,7 @@ test("task list defaults to unarchived overview records with durable Leader fact
   assert.doesNotMatch(result.output, /Archived Task/);
   assert.match(result.output, /Durable records are available/);
   assert.match(result.output, /CLI projection/);
+  assert.match(result.output, /failed/);
 });
 
 test("task list --all/--verbose retains history and expands context without writing", (t) => {
@@ -191,4 +203,103 @@ test("task overview makes missing summary and structured blockers actionable", (
   assert.match(result.output, /missing summary/);
   assert.match(result.output, new RegExp(`input:${request.id}`));
   assert.match(result.output, /answer-input \/ user/);
+});
+
+test("task overview keeps worker stalls as Leader wakeups rather than Leader attention", (t) => {
+  const { root, store, options } = fixture(t);
+  const task = createTask(store, options, "Worker stall");
+  const codex = store.getConfiguredAgent("codex");
+  store.saveRole(task.id, createRole(
+    task.id,
+    "worker",
+    [createRoleAgentBinding(codex)],
+    codex.id,
+    root,
+    NOW
+  ));
+  const run = createAgentRun(
+    store.nextAgentRunId(task.id), task.id, "worker", "new", "Worker work", NOW,
+    { agent: { agentId: "codex", adapterId: "codex" } }
+  );
+  store.saveAgentRun(run);
+  store.savePendingWakeup(mergePendingWakeup(
+    task.id,
+    "role-run-stalled",
+    NOW,
+    null
+  ));
+  store.saveEvent(task.id, createTaskEvent(
+    store.nextEventId(task.id), task.id, "run.stalled",
+    {
+      runId: run.id,
+      roleName: "worker",
+      progressAt: NOW.toISOString(),
+      kind: "execution-stalled",
+      classification: "truly-stalled",
+      evidenceKey: "worker-stall"
+    },
+    NOW
+  ));
+
+  const result = runTaskCommand(["list"], store, options);
+  assert.equal(result.kind, "output");
+  const overview = result.data.tasks[0];
+  assert.deepEqual(overview.attention, []);
+  assert.equal(overview.blockers.some(({ kind }) => kind === "attention"), false);
+  assert.equal(overview.next?.action, "process-leader-wakeup");
+  assert.equal(overview.next?.owner, "leader");
+  assert.equal(overview.next?.kind, "wakeup");
+  assert.equal(overview.nextAction, "process-leader-wakeup");
+  assert.equal(overview.nextOwner, "leader");
+});
+
+test("task list builds one consistent read-only snapshot before rendering", (t) => {
+  const { root, store, options } = fixture(t);
+  createTask(store, options, "First task");
+  createTask(store, options, "Second task");
+  const before = readFileSync(join(root, "state.json"), "utf8");
+  const readMethods = [
+    "getConfig",
+    "listTasks",
+    "getTaskBrief",
+    "getRole",
+    "listWorkItems",
+    "listInputRequests",
+    "listAgentRuns",
+    "listEvents",
+    "getLeaderFailure",
+    "getOperatorNotification",
+    "getPendingWakeup"
+  ];
+  let snapshotCount = 0;
+  let outsideSnapshotReads = 0;
+  let inSnapshot = false;
+  const read = (method, args) => {
+    if (!inSnapshot) outsideSnapshotReads += 1;
+    return store[method](...args);
+  };
+  const reader = Object.fromEntries(readMethods.map((method) => [
+    method,
+    (...args) => read(method, args)
+  ]));
+  const guardedStore = {
+    ...reader,
+    transaction(execute) {
+      snapshotCount += 1;
+      return store.transaction(() => {
+        inSnapshot = true;
+        try {
+          return execute(reader);
+        } finally {
+          inSnapshot = false;
+        }
+      });
+    }
+  };
+
+  const result = runTaskCommand(["list"], guardedStore, options);
+  assert.equal(result.kind, "output");
+  assert.equal(snapshotCount, 1);
+  assert.equal(outsideSnapshotReads, 0);
+  assert.equal(readFileSync(join(root, "state.json"), "utf8"), before);
 });

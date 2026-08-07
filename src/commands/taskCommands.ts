@@ -526,14 +526,17 @@ function createTaskAggregate(
 
 function listTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandExecution {
   const options = parseTaskListOptions(args);
-  const result = buildTaskOverview(store, options);
+  const snapshot = store.transaction((reader) => ({
+    result: buildTaskOverview(reader, options),
+    timeZone: reader.getConfig().timeZone
+  }));
   const rendered = renderTaskOverview(
-    result,
+    snapshot.result,
     options,
-    store.getConfig().timeZone,
+    snapshot.timeZone,
     defaultTableWidth()
   );
-  return output(rendered, result);
+  return output(rendered, snapshot.result);
 }
 
 function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandExecution {
