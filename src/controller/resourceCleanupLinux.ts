@@ -9,6 +9,7 @@ import { controllerSocketPath } from "../core/controllerEndpoint.js";
 import {
   CONTROLLER_DOMAIN_PATH,
   domainIdentityPath,
+  removeEphemeralDomainIdentityIfUnchanged,
   readEphemeralDomainIdentity
 } from "./domainIdentity.js";
 
@@ -134,10 +135,16 @@ function cleanArtifact(resource: RuntimeResource, ports: ControllerCleanupPorts)
     if (home === undefined || expectedToken === undefined) {
       throw new Error(`Ephemeral domain identity is unavailable: ${resource.id}.`);
     }
-    const identity = readEphemeralDomainIdentity(home);
-    if (identity.status !== "valid" || identity.identity?.token !== expectedToken) {
+    const removal = removeEphemeralDomainIdentityIfUnchanged(
+      home,
+      expectedToken,
+      artifact.fingerprint
+    );
+    if (removal === "absent") return;
+    if (removal !== "removed") {
       throw new Error(`Resource changed since scan: ${resource.id}.`);
     }
+    return;
   }
   if (
     artifact.artifactKind.endsWith("-socket")

@@ -9,11 +9,13 @@ import {
   defaultEphemeralTmuxServer,
   readEphemeralDomainIdentity,
   readLinuxProcessStartIdentity,
+  removeEphemeralDomainIdentityIfUnchanged,
   recordEphemeralTmuxTarget,
   writeEphemeralDomainIdentity
 } from "../../dist/controller/domainIdentity.js";
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { reapExpiredEphemeralResources } from "../../dist/controller/ephemeralResourceReaper.js";
+import { cleanControllerResource } from "../../dist/controller/resourceCleanupLinux.js";
 import { scanControllerResourceInventory } from "../../dist/controller/resourceInventoryLinux.js";
 import {
   createRoleSessionSet,
@@ -22,6 +24,7 @@ import {
 import { createGlobalRole, createRoleAgentBinding } from "../../dist/role/role.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import { startControllerServer } from "../../dist/core/controllerServer.js";
 import { recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
 
 function temporaryHome() {
@@ -73,6 +76,135 @@ test("same-token Controller restart writes retain recorded tmux targets", (t) =>
   const current = readEphemeralDomainIdentity(home);
   assert.equal(current.status, "valid");
   assert.deepEqual(current.identity.tmuxTargets, ["yui-test:operator"]);
+});
+
+test("identity cleanup defers when a target writer wins the final window", (t) => {
+  const { root, home } = temporaryHome();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const initial = identity(home, { tmuxTargets: [] });
+  writeEphemeralDomainIdentity(home, initial);
+  const before = readEphemeralDomainIdentity(home);
+  assert.equal(before.status, "valid");
+  const result = removeEphemeralDomainIdentityIfUnchanged(
+    home,
+    initial.token,
+    before.fingerprint,
+    {
+      beforeAcquire: () => {
+        assert.equal(
+          recordEphemeralTmuxTarget(home, initial.token, "yui-test:late"),
+          true
+        );
+      }
+    }
+  );
+  assert.equal(result, "deferred");
+  const after = readEphemeralDomainIdentity(home);
+  assert.equal(after.status, "valid");
+  assert.deepEqual(after.identity.tmuxTargets, ["yui-test:late"]);
+});
+
+test("artifact cleanup defers when target recording races its final fence check", async (t) => {
+  const { root, home } = temporaryHome();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const initial = identity(home, { tmuxTargets: [] });
+  writeEphemeralDomainIdentity(home, initial);
+  const before = readEphemeralDomainIdentity(home);
+  assert.equal(before.status, "valid");
+  const resource = {
+    id: `artifact:${home}/runtime/domain.json`,
+    fingerprint: before.fingerprint,
+    kind: "artifact",
+    state: "stale",
+    disposition: "safe",
+    reasonCode: "stale-domain-identity",
+    yuiHome: home,
+    owner: { kind: "controller-domain", yuiHome: home },
+    processes: [],
+    rssBytes: 0,
+    cpuTimeMs: 0,
+    ageMs: 0,
+    domain: {
+      kind: "ephemeral-test",
+      liveness: "expired",
+      disposition: "safe",
+      reasonCode: "ephemeral-host-dead",
+      fingerprint: "domain-fence",
+      token: initial.token,
+      tmuxTargets: [],
+      ageMs: 10_000,
+      graceMs: 1_000
+    },
+    artifact: {
+      artifactKind: "domain-identity",
+      path: `${home}/runtime/domain.json`,
+      active: false,
+      fingerprint: before.fingerprint
+    }
+  };
+  let fingerprintCalls = 0;
+  await assert.rejects(
+    cleanControllerResource(resource, {
+      ports: {
+        processStartIdentity: () => undefined,
+        signal() {},
+        sleep: async () => {},
+        artifactFingerprint: () => {
+          fingerprintCalls += 1;
+          if (fingerprintCalls === 1) {
+            assert.equal(
+              recordEphemeralTmuxTarget(home, initial.token, "yui-test:cleanup"),
+              true
+            );
+          }
+          return before.fingerprint;
+        },
+        socketActive: () => false,
+        removeArtifact() {},
+        killPane: async () => {}
+      }
+    }),
+    /changed since scan/
+  );
+  const after = readEphemeralDomainIdentity(home);
+  assert.equal(after.status, "valid");
+  assert.deepEqual(after.identity.tmuxTargets, ["yui-test:cleanup"]);
+});
+
+test("normal Controller close retains a target fence recorded in its final window", async (t) => {
+  const { root, home } = temporaryHome();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const initial = identity(home, { tmuxTargets: [] });
+  let controller;
+  controller = await startControllerServer(
+    home,
+    undefined,
+    () => {
+      assert.equal(
+        recordEphemeralTmuxTarget(home, initial.token, "yui-test:controller-close"),
+        true
+      );
+    },
+    { domainIdentity: initial }
+  );
+  await controller.close();
+  const after = readEphemeralDomainIdentity(home);
+  assert.equal(after.status, "valid");
+  assert.deepEqual(after.identity.tmuxTargets, ["yui-test:controller-close"]);
+});
+
+test("normal Controller close removes the exact empty identity generation", async (t) => {
+  const { root, home } = temporaryHome();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const initial = identity(home, { tmuxTargets: [] });
+  const controller = await startControllerServer(
+    home,
+    undefined,
+    undefined,
+    { domainIdentity: initial }
+  );
+  await controller.close();
+  assert.equal(readEphemeralDomainIdentity(home).status, "absent");
 });
 
 test("active host identity protects an otherwise expired domain", async (t) => {
