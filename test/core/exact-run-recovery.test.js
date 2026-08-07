@@ -334,7 +334,7 @@ function opaqueTerminalRecoveryStore() {
     updatedAt: PROGRESS
   };
   const sessionSet = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     owner: { scope: "task", taskId: "task-1", roleName: "leader" },
     activeAgentId: "agent-1",
     sessions: { "agent-1": store.session },

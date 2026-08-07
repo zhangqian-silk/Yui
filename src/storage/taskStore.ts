@@ -149,7 +149,7 @@ type StoredTask = {
 };
 
 type StorageState = {
-  schemaVersion: 15;
+  schemaVersion: 16;
   revision: number;
   config: YuiConfig;
   configuredAgents: Record<string, ConfiguredAgent>;
@@ -283,6 +283,7 @@ export type TaskStore = {
 
 export class FileTaskStore implements TaskStore {
   #transaction: { state: StorageState; baseRevision: number; dirty: boolean } | null = null;
+  #readCache: { fingerprint: string; state: StorageState } | null = null;
 
   constructor(private readonly rootDir: string) {
     requireStorageSchema(rootDir);
@@ -293,12 +294,15 @@ export class FileTaskStore implements TaskStore {
   transaction<T>(execute: (store: TaskStore) => T): T {
     if (this.#transaction !== null) return synchronousResult(execute(this));
     return this.#withWriteLock(() => {
-      const state = this.#readState();
+      const state = this.#readCachedState();
       this.#transaction = { state, baseRevision: state.revision, dirty: false };
       try {
         const result = synchronousResult(execute(this));
         if (this.#transaction.dirty) this.#commit(state, this.#transaction.baseRevision);
         return result;
+      } catch (error) {
+        this.#readCache = null;
+        throw error;
       } finally {
         this.#transaction = null;
       }
@@ -821,7 +825,7 @@ export class FileTaskStore implements TaskStore {
   getAgentRun(taskId: string, id: string): AgentRun | null { return optional(this.#state().tasks[taskId]?.agentRuns[id]); }
   listAgentRuns(taskId: string): AgentRun[] { return values(this.#requireTask(taskId).agentRuns, "id"); }
   saveAgentRun(run: AgentRun): void {
-    const stored = identified<AgentRun>(run, 4, "id", run.id, "Agent run");
+    const stored = identified<AgentRun>(run, 5, "id", run.id, "Agent run");
     validateAgentRun(stored);
     const aggregate = this.#requireTaskForWrite(stored.taskId);
     if (stored.purpose === "review"
@@ -1136,7 +1140,7 @@ export class FileTaskStore implements TaskStore {
   }
   #requireTaskForWrite(taskId: string): StoredTask { return this.#requireTask(taskId); }
 
-  #state(): StorageState { return this.#transaction?.state ?? this.#readState(); }
+  #state(): StorageState { return this.#transaction?.state ?? this.#readCachedState(); }
   #mutate(execute: (state: StorageState) => void): void { this.#mutateResult((state) => { execute(state); }); }
   #mutateResult<T>(execute: (state: StorageState) => T): T {
     if (this.#transaction !== null) {
@@ -1145,10 +1149,15 @@ export class FileTaskStore implements TaskStore {
       return result;
     }
     return this.#withWriteLock(() => {
-      const state = this.#readState();
-      const result = execute(state);
-      this.#commit(state, state.revision);
-      return result;
+      const state = this.#readCachedState();
+      try {
+        const result = execute(state);
+        this.#commit(state, state.revision);
+        return result;
+      } catch (error) {
+        this.#readCache = null;
+        throw error;
+      }
     });
   }
   #remove<T>(select: (state: StorageState) => Record<string, T>, id: string): boolean {
@@ -1192,6 +1201,21 @@ export class FileTaskStore implements TaskStore {
     if (!existsSync(path)) return emptyState();
     return parseState(readFileSync(path, "utf8"));
   }
+  #readCachedState(): StorageState {
+    requireStorageSchema(this.rootDir);
+    const path = join(this.rootDir, STORAGE_STATE_FILE);
+    if (!existsSync(path)) {
+      if (this.#readCache?.fingerprint === "missing") return this.#readCache.state;
+      const state = emptyState();
+      this.#readCache = { fingerprint: "missing", state };
+      return state;
+    }
+    const fingerprint = stateFileFingerprint(path);
+    if (this.#readCache?.fingerprint === fingerprint) return this.#readCache.state;
+    const state = parseState(readFileSync(path, "utf8"));
+    this.#readCache = { fingerprint, state };
+    return state;
+  }
   #commit(state: StorageState, expectedRevision: number): void {
     const current = this.#readState();
     if (current.revision !== expectedRevision) {
@@ -1201,11 +1225,17 @@ export class FileTaskStore implements TaskStore {
     const content = `${JSON.stringify(state, null, 2)}\n`;
     parseState(content);
     writeTextFileAtomically(join(this.rootDir, STORAGE_STATE_FILE), content);
+    this.#readCache = null;
   }
   #withWriteLock<T>(execute: () => T): T {
     const release = acquireStorageLock(this.rootDir);
     try { return execute(); } finally { release(); }
   }
+}
+
+function stateFileFingerprint(path: string): string {
+  const stat = statSync(path, { bigint: true });
+  return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(":");
 }
 
 export class StorageRecordError extends Error { constructor(message: string) { super(message); this.name = "StorageRecordError"; } }
@@ -1220,7 +1250,7 @@ export function ensureYuiHome(rootDir: string): void { mkdirSync(rootDir, { recu
 
 function emptyState(): StorageState {
   return {
-    schemaVersion: 15,
+    schemaVersion: 16,
     revision: 0,
     config: { schemaVersion: 1 },
     configuredAgents: {},
@@ -1313,7 +1343,7 @@ function parseState(raw: string): StorageState {
     "tasks",
     "mailboxes"
   ], "Storage state");
-  if (state.schemaVersion !== 15 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
+  if (state.schemaVersion !== 16 || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
   const result = clone(state) as unknown as StorageState;
   result.config = versioned(result.config, 1, "Yui config");
   validateYuiConfig(result.config);
@@ -1480,7 +1510,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateWorkItem(item);
     return item;
   }, "workItems");
-  parseMap(aggregate.agentRuns, (record, key) => { const run = identified<AgentRun>(record, 4, "id", key, "Agent run"); if (run.taskId !== taskId) throw new StorageRecordError(`Agent run belongs to another Task: ${run.taskId}`); validateAgentRun(run); return run; }, "agentRuns");
+  parseMap(aggregate.agentRuns, (record, key) => { const run = identified<AgentRun>(record, 5, "id", key, "Agent run"); if (run.taskId !== taskId) throw new StorageRecordError(`Agent run belongs to another Task: ${run.taskId}`); validateAgentRun(run); return run; }, "agentRuns");
   parseMap(aggregate.reviewRounds, (record, key) => {
     const round = identified<ReviewRound>(record, 2, "id", key, "ReviewRound");
     if (round.taskId !== taskId) {
@@ -1615,7 +1645,7 @@ function globalSessions(value: unknown): GlobalRoleSessionSet {
   return set;
 }
 function taskSessions(value: unknown): TaskRoleSessionSet {
-  const set = versioned<TaskRoleSessionSet>(value, 3, "Task Role session set");
+  const set = versioned<TaskRoleSessionSet>(value, 4, "Task Role session set");
   if (set.owner?.scope !== "task" || typeof set.owner.taskId !== "string" || typeof set.owner.roleName !== "string") throw new StorageRecordError("Task Role session owner is invalid.");
   validateSessions(set.sessions);
   validateRoleSessionSet(set);

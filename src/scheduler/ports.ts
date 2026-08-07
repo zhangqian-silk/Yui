@@ -244,6 +244,19 @@ export interface SchedulerStorePort {
   recordRoleRunResourceSuppression?(input: RoleRunResourceSuppressionPersistence): "recorded" | "already-recorded" | "state-changed";
   /** Atomically records one new stall episode and routes its responsibility. */
   recordRoleRunStall?(input: RoleRunStallPersistence): "raised" | "already-raised" | "state-changed";
+  /**
+   * True iff an exact provider-ready fold has been recorded for this generation
+   * (adapter/nativeSession/launch). The scheduler consults it, together with the
+   * adapter's preInputReadiness capability, to gate a fresh first push — never a
+   * sleep, screen scrape, or pane/PID inference. Absent implementation ⇒ no gate.
+   */
+  isRoleGenerationProviderReady?(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    launchId?: string;
+    nativeSessionId?: string;
+  }>): boolean;
   hasInFlightTurn(taskId: string, roleName: string): boolean;
   peekNextAgentRunId(taskId: string): string;
 
@@ -371,6 +384,8 @@ export type PreparedRoleDelivery = Readonly<{
   mode: RoleSessionLaunchMode;
   /** The prepare request created a new external Role window/process. */
   sessionStarted: boolean;
+  /** Provider launch argv carried this Run's first prompt atomically. */
+  inputSubmittedAtLaunch?: boolean;
 }>;
 
 export type ReadyRoleDelivery = Readonly<{

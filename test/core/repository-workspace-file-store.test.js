@@ -184,7 +184,7 @@ function markDelivered(store, run) {
       );
       tx.saveWorkMailbox(mailbox);
     }
-    tx.saveAgentRun({ ...run, deliveredAt: NOW.toISOString() });
+    tx.saveAgentRun({ ...run, pushedAt: NOW.toISOString(), deliveredAt: NOW.toISOString() });
   });
 }
 

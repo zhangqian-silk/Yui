@@ -137,7 +137,7 @@ test("Task Role list uses one tmux snapshot and returns structured runtime summa
   const work = store.listWorkItems(task.id)[0];
   dispatchTestRun(store, task.id, "worker", work.id);
   const activeRun = store.getActiveAgentRun(task.id, "worker");
-  store.saveAgentRun({ ...activeRun, deliveredAt: NOW.toISOString() });
+  store.saveAgentRun({ ...activeRun, pushedAt: NOW.toISOString(), deliveredAt: NOW.toISOString() });
 
   let sessions = createRoleSessionSet(
     { scope: "task", taskId: task.id, roleName: "worker" },
@@ -237,7 +237,7 @@ test("Task Role health distinguishes queued, orphaned delivered, and exited runt
     "starting"
   );
   const activeRun = store.getActiveAgentRun(task.id, "worker");
-  store.saveAgentRun({ ...activeRun, deliveredAt: NOW.toISOString() });
+  store.saveAgentRun({ ...activeRun, pushedAt: NOW.toISOString(), deliveredAt: NOW.toISOString() });
   assert.equal(
     execute(["role", "status", task.id, "worker"], store, withoutPane).data.role.health,
     "needs-attention"
@@ -258,6 +258,60 @@ test("Task Role health distinguishes queued, orphaned delivered, and exited runt
   assert.equal(
     execute(["role", "status", task.id, "worker"], store, deadPane).data.role.health,
     "failed"
+  );
+});
+
+test("Task Role status keeps pushed transport separate from provider acceptance", (t) => {
+  const { store, options } = fixture(t);
+  execute(["create", "Pushed status"], store, options);
+  const task = store.listTasks()[0];
+  execute(["role", "add", task.id, "worker"], store, options);
+  execute(["work", "create", task.id, "Run it"], store, options);
+  execute(["activate", task.id], store, options);
+  dispatchTestRun(store, task.id, "worker", store.listWorkItems(task.id)[0].id);
+
+  const pushedAt = NOW.toISOString();
+  const activeRun = store.getActiveAgentRun(task.id, "worker");
+  store.saveAgentRun({ ...activeRun, pushedAt });
+  assert.equal(store.getActiveAgentRun(task.id, "worker").pushedAt, pushedAt);
+
+  const live = execute(["role", "status", task.id, "worker"], store, options);
+  assert.equal(live.data.role.health, "awaiting-provider-acceptance");
+  assert.equal(live.data.role.activeRun.pushedAt, pushedAt);
+  assert.equal(live.data.role.activeRun.deliveredAt, undefined);
+  assert.match(
+    live.output,
+    /Active run\s+\S+ \(pushed \(awaiting provider acceptance\)\)/
+  );
+
+  const withoutPane = {
+    ...options,
+    runtime: { ...options.runtime, inspectTaskRolePanes: () => [] }
+  };
+  const ambiguous = execute(["role", "status", task.id, "worker"], store, withoutPane);
+  assert.equal(ambiguous.data.role.health, "needs-attention");
+  assert.match(
+    ambiguous.data.role.healthReason,
+    /pushed active Run is awaiting provider acceptance and has no live tmux pane/
+  );
+  assert.equal(ambiguous.data.role.activeRun.deliveredAt, undefined);
+
+  const deadPane = {
+    ...options,
+    runtime: {
+      ...options.runtime,
+      inspectTaskRolePanes: () => [{
+        taskId: task.id,
+        roleName: "worker",
+        target: `${task.id}:worker`,
+        dead: true,
+        currentCommand: "codex"
+      }]
+    }
+  };
+  assert.equal(
+    execute(["role", "status", task.id, "worker"], store, deadPane).data.role.health,
+    "needs-attention"
   );
 });
 

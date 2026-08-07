@@ -729,7 +729,7 @@ function completeTaskCommand(
       if (leaderEntry.run.workItemId !== undefined) {
         throw usageError(`Task ${task.id} has running work: ${leaderEntry.run.workItemId}.`);
       }
-      if (leaderEntry.run.deliveredAt === undefined) {
+      if (leaderEntry.run.pushedAt === undefined) {
         throw usageError(`Task ${task.id} Leader delivery is still pending.`);
       }
       const terminal = terminalizeExactTaskRun(tx, {
@@ -2576,7 +2576,7 @@ function yieldRun(
     if (active.status !== "active") {
       throw usageError(`Run ${active.id} is already terminal: ${active.status}.`);
     }
-    if (active.deliveredAt === undefined) {
+    if (active.pushedAt === undefined) {
       throw usageError(`Run ${active.id} delivery is still pending.`);
     }
     const task = requireTask(tx, active.taskId);

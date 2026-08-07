@@ -306,7 +306,8 @@ function markDelivered(store, run) {
       );
       tx.saveWorkMailbox(mailbox);
     }
-    tx.saveAgentRun({ ...run, deliveredAt: NOW.toISOString() });
+    // Delivered (provider-accepted) implies the prompt was pushed first.
+    tx.saveAgentRun({ ...run, pushedAt: NOW.toISOString(), deliveredAt: NOW.toISOString() });
   });
 }
 
@@ -1853,6 +1854,7 @@ test("Leader control Run without a WorkItem can yield and release the pending wa
     "Review pending Task events",
     NOW
   );
+  controlRun.pushedAt = NOW.toISOString();
   controlRun.deliveredAt = NOW.toISOString();
   store.transaction((tx) => {
     tx.saveActiveAgentRun(controlRun);
@@ -1902,6 +1904,7 @@ test("a rejected Worker control yield rolls back all staged FileTaskStore writes
     "invalid control run",
     NOW
   );
+  invalidRun.pushedAt = NOW.toISOString();
   invalidRun.deliveredAt = NOW.toISOString();
   store.transaction((tx) => {
     tx.saveActiveAgentRun(invalidRun);
@@ -2439,6 +2442,7 @@ test("a Leader control Run can complete its Task atomically", (t) => {
     "Review final state",
     NOW
   );
+  controlRun.pushedAt = NOW.toISOString();
   controlRun.deliveredAt = NOW.toISOString();
   store.transaction((tx) => {
     tx.saveActiveAgentRun(controlRun);
@@ -2503,6 +2507,7 @@ test("a Leader session cannot complete another Task as that Task's Leader", (t) 
     "Target control run",
     NOW
   );
+  targetRun.pushedAt = NOW.toISOString();
   targetRun.deliveredAt = NOW.toISOString();
   store.transaction((tx) => {
     tx.saveActiveAgentRun(targetRun);

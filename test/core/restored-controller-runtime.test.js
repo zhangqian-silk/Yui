@@ -566,6 +566,7 @@ test("one stale Role cleanup failure does not block another Role delivery", asyn
   ]);
   let run = {
     ...deliveredRun("task-delivery", "worker"),
+    pushedAt: undefined,
     deliveredAt: undefined
   };
   const events = [];
@@ -605,7 +606,7 @@ test("one stale Role cleanup failure does not block another Role delivery", asyn
   };
   store.saveRoleRunPrepared = () => {};
   store.saveRoleRunDelivery = ({ now }) => {
-    run = { ...run, deliveredAt: now.toISOString() };
+    run = { ...run, pushedAt: now.toISOString() };
     const mailbox = mailboxes.get(mailboxKey(deliveryTarget));
     mailboxes.set(mailboxKey(deliveryTarget), {
       ...mailbox, processing: null
@@ -664,7 +665,7 @@ test("one stale Role cleanup failure does not block another Role delivery", asyn
     mailboxes.get(mailboxKey(cleanupTarget)).pending,
     cleanupBatch
   );
-  assert.equal(run.deliveredAt, new Date(1).toISOString());
+  assert.equal(run.pushedAt, new Date(1).toISOString());
 });
 
 test("Task and global cleanup obligations supersede launch reservations atomically", async () => {
@@ -1032,7 +1033,7 @@ test("stale Role cleanup finishes before a concurrently queued Run may launch", 
   store.releaseWorkMailbox = () => false;
   store.saveRoleRunPrepared = () => {};
   store.saveRoleRunDelivery = ({ now }) => {
-    run = { ...run, deliveredAt: now.toISOString() };
+    run = { ...run, pushedAt: now.toISOString() };
     runMailbox = { ...runMailbox, processing: null };
   };
   const lifecycleHost = {
@@ -1073,6 +1074,7 @@ test("stale Role cleanup finishes before a concurrently queued Run may launch", 
   run = {
     ...deliveredRun(task.id, roleValue.name),
     id: "agent-run-92",
+    pushedAt: undefined,
     deliveredAt: undefined
   };
   runMailbox = { ...runMailbox, pending: runBatch, nextSequence: 3 };
@@ -1087,7 +1089,7 @@ test("stale Role cleanup finishes before a concurrently queued Run may launch", 
     "prepare-new",
     "send-new"
   ]);
-  assert.notEqual(run.deliveredAt, undefined);
+  assert.notEqual(run.pushedAt, undefined);
 });
 
 test("full recovery releases only Task mailboxes whose isolated workspace work failed", async () => {
@@ -1138,7 +1140,7 @@ test("controller delivers a queued Work AgentRun through tmux before liveness", 
     status: "running"
   };
   const run = {
-    schemaVersion: 4,
+    schemaVersion: 5,
     id: "agent-run-1",
     taskId: task.id,
     roleName: role.name,
@@ -1297,7 +1299,7 @@ test("dirty Role reconciliation inspects only that Role while retaining the Task
     (role) => role.taskId === taskId && role.name === roleName
   ) ?? null;
   store.getActiveAgentRun = (_taskId, roleName) => ({
-    schemaVersion: 4,
+    schemaVersion: 5,
     id: roleName === "worker" ? "agent-run-1" : "agent-run-2",
     taskId: task.id,
     roleName,
@@ -1306,6 +1308,7 @@ test("dirty Role reconciliation inspects only that Role while retaining the Task
     purpose: "execution",
     status: "active",
     effective: testEffectiveLaunch({ agentId: `codex-${roleName}` }),
+    pushedAt: new Date(0).toISOString(),
     deliveredAt: new Date(0).toISOString(),
     createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString()
   });
@@ -1410,7 +1413,7 @@ test("controller pump coalesces overlap into one non-overlapping follow-up pass"
     taskId: "task-1", name: "worker", activeAgentId: "codex", adapterId: "codex", status: "running"
   }];
   store.getActiveAgentRun = () => ({
-    schemaVersion: 4,
+    schemaVersion: 5,
     id: "agent-run-1",
     taskId: "task-1",
     roleName: "worker",
@@ -1830,6 +1833,31 @@ test("an existing busy Operator gets bounded delivery retries without startup ar
   controller.stop();
 });
 
+test("an unchanged Operator mailbox is not re-signalled by repeated full passes", async () => {
+  const fixture = operatorRuntimeFixture();
+  fixture.store.getOperatorDeliveryTarget = () => null;
+  fixture.enqueue();
+  const claim = fixture.store.claimWorkMailbox;
+  let operatorClaims = 0;
+  fixture.store.claimWorkMailbox = (input) => {
+    if (input.target.kind === "operator") operatorClaims += 1;
+    return claim(input);
+  };
+  const controller = new FileTaskController(fixture.store, noTmux, {
+    signalWindowMs: 1
+  });
+
+  await controller.pump();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await controller.pump();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  // The first full pass arms the Operator lane. The unchanged pending batch
+  // must not create another zero-delay Operator pass on the second full scan.
+  assert.equal(operatorClaims, 1);
+  controller.stop();
+});
+
 test("a dirty Hook fold signals Operator work created after scheduler phases", async () => {
   const fixture = operatorRuntimeFixture();
   let drains = 0;
@@ -1865,6 +1893,7 @@ test("a non-ready Role delivery uses bounded queued retries instead of blocking 
   const task = { id: "task-1", status: "active", projectBindings: [] };
   const roleValue = role(task.id, "worker");
   let run = deliveredRun(task.id, roleValue.name);
+  delete run.pushedAt;
   delete run.deliveredAt;
   let sends = 0;
   const store = emptyStore();
@@ -1884,7 +1913,7 @@ test("a non-ready Role delivery uses bounded queued retries instead of blocking 
       executionRef: { type: "run", taskId: task.id, id: run.id }
     }
   });
-  store.saveRoleRunDelivery = ({ now }) => { run = { ...run, deliveredAt: now.toISOString() }; };
+  store.saveRoleRunDelivery = ({ now }) => { run = { ...run, pushedAt: now.toISOString() }; };
   const delivery = {
     ...noTmux,
     async prepareRoleSession(input) {
@@ -1904,7 +1933,7 @@ test("a non-ready Role delivery uses bounded queued retries instead of blocking 
   await new Promise((resolve) => setTimeout(resolve, 50));
 
   assert.equal(sends, 4);
-  assert.notEqual(run.deliveredAt, undefined);
+  assert.notEqual(run.pushedAt, undefined);
   controller.stop();
 });
 
@@ -1912,6 +1941,7 @@ test("exhausting Role delivery retries terminalizes the exact prepared Run befor
   const task = { id: "task-1", status: "active", projectBindings: [] };
   const roleValue = role(task.id, "worker");
   let run = deliveredRun(task.id, roleValue.name);
+  delete run.pushedAt;
   delete run.deliveredAt;
   const runId = run.id;
   const session = {
@@ -2016,6 +2046,7 @@ test("a fresh Controller retries an undelivered Run in an existing busy pane", a
     ...deliveredRun(task.id, roleValue.name),
     mode: "resume"
   };
+  delete run.pushedAt;
   delete run.deliveredAt;
   let sends = 0;
   const store = emptyStore();
@@ -2070,6 +2101,7 @@ test("a resumed Role retries startup readiness when prepare created its missing 
   const task = { id: "task-1", status: "active", projectBindings: [] };
   const roleValue = role(task.id, "worker");
   const run = { ...deliveredRun(task.id, roleValue.name), mode: "resume" };
+  delete run.pushedAt;
   delete run.deliveredAt;
   let sends = 0;
   const store = emptyStore();
@@ -2270,8 +2302,9 @@ function deliveredRun(taskId, roleName) {
   const at = new Date(0).toISOString();
   const agentId = `codex-${roleName}`;
   return {
-    schemaVersion: 4, id: "agent-run-1", taskId, roleName,
-    mode: "new", input: "work", purpose: "execution", status: "active", deliveredAt: at,
+    schemaVersion: 5, id: "agent-run-1", taskId, roleName,
+    mode: "new", input: "work", purpose: "execution", status: "active",
+    pushedAt: at, deliveredAt: at,
     effective: testEffectiveLaunch({ agentId }),
     createdAt: at, updatedAt: at
   };
