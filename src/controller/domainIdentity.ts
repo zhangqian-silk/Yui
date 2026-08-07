@@ -49,6 +49,8 @@ export type DomainIdentityRead = Readonly<{
 
 export type EphemeralDomainIdentityRemoval = "removed" | "deferred" | "absent";
 
+export type EphemeralDomainIdentityEpochStatus = "completed" | "deferred" | "absent";
+
 export type EphemeralDomainIdentityRemovalOptions = Readonly<{
   /** Test-only scheduling seam for a deterministic final-window race. */
   beforeAcquire?: () => void;
@@ -317,8 +319,66 @@ export function removeEphemeralDomainIdentityIfUnchanged(
   }
 }
 
+/**
+ * Runs one bounded final cleanup epoch while the exact Home identity fence is
+ * held. Target writers either serialize before this epoch and change the
+ * expected generation, or fail closed while the epoch owns the lock.
+ */
+export async function withEphemeralDomainIdentityCleanupEpoch(
+  home: string,
+  token: string,
+  expectedDomainFingerprint: string | undefined,
+  action: () => void | PromiseLike<void>
+): Promise<EphemeralDomainIdentityEpochStatus> {
+  if (
+    typeof token !== "string"
+    || !/^[a-f0-9]{64}$/u.test(token)
+    || typeof expectedDomainFingerprint !== "string"
+    || expectedDomainFingerprint.length === 0
+  ) return "deferred";
+  const initial = readEphemeralDomainIdentity(home);
+  if (initial.status === "absent") return "absent";
+  if (!matchesEphemeralDomainGeneration(initial, token, expectedDomainFingerprint)) {
+    return "deferred";
+  }
+  let release: (() => void) | undefined;
+  try {
+    release = acquireEphemeralDomainIdentityLock(home);
+  } catch (error) {
+    if (error instanceof EphemeralDomainIdentityLockBusyError) return "deferred";
+    throw error;
+  }
+  try {
+    const current = readEphemeralDomainIdentity(home);
+    if (current.status === "absent") return "absent";
+    if (!matchesEphemeralDomainGeneration(current, token, expectedDomainFingerprint)) {
+      return "deferred";
+    }
+    await action();
+    return "completed";
+  } finally {
+    release();
+  }
+}
+
 export function domainIdentityPath(home: string): string {
   return join(resolve(home), CONTROLLER_DOMAIN_PATH);
+}
+
+/** The durable generation used by RuntimeDomainFact and cleanup CAS checks. */
+export function ephemeralDomainFingerprint(
+  identity: EphemeralDomainIdentity,
+  fileFingerprint: string | undefined
+): string {
+  validateEphemeralDomainIdentity(identity);
+  return [
+    identity.token,
+    identity.hostPid,
+    identity.hostProcessStartIdentity,
+    identity.tmuxServer,
+    [...identity.tmuxTargets].sort().join(","),
+    fileFingerprint ?? ""
+  ].join(":");
 }
 
 export function readLinuxProcessStartIdentity(pid: number): string | undefined {
@@ -403,6 +463,17 @@ function isNodeCode(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;
 }
 
+function matchesEphemeralDomainGeneration(
+  current: DomainIdentityRead,
+  token: string,
+  expectedDomainFingerprint: string
+): boolean {
+  return current.status === "valid"
+    && current.identity?.token === token
+    && ephemeralDomainFingerprint(current.identity, current.fingerprint)
+      === expectedDomainFingerprint;
+}
+
 class EphemeralDomainIdentityLockBusyError extends Error {
   constructor(lockPath: string) {
     super(`Ephemeral domain identity fence is busy: ${lockPath}.`);
@@ -417,6 +488,15 @@ type EphemeralDomainIdentityLockOwner = Readonly<{
 }>;
 
 function withEphemeralDomainIdentityLock<T>(home: string, action: () => T): T {
+  const release = acquireEphemeralDomainIdentityLock(home);
+  try {
+    return action();
+  } finally {
+    release();
+  }
+}
+
+function acquireEphemeralDomainIdentityLock(home: string): () => void {
   const lockPath = domainIdentityLockPath(home);
   const directory = dirname(lockPath);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -452,12 +532,10 @@ function withEphemeralDomainIdentityLock<T>(home: string, action: () => T): T {
   if (fileDescriptor === undefined) {
     throw new EphemeralDomainIdentityLockBusyError(lockPath);
   }
-  try {
-    return action();
-  } finally {
+  return () => {
     closeSync(fileDescriptor);
     releaseEphemeralDomainIdentityLock(lockPath, owner);
-  }
+  };
 }
 
 function domainIdentityLockPath(home: string): string {

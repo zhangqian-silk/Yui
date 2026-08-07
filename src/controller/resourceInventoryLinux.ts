@@ -36,6 +36,7 @@ import {
 import {
   CONTROLLER_DOMAIN_PATH,
   EPHEMERAL_DOMAIN_GRACE_MS,
+  ephemeralDomainFingerprint,
   readEphemeralDomainIdentity,
   readLinuxProcessStartIdentity
 } from "./domainIdentity.js";
@@ -464,7 +465,7 @@ function inspectRuntimeDomain(
       liveness: "unknown",
       disposition: "review",
       reasonCode: "invalid-domain-tmux-server",
-      fingerprint: domainFingerprint(identity, stored.fingerprint),
+      fingerprint: ephemeralDomainFingerprint(identity, stored.fingerprint),
       hostPid: identity.hostPid,
       hostProcessStartIdentity: identity.hostProcessStartIdentity,
       token: identity.token,
@@ -485,7 +486,7 @@ function inspectRuntimeDomain(
       liveness: "active",
       disposition: "protected",
       reasonCode: "ephemeral-host-active",
-      fingerprint: domainFingerprint(identity, stored.fingerprint),
+      fingerprint: ephemeralDomainFingerprint(identity, stored.fingerprint),
       hostPid: identity.hostPid,
       hostProcessStartIdentity: identity.hostProcessStartIdentity,
       token: identity.token,
@@ -510,7 +511,7 @@ function inspectRuntimeDomain(
       liveness: hostActive ? "active" : "expired",
       disposition: "review",
       reasonCode: `ephemeral-storage-${storageStatus}`,
-      fingerprint: domainFingerprint(identity, stored.fingerprint),
+      fingerprint: ephemeralDomainFingerprint(identity, stored.fingerprint),
       hostPid: identity.hostPid,
       hostProcessStartIdentity: identity.hostProcessStartIdentity,
       token: identity.token,
@@ -527,7 +528,7 @@ function inspectRuntimeDomain(
       liveness: "expired",
       disposition: "protected",
       reasonCode: "ephemeral-active-task-role",
-      fingerprint: domainFingerprint(identity, stored.fingerprint),
+      fingerprint: ephemeralDomainFingerprint(identity, stored.fingerprint),
       hostPid: identity.hostPid,
       hostProcessStartIdentity: identity.hostProcessStartIdentity,
       token: identity.token,
@@ -544,7 +545,7 @@ function inspectRuntimeDomain(
       liveness: "expired",
       disposition: "review",
       reasonCode: "ephemeral-host-identity-unavailable",
-      fingerprint: domainFingerprint(identity, stored.fingerprint),
+      fingerprint: ephemeralDomainFingerprint(identity, stored.fingerprint),
       hostPid: identity.hostPid,
       hostProcessStartIdentity: identity.hostProcessStartIdentity,
       token: identity.token,
@@ -563,7 +564,7 @@ function inspectRuntimeDomain(
       reasonCode: hostStartIdentity === undefined
         ? "ephemeral-host-identity-unavailable"
         : "ephemeral-host-grace",
-      fingerprint: domainFingerprint(identity, stored.fingerprint),
+      fingerprint: ephemeralDomainFingerprint(identity, stored.fingerprint),
       hostPid: identity.hostPid,
       hostProcessStartIdentity: identity.hostProcessStartIdentity,
       token: identity.token,
@@ -581,7 +582,7 @@ function inspectRuntimeDomain(
     reasonCode: hostStartIdentity === undefined
       ? "ephemeral-host-dead"
       : "ephemeral-host-identity-mismatch",
-    fingerprint: domainFingerprint(identity, stored.fingerprint),
+    fingerprint: ephemeralDomainFingerprint(identity, stored.fingerprint),
     hostPid: identity.hostPid,
     hostProcessStartIdentity: identity.hostProcessStartIdentity,
     token: identity.token,
@@ -591,26 +592,6 @@ function inspectRuntimeDomain(
     ageMs,
     graceMs: EPHEMERAL_DOMAIN_GRACE_MS
   };
-}
-
-function domainFingerprint(
-  identity: Readonly<{
-    token: string;
-    hostPid: number;
-    hostProcessStartIdentity: string;
-    tmuxServer: string;
-    tmuxTargets: readonly string[];
-  }>,
-  fileFingerprint: string | undefined
-): string {
-  return [
-    identity.token,
-    identity.hostPid,
-    identity.hostProcessStartIdentity,
-    identity.tmuxServer,
-    [...identity.tmuxTargets].sort().join(","),
-    fileFingerprint ?? ""
-  ].join(":");
 }
 
 function loadHomeState(
