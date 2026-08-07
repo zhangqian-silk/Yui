@@ -10,7 +10,8 @@ import {
   CONTROLLER_DOMAIN_PATH,
   domainIdentityPath,
   removeEphemeralDomainIdentityIfUnchanged,
-  readEphemeralDomainIdentity
+  readEphemeralDomainIdentity,
+  withEphemeralDomainIdentityCleanupEpoch
 } from "./domainIdentity.js";
 
 const DEFAULT_TERM_GRACE_MS = 1_000;
@@ -26,6 +27,8 @@ export type ControllerCleanupPorts = Readonly<{
   removeArtifact(path: string): void;
   killPane(resource: RuntimeResource): Promise<void>;
   inspectTmuxServerPanes(resource: RuntimeResource): Promise<readonly string[]>;
+  /** Test-only scheduling seam for a deterministic final-epoch race. */
+  beforeDomainCleanupEpoch?(resource: RuntimeResource): void;
 }>;
 
 export type ControllerResourceCleanupOptions = Readonly<{
@@ -46,63 +49,88 @@ export async function cleanControllerResource(
   assertEphemeralDomainFence(resource);
   const environment = options.environment ?? process.env;
   const ports = options.ports ?? linuxCleanupPorts(environment);
-  if (resource.artifact !== undefined) {
-    cleanArtifact(resource, ports);
-    return;
-  }
-  if (resource.kind === "agent-session") {
+  const cleanup = async (): Promise<void> => {
+    if (resource.artifact !== undefined) {
+      cleanArtifact(resource, ports);
+      return;
+    }
+    if (resource.kind === "agent-session") {
+      assertProcessIdentities(resource, ports);
+      await ports.killPane(resource);
+      return;
+    }
+    if (resource.processes.length === 0) {
+      throw new Error(`Resource has no cleanup target: ${resource.id}.`);
+    }
+    if (resource.kind === "tmux-server") {
+      const panes = await ports.inspectTmuxServerPanes(resource);
+      if (panes.length > 0) {
+        throw new Error(
+          `Tmux server still owns Role panes: ${panes.join(", ")}.`
+        );
+      }
+      // Close the small inspect-to-signal race without inventing a wait or
+      // broad process-name rule. A target appearing on the second exact query
+      // keeps the server protected for the next bounded pass.
+      const recheckedPanes = await ports.inspectTmuxServerPanes(resource);
+      if (recheckedPanes.length > 0) {
+        throw new Error(
+          `Tmux server still owns Role panes: ${recheckedPanes.join(", ")}.`
+        );
+      }
+    }
     assertProcessIdentities(resource, ports);
-    await ports.killPane(resource);
+    for (const process of [...resource.processes].reverse()) {
+      signalIfOwned(process.pid, process.startIdentity, "SIGTERM", ports);
+    }
+    const termGraceMs = positiveDuration(
+      options.termGraceMs,
+      DEFAULT_TERM_GRACE_MS,
+      "termGraceMs"
+    );
+    const killGraceMs = positiveDuration(
+      options.killGraceMs,
+      DEFAULT_KILL_GRACE_MS,
+      "killGraceMs"
+    );
+    const pollMs = positiveDuration(options.pollMs, DEFAULT_POLL_MS, "pollMs");
+    await waitForProcesses(resource, ports, termGraceMs, pollMs);
+    for (const process of [...resource.processes].reverse()) {
+      signalIfOwned(process.pid, process.startIdentity, "SIGKILL", ports);
+    }
+    await waitForProcesses(resource, ports, killGraceMs, pollMs);
+    const remaining = resource.processes.filter((process) => (
+      ports.processStartIdentity(process.pid) === process.startIdentity
+    ));
+    if (remaining.length > 0) {
+      throw new Error(
+        `Resource processes did not stop: ${remaining.map(({ pid }) => pid).join(", ")}.`
+      );
+    }
+  };
+  const domain = resource.domain;
+  if (
+    resource.artifact === undefined
+    && domain?.kind === "ephemeral-test"
+  ) {
+    const home = resource.yuiHome;
+    const token = domain.token;
+    if (home === undefined || token === undefined) {
+      throw new Error(`Ephemeral domain identity is unavailable: ${resource.id}.`);
+    }
+    ports.beforeDomainCleanupEpoch?.(resource);
+    const epoch = await withEphemeralDomainIdentityCleanupEpoch(
+      home,
+      token,
+      domain.fingerprint,
+      cleanup
+    );
+    if (epoch !== "completed") {
+      throw new Error(`Resource changed since scan: ${resource.id}.`);
+    }
     return;
   }
-  if (resource.processes.length === 0) {
-    throw new Error(`Resource has no cleanup target: ${resource.id}.`);
-  }
-  if (resource.kind === "tmux-server") {
-    const panes = await ports.inspectTmuxServerPanes(resource);
-    if (panes.length > 0) {
-      throw new Error(
-        `Tmux server still owns Role panes: ${panes.join(", ")}.`
-      );
-    }
-    // Close the small inspect-to-signal race without inventing a wait or
-    // broad process-name rule. A target appearing on the second exact query
-    // keeps the server protected for the next bounded pass.
-    const recheckedPanes = await ports.inspectTmuxServerPanes(resource);
-    if (recheckedPanes.length > 0) {
-      throw new Error(
-        `Tmux server still owns Role panes: ${recheckedPanes.join(", ")}.`
-      );
-    }
-  }
-  assertProcessIdentities(resource, ports);
-  for (const process of [...resource.processes].reverse()) {
-    signalIfOwned(process.pid, process.startIdentity, "SIGTERM", ports);
-  }
-  const termGraceMs = positiveDuration(
-    options.termGraceMs,
-    DEFAULT_TERM_GRACE_MS,
-    "termGraceMs"
-  );
-  const killGraceMs = positiveDuration(
-    options.killGraceMs,
-    DEFAULT_KILL_GRACE_MS,
-    "killGraceMs"
-  );
-  const pollMs = positiveDuration(options.pollMs, DEFAULT_POLL_MS, "pollMs");
-  await waitForProcesses(resource, ports, termGraceMs, pollMs);
-  for (const process of [...resource.processes].reverse()) {
-    signalIfOwned(process.pid, process.startIdentity, "SIGKILL", ports);
-  }
-  await waitForProcesses(resource, ports, killGraceMs, pollMs);
-  const remaining = resource.processes.filter((process) => (
-    ports.processStartIdentity(process.pid) === process.startIdentity
-  ));
-  if (remaining.length > 0) {
-    throw new Error(
-      `Resource processes did not stop: ${remaining.map(({ pid }) => pid).join(", ")}.`
-    );
-  }
+  await cleanup();
 }
 
 function assertEphemeralDomainFence(resource: RuntimeResource): void {
