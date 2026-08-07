@@ -2,13 +2,9 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
-  mkdirSync,
-  mkdtempSync,
   readFileSync,
-  rmSync,
   writeFileSync
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
@@ -17,6 +13,7 @@ import {
   dispatchPreparedReviewRound,
   runTaskCommand
 } from "../dist/commands/taskCommands.js";
+import { readEphemeralDomainIdentity } from "../dist/controller/domainIdentity.js";
 import { FileSchedulerStoreAdapter } from "../dist/controller/fileSchedulerStoreAdapter.js";
 import { FileRuntimeEventInbox } from "../dist/controller/runtimeEventInbox.js";
 import { runSessionNotifyCommand } from "../dist/controller/sessionNotify.js";
@@ -36,34 +33,35 @@ import { ensureStorageSchema } from "../dist/storage/storageSchema.js";
 import { FileTaskStore, STORAGE_STATE_FILE } from "../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../dist/task/task.js";
 import { createYuiWebServer } from "../dist/web/webServer.js";
+import { createIsolatedRuntime } from "./helpers/isolatedRuntime.js";
 
 const START = new Date("2026-08-02T08:00:00.000Z");
 
 test("isolated multi-Task identity workflow keeps local ids qualified end to end", async (t) => {
   const requestedRoot = process.env.YUI_IDENTITY_E2E_ROOT;
-  const root = requestedRoot === undefined
-    ? mkdtempSync(join(tmpdir(), "yui-task-identity-e2e-"))
-    : resolve(requestedRoot);
+  const requestedRootPath = requestedRoot === undefined ? undefined : resolve(requestedRoot);
   if (requestedRoot !== undefined) {
-    assert.equal(existsSync(root), false, `E2E artifact root already exists: ${root}`);
-    mkdirSync(root, { recursive: true });
+    assert.equal(
+      existsSync(requestedRootPath),
+      false,
+      `E2E artifact root already exists: ${requestedRootPath}`
+    );
   }
-
-  const home = join(root, "yui-home");
-  t.after(() => {
-    if (existsSync(join(home, "runtime", "controller.json"))) {
-      execFileSync(
-        process.execPath,
-        [join(process.cwd(), "dist", "cli.js"), "controller", "stop"],
-        { env: isolatedCliEnvironment(home), stdio: "ignore" }
-      );
-    }
-    if (requestedRoot === undefined) rmSync(root, { recursive: true, force: true });
+  const runtime = createIsolatedRuntime(t, {
+    ...(requestedRootPath === undefined ? {} : { root: requestedRootPath })
   });
+  const { root, home } = runtime;
   assert.notEqual(resolve(process.env.YUI_HOME ?? join(root, "unconfigured")), resolve(home));
   const primaryRepository = initializeFixtureRepository(root, "primary-repository");
   const secondaryRepository = initializeFixtureRepository(root, "secondary-repository");
   ensureStorageSchema(home, START);
+  await runtime.startController();
+  const domain = readEphemeralDomainIdentity(home);
+  assert.equal(domain.status, "valid");
+  assert.equal(domain.identity.token, runtime.identity.token);
+  assert.equal(runtime.environment.YUI_HOME, home);
+  assert.equal(runtime.environment.YUI_EPHEMERAL_TOKEN, runtime.identity.token);
+  assert.equal(runtime.environment.YUI_EPHEMERAL_TMUX_SERVER, runtime.identity.tmuxServer);
   const store = new FileTaskStore(home);
   const agent = createConfiguredAgent("codex", "codex", "codex", [], [], START);
   const binding = createRoleAgentBinding(agent);
@@ -143,9 +141,9 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
     ));
   });
 
-  const runtime = noOpRuntime();
-  const primaryLeader = commandOptions(primaryTask.id, "leader", runtime, 1);
-  const lifecycleLeader = commandOptions(lifecycleTask.id, "leader", runtime, 1);
+  const commandRuntime = noOpRuntime();
+  const primaryLeader = commandOptions(primaryTask.id, "leader", commandRuntime, 1);
+  const lifecycleLeader = commandOptions(lifecycleTask.id, "leader", commandRuntime, 1);
   const primaryWork = runTaskCommand([
     "work", "create", primaryTask.id, "Implement qualified references",
     "--role", "worker",
@@ -182,11 +180,11 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
     }
   });
   const isolated = await coordinator.isolateWorkItem(primaryTask.id, primaryWork.id);
-  const isolateResult = runCliJson(home, [
+  const isolateResult = runCliJson(runtime, [
     "task", "work", "isolate", `${primaryTask.id}/${primaryWork.id}`
   ]);
   assert.equal(isolateResult.data.workspace.root, isolated.root);
-  runCliJson(home, ["controller", "stop"]);
+  runCliJson(runtime, ["controller", "stop"]);
   await preparer.prepareTaskWorkspace(lifecycleTask.id);
 
   const scheduler = new FileSchedulerStoreAdapter(store);
@@ -211,7 +209,7 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
     "--choice", "yes=Proceed",
     "--blocks", `run:${firstLeaderRun.id}`
   ], store, {
-    ...commandOptions(primaryTask.id, "leader", runtime, 5),
+    ...commandOptions(primaryTask.id, "leader", commandRuntime, 5),
     environment: {
       YUI_SESSION_SCOPE: "task",
       YUI_TASK_ID: primaryTask.id,
@@ -224,23 +222,23 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   assert.equal(request.id, "input-1");
   assert.equal(request.requester.taskId, primaryTask.id);
 
-  const answerResult = runCliJson(home, [
+  const answerResult = runCliJson(runtime, [
     "task", "input", "answer", `${primaryTask.id}/${request.id}`,
     "--choice", "yes"
   ]);
   assert.equal(answerResult.data.request.status, "answered");
-  runCliJson(home, ["controller", "stop"]);
+  runCliJson(runtime, ["controller", "stop"]);
   const postAnswerNow = new Date();
   const postAnswerLeader = { ...primaryLeader, now: () => postAnswerNow };
   const postAnswerWorker = {
-    ...commandOptions(primaryTask.id, "worker", runtime, 9),
+    ...commandOptions(primaryTask.id, "worker", commandRuntime, 9),
     now: () => postAnswerNow
   };
   const postAnswerReviewer = {
-    ...commandOptions(primaryTask.id, "reviewer", runtime, 12),
+    ...commandOptions(primaryTask.id, "reviewer", commandRuntime, 12),
     now: () => postAnswerNow
   };
-  const cliInputDetail = runCliJson(home, [
+  const cliInputDetail = runCliJson(runtime, [
     "task", "input", "show", `${primaryTask.id}/${request.id}`
   ]);
   assert.equal(cliInputDetail.ok, true);
@@ -274,6 +272,7 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   await runSessionNotifyCommand(
     hookPayload,
     {
+      ...runtime.environment,
       YUI_HOME: home,
       YUI_SESSION_SCOPE: "task",
       YUI_TASK_ID: primaryTask.id,
@@ -368,28 +367,28 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   assert.notEqual(reviewWorkspace.root, isolated.root);
   assert.equal(await coordinator.cleanupReviewRound(primaryTask.id, review.id), "removed");
 
-  const captureResult = runCliJson(home, [
+  const captureResult = runCliJson(runtime, [
     "task", "work", "capture", `${primaryTask.id}/${primaryWork.id}`
   ]);
   const [changeSet] = captureResult.data.changeSets;
   assert.equal(changeSet.id, "change-set-1");
-  const integrationResult = runCliJson(home, [
+  const integrationResult = runCliJson(runtime, [
     "task", "integration", "start", primaryTask.id,
     "--project", primaryProject.id,
     "--change-set", changeSet.id
   ]).data;
   assert.equal(integrationResult.status, "committed");
   assert.equal(integrationResult.attempt.id, "integration-1");
-  const acceptResult = runCliJson(home, [
+  const acceptResult = runCliJson(runtime, [
     "task", "work", "accept", `${primaryTask.id}/${primaryWork.id}`,
     "--summary", "Leader accepted reviewed and integrated output."
-  ], leaderCliEnvironment(home, primaryTask.id));
+  ], leaderCliEnvironment(runtime, primaryTask.id));
   assert.equal(acceptResult.data.workItem.status, "completed");
   assert.equal(store.getWorkItem(primaryTask.id, primaryWork.id).status, "completed");
   await coordinator.runtime.stopTaskRoleSessions(primaryTask.id, ["worker"]);
-  const cleanupResult = runCliJson(home, [
+  const cleanupResult = runCliJson(runtime, [
     "task", "work", "cleanup", `${primaryTask.id}/${primaryWork.id}`, "--integrated"
-  ]);
+  ], leaderCliEnvironment(runtime, primaryTask.id));
   const workItemCleanup = cleanupResult.data.worktree.removal;
   assert.equal(workItemCleanup, "removed");
   assert.equal(
@@ -397,7 +396,7 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
     "integrated"
   );
 
-  runCliJson(home, ["controller", "stop"]);
+  runCliJson(runtime, ["controller", "stop"]);
   const lifecycleNow = new Date();
   const lifecycleLeaderNow = { ...lifecycleLeader, now: () => lifecycleNow };
   let lifecycleControlRun = store.getActiveAgentRun(lifecycleTask.id, "leader");
@@ -445,10 +444,10 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   runTaskCommand([
     "complete", lifecycleTask.id, "--summary", "Second lifecycle pass complete."
   ], store, lifecycleLeaderNow);
-  runCliJson(home, [
+  runCliJson(runtime, [
     "task", "archive", lifecycleTask.id, "--abandon"
-  ], operatorCliEnvironment(home));
-  runCliJson(home, ["controller", "stop"]);
+  ], operatorCliEnvironment(runtime));
+  runCliJson(runtime, ["controller", "stop"]);
   const finalSettlementNow = new Date();
   let finalPrimaryControlRun = store.getActiveAgentRun(primaryTask.id, "leader");
   if (finalPrimaryControlRun !== null && finalPrimaryControlRun.pushedAt === undefined) {
@@ -495,6 +494,7 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   const report = {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
+    requestedRoot: requestedRootPath ?? null,
     isolatedHome: home,
     fixtureRepositories: [
       repositoryEvidence(primaryRepository),
@@ -642,7 +642,8 @@ function noOpRuntime() {
   };
 }
 
-function runCliJson(home, args, environment = isolatedCliEnvironment(home)) {
+function runCliJson(runtimeOrHome, args, environment = isolatedCliEnvironment(runtimeOrHome)) {
+  const home = typeof runtimeOrHome === "string" ? runtimeOrHome : runtimeOrHome.home;
   const result = JSON.parse(execFileSync(
     process.execPath,
     [join(process.cwd(), "dist", "cli.js"), "--json", ...args],
@@ -652,8 +653,10 @@ function runCliJson(home, args, environment = isolatedCliEnvironment(home)) {
   return result;
 }
 
-function isolatedCliEnvironment(home) {
-  const environment = { ...process.env, YUI_HOME: home };
+function isolatedCliEnvironment(runtimeOrHome) {
+  const home = typeof runtimeOrHome === "string" ? runtimeOrHome : runtimeOrHome.home;
+  const source = typeof runtimeOrHome === "string" ? process.env : runtimeOrHome.environment;
+  const environment = { ...source, YUI_HOME: home };
   for (const name of [
     "YUI_SESSION_SCOPE",
     "YUI_TASK_ID",
@@ -666,18 +669,18 @@ function isolatedCliEnvironment(home) {
   return environment;
 }
 
-function leaderCliEnvironment(home, taskId) {
+function leaderCliEnvironment(runtimeOrHome, taskId) {
   return {
-    ...isolatedCliEnvironment(home),
+    ...isolatedCliEnvironment(runtimeOrHome),
     YUI_SESSION_SCOPE: "task",
     YUI_TASK_ID: taskId,
     YUI_ROLE: "leader"
   };
 }
 
-function operatorCliEnvironment(home) {
+function operatorCliEnvironment(runtimeOrHome) {
   return {
-    ...isolatedCliEnvironment(home),
+    ...isolatedCliEnvironment(runtimeOrHome),
     YUI_SESSION_SCOPE: "global",
     YUI_ROLE: "operator"
   };

@@ -38,6 +38,7 @@ export function createIsolatedRuntime(testContext, options = {}) {
   const root = requestedRoot === undefined
     ? mkdtempSync(join(tmpdir(), "yui-isolated-runtime-"))
     : requestedRoot;
+  const retainRoot = options.retainRoot ?? requestedRoot !== undefined;
   if (requestedRoot !== undefined) assert.equal(existsSync(root), false);
   const home = join(root, "yui-home");
   const tmuxServer = yuiTmuxServerName(home);
@@ -281,7 +282,11 @@ export function createIsolatedRuntime(testContext, options = {}) {
       }
 
       if (failure === undefined) {
-        rmSync(root, { recursive: true, force: true });
+        // An explicitly supplied root is a diagnostic boundary: clean the
+        // marked runtime resources and identity, but retain that exact root
+        // for the caller to inspect. Automatically allocated roots remain
+        // disposable.
+        if (!retainRoot) rmSync(root, { recursive: true, force: true });
         closed = true;
         tearingDown = false;
       } else {
