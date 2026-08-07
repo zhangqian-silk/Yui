@@ -438,6 +438,41 @@ test("full liveness inventory includes delivery-uncertain Runs for the shared st
   assert.equal(store.savedExitedRuns.length, 0);
 });
 
+test("cheap liveness shares one pane inventory while resource inputs stay behind the ten-minute gate", async () => {
+  const store = fakeStore();
+  const youngRole = role("worker");
+  const oldRole = { ...role("worker-2"), name: "worker-2", activeAgentId: "codex-worker-2" };
+  store.roles.push(youngRole, oldRole);
+  store.activeRuns.set(key("task-1", youngRole.name), {
+    ...activeRun("agent-run-101", youngRole.name),
+    deliveredAt: new Date(NOW.getTime() - 5 * 60_000).toISOString()
+  });
+  store.activeRuns.set(key("task-1", oldRole.name), {
+    ...activeRun("agent-run-102", oldRole.name),
+    deliveredAt: new Date(NOW.getTime() - 11 * 60_000).toISOString()
+  });
+  let paneInventories = 0;
+  let resourceInputs;
+  const delivery = {
+    async inspectRole() { throw new Error("single-Run probing is not allowed"); },
+    async inspectRoles(inputs, requested) {
+      paneInventories += 1;
+      assert.equal(inputs.length, 2);
+      resourceInputs = requested;
+      return inputs.map((input) => ({
+        taskId: input.taskId,
+        roleName: input.roleName,
+        status: "present"
+      }));
+    }
+  };
+
+  assert.deepEqual(await reconcileExitedRoleRuns(store, delivery, NOW), []);
+  assert.equal(paneInventories, 1);
+  assert.deepEqual(resourceInputs.map(({ runId }) => runId), ["agent-run-102"]);
+  assert.equal(store.savedExitedRuns.length, 0);
+});
+
 test("a delivery-uncertain local Run id does not fence another Task", async () => {
   const store = fakeStore();
   store.roles.push(role("worker"));

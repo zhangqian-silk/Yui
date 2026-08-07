@@ -137,7 +137,9 @@ export function projectRoleRunHealth(input: Readonly<{
   const resourceActivity = hostLiveness === "present"
     && nativeSession === "matching"
     && resourceEvidenceIsFresh(input.resource, input.now, windowMs)
-    && (input.resource?.active === true || input.resource?.changed === true);
+    // Residency/RSS and an unchanged cumulative counter are not progress.
+    && input.resource?.active === true
+    && input.resource?.changed === true;
   const waitingUser = input.waitingUser === true;
   const waitingOnWorkers = input.waitingOnWorkers === true && !input.staleLeaderMailbox;
   // A TmuxSessionHost binding may intentionally be opaque and therefore have
@@ -572,12 +574,28 @@ export async function reconcileStalledRoleRuns(
       statuses = await delivery.inspectRoles(stallCandidates.map(({ task, role, run, session }) => ({
           taskId: task.id,
           roleName: role.name,
+          runId: run.id,
           agentId: session?.agentId ?? run.effective.agentId,
           adapterId: session?.adapterId ?? run.effective.adapterId,
+          ...(session?.launchId === undefined ? {} : { launchId: session.launchId }),
           ...(session?.nativeSessionId === undefined
-            ? {}
-            : { nativeSessionId: session.nativeSessionId })
-        })));
+              ? {}
+              : { nativeSessionId: session.nativeSessionId })
+        })), stallCandidates.flatMap(({ task, role, run, session }) => (
+          run.deliveredAt === undefined
+            ? []
+            : [{
+                taskId: task.id,
+                roleName: role.name,
+                runId: run.id,
+                agentId: session?.agentId ?? run.effective.agentId,
+                adapterId: session?.adapterId ?? run.effective.adapterId,
+                ...(session?.launchId === undefined ? {} : { launchId: session.launchId }),
+                ...(session?.nativeSessionId === undefined
+                  ? {}
+                  : { nativeSessionId: session.nativeSessionId })
+              }]
+        )));
     } catch {
       // Health inspection is advisory. Unknown host state must leave the exact
       // Run/Session fence untouched and let the next full pass retry.
@@ -984,7 +1002,7 @@ async function consumeResourceEvidence(
 ): Promise<RoleRunResourceEvidence | undefined> {
   const resource = resourceForRun(snapshot, taskId, roleName, runId);
   if (resource === undefined) return undefined;
-  if (resource.active !== true && resource.changed !== true) return resource;
+  if (resource.active !== true || resource.changed !== true) return resource;
   const key = `${taskId}\0${roleName}\0${runId}\0${progressAt}`;
   if (store.recordRoleRunResourceSuppression !== undefined) {
     const persisted = store.recordRoleRunResourceSuppression({

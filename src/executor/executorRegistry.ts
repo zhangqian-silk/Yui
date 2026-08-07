@@ -3,6 +3,7 @@ import type {
   PreparedRoleDelivery,
   ReadyRoleDelivery,
   RoleSessionLaunchMode,
+  SchedulerRoleResourceInput,
   SchedulerRoleResourceEntry,
   SchedulerRoleSession,
   TmuxDeliveryPort
@@ -98,7 +99,8 @@ export type ExecutorRuntimePorts = Readonly<{
   launchCoordinator?: RuntimeLaunchPreparationPort;
   /** One advisory resource sample produced alongside the full Role inventory. */
   roleResourceInventory?: (
-    panes: readonly TmuxRolePaneState[]
+    panes: readonly TmuxRolePaneState[],
+    inputs: readonly SchedulerRoleResourceInput[]
   ) => Promise<readonly SchedulerRoleResourceEntry[]>;
 }>;
 
@@ -372,7 +374,9 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     agentId: string;
     adapterId: string;
     nativeSessionId?: string;
-  }>[]): Promise<readonly Readonly<{
+    runId?: string;
+    launchId?: string;
+  }>[], resourceInputs?: readonly SchedulerRoleResourceInput[]): Promise<readonly Readonly<{
     taskId: string;
     roleName: string;
     status: "present" | "absent";
@@ -392,9 +396,23 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       ? this.tmux.inspectRolePaneInventory!()
       : await this.tmux.inspectRolePaneInventoryAsync();
     let resources = new Map<string, SchedulerRoleResourceEntry["resource"]>();
-    if (this.runtimePorts?.roleResourceInventory !== undefined) {
+    const requested = resourceInputs ?? inputs.map((input) => ({
+      taskId: input.taskId,
+      roleName: input.roleName,
+      ...(input.runId === undefined ? {} : { runId: input.runId }),
+      agentId: input.agentId,
+      adapterId: input.adapterId,
+      ...(input.nativeSessionId === undefined
+        ? {}
+        : { nativeSessionId: input.nativeSessionId }),
+      ...(input.launchId === undefined ? {} : { launchId: input.launchId })
+    }));
+    if (
+      this.runtimePorts?.roleResourceInventory !== undefined
+      && requested.length > 0
+    ) {
       try {
-        for (const entry of await this.runtimePorts.roleResourceInventory(inventory)) {
+        for (const entry of await this.runtimePorts.roleResourceInventory(inventory, requested)) {
           const key = `${entry.taskId}\0${entry.roleName}`;
           if (!resources.has(key)) resources.set(key, entry.resource);
         }

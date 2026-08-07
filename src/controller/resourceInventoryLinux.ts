@@ -51,6 +51,11 @@ type LinuxProcessStat = Readonly<{
   ageMs: number;
 }>;
 
+type LinuxProcessIo = Readonly<{
+  ioReadBytes: number;
+  ioWriteBytes: number;
+}>;
+
 export async function scanControllerResourceInventory(
   options: ControllerInventoryScanOptions
 ): Promise<ControllerResourceInventory> {
@@ -246,6 +251,7 @@ function listLinuxProcesses(warnings: string[]): RuntimeProcessFact[] {
       const args = splitNullDelimited(readFileSync(`/proc/${pid}/cmdline`));
       const command = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
       const yuiHome = readYuiHome(pid);
+      const io = readProcessIo(pid);
       return [{
         pid,
         ppid: parsed.ppid,
@@ -257,6 +263,7 @@ function listLinuxProcesses(warnings: string[]): RuntimeProcessFact[] {
         args,
         rssBytes: parseStatusNumber(status, "VmRSS", 0) * 1024,
         cpuTimeMs: parsed.cpuTimeMs,
+        ...(io === undefined ? {} : io),
         ageMs: parsed.ageMs
       }];
     } catch {
@@ -272,6 +279,28 @@ function readYuiHome(pid: number): string | undefined {
   const entry = environment.find((value) => value.startsWith("YUI_HOME="));
   const value = entry?.slice("YUI_HOME=".length);
   return value === undefined || value.length === 0 ? undefined : resolve(value);
+}
+
+function readProcessIo(pid: number): LinuxProcessIo | undefined {
+  try {
+    const contents = readFileSync(`/proc/${pid}/io`, "utf8");
+    const readBytes = parseOptionalIoCounter(contents, "read_bytes");
+    const writeBytes = parseOptionalIoCounter(contents, "write_bytes");
+    return readBytes === undefined || writeBytes === undefined
+      ? undefined
+      : { ioReadBytes: readBytes, ioWriteBytes: writeBytes };
+  } catch {
+    // /proc/<pid>/io can disappear or be restricted during a point-in-time scan.
+    // CPU/RSS inventory remains useful, but no IO activity is inferred.
+    return undefined;
+  }
+}
+
+function parseOptionalIoCounter(contents: string, label: string): number | undefined {
+  const match = new RegExp(`^${label}:\\s+([0-9]+)`, "mu").exec(contents);
+  if (match === null) return undefined;
+  const value = Number(match[1]);
+  return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
 function splitNullDelimited(value: Buffer): string[] {
@@ -405,13 +434,15 @@ function loadHomeState(
         roleName: role.name,
         agentId,
         ...(adapterId === undefined ? {} : { adapterId }),
-        ...(session === null ? {} : { nativeSessionId: session.nativeSessionId })
+        ...(session === null ? {} : { nativeSessionId: session.nativeSessionId }),
+        ...(session?.launchId === undefined ? {} : { launchId: session.launchId })
       };
     });
     for (const task of store.listTasks()) {
       for (const role of store.listRoles(task.id)) {
         const session = activeRoleAgentSession(store.getRoleSessionSet(task.id, role.name));
         const binding = role.agentBindings[role.activeAgentId];
+        const run = store.getActiveAgentRun(task.id, role.name);
         const agentId = session?.effective.agentId ?? role.activeAgentId;
         const adapterId = session?.effective.adapterId ?? binding?.adapterId;
         roles.push({
@@ -422,7 +453,9 @@ function loadHomeState(
           roleName: role.name,
           agentId,
           ...(adapterId === undefined ? {} : { adapterId }),
-          ...(session === null ? {} : { nativeSessionId: session.nativeSessionId })
+          ...(session === null ? {} : { nativeSessionId: session.nativeSessionId }),
+          ...(session?.launchId === undefined ? {} : { launchId: session.launchId }),
+          ...(run === null ? {} : { runId: run.id })
         });
       }
     }

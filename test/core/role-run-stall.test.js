@@ -122,6 +122,32 @@ test("resource activity cannot make an unknown host or native Session healthy", 
   assert.equal(projection.nativeSession, "missing");
 });
 
+test("RSS-only residency does not suppress a stale accepted Run", () => {
+  const projection = projectRoleRunHealth({
+    progressAt: PROGRESS,
+    createdAt: PROGRESS,
+    deliveredAt: PROGRESS,
+    now: NOW,
+    hostLiveness: "present",
+    nativeSession: {
+      status: "running",
+      nativeSessionId: "native-1"
+    },
+    providerAcceptance: "accepted",
+    resource: {
+      observedAt: "2026-08-05T00:59:30.000Z",
+      active: true,
+      changed: false,
+      cpuTimeMs: 99,
+      rssBytes: 1024 * 1024
+    },
+    roleName: "worker"
+  });
+
+  assert.equal(projection.resourceActivity, false);
+  assert.equal(projection.stalled, true);
+});
+
 test("an opaque SessionHost binding still routes a stalled accepted Run", async () => {
   const store = stallStore({ session: null });
   let inspected;

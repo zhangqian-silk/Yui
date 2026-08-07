@@ -2,12 +2,14 @@ import {
   selectedSchedulerRoles,
   selectedSchedulerTasks,
   type SchedulerReconcileSelection,
+  type SchedulerRoleResourceInput,
   type SchedulerRoleResourceEvidence,
   type SchedulerStorePort,
   type TmuxDeliveryPort
 } from "./ports.js";
 import { formatTaskRecordReference } from "../task/taskRecordReference.js";
 import { queueLeaderWakeup } from "./wakeupQueue.js";
+import { DEFAULT_EXECUTION_STALL_CANDIDATE_AGE_MS } from "./roleRunStall.js";
 
 export const EXITED_ROLE_RUN_SUMMARY = "The role's tmux session exited before the run yielded.";
 export type RoleLiveStatus = "present" | "absent";
@@ -45,6 +47,8 @@ export async function reconcileExitedRoleRuns(
           roleName: role.name,
           agentId: run.effective.agentId,
           adapterId: run.effective.adapterId,
+          runId: run.id,
+          ...(session?.launchId === undefined ? {} : { launchId: session.launchId }),
           ...(session?.nativeSessionId === undefined
             ? {}
             : { nativeSessionId: session.nativeSessionId })
@@ -71,7 +75,25 @@ export async function reconcileExitedRoleRuns(
         statuses: liveStatuses,
         resources: resourceEvidence ?? new Map<string, SchedulerRoleResourceEvidence>()
       }
-    : await inspectRoleStatuses(delivery, candidates);
+    : await inspectRoleStatuses(
+        delivery,
+        candidates,
+        candidates.flatMap(({ task, role, run, session }) => (
+          isResourceCandidate(task, run, now)
+            ? [{
+                taskId: task.id,
+                roleName: role.name,
+                runId: run.id,
+                agentId: run.effective.agentId,
+                adapterId: run.effective.adapterId,
+                ...(session?.nativeSessionId === undefined
+                  ? {}
+                  : { nativeSessionId: session.nativeSessionId }),
+                ...(session?.launchId === undefined ? {} : { launchId: session.launchId })
+              }]
+            : []
+        ))
+      );
   if (liveStatuses !== undefined) {
     for (const [key, status] of batchSnapshot.statuses) liveStatuses.set(key, status);
   }
@@ -129,7 +151,9 @@ type RoleRunCandidate = Readonly<{
     roleName: string;
     agentId: string;
     adapterId: string;
+    runId: string;
     nativeSessionId?: string;
+    launchId?: string;
   }>;
 }>;
 
@@ -140,11 +164,15 @@ type RoleInventorySnapshot = Readonly<{
 
 async function inspectRoleStatuses(
   delivery: Pick<TmuxDeliveryPort, "inspectRole" | "inspectRoles">,
-  candidates: readonly RoleRunCandidate[]
+  candidates: readonly RoleRunCandidate[],
+  resourceInputs: readonly SchedulerRoleResourceInput[]
 ): Promise<RoleInventorySnapshot> {
   if (delivery.inspectRoles !== undefined) {
     return exactBatchInventory(
-      await delivery.inspectRoles(candidates.map(({ inspection }) => inspection)),
+      await delivery.inspectRoles(
+        candidates.map(({ inspection }) => inspection),
+        resourceInputs
+      ),
       candidates
     );
   }
@@ -185,4 +213,17 @@ function exactBatchInventory(
     throw new Error("Tmux Role batch liveness snapshot is incomplete.");
   }
   return { statuses, resources };
+}
+
+function isResourceCandidate(
+  task: Readonly<{ status: string }>,
+  run: Readonly<{ status: string; deliveredAt?: string }>,
+  now: Date
+): boolean {
+  if (task.status !== "active" || run.status !== "active" || run.deliveredAt === undefined) {
+    return false;
+  }
+  const deliveredAt = Date.parse(run.deliveredAt);
+  return Number.isFinite(deliveredAt)
+    && now.getTime() - deliveredAt >= DEFAULT_EXECUTION_STALL_CANDIDATE_AGE_MS;
 }

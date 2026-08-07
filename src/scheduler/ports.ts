@@ -89,6 +89,17 @@ export type SchedulerRoleResourceEntry = Readonly<{
   resource: SchedulerRoleResourceEvidence;
 }>;
 
+/** Exact Role generation identity requested for one advisory resource sample. */
+export type SchedulerRoleResourceInput = Readonly<{
+  taskId: string;
+  roleName: string;
+  runId?: string;
+  agentId: string;
+  adapterId: string;
+  nativeSessionId?: string;
+  launchId?: string;
+}>;
+
 export type RoleRunProgressPersistence = Readonly<{
   taskId: string;
   roleName: string;
@@ -455,7 +466,9 @@ export interface TmuxDeliveryPort {
     agentId: string;
     adapterId: string;
     nativeSessionId?: string;
-  }>[]):
+    runId?: string;
+    launchId?: string;
+  }>[], resourceInputs?: readonly SchedulerRoleResourceInput[]):
     Promise<readonly Readonly<{
       taskId: string;
       roleName: string;
