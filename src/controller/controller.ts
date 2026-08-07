@@ -22,7 +22,8 @@ import type {
 import { reconcileExitedRoleRuns } from "../scheduler/roleRunLiveness.js";
 import {
   DEFAULT_STALL_WINDOW_MS,
-  reconcileStalledRoleRuns
+  reconcileStalledRoleRuns,
+  type RoleRunResourceEvidence
 } from "../scheduler/roleRunStall.js";
 import { repairOrphanedActiveTasks } from "../scheduler/activeTaskProgress.js";
 import {
@@ -136,7 +137,8 @@ export async function runControllerSchedulerPass(
   includeOperator = true,
   runtimeCleanupOutcomes: RuntimeCleanupOutcome[] = [],
   lifecycleHost?: RuntimeLifecycleHost,
-  stallWindowMs = DEFAULT_STALL_WINDOW_MS
+  stallWindowMs = DEFAULT_STALL_WINDOW_MS,
+  resourceSuppressionKeys: Set<string> = new Set()
 ): Promise<ControllerSchedulerResult> {
   const compiledSelection = compileReconcileSelection(scope);
   const selection = includeOperator
@@ -177,15 +179,26 @@ export async function runControllerSchedulerPass(
     )));
     resolveDueRuntimeTurnCompletions(store, delivery, selection, now);
     const liveStatuses = new Map<string, "present" | "absent">();
+    const resourceEvidence = new Map<string, RoleRunResourceEvidence>();
     const failedRunRefs = await reconcileExitedRoleRuns(
       store,
       delivery,
       now,
       roleSelection,
       unsettledRunRefs,
-      liveStatuses
+      liveStatuses,
+      resourceEvidence
     );
-    await reconcileStalledRoleRuns(store, delivery, now, roleSelection, stallWindowMs, liveStatuses);
+    await reconcileStalledRoleRuns(
+      store,
+      delivery,
+      now,
+      roleSelection,
+      stallWindowMs,
+      liveStatuses,
+      resourceEvidence,
+      resourceSuppressionKeys
+    );
     await reconcileDormantRuntimeOwners(
       store,
       delivery,
@@ -761,6 +774,8 @@ export class FileTaskController {
   readonly #deliveryRetryMs: number;
   readonly #deliveryRetryLimit: number;
   readonly #stallWindowMs: number;
+  /** Narrow-port fallback; FileSchedulerStoreAdapter durably records these keys. */
+  readonly #resourceSuppressionKeys = new Set<string>();
   readonly #runtimeEventProcessor: RuntimeEventProcessorPort | undefined;
   readonly #lifecycleHost:
     | RuntimeLifecycleHost
@@ -1033,7 +1048,8 @@ export class FileTaskController {
             false,
             runtimeCleanupOutcomes,
             this.#lifecycleHost,
-            this.#stallWindowMs
+            this.#stallWindowMs,
+            this.#resourceSuppressionKeys
           );
           const secondRuntimeDrain = this.#drainRuntimeEvents();
           this.#clearPassRetry();

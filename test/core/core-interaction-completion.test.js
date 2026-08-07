@@ -140,6 +140,7 @@ const PUBLIC_PATHS = [
   "task run",
   "task run list",
   "task run retry",
+  "task run recover",
   "task run yield",
   "task integration",
   "task integration start",

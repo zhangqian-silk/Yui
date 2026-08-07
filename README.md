@@ -158,8 +158,11 @@ own base ref. Yui exposes them under one Task workspace root:
 └── shared-sdk/
 ```
 
-Each Project directory is backed by its own managed Git worktree. The Leader
-starts at the root and sees the complete Task context. Create all known
+`<workspace>/tasks/<task-id>/main` is a logical multi-Project container, not a
+Git repository. Each Project child is the supported Git cwd (for example
+`<workspace>/tasks/<task-id>/main/yui`) and points to that Project's managed
+worktree at `<workspace>/worktree/<project>/<task-id>/main`. Run Git commands
+inside the relevant Project child. The Leader starts at the root and sees the complete Task context. Create all known
 bindings together, or let the active Task Leader add one when the same outcome
 expands:
 

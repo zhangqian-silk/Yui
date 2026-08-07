@@ -154,9 +154,12 @@ Task 可以绑定多个 Project，并为每个 Project 记录独立 base ref。L
 └── shared-sdk/
 ```
 
-每个目录背后都是该 Project 独立的受管 Git worktree。创建时应一次绑定已知
-Project；如果同一目标在执行中确认还需要另一个仓库，只能由 active Task 的
-Leader 追加：
+`<workspace>/tasks/<task-id>/main` 是逻辑上的多 Project 容器，不是 Git 仓库。
+每个 Project 子目录才是受支持的 Git cwd（例如
+`<workspace>/tasks/<task-id>/main/yui`），并指向该 Project 的受管 worktree：
+`<workspace>/worktree/<project>/<task-id>/main`。Git 命令必须在对应的
+Project 子目录中运行。创建时应一次绑定已知 Project；如果同一目标在执行中
+确认还需要另一个仓库，只能由 active Task 的 Leader 追加：
 
 ```sh
 yui task create "升级认证协议" \

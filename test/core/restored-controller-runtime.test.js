@@ -130,8 +130,25 @@ test("full controller liveness and stall phases reuse one Role inventory", async
   store.listRoles = () => [role];
   store.getRole = (_taskId, name) => name === role.name ? role : null;
   store.getActiveAgentRun = () => run;
+  store.getRoleSession = () => ({
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "native-1",
+    status: "running",
+    effective: run.effective
+  });
   store.listEvents = () => events;
-  store.recordRoleRunStall = () => "raised";
+  const newerProgressAt = new Date(60_000).toISOString();
+  events.push({
+    type: "run.progress",
+    createdAt: newerProgressAt,
+    payload: { runId: run.id, progressAt: newerProgressAt }
+  });
+  let stallRecords = 0;
+  store.recordRoleRunStall = () => {
+    stallRecords += 1;
+    return "raised";
+  };
   store.hasOpenInputRequest = () => false;
   store.getWorkMailbox = () => null;
   store.listPendingWakeups = () => [];
@@ -142,19 +159,66 @@ test("full controller liveness and stall phases reuse one Role inventory", async
       singleInspections += 1;
       return "present";
     },
-    async inspectRoles(inputs) {
+    async inspectRoles(inputs, requested) {
       inventoryCalls += 1;
+      assert.equal(requested.length, 1);
+      const resourceInput = requested[0];
+      assert.equal(resourceInput.progressAt, newerProgressAt);
       return inputs.map((input) => ({
         taskId: input.taskId,
         roleName: input.roleName,
-        status: "present"
+        status: "present",
+        resource: {
+          observedAt: new Date(31 * 60_000).toISOString(),
+          progressAt: resourceInput.progressAt,
+          identity: {
+            taskId: resourceInput.taskId,
+            roleName: resourceInput.roleName,
+            runId: resourceInput.runId,
+            agentId: resourceInput.agentId,
+            adapterId: resourceInput.adapterId,
+            nativeSessionId: resourceInput.nativeSessionId
+          },
+          active: true,
+          changed: true,
+          cpuTimeMs: 20,
+          rssBytes: 4096
+        }
       }));
     }
   };
 
-  await runControllerSchedulerPass(store, delivery, new Date(31 * 60_000));
+  const resourceSuppressionKeys = new Set();
+  await runControllerSchedulerPass(
+    store,
+    delivery,
+    new Date(31 * 60_000),
+    undefined,
+    { kind: "full" },
+    true,
+    [],
+    undefined,
+    30 * 60_000,
+    resourceSuppressionKeys
+  );
   assert.equal(inventoryCalls, 1);
   assert.equal(singleInspections, 0);
+  assert.equal(stallRecords, 0);
+
+  // The same advisory sample cannot keep the same stale Run healthy forever.
+  await runControllerSchedulerPass(
+    store,
+    delivery,
+    new Date(31 * 60_000),
+    undefined,
+    { kind: "full" },
+    true,
+    [],
+    undefined,
+    30 * 60_000,
+    resourceSuppressionKeys
+  );
+  assert.equal(stallRecords, 1);
 });
 
 test("a due native Turn completion forgets the finalized Run preparation", async () => {
