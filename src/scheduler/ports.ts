@@ -16,7 +16,10 @@ import type {
   WorkMailbox
 } from "../coordination/workMailbox.js";
 import type { PendingTurnCompletion } from "../executor/turnCompletion.js";
-import type { RuntimeRoleOwner } from "../runtime/lifecycleReservation.js";
+import type {
+  RuntimeLifecycleTarget,
+  RuntimeRoleOwner
+} from "../runtime/lifecycleReservation.js";
 import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import type { Task } from "../task/task.js";
 import type { TaskEvent } from "../event/taskEvent.js";
@@ -45,6 +48,8 @@ export type SchedulerRoleSession = Readonly<{
   agentId: string;
   adapterId: string;
   nativeSessionId?: string;
+  /** Exact external-process generation, when runtime coordination recorded it. */
+  launchId?: string;
   status: "reserved" | "ready" | "running" | "stopped" | "broken";
   effective: EffectiveLaunchSnapshot;
   /** Last durable session transition, when the adapter can expose it. */
@@ -243,6 +248,11 @@ export interface SchedulerStorePort {
     >,
     now: Date
   ): boolean;
+  /** Queues a durable exact-owner cleanup obligation for a Task Role runtime. */
+  enqueueRuntimeCleanup?(
+    owner: RuntimeRoleOwner,
+    now?: Date
+  ): RuntimeLifecycleTarget | null;
   /** Atomically clears one confirmed-absent reservation and stops its session fact. */
   completeStoppedRuntimeReservation?(
     target: Extract<

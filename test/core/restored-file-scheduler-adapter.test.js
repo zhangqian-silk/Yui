@@ -8,6 +8,7 @@ import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerSt
 import { runControllerSchedulerPass } from "../../dist/controller/controller.js";
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
 import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
+import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
 import { updateRoleAgentSessionStatus } from "../../dist/executor/agentExecutor.js";
@@ -2141,6 +2142,291 @@ test("confirmed Task and global runtime cleanup also stops their persisted sessi
   );
   assert.equal(store.getWorkMailbox(taskTarget), null);
   assert.equal(store.getWorkMailbox(globalTarget), null);
+});
+
+test("Task completion queues exact runtime cleanup without a completed-task wake", async (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  const launchId = "runtime-test:generation:completion";
+  adapter.recordRuntimeNativeSession({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    launchId,
+    nativeSessionId: "thread-completed"
+  }, now);
+
+  const completion = runTaskCommand([
+    "complete", task.id, "--summary", "Completed with runtime cleanup."
+  ], store, { now: () => now });
+  assert.equal(completion.kind, "output");
+  assert.equal(store.getTask(task.id).status, "completed");
+  assert.equal(store.getWorkMailbox({ kind: "task", taskId: task.id }), null);
+
+  const target = runtimeLifecycleTarget({
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  });
+  assert.equal(hasRuntimeCleanupObligation(store.getWorkMailbox(target)), true);
+  assert.equal(store.getRoleSession(task.id, role.name).nativeSessionId, "thread-completed");
+  assert.equal(store.getRoleSession(task.id, role.name).launchId, launchId);
+
+  const owners = [];
+  await runControllerSchedulerPass(
+    adapter,
+    {
+      async prepareRoleSession() { throw new Error("unexpected Leader wake"); },
+      async waitUntilReady() { throw new Error("unexpected Leader readiness"); },
+      async sendOnce() { throw new Error("unexpected Leader send"); },
+      async inspectRole() { return "present"; },
+      async stopTask() { return false; }
+    },
+    new Date(now.getTime() + 1),
+    undefined,
+    { kind: "full" },
+    false,
+    [],
+    {
+      async inspectOwner() { return { state: "running" }; },
+      async stopOwner(owner) {
+        owners.push(owner);
+        return true;
+      }
+    }
+  );
+
+  assert.deepEqual(owners, [{
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  }]);
+  const stopped = store.getRoleSession(task.id, role.name);
+  assert.equal(stopped.status, "stopped");
+  assert.equal(stopped.nativeSessionId, "thread-completed");
+  assert.equal(stopped.launchId, launchId);
+  assert.equal(store.getWorkMailbox(target), null);
+});
+
+test("Task completion discards residual Role wake mailboxes", (t) => {
+  const { store, task, role, now } = fixture(t);
+  const worker = createRole(
+    task.id,
+    "worker",
+    [createRoleAgentBinding({ id: "codex", adapterId: "codex" })],
+    "codex",
+    task.cwd,
+    now
+  );
+  store.transaction((tx) => {
+    tx.saveRole(task.id, worker);
+    enqueueWork(tx, { kind: "role", taskId: task.id, roleName: worker.name }, "stale-role-result", now);
+    enqueueWork(tx, { kind: "role", taskId: task.id, roleName: role.name }, "stale-leader-result", now);
+  });
+
+  runTaskCommand([
+    "complete", task.id, "--summary", "Discard derived wake state."
+  ], store, { now: () => now });
+
+  assert.equal(store.getWorkMailbox({ kind: "task", taskId: task.id }), null);
+  assert.equal(store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: role.name }), null);
+  assert.equal(store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: worker.name }), null);
+});
+
+test("failed completed-Task cleanup stays pending, then reopen resumes the fixed native Session", async (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  adapter.recordRuntimeNativeSession({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    launchId: "runtime-test:generation:reopen",
+    nativeSessionId: "thread-reopen"
+  }, now);
+  runTaskCommand([
+    "complete", task.id, "--summary", "Waiting for a confirmed stop."
+  ], store, { now: () => now });
+  const target = runtimeLifecycleTarget({
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  });
+
+  await runControllerSchedulerPass(
+    adapter,
+    {
+      async prepareRoleSession() { throw new Error("unexpected Leader wake"); },
+      async waitUntilReady() { throw new Error("unexpected Leader readiness"); },
+      async sendOnce() { throw new Error("unexpected Leader send"); },
+      async inspectRole() { return "present"; },
+      async stopTask() { return false; }
+    },
+    new Date(now.getTime() + 1),
+    undefined,
+    { kind: "full" },
+    false,
+    [],
+    {
+      async inspectOwner() { return { state: "running" }; },
+      async stopOwner() { return false; }
+    }
+  );
+  assert.equal(hasRuntimeCleanupObligation(store.getWorkMailbox(target)), true);
+  assert.equal(store.getRoleSession(task.id, role.name).status, "running");
+
+  await runControllerSchedulerPass(
+    adapter,
+    {
+      async prepareRoleSession() { throw new Error("unexpected Leader wake"); },
+      async waitUntilReady() { throw new Error("unexpected Leader readiness"); },
+      async sendOnce() { throw new Error("unexpected Leader send"); },
+      async inspectRole() { return "present"; },
+      async stopTask() { return false; }
+    },
+    new Date(now.getTime() + 2),
+    undefined,
+    { kind: "full" },
+    false,
+    [],
+    {
+      async inspectOwner() { return { state: "running" }; },
+      async stopOwner() { return true; }
+    }
+  );
+  assert.equal(store.getWorkMailbox(target), null);
+  assert.equal(store.getRoleSession(task.id, role.name).status, "stopped");
+
+  runTaskCommand(["reopen", task.id], store, { now: () => new Date(now.getTime() + 3) });
+  const prepared = [];
+  const [result] = await processLeaderWakeups(adapter, {
+    async prepareRoleSession(input) {
+      prepared.push(input);
+      return { ...input, deliveryId: "reopen-delivery", sessionStarted: false };
+    },
+    async waitUntilReady(delivery) {
+      return {
+        prepared: delivery,
+        session: { ...adapter.getRoleSession(task.id, role.name), status: "running" }
+      };
+    },
+    async sendOnce() { return "sent"; }
+  }, new Date(now.getTime() + 4));
+
+  assert.equal(result.status, "dispatched");
+  assert.equal(prepared[0].mode, "resume");
+  assert.equal(prepared[0].nativeSessionId, "thread-reopen");
+});
+
+test("reopen identity drift fails closed with durable recovery state and no provider call", async (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  adapter.recordRuntimeNativeSession({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    launchId: "runtime-test:generation:identity",
+    nativeSessionId: "thread-identity"
+  }, now);
+  runTaskCommand(["complete", task.id, "--summary", "Identity fence."], store, { now: () => now });
+  const target = runtimeLifecycleTarget({
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  });
+  await runControllerSchedulerPass(
+    adapter,
+    {
+      async prepareRoleSession() { throw new Error("unexpected Leader wake"); },
+      async waitUntilReady() { throw new Error("unexpected Leader readiness"); },
+      async sendOnce() { throw new Error("unexpected Leader send"); },
+      async inspectRole() { return "present"; },
+      async stopTask() { return false; }
+    },
+    new Date(now.getTime() + 1),
+    undefined,
+    { kind: "full" },
+    false,
+    [],
+    {
+      async inspectOwner() { return { state: "running" }; },
+      async stopOwner() { return true; }
+    }
+  );
+  store.saveRole(task.id, updateRole(role, {
+    agentBindings: {
+      codex: createRoleAgentBinding(
+        { id: "codex", adapterId: "codex" },
+        { adapterId: "codex", model: "gpt-next", effort: "medium" }
+      )
+    }
+  }, new Date(now.getTime() + 2)));
+  runTaskCommand(["reopen", task.id], store, { now: () => new Date(now.getTime() + 3) });
+
+  let providerCalls = 0;
+  const [result] = await processLeaderWakeups(adapter, {
+    async prepareRoleSession() {
+      providerCalls += 1;
+      throw new Error("provider must not be called after identity drift");
+    }
+  }, new Date(now.getTime() + 4));
+
+  assert.equal(result.status, "failed");
+  assert.equal(providerCalls, 0);
+  assert.equal(store.getActiveAgentRun(task.id, role.name), null);
+  assert.equal(store.getRoleSession(task.id, role.name).status, "broken");
+  assert.match(store.getLeaderFailure(task.id).message, /identity drift/i);
+  assert.equal(hasRuntimeCleanupObligation(store.getWorkMailbox(target)), false);
+  assert.notEqual(store.getPendingWakeup(task.id), null);
+});
+
+test("reopen identity drift also fails closed while the old host remains live", async (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  adapter.recordRuntimeNativeSession({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    launchId: "runtime-test:generation:live-drift",
+    nativeSessionId: "thread-live-drift"
+  }, now);
+  runTaskCommand(["complete", task.id, "--summary", "Retain the live owner fence."], store, {
+    now: () => now
+  });
+  const target = runtimeLifecycleTarget({
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  });
+  assert.equal(store.getRoleSession(task.id, role.name).status, "running");
+  assert.equal(hasRuntimeCleanupObligation(store.getWorkMailbox(target)), true);
+
+  store.saveRole(task.id, updateRole(role, {
+    agentBindings: {
+      codex: createRoleAgentBinding(
+        { id: "codex", adapterId: "codex" },
+        { adapterId: "codex", model: "gpt-drifted", effort: "medium" }
+      )
+    }
+  }, new Date(now.getTime() + 1)));
+  runTaskCommand(["reopen", task.id], store, {
+    now: () => new Date(now.getTime() + 2)
+  });
+
+  let providerCalls = 0;
+  const [result] = await processLeaderWakeups(adapter, {
+    async prepareRoleSession() {
+      providerCalls += 1;
+      throw new Error("provider must not be called for a live identity drift");
+    }
+  }, new Date(now.getTime() + 3));
+
+  assert.equal(result.status, "failed");
+  assert.equal(providerCalls, 0);
+  assert.equal(store.getActiveAgentRun(task.id, role.name), null);
+  assert.equal(store.getRoleSession(task.id, role.name).status, "broken");
+  assert.match(store.getLeaderFailure(task.id).message, /identity drift/i);
+  assert.equal(hasRuntimeCleanupObligation(store.getWorkMailbox(target)), true);
+  assert.notEqual(store.getPendingWakeup(task.id), null);
 });
 
 test("a confirmed-absent exact reservation is cleared with its Task session stopped", (t) => {
