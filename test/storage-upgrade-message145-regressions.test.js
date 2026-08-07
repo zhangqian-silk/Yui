@@ -204,6 +204,8 @@ test("replacement Controller starts through the verified activated global binary
   mkdirSync(join(binDir, "controller"), { recursive: true });
   writeFileSync(globalBinary, "#!/bin/sh\n", { mode: 0o755 });
   const calls = [];
+  let controllerArgs = [controllerEntrypoint];
+  let controllerVersion = "9.9.9";
   const spawn = (command, args, options) => {
     calls.push({ command, args: [...args], options });
     if (command === "npm" && args[0] === "prefix") {
@@ -230,8 +232,8 @@ test("replacement Controller starts through the verified activated global binary
     if (command === globalBinary && args.includes("identity")) {
       return okData({
         executablePath: process.execPath,
-        args: [controllerEntrypoint],
-        version: "9.9.9"
+        args: controllerArgs,
+        version: controllerVersion
       });
     }
     return spawnResult();
@@ -249,6 +251,13 @@ test("replacement Controller starts through the verified activated global binary
     assert.equal(identity.command, globalBinary);
     assert.equal(calls.some((call) => call.command === process.execPath
       && call.args.includes("controller") && call.args.includes("restart")), false);
+
+    controllerArgs = ["/wrong/controllerMain.js"];
+    controllerVersion = "8.8.8";
+    assert.throws(
+      () => ports.startController("/tmp/yui-home"),
+      /Replacement Controller (?:version|launch identity)/i
+    );
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
