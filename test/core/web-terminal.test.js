@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
+import * as nodePty from "node-pty";
 
 import {
   TmuxWebTerminalService
@@ -41,13 +42,27 @@ function fakeTmux(writable = false) {
   };
 }
 
-function runTmux(yuiHome, args) {
+function runTmux(yuiHome, args, environment = process.env) {
   const result = spawnSync(
     "tmux",
     ["-L", yuiTmuxServerName(yuiHome), ...args],
-    { encoding: "utf8" }
+    { encoding: "utf8", env: environment }
   );
   return result.status === 0 ? result.stdout.trim() : "";
+}
+
+function capturePtyOptions(observed) {
+  return (command, args, options) => {
+    observed.push(options);
+    return nodePty.spawn(command, args, options);
+  };
+}
+
+function assertPtyOwnership(options, runtime) {
+  assert.equal(options.cwd, runtime.home);
+  assert.equal(options.env.YUI_HOME, runtime.home);
+  assert.equal(options.env.YUI_EPHEMERAL_DOMAIN, "1");
+  assert.equal(options.env.YUI_EPHEMERAL_TOKEN, runtime.identity.token);
 }
 
 async function waitFor(value, predicate) {
@@ -350,6 +365,7 @@ test("real web PTY detaches without stopping its tmux Agent", async (t) => {
   const runtime = createIsolatedRuntime(t);
   const yuiHome = runtime.home;
   const manager = runtime.tmux();
+  const ptyOptions = [];
   manager.ensureRoleWindow("operator", {
     name: "operator",
     workspace: yuiHome
@@ -367,7 +383,9 @@ test("real web PTY detaches without stopping its tmux Agent", async (t) => {
     tmuxBin: "tmux",
     tmux: manager,
     async prepareTaskRole() {},
-    async prepareGlobalRole() {}
+    async prepareGlobalRole() {},
+    environment: runtime.environment,
+    spawnPty: capturePtyOptions(ptyOptions)
   });
   const connection = await service.open({
     scope: "global",
@@ -375,6 +393,8 @@ test("real web PTY detaches without stopping its tmux Agent", async (t) => {
     columns: 80,
     rows: 24
   });
+  assert.equal(ptyOptions.length, 1);
+  assertPtyOwnership(ptyOptions[0], runtime);
   let output = "";
   const marker = "__YUI_WEB_PTY_OK__";
   await new Promise((resolve, reject) => {
@@ -401,6 +421,7 @@ test("real web terminals keep independent Role windows and native tmux scrolling
   const yuiHome = runtime.home;
   const manager = runtime.tmux();
   const connections = [];
+  const ptyOptions = [];
   for (const roleName of ["leader", "worker"]) {
     manager.ensureRoleWindow("task-1", {
       name: roleName,
@@ -420,7 +441,9 @@ test("real web terminals keep independent Role windows and native tmux scrolling
     tmuxBin: "tmux",
     tmux: manager,
     async prepareTaskRole() {},
-    async prepareGlobalRole() {}
+    async prepareGlobalRole() {},
+    environment: runtime.environment,
+    spawnPty: capturePtyOptions(ptyOptions)
   });
   for (const roleName of ["leader", "worker"]) {
     connections.push(await service.open({
@@ -431,11 +454,13 @@ test("real web terminals keep independent Role windows and native tmux scrolling
       rows: 24
     }));
   }
+  assert.equal(ptyOptions.length, 2);
+  for (const options of ptyOptions) assertPtyOwnership(options, runtime);
 
   const clients = await waitFor(
     () => runTmux(yuiHome, [
       "list-clients", "-F", "#{session_name}|#{window_name}"
-    ]).split("\n").filter(Boolean),
+    ], runtime.environment).split("\n").filter(Boolean),
     (rows) => rows.length === 2
   );
   assert.deepEqual(
@@ -447,15 +472,15 @@ test("real web terminals keep independent Role windows and native tmux scrolling
     assert.match(clientSession, /^yui-client-[a-f0-9]{24}$/);
     assert.equal(runTmux(yuiHome, [
       "show-options", "-v", "-t", clientSession, "mouse"
-    ]), "on");
+    ], runtime.environment), "on");
     assert.equal(runTmux(yuiHome, [
       "show-options", "-v", "-t", clientSession, "status"
-    ]), "off");
+    ], runtime.environment), "off");
   }
 
   for (const connection of connections) connection.close();
   const remainingClientSessions = await waitFor(
-    () => runTmux(yuiHome, ["list-sessions", "-F", "#{session_name}"])
+    () => runTmux(yuiHome, ["list-sessions", "-F", "#{session_name}"], runtime.environment)
       .split("\n")
       .filter((name) => name.startsWith("yui-client-")),
     (names) => names.length === 0
