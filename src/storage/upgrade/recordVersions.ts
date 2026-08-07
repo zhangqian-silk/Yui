@@ -22,115 +22,121 @@ import {
 import {
   CURRENT_AGENT_RUN_SCHEMA_VERSION,
   CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
+  CURRENT_AGENT_PROFILE_SCHEMA_VERSION,
   CURRENT_CONFIG_SCHEMA_VERSION,
+  CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION,
+  CURRENT_CHANGE_SET_SCHEMA_VERSION,
+  CURRENT_DECISION_SCHEMA_VERSION,
+  CURRENT_EVENT_SCHEMA_VERSION,
+  CURRENT_GLOBAL_ROLE_SCHEMA_VERSION,
+  CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION,
+  CURRENT_INPUT_REQUEST_SCHEMA_VERSION,
+  CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION,
+  CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION,
+  CURRENT_MESSAGE_SCHEMA_VERSION,
+  CURRENT_MILESTONE_SCHEMA_VERSION,
+  CURRENT_PROJECT_SCHEMA_VERSION,
+  CURRENT_REVIEW_ROUND_SCHEMA_VERSION,
   CURRENT_STORED_TASK_SCHEMA_VERSION,
-  CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION
+  CURRENT_TASK_BRIEF_SCHEMA_VERSION,
+  CURRENT_TASK_ROLE_SCHEMA_VERSION,
+  CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION,
+  CURRENT_TASK_SCHEMA_VERSION,
+  CURRENT_WORK_ITEM_SCHEMA_VERSION,
+  CURRENT_WORK_MAILBOX_SCHEMA_VERSION
 } from "../taskStore.js";
 import { CURRENT_LEADER_FAILURE_SCHEMA_VERSION } from "../../scheduler/leaderFailure.js";
 import { CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION } from "../../scheduler/operatorNotification.js";
 import type { RecordAxisEntry, StorageVersionState } from "../migration/index.js";
 
-/** Every persisted record family directly owned by StorageState/StoredTask. */
-const EXPECTED_RECORD_KINDS = [
-  "config",
-  "configuredAgent",
-  "project",
-  "agentProfile",
-  "globalRole",
-  "globalRoleSessionSet",
-  "storedTask",
-  "task",
-  "taskBrief",
-  "taskRole",
-  "managedWorkspace",
-  "taskRoleSessionSet",
-  "workItem",
-  "agentRun",
-  "reviewRound",
-  "changeSet",
-  "integrationAttempt",
-  "activeRunPointer",
-  "message",
-  "inputRequest",
-  "decision",
-  "milestone",
-  "event",
-  "leaderFailure",
-  "operatorNotification",
-  "workMailbox"
-] as const;
+function descriptor(version: number, path: string): RecordAxisEntry {
+  return Object.freeze({ version, path });
+}
 
 /**
- * The record families present on the current baseline, each at its real
- * `schemaVersion`. `path` is a logical, human-readable location of where the
- * family's records live inside the authoritative store; the generic engine
- * treats it as opaque. Update this map whenever a family is added or its
- * `schemaVersion` changes — it tracks the live schema, it does not freeze it.
+ * The one authoritative descriptor table for every direct StorageState and
+ * StoredTask record family. `path` is a logical, human-readable location of
+ * where the family's records live inside the authoritative store; the generic
+ * engine treats it as opaque. Update this table whenever a family is added or
+ * its `schemaVersion` changes — it tracks the live schema, it does not freeze
+ * it.
  */
-const CURRENT_RECORD_VERSIONS: Readonly<Record<string, RecordAxisEntry>> = Object.freeze({
-  config: { version: CURRENT_CONFIG_SCHEMA_VERSION, path: "state.json#/config" },
-  configuredAgent: { version: 2, path: "state.json#/configuredAgents" },
-  project: { version: 2, path: "state.json#/projects" },
-  agentProfile: { version: 2, path: "state.json#/agentProfiles" },
-  globalRole: { version: 3, path: "state.json#/globalRoles" },
-  globalRoleSessionSet: { version: 3, path: "state.json#/globalRoleSessionSets" },
+const CURRENT_RECORD_DESCRIPTORS: Readonly<Record<string, RecordAxisEntry>> = Object.freeze({
+  config: descriptor(CURRENT_CONFIG_SCHEMA_VERSION, "state.json#/config"),
+  configuredAgent: descriptor(CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION, "state.json#/configuredAgents"),
+  project: descriptor(CURRENT_PROJECT_SCHEMA_VERSION, "state.json#/projects"),
+  agentProfile: descriptor(CURRENT_AGENT_PROFILE_SCHEMA_VERSION, "state.json#/agentProfiles"),
+  globalRole: descriptor(CURRENT_GLOBAL_ROLE_SCHEMA_VERSION, "state.json#/globalRoles"),
+  globalRoleSessionSet: descriptor(
+    CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION,
+    "state.json#/globalRoleSessionSets"
+  ),
   // The task aggregate is itself a versioned record family. Keep this family
   // alongside (and distinct from) the nested `task` record family: an older
   // aggregate wrapper must be classified on the record axis before the strict
   // loader is asked to parse its nested members.
-  storedTask: {
-    version: CURRENT_STORED_TASK_SCHEMA_VERSION,
-    path: "state.json#/tasks/*"
-  },
-  task: { version: 3, path: "state.json#/tasks/*/task" },
-  taskBrief: { version: 2, path: "state.json#/tasks/*/brief" },
-  taskRole: { version: 3, path: "state.json#/tasks/*/roles" },
-  managedWorkspace: { version: 1, path: "state.json#/tasks/*/managedWorkspaces" },
-  taskRoleSessionSet: { version: 4, path: "state.json#/tasks/*/roleSessionSets" },
-  workItem: { version: 6, path: "state.json#/tasks/*/workItems" },
-  agentRun: { version: 5, path: "state.json#/tasks/*/agentRuns" },
-  reviewRound: { version: 2, path: "state.json#/tasks/*/reviewRounds" },
-  changeSet: { version: 2, path: "state.json#/tasks/*/changeSets" },
-  integrationAttempt: { version: 2, path: "state.json#/tasks/*/integrationAttempts" },
-  activeRunPointer: {
-    version: CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
-    path: "state.json#/tasks/*/activeRuns"
-  },
-  message: { version: 2, path: "state.json#/tasks/*/messages" },
-  inputRequest: { version: 2, path: "state.json#/tasks/*/inputRequests" },
-  decision: { version: 1, path: "state.json#/tasks/*/decisions" },
-  milestone: { version: 1, path: "state.json#/tasks/*/milestones" },
-  event: { version: 2, path: "state.json#/tasks/*/events" },
-  leaderFailure: {
-    version: CURRENT_LEADER_FAILURE_SCHEMA_VERSION,
-    path: "state.json#/tasks/*/leaderFailure"
-  },
-  operatorNotification: {
-    version: CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION,
-    path: "state.json#/tasks/*/operatorNotification"
-  },
-  workMailbox: { version: 1, path: "state.json#/mailboxes" }
+  storedTask: descriptor(CURRENT_STORED_TASK_SCHEMA_VERSION, "state.json#/tasks/*"),
+  task: descriptor(CURRENT_TASK_SCHEMA_VERSION, "state.json#/tasks/*/task"),
+  taskBrief: descriptor(CURRENT_TASK_BRIEF_SCHEMA_VERSION, "state.json#/tasks/*/brief"),
+  taskRole: descriptor(CURRENT_TASK_ROLE_SCHEMA_VERSION, "state.json#/tasks/*/roles"),
+  managedWorkspace: descriptor(
+    CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION,
+    "state.json#/tasks/*/managedWorkspaces"
+  ),
+  taskRoleSessionSet: descriptor(
+    CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION,
+    "state.json#/tasks/*/roleSessionSets"
+  ),
+  workItem: descriptor(CURRENT_WORK_ITEM_SCHEMA_VERSION, "state.json#/tasks/*/workItems"),
+  agentRun: descriptor(CURRENT_AGENT_RUN_SCHEMA_VERSION, "state.json#/tasks/*/agentRuns"),
+  reviewRound: descriptor(CURRENT_REVIEW_ROUND_SCHEMA_VERSION, "state.json#/tasks/*/reviewRounds"),
+  changeSet: descriptor(CURRENT_CHANGE_SET_SCHEMA_VERSION, "state.json#/tasks/*/changeSets"),
+  integrationAttempt: descriptor(
+    CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION,
+    "state.json#/tasks/*/integrationAttempts"
+  ),
+  activeRunPointer: descriptor(
+    CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
+    "state.json#/tasks/*/activeRuns"
+  ),
+  message: descriptor(CURRENT_MESSAGE_SCHEMA_VERSION, "state.json#/tasks/*/messages"),
+  inputRequest: descriptor(CURRENT_INPUT_REQUEST_SCHEMA_VERSION, "state.json#/tasks/*/inputRequests"),
+  decision: descriptor(CURRENT_DECISION_SCHEMA_VERSION, "state.json#/tasks/*/decisions"),
+  milestone: descriptor(CURRENT_MILESTONE_SCHEMA_VERSION, "state.json#/tasks/*/milestones"),
+  event: descriptor(CURRENT_EVENT_SCHEMA_VERSION, "state.json#/tasks/*/events"),
+  leaderFailure: descriptor(
+    CURRENT_LEADER_FAILURE_SCHEMA_VERSION,
+    "state.json#/tasks/*/leaderFailure"
+  ),
+  operatorNotification: descriptor(
+    CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION,
+    "state.json#/tasks/*/operatorNotification"
+  ),
+  workMailbox: descriptor(CURRENT_WORK_MAILBOX_SCHEMA_VERSION, "state.json#/mailboxes")
 });
+
+/** Kept as the public-facing name used by upgrade callers and tests. */
+const CURRENT_RECORD_VERSIONS = CURRENT_RECORD_DESCRIPTORS;
 
 /** The record-axis map for the current baseline (a defensive shallow copy). */
 export function currentRecordVersions(): Readonly<Record<string, RecordAxisEntry>> {
-  assertTaskStoreRecordVersions();
+  assertRecordVersionDescriptors();
   return { ...CURRENT_RECORD_VERSIONS };
 }
 
 /**
- * Fail closed if this centralized map drifts from the persisted boundary.
- * Completeness is checked separately from version alignment so adding a new
- * StorageState/StoredTask family cannot silently make a legal Home look
- * current. Version checks use the named parser/domain constants wherever the
- * strict loader or domain constructors own the value.
+ * Fail closed if a record descriptor map drifts from the one authoritative
+ * table. The candidate parameter is exported so the regression suite can
+ * exercise an unchecked-family version/path drift directly; production callers
+ * use the default current descriptor table.
  */
-function assertTaskStoreRecordVersions(): void {
-  const mappedKinds = Object.keys(CURRENT_RECORD_VERSIONS);
-  const missing = EXPECTED_RECORD_KINDS.filter((kind) => !Object.hasOwn(CURRENT_RECORD_VERSIONS, kind));
-  const unexpected = mappedKinds.filter(
-    (kind) => !(EXPECTED_RECORD_KINDS as readonly string[]).includes(kind)
-  );
+export function assertRecordVersionDescriptors(
+  candidate: Readonly<Record<string, RecordAxisEntry>> = CURRENT_RECORD_VERSIONS
+): void {
+  const expectedKinds = Object.keys(CURRENT_RECORD_DESCRIPTORS);
+  const mappedKinds = Object.keys(candidate);
+  const missing = expectedKinds.filter((kind) => !Object.hasOwn(candidate, kind));
+  const unexpected = mappedKinds.filter((kind) => !Object.hasOwn(CURRENT_RECORD_DESCRIPTORS, kind));
   if (missing.length > 0 || unexpected.length > 0) {
     throw new Error(
       `Record version map completeness drift: missing=${missing.join(",") || "none"}; `
@@ -138,34 +144,15 @@ function assertTaskStoreRecordVersions(): void {
     );
   }
 
-  const expected: Readonly<Record<string, number>> = {
-    config: CURRENT_CONFIG_SCHEMA_VERSION,
-    activeRunPointer: CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
-    leaderFailure: CURRENT_LEADER_FAILURE_SCHEMA_VERSION,
-    operatorNotification: CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION,
-    storedTask: CURRENT_STORED_TASK_SCHEMA_VERSION,
-    taskRoleSessionSet: CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION,
-    agentRun: CURRENT_AGENT_RUN_SCHEMA_VERSION
-  };
-  for (const [kind, version] of Object.entries(expected)) {
-    const mapped = CURRENT_RECORD_VERSIONS[kind]?.version;
-    if (mapped !== version) {
+  for (const kind of expectedKinds) {
+    const expected = CURRENT_RECORD_DESCRIPTORS[kind]!;
+    const mapped = candidate[kind];
+    if (mapped === undefined || mapped === null
+      || mapped.version !== expected.version
+      || mapped.path !== expected.path) {
       throw new Error(
-        `Record version map drift for ${kind}: taskStore=${version}, map=${String(mapped)}.`
-      );
-    }
-  }
-
-  const expectedPaths: Readonly<Record<string, string>> = {
-    config: "state.json#/config",
-    activeRunPointer: "state.json#/tasks/*/activeRuns",
-    leaderFailure: "state.json#/tasks/*/leaderFailure",
-    operatorNotification: "state.json#/tasks/*/operatorNotification"
-  };
-  for (const [kind, path] of Object.entries(expectedPaths)) {
-    if (CURRENT_RECORD_VERSIONS[kind]?.path !== path) {
-      throw new Error(
-        `Record version map drift for ${kind}: path=${String(CURRENT_RECORD_VERSIONS[kind]?.path)}.`
+        `Record version map drift for ${kind}: expected=${expected.version}@${expected.path}; `
+        + `actual=${String(mapped?.version)}@${String(mapped?.path)}.`
       );
     }
   }

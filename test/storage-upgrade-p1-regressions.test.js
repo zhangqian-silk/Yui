@@ -26,7 +26,8 @@ import {
 import { MigrationRegistry, createEmptyRegistry, planMigration } from "../dist/storage/migration/index.js";
 import {
   latestStorageVersionState,
-  currentRecordVersions
+  currentRecordVersions,
+  assertRecordVersionDescriptors
 } from "../dist/storage/upgrade/recordVersions.js";
 import { classifyHome } from "../dist/storage/upgrade/homeClassification.js";
 import { runStorageUpgrade } from "../dist/storage/upgrade/upgradeOrchestrator.js";
@@ -360,6 +361,20 @@ test("P2 map guard: current non-empty StorageState and StoredTask families are U
     stopController: async () => {}
   });
   assert.equal(result.outcome, "already-current");
+});
+
+test("P2 map guard rejects an unchecked-family descriptor drift", () => {
+  const drifted = {
+    ...currentRecordVersions(),
+    configuredAgent: {
+      ...currentRecordVersions().configuredAgent,
+      path: "state.json#/projects"
+    }
+  };
+  assert.throws(
+    () => assertRecordVersionDescriptors(drifted),
+    /Record version map drift for configuredAgent/
+  );
 });
 
 test("P2 map guard: future config and active-run pointer versions are future-version blockers", () => {

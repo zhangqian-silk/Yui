@@ -106,6 +106,35 @@ export const STORAGE_STATE_FILE = "state.json";
 export const CURRENT_STORAGE_STATE_SCHEMA_VERSION = CURRENT_AGGREGATE_SCHEMA_VERSION;
 export const CURRENT_CONFIG_SCHEMA_VERSION = 1 as const;
 export const CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION = 1 as const;
+/**
+ * Persisted StorageState/StoredTask family versions owned by this boundary.
+ *
+ * Keep these names next to the strict parser/writer so the upgrade record map
+ * can classify exactly the bytes this store accepts and emits. Nested session
+ * members and the PendingWakeup projection are included as parser boundaries
+ * below, but are not independent record-axis families.
+ */
+export const CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION = 2 as const;
+export const CURRENT_PROJECT_SCHEMA_VERSION = 2 as const;
+export const CURRENT_AGENT_PROFILE_SCHEMA_VERSION = 2 as const;
+export const CURRENT_GLOBAL_ROLE_SCHEMA_VERSION = 3 as const;
+export const CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION = 3 as const;
+export const CURRENT_TASK_SCHEMA_VERSION = 3 as const;
+export const CURRENT_TASK_BRIEF_SCHEMA_VERSION = 2 as const;
+export const CURRENT_TASK_ROLE_SCHEMA_VERSION = 3 as const;
+export const CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION = 1 as const;
+export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 6 as const;
+export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 2 as const;
+export const CURRENT_CHANGE_SET_SCHEMA_VERSION = 2 as const;
+export const CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION = 2 as const;
+export const CURRENT_MESSAGE_SCHEMA_VERSION = 2 as const;
+export const CURRENT_INPUT_REQUEST_SCHEMA_VERSION = 2 as const;
+export const CURRENT_DECISION_SCHEMA_VERSION = 1 as const;
+export const CURRENT_MILESTONE_SCHEMA_VERSION = 1 as const;
+export const CURRENT_EVENT_SCHEMA_VERSION = 2 as const;
+export const CURRENT_WORK_MAILBOX_SCHEMA_VERSION = 1 as const;
+export const CURRENT_ROLE_AGENT_SESSION_SCHEMA_VERSION = 3 as const;
+export const CURRENT_PENDING_WAKEUP_SCHEMA_VERSION = 1 as const;
 const STORAGE_LOCK_DIRECTORY = ".state.lock";
 const LOCK_TIMEOUT_MS = 5_000;
 const LOCK_RETRY_MS = 10;
@@ -143,7 +172,7 @@ type ActiveRunPointer = Readonly<{
 type TaskIdHighWaterMarks = Record<TaskRecordKind, number>;
 
 /** The schema version of each persisted `state.json#/tasks/*` aggregate. */
-export const CURRENT_STORED_TASK_SCHEMA_VERSION = 14;
+export const CURRENT_STORED_TASK_SCHEMA_VERSION = 14 as const;
 
 /**
  * Persisted nested-record versions consumed by this store's strict parser.
@@ -339,13 +368,23 @@ export class FileTaskStore implements TaskStore {
 
   getConfig(): YuiConfig { return clone(this.#state().config); }
   saveConfig(config: YuiConfig): void {
-    const stored = versioned<YuiConfig>(config, 1, "Yui config");
+    const stored = versioned<YuiConfig>(
+      config,
+      CURRENT_CONFIG_SCHEMA_VERSION,
+      "Yui config"
+    );
     validateYuiConfig(stored);
     this.#mutate((state) => { state.config = stored; });
   }
 
   saveConfiguredAgent(agent: ConfiguredAgent): void {
-    const stored = identified<ConfiguredAgent>(agent, 2, "id", agent.id, "Configured Agent");
+    const stored = identified<ConfiguredAgent>(
+      agent,
+      CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION,
+      "id",
+      agent.id,
+      "Configured Agent"
+    );
     validateConfiguredAgent(stored);
     this.#mutate((state) => { state.configuredAgents[stored.id] = stored; });
   }
@@ -368,7 +407,7 @@ export class FileTaskStore implements TaskStore {
         ...existing,
         ...clone(patch),
         updatedAt: now.toISOString()
-      }, 2, "Configured Agent");
+      }, CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION, "Configured Agent");
       const unchanged = isDeepStrictEqual(
         { ...existing, updatedAt: candidate.updatedAt },
         candidate
@@ -390,7 +429,7 @@ export class FileTaskStore implements TaskStore {
   saveProject(project: Project): void {
     const stored = identified<Project>(
       project,
-      2,
+      CURRENT_PROJECT_SCHEMA_VERSION,
       "id",
       project.id,
       "Project"
@@ -433,7 +472,7 @@ export class FileTaskStore implements TaskStore {
   saveAgentProfile(profile: AgentProfile): void {
     const stored = identified<AgentProfile>(
       profile,
-      2,
+      CURRENT_AGENT_PROFILE_SCHEMA_VERSION,
       "id",
       profile.id,
       "Agent Profile"
@@ -486,14 +525,26 @@ export class FileTaskStore implements TaskStore {
   }
 
   saveGlobalRole(role: GlobalRole): void {
-    const stored = identified<GlobalRole>(role, 3, "name", role.name, "Global Role");
+    const stored = identified<GlobalRole>(
+      role,
+      CURRENT_GLOBAL_ROLE_SCHEMA_VERSION,
+      "name",
+      role.name,
+      "Global Role"
+    );
     validateGlobalRole(stored);
     const sessions = this.getGlobalRoleSessionSet(stored.name);
     if (sessions !== null) assertSessionsMatchRole(sessions, stored);
     this.#mutate((state) => { state.globalRoles[stored.name] = stored; });
   }
   saveGlobalRoleWithSessionSet(role: GlobalRole, sessions: GlobalRoleSessionSet | null): void {
-    const storedRole = identified<GlobalRole>(role, 3, "name", role.name, "Global Role");
+    const storedRole = identified<GlobalRole>(
+      role,
+      CURRENT_GLOBAL_ROLE_SCHEMA_VERSION,
+      "name",
+      role.name,
+      "Global Role"
+    );
     validateGlobalRole(storedRole);
     const storedSessions = sessions === null ? null : globalSessions(sessions);
     if (storedSessions !== null) assertSessionsMatchRole(storedSessions, storedRole);
@@ -537,7 +588,13 @@ export class FileTaskStore implements TaskStore {
 
   nextTaskId(): string { return this.#nextGlobalId("task", (state) => Object.keys(state.tasks)); }
   saveTask(task: Task): void {
-    const stored = validateTask(identified<Task>(task, 3, "id", task.id, "Task"));
+    const stored = validateTask(identified<Task>(
+      task,
+      CURRENT_TASK_SCHEMA_VERSION,
+      "id",
+      task.id,
+      "Task"
+    ));
     this.#mutate((state) => {
       for (const binding of stored.projectBindings) {
         if (state.projects[binding.projectId] === undefined) {
@@ -614,7 +671,7 @@ export class FileTaskStore implements TaskStore {
   saveIntegrationAttempt(taskId: string, attempt: IntegrationAttempt): void {
     const stored = identified<IntegrationAttempt>(
       attempt,
-      2,
+      CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION,
       "id",
       attempt.id,
       "Integration Attempt"
@@ -672,7 +729,13 @@ export class FileTaskStore implements TaskStore {
 
   saveRole(taskId: string, role: TaskRole): void {
     const aggregate = this.#requireTaskForWrite(taskId);
-    const stored = identified<TaskRole>(role, 3, "name", role.name, "Task Role");
+    const stored = identified<TaskRole>(
+      role,
+      CURRENT_TASK_ROLE_SCHEMA_VERSION,
+      "name",
+      role.name,
+      "Task Role"
+    );
     if (stored.taskId !== taskId) throw new StorageRecordError(`Task Role belongs to another Task: ${stored.taskId}`);
     validateTaskRole(stored);
     const sessions = this.getRoleSessionSet(taskId, stored.name);
@@ -682,7 +745,13 @@ export class FileTaskStore implements TaskStore {
   listRoles(taskId: string): TaskRole[] { return values(this.#requireTask(taskId).roles, "name"); }
   getRole(taskId: string, name: string): TaskRole | null { return optional(this.#state().tasks[taskId]?.roles[name]); }
   saveTaskRoleWithSessionSet(role: TaskRole, sessions: TaskRoleSessionSet): void {
-    const storedRole = identified<TaskRole>(role, 3, "name", role.name, "Task Role");
+    const storedRole = identified<TaskRole>(
+      role,
+      CURRENT_TASK_ROLE_SCHEMA_VERSION,
+      "name",
+      role.name,
+      "Task Role"
+    );
     validateTaskRole(storedRole);
     const storedSessions = taskSessions(sessions);
     assertSessionsMatchRole(storedSessions, storedRole);
@@ -707,7 +776,11 @@ export class FileTaskStore implements TaskStore {
     });
   }
   saveManagedWorkspace(workspace: ManagedWorkspace): void {
-    const stored = clone(workspace);
+    const stored = versioned<ManagedWorkspace>(
+      workspace,
+      CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION,
+      "Managed workspace"
+    );
     validateManagedWorkspace(stored);
     const taskId = stored.owner.taskId;
     const aggregate = this.#requireTaskForWrite(taskId);
@@ -812,7 +885,13 @@ export class FileTaskStore implements TaskStore {
   getWorkItem(taskId: string, id: string): WorkItem | null { return optional(this.#state().tasks[taskId]?.workItems[id]); }
   listWorkItems(taskId: string): WorkItem[] { return values(this.#requireTask(taskId).workItems, "id"); }
   saveWorkItem(taskId: string, item: WorkItem): void {
-    const stored = identified<WorkItem>(item, 6, "id", item.id, "Work item");
+    const stored = identified<WorkItem>(
+      item,
+      CURRENT_WORK_ITEM_SCHEMA_VERSION,
+      "id",
+      item.id,
+      "Work item"
+    );
     if (stored.taskId !== taskId) throw new StorageRecordError(`Work item belongs to another Task: ${stored.taskId}`);
     validateWorkItem(stored);
     const aggregate = this.#requireTaskForWrite(taskId);
@@ -894,7 +973,13 @@ export class FileTaskStore implements TaskStore {
     return values(this.#requireTask(taskId).reviewRounds, "id");
   }
   saveReviewRound(taskId: string, round: ReviewRound): void {
-    const stored = identified<ReviewRound>(round, 2, "id", round.id, "ReviewRound");
+    const stored = identified<ReviewRound>(
+      round,
+      CURRENT_REVIEW_ROUND_SCHEMA_VERSION,
+      "id",
+      round.id,
+      "ReviewRound"
+    );
     validateReviewRound(stored);
     if (stored.taskId !== taskId) {
       throw new StorageRecordError(`ReviewRound belongs to another Task: ${stored.taskId}.`);
@@ -975,7 +1060,11 @@ export class FileTaskStore implements TaskStore {
     return this.#nextTaskRecordId(taskId, "inputRequest");
   }
   saveInputRequest(taskId: string, request: InputRequest): void {
-    const stored = validateInputRequest(request);
+    const stored = validateInputRequest(versioned<InputRequest>(
+      request,
+      CURRENT_INPUT_REQUEST_SCHEMA_VERSION,
+      "Input request"
+    ));
     if (stored.taskId !== taskId) {
       throw new StorageRecordError(`Input request belongs to another Task: ${stored.taskId}`);
     }
@@ -1086,7 +1175,13 @@ export class FileTaskStore implements TaskStore {
   }
   saveWorkMailbox(value: WorkMailbox): void {
     let mailbox: WorkMailbox;
-    try { mailbox = validateWorkMailbox(value); }
+    try {
+      mailbox = validateWorkMailbox(versioned<WorkMailbox>(
+        value,
+        CURRENT_WORK_MAILBOX_SCHEMA_VERSION,
+        "WorkMailbox"
+      ));
+    }
     catch (error) { throw new StorageRecordError(error instanceof Error ? error.message : String(error)); }
     this.#mutate((state) => {
       validateMailboxReferences(state, mailbox);
@@ -1109,7 +1204,13 @@ export class FileTaskStore implements TaskStore {
       .sort((a, b) => numericCompare(a.taskId, b.taskId));
   }
   savePendingWakeup(value: PendingWakeup): void {
-    const wakeup = identified<PendingWakeup>(value, 1, "taskId", value.taskId, "Pending wakeup");
+    const wakeup = identified<PendingWakeup>(
+      value,
+      CURRENT_PENDING_WAKEUP_SCHEMA_VERSION,
+      "taskId",
+      value.taskId,
+      "Pending wakeup"
+    );
     const target: MailboxTarget = { kind: "role", taskId: wakeup.taskId, roleName: "leader" };
     this.transaction(() => {
       const existing = this.getWorkMailbox(target);
@@ -1120,7 +1221,7 @@ export class FileTaskStore implements TaskStore {
       const fromSequence = existing?.pending?.fromSequence ?? existing?.nextSequence ?? 1;
       const toSequence = fromSequence + wakeup.requestCount - 1;
       this.saveWorkMailbox({
-        schemaVersion: 1,
+        schemaVersion: CURRENT_WORK_MAILBOX_SCHEMA_VERSION,
         target,
         nextSequence: Math.max(existing?.nextSequence ?? 1, toSequence + 1),
         processing: existing?.processing ?? null,
@@ -1163,7 +1264,10 @@ export class FileTaskStore implements TaskStore {
   #saveTaskRecord<K extends "messages">(
     taskId: string, key: K, value: StoredTask[K][string], label: string
   ): void {
-    const record = versioned<{ schemaVersion: 2; id: string }>(value, 2, label);
+    const record = versioned<{
+      schemaVersion: typeof CURRENT_MESSAGE_SCHEMA_VERSION;
+      id: string;
+    }>(value, CURRENT_MESSAGE_SCHEMA_VERSION, label);
     this.#requireTaskForWrite(taskId);
     this.#mutate((state) => {
       if (state.tasks[taskId][key][record.id] !== undefined) {
@@ -1398,12 +1502,24 @@ function parseState(raw: string): StorageState {
   );
   validateYuiConfig(result.config);
   parseMap(result.configuredAgents, (value, key) => {
-    const agent = identified<ConfiguredAgent>(value, 2, "id", key, "Configured Agent");
+    const agent = identified<ConfiguredAgent>(
+      value,
+      CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION,
+      "id",
+      key,
+      "Configured Agent"
+    );
     validateConfiguredAgent(agent);
     return agent;
   }, "configuredAgents");
   parseMap(result.projects, (value, key) => {
-    const project = identified<Project>(value, 2, "id", key, "Project");
+    const project = identified<Project>(
+      value,
+      CURRENT_PROJECT_SCHEMA_VERSION,
+      "id",
+      key,
+      "Project"
+    );
     validateProject(project);
     return project;
   }, "projects");
@@ -1413,12 +1529,24 @@ function parseState(raw: string): StorageState {
     throw new StorageRecordError(error instanceof Error ? error.message : String(error));
   }
   parseMap(result.agentProfiles, (value, key) => {
-    const profile = identified<AgentProfile>(value, 2, "id", key, "Agent Profile");
+    const profile = identified<AgentProfile>(
+      value,
+      CURRENT_AGENT_PROFILE_SCHEMA_VERSION,
+      "id",
+      key,
+      "Agent Profile"
+    );
     validateAgentProfile(profile);
     return profile;
   }, "agentProfiles");
   parseMap(result.globalRoles, (value, key) => {
-    const role = identified<GlobalRole>(value, 3, "name", key, "Global Role");
+    const role = identified<GlobalRole>(
+      value,
+      CURRENT_GLOBAL_ROLE_SCHEMA_VERSION,
+      "name",
+      key,
+      "Global Role"
+    );
     validateGlobalRole(role);
     return role;
   }, "globalRoles");
@@ -1426,7 +1554,13 @@ function parseState(raw: string): StorageState {
   parseMap(result.tasks, (value, key) => parseStoredTask(value, key), "tasks");
   parseMap(result.mailboxes, (value, key) => {
     let mailbox: WorkMailbox;
-    try { mailbox = validateWorkMailbox(value); }
+    try {
+      mailbox = validateWorkMailbox(versioned<WorkMailbox>(
+        value,
+        CURRENT_WORK_MAILBOX_SCHEMA_VERSION,
+        "WorkMailbox"
+      ));
+    }
     catch (error) { throw new StorageRecordError(error instanceof Error ? error.message : String(error)); }
     if (mailboxTargetKey(mailbox.target) !== key) {
       throw new StorageRecordError(`WorkMailbox identity is inconsistent: ${key}`);
@@ -1520,7 +1654,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
   parseMap(aggregate.integrationAttempts, (record, key) => {
     const attempt = identified<IntegrationAttempt>(
       record,
-      2,
+      CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION,
       "id",
       key,
       "Integration Attempt"
@@ -1539,11 +1673,32 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     `Task aggregate ${taskId}`
   );
   validateTaskIdHighWaterMarks(aggregate.idHighWaterMarks, taskId);
-  validateTask(identified(aggregate.task, 3, "id", taskId, "Task"));
+  validateTask(identified(
+    aggregate.task,
+    CURRENT_TASK_SCHEMA_VERSION,
+    "id",
+    taskId,
+    "Task"
+  ));
   if (aggregate.brief !== null) storedTaskBrief(aggregate.brief);
-  parseMap(aggregate.roles, (record, key) => { const role = identified<TaskRole>(record, 3, "name", key, "Task Role"); if (role.taskId !== taskId) throw new StorageRecordError(`Task Role belongs to another Task: ${role.taskId}`); validateTaskRole(role); return role; }, "roles");
+  parseMap(aggregate.roles, (record, key) => {
+    const role = identified<TaskRole>(
+      record,
+      CURRENT_TASK_ROLE_SCHEMA_VERSION,
+      "name",
+      key,
+      "Task Role"
+    );
+    if (role.taskId !== taskId) throw new StorageRecordError(`Task Role belongs to another Task: ${role.taskId}`);
+    validateTaskRole(role);
+    return role;
+  }, "roles");
   parseMap(aggregate.managedWorkspaces, (record, key) => {
-    const workspace = record as ManagedWorkspace;
+    const workspace = versioned<ManagedWorkspace>(
+      record,
+      CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION,
+      "Managed workspace"
+    );
     validateManagedWorkspace(workspace);
     if (workspace.owner.taskId !== taskId) {
       throw new StorageRecordError(
@@ -1557,7 +1712,13 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
   }, "managedWorkspaces");
   parseMap(aggregate.roleSessionSets, (record, key) => { const set = taskSessions(record); if (set.owner.taskId !== taskId || set.owner.roleName !== key) throw new StorageRecordError(`Task Role session set identity is inconsistent: ${taskId}/${key}`); return set; }, "roleSessionSets");
   parseMap(aggregate.workItems, (record, key) => {
-    const item = identified<WorkItem>(record, 6, "id", key, "Work item");
+    const item = identified<WorkItem>(
+      record,
+      CURRENT_WORK_ITEM_SCHEMA_VERSION,
+      "id",
+      key,
+      "Work item"
+    );
     if (item.taskId !== taskId) {
       throw new StorageRecordError(`Work item belongs to another Task: ${item.taskId}`);
     }
@@ -1579,7 +1740,13 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     return run;
   }, "agentRuns");
   parseMap(aggregate.reviewRounds, (record, key) => {
-    const round = identified<ReviewRound>(record, 2, "id", key, "ReviewRound");
+    const round = identified<ReviewRound>(
+      record,
+      CURRENT_REVIEW_ROUND_SCHEMA_VERSION,
+      "id",
+      key,
+      "ReviewRound"
+    );
     if (round.taskId !== taskId) {
       throw new StorageRecordError(`ReviewRound belongs to another Task: ${round.taskId}.`);
     }
@@ -1599,7 +1766,13 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     return pointer;
   }, "activeRuns");
   parseMap(aggregate.messages, (record, key) => {
-    const message = identified<TaskMessage>(record, 2, "id", key, "Message");
+    const message = identified<TaskMessage>(
+      record,
+      CURRENT_MESSAGE_SCHEMA_VERSION,
+      "id",
+      key,
+      "Message"
+    );
     if (message.taskId !== taskId) {
       throw new StorageRecordError(`Message belongs to another Task: ${message.taskId}`);
     }
@@ -1607,7 +1780,11 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     return message;
   }, "messages");
   parseMap(aggregate.inputRequests, (record, key) => {
-    const request = validateInputRequest(record);
+    const request = validateInputRequest(versioned<InputRequest>(
+      record,
+      CURRENT_INPUT_REQUEST_SCHEMA_VERSION,
+      "Input request"
+    ));
     if (request.id !== key) {
       throw new StorageRecordError(`Input request identity is inconsistent: ${key}.`);
     }
@@ -1714,7 +1891,11 @@ function validateYuiConfig(config: YuiConfig): void {
 }
 
 function globalSessions(value: unknown): GlobalRoleSessionSet {
-  const set = versioned<GlobalRoleSessionSet>(value, 3, "Global Role session set");
+  const set = versioned<GlobalRoleSessionSet>(
+    value,
+    CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION,
+    "Global Role session set"
+  );
   if (set.owner?.scope !== "global" || typeof set.owner.roleName !== "string") throw new StorageRecordError("Global Role session owner is invalid.");
   validateSessions(set.sessions);
   validateRoleSessionSet(set);
@@ -1732,7 +1913,17 @@ function taskSessions(value: unknown): TaskRoleSessionSet {
   return set;
 }
 function validateSessions(sessions: Record<string, RoleAgentSession>): void {
-  parseMap(sessions, (record, key) => identified(record, 3, "agentId", key, "Role Agent session"), "sessions");
+  parseMap(
+    sessions,
+    (record, key) => identified(
+      record,
+      CURRENT_ROLE_AGENT_SESSION_SCHEMA_VERSION,
+      "agentId",
+      key,
+      "Role Agent session"
+    ),
+    "sessions"
+  );
 }
 function assertSessionsMatchRole(
   sessions: GlobalRoleSessionSet | TaskRoleSessionSet,
@@ -1768,7 +1959,11 @@ function assertSessionsMatchRole(
 }
 
 function storedTaskBrief(value: unknown): TaskBrief {
-  const brief = versioned<TaskBrief>(value, 2, "Task Brief");
+  const brief = versioned<TaskBrief>(
+    value,
+    CURRENT_TASK_BRIEF_SCHEMA_VERSION,
+    "Task Brief"
+  );
   exact(
     brief as unknown as Record<string, unknown>,
     [
@@ -1802,7 +1997,11 @@ function storedTaskBrief(value: unknown): TaskBrief {
 }
 
 function storedDecision(value: unknown): Decision {
-  const decision = versioned<Decision>(value, 1, "Decision");
+  const decision = versioned<Decision>(
+    value,
+    CURRENT_DECISION_SCHEMA_VERSION,
+    "Decision"
+  );
   const baseFields = [
     "schemaVersion", "id", "taskId", "title", "rationale", "status", "createdAt", "updatedAt"
   ];
@@ -1836,7 +2035,11 @@ function storedDecision(value: unknown): Decision {
 }
 
 function storedMilestone(value: unknown): Milestone {
-  const milestone = versioned<Milestone>(value, 1, "Milestone");
+  const milestone = versioned<Milestone>(
+    value,
+    CURRENT_MILESTONE_SCHEMA_VERSION,
+    "Milestone"
+  );
   exact(
     milestone as unknown as Record<string, unknown>,
     ["schemaVersion", "id", "taskId", "title", "summary", "createdBy", "createdAt"],
@@ -1855,7 +2058,11 @@ function storedMilestone(value: unknown): Milestone {
 }
 
 function storedTaskEvent(value: unknown): TaskEvent {
-  const event = versioned<TaskEvent>(value, 2, "Task event");
+  const event = versioned<TaskEvent>(
+    value,
+    CURRENT_EVENT_SCHEMA_VERSION,
+    "Task event"
+  );
   exact(
     event as unknown as Record<string, unknown>,
     ["schemaVersion", "id", "taskId", "type", "payload", "createdAt"],
@@ -1957,7 +2164,13 @@ function identified<T>(value: unknown, schemaVersion: number, key: string, expec
   return record as T;
 }
 function identifiedChangeSet(value: unknown, expectedId: string): ChangeSet {
-  return identified<ChangeSet>(value, 2, "id", expectedId, "ChangeSet");
+  return identified<ChangeSet>(
+    value,
+    CURRENT_CHANGE_SET_SCHEMA_VERSION,
+    "id",
+    expectedId,
+    "ChangeSet"
+  );
 }
 function object(value: unknown, label: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new StorageRecordError(`${label} must be an object.`);
@@ -1992,7 +2205,7 @@ function pendingWakeupProjection(mailbox: WorkMailbox | null): PendingWakeup | n
     return null;
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: CURRENT_PENDING_WAKEUP_SCHEMA_VERSION,
     taskId: mailbox.target.taskId,
     reasons: [...mailbox.pending.reasons],
     requestCount: mailbox.pending.requestCount,
