@@ -3948,6 +3948,61 @@ test("a WorkItem can provision from an explicit Project ref and capture only its
   );
 });
 
+test("explicit base mismatch does not retain an unadopted WorkItem worktree", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const requestedBaseCommit = execFileSync(
+    "git", ["-C", repositoryPath, "rev-parse", "HEAD"], { encoding: "utf8" }
+  ).trim();
+  execFileSync("git", [
+    "-C", repositoryPath,
+    "commit", "--allow-empty", "-qm", "stale managed branch"
+  ]);
+  const staleBranchCommit = execFileSync(
+    "git", ["-C", repositoryPath, "rev-parse", "HEAD"], { encoding: "utf8" }
+  ).trim();
+  execFileSync("git", [
+    "-C", repositoryPath, "branch", "origin/master", requestedBaseCommit
+  ]);
+
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Reject stale explicit base", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: "HEAD"
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const result = runTaskCommand([
+    "work", "create", task.id, "Stale explicit base",
+    "--project", project.id,
+    "--base-ref", `${project.id}=origin/master`,
+    "--role", "worker"
+  ], store, { now: () => new Date(NOW) });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const identity = worktreeIdentity(task.id, result.data.workItem.id);
+  execFileSync("git", [
+    "-C", repositoryPath, "branch", identity.branch, staleBranchCommit
+  ]);
+
+  await assert.rejects(
+    preparer.prepareWorkItemWorkspace(task.id, result.data.workItem.id),
+    /did not start at its requested base ref/u
+  );
+  assert.equal(store.getWorkItemWorkspace(task.id, result.data.workItem.id), null);
+  assert.equal(
+    existsSync(join(workspace, "worktree", project.name, identity.directory)),
+    false
+  );
+  assert.equal(
+    execFileSync("git", ["-C", repositoryPath, "rev-parse", identity.branch], {
+      encoding: "utf8"
+    }).trim(),
+    staleBranchCommit
+  );
+});
+
 test("explicit WorkItem base refs reject unbound, read-only, and invalid refs without creating a workspace", async (t) => {
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);

@@ -278,6 +278,26 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           roleName: item.id,
           baseRef
         });
+        const entry: WorkspaceProjectEntry = {
+          projectId: project.id,
+          directory: binding.directory,
+          access: "write",
+          path: physical.path,
+          branch: physical.branch,
+          baseRef: previous?.access === "write" ? previous.baseRef : baseRef,
+          // The recorded base is the immutable capture boundary. An existing
+          // worktree reports its current HEAD from ensureWorktree(), which
+          // may already contain committed Worker changes and must never
+          // replace that boundary during scope expansion or reconciliation.
+          baseCommit: previous?.access === "write"
+            ? previous.baseCommit
+            : physical.baseCommit
+        };
+        // Track the physical entry before any postcondition check. If a
+        // freshly attached deterministic branch is rejected below, the
+        // catch-path must remove its unadopted worktree even though no
+        // durable ManagedWorkspace has been written yet.
+        prepared.push({ project, entry });
         if (previous?.access === "write" && (
           physical.path !== previous.path
           || physical.branch !== previous.branch
@@ -309,24 +329,6 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             + `${item.id}/${project.id}.`
           );
         }
-        prepared.push({
-          project,
-          entry: {
-            projectId: project.id,
-            directory: binding.directory,
-            access: "write",
-            path: physical.path,
-            branch: physical.branch,
-            baseRef: previous?.access === "write" ? previous.baseRef : baseRef,
-            // The recorded base is the immutable capture boundary. An existing
-            // worktree reports its current HEAD from ensureWorktree(), which
-            // may already contain committed Worker changes and must never
-            // replace that boundary during scope expansion or reconciliation.
-            baseCommit: previous?.access === "write"
-              ? previous.baseCommit
-              : physical.baseCommit
-          }
-        });
       }
       await ensureWorkspaceView(root, prepared.map(({ entry }) => entry));
       const workspace = createManagedWorkspace({
