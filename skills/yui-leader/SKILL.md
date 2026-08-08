@@ -17,6 +17,17 @@ Do not invent another execution entity or a `yui ... subagent` command.
 
 ## Lead with judgment
 
+- Keep the runtime layers distinct in every handoff: Yui Core supplies durable
+  identity, lifecycle, access, workspace, and exact-yield safety; this generic
+  role Skill supplies portable collaboration behavior; the bound Project
+  supplies its own Policy and Knowledge; and the Task Contract supplies the
+  current objective, scope, acceptance, and evidence. Do not turn a Yui
+  repository convention into a generic role requirement.
+- For a Project-backed Task, follow the Project's existing Policy and
+  Knowledge through the context pointers (`yui project show`, then the
+  relevant `yui project knowledge` records). Keep implementation commands,
+  migration rules, release checks, and provider-specific behavior in that
+  Project-owned layer.
 - Start from the user's core problem, desired outcome, and real constraints.
   Derive the smallest sufficient design from first principles before choosing
   an implementation pattern.
@@ -135,7 +146,8 @@ inside a fresh ReviewRound-owned worktree created from the frozen Candidate
 commit. Never reuse the Candidate/Worker workspace or its implementation Role
 Session. Codex and Claude may use their normal configured full capability in
 that isolated worktree; the behavioral boundary forbids push, Integration,
-Task mutation, other workspaces, stable checkouts, and real YUI_HOME. When
+Task mutation, other workspaces, stable checkouts, and the real Yui control-plane
+home. When
 creating an explicit Task Role binding, also set and read back the required
 model and effort instead of relying on CLI defaults.
 Every managed reviewer must deliver through the current Run's exact
@@ -234,7 +246,7 @@ WorkItem summary; preserve earlier round facts when updating it:
 
 ```text
 executor=subagent; profile=reviewer@3; model=inherited; effort=inherited;
-round=2; result=2 findings fixed; checks=npm test passed
+  round=2; result=2 findings fixed; checks=Project checks passed
 ```
 
 Use `model=unknown` or `effort=unknown` when the runtime does not expose the
@@ -325,6 +337,11 @@ ReviewRounds, checks, and workspace through `task context`.
   terminal. Never bypass an active round.
 - `leader`: decide whether the existing evidence is sufficient. Request Agent
   review with `yui task work review <work-id>` when it adds useful evidence.
+- `final`: for normal software delivery, keep WorkItem acceptance and
+  integration independent, then request one fresh ReviewRound over the frozen,
+  integrated Task candidate before completing the Task. The final Reviewer
+  evaluates the complete result across bound Projects; it is not a second
+  per-WorkItem approval protocol.
 - A completed review is advice. Decide whether to accept, reject, review again,
   or ask the user.
 - A failed review is terminal evidence, not an automatic retry. Retry with a
@@ -359,8 +376,9 @@ yui task work accept <work-id> --summary "<acceptance and integration evidence>"
 ```
 
 `--check` commands run from the selected Project's integration candidate root.
-Keep them Project-relative, for example `npm test`, not
-`cd <project> && npm test`.
+Keep them Project-relative and take the exact commands from Project Policy (for
+example, a Project may document `npm test`); do not invent a repository-specific
+command or use `cd <project> && npm test` as a generic default.
 
 Candidate and ReviewRound history is retained under the same WorkItem. Every
 retry round must also retain its result and checks in the WorkItem summary.

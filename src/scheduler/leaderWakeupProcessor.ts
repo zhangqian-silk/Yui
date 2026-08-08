@@ -95,7 +95,8 @@ export async function processLeaderWakeups(
       const input = markYuiRunInput(leaderWakeupInput(
         task.id,
         runId,
-        wakeup.reasons
+        wakeup.reasons,
+        task.projectBindings
       ), runId, taskRoleSessionTitle(task, role.name));
       run = createAgentRun(
         runId,
@@ -296,15 +297,19 @@ function hasNativeSession(
 function leaderWakeupInput(
   taskId: string,
   runId: string,
-  reasons: readonly string[]
+  reasons: readonly string[],
+  projectBindings: readonly Readonly<{ projectId: string; directory: string }>[]
 ): string {
   const lines: string[] = [
     "Follow the injected yui-leader Skill for this Yui wakeup.",
     `Current Leader Run: ${runId}.`,
     `Yui wakeup reasons: ${reasons.join(", ")}.`,
     `Read the authoritative context with yui task context ${taskId}.`,
+    "Keep the context layers separate: Yui Core owns durable identity, lifecycle, access, workspace, and exact-yield safety; the generic role Skill owns portable collaboration behavior; Project Policy/Knowledge owns project-specific build, test, migration, release, and review rules; the Task Contract owns this Task's objective, scope, acceptance, and evidence.",
     "For role-run-stalled or runtime-health attention, diagnose from the exact Run/Event/Session and related WorkItem/Review/Integration records. Preserve the current fence and write a Task Message only for a new root cause, impact, recovery action, acceptance decision, or user-relevant conclusion; an unchanged healthy wait is zero Message.",
-    `If the Task is Project-backed, read its catalog entry with yui project show <project> and inspect relevant Yui-maintained knowledge with yui project knowledge list <project> and yui project knowledge show <project> <knowledge>.`,
+    projectBindings.length === 0
+      ? "This Task has no bound Project Policy; do not invent repository-specific rules."
+      : `Project Policy references: ${projectBindings.map((binding) => `${binding.directory} (${binding.projectId})`).join(", ")}. Read each with yui project show <project>, then yui project knowledge list <project> and yui project knowledge show <project> <knowledge>.`,
     "Use narrower Task message, WorkItem, decision, milestone, and input commands only when a specific record needs closer inspection.",
     `When the requested outcome is finished and there are no active Worker Runs or unresolved inputs, complete the Task with yui task complete ${taskId} --summary-file - and a quoted heredoc containing the final outcome and evidence.`,
     `Before ending this turn, if the Task was not completed and no InputRequest terminalized this Run, release the active fence with yui task run yield ${runId} --summary-file - and a quoted heredoc containing the current result or waiting state. In particular, yield before waiting for Worker results; do not end the native turn while this Run remains active. The yield command must be the final tool action: after it succeeds, stop immediately and do not inspect, poll, accept, or perform further work in the same native turn.`

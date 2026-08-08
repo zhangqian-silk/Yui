@@ -2,6 +2,17 @@ import type { Role } from "../role/role.js";
 
 export type DispatchContextStore = Readonly<Record<string, never>>;
 
+/** Stable Project references that tell an Agent where Project Policy lives.
+ *
+ * Policy remains a Yui-maintained Project record (or a configured Project
+ * Skill); the dispatch only carries pointers so a launch cannot silently turn
+ * repository prose into a second source of truth.
+ */
+export type ProjectPolicyReference = Readonly<{
+  projectId: string;
+  directory?: string;
+}>;
+
 export type BuildRoleContextInput = Readonly<{
   taskId: string;
   role: Role;
@@ -18,6 +29,7 @@ export type BuildRoleContextInput = Readonly<{
       access: "read" | "write";
     }>[];
   }>;
+  projectPolicy?: readonly ProjectPolicyReference[];
 }>;
 
 /** Compatibility entry point used by the restored Task workflow. */
@@ -26,7 +38,7 @@ export function compileDispatchInput(
   taskId: string,
   role: Role,
   input: string,
-  workContext: Pick<BuildRoleContextInput, "workItem" | "workspace"> = {}
+  workContext: Pick<BuildRoleContextInput, "workItem" | "workspace" | "projectPolicy"> = {}
 ): string {
   return buildRoleContext({ taskId, role, input, ...workContext });
 }
@@ -105,6 +117,7 @@ function renderDispatchContext(
     : [];
   const rendered = [
     `Follow the injected yui-${kind} Skill for this Yui dispatch.`,
+    renderContextLayers(context, kind),
     profileLines.join("\n"),
     workLines.length === 0 ? null : workLines.join("\n"),
     "Yui dispatch:",
@@ -114,6 +127,28 @@ function renderDispatchContext(
   return kind === "worker"
     ? ensureWorkerRunCompletionRequirement(rendered)
     : rendered;
+}
+
+function renderContextLayers(
+  context: BuildRoleContextInput,
+  kind: "leader" | "worker"
+): string {
+  const projects = context.projectPolicy ?? [];
+  const policyLines = projects.length === 0
+    ? ["- none (this Task is not Project-backed)"]
+    : projects.map(({ projectId, directory }) => {
+        const label = directory === undefined ? projectId : `${directory} (${projectId})`;
+        return `- ${label}: \`yui project show ${projectId}\`; then \`yui project knowledge list ${projectId}\` and show the relevant entries`;
+      });
+  return [
+    "Context layers:",
+    "- Yui Core: durable identity, lifecycle, access, workspace, and exact handoff safety.",
+    `- Generic ${kind} Skill: reusable role behavior and evidence discipline.`,
+    "- Project Policy: project-owned build, test, migration, release, and review rules; it is not a Yui Core default.",
+    ...["Project Policy references:", ...policyLines],
+    "- Task Contract: the current Task brief, WorkItem objective, acceptance criteria, and dispatch input.",
+    "Do not import rules from another Project or Task, and do not infer Project Policy from repository files alone."
+  ].join("\n");
 }
 
 function renderWorkerScope(context: BuildRoleContextInput): string[] {

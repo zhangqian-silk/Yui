@@ -1914,6 +1914,10 @@ function dispatchWork(
     const input = markYuiRunInput(
       compileDispatchInput({}, task.id, role, rawInput, {
         workItem: item,
+        projectPolicy: task.projectBindings.map(({ projectId, directory }) => ({
+          projectId,
+          directory
+        })),
         ...(workspace?.owner.type === "work-item"
           && workspace.owner.workItemId === item.id
           ? { workspace }
@@ -2861,6 +2865,10 @@ export function dispatchPreparedReviewRound(
     const input = markYuiRunInput(
       compileDispatchInput({}, taskId, reviewer, rawInput, {
         workItem: item,
+        projectPolicy: task.projectBindings.map(({ projectId, directory }) => ({
+          projectId,
+          directory
+        })),
         workspace: round.workspace
       }),
       runId,

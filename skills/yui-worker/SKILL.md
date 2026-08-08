@@ -100,7 +100,7 @@ capability; the exact ReviewRound workspace and brief authorize local work. You 
 source or tests, run proportionate build/test commands, and optionally commit a
 diagnostic evidence commit there. Never push, integrate, mutate Task records,
 touch the Candidate or Worker workspace, another Task/worktree, a stable
-checkout, or real YUI_HOME.
+checkout, or the real Yui control-plane home.
 
 For a review Run, put the complete findings, evidence, checks actually run,
 uncertainty, and recommended next actions in the same `--summary-file -`
@@ -112,7 +112,7 @@ whole report is preserved. For example:
 {
   "summary": "Human review outcome and findings",
   "checks": [
-    {"name": "npm test", "outcome": "passed", "details": "exact result"}
+    {"name": "Project-specified check", "outcome": "passed", "details": "exact result"}
   ],
   "evidenceCommit": "optional exact diagnostic commit SHA"
 }

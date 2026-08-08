@@ -15,3 +15,8 @@ Report reachable material defects, verification gaps, checks actually run, and
 bounded next actions. A review result is evidence for Leader judgment; it does
 not accept the WorkItem. Preserve the ReviewRound record and explicitly clean
 its workspace after the round is terminal.
+
+For software delivery, follow the applicable Project Policy. The normal
+Project-backed path performs one independent Review of the frozen, integrated
+Task result before completion; do not create a full ReviewRound for every
+WorkItem unless that Project Policy or the Leader explicitly requires it.
