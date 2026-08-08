@@ -234,6 +234,19 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     }
 
     const writeProjects = new Set(item.writeProjectIds);
+    const boundProjects = new Set(task.projectBindings.map(({ projectId }) => projectId));
+    for (const baseRef of item.baseRefs ?? []) {
+      if (!boundProjects.has(baseRef.projectId)) {
+        throw new Error(
+          `WorkItem base-ref Project is not bound to its Task: ${item.id}/${baseRef.projectId}.`
+        );
+      }
+      if (!writeProjects.has(baseRef.projectId)) {
+        throw new Error(
+          `WorkItem base-ref Project is not writable: ${item.id}/${baseRef.projectId}.`
+        );
+      }
+    }
     const root = this.#workItemWorkspaceRoot(task.id, item.id);
     const prepared: Array<Readonly<{ project: Project; entry: WorkspaceProjectEntry }>> = [];
     try {
@@ -249,12 +262,21 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         }
         const previous = existing?.entries.find(({ projectId }) => projectId === project.id);
         const head = await this.git.inspect(mainEntry.path, "HEAD");
+        const requestedBaseRef = item.baseRefs?.find(({ projectId }) => (
+          projectId === project.id
+        ))?.baseRef;
+        const baseRef = previous?.access === "write"
+          ? previous.baseCommit
+          : requestedBaseRef ?? head.baseCommit;
+        const requestedBase = previous?.access === "write" || requestedBaseRef === undefined
+          ? null
+          : await this.git.inspect(project.path, requestedBaseRef);
         const physical = await this.git.ensureWorktree({
           repositoryPath: project.path,
           container: this.#projectContainer(project.name),
           taskId: task.id,
           roleName: item.id,
-          baseRef: previous?.access === "write" ? previous.baseCommit : head.baseCommit
+          baseRef
         });
         if (previous?.access === "write" && (
           physical.path !== previous.path
@@ -262,6 +284,29 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         )) {
           throw new Error(
             `Existing WorkItem Project workspace identity changed: ${item.id}/${project.id}.`
+          );
+        }
+        if (previous?.access === "write") {
+          if (requestedBaseRef === undefined && previous.baseRef !== previous.baseCommit) {
+            throw new Error(
+              `Existing WorkItem Project base ref record changed: ${item.id}/${project.id}.`
+            );
+          }
+          if (requestedBaseRef !== undefined && requestedBaseRef !== previous.baseRef) {
+            throw new Error(
+              `Existing WorkItem Project base ref changed: ${item.id}/${project.id}.`
+            );
+          }
+          if (!await this.git.isAncestor(project.path, previous.baseCommit, physical.baseCommit)) {
+            throw new Error(
+              `Existing WorkItem Project HEAD does not descend from its frozen base: `
+              + `${item.id}/${project.id}.`
+            );
+          }
+        } else if (requestedBase !== null && physical.baseCommit !== requestedBase.baseCommit) {
+          throw new Error(
+            `WorkItem Project workspace did not start at its requested base ref: `
+            + `${item.id}/${project.id}.`
           );
         }
         prepared.push({
@@ -272,7 +317,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             access: "write",
             path: physical.path,
             branch: physical.branch,
-            baseRef: previous?.access === "write" ? previous.baseRef : head.baseCommit,
+            baseRef: previous?.access === "write" ? previous.baseRef : baseRef,
             // The recorded base is the immutable capture boundary. An existing
             // worktree reports its current HEAD from ensureWorktree(), which
             // may already contain committed Worker changes and must never
