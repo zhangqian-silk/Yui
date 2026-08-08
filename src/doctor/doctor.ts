@@ -18,6 +18,10 @@ import {
   inspectStorageSchema,
   type StorageSchemaState
 } from "../storage/storageSchema.js";
+import { createEmptyRegistry } from "../storage/migration/index.js";
+import { classifyHome } from "../storage/upgrade/homeClassification.js";
+import { latestStorageVersionState } from "../storage/upgrade/recordVersions.js";
+import type { HomeSnapshot } from "../storage/upgrade/homeMigrationTarget.js";
 import {
   CommandExecutionError,
   type CommandExecutor
@@ -35,6 +39,59 @@ export type DoctorCheck = Readonly<{
   status: DoctorStatus;
   detail: string;
 }>;
+
+/**
+ * The storage-relevant doctor checks, in the order they are produced. Post-update
+ * verification (P1-3) keys off exactly these: a green `yui doctor` for the update
+ * flow means every one of these is `ok`. Tool/agent checks are diagnostic only
+ * and never block an update.
+ */
+export const STORAGE_DOCTOR_CHECK_NAMES = Object.freeze([
+  "storage schema",
+  "storage compatibility",
+  "storage state"
+] as const);
+
+/** A machine-readable summary of storage health, embedded in `--json doctor`. */
+export type StorageHealthSummary = Readonly<{
+  /** True iff every storage check is `ok`. */
+  healthy: boolean;
+  /** The storage checks that are not `ok` (empty when healthy). */
+  blocking: readonly DoctorCheck[];
+}>;
+
+/** The full machine-readable doctor result surfaced by `yui --json doctor`. */
+export type DoctorReport = Readonly<{
+  checks: readonly DoctorCheck[];
+  storage: StorageHealthSummary;
+}>;
+
+/**
+ * Classify the storage checks into a machine-readable health verdict. This is the
+ * canonical, parseable signal the update post-verify consumes (P1-3): storage is
+ * healthy only when schema, compatibility, and state are all `ok`. Any
+ * `unsupported` (version mismatch / needs-new-version), `invalid` (corrupted /
+ * unreadable), or `missing` (uninitialized) storage check is blocking — even
+ * though `yui doctor` itself exits 0.
+ */
+export function summarizeStorageHealth(
+  checks: readonly DoctorCheck[]
+): StorageHealthSummary {
+  const names = new Set<string>(STORAGE_DOCTOR_CHECK_NAMES);
+  const blocking = checks.filter(
+    (check) => names.has(check.name) && check.status !== "ok"
+  );
+  return { healthy: blocking.length === 0, blocking };
+}
+
+/** Build the full machine-readable doctor report (checks + storage health). */
+export function buildDoctorReport(
+  env: NodeJS.ProcessEnv,
+  executor: CommandExecutor
+): DoctorReport {
+  const checks = getDoctorChecks(env, executor);
+  return { checks, storage: summarizeStorageHealth(checks) };
+}
 
 type StorageInspection = Readonly<{
   check: DoctorCheck;
@@ -69,6 +126,7 @@ export function getDoctorChecks(
   return [
     homeCheck,
     schemaCheck,
+    checkCompatibility(home, homeCheck, schema),
     storage.check,
     ...(domain === undefined ? [] : [domain]),
     checkExecutable("git", env.YUI_GIT_BIN ?? "git", ["--version"], executor),
@@ -173,6 +231,67 @@ function checkSchema(state: SchemaInspection): DoctorCheck {
       return { name: "storage schema", status: "invalid", detail: state.detail };
     case "read-error":
       return { name: "storage schema", status: "invalid", detail: state.detail };
+  }
+}
+
+/**
+ * The four-state storage compatibility check: USABLE / MIGRATABLE /
+ * NEEDS_NEW_VERSION / CORRUPTED. This complements the raw "storage schema" check
+ * with the migration framework's verdict, so a user sees whether a Home can be
+ * used as-is, upgraded with `yui upgrade`, needs a newer release, or is damaged.
+ * The registry ships EMPTY, so any strictly-older Home reads as NEEDS_NEW_VERSION
+ * with a precise missing-step reason, and CORRUPTED is only ever a real
+ * structural/reference failure — never inferred from a version number.
+ */
+function checkCompatibility(
+  home: string,
+  homeCheck: DoctorCheck,
+  schema: SchemaInspection
+): DoctorCheck {
+  const name = "storage compatibility";
+  if (homeCheck.status !== "ok") {
+    return { name, status: homeCheck.status, detail: homeCheck.detail };
+  }
+  if (schema.status === "uninitialized") {
+    return { name, status: "missing", detail: "run yui setup" };
+  }
+  if (schema.status === "read-error") {
+    return { name, status: "invalid", detail: schema.detail };
+  }
+  let classification;
+  try {
+    classification = classifyHome({
+      home,
+      registry: createEmptyRegistry<HomeSnapshot>(),
+      latest: latestStorageVersionState()
+    });
+  } catch (error) {
+    return { name, status: "invalid", detail: errorMessage(error) };
+  }
+  const verdict = classification.classification.verdict;
+  const versions =
+    `layout=${classification.layoutVersion ?? "?"}/${classification.latestLayoutVersion}`
+    + ` aggregate=${classification.aggregateVersion ?? "?"}/${classification.latestAggregateVersion}`;
+  const incompatible = classification.incompatibleComponent === undefined
+    ? ""
+    : ` incompatibleComponent=${classification.incompatibleComponent}`;
+  switch (verdict) {
+    case "USABLE":
+      return { name, status: "ok", detail: `USABLE ${versions}` };
+    case "MIGRATABLE":
+      return { name, status: "ok", detail: `MIGRATABLE ${versions}; run yui upgrade` };
+    case "NEEDS_NEW_VERSION":
+      return {
+        name,
+        status: "unsupported",
+        detail: `NEEDS_NEW_VERSION ${versions}${incompatible}; ${classification.classification.blocker.reason}`
+      };
+    case "CORRUPTED":
+      return {
+        name,
+        status: "invalid",
+        detail: `CORRUPTED: ${classification.classification.detail}`
+      };
   }
 }
 

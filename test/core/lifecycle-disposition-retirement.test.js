@@ -79,10 +79,12 @@ function prepareRun(store, {
   adapterId = "claude",
   agentId = `${adapterId}-primary`,
   nativeSessionId = "native-1",
-  launchId = "launch-1"
+  launchId = "launch-1",
+  runId = "agent-run-1",
+  reuseExistingSession = false
 } = {}) {
   let run = createAgentRun(
-    "agent-run-1",
+    runId,
     "task-1",
     "worker",
     "new",
@@ -116,19 +118,25 @@ function prepareRun(store, {
         id: run.id
       }));
     }
-    let sessions = createRoleSessionSet(
-      { scope: "task", taskId: run.taskId, roleName: run.roleName },
-      agentId,
-      FIRST
-    );
-    sessions = recordRoleAgentSession(sessions, {
-      agentId,
-      adapterId,
-      nativeSessionId,
-      launchId,
-      policy: "fixed",
-      status: "running"
-    }, FIRST);
+    let sessions = tx.getTaskRoleSessionSet(run.taskId, run.roleName);
+    if (sessions === null) {
+      if (reuseExistingSession) throw new Error("Expected an existing Task Role Session.");
+      sessions = createRoleSessionSet(
+        { scope: "task", taskId: run.taskId, roleName: run.roleName },
+        agentId,
+        FIRST
+      );
+    }
+    if (!reuseExistingSession) {
+      sessions = recordRoleAgentSession(sessions, {
+        agentId,
+        adapterId,
+        nativeSessionId,
+        launchId,
+        policy: "fixed",
+        status: "running"
+      }, FIRST);
+    }
     sessions = bindTaskRoleRun(sessions, {
       agentId,
       runId: run.id,
@@ -196,6 +204,118 @@ test("Task Role reset fails exact work and forgets only the current native gener
     turnId: "late-turn",
     runId: run.id
   }), "obsolete");
+});
+
+test("public Task Role reset retires an exact opaque launch and permits the next generation", (t) => {
+  const { store, task, agent } = fixture(t, { adapterId: "codex" });
+  const run = prepareRun(store, {
+    adapterId: "codex",
+    agentId: agent.id,
+    nativeSessionId: "native-opaque-old",
+    launchId: "launch-opaque-old"
+  });
+
+  store.transaction((tx) => {
+    const sessions = tx.getTaskRoleSessionSet(task.id, run.roleName);
+    assert.notEqual(sessions, null);
+    delete sessions.sessions[sessions.activeAgentId].nativeSessionId;
+    tx.saveTaskRoleSessionSet(sessions);
+  });
+
+  const result = runTaskCommand([
+    "role", "reset", task.id, run.roleName,
+    "--reason", "Retire the exact opaque generation."
+  ], store, leaderOptions);
+
+  assert.equal(result.kind, "output");
+  assert.equal(store.getAgentRun(task.id, run.id).status, "failed");
+  assert.equal(store.getActiveAgentRun(task.id, run.roleName), null);
+  const sessions = store.getTaskRoleSessionSet(task.id, run.roleName);
+  assert.deepEqual(sessions.sessions, {});
+  assert.equal(sessions.history.length, 1);
+  assert.equal("nativeSessionId" in sessions.history[0], false);
+  const resetEvent = store.listEvents(task.id).find(
+    (event) => event.type === "runtime.role-session-reset"
+  );
+  assert.notEqual(resetEvent, undefined);
+  assert.equal("nativeSessionId" in resetEvent.payload, false);
+  assert.equal(resetEvent.payload.runId, run.id);
+  assert.equal(resetEvent.payload.roleName, run.roleName);
+
+  assert.equal(new FileSchedulerStoreAdapter(store).completeRuntimeCleanup({
+    kind: "role-runtime",
+    taskId: task.id,
+    roleName: run.roleName
+  }, THIRD), true);
+
+  store.transaction((tx) => {
+    let next = tx.getTaskRoleSessionSet(task.id, run.roleName);
+    next = recordRoleAgentSession(next, {
+      agentId: agent.id,
+      adapterId: agent.adapterId,
+      nativeSessionId: "native-opaque-second",
+      launchId: "launch-opaque-second",
+      policy: "fixed",
+      status: "running"
+    }, THIRD);
+    delete next.sessions[next.activeAgentId].nativeSessionId;
+    tx.saveTaskRoleSessionSet(next);
+  });
+  assert.equal(
+    store.getTaskRoleSessionSet(task.id, run.roleName).sessions[agent.id].launchId,
+    "launch-opaque-second"
+  );
+
+  const secondRun = prepareRun(store, {
+    adapterId: "codex",
+    agentId: agent.id,
+    runId: "agent-run-2",
+    reuseExistingSession: true
+  });
+  const secondResult = runTaskCommand([
+    "role", "reset", task.id, secondRun.roleName,
+    "--reason", "Retire the second exact opaque generation."
+  ], store, leaderOptions);
+
+  assert.equal(secondResult.kind, "output");
+  assert.equal(store.getAgentRun(task.id, secondRun.id).status, "failed");
+  const history = store.getTaskRoleSessionSet(task.id, secondRun.roleName).history;
+  assert.equal(history.length, 2);
+  assert.deepEqual(history.map((entry) => ({
+    hasNativeSessionId: Object.hasOwn(entry, "nativeSessionId"),
+    nativeSessionId: entry.nativeSessionId,
+    launchId: entry.launchId
+  })), [
+    { hasNativeSessionId: false, nativeSessionId: undefined, launchId: "launch-opaque-old" },
+    { hasNativeSessionId: false, nativeSessionId: undefined, launchId: "launch-opaque-second" }
+  ]);
+  const resetEvents = store.listEvents(task.id).filter(
+    (event) => event.type === "runtime.role-session-reset"
+  );
+  assert.equal(resetEvents.length, 2);
+  assert.equal(resetEvents.every((event) => !("nativeSessionId" in event.payload)), true);
+
+  assert.equal(new FileSchedulerStoreAdapter(store).completeRuntimeCleanup({
+    kind: "role-runtime",
+    taskId: task.id,
+    roleName: secondRun.roleName
+  }, THIRD), true);
+  store.transaction((tx) => {
+    let next = tx.getTaskRoleSessionSet(task.id, secondRun.roleName);
+    next = recordRoleAgentSession(next, {
+      agentId: agent.id,
+      adapterId: agent.adapterId,
+      nativeSessionId: "native-opaque-next",
+      launchId: "launch-opaque-next",
+      policy: "fixed",
+      status: "ready"
+    }, THIRD);
+    tx.saveTaskRoleSessionSet(next);
+  });
+  assert.equal(
+    store.getTaskRoleSessionSet(task.id, secondRun.roleName).sessions[agent.id].nativeSessionId,
+    "native-opaque-next"
+  );
 });
 
 test("the shared exact-Run terminal boundary does not infer runtime cleanup", (t) => {

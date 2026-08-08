@@ -47,7 +47,11 @@ import type {
   WorkItemIntegrationProof
 } from "../workspace/workItemChangeSetManager.js";
 import { cancelInputRequest } from "../input/inputRequest.js";
-import { terminalizeExactTaskRun } from "../lifecycle/exactRunTerminalization.js";
+import {
+  recoverExactAgentRun,
+  terminalizeExactTaskRun,
+  type ExactAgentRunRecoveryAction
+} from "../lifecycle/exactRunTerminalization.js";
 import { resetTaskRoleSessionGeneration } from "../lifecycle/taskRoleSessionReset.js";
 import {
   activeRoleAgentBinding,
@@ -2355,6 +2359,7 @@ function taskRunCommand(
   const [command, ...rest] = args;
   if (command === "list") return output(listRuns(rest, store, options));
   if (command === "retry") return output(retryRun(rest, store, options));
+  if (command === "recover") return output(recoverRun(rest, store, options));
   if (command === "yield") return yieldRun(rest, store, options);
   if (command === "checkpoint") return output(checkpointRun(rest, store, options));
   throw usageError(command === undefined
@@ -2485,6 +2490,95 @@ function retryRun(
   });
   notifyMailbox(options.runtime, roleMailbox(retried.taskId, retried.roleName), retried.taskId);
   return `Retry queued as ${retried.id} for ${retried.taskId}/${retried.roleName}\n`;
+}
+
+/**
+ * Records one explicit Leader recovery decision against an exact live Run.
+ * Retry and Session replacement remain requests: the Controller never sends
+ * another input or changes a native generation from this command.
+ */
+function recoverRun(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  const usage = "Task run recover usage: yui task run recover <task>/<run> --action <diagnose|retry|replace-session|terminate> --expected-progress-at <timestamp> --provider-acceptance <accepted|rejected|ambiguous> --reason <text> [--agent-id <id>] [--adapter-id <id>] [--native-session-id <id>] [--launch-id <id>].";
+  const parsed = parseTail(
+    args,
+    new Set([
+      "--action",
+      "--expected-progress-at",
+      "--progress-at",
+      "--provider-acceptance",
+      "--reason",
+      "--role",
+      "--agent-id",
+      "--adapter-id",
+      "--native-session-id",
+      "--launch-id"
+    ]),
+    usage
+  );
+  exactPositionals(parsed.positionals, 1, usage);
+  const now = clock(options);
+  const input = store.transaction((tx) => {
+    const active = requireRun(tx, parsed.positionals[0], options);
+    const task = requireTask(tx, active.taskId);
+    if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "recovering a run"));
+    if (taskActor(options, task.id) !== "leader") {
+      throw usageError("Only the Task Leader may control exact Agent Run recovery.");
+    }
+    const roleName = parsed.options.get("--role") ?? active.roleName;
+    if (roleName !== active.roleName) {
+      throw usageError(`Recovery Role does not match Run ${active.id}: ${roleName}.`);
+    }
+    const role = requireRole(tx, task.id, roleName);
+    const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
+    const session = sessions?.sessions[sessions.activeAgentId];
+    const action = parseRecoveryAction(parsed.options.get("--action"), usage);
+    const expectedProgressAt = parsed.options.get("--expected-progress-at")
+      ?? parsed.options.get("--progress-at");
+    if (expectedProgressAt === undefined) throw usageError("--expected-progress-at is required.", usage);
+    const providerAcceptance = parseProviderAcceptance(
+      parsed.options.get("--provider-acceptance"),
+      usage
+    );
+    const agentId = parsed.options.get("--agent-id") ?? active.effective.agentId;
+    const adapterId = parsed.options.get("--adapter-id") ?? active.effective.adapterId;
+    const nativeSessionId = parsed.options.get("--native-session-id")
+      ?? session?.nativeSessionId;
+    const launchId = parsed.options.get("--launch-id") ?? session?.launchId;
+    return {
+      taskId: task.id,
+      roleName: role.name,
+      runId: active.id,
+      agentId,
+      adapterId,
+      ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
+      ...(launchId === undefined ? {} : { launchId }),
+      expectedProgressAt,
+      providerAcceptance,
+      action,
+      reason: requiredOption(parsed.options, "--reason"),
+      now
+    };
+  });
+  const result = recoverExactAgentRun(store, input);
+  if (result.disposition !== "applied") {
+    throw usageError(
+      `Exact Run recovery ${result.disposition}: ${result.reason ?? "state changed"}.`,
+      usage
+    );
+  }
+  // The durable recovery request is committed before asking the Controller to
+  // wake the owning Leader; a failed transaction must not leak a signal.
+  if (result.run !== null && result.run.roleName !== LEADER_ROLE) {
+    notifyMailbox(options.runtime, leaderMailbox(result.run.taskId), result.run.taskId);
+  }
+  const followup = result.requiresExplicitFollowup === true
+    ? " Leader follow-up is required; no provider input or Session action was performed."
+    : "";
+  return `Recorded exact ${result.action} recovery for ${result.run?.id ?? "unknown Run"}.${followup}\n`;
 }
 
 function yieldRun(
@@ -3258,6 +3352,27 @@ function parseWorkStatus(value: string): WorkItemStatus {
   if (value === "done") return "completed";
   if (value === "failed") return "failed";
   throw usageError(`Invalid work item status: ${value}.`);
+}
+
+function parseRecoveryAction(
+  value: string | undefined,
+  usage: string
+): ExactAgentRunRecoveryAction {
+  if (
+    value === "diagnose"
+    || value === "retry"
+    || value === "replace-session"
+    || value === "terminate"
+  ) return value;
+  throw usageError("--action must be diagnose, retry, replace-session, or terminate.", usage);
+}
+
+function parseProviderAcceptance(
+  value: string | undefined,
+  usage: string
+): "accepted" | "rejected" | "ambiguous" {
+  if (value === "accepted" || value === "rejected" || value === "ambiguous") return value;
+  throw usageError("--provider-acceptance must be accepted, rejected, or ambiguous.", usage);
 }
 
 function presentWorkStatus(status: WorkItemStatus): string {

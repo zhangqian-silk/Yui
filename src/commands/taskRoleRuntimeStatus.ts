@@ -21,6 +21,7 @@ import {
 export type TaskRoleHealth =
   | "idle"
   | "starting"
+  | "awaiting-provider-acceptance"
   | "running"
   | "ready"
   | "blocked-input"
@@ -97,7 +98,7 @@ export function inspectTaskRoleRuntimeStatuses(
 export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): string {
   const activeRun = status.activeRun === null
     ? "-"
-    : `${status.activeRun.id} (${status.activeRun.deliveredAt === undefined ? "queued" : "delivered"})`;
+    : `${status.activeRun.id} (${activeRunDeliveryLabel(status.activeRun)})`;
   const activeWork = status.activeWork === null
     ? "-"
     : `${status.activeWork.id} (${status.activeWork.status}) ${status.activeWork.title}`;
@@ -313,6 +314,17 @@ function calculateHealth(
   if (nativeSession?.status === "broken") {
     return { health: "failed", healthReason: "the active native session is broken" };
   }
+  const awaitingProviderAcceptance = activeRun?.pushedAt !== undefined
+    && activeRun.deliveredAt === undefined;
+  if (
+    awaitingProviderAcceptance
+    && tmux.state !== "running"
+  ) {
+    return {
+      health: "needs-attention",
+      healthReason: "the pushed active Run is awaiting provider acceptance and has no live tmux pane"
+    };
+  }
   if (tmux.state === "exited") {
     return { health: "failed", healthReason: "the tmux pane has exited" };
   }
@@ -349,11 +361,24 @@ function calculateHealth(
     };
   }
   if (activeRun !== null) {
-    return activeRun.deliveredAt === undefined
-      ? { health: "starting", healthReason: "the active Run is awaiting tmux delivery" }
-      : { health: "running", healthReason: "the active Run has a live tmux pane" };
+    if (activeRun.deliveredAt !== undefined) {
+      return { health: "running", healthReason: "the active Run has a live tmux pane" };
+    }
+    if (activeRun.pushedAt !== undefined) {
+      return {
+        health: "awaiting-provider-acceptance",
+        healthReason: "the pushed active Run is awaiting provider acceptance"
+      };
+    }
+    return { health: "starting", healthReason: "the active Run is awaiting tmux delivery" };
   }
   return tmux.state === "running"
     ? { health: "ready", healthReason: "the native Agent pane is ready without active work" }
     : { health: "idle", healthReason: "there is no active work or live tmux pane" };
+}
+
+function activeRunDeliveryLabel(run: AgentRun): string {
+  if (run.deliveredAt !== undefined) return "delivered";
+  if (run.pushedAt !== undefined) return "pushed (awaiting provider acceptance)";
+  return "queued";
 }

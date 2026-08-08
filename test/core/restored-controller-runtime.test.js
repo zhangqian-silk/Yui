@@ -130,8 +130,25 @@ test("full controller liveness and stall phases reuse one Role inventory", async
   store.listRoles = () => [role];
   store.getRole = (_taskId, name) => name === role.name ? role : null;
   store.getActiveAgentRun = () => run;
+  store.getRoleSession = () => ({
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "native-1",
+    status: "running",
+    effective: run.effective
+  });
   store.listEvents = () => events;
-  store.recordRoleRunStall = () => "raised";
+  const newerProgressAt = new Date(60_000).toISOString();
+  events.push({
+    type: "run.progress",
+    createdAt: newerProgressAt,
+    payload: { runId: run.id, progressAt: newerProgressAt }
+  });
+  let stallRecords = 0;
+  store.recordRoleRunStall = () => {
+    stallRecords += 1;
+    return "raised";
+  };
   store.hasOpenInputRequest = () => false;
   store.getWorkMailbox = () => null;
   store.listPendingWakeups = () => [];
@@ -142,19 +159,66 @@ test("full controller liveness and stall phases reuse one Role inventory", async
       singleInspections += 1;
       return "present";
     },
-    async inspectRoles(inputs) {
+    async inspectRoles(inputs, requested) {
       inventoryCalls += 1;
+      assert.equal(requested.length, 1);
+      const resourceInput = requested[0];
+      assert.equal(resourceInput.progressAt, newerProgressAt);
       return inputs.map((input) => ({
         taskId: input.taskId,
         roleName: input.roleName,
-        status: "present"
+        status: "present",
+        resource: {
+          observedAt: new Date(31 * 60_000).toISOString(),
+          progressAt: resourceInput.progressAt,
+          identity: {
+            taskId: resourceInput.taskId,
+            roleName: resourceInput.roleName,
+            runId: resourceInput.runId,
+            agentId: resourceInput.agentId,
+            adapterId: resourceInput.adapterId,
+            nativeSessionId: resourceInput.nativeSessionId
+          },
+          active: true,
+          changed: true,
+          cpuTimeMs: 20,
+          rssBytes: 4096
+        }
       }));
     }
   };
 
-  await runControllerSchedulerPass(store, delivery, new Date(31 * 60_000));
+  const resourceSuppressionKeys = new Set();
+  await runControllerSchedulerPass(
+    store,
+    delivery,
+    new Date(31 * 60_000),
+    undefined,
+    { kind: "full" },
+    true,
+    [],
+    undefined,
+    30 * 60_000,
+    resourceSuppressionKeys
+  );
   assert.equal(inventoryCalls, 1);
   assert.equal(singleInspections, 0);
+  assert.equal(stallRecords, 0);
+
+  // The same advisory sample cannot keep the same stale Run healthy forever.
+  await runControllerSchedulerPass(
+    store,
+    delivery,
+    new Date(31 * 60_000),
+    undefined,
+    { kind: "full" },
+    true,
+    [],
+    undefined,
+    30 * 60_000,
+    resourceSuppressionKeys
+  );
+  assert.equal(stallRecords, 1);
 });
 
 test("a due native Turn completion forgets the finalized Run preparation", async () => {
@@ -2391,6 +2455,11 @@ test("background FileTask controller exposes status, scan and stop on one privat
   assert.equal(status.version, YUI_VERSION);
   assert.equal(status.storageLayoutVersion, yuiVersionIdentity().storageLayoutVersion);
   assert.equal(status.aggregateSchemaVersion, yuiVersionIdentity().aggregateSchemaVersion);
+  assert.deepEqual(await callController(home, "controller.identity", {}), {
+    executablePath: process.execPath,
+    args: process.argv.slice(1),
+    version: YUI_VERSION
+  });
   assert.deepEqual(
     await callController(home, "scheduler.signal", { key: "task:task-1" }),
     { accepted: true }
@@ -2586,4 +2655,48 @@ test("controller stop waits until the owned process is no longer reachable", asy
     "controller.status",
     "controller.status"
   ]);
+});
+
+test("fenced Controller stop requires the authenticated replacement PID", async () => {
+  const events = [];
+  let statusCalls = 0;
+  const call = async (_home, method, params) => {
+    events.push({ method, params });
+    if (method === "controller.stop") {
+      assert.deepEqual(params, { expectedPid: 20 });
+      return { stopped: true, pid: 20 };
+    }
+    assert.equal(method, "controller.status");
+    if (statusCalls++ === 0) return { running: true, pid: 20 };
+    throw new ControllerClientError("CONTROLLER_UNAVAILABLE", "Controller is unavailable.");
+  };
+
+  const result = await stopFileTaskController("/tmp/yui-fenced-stop", {
+    call,
+    expectedPid: 20,
+    pollIntervalMs: 1,
+    shutdownTimeoutMs: 100
+  });
+  assert.deepEqual(result, { stopped: true, pid: 20 });
+  assert.deepEqual(events, [
+    { method: "controller.status", params: {} },
+    { method: "controller.stop", params: { expectedPid: 20 } },
+    { method: "controller.status", params: {} }
+  ]);
+});
+
+test("fenced Controller stop refuses a PID mismatch without issuing stop", async () => {
+  let stopCalls = 0;
+  const call = async (_home, method) => {
+    if (method === "controller.stop") {
+      stopCalls += 1;
+      return { stopped: true, pid: 21 };
+    }
+    return { running: true, pid: 21 };
+  };
+  await assert.rejects(
+    stopFileTaskController("/tmp/yui-fenced-stop-mismatch", { call, expectedPid: 20 }),
+    /ownership changed.*expected PID 20.*found 21/i
+  );
+  assert.equal(stopCalls, 0);
 });
