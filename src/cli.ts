@@ -332,7 +332,14 @@ export async function main(): Promise<void> {
     const result = controllerMethod === "restart"
       ? await restartFileTaskController(home, { environment: process.env })
       : await stopFileTaskController(home, { environment: process.env });
-    emit(renderControllerResult(controllerMethod, result));
+    // The update lifecycle needs the authenticated replacement PID returned by
+    // restart/readiness.  Keep stop's long-standing text envelope, while
+    // exposing restart's structured result alongside its human output.
+    emit(
+      renderControllerResult(controllerMethod, result),
+      false,
+      controllerMethod === "restart" ? result : undefined
+    );
     return;
   }
 

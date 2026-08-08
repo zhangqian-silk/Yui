@@ -155,6 +155,13 @@ export type UpdatePorts = Readonly<{
    */
   controllerStatus?: (home: string) => UpdateControllerLifecycleStatus;
   stopController?: (home: string) => UpdateControllerStopResult;
+  /**
+   * Stop only a replacement Controller whose PID was authenticated against the
+   * restart/readiness result for this update attempt.  This is intentionally a
+   * separate seam from the parent-owned initial stop: a mismatched replacement
+   * must never fall back to an un-fenced stop of whatever now owns the Home.
+   */
+  stopReplacementController?: (home: string, pid: number) => UpdateControllerStopResult;
   /** Start the replacement only after binary activation and post-health verification. */
   startController?: (home: string) => void;
   /** Restore the exact identity captured before the update (never the staged binary). */
@@ -419,20 +426,29 @@ function activateAndVerify(
     try {
       ports.startController!(home);
     } catch (error) {
+      const unknownActive = isUnknownActiveControllerFailure(error);
       const failure: UpdateResult = {
         outcome: "aborted",
         phase: "post-verify",
         message:
-          `The replacement Controller could not start after activation and health verification: `
+          `${unknownActive ? "Replacement Controller ownership could not be authenticated safely" : "The replacement Controller could not start after activation and health verification"}: `
           + `${messageOf(error)}.`,
-        action: storageBackupPath === undefined
-          ? "The Home was not migrated. Keep writes quiesced and restore the previously running Controller identity before retrying."
-          : postSwitchRecoveryAction(home, storageBackupPath),
+        action: unknownActive
+          ? unknownActiveControllerAction(home, storageBackupPath)
+          : storageBackupPath === undefined
+            ? "The Home was not migrated. Keep writes quiesced and restore the previously running Controller identity before retrying."
+            : postSwitchRecoveryAction(home, storageBackupPath),
         recoverable: false,
         version: staged.version,
         ...(storageBackupPath === undefined ? {} : { storageBackupPath })
       };
-      return restoreBeforeSwitchOrReport(ports, home, lifecycle, storageBackupPath, failure);
+      // An ownership-unknown mismatch is a live-process blocker, not a
+      // recoverable pre-switch failure.  Restoring the captured identity here
+      // could overwrite or race a foreign process, so leave the Home quiesced
+      // and preserve the explicit manual blocker.
+      return unknownActive
+        ? failure
+        : restoreBeforeSwitchOrReport(ports, home, lifecycle, storageBackupPath, failure);
     }
   }
 
@@ -561,16 +577,18 @@ function restoreBeforeSwitchOrReport(
     ports.restoreController!(home, lifecycle.identity!);
     return failure;
   } catch (error) {
+    // Preserve the original phase, Home-switch evidence, and binary-health
+    // uncertainty guidance.  A restore failure is an appended blocker, not a
+    // replacement generic post-verify result.
     return {
-      outcome: "aborted",
-      phase: "post-verify",
+      ...failure,
       message:
         `${failure.message} The previously running Controller identity could not be restored: `
         + `${messageOf(error)}.`,
       action:
-        "Keep the Home quiesced and resolve the exact old Controller restore failure before retrying; do not start the staged/new Controller blindly.",
-      recoverable: false,
-      version: "version" in failure ? failure.version : undefined
+        `${failure.action} The old Controller restore also failed: ${messageOf(error)}. `
+        + "Keep the Home quiesced; inspect the restore blocker and resolve it before any bounded retry. ",
+      recoverable: false
     };
   }
 }
@@ -592,6 +610,20 @@ function binaryHealthUncertainAction(): string {
   return "The Home was not migrated, but the activated binary failed health verification; do not "
     + "assume the current install is usable. Reinstall Yui, verify `yui version` and `yui doctor`, "
     + "then retry `yui update` before resuming writes.";
+}
+
+function unknownActiveControllerAction(home: string, backupPath: string | undefined): string {
+  const storageEvidence = backupPath === undefined
+    ? "The Home was not migrated."
+    : `The storage switch is committed (backup at ${backupPath}); do not restore the old Controller. `;
+  return `${storageEvidence} A replacement Controller may still be active under unknown ownership. `
+    + `Keep writes quiesced and do not claim recovery or resume writes. Inspect the authenticated `
+    + `Controller status for ${home}, stop only the PID proven to belong to this update, then `
+    + "verify `yui version` and `yui doctor` before a bounded retry.";
+}
+
+function isUnknownActiveControllerFailure(error: unknown): boolean {
+  return isRecord(error) && error.code === "UPDATE_CONTROLLER_UNKNOWN_ACTIVE";
 }
 
 function isControllerLifecycleStatus(value: unknown): value is UpdateControllerLifecycleStatus {

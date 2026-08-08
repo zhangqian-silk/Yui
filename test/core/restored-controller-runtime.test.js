@@ -2592,3 +2592,47 @@ test("controller stop waits until the owned process is no longer reachable", asy
     "controller.status"
   ]);
 });
+
+test("fenced Controller stop requires the authenticated replacement PID", async () => {
+  const events = [];
+  let statusCalls = 0;
+  const call = async (_home, method, params) => {
+    events.push({ method, params });
+    if (method === "controller.stop") {
+      assert.deepEqual(params, { expectedPid: 20 });
+      return { stopped: true, pid: 20 };
+    }
+    assert.equal(method, "controller.status");
+    if (statusCalls++ === 0) return { running: true, pid: 20 };
+    throw new ControllerClientError("CONTROLLER_UNAVAILABLE", "Controller is unavailable.");
+  };
+
+  const result = await stopFileTaskController("/tmp/yui-fenced-stop", {
+    call,
+    expectedPid: 20,
+    pollIntervalMs: 1,
+    shutdownTimeoutMs: 100
+  });
+  assert.deepEqual(result, { stopped: true, pid: 20 });
+  assert.deepEqual(events, [
+    { method: "controller.status", params: {} },
+    { method: "controller.stop", params: { expectedPid: 20 } },
+    { method: "controller.status", params: {} }
+  ]);
+});
+
+test("fenced Controller stop refuses a PID mismatch without issuing stop", async () => {
+  let stopCalls = 0;
+  const call = async (_home, method) => {
+    if (method === "controller.stop") {
+      stopCalls += 1;
+      return { stopped: true, pid: 21 };
+    }
+    return { running: true, pid: 21 };
+  };
+  await assert.rejects(
+    stopFileTaskController("/tmp/yui-fenced-stop-mismatch", { call, expectedPid: 20 }),
+    /ownership changed.*expected PID 20.*found 21/i
+  );
+  assert.equal(stopCalls, 0);
+});

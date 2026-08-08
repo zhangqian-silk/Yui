@@ -46,6 +46,12 @@ export type FileControllerClientOptions = Readonly<{
   requestTimeoutMs?: number;
   /** Override the expected version for an exact-identity restore handshake. */
   expectedVersion?: string;
+  /**
+   * Fence a stop request to the exact Controller process observed by the
+   * caller.  Used only by update's replacement-mismatch cleanup; ordinary
+   * lifecycle callers leave this unset.
+   */
+  expectedPid?: number;
   onError?: (error: unknown) => void;
 }>;
 
@@ -256,18 +262,54 @@ export async function stopFileTaskController(
     "shutdownTimeoutMs"
   );
   const pollMs = positive(options.pollIntervalMs, POLL_INTERVAL_MS, "pollIntervalMs");
+  const expectedPid = options.expectedPid === undefined
+    ? undefined
+    : positive(options.expectedPid, 0, "expectedPid");
   const current = await readOptionalControllerStatus(home, call);
   const pid = controllerPid(current);
+  if (expectedPid !== undefined && pid !== expectedPid) {
+    throw new Error(
+      `Controller ownership changed before fenced stop (expected PID ${expectedPid}, `
+        + `found ${pid === undefined ? "none" : pid}).`
+    );
+  }
   if (!controllerRunning(current)) {
     return { stopped: false, alreadyStopped: true };
   }
-  await callFileTaskController(home, "controller.stop", {}, options);
+  await callFileTaskController(
+    home,
+    "controller.stop",
+    expectedPid === undefined ? {} : { expectedPid },
+    options
+  );
   const deadline = Date.now() + shutdownTimeoutMs;
   for (;;) {
-    const stillOwned = options.call === undefined
-      ? await ownedControllerDiscoveryExists(home, pid)
-      : controllerPid(await readOptionalControllerStatus(home, call)) === pid;
-    if (!stillOwned) break;
+    if (options.call === undefined) {
+      const discoveryOwned = await ownedControllerDiscoveryExists(home, pid);
+      if (!discoveryOwned && expectedPid !== undefined) {
+        // A replacement owner appearing during the drain is not equivalent to
+        // the fenced process disappearing; fail closed instead of reporting a
+        // successful stop against a foreign PID.
+        const observed = controllerPid(await readOptionalControllerStatus(home, call));
+        if (observed !== undefined && observed !== expectedPid) {
+          throw new Error(
+            `Controller ownership changed during fenced stop (expected PID ${expectedPid}, `
+              + `found ${observed}).`
+          );
+        }
+      }
+      if (!discoveryOwned) break;
+    } else {
+      const observed = controllerPid(await readOptionalControllerStatus(home, call));
+      if (observed === undefined) break;
+      if (expectedPid !== undefined && observed !== expectedPid) {
+        throw new Error(
+          `Controller ownership changed during fenced stop (expected PID ${expectedPid}, `
+            + `found ${observed}).`
+        );
+      }
+      if (observed !== pid) break;
+    }
     if (Date.now() >= deadline) {
       throw new Error(`Controller did not stop within ${shutdownTimeoutMs} ms.`);
     }

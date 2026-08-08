@@ -68,6 +68,9 @@ export function createUpdatePorts(
   // deliberately not persisted as a retry or recovery protocol.
   let verifiedActivatedBinary: string | undefined;
   let verifiedActivatedVersion: string | undefined;
+  const stopReplacementController = (home: string, pid: number): UpdateControllerStopResult => (
+    stopReplacementControllerForUpdate(home, pid, environment, spawn)
+  );
   return {
     stage(): StagedPackage {
       const stagingPath = mkdtempSync(join(stagingRoot, "yui-update-stage-"));
@@ -267,6 +270,7 @@ export function createUpdatePorts(
     stopController(home: string): UpdateControllerStopResult {
       return stopControllerForUpdate(home, environment, spawn);
     },
+    stopReplacementController,
     startController(home: string): void {
       if (verifiedActivatedBinary === undefined || verifiedActivatedVersion === undefined) {
         throw runtimeError(
@@ -279,7 +283,8 @@ export function createUpdatePorts(
         environment,
         spawn,
         verifiedActivatedBinary,
-        verifiedActivatedVersion
+        verifiedActivatedVersion,
+        stopReplacementController
       );
     },
     restoreController(home: string, identity: ControllerIdentity): void {
@@ -300,9 +305,10 @@ const UPDATE_CLIENT_RUNTIME_PATH = fileURLToPath(new URL("../controller/clientRu
 function readControllerLifecycle(
   home: string,
   environment: NodeJS.ProcessEnv,
-  spawn: UpdateSpawner
+  spawn: UpdateSpawner,
+  cliBinary?: string
 ): UpdateControllerLifecycleStatus {
-  const data = runControllerCommand(home, environment, spawn, "status");
+  const data = runControllerCommand(home, environment, spawn, "status", cliBinary);
   if (!Array.isArray(data.resources)) {
     throw new Error("Controller inventory is malformed; treating ownership as unknown-active.");
   }
@@ -363,7 +369,7 @@ function readControllerLifecycle(
     return proveControllerAbsent(home, environment, spawn);
   }
   const identity = parseControllerIdentity(
-    runControllerCommand(home, environment, spawn, "identity")
+    runControllerCommand(home, environment, spawn, "identity", cliBinary)
   );
   return {
     running: true,
@@ -417,6 +423,33 @@ function stopControllerForUpdate(
 }
 
 /**
+ * Stop a replacement only after the caller has authenticated this exact PID
+ * against the restart/readiness boundary.  The client/runtime path sends the
+ * PID fence to the Controller server itself, so a socket/discovery race cannot
+ * silently turn this cleanup into a stop of a foreign owner.
+ */
+function stopReplacementControllerForUpdate(
+  home: string,
+  expectedPid: number,
+  environment: NodeJS.ProcessEnv,
+  spawn: UpdateSpawner
+): UpdateControllerStopResult {
+  if (!isPositivePid(expectedPid)) {
+    throw unknownActiveControllerError("replacement PID was not a positive integer");
+  }
+  const result = runSchemaIndependentControllerStop(home, environment, spawn, expectedPid);
+  if (
+    result.stopped !== true
+    || result.pid !== expectedPid
+  ) {
+    throw unknownActiveControllerError(
+      `fenced stop did not confirm the authenticated replacement PID ${expectedPid}`
+    );
+  }
+  return result;
+}
+
+/**
  * Stop only the Controller owned by parent update, without dispatching the
  * public CLI command. `stopFileTaskController` authenticates the discovery,
  * issues exactly one stop RPC, and drains the owned discovery before returning.
@@ -424,13 +457,20 @@ function stopControllerForUpdate(
 function runSchemaIndependentControllerStop(
   home: string,
   environment: NodeJS.ProcessEnv,
-  spawn: UpdateSpawner
+  spawn: UpdateSpawner,
+  expectedPid?: number
 ): UpdateControllerStopResult {
   const helper = [
-    "const [runtimeModule, home] = process.argv.slice(1);",
+    "const values = process.argv.slice(1);",
+    "const expectedPid = values.length === 3 ? Number(values.pop()) : undefined;",
+    "const home = values.pop();",
+    "const runtimeModule = values.pop();",
     "(async () => {",
     "  const { stopFileTaskController } = await import(runtimeModule);",
-    "  const data = await stopFileTaskController(home, { environment: process.env });",
+    "  const data = await stopFileTaskController(home, {",
+    "    environment: process.env,",
+    "    ...(expectedPid === undefined ? {} : { expectedPid })",
+    "  });",
     "  process.stdout.write(JSON.stringify({ ok: true, data }));",
     "})().catch((error) => {",
     "  const code = typeof error?.code === 'string' ? error.code : 'RUNTIME_ERROR';",
@@ -441,7 +481,13 @@ function runSchemaIndependentControllerStop(
   ].join(" ");
   const result = spawn(
     process.execPath,
-    ["-e", helper, UPDATE_CLIENT_RUNTIME_PATH, home],
+    [
+      "-e",
+      helper,
+      UPDATE_CLIENT_RUNTIME_PATH,
+      home,
+      ...(expectedPid === undefined ? [] : [String(expectedPid)])
+    ],
     { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
   );
   if (result.error !== undefined || result.status !== 0) {
@@ -479,13 +525,132 @@ function restartControllerForUpdate(
   environment: NodeJS.ProcessEnv,
   spawn: UpdateSpawner,
   activatedBinary: string,
-  activatedVersion: string
+  activatedVersion: string,
+  stopReplacementController: (home: string, pid: number) => UpdateControllerStopResult
 ): void {
-  runControllerCommandOutput(home, environment, spawn, "restart", activatedBinary);
-  const identity = parseControllerIdentity(
-    runControllerCommand(home, environment, spawn, "identity", activatedBinary)
+  let restart: { output: string; data?: Record<string, unknown> };
+  try {
+    restart = runControllerCommandOutput(home, environment, spawn, "restart", activatedBinary);
+  } catch (error) {
+    // A restart transport/exit failure may have occurred after the activated
+    // runtime spawned its replacement.  No PID ownership proof exists in that
+    // case, so never fall through to old-identity restore.
+    throw unknownActiveControllerError(
+      `activated Controller restart outcome is unknown: ${messageOf(error)}`
+    );
+  }
+  const replacementPid = parseReplacementPid(restart.data);
+  let identityFailure: unknown;
+  try {
+    const identity = parseControllerIdentity(
+      runControllerCommand(home, environment, spawn, "identity", activatedBinary)
+    );
+    assertActivatedControllerIdentity(identity, activatedBinary, activatedVersion);
+  } catch (error) {
+    identityFailure = error;
+  }
+
+  // Readiness is authenticated twice: the restart result carries the PID that
+  // the activated runtime started, and an inventory/identity read through that
+  // same binary proves that PID still owns this Home.  A mismatch may therefore
+  // stop only the process proven to belong to this update; if that proof is
+  // unavailable, fail closed with an explicit unknown-active blocker.
+  let readiness: UpdateControllerLifecycleStatus;
+  try {
+    readiness = readControllerLifecycle(home, environment, spawn, activatedBinary);
+    if (!readiness.running || readiness.pid !== replacementPid) {
+      throw new Error(
+        `replacement readiness PID ${readiness.pid === undefined ? "none" : readiness.pid} `
+          + `does not match the authenticated restart PID ${replacementPid}`
+      );
+    }
+    assertActivatedControllerIdentity(readiness.identity!, activatedBinary, activatedVersion);
+  } catch (error) {
+    throw stopMismatchedReplacementOrBlock(
+      home,
+      environment,
+      spawn,
+      activatedBinary,
+      replacementPid,
+      stopReplacementController,
+      identityFailure ?? new Error(
+        `replacement readiness could not authenticate PID ${replacementPid}: ${messageOf(error)}`
+      )
+    );
+  }
+  if (identityFailure !== undefined) {
+    throw stopMismatchedReplacementOrBlock(
+      home,
+      environment,
+      spawn,
+      activatedBinary,
+      replacementPid,
+      stopReplacementController,
+      identityFailure
+    );
+  }
+}
+
+function parseReplacementPid(data: Record<string, unknown> | undefined): number {
+  if (
+    data === undefined
+    || data.restarted !== true
+    || !isPositivePid(data.pid)
+  ) {
+    throw unknownActiveControllerError(
+      "activated Controller restart returned no authenticated replacement PID"
+    );
+  }
+  return data.pid;
+}
+
+function stopMismatchedReplacementOrBlock(
+  home: string,
+  environment: NodeJS.ProcessEnv,
+  spawn: UpdateSpawner,
+  activatedBinary: string,
+  replacementPid: number,
+  stopReplacementController: (home: string, pid: number) => UpdateControllerStopResult,
+  mismatch: unknown
+): Error {
+  try {
+    const ownership = readControllerLifecycle(home, environment, spawn, activatedBinary);
+    if (!ownership.running || ownership.pid !== replacementPid) {
+      throw new Error(
+        `authenticated replacement ownership was lost (expected PID ${replacementPid}, `
+          + `found ${ownership.pid === undefined ? "none" : ownership.pid})`
+      );
+    }
+    const stopped = stopReplacementController(home, replacementPid);
+    if (stopped.stopped !== true || stopped.pid !== replacementPid) {
+      throw new Error(
+        `fenced replacement stop did not confirm PID ${replacementPid}`
+      );
+    }
+  } catch (error) {
+    return unknownActiveControllerError(
+      `${messageOf(mismatch)}; cannot prove safe ownership-aware cleanup: ${messageOf(error)}`
+    );
+  }
+  const error = new Error(
+    `${messageOf(mismatch)} The replacement Controller PID ${replacementPid} was authenticated `
+      + `as this update's owner and stopped; refusing replacement readiness.`
   );
-  assertActivatedControllerIdentity(identity, activatedBinary, activatedVersion);
+  Object.assign(error, {
+    code: "UPDATE_CONTROLLER_IDENTITY_MISMATCH",
+    replacementPid,
+    replacementStopped: true
+  });
+  return error;
+}
+
+function unknownActiveControllerError(reason: string): Error {
+  const error = new Error(
+    `Replacement Controller is unknown-active: ${reason}. Do not resume writes or restore `
+      + "the old identity blindly."
+  );
+  Object.assign(error, { code: "UPDATE_CONTROLLER_UNKNOWN_ACTIVE" });
+  return error;
 }
 
 /** Restore the captured process identity, never the staged/new `yui` launcher. */
@@ -614,7 +779,7 @@ function runControllerCommandOutput(
   spawn: UpdateSpawner,
   method: "stop" | "restart",
   cliBinary?: string
-): string {
+): { output: string; data?: Record<string, unknown> } {
   const command = cliBinary ?? process.execPath;
   const args = cliBinary === undefined
     ? [UPDATE_CLI_PATH, "--json", "controller", method]
@@ -631,7 +796,13 @@ function runControllerCommandOutput(
   if (!isRecord(parsed) || parsed.ok !== true || typeof parsed.output !== "string") {
     throw new Error(`Controller ${method} returned an invalid structured result.`);
   }
-  return parsed.output;
+  if (parsed.data !== undefined && !isRecord(parsed.data)) {
+    throw new Error(`Controller ${method} returned malformed structured data.`);
+  }
+  return {
+    output: parsed.output,
+    ...(parsed.data === undefined ? {} : { data: parsed.data })
+  };
 }
 
 /**

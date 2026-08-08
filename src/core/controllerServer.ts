@@ -251,16 +251,35 @@ async function routeRequest(
   }
 
   if (request.method === "controller.stop") {
-    if (!isEmptyParams(request.params)) {
+    const expectedPid = expectedControllerStopPid(request.params);
+    if (expectedPid === null) {
       sendResponse(
         socket,
         controllerFailure(request.id, "INVALID_PARAMS", "Controller params are invalid.")
       );
       return;
     }
+    if (expectedPid !== undefined && expectedPid !== process.pid) {
+      sendResponse(
+        socket,
+        controllerFailure(
+          request.id,
+          "CONTROLLER_OWNERSHIP_MISMATCH",
+          `Controller PID ${process.pid} does not match the expected PID ${expectedPid}.`
+        )
+      );
+      return;
+    }
     sendResponse(
       socket,
-      { id: request.id, ok: true, result: { stopped: true } },
+      {
+        id: request.id,
+        ok: true,
+        result: {
+          stopped: true,
+          ...(expectedPid === undefined ? {} : { pid: process.pid })
+        }
+      },
       () => void stop()
     );
     return;
@@ -286,6 +305,27 @@ async function routeRequest(
         : controllerFailure(request.id, safeError.code, safeError.message)
     );
   }
+}
+
+/**
+ * `controller.stop` is public with `{}` params, but update's replacement
+ * mismatch path may provide one exact PID fence.  `null` means malformed;
+ * `undefined` is the ordinary unfenced public request.
+ */
+function expectedControllerStopPid(value: JsonValue): number | undefined | null {
+  if (isEmptyParams(value)) return undefined;
+  if (
+    typeof value !== "object"
+    || value === null
+    || Array.isArray(value)
+    || Reflect.ownKeys(value).length !== 1
+    || !("expectedPid" in value)
+    || !Number.isSafeInteger(value.expectedPid)
+    || (value.expectedPid as number) <= 0
+  ) {
+    return null;
+  }
+  return value.expectedPid as number;
 }
 
 function sendResponse(

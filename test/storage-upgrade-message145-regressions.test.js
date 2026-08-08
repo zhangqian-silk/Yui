@@ -185,6 +185,64 @@ test("binary activation failure before Home switch is not reported as a usable c
   assert.doesNotMatch(rendered, /current install and Home remain usable/);
 });
 
+test("pre-switch activation/post-verify failure preserves binary uncertainty when restore also fails", () => {
+  for (const [phase, failureKey, failureMessage] of [
+    ["activate-binary", "activateBinary", "npm activation outcome unknown"],
+    ["post-verify", "verify", "activated doctor failed"]
+  ]) {
+    const events = [];
+    const result = runUpdate(updateLifecyclePorts(events, {
+      activateStorage: () => {
+        events.push("activate-storage");
+        return { status: "already-current" };
+      },
+      ...(failureKey === "activateBinary"
+        ? { activateBinary: () => { events.push("activate-binary"); throw new Error(failureMessage); } }
+        : { verify: () => { events.push("verify"); throw new Error(failureMessage); } }),
+      restoreController: () => {
+        events.push("restore");
+        throw new Error("restore blocker");
+      }
+    }), { home: "/tmp/yui-home" });
+    assert.equal(result.outcome, "aborted");
+    assert.equal(result.phase, phase);
+    assert.equal(result.recoverable, false);
+    assert.match(result.message, new RegExp(failureMessage));
+    assert.match(result.message, /restore blocker/);
+    assert.match(result.action, /Home was not migrated/i);
+    assert.match(result.action, /binary|health|unknown/i);
+    assert.match(result.action, /reinstall Yui|version|doctor|retry/i);
+    assert.match(result.action, /old Controller restore also failed|restore blocker/i);
+    assert.deepEqual(events, [
+      "stage", "preflight", "status", "stop", "activate-storage",
+      ...(failureKey === "activateBinary" ? ["activate-binary"] : ["activate-binary", "verify"]),
+      "restore", "cleanup"
+    ]);
+  }
+});
+
+test("unknown-active replacement failure blocks restore and write-resume claims", () => {
+  const events = [];
+  const result = runUpdate(updateLifecyclePorts(events, {
+    activateStorage: () => {
+      events.push("activate-storage");
+      return { status: "already-current" };
+    },
+    startController: () => {
+      events.push("start");
+      const error = new Error("PID ownership unavailable");
+      error.code = "UPDATE_CONTROLLER_UNKNOWN_ACTIVE";
+      throw error;
+    }
+  }), { home: "/tmp/yui-home" });
+  assert.equal(result.outcome, "aborted");
+  assert.equal(result.phase, "post-verify");
+  assert.equal(result.recoverable, false);
+  assert.match(result.message, /unknown-active|ownership unavailable/i);
+  assert.match(result.action, /unknown ownership|do not resume writes|quiesced/i);
+  assert.equal(events.includes("restore"), false);
+});
+
 test("staged storage activation marks the child externally quiesced", () => {
   let captured;
   const ports = createUpdatePorts(process.env, (_command, _args, options) => {
@@ -196,7 +254,7 @@ test("staged storage activation marks the child externally quiesced", () => {
   assert.equal(captured.env.YUI_HOME, "/tmp/yui-home");
 });
 
-test("replacement Controller starts through the verified activated global binary and re-authenticates identity", () => {
+test("replacement Controller carries authenticated PID and starts through the verified global binary", () => {
   const base = mkdtempSync(join(tmpdir(), "yui-message145-global-"));
   const binDir = join(base, "bin");
   const globalBinary = join(binDir, "yui");
@@ -204,6 +262,7 @@ test("replacement Controller starts through the verified activated global binary
   mkdirSync(join(binDir, "controller"), { recursive: true });
   writeFileSync(globalBinary, "#!/bin/sh\n", { mode: 0o755 });
   const calls = [];
+  const replacementPid = 42;
   let controllerArgs = [controllerEntrypoint];
   let controllerVersion = "9.9.9";
   const spawn = (command, args, options) => {
@@ -226,7 +285,22 @@ test("replacement Controller starts through the verified activated global binary
     }
     if (command === globalBinary && args.includes("restart")) {
       return spawnResult({
-        stdout: Buffer.from(JSON.stringify({ ok: true, output: "Controller restarted." }))
+        stdout: Buffer.from(JSON.stringify({
+          ok: true,
+          output: "Controller restarted.",
+          data: { restarted: true, previousPid: 41, pid: replacementPid }
+        }))
+      });
+    }
+    if (command === globalBinary && args.includes("status")) {
+      return okData({
+        resources: [{
+          kind: "controller",
+          state: "current",
+          yuiHome: "/tmp/yui-home",
+          processes: [{ pid: replacementPid }]
+        }],
+        warnings: []
       });
     }
     if (command === globalBinary && args.includes("identity")) {
@@ -254,10 +328,92 @@ test("replacement Controller starts through the verified activated global binary
 
     controllerArgs = ["/wrong/controllerMain.js"];
     controllerVersion = "8.8.8";
+    // The replacement PID is still the one authenticated by restart/readiness,
+    // so the fenced cleanup is allowed to stop it and no foreign process is
+    // touched.
+    const stopResult = okData({ stopped: true, pid: replacementPid });
+    const originalSpawn = spawn;
+    // The test seam receives the internal PID-fenced stop helper as a Node -e
+    // invocation. Return its structured confirmation deterministically.
+    let stopInvocations = 0;
+    const stopAwareSpawn = (command, args, options) => {
+      if (command === process.execPath && args[0] === "-e") {
+        stopInvocations += 1;
+        return stopResult;
+      }
+      return originalSpawn(command, args, options);
+    };
+    const stopAwarePorts = createUpdatePorts(process.env, stopAwareSpawn);
+    stopAwarePorts.verify({ binaryPath: "/tmp/staged/yui", version: "9.9.9" }, "/tmp/yui-home");
+    // Reuse the same activated-binary seam and deliberately mismatch both argv
+    // and version; the PID fence must run before the failure is surfaced.
     assert.throws(
-      () => ports.startController("/tmp/yui-home"),
+      () => stopAwarePorts.startController("/tmp/yui-home"),
       /Replacement Controller (?:version|launch identity)/i
     );
+    assert.equal(stopInvocations, 1, "mismatch cleanup must use exactly one PID-fenced stop");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("replacement identity mismatch with unproven PID returns an unknown-active blocker", () => {
+  const base = mkdtempSync(join(tmpdir(), "yui-message145-unknown-active-"));
+  const binDir = join(base, "bin");
+  const globalBinary = join(binDir, "yui");
+  const controllerEntrypoint = join(binDir, "controller", "controllerMain.js");
+  mkdirSync(join(binDir, "controller"), { recursive: true });
+  writeFileSync(globalBinary, "#!/bin/sh\n", { mode: 0o755 });
+  let controllerPid = 99;
+  let stopCalls = 0;
+  const spawn = (command, args) => {
+    if (command === "npm" && args[0] === "prefix") return spawnResult({ stdout: Buffer.from(base) });
+    if (command === globalBinary && args.includes("doctor")) {
+      return okData({
+        checks: [
+          { name: "storage schema", status: "ok", detail: "current" },
+          { name: "storage compatibility", status: "ok", detail: "USABLE" },
+          { name: "storage state", status: "ok", detail: "readable" }
+        ],
+        storage: { healthy: true, blocking: [] }
+      });
+    }
+    if (command === globalBinary && args.includes("version")) return okData({ version: "9.9.9" });
+    if (command === globalBinary && args.includes("restart")) {
+      return spawnResult({ stdout: Buffer.from(JSON.stringify({
+        ok: true,
+        output: "Controller restarted.",
+        data: { restarted: true, pid: 42 }
+      })) });
+    }
+    if (command === globalBinary && args.includes("status")) {
+      return okData({
+        resources: [{
+          kind: "controller",
+          state: "current",
+          yuiHome: "/tmp/yui-home",
+          processes: [{ pid: controllerPid }]
+        }],
+        warnings: []
+      });
+    }
+    if (command === globalBinary && args.includes("identity")) {
+      return okData({ executablePath: process.execPath, args: [controllerEntrypoint], version: "8.8.8" });
+    }
+    if (command === process.execPath && args[0] === "-e") {
+      stopCalls += 1;
+      return okData({ stopped: true, pid: 42 });
+    }
+    return spawnResult();
+  };
+  try {
+    const ports = createUpdatePorts(process.env, spawn);
+    ports.verify({ binaryPath: "/tmp/staged/yui", version: "9.9.9" }, "/tmp/yui-home");
+    assert.throws(
+      () => ports.startController("/tmp/yui-home"),
+      /unknown-active/i
+    );
+    assert.equal(stopCalls, 0, "a PID mismatch must not stop a foreign/unknown process");
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
