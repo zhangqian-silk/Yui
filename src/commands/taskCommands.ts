@@ -2185,9 +2185,12 @@ function prepareFinalTaskReview(
   if (latest !== undefined && (latest.status === "pending" || latest.status === "running")) {
     throw usageError(`Final Task Review is still active: ${latest.id}/${latest.status}.`);
   }
-  if (latest?.status === "completed"
-    && isSameTaskReviewCandidate(latest.taskCandidate, taskCandidate)) {
-    return null;
+  if (latest !== undefined && isSameTaskReviewCandidate(latest.taskCandidate, taskCandidate)) {
+    // A terminal round for the same immutable heads is already the final
+    // review evidence. Do not create duplicate rounds on repeated completion
+    // attempts. A failed round remains a blocker until the Leader changes the
+    // candidate or otherwise resolves the failed evidence explicitly.
+    return latest.status === "completed" ? null : latest;
   }
 
   const anchor = [...store.listWorkItems(task.id)]

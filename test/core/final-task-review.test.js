@@ -158,3 +158,21 @@ test("a changed integrated head creates a fresh final ReviewRound and keeps prio
   assert.equal(rounds[1].status, "pending");
   assert.notDeepEqual(rounds[0].taskCandidate, rounds[1].taskCandidate);
 });
+
+test("an unchanged failed final ReviewRound does not duplicate or unblock completion", (t) => {
+  const { store, task, leaderOptions } = fixture(t);
+  runTaskCommand(["complete", task.id, "--summary", "finish"], store, leaderOptions);
+  const first = store.listReviewRounds(task.id)[0];
+  store.saveReviewRound(task.id, finishReviewRound(first, "failed", "reviewer unavailable", NOW));
+
+  const second = runTaskCommand(
+    ["complete", task.id, "--summary", "finish again"],
+    store,
+    leaderOptions
+  );
+
+  assert.equal(second.kind, "output");
+  assert.match(second.output, /Final Task Review is blocked/);
+  assert.equal(store.listReviewRounds(task.id).length, 1);
+  assert.equal(store.getTask(task.id).status, "active");
+});
