@@ -213,7 +213,14 @@ function stallFixture() {
     listTasks() { return [task()]; },
     listRoles() { return [role("worker")]; },
     getActiveAgentRun() { return currentRun; },
-    getRoleSession() { return { agentId: "agent-1", adapterId: "codex", nativeSessionId: "native-1" }; },
+    getRoleSession() {
+      return {
+        agentId: "agent-1",
+        adapterId: "codex",
+        nativeSessionId: "native-1",
+        launchId: "launch-1"
+      };
+    },
     listEvents() { return events; },
     recordRoleRunStall(input) {
       if (events.some((event) => event.type === "run.stalled")) return "already-raised";
@@ -235,6 +242,13 @@ function activitySnapshot(overrides = {}) {
     agentId: "agent-1",
     adapterId: "codex",
     nativeSessionId: "native-1",
+    launchId: "launch-1",
+    rootPid: 101,
+    rootStartIdentity: "root-1",
+    cpuTimeMs: 0,
+    ioReadBytes: 0,
+    ioWriteBytes: 0,
+    childIdentities: [{ pid: 102, startIdentity: "child-1" }],
     ...overrides
   };
 }
@@ -274,6 +288,62 @@ test("semantic/provider/resource activity cancels the candidate window", async (
   sample = activitySnapshot({ ioWriteBytes: 1 });
   await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000, undefined, sampler);
   assert.equal(events.length, 0);
+});
+
+test("root and child start-identity changes cancel the no-activity candidate", async () => {
+  for (const change of [
+    { rootStartIdentity: "root-2" },
+    { childIdentities: [{ pid: 102, startIdentity: "child-2" }] }
+  ]) {
+    const { store, events } = stallFixture();
+    const sampler = createRoleRunStallSampler();
+    let sample = activitySnapshot();
+    const delivery = {
+      async inspectRole() { return "present"; },
+      async inspectRoleActivity() { return sample; }
+    };
+    await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000, undefined, sampler);
+    sample = activitySnapshot(change);
+    await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000, undefined, sampler);
+    await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000, undefined, sampler);
+    await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000, undefined, sampler);
+    assert.equal(events.length, 0);
+  }
+});
+
+test("partial activity inventory is unknown and never evidence of a stall", async () => {
+  const { store, events } = stallFixture();
+  const sampler = createRoleRunStallSampler();
+  const delivery = {
+    async inspectRole() { return "present"; },
+    async inspectRoleActivity() { return { status: "present" }; }
+  };
+  for (let index = 0; index < 5; index += 1) {
+    await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000, undefined, sampler);
+  }
+  assert.equal(events.length, 0);
+});
+
+test("activity inspection carries the exact Session and launch fence", async () => {
+  const { store } = stallFixture();
+  const sampler = createRoleRunStallSampler();
+  let inspected;
+  const delivery = {
+    async inspectRole() { return "present"; },
+    async inspectRoleActivity(input) {
+      inspected = input;
+      return activitySnapshot();
+    }
+  };
+  await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000, undefined, sampler);
+  assert.deepEqual(inspected, {
+    taskId: "task-1",
+    roleName: "worker",
+    agentId: "agent-1",
+    adapterId: "codex",
+    nativeSessionId: "native-1",
+    launchId: "launch-1"
+  });
 });
 
 test("projection is read-only and duplicate derivation is stable", () => {

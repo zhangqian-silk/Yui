@@ -5,6 +5,7 @@ import { taskMessageAuthorLabel } from "../message/message.js";
 import { formatTimestamp } from "../output/timePresentation.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { isRoleRunStalled, latestStallProgressAt } from "../scheduler/roleRunStall.js";
+import { buildTaskExecutionProjection } from "../scheduler/taskExecutionProjection.js";
 import { inspectTaskRoleSessionRecovery } from "./taskRoleRuntimeStatus.js";
 
 const RECENT_RECORD_LIMIT = 5;
@@ -27,9 +28,14 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     const workItems = reader.listWorkItems(task.id);
     const inputRequests = reader.listInputRequests(task.id);
     const roles = reader.listRoles(task.id);
+    const execution = buildTaskExecutionProjection(reader, task.id, task);
+    if (execution === null) {
+      throw new Error(`Task execution projection disappeared: ${task.id}.`);
+    }
     const roleSessionSets = reader.listRoleSessionSets(task.id);
     return {
       task,
+      execution,
       reviewConfig: reader.getReviewConfig(),
       brief: reader.getTaskBrief(task.id),
       activeDecisions: reader.listDecisions(task.id)
@@ -54,6 +60,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
   });
   const {
     task,
+    execution,
     reviewConfig,
     brief,
     activeDecisions,
@@ -77,6 +84,9 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
   const displayedWorkItems = currentAndRecentWorkItems(workItems);
   const displayedOpenInputRequests = openInputRequests.slice(-RECENT_RECORD_LIMIT);
   const displayedResolvedInputRequests = resolvedInputRequests.slice(-RECENT_RECORD_LIMIT);
+  const displayedExecutionCarriers = execution.monitoring === "active"
+    ? execution.activeRuns
+    : [];
 
   const lines = [
     `Task context: ${task.id}`,
@@ -90,6 +100,21 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     ...(task.retirementSummary === undefined ? [] : [`Retirement summary: ${task.retirementSummary}`]),
     ...(task.replacementTaskId === undefined ? [] : [`Replacement Task: ${task.replacementTaskId}`]),
     ...(task.archiveSummary === undefined ? [] : [`Archive summary: ${task.archiveSummary}`]),
+    "Execution:",
+    `  Status: ${execution.status}`,
+    `  Owner/action: ${execution.owner}/${execution.action}`,
+    `  Monitoring: ${execution.monitoring}`,
+    `  Fail-closed: ${execution.failClosed ? "yes" : "no"}`,
+    `  Reason: ${execution.reason}`,
+    `  Attention: ${execution.attention.length === 0
+      ? "none"
+      : execution.attention.map(({ kind, owner }) => `${kind}/${owner}`).join(", ")}`,
+    `  Active execution carriers (${displayedExecutionCarriers.length}):`,
+    ...(displayedExecutionCarriers.length === 0
+      ? ["    None."]
+      : displayedExecutionCarriers.map((run) => (
+          `    ${run.roleName}: ${run.id} [${run.status}; ${run.delivered ? "accepted" : "delivery-pending"}]`
+        ))),
     ...(task.projectBindings.length === 0
       ? []
       : [

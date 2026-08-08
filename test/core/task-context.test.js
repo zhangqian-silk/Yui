@@ -27,6 +27,7 @@ import {
   createRoleSessionSet,
   resetTaskRoleSession
 } from "../../dist/executor/agentExecutor.js";
+import { markAgentRunDelivered } from "../../dist/run/agentRun.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import {
   createGlobalRole,
@@ -37,6 +38,7 @@ import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import {
   createWorkItem,
+  submitWorkItemCandidate,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 
@@ -185,7 +187,8 @@ test("task context aggregates complete records and renders a compact recent summ
   }
 
   const result = output(["context", task.id], store, options);
-  assert.deepEqual(result.data, {
+  const { execution, ...legacyData } = result.data;
+  assert.deepEqual(legacyData, {
     task,
     reviewConfig: null,
     brief,
@@ -209,6 +212,38 @@ test("task context aggregates complete records and renders a compact recent summ
     openInputRequests: [],
     resolvedInputRequests: [],
     events: store.listEvents(task.id)
+  });
+  assert.deepEqual(execution, {
+    taskId: task.id,
+    taskStatus: task.status,
+    status: "recovering",
+    owner: "leader",
+    action: "recover-leader",
+    summary: "An active Run is awaiting provider acceptance; delivery remains fail-closed.",
+    reason: "delivery-pending",
+    monitoring: "active",
+    failClosed: false,
+    activeRuns: [
+      {
+        id: associatedRun.id,
+        roleName: "worker",
+        purpose: "execution",
+        delivered: false,
+        status: "active"
+      },
+      {
+        id: agentRuns[1].id,
+        roleName: "leader",
+        purpose: "execution",
+        delivered: false,
+        status: "active"
+      }
+    ],
+    activeExecutorCount: 2,
+    attention: [],
+    blockers: [],
+    pendingWakeup: null,
+    next: { owner: "leader", action: "recover-leader" }
   });
   assert.match(result.output, /^Task context: task-1/m);
   assert.match(result.output, /Objective: Give the Leader one useful read/);
@@ -493,6 +528,114 @@ test("task context emits its structured payload in the CLI top-level data field"
   assert.deepEqual(response.data.openInputRequests, []);
   assert.deepEqual(response.data.resolvedInputRequests, []);
   assert.ok(Array.isArray(response.data.events));
+});
+
+test("task context exposes one read-only execution projection for waiting, attention, recovery, and candidates", (t) => {
+  function projected(title, setup) {
+    const context = fixture(t);
+    const task = createTask(context.store, context.options, title);
+    setup(task, context.store, context.options);
+    return output(["context", task.id], context.store, context.options);
+  }
+
+  const waiting = projected("Waiting on worker", (task, store, options) => {
+    output(["activate", task.id], store, options);
+    output(["role", "add", task.id, "worker", "--agent", "codex"], store, options);
+    const run = createAgentRun(
+      store.nextAgentRunId(task.id), task.id, "worker", "new", "work", atMinute(1),
+      { agent: { agentId: "codex", adapterId: "codex" } }
+    );
+    store.saveAgentRun(markAgentRunDelivered(run, atMinute(2)));
+  });
+  assert.equal(waiting.data.execution.status, "waiting-on-agents");
+  assert.equal(waiting.data.execution.owner, "worker");
+  assert.equal(waiting.data.execution.action, "wait-for-agents");
+  assert.deepEqual(waiting.data.execution.attention, []);
+  assert.match(waiting.output, /Status: waiting-on-agents/);
+  assert.match(waiting.output, /Owner\/action: worker\/wait-for-agents/);
+  assert.match(waiting.output, /Attention: none/);
+  assert.doesNotMatch(waiting.output, /leader-stalled|needs-leader-action/);
+
+  const waitingUser = projected("Waiting for user", (task, store, options) => {
+    output(["activate", task.id], store, options);
+    output(["role", "add", task.id, "worker", "--agent", "codex"], store, options);
+    const run = createAgentRun(
+      store.nextAgentRunId(task.id), task.id, "worker", "new", "work", atMinute(1),
+      { agent: { agentId: "codex", adapterId: "codex" } }
+    );
+    const accepted = markAgentRunDelivered(run, atMinute(2));
+    store.saveAgentRun(accepted);
+    const leaderRun = createAgentRun(
+      store.nextAgentRunId(task.id), task.id, "leader", "new", "ask user", atMinute(2),
+      { agent: { agentId: "codex", adapterId: "codex" } }
+    );
+    const acceptedLeader = markAgentRunDelivered(leaderRun, atMinute(3));
+    store.saveAgentRun(acceptedLeader);
+    store.saveInputRequest(task.id, createInputRequest(
+      store.nextInputRequestId(task.id),
+      task.id,
+      { taskId: task.id, roleName: "leader", agentId: "codex", runId: acceptedLeader.id },
+      { question: "Choose a rollout", choices: [], blockedRefs: [] },
+      atMinute(4)
+    ));
+  });
+  assert.equal(waitingUser.data.execution.status, "waiting-user");
+  assert.equal(waitingUser.data.execution.owner, "user");
+  assert.match(waitingUser.output, /Status: waiting-user/);
+  assert.match(waitingUser.output, /Owner\/action: user\/answer-input/);
+
+  const candidate = projected("Candidate needs Leader", (task, store, options) => {
+    output(["activate", task.id], store, options);
+    const created = createWorkItem(
+      store.nextWorkItemId(task.id), task.id, { title: "Candidate work" }, atMinute(1)
+    );
+    const running = updateWorkItemStatus(created, "running", atMinute(2));
+    const awaiting = submitWorkItemCandidate(
+      running,
+      { summary: "Candidate is ready", source: { type: "direct" } },
+      atMinute(3)
+    );
+    store.saveWorkItem(task.id, awaiting);
+  });
+  assert.equal(candidate.data.execution.status, "needs-leader-action");
+  assert.equal(candidate.data.execution.reason, "candidate-ready");
+  assert.match(candidate.output, /Status: needs-leader-action/);
+
+  const mismatch = projected("Identity mismatch recovery", (task, store, options) => {
+    output(["activate", task.id], store, options);
+    output(["role", "add", task.id, "worker", "--agent", "codex"], store, options);
+    const run = createAgentRun(
+      store.nextAgentRunId(task.id), task.id, "worker", "new", "work", atMinute(1),
+      { agent: { agentId: "codex", adapterId: "codex" } }
+    );
+    store.saveAgentRun(markAgentRunDelivered(run, atMinute(2)));
+    const claude = createConfiguredAgent("claude", "claude", "claude", [], [], NOW);
+    store.transaction((tx) => {
+      tx.saveConfiguredAgent(claude);
+      const role = tx.getRole(task.id, "worker");
+      tx.saveRole(task.id, {
+        ...role,
+        activeAgentId: "claude",
+        agentBindings: {
+          ...role.agentBindings,
+          claude: createRoleAgentBinding(claude)
+        },
+        updatedAt: atMinute(3).toISOString()
+      });
+    });
+  });
+  assert.equal(mismatch.data.execution.status, "attention");
+  assert.equal(mismatch.data.execution.failClosed, true);
+  assert.equal(mismatch.data.execution.reason, "identity-mismatch");
+  assert.match(mismatch.output, /Fail-closed: yes/);
+
+  const completed = projected("Completed monitoring", (task, store, options) => {
+    output(["activate", task.id], store, options);
+    output(["complete", task.id, "--summary", "Done"], store, options);
+  });
+  assert.equal(completed.data.execution.status, "completed");
+  assert.equal(completed.data.execution.monitoring, "stopped");
+  assert.match(completed.output, /Monitoring: stopped/);
 });
 
 test("task context is public, interactively selects any Task state, and completes Task IDs", async () => {
