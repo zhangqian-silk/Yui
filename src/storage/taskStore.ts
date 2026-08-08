@@ -792,6 +792,15 @@ export class FileTaskStore implements TaskStore {
     if (stored.writeProjectIds.some((projectId) => !boundProjects.has(projectId))) {
       throw new StorageRecordError(`Work Item writable Project does not belong to Task: ${stored.id}.`);
     }
+    const writableProjects = new Set(stored.writeProjectIds);
+    if (stored.baseRefs?.some(({ projectId }) => !boundProjects.has(projectId))) {
+      throw new StorageRecordError(`Work Item base-ref Project does not belong to Task: ${stored.id}.`);
+    }
+    if (stored.baseRefs?.some(({ projectId }) => !writableProjects.has(projectId))) {
+      throw new StorageRecordError(
+        `Work Item base-ref Project must be writable: ${stored.id}.`
+      );
+    }
     for (const dependencyId of stored.dependsOn) {
       const dependency = this.getWorkItem(taskId, dependencyId);
       if (dependency === null) {
@@ -1973,6 +1982,17 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
         `Work Item writable Project does not belong to Task: ${taskId}/${item.id}.`
       );
     }
+    const writableProjects = new Set(item.writeProjectIds);
+    if (item.baseRefs?.some(({ projectId }) => !boundProjects.has(projectId))) {
+      throw new StorageRecordError(
+        `Work Item base-ref Project does not belong to Task: ${taskId}/${item.id}.`
+      );
+    }
+    if (item.baseRefs?.some(({ projectId }) => !writableProjects.has(projectId))) {
+      throw new StorageRecordError(
+        `Work Item base-ref Project must be writable: ${taskId}/${item.id}.`
+      );
+    }
     const replacementWorkItemId = item.disposition?.replacementWorkItemId;
     if (replacementWorkItemId !== undefined) {
       if (replacementWorkItemId === item.id) {
@@ -2303,6 +2323,7 @@ function validWorkItemTransition(existing: WorkItem, candidate: WorkItem): boole
     || existing.taskId !== candidate.taskId
     || existing.assignee !== candidate.assignee
     || existing.createdAt !== candidate.createdAt
+    || !isDeepStrictEqual(existing.baseRefs, candidate.baseRefs)
     || candidate.revision !== existing.revision + 1
     || Date.parse(candidate.updatedAt) < Date.parse(existing.updatedAt)
   ) return false;
