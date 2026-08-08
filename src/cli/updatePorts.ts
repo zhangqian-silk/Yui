@@ -528,7 +528,7 @@ function restartControllerForUpdate(
   activatedVersion: string,
   stopReplacementController: (home: string, pid: number) => UpdateControllerStopResult
 ): void {
-  let restart: { output: string; data?: Record<string, unknown> };
+  let restart: { output?: string; data?: Record<string, unknown> };
   try {
     restart = runControllerCommandOutput(home, environment, spawn, "restart", activatedBinary);
   } catch (error) {
@@ -596,6 +596,7 @@ function parseReplacementPid(data: Record<string, unknown> | undefined): number 
     data === undefined
     || data.restarted !== true
     || !isPositivePid(data.pid)
+    || (data.previousPid !== undefined && !isPositivePid(data.previousPid))
   ) {
     throw unknownActiveControllerError(
       "activated Controller restart returned no authenticated replacement PID"
@@ -779,7 +780,7 @@ function runControllerCommandOutput(
   spawn: UpdateSpawner,
   method: "stop" | "restart",
   cliBinary?: string
-): { output: string; data?: Record<string, unknown> } {
+): { output?: string; data?: Record<string, unknown> } {
   const command = cliBinary ?? process.execPath;
   const args = cliBinary === undefined
     ? [UPDATE_CLI_PATH, "--json", "controller", method]
@@ -793,16 +794,39 @@ function runControllerCommandOutput(
     throw new Error(`Controller ${method} failed (exit ${result.status ?? "null"}).`);
   }
   const parsed = JSON.parse(result.stdout.toString("utf8")) as unknown;
-  if (!isRecord(parsed) || parsed.ok !== true || typeof parsed.output !== "string") {
+  if (!isRecord(parsed) || parsed.ok !== true) {
     throw new Error(`Controller ${method} returned an invalid structured result.`);
+  }
+  if (parsed.output !== undefined && typeof parsed.output !== "string") {
+    throw new Error(`Controller ${method} returned an invalid output field.`);
   }
   if (parsed.data !== undefined && !isRecord(parsed.data)) {
     throw new Error(`Controller ${method} returned malformed structured data.`);
   }
+  if (method === "restart") {
+    if (parsed.output === undefined && parsed.data === undefined) {
+      throw new Error(`Controller ${method} returned no output or structured data.`);
+    }
+    if (parsed.data !== undefined) {
+      validateRestartEnvelopeData(parsed.data);
+    }
+  } else if (parsed.output === undefined) {
+    throw new Error(`Controller ${method} returned no output.`);
+  }
   return {
-    output: parsed.output,
+    ...(parsed.output === undefined ? {} : { output: parsed.output }),
     ...(parsed.data === undefined ? {} : { data: parsed.data })
   };
+}
+
+function validateRestartEnvelopeData(data: Record<string, unknown>): void {
+  if (
+    data.restarted !== true
+    || !isPositivePid(data.pid)
+    || (data.previousPid !== undefined && !isPositivePid(data.previousPid))
+  ) {
+    throw new Error("Controller restart returned malformed structured data.");
+  }
 }
 
 /**

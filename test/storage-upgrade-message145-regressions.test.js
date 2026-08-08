@@ -287,7 +287,6 @@ test("replacement Controller carries authenticated PID and starts through the ve
       return spawnResult({
         stdout: Buffer.from(JSON.stringify({
           ok: true,
-          output: "Controller restarted.",
           data: { restarted: true, previousPid: 41, pid: replacementPid }
         }))
       });
