@@ -2364,6 +2364,15 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
       throw new StorageRecordError(`ReviewRound Candidate not found: ${round.candidateId}.`);
     }
     assertWorkItemCandidateReferences(aggregate, item, candidate, `ReviewRound candidate ${round.id}`);
+    if ((round.scope ?? "work-item") === "task") {
+      const frozenProjects = round.taskCandidate?.projects ?? [];
+      if (frozenProjects.length !== boundProjects.size
+        || frozenProjects.some(({ projectId }) => !boundProjects.has(projectId))) {
+        throw new StorageRecordError(
+          `Task ReviewRound Projects do not match Task scope: ${round.id}.`
+        );
+      }
+    }
     if (round.reviewerRunId !== undefined) {
       const reviewerRun = aggregate.agentRuns[round.reviewerRunId];
       if (reviewerRun === undefined
@@ -2494,8 +2503,16 @@ function assertManagedWorkspaceReferences(
       }
       const item = aggregate.workItems[round.workItemId];
       const candidate = item?.candidates.find(({ id }) => id === round.candidateId);
-      if (candidate?.gitSnapshot !== undefined) {
-        for (const frozen of candidate.gitSnapshot.projects) {
+      const frozenProjects = (round.scope ?? "work-item") === "task"
+        ? round.taskCandidate?.projects ?? []
+        : candidate?.gitSnapshot?.projects ?? [];
+      if (frozenProjects.length > 0) {
+        if (workspace.entries.length !== frozenProjects.length) {
+          throw new StorageRecordError(
+            `${label} ReviewRound Project scope does not match its frozen candidate: ${taskId}/${round.id}.`
+          );
+        }
+        for (const frozen of frozenProjects) {
           const reviewEntry = workspace.entries.find(({ projectId }) => (
             projectId === frozen.projectId
           ));
@@ -2746,6 +2763,8 @@ function validReviewRoundTransition(
     || existing.candidateId !== candidate.candidateId
     || existing.reviewerRoleName !== candidate.reviewerRoleName
     || existing.reviewBaseCommit !== candidate.reviewBaseCommit
+    || (existing.scope ?? "work-item") !== (candidate.scope ?? "work-item")
+    || !isDeepStrictEqual(existing.taskCandidate, candidate.taskCandidate)
     || existing.requestedBy !== candidate.requestedBy
     || existing.createdAt !== candidate.createdAt
   ) return false;

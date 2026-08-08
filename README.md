@@ -223,6 +223,14 @@ yui config review show
 yui config review clear
 ```
 
+For Project-backed software delivery, use `--trigger final` to keep WorkItem
+acceptance and Integration independent and run one fresh ReviewRound over the
+complete frozen integrated Task candidate before completion:
+
+```sh
+yui config review set --role reviewer --trigger final
+```
+
 Every result entering Leader acceptance is one explicit candidate on its
 existing WorkItem. The current global rule applies to the next candidate in
 every existing or new Task; that candidate snapshots the rule, so later
@@ -232,6 +240,11 @@ or a Leader-managed direct result; `leader` leaves the candidate awaiting
 acceptance so the Leader can accept it directly or run
 `yui task work review <task-id>/<work-item-id>`. A configured review rule therefore keeps
 Leader-managed candidates awaiting a decision instead of marking them done.
+`final` does not create WorkItem ReviewRounds; `task complete` queues one
+Task-scoped ReviewRound after every bound Project has a committed Integration,
+and re-queues a new round only when those frozen heads change. The final
+Reviewer follows Project Policy/Knowledge and reports reachable, material,
+actionable findings across the complete Task.
 A ReviewRound freezes the Candidate's exact Git commit and creates a fresh,
 ReviewRound-owned writable worktree on a unique branch. Its AgentRun may edit,
 test, and optionally commit diagnostic evidence there, but never changes the
@@ -246,7 +259,11 @@ under the original WorkItem. A rejected result creates a new Candidate on the
 next dispatch while reusing the original execution Role, Session, and
 workspace.
 
-Project-backed Workers commit and leave the Develop workspace clean before
+Yui Core supplies lifecycle and exact-scope safety; generic role Skills supply
+portable collaboration behavior; Project Policy/Knowledge supplies
+project-specific build, test, migration, release, and review rules; the Task
+Contract supplies the current objective and acceptance. Project-backed Workers
+commit and leave the Develop workspace clean before
 yielding a Candidate. Yui freezes each writable Project's HEAD in the Candidate
 snapshot; ReviewRound worktrees are recreated from those exact commits even if
 Develop later advances during repair.

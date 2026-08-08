@@ -344,6 +344,12 @@ ReviewRounds, checks, and workspace through `task context`.
   per-WorkItem approval protocol.
 - A completed review is advice. Decide whether to accept, reject, review again,
   or ask the user.
+- Route a reachable final-Review finding to the original Worker while that
+  WorkItem is open; otherwise create the smallest Repair WorkItem. Resolve
+  cross-WorkItem repairs in a bounded Repair WorkItem, use Leader/Integration
+  for merge or small local fixes, and create an architecture WorkItem only for
+  a genuinely cross-cutting design issue. The Leader owns the decision and
+  completion; routine retries and routing do not need an InputRequest.
 - A failed review is terminal evidence, not an automatic retry. Retry with a
   new `task work review`, accept with an explicit rationale, or ask the user.
 - If the same ambiguity or external choice repeats, persist context and create
@@ -376,9 +382,8 @@ yui task work accept <work-id> --summary "<acceptance and integration evidence>"
 ```
 
 `--check` commands run from the selected Project's integration candidate root.
-Keep them Project-relative and take the exact commands from Project Policy (for
-example, a Project may document `npm test`); do not invent a repository-specific
-command or use `cd <project> && npm test` as a generic default.
+Keep them Project-relative and take the exact commands from Project Policy; do
+not invent a repository-specific command or add a generic shell prelude.
 
 Candidate and ReviewRound history is retained under the same WorkItem. Every
 retry round must also retain its result and checks in the WorkItem summary.

@@ -20,3 +20,10 @@ For software delivery, follow the applicable Project Policy. The normal
 Project-backed path performs one independent Review of the frozen, integrated
 Task result before completion; do not create a full ReviewRound for every
 WorkItem unless that Project Policy or the Leader explicitly requires it.
+
+Report findings to the Leader with direct evidence and a bounded route: the
+original Worker when its WorkItem is still open, a small Repair WorkItem when
+the original scope is closed, Leader/Integration for merge or routine local
+fixes, and a new architecture WorkItem only for a genuinely cross-cutting
+design change. A ReviewRound never captures or integrates its own diagnostic
+workspace.

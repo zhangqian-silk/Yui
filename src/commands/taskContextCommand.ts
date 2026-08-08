@@ -327,8 +327,12 @@ function renderWorkItemReviews(
   const latest = rounds.at(-1);
   if (latest === undefined) return ["    ReviewRounds: none."];
   return [
-    `    ReviewRounds: ${rounds.length}; latest ${latest.id} [${latest.status}] for ${latest.candidateId} via ${latest.reviewerRoleName} (${latest.requestedBy})`,
+    `    ReviewRounds: ${rounds.length}; latest ${latest.id} [${latest.status}] ${latest.scope === "task" ? "Task-final" : "WorkItem"} for ${latest.candidateId} via ${latest.reviewerRoleName} (${latest.requestedBy})`,
     `      Review base: ${latest.reviewBaseCommit}`,
+    ...(latest.scope === "task"
+      ? [`      Frozen integrated Task heads: ${latest.taskCandidate?.projects
+        .map(({ projectId, commit }) => `${projectId}@${commit}`).join(", ") ?? "unavailable"}`]
+      : []),
     `      Review workspace: ${latest.workspace === undefined
       ? "not prepared"
       : `${latest.workspace.root} (${latest.workspace.entries.length} writable Projects)`}`,

@@ -72,11 +72,13 @@ import {
 } from "../run/agentRun.js";
 import {
   createReviewRound,
+  createTaskReviewRound,
   finishReviewRound,
   parseReviewYieldReport,
   recordReviewWorkspaceDisposition,
   startReviewRound,
-  type ReviewRound
+  type ReviewRound,
+  type TaskReviewCandidate
 } from "../review/reviewRound.js";
 import { markYuiRunInput, retagYuiRunInput } from "../run/runIdentity.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
@@ -166,6 +168,13 @@ import {
 
 const LEADER_ROLE = "leader";
 
+/** `final` is a Task delivery policy, not a per-WorkItem ReviewRound rule. */
+function legacyWorkItemReviewConfig(
+  config: ReviewConfig | null
+): ReviewConfig | null {
+  return config?.trigger === "final" ? null : config;
+}
+
 export type TaskCommandExecution =
   | Readonly<{ kind: "output"; output: string; data?: unknown }>
   | Readonly<{
@@ -214,7 +223,7 @@ export function runTaskCommand(
     case "show": return showTaskCommand(rest, store);
     case "context": return runTaskContextCommand(rest, store);
     case "activate": return output(activateTaskCommand(rest, store, options));
-    case "complete": return output(completeTaskCommand(rest, store, options));
+    case "complete": return completeTaskCommand(rest, store, options);
     case "reopen": return output(reopenTaskCommand(rest, store, options));
     case "archive": return output(archiveTaskCommand(rest, store, options));
     case "retire": return retireTaskCommand(rest, store, options);
@@ -652,7 +661,7 @@ function completeTaskCommand(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
-): string {
+): TaskCommandExecution {
   const usage = "Task complete usage: yui task complete <id> (--summary <text>|--summary-file <path|->).";
   const parsed = parseTail(args, new Set(["--summary", "--summary-file"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
@@ -667,7 +676,12 @@ function completeTaskCommand(
     const task = requireTask(tx, parsed.positionals[0]);
     const actor = taskActor(options, task.id);
     if (task.status === "completed") {
-      return { task, changed: false, runtimeCleanupTargets: [] as RuntimeLifecycleTarget[] } as const;
+      return {
+        task,
+        changed: false,
+        runtimeCleanupTargets: [] as RuntimeLifecycleTarget[],
+        finalReview: undefined
+      } as const;
     }
     if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
@@ -749,6 +763,16 @@ function completeTaskCommand(
       }
     }
 
+    const finalReview = prepareFinalTaskReview(tx, task, now);
+    if (finalReview !== null) {
+      return {
+        task,
+        changed: false,
+        runtimeCleanupTargets: [] as RuntimeLifecycleTarget[],
+        finalReview
+      } as const;
+    }
+
     const completed = completeTask(task, now, { by: actor, summary });
     tx.saveTask(completed);
     tx.clearPendingWakeup(task.id);
@@ -779,7 +803,12 @@ function completeTaskCommand(
       roles,
       now
     );
-    return { task: completed, changed: true, runtimeCleanupTargets } as const;
+    return {
+      task: completed,
+      changed: true,
+      runtimeCleanupTargets,
+      finalReview: undefined
+    } as const;
   });
   if (result.changed) {
     for (const target of result.runtimeCleanupTargets) {
@@ -789,9 +818,18 @@ function completeTaskCommand(
     }
     notifyMailbox(options.runtime, { kind: "operator" }, result.task.id);
   }
-  return result.changed
+  if (result.finalReview !== undefined) {
+    const status = result.finalReview.status === "pending"
+      ? `Final Task Review requested as ${result.finalReview.id}.`
+      : `Final Task Review is blocked: ${result.finalReview.summary ?? result.finalReview.id}.`;
+    return output(`${status}\n`, {
+      task: result.task,
+      reviewRound: result.finalReview
+    });
+  }
+  return output(result.changed
     ? `Completed task ${result.task.id}\n`
-    : `Task ${result.task.id} is already completed\n`;
+    : `Task ${result.task.id} is already completed\n`);
 }
 
 function reopenTaskCommand(
@@ -1756,9 +1794,10 @@ function updateWork(
           + "after the required ReviewRound and Integration evidence."
         );
       }
-      const reviewConfig = status === "completed" && !isTerminalWorkItemStatus(current.status)
+      const configuredReview = status === "completed" && !isTerminalWorkItemStatus(current.status)
         ? tx.getReviewConfig()
         : null;
+      const reviewConfig = legacyWorkItemReviewConfig(configuredReview);
       const projectDelivery = task.projectBindings.length > 0
         && current.writeProjectIds.length > 0;
       const candidateRequired = status === "completed"
@@ -2124,6 +2163,141 @@ function assertWorkItemIntegrationProof(
       throw usageError(`Work Item ChangeSet is not integrated: ${projectProof.changeSetId}.`);
     }
   }
+}
+
+/**
+ * Queue the one Project-scoped ReviewRound required by the `final` policy.
+ * WorkItem/Candidate identity remains the storage anchor, while the frozen
+ * heads come from the latest committed Integration for every bound Project.
+ */
+function prepareFinalTaskReview(
+  store: TaskWorkflowStore,
+  task: Task,
+  now: Date
+): ReviewRound | null {
+  const config = store.getReviewConfig();
+  if (config?.trigger !== "final" || task.projectBindings.length === 0) return null;
+
+  const taskCandidate = latestTaskReviewCandidate(store, task);
+  const latest = chronologicalReviewRounds(store.listReviewRounds(task.id))
+    .filter((round) => (round.scope ?? "work-item") === "task")
+    .at(-1);
+  if (latest !== undefined && (latest.status === "pending" || latest.status === "running")) {
+    throw usageError(`Final Task Review is still active: ${latest.id}/${latest.status}.`);
+  }
+  if (latest?.status === "completed"
+    && isSameTaskReviewCandidate(latest.taskCandidate, taskCandidate)) {
+    return null;
+  }
+
+  const anchor = [...store.listWorkItems(task.id)]
+    .filter(({ candidates }) => candidates.length > 0)
+    .sort((left, right) => (
+      left.updatedAt.localeCompare(right.updatedAt) || left.id.localeCompare(right.id)
+    ))
+    .at(-1);
+  if (anchor === undefined) {
+    throw usageError(`Task ${task.id} has no WorkItem Candidate to anchor its final Review.`);
+  }
+  const candidate = anchor.candidates.at(-1);
+  if (candidate === undefined) {
+    throw usageError(`Task ${task.id} has no WorkItem Candidate to anchor its final Review.`);
+  }
+  return queueTaskReviewRound(store, task, anchor, candidate.id, config, taskCandidate, now);
+}
+
+function latestTaskReviewCandidate(
+  store: TaskWorkflowStore,
+  task: Task
+): TaskReviewCandidate {
+  const committed = store.listIntegrationAttempts(task.id)
+    .filter(({ status }) => status === "committed");
+  const projects = task.projectBindings.map(({ projectId }) => {
+    const attempt = committed
+      .filter((candidate) => candidate.projectId === projectId)
+      .sort((left, right) => (
+        left.updatedAt.localeCompare(right.updatedAt) || left.id.localeCompare(right.id)
+      ))
+      .at(-1);
+    if (attempt?.candidateCommit === undefined) {
+      throw usageError(
+        `Task ${task.id} requires a committed Integration for Project ${projectId} before final Review.`
+      );
+    }
+    return { projectId, commit: attempt.candidateCommit };
+  });
+  return { schemaVersion: 1, projects };
+}
+
+function isSameTaskReviewCandidate(
+  left: TaskReviewCandidate | undefined,
+  right: TaskReviewCandidate
+): boolean {
+  return left !== undefined && isDeepStrictEqual(left, right);
+}
+
+function queueTaskReviewRound(
+  store: TaskWorkflowStore,
+  task: Task,
+  item: WorkItem,
+  candidateId: string,
+  config: ReviewConfig,
+  taskCandidate: TaskReviewCandidate,
+  now: Date
+): ReviewRound {
+  const pending = createTaskReviewRound(
+    store.nextReviewRoundId(task.id),
+    task.id,
+    item.id,
+    candidateId,
+    config.roleName,
+    "policy",
+    taskCandidate,
+    now
+  );
+  store.saveReviewRound(task.id, pending);
+  const candidate = item.candidates.find(({ id }) => id === candidateId);
+  const producerRoleName = item.assignee
+    ?? (candidate?.source.type === "run"
+      ? store.getAgentRun(task.id, candidate.source.runId)?.roleName
+      : LEADER_ROLE);
+  if (producerRoleName === config.roleName) {
+    const failed = finishReviewRound(
+      pending,
+      "failed",
+      `Reviewer Role must be separate from the Task Candidate producer: ${config.roleName}.`,
+      now
+    );
+    store.saveReviewRound(task.id, failed);
+    return failed;
+  }
+  let reviewer = store.getRole(task.id, config.roleName);
+  if (reviewer === null) {
+    const globalRole = store.getGlobalRole(config.roleName);
+    if (globalRole === null) {
+      const failed = finishReviewRound(
+        pending,
+        "failed",
+        `Global Role not found: ${config.roleName}.`,
+        now
+      );
+      store.saveReviewRound(task.id, failed);
+      return failed;
+    }
+    reviewer = createTaskRole(store, task, config.roleName, undefined, now, config.roleName);
+    store.saveRole(task.id, reviewer);
+  }
+  if (store.getActiveAgentRun(task.id, reviewer.name) !== null) {
+    const failed = finishReviewRound(
+      pending,
+      "failed",
+      `Reviewer Role already has an active run: ${reviewer.name}.`,
+      now
+    );
+    store.saveReviewRound(task.id, failed);
+    return failed;
+  }
+  return pending;
 }
 
 function rejectWork(
@@ -2702,8 +2876,13 @@ function yieldRun(
     } else if (active.workItemId !== undefined) {
       const item = tx.getWorkItem(task.id, active.workItemId);
       if (item === null) throw dataError(`Work item not found for run ${active.id}: ${active.workItemId}.`);
-      const reviewConfig = tx.getReviewConfig();
-      const candidateRequired = role.name !== LEADER_ROLE || reviewConfig !== null;
+      const configuredReview = tx.getReviewConfig();
+      const reviewConfig = legacyWorkItemReviewConfig(configuredReview);
+      const projectDelivery = task.projectBindings.length > 0
+        && item.writeProjectIds.length > 0;
+      const candidateRequired = role.name !== LEADER_ROLE
+        || reviewConfig !== null
+        || projectDelivery;
       const yieldedItem = candidateRequired
           ? submitWorkItemCandidate(item, {
             summary,
@@ -2923,7 +3102,8 @@ export function dispatchPreparedReviewRound(
     if (candidate === undefined) {
       throw dataError(`ReviewRound Candidate not found: ${round.candidateId}.`);
     }
-    if (candidate.gitSnapshot?.reviewBaseCommit !== round.reviewBaseCommit) {
+    if ((round.scope ?? "work-item") === "work-item"
+      && candidate.gitSnapshot?.reviewBaseCommit !== round.reviewBaseCommit) {
       throw usageError(`ReviewRound Candidate snapshot changed: ${round.id}.`);
     }
     const reviewer = requireRole(tx, taskId, round.reviewerRoleName);
@@ -2941,19 +3121,27 @@ export function dispatchPreparedReviewRound(
     const candidateLabel = candidate.source.type === "run"
       ? `candidate Run ${candidate.source.runId}`
       : `revision ${candidate.workItemRevision}`;
+    const scopeLabel = (round.scope ?? "work-item") === "task"
+      ? `Task-scoped final Review of integrated heads: ${round.taskCandidate!.projects
+        .map(({ projectId, commit }) => `${projectId}@${commit}`).join(", ")}`
+      : "WorkItem-scoped Review";
     const rawInput = [
-      `Review WorkItem ${item.id} ${candidateLabel}.`,
+      `${scopeLabel}. Review WorkItem ${item.id} ${candidateLabel}.`,
       `ReviewRound: ${round.id}`,
       `Review base commit: ${round.reviewBaseCommit}`,
       `Review workspace: ${round.workspace.root}`,
       `Candidate summary: ${candidate.summary}`,
       `Acceptance criteria: ${item.acceptance.length === 0 ? "none" : item.acceptance.join("; ")}`,
       "Start from the user's core outcome and the WorkItem intent. The candidate summary is a pointer, not proof: inspect the complete relevant change, callers, and proportionate checks.",
+      "Keep Yui Core lifecycle safety, generic Reviewer behavior, Project Policy/Knowledge, and the Task Contract separate. Follow Project Policy pointers from the dispatch context for project-specific checks.",
+      ...(round.scope === "task"
+        ? ["This is the one final Task Review: inspect every bound Project at the frozen integrated heads, and report only reachable, material, actionable P1/P2 findings or bounded verification gaps."]
+        : []),
       "You may freely edit source/tests, run local build or test commands, and optionally commit diagnostic evidence only inside this ReviewRound-owned workspace.",
-      "Do not push, integrate, mutate Task state, touch the Candidate or Worker workspace, another Task/workspace, a stable checkout, or real YUI_HOME.",
+      "Do not push, integrate, mutate Task state, touch the Candidate or Worker workspace, another Task/workspace, a stable checkout, or the real Yui control-plane home.",
       "Use the exact --summary-file - body to report complete findings, evidence, checks actually run, uncertainty, and recommended next actions in clear Markdown or JSON. Yui preserves the full report; no fixed wording or field list is required. If you include evidenceCommit, it must match the managed Review workspace.",
       "Report reviewBaseCommit, exact checks/results, material findings, and uncertainty. Review yield completes only this Round and creates no Candidate or ChangeSet.",
-      "The Leader alone interprets and routes evidence to the original Worker; never merge review evidence yourself."
+      "The Leader alone interprets and routes evidence: original Worker when open, a small Repair WorkItem when needed, or Leader/Integration for merge and local fixes; never merge review evidence yourself."
     ].join("\n");
     const runId = tx.nextAgentRunId(taskId);
     const input = markYuiRunInput(

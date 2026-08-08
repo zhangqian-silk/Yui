@@ -366,15 +366,16 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (candidate === undefined) {
       throw new Error(`ReviewRound Candidate not found: ${round.candidateId}.`);
     }
-    // A Candidate is an immutable snapshot of Develop.  Always prefer that
-    // snapshot over the current WorkItem workspace: the Worker may have
-    // continued (or a retry may have replaced) Develop after yielding, but a
-    // ReviewRound must start from the exact Candidate commit and scope.
+    const taskScope = (round.scope ?? "work-item") === "task";
+    // A WorkItem ReviewRound is an immutable snapshot of Develop. A Task
+    // ReviewRound intentionally uses the latest committed Integration heads
+    // instead, while retaining the WorkItem/Candidate anchor for storage and
+    // lifecycle compatibility.
     const develop = candidate.workspace;
-    if (develop === undefined || candidate.gitSnapshot === undefined) {
+    if (!taskScope && (develop === undefined || candidate.gitSnapshot === undefined)) {
       throw new Error(`Candidate has no frozen managed Git snapshot: ${candidate.id}.`);
     }
-    if (candidate.gitSnapshot.reviewBaseCommit !== round.reviewBaseCommit) {
+    if (!taskScope && candidate.gitSnapshot!.reviewBaseCommit !== round.reviewBaseCommit) {
       throw new Error(`ReviewRound base no longer matches its Candidate: ${round.id}.`);
     }
     const reviewer = this.store.getRole(task.id, round.reviewerRoleName);
@@ -382,15 +383,39 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       throw new Error(`Reviewer Role not found: ${task.id}/${round.reviewerRoleName}.`);
     }
     const snapshotCommits = new Map(
-      candidate.gitSnapshot.projects.map(({ projectId, commit }) => [projectId, commit])
+      (taskScope
+        ? round.taskCandidate?.projects ?? []
+        : candidate.gitSnapshot!.projects
+      ).map(({ projectId, commit }) => [projectId, commit])
     );
-    const frozenEntries = develop.entries.map((entry) => {
-      const commit = snapshotCommits.get(entry.projectId);
-      if (commit === undefined) {
-        throw new Error(`Candidate snapshot Project is missing: ${entry.projectId}.`);
-      }
-      return { ...entry, baseRef: commit, baseCommit: commit };
-    });
+    const frozenEntries = taskScope
+      ? task.projectBindings.map((binding) => {
+          const commit = snapshotCommits.get(binding.projectId);
+          if (commit === undefined) {
+            throw new Error(`Task Review candidate Project is missing: ${binding.projectId}.`);
+          }
+          const project = requireProject(this.store, binding.projectId);
+          const identity = worktreeIdentity(task.id, round.id);
+          return {
+            projectId: binding.projectId,
+            directory: binding.directory,
+            access: "write" as const,
+            path: join(this.#projectContainer(project.name), identity.directory),
+            branch: identity.branch,
+            baseRef: commit,
+            baseCommit: commit
+          };
+        })
+      : develop!.entries.map((entry) => {
+          const commit = snapshotCommits.get(entry.projectId);
+          if (commit === undefined) {
+            throw new Error(`Candidate snapshot Project is missing: ${entry.projectId}.`);
+          }
+          return { ...entry, baseRef: commit, baseCommit: commit };
+        });
+    if (taskScope && snapshotCommits.size !== task.projectBindings.length) {
+      throw new Error(`Task Review candidate Project scope changed: ${round.id}.`);
+    }
     const expectedEntries = new Map(
       frozenEntries.map((entry) => [entry.projectId, entry] as const)
     );
