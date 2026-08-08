@@ -25,6 +25,7 @@ const PUBLIC_PATHS = [
   "help",
   "version",
   "update",
+  "upgrade",
   "setup",
   "doctor",
   "web",
