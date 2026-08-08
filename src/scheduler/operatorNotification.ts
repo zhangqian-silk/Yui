@@ -1,7 +1,9 @@
 import type { TaskCompletedBy } from "../task/task.js";
 
+export const CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION = 1 as const;
+
 export type LeaderRecoveryOperatorNotification = {
-  schemaVersion: 1;
+  schemaVersion: typeof CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION;
   taskId: string;
   type: "leader-recovery-failed";
   message: string;
@@ -10,7 +12,7 @@ export type LeaderRecoveryOperatorNotification = {
 };
 
 export type LeaderStallNotification = {
-  schemaVersion: 1;
+  schemaVersion: typeof CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION;
   taskId: string;
   type: "leader-stalled";
   message: string;
@@ -23,7 +25,7 @@ export type LeaderStallNotification = {
 };
 
 export type TaskTerminalOperatorNotification = {
-  schemaVersion: 1;
+  schemaVersion: typeof CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION;
   taskId: string;
   type: "task-terminal";
   status: "completed" | "retired";
@@ -45,7 +47,7 @@ export function createLeaderRecoveryNotification(
 ): LeaderRecoveryOperatorNotification {
   const timestamp = now.toISOString();
   return {
-    schemaVersion: 1,
+    schemaVersion: CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION,
     taskId: requiredText(taskId, "Task id"),
     type: "leader-recovery-failed",
     message: requiredText(message, "Operator notification message"),
@@ -65,7 +67,7 @@ export function createTaskTerminalNotification(
 ): TaskTerminalOperatorNotification {
   const timestamp = now.toISOString();
   return {
-    schemaVersion: 1,
+    schemaVersion: CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION,
     taskId: requiredText(taskId, "Task id"),
     type: "task-terminal",
     status,
@@ -91,7 +93,7 @@ export function createLeaderStallNotification(
     ? existing
     : undefined;
   return {
-    schemaVersion: 1,
+    schemaVersion: CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION,
     taskId: requiredText(taskId, "Task id"),
     type: "leader-stalled",
     message: requiredText([

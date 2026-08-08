@@ -1,5 +1,7 @@
+export const CURRENT_LEADER_FAILURE_SCHEMA_VERSION = 1 as const;
+
 export type LeaderFailure = {
-  schemaVersion: 1;
+  schemaVersion: typeof CURRENT_LEADER_FAILURE_SCHEMA_VERSION;
   taskId: string;
   nativeSessionId: string;
   message: string;
@@ -17,7 +19,7 @@ export function recordLeaderFailure(
 ): LeaderFailure {
   const timestamp = now.toISOString();
   return {
-    schemaVersion: 1,
+    schemaVersion: CURRENT_LEADER_FAILURE_SCHEMA_VERSION,
     taskId: requiredText(taskId, "Task id"),
     nativeSessionId: requiredText(nativeSessionId, "Native session id"),
     message: requiredText(message, "Leader failure message"),
