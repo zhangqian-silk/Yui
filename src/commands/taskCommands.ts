@@ -2648,15 +2648,6 @@ function yieldRun(
       );
     }
     const terminal = terminalization.run;
-    const message = appendMessage(
-      tx,
-      task.id,
-      reviewReport?.report ?? summary,
-      "role-result",
-      { type: "role", roleName: role.name },
-      now,
-      { runId: terminal.id, workItemId: active.workItemId }
-    );
     if (wasStalled) {
       recordTaskEvent(tx, task.id, RUN_RECOVERED_EVENT, {
         runId: terminal.id,
@@ -2737,13 +2728,11 @@ function yieldRun(
     if (leaderHandoff !== null) {
       enqueueWork(tx, leaderMailbox(task.id), leaderHandoff, now, [
         runRef(task.id, terminal.id),
-        messageRef(task.id, message.id),
         ...(terminal.workItemId === undefined ? [] : [workItemRef(task.id, terminal.workItemId)])
       ]);
     }
     return {
       run: terminal,
-      message,
       reviewDispatch,
       notifyLeader: leaderHandoff !== null
     };
@@ -2763,9 +2752,8 @@ function yieldRun(
       yielded.reviewDispatch.run.taskId
     );
   }
-  return output(`Yielded ${yielded.run.id}: ${yielded.message.body}\n`, {
+  return output(`Yielded ${yielded.run.id}: ${yielded.run.summary ?? inputSummary}\n`, {
     run: yielded.run,
-    message: yielded.message,
     ...(yielded.reviewDispatch === null
       ? {}
       : { reviewRound: yielded.reviewDispatch.round })

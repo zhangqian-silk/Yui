@@ -909,19 +909,25 @@ test("assigned Work dispatch honors dependencies and Worker yield awaits Leader 
   assert.ok(workerMailbox.pending.refs.some((ref) => ref.type === "run" && ref.id === active.id));
 
   markDelivered(store, active);
+  const messagesBeforeYield = store.listMessages(task.id);
   run(["run", "yield", active.id, "--summary", "implemented"], store, options);
-  assert.equal(store.getAgentRun(active.taskId, active.id)?.status, "yielded");
+  const yieldedRun = store.getAgentRun(active.taskId, active.id);
+  assert.equal(yieldedRun?.status, "yielded");
+  assert.equal(yieldedRun?.summary, "implemented");
   assert.equal(store.getWorkItem(first.taskId, first.id)?.status, "awaiting_acceptance");
   assert.equal(store.getActiveAgentRun(task.id, "worker"), null);
-  const resultMessage = store.listMessages(task.id).at(-1);
-  assert.deepEqual(resultMessage.author, { type: "role", roleName: "worker" });
-  assert.equal(resultMessage.kind, "role-result");
-  assert.equal(resultMessage.runId, active.id);
-  assert.equal(resultMessage.workItemId, first.id);
-  assert.equal(resultMessage.body, "implemented");
+  assert.deepEqual(store.listMessages(task.id), messagesBeforeYield);
+  const candidate = store.getWorkItem(first.taskId, first.id)?.candidates.at(-1);
+  assert.equal(candidate?.summary, "implemented");
+  assert.deepEqual(candidate?.source, { type: "run", runId: active.id });
   assert.ok(store.getPendingWakeup(task.id)?.reasons.includes("candidate-ready"));
   const leaderMailbox = store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: "leader" });
   assert.ok(leaderMailbox.pending.refs.some((ref) => ref.type === "run" && ref.id === active.id));
+  assert.ok(leaderMailbox.pending.refs.every((ref) => ref.type !== "message"));
+  const contextAfterYield = run(["context", task.id], store, options);
+  assert.match(contextAfterYield, new RegExp(`${active.id} \\[yielded/execution\\]`));
+  assert.match(contextAfterYield, /Result: implemented/);
+  assert.match(contextAfterYield, /Recent messages \(0\):\n  None\./);
   assert.throws(
     () => run(
       ["work", "update", first.id, "done", "--summary", "bypassed review"],
@@ -1017,7 +1023,9 @@ test("always review creates a ReviewRound under the same WorkItem and never revi
   const execution = store.getActiveAgentRun(task.id, "worker");
   assert.equal(execution.purpose, "execution");
   markDelivered(store, execution);
+  const messagesBeforeExecutionYield = store.listMessages(task.id);
   run(["run", "yield", execution.id, "--summary", "candidate ready"], store, options);
+  assert.deepEqual(store.listMessages(task.id), messagesBeforeExecutionYield);
 
   assert.equal(store.listWorkItems(task.id).length, 1);
   const rounds = store.listReviewRounds(task.id);
@@ -1063,6 +1071,7 @@ test("always review creates a ReviewRound under the same WorkItem and never revi
     summary: "One issue to consider.",
     checks: [{ name: "inspection", outcome: "passed", details: "Reviewed candidate evidence." }]
   })], store, options);
+  assert.deepEqual(store.listMessages(task.id), messagesBeforeExecutionYield);
   assert.equal(store.listReviewRounds(task.id).length, 1);
   assert.equal(store.listWorkItems(task.id).length, 1);
   const completedRound = store.getReviewRound(task.id, rounds[0].id);
@@ -1895,12 +1904,15 @@ test("Leader control Run without a WorkItem can yield and release the pending wa
     ));
   });
 
+  const messagesBeforeYield = store.listMessages(task.id);
   run(["run", "yield", controlRun.id, "--summary", "reviewed"], store, options);
-  assert.equal(store.getAgentRun(controlRun.taskId, controlRun.id)?.status, "yielded");
+  const yielded = store.getAgentRun(controlRun.taskId, controlRun.id);
+  assert.equal(yielded?.status, "yielded");
+  assert.equal(yielded?.summary, "reviewed");
   assert.equal(store.getActiveAgentRun(task.id, "leader"), null);
   assert.equal(store.getRole(task.id, "leader")?.status, "idle");
   assert.equal(store.getPendingWakeup(task.id), null);
-  assert.equal(store.listMessages(task.id).at(-1).body, "reviewed");
+  assert.deepEqual(store.listMessages(task.id), messagesBeforeYield);
   assert.equal(store.getTaskRoleSessionSet(task.id, "leader").inFlight, null);
   assert.equal(store.getTaskRoleSessionSet(task.id, "leader").pendingTurnCompletion, null);
 });

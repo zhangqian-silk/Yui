@@ -1981,6 +1981,7 @@ test("Worker delivery exhaustion atomically fails the exact Run and queues clean
     taskId: fx.task.id,
     id: fx.run.id
   });
+  const messagesBeforeFailure = fx.store.listMessages(fx.task.id);
 
   assert.equal(
     fx.adapter.saveRoleRunDeliveryFailure(fx.failure),
@@ -2003,13 +2004,19 @@ test("Worker delivery exhaustion atomically fails the exact Run and queues clean
   assert.ok(fx.store.listEvents(fx.task.id).some(
     (event) => event.type === "runtime.role-delivery-failed"
   ));
-  const messageCount = fx.store.listMessages(fx.task.id).length;
+  assert.deepEqual(fx.store.listMessages(fx.task.id), messagesBeforeFailure);
+  const leaderMailbox = fx.store.getWorkMailbox({
+    kind: "role",
+    taskId: fx.task.id,
+    roleName: "leader"
+  });
+  assert.ok(leaderMailbox.pending.refs.every((ref) => ref.type !== "message"));
 
   assert.equal(
     fx.adapter.saveRoleRunDeliveryFailure(fx.failure),
     "state-changed"
   );
-  assert.equal(fx.store.listMessages(fx.task.id).length, messageCount);
+  assert.deepEqual(fx.store.listMessages(fx.task.id), messagesBeforeFailure);
 });
 
 test("Reviewer delivery exhaustion fails only its ReviewRound and queues the Leader", (t) => {
@@ -2017,6 +2024,7 @@ test("Reviewer delivery exhaustion fails only its ReviewRound and queues the Lea
     roleName: "reviewer",
     purpose: "review"
   });
+  const messagesBeforeFailure = fx.store.listMessages(fx.task.id);
 
   assert.equal(
     fx.adapter.saveRoleRunDeliveryFailure(fx.failure),
@@ -2037,10 +2045,12 @@ test("Reviewer delivery exhaustion fails only its ReviewRound and queues the Lea
     1
   );
   assert.ok(fx.store.getPendingWakeup(fx.task.id).reasons.includes("review-failed"));
+  assert.deepEqual(fx.store.listMessages(fx.task.id), messagesBeforeFailure);
 });
 
 test("Leader delivery exhaustion records Operator recovery and stops its owned runtime before session exit", async (t) => {
   const fx = preparedDeliveryFailureFixture(t, { roleName: "leader" });
+  const messagesBeforeFailure = fx.store.listMessages(fx.task.id);
   const runtimeTarget = runtimeLifecycleTarget({
     scope: "task",
     taskId: fx.task.id,
@@ -2065,6 +2075,10 @@ test("Leader delivery exhaustion records Operator recovery and stops its owned r
       "leader-run-failed"
     )
   );
+  assert.deepEqual(fx.store.listMessages(fx.task.id), messagesBeforeFailure);
+  assert.ok(fx.store.getWorkMailbox({ kind: "operator" }).pending.refs.every(
+    (ref) => ref.type !== "message"
+  ));
   assert.equal(fx.store.getRoleSession(fx.task.id, fx.role.name).status, "ready");
   assert.equal(hasRuntimeCleanupObligation(
     fx.store.getWorkMailbox(runtimeTarget)
