@@ -3825,6 +3825,29 @@ test("public Task archive cleans terminal ReviewRound workspaces before archivin
     }
   );
   assert.equal(finished.status, 0, finished.stderr || finished.stdout);
+  const controllerStopped = spawnSync(
+    process.execPath,
+    [cli, "controller", "stop"],
+    { encoding: "utf8", env: { ...process.env, YUI_HOME: home } }
+  );
+  assert.equal(
+    controllerStopped.status,
+    0,
+    controllerStopped.stderr || controllerStopped.stdout
+  );
+  const leaderRun = store.getActiveAgentRun(task.id, "leader");
+  if (leaderRun !== null) {
+    markDelivered(store, leaderRun);
+    const leaderFinished = spawnSync(
+      process.execPath,
+      [cli, "task", "run", "yield", leaderRun.id, "--summary", "Archive fixture settled."],
+      { encoding: "utf8", env: leaderEnvironment }
+    );
+    assert.equal(leaderFinished.status, 0, leaderFinished.stderr || leaderFinished.stdout);
+  }
+  // This fixture completes the Task directly below rather than through the
+  // public completion command, so discard its now-quiescent Leader handoff.
+  store.removeWorkMailbox({ kind: "role", taskId: task.id, roleName: "leader" });
   const completedItem = updateWorkItemStatus(
     store.getWorkItem(task.id, item.id),
     "completed",
