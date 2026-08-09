@@ -367,8 +367,9 @@ export function foldCanonicalLifecycleEvent(
 
     case "provider-accepted":
       // Only an identity-matched durable native event can move accepted/delivered,
-      // and only after the single transport push. There is no delivered without a
-      // prior push→accept, so a transport receipt alone can never reach here.
+      // and only after the independently committed transport receipt. Provider
+      // acceptance and transport acknowledgement are deliberately separate
+      // evidence layers: neither may repair or infer the other.
       if (!expectation.pushed) return { outcome: "fail-closed", reason: "accept-without-push" };
       if (expectation.terminal) return { outcome: "obsolete", reason: "accept-after-terminal" };
       if (expectation.accepted) return { outcome: "idempotent", reason: "already-accepted" };

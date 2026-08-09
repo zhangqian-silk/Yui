@@ -23,6 +23,7 @@ import {
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
 } from "../../dist/runtime/lifecycleReservation.js";
+import { createExactInitialPromptReceipt } from "../../dist/runtime/index.js";
 import {
   createRole,
   createRoleAgentBinding,
@@ -101,6 +102,16 @@ function assertReservation(fx, roleName, launchId, runId) {
 }
 
 function runtimeBinding(request, options = {}) {
+  const hostCreated = options.hostCreated ?? true;
+  const initialPromptReceipt = options.omitInitialPromptReceipt === true
+    ? undefined
+    : options.initialPromptReceipt
+      ?? (hostCreated
+        && request.owner.scope === "task"
+        && request.adapterId === "codex"
+        && request.runId !== undefined
+          ? exactPromptReceipt(request)
+          : undefined);
   return {
     id: `binding-${options.index ?? 1}`,
     launchId: request.launchId,
@@ -108,11 +119,28 @@ function runtimeBinding(request, options = {}) {
     agentId: request.agentId,
     adapterId: request.adapterId,
     hostRef: `host-${request.owner.roleName}`,
-    hostCreated: options.hostCreated ?? true,
+    hostCreated,
+    ...(initialPromptReceipt === undefined
+      ? {}
+      : { initialPromptReceipt }),
     ...(options.nativeSessionId === undefined
       ? {}
       : { nativeSessionId: options.nativeSessionId })
   };
+}
+
+function exactPromptReceipt(request) {
+  return createExactInitialPromptReceipt({
+    owner: request.owner,
+    agentId: request.agentId,
+    adapterId: request.adapterId,
+    runId: request.runId,
+    launchId: request.launchId,
+    workspace: request.workspace,
+    ...(request.nativeSessionId === undefined
+      ? {}
+      : { nativeSessionId: request.nativeSessionId })
+  });
 }
 
 function unusedTmux(roleStatus = "exited") {
@@ -243,7 +271,7 @@ async function controllerRecoveryFixture(t, persistPrepared) {
         hostCreated,
         ...(persistPrepared
           ? { nativeSessionId: "claude-native-recovery" }
-          : {})
+          : { initialPromptReceipt: exactPromptReceipt(request) })
       });
     },
     async resume() { throw new Error("resume is not expected"); },
@@ -442,13 +470,57 @@ test("fresh Codex Leader and Worker reserve before start and their first matchin
   );
 });
 
+test("a fresh Codex argv prompt without its exact receipt retains the reservation and never falls back to push", async (t) => {
+  const fx = fixture(t);
+  let pushes = 0;
+  const host = {
+    async start(request) {
+      return runtimeBinding(request, { omitInitialPromptReceipt: true });
+    },
+    async resume() { throw new Error("resume is not expected"); },
+    async stop() { throw new Error("an unacknowledged binding must not be trusted"); },
+    async inspect() { return { state: "running" }; },
+    async inspectOwner() { return { state: "running" }; },
+    async stopOwner() { return true; }
+  };
+  const delivery = registry(
+    new RuntimeLaunchCoordinator(fx.schedulerStore, host, {
+      createGenerationId: () => "missing-receipt-generation",
+      now: () => NOW
+    }),
+    host,
+    async () => {
+      pushes += 1;
+      return "delivered";
+    }
+  );
+
+  await assert.rejects(
+    delivery.prepareRoleSession(prepareInput(fx, "worker", "agent-run-1")),
+    /initial prompt.*receipt|binding that does not match/i
+  );
+  const mailbox = reservationMailbox(fx, "worker");
+  assert.ok(mailbox);
+  assert.equal(isRuntimeLaunchReservation(mailbox.processing), true);
+  assert.deepEqual(mailbox.processing.batch.reasons, [RUNTIME_LAUNCH_RESERVED_REASON]);
+  assert.deepEqual(mailbox.processing.executionRef, {
+    type: "run",
+    taskId: fx.task.id,
+    id: "agent-run-1"
+  });
+  assert.deepEqual(mailbox.pending.reasons, [RUNTIME_CLEANUP_REQUIRED_REASON]);
+  assert.equal(pushes, 0);
+});
+
 test("a busy retry for one delivery reuses the prepared binding without starting twice", async (t) => {
   const fx = fixture(t);
   let starts = 0;
   const host = {
     async start(request) {
       starts += 1;
-      return runtimeBinding(request);
+      // An already-running Role pane receives this new Run through the active
+      // push path; no launch argv receipt exists for the new prompt.
+      return runtimeBinding(request, { hostCreated: false });
     },
     async resume() { throw new Error("resume is not expected"); },
     async stop() {},
@@ -636,7 +708,8 @@ test("after Controller restart an existing running host reuses its generation wi
       starts.push(request);
       return runtimeBinding(request, {
         index: starts.length,
-        hostCreated
+        hostCreated,
+        initialPromptReceipt: exactPromptReceipt(request)
       });
     },
     async resume() { throw new Error("resume is not expected"); },
@@ -808,7 +881,11 @@ test("a host recreated after a same-Run running probe reports generation loss wi
       }
       const hostCreated = !hostPresent;
       hostPresent = true;
-      return runtimeBinding(request, { index: starts, hostCreated });
+      return runtimeBinding(request, {
+        index: starts,
+        hostCreated,
+        initialPromptReceipt: exactPromptReceipt(request)
+      });
     },
     async resume() { throw new Error("resume is not expected"); },
     async stop() {

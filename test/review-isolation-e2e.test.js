@@ -45,6 +45,7 @@ import {
   updateWorkItemStatus
 } from "../dist/workItem/workItem.js";
 import { WorkItemChangeSetManager } from "../dist/workspace/workItemChangeSetManager.js";
+import { exactTaskCliInvocation } from "./helpers/exactTaskCli.js";
 
 const START = new Date("2026-08-03T08:00:00.000Z");
 
@@ -236,7 +237,7 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
   assert.equal(readFileSync(join(workerEntry.path, "candidate.txt"), "utf8"), candidateBytes);
 
   now = new Date(START.getTime() + 2_000);
-  const committedYield = yieldReviewThroughCli(home, task.id, reviewRun.id, {
+  const committedYield = yieldReviewThroughCli(home, store, task.id, reviewRun.id, {
     summary: "Diagnostic reproduction committed; Candidate remains immutable.",
     checks: [
       {
@@ -402,7 +403,7 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
   execFileSync("npm", ["test"], { cwd: dirtyReviewEntry.path, stdio: "pipe" });
   assert.notEqual(git(dirtyReviewEntry.path, "status", "--porcelain=v1"), "");
 
-  const dirtyYield = yieldReviewThroughCli(home, task.id, dirtyReviewRun.id, {
+  const dirtyYield = yieldReviewThroughCli(home, store, task.id, dirtyReviewRun.id, {
     summary: "Uncommitted diagnosis reproduced the behavior; preserve for Leader judgment.",
     checks: [
       {
@@ -428,13 +429,13 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
   assert.equal(git(workerEntry.path, "status", "--porcelain=v1"), continuedStatus);
   assert.equal(readFileSync(join(workerEntry.path, "worker-follow-up.txt"), "utf8"), continuedBytes);
 
-  const preserve = reviewWorkspaceCommand(home, task.id, "preserve", secondRound.id);
+  const preserve = reviewWorkspaceCommand(home, store, task.id, "preserve", secondRound.id);
   assert.equal(preserve.status, 0, preserve.stderr || preserve.error?.message);
   assert.equal(
     store.getReviewRound(task.id, secondRound.id).workspaceDisposition.kind,
     "preserved"
   );
-  const dirtyCleanup = reviewWorkspaceCommand(home, task.id, "cleanup", secondRound.id);
+  const dirtyCleanup = reviewWorkspaceCommand(home, store, task.id, "cleanup", secondRound.id);
   assert.notEqual(dirtyCleanup.status, 0);
   assert.match(dirtyCleanup.stderr, /dirty and was retained/i);
   assert.equal(existsSync(dirtyReviewEntry.path), true);
@@ -446,7 +447,7 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
   git(dirtyReviewEntry.path, "add", "test/dirty-no-commit.test.js");
   git(dirtyReviewEntry.path, "commit", "-qm", "preserved post-yield diagnosis");
   assert.equal(git(dirtyReviewEntry.path, "status", "--porcelain=v1"), "");
-  const cleanCleanup = reviewWorkspaceCommand(home, task.id, "cleanup", secondRound.id);
+  const cleanCleanup = reviewWorkspaceCommand(home, store, task.id, "cleanup", secondRound.id);
   assert.equal(cleanCleanup.status, 0, cleanCleanup.stderr || cleanCleanup.error?.message);
   assert.equal(existsSync(dirtyReviewEntry.path), false);
   assert.equal(existsSync(workerEntry.path), true);
@@ -553,9 +554,10 @@ function noOpRuntime() {
   };
 }
 
-function yieldReviewThroughCli(home, taskId, runId, result) {
+function yieldReviewThroughCli(home, store, taskId, runId, result) {
   return yieldRunThroughCli(
     home,
+    store,
     taskId,
     "reviewer",
     runId,
@@ -563,44 +565,41 @@ function yieldReviewThroughCli(home, taskId, runId, result) {
   );
 }
 
-function yieldRunThroughCli(home, taskId, roleName, runId, summary) {
+function yieldRunThroughCli(home, store, taskId, roleName, runId, summary) {
+  const invocation = exactTaskCliInvocation({ home, store, taskId, roleName });
   return spawnSync(
     process.execPath,
     [
-      join(process.cwd(), "dist", "cli.js"),
+      invocation.cliEntry,
+      ...invocation.prefix,
       "task", "run", "yield", runId, "--summary-file", "-"
     ],
     {
       encoding: "utf8",
       input: summary,
-      env: {
-        ...process.env,
-        YUI_HOME: home,
-        YUI_SESSION_SCOPE: "task",
-        YUI_TASK_ID: taskId,
-        YUI_ROLE: roleName
-      },
+      env: invocation.environment,
       timeout: 10_000
     }
   );
 }
 
-function reviewWorkspaceCommand(home, taskId, command, reviewRoundId) {
+function reviewWorkspaceCommand(home, store, taskId, command, reviewRoundId) {
+  const invocation = exactTaskCliInvocation({
+    home,
+    store,
+    taskId,
+    roleName: "leader"
+  });
   return spawnSync(
     process.execPath,
     [
-      join(process.cwd(), "dist", "cli.js"),
+      invocation.cliEntry,
+      ...invocation.prefix,
       "task", "work", "review", command, `${taskId}/${reviewRoundId}`
     ],
     {
       encoding: "utf8",
-      env: {
-        ...process.env,
-        YUI_HOME: home,
-        YUI_SESSION_SCOPE: "task",
-        YUI_TASK_ID: taskId,
-        YUI_ROLE: "leader"
-      },
+      env: invocation.environment,
       timeout: 10_000
     }
   );

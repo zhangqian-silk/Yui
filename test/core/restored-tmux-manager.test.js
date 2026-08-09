@@ -288,6 +288,35 @@ test("Role launches clear inherited process environment and use only the complet
   ]);
 });
 
+test("a launch-carried prompt records its exact pane-local transport receipt", () => {
+  const calls = [];
+  const manager = new TmuxManager("tmux-test", {
+    run(command, args) {
+      calls.push({ command, args });
+      if (tmuxCommand(args) === "has-session") throw new Error("absent");
+      return "";
+    }
+  }, { yuiHome: "/tmp/yui-home" });
+
+  manager.ensureRoleWindow("task-1", { name: "worker", workspace: "/tmp/work" }, {
+    command: "codex",
+    args: ["--", "exact prompt"],
+    env: {},
+    initialPromptReceiptId: "exact-transport-receipt"
+  });
+
+  const launch = calls.find(({ args }) => args.includes("new-session"));
+  const commandEnd = launch.args.indexOf(";", launch.args.indexOf("new-session"));
+  assert.notEqual(commandEnd, -1);
+  assert.deepEqual(launch.args.slice(commandEnd, commandEnd + 5), [
+    ";",
+    "set-option", "-w", "-t",
+    `${yuiTmuxSessionName("/tmp/yui-home", "task-1")}:worker`
+  ]);
+  assert.match(launch.args[commandEnd + 5], /^@yui_delivery_[a-f0-9]{64}$/u);
+  assert.equal(launch.args[commandEnd + 6], "1");
+});
+
 class TtyInput extends PassThrough {
   isTTY = true;
   isRaw = true;

@@ -196,7 +196,15 @@ export async function startFileTaskControllerRuntime(
       },
       workspacePreparer,
       runtimeEventProcessor: options.runtimeEventProcessor
-        ?? new FileRuntimeEventProcessor(new FileRuntimeEventInbox(home), schedulerStore),
+        ?? new FileRuntimeEventProcessor(
+          new FileRuntimeEventInbox(home),
+          schedulerStore,
+          {
+            onTaskRuntimeApplied: (input) => {
+              planner.refreshTaskRuntimeDescriptor(input);
+            }
+          }
+        ),
       domainIdentity,
       ...(options.configuration !== undefined
         ? { configuration: options.configuration }

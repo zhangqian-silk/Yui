@@ -12,6 +12,7 @@ import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventPro
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
 import { runClaudeLifecycleHookCommand } from "../../dist/controller/claudeLifecycleHook.js";
 import { runCodexLifecycleHookCommand } from "../../dist/controller/codexLifecycleHook.js";
+import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
@@ -56,13 +57,14 @@ function fixture(t, adapterId, sessionStatus = "running", options = {}) {
   const item = updateWorkItemStatus(createWorkItem(
     "work-item-1", task.id, { title: "Do work", assignee: worker.name }, first
   ), "running", first);
-  // The run is transport-pushed (never pre-set delivered): acceptance must come
-  // from the provider fold under test.
+  // Most fixtures begin after the transport receipt. The timeout regression
+  // deliberately leaves the push commit absent even though the provider has
+  // already executed the native prompt.
   let run = createAgentRun(
     "agent-run-1", task.id, worker.name, "new", "Do the work", first,
     { workItemId: item.id, effective: resolveEffectiveLaunch({ role: worker, purpose: "execution" }) }
   );
-  run = markAgentRunPushed(run, second);
+  if (options.transportPushed !== false) run = markAgentRunPushed(run, second);
   const nativeSessionId = `${adapterId}-native-1`;
   const target = { kind: "role", taskId: task.id, roleName: worker.name };
   store.transaction((tx) => {
@@ -89,9 +91,11 @@ function fixture(t, adapterId, sessionStatus = "running", options = {}) {
     sessions = bindTaskRoleRun(sessions, {
       agentId: agent.id, runId: run.id, receiptId: `agent-run:${task.id}/${run.id}`
     }, first);
-    sessions = markTaskRoleRunPushed(sessions, {
-      agentId: agent.id, runId: run.id, receiptId: `agent-run:${task.id}/${run.id}`
-    }, second);
+    if (options.transportPushed !== false) {
+      sessions = markTaskRoleRunPushed(sessions, {
+        agentId: agent.id, runId: run.id, receiptId: `agent-run:${task.id}/${run.id}`
+      }, second);
+    }
     tx.saveTaskRoleSessionSet(sessions);
   });
   if (options.runtimeDiscovered === true) {
@@ -104,6 +108,7 @@ function fixture(t, adapterId, sessionStatus = "running", options = {}) {
   const environment = {
     YUI_HOME: home, YUI_SESSION_SCOPE: "task", YUI_TASK_ID: task.id,
     YUI_ROLE: worker.name, YUI_AGENT_ID: agent.id, YUI_ADAPTER_ID: adapterId,
+    YUI_WORKSPACE: run.effective.workspace.root,
     YUI_LAUNCH_ID: "launch-1", YUI_RUN_ID: run.id,
     ...(options.runtimeDiscovered === true ? {} : { YUI_NATIVE_SESSION_ID: nativeSessionId })
   };
@@ -151,6 +156,66 @@ test("Codex UserPromptSubmit hook folds to provider-accepted and writes delivere
 
   fx.drain();
   assert.notEqual(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
+});
+
+test("provider acceptance after a missing push commit stays obsolete and exact yield remains denied", async (t) => {
+  const fx = fixture(t, "claude", "running", { transportPushed: false });
+  const before = fx.store.getAgentRun(fx.task.id, fx.run.id);
+  assert.equal(before.pushedAt, undefined);
+  assert.equal(before.deliveredAt, undefined);
+
+  // This native hook is the durable provider fact observed after the prompt
+  // executed while the Controller caller timed out before run.pushed committed.
+  await runClaudeLifecycleHookCommand(
+    JSON.stringify({
+      hook_event_name: "UserPromptSubmit",
+      session_id: fx.nativeSessionId,
+      prompt: "Do the work"
+    }),
+    fx.environment,
+    async () => ({})
+  );
+  fx.drain();
+
+  const unchanged = fx.store.getAgentRun(fx.task.id, fx.run.id);
+  assert.equal(unchanged.pushedAt, undefined);
+  assert.equal(unchanged.deliveredAt, undefined);
+  const sessions = fx.store.getTaskRoleSessionSet(fx.task.id, fx.worker.name);
+  assert.equal(sessions.inFlight.pushedAt, undefined);
+  assert.equal(sessions.inFlight.deliveredAt, undefined);
+  assert.equal(
+    sessions.sessions[fx.agent.id].nativeSessionId,
+    fx.nativeSessionId
+  );
+  assert.deepEqual(sessions.history ?? [], []);
+  assert.equal(
+    fx.store.listEvents(fx.task.id).filter(({ type }) => type === "run.pushed").length,
+    0
+  );
+  assert.equal(
+    fx.store.listEvents(fx.task.id).filter(({ type }) => type === "run.delivered").length,
+    0
+  );
+  assert.ok(fx.store.listEvents(fx.task.id).some((event) => (
+    event.type === "runtime.event-obsolete"
+      && event.payload.reason === "fail-closed:accept-without-push"
+  )));
+
+  // Provider acceptance cannot repair transport state. Without a matching
+  // receipt reconciliation, exact yield remains unavailable.
+  assert.throws(() => runTaskCommand(
+    ["run", "yield", fx.run.id, "--summary", "Provider accepted before caller timeout."],
+    fx.store,
+    {
+      now: () => new Date("2026-08-06T02:00:03.000Z"),
+      environment: {
+        YUI_SESSION_SCOPE: "task",
+        YUI_TASK_ID: fx.task.id,
+        YUI_ROLE: fx.worker.name,
+        YUI_AGENT_ID: fx.agent.id
+      }
+    }
+  ), /has not been pushed|before.*push|delivery/i);
 });
 
 test("hook resolves the current in-flight Run instead of a stale process YUI_RUN_ID", async (t) => {
@@ -233,6 +298,24 @@ test("a UserPromptSubmit hook whose native session mismatches the launch fence f
       async () => ({})
     ),
     /native session does not match/i
+  );
+  assert.equal(new FileRuntimeEventInbox(fx.home).list().length, 0);
+  assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
+});
+
+test("a UserPromptSubmit hook whose workspace differs from the Run snapshot fails before enqueue", async (t) => {
+  const fx = fixture(t, "claude");
+  await assert.rejects(
+    runClaudeLifecycleHookCommand(
+      JSON.stringify({
+        hook_event_name: "UserPromptSubmit",
+        session_id: fx.nativeSessionId,
+        prompt: "x"
+      }),
+      { ...fx.environment, YUI_WORKSPACE: `${fx.environment.YUI_WORKSPACE}-stale` },
+      async () => ({})
+    ),
+    /workspace does not match/i
   );
   assert.equal(new FileRuntimeEventInbox(fx.home).list().length, 0);
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);

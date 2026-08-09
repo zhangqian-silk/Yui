@@ -18,6 +18,7 @@ import {
   createPromptEnvelope,
   createSessionLaunchRequest,
   type ActivePromptPushPort,
+  type ExactInitialPromptReceipt,
   type RuntimeBinding,
   type RuntimeLaunchPreparationPort,
   type SessionHostPort
@@ -30,6 +31,8 @@ export type PlannedRoleSession = Readonly<{
   session: SchedulerRoleSession | null;
   /** Exact Run whose first prompt is carried by the provider launch argv. */
   initialPromptRunId?: string;
+  /** Exact transport receipt expected from the launched Role host. */
+  initialPromptReceipt?: ExactInitialPromptReceipt;
 }>;
 
 export interface RoleLaunchPlanner {
@@ -208,9 +211,11 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       ...(binding === undefined ? {} : { launchId: binding.launchId }),
       sessionStarted,
       ...(
-        sessionStarted
+        binding?.initialPromptReceipt !== undefined
         && input.runId !== undefined
-        && (planned?.initialPromptRunId ?? binding?.initialPromptRunId) === input.runId
+        && binding.initialPromptReceipt.runId === input.runId
+        && binding.initialPromptReceipt.launchId === binding.launchId
+        && binding.initialPromptReceipt.workspace === input.workspace
           ? { inputSubmittedAtLaunch: true }
           : {}
       )
@@ -243,6 +248,9 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
   }>): Promise<"sent" | "already-sent" | "busy" | "unavailable"> {
     const prepared = this.requirePrepared(input.delivery.prepared);
     if (input.delivery.prepared.inputSubmittedAtLaunch === true) {
+      if (prepared.binding?.initialPromptReceipt?.receiptId !== input.receiptId) {
+        throw new Error("Initial prompt transport receipt does not match the delivery receipt.");
+      }
       this.#prepared.delete(input.delivery.prepared.deliveryId);
       return "sent";
     }

@@ -32,6 +32,18 @@ import { startFileTaskControllerRuntime } from "../../dist/controller/runtime.js
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { testEffectiveLaunch } from "../helpers/effectiveLaunch.js";
 
+function currentControllerStatus(pid) {
+  const identity = yuiVersionIdentity();
+  return {
+    running: true,
+    pid,
+    protocolVersion: identity.controllerProtocolVersion,
+    version: identity.version,
+    storageLayoutVersion: identity.storageLayoutVersion,
+    aggregateSchemaVersion: identity.aggregateSchemaVersion
+  };
+}
+
 function emptyStore(events = []) {
   return {
     getPresentationContext() { return { timeZone: "Asia/Shanghai" }; },
@@ -2527,13 +2539,13 @@ test("controller restart waits for the old process and starts the current runtim
     }
     assert.equal(method, "controller.status");
     if (phase === "running") {
-      return { running: true, pid: 10, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+      return currentControllerStatus(10);
     }
     if (phase === "started") {
-      return { running: true, pid: 20, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+      return currentControllerStatus(20);
     }
     if (stoppingStatusCalls++ === 0) {
-      return { running: true, pid: 10, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+      return currentControllerStatus(10);
     }
     throw new ControllerClientError("CONTROLLER_UNAVAILABLE", "Controller is unavailable.");
   };

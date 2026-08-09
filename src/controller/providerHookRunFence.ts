@@ -13,6 +13,7 @@ export type ProviderHookRunFence = Readonly<{
   runId: string;
   receiptId: string;
   nativeSessionId: string;
+  workspace: string;
 }>;
 
 /**
@@ -36,6 +37,7 @@ export function resolveProviderHookRunFence(
   const taskId = requireIdentity(environment.YUI_TASK_ID, "Task id");
   const roleName = requireIdentity(environment.YUI_ROLE, "Role name");
   const agentId = requireIdentity(environment.YUI_AGENT_ID, "Agent id");
+  const workspace = requireIdentity(environment.YUI_WORKSPACE, "YUI workspace");
   const launchId = requireIdentity(environment.YUI_LAUNCH_ID, "Launch id");
   const nativeSessionId = requireIdentity(payloadNativeSessionId, "Provider session id");
   const expectedNativeSessionId = environment.YUI_NATIVE_SESSION_ID;
@@ -61,11 +63,15 @@ export function resolveProviderHookRunFence(
     || run.effective.adapterId !== adapterId) {
     throw new Error("Provider lifecycle hook Run does not match durable active state.");
   }
+  if (run.effective.workspace.root !== workspace) {
+    throw new Error("Provider lifecycle hook workspace does not match the durable Run snapshot.");
+  }
   const session = sessions.sessions[agentId];
   if (session !== undefined) {
     if (session.adapterId !== adapterId
       || session.launchId !== launchId
-      || session.nativeSessionId !== nativeSessionId) {
+      || session.nativeSessionId !== nativeSessionId
+      || session.effective.workspace.root !== workspace) {
       throw new Error("Provider lifecycle hook Session does not match its durable generation.");
     }
   } else if (adapterId !== "codex" || expectedNativeSessionId !== undefined) {
@@ -90,7 +96,8 @@ export function resolveProviderHookRunFence(
     launchId,
     runId: inFlight.runId,
     receiptId: inFlight.receiptId,
-    nativeSessionId
+    nativeSessionId,
+    workspace
   };
 }
 

@@ -36,6 +36,7 @@ import { ensureStorageSchema } from "../dist/storage/storageSchema.js";
 import { FileTaskStore, STORAGE_STATE_FILE } from "../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../dist/task/task.js";
 import { createYuiWebServer } from "../dist/web/webServer.js";
+import { exactTaskCliInvocation } from "./helpers/exactTaskCli.js";
 
 const START = new Date("2026-08-02T08:00:00.000Z");
 
@@ -380,10 +381,10 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   ]).data;
   assert.equal(integrationResult.status, "committed");
   assert.equal(integrationResult.attempt.id, "integration-1");
-  const acceptResult = runCliJson(home, [
+  const acceptResult = runExactTaskCliJson(home, store, primaryTask.id, "leader", [
     "task", "work", "accept", `${primaryTask.id}/${primaryWork.id}`,
     "--summary", "Leader accepted reviewed and integrated output."
-  ], leaderCliEnvironment(home, primaryTask.id));
+  ]);
   assert.equal(acceptResult.data.workItem.status, "completed");
   assert.equal(store.getWorkItem(primaryTask.id, primaryWork.id).status, "completed");
   await coordinator.runtime.stopTaskRoleSessions(primaryTask.id, ["worker"]);
@@ -652,6 +653,23 @@ function runCliJson(home, args, environment = isolatedCliEnvironment(home)) {
   return result;
 }
 
+function runExactTaskCliJson(home, store, taskId, roleName, args) {
+  const invocation = exactTaskCliInvocation({
+    home,
+    store,
+    taskId,
+    roleName,
+    environment: isolatedCliEnvironment(home)
+  });
+  const result = JSON.parse(execFileSync(
+    process.execPath,
+    [invocation.cliEntry, ...invocation.prefix, "--json", ...args],
+    { encoding: "utf8", env: invocation.environment }
+  ));
+  assert.equal(result.ok, true);
+  return result;
+}
+
 function isolatedCliEnvironment(home) {
   const environment = { ...process.env, YUI_HOME: home };
   for (const name of [
@@ -664,15 +682,6 @@ function isolatedCliEnvironment(home) {
     "YUI_LAUNCH_ID"
   ]) delete environment[name];
   return environment;
-}
-
-function leaderCliEnvironment(home, taskId) {
-  return {
-    ...isolatedCliEnvironment(home),
-    YUI_SESSION_SCOPE: "task",
-    YUI_TASK_ID: taskId,
-    YUI_ROLE: "leader"
-  };
 }
 
 function operatorCliEnvironment(home) {

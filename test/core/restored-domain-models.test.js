@@ -9,8 +9,8 @@ import {
 } from "../../dist/role/role.js";
 import {
   createRoleSessionSet,
-  retireTaskRoleSessionsForWorkspace,
-  updateRoleAgentSessionStatus
+  retireConfirmedAbsentInactiveTaskRolePlaceholders,
+  retireTaskRoleSessionsForWorkspace
 } from "../../dist/executor/agentExecutor.js";
 import {
   validateAgentRun,
@@ -153,7 +153,7 @@ test("Agent switching during a Run updates only desired identity and still rejec
   );
 });
 
-test("workspace migration retires only after every bound native session is stopped", () => {
+test("workspace migration retires an inactive never-started placeholder only after confirmed host absence", () => {
   let sessions = createRoleSessionSet(
     { scope: "task", taskId: "task-1", roleName: "worker" },
     "codex",
@@ -173,21 +173,48 @@ test("workspace migration retires only after every bound native session is stopp
     policy: "fixed",
     status: "ready"
   }, now);
+  sessions = { ...sessions, activeAgentId: "codex" };
 
   assert.throws(
     () => retireTaskRoleSessionsForWorkspace(sessions, later),
     /claude.*stopped|stopped.*claude/i
   );
-
-  const stopped = updateRoleAgentSessionStatus(sessions, "claude", "stopped", later);
-  const retired = retireTaskRoleSessionsForWorkspace(stopped, later);
+  const confirmedAbsent = retireConfirmedAbsentInactiveTaskRolePlaceholders(
+    sessions,
+    later
+  );
+  const retired = retireTaskRoleSessionsForWorkspace(confirmedAbsent, later);
   assert.deepEqual(retired.sessions, {});
   assert.deepEqual(
-    retired.history.map(({ agentId, nativeSessionId }) => ({ agentId, nativeSessionId })),
+    retired.history.map(({ agentId, nativeSessionId, status }) => ({
+      agentId, nativeSessionId, status
+    })),
     [
-      { agentId: "codex", nativeSessionId: "codex-stopped" },
-      { agentId: "claude", nativeSessionId: "claude-dormant-ready" }
+      { agentId: "codex", nativeSessionId: "codex-stopped", status: "stopped" },
+      { agentId: "claude", nativeSessionId: "claude-dormant-ready", status: "broken" }
     ]
+  );
+
+  const liveActive = { ...sessions, activeAgentId: "claude" };
+  assert.throws(
+    () => retireTaskRoleSessionsForWorkspace(liveActive, later),
+    /claude.*stopped|stopped.*claude/i
+  );
+
+  const launchedInactive = {
+    ...sessions,
+    sessions: {
+      ...sessions.sessions,
+      claude: { ...sessions.sessions.claude, launchId: "launch-real-claude" }
+    }
+  };
+  assert.deepEqual(
+    retireConfirmedAbsentInactiveTaskRolePlaceholders(launchedInactive, later),
+    launchedInactive
+  );
+  assert.throws(
+    () => retireTaskRoleSessionsForWorkspace(launchedInactive, later),
+    /claude.*stopped|stopped.*claude/i
   );
 });
 

@@ -168,6 +168,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       ...(request.runId === undefined ? {} : { runId: request.runId })
     }, assertLaunchCurrent, this.#now());
     let reusedConfirmedRunningHost = false;
+    let requireInitialPromptReceipt = false;
 
     if (reservation.status === "existing") {
       if (!reservation.launchId.startsWith(generationPrefix)) {
@@ -230,6 +231,8 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
           );
         }
         reusedConfirmedRunningHost = true;
+        requireInitialPromptReceipt = sameRunReservation
+          && request.adapterId === "codex";
         assertLaunchCurrent();
       }
     }
@@ -247,6 +250,9 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
             effective: request.effective,
             workspace: request.workspace,
             ...(request.runId === undefined ? {} : { runId: request.runId }),
+            ...(requireInitialPromptReceipt
+              ? { initialPromptReceiptRequired: true }
+              : {}),
             ...(request.environment === undefined
               ? {}
               : { environment: request.environment })
@@ -260,6 +266,9 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
             effective: request.effective,
             workspace: request.workspace,
             ...(request.runId === undefined ? {} : { runId: request.runId }),
+            ...(requireInitialPromptReceipt
+              ? { initialPromptReceiptRequired: true }
+              : {}),
             ...(request.environment === undefined
               ? {}
               : { environment: request.environment }),
@@ -268,7 +277,12 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
               "Native session id"
             )
           });
-      binding = requireMatchingRuntimeBinding(rawBinding, request, launchId);
+      binding = requireMatchingRuntimeBinding(
+        rawBinding,
+        request,
+        launchId,
+        requireInitialPromptReceipt
+      );
     } catch (error) {
       if (error instanceof RuntimeBindingContractError) {
         // Never pass an untrusted hostRef to stop(). Reconcile the requested
@@ -423,7 +437,8 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
 function requireMatchingRuntimeBinding(
   raw: RuntimeBinding,
   request: CoordinatedRuntimeLaunchRequest,
-  launchId: string
+  launchId: string,
+  initialPromptReceiptRequired: boolean
 ): RuntimeBinding {
   let binding: RuntimeBinding;
   try {
@@ -443,6 +458,23 @@ function requireMatchingRuntimeBinding(
         && binding.owner.taskId === request.owner.taskId
       )
     );
+  const launchCarriedPromptReceiptRequired = request.owner.scope === "task"
+    && request.adapterId === "codex"
+    && request.runId !== undefined
+    // A portable host must explicitly report reuse before the Coordinator may
+    // take the active-push path. A new or ambiguous host cannot turn a missing
+    // argv receipt into a resend.
+    && binding.hostCreated !== false;
+  if (
+    (initialPromptReceiptRequired || launchCarriedPromptReceiptRequired)
+    && binding.initialPromptReceipt === undefined
+  ) {
+    throw new RuntimeBindingContractError(
+      `Session host did not acknowledge the exact initial prompt receipt: ${
+        request.owner.roleName
+      }.`
+    );
+  }
   if (
     binding.launchId !== launchId
     || !ownerMatches
@@ -451,6 +483,14 @@ function requireMatchingRuntimeBinding(
     || (
       binding.initialPromptRunId !== undefined
       && binding.initialPromptRunId !== request.runId
+    )
+    || (
+      binding.initialPromptReceipt !== undefined
+      && (
+        binding.initialPromptReceipt.runId !== request.runId
+        || binding.initialPromptReceipt.launchId !== launchId
+        || binding.initialPromptReceipt.workspace !== request.workspace
+      )
     )
     || (
       request.mode === "resume"

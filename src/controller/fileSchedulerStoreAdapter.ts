@@ -1434,9 +1434,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     if (input.runId === undefined || sessions.inFlight.runId !== input.runId) {
       return "obsolete";
     }
-    // A matching native completion proves that this Run's prompt reached the
-    // Agent even if Controller crashed before persisting the tmux receipt.
-    return "apply";
+    // Provider completion is not a transport acknowledgement. Retain the
+    // immutable Hook until the exact pane receipt independently reconciles
+    // run.pushed; never infer transport from provider progress/terminal facts.
+    return sessions.inFlight.pushedAt === undefined ? "deferred" : "apply";
   }
 
   observeRuntimeTurnCompleted(input: Readonly<{
@@ -1539,6 +1540,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         }
         return { session: effectiveExisting, duplicate: false };
       }
+      if (sessions.inFlight !== null && sessions.inFlight.pushedAt === undefined) {
+        throw new Error(
+          "Runtime turn completion requires an independently committed transport receipt."
+        );
+      }
       const idleStatus = effectiveExisting?.status === "stopped"
         || effectiveExisting?.status === "broken"
         ? effectiveExisting.status
@@ -1570,21 +1576,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         runId: sessions.inFlight.runId,
         receiptId: sessions.inFlight.receiptId
       };
-      if (sessions.inFlight.pushedAt === undefined) {
-        const active = store.getActiveAgentRun(task.id, role.name);
-        if (active === null || active.id !== fence.runId || active.status !== "active") {
-          return { session: sessions.sessions[input.agentId]!, duplicate: false };
-        }
-        // A native turn completion proves the prompt reached the Agent, so it
-        // records the transport-reached (pushed) fact and the inFlight marker.
-        // It must NOT promote run-level acceptance (deliveredAt): only an exact
-        // provider-accepted fold (UserPromptSubmit) may do that, so a
-        // completion for an unaccepted Run never forges acceptance.
-        if (active.pushedAt === undefined) {
-          store.saveAgentRun(markAgentRunPushed(active, now));
-        }
-        sessions = markTaskRoleRunPushed(sessions, fence, now);
-      }
       const completion = createPendingTurnCompletion({
         taskId: task.id,
         roleName: role.name,
@@ -2210,9 +2201,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
 
   /**
    * Folds a provider UserPromptSubmit acceptance fact. This is the ONLY path
-   * that may advance a Run to
-   * accepted/delivered, and only under an exact identity-matched durable fold
-   * after the single transport push.
+   * that may advance a Run to accepted/delivered, and only after an exact
+   * transport receipt has independently committed run.pushed.
    */
   observeProviderPromptAccepted(
     input: TaskProviderPromptAccepted,
@@ -2241,13 +2231,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         return "obsolete";
       }
       if (active.deliveredAt === undefined) {
-        store.saveAgentRun(markAgentRunDelivered(active, now));
-        markTaskRoleRunDeliveredInFlight(store, role, active, now);
+        const delivered = markAgentRunDelivered(active, now);
+        store.saveAgentRun(delivered);
+        markTaskRoleRunDeliveredInFlight(store, role, delivered, now);
         store.saveEvent(input.taskId, createTaskEvent(
           store.nextEventId(input.taskId),
           input.taskId,
           "run.delivered",
-          runLaunchEventPayload(store.getAgentRun(input.taskId, input.runId)!),
+          runLaunchEventPayload(delivered),
           now
         ));
       }

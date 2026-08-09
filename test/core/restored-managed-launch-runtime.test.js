@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
   mkdirSync,
+  existsSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -45,6 +46,13 @@ import { createAgentRun } from "../helpers/effectiveLaunch.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
+import {
+  YUI_CONTROL_PLANE_DESCRIPTOR,
+  YUI_TASK_RUNTIME_DESCRIPTOR,
+  exactControlPlaneCommandPrefix,
+  parseExactControlPlaneDescriptor,
+  readExactTaskRuntimeDescriptorSource
+} from "../../dist/runtime/exactControlPlane.js";
 import {
   createWorkItem,
   updateWorkItemStatus
@@ -237,7 +245,7 @@ test("one planner adds Codex structured notify for Task and global launches", (t
   assert.equal(globalPlan.launch.env.YUI_AGENT_BASE_ARGS, undefined);
 });
 
-test("managed Agent PATH resolves yui to the current Controller CLI", (t) => {
+test("managed Task launch freezes the exact CLI/Home identity without writing a shared PATH launcher", (t) => {
   const { home, store, task, role, agent } = fixture(t);
   const cliPath = join(home, "current-cli.js");
   writeFileSync(
@@ -256,19 +264,26 @@ test("managed Agent PATH resolves yui to the current Controller CLI", (t) => {
     mode: "new"
   });
 
-  const invoked = spawnSync("yui", ["identity"], {
-    encoding: "utf8",
-    env: plan.launch.env
-  });
-  assert.equal(invoked.status, 0, invoked.stderr);
-  assert.deepEqual(JSON.parse(invoked.stdout), {
-    args: ["identity"],
-    home
-  });
-  assert.equal(
-    plan.launch.env.PATH.split(":")[0],
-    join(home, "runtime", "bin")
+  assert.equal(plan.launch.env.PATH, "/old-workspace/bin");
+  assert.equal(existsSync(join(home, "runtime", "bin", "yui")), false);
+  const control = parseExactControlPlaneDescriptor(
+    plan.launch.env[YUI_CONTROL_PLANE_DESCRIPTOR]
   );
+  const runtime = readExactTaskRuntimeDescriptorSource(
+    plan.launch.env[YUI_TASK_RUNTIME_DESCRIPTOR],
+    home
+  );
+  assert.equal(control.cliEntry, cliPath);
+  assert.equal(control.yuiHome, home);
+  assert.equal(runtime.taskId, task.id);
+  assert.equal(runtime.roleName, role.name);
+  assert.equal(runtime.workspace, plan.role.workspace);
+  const command = exactControlPlaneCommandPrefix(control);
+  assert.ok(plan.launch.args.some((argument) => (
+    argument.startsWith("developer_instructions=")
+      && argument.includes(command)
+      && argument.includes("Bare `yui`")
+  )));
 });
 
 test("managed Codex Task Run installs lifecycle hooks while native identity remains provider-discovered", (t) => {
@@ -655,13 +670,16 @@ test("managed Claude Task Runs inject the lifecycle hooks and exact explicit-yie
   const allowedIndex = plan.launch.args.indexOf("--allowed-tools");
   assert.ok(allowedIndex >= 0);
   const allowed = plan.launch.args.slice(allowedIndex + 1, pluginIndex);
-  assert.ok(allowed.includes(`Bash(yui --json task context ${task.id})`));
-  assert.ok(allowed.includes(`Bash(yui --json task work list ${task.id})`));
-  assert.ok(allowed.includes(`Bash(yui --json task work show ${item.id})`));
-  assert.ok(allowed.includes(
-    `Bash(yui task run yield ${run.id} --summary-file -:*)`
+  const exact = exactControlPlaneCommandPrefix(parseExactControlPlaneDescriptor(
+    plan.launch.env[YUI_CONTROL_PLANE_DESCRIPTOR]
   ));
-  assert.ok(!allowed.includes(`Bash(yui task run yield ${run.id}:*)`));
+  assert.ok(allowed.includes(`Bash(${exact} --json task context ${task.id})`));
+  assert.ok(allowed.includes(`Bash(${exact} --json task work list ${task.id})`));
+  assert.ok(allowed.includes(`Bash(${exact} --json task work show ${item.id})`));
+  assert.ok(allowed.includes(
+    `Bash(${exact} task run yield ${run.id} --summary-file -:*)`
+  ));
+  assert.ok(!allowed.some((rule) => rule.startsWith("Bash(yui")));
   assert.ok(!allowed.includes("Bash(yui task run yield *)"));
   assert.ok(!allowed.includes("Bash(yui --json task context *)"));
   assert.ok(!allowed.includes("Bash(yui:*)"));

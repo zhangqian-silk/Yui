@@ -2,6 +2,7 @@
 
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
+import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
 import { renderCommandHelp } from "./cli/helpRenderer.js";
@@ -103,9 +104,20 @@ import {
   operatorSessionRef
 } from "./operator/operatorSessionHistory.js";
 import { YUI_VERSION, yuiVersionIdentity } from "./version.js";
+import {
+  YUI_CONTROL_PLANE_DESCRIPTOR,
+  YUI_TASK_RUNTIME_DESCRIPTOR,
+  assertExactControlPlanePreflight,
+  assertExactTaskRuntimeEnvironment,
+  assertExactTaskRuntimeState,
+  exactControlPlaneDigest,
+  extractExactControlArgument,
+  parseExactControlPlaneDescriptor
+} from "./runtime/exactControlPlane.js";
 
 const VERSION = YUI_VERSION;
-const rawArgs = process.argv.slice(2);
+const exactControlInvocation = extractExactControlArgument(process.argv.slice(2));
+const rawArgs = [...exactControlInvocation.args];
 const jsonOutput = rawArgs.includes("--json");
 const args = normalizeAliases(
   jsonOutput ? rawArgs.filter((argument) => argument !== "--json") : rawArgs
@@ -128,6 +140,7 @@ void main().catch((error: unknown) => {
 });
 
 export async function main(): Promise<void> {
+  await preflightManagedTaskControlPlane();
   if (args.length === 0) {
     emit(renderCommandHelp((await import("./cli/commandCatalog.js")).ROOT_COMMAND, VERSION));
     return;
@@ -915,6 +928,59 @@ export async function main(): Promise<void> {
     `Command is not connected to the restored FileTaskStore framework yet: ${resolved[0]}.`,
     renderCommandHelp(invocation.node, VERSION)
   );
+}
+
+async function preflightManagedTaskControlPlane(): Promise<void> {
+  if (exactControlInvocation.error !== undefined) {
+    throw new Error(exactControlInvocation.error);
+  }
+  const serializedControl = process.env[YUI_CONTROL_PLANE_DESCRIPTOR];
+  const serializedRuntime = process.env[YUI_TASK_RUNTIME_DESCRIPTOR];
+  const exactRuntime = serializedControl !== undefined || serializedRuntime !== undefined;
+  if (process.env.YUI_SESSION_SCOPE === "task" && !exactRuntime) {
+    throw new Error(
+      "Exact control-plane invocation requires both frozen descriptors in a managed Task runtime."
+    );
+  }
+  if (!exactRuntime) {
+    if (exactControlInvocation.digest !== undefined) {
+      throw new Error("Exact Task control-plane invocation requires its frozen runtime descriptors.");
+    }
+    return;
+  }
+  if (process.env.YUI_SESSION_SCOPE !== "task") {
+    throw new Error("Exact Task control-plane invocation requires a managed Task runtime.");
+  }
+  if (serializedControl === undefined || serializedRuntime === undefined) {
+    throw new Error("Exact control-plane invocation is required for this managed Task runtime.");
+  }
+  const control = parseExactControlPlaneDescriptor(serializedControl);
+  const internalCallback = args[0] === "internal";
+  if (!internalCallback && exactControlInvocation.digest === undefined) {
+    throw new Error(
+      "Exact control-plane invocation is required; bare `yui` and PATH launchers are not valid in a managed Task runtime."
+    );
+  }
+  const digest = exactControlInvocation.digest ?? exactControlPlaneDigest(control);
+  await assertExactControlPlanePreflight({
+    serializedDescriptor: serializedControl,
+    digest,
+    actualExecutable: process.execPath,
+    actualCliEntry: fileURLToPath(import.meta.url),
+    actualHome: resolveYuiHome(process.env)
+  }, {
+    // Provider callbacks must remain able to append their immutable inbox fact
+    // while the Controller is offline. They still validate executable, CLI,
+    // Home, build, schema, and the exact Task runtime envelope first.
+    checkController: !internalCallback
+  });
+  const runtime = assertExactTaskRuntimeEnvironment(
+    serializedRuntime,
+    process.env,
+    digest,
+    control.yuiHome
+  );
+  assertExactTaskRuntimeState(runtime, new FileTaskStore(control.yuiHome));
 }
 
 function cleanupCliError(error: unknown, fallbackResource: string): CliError {

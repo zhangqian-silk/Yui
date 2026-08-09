@@ -3,7 +3,6 @@ import { fileURLToPath } from "node:url";
 
 import { callController, readControllerDiscovery } from "../core/controllerClient.js";
 import {
-  FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
   type JsonValue
 } from "../core/protocol.js";
 import type { FileRoleLaunchPlanner } from "../executor/fileRoleLaunchPlanner.js";
@@ -21,7 +20,7 @@ import type { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
 import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
 import type { MailboxTarget } from "../coordination/workMailbox.js";
 import { hasRuntimeLifecycleWork } from "../runtime/lifecycleReservation.js";
-import { YUI_VERSION } from "../version.js";
+import { assertControllerStatusIdentity } from "../runtime/exactControlPlane.js";
 import { EPHEMERAL_DOMAIN_ENVIRONMENT_NAMES } from "./domainIdentity.js";
 
 const STARTUP_TIMEOUT_MS = 5_000;
@@ -108,23 +107,7 @@ export async function ensureFileTaskController(
 }
 
 function assertCompatibleControllerStatus(status: JsonValue): void {
-  const statusRecord = isJsonRecord(status) && status.running === true ? status : null;
-  const actual = statusRecord?.protocolVersion;
-  if (statusRecord === null || actual !== FILE_TASK_CONTROLLER_PROTOCOL_VERSION) {
-    throw new Error(
-      `Controller protocol is incompatible (expected ${
-        FILE_TASK_CONTROLLER_PROTOCOL_VERSION
-      }, found ${typeof actual === "number" ? actual : "unknown"}). `
-        + "Run `yui controller restart` before writing new task records."
-    );
-  }
-  const actualVersion = statusRecord.version;
-  if (typeof actualVersion === "string" && actualVersion !== YUI_VERSION) {
-    throw new Error(
-      `Controller version is incompatible (expected ${YUI_VERSION}, found ${actualVersion}). `
-        + "Run `yui controller restart` before writing new task records."
-    );
-  }
+  assertControllerStatusIdentity(status);
 }
 
 function spawnDetachedFileTaskController(

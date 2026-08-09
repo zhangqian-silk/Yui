@@ -953,7 +953,7 @@ test("an unrelated Hook cannot prove that a prepared Leader Run was delivered", 
   );
 });
 
-test("a matching Hook proves delivery across the receipt persistence crash window", (t) => {
+test("a matching native completion stays deferred until an exact transport receipt is reconciled", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
   const run = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
@@ -979,18 +979,14 @@ test("a matching Hook proves delivery across the receipt persistence crash windo
   const processor = new FileRuntimeEventProcessor(inbox, adapter);
 
   const beforeReceipt = processor.drain(now);
-  assert.equal(beforeReceipt.acknowledgedEventIds.length, 1);
-  assert.equal(beforeReceipt.deferred.length, 0);
-  assert.equal(inbox.list().length, 0);
-  // A native turn completion proves the prompt was pushed, not that the provider
-  // accepted it: it records pushedAt, never deliveredAt (only a provider-accepted
-  // fold may do that).
-  assert.notEqual(store.getActiveAgentRun(task.id, role.name).pushedAt, undefined);
+  assert.equal(beforeReceipt.acknowledgedEventIds.length, 0);
+  assert.equal(beforeReceipt.deferred.length, 1);
+  assert.equal(inbox.list().length, 1);
+  // Completion is provider evidence, not a transport receipt. It remains
+  // immutable and deferred instead of inferring either pushed or delivered.
+  assert.equal(store.getActiveAgentRun(task.id, role.name).pushedAt, undefined);
   assert.equal(store.getActiveAgentRun(task.id, role.name).deliveredAt, undefined);
-  assert.equal(
-    store.getTaskRoleSessionSet(task.id, role.name).pendingTurnCompletion.runId,
-    run.id
-  );
+  assert.equal(store.getTaskRoleSessionSet(task.id, role.name).pendingTurnCompletion, null);
 });
 
 test("a Hook replay is idempotent after state commit succeeds and inbox ack crashes", (t) => {

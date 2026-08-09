@@ -25,7 +25,7 @@ import {
 } from "../../dist/controller/runtime.js";
 import { ControllerClientError } from "../../dist/core/controllerClient.js";
 import { FILE_TASK_CONTROLLER_PROTOCOL_VERSION } from "../../dist/core/protocol.js";
-import { YUI_VERSION } from "../../dist/version.js";
+import { YUI_VERSION, yuiVersionIdentity } from "../../dist/version.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import {
   createGlobalRole,
@@ -41,11 +41,25 @@ import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, archiveTask, completeTask, createTask } from "../../dist/task/task.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
+import { createExactInitialPromptReceipt } from "../../dist/runtime/index.js";
 
 const FIRST = new Date("2026-07-24T00:00:00.000Z");
 const SECOND = new Date("2026-07-24T00:00:01.000Z");
 
+function currentControllerStatus(pid) {
+  const identity = yuiVersionIdentity();
+  return {
+    running: true,
+    pid,
+    protocolVersion: identity.controllerProtocolVersion,
+    version: identity.version,
+    storageLayoutVersion: identity.storageLayoutVersion,
+    aggregateSchemaVersion: identity.aggregateSchemaVersion
+  };
+}
+
 test("storage writes reject a running Controller with an incompatible protocol", async () => {
+  const identity = yuiVersionIdentity();
   await assert.rejects(
     assertFileTaskControllerStorageCompatible("/tmp/yui-old-controller", {
       call: async () => ({ running: true, pid: 42 })
@@ -58,7 +72,9 @@ test("storage writes reject a running Controller with an incompatible protocol",
         running: true,
         pid: 43,
         protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
-        version: YUI_VERSION
+        version: YUI_VERSION,
+        storageLayoutVersion: identity.storageLayoutVersion,
+        aggregateSchemaVersion: identity.aggregateSchemaVersion
       })
     })
   );
@@ -68,7 +84,9 @@ test("storage writes reject a running Controller with an incompatible protocol",
         running: true,
         pid: 44,
         protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
-        version: "0.2.9"
+        version: "0.2.9",
+        storageLayoutVersion: identity.storageLayoutVersion,
+        aggregateSchemaVersion: identity.aggregateSchemaVersion
       })
     }),
     /Controller version is incompatible.*controller restart/i
@@ -82,6 +100,19 @@ test("storage writes reject a running Controller with an incompatible protocol",
         );
       }
     })
+  );
+  await assert.rejects(
+    assertFileTaskControllerStorageCompatible("/tmp/yui-wrong-aggregate-controller", {
+      call: async () => ({
+        running: true,
+        pid: 45,
+        protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+        version: YUI_VERSION,
+        storageLayoutVersion: identity.storageLayoutVersion,
+        aggregateSchemaVersion: identity.aggregateSchemaVersion - 1
+      })
+    }),
+    /Controller aggregate schema.*controller restart/i
   );
   await assert.rejects(
     ensureFileTaskController("/tmp/yui-old-controller", {
@@ -172,7 +203,15 @@ test("an active Role Run may launch from its snapshotted workspace", async (t) =
         agentId: request.agentId,
         adapterId: request.adapterId,
         hostRef: "opaque-workspace",
-        hostCreated: true
+        hostCreated: true,
+        initialPromptReceipt: createExactInitialPromptReceipt({
+          owner: request.owner,
+          agentId: request.agentId,
+          adapterId: request.adapterId,
+          runId: request.runId,
+          launchId: request.launchId,
+          workspace: request.workspace
+        })
       };
     },
     async resume() { throw new Error("unexpected resume"); },
@@ -781,11 +820,7 @@ test("Controller startup forwards only operational names and declared Agent envi
     },
     call: async () => {
       if (!running) throw unavailable();
-      return {
-        running: true,
-        pid: 42,
-        protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION
-      };
+      return currentControllerStatus(42);
     },
     spawnController(_home, environment) {
       spawnedEnvironment = environment;
@@ -949,7 +984,7 @@ test("launch environment keeps native context and excludes other Agents' credent
 
   assert.equal(
     plan.launch.env.PATH,
-    `${join(home, "runtime", "bin")}${delimiter}/native/bin`
+    "/native/bin"
   );
   assert.equal(plan.launch.env.HOME, "/native/home");
   assert.equal(plan.launch.env.TERM, "screen-256color");
@@ -982,8 +1017,7 @@ test("launch environment keeps native context and excludes other Agents' credent
   assert.match(
     fallbackPlan.launch.env.PATH,
     new RegExp(
-      `^${join(home, "runtime", "bin").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`
-      + `${delimiter}${dirname(process.execPath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`
+      `^${dirname(process.execPath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`
       + `${delimiter}`
     )
   );
@@ -1040,17 +1074,17 @@ test("Controller restart gives shutdown drain an independent timeout budget", as
       return { stopped: true };
     }
     if (phase === "running") {
-      return { running: true, pid: 10, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+      return currentControllerStatus(10);
     }
     if (phase === "stopping") {
       if (stoppingPolls++ < 2) {
-        return { running: true, pid: 10, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+        return currentControllerStatus(10);
       }
       phase = "stopped";
       throw unavailable();
     }
     if (phase === "stopped") throw unavailable();
-    return { running: true, pid: 20, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+    return currentControllerStatus(20);
   };
 
   const result = await restartFileTaskController("/tmp/yui-restart-long-drain", {
@@ -1081,18 +1115,18 @@ test("Controller restart default shutdown budget exceeds lifecycle request timeo
       return { stopped: true };
     }
     if (phase === "running") {
-      return { running: true, pid: 10, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+      return currentControllerStatus(10);
     }
     if (phase === "stopping") {
       if (stoppingPolls++ === 0) {
         currentTime = 40_000;
-        return { running: true, pid: 10, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+        return currentControllerStatus(10);
       }
       phase = "stopped";
       throw unavailable();
     }
     if (phase === "stopped") throw unavailable();
-    return { running: true, pid: 20, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+    return currentControllerStatus(20);
   };
 
   const result = await restartFileTaskController("/tmp/yui-restart-default-drain", {

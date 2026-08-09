@@ -182,7 +182,7 @@ test("production runtime ports launch and attempt delivery without the legacy re
   assert.deepEqual(calls.map(([kind]) => kind), ["start", "push", "push"]);
 });
 
-test("a newly launched Codex process carries the exact first Run prompt and skips tmux delivery", async () => {
+test("host creation and launch argv alone cannot acknowledge the exact first Run prompt", async () => {
   let pushes = 0;
   const registry = new ExecutorRegistry(
     { plan() { throw new Error("runtime host owns planning"); } },
@@ -206,6 +206,66 @@ test("a newly launched Codex process carries the exact first Run prompt and skip
             hostRef: "opaque",
             hostCreated: true,
             initialPromptRunId: request.runId
+          };
+        },
+        async resume() { throw new Error("unused"); },
+        async stop() {},
+        async inspect() { return { state: "running" }; }
+      },
+      promptPush: {
+        async tryPush() { pushes += 1; return "delivered"; }
+      }
+    }
+  );
+  const prepared = await registry.prepareRoleSession({
+    taskId: "task-1",
+    roleName: "leader",
+    agentId: "codex",
+    adapterId: "codex",
+    effective: effective("codex", "codex"),
+    workspace: "/tmp/workspace",
+    mode: "new",
+    runId: "agent-run-1"
+  });
+  assert.equal(prepared.inputSubmittedAtLaunch, undefined);
+  assert.equal(await registry.sendOnce({
+    delivery: await registry.waitUntilReady(prepared),
+    receiptId: "agent-run:task-1/agent-run-1",
+    text: "first prompt"
+  }), "sent");
+  assert.equal(pushes, 1);
+});
+
+test("an exact SessionHost prompt receipt acknowledges the first Run without a resend", async () => {
+  let pushes = 0;
+  const registry = new ExecutorRegistry(
+    { plan() { throw new Error("runtime host owns planning"); } },
+    {
+      ensureRoleWindow() { throw new Error("legacy launch must not run"); },
+      waitUntilReady() { throw new Error("legacy readiness must not run"); },
+      sendRoleInputOnce() { throw new Error("receipt-backed launch must not resend"); },
+      sendRoleInputOnceIfReady() { throw new Error("unused"); },
+      probeRoleStatus() { return "running"; }
+    },
+    undefined,
+    {
+      sessionHost: {
+        async start(request) {
+          return {
+            id: "binding-1",
+            launchId: request.launchId,
+            owner: request.owner,
+            agentId: request.agentId,
+            adapterId: request.adapterId,
+            hostRef: "opaque",
+            hostCreated: true,
+            initialPromptReceipt: {
+              receiptId: "agent-run:task-1/agent-run-1",
+              transportReceiptId: "exact-transport-receipt",
+              runId: "agent-run-1",
+              launchId: request.launchId,
+              workspace: "/tmp/workspace"
+            }
           };
         },
         async resume() { throw new Error("unused"); },
