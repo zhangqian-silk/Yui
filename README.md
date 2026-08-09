@@ -669,9 +669,15 @@ yui jobs list
 yui jobs retry leader-recovery:<task-id>
 yui task reconcile <task-id>
 yui task run retry <failed-run-id>
+yui task run settle <obsolete-failed-review-run-id>
 ```
 
 `jobs` is not a restored generic queue: it presents durable pending Leader wakes and Leader recovery failures only.
+
+`task run settle` is a Leader-only repair for one exact failed Reviewer Run whose
+matching Task-final ReviewRound was stranded running by an older lifecycle. It
+closes only an obsolete frozen candidate, preserves the Run, Round, workspace,
+and evidence, and never creates a retry Round.
 
 Completion is the reversible execution fence. Archiving is terminal and is accepted only after active work is settled: it stops the Task's tmux session and removes clean managed worktrees. Dirty worktrees keep the Task completed and are preserved for deliberate resolution.
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -188,6 +188,47 @@ function createLaterFinalRound(fx, previousRound, taskCandidate) {
     );
     tx.saveReviewRound(fx.task.id, round);
     return round;
+  });
+}
+
+function strandTaskFinalReview(fx) {
+  runTaskCommand(
+    ["complete", fx.task.id, "--summary", "request old-head review"],
+    fx.store,
+    fx.leaderOptions
+  );
+  const round = fx.store.listReviewRounds(fx.task.id)[0];
+  const run = dispatchFinalReview(fx, round);
+  strandFinalReviewRun(fx, run);
+  return { round, run };
+}
+
+function advanceTaskCandidate(fx) {
+  fx.store.transaction((tx) => {
+    const baseCommit = "d".repeat(40);
+    const headCommit = "e".repeat(40);
+    tx.saveChangeSet(fx.task.id, createWorkItemChangeSet({
+      id: "change-set-3",
+      taskId: fx.task.id,
+      projectId: "project-2",
+      workItemId: fx.item.id,
+      baseCommit,
+      headCommit,
+      branch: "yui/task-11/work-item-2",
+      changedPaths: ["project-2/fix.ts"]
+    }, NOW));
+    const attempt = createIntegrationAttempt({
+      id: "integration-3",
+      taskId: fx.task.id,
+      projectId: "project-2",
+      targetRef: "yui/task-11/main-2",
+      expectedHead: baseCommit,
+      changeSetIds: ["change-set-3"],
+      checkCommands: []
+    }, NOW);
+    tx.saveIntegrationAttempt(fx.task.id, updateIntegrationAttempt(
+      attempt, { status: "committed", candidateCommit: headCommit }, NOW
+    ));
   });
 }
 
@@ -432,6 +473,209 @@ test("retrying a failed final Review Run repairs its exact stranded running Roun
   assert.deepEqual(
     fx.store.getReviewRound(fx.task.id, firstRound.id),
     repairedRound
+  );
+});
+
+test("settling an obsolete stranded final Review closes it without retrying before latest-head review", (t) => {
+  const fx = fixture(t);
+  const { round: firstRound, run: firstRun } = strandTaskFinalReview(fx);
+  const frozenRunningRound = structuredClone(
+    fx.store.getReviewRound(fx.task.id, firstRound.id)
+  );
+  const frozenFailedRun = structuredClone(
+    fx.store.getAgentRun(fx.task.id, firstRun.id)
+  );
+  const frozenWorkspace = structuredClone(
+    fx.store.getReviewRoundWorkspace(fx.task.id, firstRound.id)
+  );
+  advanceTaskCandidate(fx);
+  const settledAt = new Date(NOW.getTime() + 1_000);
+
+  const settled = runTaskCommand(
+    ["run", "settle", firstRun.id],
+    fx.store,
+    { ...fx.leaderOptions, now: () => settledAt }
+  );
+
+  assert.equal(settled.kind, "output");
+  assert.match(settled.output, /Settled obsolete final Review/);
+  const oldRound = fx.store.getReviewRound(fx.task.id, firstRound.id);
+  assert.deepEqual(oldRound, {
+    ...frozenRunningRound,
+    status: "failed",
+    summary: EXITED_REVIEW_SUMMARY,
+    report: EXITED_REVIEW_SUMMARY,
+    checks: [],
+    endedAt: settledAt.toISOString()
+  });
+  assert.deepEqual(
+    fx.store.getAgentRun(fx.task.id, firstRun.id),
+    frozenFailedRun
+  );
+  assert.deepEqual(
+    fx.store.getReviewRoundWorkspace(fx.task.id, firstRound.id),
+    frozenWorkspace
+  );
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
+
+  const completion = runTaskCommand(
+    ["complete", fx.task.id, "--summary", "request latest-head review"],
+    fx.store,
+    fx.leaderOptions
+  );
+  assert.equal(completion.kind, "output");
+  assert.match(completion.output, /Final Task Review requested/);
+  const latestRound = fx.store.listReviewRounds(fx.task.id)[1];
+  assert.equal(latestRound.status, "pending");
+  assert.notDeepEqual(latestRound.taskCandidate, oldRound.taskCandidate);
+  assert.deepEqual(latestRound.taskCandidate.projects, [
+    { projectId: "project-1", commit: "c".repeat(40) },
+    { projectId: "project-2", commit: "e".repeat(40) }
+  ]);
+  assert.throws(
+    () => runTaskCommand(
+      ["complete", fx.task.id, "--summary", "do not duplicate latest-head review"],
+      fx.store,
+      fx.leaderOptions
+    ),
+    /Final Task Review is still active/i
+  );
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 2);
+});
+
+test("settling an obsolete final Review is exactly idempotent with no state write", (t) => {
+  const fx = fixture(t);
+  const { round, run } = strandTaskFinalReview(fx);
+  advanceTaskCandidate(fx);
+  runTaskCommand(
+    ["run", "settle", run.id],
+    fx.store,
+    { ...fx.leaderOptions, now: () => new Date(NOW.getTime() + 1_000) }
+  );
+  const statePath = join(fx.root, "state.json");
+  const settledState = readFileSync(statePath, "utf8");
+
+  const repeated = runTaskCommand(
+    ["run", "settle", run.id],
+    fx.store,
+    { ...fx.leaderOptions, now: () => new Date(NOW.getTime() + 2_000) }
+  );
+
+  assert.equal(repeated.kind, "output");
+  assert.match(repeated.output, /already settled/);
+  assert.equal(readFileSync(statePath, "utf8"), settledState);
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
+  assert.equal(fx.store.getReviewRound(fx.task.id, round.id).status, "failed");
+});
+
+test("settling a stranded final Review fails closed when its candidate is current", (t) => {
+  const fx = fixture(t);
+  const { round, run } = strandTaskFinalReview(fx);
+  const frozenRound = structuredClone(
+    fx.store.getReviewRound(fx.task.id, round.id)
+  );
+
+  assert.throws(
+    () => runTaskCommand(
+      ["run", "settle", run.id],
+      fx.store,
+      fx.leaderOptions
+    ),
+    /freezes the current Task candidate/i
+  );
+  assert.deepEqual(fx.store.getReviewRound(fx.task.id, round.id), frozenRound);
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
+});
+
+test("settling an obsolete final Review is Leader-only and exact-Run fenced", (t) => {
+  const fx = fixture(t);
+  const { round, run } = strandTaskFinalReview(fx);
+  advanceTaskCandidate(fx);
+  const frozenRound = structuredClone(
+    fx.store.getReviewRound(fx.task.id, round.id)
+  );
+
+  assert.throws(
+    () => runTaskCommand(
+      ["run", "settle", `${fx.task.id}/${run.id}`],
+      fx.store,
+      { now: () => NOW }
+    ),
+    /Only the Task Leader/i
+  );
+
+  const nonmatchingRun = failAgentRun(
+    { ...run, id: "agent-run-99" },
+    "different failed Review Run",
+    NOW
+  );
+  fx.store.saveAgentRun(nonmatchingRun);
+  assert.throws(
+    () => runTaskCommand(
+      ["run", "settle", nonmatchingRun.id],
+      fx.store,
+      fx.leaderOptions
+    ),
+    /identity does not match/i
+  );
+  assert.deepEqual(fx.store.getReviewRound(fx.task.id, round.id), frozenRound);
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
+});
+
+test("settling an obsolete final Review fails closed while any Reviewer Run is active", (t) => {
+  const fx = fixture(t);
+  const { round, run } = strandTaskFinalReview(fx);
+  advanceTaskCandidate(fx);
+  const frozenRound = structuredClone(
+    fx.store.getReviewRound(fx.task.id, round.id)
+  );
+  const laterRound = createLaterFinalRound(fx, round, round.taskCandidate);
+  const activeRun = dispatchFinalReview(fx, laterRound);
+
+  assert.throws(
+    () => runTaskCommand(
+      ["run", "settle", run.id],
+      fx.store,
+      fx.leaderOptions
+    ),
+    new RegExp(`already has active Run ${activeRun.id}`, "i")
+  );
+  assert.deepEqual(fx.store.getReviewRound(fx.task.id, round.id), frozenRound);
+  assert.equal(
+    fx.store.getActiveAgentRun(fx.task.id, activeRun.roleName).id,
+    activeRun.id
+  );
+});
+
+test("settling an obsolete final Review fails closed for later final Review history", (t) => {
+  const fx = fixture(t);
+  const { round, run } = strandTaskFinalReview(fx);
+  advanceTaskCandidate(fx);
+  const frozenRound = structuredClone(
+    fx.store.getReviewRound(fx.task.id, round.id)
+  );
+  const laterCandidate = {
+    ...round.taskCandidate,
+    projects: round.taskCandidate.projects.map((project) => (
+      project.projectId === "project-2"
+        ? { ...project, commit: "e".repeat(40) }
+        : project
+    ))
+  };
+  const laterRound = createLaterFinalRound(fx, round, laterCandidate);
+
+  assert.throws(
+    () => runTaskCommand(
+      ["run", "settle", run.id],
+      fx.store,
+      fx.leaderOptions
+    ),
+    /later final ReviewRound already exists/i
+  );
+  assert.deepEqual(fx.store.getReviewRound(fx.task.id, round.id), frozenRound);
+  assert.equal(
+    fx.store.getReviewRound(fx.task.id, laterRound.id).status,
+    "pending"
   );
 });
 

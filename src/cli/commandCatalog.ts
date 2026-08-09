@@ -492,13 +492,18 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "run",
     summary: "Inspect and control Task Role Agent Runs.",
-    sections: [{ id: "manage", title: "Commands", entries: ["list", "retry", "recover", "yield", "checkpoint"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["list", "retry", "settle", "recover", "yield", "checkpoint"] }],
     children: [
       { name: "list", summary: "List Runs for a work item.", usage: "yui task run list <task>/<work>" },
       {
         name: "retry",
         summary: "Retry a failed execution Run or request a fresh Round for an exact failed final Review Run.",
         usage: "yui task run retry <task>/<run>"
+      },
+      {
+        name: "settle",
+        summary: "Close an obsolete stranded final Review Run without requesting a retry Round.",
+        usage: "yui task run settle <task>/<run>"
       },
       {
         name: "recover",

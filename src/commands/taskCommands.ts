@@ -2536,6 +2536,7 @@ function taskRunCommand(
   const [command, ...rest] = args;
   if (command === "list") return output(listRuns(rest, store, options));
   if (command === "retry") return retryRun(rest, store, options);
+  if (command === "settle") return settleRun(rest, store, options);
   if (command === "recover") return output(recoverRun(rest, store, options));
   if (command === "yield") return yieldRun(rest, store, options);
   if (command === "checkpoint") return output(checkpointRun(rest, store, options));
@@ -2767,6 +2768,117 @@ function retryRun(
   );
   return output(
     `Retry queued as ${retried.run.id} for ${retried.run.taskId}/${retried.run.roleName}\n`
+  );
+}
+
+function settleRun(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  exactPositionals(args, 1, "Task run settle usage: yui task run settle <task>/<run>.");
+  const now = clock(options);
+  const result = store.transaction((tx) => {
+    const failedRun = requireRun(tx, args[0], options);
+    if (failedRun.status !== "failed") {
+      throw usageError(`Run ${failedRun.id} cannot be settled from ${failedRun.status}.`);
+    }
+    if (failedRun.purpose !== "review") {
+      throw usageError(`Run ${failedRun.id} is not a final Review Run.`);
+    }
+    const task = requireTask(tx, failedRun.taskId);
+    if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
+    if (taskActor(options, task.id) !== "leader") {
+      throw usageError("Only the Task Leader may settle an obsolete final Review Run.");
+    }
+    const round = failedRun.reviewRoundId === undefined
+      ? null
+      : tx.getReviewRound(task.id, failedRun.reviewRoundId);
+    if (round === null || (round.scope ?? "work-item") !== "task") {
+      throw usageError(
+        `Review Run ${failedRun.id} is not an obsolete Task-final Review Run.`
+      );
+    }
+    if (
+      round.reviewerRunId !== failedRun.id
+      || round.reviewerRoleName !== failedRun.roleName
+      || round.workItemId !== failedRun.workItemId
+      || round.taskCandidate === undefined
+      || round.workspace === undefined
+      || failedRun.workspace === undefined
+      || !isDeepStrictEqual(round.workspace, failedRun.workspace)
+    ) {
+      throw dataError(
+        `Final Review Run identity does not match its ReviewRound: ${failedRun.id}.`
+      );
+    }
+    const role = requireRole(tx, task.id, failedRun.roleName);
+    const item = tx.getWorkItem(task.id, round.workItemId);
+    if (item === null
+      || !item.candidates.some(({ id }) => id === round.candidateId)) {
+      throw dataError(
+        `Final Review candidate is no longer available: ${round.candidateId}.`
+      );
+    }
+    if (failedRun.summary === undefined) {
+      throw dataError(`Failed Review Run has no durable summary: ${failedRun.id}.`);
+    }
+    const activeReviewRun = tx.listAgentRuns(task.id).find((run) => (
+      run.purpose === "review" && run.status === "active"
+    ));
+    const activeRoleRun = tx.getActiveAgentRun(task.id, role.name);
+    if (activeReviewRun !== undefined || activeRoleRun !== null) {
+      const active = activeReviewRun ?? activeRoleRun!;
+      throw usageError(`${task.id}/${role.name} already has active Run ${active.id}.`);
+    }
+
+    const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id)
+      .filter((candidate) => (candidate.scope ?? "work-item") === "task"));
+    const roundIndex = taskRounds.findIndex(({ id }) => id === round.id);
+    if (roundIndex < 0) {
+      throw dataError(`Final ReviewRound is not in Task history: ${round.id}.`);
+    }
+    const laterRound = taskRounds.slice(roundIndex + 1).at(-1);
+    if (laterRound !== undefined) {
+      throw usageError(
+        `A later final ReviewRound already exists: ${laterRound.id}/${laterRound.status}.`
+      );
+    }
+    const currentCandidate = latestTaskReviewCandidate(tx, task);
+    if (isSameTaskReviewCandidate(round.taskCandidate, currentCandidate)) {
+      throw usageError(
+        `Final ReviewRound ${round.id} freezes the current Task candidate; use exact retry.`
+      );
+    }
+
+    if (round.status === "failed") {
+      if (
+        round.summary === failedRun.summary.trim()
+        && round.report === failedRun.summary.trim()
+        && (round.checks?.length ?? 0) === 0
+        && round.evidenceCommit === undefined
+      ) {
+        return { run: failedRun, round, changed: false } as const;
+      }
+      throw usageError(`Final ReviewRound is already terminal: ${round.id}/${round.status}.`);
+    }
+    if (round.status !== "running") {
+      throw usageError(`Final ReviewRound is not stranded running: ${round.id}/${round.status}.`);
+    }
+    const terminal = finishReviewRound(
+      round,
+      "failed",
+      failedRun.summary,
+      now
+    );
+    tx.saveReviewRound(task.id, terminal);
+    return { run: failedRun, round: terminal, changed: true } as const;
+  });
+  return output(
+    result.changed
+      ? `Settled obsolete final Review ${result.round.id} from failed Run ${result.run.id}\n`
+      : `Obsolete final Review already settled: ${result.round.id}/${result.run.id}\n`,
+    { agentRun: result.run, reviewRound: result.round }
   );
 }
 
