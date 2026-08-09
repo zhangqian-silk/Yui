@@ -126,7 +126,6 @@ import {
   updateWorkItemWriteProjects,
   updateWorkItemStatus,
   type WorkItem,
-  type WorkItemProjectBaseRef,
   type CandidateGitSnapshot,
   type WorkItemCandidate,
   type WorkItemStatus
@@ -1669,7 +1668,7 @@ function createWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task work create usage: yui task work create <task> <title> [--project <project> ...] [--base-ref <project>=<ref> ...] [--objective <text>] [--accept <criterion> ...] [--after <work> ...] [--role <name>].";
+  const usage = "Task work create usage: yui task work create <task> <title> [--project <project> ...] [--objective <text>] [--accept <criterion> ...] [--after <work> ...] [--role <name>].";
   const parsed = parseWorkCreateArgs(args, usage);
   exactPositionals(parsed.positionals, 2, usage);
   const now = clock(options);
@@ -1689,27 +1688,12 @@ function createWork(
       if (project === null) throw usageError(`Task Project not found: ${reference}.`);
       return project.id;
     });
-    const baseRefs: WorkItemProjectBaseRef[] = parsed.baseRefs.map(({ project, baseRef }) => {
-      const resolved = resolveProject(
-        task.projectBindings.map(({ projectId }) => requireProject(tx, projectId)),
-        project
-      );
-      if (resolved === null) throw usageError(`Task Project not found: ${project}.`);
-      if (!writeProjectIds.includes(resolved.id)) {
-        throw usageError(`Work Item base-ref Project must be writable: ${resolved.id}.`);
-      }
-      return { projectId: resolved.id, baseRef };
-    });
-    if (new Set(baseRefs.map(({ projectId }) => projectId)).size !== baseRefs.length) {
-      throw usageError("Each Work Item Project may specify at most one base ref.");
-    }
     const created = createWorkItem(tx.nextWorkItemId(task.id), task.id, {
       title: parsed.positionals[1],
       objective: parsed.objective ?? parsed.positionals[1],
       acceptance: parsed.acceptance,
       dependsOn: parsed.after,
       writeProjectIds,
-      ...(baseRefs.length === 0 ? {} : { baseRefs }),
       ...(parsed.role === undefined ? {} : { assignee: parsed.role })
     }, now);
     tx.saveWorkItem(task.id, created);
@@ -2479,7 +2463,6 @@ function showWork(
     `Title: ${item.title}`,
     `Objective: ${item.objective}`,
     `Write Projects: ${item.writeProjectIds.join(", ") || "-"}`,
-    `Base Refs: ${item.baseRefs?.map(({ projectId, baseRef }) => `${projectId}=${baseRef}`).join(", ") || "-"}`,
     `Acceptance: ${item.acceptance.length === 0 ? "-" : item.acceptance.join("; ")}`,
     `Outcome: ${item.outcome ?? "-"}`,
     `Retirement: ${item.disposition === undefined ? "-" : "retired"}`,
@@ -3811,14 +3794,12 @@ function parseWorkCreateArgs(
   acceptance: string[];
   after: string[];
   projects: string[];
-  baseRefs: Array<Readonly<{ project: string; baseRef: string }>>;
   role?: string;
 }> {
   const positionals: string[] = [];
   const acceptance: string[] = [];
   const after: string[] = [];
   const projects: string[] = [];
-  const baseRefs: Array<Readonly<{ project: string; baseRef: string }>> = [];
   let objective: string | undefined;
   let role: string | undefined;
   for (let index = 0; index < args.length; index += 1) {
@@ -3832,7 +3813,6 @@ function parseWorkCreateArgs(
       && argument !== "--accept"
       && argument !== "--after"
       && argument !== "--project"
-      && argument !== "--base-ref"
       && argument !== "--role"
     ) {
       throw usageError(`Unsupported option: ${argument}.`, usage);
@@ -3850,19 +3830,6 @@ function parseWorkCreateArgs(
     } else if (argument === "--accept") acceptance.push(value);
     else if (argument === "--after") after.push(value);
     else if (argument === "--project") projects.push(value);
-    else {
-      const separator = value.indexOf("=");
-      if (separator <= 0 || separator === value.length - 1) {
-        throw usageError(
-          "--base-ref must use <project>=<ref>.",
-          usage
-        );
-      }
-      baseRefs.push({
-        project: value.slice(0, separator),
-        baseRef: value.slice(separator + 1)
-      });
-    }
     index += 1;
   }
   return {
@@ -3871,8 +3838,7 @@ function parseWorkCreateArgs(
     ...(role === undefined ? {} : { role }),
     acceptance,
     after,
-    projects,
-    baseRefs
+    projects
   };
 }
 

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, realpathSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,7 +31,6 @@ import type {
   AgentEnvironmentRefreshPort
 } from "../runtime/ports.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
-import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import { activeLiveRoleAgentSession } from "./agentExecutor.js";
 import {
@@ -645,6 +644,21 @@ function patchEnvironment(
   for (const name of names) delete next[name];
   for (const [name, value] of Object.entries(values)) next[name] = value;
   return next;
+}
+
+function nativeSessionIdForLaunch(
+  home: string,
+  launchId: string,
+  agentId: string,
+  adapterId: string
+): string {
+  const hex = createHash("sha256").update(JSON.stringify([
+    resolve(home),
+    requireText(launchId, "Launch id"),
+    requireText(agentId, "Agent id"),
+    requireText(adapterId, "Agent adapter id")
+  ])).digest("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
 /**

@@ -22,7 +22,7 @@ type ClaudeHookEnvelope = Readonly<{
   launchId: string;
   runId: string;
   nativeSessionId: string;
-  receiptId?: string;
+  receiptId: string;
 }>;
 
 export type ClaudeStopFailureHookNotification = Omit<ClaudeHookEnvelope, "receiptId"> & Readonly<{
@@ -141,24 +141,19 @@ export function parseClaudeHookEnvelope(
     && payload.hook_event_name !== "StopFailure") {
     throw new Error("Managed Claude lifecycle ingestion received an unsupported hook event.");
   }
-  const sessionSource = payload.hook_event_name === "SessionStart"
-    ? requireIdentity(payload.source, "Claude SessionStart source")
-    : undefined;
-  const base = parseClaudeEnvelope(payload, environment, {
-    allowPreallocatedClaudeStartup: sessionSource === "startup"
-  });
+  const base = parseClaudeEnvelope(payload, environment);
   switch (payload.hook_event_name) {
     case "SessionStart":
       return {
         ...base,
         kind: "session-start",
-        sessionSource: sessionSource!
+        sessionSource: requireIdentity(payload.source, "Claude SessionStart source")
       };
     case "UserPromptSubmit":
       return {
         ...base,
         kind: "prompt-submit",
-        receiptId: requireIdentity(base.receiptId, "Claude transport receipt id")
+        receiptId: base.receiptId
       };
     case "StopFailure":
       return {
@@ -184,12 +179,11 @@ export function parseClaudeHookEnvelope(
 
 function parseClaudeEnvelope(
   payload: Record<string, unknown>,
-  environment: NodeJS.ProcessEnv,
-  options: Readonly<{ allowPreallocatedClaudeStartup?: boolean }>
+  environment: NodeJS.ProcessEnv
 ): ClaudeHookEnvelope {
   const nativeSessionId = requireIdentity(payload.session_id, "Claude session id");
   return {
-    ...resolveProviderHookRunFence(environment, "claude", nativeSessionId, options),
+    ...resolveProviderHookRunFence(environment, "claude", nativeSessionId),
     adapterId: "claude"
   };
 }

@@ -20,12 +20,6 @@ import {
 } from "../../dist/executor/agentExecutor.js";
 import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import {
-  hasRuntimeCleanupObligation,
-  isRuntimeLaunchReservation,
-  runtimeLifecycleTarget
-} from "../../dist/runtime/lifecycleReservation.js";
-import { nativeSessionIdForLaunch } from "../../dist/runtime/preallocatedNativeSession.js";
-import {
   createRole,
   createRoleAgentBinding,
   updateRoleStatus
@@ -68,7 +62,7 @@ function fixture(t, adapterId, sessionStatus = "running", options = {}) {
     "agent-run-1", task.id, worker.name, "new", "Do the work", first,
     { workItemId: item.id, effective: resolveEffectiveLaunch({ role: worker, purpose: "execution" }) }
   );
-  if (options.transportPushed !== false) run = markAgentRunPushed(run, second);
+  run = markAgentRunPushed(run, second);
   const nativeSessionId = `${adapterId}-native-1`;
   const target = { kind: "role", taskId: task.id, roleName: worker.name };
   store.transaction((tx) => {
@@ -92,16 +86,12 @@ function fixture(t, adapterId, sessionStatus = "running", options = {}) {
         policy: "fixed", status: sessionStatus, effective: run.effective
       }, first);
     }
-    if (options.bindInFlight !== false) {
-      sessions = bindTaskRoleRun(sessions, {
-        agentId: agent.id, runId: run.id, receiptId: `agent-run:${task.id}/${run.id}`
-      }, first);
-      if (options.transportPushed !== false) {
-        sessions = markTaskRoleRunPushed(sessions, {
-          agentId: agent.id, runId: run.id, receiptId: `agent-run:${task.id}/${run.id}`
-        }, second);
-      }
-    }
+    sessions = bindTaskRoleRun(sessions, {
+      agentId: agent.id, runId: run.id, receiptId: `agent-run:${task.id}/${run.id}`
+    }, first);
+    sessions = markTaskRoleRunPushed(sessions, {
+      agentId: agent.id, runId: run.id, receiptId: `agent-run:${task.id}/${run.id}`
+    }, second);
     tx.saveTaskRoleSessionSet(sessions);
   });
   if (options.runtimeDiscovered === true) {
@@ -120,7 +110,7 @@ function fixture(t, adapterId, sessionStatus = "running", options = {}) {
   const drain = () => new FileRuntimeEventProcessor(
     new FileRuntimeEventInbox(home), adapter
   ).drain(new Date("2026-08-06T02:00:02.000Z"));
-  return { home, store, adapter, task, worker, run, agent, nativeSessionId, environment, drain };
+  return { home, store, task, worker, run, agent, nativeSessionId, environment, drain };
 }
 
 test("Claude UserPromptSubmit hook folds to provider-accepted and only then writes delivered", async (t) => {
@@ -200,204 +190,6 @@ test("Claude SessionStart hook folds to a session-lifecycle event, never deliver
     (e) => e.type === "runtime.provider-session-lifecycle" && e.payload.preInputReady === "true"
   ));
 });
-
-test("Claude startup emitted before Session projection is preserved and folds afterward", async (t) => {
-  const fx = fixture(t, "claude", "reserved", {
-    runtimeDiscovered: true,
-    transportPushed: false,
-    bindInFlight: false
-  });
-  const nativeSessionId = nativeSessionIdForLaunch(
-    fx.home,
-    "launch-1",
-    fx.agent.id,
-    "claude"
-  );
-  const environment = {
-    ...fx.environment,
-    YUI_NATIVE_SESSION_ID: nativeSessionId
-  };
-  const inbox = new FileRuntimeEventInbox(fx.home);
-
-  await runClaudeLifecycleHookCommand(
-    JSON.stringify({
-      hook_event_name: "SessionStart",
-      session_id: nativeSessionId,
-      source: "startup"
-    }),
-    environment,
-    async () => ({})
-  );
-
-  assert.equal(inbox.list().length, 1);
-  const beforeProjection = fx.drain();
-  assert.equal(beforeProjection.acknowledgedEventIds.length, 0);
-  assert.equal(beforeProjection.deferred.length, 1);
-  assert.equal(beforeProjection.failed.length, 0);
-  assert.equal(inbox.list().length, 1);
-  assert.equal(fx.store.getRoleSession(fx.task.id, fx.worker.name), null);
-  assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).pushedAt, undefined);
-  assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
-
-  fx.adapter.saveRoleRunPrepared({
-    task: fx.adapter.getTask(fx.task.id),
-    role: fx.adapter.getRole(fx.task.id, fx.worker.name),
-    run: fx.run,
-    session: {
-      agentId: fx.agent.id,
-      adapterId: "claude",
-      launchId: "launch-1",
-      nativeSessionId,
-      status: "running",
-      effective: fx.run.effective
-    },
-    launchId: "launch-1",
-    now: new Date("2026-08-06T02:00:01.500Z")
-  });
-
-  const afterProjection = fx.drain();
-  assert.equal(afterProjection.acknowledgedEventIds.length, 1);
-  assert.equal(afterProjection.deferred.length, 0);
-  assert.equal(afterProjection.failed.length, 0);
-  assert.equal(inbox.list().length, 0);
-  assert.ok(fx.store.listEvents(fx.task.id).some((event) => (
-    event.type === "runtime.provider-session-lifecycle"
-      && event.payload.preInputReady === "true"
-  )));
-  assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).pushedAt, undefined);
-  assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
-  assert.equal(isRuntimeLaunchReservation(fx.store.getWorkMailbox(runtimeLifecycleTarget({
-    scope: "task",
-    taskId: fx.task.id,
-    roleName: fx.worker.name
-  }))?.processing, "launch-1"), true);
-});
-
-for (const mismatch of [
-  "native",
-  "launch",
-  "run",
-  "inflight-cross-run",
-  "cleanup-pending",
-  "reservation-missing",
-  "reservation-cross-run"
-]) {
-  test(`preallocated Claude startup rejects ${mismatch} before inbox append`, async (t) => {
-    const fx = fixture(t, "claude", "reserved", {
-      runtimeDiscovered: true,
-      transportPushed: false,
-      bindInFlight: false
-    });
-    const owner = {
-      scope: "task",
-      taskId: fx.task.id,
-      roleName: fx.worker.name
-    };
-    const nativeSessionId = nativeSessionIdForLaunch(
-      fx.home,
-      "launch-1",
-      fx.agent.id,
-      "claude"
-    );
-    let environment = {
-      ...fx.environment,
-      YUI_NATIVE_SESSION_ID: nativeSessionId
-    };
-    let payloadNativeSessionId = nativeSessionId;
-    if (mismatch === "native") {
-      payloadNativeSessionId = "not-the-preallocated-native";
-    } else if (mismatch === "launch") {
-      environment = { ...environment, YUI_LAUNCH_ID: "launch-stale" };
-    } else if (mismatch === "run") {
-      environment = { ...environment, YUI_RUN_ID: "agent-run-stale" };
-    } else if (mismatch === "inflight-cross-run") {
-      fx.store.saveAgentRun(createAgentRun(
-        "agent-run-2",
-        fx.task.id,
-        fx.worker.name,
-        "new",
-        "other Run",
-        new Date("2026-08-06T02:00:01.250Z"),
-        { effective: fx.run.effective }
-      ));
-      fx.store.saveTaskRoleSessionSet(bindTaskRoleRun(
-        fx.store.getTaskRoleSessionSet(fx.task.id, fx.worker.name),
-        {
-          agentId: fx.agent.id,
-          runId: "agent-run-2",
-          receiptId: `agent-run:${fx.task.id}/agent-run-2`
-        },
-        new Date("2026-08-06T02:00:01.500Z")
-      ));
-    } else if (mismatch === "cleanup-pending") {
-      assert.notEqual(fx.adapter.enqueueRuntimeCleanup(
-        owner,
-        new Date("2026-08-06T02:00:01.250Z")
-      ), null);
-      assert.equal(hasRuntimeCleanupObligation(fx.store.getWorkMailbox(
-        runtimeLifecycleTarget(owner)
-      )), true);
-    } else {
-      assert.equal(fx.adapter.completeRuntimeLaunchReservation(owner, "launch-1"), true);
-      if (mismatch === "reservation-cross-run") {
-        fx.store.saveAgentRun(createAgentRun(
-          "agent-run-2",
-          fx.task.id,
-          fx.worker.name,
-          "new",
-          "other Run",
-          new Date("2026-08-06T02:00:01.250Z"),
-          { effective: fx.run.effective }
-        ));
-        fx.adapter.reserveRuntimeLaunch({
-          owner,
-          launchId: "launch-1",
-          runId: "agent-run-2"
-        }, () => {}, new Date("2026-08-06T02:00:01.500Z"));
-      }
-    }
-
-    await assert.rejects(runClaudeLifecycleHookCommand(
-      JSON.stringify({
-        hook_event_name: "SessionStart",
-        source: "startup",
-        session_id: payloadNativeSessionId
-      }),
-      environment,
-      async () => ({})
-    ));
-    assert.equal(new FileRuntimeEventInbox(fx.home).list().length, 0);
-    assert.equal(fx.store.getRoleSession(fx.task.id, fx.worker.name), null);
-    assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).pushedAt, undefined);
-    assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
-  });
-}
-
-for (const event of [
-  { hook_event_name: "SessionStart", source: "resume" },
-  { hook_event_name: "UserPromptSubmit", prompt: "must not append" },
-  { hook_event_name: "StopFailure", error: "must not append" }
-]) {
-  test(`${event.hook_event_name}${event.source === undefined ? "" : `(${event.source})`} cannot use the startup-only pre-binding window`, async (t) => {
-    const fx = fixture(t, "claude", "reserved", {
-      runtimeDiscovered: true,
-      transportPushed: false,
-      bindInFlight: false
-    });
-    const nativeSessionId = nativeSessionIdForLaunch(
-      fx.home,
-      "launch-1",
-      fx.agent.id,
-      "claude"
-    );
-    await assert.rejects(runClaudeLifecycleHookCommand(
-      JSON.stringify({ ...event, session_id: nativeSessionId }),
-      { ...fx.environment, YUI_NATIVE_SESSION_ID: nativeSessionId },
-      async () => ({})
-    ));
-    assert.equal(new FileRuntimeEventInbox(fx.home).list().length, 0);
-  });
-}
 
 test("Codex SessionStart hook records session-lifecycle without pre-input readiness", async (t) => {
   const fx = fixture(t, "codex", "reserved");

@@ -21,7 +21,7 @@ type CodexHookEnvelope = Readonly<{
   launchId: string;
   runId: string;
   nativeSessionId: string;
-  receiptId?: string;
+  receiptId: string;
 }>;
 
 type CodexSessionStartEnvelope = CodexHookEnvelope & Readonly<{ kind: "session-start" }>;
@@ -109,7 +109,7 @@ export function parseCodexHookEnvelope(
       return {
         ...base,
         kind: "prompt-submit",
-        receiptId: requireIdentity(base.receiptId, "Codex transport receipt id")
+        receiptId: base.receiptId
       };
     default:
       throw new Error("Managed Codex lifecycle ingestion received an unsupported hook event.");
