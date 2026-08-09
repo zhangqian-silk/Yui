@@ -128,13 +128,12 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
   assert.match(leader, /yui task work update <work-id> running/u);
   assert.match(leader, /A Profile is required for this path/u);
   assert.match(leader, /Ignore all Task Role Agent bindings/u);
-  assert.match(leader, /executor=subagent; profile=reviewer@3/u);
   assert.match(leader, /fresh ReviewRound-owned worktree.*frozen Candidate/usi);
   assert.match(leader, /never capture, integrate, accept,\s+or auto-merge the review workspace/usi);
   assert.match(leader, /current Run's[\s\S]*--summary-file -[\s\S]*durable\s+handoff/u);
   assert.match(
     leader,
-    /`--check` commands run from the selected Project's integration candidate root[\s\S]*not\s+`cd <project> && npm test`/u
+    /`--check` commands run from the selected Project's integration candidate root[\s\S]*take the exact commands from Project Policy[\s\S]*do\s+not invent a repository-specific command or add a generic shell prelude/u
   );
   assert.match(operator, /Leader chooses among direct execution, a native subagent, and a Task Role\s+AgentRun/u);
   assert.match(operator, /inherits\s+the Leader Agent, ignores Task Role Agent bindings/u);
