@@ -443,6 +443,17 @@ async function reconcileDormantRuntimeOwners(
       byOwner.get(runtimeOwnerIdentity(candidate.owner))?.state
       === "stopped"
     ) {
+      if (
+        candidate.owner.scope === "task"
+        && candidate.launchId !== undefined
+      ) {
+        // The exact launch-owned resources must settle through the durable
+        // cleanup lane before its Session fact becomes stopped. The candidate
+        // is passed back as the CAS fence so a concurrent Hook/launch cannot
+        // redirect cleanup to a newer generation.
+        store.enqueueRuntimeCleanup?.(candidate.owner, now, candidate);
+        continue;
+      }
       if (store.markRuntimeOwnerStopped(candidate, now)) {
         forgetPreparedRuntimeOwner(delivery, candidate.owner);
       }

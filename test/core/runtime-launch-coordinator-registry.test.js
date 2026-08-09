@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -23,6 +23,7 @@ import {
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
 } from "../../dist/runtime/lifecycleReservation.js";
+import { FileTaskRuntimeIsolation } from "../../dist/runtime/taskRuntimeIsolation.js";
 import {
   createRole,
   createRoleAgentBinding,
@@ -38,6 +39,7 @@ import {
   createWorkItem,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
+import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 
 const NOW = new Date("2026-07-24T00:00:00.000Z");
 
@@ -171,6 +173,25 @@ function prepareInput(fx, roleName, runId, adapterId = fx.agent.adapterId) {
     runId,
     effective
   };
+}
+
+function taskRuntimeFixture(t, fx) {
+  const runtimeRoot = `${fx.home}-task-runtimes`;
+  t.after(() => rmSync(runtimeRoot, { recursive: true, force: true }));
+  const workspace = createManagedWorkspace({
+    owner: { type: "task", taskId: fx.task.id },
+    root: fx.home,
+    entries: []
+  }, NOW);
+  const isolation = new FileTaskRuntimeIsolation({
+    runtimeRoot,
+    controlPlane: {
+      yuiHome: fx.home,
+      controllerSocketPath: join(fx.home, "controller.sock"),
+      tmuxNamespace: "yui-test-control"
+    }
+  });
+  return { isolation, workspace };
 }
 
 async function waitFor(predicate, label, timeoutMs = 1_000) {
@@ -1506,6 +1527,7 @@ test("a resume binding with the wrong native identity is fenced into owner clean
 
 test("a stopped pre-binding host gets a new generation and the old generation Hook is obsolete", async (t) => {
   const fx = fixture(t, "claude");
+  const taskRuntime = taskRuntimeFixture(t, fx);
   let hostPresent = false;
   let createdHosts = 0;
   const starts = [];
@@ -1537,12 +1559,18 @@ test("a stopped pre-binding host gets a new generation and the old generation Ho
     host,
     {
       createGenerationId: () => "old-generation",
-      now: () => NOW
+      now: () => NOW,
+      runtimeIsolation: taskRuntime.isolation
     }
   );
   const first = await registry(firstCoordinator, host).prepareRoleSession(
-    prepareInput(fx, "worker", "agent-run-1")
+    {
+      ...prepareInput(fx, "worker", "agent-run-1"),
+      managedWorkspace: taskRuntime.workspace
+    }
   );
+  const oldGenerationRoot = starts[0].runtimeIsolation.roots.generation;
+  assert.equal(existsSync(oldGenerationRoot), true);
   hostPresent = false;
 
   const restartedStore = new FileTaskStore(fx.home);
@@ -1552,15 +1580,20 @@ test("a stopped pre-binding host gets a new generation and the old generation Ho
     host,
     {
       createGenerationId: () => "new-generation",
-      now: () => NOW
+      now: () => NOW,
+      runtimeIsolation: taskRuntime.isolation
     }
   );
-  const laterInput = prepareInput(fx, "worker", "agent-run-2");
+  const laterInput = {
+    ...prepareInput(fx, "worker", "agent-run-2"),
+    managedWorkspace: taskRuntime.workspace
+  };
   await assert.rejects(
     registry(restartedCoordinator, host).prepareRoleSession(laterInput),
     /reservation changed during recovery/i
   );
   assertReservation(fx, "worker", first.launchId, "agent-run-1");
+  assert.equal(existsSync(oldGenerationRoot), true);
 
   const priorRun = fx.store.getAgentRun(fx.task.id, "agent-run-1");
   fx.store.saveAgentRun(failAgentRun(
@@ -1574,6 +1607,8 @@ test("a stopped pre-binding host gets a new generation and the old generation Ho
   ).prepareRoleSession(laterInput);
 
   assert.notEqual(recovered.launchId, first.launchId);
+  assert.equal(existsSync(oldGenerationRoot), false);
+  assert.equal(existsSync(starts.at(-1).runtimeIsolation.roots.generation), true);
   assert.equal(recovered.sessionStarted, true);
   assert.equal(createdHosts, 2);
   assertReservation(fx, "worker", recovered.launchId);
@@ -1603,6 +1638,144 @@ test("a stopped pre-binding host gets a new generation and the old generation Ho
     restartedReservations.classifyRuntimeTurnCompleted(currentHook),
     "apply"
   );
+});
+
+test("a stopped reservation cleanup failure keeps the old launch fenced and blocks renewal", async (t) => {
+  const fx = fixture(t, "claude");
+  const taskRuntime = taskRuntimeFixture(t, fx);
+  let hostPresent = false;
+  const starts = [];
+  const host = {
+    async start(request) {
+      hostPresent = true;
+      starts.push(request);
+      return runtimeBinding(request, { index: starts.length, hostCreated: true });
+    },
+    async resume() { throw new Error("resume is not expected"); },
+    async stop() { hostPresent = false; },
+    async inspect() { return { state: hostPresent ? "running" : "stopped" }; },
+    async inspectOwner() { return { state: hostPresent ? "running" : "stopped" }; },
+    async stopOwner() { hostPresent = false; return true; }
+  };
+  const firstCoordinator = new RuntimeLaunchCoordinator(
+    fx.schedulerStore,
+    host,
+    {
+      createGenerationId: () => "old-cleanup-blocked",
+      now: () => NOW,
+      runtimeIsolation: taskRuntime.isolation
+    }
+  );
+  const first = await registry(firstCoordinator, host).prepareRoleSession({
+    ...prepareInput(fx, "worker", "agent-run-1"),
+    managedWorkspace: taskRuntime.workspace
+  });
+  const oldGenerationRoot = starts[0].runtimeIsolation.roots.generation;
+  hostPresent = false;
+  fx.store.saveAgentRun(failAgentRun(
+    fx.store.getAgentRun(fx.task.id, "agent-run-1"),
+    "old Run is terminal",
+    new Date(NOW.getTime() + 1)
+  ));
+
+  const cleanupCalls = [];
+  const blockedIsolation = {
+    preflight: (input) => taskRuntime.isolation.preflight(input),
+    activate: (preparation) => taskRuntime.isolation.activate(preparation),
+    cleanup: (preparation, reason) => taskRuntime.isolation.cleanup(preparation, reason),
+    cleanupTaskLaunch(input) {
+      cleanupCalls.push(input);
+      throw new Error("exact old generation cleanup is ambiguous");
+    }
+  };
+  const restartedCoordinator = new RuntimeLaunchCoordinator(
+    new FileSchedulerStoreAdapter(new FileTaskStore(fx.home)),
+    host,
+    {
+      createGenerationId: () => "must-not-renew",
+      now: () => NOW,
+      runtimeIsolation: blockedIsolation
+    }
+  );
+
+  await assert.rejects(
+    registry(restartedCoordinator, host).prepareRoleSession({
+      ...prepareInput(fx, "worker", "agent-run-2"),
+      managedWorkspace: taskRuntime.workspace
+    }),
+    /exact old generation cleanup is ambiguous/i
+  );
+  assert.deepEqual(cleanupCalls, [{
+    taskId: fx.task.id,
+    launchId: first.launchId,
+    reason: "interruption"
+  }]);
+  assert.equal(existsSync(oldGenerationRoot), true);
+  assert.equal(starts.length, 1);
+  assertReservation(fx, "worker", first.launchId, "agent-run-1");
+  assert.equal(
+    hasRuntimeCleanupObligation(reservationMailbox(fx, "worker")),
+    true
+  );
+});
+
+test("a reused generation is cleaned when its failed call confirms the owner stopped", async (t) => {
+  const fx = fixture(t, "claude");
+  const taskRuntime = taskRuntimeFixture(t, fx);
+  let hostPresent = false;
+  let rejectRebind = false;
+  const starts = [];
+  const host = {
+    async start(request) {
+      starts.push(request);
+      if (rejectRebind) {
+        hostPresent = false;
+        throw new Error("reused generation call failed after host stop");
+      }
+      hostPresent = true;
+      return runtimeBinding(request, { index: starts.length, hostCreated: true });
+    },
+    async resume() { throw new Error("resume is not expected"); },
+    async stop() { hostPresent = false; },
+    async inspect() { return { state: hostPresent ? "running" : "stopped" }; },
+    async inspectOwner() { return { state: hostPresent ? "running" : "stopped" }; },
+    async stopOwner() { hostPresent = false; return true; }
+  };
+  const firstCoordinator = new RuntimeLaunchCoordinator(
+    fx.schedulerStore,
+    host,
+    {
+      createGenerationId: () => "reused-generation",
+      now: () => NOW,
+      runtimeIsolation: taskRuntime.isolation
+    }
+  );
+  const input = {
+    ...prepareInput(fx, "worker", "agent-run-1"),
+    managedWorkspace: taskRuntime.workspace
+  };
+  const first = await registry(firstCoordinator, host).prepareRoleSession(input);
+  const generationRoot = starts[0].runtimeIsolation.roots.generation;
+  assert.equal(existsSync(generationRoot), true);
+  rejectRebind = true;
+
+  const restartedCoordinator = new RuntimeLaunchCoordinator(
+    new FileSchedulerStoreAdapter(new FileTaskStore(fx.home)),
+    host,
+    {
+      createGenerationId: () => "unused-replacement",
+      now: () => NOW,
+      runtimeIsolation: taskRuntime.isolation
+    }
+  );
+  await assert.rejects(
+    registry(restartedCoordinator, host).prepareRoleSession(input),
+    /reused generation call failed after host stop/i
+  );
+
+  assert.equal(starts[1].launchId, first.launchId);
+  assert.equal(existsSync(generationRoot), false);
+  assert.equal(reservationMailbox(fx, "worker"), null);
 });
 
 test("Task launch rejects a Role-only workspace before reservation or host side effects", async (t) => {

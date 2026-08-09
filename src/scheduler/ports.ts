@@ -94,6 +94,7 @@ export type DormantRuntimeOwnerCandidate = Readonly<{
   agentId: string;
   adapterId: string;
   nativeSessionId: string;
+  launchId?: string;
   sessionUpdatedAt: string;
 }>;
 
@@ -251,10 +252,11 @@ export interface SchedulerStorePort {
     >,
     now: Date
   ): boolean;
-  /** Queues a durable exact-owner cleanup obligation for a Task Role runtime. */
+  /** Queues durable owner cleanup, optionally fenced by one dormant Session fact. */
   enqueueRuntimeCleanup?(
     owner: RuntimeRoleOwner,
-    now?: Date
+    now?: Date,
+    expectedDormantCandidate?: DormantRuntimeOwnerCandidate
   ): RuntimeLifecycleTarget | null;
   /** Atomically clears one confirmed-absent reservation and stops its session fact. */
   completeStoppedRuntimeReservation?(

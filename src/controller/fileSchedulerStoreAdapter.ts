@@ -583,6 +583,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
               agentId: active.agentId,
               adapterId: active.adapterId,
               nativeSessionId: active.nativeSessionId,
+              ...(active.launchId === undefined ? {} : { launchId: active.launchId }),
               sessionUpdatedAt: active.updatedAt
             }]
           : [];
@@ -601,6 +602,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
               agentId: active.agentId,
               adapterId: active.adapterId,
               nativeSessionId: active.nativeSessionId,
+              ...(active.launchId === undefined ? {} : { launchId: active.launchId }),
               sessionUpdatedAt: active.updatedAt
             }]
           : [];
@@ -614,43 +616,26 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     now: Date
   ): boolean {
     return this.store.transaction((store) => {
-      const { owner } = candidate;
-      if (
-        hasRuntimeLifecycleWork(
-          store.getWorkMailbox(runtimeLifecycleTarget(owner))
-        )
-      ) {
-        return false;
-      }
-      if (
-        owner.scope === "task"
-        && store.getActiveAgentRun(owner.taskId, owner.roleName) !== null
-      ) {
-        return false;
-      }
-      const sessions = owner.scope === "task"
-        ? store.getTaskRoleSessionSet(owner.taskId, owner.roleName)
-        : store.getGlobalRoleSessionSet(owner.roleName);
-      const active = sessions?.sessions[sessions.activeAgentId];
-      if (
-        active === undefined
-        || active.status === "stopped"
-        || active.agentId !== candidate.agentId
-        || active.adapterId !== candidate.adapterId
-        || active.nativeSessionId !== candidate.nativeSessionId
-        || active.updatedAt !== candidate.sessionUpdatedAt
-      ) {
-        return false;
-      }
-      return markRuntimeOwnerSessionStopped(store, owner, now);
+      if (!dormantRuntimeCandidateIsCurrent(store, candidate)) return false;
+      return markRuntimeOwnerSessionStopped(store, candidate.owner, now);
     });
   }
 
   enqueueRuntimeCleanup(
     owner: RuntimeRoleOwner,
-    now = new Date()
+    now = new Date(),
+    expectedDormantCandidate?: DormantRuntimeOwnerCandidate
   ): RuntimeLifecycleTarget | null {
     return this.store.transaction((store) => {
+      if (
+        expectedDormantCandidate !== undefined
+        && (
+          !sameRuntimeOwner(owner, expectedDormantCandidate.owner)
+          || !dormantRuntimeCandidateIsCurrent(store, expectedDormantCandidate)
+        )
+      ) {
+        return null;
+      }
       if (owner.scope === "task" && store.getTask(owner.taskId) === null) {
         return null;
       }
@@ -1282,7 +1267,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   completeRuntimeLaunchReservation(
     owner: RuntimeRoleOwner,
     launchId: string,
-    expectedTerminalRunId?: string
+    expectedTerminalRunId?: string,
+    beforeComplete?: () => void
   ): boolean {
     return this.store.transaction((store) => {
       const target = runtimeLifecycleTarget(owner);
@@ -1303,6 +1289,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           return false;
         }
       }
+      beforeComplete?.();
       saveRuntimeLifecycleMailbox(
         store,
         completeProcessing(mailbox!, launchId)
@@ -2783,6 +2770,44 @@ function runtimeOwnerFromTarget(
         scope: "global",
         roleName: target.roleName
       };
+}
+
+function sameRuntimeOwner(
+  left: RuntimeRoleOwner,
+  right: RuntimeRoleOwner
+): boolean {
+  return left.scope === "task"
+    ? right.scope === "task"
+      && left.taskId === right.taskId
+      && left.roleName === right.roleName
+    : right.scope === "global" && left.roleName === right.roleName;
+}
+
+function dormantRuntimeCandidateIsCurrent(
+  store: TaskStore,
+  candidate: DormantRuntimeOwnerCandidate
+): boolean {
+  const { owner } = candidate;
+  if (hasRuntimeLifecycleWork(
+    store.getWorkMailbox(runtimeLifecycleTarget(owner))
+  )) {
+    return false;
+  }
+  if (
+    owner.scope === "task"
+    && store.getActiveAgentRun(owner.taskId, owner.roleName) !== null
+  ) {
+    return false;
+  }
+  const sessions = runtimeOwnerSessionSet(store, owner);
+  const active = sessions?.sessions[sessions.activeAgentId];
+  return active !== undefined
+    && active.status !== "stopped"
+    && active.agentId === candidate.agentId
+    && active.adapterId === candidate.adapterId
+    && active.nativeSessionId === candidate.nativeSessionId
+    && active.launchId === candidate.launchId
+    && active.updatedAt === candidate.sessionUpdatedAt;
 }
 
 function markRuntimeOwnerSessionStopped(
