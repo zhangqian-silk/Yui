@@ -974,16 +974,19 @@ function classifyLeaderStall(
   const downstream = [...observed.values()].filter((entry) => (
     entry.candidate.task.id === taskId && entry.candidate.role.name !== "leader"
   ));
-  const healthyDownstream = downstream.some((entry) => (
-    entry.live === "present" && !entry.stalled
-  ));
+  // A present downstream Run keeps recovery Leader-owned. If that Run is
+  // itself stalled, this pass has just routed its structured attention to the
+  // Leader; escalating the Leader to the Operator in the same pass would skip
+  // the intended recovery owner. Only an already-stale Leader mailbox below
+  // proves that the Leader also failed to act.
+  const downstreamPresent = downstream.some((entry) => entry.live === "present");
   const mailbox = store.getWorkMailbox({ kind: "role", taskId, roleName: "leader" });
   const pending = mailbox?.pending;
   const pendingStalled = pending !== null
     && pending !== undefined
     && Number.isFinite(Date.parse(pending.lastQueuedAt))
     && now.getTime() - Date.parse(pending.lastQueuedAt) >= windowMs;
-  if (healthyDownstream && !pendingStalled) return "waiting-on-workers";
+  if (downstreamPresent && !pendingStalled) return "waiting-on-workers";
   return "truly-stalled";
 }
 

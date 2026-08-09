@@ -507,6 +507,80 @@ test("Leader stall scan leaves waiting-user and healthy waiting-on-workers Runs 
   assert.equal(healthyWorker.events.length, 0);
 });
 
+test("a Leader with a single stalled Worker keeps the recovery Leader-owned on the same pass", async () => {
+  const store = stallStore({ roleName: "leader", downstream: true, downstreamStalled: true });
+  const delivery = { async inspectRole() { return "present"; } };
+  const first = await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  // Only the Worker's run.stalled is recorded; the Leader is not escalated to
+  // the Operator in the same reconciliation that first observed the stall.
+  const stalled = store.events.filter((event) => event.type === "run.stalled");
+  assert.equal(stalled.length, 1);
+  assert.equal(stalled[0].payload.runId, "run-worker");
+  assert.deepEqual(
+    first.map(({ runId, classification }) => ({ runId, classification })),
+    [{ runId: "run-worker", classification: "truly-stalled" }]
+  );
+
+  // A repeated pass is idempotent: no duplicate and still no Leader escalation.
+  await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 1);
+  assert.equal(
+    store.events.some((event) => (
+      event.type === "run.stalled" && event.payload.runId === "run-1"
+    )),
+    false
+  );
+});
+
+test("a recent Leader mailbox action is not escalated even while a Worker is stalled", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderMailboxQueuedAt: new Date(NOW.getTime() - 15 * 60_000).toISOString()
+  });
+  const delivery = { async inspectRole() { return "present"; } };
+  await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  const stalled = store.events.filter((event) => event.type === "run.stalled");
+  assert.equal(stalled.length, 1);
+  assert.equal(stalled[0].payload.runId, "run-worker");
+});
+
+test("a stale Leader mailbox action escalates the Leader once alongside the Worker stall", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderMailboxQueuedAt: new Date(NOW.getTime() - 60 * 60_000).toISOString()
+  });
+  const delivery = { async inspectRole() { return "present"; } };
+  const first = await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  assert.deepEqual(
+    first.map(({ runId, classification }) => ({ runId, classification })).sort((a, b) => (
+      a.runId.localeCompare(b.runId)
+    )),
+    [
+      { runId: "run-1", classification: "truly-stalled" },
+      { runId: "run-worker", classification: "truly-stalled" }
+    ]
+  );
+  assert.equal(
+    store.events.filter((event) => (
+      event.type === "run.stalled" && event.payload.runId === "run-1"
+    )).length,
+    1
+  );
+
+  // The Leader escalation is one-shot for the same Run + progress point.
+  await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  assert.equal(
+    store.events.filter((event) => (
+      event.type === "run.stalled" && event.payload.runId === "run-1"
+    )).length,
+    1
+  );
+});
+
 function stallStore(options = {}) {
   const task = { id: "task-1", title: "stall", status: "active", projectBindings: [] };
   const role = {
@@ -557,9 +631,9 @@ function stallStore(options = {}) {
     ...run,
     id: "run-worker",
     roleName: "worker",
-    deliveredAt: "2026-08-05T00:40:00.000Z",
-    createdAt: "2026-08-05T00:40:00.000Z",
-    updatedAt: "2026-08-05T00:40:00.000Z",
+    deliveredAt: options.downstreamStalled ? PROGRESS : "2026-08-05T00:40:00.000Z",
+    createdAt: options.downstreamStalled ? PROGRESS : "2026-08-05T00:40:00.000Z",
+    updatedAt: options.downstreamStalled ? PROGRESS : "2026-08-05T00:40:00.000Z",
     effective: {
       agentId: downstreamRole.activeAgentId,
       adapterId: downstreamRole.adapterId
@@ -587,7 +661,17 @@ function stallStore(options = {}) {
       return this.session;
     },
     hasOpenInputRequest() { return options.openInput === true; },
-    getWorkMailbox() { return { pending: null }; },
+    getWorkMailbox(selector) {
+      if (
+        selector !== undefined
+        && selector.kind === "role"
+        && selector.roleName === "leader"
+        && options.leaderMailboxQueuedAt !== undefined
+      ) {
+        return { pending: { lastQueuedAt: options.leaderMailboxQueuedAt } };
+      }
+      return { pending: null };
+    },
     listEvents() { return this.events; },
     recordRoleRunStall(input) {
       const existing = this.events.find((event) => (
