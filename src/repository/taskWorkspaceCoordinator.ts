@@ -57,7 +57,8 @@ export class TaskWorkspaceCoordinator {
     if (existing !== null
       && existing.owner.type === "work-item"
       && existing.owner.workItemId === item.id
-      && sameProjectScope(existing, taskProjectIds, item.writeProjectIds)) return existing;
+      && sameProjectScope(existing, taskProjectIds, item.writeProjectIds)
+      && item.baseRefs === undefined) return existing;
     if (existing !== null) {
       if (existing.owner.type !== "work-item" || existing.owner.workItemId !== item.id) {
         throw new Error(`WorkItem already has another managed workspace: ${item.taskId}/${item.id}.`);
@@ -68,7 +69,8 @@ export class TaskWorkspaceCoordinator {
     if (prepared !== null
       && prepared.owner.type === "work-item"
       && prepared.owner.workItemId === item.id
-      && sameProjectScope(prepared, taskProjectIds, item.writeProjectIds)) return prepared;
+      && sameProjectScope(prepared, taskProjectIds, item.writeProjectIds)
+      && item.baseRefs === undefined) return prepared;
     if (prepared !== null) {
       if (prepared.owner.type !== "work-item" || prepared.owner.workItemId !== item.id) {
         throw new Error(`WorkItem already has another managed workspace: ${item.taskId}/${item.id}.`);

@@ -36,6 +36,17 @@ export type WorkItemDispositionInput = Readonly<{
 
 export type WorkItemWorkspaceDisposition = "integrated" | "abandoned";
 
+/**
+ * Optional base-ref overrides used only when a fresh WorkItem Develop
+ * workspace is first provisioned. The resolved commit is frozen in the
+ * managed workspace entry; this record remains a ref request, not a second
+ * capture boundary.
+ */
+export type WorkItemProjectBaseRef = Readonly<{
+  projectId: string;
+  baseRef: string;
+}>;
+
 export type CandidateGitSnapshot = Readonly<{
   schemaVersion: 1;
   reviewBaseCommit: string;
@@ -72,6 +83,8 @@ export type WorkItem = {
   acceptance: readonly string[];
   dependsOn: readonly string[];
   writeProjectIds: readonly string[];
+  /** Explicit Git refs for the initial writable WorkItem worktree. */
+  baseRefs?: readonly WorkItemProjectBaseRef[];
   revision: number;
   assignee?: string;
   status: WorkItemStatus;
@@ -100,6 +113,7 @@ export function createWorkItem(
     dependsOn?: readonly string[];
     assignee?: string;
     writeProjectIds?: readonly string[];
+    baseRefs?: readonly WorkItemProjectBaseRef[];
   }>,
   now: Date
 ): WorkItem {
@@ -116,6 +130,9 @@ export function createWorkItem(
       input.writeProjectIds ?? [],
       "Work item writable Project"
     ),
+    ...(input.baseRefs === undefined || input.baseRefs.length === 0
+      ? {}
+      : { baseRefs: normalizeProjectBaseRefs(input.baseRefs) }),
     revision: 1,
     ...(input.assignee === undefined
       ? {}
@@ -316,6 +333,13 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
   normalizedUniqueText(workItem.acceptance, "Work item acceptance criterion");
   const dependsOn = normalizedUniqueIdentities(workItem.dependsOn, "Work item dependency");
   normalizedUniqueIdentities(workItem.writeProjectIds, "Work item writable Project");
+  if (workItem.baseRefs !== undefined) {
+    const baseRefs = normalizeProjectBaseRefs(workItem.baseRefs);
+    const writableProjects = new Set(workItem.writeProjectIds);
+    if (baseRefs.some(({ projectId }) => !writableProjects.has(projectId))) {
+      throw new Error("Work Item Project base refs must target writable Projects.");
+    }
+  }
   if (dependsOn.includes(workItem.id)) {
     throw new Error("A Work Item cannot depend on itself.");
   }
@@ -559,6 +583,30 @@ function validateStatus(status: WorkItemStatus): void {
   ].includes(status)) {
     throw new Error(`Work Item status is invalid: ${String(status)}.`);
   }
+}
+
+function normalizeProjectBaseRefs(
+  baseRefs: readonly WorkItemProjectBaseRef[]
+): readonly WorkItemProjectBaseRef[] {
+  if (!Array.isArray(baseRefs)) {
+    throw new Error("Work Item Project base refs are invalid.");
+  }
+  const projectIds = new Set<string>();
+  return baseRefs.map((entry) => {
+    if (typeof entry !== "object" || entry === null) {
+      throw new Error("Work Item Project base ref is invalid.");
+    }
+    const projectId = requireIdentity(entry.projectId, "Work Item Project id");
+    if (projectIds.has(projectId)) {
+      throw new Error(`Work Item Project base ref is duplicated: ${projectId}.`);
+    }
+    projectIds.add(projectId);
+    const baseRef = requireText(entry.baseRef, "Work Item Project base ref");
+    if (baseRef.startsWith("-") || /[\r\n]/u.test(baseRef)) {
+      throw new Error("Work Item Project base ref is invalid.");
+    }
+    return { projectId, baseRef };
+  });
 }
 
 function normalizeDisposition(

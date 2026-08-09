@@ -408,8 +408,8 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "create",
         summary: "Create a work item.",
-        usage: "yui task work create <task> <title> [--project <project> ...] [--objective <text>] [--accept <criterion> ...] [--after <work> ...] [--role <name>]",
-        options: ["--project", "--objective", "--accept", "--after", "--role"]
+        usage: "yui task work create <task> <title> [--project <project> ...] [--base-ref <project>=<ref> ...] [--objective <text>] [--accept <criterion> ...] [--after <work> ...] [--role <name>]",
+        options: ["--project", "--base-ref", "--objective", "--accept", "--after", "--role"]
       },
       { name: "list", summary: "List work items for a Task.", usage: "yui task work list <task>" },
       { name: "show", summary: "Show one Work Item.", usage: "yui task work show <work>" },
