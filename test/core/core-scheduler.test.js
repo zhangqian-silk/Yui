@@ -233,7 +233,8 @@ test("Leader wakeup directs the Agent to CLI context without embedding records",
 
   const input = store.savedDispatches[0].run.input;
   assert.match(input, /yui task context task-1/);
-  assert.match(input, /yui project knowledge list/);
+  assert.match(input, /This Task has no bound Project Policy/);
+  assert.doesNotMatch(input, /yui project knowledge list/);
   assert.doesNotMatch(input, /Restore useful task knowledge/);
   assert.doesNotMatch(input, /Keep the runtime lean/);
   assert.doesNotMatch(input, /Decision 1: Reason 1/);
