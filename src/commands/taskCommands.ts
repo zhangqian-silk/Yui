@@ -2052,7 +2052,7 @@ function acceptWork(
       throw usageError("A ReviewRound evidence commit cannot be used for WorkItem acceptance.");
     }
     const candidate = requireWorkItemCandidate(item);
-    const latestReview = chronologicalReviewRounds(tx.listReviewRounds(item.taskId)
+    const latestReview = reviewRoundsByIdentity(tx.listReviewRounds(item.taskId)
       .filter((round) => round.workItemId === item.id
         && round.candidateId === candidate.id)).at(-1);
     if (latestReview !== undefined
@@ -2179,7 +2179,7 @@ function prepareFinalTaskReview(
   if (config?.trigger !== "final" || task.projectBindings.length === 0) return null;
 
   const taskCandidate = latestTaskReviewCandidate(store, task);
-  const latest = chronologicalReviewRounds(store.listReviewRounds(task.id))
+  const latest = reviewRoundsByIdentity(store.listReviewRounds(task.id))
     .filter((round) => (round.scope ?? "work-item") === "task")
     .at(-1);
   if (latest !== undefined && (latest.status === "pending" || latest.status === "running")) {
@@ -2495,7 +2495,7 @@ function reviewWork(
     if (config === undefined) {
       throw usageError(`Candidate has no review policy: ${candidate.id}.`);
     }
-    const activeRound = chronologicalReviewRounds(tx.listReviewRounds(task.id)
+    const activeRound = reviewRoundsByIdentity(tx.listReviewRounds(task.id)
       .filter((round) => (
         round.workItemId === item.id
         && round.candidateId === candidate.id
@@ -2535,7 +2535,7 @@ function taskRunCommand(
 ): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "list") return output(listRuns(rest, store, options));
-  if (command === "retry") return output(retryRun(rest, store, options));
+  if (command === "retry") return retryRun(rest, store, options);
   if (command === "recover") return output(recoverRun(rest, store, options));
   if (command === "yield") return yieldRun(rest, store, options);
   if (command === "checkpoint") return output(checkpointRun(rest, store, options));
@@ -2585,7 +2585,7 @@ function retryRun(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
-): string {
+): TaskCommandExecution {
   exactPositionals(args, 1, "Task run retry usage: yui task run retry <task>/<run>.");
   const now = clock(options);
   const retried = store.transaction((tx) => {
@@ -2594,9 +2594,75 @@ function retryRun(
       throw usageError(`Run ${previous.id} is not retryable from ${previous.status}.`);
     }
     if (previous.purpose === "review") {
-      throw usageError(
-        `Review Run ${previous.id} is not retried directly; request a new WorkItem review.`
+      const task = requireTask(tx, previous.taskId);
+      if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
+      if (taskActor(options, task.id) !== "leader") {
+        throw usageError("Only the Task Leader may retry a final Review Run.");
+      }
+      const previousRound = previous.reviewRoundId === undefined
+        ? null
+        : tx.getReviewRound(task.id, previous.reviewRoundId);
+      if (previousRound === null
+        || (previousRound.scope ?? "work-item") !== "task") {
+        throw usageError(
+          `Review Run ${previous.id} is not retried directly; request a new WorkItem review.`
+        );
+      }
+      if (
+        previousRound.status !== "failed"
+        || previousRound.reviewerRunId !== previous.id
+        || previousRound.reviewerRoleName !== previous.roleName
+        || previousRound.workItemId !== previous.workItemId
+        || previousRound.taskCandidate === undefined
+      ) {
+        throw dataError(
+          `Final Review Run identity does not match its failed ReviewRound: ${previous.id}.`
+        );
+      }
+      const item = tx.getWorkItem(task.id, previousRound.workItemId);
+      if (item === null
+        || !item.candidates.some(({ id }) => id === previousRound.candidateId)) {
+        throw dataError(
+          `Final Review candidate is no longer available: ${previousRound.candidateId}.`
+        );
+      }
+      // ReviewRound ids are Task-local monotonic identities. Use that durable
+      // order for retry causality so a wall-clock rollback cannot create a
+      // second retry Round for the same exact failed Run.
+      const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id)
+        .filter((round) => (round.scope ?? "work-item") === "task"));
+      const previousIndex = taskRounds.findIndex(({ id }) => id === previousRound.id);
+      if (previousIndex < 0) {
+        throw dataError(`Final ReviewRound is not in Task history: ${previousRound.id}.`);
+      }
+      const laterRound = taskRounds.slice(previousIndex + 1).at(-1);
+      if (laterRound !== undefined) {
+        if (!isSameTaskReviewCandidate(
+          laterRound.taskCandidate,
+          previousRound.taskCandidate
+        )) {
+          throw usageError(
+            `A newer final Task candidate already has ReviewRound ${laterRound.id}.`
+          );
+        }
+        return { kind: "review" as const, round: laterRound, created: false };
+      }
+      const role = requireRole(tx, task.id, previous.roleName);
+      if (tx.getActiveAgentRun(task.id, role.name) !== null) {
+        throw usageError(`${task.id}/${role.name} already has an active run.`);
+      }
+      const round = createTaskReviewRound(
+        tx.nextReviewRoundId(task.id),
+        task.id,
+        previousRound.workItemId,
+        previousRound.candidateId,
+        previousRound.reviewerRoleName,
+        "leader",
+        previousRound.taskCandidate,
+        now
       );
+      tx.saveReviewRound(task.id, round);
+      return { kind: "review" as const, round, created: true };
     }
     const task = requireTask(tx, previous.taskId);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
@@ -2663,10 +2729,24 @@ function retryRun(
       ...runLaunchEventPayload(created),
       previousRunId: previous.id
     }, now);
-    return created;
+    return { kind: "run" as const, run: created };
   });
-  notifyMailbox(options.runtime, roleMailbox(retried.taskId, retried.roleName), retried.taskId);
-  return `Retry queued as ${retried.id} for ${retried.taskId}/${retried.roleName}\n`;
+  if (retried.kind === "review") {
+    return output(
+      retried.created
+        ? `Review retry requested as ${retried.round.id}\n`
+        : `Review retry already requested as ${retried.round.id} (${retried.round.status})\n`,
+      { reviewRound: retried.round }
+    );
+  }
+  notifyMailbox(
+    options.runtime,
+    roleMailbox(retried.run.taskId, retried.run.roleName),
+    retried.run.taskId
+  );
+  return output(
+    `Retry queued as ${retried.run.id} for ${retried.run.taskId}/${retried.run.roleName}\n`
+  );
 }
 
 /**
@@ -3247,10 +3327,10 @@ function requireWorkItemCandidate(item: WorkItem): WorkItemCandidate {
   return candidate;
 }
 
-function chronologicalReviewRounds(rounds: ReviewRound[]): ReviewRound[] {
+/** ReviewRound ids are the durable Task-local creation order; wall time is not causal. */
+function reviewRoundsByIdentity(rounds: ReviewRound[]): ReviewRound[] {
   return [...rounds].sort((left, right) => (
-    left.createdAt.localeCompare(right.createdAt)
-      || left.id.localeCompare(right.id, undefined, {numeric: true})
+    left.id.localeCompare(right.id, undefined, { numeric: true })
   ));
 }
 
@@ -3259,7 +3339,7 @@ function activeReviewRoundForCandidate(
   item: WorkItem,
   candidate: WorkItemCandidate
 ): ReviewRound | undefined {
-  return chronologicalReviewRounds(store.listReviewRounds(item.taskId)
+  return reviewRoundsByIdentity(store.listReviewRounds(item.taskId)
     .filter((round) => round.workItemId === item.id
       && round.candidateId === candidate.id
       && (round.status === "pending" || round.status === "running")))

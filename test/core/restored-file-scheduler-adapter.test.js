@@ -20,6 +20,7 @@ import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import {
   attachReviewRoundWorkspace,
   createReviewRound,
+  createTaskReviewRound,
   startReviewRound
 } from "../../dist/review/reviewRound.js";
 import {
@@ -154,7 +155,12 @@ function createAgentRun(adapterOrRunId, ...args) {
 
 function preparedDeliveryFailureFixture(
   t,
-  { roleName = "worker", purpose = "execution" } = {}
+  {
+    roleName = "worker",
+    purpose = "execution",
+    prepare = true,
+    reviewScope = "work-item"
+  } = {}
 ) {
   const fx = fixture(t);
   const { home, store, task, now, adapter } = fx;
@@ -190,16 +196,30 @@ function preparedDeliveryFailureFixture(
       source: { type: "direct" }
     }, now);
     const reviewBaseCommit = "b".repeat(40);
-    const pendingRound = createReviewRound(
-      "review-round-1",
-      task.id,
-      item.id,
-      item.candidates[0].id,
-      roleName,
-      "leader",
-      reviewBaseCommit,
-      now
-    );
+    const pendingRound = reviewScope === "task"
+      ? createTaskReviewRound(
+          "review-round-1",
+          task.id,
+          item.id,
+          item.candidates[0].id,
+          roleName,
+          "policy",
+          {
+            schemaVersion: 1,
+            projects: [{ projectId: "project-1", commit: reviewBaseCommit }]
+          },
+          now
+        )
+      : createReviewRound(
+          "review-round-1",
+          task.id,
+          item.id,
+          item.candidates[0].id,
+          roleName,
+          "leader",
+          reviewBaseCommit,
+          now
+        );
     const reviewWorkspace = createManagedWorkspace({
       owner: { type: "review-round", taskId: task.id, reviewRoundId: pendingRound.id },
       root: join(home, "reviews", pendingRound.id),
@@ -258,6 +278,9 @@ function preparedDeliveryFailureFixture(
       { type: "run", taskId: task.id, id: run.id }
     ]);
   });
+  if (!prepare) {
+    return { ...fx, role, run, item, round, target };
+  }
   const mailboxBatchId = `agent-run:${task.id}/${run.id}`;
   const claim = adapter.claimWorkMailbox({
     target,
@@ -304,6 +327,138 @@ function preparedDeliveryFailureFixture(
     }
   };
 }
+
+test("final Reviewer launch failure atomically fails its started ReviewRound before Session creation", async (t) => {
+  const fx = preparedDeliveryFailureFixture(t, {
+    roleName: "reviewer",
+    purpose: "review",
+    prepare: false,
+    reviewScope: "task"
+  });
+  const forgotten = [];
+  const delivery = {
+    async prepareRoleSession() {
+      fx.store.transaction((tx) => {
+        enqueueWork(tx, fx.target, "newer-review-signal", fx.now, [
+          { type: "work-item", taskId: fx.task.id, id: fx.item.id }
+        ]);
+      });
+      throw new Error("provider launch failed before Session creation");
+    },
+    async waitUntilReady() { throw new Error("unreachable"); },
+    async sendOnce() { throw new Error("unreachable"); },
+    forgetPrepared(input) { forgotten.push(input); }
+  };
+
+  assert.equal(fx.store.getRoleSession(fx.task.id, fx.role.name), null);
+  const [result] = await processActiveRoleRunDeliveries(
+    fx.adapter,
+    delivery,
+    fx.now
+  );
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.reason, "launch-failed");
+  assert.equal(result.terminalized, true);
+  assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).status, "failed");
+  assert.equal(fx.store.getReviewRound(fx.task.id, fx.round.id).status, "failed");
+  assert.equal(fx.store.getActiveAgentRun(fx.task.id, fx.role.name), null);
+  assert.equal(
+    fx.store.getWorkMailbox(fx.target).processing,
+    null
+  );
+  assert.deepEqual(
+    fx.store.getWorkMailbox(fx.target).pending.reasons,
+    ["newer-review-signal"]
+  );
+  assert.ok(
+    fx.store.getPendingWakeup(fx.task.id).reasons.includes("review-failed")
+  );
+  assert.equal(fx.store.getRoleSession(fx.task.id, fx.role.name), null);
+  assert.deepEqual(forgotten, [{
+    taskId: fx.task.id,
+    roleName: fx.role.name,
+    runId: fx.run.id
+  }]);
+});
+
+test("Reviewer launch failure fails closed when its ReviewRound identity snapshot mismatches", (t) => {
+  const fx = preparedDeliveryFailureFixture(t, {
+    roleName: "reviewer",
+    purpose: "review",
+    prepare: false,
+    reviewScope: "task"
+  });
+  const batchId = `agent-run:${fx.task.id}/${fx.run.id}`;
+  const claim = fx.adapter.claimWorkMailbox({
+    target: fx.target,
+    batchId,
+    owner: "controller",
+    now: fx.now,
+    executionRef: { type: "run", taskId: fx.task.id, id: fx.run.id }
+  });
+  assert.notEqual(claim.status, "empty");
+  const beforeRound = structuredClone(
+    fx.store.getReviewRound(fx.task.id, fx.round.id)
+  );
+
+  assert.equal(fx.adapter.saveExitedRoleRun({
+    task: fx.adapter.getTask(fx.task.id),
+    role: fx.adapter.getRole(fx.task.id, fx.role.name),
+    run: { ...fx.run, reviewRoundId: "review-round-99" },
+    session: null,
+    summary: "stale launch failure",
+    now: fx.now
+  }), "state-changed");
+
+  assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).status, "active");
+  assert.equal(
+    fx.store.getActiveAgentRun(fx.task.id, fx.role.name).id,
+    fx.run.id
+  );
+  assert.deepEqual(
+    fx.store.getReviewRound(fx.task.id, fx.round.id),
+    beforeRound
+  );
+  assert.deepEqual(
+    fx.store.getWorkMailbox(fx.target).processing.executionRef,
+    { type: "run", taskId: fx.task.id, id: fx.run.id }
+  );
+  assert.equal(
+    fx.store.getPendingWakeup(fx.task.id).reasons.includes("review-failed"),
+    false
+  );
+});
+
+test("WorkItem Review Run retry keeps the legacy explicit new-review boundary", async (t) => {
+  const fx = preparedDeliveryFailureFixture(t, {
+    roleName: "reviewer",
+    purpose: "review",
+    prepare: false
+  });
+  await processActiveRoleRunDeliveries(fx.adapter, {
+    async prepareRoleSession() { throw new Error("reviewer launch failed"); },
+    async waitUntilReady() { throw new Error("unreachable"); },
+    async sendOnce() { throw new Error("unreachable"); }
+  }, fx.now);
+
+  assert.throws(
+    () => runTaskCommand(
+      ["run", "retry", fx.run.id],
+      fx.store,
+      {
+        now: () => fx.now,
+        environment: {
+          YUI_SESSION_SCOPE: "task",
+          YUI_TASK_ID: fx.task.id,
+          YUI_ROLE: "leader"
+        }
+      }
+    ),
+    /request a new WorkItem review/
+  );
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
+});
 
 test("FileSchedulerStoreAdapter commits Leader run, Role and fixed session together", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);

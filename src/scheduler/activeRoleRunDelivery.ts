@@ -275,7 +275,8 @@ export async function processActiveRoleRunDeliveries(
             runId: run.id,
             status: "failed",
             reason: "launch-failed",
-            error: persisted === "state-changed" ? "Run state changed during launch failure." : message
+            error: persisted === "state-changed" ? "Run state changed during launch failure." : message,
+            terminalized: persisted === "failed"
           });
           continue;
         }

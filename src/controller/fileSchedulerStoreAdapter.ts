@@ -1123,6 +1123,42 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       ) {
         return "state-changed";
       }
+      if (currentRun.purpose === "review") {
+        if (
+          input.run.taskId !== currentRun.taskId
+          || input.run.roleName !== currentRun.roleName
+          || input.run.purpose !== "review"
+          || input.run.reviewRoundId !== currentRun.reviewRoundId
+          || input.run.workItemId !== currentRun.workItemId
+          || input.run.effective.agentId !== currentRun.effective.agentId
+          || input.run.effective.adapterId !== currentRun.effective.adapterId
+        ) {
+          return "state-changed";
+        }
+        const terminal = terminalizeExactTaskRun(store, {
+          taskId: task.id,
+          roleName: role.name,
+          agentId: currentRun.effective.agentId,
+          runId: currentRun.id,
+          receiptId: formatAgentRunReceiptId(task.id, currentRun.id),
+          ...(input.session?.nativeSessionId === undefined
+            ? {}
+            : { nativeSessionId: input.session.nativeSessionId }),
+          outcome: { status: "failed", summary: input.summary }
+        }, input.now);
+        if (terminal.disposition !== "applied") return "state-changed";
+        clearMatchingLeaderStallAttention(store, task.id, currentRun.id);
+        store.saveRole(task.id, updateRoleStatus(role, "exited", input.now));
+        stopTaskSessionIfPresent(
+          store,
+          task.id,
+          role.name,
+          currentRun.effective.agentId,
+          input.now
+        );
+        queueLeaderWakeup(store, task.id, "review-failed", input.now);
+        return "failed";
+      }
       store.saveAgentRun(failAgentRun(currentRun, input.summary, input.now));
       clearMatchingLeaderStallAttention(store, task.id, currentRun.id);
       store.clearActiveAgentRun(task.id, role.name);
@@ -1148,9 +1184,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       queueLeaderWakeup(
         store,
         task.id,
-        currentRun.purpose === "review"
-          ? "review-failed"
-          : role.name === "leader" ? "leader-run-failed" : "role-run-failed",
+        role.name === "leader" ? "leader-run-failed" : "role-run-failed",
         input.now
       );
       return "failed";

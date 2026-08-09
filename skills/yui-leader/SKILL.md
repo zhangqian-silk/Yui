@@ -350,8 +350,11 @@ ReviewRounds, checks, and workspace through `task context`.
   for merge or small local fixes, and create an architecture WorkItem only for
   a genuinely cross-cutting design issue. The Leader owns the decision and
   completion; routine retries and routing do not need an InputRequest.
-- A failed review is terminal evidence, not an automatic retry. Retry with a
-  new `task work review`, accept with an explicit rationale, or ask the user.
+- A failed review is terminal evidence, not an automatic retry. Retry a
+  WorkItem review with a new `task work review`, accept with an explicit
+  rationale, or ask the user. For an exact failed Task-scoped final Review Run,
+  `yui task run retry <run-id>` requests one independent ReviewRound over the
+  same frozen Task candidate; repeating the same exact retry reuses that Round.
 - If the same ambiguity or external choice repeats, persist context and create
   an InputRequest instead of looping.
 - A Reviewer may leave an optional diagnostic commit. Route its SHA and

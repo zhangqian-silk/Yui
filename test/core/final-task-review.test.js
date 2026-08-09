@@ -5,14 +5,23 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
+import {
+  dispatchPreparedReviewRound,
+  runTaskCommand
+} from "../../dist/commands/taskCommands.js";
 import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
 import { createIntegrationAttempt, updateIntegrationAttempt } from "../../dist/integration/integrationAttempt.js";
+import { terminalizeExactTaskRun } from "../../dist/lifecycle/exactRunTerminalization.js";
 import { createProject } from "../../dist/repository/project.js";
 import { createGlobalRole, createRoleAgentBinding } from "../../dist/role/role.js";
-import { finishReviewRound } from "../../dist/review/reviewRound.js";
-import { runTaskCommand } from "../../dist/commands/taskCommands.js";
+import {
+  attachReviewRoundWorkspace,
+  finishReviewRound
+} from "../../dist/review/reviewRound.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
+import { formatAgentRunReceiptId } from "../../dist/task/taskRecordReference.js";
+import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 import { submitWorkItemCandidate, updateWorkItemStatus } from "../../dist/workItem/workItem.js";
 
 const NOW = new Date("2026-08-08T00:00:00.000Z");
@@ -96,7 +105,55 @@ function fixture(t) {
       ));
     }
   });
-  return { store, task, item, leaderOptions };
+  return { root, store, task, item, leaderOptions };
+}
+
+function dispatchFinalReview(fx, round) {
+  const bindings = new Map(fx.task.projectBindings.map((binding) => (
+    [binding.projectId, binding]
+  )));
+  const workspaceRoot = join(fx.root, "reviews", round.id);
+  const workspace = createManagedWorkspace({
+    owner: { type: "review-round", taskId: fx.task.id, reviewRoundId: round.id },
+    root: workspaceRoot,
+    entries: round.taskCandidate.projects.map(({ projectId, commit }, index) => ({
+      projectId,
+      directory: bindings.get(projectId).directory,
+      access: "write",
+      path: join(workspaceRoot, bindings.get(projectId).directory),
+      branch: `yui/${fx.task.id}/${round.id}-${index + 1}`,
+      baseRef: commit,
+      baseCommit: commit
+    }))
+  }, NOW);
+  fx.store.transaction((tx) => {
+    tx.saveManagedWorkspace(workspace);
+    tx.saveReviewRound(
+      fx.task.id,
+      attachReviewRoundWorkspace(round, workspace)
+    );
+  });
+  return dispatchPreparedReviewRound(
+    fx.task.id,
+    round.id,
+    fx.store,
+    fx.leaderOptions
+  );
+}
+
+function finishFinalReviewRun(fx, run, status, summary, reviewResult = undefined) {
+  fx.store.transaction((tx) => {
+    const result = terminalizeExactTaskRun(tx, {
+      taskId: fx.task.id,
+      roleName: run.roleName,
+      agentId: run.effective.agentId,
+      runId: run.id,
+      receiptId: formatAgentRunReceiptId(fx.task.id, run.id),
+      outcome: { status, summary },
+      ...(reviewResult === undefined ? {} : { reviewResult })
+    }, NOW);
+    assert.equal(result.disposition, "applied");
+  });
 }
 
 test("final policy queues one Task Review over all committed Project heads", (t) => {
@@ -175,4 +232,101 @@ test("an unchanged failed final ReviewRound does not duplicate or unblock comple
   assert.match(second.output, /Final Task Review is blocked/);
   assert.equal(store.listReviewRounds(task.id).length, 1);
   assert.equal(store.getTask(task.id).status, "active");
+});
+
+test("retrying an exact failed final Review Run creates one independent Round for the unchanged candidate", (t) => {
+  const fx = fixture(t);
+  runTaskCommand(
+    ["complete", fx.task.id, "--summary", "request final review"],
+    fx.store,
+    fx.leaderOptions
+  );
+  const firstRound = fx.store.listReviewRounds(fx.task.id)[0];
+  const firstRun = dispatchFinalReview(fx, firstRound);
+  finishFinalReviewRun(
+    fx,
+    firstRun,
+    "failed",
+    "material review finding",
+    {
+      report: "The frozen candidate needs explicit Leader disposition.",
+      checks: [{ name: "focused review", outcome: "failed" }],
+      evidenceCommit: "f".repeat(40)
+    }
+  );
+  const frozenFailedRound = structuredClone(
+    fx.store.getReviewRound(fx.task.id, firstRound.id)
+  );
+  const frozenFailedWorkspace = structuredClone(
+    fx.store.getReviewRoundWorkspace(fx.task.id, firstRound.id)
+  );
+  const retryOptions = {
+    ...fx.leaderOptions,
+    now: () => new Date(NOW.getTime() - 1_000)
+  };
+
+  const retried = runTaskCommand(
+    ["run", "retry", firstRun.id],
+    fx.store,
+    retryOptions
+  );
+
+  assert.equal(retried.kind, "output");
+  assert.match(retried.output, /Review retry requested/);
+  const rounds = fx.store.listReviewRounds(fx.task.id);
+  assert.equal(rounds.length, 2);
+  const retryRound = rounds[1];
+  assert.equal(retryRound.status, "pending");
+  assert.notEqual(retryRound.id, firstRound.id);
+  assert.equal(retryRound.requestedBy, "leader");
+  assert.deepEqual(retryRound.taskCandidate, firstRound.taskCandidate);
+  assert.equal(retryRound.workspace, undefined);
+  assert.deepEqual(
+    fx.store.getReviewRound(fx.task.id, firstRound.id),
+    frozenFailedRound
+  );
+  assert.deepEqual(
+    fx.store.getReviewRoundWorkspace(fx.task.id, firstRound.id),
+    frozenFailedWorkspace
+  );
+
+  const repeated = runTaskCommand(
+    ["run", "retry", firstRun.id],
+    fx.store,
+    retryOptions
+  );
+  assert.equal(repeated.kind, "output");
+  assert.equal(repeated.data.reviewRound.id, retryRound.id);
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 2);
+
+  const retryRun = dispatchFinalReview(fx, retryRound);
+  const runningRetryRound = fx.store.getReviewRound(fx.task.id, retryRound.id);
+  assert.notEqual(runningRetryRound.workspace.root, frozenFailedRound.workspace.root);
+  assert.deepEqual(runningRetryRound.workspace.owner, {
+    type: "review-round",
+    taskId: fx.task.id,
+    reviewRoundId: retryRound.id
+  });
+  const repeatedAfterDispatch = runTaskCommand(
+    ["run", "retry", firstRun.id],
+    fx.store,
+    retryOptions
+  );
+  assert.equal(repeatedAfterDispatch.kind, "output");
+  assert.equal(repeatedAfterDispatch.data.reviewRound.id, retryRound.id);
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 2);
+  finishFinalReviewRun(fx, retryRun, "yielded", "final review passed");
+  assert.equal(fx.store.getTask(fx.task.id).status, "active");
+  const completed = runTaskCommand(
+    ["complete", fx.task.id, "--summary", "final review accepted"],
+    fx.store,
+    fx.leaderOptions
+  );
+  assert.equal(completed.kind, "output");
+  assert.match(completed.output, /Completed task/);
+  assert.equal(fx.store.getTask(fx.task.id).status, "completed");
+  assert.deepEqual(
+    fx.store.getReviewRound(fx.task.id, firstRound.id),
+    frozenFailedRound
+  );
 });

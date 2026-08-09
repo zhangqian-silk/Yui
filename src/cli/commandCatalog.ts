@@ -495,7 +495,11 @@ const taskChildren: readonly NodeInput[] = [
     sections: [{ id: "manage", title: "Commands", entries: ["list", "retry", "recover", "yield", "checkpoint"] }],
     children: [
       { name: "list", summary: "List Runs for a work item.", usage: "yui task run list <task>/<work>" },
-      { name: "retry", summary: "Retry a failed Run.", usage: "yui task run retry <task>/<run>" },
+      {
+        name: "retry",
+        summary: "Retry a failed execution Run or request a fresh Round for an exact failed final Review Run.",
+        usage: "yui task run retry <task>/<run>"
+      },
       {
         name: "recover",
         summary: "Record one exact Leader-controlled Run recovery decision.",
