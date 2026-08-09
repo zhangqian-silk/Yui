@@ -47,6 +47,10 @@ import {
   type RuntimeRoleOwner
 } from "../runtime/lifecycleReservation.js";
 import type { SessionHostPort } from "../runtime/ports.js";
+import type {
+  TaskRuntimeCleanupReason,
+  TaskRuntimeLifecycleCleanupPort
+} from "../runtime/taskRuntimeIsolation.js";
 import { formatTaskRecordReference } from "../task/taskRecordReference.js";
 import type { RuntimeEventProcessorPort } from "./runtimeEventProcessor.js";
 import type { EphemeralDomainIdentity } from "./domainIdentity.js";
@@ -63,7 +67,7 @@ class RuntimeEventApplyError extends AggregateError {}
 type RuntimeLifecycleHost = Pick<
   SessionHostPort,
   "inspectOwner" | "inspectOwners" | "stopOwner"
->;
+> & Partial<TaskRuntimeLifecycleCleanupPort>;
 
 type RoleRunDeliveryFailureIdentity = Omit<
   RoleRunDeliveryFailurePersistence,
@@ -296,6 +300,36 @@ async function processSelectedRoleRuntimeCleanups(
           throw new Error(
             `Role runtime cleanup could not confirm the host stopped: ${runtimeOwnerLabel(owner)}.`
           );
+        }
+        if (target.kind === "role-runtime") {
+          const session = store.getRoleSession(target.taskId, target.roleName);
+          const reservedLaunchId = isRuntimeLaunchReservation(mailbox.processing)
+            ? mailbox.processing!.batchId
+            : undefined;
+          if (
+            reservedLaunchId !== undefined
+            && session?.launchId !== undefined
+            && reservedLaunchId !== session.launchId
+          ) {
+            throw new Error(
+              `Task runtime cleanup launch identity is ambiguous: ${target.taskId}.`
+            );
+          }
+          const launchId = reservedLaunchId ?? session?.launchId;
+          if (
+            launchId !== undefined
+            && lifecycleHost.cleanupTaskLaunch !== undefined
+          ) {
+            const task = store.getTask(target.taskId);
+            const reason: TaskRuntimeCleanupReason = task?.status === "completed"
+              ? "completion"
+              : "interruption";
+            lifecycleHost.cleanupTaskLaunch({
+              taskId: target.taskId,
+              launchId,
+              reason
+            });
+          }
         }
         if (
           store.completeRuntimeCleanup === undefined

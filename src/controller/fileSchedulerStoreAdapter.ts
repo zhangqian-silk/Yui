@@ -3139,6 +3139,7 @@ function mapRole(
     ...(binding.config.effort === undefined ? {} : { effort: binding.config.effort }),
     effective,
     workspace: role.workspace,
+    ...(workspace === undefined ? {} : { managedWorkspace: workspace }),
     status: role.status
   };
 }

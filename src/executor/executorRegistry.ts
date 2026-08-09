@@ -23,6 +23,11 @@ import {
   type SessionHostPort
 } from "../runtime/index.js";
 import type { EffectiveLaunchSnapshot } from "./effectiveLaunch.js";
+import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
+import type {
+  TaskRuntimeIsolationDescriptor,
+  TaskRuntimeLaunchPolicy
+} from "../runtime/taskRuntimeIsolation.js";
 
 export type PlannedRoleSession = Readonly<{
   role: TmuxRole;
@@ -40,6 +45,7 @@ export interface RoleLaunchPlanner {
     mode: RoleSessionLaunchMode;
     runId?: string;
     nativeSessionId?: string;
+    runtimeIsolation?: TaskRuntimeIsolationDescriptor;
   }>): PlannedRoleSession;
 }
 
@@ -123,6 +129,8 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     adapterId: string;
     effective: EffectiveLaunchSnapshot;
     workspace: string;
+    managedWorkspace?: ManagedWorkspace;
+    runtimePolicy?: TaskRuntimeLaunchPolicy;
     mode: RoleSessionLaunchMode;
     runId?: string;
     nativeSessionId?: string;
@@ -160,6 +168,12 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
         adapterId: input.adapterId,
         effective: input.effective,
         workspace: input.workspace,
+        ...(input.managedWorkspace === undefined
+          ? {}
+          : { managedWorkspace: input.managedWorkspace }),
+        ...(input.runtimePolicy === undefined
+          ? {}
+          : { runtimePolicy: input.runtimePolicy }),
         ...(input.runId === undefined ? {} : { runId: input.runId })
       } as const;
       if (this.runtimePorts.launchCoordinator !== undefined) {

@@ -22,6 +22,7 @@ import type {
 } from "./ports.js";
 import { requireSafeIdentity } from "./validation.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
+import type { TaskRuntimeIsolationDescriptor } from "./taskRuntimeIsolation.js";
 
 export type RuntimeTmuxRole = Readonly<{
   name: string;
@@ -53,6 +54,7 @@ export interface RuntimeRoleLaunchPlannerPort {
     runId?: string;
     nativeSessionId?: string;
     launchId?: string;
+    runtimeIsolation?: TaskRuntimeIsolationDescriptor;
     environment?: Readonly<Record<string, string>>;
   }>): RuntimePlannedSession;
   planGlobalRole(input: Readonly<{
@@ -321,6 +323,9 @@ export class TmuxSessionHost implements SessionHostPort {
       launchId: request.launchId,
       mode: request.mode,
       ...(request.runId === undefined ? {} : { runId: request.runId }),
+      ...(request.runtimeIsolation === undefined
+        ? {}
+        : { runtimeIsolation: request.runtimeIsolation }),
       ...(request.environment === undefined
         ? {}
         : { environment: request.environment }),

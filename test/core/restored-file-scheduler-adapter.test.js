@@ -2169,6 +2169,7 @@ test("Task completion queues exact runtime cleanup without a completed-task wake
   assert.equal(store.getRoleSession(task.id, role.name).launchId, launchId);
 
   const owners = [];
+  const runtimeCleanups = [];
   await runControllerSchedulerPass(
     adapter,
     {
@@ -2188,6 +2189,10 @@ test("Task completion queues exact runtime cleanup without a completed-task wake
       async stopOwner(owner) {
         owners.push(owner);
         return true;
+      },
+      cleanupTaskLaunch(input) {
+        runtimeCleanups.push(input);
+        return "absent";
       }
     }
   );
@@ -2196,6 +2201,11 @@ test("Task completion queues exact runtime cleanup without a completed-task wake
     scope: "task",
     taskId: task.id,
     roleName: role.name
+  }]);
+  assert.deepEqual(runtimeCleanups, [{
+    taskId: task.id,
+    launchId,
+    reason: "completion"
   }]);
   const stopped = store.getRoleSession(task.id, role.name);
   assert.equal(stopped.status, "stopped");

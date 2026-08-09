@@ -1,6 +1,8 @@
 import { reconciliationIntervalMilliseconds } from "../config/yuiConfig.js";
 import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { controllerSocketPath } from "../core/controllerEndpoint.js";
 import type { ControllerDispatcher } from "../core/controllerServer.js";
 import type { JsonValue } from "../core/protocol.js";
 import { type GlobalRole, type Role } from "../role/role.js";
@@ -36,13 +38,16 @@ import {
   type TaskWorkspacePreparer
 } from "../repository/taskWorkspacePreparer.js";
 import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
-import { TmuxManager } from "../tmux/tmuxManager.js";
+import { TmuxManager, yuiTmuxServerName } from "../tmux/tmuxManager.js";
 import {
+  FileTaskRuntimeIsolation,
   TmuxPromptPushAdapter,
   TmuxSessionHost,
   type ActivePromptPushPort,
   type AgentEnvironmentRefreshPort,
   type RuntimeLaunchPreparationPort,
+  type TaskRuntimeIsolationPort,
+  type TaskRuntimeLifecycleCleanupPort,
   type SessionHostPort
 } from "../runtime/index.js";
 import {
@@ -74,6 +79,7 @@ export type FileTaskControllerFactoryOptions = ControllerRuntimeOptions & Readon
   dispatcher?: ControllerDispatcher;
   environment?: NodeJS.ProcessEnv;
   workspacePreparer?: TaskWorkspacePreparer;
+  runtimeIsolation?: TaskRuntimeIsolationPort & Partial<TaskRuntimeLifecycleCleanupPort>;
 }>;
 
 export type RunningFileTaskControllerRuntime = RunningFileTaskController & Readonly<{
@@ -84,6 +90,7 @@ export type RunningFileTaskControllerRuntime = RunningFileTaskController & Reado
   delivery: ExecutorRegistry;
   sessionHost: SessionHostPort;
   promptPush: ActivePromptPushPort;
+  runtimeIsolation: TaskRuntimeIsolationPort & Partial<TaskRuntimeLifecycleCleanupPort>;
   workspacePreparer: TaskWorkspacePreparer;
 }>;
 
@@ -120,6 +127,42 @@ export async function startFileTaskControllerRuntime(
   const sessionHost = options.sessionHost ?? new TmuxSessionHost(planner, tmux);
   const promptPush = options.promptPush
     ?? new TmuxPromptPushAdapter(tmux, agentProcessReadinessProbe);
+  const runtimeIsolation = options.runtimeIsolation
+    ?? new FileTaskRuntimeIsolation({
+      // A sibling of the exact control Home keeps provider data/cache/tmp out
+      // of both the shared control plane and every managed Git workspace.
+      runtimeRoot: `${resolve(home)}.task-runtimes`,
+      controlPlane: {
+        yuiHome: home,
+        controllerSocketPath: controllerSocketPath(home),
+        tmuxNamespace: yuiTmuxServerName(home),
+        globalInstallPaths: [process.execPath]
+      }
+    });
+  const lifecycleHost = {
+    inspectOwner: (owner: Parameters<SessionHostPort["inspectOwner"]>[0]) => (
+      sessionHost.inspectOwner(owner)
+    ),
+    ...(sessionHost.inspectOwners === undefined
+      ? {}
+      : {
+          inspectOwners: (
+            owners: Parameters<NonNullable<SessionHostPort["inspectOwners"]>>[0]
+          ) => sessionHost.inspectOwners!(owners)
+        }),
+    stopOwner: (owner: Parameters<SessionHostPort["stopOwner"]>[0]) => (
+      sessionHost.stopOwner(owner)
+    ),
+    ...(runtimeIsolation.cleanupTaskLaunch === undefined
+      ? {}
+      : {
+          cleanupTaskLaunch: (
+            input: Parameters<NonNullable<
+              TaskRuntimeLifecycleCleanupPort["cleanupTaskLaunch"]
+            >>[0]
+          ) => runtimeIsolation.cleanupTaskLaunch!(input)
+        })
+  };
   let runningRuntime: RunningFileTaskController["runtime"] | undefined;
   let runningController: RunningFileTaskController | undefined;
   const signalRuntimeCleanup = (target: RuntimeLifecycleTarget) => {
@@ -144,7 +187,8 @@ export async function startFileTaskControllerRuntime(
       launchFingerprint: (request) => (
         runtimeLaunchFingerprint(store, request)
       ),
-      onCleanupRequired: signalRuntimeCleanup
+      onCleanupRequired: signalRuntimeCleanup,
+      runtimeIsolation
     }
   );
   const delivery = options.delivery ?? new ExecutorRegistry(
@@ -188,7 +232,7 @@ export async function startFileTaskControllerRuntime(
       deliveryRetryLimit: options.deliveryRetryLimit,
       now: options.now,
       onError: options.onError,
-      lifecycleHost: sessionHost,
+      lifecycleHost,
       ...(resourceReaper === undefined ? {} : { resourceReaper }),
       onExpiredEphemeralDomain: (domain) => {
         if (domain.yuiHome !== home) return;
@@ -230,6 +274,7 @@ export async function startFileTaskControllerRuntime(
     delivery,
     sessionHost,
     promptPush,
+    runtimeIsolation,
     workspacePreparer
   };
 }
@@ -324,6 +369,10 @@ export function createRuntimeLifecycleDispatcher(
     const activeRun = request.scope === "task"
       ? store.getActiveAgentRun(request.taskId, request.roleName)
       : null;
+    const managedWorkspace = request.scope === "task"
+      ? activeRun?.workspace
+        ?? currentDesiredManagedWorkspace(store, request.taskId, request.roleName)
+      : undefined;
     const sessions = request.scope === "task"
       ? store.getTaskRoleSessionSet(request.taskId, request.roleName)
       : store.getGlobalRoleSessionSet(request.roleName);
@@ -356,6 +405,7 @@ export function createRuntimeLifecycleDispatcher(
       adapterId: binding.adapterId,
       effective,
       workspace: effective.workspace.root,
+      ...(managedWorkspace === undefined ? {} : { managedWorkspace }),
       ...(activeRun === null ? {} : { runId: activeRun.id }),
       ...(request.environment === undefined
         ? {}
@@ -462,6 +512,19 @@ function assertRuntimeLaunchRequestCurrent(
   ) {
     throw new Error(`Role launch state changed: ${request.owner.roleName}.`);
   }
+  if (request.owner.scope === "task" && request.managedWorkspace !== undefined) {
+    const expectedWorkspace = activeRun?.workspace
+      ?? currentDesiredManagedWorkspace(
+        store,
+        request.owner.taskId,
+        request.owner.roleName
+      );
+    if (!isDeepStrictEqual(expectedWorkspace, request.managedWorkspace)) {
+      throw new Error(
+        `Managed workspace launch state changed: ${request.owner.roleName}.`
+      );
+    }
+  }
   const binding = role.agentBindings[request.agentId];
   if (binding === undefined || binding.adapterId !== request.adapterId) {
     throw new Error(`Role effective binding changed: ${request.owner.roleName}.`);
@@ -522,8 +585,26 @@ function runtimeLaunchFingerprint(
   return createHash("sha256").update(JSON.stringify([
     request.owner,
     request.effective,
+    request.managedWorkspace,
+    request.runtimePolicy,
     agent
   ])).digest("hex");
+}
+
+function currentDesiredManagedWorkspace(
+  store: TaskStore,
+  taskId: string,
+  roleName: string
+) {
+  const item = store.listWorkItems(taskId).find((candidate) => (
+    candidate.assignee === roleName
+      && !["completed", "failed", "retired"].includes(candidate.status)
+  )) ?? null;
+  return (item === null
+    ? store.getTaskWorkspace(taskId)
+    : store.getWorkItemWorkspace(taskId, item.id))
+    ?? store.getTaskWorkspace(taskId)
+    ?? undefined;
 }
 
 function hasPendingRuntimeCleanup(

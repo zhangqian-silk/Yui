@@ -24,6 +24,8 @@ import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import type { Task } from "../task/task.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
+import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
+import type { TaskRuntimeLaunchPolicy } from "../runtime/taskRuntimeIsolation.js";
 
 export type SchedulerTask = Readonly<Pick<
   Task,
@@ -39,6 +41,7 @@ export type SchedulerRole = Readonly<{
   effort?: string;
   effective: EffectiveLaunchSnapshot;
   workspace: string;
+  managedWorkspace?: ManagedWorkspace;
   status: "idle" | "running" | "detached" | "exited" | "failed";
 }>;
 
@@ -382,6 +385,8 @@ export interface TmuxDeliveryPort {
     adapterId: string;
     effective: EffectiveLaunchSnapshot;
     workspace: string;
+    managedWorkspace?: ManagedWorkspace;
+    runtimePolicy?: TaskRuntimeLaunchPolicy;
     mode: RoleSessionLaunchMode;
     runId?: string;
     nativeSessionId?: string;

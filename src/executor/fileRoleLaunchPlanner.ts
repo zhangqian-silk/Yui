@@ -52,6 +52,11 @@ import {
   type ExactControlPlaneDescriptor
 } from "../runtime/exactControlPlane.js";
 import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.js";
+import {
+  parseTaskRuntimeIsolationDescriptor,
+  taskRuntimeIsolationEnvironment,
+  type TaskRuntimeIsolationDescriptor
+} from "../runtime/taskRuntimeIsolation.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
@@ -293,6 +298,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       nativeSessionId?: string;
       launchId?: string;
       runId?: string;
+      runtimeIsolation?: TaskRuntimeIsolationDescriptor;
       environment?: Readonly<Record<string, string>>;
     }>,
     owner: Readonly<{ scope: "task"; taskId: string } | { scope: "global" }>,
@@ -326,6 +332,24 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const launchEnvironment = { ...inheritedLaunchEnvironment };
     const adapter = resolveAgentAdapter(binding.adapterId);
     const effectiveWorkspace = effective.workspace.root;
+    const runtimeIsolation = input.runtimeIsolation === undefined
+      ? undefined
+      : parseTaskRuntimeIsolationDescriptor(JSON.stringify(input.runtimeIsolation));
+    if (runtimeIsolation !== undefined && (
+      owner.scope !== "task"
+      || runtimeIsolation.taskId !== owner.taskId
+      || runtimeIsolation.workspace.root !== effectiveWorkspace
+      || runtimeIsolation.generation.runId !== input.runId
+      || runtimeIsolation.generation.launchId !== input.launchId
+    )) {
+      throw new Error("Role launch does not match its Task runtime isolation descriptor.");
+    }
+    Object.assign(
+      launchEnvironment,
+      runtimeIsolation === undefined
+        ? {}
+        : taskRuntimeIsolationEnvironment(runtimeIsolation)
+    );
     const baseSessionContext = compileRoleSessionContext(this.home, launchRole, owner);
     const sessionContext = owner.scope === "task"
       ? {

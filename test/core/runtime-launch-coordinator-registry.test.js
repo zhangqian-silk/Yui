@@ -1604,3 +1604,48 @@ test("a stopped pre-binding host gets a new generation and the old generation Ho
     "apply"
   );
 });
+
+test("Task launch rejects a Role-only workspace before reservation or host side effects", async (t) => {
+  const fx = fixture(t, "claude");
+  let starts = 0;
+  const host = {
+    async start(request) {
+      starts += 1;
+      return runtimeBinding(request, { hostCreated: true });
+    },
+    async resume() { throw new Error("resume is not expected"); },
+    async stop() { throw new Error("stop is not expected"); },
+    async inspect() { return { state: "stopped" }; },
+    async inspectOwner() { return { state: "stopped" }; },
+    async stopOwner() { throw new Error("owner cleanup is not expected"); }
+  };
+  const coordinator = new RuntimeLaunchCoordinator(
+    fx.schedulerStore,
+    host,
+    {
+      createGenerationId: () => "missing-workspace-owner",
+      now: () => NOW,
+      runtimeIsolation: {
+        preflight() { throw new Error("preflight must not receive an ownerless request"); },
+        activate() { throw new Error("activation is not expected"); },
+        cleanup() { throw new Error("cleanup is not expected"); }
+      }
+    }
+  );
+  const input = prepareInput(fx, "leader", "agent-run-1");
+
+  await assert.rejects(
+    coordinator.prepare({
+      owner: owner(fx, "leader"),
+      agentId: input.agentId,
+      adapterId: input.adapterId,
+      effective: input.effective,
+      workspace: input.workspace,
+      mode: input.mode,
+      runId: input.runId
+    }, "deferred"),
+    /authoritative ManagedWorkspace owner is required/i
+  );
+  assert.equal(starts, 0);
+  assert.equal(reservationMailbox(fx, "leader"), null);
+});
