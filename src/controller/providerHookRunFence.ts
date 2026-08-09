@@ -13,7 +13,7 @@ export type ProviderHookRunFence = Readonly<{
   agentId: string;
   launchId: string;
   runId: string;
-  receiptId: string;
+  receiptId?: string;
   nativeSessionId: string;
   workspace: string;
 }>;
@@ -55,16 +55,44 @@ export function resolveProviderHookRunFence(
 
   const store = new FileTaskStore(home);
   const sessions = store.getTaskRoleSessionSet(taskId, roleName);
-  if (sessions === null || sessions.inFlight === null) {
+  if (sessions !== null && sessions.activeAgentId !== agentId) {
+    throw new Error("Provider lifecycle hook Session Agent is not current.");
+  }
+  const inFlight = sessions?.inFlight;
+  const mailbox = store.getWorkMailbox(runtimeLifecycleTarget({
+    scope: "task",
+    taskId,
+    roleName
+  }));
+  const exactReservation = isRuntimeLaunchReservation(mailbox?.processing, launchId)
+    && !hasRuntimeCleanupObligation(mailbox);
+  const executionRef = mailbox?.processing?.executionRef;
+  const startupRunId = options.allowPreallocatedClaudeStartup === true
+    ? requireIdentity(environment.YUI_RUN_ID, "Run id")
+    : undefined;
+  const deterministicClaudeStartup = adapterId === "claude"
+    && options.allowPreallocatedClaudeStartup === true
+    && expectedNativeSessionId !== undefined
+    && exactReservation
+    && executionRef?.type === "run"
+    && executionRef.taskId === taskId
+    && executionRef.id === startupRunId
+    && nativeSessionId === nativeSessionIdForLaunch(
+      home,
+      launchId,
+      agentId,
+      adapterId
+    );
+  if ((inFlight === null || inFlight === undefined) && !deterministicClaudeStartup) {
     throw new Error("Provider lifecycle hook has no matching durable in-flight Run.");
   }
-  const inFlight = sessions.inFlight;
-  if (inFlight.agentId !== agentId) {
+  if (inFlight !== null && inFlight !== undefined && inFlight.agentId !== agentId) {
     throw new Error("Provider lifecycle hook has no matching durable in-flight Run.");
   }
+  const runId = inFlight?.runId ?? startupRunId!;
   const run = store.getActiveAgentRun(taskId, roleName);
   if (run === null
-    || run.id !== inFlight.runId
+    || run.id !== runId
     || run.status !== "active"
     || run.effective.agentId !== agentId
     || run.effective.adapterId !== adapterId) {
@@ -73,7 +101,7 @@ export function resolveProviderHookRunFence(
   if (run.effective.workspace.root !== workspace) {
     throw new Error("Provider lifecycle hook workspace does not match the durable Run snapshot.");
   }
-  const session = sessions.sessions[agentId];
+  const session = sessions?.sessions[agentId];
   if (session !== undefined) {
     if (session.adapterId !== adapterId
       || session.launchId !== launchId
@@ -82,30 +110,9 @@ export function resolveProviderHookRunFence(
       throw new Error("Provider lifecycle hook Session does not match its durable generation.");
     }
   } else {
-    const mailbox = store.getWorkMailbox(runtimeLifecycleTarget({
-      scope: "task",
-      taskId,
-      roleName
-    }));
-    const exactReservation = isRuntimeLaunchReservation(mailbox?.processing, launchId)
-      && !hasRuntimeCleanupObligation(mailbox);
     const runtimeDiscoveredCodex = adapterId === "codex"
       && expectedNativeSessionId === undefined
       && exactReservation;
-    const executionRef = mailbox?.processing?.executionRef;
-    const deterministicClaudeStartup = adapterId === "claude"
-      && options.allowPreallocatedClaudeStartup === true
-      && expectedNativeSessionId !== undefined
-      && exactReservation
-      && executionRef?.type === "run"
-      && executionRef.taskId === taskId
-      && executionRef.id === inFlight.runId
-      && nativeSessionId === nativeSessionIdForLaunch(
-        home,
-        launchId,
-        agentId,
-        adapterId
-      );
     if (!runtimeDiscoveredCodex && !deterministicClaudeStartup) {
       throw new Error("Provider lifecycle hook launch is not durably reserved.");
     }
@@ -115,8 +122,8 @@ export function resolveProviderHookRunFence(
     roleName,
     agentId,
     launchId,
-    runId: inFlight.runId,
-    receiptId: inFlight.receiptId,
+    runId,
+    ...(inFlight?.receiptId === undefined ? {} : { receiptId: inFlight.receiptId }),
     nativeSessionId,
     workspace
   };

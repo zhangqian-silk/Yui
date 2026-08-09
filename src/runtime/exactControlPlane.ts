@@ -391,17 +391,6 @@ export function assertExactTaskRuntimeState(
   if (sessions !== null && sessions.activeAgentId !== runtime.agentId) {
     throw new Error("Exact Task runtime Session Agent is not current.");
   }
-  if (runtime.runId !== undefined && (
-    sessions?.inFlight?.agentId !== runtime.agentId
-    || sessions.inFlight.runId !== runtime.runId
-    || sessions.inFlight.receiptId !== formatAgentRunReceiptId(
-      runtime.taskId,
-      runtime.runId
-    )
-  )) {
-    throw new Error("Exact Task runtime in-flight Run fence is not current.");
-  }
-
   const lifecycleMailbox = store.getWorkMailbox(runtimeLifecycleTarget({
     scope: "task",
     taskId: runtime.taskId,
@@ -411,6 +400,36 @@ export function assertExactTaskRuntimeState(
     && isRuntimeLaunchReservation(lifecycleMailbox?.processing, runtime.launchId);
   const sessionLaunch = runtime.launchId !== undefined
     && session?.launchId === runtime.launchId;
+  const executionRef = lifecycleMailbox?.processing?.executionRef;
+  const preallocated = options.preallocatedNativeSessionReservation;
+  const exactPreallocatedReservation =
+    preallocated !== undefined
+    && runtime.adapterId === "claude"
+    && runtime.runId !== undefined
+    && runtime.launchId !== undefined
+    && runtime.nativeSessionId !== undefined
+    && session === undefined
+    && reservation
+    && !hasRuntimeCleanupObligation(lifecycleMailbox)
+    && executionRef?.type === "run"
+    && executionRef.taskId === runtime.taskId
+    && executionRef.id === runtime.runId
+    && runtime.nativeSessionId === nativeSessionIdForLaunch(
+      preallocated.yuiHome,
+      runtime.launchId,
+      runtime.agentId,
+      runtime.adapterId
+    );
+  if (runtime.runId !== undefined && (
+    sessions?.inFlight?.agentId !== runtime.agentId
+    || sessions.inFlight.runId !== runtime.runId
+    || sessions.inFlight.receiptId !== formatAgentRunReceiptId(
+      runtime.taskId,
+      runtime.runId
+    )
+  ) && !exactPreallocatedReservation) {
+    throw new Error("Exact Task runtime in-flight Run fence is not current.");
+  }
   if (runtime.launchId === undefined || (!reservation && !sessionLaunch)) {
     throw new Error("Exact Task runtime launch fence is not current.");
   }
@@ -419,24 +438,6 @@ export function assertExactTaskRuntimeState(
       throw new Error("Exact Task runtime native Session fence is missing.");
     }
   } else if (session === undefined) {
-    const executionRef = lifecycleMailbox?.processing?.executionRef;
-    const preallocated = options.preallocatedNativeSessionReservation;
-    const exactPreallocatedReservation =
-      preallocated !== undefined
-      && runtime.adapterId === "claude"
-      && runtime.runId !== undefined
-      && runtime.launchId !== undefined
-      && reservation
-      && !hasRuntimeCleanupObligation(lifecycleMailbox)
-      && executionRef?.type === "run"
-      && executionRef.taskId === runtime.taskId
-      && executionRef.id === runtime.runId
-      && runtime.nativeSessionId === nativeSessionIdForLaunch(
-        preallocated.yuiHome,
-        runtime.launchId,
-        runtime.agentId,
-        runtime.adapterId
-      );
     if (!exactPreallocatedReservation) {
       throw new Error("Exact Task runtime native Session fence is not current.");
     }

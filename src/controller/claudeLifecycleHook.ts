@@ -22,7 +22,7 @@ type ClaudeHookEnvelope = Readonly<{
   launchId: string;
   runId: string;
   nativeSessionId: string;
-  receiptId: string;
+  receiptId?: string;
 }>;
 
 export type ClaudeStopFailureHookNotification = Omit<ClaudeHookEnvelope, "receiptId"> & Readonly<{
@@ -158,7 +158,7 @@ export function parseClaudeHookEnvelope(
       return {
         ...base,
         kind: "prompt-submit",
-        receiptId: base.receiptId
+        receiptId: requireIdentity(base.receiptId, "Claude transport receipt id")
       };
     case "StopFailure":
       return {

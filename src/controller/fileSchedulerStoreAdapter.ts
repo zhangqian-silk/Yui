@@ -117,6 +117,7 @@ import {
   type RuntimeLifecycleTarget,
   type RuntimeRoleOwner
 } from "../runtime/lifecycleReservation.js";
+import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.js";
 
 /** Maps the authoritative FileTaskStore records to the scheduler's narrow port. */
 export class FileSchedulerStoreAdapter implements SchedulerStorePort {
@@ -2206,17 +2207,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             },
             now
           ));
-          if (
-            decision.outcome.outcome === "mark-ready"
-            && input.adapterId === "claude"
-            && input.sessionSource === "startup"
-          ) {
-            completeRuntimeHookReservation(
-              store,
-              { scope: "task", taskId: input.taskId, roleName: input.roleName },
-              input.launchId
-            );
-          }
           return "applied";
       }
     });
@@ -2293,7 +2283,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       return { kind: "obsolete", reason: error instanceof Error ? error.message : "map-failed" };
     }
     const expectation = this.projectRunExpectation(store, signal.fence, runId);
-    if (expectation === null) return { kind: "obsolete", reason: "run-or-role-missing" };
+    if (expectation === null) {
+      if (preallocatedClaudeStartupAwaitingProjection(store, signal, runId)) {
+        return { kind: "deferred", reason: "preallocated-session-not-yet-projected" };
+      }
+      return { kind: "obsolete", reason: "run-or-role-missing" };
+    }
     const outcome = foldCanonicalLifecycleEvent(event, expectation);
     switch (outcome.outcome) {
       case "obsolete":
@@ -2689,6 +2684,65 @@ function runtimeHookMatchesReservation(
   const processing = mailbox?.processing;
   return launchId !== undefined
     && isRuntimeLaunchReservation(processing, launchId);
+}
+
+/**
+ * Claude may publish SessionStart(startup) synchronously from host.start(),
+ * before the Controller can atomically project the returned Session and bind
+ * the Run. Preserve that exact immutable fact only while the matching launch
+ * reservation is still the durable owner of the active Run. Everything else
+ * remains obsolete/fail-closed.
+ */
+function preallocatedClaudeStartupAwaitingProjection(
+  store: TaskStore,
+  signal: NativeLifecycleSignal,
+  runId: string | undefined
+): boolean {
+  if (
+    signal.kind !== "native-session-start"
+    || signal.sessionSource !== "startup"
+    || signal.fence.adapterId !== "claude"
+    || runId === undefined
+    || signal.fence.runId !== runId
+    || signal.fence.launchId === undefined
+    || signal.fence.nativeSessionId === undefined
+  ) return false;
+
+  const task = store.getTask(signal.fence.taskId);
+  const role = store.getRole(signal.fence.taskId, signal.fence.roleName);
+  const run = store.getActiveAgentRun(signal.fence.taskId, signal.fence.roleName);
+  const sessions = store.getTaskRoleSessionSet(signal.fence.taskId, signal.fence.roleName);
+  if (
+    task === null
+    || task.status !== "active"
+    || role === null
+    || role.activeAgentId !== signal.fence.agentId
+    || run === null
+    || run.id !== runId
+    || run.status !== "active"
+    || run.effective.agentId !== signal.fence.agentId
+    || run.effective.adapterId !== "claude"
+    || (sessions?.inFlight !== null && sessions?.inFlight !== undefined)
+    || sessions?.sessions[signal.fence.agentId] !== undefined
+  ) return false;
+
+  const mailbox = store.getWorkMailbox(runtimeLifecycleTarget({
+    scope: "task",
+    taskId: signal.fence.taskId,
+    roleName: signal.fence.roleName
+  }));
+  const executionRef = mailbox?.processing?.executionRef;
+  return isRuntimeLaunchReservation(mailbox?.processing, signal.fence.launchId)
+    && !hasRuntimeCleanupObligation(mailbox)
+    && executionRef?.type === "run"
+    && executionRef.taskId === signal.fence.taskId
+    && executionRef.id === runId
+    && signal.fence.nativeSessionId === nativeSessionIdForLaunch(
+      store.rootDirectory(),
+      signal.fence.launchId,
+      signal.fence.agentId,
+      "claude"
+    );
 }
 
 function completeRuntimeHookReservation(

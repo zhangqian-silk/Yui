@@ -105,13 +105,15 @@ function fixture(t, adapterId, sessionStatus = "running", options = {}) {
         policy: "fixed", status: sessionStatus, effective: run.effective
       }, first);
     }
-    sessions = bindTaskRoleRun(sessions, {
-      agentId: agent.id, runId: run.id, receiptId: `agent-run:${task.id}/${run.id}`
-    }, first);
-    if (options.transportPushed !== false) {
-      sessions = markTaskRoleRunPushed(sessions, {
+    if (options.bindInFlight !== false) {
+      sessions = bindTaskRoleRun(sessions, {
         agentId: agent.id, runId: run.id, receiptId: `agent-run:${task.id}/${run.id}`
-      }, second);
+      }, first);
+      if (options.transportPushed !== false) {
+        sessions = markTaskRoleRunPushed(sessions, {
+          agentId: agent.id, runId: run.id, receiptId: `agent-run:${task.id}/${run.id}`
+        }, second);
+      }
     }
     tx.saveTaskRoleSessionSet(sessions);
   });
@@ -276,7 +278,8 @@ test("Claude SessionStart hook folds to a session-lifecycle event, never deliver
 test("exact internal Claude startup is queued before its preallocated Session is durable and folds only afterward", (t) => {
   const fx = fixture(t, "claude", "reserved", {
     runtimeDiscovered: true,
-    transportPushed: false
+    transportPushed: false,
+    bindInFlight: false
   });
   const nativeSessionId = nativeSessionIdForLaunch(
     fx.home,
@@ -342,13 +345,13 @@ test("exact internal Claude startup is queued before its preallocated Session is
     session_id: forgedNativeSessionId
   }, { ...environment, YUI_NATIVE_SESSION_ID: forgedNativeSessionId });
   assert.notEqual(forged.status, 0);
-  assert.match(forged.stderr, /native Session fence is not current/i);
+  assert.match(forged.stderr, /fence is not current/i);
   assert.equal(inbox.list().length, 0);
   writeTextFileAtomically(runtimeSource, `${serializeExactDescriptor(runtime)}\n`);
 
   const external = invoke(["version"]);
   assert.notEqual(external.status, 0);
-  assert.match(external.stderr, /native Session fence is not current/i);
+  assert.match(external.stderr, /fence is not current/i);
   assert.equal(inbox.list().length, 0);
   for (const payload of [
     {
@@ -389,14 +392,21 @@ test("exact internal Claude startup is queued before its preallocated Session is
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).pushedAt, undefined);
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
 
-  fx.adapter.recordRuntimeNativeSession({
-    taskId: fx.task.id,
-    roleName: fx.worker.name,
-    agentId: fx.agent.id,
-    adapterId: "claude",
+  fx.adapter.saveRoleRunPrepared({
+    task: fx.adapter.getTask(fx.task.id),
+    role: fx.adapter.getRole(fx.task.id, fx.worker.name),
+    run: fx.run,
+    session: {
+      agentId: fx.agent.id,
+      adapterId: "claude",
+      launchId: "launch-1",
+      nativeSessionId,
+      status: "running",
+      effective: fx.run.effective
+    },
     launchId: "launch-1",
-    nativeSessionId
-  }, new Date("2026-08-06T02:00:01.500Z"));
+    now: new Date("2026-08-06T02:00:01.500Z")
+  });
   const afterSession = fx.drain();
   assert.equal(afterSession.acknowledgedEventIds.length, 1);
   assert.equal(afterSession.deferred.length, 0);
@@ -408,11 +418,11 @@ test("exact internal Claude startup is queued before its preallocated Session is
   )));
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).pushedAt, undefined);
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
-  assert.equal(fx.store.getWorkMailbox(runtimeLifecycleTarget({
+  assert.equal(isRuntimeLaunchReservation(fx.store.getWorkMailbox(runtimeLifecycleTarget({
     scope: "task",
     taskId: fx.task.id,
     roleName: fx.worker.name
-  })), null);
+  }))?.processing, "launch-1"), true);
 });
 
 for (const mismatch of [
@@ -425,7 +435,8 @@ for (const mismatch of [
   test(`preallocated Claude startup rejects ${mismatch} before inbox append`, async (t) => {
     const fx = fixture(t, "claude", "reserved", {
       runtimeDiscovered: true,
-      transportPushed: false
+      transportPushed: false,
+      bindInFlight: false
     });
     const owner = {
       scope: "task",
