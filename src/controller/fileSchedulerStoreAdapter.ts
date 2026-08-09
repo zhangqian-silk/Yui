@@ -54,7 +54,8 @@ import type {
   ProviderLifecycleObservation,
   TaskClaudeStopFailureEvent,
   TaskProviderPromptAccepted,
-  TaskProviderSessionLifecycle
+  TaskProviderSessionLifecycle,
+  TaskProviderTurnProgress
 } from "./runtimeEventProcessor.js";
 import type {
   DormantRuntimeOwnerCandidate,
@@ -2286,6 +2287,58 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         ));
       }
       return "applied";
+    });
+  }
+
+  /**
+   * Folds provider-native in-turn progress through the canonical lifecycle
+   * contract. Progress is an advisory semantic fence only: it never advances
+   * Run delivery/acceptance and never reads pane text or process counters.
+   */
+  observeProviderTurnProgress(
+    input: TaskProviderTurnProgress,
+    now = new Date()
+  ): ProviderLifecycleObservation {
+    return this.store.transaction((store) => {
+      const decision = this.foldProviderSignal(store, {
+        kind: "native-turn-progress",
+        ...(input.sequence === undefined ? {} : { sequence: input.sequence }),
+        fence: providerFence(input)
+      }, input.runId);
+      switch (decision.kind) {
+        case "obsolete":
+          recordCanonicalObsolete(store, input, "native-turn-progress", decision.reason, now);
+          return "obsolete";
+        case "deferred":
+          return "deferred";
+        case "idempotent":
+          return "applied";
+        case "apply":
+          if (decision.outcome.outcome !== "advance-progress") return "obsolete";
+          if (store.listEvents(input.taskId).some((event) => (
+            event.type === "runtime.provider-turn-progress"
+            && event.payload.eventId === input.eventId
+          ))) return "applied";
+          store.saveEvent(input.taskId, createTaskEvent(
+            store.nextEventId(input.taskId),
+            input.taskId,
+            "runtime.provider-turn-progress",
+            {
+              eventId: input.eventId,
+              roleName: input.roleName,
+              agentId: input.agentId,
+              adapterId: input.adapterId,
+              launchId: input.launchId,
+              nativeSessionId: input.nativeSessionId,
+              runId: input.runId,
+              progressId: input.progressId,
+              progressAt: now.toISOString(),
+              ...(input.sequence === undefined ? {} : { sequence: String(input.sequence) })
+            },
+            now
+          ));
+          return "applied";
+      }
     });
   }
 

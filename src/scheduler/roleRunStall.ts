@@ -262,7 +262,11 @@ export function latestRunProgressAt(
 ): string | undefined {
   let latest: string | undefined;
   for (const event of events) {
-    if (event.type !== RUN_PROGRESS_EVENT || event.payload.runId !== runId) continue;
+    if (
+      event.type !== RUN_PROGRESS_EVENT
+      && event.type !== "runtime.provider-turn-progress"
+    ) continue;
+    if (event.payload.runId !== runId) continue;
     const progressAt = typeof event.payload.progressAt === "string"
       && Number.isFinite(Date.parse(event.payload.progressAt))
       ? event.payload.progressAt
@@ -444,6 +448,7 @@ export function latestRunActivityAt(
 ): string | undefined {
   const semanticTypes = new Set([
     RUN_PROGRESS_EVENT,
+    "runtime.provider-turn-progress",
     "message.sent",
     "input.answered",
     "input.auto-answered",
@@ -977,16 +982,33 @@ function classifyLeaderStall(
   // A present downstream Run keeps recovery Leader-owned. If that Run is
   // itself stalled, this pass has just routed its structured attention to the
   // Leader; escalating the Leader to the Operator in the same pass would skip
-  // the intended recovery owner. Only an already-stale Leader mailbox below
-  // proves that the Leader also failed to act.
+  // the intended recovery owner.
   const downstreamPresent = downstream.some((entry) => entry.live === "present");
+  const leader = [...observed.values()].find((entry) => (
+    entry.candidate.task.id === taskId && entry.candidate.role.name === "leader"
+  ));
   const mailbox = store.getWorkMailbox({ kind: "role", taskId, roleName: "leader" });
   const pending = mailbox?.pending;
   const pendingStalled = pending !== null
     && pending !== undefined
     && Number.isFinite(Date.parse(pending.lastQueuedAt))
     && now.getTime() - Date.parse(pending.lastQueuedAt) >= windowMs;
-  if (downstreamPresent && !pendingStalled) return "waiting-on-workers";
+  const processing = mailbox?.processing;
+  const processingCurrent = processing?.executionRef?.type === "run"
+    && processing.executionRef.taskId === taskId
+    && leader !== undefined
+    && processing.executionRef.id === leader.candidate.run.id;
+  const processingStartedAt = processing === undefined || processing === null
+    ? NaN
+    : Date.parse(processing.startedAt);
+  const leaderProgressAt = leader === undefined ? NaN : Date.parse(leader.progressAt);
+  const processingStalled = processingCurrent
+    && Number.isFinite(processingStartedAt)
+    && now.getTime() - processingStartedAt >= windowMs
+    && Number.isFinite(leaderProgressAt)
+    && leaderProgressAt <= processingStartedAt;
+  if (processingStalled || pendingStalled) return "truly-stalled";
+  if (downstreamPresent) return "waiting-on-workers";
   return "truly-stalled";
 }
 
@@ -1010,7 +1032,23 @@ function leaderStallEvidence(
       && now.getTime() - Date.parse(pending.lastQueuedAt) >= windowMs
       ? "stale"
       : "recent";
-  return `downstream=active:${active},healthy:${healthy},stalled:${stalled}:leader-mailbox=${pendingAge}`;
+  const processing = store.getWorkMailbox({ kind: "role", taskId, roleName: "leader" })?.processing;
+  const leader = [...observed.values()].find((entry) => (
+    entry.candidate.task.id === taskId && entry.candidate.role.name === "leader"
+  ));
+  const processingCurrent = processing?.executionRef?.type === "run"
+    && processing.executionRef.taskId === taskId
+    && leader !== undefined
+    && processing.executionRef.id === leader.candidate.run.id;
+  const processingAge = processing === undefined || processing === null
+    ? "none"
+    : !processingCurrent
+      ? "mismatched"
+      : Number.isFinite(Date.parse(processing.startedAt))
+        && now.getTime() - Date.parse(processing.startedAt) >= windowMs
+        ? "stale"
+        : "recent";
+  return `downstream=active:${active},healthy:${healthy},stalled:${stalled}:leader-mailbox=${pendingAge},leader-processing=${processingAge}`;
 }
 
 function stallEvidenceKey(roleStatus: string, sessionStatus: string | undefined): string {

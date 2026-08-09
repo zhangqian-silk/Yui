@@ -71,6 +71,39 @@ test("late stale progress events cannot move the durable progress fence backward
   );
 });
 
+test("provider-native turn progress advances the exact Run progress fence", async () => {
+  const progressAt = "2026-08-05T00:55:00.000Z";
+  const store = stallStore();
+  store.events.push(createTaskEvent(
+    "event-3",
+    "task-1",
+    "runtime.provider-turn-progress",
+    {
+      runId: "run-1",
+      roleName: "worker",
+      agentId: "agent-1",
+      adapterId: "codex",
+      nativeSessionId: "native-1",
+      launchId: "launch-1",
+      progressId: "tool-1",
+      progressAt
+    },
+    new Date(progressAt)
+  ));
+
+  assert.equal(latestRunProgressAt(store.events, "run-1"), progressAt);
+  assert.deepEqual(
+    await reconcileStalledRoleRuns(
+      store,
+      { async inspectRole() { return "present"; } },
+      NOW,
+      undefined,
+      30 * 60_000
+    ),
+    []
+  );
+});
+
 test("one health projection keeps live resource activity advisory and does not advance the clock", () => {
   const projection = projectRoleRunHealth({
     progressAt: PROGRESS,
@@ -581,6 +614,116 @@ test("a stale Leader mailbox action escalates the Leader once alongside the Work
   );
 });
 
+test("an exact current Leader processing batch ages into one Operator-owned stall", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: new Date(NOW.getTime() - 60 * 60_000).toISOString(),
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" }
+    }
+  });
+  const delivery = { async inspectRole() { return "present"; } };
+  const first = await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  assert.deepEqual(
+    first.map(({ runId, classification }) => ({ runId, classification })).sort((a, b) => (
+      a.runId.localeCompare(b.runId)
+    )),
+    [
+      { runId: "run-1", classification: "truly-stalled" },
+      { runId: "run-worker", classification: "truly-stalled" }
+    ]
+  );
+  assert.equal(
+    store.events.filter((event) => (
+      event.type === "run.stalled" && event.payload.runId === "run-1"
+    )).length,
+    1
+  );
+
+  // Reconciliation is one-shot for this exact Run + progress point.
+  await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  assert.equal(
+    store.events.filter((event) => (
+      event.type === "run.stalled" && event.payload.runId === "run-1"
+    )).length,
+    1
+  );
+});
+
+test("a recent exact Leader processing batch keeps Worker recovery Leader-owned", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: new Date(NOW.getTime() - 15 * 60_000).toISOString(),
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" }
+    }
+  });
+  const delivery = { async inspectRole() { return "present"; } };
+  const first = await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  assert.deepEqual(first.map(({ runId }) => runId), ["run-worker"]);
+  assert.equal(
+    store.events.some((event) => event.type === "run.stalled" && event.payload.runId === "run-1"),
+    false
+  );
+});
+
+test("a newer durable Leader progress fence keeps an old processing batch quiet", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: new Date(NOW.getTime() - 60 * 60_000).toISOString(),
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" }
+    }
+  });
+  store.events.push(createTaskEvent(
+    "event-3",
+    "task-1",
+    "run.progress",
+    {
+      runId: "run-1",
+      progressAt: new Date(NOW.getTime() - 5 * 60_000).toISOString()
+    },
+    new Date(NOW.getTime() - 5 * 60_000)
+  ));
+  const delivery = { async inspectRole() { return "present"; } };
+  const first = await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  assert.deepEqual(first.map(({ runId }) => runId), ["run-worker"]);
+  assert.equal(
+    store.events.some((event) => event.type === "run.stalled" && event.payload.runId === "run-1"),
+    false
+  );
+});
+
+test("mismatched Leader processing is not current action evidence", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: new Date(NOW.getTime() - 60 * 60_000).toISOString(),
+      executionRef: { type: "run", taskId: "task-other", id: "run-other" }
+    }
+  });
+  const delivery = { async inspectRole() { return "present"; } };
+  const first = await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  assert.deepEqual(
+    first.map(({ runId }) => runId),
+    ["run-worker"]
+  );
+  assert.equal(
+    store.events.some((event) => (
+      event.type === "run.stalled" && event.payload.runId === "run-1"
+    )),
+    false
+  );
+});
+
 function stallStore(options = {}) {
   const task = { id: "task-1", title: "stall", status: "active", projectBindings: [] };
   const role = {
@@ -669,6 +812,31 @@ function stallStore(options = {}) {
         && options.leaderMailboxQueuedAt !== undefined
       ) {
         return { pending: { lastQueuedAt: options.leaderMailboxQueuedAt } };
+      }
+      if (
+        selector !== undefined
+        && selector.kind === "role"
+        && selector.roleName === "leader"
+        && options.leaderProcessing !== undefined
+      ) {
+        return {
+          pending: null,
+          processing: {
+            batchId: "task-1/leader-batch-1",
+            batch: {
+              fromSequence: 1,
+              toSequence: 1,
+              reasons: ["leader-action"],
+              refs: [],
+              requestCount: 1,
+              firstQueuedAt: options.leaderProcessing.startedAt,
+              lastQueuedAt: options.leaderProcessing.startedAt
+            },
+            owner: "controller",
+            startedAt: options.leaderProcessing.startedAt,
+            executionRef: options.leaderProcessing.executionRef
+          }
+        };
       }
       return { pending: null };
     },

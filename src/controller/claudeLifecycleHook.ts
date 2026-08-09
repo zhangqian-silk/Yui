@@ -37,6 +37,7 @@ export type ClaudeStopFailureHookNotification = Omit<ClaudeHookEnvelope, "receip
  * by hook_event_name and writes one immutable runtime-inbox event per fact:
  * SessionStart → native-session-lifecycle (carrying the source variant),
  * UserPromptSubmit → native-prompt-accepted (the exact provider-accepted fence),
+ * PostToolUse → native-turn-progress (the exact provider/tool progress fence),
  * StopFailure → claude-stop-failure. The durable write is authoritative; the
  * socket call is only a wake-up hint.
  */
@@ -71,6 +72,18 @@ export async function runClaudeLifecycleHookCommand(
       nativeSessionId: envelope.nativeSessionId,
       runId: envelope.runId,
       receiptId: envelope.receiptId
+    });
+  } else if (envelope.kind === "turn-progress") {
+    inbox.enqueueProviderProgress({
+      scope: "task",
+      taskId: envelope.taskId,
+      roleName: envelope.roleName,
+      agentId: envelope.agentId,
+      adapterId: "claude",
+      launchId: envelope.launchId,
+      nativeSessionId: envelope.nativeSessionId,
+      runId: envelope.runId,
+      progressId: envelope.progressId
     });
   } else {
     inbox.enqueueClaudeStopFailure({
@@ -114,6 +127,10 @@ type ClaudePromptSubmitHookNotification = ClaudeHookEnvelope & Readonly<{
   kind: "prompt-submit";
   receiptId: string;
 }>;
+type ClaudeTurnProgressHookNotification = ClaudeHookEnvelope & Readonly<{
+  kind: "turn-progress";
+  progressId: string;
+}>;
 type ClaudeStopFailureEnvelope = ClaudeHookEnvelope & Readonly<{
   kind: "stop-failure";
   error: string;
@@ -123,6 +140,7 @@ type ClaudeStopFailureEnvelope = ClaudeHookEnvelope & Readonly<{
 type ClaudeHookNotificationEnvelope =
   | ClaudeSessionStartHookNotification
   | ClaudePromptSubmitHookNotification
+  | ClaudeTurnProgressHookNotification
   | ClaudeStopFailureEnvelope;
 
 /**
@@ -138,6 +156,7 @@ export function parseClaudeHookEnvelope(
   const payload = parseObject(stdinJson);
   if (payload.hook_event_name !== "SessionStart"
     && payload.hook_event_name !== "UserPromptSubmit"
+    && payload.hook_event_name !== "PostToolUse"
     && payload.hook_event_name !== "StopFailure") {
     throw new Error("Managed Claude lifecycle ingestion received an unsupported hook event.");
   }
@@ -159,6 +178,12 @@ export function parseClaudeHookEnvelope(
         ...base,
         kind: "prompt-submit",
         receiptId: requireIdentity(base.receiptId, "Claude transport receipt id")
+      };
+    case "PostToolUse":
+      return {
+        ...base,
+        kind: "turn-progress",
+        progressId: requireIdentity(payload.tool_use_id, "Claude PostToolUse id")
       };
     case "StopFailure":
       return {

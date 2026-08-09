@@ -146,6 +146,57 @@ test("Claude UserPromptSubmit hook folds to provider-accepted and only then writ
   assert.ok(fx.store.listEvents(fx.task.id).some((e) => e.type === "run.delivered"));
 });
 
+test("Claude PostToolUse hook records exact in-turn provider progress without acceptance", async (t) => {
+  const fx = fixture(t, "claude");
+  const acceptance = JSON.stringify({
+    hook_event_name: "UserPromptSubmit",
+    session_id: fx.nativeSessionId,
+    prompt: "Do the work"
+  });
+  await runClaudeLifecycleHookCommand(acceptance, fx.environment, async () => ({}));
+  fx.drain();
+  const deliveredAt = fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt;
+  assert.notEqual(deliveredAt, undefined);
+
+  await runClaudeLifecycleHookCommand(JSON.stringify({
+    hook_event_name: "PostToolUse",
+    session_id: fx.nativeSessionId,
+    tool_use_id: "toolu_01_progress",
+    tool_name: "Read",
+    tool_input: { file_path: "/managed/workspace/input.txt" }
+  }), fx.environment, async () => ({}));
+  const [queued] = new FileRuntimeEventInbox(fx.home).list();
+  assert.equal(queued.type, "native-turn-progress");
+  assert.equal(queued.progressId, "toolu_01_progress");
+  assert.equal(queued.runId, fx.run.id);
+  assert.equal(queued.nativeSessionId, fx.nativeSessionId);
+
+  fx.drain();
+  assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, deliveredAt);
+  const progress = fx.store.listEvents(fx.task.id).filter(
+    (event) => event.type === "runtime.provider-turn-progress"
+  );
+  assert.equal(progress.length, 1);
+  assert.equal(progress[0].payload.progressId, "toolu_01_progress");
+  assert.equal(progress[0].payload.roleName, fx.worker.name);
+  assert.equal(progress[0].payload.agentId, fx.agent.id);
+  assert.equal(progress[0].payload.adapterId, "claude");
+  assert.equal(progress[0].payload.launchId, "launch-1");
+});
+
+test("Claude PostToolUse without its provider event identity fails closed", async (t) => {
+  const fx = fixture(t, "claude");
+  await assert.rejects(
+    runClaudeLifecycleHookCommand(JSON.stringify({
+      hook_event_name: "PostToolUse",
+      session_id: fx.nativeSessionId,
+      tool_name: "Read"
+    }), fx.environment, async () => ({})),
+    /PostToolUse id/i
+  );
+  assert.deepEqual(new FileRuntimeEventInbox(fx.home).list(), []);
+});
+
 test("Codex UserPromptSubmit hook folds to provider-accepted and writes delivered", async (t) => {
   const fx = fixture(t, "codex");
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
