@@ -2300,6 +2300,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     now = new Date()
   ): ProviderLifecycleObservation {
     return this.store.transaction((store) => {
+      const receivedAtMs = Date.parse(input.receivedAt);
+      if (!Number.isFinite(receivedAtMs) || receivedAtMs > now.getTime()) {
+        recordCanonicalObsolete(store, input, "native-turn-progress", "received-at-invalid", now);
+        return "obsolete";
+      }
       const decision = this.foldProviderSignal(store, {
         kind: "native-turn-progress",
         ...(input.sequence === undefined ? {} : { sequence: input.sequence }),
@@ -2332,7 +2337,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
               nativeSessionId: input.nativeSessionId,
               runId: input.runId,
               progressId: input.progressId,
-              progressAt: now.toISOString(),
+              progressAt: input.receivedAt,
               ...(input.sequence === undefined ? {} : { sequence: String(input.sequence) })
             },
             now

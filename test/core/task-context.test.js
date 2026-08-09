@@ -494,6 +494,8 @@ test("task context keeps empty knowledge and work explicit and reads terminal Ta
   for (const [taskId, status] of [[completed.id, "completed"], [archived.id, "archived"]]) {
     const result = output(["context", taskId], store, options);
     assert.equal(result.data.task.status, status);
+    assert.equal(result.data.execution.status, status);
+    assert.equal(result.data.execution.monitoring, "stopped");
     assert.equal(result.data.brief, null);
     assert.deepEqual(result.data.activeDecisions, []);
     assert.deepEqual(result.data.milestones, []);

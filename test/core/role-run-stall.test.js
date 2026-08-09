@@ -5,6 +5,7 @@ import {
   evaluateRoleRunStall,
   isRoleRunStalled,
   latestDurableProgressAt,
+  latestRunActivityAt,
   latestRunProgressAt,
   projectRoleRunHealth,
   reconcileStalledRoleRuns
@@ -306,6 +307,68 @@ test("one scheduler resource sample suppresses an execution false positive witho
   );
   assert.deepEqual(result, []);
   assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 0);
+});
+
+test("continued resource activity is bounded by the semantic progress gap", async () => {
+  const store = stallStore();
+  let recorded = false;
+  store.recordRoleRunResourceSuppression = () => {
+    if (recorded) return "already-recorded";
+    recorded = true;
+    return "recorded";
+  };
+  const evidenceAt = (now) => new Map([[
+    "task-1\0worker\0run-1",
+    {
+      observedAt: new Date(now.getTime() - 30_000).toISOString(),
+      progressAt: PROGRESS,
+      identity: {
+        taskId: "task-1",
+        roleName: "worker",
+        runId: "run-1",
+        agentId: "agent-1",
+        adapterId: "codex",
+        nativeSessionId: "native-1"
+      },
+      active: true,
+      changed: true,
+      cpuTimeMs: now.getTime()
+    }
+  ]]);
+  const delivery = { async inspectRole() { return "present"; } };
+
+  assert.deepEqual(await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    NOW,
+    undefined,
+    30 * 60_000,
+    undefined,
+    evidenceAt(NOW)
+  ), []);
+  const stillBounded = new Date("2026-08-05T01:20:00.000Z");
+  assert.deepEqual(await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    stillBounded,
+    undefined,
+    30 * 60_000,
+    undefined,
+    evidenceAt(stillBounded)
+  ), []);
+
+  const expired = new Date("2026-08-05T01:30:00.000Z");
+  const result = await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    expired,
+    undefined,
+    30 * 60_000,
+    undefined,
+    evidenceAt(expired)
+  );
+  assert.equal(result[0]?.runId, "run-1");
+  assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 1);
 });
 
 test("launch identity can fence advisory resource activity when native Session id is opaque", async () => {
@@ -700,6 +763,183 @@ test("a newer durable Leader progress fence keeps an old processing batch quiet"
   );
 });
 
+test("a Leader processing action escalates after its newer progress fence ages out", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: "2026-08-05T00:10:00.000Z",
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" }
+    }
+  });
+  store.events.push(createTaskEvent(
+    "event-3",
+    "task-1",
+    "run.progress",
+    {
+      runId: "run-1",
+      progressAt: "2026-08-05T00:20:00.000Z"
+    },
+    new Date("2026-08-05T00:20:00.000Z")
+  ));
+  const delivery = { async inspectRole() { return "present"; } };
+  const result = await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    new Date("2026-08-05T01:20:00.000Z"),
+    undefined,
+    30 * 60_000
+  );
+  assert.equal(result.some(({ runId }) => runId === "run-1"), true);
+  assert.equal(
+    store.events.filter((event) => event.type === "run.stalled" && event.payload.runId === "run-1").length,
+    1
+  );
+});
+
+test("a stale unrelated pending Leader batch cannot override fresh current processing progress", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: "2026-08-05T00:00:00.000Z",
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" }
+    }
+  });
+  store.events.push(createTaskEvent(
+    "event-3",
+    "task-1",
+    "run.progress",
+    {
+      runId: "run-1",
+      progressAt: "2026-08-05T00:20:00.000Z"
+    },
+    new Date("2026-08-05T00:20:00.000Z")
+  ));
+  const originalMailbox = store.getWorkMailbox.bind(store);
+  store.getWorkMailbox = (selector) => {
+    const mailbox = originalMailbox(selector);
+    if (selector?.kind !== "role" || selector.roleName !== "leader") return mailbox;
+    return {
+      ...mailbox,
+      pending: {
+        lastQueuedAt: "2026-08-05T00:00:00.000Z",
+        refs: [{ type: "run", taskId: "task-other", id: "run-other" }]
+      }
+    };
+  };
+  const delivery = { async inspectRole() { return "present"; } };
+  const result = await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    new Date("2026-08-05T00:40:00.000Z"),
+    undefined,
+    30 * 60_000
+  );
+  assert.deepEqual(result.map(({ runId }) => runId), ["run-worker"]);
+  assert.equal(
+    store.events.some((event) => event.type === "run.stalled" && event.payload.runId === "run-1"),
+    false
+  );
+});
+
+test("current Leader action lifecycle progress is bounded to its processing batch", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: "2026-08-05T00:00:00.000Z",
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" },
+      refs: [{ type: "work-item", taskId: "task-1", id: "work-1" }]
+    }
+  });
+  store.events.push(createTaskEvent(
+    "event-3",
+    "task-1",
+    "work.retired",
+    { workItemId: "work-1", summary: "retired" },
+    new Date("2026-08-05T00:20:00.000Z")
+  ));
+  const delivery = { async inspectRole() { return "present"; } };
+  const result = await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    new Date("2026-08-05T00:40:00.000Z"),
+    undefined,
+    30 * 60_000
+  );
+  assert.deepEqual(result.map(({ runId }) => runId), ["run-worker"]);
+  assert.equal(
+    store.events.some((event) => event.type === "run.stalled" && event.payload.runId === "run-1"),
+    false
+  );
+});
+
+test("Task-scoped milestone progress requires the exact current action reason and Task ref", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: "2026-08-05T00:00:00.000Z",
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" },
+      reasons: ["milestone-added"],
+      refs: [{ type: "task", id: "task-1" }]
+    }
+  });
+  store.events.push(createTaskEvent(
+    "event-4",
+    "task-1",
+    "milestone.added",
+    { milestoneId: "milestone-1", title: "checkpoint" },
+    new Date("2026-08-05T00:20:00.000Z")
+  ));
+  const delivery = { async inspectRole() { return "present"; } };
+  const result = await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    new Date("2026-08-05T00:40:00.000Z"),
+    undefined,
+    30 * 60_000
+  );
+  assert.deepEqual(result.map(({ runId }) => runId), ["run-worker"]);
+});
+
+test("provider activity lookup uses the immutable progress timestamp, not drain time", () => {
+  const receivedAt = "2026-08-05T00:05:00.000Z";
+  const events = [createTaskEvent(
+    "event-3",
+    "task-1",
+    "runtime.provider-turn-progress",
+    {
+      runId: "run-1",
+      roleName: "worker",
+      agentId: "agent-1",
+      adapterId: "codex",
+      nativeSessionId: "native-1",
+      launchId: "launch-1",
+      progressAt: receivedAt
+    },
+    NOW
+  )];
+  assert.equal(latestRunActivityAt(events, "run-1"), receivedAt);
+});
+
+test("malformed provider progress cannot become durable activity through event creation time", () => {
+  const events = [createTaskEvent(
+    "event-4",
+    "task-1",
+    "runtime.provider-turn-progress",
+    { runId: "run-1" },
+    NOW
+  )];
+  assert.equal(latestRunActivityAt(events, "run-1"), undefined);
+  assert.equal(latestRunProgressAt(events, "run-1"), undefined);
+});
+
 test("mismatched Leader processing is not current action evidence", async () => {
   const store = stallStore({
     roleName: "leader",
@@ -826,8 +1066,8 @@ function stallStore(options = {}) {
             batch: {
               fromSequence: 1,
               toSequence: 1,
-              reasons: ["leader-action"],
-              refs: [],
+              reasons: options.leaderProcessing.reasons ?? ["leader-action"],
+              refs: options.leaderProcessing.refs ?? [],
               requestCount: 1,
               firstQueuedAt: options.leaderProcessing.startedAt,
               lastQueuedAt: options.leaderProcessing.startedAt

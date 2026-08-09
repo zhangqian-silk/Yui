@@ -167,6 +167,67 @@ test("a Worker stall is Leader-owned checkpoint attention, while a Leader stall 
   assert.equal(leader.attention[0].kind, "leader-stalled");
 });
 
+test("healthy execution remains visible while one Worker routes checkpoint attention", () => {
+  const result = projection({
+    roles: [role("worker"), role("worker-2")],
+    runs: [run("worker"), run("worker-2")],
+    events: [{
+      type: "run.stalled",
+      createdAt: NOW.toISOString(),
+      payload: { runId: "worker-run-1", progressAt: "2026-08-09T11:00:00.000Z" }
+    }]
+  });
+  assert.equal(result.status, "progressing-with-attention");
+  assert.equal(result.activeExecutorCount, 2);
+  assert.equal(result.owner, "leader");
+  assert.equal(result.action, "inspect-attention");
+  assert.equal(result.attention.length, 1);
+});
+
+test("newer exact Run progress clears an older stall episode immediately", () => {
+  const result = projection({
+    roles: [role("worker")],
+    runs: [run("worker")],
+    events: [
+      {
+        type: "run.stalled",
+        createdAt: "2026-08-09T11:30:00.000Z",
+        payload: { runId: "worker-run-1", progressAt: "2026-08-09T11:00:00.000Z" }
+      },
+      {
+        type: "run.progress",
+        createdAt: "2026-08-09T11:45:00.000Z",
+        payload: { runId: "worker-run-1", progressAt: "2026-08-09T11:45:00.000Z" }
+      }
+    ]
+  });
+  assert.equal(result.status, "waiting-on-agents");
+  assert.deepEqual(result.attention, []);
+});
+
+test("Leader stall notification and its exact run episode project once", () => {
+  const progressAt = "2026-08-09T11:00:00.000Z";
+  const result = projection({
+    roles: [role("leader")],
+    runs: [run("leader")],
+    operatorNotification: {
+      type: "leader-stalled",
+      runId: "leader-run-1",
+      progressAt,
+      message: "Leader has no progress",
+      updatedAt: NOW.toISOString()
+    },
+    events: [{
+      type: "run.stalled",
+      createdAt: NOW.toISOString(),
+      payload: { runId: "leader-run-1", progressAt }
+    }]
+  });
+  assert.equal(result.attention.length, 1);
+  assert.equal(result.attention[0].id, `leader-stall:leader-run-1:${progressAt}`);
+  assert.equal(result.attention[0].owner, "operator");
+});
+
 test("provider/session identity mismatch fails closed", () => {
   const result = projection({
     roles: [{ ...role("worker"), activeAgentId: "different-agent" }],
@@ -186,6 +247,19 @@ test("completed Tasks stop monitoring without archiving or mutation", () => {
   assert.equal(result.status, "completed");
   assert.equal(result.monitoring, "stopped");
   assert.equal(result.action, "none");
+});
+
+test("retired and archived Tasks expose their exact stopped disposition", () => {
+  for (const terminal of ["retired", "archived"]) {
+    const result = projectTaskExecution({
+      task: task(terminal),
+      roles: [role("leader")],
+      runs: [run("leader")]
+    });
+    assert.equal(result.status, terminal);
+    assert.equal(result.taskStatus, terminal);
+    assert.equal(result.monitoring, "stopped");
+  }
 });
 
 test("candidate and integration facts route to Leader action", () => {

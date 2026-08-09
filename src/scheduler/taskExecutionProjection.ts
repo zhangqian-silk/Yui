@@ -12,6 +12,7 @@ import type { ReviewRound } from "../review/reviewRound.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import type { ChangeSet } from "../integration/changeSet.js";
 import type { WorkMailbox } from "../coordination/workMailbox.js";
+import { isRoleRunStalled, latestStallProgressAt } from "./roleRunStall.js";
 
 /**
  * Task-first status is a read-model vocabulary. It is deliberately not a new
@@ -24,9 +25,12 @@ export type TaskExecutionStatus =
   | "waiting-user"
   | "recovering"
   | "attention"
+  | "progressing-with-attention"
   | "blocked"
   | "working"
-  | "completed";
+  | "completed"
+  | "retired"
+  | "archived";
 
 export type TaskExecutionOwner =
   | "leader"
@@ -248,9 +252,10 @@ export function projectTaskExecution(
     ? "stopped"
     : "active";
   if (monitoring === "stopped") {
+    const stoppedStatus = task.status as Extract<TaskStatus, "completed" | "retired" | "archived">;
     return projection({
       task,
-      status: "completed",
+      status: stoppedStatus,
       owner: "none",
       action: "none",
       summary: `Task ${task.id} is ${task.status}; execution monitoring is stopped.`,
@@ -279,6 +284,10 @@ export function projectTaskExecution(
   const blockers = collectBlockers(workItems, reviewRounds, integrations, openInputs, task);
   const activeExecutors = activeRuns.filter((run) => isExecutionCarrier(run));
   const activeWorkers = activeExecutors.filter((run) => run.roleName !== "leader");
+  const healthyExecutionCarriers = activeWorkers.filter((run) => (
+    run.deliveredAt !== undefined
+    && !attention.some((item) => item.runId === run.id)
+  ));
   const activeLeader = activeRuns.find((run) => run.roleName === "leader");
   const pendingDelivery = activeRuns.some((run) => run.deliveredAt === undefined);
   const hasPendingLeaderWork = pendingWakeup !== null
@@ -301,13 +310,17 @@ export function projectTaskExecution(
 
   if (attention.length > 0) {
     const first = attention[0];
+    const progressingWithAttention = first.kind === "checkpoint-overdue"
+      && healthyExecutionCarriers.length > 0;
     return projection({
       task,
-      status: "attention",
+      status: progressingWithAttention ? "progressing-with-attention" : "attention",
       owner: first.owner,
       action: "inspect-attention",
-      summary: first.summary,
-      reason: first.kind,
+      summary: progressingWithAttention
+        ? `${healthyExecutionCarriers.length} healthy execution carrier(s) remain while ${first.summary}`
+        : first.summary,
+      reason: progressingWithAttention ? "progressing-with-attention" : first.kind,
       monitoring,
       failClosed: hasLeaderMismatch || attention.some((item) => item.failClosed === true),
       activeRuns: activeRunViews,
@@ -577,11 +590,12 @@ function collectAttention(input: Readonly<{
         failClosed: true
       });
     }
-    if (isRoleRunStalledEvent(events, run.id)) {
+    if (isRoleRunStalled(events, run.id)) {
       if (run.roleName === "leader") {
+        const progressAt = latestStallProgressAt(events, run.id) ?? "unknown";
         result.push({
           kind: "leader-stalled",
-          id: `leader-stall:${run.id}`,
+          id: `leader-stall:${run.id}:${progressAt}`,
           owner: "operator",
           summary: `Leader Run ${run.id} has an unresolved no-progress attention.`,
           runId: run.id,
@@ -726,17 +740,6 @@ function isRecoveryPending(
     ...(mailbox?.processing?.batch.reasons ?? [])
   ];
   return reasons.some((reason) => /(?:recover|stalled|failed|uncertain|orphan)/iu.test(reason));
-}
-
-function isRoleRunStalledEvent(events: readonly TaskEvent[], runId: string): boolean {
-  const stalled = events
-    .filter((event) => event.type === "run.stalled" && event.payload.runId === runId)
-    .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
-  if (stalled === undefined) return false;
-  const recovered = events
-    .filter((event) => event.type === "run.recovered" && event.payload.runId === runId)
-    .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
-  return recovered === undefined || Date.parse(recovered.createdAt) <= Date.parse(stalled.createdAt);
 }
 
 function uniqueAttention(items: readonly TaskExecutionAttention[]): TaskExecutionAttention[] {

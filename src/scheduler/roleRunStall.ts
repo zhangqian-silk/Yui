@@ -19,6 +19,8 @@ import type { RoleLiveStatusSnapshot } from "./roleRunLiveness.js";
 export const DEFAULT_STALL_WINDOW_MS = 30 * 60_000;
 /** Cheap execution-stall candidate filter; the real threshold remains 30m. */
 export const DEFAULT_EXECUTION_STALL_CANDIDATE_AGE_MS = 10 * 60_000;
+/** Resource activity may postpone attention only within this semantic gap. */
+export const DEFAULT_RESOURCE_ONLY_SEMANTIC_GAP_MS = 90 * 60_000;
 
 export const RUN_PROGRESS_EVENT = "run.progress";
 export const RUN_STALLED_EVENT = "run.stalled";
@@ -267,6 +269,11 @@ export function latestRunProgressAt(
       && event.type !== "runtime.provider-turn-progress"
     ) continue;
     if (event.payload.runId !== runId) continue;
+    if (
+      event.type === "runtime.provider-turn-progress"
+      && (typeof event.payload.progressAt !== "string"
+        || !Number.isFinite(Date.parse(event.payload.progressAt)))
+    ) continue;
     const progressAt = typeof event.payload.progressAt === "string"
       && Number.isFinite(Date.parse(event.payload.progressAt))
       ? event.payload.progressAt
@@ -469,7 +476,13 @@ export function latestRunActivityAt(
       || event.type === RUN_STALLED_EVENT
       || event.type === RUN_RECOVERED_EVENT
     ) continue;
-    const activityAt = event.type === RUN_PROGRESS_EVENT
+    if (
+      event.type === "runtime.provider-turn-progress"
+      && (typeof event.payload.progressAt !== "string"
+        || !Number.isFinite(Date.parse(event.payload.progressAt)))
+    ) continue;
+    const activityAt = (event.type === RUN_PROGRESS_EVENT
+      || event.type === "runtime.provider-turn-progress")
       && typeof event.payload.progressAt === "string"
       && Number.isFinite(Date.parse(event.payload.progressAt))
       ? event.payload.progressAt
@@ -989,27 +1002,129 @@ function classifyLeaderStall(
   ));
   const mailbox = store.getWorkMailbox({ kind: "role", taskId, roleName: "leader" });
   const pending = mailbox?.pending;
-  const pendingStalled = pending !== null
-    && pending !== undefined
-    && Number.isFinite(Date.parse(pending.lastQueuedAt))
-    && now.getTime() - Date.parse(pending.lastQueuedAt) >= windowMs;
   const processing = mailbox?.processing;
   const processingCurrent = processing?.executionRef?.type === "run"
     && processing.executionRef.taskId === taskId
     && leader !== undefined
     && processing.executionRef.id === leader.candidate.run.id;
-  const processingStartedAt = processing === undefined || processing === null
-    ? NaN
-    : Date.parse(processing.startedAt);
-  const leaderProgressAt = leader === undefined ? NaN : Date.parse(leader.progressAt);
-  const processingStalled = processingCurrent
-    && Number.isFinite(processingStartedAt)
-    && now.getTime() - processingStartedAt >= windowMs
-    && Number.isFinite(leaderProgressAt)
-    && leaderProgressAt <= processingStartedAt;
-  if (processingStalled || pendingStalled) return "truly-stalled";
+  const currentRunId = leader?.candidate.run.id;
+  if (processingCurrent && currentRunId !== undefined && processing !== null) {
+    const actionProgressAt = latestLeaderActionProgressAt(
+      store,
+      taskId,
+      currentRunId,
+      processing.startedAt,
+      processing.batch,
+      now
+    );
+    const actionProgressMs = Date.parse(actionProgressAt);
+    const actionStalled = Number.isFinite(actionProgressMs)
+      && now.getTime() - actionProgressMs >= windowMs;
+    if (actionStalled) return "truly-stalled";
+    return downstreamPresent ? "waiting-on-workers" : "working";
+  }
+  const pendingStalled = pending !== null
+    && pending !== undefined
+    && Number.isFinite(Date.parse(pending.lastQueuedAt))
+    && now.getTime() - Date.parse(pending.lastQueuedAt) >= windowMs;
+  if (pendingStalled) return "truly-stalled";
   if (downstreamPresent) return "waiting-on-workers";
   return "truly-stalled";
+}
+
+const LEADER_ACTION_PROGRESS_TYPES = new Set([
+  RUN_PROGRESS_EVENT,
+  "runtime.provider-turn-progress",
+  "input.answered",
+  "input.auto-answered",
+  "input.cancelled",
+  "work.accepted",
+  "work.updated",
+  "work.retired",
+  "review.completed",
+  "review.failed",
+  "integration.updated",
+  "integration.completed",
+  "integration.failed",
+  "decision.recorded",
+  "decision.superseded",
+  "milestone.added"
+]);
+
+function latestLeaderActionProgressAt(
+  store: SchedulerStorePort,
+  taskId: string,
+  runId: string,
+  startedAt: string,
+  batch: Readonly<{
+    refs: readonly Readonly<{ type: string; taskId?: string; id: string }>[];
+    reasons: readonly string[];
+  }>,
+  now: Date
+): string {
+  const startedMs = Date.parse(startedAt);
+  if (!Number.isFinite(startedMs)) return "";
+  let latest = startedAt;
+  let latestMs = startedMs;
+  for (const event of store.listEvents?.(taskId) ?? []) {
+    if (!LEADER_ACTION_PROGRESS_TYPES.has(event.type)) continue;
+    if (event.payload.taskId !== undefined && event.payload.taskId !== taskId) continue;
+    if (!leaderActionEventMatches(event, taskId, runId, batch)) continue;
+    const createdMs = Date.parse(event.createdAt);
+    if (
+      !Number.isFinite(createdMs)
+      || createdMs < startedMs
+      || createdMs > now.getTime()
+    ) continue;
+    const value = (event.type === RUN_PROGRESS_EVENT
+      || event.type === "runtime.provider-turn-progress")
+      && typeof event.payload.progressAt === "string"
+      && Number.isFinite(Date.parse(event.payload.progressAt))
+      ? event.payload.progressAt
+      : event.createdAt;
+    const valueMs = Date.parse(value);
+    if (
+      !Number.isFinite(valueMs)
+      || valueMs < startedMs
+      || valueMs > now.getTime()
+      || valueMs <= latestMs
+    ) continue;
+    latest = value;
+    latestMs = valueMs;
+  }
+  return latest;
+}
+
+function leaderActionEventMatches(
+  event: TaskEvent,
+  taskId: string,
+  runId: string,
+  batch: Readonly<{
+    refs: readonly Readonly<{ type: string; taskId?: string; id: string }>[];
+    reasons: readonly string[];
+  }>
+): boolean {
+  if (event.payload.runId === runId) return true;
+  const refs = batch.refs ?? [];
+  const refMatches = (type: string, payloadKey: string): boolean => {
+    const id = event.payload[payloadKey];
+    return typeof id === "string" && refs.some((ref) => (
+      ref.type === type
+      && ref.id === id
+      && (ref.taskId === undefined || ref.taskId === taskId)
+    ));
+  };
+  if (refMatches("run", "runId")) return true;
+  if (refMatches("work-item", "workItemId")) return true;
+  const reason = event.type.replaceAll(".", "-");
+  const reasonMatches = batch.reasons.some((candidate) => (
+    candidate === reason
+    || candidate.startsWith(`${reason}-`)
+    || reason.startsWith(`${candidate}-`)
+  ));
+  return reasonMatches && refs.some((ref) => (
+    ref.type === "task" && (ref.taskId === undefined || ref.taskId === taskId)
+  ));
 }
 
 function leaderStallEvidence(
@@ -1123,7 +1238,7 @@ function hasResourceIdentityText(value: string | undefined): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
-/** Consume at most one advisory sample for one Run/progress point. */
+/** Persist the first advisory sample and keep it bounded by the semantic gap. */
 async function consumeResourceEvidence(
   store: SchedulerStorePort,
   snapshot: RoleRunResourceEvidenceSnapshot | undefined,
@@ -1167,9 +1282,10 @@ async function consumeResourceEvidence(
       observedAt: resource.observedAt,
       now
     });
-    if (persisted === "recorded") return resource;
-    if (persisted === "already-recorded") {
-      return { ...resource, active: false, changed: false };
+    if (persisted === "recorded" || persisted === "already-recorded") {
+      return resourceFallsWithinSemanticGap(progressAt, now)
+        ? resource
+        : { ...resource, active: false, changed: false };
     }
     // A concurrent Run/session change invalidates this sample. Do not let the
     // stale changed bit suppress the current Run's attention episode.
@@ -1180,6 +1296,13 @@ async function consumeResourceEvidence(
     return resource;
   }
   return { ...resource, active: false, changed: false };
+}
+
+function resourceFallsWithinSemanticGap(progressAt: string, now: Date): boolean {
+  const progressMs = Date.parse(progressAt);
+  return Number.isFinite(progressMs)
+    && progressMs <= now.getTime()
+    && now.getTime() - progressMs < DEFAULT_RESOURCE_ONLY_SEMANTIC_GAP_MS;
 }
 
 function resourceEvidenceIsFresh(

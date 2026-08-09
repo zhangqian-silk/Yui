@@ -35,6 +35,8 @@ export type TaskProviderPromptAccepted = Readonly<{
 
 export type TaskProviderTurnProgress = Readonly<{
   eventId: string;
+  /** Immutable inbox admission time; provider activity must not use drain time. */
+  receivedAt: string;
   taskId: string;
   roleName: string;
   agentId: string;
@@ -262,6 +264,7 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
     if (this.observer.observeProviderTurnProgress === undefined) return "obsolete";
     const outcome = this.observer.observeProviderTurnProgress({
       eventId: event.id,
+      receivedAt: event.receivedAt,
       taskId: event.taskId,
       roleName: event.roleName,
       agentId: event.agentId,
