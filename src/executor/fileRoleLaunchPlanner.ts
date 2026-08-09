@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,7 +30,6 @@ import type {
   AgentEnvironmentRefresh,
   AgentEnvironmentRefreshPort
 } from "../runtime/ports.js";
-import { createExactInitialPromptReceipt } from "../runtime/runtimeBinding.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import { activeLiveRoleAgentSession } from "./agentExecutor.js";
@@ -52,6 +51,7 @@ import {
   serializeExactDescriptor,
   type ExactControlPlaneDescriptor
 } from "../runtime/exactControlPlane.js";
+import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
@@ -480,27 +480,9 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         `${serializeExactDescriptor(runtimeDescriptor)}\n`
       );
     }
-    const initialPromptReceipt = binding.adapterId === "codex"
-      && owner.scope === "task"
-      && input.runId !== undefined
-      ? createExactInitialPromptReceipt({
-          owner: { scope: "task", taskId: owner.taskId, roleName: role.name },
-          agentId: configured.id,
-          adapterId: configured.adapterId,
-          runId: input.runId,
-          launchId: requireText(input.launchId, "Launch id"),
-          workspace: effectiveWorkspace,
-          ...(session === null
-            ? {}
-            : { nativeSessionId: session.nativeSessionId })
-        })
-      : undefined;
     const launch = {
       command: configured.command,
       args,
-      ...(initialPromptReceipt === undefined
-        ? {}
-        : { initialPromptReceiptId: initialPromptReceipt.transportReceiptId }),
       env: {
         ...launchEnvironment,
         YUI_HOME: resolve(this.home),
@@ -546,11 +528,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         ...(owner.scope === "task" ? { status: (role as TaskRole).status } : {})
       },
       launch: scopedLaunch,
-      session,
-      ...(initialPromptReceipt === undefined ? {} : { initialPromptReceipt }),
-      ...(binding.adapterId === "codex" && input.runId !== undefined
-        ? { initialPromptRunId: input.runId }
-        : {})
+      session
     };
   }
 
@@ -561,7 +539,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       command: string;
       args: readonly string[];
       env: Readonly<Record<string, string>>;
-      initialPromptReceiptId?: string;
     }>,
     workspaceOverride?: ManagedWorkspace
   ): typeof launch {
@@ -755,21 +732,6 @@ function patchEnvironment(
   for (const name of names) delete next[name];
   for (const [name, value] of Object.entries(values)) next[name] = value;
   return next;
-}
-
-function nativeSessionIdForLaunch(
-  home: string,
-  launchId: string,
-  agentId: string,
-  adapterId: string
-): string {
-  const hex = createHash("sha256").update(JSON.stringify([
-    resolve(home),
-    requireText(launchId, "Launch id"),
-    requireText(agentId, "Agent id"),
-    requireText(adapterId, "Agent adapter id")
-  ])).digest("hex");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
 /**

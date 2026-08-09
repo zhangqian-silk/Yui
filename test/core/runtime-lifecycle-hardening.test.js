@@ -41,7 +41,6 @@ import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, archiveTask, completeTask, createTask } from "../../dist/task/task.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
-import { createExactInitialPromptReceipt } from "../../dist/runtime/index.js";
 
 const FIRST = new Date("2026-07-24T00:00:00.000Z");
 const SECOND = new Date("2026-07-24T00:00:01.000Z");
@@ -203,15 +202,7 @@ test("an active Role Run may launch from its snapshotted workspace", async (t) =
         agentId: request.agentId,
         adapterId: request.adapterId,
         hostRef: "opaque-workspace",
-        hostCreated: true,
-        initialPromptReceipt: createExactInitialPromptReceipt({
-          owner: request.owner,
-          agentId: request.agentId,
-          adapterId: request.adapterId,
-          runId: request.runId,
-          launchId: request.launchId,
-          workspace: request.workspace
-        })
+        hostCreated: false
       };
     },
     async resume() { throw new Error("unexpected resume"); },

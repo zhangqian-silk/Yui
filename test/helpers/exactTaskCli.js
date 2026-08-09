@@ -170,7 +170,23 @@ export function exactTaskCliInvocation({
   return {
     cliEntry,
     prefix: [EXACT_CONTROL_ARGUMENT, digest],
-    environment: managedEnvironment
+    environment: managedEnvironment,
+    completeFixtureRuntimeReservation() {
+      const owner = { scope: "task", taskId, roleName };
+      const mailbox = store.getWorkMailbox(runtimeLifecycleTarget(owner));
+      if (!isRuntimeLaunchReservation(mailbox?.processing, launchId)) return false;
+      const reservedRunId = mailbox.processing.executionRef?.type === "run"
+        ? mailbox.processing.executionRef.id
+        : undefined;
+      if (reservedRunId !== run?.id) {
+        throw new Error(`Fixture runtime reservation changed: ${launchId}.`);
+      }
+      return new FileSchedulerStoreAdapter(store).completeRuntimeLaunchReservation(
+        owner,
+        launchId,
+        reservedRunId
+      );
+    }
   };
 }
 

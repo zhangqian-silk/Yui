@@ -567,7 +567,7 @@ function yieldReviewThroughCli(home, store, taskId, runId, result) {
 
 function yieldRunThroughCli(home, store, taskId, roleName, runId, summary) {
   const invocation = exactTaskCliInvocation({ home, store, taskId, roleName });
-  return spawnSync(
+  const result = spawnSync(
     process.execPath,
     [
       invocation.cliEntry,
@@ -581,6 +581,8 @@ function yieldRunThroughCli(home, store, taskId, roleName, runId, summary) {
       timeout: 10_000
     }
   );
+  if (result.status === 0) invocation.completeFixtureRuntimeReservation();
+  return result;
 }
 
 function reviewWorkspaceCommand(home, store, taskId, command, reviewRoundId) {
@@ -590,7 +592,7 @@ function reviewWorkspaceCommand(home, store, taskId, command, reviewRoundId) {
     taskId,
     roleName: "leader"
   });
-  return spawnSync(
+  const result = spawnSync(
     process.execPath,
     [
       invocation.cliEntry,
@@ -603,6 +605,8 @@ function reviewWorkspaceCommand(home, store, taskId, command, reviewRoundId) {
       timeout: 10_000
     }
   );
+  if (result.status === 0) invocation.completeFixtureRuntimeReservation();
+  return result;
 }
 
 function markDelivered(store, run, now) {

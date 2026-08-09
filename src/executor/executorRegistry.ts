@@ -18,7 +18,6 @@ import {
   createPromptEnvelope,
   createSessionLaunchRequest,
   type ActivePromptPushPort,
-  type ExactInitialPromptReceipt,
   type RuntimeBinding,
   type RuntimeLaunchPreparationPort,
   type SessionHostPort
@@ -29,10 +28,6 @@ export type PlannedRoleSession = Readonly<{
   role: TmuxRole;
   launch: TmuxLaunchPlan;
   session: SchedulerRoleSession | null;
-  /** Exact Run whose first prompt is carried by the provider launch argv. */
-  initialPromptRunId?: string;
-  /** Exact transport receipt expected from the launched Role host. */
-  initialPromptReceipt?: ExactInitialPromptReceipt;
 }>;
 
 export interface RoleLaunchPlanner {
@@ -209,16 +204,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     const delivery: PreparedRoleDelivery = {
       ...deliveryBase,
       ...(binding === undefined ? {} : { launchId: binding.launchId }),
-      sessionStarted,
-      ...(
-        binding?.initialPromptReceipt !== undefined
-        && input.runId !== undefined
-        && binding.initialPromptReceipt.runId === input.runId
-        && binding.initialPromptReceipt.launchId === binding.launchId
-        && binding.initialPromptReceipt.workspace === input.workspace
-          ? { inputSubmittedAtLaunch: true }
-          : {}
-      )
+      sessionStarted
     };
     this.#prepared.set(delivery.deliveryId, {
       delivery,
@@ -247,13 +233,6 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     text: string;
   }>): Promise<"sent" | "already-sent" | "busy" | "unavailable"> {
     const prepared = this.requirePrepared(input.delivery.prepared);
-    if (input.delivery.prepared.inputSubmittedAtLaunch === true) {
-      if (prepared.binding?.initialPromptReceipt?.receiptId !== input.receiptId) {
-        throw new Error("Initial prompt transport receipt does not match the delivery receipt.");
-      }
-      this.#prepared.delete(input.delivery.prepared.deliveryId);
-      return "sent";
-    }
     if (prepared.binding !== undefined && this.runtimePorts !== undefined) {
       const runId = input.delivery.prepared.runId;
       if (runId === undefined) {

@@ -4,9 +4,7 @@ export {
   type PromptSource
 } from "./promptEnvelope.js";
 export {
-  createExactInitialPromptReceipt,
   createRuntimeBinding,
-  type ExactInitialPromptReceipt,
   type RuntimeBinding
 } from "./runtimeBinding.js";
 export {

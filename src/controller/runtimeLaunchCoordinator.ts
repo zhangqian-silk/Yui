@@ -168,7 +168,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       ...(request.runId === undefined ? {} : { runId: request.runId })
     }, assertLaunchCurrent, this.#now());
     let reusedConfirmedRunningHost = false;
-    let requireInitialPromptReceipt = false;
+    let launchPromptAcknowledgementRequired = false;
 
     if (reservation.status === "existing") {
       if (!reservation.launchId.startsWith(generationPrefix)) {
@@ -231,7 +231,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
           );
         }
         reusedConfirmedRunningHost = true;
-        requireInitialPromptReceipt = sameRunReservation
+        launchPromptAcknowledgementRequired = sameRunReservation
           && request.adapterId === "codex";
         assertLaunchCurrent();
       }
@@ -250,9 +250,6 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
             effective: request.effective,
             workspace: request.workspace,
             ...(request.runId === undefined ? {} : { runId: request.runId }),
-            ...(requireInitialPromptReceipt
-              ? { initialPromptReceiptRequired: true }
-              : {}),
             ...(request.environment === undefined
               ? {}
               : { environment: request.environment })
@@ -266,9 +263,6 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
             effective: request.effective,
             workspace: request.workspace,
             ...(request.runId === undefined ? {} : { runId: request.runId }),
-            ...(requireInitialPromptReceipt
-              ? { initialPromptReceiptRequired: true }
-              : {}),
             ...(request.environment === undefined
               ? {}
               : { environment: request.environment }),
@@ -281,7 +275,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
         rawBinding,
         request,
         launchId,
-        requireInitialPromptReceipt
+        launchPromptAcknowledgementRequired
       );
     } catch (error) {
       if (error instanceof RuntimeBindingContractError) {
@@ -438,7 +432,7 @@ function requireMatchingRuntimeBinding(
   raw: RuntimeBinding,
   request: CoordinatedRuntimeLaunchRequest,
   launchId: string,
-  initialPromptReceiptRequired: boolean
+  launchPromptAcknowledgementRequired: boolean
 ): RuntimeBinding {
   let binding: RuntimeBinding;
   try {
@@ -458,19 +452,19 @@ function requireMatchingRuntimeBinding(
         && binding.owner.taskId === request.owner.taskId
       )
     );
-  const launchCarriedPromptReceiptRequired = request.owner.scope === "task"
+  const launchCarriedPromptAcknowledgementRequired = request.owner.scope === "task"
     && request.adapterId === "codex"
     && request.runId !== undefined
-    // A portable host must explicitly report reuse before the Coordinator may
-    // take the active-push path. A new or ambiguous host cannot turn a missing
-    // argv receipt into a resend.
+    // An explicit reused-host result may take the receipt-backed active-push
+    // path. A new or ambiguous host may have carried the prompt in argv, but
+    // Yui has no provider acknowledgement for that transport.
     && binding.hostCreated !== false;
   if (
-    (initialPromptReceiptRequired || launchCarriedPromptReceiptRequired)
-    && binding.initialPromptReceipt === undefined
+    launchPromptAcknowledgementRequired
+    || launchCarriedPromptAcknowledgementRequired
   ) {
     throw new RuntimeBindingContractError(
-      `Session host did not acknowledge the exact initial prompt receipt: ${
+      `Session host cannot acknowledge the exact launch-carried prompt: ${
         request.owner.roleName
       }.`
     );
@@ -480,18 +474,6 @@ function requireMatchingRuntimeBinding(
     || !ownerMatches
     || binding.agentId !== request.agentId
     || binding.adapterId !== request.adapterId
-    || (
-      binding.initialPromptRunId !== undefined
-      && binding.initialPromptRunId !== request.runId
-    )
-    || (
-      binding.initialPromptReceipt !== undefined
-      && (
-        binding.initialPromptReceipt.runId !== request.runId
-        || binding.initialPromptReceipt.launchId !== launchId
-        || binding.initialPromptReceipt.workspace !== request.workspace
-      )
-    )
     || (
       request.mode === "resume"
       && binding.nativeSessionId !== request.nativeSessionId

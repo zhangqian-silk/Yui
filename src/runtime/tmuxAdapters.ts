@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 
 import {
   createRuntimeBinding,
-  type ExactInitialPromptReceipt,
   type RuntimeBinding
 } from "./runtimeBinding.js";
 import {
@@ -34,15 +33,12 @@ export type RuntimeTmuxLaunchPlan = Readonly<{
   command: string;
   args: readonly string[];
   env: Readonly<Record<string, string>>;
-  initialPromptReceiptId?: string;
 }>;
 
 export type RuntimePlannedSession = Readonly<{
   role: RuntimeTmuxRole;
   launch: RuntimeTmuxLaunchPlan;
   session: Readonly<{ nativeSessionId?: string }> | null;
-  initialPromptRunId?: string;
-  initialPromptReceipt?: ExactInitialPromptReceipt;
 }>;
 
 /** Narrow structural boundary implemented by FileRoleLaunchPlanner. */
@@ -100,16 +96,6 @@ export interface RuntimeTmuxHostPort {
     roleName: string;
     dead: boolean;
   }>[]>;
-  hasDeliveryReceipt?(
-    hostId: string,
-    roleName: string,
-    receiptId: string
-  ): boolean;
-  hasDeliveryReceiptAsync?(
-    hostId: string,
-    roleName: string,
-    receiptId: string
-  ): Promise<boolean>;
 }
 
 export type RuntimeTmuxPaneState = Readonly<{
@@ -366,33 +352,6 @@ export class TmuxSessionHost implements SessionHostPort {
       planned.role,
       planned.launch
     );
-    const promptCarriedAtLaunch = hostCreated
-      && request.owner.scope === "task"
-      && request.adapterId === "codex"
-      && request.runId !== undefined;
-    if (promptCarriedAtLaunch && planned.initialPromptReceipt === undefined) {
-      throw new Error(
-        `Exact initial prompt transport receipt was not planned: ${request.owner.roleName}.`
-      );
-    }
-    const initialPromptReceipt = planned.initialPromptReceipt === undefined
-      ? undefined
-      : await hasDeliveryReceipt(
-          this.tmux,
-          hostId,
-          request.owner.roleName,
-          planned.initialPromptReceipt.transportReceiptId
-        )
-        ? planned.initialPromptReceipt
-        : undefined;
-    if (
-      (promptCarriedAtLaunch || request.initialPromptReceiptRequired === true)
-      && initialPromptReceipt === undefined
-    ) {
-      throw new Error(
-        `Exact initial prompt transport receipt is missing: ${request.owner.roleName}.`
-      );
-    }
     return createRuntimeBinding({
       id: bindingId,
       launchId: request.launchId,
@@ -405,7 +364,6 @@ export class TmuxSessionHost implements SessionHostPort {
         roleName: request.owner.roleName
       }),
       hostCreated,
-      ...(initialPromptReceipt === undefined ? {} : { initialPromptReceipt }),
       ...(nativeSessionId === undefined ? {} : { nativeSessionId })
     });
   }
@@ -450,18 +408,6 @@ async function ensureRoleWindow(
   return tmux.ensureRoleWindowAsync === undefined
     ? tmux.ensureRoleWindow(hostId, role, launch)
     : tmux.ensureRoleWindowAsync(hostId, role, launch);
-}
-
-async function hasDeliveryReceipt(
-  tmux: RuntimeTmuxHostPort,
-  hostId: string,
-  roleName: string,
-  receiptId: string
-): Promise<boolean> {
-  if (tmux.hasDeliveryReceiptAsync !== undefined) {
-    return tmux.hasDeliveryReceiptAsync(hostId, roleName, receiptId);
-  }
-  return tmux.hasDeliveryReceipt?.(hostId, roleName, receiptId) ?? false;
 }
 
 async function probeRoleStatus(

@@ -980,7 +980,16 @@ async function preflightManagedTaskControlPlane(): Promise<void> {
     digest,
     control.yuiHome
   );
-  assertExactTaskRuntimeState(runtime, new FileTaskStore(control.yuiHome));
+  const preallocatedClaudeCallback = args.length === 2
+    && args[0] === "internal"
+    && args[1] === "claude-hook";
+  assertExactTaskRuntimeState(
+    runtime,
+    new FileTaskStore(control.yuiHome),
+    preallocatedClaudeCallback
+      ? { preallocatedNativeSessionReservation: { yuiHome: control.yuiHome } }
+      : {}
+  );
 }
 
 function cleanupCliError(error: unknown, fallbackResource: string): CliError {

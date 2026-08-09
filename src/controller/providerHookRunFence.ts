@@ -1,9 +1,11 @@
 import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import { FileTaskStore } from "../storage/taskStore.js";
 import {
+  hasRuntimeCleanupObligation,
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
+import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.js";
 
 export type ProviderHookRunFence = Readonly<{
   taskId: string;
@@ -16,6 +18,10 @@ export type ProviderHookRunFence = Readonly<{
   workspace: string;
 }>;
 
+export type ProviderHookRunFenceOptions = Readonly<{
+  allowPreallocatedClaudeStartup?: boolean;
+}>;
+
 /**
  * Resolves turn identity from the current durable in-flight fence. Provider
  * processes are long-lived, so their launch environment cannot identify later
@@ -25,7 +31,8 @@ export type ProviderHookRunFence = Readonly<{
 export function resolveProviderHookRunFence(
   environment: NodeJS.ProcessEnv,
   adapterId: AgentAdapterId,
-  payloadNativeSessionId: string
+  payloadNativeSessionId: string,
+  options: ProviderHookRunFenceOptions = {}
 ): ProviderHookRunFence {
   if (environment.YUI_SESSION_SCOPE !== "task") {
     throw new Error("Provider lifecycle hook requires a Task session scope.");
@@ -74,18 +81,32 @@ export function resolveProviderHookRunFence(
       || session.effective.workspace.root !== workspace) {
       throw new Error("Provider lifecycle hook Session does not match its durable generation.");
     }
-  } else if (adapterId !== "codex" || expectedNativeSessionId !== undefined) {
-    // Only a runtime-discovered Codex session may report its native id before
-    // the RoleSessionSet contains that session. Preallocated providers must
-    // already match their durable Session record.
-    throw new Error("Provider lifecycle hook Session is not durably reserved.");
   } else {
     const mailbox = store.getWorkMailbox(runtimeLifecycleTarget({
       scope: "task",
       taskId,
       roleName
     }));
-    if (!isRuntimeLaunchReservation(mailbox?.processing, launchId)) {
+    const exactReservation = isRuntimeLaunchReservation(mailbox?.processing, launchId)
+      && !hasRuntimeCleanupObligation(mailbox);
+    const runtimeDiscoveredCodex = adapterId === "codex"
+      && expectedNativeSessionId === undefined
+      && exactReservation;
+    const executionRef = mailbox?.processing?.executionRef;
+    const deterministicClaudeStartup = adapterId === "claude"
+      && options.allowPreallocatedClaudeStartup === true
+      && expectedNativeSessionId !== undefined
+      && exactReservation
+      && executionRef?.type === "run"
+      && executionRef.taskId === taskId
+      && executionRef.id === inFlight.runId
+      && nativeSessionId === nativeSessionIdForLaunch(
+        home,
+        launchId,
+        agentId,
+        adapterId
+      );
+    if (!runtimeDiscoveredCodex && !deterministicClaudeStartup) {
       throw new Error("Provider lifecycle hook launch is not durably reserved.");
     }
   }

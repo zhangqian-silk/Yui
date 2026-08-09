@@ -288,7 +288,7 @@ test("Role launches clear inherited process environment and use only the complet
   ]);
 });
 
-test("a launch-carried prompt records its exact pane-local transport receipt", () => {
+test("a launch-carried prompt cannot record Yui's own pane marker as transport acknowledgement", () => {
   const calls = [];
   const manager = new TmuxManager("tmux-test", {
     run(command, args) {
@@ -299,22 +299,19 @@ test("a launch-carried prompt records its exact pane-local transport receipt", (
   }, { yuiHome: "/tmp/yui-home" });
 
   manager.ensureRoleWindow("task-1", { name: "worker", workspace: "/tmp/work" }, {
-    command: "codex",
-    args: ["--", "exact prompt"],
+    // Reproduces the bounded gap without an Agent: tmux can create this pane
+    // successfully even though no provider can accept the prompt.
+    command: "/bin/sh",
+    args: ["-c", "sleep 0.01"],
     env: {},
     initialPromptReceiptId: "exact-transport-receipt"
   });
 
   const launch = calls.find(({ args }) => args.includes("new-session"));
-  const commandEnd = launch.args.indexOf(";", launch.args.indexOf("new-session"));
-  assert.notEqual(commandEnd, -1);
-  assert.deepEqual(launch.args.slice(commandEnd, commandEnd + 5), [
-    ";",
-    "set-option", "-w", "-t",
-    `${yuiTmuxSessionName("/tmp/yui-home", "task-1")}:worker`
+  assert.deepEqual(launch.args.slice(launch.args.indexOf("--") + 1), [
+    "env", "-i", "--", "/bin/sh", "-c", "sleep 0.01"
   ]);
-  assert.match(launch.args[commandEnd + 5], /^@yui_delivery_[a-f0-9]{64}$/u);
-  assert.equal(launch.args[commandEnd + 6], "1");
+  assert.equal(launch.args.includes("set-option", launch.args.indexOf("new-session")), false);
 });
 
 class TtyInput extends PassThrough {

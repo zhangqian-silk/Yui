@@ -2140,6 +2140,18 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         case "idempotent":
           return "applied";
         case "apply":
+          if (
+            decision.outcome.outcome === "mark-ready"
+            && input.adapterId === "claude"
+            && input.sessionSource === "startup"
+            && store.getTaskRoleSessionSet(input.taskId, input.roleName)
+              ?.sessions[input.agentId] === undefined
+          ) {
+            // Claude emits startup readiness after native process creation but
+            // before the Controller projects its preallocated Session. Keep
+            // the immutable fact queued until that exact Session is durable.
+            return "deferred";
+          }
           if (decision.outcome.outcome === "bind-native-session") {
             const role = store.getRole(input.taskId, input.roleName);
             const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
@@ -2194,6 +2206,17 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             },
             now
           ));
+          if (
+            decision.outcome.outcome === "mark-ready"
+            && input.adapterId === "claude"
+            && input.sessionSource === "startup"
+          ) {
+            completeRuntimeHookReservation(
+              store,
+              { scope: "task", taskId: input.taskId, roleName: input.roleName },
+              input.launchId
+            );
+          }
           return "applied";
       }
     });

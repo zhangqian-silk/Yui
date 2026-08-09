@@ -4,7 +4,6 @@ import test from "node:test";
 import {
   TmuxPromptPushAdapter,
   TmuxSessionHost,
-  createExactInitialPromptReceipt,
   createPromptEnvelope,
   createRuntimeBinding,
   createSessionLaunchRequest
@@ -31,25 +30,10 @@ function fakePlan(nativeSessionId = undefined) {
 
 test("TmuxSessionHost starts task owners through the task planner and returns an opaque binding", async () => {
   const calls = [];
-  const promptReceipt = createExactInitialPromptReceipt({
-    owner: { scope: "task", taskId: "task-1", roleName: "leader" },
-    agentId: "codex-personal",
-    adapterId: "codex",
-    runId: "agent-run-1",
-    launchId: "launch-1",
-    workspace: "/repo"
-  });
   const planner = {
     plan(input) {
       calls.push(["plan", input]);
-      return {
-        ...fakePlan(),
-        launch: {
-          ...fakePlan().launch,
-          initialPromptReceiptId: promptReceipt.transportReceiptId
-        },
-        initialPromptReceipt: promptReceipt
-      };
+      return fakePlan();
     },
     planGlobalRole() {
       throw new Error("unexpected global plan");
@@ -61,10 +45,6 @@ test("TmuxSessionHost starts task owners through the task planner and returns an
     },
     async ensureRoleWindowAsync(taskId, role, launch) {
       calls.push(["ensure-async", taskId, role, launch]);
-      return true;
-    },
-    async hasDeliveryReceiptAsync(taskId, roleName, receiptId) {
-      calls.push(["receipt-async", taskId, roleName, receiptId]);
       return true;
     },
     probeRoleStatus() {
@@ -105,52 +85,32 @@ test("TmuxSessionHost starts task owners through the task planner and returns an
       mode: "new",
       runId: "agent-run-1"
     }],
-    ["ensure-async", "task-1", fakePlan().role, {
-      ...fakePlan().launch,
-      initialPromptReceiptId: promptReceipt.transportReceiptId
-    }]
+    ["ensure-async", "task-1", fakePlan().role, fakePlan().launch]
   ]);
   assert.equal(binding.id, "binding-1");
   assert.equal(binding.launchId, "launch-1");
   assert.equal(binding.hostRef.startsWith("yui-tmux:v1:"), true);
-  assert.deepEqual(calls[2], [
-    "receipt-async", "task-1", "leader", promptReceipt.transportReceiptId
-  ]);
-  assert.deepEqual(binding.initialPromptReceipt, promptReceipt);
+  assert.equal("initialPromptReceipt" in binding, false);
   assert.equal("nativeSessionId" in binding, false);
   assert.deepEqual(await host.inspect(binding), { state: "running" });
   assert.deepEqual(calls.at(-1), ["probe-async", "task-1", "leader"]);
 });
 
-test("a newly launched argv prompt fails closed when its exact pane receipt is missing or stale", async () => {
-  const promptReceipt = createExactInitialPromptReceipt({
-    owner: { scope: "task", taskId: "task-1", roleName: "leader" },
-    agentId: "codex-personal",
-    adapterId: "codex",
-    runId: "agent-run-1",
-    launchId: "launch-1",
-    workspace: "/repo"
-  });
-  const queried = [];
+test("planner metadata cannot inject a launch prompt acknowledgement into a runtime binding", async () => {
+  let queried = false;
   const host = new TmuxSessionHost({
     plan() {
       return {
         ...fakePlan(),
-        launch: {
-          ...fakePlan().launch,
-          initialPromptReceiptId: promptReceipt.transportReceiptId
-        },
-        initialPromptReceipt: promptReceipt
+        initialPromptReceipt: { receiptId: "not-a-supported-seam" }
       };
     },
     planGlobalRole() { throw new Error("unexpected global plan"); }
   }, {
     async ensureRoleWindowAsync() { return true; },
-    async hasDeliveryReceiptAsync(taskId, roleName, receiptId) {
-      queried.push([taskId, roleName, receiptId]);
-      // A stale receipt on another window/generation cannot acknowledge this
-      // exact launch-carried prompt.
-      return receiptId === "initial-prompt:stale-cross-pane";
+    async hasDeliveryReceiptAsync() {
+      queried = true;
+      throw new Error("launch must not query a delivery receipt");
     },
     probeRoleStatus() { return "running"; },
     killRole() {}
@@ -166,13 +126,10 @@ test("a newly launched argv prompt fails closed when its exact pane receipt is m
     runId: "agent-run-1"
   });
 
-  await assert.rejects(
-    host.start(request),
-    /initial prompt transport receipt is missing/i
-  );
-  assert.deepEqual(queried, [[
-    "task-1", "leader", promptReceipt.transportReceiptId
-  ]]);
+  const binding = await host.start(request);
+  assert.equal(queried, false);
+  assert.equal(binding.hostCreated, true);
+  assert.equal("initialPromptReceipt" in binding, false);
 });
 
 test("TmuxSessionHost serializes first Role windows that share one Task host", async () => {

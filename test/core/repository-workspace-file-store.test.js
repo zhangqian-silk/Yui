@@ -42,6 +42,7 @@ import {
   updateRole
 } from "../../dist/role/role.js";
 import { yieldAgentRun } from "../../dist/run/agentRun.js";
+import { createStartupReadyClaudeAgent } from "../helpers/mockClaudeAgent.js";
 import {
   createReviewRound
 } from "../../dist/review/reviewRound.js";
@@ -51,6 +52,7 @@ import {
   testEffectiveLaunch
 } from "../helpers/effectiveLaunch.js";
 import { exactTaskCliInvocation } from "../helpers/exactTaskCli.js";
+import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
 import { createInputRequest } from "../../dist/input/inputRequest.js";
 import {
   createIntegrationAttempt,
@@ -65,6 +67,10 @@ import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
 import { TaskWorkspaceCoordinator } from "../../dist/repository/taskWorkspaceCoordinator.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import {
+  isRuntimeLaunchReservation,
+  runtimeLifecycleTarget
+} from "../../dist/runtime/lifecycleReservation.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, completeTask, createTask } from "../../dist/task/task.js";
 import {
@@ -76,6 +82,7 @@ import {
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
+import { yuiTmuxServerName } from "../../dist/tmux/tmuxManager.js";
 import { WorkItemChangeSetManager } from "../../dist/workspace/workItemChangeSetManager.js";
 
 const NOW = new Date("2026-07-19T12:00:00.000Z");
@@ -101,6 +108,17 @@ function fixture(t) {
         `Fixture Controller cleanup failed: ${stopped.stderr || stopped.error?.message}`
       );
     }
+    const stoppedTmux = spawnSync(
+      process.env.YUI_TMUX_BIN ?? "tmux",
+      ["-L", yuiTmuxServerName(home), "kill-server"],
+      { encoding: "utf8", env: { ...process.env, YUI_HOME: home } }
+    );
+    assert.equal(
+      stoppedTmux.status === 0
+        || /no server running|failed to connect|error connecting/i.test(stoppedTmux.stderr ?? ""),
+      true,
+      `Fixture tmux cleanup failed: ${stoppedTmux.stderr || stoppedTmux.error?.message}`
+    );
     rmSync(root, { recursive: true, force: true });
   });
   const workspace = join(root, "workspace");
@@ -128,8 +146,15 @@ async function addProject(store, repositoryPath) {
   return store.listProjects()[0];
 }
 
-function addTaskRoles(store, task, repositoryPath, names = ["leader", "worker"]) {
-  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], NOW);
+function addTaskRoles(
+  store,
+  task,
+  repositoryPath,
+  names = ["leader", "worker"],
+  configuredAgent = undefined
+) {
+  const agent = configuredAgent
+    ?? createConfiguredAgent("codex", "codex", "codex", [], [], NOW);
   store.transaction((tx) => {
     tx.saveConfiguredAgent(agent);
     tx.saveTask(task);
@@ -308,6 +333,57 @@ test("workspace isolation preserves an absent but launch-bearing inactive Claude
     /claude.*stopped|stopped.*claude/i
   );
   assert.deepEqual(fixture.sessions(), before);
+});
+
+test("workspace isolation rechecks a runless launch reservation before placeholder retirement", async () => {
+  const fixture = placeholderIsolationStore(dormantClaudePlaceholder());
+  const before = structuredClone(fixture.sessions());
+  const target = runtimeLifecycleTarget({
+    scope: "task",
+    taskId: fixture.item.taskId,
+    roleName: fixture.item.assignee
+  });
+  let mailbox = null;
+  fixture.store.getWorkMailbox = () => mailbox;
+  let prepared = false;
+  let inspections = 0;
+  const coordinator = new TaskWorkspaceCoordinator(fixture.store, {
+    now: () => new Date(NOW),
+    async prepareTaskWorkspace() {},
+    async prepareWorkItemWorkspace() {
+      prepared = true;
+      return { path: "/must-not-be-created" };
+    }
+  }, {
+    inspectTaskRolePanes() {
+      inspections += 1;
+      if (inspections === 1) {
+        mailbox = claimPending(enqueueSignal(createWorkMailbox(target), {
+          reason: "runtime-launch-reserved",
+          refs: [{ type: "task", id: fixture.item.taskId }],
+          occurredAt: NOW.toISOString()
+        }), {
+          batchId: "late-runless-launch",
+          owner: "runtime-lifecycle",
+          startedAt: NOW.toISOString()
+        });
+      }
+      return [];
+    },
+    async stopTaskRoleSessions() {}
+  });
+
+  await assert.rejects(
+    coordinator.isolateWorkItem(fixture.item.taskId, fixture.item.id),
+    /runtime lifecycle|launch reservation|unsettled/i
+  );
+  assert.equal(inspections, 2);
+  assert.equal(prepared, false);
+  assert.deepEqual(fixture.sessions(), before);
+  assert.equal(isRuntimeLaunchReservation(
+    mailbox.processing,
+    "late-runless-launch"
+  ), true);
 });
 
 test("workspace coordination stops a live Role only after a clean preflight", async () => {
@@ -2073,6 +2149,80 @@ test("an inactive never-started Claude placeholder does not block isolation or d
   assert.equal(store.getRoleSession(task.id, "leader").status, "running");
 });
 
+test("a runless runtime launch reservation blocks isolation without retiring a never-started Claude placeholder", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Fence runless Role launch", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const claude = createConfiguredAgent("claude", "claude", "claude", [], [], NOW);
+  const worker = store.getRole(task.id, "worker");
+  store.transaction((tx) => {
+    tx.saveConfiguredAgent(claude);
+    tx.saveRole(task.id, updateRole(worker, {
+      agentBindings: {
+        ...worker.agentBindings,
+        [claude.id]: createRoleAgentBinding(claude)
+      }
+    }, NOW));
+  });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: worker.name
+  }, "codex", NOW);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: claude.id,
+    adapterId: claude.adapterId,
+    nativeSessionId: "aggregate-16-never-started-claude",
+    policy: "fixed",
+    status: "ready"
+  }, NOW);
+  sessions = { ...sessions, activeAgentId: "codex" };
+  store.saveTaskRoleSessionSet(sessions);
+  const before = structuredClone(sessions);
+  const item = createWorkItem("work-item-1", task.id, {
+    title: "Do not migrate across a reserved launch",
+    assignee: worker.name,
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const scheduler = new FileSchedulerStoreAdapter(store);
+  const owner = { scope: "task", taskId: task.id, roleName: worker.name };
+  scheduler.reserveRuntimeLaunch({
+    owner,
+    launchId: "runless-launch"
+  }, () => {}, NOW);
+  assert.equal(store.getActiveAgentRun(task.id, worker.name), null);
+  assert.equal(store.getTaskRoleSessionSet(task.id, worker.name).inFlight, null);
+  assert.equal(isRuntimeLaunchReservation(store.getWorkMailbox(
+    runtimeLifecycleTarget(owner)
+  )?.processing, "runless-launch"), true);
+  let stopped = 0;
+  const coordinator = new TaskWorkspaceCoordinator(store, preparer, {
+    inspectTaskRolePanes: () => [],
+    async stopTaskRoleSessions() { stopped += 1; }
+  });
+
+  await assert.rejects(
+    coordinator.isolateWorkItem(task.id, item.id),
+    /runtime lifecycle|launch reservation|unsettled/i
+  );
+  assert.equal(stopped, 0);
+  assert.equal(store.getWorkItemWorkspace(task.id, item.id), null);
+  assert.deepEqual(store.getTaskRoleSessionSet(task.id, worker.name), before);
+  assert.equal(isRuntimeLaunchReservation(store.getWorkMailbox(
+    runtimeLifecycleTarget(owner)
+  )?.processing, "runless-launch"), true);
+});
+
 test("Leader can capture, integrate, and clean an isolated Role result before follow-up work", async (t) => {
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
@@ -3655,7 +3805,13 @@ test("public terminal ReviewRound cleanup removes its clean workspace", async (t
       baseRef: project.developmentBranch
     }]
   }), NOW);
-  const agent = addTaskRoles(store, task, repositoryPath);
+  const agent = addTaskRoles(
+    store,
+    task,
+    repositoryPath,
+    ["leader", "worker"],
+    createStartupReadyClaudeAgent(home, NOW, "claude-mock")
+  );
   store.transaction((tx) => {
     tx.saveGlobalRole(createGlobalRole(
       "reviewer",
@@ -3749,7 +3905,13 @@ test("public dispatch prepares a WorkItem-owned read-only Develop workspace befo
       baseRef: project.developmentBranch
     }]
   }), NOW);
-  addTaskRoles(store, task, repositoryPath);
+  addTaskRoles(
+    store,
+    task,
+    repositoryPath,
+    ["leader", "worker"],
+    createStartupReadyClaudeAgent(home, NOW, "claude-mock")
+  );
   const item = createWorkItem("work-item-1", task.id, {
     title: "Inspect without writes",
     assignee: "worker",
@@ -3946,7 +4108,13 @@ test("public Task archive cleans terminal ReviewRound workspaces before archivin
       baseRef: project.developmentBranch
     }]
   }), NOW);
-  const agent = addTaskRoles(store, task, repositoryPath);
+  const agent = addTaskRoles(
+    store,
+    task,
+    repositoryPath,
+    ["leader", "worker"],
+    createStartupReadyClaudeAgent(home, NOW, "claude-mock")
+  );
   store.transaction((tx) => {
     tx.saveGlobalRole(createGlobalRole(
       "reviewer",

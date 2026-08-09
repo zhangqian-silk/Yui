@@ -26,8 +26,6 @@ export type TmuxLaunchPlan = Readonly<{
   command: string;
   args: readonly string[];
   env: Readonly<Record<string, string>>;
-  /** Exact pane-local receipt for a prompt carried by the launch argv. */
-  initialPromptReceiptId?: string;
 }>;
 
 export type TmuxPaneState = Readonly<{
@@ -193,8 +191,7 @@ export class TmuxManager {
         "-n", role.name,
         "-c", safeValue(role.workspace, "Role workspace"),
         "--",
-        ...launchCommand(launch),
-        ...initialPromptReceiptCommand(taskId, role.name, launch, this.#yuiHome)
+        ...launchCommand(launch)
       ]);
     } else {
       this.configureServerHistory();
@@ -204,8 +201,7 @@ export class TmuxManager {
         "-n", role.name,
         "-c", safeValue(role.workspace, "Role workspace"),
         "--",
-        ...launchCommand(launch),
-        ...initialPromptReceiptCommand(taskId, role.name, launch, this.#yuiHome)
+        ...launchCommand(launch)
       ]);
     }
     return true;
@@ -241,8 +237,7 @@ export class TmuxManager {
         "-n", role.name,
         "-c", safeValue(role.workspace, "Role workspace"),
         "--",
-        ...launchCommand(launch),
-        ...initialPromptReceiptCommand(taskId, role.name, launch, this.#yuiHome)
+        ...launchCommand(launch)
       ]);
     } else {
       await this.configureServerHistoryAsync();
@@ -252,8 +247,7 @@ export class TmuxManager {
         "-n", role.name,
         "-c", safeValue(role.workspace, "Role workspace"),
         "--",
-        ...launchCommand(launch),
-        ...initialPromptReceiptCommand(taskId, role.name, launch, this.#yuiHome)
+        ...launchCommand(launch)
       ]);
     }
     return true;
@@ -1272,21 +1266,6 @@ function launchCommand(launch: TmuxLaunchPlan): string[] {
   // this exact Agent. Never inherit the Controller or tmux server environment:
   // it may contain credentials belonging to another configured Agent.
   return ["env", "-i", "--", ...environment, command, ...args];
-}
-
-function initialPromptReceiptCommand(
-  taskId: string,
-  roleName: string,
-  launch: TmuxLaunchPlan,
-  yuiHome: string
-): string[] {
-  if (launch.initialPromptReceiptId === undefined) return [];
-  return [
-    ";",
-    "set-option", "-w", "-t", yuiTmuxTarget(yuiHome, taskId, roleName),
-    deliveryReceiptOption(launch.initialPromptReceiptId),
-    "1"
-  ];
 }
 
 function isExplicitlyAbsentTmuxSession(error: unknown): boolean {

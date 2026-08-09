@@ -15,9 +15,11 @@ import {
 } from "../version.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
+  hasRuntimeCleanupObligation,
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
 } from "./lifecycleReservation.js";
+import { nativeSessionIdForLaunch } from "./preallocatedNativeSession.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import { writeTextFileAtomically } from "../storage/durableFile.js";
 
@@ -351,10 +353,16 @@ export type ExactTaskRuntimeStatePort = Pick<
   | "getWorkMailbox"
 >;
 
+export type ExactTaskRuntimeStateOptions = Readonly<{
+  /** Narrow startup allowance before a deterministic preallocated Session is projected. */
+  preallocatedNativeSessionReservation?: Readonly<{ yuiHome: string }>;
+}>;
+
 /** Fences a descriptor to the one currently active durable Task runtime. */
 export function assertExactTaskRuntimeState(
   runtime: ExactTaskRuntimeDescriptor,
-  store: ExactTaskRuntimeStatePort
+  store: ExactTaskRuntimeStatePort,
+  options: ExactTaskRuntimeStateOptions = {}
 ): void {
   const task = store.getTask(runtime.taskId);
   if (task === null || task.status !== "active") {
@@ -394,16 +402,13 @@ export function assertExactTaskRuntimeState(
     throw new Error("Exact Task runtime in-flight Run fence is not current.");
   }
 
-  const reservation = runtime.launchId === undefined
-    ? false
-    : isRuntimeLaunchReservation(
-        store.getWorkMailbox(runtimeLifecycleTarget({
-          scope: "task",
-          taskId: runtime.taskId,
-          roleName: runtime.roleName
-        }))?.processing,
-        runtime.launchId
-      );
+  const lifecycleMailbox = store.getWorkMailbox(runtimeLifecycleTarget({
+    scope: "task",
+    taskId: runtime.taskId,
+    roleName: runtime.roleName
+  }));
+  const reservation = runtime.launchId !== undefined
+    && isRuntimeLaunchReservation(lifecycleMailbox?.processing, runtime.launchId);
   const sessionLaunch = runtime.launchId !== undefined
     && session?.launchId === runtime.launchId;
   if (runtime.launchId === undefined || (!reservation && !sessionLaunch)) {
@@ -413,9 +418,30 @@ export function assertExactTaskRuntimeState(
     if (session !== undefined) {
       throw new Error("Exact Task runtime native Session fence is missing.");
     }
+  } else if (session === undefined) {
+    const executionRef = lifecycleMailbox?.processing?.executionRef;
+    const preallocated = options.preallocatedNativeSessionReservation;
+    const exactPreallocatedReservation =
+      preallocated !== undefined
+      && runtime.adapterId === "claude"
+      && runtime.runId !== undefined
+      && runtime.launchId !== undefined
+      && reservation
+      && !hasRuntimeCleanupObligation(lifecycleMailbox)
+      && executionRef?.type === "run"
+      && executionRef.taskId === runtime.taskId
+      && executionRef.id === runtime.runId
+      && runtime.nativeSessionId === nativeSessionIdForLaunch(
+        preallocated.yuiHome,
+        runtime.launchId,
+        runtime.agentId,
+        runtime.adapterId
+      );
+    if (!exactPreallocatedReservation) {
+      throw new Error("Exact Task runtime native Session fence is not current.");
+    }
   } else if (
-    session === undefined
-    || session.agentId !== runtime.agentId
+    session.agentId !== runtime.agentId
     || session.adapterId !== runtime.adapterId
     || session.nativeSessionId !== runtime.nativeSessionId
     || session.launchId !== runtime.launchId

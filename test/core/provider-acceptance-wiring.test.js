@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,12 +22,28 @@ import {
 } from "../../dist/executor/agentExecutor.js";
 import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import {
+  EXACT_CONTROL_ARGUMENT,
+  YUI_CONTROL_PLANE_DESCRIPTOR,
+  YUI_TASK_RUNTIME_DESCRIPTOR,
+  createExactControlPlaneDescriptor,
+  createExactTaskRuntimeDescriptor,
+  exactControlPlaneDigest,
+  exactTaskRuntimeDescriptorPath,
+  serializeExactDescriptor
+} from "../../dist/runtime/exactControlPlane.js";
+import {
+  isRuntimeLaunchReservation,
+  runtimeLifecycleTarget
+} from "../../dist/runtime/lifecycleReservation.js";
+import { nativeSessionIdForLaunch } from "../../dist/runtime/preallocatedNativeSession.js";
+import {
   createRole,
   createRoleAgentBinding,
   updateRoleStatus
 } from "../../dist/role/role.js";
 import { createAgentRun, markAgentRunPushed } from "../../dist/run/agentRun.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import { writeTextFileAtomically } from "../../dist/storage/durableFile.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { createWorkItem, updateWorkItemStatus } from "../../dist/workItem/workItem.js";
@@ -115,7 +132,7 @@ function fixture(t, adapterId, sessionStatus = "running", options = {}) {
   const drain = () => new FileRuntimeEventProcessor(
     new FileRuntimeEventInbox(home), adapter
   ).drain(new Date("2026-08-06T02:00:02.000Z"));
-  return { home, store, task, worker, run, agent, nativeSessionId, environment, drain };
+  return { home, store, adapter, task, worker, run, agent, nativeSessionId, environment, drain };
 }
 
 test("Claude UserPromptSubmit hook folds to provider-accepted and only then writes delivered", async (t) => {
@@ -255,6 +272,217 @@ test("Claude SessionStart hook folds to a session-lifecycle event, never deliver
     (e) => e.type === "runtime.provider-session-lifecycle" && e.payload.preInputReady === "true"
   ));
 });
+
+test("exact internal Claude startup is queued before its preallocated Session is durable and folds only afterward", (t) => {
+  const fx = fixture(t, "claude", "reserved", {
+    runtimeDiscovered: true,
+    transportPushed: false
+  });
+  const nativeSessionId = nativeSessionIdForLaunch(
+    fx.home,
+    "launch-1",
+    fx.agent.id,
+    "claude"
+  );
+  const cliEntry = join(process.cwd(), "dist", "cli.js");
+  const control = createExactControlPlaneDescriptor({
+    executable: process.execPath,
+    cliEntry,
+    yuiHome: fx.home
+  });
+  const digest = exactControlPlaneDigest(control);
+  const runtime = createExactTaskRuntimeDescriptor({
+    controlPlaneDigest: digest,
+    taskId: fx.task.id,
+    roleName: fx.worker.name,
+    agentId: fx.agent.id,
+    adapterId: "claude",
+    workspace: fx.run.effective.workspace.root,
+    runId: fx.run.id,
+    launchId: "launch-1",
+    nativeSessionId
+  });
+  const runtimeSource = exactTaskRuntimeDescriptorPath(fx.home, runtime);
+  writeTextFileAtomically(runtimeSource, `${serializeExactDescriptor(runtime)}\n`);
+  assert.equal(isRuntimeLaunchReservation(fx.store.getWorkMailbox(
+    runtimeLifecycleTarget({
+      scope: "task",
+      taskId: fx.task.id,
+      roleName: fx.worker.name
+    })
+  )?.processing, "launch-1"), true);
+  const environment = {
+    ...process.env,
+    ...fx.environment,
+    YUI_NATIVE_SESSION_ID: nativeSessionId,
+    [YUI_CONTROL_PLANE_DESCRIPTOR]: serializeExactDescriptor(control),
+    [YUI_TASK_RUNTIME_DESCRIPTOR]: runtimeSource
+  };
+  const invoke = (command, payload, invocationEnvironment = environment) => spawnSync(process.execPath, [
+    cliEntry,
+    EXACT_CONTROL_ARGUMENT,
+    digest,
+    ...command
+  ], {
+    encoding: "utf8",
+    env: invocationEnvironment,
+    ...(payload === undefined ? {} : { input: JSON.stringify(payload) })
+  });
+  const inbox = new FileRuntimeEventInbox(fx.home);
+
+  const forgedNativeSessionId = "00000000-0000-4000-a000-000000000000";
+  const forgedRuntime = createExactTaskRuntimeDescriptor({
+    ...runtime,
+    nativeSessionId: forgedNativeSessionId
+  });
+  writeTextFileAtomically(runtimeSource, `${serializeExactDescriptor(forgedRuntime)}\n`);
+  const forged = invoke(["internal", "claude-hook"], {
+    hook_event_name: "SessionStart",
+    source: "startup",
+    session_id: forgedNativeSessionId
+  }, { ...environment, YUI_NATIVE_SESSION_ID: forgedNativeSessionId });
+  assert.notEqual(forged.status, 0);
+  assert.match(forged.stderr, /native Session fence is not current/i);
+  assert.equal(inbox.list().length, 0);
+  writeTextFileAtomically(runtimeSource, `${serializeExactDescriptor(runtime)}\n`);
+
+  const external = invoke(["version"]);
+  assert.notEqual(external.status, 0);
+  assert.match(external.stderr, /native Session fence is not current/i);
+  assert.equal(inbox.list().length, 0);
+  for (const payload of [
+    {
+      hook_event_name: "UserPromptSubmit",
+      session_id: nativeSessionId,
+      prompt: "must not append"
+    },
+    {
+      hook_event_name: "StopFailure",
+      session_id: nativeSessionId,
+      error: "must not append"
+    },
+    {
+      hook_event_name: "SessionStart",
+      source: "resume",
+      session_id: nativeSessionId
+    }
+  ]) {
+    const rejected = invoke(["internal", "claude-hook"], payload);
+    assert.notEqual(rejected.status, 0, payload.hook_event_name);
+    assert.equal(inbox.list().length, 0);
+  }
+
+  const invoked = invoke(["internal", "claude-hook"], {
+    hook_event_name: "SessionStart",
+    source: "startup",
+    session_id: nativeSessionId
+  });
+  assert.equal(invoked.status, 0, invoked.stderr);
+
+  assert.equal(inbox.list().length, 1);
+  const beforeSession = fx.drain();
+  assert.equal(beforeSession.acknowledgedEventIds.length, 0);
+  assert.equal(beforeSession.deferred.length, 1);
+  assert.equal(beforeSession.failed.length, 0);
+  assert.equal(inbox.list().length, 1);
+  assert.equal(fx.store.getRoleSession(fx.task.id, fx.worker.name), null);
+  assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).pushedAt, undefined);
+  assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
+
+  fx.adapter.recordRuntimeNativeSession({
+    taskId: fx.task.id,
+    roleName: fx.worker.name,
+    agentId: fx.agent.id,
+    adapterId: "claude",
+    launchId: "launch-1",
+    nativeSessionId
+  }, new Date("2026-08-06T02:00:01.500Z"));
+  const afterSession = fx.drain();
+  assert.equal(afterSession.acknowledgedEventIds.length, 1);
+  assert.equal(afterSession.deferred.length, 0);
+  assert.equal(afterSession.failed.length, 0);
+  assert.equal(inbox.list().length, 0);
+  assert.ok(fx.store.listEvents(fx.task.id).some((event) => (
+    event.type === "runtime.provider-session-lifecycle"
+      && event.payload.preInputReady === "true"
+  )));
+  assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).pushedAt, undefined);
+  assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
+  assert.equal(fx.store.getWorkMailbox(runtimeLifecycleTarget({
+    scope: "task",
+    taskId: fx.task.id,
+    roleName: fx.worker.name
+  })), null);
+});
+
+for (const mismatch of [
+  "native",
+  "launch",
+  "workspace",
+  "reservation-missing",
+  "reservation-cross-run"
+]) {
+  test(`preallocated Claude startup rejects ${mismatch} before inbox append`, async (t) => {
+    const fx = fixture(t, "claude", "reserved", {
+      runtimeDiscovered: true,
+      transportPushed: false
+    });
+    const owner = {
+      scope: "task",
+      taskId: fx.task.id,
+      roleName: fx.worker.name
+    };
+    const nativeSessionId = nativeSessionIdForLaunch(
+      fx.home,
+      "launch-1",
+      fx.agent.id,
+      "claude"
+    );
+    let environment = {
+      ...fx.environment,
+      YUI_NATIVE_SESSION_ID: nativeSessionId
+    };
+    let payloadNativeSessionId = nativeSessionId;
+    if (mismatch === "native") {
+      payloadNativeSessionId = "not-the-preallocated-native";
+    } else if (mismatch === "launch") {
+      environment = { ...environment, YUI_LAUNCH_ID: "launch-stale" };
+    } else if (mismatch === "workspace") {
+      environment = { ...environment, YUI_WORKSPACE: `${environment.YUI_WORKSPACE}-stale` };
+    } else {
+      assert.equal(fx.adapter.completeRuntimeLaunchReservation(
+        owner,
+        "launch-1"
+      ), true);
+      if (mismatch === "reservation-cross-run") {
+        fx.store.saveAgentRun(createAgentRun(
+          "agent-run-2",
+          fx.task.id,
+          fx.worker.name,
+          "new",
+          "other Run",
+          new Date("2026-08-06T02:00:01.250Z"),
+          { effective: fx.run.effective }
+        ));
+        fx.adapter.reserveRuntimeLaunch({
+          owner,
+          launchId: "launch-1",
+          runId: "agent-run-2"
+        }, () => {}, new Date("2026-08-06T02:00:01.500Z"));
+      }
+    }
+
+    await assert.rejects(runClaudeLifecycleHookCommand(JSON.stringify({
+      hook_event_name: "SessionStart",
+      source: "startup",
+      session_id: payloadNativeSessionId
+    }), environment, async () => ({})));
+    assert.equal(new FileRuntimeEventInbox(fx.home).list().length, 0);
+    assert.equal(fx.store.getRoleSession(fx.task.id, fx.worker.name), null);
+    assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).pushedAt, undefined);
+    assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
+  });
+}
 
 test("Codex SessionStart hook records session-lifecycle without pre-input readiness", async (t) => {
   const fx = fixture(t, "codex", "reserved");

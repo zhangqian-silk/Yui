@@ -1,6 +1,10 @@
 import { isDeepStrictEqual } from "node:util";
 
 import { retireConfirmedAbsentInactiveTaskRolePlaceholders } from "../executor/agentExecutor.js";
+import {
+  hasRuntimeLifecycleWork,
+  runtimeLifecycleTarget
+} from "../runtime/lifecycleReservation.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
@@ -327,6 +331,13 @@ export class TaskWorkspaceCoordinator {
         && sessions?.pendingTurnCompletion !== undefined) {
         throw new Error(`Role has unsettled Run state: ${taskId}/${roleName}.`);
       }
+      if (this.store.getWorkMailbox !== undefined && hasRuntimeLifecycleWork(
+        this.store.getWorkMailbox(
+          runtimeLifecycleTarget({ scope: "task", taskId, roleName })
+        )
+      )) {
+        throw new Error(`Role has unsettled runtime lifecycle state: ${taskId}/${roleName}.`);
+      }
     }
     const inspect = this.runtime.inspectTaskRolePanes?.bind(this.runtime);
     const observedPanes = inspect?.(taskId);
@@ -361,6 +372,13 @@ export class TaskWorkspaceCoordinator {
         }
         if (tx.getActiveAgentRun(taskId, roleName) !== null) {
           throw new Error(`Role has an active Run: ${taskId}/${roleName}.`);
+        }
+        if (tx.getWorkMailbox !== undefined && hasRuntimeLifecycleWork(
+          tx.getWorkMailbox(
+            runtimeLifecycleTarget({ scope: "task", taskId, roleName })
+          )
+        )) {
+          throw new Error(`Role has unsettled runtime lifecycle state: ${taskId}/${roleName}.`);
         }
         const sessions = tx.getTaskRoleSessionSet(taskId, roleName);
         if (sessions === null) continue;

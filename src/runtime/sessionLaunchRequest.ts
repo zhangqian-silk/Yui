@@ -13,8 +13,6 @@ type SessionLaunchRequestBase = Readonly<{
   effective: EffectiveLaunchSnapshot;
   workspace: string;
   runId?: string;
-  /** Recovery of the same exact launch must observe its prior prompt receipt. */
-  initialPromptReceiptRequired?: boolean;
   environment?: Readonly<Record<string, string>>;
 }>;
 
@@ -51,14 +49,6 @@ export function createSessionLaunchRequest(
     ...(input.runId === undefined
       ? {}
       : { runId: requireSafeIdentity(input.runId, "Run id") }),
-    ...(input.initialPromptReceiptRequired === undefined
-      ? {}
-      : {
-          initialPromptReceiptRequired: requireBoolean(
-            input.initialPromptReceiptRequired,
-            "Initial prompt receipt requirement"
-          )
-        }),
     ...(input.environment === undefined
       ? {}
       : { environment: copyEnvironment(input.environment) })
@@ -72,11 +62,6 @@ export function createSessionLaunchRequest(
     };
   }
   throw new Error("Session launch mode is invalid.");
-}
-
-function requireBoolean(value: unknown, label: string): boolean {
-  if (typeof value !== "boolean") throw new TypeError(`${label} must be boolean.`);
-  return value;
 }
 
 function copyEnvironment(

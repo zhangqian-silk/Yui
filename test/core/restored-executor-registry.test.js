@@ -204,8 +204,7 @@ test("host creation and launch argv alone cannot acknowledge the exact first Run
             agentId: request.agentId,
             adapterId: request.adapterId,
             hostRef: "opaque",
-            hostCreated: true,
-            initialPromptRunId: request.runId
+            hostCreated: true
           };
         },
         async resume() { throw new Error("unused"); },
@@ -227,7 +226,7 @@ test("host creation and launch argv alone cannot acknowledge the exact first Run
     mode: "new",
     runId: "agent-run-1"
   });
-  assert.equal(prepared.inputSubmittedAtLaunch, undefined);
+  assert.equal("inputSubmittedAtLaunch" in prepared, false);
   assert.equal(await registry.sendOnce({
     delivery: await registry.waitUntilReady(prepared),
     receiptId: "agent-run:task-1/agent-run-1",
@@ -236,14 +235,14 @@ test("host creation and launch argv alone cannot acknowledge the exact first Run
   assert.equal(pushes, 1);
 });
 
-test("an exact SessionHost prompt receipt acknowledges the first Run without a resend", async () => {
+test("unsupported SessionHost receipt metadata cannot bypass active prompt delivery", async () => {
   let pushes = 0;
   const registry = new ExecutorRegistry(
     { plan() { throw new Error("runtime host owns planning"); } },
     {
       ensureRoleWindow() { throw new Error("legacy launch must not run"); },
       waitUntilReady() { throw new Error("legacy readiness must not run"); },
-      sendRoleInputOnce() { throw new Error("receipt-backed launch must not resend"); },
+      sendRoleInputOnce() { throw new Error("runtime prompt must not use legacy tmux delivery"); },
       sendRoleInputOnceIfReady() { throw new Error("unused"); },
       probeRoleStatus() { return "running"; }
     },
@@ -287,13 +286,13 @@ test("an exact SessionHost prompt receipt acknowledges the first Run without a r
     mode: "new",
     runId: "agent-run-1"
   });
-  assert.equal(prepared.inputSubmittedAtLaunch, true);
+  assert.equal("inputSubmittedAtLaunch" in prepared, false);
   assert.equal(await registry.sendOnce({
     delivery: await registry.waitUntilReady(prepared),
     receiptId: "agent-run:task-1/agent-run-1",
     text: "first prompt"
   }), "sent");
-  assert.equal(pushes, 0);
+  assert.equal(pushes, 1);
 });
 
 test("prepared runtime bindings survive transient unavailability but explicit terminal cleanup starts a new generation", async () => {
