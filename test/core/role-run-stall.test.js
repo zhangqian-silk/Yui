@@ -805,16 +805,17 @@ test("a stale unrelated pending Leader batch cannot override fresh current proce
     downstreamStalled: true,
     leaderProcessing: {
       startedAt: "2026-08-05T00:00:00.000Z",
-      executionRef: { type: "run", taskId: "task-1", id: "run-1" }
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" },
+      refs: [{ type: "work-item", taskId: "task-1", id: "work-1" }]
     }
   });
   store.events.push(createTaskEvent(
     "event-3",
     "task-1",
-    "run.progress",
+    "work.retired",
     {
-      runId: "run-1",
-      progressAt: "2026-08-05T00:20:00.000Z"
+      workItemId: "work-1",
+      summary: "retired"
     },
     new Date("2026-08-05T00:20:00.000Z")
   ));
