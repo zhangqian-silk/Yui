@@ -24,10 +24,11 @@ export type ProviderHookRunFenceOptions = Readonly<{
 }>;
 
 /**
- * Resolves turn identity from the current durable in-flight fence. Provider
- * processes are long-lived, so their launch environment cannot identify later
- * Runs. The immutable hook event freezes the current Run/receipt here; the
- * normal inbox fold revalidates it before changing any state.
+ * Resolves turn identity from the current durable in-flight fence. The one
+ * exception is Claude SessionStart(startup), which can arrive synchronously
+ * before Session projection and is fenced by the exact Run-bound launch
+ * reservation plus deterministic native identity. The immutable hook event is
+ * revalidated by the normal inbox fold before changing any state.
  */
 export function resolveProviderHookRunFence(
   environment: NodeJS.ProcessEnv,

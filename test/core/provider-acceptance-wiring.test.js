@@ -430,6 +430,8 @@ for (const mismatch of [
   "native",
   "launch",
   "workspace",
+  "run",
+  "inflight-cross-run",
   "cleanup-pending",
   "reservation-missing",
   "reservation-cross-run"
@@ -462,6 +464,27 @@ for (const mismatch of [
       environment = { ...environment, YUI_LAUNCH_ID: "launch-stale" };
     } else if (mismatch === "workspace") {
       environment = { ...environment, YUI_WORKSPACE: `${environment.YUI_WORKSPACE}-stale` };
+    } else if (mismatch === "run") {
+      environment = { ...environment, YUI_RUN_ID: "agent-run-stale" };
+    } else if (mismatch === "inflight-cross-run") {
+      fx.store.saveAgentRun(createAgentRun(
+        "agent-run-2",
+        fx.task.id,
+        fx.worker.name,
+        "new",
+        "other Run",
+        new Date("2026-08-06T02:00:01.250Z"),
+        { effective: fx.run.effective }
+      ));
+      fx.store.saveTaskRoleSessionSet(bindTaskRoleRun(
+        fx.store.getTaskRoleSessionSet(fx.task.id, fx.worker.name),
+        {
+          agentId: fx.agent.id,
+          runId: "agent-run-2",
+          receiptId: `agent-run:${fx.task.id}/agent-run-2`
+        },
+        new Date("2026-08-06T02:00:01.500Z")
+      ));
     } else if (mismatch === "cleanup-pending") {
       assert.notEqual(fx.adapter.enqueueRuntimeCleanup(
         owner,
@@ -471,10 +494,7 @@ for (const mismatch of [
         runtimeLifecycleTarget(owner)
       )), true);
     } else {
-      assert.equal(fx.adapter.completeRuntimeLaunchReservation(
-        owner,
-        "launch-1"
-      ), true);
+      assert.equal(fx.adapter.completeRuntimeLaunchReservation(owner, "launch-1"), true);
       if (mismatch === "reservation-cross-run") {
         fx.store.saveAgentRun(createAgentRun(
           "agent-run-2",
@@ -493,15 +513,45 @@ for (const mismatch of [
       }
     }
 
-    await assert.rejects(runClaudeLifecycleHookCommand(JSON.stringify({
-      hook_event_name: "SessionStart",
-      source: "startup",
-      session_id: payloadNativeSessionId
-    }), environment, async () => ({})));
+    await assert.rejects(runClaudeLifecycleHookCommand(
+      JSON.stringify({
+        hook_event_name: "SessionStart",
+        source: "startup",
+        session_id: payloadNativeSessionId
+      }),
+      environment,
+      async () => ({})
+    ));
     assert.equal(new FileRuntimeEventInbox(fx.home).list().length, 0);
     assert.equal(fx.store.getRoleSession(fx.task.id, fx.worker.name), null);
     assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).pushedAt, undefined);
     assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
+  });
+}
+
+for (const event of [
+  { hook_event_name: "SessionStart", source: "resume" },
+  { hook_event_name: "UserPromptSubmit", prompt: "must not append" },
+  { hook_event_name: "StopFailure", error: "must not append" }
+]) {
+  test(`${event.hook_event_name}${event.source === undefined ? "" : `(${event.source})`} cannot use the startup-only pre-binding window`, async (t) => {
+    const fx = fixture(t, "claude", "reserved", {
+      runtimeDiscovered: true,
+      transportPushed: false,
+      bindInFlight: false
+    });
+    const nativeSessionId = nativeSessionIdForLaunch(
+      fx.home,
+      "launch-1",
+      fx.agent.id,
+      "claude"
+    );
+    await assert.rejects(runClaudeLifecycleHookCommand(
+      JSON.stringify({ ...event, session_id: nativeSessionId }),
+      { ...fx.environment, YUI_NATIVE_SESSION_ID: nativeSessionId },
+      async () => ({})
+    ));
+    assert.equal(new FileRuntimeEventInbox(fx.home).list().length, 0);
   });
 }
 

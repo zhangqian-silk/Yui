@@ -445,3 +445,115 @@ test("Operator input notification never launches a pane or waits for a busy proc
   assert.equal(await registry.notifyOperatorInputOnce(input), "sent");
   assert.equal(calls.length, 3);
 });
+
+test("Role inventory carries one advisory CPU/RSS sample into the scheduler batch", async () => {
+  let resourceCalls = 0;
+  const registry = new ExecutorRegistry(
+    { plan() { throw new Error("unused"); } },
+    {
+      inspectRolePaneInventory() {
+        return [{
+          taskId: "task-1",
+          roleName: "worker",
+          target: "task-1:worker",
+          dead: false,
+          pid: 123,
+          currentCommand: "codex"
+        }];
+      }
+    },
+    undefined,
+    {
+      sessionHost: {},
+      promptPush: {},
+      async roleResourceInventory(panes, inputs) {
+        resourceCalls += 1;
+        assert.equal(panes.length, 1);
+        assert.equal(panes[0].pid, 123);
+        assert.deepEqual(inputs, [{
+          taskId: "task-1",
+          roleName: "worker",
+          runId: "run-1",
+          agentId: "codex",
+          adapterId: "codex",
+          nativeSessionId: "native-1",
+          launchId: "launch-1"
+        }]);
+        return [{
+          taskId: "task-1",
+          roleName: "worker",
+          resource: {
+            observedAt: "2026-08-05T01:00:00.000Z",
+            active: true,
+            cpuTimeMs: 7,
+            rssBytes: 4096
+          }
+        }];
+      }
+    }
+  );
+  const result = await registry.inspectRoles([{
+    taskId: "task-1",
+    roleName: "worker",
+    agentId: "codex",
+    adapterId: "codex",
+    runId: "run-1",
+    nativeSessionId: "native-1",
+    launchId: "launch-1"
+  }]);
+  assert.equal(resourceCalls, 1);
+  assert.deepEqual(result, [{
+    taskId: "task-1",
+    roleName: "worker",
+    status: "present",
+    resource: {
+      observedAt: "2026-08-05T01:00:00.000Z",
+      active: true,
+      cpuTimeMs: 7,
+      rssBytes: 4096
+    }
+  }]);
+});
+
+test("Role inventory keeps cheap pane liveness without a resource scan before the stall gate", async () => {
+  let resourceCalls = 0;
+  const registry = new ExecutorRegistry(
+    { plan() { throw new Error("unused"); } },
+    {
+      inspectRolePaneInventory() {
+        return [{
+          taskId: "task-1",
+          roleName: "worker",
+          target: "task-1:worker",
+          dead: false,
+          pid: 123,
+          currentCommand: "codex"
+        }];
+      }
+    },
+    undefined,
+    {
+      sessionHost: {},
+      promptPush: {},
+      async roleResourceInventory() {
+        resourceCalls += 1;
+        return [];
+      }
+    }
+  );
+
+  const result = await registry.inspectRoles([{
+    taskId: "task-1",
+    roleName: "worker",
+    agentId: "codex",
+    adapterId: "codex",
+    runId: "run-young",
+    nativeSessionId: "native-young"
+  }], []);
+  assert.deepEqual(result, [{
+    taskId: "task-1",
+    roleName: "worker",
+    status: "present"
+  }]);
+  assert.equal(resourceCalls, 0);
+});

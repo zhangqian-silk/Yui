@@ -64,6 +64,7 @@ import type {
   RoleRunDeliveryFailurePersistence,
   RoleRunDeliveryPersistence,
   RoleRunProgressPersistence,
+  RoleRunResourceSuppressionPersistence,
   RoleRunStallPersistence,
   SchedulerRunProgress,
   SchedulerRole,
@@ -79,15 +80,14 @@ import {
 import { pendingWakeupsMatch } from "../scheduler/pendingWakeup.js";
 import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
 import {
-  latestDurableProgressAt,
-  latestRunActivityAt,
+  latestRunDurableProgressAt,
   latestRunEventTime,
-  latestRunProgressAt,
   latestStallEvidenceKey,
   isRoleRunStalled,
   clearMatchingLeaderStallAttention,
   RUN_PROGRESS_EVENT,
   RUN_RECOVERED_EVENT,
+  RUN_RESOURCE_SUPPRESSED_EVENT,
   RUN_STALLED_EVENT
 } from "../scheduler/roleRunStall.js";
 import type { TaskStore } from "../storage/taskStore.js";
@@ -224,59 +224,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string,
     runId: string
   ): SchedulerRunProgress | null {
-    const run = this.store.getActiveAgentRun(taskId, roleName);
-    if (run === null || run.id !== runId) return null;
-    const events = this.store.listEvents(taskId);
-    const latestCheckpointAt = latestRunProgressAt(events, run.id);
-    const workItem = run.workItemId === undefined
-      ? null
-      : this.store.getWorkItem(taskId, run.workItemId);
-    const reviewRounds = run.workItemId === undefined
-      ? []
-      : this.store.listReviewRounds(taskId).filter(({ workItemId }) => workItemId === run.workItemId);
-    const changeSets = run.workItemId === undefined
-      ? []
-      : this.store.listChangeSets(taskId).filter(({ workItemId }) => workItemId === run.workItemId);
-    const integrationChangeSetIds = new Set(changeSets.map(({ id }) => id));
-    const integrations = this.store.listIntegrationAttempts(taskId).filter((attempt) => (
-      attempt.changeSetIds.some((id) => integrationChangeSetIds.has(id))
-    ));
-    const inputProgress = this.store.listInputRequests(taskId)
-      .filter((request) => (
-        request.requester.runId === run.id
-        || request.blockedRefs.some((ref) => ref.type === "run" && ref.id === run.id)
-      ));
-    const latestActivityAt = latestRunActivityAt(events, run.id);
-    const progressAt = run.deliveredAt === undefined
-      ? run.createdAt
-      : latestDurableProgressAt({
-          deliveredAt: run.deliveredAt,
-          latestCheckpointAt,
-          latestActivityAt
-        });
-    const relatedUpdatedAt = [
-      workItem?.updatedAt,
-      ...reviewRounds.map(({ endedAt, createdAt }) => endedAt ?? createdAt),
-      ...changeSets.map(({ createdAt }) => createdAt),
-      ...integrations.map(({ updatedAt }) => updatedAt),
-      ...inputProgress.map(({ updatedAt }) => updatedAt),
-      ...(workItem?.candidates ?? []).map(({ createdAt }) => createdAt)
-    ].filter((value): value is string => (
-      typeof value === "string" && Number.isFinite(Date.parse(value))
-    ));
-    const latestRelatedAt = relatedUpdatedAt.reduce<string | undefined>(
-      (latest, value) => latest === undefined || Date.parse(value) > Date.parse(latest) ? value : latest,
-      undefined
-    );
-    const finalProgressAt = run.deliveredAt === undefined
-      ? run.createdAt
-      : latestRelatedAt === undefined
-        ? progressAt
-        : Date.parse(latestRelatedAt) > Date.parse(progressAt) ? latestRelatedAt : progressAt;
-    return {
-      progressAt: finalProgressAt,
-      ...(latestRelatedAt === undefined ? {} : { evidence: "work-review-integration" })
-    };
+    return latestRunDurableProgressAt(this.store, taskId, roleName, runId);
   }
 
   recordRoleRunStall(
@@ -293,7 +241,20 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         || run === null
         || run.id !== input.runId
         || run.status !== "active"
+        || run.effective.agentId !== input.agentId
+        || run.effective.adapterId !== input.adapterId
       ) return "state-changed";
+
+      const progress = latestRunDurableProgressAt(
+        store,
+        input.taskId,
+        input.roleName,
+        input.runId
+      );
+      if (progress?.progressAt !== input.progressAt) return "state-changed";
+
+      const session = store.getRoleSession(input.taskId, input.roleName);
+      if (!matchesStallSessionFence(session, input.session)) return "state-changed";
 
       const existing = latestStallEvidenceKey(store.listEvents(task.id), run.id);
       if (existing?.progressAt === input.progressAt) return "already-raised";
@@ -348,12 +309,25 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         || run.status !== "active"
       ) return "state-changed";
       const events = store.listEvents(task.id);
+      const previousStall = latestStallEvidenceKey(events, run.id);
+      // A progress fact can close only the matching, older stall episode. A
+      // stale/native observation must never clear a newer attention point.
+      if (
+        previousStall !== undefined
+        && Date.parse(input.progressAt) <= Date.parse(previousStall.progressAt)
+      ) {
+        return "already-recorded";
+      }
       const existing = events.some((event) => (
         event.type === RUN_PROGRESS_EVENT
         && event.payload.runId === run.id
         && (
           event.payload.progressAt === input.progressAt
-          || Date.parse(event.createdAt) >= Date.parse(input.progressAt)
+          || (
+            typeof event.payload.progressAt === "string"
+            && Number.isFinite(Date.parse(event.payload.progressAt))
+            && Date.parse(event.payload.progressAt) >= Date.parse(input.progressAt)
+          )
         )
       ));
       const stalledAt = latestRunEventTime(events, RUN_STALLED_EVENT, run.id);
@@ -391,6 +365,53 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         clearMatchingLeaderStallAttention(store, task.id, run.id);
       }
       return existing && !recovered ? "already-recorded" : "recorded";
+    });
+  }
+
+  recordRoleRunResourceSuppression(
+    input: RoleRunResourceSuppressionPersistence
+  ): "recorded" | "already-recorded" | "state-changed" {
+    return this.store.transaction((store) => {
+      const task = store.getTask(input.taskId);
+      const run = store.getActiveAgentRun(input.taskId, input.roleName);
+      if (
+        task === null
+        || task.status !== "active"
+        || run === null
+        || run.id !== input.runId
+        || run.status !== "active"
+      ) return "state-changed";
+      const session = store.getRoleSession(input.taskId, input.roleName);
+      if (
+        session === null
+        || session.agentId !== input.agentId
+        || session.adapterId !== input.adapterId
+        || session.status === "stopped"
+        || session.status === "broken"
+        || session.nativeSessionId !== input.nativeSessionId
+        || session.launchId !== input.launchId
+      ) return "state-changed";
+      const existing = store.listEvents(task.id).some((event) => (
+        event.type === RUN_RESOURCE_SUPPRESSED_EVENT
+        && event.payload.runId === run.id
+        && event.payload.roleName === input.roleName
+        && event.payload.progressAt === input.progressAt
+      ));
+      if (existing) return "already-recorded";
+      store.saveEvent(task.id, createTaskEvent(
+        store.nextEventId(task.id),
+        task.id,
+        RUN_RESOURCE_SUPPRESSED_EVENT,
+        {
+          runId: run.id,
+          roleName: input.roleName,
+          progressAt: input.progressAt,
+          observedAt: input.observedAt,
+          kind: "advisory-resource"
+        },
+        input.now
+      ));
+      return "recorded";
     });
   }
 
@@ -3391,6 +3412,18 @@ function schedulerRoleSessionsMatch(
     && current.nativeSessionId === expected.nativeSessionId
     && current.launchId === expected.launchId
     && isDeepStrictEqual(current.effective, expected.effective);
+}
+
+function matchesStallSessionFence(
+  current: SchedulerRoleSession | null,
+  expected: RoleRunStallPersistence["session"]
+): boolean {
+  if (current === null || expected === null) return current === expected;
+  return current.agentId === expected.agentId
+    && current.adapterId === expected.adapterId
+    && current.nativeSessionId === expected.nativeSessionId
+    && current.launchId === expected.launchId
+    && current.status === expected.status;
 }
 
 function requireRole(store: TaskStore, taskId: string, roleName: string) {

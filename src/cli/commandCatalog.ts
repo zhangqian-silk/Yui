@@ -408,8 +408,8 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "create",
         summary: "Create a work item.",
-        usage: "yui task work create <task> <title> [--project <project> ...] [--objective <text>] [--accept <criterion> ...] [--after <work> ...] [--role <name>]",
-        options: ["--project", "--objective", "--accept", "--after", "--role"]
+        usage: "yui task work create <task> <title> [--project <project> ...] [--base-ref <project>=<ref> ...] [--objective <text>] [--accept <criterion> ...] [--after <work> ...] [--role <name>]",
+        options: ["--project", "--base-ref", "--objective", "--accept", "--after", "--role"]
       },
       { name: "list", summary: "List work items for a Task.", usage: "yui task work list <task>" },
       { name: "show", summary: "Show one Work Item.", usage: "yui task work show <work>" },
@@ -492,10 +492,16 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "run",
     summary: "Inspect and control Task Role Agent Runs.",
-    sections: [{ id: "manage", title: "Commands", entries: ["list", "retry", "yield", "checkpoint"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["list", "retry", "recover", "yield", "checkpoint"] }],
     children: [
       { name: "list", summary: "List Runs for a work item.", usage: "yui task run list <task>/<work>" },
       { name: "retry", summary: "Retry a failed Run.", usage: "yui task run retry <task>/<run>" },
+      {
+        name: "recover",
+        summary: "Record one exact Leader-controlled Run recovery decision.",
+        usage: "yui task run recover <task>/<run> --action <diagnose|retry|replace-session|terminate> --expected-progress-at <timestamp> --provider-acceptance <accepted|rejected|ambiguous> --reason <text>",
+        options: ["--action", "--expected-progress-at", "--provider-acceptance", "--reason", "--role", "--agent-id", "--adapter-id", "--native-session-id", "--launch-id"]
+      },
       {
         name: "yield",
         summary: "Complete an active Run and wake the Leader.",
@@ -621,7 +627,7 @@ export const ROOT_COMMAND = buildNode({
   usage: "yui [--json] <command>",
   sections: [
     { id: "general", title: "General", entries: [
-      "help", "version", "update", "setup", "doctor", "completion"
+      "help", "version", "update", "upgrade", "setup", "doctor", "completion"
     ] },
     { id: "workflow", title: "Workflow", entries: ["operator", "project", "task"] },
     { id: "configuration", title: "Configuration", entries: ["config", "agent", "profile", "role"] },
@@ -632,6 +638,12 @@ export const ROOT_COMMAND = buildNode({
     { name: "help", summary: "Show root or scoped command help.", usage: "yui help [command ...]", commandPathArguments: true },
     { name: "version", summary: "Print the installed Yui version." },
     { name: "update", summary: "Install the latest published Yui package globally." },
+    {
+      name: "upgrade",
+      summary: "Migrate this Home's storage to the current schema.",
+      usage: "yui upgrade [--dry-run]",
+      options: ["--dry-run"]
+    },
     { name: "setup", summary: "Initialize or update Yui configuration." },
     { name: "doctor", summary: "Check Yui dependencies and file state." },
     {
@@ -668,7 +680,7 @@ export const ROOT_COMMAND = buildNode({
       sections: [{
         id: "lifecycle",
         title: "Commands",
-        entries: ["status", "cleanup", "stop", "restart"]
+        entries: ["status", "cleanup", "identity", "stop", "restart"]
       }],
       children: [
         {
@@ -682,6 +694,11 @@ export const ROOT_COMMAND = buildNode({
           summary: "Interactively clean confirmed unused runtime resources.",
           usage: "yui controller cleanup [--all]",
           options: ["--all"]
+        },
+        {
+          name: "identity",
+          summary: "Read the authenticated Controller launch identity.",
+          hidden: true
         },
         { name: "stop", summary: "Stop the Controller." },
         { name: "restart", summary: "Restart internal services without stopping tmux sessions." }

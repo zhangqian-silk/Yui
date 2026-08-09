@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  buildControllerResourceInventory
+  buildControllerResourceInventory,
+  createRuntimeResourceActivityTracker
 } from "../../dist/controller/resourceInventory.js";
 import {
   classifyRuntimeProcess,
@@ -11,6 +12,167 @@ import {
 
 const HOME = "/tmp/yui-inventory-home";
 const NOW = "2026-07-28T00:00:00.000Z";
+
+function roleResource(overrides = {}) {
+  return {
+    id: "agent-session:/tmp/yui:yui-task-1:worker",
+    fingerprint: "agent-session:123:1000:yui-task-1:worker",
+    kind: "agent-session",
+    state: "running",
+    disposition: "protected",
+    reasonCode: "owned-role-pane",
+    yuiHome: HOME,
+    owner: {
+      kind: "task-role",
+      taskId: "task-1",
+      roleName: "worker",
+      runId: "run-1",
+      agentId: "agent-1",
+      adapterId: "codex",
+      nativeSessionId: "native-1",
+      launchId: "launch-1"
+    },
+    processes: [{
+      pid: 123,
+      ppid: 1,
+      uid: 1000,
+      startIdentity: "1000",
+      command: "codex",
+      rssBytes: 1024,
+      cpuTimeMs: 10,
+      ageMs: 60_000
+    }],
+    rssBytes: 1024,
+    cpuTimeMs: 10,
+    ageMs: 60_000,
+    ...overrides
+  };
+}
+
+function resourceIdentity(overrides = {}) {
+  return {
+    taskId: "task-1",
+    roleName: "worker",
+    runId: "run-1",
+    agentId: "agent-1",
+    adapterId: "codex",
+    nativeSessionId: "native-1",
+    launchId: "launch-1",
+    ...overrides
+  };
+}
+
+test("adjacent resource activity requires exact identity and increasing CPU/IO counters", () => {
+  const tracker = createRuntimeResourceActivityTracker();
+  assert.equal(tracker(resourceIdentity(), roleResource()), false, "first sample is a baseline");
+  assert.equal(tracker(resourceIdentity(), roleResource()), false, "cumulative CPU is not a delta");
+  assert.equal(
+    tracker(resourceIdentity(), roleResource({ cpuTimeMs: 11 })),
+    true,
+    "CPU increment is activity"
+  );
+  assert.equal(
+    tracker(resourceIdentity(), roleResource({ cpuTimeMs: 11, rssBytes: 2048 })),
+    false,
+    "RSS-only residency is not activity"
+  );
+  assert.equal(
+    tracker(resourceIdentity(), roleResource({ cpuTimeMs: 11, ioReadBytes: 3 })),
+    false,
+    "first IO sample is a baseline"
+  );
+  assert.equal(
+    tracker(resourceIdentity(), roleResource({ cpuTimeMs: 11, ioReadBytes: 4 })),
+    true,
+    "IO increment is activity"
+  );
+  assert.equal(
+    tracker(resourceIdentity(), roleResource({ cpuTimeMs: 3, ioReadBytes: 1 })),
+    false,
+    "counter reset establishes a new baseline"
+  );
+  assert.equal(
+    tracker(resourceIdentity(), roleResource({ cpuTimeMs: 4, ioReadBytes: 1 })),
+    false,
+    "the first valid sample after a reset is not adjacent"
+  );
+  assert.equal(
+    tracker(resourceIdentity(), roleResource({ cpuTimeMs: 5, ioReadBytes: 1 })),
+    true,
+    "activity resumes only after a post-reset baseline"
+  );
+  assert.equal(
+    tracker(resourceIdentity({ nativeSessionId: "other-native" }), roleResource()),
+    false,
+    "identity mismatch is fail-closed"
+  );
+  assert.equal(
+    createRuntimeResourceActivityTracker()(resourceIdentity(), roleResource({ cpuTimeMs: 99 })),
+    false,
+    "Controller restart starts a fresh baseline"
+  );
+});
+
+test("rejected identity, inventory, counter, and process gaps clear the adjacent baseline", () => {
+  const identity = resourceIdentity();
+  const tracker = createRuntimeResourceActivityTracker();
+  assert.equal(tracker(identity, roleResource({ cpuTimeMs: 10 })), false);
+  assert.equal(
+    tracker({ ...identity, nativeSessionId: "old-native" }, roleResource({ cpuTimeMs: 11 })),
+    false,
+    "identity mismatch is a gap"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ cpuTimeMs: 20 })),
+    false,
+    "the first sample after identity returns is a baseline"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ cpuTimeMs: 21 })),
+    true,
+    "only the next adjacent sample is activity"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ processes: [], cpuTimeMs: 22 })),
+    false,
+    "an empty process inventory clears the baseline"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ cpuTimeMs: 30 })),
+    false,
+    "a sample after an empty inventory is a baseline"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ cpuTimeMs: Number.NaN })),
+    false,
+    "an invalid counter clears the baseline"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ cpuTimeMs: 40 })),
+    false,
+    "a sample after an invalid counter is a baseline"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ cpuTimeMs: 41 })),
+    true,
+    "valid adjacent samples resume only after the gap"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ fingerprint: "agent-session:new-process", cpuTimeMs: 42 })),
+    false,
+    "a process identity change is a generation gap"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ fingerprint: "agent-session:new-process", cpuTimeMs: 43 })),
+    false,
+    "the first sample after process replacement is a baseline"
+  );
+  assert.equal(
+    tracker(identity, roleResource({ fingerprint: "agent-session:new-process", cpuTimeMs: 44 })),
+    true,
+    "replacement process activity needs an adjacent sample"
+  );
+});
 
 function processFact(overrides) {
   return {

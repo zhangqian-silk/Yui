@@ -7,9 +7,14 @@ import test from "node:test";
 import {
   CURRENT_AGGREGATE_SCHEMA_VERSION,
   CURRENT_STORAGE_LAYOUT_VERSION,
+  ensureStorageSchema,
   inspectStorageSchema,
   requireStorageSchema
 } from "../../dist/storage/storageSchema.js";
+import { createEmptyRegistry } from "../../dist/storage/migration/index.js";
+import { classifyHome } from "../../dist/storage/upgrade/homeClassification.js";
+import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
+import { FileTaskStore } from "../../dist/storage/taskStore.js";
 
 function temporaryHome() {
   return mkdtempSync(join(tmpdir(), "yui-storage-schema-"));
@@ -91,10 +96,83 @@ test("storage inspection rejects future layout and aggregate versions", () => {
   );
 });
 
-test("the development schema exposes no migration API", async () => {
+test("storageSchema itself stays a fresh-only strict gate with no first-release logic", async () => {
+  // The centralized migration framework lives in ../migration and ../upgrade, not
+  // inside storageSchema. This module must not grow in-module migration dispatch
+  // or any first-release / pre-release detection (formatEpoch, releaseBaselineId,
+  // reset/cutover helpers) — message-8 §1/§6. It stays the strict version gate.
   const schema = await import("../../dist/storage/storageSchema.js");
-  assert.equal("dispatchStorageMigrations" in schema, false);
-  assert.equal("dispatchAggregateMigrations" in schema, false);
-  assert.equal("STORAGE_MIGRATIONS" in schema, false);
-  assert.equal("AGGREGATE_MIGRATIONS" in schema, false);
+  for (const forbidden of [
+    "dispatchStorageMigrations",
+    "dispatchAggregateMigrations",
+    "STORAGE_MIGRATIONS",
+    "AGGREGATE_MIGRATIONS",
+    "formatEpoch",
+    "releaseBaselineId",
+    "resetStorage",
+    "cutover"
+  ]) {
+    assert.equal(forbidden in schema, false, `storageSchema must not export ${forbidden}`);
+  }
+});
+
+function currentHome() {
+  const home = temporaryHome();
+  ensureStorageSchema(home);
+  // Touch the store so state.json exists and is loadable by the classifier.
+  new FileTaskStore(home).getConfig();
+  return home;
+}
+
+function classify(home) {
+  return classifyHome({
+    home,
+    registry: createEmptyRegistry(),
+    latest: latestStorageVersionState()
+  });
+}
+
+test("a current Home classifies USABLE under the empty registry", () => {
+  const result = classify(currentHome());
+  assert.equal(result.classification.verdict, "USABLE");
+  assert.equal(result.layoutVersion, CURRENT_STORAGE_LAYOUT_VERSION);
+  assert.equal(result.aggregateVersion, CURRENT_AGGREGATE_SCHEMA_VERSION);
+});
+
+test("a strictly-older Home fails closed as NEEDS_NEW_VERSION/missing-step", () => {
+  const home = currentHome();
+  writeManifest(home, { aggregateSchemaVersion: 7 });
+  const result = classify(home);
+  assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");
+  // Empty registry => no adjacent step => a precise missing-step reason, never a
+  // version-magnitude guess and never CORRUPTED.
+  assert.equal(result.classification.blocker.reason, "missing-step");
+  assert.equal(result.incompatibleComponent, "aggregate");
+});
+
+test("a future Home fails closed as NEEDS_NEW_VERSION/future-version", () => {
+  const home = currentHome();
+  writeManifest(home, { aggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION + 1 });
+  const result = classify(home);
+  assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");
+  assert.equal(result.classification.blocker.reason, "future-version");
+  assert.equal(result.incompatibleComponent, "aggregate");
+});
+
+test("a future layout is reported against the layout component", () => {
+  const home = currentHome();
+  writeManifest(home, { storageVersion: CURRENT_STORAGE_LAYOUT_VERSION + 1 });
+  const result = classify(home);
+  assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");
+  assert.equal(result.incompatibleComponent, "layout");
+});
+
+test("real structural damage classifies CORRUPTED, not a version verdict", () => {
+  const home = currentHome();
+  // Current manifest, but a broken state.json: only a real parse/reference
+  // failure is CORRUPTED. The classifier never infers corruption from versions.
+  writeFileSync(join(home, "state.json"), "{ not valid json");
+  const result = classify(home);
+  assert.equal(result.classification.verdict, "CORRUPTED");
+  assert.match(result.classification.detail, /state\.json/i);
 });

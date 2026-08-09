@@ -47,7 +47,11 @@ import type {
   WorkItemIntegrationProof
 } from "../workspace/workItemChangeSetManager.js";
 import { cancelInputRequest } from "../input/inputRequest.js";
-import { terminalizeExactTaskRun } from "../lifecycle/exactRunTerminalization.js";
+import {
+  recoverExactAgentRun,
+  terminalizeExactTaskRun,
+  type ExactAgentRunRecoveryAction
+} from "../lifecycle/exactRunTerminalization.js";
 import { resetTaskRoleSessionGeneration } from "../lifecycle/taskRoleSessionReset.js";
 import {
   activeRoleAgentBinding,
@@ -120,6 +124,7 @@ import {
   updateWorkItemWriteProjects,
   updateWorkItemStatus,
   type WorkItem,
+  type WorkItemProjectBaseRef,
   type CandidateGitSnapshot,
   type WorkItemCandidate,
   type WorkItemStatus
@@ -1626,7 +1631,7 @@ function createWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task work create usage: yui task work create <task> <title> [--project <project> ...] [--objective <text>] [--accept <criterion> ...] [--after <work> ...] [--role <name>].";
+  const usage = "Task work create usage: yui task work create <task> <title> [--project <project> ...] [--base-ref <project>=<ref> ...] [--objective <text>] [--accept <criterion> ...] [--after <work> ...] [--role <name>].";
   const parsed = parseWorkCreateArgs(args, usage);
   exactPositionals(parsed.positionals, 2, usage);
   const now = clock(options);
@@ -1646,12 +1651,27 @@ function createWork(
       if (project === null) throw usageError(`Task Project not found: ${reference}.`);
       return project.id;
     });
+    const baseRefs: WorkItemProjectBaseRef[] = parsed.baseRefs.map(({ project, baseRef }) => {
+      const resolved = resolveProject(
+        task.projectBindings.map(({ projectId }) => requireProject(tx, projectId)),
+        project
+      );
+      if (resolved === null) throw usageError(`Task Project not found: ${project}.`);
+      if (!writeProjectIds.includes(resolved.id)) {
+        throw usageError(`Work Item base-ref Project must be writable: ${resolved.id}.`);
+      }
+      return { projectId: resolved.id, baseRef };
+    });
+    if (new Set(baseRefs.map(({ projectId }) => projectId)).size !== baseRefs.length) {
+      throw usageError("Each Work Item Project may specify at most one base ref.");
+    }
     const created = createWorkItem(tx.nextWorkItemId(task.id), task.id, {
       title: parsed.positionals[1],
       objective: parsed.objective ?? parsed.positionals[1],
       acceptance: parsed.acceptance,
       dependsOn: parsed.after,
       writeProjectIds,
+      ...(baseRefs.length === 0 ? {} : { baseRefs }),
       ...(parsed.role === undefined ? {} : { assignee: parsed.role })
     }, now);
     tx.saveWorkItem(task.id, created);
@@ -2278,6 +2298,7 @@ function showWork(
     `Title: ${item.title}`,
     `Objective: ${item.objective}`,
     `Write Projects: ${item.writeProjectIds.join(", ") || "-"}`,
+    `Base Refs: ${item.baseRefs?.map(({ projectId, baseRef }) => `${projectId}=${baseRef}`).join(", ") || "-"}`,
     `Acceptance: ${item.acceptance.length === 0 ? "-" : item.acceptance.join("; ")}`,
     `Outcome: ${item.outcome ?? "-"}`,
     `Retirement: ${item.disposition === undefined ? "-" : "retired"}`,
@@ -2351,6 +2372,7 @@ function taskRunCommand(
   const [command, ...rest] = args;
   if (command === "list") return output(listRuns(rest, store, options));
   if (command === "retry") return output(retryRun(rest, store, options));
+  if (command === "recover") return output(recoverRun(rest, store, options));
   if (command === "yield") return yieldRun(rest, store, options);
   if (command === "checkpoint") return output(checkpointRun(rest, store, options));
   throw usageError(command === undefined
@@ -2481,6 +2503,95 @@ function retryRun(
   });
   notifyMailbox(options.runtime, roleMailbox(retried.taskId, retried.roleName), retried.taskId);
   return `Retry queued as ${retried.id} for ${retried.taskId}/${retried.roleName}\n`;
+}
+
+/**
+ * Records one explicit Leader recovery decision against an exact live Run.
+ * Retry and Session replacement remain requests: the Controller never sends
+ * another input or changes a native generation from this command.
+ */
+function recoverRun(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  const usage = "Task run recover usage: yui task run recover <task>/<run> --action <diagnose|retry|replace-session|terminate> --expected-progress-at <timestamp> --provider-acceptance <accepted|rejected|ambiguous> --reason <text> [--agent-id <id>] [--adapter-id <id>] [--native-session-id <id>] [--launch-id <id>].";
+  const parsed = parseTail(
+    args,
+    new Set([
+      "--action",
+      "--expected-progress-at",
+      "--progress-at",
+      "--provider-acceptance",
+      "--reason",
+      "--role",
+      "--agent-id",
+      "--adapter-id",
+      "--native-session-id",
+      "--launch-id"
+    ]),
+    usage
+  );
+  exactPositionals(parsed.positionals, 1, usage);
+  const now = clock(options);
+  const input = store.transaction((tx) => {
+    const active = requireRun(tx, parsed.positionals[0], options);
+    const task = requireTask(tx, active.taskId);
+    if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "recovering a run"));
+    if (taskActor(options, task.id) !== "leader") {
+      throw usageError("Only the Task Leader may control exact Agent Run recovery.");
+    }
+    const roleName = parsed.options.get("--role") ?? active.roleName;
+    if (roleName !== active.roleName) {
+      throw usageError(`Recovery Role does not match Run ${active.id}: ${roleName}.`);
+    }
+    const role = requireRole(tx, task.id, roleName);
+    const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
+    const session = sessions?.sessions[sessions.activeAgentId];
+    const action = parseRecoveryAction(parsed.options.get("--action"), usage);
+    const expectedProgressAt = parsed.options.get("--expected-progress-at")
+      ?? parsed.options.get("--progress-at");
+    if (expectedProgressAt === undefined) throw usageError("--expected-progress-at is required.", usage);
+    const providerAcceptance = parseProviderAcceptance(
+      parsed.options.get("--provider-acceptance"),
+      usage
+    );
+    const agentId = parsed.options.get("--agent-id") ?? active.effective.agentId;
+    const adapterId = parsed.options.get("--adapter-id") ?? active.effective.adapterId;
+    const nativeSessionId = parsed.options.get("--native-session-id")
+      ?? session?.nativeSessionId;
+    const launchId = parsed.options.get("--launch-id") ?? session?.launchId;
+    return {
+      taskId: task.id,
+      roleName: role.name,
+      runId: active.id,
+      agentId,
+      adapterId,
+      ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
+      ...(launchId === undefined ? {} : { launchId }),
+      expectedProgressAt,
+      providerAcceptance,
+      action,
+      reason: requiredOption(parsed.options, "--reason"),
+      now
+    };
+  });
+  const result = recoverExactAgentRun(store, input);
+  if (result.disposition !== "applied") {
+    throw usageError(
+      `Exact Run recovery ${result.disposition}: ${result.reason ?? "state changed"}.`,
+      usage
+    );
+  }
+  // The durable recovery request is committed before asking the Controller to
+  // wake the owning Leader; a failed transaction must not leak a signal.
+  if (result.run !== null && result.run.roleName !== LEADER_ROLE) {
+    notifyMailbox(options.runtime, leaderMailbox(result.run.taskId), result.run.taskId);
+  }
+  const followup = result.requiresExplicitFollowup === true
+    ? " Leader follow-up is required; no provider input or Session action was performed."
+    : "";
+  return `Recorded exact ${result.action} recovery for ${result.run?.id ?? "unknown Run"}.${followup}\n`;
 }
 
 function yieldRun(
@@ -3252,6 +3363,27 @@ function parseWorkStatus(value: string): WorkItemStatus {
   throw usageError(`Invalid work item status: ${value}.`);
 }
 
+function parseRecoveryAction(
+  value: string | undefined,
+  usage: string
+): ExactAgentRunRecoveryAction {
+  if (
+    value === "diagnose"
+    || value === "retry"
+    || value === "replace-session"
+    || value === "terminate"
+  ) return value;
+  throw usageError("--action must be diagnose, retry, replace-session, or terminate.", usage);
+}
+
+function parseProviderAcceptance(
+  value: string | undefined,
+  usage: string
+): "accepted" | "rejected" | "ambiguous" {
+  if (value === "accepted" || value === "rejected" || value === "ambiguous") return value;
+  throw usageError("--provider-acceptance must be accepted, rejected, or ambiguous.", usage);
+}
+
 function presentWorkStatus(status: WorkItemStatus): string {
   if (status === "pending") return "todo";
   if (status === "completed") return "done";
@@ -3267,12 +3399,14 @@ function parseWorkCreateArgs(
   acceptance: string[];
   after: string[];
   projects: string[];
+  baseRefs: Array<Readonly<{ project: string; baseRef: string }>>;
   role?: string;
 }> {
   const positionals: string[] = [];
   const acceptance: string[] = [];
   const after: string[] = [];
   const projects: string[] = [];
+  const baseRefs: Array<Readonly<{ project: string; baseRef: string }>> = [];
   let objective: string | undefined;
   let role: string | undefined;
   for (let index = 0; index < args.length; index += 1) {
@@ -3286,6 +3420,7 @@ function parseWorkCreateArgs(
       && argument !== "--accept"
       && argument !== "--after"
       && argument !== "--project"
+      && argument !== "--base-ref"
       && argument !== "--role"
     ) {
       throw usageError(`Unsupported option: ${argument}.`, usage);
@@ -3303,6 +3438,19 @@ function parseWorkCreateArgs(
     } else if (argument === "--accept") acceptance.push(value);
     else if (argument === "--after") after.push(value);
     else if (argument === "--project") projects.push(value);
+    else {
+      const separator = value.indexOf("=");
+      if (separator <= 0 || separator === value.length - 1) {
+        throw usageError(
+          "--base-ref must use <project>=<ref>.",
+          usage
+        );
+      }
+      baseRefs.push({
+        project: value.slice(0, separator),
+        baseRef: value.slice(separator + 1)
+      });
+    }
     index += 1;
   }
   return {
@@ -3311,7 +3459,8 @@ function parseWorkCreateArgs(
     ...(role === undefined ? {} : { role }),
     acceptance,
     after,
-    projects
+    projects,
+    baseRefs
   };
 }
 

@@ -96,13 +96,16 @@ function recordParsedTurnCompletion(schedulerStore, payload, environment) {
 }
 
 test("managed session titles stay compact without losing the role", () => {
+  assert.equal(
+    taskRoleSessionTitle({ id: "task-123", title: "A task" }, "worker"),
+    "Yui · task-123 · worker · A task"
+  );
   const title = taskRoleSessionTitle(
     { id: "task-123", title: "A".repeat(300) },
     "leader"
   );
   assert.equal(title.length, MAX_SESSION_TITLE_LENGTH);
-  assert.match(title, /^Yui · task-123 · /);
-  assert.match(title, /… · Leader$/);
+  assert.match(title, /^Yui · task-123 · Leader · A+…$/);
 });
 
 test("Controller lifecycle dispatcher is the sole session creator for enter", async (t) => {
@@ -147,6 +150,47 @@ test("Controller lifecycle dispatcher is the sole session creator for enter", as
   assert.equal(
     store.getGlobalRoleSessionSet(globalRole.name).sessions[globalRole.activeAgentId].nativeSessionId,
     "thread-global"
+  );
+});
+
+test("Controller ensure refuses to rebind a live opaque Session", async (t) => {
+  const { store, task, role, agent, now } = fixture(t);
+  const schedulerStore = new FileSchedulerStoreAdapter(store);
+  schedulerStore.recordRuntimeNativeSession({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    nativeSessionId: "thread-opaque-host"
+  }, now);
+  const sessions = store.getTaskRoleSessionSet(task.id, role.name);
+  const opaque = { ...sessions.sessions[agent.id] };
+  delete opaque.nativeSessionId;
+  opaque.launchId = "opaque-launch-1";
+  store.saveTaskRoleSessionSet({
+    ...sessions,
+    sessions: { ...sessions.sessions, [agent.id]: opaque }
+  });
+  let starts = 0;
+  let resumes = 0;
+  const dispatch = createRuntimeLifecycleDispatcher(store, schedulerStore, {
+    async start() { starts += 1; throw new Error("must not start"); },
+    async resume() { resumes += 1; throw new Error("must not resume"); }
+  });
+
+  await assert.rejects(
+    dispatch("runtime.ensure-role-session", {
+      scope: "task",
+      taskId: task.id,
+      roleName: role.name
+    }),
+    /no native Session identity/i
+  );
+  assert.equal(starts, 0);
+  assert.equal(resumes, 0);
+  assert.equal(
+    store.getTaskRoleSessionSet(task.id, role.name).sessions[agent.id].launchId,
+    "opaque-launch-1"
   );
 });
 
@@ -236,7 +280,7 @@ test("one planner adds Codex structured notify for Task and global launches", (t
   assert.equal(taskPlan.launch.env.YUI_TASK_ID, task.id);
   assert.equal(
     taskPlan.launch.env.YUI_SESSION_TITLE,
-    "Yui · task-1 · Managed launch · Leader"
+    "Yui · task-1 · Leader · Managed launch"
   );
   assert.equal(globalPlan.launch.env.YUI_SESSION_SCOPE, "global");
   assert.equal(globalPlan.launch.env.YUI_TASK_ID, undefined);
@@ -420,7 +464,7 @@ test("Claude new launch is preallocated once and persisted without a prompt", (t
   assert.deepEqual(plan.launch.args.slice(-2), ["--session-id", "claude-native-1"]);
   assert.deepEqual(
     plan.launch.args.slice(plan.launch.args.indexOf("--name"), plan.launch.args.indexOf("--name") + 2),
-    ["--name", "Yui · task-1 · Managed launch · Leader"]
+    ["--name", "Yui · task-1 · Leader · Managed launch"]
   );
   assert.equal(plan.session.nativeSessionId, "claude-native-1");
   assert.equal(plan.launch.args.some((argument) => argument.includes("Yui setup:")), false);
@@ -704,7 +748,7 @@ test("Codex notify payload is strictly converted to one durable runtime event", 
     YUI_AGENT_ID: agent.id,
     YUI_ADAPTER_ID: "codex",
     YUI_LAUNCH_ID: "launch-notify-strict",
-    YUI_SESSION_TITLE: "Yui · task-1 · Managed launch · Leader",
+    YUI_SESSION_TITLE: "Yui · task-1 · Leader · Managed launch",
     YUI_AGENT_COMMAND: "codex-test",
     YUI_AGENT_BASE_ARGS: "[\"--profile\",\"test\"]"
   };
@@ -714,7 +758,7 @@ test("Codex notify payload is strictly converted to one durable runtime event", 
     "turn-id": "turn-1",
     cwd: home,
     "input-messages": [
-      "Yui · task-1 · Managed launch · Leader · Run agent-run-1\n\nDo the work"
+      "Yui · task-1 · Leader · Managed launch · Run agent-run-1\n\nDo the work"
     ],
     "last-assistant-message": "done"
   });
@@ -740,7 +784,7 @@ test("Codex notify payload is strictly converted to one durable runtime event", 
     baseArgs: ["--profile", "test"],
     environment,
     threadId: "thread-native-1",
-    name: "Yui · task-1 · Managed launch · Leader"
+    name: "Yui · task-1 · Leader · Managed launch"
   }]);
   const inbox = new FileRuntimeEventInbox(home);
   assert.deepEqual(inbox.list().map((event) => ({

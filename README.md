@@ -59,11 +59,115 @@ and `task integration start`, keep their subordinate IDs local to that Task.
 Candidate IDs are local to their WorkItem and carry both Task and WorkItem
 provenance.
 
-Yui supports only the current aggregate-v14 / StoredTask-v13 schema. Older
-homes are intentionally unsupported: initialize a fresh `YUI_HOME` instead of
-asking the runtime to convert, dual-read, or infer historical records. See
+Yui models three independent, monotonic storage version axes: the on-disk
+`layout` (`schema.json`, `state.json`, locks), the authoritative `aggregate`
+document, and the `record` axis — a `recordKind -> version` map where every
+record family (WorkItem, AgentRun, ReviewRound, …) versions on its own. A
+centralized, future-facing migration framework (registry → planner → engine)
+covers all three; the registry ships **empty** in this release, so no historical
+migration step exists yet and any strictly-older home is fail-closed. The record
+axis is genuinely independent: a home's per-family record versions are read
+**structurally** from the raw `state.json` (never through the strict loader), so
+a home whose *only* difference is an older record family is a version verdict
+(MIGRATABLE / NEEDS_NEW_VERSION) — not a false CORRUPTED.
+
+`yui doctor` and `yui upgrade` present one of four compatibility states:
+
+- **USABLE** — every axis is at the current version; nothing to do.
+- **MIGRATABLE** — strictly older on any axis (scalar or a single record family),
+  and a complete deterministic step path exists (none today, since the registry
+  is empty).
+- **NEEDS_NEW_VERSION** — a version this release cannot migrate: either newer
+  than supported (`future-version`) or older with no registered step
+  (`missing-step`), on any axis including a record family. Under the empty
+  registry, every strictly-older home lands here with a precise reason and the
+  incompatible component (layout vs aggregate).
+- **CORRUPTED** — real structural or reference-graph damage only (unparseable
+  `state.json`, a container that doesn't match its record locator, a record with
+  a missing/invalid `schemaVersion`, or a broken reference graph found once every
+  axis is already current), never inferred from a version number.
+
+`yui upgrade` is the diagnostic/manual entry point. `yui upgrade --dry-run`
+runs a read-only preflight and plan, validates through the real loader gate on a
+staged copy, prints the report, and discards it without switching. `yui upgrade`
+(execute) places an admission fence (new writers, CLI and Controller alike,
+refuse to start), drains the Controller with the public `controller.stop`, then
+enters one shared sibling coordination boundary. Inside it, both the
+runtime-lifecycle mailboxes AND the durable runtime inbox (`runtime/inbox/*`) are
+checked (either non-empty blocks at `drain-incomplete`, so authoritative
+not-yet-applied events are never dropped by a switch), followed by the revision
+pin, complete-home copy, validation, and two-step switch.
+The boundary is `<home>.upgrade-coordination.lock`, outside the Home so renames
+cannot move a live lock. Inbox `publish` takes that same lock, checks the fence
+and any unresolved switch-progress marker while holding it, writes the temp/link/
+fsync event, and releases it. Upgrade takes the lock after the Controller drain,
+proves both runtime lanes, re-pins the revision under `.state.lock`, copies the
+complete Home, and keeps the coordination lock through `home -> backup` and
+`staging -> home`. Thus a hook admitted before the fence either finishes before
+the final snapshot (and its event is copied) or waits and receives an explicit
+`UpgradeFenceError` after cutover; it can safely re-deliver and is never silently
+stranded only in the backup. With no fence, the normal hook path keeps the same
+durable behavior, only serialized at this boundary. **Fence acquisition is a
+single atomic file create**, so two concurrent upgraders never both acquire —
+exactly one wins and the other fails closed. A provably-dead owner's stale fence
+is reclaimed, but the reclaim is an **atomic compare-and-delete** (it removes only
+the exact stale bytes, under a lock), so a fresh live fence a racer created in the
+meantime is never clobbered — two entrants can never both end up "acquired". That
+reclaim lock is itself **crash-recoverable** (owner-pid + age reclaim), so a
+holder that crashes mid-reclaim cannot orphan it and permanently block admission;
+when a reclaim cannot be proven complete the writer fails closed rather than
+falsely reporting the home writable. The coordination lock uses the same bounded
+crash-recovery rule: it records an owner PID, waits only for a bounded interval,
+and atomically renames aside a lock whose owner is provably dead (or whose
+owner-less directory is older than the conservative acquisition window). A live
+or undeterminable holder fails closed, so a crash cannot deadlock the Home and a
+live writer is never evicted by a TTL. A switch-progress marker blocks hook
+admission when the Home is missing or uninitialized (including a malformed
+marker, because its recovery phase is unknowable); a stale marker beside an
+intact Home is ignored just as the update probe ignores it after corroborating
+the filesystem. The lock order is one-way — coordination
+lock, then `.state.lock`; inbox writers never acquire `.state.lock` — so no
+coordination cycle is introduced. An **uninitialized home** (never `yui setup`)
+returns a structured "run `yui setup`" blocker rather than a silent no-op. Quiesce
+**fails closed on any undeterminable signal**: a `.state.lock` that exists but
+whose owner is missing/empty/non-integer/unreadable (a writer may be
+mid-acquisition), or a malformed `runtime/controller.json`, is treated as an
+active runtime and blocks the upgrade; only a provably-absent lock or a
+clearly-dead owner is safe to proceed past.
+
+The migration only transforms `schema.json` + `state.json`, but because the
+atomic switch replaces the whole home directory, **staging carries a complete
+copy of the home** — `runtime/`, `runtime/inbox/*` (authoritative), `cache/`, and
+`artifacts/` are all preserved through the switch and retained in the backup, with
+no silent loss (the transient `.state.lock` is the sole exception; a real home
+entry that happens to share the staging directory's name is preserved too, and an
+in-home staging layout is refused outright). The switch is two renames with one
+non-atomic window, and **every** step after the first rename — the fsyncs and the
+progress-marker writes, not just the rename — is phase-aware: a failure first
+attempts an automatic rollback, and only if that rollback **also** fails is the
+home reported as partially switched (a distinct `switch-ambiguous` blocker with
+the exact `mv "<backup>" "<home>"` recovery) — it never falsely claims the home is
+unchanged. A crash mid-switch leaves a durable marker; `yui update` recovery reads
+that marker plus filesystem evidence (backup present, home missing) to name the
+exact backup restore rather than a generic retry. Any other failed or blocked step
+leaves the authoritative home byte-for-byte unchanged and reports the exact
+blocker stage and recovery action. It never converts a real home in this release
+(the registry is empty), and Yui never
+dual-reads an older schema or guesses an old identifier. See
 [Task-local identity](docs/task-local-identity.md) for the current reference
 contract.
+
+Schema work across Tasks is not serialized: any Task may advance a version axis
+(`layout`, `aggregate`, or a `record` family) on its own isolated branch without
+waiting for another Task's schema change to land. The later-integrating branch
+owns the reconciliation — rebasing onto the latest project head, resolving schema
+and code conflicts, re-advancing the schema versions and record-version-map
+entries the rebase requires, rebuilding and re-validating the wiring, and
+re-running the isolated E2E and docs. This is a deliberate scheduling trade-off
+that avoids cross-Task blocking, not an accident to repair ad hoc. The
+record-version map above is a current-baseline snapshot, so if another Task later
+lands a record-schema change, the integrating branch re-derives it against the
+newest head and re-tests to convergence.
 
 Setup also seeds four reusable Worker Profiles:
 
@@ -158,8 +262,11 @@ own base ref. Yui exposes them under one Task workspace root:
 └── shared-sdk/
 ```
 
-Each Project directory is backed by its own managed Git worktree. The Leader
-starts at the root and sees the complete Task context. Create all known
+`<workspace>/tasks/<task-id>/main` is a logical multi-Project container, not a
+Git repository. Each Project child is the supported Git cwd (for example
+`<workspace>/tasks/<task-id>/main/yui`) and points to that Project's managed
+worktree at `<workspace>/worktree/<project>/<task-id>/main`. Run Git commands
+inside the relevant Project child. The Leader starts at the root and sees the complete Task context. Create all known
 bindings together, or let the active Task Leader add one when the same outcome
 expands:
 
@@ -589,11 +696,59 @@ The restored management surface includes:
 
 ```sh
 yui update
+yui upgrade [--dry-run]
 yui agent add|list|show|capabilities|update|remove
 yui role add|list|show|update|remove|bind|enter
 yui role session record|replace
 yui project add|clone|refresh|update|discover|list|show|knowledge
 ```
+
+`yui update` stages the newly published package **side by side** — it never
+replaces the current global install first — then uses the staged binary to run a
+read-only preflight against the home. Only when that is safe does it migrate
+storage (atomically, with a timestamped backup) and promote the binary, running
+a new-binary health check last. It promotes the **same artifact it staged**
+(binary activation pins the exact staged version, never a second bare `@latest`);
+the staged version must be a **concrete semver** — a `latest`/dist-tag sentinel,
+a malformed value, or a probe without a valid `{ ok:true }` envelope at exit 0 is
+rejected and the stage **fails** rather than falling back to `@latest`. The health
+check runs the **actually-activated** global binary and **requires** its version
+to be concrete and equal to the staged one — a missing, unparseable, or mismatched
+version fails closed (never skipped). Every spawned-child result must be a valid
+`{ ok:true, data }` **success envelope** before its outcome is trusted (else
+preflight blocks / activation is ambiguous), and a success-class outcome is
+trusted **only when the process also exited 0**. The post-update health check
+**parses and validates the machine-readable `yui --json doctor` envelope before
+interpreting the exit status** — because `--json doctor` exits non-zero on
+unhealthy storage — requires **every** expected storage check present-and-`ok`
+(a missing/duplicated/malformed check fails closed), and rejects an unparseable or
+self-contradictory envelope; only a valid success envelope with all storage checks
+`ok` and exit 0 is healthy. On any failure it reports the exact phase and a
+recovery action.
+
+If the storage-activation step cannot be resolved — the spawned staged binary was
+killed or crashed after switching but before reporting — `yui update` reports a
+distinct **ambiguous** result (a dedicated non-zero exit), never a false
+"unchanged/recoverable". A durable completion receipt written the instant the
+switch commits (a `<home>.upgrade-receipt.json` sibling, cleared on clean
+success) lets it resolve the true state from receipt + backup + current schema
+and print precise manual-verification steps. The receipt is trusted only when it
+genuinely corresponds: it must carry this home's `homePath` and a `backupPath`
+that is the expected `<home>.backup-*` real directory, so a **legacy receipt
+without those fields, or one whose backup is unrelated / missing / not a
+directory** is not trusted as proof of this attempt's switch — the
+tool re-probes the real on-disk state instead.
+
+Rollback boundary (precise): this release does **not** introduce a versioned
+binary pointer or stable launcher, so it does **not** claim binary+home
+dual-resource atomicity. It guarantees: (1) staging is isolated — a
+stage/preflight failure leaves the old binary and home byte-for-byte unchanged;
+(2) the storage switch is atomic with a timestamped backup and is recoverable by
+restoring that backup until the new version resumes writes; (3) no auto-downgrade
+once the new version has written. The one non-atomic window — storage already
+switched, binary promotion then fails — is reported with the exact
+`mv <backup> <home>` recovery, and because the axes are version-gated the old
+binary fail-closes on the new home rather than misreading it.
 
 Agent environment bindings store process-environment variable names, never secret values. Adapter-owned lifecycle arguments cannot be overridden through raw arguments.
 
@@ -603,7 +758,10 @@ Yui targets one trusted local user on one machine. Its Web/API surface is
 loopback-only and intentionally omits remote or multi-user Web access,
 distributed coordination, backup/import/export commands, trash/restore,
 derived indexes, recovery journals, runtime leases, inactivity TTLs,
-cooldowns, and recurring schedules.
+cooldowns, and recurring schedules. (The one internal exception is the
+timestamped home backup `yui upgrade`/`yui update` takes immediately before an
+atomic storage switch, purely to make that single switch recoverable — it is not
+a general backup/restore facility.)
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for persistence and scheduling details.
 The reusable, user-driven acceptance plan is documented in

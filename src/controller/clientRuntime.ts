@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import { callController, readControllerDiscovery } from "../core/controllerClient.js";
 import {
+  FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
   type JsonValue
 } from "../core/protocol.js";
 import type { FileRoleLaunchPlanner } from "../executor/fileRoleLaunchPlanner.js";
@@ -22,6 +23,7 @@ import type { MailboxTarget } from "../coordination/workMailbox.js";
 import { hasRuntimeLifecycleWork } from "../runtime/lifecycleReservation.js";
 import { assertControllerStatusIdentity } from "../runtime/exactControlPlane.js";
 import { EPHEMERAL_DOMAIN_ENVIRONMENT_NAMES } from "./domainIdentity.js";
+import { YUI_VERSION, yuiVersionIdentity } from "../version.js";
 
 const STARTUP_TIMEOUT_MS = 5_000;
 // A lifecycle RPC may legitimately occupy the Controller for 30 seconds.
@@ -45,7 +47,21 @@ export type FileControllerClientOptions = Readonly<{
   shutdownTimeoutMs?: number;
   pollIntervalMs?: number;
   requestTimeoutMs?: number;
+  /** Override the expected version for an exact-identity restore handshake. */
+  expectedVersion?: string;
+  /**
+   * Fence a stop request to the exact Controller process observed by the
+   * caller.  Used only by update's replacement-mismatch cleanup; ordinary
+   * lifecycle callers leave this unset.
+   */
+  expectedPid?: number;
   onError?: (error: unknown) => void;
+}>;
+
+export type ControllerLaunchIdentity = Readonly<{
+  executablePath: string;
+  args: readonly string[];
+  version: string;
 }>;
 
 /**
@@ -81,7 +97,7 @@ export async function ensureFileTaskController(
   const call = options.call ?? callController;
   try {
     const status = await call(home, "controller.status", {});
-    assertCompatibleControllerStatus(status);
+    assertCompatibleControllerStatus(status, options.expectedVersion);
     return status;
   } catch (error) {
     if (!isUnavailable(error)) throw error;
@@ -94,7 +110,7 @@ export async function ensureFileTaskController(
   for (;;) {
     try {
       const status = await call(home, "controller.status", {});
-      assertCompatibleControllerStatus(status);
+      assertCompatibleControllerStatus(status, options.expectedVersion);
       return status;
     } catch (error) {
       if (!isUnavailable(error)) throw error;
@@ -106,8 +122,115 @@ export async function ensureFileTaskController(
   }
 }
 
-function assertCompatibleControllerStatus(status: JsonValue): void {
-  assertControllerStatusIdentity(status);
+/** Start and await readiness for a captured Controller identity. */
+export async function ensureFileTaskControllerIdentity(
+  home: string,
+  identity: ControllerLaunchIdentity,
+  options: FileControllerClientOptions = {}
+): Promise<JsonValue> {
+  assertExpectedControllerLaunchIdentity(identity);
+  const status = await ensureFileTaskController(home, {
+    ...options,
+    expectedVersion: identity.version
+  });
+  // A same-version status is not an identity proof: another Controller binary
+  // may own the Home after a restart or a stale discovery race. Authenticate
+  // the socket owner and compare the complete launch vector before reporting
+  // readiness. This post-readiness check deliberately has no retry or spawn
+  // fallback; a mismatch/unavailable/malformed identity is fail-closed.
+  const call = options.call ?? callController;
+  const actual = await call(home, "controller.identity", {}, {
+    timeoutMs: options.requestTimeoutMs
+  });
+  assertControllerLaunchIdentity(actual, identity);
+  return status;
+}
+
+function assertExpectedControllerLaunchIdentity(
+  identity: ControllerLaunchIdentity
+): void {
+  if (
+    typeof identity.executablePath !== "string"
+    || identity.executablePath.length === 0
+    || !Array.isArray(identity.args)
+    || identity.args.some((arg) => typeof arg !== "string")
+    || typeof identity.version !== "string"
+    || identity.version.length === 0
+  ) {
+    throw new Error(
+      "Expected Controller launch identity is malformed; refusing to start or accept a Controller."
+    );
+  }
+}
+
+function assertControllerLaunchIdentity(
+  actual: JsonValue,
+  expected: ControllerLaunchIdentity
+): void {
+  if (!isJsonRecord(actual)) {
+    throw new Error(
+      "Authenticated Controller launch identity is malformed; refusing to accept readiness."
+    );
+  }
+  const actualArgs = actual.args;
+  if (
+    typeof actual.executablePath !== "string"
+    || !Array.isArray(actualArgs)
+    || actualArgs.some((arg) => typeof arg !== "string")
+    || typeof actual.version !== "string"
+  ) {
+    throw new Error(
+      "Authenticated Controller launch identity is malformed; refusing to accept readiness."
+    );
+  }
+  const argsMatch = actualArgs.length === expected.args.length
+    && actualArgs.every((arg, index) => arg === expected.args[index]);
+  if (
+    actual.executablePath !== expected.executablePath
+    || !argsMatch
+    || actual.version !== expected.version
+  ) {
+    throw new Error(
+      "Authenticated Controller launch identity does not match the captured executable, argv, and version; refusing readiness."
+    );
+  }
+}
+
+function assertCompatibleControllerStatus(
+  status: JsonValue,
+  expectedVersion?: string
+): void {
+  const statusRecord = isJsonRecord(status) && status.running === true ? status : null;
+  const actual = statusRecord?.protocolVersion;
+  if (statusRecord === null || actual !== FILE_TASK_CONTROLLER_PROTOCOL_VERSION) {
+    throw new Error(
+      `Controller protocol is incompatible (expected ${
+        FILE_TASK_CONTROLLER_PROTOCOL_VERSION
+      }, found ${typeof actual === "number" ? actual : "unknown"}). `
+        + "Run `yui controller restart` before writing new task records."
+    );
+  }
+  const actualVersion = statusRecord.version;
+  const expected = expectedVersion ?? YUI_VERSION;
+  const versionMismatch = expectedVersion === undefined
+    ? typeof actualVersion === "string" && actualVersion !== expected
+    : actualVersion !== expected;
+  if (versionMismatch) {
+    throw new Error(
+      `Controller version is incompatible (expected ${expected}, found ${
+        typeof actualVersion === "string" ? actualVersion : "unknown"
+      }). `
+        + "Run `yui controller restart` before writing new task records."
+    );
+  }
+  // Ordinary callers must authenticate the complete control-plane identity.
+  // An update/upgrade restore instead targets a previously captured Controller
+  // binary, which may predate the current storage-layout status fields; that
+  // path authenticates its executable, argv, and version immediately after
+  // readiness in ensureFileTaskControllerIdentity.
+  if (expectedVersion === undefined) {
+    assertControllerStatusIdentity(status, yuiVersionIdentity());
+  }
 }
 
 function spawnDetachedFileTaskController(
@@ -150,18 +273,54 @@ export async function stopFileTaskController(
     "shutdownTimeoutMs"
   );
   const pollMs = positive(options.pollIntervalMs, POLL_INTERVAL_MS, "pollIntervalMs");
+  const expectedPid = options.expectedPid === undefined
+    ? undefined
+    : positive(options.expectedPid, 0, "expectedPid");
   const current = await readOptionalControllerStatus(home, call);
   const pid = controllerPid(current);
+  if (expectedPid !== undefined && pid !== expectedPid) {
+    throw new Error(
+      `Controller ownership changed before fenced stop (expected PID ${expectedPid}, `
+        + `found ${pid === undefined ? "none" : pid}).`
+    );
+  }
   if (!controllerRunning(current)) {
     return { stopped: false, alreadyStopped: true };
   }
-  await callFileTaskController(home, "controller.stop", {}, options);
+  await callFileTaskController(
+    home,
+    "controller.stop",
+    expectedPid === undefined ? {} : { expectedPid },
+    options
+  );
   const deadline = Date.now() + shutdownTimeoutMs;
   for (;;) {
-    const stillOwned = options.call === undefined
-      ? await ownedControllerDiscoveryExists(home, pid)
-      : controllerPid(await readOptionalControllerStatus(home, call)) === pid;
-    if (!stillOwned) break;
+    if (options.call === undefined) {
+      const discoveryOwned = await ownedControllerDiscoveryExists(home, pid);
+      if (!discoveryOwned && expectedPid !== undefined) {
+        // A replacement owner appearing during the drain is not equivalent to
+        // the fenced process disappearing; fail closed instead of reporting a
+        // successful stop against a foreign PID.
+        const observed = controllerPid(await readOptionalControllerStatus(home, call));
+        if (observed !== undefined && observed !== expectedPid) {
+          throw new Error(
+            `Controller ownership changed during fenced stop (expected PID ${expectedPid}, `
+              + `found ${observed}).`
+          );
+        }
+      }
+      if (!discoveryOwned) break;
+    } else {
+      const observed = controllerPid(await readOptionalControllerStatus(home, call));
+      if (observed === undefined) break;
+      if (expectedPid !== undefined && observed !== expectedPid) {
+        throw new Error(
+          `Controller ownership changed during fenced stop (expected PID ${expectedPid}, `
+            + `found ${observed}).`
+        );
+      }
+      if (observed !== pid) break;
+    }
     if (Date.now() >= deadline) {
       throw new Error(`Controller did not stop within ${shutdownTimeoutMs} ms.`);
     }

@@ -3,6 +3,8 @@ import type {
   PreparedRoleDelivery,
   ReadyRoleDelivery,
   RoleSessionLaunchMode,
+  SchedulerRoleResourceInput,
+  SchedulerRoleResourceEntry,
   SchedulerRoleSession,
   TmuxDeliveryPort
 } from "../scheduler/ports.js";
@@ -99,6 +101,11 @@ export type ExecutorRuntimePorts = Readonly<{
   sessionHost: SessionHostPort;
   promptPush: ActivePromptPushPort;
   launchCoordinator?: RuntimeLaunchPreparationPort;
+  /** One advisory resource sample produced alongside the full Role inventory. */
+  roleResourceInventory?: (
+    panes: readonly TmuxRolePaneState[],
+    inputs: readonly SchedulerRoleResourceInput[]
+  ) => Promise<readonly SchedulerRoleResourceEntry[]>;
 }>;
 
 type PreparedRuntime = Readonly<{
@@ -368,10 +375,14 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     agentId: string;
     adapterId: string;
     nativeSessionId?: string;
-  }>[]): Promise<readonly Readonly<{
+    runId?: string;
+    launchId?: string;
+    progressAt?: string;
+  }>[], resourceInputs?: readonly SchedulerRoleResourceInput[]): Promise<readonly Readonly<{
     taskId: string;
     roleName: string;
     status: "present" | "absent";
+    resource?: SchedulerRoleResourceEntry["resource"];
   }>[]> {
     if (
       this.tmux.inspectRolePaneInventory === undefined
@@ -386,18 +397,48 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     const inventory = this.tmux.inspectRolePaneInventoryAsync === undefined
       ? this.tmux.inspectRolePaneInventory!()
       : await this.tmux.inspectRolePaneInventoryAsync();
+    let resources = new Map<string, SchedulerRoleResourceEntry["resource"]>();
+    const requested = resourceInputs ?? inputs.map((input) => ({
+      taskId: input.taskId,
+      roleName: input.roleName,
+      ...(input.runId === undefined ? {} : { runId: input.runId }),
+      agentId: input.agentId,
+      adapterId: input.adapterId,
+      ...(input.nativeSessionId === undefined
+        ? {}
+        : { nativeSessionId: input.nativeSessionId }),
+      ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+      ...(input.progressAt === undefined ? {} : { progressAt: input.progressAt })
+    }));
+    if (
+      this.runtimePorts?.roleResourceInventory !== undefined
+      && requested.length > 0
+    ) {
+      try {
+        for (const entry of await this.runtimePorts.roleResourceInventory(inventory, requested)) {
+          const key = `${entry.taskId}\0${entry.roleName}`;
+          if (!resources.has(key)) resources.set(key, entry.resource);
+        }
+      } catch {
+        // Resource evidence is advisory. A failed process snapshot must not
+        // turn the authoritative pane inventory into an absent observation.
+      }
+    }
     const present = new Set(
       inventory
         .filter((pane) => !pane.dead)
         .map((pane) => `${pane.taskId}\0${pane.roleName}`)
     );
-    return inputs.map((input) => ({
-      taskId: input.taskId,
-      roleName: input.roleName,
-      status: present.has(`${input.taskId}\0${input.roleName}`)
-        ? "present"
-        : "absent"
-    }));
+    return inputs.map((input) => {
+      const key = `${input.taskId}\0${input.roleName}`;
+      const resource = resources.get(key);
+      return {
+        taskId: input.taskId,
+        roleName: input.roleName,
+        status: present.has(key) ? "present" : "absent",
+        ...(resource === undefined ? {} : { resource })
+      };
+    });
   }
 
   async stopRole(taskId: string, roleName: string): Promise<boolean> {

@@ -87,6 +87,10 @@ import { WorkItemChangeSetManager } from "../../dist/workspace/workItemChangeSet
 
 const NOW = new Date("2026-07-19T12:00:00.000Z");
 
+function git(args) {
+  return execFileSync("git", args, { encoding: "utf8" });
+}
+
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), "yui-project-"));
   const home = join(root, "home");
@@ -4190,4 +4194,201 @@ test("public Task archive cleans terminal ReviewRound workspaces before archivin
   assert.equal(store.getReviewRoundWorkspace(task.id, round.id), null);
   assert.equal(existsSync(join(workspace, "tasks", task.id, "reviews", round.id)), false);
   assert.equal(existsSync(main), false);
+});
+
+test("a WorkItem can provision from an explicit Project ref and capture only its descendants", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const developmentBranch = execFileSync(
+    "git", ["-C", repositoryPath, "symbolic-ref", "--short", "HEAD"], { encoding: "utf8" }
+  ).trim();
+  git(["-C", repositoryPath, "checkout", "-q", "-b", "latest-master"]);
+  writeFileSync(join(repositoryPath, "latest.txt"), "latest\n");
+  git(["-C", repositoryPath, "add", "latest.txt"]);
+  git([
+    "-C", repositoryPath,
+    "-c", "user.name=Yui Test",
+    "-c", "user.email=yui@example.invalid",
+    "commit", "-qm", "latest master"
+  ]);
+  const latestCommit = git(["-C", repositoryPath, "rev-parse", "HEAD"]).trim();
+  git(["-C", repositoryPath, "branch", "origin/master", "latest-master"]);
+  git(["-C", repositoryPath, "checkout", "-q", developmentBranch]);
+
+  const task = activateTask(createTask("task-1", "Explicit base", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: "HEAD"
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const result = runTaskCommand([
+    "work", "create", task.id, "Use latest master",
+    "--project", project.id,
+    "--base-ref", `${project.id}=origin/master`,
+    "--role", "worker"
+  ], store, { now: () => new Date(NOW) });
+  assert.equal(result.data.workItem.baseRefs[0].baseRef, "origin/master");
+
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  const main = await preparer.prepareTaskWorkspace(task.id);
+  const workspace = await preparer.prepareWorkItemWorkspace(task.id, result.data.workItem.id);
+  const entry = workspace.entries.find(({ access }) => access === "write");
+  assert.equal(entry.baseRef, "origin/master");
+  assert.equal(entry.baseCommit, latestCommit);
+  assert.equal(
+    git(["-C", entry.path, "rev-parse", "HEAD"]).trim(),
+    latestCommit
+  );
+  assert.equal(
+    git(["-C", join(main.path, project.name), "rev-parse", "HEAD"]).trim(),
+    git(["-C", repositoryPath, "rev-parse", developmentBranch]).trim()
+  );
+
+  const running = updateWorkItemStatus(result.data.workItem, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  const candidateRun = yieldAgentRun(createAgentRun(
+    store.nextAgentRunId(task.id),
+    task.id,
+    "worker",
+    "new",
+    "Prepare explicit-base candidate.",
+    NOW,
+    { workItemId: result.data.workItem.id, workspace }
+  ), "Candidate ready.", NOW);
+  store.saveAgentRun(candidateRun);
+  store.saveWorkItem(task.id, submitWorkItemCandidate(running, {
+    summary: candidateRun.summary,
+    source: { type: "run", runId: candidateRun.id },
+    workspace
+  }, NOW));
+  writeFileSync(join(entry.path, "change.txt"), "descendant\n");
+  git(["-C", entry.path, "add", "change.txt"]);
+  git([
+    "-C", entry.path,
+    "-c", "user.name=Yui Test",
+    "-c", "user.email=yui@example.invalid",
+    "commit", "-qm", "descendant change"
+  ]);
+  const manager = new WorkItemChangeSetManager(store, () => new Date(NOW));
+  const [changeSet] = await manager.capture(task.id, result.data.workItem.id);
+  assert.equal(changeSet.baseCommit, latestCommit);
+
+  const tree = git(["-C", entry.path, "rev-parse", "HEAD^{tree}"]).trim();
+  const unrelated = git([
+    "-C", entry.path,
+    "-c", "user.name=Yui Test",
+    "-c", "user.email=yui@example.invalid",
+    "commit-tree", tree,
+    "-m", "unrelated history"
+  ]).trim();
+  git(["-C", entry.path, "reset", "--hard", unrelated]);
+  await assert.rejects(
+    preparer.prepareWorkItemWorkspace(task.id, result.data.workItem.id),
+    /does not descend from its frozen base/u
+  );
+  await assert.rejects(
+    manager.capture(task.id, result.data.workItem.id),
+    /does not descend from its recorded base/u
+  );
+});
+
+test("explicit base mismatch does not retain an unadopted WorkItem worktree", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const requestedBaseCommit = execFileSync(
+    "git", ["-C", repositoryPath, "rev-parse", "HEAD"], { encoding: "utf8" }
+  ).trim();
+  execFileSync("git", [
+    "-C", repositoryPath,
+    "commit", "--allow-empty", "-qm", "stale managed branch"
+  ]);
+  const staleBranchCommit = execFileSync(
+    "git", ["-C", repositoryPath, "rev-parse", "HEAD"], { encoding: "utf8" }
+  ).trim();
+  execFileSync("git", [
+    "-C", repositoryPath, "branch", "origin/master", requestedBaseCommit
+  ]);
+
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Reject stale explicit base", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: "HEAD"
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const result = runTaskCommand([
+    "work", "create", task.id, "Stale explicit base",
+    "--project", project.id,
+    "--base-ref", `${project.id}=origin/master`,
+    "--role", "worker"
+  ], store, { now: () => new Date(NOW) });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const identity = worktreeIdentity(task.id, result.data.workItem.id);
+  execFileSync("git", [
+    "-C", repositoryPath, "branch", identity.branch, staleBranchCommit
+  ]);
+
+  await assert.rejects(
+    preparer.prepareWorkItemWorkspace(task.id, result.data.workItem.id),
+    /did not start at its requested base ref/u
+  );
+  assert.equal(store.getWorkItemWorkspace(task.id, result.data.workItem.id), null);
+  assert.equal(
+    existsSync(join(workspace, "worktree", project.name, identity.directory)),
+    false
+  );
+  assert.equal(
+    execFileSync("git", ["-C", repositoryPath, "rev-parse", identity.branch], {
+      encoding: "utf8"
+    }).trim(),
+    staleBranchCommit
+  );
+});
+
+test("explicit WorkItem base refs reject unbound, read-only, and invalid refs without creating a workspace", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Reject explicit base", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: "HEAD"
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const environment = {
+    YUI_SESSION_SCOPE: "task",
+    YUI_TASK_ID: task.id,
+    YUI_ROLE: "leader"
+  };
+  assert.throws(
+    () => runTaskCommand([
+      "work", "create", task.id, "Unbound ref",
+      "--base-ref", "project-999=origin/master"
+    ], store, { now: () => new Date(NOW), environment }),
+    /Task Project not found/u
+  );
+  assert.throws(
+    () => runTaskCommand([
+      "work", "create", task.id, "Read-only ref",
+      "--base-ref", `${project.id}=origin/master`
+    ], store, { now: () => new Date(NOW), environment }),
+    /must be writable/u
+  );
+  const created = runTaskCommand([
+    "work", "create", task.id, "Invalid ref",
+    "--project", project.id,
+    "--base-ref", `${project.id}=does-not-exist`
+  ], store, { now: () => new Date(NOW), environment });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  await assert.rejects(
+    preparer.prepareWorkItemWorkspace(task.id, created.data.workItem.id),
+    /Git command failed|does-not-exist/u
+  );
+  assert.equal(store.getWorkItemWorkspace(task.id, created.data.workItem.id), null);
 });

@@ -334,7 +334,12 @@ export function runCard(run, t, locale) {
   const foot = node("div", "execute-foot");
   const tags = node("div", "execute-tags");
   tags.append(chip(t("mode." + run.mode)));
-  tags.append(chip(t(run.deliveredAt ? "delivery.delivered" : "delivery.pending")));
+  const deliveryKey = run.deliveredAt
+    ? "delivery.delivered"
+    : run.pushedAt
+      ? "delivery.pushed"
+      : "delivery.pending";
+  tags.append(chip(t(deliveryKey)));
   const badge = run.effective ? agentBadge(run.effective) : (run.agentId ? agentBadge(run) : null);
   if (badge) tags.append(badge);
   foot.append(tags);

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { chmodSync, realpathSync } from "node:fs";
+import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
@@ -31,6 +31,7 @@ import type {
   AgentEnvironmentRefreshPort
 } from "../runtime/ports.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
+import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import { activeLiveRoleAgentSession } from "./agentExecutor.js";
 import {
@@ -51,7 +52,6 @@ import {
   serializeExactDescriptor,
   type ExactControlPlaneDescriptor
 } from "../runtime/exactControlPlane.js";
-import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.js";
 import {
   parseTaskRuntimeIsolationDescriptor,
   taskRuntimeIsolationEnvironment,

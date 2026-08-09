@@ -56,6 +56,8 @@ export type RuntimeProcessFact = Readonly<{
   args: readonly string[];
   rssBytes: number;
   cpuTimeMs: number;
+  ioReadBytes?: number;
+  ioWriteBytes?: number;
   ageMs: number;
 }>;
 
@@ -79,6 +81,8 @@ export type RuntimeRoleFact = Readonly<{
   agentId: string;
   adapterId?: string;
   nativeSessionId?: string;
+  launchId?: string;
+  runId?: string;
 }>;
 
 export type RuntimeArtifactFact = Readonly<{
@@ -125,6 +129,8 @@ export type RuntimeOwner =
       agentId: string;
       adapterId?: string;
       nativeSessionId?: string;
+      launchId?: string;
+      runId?: string;
     }>
   | Readonly<{
       kind: "global-role";
@@ -132,6 +138,8 @@ export type RuntimeOwner =
       agentId: string;
       adapterId?: string;
       nativeSessionId?: string;
+      launchId?: string;
+      runId?: string;
     }>
   | Readonly<{ kind: "none" }>;
 
@@ -147,6 +155,8 @@ export type RuntimeResource = Readonly<{
   processes: readonly RuntimeProcessInfo[];
   rssBytes: number;
   cpuTimeMs: number;
+  ioReadBytes?: number;
+  ioWriteBytes?: number;
   ageMs: number;
   target?: string;
   paneDead?: boolean;
@@ -154,6 +164,106 @@ export type RuntimeResource = Readonly<{
   artifact?: RuntimeArtifactFact;
   domain?: RuntimeDomainFact;
 }>;
+
+/** Exact identity carried by one bounded Role resource sample. */
+export type RuntimeResourceSampleIdentity = Readonly<{
+  taskId: string;
+  roleName: string;
+  runId: string;
+  agentId: string;
+  adapterId: string;
+  nativeSessionId?: string;
+  launchId?: string;
+}>;
+
+/**
+ * Keeps only the immediately previous sample for each Role. The cache is
+ * intentionally process-local: a Controller restart starts with a baseline
+ * sample and cannot infer progress from cumulative counters left by an older
+ * Controller instance.
+ */
+export type RuntimeResourceActivityTracker = (
+  identity: RuntimeResourceSampleIdentity,
+  resource: RuntimeResource
+) => boolean;
+
+export function createRuntimeResourceActivityTracker(): RuntimeResourceActivityTracker {
+  const previous = new Map<string, Readonly<{
+    identity: string;
+    fingerprint: string;
+    cpuTimeMs: number;
+    ioReadBytes?: number;
+    ioWriteBytes?: number;
+  }>>();
+  return (identity, resource) => {
+    const roleKey = resourceSampleRoleKey(identity, resource);
+    const ownerRoleKey = resource.owner.kind === "task-role"
+      ? `${resource.owner.taskId}\0${resource.owner.roleName}`
+      : undefined;
+    const reject = () => {
+      // A rejected observation is a generation/process gap, not an adjacent
+      // sample. Never let a later valid observation bridge across it.
+      const keys = new Set([roleKey, ownerRoleKey].filter((key): key is string => key !== undefined));
+      if (keys.size === 0) previous.clear();
+      else for (const key of keys) previous.delete(key);
+      return false;
+    };
+    if (!matchesResourceIdentity(identity, resource.owner)) return reject();
+    if (!Array.isArray(resource.processes) || resource.processes.length === 0) {
+      return reject();
+    }
+    const cpuTimeMs = nonNegativeCounter(resource.cpuTimeMs);
+    if (cpuTimeMs === undefined) return reject();
+    const ioReadBytes = optionalCounter(resource.ioReadBytes);
+    const ioWriteBytes = optionalCounter(resource.ioWriteBytes);
+    if (
+      (resource.ioReadBytes !== undefined && ioReadBytes === undefined)
+      || (resource.ioWriteBytes !== undefined && ioWriteBytes === undefined)
+      || roleKey === undefined
+    ) return reject();
+    const identityKey = JSON.stringify([
+      identity.runId,
+      identity.agentId,
+      identity.adapterId,
+      identity.nativeSessionId ?? null,
+      identity.launchId ?? null
+    ]);
+    const current = {
+      identity: identityKey,
+      fingerprint: resource.fingerprint,
+      cpuTimeMs,
+      ...(ioReadBytes === undefined ? {} : { ioReadBytes }),
+      ...(ioWriteBytes === undefined ? {} : { ioWriteBytes })
+    };
+    const prior = previous.get(roleKey);
+    if (prior === undefined) {
+      previous.set(roleKey, current);
+      return false;
+    }
+    if (
+      (prior.ioReadBytes !== undefined && ioReadBytes === undefined)
+      || (prior.ioWriteBytes !== undefined && ioWriteBytes === undefined)
+    ) return reject();
+    if (
+      prior.identity !== current.identity
+      || prior.fingerprint !== current.fingerprint
+    ) {
+      // An identity/process generation change is not adjacent to the prior
+      // sample. Require a fresh baseline on a subsequent valid observation.
+      previous.delete(roleKey);
+      return false;
+    }
+    if (
+      cpuTimeMs < prior.cpuTimeMs
+      || counterReset(ioReadBytes, prior.ioReadBytes)
+      || counterReset(ioWriteBytes, prior.ioWriteBytes)
+    ) return reject();
+    previous.set(roleKey, current);
+    return cpuTimeMs > prior.cpuTimeMs
+      || counterIncrease(ioReadBytes, prior.ioReadBytes)
+      || counterIncrease(ioWriteBytes, prior.ioWriteBytes);
+  };
+}
 
 export type RuntimeDomainSummary = Readonly<{
   yuiHome: string;
@@ -416,7 +526,9 @@ function roleOwner(role: RuntimeRoleFact): RuntimeOwner {
       roleName: role.roleName,
       agentId: role.agentId,
       ...(role.adapterId === undefined ? {} : { adapterId: role.adapterId }),
-      ...(role.nativeSessionId === undefined ? {} : { nativeSessionId: role.nativeSessionId })
+      ...(role.nativeSessionId === undefined ? {} : { nativeSessionId: role.nativeSessionId }),
+      ...(role.launchId === undefined ? {} : { launchId: role.launchId }),
+      ...(role.runId === undefined ? {} : { runId: role.runId })
     };
   }
   return {
@@ -427,7 +539,9 @@ function roleOwner(role: RuntimeRoleFact): RuntimeOwner {
     roleName: role.roleName,
     agentId: role.agentId,
     ...(role.adapterId === undefined ? {} : { adapterId: role.adapterId }),
-    ...(role.nativeSessionId === undefined ? {} : { nativeSessionId: role.nativeSessionId })
+    ...(role.nativeSessionId === undefined ? {} : { nativeSessionId: role.nativeSessionId }),
+    ...(role.launchId === undefined ? {} : { launchId: role.launchId }),
+    ...(role.runId === undefined ? {} : { runId: role.runId })
   };
 }
 
@@ -497,6 +611,8 @@ function processResource(input: Readonly<{
     processes,
     rssBytes: sum(processes.map(({ rssBytes }) => rssBytes)),
     cpuTimeMs: sum(processes.map(({ cpuTimeMs }) => cpuTimeMs)),
+    ...optionalCounterFields(processes, "ioReadBytes"),
+    ...optionalCounterFields(processes, "ioWriteBytes"),
     ageMs: max(processes.map(({ ageMs }) => ageMs)),
     ...(input.target === undefined ? {} : { target: input.target }),
     ...(input.paneDead === undefined ? {} : { paneDead: input.paneDead }),
@@ -600,8 +716,102 @@ function publicProcess(process: RuntimeProcessFact): RuntimeProcessInfo {
     command: process.command,
     rssBytes: process.rssBytes,
     cpuTimeMs: process.cpuTimeMs,
+    ...(process.ioReadBytes === undefined ? {} : { ioReadBytes: process.ioReadBytes }),
+    ...(process.ioWriteBytes === undefined ? {} : { ioWriteBytes: process.ioWriteBytes }),
     ageMs: process.ageMs
   };
+}
+
+function optionalCounterFields(
+  processes: readonly Readonly<{
+    ioReadBytes?: number;
+    ioWriteBytes?: number;
+  }>[],
+  field: "ioReadBytes" | "ioWriteBytes"
+): Readonly<{ ioReadBytes?: number; ioWriteBytes?: number }> {
+  const values = processes
+    .map((process) => process[field])
+    .filter((value): value is number => value !== undefined);
+  return values.length === 0
+    ? {}
+    : field === "ioReadBytes"
+      ? { ioReadBytes: sum(values) }
+      : { ioWriteBytes: sum(values) };
+}
+
+function matchesResourceIdentity(
+  identity: RuntimeResourceSampleIdentity,
+  owner: RuntimeOwner
+): boolean {
+  if (
+    identity === undefined
+    || typeof identity.taskId !== "string"
+    || identity.taskId.length === 0
+    || typeof identity.roleName !== "string"
+    || identity.roleName.length === 0
+    || typeof identity.runId !== "string"
+    || identity.runId.length === 0
+    || typeof identity.agentId !== "string"
+    || identity.agentId.length === 0
+    || typeof identity.adapterId !== "string"
+    || identity.adapterId.length === 0
+    || (identity.nativeSessionId !== undefined && !hasIdentityText(identity.nativeSessionId))
+    || (identity.launchId !== undefined && !hasIdentityText(identity.launchId))
+  ) return false;
+  if (
+    owner.kind !== "task-role"
+    || owner.taskId !== identity.taskId
+    || owner.roleName !== identity.roleName
+    || owner.runId !== identity.runId
+    || owner.agentId !== identity.agentId
+    || owner.adapterId !== identity.adapterId
+  ) return false;
+  if (!hasIdentityText(identity.nativeSessionId) && !hasIdentityText(identity.launchId)) return false;
+  if (
+    identity.nativeSessionId !== undefined
+    && owner.nativeSessionId !== identity.nativeSessionId
+  ) return false;
+  if (identity.launchId !== undefined && owner.launchId !== identity.launchId) return false;
+  return true;
+}
+
+function hasIdentityText(value: string | undefined): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function resourceSampleRoleKey(
+  identity: RuntimeResourceSampleIdentity | undefined,
+  resource: RuntimeResource | undefined
+): string | undefined {
+  const taskId = typeof identity?.taskId === "string" && identity.taskId.length > 0
+    ? identity.taskId
+    : resource?.owner.kind === "task-role"
+      ? resource.owner.taskId
+      : undefined;
+  const roleName = typeof identity?.roleName === "string" && identity.roleName.length > 0
+    ? identity.roleName
+    : resource?.owner.kind === "task-role"
+      ? resource.owner.roleName
+      : undefined;
+  return taskId === undefined || roleName === undefined
+    ? undefined
+    : `${taskId}\0${roleName}`;
+}
+
+function nonNegativeCounter(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function optionalCounter(value: number | undefined): number | undefined {
+  return nonNegativeCounter(value);
+}
+
+function counterReset(current: number | undefined, prior: number | undefined): boolean {
+  return current !== undefined && prior !== undefined && current < prior;
+}
+
+function counterIncrease(current: number | undefined, prior: number | undefined): boolean {
+  return current !== undefined && prior !== undefined && current > prior;
 }
 
 function publicProcessKind(kind: RuntimeProcessKind): RuntimeResourceKind {

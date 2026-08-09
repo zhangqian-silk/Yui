@@ -25,6 +25,7 @@ import {
 import { resolveOperatorWizardArguments } from "./cli/operatorWizard.js";
 import type { SelectionPorts } from "./cli/selectionPorts.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
+import { runUpgradeCommand } from "./cli/upgradeCommand.js";
 import { formatTimestamp } from "./output/timePresentation.js";
 import { renderAgentConfigurationCatalog } from "./output/agentConfigurationPresentation.js";
 import type { ConfiguredAgent } from "./agent/agent.js";
@@ -72,13 +73,14 @@ import {
   restartFileTaskController,
   stopFileTaskController
 } from "./controller/clientRuntime.js";
+import { callController, ControllerClientError } from "./core/controllerClient.js";
 import { FileSchedulerStoreAdapter } from "./controller/fileSchedulerStoreAdapter.js";
 import { cleanControllerResource } from "./controller/resourceCleanupLinux.js";
 import { scanControllerResourceInventory } from "./controller/resourceInventoryLinux.js";
 import { runSessionNotifyCommand } from "./controller/sessionNotify.js";
 import { runClaudeLifecycleHookCommand } from "./controller/claudeLifecycleHook.js";
 import { runCodexLifecycleHookCommand } from "./controller/codexLifecycleHook.js";
-import { runDoctorCommand } from "./doctor/doctor.js";
+import { buildDoctorReport, renderDoctor, runDoctorCommand } from "./doctor/doctor.js";
 import { agentNotFound, CliError, runtimeError, usageError } from "./errors/cliError.js";
 import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
 import {
@@ -206,7 +208,39 @@ export async function main(): Promise<void> {
     return;
   }
   if (args[0] === "doctor") {
-    emit(runDoctorCommand(args.slice(1), process.env, new NodeCommandExecutor()));
+    const doctorArgs = args.slice(1);
+    if (doctorArgs.length !== 0) {
+      // Preserve the usage error for stray operands (parity with text mode).
+      runDoctorCommand(doctorArgs, process.env, new NodeCommandExecutor());
+      return;
+    }
+    const report = buildDoctorReport(process.env, new NodeCommandExecutor());
+    if (jsonOutput) {
+      // Machine-readable result: the full checks array + a storage-health verdict
+      // the update post-verify parses (P1-3). Exit non-zero when storage is not
+      // healthy so even a naive exit-code check fails closed. This exit-code
+      // signal is scoped to the --json path; text-mode doctor keeps its existing
+      // presentation and exit 0 (the WorkItem allows doctor's presentation to stay).
+      if (!report.storage.healthy) process.exitCode = 5;
+      emit("", false, report);
+      return;
+    }
+    emit(renderDoctor(report.checks));
+    return;
+  }
+  if (args[0] === "upgrade") {
+    // Mirror doctor/controller: needs a Home but self-manages the schema check,
+    // because upgrade must run against a non-current Home. Dispatched before the
+    // unconditional requireStorageSchema gate below.
+    const result = await runUpgradeCommand(
+      args.slice(1),
+      home,
+      process.env.YUI_UPDATE_EXTERNALLY_QUIESCED === "1"
+        ? { controllerLifecycle: "externally-quiesced" }
+        : {}
+    );
+    process.exitCode = result.exitCode;
+    emit(result.output, false, result.data);
     return;
   }
   if (args[0] === "internal") {
@@ -227,6 +261,33 @@ export async function main(): Promise<void> {
 
   if (args[0] === "controller") {
     const method = args[1];
+    if (method === "identity" && args.length === 2) {
+      // Internal lifecycle seam used by update/upgrade. The Controller socket
+      // authenticates this exact launch identity; public `controller status`
+      // intentionally redacts argv in its resource inventory.
+      try {
+        const identity = await callController(home, "controller.identity", {});
+        emit("", false, identity);
+      } catch (error) {
+        // Preserve the Controller protocol code for the synchronous update
+        // lifecycle owner. A generic RUNTIME_ERROR would erase the only
+        // definitive CONTROLLER_NOT_RUNNING proof and force an unnecessary
+        // unknown-active block.
+        if (!(error instanceof ControllerClientError)) throw error;
+        if (jsonOutput) {
+          process.stderr.write(`${JSON.stringify({
+            ok: false,
+            code: error.code,
+            message: error.message,
+            details: {}
+          })}\n`);
+        } else {
+          process.stderr.write(`RUNTIME_ERROR: ${error.message}\n`);
+        }
+        process.exitCode = 5;
+      }
+      return;
+    }
     if (method === "status") {
       const options = parseControllerStatusOptions(args.slice(2));
       const snapshot = await scanControllerResourceInventory({
@@ -284,7 +345,14 @@ export async function main(): Promise<void> {
     const result = controllerMethod === "restart"
       ? await restartFileTaskController(home, { environment: process.env })
       : await stopFileTaskController(home, { environment: process.env });
-    emit(renderControllerResult(controllerMethod, result));
+    // The update lifecycle needs the authenticated replacement PID returned by
+    // restart/readiness.  Keep stop's long-standing text envelope, while
+    // exposing restart's structured result alongside its human output.
+    emit(
+      renderControllerResult(controllerMethod, result),
+      false,
+      controllerMethod === "restart" ? result : undefined
+    );
     return;
   }
 

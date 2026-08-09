@@ -67,6 +67,11 @@ import {
   recordEphemeralTmuxTarget
 } from "./domainIdentity.js";
 import { createEphemeralResourceReaper } from "./ephemeralResourceReaper.js";
+import { scanControllerResourceInventory } from "./resourceInventoryLinux.js";
+import {
+  createRuntimeResourceActivityTracker,
+  type RuntimeResourceSampleIdentity
+} from "./resourceInventory.js";
 
 export type FileTaskControllerFactoryOptions = ControllerRuntimeOptions & Readonly<{
   store?: TaskStore;
@@ -163,6 +168,7 @@ export async function startFileTaskControllerRuntime(
           ) => runtimeIsolation.cleanupTaskLaunch!(input)
         })
   };
+  const resourceActivity = createRuntimeResourceActivityTracker();
   let runningRuntime: RunningFileTaskController["runtime"] | undefined;
   let runningController: RunningFileTaskController | undefined;
   const signalRuntimeCleanup = (target: RuntimeLifecycleTarget) => {
@@ -195,7 +201,81 @@ export async function startFileTaskControllerRuntime(
     planner,
     tmux,
     agentProcessReadinessProbe,
-    { sessionHost, promptPush, launchCoordinator }
+    {
+      sessionHost,
+      promptPush,
+      launchCoordinator,
+      roleResourceInventory: async (panes, inputs) => {
+        const inventory = await scanControllerResourceInventory({
+          currentHome: home,
+          scope: "current",
+          panes,
+          ...(options.environment === undefined
+            ? {}
+            : { environment: options.environment })
+        });
+        return inventory.resources.flatMap((resource) => {
+          if (resource.kind !== "agent-session") return [];
+          const owner = resource.owner;
+          if (owner.kind !== "task-role") return [];
+          const active = resource.state === "running" || resource.state === "current";
+          const input = inputs.find((candidate) => (
+            candidate.taskId === owner.taskId
+            && candidate.roleName === owner.roleName
+          ));
+          if (input === undefined) return [];
+          const identity = owner.runId === undefined
+            || owner.adapterId === undefined
+            || (owner.nativeSessionId === undefined && owner.launchId === undefined)
+            || (owner.nativeSessionId !== undefined && owner.nativeSessionId.trim().length === 0)
+            || (owner.launchId !== undefined && owner.launchId.trim().length === 0)
+            ? undefined
+            : {
+                taskId: owner.taskId,
+                roleName: owner.roleName,
+                runId: owner.runId,
+                agentId: owner.agentId,
+                adapterId: owner.adapterId,
+                ...(owner.nativeSessionId === undefined
+                  ? {}
+                  : { nativeSessionId: owner.nativeSessionId }),
+                ...(owner.launchId === undefined ? {} : { launchId: owner.launchId })
+              };
+          const changed = !active || input.runId === undefined
+            ? false
+            : resourceActivity({
+                taskId: input.taskId,
+                roleName: input.roleName,
+                runId: input.runId,
+                agentId: input.agentId,
+                adapterId: input.adapterId,
+                ...(input.nativeSessionId === undefined
+                  ? {}
+                  : { nativeSessionId: input.nativeSessionId }),
+                ...(input.launchId === undefined ? {} : { launchId: input.launchId })
+              } satisfies RuntimeResourceSampleIdentity, resource);
+          return [{
+            taskId: owner.taskId,
+            roleName: owner.roleName,
+            resource: {
+              observedAt: inventory.observedAt,
+              active,
+              changed: active && changed,
+              ...(identity === undefined ? {} : { identity }),
+              ...(input.progressAt === undefined ? {} : { progressAt: input.progressAt }),
+              cpuTimeMs: resource.cpuTimeMs,
+              ...(resource.ioReadBytes === undefined
+                ? {}
+                : { ioReadBytes: resource.ioReadBytes }),
+              ...(resource.ioWriteBytes === undefined
+                ? {}
+                : { ioWriteBytes: resource.ioWriteBytes }),
+              rssBytes: resource.rssBytes
+            }
+          }];
+        });
+      }
+    }
   );
   const workspacePreparer = options.workspacePreparer
     ?? new FileTaskWorkspacePreparer(home, store);
