@@ -909,6 +909,70 @@ test("Task-scoped milestone progress requires the exact current action reason an
   assert.deepEqual(result.map(({ runId }) => runId), ["run-worker"]);
 });
 
+test("a stamped Leader event from another Task cannot refresh a local Run-id collision", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: "2026-08-05T00:00:00.000Z",
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" }
+    }
+  });
+  store.events.push(createTaskEvent(
+    "event-1",
+    "task-other",
+    "decision.recorded",
+    { leaderRunId: "run-1", decisionId: "decision-1" },
+    new Date("2026-08-05T00:20:00.000Z")
+  ));
+  const delivery = { async inspectRole() { return "present"; } };
+  const result = await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    new Date("2026-08-05T00:40:00.000Z"),
+    undefined,
+    30 * 60_000
+  );
+  assert.deepEqual(
+    result.map(({ runId }) => runId).sort(),
+    ["run-1", "run-worker"]
+  );
+});
+
+test("a mailbox reason prefix cannot claim a different Leader lifecycle event", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: "2026-08-05T00:00:00.000Z",
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" },
+      reasons: ["milestone-added-extra"],
+      refs: [{ type: "task", id: "task-1" }]
+    }
+  });
+  store.events.push(createTaskEvent(
+    "event-1",
+    "task-1",
+    "milestone.added",
+    { milestoneId: "milestone-1", title: "Not the claimed reason" },
+    new Date("2026-08-05T00:20:00.000Z")
+  ));
+  const delivery = { async inspectRole() { return "present"; } };
+  const result = await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    new Date("2026-08-05T00:40:00.000Z"),
+    undefined,
+    30 * 60_000
+  );
+  assert.deepEqual(
+    result.map(({ runId }) => runId).sort(),
+    ["run-1", "run-worker"]
+  );
+});
+
 test("provider activity lookup uses the immutable progress timestamp, not drain time", () => {
   const receivedAt = "2026-08-05T00:05:00.000Z";
   const events = [createTaskEvent(

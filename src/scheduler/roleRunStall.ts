@@ -1104,6 +1104,8 @@ function leaderActionEventMatches(
     reasons: readonly string[];
   }>
 ): boolean {
+  if (event.taskId !== taskId) return false;
+  if (event.payload.leaderRunId === runId) return true;
   if (event.payload.runId === runId) return true;
   const refs = batch.refs ?? [];
   const refMatches = (type: string, payloadKey: string): boolean => {
@@ -1117,10 +1119,11 @@ function leaderActionEventMatches(
   if (refMatches("run", "runId")) return true;
   if (refMatches("work-item", "workItemId")) return true;
   const reason = event.type.replaceAll(".", "-");
+  // Mailbox reasons are opaque exact coalescing keys. A prefix or suffix
+  // resemblance can belong to another action in the same Task and is not a
+  // durable ownership fence.
   const reasonMatches = batch.reasons.some((candidate) => (
     candidate === reason
-    || candidate.startsWith(`${reason}-`)
-    || reason.startsWith(`${candidate}-`)
   ));
   return reasonMatches && refs.some((ref) => (
     ref.type === "task" && (ref.taskId === undefined || ref.taskId === taskId)
