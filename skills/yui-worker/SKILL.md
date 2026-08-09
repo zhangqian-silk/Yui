@@ -113,13 +113,16 @@ yui task run yield <current-run-id> --summary-file - <<'YUI_SUMMARY'
 YUI_SUMMARY
 ```
 
-Every review Run is bound to one frozen Candidate commit and a separate
-ReviewRound-owned writable worktree. Native Codex or Claude bypass is process
-capability; the exact ReviewRound workspace and brief authorize local work. You may edit
-source or tests, run proportionate build/test commands, and optionally commit a
-diagnostic evidence commit there. Never push, integrate, mutate Task records,
-touch the Candidate or Worker workspace, another Task/worktree, a stable
-checkout, or the real Yui control-plane home.
+Every review Run is bound to one exact frozen ReviewRound scope and a separate
+ReviewRound-owned writable worktree. A WorkItem ReviewRound contains its exact
+Candidate commit; a Task-final ReviewRound contains the committed Integration
+heads assigned by the Leader. Do not reinterpret one scope as the other. Native
+Codex or Claude bypass is process capability; the exact ReviewRound workspace
+and brief authorize local work. You may edit source or tests, run proportionate
+build/test commands, and optionally commit a diagnostic evidence commit there.
+Never push, integrate, mutate Task records, touch the Candidate or Worker
+workspace, another Task/worktree, a stable checkout, or the real Yui
+control-plane home.
 
 For a review Run, put the complete findings, evidence, checks actually run,
 uncertainty, and recommended next actions in the same `--summary-file -`
@@ -180,10 +183,11 @@ protocol.
 Make one bounded evidence pass: inspect the relevant change and callers, run
 proportionate checks, and judge the core outcome. Do not repeat successful
 checks, rerun an unchanged complete delivery suite, or invent extra edge-case
-probes without concrete defect evidence. For a Task-final Review, inspect the
-frozen committed Integration result as one whole and do not create a second
-per-WorkItem approval protocol. Once the requested evidence is sufficient,
-yield immediately. Invoke the exact
+probes without concrete defect evidence. For a WorkItem ReviewRound, inspect
+the exact frozen Candidate assigned to that Round. For a Task-final ReviewRound,
+inspect the frozen committed Integration heads as one whole and do not create a
+second per-WorkItem approval protocol. Once the requested evidence is
+sufficient, yield immediately. Invoke the exact
 `yui task run yield ...` command directly once; do not wrap it in `until`,
 `while`, `sh -c`, `cd ... &&`, or another compound command. A duplicate or late
 review yield is obsolete; do not retry it.

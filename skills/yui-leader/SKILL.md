@@ -37,8 +37,9 @@ Choose the executor in this order:
 
 Do not dispatch a Task Role merely to obtain a fresh context, run a command,
 perform a routine small edit, or add an intermediate review. Direct and native
-execution create no Worker Role, Yui Session, or AgentRun; the WorkItem and its
-workspace remain the durable delivery boundary.
+execution add no Worker Role, Worker Yui Session, or Worker AgentRun. The exact
+Leader Run fence stays active until a native child hands back its result; the
+WorkItem and its workspace remain the durable delivery boundary.
 
 A Project-backed code result still uses one WorkItem-owned Develop workspace
 and a clean committed Candidate. The fast path compresses orchestration, not
@@ -71,13 +72,19 @@ WorkItem while its delivery scope remains open. If an immutable final-review
 boundary makes that impossible, create only the smallest repair WorkItem and
 retain the original Candidate, Review, and Integration evidence.
 
-A healthy delegated wait is event-driven. Yield the active Leader Run, then
-remain silent until a child result, managed Run result, attention event, or user
-input wakes the Task. Do not poll, send a waiting Message, or rewrite an
-unchanged checkpoint. The ordinary fast path emits no Task Message and no
-InputRequest: write a Message only for a new semantic conclusion with value to
-another reader, and create an InputRequest only for a real user choice,
-authorization, or unavailable external fact that blocks progress.
+Native and managed waits use different fences. For a native child, wait once on
+the native completion event inside the current Leader turn. Keep the exact
+Leader Run active; the child result returns control directly to this Leader.
+Do not poll, send a waiting Message, rewrite a checkpoint, or yield before that
+handoff.
+
+For a managed Task Role or Reviewer Run, persist a necessary changed checkpoint,
+yield the active Leader Run, and stop the turn. Its durable mailbox result or an
+attention event wakes a later Leader Run. An unchanged healthy managed wait is
+silent. The ordinary fast path emits no Task Message and no InputRequest: write
+a Message only for a new semantic conclusion with value to another reader, and
+create an InputRequest only for a real user choice, authorization, or
+unavailable external fact that blocks progress.
 
 ## Lead with judgment
 
@@ -205,12 +212,13 @@ Choose before creating the WorkItem:
 
 Keep review execution separate from implementation. A reviewer uses the single
 built-in write-capable `reviewer` Profile, but Yui grants that capability only
-inside a fresh ReviewRound-owned worktree created from the frozen Candidate
-commit. Never reuse the Candidate/Worker workspace or its implementation Role
-Session. Codex and Claude may use their normal configured full capability in
-that isolated worktree; the behavioral boundary forbids push, Integration,
-Task mutation, other workspaces, stable checkouts, and the real Yui control-plane
-home. When
+inside a fresh ReviewRound-owned worktree created from its exact frozen scope:
+the assigned WorkItem Candidate or the committed Integration heads of a
+Task-final Review. Never reuse the Candidate/Worker workspace or its
+implementation Role Session. Codex and Claude may use their normal configured
+full capability in that isolated worktree; the behavioral boundary forbids
+push, Integration, Task mutation, other workspaces, stable checkouts, and the
+real Yui control-plane home. When
 creating an explicit Task Role binding, also set and read back the required
 model and effort instead of relying on CLI defaults.
 Every managed reviewer must deliver through the current Run's exact
@@ -302,7 +310,9 @@ confirmed.
 Create and communicate with the child through the native Agent tools. Yui does
 not create, address, resume, or terminate that child. The child returns its
 result through the native child-result mechanism and must not mutate Yui
-lifecycle state.
+lifecycle state. Wait on the native completion event in this Leader turn and
+keep the current Leader Run active until that one result arrives; do not yield
+the Run as though Yui could wake it for a native child.
 
 Review the returned work and run proportionate checks. Record each round in the
 WorkItem summary; preserve earlier round facts when updating it:
@@ -553,8 +563,10 @@ broaden permissions, use a wrapper, mutate Yui state, or invent delivery
 evidence; truthfully surface the blocker through the supported provider failure
 boundary. Do not add a fallback protocol.
 
-Always yield before waiting for delegated results. Leaving the Run active
-prevents queued results from waking the Leader.
+Yield before waiting only for managed Task Role or Reviewer results whose
+durable mailbox can wake the Task. Do not yield while a native child result is
+outstanding; its native completion event returns to this same Leader turn and
+requires the exact Leader Run fence to remain active.
 
 Complete only after required WorkItems are accepted, Role work is terminal,
 latest isolated results are integrated or deliberately abandoned, and user
