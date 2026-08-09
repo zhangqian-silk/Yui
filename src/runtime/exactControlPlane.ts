@@ -420,6 +420,8 @@ export function assertExactTaskRuntimeState(
       runtime.agentId,
       runtime.adapterId
     );
+  const preallocatedBeforeInFlightProjection = exactPreallocatedReservation
+    && (sessions?.inFlight === null || sessions?.inFlight === undefined);
   if (runtime.runId !== undefined && (
     sessions?.inFlight?.agentId !== runtime.agentId
     || sessions.inFlight.runId !== runtime.runId
@@ -427,7 +429,7 @@ export function assertExactTaskRuntimeState(
       runtime.taskId,
       runtime.runId
     )
-  ) && !exactPreallocatedReservation) {
+  ) && !preallocatedBeforeInFlightProjection) {
     throw new Error("Exact Task runtime in-flight Run fence is not current.");
   }
   if (runtime.launchId === undefined || (!reservation && !sessionLaunch)) {

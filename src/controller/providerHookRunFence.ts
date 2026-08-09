@@ -6,6 +6,7 @@ import {
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
 import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.js";
+import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 
 export type ProviderHookRunFence = Readonly<{
   taskId: string;
@@ -54,11 +55,20 @@ export function resolveProviderHookRunFence(
   }
 
   const store = new FileTaskStore(home);
+  const task = store.getTask(taskId);
+  if (task === null || task.status !== "active") {
+    throw new Error("Provider lifecycle hook Task is not current and active.");
+  }
+  const role = store.getRole(taskId, roleName);
+  if (role === null || role.activeAgentId !== agentId) {
+    throw new Error("Provider lifecycle hook Role or Agent is not current.");
+  }
   const sessions = store.getTaskRoleSessionSet(taskId, roleName);
   if (sessions !== null && sessions.activeAgentId !== agentId) {
     throw new Error("Provider lifecycle hook Session Agent is not current.");
   }
   const inFlight = sessions?.inFlight;
+  const session = sessions?.sessions[agentId];
   const mailbox = store.getWorkMailbox(runtimeLifecycleTarget({
     scope: "task",
     taskId,
@@ -73,6 +83,7 @@ export function resolveProviderHookRunFence(
   const deterministicClaudeStartup = adapterId === "claude"
     && options.allowPreallocatedClaudeStartup === true
     && expectedNativeSessionId !== undefined
+    && session === undefined
     && exactReservation
     && executionRef?.type === "run"
     && executionRef.taskId === taskId
@@ -89,6 +100,17 @@ export function resolveProviderHookRunFence(
   if (inFlight !== null && inFlight !== undefined && inFlight.agentId !== agentId) {
     throw new Error("Provider lifecycle hook has no matching durable in-flight Run.");
   }
+  if (
+    deterministicClaudeStartup
+    && inFlight !== null
+    && inFlight !== undefined
+    && (
+      inFlight.runId !== startupRunId
+      || inFlight.receiptId !== formatAgentRunReceiptId(taskId, startupRunId!)
+    )
+  ) {
+    throw new Error("Provider lifecycle hook has no matching durable in-flight Run.");
+  }
   const runId = inFlight?.runId ?? startupRunId!;
   const run = store.getActiveAgentRun(taskId, roleName);
   if (run === null
@@ -101,7 +123,6 @@ export function resolveProviderHookRunFence(
   if (run.effective.workspace.root !== workspace) {
     throw new Error("Provider lifecycle hook workspace does not match the durable Run snapshot.");
   }
-  const session = sessions?.sessions[agentId];
   if (session !== undefined) {
     if (session.adapterId !== adapterId
       || session.launchId !== launchId

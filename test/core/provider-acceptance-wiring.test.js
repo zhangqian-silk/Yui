@@ -32,6 +32,7 @@ import {
   serializeExactDescriptor
 } from "../../dist/runtime/exactControlPlane.js";
 import {
+  hasRuntimeCleanupObligation,
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
 } from "../../dist/runtime/lifecycleReservation.js";
@@ -345,13 +346,13 @@ test("exact internal Claude startup is queued before its preallocated Session is
     session_id: forgedNativeSessionId
   }, { ...environment, YUI_NATIVE_SESSION_ID: forgedNativeSessionId });
   assert.notEqual(forged.status, 0);
-  assert.match(forged.stderr, /fence is not current/i);
+  assert.match(forged.stderr, /in-flight Run fence is not current/i);
   assert.equal(inbox.list().length, 0);
   writeTextFileAtomically(runtimeSource, `${serializeExactDescriptor(runtime)}\n`);
 
   const external = invoke(["version"]);
   assert.notEqual(external.status, 0);
-  assert.match(external.stderr, /fence is not current/i);
+  assert.match(external.stderr, /in-flight Run fence is not current/i);
   assert.equal(inbox.list().length, 0);
   for (const payload of [
     {
@@ -412,10 +413,10 @@ test("exact internal Claude startup is queued before its preallocated Session is
   assert.equal(afterSession.deferred.length, 0);
   assert.equal(afterSession.failed.length, 0);
   assert.equal(inbox.list().length, 0);
-  assert.ok(fx.store.listEvents(fx.task.id).some((event) => (
+  assert.equal(fx.store.listEvents(fx.task.id).filter((event) => (
     event.type === "runtime.provider-session-lifecycle"
       && event.payload.preInputReady === "true"
-  )));
+  )).length, 1);
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).pushedAt, undefined);
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
   assert.equal(isRuntimeLaunchReservation(fx.store.getWorkMailbox(runtimeLifecycleTarget({
@@ -429,6 +430,7 @@ for (const mismatch of [
   "native",
   "launch",
   "workspace",
+  "cleanup-pending",
   "reservation-missing",
   "reservation-cross-run"
 ]) {
@@ -460,6 +462,14 @@ for (const mismatch of [
       environment = { ...environment, YUI_LAUNCH_ID: "launch-stale" };
     } else if (mismatch === "workspace") {
       environment = { ...environment, YUI_WORKSPACE: `${environment.YUI_WORKSPACE}-stale` };
+    } else if (mismatch === "cleanup-pending") {
+      assert.notEqual(fx.adapter.enqueueRuntimeCleanup(
+        owner,
+        new Date("2026-08-06T02:00:01.250Z")
+      ), null);
+      assert.equal(hasRuntimeCleanupObligation(fx.store.getWorkMailbox(
+        runtimeLifecycleTarget(owner)
+      )), true);
     } else {
       assert.equal(fx.adapter.completeRuntimeLaunchReservation(
         owner,
