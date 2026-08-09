@@ -232,6 +232,13 @@ function advanceTaskCandidate(fx) {
   });
 }
 
+function setReviewConfig(fx, review) {
+  fx.store.transaction((tx) => {
+    const { review: _previousReview, ...config } = tx.getConfig();
+    tx.saveConfig(review === undefined ? config : { ...config, review });
+  });
+}
+
 test("final policy queues one Task Review over all committed Project heads", (t) => {
   const { store, task, item, leaderOptions } = fixture(t);
   const first = runTaskCommand(
@@ -291,6 +298,159 @@ test("a changed integrated head creates a fresh final ReviewRound and keeps prio
   assert.equal(rounds[1].status, "pending");
   assert.notDeepEqual(rounds[0].taskCandidate, rounds[1].taskCandidate);
 });
+
+for (const [drift, review] of [
+  ["leader", { roleName: "replacement-reviewer", trigger: "leader" }],
+  ["always", { roleName: "replacement-reviewer", trigger: "always" }],
+  ["absent", undefined]
+]) {
+  test(`durable final-review contract survives global ${drift} drift after integrated head changes`, (t) => {
+    const fx = fixture(t);
+    runTaskCommand(
+      ["complete", fx.task.id, "--summary", "request initial review"],
+      fx.store,
+      fx.leaderOptions
+    );
+    const first = fx.store.listReviewRounds(fx.task.id)[0];
+    const reviewerSnapshot = structuredClone(
+      fx.store.getRole(fx.task.id, first.reviewerRoleName)
+    );
+    fx.store.saveReviewRound(
+      fx.task.id,
+      finishReviewRound(first, "failed", "old head needs replacement", NOW)
+    );
+    advanceTaskCandidate(fx);
+    setReviewConfig(fx, review);
+
+    const completion = runTaskCommand(
+      ["complete", fx.task.id, "--summary", "request latest-head review"],
+      fx.store,
+      fx.leaderOptions
+    );
+
+    assert.match(completion.output, /Final Task Review requested/);
+    const rounds = fx.store.listReviewRounds(fx.task.id);
+    assert.equal(rounds.length, 2);
+    assert.equal(rounds[1].reviewerRoleName, first.reviewerRoleName);
+    assert.deepEqual(
+      fx.store.getRole(fx.task.id, first.reviewerRoleName),
+      reviewerSnapshot
+    );
+    assert.notDeepEqual(rounds[1].taskCandidate, first.taskCandidate);
+    assert.equal(fx.store.getTask(fx.task.id).status, "active");
+    assert.throws(
+      () => runTaskCommand(
+        ["complete", fx.task.id, "--summary", "do not duplicate latest review"],
+        fx.store,
+        fx.leaderOptions
+      ),
+      /Final Task Review is still active/
+    );
+    assert.equal(fx.store.listReviewRounds(fx.task.id).length, 2);
+  });
+}
+
+test("same-head final-review states remain authoritative after global drift", (t) => {
+  const pending = fixture(t);
+  runTaskCommand(
+    ["complete", pending.task.id, "--summary", "request pending review"],
+    pending.store,
+    pending.leaderOptions
+  );
+  setReviewConfig(pending, { roleName: "replacement-reviewer", trigger: "leader" });
+  assert.throws(
+    () => runTaskCommand(
+      ["complete", pending.task.id, "--summary", "pending must block"],
+      pending.store,
+      pending.leaderOptions
+    ),
+    /Final Task Review is still active: review-round-1\/pending/
+  );
+  assert.equal(pending.store.getTask(pending.task.id).status, "active");
+
+  const running = fixture(t);
+  runTaskCommand(
+    ["complete", running.task.id, "--summary", "request running review"],
+    running.store,
+    running.leaderOptions
+  );
+  const runningRound = running.store.listReviewRounds(running.task.id)[0];
+  strandFinalReviewRun(running, dispatchFinalReview(running, runningRound));
+  setReviewConfig(running, { roleName: "replacement-reviewer", trigger: "always" });
+  assert.throws(
+    () => runTaskCommand(
+      ["complete", running.task.id, "--summary", "running must block"],
+      running.store,
+      running.leaderOptions
+    ),
+    /Final Task Review is still active: review-round-1\/running/
+  );
+  assert.equal(running.store.getTask(running.task.id).status, "active");
+
+  const failed = fixture(t);
+  runTaskCommand(
+    ["complete", failed.task.id, "--summary", "request failed review"],
+    failed.store,
+    failed.leaderOptions
+  );
+  const failedRound = failed.store.listReviewRounds(failed.task.id)[0];
+  failed.store.saveReviewRound(
+    failed.task.id,
+    finishReviewRound(failedRound, "failed", "material finding", NOW)
+  );
+  setReviewConfig(failed, undefined);
+  const blocked = runTaskCommand(
+    ["complete", failed.task.id, "--summary", "failed must block"],
+    failed.store,
+    failed.leaderOptions
+  );
+  assert.match(blocked.output, /Final Task Review is blocked: material finding/);
+  assert.equal(failed.store.getTask(failed.task.id).status, "active");
+
+  const completed = fixture(t);
+  runTaskCommand(
+    ["complete", completed.task.id, "--summary", "request completed review"],
+    completed.store,
+    completed.leaderOptions
+  );
+  const completedRound = completed.store.listReviewRounds(completed.task.id)[0];
+  finishFinalReviewRun(
+    completed,
+    dispatchFinalReview(completed, completedRound),
+    "yielded",
+    "review passed"
+  );
+  setReviewConfig(completed, { roleName: "replacement-reviewer", trigger: "always" });
+  const completion = runTaskCommand(
+    ["complete", completed.task.id, "--summary", "reviewed head may complete"],
+    completed.store,
+    completed.leaderOptions
+  );
+  assert.match(completion.output, /Completed task/);
+  assert.equal(completed.store.getTask(completed.task.id).status, "completed");
+  assert.equal(completed.store.listReviewRounds(completed.task.id).length, 1);
+});
+
+for (const [policy, review] of [
+  ["leader", { roleName: "reviewer", trigger: "leader" }],
+  ["always", { roleName: "reviewer", trigger: "always" }],
+  ["absent", undefined]
+]) {
+  test(`Project-backed Task without a final-review contract retains global ${policy} behavior`, (t) => {
+    const fx = fixture(t);
+    setReviewConfig(fx, review);
+
+    const completion = runTaskCommand(
+      ["complete", fx.task.id, "--summary", "no final contract"],
+      fx.store,
+      fx.leaderOptions
+    );
+
+    assert.match(completion.output, /Completed task/);
+    assert.equal(fx.store.getTask(fx.task.id).status, "completed");
+    assert.equal(fx.store.listReviewRounds(fx.task.id).length, 0);
+  });
+}
 
 test("an unchanged failed final ReviewRound does not duplicate or unblock completion", (t) => {
   const { store, task, leaderOptions } = fixture(t);

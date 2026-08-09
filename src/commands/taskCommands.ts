@@ -2191,13 +2191,16 @@ function prepareFinalTaskReview(
   task: Task,
   now: Date
 ): ReviewRound | null {
-  const config = store.getReviewConfig();
-  if (config?.trigger !== "final" || task.projectBindings.length === 0) return null;
-
-  const taskCandidate = latestTaskReviewCandidate(store, task);
+  if (task.projectBindings.length === 0) return null;
   const latest = reviewRoundsByIdentity(store.listReviewRounds(task.id))
     .filter((round) => (round.scope ?? "work-item") === "task")
     .at(-1);
+  const config: ReviewConfig | null = latest === undefined
+    ? store.getReviewConfig()
+    : { roleName: latest.reviewerRoleName, trigger: "final" };
+  if (config?.trigger !== "final") return null;
+
+  const taskCandidate = latestTaskReviewCandidate(store, task);
   if (latest !== undefined && (latest.status === "pending" || latest.status === "running")) {
     throw usageError(`Final Task Review is still active: ${latest.id}/${latest.status}.`);
   }
