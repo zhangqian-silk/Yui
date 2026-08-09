@@ -1109,17 +1109,39 @@ function taskMessageCommand(
     const result = store.transaction((tx) => {
       const task = requireTask(tx, parsed.positionals[0]);
       assertTaskOpen(task);
-      const message = appendMessage(tx, task.id, body, "user", { type: "user" }, now);
-      if (task.status === "active") {
-        enqueueWork(tx, leaderMailbox(task.id), "user-message", now, [messageRef(task.id, message.id)]);
+      const actor = taskActor(options, task.id);
+      const message = actor === "leader"
+        ? appendMessage(
+            tx,
+            task.id,
+            body,
+            "role-result",
+            { type: "role", roleName: LEADER_ROLE },
+            now
+          )
+        : actor === "operator"
+          ? appendMessage(tx, task.id, body, "operator", { type: "operator" }, now)
+          : appendMessage(tx, task.id, body, "user", { type: "user" }, now);
+      if (task.status === "active" && actor !== "leader") {
+        enqueueWork(
+          tx,
+          leaderMailbox(task.id),
+          actor === "operator" ? "operator-input" : "user-message",
+          now,
+          [messageRef(task.id, message.id)]
+        );
       }
-      return { task, message };
+      return { task, message, actor };
     });
-    notifyMailbox(
-      options.runtime,
-      result.task.status === "active" ? leaderMailbox(result.task.id) : taskMailbox(result.task.id),
-      result.task.id
-    );
+    if (result.actor !== "leader") {
+      notifyMailbox(
+        options.runtime,
+        result.task.status === "active"
+          ? leaderMailbox(result.task.id)
+          : taskMailbox(result.task.id),
+        result.task.id
+      );
+    }
     return `Sent message ${result.message.id} to ${result.task.id}\n`;
   }
   if (command === "list") {

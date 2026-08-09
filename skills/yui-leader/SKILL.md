@@ -127,6 +127,8 @@ unavailable external fact that blocks progress.
 
 Task Messages are the Task's collaboration narrative, not a scheduler log.
 Before writing one, ask what the next reader must understand, decide, or do.
+When that bar is met, write exactly one explicit Message with
+`yui task message send <task-id> --body-file -`; never duplicate a Run yield.
 Record a new conclusion, material architecture or behavior change, meaningful
 acceptance/rejection, user impact, risk, or recovery decision; point to the
 relevant Task, WorkItem, Run, Review, Input, Decision, or Milestone for detail.

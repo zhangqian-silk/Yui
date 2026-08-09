@@ -870,15 +870,101 @@ test("Operator submit creates a Draft and active Task messages wake its Leader",
   assert.equal(store.getPendingWakeup(task.id)?.requestCount, before + 1);
   assert.ok(store.getPendingWakeup(task.id)?.reasons.includes("operator-input"));
 
-  run(["message", "send", task.id, "User follow-up"], store, options);
+  run(["message", "send", task.id, "User follow-up"], store, {
+    ...options,
+    environment: {}
+  });
   const userMessage = store.listMessages(task.id).at(-1);
   assert.equal(userMessage.kind, "user");
   assert.deepEqual(userMessage.author, { type: "user" });
   assert.ok(store.getPendingWakeup(task.id)?.reasons.includes("user-message"));
 
+  const beforeManagedOperator = store.getPendingWakeup(task.id)?.requestCount;
+  run(["message", "send", task.id, "Operator decision"], store, {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "global",
+      YUI_ROLE: "operator"
+    }
+  });
+  const operatorMessage = store.listMessages(task.id).at(-1);
+  assert.equal(operatorMessage.kind, "operator");
+  assert.deepEqual(operatorMessage.author, { type: "operator" });
+  assert.equal(store.getPendingWakeup(task.id)?.requestCount, beforeManagedOperator + 1);
+  assert.ok(store.getPendingWakeup(task.id)?.reasons.includes("operator-input"));
+
   const aggregate = JSON.parse(readFileSync(join(root, "state.json"), "utf8")).tasks[task.id];
   assert.ok(aggregate.messages[userMessage.id]);
+  assert.ok(aggregate.messages[operatorMessage.id]);
   assert.equal("comments" in aggregate, false);
+});
+
+test("matching Leader message send records one explicit semantic Message without self-wake", (t) => {
+  const { store, options, calls } = fixture(t);
+  const task = createTask(store, options, "Leader conclusion");
+  run(["activate", task.id], store, options);
+  store.clearPendingWakeup(task.id);
+  const changedBeforeSend = calls.changed.length;
+
+  run(["message", "send", task.id, "The implementation evidence is accepted."], store, {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  });
+
+  const [message] = store.listMessages(task.id);
+  assert.equal(store.listMessages(task.id).length, 1);
+  assert.equal(message.kind, "role-result");
+  assert.deepEqual(message.author, { type: "role", roleName: "leader" });
+  assert.equal(message.body, "The implementation evidence is accepted.");
+  assert.equal(message.runId, undefined);
+  assert.equal(store.getPendingWakeup(task.id), null);
+  assert.equal(calls.changed.length, changedBeforeSend);
+  assert.equal(store.listEvents(task.id).filter(({ type }) => type === "message.sent").length, 1);
+  assert.deepEqual(store.listEvents(task.id).at(-1).payload, {
+    messageId: message.id,
+    kind: "role-result"
+  });
+  assert.match(run(["message", "list", task.id], store, options), /leader.*implementation evidence/u);
+  const context = run(["context", task.id], store, options);
+  assert.match(context, /\[leader\]/u);
+  assert.match(context, /The implementation evidence is accepted\./u);
+});
+
+test("managed non-Leader and incomplete identities cannot send a Task Message", (t) => {
+  const { store, options, calls } = fixture(t);
+  const task = createTask(store, options, "Fenced message");
+  run(["activate", task.id], store, options);
+  store.clearPendingWakeup(task.id);
+  const eventsBeforeSend = store.listEvents(task.id);
+  const changedBeforeSend = calls.changed.length;
+
+  assert.throws(
+    () => runTaskCommand(["message", "send", task.id, "Worker conclusion"], store, {
+      ...options,
+      environment: {
+        YUI_SESSION_SCOPE: "task",
+        YUI_TASK_ID: task.id,
+        YUI_ROLE: "worker"
+      }
+    }),
+    /managed Task Session.*matching Leader/iu
+  );
+  assert.throws(
+    () => runTaskCommand(["message", "send", task.id, "Incomplete conclusion"], store, {
+      ...options,
+      environment: { YUI_ROLE: "leader" }
+    }),
+    /identity is incomplete/iu
+  );
+
+  assert.deepEqual(store.listMessages(task.id), []);
+  assert.deepEqual(store.listEvents(task.id), eventsBeforeSend);
+  assert.equal(store.getPendingWakeup(task.id), null);
+  assert.equal(calls.changed.length, changedBeforeSend);
 });
 
 test("assigned Work dispatch honors dependencies and Worker yield awaits Leader acceptance", (t) => {
