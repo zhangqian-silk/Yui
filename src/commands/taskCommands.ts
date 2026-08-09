@@ -2599,7 +2599,7 @@ function retryRun(
       if (taskActor(options, task.id) !== "leader") {
         throw usageError("Only the Task Leader may retry a final Review Run.");
       }
-      const previousRound = previous.reviewRoundId === undefined
+      let previousRound = previous.reviewRoundId === undefined
         ? null
         : tx.getReviewRound(task.id, previous.reviewRoundId);
       if (previousRound === null
@@ -2609,7 +2609,7 @@ function retryRun(
         );
       }
       if (
-        previousRound.status !== "failed"
+        (previousRound.status !== "failed" && previousRound.status !== "running")
         || previousRound.reviewerRunId !== previous.id
         || previousRound.reviewerRoleName !== previous.roleName
         || previousRound.workItemId !== previous.workItemId
@@ -2619,11 +2619,14 @@ function retryRun(
           `Final Review Run identity does not match its failed ReviewRound: ${previous.id}.`
         );
       }
+      const previousRoundId = previousRound.id;
+      const previousCandidateId = previousRound.candidateId;
+      const previousTaskCandidate = previousRound.taskCandidate;
       const item = tx.getWorkItem(task.id, previousRound.workItemId);
       if (item === null
-        || !item.candidates.some(({ id }) => id === previousRound.candidateId)) {
+        || !item.candidates.some(({ id }) => id === previousCandidateId)) {
         throw dataError(
-          `Final Review candidate is no longer available: ${previousRound.candidateId}.`
+          `Final Review candidate is no longer available: ${previousCandidateId}.`
         );
       }
       // ReviewRound ids are Task-local monotonic identities. Use that durable
@@ -2631,20 +2634,38 @@ function retryRun(
       // second retry Round for the same exact failed Run.
       const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id)
         .filter((round) => (round.scope ?? "work-item") === "task"));
-      const previousIndex = taskRounds.findIndex(({ id }) => id === previousRound.id);
+      const previousIndex = taskRounds.findIndex(({ id }) => id === previousRoundId);
       if (previousIndex < 0) {
-        throw dataError(`Final ReviewRound is not in Task history: ${previousRound.id}.`);
+        throw dataError(`Final ReviewRound is not in Task history: ${previousRoundId}.`);
       }
       const laterRound = taskRounds.slice(previousIndex + 1).at(-1);
-      if (laterRound !== undefined) {
-        if (!isSameTaskReviewCandidate(
-          laterRound.taskCandidate,
-          previousRound.taskCandidate
-        )) {
-          throw usageError(
-            `A newer final Task candidate already has ReviewRound ${laterRound.id}.`
-          );
+      if (laterRound !== undefined && !isSameTaskReviewCandidate(
+        laterRound.taskCandidate,
+        previousTaskCandidate
+      )) {
+        throw usageError(
+          `A newer final Task candidate already has ReviewRound ${laterRound.id}.`
+        );
+      }
+      // A pre-fix Controller could fail an exact final Review Run while leaving
+      // its started Round running. Repair only at this explicit Leader retry
+      // boundary, after every durable identity/candidate fence has matched.
+      if (previousRound.status === "running") {
+        if (tx.getActiveAgentRun(task.id, previous.roleName) !== null) {
+          throw usageError(`${task.id}/${previous.roleName} already has an active run.`);
         }
+        if (previous.summary === undefined) {
+          throw dataError(`Failed Review Run has no durable summary: ${previous.id}.`);
+        }
+        previousRound = finishReviewRound(
+          previousRound,
+          "failed",
+          previous.summary,
+          now
+        );
+        tx.saveReviewRound(task.id, previousRound);
+      }
+      if (laterRound !== undefined) {
         return { kind: "review" as const, round: laterRound, created: false };
       }
       const role = requireRole(tx, task.id, previous.roleName);
@@ -2655,10 +2676,10 @@ function retryRun(
         tx.nextReviewRoundId(task.id),
         task.id,
         previousRound.workItemId,
-        previousRound.candidateId,
+        previousCandidateId,
         previousRound.reviewerRoleName,
         "leader",
-        previousRound.taskCandidate,
+        previousTaskCandidate,
         now
       );
       tx.saveReviewRound(task.id, round);
