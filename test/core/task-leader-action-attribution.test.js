@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,8 +14,10 @@ import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerSt
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
-  markTaskRoleRunDelivered
+  markTaskRoleRunDelivered,
+  updateRoleAgentSessionStatus
 } from "../../dist/executor/agentExecutor.js";
+import { taskLeaderActionRunId } from "../../dist/commands/taskActor.js";
 import { reconcileStalledRoleRuns } from "../../dist/scheduler/roleRunStall.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
@@ -289,4 +292,122 @@ test("unmanaged or stale Leader environment cannot stamp a lifecycle event", asy
   assert.equal(event.payload.leaderRunId, undefined);
   const result = await reconcile(adapter, FIRST_RECONCILE);
   assert.equal(result.some(({ runId }) => runId === leaderRun.id), true);
+});
+
+test("fixed Leader Session uses an exact per-command current-turn assertion", async (t) => {
+  const { store, adapter, task, leaderRun, workerRun, leaderEnvironment } = fixture(t);
+  const fixedSessionEnvironment = {
+    ...leaderEnvironment,
+    // A fixed native Session keeps the process environment from an earlier
+    // AgentRun/generation.  The managed turn must carry its exact durable
+    // Run/receipt assertion separately for this command.
+    YUI_RUN_ID: "agent-run-46",
+    YUI_LAUNCH_ID: "runtime-old:generation:old",
+    YUI_LEADER_ACTION_RUN_ID: leaderRun.id,
+    YUI_LEADER_ACTION_RECEIPT_ID: `agent-run:${task.id}/${leaderRun.id}`
+  };
+  delete fixedSessionEnvironment.YUI_NATIVE_SESSION_ID;
+
+  const command = (args) => runTaskCommand(args, store, leaderOptions(fixedSessionEnvironment, PROGRESS));
+  command([
+    "decision", "record", task.id,
+    "--title", "Fixed Session progress",
+    "--rationale", "The current turn carries an exact durable assertion."
+  ]);
+  command([
+    "milestone", "add", task.id,
+    "--title", "Fixed Session milestone",
+    "--summary", "The exact current turn reached a durable checkpoint."
+  ]);
+  command([
+    "work", "retire", `${task.id}/work-item-2`,
+    "--summary", "The exact current turn completed its lifecycle action."
+  ]);
+
+  const actionEvents = store.listEvents(task.id).filter((event) => (
+    ["decision.recorded", "milestone.added", "work.retired"].includes(event.type)
+  ));
+  assert.equal(actionEvents.length, 3);
+  assert.deepEqual(actionEvents.map((event) => event.payload.leaderRunId), [
+    leaderRun.id,
+    leaderRun.id,
+    leaderRun.id
+  ]);
+  const result = await reconcile(adapter, FIRST_RECONCILE);
+  assert.deepEqual(result.map(({ runId }) => runId), [workerRun.id]);
+  const expired = await reconcile(adapter, EXPIRED_RECONCILE);
+  assert.equal(expired.some(({ runId }) => runId === leaderRun.id), true);
+  assert.equal(store.listEvents(task.id).filter((event) => (
+    event.type === "run.stalled" && event.payload.runId === leaderRun.id
+  )).length, 1);
+
+  // The production CLI receives the per-command assertion through its child
+  // environment even though the fixed provider process retains stale values.
+  const cliEnvironment = { ...process.env, ...fixedSessionEnvironment };
+  delete cliEnvironment.YUI_NATIVE_SESSION_ID;
+  const cliResult = JSON.parse(execFileSync(
+    process.execPath,
+    [
+      join(process.cwd(), "dist", "cli.js"),
+      "--json", "task", "decision", "record", task.id,
+      "--title", "Fixed Session CLI progress",
+      "--rationale", "The managed launcher carries the exact current assertion."
+    ],
+    { encoding: "utf8", env: cliEnvironment }
+  ));
+  assert.equal(cliResult.ok, true);
+  const cliDecision = store.listDecisions(task.id).at(-1);
+  assert.notEqual(cliDecision, undefined);
+  const cliEvent = store.listEvents(task.id).find((event) => (
+    event.type === "decision.recorded"
+      && event.payload.decisionId === cliDecision.id
+  ));
+  assert.notEqual(cliEvent, undefined);
+  assert.equal(cliEvent.payload.leaderRunId, leaderRun.id);
+});
+
+test("current-turn assertions fail closed on receipt, Task, Session, and caller mismatches", (t) => {
+  const { store, task, leaderRun, leaderEnvironment } = fixture(t);
+  const base = {
+    ...leaderEnvironment,
+    YUI_RUN_ID: "agent-run-46",
+    YUI_LAUNCH_ID: "runtime-old:generation:old",
+    YUI_LEADER_ACTION_RUN_ID: leaderRun.id,
+    YUI_LEADER_ACTION_RECEIPT_ID: `agent-run:${task.id}/${leaderRun.id}`
+  };
+  delete base.YUI_NATIVE_SESSION_ID;
+  const variants = [
+    ["stale receipt", { ...base, YUI_LEADER_ACTION_RECEIPT_ID: "agent-run:task-1/old" }],
+    ["missing receipt", { ...base, YUI_LEADER_ACTION_RECEIPT_ID: undefined }],
+    ["old native Session", { ...base, YUI_NATIVE_SESSION_ID: "native-old" }],
+    ["cross-Task identity", { ...base, YUI_TASK_ID: "task-2" }],
+    ["unmanaged caller", { ...base, YUI_SESSION_SCOPE: undefined, YUI_ROLE: undefined }]
+  ];
+  for (const [label, environment] of variants) {
+    assert.equal(
+      taskLeaderActionRunId(store, task.id, environment, store.rootDirectory()),
+      undefined,
+      label
+    );
+  }
+  for (const status of ["stopped", "broken"]) {
+    const sessions = updateRoleAgentSessionStatus(
+      store.getTaskRoleSessionSet(task.id, "leader"),
+      "codex",
+      status,
+      PROGRESS
+    );
+    store.saveTaskRoleSessionSet(sessions);
+    assert.equal(
+      taskLeaderActionRunId(store, task.id, base, store.rootDirectory()),
+      undefined,
+      `current ${status} Session`
+    );
+    store.saveTaskRoleSessionSet(updateRoleAgentSessionStatus(
+      store.getTaskRoleSessionSet(task.id, "leader"),
+      "codex",
+      "running",
+      PROGRESS
+    ));
+  }
 });
