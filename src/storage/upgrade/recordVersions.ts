@@ -11,8 +11,9 @@
  * per-record modules. It is intentionally NOT a frozen "first release" set: as
  * the schema evolves (a new record family, a bumped family version), this map is
  * updated in lockstep, exactly like the scalar constants. It exists so
- * doctor/inspect and the migration planner can reason about record families;
- * with the registry shipping EMPTY, no record step ever runs against a real Home.
+ * doctor/inspect and the migration planner can reason about record families.
+ * The current production graph has no record-axis steps; adding one requires an
+ * explicit adjacent registration and transform.
  */
 
 import {

@@ -18,7 +18,7 @@
  * This scanner keeps the record axis genuinely independent: it reads the source
  * versions structurally (JSON only), so a record-only-older Home flows into the
  * planner and is classified `MIGRATABLE` (when a step path exists) or
- * `NEEDS_NEW_VERSION` (fail-closed under the empty registry) — never `CORRUPTED`.
+ * `NEEDS_NEW_VERSION` (when no applicable path exists) — never `CORRUPTED`.
  * `CORRUPTED` is reserved for genuine JSON/structural damage (unparseable
  * `state.json`, a non-object root, a container whose shape is not what the path
  * describes, or a record with a missing/invalid `schemaVersion`).

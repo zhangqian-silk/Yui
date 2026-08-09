@@ -14,9 +14,8 @@
  * `schema.json` manifest that is not valid. It is never inferred from version
  * magnitude. An older or newer version — on ANY axis, including a single older
  * record family — is a version verdict (`MIGRATABLE` when a complete step path
- * exists, else `NEEDS_NEW_VERSION`), never `CORRUPTED`. With the registry shipping
- * EMPTY, any strictly-older Home is `NEEDS_NEW_VERSION` via a precise
- * `missing-step` reason.
+ * exists, else `NEEDS_NEW_VERSION`), never `CORRUPTED`. A strictly-older Home
+ * without a complete registered path receives a precise `missing-step` reason.
  *
  * The three axes are independent: the record axis is read structurally from the
  * raw `state.json` (see `inspectSourceVersionState` / `recordVersionScan.ts`), so

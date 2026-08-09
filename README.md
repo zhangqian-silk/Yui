@@ -64,9 +64,10 @@ Yui models three independent, monotonic storage version axes: the on-disk
 document, and the `record` axis — a `recordKind -> version` map where every
 record family (WorkItem, AgentRun, ReviewRound, …) versions on its own. A
 centralized, future-facing migration framework (registry → planner → engine)
-covers all three; the registry ships **empty** in this release, so no historical
-migration step exists yet and any strictly-older home is fail-closed. The record
-axis is genuinely independent: a home's per-family record versions are read
+covers all three. The production registry contains only explicit adjacent
+steps — currently aggregate `16→17`; any older version without a complete path
+is fail-closed. The record axis is genuinely independent: a home's per-family
+record versions are read
 **structurally** from the raw `state.json` (never through the strict loader), so
 a home whose *only* difference is an older record family is a version verdict
 (MIGRATABLE / NEEDS_NEW_VERSION) — not a false CORRUPTED.
@@ -75,13 +76,12 @@ a home whose *only* difference is an older record family is a version verdict
 
 - **USABLE** — every axis is at the current version; nothing to do.
 - **MIGRATABLE** — strictly older on any axis (scalar or a single record family),
-  and a complete deterministic step path exists (none today, since the registry
-  is empty).
+  and a complete deterministic step path exists (currently aggregate `16→17`).
 - **NEEDS_NEW_VERSION** — a version this release cannot migrate: either newer
   than supported (`future-version`) or older with no registered step
-  (`missing-step`), on any axis including a record family. Under the empty
-  registry, every strictly-older home lands here with a precise reason and the
-  incompatible component (layout vs aggregate).
+  (`missing-step`), on any axis including a record family. Every unsupported
+  path lands here with a precise reason and the incompatible component (layout
+  vs aggregate).
 - **CORRUPTED** — real structural or reference-graph damage only (unparseable
   `state.json`, a container that doesn't match its record locator, a record with
   a missing/invalid `schemaVersion`, or a broken reference graph found once every
@@ -151,9 +151,9 @@ unchanged. A crash mid-switch leaves a durable marker; `yui update` recovery rea
 that marker plus filesystem evidence (backup present, home missing) to name the
 exact backup restore rather than a generic retry. Any other failed or blocked step
 leaves the authoritative home byte-for-byte unchanged and reports the exact
-blocker stage and recovery action. It never converts a real home in this release
-(the registry is empty), and Yui never
-dual-reads an older schema or guesses an old identifier. See
+blocker stage and recovery action. Only explicitly registered adjacent steps
+can convert a real home; Yui never dual-reads an older schema or guesses an old
+identifier. See
 [Task-local identity](docs/task-local-identity.md) for the current reference
 contract.
 
