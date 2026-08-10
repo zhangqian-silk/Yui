@@ -22,10 +22,7 @@ export const YUI_TASK_RUNTIME_ISOLATION_DESCRIPTOR =
 export const YUI_TASK_RUNTIME_SERVICE_NAMESPACE =
   "YUI_TASK_RUNTIME_SERVICE_NAMESPACE";
 
-export type TaskRuntimeWorkspaceOwner = Exclude<
-  ManagedWorkspaceOwner,
-  Readonly<{ type: "integration-attempt"; taskId: string; integrationAttemptId: string }>
->;
+export type TaskRuntimeWorkspaceOwner = ManagedWorkspaceOwner;
 
 export type TaskRuntimePortAllocation = Readonly<{
   name: string;
@@ -716,9 +713,6 @@ function validatePreparation(
 }
 
 function taskRuntimeWorkspaceOwner(owner: ManagedWorkspaceOwner): TaskRuntimeWorkspaceOwner {
-  if (owner.type === "integration-attempt") {
-    throw new Error("An IntegrationAttempt cannot own a Task runtime.");
-  }
   return owner;
 }
 

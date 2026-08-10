@@ -158,7 +158,12 @@ test("a foreground Task runtime remains workspace-owned without inventing a Run"
 for (const owner of [
   { type: "task", taskId: "task-15" },
   { type: "work-item", taskId: "task-15", workItemId: "work-item-9" },
-  { type: "review-round", taskId: "task-15", reviewRoundId: "review-round-4" }
+  { type: "review-round", taskId: "task-15", reviewRoundId: "review-round-4" },
+  {
+    type: "integration-attempt",
+    taskId: "task-15",
+    integrationAttemptId: "integration-4"
+  }
 ]) {
   test(`${owner.type} ManagedWorkspace can own one exact Task runtime generation`, (t) => {
     const fx = fixture(t, owner);
@@ -588,7 +593,7 @@ test("lifecycle cleanup resolves one exact Task and launch marker without a Role
   fx.service.cleanup(sibling, "completion");
 });
 
-test("unmarked and IntegrationAttempt-owned runtime paths are never repaired or cleaned", (t) => {
+test("unmarked runtime paths are never repaired or cleaned", (t) => {
   const fx = fixture(t);
   const runtime = descriptor(fx);
   mkdirSync(runtime.roots.generation, { recursive: true });
@@ -605,16 +610,6 @@ test("unmarked and IntegrationAttempt-owned runtime paths are never repaired or 
     /unmarked or invalid/i
   );
   assert.equal(existsSync(runtime.roots.generation), true);
-
-  const integrationFx = fixture(t, {
-    type: "integration-attempt",
-    taskId: "task-15",
-    integrationAttemptId: "integration-attempt-1"
-  });
-  assert.throws(
-    () => descriptor(integrationFx),
-    /IntegrationAttempt cannot own a Task runtime/i
-  );
 });
 
 test("coordinator activates isolation after reservation and cleans a stopped failed start", async (t) => {
