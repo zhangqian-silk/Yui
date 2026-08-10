@@ -14,12 +14,16 @@ export async function captureManagedGitChanges(input: Readonly<{
   baseCommit: string;
   commitMessage: string;
   identity: string;
+  requireClean?: boolean;
 }>): Promise<ManagedGitChange | null> {
   await assertManagedHead(input);
   const status = await git([
     "-C", input.path, "status", "--porcelain=v1", "--untracked-files=all"
   ]);
   if (status.trim().length > 0) {
+    if (input.requireClean === true) {
+      throw new Error(`Managed workspace must be clean before capture: ${input.identity}.`);
+    }
     await git(["-C", input.path, "add", "--all"]);
     await git([
       "-C", input.path,

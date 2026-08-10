@@ -104,7 +104,8 @@ export class GitIntegrationService {
         this.store,
         task.id,
         project.path,
-        current.changeSetIds
+        current.changeSetIds,
+        current.expectedHead
       );
       let remaining = plan;
       if (current.resolution?.action === "manual-resolution") {
@@ -305,7 +306,8 @@ async function integrationCommitPlan(
   store: TaskStore,
   taskId: string,
   repositoryPath: string,
-  changeSetIds: readonly string[]
+  changeSetIds: readonly string[],
+  expectedHead: string
 ): Promise<PlannedCommit[]> {
   const plan: PlannedCommit[] = [];
   for (const changeSetId of changeSetIds) {
@@ -315,7 +317,17 @@ async function integrationCommitPlan(
       "-C", repositoryPath, "rev-list", "--reverse",
       `${changeSet.baseCommit}..${changeSet.headCommit}`
     ])).trim().split("\n").filter(Boolean);
-    plan.push(...commits.map((commit) => ({ changeSetId, commit })));
+    for (const commit of commits) {
+      // A direct Task-main recovery may capture commits after they are already
+      // present on the exact target. Treat those commits as applied rather
+      // than attempting an empty cherry-pick; the later checks and CAS still
+      // fence the committed Integration to expectedHead.
+      if (await gitSucceeds([
+        "-C", repositoryPath,
+        "merge-base", "--is-ancestor", commit, expectedHead
+      ])) continue;
+      plan.push({ changeSetId, commit });
+    }
   }
   return plan;
 }

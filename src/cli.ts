@@ -652,7 +652,10 @@ export async function main(): Promise<void> {
       const reference = cliWorkItemReference(workItemId, process.env);
       const changeSets = await new WorkItemChangeSetManager(store).capture(
         reference.taskId,
-        reference.localId
+        reference.localId,
+        taskFinalReviewContract === undefined
+          ? {}
+          : { taskFinalReviewContract }
       );
       const qualified = `${reference.taskId}/${reference.localId}`;
       emit(

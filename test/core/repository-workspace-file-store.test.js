@@ -4136,6 +4136,97 @@ test("a roleless Project WorkItem follows isolate, Candidate, Integration, accep
   assert.equal(existsSync(join(workspace, "tasks", task.id, "work-items", item.id)), false);
 });
 
+test("an exact direct Candidate captures clean Task main and records already-contained Integration", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Direct Task-main delivery", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }],
+    requireIntegration: true
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath, ["leader"]);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  const prepared = await preparer.prepareTaskWorkspace(task.id);
+  const taskWorkspace = store.getTaskWorkspace(task.id);
+  const taskEntry = taskWorkspace.entries.find(({ projectId }) => projectId === project.id);
+  const mainPath = join(prepared.path, project.name);
+  const item = updateWorkItemStatus(createWorkItem("work-item-1", task.id, {
+    title: "Package exact direct delivery",
+    writeProjectIds: [project.id]
+  }, NOW), "running", NOW);
+  const invocation = exactTaskCliInvocation({
+    home,
+    store,
+    taskId: task.id,
+    roleName: "leader",
+    taskFinalReviewerRole: "reviewer"
+  });
+  const contract = createTaskFinalReviewContract({
+    taskId: task.id,
+    reviewerRoleName: "reviewer",
+    controlPlaneDigest: invocation.controlDigest
+  });
+  store.saveWorkItem(task.id, submitWorkItemCandidate(item, {
+    summary: "Direct Task main is ready for provenance capture.",
+    source: { type: "direct" },
+    reviewPolicy: { roleName: "reviewer", trigger: "final" },
+    taskFinalReviewContract: contract
+  }, NOW));
+  writeFileSync(join(mainPath, "direct-main.txt"), "direct main delivery\n");
+  git(["-C", mainPath, "add", "direct-main.txt"]);
+  git(["-C", mainPath, "commit", "-qm", "direct main delivery"]);
+  const head = git(["-C", mainPath, "rev-parse", "HEAD"]).trim();
+  const manager = new WorkItemChangeSetManager(store, () => new Date(NOW));
+
+  await assert.rejects(
+    manager.capture(task.id, item.id),
+    /no managed workspace/i
+  );
+  await assert.rejects(
+    manager.capture(task.id, item.id, {
+      taskFinalReviewContract: createTaskFinalReviewContract({
+        taskId: task.id,
+        reviewerRoleName: "reviewer",
+        controlPlaneDigest: "b".repeat(64)
+      })
+    }),
+    /Task-final contract|direct Candidate/i
+  );
+  writeFileSync(join(mainPath, "dirty.txt"), "must not be captured\n");
+  await assert.rejects(
+    manager.capture(task.id, item.id, { taskFinalReviewContract: contract }),
+    /Task main.*clean/i
+  );
+  unlinkSync(join(mainPath, "dirty.txt"));
+
+  const captured = spawnSync(process.execPath, [
+    invocation.cliEntry,
+    ...invocation.prefix,
+    "task", "work", "capture", item.id
+  ], { encoding: "utf8", env: invocation.environment });
+  assert.equal(captured.status, 0, captured.stderr || captured.stdout);
+  const [changeSet] = store.listChangeSets(task.id);
+  assert.notEqual(changeSet, undefined);
+  assert.equal(changeSet.workItemId, item.id);
+  assert.equal(changeSet.baseCommit, taskEntry.baseCommit);
+  assert.equal(changeSet.headCommit, head);
+  assert.deepEqual(changeSet.changedPaths, ["direct-main.txt"]);
+
+  const result = await runTaskIntegrationCommand([
+    "start", task.id, "--change-set", changeSet.id
+  ], store, home, { now: () => new Date(NOW) });
+  assert.match(result.output, /Integrated/i);
+  const [integration] = store.listIntegrationAttempts(task.id);
+  assert.equal(integration.status, "committed");
+  assert.equal(integration.expectedHead, head);
+  assert.equal(integration.candidateCommit, head);
+  assert.deepEqual(integration.changeSetIds, [changeSet.id]);
+  assert.equal(git(["-C", mainPath, "rev-parse", "HEAD"]).trim(), head);
+});
+
 test("Task archive requires explicit WorkItem cleanup and preserves its record", async (t) => {
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);

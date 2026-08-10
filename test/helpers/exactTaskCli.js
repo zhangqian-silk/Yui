@@ -25,6 +25,7 @@ import {
 } from "../../dist/runtime/lifecycleReservation.js";
 import { writeTextFileAtomically } from "../../dist/storage/durableFile.js";
 import { formatAgentRunReceiptId } from "../../dist/task/taskRecordReference.js";
+import { TASK_FINAL_REVIEW_ARGUMENT } from "../../dist/review/taskFinalReviewContract.js";
 
 let nextLaunch = 0;
 
@@ -34,6 +35,7 @@ export function exactTaskCliInvocation({
   store,
   taskId,
   roleName,
+  taskFinalReviewerRole,
   environment = process.env,
   cliEntry = join(process.cwd(), "dist", "cli.js")
 }) {
@@ -169,7 +171,14 @@ export function exactTaskCliInvocation({
   else managedEnvironment.YUI_NATIVE_SESSION_ID = nativeSessionId;
   return {
     cliEntry,
-    prefix: [EXACT_CONTROL_ARGUMENT, digest],
+    controlDigest: digest,
+    prefix: [
+      EXACT_CONTROL_ARGUMENT,
+      digest,
+      ...(taskFinalReviewerRole === undefined
+        ? []
+        : [TASK_FINAL_REVIEW_ARGUMENT, taskId, taskFinalReviewerRole])
+    ],
     environment: managedEnvironment,
     completeFixtureRuntimeReservation() {
       const owner = { scope: "task", taskId, roleName };
