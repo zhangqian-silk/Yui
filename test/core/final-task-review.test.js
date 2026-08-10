@@ -358,12 +358,13 @@ function addCompletedDirectWorkItem(fx, title, assignee = undefined) {
   return fx.store.getWorkItem(fx.task.id, item.id);
 }
 
-function integrateProducerAfterCurrentHeads(fx, item) {
+function integrateProducerAfterCurrentHeads(fx, item, options = {}) {
   fx.store.transaction((tx) => {
     for (const [index, projectId] of ["project-1", "project-2"].entries()) {
       const baseCommit = String.fromCharCode(99 + index).repeat(40);
-      const headCommit = ["e", "f"][index].repeat(40);
-      const changeSetId = `change-set-${index + 3}`;
+      const headCommit = (options.headCommits ?? ["e", "f"])[index].repeat(40);
+      const expectedHead = (options.expectedHeads ?? ["c", "d"])[index].repeat(40);
+      const changeSetId = tx.nextChangeSetId(fx.task.id);
       tx.saveChangeSet(fx.task.id, createWorkItemChangeSet({
         id: changeSetId,
         taskId: fx.task.id,
@@ -375,17 +376,97 @@ function integrateProducerAfterCurrentHeads(fx, item) {
         changedPaths: [`${projectId}/${item.id}.ts`]
       }, NOW));
       const attempt = createIntegrationAttempt({
-        id: `integration-${index + 3}`,
+        id: tx.nextIntegrationAttemptId(fx.task.id),
         taskId: fx.task.id,
         projectId,
         targetRef: `yui/task-11/main-${index + 1}`,
-        expectedHead: baseCommit,
+        expectedHead,
         changeSetIds: [changeSetId],
         checkCommands: []
       }, NOW);
       tx.saveIntegrationAttempt(fx.task.id, updateIntegrationAttempt(
         attempt, { status: "committed", candidateCommit: headCommit }, NOW
       ));
+    }
+  });
+}
+
+function recordIntegrationAttempt(fx, item, input) {
+  return fx.store.transaction((tx) => {
+    const changeSetId = tx.nextChangeSetId(fx.task.id);
+    tx.saveChangeSet(fx.task.id, createWorkItemChangeSet({
+      id: changeSetId,
+      taskId: fx.task.id,
+      projectId: input.projectId,
+      workItemId: item.id,
+      baseCommit: input.changeSetBase,
+      headCommit: input.changeSetHead,
+      branch: `yui/task-1/${item.id}-${changeSetId}`,
+      changedPaths: [`${input.projectId}/${changeSetId}.ts`]
+    }, NOW));
+    const attempt = createIntegrationAttempt({
+      id: tx.nextIntegrationAttemptId(fx.task.id),
+      taskId: fx.task.id,
+      projectId: input.projectId,
+      targetRef: input.targetRef,
+      expectedHead: input.expectedHead,
+      changeSetIds: [changeSetId],
+      checkCommands: []
+    }, NOW);
+    const stored = input.status === "running"
+      ? attempt
+      : updateIntegrationAttempt(attempt, {
+          status: input.status,
+          ...(input.candidateCommit === undefined
+            ? {}
+            : { candidateCommit: input.candidateCommit })
+        }, NOW);
+    tx.saveIntegrationAttempt(fx.task.id, stored);
+    return stored;
+  });
+}
+
+function withMissingProducerProvenance(store, input) {
+  return new Proxy(store, {
+    get(target, property) {
+      if (property === "transaction") {
+        return (callback) => target.transaction((tx) => callback(new Proxy(tx, {
+          get(transaction, transactionProperty) {
+            if (transactionProperty === "getChangeSet") {
+              return (taskId, changeSetId) => {
+                const changeSet = transaction.getChangeSet(taskId, changeSetId);
+                return input.kind === "change-set" && changeSetId === input.changeSetId
+                  ? null
+                  : changeSet;
+              };
+            }
+            if (transactionProperty === "getWorkItem") {
+              return (taskId, workItemId) => {
+                const item = transaction.getWorkItem(taskId, workItemId);
+                if (workItemId !== input.workItemId || item === null) return item;
+                if (input.kind === "work-item") return null;
+                if (input.kind === "candidate") return { ...item, candidates: [] };
+                if (input.kind !== "run") return item;
+                return {
+                  ...item,
+                  candidates: item.candidates.map((candidate, index) => (
+                    index === item.candidates.length - 1
+                      ? {
+                          ...candidate,
+                          source: { type: "run", runId: "agent-run-999" }
+                        }
+                      : candidate
+                  ))
+                };
+              };
+            }
+            const value = Reflect.get(transaction, transactionProperty, transaction);
+            return typeof value === "function" ? value.bind(transaction) : value;
+          }
+        })));
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
     }
   });
 }
@@ -683,6 +764,144 @@ test("Task-final Reviewer checks every integrated producer instead of the latest
   );
 });
 
+test("Task-final Reviewer covers producers across non-Integration merge boundaries", (t) => {
+  const fx = fixture(t, { producerRunRoleName: "reviewer" });
+  const laterAnchor = addCompletedDirectWorkItem(fx, "post-merge independent producer", "worker-a");
+  integrateProducerAfterCurrentHeads(fx, laterAnchor, { expectedHeads: ["1", "2"] });
+
+  const completion = runTaskCommand(
+    ["complete", fx.task.id, "--summary", "request final review"],
+    fx.store,
+    fx.leaderOptions
+  );
+
+  assert.match(completion.output, /Final Task Review is blocked/);
+  const round = fx.store.listReviewRounds(fx.task.id)[0];
+  assert.equal(round.status, "failed");
+  assert.equal(round.reviewerRunId, undefined);
+  assert.match(round.summary, /work-item-1/);
+  assert.match(round.summary, /reviewer/);
+  assert.equal(
+    fx.store.listAgentRuns(fx.task.id).filter(({ purpose }) => purpose === "review").length,
+    0
+  );
+});
+
+test("Task-final producer lineage excludes noncommitted, later, and unrelated attempts", (t) => {
+  const fx = fixture(t);
+  const excluded = addCompletedDirectWorkItem(fx, "excluded reviewer producer", "reviewer");
+  recordIntegrationAttempt(fx, excluded, {
+    projectId: "project-1",
+    targetRef: "yui/task-11/main-1",
+    expectedHead: "c".repeat(40),
+    changeSetBase: "c".repeat(40),
+    changeSetHead: "7".repeat(40),
+    status: "failed"
+  });
+  recordIntegrationAttempt(fx, excluded, {
+    projectId: "project-1",
+    targetRef: "yui/task-11/main-1",
+    expectedHead: "c".repeat(40),
+    changeSetBase: "c".repeat(40),
+    changeSetHead: "8".repeat(40),
+    status: "running"
+  });
+  recordIntegrationAttempt(fx, excluded, {
+    projectId: "project-1",
+    targetRef: "yui/task-11/preview",
+    expectedHead: "c".repeat(40),
+    changeSetBase: "c".repeat(40),
+    changeSetHead: "5".repeat(40),
+    candidateCommit: "5".repeat(40),
+    status: "committed"
+  });
+  recordIntegrationAttempt(fx, excluded, {
+    projectId: "project-2",
+    targetRef: "yui/task-11/main-1",
+    expectedHead: "d".repeat(40),
+    changeSetBase: "d".repeat(40),
+    changeSetHead: "6".repeat(40),
+    candidateCommit: "6".repeat(40),
+    status: "committed"
+  });
+  recordIntegrationAttempt(fx, excluded, {
+    projectId: "project-2",
+    targetRef: "yui/task-11/main-2",
+    expectedHead: "d".repeat(40),
+    changeSetBase: "d".repeat(40),
+    changeSetHead: "a".repeat(40),
+    status: "failed"
+  });
+  const included = addCompletedDirectWorkItem(fx, "frozen independent producer", "worker-a");
+  integrateProducerAfterCurrentHeads(fx, included, { expectedHeads: ["1", "2"] });
+  const frozenCandidate = {
+    schemaVersion: 1,
+    projects: [
+      { projectId: "project-1", commit: "e".repeat(40) },
+      { projectId: "project-2", commit: "f".repeat(40) }
+    ]
+  };
+  const round = createTaskReviewRound(
+    fx.store.nextReviewRoundId(fx.task.id),
+    fx.task.id,
+    included.id,
+    included.candidates.at(-1).id,
+    "reviewer",
+    "policy",
+    frozenCandidate,
+    NOW
+  );
+  fx.store.saveReviewRound(fx.task.id, round);
+  const laterAttempt = recordIntegrationAttempt(fx, excluded, {
+    projectId: "project-1",
+    targetRef: "yui/task-11/main-1",
+    expectedHead: "e".repeat(40),
+    changeSetBase: "e".repeat(40),
+    changeSetHead: "9".repeat(40),
+    candidateCommit: "9".repeat(40),
+    status: "committed"
+  });
+  assert.equal(laterAttempt.id, "integration-10");
+
+  const run = dispatchFinalReview(fx, round);
+
+  assert.equal(run.roleName, "reviewer");
+  assert.equal(run.purpose, "review");
+  assert.equal(run.reviewRoundId, round.id);
+});
+
+test("merge-boundary producer provenance remains fail-closed", (t) => {
+  const fx = fixture(t);
+  const laterAnchor = addCompletedDirectWorkItem(fx, "post-merge producer", "worker-a");
+  integrateProducerAfterCurrentHeads(fx, laterAnchor, { expectedHeads: ["1", "2"] });
+  const firstChangeSet = fx.store.listChangeSets(fx.task.id).find((changeSet) => (
+    changeSet.workItemId === fx.item.id && changeSet.projectId === "project-1"
+  ));
+  assert.notEqual(firstChangeSet, undefined);
+  const cases = [
+    ["change-set", /Committed Integration ChangeSet provenance is invalid/i],
+    ["work-item", /Committed Integration producer WorkItem is unavailable/i],
+    ["candidate", /Committed producer WorkItem has no Candidate/i],
+    ["run", /Committed producer Candidate Run is unavailable/i]
+  ];
+  for (const [kind, expected] of cases) {
+    const unavailable = withMissingProducerProvenance(fx.store, {
+      kind,
+      changeSetId: firstChangeSet.id,
+      workItemId: fx.item.id
+    });
+    assert.throws(
+      () => runTaskCommand(
+        ["complete", fx.task.id, "--summary", "request final review"],
+        unavailable,
+        fx.leaderOptions
+      ),
+      expected
+    );
+    assert.equal(fx.store.listReviewRounds(fx.task.id).length, 0);
+  }
+});
+
 test("dispatch rechecks producer independence for a pre-existing pending Task Round", (t) => {
   const fx = fixture(t, { producerRunRoleName: "reviewer" });
   const laterAnchor = addCompletedDirectWorkItem(fx, "later independent producer", "worker-a");
@@ -718,10 +937,10 @@ test("dispatch rechecks producer independence for a pre-existing pending Task Ro
   );
 });
 
-test("independent Reviewer still dispatches a valid multi-producer Task candidate", (t) => {
+test("independent Reviewer still dispatches across non-Integration merge boundaries", (t) => {
   const fx = fixture(t);
   const laterProducer = addCompletedDirectWorkItem(fx, "later producer", "worker-a");
-  integrateProducerAfterCurrentHeads(fx, laterProducer);
+  integrateProducerAfterCurrentHeads(fx, laterProducer, { expectedHeads: ["1", "2"] });
 
   const completion = runTaskCommand(
     ["complete", fx.task.id, "--summary", "request final review"],

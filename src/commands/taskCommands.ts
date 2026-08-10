@@ -2326,28 +2326,32 @@ function taskReviewProducers(
     const attempts = store.listIntegrationAttempts(task.id)
       .filter((attempt) => (
         attempt.status === "committed" && attempt.projectId === project.projectId
-      ));
-    const head = [...attempts]
-      .filter(({ candidateCommit }) => candidateCommit === project.commit)
-      .sort((left, right) => (
-        left.updatedAt.localeCompare(right.updatedAt) || left.id.localeCompare(right.id)
       ))
-      .at(-1);
-    if (head === undefined) {
+      .sort((left, right) => (
+        left.id.localeCompare(right.id, undefined, { numeric: true })
+      ));
+    let headIndex = -1;
+    for (let index = attempts.length - 1; index >= 0; index -= 1) {
+      if (attempts[index]!.candidateCommit === project.commit) {
+        headIndex = index;
+        break;
+      }
+    }
+    if (headIndex < 0) {
       throw dataError(
         `Committed Integration provenance is unavailable for `
         + `${project.projectId}@${project.commit}.`
       );
     }
-    let attemptIndex = attempts.findIndex(({ id }) => id === head.id);
-    if (attemptIndex < 0) {
-      throw dataError(`Committed Integration is not in Task history: ${head.id}.`);
-    }
-    // Follow the exact committed target lineage back from the frozen head.
-    // Each attempt names only its own ChangeSets; expectedHead connects prior
-    // Task integrations until the Project base, which has no Task producer.
-    while (attemptIndex >= 0) {
-      const attempt = attempts[attemptIndex]!;
+    const head = attempts[headIndex]!;
+    // Integration ids are durable Task-local creation order. A committed CAS
+    // cannot be overtaken by an older attempt on the same target, while a
+    // supported import merge may advance expectedHead without an Integration.
+    // Therefore the stored lineage is every committed same-target attempt
+    // through the exact frozen head, rather than an expectedHead commit chain.
+    const lineage = attempts.slice(0, headIndex + 1)
+      .filter(({ targetRef }) => targetRef === head.targetRef);
+    for (const attempt of lineage) {
       for (const changeSetId of attempt.changeSetIds) {
         const changeSet = store.getChangeSet(task.id, changeSetId);
         if (changeSet === null || changeSet.projectId !== project.projectId) {
@@ -2368,16 +2372,6 @@ function taskReviewProducers(
           roleName: workItemProducerRoleName(store, item)
         });
       }
-      let previousIndex = -1;
-      for (let index = attemptIndex - 1; index >= 0; index -= 1) {
-        const previous = attempts[index]!;
-        if (previous.targetRef === attempt.targetRef
-          && previous.candidateCommit === attempt.expectedHead) {
-          previousIndex = index;
-          break;
-        }
-      }
-      attemptIndex = previousIndex;
     }
   }
   return [...producers.values()];
