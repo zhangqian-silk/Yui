@@ -23,6 +23,7 @@ import {
 import {
   attachReviewRoundWorkspace,
   createReviewRound,
+  createTaskReviewRound,
   finishReviewRound,
   startReviewRound
 } from "../../dist/review/reviewRound.js";
@@ -100,6 +101,16 @@ function fixture(t, { projectTask = true, projectWork = true } = {}) {
     reviewerRoleName: "reviewer",
     controlPlaneDigest: "a".repeat(64)
   });
+  const exact = {
+    ...leader,
+    taskFinalReviewContract: contract,
+    actualTaskReviewCandidate: projectTask
+      ? {
+          schemaVersion: 1,
+          projects: [{ projectId: "project-1", commit: "c".repeat(40) }]
+        }
+      : undefined
+  };
   return {
     home,
     store,
@@ -107,7 +118,7 @@ function fixture(t, { projectTask = true, projectWork = true } = {}) {
     item,
     leader,
     contract,
-    exact: { ...leader, taskFinalReviewContract: contract }
+    exact
   };
 }
 
@@ -164,6 +175,10 @@ function advanceIntegratedHead(fx) {
     { status: "committed", candidateCommit: "d".repeat(40) },
     NOW
   ));
+  fx.exact.actualTaskReviewCandidate = {
+    schemaVersion: 1,
+    projects: [{ projectId: "project-1", commit: "d".repeat(40) }]
+  };
 }
 
 function completeReview(fx, round) {
@@ -289,6 +304,36 @@ test("exact Task contract creates a metadata-only Candidate and one final Task R
     "complete", fx.task.id, "--summary", "complete reviewed head"
   ], fx.store, fx.exact);
   assert.equal(fx.store.getTask(fx.task.id).status, "completed");
+});
+
+test("exact Task contract is preserved by a no-Run final Review retry", (t) => {
+  const fx = fixture(t);
+  submitAndAccept(fx);
+  const candidate = fx.store.getWorkItem(fx.task.id, fx.item.id).candidates.at(-1);
+  const failed = finishReviewRound(createTaskReviewRound(
+    fx.store.nextReviewRoundId(fx.task.id),
+    fx.task.id,
+    fx.item.id,
+    candidate.id,
+    "reviewer",
+    "policy",
+    fx.exact.actualTaskReviewCandidate,
+    NOW,
+    fx.contract
+  ), "failed", "reviewer unavailable before dispatch", NOW);
+  fx.store.saveReviewRound(fx.task.id, failed);
+
+  const retried = runTaskCommand(
+    ["work", "review", "retry", failed.id],
+    fx.store,
+    fx.exact
+  );
+
+  assert.match(retried.output, /Task-final Review retry requested/);
+  const rounds = fx.store.listReviewRounds(fx.task.id);
+  assert.equal(rounds.length, 2);
+  assert.deepEqual(rounds[1].taskFinalReviewContract, fx.contract);
+  assert.deepEqual(rounds[1].taskCandidate, failed.taskCandidate);
 });
 
 test("completed non-Task-scoped evidence cannot satisfy the exact Task contract", (t) => {

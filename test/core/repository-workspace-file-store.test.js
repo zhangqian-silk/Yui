@@ -3288,6 +3288,101 @@ test("a Task-final ReviewRound worktree starts at its frozen integrated head", a
   );
 });
 
+test("exact Task completion rejects Task-main drift after the latest Integration", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Review the actual Task head", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }],
+    requireIntegration: true
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath, ["leader", "reviewer"]);
+  store.saveConfig({
+    ...store.getConfig(),
+    defaultWorkspace: workspace,
+    review: { roleName: "reviewer", trigger: "final" }
+  });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const taskEntry = store.getTaskWorkspace(task.id).entries[0];
+  const baseCommit = git(["-C", taskEntry.path, "rev-parse", "HEAD"]).trim();
+  const invocation = exactTaskCliInvocation({
+    home,
+    store,
+    taskId: task.id,
+    roleName: "leader",
+    taskFinalReviewerRole: "reviewer"
+  });
+  const contract = createTaskFinalReviewContract({
+    taskId: task.id,
+    reviewerRoleName: "reviewer",
+    controlPlaneDigest: invocation.controlDigest
+  });
+  const item = updateWorkItemStatus(createWorkItem("work-item-1", task.id, {
+    title: "Integrated delivery",
+    writeProjectIds: [project.id]
+  }, NOW), "running", NOW);
+  const submitted = submitWorkItemCandidate(item, {
+    summary: "Integrated delivery",
+    source: { type: "direct" },
+    reviewPolicy: { roleName: "reviewer", trigger: "final" },
+    taskFinalReviewContract: contract
+  }, NOW);
+  store.saveWorkItem(task.id, updateWorkItemStatus(
+    submitted,
+    "completed",
+    NOW,
+    "Accepted for final Review."
+  ));
+
+  writeFileSync(join(taskEntry.path, "integrated.txt"), "integrated\n");
+  git(["-C", taskEntry.path, "add", "integrated.txt"]);
+  git(["-C", taskEntry.path, "commit", "-qm", "integrated"]);
+  const integratedCommit = git(["-C", taskEntry.path, "rev-parse", "HEAD"]).trim();
+  const changeSet = createWorkItemChangeSet({
+    id: "change-set-1",
+    taskId: task.id,
+    projectId: project.id,
+    workItemId: item.id,
+    baseCommit,
+    headCommit: integratedCommit,
+    branch: taskEntry.branch,
+    changedPaths: ["integrated.txt"]
+  }, NOW);
+  const integration = updateIntegrationAttempt(createIntegrationAttempt({
+    id: "integration-1",
+    taskId: task.id,
+    projectId: project.id,
+    targetRef: taskEntry.branch,
+    expectedHead: baseCommit,
+    changeSetIds: [changeSet.id],
+    checkCommands: []
+  }, NOW), { status: "committed", candidateCommit: integratedCommit }, NOW);
+  store.transaction((tx) => {
+    tx.saveChangeSet(task.id, changeSet);
+    tx.saveIntegrationAttempt(task.id, integration);
+  });
+
+  writeFileSync(join(taskEntry.path, "drift.txt"), "unintegrated drift\n");
+  git(["-C", taskEntry.path, "add", "drift.txt"]);
+  git(["-C", taskEntry.path, "commit", "-qm", "post-integration drift"]);
+  const actualCommit = git(["-C", taskEntry.path, "rev-parse", "HEAD"]).trim();
+  assert.notEqual(actualCommit, integratedCommit);
+
+  const result = spawnSync(process.execPath, [
+    invocation.cliEntry,
+    ...invocation.prefix,
+    "task", "complete", task.id, "--summary", "Request exact final Review."
+  ], { encoding: "utf8", env: invocation.environment });
+  assert.notEqual(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stderr, /actual Task head.*latest committed Integration/i);
+  assert.equal(store.listReviewRounds(task.id).length, 0);
+  assert.equal(store.getTask(task.id).status, "active");
+});
+
 test("a reviewer launches from a fresh ReviewRound workspace frozen from the Candidate", async (t) => {
   const { home, workspace, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
