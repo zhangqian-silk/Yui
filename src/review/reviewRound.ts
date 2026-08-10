@@ -5,12 +5,26 @@ import {
 } from "../domain/validation.js";
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
 import {
+  validateTaskFinalReviewContract,
+  type TaskFinalReviewContract
+} from "./taskFinalReviewContract.js";
+import {
   validateManagedWorkspace,
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
 export type ReviewRoundStatus = "pending" | "running" | "completed" | "failed";
 export type ReviewRequestSource = "policy" | "leader";
 export type ReviewWorkspaceDisposition = "preserved" | "removed";
+export type ReviewScope = "work-item" | "task";
+
+/** Immutable heads reviewed by a Task-scoped final ReviewRound. */
+export type TaskReviewCandidate = Readonly<{
+  schemaVersion: 1;
+  projects: readonly Readonly<{
+    projectId: string;
+    commit: string;
+  }>[];
+}>;
 
 export type ReviewCheck = Readonly<{
   name: string;
@@ -34,6 +48,12 @@ export type ReviewRound = {
   reviewerRoleName: string;
   reviewerRunId?: string;
   reviewBaseCommit: string;
+  /** Omitted on legacy records, which are equivalent to `work-item`. */
+  scope?: ReviewScope;
+  /** Present only when this round reviews the complete integrated Task. */
+  taskCandidate?: TaskReviewCandidate;
+  /** Exact Task/control capability that established this Task-final gate. */
+  taskFinalReviewContract?: TaskFinalReviewContract;
   workspace?: ManagedWorkspace;
   requestedBy: ReviewRequestSource;
   status: ReviewRoundStatus;
@@ -67,6 +87,37 @@ export function createReviewRound(
     candidateId: requireIdentity(candidateId, "Candidate id"),
     reviewerRoleName: requireIdentity(reviewerRoleName, "Reviewer Role"),
     reviewBaseCommit: requireCommit(reviewBaseCommit, "Review base commit"),
+    requestedBy: validateReviewRequestSource(requestedBy),
+    status: "pending",
+    createdAt: now.toISOString()
+  });
+}
+
+export function createTaskReviewRound(
+  id: string,
+  taskId: string,
+  workItemId: string,
+  candidateId: string,
+  reviewerRoleName: string,
+  requestedBy: ReviewRequestSource,
+  taskCandidate: TaskReviewCandidate,
+  now: Date,
+  taskFinalReviewContract?: TaskFinalReviewContract
+): ReviewRound {
+  const candidate = validateTaskReviewCandidate(taskCandidate);
+  return validateReviewRound({
+    schemaVersion: 2,
+    id: requireIdentity(id, "ReviewRound id"),
+    taskId: requireIdentity(taskId, "Task id"),
+    workItemId: requireIdentity(workItemId, "Work Item id"),
+    candidateId: requireIdentity(candidateId, "Candidate id"),
+    reviewerRoleName: requireIdentity(reviewerRoleName, "Reviewer Role"),
+    reviewBaseCommit: candidate.projects[0]!.commit,
+    scope: "task",
+    taskCandidate: candidate,
+    ...(taskFinalReviewContract === undefined
+      ? {}
+      : { taskFinalReviewContract }),
     requestedBy: validateReviewRequestSource(requestedBy),
     status: "pending",
     createdAt: now.toISOString()
@@ -203,6 +254,31 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
   }
   requireIdentity(round.reviewerRoleName, "Reviewer Role");
   requireCommit(round.reviewBaseCommit, "Review base commit");
+  const scope = round.scope ?? "work-item";
+  if (scope !== "work-item" && scope !== "task") {
+    throw new Error(`ReviewRound scope is invalid: ${String(round.scope)}.`);
+  }
+  if (scope === "task") {
+    if (round.taskCandidate === undefined) {
+      throw new Error(`Task ReviewRound requires a frozen Task candidate: ${round.id}.`);
+    }
+    const candidate = validateTaskReviewCandidate(round.taskCandidate);
+    if (candidate.projects[0]!.commit !== round.reviewBaseCommit) {
+      throw new Error(`Task ReviewRound base does not match its primary Project: ${round.id}.`);
+    }
+    if (round.taskFinalReviewContract !== undefined) {
+      const contract = validateTaskFinalReviewContract(round.taskFinalReviewContract);
+      if (contract.taskId !== round.taskId) {
+        throw new Error(`Task ReviewRound contract belongs to another Task: ${round.id}.`);
+      }
+      if (contract.reviewerRoleName !== round.reviewerRoleName) {
+        throw new Error(`Task ReviewRound contract uses another Reviewer Role: ${round.id}.`);
+      }
+    }
+  } else if (round.taskCandidate !== undefined
+    || round.taskFinalReviewContract !== undefined) {
+    throw new Error(`WorkItem ReviewRound cannot carry a Task candidate or contract: ${round.id}.`);
+  }
   validateReviewRequestSource(round.requestedBy);
   if (!["pending", "running", "completed", "failed"].includes(round.status)) {
     throw new Error(`ReviewRound status is invalid: ${String(round.status)}.`);
@@ -249,6 +325,25 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
     requireTimestamp(round.workspaceDisposition.recordedAt, "Review workspace disposition time");
   }
   return round;
+}
+
+export function validateTaskReviewCandidate(
+  candidate: TaskReviewCandidate
+): TaskReviewCandidate {
+  if (candidate.schemaVersion !== 1) {
+    throw new Error("Task Review candidate must use schemaVersion 1.");
+  }
+  if (!Array.isArray(candidate.projects) || candidate.projects.length === 0) {
+    throw new Error("Task Review candidate requires at least one Project.");
+  }
+  const projects = candidate.projects.map(({ projectId, commit }) => ({
+    projectId: requireIdentity(projectId, "Task Review Project"),
+    commit: requireCommit(commit, "Task Review Project commit")
+  }));
+  if (new Set(projects.map(({ projectId }) => projectId)).size !== projects.length) {
+    throw new Error("Task Review candidate Projects must be unique.");
+  }
+  return { schemaVersion: 1, projects };
 }
 
 function extractChecks(value: unknown): readonly ReviewCheck[] {

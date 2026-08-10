@@ -70,10 +70,11 @@ export async function processLeaderWakeups(
       continue;
     }
 
+    const reopening = wakeup.reasons.includes("task-reopened");
     const existingSession = store.getRoleSession(
       task.id,
       role.name,
-      role.effective.agentId
+      reopening ? undefined : role.effective.agentId
     );
     let effectiveSession: SchedulerRoleSession | null = existingSession;
     let claimed = false;
@@ -120,7 +121,11 @@ export async function processLeaderWakeups(
       }
       const compatibleSession = existingSession !== null
         && effectiveLaunchSnapshotsCompatible(existingSession.effective, role.effective);
+      const reopenIdentityDrift = reopening
+        && hasNativeSession(existingSession)
+        && !compatibleSession;
       if (hasNativeSession(existingSession) && !compatibleSession
+        && !reopenIdentityDrift
         && existingSession.status !== "stopped" && existingSession.status !== "broken") {
         throw new Error(
           `Leader Session is incompatible with desired effective launch: ${task.id}/${role.name}.`
@@ -141,6 +146,9 @@ export async function processLeaderWakeups(
         input,
         now,
         {
+          ...(role.managedWorkspace === undefined
+            ? {}
+            : { workspace: role.managedWorkspace }),
           effective: role.effective
         }
       );
@@ -148,7 +156,11 @@ export async function processLeaderWakeups(
         task,
         role,
         run,
-        session: existingSession,
+        // An incompatible reopened generation is intentionally not rebound to
+        // a new native host. Keep the old fixed Session as evidence while
+        // claiming a short-lived Run so the existing failure path can record a
+        // durable, retryable recovery obligation before any provider call.
+        session: reopenIdentityDrift ? null : existingSession,
         wakeup,
         now
       });
@@ -157,6 +169,11 @@ export async function processLeaderWakeups(
         continue;
       }
       claimed = true;
+      if (reopenIdentityDrift) {
+        throw new Error(
+          `Leader reopen refused after effective launch identity drift: ${task.id}/${role.name}.`
+        );
+      }
       prepared = await delivery.prepareRoleSession({
         taskId: task.id,
         roleName: role.name,
@@ -164,6 +181,9 @@ export async function processLeaderWakeups(
         adapterId: role.effective.adapterId,
         effective: role.effective,
         workspace: role.effective.workspace.root,
+        ...(run.workspace === undefined
+          ? {}
+          : { managedWorkspace: run.workspace }),
         mode,
         runId: run.id,
         ...(mode === "resume" ? { nativeSessionId: existingSession!.nativeSessionId } : {})

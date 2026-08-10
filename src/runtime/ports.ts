@@ -2,6 +2,8 @@ import type { PromptEnvelope } from "./promptEnvelope.js";
 import type { RuntimeBinding } from "./runtimeBinding.js";
 import type { RuntimeOwner } from "./runtimeOwner.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
+import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
+import type { TaskRuntimeLaunchPolicy } from "./taskRuntimeIsolation.js";
 import type {
   NewSessionLaunchRequest,
   ResumeSessionLaunchRequest
@@ -33,6 +35,9 @@ export type RuntimeLaunchPreparationRequest = Readonly<{
   adapterId: string;
   effective: EffectiveLaunchSnapshot;
   workspace: string;
+  /** Authoritative runtime owner; a Role is only transport/session addressing. */
+  managedWorkspace?: ManagedWorkspace;
+  runtimePolicy?: TaskRuntimeLaunchPolicy;
   environment?: Readonly<Record<string, string>>;
   mode: "new" | "resume";
   nativeSessionId?: string;

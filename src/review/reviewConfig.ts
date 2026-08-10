@@ -1,6 +1,6 @@
 import { requireIdentity } from "../domain/validation.js";
 
-export const REVIEW_TRIGGERS = ["always", "leader"] as const;
+export const REVIEW_TRIGGERS = ["always", "leader", "final"] as const;
 export type ReviewTrigger = typeof REVIEW_TRIGGERS[number];
 
 export type ReviewConfig = Readonly<{

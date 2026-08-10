@@ -7,10 +7,15 @@ import {
   processActiveRoleRunDeliveries,
   type ActiveRoleRunDeliveryResult
 } from "../scheduler/activeRoleRunDelivery.js";
+import {
+  selectedSchedulerRoles,
+  selectedSchedulerTasks
+} from "../scheduler/ports.js";
 import type {
   AutoResolvedInput,
   RoleRunDeliveryFailurePersistence,
   SchedulerReconcileSelection,
+  SchedulerRoleSession,
   SchedulerStorePort,
   TmuxDeliveryPort
 } from "../scheduler/ports.js";
@@ -38,12 +43,18 @@ import type { MailboxTarget, ProcessingBatch } from "../coordination/workMailbox
 import {
   hasRuntimeCleanupObligation,
   isRuntimeLaunchReservation,
+  runtimeLifecycleTarget,
   type RuntimeLifecycleTarget,
   type RuntimeRoleOwner
 } from "../runtime/lifecycleReservation.js";
 import type { SessionHostPort } from "../runtime/ports.js";
+import type {
+  TaskRuntimeCleanupReason,
+  TaskRuntimeLifecycleCleanupPort
+} from "../runtime/taskRuntimeIsolation.js";
 import { formatTaskRecordReference } from "../task/taskRecordReference.js";
 import type { RuntimeEventProcessorPort } from "./runtimeEventProcessor.js";
+import type { EphemeralDomainIdentity } from "./domainIdentity.js";
 
 const DEFAULT_RECONCILIATION_INTERVAL_MS = reconciliationIntervalMilliseconds();
 const DEFAULT_SIGNAL_WINDOW_MS = 100;
@@ -57,7 +68,7 @@ class RuntimeEventApplyError extends AggregateError {}
 type RuntimeLifecycleHost = Pick<
   SessionHostPort,
   "inspectOwner" | "inspectOwners" | "stopOwner"
->;
+> & Partial<TaskRuntimeLifecycleCleanupPort>;
 
 type RoleRunDeliveryFailureIdentity = Omit<
   RoleRunDeliveryFailurePersistence,
@@ -84,6 +95,14 @@ export type ControllerRuntimeOptions = Readonly<{
   runtimeEventProcessor?: RuntimeEventProcessorPort;
   lifecycleHost?: RuntimeLifecycleHost;
   configuration?: ControllerConfigurationPort;
+  domainIdentity?: EphemeralDomainIdentity;
+  resourceReaper?: () => Promise<Readonly<{
+    cleaned: number;
+    failed: readonly Readonly<{ id: string; message: string }>[];
+    expiredDomains?: readonly Readonly<{ yuiHome: string; token?: string }>[];
+  }>>;
+  onExpiredEphemeralDomain?:
+    (domain: Readonly<{ yuiHome: string; token?: string }>) => void;
 }>;
 
 export interface ControllerConfigurationPort {
@@ -129,6 +148,7 @@ export async function runControllerSchedulerPass(
   const selection = includeOperator
     ? compiledSelection
     : { ...compiledSelection, operator: false };
+  queueSelectedCompletedTaskRuntimeCleanups(store, selection, now);
   const failedCleanupRoles = await processSelectedRoleRuntimeCleanups(
     store,
     delivery,
@@ -233,6 +253,42 @@ type RuntimeCleanupOutcome = Readonly<{
   error?: unknown;
 }>;
 
+function queueSelectedCompletedTaskRuntimeCleanups(
+  store: SchedulerStorePort,
+  selection: ReconcileSelection,
+  now: Date
+): void {
+  if (store.enqueueRuntimeCleanup === undefined) return;
+  for (const task of selectedSchedulerTasks(store, selection)) {
+    if (task.status !== "completed") continue;
+    for (const role of selectedSchedulerRoles(store, task.id, selection)) {
+      if (store.getActiveAgentRun(task.id, role.name) !== null) continue;
+      const session = store.getRoleSession(task.id, role.name);
+      if (!schedulerSessionRequiresRuntimeCleanup(session)) continue;
+      const target = runtimeLifecycleTarget({
+        scope: "task",
+        taskId: task.id,
+        roleName: role.name
+      });
+      if (hasRuntimeCleanupObligation(store.getWorkMailbox(target))) continue;
+      store.enqueueRuntimeCleanup({
+        scope: "task",
+        taskId: task.id,
+        roleName: role.name
+      }, now);
+    }
+  }
+}
+
+function schedulerSessionRequiresRuntimeCleanup(
+  session: SchedulerRoleSession | null
+): boolean {
+  if (session === null || session.status === "stopped" || session.status === "broken") {
+    return false;
+  }
+  return session.status === "running" || session.launchId !== undefined;
+}
+
 async function processSelectedRoleRuntimeCleanups(
   store: SchedulerStorePort,
   delivery: TmuxDeliveryPort,
@@ -257,6 +313,36 @@ async function processSelectedRoleRuntimeCleanups(
           throw new Error(
             `Role runtime cleanup could not confirm the host stopped: ${runtimeOwnerLabel(owner)}.`
           );
+        }
+        if (target.kind === "role-runtime") {
+          const session = store.getRoleSession(target.taskId, target.roleName);
+          const reservedLaunchId = isRuntimeLaunchReservation(mailbox.processing)
+            ? mailbox.processing!.batchId
+            : undefined;
+          if (
+            reservedLaunchId !== undefined
+            && session?.launchId !== undefined
+            && reservedLaunchId !== session.launchId
+          ) {
+            throw new Error(
+              `Task runtime cleanup launch identity is ambiguous: ${target.taskId}.`
+            );
+          }
+          const launchId = reservedLaunchId ?? session?.launchId;
+          if (
+            launchId !== undefined
+            && lifecycleHost.cleanupTaskLaunch !== undefined
+          ) {
+            const task = store.getTask(target.taskId);
+            const reason: TaskRuntimeCleanupReason = task?.status === "completed"
+              ? "completion"
+              : "interruption";
+            lifecycleHost.cleanupTaskLaunch({
+              taskId: target.taskId,
+              launchId,
+              reason
+            });
+          }
         }
         if (
           store.completeRuntimeCleanup === undefined
@@ -370,6 +456,17 @@ async function reconcileDormantRuntimeOwners(
       byOwner.get(runtimeOwnerIdentity(candidate.owner))?.state
       === "stopped"
     ) {
+      if (
+        candidate.owner.scope === "task"
+        && candidate.launchId !== undefined
+      ) {
+        // The exact launch-owned resources must settle through the durable
+        // cleanup lane before its Session fact becomes stopped. The candidate
+        // is passed back as the CAS fence so a concurrent Hook/launch cannot
+        // redirect cleanup to a newer generation.
+        store.enqueueRuntimeCleanup?.(candidate.owner, now, candidate);
+        continue;
+      }
       if (store.markRuntimeOwnerStopped(candidate, now)) {
         forgetPreparedRuntimeOwner(delivery, candidate.owner);
       }
@@ -741,6 +838,12 @@ export class FileTaskController {
   readonly #signalScheduler: MailboxScheduler<MailboxKey>;
   readonly #operatorSignalScheduler: MailboxScheduler<MailboxKey>;
   readonly #configuration: ControllerConfigurationPort | undefined;
+  readonly #resourceReaper:
+    | ControllerRuntimeOptions["resourceReaper"]
+    | undefined;
+  readonly #onExpiredEphemeralDomain:
+    | ControllerRuntimeOptions["onExpiredEphemeralDomain"]
+    | undefined;
   #current: Promise<ControllerSchedulerResult> | undefined;
   #operatorCurrent: Promise<void> | undefined;
   #pendingFull = false;
@@ -780,6 +883,8 @@ export class FileTaskController {
     this.#runtimeEventProcessor = options.runtimeEventProcessor;
     this.#lifecycleHost = options.lifecycleHost;
     this.#configuration = options.configuration;
+    this.#resourceReaper = options.resourceReaper;
+    this.#onExpiredEphemeralDomain = options.onExpiredEphemeralDomain;
     this.#signalScheduler = new MailboxScheduler(
       async (keys) => { await this.#requestPass({ kind: "dirty", keys }); },
       {
@@ -959,6 +1064,25 @@ export class FileTaskController {
         this.#pendingKeys.clear();
         try {
           if (scope.kind === "full") this.reloadReconciliationInterval();
+          if (scope.kind === "full" && this.#resourceReaper !== undefined) {
+            const reap = await this.#resourceReaper();
+            for (const failure of reap.failed) {
+              this.#onError(new Error(
+                `Ephemeral runtime reap failed for ${failure.id}: ${failure.message}`
+              ));
+            }
+            // The reaper owns the exact resource fences. Once a whole expired
+            // domain converges, let the detached Controller close itself on a
+            // later turn; never close while this reconciliation pass is still
+            // the in-flight server request.
+            if (reap.failed.length === 0 && (reap.expiredDomains?.length ?? 0) > 0) {
+              for (const domain of reap.expiredDomains ?? []) {
+                queueMicrotask(() => {
+                  this.#onExpiredEphemeralDomain?.(domain);
+                });
+              }
+            }
+          }
           const firstRuntimeDrain = this.#drainRuntimeEvents();
           result = await runControllerSchedulerPass(
             this.store,
@@ -1393,6 +1517,8 @@ export async function startFileTaskController(
     runtime.stop();
     await Promise.allSettled([...lifecycleRequests]);
     await runtime.shutdownAndDrain();
+  }, {
+    domainIdentity: options.domainIdentity
   });
   runtime.start();
   const closed = server.closed;

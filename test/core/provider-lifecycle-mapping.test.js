@@ -162,7 +162,7 @@ test("mapping is selected by the fence adapterId — a Codex signal is never map
 
 // --- Mapping + fold integrate: Codex has no pre-input push gate ---------------
 
-test("mapped Codex acceptance still requires the single push before it advances", () => {
+test("mapped Codex acceptance still requires an independently committed transport receipt", () => {
   const accepted = mapNativeLifecycleSignal({ kind: "native-prompt-submit", fence: codexFence });
   const beforePush = {
     fence: codexFence, pushed: false, accepted: false, terminal: false

@@ -725,9 +725,9 @@ export const ROOT_COMMAND = buildNode({
             {
               name: "set",
               summary: "Enable review with a Global Role.",
-              usage: "yui config review set --role <global-role> --trigger <always|leader>",
+              usage: "yui config review set --role <global-role> --trigger <always|leader|final>",
               options: ["--role", "--trigger"],
-              optionValues: { "--trigger": ["always", "leader"] }
+              optionValues: { "--trigger": ["always", "leader", "final"] }
             },
             { name: "clear", summary: "Disable global review." }
           ]

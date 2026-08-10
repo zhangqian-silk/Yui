@@ -4,6 +4,10 @@ import {
   validateEffectiveLaunchSnapshot,
   type EffectiveLaunchSnapshot
 } from "../executor/effectiveLaunch.js";
+import {
+  parseTaskRuntimeIsolationDescriptor,
+  type TaskRuntimeIsolationDescriptor
+} from "./taskRuntimeIsolation.js";
 
 type SessionLaunchRequestBase = Readonly<{
   launchId: string;
@@ -12,6 +16,7 @@ type SessionLaunchRequestBase = Readonly<{
   adapterId: string;
   effective: EffectiveLaunchSnapshot;
   workspace: string;
+  runtimeIsolation?: TaskRuntimeIsolationDescriptor;
   runId?: string;
   environment?: Readonly<Record<string, string>>;
 }>;
@@ -39,6 +44,20 @@ export function createSessionLaunchRequest(
     || effective.workspace.root !== workspace) {
     throw new TypeError("Session launch request does not match its effective snapshot.");
   }
+  const runtimeIsolation = input.runtimeIsolation === undefined
+    ? undefined
+    : parseTaskRuntimeIsolationDescriptor(JSON.stringify(input.runtimeIsolation));
+  if (runtimeIsolation !== undefined && (
+    input.owner.scope !== "task"
+    || runtimeIsolation.taskId !== input.owner.taskId
+    || runtimeIsolation.workspace.root !== workspace
+    || runtimeIsolation.generation.launchId !== input.launchId
+    || runtimeIsolation.generation.runId !== input.runId
+  )) {
+    throw new TypeError(
+      "Session launch request does not match its Task runtime isolation descriptor."
+    );
+  }
   const common = {
     launchId: requireSafeIdentity(input.launchId, "Launch id"),
     owner: normalizeRuntimeOwner(input.owner),
@@ -46,6 +65,7 @@ export function createSessionLaunchRequest(
     adapterId,
     effective,
     workspace,
+    ...(runtimeIsolation === undefined ? {} : { runtimeIsolation }),
     ...(input.runId === undefined
       ? {}
       : { runId: requireSafeIdentity(input.runId, "Run id") }),

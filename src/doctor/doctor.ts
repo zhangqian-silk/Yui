@@ -26,6 +26,11 @@ import {
   CommandExecutionError,
   type CommandExecutor
 } from "../tmux/commandExecutor.js";
+import {
+  EPHEMERAL_DOMAIN_GRACE_MS,
+  readEphemeralDomainIdentity,
+  readLinuxProcessStartIdentity
+} from "../controller/domainIdentity.js";
 
 export type DoctorStatus = "ok" | "missing" | "unsupported" | "invalid";
 
@@ -117,15 +122,52 @@ export function getDoctorChecks(
   const schema = readSchema(home);
   const schemaCheck = checkSchema(schema);
   const storage = inspectState(home, homeCheck, schema);
+  const domain = checkEphemeralDomain(home);
   return [
     homeCheck,
     schemaCheck,
     checkCompatibility(home, homeCheck, schema),
     storage.check,
+    ...(domain === undefined ? [] : [domain]),
     checkExecutable("git", env.YUI_GIT_BIN ?? "git", ["--version"], executor),
     checkExecutable("tmux", env.YUI_TMUX_BIN ?? "tmux", ["-V"], executor),
     ...storage.agents.flatMap((agent) => checkAgent(agent, executor))
   ];
+}
+
+function checkEphemeralDomain(home: string): DoctorCheck | undefined {
+  const identity = readEphemeralDomainIdentity(home);
+  if (identity.status === "absent") return undefined;
+  if (identity.status === "invalid" || identity.identity === undefined) {
+    return {
+      name: "ephemeral domain",
+      status: "invalid",
+      detail: "runtime/domain.json is invalid; recreate the isolated test domain."
+    };
+  }
+  const host = readLinuxProcessStartIdentity(identity.identity.hostPid);
+  if (host === identity.identity.hostProcessStartIdentity) {
+    return {
+      name: "ephemeral domain",
+      status: "ok",
+      detail: `active host=${identity.identity.hostPid}:${host} token=${identity.identity.token.slice(0, 12)}`
+    };
+  }
+  if (host === undefined && existsSync(`/proc/${identity.identity.hostPid}`)) {
+    return {
+      name: "ephemeral domain",
+      status: "invalid",
+      detail: "host process is present but its start identity is unreadable; keep the domain protected and retry."
+    };
+  }
+  const ageMs = Math.max(0, Date.now() - Date.parse(identity.identity.createdAt));
+  return {
+    name: "ephemeral domain",
+    status: ageMs >= EPHEMERAL_DOMAIN_GRACE_MS ? "missing" : "invalid",
+    detail: ageMs >= EPHEMERAL_DOMAIN_GRACE_MS
+      ? "host is expired; run yui controller cleanup --all or wait for Controller recovery."
+      : "host identity is unavailable; bounded grace is still in progress."
+  };
 }
 
 export function renderDoctor(checks: readonly DoctorCheck[]): string {

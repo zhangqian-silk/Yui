@@ -44,6 +44,7 @@ import {
   validateReviewRound,
   type ReviewRound
 } from "../review/reviewRound.js";
+import { sameTaskFinalReviewContract } from "../review/taskFinalReviewContract.js";
 import {
   assertProjectCatalog,
   validateProject,
@@ -1003,6 +1004,15 @@ export class FileTaskStore implements TaskStore {
       throw new StorageRecordError(`ReviewRound Candidate not found: ${stored.candidateId}.`);
     }
     assertWorkItemCandidateReferences(aggregate, item, candidate, `ReviewRound candidate ${stored.id}`);
+    if ((stored.scope ?? "work-item") === "task"
+      && !sameTaskFinalReviewContract(
+        stored.taskFinalReviewContract,
+        candidate.taskFinalReviewContract
+      )) {
+      throw new StorageRecordError(
+        `Task ReviewRound contract does not match its Candidate: ${stored.id}.`
+      );
+    }
     if (stored.reviewerRunId !== undefined) {
       const reviewerRun = aggregate.agentRuns[stored.reviewerRunId];
       if (reviewerRun !== undefined
@@ -2384,6 +2394,23 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
       throw new StorageRecordError(`ReviewRound Candidate not found: ${round.candidateId}.`);
     }
     assertWorkItemCandidateReferences(aggregate, item, candidate, `ReviewRound candidate ${round.id}`);
+    if ((round.scope ?? "work-item") === "task") {
+      const frozenProjects = round.taskCandidate?.projects ?? [];
+      if (frozenProjects.length !== boundProjects.size
+        || frozenProjects.some(({ projectId }) => !boundProjects.has(projectId))) {
+        throw new StorageRecordError(
+          `Task ReviewRound Projects do not match Task scope: ${round.id}.`
+        );
+      }
+      if (!sameTaskFinalReviewContract(
+        round.taskFinalReviewContract,
+        candidate.taskFinalReviewContract
+      )) {
+        throw new StorageRecordError(
+          `Task ReviewRound contract does not match its Candidate: ${round.id}.`
+        );
+      }
+    }
     if (round.reviewerRunId !== undefined) {
       const reviewerRun = aggregate.agentRuns[round.reviewerRunId];
       if (reviewerRun === undefined
@@ -2514,8 +2541,16 @@ function assertManagedWorkspaceReferences(
       }
       const item = aggregate.workItems[round.workItemId];
       const candidate = item?.candidates.find(({ id }) => id === round.candidateId);
-      if (candidate?.gitSnapshot !== undefined) {
-        for (const frozen of candidate.gitSnapshot.projects) {
+      const frozenProjects = (round.scope ?? "work-item") === "task"
+        ? round.taskCandidate?.projects ?? []
+        : candidate?.gitSnapshot?.projects ?? [];
+      if (frozenProjects.length > 0) {
+        if (workspace.entries.length !== frozenProjects.length) {
+          throw new StorageRecordError(
+            `${label} ReviewRound Project scope does not match its frozen candidate: ${taskId}/${round.id}.`
+          );
+        }
+        for (const frozen of frozenProjects) {
           const reviewEntry = workspace.entries.find(({ projectId }) => (
             projectId === frozen.projectId
           ));
@@ -2699,6 +2734,25 @@ function assertWorkItemCandidateReferences(
         || candidate.workspace.owner.workItemId !== item.id)) {
       throw new StorageRecordError(`${label} must use the WorkItem-owned Develop workspace.`);
     }
+    if (candidate.taskMainSnapshot !== undefined) {
+      const expectedProjects = [...item.writeProjectIds].sort();
+      const actualProjects = candidate.taskMainSnapshot.projects
+        .map(({ projectId }) => projectId)
+        .sort();
+      if (!isDeepStrictEqual(actualProjects, expectedProjects)) {
+        throw new StorageRecordError(`${label} Task-main snapshot scope is stale.`);
+      }
+      for (const project of candidate.taskMainSnapshot.projects) {
+        const binding = aggregate.task.projectBindings.find(
+          ({ projectId }) => projectId === project.projectId
+        );
+        if (binding === undefined || binding.directory !== project.directory) {
+          throw new StorageRecordError(
+            `${label} Task-main snapshot Project is not bound: ${project.projectId}.`
+          );
+        }
+      }
+    }
     return;
   }
   const run = aggregate.agentRuns[candidate.source.runId];
@@ -2767,6 +2821,12 @@ function validReviewRoundTransition(
     || existing.candidateId !== candidate.candidateId
     || existing.reviewerRoleName !== candidate.reviewerRoleName
     || existing.reviewBaseCommit !== candidate.reviewBaseCommit
+    || (existing.scope ?? "work-item") !== (candidate.scope ?? "work-item")
+    || !isDeepStrictEqual(existing.taskCandidate, candidate.taskCandidate)
+    || !sameTaskFinalReviewContract(
+      existing.taskFinalReviewContract,
+      candidate.taskFinalReviewContract
+    )
     || existing.requestedBy !== candidate.requestedBy
     || existing.createdAt !== candidate.createdAt
   ) return false;

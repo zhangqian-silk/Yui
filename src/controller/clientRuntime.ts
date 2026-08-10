@@ -21,7 +21,9 @@ import type { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
 import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
 import type { MailboxTarget } from "../coordination/workMailbox.js";
 import { hasRuntimeLifecycleWork } from "../runtime/lifecycleReservation.js";
-import { YUI_VERSION } from "../version.js";
+import { assertControllerStatusIdentity } from "../runtime/exactControlPlane.js";
+import { EPHEMERAL_DOMAIN_ENVIRONMENT_NAMES } from "./domainIdentity.js";
+import { YUI_VERSION, yuiVersionIdentity } from "../version.js";
 
 const STARTUP_TIMEOUT_MS = 5_000;
 // A lifecycle RPC may legitimately occupy the Controller for 30 seconds.
@@ -33,7 +35,8 @@ const ENVIRONMENT_REFRESH_TIMEOUT_MS = 500;
 const CONFIGURATION_REFRESH_TIMEOUT_MS = 500;
 const CONTROLLER_OPERATIONAL_ENVIRONMENT = [
   ...AGENT_OPERATIONAL_ENVIRONMENT_NAMES,
-  "YUI_TMUX_BIN"
+  "YUI_TMUX_BIN",
+  ...EPHEMERAL_DOMAIN_ENVIRONMENT_NAMES
 ] as const;
 
 export type FileControllerClientOptions = Readonly<{
@@ -219,6 +222,14 @@ function assertCompatibleControllerStatus(
       }). `
         + "Run `yui controller restart` before writing new task records."
     );
+  }
+  // Ordinary callers must authenticate the complete control-plane identity.
+  // An update/upgrade restore instead targets a previously captured Controller
+  // binary, which may predate the current storage-layout status fields; that
+  // path authenticates its executable, argv, and version immediately after
+  // readiness in ensureFileTaskControllerIdentity.
+  if (expectedVersion === undefined) {
+    assertControllerStatusIdentity(status, yuiVersionIdentity());
   }
 }
 

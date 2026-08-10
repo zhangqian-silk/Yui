@@ -26,6 +26,25 @@ export type RuntimeResourceState =
   | "dead";
 export type CleanupDisposition = "safe" | "review" | "protected" | "report-only";
 
+export type RuntimeDomainKind = "ephemeral-test" | "unmarked" | "invalid";
+export type RuntimeDomainLiveness = "active" | "expired" | "unknown";
+
+export type RuntimeDomainFact = Readonly<{
+  kind: RuntimeDomainKind;
+  liveness: RuntimeDomainLiveness;
+  disposition: CleanupDisposition;
+  reasonCode: string;
+  fingerprint: string;
+  hostPid?: number;
+  hostProcessStartIdentity?: string;
+  token?: string;
+  tmuxServer?: string;
+  tmuxTargets: readonly string[];
+  createdAt?: string;
+  ageMs: number;
+  graceMs: number;
+}>;
+
 export type RuntimeProcessFact = Readonly<{
   pid: number;
   ppid: number;
@@ -67,7 +86,7 @@ export type RuntimeRoleFact = Readonly<{
 }>;
 
 export type RuntimeArtifactFact = Readonly<{
-  artifactKind: "controller-discovery" | "controller-socket" | "tmux-socket";
+  artifactKind: "controller-discovery" | "controller-socket" | "tmux-socket" | "domain-identity";
   path: string;
   active: boolean;
   fingerprint: string;
@@ -96,6 +115,7 @@ export type RuntimeHomeFact = Readonly<{
   panes: readonly RuntimePaneFact[];
   roles: readonly RuntimeRoleFact[];
   artifacts: readonly RuntimeArtifactFact[];
+  domain?: RuntimeDomainFact;
 }>;
 
 export type RuntimeOwner =
@@ -139,7 +159,10 @@ export type RuntimeResource = Readonly<{
   ioWriteBytes?: number;
   ageMs: number;
   target?: string;
+  paneDead?: boolean;
+  paneCommand?: string;
   artifact?: RuntimeArtifactFact;
+  domain?: RuntimeDomainFact;
 }>;
 
 /** Exact identity carried by one bounded Role resource sample. */
@@ -249,6 +272,18 @@ export type RuntimeDomainSummary = Readonly<{
   liveProcessCount: number;
   rssBytes: number;
   issueCount: number;
+  domainKind?: RuntimeDomainKind;
+  liveness?: RuntimeDomainLiveness;
+  disposition?: CleanupDisposition;
+  reasonCode?: string;
+  fingerprint?: string;
+  hostPid?: number;
+  hostProcessStartIdentity?: string;
+  token?: string;
+  tmuxServer?: string;
+  tmuxTargets?: readonly string[];
+  graceMs?: number;
+  ageMs?: number;
 }>;
 
 export type ControllerResourceInventory = Readonly<{
@@ -317,7 +352,8 @@ export function buildControllerResourceInventory(
               : "orphan-controller",
         yuiHome,
         owner: { kind: "controller-domain", yuiHome },
-        processes: [process]
+        processes: [process],
+        domain: homeFact.domain
       }));
     }
 
@@ -340,7 +376,10 @@ export function buildControllerResourceInventory(
         yuiHome,
         owner: role === undefined ? { kind: "none" } : roleOwner(role),
         processes: paneProcesses,
-        target: pane.target
+        target: pane.target,
+        paneDead: pane.dead,
+        paneCommand: pane.currentCommand,
+        domain: homeFact.domain
       }));
     }
 
@@ -372,7 +411,8 @@ export function buildControllerResourceInventory(
         owner: ownedTmuxServer
           ? { kind: "controller-domain", yuiHome }
           : { kind: "none" },
-        processes: [process]
+        processes: [process],
+        domain: homeFact.domain
       }));
     }
 
@@ -387,7 +427,7 @@ export function buildControllerResourceInventory(
           artifact.path !== discoveryArtifact.path
         ))];
     for (const artifact of artifacts) {
-      resources.push(artifactResource(artifact, yuiHome));
+      resources.push(artifactResource(artifact, yuiHome, homeFact.domain));
     }
   }
 
@@ -406,6 +446,23 @@ export function buildControllerResourceInventory(
       liveProcessCount: uniqueProcesses(owned).length,
       rssBytes: sum(uniqueProcesses(owned).map(({ rssBytes }) => rssBytes)),
       issueCount: owned.filter(({ disposition }) => disposition !== "protected").length
+        + (home.domain !== undefined && home.domain.disposition !== "protected" ? 1 : 0),
+      ...(home.domain === undefined ? {} : {
+        domainKind: home.domain.kind,
+        liveness: home.domain.liveness,
+        disposition: home.domain.disposition,
+        reasonCode: home.domain.reasonCode,
+        fingerprint: home.domain.fingerprint,
+        ...(home.domain.hostPid === undefined ? {} : { hostPid: home.domain.hostPid }),
+        ...(home.domain.hostProcessStartIdentity === undefined
+          ? {}
+          : { hostProcessStartIdentity: home.domain.hostProcessStartIdentity }),
+        ...(home.domain.token === undefined ? {} : { token: home.domain.token }),
+        ...(home.domain.tmuxServer === undefined ? {} : { tmuxServer: home.domain.tmuxServer }),
+        tmuxTargets: home.domain.tmuxTargets,
+        ...(home.domain.graceMs === 0 ? {} : { graceMs: home.domain.graceMs }),
+        ageMs: home.domain.ageMs
+      })
     };
   }).sort((left, right) => left.yuiHome.localeCompare(right.yuiHome));
   const allProcesses = uniqueProcesses(ordered);
@@ -522,16 +579,33 @@ function processResource(input: Readonly<{
   owner: RuntimeOwner;
   processes: readonly RuntimeProcessFact[];
   target?: string;
+  paneDead?: boolean;
+  paneCommand?: string;
+  domain?: RuntimeDomainFact;
 }>): RuntimeResource {
   const processes = input.processes.map(publicProcess);
   const identity = processes.map(({ pid, startIdentity }) => `${pid}:${startIdentity}`).sort().join(",");
+  const disposition = domainDisposition(
+    input.disposition,
+    input.reasonCode,
+    input.domain,
+    input.target
+  );
+  const fingerprint = [
+    input.kind,
+    identity,
+    input.target ?? "",
+    input.paneDead === undefined ? "" : String(input.paneDead),
+    input.paneCommand ?? "",
+    input.domain?.fingerprint ?? ""
+  ].join(":");
   return {
     id: `${input.kind}:${input.yuiHome}:${input.target ?? (identity || input.reasonCode)}`,
-    fingerprint: `${input.kind}:${identity}:${input.target ?? ""}`,
+    fingerprint,
     kind: input.kind,
     state: input.state,
-    disposition: input.disposition,
-    reasonCode: input.reasonCode,
+    disposition,
+    reasonCode: domainReason(input.reasonCode, input.domain, disposition, input.target),
     yuiHome: input.yuiHome,
     owner: input.owner,
     processes,
@@ -540,22 +614,34 @@ function processResource(input: Readonly<{
     ...optionalCounterFields(processes, "ioReadBytes"),
     ...optionalCounterFields(processes, "ioWriteBytes"),
     ageMs: max(processes.map(({ ageMs }) => ageMs)),
-    ...(input.target === undefined ? {} : { target: input.target })
+    ...(input.target === undefined ? {} : { target: input.target }),
+    ...(input.paneDead === undefined ? {} : { paneDead: input.paneDead }),
+    ...(input.paneCommand === undefined ? {} : { paneCommand: input.paneCommand }),
+    ...(input.domain === undefined ? {} : { domain: input.domain })
   };
 }
 
 function artifactResource(
   artifact: RuntimeArtifactFact,
-  yuiHome?: string
+  yuiHome?: string,
+  domain?: RuntimeDomainFact
 ): RuntimeResource {
   const stale = !artifact.active;
+  const baseDisposition: CleanupDisposition = stale ? "safe" : "report-only";
+  const disposition = domainDisposition(baseDisposition, undefined, domain);
   return {
     id: `artifact:${artifact.path}`,
-    fingerprint: artifact.fingerprint,
+    fingerprint: domain === undefined
+      ? artifact.fingerprint
+      : `${artifact.fingerprint}:${domain.fingerprint}`,
     kind: "artifact",
     state: stale ? "stale" : "unattributed",
-    disposition: stale ? "safe" : "report-only",
-    reasonCode: stale ? `stale-${artifact.artifactKind}` : `active-unmapped-${artifact.artifactKind}`,
+    disposition,
+    reasonCode: domainReason(
+      stale ? `stale-${artifact.artifactKind}` : `active-unmapped-${artifact.artifactKind}`,
+      domain,
+      disposition
+    ),
     ...(yuiHome === undefined ? {} : { yuiHome }),
     owner: yuiHome === undefined
       ? { kind: "none" }
@@ -564,8 +650,61 @@ function artifactResource(
     rssBytes: 0,
     cpuTimeMs: 0,
     ageMs: 0,
-    artifact
+    artifact,
+    ...(domain === undefined ? {} : { domain })
   };
+}
+
+function domainDisposition(
+  base: CleanupDisposition,
+  _reason: string | undefined,
+  domain: RuntimeDomainFact | undefined,
+  target?: string
+): CleanupDisposition {
+  if (domain === undefined) return base;
+  if (domain.disposition === "safe") {
+    // Once the exact host identity has expired past grace, every resource
+    // attributed to that marked domain inherits the same ownership fence. A
+    // live orphan pane/server is therefore safe too; active Task/Role work is
+    // rejected earlier by inspectRuntimeDomain and never receives a safe
+    // domain fact. The scanner's own current process is excluded from the
+    // process inventory, while a manually supplied current-controller fact is
+    // safe to reap by the same exact identity fence.
+    if (domain.liveness === "expired") {
+      if (
+        target !== undefined
+        && !domain.tmuxTargets.includes(target)
+      ) return "review";
+      // A tmux server with panes is protected until the pane resources have
+      // been removed and a later bounded pass can revalidate the empty
+      // server. This avoids killing a server while a target race is in flight.
+      if (base === "protected" && _reason === "owned-tmux-server") return "protected";
+      // `report-only` is deliberately reserved for an unrecognized process;
+      // the YUI_HOME environment alone is not a cleanup ownership proof.
+      return base === "report-only" ? "report-only" : "safe";
+    }
+    return base;
+  }
+  if (domain.liveness === "active") return "protected";
+  if (base === "protected") return "protected";
+  return "review";
+}
+
+function domainReason(
+  base: string,
+  domain: RuntimeDomainFact | undefined,
+  disposition: CleanupDisposition,
+  target?: string
+): string {
+  if (
+    domain?.disposition === "safe"
+    && domain.liveness === "expired"
+    && target !== undefined
+    && !domain.tmuxTargets.includes(target)
+  ) return `ephemeral-tmux-target-unmatched:${base}`;
+  if (domain === undefined || domain.disposition === "safe") return base;
+  if (disposition === "protected") return `${domain.reasonCode}:${base}`;
+  return `${domain.reasonCode}:${base}`;
 }
 
 function publicProcess(process: RuntimeProcessFact): RuntimeProcessInfo {

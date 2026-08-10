@@ -9,7 +9,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
-import { activeRoleAgentSession } from "../executor/agentExecutor.js";
+import { activeLiveRoleAgentSession } from "../executor/agentExecutor.js";
 import { inspectStorageSchema } from "../storage/storageSchema.js";
 import { FileTaskStore } from "../storage/taskStore.js";
 import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
@@ -34,6 +34,13 @@ import {
   type RuntimeProcessKind,
   type RuntimeRoleFact
 } from "./resourceInventory.js";
+import {
+  CONTROLLER_DOMAIN_PATH,
+  EPHEMERAL_DOMAIN_GRACE_MS,
+  ephemeralDomainFingerprint,
+  readEphemeralDomainIdentity,
+  readLinuxProcessStartIdentity
+} from "./domainIdentity.js";
 
 export type ControllerInventoryScanOptions = Readonly<{
   currentHome: string;
@@ -61,6 +68,7 @@ export async function scanControllerResourceInventory(
 ): Promise<ControllerResourceInventory> {
   const currentHome = resolve(options.currentHome);
   const environment = options.environment ?? process.env;
+  const observedAt = (options.now ?? (() => new Date()))();
   const warnings: string[] = [];
   const activeSockets = readActiveUnixSocketPaths(warnings);
   const processes = listLinuxProcesses(warnings)
@@ -84,6 +92,13 @@ export async function scanControllerResourceInventory(
   for (const home of [...homes].sort()) {
     const matchingProcesses = processes.filter(({ yuiHome }) => yuiHome === home);
     const state = loadHomeState(home, warnings);
+    const domain = inspectRuntimeDomain(
+      home,
+      matchingProcesses,
+      state.roles,
+      state.storageStatus,
+      observedAt
+    );
     const tmuxSocketPath = join(tmpdir(), `tmux-${uid}`, yuiTmuxServerName(home));
     const tmuxArtifact = rawTmuxArtifacts.find(({ path }) => path === tmuxSocketPath);
     if (tmuxArtifact !== undefined) associatedArtifacts.add(tmuxArtifact.path);
@@ -108,13 +123,37 @@ export async function scanControllerResourceInventory(
     if (discovery.status === "invalid" && discovery.artifact !== undefined) {
       associatedArtifacts.add(discovery.artifact.path);
     }
-    if (tmuxArtifact !== undefined && !tmuxArtifact.active) artifacts.push(tmuxArtifact);
+    // Keep active sockets visible as report-only resources too. An expired
+    // domain must not self-close while its tmux namespace is still active;
+    // the next bounded pass can reclassify the exact socket after the pane and
+    // server converge.
+    if (tmuxArtifact !== undefined) artifacts.push(tmuxArtifact);
+
+    const domainPath = join(home, CONTROLLER_DOMAIN_PATH);
+    const domainIdentity = readEphemeralDomainIdentity(home);
+    if (domainIdentity.status !== "absent" && existsSync(domainPath)) {
+      artifacts.push(fileArtifact(
+        domainPath,
+        "domain-identity",
+        domain?.liveness === "active"
+      ));
+    }
 
     const validDiscoveryProcess = discovery.status === "valid"
-      && matchingProcesses.some((candidate) => (
-        candidate.pid === discovery.pid
-        && candidate.startIdentity === discovery.processStartIdentity
-      ));
+      && (
+        matchingProcesses.some((candidate) => (
+          candidate.pid === discovery.pid
+          && candidate.startIdentity === discovery.processStartIdentity
+        ))
+        // The scanner omits its own process from signalable resources. A
+        // Controller nevertheless must recognize its exact discovery fence;
+        // otherwise its own expired-domain pass would delete controller.json
+        // and strand the still-running server without a callable endpoint.
+        || (
+          discovery.pid === process.pid
+          && readLinuxProcessStartIdentity(process.pid) === discovery.processStartIdentity
+        )
+      );
     const discoveryPath = join(home, CONTROLLER_DISCOVERY_PATH);
     const expectedControllerSocketPath = controllerSocketPath(home);
     if (
@@ -139,7 +178,8 @@ export async function scanControllerResourceInventory(
       discovery,
       panes,
       roles: state.roles,
-      artifacts
+      artifacts,
+      ...(domain === undefined ? {} : { domain })
     });
   }
 
@@ -150,7 +190,7 @@ export async function scanControllerResourceInventory(
     : [];
   return buildControllerResourceInventory({
     schemaVersion: 1,
-    observedAt: (options.now ?? (() => new Date()))().toISOString(),
+    observedAt: observedAt.toISOString(),
     currentHome,
     scope: options.scope,
     processes: options.scope === "all"
@@ -408,6 +448,186 @@ async function inspectDiscovery(
   }
 }
 
+function inspectRuntimeDomain(
+  home: string,
+  processes: readonly RuntimeProcessFact[],
+  roles: readonly RuntimeRoleFact[],
+  storageStatus: RuntimeHomeFact["storageStatus"],
+  now: Date
+): RuntimeHomeFact["domain"] {
+  const stored = readEphemeralDomainIdentity(home);
+  if (stored.status === "absent") {
+    // A current, ordinary YUI_HOME is a real control domain, not a disposable
+    // test domain. Keep it visible even when it is currently idle so a stale
+    // artifact cannot acquire ephemeral cleanup authority by omission. An
+    // uninitialized temporary directory with no runtime facts remains absent
+    // to preserve the legacy empty-home inventory behavior.
+    if (
+      storageStatus !== "current"
+      && processes.length === 0
+      && roles.length === 0
+    ) return undefined;
+    return {
+      kind: "unmarked",
+      liveness: "unknown",
+      disposition: "review",
+      reasonCode: "unmarked-domain",
+      fingerprint: `unmarked:${home}`,
+      tmuxTargets: [],
+      ageMs: 0,
+      graceMs: EPHEMERAL_DOMAIN_GRACE_MS
+    };
+  }
+  if (stored.status === "invalid" || stored.identity === undefined) {
+    return {
+      kind: "invalid",
+      liveness: "unknown",
+      disposition: "review",
+      reasonCode: "invalid-domain-identity",
+      fingerprint: `invalid:${stored.fingerprint ?? home}`,
+      tmuxTargets: [],
+      ageMs: 0,
+      graceMs: EPHEMERAL_DOMAIN_GRACE_MS
+    };
+  }
+
+  const identity = stored.identity;
+  const ageMs = Math.max(0, now.getTime() - Date.parse(identity.createdAt));
+  if (identity.tmuxServer !== yuiTmuxServerName(home)) {
+    return {
+      kind: "invalid",
+      liveness: "unknown",
+      disposition: "review",
+      reasonCode: "invalid-domain-tmux-server",
+      fingerprint: ephemeralDomainFingerprint(identity, stored.fingerprint),
+      hostPid: identity.hostPid,
+      hostProcessStartIdentity: identity.hostProcessStartIdentity,
+      token: identity.token,
+      tmuxServer: identity.tmuxServer,
+      tmuxTargets: identity.tmuxTargets,
+      createdAt: identity.createdAt,
+      ageMs,
+      graceMs: EPHEMERAL_DOMAIN_GRACE_MS
+    };
+  }
+  const hostStartIdentity = readLinuxProcessStartIdentity(identity.hostPid);
+  const hostPathExists = existsSync(`/proc/${identity.hostPid}`);
+  const hostActive = hostStartIdentity === identity.hostProcessStartIdentity;
+  const storageSafe = storageStatus === "current";
+  if (hostActive) {
+    return {
+      kind: "ephemeral-test",
+      liveness: "active",
+      disposition: "protected",
+      reasonCode: "ephemeral-host-active",
+      fingerprint: ephemeralDomainFingerprint(identity, stored.fingerprint),
+      hostPid: identity.hostPid,
+      hostProcessStartIdentity: identity.hostProcessStartIdentity,
+      token: identity.token,
+      tmuxServer: identity.tmuxServer,
+      tmuxTargets: identity.tmuxTargets,
+      createdAt: identity.createdAt,
+      ageMs,
+      graceMs: EPHEMERAL_DOMAIN_GRACE_MS
+    };
+  }
+
+  const activeRole = roles.some((role) => (
+    (role.ownerKind === "task-role" && role.taskStatus === "active")
+    // Global Roles have no Task status. Only a live native Session is a
+    // durable liveness fact for that scope; stopped/broken history must not
+    // protect an expired disposable domain merely because it has an ID.
+    || (role.ownerKind === "global-role" && role.nativeSessionId !== undefined)
+  ));
+  if (!storageSafe) {
+    return {
+      kind: "ephemeral-test",
+      liveness: hostActive ? "active" : "expired",
+      disposition: "review",
+      reasonCode: `ephemeral-storage-${storageStatus}`,
+      fingerprint: ephemeralDomainFingerprint(identity, stored.fingerprint),
+      hostPid: identity.hostPid,
+      hostProcessStartIdentity: identity.hostProcessStartIdentity,
+      token: identity.token,
+      tmuxServer: identity.tmuxServer,
+      tmuxTargets: identity.tmuxTargets,
+      createdAt: identity.createdAt,
+      ageMs,
+      graceMs: EPHEMERAL_DOMAIN_GRACE_MS
+    };
+  }
+  if (activeRole) {
+    return {
+      kind: "ephemeral-test",
+      liveness: "expired",
+      disposition: "protected",
+      reasonCode: "ephemeral-active-task-role",
+      fingerprint: ephemeralDomainFingerprint(identity, stored.fingerprint),
+      hostPid: identity.hostPid,
+      hostProcessStartIdentity: identity.hostProcessStartIdentity,
+      token: identity.token,
+      tmuxServer: identity.tmuxServer,
+      tmuxTargets: identity.tmuxTargets,
+      createdAt: identity.createdAt,
+      ageMs,
+      graceMs: EPHEMERAL_DOMAIN_GRACE_MS
+    };
+  }
+  if (hostStartIdentity === undefined && hostPathExists) {
+    return {
+      kind: "ephemeral-test",
+      liveness: "expired",
+      disposition: "review",
+      reasonCode: "ephemeral-host-identity-unavailable",
+      fingerprint: ephemeralDomainFingerprint(identity, stored.fingerprint),
+      hostPid: identity.hostPid,
+      hostProcessStartIdentity: identity.hostProcessStartIdentity,
+      token: identity.token,
+      tmuxServer: identity.tmuxServer,
+      tmuxTargets: identity.tmuxTargets,
+      createdAt: identity.createdAt,
+      ageMs,
+      graceMs: EPHEMERAL_DOMAIN_GRACE_MS
+    };
+  }
+  if (ageMs < EPHEMERAL_DOMAIN_GRACE_MS) {
+    return {
+      kind: "ephemeral-test",
+      liveness: "expired",
+      disposition: "review",
+      reasonCode: hostStartIdentity === undefined
+        ? "ephemeral-host-identity-unavailable"
+        : "ephemeral-host-grace",
+      fingerprint: ephemeralDomainFingerprint(identity, stored.fingerprint),
+      hostPid: identity.hostPid,
+      hostProcessStartIdentity: identity.hostProcessStartIdentity,
+      token: identity.token,
+      tmuxServer: identity.tmuxServer,
+      tmuxTargets: identity.tmuxTargets,
+      createdAt: identity.createdAt,
+      ageMs,
+      graceMs: EPHEMERAL_DOMAIN_GRACE_MS
+    };
+  }
+  return {
+    kind: "ephemeral-test",
+    liveness: "expired",
+    disposition: "safe",
+    reasonCode: hostStartIdentity === undefined
+      ? "ephemeral-host-dead"
+      : "ephemeral-host-identity-mismatch",
+    fingerprint: ephemeralDomainFingerprint(identity, stored.fingerprint),
+    hostPid: identity.hostPid,
+    hostProcessStartIdentity: identity.hostProcessStartIdentity,
+    token: identity.token,
+    tmuxServer: identity.tmuxServer,
+    tmuxTargets: identity.tmuxTargets,
+    createdAt: identity.createdAt,
+    ageMs,
+    graceMs: EPHEMERAL_DOMAIN_GRACE_MS
+  };
+}
+
 function loadHomeState(
   home: string,
   warnings: string[]
@@ -425,7 +645,7 @@ function loadHomeState(
   try {
     const store = new FileTaskStore(home);
     const roles: RuntimeRoleFact[] = store.listGlobalRoles().map((role) => {
-      const session = activeRoleAgentSession(store.getGlobalRoleSessionSet(role.name));
+      const session = activeLiveRoleAgentSession(store.getGlobalRoleSessionSet(role.name));
       const binding = role.agentBindings[role.activeAgentId];
       const agentId = session?.effective.agentId ?? role.activeAgentId;
       const adapterId = session?.effective.adapterId ?? binding?.adapterId;
@@ -440,7 +660,7 @@ function loadHomeState(
     });
     for (const task of store.listTasks()) {
       for (const role of store.listRoles(task.id)) {
-        const session = activeRoleAgentSession(store.getRoleSessionSet(task.id, role.name));
+        const session = activeLiveRoleAgentSession(store.getRoleSessionSet(task.id, role.name));
         const binding = role.agentBindings[role.activeAgentId];
         const run = store.getActiveAgentRun(task.id, role.name);
         const agentId = session?.effective.agentId ?? role.activeAgentId;

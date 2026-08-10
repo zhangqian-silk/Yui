@@ -14,6 +14,14 @@ import {
   cleanControllerResource
 } from "../../dist/controller/resourceCleanupLinux.js";
 import {
+  createEphemeralDomainIdentity,
+  defaultEphemeralTmuxServer,
+  ephemeralDomainFingerprint,
+  readEphemeralDomainIdentity,
+  recordEphemeralTmuxTarget,
+  writeEphemeralDomainIdentity
+} from "../../dist/controller/domainIdentity.js";
+import {
   scanControllerResourceInventory
 } from "../../dist/controller/resourceInventoryLinux.js";
 import { controllerSocketPath } from "../../dist/core/controllerEndpoint.js";
@@ -119,9 +127,141 @@ test("tmux server cleanup refuses to signal while Role panes remain", async () =
   assert.deepEqual(signals, []);
 });
 
+test("ephemeral cleanup defers without signaling when a target writer wins the final epoch", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-domain-cleanup-race-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const initial = createEphemeralDomainIdentity({
+    tmuxServer: defaultEphemeralTmuxServer(home),
+    tmuxTargets: ["yui-test:server"],
+    hostPid: 99999999,
+    hostProcessStartIdentity: "123"
+  });
+  writeEphemeralDomainIdentity(home, initial);
+  const before = readEphemeralDomainIdentity(home);
+  assert.equal(before.status, "valid");
+  const domain = {
+    kind: "ephemeral-test",
+    liveness: "expired",
+    disposition: "safe",
+    reasonCode: "ephemeral-host-dead",
+    fingerprint: ephemeralDomainFingerprint(initial, before.fingerprint),
+    token: initial.token,
+    tmuxTargets: initial.tmuxTargets,
+    ageMs: 10_000,
+    graceMs: 1_000
+  };
+  const resource = processResource({
+    id: `tmux-server:${home}:100:1000`,
+    yuiHome: home,
+    kind: "tmux-server",
+    state: "orphaned",
+    reasonCode: "orphan-tmux-server",
+    domain
+  });
+  const signals = [];
+  await assert.rejects(
+    cleanControllerResource(resource, {
+      ports: {
+        processStartIdentity: () => "1000",
+        signal: (pid, signal) => signals.push([pid, signal]),
+        sleep: async () => {},
+        artifactFingerprint: () => undefined,
+        socketActive: () => false,
+        removeArtifact() {},
+        killPane: async () => {},
+        inspectTmuxServerPanes: async () => {
+          throw new Error("inspection should be deferred after the writer wins");
+        },
+        beforeDomainCleanupEpoch: () => {
+          assert.equal(
+            recordEphemeralTmuxTarget(home, initial.token, "yui-test:new"),
+            true
+          );
+        }
+      }
+    }),
+    /changed since scan/
+  );
+  assert.deepEqual(signals, []);
+  const after = readEphemeralDomainIdentity(home);
+  assert.equal(after.status, "valid");
+  assert.deepEqual(after.identity.tmuxTargets, ["yui-test:new", "yui-test:server"]);
+});
+
+test("ephemeral cleanup holds the identity fence through final inspection and signaling", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-domain-cleanup-lock-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const initial = createEphemeralDomainIdentity({
+    tmuxServer: defaultEphemeralTmuxServer(home),
+    tmuxTargets: ["yui-test:server"],
+    hostPid: 99999999,
+    hostProcessStartIdentity: "123"
+  });
+  writeEphemeralDomainIdentity(home, initial);
+  const before = readEphemeralDomainIdentity(home);
+  assert.equal(before.status, "valid");
+  const domain = {
+    kind: "ephemeral-test",
+    liveness: "expired",
+    disposition: "safe",
+    reasonCode: "ephemeral-host-dead",
+    fingerprint: ephemeralDomainFingerprint(initial, before.fingerprint),
+    token: initial.token,
+    tmuxTargets: initial.tmuxTargets,
+    ageMs: 10_000,
+    graceMs: 1_000
+  };
+  const resource = processResource({
+    id: `tmux-server:${home}:100:1000`,
+    yuiHome: home,
+    kind: "tmux-server",
+    state: "orphaned",
+    reasonCode: "orphan-tmux-server",
+    domain
+  });
+  const identities = new Map([[100, "1000"]]);
+  const signals = [];
+  let inspectCalls = 0;
+  let writerResult;
+  await cleanControllerResource(resource, {
+    termGraceMs: 1,
+    killGraceMs: 1,
+    pollMs: 1,
+    ports: {
+      processStartIdentity: (pid) => identities.get(pid),
+      signal(pid, signal) {
+        signals.push([pid, signal]);
+        if (signal === "SIGKILL") identities.delete(pid);
+      },
+      sleep: async () => {},
+      artifactFingerprint: () => undefined,
+      socketActive: () => false,
+      removeArtifact() {},
+      killPane: async () => {},
+      inspectTmuxServerPanes: async () => {
+        inspectCalls += 1;
+        if (inspectCalls === 2) {
+          writerResult = recordEphemeralTmuxTarget(
+            home,
+            initial.token,
+            "yui-test:blocked"
+          );
+        }
+        return [];
+      }
+    }
+  });
+  assert.equal(writerResult, false);
+  assert.deepEqual(signals, [
+    [100, "SIGTERM"],
+    [100, "SIGKILL"]
+  ]);
+  assert.equal(readEphemeralDomainIdentity(home).status, "valid");
+});
+
 test("artifact cleanup revalidates fingerprint and socket liveness", async () => {
   const uid = typeof process.getuid === "function" ? process.getuid() : 0;
-  const path = `/tmp/tmux-${uid}/yui-0123456789abcdef01234567`;
+  const path = join(tmpdir(), `tmux-${uid}`, "yui-0123456789abcdef01234567");
   const artifact = processResource({
     id: `artifact:${path}`,
     fingerprint: "before",

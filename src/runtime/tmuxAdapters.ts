@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 
-import { createRuntimeBinding, type RuntimeBinding } from "./runtimeBinding.js";
+import {
+  createRuntimeBinding,
+  type RuntimeBinding
+} from "./runtimeBinding.js";
 import {
   normalizeRuntimeOwner,
   type RuntimeOwner
@@ -19,6 +22,7 @@ import type {
 } from "./ports.js";
 import { requireSafeIdentity } from "./validation.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
+import type { TaskRuntimeIsolationDescriptor } from "./taskRuntimeIsolation.js";
 
 export type RuntimeTmuxRole = Readonly<{
   name: string;
@@ -36,7 +40,6 @@ export type RuntimePlannedSession = Readonly<{
   role: RuntimeTmuxRole;
   launch: RuntimeTmuxLaunchPlan;
   session: Readonly<{ nativeSessionId?: string }> | null;
-  initialPromptRunId?: string;
 }>;
 
 /** Narrow structural boundary implemented by FileRoleLaunchPlanner. */
@@ -51,6 +54,7 @@ export interface RuntimeRoleLaunchPlannerPort {
     runId?: string;
     nativeSessionId?: string;
     launchId?: string;
+    runtimeIsolation?: TaskRuntimeIsolationDescriptor;
     environment?: Readonly<Record<string, string>>;
   }>): RuntimePlannedSession;
   planGlobalRole(input: Readonly<{
@@ -319,6 +323,9 @@ export class TmuxSessionHost implements SessionHostPort {
       launchId: request.launchId,
       mode: request.mode,
       ...(request.runId === undefined ? {} : { runId: request.runId }),
+      ...(request.runtimeIsolation === undefined
+        ? {}
+        : { runtimeIsolation: request.runtimeIsolation }),
       ...(request.environment === undefined
         ? {}
         : { environment: request.environment }),
@@ -362,9 +369,6 @@ export class TmuxSessionHost implements SessionHostPort {
         roleName: request.owner.roleName
       }),
       hostCreated,
-      ...(hostCreated && planned.initialPromptRunId !== undefined
-        ? { initialPromptRunId: planned.initialPromptRunId }
-        : {}),
       ...(nativeSessionId === undefined ? {} : { nativeSessionId })
     });
   }

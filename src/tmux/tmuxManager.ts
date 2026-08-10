@@ -59,6 +59,8 @@ export type TmuxReadinessProbe = (pane: TmuxPaneState) => boolean;
 
 export type TmuxManagerOptions = Readonly<{
   yuiHome?: string;
+  /** Records exact Yui Role pane targets for an explicitly fenced domain. */
+  onRoleTargetRecorded?: (target: string) => void;
   terminalInput?: TerminalInput;
   terminalType?: string;
   closeInteractiveInput?: () => void;
@@ -100,6 +102,7 @@ export class TmuxReadinessProbeRequiredError extends Error {
 export class TmuxManager {
   readonly #yuiHome: string;
   readonly #serverName: string;
+  readonly #onRoleTargetRecorded: ((target: string) => void) | undefined;
   readonly #terminalInput: TerminalInput;
   readonly #terminalType: string;
   readonly #closeInteractiveInput: () => void;
@@ -122,6 +125,7 @@ export class TmuxManager {
       : yuiHomeOrOptions;
     this.#yuiHome = options.yuiHome ?? process.env.YUI_HOME ?? process.cwd();
     this.#serverName = yuiTmuxServerName(this.#yuiHome);
+    this.#onRoleTargetRecorded = options.onRoleTargetRecorded;
     this.#terminalInput = options.terminalInput ?? process.stdin as Readable & TerminalInput;
     this.#terminalType = usableInteractiveTerminal(options.terminalType ?? process.env.TERM);
     this.#closeInteractiveInput = options.closeInteractiveInput ?? (() => {});
@@ -162,6 +166,7 @@ export class TmuxManager {
     launch?: TmuxLaunchPlan
   ): boolean {
     if (this.windowNames(taskId).includes(role.name)) {
+      this.recordRoleTarget(taskId, role.name);
       this.configureServerHistory();
       return false;
     }
@@ -169,6 +174,10 @@ export class TmuxManager {
       throw runtimeError(`Agent launch plan is required to create Role window: ${role.name}.`);
     }
 
+    // Persist the exact target before any tmux mutation. If the recorder
+    // cannot prove the current ephemeral identity/token, do not create a
+    // pane that a later reaper could not fence.
+    this.recordRoleTarget(taskId, role.name);
     if (!this.hasSession(taskId)) {
       this.run([
         "start-server",
@@ -205,12 +214,16 @@ export class TmuxManager {
   ): Promise<boolean> {
     const snapshot = await this.sessionWindowNamesAsync(taskId);
     if (snapshot.names.includes(role.name)) {
+      this.recordRoleTarget(taskId, role.name);
       await this.configureServerHistoryAsync();
       return false;
     }
     if (launch === undefined) {
       throw runtimeError(`Agent launch plan is required to create Role window: ${role.name}.`);
     }
+    // Keep the async launch ordering identical to the sync path: a recorder
+    // failure is a precondition failure, never a post-launch cleanup hint.
+    this.recordRoleTarget(taskId, role.name);
     if (!snapshot.exists) {
       await this.runAsync([
         "start-server",
@@ -845,6 +858,18 @@ export class TmuxManager {
     ]).trim() === "1";
   }
 
+  async hasDeliveryReceiptAsync(
+    taskId: string,
+    roleName: string,
+    receiptId: string
+  ): Promise<boolean> {
+    safeValue(receiptId, "tmux delivery receipt id");
+    const option = deliveryReceiptOption(receiptId);
+    return (await this.runAsync([
+      "show-options", "-wqv", "-t", this.target(taskId, roleName), option
+    ])).trim() === "1";
+  }
+
   detachRole(taskId: string): void {
     this.run(["detach-client", "-s", this.sessionName(taskId)]);
   }
@@ -887,6 +912,7 @@ export class TmuxManager {
     const taskSession = this.sessionName(taskId);
     const sessions = this.taskSessionGroupNames(taskId);
     if (sessions.length === 0 && !this.hasSession(taskId)) return false;
+    this.recordTaskTargets(taskId);
     for (const session of [...sessions.filter((name) => name !== taskSession), taskSession]) {
       try {
         this.run(["kill-session", "-t", session]);
@@ -901,6 +927,7 @@ export class TmuxManager {
     const taskSession = this.sessionName(taskId);
     const sessions = await this.taskSessionGroupNamesAsync(taskId);
     if (sessions.length === 0 && !(await this.hasSessionAsync(taskId))) return false;
+    await this.recordTaskTargetsAsync(taskId);
     for (const session of [...sessions.filter((name) => name !== taskSession), taskSession]) {
       try {
         await this.runAsync(["kill-session", "-t", session]);
@@ -912,20 +939,29 @@ export class TmuxManager {
   }
 
   stopRole(taskId: string, roleName: string): void {
+    this.recordRoleTarget(taskId, roleName);
     this.run(["send-keys", "-t", this.target(taskId, roleName), "C-c"]);
   }
 
   killRole(taskId: string, roleName: string): void {
+    this.recordRoleTarget(taskId, roleName);
     this.run(["kill-window", "-t", this.target(taskId, roleName)]);
   }
 
   async killRoleAsync(taskId: string, roleName: string): Promise<void> {
+    this.recordRoleTarget(taskId, roleName);
     await this.runAsync(["kill-window", "-t", this.target(taskId, roleName)]);
   }
 
   renameRole(taskId: string, oldRoleName: string, newRoleName: string): void {
+    const target = this.target(taskId, oldRoleName);
+    const nextRoleName = safeValue(newRoleName, "Role name");
+    // Retain the new exact fence even if tmux later rejects the rename. The
+    // stale fence is conservative and lets a later bounded retry revalidate
+    // the pane instead of guessing or dropping ownership evidence.
+    this.recordRoleTarget(taskId, newRoleName);
     this.run([
-      "rename-window", "-t", this.target(taskId, oldRoleName), safeValue(newRoleName, "Role name")
+      "rename-window", "-t", target, nextRoleName
     ]);
   }
 
@@ -1024,6 +1060,24 @@ export class TmuxManager {
 
   private target(taskId: string, roleName: string): string {
     return yuiTmuxTarget(this.#yuiHome, taskId, roleName);
+  }
+
+  private recordRoleTarget(taskId: string, roleName: string): void {
+    this.#onRoleTargetRecorded?.(this.target(taskId, roleName));
+  }
+
+  private recordTaskTargets(taskId: string): void {
+    if (this.#onRoleTargetRecorded === undefined) return;
+    for (const pane of this.inspectTaskRolePanes(taskId)) {
+      this.#onRoleTargetRecorded(pane.target);
+    }
+  }
+
+  private async recordTaskTargetsAsync(taskId: string): Promise<void> {
+    if (this.#onRoleTargetRecorded === undefined) return;
+    for (const pane of await this.inspectRolePaneInventoryAsync()) {
+      if (pane.taskId === taskId) this.#onRoleTargetRecorded(pane.target);
+    }
   }
 
   private configureServerHistory(): void {
