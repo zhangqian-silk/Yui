@@ -582,10 +582,12 @@ function ensureManagedClaudeLifecyclePlugin(home: string, cliPath: string): stri
       hooks: {
         // SessionStart proves the session exists (and, for source=startup,
         // pre-input readiness); UserPromptSubmit is the exact provider-accepted
-        // fence; StopFailure is the terminal failure fact. All route to the same
+        // fence; PostToolUse is a provider-native in-turn progress fact and
+        // StopFailure is the terminal failure fact. All route to the same
         // Yui-owned entrypoint, which parses by hook_event_name.
         SessionStart: [{ hooks: [command] }],
         UserPromptSubmit: [{ hooks: [command] }],
+        PostToolUse: [{ hooks: [command] }],
         StopFailure: [{ hooks: [command] }]
       }
     }, null, 2)}\n`

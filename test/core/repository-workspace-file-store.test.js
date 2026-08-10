@@ -62,6 +62,7 @@ import {
 import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
 import { TaskWorkspaceCoordinator } from "../../dist/repository/taskWorkspaceCoordinator.js";
+import { stopFileTaskController } from "../../dist/controller/clientRuntime.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, completeTask, createTask } from "../../dist/task/task.js";
@@ -3816,38 +3817,22 @@ test("public Task archive cleans terminal ReviewRound workspaces before archivin
   const round = store.listReviewRounds(task.id)[0];
   const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
   markDelivered(store, reviewRun);
-  const finished = spawnSync(
-    process.execPath,
-    [cli, "task", "run", "yield", reviewRun.id, "--summary", "Review complete"],
+  // The review result durably queues a Leader wake.  Quiesce this fixture's
+  // exact Controller before completing the terminal Task so its asynchronous
+  // scheduler cannot race archive preflight by creating the expected Leader
+  // Run.  The yield still folds the durable result; omitting the optional
+  // runtime signal here preserves the pending wake for the archive scanner.
+  await stopFileTaskController(home);
+  const finished = runTaskCommand(
+    ["run", "yield", `${task.id}/${reviewRun.id}`, "--summary", "Review complete"],
+    store,
     {
-      encoding: "utf8",
-      env: { ...leaderEnvironment, YUI_ROLE: "reviewer" }
+      environment: {},
+      yuiHome: home,
+      reviewWorkspaceResult: await preparer.snapshotReviewRoundResult(task.id, round.id)
     }
   );
-  assert.equal(finished.status, 0, finished.stderr || finished.stdout);
-  const controllerStopped = spawnSync(
-    process.execPath,
-    [cli, "controller", "stop"],
-    { encoding: "utf8", env: { ...process.env, YUI_HOME: home } }
-  );
-  assert.equal(
-    controllerStopped.status,
-    0,
-    controllerStopped.stderr || controllerStopped.stdout
-  );
-  const leaderRun = store.getActiveAgentRun(task.id, "leader");
-  if (leaderRun !== null) {
-    markDelivered(store, leaderRun);
-    const leaderFinished = spawnSync(
-      process.execPath,
-      [cli, "task", "run", "yield", leaderRun.id, "--summary", "Archive fixture settled."],
-      { encoding: "utf8", env: leaderEnvironment }
-    );
-    assert.equal(leaderFinished.status, 0, leaderFinished.stderr || leaderFinished.stdout);
-  }
-  // This fixture completes the Task directly below rather than through the
-  // public completion command, so discard its now-quiescent Leader handoff.
-  store.removeWorkMailbox({ kind: "role", taskId: task.id, roleName: "leader" });
+  assert.equal(finished.kind, "output");
   const completedItem = updateWorkItemStatus(
     store.getWorkItem(task.id, item.id),
     "completed",

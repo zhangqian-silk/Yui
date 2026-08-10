@@ -344,6 +344,7 @@ function leaderWakeupInput(
   const lines: string[] = [
     "Follow the injected yui-leader Skill for this Yui wakeup.",
     `Current Leader Run: ${runId}.`,
+    `For every Leader decision, milestone, or Work Item lifecycle command that is meaningful progress, carry this exact current-turn assertion on that command: YUI_LEADER_ACTION_RUN_ID=${runId} YUI_LEADER_ACTION_RECEIPT_ID=${formatAgentRunReceiptId(taskId, runId)}. The native Session environment may retain an older YUI_RUN_ID/launch; never copy those values, and never reuse this assertion after the turn changes.`,
     `Yui wakeup reasons: ${reasons.join(", ")}.`,
     `Read the authoritative context with yui task context ${taskId}.`,
     "Keep the context layers separate: Yui Core owns durable identity, lifecycle, access, workspace, and exact-yield safety; the generic role Skill owns portable collaboration behavior; Project Policy/Knowledge owns project-specific build, test, migration, release, and review rules; the Task Contract owns this Task's objective, scope, acceptance, and evidence.",

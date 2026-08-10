@@ -147,6 +147,10 @@ test("an idle Leader starts a real wakeup run, waits for readiness, sends once, 
   assert.match(store.savedDispatches[0].run.input, /role-result/);
   assert.match(store.savedDispatches[0].run.input, /yui task context task-1/);
   assert.match(store.savedDispatches[0].run.input, /Current Leader Run: agent-run-1/);
+  assert.match(
+    store.savedDispatches[0].run.input,
+    /YUI_LEADER_ACTION_RUN_ID=agent-run-1 YUI_LEADER_ACTION_RECEIPT_ID=agent-run:task-1\/agent-run-1/
+  );
   assert.match(store.savedDispatches[0].run.input, /yui task run yield agent-run-1/);
   assert.match(store.savedDispatches[0].run.input, /yui task complete task-1 --summary/);
   assert.doesNotMatch(store.savedDispatches[0].run.input, /yui task message list/);

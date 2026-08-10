@@ -686,9 +686,9 @@ test("managed Claude Task Runs inject the lifecycle hooks and exact explicit-yie
   const hooks = JSON.parse(readFileSync(join(pluginRoot, "hooks", "hooks.json"), "utf8"));
   assert.deepEqual(
     Object.keys(hooks.hooks).sort(),
-    ["SessionStart", "StopFailure", "UserPromptSubmit"]
+    ["PostToolUse", "SessionStart", "StopFailure", "UserPromptSubmit"]
   );
-  for (const eventKey of ["SessionStart", "UserPromptSubmit", "StopFailure"]) {
+  for (const eventKey of ["SessionStart", "UserPromptSubmit", "PostToolUse", "StopFailure"]) {
     const command = hooks.hooks[eventKey][0].hooks[0];
     assert.equal(command.command, process.execPath, eventKey);
     assert.deepEqual(command.args, ["/dist/cli.js", "internal", "claude-hook"], eventKey);

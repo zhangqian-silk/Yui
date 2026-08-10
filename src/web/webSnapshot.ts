@@ -4,6 +4,10 @@ import type { Task, TaskStatus } from "../task/task.js";
 import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
 import { isRoleRunStalled } from "../scheduler/roleRunStall.js";
 import type { TaskEvent } from "../event/taskEvent.js";
+import {
+  buildTaskExecutionProjection,
+  type TaskExecutionProjection
+} from "../scheduler/taskExecutionProjection.js";
 
 export type WebDashboardStore = Pick<TaskStore,
   | "transaction"
@@ -33,6 +37,7 @@ type DashboardTask = Task & Readonly<{
   roleCount: number;
   openInputCount: number;
   needsAttentionCount: number;
+  execution: TaskExecutionProjection | null;
   projectNames?: readonly string[];
 }>;
 
@@ -78,6 +83,7 @@ export function buildWebDashboardSnapshot(
       const needsAttentionCount = reader.listAgentRuns(task.id)
         .filter((run) => run.status === "active" && isRoleRunStalled(events, run.id))
         .length;
+      const execution = buildTaskExecutionProjection(reader, task.id);
       const names = task.projectBindings.flatMap(({ projectId }) => {
         const name = projectNames.get(projectId);
         return name === undefined ? [] : [name];
@@ -88,7 +94,8 @@ export function buildWebDashboardSnapshot(
         workItems: countWorkItems(reader.listWorkItems(task.id)),
         roleCount: reader.listRoles(task.id).length,
         openInputCount: taskOpenInputs,
-        needsAttentionCount
+        needsAttentionCount,
+        execution
       };
     }).sort(compareDashboardTasks);
 
@@ -144,6 +151,7 @@ export function buildWebTaskDetail(store: WebDashboardStore, taskId: string): ob
     });
     return {
       task: projectNames.length === 0 ? task : { ...task, projectNames },
+      execution: buildTaskExecutionProjection(reader, taskId),
       brief: reader.getTaskBrief(taskId),
       roles,
       workItems: reader.listWorkItems(taskId),
