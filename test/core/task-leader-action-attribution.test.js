@@ -11,6 +11,7 @@ import { bindExecution, claimPending } from "../../dist/coordination/workMailbox
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { createTaskMessage } from "../../dist/message/message.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
+import { stopFileTaskController } from "../../dist/controller/clientRuntime.js";
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
@@ -47,7 +48,10 @@ const EXPIRED_RECONCILE = new Date("2026-08-05T00:50:00.000Z");
 
 function fixture(t) {
   const home = mkdtempSync(join(tmpdir(), "yui-leader-action-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(async () => {
+    await stopFileTaskController(home);
+    rmSync(home, { recursive: true, force: true });
+  });
   ensureStorageSchema(home, START);
   const store = new FileTaskStore(home);
   const agent = createConfiguredAgent("codex", "codex", "codex", [], [], START);
