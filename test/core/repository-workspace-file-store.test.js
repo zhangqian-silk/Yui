@@ -44,8 +44,12 @@ import {
 import { yieldAgentRun } from "../../dist/run/agentRun.js";
 import { createStartupReadyClaudeAgent } from "../helpers/mockClaudeAgent.js";
 import {
-  createReviewRound
+  createReviewRound,
+  createTaskReviewRound
 } from "../../dist/review/reviewRound.js";
+import {
+  createTaskFinalReviewContract
+} from "../../dist/review/taskFinalReviewContract.js";
 import {
   createAgentRun,
   recordRoleAgentSession,
@@ -3209,6 +3213,78 @@ test("Project Task create returns the current Task, Leader, and workspace state"
   assert.deepEqual(
     result.data.leader,
     new FileTaskStore(home).getRole(result.data.task.id, "leader")
+  );
+});
+
+test("a Task-final ReviewRound worktree starts at its frozen integrated head", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Review the integrated Task", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath, ["leader", "reviewer"]);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const taskWorkspace = store.getTaskWorkspace(task.id);
+  const taskMainEntry = taskWorkspace.entries[0];
+  const taskMainCommit = git(["-C", taskMainEntry.path, "rev-parse", "HEAD"]).trim();
+
+  const item = createWorkItem("work-item-1", task.id, {
+    title: "Leader-direct metadata",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  const contract = createTaskFinalReviewContract({
+    taskId: task.id,
+    reviewerRoleName: "reviewer",
+    controlPlaneDigest: "a".repeat(64)
+  });
+  const submitted = submitWorkItemCandidate(running, {
+    summary: "metadata-only Candidate",
+    source: { type: "direct" },
+    reviewPolicy: { roleName: "reviewer", trigger: "final" },
+    taskFinalReviewContract: contract
+  }, NOW);
+  store.saveWorkItem(task.id, submitted);
+
+  writeFileSync(join(repositoryPath, "integrated.txt"), "integrated head\n");
+  git(["-C", repositoryPath, "add", "integrated.txt"]);
+  git(["-C", repositoryPath, "commit", "-qm", "integrated head"]);
+  const integratedCommit = git(["-C", repositoryPath, "rev-parse", "HEAD"]).trim();
+  assert.notEqual(integratedCommit, taskMainCommit);
+
+  const candidate = submitted.candidates[0];
+  const round = createTaskReviewRound(
+    "review-round-1",
+    task.id,
+    item.id,
+    candidate.id,
+    "reviewer",
+    "policy",
+    {
+      schemaVersion: 1,
+      projects: [{ projectId: project.id, commit: integratedCommit }]
+    },
+    NOW,
+    contract
+  );
+  store.saveReviewRound(task.id, round);
+
+  const reviewWorkspace = await preparer.prepareReviewRoundWorkspace(task.id, round.id);
+  const reviewEntry = reviewWorkspace.entries[0];
+  assert.equal(candidate.workspace, undefined);
+  assert.equal(reviewEntry.baseCommit, integratedCommit);
+  assert.equal(git(["-C", reviewEntry.path, "rev-parse", "HEAD"]).trim(), integratedCommit);
+  assert.equal(readFileSync(join(reviewEntry.path, "integrated.txt"), "utf8"), "integrated head\n");
+  assert.equal(
+    git(["-C", taskMainEntry.path, "rev-parse", "HEAD"]).trim(),
+    taskMainCommit
   );
 });
 

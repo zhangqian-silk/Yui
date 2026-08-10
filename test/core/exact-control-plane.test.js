@@ -42,9 +42,18 @@ import { createAgentRun } from "../helpers/effectiveLaunch.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
+import { createProject } from "../../dist/repository/project.js";
+import {
+  createWorkItem,
+  updateWorkItemStatus
+} from "../../dist/workItem/workItem.js";
 import { yuiVersionIdentity } from "../../dist/version.js";
+import {
+  TASK_FINAL_REVIEW_ARGUMENT,
+  createTaskFinalReviewContract
+} from "../../dist/review/taskFinalReviewContract.js";
 
-function fixture(t) {
+function fixture(t, roleName = "worker", { projectBacked = false } = {}) {
   const home = mkdtempSync(join(tmpdir(), "yui-exact-control-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home, new Date("2026-08-09T00:00:00.000Z"));
@@ -59,7 +68,7 @@ function fixture(t) {
   const runtime = createExactTaskRuntimeDescriptor({
     controlPlaneDigest: digest,
     taskId: "task-15",
-    roleName: "worker",
+    roleName,
     agentId: "claude",
     adapterId: "claude",
     workspace: home,
@@ -77,7 +86,19 @@ function fixture(t) {
     [],
     now
   );
-  const task = activateTask(createTask(runtime.taskId, "Exact runtime", now), now);
+  const projectPath = join(home, "project");
+  if (projectBacked) mkdirSync(projectPath, { recursive: true });
+  const task = activateTask(createTask(runtime.taskId, "Exact runtime", now, {
+    ...(projectBacked
+      ? {
+          projectBindings: [{
+            projectId: "project-1",
+            directory: "project",
+            baseRef: "main"
+          }]
+        }
+      : {})
+  }), now);
   const role = createRole(
     task.id,
     runtime.roleName,
@@ -116,14 +137,151 @@ function fixture(t) {
     receiptId: `agent-run:${task.id}/${run.id}`
   }, now);
   store.transaction((tx) => {
+    if (projectBacked) {
+      tx.saveProject(createProject(
+        "project-1",
+        "project",
+        projectPath,
+        { stable: "main", development: "main" },
+        now
+      ));
+      tx.saveConfig({
+        ...tx.getConfig(),
+        review: { roleName: "reviewer", trigger: "leader" }
+      });
+    }
     tx.saveConfiguredAgent(agent);
     tx.saveTask(task);
     tx.saveRole(task.id, role);
     tx.saveActiveAgentRun(run);
     tx.saveTaskRoleSessionSet(sessions);
+    if (projectBacked) {
+      const item = createWorkItem("work-item-1", task.id, {
+        title: "metadata-only exact Candidate",
+        writeProjectIds: ["project-1"]
+      }, now);
+      tx.saveWorkItem(task.id, updateWorkItemStatus(item, "running", now));
+    }
   });
-  return { home, cliEntry, control, digest, runtime };
+  return { home, cliEntry, control, digest, runtime, store };
 }
+
+test("Task-final contract prefix is bound to the verified exact Leader Task and control digest", (t) => {
+  const { home, cliEntry, control, digest, runtime } = fixture(t, "leader");
+  const statePath = join(home, "state.json");
+  const stateBefore = readFileSync(statePath, "utf8");
+  const environment = {
+    ...process.env,
+    YUI_HOME: home,
+    YUI_SESSION_SCOPE: "task",
+    YUI_TASK_ID: runtime.taskId,
+    YUI_ROLE: runtime.roleName,
+    YUI_AGENT_ID: runtime.agentId,
+    YUI_ADAPTER_ID: runtime.adapterId,
+    YUI_WORKSPACE: runtime.workspace,
+    YUI_RUN_ID: runtime.runId,
+    YUI_LAUNCH_ID: runtime.launchId,
+    YUI_NATIVE_SESSION_ID: runtime.nativeSessionId,
+    [YUI_CONTROL_PLANE_DESCRIPTOR]: serializeExactDescriptor(control),
+    [YUI_TASK_RUNTIME_DESCRIPTOR]: serializeExactDescriptor(runtime)
+  };
+  const exact = spawnSync(process.execPath, [
+    cliEntry,
+    EXACT_CONTROL_ARGUMENT,
+    digest,
+    TASK_FINAL_REVIEW_ARGUMENT,
+    runtime.taskId,
+    "reviewer",
+    "version"
+  ], { encoding: "utf8", env: environment });
+  assert.equal(exact.status, 0, exact.stderr);
+  const contract = createTaskFinalReviewContract({
+    taskId: runtime.taskId,
+    reviewerRoleName: "reviewer",
+    controlPlaneDigest: digest
+  });
+  assert.equal(contract.taskId, runtime.taskId);
+  assert.equal(contract.reviewerRoleName, "reviewer");
+  assert.equal(contract.controlPlaneDigest, digest);
+  assert.match(contract.digest, /^[a-f0-9]{64}$/u);
+  assert.equal(readFileSync(statePath, "utf8"), stateBefore);
+
+  const wrongTask = spawnSync(process.execPath, [
+    cliEntry,
+    EXACT_CONTROL_ARGUMENT,
+    digest,
+    TASK_FINAL_REVIEW_ARGUMENT,
+    "task-16",
+    "reviewer",
+    "version"
+  ], { encoding: "utf8", env: environment });
+  assert.notEqual(wrongTask.status, 0);
+  assert.match(wrongTask.stderr, /contract Task id mismatch/i);
+  assert.equal(readFileSync(statePath, "utf8"), stateBefore);
+
+  const wrongDigest = spawnSync(process.execPath, [
+    cliEntry,
+    EXACT_CONTROL_ARGUMENT,
+    "0".repeat(64),
+    TASK_FINAL_REVIEW_ARGUMENT,
+    runtime.taskId,
+    "reviewer",
+    "version"
+  ], { encoding: "utf8", env: environment });
+  assert.notEqual(wrongDigest.status, 0);
+  assert.match(wrongDigest.stderr, /digest does not match/i);
+  assert.equal(readFileSync(statePath, "utf8"), stateBefore);
+});
+
+test("exact Task-final CLI submits and accepts a metadata-only Project Candidate", (t) => {
+  const { home, cliEntry, control, digest, runtime, store } = fixture(
+    t,
+    "leader",
+    { projectBacked: true }
+  );
+  const environment = {
+    ...process.env,
+    YUI_HOME: home,
+    YUI_SESSION_SCOPE: "task",
+    YUI_TASK_ID: runtime.taskId,
+    YUI_ROLE: runtime.roleName,
+    YUI_AGENT_ID: runtime.agentId,
+    YUI_ADAPTER_ID: runtime.adapterId,
+    YUI_WORKSPACE: runtime.workspace,
+    YUI_RUN_ID: runtime.runId,
+    YUI_LAUNCH_ID: runtime.launchId,
+    YUI_NATIVE_SESSION_ID: runtime.nativeSessionId,
+    [YUI_CONTROL_PLANE_DESCRIPTOR]: serializeExactDescriptor(control),
+    [YUI_TASK_RUNTIME_DESCRIPTOR]: serializeExactDescriptor(runtime)
+  };
+  const prefix = [
+    cliEntry,
+    EXACT_CONTROL_ARGUMENT,
+    digest,
+    TASK_FINAL_REVIEW_ARGUMENT,
+    runtime.taskId,
+    "reviewer"
+  ];
+  const submitted = spawnSync(process.execPath, [
+    ...prefix,
+    "task", "work", "update", "work-item-1", "done",
+    "--summary", "metadata-only Candidate"
+  ], { encoding: "utf8", env: environment });
+  assert.equal(submitted.status, 0, submitted.stderr);
+  assert.match(submitted.stdout, /Submitted work item/u);
+  const candidate = store.getWorkItem(runtime.taskId, "work-item-1").candidates[0];
+  assert.equal(candidate.workspace, undefined);
+  assert.equal(candidate.taskFinalReviewContract.controlPlaneDigest, digest);
+
+  const accepted = spawnSync(process.execPath, [
+    ...prefix,
+    "task", "work", "accept", "work-item-1",
+    "--summary", "exact metadata accepted"
+  ], { encoding: "utf8", env: environment });
+  assert.equal(accepted.status, 0, accepted.stderr);
+  assert.match(accepted.stdout, /Accepted Work Item/u);
+  assert.equal(store.getWorkItem(runtime.taskId, "work-item-1").status, "completed");
+});
 
 test("control-plane and Task runtime descriptors are tagged and never interchangeable", (t) => {
   const { control, runtime } = fixture(t);

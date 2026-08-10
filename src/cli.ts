@@ -116,10 +116,16 @@ import {
   extractExactControlArgument,
   parseExactControlPlaneDescriptor
 } from "./runtime/exactControlPlane.js";
+import {
+  createTaskFinalReviewContract,
+  extractTaskFinalReviewRequest,
+  type TaskFinalReviewContract
+} from "./review/taskFinalReviewContract.js";
 
 const VERSION = YUI_VERSION;
 const exactControlInvocation = extractExactControlArgument(process.argv.slice(2));
-const rawArgs = [...exactControlInvocation.args];
+const taskFinalReviewInvocation = extractTaskFinalReviewRequest(exactControlInvocation.args);
+const rawArgs = [...taskFinalReviewInvocation.args];
 const jsonOutput = rawArgs.includes("--json");
 const args = normalizeAliases(
   jsonOutput ? rawArgs.filter((argument) => argument !== "--json") : rawArgs
@@ -142,7 +148,7 @@ void main().catch((error: unknown) => {
 });
 
 export async function main(): Promise<void> {
-  await preflightManagedTaskControlPlane();
+  const taskFinalReviewContract = await preflightManagedTaskControlPlane();
   if (args.length === 0) {
     emit(renderCommandHelp((await import("./cli/commandCatalog.js")).ROOT_COMMAND, VERSION));
     return;
@@ -884,7 +890,8 @@ export async function main(): Promise<void> {
       resolved,
       store,
       workspacePreparer,
-      process.env
+      process.env,
+      taskFinalReviewContract
     );
     const reviewWorkspaceResult = await reviewWorkspaceResultForTaskCommand(
       resolved,
@@ -899,6 +906,9 @@ export async function main(): Promise<void> {
         runtime,
         environment: process.env,
         yuiHome: home,
+        ...(taskFinalReviewContract === undefined
+          ? {}
+          : { taskFinalReviewContract }),
         ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
         ...(candidateGitSnapshot === undefined ? {} : { candidateGitSnapshot }),
         ...(reviewWorkspaceResult === undefined ? {} : { reviewWorkspaceResult }),
@@ -998,9 +1008,14 @@ export async function main(): Promise<void> {
   );
 }
 
-async function preflightManagedTaskControlPlane(): Promise<void> {
+async function preflightManagedTaskControlPlane(): Promise<
+  TaskFinalReviewContract | undefined
+> {
   if (exactControlInvocation.error !== undefined) {
     throw new Error(exactControlInvocation.error);
+  }
+  if (taskFinalReviewInvocation.error !== undefined) {
+    throw new Error(taskFinalReviewInvocation.error);
   }
   const serializedControl = process.env[YUI_CONTROL_PLANE_DESCRIPTOR];
   const serializedRuntime = process.env[YUI_TASK_RUNTIME_DESCRIPTOR];
@@ -1014,7 +1029,12 @@ async function preflightManagedTaskControlPlane(): Promise<void> {
     if (exactControlInvocation.digest !== undefined) {
       throw new Error("Exact Task control-plane invocation requires its frozen runtime descriptors.");
     }
-    return;
+    if (taskFinalReviewInvocation.request !== undefined) {
+      throw new Error(
+        "Task final-review contract requires a verified exact Task control-plane invocation."
+      );
+    }
+    return undefined;
   }
   if (process.env.YUI_SESSION_SCOPE !== "task") {
     throw new Error("Exact Task control-plane invocation requires a managed Task runtime.");
@@ -1058,6 +1078,21 @@ async function preflightManagedTaskControlPlane(): Promise<void> {
       ? { preallocatedNativeSessionReservation: { yuiHome: control.yuiHome } }
       : {}
   );
+  const request = taskFinalReviewInvocation.request;
+  if (request === undefined) return undefined;
+  if (runtime.roleName !== "leader") {
+    throw new Error("Only the exact Task Leader invocation may establish a final-review contract.");
+  }
+  if (request.taskId !== runtime.taskId) {
+    throw new Error(
+      `Task final-review contract Task id mismatch: expected ${runtime.taskId}, found ${request.taskId}.`
+    );
+  }
+  return createTaskFinalReviewContract({
+    taskId: runtime.taskId,
+    reviewerRoleName: request.reviewerRoleName,
+    controlPlaneDigest: digest
+  });
 }
 
 function cleanupCliError(error: unknown, fallbackResource: string): CliError {
@@ -1128,7 +1163,8 @@ async function candidateSnapshotForTaskCommand(
   args: readonly string[],
   store: FileTaskStore,
   preparer: FileTaskWorkspacePreparer,
-  environment: NodeJS.ProcessEnv
+  environment: NodeJS.ProcessEnv,
+  taskFinalReviewContract?: TaskFinalReviewContract
 ) {
   if (args[0] !== "task" || store.getReviewConfig() === null) return undefined;
   if (args[1] === "run" && args[2] === "yield" && args[3] !== undefined) {
@@ -1147,6 +1183,10 @@ async function candidateSnapshotForTaskCommand(
     const reference = cliWorkItemReference(args[3], environment);
     const workspace = store.getWorkItemWorkspace(reference.taskId, reference.localId);
     if (workspace === null) {
+      // The exact Task-final contract intentionally supports a Leader-direct,
+      // metadata-only Project Candidate. The command layer performs the full
+      // Task/WorkItem/source/contract validation before any aggregate write.
+      if (taskFinalReviewContract !== undefined) return undefined;
       throw usageError(
         `Reviewable direct WorkItem has no managed Candidate workspace: ${reference.localId}.`
       );

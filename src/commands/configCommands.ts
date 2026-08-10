@@ -81,7 +81,7 @@ function runReviewConfigCommand(args: string[], store: ConfigCommandStore): stri
   }
   if (command === "set") {
     const usage = "Config review set usage: "
-      + "yui config review set --role <global-role> --trigger <always|leader>.";
+      + "yui config review set --role <global-role> --trigger <always|leader|final>.";
     if (rest.length !== 4) throw usageError(usage);
     const options = new Map<string, string>();
     for (let index = 0; index < rest.length; index += 2) {

@@ -72,11 +72,13 @@ import {
 } from "../run/agentRun.js";
 import {
   createReviewRound,
+  createTaskReviewRound,
   finishReviewRound,
   parseReviewYieldReport,
   recordReviewWorkspaceDisposition,
   startReviewRound,
-  type ReviewRound
+  type ReviewRound,
+  type TaskReviewCandidate
 } from "../review/reviewRound.js";
 import { markYuiRunInput, retagYuiRunInput } from "../run/runIdentity.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
@@ -130,6 +132,12 @@ import {
   type WorkItemStatus
 } from "../workItem/workItem.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
+import {
+  sameTaskFinalReviewContract,
+  taskFinalReviewConfig,
+  validateTaskFinalReviewContract,
+  type TaskFinalReviewContract
+} from "../review/taskFinalReviewContract.js";
 import { managedWorkspaceKey } from "../worktree/managedWorkspace.js";
 import {
   hasAgentConfigOptions,
@@ -170,6 +178,68 @@ import {
 
 const LEADER_ROLE = "leader";
 
+/** `final` is a Task delivery policy, not a per-WorkItem ReviewRound rule. */
+function legacyWorkItemReviewConfig(
+  config: ReviewConfig | null
+): ReviewConfig | null {
+  return config?.trigger === "final" ? null : config;
+}
+
+function storedTaskFinalReviewContract(
+  store: TaskWorkflowStore,
+  taskId: string
+): TaskFinalReviewContract | undefined {
+  const contracts = store.listWorkItems(taskId)
+    .flatMap(({ candidates }) => candidates)
+    .flatMap(({ taskFinalReviewContract }) => (
+      taskFinalReviewContract === undefined ? [] : [taskFinalReviewContract]
+    ));
+  const first = contracts[0];
+  if (first === undefined) return undefined;
+  validateTaskFinalReviewContract(first);
+  if (contracts.some((contract) => !sameTaskFinalReviewContract(first, contract))) {
+    throw dataError(`Task ${taskId} contains conflicting final-review contracts.`);
+  }
+  return first;
+}
+
+/**
+ * Resolve one exact Task-local contract before the caller performs any write.
+ * Once a Candidate has established the contract, every later Candidate,
+ * acceptance, and completion mutation must present the same verified
+ * capability; shared review-config drift is intentionally irrelevant.
+ */
+function taskFinalReviewContractForMutation(
+  store: TaskWorkflowStore,
+  taskId: string,
+  options: TaskCommandOptions
+): TaskFinalReviewContract | undefined {
+  const supplied = options.taskFinalReviewContract;
+  if (supplied !== undefined) {
+    validateTaskFinalReviewContract(supplied);
+    if (supplied.taskId !== taskId) {
+      throw usageError(
+        `Task final-review contract Task id mismatch: expected ${taskId}, found ${supplied.taskId}.`
+      );
+    }
+  }
+  const stored = storedTaskFinalReviewContract(store, taskId);
+  if ((stored ?? supplied) !== undefined
+    && requireTask(store, taskId).projectBindings.length === 0) {
+    throw usageError(
+      `Task final-review contract requires a Project-backed Task: ${taskId}.`
+    );
+  }
+  if (stored === undefined) return supplied;
+  if (supplied === undefined) {
+    throw usageError(`Task final-review contract is missing for ${taskId}.`);
+  }
+  if (!sameTaskFinalReviewContract(stored, supplied)) {
+    throw usageError(`Task final-review contract control-plane digest mismatch for ${taskId}.`);
+  }
+  return stored;
+}
+
 export type TaskCommandExecution =
   | Readonly<{ kind: "output"; output: string; data?: unknown }>
   | Readonly<{
@@ -203,6 +273,8 @@ export type TaskCommandOptions = Readonly<{
     evidenceCommit?: string;
   }>;
   taskRetirementProof?: TaskRetirementProof;
+  /** Verified by exact CLI preflight; never reconstructed from process.env. */
+  taskFinalReviewContract?: TaskFinalReviewContract;
 }>;
 
 export function runTaskCommand(
@@ -218,7 +290,7 @@ export function runTaskCommand(
     case "show": return showTaskCommand(rest, store);
     case "context": return runTaskContextCommand(rest, store);
     case "activate": return output(activateTaskCommand(rest, store, options));
-    case "complete": return output(completeTaskCommand(rest, store, options));
+    case "complete": return completeTaskCommand(rest, store, options);
     case "reopen": return output(reopenTaskCommand(rest, store, options));
     case "archive": return output(archiveTaskCommand(rest, store, options));
     case "retire": return retireTaskCommand(rest, store, options);
@@ -656,7 +728,7 @@ function completeTaskCommand(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
-): string {
+): TaskCommandExecution {
   const usage = "Task complete usage: yui task complete <id> (--summary <text>|--summary-file <path|->).";
   const parsed = parseTail(args, new Set(["--summary", "--summary-file"]), usage);
   exactPositionals(parsed.positionals, 1, usage);
@@ -671,10 +743,18 @@ function completeTaskCommand(
     const task = requireTask(tx, parsed.positionals[0]);
     const actor = taskActor(options, task.id);
     if (task.status === "completed") {
-      return { task, changed: false, runtimeCleanupTargets: [] as RuntimeLifecycleTarget[] } as const;
+      return {
+        task,
+        changed: false,
+        runtimeCleanupTargets: [] as RuntimeLifecycleTarget[],
+        finalReview: undefined
+      } as const;
     }
     if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
+    // Resolve and authenticate the durable Task-local gate before terminalizing
+    // a Leader Run or performing any other Task/WorkItem write below.
+    const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
     assertNoOpenInputRequests(tx, task.id, "completing the Task");
     const incompleteWork = tx.listWorkItems(task.id).find((item) => (
       item.status !== "completed"
@@ -753,6 +833,16 @@ function completeTaskCommand(
       }
     }
 
+    const finalReview = prepareFinalTaskReview(tx, task, now, taskFinalContract);
+    if (finalReview !== null) {
+      return {
+        task,
+        changed: false,
+        runtimeCleanupTargets: [] as RuntimeLifecycleTarget[],
+        finalReview
+      } as const;
+    }
+
     const completed = completeTask(task, now, { by: actor, summary });
     tx.saveTask(completed);
     tx.clearPendingWakeup(task.id);
@@ -783,7 +873,12 @@ function completeTaskCommand(
       roles,
       now
     );
-    return { task: completed, changed: true, runtimeCleanupTargets } as const;
+    return {
+      task: completed,
+      changed: true,
+      runtimeCleanupTargets,
+      finalReview: undefined
+    } as const;
   });
   if (result.changed) {
     for (const target of result.runtimeCleanupTargets) {
@@ -793,9 +888,18 @@ function completeTaskCommand(
     }
     notifyMailbox(options.runtime, { kind: "operator" }, result.task.id);
   }
-  return result.changed
+  if (result.finalReview !== undefined) {
+    const status = result.finalReview.status === "pending"
+      ? `Final Task Review requested as ${result.finalReview.id}.`
+      : `Final Task Review is blocked: ${result.finalReview.summary ?? result.finalReview.id}.`;
+    return output(`${status}\n`, {
+      task: result.task,
+      reviewRound: result.finalReview
+    });
+  }
+  return output(result.changed
     ? `Completed task ${result.task.id}\n`
-    : `Task ${result.task.id} is already completed\n`;
+    : `Task ${result.task.id} is already completed\n`);
 }
 
 function reopenTaskCommand(
@@ -1797,16 +1901,27 @@ function updateWork(
           + "after the required ReviewRound and Integration evidence."
         );
       }
-      const reviewConfig = status === "completed" && !isTerminalWorkItemStatus(current.status)
+      const configuredReview = status === "completed" && !isTerminalWorkItemStatus(current.status)
         ? tx.getReviewConfig()
         : null;
+      const taskFinalContract = status === "completed" && current.status === "running"
+        ? taskFinalReviewContractForMutation(tx, task.id, options)
+        : undefined;
+      const candidatePolicy = taskFinalContract === undefined
+        ? legacyWorkItemReviewConfig(configuredReview)
+        : taskFinalReviewConfig(taskFinalContract);
       const projectDelivery = task.projectBindings.length > 0
         && current.writeProjectIds.length > 0;
+      const metadataOnlyTaskFinalDelivery = taskFinalContract !== undefined
+        && current.assignee === undefined;
       const candidateRequired = status === "completed"
         && current.status === "running"
-        && (projectDelivery || reviewConfig !== null);
+        && (projectDelivery || candidatePolicy !== null);
       const developWorkspace = tx.getWorkItemWorkspace(task.id, current.id);
-      if (status === "completed" && projectDelivery && developWorkspace === null) {
+      if (status === "completed"
+        && projectDelivery
+        && developWorkspace === null
+        && !metadataOnlyTaskFinalDelivery) {
         throw usageError(
           `Project-backed Work Item ${current.id} must be isolated before Candidate submission.`
         );
@@ -1815,7 +1930,10 @@ function updateWork(
         ? submitWorkItemCandidate(current, {
             summary: summary!,
             source: { type: "direct" },
-            ...(reviewConfig === null ? {} : { reviewPolicy: reviewConfig }),
+            ...(candidatePolicy === null ? {} : { reviewPolicy: candidatePolicy }),
+            ...(taskFinalContract === undefined
+              ? {}
+              : { taskFinalReviewContract: taskFinalContract }),
             ...(developWorkspace === null
               ? {}
               : { workspace: developWorkspace }),
@@ -1843,11 +1961,11 @@ function updateWork(
       enqueueWork(tx, taskMailbox(task.id), "work-updated", now, [
         workItemRef(task.id, updated.id)
       ]);
-      const reviewDispatch = reviewConfig?.trigger === "always"
+      const reviewDispatch = candidatePolicy?.trigger === "always"
         ? queueReviewRound(
             tx,
             updated,
-            reviewConfig,
+            candidatePolicy,
             "policy",
             now
           )
@@ -1855,7 +1973,7 @@ function updateWork(
       return {
         item: updated,
         reviewDispatch,
-        reviewTrigger: reviewConfig?.trigger ?? null
+        reviewTrigger: candidatePolicy?.trigger ?? null
       };
     }
     throw usageError(
@@ -2051,7 +2169,16 @@ function acceptWork(
       throw usageError("A ReviewRound evidence commit cannot be used for WorkItem acceptance.");
     }
     const candidate = requireWorkItemCandidate(item);
-    const latestReview = chronologicalReviewRounds(tx.listReviewRounds(item.taskId)
+    const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
+    if (!sameTaskFinalReviewContract(
+      candidate.taskFinalReviewContract,
+      taskFinalContract
+    )) {
+      throw usageError(
+        `Task final-review contract does not match Candidate ${candidate.id}.`
+      );
+    }
+    const latestReview = reviewRoundsByIdentity(tx.listReviewRounds(item.taskId)
       .filter((round) => round.workItemId === item.id
         && round.candidateId === candidate.id)).at(-1);
     if (latestReview !== undefined
@@ -2065,9 +2192,15 @@ function acceptWork(
       throw usageError(`Work Item candidate has no required ReviewRound: ${item.id}.`);
     }
     const isolatedWorkspace = tx.getWorkItemWorkspace(item.taskId, item.id);
+    const metadataOnlyTaskFinalDelivery = item.assignee === undefined
+      && candidate.source.type === "direct"
+      && candidate.workspace === undefined
+      && candidate.taskFinalReviewContract !== undefined
+      && taskFinalContract !== undefined;
     if (task.projectBindings.length > 0
       && item.writeProjectIds.length > 0
-      && isolatedWorkspace === null) {
+      && isolatedWorkspace === null
+      && !metadataOnlyTaskFinalDelivery) {
       throw usageError(
         `Project-backed Work Item ${item.id} has no WorkItem Develop workspace for acceptance.`
       );
@@ -2163,6 +2296,173 @@ function assertWorkItemIntegrationProof(
       throw usageError(`Work Item ChangeSet is not integrated: ${projectProof.changeSetId}.`);
     }
   }
+}
+
+/**
+ * Queue the one Project-scoped ReviewRound required by the `final` policy.
+ * WorkItem/Candidate identity remains the storage anchor, while the frozen
+ * heads come from the latest committed Integration for every bound Project.
+ */
+function prepareFinalTaskReview(
+  store: TaskWorkflowStore,
+  task: Task,
+  now: Date,
+  taskFinalContract: TaskFinalReviewContract | undefined
+): ReviewRound | null {
+  if (task.projectBindings.length === 0) return null;
+  const latest = reviewRoundsByIdentity(store.listReviewRounds(task.id))
+    .filter((round) => (
+      (round.scope ?? "work-item") === "task"
+      && sameTaskFinalReviewContract(
+        round.taskFinalReviewContract,
+        taskFinalContract
+      )
+    ))
+    .at(-1);
+  const config: ReviewConfig | null = taskFinalContract !== undefined
+    ? taskFinalReviewConfig(taskFinalContract)
+    : latest === undefined
+      ? store.getReviewConfig()
+      : { roleName: latest.reviewerRoleName, trigger: "final" };
+  if (config?.trigger !== "final") return null;
+
+  const taskCandidate = latestTaskReviewCandidate(store, task);
+  if (latest !== undefined && (latest.status === "pending" || latest.status === "running")) {
+    throw usageError(`Final Task Review is still active: ${latest.id}/${latest.status}.`);
+  }
+  if (latest !== undefined && isSameTaskReviewCandidate(latest.taskCandidate, taskCandidate)) {
+    // A terminal round for the same immutable heads is already the final
+    // review evidence. Do not create duplicate rounds on repeated completion
+    // attempts. A failed round remains a blocker until the Leader changes the
+    // candidate or otherwise resolves the failed evidence explicitly.
+    return latest.status === "completed" ? null : latest;
+  }
+
+  const anchor = [...store.listWorkItems(task.id)]
+    .filter(({ candidates }) => candidates.some(({ taskFinalReviewContract }) => (
+      sameTaskFinalReviewContract(taskFinalReviewContract, taskFinalContract)
+    )))
+    .sort((left, right) => (
+      left.updatedAt.localeCompare(right.updatedAt) || left.id.localeCompare(right.id)
+    ))
+    .at(-1);
+  if (anchor === undefined) {
+    throw usageError(`Task ${task.id} has no WorkItem Candidate to anchor its final Review.`);
+  }
+  const candidate = anchor.candidates
+    .filter(({ taskFinalReviewContract }) => (
+      sameTaskFinalReviewContract(taskFinalReviewContract, taskFinalContract)
+    ))
+    .at(-1);
+  if (candidate === undefined) {
+    throw usageError(`Task ${task.id} has no WorkItem Candidate to anchor its final Review.`);
+  }
+  return queueTaskReviewRound(
+    store,
+    task,
+    anchor,
+    candidate.id,
+    config,
+    taskCandidate,
+    now,
+    taskFinalContract
+  );
+}
+
+function latestTaskReviewCandidate(
+  store: TaskWorkflowStore,
+  task: Task
+): TaskReviewCandidate {
+  const committed = store.listIntegrationAttempts(task.id)
+    .filter(({ status }) => status === "committed");
+  const projects = task.projectBindings.map(({ projectId }) => {
+    const attempt = committed
+      .filter((candidate) => candidate.projectId === projectId)
+      .sort((left, right) => (
+        left.updatedAt.localeCompare(right.updatedAt) || left.id.localeCompare(right.id)
+      ))
+      .at(-1);
+    if (attempt?.candidateCommit === undefined) {
+      throw usageError(
+        `Task ${task.id} requires a committed Integration for Project ${projectId} before final Review.`
+      );
+    }
+    return { projectId, commit: attempt.candidateCommit };
+  });
+  return { schemaVersion: 1, projects };
+}
+
+function isSameTaskReviewCandidate(
+  left: TaskReviewCandidate | undefined,
+  right: TaskReviewCandidate
+): boolean {
+  return left !== undefined && isDeepStrictEqual(left, right);
+}
+
+function queueTaskReviewRound(
+  store: TaskWorkflowStore,
+  task: Task,
+  item: WorkItem,
+  candidateId: string,
+  config: ReviewConfig,
+  taskCandidate: TaskReviewCandidate,
+  now: Date,
+  taskFinalContract?: TaskFinalReviewContract
+): ReviewRound {
+  const pending = createTaskReviewRound(
+    store.nextReviewRoundId(task.id),
+    task.id,
+    item.id,
+    candidateId,
+    config.roleName,
+    "policy",
+    taskCandidate,
+    now,
+    taskFinalContract
+  );
+  store.saveReviewRound(task.id, pending);
+  const candidate = item.candidates.find(({ id }) => id === candidateId);
+  const producerRoleName = item.assignee
+    ?? (candidate?.source.type === "run"
+      ? store.getAgentRun(task.id, candidate.source.runId)?.roleName
+      : LEADER_ROLE);
+  if (producerRoleName === config.roleName) {
+    const failed = finishReviewRound(
+      pending,
+      "failed",
+      `Reviewer Role must be separate from the Task Candidate producer: ${config.roleName}.`,
+      now
+    );
+    store.saveReviewRound(task.id, failed);
+    return failed;
+  }
+  let reviewer = store.getRole(task.id, config.roleName);
+  if (reviewer === null) {
+    const globalRole = store.getGlobalRole(config.roleName);
+    if (globalRole === null) {
+      const failed = finishReviewRound(
+        pending,
+        "failed",
+        `Global Role not found: ${config.roleName}.`,
+        now
+      );
+      store.saveReviewRound(task.id, failed);
+      return failed;
+    }
+    reviewer = createTaskRole(store, task, config.roleName, undefined, now, config.roleName);
+    store.saveRole(task.id, reviewer);
+  }
+  if (store.getActiveAgentRun(task.id, reviewer.name) !== null) {
+    const failed = finishReviewRound(
+      pending,
+      "failed",
+      `Reviewer Role already has an active run: ${reviewer.name}.`,
+      now
+    );
+    store.saveReviewRound(task.id, failed);
+    return failed;
+  }
+  return pending;
 }
 
 function rejectWork(
@@ -2359,7 +2659,12 @@ function reviewWork(
     if (config === undefined) {
       throw usageError(`Candidate has no review policy: ${candidate.id}.`);
     }
-    const activeRound = chronologicalReviewRounds(tx.listReviewRounds(task.id)
+    if (config.trigger === "final") {
+      throw usageError(
+        `Final review policy is Task-scoped; complete Task ${task.id} to request its final Review.`
+      );
+    }
+    const activeRound = reviewRoundsByIdentity(tx.listReviewRounds(task.id)
       .filter((round) => (
         round.workItemId === item.id
         && round.candidateId === candidate.id
@@ -2399,7 +2704,8 @@ function taskRunCommand(
 ): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "list") return output(listRuns(rest, store, options));
-  if (command === "retry") return output(retryRun(rest, store, options));
+  if (command === "retry") return retryRun(rest, store, options);
+  if (command === "settle") return settleRun(rest, store, options);
   if (command === "recover") return output(recoverRun(rest, store, options));
   if (command === "yield") return yieldRun(rest, store, options);
   if (command === "checkpoint") return output(checkpointRun(rest, store, options));
@@ -2449,7 +2755,7 @@ function retryRun(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
-): string {
+): TaskCommandExecution {
   exactPositionals(args, 1, "Task run retry usage: yui task run retry <task>/<run>.");
   const now = clock(options);
   const retried = store.transaction((tx) => {
@@ -2458,9 +2764,106 @@ function retryRun(
       throw usageError(`Run ${previous.id} is not retryable from ${previous.status}.`);
     }
     if (previous.purpose === "review") {
-      throw usageError(
-        `Review Run ${previous.id} is not retried directly; request a new WorkItem review.`
+      const task = requireTask(tx, previous.taskId);
+      if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
+      if (taskActor(options, task.id) !== "leader") {
+        throw usageError("Only the Task Leader may retry a final Review Run.");
+      }
+      let previousRound = previous.reviewRoundId === undefined
+        ? null
+        : tx.getReviewRound(task.id, previous.reviewRoundId);
+      if (previousRound === null
+        || (previousRound.scope ?? "work-item") !== "task") {
+        throw usageError(
+          `Review Run ${previous.id} is not retried directly; request a new WorkItem review.`
+        );
+      }
+      const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
+      if (!sameTaskFinalReviewContract(
+        previousRound.taskFinalReviewContract,
+        taskFinalContract
+      )) {
+        throw usageError(
+          `Task final-review contract does not match ReviewRound ${previousRound.id}.`
+        );
+      }
+      if (
+        (previousRound.status !== "failed" && previousRound.status !== "running")
+        || previousRound.reviewerRunId !== previous.id
+        || previousRound.reviewerRoleName !== previous.roleName
+        || previousRound.workItemId !== previous.workItemId
+        || previousRound.taskCandidate === undefined
+      ) {
+        throw dataError(
+          `Final Review Run identity does not match its failed ReviewRound: ${previous.id}.`
+        );
+      }
+      const previousRoundId = previousRound.id;
+      const previousCandidateId = previousRound.candidateId;
+      const previousTaskCandidate = previousRound.taskCandidate;
+      const item = tx.getWorkItem(task.id, previousRound.workItemId);
+      if (item === null
+        || !item.candidates.some(({ id }) => id === previousCandidateId)) {
+        throw dataError(
+          `Final Review candidate is no longer available: ${previousCandidateId}.`
+        );
+      }
+      // ReviewRound ids are Task-local monotonic identities. Use that durable
+      // order for retry causality so a wall-clock rollback cannot create a
+      // second retry Round for the same exact failed Run.
+      const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id)
+        .filter((round) => (round.scope ?? "work-item") === "task"));
+      const previousIndex = taskRounds.findIndex(({ id }) => id === previousRoundId);
+      if (previousIndex < 0) {
+        throw dataError(`Final ReviewRound is not in Task history: ${previousRoundId}.`);
+      }
+      const laterRound = taskRounds.slice(previousIndex + 1).at(-1);
+      if (laterRound !== undefined && !isSameTaskReviewCandidate(
+        laterRound.taskCandidate,
+        previousTaskCandidate
+      )) {
+        throw usageError(
+          `A newer final Task candidate already has ReviewRound ${laterRound.id}.`
+        );
+      }
+      // A pre-fix Controller could fail an exact final Review Run while leaving
+      // its started Round running. Repair only at this explicit Leader retry
+      // boundary, after every durable identity/candidate fence has matched.
+      if (previousRound.status === "running") {
+        if (tx.getActiveAgentRun(task.id, previous.roleName) !== null) {
+          throw usageError(`${task.id}/${previous.roleName} already has an active run.`);
+        }
+        if (previous.summary === undefined) {
+          throw dataError(`Failed Review Run has no durable summary: ${previous.id}.`);
+        }
+        previousRound = finishReviewRound(
+          previousRound,
+          "failed",
+          previous.summary,
+          now
+        );
+        tx.saveReviewRound(task.id, previousRound);
+      }
+      if (laterRound !== undefined) {
+        return { kind: "review" as const, round: laterRound, created: false };
+      }
+      const role = requireRole(tx, task.id, previous.roleName);
+      if (tx.getActiveAgentRun(task.id, role.name) !== null) {
+        throw usageError(`${task.id}/${role.name} already has an active run.`);
+      }
+      const round = createTaskReviewRound(
+        tx.nextReviewRoundId(task.id),
+        task.id,
+        previousRound.workItemId,
+        previousCandidateId,
+        previousRound.reviewerRoleName,
+        "leader",
+        previousTaskCandidate,
+        now,
+        taskFinalContract
       );
+      tx.saveReviewRound(task.id, round);
+      return { kind: "review" as const, round, created: true };
     }
     const task = requireTask(tx, previous.taskId);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
@@ -2527,10 +2930,144 @@ function retryRun(
       ...runLaunchEventPayload(created),
       previousRunId: previous.id
     }, now);
-    return created;
+    return { kind: "run" as const, run: created };
   });
-  notifyMailbox(options.runtime, roleMailbox(retried.taskId, retried.roleName), retried.taskId);
-  return `Retry queued as ${retried.id} for ${retried.taskId}/${retried.roleName}\n`;
+  if (retried.kind === "review") {
+    return output(
+      retried.created
+        ? `Review retry requested as ${retried.round.id}\n`
+        : `Review retry already requested as ${retried.round.id} (${retried.round.status})\n`,
+      { reviewRound: retried.round }
+    );
+  }
+  notifyMailbox(
+    options.runtime,
+    roleMailbox(retried.run.taskId, retried.run.roleName),
+    retried.run.taskId
+  );
+  return output(
+    `Retry queued as ${retried.run.id} for ${retried.run.taskId}/${retried.run.roleName}\n`
+  );
+}
+
+function settleRun(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  exactPositionals(args, 1, "Task run settle usage: yui task run settle <task>/<run>.");
+  const now = clock(options);
+  const result = store.transaction((tx) => {
+    const failedRun = requireRun(tx, args[0], options);
+    if (failedRun.status !== "failed") {
+      throw usageError(`Run ${failedRun.id} cannot be settled from ${failedRun.status}.`);
+    }
+    if (failedRun.purpose !== "review") {
+      throw usageError(`Run ${failedRun.id} is not a final Review Run.`);
+    }
+    const task = requireTask(tx, failedRun.taskId);
+    if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
+    if (taskActor(options, task.id) !== "leader") {
+      throw usageError("Only the Task Leader may settle an obsolete final Review Run.");
+    }
+    const round = failedRun.reviewRoundId === undefined
+      ? null
+      : tx.getReviewRound(task.id, failedRun.reviewRoundId);
+    if (round === null || (round.scope ?? "work-item") !== "task") {
+      throw usageError(
+        `Review Run ${failedRun.id} is not an obsolete Task-final Review Run.`
+      );
+    }
+    const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
+    if (!sameTaskFinalReviewContract(
+      round.taskFinalReviewContract,
+      taskFinalContract
+    )) {
+      throw usageError(
+        `Task final-review contract does not match ReviewRound ${round.id}.`
+      );
+    }
+    if (
+      round.reviewerRunId !== failedRun.id
+      || round.reviewerRoleName !== failedRun.roleName
+      || round.workItemId !== failedRun.workItemId
+      || round.taskCandidate === undefined
+      || round.workspace === undefined
+      || failedRun.workspace === undefined
+      || !isDeepStrictEqual(round.workspace, failedRun.workspace)
+    ) {
+      throw dataError(
+        `Final Review Run identity does not match its ReviewRound: ${failedRun.id}.`
+      );
+    }
+    const role = requireRole(tx, task.id, failedRun.roleName);
+    const item = tx.getWorkItem(task.id, round.workItemId);
+    if (item === null
+      || !item.candidates.some(({ id }) => id === round.candidateId)) {
+      throw dataError(
+        `Final Review candidate is no longer available: ${round.candidateId}.`
+      );
+    }
+    if (failedRun.summary === undefined) {
+      throw dataError(`Failed Review Run has no durable summary: ${failedRun.id}.`);
+    }
+    const activeReviewRun = tx.listAgentRuns(task.id).find((run) => (
+      run.purpose === "review" && run.status === "active"
+    ));
+    const activeRoleRun = tx.getActiveAgentRun(task.id, role.name);
+    if (activeReviewRun !== undefined || activeRoleRun !== null) {
+      const active = activeReviewRun ?? activeRoleRun!;
+      throw usageError(`${task.id}/${role.name} already has active Run ${active.id}.`);
+    }
+
+    const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id)
+      .filter((candidate) => (candidate.scope ?? "work-item") === "task"));
+    const roundIndex = taskRounds.findIndex(({ id }) => id === round.id);
+    if (roundIndex < 0) {
+      throw dataError(`Final ReviewRound is not in Task history: ${round.id}.`);
+    }
+    const laterRound = taskRounds.slice(roundIndex + 1).at(-1);
+    if (laterRound !== undefined) {
+      throw usageError(
+        `A later final ReviewRound already exists: ${laterRound.id}/${laterRound.status}.`
+      );
+    }
+    const currentCandidate = latestTaskReviewCandidate(tx, task);
+    if (isSameTaskReviewCandidate(round.taskCandidate, currentCandidate)) {
+      throw usageError(
+        `Final ReviewRound ${round.id} freezes the current Task candidate; use exact retry.`
+      );
+    }
+
+    if (round.status === "failed") {
+      if (
+        round.summary === failedRun.summary.trim()
+        && round.report === failedRun.summary.trim()
+        && (round.checks?.length ?? 0) === 0
+        && round.evidenceCommit === undefined
+      ) {
+        return { run: failedRun, round, changed: false } as const;
+      }
+      throw usageError(`Final ReviewRound is already terminal: ${round.id}/${round.status}.`);
+    }
+    if (round.status !== "running") {
+      throw usageError(`Final ReviewRound is not stranded running: ${round.id}/${round.status}.`);
+    }
+    const terminal = finishReviewRound(
+      round,
+      "failed",
+      failedRun.summary,
+      now
+    );
+    tx.saveReviewRound(task.id, terminal);
+    return { run: failedRun, round: terminal, changed: true } as const;
+  });
+  return output(
+    result.changed
+      ? `Settled obsolete final Review ${result.round.id} from failed Run ${result.run.id}\n`
+      : `Obsolete final Review already settled: ${result.round.id}/${result.run.id}\n`,
+    { agentRun: result.run, reviewRound: result.round }
+  );
 }
 
 /**
@@ -2650,6 +3187,10 @@ function yieldRun(
     const role = requireRole(tx, task.id, active.roleName);
     const pointer = tx.getActiveAgentRun(task.id, role.name);
     if (pointer?.id !== active.id) throw usageError(`Run is not active for ${task.id}/${role.name}: ${active.id}.`);
+    const taskFinalContract = active.purpose === "execution"
+      && active.workItemId !== undefined
+      ? taskFinalReviewContractForMutation(tx, task.id, options)
+      : undefined;
     const wasStalled = isRoleRunStalled(tx.listEvents(task.id), active.id);
     let reviewReport;
     if (active.purpose === "review") {
@@ -2734,13 +3275,23 @@ function yieldRun(
     } else if (active.workItemId !== undefined) {
       const item = tx.getWorkItem(task.id, active.workItemId);
       if (item === null) throw dataError(`Work item not found for run ${active.id}: ${active.workItemId}.`);
-      const reviewConfig = tx.getReviewConfig();
-      const candidateRequired = role.name !== LEADER_ROLE || reviewConfig !== null;
+      const configuredReview = tx.getReviewConfig();
+      const candidatePolicy = taskFinalContract === undefined
+        ? legacyWorkItemReviewConfig(configuredReview)
+        : taskFinalReviewConfig(taskFinalContract);
+      const projectDelivery = task.projectBindings.length > 0
+        && item.writeProjectIds.length > 0;
+      const candidateRequired = role.name !== LEADER_ROLE
+        || candidatePolicy !== null
+        || projectDelivery;
       const yieldedItem = candidateRequired
           ? submitWorkItemCandidate(item, {
             summary,
             source: { type: "run", runId: terminal.id },
-            ...(reviewConfig === null ? {} : { reviewPolicy: reviewConfig }),
+            ...(candidatePolicy === null ? {} : { reviewPolicy: candidatePolicy }),
+            ...(taskFinalContract === undefined
+              ? {}
+              : { taskFinalReviewContract: taskFinalContract }),
             ...(active.workspace === undefined ? {} : { workspace: active.workspace }),
             ...(options.candidateGitSnapshot === undefined
               ? {}
@@ -2749,8 +3300,8 @@ function yieldRun(
         : updateWorkItemStatus(item, "completed", now, summary);
       tx.saveWorkItem(task.id, yieldedItem);
       if (candidateRequired) submittedItem = yieldedItem;
-      if (reviewConfig?.trigger === "always") {
-        automaticReview = { item: yieldedItem, config: reviewConfig };
+      if (candidatePolicy?.trigger === "always") {
+        automaticReview = { item: yieldedItem, config: candidatePolicy };
       }
     } else if (role.name !== LEADER_ROLE) {
       throw usageError(`Run ${active.id} is not a work run.`);
@@ -2952,7 +3503,8 @@ export function dispatchPreparedReviewRound(
     if (candidate === undefined) {
       throw dataError(`ReviewRound Candidate not found: ${round.candidateId}.`);
     }
-    if (candidate.gitSnapshot?.reviewBaseCommit !== round.reviewBaseCommit) {
+    if ((round.scope ?? "work-item") === "work-item"
+      && candidate.gitSnapshot?.reviewBaseCommit !== round.reviewBaseCommit) {
       throw usageError(`ReviewRound Candidate snapshot changed: ${round.id}.`);
     }
     const reviewer = requireRole(tx, taskId, round.reviewerRoleName);
@@ -2970,19 +3522,27 @@ export function dispatchPreparedReviewRound(
     const candidateLabel = candidate.source.type === "run"
       ? `candidate Run ${candidate.source.runId}`
       : `revision ${candidate.workItemRevision}`;
+    const scopeLabel = (round.scope ?? "work-item") === "task"
+      ? `Task-scoped final Review of integrated heads: ${round.taskCandidate!.projects
+        .map(({ projectId, commit }) => `${projectId}@${commit}`).join(", ")}`
+      : "WorkItem-scoped Review";
     const rawInput = [
-      `Review WorkItem ${item.id} ${candidateLabel}.`,
+      `${scopeLabel}. Review WorkItem ${item.id} ${candidateLabel}.`,
       `ReviewRound: ${round.id}`,
       `Review base commit: ${round.reviewBaseCommit}`,
       `Review workspace: ${round.workspace.root}`,
       `Candidate summary: ${candidate.summary}`,
       `Acceptance criteria: ${item.acceptance.length === 0 ? "none" : item.acceptance.join("; ")}`,
       "Start from the user's core outcome and the WorkItem intent. The candidate summary is a pointer, not proof: inspect the complete relevant change, callers, and proportionate checks.",
+      "Keep Yui Core lifecycle safety, generic Reviewer behavior, Project Policy/Knowledge, and the Task Contract separate. Follow Project Policy pointers from the dispatch context for project-specific checks.",
+      ...(round.scope === "task"
+        ? ["This is the one final Task Review: inspect every bound Project at the frozen integrated heads, and report only reachable, material, actionable P1/P2 findings or bounded verification gaps."]
+        : []),
       "You may freely edit source/tests, run local build or test commands, and optionally commit diagnostic evidence only inside this ReviewRound-owned workspace.",
-      "Do not push, integrate, mutate Task state, touch the Candidate or Worker workspace, another Task/workspace, a stable checkout, or real YUI_HOME.",
+      "Do not push, integrate, mutate Task state, touch the Candidate or Worker workspace, another Task/workspace, a stable checkout, or the real Yui control-plane home.",
       "Use the exact --summary-file - body to report complete findings, evidence, checks actually run, uncertainty, and recommended next actions in clear Markdown or JSON. Yui preserves the full report; no fixed wording or field list is required. If you include evidenceCommit, it must match the managed Review workspace.",
       "Report reviewBaseCommit, exact checks/results, material findings, and uncertainty. Review yield completes only this Round and creates no Candidate or ChangeSet.",
-      "The Leader alone interprets and routes evidence to the original Worker; never merge review evidence yourself."
+      "The Leader alone interprets and routes evidence: original Worker when open, a small Repair WorkItem when needed, or Leader/Integration for merge and local fixes; never merge review evidence yourself."
     ].join("\n");
     const runId = tx.nextAgentRunId(taskId);
     const input = markYuiRunInput(
@@ -3081,10 +3641,10 @@ function requireWorkItemCandidate(item: WorkItem): WorkItemCandidate {
   return candidate;
 }
 
-function chronologicalReviewRounds(rounds: ReviewRound[]): ReviewRound[] {
+/** ReviewRound ids are the durable Task-local creation order; wall time is not causal. */
+function reviewRoundsByIdentity(rounds: ReviewRound[]): ReviewRound[] {
   return [...rounds].sort((left, right) => (
-    left.createdAt.localeCompare(right.createdAt)
-      || left.id.localeCompare(right.id, undefined, {numeric: true})
+    left.id.localeCompare(right.id, undefined, { numeric: true })
   ));
 }
 
@@ -3093,7 +3653,7 @@ function activeReviewRoundForCandidate(
   item: WorkItem,
   candidate: WorkItemCandidate
 ): ReviewRound | undefined {
-  return chronologicalReviewRounds(store.listReviewRounds(item.taskId)
+  return reviewRoundsByIdentity(store.listReviewRounds(item.taskId)
     .filter((round) => round.workItemId === item.id
       && round.candidateId === candidate.id
       && (round.status === "pending" || round.status === "running")))

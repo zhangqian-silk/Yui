@@ -7,6 +7,11 @@ import {
 } from "../domain/validation.js";
 import { validateReviewConfig, type ReviewConfig } from "../review/reviewConfig.js";
 import {
+  taskFinalReviewConfig,
+  validateTaskFinalReviewContract,
+  type TaskFinalReviewContract
+} from "../review/taskFinalReviewContract.js";
+import {
   validateManagedWorkspace,
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
@@ -68,6 +73,7 @@ export type WorkItemCandidate = Readonly<{
     | Readonly<{ type: "direct" }>
     | Readonly<{ type: "run"; runId: string }>;
   reviewPolicy?: ReviewConfig;
+  taskFinalReviewContract?: TaskFinalReviewContract;
   /** Snapshot of the WorkItem-owned Develop workspace at candidate time. */
   workspace?: ManagedWorkspace;
   gitSnapshot?: CandidateGitSnapshot;
@@ -152,6 +158,7 @@ export function submitWorkItemCandidate(
       | Readonly<{ type: "direct" }>
       | Readonly<{ type: "run"; runId: string }>;
     reviewPolicy?: ReviewConfig;
+    taskFinalReviewContract?: TaskFinalReviewContract;
     workspace?: ManagedWorkspace;
     gitSnapshot?: CandidateGitSnapshot;
   }>,
@@ -175,6 +182,9 @@ export function submitWorkItemCandidate(
     summary: input.summary,
     source: input.source,
     ...(input.reviewPolicy === undefined ? {} : { reviewPolicy: input.reviewPolicy }),
+    ...(input.taskFinalReviewContract === undefined
+      ? {}
+      : { taskFinalReviewContract: input.taskFinalReviewContract }),
     ...(input.workspace === undefined ? {} : { workspace: input.workspace }),
     ...(input.gitSnapshot === undefined ? {} : { gitSnapshot: input.gitSnapshot }),
     createdAt: now.toISOString()
@@ -448,6 +458,17 @@ export function validateWorkItemCandidate(
     }, "agentRun");
   }
   if (candidate.reviewPolicy !== undefined) validateReviewConfig(candidate.reviewPolicy);
+  if (candidate.taskFinalReviewContract !== undefined) {
+    const contract = validateTaskFinalReviewContract(candidate.taskFinalReviewContract);
+    if (contract.taskId !== candidate.taskId) {
+      throw new Error("Task final-review contract belongs to another Task.");
+    }
+    const policy = taskFinalReviewConfig(contract);
+    if (candidate.reviewPolicy?.roleName !== policy.roleName
+      || candidate.reviewPolicy.trigger !== policy.trigger) {
+      throw new Error("Task final-review contract does not match the Candidate review policy.");
+    }
+  }
   if (candidate.workspace !== undefined) {
     validateManagedWorkspace(candidate.workspace);
     if (candidate.workspace.owner.type !== "work-item"
