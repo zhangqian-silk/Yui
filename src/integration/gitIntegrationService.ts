@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { lstat, mkdir, open, rm, stat } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -288,7 +289,7 @@ export class GitIntegrationService {
   ): TaskRuntimeIsolationPreparation {
     return this.runtimeIsolation.preflight({
       workspace,
-      launchId: attempt.id,
+      launchId: integrationRuntimeLaunchId(this.home, attempt.id),
       generationId: "integration-checks",
       allowExactActive: true
     });
@@ -600,7 +601,7 @@ function isNodeCode(error: unknown, code: string): boolean {
 function defaultIntegrationRuntimeIsolation(home: string): TaskRuntimeIsolationPort {
   const controlHome = resolve(home);
   return new FileTaskRuntimeIsolation({
-    runtimeRoot: `${controlHome}.task-runtimes`,
+    runtimeRoot: "/tmp",
     controlPlane: {
       yuiHome: controlHome,
       controllerSocketPath: controllerSocketPath(controlHome),
@@ -608,6 +609,13 @@ function defaultIntegrationRuntimeIsolation(home: string): TaskRuntimeIsolationP
       globalInstallPaths: [process.execPath]
     }
   });
+}
+
+function integrationRuntimeLaunchId(home: string, integrationId: string): string {
+  const homeDigest = createHash("sha256")
+    .update(resolve(home))
+    .digest("hex");
+  return `${integrationId}-${homeDigest}`;
 }
 
 function checkFailureReason(completion: CheckCompletion): string {

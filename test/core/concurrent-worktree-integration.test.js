@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -35,12 +36,15 @@ const now = new Date("2026-07-26T00:00:00.000Z");
 
 test("same-file WorkItems run in separate worktrees and a conflicting integration waits for Leader", async () => {
   const root = mkdtempSync(join(tmpdir(), "yui-integration-"));
+  writeFileSync(join(root, "package.json"), JSON.stringify({ type: "module" }));
   const repositoryPath = join(root, "repository");
   git(["init", "-b", "master", repositoryPath]);
   git(["-C", repositoryPath, "config", "user.name", "Test"]);
   git(["-C", repositoryPath, "config", "user.email", "test@example.com"]);
   writeFileSync(join(repositoryPath, "shared.txt"), "base\n");
   writeFileSync(join(repositoryPath, "check-environment.mjs"), `
+import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const serialized = process.env.YUI_TASK_RUNTIME_ISOLATION_DESCRIPTOR;
@@ -75,6 +79,25 @@ const expected = {
 for (const [name, value] of Object.entries(expected)) {
   if (process.env[name] !== value) {
     throw new Error("wrong isolated environment: " + name);
+  }
+}
+const commonJsProbe = join(process.env.TMPDIR, "commonjs-probe");
+writeFileSync(
+  commonJsProbe,
+  'const fs = require("node:fs"); process.stdout.write(typeof fs.readFileSync);'
+);
+if (execFileSync(process.execPath, [commonJsProbe], { encoding: "utf8" }) !== "function") {
+  throw new Error("Integration TMPDIR did not isolate CommonJS package lookup");
+}
+if (process.platform === "linux") {
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const socketPath = join(
+    process.env.TMPDIR,
+    "yui-" + uid,
+    "0".repeat(24) + ".sock"
+  );
+  if (Buffer.byteLength(socketPath) >= 108) {
+    throw new Error("Integration TMPDIR exceeds the Controller socket path budget");
   }
 }
 console.log(JSON.stringify({ descriptor, environment: expected }));
@@ -261,6 +284,13 @@ console.log(JSON.stringify({ descriptor, environment: expected }));
     taskId: task.id,
     integrationAttemptId: firstIntegration.id
   });
+  assert.equal(
+    successfulOutput.descriptor.generation.launchId,
+    `${firstIntegration.id}-${createHash("sha256")
+      .update(home)
+      .digest("hex")}`
+  );
+  assert.equal(successfulOutput.descriptor.roots.generation.startsWith("/tmp/"), true);
   assert.equal(
     successfulOutput.environment.HOME,
     join(successfulOutput.descriptor.roots.data, "home")
