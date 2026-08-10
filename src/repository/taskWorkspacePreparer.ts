@@ -20,10 +20,8 @@ import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
 import {
   createCandidateGitSnapshot,
-  createDirectTaskMainSnapshot,
   recordWorkItemWorkspaceDisposition,
   type CandidateGitSnapshot,
-  type DirectTaskMainSnapshot,
   type WorkItem,
   type WorkItemWorkspaceDisposition
 } from "../workItem/workItem.js";
@@ -210,45 +208,6 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       });
     }
     return createCandidateGitSnapshot(workspace, projects);
-  }
-
-  async snapshotDirectTaskMain(
-    workspace: ManagedWorkspace,
-    projectIds: readonly string[]
-  ): Promise<DirectTaskMainSnapshot> {
-    if (workspace.owner.type !== "task") {
-      throw new Error("Only Task main can become a direct Candidate source.");
-    }
-    const selected = new Set(projectIds);
-    const entries = workspace.entries.filter(({ projectId }) => selected.has(projectId));
-    if (entries.length !== selected.size) {
-      throw new Error("Direct Candidate Project scope does not match Task main.");
-    }
-    const projects = [];
-    for (const entry of entries) {
-      if (entry.access !== "write") {
-        throw new Error(`Direct Candidate Project is not writable: ${entry.projectId}.`);
-      }
-      if (!await this.git.isClean(entry.path)) {
-        throw new Error(
-          `Direct Candidate Task main must be clean and committed: ${entry.projectId}.`
-        );
-      }
-      const branch = await this.git.headRef(entry.path);
-      if (branch !== entry.branch) {
-        throw new Error(
-          `Direct Candidate Task main left its managed branch: ${entry.projectId}/${branch}.`
-        );
-      }
-      const headCommit = (await this.git.inspect(entry.path, "HEAD")).baseCommit;
-      if (!await this.git.isAncestor(entry.path, entry.baseCommit, headCommit)) {
-        throw new Error(
-          `Direct Candidate Task main does not descend from its recorded base: ${entry.projectId}.`
-        );
-      }
-      projects.push({ projectId: entry.projectId, headCommit });
-    }
-    return createDirectTaskMainSnapshot(workspace, projectIds, projects);
   }
 
   async prepareWorkItemWorkspace(

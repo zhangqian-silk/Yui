@@ -288,32 +288,6 @@ test("Role launches clear inherited process environment and use only the complet
   ]);
 });
 
-test("a launch-carried prompt cannot record Yui's own pane marker as transport acknowledgement", () => {
-  const calls = [];
-  const manager = new TmuxManager("tmux-test", {
-    run(command, args) {
-      calls.push({ command, args });
-      if (tmuxCommand(args) === "has-session") throw new Error("absent");
-      return "";
-    }
-  }, { yuiHome: "/tmp/yui-home" });
-
-  manager.ensureRoleWindow("task-1", { name: "worker", workspace: "/tmp/work" }, {
-    // Reproduces the bounded gap without an Agent: tmux can create this pane
-    // successfully even though no provider can accept the prompt.
-    command: "/bin/sh",
-    args: ["-c", "sleep 0.01"],
-    env: {},
-    initialPromptReceiptId: "exact-transport-receipt"
-  });
-
-  const launch = calls.find(({ args }) => args.includes("new-session"));
-  assert.deepEqual(launch.args.slice(launch.args.indexOf("--") + 1), [
-    "env", "-i", "--", "/bin/sh", "-c", "sleep 0.01"
-  ]);
-  assert.equal(launch.args.includes("set-option", launch.args.indexOf("new-session")), false);
-});
-
 class TtyInput extends PassThrough {
   isTTY = true;
   isRaw = true;
@@ -776,16 +750,9 @@ test("real tmux delivery applies one receipt and one command", async (t) => {
   const ready = ({ dead, pid, currentCommand }) => (
     !dead && pid !== undefined && currentCommand === "bash"
   );
-  let delivery = "not-ready";
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    delivery = await manager.sendRoleInputOnceIfReadyAsync(
-      taskId, roleName, receiptId, input, ready
-    );
-    if (delivery === "sent") break;
-    assert.equal(delivery, "not-ready");
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.equal(delivery, "sent");
+  assert.equal(await manager.sendRoleInputOnceIfReadyAsync(
+    taskId, roleName, receiptId, input, ready
+  ), "sent");
   assert.equal(await manager.sendRoleInputOnceIfReadyAsync(
     taskId, roleName, receiptId, input, () => {
       throw new Error("an existing receipt must bypass readiness");

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
@@ -11,7 +11,6 @@ import { bindExecution, claimPending } from "../../dist/coordination/workMailbox
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { createTaskMessage } from "../../dist/message/message.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
-import { stopFileTaskController } from "../../dist/controller/clientRuntime.js";
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
@@ -26,16 +25,6 @@ import { activateTask, createTask } from "../../dist/task/task.js";
 import { createRole, createRoleAgentBinding, updateRoleStatus } from "../../dist/role/role.js";
 import { markAgentRunDelivered } from "../../dist/run/agentRun.js";
 import {
-  EXACT_CONTROL_ARGUMENT,
-  YUI_CONTROL_PLANE_DESCRIPTOR,
-  YUI_TASK_RUNTIME_DESCRIPTOR,
-  createExactControlPlaneDescriptor,
-  createExactTaskRuntimeDescriptor,
-  exactControlPlaneDigest,
-  exactTaskRuntimeDescriptorPath,
-  serializeExactDescriptor
-} from "../../dist/runtime/exactControlPlane.js";
-import {
   createWorkItem,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
@@ -48,10 +37,7 @@ const EXPIRED_RECONCILE = new Date("2026-08-05T00:50:00.000Z");
 
 function fixture(t) {
   const home = mkdtempSync(join(tmpdir(), "yui-leader-action-"));
-  t.after(async () => {
-    await stopFileTaskController(home);
-    rmSync(home, { recursive: true, force: true });
-  });
+  t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home, START);
   const store = new FileTaskStore(home);
   const agent = createConfiguredAgent("codex", "codex", "codex", [], [], START);
@@ -148,7 +134,6 @@ function fixture(t) {
       YUI_ROLE: "leader",
       YUI_AGENT_ID: "codex",
       YUI_ADAPTER_ID: "codex",
-      YUI_WORKSPACE: leaderRun.effective.workspace.root,
       YUI_RUN_ID: leaderRun.id,
       YUI_LAUNCH_ID: "leader-launch",
       YUI_NATIVE_SESSION_ID: "leader-native"
@@ -358,37 +343,12 @@ test("fixed Leader Session uses an exact per-command current-turn assertion", as
 
   // The production CLI receives the per-command assertion through its child
   // environment even though the fixed provider process retains stale values.
-  const cliEntry = join(process.cwd(), "dist", "cli.js");
-  const control = createExactControlPlaneDescriptor({
-    executable: process.execPath,
-    cliEntry,
-    yuiHome: store.rootDirectory()
-  });
-  const controlDigest = exactControlPlaneDigest(control);
-  const runtime = createExactTaskRuntimeDescriptor({
-    controlPlaneDigest: controlDigest,
-    taskId: task.id,
-    roleName: "leader",
-    agentId: "codex",
-    adapterId: "codex",
-    workspace: leaderRun.effective.workspace.root,
-    runId: leaderRun.id,
-    launchId: "leader-launch",
-    nativeSessionId: "leader-native"
-  });
-  const runtimeSource = exactTaskRuntimeDescriptorPath(store.rootDirectory(), runtime);
-  mkdirSync(dirname(runtimeSource), { recursive: true });
-  writeFileSync(runtimeSource, `${serializeExactDescriptor(runtime)}\n`, { mode: 0o600 });
   const cliEnvironment = { ...process.env, ...fixedSessionEnvironment };
   delete cliEnvironment.YUI_NATIVE_SESSION_ID;
-  cliEnvironment[YUI_CONTROL_PLANE_DESCRIPTOR] = serializeExactDescriptor(control);
-  cliEnvironment[YUI_TASK_RUNTIME_DESCRIPTOR] = runtimeSource;
   const cliResult = JSON.parse(execFileSync(
     process.execPath,
     [
-      cliEntry,
-      EXACT_CONTROL_ARGUMENT,
-      controlDigest,
+      join(process.cwd(), "dist", "cli.js"),
       "--json", "task", "decision", "record", task.id,
       "--title", "Fixed Session CLI progress",
       "--rationale", "The managed launcher carries the exact current assertion."

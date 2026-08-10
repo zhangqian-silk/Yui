@@ -25,16 +25,13 @@ import {
   type SessionHostPort
 } from "../runtime/index.js";
 import type { EffectiveLaunchSnapshot } from "./effectiveLaunch.js";
-import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
-import type {
-  TaskRuntimeIsolationDescriptor,
-  TaskRuntimeLaunchPolicy
-} from "../runtime/taskRuntimeIsolation.js";
 
 export type PlannedRoleSession = Readonly<{
   role: TmuxRole;
   launch: TmuxLaunchPlan;
   session: SchedulerRoleSession | null;
+  /** Exact Run whose first prompt is carried by the provider launch argv. */
+  initialPromptRunId?: string;
 }>;
 
 export interface RoleLaunchPlanner {
@@ -47,7 +44,6 @@ export interface RoleLaunchPlanner {
     mode: RoleSessionLaunchMode;
     runId?: string;
     nativeSessionId?: string;
-    runtimeIsolation?: TaskRuntimeIsolationDescriptor;
   }>): PlannedRoleSession;
 }
 
@@ -136,8 +132,6 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     adapterId: string;
     effective: EffectiveLaunchSnapshot;
     workspace: string;
-    managedWorkspace?: ManagedWorkspace;
-    runtimePolicy?: TaskRuntimeLaunchPolicy;
     mode: RoleSessionLaunchMode;
     runId?: string;
     nativeSessionId?: string;
@@ -175,12 +169,6 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
         adapterId: input.adapterId,
         effective: input.effective,
         workspace: input.workspace,
-        ...(input.managedWorkspace === undefined
-          ? {}
-          : { managedWorkspace: input.managedWorkspace }),
-        ...(input.runtimePolicy === undefined
-          ? {}
-          : { runtimePolicy: input.runtimePolicy }),
         ...(input.runId === undefined ? {} : { runId: input.runId })
       } as const;
       if (this.runtimePorts.launchCoordinator !== undefined) {
@@ -225,7 +213,14 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     const delivery: PreparedRoleDelivery = {
       ...deliveryBase,
       ...(binding === undefined ? {} : { launchId: binding.launchId }),
-      sessionStarted
+      sessionStarted,
+      ...(
+        sessionStarted
+        && input.runId !== undefined
+        && (planned?.initialPromptRunId ?? binding?.initialPromptRunId) === input.runId
+          ? { inputSubmittedAtLaunch: true }
+          : {}
+      )
     };
     this.#prepared.set(delivery.deliveryId, {
       delivery,
@@ -254,6 +249,10 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     text: string;
   }>): Promise<"sent" | "already-sent" | "busy" | "unavailable"> {
     const prepared = this.requirePrepared(input.delivery.prepared);
+    if (input.delivery.prepared.inputSubmittedAtLaunch === true) {
+      this.#prepared.delete(input.delivery.prepared.deliveryId);
+      return "sent";
+    }
     if (prepared.binding !== undefined && this.runtimePorts !== undefined) {
       const runId = input.delivery.prepared.runId;
       if (runId === undefined) {

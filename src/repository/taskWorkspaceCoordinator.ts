@@ -1,10 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
 
-import { retireConfirmedAbsentInactiveTaskRolePlaceholders } from "../executor/agentExecutor.js";
-import {
-  hasRuntimeLifecycleWork,
-  runtimeLifecycleTarget
-} from "../runtime/lifecycleReservation.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
@@ -27,10 +22,6 @@ export { WorkspaceCleanupBlockedError } from "./taskWorkspacePreparer.js";
 
 export type TaskRoleRuntimeStopper = Readonly<{
   stopTaskRoleSessions(taskId: string, roleNames: readonly string[]): Promise<void>;
-  inspectTaskRolePanes?(taskId: string): readonly Readonly<{
-    roleName: string;
-    dead: boolean;
-  }>[];
 }>;
 
 type TaskArchiveSnapshot = Readonly<{
@@ -319,78 +310,17 @@ export class TaskWorkspaceCoordinator {
   }
 
   async #stopLiveRoles(taskId: string, roleNames: readonly string[]): Promise<void> {
-    const targets = [...new Set(roleNames)];
-    const getActiveRun = this.store.getActiveAgentRun?.bind(this.store);
-    for (const roleName of targets) {
-      if (getActiveRun !== undefined && getActiveRun(taskId, roleName) !== null) {
-        throw new Error(`Role has an active Run: ${taskId}/${roleName}.`);
-      }
+    const live = roleNames.filter((roleName) => {
       const sessions = this.store.getTaskRoleSessionSet(taskId, roleName);
-      if (sessions?.inFlight !== null && sessions?.inFlight !== undefined) {
-        throw new Error(`Role has unsettled Run state: ${taskId}/${roleName}.`);
-      }
-      if (sessions?.pendingTurnCompletion !== null
-        && sessions?.pendingTurnCompletion !== undefined) {
-        throw new Error(`Role has unsettled Run state: ${taskId}/${roleName}.`);
-      }
-      if (this.store.getWorkMailbox !== undefined && hasRuntimeLifecycleWork(
-        this.store.getWorkMailbox(
-          runtimeLifecycleTarget({ scope: "task", taskId, roleName })
+      return sessions !== null && (
+        sessions.inFlight !== null
+        || sessions.pendingTurnCompletion !== null
+        || Object.values(sessions.sessions).some(
+          ({ status }) => status !== "stopped" && status !== "broken"
         )
-      )) {
-        throw new Error(`Role has unsettled runtime lifecycle state: ${taskId}/${roleName}.`);
-      }
-    }
-    const inspect = this.runtime.inspectTaskRolePanes?.bind(this.runtime);
-    const observedPanes = inspect?.(taskId);
-    const live = targets.filter((roleName) => {
-      const sessions = this.store.getTaskRoleSessionSet(taskId, roleName);
-      const activeSession = sessions === null
-        ? undefined
-        : sessions.activeAgentId === undefined
-          // Narrow test doubles and restored callers predating activeAgentId
-          // still conservatively represent any nonterminal record as live.
-          ? Object.values(sessions.sessions).find(
-              ({ status }) => status !== "stopped" && status !== "broken"
-            )
-          : sessions.sessions[sessions.activeAgentId];
-      return observedPanes?.some((pane) => pane.roleName === roleName && !pane.dead) === true
-        || (sessions !== null && activeSession !== undefined
-          && activeSession.status !== "stopped"
-          && activeSession.status !== "broken");
+      );
     });
     if (live.length > 0) await this.runtime.stopTaskRoleSessions(taskId, live);
-
-    // The aggregate-16 dormant Claude placeholder is the sole exception to
-    // strict workspace-session retirement. The synchronous pane inspection is
-    // performed while holding the Task store transaction so a normal launch
-    // cannot reserve a Run/Session between absence proof and terminalization.
-    if (inspect === undefined || this.store.transaction === undefined) return;
-    this.store.transaction((tx) => {
-      const panes = inspect(taskId);
-      for (const roleName of targets) {
-        if (panes.some((pane) => pane.roleName === roleName && !pane.dead)) {
-          throw new Error(`Task Role native pane must stop before workspace migration: ${roleName}.`);
-        }
-        if (tx.getActiveAgentRun(taskId, roleName) !== null) {
-          throw new Error(`Role has an active Run: ${taskId}/${roleName}.`);
-        }
-        if (tx.getWorkMailbox !== undefined && hasRuntimeLifecycleWork(
-          tx.getWorkMailbox(
-            runtimeLifecycleTarget({ scope: "task", taskId, roleName })
-          )
-        )) {
-          throw new Error(`Role has unsettled runtime lifecycle state: ${taskId}/${roleName}.`);
-        }
-        const sessions = tx.getTaskRoleSessionSet(taskId, roleName);
-        if (sessions === null) continue;
-        const retired = retireConfirmedAbsentInactiveTaskRolePlaceholders(
-          sessions,
-          this.preparer.now()
-        );
-        if (retired !== sessions) tx.saveTaskRoleSessionSet(retired);
-      }
-    });
   }
 
   #workItemIsolationAssignee(item: WorkItem): string | undefined {

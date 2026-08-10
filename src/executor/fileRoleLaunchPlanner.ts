@@ -40,23 +40,6 @@ import {
   resolveEffectiveLaunch,
   type EffectiveLaunchSnapshot
 } from "./effectiveLaunch.js";
-import {
-  YUI_CONTROL_PLANE_DESCRIPTOR,
-  YUI_TASK_RUNTIME_DESCRIPTOR,
-  assertExactTaskRuntimeState,
-  createExactControlPlaneDescriptor,
-  createExactTaskRuntimeDescriptor,
-  exactControlPlaneCommandPrefix,
-  exactControlPlaneDigest,
-  exactTaskRuntimeDescriptorPath,
-  serializeExactDescriptor,
-  type ExactControlPlaneDescriptor
-} from "../runtime/exactControlPlane.js";
-import {
-  parseTaskRuntimeIsolationDescriptor,
-  taskRuntimeIsolationEnvironment,
-  type TaskRuntimeIsolationDescriptor
-} from "../runtime/taskRuntimeIsolation.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
@@ -87,7 +70,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   #nativeAgentEnvironment: NodeJS.ProcessEnv;
   readonly #createNativeSessionId: () => string;
   readonly #cliPath: string;
-  readonly #controlPlane: ExactControlPlaneDescriptor;
+  readonly #managedBinPath: string;
 
   constructor(
     readonly home: string,
@@ -111,14 +94,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     this.#createNativeSessionId = options.createNativeSessionId ?? randomUUID;
     this.#cliPath = canonicalPath(options.cliPath
       ?? fileURLToPath(new URL("../cli.js", import.meta.url)));
-    // Freeze the complete control identity before any native process exists.
-    // This value is immutable for the planner/Controller lifetime and is never
-    // rewritten through a shared PATH launcher.
-    this.#controlPlane = createExactControlPlaneDescriptor({
-      executable: process.execPath,
-      cliEntry: this.#cliPath,
-      yuiHome: this.home
-    });
+    this.#managedBinPath = ensureManagedYuiLauncher(this.home, this.#cliPath);
   }
 
   refreshAgentEnvironment(refresh: AgentEnvironmentRefresh): void {
@@ -131,43 +107,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       this.#nativeAgentEnvironment,
       refresh.nativeNames,
       refresh.nativeSources
-    );
-  }
-
-  /** Re-publishes provider-discovered native identity after its durable fold. */
-  refreshTaskRuntimeDescriptor(input: Readonly<{
-    taskId: string;
-    roleName: string;
-  }>): void {
-    const task = this.store.getTask(input.taskId);
-    const role = this.store.getRole(input.taskId, input.roleName);
-    if (task === null || task.status !== "active" || role === null) {
-      throw new Error(`Task runtime is not current: ${input.taskId}/${input.roleName}.`);
-    }
-    const run = this.store.getActiveAgentRun(input.taskId, input.roleName);
-    const sessions = this.store.getTaskRoleSessionSet(input.taskId, input.roleName);
-    const session = sessions?.sessions[role.activeAgentId];
-    if (session === undefined || session.launchId === undefined) {
-      throw new Error(
-        `Task runtime native Session is not ready: ${input.taskId}/${input.roleName}.`
-      );
-    }
-    const effective = run?.effective ?? session.effective;
-    const descriptor = createExactTaskRuntimeDescriptor({
-      controlPlaneDigest: exactControlPlaneDigest(this.#controlPlane),
-      taskId: input.taskId,
-      roleName: input.roleName,
-      agentId: session.agentId,
-      adapterId: session.adapterId as "codex" | "claude",
-      workspace: effective.workspace.root,
-      ...(run === null ? {} : { runId: run.id }),
-      launchId: session.launchId,
-      nativeSessionId: session.nativeSessionId
-    });
-    assertExactTaskRuntimeState(descriptor, this.store);
-    writeTextFileAtomically(
-      exactTaskRuntimeDescriptorPath(this.home, descriptor),
-      `${serializeExactDescriptor(descriptor)}\n`
     );
   }
 
@@ -298,7 +237,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       nativeSessionId?: string;
       launchId?: string;
       runId?: string;
-      runtimeIsolation?: TaskRuntimeIsolationDescriptor;
       environment?: Readonly<Record<string, string>>;
     }>,
     owner: Readonly<{ scope: "task"; taskId: string } | { scope: "global" }>,
@@ -329,37 +267,17 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       ...operationalAgentEnvironment(configured.adapterId, operationalSourceEnvironment),
       ...resolvedAgentEnvironment
     };
-    const launchEnvironment = { ...inheritedLaunchEnvironment };
+    const launchEnvironment = {
+      ...inheritedLaunchEnvironment,
+      PATH: [
+        this.#managedBinPath,
+        inheritedLaunchEnvironment.PATH
+      ].filter((value): value is string => value !== undefined && value.length > 0)
+        .join(delimiter)
+    };
     const adapter = resolveAgentAdapter(binding.adapterId);
     const effectiveWorkspace = effective.workspace.root;
-    const runtimeIsolation = input.runtimeIsolation === undefined
-      ? undefined
-      : parseTaskRuntimeIsolationDescriptor(JSON.stringify(input.runtimeIsolation));
-    if (runtimeIsolation !== undefined && (
-      owner.scope !== "task"
-      || runtimeIsolation.taskId !== owner.taskId
-      || runtimeIsolation.workspace.root !== effectiveWorkspace
-      || runtimeIsolation.generation.runId !== input.runId
-      || runtimeIsolation.generation.launchId !== input.launchId
-    )) {
-      throw new Error("Role launch does not match its Task runtime isolation descriptor.");
-    }
-    Object.assign(
-      launchEnvironment,
-      runtimeIsolation === undefined
-        ? {}
-        : taskRuntimeIsolationEnvironment(runtimeIsolation)
-    );
-    const baseSessionContext = compileRoleSessionContext(this.home, launchRole, owner);
-    const sessionContext = owner.scope === "task"
-      ? {
-          ...baseSessionContext,
-          developerInstructions: [
-            baseSessionContext.developerInstructions,
-            renderExactControlPlaneInstructions(this.#controlPlane)
-          ].join("\n")
-        }
-      : baseSessionContext;
+    const sessionContext = compileRoleSessionContext(this.home, launchRole, owner);
     const codexConfig = binding.config.adapterId === "codex"
       ? inspectCodexLaunchConfig({
           environment: {
@@ -389,8 +307,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           binding.config,
           owner.taskId,
           managedRun?.workItemId,
-          input.runId,
-          this.#controlPlane
+          input.runId
         )
       : binding.config;
     const compileInput = {
@@ -480,30 +397,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       session = readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective);
     }
 
-    const runtimeDescriptor = owner.scope === "task"
-      ? createExactTaskRuntimeDescriptor({
-          controlPlaneDigest: exactControlPlaneDigest(this.#controlPlane),
-          taskId: owner.taskId,
-          roleName: role.name,
-          agentId: configured.id,
-          adapterId: configured.adapterId,
-          workspace: effectiveWorkspace,
-          ...(input.runId === undefined ? {} : { runId: input.runId }),
-          ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
-          ...(session === null
-            ? {}
-            : { nativeSessionId: session.nativeSessionId })
-        })
-      : undefined;
-    const runtimeDescriptorSource = runtimeDescriptor === undefined
-      ? undefined
-      : exactTaskRuntimeDescriptorPath(this.home, runtimeDescriptor);
-    if (runtimeDescriptor !== undefined && runtimeDescriptorSource !== undefined) {
-      writeTextFileAtomically(
-        runtimeDescriptorSource,
-        `${serializeExactDescriptor(runtimeDescriptor)}\n`
-      );
-    }
     const launch = {
       command: configured.command,
       args,
@@ -516,12 +409,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         YUI_AGENT_ID: configured.id,
         YUI_ADAPTER_ID: configured.adapterId,
         YUI_WORKSPACE: effectiveWorkspace,
-        ...(runtimeDescriptor === undefined
-          ? {}
-          : {
-              [YUI_CONTROL_PLANE_DESCRIPTOR]: serializeExactDescriptor(this.#controlPlane),
-              [YUI_TASK_RUNTIME_DESCRIPTOR]: runtimeDescriptorSource!
-            }),
         ...(sessionTitle === undefined
           ? {}
           : {
@@ -552,7 +439,10 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         ...(owner.scope === "task" ? { status: (role as TaskRole).status } : {})
       },
       launch: scopedLaunch,
-      session
+      session,
+      ...(binding.adapterId === "codex" && input.runId !== undefined
+        ? { initialPromptRunId: input.runId }
+        : {})
     };
   }
 
@@ -656,6 +546,21 @@ function workspaceScopeEnvironment(
   };
 }
 
+function ensureManagedYuiLauncher(home: string, cliPath: string): string {
+  const binPath = join(resolve(home), "runtime", "bin");
+  const launcherPath = join(binPath, "yui");
+  writeTextFileAtomically(
+    launcherPath,
+    [
+      "#!/bin/sh",
+      `exec ${shellQuote(canonicalPath(process.execPath))} ${shellQuote(cliPath)} "$@"`,
+      ""
+    ].join("\n")
+  );
+  chmodSync(launcherPath, 0o700);
+  return binPath;
+}
+
 function ensureManagedClaudeLifecyclePlugin(home: string, cliPath: string): string {
   const root = join(resolve(home), "runtime", "claude-lifecycle-plugin");
   writeTextFileAtomically(
@@ -694,18 +599,16 @@ function managedClaudeControlPlaneConfig(
   config: ClaudeAgentConfig,
   taskId: string,
   workItemId: string | undefined,
-  runId: string,
-  controlPlane: ExactControlPlaneDescriptor
+  runId: string
 ): ClaudeAgentConfig {
   if (config.permission.strategy !== "configured") return config;
-  const exact = exactControlPlaneCommandPrefix(controlPlane);
   const managed = [
-    `Bash(${exact} --json task context ${taskId})`,
-    `Bash(${exact} --json task work list ${taskId})`,
+    `Bash(yui --json task context ${taskId})`,
+    `Bash(yui --json task work list ${taskId})`,
     ...(workItemId === undefined
       ? []
-      : [`Bash(${exact} --json task work show ${workItemId})`]),
-    `Bash(${exact} task run yield ${runId} --summary-file -:*)`
+      : [`Bash(yui --json task work show ${workItemId})`]),
+    `Bash(yui task run yield ${runId} --summary-file -:*)`
   ];
   const existing = (config.permission.allowedTools ?? [])
     .filter((rule) => !isManagedYuiBashRule(rule));
@@ -719,21 +622,7 @@ function managedClaudeControlPlaneConfig(
 }
 
 function isManagedYuiBashRule(rule: string): boolean {
-  const normalized = rule.trim();
-  return /^Bash\(yui(?:\s|:\*|\*|\))/u.test(normalized)
-    || /^Bash\(.*\s--yui-control\s/u.test(normalized);
-}
-
-function renderExactControlPlaneInstructions(
-  descriptor: ExactControlPlaneDescriptor
-): string {
-  const command = exactControlPlaneCommandPrefix(descriptor);
-  return [
-    "Exact Yui control-plane command prefix for this managed Task session:",
-    `\`${command}\``,
-    "Replace the portable bare `yui` token in Yui Role Skills and dispatch instructions with this exact prefix.",
-    "Bare `yui`, a PATH launcher, another checkout CLI, another YUI_HOME, or a changed schema/Controller identity is invalid and fails before Task state is read or written."
-  ].join("\n");
+  return /^Bash\(yui(?:\s|:\*|\*|\))/u.test(rule.trim());
 }
 
 function canonicalPath(path: string): string {

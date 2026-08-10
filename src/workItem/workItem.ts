@@ -7,11 +7,6 @@ import {
 } from "../domain/validation.js";
 import { validateReviewConfig, type ReviewConfig } from "../review/reviewConfig.js";
 import {
-  taskFinalReviewConfig,
-  validateTaskFinalReviewContract,
-  type TaskFinalReviewContract
-} from "../review/taskFinalReviewContract.js";
-import {
   validateManagedWorkspace,
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
@@ -61,23 +56,6 @@ export type CandidateGitSnapshot = Readonly<{
   }>[];
 }>;
 
-/**
- * Frozen provenance for an exact-contract Leader-direct Candidate. Task main
- * workspace records intentionally follow the physical branch HEAD as the
- * Controller prepares Roles, so they cannot also serve as an immutable
- * ChangeSet boundary.
- */
-export type DirectTaskMainSnapshot = Readonly<{
-  schemaVersion: 1;
-  projects: readonly Readonly<{
-    projectId: string;
-    directory: string;
-    branch: string;
-    baseCommit: string;
-    headCommit: string;
-  }>[];
-}>;
-
 export type WorkItemCandidate = Readonly<{
   schemaVersion: 2;
   id: string;
@@ -90,12 +68,9 @@ export type WorkItemCandidate = Readonly<{
     | Readonly<{ type: "direct" }>
     | Readonly<{ type: "run"; runId: string }>;
   reviewPolicy?: ReviewConfig;
-  taskFinalReviewContract?: TaskFinalReviewContract;
   /** Snapshot of the WorkItem-owned Develop workspace at candidate time. */
   workspace?: ManagedWorkspace;
   gitSnapshot?: CandidateGitSnapshot;
-  /** Exact base/head boundary for a metadata-only direct Task-main Candidate. */
-  taskMainSnapshot?: DirectTaskMainSnapshot;
   createdAt: string;
 }>;
 
@@ -177,10 +152,8 @@ export function submitWorkItemCandidate(
       | Readonly<{ type: "direct" }>
       | Readonly<{ type: "run"; runId: string }>;
     reviewPolicy?: ReviewConfig;
-    taskFinalReviewContract?: TaskFinalReviewContract;
     workspace?: ManagedWorkspace;
     gitSnapshot?: CandidateGitSnapshot;
-    taskMainSnapshot?: DirectTaskMainSnapshot;
   }>,
   now: Date
 ): WorkItem {
@@ -202,14 +175,8 @@ export function submitWorkItemCandidate(
     summary: input.summary,
     source: input.source,
     ...(input.reviewPolicy === undefined ? {} : { reviewPolicy: input.reviewPolicy }),
-    ...(input.taskFinalReviewContract === undefined
-      ? {}
-      : { taskFinalReviewContract: input.taskFinalReviewContract }),
     ...(input.workspace === undefined ? {} : { workspace: input.workspace }),
     ...(input.gitSnapshot === undefined ? {} : { gitSnapshot: input.gitSnapshot }),
-    ...(input.taskMainSnapshot === undefined
-      ? {}
-      : { taskMainSnapshot: input.taskMainSnapshot }),
     createdAt: now.toISOString()
   });
   const { outcome: _outcome, endedAt: _endedAt, ...base } = workItem;
@@ -481,17 +448,6 @@ export function validateWorkItemCandidate(
     }, "agentRun");
   }
   if (candidate.reviewPolicy !== undefined) validateReviewConfig(candidate.reviewPolicy);
-  if (candidate.taskFinalReviewContract !== undefined) {
-    const contract = validateTaskFinalReviewContract(candidate.taskFinalReviewContract);
-    if (contract.taskId !== candidate.taskId) {
-      throw new Error("Task final-review contract belongs to another Task.");
-    }
-    const policy = taskFinalReviewConfig(contract);
-    if (candidate.reviewPolicy?.roleName !== policy.roleName
-      || candidate.reviewPolicy.trigger !== policy.trigger) {
-      throw new Error("Task final-review contract does not match the Candidate review policy.");
-    }
-  }
   if (candidate.workspace !== undefined) {
     validateManagedWorkspace(candidate.workspace);
     if (candidate.workspace.owner.type !== "work-item"
@@ -506,91 +462,8 @@ export function validateWorkItemCandidate(
     }
     validateCandidateGitSnapshot(candidate.gitSnapshot, candidate.workspace);
   }
-  if (candidate.taskMainSnapshot !== undefined) {
-    if (candidate.source.type !== "direct"
-      || candidate.workspace !== undefined
-      || candidate.gitSnapshot !== undefined
-      || candidate.taskFinalReviewContract === undefined) {
-      throw new Error(
-        "Task-main Candidate snapshot requires an exact direct metadata-only Candidate."
-      );
-    }
-    validateDirectTaskMainSnapshot(candidate.taskMainSnapshot);
-  }
   requireTimestamp(candidate.createdAt, "Work Item candidate createdAt");
   return candidate;
-}
-
-export function createDirectTaskMainSnapshot(
-  workspace: ManagedWorkspace,
-  projectIds: readonly string[],
-  heads: readonly Readonly<{ projectId: string; headCommit: string }>[]
-): DirectTaskMainSnapshot {
-  validateManagedWorkspace(workspace);
-  if (workspace.owner.type !== "task") {
-    throw new Error("Direct Candidate snapshot must come from Task main.");
-  }
-  const selected = normalizedUniqueIdentities(
-    projectIds,
-    "Direct Candidate snapshot Project"
-  );
-  const headByProject = new Map(heads.map(({ projectId, headCommit }) => [
-    requireIdentity(projectId, "Direct Candidate snapshot Project"),
-    requireCommit(headCommit, "Direct Candidate snapshot head")
-  ]));
-  if (headByProject.size !== heads.length) {
-    throw new Error("Direct Candidate snapshot Projects are duplicated.");
-  }
-  const projects = workspace.entries
-    .filter(({ projectId }) => selected.includes(projectId))
-    .map((entry) => {
-      if (entry.access !== "write") {
-        throw new Error(
-          `Direct Candidate snapshot Project is not writable: ${entry.projectId}.`
-        );
-      }
-      const headCommit = headByProject.get(entry.projectId);
-      if (headCommit === undefined) {
-        throw new Error(
-          `Direct Candidate snapshot Project head is missing: ${entry.projectId}.`
-        );
-      }
-      return {
-        projectId: entry.projectId,
-        directory: entry.directory,
-        branch: entry.branch,
-        baseCommit: entry.baseCommit,
-        headCommit
-      };
-    });
-  if (projects.length !== selected.length || projects.length !== headByProject.size) {
-    throw new Error("Direct Candidate snapshot Project scope does not match Task main.");
-  }
-  return validateDirectTaskMainSnapshot({ schemaVersion: 1, projects });
-}
-
-function validateDirectTaskMainSnapshot(
-  snapshot: DirectTaskMainSnapshot
-): DirectTaskMainSnapshot {
-  if (typeof snapshot !== "object" || snapshot === null || snapshot.schemaVersion !== 1) {
-    throw new Error("Direct Candidate Task-main snapshot must use schemaVersion 1.");
-  }
-  if (!Array.isArray(snapshot.projects) || snapshot.projects.length === 0) {
-    throw new Error("Direct Candidate Task-main snapshot requires a Project.");
-  }
-  const projectIds = new Set<string>();
-  for (const project of snapshot.projects) {
-    const projectId = requireIdentity(project.projectId, "Direct Candidate snapshot Project");
-    if (projectIds.has(projectId)) {
-      throw new Error("Direct Candidate snapshot Projects are duplicated.");
-    }
-    projectIds.add(projectId);
-    requireText(project.directory, "Direct Candidate snapshot directory");
-    requireText(project.branch, "Direct Candidate snapshot branch");
-    requireCommit(project.baseCommit, "Direct Candidate snapshot base");
-    requireCommit(project.headCommit, "Direct Candidate snapshot head");
-  }
-  return snapshot;
 }
 
 export function createCandidateGitSnapshot(

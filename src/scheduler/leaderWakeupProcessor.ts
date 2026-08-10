@@ -147,9 +147,6 @@ export async function processLeaderWakeups(
         input,
         now,
         {
-          ...(role.managedWorkspace === undefined
-            ? {}
-            : { workspace: role.managedWorkspace }),
           effective: role.effective
         }
       );
@@ -182,9 +179,6 @@ export async function processLeaderWakeups(
         adapterId: role.effective.adapterId,
         effective: role.effective,
         workspace: role.effective.workspace.root,
-        ...(run.workspace === undefined
-          ? {}
-          : { managedWorkspace: run.workspace }),
         mode,
         runId: run.id,
         ...(mode === "resume" ? { nativeSessionId: existingSession!.nativeSessionId } : {})

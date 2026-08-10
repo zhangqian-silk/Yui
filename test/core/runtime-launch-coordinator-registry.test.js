@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -23,7 +23,6 @@ import {
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
 } from "../../dist/runtime/lifecycleReservation.js";
-import { FileTaskRuntimeIsolation } from "../../dist/runtime/taskRuntimeIsolation.js";
 import {
   createRole,
   createRoleAgentBinding,
@@ -39,7 +38,6 @@ import {
   createWorkItem,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
-import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 
 const NOW = new Date("2026-07-24T00:00:00.000Z");
 
@@ -103,7 +101,6 @@ function assertReservation(fx, roleName, launchId, runId) {
 }
 
 function runtimeBinding(request, options = {}) {
-  const hostCreated = options.hostCreated ?? false;
   return {
     id: `binding-${options.index ?? 1}`,
     launchId: request.launchId,
@@ -111,7 +108,7 @@ function runtimeBinding(request, options = {}) {
     agentId: request.agentId,
     adapterId: request.adapterId,
     hostRef: `host-${request.owner.roleName}`,
-    hostCreated,
+    hostCreated: options.hostCreated ?? true,
     ...(options.nativeSessionId === undefined
       ? {}
       : { nativeSessionId: options.nativeSessionId })
@@ -175,25 +172,6 @@ function prepareInput(fx, roleName, runId, adapterId = fx.agent.adapterId) {
   };
 }
 
-function taskRuntimeFixture(t, fx) {
-  const runtimeRoot = `${fx.home}-task-runtimes`;
-  t.after(() => rmSync(runtimeRoot, { recursive: true, force: true }));
-  const workspace = createManagedWorkspace({
-    owner: { type: "task", taskId: fx.task.id },
-    root: fx.home,
-    entries: []
-  }, NOW);
-  const isolation = new FileTaskRuntimeIsolation({
-    runtimeRoot,
-    controlPlane: {
-      yuiHome: fx.home,
-      controllerSocketPath: join(fx.home, "controller.sock"),
-      tmuxNamespace: "yui-test-control"
-    }
-  });
-  return { isolation, workspace };
-}
-
 async function waitFor(predicate, label, timeoutMs = 1_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -254,9 +232,8 @@ async function controllerRecoveryFixture(t, persistPrepared) {
   };
   const host = {
     async start(request) {
-      const hostCreated = persistPrepared && (
-        controls.starts.length === 0 || controls.recreateNextStart
-      );
+      const hostCreated = controls.starts.length === 0
+        || controls.recreateNextStart;
       controls.recreateNextStart = false;
       controls.state = "running";
       controls.starts.push(request);
@@ -400,14 +377,14 @@ function prePreparedControllerRecoveryFixture(t) {
   return controllerRecoveryFixture(t, false);
 }
 
-test("fresh Claude Leader and Worker reserve before start and their first matching Hook binds the native session", async (t) => {
-  const fx = fixture(t, "claude");
+test("fresh Codex Leader and Worker reserve before start and their first matching Hook binds the native session", async (t) => {
+  const fx = fixture(t);
   const starts = [];
   const host = {
     async start(request) {
       assertReservation(fx, request.owner.roleName, request.launchId);
       starts.push(request);
-      return runtimeBinding(request, { index: starts.length, hostCreated: true });
+      return runtimeBinding(request, { index: starts.length });
     },
     async resume() { throw new Error("resume is not expected"); },
     async stop() {},
@@ -465,84 +442,13 @@ test("fresh Claude Leader and Worker reserve before start and their first matchi
   );
 });
 
-test("a fresh Codex argv prompt without provider acknowledgement retains the reservation and never falls back to push", async (t) => {
-  const fx = fixture(t);
-  const item = updateWorkItemStatus(createWorkItem(
-    "work-item-1",
-    fx.task.id,
-    { title: "Fresh Codex bounded gap", assignee: "worker" },
-    NOW
-  ), "running", NOW);
-  fx.store.saveWorkItem(fx.task.id, item);
-  const effective = fx.schedulerStore.getRole(fx.task.id, "worker").effective;
-  fx.store.saveAgentRun(createAgentRun(
-    "agent-run-1",
-    fx.task.id,
-    "worker",
-    "new",
-    "prepare agent-run-1",
-    NOW,
-    { effective, workItemId: item.id }
-  ));
-  let pushes = 0;
-  const host = {
-    async start(request) {
-      return runtimeBinding(request, { hostCreated: true });
-    },
-    async resume() { throw new Error("resume is not expected"); },
-    async stop() { throw new Error("an unacknowledged binding must not be trusted"); },
-    async inspect() { return { state: "running" }; },
-    async inspectOwner() { return { state: "running" }; },
-    async stopOwner() { return true; }
-  };
-  const delivery = registry(
-    new RuntimeLaunchCoordinator(fx.schedulerStore, host, {
-      createGenerationId: () => "missing-receipt-generation",
-      now: () => NOW
-    }),
-    host,
-    async () => {
-      pushes += 1;
-      return "delivered";
-    }
-  );
-
-  await assert.rejects(
-    delivery.prepareRoleSession(prepareInput(fx, "worker", "agent-run-1")),
-    /cannot acknowledge the exact launch-carried prompt/i
-  );
-  const mailbox = reservationMailbox(fx, "worker");
-  assert.ok(mailbox);
-  assert.equal(isRuntimeLaunchReservation(mailbox.processing), true);
-  assert.deepEqual(mailbox.processing.batch.reasons, [RUNTIME_LAUNCH_RESERVED_REASON]);
-  assert.deepEqual(mailbox.processing.executionRef, {
-    type: "run",
-    taskId: fx.task.id,
-    id: "agent-run-1"
-  });
-  assert.deepEqual(mailbox.pending.reasons, [RUNTIME_CLEANUP_REQUIRED_REASON]);
-  assert.equal(pushes, 0);
-  const run = fx.store.getAgentRun(fx.task.id, "agent-run-1");
-  assert.equal(run.pushedAt, undefined);
-  assert.equal(run.deliveredAt, undefined);
-  assert.equal(
-    fx.store.listEvents(fx.task.id).filter(({ type }) => (
-      type === "run.pushed" || type === "run.delivered"
-    )).length,
-    0
-  );
-  assert.equal(fx.store.getWorkItem(fx.task.id, item.id).candidates.length, 0);
-});
-
 test("a busy retry for one delivery reuses the prepared binding without starting twice", async (t) => {
   const fx = fixture(t);
   let starts = 0;
   const host = {
     async start(request) {
       starts += 1;
-      // An already-running Role pane receives this new Run through the active
-      // push path; no launch argv receipt exists for the new prompt.
-      return runtimeBinding(request, { hostCreated: false });
+      return runtimeBinding(request);
     },
     async resume() { throw new Error("resume is not expected"); },
     async stop() {},
@@ -717,9 +623,9 @@ for (const inspectionState of ["stopped", "running", "unavailable"]) {
   });
 }
 
-test("same-Run recovery without provider acknowledgement retains its generation and fails closed", async (t) => {
+test("after Controller restart an existing running host reuses its generation without creating another host", async (t) => {
   const fx = fixture(t);
-  let hostPresent = true;
+  let hostPresent = false;
   let createdHosts = 0;
   const starts = [];
   const host = {
@@ -769,18 +675,19 @@ test("same-Run recovery without provider acknowledgement retains its generation 
       now: () => NOW
     }
   );
-  await assert.rejects(
-    registry(restartedCoordinator, host).prepareRoleSession(
-      prepareInput(fx, "leader", "agent-run-1")
-    ),
-    /cannot acknowledge the exact launch-carried prompt/i
+  const recovered = await registry(
+    restartedCoordinator,
+    host
+  ).prepareRoleSession(
+    prepareInput(fx, "leader", "agent-run-1")
   );
 
-  assert.equal(createdHosts, 0);
+  assert.equal(recovered.launchId, first.launchId);
+  assert.equal(recovered.sessionStarted, false);
+  assert.equal(createdHosts, 1);
   assert.equal(starts.length, 2);
   assert.equal(starts[1].launchId, first.launchId);
-  const mailbox = assertReservation(fx, "leader", first.launchId);
-  assert.deepEqual(mailbox.pending.reasons, [RUNTIME_CLEANUP_REQUIRED_REASON]);
+  assertReservation(fx, "leader", first.launchId);
 });
 
 for (const inspectionState of ["starting", "unavailable"]) {
@@ -791,7 +698,7 @@ for (const inspectionState of ["starting", "unavailable"]) {
     const host = {
       async start(request) {
         starts += 1;
-        return runtimeBinding(request, { index: starts, hostCreated: false });
+        return runtimeBinding(request, { index: starts, hostCreated: true });
       },
       async resume() { throw new Error("resume is not expected"); },
       async stop() {},
@@ -837,13 +744,13 @@ for (const inspectionState of ["starting", "unavailable"]) {
 
 test("a confirmed-stopped generation is lost for the same active Run instead of renewed", async (t) => {
   const fx = fixture(t);
-  let hostPresent = true;
+  let hostPresent = false;
   let starts = 0;
   const host = {
     async start(request) {
       starts += 1;
       hostPresent = true;
-      return runtimeBinding(request, { index: starts, hostCreated: false });
+      return runtimeBinding(request, { index: starts, hostCreated: true });
     },
     async resume() { throw new Error("resume is not expected"); },
     async stop() { hostPresent = false; },
@@ -887,7 +794,7 @@ test("a confirmed-stopped generation is lost for the same active Run instead of 
 });
 
 test("a host recreated after a same-Run running probe reports generation loss without renewal", async (t) => {
-  const fx = fixture(t, "claude");
+  const fx = fixture(t);
   let hostPresent = false;
   let starts = 0;
   let stops = 0;
@@ -901,10 +808,7 @@ test("a host recreated after a same-Run running probe reports generation loss wi
       }
       const hostCreated = !hostPresent;
       hostPresent = true;
-      return runtimeBinding(request, {
-        index: starts,
-        hostCreated
-      });
+      return runtimeBinding(request, { index: starts, hostCreated });
     },
     async resume() { throw new Error("resume is not expected"); },
     async stop() {
@@ -1153,7 +1057,7 @@ for (const runtimeState of ["starting", "unavailable"]) {
       new Set(workerStarts.map((request) => request.launchId)),
       new Set([fx.launchId])
     );
-    assert.equal(fx.controls.hostCreations, 0);
+    assert.equal(fx.controls.hostCreations, 1);
 
     fx.controls.allowStopOwner = true;
     recovery.controller.signal(`role:${fx.task.id}/${fx.roleName}`);
@@ -1198,7 +1102,7 @@ for (const runtimeState of ["starting", "unavailable"]) {
 }
 
 for (const recoveryLoss of ["stopped", "recreated"]) {
-  test(`Controller terminalizes a pre-prepared same-Run ${recoveryLoss} generation loss and queues cleanup`, async (t) => {
+  test(`Controller immediately terminalizes a pre-prepared same-Run ${recoveryLoss} generation loss`, async (t) => {
     const fx = await prePreparedControllerRecoveryFixture(t);
     fx.controls.allowStopOwner = false;
     if (recoveryLoss === "stopped") {
@@ -1233,7 +1137,6 @@ for (const recoveryLoss of ["stopped", "recreated"]) {
       0
     );
 
-    recovery.controller.signal(`role:${fx.task.id}/${fx.roleName}`);
     await waitFor(
       () => fx.controls.stoppedOwners.includes(fx.roleName),
       `the pre-prepared ${recoveryLoss} cleanup attempt`
@@ -1258,39 +1161,42 @@ for (const recoveryLoss of ["stopped", "recreated"]) {
 }
 
 for (const initialState of ["starting", "unavailable"]) {
-  test(`Controller fails closed when pre-prepared ${initialState}-to-running Codex recovery lacks provider acknowledgement`, async (t) => {
+  test(`Controller persists and delivers a pre-prepared ${initialState}-to-running Run on its original generation`, async (t) => {
     const fx = await prePreparedControllerRecoveryFixture(t);
     fx.controls.inspections.push(initialState, "running");
-    fx.controls.allowStopOwner = false;
     fx.controls.pushOutcome = "sent";
     const recovery = fx.startController(2);
 
     recovery.controller.signal(`role:${fx.task.id}/${fx.roleName}`);
     await waitFor(
-      () => recovery.store.getAgentRun(fx.task.id, fx.run.id)?.status === "failed",
-      `the pre-prepared ${initialState} Run to fail closed`
+      () => recovery.store.getAgentRun(fx.task.id, fx.run.id)?.pushedAt !== undefined,
+      `the pre-prepared ${initialState} Run to deliver`
     );
 
-    const failed = recovery.store.getAgentRun(fx.task.id, fx.run.id);
-    assert.equal(failed.pushedAt, undefined);
-    assert.equal(failed.deliveredAt, undefined);
-    assert.equal(recovery.store.getTaskRoleSessionSet(fx.task.id, fx.roleName), null);
+    const delivered = recovery.store.getAgentRun(fx.task.id, fx.run.id);
+    assert.equal(delivered.status, "active");
+    const sessions = recovery.store.getTaskRoleSessionSet(
+      fx.task.id,
+      fx.roleName
+    );
+    assert.equal(sessions.sessions[fx.agent.id], undefined);
+    assert.equal(sessions.inFlight.runId, fx.run.id);
+    assert.notEqual(sessions.inFlight.pushedAt, undefined);
+    assert.equal(sessions.inFlight.deliveredAt, undefined);
     const workerStarts = fx.controls.starts.filter(
       (request) => request.owner.roleName === fx.roleName
     );
     assert.equal(workerStarts.length, 2);
-    assert.equal(fx.controls.hostCreations, 0);
+    assert.equal(fx.controls.hostCreations, 1);
     assert.deepEqual(
       new Set(workerStarts.map((request) => request.launchId)),
       new Set([fx.launchId])
     );
-    assert.equal(
-      hasRuntimeCleanupObligation(reservationMailbox(fx, fx.roleName)),
-      true
-    );
+    assertReservation(fx, fx.roleName, fx.launchId, fx.run.id);
     const item = recovery.store.getWorkItem(fx.task.id, fx.item.id);
-    assert.equal(item.status, "failed");
+    assert.equal(item.status, "running");
     assert.equal(item.candidates.length, 0);
+    assert.deepEqual(recovery.errors, []);
   });
 }
 
@@ -1349,7 +1255,7 @@ for (const conflict of ["session", "in-flight"]) {
 
 test("a foreground preflight failure cannot enqueue cleanup for an existing healthy generation", async (t) => {
   const fx = fixture(t);
-  let hostPresent = true;
+  let hostPresent = false;
   let rejectRebind = false;
   let stops = 0;
   const host = {
@@ -1362,7 +1268,7 @@ test("a foreground preflight failure cannot enqueue cleanup for an existing heal
         throw new Error("foreground Codex config conflict");
       }
       hostPresent = true;
-      return runtimeBinding(request, { hostCreated: false });
+      return runtimeBinding(request, { hostCreated: true });
     },
     async resume() { throw new Error("resume is not expected"); },
     async stop() {
@@ -1526,8 +1432,7 @@ test("a resume binding with the wrong native identity is fenced into owner clean
 });
 
 test("a stopped pre-binding host gets a new generation and the old generation Hook is obsolete", async (t) => {
-  const fx = fixture(t, "claude");
-  const taskRuntime = taskRuntimeFixture(t, fx);
+  const fx = fixture(t);
   let hostPresent = false;
   let createdHosts = 0;
   const starts = [];
@@ -1559,18 +1464,12 @@ test("a stopped pre-binding host gets a new generation and the old generation Ho
     host,
     {
       createGenerationId: () => "old-generation",
-      now: () => NOW,
-      runtimeIsolation: taskRuntime.isolation
+      now: () => NOW
     }
   );
   const first = await registry(firstCoordinator, host).prepareRoleSession(
-    {
-      ...prepareInput(fx, "worker", "agent-run-1"),
-      managedWorkspace: taskRuntime.workspace
-    }
+    prepareInput(fx, "worker", "agent-run-1")
   );
-  const oldGenerationRoot = starts[0].runtimeIsolation.roots.generation;
-  assert.equal(existsSync(oldGenerationRoot), true);
   hostPresent = false;
 
   const restartedStore = new FileTaskStore(fx.home);
@@ -1580,20 +1479,15 @@ test("a stopped pre-binding host gets a new generation and the old generation Ho
     host,
     {
       createGenerationId: () => "new-generation",
-      now: () => NOW,
-      runtimeIsolation: taskRuntime.isolation
+      now: () => NOW
     }
   );
-  const laterInput = {
-    ...prepareInput(fx, "worker", "agent-run-2"),
-    managedWorkspace: taskRuntime.workspace
-  };
+  const laterInput = prepareInput(fx, "worker", "agent-run-2");
   await assert.rejects(
     registry(restartedCoordinator, host).prepareRoleSession(laterInput),
     /reservation changed during recovery/i
   );
   assertReservation(fx, "worker", first.launchId, "agent-run-1");
-  assert.equal(existsSync(oldGenerationRoot), true);
 
   const priorRun = fx.store.getAgentRun(fx.task.id, "agent-run-1");
   fx.store.saveAgentRun(failAgentRun(
@@ -1607,8 +1501,6 @@ test("a stopped pre-binding host gets a new generation and the old generation Ho
   ).prepareRoleSession(laterInput);
 
   assert.notEqual(recovered.launchId, first.launchId);
-  assert.equal(existsSync(oldGenerationRoot), false);
-  assert.equal(existsSync(starts.at(-1).runtimeIsolation.roots.generation), true);
   assert.equal(recovered.sessionStarted, true);
   assert.equal(createdHosts, 2);
   assertReservation(fx, "worker", recovered.launchId);
@@ -1638,187 +1530,4 @@ test("a stopped pre-binding host gets a new generation and the old generation Ho
     restartedReservations.classifyRuntimeTurnCompleted(currentHook),
     "apply"
   );
-});
-
-test("a stopped reservation cleanup failure keeps the old launch fenced and blocks renewal", async (t) => {
-  const fx = fixture(t, "claude");
-  const taskRuntime = taskRuntimeFixture(t, fx);
-  let hostPresent = false;
-  const starts = [];
-  const host = {
-    async start(request) {
-      hostPresent = true;
-      starts.push(request);
-      return runtimeBinding(request, { index: starts.length, hostCreated: true });
-    },
-    async resume() { throw new Error("resume is not expected"); },
-    async stop() { hostPresent = false; },
-    async inspect() { return { state: hostPresent ? "running" : "stopped" }; },
-    async inspectOwner() { return { state: hostPresent ? "running" : "stopped" }; },
-    async stopOwner() { hostPresent = false; return true; }
-  };
-  const firstCoordinator = new RuntimeLaunchCoordinator(
-    fx.schedulerStore,
-    host,
-    {
-      createGenerationId: () => "old-cleanup-blocked",
-      now: () => NOW,
-      runtimeIsolation: taskRuntime.isolation
-    }
-  );
-  const first = await registry(firstCoordinator, host).prepareRoleSession({
-    ...prepareInput(fx, "worker", "agent-run-1"),
-    managedWorkspace: taskRuntime.workspace
-  });
-  const oldGenerationRoot = starts[0].runtimeIsolation.roots.generation;
-  hostPresent = false;
-  fx.store.saveAgentRun(failAgentRun(
-    fx.store.getAgentRun(fx.task.id, "agent-run-1"),
-    "old Run is terminal",
-    new Date(NOW.getTime() + 1)
-  ));
-
-  const cleanupCalls = [];
-  const blockedIsolation = {
-    preflight: (input) => taskRuntime.isolation.preflight(input),
-    activate: (preparation) => taskRuntime.isolation.activate(preparation),
-    cleanup: (preparation, reason) => taskRuntime.isolation.cleanup(preparation, reason),
-    cleanupTaskLaunch(input) {
-      cleanupCalls.push(input);
-      throw new Error("exact old generation cleanup is ambiguous");
-    }
-  };
-  const restartedCoordinator = new RuntimeLaunchCoordinator(
-    new FileSchedulerStoreAdapter(new FileTaskStore(fx.home)),
-    host,
-    {
-      createGenerationId: () => "must-not-renew",
-      now: () => NOW,
-      runtimeIsolation: blockedIsolation
-    }
-  );
-
-  await assert.rejects(
-    registry(restartedCoordinator, host).prepareRoleSession({
-      ...prepareInput(fx, "worker", "agent-run-2"),
-      managedWorkspace: taskRuntime.workspace
-    }),
-    /exact old generation cleanup is ambiguous/i
-  );
-  assert.deepEqual(cleanupCalls, [{
-    taskId: fx.task.id,
-    launchId: first.launchId,
-    reason: "interruption"
-  }]);
-  assert.equal(existsSync(oldGenerationRoot), true);
-  assert.equal(starts.length, 1);
-  assertReservation(fx, "worker", first.launchId, "agent-run-1");
-  assert.equal(
-    hasRuntimeCleanupObligation(reservationMailbox(fx, "worker")),
-    true
-  );
-});
-
-test("a reused generation is cleaned when its failed call confirms the owner stopped", async (t) => {
-  const fx = fixture(t, "claude");
-  const taskRuntime = taskRuntimeFixture(t, fx);
-  let hostPresent = false;
-  let rejectRebind = false;
-  const starts = [];
-  const host = {
-    async start(request) {
-      starts.push(request);
-      if (rejectRebind) {
-        hostPresent = false;
-        throw new Error("reused generation call failed after host stop");
-      }
-      hostPresent = true;
-      return runtimeBinding(request, { index: starts.length, hostCreated: true });
-    },
-    async resume() { throw new Error("resume is not expected"); },
-    async stop() { hostPresent = false; },
-    async inspect() { return { state: hostPresent ? "running" : "stopped" }; },
-    async inspectOwner() { return { state: hostPresent ? "running" : "stopped" }; },
-    async stopOwner() { hostPresent = false; return true; }
-  };
-  const firstCoordinator = new RuntimeLaunchCoordinator(
-    fx.schedulerStore,
-    host,
-    {
-      createGenerationId: () => "reused-generation",
-      now: () => NOW,
-      runtimeIsolation: taskRuntime.isolation
-    }
-  );
-  const input = {
-    ...prepareInput(fx, "worker", "agent-run-1"),
-    managedWorkspace: taskRuntime.workspace
-  };
-  const first = await registry(firstCoordinator, host).prepareRoleSession(input);
-  const generationRoot = starts[0].runtimeIsolation.roots.generation;
-  assert.equal(existsSync(generationRoot), true);
-  rejectRebind = true;
-
-  const restartedCoordinator = new RuntimeLaunchCoordinator(
-    new FileSchedulerStoreAdapter(new FileTaskStore(fx.home)),
-    host,
-    {
-      createGenerationId: () => "unused-replacement",
-      now: () => NOW,
-      runtimeIsolation: taskRuntime.isolation
-    }
-  );
-  await assert.rejects(
-    registry(restartedCoordinator, host).prepareRoleSession(input),
-    /reused generation call failed after host stop/i
-  );
-
-  assert.equal(starts[1].launchId, first.launchId);
-  assert.equal(existsSync(generationRoot), false);
-  assert.equal(reservationMailbox(fx, "worker"), null);
-});
-
-test("Task launch rejects a Role-only workspace before reservation or host side effects", async (t) => {
-  const fx = fixture(t, "claude");
-  let starts = 0;
-  const host = {
-    async start(request) {
-      starts += 1;
-      return runtimeBinding(request, { hostCreated: true });
-    },
-    async resume() { throw new Error("resume is not expected"); },
-    async stop() { throw new Error("stop is not expected"); },
-    async inspect() { return { state: "stopped" }; },
-    async inspectOwner() { return { state: "stopped" }; },
-    async stopOwner() { throw new Error("owner cleanup is not expected"); }
-  };
-  const coordinator = new RuntimeLaunchCoordinator(
-    fx.schedulerStore,
-    host,
-    {
-      createGenerationId: () => "missing-workspace-owner",
-      now: () => NOW,
-      runtimeIsolation: {
-        preflight() { throw new Error("preflight must not receive an ownerless request"); },
-        activate() { throw new Error("activation is not expected"); },
-        cleanup() { throw new Error("cleanup is not expected"); }
-      }
-    }
-  );
-  const input = prepareInput(fx, "leader", "agent-run-1");
-
-  await assert.rejects(
-    coordinator.prepare({
-      owner: owner(fx, "leader"),
-      agentId: input.agentId,
-      adapterId: input.adapterId,
-      effective: input.effective,
-      workspace: input.workspace,
-      mode: input.mode,
-      runId: input.runId
-    }, "deferred"),
-    /authoritative ManagedWorkspace owner is required/i
-  );
-  assert.equal(starts, 0);
-  assert.equal(reservationMailbox(fx, "leader"), null);
 });

@@ -1327,7 +1327,7 @@ test("an unrelated Hook cannot prove that a prepared Leader Run was delivered", 
   );
 });
 
-test("a matching native completion stays deferred until an exact transport receipt is reconciled", (t) => {
+test("a matching Hook proves delivery across the receipt persistence crash window", (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
   const run = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
@@ -1353,14 +1353,18 @@ test("a matching native completion stays deferred until an exact transport recei
   const processor = new FileRuntimeEventProcessor(inbox, adapter);
 
   const beforeReceipt = processor.drain(now);
-  assert.equal(beforeReceipt.acknowledgedEventIds.length, 0);
-  assert.equal(beforeReceipt.deferred.length, 1);
-  assert.equal(inbox.list().length, 1);
-  // Completion is provider evidence, not a transport receipt. It remains
-  // immutable and deferred instead of inferring either pushed or delivered.
-  assert.equal(store.getActiveAgentRun(task.id, role.name).pushedAt, undefined);
+  assert.equal(beforeReceipt.acknowledgedEventIds.length, 1);
+  assert.equal(beforeReceipt.deferred.length, 0);
+  assert.equal(inbox.list().length, 0);
+  // A native turn completion proves the prompt was pushed, not that the provider
+  // accepted it: it records pushedAt, never deliveredAt (only a provider-accepted
+  // fold may do that).
+  assert.notEqual(store.getActiveAgentRun(task.id, role.name).pushedAt, undefined);
   assert.equal(store.getActiveAgentRun(task.id, role.name).deliveredAt, undefined);
-  assert.equal(store.getTaskRoleSessionSet(task.id, role.name).pendingTurnCompletion, null);
+  assert.equal(
+    store.getTaskRoleSessionSet(task.id, role.name).pendingTurnCompletion.runId,
+    run.id
+  );
 });
 
 test("a Hook replay is idempotent after state commit succeeds and inbox ack crashes", (t) => {
@@ -2557,7 +2561,6 @@ test("Task completion queues exact runtime cleanup without a completed-task wake
   assert.equal(store.getRoleSession(task.id, role.name).launchId, launchId);
 
   const owners = [];
-  const runtimeCleanups = [];
   await runControllerSchedulerPass(
     adapter,
     {
@@ -2577,10 +2580,6 @@ test("Task completion queues exact runtime cleanup without a completed-task wake
       async stopOwner(owner) {
         owners.push(owner);
         return true;
-      },
-      cleanupTaskLaunch(input) {
-        runtimeCleanups.push(input);
-        return "absent";
       }
     }
   );
@@ -2590,11 +2589,6 @@ test("Task completion queues exact runtime cleanup without a completed-task wake
     taskId: task.id,
     roleName: role.name
   }]);
-  assert.deepEqual(runtimeCleanups, [{
-    taskId: task.id,
-    launchId,
-    reason: "completion"
-  }]);
   const stopped = store.getRoleSession(task.id, role.name);
   assert.equal(stopped.status, "stopped");
   assert.equal(stopped.nativeSessionId, "thread-completed");
@@ -2602,100 +2596,6 @@ test("Task completion queues exact runtime cleanup without a completed-task wake
   assert.equal(store.getWorkMailbox(target), null);
 });
 
-test("natural dormant Task absence cleans the exact launch before marking its session stopped", async (t) => {
-  const { store, task, role, now, adapter } = fixture(t);
-  const launchId = "runtime-test:generation:dormant";
-  adapter.recordRuntimeNativeSession({
-    taskId: task.id,
-    roleName: role.name,
-    agentId: role.activeAgentId,
-    adapterId: "codex",
-    launchId,
-    nativeSessionId: "thread-dormant"
-  }, now);
-  store.clearPendingWakeup(task.id);
-  // Keep the active Task intentionally waiting so orphan repair does not
-  // synthesize unrelated Leader work during this dormant-owner regression.
-  adapter.hasOpenInputRequest = () => true;
-  assert.equal(adapter.listDormantRuntimeOwners()[0].launchId, launchId);
-  const target = runtimeLifecycleTarget({
-    scope: "task",
-    taskId: task.id,
-    roleName: role.name
-  });
-  const initialStatus = store.getRoleSession(task.id, role.name).status;
-  let failCleanup = true;
-  const cleanupCalls = [];
-  const lifecycleHost = {
-    async inspectOwner() { return { state: "stopped" }; },
-    async inspectOwners(owners) {
-      return owners.map((owner) => ({ owner, inspection: { state: "stopped" } }));
-    },
-    async stopOwner() { return true; },
-    cleanupTaskLaunch(input) {
-      cleanupCalls.push(input);
-      if (failCleanup) throw new Error("dormant cleanup remains ambiguous");
-      return "cleaned";
-    }
-  };
-  const delivery = {
-    async prepareRoleSession() { throw new Error("unexpected Role preparation"); },
-    async waitUntilReady() { throw new Error("unexpected Role readiness"); },
-    async sendOnce() { throw new Error("unexpected Role delivery"); },
-    async inspectRole() { return "present"; },
-    async stopTask() { return false; }
-  };
-
-  await runControllerSchedulerPass(
-    adapter,
-    delivery,
-    new Date(now.getTime() + 1),
-    undefined,
-    { kind: "full" },
-    false,
-    [],
-    lifecycleHost
-  );
-  assert.equal(store.getRoleSession(task.id, role.name).status, initialStatus);
-  assert.equal(hasRuntimeCleanupObligation(store.getWorkMailbox(target)), true);
-  assert.deepEqual(cleanupCalls, []);
-
-  await runControllerSchedulerPass(
-    adapter,
-    delivery,
-    new Date(now.getTime() + 2),
-    undefined,
-    { kind: "full" },
-    false,
-    [],
-    lifecycleHost
-  );
-  assert.equal(store.getRoleSession(task.id, role.name).status, initialStatus);
-  assert.equal(hasRuntimeCleanupObligation(store.getWorkMailbox(target)), true);
-  assert.deepEqual(cleanupCalls, [{
-    taskId: task.id,
-    launchId,
-    reason: "interruption"
-  }]);
-
-  failCleanup = false;
-  await runControllerSchedulerPass(
-    adapter,
-    delivery,
-    new Date(now.getTime() + 3),
-    undefined,
-    { kind: "full" },
-    false,
-    [],
-    lifecycleHost
-  );
-  assert.equal(store.getRoleSession(task.id, role.name).status, "stopped");
-  assert.equal(store.getWorkMailbox(target), null);
-  assert.deepEqual(cleanupCalls, [
-    { taskId: task.id, launchId, reason: "interruption" },
-    { taskId: task.id, launchId, reason: "interruption" }
-  ]);
-});
 test("Task completion discards residual Role wake mailboxes", (t) => {
   const { store, task, role, now } = fixture(t);
   const worker = createRole(

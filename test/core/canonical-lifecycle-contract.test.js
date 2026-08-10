@@ -167,7 +167,7 @@ test("happy path: host -> session -> ready -> pushed -> accepted -> progress -> 
     { outcome: "mark-pushed" }
   );
 
-  // normal accepted path after the local push commit
+  // accepted only after a push
   assert.deepEqual(
     foldCanonicalLifecycleEvent(acceptedEvent(), expectation({ pushed: true })),
     { outcome: "advance-accepted" }
@@ -196,7 +196,7 @@ test("happy path: host -> session -> ready -> pushed -> accepted -> progress -> 
 
 // --- The core prohibition: no delivered/accepted without a prior push --------
 
-test("acceptance without a prior push fails closed (provider evidence is not transport evidence)", () => {
+test("acceptance without a prior push fails closed (never delivered from a receipt alone)", () => {
   assert.deepEqual(
     foldCanonicalLifecycleEvent(acceptedEvent(), expectation({ pushed: false })),
     { outcome: "fail-closed", reason: "accept-without-push" }

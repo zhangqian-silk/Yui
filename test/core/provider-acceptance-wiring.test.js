@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +12,6 @@ import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventPro
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
 import { runClaudeLifecycleHookCommand } from "../../dist/controller/claudeLifecycleHook.js";
 import { runCodexLifecycleHookCommand } from "../../dist/controller/codexLifecycleHook.js";
-import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
@@ -21,16 +19,6 @@ import {
   recordRoleAgentSession
 } from "../../dist/executor/agentExecutor.js";
 import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
-import {
-  EXACT_CONTROL_ARGUMENT,
-  YUI_CONTROL_PLANE_DESCRIPTOR,
-  YUI_TASK_RUNTIME_DESCRIPTOR,
-  createExactControlPlaneDescriptor,
-  createExactTaskRuntimeDescriptor,
-  exactControlPlaneDigest,
-  exactTaskRuntimeDescriptorPath,
-  serializeExactDescriptor
-} from "../../dist/runtime/exactControlPlane.js";
 import {
   hasRuntimeCleanupObligation,
   isRuntimeLaunchReservation,
@@ -44,7 +32,6 @@ import {
 } from "../../dist/role/role.js";
 import { createAgentRun, markAgentRunPushed } from "../../dist/run/agentRun.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
-import { writeTextFileAtomically } from "../../dist/storage/durableFile.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { createWorkItem, updateWorkItemStatus } from "../../dist/workItem/workItem.js";
@@ -75,9 +62,8 @@ function fixture(t, adapterId, sessionStatus = "running", options = {}) {
   const item = updateWorkItemStatus(createWorkItem(
     "work-item-1", task.id, { title: "Do work", assignee: worker.name }, first
   ), "running", first);
-  // Most fixtures begin after the transport receipt. The timeout regression
-  // deliberately leaves the push commit absent even though the provider has
-  // already executed the native prompt.
+  // The run is transport-pushed (never pre-set delivered): acceptance must come
+  // from the provider fold under test.
   let run = createAgentRun(
     "agent-run-1", task.id, worker.name, "new", "Do the work", first,
     { workItemId: item.id, effective: resolveEffectiveLaunch({ role: worker, purpose: "execution" }) }
@@ -128,7 +114,6 @@ function fixture(t, adapterId, sessionStatus = "running", options = {}) {
   const environment = {
     YUI_HOME: home, YUI_SESSION_SCOPE: "task", YUI_TASK_ID: task.id,
     YUI_ROLE: worker.name, YUI_AGENT_ID: agent.id, YUI_ADAPTER_ID: adapterId,
-    YUI_WORKSPACE: run.effective.workspace.root,
     YUI_LAUNCH_ID: "launch-1", YUI_RUN_ID: run.id,
     ...(options.runtimeDiscovered === true ? {} : { YUI_NATIVE_SESSION_ID: nativeSessionId })
   };
@@ -307,66 +292,6 @@ test("Codex UserPromptSubmit hook folds to provider-accepted and writes delivere
   assert.notEqual(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
 });
 
-test("provider acceptance after a missing push commit stays obsolete and exact yield remains denied", async (t) => {
-  const fx = fixture(t, "claude", "running", { transportPushed: false });
-  const before = fx.store.getAgentRun(fx.task.id, fx.run.id);
-  assert.equal(before.pushedAt, undefined);
-  assert.equal(before.deliveredAt, undefined);
-
-  // This native hook is the durable provider fact observed after the prompt
-  // executed while the Controller caller timed out before run.pushed committed.
-  await runClaudeLifecycleHookCommand(
-    JSON.stringify({
-      hook_event_name: "UserPromptSubmit",
-      session_id: fx.nativeSessionId,
-      prompt: "Do the work"
-    }),
-    fx.environment,
-    async () => ({})
-  );
-  fx.drain();
-
-  const unchanged = fx.store.getAgentRun(fx.task.id, fx.run.id);
-  assert.equal(unchanged.pushedAt, undefined);
-  assert.equal(unchanged.deliveredAt, undefined);
-  const sessions = fx.store.getTaskRoleSessionSet(fx.task.id, fx.worker.name);
-  assert.equal(sessions.inFlight.pushedAt, undefined);
-  assert.equal(sessions.inFlight.deliveredAt, undefined);
-  assert.equal(
-    sessions.sessions[fx.agent.id].nativeSessionId,
-    fx.nativeSessionId
-  );
-  assert.deepEqual(sessions.history ?? [], []);
-  assert.equal(
-    fx.store.listEvents(fx.task.id).filter(({ type }) => type === "run.pushed").length,
-    0
-  );
-  assert.equal(
-    fx.store.listEvents(fx.task.id).filter(({ type }) => type === "run.delivered").length,
-    0
-  );
-  assert.ok(fx.store.listEvents(fx.task.id).some((event) => (
-    event.type === "runtime.event-obsolete"
-      && event.payload.reason === "fail-closed:accept-without-push"
-  )));
-
-  // Provider acceptance cannot repair transport state. Without a matching
-  // receipt reconciliation, exact yield remains unavailable.
-  assert.throws(() => runTaskCommand(
-    ["run", "yield", fx.run.id, "--summary", "Provider accepted before caller timeout."],
-    fx.store,
-    {
-      now: () => new Date("2026-08-06T02:00:03.000Z"),
-      environment: {
-        YUI_SESSION_SCOPE: "task",
-        YUI_TASK_ID: fx.task.id,
-        YUI_ROLE: fx.worker.name,
-        YUI_AGENT_ID: fx.agent.id
-      }
-    }
-  ), /has not been pushed|before.*push|delivery/i);
-});
-
 test("hook resolves the current in-flight Run instead of a stale process YUI_RUN_ID", async (t) => {
   const fx = fixture(t, "codex");
   await runCodexLifecycleHookCommand(
@@ -405,7 +330,7 @@ test("Claude SessionStart hook folds to a session-lifecycle event, never deliver
   ));
 });
 
-test("exact internal Claude startup is queued before its preallocated Session is durable and folds only afterward", (t) => {
+test("Claude startup emitted before Session projection is preserved and folds afterward", async (t) => {
   const fx = fixture(t, "claude", "reserved", {
     runtimeDiscovered: true,
     transportPushed: false,
@@ -417,106 +342,27 @@ test("exact internal Claude startup is queued before its preallocated Session is
     fx.agent.id,
     "claude"
   );
-  const cliEntry = join(process.cwd(), "dist", "cli.js");
-  const control = createExactControlPlaneDescriptor({
-    executable: process.execPath,
-    cliEntry,
-    yuiHome: fx.home
-  });
-  const digest = exactControlPlaneDigest(control);
-  const runtime = createExactTaskRuntimeDescriptor({
-    controlPlaneDigest: digest,
-    taskId: fx.task.id,
-    roleName: fx.worker.name,
-    agentId: fx.agent.id,
-    adapterId: "claude",
-    workspace: fx.run.effective.workspace.root,
-    runId: fx.run.id,
-    launchId: "launch-1",
-    nativeSessionId
-  });
-  const runtimeSource = exactTaskRuntimeDescriptorPath(fx.home, runtime);
-  writeTextFileAtomically(runtimeSource, `${serializeExactDescriptor(runtime)}\n`);
-  assert.equal(isRuntimeLaunchReservation(fx.store.getWorkMailbox(
-    runtimeLifecycleTarget({
-      scope: "task",
-      taskId: fx.task.id,
-      roleName: fx.worker.name
-    })
-  )?.processing, "launch-1"), true);
   const environment = {
-    ...process.env,
     ...fx.environment,
-    YUI_NATIVE_SESSION_ID: nativeSessionId,
-    [YUI_CONTROL_PLANE_DESCRIPTOR]: serializeExactDescriptor(control),
-    [YUI_TASK_RUNTIME_DESCRIPTOR]: runtimeSource
+    YUI_NATIVE_SESSION_ID: nativeSessionId
   };
-  const invoke = (command, payload, invocationEnvironment = environment) => spawnSync(process.execPath, [
-    cliEntry,
-    EXACT_CONTROL_ARGUMENT,
-    digest,
-    ...command
-  ], {
-    encoding: "utf8",
-    env: invocationEnvironment,
-    ...(payload === undefined ? {} : { input: JSON.stringify(payload) })
-  });
   const inbox = new FileRuntimeEventInbox(fx.home);
 
-  const forgedNativeSessionId = "00000000-0000-4000-a000-000000000000";
-  const forgedRuntime = createExactTaskRuntimeDescriptor({
-    ...runtime,
-    nativeSessionId: forgedNativeSessionId
-  });
-  writeTextFileAtomically(runtimeSource, `${serializeExactDescriptor(forgedRuntime)}\n`);
-  const forged = invoke(["internal", "claude-hook"], {
-    hook_event_name: "SessionStart",
-    source: "startup",
-    session_id: forgedNativeSessionId
-  }, { ...environment, YUI_NATIVE_SESSION_ID: forgedNativeSessionId });
-  assert.notEqual(forged.status, 0);
-  assert.match(forged.stderr, /in-flight Run fence is not current/i);
-  assert.equal(inbox.list().length, 0);
-  writeTextFileAtomically(runtimeSource, `${serializeExactDescriptor(runtime)}\n`);
-
-  const external = invoke(["version"]);
-  assert.notEqual(external.status, 0);
-  assert.match(external.stderr, /in-flight Run fence is not current/i);
-  assert.equal(inbox.list().length, 0);
-  for (const payload of [
-    {
-      hook_event_name: "UserPromptSubmit",
-      session_id: nativeSessionId,
-      prompt: "must not append"
-    },
-    {
-      hook_event_name: "StopFailure",
-      session_id: nativeSessionId,
-      error: "must not append"
-    },
-    {
+  await runClaudeLifecycleHookCommand(
+    JSON.stringify({
       hook_event_name: "SessionStart",
-      source: "resume",
-      session_id: nativeSessionId
-    }
-  ]) {
-    const rejected = invoke(["internal", "claude-hook"], payload);
-    assert.notEqual(rejected.status, 0, payload.hook_event_name);
-    assert.equal(inbox.list().length, 0);
-  }
-
-  const invoked = invoke(["internal", "claude-hook"], {
-    hook_event_name: "SessionStart",
-    source: "startup",
-    session_id: nativeSessionId
-  });
-  assert.equal(invoked.status, 0, invoked.stderr);
+      session_id: nativeSessionId,
+      source: "startup"
+    }),
+    environment,
+    async () => ({})
+  );
 
   assert.equal(inbox.list().length, 1);
-  const beforeSession = fx.drain();
-  assert.equal(beforeSession.acknowledgedEventIds.length, 0);
-  assert.equal(beforeSession.deferred.length, 1);
-  assert.equal(beforeSession.failed.length, 0);
+  const beforeProjection = fx.drain();
+  assert.equal(beforeProjection.acknowledgedEventIds.length, 0);
+  assert.equal(beforeProjection.deferred.length, 1);
+  assert.equal(beforeProjection.failed.length, 0);
   assert.equal(inbox.list().length, 1);
   assert.equal(fx.store.getRoleSession(fx.task.id, fx.worker.name), null);
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).pushedAt, undefined);
@@ -537,15 +383,16 @@ test("exact internal Claude startup is queued before its preallocated Session is
     launchId: "launch-1",
     now: new Date("2026-08-06T02:00:01.500Z")
   });
-  const afterSession = fx.drain();
-  assert.equal(afterSession.acknowledgedEventIds.length, 1);
-  assert.equal(afterSession.deferred.length, 0);
-  assert.equal(afterSession.failed.length, 0);
+
+  const afterProjection = fx.drain();
+  assert.equal(afterProjection.acknowledgedEventIds.length, 1);
+  assert.equal(afterProjection.deferred.length, 0);
+  assert.equal(afterProjection.failed.length, 0);
   assert.equal(inbox.list().length, 0);
-  assert.equal(fx.store.listEvents(fx.task.id).filter((event) => (
+  assert.ok(fx.store.listEvents(fx.task.id).some((event) => (
     event.type === "runtime.provider-session-lifecycle"
       && event.payload.preInputReady === "true"
-  )).length, 1);
+  )));
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).pushedAt, undefined);
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
   assert.equal(isRuntimeLaunchReservation(fx.store.getWorkMailbox(runtimeLifecycleTarget({
@@ -558,7 +405,6 @@ test("exact internal Claude startup is queued before its preallocated Session is
 for (const mismatch of [
   "native",
   "launch",
-  "workspace",
   "run",
   "inflight-cross-run",
   "cleanup-pending",
@@ -591,8 +437,6 @@ for (const mismatch of [
       payloadNativeSessionId = "not-the-preallocated-native";
     } else if (mismatch === "launch") {
       environment = { ...environment, YUI_LAUNCH_ID: "launch-stale" };
-    } else if (mismatch === "workspace") {
-      environment = { ...environment, YUI_WORKSPACE: `${environment.YUI_WORKSPACE}-stale` };
     } else if (mismatch === "run") {
       environment = { ...environment, YUI_RUN_ID: "agent-run-stale" };
     } else if (mismatch === "inflight-cross-run") {
@@ -726,24 +570,6 @@ test("a UserPromptSubmit hook whose native session mismatches the launch fence f
       async () => ({})
     ),
     /native session does not match/i
-  );
-  assert.equal(new FileRuntimeEventInbox(fx.home).list().length, 0);
-  assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
-});
-
-test("a UserPromptSubmit hook whose workspace differs from the Run snapshot fails before enqueue", async (t) => {
-  const fx = fixture(t, "claude");
-  await assert.rejects(
-    runClaudeLifecycleHookCommand(
-      JSON.stringify({
-        hook_event_name: "UserPromptSubmit",
-        session_id: fx.nativeSessionId,
-        prompt: "x"
-      }),
-      { ...fx.environment, YUI_WORKSPACE: `${fx.environment.YUI_WORKSPACE}-stale` },
-      async () => ({})
-    ),
-    /workspace does not match/i
   );
   assert.equal(new FileRuntimeEventInbox(fx.home).list().length, 0);
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);

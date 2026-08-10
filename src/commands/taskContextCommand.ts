@@ -234,9 +234,6 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
               : item.candidates.flatMap((candidate) => [
                   `    Candidate ${candidate.sequence}: ${candidate.id}${item.status === "awaiting_acceptance" && candidate === item.candidates.at(-1) ? " [current]" : ""} (${candidate.source.type === "run" ? candidate.source.runId : "direct"})`,
                   `      Review policy: ${candidate.reviewPolicy === undefined ? "none" : `${candidate.reviewPolicy.roleName} (${candidate.reviewPolicy.trigger})`}`,
-                  `      Task-final contract: ${candidate.taskFinalReviewContract === undefined
-                    ? "none"
-                    : `${candidate.taskFinalReviewContract.digest} via control ${candidate.taskFinalReviewContract.controlPlaneDigest}`}`,
                   `      Frozen Git: ${candidate.gitSnapshot === undefined
                     ? "unavailable"
                     : `${candidate.gitSnapshot.reviewBaseCommit} (${candidate.gitSnapshot.projects.length} Projects)`}`,
@@ -358,11 +355,8 @@ function renderWorkItemReviews(
     `    ReviewRounds: ${rounds.length}; latest ${latest.id} [${latest.status}] ${latest.scope === "task" ? "Task-final" : "WorkItem"} for ${latest.candidateId} via ${latest.reviewerRoleName} (${latest.requestedBy})`,
     `      Review base: ${latest.reviewBaseCommit}`,
     ...(latest.scope === "task"
-      ? [
-          `      Frozen integrated Task heads: ${latest.taskCandidate?.projects
-            .map(({ projectId, commit }) => `${projectId}@${commit}`).join(", ") ?? "unavailable"}`,
-          `      Task-final contract: ${latest.taskFinalReviewContract?.digest ?? "global policy"}`
-        ]
+      ? [`      Frozen integrated Task heads: ${latest.taskCandidate?.projects
+        .map(({ projectId, commit }) => `${projectId}@${commit}`).join(", ") ?? "unavailable"}`]
       : []),
     `      Review workspace: ${latest.workspace === undefined
       ? "not prepared"

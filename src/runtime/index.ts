@@ -56,27 +56,3 @@ export {
   TmuxSessionHost,
   type TmuxSessionHostOptions
 } from "./tmuxAdapters.js";
-export {
-  FileTaskRuntimeIsolation,
-  YUI_TASK_RUNTIME_ISOLATION_DESCRIPTOR,
-  YUI_TASK_RUNTIME_SERVICE_NAMESPACE,
-  assertTaskRuntimeIsolationPreflight,
-  createTaskRuntimeIsolationDescriptor,
-  parseTaskRuntimeIsolationDescriptor,
-  planTaskRuntimeCleanup,
-  taskRuntimeIsolationEnvironment,
-  taskRuntimeIsolationFingerprint,
-  type FileTaskRuntimeIsolationOptions,
-  type TaskRuntimeCleanupReason,
-  type TaskRuntimeControlBoundary,
-  type TaskRuntimeIsolationDescriptor,
-  type TaskRuntimeIsolationPort,
-  type TaskRuntimeLifecycleCleanupPort,
-  type TaskRuntimeIsolationPreparation,
-  type TaskRuntimeIsolationPreflightInput,
-  type TaskRuntimeLaunchPolicy,
-  type TaskRuntimePathLayout,
-  type TaskRuntimePortAllocation,
-  type TaskRuntimeResourceObservation,
-  type TaskRuntimeWorkspaceOwner
-} from "./taskRuntimeIsolation.js";

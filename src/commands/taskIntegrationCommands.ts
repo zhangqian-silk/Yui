@@ -27,7 +27,7 @@ export async function runTaskIntegrationCommand(
 ): Promise<Readonly<{ output: string; data?: unknown }>> {
   const now = options.now ?? (() => new Date());
   const [command, ...rest] = args;
-  if (command === "start") return start(rest, store, home, now, options.environment);
+  if (command === "start") return start(rest, store, home, now);
   if (command === "continue") {
     return continueIntegration(rest, store, home, now, options.environment);
   }
@@ -82,8 +82,7 @@ async function start(
   args: readonly string[],
   store: TaskStore,
   home: string,
-  now: () => Date,
-  environment: NodeJS.ProcessEnv | undefined
+  now: () => Date
 ): Promise<Readonly<{ output: string; data: unknown }>> {
   const usage = "Task Integration start usage: yui task integration start <task> [--project <project>] --change-set <id> [--change-set <id> ...] [--target <ref>] [--check <command> ...].";
   const parsed = parseRepeatable(
@@ -150,7 +149,7 @@ async function start(
     tx.saveIntegrationAttempt(task.id, created);
     return created;
   });
-  return runIntegration(store, home, integration, now, environment);
+  return runIntegration(store, home, integration, now);
 }
 
 async function continueIntegration(
@@ -174,17 +173,16 @@ async function continueIntegration(
   ) {
     throw usageError(`Integration is not ready to continue: ${integration.id}/${integration.status}.`);
   }
-  return runIntegration(store, home, integration, now, environment);
+  return runIntegration(store, home, integration, now);
 }
 
 async function runIntegration(
   store: TaskStore,
   home: string,
   integration: IntegrationAttempt,
-  now: () => Date,
-  environment: NodeJS.ProcessEnv | undefined
+  now: () => Date
 ): Promise<Readonly<{ output: string; data: unknown }>> {
-  const result = await new GitIntegrationService(home, store, undefined, now, environment)
+  const result = await new GitIntegrationService(home, store, undefined, now)
     .integrate(integration.taskId, integration.id);
   const output = result.status === "committed"
     ? `Integrated ${result.attempt.changeSetIds.join(", ")} into ${result.attempt.targetRef} with CAS (${result.attempt.id})\n`

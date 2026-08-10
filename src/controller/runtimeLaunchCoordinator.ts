@@ -14,11 +14,6 @@ import {
   type SessionHostPort
 } from "../runtime/index.js";
 import { validateEffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
-import type {
-  TaskRuntimeIsolationPort,
-  TaskRuntimeIsolationPreparation,
-  TaskRuntimeLifecycleCleanupPort
-} from "../runtime/taskRuntimeIsolation.js";
 
 export type CoordinatedRuntimeLaunchRequest = RuntimeLaunchPreparationRequest;
 
@@ -47,9 +42,7 @@ export type RuntimeLaunchReservationPort = Readonly<{
   completeRuntimeLaunchReservation(
     owner: RuntimeRoleOwner,
     launchId: string,
-    expectedTerminalRunId?: string,
-    /** Runs after the exact reservation/terminal fence passes, before it clears. */
-    beforeComplete?: () => void
+    expectedTerminalRunId?: string
   ): boolean;
   settleStoppedRuntimeLaunch(input: Readonly<{
     owner: RuntimeRoleOwner;
@@ -70,7 +63,6 @@ export type RuntimeLaunchCoordinatorOptions = Readonly<{
   assertCurrent?: (request: CoordinatedRuntimeLaunchRequest) => void;
   launchFingerprint?: (request: CoordinatedRuntimeLaunchRequest) => string;
   onCleanupRequired?: (target: RuntimeLifecycleTarget) => void;
-  runtimeIsolation?: TaskRuntimeIsolationPort & Partial<TaskRuntimeLifecycleCleanupPort>;
 }>;
 
 export type RuntimeLaunchPersistence = RuntimeLaunchPersistencePort;
@@ -97,9 +89,6 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
   readonly #onCleanupRequired:
     | ((target: RuntimeLifecycleTarget) => void)
     | undefined;
-  readonly #runtimeIsolation:
-    | (TaskRuntimeIsolationPort & Partial<TaskRuntimeLifecycleCleanupPort>)
-    | undefined;
 
   constructor(
     private readonly reservations: RuntimeLaunchReservationPort,
@@ -112,7 +101,6 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
     this.#launchFingerprint = options.launchFingerprint
       ?? defaultLaunchFingerprint;
     this.#onCleanupRequired = options.onCleanupRequired;
-    this.#runtimeIsolation = options.runtimeIsolation;
   }
 
   async prepare(
@@ -156,24 +144,6 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
         "Runtime launch request does not match its effective snapshot."
       );
     }
-    if (this.#runtimeIsolation !== undefined && request.owner.scope === "task") {
-      if (request.managedWorkspace === undefined) {
-        throw new Error(
-          "An authoritative ManagedWorkspace owner is required for a Task runtime launch."
-        );
-      }
-      if (
-        request.managedWorkspace.owner.taskId !== request.owner.taskId
-        || request.managedWorkspace.root !== request.workspace
-      ) {
-        throw new Error(
-          "Task runtime launch does not match its authoritative ManagedWorkspace."
-        );
-      }
-    }
-    if (request.owner.scope === "global" && request.managedWorkspace !== undefined) {
-      throw new Error("A global runtime cannot use a Task ManagedWorkspace.");
-    }
     const expectedFingerprint = requireText(
       this.#launchFingerprint(request),
       "Launch fingerprint"
@@ -188,24 +158,16 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       }
     };
     const generationPrefix = `runtime-${expectedFingerprint}:generation:`;
-    const proposedGenerationId = requireText(
+    const proposedLaunchId = `${generationPrefix}${requireText(
       this.#createGenerationId(),
       "Launch generation id"
-    );
-    const proposedLaunchId = `${generationPrefix}${proposedGenerationId}`;
-    let runtimeIsolation = this.#preflightRuntimeIsolation(
-      request,
-      proposedLaunchId,
-      proposedGenerationId,
-      false
-    );
+    )}`;
     let reservation = this.reservations.reserveRuntimeLaunch({
       owner: request.owner,
       launchId: proposedLaunchId,
       ...(request.runId === undefined ? {} : { runId: request.runId })
     }, assertLaunchCurrent, this.#now());
     let reusedConfirmedRunningHost = false;
-    let launchPromptAcknowledgementRequired = false;
 
     if (reservation.status === "existing") {
       if (!reservation.launchId.startsWith(generationPrefix)) {
@@ -244,29 +206,11 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
             `Exact Run launch generation stopped before delivery: ${request.runId}/${reservation.launchId}.`
           );
         }
-        const taskOwner = request.owner.scope === "task"
-          ? request.owner
-          : undefined;
-        let exactCleanupAttempted = false;
-        let completed = false;
-        try {
-          completed = this.reservations.completeRuntimeLaunchReservation(
-            request.owner,
-            reservation.launchId,
-            differentRunReservation ? reservation.runId : undefined,
-            taskOwner !== undefined && this.#runtimeIsolation !== undefined
-              ? () => {
-                  exactCleanupAttempted = true;
-                  this.#cleanupTaskLaunch(taskOwner, reservation.launchId);
-                }
-              : undefined
-          );
-        } catch (error) {
-          if (exactCleanupAttempted) this.#requireCleanup(request.owner);
-          throw error;
-        }
-        if (!completed) {
-          if (exactCleanupAttempted) this.#requireCleanup(request.owner);
+        if (!this.reservations.completeRuntimeLaunchReservation(
+          request.owner,
+          reservation.launchId,
+          differentRunReservation ? reservation.runId : undefined
+        )) {
           throw new Error("Runtime launch reservation changed during recovery.");
         }
         reservation = this.reservations.reserveRuntimeLaunch({
@@ -286,14 +230,6 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
           );
         }
         reusedConfirmedRunningHost = true;
-        launchPromptAcknowledgementRequired = sameRunReservation
-          && request.adapterId === "codex";
-        runtimeIsolation = this.#preflightRuntimeIsolation(
-          request,
-          reservation.launchId,
-          reservation.launchId.slice(generationPrefix.length),
-          true
-        );
         assertLaunchCurrent();
       }
     }
@@ -301,12 +237,6 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
     const launchId = reservation.launchId;
     let binding: RuntimeBinding;
     try {
-      if (!reusedConfirmedRunningHost && runtimeIsolation !== undefined) {
-        // Activation is the first runtime-resource side effect and can occur
-        // only after the centralized read-only preflight and durable launch
-        // reservation have both succeeded.
-        this.#runtimeIsolation!.activate(runtimeIsolation);
-      }
       const rawBinding = request.mode === "new"
         ? await this.host.start({
             mode: "new",
@@ -316,9 +246,6 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
             adapterId: request.adapterId,
             effective: request.effective,
             workspace: request.workspace,
-            ...(runtimeIsolation === undefined
-              ? {}
-              : { runtimeIsolation: runtimeIsolation.descriptor }),
             ...(request.runId === undefined ? {} : { runId: request.runId }),
             ...(request.environment === undefined
               ? {}
@@ -332,9 +259,6 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
             adapterId: request.adapterId,
             effective: request.effective,
             workspace: request.workspace,
-            ...(runtimeIsolation === undefined
-              ? {}
-              : { runtimeIsolation: runtimeIsolation.descriptor }),
             ...(request.runId === undefined ? {} : { runId: request.runId }),
             ...(request.environment === undefined
               ? {}
@@ -344,12 +268,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
               "Native session id"
             )
           });
-      binding = requireMatchingRuntimeBinding(
-        rawBinding,
-        request,
-        launchId,
-        launchPromptAcknowledgementRequired
-      );
+      binding = requireMatchingRuntimeBinding(rawBinding, request, launchId);
     } catch (error) {
       if (error instanceof RuntimeBindingContractError) {
         // Never pass an untrusted hostRef to stop(). Reconcile the requested
@@ -360,8 +279,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       await this.#settleFailedStart(
         request,
         launchId,
-        reusedConfirmedRunningHost,
-        runtimeIsolation
+        reusedConfirmedRunningHost
       );
       throw error;
     }
@@ -378,7 +296,6 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
         request.owner,
         binding,
         launchId,
-        runtimeIsolation,
         new Error(
           `Runtime host was recreated while recovering an existing generation: ${
             request.owner.roleName
@@ -408,13 +325,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
         }, assertLaunchCurrent);
       }
     } catch (error) {
-      await this.#compensateStartedHost(
-        request.owner,
-        binding,
-        launchId,
-        runtimeIsolation,
-        error
-      );
+      await this.#compensateStartedHost(request.owner, binding, launchId, error);
     }
     return binding;
   }
@@ -422,8 +333,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
   async #settleFailedStart(
     request: CoordinatedRuntimeLaunchRequest,
     launchId: string,
-    reusedConfirmedRunningHost: boolean,
-    runtimeIsolation: TaskRuntimeIsolationPreparation | undefined
+    reusedConfirmedRunningHost: boolean
   ): Promise<void> {
     let inspection;
     try {
@@ -435,19 +345,6 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       return;
     }
     if (inspection.state === "stopped") {
-      if (runtimeIsolation !== undefined) {
-        try {
-          this.#runtimeIsolation!.cleanup(runtimeIsolation, "failure");
-        } catch (cleanupError) {
-          this.#requireCleanup(request.owner);
-          throw new Error(
-            `Task runtime launch failed and exact resource cleanup also failed: ${
-              cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
-            }`,
-            { cause: cleanupError }
-          );
-        }
-      }
       if (!this.#settleConfirmedStopped(request, launchId)) {
         this.#requireCleanup(request.owner);
       }
@@ -461,7 +358,6 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
     owner: RuntimeRoleOwner,
     binding: RuntimeBinding,
     launchId: string,
-    runtimeIsolation: TaskRuntimeIsolationPreparation | undefined,
     cause: unknown
   ): Promise<never> {
     try {
@@ -481,19 +377,6 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
     } catch {
       // Durable owner cleanup below is the only safe fallback.
     }
-    if (stopped && runtimeIsolation !== undefined) {
-      try {
-        this.#runtimeIsolation!.cleanup(runtimeIsolation, "failure");
-      } catch (cleanupError) {
-        this.#requireCleanup(owner);
-        throw new Error(
-          `Runtime host stopped but exact Task resource cleanup failed: ${
-            cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
-          }`,
-          { cause: cleanupError }
-        );
-      }
-    }
     if (
       !stopped
       || !this.reservations.settleStoppedRuntimeLaunch({
@@ -509,40 +392,6 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       this.#requireCleanup(owner);
     }
     throw cause;
-  }
-
-  #preflightRuntimeIsolation(
-    request: CoordinatedRuntimeLaunchRequest,
-    launchId: string,
-    generationId: string,
-    allowExactActive: boolean
-  ): TaskRuntimeIsolationPreparation | undefined {
-    if (this.#runtimeIsolation === undefined || request.owner.scope !== "task") {
-      return undefined;
-    }
-    return this.#runtimeIsolation.preflight({
-      workspace: request.managedWorkspace!,
-      ...(request.runId === undefined ? {} : { runId: request.runId }),
-      launchId,
-      generationId: requireText(generationId, "Launch generation id"),
-      ...(request.runtimePolicy === undefined ? {} : { policy: request.runtimePolicy }),
-      ...(allowExactActive ? { allowExactActive: true } : {})
-    });
-  }
-
-  #cleanupTaskLaunch(
-    owner: Extract<RuntimeRoleOwner, { scope: "task" }>,
-    launchId: string
-  ): void {
-    const cleanupTaskLaunch = this.#runtimeIsolation?.cleanupTaskLaunch;
-    if (cleanupTaskLaunch === undefined) {
-      throw new Error("Exact Task runtime launch cleanup is unavailable.");
-    }
-    cleanupTaskLaunch.call(this.#runtimeIsolation, {
-      taskId: owner.taskId,
-      launchId,
-      reason: "interruption"
-    });
   }
 
   #settleConfirmedStopped(
@@ -574,8 +423,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
 function requireMatchingRuntimeBinding(
   raw: RuntimeBinding,
   request: CoordinatedRuntimeLaunchRequest,
-  launchId: string,
-  launchPromptAcknowledgementRequired: boolean
+  launchId: string
 ): RuntimeBinding {
   let binding: RuntimeBinding;
   try {
@@ -595,28 +443,15 @@ function requireMatchingRuntimeBinding(
         && binding.owner.taskId === request.owner.taskId
       )
     );
-  const launchCarriedPromptAcknowledgementRequired = request.owner.scope === "task"
-    && request.adapterId === "codex"
-    && request.runId !== undefined
-    // An explicit reused-host result may take the receipt-backed active-push
-    // path. A new or ambiguous host may have carried the prompt in argv, but
-    // Yui has no provider acknowledgement for that transport.
-    && binding.hostCreated !== false;
-  if (
-    launchPromptAcknowledgementRequired
-    || launchCarriedPromptAcknowledgementRequired
-  ) {
-    throw new RuntimeBindingContractError(
-      `Session host cannot acknowledge the exact launch-carried prompt: ${
-        request.owner.roleName
-      }.`
-    );
-  }
   if (
     binding.launchId !== launchId
     || !ownerMatches
     || binding.agentId !== request.agentId
     || binding.adapterId !== request.adapterId
+    || (
+      binding.initialPromptRunId !== undefined
+      && binding.initialPromptRunId !== request.runId
+    )
     || (
       request.mode === "resume"
       && binding.nativeSessionId !== request.nativeSessionId
@@ -639,9 +474,7 @@ function defaultLaunchFingerprint(
     request.agentId,
     request.adapterId,
     request.effective,
-    request.workspace,
-    request.managedWorkspace,
-    request.runtimePolicy
+    request.workspace
   ])).digest("hex");
 }
 
