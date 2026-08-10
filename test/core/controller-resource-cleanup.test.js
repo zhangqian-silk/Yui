@@ -261,7 +261,7 @@ test("ephemeral cleanup holds the identity fence through final inspection and si
 
 test("artifact cleanup revalidates fingerprint and socket liveness", async () => {
   const uid = typeof process.getuid === "function" ? process.getuid() : 0;
-  const path = `/tmp/tmux-${uid}/yui-0123456789abcdef01234567`;
+  const path = join(tmpdir(), `tmux-${uid}`, "yui-0123456789abcdef01234567");
   const artifact = processResource({
     id: `artifact:${path}`,
     fingerprint: "before",

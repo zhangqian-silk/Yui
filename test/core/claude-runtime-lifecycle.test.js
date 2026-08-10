@@ -10,6 +10,7 @@ import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { bindExecution, claimPending } from "../../dist/coordination/workMailbox.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
+import { stopFileTaskController } from "../../dist/controller/clientRuntime.js";
 import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
@@ -71,7 +72,10 @@ function currentClaudeHookCommon(hookEventName) {
 
 function workflowFixture(t) {
   const home = mkdtempSync(join(tmpdir(), "yui-claude-lifecycle-state-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(async () => {
+    await stopFileTaskController(home);
+    rmSync(home, { recursive: true, force: true });
+  });
   ensureStorageSchema(home);
   const store = new FileTaskStore(home);
   const first = new Date("2026-08-02T02:00:00.000Z");
