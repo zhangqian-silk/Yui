@@ -3,6 +3,8 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  writeFileSync,
   rmSync
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -183,6 +185,184 @@ for (const owner of [
     assert.equal(existsSync(preparation.descriptor.roots.generation), false);
   });
 }
+
+test("parallel non-Yui Tasks isolate colliding runtime names and exact cleanup", (t) => {
+  const base = mkdtempSync(join(tmpdir(), "yui-parallel-project-runtime-"));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const controlHome = join(base, "control-home");
+  const runtimeRoot = join(base, "task-runtimes");
+  const globalInstall = join(base, "global-install");
+  for (const path of [controlHome, globalInstall]) mkdirSync(path, { recursive: true });
+  const controlPlane = {
+    yuiHome: controlHome,
+    controllerSocketPath: join(base, "controller.sock"),
+    tmuxNamespace: "yui-control-tmux",
+    globalInstallPaths: [globalInstall]
+  };
+  const observed = new Map();
+  const service = new FileTaskRuntimeIsolation({
+    runtimeRoot,
+    controlPlane,
+    inspectResources(runtime) {
+      const fingerprint = taskRuntimeIsolationFingerprint(runtime);
+      const ids = [
+        ...runtime.portAllocations.map(({ port }) => `port:${port}`),
+        ...runtime.portAllocations.map(({ name }) => (
+          `service:${runtime.serviceNamespace}:${name}`
+        )),
+        `process:${runtime.serviceNamespace}:mock-agent`,
+        ...runtime.externalCapabilities.requested.map((capability) => (
+          `external:${runtime.serviceNamespace}:${capability}`
+        ))
+      ];
+      return ids.flatMap((id) => {
+        const resource = observed.get(id);
+        if (resource === undefined) return [];
+        return [{
+          id,
+          kind: resource.kind,
+          ownership: resource.fingerprint === fingerprint ? "owned" : "mismatched",
+          state: resource.active ? "active" : "inactive",
+          descriptorFingerprint: resource.fingerprint
+        }];
+      });
+    }
+  });
+
+  function nonYuiWorkspace(taskId, projectId) {
+    const root = join(base, "workspaces", taskId);
+    const project = join(root, "inventory-service");
+    mkdirSync(project, { recursive: true });
+    return createManagedWorkspace({
+      owner: { type: "task", taskId },
+      root,
+      entries: [{
+        projectId,
+        directory: "inventory-service",
+        access: "write",
+        path: project,
+        branch: `feature/${taskId}`,
+        baseRef: "refs/heads/main",
+        baseCommit: COMMIT
+      }]
+    }, NOW);
+  }
+
+  function request(workspace, port) {
+    return {
+      workspace,
+      runId: "agent-run-1",
+      launchId: "launch-shared-local-id",
+      generationId: "generation-shared-local-id",
+      policy: {
+        declaredExternalCapabilities: ["network:mock"],
+        requestedExternalCapabilities: ["network:mock"],
+        portPreference: [43110, 43111],
+        portAllocations: [{ name: "inventory-api", port }]
+      }
+    };
+  }
+
+  function startMock(preparation) {
+    const runtime = preparation.descriptor;
+    for (const { name, port } of runtime.portAllocations) {
+      observed.set(`port:${port}`, {
+        kind: "port",
+        fingerprint: preparation.fingerprint,
+        active: true
+      });
+      observed.set(`service:${runtime.serviceNamespace}:${name}`, {
+        kind: "service",
+        fingerprint: preparation.fingerprint,
+        active: true
+      });
+    }
+    observed.set(`process:${runtime.serviceNamespace}:mock-agent`, {
+      kind: "service",
+      fingerprint: preparation.fingerprint,
+      active: true
+    });
+    for (const capability of runtime.externalCapabilities.requested) {
+      observed.set(`external:${runtime.serviceNamespace}:${capability}`, {
+        kind: "external",
+        fingerprint: preparation.fingerprint,
+        active: true
+      });
+    }
+  }
+
+  function stopMock(preparation) {
+    const runtime = preparation.descriptor;
+    for (const { name, port } of runtime.portAllocations) {
+      observed.delete(`port:${port}`);
+      observed.delete(`service:${runtime.serviceNamespace}:${name}`);
+    }
+    observed.delete(`process:${runtime.serviceNamespace}:mock-agent`);
+    for (const capability of runtime.externalCapabilities.requested) {
+      observed.delete(`external:${runtime.serviceNamespace}:${capability}`);
+    }
+  }
+
+  const workspaceA = nonYuiWorkspace("task-15", "inventory-a");
+  const workspaceB = nonYuiWorkspace("task-16", "inventory-b");
+  const preparationA = service.preflight(request(workspaceA, 43110));
+  service.activate(preparationA);
+  startMock(preparationA);
+
+  const collidingB = request(workspaceB, 43110);
+  assert.throws(
+    () => service.preflight(collidingB),
+    /ambiguous or externally owned.*port:43110/i
+  );
+  const rejectedB = createTaskRuntimeIsolationDescriptor({
+    ...collidingB,
+    runtimeRoot
+  });
+  assert.equal(existsSync(rejectedB.roots.generation), false);
+  assert.equal(existsSync(preparationA.descriptor.roots.generation), true);
+
+  const preparationB = service.preflight(request(workspaceB, 43111));
+  service.activate(preparationB);
+  startMock(preparationB);
+  const runtimeA = preparationA.descriptor;
+  const runtimeB = preparationB.descriptor;
+  const cacheKey = "shared-cache-key";
+  writeFileSync(join(runtimeA.roots.cache, cacheKey), "task-15\n");
+  writeFileSync(join(runtimeB.roots.cache, cacheKey), "task-16\n");
+
+  assert.equal(runtimeA.generation.runId, runtimeB.generation.runId);
+  assert.deepEqual(runtimeA.portPreference, runtimeB.portPreference);
+  assert.equal(runtimeA.portAllocations[0].name, runtimeB.portAllocations[0].name);
+  assert.notEqual(runtimeA.portAllocations[0].port, runtimeB.portAllocations[0].port);
+  assert.notEqual(runtimeA.roots.generation, runtimeB.roots.generation);
+  assert.notEqual(runtimeA.roots.data, runtimeB.roots.data);
+  assert.notEqual(runtimeA.roots.cache, runtimeB.roots.cache);
+  assert.notEqual(runtimeA.serviceNamespace, runtimeB.serviceNamespace);
+  assert.notEqual(runtimeA.serviceNamespace, controlPlane.tmuxNamespace);
+  assert.notEqual(runtimeB.serviceNamespace, controlPlane.tmuxNamespace);
+  assert.notEqual(preparationA.fingerprint, preparationB.fingerprint);
+  assert.deepEqual(runtimeA.externalCapabilities, runtimeB.externalCapabilities);
+  assert.equal(readFileSync(join(runtimeA.roots.cache, cacheKey), "utf8"), "task-15\n");
+  assert.equal(readFileSync(join(runtimeB.roots.cache, cacheKey), "utf8"), "task-16\n");
+
+  assert.throws(
+    () => service.cleanup(preparationA, "completion"),
+    /active or unknown.*port:43110/i
+  );
+  stopMock(preparationA);
+  service.cleanup(preparationA, "completion");
+  assert.equal(existsSync(runtimeA.roots.generation), false);
+  assert.equal(existsSync(runtimeB.roots.generation), true);
+  assert.equal(readFileSync(join(runtimeB.roots.cache, cacheKey), "utf8"), "task-16\n");
+  assert.equal(observed.get("port:43111").fingerprint, preparationB.fingerprint);
+
+  stopMock(preparationB);
+  service.cleanup(preparationB, "completion");
+  assert.equal(existsSync(runtimeB.roots.generation), false);
+  assert.equal(observed.size, 0);
+  assert.equal(existsSync(controlHome), true);
+  assert.equal(existsSync(globalInstall), true);
+});
 
 test("preflight rejects cross-Task, cross-owner, control, global, workspace, and external drift", (t) => {
   const fx = fixture(t);

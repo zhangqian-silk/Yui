@@ -281,6 +281,16 @@ test("exact Task-final CLI submits and accepts a metadata-only Project Candidate
   assert.equal(accepted.status, 0, accepted.stderr);
   assert.match(accepted.stdout, /Accepted Work Item/u);
   assert.equal(store.getWorkItem(runtime.taskId, "work-item-1").status, "completed");
+
+  // Both writes signal the isolated Home's Controller. Settle that owned
+  // process through the same frozen control plane before the fixture removes
+  // the Home; deleting a live Controller's files would hide a process leak.
+  const stopped = spawnSync(process.execPath, [
+    ...prefix,
+    "controller", "stop"
+  ], { encoding: "utf8", env: environment });
+  assert.equal(stopped.status, 0, stopped.stderr);
+  assert.match(stopped.stdout, /stopped|already stopped/i);
 });
 
 test("control-plane and Task runtime descriptors are tagged and never interchangeable", (t) => {
