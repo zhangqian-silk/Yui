@@ -455,8 +455,16 @@ const taskChildren: readonly NodeInput[] = [
         summary: "Ask the configured reviewer to inspect a WorkItem candidate.",
         usage: "yui task work review <task>/<work>",
         executable: true,
-        sections: [{ id: "workspace", title: "Review workspace", entries: ["cleanup", "preserve"] }],
+        sections: [
+          { id: "retry", title: "Task-final recovery", entries: ["retry"] },
+          { id: "workspace", title: "Review workspace", entries: ["cleanup", "preserve"] }
+        ],
         children: [
+          {
+            name: "retry",
+            summary: "Retry a failed Task-final ReviewRound that has no Reviewer Run.",
+            usage: "yui task work review retry <task>/<review-round>"
+          },
           {
             name: "cleanup",
             summary: "Remove only a clean terminal ReviewRound worktree.",

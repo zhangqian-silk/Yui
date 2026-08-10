@@ -9,6 +9,7 @@ import {
   dispatchPreparedReviewRound,
   runTaskCommand
 } from "../../dist/commands/taskCommands.js";
+import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
 import { createIntegrationAttempt, updateIntegrationAttempt } from "../../dist/integration/integrationAttempt.js";
 import { terminalizeExactTaskRun } from "../../dist/lifecycle/exactRunTerminalization.js";
@@ -18,9 +19,10 @@ import {
   createRoleAgentBinding,
   updateRoleStatus
 } from "../../dist/role/role.js";
-import { failAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun, failAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
 import {
   attachReviewRoundWorkspace,
+  createReviewRound,
   createTaskReviewRound,
   finishReviewRound
 } from "../../dist/review/reviewRound.js";
@@ -33,7 +35,7 @@ import { submitWorkItemCandidate, updateWorkItemStatus } from "../../dist/workIt
 const NOW = new Date("2026-08-08T00:00:00.000Z");
 const EXITED_REVIEW_SUMMARY = "The role's tmux session exited before the run yielded.";
 
-function fixture(t) {
+function fixture(t, options = {}) {
   const root = mkdtempSync(join(tmpdir(), "yui-final-review-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   ensureStorageSchema(root, NOW);
@@ -65,7 +67,19 @@ function fixture(t) {
   ], store, { now: () => NOW });
   const task = store.getTask("task-1");
   runTaskCommand(["activate", task.id], store, { now: () => NOW });
-  runTaskCommand(["work", "create", task.id, "change"], store, { now: () => NOW });
+  if (options.producerRunRoleName !== undefined) {
+    runTaskCommand(
+      ["role", "add", task.id, options.producerRunRoleName, "--agent", codex.id],
+      store,
+      { now: () => NOW }
+    );
+  }
+  runTaskCommand([
+    "work", "create", task.id, "change",
+    ...(options.producerRunRoleName === undefined
+      ? []
+      : ["--role", options.producerRunRoleName])
+  ], store, { now: () => NOW });
   const item = store.getWorkItem(task.id, "work-item-1");
   const leaderOptions = {
     now: () => NOW,
@@ -75,12 +89,42 @@ function fixture(t) {
       YUI_ROLE: "leader"
     }
   };
-  runTaskCommand(["work", "update", item.id, "running"], store, leaderOptions);
+  if (options.producerRunRoleName === undefined) {
+    runTaskCommand(["work", "update", item.id, "running"], store, leaderOptions);
+  }
   store.transaction((tx) => {
-    const running = tx.getWorkItem(task.id, item.id);
+    const current = tx.getWorkItem(task.id, item.id);
+    const running = options.producerRunRoleName === undefined
+      ? current
+      : updateWorkItemStatus(current, "running", NOW);
+    if (options.producerRunRoleName !== undefined) {
+      tx.saveWorkItem(task.id, running);
+    }
+    let source = { type: "direct" };
+    if (options.producerRunRoleName !== undefined) {
+      const producer = tx.getRole(task.id, options.producerRunRoleName);
+      const producerRun = createAgentRun(
+        tx.nextAgentRunId(task.id),
+        task.id,
+        producer.name,
+        "new",
+        "produce integrated candidate",
+        NOW,
+        {
+          workItemId: item.id,
+          effective: resolveEffectiveLaunch({
+            role: producer,
+            purpose: "execution",
+            workItemWriteProjectIds: running.writeProjectIds
+          })
+        }
+      );
+      tx.saveAgentRun(yieldAgentRun(producerRun, "integrated candidate", NOW));
+      source = { type: "run", runId: producerRun.id };
+    }
     const candidate = submitWorkItemCandidate(running, {
       summary: "integrated candidate",
-      source: { type: "direct" }
+      source
     }, NOW);
     tx.saveWorkItem(task.id, candidate);
     tx.saveWorkItem(task.id, updateWorkItemStatus(candidate, "completed", NOW, "accepted"));
@@ -238,6 +282,461 @@ function setReviewConfig(fx, review) {
     tx.saveConfig(review === undefined ? config : { ...config, review });
   });
 }
+
+function failFinalReviewBeforeRun(fx) {
+  const globalReviewer = fx.store.getGlobalRole("reviewer");
+  assert.notEqual(globalReviewer, null);
+  assert.equal(fx.store.removeGlobalRole("reviewer"), true);
+  const completion = runTaskCommand(
+    ["complete", fx.task.id, "--summary", "request final review"],
+    fx.store,
+    fx.leaderOptions
+  );
+  const round = fx.store.listReviewRounds(fx.task.id).at(-1);
+  assert.match(completion.output, /Final Task Review is blocked/);
+  assert.equal(round.status, "failed");
+  assert.equal(round.reviewerRunId, undefined);
+  assert.match(round.summary, /Global Role not found/);
+  return { globalReviewer, round };
+}
+
+function addCompletedDirectWorkItem(fx, title, assignee = undefined) {
+  if (assignee !== undefined && fx.store.getRole(fx.task.id, assignee) === null) {
+    runTaskCommand(
+      ["role", "add", fx.task.id, assignee, "--agent", "codex"],
+      fx.store,
+      fx.leaderOptions
+    );
+  }
+  runTaskCommand([
+    "work", "create", fx.task.id, title,
+    ...(assignee === undefined ? [] : ["--role", assignee])
+  ], fx.store, fx.leaderOptions);
+  const item = fx.store.listWorkItems(fx.task.id).at(-1);
+  if (assignee === undefined) {
+    runTaskCommand(["work", "update", item.id, "running"], fx.store, fx.leaderOptions);
+  }
+  fx.store.transaction((tx) => {
+    const current = tx.getWorkItem(fx.task.id, item.id);
+    const running = assignee === undefined
+      ? current
+      : updateWorkItemStatus(current, "running", NOW);
+    if (assignee !== undefined) tx.saveWorkItem(fx.task.id, running);
+    const summary = `${title} candidate`;
+    let source = { type: "direct" };
+    if (assignee !== undefined) {
+      const producer = tx.getRole(fx.task.id, assignee);
+      const run = createAgentRun(
+        tx.nextAgentRunId(fx.task.id),
+        fx.task.id,
+        producer.name,
+        "new",
+        `produce ${title}`,
+        NOW,
+        {
+          workItemId: item.id,
+          effective: resolveEffectiveLaunch({
+            role: producer,
+            purpose: "execution",
+            workItemWriteProjectIds: running.writeProjectIds
+          })
+        }
+      );
+      tx.saveAgentRun(yieldAgentRun(run, summary, NOW));
+      source = { type: "run", runId: run.id };
+    }
+    const candidate = submitWorkItemCandidate(running, {
+      summary,
+      source
+    }, NOW);
+    tx.saveWorkItem(fx.task.id, candidate);
+    tx.saveWorkItem(
+      fx.task.id,
+      updateWorkItemStatus(candidate, "completed", NOW, `${title} accepted`)
+    );
+  });
+  return fx.store.getWorkItem(fx.task.id, item.id);
+}
+
+function integrateProducerAfterCurrentHeads(fx, item) {
+  fx.store.transaction((tx) => {
+    for (const [index, projectId] of ["project-1", "project-2"].entries()) {
+      const baseCommit = String.fromCharCode(99 + index).repeat(40);
+      const headCommit = ["e", "f"][index].repeat(40);
+      const changeSetId = `change-set-${index + 3}`;
+      tx.saveChangeSet(fx.task.id, createWorkItemChangeSet({
+        id: changeSetId,
+        taskId: fx.task.id,
+        projectId,
+        workItemId: item.id,
+        baseCommit,
+        headCommit,
+        branch: `yui/task-1/${item.id}-${index + 1}`,
+        changedPaths: [`${projectId}/${item.id}.ts`]
+      }, NOW));
+      const attempt = createIntegrationAttempt({
+        id: `integration-${index + 3}`,
+        taskId: fx.task.id,
+        projectId,
+        targetRef: `yui/task-11/main-${index + 1}`,
+        expectedHead: baseCommit,
+        changeSetIds: [changeSetId],
+        checkCommands: []
+      }, NOW);
+      tx.saveIntegrationAttempt(fx.task.id, updateIntegrationAttempt(
+        attempt, { status: "committed", candidateCommit: headCommit }, NOW
+      ));
+    }
+  });
+}
+
+function withoutAnchorCandidate(store, taskId, workItemId) {
+  return new Proxy(store, {
+    get(target, property) {
+      if (property === "transaction") {
+        return (callback) => target.transaction((tx) => callback(new Proxy(tx, {
+          get(transaction, transactionProperty) {
+            if (transactionProperty === "getWorkItem") {
+              return (requestedTaskId, requestedWorkItemId) => {
+                const item = transaction.getWorkItem(requestedTaskId, requestedWorkItemId);
+                return requestedTaskId === taskId && requestedWorkItemId === workItemId
+                  ? { ...item, candidates: [] }
+                  : item;
+              };
+            }
+            const value = Reflect.get(transaction, transactionProperty, transaction);
+            return typeof value === "function" ? value.bind(transaction) : value;
+          }
+        })));
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+}
+
+test("Leader retries one failed no-Run final ReviewRound without changing old evidence", (t) => {
+  const fx = fixture(t);
+  const { globalReviewer, round: failedRound } = failFinalReviewBeforeRun(fx);
+  const frozenFailedRound = JSON.stringify(
+    fx.store.getReviewRound(fx.task.id, failedRound.id)
+  );
+  fx.store.saveGlobalRole(globalReviewer);
+
+  const retried = runTaskCommand(
+    ["work", "review", "retry", failedRound.id],
+    fx.store,
+    fx.leaderOptions
+  );
+
+  assert.equal(retried.kind, "output");
+  assert.match(retried.output, /Task-final Review retry requested/);
+  const rounds = fx.store.listReviewRounds(fx.task.id);
+  assert.equal(rounds.length, 2);
+  const retryRound = rounds[1];
+  assert.equal(retryRound.status, "pending");
+  assert.equal(retryRound.requestedBy, "leader");
+  assert.deepEqual(retryRound.taskCandidate, failedRound.taskCandidate);
+  assert.equal(retryRound.workItemId, failedRound.workItemId);
+  assert.equal(retryRound.candidateId, failedRound.candidateId);
+  assert.equal(retryRound.reviewerRoleName, failedRound.reviewerRoleName);
+  assert.equal(
+    JSON.stringify(fx.store.getReviewRound(fx.task.id, failedRound.id)),
+    frozenFailedRound
+  );
+
+  const repeated = runTaskCommand(
+    ["work", "review", "retry", failedRound.id],
+    fx.store,
+    fx.leaderOptions
+  );
+  assert.match(repeated.output, /already requested/);
+  assert.equal(repeated.data.reviewRound.id, retryRound.id);
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 2);
+
+  const retryRun = dispatchFinalReview(fx, retryRound);
+  assert.equal(retryRun.purpose, "review");
+  assert.equal(retryRun.reviewRoundId, retryRound.id);
+  assert.equal(retryRun.roleName, failedRound.reviewerRoleName);
+  assert.equal(
+    fx.store.listAgentRuns(fx.task.id).filter(({ purpose }) => purpose === "review").length,
+    1
+  );
+  const repeatedAfterDispatch = runTaskCommand(
+    ["work", "review", "retry", failedRound.id],
+    fx.store,
+    fx.leaderOptions
+  );
+  assert.match(repeatedAfterDispatch.output, /already requested/);
+  assert.equal(repeatedAfterDispatch.data.reviewRound.id, retryRound.id);
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 2);
+  assert.equal(
+    JSON.stringify(fx.store.getReviewRound(fx.task.id, failedRound.id)),
+    frozenFailedRound
+  );
+});
+
+test("no-Run final Review retry is exact-Leader-only and rejects nonfailed or nonfinal Rounds", (t) => {
+  const failed = fixture(t);
+  const { round: failedRound } = failFinalReviewBeforeRun(failed);
+  const frozenFailedRound = structuredClone(failedRound);
+  assert.throws(
+    () => runTaskCommand(
+      ["work", "review", "retry", `${failed.task.id}/${failedRound.id}`],
+      failed.store,
+      { now: () => NOW }
+    ),
+    /Only the Task Leader/i
+  );
+  assert.throws(
+    () => runTaskCommand(
+      ["work", "review", "retry", `task-2/${failedRound.id}`],
+      failed.store,
+      failed.leaderOptions
+    ),
+    /ReviewRound not found/i
+  );
+  assert.deepEqual(
+    failed.store.getReviewRound(failed.task.id, failedRound.id),
+    frozenFailedRound
+  );
+
+  const pending = fixture(t);
+  runTaskCommand(
+    ["complete", pending.task.id, "--summary", "request pending review"],
+    pending.store,
+    pending.leaderOptions
+  );
+  const pendingRound = pending.store.listReviewRounds(pending.task.id)[0];
+  assert.throws(
+    () => runTaskCommand(
+      ["work", "review", "retry", pendingRound.id],
+      pending.store,
+      pending.leaderOptions
+    ),
+    /not retryable from pending/i
+  );
+
+  const withRun = fixture(t);
+  runTaskCommand(
+    ["complete", withRun.task.id, "--summary", "request dispatched review"],
+    withRun.store,
+    withRun.leaderOptions
+  );
+  const withRunRound = withRun.store.listReviewRounds(withRun.task.id)[0];
+  finishFinalReviewRun(
+    withRun,
+    dispatchFinalReview(withRun, withRunRound),
+    "failed",
+    "review run failed"
+  );
+  assert.throws(
+    () => runTaskCommand(
+      ["work", "review", "retry", withRunRound.id],
+      withRun.store,
+      withRun.leaderOptions
+    ),
+    /has Reviewer Run .*use task run retry/i
+  );
+
+  const workItem = fixture(t);
+  const candidate = workItem.store.getWorkItem(
+    workItem.task.id,
+    workItem.item.id
+  ).candidates.at(-1);
+  const workItemRound = finishReviewRound(createReviewRound(
+    workItem.store.nextReviewRoundId(workItem.task.id),
+    workItem.task.id,
+    workItem.item.id,
+    candidate.id,
+    "reviewer",
+    "leader",
+    "c".repeat(40),
+    NOW
+  ), "failed", "work-item review failed before dispatch", NOW);
+  workItem.store.saveReviewRound(workItem.task.id, workItemRound);
+  assert.throws(
+    () => runTaskCommand(
+      ["work", "review", "retry", workItemRound.id],
+      workItem.store,
+      workItem.leaderOptions
+    ),
+    /not a failed Task-final ReviewRound/i
+  );
+});
+
+test("no-Run final Review retry rejects candidate drift, unavailable anchors, and conflicts", (t) => {
+  const drifted = fixture(t);
+  const { globalReviewer, round: driftedRound } = failFinalReviewBeforeRun(drifted);
+  drifted.store.saveGlobalRole(globalReviewer);
+  advanceTaskCandidate(drifted);
+  assert.throws(
+    () => runTaskCommand(
+      ["work", "review", "retry", driftedRound.id],
+      drifted.store,
+      drifted.leaderOptions
+    ),
+    /no longer the current Task candidate/i
+  );
+  assert.equal(drifted.store.listReviewRounds(drifted.task.id).length, 1);
+
+  const unavailable = fixture(t);
+  const {
+    globalReviewer: unavailableReviewer,
+    round: unavailableRound
+  } = failFinalReviewBeforeRun(unavailable);
+  unavailable.store.saveGlobalRole(unavailableReviewer);
+  const unavailableStore = withoutAnchorCandidate(
+    unavailable.store,
+    unavailable.task.id,
+    unavailableRound.workItemId
+  );
+  assert.throws(
+    () => runTaskCommand(
+      ["work", "review", "retry", unavailableRound.id],
+      unavailableStore,
+      unavailable.leaderOptions
+    ),
+    /anchor Candidate is no longer available/i
+  );
+
+  const newer = fixture(t);
+  const { globalReviewer: restored, round: oldRound } = failFinalReviewBeforeRun(newer);
+  newer.store.saveGlobalRole(restored);
+  createLaterFinalRound(
+    newer,
+    { ...oldRound, reviewerRoleName: "conflicting-reviewer" },
+    oldRound.taskCandidate
+  );
+  assert.throws(
+    () => runTaskCommand(
+      ["work", "review", "retry", oldRound.id],
+      newer.store,
+      newer.leaderOptions
+    ),
+    /newer conflicting final ReviewRound/i
+  );
+  assert.equal(newer.store.listReviewRounds(newer.task.id).length, 2);
+
+  const active = fixture(t);
+  const { globalReviewer: activeReviewer, round: activeRound } = failFinalReviewBeforeRun(active);
+  active.store.saveGlobalRole(activeReviewer);
+  runTaskCommand(
+    ["role", "add", active.task.id, "reviewer", "--agent", "codex"],
+    active.store,
+    active.leaderOptions
+  );
+  active.store.transaction((tx) => {
+    const reviewer = tx.getRole(active.task.id, "reviewer");
+    const run = createAgentRun(
+      tx.nextAgentRunId(active.task.id),
+      active.task.id,
+      reviewer.name,
+      "new",
+      "unrelated active review-role work",
+      NOW,
+      {
+        workItemId: active.item.id,
+        effective: resolveEffectiveLaunch({
+          role: reviewer,
+          purpose: "execution",
+          workItemWriteProjectIds: active.item.writeProjectIds
+        })
+      }
+    );
+    tx.saveAgentRun(run);
+    tx.saveActiveAgentRun(run);
+    tx.saveRole(active.task.id, updateRoleStatus(reviewer, "running", NOW));
+  });
+  assert.throws(
+    () => runTaskCommand(
+      ["work", "review", "retry", activeRound.id],
+      active.store,
+      active.leaderOptions
+    ),
+    /Reviewer Role already has an active run/i
+  );
+  assert.equal(active.store.listReviewRounds(active.task.id).length, 1);
+});
+
+test("Task-final Reviewer checks every integrated producer instead of the latest anchor", (t) => {
+  const fx = fixture(t, { producerRunRoleName: "reviewer" });
+  const laterAnchor = addCompletedDirectWorkItem(fx, "later independent producer", "worker-a");
+  integrateProducerAfterCurrentHeads(fx, laterAnchor);
+
+  const completion = runTaskCommand(
+    ["complete", fx.task.id, "--summary", "request final review"],
+    fx.store,
+    fx.leaderOptions
+  );
+
+  assert.match(completion.output, /Final Task Review is blocked/);
+  const round = fx.store.listReviewRounds(fx.task.id)[0];
+  assert.equal(round.workItemId, laterAnchor.id);
+  assert.equal(round.status, "failed");
+  assert.equal(round.reviewerRunId, undefined);
+  assert.match(round.summary, /work-item-1/);
+  assert.match(round.summary, /reviewer/);
+  assert.equal(
+    fx.store.listAgentRuns(fx.task.id).filter(({ purpose }) => purpose === "review").length,
+    0
+  );
+});
+
+test("dispatch rechecks producer independence for a pre-existing pending Task Round", (t) => {
+  const fx = fixture(t, { producerRunRoleName: "reviewer" });
+  const laterAnchor = addCompletedDirectWorkItem(fx, "later independent producer", "worker-a");
+  integrateProducerAfterCurrentHeads(fx, laterAnchor);
+  const legacyPending = createTaskReviewRound(
+    fx.store.nextReviewRoundId(fx.task.id),
+    fx.task.id,
+    laterAnchor.id,
+    laterAnchor.candidates.at(-1).id,
+    "reviewer",
+    "policy",
+    {
+      schemaVersion: 1,
+      projects: [
+        { projectId: "project-1", commit: "e".repeat(40) },
+        { projectId: "project-2", commit: "f".repeat(40) }
+      ]
+    },
+    NOW
+  );
+  fx.store.saveReviewRound(fx.task.id, legacyPending);
+
+  assert.throws(
+    () => dispatchFinalReview(fx, legacyPending),
+    /Final Task Review cannot dispatch.*work-item-1/i
+  );
+  const stored = fx.store.getReviewRound(fx.task.id, legacyPending.id);
+  assert.equal(stored.status, "pending");
+  assert.equal(stored.reviewerRunId, undefined);
+  assert.equal(
+    fx.store.listAgentRuns(fx.task.id).filter(({ purpose }) => purpose === "review").length,
+    0
+  );
+});
+
+test("independent Reviewer still dispatches a valid multi-producer Task candidate", (t) => {
+  const fx = fixture(t);
+  const laterProducer = addCompletedDirectWorkItem(fx, "later producer", "worker-a");
+  integrateProducerAfterCurrentHeads(fx, laterProducer);
+
+  const completion = runTaskCommand(
+    ["complete", fx.task.id, "--summary", "request final review"],
+    fx.store,
+    fx.leaderOptions
+  );
+
+  assert.match(completion.output, /Final Task Review requested/);
+  const round = fx.store.listReviewRounds(fx.task.id)[0];
+  assert.equal(round.status, "pending");
+  const run = dispatchFinalReview(fx, round);
+  assert.equal(run.roleName, "reviewer");
+  assert.equal(run.purpose, "review");
+  assert.equal(run.reviewRoundId, round.id);
+});
 
 test("final policy queues one Task Review over all committed Project heads", (t) => {
   const { store, task, item, leaderOptions } = fixture(t);
