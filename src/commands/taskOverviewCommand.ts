@@ -16,6 +16,10 @@ import type { TaskStore } from "../storage/taskStore.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
+import {
+  buildTaskExecutionProjection,
+  type TaskExecutionProjection
+} from "../scheduler/taskExecutionProjection.js";
 
 export type TaskListOptions = Readonly<{
   all: boolean;
@@ -105,6 +109,8 @@ export type TaskOverview = Task & Readonly<{
   nextAction: string | null;
   nextOwner: string | null;
   runtime: TaskOverviewRuntime;
+  /** One read-only Task-first fold shared with scheduler/web consumers. */
+  execution: TaskExecutionProjection;
 }>;
 
 export type TaskOverviewResult = Readonly<{
@@ -155,6 +161,7 @@ export function renderTaskOverview(
       { header: "Summary updated", minWidth: 16, maxWidth: 28 },
       { header: "Work", minWidth: 8, maxWidth: 38 },
       { header: "Blockers", minWidth: 9, maxWidth: 42 },
+      { header: "Execution", minWidth: 14, maxWidth: 34 },
       { header: "Next action / owner", minWidth: 16, maxWidth: 42 }
     ],
     result.tasks.map((task) => [
@@ -167,6 +174,7 @@ export function renderTaskOverview(
         : formatTimestamp(task.summaryUpdatedAt, timeZone),
       workCell(task.work.counts),
       blockersCell(task.blockers),
+      `${task.execution.status} / ${task.execution.owner}`,
       nextCell(task.next)
     ]),
     width
@@ -225,6 +233,10 @@ function buildTaskOverviewEntry(task: Task, store: TaskStore): TaskOverview {
     activeRunCount: runtimeRuns.length,
     pendingDeliveryCount: runtimeRuns.filter((run) => run.delivery === "pending").length
   };
+  const execution = buildTaskExecutionProjection(store, task.id, task);
+  if (execution === null) {
+    throw new Error(`Task execution projection disappeared: ${task.id}.`);
+  }
   return {
     ...task,
     brief,
@@ -242,7 +254,8 @@ function buildTaskOverviewEntry(task: Task, store: TaskStore): TaskOverview {
     next,
     nextAction: next?.action ?? null,
     nextOwner: next?.owner ?? null,
-    runtime
+    runtime,
+    execution
   };
 }
 
@@ -513,6 +526,8 @@ function renderVerboseDetails(
       `  Summary updated at: ${task.summaryUpdatedAt === null
         ? "missing"
         : formatTimestamp(task.summaryUpdatedAt, timeZone)}`,
+      `  Execution: ${task.execution.status} (${task.execution.owner}); ${task.execution.summary}`,
+      `  Monitoring: ${task.execution.monitoring}; attention: ${task.execution.attention.length}`,
       `  Projects: ${task.projectBindings.length === 0
         ? "none"
         : task.projectBindings.map(({ directory, projectId, baseRef }) => (

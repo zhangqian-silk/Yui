@@ -15,8 +15,88 @@ WorkItem. Choose one of three execution paths for each WorkItem:
 
 Do not invent another execution entity or a `yui ... subagent` command.
 
+## Default to the Leader-first fast path
+
+For ordinary, continuous, single-Project development, create one roleless
+WorkItem for the bounded result. Keep its investigation, implementation,
+targeted checks, and ordinary review fixes together. A phase name is not a
+reason to create another WorkItem, Role, Session, Run, Message, or Input.
+
+Choose the executor in this order:
+
+1. **Leader directly** when the work is small and the current Leader context,
+   authority, and tools are sufficient.
+2. **At most one native implementer subagent** when one bounded implementation
+   pass benefits from parallel attention or a specialist available inside the
+   current Agent. Give it one explicit Profile, one writable workspace, and one
+   result contract.
+3. **Task Role AgentRun** only when the work genuinely needs independent
+   parallel ownership, different credentials or authority, a provider/model
+   capability unavailable to the current Agent, or an independently managed
+   Session and durable Run lifecycle.
+
+Do not dispatch a Task Role merely to obtain a fresh context, run a command,
+perform a routine small edit, or add an intermediate review. Direct and native
+execution add no Worker Role, Worker Yui Session, or Worker AgentRun. The exact
+Leader Run fence stays active until a native child hands back its result; the
+WorkItem and its workspace remain the durable delivery boundary.
+
+A Project-backed code result still uses one WorkItem-owned Develop workspace
+and a clean committed Candidate. The fast path compresses orchestration, not
+delivery evidence: Candidate, ChangeSet, committed Integration, acceptance,
+Task-final Review when supplied by the configured review policy, and Task
+completion remain distinct judgments and records.
+
+Use this validation and review cadence unless Project Policy requires more:
+
+1. During implementation, run the smallest target check that can catch the
+   changed behavior. Do not repeat an unchanged successful check without a
+   concrete defect or new change.
+2. Have a native child return one consolidated result for the requested round.
+   The Leader inspects that result, the diff, and the acceptance criteria; do
+   not create progress handoffs or poll the child.
+3. Capture the reviewed Candidate and run the Project Policy's complete
+   delivery validation once on the Integration candidate. Treat that committed
+   Integration and its check as the pre-delivery evidence; do not run the same
+   full suite earlier merely for reassurance.
+4. For the normal final-review policy, use one independent Task-final Review of
+   the frozen committed Integration heads before completion. Do not substitute
+   per-WorkItem ReviewRounds. If the selected Yui Core does not supply that
+   primitive, report the capability gap instead of emulating it with new state
+   or repeated reviews.
+
+Route a reachable finding back to the original execution unit: the Leader
+fixes direct work, the same native child handles its bounded correction, and
+the same Task Role and native Session handle managed work. Keep the same
+WorkItem while its delivery scope remains open. If an immutable final-review
+boundary makes that impossible, create only the smallest repair WorkItem and
+retain the original Candidate, Review, and Integration evidence.
+
+Native and managed waits use different fences. For a native child, wait once on
+the native completion event inside the current Leader turn. Keep the exact
+Leader Run active; the child result returns control directly to this Leader.
+Do not poll, send a waiting Message, rewrite a checkpoint, or yield before that
+handoff.
+
+For a managed Task Role or Reviewer Run, persist a necessary changed checkpoint,
+yield the active Leader Run, and stop the turn. Its durable mailbox result or an
+attention event wakes a later Leader Run. An unchanged healthy managed wait is
+silent. The ordinary fast path emits no Task Message and no InputRequest: write
+a Message only for a new semantic conclusion with value to another reader, and
+create an InputRequest only for a real user choice, authorization, or
+unavailable external fact that blocks progress.
+
 ## Lead with judgment
 
+- Keep the context layers distinct in every handoff: Yui Core supplies durable
+  identity, lifecycle, access, workspace, and exact-yield safety; this generic
+  role Skill supplies portable collaboration behavior; the bound Project
+  supplies its own Policy and Knowledge; and the Task Contract supplies the
+  current objective, scope, acceptance, and evidence. Do not turn a Project
+  convention into a generic role requirement.
+- For a Project-backed Task, follow the Project's existing Policy and Knowledge
+  through the context pointers. Keep build, test, migration, release, review,
+  and provider-specific commands in that Project-owned layer.
 - Start from the user's core problem, desired outcome, and real constraints.
   Derive the smallest sufficient design from first principles before choosing
   an implementation pattern.
@@ -47,6 +127,8 @@ Do not invent another execution entity or a `yui ... subagent` command.
 
 Task Messages are the Task's collaboration narrative, not a scheduler log.
 Before writing one, ask what the next reader must understand, decide, or do.
+When that bar is met, write exactly one explicit Message with
+`yui task message send <task-id> --body-file -`; never duplicate a Run yield.
 Record a new conclusion, material architecture or behavior change, meaningful
 acceptance/rejection, user impact, risk, or recovery decision; point to the
 relevant Task, WorkItem, Run, Review, Input, Decision, or Milestone for detail.
@@ -68,20 +150,19 @@ character budget: choose the smallest useful abstraction for the recipient.
 
 ## Recover and persist Task context
 
-A launch or wake message is a pointer, not the full context. Start with:
+A launch or wake message is a pointer, not the full context. Start with the
+complete Task projection, then follow its Project Policy references:
 
 ```sh
 yui task context <task-id>
-yui task work list <task-id>
-yui task role list <task-id>
-yui task integration list <task-id>
-yui task input list <task-id> --all
 yui project show <project>
 yui project knowledge list <project>
 ```
 
-Inspect narrower records only as needed. Use exact IDs returned by Yui. Never
-edit `state.json`, managed refs, worktrees, Sessions, or provider IDs directly.
+Inspect `task work`, `task role`, `task integration`, `task input`, and other
+narrower records only when the projection identifies a specific record that
+needs closer evidence. Use exact IDs returned by Yui. Never edit `state.json`,
+managed refs, worktrees, Sessions, or provider IDs directly.
 
 Maintain durable context throughout a long-running Task:
 
@@ -90,8 +171,10 @@ Maintain durable context throughout a long-running Task:
 - Keep the technical approach stable enough to explain the coordinated change
   across Projects. Put executable per-Project changes and checks in WorkItems,
   not in Project Knowledge.
-- Before every Leader yield, update `focus` and `leader-summary` so the next
-  wake can resume without relying on the native conversation transcript.
+- Before a Leader yield after material progress, update `focus` and
+  `leader-summary` so the next wake can resume without relying on the native
+  conversation transcript. An unchanged healthy wait needs no duplicate
+  checkpoint write.
 - Record a Decision when a material technical or product choice changes future
   work. Supersede it explicitly when the choice changes.
 - Add a Milestone for a phase result that can be independently reported or
@@ -131,11 +214,13 @@ Choose before creating the WorkItem:
 
 Keep review execution separate from implementation. A reviewer uses the single
 built-in write-capable `reviewer` Profile, but Yui grants that capability only
-inside a fresh ReviewRound-owned worktree created from the frozen Candidate
-commit. Never reuse the Candidate/Worker workspace or its implementation Role
-Session. Codex and Claude may use their normal configured full capability in
-that isolated worktree; the behavioral boundary forbids push, Integration,
-Task mutation, other workspaces, stable checkouts, and real YUI_HOME. When
+inside a fresh ReviewRound-owned worktree created from its exact frozen scope:
+the assigned WorkItem Candidate or the committed Integration heads of a
+Task-final Review. Never reuse the Candidate/Worker workspace or its
+implementation Role Session. Codex and Claude may use their normal configured
+full capability in that isolated worktree; the behavioral boundary forbids
+push, Integration, Task mutation, other workspaces, stable checkouts, and the
+real Yui control-plane home. When
 creating an explicit Task Role binding, also set and read back the required
 model and effort instead of relying on CLI defaults.
 Every managed reviewer must deliver through the current Run's exact
@@ -227,14 +312,16 @@ confirmed.
 Create and communicate with the child through the native Agent tools. Yui does
 not create, address, resume, or terminate that child. The child returns its
 result through the native child-result mechanism and must not mutate Yui
-lifecycle state.
+lifecycle state. Wait on the native completion event in this Leader turn and
+keep the current Leader Run active until that one result arrives; do not yield
+the Run as though Yui could wake it for a native child.
 
 Review the returned work and run proportionate checks. Record each round in the
 WorkItem summary; preserve earlier round facts when updating it:
 
 ```text
-executor=subagent; profile=reviewer@3; model=inherited; effort=inherited;
-round=2; result=2 findings fixed; checks=npm test passed
+executor=subagent; profile=implementer@1; model=inherited; effort=inherited;
+round=2; result=bounded correction delivered; checks=Project checks passed
 ```
 
 Use `model=unknown` or `effort=unknown` when the runtime does not expose the
@@ -359,8 +446,8 @@ yui task work accept <work-id> --summary "<acceptance and integration evidence>"
 ```
 
 `--check` commands run from the selected Project's integration candidate root.
-Keep them Project-relative, for example `npm test`, not
-`cd <project> && npm test`.
+Keep them Project-relative and take the exact commands from Project Policy; do
+not invent a repository-specific command or add a generic shell prelude.
 
 Candidate and ReviewRound history is retained under the same WorkItem. Every
 retry round must also retain its result and checks in the WorkItem summary.
@@ -424,8 +511,11 @@ yui task run retry <run-id>
 
 ## Request a decision
 
-When user judgment is required, first persist the Task checkpoint, then create
-one durable InputRequest:
+When a real user choice, new authority, or unavailable external fact is
+required, first persist the Task checkpoint, then create one durable
+InputRequest. Do not use InputRequests for scheduling, routine implementation
+choices inside the accepted Task Contract, review-fix routing, or confirmation
+to continue:
 
 ```sh
 yui task input request <task-id> --question "<specific question>" \
@@ -455,7 +545,7 @@ Every wake is an active control Run. Before ending:
 - Review Runs report findings, verification gaps, and limits. Use that evidence
   to decide disposition as Leader; do not treat the review as acceptance.
 
-1. update the Brief checkpoint;
+1. update the Brief checkpoint if semantic state changed;
 2. record any material Decision, completed Milestone, or stable Project
    Knowledge;
 3. do exactly one of: complete the Task, create an InputRequest, or yield.
@@ -475,8 +565,10 @@ broaden permissions, use a wrapper, mutate Yui state, or invent delivery
 evidence; truthfully surface the blocker through the supported provider failure
 boundary. Do not add a fallback protocol.
 
-Always yield before waiting for delegated results. Leaving the Run active
-prevents queued results from waking the Leader.
+Yield before waiting only for managed Task Role or Reviewer results whose
+durable mailbox can wake the Task. Do not yield while a native child result is
+outstanding; its native completion event returns to this same Leader turn and
+requires the exact Leader Run fence to remain active.
 
 Complete only after required WorkItems are accepted, Role work is terminal,
 latest isolated results are integrated or deliberately abandoned, and user

@@ -438,7 +438,7 @@ test("stale stall persistence cannot cross a Session terminal transition", (t) =
   );
 });
 
-test("advisory resource suppression survives a Controller restart for one Run/progress point", async (t) => {
+test("advisory resource suppression survives restart but expires at the semantic progress bound", async (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
   const createdAt = new Date(now.getTime() - 60 * 60_000);
   const run = createAgentRun(
@@ -479,6 +479,7 @@ test("advisory resource suppression survives a Controller restart for one Run/pr
     ));
     tx.saveTaskRoleSessionSet(sessions);
   });
+  let observedAt = new Date(now.getTime() - 1_000).toISOString();
   const delivery = {
     async inspectRole() { return "present"; },
     async inspectRoles(inputs) {
@@ -487,7 +488,7 @@ test("advisory resource suppression survives a Controller restart for one Run/pr
         roleName: input.roleName,
         status: "present",
         resource: {
-          observedAt: new Date(now.getTime() - 1_000).toISOString(),
+          observedAt,
           progressAt: input.progressAt,
           identity: {
             taskId: input.taskId,
@@ -543,6 +544,30 @@ test("advisory resource suppression survives a Controller restart for one Run/pr
     new Set()
   );
   assert.deepEqual(second.failedRunRefs, []);
+  assert.equal(
+    restartedStore.listEvents(task.id).filter((event) => event.type === "run.resource-suppressed").length,
+    1
+  );
+  assert.equal(
+    restartedStore.listEvents(task.id).filter((event) => event.type === "run.stalled").length,
+    0
+  );
+
+  const expired = new Date(now.getTime() + 31 * 60_000);
+  observedAt = new Date(expired.getTime() - 1_000).toISOString();
+  const third = await runControllerSchedulerPass(
+    restartedAdapter,
+    delivery,
+    expired,
+    undefined,
+    { kind: "full" },
+    true,
+    [],
+    undefined,
+    30 * 60_000,
+    new Set()
+  );
+  assert.deepEqual(third.failedRunRefs, []);
   assert.equal(
     restartedStore.listEvents(task.id).filter((event) => event.type === "run.resource-suppressed").length,
     1
@@ -1978,6 +2003,7 @@ test("Worker delivery exhaustion atomically fails the exact Run and queues clean
     taskId: fx.task.id,
     id: fx.run.id
   });
+  const messagesBeforeFailure = fx.store.listMessages(fx.task.id);
 
   assert.equal(
     fx.adapter.saveRoleRunDeliveryFailure(fx.failure),
@@ -2000,13 +2026,19 @@ test("Worker delivery exhaustion atomically fails the exact Run and queues clean
   assert.ok(fx.store.listEvents(fx.task.id).some(
     (event) => event.type === "runtime.role-delivery-failed"
   ));
-  const messageCount = fx.store.listMessages(fx.task.id).length;
+  assert.deepEqual(fx.store.listMessages(fx.task.id), messagesBeforeFailure);
+  const leaderMailbox = fx.store.getWorkMailbox({
+    kind: "role",
+    taskId: fx.task.id,
+    roleName: "leader"
+  });
+  assert.ok(leaderMailbox.pending.refs.every((ref) => ref.type !== "message"));
 
   assert.equal(
     fx.adapter.saveRoleRunDeliveryFailure(fx.failure),
     "state-changed"
   );
-  assert.equal(fx.store.listMessages(fx.task.id).length, messageCount);
+  assert.deepEqual(fx.store.listMessages(fx.task.id), messagesBeforeFailure);
 });
 
 test("Reviewer delivery exhaustion fails only its ReviewRound and queues the Leader", (t) => {
@@ -2014,6 +2046,7 @@ test("Reviewer delivery exhaustion fails only its ReviewRound and queues the Lea
     roleName: "reviewer",
     purpose: "review"
   });
+  const messagesBeforeFailure = fx.store.listMessages(fx.task.id);
 
   assert.equal(
     fx.adapter.saveRoleRunDeliveryFailure(fx.failure),
@@ -2034,10 +2067,12 @@ test("Reviewer delivery exhaustion fails only its ReviewRound and queues the Lea
     1
   );
   assert.ok(fx.store.getPendingWakeup(fx.task.id).reasons.includes("review-failed"));
+  assert.deepEqual(fx.store.listMessages(fx.task.id), messagesBeforeFailure);
 });
 
 test("Leader delivery exhaustion records Operator recovery and stops its owned runtime before session exit", async (t) => {
   const fx = preparedDeliveryFailureFixture(t, { roleName: "leader" });
+  const messagesBeforeFailure = fx.store.listMessages(fx.task.id);
   const runtimeTarget = runtimeLifecycleTarget({
     scope: "task",
     taskId: fx.task.id,
@@ -2062,6 +2097,10 @@ test("Leader delivery exhaustion records Operator recovery and stops its owned r
       "leader-run-failed"
     )
   );
+  assert.deepEqual(fx.store.listMessages(fx.task.id), messagesBeforeFailure);
+  assert.ok(fx.store.getWorkMailbox({ kind: "operator" }).pending.refs.every(
+    (ref) => ref.type !== "message"
+  ));
   assert.equal(fx.store.getRoleSession(fx.task.id, fx.role.name).status, "ready");
   assert.equal(hasRuntimeCleanupObligation(
     fx.store.getWorkMailbox(runtimeTarget)

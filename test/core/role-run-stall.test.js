@@ -5,6 +5,7 @@ import {
   evaluateRoleRunStall,
   isRoleRunStalled,
   latestDurableProgressAt,
+  latestRunActivityAt,
   latestRunProgressAt,
   projectRoleRunHealth,
   reconcileStalledRoleRuns
@@ -68,6 +69,39 @@ test("late stale progress events cannot move the durable progress fence backward
   assert.equal(
     latestRunProgressAt(events, "run-1"),
     "2026-08-05T00:30:00.000Z"
+  );
+});
+
+test("provider-native turn progress advances the exact Run progress fence", async () => {
+  const progressAt = "2026-08-05T00:55:00.000Z";
+  const store = stallStore();
+  store.events.push(createTaskEvent(
+    "event-3",
+    "task-1",
+    "runtime.provider-turn-progress",
+    {
+      runId: "run-1",
+      roleName: "worker",
+      agentId: "agent-1",
+      adapterId: "codex",
+      nativeSessionId: "native-1",
+      launchId: "launch-1",
+      progressId: "tool-1",
+      progressAt
+    },
+    new Date(progressAt)
+  ));
+
+  assert.equal(latestRunProgressAt(store.events, "run-1"), progressAt);
+  assert.deepEqual(
+    await reconcileStalledRoleRuns(
+      store,
+      { async inspectRole() { return "present"; } },
+      NOW,
+      undefined,
+      30 * 60_000
+    ),
+    []
   );
 });
 
@@ -273,6 +307,68 @@ test("one scheduler resource sample suppresses an execution false positive witho
   );
   assert.deepEqual(result, []);
   assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 0);
+});
+
+test("continued resource activity is bounded by the semantic progress gap", async () => {
+  const store = stallStore();
+  let recorded = false;
+  store.recordRoleRunResourceSuppression = () => {
+    if (recorded) return "already-recorded";
+    recorded = true;
+    return "recorded";
+  };
+  const evidenceAt = (now) => new Map([[
+    "task-1\0worker\0run-1",
+    {
+      observedAt: new Date(now.getTime() - 30_000).toISOString(),
+      progressAt: PROGRESS,
+      identity: {
+        taskId: "task-1",
+        roleName: "worker",
+        runId: "run-1",
+        agentId: "agent-1",
+        adapterId: "codex",
+        nativeSessionId: "native-1"
+      },
+      active: true,
+      changed: true,
+      cpuTimeMs: now.getTime()
+    }
+  ]]);
+  const delivery = { async inspectRole() { return "present"; } };
+
+  assert.deepEqual(await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    NOW,
+    undefined,
+    30 * 60_000,
+    undefined,
+    evidenceAt(NOW)
+  ), []);
+  const stillBounded = new Date("2026-08-05T01:20:00.000Z");
+  assert.deepEqual(await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    stillBounded,
+    undefined,
+    30 * 60_000,
+    undefined,
+    evidenceAt(stillBounded)
+  ), []);
+
+  const expired = new Date("2026-08-05T01:30:00.000Z");
+  const result = await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    expired,
+    undefined,
+    30 * 60_000,
+    undefined,
+    evidenceAt(expired)
+  );
+  assert.equal(result[0]?.runId, "run-1");
+  assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 1);
 });
 
 test("launch identity can fence advisory resource activity when native Session id is opaque", async () => {
@@ -507,6 +603,432 @@ test("Leader stall scan leaves waiting-user and healthy waiting-on-workers Runs 
   assert.equal(healthyWorker.events.length, 0);
 });
 
+test("a Leader with a single stalled Worker keeps the recovery Leader-owned on the same pass", async () => {
+  const store = stallStore({ roleName: "leader", downstream: true, downstreamStalled: true });
+  const delivery = { async inspectRole() { return "present"; } };
+  const first = await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  // Only the Worker's run.stalled is recorded; the Leader is not escalated to
+  // the Operator in the same reconciliation that first observed the stall.
+  const stalled = store.events.filter((event) => event.type === "run.stalled");
+  assert.equal(stalled.length, 1);
+  assert.equal(stalled[0].payload.runId, "run-worker");
+  assert.deepEqual(
+    first.map(({ runId, classification }) => ({ runId, classification })),
+    [{ runId: "run-worker", classification: "truly-stalled" }]
+  );
+
+  // A repeated pass is idempotent: no duplicate and still no Leader escalation.
+  await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 1);
+  assert.equal(
+    store.events.some((event) => (
+      event.type === "run.stalled" && event.payload.runId === "run-1"
+    )),
+    false
+  );
+});
+
+test("a recent Leader mailbox action is not escalated even while a Worker is stalled", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderMailboxQueuedAt: new Date(NOW.getTime() - 15 * 60_000).toISOString()
+  });
+  const delivery = { async inspectRole() { return "present"; } };
+  await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  const stalled = store.events.filter((event) => event.type === "run.stalled");
+  assert.equal(stalled.length, 1);
+  assert.equal(stalled[0].payload.runId, "run-worker");
+});
+
+test("a stale Leader mailbox action escalates the Leader once alongside the Worker stall", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderMailboxQueuedAt: new Date(NOW.getTime() - 60 * 60_000).toISOString()
+  });
+  const delivery = { async inspectRole() { return "present"; } };
+  const first = await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  assert.deepEqual(
+    first.map(({ runId, classification }) => ({ runId, classification })).sort((a, b) => (
+      a.runId.localeCompare(b.runId)
+    )),
+    [
+      { runId: "run-1", classification: "truly-stalled" },
+      { runId: "run-worker", classification: "truly-stalled" }
+    ]
+  );
+  assert.equal(
+    store.events.filter((event) => (
+      event.type === "run.stalled" && event.payload.runId === "run-1"
+    )).length,
+    1
+  );
+
+  // The Leader escalation is one-shot for the same Run + progress point.
+  await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  assert.equal(
+    store.events.filter((event) => (
+      event.type === "run.stalled" && event.payload.runId === "run-1"
+    )).length,
+    1
+  );
+});
+
+test("an exact current Leader processing batch ages into one Operator-owned stall", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: new Date(NOW.getTime() - 60 * 60_000).toISOString(),
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" }
+    }
+  });
+  const delivery = { async inspectRole() { return "present"; } };
+  const first = await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  assert.deepEqual(
+    first.map(({ runId, classification }) => ({ runId, classification })).sort((a, b) => (
+      a.runId.localeCompare(b.runId)
+    )),
+    [
+      { runId: "run-1", classification: "truly-stalled" },
+      { runId: "run-worker", classification: "truly-stalled" }
+    ]
+  );
+  assert.equal(
+    store.events.filter((event) => (
+      event.type === "run.stalled" && event.payload.runId === "run-1"
+    )).length,
+    1
+  );
+
+  // Reconciliation is one-shot for this exact Run + progress point.
+  await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  assert.equal(
+    store.events.filter((event) => (
+      event.type === "run.stalled" && event.payload.runId === "run-1"
+    )).length,
+    1
+  );
+});
+
+test("a recent exact Leader processing batch keeps Worker recovery Leader-owned", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: new Date(NOW.getTime() - 15 * 60_000).toISOString(),
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" }
+    }
+  });
+  const delivery = { async inspectRole() { return "present"; } };
+  const first = await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  assert.deepEqual(first.map(({ runId }) => runId), ["run-worker"]);
+  assert.equal(
+    store.events.some((event) => event.type === "run.stalled" && event.payload.runId === "run-1"),
+    false
+  );
+});
+
+test("a newer durable Leader progress fence keeps an old processing batch quiet", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: new Date(NOW.getTime() - 60 * 60_000).toISOString(),
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" }
+    }
+  });
+  store.events.push(createTaskEvent(
+    "event-3",
+    "task-1",
+    "run.progress",
+    {
+      runId: "run-1",
+      progressAt: new Date(NOW.getTime() - 5 * 60_000).toISOString()
+    },
+    new Date(NOW.getTime() - 5 * 60_000)
+  ));
+  const delivery = { async inspectRole() { return "present"; } };
+  const first = await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  assert.deepEqual(first.map(({ runId }) => runId), ["run-worker"]);
+  assert.equal(
+    store.events.some((event) => event.type === "run.stalled" && event.payload.runId === "run-1"),
+    false
+  );
+});
+
+test("a Leader processing action escalates after its newer progress fence ages out", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: "2026-08-05T00:10:00.000Z",
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" }
+    }
+  });
+  store.events.push(createTaskEvent(
+    "event-3",
+    "task-1",
+    "run.progress",
+    {
+      runId: "run-1",
+      progressAt: "2026-08-05T00:20:00.000Z"
+    },
+    new Date("2026-08-05T00:20:00.000Z")
+  ));
+  const delivery = { async inspectRole() { return "present"; } };
+  const result = await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    new Date("2026-08-05T01:20:00.000Z"),
+    undefined,
+    30 * 60_000
+  );
+  assert.equal(result.some(({ runId }) => runId === "run-1"), true);
+  assert.equal(
+    store.events.filter((event) => event.type === "run.stalled" && event.payload.runId === "run-1").length,
+    1
+  );
+});
+
+test("a stale unrelated pending Leader batch cannot override fresh current processing progress", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: "2026-08-05T00:00:00.000Z",
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" },
+      refs: [{ type: "work-item", taskId: "task-1", id: "work-1" }]
+    }
+  });
+  store.events.push(createTaskEvent(
+    "event-3",
+    "task-1",
+    "work.retired",
+    {
+      workItemId: "work-1",
+      summary: "retired"
+    },
+    new Date("2026-08-05T00:20:00.000Z")
+  ));
+  const originalMailbox = store.getWorkMailbox.bind(store);
+  store.getWorkMailbox = (selector) => {
+    const mailbox = originalMailbox(selector);
+    if (selector?.kind !== "role" || selector.roleName !== "leader") return mailbox;
+    return {
+      ...mailbox,
+      pending: {
+        lastQueuedAt: "2026-08-05T00:00:00.000Z",
+        refs: [{ type: "run", taskId: "task-other", id: "run-other" }]
+      }
+    };
+  };
+  const delivery = { async inspectRole() { return "present"; } };
+  const result = await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    new Date("2026-08-05T00:40:00.000Z"),
+    undefined,
+    30 * 60_000
+  );
+  assert.deepEqual(result.map(({ runId }) => runId), ["run-worker"]);
+  assert.equal(
+    store.events.some((event) => event.type === "run.stalled" && event.payload.runId === "run-1"),
+    false
+  );
+});
+
+test("current Leader action lifecycle progress is bounded to its processing batch", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: "2026-08-05T00:00:00.000Z",
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" },
+      refs: [{ type: "work-item", taskId: "task-1", id: "work-1" }]
+    }
+  });
+  store.events.push(createTaskEvent(
+    "event-3",
+    "task-1",
+    "work.retired",
+    { workItemId: "work-1", summary: "retired" },
+    new Date("2026-08-05T00:20:00.000Z")
+  ));
+  const delivery = { async inspectRole() { return "present"; } };
+  const result = await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    new Date("2026-08-05T00:40:00.000Z"),
+    undefined,
+    30 * 60_000
+  );
+  assert.deepEqual(result.map(({ runId }) => runId), ["run-worker"]);
+  assert.equal(
+    store.events.some((event) => event.type === "run.stalled" && event.payload.runId === "run-1"),
+    false
+  );
+});
+
+test("Task-scoped milestone progress requires the exact current action reason and Task ref", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: "2026-08-05T00:00:00.000Z",
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" },
+      reasons: ["milestone-added"],
+      refs: [{ type: "task", id: "task-1" }]
+    }
+  });
+  store.events.push(createTaskEvent(
+    "event-4",
+    "task-1",
+    "milestone.added",
+    { milestoneId: "milestone-1", title: "checkpoint" },
+    new Date("2026-08-05T00:20:00.000Z")
+  ));
+  const delivery = { async inspectRole() { return "present"; } };
+  const result = await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    new Date("2026-08-05T00:40:00.000Z"),
+    undefined,
+    30 * 60_000
+  );
+  assert.deepEqual(result.map(({ runId }) => runId), ["run-worker"]);
+});
+
+test("a stamped Leader event from another Task cannot refresh a local Run-id collision", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: "2026-08-05T00:00:00.000Z",
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" }
+    }
+  });
+  store.events.push(createTaskEvent(
+    "event-1",
+    "task-other",
+    "decision.recorded",
+    { leaderRunId: "run-1", decisionId: "decision-1" },
+    new Date("2026-08-05T00:20:00.000Z")
+  ));
+  const delivery = { async inspectRole() { return "present"; } };
+  const result = await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    new Date("2026-08-05T00:40:00.000Z"),
+    undefined,
+    30 * 60_000
+  );
+  assert.deepEqual(
+    result.map(({ runId }) => runId).sort(),
+    ["run-1", "run-worker"]
+  );
+});
+
+test("a mailbox reason prefix cannot claim a different Leader lifecycle event", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: "2026-08-05T00:00:00.000Z",
+      executionRef: { type: "run", taskId: "task-1", id: "run-1" },
+      reasons: ["milestone-added-extra"],
+      refs: [{ type: "task", id: "task-1" }]
+    }
+  });
+  store.events.push(createTaskEvent(
+    "event-1",
+    "task-1",
+    "milestone.added",
+    { milestoneId: "milestone-1", title: "Not the claimed reason" },
+    new Date("2026-08-05T00:20:00.000Z")
+  ));
+  const delivery = { async inspectRole() { return "present"; } };
+  const result = await reconcileStalledRoleRuns(
+    store,
+    delivery,
+    new Date("2026-08-05T00:40:00.000Z"),
+    undefined,
+    30 * 60_000
+  );
+  assert.deepEqual(
+    result.map(({ runId }) => runId).sort(),
+    ["run-1", "run-worker"]
+  );
+});
+
+test("provider activity lookup uses the immutable progress timestamp, not drain time", () => {
+  const receivedAt = "2026-08-05T00:05:00.000Z";
+  const events = [createTaskEvent(
+    "event-3",
+    "task-1",
+    "runtime.provider-turn-progress",
+    {
+      runId: "run-1",
+      roleName: "worker",
+      agentId: "agent-1",
+      adapterId: "codex",
+      nativeSessionId: "native-1",
+      launchId: "launch-1",
+      progressAt: receivedAt
+    },
+    NOW
+  )];
+  assert.equal(latestRunActivityAt(events, "run-1"), receivedAt);
+});
+
+test("malformed provider progress cannot become durable activity through event creation time", () => {
+  const events = [createTaskEvent(
+    "event-4",
+    "task-1",
+    "runtime.provider-turn-progress",
+    { runId: "run-1" },
+    NOW
+  )];
+  assert.equal(latestRunActivityAt(events, "run-1"), undefined);
+  assert.equal(latestRunProgressAt(events, "run-1"), undefined);
+});
+
+test("mismatched Leader processing is not current action evidence", async () => {
+  const store = stallStore({
+    roleName: "leader",
+    downstream: true,
+    downstreamStalled: true,
+    leaderProcessing: {
+      startedAt: new Date(NOW.getTime() - 60 * 60_000).toISOString(),
+      executionRef: { type: "run", taskId: "task-other", id: "run-other" }
+    }
+  });
+  const delivery = { async inspectRole() { return "present"; } };
+  const first = await reconcileStalledRoleRuns(store, delivery, NOW, undefined, 30 * 60_000);
+  assert.deepEqual(
+    first.map(({ runId }) => runId),
+    ["run-worker"]
+  );
+  assert.equal(
+    store.events.some((event) => (
+      event.type === "run.stalled" && event.payload.runId === "run-1"
+    )),
+    false
+  );
+});
+
 function stallStore(options = {}) {
   const task = { id: "task-1", title: "stall", status: "active", projectBindings: [] };
   const role = {
@@ -557,9 +1079,9 @@ function stallStore(options = {}) {
     ...run,
     id: "run-worker",
     roleName: "worker",
-    deliveredAt: "2026-08-05T00:40:00.000Z",
-    createdAt: "2026-08-05T00:40:00.000Z",
-    updatedAt: "2026-08-05T00:40:00.000Z",
+    deliveredAt: options.downstreamStalled ? PROGRESS : "2026-08-05T00:40:00.000Z",
+    createdAt: options.downstreamStalled ? PROGRESS : "2026-08-05T00:40:00.000Z",
+    updatedAt: options.downstreamStalled ? PROGRESS : "2026-08-05T00:40:00.000Z",
     effective: {
       agentId: downstreamRole.activeAgentId,
       adapterId: downstreamRole.adapterId
@@ -587,7 +1109,42 @@ function stallStore(options = {}) {
       return this.session;
     },
     hasOpenInputRequest() { return options.openInput === true; },
-    getWorkMailbox() { return { pending: null }; },
+    getWorkMailbox(selector) {
+      if (
+        selector !== undefined
+        && selector.kind === "role"
+        && selector.roleName === "leader"
+        && options.leaderMailboxQueuedAt !== undefined
+      ) {
+        return { pending: { lastQueuedAt: options.leaderMailboxQueuedAt } };
+      }
+      if (
+        selector !== undefined
+        && selector.kind === "role"
+        && selector.roleName === "leader"
+        && options.leaderProcessing !== undefined
+      ) {
+        return {
+          pending: null,
+          processing: {
+            batchId: "task-1/leader-batch-1",
+            batch: {
+              fromSequence: 1,
+              toSequence: 1,
+              reasons: options.leaderProcessing.reasons ?? ["leader-action"],
+              refs: options.leaderProcessing.refs ?? [],
+              requestCount: 1,
+              firstQueuedAt: options.leaderProcessing.startedAt,
+              lastQueuedAt: options.leaderProcessing.startedAt
+            },
+            owner: "controller",
+            startedAt: options.leaderProcessing.startedAt,
+            executionRef: options.leaderProcessing.executionRef
+          }
+        };
+      }
+      return { pending: null };
+    },
     listEvents() { return this.events; },
     recordRoleRunStall(input) {
       const existing = this.events.find((event) => (

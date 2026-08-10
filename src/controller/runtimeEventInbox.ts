@@ -123,11 +123,34 @@ export type RuntimePromptAcceptedEvent = Readonly<{
   receivedAt: string;
 }> & RuntimePromptAcceptedInput;
 
+/** A provider-native progress fact emitted during an accepted turn. */
+export type RuntimeProviderProgressInput = Readonly<{
+  scope: "task";
+  taskId: string;
+  roleName: string;
+  agentId: string;
+  adapterId: "codex" | "claude";
+  launchId: string;
+  nativeSessionId: string;
+  runId: string;
+  /** Provider-native event identity (for example Claude tool_use_id). */
+  progressId: string;
+  sequence?: number;
+}>;
+
+export type RuntimeProviderProgressEvent = Readonly<{
+  schemaVersion: 1;
+  id: string;
+  type: "native-turn-progress";
+  receivedAt: string;
+}> & RuntimeProviderProgressInput;
+
 export type RuntimeLifecycleEvent =
   | RuntimeTurnCompletedEvent
   | RuntimeClaudeStopFailureEvent
   | RuntimeSessionLifecycleEvent
-  | RuntimePromptAcceptedEvent;
+  | RuntimePromptAcceptedEvent
+  | RuntimeProviderProgressEvent;
 
 export type RuntimeEventEnqueueResult<TEvent extends RuntimeLifecycleEvent = RuntimeLifecycleEvent> =
   Readonly<{ event: TEvent; created: boolean }>;
@@ -201,6 +224,19 @@ export class FileRuntimeEventInbox {
       schemaVersion: 1,
       id: runtimeEventId("native-prompt-accepted", normalized),
       type: "native-prompt-accepted",
+      receivedAt: this.now().toISOString(),
+      ...normalized
+    }));
+  }
+
+  enqueueProviderProgress(
+    input: RuntimeProviderProgressInput
+  ): RuntimeEventEnqueueResult<RuntimeProviderProgressEvent> {
+    const normalized = normalizeProviderProgressInput(input);
+    return this.publish(Object.freeze({
+      schemaVersion: 1,
+      id: runtimeEventId("native-turn-progress", normalized),
+      type: "native-turn-progress",
       receivedAt: this.now().toISOString(),
       ...normalized
     }));
@@ -373,6 +409,7 @@ function runtimeEventId(
     | RuntimeClaudeStopFailureInput
     | RuntimeSessionLifecycleInput
     | RuntimePromptAcceptedInput
+    | RuntimeProviderProgressInput
 ): string {
   const common = [
     1,
@@ -386,6 +423,8 @@ function runtimeEventId(
     input.nativeSessionId,
     "turnId" in input ? input.turnId : null,
     input.runId ?? null,
+    "progressId" in input ? input.progressId : null,
+    "sequence" in input ? input.sequence ?? null : null,
     "sessionSource" in input ? input.sessionSource ?? null : null,
     "receiptId" in input ? input.receiptId ?? null : null
   ];
@@ -494,6 +533,28 @@ function normalizePromptAcceptedInput(
   };
 }
 
+function normalizeProviderProgressInput(
+  input: RuntimeProviderProgressInput
+): RuntimeProviderProgressInput {
+  if (input.scope !== "task") throw invalidEvent();
+  if (input.adapterId !== "codex" && input.adapterId !== "claude") throw invalidEvent();
+  if (input.sequence !== undefined && !Number.isSafeInteger(input.sequence)) {
+    throw invalidEvent();
+  }
+  return {
+    scope: "task",
+    taskId: requireIdentityText(input.taskId, "Task id"),
+    roleName: requireIdentityText(input.roleName, "Role name"),
+    agentId: requireIdentityText(input.agentId, "Agent id"),
+    adapterId: input.adapterId,
+    launchId: requireIdentityText(input.launchId, "Launch id"),
+    nativeSessionId: requireIdentityText(input.nativeSessionId, "Native session id"),
+    runId: requireIdentityText(input.runId, "Run id"),
+    progressId: requireIdentityText(input.progressId, "Provider progress id"),
+    ...(input.sequence === undefined ? {} : { sequence: input.sequence })
+  };
+}
+
 function parseRuntimeEvent(value: unknown): RuntimeLifecycleEvent {
   if (!isObject(value)) throw invalidEvent();
   switch (value.type) {
@@ -501,6 +562,7 @@ function parseRuntimeEvent(value: unknown): RuntimeLifecycleEvent {
     case "claude-stop-failure": return parseClaudeStopFailureEvent(value);
     case "native-session-lifecycle": return parseSessionLifecycleEvent(value);
     case "native-prompt-accepted": return parsePromptAcceptedEvent(value);
+    case "native-turn-progress": return parseProviderProgressEvent(value);
     default: throw invalidEvent();
   }
 }
@@ -538,6 +600,25 @@ function parsePromptAcceptedEvent(
     schemaVersion: 1,
     id: requireIdentityText(value.id, "Event id"),
     type: "native-prompt-accepted",
+    receivedAt: requireTimestamp(value.receivedAt),
+    ...normalized
+  });
+}
+
+function parseProviderProgressEvent(
+  value: Record<string, any>
+): RuntimeProviderProgressEvent {
+  const expected = [
+    "schemaVersion", "id", "type", "receivedAt", "scope", "taskId", "roleName",
+    "agentId", "adapterId", "launchId", "nativeSessionId", "runId", "progressId",
+    ...(value.sequence === undefined ? [] : ["sequence"])
+  ];
+  if (value.schemaVersion !== 1 || !hasExactKeys(value, expected)) throw invalidEvent();
+  const normalized = normalizeProviderProgressInput(value as RuntimeProviderProgressInput);
+  return Object.freeze({
+    schemaVersion: 1,
+    id: requireIdentityText(value.id, "Event id"),
+    type: "native-turn-progress",
     receivedAt: requireTimestamp(value.receivedAt),
     ...normalized
   });
@@ -673,7 +754,11 @@ function hasSameIdentity(left: RuntimeLifecycleEvent, right: RuntimeLifecycleEve
     && left.launchId === right.launchId
     && left.nativeSessionId === right.nativeSessionId
     && left.runId === right.runId
-    && (!("turnId" in left) || !("turnId" in right) || left.turnId === right.turnId);
+    && (!("turnId" in left) || !("turnId" in right) || left.turnId === right.turnId)
+    && (!("progressId" in left)
+      || !("progressId" in right)
+      || left.progressId === right.progressId)
+    && (!("sequence" in left) || !("sequence" in right) || left.sequence === right.sequence);
 }
 
 function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {

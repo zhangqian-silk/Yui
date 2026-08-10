@@ -701,9 +701,9 @@ test("managed Claude Task Runs inject the lifecycle hooks and exact explicit-yie
   const hooks = JSON.parse(readFileSync(join(pluginRoot, "hooks", "hooks.json"), "utf8"));
   assert.deepEqual(
     Object.keys(hooks.hooks).sort(),
-    ["SessionStart", "StopFailure", "UserPromptSubmit"]
+    ["PostToolUse", "SessionStart", "StopFailure", "UserPromptSubmit"]
   );
-  for (const eventKey of ["SessionStart", "UserPromptSubmit", "StopFailure"]) {
+  for (const eventKey of ["SessionStart", "UserPromptSubmit", "PostToolUse", "StopFailure"]) {
     const command = hooks.hooks[eventKey][0].hooks[0];
     assert.equal(command.command, process.execPath, eventKey);
     assert.deepEqual(command.args, ["/dist/cli.js", "internal", "claude-hook"], eventKey);
@@ -930,6 +930,7 @@ test("Codex turn completion releases a forgotten Leader active fence exactly onc
     "input-messages": [],
     "last-assistant-message": "Workers dispatched; waiting for their results."
   });
+  const messagesBeforeCompletion = store.listMessages(task.id);
   recordParsedTurnCompletion(schedulerStore, payload, environment);
 
   assert.equal(store.getActiveAgentRun(task.id, role.name), null);
@@ -942,10 +943,10 @@ test("Codex turn completion releases a forgotten Leader active fence exactly onc
   assert.equal(store.getRoleSession(task.id, role.name).status, "ready");
   assert.equal(store.getTask(task.id).status, "active");
   assert.deepEqual(store.getPendingWakeup(task.id).reasons, ["role-result"]);
-  assert.equal(store.listMessages(task.id).filter((message) => message.runId === run.id).length, 1);
+  assert.deepEqual(store.listMessages(task.id), messagesBeforeCompletion);
 
   recordParsedTurnCompletion(schedulerStore, payload, environment);
-  assert.equal(store.listMessages(task.id).filter((message) => message.runId === run.id).length, 1);
+  assert.deepEqual(store.listMessages(task.id), messagesBeforeCompletion);
   assert.equal(store.getRoleSession(task.id, role.name).status, "ready");
 });
 
@@ -997,6 +998,7 @@ test("a quiescent result-driven Leader turn queues recovery when the Agent forge
     "input-messages": [],
     "last-assistant-message": "Analysis complete and verified."
   });
+  const messagesBeforeCompletion = store.listMessages(task.id);
   recordParsedTurnCompletion(schedulerStore, payload, environment);
 
   assert.equal(store.getTask(task.id).status, "active");
@@ -1004,6 +1006,7 @@ test("a quiescent result-driven Leader turn queues recovery when the Agent forge
   assert.equal(store.getAgentRun(task.id, run.id).status, "yielded");
   assert.equal(store.getActiveAgentRun(task.id, role.name), null);
   assert.deepEqual(store.getPendingWakeup(task.id).reasons, ["leader-turn-unclosed"]);
+  assert.deepEqual(store.listMessages(task.id), messagesBeforeCompletion);
 });
 
 test("a Worker turn that forgets to yield fails visibly and wakes the Leader", async (t) => {

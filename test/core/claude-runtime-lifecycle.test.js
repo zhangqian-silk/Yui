@@ -272,6 +272,7 @@ test("Claude StopFailure accepts provider evolution but never infers a managed i
 test("Claude StopFailure fails the exact Run and WorkItem without a Candidate or retry", async (t) => {
   const { home, store, task, worker, item, run, agent, second } = workflowFixture(t);
   const adapter = new FileSchedulerStoreAdapter(store);
+  const messagesBeforeFailure = store.listMessages(task.id);
   await runClaudeLifecycleHookCommand(JSON.stringify({
     ...currentClaudeHookCommon("StopFailure"),
     error: "server_error",
@@ -317,7 +318,14 @@ test("Claude StopFailure fails the exact Run and WorkItem without a Candidate or
   assert.deepEqual(failedItem.candidates, []);
   assert.equal(store.getActiveAgentRun(task.id, worker.name), null);
   assert.equal(store.listAgentRuns(task.id).length, 1);
-  assert.ok(store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: "leader" }).pending.reasons.includes("role-run-failed"));
+  const leaderMailbox = store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: "leader" });
+  assert.ok(leaderMailbox.pending.reasons.includes("role-run-failed"));
+  assert.ok(leaderMailbox.pending.refs.every((ref) => ref.type !== "message"));
+  assert.deepEqual(store.listMessages(task.id), messagesBeforeFailure);
+  assert.ok(store.listEvents(task.id).some((entry) => (
+    entry.type === "runtime.claude-stop-failure"
+    && entry.payload.runId === run.id
+  )));
   assert.equal(adapter.classifyClaudeStopFailureEvent(event), "obsolete");
   assert.equal(adapter.observeClaudeStopFailureEvent(event, second).disposition, "obsolete");
   assert.equal(store.getWorkItem(task.id, item.id).candidates.length, 0);
@@ -328,6 +336,7 @@ test("exact stdin yield preserves multiline UTF-8, rejects wrong or repeated Run
   const { home, store, task, worker, item, run, agent } = workflowFixture(t);
   const adapter = new FileSchedulerStoreAdapter(store);
   const summary = "第一段\n\n完整结果🙂\n最后一段";
+  const messagesBeforeYield = store.listMessages(task.id);
 
   const wrong = yieldThroughCli(home, "agent-run-99", "wrong Run must fail");
   assert.notEqual(wrong.status, 0);
@@ -337,11 +346,12 @@ test("exact stdin yield preserves multiline UTF-8, rejects wrong or repeated Run
   assert.equal(yielded.status, 0, yielded.stderr);
   assert.equal(store.getAgentRun(task.id, run.id).summary, summary);
   assert.equal(store.getWorkItem(task.id, item.id).candidates[0].summary, summary);
-  assert.equal(store.listMessages(task.id).at(-1).body, summary);
+  assert.deepEqual(store.listMessages(task.id), messagesBeforeYield);
 
   const repeated = yieldThroughCli(home, run.id, "duplicate result");
   assert.notEqual(repeated.status, 0);
   assert.equal(store.getWorkItem(task.id, item.id).candidates.length, 1);
+  assert.deepEqual(store.listMessages(task.id), messagesBeforeYield);
   const third = new Date(Date.now() + 60_000);
   const options = {
     now: () => third,
@@ -401,7 +411,7 @@ test("exact stdin yield preserves multiline UTF-8, rejects wrong or repeated Run
   );
   assert.deepEqual(
     Object.keys(resumeHooks.hooks).sort(),
-    ["SessionStart", "StopFailure", "UserPromptSubmit"]
+    ["PostToolUse", "SessionStart", "StopFailure", "UserPromptSubmit"]
   );
 
   const late = {

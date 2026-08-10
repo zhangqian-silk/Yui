@@ -348,6 +348,7 @@ function leaderWakeupInput(
   const lines: string[] = [
     "Follow the injected yui-leader Skill for this Yui wakeup.",
     `Current Leader Run: ${runId}.`,
+    `For every Leader decision, milestone, or Work Item lifecycle command that is meaningful progress, carry this exact current-turn assertion on that command: YUI_LEADER_ACTION_RUN_ID=${runId} YUI_LEADER_ACTION_RECEIPT_ID=${formatAgentRunReceiptId(taskId, runId)}. The native Session environment may retain an older YUI_RUN_ID/launch; never copy those values, and never reuse this assertion after the turn changes.`,
     `Yui wakeup reasons: ${reasons.join(", ")}.`,
     `Read the authoritative context with yui task context ${taskId}.`,
     "For role-run-stalled or runtime-health attention, diagnose from the exact Run/Event/Session and related WorkItem/Review/Integration records. Preserve the current fence and write a Task Message only for a new root cause, impact, recovery action, acceptance decision, or user-relevant conclusion; an unchanged healthy wait is zero Message.",

@@ -157,7 +157,10 @@ import {
   openInputRequestCount,
   runTaskInputCommand
 } from "./taskInputCommands.js";
-import { taskActor as resolveTaskActor } from "./taskActor.js";
+import {
+  taskActor as resolveTaskActor,
+  taskLeaderActionRunId
+} from "./taskActor.js";
 import { createTaskTerminalNotification } from "../scheduler/operatorNotification.js";
 import {
   buildTaskOverview,
@@ -1131,17 +1134,39 @@ function taskMessageCommand(
     const result = store.transaction((tx) => {
       const task = requireTask(tx, parsed.positionals[0]);
       assertTaskOpen(task);
-      const message = appendMessage(tx, task.id, body, "user", { type: "user" }, now);
-      if (task.status === "active") {
-        enqueueWork(tx, leaderMailbox(task.id), "user-message", now, [messageRef(task.id, message.id)]);
+      const actor = taskActor(options, task.id);
+      const message = actor === "leader"
+        ? appendMessage(
+            tx,
+            task.id,
+            body,
+            "role-result",
+            { type: "role", roleName: LEADER_ROLE },
+            now
+          )
+        : actor === "operator"
+          ? appendMessage(tx, task.id, body, "operator", { type: "operator" }, now)
+          : appendMessage(tx, task.id, body, "user", { type: "user" }, now);
+      if (task.status === "active" && actor !== "leader") {
+        enqueueWork(
+          tx,
+          leaderMailbox(task.id),
+          actor === "operator" ? "operator-input" : "user-message",
+          now,
+          [messageRef(task.id, message.id)]
+        );
       }
-      return { task, message };
+      return { task, message, actor };
     });
-    notifyMailbox(
-      options.runtime,
-      result.task.status === "active" ? leaderMailbox(result.task.id) : taskMailbox(result.task.id),
-      result.task.id
-    );
+    if (result.actor !== "leader") {
+      notifyMailbox(
+        options.runtime,
+        result.task.status === "active"
+          ? leaderMailbox(result.task.id)
+          : taskMailbox(result.task.id),
+        result.task.id
+      );
+    }
     return `Sent message ${result.message.id} to ${result.task.id}\n`;
   }
   if (command === "list") {
@@ -1811,7 +1836,8 @@ function updateWork(
         recordTaskEvent(tx, task.id, "work.updated", {
           workItemId: updated.id,
           status: updated.status,
-          summary
+          summary,
+          ...leaderActionEventPayload(tx, task.id, options)
         }, now);
       }
       enqueueWork(tx, taskMailbox(task.id), "work-updated", now, [
@@ -2068,7 +2094,8 @@ function acceptWork(
         ? { runId: candidate.source.runId }
         : { workItemRevision: String(candidate.workItemRevision) }),
       acceptedBy: "leader",
-      summary
+      summary,
+      ...leaderActionEventPayload(tx, item.taskId, options)
     }, now);
     return completed;
   });
@@ -2242,7 +2269,8 @@ function retireWork(
         summary,
         ...(replacementWorkItemId === undefined
           ? {}
-          : { replacementWorkItemId })
+          : { replacementWorkItemId }),
+        ...leaderActionEventPayload(tx, task.id, options)
       }, now);
     }
     return next;
@@ -2667,15 +2695,6 @@ function yieldRun(
       );
     }
     const terminal = terminalization.run;
-    const message = appendMessage(
-      tx,
-      task.id,
-      reviewReport?.report ?? summary,
-      "role-result",
-      { type: "role", roleName: role.name },
-      now,
-      { runId: terminal.id, workItemId: active.workItemId }
-    );
     if (wasStalled) {
       recordTaskEvent(tx, task.id, RUN_RECOVERED_EVENT, {
         runId: terminal.id,
@@ -2756,13 +2775,11 @@ function yieldRun(
     if (leaderHandoff !== null) {
       enqueueWork(tx, leaderMailbox(task.id), leaderHandoff, now, [
         runRef(task.id, terminal.id),
-        messageRef(task.id, message.id),
         ...(terminal.workItemId === undefined ? [] : [workItemRef(task.id, terminal.workItemId)])
       ]);
     }
     return {
       run: terminal,
-      message,
       reviewDispatch,
       notifyLeader: leaderHandoff !== null
     };
@@ -2782,9 +2799,8 @@ function yieldRun(
       yielded.reviewDispatch.run.taskId
     );
   }
-  return output(`Yielded ${yielded.run.id}: ${yielded.message.body}\n`, {
+  return output(`Yielded ${yielded.run.id}: ${yielded.run.summary ?? inputSummary}\n`, {
     run: yielded.run,
-    message: yielded.message,
     ...(yielded.reviewDispatch === null
       ? {}
       : { reviewRound: yielded.reviewDispatch.round })
@@ -3161,6 +3177,20 @@ function recordTaskEvent(
   now: Date
 ): void {
   recordTaskEventRecord(store, taskId, type, payload, now);
+}
+
+function leaderActionEventPayload(
+  store: TaskWorkflowStore,
+  taskId: string,
+  options: TaskCommandOptions
+): TaskEventPayload {
+  const runId = taskLeaderActionRunId(
+    store,
+    taskId,
+    options.environment,
+    options.yuiHome
+  );
+  return runId === undefined ? {} : { leaderRunId: runId };
 }
 
 function recordTaskEventRecord(
@@ -3596,7 +3626,11 @@ function taskDecisionCommand(
       const actor = taskActor(options, task.id);
       const decision = createDecision(tx.nextDecisionId(task.id), task.id, title, rationale, now);
       tx.saveDecision(task.id, decision);
-      recordTaskEvent(tx, task.id, "decision.recorded", { decisionId: decision.id, title }, now);
+      recordTaskEvent(tx, task.id, "decision.recorded", {
+        decisionId: decision.id,
+        title,
+        ...leaderActionEventPayload(tx, task.id, options)
+      }, now);
       enqueueWork(tx, taskMailbox(task.id), "decision-recorded", now, [taskRef(task.id)]);
       if (task.status === "active" && actor !== "leader") {
         enqueueWork(tx, leaderMailbox(task.id), "decision-recorded", now, [taskRef(task.id)]);
@@ -3668,7 +3702,11 @@ function taskDecisionCommand(
       if (existing === null) throw dataError(`Decision not found: ${parsed.positionals[1]}.`);
       const decision = supersedeDecision(existing, reason, now);
       tx.saveDecision(task.id, decision);
-      recordTaskEvent(tx, task.id, "decision.superseded", { decisionId: decision.id, reason }, now);
+      recordTaskEvent(tx, task.id, "decision.superseded", {
+        decisionId: decision.id,
+        reason,
+        ...leaderActionEventPayload(tx, task.id, options)
+      }, now);
       enqueueWork(tx, taskMailbox(task.id), "decision-superseded", now, [taskRef(task.id)]);
       if (task.status === "active" && actor !== "leader") {
         enqueueWork(tx, leaderMailbox(task.id), "decision-superseded", now, [taskRef(task.id)]);
@@ -3705,7 +3743,11 @@ function taskMilestoneCommand(
       }
       const milestone = createMilestone(tx.nextMilestoneId(task.id), task.id, title, summary, now);
       tx.saveMilestone(task.id, milestone);
-      recordTaskEvent(tx, task.id, "milestone.added", { milestoneId: milestone.id, title }, now);
+      recordTaskEvent(tx, task.id, "milestone.added", {
+        milestoneId: milestone.id,
+        title,
+        ...leaderActionEventPayload(tx, task.id, options)
+      }, now);
       enqueueWork(tx, taskMailbox(task.id), "milestone-added", now, [taskRef(task.id)]);
       return { task, milestone };
     });

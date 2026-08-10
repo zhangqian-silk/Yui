@@ -4,6 +4,7 @@ import type {
   RuntimeClaudeStopFailureEvent,
   RuntimeLifecycleEvent,
   RuntimePromptAcceptedEvent,
+  RuntimeProviderProgressEvent,
   RuntimeSessionLifecycleEvent,
   RuntimeTurnCompletedEvent
 } from "./runtimeEventInbox.js";
@@ -30,6 +31,21 @@ export type TaskProviderPromptAccepted = Readonly<{
   nativeSessionId: string;
   runId: string;
   receiptId: string;
+}>;
+
+export type TaskProviderTurnProgress = Readonly<{
+  eventId: string;
+  /** Immutable inbox admission time; provider activity must not use drain time. */
+  receivedAt: string;
+  taskId: string;
+  roleName: string;
+  agentId: string;
+  adapterId: "codex" | "claude";
+  launchId: string;
+  nativeSessionId: string;
+  runId: string;
+  progressId: string;
+  sequence?: number;
 }>;
 
 export type ProviderLifecycleObservation = "applied" | "obsolete" | "deferred";
@@ -121,6 +137,11 @@ export type RuntimeTurnEventObserver = Readonly<{
     input: TaskProviderPromptAccepted,
     now?: Date
   ): ProviderLifecycleObservation;
+  /** Folds a provider-native in-turn progress fact through the canonical contract. */
+  observeProviderTurnProgress?(
+    input: TaskProviderTurnProgress,
+    now?: Date
+  ): ProviderLifecycleObservation;
 }>;
 
 export type RuntimeEventDrainFailure = Readonly<{
@@ -175,6 +196,12 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
           this.applyClaudeStopFailure(event, now);
         } else if (event.type === "native-session-lifecycle") {
           const outcome = this.applySessionLifecycle(event, now);
+          if (outcome === "deferred") {
+            deferred.push(event);
+            continue;
+          }
+        } else if (event.type === "native-turn-progress") {
+          const outcome = this.applyProviderTurnProgress(event, now);
           if (outcome === "deferred") {
             deferred.push(event);
             continue;
@@ -246,6 +273,29 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       });
     }
     return outcome === "deferred" ? "deferred" : outcome;
+  }
+
+  private applyProviderTurnProgress(
+    event: RuntimeProviderProgressEvent,
+    now: Date
+  ): "applied" | "deferred" | "obsolete" {
+    const task = this.observer.getTask(event.taskId);
+    if (task === null || task.status !== "active") return "obsolete";
+    if (this.observer.observeProviderTurnProgress === undefined) return "obsolete";
+    const outcome = this.observer.observeProviderTurnProgress({
+      eventId: event.id,
+      receivedAt: event.receivedAt,
+      taskId: event.taskId,
+      roleName: event.roleName,
+      agentId: event.agentId,
+      adapterId: event.adapterId,
+      launchId: event.launchId,
+      nativeSessionId: event.nativeSessionId,
+      runId: event.runId,
+      progressId: event.progressId,
+      ...(event.sequence === undefined ? {} : { sequence: event.sequence })
+    }, now);
+    return outcome === "deferred" ? "deferred" : "applied";
   }
 
   private applyCodex(

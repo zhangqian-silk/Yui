@@ -23,7 +23,6 @@ import {
   type PendingTurnCompletion
 } from "../executor/turnCompletion.js";
 import { createTaskEvent } from "../event/taskEvent.js";
-import { createTaskMessage } from "../message/message.js";
 import { answerInputRequest } from "../input/inputRequest.js";
 import { activeRoleAgentBinding, updateRoleStatus } from "../role/role.js";
 import {
@@ -54,7 +53,8 @@ import type {
   ProviderLifecycleObservation,
   TaskClaudeStopFailureEvent,
   TaskProviderPromptAccepted,
-  TaskProviderSessionLifecycle
+  TaskProviderSessionLifecycle,
+  TaskProviderTurnProgress
 } from "./runtimeEventProcessor.js";
 import type {
   DormantRuntimeOwnerCandidate,
@@ -913,28 +913,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       );
 
       const terminal = result.run;
-      const message = createTaskMessage(
-        store.nextMessageId(input.taskId),
-        input.taskId,
-        summary,
-        "role-result",
-        { type: "role", roleName: input.roleName },
-        input.now,
-        {
-          runId: terminal.id,
-          ...(terminal.workItemId === undefined
-            ? {}
-            : { workItemId: terminal.workItemId })
-        }
-      );
-      store.saveMessage(input.taskId, message);
-      store.saveEvent(input.taskId, createTaskEvent(
-        store.nextEventId(input.taskId),
-        input.taskId,
-        "message.sent",
-        { messageId: message.id, kind: message.kind },
-        input.now
-      ));
       store.saveEvent(input.taskId, createTaskEvent(
         store.nextEventId(input.taskId),
         input.taskId,
@@ -967,7 +945,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           input.now,
           [
             { type: "run", taskId: input.taskId, id: terminal.id },
-            { type: "message", taskId: input.taskId, id: message.id },
             ...(terminal.workItemId === undefined
               ? []
                 : [{ type: "work-item" as const, taskId: input.taskId, id: terminal.workItemId }])
@@ -1001,8 +978,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           input.now,
           [
             { type: "task", id: input.taskId },
-            { type: "run", taskId: input.taskId, id: terminal.id },
-            { type: "message", taskId: input.taskId, id: message.id }
+            { type: "run", taskId: input.taskId, id: terminal.id }
           ]
         );
       }
@@ -1883,32 +1859,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         );
       }
       const terminal = result.run;
-      const message = input.origin === "recovery"
-        ? null
-        : createTaskMessage(
-            store.nextMessageId(task.id),
-            task.id,
-            input.summary,
-            "role-result",
-            { type: "role", roleName: role.name },
-            now,
-            { runId: terminal.id }
-          );
-      if (message === null) {
+      if (input.origin === "recovery") {
         store.saveEvent(task.id, createTaskEvent(
           store.nextEventId(task.id),
           task.id,
           RUN_RECOVERED_EVENT,
           { runId: terminal.id, roleName: role.name, summary: input.summary },
-          now
-        ));
-      } else {
-        store.saveMessage(task.id, message);
-        store.saveEvent(task.id, createTaskEvent(
-          store.nextEventId(task.id),
-          task.id,
-          "message.sent",
-          { messageId: message.id, kind: message.kind, runId: terminal.id },
           now
         ));
       }
@@ -2035,26 +1991,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       );
 
       const terminal = result.run;
-      const message = createTaskMessage(
-        store.nextMessageId(input.taskId),
-        input.taskId,
-        summary,
-        "role-result",
-        { type: "role", roleName: input.roleName },
-        now,
-        {
-          runId: input.runId,
-          ...(before.workItemId === undefined ? {} : { workItemId: before.workItemId })
-        }
-      );
-      store.saveMessage(input.taskId, message);
-      store.saveEvent(input.taskId, createTaskEvent(
-        store.nextEventId(input.taskId),
-        input.taskId,
-        "message.sent",
-        { messageId: message.id, kind: message.kind },
-        now
-      ));
 
       if (before.purpose === "execution" && before.workItemId !== undefined) {
         const item = store.getWorkItem(input.taskId, before.workItemId);
@@ -2096,7 +2032,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           now,
           [
             { type: "run", taskId: input.taskId, id: terminal.id },
-            { type: "message", taskId: input.taskId, id: message.id },
             ...(terminal.workItemId === undefined
               ? []
               : [{ type: "work-item" as const, taskId: input.taskId, id: terminal.workItemId }])
@@ -2264,6 +2199,63 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         ));
       }
       return "applied";
+    });
+  }
+
+  /**
+   * Folds provider-native in-turn progress through the canonical lifecycle
+   * contract. Progress is an advisory semantic fence only: it never advances
+   * Run delivery/acceptance and never reads pane text or process counters.
+   */
+  observeProviderTurnProgress(
+    input: TaskProviderTurnProgress,
+    now = new Date()
+  ): ProviderLifecycleObservation {
+    return this.store.transaction((store) => {
+      const receivedAtMs = Date.parse(input.receivedAt);
+      if (!Number.isFinite(receivedAtMs) || receivedAtMs > now.getTime()) {
+        recordCanonicalObsolete(store, input, "native-turn-progress", "received-at-invalid", now);
+        return "obsolete";
+      }
+      const decision = this.foldProviderSignal(store, {
+        kind: "native-turn-progress",
+        ...(input.sequence === undefined ? {} : { sequence: input.sequence }),
+        fence: providerFence(input)
+      }, input.runId);
+      switch (decision.kind) {
+        case "obsolete":
+          recordCanonicalObsolete(store, input, "native-turn-progress", decision.reason, now);
+          return "obsolete";
+        case "deferred":
+          return "deferred";
+        case "idempotent":
+          return "applied";
+        case "apply":
+          if (decision.outcome.outcome !== "advance-progress") return "obsolete";
+          if (store.listEvents(input.taskId).some((event) => (
+            event.type === "runtime.provider-turn-progress"
+            && event.payload.eventId === input.eventId
+          ))) return "applied";
+          store.saveEvent(input.taskId, createTaskEvent(
+            store.nextEventId(input.taskId),
+            input.taskId,
+            "runtime.provider-turn-progress",
+            {
+              eventId: input.eventId,
+              roleName: input.roleName,
+              agentId: input.agentId,
+              adapterId: input.adapterId,
+              launchId: input.launchId,
+              nativeSessionId: input.nativeSessionId,
+              runId: input.runId,
+              progressId: input.progressId,
+              progressAt: input.receivedAt,
+              ...(input.sequence === undefined ? {} : { sequence: String(input.sequence) })
+            },
+            now
+          ));
+          return "applied";
+      }
     });
   }
 
