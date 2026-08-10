@@ -119,9 +119,12 @@ export interface TaskRuntimeLifecycleCleanupPort {
   }>): "absent" | "cleaned";
 }
 
+export type TaskRuntimePathLayout = "hierarchical" | "compact";
+
 export type FileTaskRuntimeIsolationOptions = Readonly<{
   runtimeRoot: string;
   controlPlane: TaskRuntimeControlBoundary;
+  pathLayout?: TaskRuntimePathLayout;
   inspectResources?: (
     descriptor: TaskRuntimeIsolationDescriptor
   ) => readonly TaskRuntimeResourceObservation[];
@@ -146,6 +149,7 @@ export class FileTaskRuntimeIsolation implements
   TaskRuntimeLifecycleCleanupPort {
   readonly #runtimeRoot: string;
   readonly #controlPlane: TaskRuntimeControlBoundary;
+  readonly #pathLayout: TaskRuntimePathLayout;
   readonly #inspectResources:
     | ((descriptor: TaskRuntimeIsolationDescriptor) => readonly TaskRuntimeResourceObservation[])
     | undefined;
@@ -153,19 +157,22 @@ export class FileTaskRuntimeIsolation implements
   constructor(options: FileTaskRuntimeIsolationOptions) {
     this.#runtimeRoot = canonicalPath(options.runtimeRoot, "Task runtime root");
     this.#controlPlane = normalizeControlBoundary(options.controlPlane);
+    this.#pathLayout = taskRuntimePathLayout(options.pathLayout);
     this.#inspectResources = options.inspectResources;
   }
 
   preflight(input: TaskRuntimeIsolationPreflightInput): TaskRuntimeIsolationPreparation {
     const descriptor = createTaskRuntimeIsolationDescriptor({
       ...input,
-      runtimeRoot: this.#runtimeRoot
+      runtimeRoot: this.#runtimeRoot,
+      pathLayout: this.#pathLayout
     });
     const fingerprint = taskRuntimeIsolationFingerprint(descriptor);
     assertTaskRuntimeIsolationPreflight({
       descriptor,
       workspace: input.workspace,
       runtimeRoot: this.#runtimeRoot,
+      pathLayout: this.#pathLayout,
       controlPlane: this.#controlPlane,
       resources: [
         ...inspectGenerationRoot(descriptor, fingerprint),
@@ -277,7 +284,11 @@ export class FileTaskRuntimeIsolation implements
     const taskId = requireIdentity(input.taskId, "Task id");
     const launchId = requireIdentity(input.launchId, "Launch id");
     requireCleanupReason(input.reason);
-    const taskRoot = join(this.#runtimeRoot, taskId);
+    const taskRoot = taskRuntimeInventoryRoot(
+      this.#runtimeRoot,
+      taskId,
+      this.#pathLayout
+    );
     let entries;
     try {
       const metadata = lstatSync(taskRoot);
@@ -289,7 +300,7 @@ export class FileTaskRuntimeIsolation implements
       if (isNodeCode(error, "ENOENT")) return "absent";
       throw error;
     }
-    const launchDigest = digest(JSON.stringify([taskId, launchId])).slice(0, 24);
+    const launchDigest = taskRuntimeLaunchDigest(taskId, launchId, this.#pathLayout);
     const matches: TaskRuntimeIsolationPreparation[] = [];
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.isSymbolicLink()) {
@@ -345,6 +356,7 @@ export function createTaskRuntimeIsolationDescriptor(input: Readonly<{
   launchId: string;
   generationId: string;
   runtimeRoot: string;
+  pathLayout?: TaskRuntimePathLayout;
   policy?: TaskRuntimeLaunchPolicy;
 }>): TaskRuntimeIsolationDescriptor {
   const workspace = validateManagedWorkspace(input.workspace);
@@ -356,7 +368,14 @@ export function createTaskRuntimeIsolationDescriptor(input: Readonly<{
   const launchId = requireIdentity(input.launchId, "Launch id");
   const generationId = requireIdentity(input.generationId, "Generation id");
   const runtimeRoot = canonicalPath(input.runtimeRoot, "Task runtime root");
-  const generation = taskRuntimeGenerationRoot(runtimeRoot, taskId, owner, launchId);
+  const pathLayout = taskRuntimePathLayout(input.pathLayout);
+  const generation = taskRuntimeGenerationRoot(
+    runtimeRoot,
+    taskId,
+    owner,
+    launchId,
+    pathLayout
+  );
   const declared = capabilities(
     input.policy?.declaredExternalCapabilities ?? [],
     "Declared external capability"
@@ -483,6 +502,7 @@ export function assertTaskRuntimeIsolationPreflight(input: Readonly<{
   descriptor: TaskRuntimeIsolationDescriptor;
   workspace: ManagedWorkspace;
   runtimeRoot: string;
+  pathLayout?: TaskRuntimePathLayout;
   controlPlane: TaskRuntimeControlBoundary;
   resources?: readonly TaskRuntimeResourceObservation[];
   allowExactActive?: boolean;
@@ -498,11 +518,13 @@ export function assertTaskRuntimeIsolationPreflight(input: Readonly<{
     throw new Error("Task runtime owner or workspace does not match its ManagedWorkspace.");
   }
   const runtimeRoot = canonicalPath(input.runtimeRoot, "Task runtime root");
+  const pathLayout = taskRuntimePathLayout(input.pathLayout);
   const expectedGeneration = taskRuntimeGenerationRoot(
     runtimeRoot,
     descriptor.taskId,
     expectedOwner,
-    descriptor.generation.launchId
+    descriptor.generation.launchId,
+    pathLayout
   );
   if (
     descriptor.roots.generation !== expectedGeneration
@@ -720,11 +742,51 @@ function taskRuntimeGenerationRoot(
   runtimeRoot: string,
   taskId: string,
   owner: TaskRuntimeWorkspaceOwner,
-  launchId: string
+  launchId: string,
+  pathLayout: TaskRuntimePathLayout = "hierarchical"
 ): string {
-  const ownerDigest = digest(JSON.stringify(owner)).slice(0, 24);
-  const launchDigest = digest(JSON.stringify([taskId, launchId])).slice(0, 24);
-  return join(runtimeRoot, taskId, ownerDigest, launchDigest);
+  return join(
+    taskRuntimeInventoryRoot(runtimeRoot, taskId, pathLayout),
+    taskRuntimeOwnerDigest(taskId, owner, pathLayout),
+    taskRuntimeLaunchDigest(taskId, launchId, pathLayout)
+  );
+}
+
+function taskRuntimeInventoryRoot(
+  runtimeRoot: string,
+  taskId: string,
+  pathLayout: TaskRuntimePathLayout
+): string {
+  return pathLayout === "compact" ? runtimeRoot : join(runtimeRoot, taskId);
+}
+
+function taskRuntimeOwnerDigest(
+  taskId: string,
+  owner: TaskRuntimeWorkspaceOwner,
+  pathLayout: TaskRuntimePathLayout
+): string {
+  return pathLayout === "compact"
+    ? digest(JSON.stringify([taskId, owner])).slice(0, 20)
+    : digest(JSON.stringify(owner)).slice(0, 24);
+}
+
+function taskRuntimeLaunchDigest(
+  taskId: string,
+  launchId: string,
+  pathLayout: TaskRuntimePathLayout
+): string {
+  return digest(JSON.stringify([taskId, launchId])).slice(
+    0,
+    pathLayout === "compact" ? 20 : 24
+  );
+}
+
+function taskRuntimePathLayout(value: TaskRuntimePathLayout | undefined): TaskRuntimePathLayout {
+  const pathLayout = value ?? "hierarchical";
+  if (pathLayout !== "hierarchical" && pathLayout !== "compact") {
+    throw new Error("Task runtime path layout is invalid.");
+  }
+  return pathLayout;
 }
 
 function taskRuntimeServiceNamespace(

@@ -75,6 +75,7 @@ export {
   type TaskRuntimeIsolationPreparation,
   type TaskRuntimeIsolationPreflightInput,
   type TaskRuntimeLaunchPolicy,
+  type TaskRuntimePathLayout,
   type TaskRuntimePortAllocation,
   type TaskRuntimeResourceObservation,
   type TaskRuntimeWorkspaceOwner

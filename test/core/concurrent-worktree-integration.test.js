@@ -9,7 +9,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
@@ -70,6 +70,7 @@ const expected = {
   TMPDIR: descriptor.roots.temporary,
   TMP: descriptor.roots.temporary,
   TEMP: descriptor.roots.temporary,
+  TMUX_TMPDIR: descriptor.roots.temporary,
   XDG_CACHE_HOME: descriptor.roots.cache,
   XDG_DATA_HOME: descriptor.roots.data,
   XDG_STATE_HOME: join(descriptor.roots.data, "state"),
@@ -96,7 +97,7 @@ if (process.platform === "linux") {
     "yui-" + uid,
     "0".repeat(24) + ".sock"
   );
-  if (Buffer.byteLength(socketPath) >= 108) {
+  if (Buffer.byteLength(socketPath) >= 100) {
     throw new Error("Integration TMPDIR exceeds the Controller socket path budget");
   }
 }
@@ -290,7 +291,19 @@ console.log(JSON.stringify({ descriptor, environment: expected }));
       .update(home)
       .digest("hex")}`
   );
-  assert.equal(successfulOutput.descriptor.roots.generation.startsWith("/tmp/"), true);
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const compactRuntimeRoot = join("/tmp", `yi-${uid.toString(36)}`);
+  assert.equal(
+    successfulOutput.descriptor.roots.generation.startsWith(`${compactRuntimeRoot}/`),
+    true
+  );
+  assert.deepEqual(
+    relative(
+      compactRuntimeRoot,
+      successfulOutput.descriptor.roots.generation
+    ).split("/").map((component) => component.length),
+    [20, 20]
+  );
   assert.equal(
     successfulOutput.environment.HOME,
     join(successfulOutput.descriptor.roots.data, "home")

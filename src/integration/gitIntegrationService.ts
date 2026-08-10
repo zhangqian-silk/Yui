@@ -587,6 +587,7 @@ async function integrationCheckEnvironment(
     TMPDIR: runtime.descriptor.roots.temporary,
     TMP: runtime.descriptor.roots.temporary,
     TEMP: runtime.descriptor.roots.temporary,
+    TMUX_TMPDIR: runtime.descriptor.roots.temporary,
     ...runtime.environment
   });
 }
@@ -601,7 +602,8 @@ function isNodeCode(error: unknown, code: string): boolean {
 function defaultIntegrationRuntimeIsolation(home: string): TaskRuntimeIsolationPort {
   const controlHome = resolve(home);
   return new FileTaskRuntimeIsolation({
-    runtimeRoot: "/tmp",
+    runtimeRoot: integrationRuntimeRoot(),
+    pathLayout: "compact",
     controlPlane: {
       yuiHome: controlHome,
       controllerSocketPath: controllerSocketPath(controlHome),
@@ -609,6 +611,11 @@ function defaultIntegrationRuntimeIsolation(home: string): TaskRuntimeIsolationP
       globalInstallPaths: [process.execPath]
     }
   });
+}
+
+function integrationRuntimeRoot(): string {
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  return join("/tmp", `yi-${uid.toString(36)}`);
 }
 
 function integrationRuntimeLaunchId(home: string, integrationId: string): string {

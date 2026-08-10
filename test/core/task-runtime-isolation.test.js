@@ -8,7 +8,7 @@ import {
   rmSync
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import test from "node:test";
 
 import {
@@ -153,6 +153,48 @@ test("a foreground Task runtime remains workspace-owned without inventing a Run"
   assert.deepEqual(preparation.descriptor.workspace.owner, fx.workspace.owner);
   fx.service.activate(preparation);
   fx.service.cleanup(preparation, "interruption");
+});
+
+test("compact runtime paths retain exact marker ownership and launch cleanup", (t) => {
+  const fx = fixture(t, {
+    type: "integration-attempt",
+    taskId: "task-15",
+    integrationAttemptId: "integration-4"
+  });
+  const service = new FileTaskRuntimeIsolation({
+    runtimeRoot: fx.runtimeRoot,
+    controlPlane: fx.controlPlane,
+    pathLayout: "compact"
+  });
+  const preparation = service.preflight(launchInput(fx));
+  const components = relative(
+    fx.runtimeRoot,
+    preparation.descriptor.roots.generation
+  ).split("/");
+
+  assert.deepEqual(components.map((component) => component.length), [20, 20]);
+  assert.ok(components.every((component) => /^[a-f0-9]{20}$/u.test(component)));
+  assert.doesNotMatch(preparation.descriptor.roots.generation, /task-15/u);
+
+  service.activate(preparation);
+  assert.equal(service.cleanupTaskLaunch({
+    taskId: "task-15",
+    launchId: preparation.descriptor.generation.launchId,
+    reason: "completion"
+  }), "cleaned");
+  assert.equal(existsSync(preparation.descriptor.roots.generation), false);
+});
+
+test("an unknown Task runtime path layout fails closed", (t) => {
+  const fx = fixture(t);
+  assert.throws(
+    () => new FileTaskRuntimeIsolation({
+      runtimeRoot: fx.runtimeRoot,
+      controlPlane: fx.controlPlane,
+      pathLayout: "future"
+    }),
+    /path layout is invalid/i
+  );
 });
 
 for (const owner of [

@@ -21,6 +21,7 @@ export const AGENT_OPERATIONAL_ENVIRONMENT_NAMES = [
   "TMPDIR",
   "TMP",
   "TEMP",
+  "TMUX_TMPDIR",
   "TERM",
   "COLORTERM",
   "LANG",

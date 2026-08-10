@@ -803,6 +803,7 @@ test("Controller startup forwards only operational names and declared Agent envi
       HOME: "/test/home",
       LANG: "C.UTF-8",
       CODEX_HOME: "/test/codex-home",
+      TMUX_TMPDIR: "/test/tmux-tmp",
       DECLARED_CONTROLLER_SECRET: "declared-value",
       UNDECLARED_CONTROLLER_SECRET: "must-not-cross",
       YUI_TASK_ID: "parent-task",
@@ -822,6 +823,7 @@ test("Controller startup forwards only operational names and declared Agent envi
   assert.equal(spawnedEnvironment.PATH, "/test/bin");
   assert.equal(spawnedEnvironment.HOME, "/test/home");
   assert.equal(spawnedEnvironment.CODEX_HOME, "/test/codex-home");
+  assert.equal(spawnedEnvironment.TMUX_TMPDIR, "/test/tmux-tmp");
   assert.equal(spawnedEnvironment.DECLARED_CONTROLLER_SECRET, "declared-value");
   assert.equal(spawnedEnvironment.UNDECLARED_CONTROLLER_SECRET, undefined);
   assert.equal(spawnedEnvironment.YUI_TASK_ID, undefined);
