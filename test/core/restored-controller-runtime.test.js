@@ -2121,7 +2121,9 @@ test("a fresh Controller retries an undelivered Run in an existing busy pane", a
   });
 
   controller.signal("role:task-1/worker");
-  await new Promise((resolve) => setTimeout(resolve, 25));
+  for (let attempt = 0; attempt < 100 && sends < 3; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
 
   assert.equal(sends, 3);
   controller.stop();
