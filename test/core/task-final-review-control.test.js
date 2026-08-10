@@ -294,9 +294,12 @@ test("exact Task contract creates a metadata-only Candidate and one final Task R
   assert.deepEqual(rounds[0].taskFinalReviewContract, fx.contract);
   assert.equal(fx.store.getTask(fx.task.id).status, "active");
 
-  assert.throws(() => runTaskCommand([
-    "complete", fx.task.id, "--summary", "must not duplicate"
-  ], fx.store, fx.exact), /Final Task Review is still active/);
+  const repeated = runTaskCommand([
+    "complete", fx.task.id, "--summary", "resume the exact pending Review"
+  ], fx.store, fx.exact);
+  assert.match(repeated.output, /Final Task Review requested/);
+  assert.equal(repeated.data.reviewRound.id, rounds[0].id);
+  assert.deepEqual(repeated.data.reviewRound, rounds[0]);
   assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
 
   completeReview(fx, rounds[0]);
@@ -304,6 +307,56 @@ test("exact Task contract creates a metadata-only Candidate and one final Task R
     "complete", fx.task.id, "--summary", "complete reviewed head"
   ], fx.store, fx.exact);
   assert.equal(fx.store.getTask(fx.task.id).status, "completed");
+});
+
+test("pending exact Task Review recovery rejects identity and head drift without writes", (t) => {
+  for (const drift of ["contract", "reviewer", "reviewer-run", "head"]) {
+    const fx = fixture(t);
+    submitAndAccept(fx);
+    runTaskCommand([
+      "complete", fx.task.id, "--summary", "establish exact pending Review"
+    ], fx.store, fx.exact);
+    const round = structuredClone(fx.store.listReviewRounds(fx.task.id)[0]);
+    if (drift === "reviewer-run") {
+      assert.throws(() => fx.store.saveReviewRound(fx.task.id, {
+        ...round,
+        reviewerRunId: "agent-run-99"
+      }), /transition is invalid/i);
+      assert.deepEqual(fx.store.getReviewRound(fx.task.id, round.id), round);
+      continue;
+    }
+    const options = drift === "head"
+      ? {
+          ...fx.exact,
+          actualTaskReviewCandidate: {
+            schemaVersion: 1,
+            projects: [{ projectId: "project-1", commit: "d".repeat(40) }]
+          }
+        }
+      : {
+          ...fx.exact,
+          taskFinalReviewContract: createTaskFinalReviewContract({
+            taskId: fx.task.id,
+            reviewerRoleName: drift === "reviewer" ? "replacement-reviewer" : "reviewer",
+            controlPlaneDigest: drift === "contract"
+              ? "b".repeat(64)
+              : fx.contract.controlPlaneDigest
+          })
+        };
+
+    assert.throws(
+      () => runTaskCommand([
+        "complete", fx.task.id, "--summary", `reject ${drift} drift`
+      ], fx.store, options),
+      /contract|control-plane digest|actual Task head|Reviewer/i
+    );
+    assert.deepEqual(fx.store.getReviewRound(fx.task.id, round.id), round);
+    assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
+    assert.equal(
+      fx.store.listAgentRuns(fx.task.id).filter(({ purpose }) => purpose === "review").length,
+      0
+    );
+  }
 });
 
 test("exact Task contract is preserved by a no-Run final Review retry", (t) => {

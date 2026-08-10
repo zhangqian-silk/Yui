@@ -56,6 +56,8 @@ import { runProfileCommand } from "./commands/profileCommands.js";
 import {
   dispatchPreparedReviewRound,
   failPendingReviewRound,
+  RESUMED_PENDING_FINAL_REVIEW,
+  TaskFinalReviewDispatchDriftError,
   preserveReviewRoundWorkspace,
   runTaskCommand,
   validateTaskArchiveRequest
@@ -87,7 +89,10 @@ import {
   TaskWorkspaceCoordinator,
   WorkspaceCleanupBlockedError
 } from "./repository/taskWorkspaceCoordinator.js";
-import { FileTaskWorkspacePreparer } from "./repository/taskWorkspacePreparer.js";
+import {
+  FileTaskWorkspacePreparer,
+  ReviewRoundWorkspaceEvidenceError
+} from "./repository/taskWorkspacePreparer.js";
 import { inspectStorageSchema, requireStorageSchema } from "./storage/storageSchema.js";
 import { FileTaskStore, resolveYuiHome } from "./storage/taskStore.js";
 import { resolveTaskRecordReference } from "./task/taskRecordReference.js";
@@ -981,6 +986,16 @@ export async function main(): Promise<void> {
             workspace
           };
         } catch (error) {
+          const currentRound = store.getReviewRound(
+            requestedRound.taskId,
+            requestedRound.id
+          );
+          if (requestedRound.resumedPendingFinalReview
+            && (error instanceof ReviewRoundWorkspaceEvidenceError
+              || error instanceof TaskFinalReviewDispatchDriftError)
+            && (currentRound?.scope ?? "work-item") === "task") {
+            throw error;
+          }
           const message = error instanceof Error ? error.message : String(error);
           const failed = failPendingReviewRound(
             requestedRound.taskId,
@@ -1387,6 +1402,7 @@ function reviewRoundFromCommandData(data: unknown): Readonly<{
   id: string;
   taskId: string;
   status: string;
+  resumedPendingFinalReview: boolean;
 }> | undefined {
   if (typeof data !== "object" || data === null || !("reviewRound" in data)) return undefined;
   const round = (data as { reviewRound?: unknown }).reviewRound;
@@ -1395,7 +1411,14 @@ function reviewRoundFromCommandData(data: unknown): Readonly<{
   return typeof value.id === "string"
     && typeof value.taskId === "string"
     && typeof value.status === "string"
-    ? { id: value.id, taskId: value.taskId, status: value.status }
+    ? {
+        id: value.id,
+        taskId: value.taskId,
+        status: value.status,
+        resumedPendingFinalReview: (
+          data as { [RESUMED_PENDING_FINAL_REVIEW]?: unknown }
+        )[RESUMED_PENDING_FINAL_REVIEW] === true
+      }
     : undefined;
 }
 
