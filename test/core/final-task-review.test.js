@@ -87,6 +87,13 @@ function fixture(t, options = {}) {
       YUI_SESSION_SCOPE: "task",
       YUI_TASK_ID: task.id,
       YUI_ROLE: "leader"
+    },
+    actualTaskReviewCandidate: {
+      schemaVersion: 1,
+      projects: [
+        { projectId: "project-1", commit: "c".repeat(40) },
+        { projectId: "project-2", commit: "d".repeat(40) }
+      ]
     }
   };
   if (options.producerRunRoleName === undefined) {
@@ -128,7 +135,10 @@ function fixture(t, options = {}) {
     }, NOW);
     tx.saveWorkItem(task.id, candidate);
     tx.saveWorkItem(task.id, updateWorkItemStatus(candidate, "completed", NOW, "accepted"));
+    const integratedProjectIds = options.integratedProjectIds
+      ?? ["project-1", "project-2"];
     for (const [index, projectId] of ["project-1", "project-2"].entries()) {
+      if (!integratedProjectIds.includes(projectId)) continue;
       const baseCommit = String.fromCharCode(97 + index).repeat(40);
       const headCommit = String.fromCharCode(99 + index).repeat(40);
       const changeSetId = `change-set-${index + 1}`;
@@ -157,6 +167,16 @@ function fixture(t, options = {}) {
     }
   });
   return { root, store, task, item, leaderOptions };
+}
+
+function setActualTaskHeads(fx, commits) {
+  fx.leaderOptions.actualTaskReviewCandidate = {
+    schemaVersion: 1,
+    projects: fx.task.projectBindings.map(({ projectId }, index) => ({
+      projectId,
+      commit: commits[index]
+    }))
+  };
 }
 
 function dispatchFinalReview(fx, round) {
@@ -274,6 +294,7 @@ function advanceTaskCandidate(fx) {
       attempt, { status: "committed", candidateCommit: headCommit }, NOW
     ));
   });
+  setActualTaskHeads(fx, ["c".repeat(40), "e".repeat(40)]);
 }
 
 function setReviewConfig(fx, review) {
@@ -359,10 +380,12 @@ function addCompletedDirectWorkItem(fx, title, assignee = undefined) {
 }
 
 function integrateProducerAfterCurrentHeads(fx, item, options = {}) {
+  const headCommits = (options.headCommits ?? ["e", "f"])
+    .map((value) => value.repeat(40));
   fx.store.transaction((tx) => {
     for (const [index, projectId] of ["project-1", "project-2"].entries()) {
       const baseCommit = String.fromCharCode(99 + index).repeat(40);
-      const headCommit = (options.headCommits ?? ["e", "f"])[index].repeat(40);
+      const headCommit = headCommits[index];
       const expectedHead = (options.expectedHeads ?? ["c", "d"])[index].repeat(40);
       const changeSetId = tx.nextChangeSetId(fx.task.id);
       tx.saveChangeSet(fx.task.id, createWorkItemChangeSet({
@@ -389,9 +412,11 @@ function integrateProducerAfterCurrentHeads(fx, item, options = {}) {
       ));
     }
   });
+  setActualTaskHeads(fx, headCommits);
 }
 
 function recordIntegrationAttempt(fx, item, input) {
+  const timestamp = input.now ?? NOW;
   return fx.store.transaction((tx) => {
     const changeSetId = tx.nextChangeSetId(fx.task.id);
     tx.saveChangeSet(fx.task.id, createWorkItemChangeSet({
@@ -403,7 +428,7 @@ function recordIntegrationAttempt(fx, item, input) {
       headCommit: input.changeSetHead,
       branch: `yui/task-1/${item.id}-${changeSetId}`,
       changedPaths: [`${input.projectId}/${changeSetId}.ts`]
-    }, NOW));
+    }, timestamp));
     const attempt = createIntegrationAttempt({
       id: tx.nextIntegrationAttemptId(fx.task.id),
       taskId: fx.task.id,
@@ -412,7 +437,7 @@ function recordIntegrationAttempt(fx, item, input) {
       expectedHead: input.expectedHead,
       changeSetIds: [changeSetId],
       checkCommands: []
-    }, NOW);
+    }, timestamp);
     const stored = input.status === "running"
       ? attempt
       : updateIntegrationAttempt(attempt, {
@@ -420,7 +445,7 @@ function recordIntegrationAttempt(fx, item, input) {
           ...(input.candidateCommit === undefined
             ? {}
             : { candidateCommit: input.candidateCommit })
-        }, NOW);
+        }, timestamp);
     tx.saveIntegrationAttempt(fx.task.id, stored);
     return stored;
   });
@@ -787,7 +812,7 @@ test("Task-final Reviewer covers producers across non-Integration merge boundari
   );
 });
 
-test("Task-final producer lineage excludes noncommitted, later, and unrelated attempts", (t) => {
+test("Task-final producer lineage excludes noncommitted and unrelated attempts", (t) => {
   const fx = fixture(t);
   const excluded = addCompletedDirectWorkItem(fx, "excluded reviewer producer", "reviewer");
   recordIntegrationAttempt(fx, excluded, {
@@ -852,16 +877,6 @@ test("Task-final producer lineage excludes noncommitted, later, and unrelated at
     NOW
   );
   fx.store.saveReviewRound(fx.task.id, round);
-  const laterAttempt = recordIntegrationAttempt(fx, excluded, {
-    projectId: "project-1",
-    targetRef: "yui/task-11/main-1",
-    expectedHead: "e".repeat(40),
-    changeSetBase: "e".repeat(40),
-    changeSetHead: "9".repeat(40),
-    candidateCommit: "9".repeat(40),
-    status: "committed"
-  });
-  assert.equal(laterAttempt.id, "integration-10");
 
   const run = dispatchFinalReview(fx, round);
 
@@ -957,6 +972,212 @@ test("independent Reviewer still dispatches across non-Integration merge boundar
   assert.equal(run.reviewRoundId, round.id);
 });
 
+test("final Review queue rejects an actual Task head that moved after its latest Integration", (t) => {
+  const fx = fixture(t);
+  setActualTaskHeads(fx, ["f".repeat(40), "d".repeat(40)]);
+
+  assert.throws(
+    () => runTaskCommand(
+      ["complete", fx.task.id, "--summary", "must not review an unintegrated target"],
+      fx.store,
+      fx.leaderOptions
+    ),
+    /actual Task head.*latest committed Integration/i
+  );
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 0);
+  assert.equal(fx.store.getTask(fx.task.id).status, "active");
+});
+
+test("completed final Review evidence is not reused after the actual Task head drifts", (t) => {
+  const fx = fixture(t);
+  runTaskCommand(
+    ["complete", fx.task.id, "--summary", "review the integrated head"],
+    fx.store,
+    fx.leaderOptions
+  );
+  const round = fx.store.listReviewRounds(fx.task.id)[0];
+  finishFinalReviewRun(
+    fx,
+    dispatchFinalReview(fx, round),
+    "yielded",
+    "reviewed exact integrated head"
+  );
+  setActualTaskHeads(fx, ["f".repeat(40), "d".repeat(40)]);
+
+  assert.throws(
+    () => runTaskCommand(
+      ["complete", fx.task.id, "--summary", "must recheck the target"],
+      fx.store,
+      fx.leaderOptions
+    ),
+    /actual Task head.*latest committed Integration/i
+  );
+  assert.equal(fx.store.getTask(fx.task.id).status, "active");
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
+});
+
+test("Task-final dispatch rechecks the actual Task head after queue", (t) => {
+  const fx = fixture(t);
+  runTaskCommand(
+    ["complete", fx.task.id, "--summary", "queue exact final review"],
+    fx.store,
+    fx.leaderOptions
+  );
+  const round = fx.store.listReviewRounds(fx.task.id)[0];
+  setActualTaskHeads(fx, ["f".repeat(40), "d".repeat(40)]);
+
+  assert.throws(
+    () => dispatchFinalReview(fx, round),
+    /actual Task head.*latest committed Integration/i
+  );
+  assert.equal(fx.store.getReviewRound(fx.task.id, round.id).status, "pending");
+  assert.equal(fx.store.listAgentRuns(fx.task.id).length, 0);
+});
+
+test("no-Run final Review retry rechecks the actual Task head", (t) => {
+  const fx = fixture(t);
+  const { globalReviewer, round } = failFinalReviewBeforeRun(fx);
+  fx.store.saveGlobalRole(globalReviewer);
+  setActualTaskHeads(fx, ["f".repeat(40), "d".repeat(40)]);
+
+  assert.throws(
+    () => runTaskCommand(
+      ["work", "review", "retry", round.id],
+      fx.store,
+      fx.leaderOptions
+    ),
+    /actual Task head.*latest committed Integration/i
+  );
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
+});
+
+test("failed final Review Run retry rechecks the actual Task head", (t) => {
+  const fx = fixture(t);
+  runTaskCommand(
+    ["complete", fx.task.id, "--summary", "queue exact final review"],
+    fx.store,
+    fx.leaderOptions
+  );
+  const round = fx.store.listReviewRounds(fx.task.id)[0];
+  const run = dispatchFinalReview(fx, round);
+  finishFinalReviewRun(fx, run, "failed", "review failed");
+  setActualTaskHeads(fx, ["f".repeat(40), "d".repeat(40)]);
+
+  assert.throws(
+    () => runTaskCommand(["run", "retry", run.id], fx.store, fx.leaderOptions),
+    /actual Task head.*latest committed Integration/i
+  );
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
+});
+
+test("obsolete final Review settlement rechecks the actual Task head", (t) => {
+  const fx = fixture(t);
+  const { round, run } = strandTaskFinalReview(fx);
+  const frozen = structuredClone(fx.store.getReviewRound(fx.task.id, round.id));
+  advanceTaskCandidate(fx);
+  setActualTaskHeads(fx, ["f".repeat(40), "e".repeat(40)]);
+
+  assert.throws(
+    () => runTaskCommand(["run", "settle", run.id], fx.store, fx.leaderOptions),
+    /actual Task head.*latest committed Integration/i
+  );
+  assert.deepEqual(fx.store.getReviewRound(fx.task.id, round.id), frozen);
+});
+
+test("latest committed Integration follows numeric Task-local identity despite clock rollback", (t) => {
+  const fx = fixture(t);
+  for (let index = 3; index <= 8; index += 1) {
+    recordIntegrationAttempt(fx, fx.item, {
+      projectId: "project-1",
+      targetRef: "yui/task-11/main-1",
+      expectedHead: "c".repeat(40),
+      changeSetBase: "c".repeat(40),
+      changeSetHead: String(index).repeat(40),
+      status: "failed"
+    });
+  }
+  const integration9 = recordIntegrationAttempt(fx, fx.item, {
+    projectId: "project-1",
+    targetRef: "yui/task-11/main-1",
+    expectedHead: "c".repeat(40),
+    changeSetBase: "c".repeat(40),
+    changeSetHead: "e".repeat(40),
+    candidateCommit: "e".repeat(40),
+    status: "committed",
+    now: new Date(NOW.getTime() + 1_000)
+  });
+  assert.equal(integration9.id, "integration-9");
+  setActualTaskHeads(fx, ["e".repeat(40), "d".repeat(40)]);
+  runTaskCommand(
+    ["complete", fx.task.id, "--summary", "review integration-9"],
+    fx.store,
+    fx.leaderOptions
+  );
+  const firstRound = fx.store.listReviewRounds(fx.task.id)[0];
+  finishFinalReviewRun(
+    fx,
+    dispatchFinalReview(fx, firstRound),
+    "yielded",
+    "integration-9 reviewed"
+  );
+
+  const integration10 = recordIntegrationAttempt(fx, fx.item, {
+    projectId: "project-1",
+    targetRef: "yui/task-11/main-1",
+    expectedHead: "e".repeat(40),
+    changeSetBase: "e".repeat(40),
+    changeSetHead: "f".repeat(40),
+    candidateCommit: "f".repeat(40),
+    status: "committed",
+    now: new Date(NOW.getTime() - 1_000)
+  });
+  assert.equal(integration10.id, "integration-10");
+  setActualTaskHeads(fx, ["f".repeat(40), "d".repeat(40)]);
+
+  const requested = runTaskCommand(
+    ["complete", fx.task.id, "--summary", "review integration-10"],
+    fx.store,
+    fx.leaderOptions
+  );
+  assert.match(requested.output, /Final Task Review requested/);
+  const rounds = fx.store.listReviewRounds(fx.task.id);
+  assert.equal(rounds.length, 2);
+  assert.equal(rounds[1].taskCandidate.projects[0].commit, "f".repeat(40));
+  assert.equal(fx.store.getTask(fx.task.id).status, "active");
+});
+
+test("final Review freezes a bound Project with no Integration and no producer", (t) => {
+  const fx = fixture(t, { integratedProjectIds: ["project-1"] });
+
+  const requested = runTaskCommand(
+    ["complete", fx.task.id, "--summary", "review modified and context Projects"],
+    fx.store,
+    fx.leaderOptions
+  );
+  assert.match(requested.output, /Final Task Review requested/);
+  const round = fx.store.listReviewRounds(fx.task.id)[0];
+  assert.deepEqual(round.taskCandidate.projects, [
+    { projectId: "project-1", commit: "c".repeat(40) },
+    { projectId: "project-2", commit: "d".repeat(40) }
+  ]);
+  const run = dispatchFinalReview(fx, round);
+  assert.equal(run.purpose, "review");
+  assert.equal(run.reviewRoundId, round.id);
+  finishFinalReviewRun(
+    fx,
+    run,
+    "yielded",
+    "modified and context Projects reviewed"
+  );
+  const completed = runTaskCommand(
+    ["complete", fx.task.id, "--summary", "partial multi-Project delivery accepted"],
+    fx.store,
+    fx.leaderOptions
+  );
+  assert.match(completed.output, /Completed task/);
+  assert.equal(fx.store.getTask(fx.task.id).status, "completed");
+});
+
 test("final policy queues one Task Review over all committed Project heads", (t) => {
   const { store, task, item, leaderOptions } = fixture(t);
   const first = runTaskCommand(
@@ -1009,6 +1230,13 @@ test("a changed integrated head creates a fresh final ReviewRound and keeps prio
       attempt, { status: "committed", candidateCommit: headCommit }, NOW
     ));
   });
+  leaderOptions.actualTaskReviewCandidate = {
+    schemaVersion: 1,
+    projects: [
+      { projectId: "project-1", commit: "c".repeat(40) },
+      { projectId: "project-2", commit: "e".repeat(40) }
+    ]
+  };
   runTaskCommand(["complete", task.id, "--summary", "finish"], store, leaderOptions);
   const rounds = store.listReviewRounds(task.id);
   assert.equal(rounds.length, 2);
@@ -1507,7 +1735,11 @@ test("settling an obsolete final Review fails closed while any Reviewer Run is a
   const frozenRound = structuredClone(
     fx.store.getReviewRound(fx.task.id, round.id)
   );
-  const laterRound = createLaterFinalRound(fx, round, round.taskCandidate);
+  const laterRound = createLaterFinalRound(
+    fx,
+    round,
+    fx.leaderOptions.actualTaskReviewCandidate
+  );
   const activeRun = dispatchFinalReview(fx, laterRound);
 
   assert.throws(
@@ -1556,7 +1788,6 @@ test("settling an obsolete final Review fails closed for later final Review hist
     "pending"
   );
 });
-
 test("stranded final Review retry fails closed for a nonmatching failed Run", (t) => {
   const fx = fixture(t);
   runTaskCommand(

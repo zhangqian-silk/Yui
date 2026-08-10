@@ -5,7 +5,12 @@ import {
   type WorkItemChangeSet
 } from "../integration/changeSet.js";
 import { NodeGitWorkspace } from "../repository/gitWorkspace.js";
+import {
+  sameTaskFinalReviewContract,
+  type TaskFinalReviewContract
+} from "../review/taskFinalReviewContract.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import type { DirectTaskMainSnapshot } from "../workItem/workItem.js";
 import type {
   ManagedWorkspace,
   WorkspaceProjectEntry
@@ -54,11 +59,41 @@ export class WorkItemChangeSetManager {
 
   async capture(
     taskId: string,
-    workItemId: string
+    workItemId: string,
+    options: Readonly<{
+      taskFinalReviewContract?: TaskFinalReviewContract;
+    }> = {}
   ): Promise<readonly WorkItemChangeSet[]> {
-    const context = requireCapturableContext(this.store, taskId, workItemId);
+    const context = requireCapturableContext(
+      this.store,
+      taskId,
+      workItemId,
+      options.taskFinalReviewContract
+    );
+    const entries = capturableEntries(context);
+    if (context.source === "task-main") {
+      const git = new NodeGitWorkspace();
+      for (const { entry, expectedHead } of entries) {
+        if (!await git.isClean(entry.path)) {
+          throw new Error(
+            `Exact direct Candidate Task main must be clean: ${
+              context.workItemId
+            }/${entry.projectId}.`
+          );
+        }
+        const branch = await git.headRef(entry.path);
+        const headCommit = (await git.inspect(entry.path, "HEAD")).baseCommit;
+        if (branch !== entry.branch || headCommit !== expectedHead) {
+          throw new Error(
+            `Exact direct Candidate Task main no longer matches its frozen snapshot: ${
+              context.workItemId
+            }/${entry.projectId}.`
+          );
+        }
+      }
+    }
     const captured: WorkItemChangeSet[] = [];
-    for (const entry of writableEntries(context.workspace)) {
+    for (const entry of entries) {
       const changeSet = await this.#captureProject(context, entry);
       if (changeSet !== null) captured.push(changeSet);
     }
@@ -231,14 +266,16 @@ export class WorkItemChangeSetManager {
 
   async #captureProject(
     context: CapturableContext,
-    entry: WorkspaceProjectEntry
+    project: CapturableProject
   ): Promise<WorkItemChangeSet | null> {
+    const { entry, expectedHead } = project;
     const result = await captureManagedGitChanges({
       path: entry.path,
       branch: entry.branch,
       baseCommit: entry.baseCommit,
       commitMessage: `yui: work item ${context.workItemId} (${entry.directory})`,
-      identity: `${context.workItemId}/${entry.projectId}`
+      identity: `${context.workItemId}/${entry.projectId}`,
+      ...(context.source === "task-main" ? { requireClean: true, expectedHead } : {})
     });
     if (result === null) return null;
     const existing = findWorkItemChangeSet(
@@ -300,13 +337,23 @@ type CapturableContext = Readonly<{
   workItemId: string;
   assignee?: string;
   expectedRevision: number;
+  source: "work-item" | "task-main";
+  writeProjectIds: readonly string[];
+  taskFinalReviewContract?: TaskFinalReviewContract;
+  taskMainSnapshot?: DirectTaskMainSnapshot;
   workspace: ManagedWorkspace;
+}>;
+
+type CapturableProject = Readonly<{
+  entry: WorkspaceProjectEntry;
+  expectedHead?: string;
 }>;
 
 function requireCapturableContext(
   store: TaskStore,
   taskId: string,
-  workItemId: string
+  workItemId: string,
+  taskFinalReviewContract: TaskFinalReviewContract | undefined
 ): CapturableContext {
   const item = store.getWorkItem(taskId, workItemId);
   if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
@@ -331,31 +378,106 @@ function requireCapturableContext(
       `ReviewRound-owned workspace cannot be captured as WorkItem Develop: ${item.id}.`
     );
   }
-  if (
-    workspace === null
-    || workspace.owner.type !== "work-item"
-    || workspace.owner.workItemId !== item.id
-  ) {
-    throw new Error(`Work item has no managed workspace: ${item.id}.`);
+  const exactWorkItemWorkspace = workspace !== null
+    && workspace.owner.type === "work-item"
+    && workspace.owner.workItemId === item.id;
+  let selectedWorkspace: ManagedWorkspace;
+  let source: CapturableContext["source"];
+  let taskMainSnapshot: DirectTaskMainSnapshot | undefined;
+  if (exactWorkItemWorkspace) {
+    selectedWorkspace = workspace;
+    source = "work-item";
+  } else {
+    if (taskFinalReviewContract === undefined) {
+      throw new Error(`Work item has no managed workspace: ${item.id}.`);
+    }
+    const candidate = item.candidates.at(-1);
+    if (
+      candidate?.source.type !== "direct"
+      || !sameTaskFinalReviewContract(
+        candidate.taskFinalReviewContract,
+        taskFinalReviewContract
+      )
+    ) {
+      throw new Error(
+        `Work item has no matching exact Task-final direct Candidate: ${item.id}.`
+      );
+    }
+    if (candidate.taskMainSnapshot === undefined) {
+      throw new Error(
+        `Exact Task-final direct Candidate has no frozen Task-main snapshot: ${item.id}.`
+      );
+    }
+    if (latestExactDirectAnchorId(
+      store,
+      task.id,
+      taskFinalReviewContract
+    ) !== item.id) {
+      throw new Error(
+        `Only the latest exact Task-final direct Candidate may capture Task main: ${item.id}.`
+      );
+    }
+    const taskWorkspace = store.getTaskWorkspace(task.id);
+    if (
+      taskWorkspace === null
+      || taskWorkspace.owner.type !== "task"
+      || taskWorkspace.owner.taskId !== task.id
+    ) {
+      throw new Error(`Task has no authoritative main workspace: ${task.id}.`);
+    }
+    selectedWorkspace = taskWorkspace;
+    source = "task-main";
+    taskMainSnapshot = candidate.taskMainSnapshot;
   }
-  const actualWriteProjects = writableEntries(workspace).map(({ projectId }) => projectId).sort();
   const expectedWriteProjects = [...item.writeProjectIds].sort();
+  const availableWriteProjects = writableEntries(selectedWorkspace)
+    .map(({ projectId }) => projectId);
+  const actualWriteProjects = availableWriteProjects
+    .filter((projectId) => expectedWriteProjects.includes(projectId))
+    .sort();
   if (!isDeepStrictEqual(actualWriteProjects, expectedWriteProjects)) {
     throw new Error(`Work item workspace scope is stale: ${item.id}.`);
+  }
+  if (source === "task-main") {
+    const snapshotProjects = taskMainSnapshot!.projects
+      .map(({ projectId }) => projectId)
+      .sort();
+    if (!isDeepStrictEqual(snapshotProjects, expectedWriteProjects)) {
+      throw new Error(`Direct Candidate snapshot scope is stale: ${item.id}.`);
+    }
+    for (const snapshot of taskMainSnapshot!.projects) {
+      const current = selectedWorkspace.entries.find(
+        ({ projectId }) => projectId === snapshot.projectId
+      );
+      if (current === undefined
+        || current.access !== "write"
+        || current.directory !== snapshot.directory
+        || current.branch !== snapshot.branch) {
+        throw new Error(
+          `Direct Candidate Task-main identity is stale: ${item.id}/${snapshot.projectId}.`
+        );
+      }
+    }
   }
   return {
     taskId: task.id,
     workItemId: item.id,
     ...(item.assignee === undefined ? {} : { assignee: item.assignee }),
     expectedRevision: item.revision,
-    workspace
+    source,
+    writeProjectIds: expectedWriteProjects,
+    ...(source === "task-main" ? { taskFinalReviewContract, taskMainSnapshot } : {}),
+    workspace: selectedWorkspace
   };
 }
 
 function assertCaptureStillCurrent(store: TaskStore, expected: CapturableContext): void {
   const task = store.getTask(expected.taskId);
   const item = store.getWorkItem(expected.taskId, expected.workItemId);
-  const workspace = store.getWorkItemWorkspace(expected.taskId, expected.workItemId);
+  const workspace = expected.source === "task-main"
+    ? store.getTaskWorkspace(expected.taskId)
+    : store.getWorkItemWorkspace(expected.taskId, expected.workItemId);
+  const candidate = item?.candidates.at(-1);
   if (
     task?.status !== "active"
     || item === null
@@ -363,7 +485,22 @@ function assertCaptureStillCurrent(store: TaskStore, expected: CapturableContext
     || !CAPTURABLE_WORK_ITEM_STATUSES.has(item.status)
     || item.workspaceDisposition !== undefined
     || workspace === null
-    || !isDeepStrictEqual(workspace, expected.workspace)
+    || (expected.source === "task-main"
+      ? !sameTaskMainWorkspaceIdentity(workspace, expected.workspace)
+      : !isDeepStrictEqual(workspace, expected.workspace))
+    || (expected.source === "task-main" && (
+      candidate?.source.type !== "direct"
+      || !isDeepStrictEqual(candidate.taskMainSnapshot, expected.taskMainSnapshot)
+      || !sameTaskFinalReviewContract(
+        candidate.taskFinalReviewContract,
+        expected.taskFinalReviewContract
+      )
+      || latestExactDirectAnchorId(
+        store,
+        expected.taskId,
+        expected.taskFinalReviewContract
+      ) !== expected.workItemId
+    ))
   ) {
     throw new Error(
       `WorkItem changed while its ChangeSets were being captured: ${
@@ -371,6 +508,66 @@ function assertCaptureStillCurrent(store: TaskStore, expected: CapturableContext
       }. Retry capture.`
     );
   }
+}
+
+function sameTaskMainWorkspaceIdentity(
+  current: ManagedWorkspace,
+  expected: ManagedWorkspace
+): boolean {
+  return current.owner.type === "task"
+    && expected.owner.type === "task"
+    && current.owner.taskId === expected.owner.taskId
+    && current.root === expected.root
+    && current.entries.length === expected.entries.length
+    && current.entries.every((entry, index) => {
+      const frozen = expected.entries[index];
+      return frozen !== undefined
+        && entry.projectId === frozen.projectId
+        && entry.directory === frozen.directory
+        && entry.access === frozen.access
+        && entry.path === frozen.path
+        && entry.branch === frozen.branch;
+    });
+}
+
+function latestExactDirectAnchorId(
+  store: TaskStore,
+  taskId: string,
+  contract: TaskFinalReviewContract | undefined
+): string | undefined {
+  if (contract === undefined) return undefined;
+  return store.listWorkItems(taskId)
+    .filter((item) => {
+      const candidate = item.candidates.at(-1);
+      return candidate?.source.type === "direct"
+        && sameTaskFinalReviewContract(candidate.taskFinalReviewContract, contract);
+    })
+    .sort((left, right) => (
+      left.updatedAt.localeCompare(right.updatedAt) || left.id.localeCompare(right.id)
+    ))
+    .at(-1)?.id;
+}
+
+function capturableEntries(
+  context: CapturableContext
+): readonly CapturableProject[] {
+  const allowed = new Set(context.writeProjectIds);
+  return writableEntries(context.workspace)
+    .filter(({ projectId }) => allowed.has(projectId))
+    .map((entry) => {
+      if (context.source !== "task-main") return { entry };
+      const snapshot = context.taskMainSnapshot!.projects.find(
+        ({ projectId }) => projectId === entry.projectId
+      )!;
+      return {
+        entry: {
+          ...entry,
+          branch: snapshot.branch,
+          baseCommit: snapshot.baseCommit
+        },
+        expectedHead: snapshot.headCommit
+      };
+    });
 }
 
 function writableEntries(workspace: ManagedWorkspace): readonly WorkspaceProjectEntry[] {

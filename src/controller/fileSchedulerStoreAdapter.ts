@@ -604,6 +604,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
               agentId: active.agentId,
               adapterId: active.adapterId,
               nativeSessionId: active.nativeSessionId,
+              ...(active.launchId === undefined ? {} : { launchId: active.launchId }),
               sessionUpdatedAt: active.updatedAt
             }]
           : [];
@@ -622,6 +623,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
               agentId: active.agentId,
               adapterId: active.adapterId,
               nativeSessionId: active.nativeSessionId,
+              ...(active.launchId === undefined ? {} : { launchId: active.launchId }),
               sessionUpdatedAt: active.updatedAt
             }]
           : [];
@@ -635,43 +637,26 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     now: Date
   ): boolean {
     return this.store.transaction((store) => {
-      const { owner } = candidate;
-      if (
-        hasRuntimeLifecycleWork(
-          store.getWorkMailbox(runtimeLifecycleTarget(owner))
-        )
-      ) {
-        return false;
-      }
-      if (
-        owner.scope === "task"
-        && store.getActiveAgentRun(owner.taskId, owner.roleName) !== null
-      ) {
-        return false;
-      }
-      const sessions = owner.scope === "task"
-        ? store.getTaskRoleSessionSet(owner.taskId, owner.roleName)
-        : store.getGlobalRoleSessionSet(owner.roleName);
-      const active = sessions?.sessions[sessions.activeAgentId];
-      if (
-        active === undefined
-        || active.status === "stopped"
-        || active.agentId !== candidate.agentId
-        || active.adapterId !== candidate.adapterId
-        || active.nativeSessionId !== candidate.nativeSessionId
-        || active.updatedAt !== candidate.sessionUpdatedAt
-      ) {
-        return false;
-      }
-      return markRuntimeOwnerSessionStopped(store, owner, now);
+      if (!dormantRuntimeCandidateIsCurrent(store, candidate)) return false;
+      return markRuntimeOwnerSessionStopped(store, candidate.owner, now);
     });
   }
 
   enqueueRuntimeCleanup(
     owner: RuntimeRoleOwner,
-    now = new Date()
+    now = new Date(),
+    expectedDormantCandidate?: DormantRuntimeOwnerCandidate
   ): RuntimeLifecycleTarget | null {
     return this.store.transaction((store) => {
+      if (
+        expectedDormantCandidate !== undefined
+        && (
+          !sameRuntimeOwner(owner, expectedDormantCandidate.owner)
+          || !dormantRuntimeCandidateIsCurrent(store, expectedDormantCandidate)
+        )
+      ) {
+        return null;
+      }
       if (owner.scope === "task" && store.getTask(owner.taskId) === null) {
         return null;
       }
@@ -1313,7 +1298,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   completeRuntimeLaunchReservation(
     owner: RuntimeRoleOwner,
     launchId: string,
-    expectedTerminalRunId?: string
+    expectedTerminalRunId?: string,
+    beforeComplete?: () => void
   ): boolean {
     return this.store.transaction((store) => {
       const target = runtimeLifecycleTarget(owner);
@@ -1334,6 +1320,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           return false;
         }
       }
+      beforeComplete?.();
       saveRuntimeLifecycleMailbox(
         store,
         completeProcessing(mailbox!, launchId)
@@ -1466,9 +1453,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     if (input.runId === undefined || sessions.inFlight.runId !== input.runId) {
       return "obsolete";
     }
-    // A matching native completion proves that this Run's prompt reached the
-    // Agent even if Controller crashed before persisting the tmux receipt.
-    return "apply";
+    // Provider completion is not a transport acknowledgement. Retain the
+    // immutable Hook until the exact pane receipt independently reconciles
+    // run.pushed; never infer transport from provider progress/terminal facts.
+    return sessions.inFlight.pushedAt === undefined ? "deferred" : "apply";
   }
 
   observeRuntimeTurnCompleted(input: Readonly<{
@@ -1571,6 +1559,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         }
         return { session: effectiveExisting, duplicate: false };
       }
+      if (sessions.inFlight !== null && sessions.inFlight.pushedAt === undefined) {
+        throw new Error(
+          "Runtime turn completion requires an independently committed transport receipt."
+        );
+      }
       const idleStatus = effectiveExisting?.status === "stopped"
         || effectiveExisting?.status === "broken"
         ? effectiveExisting.status
@@ -1602,21 +1595,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         runId: sessions.inFlight.runId,
         receiptId: sessions.inFlight.receiptId
       };
-      if (sessions.inFlight.pushedAt === undefined) {
-        const active = store.getActiveAgentRun(task.id, role.name);
-        if (active === null || active.id !== fence.runId || active.status !== "active") {
-          return { session: sessions.sessions[input.agentId]!, duplicate: false };
-        }
-        // A native turn completion proves the prompt reached the Agent, so it
-        // records the transport-reached (pushed) fact and the inFlight marker.
-        // It must NOT promote run-level acceptance (deliveredAt): only an exact
-        // provider-accepted fold (UserPromptSubmit) may do that, so a
-        // completion for an unaccepted Run never forges acceptance.
-        if (active.pushedAt === undefined) {
-          store.saveAgentRun(markAgentRunPushed(active, now));
-        }
-        sessions = markTaskRoleRunPushed(sessions, fence, now);
-      }
       const completion = createPendingTurnCompletion({
         taskId: task.id,
         roleName: role.name,
@@ -2147,9 +2125,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             && store.getTaskRoleSessionSet(input.taskId, input.roleName)
               ?.sessions[input.agentId] === undefined
           ) {
-            // Claude can emit startup readiness from host.start() before the
-            // Controller projects its preallocated Session. Keep the durable
-            // fact queued until that exact Session is present.
+            // Claude emits startup readiness after native process creation but
+            // before the Controller projects its preallocated Session. Keep
+            // the immutable fact queued until that exact Session is durable.
             return "deferred";
           }
           if (decision.outcome.outcome === "bind-native-session") {
@@ -2213,9 +2191,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
 
   /**
    * Folds a provider UserPromptSubmit acceptance fact. This is the ONLY path
-   * that may advance a Run to
-   * accepted/delivered, and only under an exact identity-matched durable fold
-   * after the single transport push.
+   * that may advance a Run to accepted/delivered, and only after an exact
+   * transport receipt has independently committed run.pushed.
    */
   observeProviderPromptAccepted(
     input: TaskProviderPromptAccepted,
@@ -2244,13 +2221,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         return "obsolete";
       }
       if (active.deliveredAt === undefined) {
-        store.saveAgentRun(markAgentRunDelivered(active, now));
-        markTaskRoleRunDeliveredInFlight(store, role, active, now);
+        const delivered = markAgentRunDelivered(active, now);
+        store.saveAgentRun(delivered);
+        markTaskRoleRunDeliveredInFlight(store, role, delivered, now);
         store.saveEvent(input.taskId, createTaskEvent(
           store.nextEventId(input.taskId),
           input.taskId,
           "run.delivered",
-          runLaunchEventPayload(store.getAgentRun(input.taskId, input.runId)!),
+          runLaunchEventPayload(delivered),
           now
         ));
       }
@@ -2743,9 +2721,11 @@ function runtimeHookMatchesReservation(
 }
 
 /**
- * Claude can publish SessionStart(startup) synchronously from host.start(),
- * before the Controller atomically projects the returned Session and Run
- * binding. Preserve only the exact event owned by the matching launch.
+ * Claude may publish SessionStart(startup) synchronously from host.start(),
+ * before the Controller can atomically project the returned Session and bind
+ * the Run. Preserve that exact immutable fact only while the matching launch
+ * reservation is still the durable owner of the active Run. Everything else
+ * remains obsolete/fail-closed.
  */
 function preallocatedClaudeStartupAwaitingProjection(
   store: TaskStore,
@@ -2837,6 +2817,44 @@ function runtimeOwnerFromTarget(
         scope: "global",
         roleName: target.roleName
       };
+}
+
+function sameRuntimeOwner(
+  left: RuntimeRoleOwner,
+  right: RuntimeRoleOwner
+): boolean {
+  return left.scope === "task"
+    ? right.scope === "task"
+      && left.taskId === right.taskId
+      && left.roleName === right.roleName
+    : right.scope === "global" && left.roleName === right.roleName;
+}
+
+function dormantRuntimeCandidateIsCurrent(
+  store: TaskStore,
+  candidate: DormantRuntimeOwnerCandidate
+): boolean {
+  const { owner } = candidate;
+  if (hasRuntimeLifecycleWork(
+    store.getWorkMailbox(runtimeLifecycleTarget(owner))
+  )) {
+    return false;
+  }
+  if (
+    owner.scope === "task"
+    && store.getActiveAgentRun(owner.taskId, owner.roleName) !== null
+  ) {
+    return false;
+  }
+  const sessions = runtimeOwnerSessionSet(store, owner);
+  const active = sessions?.sessions[sessions.activeAgentId];
+  return active !== undefined
+    && active.status !== "stopped"
+    && active.agentId === candidate.agentId
+    && active.adapterId === candidate.adapterId
+    && active.nativeSessionId === candidate.nativeSessionId
+    && active.launchId === candidate.launchId
+    && active.updatedAt === candidate.sessionUpdatedAt;
 }
 
 function markRuntimeOwnerSessionStopped(
@@ -3193,6 +3211,7 @@ function mapRole(
     ...(binding.config.effort === undefined ? {} : { effort: binding.config.effort }),
     effective,
     workspace: role.workspace,
+    ...(workspace === undefined ? {} : { managedWorkspace: workspace }),
     status: role.status
   };
 }

@@ -159,11 +159,19 @@ export interface RuntimeEventProcessorPort {
   drain(now: Date): RuntimeEventDrainResult;
 }
 
+export type FileRuntimeEventProcessorOptions = Readonly<{
+  onTaskRuntimeApplied?: (input: Readonly<{
+    taskId: string;
+    roleName: string;
+  }>) => void;
+}>;
+
 /** Folds immutable Hook facts one at a time before acknowledging them. */
 export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
   constructor(
     private readonly inbox: Pick<FileRuntimeEventInbox, "list" | "acknowledge">,
-    private readonly observer: RuntimeTurnEventObserver
+    private readonly observer: RuntimeTurnEventObserver,
+    private readonly options: FileRuntimeEventProcessorOptions = {}
   ) {}
 
   drain(now: Date): RuntimeEventDrainResult {
@@ -231,7 +239,13 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       ...(event.runId === undefined ? {} : { runId: event.runId }),
       ...(event.sessionSource === undefined ? {} : { sessionSource: event.sessionSource })
     }, now);
-    return outcome === "deferred" ? "deferred" : "applied";
+    if (outcome === "applied") {
+      this.options.onTaskRuntimeApplied?.({
+        taskId: event.taskId,
+        roleName: event.roleName
+      });
+    }
+    return outcome === "deferred" ? "deferred" : outcome;
   }
 
   private applyPromptAccepted(
@@ -252,7 +266,13 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       runId: event.runId,
       receiptId: event.receiptId
     }, now);
-    return outcome === "deferred" ? "deferred" : "applied";
+    if (outcome === "applied") {
+      this.options.onTaskRuntimeApplied?.({
+        taskId: event.taskId,
+        roleName: event.roleName
+      });
+    }
+    return outcome === "deferred" ? "deferred" : outcome;
   }
 
   private applyProviderTurnProgress(
@@ -316,6 +336,10 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
         this.recordObsolete(event, "runtime-cleanup-or-stopped-session", now);
         return "obsolete";
       }
+      this.options.onTaskRuntimeApplied?.({
+        taskId: event.taskId!,
+        roleName: event.roleName
+      });
       return "applied";
     }
     const input: GlobalRuntimeTurnCompleted = {

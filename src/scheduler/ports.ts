@@ -24,6 +24,8 @@ import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import type { Task } from "../task/task.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
+import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
+import type { TaskRuntimeLaunchPolicy } from "../runtime/taskRuntimeIsolation.js";
 
 export type SchedulerTask = Readonly<Pick<
   Task,
@@ -39,6 +41,7 @@ export type SchedulerRole = Readonly<{
   effort?: string;
   effective: EffectiveLaunchSnapshot;
   workspace: string;
+  managedWorkspace?: ManagedWorkspace;
   status: "idle" | "running" | "detached" | "exited" | "failed";
 }>;
 
@@ -160,6 +163,7 @@ export type DormantRuntimeOwnerCandidate = Readonly<{
   agentId: string;
   adapterId: string;
   nativeSessionId: string;
+  launchId?: string;
   sessionUpdatedAt: string;
 }>;
 
@@ -319,10 +323,11 @@ export interface SchedulerStorePort {
     >,
     now: Date
   ): boolean;
-  /** Queues a durable exact-owner cleanup obligation for a Task Role runtime. */
+  /** Queues durable owner cleanup, optionally fenced by one dormant Session fact. */
   enqueueRuntimeCleanup?(
     owner: RuntimeRoleOwner,
-    now?: Date
+    now?: Date,
+    expectedDormantCandidate?: DormantRuntimeOwnerCandidate
   ): RuntimeLifecycleTarget | null;
   /** Atomically clears one confirmed-absent reservation and stops its session fact. */
   completeStoppedRuntimeReservation?(
@@ -432,8 +437,6 @@ export type PreparedRoleDelivery = Readonly<{
   mode: RoleSessionLaunchMode;
   /** The prepare request created a new external Role window/process. */
   sessionStarted: boolean;
-  /** Provider launch argv carried this Run's first prompt atomically. */
-  inputSubmittedAtLaunch?: boolean;
 }>;
 
 export type ReadyRoleDelivery = Readonly<{
@@ -455,6 +458,8 @@ export interface TmuxDeliveryPort {
     adapterId: string;
     effective: EffectiveLaunchSnapshot;
     workspace: string;
+    managedWorkspace?: ManagedWorkspace;
+    runtimePolicy?: TaskRuntimeLaunchPolicy;
     mode: RoleSessionLaunchMode;
     runId?: string;
     nativeSessionId?: string;

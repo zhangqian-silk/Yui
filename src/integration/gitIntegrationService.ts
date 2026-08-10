@@ -1,21 +1,63 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdir, open, rm, stat } from "node:fs/promises";
-import { join, relative, resolve, sep } from "node:path";
+import { createHash } from "node:crypto";
+import { lstat, mkdir, open, rm, stat } from "node:fs/promises";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
+import { selectEnvironment } from "../agent/launchEnvironment.js";
+import { controllerSocketPath } from "../core/controllerEndpoint.js";
 import type { CheckResult } from "./checkResult.js";
 import { NodeGitWorkspace, type GitWorkspacePort } from "../repository/gitWorkspace.js";
 import type { GitWorkspaceRemoval } from "../repository/gitWorkspace.js";
 import { resolveWorktreeRoot } from "../repository/taskWorkspacePreparer.js";
+import {
+  FileTaskRuntimeIsolation,
+  type TaskRuntimeIsolationPort,
+  type TaskRuntimeIsolationPreparation
+} from "../runtime/taskRuntimeIsolation.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import { yuiTmuxServerName } from "../tmux/tmuxManager.js";
 import {
   requireLeaderDecision,
   updateIntegrationAttempt,
   type IntegrationAttempt
 } from "./integrationAttempt.js";
-import { createManagedWorkspace } from "../worktree/managedWorkspace.js";
+import {
+  createManagedWorkspace,
+  type ManagedWorkspace
+} from "../worktree/managedWorkspace.js";
 
 const executeFile = promisify(execFile);
+
+const INTEGRATION_OPERATIONAL_ENVIRONMENT_NAMES = [
+  "PATH",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "TERM",
+  "COLORTERM",
+  "LANG",
+  "LANGUAGE",
+  "LC_ALL",
+  "LC_ADDRESS",
+  "LC_COLLATE",
+  "LC_CTYPE",
+  "LC_IDENTIFICATION",
+  "LC_MEASUREMENT",
+  "LC_MESSAGES",
+  "LC_MONETARY",
+  "LC_NAME",
+  "LC_NUMERIC",
+  "LC_PAPER",
+  "LC_TELEPHONE",
+  "LC_TIME",
+  "TZ",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "NODE_EXTRA_CA_CERTS",
+  "CURL_CA_BUNDLE",
+  "REQUESTS_CA_BUNDLE"
+] as const;
 
 export type IntegrationResult =
   | Readonly<{ status: "committed"; attempt: IntegrationAttempt; workspace: IntegrationWorkspace }>
@@ -33,15 +75,21 @@ export type IntegrationWorkspace = Readonly<{
 export class GitIntegrationService {
   readonly home: string;
   readonly worktreeRoot: string;
+  readonly environment: NodeJS.ProcessEnv;
+  readonly runtimeIsolation: TaskRuntimeIsolationPort;
 
   constructor(
     home: string,
     readonly store: TaskStore,
     readonly git: GitWorkspacePort = new NodeGitWorkspace(),
-    readonly now: () => Date = () => new Date()
+    readonly now: () => Date = () => new Date(),
+    environment: NodeJS.ProcessEnv = process.env,
+    runtimeIsolation: TaskRuntimeIsolationPort = defaultIntegrationRuntimeIsolation(home)
   ) {
     this.home = resolve(home);
     this.worktreeRoot = resolveWorktreeRoot(home, store.getConfig().defaultWorkspace);
+    this.environment = { ...environment };
+    this.runtimeIsolation = runtimeIsolation;
   }
 
   async integrate(taskId: string, integrationId: string): Promise<IntegrationResult> {
@@ -59,6 +107,7 @@ export class GitIntegrationService {
     if (project === null) throw new Error(`Project not found: ${initial.projectId}.`);
     let prepared: Readonly<{ path: string; branch: string; baseCommit: string }>;
     let workspace: IntegrationWorkspace;
+    let managedWorkspace: ManagedWorkspace;
     try {
       prepared = await this.git.ensureIntegrationWorktree({
         repositoryPath: project.path,
@@ -74,7 +123,7 @@ export class GitIntegrationService {
         baseCommit: prepared.baseCommit
       };
       const existingWorkspace = this.store.getIntegrationWorkspace(task.id, initial.id);
-      this.store.saveManagedWorkspace(existingWorkspace ?? createManagedWorkspace({
+      managedWorkspace = existingWorkspace ?? createManagedWorkspace({
         owner: {
           type: "integration-attempt",
           taskId: task.id,
@@ -90,7 +139,8 @@ export class GitIntegrationService {
           baseRef: initial.expectedHead,
           baseCommit: prepared.baseCommit
         }]
-      }, this.now()));
+      }, this.now());
+      this.store.saveManagedWorkspace(managedWorkspace);
     } catch (error) {
       return this.#fail(initial, error, "integration-preparation");
     }
@@ -104,7 +154,8 @@ export class GitIntegrationService {
         this.store,
         task.id,
         project.path,
-        current.changeSetIds
+        current.changeSetIds,
+        current.expectedHead
       );
       let remaining = plan;
       if (current.resolution?.action === "manual-resolution") {
@@ -122,13 +173,7 @@ export class GitIntegrationService {
         return conflict;
       }
 
-      const checkResults = await runChecks(
-        prepared.path,
-        current.checkCommands,
-        this.home,
-        task.id,
-        current.id
-      );
+      const checkResults = await this.#runChecks(current, managedWorkspace, prepared.path);
       if (checkResults.some((check) => check.outcome === "failed")) {
         current = updateIntegrationAttempt(current, {
           status: "failed",
@@ -179,6 +224,17 @@ export class GitIntegrationService {
     }
     const project = this.store.getProject(integration.projectId);
     if (project === null) throw new Error(`Project not found: ${integration.projectId}.`);
+    const managedWorkspace = this.store.getIntegrationWorkspace(
+      integration.taskId,
+      integration.id
+    );
+    if (managedWorkspace !== null) {
+      const runtime = this.#runtimePreparation(integration, managedWorkspace);
+      this.runtimeIsolation.cleanup(
+        runtime,
+        integration.status === "committed" ? "completion" : "failure"
+      );
+    }
     const result = await this.git.removeIntegrationWorktree({
       repositoryPath: project.path,
       container: join(this.worktreeRoot, project.name),
@@ -197,6 +253,46 @@ export class GitIntegrationService {
       });
     }
     return result;
+  }
+
+  async #runChecks(
+    attempt: IntegrationAttempt,
+    workspace: ManagedWorkspace,
+    path: string
+  ): Promise<CheckResult[]> {
+    if (attempt.checkCommands.length === 0) return [];
+    const runtime = this.#runtimePreparation(attempt, workspace);
+    this.runtimeIsolation.activate(runtime);
+    let cleanupReason: "completion" | "failure" = "failure";
+    try {
+      const environment = await integrationCheckEnvironment(this.environment, runtime);
+      const checks = await runChecks(
+        path,
+        attempt.checkCommands,
+        this.home,
+        attempt.taskId,
+        attempt.id,
+        environment
+      );
+      cleanupReason = checks.some(({ outcome }) => outcome === "failed")
+        ? "failure"
+        : "completion";
+      return checks;
+    } finally {
+      this.runtimeIsolation.cleanup(runtime, cleanupReason);
+    }
+  }
+
+  #runtimePreparation(
+    attempt: IntegrationAttempt,
+    workspace: ManagedWorkspace
+  ): TaskRuntimeIsolationPreparation {
+    return this.runtimeIsolation.preflight({
+      workspace,
+      launchId: integrationRuntimeLaunchId(this.home, attempt.id),
+      generationId: "integration-checks",
+      allowExactActive: true
+    });
   }
 
   async #applyCommits(
@@ -305,7 +401,8 @@ async function integrationCommitPlan(
   store: TaskStore,
   taskId: string,
   repositoryPath: string,
-  changeSetIds: readonly string[]
+  changeSetIds: readonly string[],
+  expectedHead: string
 ): Promise<PlannedCommit[]> {
   const plan: PlannedCommit[] = [];
   for (const changeSetId of changeSetIds) {
@@ -315,7 +412,17 @@ async function integrationCommitPlan(
       "-C", repositoryPath, "rev-list", "--reverse",
       `${changeSet.baseCommit}..${changeSet.headCommit}`
     ])).trim().split("\n").filter(Boolean);
-    plan.push(...commits.map((commit) => ({ changeSetId, commit })));
+    for (const commit of commits) {
+      // A direct Task-main recovery may capture commits after they are already
+      // present on the exact target. Treat those commits as applied rather
+      // than attempting an empty cherry-pick; the later checks and CAS still
+      // fence the committed Integration to expectedHead.
+      if (await gitSucceeds([
+        "-C", repositoryPath,
+        "merge-base", "--is-ancestor", commit, expectedHead
+      ])) continue;
+      plan.push({ changeSetId, commit });
+    }
   }
   return plan;
 }
@@ -348,7 +455,8 @@ async function runChecks(
   commands: readonly string[],
   home: string,
   taskId: string,
-  integrationId: string
+  integrationId: string,
+  environment: Readonly<Record<string, string>>
 ): Promise<CheckResult[]> {
   if (commands.length === 0) return [];
   const outputDirectory = integrationCheckDirectory(home, taskId, integrationId);
@@ -361,7 +469,7 @@ async function runChecks(
       `${String(index + 1).padStart(3, "0")}.log`
     );
     const logPath = relative(home, absoluteLogPath).split(sep).join("/");
-    const result = await runCheck(path, command, absoluteLogPath, logPath);
+    const result = await runCheck(path, command, absoluteLogPath, logPath, environment);
     results.push(result);
     if (result.outcome === "failed") break;
   }
@@ -379,12 +487,13 @@ async function runCheck(
   cwd: string,
   command: string,
   absoluteLogPath: string,
-  logPath: string
+  logPath: string,
+  environment: Readonly<Record<string, string>>
 ): Promise<CheckResult> {
   const output = await open(absoluteLogPath, "w", 0o600);
   let completion: CheckCompletion;
   try {
-    completion = await spawnCheck(command, cwd, output.fd);
+    completion = await spawnCheck(command, cwd, output.fd, environment);
   } finally {
     await output.close();
   }
@@ -421,12 +530,14 @@ async function runCheck(
 async function spawnCheck(
   command: string,
   cwd: string,
-  outputFd: number
+  outputFd: number,
+  environment: Readonly<Record<string, string>>
 ): Promise<CheckCompletion> {
   let child;
   try {
     child = spawn("/bin/sh", ["-lc", command], {
       cwd,
+      env: environment,
       stdio: ["ignore", outputFd, outputFd]
     });
   } catch (error) {
@@ -453,6 +564,65 @@ async function spawnCheck(
   });
   clearTimeout(timeout);
   return { ...completion, timedOut };
+}
+
+async function integrationCheckEnvironment(
+  source: NodeJS.ProcessEnv,
+  runtime: TaskRuntimeIsolationPreparation
+): Promise<Readonly<Record<string, string>>> {
+  const home = join(runtime.descriptor.roots.data, "home");
+  try {
+    await mkdir(home, { mode: 0o700 });
+  } catch (error) {
+    if (!isNodeCode(error, "EEXIST")) throw error;
+  }
+  const homeMetadata = await lstat(home);
+  if (!homeMetadata.isDirectory() || homeMetadata.isSymbolicLink()) {
+    throw new Error("Integration runtime HOME is not an owned directory.");
+  }
+  return Object.freeze({
+    ...selectEnvironment(source, INTEGRATION_OPERATIONAL_ENVIRONMENT_NAMES),
+    PATH: source.PATH || `${dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`,
+    HOME: home,
+    TMPDIR: runtime.descriptor.roots.temporary,
+    TMP: runtime.descriptor.roots.temporary,
+    TEMP: runtime.descriptor.roots.temporary,
+    TMUX_TMPDIR: runtime.descriptor.roots.temporary,
+    ...runtime.environment
+  });
+}
+
+function isNodeCode(error: unknown, code: string): boolean {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && (error as { code?: unknown }).code === code;
+}
+
+function defaultIntegrationRuntimeIsolation(home: string): TaskRuntimeIsolationPort {
+  const controlHome = resolve(home);
+  return new FileTaskRuntimeIsolation({
+    runtimeRoot: integrationRuntimeRoot(),
+    pathLayout: "compact",
+    controlPlane: {
+      yuiHome: controlHome,
+      controllerSocketPath: controllerSocketPath(controlHome),
+      tmuxNamespace: yuiTmuxServerName(controlHome),
+      globalInstallPaths: [process.execPath]
+    }
+  });
+}
+
+function integrationRuntimeRoot(): string {
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  return join("/tmp", `yi-${uid.toString(36)}`);
+}
+
+function integrationRuntimeLaunchId(home: string, integrationId: string): string {
+  const homeDigest = createHash("sha256")
+    .update(resolve(home))
+    .digest("hex");
+  return `${integrationId}-${homeDigest}`;
 }
 
 function checkFailureReason(completion: CheckCompletion): string {

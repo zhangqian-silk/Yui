@@ -24,6 +24,7 @@ import {
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
+  retireTaskRoleSessionsForWorkspace,
   roleAgentSessionResumeMode,
   updateRoleAgentSessionStatus
 } from "../../dist/executor/agentExecutor.js";
@@ -41,14 +42,21 @@ import {
   updateRole
 } from "../../dist/role/role.js";
 import { yieldAgentRun } from "../../dist/run/agentRun.js";
+import { createStartupReadyClaudeAgent } from "../helpers/mockClaudeAgent.js";
 import {
-  createReviewRound
+  createReviewRound,
+  createTaskReviewRound
 } from "../../dist/review/reviewRound.js";
+import {
+  createTaskFinalReviewContract
+} from "../../dist/review/taskFinalReviewContract.js";
 import {
   createAgentRun,
   recordRoleAgentSession,
   testEffectiveLaunch
 } from "../helpers/effectiveLaunch.js";
+import { exactTaskCliInvocation } from "../helpers/exactTaskCli.js";
+import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
 import { createInputRequest } from "../../dist/input/inputRequest.js";
 import {
   createIntegrationAttempt,
@@ -64,6 +72,10 @@ import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePr
 import { TaskWorkspaceCoordinator } from "../../dist/repository/taskWorkspaceCoordinator.js";
 import { stopFileTaskController } from "../../dist/controller/clientRuntime.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import {
+  isRuntimeLaunchReservation,
+  runtimeLifecycleTarget
+} from "../../dist/runtime/lifecycleReservation.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, completeTask, createTask } from "../../dist/task/task.js";
 import {
@@ -75,6 +87,7 @@ import {
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
+import { yuiTmuxServerName } from "../../dist/tmux/tmuxManager.js";
 import { WorkItemChangeSetManager } from "../../dist/workspace/workItemChangeSetManager.js";
 
 const NOW = new Date("2026-07-19T12:00:00.000Z");
@@ -104,6 +117,17 @@ function fixture(t) {
         `Fixture Controller cleanup failed: ${stopped.stderr || stopped.error?.message}`
       );
     }
+    const stoppedTmux = spawnSync(
+      process.env.YUI_TMUX_BIN ?? "tmux",
+      ["-L", yuiTmuxServerName(home), "kill-server"],
+      { encoding: "utf8", env: { ...process.env, YUI_HOME: home } }
+    );
+    assert.equal(
+      stoppedTmux.status === 0
+        || /no server running|failed to connect|error connecting/i.test(stoppedTmux.stderr ?? ""),
+      true,
+      `Fixture tmux cleanup failed: ${stoppedTmux.stderr || stoppedTmux.error?.message}`
+    );
     rmSync(root, { recursive: true, force: true });
   });
   const workspace = join(root, "workspace");
@@ -131,8 +155,15 @@ async function addProject(store, repositoryPath) {
   return store.listProjects()[0];
 }
 
-function addTaskRoles(store, task, repositoryPath, names = ["leader", "worker"]) {
-  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], NOW);
+function addTaskRoles(
+  store,
+  task,
+  repositoryPath,
+  names = ["leader", "worker"],
+  configuredAgent = undefined
+) {
+  const agent = configuredAgent
+    ?? createConfiguredAgent("codex", "codex", "codex", [], [], NOW);
   store.transaction((tx) => {
     tx.saveConfiguredAgent(agent);
     tx.saveTask(task);
@@ -166,6 +197,10 @@ function savePlannerRun(store, taskId, roleName, context = {}) {
 }
 
 function markDelivered(store, run) {
+  const deliveredAt = new Date(Math.max(
+    NOW.getTime(),
+    Date.parse(run.createdAt)
+  ));
   store.transaction((tx) => {
     const target = { kind: "role", taskId: run.taskId, roleName: run.roleName };
     let mailbox = tx.getWorkMailbox(target) ?? createWorkMailbox(target);
@@ -174,7 +209,7 @@ function markDelivered(store, run) {
         mailbox = enqueueSignal(mailbox, {
           reason: "fixture-run-dispatched",
           refs: [{ type: "run", taskId: run.taskId, id: run.id }],
-          occurredAt: NOW.toISOString()
+          occurredAt: deliveredAt.toISOString()
         });
       }
       const batchId = `agent-run:${run.taskId}/${run.id}`;
@@ -182,15 +217,28 @@ function markDelivered(store, run) {
         claimPending(mailbox, {
           batchId,
           owner: "controller",
-          startedAt: NOW.toISOString()
+          startedAt: deliveredAt.toISOString()
         }),
         batchId,
         { type: "run", taskId: run.taskId, id: run.id }
       );
       tx.saveWorkMailbox(mailbox);
     }
-    tx.saveAgentRun({ ...run, pushedAt: NOW.toISOString(), deliveredAt: NOW.toISOString() });
+    tx.saveAgentRun({
+      ...run,
+      pushedAt: deliveredAt.toISOString(),
+      deliveredAt: deliveredAt.toISOString()
+    });
   });
+}
+
+function spawnExactTaskCli(home, store, taskId, roleName, args) {
+  const invocation = exactTaskCliInvocation({ home, store, taskId, roleName });
+  return spawnSync(
+    process.execPath,
+    [invocation.cliEntry, ...invocation.prefix, ...args],
+    { encoding: "utf8", env: invocation.environment }
+  );
 }
 
 function liveSessionSet(status = "ready") {
@@ -200,6 +248,152 @@ function liveSessionSet(status = "ready") {
     pendingTurnCompletion: null
   };
 }
+
+function dormantClaudePlaceholder(launchId) {
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId: "task-1",
+    roleName: "worker"
+  }, "codex", NOW);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "claude",
+    adapterId: "claude",
+    nativeSessionId: "aggregate-16-claude-placeholder",
+    ...(launchId === undefined ? {} : { launchId }),
+    policy: "fixed",
+    status: "ready"
+  }, NOW);
+  return sessions;
+}
+
+function placeholderIsolationStore(initialSessions) {
+  let sessions = initialSessions;
+  const item = {
+    id: "work-item-1",
+    taskId: "task-1",
+    assignee: "worker",
+    writeProjectIds: ["project-1"],
+    status: "pending"
+  };
+  const store = {
+    getWorkItem: () => item,
+    getTask: () => ({
+      id: item.taskId,
+      status: "active",
+      projectBindings: [{ projectId: "project-1" }]
+    }),
+    getRole: () => ({ name: item.assignee }),
+    getWorkItemWorkspace: () => null,
+    getActiveAgentRun: () => null,
+    listAgentRuns: () => [],
+    getTaskRoleSessionSet: () => sessions,
+    saveTaskRoleSessionSet(next) { sessions = next; },
+    transaction(operation) { return operation(store); }
+  };
+  return { item, store, sessions: () => sessions };
+}
+
+test("workspace isolation preserves a dormant Claude placeholder while its exact Role pane is live", async () => {
+  const fixture = placeholderIsolationStore(dormantClaudePlaceholder());
+  const before = structuredClone(fixture.sessions());
+  let stopped = 0;
+  let prepared = false;
+  const coordinator = new TaskWorkspaceCoordinator(fixture.store, {
+    now: () => new Date(NOW),
+    async prepareTaskWorkspace() {},
+    async prepareWorkItemWorkspace() {
+      prepared = true;
+      return { path: "/must-not-be-created" };
+    }
+  }, {
+    inspectTaskRolePanes() {
+      return [{ roleName: "worker", dead: false }];
+    },
+    async stopTaskRoleSessions() { stopped += 1; }
+  });
+
+  await assert.rejects(
+    coordinator.isolateWorkItem(fixture.item.taskId, fixture.item.id),
+    /native pane must stop/i
+  );
+  assert.equal(stopped, 1);
+  assert.equal(prepared, false);
+  assert.deepEqual(fixture.sessions(), before);
+});
+
+test("workspace isolation preserves an absent but launch-bearing inactive Claude Session", async () => {
+  const fixture = placeholderIsolationStore(
+    dormantClaudePlaceholder("launch-real-claude")
+  );
+  const before = structuredClone(fixture.sessions());
+  const coordinator = new TaskWorkspaceCoordinator(fixture.store, {
+    now: () => new Date(NOW),
+    async prepareTaskWorkspace() {},
+    async prepareWorkItemWorkspace() {
+      retireTaskRoleSessionsForWorkspace(fixture.sessions(), NOW);
+    }
+  }, {
+    inspectTaskRolePanes() { return []; },
+    async stopTaskRoleSessions() {}
+  });
+
+  await assert.rejects(
+    coordinator.isolateWorkItem(fixture.item.taskId, fixture.item.id),
+    /claude.*stopped|stopped.*claude/i
+  );
+  assert.deepEqual(fixture.sessions(), before);
+});
+
+test("workspace isolation rechecks a runless launch reservation before placeholder retirement", async () => {
+  const fixture = placeholderIsolationStore(dormantClaudePlaceholder());
+  const before = structuredClone(fixture.sessions());
+  const target = runtimeLifecycleTarget({
+    scope: "task",
+    taskId: fixture.item.taskId,
+    roleName: fixture.item.assignee
+  });
+  let mailbox = null;
+  fixture.store.getWorkMailbox = () => mailbox;
+  let prepared = false;
+  let inspections = 0;
+  const coordinator = new TaskWorkspaceCoordinator(fixture.store, {
+    now: () => new Date(NOW),
+    async prepareTaskWorkspace() {},
+    async prepareWorkItemWorkspace() {
+      prepared = true;
+      return { path: "/must-not-be-created" };
+    }
+  }, {
+    inspectTaskRolePanes() {
+      inspections += 1;
+      if (inspections === 1) {
+        mailbox = claimPending(enqueueSignal(createWorkMailbox(target), {
+          reason: "runtime-launch-reserved",
+          refs: [{ type: "task", id: fixture.item.taskId }],
+          occurredAt: NOW.toISOString()
+        }), {
+          batchId: "late-runless-launch",
+          owner: "runtime-lifecycle",
+          startedAt: NOW.toISOString()
+        });
+      }
+      return [];
+    },
+    async stopTaskRoleSessions() {}
+  });
+
+  await assert.rejects(
+    coordinator.isolateWorkItem(fixture.item.taskId, fixture.item.id),
+    /runtime lifecycle|launch reservation|unsettled/i
+  );
+  assert.equal(inspections, 2);
+  assert.equal(prepared, false);
+  assert.deepEqual(fixture.sessions(), before);
+  assert.equal(isRuntimeLaunchReservation(
+    mailbox.processing,
+    "late-runless-launch"
+  ), true);
+});
 
 test("workspace coordination stops a live Role only after a clean preflight", async () => {
   const events = [];
@@ -1859,6 +2053,185 @@ test("a Role workspace migration retires its cwd-bound stopped native session", 
   assert.equal(store.getRoleSession(task.id, "worker"), null);
 });
 
+test("an inactive never-started Claude placeholder does not block isolation or disturb the active Leader", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Isolate before Claude starts", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const claude = createConfiguredAgent("claude", "claude", "claude", [], [], NOW);
+  const worker = store.getRole(task.id, "worker");
+  store.transaction((tx) => {
+    tx.saveConfiguredAgent(claude);
+    tx.saveRole(task.id, updateRole(worker, {
+      agentBindings: {
+        ...worker.agentBindings,
+        [claude.id]: createRoleAgentBinding(claude)
+      }
+    }, NOW));
+  });
+
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  let leaderSessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: "leader"
+  }, "codex", NOW);
+  leaderSessions = recordRoleAgentSession(leaderSessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "leader-main-session",
+    policy: "fixed",
+    status: "running"
+  }, NOW);
+  store.saveTaskRoleSessionSet(leaderSessions);
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: "worker"
+  }, "codex", NOW);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: claude.id,
+    adapterId: claude.adapterId,
+    nativeSessionId: "aggregate-16-never-started-claude",
+    policy: "fixed",
+    status: "ready"
+  }, NOW);
+  // The aggregate-16 placeholder belongs to a configured but inactive Agent;
+  // status correctly projects no active native Session or launch.
+  sessions = { ...sessions, activeAgentId: "codex" };
+  store.saveTaskRoleSessionSet(sessions);
+
+  const status = runTaskCommand(["role", "status", task.id, "worker"], store, {
+    now: () => new Date(NOW),
+    runtime: {
+      inspectTaskRolePanes: () => []
+    },
+    environment: {}
+  });
+  assert.equal(status.kind, "output");
+  assert.equal(status.data.role.health, "idle");
+  assert.equal(status.data.role.activeRun, null);
+  assert.equal(status.data.role.activeWork, null);
+  assert.equal(status.data.role.effectiveLaunch, null);
+  assert.equal(status.data.role.nativeSession, null);
+  assert.equal(status.data.role.tmux.state, "missing");
+  assert.equal(status.data.role.freshLaunchAllowed, true);
+  assert.equal(status.data.role.runSessionDrift, false);
+
+  const item = createWorkItem("work-item-1", task.id, {
+    title: "Start in an isolated workspace",
+    assignee: "worker",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const stopped = [];
+  const coordinator = new TaskWorkspaceCoordinator(store, preparer, {
+    inspectTaskRolePanes() {
+      return [];
+    },
+    async stopTaskRoleSessions(taskId, roles) {
+      stopped.push([taskId, roles]);
+    }
+  });
+  const isolated = await coordinator.isolateWorkItem(task.id, item.id);
+
+  assert.equal(isolated.owner.type, "work-item");
+  assert.equal(isolated.owner.workItemId, item.id);
+  assert.deepEqual(stopped, []);
+  const retired = store.getTaskRoleSessionSet(task.id, "worker");
+  assert.deepEqual(retired.sessions, {});
+  assert.deepEqual(retired.history.map(({ agentId, status: state }) => ({
+    agentId, status: state
+  })), [{ agentId: claude.id, status: "broken" }]);
+  assert.ok(Object.hasOwn(store.getRole(task.id, "worker").agentBindings, claude.id));
+  assert.equal(
+    store.getRoleSession(task.id, "leader").nativeSessionId,
+    "leader-main-session"
+  );
+  assert.equal(store.getRoleSession(task.id, "leader").status, "running");
+});
+
+test("a runless runtime launch reservation blocks isolation without retiring a never-started Claude placeholder", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Fence runless Role launch", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const claude = createConfiguredAgent("claude", "claude", "claude", [], [], NOW);
+  const worker = store.getRole(task.id, "worker");
+  store.transaction((tx) => {
+    tx.saveConfiguredAgent(claude);
+    tx.saveRole(task.id, updateRole(worker, {
+      agentBindings: {
+        ...worker.agentBindings,
+        [claude.id]: createRoleAgentBinding(claude)
+      }
+    }, NOW));
+  });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: worker.name
+  }, "codex", NOW);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: claude.id,
+    adapterId: claude.adapterId,
+    nativeSessionId: "aggregate-16-never-started-claude",
+    policy: "fixed",
+    status: "ready"
+  }, NOW);
+  sessions = { ...sessions, activeAgentId: "codex" };
+  store.saveTaskRoleSessionSet(sessions);
+  const before = structuredClone(sessions);
+  const item = createWorkItem("work-item-1", task.id, {
+    title: "Do not migrate across a reserved launch",
+    assignee: worker.name,
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const scheduler = new FileSchedulerStoreAdapter(store);
+  const owner = { scope: "task", taskId: task.id, roleName: worker.name };
+  scheduler.reserveRuntimeLaunch({
+    owner,
+    launchId: "runless-launch"
+  }, () => {}, NOW);
+  assert.equal(store.getActiveAgentRun(task.id, worker.name), null);
+  assert.equal(store.getTaskRoleSessionSet(task.id, worker.name).inFlight, null);
+  assert.equal(isRuntimeLaunchReservation(store.getWorkMailbox(
+    runtimeLifecycleTarget(owner)
+  )?.processing, "runless-launch"), true);
+  let stopped = 0;
+  const coordinator = new TaskWorkspaceCoordinator(store, preparer, {
+    inspectTaskRolePanes: () => [],
+    async stopTaskRoleSessions() { stopped += 1; }
+  });
+
+  await assert.rejects(
+    coordinator.isolateWorkItem(task.id, item.id),
+    /runtime lifecycle|launch reservation|unsettled/i
+  );
+  assert.equal(stopped, 0);
+  assert.equal(store.getWorkItemWorkspace(task.id, item.id), null);
+  assert.deepEqual(store.getTaskRoleSessionSet(task.id, worker.name), before);
+  assert.equal(isRuntimeLaunchReservation(store.getWorkMailbox(
+    runtimeLifecycleTarget(owner)
+  )?.processing, "runless-launch"), true);
+});
+
 test("Leader can capture, integrate, and clean an isolated Role result before follow-up work", async (t) => {
   const { home, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
@@ -2843,6 +3216,173 @@ test("Project Task create returns the current Task, Leader, and workspace state"
   );
 });
 
+test("a Task-final ReviewRound worktree starts at its frozen integrated head", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Review the integrated Task", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath, ["leader", "reviewer"]);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const taskWorkspace = store.getTaskWorkspace(task.id);
+  const taskMainEntry = taskWorkspace.entries[0];
+  const taskMainCommit = git(["-C", taskMainEntry.path, "rev-parse", "HEAD"]).trim();
+
+  const item = createWorkItem("work-item-1", task.id, {
+    title: "Leader-direct metadata",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const running = updateWorkItemStatus(item, "running", NOW);
+  store.saveWorkItem(task.id, running);
+  const contract = createTaskFinalReviewContract({
+    taskId: task.id,
+    reviewerRoleName: "reviewer",
+    controlPlaneDigest: "a".repeat(64)
+  });
+  const submitted = submitWorkItemCandidate(running, {
+    summary: "metadata-only Candidate",
+    source: { type: "direct" },
+    reviewPolicy: { roleName: "reviewer", trigger: "final" },
+    taskFinalReviewContract: contract
+  }, NOW);
+  store.saveWorkItem(task.id, submitted);
+
+  writeFileSync(join(repositoryPath, "integrated.txt"), "integrated head\n");
+  git(["-C", repositoryPath, "add", "integrated.txt"]);
+  git(["-C", repositoryPath, "commit", "-qm", "integrated head"]);
+  const integratedCommit = git(["-C", repositoryPath, "rev-parse", "HEAD"]).trim();
+  assert.notEqual(integratedCommit, taskMainCommit);
+
+  const candidate = submitted.candidates[0];
+  const round = createTaskReviewRound(
+    "review-round-1",
+    task.id,
+    item.id,
+    candidate.id,
+    "reviewer",
+    "policy",
+    {
+      schemaVersion: 1,
+      projects: [{ projectId: project.id, commit: integratedCommit }]
+    },
+    NOW,
+    contract
+  );
+  store.saveReviewRound(task.id, round);
+
+  const reviewWorkspace = await preparer.prepareReviewRoundWorkspace(task.id, round.id);
+  const reviewEntry = reviewWorkspace.entries[0];
+  assert.equal(candidate.workspace, undefined);
+  assert.equal(reviewEntry.baseCommit, integratedCommit);
+  assert.equal(git(["-C", reviewEntry.path, "rev-parse", "HEAD"]).trim(), integratedCommit);
+  assert.equal(readFileSync(join(reviewEntry.path, "integrated.txt"), "utf8"), "integrated head\n");
+  assert.equal(
+    git(["-C", taskMainEntry.path, "rev-parse", "HEAD"]).trim(),
+    taskMainCommit
+  );
+});
+
+test("exact Task completion rejects Task-main drift after the latest Integration", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Review the actual Task head", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }],
+    requireIntegration: true
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath, ["leader", "reviewer"]);
+  store.saveConfig({
+    ...store.getConfig(),
+    defaultWorkspace: workspace,
+    review: { roleName: "reviewer", trigger: "final" }
+  });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const taskEntry = store.getTaskWorkspace(task.id).entries[0];
+  const baseCommit = git(["-C", taskEntry.path, "rev-parse", "HEAD"]).trim();
+  const invocation = exactTaskCliInvocation({
+    home,
+    store,
+    taskId: task.id,
+    roleName: "leader",
+    taskFinalReviewerRole: "reviewer"
+  });
+  const contract = createTaskFinalReviewContract({
+    taskId: task.id,
+    reviewerRoleName: "reviewer",
+    controlPlaneDigest: invocation.controlDigest
+  });
+  const item = updateWorkItemStatus(createWorkItem("work-item-1", task.id, {
+    title: "Integrated delivery",
+    writeProjectIds: [project.id]
+  }, NOW), "running", NOW);
+  const submitted = submitWorkItemCandidate(item, {
+    summary: "Integrated delivery",
+    source: { type: "direct" },
+    reviewPolicy: { roleName: "reviewer", trigger: "final" },
+    taskFinalReviewContract: contract
+  }, NOW);
+  store.saveWorkItem(task.id, updateWorkItemStatus(
+    submitted,
+    "completed",
+    NOW,
+    "Accepted for final Review."
+  ));
+
+  writeFileSync(join(taskEntry.path, "integrated.txt"), "integrated\n");
+  git(["-C", taskEntry.path, "add", "integrated.txt"]);
+  git(["-C", taskEntry.path, "commit", "-qm", "integrated"]);
+  const integratedCommit = git(["-C", taskEntry.path, "rev-parse", "HEAD"]).trim();
+  const changeSet = createWorkItemChangeSet({
+    id: "change-set-1",
+    taskId: task.id,
+    projectId: project.id,
+    workItemId: item.id,
+    baseCommit,
+    headCommit: integratedCommit,
+    branch: taskEntry.branch,
+    changedPaths: ["integrated.txt"]
+  }, NOW);
+  const integration = updateIntegrationAttempt(createIntegrationAttempt({
+    id: "integration-1",
+    taskId: task.id,
+    projectId: project.id,
+    targetRef: taskEntry.branch,
+    expectedHead: baseCommit,
+    changeSetIds: [changeSet.id],
+    checkCommands: []
+  }, NOW), { status: "committed", candidateCommit: integratedCommit }, NOW);
+  store.transaction((tx) => {
+    tx.saveChangeSet(task.id, changeSet);
+    tx.saveIntegrationAttempt(task.id, integration);
+  });
+
+  writeFileSync(join(taskEntry.path, "drift.txt"), "unintegrated drift\n");
+  git(["-C", taskEntry.path, "add", "drift.txt"]);
+  git(["-C", taskEntry.path, "commit", "-qm", "post-integration drift"]);
+  const actualCommit = git(["-C", taskEntry.path, "rev-parse", "HEAD"]).trim();
+  assert.notEqual(actualCommit, integratedCommit);
+
+  const result = spawnSync(process.execPath, [
+    invocation.cliEntry,
+    ...invocation.prefix,
+    "task", "complete", task.id, "--summary", "Request exact final Review."
+  ], { encoding: "utf8", env: invocation.environment });
+  assert.notEqual(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stderr, /actual Task head.*latest committed Integration/i);
+  assert.equal(store.listReviewRounds(task.id).length, 0);
+  assert.equal(store.getTask(task.id).status, "active");
+});
+
 test("a reviewer launches from a fresh ReviewRound workspace frozen from the Candidate", async (t) => {
   const { home, workspace, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
@@ -2993,21 +3533,12 @@ test("public review delivery binds the physical ReviewRound workspace before not
     workspace: develop,
     gitSnapshot: await preparer.snapshotCandidateWorkspace(develop)
   }, NOW));
-  const leaderEnvironment = {
-    ...process.env,
-    YUI_HOME: home,
-    YUI_SESSION_SCOPE: "task",
-    YUI_TASK_ID: task.id,
-    YUI_ROLE: "leader"
-  };
-
-  const result = spawnSync(
-    process.execPath,
-    [join(process.cwd(), "dist", "cli.js"), "task", "work", "review", item.id],
-    {
-      encoding: "utf8",
-      env: leaderEnvironment
-    }
+  const result = spawnExactTaskCli(
+    home,
+    store,
+    task.id,
+    "leader",
+    ["task", "work", "review", item.id]
   );
   assert.equal(result.status, 0, result.stderr || result.stdout);
 
@@ -3022,7 +3553,6 @@ test("public review delivery binds the physical ReviewRound workspace before not
   assert.equal(store.getReviewRoundWorkspace(task.id, round.id).root, reviewRun.workspace.root);
   assert.equal(existsSync(reviewRun.workspace.root), true);
   assert.match(reviewRun.input, new RegExp(reviewRun.workspace.root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  const cli = join(process.cwd(), "dist", "cli.js");
   const reviewMailbox = store.getWorkMailbox({
     kind: "role",
     taskId: task.id,
@@ -3043,10 +3573,12 @@ test("public review delivery binds the physical ReviewRound workspace before not
     "commit", "-qm", "review diagnostic evidence"
   ]);
 
-  const contextAfterDiagnostic = spawnSync(
-    process.execPath,
-    [cli, "task", "show", task.id],
-    { encoding: "utf8", env: leaderEnvironment }
+  const contextAfterDiagnostic = spawnExactTaskCli(
+    home,
+    store,
+    task.id,
+    "leader",
+    ["task", "show", task.id]
   );
   assert.equal(
     contextAfterDiagnostic.status,
@@ -3057,10 +3589,12 @@ test("public review delivery binds the physical ReviewRound workspace before not
     store.getReviewRoundWorkspace(task.id, round.id).entries[0].baseCommit,
     frozenReviewBase
   );
-  const captureAfterDiagnostic = spawnSync(
-    process.execPath,
-    [cli, "task", "work", "capture", item.id],
-    { encoding: "utf8", env: leaderEnvironment }
+  const captureAfterDiagnostic = spawnExactTaskCli(
+    home,
+    store,
+    task.id,
+    "leader",
+    ["task", "work", "capture", item.id]
   );
   assert.equal(captureAfterDiagnostic.status, 0, captureAfterDiagnostic.stderr);
   assert.match(captureAfterDiagnostic.stdout, /no changes to capture/i);
@@ -3447,7 +3981,13 @@ test("public terminal ReviewRound cleanup removes its clean workspace", async (t
       baseRef: project.developmentBranch
     }]
   }), NOW);
-  const agent = addTaskRoles(store, task, repositoryPath);
+  const agent = addTaskRoles(
+    store,
+    task,
+    repositoryPath,
+    ["leader", "worker"],
+    createStartupReadyClaudeAgent(home, NOW, "claude-mock")
+  );
   store.transaction((tx) => {
     tx.saveGlobalRole(createGlobalRole(
       "reviewer",
@@ -3481,29 +4021,23 @@ test("public terminal ReviewRound cleanup removes its clean workspace", async (t
     workspace: develop,
     gitSnapshot: await preparer.snapshotCandidateWorkspace(develop)
   }, NOW));
-  const cli = join(process.cwd(), "dist", "cli.js");
-  const leaderEnvironment = {
-    ...process.env,
-    YUI_HOME: home,
-    YUI_SESSION_SCOPE: "task",
-    YUI_TASK_ID: task.id,
-    YUI_ROLE: "leader"
-  };
-  const queued = spawnSync(process.execPath, [cli, "task", "work", "review", item.id], {
-    encoding: "utf8",
-    env: leaderEnvironment
-  });
+  const queued = spawnExactTaskCli(
+    home,
+    store,
+    task.id,
+    "leader",
+    ["task", "work", "review", item.id]
+  );
   assert.equal(queued.status, 0, queued.stderr || queued.stdout);
   const round = store.listReviewRounds(task.id)[0];
   const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
   markDelivered(store, reviewRun);
-  const finished = spawnSync(
-    process.execPath,
-    [cli, "task", "run", "yield", reviewRun.id, "--summary", "Review complete"],
-    {
-      encoding: "utf8",
-      env: { ...leaderEnvironment, YUI_ROLE: "reviewer" }
-    }
+  const finished = spawnExactTaskCli(
+    home,
+    store,
+    task.id,
+    "reviewer",
+    ["task", "run", "yield", reviewRun.id, "--summary", "Review complete"]
   );
   assert.equal(finished.status, 0, finished.stderr || finished.stdout);
   assert.equal(store.getReviewRound(task.id, round.id).status, "completed");
@@ -3512,10 +4046,12 @@ test("public terminal ReviewRound cleanup removes its clean workspace", async (t
 
   const dirtyMarker = join(reviewRoot, project.name, "review-dirty.txt");
   writeFileSync(dirtyMarker, "retain this evidence\n");
-  const retained = spawnSync(
-    process.execPath,
-    [cli, "task", "work", "review", "cleanup", round.id],
-    { encoding: "utf8", env: leaderEnvironment }
+  const retained = spawnExactTaskCli(
+    home,
+    store,
+    task.id,
+    "leader",
+    ["task", "work", "review", "cleanup", round.id]
   );
   assert.notEqual(retained.status, 0);
   assert.match(retained.stderr, /dirty/i);
@@ -3523,10 +4059,12 @@ test("public terminal ReviewRound cleanup removes its clean workspace", async (t
   assert.equal(existsSync(reviewRoot), true);
   unlinkSync(dirtyMarker);
 
-  const cleaned = spawnSync(
-    process.execPath,
-    [cli, "task", "work", "review", "cleanup", round.id],
-    { encoding: "utf8", env: leaderEnvironment }
+  const cleaned = spawnExactTaskCli(
+    home,
+    store,
+    task.id,
+    "leader",
+    ["task", "work", "review", "cleanup", round.id]
   );
   assert.equal(cleaned.status, 0, cleaned.stderr || cleaned.stdout);
   assert.equal(store.getReviewRoundWorkspace(task.id, round.id), null);
@@ -3543,25 +4081,25 @@ test("public dispatch prepares a WorkItem-owned read-only Develop workspace befo
       baseRef: project.developmentBranch
     }]
   }), NOW);
-  addTaskRoles(store, task, repositoryPath);
+  addTaskRoles(
+    store,
+    task,
+    repositoryPath,
+    ["leader", "worker"],
+    createStartupReadyClaudeAgent(home, NOW, "claude-mock")
+  );
   const item = createWorkItem("work-item-1", task.id, {
     title: "Inspect without writes",
     assignee: "worker",
     writeProjectIds: []
   }, NOW);
   store.saveWorkItem(task.id, item);
-  const cli = join(process.cwd(), "dist", "cli.js");
-  const environment = {
-    ...process.env,
-    YUI_HOME: home,
-    YUI_SESSION_SCOPE: "task",
-    YUI_TASK_ID: task.id,
-    YUI_ROLE: "worker"
-  };
-  const dispatched = spawnSync(
-    process.execPath,
-    [cli, "task", "work", "dispatch", item.id],
-    { encoding: "utf8", env: environment }
+  const dispatched = spawnExactTaskCli(
+    home,
+    store,
+    task.id,
+    "leader",
+    ["task", "work", "dispatch", item.id]
   );
   assert.equal(dispatched.status, 0, dispatched.stderr || dispatched.stdout);
 
@@ -3578,10 +4116,12 @@ test("public dispatch prepares a WorkItem-owned read-only Develop workspace befo
   assert.deepEqual(active.workspace.owner, workspaceRecord.owner);
   markDelivered(store, active);
 
-  const yielded = spawnSync(
-    process.execPath,
-    [cli, "task", "run", "yield", active.id, "--summary", "Read-only result ready"],
-    { encoding: "utf8", env: environment }
+  const yielded = spawnExactTaskCli(
+    home,
+    store,
+    task.id,
+    "worker",
+    ["task", "run", "yield", active.id, "--summary", "Read-only result ready"]
   );
   assert.equal(yielded.status, 0, yielded.stderr || yielded.stdout);
   const candidateItem = store.getWorkItem(task.id, item.id);
@@ -3608,19 +4148,14 @@ test("a roleless Project WorkItem follows isolate, Candidate, Integration, accep
   }, NOW);
   store.saveWorkItem(task.id, item);
 
-  const cli = join(process.cwd(), "dist", "cli.js");
-  const leaderEnvironment = {
-    ...process.env,
-    YUI_HOME: home,
-    YUI_SESSION_SCOPE: "task",
-    YUI_TASK_ID: task.id,
-    YUI_ROLE: "leader"
-  };
-  const isolated = spawnSync(
-    process.execPath,
-    [cli, "task", "work", "isolate", item.id],
-    { encoding: "utf8", env: leaderEnvironment }
+  const runAsLeader = (args) => spawnExactTaskCli(
+    home,
+    store,
+    task.id,
+    "leader",
+    args
   );
+  const isolated = runAsLeader(["task", "work", "isolate", item.id]);
   assert.equal(isolated.status, 0, isolated.stderr || isolated.stdout);
   const develop = store.getWorkItemWorkspace(task.id, item.id);
   assert.notEqual(develop, null);
@@ -3631,11 +4166,7 @@ test("a roleless Project WorkItem follows isolate, Candidate, Integration, accep
   });
   assert.equal(store.getWorkItem(task.id, item.id).assignee, undefined);
 
-  const started = spawnSync(
-    process.execPath,
-    [cli, "task", "work", "update", item.id, "running"],
-    { encoding: "utf8", env: leaderEnvironment }
-  );
+  const started = runAsLeader(["task", "work", "update", item.id, "running"]);
   assert.equal(started.status, 0, started.stderr || started.stdout);
   assert.equal(store.getWorkItem(task.id, item.id).status, "running");
   assert.equal(store.getWorkItem(task.id, item.id).candidates.length, 0);
@@ -3644,11 +4175,9 @@ test("a roleless Project WorkItem follows isolate, Candidate, Integration, accep
   writeFileSync(join(isolatedPath, "roleless.txt"), "roleless result\n");
   execFileSync("git", ["-C", isolatedPath, "add", "roleless.txt"]);
   execFileSync("git", ["-C", isolatedPath, "commit", "-qm", "roleless result"]);
-  const completed = spawnSync(
-    process.execPath,
-    [cli, "task", "work", "update", item.id, "done", "--summary", "Ready for integration"],
-    { encoding: "utf8", env: leaderEnvironment }
-  );
+  const completed = runAsLeader([
+    "task", "work", "update", item.id, "done", "--summary", "Ready for integration"
+  ]);
   assert.equal(completed.status, 0, completed.stderr || completed.stdout);
   const candidateItem = store.getWorkItem(task.id, item.id);
   assert.equal(candidateItem.status, "awaiting_acceptance");
@@ -3661,46 +4190,34 @@ test("a roleless Project WorkItem follows isolate, Candidate, Integration, accep
     candidate.workspace.entries[0].baseCommit
   );
 
-  const bypassed = spawnSync(
-    process.execPath,
-    [cli, "task", "work", "update", item.id, "done", "--summary", "Bypass attempt"],
-    { encoding: "utf8", env: leaderEnvironment }
-  );
+  const bypassed = runAsLeader([
+    "task", "work", "update", item.id, "done", "--summary", "Bypass attempt"
+  ]);
   assert.notEqual(bypassed.status, 0);
   assert.match(bypassed.stderr, /awaiting acceptance|task work accept/i);
   assert.equal(store.getWorkItem(task.id, item.id).status, "awaiting_acceptance");
 
-  const captured = spawnSync(
-    process.execPath,
-    [cli, "task", "work", "capture", item.id],
-    { encoding: "utf8", env: leaderEnvironment }
-  );
+  const captured = runAsLeader(["task", "work", "capture", item.id]);
   assert.equal(captured.status, 0, captured.stderr || captured.stdout);
   const [changeSet] = store.listChangeSets(task.id);
   assert.notEqual(changeSet, undefined);
   assert.equal(changeSet.workItemId, item.id);
 
-  const integration = spawnSync(
-    process.execPath,
-    [cli, "task", "integration", "start", task.id, "--change-set", changeSet.id],
-    { encoding: "utf8", env: leaderEnvironment }
-  );
+  const integration = runAsLeader([
+    "task", "integration", "start", task.id, "--change-set", changeSet.id
+  ]);
   assert.equal(integration.status, 0, integration.stderr || integration.stdout);
   assert.match(integration.stdout, /Integrated/i);
 
-  const accepted = spawnSync(
-    process.execPath,
-    [cli, "task", "work", "accept", item.id, "--summary", "Integrated and accepted"],
-    { encoding: "utf8", env: leaderEnvironment }
-  );
+  const accepted = runAsLeader([
+    "task", "work", "accept", item.id, "--summary", "Integrated and accepted"
+  ]);
   assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
   assert.equal(store.getWorkItem(task.id, item.id).status, "completed");
 
-  const cleaned = spawnSync(
-    process.execPath,
-    [cli, "task", "work", "cleanup", item.id, "--integrated"],
-    { encoding: "utf8", env: leaderEnvironment }
-  );
+  const cleaned = runAsLeader([
+    "task", "work", "cleanup", item.id, "--integrated"
+  ]);
   assert.equal(cleaned.status, 0, cleaned.stderr || cleaned.stdout);
   assert.equal(store.getWorkItemWorkspace(task.id, item.id), null);
   assert.equal(store.getWorkItem(task.id, item.id).workspaceDisposition, "integrated");
@@ -3712,6 +4229,125 @@ test("a roleless Project WorkItem follows isolate, Candidate, Integration, accep
     { stdio: "ignore" }
   ));
   assert.equal(existsSync(join(workspace, "tasks", task.id, "work-items", item.id)), false);
+});
+
+test("an exact direct Candidate captures clean Task main and records already-contained Integration", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Direct Task-main delivery", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }],
+    requireIntegration: true
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath, ["leader"]);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  const prepared = await preparer.prepareTaskWorkspace(task.id);
+  const taskWorkspace = store.getTaskWorkspace(task.id);
+  const taskEntry = taskWorkspace.entries.find(({ projectId }) => projectId === project.id);
+  const mainPath = join(prepared.path, project.name);
+  const item = updateWorkItemStatus(createWorkItem("work-item-1", task.id, {
+    title: "Package exact direct delivery",
+    writeProjectIds: [project.id]
+  }, NOW), "running", NOW);
+  const invocation = exactTaskCliInvocation({
+    home,
+    store,
+    taskId: task.id,
+    roleName: "leader",
+    taskFinalReviewerRole: "reviewer"
+  });
+  const contract = createTaskFinalReviewContract({
+    taskId: task.id,
+    reviewerRoleName: "reviewer",
+    controlPlaneDigest: invocation.controlDigest
+  });
+  store.saveWorkItem(task.id, item);
+  writeFileSync(join(mainPath, "direct-main.txt"), "direct main delivery\n");
+  git(["-C", mainPath, "add", "direct-main.txt"]);
+  git(["-C", mainPath, "commit", "-qm", "direct main delivery"]);
+  const head = git(["-C", mainPath, "rev-parse", "HEAD"]).trim();
+  const submitted = spawnSync(process.execPath, [
+    invocation.cliEntry,
+    ...invocation.prefix,
+    "task", "work", "update", item.id, "done",
+    "--summary", "Direct Task main is ready for provenance capture."
+  ], { encoding: "utf8", env: invocation.environment });
+  assert.equal(submitted.status, 0, submitted.stderr || submitted.stdout);
+  const candidate = store.getWorkItem(task.id, item.id).candidates.at(-1);
+  assert.equal(candidate.source.type, "direct");
+  assert.deepEqual(candidate.taskMainSnapshot.projects, [{
+    projectId: project.id,
+    directory: taskEntry.directory,
+    branch: taskEntry.branch,
+    baseCommit: taskEntry.baseCommit,
+    headCommit: head
+  }]);
+
+  // A normal Controller preparation observes the physical HEAD and advances
+  // the mutable Task workspace record. Capture must still use the Candidate's
+  // frozen boundary rather than silently reporting an empty result.
+  await preparer.prepareTaskWorkspace(task.id);
+  assert.equal(
+    store.getTaskWorkspace(task.id).entries.find(({ projectId }) => projectId === project.id)
+      .baseCommit,
+    head
+  );
+  const manager = new WorkItemChangeSetManager(store, () => new Date(NOW));
+
+  await assert.rejects(
+    manager.capture(task.id, item.id),
+    /no managed workspace/i
+  );
+  await assert.rejects(
+    manager.capture(task.id, item.id, {
+      taskFinalReviewContract: createTaskFinalReviewContract({
+        taskId: task.id,
+        reviewerRoleName: "reviewer",
+        controlPlaneDigest: "b".repeat(64)
+      })
+    }),
+    /Task-final contract|direct Candidate/i
+  );
+  writeFileSync(join(mainPath, "dirty.txt"), "must not be captured\n");
+  await assert.rejects(
+    manager.capture(task.id, item.id, { taskFinalReviewContract: contract }),
+    /Task main.*clean/i
+  );
+  unlinkSync(join(mainPath, "dirty.txt"));
+
+  const captureInvocation = exactTaskCliInvocation({
+    home,
+    store,
+    taskId: task.id,
+    roleName: "leader",
+    taskFinalReviewerRole: "reviewer"
+  });
+  const captured = spawnSync(process.execPath, [
+    captureInvocation.cliEntry,
+    ...captureInvocation.prefix,
+    "task", "work", "capture", item.id
+  ], { encoding: "utf8", env: captureInvocation.environment });
+  assert.equal(captured.status, 0, captured.stderr || captured.stdout);
+  const [changeSet] = store.listChangeSets(task.id);
+  assert.notEqual(changeSet, undefined);
+  assert.equal(changeSet.workItemId, item.id);
+  assert.equal(changeSet.baseCommit, taskEntry.baseCommit);
+  assert.equal(changeSet.headCommit, head);
+  assert.deepEqual(changeSet.changedPaths, ["direct-main.txt"]);
+
+  const result = await runTaskIntegrationCommand([
+    "start", task.id, "--change-set", changeSet.id
+  ], store, home, { now: () => new Date(NOW) });
+  assert.match(result.output, /Integrated/i);
+  const [integration] = store.listIntegrationAttempts(task.id);
+  assert.equal(integration.status, "committed");
+  assert.equal(integration.expectedHead, head);
+  assert.equal(integration.candidateCommit, head);
+  assert.deepEqual(integration.changeSetIds, [changeSet.id]);
+  assert.equal(git(["-C", mainPath, "rev-parse", "HEAD"]).trim(), head);
 });
 
 test("Task archive requires explicit WorkItem cleanup and preserves its record", async (t) => {
@@ -3767,7 +4403,13 @@ test("public Task archive cleans terminal ReviewRound workspaces before archivin
       baseRef: project.developmentBranch
     }]
   }), NOW);
-  const agent = addTaskRoles(store, task, repositoryPath);
+  const agent = addTaskRoles(
+    store,
+    task,
+    repositoryPath,
+    ["leader", "worker"],
+    createStartupReadyClaudeAgent(home, NOW, "claude-mock")
+  );
   store.transaction((tx) => {
     tx.saveGlobalRole(createGlobalRole(
       "reviewer",
@@ -3801,18 +4443,13 @@ test("public Task archive cleans terminal ReviewRound workspaces before archivin
     workspace: develop,
     gitSnapshot: await preparer.snapshotCandidateWorkspace(develop)
   }, NOW));
-  const cli = join(process.cwd(), "dist", "cli.js");
-  const leaderEnvironment = {
-    ...process.env,
-    YUI_HOME: home,
-    YUI_SESSION_SCOPE: "task",
-    YUI_TASK_ID: task.id,
-    YUI_ROLE: "leader"
-  };
-  const queued = spawnSync(process.execPath, [cli, "task", "work", "review", item.id], {
-    encoding: "utf8",
-    env: leaderEnvironment
-  });
+  const queued = spawnExactTaskCli(
+    home,
+    store,
+    task.id,
+    "leader",
+    ["task", "work", "review", item.id]
+  );
   assert.equal(queued.status, 0, queued.stderr || queued.stdout);
   const round = store.listReviewRounds(task.id)[0];
   const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
@@ -3848,7 +4485,7 @@ test("public Task archive cleans terminal ReviewRound workspaces before archivin
 
   const archived = spawnSync(
     process.execPath,
-    [cli, "task", "archive", task.id, "--integrated"],
+    [join(process.cwd(), "dist", "cli.js"), "task", "archive", task.id, "--integrated"],
     { encoding: "utf8", env: { ...process.env, YUI_HOME: home } }
   );
   assert.equal(archived.status, 0, archived.stderr || archived.stdout);

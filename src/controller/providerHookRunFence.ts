@@ -16,6 +16,7 @@ export type ProviderHookRunFence = Readonly<{
   runId: string;
   receiptId?: string;
   nativeSessionId: string;
+  workspace: string;
 }>;
 
 export type ProviderHookRunFenceOptions = Readonly<{
@@ -45,6 +46,7 @@ export function resolveProviderHookRunFence(
   const taskId = requireIdentity(environment.YUI_TASK_ID, "Task id");
   const roleName = requireIdentity(environment.YUI_ROLE, "Role name");
   const agentId = requireIdentity(environment.YUI_AGENT_ID, "Agent id");
+  const workspace = requireIdentity(environment.YUI_WORKSPACE, "YUI workspace");
   const launchId = requireIdentity(environment.YUI_LAUNCH_ID, "Launch id");
   const nativeSessionId = requireIdentity(payloadNativeSessionId, "Provider session id");
   const expectedNativeSessionId = environment.YUI_NATIVE_SESSION_ID;
@@ -73,7 +75,8 @@ export function resolveProviderHookRunFence(
     taskId,
     roleName
   }));
-  const launchReserved = isRuntimeLaunchReservation(mailbox?.processing, launchId);
+  const exactReservation = isRuntimeLaunchReservation(mailbox?.processing, launchId)
+    && !hasRuntimeCleanupObligation(mailbox);
   const executionRef = mailbox?.processing?.executionRef;
   const startupRunId = options.allowPreallocatedClaudeStartup === true
     ? requireIdentity(environment.YUI_RUN_ID, "Run id")
@@ -82,8 +85,7 @@ export function resolveProviderHookRunFence(
     && options.allowPreallocatedClaudeStartup === true
     && expectedNativeSessionId !== undefined
     && session === undefined
-    && launchReserved
-    && !hasRuntimeCleanupObligation(mailbox)
+    && exactReservation
     && executionRef?.type === "run"
     && executionRef.taskId === taskId
     && executionRef.id === startupRunId
@@ -119,16 +121,20 @@ export function resolveProviderHookRunFence(
     || run.effective.adapterId !== adapterId) {
     throw new Error("Provider lifecycle hook Run does not match durable active state.");
   }
+  if (run.effective.workspace.root !== workspace) {
+    throw new Error("Provider lifecycle hook workspace does not match the durable Run snapshot.");
+  }
   if (session !== undefined) {
     if (session.adapterId !== adapterId
       || session.launchId !== launchId
-      || session.nativeSessionId !== nativeSessionId) {
+      || session.nativeSessionId !== nativeSessionId
+      || session.effective.workspace.root !== workspace) {
       throw new Error("Provider lifecycle hook Session does not match its durable generation.");
     }
   } else {
     const runtimeDiscoveredCodex = adapterId === "codex"
       && expectedNativeSessionId === undefined
-      && launchReserved;
+      && exactReservation;
     if (!runtimeDiscoveredCodex && !deterministicClaudeStartup) {
       throw new Error("Provider lifecycle hook launch is not durably reserved.");
     }
@@ -140,7 +146,8 @@ export function resolveProviderHookRunFence(
     launchId,
     runId,
     ...(inFlight?.receiptId === undefined ? {} : { receiptId: inFlight.receiptId }),
-    nativeSessionId
+    nativeSessionId,
+    workspace
   };
 }
 

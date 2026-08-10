@@ -5,6 +5,10 @@ import {
 } from "../domain/validation.js";
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
 import {
+  validateTaskFinalReviewContract,
+  type TaskFinalReviewContract
+} from "./taskFinalReviewContract.js";
+import {
   validateManagedWorkspace,
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
@@ -48,6 +52,8 @@ export type ReviewRound = {
   scope?: ReviewScope;
   /** Present only when this round reviews the complete integrated Task. */
   taskCandidate?: TaskReviewCandidate;
+  /** Exact Task/control capability that established this Task-final gate. */
+  taskFinalReviewContract?: TaskFinalReviewContract;
   workspace?: ManagedWorkspace;
   requestedBy: ReviewRequestSource;
   status: ReviewRoundStatus;
@@ -95,7 +101,8 @@ export function createTaskReviewRound(
   reviewerRoleName: string,
   requestedBy: ReviewRequestSource,
   taskCandidate: TaskReviewCandidate,
-  now: Date
+  now: Date,
+  taskFinalReviewContract?: TaskFinalReviewContract
 ): ReviewRound {
   const candidate = validateTaskReviewCandidate(taskCandidate);
   return validateReviewRound({
@@ -108,6 +115,9 @@ export function createTaskReviewRound(
     reviewBaseCommit: candidate.projects[0]!.commit,
     scope: "task",
     taskCandidate: candidate,
+    ...(taskFinalReviewContract === undefined
+      ? {}
+      : { taskFinalReviewContract }),
     requestedBy: validateReviewRequestSource(requestedBy),
     status: "pending",
     createdAt: now.toISOString()
@@ -256,8 +266,18 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
     if (candidate.projects[0]!.commit !== round.reviewBaseCommit) {
       throw new Error(`Task ReviewRound base does not match its primary Project: ${round.id}.`);
     }
-  } else if (round.taskCandidate !== undefined) {
-    throw new Error(`WorkItem ReviewRound cannot carry a Task candidate: ${round.id}.`);
+    if (round.taskFinalReviewContract !== undefined) {
+      const contract = validateTaskFinalReviewContract(round.taskFinalReviewContract);
+      if (contract.taskId !== round.taskId) {
+        throw new Error(`Task ReviewRound contract belongs to another Task: ${round.id}.`);
+      }
+      if (contract.reviewerRoleName !== round.reviewerRoleName) {
+        throw new Error(`Task ReviewRound contract uses another Reviewer Role: ${round.id}.`);
+      }
+    }
+  } else if (round.taskCandidate !== undefined
+    || round.taskFinalReviewContract !== undefined) {
+    throw new Error(`WorkItem ReviewRound cannot carry a Task candidate or contract: ${round.id}.`);
   }
   validateReviewRequestSource(round.requestedBy);
   if (!["pending", "running", "completed", "failed"].includes(round.status)) {

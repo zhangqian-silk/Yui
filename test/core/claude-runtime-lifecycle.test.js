@@ -10,6 +10,7 @@ import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { bindExecution, claimPending } from "../../dist/coordination/workMailbox.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
+import { stopFileTaskController } from "../../dist/controller/clientRuntime.js";
 import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
@@ -31,6 +32,12 @@ import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { createWorkItem, updateWorkItemStatus } from "../../dist/workItem/workItem.js";
+import {
+  EXACT_CONTROL_ARGUMENT,
+  YUI_CONTROL_PLANE_DESCRIPTOR,
+  exactControlPlaneDigest,
+  parseExactControlPlaneDescriptor
+} from "../../dist/runtime/exactControlPlane.js";
 
 function fixture(t) {
   const { home } = workflowFixture(t);
@@ -43,6 +50,7 @@ function fixture(t) {
       YUI_ROLE: "worker",
       YUI_AGENT_ID: "claude-primary",
       YUI_ADAPTER_ID: "claude",
+      YUI_WORKSPACE: home,
       YUI_LAUNCH_ID: "launch-1",
       YUI_RUN_ID: "agent-run-stale-process-value",
       YUI_NATIVE_SESSION_ID: "native-1"
@@ -64,7 +72,10 @@ function currentClaudeHookCommon(hookEventName) {
 
 function workflowFixture(t) {
   const home = mkdtempSync(join(tmpdir(), "yui-claude-lifecycle-state-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(async () => {
+    await stopFileTaskController(home);
+    rmSync(home, { recursive: true, force: true });
+  });
   ensureStorageSchema(home);
   const store = new FileTaskStore(home);
   const first = new Date("2026-08-02T02:00:00.000Z");
@@ -142,10 +153,32 @@ function workflowFixture(t) {
 }
 
 function yieldThroughCli(home, runId, summary) {
+  const store = new FileTaskStore(home);
+  const task = store.getTask("task-1");
+  const role = store.getRole(task.id, "worker");
+  const active = store.getActiveAgentRun(task.id, role.name);
+  const session = store.getRoleSession(task.id, role.name);
+  const cliEntry = join(process.cwd(), "dist", "cli.js");
+  const plan = new FileRoleLaunchPlanner(home, store, { cliPath: cliEntry }).plan({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: session.adapterId,
+    effective: active?.effective ?? session.effective,
+    mode: "resume",
+    nativeSessionId: session.nativeSessionId,
+    launchId: session.launchId,
+    ...(active === null ? {} : { runId: active.id })
+  });
+  const control = parseExactControlPlaneDescriptor(
+    plan.launch.env[YUI_CONTROL_PLANE_DESCRIPTOR]
+  );
   return spawnSync(
     process.execPath,
     [
-      join(process.cwd(), "dist", "cli.js"),
+      cliEntry,
+      EXACT_CONTROL_ARGUMENT,
+      exactControlPlaneDigest(control),
       "task", "run", "yield", runId, "--summary-file", "-"
     ],
     {
@@ -153,10 +186,7 @@ function yieldThroughCli(home, runId, summary) {
       input: summary,
       env: {
         ...process.env,
-        YUI_HOME: home,
-        YUI_SESSION_SCOPE: "task",
-        YUI_TASK_ID: "task-1",
-        YUI_ROLE: "worker"
+        ...plan.launch.env
       }
     }
   );
@@ -259,6 +289,7 @@ test("Claude StopFailure fails the exact Run and WorkItem without a Candidate or
     YUI_ROLE: worker.name,
     YUI_AGENT_ID: agent.id,
     YUI_ADAPTER_ID: "claude",
+    YUI_WORKSPACE: run.effective.workspace.root,
     YUI_LAUNCH_ID: "launch-1",
     YUI_RUN_ID: run.id,
     YUI_NATIVE_SESSION_ID: "native-1"
